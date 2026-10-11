@@ -1,5 +1,4 @@
 use super::*;
-use crate::catalog::CatalogRegistryLimits;
 
 const STORE: &str = r#"(endpoint-set-document :schema-version 1 :kind stores
   :set (endpoint-set :entries [
@@ -28,14 +27,7 @@ fn reference(path: &str) -> String {
 }
 
 fn registry(root: &Path) -> PolicyRegistry {
-    PolicyRegistry::new_for_workspace(
-        root.to_path_buf(),
-        Arc::new(TaintCatalogRegistry::new_without_workspace(
-            CatalogRegistryLimits::default(),
-        )),
-        PolicyRegistryLimits::default(),
-    )
-    .unwrap()
+    crate::test_registry_for_workspace(root)
 }
 
 #[test]
@@ -335,34 +327,6 @@ fn wrong_kind_missing_cycles_and_hash_mismatches_fail_transactionally() {
 }
 
 #[test]
-fn cancellation_and_entry_budget_never_register_a_partial_policy() {
-    let temp = tempfile::tempdir().unwrap();
-    std::fs::write(temp.path().join("db.rqlp"), STORE).unwrap();
-    let mut registry = registry(temp.path());
-    registry.limits = registry.limits.with_max_endpoint_set_entries(3).unwrap();
-    assert!(
-        registry
-            .register_policy_bytes(
-                "p.rqlp".into(),
-                policy("test", &reference("db.rqlp")).as_bytes()
-            )
-            .is_err()
-    );
-    assert_eq!(registry.policies().len(), 0);
-    let token = CancellationToken::new();
-    token.cancel();
-    registry.set_cancellation(Some(token));
-    assert!(matches!(
-        registry.register_policy_bytes(
-            "p.rqlp".into(),
-            policy("test", &reference("db.rqlp")).as_bytes()
-        ),
-        Err(PolicyRegistryError::Cancelled)
-    ));
-    assert_eq!(registry.policies().len(), 0);
-}
-
-#[test]
 fn exhausted_import_bytes_and_mid_closure_cancellation_do_not_commit_cache() {
     let temp = tempfile::tempdir().unwrap();
     std::fs::write(temp.path().join("db.rqlp"), STORE).unwrap();
@@ -426,4 +390,32 @@ fn imported_symlink_cannot_escape_workspace() {
             )
             .is_err()
     );
+}
+
+#[test]
+fn cancellation_and_entry_budget_never_register_a_partial_policy() {
+    let temp = tempfile::tempdir().unwrap();
+    std::fs::write(temp.path().join("db.rqlp"), STORE).unwrap();
+    let mut registry = registry(temp.path());
+    registry.limits = registry.limits.with_max_endpoint_set_entries(3).unwrap();
+    assert!(
+        registry
+            .register_policy_bytes(
+                "p.rqlp".into(),
+                policy("test", &reference("db.rqlp")).as_bytes()
+            )
+            .is_err()
+    );
+    assert_eq!(registry.policies().len(), 0);
+    let token = CancellationToken::new();
+    token.cancel();
+    registry.set_cancellation(Some(token));
+    assert!(matches!(
+        registry.register_policy_bytes(
+            "p.rqlp".into(),
+            policy("test", &reference("db.rqlp")).as_bytes()
+        ),
+        Err(PolicyRegistryError::Cancelled)
+    ));
+    assert_eq!(registry.policies().len(), 0);
 }

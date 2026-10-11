@@ -3,12 +3,14 @@
 use crate::hash::{HashMap, HashSet};
 
 use super::{
-    AllocationId, AllocationKind, AllocationSite, BasicBlock, BlockId, CaptureBinding, CaptureId,
-    CaptureMode, ControlEdge, ControlEdgeKind, Evidence, EvidenceId, GuardFactParts, GuardId,
-    LoopSite, MemoryLocation, MemoryLocationId, MemoryLocationKind, ProcedureSemanticsParts,
-    ProgramPoint, ProgramPointId, SemanticBudget, SemanticBudgetExceeded, SemanticCallSite,
-    SemanticEvent, SemanticGap, SemanticLocator, SemanticValue, SemanticWork, SourceMapping,
-    SourceMappingId, StatementEntrySite, SwitchFactId, SwitchFactParts,
+    AllocationId, AllocationKind, AllocationSite, BasicBlock, BlockId, CallReceiverTypeFact,
+    CaptureBinding, CaptureId, CaptureMode, ControlEdge, ControlEdgeKind, DropBehavior, DropFact,
+    Evidence, EvidenceId, GuardFactParts, GuardId, LoopSite, MemoryLocation, MemoryLocationId,
+    MemoryLocationKind, ProcedureSemanticsParts, ProgramPoint, ProgramPointId, ScopeEndAt,
+    ScopeEndFact, SemanticBudget, SemanticBudgetExceeded, SemanticCallSite, SemanticEffect,
+    SemanticEvent, SemanticGap, SemanticLocator, SemanticPlace, SemanticValue, SemanticWork,
+    SourceMapping, SourceMappingId, StatementEntrySite, SwitchFactId, SwitchFactParts,
+    ValueFlowKind, ValueId,
 };
 
 #[derive(Debug, Clone)]
@@ -28,9 +30,29 @@ pub(crate) struct ProcedureCfgBuilder {
     parts: ProcedureSemanticsParts,
     points: Vec<PendingPoint>,
     scopes: Vec<ScopeFrame>,
+    scope_cleanup_actions: HashMap<ScopeFrameId, Vec<ScopeCleanupAction>>,
     cleanup_specializations: HashMap<CleanupKey, ProgramPointId>,
     budget_snapshot: SemanticBudget,
     prospective_work: SemanticWork,
+}
+
+pub(crate) fn resolve_abrupt_throw(
+    builder: &ProcedureCfgBuilder,
+    scope: ScopeFrameId,
+    value: ValueId,
+    catch_binders: &HashMap<ProgramPointId, ValueId>,
+) -> Option<(CompletionRoute, Option<SemanticEffect>)> {
+    let route =
+        builder.resolve_completion(scope, &CompletionRequest::new(CompletionKind::Throw, None))?;
+    let effect = catch_binders
+        .get(&route.destination().target())
+        .copied()
+        .map(|target| SemanticEffect::ValueFlow {
+            kind: ValueFlowKind::Local,
+            source: value,
+            target,
+        });
+    Some((route, effect))
 }
 
 impl ProcedureCfgBuilder {
@@ -52,6 +74,7 @@ impl ProcedureCfgBuilder {
                 && parts.captures.is_empty()
                 && parts.call_sites.is_empty()
                 && parts.gaps.is_empty()
+                && parts.go_predeclared_builtin_assumptions.is_empty()
                 && parts.statement_entries.is_empty()
                 && parts.loop_sites.is_empty(),
             "CFG builder requires side-table rows to be allocated through the builder"
@@ -70,6 +93,7 @@ impl ProcedureCfgBuilder {
             parts,
             points: Vec::new(),
             scopes: Vec::new(),
+            scope_cleanup_actions: HashMap::default(),
             cleanup_specializations: HashMap::default(),
             budget_snapshot: budget.clone(),
             prospective_work,
@@ -96,7 +120,7 @@ impl ProcedureCfgBuilder {
         let id = SourceMappingId::try_from_index(self.parts.source_mappings.len())
             .expect("source-mapping count is bounded by the u32 semantic budget");
         assert_eq!(mapping.id, id, "source mappings must use dense builder IDs");
-        self.reserve(combine_work(
+        self.reserve(SemanticWork::conservative_add(
             SemanticWork {
                 source_mappings: 1,
                 ..SemanticWork::default()
@@ -267,7 +291,7 @@ impl ProcedureCfgBuilder {
             | MemoryLocationKind::LexicalCell { .. }
             | MemoryLocationKind::Capture { .. } => SemanticWork::default(),
         };
-        self.reserve(combine_work(
+        self.reserve(SemanticWork::conservative_add(
             SemanticWork {
                 memory_locations: 1,
                 ..SemanticWork::default()
@@ -337,6 +361,37 @@ impl ProcedureCfgBuilder {
         })?;
         self.parts.call_sites.push(call_site);
         Ok(id)
+    }
+
+    /// Record the written receiver type of a method call. The call site must
+    /// already be published, and facts arrive in increasing call-site order.
+    pub(crate) fn add_call_receiver_type_fact(
+        &mut self,
+        fact: CallReceiverTypeFact,
+    ) -> Result<(), SemanticBudgetExceeded> {
+        assert!(
+            fact.call_site.index() < self.parts.call_sites.len(),
+            "receiver type fact must follow its published call site"
+        );
+        debug_assert!(
+            self.parts
+                .receiver_type_facts
+                .last()
+                .is_none_or(|previous| previous.call_site < fact.call_site),
+            "receiver type facts must be in strictly increasing call-site order"
+        );
+        let owned_text_bytes = fact
+            .receiver_type
+            .iter()
+            .map(|segment| segment.len())
+            .fold(fact.member.len(), usize::saturating_add);
+        self.reserve(SemanticWork {
+            nested_entries: fact.receiver_type.len(),
+            owned_text_bytes,
+            ..SemanticWork::default()
+        })?;
+        self.parts.receiver_type_facts.push(fact);
+        Ok(())
     }
 
     pub(crate) fn add_point(
@@ -448,6 +503,78 @@ impl ProcedureCfgBuilder {
         id
     }
 
+    /// Append one ordered lifecycle action to a cleanup scope.
+    #[allow(dead_code)] // Lane C consumes this producer hook in the dependent change.
+    pub(crate) fn register_scope_cleanup_action(
+        &mut self,
+        scope: ScopeFrameId,
+        action: ScopeCleanupAction,
+    ) -> Result<(), SemanticBudgetExceeded> {
+        let frame = self
+            .scopes
+            .get(scope.index())
+            .expect("cleanup action scope must exist");
+        assert!(
+            matches!(&frame.binding, ScopeBinding::Cleanup { .. }),
+            "cleanup actions belong to cleanup scope frames"
+        );
+        self.reserve(SemanticWork {
+            nested_entries: 1,
+            ..SemanticWork::default()
+        })?;
+        self.scope_cleanup_actions
+            .entry(scope)
+            .or_default()
+            .push(action);
+        Ok(())
+    }
+
+    #[allow(dead_code)] // Lane C consumes this producer hook in the dependent change.
+    fn add_cleanup_action_fact(
+        &mut self,
+        point: ProgramPointId,
+        action: &ScopeCleanupAction,
+    ) -> Result<(), SemanticBudgetExceeded> {
+        self.reserve(SemanticWork {
+            nested_entries: 1,
+            ..SemanticWork::default()
+        })?;
+        match action {
+            ScopeCleanupAction::Drop {
+                place,
+                behavior,
+                source,
+                evidence,
+            } => self.parts.drops.push(DropFact {
+                place: place.clone(),
+                point,
+                behavior: behavior.clone(),
+                source: *source,
+                evidence: *evidence,
+            }),
+            ScopeCleanupAction::ScopeEnd {
+                place,
+                source,
+                evidence,
+            } => self.parts.scope_ends.push(ScopeEndFact {
+                place: place.clone(),
+                at: ScopeEndAt::Point(point),
+                source: *source,
+                evidence: *evidence,
+            }),
+        }
+        Ok(())
+    }
+
+    #[allow(dead_code)] // Lane C consumes this producer hook in the dependent change.
+    pub(crate) fn emit_cleanup_action_fact(
+        &mut self,
+        point: ProgramPointId,
+        action: &ScopeCleanupAction,
+    ) -> Result<(), SemanticBudgetExceeded> {
+        self.add_cleanup_action_fact(point, action)
+    }
+
     /// Resolve an abrupt completion by walking persistent parent-linked scope
     /// frames iteratively. Cleanup regions are returned inner-to-outer.
     pub(crate) fn resolve_completion(
@@ -456,6 +583,7 @@ impl ProcedureCfgBuilder {
         request: &CompletionRequest<'_>,
     ) -> Option<CompletionRoute> {
         let mut cleanups = Vec::new();
+        let mut operations = Vec::new();
         let mut cursor = Some(scope);
         while let Some(id) = cursor {
             let frame = self.scopes.get(id.index())?;
@@ -478,9 +606,10 @@ impl ProcedureCfgBuilder {
                             continue;
                         }
                     };
-                    return Some(CompletionRoute::new(
+                    return Some(CompletionRoute::with_operations(
                         CompletionTarget::new(request.kind, target, edge_kind),
                         cleanups,
+                        operations,
                     ));
                 }
                 ScopeBinding::Function {
@@ -488,23 +617,25 @@ impl ProcedureCfgBuilder {
                     throw_target,
                 } => match request.kind {
                     CompletionKind::Return => {
-                        return Some(CompletionRoute::new(
+                        return Some(CompletionRoute::with_operations(
                             CompletionTarget::new(
                                 CompletionKind::Return,
                                 *return_target,
                                 ControlEdgeKind::Normal,
                             ),
                             cleanups,
+                            operations,
                         ));
                     }
                     CompletionKind::Throw => {
-                        return Some(CompletionRoute::new(
+                        return Some(CompletionRoute::with_operations(
                             CompletionTarget::new(
                                 CompletionKind::Throw,
                                 *throw_target,
                                 ControlEdgeKind::Exceptional,
                             ),
                             cleanups,
+                            operations,
                         ));
                     }
                     CompletionKind::Normal
@@ -516,13 +647,14 @@ impl ProcedureCfgBuilder {
                     yield_target,
                     yield_edge_kind,
                 } if request.kind == CompletionKind::Yield => {
-                    return Some(CompletionRoute::new(
+                    return Some(CompletionRoute::with_operations(
                         CompletionTarget::new(
                             CompletionKind::Yield,
                             *yield_target,
                             *yield_edge_kind,
                         ),
                         cleanups,
+                        operations,
                     ));
                 }
                 ScopeBinding::Loop {
@@ -534,23 +666,25 @@ impl ProcedureCfgBuilder {
                 } => {
                     if label_matches(request.label, label.as_deref(), true) {
                         if request.kind == CompletionKind::Break {
-                            return Some(CompletionRoute::new(
+                            return Some(CompletionRoute::with_operations(
                                 CompletionTarget::new(
                                     CompletionKind::Break,
                                     *break_target,
                                     *break_edge_kind,
                                 ),
                                 cleanups,
+                                operations,
                             ));
                         }
                         if request.kind == CompletionKind::Continue {
-                            return Some(CompletionRoute::new(
+                            return Some(CompletionRoute::with_operations(
                                 CompletionTarget::new(
                                     CompletionKind::Continue,
                                     *continue_target,
                                     *continue_edge_kind,
                                 ),
                                 cleanups,
+                                operations,
                             ));
                         }
                     }
@@ -564,27 +698,40 @@ impl ProcedureCfgBuilder {
                     if request.kind == CompletionKind::Break
                         && label_matches(request.label, label.as_deref(), *accepts_unlabeled)
                     {
-                        return Some(CompletionRoute::new(
+                        return Some(CompletionRoute::with_operations(
                             CompletionTarget::new(
                                 CompletionKind::Break,
                                 *break_target,
                                 *break_edge_kind,
                             ),
                             cleanups,
+                            operations,
                         ));
                     }
                 }
                 ScopeBinding::Handler { entry } if request.kind == CompletionKind::Throw => {
-                    return Some(CompletionRoute::new(
+                    return Some(CompletionRoute::with_operations(
                         CompletionTarget::new(
                             CompletionKind::Throw,
                             *entry,
                             ControlEdgeKind::Exceptional,
                         ),
                         cleanups,
+                        operations,
                     ));
                 }
-                ScopeBinding::Cleanup { region } => cleanups.push(*region),
+                ScopeBinding::Cleanup { region } => {
+                    let cleanup_index = cleanups.len();
+                    cleanups.push(*region);
+                    if let Some(actions) = self.scope_cleanup_actions.get(&id) {
+                        operations
+                            .extend(actions.iter().cloned().map(CleanupRouteOperation::Action));
+                    }
+                    operations.push(CleanupRouteOperation::Region {
+                        cleanup_index,
+                        region: *region,
+                    });
+                }
                 ScopeBinding::Handler { .. } | ScopeBinding::Yieldable { .. } => {}
             }
             cursor = frame.parent;
@@ -630,10 +777,128 @@ impl ProcedureCfgBuilder {
         region: CleanupRegionId,
         target: ProgramPointId,
     ) -> CompletionRoute {
-        CompletionRoute::new(
+        let mut operations = Vec::new();
+        if let Some(index) = self.scopes.iter().position(|frame| {
+            matches!(&frame.binding, ScopeBinding::Cleanup { region: actual } if *actual == region)
+        }) {
+            let scope = ScopeFrameId::try_from_index(index);
+            if let Some(actions) = self.scope_cleanup_actions.get(&scope) {
+                operations.extend(
+                    actions
+                        .iter()
+                        .cloned()
+                        .map(CleanupRouteOperation::Action),
+                );
+            }
+        }
+        if operations.is_empty() {
+            return CompletionRoute::new(
+                CompletionTarget::new(CompletionKind::Normal, target, ControlEdgeKind::Normal),
+                vec![region],
+            );
+        }
+        let cleanups = vec![region];
+        operations.push(CleanupRouteOperation::Region {
+            cleanup_index: 0,
+            region,
+        });
+        CompletionRoute::with_operations(
             CompletionTarget::new(CompletionKind::Normal, target, ControlEdgeKind::Normal),
-            vec![region],
+            cleanups,
+            operations,
         )
+    }
+
+    /// Resolve normal completion through cleanup frames from `scope` up to,
+    /// but not including, `stop_before`.
+    ///
+    /// This is the shared lexical-scope exit path for adapters whose binding
+    /// lifetimes begin at different statements within one syntax block.
+    pub(crate) fn normal_cleanup_completion_until(
+        &self,
+        scope: ScopeFrameId,
+        stop_before: ScopeFrameId,
+        target: ProgramPointId,
+    ) -> CompletionRoute {
+        let mut cleanups = Vec::new();
+        let mut operations = Vec::new();
+        let mut cursor = Some(scope);
+        while cursor != Some(stop_before) {
+            let id = cursor.expect("normal cleanup boundary must be an ancestor scope");
+            let frame = self
+                .scopes
+                .get(id.index())
+                .expect("scope IDs are allocated by this CFG builder");
+            if let ScopeBinding::Cleanup { region } = &frame.binding {
+                let region = *region;
+                let cleanup_index = cleanups.len();
+                cleanups.push(region);
+                if let Some(actions) = self.scope_cleanup_actions.get(&id) {
+                    operations.extend(actions.iter().cloned().map(CleanupRouteOperation::Action));
+                }
+                operations.push(CleanupRouteOperation::Region {
+                    cleanup_index,
+                    region,
+                });
+            }
+            cursor = frame.parent;
+        }
+        CompletionRoute::with_operations(
+            CompletionTarget::new(CompletionKind::Normal, target, ControlEdgeKind::Normal),
+            cleanups,
+            operations,
+        )
+    }
+
+    /// Resolve async cancellation through the active cleanup scopes.
+    ///
+    /// Only actions for places retained across the suspension point are
+    /// included. Exception handlers and loop targets do not intercept future
+    /// cancellation; the route ends at the caller-supplied cancellation exit.
+    #[allow(dead_code)] // Lane C consumes this producer hook in the dependent change.
+    pub(crate) fn resolve_cancellation(
+        &self,
+        scope: ScopeFrameId,
+        target: ProgramPointId,
+        live_places: &[SemanticPlace],
+    ) -> Option<CompletionRoute> {
+        let mut cleanups = Vec::new();
+        let mut operations = Vec::new();
+        let mut cursor = Some(scope);
+        while let Some(id) = cursor {
+            let frame = self.scopes.get(id.index())?;
+            if let ScopeBinding::Cleanup { region } = &frame.binding {
+                let region = *region;
+                let cleanup_index = cleanups.len();
+                cleanups.push(region);
+                if let Some(actions) = self.scope_cleanup_actions.get(&id) {
+                    operations.extend(
+                        actions
+                            .iter()
+                            .filter(|action| live_places.contains(action.place()))
+                            .cloned()
+                            .map(CleanupRouteOperation::Action),
+                    );
+                }
+                operations.push(CleanupRouteOperation::Region {
+                    cleanup_index,
+                    region,
+                });
+            }
+            if matches!(&frame.binding, ScopeBinding::Function { .. }) {
+                return Some(CompletionRoute::with_operations(
+                    CompletionTarget::new(
+                        CompletionKind::Throw,
+                        target,
+                        ControlEdgeKind::Exceptional,
+                    ),
+                    cleanups,
+                    operations,
+                ));
+            }
+            cursor = frame.parent;
+        }
+        None
     }
 
     /// Preserve cleanup routing while inserting a final completion continuation.
@@ -814,7 +1079,7 @@ impl ProcedureCfgBuilder {
             &self.budget_snapshot,
             self.prospective_work,
         )?;
-        self.prospective_work = combine_work(self.prospective_work, derived_work);
+        self.prospective_work = self.prospective_work.conservative_add(derived_work);
         self.parts.blocks = blocks;
         self.parts.points = points;
         Ok((self.parts, self.prospective_work))
@@ -837,21 +1102,36 @@ fn cleanup_key(route: &CompletionRoute, cleanup_index: usize) -> CleanupKey {
         .get(cleanup_index)
         .copied()
         .unwrap_or_else(|| panic!("cleanup index {cleanup_index} is outside completion route"));
+    let operation_index = route
+        .operations
+        .iter()
+        .position(|operation| {
+            matches!(operation, CleanupRouteOperation::Region { cleanup_index: actual, .. } if *actual == cleanup_index)
+        })
+        .expect("each cleanup region has a route operation");
+    assert!(matches!(
+        route.operations[operation_index],
+        CleanupRouteOperation::Region { region: actual, .. } if actual == region
+    ));
     CleanupKey {
         region,
         destination: route.destination,
-        outer_cleanups: route.cleanups[cleanup_index + 1..]
-            .to_vec()
-            .into_boxed_slice(),
+        outer_operations: route.operations[operation_index + 1..]
+            .iter()
+            .map(|operation| match operation {
+                CleanupRouteOperation::Action(action) => {
+                    CleanupOperationKey::Action(Box::new(action.clone()))
+                }
+                CleanupRouteOperation::Region { region, .. } => {
+                    CleanupOperationKey::Region(*region)
+                }
+            })
+            .collect(),
     }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct ReachabilitySealCancelled;
-
-fn combine_work(left: SemanticWork, right: SemanticWork) -> SemanticWork {
-    left.conservative_add(right)
-}
 
 /// Work retained by a newly initialized procedure CFG before points or
 /// adapter-owned rows are added.
@@ -869,10 +1149,10 @@ pub(crate) fn initial_procedure_cfg_work<'locator>(
         nested_entries: 2,
         ..SemanticWork::default()
     };
-    work = combine_work(work, locator_work(procedure_locator, 2));
+    work = work.conservative_add(locator_work(procedure_locator, 2));
     for locator in source_mapping_locators {
         work.source_mappings = work.source_mappings.saturating_add(1);
-        work = combine_work(work, locator_work(locator, 1));
+        work = work.conservative_add(locator_work(locator, 1));
     }
     for source_count in evidence_source_counts {
         work.evidence = work.evidence.saturating_add(1);
@@ -882,21 +1162,10 @@ pub(crate) fn initial_procedure_cfg_work<'locator>(
 }
 
 fn locator_work(locator: &SemanticLocator, copies: usize) -> SemanticWork {
-    let segment_count = locator.declaration().segments().len();
-    let segment_name_bytes = locator
-        .declaration()
-        .segments()
-        .iter()
-        .filter_map(|segment| segment.name())
-        .fold(0usize, |total, name| total.saturating_add(name.len()));
+    let work = super::workspace_oracle::semantic_locator_work(locator);
     SemanticWork {
-        nested_entries: segment_count.saturating_mul(copies),
-        owned_text_bytes: locator
-            .path()
-            .as_str()
-            .len()
-            .saturating_add(segment_name_bytes)
-            .saturating_mul(copies),
+        nested_entries: work.nested_entries.saturating_mul(copies),
+        owned_text_bytes: work.owned_text_bytes.saturating_mul(copies),
         ..SemanticWork::default()
     }
 }
@@ -980,6 +1249,19 @@ pub(crate) enum CompletionKind {
     Yield,
 }
 
+impl CompletionKind {
+    pub(crate) const fn label(self) -> &'static str {
+        match self {
+            Self::Normal => "normal",
+            Self::Return => "return",
+            Self::Throw => "throw",
+            Self::Break => "break",
+            Self::Continue => "continue",
+            Self::Yield => "yield",
+        }
+    }
+}
+
 pub(crate) struct CompletionRequest<'a> {
     pub(crate) kind: CompletionKind,
     pub(crate) label: Option<&'a str>,
@@ -1016,17 +1298,96 @@ impl CompletionTarget {
     }
 }
 
+/// One typed lifecycle event registered for an owned cleanup scope.
+#[allow(dead_code)] // Constructed by the dependent Rust producer in Lane C.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(crate) enum ScopeCleanupAction {
+    Drop {
+        place: SemanticPlace,
+        behavior: DropBehavior,
+        source: SourceMappingId,
+        evidence: EvidenceId,
+    },
+    ScopeEnd {
+        place: SemanticPlace,
+        source: SourceMappingId,
+        evidence: EvidenceId,
+    },
+}
+
+#[allow(dead_code)] // Accessed by the dependent Rust producer and planner in Lane C.
+impl ScopeCleanupAction {
+    const fn place(&self) -> &SemanticPlace {
+        match self {
+            Self::Drop { place, .. } | Self::ScopeEnd { place, .. } => place,
+        }
+    }
+
+    pub(crate) const fn source(&self) -> SourceMappingId {
+        match self {
+            Self::Drop { source, .. } | Self::ScopeEnd { source, .. } => *source,
+        }
+    }
+
+    pub(crate) const fn evidence(&self) -> EvidenceId {
+        match self {
+            Self::Drop { evidence, .. } | Self::ScopeEnd { evidence, .. } => *evidence,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(crate) enum CleanupRouteOperation {
+    Action(ScopeCleanupAction),
+    Region {
+        cleanup_index: usize,
+        region: CleanupRegionId,
+    },
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct CompletionRoute {
     destination: CompletionTarget,
     cleanups: Box<[CleanupRegionId]>,
+    operations: Box<[CleanupRouteOperation]>,
 }
 
 impl CompletionRoute {
     fn new(destination: CompletionTarget, cleanups: Vec<CleanupRegionId>) -> Self {
+        let operations = cleanups
+            .iter()
+            .copied()
+            .enumerate()
+            .map(|(cleanup_index, region)| CleanupRouteOperation::Region {
+                cleanup_index,
+                region,
+            })
+            .collect();
+        Self::with_operations(destination, cleanups, operations)
+    }
+
+    fn with_operations(
+        destination: CompletionTarget,
+        cleanups: Vec<CleanupRegionId>,
+        operations: Vec<CleanupRouteOperation>,
+    ) -> Self {
+        let mut cleanup_index = 0;
+        for operation in &operations {
+            if let CleanupRouteOperation::Region {
+                cleanup_index: actual_index,
+                region,
+            } = operation
+            {
+                assert_eq!(*actual_index, cleanup_index);
+                assert_eq!(Some(region), cleanups.get(cleanup_index));
+                cleanup_index += 1;
+            }
+        }
+        assert_eq!(cleanup_index, cleanups.len());
         Self {
             destination,
             cleanups: cleanups.into_boxed_slice(),
+            operations: operations.into_boxed_slice(),
         }
     }
 
@@ -1037,13 +1398,23 @@ impl CompletionRoute {
     pub(crate) fn cleanups(&self) -> &[CleanupRegionId] {
         &self.cleanups
     }
+
+    pub(crate) fn operations(&self) -> &[CleanupRouteOperation] {
+        &self.operations
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct CleanupKey {
     region: CleanupRegionId,
     destination: CompletionTarget,
-    outer_cleanups: Box<[CleanupRegionId]>,
+    outer_operations: Box<[CleanupOperationKey]>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+enum CleanupOperationKey {
+    Action(Box<ScopeCleanupAction>),
+    Region(CleanupRegionId),
 }
 
 struct ScopeFrame {
@@ -1104,14 +1475,11 @@ fn derive_blocks(
         if assignments[start].is_some() {
             continue;
         }
-        let candidate = combine_work(
-            derived_work,
-            SemanticWork {
-                blocks: 1,
-                ..SemanticWork::default()
-            },
-        );
-        budget.check(combine_work(base_work, candidate))?;
+        let candidate = derived_work.conservative_add(SemanticWork {
+            blocks: 1,
+            ..SemanticWork::default()
+        });
+        budget.check(base_work.conservative_add(candidate))?;
         derived_work = candidate;
         let block_id = BlockId::try_from_index(blocks.len())
             .expect("block count cannot exceed program-point count");
@@ -1121,14 +1489,11 @@ fn derive_blocks(
             if assignments[cursor.index()].replace(block_id).is_some() {
                 break;
             }
-            let candidate = combine_work(
-                derived_work,
-                SemanticWork {
-                    nested_entries: 1,
-                    ..SemanticWork::default()
-                },
-            );
-            budget.check(combine_work(base_work, candidate))?;
+            let candidate = derived_work.conservative_add(SemanticWork {
+                nested_entries: 1,
+                ..SemanticWork::default()
+            });
+            budget.check(base_work.conservative_add(candidate))?;
             derived_work = candidate;
             members.push(cursor);
             if barriers[cursor.index()] || outgoing[cursor.index()].len() != 1 {
@@ -1243,6 +1608,150 @@ mod tests {
     }
 
     #[test]
+    fn cleanup_routes_preserve_action_order_and_filter_cancellation_by_live_place() {
+        let mut builder = builder();
+        let normal_exit = point(&mut builder, SemanticEffect::NormalExit);
+        let exceptional_exit = point(&mut builder, SemanticEffect::ExceptionalExit);
+        let function = builder.push_scope(
+            None,
+            ScopeBinding::Function {
+                return_target: normal_exit,
+                throw_target: exceptional_exit,
+            },
+        );
+        let region = CleanupRegionId::new(0);
+        let cleanup = builder.push_scope(Some(function), ScopeBinding::Cleanup { region });
+        let local = SemanticPlace::MemoryLocation(MemoryLocationId::new(3));
+        let retained = SemanticPlace::MemoryLocation(MemoryLocationId::new(8));
+        for action in [
+            ScopeCleanupAction::Drop {
+                place: local.clone(),
+                behavior: DropBehavior::Trivial,
+                source: SourceMappingId::new(0),
+                evidence: EvidenceId::new(0),
+            },
+            ScopeCleanupAction::ScopeEnd {
+                place: local.clone(),
+                source: SourceMappingId::new(0),
+                evidence: EvidenceId::new(0),
+            },
+            ScopeCleanupAction::Drop {
+                place: retained.clone(),
+                behavior: DropBehavior::Trivial,
+                source: SourceMappingId::new(0),
+                evidence: EvidenceId::new(0),
+            },
+            ScopeCleanupAction::ScopeEnd {
+                place: retained.clone(),
+                source: SourceMappingId::new(0),
+                evidence: EvidenceId::new(0),
+            },
+        ] {
+            builder
+                .register_scope_cleanup_action(cleanup, action)
+                .expect("cleanup action fits the procedure budget");
+        }
+
+        let return_route = builder
+            .resolve_completion(
+                cleanup,
+                &CompletionRequest::new(CompletionKind::Return, None),
+            )
+            .expect("return crosses the cleanup scope");
+        assert_eq!(return_route.cleanups(), &[region]);
+        assert!(matches!(
+            return_route.operations(),
+            [
+                CleanupRouteOperation::Action(ScopeCleanupAction::Drop { place: first, .. }),
+                CleanupRouteOperation::Action(ScopeCleanupAction::ScopeEnd { place: second, .. }),
+                CleanupRouteOperation::Action(ScopeCleanupAction::Drop { place: third, .. }),
+                CleanupRouteOperation::Action(ScopeCleanupAction::ScopeEnd { place: fourth, .. }),
+                CleanupRouteOperation::Region { region: actual, .. }
+            ] if first == &local && second == &local && third == &retained && fourth == &retained && actual == &region
+        ));
+
+        let normal_route = builder.normal_cleanup_completion(region, normal_exit);
+        assert_eq!(normal_route.operations(), return_route.operations());
+
+        let cancellation = builder
+            .resolve_cancellation(cleanup, exceptional_exit, std::slice::from_ref(&retained))
+            .expect("cancellation reaches the function boundary");
+        assert_eq!(
+            cancellation.destination().edge_kind(),
+            ControlEdgeKind::Exceptional
+        );
+        assert!(matches!(
+            cancellation.operations(),
+            [
+                CleanupRouteOperation::Action(ScopeCleanupAction::Drop { place, .. }),
+                CleanupRouteOperation::Action(ScopeCleanupAction::ScopeEnd { place: ended, .. }),
+                CleanupRouteOperation::Region { .. }
+            ] if place == &retained && ended == &retained
+        ));
+    }
+
+    #[test]
+    fn cleanup_specialization_reuse_ignores_route_local_region_indices() {
+        let mut builder = builder();
+        let normal_exit = point(&mut builder, SemanticEffect::NormalExit);
+        let exceptional_exit = point(&mut builder, SemanticEffect::ExceptionalExit);
+        let function = builder.push_scope(
+            None,
+            ScopeBinding::Function {
+                return_target: normal_exit,
+                throw_target: exceptional_exit,
+            },
+        );
+        let outer = builder.push_scope(
+            Some(function),
+            ScopeBinding::Cleanup {
+                region: CleanupRegionId::new(9),
+            },
+        );
+        let shared = builder.push_scope(
+            Some(outer),
+            ScopeBinding::Cleanup {
+                region: CleanupRegionId::new(4),
+            },
+        );
+        let route_without_extra_scope = builder
+            .resolve_completion(
+                shared,
+                &CompletionRequest::new(CompletionKind::Return, None),
+            )
+            .expect("return resolves through shared cleanup");
+        let inner = builder.push_scope(
+            Some(shared),
+            ScopeBinding::Cleanup {
+                region: CleanupRegionId::new(2),
+            },
+        );
+        let route_with_extra_scope = builder
+            .resolve_completion(inner, &CompletionRequest::new(CompletionKind::Return, None))
+            .expect("nested return resolves through shared cleanup");
+
+        let (first, first_created) = builder
+            .cleanup_specialization(
+                &route_without_extra_scope,
+                0,
+                SourceMappingId::new(0),
+                EvidenceId::new(0),
+            )
+            .expect("first shared cleanup specialization");
+        let (second, second_created) = builder
+            .cleanup_specialization(
+                &route_with_extra_scope,
+                1,
+                SourceMappingId::new(0),
+                EvidenceId::new(0),
+            )
+            .expect("second shared cleanup specialization");
+        assert!(first_created);
+        assert!(!second_created);
+        assert_eq!(first, second);
+    }
+
+    #[test]
     fn iterative_driver_handles_deep_work_without_recursion() {
         let mut builder = builder();
         builder
@@ -1257,16 +1766,6 @@ mod tests {
                 },
             )
             .expect("deep iterative chain");
-    }
-
-    #[test]
-    fn builder_budget_includes_procedure_and_retained_locator_identity() {
-        let builder = builder();
-        let work = builder.prospective_work();
-
-        assert_eq!(work.procedures, 1);
-        assert!(work.nested_entries >= 2);
-        assert!(work.owned_text_bytes > 0);
     }
 
     #[test]
@@ -1374,64 +1873,6 @@ mod tests {
             assert_eq!(error.attempted(), baseline + text_bytes);
             assert_eq!(builder.prospective_work(), before);
         }
-    }
-
-    #[test]
-    fn structured_continue_retains_its_loop_specific_edge_kind() {
-        let mut builder = builder();
-        let normal_exit = point(&mut builder, SemanticEffect::NormalExit);
-        let exceptional_exit = point(&mut builder, SemanticEffect::ExceptionalExit);
-        let loop_test = point(&mut builder, SemanticEffect::Entry);
-        let function = builder.push_scope(
-            None,
-            ScopeBinding::Function {
-                return_target: normal_exit,
-                throw_target: exceptional_exit,
-            },
-        );
-        let loop_scope = builder.push_scope(
-            Some(function),
-            ScopeBinding::Loop {
-                label: Some("outer".into()),
-                break_target: normal_exit,
-                break_edge_kind: ControlEdgeKind::Normal,
-                continue_target: loop_test,
-                continue_edge_kind: ControlEdgeKind::LoopBack,
-            },
-        );
-
-        let route = builder
-            .resolve_completion(
-                loop_scope,
-                &CompletionRequest::new(CompletionKind::Continue, Some("outer")),
-            )
-            .expect("labeled continue should resolve to the labeled loop");
-        assert_eq!(route.destination().target(), loop_test);
-        assert_eq!(route.destination().edge_kind(), ControlEdgeKind::LoopBack);
-    }
-
-    #[test]
-    fn structured_break_retains_its_downstream_edge_kind() {
-        let mut builder = builder();
-        let outer_test = point(&mut builder, SemanticEffect::Entry);
-        let breakable = builder.push_scope(
-            None,
-            ScopeBinding::Breakable {
-                label: None,
-                accepts_unlabeled: true,
-                break_target: outer_test,
-                break_edge_kind: ControlEdgeKind::LoopBack,
-            },
-        );
-
-        let route = builder
-            .resolve_completion(
-                breakable,
-                &CompletionRequest::new(CompletionKind::Break, None),
-            )
-            .expect("break should resolve through the nested breakable scope");
-        assert_eq!(route.destination().target(), outer_test);
-        assert_eq!(route.destination().edge_kind(), ControlEdgeKind::LoopBack);
     }
 
     #[test]
@@ -1561,29 +2002,6 @@ mod tests {
     }
 
     #[test]
-    fn function_scope_does_not_treat_yield_as_procedure_return() {
-        let mut builder = builder();
-        let normal_exit = point(&mut builder, SemanticEffect::NormalExit);
-        let exceptional_exit = point(&mut builder, SemanticEffect::ExceptionalExit);
-        let function = builder.push_scope(
-            None,
-            ScopeBinding::Function {
-                return_target: normal_exit,
-                throw_target: exceptional_exit,
-            },
-        );
-
-        assert!(
-            builder
-                .resolve_completion(
-                    function,
-                    &CompletionRequest::new(CompletionKind::Yield, None),
-                )
-                .is_none()
-        );
-    }
-
-    #[test]
     fn disconnected_scope_intercepts_control_completions_before_live_outer_scopes() {
         let mut builder = builder();
         let live_exit = point(&mut builder, SemanticEffect::NormalExit);
@@ -1628,24 +2046,6 @@ mod tests {
             assert_eq!(route.destination().target(), dead_control);
             assert_eq!(route.destination().edge_kind(), edge_kind);
         }
-    }
-
-    #[test]
-    fn block_derivation_checks_the_budget_before_retaining_each_block() {
-        let mut limits = SemanticBudget::default().limits();
-        limits.blocks = 2;
-        let budget = SemanticBudget::new(limits).expect("positive limits");
-        let mut builder = builder_with_budget(&budget);
-        point(&mut builder, SemanticEffect::Entry);
-        point(&mut builder, SemanticEffect::NormalExit);
-        point(&mut builder, SemanticEffect::ExceptionalExit);
-
-        let exceeded = builder
-            .finish_with_work()
-            .expect_err("three disconnected points require three blocks");
-        assert_eq!(exceeded.dimension(), SemanticBudgetDimension::Blocks);
-        assert_eq!(exceeded.limit(), 2);
-        assert_eq!(exceeded.attempted(), 3);
     }
 
     #[test]
@@ -1829,5 +2229,23 @@ mod tests {
         assert!(created);
         assert_ne!(yield_entry, return_entry);
         assert_ne!(yield_entry, throw_entry);
+    }
+
+    #[test]
+    fn block_derivation_checks_the_budget_before_retaining_each_block() {
+        let mut limits = SemanticBudget::default().limits();
+        limits.blocks = 2;
+        let budget = SemanticBudget::new(limits).expect("positive limits");
+        let mut builder = builder_with_budget(&budget);
+        point(&mut builder, SemanticEffect::Entry);
+        point(&mut builder, SemanticEffect::NormalExit);
+        point(&mut builder, SemanticEffect::ExceptionalExit);
+
+        let exceeded = builder
+            .finish_with_work()
+            .expect_err("three disconnected points require three blocks");
+        assert_eq!(exceeded.dimension(), SemanticBudgetDimension::Blocks);
+        assert_eq!(exceeded.limit(), 2);
+        assert_eq!(exceeded.attempted(), 3);
     }
 }

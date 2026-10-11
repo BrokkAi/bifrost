@@ -10,17 +10,8 @@ use brokk_bifrost_core::analyzer::tree_walk::{WalkControl, node_range, walk_name
 use brokk_bifrost_core::analyzer::{CodeUnit, ProjectFile};
 use tree_sitter::Node;
 
-pub fn node_text<'a>(node: Node<'_>, source: &'a str) -> &'a str {
-    brokk_bifrost_core::analyzer::common::node_source_text(node, source)
-}
-
-/// Intern one qualified-name segment in the process-global interner. Shared by
-/// the JavaScript and TypeScript adapters (both build `FqName`s the same way:
-/// `package_name` is always empty, so every chain starts fresh from either a
-/// parent's own `fq` or one of the synthetic file-scope prefixes below).
-pub fn js_ts_segment(text: &str, kind: SegmentKind) -> SegmentId {
-    segment_interner().intern(text, kind)
-}
+pub use brokk_bifrost_core::analyzer::common::node_source_text as node_text;
+pub use brokk_bifrost_core::analyzer::tree_walk::root_node;
 
 /// The file's own base name (with extension) as a single [`SegmentKind::Path`]
 /// segment. Its text may itself contain literal dots (`utils.test.js`), which
@@ -34,7 +25,7 @@ fn file_name_path_segment(file: &ProjectFile) -> SegmentId {
         .file_name()
         .and_then(|name| name.to_str())
         .unwrap_or("module");
-    js_ts_segment(name, SegmentKind::Path)
+    segment_interner().intern(name, SegmentKind::Path)
 }
 
 pub fn module_code_unit(file: &ProjectFile) -> CodeUnit {
@@ -55,13 +46,88 @@ pub fn trim_statement(text: &str) -> String {
     text.trim().trim_end_matches(';').trim().to_string()
 }
 
+pub(crate) fn export_is_default(node: Node<'_>, source: &str) -> bool {
+    (0..node.child_count()).any(|index| {
+        node.child(index)
+            .is_some_and(|child| child.kind() == "default" || node_text(child, source) == "default")
+    })
+}
+
+pub(crate) fn object_literal_property_kind(node: Node<'_>) -> CodeUnitType {
+    if node.kind() == "method_definition"
+        || node
+            .child_by_field_name("value")
+            .is_some_and(|value| matches!(value.kind(), "arrow_function" | "function_expression"))
+    {
+        CodeUnitType::Function
+    } else {
+        CodeUnitType::Field
+    }
+}
+
+pub(crate) fn is_simple_js_ts_initializer(node: Node<'_>) -> bool {
+    matches!(
+        node.kind(),
+        "string"
+            | "number"
+            | "true"
+            | "false"
+            | "null"
+            | "undefined"
+            | "regex"
+            | "template_string"
+            | "unary_expression"
+            | "binary_expression"
+            | "identifier"
+            | "member_expression"
+    )
+}
+
+pub(crate) fn collect_return_object_literals<'tree>(
+    node: Node<'tree>,
+    root_id: usize,
+    out: &mut Vec<Node<'tree>>,
+    mut is_nested_boundary: impl FnMut(Node<'tree>) -> bool,
+    mut object_literal_value: impl FnMut(Node<'tree>) -> Option<Node<'tree>>,
+) {
+    let mut stack = vec![node];
+    while let Some(node) = stack.pop() {
+        if node.id() != root_id && is_nested_boundary(node) {
+            continue;
+        }
+
+        if node.kind() == "return_statement" {
+            let mut cursor = node.walk();
+            if let Some(object) = node
+                .named_children(&mut cursor)
+                .find_map(&mut object_literal_value)
+            {
+                out.push(object);
+            }
+            continue;
+        }
+
+        if node.kind() == "arrow_function"
+            && let Some(body) = node.child_by_field_name("body")
+            && let Some(object) = object_literal_value(body)
+        {
+            out.push(object);
+        }
+
+        for index in (0..node.named_child_count()).rev() {
+            if let Some(child) = node.named_child(index) {
+                stack.push(child);
+            }
+        }
+    }
+}
+
 // The helpers below are shared verbatim between the JavaScript and TypeScript
 // adapters (`javascript/mod.rs` / `typescript/mod.rs`): each language used to
 // carry a byte-identical private copy under a `js_`/`ts_` prefix. None of them
 // touch dialect-specific grammar (no TSX/type-annotation handling lives here),
-// so there is no per-language hole to parameterize — they are pure duplicates,
-// not twins. See `.agents/docs/cross-language-duplication-survey.md` (CPD
-// family #3) for the survey that identified them.
+// so there is no per-language hole to parameterize -- they are pure duplicates,
+// not twins.
 
 /// Adds a synthetic `default` CodeUnit for an anonymous `export default ...`
 /// declaration (function/class/object literal with no name of its own).
@@ -80,7 +146,7 @@ pub(crate) fn add_default_export_unit(
     } else {
         SegmentKind::Member
     };
-    let fq = FqName::new().with_pushed(js_ts_segment("default", segment_kind));
+    let fq = FqName::new().with_pushed(segment_interner().intern("default", segment_kind));
     let code_unit = CodeUnit::new_fq(file.clone(), kind, "", "default", fq);
     parsed.add_code_unit(
         code_unit.clone(),
@@ -89,12 +155,13 @@ pub(crate) fn add_default_export_unit(
         None,
         Some(code_unit.clone()),
     );
-    parsed.record_materialization(MaterializationRecord::Export {
-        range: node_range(export),
-        form: ExportForm::DefaultAnonymous,
-        exported_name: "default".to_string(),
-        target: Some(code_unit.clone()),
-    });
+    record_export_row(
+        parsed,
+        export,
+        ExportForm::DefaultAnonymous,
+        "default".to_string(),
+        Some(code_unit.clone()),
+    );
     code_unit
 }
 
@@ -113,20 +180,21 @@ pub fn record_named_export(
     let Some(name) = declaration.child_by_field_name("name") else {
         return;
     };
-    parsed.record_materialization(MaterializationRecord::Export {
-        range: node_range(export),
-        form: if is_default {
+    record_export_row(
+        parsed,
+        export,
+        if is_default {
             ExportForm::DefaultNamed
         } else {
             ExportForm::Named
         },
-        exported_name: if is_default {
+        if is_default {
             "default".to_string()
         } else {
             node_source_text(name, source).trim().to_string()
         },
-        target: None,
-    });
+        None,
+    );
 }
 
 /// Records one export row per binder of each declarator of an exported
@@ -157,12 +225,7 @@ pub fn record_named_declarator_exports(
             if exported_name.is_empty() {
                 continue;
             }
-            parsed.record_materialization(MaterializationRecord::Export {
-                range: node_range(export),
-                form: ExportForm::Named,
-                exported_name,
-                target: None,
-            });
+            record_export_row(parsed, export, ExportForm::Named, exported_name, None);
         }
     }
 }
@@ -170,12 +233,81 @@ pub fn record_named_declarator_exports(
 /// Records the `export default name` re-export row: it points at an existing
 /// binding, so it materializes no declaration but is still an export fact.
 pub fn record_default_reexport(export: Node<'_>, parsed: &mut ParsedFile) {
+    record_export_row(
+        parsed,
+        export,
+        ExportForm::DefaultNamed,
+        "default".to_string(),
+        None,
+    );
+}
+
+fn record_export_row(
+    parsed: &mut ParsedFile,
+    export: Node<'_>,
+    form: ExportForm,
+    exported_name: String,
+    target: Option<CodeUnit>,
+) {
     parsed.record_materialization(MaterializationRecord::Export {
         range: node_range(export),
-        form: ExportForm::DefaultNamed,
-        exported_name: "default".to_string(),
-        target: None,
+        form,
+        exported_name,
+        target,
     });
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn visit_default_export_value<'export, 'value, 'source>(
+    file: &ProjectFile,
+    source: &str,
+    export: Node<'export>,
+    value: Node<'value>,
+    parsed: &mut JsTsParsedFile<'source>,
+    mut visit_function: impl FnMut(
+        &ProjectFile,
+        &str,
+        Node<'export>,
+        Node<'value>,
+        &mut JsTsParsedFile<'source>,
+    ),
+    mut visit_class: impl FnMut(
+        &ProjectFile,
+        &str,
+        Node<'export>,
+        Node<'value>,
+        &mut JsTsParsedFile<'source>,
+    ),
+    mut visit_object_properties: impl FnMut(
+        &ProjectFile,
+        &str,
+        Node<'value>,
+        &CodeUnit,
+        &CodeUnit,
+        &mut JsTsParsedFile<'source>,
+    ),
+) {
+    match value.kind() {
+        "arrow_function" | "function_expression" | "generator_function" => {
+            visit_function(file, source, export, value, parsed);
+        }
+        "class" => visit_class(file, source, export, value, parsed),
+        "object" => {
+            let code_unit =
+                add_default_export_unit(file, source, export, CodeUnitType::Field, parsed);
+            parsed.add_signature(code_unit.clone(), trim_statement(node_text(export, source)));
+            visit_object_properties(file, source, value, &code_unit, &code_unit, parsed);
+        }
+        // `export default name` and `export default object.member` point at an
+        // existing binding. Every other expression creates an anonymous default
+        // value that needs its own source-backed declaration (#2301).
+        "identifier" | "member_expression" => record_default_reexport(export, parsed),
+        _ => {
+            let code_unit =
+                add_default_export_unit(file, source, export, CodeUnitType::Field, parsed);
+            parsed.add_signature(code_unit, trim_statement(node_text(export, source)));
+        }
+    }
 }
 
 /// If `node` is a `this.<property>` member expression with a nameable
@@ -257,7 +389,7 @@ pub fn file_scoped_field_name(file: &ProjectFile, name: &str) -> String {
 pub fn file_scoped_field_fq(file: &ProjectFile, name: &str) -> FqName {
     FqName::new()
         .with_pushed(file_name_path_segment(file))
-        .with_pushed(js_ts_segment(name, SegmentKind::Member))
+        .with_pushed(segment_interner().intern(name, SegmentKind::Member))
 }
 
 /// The structured identity of a file-scoped *type* declaration: the same
@@ -270,7 +402,7 @@ pub fn file_scoped_field_fq(file: &ProjectFile, name: &str) -> FqName {
 pub fn file_scoped_type_fq(file: &ProjectFile, name: &str) -> FqName {
     FqName::new()
         .with_pushed(file_name_path_segment(file))
-        .with_pushed(js_ts_segment(name, SegmentKind::Type))
+        .with_pushed(segment_interner().intern(name, SegmentKind::Type))
 }
 
 pub type TopLevelFieldIdentity = fn(&ProjectFile, &str) -> (String, FqName);
@@ -285,7 +417,7 @@ pub fn file_scoped_field_identity(file: &ProjectFile, name: &str) -> (String, Fq
 pub fn program_scoped_field_identity(_file: &ProjectFile, name: &str) -> (String, FqName) {
     (
         name.to_owned(),
-        FqName::new().with_pushed(js_ts_segment(name, SegmentKind::Member)),
+        FqName::new().with_pushed(segment_interner().intern(name, SegmentKind::Member)),
     )
 }
 
@@ -318,7 +450,7 @@ pub(crate) fn add_destructured_binder_units(
                 parent
                     .fq()
                     .clone()
-                    .with_pushed(js_ts_segment(name, SegmentKind::Member)),
+                    .with_pushed(segment_interner().intern(name, SegmentKind::Member)),
             ),
             None => top_level_identity(file, name),
         };
@@ -352,14 +484,6 @@ pub fn module_scoped_field_uses_file_name(code_unit: &CodeUnit) -> bool {
         return false;
     };
     code_unit.short_name().starts_with(&format!("{file_name}."))
-}
-
-/// Walks up to the outermost ancestor of `node` (the parse tree root).
-pub fn root_node(mut node: Node<'_>) -> Node<'_> {
-    while let Some(parent) = node.parent() {
-        node = parent;
-    }
-    node
 }
 
 /// Collects every function-declaration or function-valued variable-declarator
@@ -440,4 +564,37 @@ pub fn call_is_schema_object_builder(call: Node<'_>, source: &str) -> bool {
         return false;
     };
     node_text(property, source).trim() == "object"
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ShapePreservation {
+    Preserves,
+    DoesNotPreserve,
+    Unknown,
+}
+
+pub(crate) fn call_preserves_object_argument_shape(
+    call: Node<'_>,
+    source: &str,
+    argument_index: usize,
+    preservation: ShapePreservation,
+) -> bool {
+    (argument_index == 0 && call_is_schema_object_builder(call, source))
+        || preservation == ShapePreservation::Preserves
+}
+
+pub(crate) fn surface_call_preserves_object_argument_shape(
+    call: Node<'_>,
+    source: &str,
+    argument_index: usize,
+    preservation: ShapePreservation,
+) -> bool {
+    if argument_index == 0 && call_is_schema_object_builder(call, source) {
+        return true;
+    }
+    match preservation {
+        ShapePreservation::Preserves => true,
+        ShapePreservation::DoesNotPreserve => false,
+        ShapePreservation::Unknown => call_has_likely_surface_factory_name(call, source),
+    }
 }

@@ -12,13 +12,13 @@
 
 use std::collections::VecDeque;
 
-use super::correlations::CorrelationError;
+use super::correlations::{CorrelationError, charge_edges, charge_entries, check_cancelled};
 use crate::analyzer::WorkspaceAnalyzer;
 use crate::analyzer::semantic::{
     CancellationToken, ClassAtom, ClassIdentity, GuardFact, GuardPredicate, MemberAccessQuery,
     MemoryLocationId, MemoryLocationKind, ProcedureHandle, ProcedureSemantics, ProgramPointId,
-    SemanticBudget, SemanticEffect, SemanticGapImpact, SemanticValueKind, SemanticWork,
-    TypeFlowAdapter, ValueFlowSnapshot, ValueId,
+    SemanticBudget, SemanticEffect, SemanticGapImpact, SemanticValueKind, TypeFlowAdapter,
+    ValueFlowSnapshot, ValueId,
 };
 use crate::hash::{HashMap, HashSet};
 
@@ -66,15 +66,7 @@ struct State {
 
 impl State {
     fn copy(&mut self, source: ValueId, target: ValueId, tracked: &HashSet<ValueId>) {
-        if source == target || !tracked.contains(&target) {
-            return;
-        }
-        if let Some(origins) = self.origins.get(&source) {
-            let origins = origins.clone();
-            self.origins.insert(target, origins);
-        } else {
-            self.origins.remove(&target);
-        }
+        super::copy_tracked_value(&mut self.origins, source, target, tracked);
     }
 
     fn is_receiver(&self, value: ValueId) -> bool {
@@ -103,7 +95,7 @@ impl State {
         budget: &mut SemanticBudget,
         cancellation: &CancellationToken,
     ) -> Result<bool, CorrelationError> {
-        check_cancelled(cancellation)?;
+        check_cancelled(Some(cancellation))?;
         let before_size = self.size();
         let before = self.clone();
         self.origins.retain(|value, origins| {
@@ -116,7 +108,7 @@ impl State {
         });
         for (field, incoming) in self.fields.iter_mut().zip(&other.fields) {
             for alternative in incoming {
-                check_cancelled(cancellation)?;
+                check_cancelled(Some(cancellation))?;
                 if field.iter().any(|old| {
                     old.version == alternative.version
                         && old
@@ -190,7 +182,7 @@ impl FieldAccesses {
         let mut location_members = Vec::<(MemoryLocationId, Box<str>)>::new();
         let mut queried = HashSet::default();
         for location in procedure.semantics().memory_locations() {
-            check_cancelled(cancellation)?;
+            check_cancelled(Some(cancellation))?;
             charge_entries(budget, 1)?;
             if let MemoryLocationKind::Field { base, .. } = location.kind {
                 queried.insert(base);
@@ -220,7 +212,7 @@ impl FieldAccesses {
         charge_entries(budget, members.len())?;
         let mut truthiness_is_pure = Vec::with_capacity(members.len());
         for member in &members {
-            check_cancelled(cancellation)?;
+            check_cancelled(Some(cancellation))?;
             let Some(slot) = field_slots.slot(class, member) else {
                 truthiness_is_pure.push(false);
                 continue;
@@ -231,7 +223,7 @@ impl FieldAccesses {
             }
             let mut pure = true;
             for (atom, _) in &slot.atoms {
-                check_cancelled(cancellation)?;
+                check_cancelled(Some(cancellation))?;
                 charge_entries(budget, 1)?;
                 if !matches!(atom, ClassAtom::Class(class) if adapter.truthiness_is_pure(workspace, class))
                 {
@@ -243,7 +235,7 @@ impl FieldAccesses {
         }
         let mut pure_reads = HashSet::default();
         for (field, member) in members.iter().enumerate() {
-            check_cancelled(cancellation)?;
+            check_cancelled(Some(cancellation))?;
             charge_entries(budget, 1)?;
             let Some(slot) = field_slots.slot(class, member) else {
                 continue;
@@ -252,7 +244,7 @@ impl FieldAccesses {
                 continue;
             }
             for (location, accessed_member) in &location_members {
-                check_cancelled(cancellation)?;
+                check_cancelled(Some(cancellation))?;
                 charge_entries(budget, 1)?;
                 if slot.atoms.iter().all(|(atom, _)| {
                     matches!(atom, ClassAtom::Class(class) if adapter.member_access_is_pure(workspace, class, accessed_member))
@@ -265,7 +257,7 @@ impl FieldAccesses {
         let mut version_slots = vec![None; members.len()];
         let mut version_slot_count = 0;
         for point in procedure.semantics().points() {
-            check_cancelled(cancellation)?;
+            check_cancelled(Some(cancellation))?;
             charge_entries(budget, point.events.len().saturating_add(1))?;
             for event in &point.events {
                 let SemanticEffect::MemoryLoad { location, .. } = event.effect else {
@@ -282,7 +274,7 @@ impl FieldAccesses {
         }
         let mut guards_by_point = HashMap::<ProgramPointId, Vec<usize>>::default();
         for (guard_index, guard) in procedure.semantics().guard_facts().iter().enumerate() {
-            check_cancelled(cancellation)?;
+            check_cancelled(Some(cancellation))?;
             charge_entries(budget, 1)?;
             guards_by_point
                 .entry(guard.point)
@@ -331,7 +323,7 @@ fn tracked_values(
     cancellation: &CancellationToken,
 ) -> Result<HashSet<ValueId>, CorrelationError> {
     for guard in semantics.guard_facts() {
-        check_cancelled(cancellation)?;
+        check_cancelled(Some(cancellation))?;
         charge_entries(budget, 1)?;
         if let Some(subject) = guard_origin_subject(guard) {
             queried.insert(subject);
@@ -339,7 +331,7 @@ fn tracked_values(
     }
     let mut sources_of = HashMap::<ValueId, Vec<ValueId>>::default();
     for point in semantics.points() {
-        check_cancelled(cancellation)?;
+        check_cancelled(Some(cancellation))?;
         charge_entries(budget, point.events.len().saturating_add(1))?;
         for event in &point.events {
             let (source, target) = match event.effect {
@@ -357,22 +349,7 @@ fn tracked_values(
             sources_of.entry(target).or_default().push(source);
         }
     }
-    let mut tracked = queried.clone();
-    let mut pending = queried.into_iter().collect::<Vec<_>>();
-    while let Some(target) = pending.pop() {
-        check_cancelled(cancellation)?;
-        charge_entries(budget, 1)?;
-        let Some(sources) = sources_of.get(&target) else {
-            continue;
-        };
-        charge_entries(budget, sources.len())?;
-        for &source in sources {
-            if tracked.insert(source) {
-                pending.push(source);
-            }
-        }
-    }
-    Ok(tracked)
+    super::tracked_copy_sources(&sources_of, queried, budget, cancellation)
 }
 
 /// One point's effect on the flow state, and the loads it refines.
@@ -397,7 +374,7 @@ fn transfer(
         .iter()
         .enumerate()
     {
-        check_cancelled(cancellation)?;
+        check_cancelled(Some(cancellation))?;
         match event.effect {
             SemanticEffect::Assignment { target, value } => {
                 state.copy(value, target, &accesses.tracked);
@@ -476,7 +453,7 @@ fn transfer(
                                 matches!(origin, Origin::Read { field: candidate, .. } if *candidate == field)
                             })
                         });
-                        check_cancelled(cancellation)?;
+                        check_cancelled(Some(cancellation))?;
                         state.fields[slot] = vec![FieldAlternative {
                             version: FieldVersion::Store {
                                 point,
@@ -530,7 +507,7 @@ fn refine_edge(
     };
     let guards = procedure.semantics().guard_facts();
     for &guard_index in guard_indexes {
-        check_cancelled(cancellation)?;
+        check_cancelled(Some(cancellation))?;
         let guard = &guards[guard_index];
         debug_assert_eq!(
             guard.point, point,
@@ -574,7 +551,7 @@ fn refine_edge(
         let field = *field;
         let slot = accesses.version_slots[field].expect("a read member carries version state");
         for alternative in &mut state.fields[slot] {
-            check_cancelled(cancellation)?;
+            check_cancelled(Some(cancellation))?;
             if origins.contains(&Origin::Read {
                 field,
                 version: alternative.version,
@@ -585,37 +562,6 @@ fn refine_edge(
             }
         }
     }
-    Ok(())
-}
-
-fn check_cancelled(cancellation: &CancellationToken) -> Result<(), CorrelationError> {
-    if cancellation.is_cancelled() {
-        return Err(CorrelationError::Cancelled {
-            timed_out: cancellation.is_timed_out(),
-        });
-    }
-    Ok(())
-}
-
-fn charge_entries(budget: &mut SemanticBudget, count: usize) -> Result<(), CorrelationError> {
-    if count == 0 {
-        return Ok(());
-    }
-    budget.charge(SemanticWork {
-        nested_entries: count,
-        ..SemanticWork::default()
-    })?;
-    Ok(())
-}
-
-fn charge_edges(budget: &mut SemanticBudget, count: usize) -> Result<(), CorrelationError> {
-    if count == 0 {
-        return Ok(());
-    }
-    budget.charge(SemanticWork {
-        control_edges: count,
-        ..SemanticWork::default()
-    })?;
     Ok(())
 }
 
@@ -654,7 +600,7 @@ pub(super) fn derive(
     let semantics = procedure.semantics();
     let mut origins = HashMap::default();
     for value in semantics.values() {
-        check_cancelled(cancellation)?;
+        check_cancelled(Some(cancellation))?;
         if !accesses.tracked.contains(&value.id) {
             continue;
         }
@@ -685,7 +631,7 @@ pub(super) fn derive(
     let mut queued = vec![false; point_count];
     queued[semantics.entry_point().index()] = true;
     while let Some(point) = pending.pop_front() {
-        check_cancelled(cancellation)?;
+        check_cancelled(Some(cancellation))?;
         queued[point.index()] = false;
         // The visit's working copy is transient.  What this fixpoint keeps is
         // the state stored per point, charged where it is stored.
@@ -702,7 +648,7 @@ pub(super) fn derive(
             cancellation,
         )?;
         for (edge_id, edge) in semantics.successor_edges(point) {
-            check_cancelled(cancellation)?;
+            check_cancelled(Some(cancellation))?;
             charge_edges(budget, 1)?;
             let mut next = state.clone();
             refine_edge(
@@ -728,7 +674,7 @@ pub(super) fn derive(
     }
     let mut loads = Vec::new();
     for point in semantics.points() {
-        check_cancelled(cancellation)?;
+        check_cancelled(Some(cancellation))?;
         if let Some(mut state) = incoming[point.id.index()].take() {
             let refined = transfer(
                 procedure,
@@ -758,6 +704,7 @@ mod tests {
     use crate::analyzer::{AnalyzerConfig, Language};
     use crate::inline_project::InlineTestProject;
     use crate::type_flow::FieldSlotIndex;
+    use brokk_bifrost_test_macros::hardwon;
 
     const SOURCE: &str = concat!(
         "class Box:\n",
@@ -820,14 +767,9 @@ mod tests {
     }
 
     #[test]
-    fn a_member_the_procedure_only_stores_carries_no_version_state() {
-        assert!(
-            derive_named("__init__").is_empty(),
-            "a procedure that reads back no member has no load to refine"
-        );
-    }
-
-    #[test]
+    #[hardwon(
+        "#3124+#3129+#3152: 271660e00562: field-version refinement must retain only loaded member state"
+    )]
     fn a_member_the_procedure_loads_still_carries_version_state() {
         let loads = derive_named("read");
         assert!(
@@ -839,6 +781,17 @@ mod tests {
         assert!(
             loads.iter().all(|load| load.member.as_ref() != "second"),
             "a member this procedure never loads produces no refinement: {loads:#?}"
+        );
+    }
+
+    #[hardwon(
+        "#3129: a store-only procedure allocated field refinement version state it could never read"
+    )]
+    #[test]
+    fn a_member_the_procedure_only_stores_carries_no_version_state() {
+        assert!(
+            derive_named("__init__").is_empty(),
+            "a procedure that reads back no member has no load to refine"
         );
     }
 }

@@ -20,8 +20,10 @@ use crate::analyzer::{
     ingest_source_bytes,
 };
 use crate::git_file::{list_git_files_at_revision, read_git_file_bytes};
+use crate::mcp_common::contains_glob_syntax;
 use crate::tool_arguments::GitHistoryOverlay;
 use crate::{SearchToolsService, collect_workspace_files};
+use brokk_bifrost_analysis::path_utils::is_windows_absolute_path;
 use glob::Pattern;
 use std::collections::BTreeSet;
 use std::path::{Component, Path, PathBuf};
@@ -355,7 +357,7 @@ fn normalize_literal_source_path(raw: &str, root: &Path) -> Result<PathBuf, Stri
                 .map_err(|err| format!("Failed to resolve source path {}: {err}", abs.display()))?;
             let rel = normalized_abs
                 .strip_prefix(&canonical_root)
-                .map_err(|_| absolute_source_outside_workspace_error(raw, root))?;
+                .map_err(|_| crate::mcp_common::absolute_path_outside_workspace_error(raw, root))?;
             return normalize_relative_path(&rel.to_string_lossy());
         }
         return normalize_relative_path(&normalize_absolute_source_string(raw, root)?);
@@ -367,24 +369,9 @@ fn normalize_literal_source_path(raw: &str, root: &Path) -> Result<PathBuf, Stri
 fn normalize_absolute_source_string(raw: &str, root: &Path) -> Result<String, String> {
     let raw_norm = raw.replace('\\', "/");
     let root_norm = root.display().to_string().replace('\\', "/");
-    let root_trimmed = root_norm.trim_end_matches('/');
-
-    if raw_norm == root_trimmed {
-        return Ok(String::new());
-    }
-
-    raw_norm
-        .strip_prefix(&format!("{root_trimmed}/"))
+    crate::mcp_common::strip_workspace_root(&raw_norm, &root_norm)
         .map(str::to_string)
-        .ok_or_else(|| absolute_source_outside_workspace_error(raw, root))
-}
-
-fn absolute_source_outside_workspace_error(raw: &str, root: &Path) -> String {
-    format!(
-        "absolute path is outside active workspace: {} (workspace: {})",
-        raw,
-        root.display()
-    )
+        .ok_or_else(|| crate::mcp_common::absolute_path_outside_workspace_error(raw, root))
 }
 
 fn normalize_relative_path(raw: &str) -> Result<PathBuf, String> {
@@ -405,18 +392,6 @@ fn normalize_relative_path(raw: &str) -> Result<PathBuf, String> {
     Ok(rel)
 }
 
-fn contains_glob_syntax(raw: &str) -> bool {
-    raw.contains(['*', '?', '['])
-}
-
 fn looks_like_absolute_path(raw: &str) -> bool {
     Path::new(raw).is_absolute() || is_windows_absolute_path(raw)
-}
-
-fn is_windows_absolute_path(raw: &str) -> bool {
-    let bytes = raw.as_bytes();
-    bytes.len() >= 3
-        && bytes[0].is_ascii_alphabetic()
-        && bytes[1] == b':'
-        && matches!(bytes[2], b'/' | b'\\')
 }

@@ -3,6 +3,7 @@ use std::hash::{Hash, Hasher};
 use std::mem::size_of;
 use std::sync::Arc;
 
+use crate::analyzer::Range;
 use crate::compact_graph::CompactRows;
 use crate::hash::{HashMap, HashSet};
 
@@ -549,23 +550,23 @@ impl Hasher for MaterializationFingerprintHasher {
     }
 
     fn write_u8(&mut self, value: u8) {
-        self.0.push(&value.to_le_bytes());
+        self.write(&value.to_le_bytes());
     }
 
     fn write_u16(&mut self, value: u16) {
-        self.0.push(&value.to_le_bytes());
+        self.write(&value.to_le_bytes());
     }
 
     fn write_u32(&mut self, value: u32) {
-        self.0.push(&value.to_le_bytes());
+        self.write(&value.to_le_bytes());
     }
 
     fn write_u64(&mut self, value: u64) {
-        self.0.push(&value.to_le_bytes());
+        self.write(&value.to_le_bytes());
     }
 
     fn write_u128(&mut self, value: u128) {
-        self.0.push(&value.to_le_bytes());
+        self.write(&value.to_le_bytes());
     }
 
     fn write_usize(&mut self, value: usize) {
@@ -573,23 +574,23 @@ impl Hasher for MaterializationFingerprintHasher {
     }
 
     fn write_i8(&mut self, value: i8) {
-        self.0.push(&value.to_le_bytes());
+        self.write(&value.to_le_bytes());
     }
 
     fn write_i16(&mut self, value: i16) {
-        self.0.push(&value.to_le_bytes());
+        self.write(&value.to_le_bytes());
     }
 
     fn write_i32(&mut self, value: i32) {
-        self.0.push(&value.to_le_bytes());
+        self.write(&value.to_le_bytes());
     }
 
     fn write_i64(&mut self, value: i64) {
-        self.0.push(&value.to_le_bytes());
+        self.write(&value.to_le_bytes());
     }
 
     fn write_i128(&mut self, value: i128) {
-        self.0.push(&value.to_le_bytes());
+        self.write(&value.to_le_bytes());
     }
 
     fn write_isize(&mut self, value: isize) {
@@ -622,6 +623,15 @@ pub struct ProcedureSemantics {
     source_mappings: Box<[SourceMapping]>,
     statement_entries: Box<[StatementEntrySite]>,
     loop_sites: Box<[LoopSite]>,
+    drops: Box<[DropFact]>,
+    move_outs: Box<[MoveOutFact]>,
+    scope_ends: Box<[ScopeEndFact]>,
+    pointer_origins: Box<[PointerOrigin]>,
+    pointer_aliases: Box<[PointerAlias]>,
+    pointer_accesses: Box<[PointerAccess]>,
+    pointer_invalidations: Box<[PointerInvalidation]>,
+    incomplete_facts: Box<[SemanticIncompleteFact]>,
+    receiver_type_facts: Box<[CallReceiverTypeFact]>,
     evidence_rows: Box<[Evidence]>,
     gaps: Box<[SemanticGap]>,
     blocks: Box<[BasicBlock]>,
@@ -668,6 +678,15 @@ impl ProcedureSemantics {
             source_mappings: parts.source_mappings.into_boxed_slice(),
             statement_entries: parts.statement_entries.into_boxed_slice(),
             loop_sites: parts.loop_sites.into_boxed_slice(),
+            drops: parts.drops.into_boxed_slice(),
+            move_outs: parts.move_outs.into_boxed_slice(),
+            scope_ends: parts.scope_ends.into_boxed_slice(),
+            pointer_origins: parts.pointer_origins.into_boxed_slice(),
+            pointer_aliases: parts.pointer_aliases.into_boxed_slice(),
+            pointer_accesses: parts.pointer_accesses.into_boxed_slice(),
+            pointer_invalidations: parts.pointer_invalidations.into_boxed_slice(),
+            incomplete_facts: parts.incomplete_facts.into_boxed_slice(),
+            receiver_type_facts: parts.receiver_type_facts.into_boxed_slice(),
             evidence_rows: parts.evidence_rows.into_boxed_slice(),
             gaps: parts.gaps.into_boxed_slice(),
             blocks: parts.blocks.into_boxed_slice(),
@@ -701,6 +720,15 @@ impl ProcedureSemantics {
         self.source_mappings.hash(&mut digest);
         self.statement_entries.hash(&mut digest);
         self.loop_sites.hash(&mut digest);
+        self.drops.hash(&mut digest);
+        self.move_outs.hash(&mut digest);
+        self.scope_ends.hash(&mut digest);
+        self.pointer_origins.hash(&mut digest);
+        self.pointer_aliases.hash(&mut digest);
+        self.pointer_accesses.hash(&mut digest);
+        self.pointer_invalidations.hash(&mut digest);
+        self.incomplete_facts.hash(&mut digest);
+        self.receiver_type_facts.hash(&mut digest);
         self.evidence_rows.hash(&mut digest);
         self.gaps.hash(&mut digest);
         self.blocks.hash(&mut digest);
@@ -831,6 +859,61 @@ impl ProcedureSemantics {
         &self.loop_sites
     }
 
+    /// Every explicit or implicit place destruction represented in this
+    /// procedure artifact.
+    pub fn drops(&self) -> &[DropFact] {
+        &self.drops
+    }
+
+    /// Place-level initialization transitions tied to move transfer events.
+    pub fn move_outs(&self) -> &[MoveOutFact] {
+        &self.move_outs
+    }
+
+    /// Exact local storage-lifetime end points or CFG edges.
+    pub fn scope_ends(&self) -> &[ScopeEndFact] {
+        &self.scope_ends
+    }
+
+    /// Procedure-local stack and allocation origins.
+    pub fn pointer_origins(&self) -> &[PointerOrigin] {
+        &self.pointer_origins
+    }
+
+    /// Pointer values and the origins they may designate.
+    pub fn pointer_aliases(&self) -> &[PointerAlias] {
+        &self.pointer_aliases
+    }
+
+    /// Source-mapped indirect operations through pointer values.
+    pub fn pointer_accesses(&self) -> &[PointerAccess] {
+        &self.pointer_accesses
+    }
+
+    /// Events that deallocate, transfer, drop, or may reallocate an origin.
+    pub fn pointer_invalidations(&self) -> &[PointerInvalidation] {
+        &self.pointer_invalidations
+    }
+
+    /// Machine-readable reasons that lifecycle or pointer support is partial.
+    pub fn incomplete_facts(&self) -> &[SemanticIncompleteFact] {
+        &self.incomplete_facts
+    }
+
+    /// Written receiver types of this procedure's method calls, in increasing
+    /// call-site order, one fact per call site at most.
+    pub fn receiver_type_facts(&self) -> &[CallReceiverTypeFact] {
+        &self.receiver_type_facts
+    }
+
+    /// The written receiver type fact for one call site, if the file proved one.
+    pub fn receiver_type_fact(&self, call_site: CallSiteId) -> Option<&CallReceiverTypeFact> {
+        self.receiver_type_facts
+            .binary_search_by_key(&call_site, |fact| fact.call_site)
+            .ok()
+            .map(|index| &self.receiver_type_facts[index])
+    }
+
     pub fn evidence_rows(&self) -> &[Evidence] {
         &self.evidence_rows
     }
@@ -938,6 +1021,29 @@ impl ProcedureSemantics {
         self.memory_locations.get(id.index())
     }
 
+    /// An entry copy into a formal's own cell establishes private storage.
+    /// It preserves the incoming value without writing the referenced object.
+    /// Later stores and stores into capture or selected locations are accesses.
+    pub fn is_formal_cell_initialization(
+        &self,
+        point: ProgramPointId,
+        effect: &SemanticEffect,
+    ) -> bool {
+        let SemanticEffect::MemoryStore {
+            location, value, ..
+        } = *effect
+        else {
+            return false;
+        };
+        point == self.entry_point()
+            && self.memory_location(location).is_some_and(|location| {
+                matches!(location.kind, MemoryLocationKind::LexicalCell { binding } if binding == value)
+            })
+            && self.value(value).is_some_and(|value| {
+                matches!(value.kind, SemanticValueKind::Parameter { .. } | SemanticValueKind::Receiver { .. })
+            })
+    }
+
     /// Return the unique local storage owned by one lexical binding.
     pub fn binding_memory_location(&self, binding: ValueId) -> Option<MemoryLocationId> {
         let mut matching = self.memory_locations.iter().filter_map(|location| {
@@ -1024,6 +1130,10 @@ impl ProcedureSemantics {
 
     pub fn source_mapping(&self, id: SourceMappingId) -> Option<&SourceMapping> {
         self.source_mappings.get(id.index())
+    }
+
+    fn source_locator(&self, id: SourceMappingId) -> Option<&SemanticLocator> {
+        self.source_mapping(id).map(|mapping| &mapping.locator)
     }
 
     pub fn evidence_row(&self, id: EvidenceId) -> Option<&Evidence> {
@@ -1258,16 +1368,33 @@ fn boxed_slice_index_retained_bytes<K, V>(index: &HashMap<K, Box<[V]>>) -> u64 {
 /// One immutable interpretation of one mounted source snapshot.
 #[derive(Debug)]
 pub struct SemanticArtifact {
+    query_source: Option<Arc<str>>,
     key: SemanticArtifactKey,
     materialization_id: SemanticArtifactMaterializationId,
     capabilities: SemanticCapabilities,
     work: SemanticWork,
+    go_predeclared_builtin_assumptions: Box<[GoPredeclaredBuiltin]>,
     procedures: Box<[ProcedureSemantics]>,
     procedures_by_locator: HashMap<SemanticLocator, ProcedureId>,
     /// Procedures lexically enclosed by each procedure, built once from the
     /// validated parent links so a closure walk never rescans the procedure
     /// table per visited procedure (#2640, #2951).
     lexical_children: HashMap<ProcedureId, Box<[ProcedureId]>>,
+    /// Source hull of each procedure's call-site mappings, sorted by start.
+    /// Built once so a range lookup examines only procedures that can own a
+    /// call site containing the range.
+    call_source_extents: Box<[CallSourceExtent]>,
+}
+
+/// The hull of one procedure's call-site source mappings. `max_end_byte` is
+/// the largest `end_byte` of this entry and of every earlier entry in start
+/// order, so a backward scan can stop once no earlier entry reaches a range.
+#[derive(Debug, Clone, Copy)]
+struct CallSourceExtent {
+    procedure: ProcedureId,
+    start_byte: usize,
+    end_byte: usize,
+    max_end_byte: usize,
 }
 
 impl SemanticArtifact {
@@ -1295,10 +1422,18 @@ impl SemanticArtifact {
     pub fn try_new_with_budget(
         key: SemanticArtifactKey,
         capabilities: SemanticCapabilities,
-        procedure_parts: Vec<ProcedureSemanticsParts>,
+        mut procedure_parts: Vec<ProcedureSemanticsParts>,
         budget: &mut SemanticBudget,
     ) -> Result<Self, SemanticArtifactBuildError> {
-        let work = measure_artifact_work(&key, &procedure_parts);
+        let mut go_predeclared_builtin_assumptions = Vec::new();
+        for procedure in &mut procedure_parts {
+            go_predeclared_builtin_assumptions
+                .append(&mut procedure.go_predeclared_builtin_assumptions);
+        }
+        go_predeclared_builtin_assumptions.sort_unstable_by_key(|builtin| builtin.name());
+        go_predeclared_builtin_assumptions.dedup();
+        let work =
+            measure_artifact_work(&key, &procedure_parts, &go_predeclared_builtin_assumptions);
         let mut charged_budget = budget.clone();
         charged_budget.charge(work)?;
         validate_artifact(&key, &capabilities, &procedure_parts)?;
@@ -1327,19 +1462,43 @@ impl SemanticArtifact {
             .into_iter()
             .map(|(parent, children)| (parent, children.into_boxed_slice()))
             .collect();
-        let materialization_id =
-            compute_artifact_materialization_id(&key, &capabilities, &procedures);
+        let call_source_extents = call_source_extent_index(&procedures);
+        let materialization_id = compute_artifact_materialization_id(
+            &key,
+            &capabilities,
+            &procedures,
+            &go_predeclared_builtin_assumptions,
+        );
         let artifact = Self {
+            query_source: None,
             key,
             materialization_id,
             capabilities,
             work,
+            go_predeclared_builtin_assumptions: go_predeclared_builtin_assumptions.into(),
             procedures,
             procedures_by_locator,
             lexical_children,
+            call_source_extents,
         };
         *budget = charged_budget;
         Ok(artifact)
+    }
+
+    /// Retain one selected source file only for this demand materialization.
+    /// Its bytes must be the exact revision already validated by the lowerer.
+    pub(crate) fn with_query_source(mut self, source: Arc<str>) -> Self {
+        assert_eq!(
+            self.key.revision().content(),
+            super::super::ids::ContentIdentity::hash_bytes(source.as_bytes()),
+            "query source must match its semantic artifact revision"
+        );
+        self.query_source = Some(source);
+        self
+    }
+
+    pub(crate) fn query_source(&self) -> Option<&Arc<str>> {
+        self.query_source.as_ref()
     }
 
     pub fn key(&self) -> &SemanticArtifactKey {
@@ -1356,6 +1515,10 @@ impl SemanticArtifact {
 
     pub const fn work(&self) -> SemanticWork {
         self.work
+    }
+
+    pub fn go_predeclared_builtin_assumptions(&self) -> &[GoPredeclaredBuiltin] {
+        &self.go_predeclared_builtin_assumptions
     }
 
     pub fn procedures(&self) -> &[ProcedureSemantics] {
@@ -1386,6 +1549,34 @@ impl SemanticArtifact {
         boxed_slice_index_retained_bytes(&self.lexical_children)
     }
 
+    /// Procedures, in procedure-table order, that own a call site whose source
+    /// mapping can contain `range`. Each procedure is filtered by the hull of
+    /// its call-site mappings, not by its own anchor: a Ruby procedure anchors
+    /// only its `def` header, so its body call sites lie outside the anchor.
+    /// Every returned procedure is a candidate; the caller still checks each
+    /// call site's own mapping.
+    pub(crate) fn procedures_with_call_source_containing(&self, range: Range) -> Vec<ProcedureId> {
+        let candidates = self
+            .call_source_extents
+            .partition_point(|extent| extent.start_byte <= range.start_byte);
+        let mut found = Vec::new();
+        for extent in self.call_source_extents[..candidates].iter().rev() {
+            if extent.max_end_byte < range.end_byte {
+                break;
+            }
+            if extent.end_byte >= range.end_byte {
+                found.push(extent.procedure);
+            }
+        }
+        found.sort_unstable();
+        found
+    }
+
+    /// Conservative heap storage retained by the call-source extent index.
+    pub(crate) fn call_source_extents_retained_bytes(&self) -> u64 {
+        (self.call_source_extents.len() as u64).saturating_mul(size_of::<CallSourceExtent>() as u64)
+    }
+
     pub fn procedure_by_locator(&self, locator: &SemanticLocator) -> Option<&ProcedureSemantics> {
         self.procedure(self.procedure_id(locator)?)
     }
@@ -1399,10 +1590,48 @@ impl SemanticArtifact {
     }
 }
 
+/// Build the call-source extent index. A procedure contributes the hull of
+/// every call-site mapping it owns, so the hull contains each of its call
+/// sites regardless of what the procedure's own anchor covers.
+fn call_source_extent_index(procedures: &[ProcedureSemantics]) -> Box<[CallSourceExtent]> {
+    let mut extents = Vec::new();
+    for procedure in procedures {
+        let mut hull: Option<(usize, usize)> = None;
+        for call in procedure.call_sites() {
+            let Some(mapping) = procedure.source_mapping(call.source) else {
+                continue;
+            };
+            let span = mapping.locator.anchor().span();
+            let start = span.start_byte() as usize;
+            let end = span.end_byte() as usize;
+            hull = Some(match hull {
+                None => (start, end),
+                Some((hull_start, hull_end)) => (hull_start.min(start), hull_end.max(end)),
+            });
+        }
+        if let Some((start_byte, end_byte)) = hull {
+            extents.push(CallSourceExtent {
+                procedure: procedure.id(),
+                start_byte,
+                end_byte,
+                max_end_byte: end_byte,
+            });
+        }
+    }
+    extents.sort_unstable_by_key(|extent| extent.start_byte);
+    let mut running_max = 0;
+    for extent in &mut extents {
+        running_max = running_max.max(extent.end_byte);
+        extent.max_end_byte = running_max;
+    }
+    extents.into_boxed_slice()
+}
+
 fn compute_artifact_materialization_id(
     key: &SemanticArtifactKey,
     capabilities: &SemanticCapabilities,
     procedures: &[ProcedureSemantics],
+    go_predeclared_builtin_assumptions: &[GoPredeclaredBuiltin],
 ) -> SemanticArtifactMaterializationId {
     let mut digest = MaterializationFingerprintHasher::new(ARTIFACT_MATERIALIZATION_ID_DOMAIN);
     key.fingerprint().hash(&mut digest);
@@ -1411,6 +1640,7 @@ fn compute_artifact_materialization_id(
         support.hash(&mut digest);
     });
     procedures.len().hash(&mut digest);
+    go_predeclared_builtin_assumptions.hash(&mut digest);
     for procedure in procedures {
         procedure.id().hash(&mut digest);
         procedure.materialization_id().hash(&mut digest);
@@ -1510,6 +1740,10 @@ impl ProcedureHandle {
         Some(self.scoped(id))
     }
 
+    pub fn source_locator(&self, id: SourceMappingId) -> Option<&SemanticLocator> {
+        self.semantics().source_locator(id)
+    }
+
     pub fn evidence_handle(&self, id: EvidenceId) -> Option<EvidenceHandle> {
         self.semantics().evidence_row(id)?;
         Some(self.scoped(id))
@@ -1541,8 +1775,7 @@ impl Eq for ProcedureHandle {}
 
 impl Hash for ProcedureHandle {
     fn hash<H: Hasher>(&self, state: &mut H) {
-        std::ptr::hash(Arc::as_ptr(&self.artifact), state);
-        self.id.hash(state);
+        crate::analyzer::semantic::hash_arc_key(&self.artifact, &self.id, state);
     }
 }
 
@@ -1666,6 +1899,24 @@ impl<I: Copy> ProcedureLocalHandle<I> {
     }
 }
 
+impl ProcedureLocalHandle<ProgramPointId> {
+    /// Resolve this program point's source mapping to its semantic locator.
+    pub fn locator(&self) -> Option<&SemanticLocator> {
+        let semantics = self.procedure.semantics();
+        let point = semantics.point(self.id)?;
+        semantics.source_locator(point.source)
+    }
+}
+
+impl ProcedureLocalHandle<CallSiteId> {
+    /// Resolve this call site's source mapping to its semantic locator.
+    pub fn locator(&self) -> Option<&SemanticLocator> {
+        let semantics = self.procedure.semantics();
+        let call = semantics.call_site(self.id)?;
+        semantics.source_locator(call.source)
+    }
+}
+
 pub type BlockHandle = ProcedureLocalHandle<BlockId>;
 pub type ProgramPointHandle = ProcedureLocalHandle<ProgramPointId>;
 pub type ControlEdgeHandle = ProcedureLocalHandle<ControlEdgeId>;
@@ -1731,21 +1982,6 @@ mod tests {
                 .get(&(ValueId::new(7), ProgramPointId::new(11)))
                 .map(Box::as_ref),
             Some([CallSiteId::new(0), CallSiteId::new(1)].as_slice())
-        );
-    }
-
-    #[test]
-    fn call_phase_index_sorts_shared_value_points_for_bounded_membership() {
-        let mut later = call_with_shared_result(12);
-        later.callee = ValueId::new(9);
-        let mut earlier = call_with_shared_result(3);
-        earlier.callee = ValueId::new(9);
-
-        let (phase_points, _) = index_call_phases(&[later, earlier]);
-
-        assert_eq!(
-            phase_points.get(&ValueId::new(9)).map(Box::as_ref),
-            Some([ProgramPointId::new(3), ProgramPointId::new(12)].as_slice())
         );
     }
 }

@@ -1,11 +1,13 @@
-//! Test-support route for native Go forward usage over selected reverse rows.
+//! Native Go usage queries over selected inverse rows.
 
 use super::GoAnalyzer;
-use super::selected_reverse::{GoSelectedReverseOutcome, go_selected_inverse_for};
+use super::selected_reverse::{
+    GoSelectedReverseOutcome, go_selected_inverse_for_with_test_inclusion,
+};
 use crate::analyzer::CodeUnitIndex;
 use crate::analyzer::structural::reference_edges::EdgeCompleteness;
 use crate::analyzer::usages::UsageProof;
-use crate::analyzer::usages::outcome::GraphUsageOutcome;
+use crate::analyzer::usages::outcome::{GraphFailureReason, GraphUsageOutcome};
 use crate::analyzer::usages::{
     FuzzyResult, GraphUsageAnalyzer, UsageAnalysisDiagnostic, UsageHit, UsageHitSurface,
 };
@@ -16,7 +18,6 @@ use brokk_bifrost_core::analyzer::usages::scan_scope::UsageScanScope;
 use std::collections::BTreeSet;
 
 /// Native Go forward-usage discovery through the selected reference index.
-/// The type is test-support only until the Go consumer cutover is approved.
 #[derive(Default)]
 pub struct GoNativeUsageStrategy;
 
@@ -67,14 +68,20 @@ impl GraphUsageAnalyzer for GoNativeUsageStrategy {
                     "native Go usage query was cancelled".into(),
                 ));
             }
-            let answer = match go_selected_inverse_for(go, target, &cancellation) {
+            let answer = match go_selected_inverse_for_with_test_inclusion(
+                go,
+                target,
+                scan_scope.includes_tests(),
+                &cancellation,
+            ) {
                 GoSelectedReverseOutcome::Ready(answer) => answer,
                 GoSelectedReverseOutcome::Unavailable(reason) => {
-                    return GraphUsageOutcome::TerminalFailure(diagnostic(
-                        primary,
-                        "native_resolution_unavailable",
-                        reason,
-                    ));
+                    let mut unavailable = GraphFailureReason::UnavailableCanonicalFacts(
+                        "Go graph indexed source was unavailable",
+                    )
+                    .diagnostic(primary.fq_name(), "go_native");
+                    unavailable.reason = format!("{}; {reason}", unavailable.reason);
+                    return GraphUsageOutcome::TerminalFailure(unavailable);
                 }
                 GoSelectedReverseOutcome::Stale(reason) => {
                     return GraphUsageOutcome::TerminalFailure(diagnostic(

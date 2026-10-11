@@ -86,7 +86,7 @@ Use a machine-readable manifest such as:
 }
 ```
 
-Replace example values with observed values; do not copy `0.8.5` into a future run without checking the binary. Record only environment variables that affect Bifrost behavior, and redact secrets before publication.
+Replace example values with observed values; do not copy `0.8.5` into a future run without checking the binary. `bifrost --version` prints the version and the built-in policy catalog digest, and `bifrost --build-identity` prints the source commit the binary was built from. Record only environment variables that affect Bifrost behavior; [Environment Variables](/reference/environment/) lists them. Redact secrets before publication.
 
 ### Policy runs
 
@@ -136,27 +136,29 @@ part of the policy meaning; the directory path and unselected leaves are not.
 
 ## Capture The Execution Contract
 
-- **Engine:** binary version, full source commit when known, build features/profile, and plugin or package version.
+- **Engine:** binary version, full source commit (`bifrost --build-identity`), built-in policy catalog digest (`bifrost --version`), build features and profile, and plugin or package version.
 - **Source:** repository and full commit, dirty-tree status or patch, workspace root, submodules, generated/vendor policy, and relevant file filters.
 - **Query:** both RQL and canonical JSON when applicable, `schema_version`, file hash, result detail, limits, languages, and path filters.
 - **Policy:** every root and dependency source, source hashes, resolved policy/endpoint and nested RQL schema versions plus origins, loaded semantic hash, selected endpoint and catalog manifests, precedence manifest, suppression source and hash, evaluation date, report limits, output format, `--fail-on`, and strict-version mode.
 - **Interface:** exact CLI command, MCP toolset and arguments, Python package version and call, or Rust dependency revision.
-- **Environment:** operating system and hardware when timing matters; semantic model ID/directory and accelerator settings when semantic search is involved.
+- **Environment:** operating system and hardware when timing matters; every Bifrost environment variable that was set, such as `BIFROST_PARALLELISM`, `BIFROST_OPEN_SEMANTIC_PACK_BUNDLE`, and `BIFROST_OPEN_POLICY_PACK_ROOT`; and the semantic packs the report lists as selected.
 - **Response:** every typed result variant, diagnostics, `truncated`, proof tiers, provenance, and `provenance_truncated` before downstream filtering.
 
 For MCP, record the configured workspace root and the exact `query_code` or
 `run_policy` arguments. A saved `query_file` path is workspace-relative and
 exclusive with inline query fields; policy files, suppression override, fixed
-evaluation date, and threshold are independent `run_policy` fields. For VS
-Code, record the extension and server versions, whether the RQL or policy
-buffer was unsaved, and the UTC evaluation date reported by the policy run;
-unsaved text is an input that must be preserved separately.
+evaluation date, and threshold are independent `run_policy` fields. For the VS
+Code extension, which is part of the separate `bifrost-lsp` project (see
+[LSP Server](/lsp/)), record the extension version, the version of the Bifrost
+binary it started, whether the RQL or policy buffer was unsaved, and the UTC
+evaluation date reported by the policy run. Unsaved text is an input that must
+be preserved separately.
 
 ## Cold and Warm Runs
 
-Label cache state precisely. Bifrost's persistent repository cache is `.bifrost/cache/bifrost_cache.v<N>.db` at the primary Git repository root by default, where `<N>` is the cache schema version the build reads, and linked worktrees share it. `BIFROST_CACHE_ROOT` instead derives one stable repository-specific child beneath a machine-local root while preserving linked-worktree sharing. An explicit `BIFROST_CACHE_DIR` has higher priority and uses `$BIFROST_CACHE_DIR/bifrost_cache.v<N>.db` exactly. A new process using any of those databases is not a fully cold run. Record the resolved database path and whether you removed the cache while Bifrost was stopped, reused it, warmed the same process, or changed branches between samples.
+Label cache state precisely. Bifrost's persistent repository cache is `.bifrost/cache/bifrost_cache.v<N>.db` at the primary Git repository root by default, where `<N>` is the cache schema version the build reads, and linked worktrees share it. `BIFROST_CACHE_ROOT` instead derives one stable repository-specific child beneath a machine-local root while preserving linked-worktree sharing. An explicit `BIFROST_CACHE_DIR` has higher priority and uses `$BIFROST_CACHE_DIR/bifrost_cache.v<N>.db` exactly. A new process using any of those databases is not a fully cold run. Semantic packs that Bifrost generated for another repository are also reused from the machine-level cache; see [Configuration Files](/reference/configuration-files/). Record the resolved database path and whether you removed the cache while Bifrost was stopped, reused it, warmed the same process, or changed branches between samples.
 
-Use the [evaluation protocol](/evaluation-evidence/) when publishing timing, memory, precision, or recall. Keep installation downloads and optional semantic-model downloads separate unless they are intentionally part of the measurement.
+Use the [evaluation protocol](/evaluation-evidence/) when publishing timing, memory, precision, or recall. Keep binary and open-pack acquisition downloads out of the measurement unless they are intentionally part of it.
 
 ## Verify Before Publication
 

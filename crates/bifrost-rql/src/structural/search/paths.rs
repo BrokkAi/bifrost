@@ -254,14 +254,15 @@ pub(super) const RESOLVED_PATH_QUERY_AXES: &[IdentityAxis] =
 /// The public projection of one qualified-path row.
 pub(super) fn public_path(value: &PathValue, range: CodeQueryRange) -> CodeQueryQualifiedPath {
     let row = value.row();
+    let metadata = super::public_source_metadata(&row.file, row.range, range);
     CodeQueryQualifiedPath {
         id: value.id(),
         ast_id: row.ast_id(),
-        path: super::rel_path_string(&row.file),
-        language: crate::analyzer::common::language_for_file(&row.file).config_label(),
-        range,
-        start_byte: row.range.start_byte,
-        end_byte: row.range.end_byte,
+        path: metadata.path,
+        language: metadata.language,
+        range: metadata.range,
+        start_byte: metadata.start_byte,
+        end_byte: metadata.end_byte,
         segment_count: row.segment_count,
     }
 }
@@ -269,14 +270,15 @@ pub(super) fn public_path(value: &PathValue, range: CodeQueryRange) -> CodeQuery
 /// The public projection of one path-segment row.
 pub(super) fn public_segment(value: &SegmentValue, range: CodeQueryRange) -> CodeQueryPathSegment {
     let row = value.row();
+    let metadata = super::public_source_metadata(&row.file, row.range, range);
     CodeQueryPathSegment {
         id: value.id(),
         ast_id: row.ast_id(),
-        path: super::rel_path_string(&row.file),
-        language: crate::analyzer::common::language_for_file(&row.file).config_label(),
-        range,
-        start_byte: row.range.start_byte,
-        end_byte: row.range.end_byte,
+        path: metadata.path,
+        language: metadata.language,
+        range: metadata.range,
+        start_byte: metadata.start_byte,
+        end_byte: metadata.end_byte,
         path_ast_id: super::super::occurrence_rows::ast_id(
             row.content_identity,
             row.path_terminal_node,

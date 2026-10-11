@@ -10,6 +10,7 @@ import {
   verifyQualifiedRelease,
 } from "./verify-qualified-release.mjs";
 import { generateManifest } from "./release-qualification.mjs";
+import { createQualificationBundle } from "./qualification-test-helpers.mjs";
 
 const commit = "a".repeat(40);
 const identity = {
@@ -63,13 +64,17 @@ test("rejects paths that are absent from the verified manifest", async () => {
 });
 
 async function fixtureBundle() {
-  const root = await fs.mkdtemp(path.join(os.tmpdir(), "bifrost-qualified-release-"));
-  const bundleDir = path.join(root, "bundle");
-  await fs.mkdir(bundleDir);
-  const binaryPath = path.join(bundleDir, "bifrost-v0.10.3-linux.tar.gz");
-  await fs.writeFile(binaryPath, "binary");
-  await fs.writeFile(path.join(bundleDir, "brokk_bifrost_searchtools-0.10.3-py3-none-any.whl"), "wheel");
-  const manifestPath = path.join(bundleDir, "release-qualification.json");
-  generateManifest({ bundleDir, identity, outputPath: manifestPath });
-  return { bundleDir, manifestPath, binaryPath };
+  const fixture = await createQualificationBundle({
+    prefix: "bifrost-qualified-release-",
+    files: {
+      "bifrost-v0.10.3-linux.tar.gz": "binary",
+      "brokk_bifrost_searchtools-0.10.3-py3-none-any.whl": "wheel",
+    },
+    identity,
+    generateManifest,
+  });
+  return {
+    ...fixture,
+    binaryPath: path.join(fixture.bundleDir, "bifrost-v0.10.3-linux.tar.gz"),
+  };
 }

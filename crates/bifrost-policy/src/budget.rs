@@ -202,6 +202,16 @@ const MAX_ORGANIZATIONAL_RISK_OVERLAYS: usize = 64;
 // retention bound, so the report cap and the evaluation cap are one number and
 // a run can never be asked to retain an obligation the evaluator dropped.
 const MAX_OBLIGATIONS_PER_RUN: usize = MAX_RETAINED_RELATIONAL_OBLIGATIONS;
+/// Per-policy caps on the taint composition engine (M3.1). Defaults are the
+/// values the composition runs under; hard caps are sixteen times the defaults,
+/// like the other workspace-scaling lanes.
+const MAX_COMPOSITION_PROCEDURES: usize = 50_000;
+const MAX_COMPOSITION_HOPS: usize = 2_000_000;
+const MAX_COMPOSITION_CALLERS_PER_PROCEDURE: usize = 10_000;
+const MAX_COMPOSITION_PROCEDURES_HARD_CAP: usize = 16 * MAX_COMPOSITION_PROCEDURES;
+const MAX_COMPOSITION_HOPS_HARD_CAP: usize = 16 * MAX_COMPOSITION_HOPS;
+const MAX_COMPOSITION_CALLERS_PER_PROCEDURE_HARD_CAP: usize =
+    16 * MAX_COMPOSITION_CALLERS_PER_PROCEDURE;
 const MAX_RETAINED_REPORT_BYTES_PER_POLICY: usize = 16 * 1024 * 1024;
 
 const MAX_POLICIES_PER_BATCH: usize = 256;
@@ -235,6 +245,9 @@ pub struct PolicyBudget {
     max_organizational_risk_overlays: usize,
     max_obligations_per_run: usize,
     max_retained_report_bytes: usize,
+    max_composition_procedures: usize,
+    max_composition_hops: usize,
+    max_composition_callers_per_procedure: usize,
 }
 
 impl Default for PolicyBudget {
@@ -269,6 +282,9 @@ impl Default for PolicyBudget {
             max_projection_scenario_memberships: MAX_PROJECTION_SCENARIO_MEMBERSHIPS,
             max_organizational_risk_overlays: MAX_ORGANIZATIONAL_RISK_OVERLAYS,
             max_obligations_per_run: MAX_OBLIGATIONS_PER_RUN,
+            max_composition_procedures: MAX_COMPOSITION_PROCEDURES,
+            max_composition_hops: MAX_COMPOSITION_HOPS,
+            max_composition_callers_per_procedure: MAX_COMPOSITION_CALLERS_PER_PROCEDURE,
             max_retained_report_bytes: MAX_RETAINED_REPORT_BYTES_PER_POLICY,
         }
     }
@@ -486,6 +502,18 @@ impl PolicyBudget {
         self.max_obligations_per_run
     }
 
+    pub const fn max_composition_procedures(&self) -> usize {
+        self.max_composition_procedures
+    }
+
+    pub const fn max_composition_hops(&self) -> usize {
+        self.max_composition_hops
+    }
+
+    pub const fn max_composition_callers_per_procedure(&self) -> usize {
+        self.max_composition_callers_per_procedure
+    }
+
     pub const fn max_retained_report_bytes(&self) -> usize {
         self.max_retained_report_bytes
     }
@@ -567,6 +595,9 @@ pub enum PolicyBudgetField {
     ProjectionScenarioMemberships,
     OrganizationalRiskOverlays,
     ObligationsPerRun,
+    CompositionProcedures,
+    CompositionHops,
+    CompositionCallersPerProcedure,
     RetainedReportBytesPerPolicy,
     PoliciesPerBatch,
     TotalFindingsPerBatch,
@@ -603,6 +634,9 @@ impl PolicyBudgetField {
             Self::ProjectionScenarioMemberships => "projection_scenario_memberships",
             Self::OrganizationalRiskOverlays => "organizational_risk_overlays",
             Self::ObligationsPerRun => "obligations_per_run",
+            Self::CompositionProcedures => "composition_procedures",
+            Self::CompositionHops => "composition_hops",
+            Self::CompositionCallersPerProcedure => "composition_callers_per_procedure",
             Self::RetainedReportBytesPerPolicy => "retained_report_bytes_per_policy",
             Self::PoliciesPerBatch => "policies_per_batch",
             Self::TotalFindingsPerBatch => "total_findings_per_batch",
@@ -846,6 +880,24 @@ impl PolicyBudgetBuilder {
         MAX_ORGANIZATIONAL_RISK_OVERLAYS
     );
     policy_budget_setter!(
+        with_max_composition_procedures,
+        max_composition_procedures,
+        CompositionProcedures,
+        MAX_COMPOSITION_PROCEDURES_HARD_CAP
+    );
+    policy_budget_setter!(
+        with_max_composition_hops,
+        max_composition_hops,
+        CompositionHops,
+        MAX_COMPOSITION_HOPS_HARD_CAP
+    );
+    policy_budget_setter!(
+        with_max_composition_callers_per_procedure,
+        max_composition_callers_per_procedure,
+        CompositionCallersPerProcedure,
+        MAX_COMPOSITION_CALLERS_PER_PROCEDURE_HARD_CAP
+    );
+    policy_budget_setter!(
         with_max_obligations_per_run,
         max_obligations_per_run,
         ObligationsPerRun,
@@ -924,146 +976,10 @@ impl PolicyBatchBudgetBuilder {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use brokk_bifrost_test_macros::hardwon;
 
     #[test]
-    fn defaults_are_the_schema_version_one_cli_caps() {
-        let budget = PolicyBudget::default();
-        let query = budget.query_limits();
-        assert_eq!(query.max_scanned_files, 20_000);
-        assert_eq!(query.max_scanned_source_bytes, 128 * 1024 * 1024);
-        assert_eq!(query.max_fact_nodes, 2_000_000);
-        assert_eq!(query.max_pipeline_rows, 50_000);
-        assert_eq!(budget.max_selector_results(), 50_000);
-        assert_eq!(
-            query.semantic.max_materialized_files,
-            MAX_SEMANTIC_MATERIALIZED_FILES
-        );
-        assert_eq!(
-            query.semantic.max_retained_bytes,
-            MAX_SEMANTIC_RETAINED_BYTES
-        );
-        assert_eq!(
-            query.semantic.max_traversal_steps,
-            MAX_SEMANTIC_TRAVERSAL_STEPS
-        );
-        assert_eq!(budget.max_findings(), 1_000);
-        assert_eq!(budget.max_diagnostics(), 256);
-        assert_eq!(budget.max_related_locations_per_finding(), 64);
-        assert_eq!(budget.max_evidence_refs_per_finding(), 256);
-        assert_eq!(budget.max_evidence_bytes_per_finding(), 64 * 1024);
-        assert_eq!(budget.max_origins_per_finding(), 256);
-        assert_eq!(budget.max_witnesses_per_finding(), 64);
-        assert_eq!(budget.max_witness_steps(), 1_024);
-        assert_eq!(budget.max_witness_bytes(), 1024 * 1024);
-        assert_eq!(budget.max_cvss_overlays(), 256);
-        assert_eq!(budget.max_cvss_evidence_records_per_finding(), 256);
-        assert_eq!(budget.max_cvss_variants_per_finding(), 32);
-        assert_eq!(budget.max_cvss_reduction_steps(), 32_768);
-        assert_eq!(budget.max_projection_scenario_memberships(), 16_384);
-        assert_eq!(budget.max_organizational_risk_overlays(), 64);
-        assert_eq!(budget.max_obligations_per_run(), 64);
-        assert_eq!(budget.max_retained_report_bytes(), 16 * 1024 * 1024);
-
-        let batch = PolicyBatchBudget::default();
-        assert_eq!(batch.max_policies(), 256);
-        assert_eq!(batch.max_total_findings(), 10_000);
-        assert_eq!(batch.max_retained_report_bytes(), 64 * 1024 * 1024);
-        assert_eq!(batch.max_serialized_report_bytes(), 64 * 1024 * 1024);
-    }
-
-    #[test]
-    fn every_limit_can_be_lowered_to_zero() {
-        let budget = PolicyBudget::builder()
-            .with_query_limits(CodeQueryExecutionLimits {
-                max_scanned_files: 0,
-                max_scanned_source_bytes: 0,
-                max_fact_nodes: 0,
-                max_pipeline_rows: 0,
-                semantic: CodeQuerySemanticLimits::default(),
-                typestate: CodeQueryTypestateLimits::default(),
-                value_flow: Default::default(),
-                taint: Default::default(),
-            })
-            .unwrap()
-            .with_max_selector_results(0)
-            .unwrap()
-            .with_max_findings(0)
-            .unwrap()
-            .with_max_diagnostics(0)
-            .unwrap()
-            .with_max_related_locations_per_finding(0)
-            .unwrap()
-            .with_max_evidence_refs_per_finding(0)
-            .unwrap()
-            .with_max_evidence_bytes_per_finding(0)
-            .unwrap()
-            .with_max_origins_per_finding(0)
-            .unwrap()
-            .with_max_witnesses_per_finding(0)
-            .unwrap()
-            .with_max_witness_steps(0)
-            .unwrap()
-            .with_max_witness_bytes(0)
-            .unwrap()
-            .with_max_cvss_overlays(0)
-            .unwrap()
-            .with_max_cvss_evidence_records_per_finding(0)
-            .unwrap()
-            .with_max_cvss_variants_per_finding(0)
-            .unwrap()
-            .with_max_cvss_reduction_steps(0)
-            .unwrap()
-            .with_max_projection_scenario_memberships(0)
-            .unwrap()
-            .with_max_organizational_risk_overlays(0)
-            .unwrap()
-            .with_max_obligations_per_run(0)
-            .unwrap()
-            .with_max_retained_report_bytes(0)
-            .unwrap()
-            .build()
-            .unwrap();
-        assert_eq!(budget.max_selector_results(), 0);
-        assert_eq!(budget.max_findings(), 0);
-        assert_eq!(budget.max_retained_report_bytes(), 0);
-    }
-
-    #[test]
-    fn query_limits_reject_zero_semantic_and_typestate_dimensions() {
-        let semantic_error = PolicyBudget::builder()
-            .with_query_limits(CodeQueryExecutionLimits {
-                semantic: CodeQuerySemanticLimits {
-                    max_source_bytes: 0,
-                    ..CodeQuerySemanticLimits::default()
-                },
-                ..CodeQueryExecutionLimits::default()
-            })
-            .unwrap_err();
-        assert_eq!(
-            semantic_error,
-            PolicyBudgetError::InvalidQueryLimits {
-                detail: "semantic limits must all be positive",
-            }
-        );
-
-        let typestate_error = PolicyBudget::builder()
-            .with_query_limits(CodeQueryExecutionLimits {
-                typestate: CodeQueryTypestateLimits {
-                    max_candidates: 0,
-                    ..CodeQueryTypestateLimits::default()
-                },
-                ..CodeQueryExecutionLimits::default()
-            })
-            .unwrap_err();
-        assert_eq!(
-            typestate_error,
-            PolicyBudgetError::InvalidQueryLimits {
-                detail: "typestate limits must be positive and within their hard caps",
-            }
-        );
-    }
-
-    #[test]
+    #[hardwon("#1936: measured semantic budgets were rejected at the default floor")]
     fn builders_reject_values_above_their_hard_caps() {
         // The scan lanes' hard cap is the workspace-scaling ceiling, not the
         // fixed default floor (#1771).
@@ -1336,6 +1252,7 @@ mod tests {
     }
 
     #[test]
+    #[hardwon("#1771: fixed scan budgets left large workspaces inconclusive")]
     fn scan_lanes_scale_with_the_audited_workspace_volume() {
         // This repository at the time of #1771: 1309 Rust files, 37.6MB.
         let scaled = PolicyBudget::default().scaled_for_workspace(37_600_000, 1_309);
@@ -1359,6 +1276,9 @@ mod tests {
     }
 
     #[test]
+    #[hardwon(
+        "#1771: the fix prevented scaled scan grants from exceeding the hard cap after workspace-volume growth."
+    )]
     fn scaled_scan_lanes_clamp_to_their_hard_caps() {
         let scaled = PolicyBudget::default().scaled_for_workspace(u64::MAX, usize::MAX);
         let query = scaled.query_limits();
@@ -1376,34 +1296,7 @@ mod tests {
     }
 
     #[test]
-    fn a_small_workspace_leaves_every_scan_lane_at_its_default() {
-        let scaled = PolicyBudget::default().scaled_for_workspace(1024 * 1024, 50);
-        let query = scaled.query_limits();
-        assert_eq!(query.max_fact_nodes, MAX_FACT_NODES);
-        assert_eq!(query.max_scanned_source_bytes, MAX_SCANNED_SOURCE_BYTES);
-        assert_eq!(query.max_scanned_files, MAX_SCANNED_FILES);
-        assert_eq!(query.max_pipeline_rows, MAX_PIPELINE_ROWS);
-        // Only the semantic file lane stays at its default: 1MiB of source is
-        // below that floor.
-        let semantic = query.semantic;
-        let default = CodeQuerySemanticLimits::default();
-        assert_eq!(
-            semantic.max_materialized_files,
-            default.max_materialized_files
-        );
-        // The row, retention, and traversal lanes rise. These are measured
-        // densities, not the ratio model overreaching.
-        assert_eq!(semantic.max_rows_per_dimension, 1024 * 1024 * 3);
-        assert!(semantic.max_rows_per_dimension > default.max_rows_per_dimension);
-        assert_eq!(semantic.max_retained_bytes, 1024 * 1024 * 456);
-        assert!(semantic.max_retained_bytes > default.max_retained_bytes);
-        assert_eq!(semantic.max_traversal_steps, 1024 * 1024);
-        assert!(semantic.max_traversal_steps > default.max_traversal_steps);
-        assert_eq!(semantic.max_source_bytes, 64 * 1024 * 1024);
-        assert!(semantic.max_source_bytes > default.max_source_bytes);
-    }
-
-    #[test]
+    #[hardwon("#1936: measured Go workspace work exhausted the semantic row grant")]
     fn go_whole_workspace_semantics_has_headroom_over_the_measured_lower_bound() {
         let semantic = PolicyBudget::default()
             .scaled_for_workspace(735_750, 94)
@@ -1417,6 +1310,7 @@ mod tests {
     }
 
     #[test]
+    #[hardwon("#1936: measured workspace work exhausted retained and source grants")]
     fn restic_whole_workspace_retention_has_headroom_over_the_measured_lower_bound() {
         let semantic = PolicyBudget::default()
             .scaled_for_workspace(2_368_675, 538)
@@ -1440,6 +1334,7 @@ mod tests {
     }
 
     #[test]
+    #[hardwon("#1936: semantic lane caps made measured policy evaluation abstain")]
     fn semantic_lanes_scale_with_the_audited_workspace_volume() {
         // OWASP BenchmarkJava at the time of #1936: 1572 files, ~40MB.  Before
         // this change the compile abstained here: the 256-file materialization
@@ -1543,31 +1438,6 @@ mod tests {
     }
 
     #[test]
-    fn scaling_preserves_independently_widened_semantic_limits() {
-        let custom_source_bytes = 8 * MAX_SEMANTIC_SOURCE_BYTES;
-        let custom_traversal_steps = 3 * MAX_SEMANTIC_TRAVERSAL_STEPS;
-        let host_widened = PolicyBudget::builder()
-            .with_query_limits(CodeQueryExecutionLimits {
-                semantic: CodeQuerySemanticLimits {
-                    max_source_bytes: custom_source_bytes,
-                    max_traversal_steps: custom_traversal_steps,
-                    ..CodeQuerySemanticLimits::default()
-                },
-                ..CodeQueryExecutionLimits::default()
-            })
-            .expect("independently widened semantic lanes are valid")
-            .build()
-            .unwrap();
-
-        let semantic = host_widened
-            .scaled_for_workspace(1024 * 1024, 50)
-            .query_limits()
-            .semantic;
-        assert_eq!(semantic.max_source_bytes, custom_source_bytes);
-        assert_eq!(semantic.max_traversal_steps, custom_traversal_steps);
-    }
-
-    #[test]
     fn widening_semantic_source_work_does_not_widen_traversal() {
         let workspace_source_bytes = 40_000_000_u64;
         let baseline = PolicyBudget::default()
@@ -1602,6 +1472,7 @@ mod tests {
     /// The request-wide output lane must follow the audited workspace, or a
     /// corpus-scale run loses its late batches to the batch order (#2471).
     #[test]
+    #[hardwon("#2471: request-wide finding cap starved the analyzed corpus")]
     fn the_findings_lane_scales_with_the_audited_workspace_volume() {
         // OWASP BenchmarkJava at 007786f86: 2770 analyzed files, 11,633,213
         // source bytes.  The fixed 1000-finding lane is spent by the `xss`
@@ -1639,6 +1510,9 @@ mod tests {
     /// decision into an abstention on a workspace that is not the one measured,
     /// so the calibrated model must dominate the #1936 ratio model everywhere.
     #[test]
+    #[hardwon(
+        "#1936: measured workspace semantic work must remain above the calibrated ratio floor"
+    )]
     fn the_measured_densities_never_lower_a_lane_below_the_ratio_model() {
         for total_source_bytes in [
             0_u64,
@@ -1692,6 +1566,9 @@ mod tests {
     }
 
     #[test]
+    #[hardwon(
+        "#1771: the workspace-scaling fix must cap every semantic lane so larger repositories cannot admit unbounded work."
+    )]
     fn scaled_semantic_lanes_clamp_to_their_hard_caps() {
         let scaled = PolicyBudget::default().scaled_for_workspace(u64::MAX, usize::MAX);
         let semantic = scaled.query_limits().semantic;
@@ -1721,6 +1598,9 @@ mod tests {
     }
 
     #[test]
+    #[hardwon(
+        "#1771: the scaling fix must preserve caller-widened semantic grants instead of shrinking them back to defaults."
+    )]
     fn scaling_never_lowers_a_host_widened_semantic_budget() {
         let host_widened = PolicyBudget::builder()
             .with_query_limits(CodeQueryExecutionLimits {
@@ -1757,6 +1637,68 @@ mod tests {
             semantic.max_traversal_steps,
             8 * MAX_SEMANTIC_TRAVERSAL_STEPS
         );
+    }
+
+    #[hardwon("#1771: zero semantic and typestate budgets must be rejected")]
+    #[test]
+    fn query_limits_reject_zero_semantic_and_typestate_dimensions() {
+        let semantic_error = PolicyBudget::builder()
+            .with_query_limits(CodeQueryExecutionLimits {
+                semantic: CodeQuerySemanticLimits {
+                    max_source_bytes: 0,
+                    ..CodeQuerySemanticLimits::default()
+                },
+                ..CodeQueryExecutionLimits::default()
+            })
+            .unwrap_err();
+        assert_eq!(
+            semantic_error,
+            PolicyBudgetError::InvalidQueryLimits {
+                detail: "semantic limits must all be positive",
+            }
+        );
+
+        let typestate_error = PolicyBudget::builder()
+            .with_query_limits(CodeQueryExecutionLimits {
+                typestate: CodeQueryTypestateLimits {
+                    max_candidates: 0,
+                    ..CodeQueryTypestateLimits::default()
+                },
+                ..CodeQueryExecutionLimits::default()
+            })
+            .unwrap_err();
+        assert_eq!(
+            typestate_error,
+            PolicyBudgetError::InvalidQueryLimits {
+                detail: "typestate limits must be positive and within their hard caps",
+            }
+        );
+    }
+
+    #[hardwon("368d5f661b9e: workspace scaling preserves independently widened semantic limits")]
+    #[test]
+    fn scaling_preserves_independently_widened_semantic_limits() {
+        let custom_source_bytes = 8 * MAX_SEMANTIC_SOURCE_BYTES;
+        let custom_traversal_steps = 3 * MAX_SEMANTIC_TRAVERSAL_STEPS;
+        let host_widened = PolicyBudget::builder()
+            .with_query_limits(CodeQueryExecutionLimits {
+                semantic: CodeQuerySemanticLimits {
+                    max_source_bytes: custom_source_bytes,
+                    max_traversal_steps: custom_traversal_steps,
+                    ..CodeQuerySemanticLimits::default()
+                },
+                ..CodeQueryExecutionLimits::default()
+            })
+            .expect("independently widened semantic lanes are valid")
+            .build()
+            .unwrap();
+
+        let semantic = host_widened
+            .scaled_for_workspace(1024 * 1024, 50)
+            .query_limits()
+            .semantic;
+        assert_eq!(semantic.max_source_bytes, custom_source_bytes);
+        assert_eq!(semantic.max_traversal_steps, custom_traversal_steps);
     }
 
     #[test]

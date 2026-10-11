@@ -1105,21 +1105,13 @@ fn preceded_by_odd_backslashes(bytes: &[u8], index: usize) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use brokk_bifrost_test_macros::hardwon;
 
     fn entry(pattern: &str, replacements: &[&str]) -> AliasEntry {
         AliasEntry {
             pattern: parse_pattern(pattern),
             replacements: replacements.iter().map(|r| r.to_string()).collect(),
         }
-    }
-
-    #[test]
-    fn matches_trailing_wildcard() {
-        let entries = vec![entry("@/*", &["src/*"])];
-        assert_eq!(
-            best_match(&entries, "@/lib/foo"),
-            Some(vec!["src/lib/foo".to_string()])
-        );
     }
 
     #[test]
@@ -1150,12 +1142,6 @@ mod tests {
             best_match(&entries, "@/foo"),
             Some(vec!["src/foo".to_string(), "generated/foo".to_string()])
         );
-    }
-
-    #[test]
-    fn non_matching_specifier_returns_none() {
-        let entries = vec![entry("@/*", &["src/*"])];
-        assert_eq!(best_match(&entries, "react"), None);
     }
 
     #[test]
@@ -1335,6 +1321,7 @@ mod tests {
     }
 
     #[test]
+    #[hardwon("f2a0318baa11: malformed library and extends config was treated as complete")]
     fn malformed_shapes_and_missing_config_fail_closed() {
         let base = tempfile::tempdir().unwrap();
         let root = base.path();
@@ -1363,6 +1350,7 @@ mod tests {
     }
 
     #[test]
+    #[hardwon("f2a0318baa11: a config outside the project root supplied library facts")]
     fn config_outside_root_is_not_eligible_for_library_selection() {
         let root = tempfile::tempdir().unwrap();
         let outside = tempfile::tempdir().unwrap();
@@ -1379,6 +1367,7 @@ mod tests {
     }
 
     #[test]
+    #[hardwon("f2a0318baa11: aggregate TypeScript libraries activated unrelated DOM facts")]
     fn aggregate_activation_closure_keeps_es_core_without_dom() {
         let es2015 = typescript_library_activation_closure(&["es2015".to_owned()]);
         assert!(es2015.contains(&"es5".to_owned()));

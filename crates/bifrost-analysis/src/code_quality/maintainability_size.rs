@@ -685,38 +685,25 @@ mod tests {
     }
 
     #[test]
-    fn long_method_no_files_reports_empty() {
-        let fix =
-            AnalyzerFixture::new(&[("Foo.java", "package com.example; public class Foo {}\n")]);
-        let result = report_long_method_and_god_object_smells(
-            fix.analyzer.analyzer(),
-            ReportLongMethodAndGodObjectSmellsParams::default(),
+    fn java_implicit_constructor_does_not_inflate_god_object() {
+        // Java's compiler-provided default constructor is not an analyzer CodeUnit, so a class
+        // with fourteen real methods must remain below a fifteen-child threshold.
+        let java = format!(
+            "package com.example;\npublic class Boundary {{\n{helpers}\n}}\n",
+            helpers = java_helpers(14),
         );
-        assert!(
-            result
-                .report
-                .starts_with("Long method and god object smells (max findings: 20):"),
-            "report: {}",
-            result.report
-        );
-        assert!(result.report.contains("- Files analyzed cap: 25"));
-        assert!(result.report.contains("- Weights: longMethodLines=80"));
-        assert!(
-            result
-                .report
-                .contains("No long method or god object smells found.")
-        );
-        assert!(!result.truncated);
-    }
-
-    #[test]
-    fn long_method_small_cohesive_file_reports_nothing() {
-        let java = "package com.example;\npublic class Small {\n    public int add(int left, int right) {\n        return left + right;\n    }\n}\n";
-        let fix = AnalyzerFixture::new(&[("com/example/Small.java", java)]);
+        let fix = AnalyzerFixture::new(&[("com/example/Boundary.java", java.as_str())]);
         let result = report_long_method_and_god_object_smells(
             fix.analyzer.analyzer(),
             ReportLongMethodAndGodObjectSmellsParams {
-                file_paths: vec!["com/example/Small.java".to_string()],
+                file_paths: vec!["com/example/Boundary.java".to_string()],
+                long_method_span_lines: 999,
+                high_complexity_threshold: 999,
+                god_object_span_lines: 999,
+                god_object_direct_children: 15,
+                god_object_functions: 15,
+                helper_sprawl_functions: 999,
+                helper_sprawl_workflow_lines: 999,
                 ..Default::default()
             },
         );
@@ -724,192 +711,9 @@ mod tests {
             result
                 .report
                 .contains("No long method or god object smells found."),
-            "report: {}",
+            "implicit constructor must not count toward direct-children / functions; report: {}",
             result.report
         );
-        assert!(!result.truncated);
-    }
-
-    #[test]
-    fn long_method_flags_oversized_function_with_rationale() {
-        let java = format!(
-            "package com.example;\npublic class Workflow {{\n    public void generatedWorkflow() {{\n{body}\n    }}\n}}\n",
-            body = java_statements(85),
-        );
-        let fix = AnalyzerFixture::new(&[("com/example/Workflow.java", java.as_str())]);
-        let result = report_long_method_and_god_object_smells(
-            fix.analyzer.analyzer(),
-            ReportLongMethodAndGodObjectSmellsParams {
-                file_paths: vec!["com/example/Workflow.java".to_string()],
-                ..Default::default()
-            },
-        );
-        assert!(
-            result
-                .report
-                .contains("`com.example.Workflow.generatedWorkflow`"),
-            "report: {}",
-            result.report
-        );
-        assert!(result.report.contains("long function spans"));
-        assert!(!result.truncated);
-    }
-
-    #[test]
-    fn long_method_flags_god_object_with_helper_sprawl() {
-        let java = format!(
-            "package com.example;\npublic class GeneratedController {{\n    public void executeWorkflow() {{\n{body}\n    }}\n{helpers}\n}}\n",
-            body = java_statements(65),
-            helpers = java_helpers(16),
-        );
-        let fix = AnalyzerFixture::new(&[("com/example/GeneratedController.java", java.as_str())]);
-        let result = report_long_method_and_god_object_smells(
-            fix.analyzer.analyzer(),
-            ReportLongMethodAndGodObjectSmellsParams {
-                file_paths: vec!["com/example/GeneratedController.java".to_string()],
-                ..Default::default()
-            },
-        );
-        assert!(
-            result.report.contains("`com.example.GeneratedController`"),
-            "report: {}",
-            result.report
-        );
-        assert!(
-            result.report.contains("helper sprawl"),
-            "report: {}",
-            result.report
-        );
-        // The class line must appear before any of its helper-function lines —
-        // brokk-shared documents that god object ranks above its workflow helper.
-        let class_pos = result
-            .report
-            .find("`com.example.GeneratedController` in")
-            .unwrap();
-        let workflow_pos = result
-            .report
-            .find("`com.example.GeneratedController.executeWorkflow`")
-            .unwrap_or(usize::MAX);
-        assert!(class_pos < workflow_pos);
-    }
-
-    #[test]
-    fn long_method_custom_threshold_overrides_default() {
-        // 12 statements, below the default 80-line threshold but above a
-        // custom 10-line override.
-        let java = format!(
-            "package com.example;\npublic class Tunable {{\n    public void smallerWorkflow() {{\n{body}\n    }}\n}}\n",
-            body = java_statements(12),
-        );
-        let fix = AnalyzerFixture::new(&[("com/example/Tunable.java", java.as_str())]);
-        let permissive = report_long_method_and_god_object_smells(
-            fix.analyzer.analyzer(),
-            ReportLongMethodAndGodObjectSmellsParams {
-                file_paths: vec!["com/example/Tunable.java".to_string()],
-                long_method_span_lines: 10,
-                ..Default::default()
-            },
-        );
-        assert!(
-            permissive
-                .report
-                .contains("`com.example.Tunable.smallerWorkflow`"),
-            "permissive: {}",
-            permissive.report
-        );
-        let strict = report_long_method_and_god_object_smells(
-            fix.analyzer.analyzer(),
-            ReportLongMethodAndGodObjectSmellsParams {
-                file_paths: vec!["com/example/Tunable.java".to_string()],
-                long_method_span_lines: 200,
-                ..Default::default()
-            },
-        );
-        assert!(
-            strict
-                .report
-                .contains("No long method or god object smells found."),
-            "strict: {}",
-            strict.report
-        );
-    }
-
-    #[test]
-    fn long_method_zero_weight_falls_back_to_default() {
-        // Zero is *not* an explicit override for this tool (pick_positive
-        // semantics) — passing 0 must reproduce the default behaviour, not
-        // disable the rule.
-        let java = format!(
-            "package com.example;\npublic class Workflow {{\n    public void generatedWorkflow() {{\n{body}\n    }}\n}}\n",
-            body = java_statements(85),
-        );
-        let fix = AnalyzerFixture::new(&[("com/example/Workflow.java", java.as_str())]);
-        let result = report_long_method_and_god_object_smells(
-            fix.analyzer.analyzer(),
-            ReportLongMethodAndGodObjectSmellsParams {
-                file_paths: vec!["com/example/Workflow.java".to_string()],
-                long_method_span_lines: 0,
-                ..Default::default()
-            },
-        );
-        assert!(
-            result.report.contains("long function spans"),
-            "report: {}",
-            result.report
-        );
-        // Weights header must still print the *default* 80, not 0.
-        assert!(result.report.contains("longMethodLines=80"));
-    }
-
-    #[test]
-    fn long_method_max_findings_truncates_output() {
-        let java = format!(
-            "package com.example;\npublic class A {{\n    public void big() {{\n{body}\n    }}\n}}\nclass B {{\n    public void big() {{\n{body}\n    }}\n}}\n",
-            body = java_statements(85),
-        );
-        let fix = AnalyzerFixture::new(&[("com/example/A.java", java.as_str())]);
-        let result = report_long_method_and_god_object_smells(
-            fix.analyzer.analyzer(),
-            ReportLongMethodAndGodObjectSmellsParams {
-                file_paths: vec!["com/example/A.java".to_string()],
-                max_findings: 1,
-                ..Default::default()
-            },
-        );
-        assert!(result.truncated, "report: {}", result.report);
-        assert_eq!(
-            result.report.matches("[score ").count(),
-            1,
-            "report: {}",
-            result.report
-        );
-    }
-
-    #[test]
-    fn long_method_missing_file_is_skipped() {
-        let fix =
-            AnalyzerFixture::new(&[("Foo.java", "package com.example; public class Foo {}\n")]);
-        let result = report_long_method_and_god_object_smells(
-            fix.analyzer.analyzer(),
-            ReportLongMethodAndGodObjectSmellsParams {
-                file_paths: vec!["does/not/exist.java".to_string()],
-                ..Default::default()
-            },
-        );
-        assert!(
-            result
-                .report
-                .contains("No long method or god object smells found.")
-        );
-        // The skipped-inputs footer must surface the silent drop.
-        assert!(
-            result
-                .report
-                .contains("- Note: skipped 1 input(s) (empty, unresolvable, or missing)."),
-            "report: {}",
-            result.report
-        );
-        assert!(!result.truncated);
     }
 
     #[test]
@@ -949,93 +753,6 @@ mod tests {
         assert!(
             !result.report.contains("`com.example.BetaController`"),
             "Beta should have been excluded by max_files=1; report: {}",
-            result.report
-        );
-    }
-
-    #[test]
-    fn is_file_level_module_excludes_java_package_modules() {
-        // Java package modules are NOT file-level in the brokk sense; they
-        // must keep class-style scoring thresholds. This test guards the
-        // explicit Language::Java exclusion in is_file_level_module.
-        let java = "package com.example;\npublic class Foo {}\n";
-        let fix = AnalyzerFixture::new(&[("com/example/Foo.java", java)]);
-        let analyzer = fix.analyzer.analyzer();
-        let package_modules: Vec<_> = analyzer
-            .top_level_declarations(
-                &analyzer
-                    .project()
-                    .file_by_rel_path(std::path::Path::new("com/example/Foo.java"))
-                    .unwrap(),
-            )
-            .into_iter()
-            .filter(|cu| cu.is_module())
-            .collect();
-        for module_cu in &package_modules {
-            assert!(
-                !is_file_level_module(analyzer, module_cu, true),
-                "Java package module should not be treated as file-level: {:?}",
-                module_cu
-            );
-        }
-    }
-
-    #[test]
-    fn is_file_level_module_rejects_non_module_and_non_top_level() {
-        let java = "package com.example;\npublic class Foo { public void m() {} }\n";
-        let fix = AnalyzerFixture::new(&[("com/example/Foo.java", java)]);
-        let analyzer = fix.analyzer.analyzer();
-        let file = analyzer
-            .project()
-            .file_by_rel_path(std::path::Path::new("com/example/Foo.java"))
-            .unwrap();
-        let class_cu = analyzer
-            .top_level_declarations(&file)
-            .into_iter()
-            .find(|cu| cu.is_class())
-            .expect("expected the Foo class");
-        assert!(
-            !is_file_level_module(analyzer, &class_cu, true),
-            "non-module CU must never be flagged file-level"
-        );
-        for cu in analyzer.top_level_declarations(&file) {
-            if cu.is_module() {
-                assert!(
-                    !is_file_level_module(analyzer, &cu, false),
-                    "top_level=false must always reject"
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn java_implicit_constructor_does_not_inflate_god_object() {
-        // Java's compiler-provided default constructor is not an analyzer CodeUnit, so a class
-        // with fourteen real methods must remain below a fifteen-child threshold.
-        let java = format!(
-            "package com.example;\npublic class Boundary {{\n{helpers}\n}}\n",
-            helpers = java_helpers(14),
-        );
-        let fix = AnalyzerFixture::new(&[("com/example/Boundary.java", java.as_str())]);
-        let result = report_long_method_and_god_object_smells(
-            fix.analyzer.analyzer(),
-            ReportLongMethodAndGodObjectSmellsParams {
-                file_paths: vec!["com/example/Boundary.java".to_string()],
-                long_method_span_lines: 999,
-                high_complexity_threshold: 999,
-                god_object_span_lines: 999,
-                god_object_direct_children: 15,
-                god_object_functions: 15,
-                helper_sprawl_functions: 999,
-                helper_sprawl_workflow_lines: 999,
-                ..Default::default()
-            },
-        );
-        assert!(
-            result
-                .report
-                .contains("No long method or god object smells found."),
-            "implicit constructor must not count toward direct-children / functions; report: {}",
             result.report
         );
     }

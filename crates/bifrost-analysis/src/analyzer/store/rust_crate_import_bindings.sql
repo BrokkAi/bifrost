@@ -56,4 +56,40 @@ SELECT source.module_path, 'type', source.bound_name, source.blob_id,
 FROM cr_source_imports AS source
 CROSS JOIN cr_dependencies AS root ON root.extern_name = source.imported_name
   AND root.dependency_crate_key IS NOT NULL
-WHERE source.head_segment IS NULL AND source.is_glob = 0 AND source.bound_name IS NOT NULL;
+WHERE source.head_segment IS NULL AND source.is_glob = 0 AND source.bound_name IS NOT NULL
+UNION
+-- A named use can bind a Rust module even though the module is not an item
+-- export. Publish that binding in the type namespace so selected route lookup
+-- can place aliases such as `use crate::base::{self as base}` from the same
+-- structured route facts used to derive the module containers.
+SELECT source.module_path, 'type', source.bound_name, source.blob_id,
+       source.import_ordinal, source.binder_scope,
+       route.target_crate_key,
+       CASE WHEN source.imported_name='self' THEN route.target_module_path
+            ELSE route.target_module_path || '::' || source.imported_name END,
+       'self'
+FROM cr_source_imports AS source
+CROSS JOIN cr_routes AS route
+  ON route.blob_id=source.blob_id
+ AND route.import_ordinal=source.import_ordinal
+ AND route.module_path=source.module_path
+CROSS JOIN cr_containers_all AS container
+  ON container.crate_key=route.target_crate_key
+ AND container.container_path=CASE WHEN source.imported_name='self'
+       THEN route.target_module_path
+       ELSE route.target_module_path || '::' || source.imported_name END
+WHERE source.is_glob=0 AND source.bound_name IS NOT NULL
+  AND ((route.target_crate_key=(SELECT crate_key FROM cr_identity)
+        AND NOT EXISTS(SELECT 1 FROM cr_enums AS enumeration
+                       WHERE enumeration.container_path=container.container_path))
+       OR EXISTS(SELECT 1 FROM cr_foreign AS dependency
+                 CROSS JOIN rust_crate_containers AS module
+                   ON module.topology_id=dependency.topology_id
+                  AND module.container_path=container.container_path
+                 WHERE module.kind='module'
+                   AND dependency.crate_key=route.target_crate_key))
+  AND NOT EXISTS(SELECT 1 FROM cr_exports AS exported
+                 WHERE exported.crate_key=route.target_crate_key
+                   AND exported.module_path=route.target_module_path
+                   AND exported.namespace='type'
+                   AND exported.name=source.imported_name);

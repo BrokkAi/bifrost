@@ -236,6 +236,7 @@ pub enum CodeQueryRowScalarType {
     StableId,
     String,
     StringList,
+    IntegerList,
     Integer,
     Boolean,
     ConstrainedEnum,
@@ -243,12 +244,29 @@ pub enum CodeQueryRowScalarType {
 }
 
 impl CodeQueryRowScalarType {
+    /// Whether a literal of the given scalar type can address this field.
+    /// String literals can address identity-bearing scalar values by spelling.
+    pub const fn accepts_literal_type(self, literal_type: Self) -> bool {
+        matches!(
+            (self, literal_type),
+            (
+                Self::String | Self::StableId | Self::DeclarationIdentity,
+                Self::String
+            ) | (Self::StringList, Self::StringList)
+                | (Self::IntegerList, Self::IntegerList)
+                | (Self::Integer, Self::Integer)
+                | (Self::Boolean, Self::Boolean)
+                | (Self::ConstrainedEnum, Self::ConstrainedEnum)
+        )
+    }
+
     /// Stable public spelling used by row-schema catalogs and diagnostics.
     pub const fn label(self) -> &'static str {
         match self {
             Self::StableId => "stable_id",
             Self::String => "string",
             Self::StringList => "string_list",
+            Self::IntegerList => "integer_list",
             Self::Integer => "integer",
             Self::Boolean => "boolean",
             Self::ConstrainedEnum => "constrained_enum",
@@ -306,6 +324,44 @@ pub struct CodeQueryRowField {
 }
 
 impl CodeQueryRowField {
+    /// Short editor help for Python facts added to the queryable row schema.
+    /// The source parser attaches this text to matching `filter` field names.
+    pub fn rql_help_for_name(name: &str) -> Option<&'static str> {
+        match name {
+            "base_branch_definition_count" => Some(
+                "Number of distinct same-name member declarations found under resolved direct base branches.",
+            ),
+            "has_strict_ordering" => {
+                Some("Whether the class's effective C3 method set defines __lt__ or __gt__.")
+            }
+            "has_non_strict_ordering" => {
+                Some("Whether the class's effective C3 method set defines __le__ or __ge__.")
+            }
+            "total_ordering_decorator" => Some(
+                "Whether the class has a directly recognized functools.total_ordering decorator.",
+            ),
+            "inherited_ne_present" => {
+                Some("Whether the class inherits an effective __ne__ implementation.")
+            }
+            "inherited_ne_delegates" => Some(
+                "Whether every effective inherited __ne__ implementation is recognized as delegating to __eq__.",
+            ),
+            "returns_receiver" => Some(
+                "Whether the selected iterator return expression is exactly the receiver parameter.",
+            ),
+            "target_non_trivial" => Some(
+                "Whether the lifecycle target method has a non-trivial body under CodeQL's MethodCallOrder predicate.",
+            ),
+            "target_reads_self" => Some(
+                "Whether the dispatched subclass override reads its receiver as an attribute receiver or call argument.",
+            ),
+            "special_method_status" => {
+                Some("Arity compatibility status for a recognized Python special-method protocol.")
+            }
+            _ => None,
+        }
+    }
+
     /// A required field of a scalar type that carries no value domain.
     ///
     /// The assertion runs during const evaluation, so an enum-typed field
@@ -339,43 +395,47 @@ impl CodeQueryRowField {
 
     /// A required enum field over a finite label set.
     pub const fn required_enum(name: &'static str, labels: &'static [&'static str]) -> Self {
+        Self::required_constrained_enum(name, CodeQueryEnumDomain::Labels(labels))
+    }
+
+    const fn required_constrained_enum(
+        name: &'static str,
+        value_domain: CodeQueryEnumDomain,
+    ) -> Self {
         Self {
             name,
             scalar_type: CodeQueryRowScalarType::ConstrainedEnum,
             nullable: false,
-            value_domain: Some(CodeQueryEnumDomain::Labels(labels)),
+            value_domain: Some(value_domain),
         }
     }
 
     /// An optional enum field over a finite label set.
     pub const fn optional_enum(name: &'static str, labels: &'static [&'static str]) -> Self {
+        Self::optional_constrained_enum(name, CodeQueryEnumDomain::Labels(labels))
+    }
+
+    const fn optional_constrained_enum(
+        name: &'static str,
+        value_domain: CodeQueryEnumDomain,
+    ) -> Self {
         Self {
             name,
             scalar_type: CodeQueryRowScalarType::ConstrainedEnum,
             nullable: true,
-            value_domain: Some(CodeQueryEnumDomain::Labels(labels)),
+            value_domain: Some(value_domain),
         }
     }
 
     /// A required enum field whose producer's vocabulary cannot be enumerated.
     /// `reason` states why, and no literal over it is ever rejected.
     pub const fn required_open_enum(name: &'static str, reason: &'static str) -> Self {
-        Self {
-            name,
-            scalar_type: CodeQueryRowScalarType::ConstrainedEnum,
-            nullable: false,
-            value_domain: Some(CodeQueryEnumDomain::Unenumerable(reason)),
-        }
+        Self::required_constrained_enum(name, CodeQueryEnumDomain::Unenumerable(reason))
     }
 
     /// An optional enum field whose producer's vocabulary cannot be enumerated.
     pub const fn optional_open_enum(name: &'static str, reason: &'static str) -> Self {
-        Self {
-            name,
-            scalar_type: CodeQueryRowScalarType::ConstrainedEnum,
-            nullable: true,
-            value_domain: Some(CodeQueryEnumDomain::Unenumerable(reason)),
-        }
+        Self::optional_constrained_enum(name, CodeQueryEnumDomain::Unenumerable(reason))
     }
 }
 
@@ -400,6 +460,7 @@ mod value_domain {
         ControlEdgeKind, DispatchBoundaryKind, EvidenceCompleteness, ExecutionTiming,
         ProcedureKind, ProofStatus,
     };
+    use crate::analyzer::structural::materialization::SourceExportBindingKind;
     use crate::analyzer::usages::call_binding::{
         CallBindingCoverage, CallBindingKind, CallBindingMapping, CallBindingReason,
     };
@@ -424,7 +485,7 @@ mod value_domain {
     };
     use brokk_bifrost_core::analyzer::structural::edges::{OwnerRelation, SiteClass};
     use brokk_bifrost_core::analyzer::structural::flow_state::{
-        FlowCertainty, FlowRelation, FlowSubjectKind, StateEventClass,
+        FlowCertainty, FlowRelation, FlowSubjectKind, StateEventClass, StateEventReadCause,
     };
     use brokk_bifrost_core::analyzer::structural::materialization::{
         DeclarationOrigin, ExportForm, GenerationInputClass, GenerationKind,
@@ -446,14 +507,32 @@ mod value_domain {
     pub(super) const LANGUAGE: &[&str] = Language::CONFIG_LABELS;
     pub(super) const LANGUAGE_DIALECT: &[&str] = LanguageDialect::STABLE_LABELS;
     pub(super) const STRUCTURAL_KIND: &[&str] = NormalizedKind::LABELS;
+    pub(super) const PYTHON_IMPORT_FORM: &[&str] = &["import", "from"];
+    pub(super) const PYTHON_IMPORT_TARGET_STATUS: &[&str] = &[
+        "resolved_local",
+        "no_workspace_target",
+        "ambiguous",
+        "unavailable",
+        "mixed",
+    ];
+    pub(super) const PYTHON_IMPORT_EXPORT_STATE: &[&str] = &[
+        "not_wildcard",
+        "absent",
+        "listed",
+        "unreadable",
+        "unresolved",
+        "ambiguous",
+        "unavailable",
+        "mixed",
+    ];
+    pub(super) const PYTHON_IMPORT_CYCLE_STATE: &[&str] = &["cyclic", "incomplete"];
     pub(super) const CODE_UNIT_KIND: &[&str] = CodeUnitType::DISPLAY_LOWERCASE_LABELS;
 
-    /// `declaration.kind` is refined to a normalized structural kind when the
+    /// `declaration.kind` is refined to a normalized declaration kind when the
     /// seed's own span matched the declaration exactly, and otherwise falls
-    /// back to the code unit's coarse type, so the field's domain is the union
-    /// of both vocabularies. A unit test pins the union against its two parts.
+    /// back to the code unit's coarse type. Keep this domain to the values
+    /// those two producers can emit, not every normalized syntax kind.
     pub(super) const DECLARATION_KIND: &[&str] = &[
-        "declaration",
         "callable",
         "function",
         "method",
@@ -461,36 +540,9 @@ mod value_domain {
         "lambda",
         "class",
         "import",
-        "call",
-        "assignment",
-        "field_access",
-        "identifier",
-        "literal",
-        "string_literal",
-        "numeric_literal",
-        "boolean_literal",
-        "null_literal",
-        "collection_literal",
-        "jsx_element",
-        "jsx_attribute",
-        "jsx_spread_attribute",
-        "object_property",
-        "computed_property",
-        "concurrent_spawn",
-        "resource_release",
-        "spread_element",
-        "return",
-        "throw",
-        "catch",
-        "if",
-        "loop",
-        "for_loop",
-        "while_loop",
-        "decorator",
         "parameter",
-        "block",
-        "field",
         "module",
+        "field",
         "macro",
         "file scope",
     ];
@@ -511,6 +563,7 @@ mod value_domain {
     pub(super) const USAGE_PROOF: &[&str] = brokk_bifrost_rql::schema::USAGE_PROOF_LABELS;
     pub(super) const REFERENCE_KIND: &[&str] = brokk_bifrost_rql::schema::REFERENCE_KIND_LABELS;
     pub(super) const CALL_SYNTAX_KIND: &[&str] = render::CALL_SYNTAX_KIND_LABELS;
+    pub(super) const CALL_RECEIVER_KIND: &[&str] = &["implicit", "this", "explicit", "unknown"];
     pub(super) const EXPRESSION_INPUT_KIND: &[&str] = render::EXPRESSION_INPUT_KIND_LABELS;
     pub(super) const JSX_ELEMENT_IDENTITY: &[&str] = &["intrinsic", "component", "unknown"];
     pub(super) const JSX_ATTRIBUTE_KIND: &[&str] = &["jsx_attribute", "jsx_spread_attribute"];
@@ -560,6 +613,25 @@ mod value_domain {
         member_family::MEMBER_FAMILY_EDGE_PROOF_LABELS;
     pub(super) const MEMBER_FAMILY_EDGE_COMPLETENESS: &[&str] =
         render::MEMBER_FAMILY_EDGE_COMPLETENESS_LABELS;
+    pub(super) const PYTHON_HIERARCHY_FACT_KIND: &[&str] =
+        super::super::python_class_hierarchy::PYTHON_HIERARCHY_FACT_KIND_LABELS;
+    pub(super) const PYTHON_HIERARCHY_OUTCOME: &[&str] =
+        super::super::python_class_hierarchy::PYTHON_HIERARCHY_OUTCOME_LABELS;
+    pub(super) const PYTHON_HIERARCHY_REASON: &[&str] =
+        super::super::python_class_hierarchy::PYTHON_HIERARCHY_REASON_LABELS;
+    pub(super) const PYTHON_BASE_RESOLUTION: &[&str] =
+        super::super::python_class_hierarchy::PYTHON_BASE_RESOLUTION_LABELS;
+    pub(super) const PYTHON_HIERARCHY_COVERAGE: &[&str] =
+        super::super::python_class_hierarchy::PYTHON_HIERARCHY_COVERAGE_LABELS;
+    pub(super) const PYTHON_SPECIAL_METHOD_STATUS: &[&str] = &[
+        "compatible",
+        "too_few",
+        "too_many",
+        "required_optional_second",
+        "required_optional_third",
+        "placeholder",
+        "incomplete",
+    ];
 
     pub(super) const CALL_KIND: &[&str] = CallKind::LABELS;
     pub(super) const CALL_SHAPE_COVERAGE: &[&str] = CallShapeCoverage::LABELS;
@@ -577,15 +649,185 @@ mod value_domain {
     pub(super) const EFFECT_DERIVATION: &[&str] = EffectDerivation::LABELS;
     pub(super) const EFFECT_REASON: &[&str] = EffectReason::LABELS;
     pub(super) const EFFECT_COVERAGE: &[&str] = EffectCoverage::LABELS;
-    pub(super) const RESULT_CONTRACT_PREDICATE: &[&str] = &["null", "non_null", "true", "false"];
+    pub(super) const RESULT_CONTRACT_PREDICATE: &[&str] = &[
+        "null",
+        "non_null",
+        "true",
+        "false",
+        "eof",
+        "nonzero",
+        "minus_one",
+    ];
+    pub(super) const PYTHON_RULE_RELATION: &[&str] = &[
+        "documentation",
+        "useless_class",
+        "attribute_shadows_method",
+        "modification_of_default_value",
+        "procedure_return_profile",
+        "assertion_context",
+        "implicit_string_concatenation",
+        "undefined_placeholder_variable",
+        "call_result_use",
+        "tuple_return_groups",
+        "lambda_forwarding",
+        "iterator_return_protocol",
+        "builtin_identity",
+        "raise_not_implemented",
+        "illegal_raise",
+        "unexpected_raise_in_special_method",
+        "str_format_missing_argument",
+        "str_format_missing_named_argument",
+        "str_format_mixed_fields",
+        "str_format_surplus_argument",
+        "str_format_surplus_named_argument",
+        "percent_format_wrong_arguments",
+        "percent_format_unsupported_character",
+        "percent_format_not_mapping",
+        "url_construction",
+        "unsafe_cyclic_import",
+        "commented_out_code_block",
+        "overly_complex_delete",
+        "lexical_variable",
+        "lexical_variable_definition",
+        "lexical_variable_use",
+        "lexical_variable_peer",
+        "nested_loop_same_variable",
+    ];
+    pub(super) const RUST_POINTER_RELATION: &[&str] =
+        &["access_after_lifetime_ended", "access_invalid_pointer"];
+    pub(super) const RUST_POINTER_ORIGIN_KIND: &[&str] = &["stack_place", "allocation"];
+    pub(super) const RUST_POINTER_INVALIDATION_CAUSE: &[&str] = &[
+        "deallocated",
+        "owner_dropped",
+        "ownership_transferred",
+        "possible_reallocation",
+    ];
+    pub(super) const RUST_POINTER_ACCESS_KIND: &[&str] = &["read", "write", "read_write"];
+    pub(super) const RUST_POINTER_STRENGTH: &[&str] = &["must", "may"];
+    pub(super) const RUST_POINTER_BOUNDS: &[&str] = &[
+        "in_bounds",
+        "out_of_bounds",
+        "may_be_out_of_bounds",
+        "incomplete",
+    ];
+    pub(super) const RUST_POINTER_PROOF: &[&str] = &["proven", "unproven"];
+    pub(super) const RUST_POINTER_COMPLETENESS: &[&str] = &["complete", "partial"];
+    pub(super) const PYTHON_RULE_OUTCOME: &[&str] = &[
+        "mixed_returns",
+        "uniform_returns",
+        "mixed_tuple_arities",
+        "uniform_tuple_arities",
+        "forwarded",
+        "changed",
+        "consumed",
+        "discarded",
+        "may_be_uninitialized",
+        "iterator",
+        "non_iterator",
+        "builtin",
+        "shadowed",
+        "legal",
+        "illegal",
+        "allowed",
+        "unexpected",
+        "issue",
+        "no_issue",
+        "full_control",
+        "partial_control",
+        "unknown",
+        "open",
+        "excluded",
+        "variable",
+        "definition",
+        "use",
+        "peer",
+        "loop_pair",
+        "code",
+    ];
+    pub(super) const PYTHON_RULE_PROOF: &[&str] = &["proven", "best_effort", "none"];
+    pub(super) const PYTHON_RULE_COMPLETENESS: &[&str] = &["complete", "partial"];
+    pub(super) const PYTHON_TRI_STATE: &[&str] = &["yes", "no", "unknown"];
+    pub(super) const PYTHON_CALLABLE_EVALUATION_TIME: &[&str] =
+        &["stable_at_creation", "invocation", "unknown"];
+    pub(super) const PYTHON_VARIABLE_SCOPE_KIND: &[&str] =
+        &["module", "function", "class", "comprehension"];
+    pub(super) const PYTHON_VARIABLE_DEFINITION_KIND: &[&str] = &[
+        "assignment",
+        "parameter",
+        "loop_target",
+        "import",
+        "augmented",
+        "del",
+        "with_target",
+        "except_target",
+        "function_declaration",
+        "class_declaration",
+        "pattern_target",
+    ];
+    pub(super) const PYTHON_VARIABLE_REACHABILITY: &[&str] = &["reachable", "unreachable", "open"];
+    pub(super) const PYTHON_VARIABLE_ACCESS_KIND: &[&str] = &["read", "write"];
+    pub(super) const PYTHON_RETURN_CONTRACT: &[&str] = &[
+        "always_none",
+        "explicit_none",
+        "may_return_value",
+        "unknown",
+    ];
+    pub(super) const PYTHON_RESULT_USE: &[&str] = &["consumed", "discarded", "unknown"];
     pub(super) const RESULT_USE_VALIDATION: &[&str] =
         &["unused", "satisfied", "violated", "unknown"];
-    pub(super) const RESULT_OBLIGATION_KIND: &[&str] =
-        &["pure_transformation_value", "fallible_status"];
-    pub(super) const RESULT_OBLIGATION_USE: &[&str] = &["discarded", "other_context", "unknown"];
+    pub(super) const RESULT_OBLIGATION_KIND: &[&str] = &[
+        "pure_transformation_value",
+        "fallible_status",
+        "must_use_value",
+    ];
+    pub(super) const RESULT_OBLIGATION_PROVENANCE: &[&str] = &["reviewed", "native"];
+    pub(super) const RESULT_OBLIGATION_BASIS: &[&str] = &[
+        "static_signature",
+        "dispatch_agreement",
+        "builtin_receiver_assumption",
+        "libc_standard_declaration",
+        "python_stdlib_function",
+        "exact_literal_receiver",
+    ];
+    pub(super) const RESULT_OBLIGATION_USE: &[&str] = &[
+        "discarded",
+        "other_context",
+        "consumed",
+        "intentional_discard",
+        "open",
+        "unknown",
+    ];
+    pub(super) const RESULT_OBLIGATION_RESULT_USE_DETAIL: &[&str] = &[
+        "go_blank_assignment",
+        "rust_let_underscore",
+        "rust_drop",
+        "cpp_void_cast",
+        "javascript_void",
+        "csharp_discard_assignment",
+        "missing_call",
+        "ambiguous_call",
+        "recovered_syntax",
+        "deferred_context",
+        "unsupported_syntax",
+        "unclassified_syntax",
+        "missing_result_port",
+    ];
     pub(super) const RESULT_OBLIGATION_REASON: &[&str] = &[
         "unsupported_language",
         "result_use_unclassified",
+        "go_blank_assignment",
+        "rust_let_underscore",
+        "rust_drop",
+        "cpp_void_cast",
+        "javascript_void",
+        "csharp_discard_assignment",
+        "missing_call",
+        "ambiguous_call",
+        "recovered_syntax",
+        "deferred_context",
+        "unsupported_syntax",
+        "unclassified_syntax",
+        "missing_result_port",
         "dispatch_unresolved",
         "dispatch_interrupted",
         "dispatch_truncated",
@@ -596,6 +838,22 @@ mod value_domain {
         "model_conflict",
         "obligation_unavailable",
         "obligation_conflict",
+        "native_signature_unknown",
+        "native_target_unknown",
+        "native_rust_analyzer",
+        "native_target_language",
+        "native_target_source",
+        "native_target_declaration",
+        "native_trait_signature_unknown",
+        "native_trait_signature_source",
+        "native_trait_signature_declaration",
+        "native_return_type_depth",
+        "native_return_type_source",
+        "native_return_type_declaration",
+        "native_return_type_unknown",
+        "native_return_type_unresolved",
+        "native_std_type_unmodeled",
+        "native_excluded_stdlib_never_error",
     ];
     pub(super) const RESULT_SUBJECT_OUTCOME: &[&str] = CodeQueryResultSubjectOutcome::LABELS;
     pub(super) const RESULT_CONTRACT_USE_KIND: &[&str] = &[
@@ -629,15 +887,6 @@ mod value_domain {
     pub(super) const SWITCH_KIND: &[&str] = &["expression", "expressionless", "type"];
     pub(super) const SWITCH_SELECTOR_DOMAIN: &[&str] = &["boolean", "open"];
     pub(super) const SWITCH_VERDICT: &[&str] = &["exhaustive", "non_exhaustive", "unknown"];
-    pub(super) const CONCURRENT_ACCESS_MODE: &[&str] = &["read", "write"];
-    pub(super) const CONCURRENT_TASK_RELATION: &[&str] =
-        &["parent_child", "siblings", "nested", "repeated"];
-    pub(super) const CONCURRENT_ORDERING: &[&str] = &["unordered", "happens_before", "open"];
-    pub(super) const CONCURRENT_PROTECTION: &[&str] =
-        &["unprotected", "compatible_lock", "atomic_only", "open"];
-    pub(super) const CONCURRENT_VERDICT: &[&str] = &["conflict", "ordered", "protected"];
-    pub(super) const CONCURRENT_PROOF: &[&str] = &["proven", "open"];
-    pub(super) const CONCURRENT_COVERAGE: &[&str] = &["exhaustive", "open"];
     pub(super) const CLASS_SET_STATUS: &[&str] = ClassSetStatus::LABELS;
     pub(super) const ABSENT_MEMBER_PROOF: &[&str] = AbsentMemberProof::LABELS;
     pub(super) const ABSENT_MEMBER_WITNESS_STATUS: &[&str] =
@@ -650,8 +899,12 @@ mod value_domain {
         "selector_domain_open",
         "expressionless_without_default",
     ];
-    pub(super) const ASSIGNMENT_RELATION_KIND: &[&str] =
-        &["self_assignment", "failed_swap", "overwritten_unread"];
+    pub(super) const ASSIGNMENT_RELATION_KIND: &[&str] = &[
+        "self_assignment",
+        "self_initializer",
+        "failed_swap",
+        "overwritten_unread",
+    ];
     pub(super) const ASSIGNMENT_STORAGE_KIND: &[&str] = &[
         "ordinary_local",
         "nonlocal",
@@ -665,6 +918,7 @@ mod value_domain {
     ];
     pub(super) const ASSIGNMENT_VERDICT: &[&str] = &[
         "self_assignment",
+        "self_initializer",
         "failed_swap",
         "overwritten_unread",
         "different",
@@ -687,6 +941,20 @@ mod value_domain {
     ];
 
     pub(super) const SIGNATURE_COVERAGE: &[&str] = SignatureCoverage::LABELS;
+    pub(super) const LITERAL_OCCURRENCE_KIND: &[&str] = &[
+        "string",
+        "integer",
+        "boolean",
+        "null",
+        "numeric",
+        "character",
+        "collection",
+        "unsupported",
+    ];
+    pub(super) const LITERAL_OCCURRENCE_SCOPE_KIND: &[&str] = &["file", "module", "callable"];
+    pub(super) const LITERAL_OCCURRENCE_COVERAGE: &[&str] = &["exact", "incomplete"];
+    pub(super) const CALLABLE_METRICS_COVERAGE: &[&str] = &["exact", "incomplete", "unrecorded"];
+    pub(super) const PYTHON_METHOD_KIND: &[&str] = &["instance", "static", "class", "unknown"];
     pub(super) const DECORATOR_BINDING_STATUS: &[&str] = decorator_binding::BINDING_STATUS;
     pub(super) const DECORATOR_COMPLETION: &[&str] = decorator_binding::COMPLETION;
     pub(super) const DECORATOR_COVERAGE: &[&str] = decorator_binding::COVERAGE;
@@ -722,6 +990,8 @@ mod value_domain {
     pub(super) const GENERATION_KIND: &[&str] = GenerationKind::LABELS;
     pub(super) const GENERATION_INPUT: &[&str] = GenerationInputClass::LABELS;
     pub(super) const EXPORT_FORM: &[&str] = ExportForm::LABELS;
+    pub(super) const EXPORT_DEFINITION_STATUS: &[&str] = &["defined", "undefined", "unknown"];
+    pub(super) const EXPORT_BINDING_KIND: &[&str] = SourceExportBindingKind::LABELS;
     pub(super) const DECLARATION_ORIGIN: &[&str] = DeclarationOrigin::LABELS;
     pub(super) const SEGMENT_RESOLUTION_STATUS: &[&str] = SegmentResolutionStatus::LABELS;
 
@@ -731,6 +1001,8 @@ mod value_domain {
         brokk_bifrost_core::analyzer::structural::edges::EdgeProvenance::LABELS;
 
     pub(super) const STATE_EVENT_CLASS: &[&str] = StateEventClass::LABELS;
+    pub(super) const STATE_EVENT_READ_CAUSE: &[&str] = StateEventReadCause::LABELS;
+    pub(super) const BINDING_INITIALIZER_CALL_ROLE: &[&str] = &["result", "receiver"];
     pub(super) const FLOW_SUBJECT: &[&str] = FlowSubjectKind::LABELS;
     pub(super) const FLOW_RELATION: &[&str] = FlowRelation::LABELS;
     pub(super) const FLOW_CERTAINTY: &[&str] = FlowCertainty::LABELS;
@@ -748,6 +1020,7 @@ mod value_domain {
         "contradictory_condition",
         "subsumed_condition",
         "redundant_boolean_return",
+        "empty_arm",
     ];
     pub(super) const BRANCH_VERDICT: &[&str] = &["proven", "distinct", "open"];
     pub(super) const LOOP_KIND: &[&str] = &["while", "for", "do"];
@@ -854,6 +1127,14 @@ mod value_domain {
     ];
     pub(super) const CONFIGURATION_PROVENANCE: &[&str] = &["authored"];
     pub(super) const CONFIGURATION_COMPLETENESS: &[&str] = &["complete", "incomplete"];
+    pub(super) const CROSS_DOMAIN_OPERATOR: &[&str] =
+        super::super::super::cross_domain::CROSS_DOMAIN_OPERATOR_LABELS;
+    pub(super) const CROSS_DOMAIN_ROW_DOMAIN: &[&str] =
+        super::super::super::cross_domain::CROSS_DOMAIN_ROW_DOMAIN_LABELS;
+    pub(super) const CROSS_DOMAIN_RELATION: &[&str] =
+        super::super::super::cross_domain::CROSS_DOMAIN_RELATION_LABELS;
+    pub(super) const CROSS_DOMAIN_BINDING: &[&str] =
+        super::super::super::cross_domain::CrossDomainBinding::LABELS;
     /// The three boundary roles plus the `interior` label an absent boundary
     /// renders as; the producer is the row projector, and the exact literal set
     /// lives beside the enum it extends rather than being restated here.
@@ -885,6 +1166,7 @@ pub enum CodeQueryRowScalarRef<'a> {
     StableId(&'a str),
     String(&'a str),
     StringList(&'a [String]),
+    IntegerList(&'a [u64]),
     Integer(u64),
     Boolean(bool),
     ConstrainedEnum(&'a str),
@@ -897,6 +1179,7 @@ impl CodeQueryRowScalarRef<'_> {
             Self::StableId(_) => CodeQueryRowScalarType::StableId,
             Self::String(_) => CodeQueryRowScalarType::String,
             Self::StringList(_) => CodeQueryRowScalarType::StringList,
+            Self::IntegerList(_) => CodeQueryRowScalarType::IntegerList,
             Self::Integer(_) => CodeQueryRowScalarType::Integer,
             Self::Boolean(_) => CodeQueryRowScalarType::Boolean,
             Self::ConstrainedEnum(_) => CodeQueryRowScalarType::ConstrainedEnum,
@@ -1170,8 +1453,46 @@ detailed_row_domains! {
         fields: [
                     CodeQueryRowField::optional("id", Scalar::StableId),
                     CodeQueryRowField::optional("ast_id", Scalar::StableId),
+                    CodeQueryRowField::optional("parent_ast_id", Scalar::StableId),
+                    CodeQueryRowField::optional("left_ast_id", Scalar::StableId),
+                    CodeQueryRowField::optional("right_ast_id", Scalar::StableId),
+                    CodeQueryRowField::optional("object_ast_id", Scalar::StableId),
+                    CodeQueryRowField::optional("object_name", Scalar::String),
+                    CodeQueryRowField::optional("callee_ast_id", Scalar::StableId),
+                    CodeQueryRowField::optional("receiver_ast_id", Scalar::StableId),
+                    CodeQueryRowField::optional("enclosing_callable_ast_id", Scalar::StableId),
+                    CodeQueryRowField::optional("name", Scalar::String),
+                    CodeQueryRowField::optional("string_value", Scalar::String),
+                    CodeQueryRowField::optional("construct", Scalar::String),
+                    CodeQueryRowField::optional_enum("occurrence_role", value_domain::OCCURRENCE_ROLE),
+                    CodeQueryRowField::optional("element_index", Scalar::Integer),
+                    CodeQueryRowField::optional("element_count", Scalar::Integer),
+                    CodeQueryRowField::optional("is_last_element", Scalar::Boolean),
+                    CodeQueryRowField::optional("parameter_index", Scalar::Integer),
                     CodeQueryRowField::required_enum("language", value_domain::LANGUAGE),
                     CodeQueryRowField::required_enum("kind", value_domain::STRUCTURAL_KIND),
+                    CodeQueryRowField::optional("python_import_complete", Scalar::Boolean),
+                    CodeQueryRowField::optional_enum("python_import_form", value_domain::PYTHON_IMPORT_FORM),
+                    CodeQueryRowField::optional("python_import_module", Scalar::String),
+                    CodeQueryRowField::optional("python_import_name", Scalar::String),
+                    CodeQueryRowField::optional("python_import_alias", Scalar::String),
+                    CodeQueryRowField::optional("python_import_modules", Scalar::StringList),
+                    CodeQueryRowField::optional("python_import_names", Scalar::StringList),
+                    CodeQueryRowField::optional("python_import_aliases", Scalar::StringList),
+                    CodeQueryRowField::optional("python_import_wildcard", Scalar::Boolean),
+                    CodeQueryRowField::optional("python_import_module_scope", Scalar::Boolean),
+                    CodeQueryRowField::optional("python_import_source_order", Scalar::Integer),
+                    CodeQueryRowField::optional("python_import_in_import_error_handler", Scalar::Boolean),
+                    CodeQueryRowField::optional("python_import_in_main_guard", Scalar::Boolean),
+                    CodeQueryRowField::optional("python_import_target_paths", Scalar::StringList),
+                    CodeQueryRowField::optional_enum("python_import_target_status", value_domain::PYTHON_IMPORT_TARGET_STATUS),
+                    CodeQueryRowField::optional("python_import_repeated", Scalar::Boolean),
+                    CodeQueryRowField::optional("python_import_duplicate", Scalar::Boolean),
+                    CodeQueryRowField::optional("python_import_mixed_form", Scalar::Boolean),
+                    CodeQueryRowField::optional("python_import_own_module", Scalar::Boolean),
+                    CodeQueryRowField::optional("python_import_polluting", Scalar::Boolean),
+                    CodeQueryRowField::optional_enum("python_import_export_state", value_domain::PYTHON_IMPORT_EXPORT_STATE),
+                    CodeQueryRowField::optional_enum("python_import_cycle_state", value_domain::PYTHON_IMPORT_CYCLE_STATE),
         ],
     },
     Declaration => "declaration" {
@@ -1236,43 +1557,6 @@ detailed_row_domains! {
                     CodeQueryRowField::required("path_complete", Scalar::Boolean),
                     CodeQueryRowField::required("analysis_complete", Scalar::Boolean),
                     CodeQueryRowField::required("abstained", Scalar::Boolean),
-        ],
-    },
-    ConcurrentAccessConflict => "concurrent_access_conflict" {
-        display_range: |value| Some(value.range),
-        identities: None,
-        fields: [
-                    CodeQueryRowField::required("id", Scalar::StableId),
-                    CodeQueryRowField::required("root_procedure_id", Scalar::StableId),
-                    CodeQueryRowField::optional("ast_id", Scalar::StableId),
-                    CodeQueryRowField::required("location_id", Scalar::StableId),
-                    CodeQueryRowField::required("location_kind", Scalar::String),
-                    CodeQueryRowField::required("first_procedure_id", Scalar::StableId),
-                    CodeQueryRowField::required("first_point_id", Scalar::Integer),
-                    CodeQueryRowField::required_enum("first_access", value_domain::CONCURRENT_ACCESS_MODE),
-                    CodeQueryRowField::required("first_path", Scalar::String),
-                    CodeQueryRowField::required("first_start_line", Scalar::Integer),
-                    CodeQueryRowField::required("first_start_column", Scalar::Integer),
-                    CodeQueryRowField::required("first_end_line", Scalar::Integer),
-                    CodeQueryRowField::required("first_end_column", Scalar::Integer),
-                    CodeQueryRowField::required("first_start_byte", Scalar::Integer),
-                    CodeQueryRowField::required("first_end_byte", Scalar::Integer),
-                    CodeQueryRowField::required("second_procedure_id", Scalar::StableId),
-                    CodeQueryRowField::required("second_point_id", Scalar::Integer),
-                    CodeQueryRowField::required_enum("second_access", value_domain::CONCURRENT_ACCESS_MODE),
-                    CodeQueryRowField::required("second_path", Scalar::String),
-                    CodeQueryRowField::required("second_start_line", Scalar::Integer),
-                    CodeQueryRowField::required("second_start_column", Scalar::Integer),
-                    CodeQueryRowField::required("second_end_line", Scalar::Integer),
-                    CodeQueryRowField::required("second_end_column", Scalar::Integer),
-                    CodeQueryRowField::required("second_start_byte", Scalar::Integer),
-                    CodeQueryRowField::required("second_end_byte", Scalar::Integer),
-                    CodeQueryRowField::required_enum("task_relation", value_domain::CONCURRENT_TASK_RELATION),
-                    CodeQueryRowField::required_enum("ordering", value_domain::CONCURRENT_ORDERING),
-                    CodeQueryRowField::required_enum("protection", value_domain::CONCURRENT_PROTECTION),
-                    CodeQueryRowField::required_enum("verdict", value_domain::CONCURRENT_VERDICT),
-                    CodeQueryRowField::required_enum("proof", value_domain::CONCURRENT_PROOF),
-                    CodeQueryRowField::required_enum("coverage", value_domain::CONCURRENT_COVERAGE),
         ],
     },
     TypestateWitness => "typestate_witness" {
@@ -1365,6 +1649,27 @@ detailed_row_domains! {
                     CodeQueryRowField::required("ambiguous", Scalar::Boolean),
         ],
     },
+    DependencyEvidence => "dependency_evidence" {
+        display_range: |value| value.range,
+        identities: None,
+        fields: [
+            CodeQueryRowField::required("id", Scalar::StableId),
+            CodeQueryRowField::required("path", Scalar::String),
+            CodeQueryRowField::required("ecosystem", Scalar::String),
+            CodeQueryRowField::required("package", Scalar::String),
+            CodeQueryRowField::required("evidence_kind", Scalar::String),
+            CodeQueryRowField::optional("version_requirement", Scalar::String),
+            CodeQueryRowField::optional("exact_version", Scalar::String),
+            CodeQueryRowField::optional("source", Scalar::String),
+            CodeQueryRowField::optional("locator", Scalar::String),
+            CodeQueryRowField::optional("declared_by", Scalar::StableId),
+            CodeQueryRowField::required("scope", Scalar::String),
+            CodeQueryRowField::required("source_digest", Scalar::String),
+            CodeQueryRowField::required("start_byte", Scalar::Integer),
+            CodeQueryRowField::required("end_byte", Scalar::Integer),
+            CodeQueryRowField::required("complete", Scalar::Boolean),
+        ],
+    },
     ConfigurationFact => "configuration_fact" {
         display_range: |value| Some(value.range),
         identities: None,
@@ -1378,6 +1683,7 @@ detailed_row_domains! {
                     CodeQueryRowField::required_enum("node_kind", value_domain::CONFIGURATION_NODE_KIND),
                     CodeQueryRowField::optional_enum("role", value_domain::CONFIGURATION_ROLE),
                     CodeQueryRowField::optional_enum("scalar_kind", value_domain::CONFIGURATION_SCALAR_KIND),
+                    CodeQueryRowField::optional("value", Scalar::String),
                     CodeQueryRowField::required_enum("provenance", value_domain::CONFIGURATION_PROVENANCE),
                     CodeQueryRowField::required_enum("completeness", value_domain::CONFIGURATION_COMPLETENESS),
                     CodeQueryRowField::optional("key", Scalar::String),
@@ -1385,6 +1691,31 @@ detailed_row_domains! {
                     CodeQueryRowField::optional("index", Scalar::Integer),
                     CodeQueryRowField::required("route", Scalar::String),
                     CodeQueryRowField::required("ordinal", Scalar::Integer),
+        ],
+    },
+    CrossDomain => "cross_domain" {
+        display_range: |value| value.range,
+        identities: None,
+        // Issue #3284. `domain` is the required discriminator; the code and
+        // configuration columns are present exactly when the row carries
+        // that side. `configuration_id` equals the configuration fact row's
+        // `id`, so a plan can join the two by stable key.
+        fields: [
+                    CodeQueryRowField::required("id", Scalar::StableId),
+                    CodeQueryRowField::required_enum("operator", value_domain::CROSS_DOMAIN_OPERATOR),
+                    CodeQueryRowField::required_enum("domain", value_domain::CROSS_DOMAIN_ROW_DOMAIN),
+                    CodeQueryRowField::optional_enum("relation", value_domain::CROSS_DOMAIN_RELATION),
+                    CodeQueryRowField::optional_enum("binding", value_domain::CROSS_DOMAIN_BINDING),
+                    CodeQueryRowField::optional("key", Scalar::String),
+                    CodeQueryRowField::optional("code_id", Scalar::StableId),
+                    CodeQueryRowField::optional("code_path", Scalar::String),
+                    CodeQueryRowField::optional("configuration_id", Scalar::StableId),
+                    CodeQueryRowField::optional("configuration_path", Scalar::String),
+                    CodeQueryRowField::optional("mitigated", Scalar::Boolean),
+                    CodeQueryRowField::optional("dependency_id", Scalar::StableId),
+                    CodeQueryRowField::optional("owner", Scalar::StableId),
+                    CodeQueryRowField::optional("mapping_id", Scalar::StableId),
+                    CodeQueryRowField::required("path", Scalar::String),
         ],
     },
     File => "file" {
@@ -1411,10 +1742,18 @@ detailed_row_domains! {
         display_range: |value| Some(value.range),
         identities: Call,
         fields: [
+                    CodeQueryRowField::optional("site_id", Scalar::StableId),
+                    CodeQueryRowField::optional("program_point_id", Scalar::StableId),
                     CodeQueryRowField::optional("caller_id", Scalar::DeclarationIdentity),
                     CodeQueryRowField::optional("callee_id", Scalar::DeclarationIdentity),
                     CodeQueryRowField::required_enum("call_kind", value_domain::CALL_SYNTAX_KIND),
                     CodeQueryRowField::required_enum("proof", value_domain::USAGE_PROOF),
+                    CodeQueryRowField::required_enum(
+                        "receiver_kind",
+                        value_domain::CALL_RECEIVER_KIND
+                    ),
+                    CodeQueryRowField::optional("argument_identity", Scalar::StableId),
+                    CodeQueryRowField::optional("caller_parameter_identity", Scalar::StableId),
         ],
     },
     ExpressionSite => "expression_site" {
@@ -1545,6 +1884,7 @@ detailed_row_domains! {
                     CodeQueryRowField::required("site_id", Scalar::StableId),
                     CodeQueryRowField::required("site_ast_id", Scalar::StableId),
                     CodeQueryRowField::optional("callee_name", Scalar::String),
+                    CodeQueryRowField::optional("resolved_external_callee", Scalar::String),
                     CodeQueryRowField::required_enum("call_kind", value_domain::CALL_KIND),
                     CodeQueryRowField::required_enum("coverage", value_domain::CALL_SHAPE_COVERAGE),
                     CodeQueryRowField::required("group_count", Scalar::Integer),
@@ -1591,6 +1931,7 @@ detailed_row_domains! {
                     CodeQueryRowField::required("site_id", Scalar::StableId),
                     CodeQueryRowField::required("argument_index", Scalar::Integer),
                     CodeQueryRowField::optional("name", Scalar::String),
+                    CodeQueryRowField::optional("literal_value", Scalar::String),
                     CodeQueryRowField::required("spread", Scalar::Boolean),
         ],
     },
@@ -1605,8 +1946,12 @@ detailed_row_domains! {
                     CodeQueryRowField::required("id", Scalar::StableId),
                     CodeQueryRowField::required("site_id", Scalar::StableId),
                     CodeQueryRowField::required("site_ast_id", Scalar::StableId),
+                    CodeQueryRowField::optional("program_point_id", Scalar::StableId),
                     CodeQueryRowField::optional("group_id", Scalar::StableId),
                     CodeQueryRowField::optional("argument_id", Scalar::StableId),
+                    CodeQueryRowField::optional("binding_id", Scalar::StableId),
+                    CodeQueryRowField::optional("literal_value", Scalar::String),
+                    CodeQueryRowField::optional("path_identity", Scalar::String),
                     CodeQueryRowField::optional("target_id", Scalar::DeclarationIdentity),
                     CodeQueryRowField::optional("declared_target_id", Scalar::StableId),
                     CodeQueryRowField::optional("semantic_target_id", Scalar::StableId),
@@ -1778,7 +2123,13 @@ detailed_row_domains! {
             CodeQueryRowField::optional("result_ordinal", Scalar::Integer),
             CodeQueryRowField::optional_enum("obligation_kind", value_domain::RESULT_OBLIGATION_KIND),
             CodeQueryRowField::optional_enum("failure_predicate", value_domain::RESULT_CONTRACT_PREDICATE),
+            CodeQueryRowField::optional_enum("provenance", value_domain::RESULT_OBLIGATION_PROVENANCE),
+            CodeQueryRowField::optional_enum("obligation_basis", value_domain::RESULT_OBLIGATION_BASIS),
             CodeQueryRowField::required_enum("result_use", value_domain::RESULT_OBLIGATION_USE),
+            CodeQueryRowField::optional_enum(
+                "result_use_detail",
+                value_domain::RESULT_OBLIGATION_RESULT_USE_DETAIL,
+            ),
             CodeQueryRowField::required_enum("coverage", value_domain::EFFECT_COVERAGE),
             CodeQueryRowField::optional_enum("reason", value_domain::RESULT_OBLIGATION_REASON),
             CodeQueryRowField::optional("pack_id", Scalar::String),
@@ -2046,6 +2397,7 @@ detailed_row_domains! {
                     CodeQueryRowField::required("ordinal", Scalar::Integer),
                     CodeQueryRowField::required_enum("coverage", value_domain::SIGNATURE_COVERAGE),
                     CodeQueryRowField::required_enum("role", value_domain::DECLARATION_ROLE),
+                    CodeQueryRowField::optional("first_parameter", Scalar::String),
                     CodeQueryRowField::optional("required_arity", Scalar::Integer),
                     CodeQueryRowField::optional("total_arity", Scalar::Integer),
                     CodeQueryRowField::required("repeated", Scalar::Boolean),
@@ -2054,9 +2406,62 @@ detailed_row_domains! {
                         "receiver_contract",
                         value_domain::RECEIVER_CONTRACT
                     ),
+                    CodeQueryRowField::optional_enum(
+                        "python_method_kind",
+                        value_domain::PYTHON_METHOD_KIND
+                    ),
+                    CodeQueryRowField::optional("python_owner_is_metaclass", Scalar::Boolean),
+                    CodeQueryRowField::optional("python_owner_is_zope_interface", Scalar::Boolean),
+                    CodeQueryRowField::optional("python_used_in_class_body", Scalar::Boolean),
+                    CodeQueryRowField::optional("python_no_args_with_decorator", Scalar::Boolean),
                     CodeQueryRowField::optional("return_type", Scalar::String),
                     CodeQueryRowField::required("declaration_only", Scalar::Boolean),
                     CodeQueryRowField::required("parameter_count", Scalar::Integer),
+                    CodeQueryRowField::optional_enum(
+                        "special_method_status",
+                        value_domain::PYTHON_SPECIAL_METHOD_STATUS
+                    ),
+        ],
+    },
+    LiteralOccurrence => "literal_occurrence" {
+        display_range: |value| Some(value.range),
+        identities: None,
+        fields: [
+                    CodeQueryRowField::required("id", Scalar::StableId),
+                    CodeQueryRowField::required("scope_id", Scalar::StableId),
+                    CodeQueryRowField::required_enum(
+                        "scope_kind",
+                        value_domain::LITERAL_OCCURRENCE_SCOPE_KIND
+                    ),
+                    CodeQueryRowField::required("path", Scalar::String),
+                    CodeQueryRowField::required_enum("language", value_domain::LANGUAGE),
+                    CodeQueryRowField::required_enum(
+                        "kind",
+                        value_domain::LITERAL_OCCURRENCE_KIND
+                    ),
+                    CodeQueryRowField::optional("identity", Scalar::String),
+                    CodeQueryRowField::required_enum(
+                        "coverage",
+                        value_domain::LITERAL_OCCURRENCE_COVERAGE
+                    ),
+                    CodeQueryRowField::required("trivial", Scalar::Boolean),
+                    CodeQueryRowField::optional("parent_call_id", Scalar::StableId),
+                    CodeQueryRowField::optional("argument_index", Scalar::Integer),
+        ],
+    },
+    CallableMetrics => "callable_metrics" {
+        display_range: |value| Some(value.range),
+        identities: None,
+        fields: [
+                    CodeQueryRowField::required("id", Scalar::StableId),
+                    CodeQueryRowField::optional("callable_id", Scalar::DeclarationIdentity),
+                    CodeQueryRowField::required("site_id", Scalar::StableId),
+                    CodeQueryRowField::required("path", Scalar::String),
+                    CodeQueryRowField::required_enum("language", value_domain::LANGUAGE),
+                    CodeQueryRowField::required_enum("coverage", value_domain::CALLABLE_METRICS_COVERAGE),
+                    CodeQueryRowField::optional("max_nesting", Scalar::Integer),
+                    CodeQueryRowField::optional("cognitive_complexity", Scalar::Integer),
+                    CodeQueryRowField::optional("owned_body_span_lines", Scalar::Integer),
         ],
     },
     SignatureParameter => "signature_parameter" {
@@ -2166,6 +2571,27 @@ detailed_row_domains! {
                     CodeQueryRowField::required_enum("completeness", value_domain::RECEIVER_COVERAGE),
         ],
     },
+    PointsToCandidate => "points_to_candidate" {
+        display_range: |value| Some(value.range),
+        identities: None,
+        fields: [
+                    CodeQueryRowField::required("id", Scalar::StableId),
+                    CodeQueryRowField::required("site_id", Scalar::StableId),
+                    CodeQueryRowField::optional("program_point_id", Scalar::StableId),
+                    CodeQueryRowField::required("candidate_index", Scalar::Integer),
+                    CodeQueryRowField::optional("object_id", Scalar::String),
+                    CodeQueryRowField::optional_enum(
+                        "object_cardinality",
+                        value_domain::OBJECT_CARDINALITY
+                    ),
+                    CodeQueryRowField::required_enum("proof", value_domain::EVIDENCE_PROOF),
+                    CodeQueryRowField::required_enum(
+                        "completeness",
+                        value_domain::EVIDENCE_COMPLETENESS
+                    ),
+                    CodeQueryRowField::required_enum("coverage", value_domain::CANDIDATE_COVERAGE),
+        ],
+    },
     MemberSelection => "member_selection" {
         display_range: |value| Some(value.range),
         identities: None,
@@ -2218,6 +2644,7 @@ detailed_row_domains! {
                     CodeQueryRowField::optional("site_ast_id", Scalar::StableId),
                     CodeQueryRowField::required("ordinal", Scalar::Integer),
                     CodeQueryRowField::required("target_id", Scalar::StableId),
+                    CodeQueryRowField::optional("target_fq_name", Scalar::String),
                     CodeQueryRowField::optional("target_declaration_id", Scalar::DeclarationIdentity),
                     CodeQueryRowField::required_enum("proof", value_domain::EVIDENCE_PROOF),
                     CodeQueryRowField::required_enum(
@@ -2273,6 +2700,36 @@ detailed_row_domains! {
                     ),
                     CodeQueryRowField::required_enum("coverage", value_domain::MEMBER_FAMILY_COVERAGE),
                     CodeQueryRowField::optional("target_declaration_id", Scalar::DeclarationIdentity),
+        ],
+    },
+    PythonHierarchyFact => "python_hierarchy_fact" {
+        display_range: |value| Some(value.range),
+        identities: None,
+        fields: [
+                    CodeQueryRowField::required("id", Scalar::StableId),
+                    CodeQueryRowField::required("root_id", Scalar::StableId),
+                    CodeQueryRowField::required_enum("fact_kind", value_domain::PYTHON_HIERARCHY_FACT_KIND),
+                    CodeQueryRowField::required_enum("outcome", value_domain::PYTHON_HIERARCHY_OUTCOME),
+                    CodeQueryRowField::optional_enum("reason", value_domain::PYTHON_HIERARCHY_REASON),
+                    CodeQueryRowField::required_enum("coverage", value_domain::PYTHON_HIERARCHY_COVERAGE),
+                    CodeQueryRowField::optional("ordinal", Scalar::Integer),
+                    CodeQueryRowField::optional("base_spelling", Scalar::String),
+                    CodeQueryRowField::optional_enum("base_resolution", value_domain::PYTHON_BASE_RESOLUTION),
+                    CodeQueryRowField::optional("root_declaration_id", Scalar::StableId),
+                    CodeQueryRowField::optional("declaration_id", Scalar::StableId),
+                    CodeQueryRowField::optional("owner_id", Scalar::StableId),
+                    CodeQueryRowField::optional("target_id", Scalar::StableId),
+                    CodeQueryRowField::optional("target_owner_id", Scalar::StableId),
+                    CodeQueryRowField::optional("member_name", Scalar::String),
+                    CodeQueryRowField::optional("mro_rank", Scalar::Integer),
+                    CodeQueryRowField::optional("target_non_trivial", Scalar::Boolean),
+                    CodeQueryRowField::optional("target_reads_self", Scalar::Boolean),
+                    CodeQueryRowField::optional("base_branch_definition_count", Scalar::Integer),
+                    CodeQueryRowField::optional("has_strict_ordering", Scalar::Boolean),
+                    CodeQueryRowField::optional("has_non_strict_ordering", Scalar::Boolean),
+                    CodeQueryRowField::optional("total_ordering_decorator", Scalar::Boolean),
+                    CodeQueryRowField::optional("inherited_ne_present", Scalar::Boolean),
+                    CodeQueryRowField::optional("inherited_ne_delegates", Scalar::Boolean),
         ],
     },
     Occurrence => "occurrence" {
@@ -2401,6 +2858,21 @@ detailed_row_domains! {
                     CodeQueryRowField::required_enum("form", value_domain::EXPORT_FORM),
                     CodeQueryRowField::required("exported_name", Scalar::String),
                     CodeQueryRowField::optional("target_fq_name", Scalar::String),
+                    CodeQueryRowField::optional_enum(
+                        "definition_status",
+                        value_domain::EXPORT_DEFINITION_STATUS
+                    ),
+                    CodeQueryRowField::optional("definition_binding_name", Scalar::String),
+                    CodeQueryRowField::optional_enum(
+                        "definition_binding_kind",
+                        value_domain::EXPORT_BINDING_KIND
+                    ),
+                    CodeQueryRowField::optional("definition_binding_start_byte", Scalar::Integer),
+                    CodeQueryRowField::optional("definition_binding_end_byte", Scalar::Integer),
+                    CodeQueryRowField::optional("definition_binding_start_line", Scalar::Integer),
+                    CodeQueryRowField::optional("definition_binding_start_column", Scalar::Integer),
+                    CodeQueryRowField::optional("definition_binding_end_line", Scalar::Integer),
+                    CodeQueryRowField::optional("definition_binding_end_column", Scalar::Integer),
         ],
     },
     DeclarationState => "declaration_state" {
@@ -2462,6 +2934,10 @@ detailed_row_domains! {
                     CodeQueryRowField::required("procedure_id", Scalar::StableId),
                     CodeQueryRowField::required_enum("language", value_domain::LANGUAGE),
                     CodeQueryRowField::required_enum("event_class", value_domain::STATE_EVENT_CLASS),
+                    CodeQueryRowField::optional_enum(
+                        "read_cause",
+                        value_domain::STATE_EVENT_READ_CAUSE,
+                    ),
                     CodeQueryRowField::required_enum("subject", value_domain::FLOW_SUBJECT),
                     CodeQueryRowField::optional("member", Scalar::String),
                     CodeQueryRowField::required("subject_value", Scalar::Integer),
@@ -2473,6 +2949,17 @@ detailed_row_domains! {
                         value_domain::FLOW_STATE_COMPLETENESS
                     ),
                     CodeQueryRowField::required("generation", Scalar::Integer),
+        ],
+    },
+    BindingInitializerCall => "binding_initializer_call" {
+        display_range: |value| Some(value.range),
+        identities: None,
+        fields: [
+                    CodeQueryRowField::required("id", Scalar::StableId),
+                    CodeQueryRowField::required("establishment_event_id", Scalar::StableId),
+                    CodeQueryRowField::required("site_ast_id", Scalar::StableId),
+                    CodeQueryRowField::required_enum("initializer_role", value_domain::BINDING_INITIALIZER_CALL_ROLE),
+                    CodeQueryRowField::required_enum("language", value_domain::LANGUAGE),
         ],
     },
     FlowRelation => "flow_relation" {
@@ -2546,8 +3033,19 @@ detailed_row_domains! {
             CodeQueryRowField::optional_enum("reason", &[
                 "unsupported_language", "syntax_unavailable", "source_limit",
                 "snapshot_mismatch", "cancelled", "syntax_recovery", "missing_body",
-                "missing_try_body"
+                "missing_try_body", "caught_type_unresolved", "caught_type_ambiguous",
+                "caught_type_hierarchy_unknown"
             ]),
+            CodeQueryRowField::optional("caught_type", Scalar::DeclarationIdentity),
+            CodeQueryRowField::optional_enum(
+                "caught_type_relation",
+                &["system_exception", "not_system_exception", "unknown"],
+            ),
+            CodeQueryRowField::optional("has_filter", Scalar::Boolean),
+            CodeQueryRowField::optional_enum(
+                "rethrow_kind",
+                &["none", "bare", "caught_variable", "both", "unknown"],
+            ),
         ],
     },
     BranchRelation => "branch_relation" {
@@ -2577,6 +3075,61 @@ detailed_row_domains! {
             CodeQueryRowField::optional("repeat_edge_id", Scalar::StableId),
         ],
     },
+    CppExpression => "cpp_expression" {
+        display_range: |value| Some(value.range),
+        identities: None,
+        fields: [
+            CodeQueryRowField::required("id", Scalar::StableId),
+            CodeQueryRowField::required_enum("language", value_domain::LANGUAGE),
+            CodeQueryRowField::required_open_enum(
+                "kind",
+                "C++ expression kinds are adapter-owned and may grow with grammar support"
+            ),
+            CodeQueryRowField::optional("name", Scalar::String),
+            CodeQueryRowField::optional("type_text", Scalar::String),
+            CodeQueryRowField::required_open_enum(
+                "type_form",
+                "C++ written type forms are adapter-owned"
+            ),
+            CodeQueryRowField::required_open_enum(
+                "signedness",
+                "C++ signedness is exact only for selected scalar spellings"
+            ),
+            CodeQueryRowField::optional("width_bits", Scalar::Integer),
+            CodeQueryRowField::optional("literal_text", Scalar::String),
+            CodeQueryRowField::optional("integer_value", Scalar::String),
+            CodeQueryRowField::optional("array_extent", Scalar::Integer),
+            CodeQueryRowField::optional("array_is_reference", Scalar::Boolean),
+            CodeQueryRowField::optional("parameter_by_value", Scalar::Boolean),
+            CodeQueryRowField::optional("bit_field_width", Scalar::Integer),
+            CodeQueryRowField::optional("bit_field_anonymous", Scalar::Boolean),
+            CodeQueryRowField::optional("enum_scoped", Scalar::Boolean),
+            CodeQueryRowField::optional("enum_ordinal", Scalar::Integer),
+            CodeQueryRowField::optional("enum_value", Scalar::String),
+            CodeQueryRowField::optional("has_initializer", Scalar::Boolean),
+            CodeQueryRowField::optional(
+                "enum_has_implicit_before_nonreference",
+                Scalar::Boolean
+            ),
+            CodeQueryRowField::optional("return_top_level_const", Scalar::Boolean),
+            CodeQueryRowField::optional("member_function", Scalar::Boolean),
+            CodeQueryRowField::optional("member_function_const", Scalar::Boolean),
+            CodeQueryRowField::optional("type_size_bytes", Scalar::Integer),
+            CodeQueryRowField::optional("type_size_exact", Scalar::Boolean),
+            CodeQueryRowField::optional_enum(
+                "sizeof_operand_kind",
+                &["type", "expression"]
+            ),
+            CodeQueryRowField::optional("sizeof_operand_is_parameter", Scalar::Boolean),
+            CodeQueryRowField::optional("sizeof_has_side_effect", Scalar::Boolean),
+            CodeQueryRowField::optional("loop_has_short_ancestor", Scalar::Boolean),
+            CodeQueryRowField::required_enum(
+                "completeness",
+                &["complete", "open"]
+            ),
+            CodeQueryRowField::optional("completeness_reason", Scalar::String),
+        ],
+    },
     StatementReachability => "statement_reachability" {
         display_range: |value| Some(value.range),
         identities: None,
@@ -2586,6 +3139,167 @@ detailed_row_domains! {
             CodeQueryRowField::required_enum("language", value_domain::LANGUAGE),
             CodeQueryRowField::required_enum("statement_kind", value_domain::STATEMENT_KIND),
             CodeQueryRowField::required_enum("verdict", value_domain::STATEMENT_VERDICT),
+            CodeQueryRowField::optional("reason", Scalar::String),
+        ],
+    },
+    PendingCleanupFlow => "pending_cleanup_flow" {
+        display_range: |value| Some(value.range),
+        identities: None,
+        fields: [
+            CodeQueryRowField::required("id", Scalar::StableId),
+            CodeQueryRowField::required("procedure_id", Scalar::StableId),
+            CodeQueryRowField::required_enum("language", value_domain::LANGUAGE),
+            CodeQueryRowField::required("cleanup_id", Scalar::StableId),
+            CodeQueryRowField::required_enum(
+                "cleanup_kind",
+                &["finally", "ensure", "defer", "using", "with", "raii_drop"],
+            ),
+            CodeQueryRowField::required_enum(
+                "pending_kind",
+                &["return", "throw", "break", "continue"],
+            ),
+            CodeQueryRowField::required("source_id", Scalar::StableId),
+            CodeQueryRowField::required("target_id", Scalar::StableId),
+            CodeQueryRowField::required_enum(
+                "verdict",
+                &["overrides", "preserves", "unknown"],
+            ),
+            CodeQueryRowField::required_enum("proof", &["exact", "unknown"]),
+            CodeQueryRowField::required_enum("coverage", &["exhaustive", "incomplete"]),
+            CodeQueryRowField::optional("reason", Scalar::String),
+        ],
+    },
+    PythonRuleFact => "python_rule_fact" {
+        display_range: |value| Some(value.range),
+        identities: None,
+        fields: [
+            CodeQueryRowField::required("id", Scalar::StableId),
+            CodeQueryRowField::required_enum("relation", value_domain::PYTHON_RULE_RELATION),
+            CodeQueryRowField::optional("owner_id", Scalar::StableId),
+            CodeQueryRowField::required("path", Scalar::String),
+            CodeQueryRowField::required_enum("language", value_domain::LANGUAGE),
+            CodeQueryRowField::required_enum("outcome", value_domain::PYTHON_RULE_OUTCOME),
+            CodeQueryRowField::required_enum("proof", value_domain::PYTHON_RULE_PROOF),
+            CodeQueryRowField::required_enum("completeness", value_domain::PYTHON_RULE_COMPLETENESS),
+            CodeQueryRowField::optional("reason", Scalar::String),
+            CodeQueryRowField::optional("explicit_value_returns", Scalar::Integer),
+            CodeQueryRowField::optional("none_returns", Scalar::Integer),
+            CodeQueryRowField::optional("explicit_return_statements", Scalar::Integer),
+            CodeQueryRowField::optional("fallthrough_none_returns", Scalar::Integer),
+            CodeQueryRowField::optional("mixed_returns", Scalar::Boolean),
+            CodeQueryRowField::optional("is_async", Scalar::Boolean),
+            CodeQueryRowField::optional("is_generator", Scalar::Boolean),
+            CodeQueryRowField::optional_enum("test_scope", value_domain::PYTHON_TRI_STATE),
+            CodeQueryRowField::optional_enum(
+                "terminal_elif_else",
+                value_domain::PYTHON_TRI_STATE,
+            ),
+            CodeQueryRowField::optional("tuple_return_count", Scalar::Integer),
+            CodeQueryRowField::optional("distinct_tuple_arities", Scalar::Integer),
+            CodeQueryRowField::optional("tuple_return_arities", Scalar::IntegerList),
+            CodeQueryRowField::optional("assignment_target_count", Scalar::Integer),
+            CodeQueryRowField::optional_enum(
+                "assignment_arity_match",
+                value_domain::PYTHON_TRI_STATE,
+            ),
+            CodeQueryRowField::optional("mixed_tuple_arities", Scalar::Boolean),
+            CodeQueryRowField::optional("annotated", Scalar::Boolean),
+            CodeQueryRowField::optional_enum("return_contract", value_domain::PYTHON_RETURN_CONTRACT),
+            CodeQueryRowField::optional_enum("result_use", value_domain::PYTHON_RESULT_USE),
+            CodeQueryRowField::optional("forwarded", Scalar::Boolean),
+            CodeQueryRowField::optional_enum(
+                "callable_evaluation_time",
+                value_domain::PYTHON_CALLABLE_EVALUATION_TIME,
+            ),
+            CodeQueryRowField::optional_enum("default_equivalent", value_domain::PYTHON_TRI_STATE),
+            CodeQueryRowField::optional("target_id", Scalar::StableId),
+            CodeQueryRowField::optional("returns_receiver", Scalar::Boolean),
+            CodeQueryRowField::optional("parameter_count", Scalar::Integer),
+            CodeQueryRowField::optional("scope_is_public", Scalar::Boolean),
+            CodeQueryRowField::optional("docstring_present", Scalar::Boolean),
+            CodeQueryRowField::optional("docstring_value", Scalar::String),
+            CodeQueryRowField::optional("comment_block_text", Scalar::String),
+            CodeQueryRowField::optional("comment_block_lines", Scalar::StringList),
+            CodeQueryRowField::optional("lines_of_code", Scalar::Integer),
+            CodeQueryRowField::optional("decorator_count", Scalar::Integer),
+            CodeQueryRowField::optional("is_override", Scalar::Boolean),
+            CodeQueryRowField::optional("is_property_accessor", Scalar::Boolean),
+            CodeQueryRowField::optional("public_method_count", Scalar::Integer),
+            CodeQueryRowField::optional("has_inheritance", Scalar::Boolean),
+            CodeQueryRowField::optional("has_subclasses", Scalar::Boolean),
+            CodeQueryRowField::optional("has_special_method", Scalar::Boolean),
+            CodeQueryRowField::optional("is_decorated", Scalar::Boolean),
+            CodeQueryRowField::optional("is_probable_mixin", Scalar::Boolean),
+            CodeQueryRowField::optional("is_stateful", Scalar::Boolean),
+            CodeQueryRowField::optional("is_top_level", Scalar::Boolean),
+            CodeQueryRowField::optional("cyclomatic_complexity", Scalar::Integer),
+            CodeQueryRowField::optional("url_prefix", Scalar::String),
+            CodeQueryRowField::optional("variable_id", Scalar::StableId),
+            CodeQueryRowField::optional("name", Scalar::String),
+            CodeQueryRowField::optional_enum("scope_kind", value_domain::PYTHON_VARIABLE_SCOPE_KIND),
+            CodeQueryRowField::optional("is_global", Scalar::Boolean),
+            CodeQueryRowField::optional("is_nonlocal", Scalar::Boolean),
+            CodeQueryRowField::optional("is_builtin", Scalar::Boolean),
+            CodeQueryRowField::optional("call_callee", Scalar::Boolean),
+            CodeQueryRowField::optional("has_read", Scalar::Boolean),
+            CodeQueryRowField::optional_enum(
+                "definition_kind",
+                value_domain::PYTHON_VARIABLE_DEFINITION_KIND,
+            ),
+            CodeQueryRowField::optional("definition_order", Scalar::Integer),
+            CodeQueryRowField::optional("first_definition", Scalar::Boolean),
+            CodeQueryRowField::optional("definition_is_unused", Scalar::Boolean),
+            CodeQueryRowField::optional("annotation_only", Scalar::Boolean),
+            CodeQueryRowField::optional("annotated_assignment", Scalar::Boolean),
+            CodeQueryRowField::optional("is_abstract", Scalar::Boolean),
+            CodeQueryRowField::optional("is_overriding_method", Scalar::Boolean),
+            CodeQueryRowField::optional("is_overridden_method", Scalar::Boolean),
+            CodeQueryRowField::optional_enum(
+                "reachability",
+                value_domain::PYTHON_VARIABLE_REACHABILITY,
+            ),
+            CodeQueryRowField::optional_enum(
+                "access_kind",
+                value_domain::PYTHON_VARIABLE_ACCESS_KIND,
+            ),
+            CodeQueryRowField::optional("nested_scope", Scalar::Boolean),
+            CodeQueryRowField::optional("in_main_guard", Scalar::Boolean),
+            CodeQueryRowField::optional("optimizing_parameter", Scalar::Boolean),
+            CodeQueryRowField::optional("self_assignment", Scalar::Boolean),
+            CodeQueryRowField::optional_enum(
+                "related_scope_kind",
+                value_domain::PYTHON_VARIABLE_SCOPE_KIND,
+            ),
+            CodeQueryRowField::optional("related_has_definition_outside_main", Scalar::Boolean),
+            CodeQueryRowField::optional("related_has_deletion", Scalar::Boolean),
+            CodeQueryRowField::optional("related_has_import", Scalar::Boolean),
+            CodeQueryRowField::optional("related_is_pytest_fixture", Scalar::Boolean),
+            CodeQueryRowField::optional("loop_has_body_read", Scalar::Boolean),
+            CodeQueryRowField::optional("loop_policy_excluded", Scalar::Boolean),
+            CodeQueryRowField::optional("nested_loop_reused", Scalar::Boolean),
+            CodeQueryRowField::optional("nested_loop_has_outer_use", Scalar::Boolean),
+        ],
+    },
+    RustPointerFinding => "rust_pointer_finding" {
+        display_range: |value| Some(value.range),
+        identities: Primary,
+        fields: [
+            CodeQueryRowField::required("id", Scalar::StableId),
+            CodeQueryRowField::required("path", Scalar::String),
+            CodeQueryRowField::required_enum("language", value_domain::LANGUAGE),
+            CodeQueryRowField::required_enum("relation", value_domain::RUST_POINTER_RELATION),
+            CodeQueryRowField::required("origin_id", Scalar::StableId),
+            CodeQueryRowField::required_enum("origin_kind", value_domain::RUST_POINTER_ORIGIN_KIND),
+            CodeQueryRowField::optional_enum("invalidation_cause", value_domain::RUST_POINTER_INVALIDATION_CAUSE),
+            CodeQueryRowField::required_enum("access_kind", value_domain::RUST_POINTER_ACCESS_KIND),
+            CodeQueryRowField::required_enum("strength", value_domain::RUST_POINTER_STRENGTH),
+            CodeQueryRowField::required("path_proven", Scalar::Boolean),
+            CodeQueryRowField::required_enum("bounds", value_domain::RUST_POINTER_BOUNDS),
+            CodeQueryRowField::optional("byte_offset", Scalar::String),
+            CodeQueryRowField::optional("byte_extent", Scalar::String),
+            CodeQueryRowField::optional("access_width", Scalar::String),
+            CodeQueryRowField::required_enum("proof", value_domain::RUST_POINTER_PROOF),
+            CodeQueryRowField::required_enum("completeness", value_domain::RUST_POINTER_COMPLETENESS),
             CodeQueryRowField::optional("reason", Scalar::String),
         ],
     },
@@ -2825,12 +3539,183 @@ fn project_code_query_row_field<'a>(
         (CodeQueryResultValue::StructuralMatch { value }, "ast_id") => {
             value.ast_id.as_deref().map(Scalar::StableId)
         }
+        (CodeQueryResultValue::StructuralMatch { value }, "parent_ast_id") => value
+            .relations
+            .as_deref()
+            .and_then(|relations| relations.parent_ast_id.as_deref())
+            .map(Scalar::StableId),
+        (CodeQueryResultValue::StructuralMatch { value }, "left_ast_id") => value
+            .relations
+            .as_deref()
+            .and_then(|relations| relations.left_ast_id.as_deref())
+            .map(Scalar::StableId),
+        (CodeQueryResultValue::StructuralMatch { value }, "right_ast_id") => value
+            .relations
+            .as_deref()
+            .and_then(|relations| relations.right_ast_id.as_deref())
+            .map(Scalar::StableId),
+        (CodeQueryResultValue::StructuralMatch { value }, "object_ast_id") => value
+            .relations
+            .as_deref()
+            .and_then(|relations| relations.object_ast_id.as_deref())
+            .map(Scalar::StableId),
+        (CodeQueryResultValue::StructuralMatch { value }, "object_name") => value
+            .relations
+            .as_deref()
+            .and_then(|relations| relations.object_name.as_deref())
+            .map(Scalar::String),
+        (CodeQueryResultValue::StructuralMatch { value }, "callee_ast_id") => value
+            .relations
+            .as_deref()
+            .and_then(|relations| relations.callee_ast_id.as_deref())
+            .map(Scalar::StableId),
+        (CodeQueryResultValue::StructuralMatch { value }, "receiver_ast_id") => value
+            .relations
+            .as_deref()
+            .and_then(|relations| relations.receiver_ast_id.as_deref())
+            .map(Scalar::StableId),
+        (CodeQueryResultValue::StructuralMatch { value }, "enclosing_callable_ast_id") => value
+            .relations
+            .as_deref()
+            .and_then(|relations| relations.enclosing_callable_ast_id.as_deref())
+            .map(Scalar::StableId),
+        (CodeQueryResultValue::StructuralMatch { value }, "name") => value
+            .relations
+            .as_deref()
+            .and_then(|relations| relations.name.as_deref())
+            .map(Scalar::String),
+        (CodeQueryResultValue::StructuralMatch { value }, "string_value") => value
+            .relations
+            .as_deref()
+            .and_then(|relations| relations.string_value.as_deref())
+            .map(Scalar::String),
+        (CodeQueryResultValue::StructuralMatch { value }, "construct") => value
+            .relations
+            .as_deref()
+            .and_then(|relations| relations.construct.as_deref())
+            .map(Scalar::String),
+        (CodeQueryResultValue::StructuralMatch { value }, "occurrence_role") => value
+            .relations
+            .as_deref()
+            .and_then(|relations| relations.occurrence_role)
+            .map(Scalar::ConstrainedEnum),
+        (CodeQueryResultValue::StructuralMatch { value }, "element_index") => value
+            .relations
+            .as_deref()
+            .and_then(|relations| relations.element_index)
+            .map(|index| Scalar::Integer(index as u64)),
+        (CodeQueryResultValue::StructuralMatch { value }, "element_count") => value
+            .relations
+            .as_deref()
+            .and_then(|relations| relations.element_count)
+            .map(|count| Scalar::Integer(count as u64)),
+        (CodeQueryResultValue::StructuralMatch { value }, "is_last_element") => value
+            .relations
+            .as_deref()
+            .and_then(|relations| relations.is_last_element)
+            .map(Scalar::Boolean),
+        (CodeQueryResultValue::StructuralMatch { value }, "parameter_index") => value
+            .relations
+            .as_deref()
+            .and_then(|relations| relations.parameter_index)
+            .map(|index| Scalar::Integer(index as u64)),
         (CodeQueryResultValue::StructuralMatch { value }, "language") => {
             Some(Scalar::ConstrainedEnum(value.language))
         }
         (CodeQueryResultValue::StructuralMatch { value }, "kind") => {
             Some(Scalar::ConstrainedEnum(value.kind))
         }
+        (CodeQueryResultValue::StructuralMatch { value }, "python_import_complete") => value
+            .python_import
+            .as_ref()
+            .map(|site| Scalar::Boolean(site.complete)),
+        (CodeQueryResultValue::StructuralMatch { value }, "python_import_form") => value
+            .python_import
+            .as_ref()
+            .and_then(|site| site.form.map(Scalar::ConstrainedEnum)),
+        (CodeQueryResultValue::StructuralMatch { value }, "python_import_module") => value
+            .python_import
+            .as_ref()
+            .and_then(|site| site.module.as_deref().map(Scalar::String)),
+        (CodeQueryResultValue::StructuralMatch { value }, "python_import_name") => value
+            .python_import
+            .as_ref()
+            .and_then(|site| site.name.as_deref().map(Scalar::String)),
+        (CodeQueryResultValue::StructuralMatch { value }, "python_import_alias") => value
+            .python_import
+            .as_ref()
+            .and_then(|site| site.alias.as_deref().map(Scalar::String)),
+        (CodeQueryResultValue::StructuralMatch { value }, "python_import_modules") => value
+            .python_import
+            .as_ref()
+            .map(|site| Scalar::StringList(&site.modules)),
+        (CodeQueryResultValue::StructuralMatch { value }, "python_import_names") => value
+            .python_import
+            .as_ref()
+            .map(|site| Scalar::StringList(&site.names)),
+        (CodeQueryResultValue::StructuralMatch { value }, "python_import_aliases") => value
+            .python_import
+            .as_ref()
+            .map(|site| Scalar::StringList(&site.aliases)),
+        (CodeQueryResultValue::StructuralMatch { value }, "python_import_wildcard") => value
+            .python_import
+            .as_ref()
+            .map(|site| Scalar::Boolean(site.wildcard)),
+        (CodeQueryResultValue::StructuralMatch { value }, "python_import_module_scope") => value
+            .python_import
+            .as_ref()
+            .and_then(|site| site.module_scope.map(Scalar::Boolean)),
+        (CodeQueryResultValue::StructuralMatch { value }, "python_import_source_order") => value
+            .python_import
+            .as_ref()
+            .map(|site| Scalar::Integer(site.source_order)),
+        (CodeQueryResultValue::StructuralMatch { value }, "python_import_target_paths") => value
+            .python_import
+            .as_ref()
+            .map(|site| Scalar::StringList(&site.target_paths)),
+        (CodeQueryResultValue::StructuralMatch { value }, "python_import_target_status") => value
+            .python_import
+            .as_ref()
+            .map(|site| Scalar::ConstrainedEnum(site.target_status)),
+        (CodeQueryResultValue::StructuralMatch { value }, "python_import_repeated") => value
+            .python_import
+            .as_ref()
+            .map(|site| Scalar::Boolean(site.repeated)),
+        (CodeQueryResultValue::StructuralMatch { value }, "python_import_duplicate") => value
+            .python_import
+            .as_ref()
+            .and_then(|site| site.duplicate.map(Scalar::Boolean)),
+        (
+            CodeQueryResultValue::StructuralMatch { value },
+            "python_import_in_import_error_handler",
+        ) => value
+            .python_import
+            .as_ref()
+            .and_then(|site| site.in_import_error_handler.map(Scalar::Boolean)),
+        (CodeQueryResultValue::StructuralMatch { value }, "python_import_in_main_guard") => value
+            .python_import
+            .as_ref()
+            .and_then(|site| site.in_main_guard.map(Scalar::Boolean)),
+        (CodeQueryResultValue::StructuralMatch { value }, "python_import_mixed_form") => value
+            .python_import
+            .as_ref()
+            .map(|site| Scalar::Boolean(site.mixed_form)),
+        (CodeQueryResultValue::StructuralMatch { value }, "python_import_own_module") => value
+            .python_import
+            .as_ref()
+            .and_then(|site| site.own_module.map(Scalar::Boolean)),
+        (CodeQueryResultValue::StructuralMatch { value }, "python_import_polluting") => value
+            .python_import
+            .as_ref()
+            .and_then(|site| site.polluting.map(Scalar::Boolean)),
+        (CodeQueryResultValue::StructuralMatch { value }, "python_import_export_state") => value
+            .python_import
+            .as_ref()
+            .map(|site| Scalar::ConstrainedEnum(site.export_state)),
+        (CodeQueryResultValue::StructuralMatch { value }, "python_import_cycle_state") => value
+            .python_import
+            .as_ref()
+            .and_then(|site| site.cycle_state.map(Scalar::ConstrainedEnum)),
         (CodeQueryResultValue::Declaration { value }, "id") => {
             value.id.as_deref().map(Scalar::DeclarationIdentity)
         }
@@ -2899,135 +3784,6 @@ fn project_code_query_row_field<'a>(
         }
         (CodeQueryResultValue::TypestateFinding { value }, "abstained") => {
             Some(Scalar::Boolean(value.abstained))
-        }
-        (CodeQueryResultValue::ConcurrentAccessConflict { value }, "id") => {
-            Some(Scalar::StableId(&value.id))
-        }
-        (CodeQueryResultValue::ConcurrentAccessConflict { value }, "root_procedure_id") => {
-            Some(Scalar::StableId(&value.root_procedure_id))
-        }
-        (CodeQueryResultValue::ConcurrentAccessConflict { value }, "ast_id") => {
-            value.ast_id.as_deref().map(Scalar::StableId)
-        }
-        (CodeQueryResultValue::ConcurrentAccessConflict { value }, "location_id") => {
-            Some(Scalar::StableId(&value.location_id))
-        }
-        (CodeQueryResultValue::ConcurrentAccessConflict { value }, "location_kind") => {
-            Some(Scalar::String(&value.location_kind))
-        }
-        (CodeQueryResultValue::ConcurrentAccessConflict { value }, "first_procedure_id") => {
-            Some(Scalar::StableId(&value.first_procedure_id))
-        }
-        (CodeQueryResultValue::ConcurrentAccessConflict { value }, "first_point_id") => {
-            Some(Scalar::Integer(u64::from(value.first_point_id)))
-        }
-        (CodeQueryResultValue::ConcurrentAccessConflict { value }, "first_access") => {
-            Some(Scalar::ConstrainedEnum(value.first_access))
-        }
-        (CodeQueryResultValue::ConcurrentAccessConflict { value }, "first_path") => {
-            Some(Scalar::String(&value.first_path))
-        }
-        (CodeQueryResultValue::ConcurrentAccessConflict { value }, "first_start_line") => {
-            Some(Scalar::Integer(
-                u64::try_from(value.first_range.start_line)
-                    .expect("usize fits in u64 on supported targets"),
-            ))
-        }
-        (CodeQueryResultValue::ConcurrentAccessConflict { value }, "first_start_column") => {
-            Some(Scalar::Integer(
-                u64::try_from(value.first_range.start_column)
-                    .expect("usize fits in u64 on supported targets"),
-            ))
-        }
-        (CodeQueryResultValue::ConcurrentAccessConflict { value }, "first_end_line") => {
-            Some(Scalar::Integer(
-                u64::try_from(value.first_range.end_line)
-                    .expect("usize fits in u64 on supported targets"),
-            ))
-        }
-        (CodeQueryResultValue::ConcurrentAccessConflict { value }, "first_end_column") => {
-            Some(Scalar::Integer(
-                u64::try_from(value.first_range.end_column)
-                    .expect("usize fits in u64 on supported targets"),
-            ))
-        }
-        (CodeQueryResultValue::ConcurrentAccessConflict { value }, "first_start_byte") => {
-            Some(Scalar::Integer(
-                u64::try_from(value.first_start_byte)
-                    .expect("usize fits in u64 on supported targets"),
-            ))
-        }
-        (CodeQueryResultValue::ConcurrentAccessConflict { value }, "first_end_byte") => {
-            Some(Scalar::Integer(
-                u64::try_from(value.first_end_byte)
-                    .expect("usize fits in u64 on supported targets"),
-            ))
-        }
-        (CodeQueryResultValue::ConcurrentAccessConflict { value }, "second_procedure_id") => {
-            Some(Scalar::StableId(&value.second_procedure_id))
-        }
-        (CodeQueryResultValue::ConcurrentAccessConflict { value }, "second_point_id") => {
-            Some(Scalar::Integer(u64::from(value.second_point_id)))
-        }
-        (CodeQueryResultValue::ConcurrentAccessConflict { value }, "second_access") => {
-            Some(Scalar::ConstrainedEnum(value.second_access))
-        }
-        (CodeQueryResultValue::ConcurrentAccessConflict { value }, "second_path") => {
-            Some(Scalar::String(&value.second_path))
-        }
-        (CodeQueryResultValue::ConcurrentAccessConflict { value }, "second_start_line") => {
-            Some(Scalar::Integer(
-                u64::try_from(value.second_range.start_line)
-                    .expect("usize fits in u64 on supported targets"),
-            ))
-        }
-        (CodeQueryResultValue::ConcurrentAccessConflict { value }, "second_start_column") => {
-            Some(Scalar::Integer(
-                u64::try_from(value.second_range.start_column)
-                    .expect("usize fits in u64 on supported targets"),
-            ))
-        }
-        (CodeQueryResultValue::ConcurrentAccessConflict { value }, "second_end_line") => {
-            Some(Scalar::Integer(
-                u64::try_from(value.second_range.end_line)
-                    .expect("usize fits in u64 on supported targets"),
-            ))
-        }
-        (CodeQueryResultValue::ConcurrentAccessConflict { value }, "second_end_column") => {
-            Some(Scalar::Integer(
-                u64::try_from(value.second_range.end_column)
-                    .expect("usize fits in u64 on supported targets"),
-            ))
-        }
-        (CodeQueryResultValue::ConcurrentAccessConflict { value }, "second_start_byte") => {
-            Some(Scalar::Integer(
-                u64::try_from(value.second_start_byte)
-                    .expect("usize fits in u64 on supported targets"),
-            ))
-        }
-        (CodeQueryResultValue::ConcurrentAccessConflict { value }, "second_end_byte") => {
-            Some(Scalar::Integer(
-                u64::try_from(value.second_end_byte)
-                    .expect("usize fits in u64 on supported targets"),
-            ))
-        }
-        (CodeQueryResultValue::ConcurrentAccessConflict { value }, "task_relation") => {
-            Some(Scalar::ConstrainedEnum(value.task_relation))
-        }
-        (CodeQueryResultValue::ConcurrentAccessConflict { value }, "ordering") => {
-            Some(Scalar::ConstrainedEnum(value.ordering))
-        }
-        (CodeQueryResultValue::ConcurrentAccessConflict { value }, "protection") => {
-            Some(Scalar::ConstrainedEnum(value.protection))
-        }
-        (CodeQueryResultValue::ConcurrentAccessConflict { value }, "verdict") => {
-            Some(Scalar::ConstrainedEnum(value.verdict))
-        }
-        (CodeQueryResultValue::ConcurrentAccessConflict { value }, "proof") => {
-            Some(Scalar::ConstrainedEnum(value.proof))
-        }
-        (CodeQueryResultValue::ConcurrentAccessConflict { value }, "coverage") => {
-            Some(Scalar::ConstrainedEnum(value.coverage))
         }
         (CodeQueryResultValue::TypestateWitness { value }, "id") => {
             Some(Scalar::StableId(&value.id))
@@ -3172,6 +3928,12 @@ fn project_code_query_row_field<'a>(
         (CodeQueryResultValue::CallSite { value }, "caller_id") => {
             value.caller.id.as_deref().map(Scalar::DeclarationIdentity)
         }
+        (CodeQueryResultValue::CallSite { value }, "site_id") => {
+            value.site_id.as_deref().map(Scalar::StableId)
+        }
+        (CodeQueryResultValue::CallSite { value }, "program_point_id") => {
+            value.program_point_id.as_deref().map(Scalar::StableId)
+        }
         (CodeQueryResultValue::CallSite { value }, "callee_id") => {
             value.callee.id.as_deref().map(Scalar::DeclarationIdentity)
         }
@@ -3181,6 +3943,16 @@ fn project_code_query_row_field<'a>(
         (CodeQueryResultValue::CallSite { value }, "proof") => {
             Some(Scalar::ConstrainedEnum(value.proof))
         }
+        (CodeQueryResultValue::CallSite { value }, "receiver_kind") => {
+            Some(Scalar::ConstrainedEnum(value.receiver_kind))
+        }
+        (CodeQueryResultValue::CallSite { value }, "argument_identity") => {
+            value.argument_identity.as_deref().map(Scalar::StableId)
+        }
+        (CodeQueryResultValue::CallSite { value }, "caller_parameter_identity") => value
+            .caller_parameter_identity
+            .as_deref()
+            .map(Scalar::StableId),
         (CodeQueryResultValue::ExpressionSite { value }, "input_kind") => {
             Some(Scalar::ConstrainedEnum(value.input_kind))
         }
@@ -3393,6 +4165,10 @@ fn project_code_query_row_field<'a>(
         (CodeQueryResultValue::CallShape { value }, "callee_name") => {
             value.callee_name.as_deref().map(Scalar::String)
         }
+        (CodeQueryResultValue::CallShape { value }, "resolved_external_callee") => value
+            .resolved_external_callee
+            .as_deref()
+            .map(Scalar::String),
         (CodeQueryResultValue::CallShape { value }, "argument_count") => {
             Some(Scalar::Integer(value.argument_count as u64))
         }
@@ -3455,6 +4231,9 @@ fn project_code_query_row_field<'a>(
         (CodeQueryResultValue::CallArgument { value }, "name") => {
             value.name.as_deref().map(Scalar::String)
         }
+        (CodeQueryResultValue::CallArgument { value }, "literal_value") => {
+            value.literal_value.as_deref().map(Scalar::String)
+        }
         (CodeQueryResultValue::CallableSignature { value }, "id") => {
             Some(Scalar::StableId(&value.id))
         }
@@ -3475,6 +4254,9 @@ fn project_code_query_row_field<'a>(
         (CodeQueryResultValue::CallableSignature { value }, "role") => {
             Some(Scalar::ConstrainedEnum(value.role))
         }
+        (CodeQueryResultValue::CallableSignature { value }, "first_parameter") => {
+            value.first_parameter.as_deref().map(Scalar::String)
+        }
         (CodeQueryResultValue::CallableSignature { value }, "required_arity") => value
             .required_arity
             .map(|arity| Scalar::Integer(arity as u64)),
@@ -3490,6 +4272,21 @@ fn project_code_query_row_field<'a>(
         (CodeQueryResultValue::CallableSignature { value }, "receiver_contract") => {
             value.receiver_contract.map(Scalar::ConstrainedEnum)
         }
+        (CodeQueryResultValue::CallableSignature { value }, "python_method_kind") => {
+            value.python_method_kind.map(Scalar::ConstrainedEnum)
+        }
+        (CodeQueryResultValue::CallableSignature { value }, "python_owner_is_metaclass") => {
+            value.python_owner_is_metaclass.map(Scalar::Boolean)
+        }
+        (CodeQueryResultValue::CallableSignature { value }, "python_owner_is_zope_interface") => {
+            value.python_owner_is_zope_interface.map(Scalar::Boolean)
+        }
+        (CodeQueryResultValue::CallableSignature { value }, "python_used_in_class_body") => {
+            value.python_used_in_class_body.map(Scalar::Boolean)
+        }
+        (CodeQueryResultValue::CallableSignature { value }, "python_no_args_with_decorator") => {
+            value.python_no_args_with_decorator.map(Scalar::Boolean)
+        }
         (CodeQueryResultValue::CallableSignature { value }, "return_type") => {
             value.return_type.as_deref().map(Scalar::String)
         }
@@ -3499,6 +4296,70 @@ fn project_code_query_row_field<'a>(
         (CodeQueryResultValue::CallableSignature { value }, "parameter_count") => {
             Some(Scalar::Integer(value.parameter_count as u64))
         }
+        (CodeQueryResultValue::CallableSignature { value }, "special_method_status") => {
+            value.special_method_status.map(Scalar::ConstrainedEnum)
+        }
+        (CodeQueryResultValue::LiteralOccurrence { value }, "id") => {
+            Some(Scalar::StableId(&value.id))
+        }
+        (CodeQueryResultValue::LiteralOccurrence { value }, "scope_id") => {
+            Some(Scalar::StableId(&value.scope_id))
+        }
+        (CodeQueryResultValue::LiteralOccurrence { value }, "scope_kind") => {
+            Some(Scalar::ConstrainedEnum(value.scope_kind))
+        }
+        (CodeQueryResultValue::LiteralOccurrence { value }, "path") => {
+            Some(Scalar::String(&value.path))
+        }
+        (CodeQueryResultValue::LiteralOccurrence { value }, "language") => {
+            Some(Scalar::ConstrainedEnum(value.language))
+        }
+        (CodeQueryResultValue::LiteralOccurrence { value }, "kind") => {
+            Some(Scalar::ConstrainedEnum(value.kind))
+        }
+        (CodeQueryResultValue::LiteralOccurrence { value }, "identity") => {
+            value.identity.as_deref().map(Scalar::String)
+        }
+        (CodeQueryResultValue::LiteralOccurrence { value }, "coverage") => {
+            Some(Scalar::ConstrainedEnum(value.coverage))
+        }
+        (CodeQueryResultValue::LiteralOccurrence { value }, "trivial") => {
+            Some(Scalar::Boolean(value.trivial))
+        }
+        (CodeQueryResultValue::LiteralOccurrence { value }, "parent_call_id") => {
+            value.parent_call_id.as_deref().map(Scalar::StableId)
+        }
+        (CodeQueryResultValue::LiteralOccurrence { value }, "argument_index") => value
+            .argument_index
+            .map(|index| Scalar::Integer(index as u64)),
+        (CodeQueryResultValue::CallableMetrics { value }, "id") => {
+            Some(Scalar::StableId(&value.id))
+        }
+        (CodeQueryResultValue::CallableMetrics { value }, "callable_id") => value
+            .callable_id
+            .as_deref()
+            .map(Scalar::DeclarationIdentity),
+        (CodeQueryResultValue::CallableMetrics { value }, "site_id") => {
+            Some(Scalar::StableId(&value.site_id))
+        }
+        (CodeQueryResultValue::CallableMetrics { value }, "path") => {
+            Some(Scalar::String(&value.path))
+        }
+        (CodeQueryResultValue::CallableMetrics { value }, "language") => {
+            Some(Scalar::ConstrainedEnum(value.language))
+        }
+        (CodeQueryResultValue::CallableMetrics { value }, "coverage") => {
+            Some(Scalar::ConstrainedEnum(value.coverage))
+        }
+        (CodeQueryResultValue::CallableMetrics { value }, "max_nesting") => value
+            .max_nesting
+            .map(|metric| Scalar::Integer(metric as u64)),
+        (CodeQueryResultValue::CallableMetrics { value }, "cognitive_complexity") => value
+            .cognitive_complexity
+            .map(|metric| Scalar::Integer(metric as u64)),
+        (CodeQueryResultValue::CallableMetrics { value }, "owned_body_span_lines") => value
+            .owned_body_span_lines
+            .map(|metric| Scalar::Integer(metric as u64)),
         (CodeQueryResultValue::CallableApplicability { value }, "id") => {
             Some(Scalar::StableId(&value.id))
         }
@@ -3646,11 +4507,23 @@ fn project_code_query_row_field<'a>(
         (CodeQueryResultValue::CallBinding { value }, "site_ast_id") => {
             Some(Scalar::StableId(&value.site_ast_id))
         }
+        (CodeQueryResultValue::CallBinding { value }, "program_point_id") => {
+            value.program_point_id.as_deref().map(Scalar::StableId)
+        }
         (CodeQueryResultValue::CallBinding { value }, "group_id") => {
             value.group_id.as_deref().map(Scalar::StableId)
         }
         (CodeQueryResultValue::CallBinding { value }, "argument_id") => {
             value.argument_id.as_deref().map(Scalar::StableId)
+        }
+        (CodeQueryResultValue::CallBinding { value }, "binding_id") => {
+            value.binding_id.as_deref().map(Scalar::StableId)
+        }
+        (CodeQueryResultValue::CallBinding { value }, "literal_value") => {
+            value.literal_value.as_deref().map(Scalar::String)
+        }
+        (CodeQueryResultValue::CallBinding { value }, "path_identity") => {
+            value.path_identity.as_deref().map(Scalar::String)
         }
         (CodeQueryResultValue::CallBinding { value }, "target_id") => value
             .target
@@ -3999,8 +4872,17 @@ fn project_code_query_row_field<'a>(
         (CodeQueryResultValue::CallResultObligation { value }, "failure_predicate") => {
             value.failure_predicate.map(Scalar::ConstrainedEnum)
         }
+        (CodeQueryResultValue::CallResultObligation { value }, "provenance") => {
+            value.provenance.map(Scalar::ConstrainedEnum)
+        }
+        (CodeQueryResultValue::CallResultObligation { value }, "obligation_basis") => {
+            value.obligation_basis.map(Scalar::ConstrainedEnum)
+        }
         (CodeQueryResultValue::CallResultObligation { value }, "result_use") => {
             Some(Scalar::ConstrainedEnum(value.result_use))
+        }
+        (CodeQueryResultValue::CallResultObligation { value }, "result_use_detail") => {
+            value.result_use_detail.map(Scalar::ConstrainedEnum)
         }
         (CodeQueryResultValue::CallResultObligation { value }, "coverage") => {
             Some(Scalar::ConstrainedEnum(value.coverage))
@@ -4489,6 +5371,9 @@ fn project_code_query_row_field<'a>(
         (CodeQueryResultValue::DispatchTarget { value }, "target_id") => {
             Some(Scalar::StableId(&value.target_id))
         }
+        (CodeQueryResultValue::DispatchTarget { value }, "target_fq_name") => {
+            value.target_fq_name.as_deref().map(Scalar::String)
+        }
         (CodeQueryResultValue::DispatchTarget { value }, "target_declaration_id") => value
             .target_declaration
             .as_ref()
@@ -4586,6 +5471,80 @@ fn project_code_query_row_field<'a>(
             .as_ref()
             .and_then(|declaration| declaration.id.as_deref())
             .map(Scalar::DeclarationIdentity),
+        (CodeQueryResultValue::PythonHierarchyFact { value }, "id") => {
+            Some(Scalar::StableId(&value.id))
+        }
+        (CodeQueryResultValue::PythonHierarchyFact { value }, "root_id") => {
+            Some(Scalar::StableId(&value.root_id))
+        }
+        (CodeQueryResultValue::PythonHierarchyFact { value }, "fact_kind") => {
+            Some(Scalar::ConstrainedEnum(value.fact_kind))
+        }
+        (CodeQueryResultValue::PythonHierarchyFact { value }, "outcome") => {
+            Some(Scalar::ConstrainedEnum(value.outcome))
+        }
+        (CodeQueryResultValue::PythonHierarchyFact { value }, "reason") => {
+            value.reason.map(Scalar::ConstrainedEnum)
+        }
+        (CodeQueryResultValue::PythonHierarchyFact { value }, "coverage") => {
+            Some(Scalar::ConstrainedEnum(value.coverage))
+        }
+        (CodeQueryResultValue::PythonHierarchyFact { value }, "ordinal") => {
+            value.ordinal.map(|ordinal| Scalar::Integer(ordinal as u64))
+        }
+        (CodeQueryResultValue::PythonHierarchyFact { value }, "base_spelling") => {
+            value.base_spelling.as_deref().map(Scalar::String)
+        }
+        (CodeQueryResultValue::PythonHierarchyFact { value }, "base_resolution") => {
+            value.base_resolution.map(Scalar::ConstrainedEnum)
+        }
+        (CodeQueryResultValue::PythonHierarchyFact { value }, "root_declaration_id") => {
+            value.root_declaration_id.as_deref().map(Scalar::StableId)
+        }
+        (CodeQueryResultValue::PythonHierarchyFact { value }, "declaration_id") => {
+            value.declaration_id.as_deref().map(Scalar::StableId)
+        }
+        (CodeQueryResultValue::PythonHierarchyFact { value }, "owner_id") => {
+            value.owner_id.as_deref().map(Scalar::StableId)
+        }
+        (CodeQueryResultValue::PythonHierarchyFact { value }, "target_id") => {
+            value.target_id.as_deref().map(Scalar::StableId)
+        }
+        (CodeQueryResultValue::PythonHierarchyFact { value }, "target_owner_id") => {
+            value.target_owner_id.as_deref().map(Scalar::StableId)
+        }
+        (CodeQueryResultValue::PythonHierarchyFact { value }, "member_name") => {
+            value.member_name.as_deref().map(Scalar::String)
+        }
+        (CodeQueryResultValue::PythonHierarchyFact { value }, "mro_rank") => {
+            value.mro_rank.map(|rank| Scalar::Integer(rank as u64))
+        }
+        (CodeQueryResultValue::PythonHierarchyFact { value }, "target_non_trivial") => {
+            value.target_non_trivial.map(Scalar::Boolean)
+        }
+        (CodeQueryResultValue::PythonHierarchyFact { value }, "target_reads_self") => {
+            value.target_reads_self.map(Scalar::Boolean)
+        }
+        (CodeQueryResultValue::PythonHierarchyFact { value }, "base_branch_definition_count") => {
+            value
+                .base_branch_definition_count
+                .map(|count| Scalar::Integer(count as u64))
+        }
+        (CodeQueryResultValue::PythonHierarchyFact { value }, "has_strict_ordering") => {
+            value.has_strict_ordering.map(Scalar::Boolean)
+        }
+        (CodeQueryResultValue::PythonHierarchyFact { value }, "has_non_strict_ordering") => {
+            value.has_non_strict_ordering.map(Scalar::Boolean)
+        }
+        (CodeQueryResultValue::PythonHierarchyFact { value }, "total_ordering_decorator") => {
+            value.total_ordering_decorator.map(Scalar::Boolean)
+        }
+        (CodeQueryResultValue::PythonHierarchyFact { value }, "inherited_ne_present") => {
+            value.inherited_ne_present.map(Scalar::Boolean)
+        }
+        (CodeQueryResultValue::PythonHierarchyFact { value }, "inherited_ne_delegates") => {
+            value.inherited_ne_delegates.map(Scalar::Boolean)
+        }
         (CodeQueryResultValue::ReceiverEvidence { value }, "id") => {
             Some(Scalar::StableId(&value.id))
         }
@@ -4625,6 +5584,33 @@ fn project_code_query_row_field<'a>(
         }
         (CodeQueryResultValue::ReceiverEvidence { value }, "completeness") => {
             Some(Scalar::ConstrainedEnum(value.completeness))
+        }
+        (CodeQueryResultValue::PointsToCandidate { value }, "id") => {
+            Some(Scalar::StableId(&value.id))
+        }
+        (CodeQueryResultValue::PointsToCandidate { value }, "site_id") => {
+            Some(Scalar::StableId(&value.site_id))
+        }
+        (CodeQueryResultValue::PointsToCandidate { value }, "program_point_id") => {
+            value.program_point_id.as_deref().map(Scalar::StableId)
+        }
+        (CodeQueryResultValue::PointsToCandidate { value }, "candidate_index") => {
+            Some(Scalar::Integer(value.candidate_index as u64))
+        }
+        (CodeQueryResultValue::PointsToCandidate { value }, "object_id") => {
+            value.object_id.as_deref().map(Scalar::String)
+        }
+        (CodeQueryResultValue::PointsToCandidate { value }, "object_cardinality") => {
+            value.object_cardinality.map(Scalar::ConstrainedEnum)
+        }
+        (CodeQueryResultValue::PointsToCandidate { value }, "proof") => {
+            Some(Scalar::ConstrainedEnum(value.proof))
+        }
+        (CodeQueryResultValue::PointsToCandidate { value }, "completeness") => {
+            Some(Scalar::ConstrainedEnum(value.completeness))
+        }
+        (CodeQueryResultValue::PointsToCandidate { value }, "coverage") => {
+            Some(Scalar::ConstrainedEnum(value.coverage))
         }
         (CodeQueryResultValue::MemberSelection { value }, "id") => {
             Some(Scalar::StableId(&value.id))
@@ -4847,6 +5833,50 @@ fn project_code_query_row_field<'a>(
         (CodeQueryResultValue::Export { value }, "target_fq_name") => {
             value.target_fq_name.as_deref().map(Scalar::String)
         }
+        (CodeQueryResultValue::Export { value }, "definition_status") => value
+            .local_definition
+            .as_ref()
+            .map(|definition| Scalar::ConstrainedEnum(definition.status())),
+        (CodeQueryResultValue::Export { value }, "definition_binding_name") => value
+            .local_definition
+            .as_ref()
+            .and_then(|definition| definition.binding())
+            .map(|binding| Scalar::String(&binding.name)),
+        (CodeQueryResultValue::Export { value }, "definition_binding_kind") => value
+            .local_definition
+            .as_ref()
+            .and_then(|definition| definition.binding())
+            .map(|binding| Scalar::ConstrainedEnum(&binding.kind)),
+        (CodeQueryResultValue::Export { value }, "definition_binding_start_byte") => value
+            .local_definition
+            .as_ref()
+            .and_then(|definition| definition.binding())
+            .map(|binding| Scalar::Integer(binding.start_byte as u64)),
+        (CodeQueryResultValue::Export { value }, "definition_binding_end_byte") => value
+            .local_definition
+            .as_ref()
+            .and_then(|definition| definition.binding())
+            .map(|binding| Scalar::Integer(binding.end_byte as u64)),
+        (CodeQueryResultValue::Export { value }, "definition_binding_start_line") => value
+            .local_definition
+            .as_ref()
+            .and_then(|definition| definition.binding())
+            .map(|binding| Scalar::Integer(binding.range.start_line as u64)),
+        (CodeQueryResultValue::Export { value }, "definition_binding_start_column") => value
+            .local_definition
+            .as_ref()
+            .and_then(|definition| definition.binding())
+            .map(|binding| Scalar::Integer(binding.range.start_column as u64)),
+        (CodeQueryResultValue::Export { value }, "definition_binding_end_line") => value
+            .local_definition
+            .as_ref()
+            .and_then(|definition| definition.binding())
+            .map(|binding| Scalar::Integer(binding.range.end_line as u64)),
+        (CodeQueryResultValue::Export { value }, "definition_binding_end_column") => value
+            .local_definition
+            .as_ref()
+            .and_then(|definition| definition.binding())
+            .map(|binding| Scalar::Integer(binding.range.end_column as u64)),
         (CodeQueryResultValue::DeclarationState { value }, "id") => {
             Some(Scalar::StableId(&value.id))
         }
@@ -4953,6 +5983,9 @@ fn project_code_query_row_field<'a>(
         (CodeQueryResultValue::StateEvent { value }, "event_class") => {
             Some(Scalar::ConstrainedEnum(value.event_class))
         }
+        (CodeQueryResultValue::StateEvent { value }, "read_cause") => {
+            value.read_cause.map(Scalar::ConstrainedEnum)
+        }
         (CodeQueryResultValue::StateEvent { value }, "subject") => {
             Some(Scalar::ConstrainedEnum(value.subject))
         }
@@ -4976,6 +6009,21 @@ fn project_code_query_row_field<'a>(
         }
         (CodeQueryResultValue::StateEvent { value }, "generation") => {
             Some(Scalar::Integer(value.generation))
+        }
+        (CodeQueryResultValue::BindingInitializerCall { value }, "id") => {
+            Some(Scalar::StableId(&value.id))
+        }
+        (CodeQueryResultValue::BindingInitializerCall { value }, "establishment_event_id") => {
+            Some(Scalar::StableId(&value.establishment_event_id))
+        }
+        (CodeQueryResultValue::BindingInitializerCall { value }, "site_ast_id") => {
+            Some(Scalar::StableId(&value.site_ast_id))
+        }
+        (CodeQueryResultValue::BindingInitializerCall { value }, "initializer_role") => {
+            Some(Scalar::ConstrainedEnum(value.initializer_role))
+        }
+        (CodeQueryResultValue::BindingInitializerCall { value }, "language") => {
+            Some(Scalar::ConstrainedEnum(value.language))
         }
         (CodeQueryResultValue::RewritePath { value }, "id") => Some(Scalar::StableId(&value.id)),
         (CodeQueryResultValue::RewritePath { value }, "language") => {
@@ -5103,6 +6151,19 @@ fn project_code_query_row_field<'a>(
         (CodeQueryResultValue::FailureHandlerState { value }, "reason") => {
             value.reason.map(Scalar::ConstrainedEnum)
         }
+        (CodeQueryResultValue::FailureHandlerState { value }, "caught_type") => value
+            .caught_type
+            .as_deref()
+            .map(Scalar::DeclarationIdentity),
+        (CodeQueryResultValue::FailureHandlerState { value }, "caught_type_relation") => {
+            value.caught_type_relation.map(Scalar::ConstrainedEnum)
+        }
+        (CodeQueryResultValue::FailureHandlerState { value }, "has_filter") => {
+            value.has_filter.map(Scalar::Boolean)
+        }
+        (CodeQueryResultValue::FailureHandlerState { value }, "rethrow_kind") => {
+            value.rethrow_kind.map(Scalar::ConstrainedEnum)
+        }
         (CodeQueryResultValue::BranchRelation { value }, "id") => Some(Scalar::StableId(&value.id)),
         (CodeQueryResultValue::BranchRelation { value }, "owner_id") => {
             Some(Scalar::StableId(&value.owner_id))
@@ -5144,6 +6205,100 @@ fn project_code_query_row_field<'a>(
         (CodeQueryResultValue::LoopRelation { value }, "repeat_edge_id") => {
             value.repeat_edge_id.as_deref().map(Scalar::StableId)
         }
+        (CodeQueryResultValue::CppExpression { value }, "id") => Some(Scalar::StableId(&value.id)),
+        (CodeQueryResultValue::CppExpression { value }, "language") => {
+            Some(Scalar::ConstrainedEnum(value.language))
+        }
+        (CodeQueryResultValue::CppExpression { value }, "kind") => {
+            Some(Scalar::ConstrainedEnum(value.kind))
+        }
+        (CodeQueryResultValue::CppExpression { value }, "name") => {
+            value.name.as_deref().map(Scalar::String)
+        }
+        (CodeQueryResultValue::CppExpression { value }, "type_text") => {
+            value.type_text.as_deref().map(Scalar::String)
+        }
+        (CodeQueryResultValue::CppExpression { value }, "type_form") => {
+            Some(Scalar::ConstrainedEnum(value.type_form))
+        }
+        (CodeQueryResultValue::CppExpression { value }, "signedness") => {
+            Some(Scalar::ConstrainedEnum(value.signedness))
+        }
+        (CodeQueryResultValue::CppExpression { value }, "width_bits") => {
+            value.width_bits.map(u64::from).map(Scalar::Integer)
+        }
+        (CodeQueryResultValue::CppExpression { value }, "literal_text") => {
+            value.literal_text.as_deref().map(Scalar::String)
+        }
+        (CodeQueryResultValue::CppExpression { value }, "integer_value") => {
+            value.integer_value.as_deref().map(Scalar::String)
+        }
+        (CodeQueryResultValue::CppExpression { value }, "array_extent") => {
+            value.array_extent.map(Scalar::Integer)
+        }
+        (CodeQueryResultValue::CppExpression { value }, "array_is_reference") => {
+            value.array_is_reference.map(Scalar::Boolean)
+        }
+        (CodeQueryResultValue::CppExpression { value }, "parameter_by_value") => {
+            value.parameter_by_value.map(Scalar::Boolean)
+        }
+        (CodeQueryResultValue::CppExpression { value }, "bit_field_width") => {
+            value.bit_field_width.map(Scalar::Integer)
+        }
+        (CodeQueryResultValue::CppExpression { value }, "bit_field_anonymous") => {
+            value.bit_field_anonymous.map(Scalar::Boolean)
+        }
+        (CodeQueryResultValue::CppExpression { value }, "enum_scoped") => {
+            value.enum_scoped.map(Scalar::Boolean)
+        }
+        (CodeQueryResultValue::CppExpression { value }, "enum_ordinal") => {
+            value.enum_ordinal.map(u64::from).map(Scalar::Integer)
+        }
+        (CodeQueryResultValue::CppExpression { value }, "enum_value") => {
+            value.enum_value.as_deref().map(Scalar::String)
+        }
+        (CodeQueryResultValue::CppExpression { value }, "has_initializer") => {
+            value.has_initializer.map(Scalar::Boolean)
+        }
+        (
+            CodeQueryResultValue::CppExpression { value },
+            "enum_has_implicit_before_nonreference",
+        ) => value
+            .enum_has_implicit_before_nonreference
+            .map(Scalar::Boolean),
+        (CodeQueryResultValue::CppExpression { value }, "return_top_level_const") => {
+            value.return_top_level_const.map(Scalar::Boolean)
+        }
+        (CodeQueryResultValue::CppExpression { value }, "member_function") => {
+            value.member_function.map(Scalar::Boolean)
+        }
+        (CodeQueryResultValue::CppExpression { value }, "member_function_const") => {
+            value.member_function_const.map(Scalar::Boolean)
+        }
+        (CodeQueryResultValue::CppExpression { value }, "type_size_bytes") => {
+            value.type_size_bytes.map(Scalar::Integer)
+        }
+        (CodeQueryResultValue::CppExpression { value }, "type_size_exact") => {
+            value.type_size_exact.map(Scalar::Boolean)
+        }
+        (CodeQueryResultValue::CppExpression { value }, "sizeof_operand_kind") => {
+            value.sizeof_operand_kind.map(Scalar::ConstrainedEnum)
+        }
+        (CodeQueryResultValue::CppExpression { value }, "sizeof_operand_is_parameter") => {
+            value.sizeof_operand_is_parameter.map(Scalar::Boolean)
+        }
+        (CodeQueryResultValue::CppExpression { value }, "sizeof_has_side_effect") => {
+            value.sizeof_has_side_effect.map(Scalar::Boolean)
+        }
+        (CodeQueryResultValue::CppExpression { value }, "loop_has_short_ancestor") => {
+            value.loop_has_short_ancestor.map(Scalar::Boolean)
+        }
+        (CodeQueryResultValue::CppExpression { value }, "completeness") => {
+            Some(Scalar::ConstrainedEnum(value.completeness))
+        }
+        (CodeQueryResultValue::CppExpression { value }, "completeness_reason") => {
+            value.completeness_reason.as_deref().map(Scalar::String)
+        }
         (CodeQueryResultValue::StatementReachability { value }, "id") => {
             Some(Scalar::StableId(&value.id))
         }
@@ -5161,6 +6316,346 @@ fn project_code_query_row_field<'a>(
         }
         (CodeQueryResultValue::StatementReachability { value }, "reason") => {
             value.reason.as_deref().map(Scalar::String)
+        }
+        (CodeQueryResultValue::PendingCleanupFlow { value }, "id") => {
+            Some(Scalar::StableId(&value.id))
+        }
+        (CodeQueryResultValue::PendingCleanupFlow { value }, "procedure_id") => {
+            Some(Scalar::StableId(&value.procedure_id))
+        }
+        (CodeQueryResultValue::PendingCleanupFlow { value }, "language") => {
+            Some(Scalar::ConstrainedEnum(value.language))
+        }
+        (CodeQueryResultValue::PendingCleanupFlow { value }, "cleanup_id") => {
+            Some(Scalar::StableId(&value.cleanup_id))
+        }
+        (CodeQueryResultValue::PendingCleanupFlow { value }, "cleanup_kind") => {
+            Some(Scalar::ConstrainedEnum(value.cleanup_kind))
+        }
+        (CodeQueryResultValue::PendingCleanupFlow { value }, "pending_kind") => {
+            Some(Scalar::ConstrainedEnum(value.pending_kind))
+        }
+        (CodeQueryResultValue::PendingCleanupFlow { value }, "source_id") => {
+            Some(Scalar::StableId(&value.source.id))
+        }
+        (CodeQueryResultValue::PendingCleanupFlow { value }, "target_id") => {
+            Some(Scalar::StableId(&value.target.id))
+        }
+        (CodeQueryResultValue::PendingCleanupFlow { value }, "verdict") => {
+            Some(Scalar::ConstrainedEnum(value.verdict))
+        }
+        (CodeQueryResultValue::PendingCleanupFlow { value }, "proof") => {
+            Some(Scalar::ConstrainedEnum(value.proof))
+        }
+        (CodeQueryResultValue::PendingCleanupFlow { value }, "coverage") => {
+            Some(Scalar::ConstrainedEnum(value.coverage))
+        }
+        (CodeQueryResultValue::PendingCleanupFlow { value }, "reason") => {
+            value.reason.as_deref().map(Scalar::String)
+        }
+        (CodeQueryResultValue::PythonRuleFact { value }, "id") => Some(Scalar::StableId(&value.id)),
+        (CodeQueryResultValue::PythonRuleFact { value }, "relation") => {
+            Some(Scalar::ConstrainedEnum(value.relation))
+        }
+        (CodeQueryResultValue::PythonRuleFact { value }, "owner_id") => {
+            value.owner_id.as_deref().map(Scalar::StableId)
+        }
+        (CodeQueryResultValue::PythonRuleFact { value }, "path") => {
+            Some(Scalar::String(&value.path))
+        }
+        (CodeQueryResultValue::PythonRuleFact { value }, "language") => {
+            Some(Scalar::ConstrainedEnum(value.language))
+        }
+        (CodeQueryResultValue::PythonRuleFact { value }, "outcome") => {
+            Some(Scalar::ConstrainedEnum(value.outcome))
+        }
+        (CodeQueryResultValue::PythonRuleFact { value }, "proof") => {
+            Some(Scalar::ConstrainedEnum(value.proof))
+        }
+        (CodeQueryResultValue::PythonRuleFact { value }, "completeness") => {
+            Some(Scalar::ConstrainedEnum(value.completeness))
+        }
+        (CodeQueryResultValue::PythonRuleFact { value }, "reason") => {
+            value.reason.as_deref().map(Scalar::String)
+        }
+        (CodeQueryResultValue::RustPointerFinding { value }, "id") => {
+            Some(Scalar::StableId(&value.id))
+        }
+        (CodeQueryResultValue::RustPointerFinding { value }, "path") => {
+            Some(Scalar::String(&value.path))
+        }
+        (CodeQueryResultValue::RustPointerFinding { value }, "language") => {
+            Some(Scalar::ConstrainedEnum(value.language))
+        }
+        (CodeQueryResultValue::RustPointerFinding { value }, "relation") => {
+            Some(Scalar::ConstrainedEnum(value.relation))
+        }
+        (CodeQueryResultValue::RustPointerFinding { value }, "origin_id") => {
+            Some(Scalar::StableId(&value.origin_id))
+        }
+        (CodeQueryResultValue::RustPointerFinding { value }, "origin_kind") => {
+            Some(Scalar::ConstrainedEnum(value.origin_kind))
+        }
+        (CodeQueryResultValue::RustPointerFinding { value }, "invalidation_cause") => {
+            value.invalidation_cause.map(Scalar::ConstrainedEnum)
+        }
+        (CodeQueryResultValue::RustPointerFinding { value }, "access_kind") => {
+            Some(Scalar::ConstrainedEnum(value.access_kind))
+        }
+        (CodeQueryResultValue::RustPointerFinding { value }, "strength") => {
+            Some(Scalar::ConstrainedEnum(value.strength))
+        }
+        (CodeQueryResultValue::RustPointerFinding { value }, "path_proven") => {
+            Some(Scalar::Boolean(value.path_proven))
+        }
+        (CodeQueryResultValue::RustPointerFinding { value }, "bounds") => {
+            Some(Scalar::ConstrainedEnum(value.bounds))
+        }
+        (CodeQueryResultValue::RustPointerFinding { value }, "byte_offset") => {
+            value.byte_offset.as_deref().map(Scalar::String)
+        }
+        (CodeQueryResultValue::RustPointerFinding { value }, "byte_extent") => {
+            value.byte_extent.as_deref().map(Scalar::String)
+        }
+        (CodeQueryResultValue::RustPointerFinding { value }, "access_width") => {
+            value.access_width.as_deref().map(Scalar::String)
+        }
+        (CodeQueryResultValue::RustPointerFinding { value }, "proof") => {
+            Some(Scalar::ConstrainedEnum(value.proof))
+        }
+        (CodeQueryResultValue::RustPointerFinding { value }, "completeness") => {
+            Some(Scalar::ConstrainedEnum(value.completeness))
+        }
+        (CodeQueryResultValue::RustPointerFinding { value }, "reason") => {
+            value.reason.as_deref().map(Scalar::String)
+        }
+        (CodeQueryResultValue::PythonRuleFact { value }, "explicit_value_returns") => value
+            .explicit_value_returns
+            .map(|count| Scalar::Integer(count as u64)),
+        (CodeQueryResultValue::PythonRuleFact { value }, "none_returns") => value
+            .none_returns
+            .map(|count| Scalar::Integer(count as u64)),
+        (CodeQueryResultValue::PythonRuleFact { value }, "explicit_return_statements") => value
+            .explicit_return_statements
+            .map(|count| Scalar::Integer(count as u64)),
+        (CodeQueryResultValue::PythonRuleFact { value }, "fallthrough_none_returns") => value
+            .fallthrough_none_returns
+            .map(|count| Scalar::Integer(count as u64)),
+        (CodeQueryResultValue::PythonRuleFact { value }, "mixed_returns") => {
+            value.mixed_returns.map(Scalar::Boolean)
+        }
+        (CodeQueryResultValue::PythonRuleFact { value }, "is_async") => {
+            value.is_async.map(Scalar::Boolean)
+        }
+        (CodeQueryResultValue::PythonRuleFact { value }, "is_generator") => {
+            value.is_generator.map(Scalar::Boolean)
+        }
+        (CodeQueryResultValue::PythonRuleFact { value }, "test_scope") => {
+            value.test_scope.map(Scalar::ConstrainedEnum)
+        }
+        (CodeQueryResultValue::PythonRuleFact { value }, "terminal_elif_else") => {
+            value.terminal_elif_else.map(Scalar::ConstrainedEnum)
+        }
+        (CodeQueryResultValue::PythonRuleFact { value }, "tuple_return_count") => value
+            .tuple_return_count
+            .map(|count| Scalar::Integer(count as u64)),
+        (CodeQueryResultValue::PythonRuleFact { value }, "distinct_tuple_arities") => value
+            .distinct_tuple_arities
+            .map(|count| Scalar::Integer(count as u64)),
+        (CodeQueryResultValue::PythonRuleFact { value }, "tuple_return_arities") => value
+            .tuple_return_arities
+            .as_deref()
+            .map(Scalar::IntegerList),
+        (CodeQueryResultValue::PythonRuleFact { value }, "assignment_target_count") => value
+            .assignment_target_count
+            .map(|count| Scalar::Integer(count as u64)),
+        (CodeQueryResultValue::PythonRuleFact { value }, "assignment_arity_match") => {
+            value.assignment_arity_match.map(Scalar::ConstrainedEnum)
+        }
+        (CodeQueryResultValue::PythonRuleFact { value }, "mixed_tuple_arities") => {
+            value.mixed_tuple_arities.map(Scalar::Boolean)
+        }
+        (CodeQueryResultValue::PythonRuleFact { value }, "annotated") => {
+            value.annotated.map(Scalar::Boolean)
+        }
+        (CodeQueryResultValue::PythonRuleFact { value }, "return_contract") => {
+            value.return_contract.map(Scalar::ConstrainedEnum)
+        }
+        (CodeQueryResultValue::PythonRuleFact { value }, "result_use") => {
+            value.result_use.map(Scalar::ConstrainedEnum)
+        }
+        (CodeQueryResultValue::PythonRuleFact { value }, "forwarded") => {
+            value.forwarded.map(Scalar::Boolean)
+        }
+        (CodeQueryResultValue::PythonRuleFact { value }, "callable_evaluation_time") => {
+            value.callable_evaluation_time.map(Scalar::ConstrainedEnum)
+        }
+        (CodeQueryResultValue::PythonRuleFact { value }, "default_equivalent") => {
+            value.default_equivalent.map(Scalar::ConstrainedEnum)
+        }
+        (CodeQueryResultValue::PythonRuleFact { value }, "target_id") => {
+            value.target_id.as_deref().map(Scalar::StableId)
+        }
+        (CodeQueryResultValue::PythonRuleFact { value }, "returns_receiver") => {
+            value.returns_receiver.map(Scalar::Boolean)
+        }
+        (CodeQueryResultValue::PythonRuleFact { value }, "parameter_count") => value
+            .parameter_count
+            .map(|count| Scalar::Integer(count as u64)),
+        (CodeQueryResultValue::PythonRuleFact { value }, "scope_is_public") => {
+            value.scope_is_public.map(Scalar::Boolean)
+        }
+        (CodeQueryResultValue::PythonRuleFact { value }, "docstring_present") => {
+            value.docstring_present.map(Scalar::Boolean)
+        }
+        (CodeQueryResultValue::PythonRuleFact { value }, "docstring_value") => {
+            value.docstring_value.as_deref().map(Scalar::String)
+        }
+        (CodeQueryResultValue::PythonRuleFact { value }, "comment_block_text") => {
+            value.comment_block_text.as_deref().map(Scalar::String)
+        }
+        (CodeQueryResultValue::PythonRuleFact { value }, "comment_block_lines") => {
+            value.comment_block_lines.as_deref().map(Scalar::StringList)
+        }
+        (CodeQueryResultValue::PythonRuleFact { value }, "lines_of_code") => value
+            .lines_of_code
+            .map(|count| Scalar::Integer(count as u64)),
+        (CodeQueryResultValue::PythonRuleFact { value }, "decorator_count") => value
+            .decorator_count
+            .map(|count| Scalar::Integer(count as u64)),
+        (CodeQueryResultValue::PythonRuleFact { value }, "is_override") => {
+            value.is_override.map(Scalar::Boolean)
+        }
+        (CodeQueryResultValue::PythonRuleFact { value }, "is_property_accessor") => {
+            value.is_property_accessor.map(Scalar::Boolean)
+        }
+        (CodeQueryResultValue::PythonRuleFact { value }, "public_method_count") => value
+            .public_method_count
+            .map(|count| Scalar::Integer(count as u64)),
+        (CodeQueryResultValue::PythonRuleFact { value }, "has_inheritance") => {
+            value.has_inheritance.map(Scalar::Boolean)
+        }
+        (CodeQueryResultValue::PythonRuleFact { value }, "has_subclasses") => {
+            value.has_subclasses.map(Scalar::Boolean)
+        }
+        (CodeQueryResultValue::PythonRuleFact { value }, "has_special_method") => {
+            value.has_special_method.map(Scalar::Boolean)
+        }
+        (CodeQueryResultValue::PythonRuleFact { value }, "is_decorated") => {
+            value.is_decorated.map(Scalar::Boolean)
+        }
+        (CodeQueryResultValue::PythonRuleFact { value }, "is_probable_mixin") => {
+            value.is_probable_mixin.map(Scalar::Boolean)
+        }
+        (CodeQueryResultValue::PythonRuleFact { value }, "is_stateful") => {
+            value.is_stateful.map(Scalar::Boolean)
+        }
+        (CodeQueryResultValue::PythonRuleFact { value }, "is_top_level") => {
+            value.is_top_level.map(Scalar::Boolean)
+        }
+        (CodeQueryResultValue::PythonRuleFact { value }, "cyclomatic_complexity") => value
+            .cyclomatic_complexity
+            .map(|count| Scalar::Integer(count as u64)),
+        (CodeQueryResultValue::PythonRuleFact { value }, "url_prefix") => {
+            value.url_prefix.as_deref().map(Scalar::String)
+        }
+        (CodeQueryResultValue::PythonRuleFact { value }, "variable_id") => {
+            value.variable_id.as_deref().map(Scalar::StableId)
+        }
+        (CodeQueryResultValue::PythonRuleFact { value }, "name") => {
+            value.name.as_deref().map(Scalar::String)
+        }
+        (CodeQueryResultValue::PythonRuleFact { value }, "scope_kind") => {
+            value.scope_kind.map(Scalar::ConstrainedEnum)
+        }
+        (CodeQueryResultValue::PythonRuleFact { value }, "is_global") => {
+            value.is_global.map(Scalar::Boolean)
+        }
+        (CodeQueryResultValue::PythonRuleFact { value }, "is_nonlocal") => {
+            value.is_nonlocal.map(Scalar::Boolean)
+        }
+        (CodeQueryResultValue::PythonRuleFact { value }, "is_builtin") => {
+            value.is_builtin.map(Scalar::Boolean)
+        }
+        (CodeQueryResultValue::PythonRuleFact { value }, "call_callee") => {
+            value.call_callee.map(Scalar::Boolean)
+        }
+        (CodeQueryResultValue::PythonRuleFact { value }, "has_read") => {
+            value.has_read.map(Scalar::Boolean)
+        }
+        (CodeQueryResultValue::PythonRuleFact { value }, "definition_kind") => {
+            value.definition_kind.map(Scalar::ConstrainedEnum)
+        }
+        (CodeQueryResultValue::PythonRuleFact { value }, "definition_order") => value
+            .definition_order
+            .map(|order| Scalar::Integer(order as u64)),
+        (CodeQueryResultValue::PythonRuleFact { value }, "first_definition") => {
+            value.first_definition.map(Scalar::Boolean)
+        }
+        (CodeQueryResultValue::PythonRuleFact { value }, "definition_is_unused") => {
+            value.definition_is_unused.map(Scalar::Boolean)
+        }
+        (CodeQueryResultValue::PythonRuleFact { value }, "annotation_only") => {
+            value.annotation_only.map(Scalar::Boolean)
+        }
+        (CodeQueryResultValue::PythonRuleFact { value }, "annotated_assignment") => {
+            value.annotated_assignment.map(Scalar::Boolean)
+        }
+        (CodeQueryResultValue::PythonRuleFact { value }, "is_abstract") => {
+            value.is_abstract.map(Scalar::Boolean)
+        }
+        (CodeQueryResultValue::PythonRuleFact { value }, "is_overriding_method") => {
+            value.is_overriding_method.map(Scalar::Boolean)
+        }
+        (CodeQueryResultValue::PythonRuleFact { value }, "is_overridden_method") => {
+            value.is_overridden_method.map(Scalar::Boolean)
+        }
+        (CodeQueryResultValue::PythonRuleFact { value }, "reachability") => {
+            value.reachability.map(Scalar::ConstrainedEnum)
+        }
+        (CodeQueryResultValue::PythonRuleFact { value }, "access_kind") => {
+            value.access_kind.map(Scalar::ConstrainedEnum)
+        }
+        (CodeQueryResultValue::PythonRuleFact { value }, "nested_scope") => {
+            value.nested_scope.map(Scalar::Boolean)
+        }
+        (CodeQueryResultValue::PythonRuleFact { value }, "in_main_guard") => {
+            value.in_main_guard.map(Scalar::Boolean)
+        }
+        (CodeQueryResultValue::PythonRuleFact { value }, "optimizing_parameter") => {
+            value.optimizing_parameter.map(Scalar::Boolean)
+        }
+        (CodeQueryResultValue::PythonRuleFact { value }, "self_assignment") => {
+            value.self_assignment.map(Scalar::Boolean)
+        }
+        (CodeQueryResultValue::PythonRuleFact { value }, "related_scope_kind") => {
+            value.related_scope_kind.map(Scalar::ConstrainedEnum)
+        }
+        (CodeQueryResultValue::PythonRuleFact { value }, "related_has_definition_outside_main") => {
+            value
+                .related_has_definition_outside_main
+                .map(Scalar::Boolean)
+        }
+        (CodeQueryResultValue::PythonRuleFact { value }, "related_has_deletion") => {
+            value.related_has_deletion.map(Scalar::Boolean)
+        }
+        (CodeQueryResultValue::PythonRuleFact { value }, "related_has_import") => {
+            value.related_has_import.map(Scalar::Boolean)
+        }
+        (CodeQueryResultValue::PythonRuleFact { value }, "related_is_pytest_fixture") => {
+            value.related_is_pytest_fixture.map(Scalar::Boolean)
+        }
+        (CodeQueryResultValue::PythonRuleFact { value }, "loop_has_body_read") => {
+            value.loop_has_body_read.map(Scalar::Boolean)
+        }
+        (CodeQueryResultValue::PythonRuleFact { value }, "loop_policy_excluded") => {
+            value.loop_policy_excluded.map(Scalar::Boolean)
+        }
+        (CodeQueryResultValue::PythonRuleFact { value }, "nested_loop_reused") => {
+            value.nested_loop_reused.map(Scalar::Boolean)
+        }
+        (CodeQueryResultValue::PythonRuleFact { value }, "nested_loop_has_outer_use") => {
+            value.nested_loop_has_outer_use.map(Scalar::Boolean)
         }
         (CodeQueryResultValue::Guard { value }, "id") => Some(Scalar::StableId(&value.id)),
         (CodeQueryResultValue::Guard { value }, "procedure_id") => {
@@ -5268,6 +6763,51 @@ fn project_code_query_row_field<'a>(
         (CodeQueryResultValue::TopologyEdge { value }, "completeness") => {
             Some(Scalar::ConstrainedEnum(value.completeness))
         }
+        (CodeQueryResultValue::DependencyEvidence { value }, "id") => {
+            Some(Scalar::StableId(&value.id))
+        }
+        (CodeQueryResultValue::DependencyEvidence { value }, "path") => {
+            Some(Scalar::String(&value.path))
+        }
+        (CodeQueryResultValue::DependencyEvidence { value }, "ecosystem") => {
+            Some(Scalar::String(&value.ecosystem))
+        }
+        (CodeQueryResultValue::DependencyEvidence { value }, "package") => {
+            Some(Scalar::String(&value.package))
+        }
+        (CodeQueryResultValue::DependencyEvidence { value }, "evidence_kind") => {
+            Some(Scalar::String(&value.evidence_kind))
+        }
+        (CodeQueryResultValue::DependencyEvidence { value }, "scope") => {
+            Some(Scalar::String(&value.scope))
+        }
+        (CodeQueryResultValue::DependencyEvidence { value }, "source_digest") => {
+            Some(Scalar::String(&value.source_digest))
+        }
+        (CodeQueryResultValue::DependencyEvidence { value }, "version_requirement") => {
+            value.version_requirement.as_deref().map(Scalar::String)
+        }
+        (CodeQueryResultValue::DependencyEvidence { value }, "exact_version") => {
+            value.exact_version.as_deref().map(Scalar::String)
+        }
+        (CodeQueryResultValue::DependencyEvidence { value }, "source") => {
+            value.source.as_deref().map(Scalar::String)
+        }
+        (CodeQueryResultValue::DependencyEvidence { value }, "locator") => {
+            value.locator.as_deref().map(Scalar::String)
+        }
+        (CodeQueryResultValue::DependencyEvidence { value }, "declared_by") => {
+            value.declared_by.as_deref().map(Scalar::StableId)
+        }
+        (CodeQueryResultValue::DependencyEvidence { value }, "start_byte") => {
+            Some(Scalar::Integer(value.start_byte as u64))
+        }
+        (CodeQueryResultValue::DependencyEvidence { value }, "end_byte") => {
+            Some(Scalar::Integer(value.end_byte as u64))
+        }
+        (CodeQueryResultValue::DependencyEvidence { value }, "complete") => {
+            Some(Scalar::Boolean(value.complete))
+        }
         (CodeQueryResultValue::ConfigurationFact { value }, "id") => {
             Some(Scalar::StableId(&value.id))
         }
@@ -5295,6 +6835,9 @@ fn project_code_query_row_field<'a>(
         (CodeQueryResultValue::ConfigurationFact { value }, "scalar_kind") => {
             value.scalar_kind.map(Scalar::ConstrainedEnum)
         }
+        (CodeQueryResultValue::ConfigurationFact { value }, "value") => {
+            value.value.as_deref().map(Scalar::String)
+        }
         (CodeQueryResultValue::ConfigurationFact { value }, "provenance") => {
             Some(Scalar::ConstrainedEnum(value.provenance))
         }
@@ -5316,6 +6859,47 @@ fn project_code_query_row_field<'a>(
         (CodeQueryResultValue::ConfigurationFact { value }, "ordinal") => {
             Some(Scalar::Integer(u64::from(value.ordinal)))
         }
+        (CodeQueryResultValue::CrossDomain { value }, "id") => Some(Scalar::StableId(&value.id)),
+        (CodeQueryResultValue::CrossDomain { value }, "operator") => {
+            Some(Scalar::ConstrainedEnum(value.operator))
+        }
+        (CodeQueryResultValue::CrossDomain { value }, "domain") => {
+            Some(Scalar::ConstrainedEnum(value.domain))
+        }
+        (CodeQueryResultValue::CrossDomain { value }, "relation") => {
+            value.relation.map(Scalar::ConstrainedEnum)
+        }
+        (CodeQueryResultValue::CrossDomain { value }, "binding") => {
+            value.binding.map(Scalar::ConstrainedEnum)
+        }
+        (CodeQueryResultValue::CrossDomain { value }, "key") => {
+            value.key.as_deref().map(Scalar::String)
+        }
+        (CodeQueryResultValue::CrossDomain { value }, "code_id") => {
+            value.code_id.as_deref().map(Scalar::StableId)
+        }
+        (CodeQueryResultValue::CrossDomain { value }, "mitigated") => {
+            value.mitigated.map(Scalar::Boolean)
+        }
+        (CodeQueryResultValue::CrossDomain { value }, "dependency_id") => {
+            value.dependency_id.as_deref().map(Scalar::StableId)
+        }
+        (CodeQueryResultValue::CrossDomain { value }, "owner") => {
+            value.owner.as_deref().map(Scalar::StableId)
+        }
+        (CodeQueryResultValue::CrossDomain { value }, "mapping_id") => {
+            value.mapping_id.as_deref().map(Scalar::StableId)
+        }
+        (CodeQueryResultValue::CrossDomain { value }, "code_path") => {
+            value.code_path.as_deref().map(Scalar::String)
+        }
+        (CodeQueryResultValue::CrossDomain { value }, "configuration_id") => {
+            value.configuration_id.as_deref().map(Scalar::StableId)
+        }
+        (CodeQueryResultValue::CrossDomain { value }, "configuration_path") => {
+            value.configuration_path.as_deref().map(Scalar::String)
+        }
+        (CodeQueryResultValue::CrossDomain { value }, "path") => Some(Scalar::String(&value.path)),
         _ => None,
     }
 }
@@ -5346,10 +6930,6 @@ pub enum DetailedCodeQueryKey {
     TypestateFinding {
         id: String,
     },
-    ConcurrentAccessConflict {
-        id: String,
-        root_procedure_id: String,
-    },
     TypestateWitness {
         id: String,
         finding_id: String,
@@ -5375,15 +6955,33 @@ pub enum DetailedCodeQueryKey {
         id: String,
     },
     File,
+    DependencyEvidence {
+        id: String,
+        ecosystem: String,
+        package: String,
+        evidence_kind: String,
+        scope: String,
+        source_digest: String,
+        version_requirement: Option<String>,
+        exact_version: Option<String>,
+        source: Option<String>,
+        declared_by: Option<String>,
+    },
     ConfigurationFact {
         id: String,
         fact_id: String,
+    },
+    CrossDomain {
+        id: String,
+        code_id: Option<String>,
+        configuration_id: Option<String>,
     },
     ReferenceSite {
         target_id: Option<String>,
         target_fq_name: String,
     },
     CallSite {
+        site_id: Option<String>,
         caller_fq_name: String,
         callee_fq_name: String,
     },
@@ -5409,6 +7007,10 @@ pub enum DetailedCodeQueryKey {
         site_id: String,
     },
     ReceiverEvidence {
+        id: String,
+        site_id: String,
+    },
+    PointsToCandidate {
         id: String,
         site_id: String,
     },
@@ -5439,6 +7041,10 @@ pub enum DetailedCodeQueryKey {
         id: String,
         member_id: String,
         ordinal: usize,
+    },
+    PythonHierarchyFact {
+        id: String,
+        root_id: String,
     },
     CallShape {
         id: String,
@@ -5509,6 +7115,14 @@ pub enum DetailedCodeQueryKey {
         declaration_id: String,
         site_id: String,
     },
+    LiteralOccurrence {
+        id: String,
+    },
+    CallableMetrics {
+        id: String,
+        callable_id: Option<String>,
+        site_id: String,
+    },
     CallableApplicability {
         id: String,
         site_ast_id: String,
@@ -5563,6 +7177,7 @@ pub enum DetailedCodeQueryKey {
         id: String,
         form: String,
         exported_name: String,
+        local_definition: Option<DetailedCodeQueryExportLocalDefinition>,
     },
     DeclarationState {
         id: String,
@@ -5580,6 +7195,11 @@ pub enum DetailedCodeQueryKey {
         ast_id: Option<String>,
         procedure_id: String,
         event_class: String,
+    },
+    BindingInitializerCall {
+        id: String,
+        establishment_event_id: String,
+        site_ast_id: String,
     },
     FlowRelation {
         id: String,
@@ -5603,6 +7223,9 @@ pub enum DetailedCodeQueryKey {
         id: String,
         procedure_id: String,
     },
+    CppExpression {
+        id: String,
+    },
     FailureHandlerState {
         id: String,
         catch_ast_id: String,
@@ -5611,6 +7234,17 @@ pub enum DetailedCodeQueryKey {
     StatementReachability {
         id: String,
         procedure_id: String,
+    },
+    PendingCleanupFlow {
+        id: String,
+        procedure_id: String,
+    },
+    PythonRuleFact {
+        id: String,
+        relation: String,
+    },
+    RustPointerFinding {
+        id: String,
     },
     Guard {
         id: String,
@@ -5647,6 +7281,20 @@ pub enum DetailedCodeQueryKey {
         to_name: String,
         scope: String,
     },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum DetailedCodeQueryExportLocalDefinition {
+    Defined {
+        binding_name: String,
+        binding_kind: String,
+        start_byte: usize,
+        end_byte: usize,
+        range: CodeQueryRange,
+    },
+    Undefined,
+    Unknown,
 }
 
 impl DetailedCodeQueryResult {
@@ -5911,6 +7559,12 @@ fn detailed_semantic_identity(
                 procedure_id: value.procedure_id.clone(),
             },
         )),
+        CodeQueryResultValue::CppExpression { value } => Some((
+            DetailedCodeQueryDomain::CppExpression,
+            DetailedCodeQueryKey::CppExpression {
+                id: value.id.clone(),
+            },
+        )),
         CodeQueryResultValue::StatementReachability { value } => Some((
             DetailedCodeQueryDomain::StatementReachability,
             DetailedCodeQueryKey::StatementReachability {
@@ -5918,11 +7572,24 @@ fn detailed_semantic_identity(
                 procedure_id: value.procedure_id.clone(),
             },
         )),
-        CodeQueryResultValue::ConcurrentAccessConflict { value } => Some((
-            DetailedCodeQueryDomain::ConcurrentAccessConflict,
-            DetailedCodeQueryKey::ConcurrentAccessConflict {
+        CodeQueryResultValue::PendingCleanupFlow { value } => Some((
+            DetailedCodeQueryDomain::PendingCleanupFlow,
+            DetailedCodeQueryKey::PendingCleanupFlow {
                 id: value.id.clone(),
-                root_procedure_id: value.root_procedure_id.clone(),
+                procedure_id: value.procedure_id.clone(),
+            },
+        )),
+        CodeQueryResultValue::PythonRuleFact { value } => Some((
+            DetailedCodeQueryDomain::PythonRuleFact,
+            DetailedCodeQueryKey::PythonRuleFact {
+                id: value.id.clone(),
+                relation: value.relation.to_string(),
+            },
+        )),
+        CodeQueryResultValue::RustPointerFinding { value } => Some((
+            DetailedCodeQueryDomain::RustPointerFinding,
+            DetailedCodeQueryKey::RustPointerFinding {
+                id: value.id.clone(),
             },
         )),
         CodeQueryResultValue::DetachedTaskTransfer { value } => Some((
@@ -5983,11 +7650,41 @@ fn detailed_semantic_identity(
                 id: value.id.clone(),
             },
         )),
+        CodeQueryResultValue::DependencyEvidence { value } => Some((
+            DetailedCodeQueryDomain::DependencyEvidence,
+            DetailedCodeQueryKey::DependencyEvidence {
+                id: value.id.clone(),
+                ecosystem: value.ecosystem.clone(),
+                package: value.package.clone(),
+                evidence_kind: value.evidence_kind.clone(),
+                scope: value.scope.clone(),
+                source_digest: value.source_digest.clone(),
+                version_requirement: value.version_requirement.clone(),
+                exact_version: value.exact_version.clone(),
+                source: value.source.clone(),
+                declared_by: value.declared_by.clone(),
+            },
+        )),
         CodeQueryResultValue::ConfigurationFact { value } => Some((
             DetailedCodeQueryDomain::ConfigurationFact,
             DetailedCodeQueryKey::ConfigurationFact {
                 id: value.id.clone(),
                 fact_id: value.fact_id.clone(),
+            },
+        )),
+        CodeQueryResultValue::PointsToCandidate { value } => Some((
+            DetailedCodeQueryDomain::PointsToCandidate,
+            DetailedCodeQueryKey::PointsToCandidate {
+                id: value.id.clone(),
+                site_id: value.site_id.clone(),
+            },
+        )),
+        CodeQueryResultValue::CrossDomain { value } => Some((
+            DetailedCodeQueryDomain::CrossDomain,
+            DetailedCodeQueryKey::CrossDomain {
+                id: value.id.clone(),
+                code_id: value.code_id.clone(),
+                configuration_id: value.configuration_id.clone(),
             },
         )),
         CodeQueryResultValue::StructuralMatch { .. }
@@ -6007,6 +7704,7 @@ fn detailed_semantic_identity(
         | CodeQueryResultValue::DispatchTarget { .. }
         | CodeQueryResultValue::MemberFamily { .. }
         | CodeQueryResultValue::MemberFamilyEdge { .. }
+        | CodeQueryResultValue::PythonHierarchyFact { .. }
         | CodeQueryResultValue::CallShape { .. }
         | CodeQueryResultValue::CallArgumentGroup { .. }
         | CodeQueryResultValue::CallArgument { .. }
@@ -6014,6 +7712,8 @@ fn detailed_semantic_identity(
         | CodeQueryResultValue::CallEffect { .. }
         | CodeQueryResultValue::ProcedureEffect { .. }
         | CodeQueryResultValue::CallableSignature { .. }
+        | CodeQueryResultValue::LiteralOccurrence { .. }
+        | CodeQueryResultValue::CallableMetrics { .. }
         | CodeQueryResultValue::SignatureParameter { .. }
         | CodeQueryResultValue::DecoratedParameter { .. }
         | CodeQueryResultValue::CallableApplicability { .. }
@@ -6029,6 +7729,7 @@ fn detailed_semantic_identity(
         | CodeQueryResultValue::DeclarationState { .. }
         | CodeQueryResultValue::ReferenceEdge { .. }
         | CodeQueryResultValue::StateEvent { .. }
+        | CodeQueryResultValue::BindingInitializerCall { .. }
         | CodeQueryResultValue::FlowRelation { .. }
         | CodeQueryResultValue::ControlRelation { .. }
         | CodeQueryResultValue::BranchRelation { .. }
@@ -6087,12 +7788,17 @@ fn semantic_wire_id(key: &DetailedCodeQueryKey) -> Option<&str> {
         | DetailedCodeQueryKey::FlowEndpoint { id }
         | DetailedCodeQueryKey::FlowWitness { id, .. }
         | DetailedCodeQueryKey::AbsentMemberWitness { id, .. }
-        | DetailedCodeQueryKey::TaintFinding { id } => Some(id),
+        | DetailedCodeQueryKey::TaintFinding { id }
+        | DetailedCodeQueryKey::RustPointerFinding { id } => Some(id),
         DetailedCodeQueryKey::StructuralMatch { .. }
         | DetailedCodeQueryKey::Declaration { .. }
         | DetailedCodeQueryKey::File
+        | DetailedCodeQueryKey::DependencyEvidence { .. }
         | DetailedCodeQueryKey::ConfigurationFact { .. }
+        | DetailedCodeQueryKey::CrossDomain { .. }
         | DetailedCodeQueryKey::ReferenceSite { .. }
+        // A call-site ID identifies the row, while its stable owner candidate
+        // is the enclosing caller declaration.
         | DetailedCodeQueryKey::CallSite { .. }
         | DetailedCodeQueryKey::ExpressionSite { .. }
         | DetailedCodeQueryKey::JsxAttributeValue { .. }
@@ -6100,12 +7806,14 @@ fn semantic_wire_id(key: &DetailedCodeQueryKey) -> Option<&str> {
         | DetailedCodeQueryKey::MemberTargetAnalysis { .. }
         | DetailedCodeQueryKey::ReceiverOutcome { .. }
         | DetailedCodeQueryKey::ReceiverEvidence { .. }
+        | DetailedCodeQueryKey::PointsToCandidate { .. }
         | DetailedCodeQueryKey::FieldWriteValue { .. }
         | DetailedCodeQueryKey::RuntimeKeyedReadValue { .. }
         | DetailedCodeQueryKey::DispatchOutcome { .. }
         | DetailedCodeQueryKey::DispatchTarget { .. }
         | DetailedCodeQueryKey::MemberFamily { .. }
         | DetailedCodeQueryKey::MemberFamilyEdge { .. }
+        | DetailedCodeQueryKey::PythonHierarchyFact { .. }
         | DetailedCodeQueryKey::CallShape { .. }
         | DetailedCodeQueryKey::CallArgumentGroup { .. }
         | DetailedCodeQueryKey::CallArgument { .. }
@@ -6119,13 +7827,18 @@ fn semantic_wire_id(key: &DetailedCodeQueryKey) -> Option<&str> {
         | DetailedCodeQueryKey::SwitchCoverage { .. }
         | DetailedCodeQueryKey::AssignmentRelation { .. }
         | DetailedCodeQueryKey::LoopRelation { .. }
+        | DetailedCodeQueryKey::CppExpression { .. }
         | DetailedCodeQueryKey::StatementReachability { .. }
-        | DetailedCodeQueryKey::ConcurrentAccessConflict { .. }
+        | DetailedCodeQueryKey::PendingCleanupFlow { .. }
+        // This query-derived id is not a semantic IR wire identity.
+        | DetailedCodeQueryKey::PythonRuleFact { .. }
         | DetailedCodeQueryKey::ClassSetRow { .. }
         | DetailedCodeQueryKey::AbsentMemberFinding { .. }
         | DetailedCodeQueryKey::DetachedTaskTransfer { .. }
         | DetailedCodeQueryKey::ProcedureEffect { .. }
         | DetailedCodeQueryKey::CallableSignature { .. }
+        | DetailedCodeQueryKey::LiteralOccurrence { .. }
+        | DetailedCodeQueryKey::CallableMetrics { .. }
         | DetailedCodeQueryKey::SignatureParameter { .. }
         | DetailedCodeQueryKey::DecoratedParameter { .. }
         | DetailedCodeQueryKey::CallableApplicability { .. }
@@ -6141,6 +7854,7 @@ fn semantic_wire_id(key: &DetailedCodeQueryKey) -> Option<&str> {
         | DetailedCodeQueryKey::DeclarationState { .. }
         | DetailedCodeQueryKey::ReferenceEdge { .. }
         | DetailedCodeQueryKey::StateEvent { .. }
+        | DetailedCodeQueryKey::BindingInitializerCall { .. }
         | DetailedCodeQueryKey::FlowRelation { .. }
         | DetailedCodeQueryKey::ControlRelation { .. }
         | DetailedCodeQueryKey::BranchRelation { .. }
@@ -6264,26 +7978,6 @@ mod toy_domain {
 #[cfg(test)]
 mod registry {
     use super::*;
-
-    #[test]
-    fn exceeded_limit_publishes_only_the_five_budget_lanes() {
-        let field = DetailedCodeQueryDomain::DispatchOutcome
-            .row_fields()
-            .iter()
-            .find(|field| field.name == "exceeded_limit")
-            .expect("dispatch outcome registers its budget limit");
-        assert!(field.nullable);
-        assert_eq!(
-            field.value_domain,
-            Some(CodeQueryEnumDomain::Labels(&[
-                "source",
-                "rows",
-                "retained_bytes",
-                "steps",
-                "files",
-            ])),
-        );
-    }
 
     /// #2956: the class-set Unknown reasons (`unknown:<label>` origins) are
     /// row values behind a registered open enum, so renaming `budget` to

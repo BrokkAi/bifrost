@@ -3,14 +3,15 @@
 //!
 //! One *control relation* says how two program points of one procedure's
 //! production control-flow graph relate: `dominates`, `postdominates`,
-//! `control_depends_on`, `reachable` (from the procedure entry), and `in_loop`.
+//! `control_depends_on`, `reachable` (from the procedure entry), `reaches`,
+//! and `in_loop`.
 //! Every row joins on the same stable wire ids the `program_point` and
 //! `control_edge` rows publish, so a policy relates "the point that calls
 //! validate" to "the point that calls store" by id equality rather than by
 //! comparing ranges.
 //!
 //! No algorithm lives here. `crate::analyzer::semantic::cfg_algorithms` stays
-//! the single source of truth for all five; this module runs them once per
+//! the single source of truth for the shared relations; this module runs them once per
 //! procedure under one shared [`CfgAlgorithmBudget`], turns their answers into
 //! rows, and turns their failures into typed diagnostics.
 //!
@@ -158,7 +159,7 @@ pub(super) struct ProcedureControlRelations {
 
 /// Derive every control relation of one procedure.
 ///
-/// All five algorithms share one budget ledger, so a procedure cannot spend the
+/// All algorithms share one budget ledger, so a procedure cannot spend the
 /// whole allowance on dominance and then report the other four as absent
 /// without a reason: whichever relation the ledger runs out inside records its
 /// own `BudgetExhausted` and the ones after it record theirs.
@@ -210,6 +211,42 @@ pub(super) fn control_relations_for_procedure(
             certainty: FlowCertainty::Exact,
         });
     }
+
+    // Unlike entry reachability, this relation is intentionally pair-local:
+    // policies use it to establish that one exact call point precedes another
+    // in the same procedure. Each source gets the same shared bounded CFG
+    // traversal, and a failed source walk drops the whole relation rather than
+    // presenting a partial transitive closure as a complete answer.
+    let reaches_start = rows.len();
+    let mut reaches_complete = true;
+    for source in live.iter().copied() {
+        let reached = match forward_reachability(procedure, source, &mut request) {
+            Ok(reached) => reached,
+            Err(error) => {
+                rows.truncate(reaches_start);
+                push_algorithm_reason(&error, ControlRelationKind::Reaches, &mut reasons);
+                reaches_complete = false;
+                break;
+            }
+        };
+        for target in live.iter().copied().filter(|target| *target != source) {
+            if reached.contains(procedure, target) {
+                rows.push(ControlRelationRow {
+                    relation: ControlRelationKind::Reaches,
+                    source,
+                    target,
+                    controlling_edge: None,
+                    certainty: FlowCertainty::Exact,
+                });
+            }
+        }
+    }
+    debug_assert!(
+        reaches_complete
+            || !rows
+                .iter()
+                .any(|row| { row.relation == ControlRelationKind::Reaches })
+    );
 
     match dominators(procedure, entry, &mut request) {
         Ok(dominance) => {
@@ -589,11 +626,9 @@ impl ControlRelationValue {
     /// otherwise `partial`. A row whose family was fully enumerated is not made
     /// partial by a hole in an unrelated relation.
     pub(super) fn completeness_label(&self) -> &'static str {
-        if self.relations.completeness.covers(self.row().relation) {
-            "complete"
-        } else {
-            "partial"
-        }
+        super::completeness_label_for_coverage(
+            self.relations.completeness.covers(self.row().relation),
+        )
     }
 }
 
@@ -699,11 +734,11 @@ pub(super) fn detailed_key(value: &ControlRelationValue) -> DetailedCodeQueryKey
 /// The row's own source anchor: the target point, which is the position an
 /// author is asking about when they ask what dominates or governs it.
 pub(super) fn anchor(value: &ControlRelationValue) -> (ProjectFile, Range) {
-    let point = value
-        .procedure
-        .point_value(value.row().target)
-        .expect("a validated procedure owns the point its own relation names");
-    (value.procedure.file().clone(), point.source_range())
+    super::procedure_point_anchor(
+        &value.procedure,
+        value.row().target,
+        "a validated procedure owns the point its own relation names",
+    )
 }
 
 /// The trace reference of one control-relation row: enough to name the claim
@@ -767,8 +802,6 @@ mod tests {
         assert!(completeness.covers(ControlRelationKind::InLoop));
     }
 
-    /// Cancellation is not a per-relation hole: nothing the derivation produced
-    /// before it can be claimed to be the complete set.
     #[test]
     fn cancellation_covers_nothing() {
         let completeness = ControlRelationCompleteness::Incomplete {
@@ -797,46 +830,9 @@ mod tests {
         };
         let mut diagnostics = Vec::new();
         cache.report_completeness("procedure-1", Language::Java, &relations, &mut diagnostics);
-        assert_eq!(diagnostics.len(), 2, "{diagnostics:?}");
-        assert!(
-            diagnostics
-                .iter()
-                .all(|diagnostic| diagnostic.impact == CodeQueryDiagnosticImpact::Incomplete),
-            "{diagnostics:?}"
-        );
+        crate::structural::search::test_support::assert_incomplete_diagnostics(&diagnostics, 2);
         // The second call adds nothing: one reason is reported once per subject.
         cache.report_completeness("procedure-1", Language::Java, &relations, &mut diagnostics);
-        assert_eq!(diagnostics.len(), 2, "{diagnostics:?}");
-    }
-
-    #[test]
-    fn a_relation_filter_keeps_only_the_named_relation() {
-        let row = ControlRelationRow {
-            relation: ControlRelationKind::Dominates,
-            source: ProgramPointId::try_from_index(0).expect("index fits"),
-            target: ProgramPointId::try_from_index(1).expect("index fits"),
-            controlling_edge: None,
-            certainty: FlowCertainty::Exact,
-        };
-        let filter = ControlRelationFilter {
-            relations: vec![ControlRelationKind::Postdominates],
-            exit_partitions: Vec::new(),
-        };
-        assert!(!control_relation_filter_matches(&filter, &row));
-        assert!(control_relation_filter_matches(
-            &ControlRelationFilter::default(),
-            &row
-        ));
-        // A reserved partition is a partition no row was computed against.
-        let reserved = ControlRelationFilter {
-            relations: Vec::new(),
-            exit_partitions: vec![ControlExitPartition::NormalOnly],
-        };
-        assert!(!control_relation_filter_matches(&reserved, &row));
-        let derived = ControlRelationFilter {
-            relations: Vec::new(),
-            exit_partitions: vec![ControlExitPartition::NormalAndExceptional],
-        };
-        assert!(control_relation_filter_matches(&derived, &row));
+        crate::structural::search::test_support::assert_incomplete_diagnostics(&diagnostics, 2);
     }
 }

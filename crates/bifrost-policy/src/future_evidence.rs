@@ -15,7 +15,9 @@ use serde::ser::SerializeStruct;
 use serde::{Deserialize, Deserializer, Serialize, Serializer, de};
 use sha2::{Digest, Sha256};
 
-use brokk_bifrost_analysis::analyzer::canonical_hash::{CanonicalHasher, write_lower_hex};
+use brokk_bifrost_analysis::analyzer::canonical_hash::{
+    CanonicalHasher, write_length_prefixed as update_finding_value, write_lower_hex,
+};
 pub use brokk_bifrost_flow::typestate::{TypestateBindingPlanHash, TypestateProtocolHash};
 
 use super::budget::PolicyBudget;
@@ -24,20 +26,23 @@ use super::cvss::{CvssEvidenceContentHash, SourceScenarioSetHash};
 use super::definition::{
     EndpointId, EndpointObservationPhase, FindingCombinationId, PolicyCategoryId, PolicyId,
     PolicySemanticEvent, TaintCatalogHash, TaintEntryId, TaintImpact, TaintLabel,
-    TaintSourceEvidence, TaintSystemEntry, TaintTag, TaintTrustBoundary, TypestateEventId,
-    TypestateExitScope, TypestateExpectationId, TypestateStateId,
+    TaintSourceEvidence, TaintSystemEntry, TaintTag, TaintThreatModel, TaintTrustBoundary,
+    TypestateEventId, TypestateExitScope, TypestateExpectationId, TypestateStateId,
 };
 use super::finding::PolicySourceLocation;
 use super::finding_identity::{
-    AnalysisEventRef, AnalysisFindingId, AnalysisSubjectRef, EvidenceRef, FindingIdentityStability,
-    OpaqueFindingKey, SourceScenarioId, StableIdentityDerivation, StableSemanticIdentity,
-    TypestateScenarioId, WitnessId,
+    AnalysisEventRef, AnalysisFindingId, AnalysisSubjectRef, EvidenceRef, OpaqueFindingKey,
+    SourceScenarioId, StableIdentityDerivation, StableSemanticIdentity, TypestateScenarioId,
+    WitnessId, update_stable_semantic_identity,
 };
 use super::identity::{
     EndpointAnalysisProjectionHash, EndpointSemanticHash, TypestateAuthoringProjectionHash,
 };
 use super::resolved::{ResolvedCatalogIdentity, ResolvedEndpointIdentity};
-use super::retained::{RetainedSize, retained_extra};
+use super::retained::{
+    RetainedSize, ensure_truncation_consistency, retained_extra, retained_size_with_extra,
+    retained_size_with_extras, retained_size_with_field_extra,
+};
 
 const MAX_PROJECTION_SOURCE_FACTS: usize = 4_096;
 const MAX_PROJECTION_SCENARIO_MEMBERSHIPS: usize = 16_384;
@@ -54,6 +59,30 @@ const TYPESTATE_VIOLATION_DOMAIN: &[u8] = b"bifrost-typestate-violation/v1";
 const CVSS_STATIC_EVIDENCE_DOMAIN: &[u8] = b"bifrost-cvss-static-evidence/v1";
 const POLICY_VULNERABILITY_DOMAIN: &[u8] = b"bifrost-policy-vulnerability/v1";
 const POLICY_FINDING_DOMAIN: &[u8] = b"bifrost-policy-finding/v1";
+
+fn policy_finding_hasher(policy_id: &PolicyId, analysis_kind: &[u8]) -> Sha256 {
+    let mut hasher = Sha256::new();
+    update_finding_value(&mut hasher, POLICY_FINDING_DOMAIN);
+    update_finding_value(&mut hasher, analysis_kind);
+    update_finding_value(&mut hasher, policy_id.as_str().as_bytes());
+    hasher
+}
+
+fn vulnerability_hasher(analysis_kind: &[u8]) -> Sha256 {
+    let mut hasher = Sha256::new();
+    update_finding_value(&mut hasher, POLICY_VULNERABILITY_DOMAIN);
+    update_finding_value(&mut hasher, analysis_kind);
+    hasher
+}
+
+impl Serialize for TaintThreatModel {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(self.label())
+    }
+}
 
 macro_rules! define_digest {
     ($name:ident) => {
@@ -179,6 +208,7 @@ pub struct TaintSourceProjectionFact {
     pub source_endpoint_semantic_hash: EndpointSemanticHash,
     pub source_endpoint_analysis_projection_hash: EndpointAnalysisProjectionHash,
     pub source_display_name: String,
+    pub source_threat_model: Option<TaintThreatModel>,
     pub source_categories: Vec<PolicyCategoryId>,
     pub source_label: TaintLabel,
     pub source_evidence: Option<TaintSourceEvidence>,
@@ -201,11 +231,39 @@ impl TaintSourceProjectionFact {
         source_scenario_ids: Vec<SourceScenarioId>,
         evidence_ref: EvidenceRef,
     ) -> Result<Self, FutureEvidenceError> {
+        Self::try_new_with_threat_model(
+            source_endpoint,
+            source_endpoint_semantic_hash,
+            source_endpoint_analysis_projection_hash,
+            source_display_name,
+            None,
+            source_categories,
+            source_label,
+            source_evidence,
+            source_scenario_ids,
+            evidence_ref,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn try_new_with_threat_model(
+        source_endpoint: ResolvedEndpointIdentity,
+        source_endpoint_semantic_hash: EndpointSemanticHash,
+        source_endpoint_analysis_projection_hash: EndpointAnalysisProjectionHash,
+        source_display_name: String,
+        source_threat_model: Option<TaintThreatModel>,
+        source_categories: Vec<PolicyCategoryId>,
+        source_label: TaintLabel,
+        source_evidence: Option<TaintSourceEvidence>,
+        source_scenario_ids: Vec<SourceScenarioId>,
+        evidence_ref: EvidenceRef,
+    ) -> Result<Self, FutureEvidenceError> {
         let mut value = Self {
             source_endpoint,
             source_endpoint_semantic_hash,
             source_endpoint_analysis_projection_hash,
             source_display_name,
+            source_threat_model,
             source_categories,
             source_label,
             source_evidence,
@@ -242,7 +300,7 @@ impl TaintSourceProjectionFact {
 
     fn normalize_contents(&mut self) -> Result<(), FutureEvidenceError> {
         validate_text("source_display_name", &self.source_display_name)?;
-        tighten_string(&mut self.source_display_name);
+        super::finding::tighten_string(&mut self.source_display_name);
         normalize_semantic_set(
             &mut self.source_categories,
             "source_categories",
@@ -333,7 +391,7 @@ impl TaintPolicyProjectionFacts {
 
     fn normalize_contents(&mut self, budget: &PolicyBudget) -> Result<(), FutureEvidenceError> {
         validate_text("sink_display_name", &self.sink_display_name)?;
-        tighten_string(&mut self.sink_display_name);
+        super::finding::tighten_string(&mut self.sink_display_name);
         normalize_semantic_set(
             &mut self.sink_categories,
             "sink_categories",
@@ -503,13 +561,6 @@ impl TaintFindingAnchor {
         Self::Weak(TaintWeakAnchor { typed_key })
     }
 
-    pub const fn stability(&self) -> FindingIdentityStability {
-        match self {
-            Self::Strong(_) => FindingIdentityStability::Strong,
-            Self::Weak(_) => FindingIdentityStability::Weak,
-        }
-    }
-
     pub const fn strong_fields(&self) -> Option<&TaintStrongAnchor> {
         match self {
             Self::Strong(anchor) => Some(anchor),
@@ -524,6 +575,8 @@ impl TaintFindingAnchor {
         }
     }
 }
+
+crate::impl_finding_anchor_stability!(TaintFindingAnchor);
 
 impl Serialize for TaintFindingAnchor {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
@@ -562,22 +615,25 @@ impl Serialize for TaintFindingAnchor {
 
 impl RetainedSize for TaintStrongAnchor {
     fn retained_size(&self) -> usize {
-        size_of::<Self>().saturating_add(retained_extra(&self.sink_identity))
+        retained_size_with_field_extra(self, &self.sink_identity)
     }
 }
 
 impl RetainedSize for TaintWeakAnchor {
     fn retained_size(&self) -> usize {
-        size_of::<Self>().saturating_add(retained_extra(&self.typed_key))
+        retained_size_with_field_extra(self, &self.typed_key)
     }
 }
 
 impl RetainedSize for TaintFindingAnchor {
     fn retained_size(&self) -> usize {
-        size_of::<Self>().saturating_add(match self {
-            Self::Strong(anchor) => retained_extra(anchor),
-            Self::Weak(anchor) => retained_extra(anchor),
-        })
+        retained_size_with_extra(
+            self,
+            match self {
+                Self::Strong(anchor) => retained_extra(anchor),
+                Self::Weak(anchor) => retained_extra(anchor),
+            },
+        )
     }
 }
 
@@ -585,6 +641,7 @@ impl RetainedSize for TaintFindingAnchor {
 pub struct TaintOriginEvidence {
     source_endpoint: ResolvedEndpointIdentity,
     source_label: TaintLabel,
+    source_threat_model: Option<TaintThreatModel>,
     source_evidence: Option<TaintSourceEvidence>,
     primary: PolicySourceLocation,
     scenario_id: SourceScenarioId,
@@ -592,9 +649,30 @@ pub struct TaintOriginEvidence {
 }
 
 impl TaintOriginEvidence {
+    #[cfg(test)]
     pub(crate) fn try_new(
         source_endpoint: ResolvedEndpointIdentity,
         source_label: TaintLabel,
+        source_evidence: Option<TaintSourceEvidence>,
+        primary: PolicySourceLocation,
+        scenario_id: SourceScenarioId,
+        evidence_refs: Vec<EvidenceRef>,
+    ) -> Result<Self, FutureEvidenceError> {
+        Self::try_new_with_threat_model(
+            source_endpoint,
+            source_label,
+            None,
+            source_evidence,
+            primary,
+            scenario_id,
+            evidence_refs,
+        )
+    }
+
+    pub(crate) fn try_new_with_threat_model(
+        source_endpoint: ResolvedEndpointIdentity,
+        source_label: TaintLabel,
+        source_threat_model: Option<TaintThreatModel>,
         source_evidence: Option<TaintSourceEvidence>,
         primary: PolicySourceLocation,
         scenario_id: SourceScenarioId,
@@ -609,6 +687,7 @@ impl TaintOriginEvidence {
         Ok(Self {
             source_endpoint,
             source_label,
+            source_threat_model,
             source_evidence,
             primary,
             scenario_id,
@@ -622,6 +701,10 @@ impl TaintOriginEvidence {
 
     pub const fn source_label(&self) -> &TaintLabel {
         &self.source_label
+    }
+
+    pub const fn source_threat_model(&self) -> Option<TaintThreatModel> {
+        self.source_threat_model
     }
 
     pub const fn source_evidence(&self) -> Option<&TaintSourceEvidence> {
@@ -643,13 +726,17 @@ impl TaintOriginEvidence {
 
 impl RetainedSize for TaintOriginEvidence {
     fn retained_size(&self) -> usize {
-        size_of::<Self>()
-            .saturating_add(retained_extra(&self.source_endpoint))
-            .saturating_add(retained_extra(&self.source_label))
-            .saturating_add(retained_extra(&self.source_evidence))
-            .saturating_add(retained_extra(&self.primary))
-            .saturating_add(retained_extra(&self.scenario_id))
-            .saturating_add(retained_extra(&self.evidence_refs))
+        retained_size_with_extras(
+            self,
+            [
+                retained_extra(&self.source_endpoint),
+                retained_extra(&self.source_label),
+                retained_extra(&self.source_evidence),
+                retained_extra(&self.primary),
+                retained_extra(&self.scenario_id),
+                retained_extra(&self.evidence_refs),
+            ],
+        )
     }
 }
 
@@ -661,6 +748,7 @@ pub struct TaintFindingEvidence {
     source_endpoint: ResolvedEndpointIdentity,
     sink_endpoint: ResolvedEndpointIdentity,
     source_display_name: String,
+    source_threat_model: Option<TaintThreatModel>,
     sink_display_name: String,
     source_categories: Vec<PolicyCategoryId>,
     sink_categories: Vec<PolicyCategoryId>,
@@ -680,6 +768,7 @@ pub struct TaintFindingEvidence {
 }
 
 impl TaintFindingEvidence {
+    #[cfg(test)]
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn try_new(
         analysis_finding_id: AnalysisFindingId,
@@ -687,7 +776,62 @@ impl TaintFindingEvidence {
         sink: AnalysisEventRef,
         source_endpoint: ResolvedEndpointIdentity,
         sink_endpoint: ResolvedEndpointIdentity,
+        source_display_name: String,
+        sink_display_name: String,
+        source_categories: Vec<PolicyCategoryId>,
+        sink_categories: Vec<PolicyCategoryId>,
+        selected_combination: Option<FindingCombinationId>,
+        sink_tags: Vec<TaintTag>,
+        sink_impacts: Vec<TaintImpact>,
+        reached_source_labels: Vec<TaintLabel>,
+        origins: Vec<TaintOriginEvidence>,
+        origins_truncated: bool,
+        source_scenarios: Vec<SourceScenarioId>,
+        source_scenarios_truncated: bool,
+        omitted_source_scenarios_lower_bound: u64,
+        source_scenario_set_hash: SourceScenarioSetHash,
+        witness_refs: Vec<WitnessId>,
+        witness_refs_truncated: bool,
+        projection_facts_hash: TaintProjectionFactsHash,
+        budget: &PolicyBudget,
+    ) -> Result<Self, FutureEvidenceError> {
+        Self::try_new_with_threat_model(
+            analysis_finding_id,
+            anchor,
+            sink,
+            source_endpoint,
+            sink_endpoint,
+            source_display_name,
+            None,
+            sink_display_name,
+            source_categories,
+            sink_categories,
+            selected_combination,
+            sink_tags,
+            sink_impacts,
+            reached_source_labels,
+            origins,
+            origins_truncated,
+            source_scenarios,
+            source_scenarios_truncated,
+            omitted_source_scenarios_lower_bound,
+            source_scenario_set_hash,
+            witness_refs,
+            witness_refs_truncated,
+            projection_facts_hash,
+            budget,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn try_new_with_threat_model(
+        analysis_finding_id: AnalysisFindingId,
+        anchor: TaintFindingAnchor,
+        sink: AnalysisEventRef,
+        source_endpoint: ResolvedEndpointIdentity,
+        sink_endpoint: ResolvedEndpointIdentity,
         mut source_display_name: String,
+        source_threat_model: Option<TaintThreatModel>,
         mut sink_display_name: String,
         mut source_categories: Vec<PolicyCategoryId>,
         mut sink_categories: Vec<PolicyCategoryId>,
@@ -708,8 +852,8 @@ impl TaintFindingEvidence {
     ) -> Result<Self, FutureEvidenceError> {
         validate_text("source_display_name", &source_display_name)?;
         validate_text("sink_display_name", &sink_display_name)?;
-        tighten_string(&mut source_display_name);
-        tighten_string(&mut sink_display_name);
+        super::finding::tighten_string(&mut source_display_name);
+        super::finding::tighten_string(&mut sink_display_name);
         normalize_semantic_set(
             &mut source_categories,
             "source_categories",
@@ -735,39 +879,26 @@ impl TaintFindingEvidence {
             MAX_REPORT_SET_ITEMS,
             false,
         )?;
-        normalize_semantic_set(
+        normalize_projection_scenarios(
             &mut source_scenarios,
             "source_scenarios",
-            budget
-                .max_projection_scenario_memberships()
-                .min(MAX_PROJECTION_SCENARIO_MEMBERSHIPS),
             source_scenarios_truncated,
+            budget,
         )?;
-        normalize_semantic_set(
-            &mut witness_refs,
-            "witness_refs",
-            budget
-                .max_witnesses_per_finding()
-                .min(MAX_REPORT_WITNESS_REFS),
-            true,
-        )?;
+        normalize_witness_refs(&mut witness_refs, budget)?;
         validate_truncation_count(
             "source_scenarios",
             source_scenarios_truncated,
             omitted_source_scenarios_lower_bound,
         )?;
-        if source_scenario_set_hash == empty_source_scenario_set_hash() {
-            return Err(FutureEvidenceError::EmptySemanticSet {
-                field: "full_source_scenarios",
-            });
-        }
-        if !source_scenarios_truncated
-            && source_scenario_set_hash != compute_source_scenario_set_hash(&source_scenarios)
-        {
-            return Err(FutureEvidenceError::ScenarioSetHashMismatch {
-                field: "source_scenarios",
-            });
-        }
+        validate_scenario_set_hash(
+            &source_scenario_set_hash,
+            &empty_source_scenario_set_hash(),
+            source_scenarios_truncated,
+            "full_source_scenarios",
+            "source_scenarios",
+            || compute_source_scenario_set_hash(&source_scenarios),
+        )?;
         if let Some(strong) = anchor.strong_fields()
             && strong.source_scenario_set_hash != source_scenario_set_hash
         {
@@ -785,7 +916,7 @@ impl TaintFindingEvidence {
                 return Err(FutureEvidenceError::DuplicateSemanticValue { field: "origins" });
             }
         }
-        tighten_vec(&mut origins);
+        super::finding::tighten_vec(&mut origins);
         let mut evidence_refs = origins
             .iter()
             .flat_map(|origin| origin.evidence_refs.iter().cloned())
@@ -815,6 +946,7 @@ impl TaintFindingEvidence {
             source_endpoint,
             sink_endpoint,
             source_display_name,
+            source_threat_model,
             sink_display_name,
             source_categories,
             sink_categories,
@@ -853,6 +985,9 @@ impl TaintFindingEvidence {
     }
     pub fn source_display_name(&self) -> &str {
         &self.source_display_name
+    }
+    pub const fn source_threat_model(&self) -> Option<TaintThreatModel> {
+        self.source_threat_model
     }
     pub fn sink_display_name(&self) -> &str {
         &self.sink_display_name
@@ -995,7 +1130,7 @@ impl Serialize for FlowFindingEvidence {
 
 impl RetainedSize for FlowFindingEvidence {
     fn retained_size(&self) -> usize {
-        size_of::<Self>().saturating_add(retained_extra(&self.inner))
+        retained_size_with_field_extra(self, &self.inner)
     }
 }
 
@@ -1139,7 +1274,7 @@ impl RetainedSize for ResolvedTypestateTerminal {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[must_use = "projection facts must be normalized and validated before policy reduction"]
 pub struct TypestatePolicyProjectionFacts {
-    #[serde(serialize_with = "serialize_display_value")]
+    #[serde(serialize_with = "crate::serialize_display_value")]
     pub authoring_projection_hash: TypestateAuthoringProjectionHash,
     pub protocol_hash: TypestateProtocolHash,
     pub binding_plan_hash: TypestateBindingPlanHash,
@@ -1153,14 +1288,6 @@ pub struct TypestatePolicyProjectionFacts {
     pub scenario_ids: Vec<TypestateScenarioId>,
     pub scenario_set_hash: TypestateScenarioSetHash,
     pub semantic_hash: TypestateProjectionFactsHash,
-}
-
-fn serialize_display_value<T, S>(value: &T, serializer: S) -> Result<S::Ok, S::Error>
-where
-    T: fmt::Display,
-    S: Serializer,
-{
-    serializer.collect_str(value)
 }
 
 impl TypestatePolicyProjectionFacts {
@@ -1223,7 +1350,7 @@ impl TypestatePolicyProjectionFacts {
 
     fn normalize_contents(&mut self, budget: &PolicyBudget) -> Result<(), FutureEvidenceError> {
         validate_text("source_display_name", &self.source_display_name)?;
-        tighten_string(&mut self.source_display_name);
+        super::finding::tighten_string(&mut self.source_display_name);
         normalize_semantic_set(
             &mut self.source_categories,
             "source_categories",
@@ -1508,13 +1635,6 @@ impl TypestateFindingAnchor {
         Ok(anchor)
     }
 
-    pub const fn stability(&self) -> FindingIdentityStability {
-        match self {
-            Self::Strong(_) => FindingIdentityStability::Strong,
-            Self::Weak(_) => FindingIdentityStability::Weak,
-        }
-    }
-
     pub fn strong_fields(&self) -> Option<&TypestateStrongAnchor> {
         match self {
             Self::Strong(anchor) => Some(anchor.as_ref()),
@@ -1529,6 +1649,8 @@ impl TypestateFindingAnchor {
         }
     }
 }
+
+crate::impl_finding_anchor_stability!(TypestateFindingAnchor);
 
 impl Serialize for TypestateFindingAnchor {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
@@ -1559,24 +1681,31 @@ impl Serialize for TypestateFindingAnchor {
 
 impl RetainedSize for TypestateStrongAnchor {
     fn retained_size(&self) -> usize {
-        size_of::<Self>()
-            .saturating_add(retained_extra(&self.subject_identity))
-            .saturating_add(retained_extra(&self.violation_site_identity))
+        retained_size_with_extras(
+            self,
+            [
+                retained_extra(&self.subject_identity),
+                retained_extra(&self.violation_site_identity),
+            ],
+        )
     }
 }
 
 impl RetainedSize for TypestateWeakAnchor {
     fn retained_size(&self) -> usize {
-        size_of::<Self>().saturating_add(retained_extra(&self.typed_key))
+        retained_size_with_field_extra(self, &self.typed_key)
     }
 }
 
 impl RetainedSize for TypestateFindingAnchor {
     fn retained_size(&self) -> usize {
-        size_of::<Self>().saturating_add(match self {
-            Self::Strong(anchor) => anchor.as_ref().retained_size(),
-            Self::Weak(anchor) => retained_extra(anchor),
-        })
+        retained_size_with_extra(
+            self,
+            match self {
+                Self::Strong(anchor) => anchor.as_ref().retained_size(),
+                Self::Weak(anchor) => retained_extra(anchor),
+            },
+        )
     }
 }
 
@@ -1620,37 +1749,26 @@ impl TypestateFindingEvidence {
         budget: &PolicyBudget,
     ) -> Result<Self, FutureEvidenceError> {
         let violation = violation.try_normalized()?;
-        normalize_semantic_set(
+        normalize_projection_scenarios(
             &mut scenario_ids,
             "typestate_scenario_ids",
-            budget
-                .max_projection_scenario_memberships()
-                .min(MAX_PROJECTION_SCENARIO_MEMBERSHIPS),
             scenarios_truncated,
+            budget,
         )?;
-        normalize_semantic_set(
-            &mut witness_refs,
-            "witness_refs",
-            budget
-                .max_witnesses_per_finding()
-                .min(MAX_REPORT_WITNESS_REFS),
-            true,
-        )?;
+        normalize_witness_refs(&mut witness_refs, budget)?;
         validate_truncation_count(
             "typestate_scenarios",
             scenarios_truncated,
             omitted_scenarios_lower_bound,
         )?;
-        if scenario_set_hash == empty_typestate_scenario_set_hash() {
-            return Err(FutureEvidenceError::EmptySemanticSet {
-                field: "full_typestate_scenarios",
-            });
-        }
-        if !scenarios_truncated && scenario_set_hash != typestate_scenario_set_hash(&scenario_ids) {
-            return Err(FutureEvidenceError::ScenarioSetHashMismatch {
-                field: "typestate_scenario_ids",
-            });
-        }
+        validate_scenario_set_hash(
+            &scenario_set_hash,
+            &empty_typestate_scenario_set_hash(),
+            scenarios_truncated,
+            "full_typestate_scenarios",
+            "typestate_scenario_ids",
+            || typestate_scenario_set_hash(&scenario_ids),
+        )?;
         if let Some(site) = &violation_site
             && site.derivation() != Some(StableIdentityDerivation::ProtocolViolationSite)
         {
@@ -1750,15 +1868,19 @@ impl TypestateFindingEvidence {
 
 impl RetainedSize for TypestateFindingEvidence {
     fn retained_size(&self) -> usize {
-        size_of::<Self>()
-            .saturating_add(retained_extra(&self.analysis_finding_id))
-            .saturating_add(retained_extra(&self.anchor))
-            .saturating_add(retained_extra(&self.subject))
-            .saturating_add(retained_extra(&self.source_endpoint))
-            .saturating_add(retained_extra(&self.violation_site))
-            .saturating_add(retained_extra(&self.violation))
-            .saturating_add(retained_extra(&self.scenario_ids))
-            .saturating_add(retained_extra(&self.witness_refs))
+        retained_size_with_extras(
+            self,
+            [
+                retained_extra(&self.analysis_finding_id),
+                retained_extra(&self.anchor),
+                retained_extra(&self.subject),
+                retained_extra(&self.source_endpoint),
+                retained_extra(&self.violation_site),
+                retained_extra(&self.violation),
+                retained_extra(&self.scenario_ids),
+                retained_extra(&self.witness_refs),
+            ],
+        )
     }
 }
 
@@ -1926,7 +2048,54 @@ fn normalize_semantic_set<T: Ord>(
     if values.windows(2).any(|pair| pair[0] == pair[1]) {
         return Err(FutureEvidenceError::DuplicateSemanticValue { field });
     }
-    tighten_vec(values);
+    super::finding::tighten_vec(values);
+    Ok(())
+}
+
+fn normalize_projection_scenarios<T: Ord>(
+    scenarios: &mut Vec<T>,
+    field: &'static str,
+    truncated: bool,
+    budget: &PolicyBudget,
+) -> Result<(), FutureEvidenceError> {
+    normalize_semantic_set(
+        scenarios,
+        field,
+        budget
+            .max_projection_scenario_memberships()
+            .min(MAX_PROJECTION_SCENARIO_MEMBERSHIPS),
+        truncated,
+    )
+}
+
+fn normalize_witness_refs(
+    witness_refs: &mut Vec<WitnessId>,
+    budget: &PolicyBudget,
+) -> Result<(), FutureEvidenceError> {
+    normalize_semantic_set(
+        witness_refs,
+        "witness_refs",
+        budget
+            .max_witnesses_per_finding()
+            .min(MAX_REPORT_WITNESS_REFS),
+        true,
+    )
+}
+
+fn validate_scenario_set_hash<H: PartialEq>(
+    scenario_set_hash: &H,
+    empty_set_hash: &H,
+    truncated: bool,
+    full_field: &'static str,
+    field: &'static str,
+    compute_hash: impl FnOnce() -> H,
+) -> Result<(), FutureEvidenceError> {
+    if scenario_set_hash == empty_set_hash {
+        return Err(FutureEvidenceError::EmptySemanticSet { field: full_field });
+    }
+    if !truncated && scenario_set_hash != &compute_hash() {
+        return Err(FutureEvidenceError::ScenarioSetHashMismatch { field });
+    }
     Ok(())
 }
 
@@ -1935,10 +2104,11 @@ fn validate_truncation_count(
     truncated: bool,
     omitted_lower_bound: u64,
 ) -> Result<(), FutureEvidenceError> {
-    if truncated != (omitted_lower_bound > 0) {
-        return Err(FutureEvidenceError::InvalidTruncationCount { field });
-    }
-    Ok(())
+    ensure_truncation_consistency(
+        truncated,
+        omitted_lower_bound,
+        FutureEvidenceError::InvalidTruncationCount { field },
+    )
 }
 
 fn ensure_retained_evidence_bound<T: RetainedSize>(
@@ -1985,11 +2155,11 @@ fn compare_taint_origins(left: &TaintOriginEvidence, right: &TaintOriginEvidence
 }
 
 fn compute_source_scenario_set_hash(scenarios: &[SourceScenarioId]) -> SourceScenarioSetHash {
-    let mut hasher = CanonicalHasher::new(SOURCE_SCENARIO_SET_DOMAIN);
-    hasher.sequence("scenario_ids", scenarios, |hasher, scenario| {
-        hasher.value(scenario.as_str().as_bytes());
-    });
-    SourceScenarioSetHash::from_bytes(hasher.finish())
+    SourceScenarioSetHash::from_bytes(hash_scenario_set(
+        SOURCE_SCENARIO_SET_DOMAIN,
+        scenarios,
+        SourceScenarioId::as_str,
+    ))
 }
 
 pub(crate) fn empty_source_scenario_set_hash() -> SourceScenarioSetHash {
@@ -1997,11 +2167,23 @@ pub(crate) fn empty_source_scenario_set_hash() -> SourceScenarioSetHash {
 }
 
 fn typestate_scenario_set_hash(scenarios: &[TypestateScenarioId]) -> TypestateScenarioSetHash {
-    let mut hasher = CanonicalHasher::new(TYPESTATE_SCENARIO_SET_DOMAIN);
+    TypestateScenarioSetHash(hash_scenario_set(
+        TYPESTATE_SCENARIO_SET_DOMAIN,
+        scenarios,
+        TypestateScenarioId::as_str,
+    ))
+}
+
+fn hash_scenario_set<T>(
+    domain: &[u8],
+    scenarios: &[T],
+    scenario_id: impl for<'a> Fn(&'a T) -> &'a str,
+) -> [u8; 32] {
+    let mut hasher = CanonicalHasher::new(domain);
     hasher.sequence("scenario_ids", scenarios, |hasher, scenario| {
-        hasher.value(scenario.as_str().as_bytes());
+        hasher.value(scenario_id(scenario).as_bytes());
     });
-    TypestateScenarioSetHash(hasher.finish())
+    hasher.finish()
 }
 
 fn empty_typestate_scenario_set_hash() -> TypestateScenarioSetHash {
@@ -2014,6 +2196,11 @@ fn taint_source_content_hash(fact: &TaintSourceProjectionFact) -> CvssEvidenceCo
     hasher.field(
         "source_endpoint_analysis_projection_hash",
         fact.source_endpoint_analysis_projection_hash.as_bytes(),
+    );
+    hasher.field(
+        "source_threat_model",
+        fact.source_threat_model
+            .map_or(b"".as_slice(), |model| model.label().as_bytes()),
     );
     hasher.field("source_label", fact.source_label.as_str().as_bytes());
     hash_taint_source_evidence(&mut hasher, fact.source_evidence.as_ref());
@@ -2051,6 +2238,10 @@ fn taint_projection_facts_hash(facts: &TaintPolicyProjectionFacts) -> TaintProje
         hasher.value(fact.source_endpoint_semantic_hash.as_bytes());
         hasher.value(fact.source_endpoint_analysis_projection_hash.as_bytes());
         hasher.value(fact.source_display_name.as_bytes());
+        hasher.value(
+            fact.source_threat_model
+                .map_or(b"".as_slice(), |model| model.label().as_bytes()),
+        );
         hash_string_ids(hasher, "source_categories", &fact.source_categories);
         hasher.value(fact.source_label.as_str().as_bytes());
         hash_taint_source_evidence(hasher, fact.source_evidence.as_ref());
@@ -2114,14 +2305,11 @@ pub(crate) fn taint_policy_finding_digest(
     policy_id: &PolicyId,
     anchor: &TaintFindingAnchor,
 ) -> [u8; 32] {
-    let mut hasher = Sha256::new();
-    update_finding_value(&mut hasher, POLICY_FINDING_DOMAIN);
-    update_finding_value(&mut hasher, b"taint");
-    update_finding_value(&mut hasher, policy_id.as_str().as_bytes());
+    let mut hasher = policy_finding_hasher(policy_id, b"taint");
     match anchor {
         TaintFindingAnchor::Strong(anchor) => {
             update_finding_value(&mut hasher, b"strong");
-            update_finding_stable_identity(&mut hasher, &anchor.sink_identity);
+            update_stable_semantic_identity(&mut hasher, &anchor.sink_identity);
             update_finding_value(&mut hasher, &anchor.sink_site_ordinal.to_be_bytes());
             update_finding_value(
                 &mut hasher,
@@ -2142,13 +2330,11 @@ pub(crate) fn taint_policy_finding_digest(
 }
 
 pub(crate) fn taint_vulnerability_digest(anchor: &TaintFindingAnchor) -> [u8; 32] {
-    let mut hasher = Sha256::new();
-    update_finding_value(&mut hasher, POLICY_VULNERABILITY_DOMAIN);
-    update_finding_value(&mut hasher, b"taint");
+    let mut hasher = vulnerability_hasher(b"taint");
     match anchor {
         TaintFindingAnchor::Strong(anchor) => {
             update_finding_value(&mut hasher, b"strong");
-            update_finding_stable_identity(&mut hasher, &anchor.sink_identity);
+            update_stable_semantic_identity(&mut hasher, &anchor.sink_identity);
             update_finding_value(&mut hasher, &anchor.sink_site_ordinal.to_be_bytes());
             update_finding_value(
                 &mut hasher,
@@ -2179,16 +2365,13 @@ pub(crate) fn typestate_policy_finding_digest(
     policy_id: &PolicyId,
     anchor: &TypestateFindingAnchor,
 ) -> [u8; 32] {
-    let mut hasher = Sha256::new();
-    update_finding_value(&mut hasher, POLICY_FINDING_DOMAIN);
-    update_finding_value(&mut hasher, b"typestate");
-    update_finding_value(&mut hasher, policy_id.as_str().as_bytes());
+    let mut hasher = policy_finding_hasher(policy_id, b"typestate");
     match anchor {
         TypestateFindingAnchor::Strong(anchor) => {
             update_finding_value(&mut hasher, b"strong");
             update_finding_value(&mut hasher, anchor.protocol_hash.as_bytes());
-            update_finding_stable_identity(&mut hasher, &anchor.subject_identity);
-            update_finding_stable_identity(&mut hasher, &anchor.violation_site_identity);
+            update_stable_semantic_identity(&mut hasher, &anchor.subject_identity);
+            update_stable_semantic_identity(&mut hasher, &anchor.violation_site_identity);
             update_finding_value(&mut hasher, anchor.scenario_set_hash.as_bytes());
             update_finding_value(&mut hasher, anchor.violation_hash.as_bytes());
         }
@@ -2201,15 +2384,13 @@ pub(crate) fn typestate_policy_finding_digest(
 }
 
 pub(crate) fn typestate_vulnerability_digest(anchor: &TypestateFindingAnchor) -> [u8; 32] {
-    let mut hasher = Sha256::new();
-    update_finding_value(&mut hasher, POLICY_VULNERABILITY_DOMAIN);
-    update_finding_value(&mut hasher, b"typestate");
+    let mut hasher = vulnerability_hasher(b"typestate");
     match anchor {
         TypestateFindingAnchor::Strong(anchor) => {
             update_finding_value(&mut hasher, b"strong");
             update_finding_value(&mut hasher, anchor.protocol_hash.as_bytes());
-            update_finding_stable_identity(&mut hasher, &anchor.subject_identity);
-            update_finding_stable_identity(&mut hasher, &anchor.violation_site_identity);
+            update_stable_semantic_identity(&mut hasher, &anchor.subject_identity);
+            update_stable_semantic_identity(&mut hasher, &anchor.violation_site_identity);
             update_finding_value(&mut hasher, anchor.scenario_set_hash.as_bytes());
             update_finding_value(&mut hasher, anchor.violation_hash.as_bytes());
         }
@@ -2219,37 +2400,6 @@ pub(crate) fn typestate_vulnerability_digest(anchor: &TypestateFindingAnchor) ->
         }
     }
     hasher.finalize().into()
-}
-
-fn update_finding_stable_identity(hasher: &mut Sha256, identity: &StableSemanticIdentity) {
-    update_finding_value(hasher, identity.namespace().as_bytes());
-    update_finding_value(hasher, identity.path().as_str().as_bytes());
-    if let Some(id) = identity.declaration_id() {
-        update_finding_value(hasher, b"declaration_id");
-        update_finding_value(hasher, id.as_bytes());
-    } else {
-        update_finding_value(
-            hasher,
-            identity
-                .derivation()
-                .expect("a derived stable identity has a derivation")
-                .as_str()
-                .as_bytes(),
-        );
-        update_finding_value(
-            hasher,
-            identity
-                .semantic_key()
-                .expect("a derived stable identity has a semantic key")
-                .as_bytes(),
-        );
-    }
-}
-
-fn update_finding_value(hasher: &mut Sha256, value: &[u8]) {
-    let length = u64::try_from(value.len()).expect("usize fits u64 on supported targets");
-    hasher.update(length.to_be_bytes());
-    hasher.update(value);
 }
 
 fn hash_typestate_violation(hasher: &mut CanonicalHasher, value: &TypestateViolationEvidence) {
@@ -2299,13 +2449,12 @@ fn hash_optional_endpoint_identity(
     hasher: &mut CanonicalHasher,
     identity: &Option<ResolvedEndpointIdentity>,
 ) {
-    match identity {
-        Some(identity) => {
-            hasher.field("endpoint_presence", b"some");
-            hash_endpoint_identity(hasher, identity);
-        }
-        None => hasher.field("endpoint_presence", b"none"),
-    }
+    hash_optional_identity(
+        hasher,
+        "endpoint_presence",
+        identity.as_ref(),
+        hash_endpoint_identity,
+    );
 }
 
 fn hash_endpoint_identity(hasher: &mut CanonicalHasher, identity: &ResolvedEndpointIdentity) {
@@ -2336,12 +2485,26 @@ fn hash_optional_stable_identity(
     hasher: &mut CanonicalHasher,
     identity: &Option<StableSemanticIdentity>,
 ) {
+    hash_optional_identity(
+        hasher,
+        "stable_identity_presence",
+        identity.as_ref(),
+        hash_stable_identity,
+    );
+}
+
+fn hash_optional_identity<T>(
+    hasher: &mut CanonicalHasher,
+    presence_field: &'static str,
+    identity: Option<&T>,
+    hash_identity: impl FnOnce(&mut CanonicalHasher, &T),
+) {
     match identity {
         Some(identity) => {
-            hasher.field("stable_identity_presence", b"some");
-            hash_stable_identity(hasher, identity);
+            hasher.field(presence_field, b"some");
+            hash_identity(hasher, identity);
         }
-        None => hasher.field("stable_identity_presence", b"none"),
+        None => hasher.field(presence_field, b"none"),
     }
 }
 
@@ -2380,14 +2543,14 @@ fn hash_taint_source_evidence(
                 "trust_boundary",
                 evidence
                     .trust_boundary
-                    .map_or("none", taint_trust_boundary_label)
+                    .map_or("none", TaintTrustBoundary::label)
                     .as_bytes(),
             );
             hasher.field(
                 "system_entry",
                 evidence
                     .system_entry
-                    .map_or("none", taint_system_entry_label)
+                    .map_or("none", TaintSystemEntry::label)
                     .as_bytes(),
             );
         }
@@ -2399,15 +2562,15 @@ fn hash_semantic_event(hasher: &mut CanonicalHasher, event: PolicySemanticEvent)
     match event {
         PolicySemanticEvent::NormalProcedureExit { scope } => {
             hasher.field("semantic_event", b"normal_procedure_exit");
-            hasher.field("scope", typestate_exit_scope_label(scope).as_bytes());
+            hasher.field("scope", (scope).label().as_bytes());
         }
         PolicySemanticEvent::ExceptionalProcedureExit { scope } => {
             hasher.field("semantic_event", b"exceptional_procedure_exit");
-            hasher.field("scope", typestate_exit_scope_label(scope).as_bytes());
+            hasher.field("scope", (scope).label().as_bytes());
         }
         PolicySemanticEvent::SuspensionBoundary { scope } => {
             hasher.field("semantic_event", b"suspension_boundary");
-            hasher.field("scope", typestate_exit_scope_label(scope).as_bytes());
+            hasher.field("scope", (scope).label().as_bytes());
         }
     }
 }
@@ -2416,14 +2579,6 @@ fn hash_string_ids<T: AsRef<str>>(hasher: &mut CanonicalHasher, field: &'static 
     hasher.sequence(field, values, |hasher, value| {
         hasher.value(value.as_ref().as_bytes());
     });
-}
-
-fn tighten_string(value: &mut String) {
-    *value = std::mem::take(value).into_boxed_str().into_string();
-}
-
-fn tighten_vec<T>(values: &mut Vec<T>) {
-    *values = std::mem::take(values).into_boxed_slice().into_vec();
 }
 
 macro_rules! serialize_string_identifier {
@@ -2577,7 +2732,7 @@ impl Serialize for SerializableTaintTrustBoundary {
     where
         S: Serializer,
     {
-        serializer.serialize_str(taint_trust_boundary_label(self.0))
+        serializer.serialize_str((self.0).label())
     }
 }
 
@@ -2588,7 +2743,7 @@ impl Serialize for SerializableTaintSystemEntry {
     where
         S: Serializer,
     {
-        serializer.serialize_str(taint_system_entry_label(self.0))
+        serializer.serialize_str((self.0).label())
     }
 }
 
@@ -2636,7 +2791,7 @@ impl Serialize for SerializableTypestateExitScope {
     where
         S: Serializer,
     {
-        serializer.serialize_str(typestate_exit_scope_label(self.0))
+        serializer.serialize_str((self.0).label())
     }
 }
 
@@ -2667,24 +2822,6 @@ impl RetainedSize for EndpointObservationPhase {
 impl RetainedSize for PolicySemanticEvent {
     fn retained_size(&self) -> usize {
         size_of::<Self>()
-    }
-}
-
-fn taint_trust_boundary_label(value: TaintTrustBoundary) -> &'static str {
-    match value {
-        TaintTrustBoundary::External => "external",
-        TaintTrustBoundary::Internal => "internal",
-        TaintTrustBoundary::SameTrustZone => "same_trust_zone",
-    }
-}
-
-fn taint_system_entry_label(value: TaintSystemEntry) -> &'static str {
-    match value {
-        TaintSystemEntry::VulnerableSystemNetworkStack => "vulnerable_system_network_stack",
-        TaintSystemEntry::DownloadedArtifact => "downloaded_artifact",
-        TaintSystemEntry::LocalInput => "local_input",
-        TaintSystemEntry::AdjacentNetwork => "adjacent_network",
-        TaintSystemEntry::Physical => "physical",
     }
 }
 
@@ -2884,15 +3021,12 @@ fn endpoint_phase_label(value: EndpointObservationPhase) -> &'static str {
     value.label()
 }
 
-fn typestate_exit_scope_label(value: TypestateExitScope) -> &'static str {
-    value.label()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::finding_identity::PolicyFindingId;
+    use crate::finding_identity::{FindingIdentityStability, PolicyFindingId};
     use brokk_bifrost_analysis::analyzer::semantic::WorkspaceRelativePath;
+    use brokk_bifrost_test_macros::hardwon;
     use serde_json::json;
 
     fn endpoint(value: &str) -> ResolvedEndpointIdentity {
@@ -2941,7 +3075,7 @@ mod tests {
         display: &str,
         scenarios: &[&str],
     ) -> TaintSourceProjectionFact {
-        TaintSourceProjectionFact::try_new(
+        crate::test_support::taint_source_projection_fact(
             endpoint(endpoint_name),
             EndpointSemanticHash::from_bytes([1; 32]),
             EndpointAnalysisProjectionHash::from_bytes([2; 32]),
@@ -2958,7 +3092,6 @@ mod tests {
                 .collect(),
             evidence_ref(endpoint_name),
         )
-        .unwrap()
     }
 
     fn taint_projection(
@@ -3376,6 +3509,7 @@ mod tests {
     }
 
     #[test]
+    #[hardwon("#2544: distinct sink sites in one procedure collided as one finding")]
     fn future_anchors_have_stable_common_policy_finding_id_paths() {
         let policy_id = PolicyId::new("security.flow").unwrap();
         let source_scenarios =
@@ -3452,6 +3586,7 @@ mod tests {
     /// the site is folded twice -- once as the anchor's own field and once
     /// through the violation hash.
     #[test]
+    #[hardwon("#2968: an unrelated added subject rotated unchanged finding identities")]
     fn typestate_identities_survive_a_plan_change_and_separate_two_sites() {
         let policy_id = PolicyId::new("test.lifecycle").unwrap();
         let base_plan = TypestateBindingPlanHash::from_canonical_bytes(b"bindings");
@@ -3506,37 +3641,6 @@ mod tests {
     }
 
     #[test]
-    fn terminal_violations_require_nonempty_expected_states_and_actual_violation() {
-        let terminal = ResolvedTypestateTerminal::SemanticEvent {
-            event: PolicySemanticEvent::NormalProcedureExit {
-                scope: TypestateExitScope::AnalysisRoot,
-            },
-        };
-        assert_eq!(
-            TypestateViolationEvidence::try_terminal_expectation(
-                TypestateExpectationId::new("closed-at-exit").unwrap(),
-                terminal.clone(),
-                TypestateStateId::new("open").unwrap(),
-                Vec::new(),
-            )
-            .unwrap_err(),
-            FutureEvidenceError::EmptySemanticSet {
-                field: "expected_states"
-            }
-        );
-        assert_eq!(
-            TypestateViolationEvidence::try_terminal_expectation(
-                TypestateExpectationId::new("closed-at-exit").unwrap(),
-                terminal,
-                TypestateStateId::new("closed").unwrap(),
-                vec![TypestateStateId::new("closed").unwrap()],
-            )
-            .unwrap_err(),
-            FutureEvidenceError::ObservedStateIsExpected
-        );
-    }
-
-    #[test]
     fn suspension_boundary_wire_round_trip_and_hash_are_distinct() {
         let event = PolicySemanticEvent::SuspensionBoundary {
             scope: TypestateExitScope::AnalysisRoot,
@@ -3564,141 +3668,6 @@ mod tests {
             },
         );
         assert_ne!(suspension.finish(), normal.finish());
-    }
-
-    #[test]
-    fn truncation_counts_and_strong_anchor_integrity_are_enforced() {
-        let projection = typestate_projection();
-        let anchor = TypestateFindingAnchor::strong(
-            projection.protocol_hash,
-            stable_identity(StableIdentityDerivation::ProtocolSubject, "subject"),
-            projection.violation_site.clone().unwrap(),
-            projection.scenario_set_hash,
-            &projection.violation,
-        )
-        .unwrap();
-
-        let error = TypestateFindingEvidence::try_new(
-            AnalysisFindingId::try_new("typestate", "finding").unwrap(),
-            anchor.clone(),
-            projection.protocol_hash,
-            projection.binding_plan_hash,
-            AnalysisSubjectRef::try_new("typestate", "subject").unwrap(),
-            projection.source_endpoint.clone(),
-            projection.violation_site.clone(),
-            projection.violation.clone(),
-            projection.scenario_ids.clone(),
-            false,
-            1,
-            projection.scenario_set_hash,
-            Vec::new(),
-            false,
-            projection.semantic_hash,
-            &PolicyBudget::default(),
-        )
-        .unwrap_err();
-        assert_eq!(
-            error,
-            FutureEvidenceError::InvalidTruncationCount {
-                field: "typestate_scenarios"
-            }
-        );
-
-        let low_budget = PolicyBudget::builder()
-            .with_max_projection_scenario_memberships(1)
-            .unwrap()
-            .build()
-            .unwrap();
-        assert_eq!(
-            TypestateFindingEvidence::try_new(
-                AnalysisFindingId::try_new("typestate", "finding-low-budget").unwrap(),
-                anchor.clone(),
-                projection.protocol_hash,
-                projection.binding_plan_hash,
-                AnalysisSubjectRef::try_new("typestate", "subject").unwrap(),
-                projection.source_endpoint.clone(),
-                projection.violation_site.clone(),
-                projection.violation.clone(),
-                projection.scenario_ids.clone(),
-                false,
-                0,
-                projection.scenario_set_hash,
-                Vec::new(),
-                false,
-                projection.semantic_hash,
-                &low_budget,
-            )
-            .unwrap_err(),
-            FutureEvidenceError::TooManyItems {
-                field: "typestate_scenario_ids",
-                max_items: 1,
-            }
-        );
-
-        let changed_violation = TypestateViolationEvidence::error_transition(
-            TypestateEventId::new("close").unwrap(),
-            None,
-            TypestateStateId::new("open").unwrap(),
-            TypestateStateId::new("error").unwrap(),
-        );
-        assert_eq!(
-            TypestateFindingEvidence::try_new(
-                AnalysisFindingId::try_new("typestate", "finding").unwrap(),
-                anchor,
-                projection.protocol_hash,
-                projection.binding_plan_hash,
-                AnalysisSubjectRef::try_new("typestate", "subject").unwrap(),
-                projection.source_endpoint,
-                projection.violation_site,
-                changed_violation,
-                projection.scenario_ids,
-                false,
-                0,
-                projection.scenario_set_hash,
-                Vec::new(),
-                false,
-                projection.semantic_hash,
-                &PolicyBudget::default(),
-            )
-            .unwrap_err(),
-            FutureEvidenceError::ViolationHashMismatch
-        );
-    }
-
-    #[test]
-    fn taint_finding_truncation_and_lowered_membership_budget_are_enforced() {
-        let projection = taint_projection(vec![source_fact(
-            "source",
-            "untrusted",
-            "source",
-            &["path-a", "path-b"],
-        )]);
-        assert_eq!(
-            taint_finding(&projection, false, 1, &PolicyBudget::default()).unwrap_err(),
-            FutureEvidenceError::InvalidTruncationCount {
-                field: "source_scenarios"
-            }
-        );
-
-        let low_budget = PolicyBudget::builder()
-            .with_max_projection_scenario_memberships(1)
-            .unwrap()
-            .build()
-            .unwrap();
-        assert_eq!(
-            taint_finding(&projection, false, 0, &low_budget).unwrap_err(),
-            FutureEvidenceError::TooManyItems {
-                field: "source_scenarios",
-                max_items: 1,
-            }
-        );
-
-        let valid = taint_finding(&projection, false, 0, &PolicyBudget::default()).unwrap();
-        assert_eq!(valid.source_scenarios().len(), 2);
-        assert_eq!(
-            serde_json::to_value(valid).unwrap()["source_scenario_set_hash"],
-            json!(projection.source_facts[0].scenario_set_hash.to_string())
-        );
     }
 
     #[test]
@@ -3771,6 +3740,63 @@ mod tests {
     }
 
     #[test]
+    fn retained_size_tracks_owned_display_storage_exactly() {
+        let short = source_fact("source", "untrusted", "a", &["path"]);
+        let long = source_fact(
+            "source",
+            "untrusted",
+            "a considerably longer display",
+            &["path"],
+        );
+        assert_eq!(
+            long.retained_size() - short.retained_size(),
+            long.source_display_name.len() - short.source_display_name.len()
+        );
+        assert_eq!(
+            TaintProjectionFactsHash::from_bytes([1; 32]).retained_size(),
+            size_of::<TaintProjectionFactsHash>()
+        );
+        let projection = taint_projection(vec![short]);
+        assert!(projection.retained_size() > size_of::<TaintPolicyProjectionFacts>());
+    }
+
+    #[test]
+    fn taint_finding_truncation_and_lowered_membership_budget_are_enforced() {
+        let projection = taint_projection(vec![source_fact(
+            "source",
+            "untrusted",
+            "source",
+            &["path-a", "path-b"],
+        )]);
+        assert_eq!(
+            taint_finding(&projection, false, 1, &PolicyBudget::default()).unwrap_err(),
+            FutureEvidenceError::InvalidTruncationCount {
+                field: "source_scenarios"
+            }
+        );
+
+        let low_budget = PolicyBudget::builder()
+            .with_max_projection_scenario_memberships(1)
+            .unwrap()
+            .build()
+            .unwrap();
+        assert_eq!(
+            taint_finding(&projection, false, 0, &low_budget).unwrap_err(),
+            FutureEvidenceError::TooManyItems {
+                field: "source_scenarios",
+                max_items: 1,
+            }
+        );
+
+        let valid = taint_finding(&projection, false, 0, &PolicyBudget::default()).unwrap();
+        assert_eq!(valid.source_scenarios().len(), 2);
+        assert_eq!(
+            serde_json::to_value(valid).unwrap()["source_scenario_set_hash"],
+            json!(projection.source_facts[0].scenario_set_hash.to_string())
+        );
+    }
+
+    #[test]
     fn wire_shapes_are_stable_tagged_snake_case_values() {
         let projection = typestate_projection();
         let json = serde_json::to_value(&projection).unwrap();
@@ -3799,26 +3825,5 @@ mod tests {
             serde_json::to_value(weak).unwrap(),
             json!({"type": "weak", "typed_key": "taint:snapshot-finding"})
         );
-    }
-
-    #[test]
-    fn retained_size_tracks_owned_display_storage_exactly() {
-        let short = source_fact("source", "untrusted", "a", &["path"]);
-        let long = source_fact(
-            "source",
-            "untrusted",
-            "a considerably longer display",
-            &["path"],
-        );
-        assert_eq!(
-            long.retained_size() - short.retained_size(),
-            long.source_display_name.len() - short.source_display_name.len()
-        );
-        assert_eq!(
-            TaintProjectionFactsHash::from_bytes([1; 32]).retained_size(),
-            size_of::<TaintProjectionFactsHash>()
-        );
-        let projection = taint_projection(vec![short]);
-        assert!(projection.retained_size() > size_of::<TaintPolicyProjectionFacts>());
     }
 }

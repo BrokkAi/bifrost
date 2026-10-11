@@ -1,7 +1,9 @@
+use super::{equivalent_java_type_identity, restrict_visibility as restrict_semantic_visibility};
+use crate::analyzer::dependency_support::resolve_dependency_path as resolve_path;
 use crate::analyzer::jvm::dependency_discovery::{discover_build_tools, discover_metadata};
 use crate::analyzer::jvm::java_artifact::{
     JavaClassSurfaceOutcome, JavaJarPackProducer, ZipDirectoryStatus, class_surface,
-    zip_directory_status,
+    source_type_kind, zip_directory_status,
 };
 use crate::analyzer::jvm::jdk_artifact::{
     JdkSourceArchivePackProducer, detect_jdk_source_archive_layout,
@@ -9,6 +11,7 @@ use crate::analyzer::jvm::jdk_artifact::{
 use crate::analyzer::jvm::jmod_artifact::JdkJmodSetPackProducer;
 use crate::analyzer::jvm::kotlin_artifact::KotlinSourceJarPackProducer;
 use crate::analyzer::jvm::scala_artifact::ScalaSourceJarPackProducer;
+use crate::analyzer::semantic::ids::push_optional_bytes;
 use crate::analyzer::semantic::{LengthDelimitedDigest, StableDigest};
 use crate::analyzer::semantic_model::{
     ActivationSelector, ArtifactProducerLimits, ArtifactProduction, ArtifactProductionRequest,
@@ -31,7 +34,7 @@ use crate::analyzer::{
 use crate::hash::HashMap;
 use brokk_bifrost_jvm::java::declarations::{
     class_like_body_children_rev, determine_package_name, is_class_like_declaration_kind,
-    node_text, parse_tree,
+    java_modifier_keywords, node_text, parse_tree,
 };
 use jclassfile::attributes::Attribute;
 use jclassfile::constant_pool::ConstantPool;
@@ -43,12 +46,15 @@ use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::SystemTime;
+
+fn is_public_external_type(external_type: &JvmExternalType) -> bool {
+    external_type.visibility == JvmVisibility::Public
+}
 use tree_sitter::Parser;
 use zip::ZipArchive;
 
 use crate::CancellationToken;
 use crate::analyzer::topology::DependencyScope;
-use crate::analyzer::tree_walk::named_children_iter;
 
 const MAX_ARCHIVE_ENTRIES: usize = 10_000;
 const MAX_INDEX_ARTIFACTS: usize = 128;
@@ -103,6 +109,25 @@ pub(crate) struct JvmExternalDeclarationIndex {
     /// Stable, path-independent identity of the effective declaration surface
     /// this index exposes to type, member, and hierarchy resolution.
     dispatch_behavior_identity: OnceLock<StableDigest>,
+}
+
+pub(crate) fn get_or_build_external_declaration_index<'a>(
+    index: &'a OnceLock<Arc<JvmExternalDeclarationIndex>>,
+    config: &JvmAnalyzerConfig,
+    project: &dyn Project,
+) -> &'a JvmExternalDeclarationIndex {
+    index
+        .get_or_init(|| JvmExternalDeclarationIndex::build_for_project(config, project))
+        .as_ref()
+}
+
+/// Whether the retained external index resolves a name from `access_package`.
+pub(crate) fn jvm_external_qualified_name_exists(
+    index: &JvmExternalDeclarationIndex,
+    fqn: &str,
+    access_package: &str,
+) -> bool {
+    index.resolve_qualified_name(fqn, access_package).is_some()
 }
 
 /// The member surface one indexed artifact type carries (#1900).
@@ -341,6 +366,11 @@ enum JvmDependencyOrigin {
 pub struct JvmDependencyPackAdapter;
 
 impl JvmDependencyPackAdapter {
+    /// Build the exact JDK dependency when no local source archive is available.
+    pub fn jdk_dependency(version: JdkVersion) -> ResolvedDependency {
+        resolved_jdk_dependency(version, None)
+    }
+
     /// Build the exact JDK source dependency used by the runtime resolver.
     /// Release tooling uses this constructor so its production key includes
     /// the same evidence and provenance as a locally discovered JDK.
@@ -520,20 +550,7 @@ pub fn resolve_jvm_semantic_pack_dependencies(
 }
 
 fn cancelled_discovery(message: &str) -> DependencyDiscoveryOutcome {
-    DependencyDiscoveryOutcome {
-        dependencies: Vec::new(),
-        diagnostics: vec![DependencyPackDiagnostic {
-            severity: DependencyPackDiagnosticSeverity::Error,
-            code: "discovery.cancelled".to_owned(),
-            dependency_id: None,
-            location: None,
-            message: message.to_owned(),
-        }],
-        suppressed_diagnostics: SuppressedDiagnostics::default(),
-        complete: false,
-        cancelled: true,
-        profile: DependencyDiscoveryProfile::default(),
-    }
+    DependencyDiscoveryOutcome::cancelled_with_message(message)
 }
 
 fn jvm_coordinate_id(coordinate: &JvmMavenCoordinate) -> String {
@@ -1047,15 +1064,8 @@ impl DependencyPackAdapter for JvmDependencyPackAdapter {
         "bifrost-jvm-dependency"
     }
 
-    fn adapter_version(&self) -> &str {
-        env!("CARGO_PKG_VERSION")
-    }
-
     fn producer(&self) -> Producer {
-        Producer {
-            name: "bifrost-jvm-dependency".to_owned(),
-            version: env!("CARGO_PKG_VERSION").to_owned(),
-        }
+        Producer::for_name("bifrost-jvm-dependency")
     }
 
     fn can_produce(&self, dependency: &ResolvedDependency) -> bool {
@@ -1412,49 +1422,9 @@ fn jvm_dependency_production_request(dependency: &ResolvedDependency) -> Artifac
                 .into_iter()
                 .collect(),
         },
-        activation: vec![ActivationSelector {
-            package: dependency
-                .evidence
-                .package
-                .as_ref()
-                .map(|coordinate| NameSelector {
-                    name: coordinate.name.clone(),
-                    version: coordinate
-                        .version
-                        .as_ref()
-                        .map(|version| format!("={version}")),
-                }),
-            module: dependency
-                .evidence
-                .module
-                .as_ref()
-                .map(|coordinate| NameSelector {
-                    name: coordinate.name.clone(),
-                    version: coordinate
-                        .version
-                        .as_ref()
-                        .map(|version| format!("={version}")),
-                }),
-            toolchain: dependency
-                .evidence
-                .toolchain
-                .as_ref()
-                .map(|coordinate| NameSelector {
-                    name: coordinate.name.clone(),
-                    version: coordinate
-                        .version
-                        .as_ref()
-                        .map(|version| format!("={version}")),
-                }),
-            targets: dependency.evidence.target.clone().into_iter().collect(),
-            configurations: dependency
-                .evidence
-                .configuration
-                .clone()
-                .into_iter()
-                .collect(),
-            artifact_sha256: None,
-        }],
+        activation: vec![
+            crate::analyzer::semantic_model::activation_selector_for_evidence(&dependency.evidence),
+        ],
         provenance: Provenance {
             source: "exact local JVM dependency".to_owned(),
             revision: None,
@@ -1518,6 +1488,7 @@ fn merge_java_dependency_packs(
             collection_flows,
             deferred_yields,
             conditional_type_refinements,
+            callable_values,
         } = shard;
         let (secondary_types, secondary_members, secondary_relations) = match payload {
             AuthoredPayload::DeclarationFacts {
@@ -1536,11 +1507,16 @@ fn merge_java_dependency_packs(
                         collection_flows,
                         deferred_yields,
                         conditional_type_refinements,
+                        callable_values,
                     });
                 }
                 continue;
             }
         };
+        assert!(
+            callable_values.is_none(),
+            "JVM extraction cannot produce callable values"
+        );
         assert!(
             runtime_contracts.is_none(),
             "JVM declaration extraction cannot produce portable runtime contracts"
@@ -1564,6 +1540,7 @@ fn merge_java_dependency_packs(
                     collection_flows: None,
                     deferred_yields: None,
                     conditional_type_refinements: None,
+                    callable_values: None,
                 });
                 index
             });
@@ -1643,13 +1620,15 @@ fn merge_java_dependency_packs(
 }
 
 fn equivalent_java_type_fact(left: &TypeFact, right: &TypeFact) -> bool {
-    left.id == right.id
-        && left.name == right.name
-        && left.type_kind == right.type_kind
-        && left.visibility == right.visibility
-        && left.is_abstract == right.is_abstract
-        && left.is_sealed == right.is_sealed
-        && left.type_parameters == right.type_parameters
+    equivalent_java_type_identity(left, right)
+        && !left
+            .hierarchy
+            .iter()
+            .any(|edge| edge.target.contains_unknown())
+        && !right
+            .hierarchy
+            .iter()
+            .any(|edge| edge.target.contains_unknown())
         && left.hierarchy == right.hierarchy
         && left.aliases == right.aliases
         && left.extension_surfaces == right.extension_surfaces
@@ -1673,6 +1652,9 @@ fn equivalent_java_signature(left: Option<&Signature>, right: Option<&Signature>
     match (left, right) {
         (None, None) => true,
         (Some(left), Some(right)) => {
+            if left.contains_unknown_types() || right.contains_unknown_types() {
+                return false;
+            }
             left.type_parameters.len() == right.type_parameters.len()
                 && left.returns == right.returns
                 && left.parameters.len() == right.parameters.len()
@@ -1753,22 +1735,21 @@ fn external_index_memo_key(
             ProducerDiagnosticSeverity::Error => b"error",
         });
         digest.push(diagnostic.code.as_bytes());
-        push_optional_evidence(&mut digest, diagnostic.source_entry.as_deref());
-        push_optional_evidence(&mut digest, diagnostic.location.as_deref());
-        push_optional_evidence(&mut digest, diagnostic.declaration.as_deref());
+        push_optional_bytes(
+            &mut digest,
+            diagnostic.source_entry.as_deref().map(str::as_bytes),
+        );
+        push_optional_bytes(
+            &mut digest,
+            diagnostic.location.as_deref().map(str::as_bytes),
+        );
+        push_optional_bytes(
+            &mut digest,
+            diagnostic.declaration.as_deref().map(str::as_bytes),
+        );
         digest.push(diagnostic.message.as_bytes());
     }
     digest.finish()
-}
-
-fn push_optional_evidence(digest: &mut LengthDelimitedDigest, value: Option<&str>) {
-    match value {
-        Some(value) => {
-            digest.push(b"some");
-            digest.push(value.as_bytes());
-        }
-        None => digest.push(b"none"),
-    }
 }
 
 /// Push one artifact file's identity: its path and, when the file is
@@ -2084,8 +2065,7 @@ impl JvmExternalDeclarationIndex {
         import_path: &str,
         access_package: &str,
     ) -> Option<&JvmExternalType> {
-        self.get(import_path)
-            .filter(|ty| ty.is_accessible_from_package(access_package))
+        self.resolve_qualified_name(import_path, access_package)
     }
 
     pub(crate) fn resolve_wildcard_import(
@@ -2094,8 +2074,7 @@ impl JvmExternalDeclarationIndex {
         short_name: &str,
         access_package: &str,
     ) -> Option<&JvmExternalType> {
-        self.get(&qualified_name(package_name, short_name))
-            .filter(|ty| ty.is_accessible_from_package(access_package))
+        self.resolve_qualified_name(&qualified_name(package_name, short_name), access_package)
     }
 
     pub(crate) fn resolve_same_package(
@@ -2103,13 +2082,12 @@ impl JvmExternalDeclarationIndex {
         package_name: &str,
         short_name: &str,
     ) -> Option<&JvmExternalType> {
-        self.get(&qualified_name(package_name, short_name))
-            .filter(|ty| ty.is_accessible_from_package(package_name))
+        self.resolve_qualified_name(&qualified_name(package_name, short_name), package_name)
     }
 
     pub(crate) fn resolve_java_lang(&self, short_name: &str) -> Option<&JvmExternalType> {
         self.get(&qualified_name("java.lang", short_name))
-            .filter(|ty| ty.visibility == JvmVisibility::Public)
+            .filter(|external_type| is_public_external_type(external_type))
     }
 
     pub(crate) fn resolve_qualified_name(
@@ -2494,37 +2472,11 @@ impl JvmExternalDeclarationIndex {
         artifact_kind: ExternalArtifactKind,
     ) -> JavaArtifactFacts {
         let production = JavaJarPackProducer.produce_exact_artifact(
-            &ArtifactProductionRequest {
-                path: artifact_path.to_path_buf(),
+            &local_jvm_artifact_production_request(
+                artifact_path,
                 artifact_kind,
-                pack_id: "bifrost.external.java".to_owned(),
-                pack_version: env!("CARGO_PKG_VERSION").to_owned(),
-                ecosystem: "maven".to_owned(),
-                compatibility: Compatibility {
-                    bifrost: None,
-                    toolchains: Vec::new(),
-                },
-                activation: vec![ActivationSelector {
-                    package: None,
-                    module: None,
-                    toolchain: Some(NameSelector {
-                        name: "jvm".to_owned(),
-                        version: None,
-                    }),
-                    targets: Vec::new(),
-                    configurations: Vec::new(),
-                    artifact_sha256: None,
-                }],
-                provenance: Provenance {
-                    source: "local dependency artifact".to_owned(),
-                    revision: None,
-                },
-                license: "NOASSERTION".to_owned(),
-                safety: Safety {
-                    generated_code_only: false,
-                    review_required: false,
-                },
-            },
+                "bifrost.external.java",
+            ),
             &ArtifactProducerLimits::default(),
         );
         self.production_diagnostics
@@ -2552,37 +2504,11 @@ impl JvmExternalDeclarationIndex {
 
     fn produce_scala_type_facts(&mut self, artifact_path: &Path) -> HashMap<String, TypeFact> {
         let production = ScalaSourceJarPackProducer.produce_exact_artifact(
-            &ArtifactProductionRequest {
-                path: artifact_path.to_path_buf(),
-                artifact_kind: ExternalArtifactKind::ScalaSourceJar,
-                pack_id: "bifrost.external.scala".to_owned(),
-                pack_version: env!("CARGO_PKG_VERSION").to_owned(),
-                ecosystem: "maven".to_owned(),
-                compatibility: Compatibility {
-                    bifrost: None,
-                    toolchains: Vec::new(),
-                },
-                activation: vec![ActivationSelector {
-                    package: None,
-                    module: None,
-                    toolchain: Some(NameSelector {
-                        name: "jvm".to_owned(),
-                        version: None,
-                    }),
-                    targets: Vec::new(),
-                    configurations: Vec::new(),
-                    artifact_sha256: None,
-                }],
-                provenance: Provenance {
-                    source: "local dependency artifact".to_owned(),
-                    revision: None,
-                },
-                license: "NOASSERTION".to_owned(),
-                safety: Safety {
-                    generated_code_only: false,
-                    review_required: false,
-                },
-            },
+            &local_jvm_artifact_production_request(
+                artifact_path,
+                ExternalArtifactKind::ScalaSourceJar,
+                "bifrost.external.scala",
+            ),
             &ArtifactProducerLimits::default(),
         );
         self.production_diagnostics
@@ -2629,9 +2555,8 @@ impl JvmExternalDeclarationIndex {
 ///    the same `src.zip` through both would double-produce and diverge from
 ///    that pack's own completeness/gap accounting (#2401).
 ///
-/// Confirmed twice independently: #2538's investigation (see that issue's
-/// ExecPlan, `.agents/plans/issue-2538-external-constants.md`, "Surprises &
-/// Discoveries") found this exclusion by tracing why `java.util.Locale`/
+/// Confirmed twice independently: #2538's investigation found this exclusion
+/// by tracing why `java.util.Locale`/
 /// `javax.crypto.Cipher` never resolved through this index, and #2401's own
 /// session (this repository, 2026-08-21) re-confirmed it while evaluating
 /// whether to lift it. Do not lift this exclusion; if a JDK dependency ever
@@ -2833,7 +2758,7 @@ impl<'a> JvmExternalDeclarations<'a> {
 
     pub(crate) fn resolve_java_lang(&self, short_name: &str) -> Option<JvmExternalType> {
         self.get(&qualified_name("java.lang", short_name))
-            .filter(|external_type| external_type.visibility == JvmVisibility::Public)
+            .filter(is_public_external_type)
     }
 
     pub(crate) fn resolve_qualified_name(
@@ -2922,15 +2847,9 @@ impl<'a> JvmExternalDeclarations<'a> {
     /// read one activated set the same way.
     fn pack_declaration(&self, fqn: &str) -> Option<JvmExternalType> {
         let overlay = self.packs.as_ref()?;
-        let mut declarations = overlay
-            .symbols_named(fqn)
-            .records
+        let mut declarations = qualified_model_symbols(overlay, fqn)
             .into_iter()
-            .filter(|symbol| {
-                self.admits_pack_symbol(symbol)
-                    && (symbol.qualified_name == fqn
-                        || symbol.aliases.iter().any(|alias| alias == fqn))
-            })
+            .filter(|symbol| self.admits_pack_symbol(symbol))
             .filter_map(pack_external_type);
         let declared = declarations.next()?;
         // Two activated packs claiming one qualified name is ambiguity, not a
@@ -2997,7 +2916,7 @@ impl<'a> JvmExternalDeclarations<'a> {
                 let mut call_shapes = Vec::new();
                 let mut call_shapes_incomplete = false;
                 for symbol in &matched {
-                    if !pack_symbol_is_callable(symbol.kind) {
+                    if !crate::analyzer::semantic_model::symbol_kind_is_callable(symbol.kind) {
                         continue;
                     }
                     let Some(signature) = symbol.structured_signature.as_ref() else {
@@ -3018,6 +2937,11 @@ impl<'a> JvmExternalDeclarations<'a> {
                     call_shapes.push(JvmExternalCallShape {
                         non_overridable: symbol.non_overridable,
                         parameter_count,
+                        parameters: signature
+                            .parameters
+                            .iter()
+                            .map(|parameter| parameter.r#type.clone())
+                            .collect(),
                         is_static: symbol.is_static,
                         variadic: signature
                             .parameters
@@ -3071,9 +2995,28 @@ impl<'a> JvmExternalDeclarations<'a> {
     }
 }
 
-fn pack_symbol_is_callable(kind: crate::analyzer::semantic_model::SemanticModelSymbolKind) -> bool {
-    use crate::analyzer::semantic_model::SemanticModelSymbolKind as Kind;
-    matches!(kind, Kind::Constructor | Kind::Method | Kind::Function)
+/// Whether the reviewed packs in `overlay` declare the external type `fqn`.
+pub(crate) fn model_declares_external_type(
+    overlay: &crate::analyzer::semantic_model::SemanticModelOverlay,
+    fqn: &str,
+) -> bool {
+    qualified_model_symbols(overlay, fqn)
+        .iter()
+        .any(|symbol| pack_type_kind(symbol.kind).is_some())
+}
+
+pub(crate) fn qualified_model_symbols<'a>(
+    overlay: &'a crate::analyzer::semantic_model::SemanticModelOverlay,
+    fqn: &str,
+) -> Vec<&'a crate::analyzer::semantic_model::SemanticModelSymbol> {
+    overlay
+        .symbols_named(fqn)
+        .records
+        .into_iter()
+        .filter(|symbol| {
+            symbol.qualified_name == fqn || symbol.aliases.iter().any(|alias| alias == fqn)
+        })
+        .collect()
 }
 
 /// One member an external declaration surface declares on an external type
@@ -3147,6 +3090,7 @@ pub(crate) struct JvmExternalMember {
 struct JvmExternalCallShape {
     non_overridable: Option<crate::analyzer::semantic_model::NonOverridableEvidence>,
     parameter_count: u32,
+    parameters: Vec<TypeRef>,
     is_static: bool,
     variadic: bool,
     /// The type this overload's own declaration writes as its return type.
@@ -3237,6 +3181,31 @@ impl JvmExternalMember {
             .map(|shape| shape.parameter_count)
     }
 
+    /// Select one external overload from structured Java argument types.
+    ///
+    /// Arity alone is not Java applicability: a unique `m(String)` does not
+    /// accept `m(1)`. Unknown conversions keep the external call unproved.
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn applicable_parameter_count_for_argument_types(
+        &self,
+        instance_receiver: bool,
+        actuals: &[TypeRef],
+    ) -> Option<u32> {
+        self.applicable_shape_for_argument_types(instance_receiver, actuals)
+            .map(|shape| shape.parameter_count)
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn non_overridable_for_argument_types(
+        &self,
+        instance_receiver: bool,
+        actuals: &[TypeRef],
+    ) -> Option<&crate::analyzer::semantic_model::NonOverridableEvidence> {
+        self.applicable_shape_for_argument_types(instance_receiver, actuals)?
+            .non_overridable
+            .as_ref()
+    }
+
     /// The declared return type of the same one overload
     /// [`Self::applicable_parameter_count`] selects (#3522).
     ///
@@ -3302,6 +3271,271 @@ impl JvmExternalMember {
         }
         matched
     }
+
+    #[cfg(any(test, feature = "test-support"))]
+    fn applicable_shape_for_argument_types(
+        &self,
+        instance_receiver: bool,
+        actuals: &[TypeRef],
+    ) -> Option<&JvmExternalCallShape> {
+        if self.call_shapes_incomplete {
+            return None;
+        }
+        let wants_static = !instance_receiver;
+        let mut candidates = Vec::new();
+        for shape in &self.call_shapes {
+            if shape.is_static != wants_static {
+                continue;
+            }
+            if shape.variadic {
+                let minimum = shape.parameter_count.saturating_sub(1) as usize;
+                if actuals.len() >= minimum {
+                    return None;
+                }
+                continue;
+            }
+            if shape.parameter_count as usize == actuals.len() {
+                candidates.push(shape);
+            }
+        }
+        let selected = select_java_external_signature(
+            actuals,
+            &candidates
+                .iter()
+                .map(|shape| shape.parameters.as_slice())
+                .collect::<Vec<_>>(),
+        )?;
+        candidates.get(selected).copied()
+    }
+}
+
+#[cfg(any(test, feature = "test-support"))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum JavaExternalInvocationPhase {
+    Strict,
+    Loose,
+}
+
+#[cfg(any(test, feature = "test-support"))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum JavaExternalConversion {
+    Strict,
+    Loose,
+    Inapplicable,
+    Unknown,
+}
+
+/// Select the unique most-specific signature under Java's fixed-arity
+/// invocation phases. `None` preserves uncertainty when one of the structured
+/// parameter types cannot decide applicability or specificity.
+#[cfg(any(test, feature = "test-support"))]
+fn select_java_external_signature(actuals: &[TypeRef], candidates: &[&[TypeRef]]) -> Option<usize> {
+    let mut applicable = Vec::new();
+    for (index, formals) in candidates.iter().enumerate() {
+        if formals.len() != actuals.len() {
+            return None;
+        }
+        let mut phase = JavaExternalInvocationPhase::Strict;
+        let mut inapplicable = false;
+        for (actual, formal) in actuals.iter().zip(*formals) {
+            match java_external_conversion(actual, formal) {
+                JavaExternalConversion::Strict => {}
+                JavaExternalConversion::Loose => phase = JavaExternalInvocationPhase::Loose,
+                JavaExternalConversion::Inapplicable => {
+                    inapplicable = true;
+                    break;
+                }
+                JavaExternalConversion::Unknown => return None,
+            }
+        }
+        if !inapplicable {
+            applicable.push((index, phase, *formals));
+        }
+    }
+    let earliest = applicable.iter().map(|(_, phase, _)| *phase).min()?;
+    let phase_candidates = applicable
+        .into_iter()
+        .filter(|(_, phase, _)| *phase == earliest)
+        .collect::<Vec<_>>();
+    let mut maximal = Vec::new();
+    for (index, _, formals) in &phase_candidates {
+        let mut dominated = false;
+        for (other_index, _, other_formals) in &phase_candidates {
+            if index == other_index {
+                continue;
+            }
+            if java_external_more_specific(other_formals, formals)? {
+                dominated = true;
+                break;
+            }
+        }
+        if !dominated {
+            maximal.push(*index);
+        }
+    }
+    match maximal.as_slice() {
+        [selected] => Some(*selected),
+        _ => None,
+    }
+}
+
+#[cfg(any(test, feature = "test-support"))]
+pub(crate) fn select_java_external_signature_for_types(
+    actuals: &[TypeRef],
+    candidates: &[Vec<TypeRef>],
+) -> Option<usize> {
+    let candidates = candidates.iter().map(Vec::as_slice).collect::<Vec<_>>();
+    select_java_external_signature(actuals, &candidates)
+}
+
+#[cfg(any(test, feature = "test-support"))]
+fn java_external_conversion(actual: &TypeRef, formal: &TypeRef) -> JavaExternalConversion {
+    let actual_primitive = java_external_primitive(actual);
+    let formal_primitive = java_external_primitive(formal);
+    match (actual_primitive, formal_primitive) {
+        (Some(actual), Some(formal)) => {
+            return if crate::analyzer::java::primitive_converts(actual, formal) {
+                JavaExternalConversion::Strict
+            } else {
+                JavaExternalConversion::Inapplicable
+            };
+        }
+        (Some(actual), None) => {
+            let Some(formal_name) = java_external_reference_name(formal) else {
+                return JavaExternalConversion::Unknown;
+            };
+            return if java_external_wrapper_name(actual) == Some(formal_name)
+                || formal_name == "java.lang.Object"
+            {
+                JavaExternalConversion::Loose
+            } else if formal_name == "java.lang.String" {
+                JavaExternalConversion::Inapplicable
+            } else {
+                JavaExternalConversion::Unknown
+            };
+        }
+        (None, Some(formal)) => {
+            let Some(actual_name) = java_external_reference_name(actual) else {
+                return JavaExternalConversion::Unknown;
+            };
+            return if let Some(unboxed) = java_external_wrapper_primitive(actual_name) {
+                if crate::analyzer::java::primitive_converts(unboxed, formal) {
+                    JavaExternalConversion::Loose
+                } else {
+                    JavaExternalConversion::Inapplicable
+                }
+            } else if actual_name == "java.lang.String" {
+                JavaExternalConversion::Inapplicable
+            } else {
+                JavaExternalConversion::Unknown
+            };
+        }
+        (None, None) => {}
+    }
+    if actual == formal || matches!(actual, TypeRef::Named { name, .. } if name == "<null>") {
+        return JavaExternalConversion::Strict;
+    }
+    if java_external_reference_name(formal) == Some("java.lang.Object")
+        && java_external_reference_name(actual).is_some()
+    {
+        return JavaExternalConversion::Strict;
+    }
+    JavaExternalConversion::Unknown
+}
+
+#[cfg(any(test, feature = "test-support"))]
+fn java_external_more_specific(left: &[TypeRef], right: &[TypeRef]) -> Option<bool> {
+    if left.len() != right.len() {
+        return None;
+    }
+    let mut strict = false;
+    for (left, right) in left.iter().zip(right) {
+        if left == right {
+            continue;
+        }
+        match (
+            java_external_primitive(left),
+            java_external_primitive(right),
+        ) {
+            (Some(left), Some(right)) => {
+                if !crate::analyzer::java::primitive_converts(left, right) {
+                    return Some(false);
+                }
+                strict = true;
+                continue;
+            }
+            (None, None)
+                if java_external_reference_name(right) == Some("java.lang.Object")
+                    && java_external_reference_name(left).is_some() =>
+            {
+                strict = true;
+            }
+            _ => return None,
+        }
+    }
+    Some(strict)
+}
+
+#[cfg(any(test, feature = "test-support"))]
+fn java_external_primitive(
+    type_ref: &TypeRef,
+) -> Option<crate::analyzer::usages::call_conversion::JavaPrimitive> {
+    let TypeRef::Named {
+        name, arguments, ..
+    } = type_ref
+    else {
+        return None;
+    };
+    arguments
+        .is_empty()
+        .then(|| crate::analyzer::java::primitive_for_name(name))
+        .flatten()
+}
+
+#[cfg(any(test, feature = "test-support"))]
+fn java_external_reference_name(type_ref: &TypeRef) -> Option<&str> {
+    match type_ref {
+        TypeRef::Named {
+            name, arguments, ..
+        } if arguments.is_empty() => Some(name),
+        TypeRef::Declared { id, arguments, .. } if arguments.is_empty() => Some(id),
+        _ => None,
+    }
+}
+
+#[cfg(any(test, feature = "test-support"))]
+fn java_external_wrapper_name(
+    primitive: crate::analyzer::usages::call_conversion::JavaPrimitive,
+) -> Option<&'static str> {
+    use crate::analyzer::usages::call_conversion::JavaPrimitive;
+    Some(match primitive {
+        JavaPrimitive::Boolean => "java.lang.Boolean",
+        JavaPrimitive::Byte => "java.lang.Byte",
+        JavaPrimitive::Short => "java.lang.Short",
+        JavaPrimitive::Char => "java.lang.Character",
+        JavaPrimitive::Int => "java.lang.Integer",
+        JavaPrimitive::Long => "java.lang.Long",
+        JavaPrimitive::Float => "java.lang.Float",
+        JavaPrimitive::Double => "java.lang.Double",
+    })
+}
+
+#[cfg(any(test, feature = "test-support"))]
+fn java_external_wrapper_primitive(
+    name: &str,
+) -> Option<crate::analyzer::usages::call_conversion::JavaPrimitive> {
+    use crate::analyzer::usages::call_conversion::JavaPrimitive;
+    Some(match name {
+        "java.lang.Boolean" => JavaPrimitive::Boolean,
+        "java.lang.Byte" => JavaPrimitive::Byte,
+        "java.lang.Short" => JavaPrimitive::Short,
+        "java.lang.Character" => JavaPrimitive::Char,
+        "java.lang.Integer" => JavaPrimitive::Int,
+        "java.lang.Long" => JavaPrimitive::Long,
+        "java.lang.Float" => JavaPrimitive::Float,
+        "java.lang.Double" => JavaPrimitive::Double,
+        _ => return None,
+    })
 }
 
 impl JvmExternalCallShape {
@@ -3343,6 +3577,11 @@ fn external_call_shape(
     Some(JvmExternalCallShape {
         non_overridable,
         parameter_count,
+        parameters: signature
+            .parameters
+            .iter()
+            .map(|parameter| parameter.r#type.clone())
+            .collect(),
         is_static,
         variadic: signature
             .parameters
@@ -3668,6 +3907,54 @@ fn resolve_explicit_artifact(
     }
 }
 
+fn maven_coordinate_jar_names(coordinate: &JvmMavenCoordinate) -> (String, String) {
+    (
+        format!("{}-{}.jar", coordinate.artifact_id, coordinate.version),
+        format!(
+            "{}-{}-sources.jar",
+            coordinate.artifact_id, coordinate.version
+        ),
+    )
+}
+
+fn local_jvm_artifact_production_request(
+    path: &Path,
+    artifact_kind: ExternalArtifactKind,
+    pack_id: &str,
+) -> ArtifactProductionRequest {
+    ArtifactProductionRequest {
+        path: path.to_path_buf(),
+        artifact_kind,
+        pack_id: pack_id.to_owned(),
+        pack_version: env!("CARGO_PKG_VERSION").to_owned(),
+        ecosystem: "maven".to_owned(),
+        compatibility: Compatibility {
+            bifrost: None,
+            toolchains: Vec::new(),
+        },
+        activation: vec![ActivationSelector {
+            package: None,
+            module: None,
+            toolchain: Some(NameSelector {
+                name: "jvm".to_owned(),
+                version: None,
+            }),
+            targets: Vec::new(),
+            configurations: Vec::new(),
+            artifact_sha256: None,
+        }],
+        provenance: Provenance {
+            source: "local dependency artifact".to_owned(),
+            revision: None,
+        },
+        license: "NOASSERTION".to_owned(),
+        safety: Safety {
+            generated_code_only: false,
+            review_required: false,
+        },
+    }
+}
+
 fn resolve_coordinate(
     repository_root: &Path,
     coordinate: &JvmMavenCoordinate,
@@ -3684,11 +3971,7 @@ fn resolve_coordinate(
     directory.push(&coordinate.artifact_id);
     directory.push(&coordinate.version);
 
-    let jar_name = format!("{}-{}.jar", coordinate.artifact_id, coordinate.version);
-    let sources_name = format!(
-        "{}-{}-sources.jar",
-        coordinate.artifact_id, coordinate.version
-    );
+    let (jar_name, sources_name) = maven_coordinate_jar_names(coordinate);
     let artifact_path = canonical_file_under(&repository_root, &directory.join(jar_name))?;
     if !artifact_path.is_file() {
         return None;
@@ -3952,11 +4235,7 @@ fn resolve_gradle_coordinate(
     jars.sort();
     jars.dedup();
 
-    let expected_binary = format!("{}-{}.jar", coordinate.artifact_id, coordinate.version);
-    let expected_sources = format!(
-        "{}-{}-sources.jar",
-        coordinate.artifact_id, coordinate.version
-    );
+    let (expected_binary, expected_sources) = maven_coordinate_jar_names(coordinate);
     let sources = jars
         .iter()
         .find(|path| {
@@ -4006,14 +4285,6 @@ fn home_dir() -> Option<PathBuf> {
         })
 }
 
-pub(crate) fn resolve_path(project_root: &Path, path: &Path) -> PathBuf {
-    if path.is_absolute() {
-        path.to_path_buf()
-    } else {
-        project_root.join(path)
-    }
-}
-
 fn source_types(artifact_path: &Path, source_path: &str, source: &str) -> Vec<JvmExternalType> {
     let Some(tree) = parse_tree(source) else {
         return Vec::new();
@@ -4049,7 +4320,7 @@ fn source_types(artifact_path: &Path, source_path: &str, source: &str) -> Vec<Jv
             .as_deref()
             .map(|parent| format!("{parent}.{simple_name}"))
             .unwrap_or_else(|| simple_name.to_string());
-        let declared_visibility = source_visibility(node, source, default_visibility);
+        let declared_visibility = source_visibility(node, default_visibility);
         let visibility = parent_visibility
             .map(|parent| restrict_visibility(declared_visibility, parent))
             .unwrap_or(declared_visibility);
@@ -4201,31 +4472,18 @@ fn kotlin_external_kind(node: tree_sitter::Node<'_>) -> Option<JvmExternalTypeKi
 
 fn source_visibility(
     node: tree_sitter::Node<'_>,
-    source: &str,
     default_visibility: JvmVisibility,
 ) -> JvmVisibility {
-    for child in named_children_iter(node) {
-        if child.kind() != "modifiers" {
-            continue;
-        }
-        let modifiers = node_text(child, source);
-        if modifier_present(modifiers, "public") {
-            return JvmVisibility::Public;
-        }
-        if modifier_present(modifiers, "protected") {
-            return JvmVisibility::Protected;
-        }
-        if modifier_present(modifiers, "private") {
-            return JvmVisibility::Private;
-        }
+    let modifiers = java_modifier_keywords(node).collect::<Vec<_>>();
+    if modifiers.contains(&"public") {
+        JvmVisibility::Public
+    } else if modifiers.contains(&"protected") {
+        JvmVisibility::Protected
+    } else if modifiers.contains(&"private") {
+        JvmVisibility::Private
+    } else {
+        default_visibility
     }
-    default_visibility
-}
-
-fn modifier_present(modifiers: &str, expected: &str) -> bool {
-    modifiers
-        .split(|ch: char| !ch.is_ascii_alphabetic())
-        .any(|token| token == expected)
 }
 
 /// One class to assemble into a test class JAR: its binary name, the binary
@@ -4253,6 +4511,32 @@ pub(crate) struct TestClassMethod<'a> {
     pub(crate) name: &'a str,
     pub(crate) descriptor: &'a str,
     pub(crate) is_static: bool,
+}
+
+#[cfg(test)]
+pub(crate) fn probe_registry_base_class_files() -> [TestClassFile<'static>; 2] {
+    [
+        TestClassFile {
+            internal_name: "com/example/probe/Registry",
+            super_internal_name: "com/example/probe/BaseRegistry",
+            methods: &[TestClassMethod {
+                name: "register",
+                descriptor: "(Ljava/lang/String;)V",
+                is_static: true,
+            }],
+            private_nested: false,
+        },
+        TestClassFile {
+            internal_name: "com/example/probe/BaseRegistry",
+            super_internal_name: "java/lang/Object",
+            methods: &[TestClassMethod {
+                name: "reset",
+                descriptor: "()V",
+                is_static: true,
+            }],
+            private_nested: false,
+        },
+    ]
 }
 
 /// The bytes of a minimal, valid `.class` file for `class`.
@@ -4381,14 +4665,16 @@ pub(crate) fn write_test_class_jar(path: &Path, classes: &[TestClassFile<'_>]) {
 }
 
 fn restrict_visibility(declared: JvmVisibility, enclosing: JvmVisibility) -> JvmVisibility {
-    match (declared, enclosing) {
-        (JvmVisibility::Private, _) | (_, JvmVisibility::Private) => JvmVisibility::Private,
-        (JvmVisibility::PackagePrivate, _) | (_, JvmVisibility::PackagePrivate) => {
-            JvmVisibility::PackagePrivate
-        }
-        (JvmVisibility::Protected, _) | (_, JvmVisibility::Protected) => JvmVisibility::Protected,
-        _ => JvmVisibility::Public,
-    }
+    let to_visibility = |visibility| match visibility {
+        JvmVisibility::Public => Visibility::Public,
+        JvmVisibility::Protected => Visibility::Protected,
+        JvmVisibility::PackagePrivate => Visibility::Package,
+        JvmVisibility::Private => Visibility::Private,
+    };
+    semantic_visibility(restrict_semantic_visibility(
+        to_visibility(declared),
+        to_visibility(enclosing),
+    ))
 }
 
 fn is_interface_like_node(kind: &str) -> bool {
@@ -4399,21 +4685,13 @@ fn is_interface_like_node(kind: &str) -> bool {
 }
 
 fn source_kind(kind: &str) -> JvmExternalTypeKind {
-    match kind {
-        "interface_declaration" => JvmExternalTypeKind::Interface,
-        "enum_declaration" => JvmExternalTypeKind::Enum,
-        "annotation_type_declaration" => JvmExternalTypeKind::Annotation,
-        "record_declaration" => JvmExternalTypeKind::Record,
-        _ => JvmExternalTypeKind::Class,
-    }
+    source_type_kind(kind)
+        .map(semantic_type_kind)
+        .unwrap_or(JvmExternalTypeKind::Class)
 }
 
 fn qualified_name(package_name: &str, short_name: &str) -> String {
-    if package_name.is_empty() {
-        short_name.to_string()
-    } else {
-        format!("{package_name}.{short_name}")
-    }
+    brokk_bifrost_core::analyzer::common::qualify_dotted_name(package_name, short_name)
 }
 
 fn enclosing_type_fqns(external_type: &JvmExternalType) -> Vec<String> {
@@ -4430,14 +4708,12 @@ fn enclosing_type_fqns(external_type: &JvmExternalType) -> Vec<String> {
 mod tests {
     use super::*;
     use crate::analyzer::{
-        AnalyzerConfig, AnalyzerDelegate, IAnalyzer, JavaAnalyzer, JvmExternalArtifact,
-        JvmExternalDependencies, JvmMavenCoordinate, Language, MultiAnalyzer, Project, ProjectFile,
-        PythonAnalyzer, TestProject, resolve_analyzer,
+        AnalyzerConfig, AnalyzerDelegate, AnalyzerQueryScope, IAnalyzer, JavaAnalyzer,
+        JvmExternalArtifact, JvmExternalDependencies, JvmMavenCoordinate, Language, MultiAnalyzer,
+        Project, ProjectFile, PythonAnalyzer, QueryScope, TestProject, resolve_analyzer,
     };
-    use crate::analyzer::{AnalyzerQueryScope, QueryScope};
     use std::collections::{BTreeMap, BTreeSet};
     use std::fs;
-    use std::io::Write;
     use std::process::Command;
     use std::sync::Arc;
     use zip::write::SimpleFileOptions;
@@ -4446,7 +4722,11 @@ mod tests {
     const BINARY_JAR: &str = "external-lib-1.2.3.jar";
     const SOURCE_JAR: &str = "external-lib-1.2.3-sources.jar";
 
+    use brokk_bifrost_test_macros::hardwon;
     #[test]
+    #[hardwon(
+        "#3699: Regression ensures array shape is preserved only for one complete matching overload, not ambiguous/incomplete calls"
+    )]
     fn selected_external_return_preserves_array_shape_and_overload_uncertainty() {
         let returned = TypeRef::Array {
             element: Box::new(TypeRef::Named {
@@ -4466,6 +4746,7 @@ mod tests {
             call_shapes: vec![JvmExternalCallShape {
                 non_overridable: None,
                 parameter_count: 0,
+                parameters: Vec::new(),
                 is_static: true,
                 variadic: false,
                 returns: Some(returned.clone()),
@@ -4484,6 +4765,9 @@ mod tests {
     }
 
     #[test]
+    #[hardwon(
+        "#3693: Builds actual class jars and verifies changing an array element type changes dispatch behavior identity"
+    )]
     fn external_return_array_element_changes_behavior_identity() {
         let root = tempfile::tempdir().expect("temporary class jar directory");
         let mut identities = Vec::new();
@@ -4517,63 +4801,9 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires BIFROST_JDK_HOME pointing to a pinned JDK installation"]
-    fn pinned_jdk_home_preparation_is_cached() {
-        use crate::analyzer::JvmStandardLibraryDiscoveryConfig;
-        use crate::analyzer::semantic_model::{
-            CatalogOptions, DependencyPackPreparationStatus, SemanticPackCatalog,
-            prepare_dependency_semantic_packs,
-        };
-
-        let home =
-            PathBuf::from(std::env::var_os("BIFROST_JDK_HOME").expect("set BIFROST_JDK_HOME"));
-        let root = tempfile::tempdir().unwrap();
-        let project = TestProject::new(root.path(), Language::Java);
-        let config = JvmAnalyzerConfig {
-            dependency_discovery: crate::analyzer::JvmDependencyDiscoveryConfig {
-                mode: JvmDependencyDiscoveryMode::Disabled,
-                ..Default::default()
-            },
-            standard_library_discovery: JvmStandardLibraryDiscoveryConfig {
-                jdk_homes: vec![home],
-                discover_java_home: false,
-                ..Default::default()
-            },
-            ..Default::default()
-        };
-        let limits = DependencyPackLimits::default();
-        let discovered = resolve_jvm_semantic_pack_dependencies(&config, &project, &limits, None);
-        assert!(discovered.complete, "{discovered:#?}");
-        assert_eq!(discovered.dependencies.len(), 1, "{discovered:#?}");
-        let catalog = SemanticPackCatalog::open_ephemeral(CatalogOptions::default()).unwrap();
-        let prepared = prepare_dependency_semantic_packs(
-            &catalog,
-            &JvmDependencyPackAdapter,
-            &discovered.dependencies,
-            &limits,
-            None,
-        );
-        // Partial declaration coverage is expected, but the artifact must
-        // still install and leave exact activation evidence and a cache entry.
-        assert_eq!(prepared.packs.len(), 1, "{prepared:#?}");
-        assert_eq!(prepared.evidence.len(), 1, "{prepared:#?}");
-        assert_eq!(
-            prepared.packs[0].status,
-            DependencyPackPreparationStatus::Generated
-        );
-        let reused = prepare_dependency_semantic_packs(
-            &catalog,
-            &JvmDependencyPackAdapter,
-            &discovered.dependencies,
-            &limits,
-            None,
-        );
-        assert_eq!(reused.packs.len(), 1, "{reused:#?}");
-        assert_eq!(reused.profile.generated_packs, 0, "{reused:#?}");
-        assert_eq!(reused.evidence, prepared.evidence);
-    }
-
-    #[test]
+    #[hardwon(
+        "#3422: Checks missing toolchain diagnostics include actionable configuration guidance"
+    )]
     fn missing_jdk_discovery_explains_how_to_activate_stdlib_packs() {
         let config = JvmAnalyzerConfig::default();
         let root = tempfile::tempdir().expect("temp root");
@@ -4602,41 +4832,20 @@ mod tests {
     /// fixture proves a *deliberate exclusion* does not make the artifact
     /// report as not fully read.
     fn probe_class_jar(path: &Path) {
-        write_test_class_jar(
-            path,
-            &[
-                TestClassFile {
-                    internal_name: "com/example/probe/Registry",
-                    super_internal_name: "com/example/probe/BaseRegistry",
-                    methods: &[TestClassMethod {
-                        name: "register",
-                        descriptor: "(Ljava/lang/String;)V",
-                        is_static: true,
-                    }],
-                    private_nested: false,
-                },
-                TestClassFile {
-                    internal_name: "com/example/probe/BaseRegistry",
-                    super_internal_name: "java/lang/Object",
-                    methods: &[TestClassMethod {
-                        name: "reset",
-                        descriptor: "()V",
-                        is_static: true,
-                    }],
-                    private_nested: false,
-                },
-                TestClassFile {
-                    internal_name: "com/example/probe/Registry$Hidden",
-                    super_internal_name: "java/lang/Object",
-                    methods: &[TestClassMethod {
-                        name: "secret",
-                        descriptor: "()V",
-                        is_static: true,
-                    }],
-                    private_nested: true,
-                },
-            ],
-        );
+        let mut classes = probe_registry_base_class_files()
+            .into_iter()
+            .collect::<Vec<_>>();
+        classes.push(TestClassFile {
+            internal_name: "com/example/probe/Registry$Hidden",
+            super_internal_name: "java/lang/Object",
+            methods: &[TestClassMethod {
+                name: "secret",
+                descriptor: "()V",
+                is_static: true,
+            }],
+            private_nested: true,
+        });
+        write_test_class_jar(path, &classes);
     }
 
     fn probe_index(jar: &Path) -> JvmExternalDeclarationIndex {
@@ -4649,6 +4858,9 @@ mod tests {
     }
 
     #[test]
+    #[hardwon(
+        "#1900: A JAR member declaration must resolve where class metadata had previously discarded it"
+    )]
     fn a_class_jar_member_answers_a_written_member_spelling() {
         let root = tempfile::tempdir().unwrap();
         let jar = root.path().join("probe.jar");
@@ -5276,9 +5488,10 @@ mod tests {
             &[
                 (
                     "classes/module-info.class",
-                    &crate::analyzer::jvm::jmod_artifact::test_module_info_class_bytes(&[
-                        "java/lang",
-                    ]),
+                    &crate::analyzer::jvm::jmod_artifact::test_module_info_class_bytes(
+                        &["java/lang"],
+                        &[],
+                    ),
                 ),
                 ("classes/java/lang/Object.class", &class),
             ],
@@ -5361,49 +5574,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn missing_jmod_after_discovery_is_an_honest_preparation_failure() {
-        use crate::analyzer::JvmStandardLibraryDiscoveryConfig;
-        use crate::analyzer::semantic_model::{
-            CatalogOptions, SemanticPackCatalog, prepare_dependency_semantic_packs,
-        };
-
-        let root = tempfile::tempdir().unwrap();
-        let home = root.path().join("jdk");
-        fs::create_dir_all(home.join("jmods")).unwrap();
-        fs::write(home.join("release"), "JAVA_VERSION=\"21.0.8\"\n").unwrap();
-        fs::write(home.join("jmods/java.base.jmod"), b"not a jmod").unwrap();
-        let config = JvmAnalyzerConfig {
-            standard_library_discovery: JvmStandardLibraryDiscoveryConfig {
-                jdk_homes: vec![home.clone()],
-                discover_java_home: false,
-                ..Default::default()
-            },
-            ..JvmAnalyzerConfig::default()
-        };
-        let project = TestProject::new(root.path(), Language::Java);
-        let limits = DependencyPackLimits::default();
-        let discovered = resolve_jvm_semantic_pack_dependencies(&config, &project, &limits, None);
-        assert_eq!(discovered.dependencies.len(), 1);
-        fs::remove_file(home.join("jmods/java.base.jmod")).unwrap();
-        let catalog = SemanticPackCatalog::open_ephemeral(CatalogOptions::default()).unwrap();
-        let prepared = prepare_dependency_semantic_packs(
-            &catalog,
-            &JvmDependencyPackAdapter,
-            &discovered.dependencies,
-            &limits,
-            None,
-        );
-        assert!(!prepared.complete);
-        assert!(prepared.packs.is_empty());
-        assert!(
-            prepared
-                .diagnostics
-                .iter()
-                .any(|diagnostic| { diagnostic.code == "artifact.metadata" })
-        );
-    }
-
     /// A second production over the same installed JDK must answer from the
     /// catalog instead of reading the JMOD set again (#3429).
     ///
@@ -5412,6 +5582,7 @@ mod tests {
     /// digest plus each selected archive's path, length, and modification time.
     /// The catalog is reopened between the two preparations, so only what the
     /// first process wrote to disk can serve the second.
+    #[hardwon("#3006: jdk jmod set source identity serves a second production without reading")]
     #[test]
     fn jdk_jmod_set_source_identity_serves_a_second_production_without_reading() {
         use crate::analyzer::semantic_model::{
@@ -5488,6 +5659,7 @@ mod tests {
     /// A JDK whose selected JMOD set changed is a different JDK: its packs are
     /// read and produced, never served from the identity the old set was
     /// learned under (#3429).
+    #[hardwon("#3006: changed jdk jmod set identity is not served from the catalog")]
     #[test]
     fn changed_jdk_jmod_set_identity_is_not_served_from_the_catalog() {
         use crate::analyzer::semantic_model::{
@@ -5553,20 +5725,9 @@ mod tests {
     }
 
     fn test_jdk_config(home: &Path) -> JvmAnalyzerConfig {
-        use crate::analyzer::JvmStandardLibraryDiscoveryConfig;
-
-        JvmAnalyzerConfig {
-            dependency_discovery: crate::analyzer::JvmDependencyDiscoveryConfig {
-                mode: JvmDependencyDiscoveryMode::Disabled,
-                ..Default::default()
-            },
-            standard_library_discovery: JvmStandardLibraryDiscoveryConfig {
-                jdk_homes: vec![home.to_path_buf()],
-                discover_java_home: false,
-                ..Default::default()
-            },
-            ..JvmAnalyzerConfig::default()
-        }
+        let mut config = crate::test_support::hermetic_jvm_config();
+        config.jvm.standard_library_discovery.jdk_homes = vec![home.to_path_buf()];
+        config.jvm
     }
 
     /// An installed JDK fixture with one class-bearing `java.base` module and
@@ -5587,7 +5748,7 @@ mod tests {
             &[
                 (
                     "classes/module-info.class",
-                    &test_module_info_class_bytes(&["java/lang"]),
+                    &test_module_info_class_bytes(&["java/lang"], &[]),
                 ),
                 ("classes/java/lang/Object.class", &class),
             ],
@@ -5599,7 +5760,7 @@ mod tests {
                 &home.join("jmods").join(name),
                 &[(
                     "classes/module-info.class",
-                    &test_module_info_class_bytes(&[package.as_str()]),
+                    &test_module_info_class_bytes(&[package.as_str()], &[]),
                 )],
             );
         }
@@ -5667,6 +5828,9 @@ mod tests {
     }
 
     #[test]
+    #[hardwon(
+        "#2874: Checks an invalid environment-selected JDK is a warning with no guessed dependency"
+    )]
     fn invalid_environment_jdk_home_is_a_warning_without_guessed_version() {
         let root = tempfile::tempdir().unwrap();
         let missing = root.path().join("not-a-jdk");
@@ -5689,17 +5853,11 @@ mod tests {
     /// Writes the smallest JDK home automatic discovery accepts: a `release`
     /// file that declares one `JAVA_VERSION`.
     fn write_jdk_release(root: &Path, java_version: &str) -> PathBuf {
-        let home = root.join("jdk");
-        fs::create_dir_all(&home).unwrap();
-        fs::write(
-            home.join("release"),
-            format!("JAVA_VERSION=\"{java_version}\"\n"),
-        )
-        .unwrap();
-        home
+        crate::test_support::write_jdk_release(&root.join("jdk"), java_version)
     }
 
     #[test]
+    #[hardwon("#2874: Checks four-component JDK version remains exact in identity and provenance")]
     fn four_part_temurin_version_keeps_its_exact_spelling() {
         let root = tempfile::tempdir().unwrap();
         let home = write_jdk_release(root.path(), "21.0.12.1");
@@ -5738,6 +5896,9 @@ mod tests {
     }
 
     #[test]
+    #[hardwon(
+        "#2874: Checks an explicitly configured JDK home accepts a four-part release version"
+    )]
     fn configured_jdk_home_accepts_a_four_part_version() {
         use crate::analyzer::JvmStandardLibraryDiscoveryConfig;
 
@@ -5764,6 +5925,9 @@ mod tests {
     }
 
     #[test]
+    #[hardwon(
+        "#2874: Checks feature-only version maps to a complete semantic-version coordinate without guessing a different feature"
+    )]
     fn feature_only_jdk_version_fills_the_missing_semver_components() {
         let root = tempfile::tempdir().unwrap();
         let home = write_jdk_release(root.path(), "21");
@@ -5792,6 +5956,9 @@ mod tests {
     }
 
     #[test]
+    #[hardwon(
+        "#2874: Keeps legacy underscore and overlong version forms out of exact JDK evidence"
+    )]
     fn undotted_and_overlong_jdk_versions_stay_invalid() {
         for java_version in ["1.8.0_392", "21.0.12.1.7"] {
             let root = tempfile::tempdir().unwrap();
@@ -5898,6 +6065,27 @@ mod tests {
                 .resolve_wildcard_import("com.example.dep", "ExternalService", "app")
                 .is_some()
         );
+    }
+
+    #[test]
+    #[hardwon("#4271: Annotation text containing public hid a protected source-JAR member type")]
+    fn java_source_jar_visibility_ignores_annotation_values() {
+        let Some(fixture) = ExternalJarFixture::new(true) else {
+            return;
+        };
+        let index = JvmExternalDeclarationIndex::build(
+            &fixture.coordinate_config(),
+            fixture.project_root(),
+        );
+        let nested = index
+            .get("com.example.dep.ExternalService.AnnotatedProtectedNested")
+            .expect("annotated protected nested type is indexed");
+
+        assert_eq!(JvmVisibility::Protected, nested.visibility());
+        assert!(matches!(
+            nested.source(),
+            JvmExternalDeclarationSource::SourceJar { .. }
+        ));
     }
 
     #[test]
@@ -6042,6 +6230,7 @@ mod tests {
                     collection_flows: None,
                     deferred_yields: None,
                     conditional_type_refinements: None,
+                    callable_values: None,
                 },
             );
         }
@@ -6161,6 +6350,9 @@ mod tests {
     }
 
     #[test]
+    #[hardwon(
+        "#2756: A refused dependency with no compatible pack must receive specific and generic accounting diagnostics"
+    )]
     fn scala_library_without_sources_waits_for_compatible_prebuilt_pack() {
         use crate::analyzer::semantic_model::{
             CatalogOptions, SemanticPackCatalog, prepare_dependency_semantic_packs,
@@ -6267,6 +6459,9 @@ mod tests {
     }
 
     #[test]
+    #[hardwon(
+        "#2756: A refused dependency with no compatible pack must receive specific and generic accounting diagnostics"
+    )]
     fn kotlin_library_without_sources_waits_for_compatible_prebuilt_pack() {
         use crate::analyzer::semantic_model::{
             CatalogOptions, DependencyPackLimits, SemanticPackCatalog,
@@ -6317,98 +6512,10 @@ mod tests {
     }
 
     #[test]
-    fn incomplete_kotlin_classification_never_falls_through_to_java() {
-        let temp = tempfile::tempdir().unwrap();
-        let source_jar = temp.path().join("unknown-sources.jar");
-        File::create(&source_jar)
-            .unwrap()
-            .set_len(MAX_ARTIFACT_BYTES + 1)
-            .unwrap();
-        let invalid_jar = temp.path().join("invalid-sources.jar");
-        fs::write(&invalid_jar, b"not a ZIP archive").unwrap();
-        for path in [source_jar, invalid_jar] {
-            let dependency = resolved_semantic_pack_dependency(ResolvedJvmArtifact {
-                artifact_path: temp.path().join("unknown.jar"),
-                source_artifact_path: Some(path),
-                coordinate: Some(JvmMavenCoordinate::new("example", "unknown", "1.0.0")),
-                origin: JvmDependencyOrigin::ExplicitPath,
-            });
-
-            assert_eq!(dependency.evidence.language, "kotlin");
-            assert_eq!(
-                dependency.artifacts[0].kind,
-                ExternalArtifactKind::KotlinSourceJar
-            );
-            assert!(dependency.provenance.iter().any(|entry| {
-                entry.key == "kotlin.classification" && entry.value == "incomplete"
-            }));
-        }
-    }
-
-    #[test]
-    fn unresolved_jvm_coordinate_is_actionable_incomplete_discovery() {
-        use crate::analyzer::semantic_model::{
-            DependencyPackLimits, prepare_discovered_dependency_semantic_packs,
-        };
-
-        let root = tempfile::tempdir().unwrap();
-        let project = TestProject::new(root.path(), Language::Java);
-        let config = JvmAnalyzerConfig {
-            external_dependencies: JvmExternalDependencies {
-                coordinates: vec![JvmMavenCoordinate {
-                    group_id: "com.example".to_owned(),
-                    artifact_id: "missing".to_owned(),
-                    version: "1.0.0".to_owned(),
-                }],
-                repository_roots: vec![root.path().join("repository")],
-                ..JvmExternalDependencies::default()
-            },
-            dependency_discovery: crate::analyzer::JvmDependencyDiscoveryConfig {
-                mode: JvmDependencyDiscoveryMode::Disabled,
-                ..crate::analyzer::JvmDependencyDiscoveryConfig::default()
-            },
-            standard_library_discovery: crate::analyzer::JvmStandardLibraryDiscoveryConfig {
-                discover_java_home: false,
-                ..Default::default()
-            },
-        };
-        let limits = DependencyPackLimits::default();
-        let discovery = resolve_jvm_semantic_pack_dependencies(&config, &project, &limits, None);
-
-        assert!(!discovery.complete);
-        assert!(discovery.dependencies.is_empty());
-        assert_eq!(discovery.diagnostics[0].code, "jvm.dependency_unresolved");
-        let catalog = crate::analyzer::semantic_model::SemanticPackCatalog::open_ephemeral(
-            Default::default(),
-        )
-        .unwrap();
-        let prepared = prepare_discovered_dependency_semantic_packs(
-            &catalog,
-            &JvmDependencyPackAdapter,
-            discovery,
-            &limits,
-            None,
-        );
-        assert!(!prepared.complete);
-        assert!(
-            prepared
-                .compose_activation_request(
-                    crate::analyzer::semantic_model::SemanticModelActivationRequest {
-                        bifrost_version: Version::parse(env!("CARGO_PKG_VERSION")).unwrap(),
-                        evidence: Vec::new(),
-                        controls: Vec::new(),
-                        limits: Default::default(),
-                    }
-                )
-                .is_none()
-        );
-    }
-
-    #[test]
     fn renamed_identical_jars_reuse_one_path_independent_manifest() {
         use crate::analyzer::semantic_model::{
-            CatalogOptions, DependencyPackLimits, DependencyPackPreparationStatus,
-            SemanticPackCatalog, prepare_dependency_semantic_packs,
+            CatalogOptions, DependencyPackLimits, SemanticPackCatalog,
+            assert_path_independent_pack_reuse, prepare_dependency_semantic_packs,
         };
 
         let Some(fixture) = ExternalJarFixture::new(true) else {
@@ -6459,17 +6566,7 @@ mod tests {
             None,
         );
 
-        assert!(
-            first.complete && second.complete,
-            "first={:#?}\nsecond={:#?}",
-            first,
-            second
-        );
-        assert_eq!(
-            second.packs[0].status,
-            DependencyPackPreparationStatus::Reused
-        );
-        assert_eq!(first.packs[0].production, second.packs[0].production);
+        assert_path_independent_pack_reuse(&first, &second);
     }
 
     #[test]
@@ -6519,276 +6616,6 @@ mod tests {
                 .is_none(),
             "classfile fallback should respect InnerClasses private visibility"
         );
-    }
-
-    #[cfg_attr(not(scheduled_tests), ignore = "scheduled-only")]
-    #[test]
-    fn java_dependency_discovery_indexes_exact_maven_pom_coordinate() {
-        let Some(fixture) = ExternalJarFixture::new(true) else {
-            return;
-        };
-        let app = ProjectFile::new(fixture.project_root().to_path_buf(), "src/App.java");
-        app.write(
-            "package app; import com.example.dep.ExternalService; class App { ExternalService service; }",
-        )
-        .unwrap();
-        ProjectFile::new(fixture.project_root().to_path_buf(), "pom.xml")
-            .write(
-                "<project><groupId>app</groupId><artifactId>app</artifactId><version>1</version><dependencies><dependency><groupId>com.example</groupId><artifactId>external-lib</artifactId><version>1.2.3</version></dependency></dependencies></project>",
-            )
-            .unwrap();
-        let config = AnalyzerConfig {
-            jvm: JvmAnalyzerConfig {
-                external_dependencies: JvmExternalDependencies {
-                    repository_roots: vec![fixture.maven_repository_root()],
-                    ..JvmExternalDependencies::default()
-                },
-                ..JvmAnalyzerConfig::default()
-            },
-            ..AnalyzerConfig::default()
-        };
-        let analyzer = JavaAnalyzer::from_project_with_config(
-            TestProject::new(fixture.project_root().to_path_buf(), Language::Java),
-            config,
-        );
-        let scope = AnalyzerQueryScope::new(&analyzer);
-        let token = scope.token();
-        assert!(analyzer.is_known_type_name_in_file(token, None, &app, "ExternalService"));
-    }
-
-    #[test]
-    fn java_dependency_discovery_indexes_only_locked_gradle_coordinate_directory() {
-        let Some(fixture) = ExternalJarFixture::new(true) else {
-            return;
-        };
-        let gradle_cache = fixture.root.join("gradle-cache");
-        let locked_dir = gradle_cache.join("com.example/external-lib/1.2.3/binary-hash");
-        let source_dir = gradle_cache.join("com.example/external-lib/1.2.3/source-hash");
-        let unrelated_dir = gradle_cache.join("unrelated/example/9.9.9/hash");
-        fs::create_dir_all(&locked_dir).unwrap();
-        fs::create_dir_all(&source_dir).unwrap();
-        fs::create_dir_all(&unrelated_dir).unwrap();
-        fs::copy(fixture.binary_jar_path(), locked_dir.join(BINARY_JAR)).unwrap();
-        fs::copy(fixture.source_jar_path(), source_dir.join(SOURCE_JAR)).unwrap();
-        fs::copy(
-            fixture.binary_jar_path(),
-            unrelated_dir.join("example-9.9.9.jar"),
-        )
-        .unwrap();
-
-        let app = ProjectFile::new(fixture.project_root().to_path_buf(), "src/App.java");
-        app.write(
-            "package app; import com.example.dep.ExternalService; class App { ExternalService service; }",
-        )
-        .unwrap();
-        ProjectFile::new(fixture.project_root().to_path_buf(), "gradle.lockfile")
-            .write("com.example:external-lib:1.2.3=compileClasspath\n")
-            .unwrap();
-        let config = AnalyzerConfig {
-            jvm: JvmAnalyzerConfig {
-                external_dependencies: JvmExternalDependencies {
-                    repository_roots: vec![fixture.root.join("empty-maven")],
-                    gradle_cache_roots: vec![gradle_cache],
-                    ..JvmExternalDependencies::default()
-                },
-                ..JvmAnalyzerConfig::default()
-            },
-            ..AnalyzerConfig::default()
-        };
-        let analyzer = JavaAnalyzer::from_project_with_config(
-            TestProject::new(fixture.project_root().to_path_buf(), Language::Java),
-            config,
-        );
-        let scope = AnalyzerQueryScope::new(&analyzer);
-        let token = scope.token();
-        let resolution = analyzer
-            .resolve_type_name_with_external(token, None, &app, "ExternalService")
-            .unwrap();
-        let crate::analyzer::java::imports::JavaTypeResolution::External(external) = resolution
-        else {
-            panic!("dependency should resolve externally");
-        };
-        assert!(matches!(
-            external.source(),
-            JvmExternalDeclarationSource::SourceJar { .. }
-        ));
-    }
-
-    #[test]
-    fn java_dependency_discovery_skips_classifier_only_gradle_cache_entries() {
-        let Some(fixture) = ExternalJarFixture::new(false) else {
-            return;
-        };
-        let gradle_cache = fixture.root.join("gradle-cache");
-        let classifier_dir = gradle_cache.join("com.example/external-lib/1.2.3/classifier-hash");
-        fs::create_dir_all(&classifier_dir).unwrap();
-        fs::copy(
-            fixture.binary_jar_path(),
-            classifier_dir.join("external-lib-1.2.3-tests.jar"),
-        )
-        .unwrap();
-
-        let config = JvmExternalDependencies {
-            coordinates: vec![JvmMavenCoordinate::new(
-                "com.example",
-                "external-lib",
-                "1.2.3",
-            )],
-            gradle_cache_roots: vec![gradle_cache],
-            ..JvmExternalDependencies::default()
-        };
-        let index = JvmExternalDeclarationIndex::build(&config, fixture.project_root());
-        assert!(index.is_empty());
-    }
-
-    #[cfg_attr(not(scheduled_tests), ignore = "scheduled-only")]
-    #[test]
-    fn java_dependency_discovery_disabled_keeps_metadata_out_of_index() {
-        let Some(fixture) = ExternalJarFixture::new(false) else {
-            return;
-        };
-        let app = ProjectFile::new(fixture.project_root().to_path_buf(), "src/App.java");
-        app.write(
-            "package app; import com.example.dep.ExternalService; class App { ExternalService service; }",
-        )
-        .unwrap();
-        ProjectFile::new(fixture.project_root().to_path_buf(), "pom.xml")
-            .write(
-                "<project><dependencies><dependency><groupId>com.example</groupId><artifactId>external-lib</artifactId><version>1.2.3</version></dependency></dependencies></project>",
-            )
-            .unwrap();
-        let config = AnalyzerConfig {
-            jvm: JvmAnalyzerConfig {
-                external_dependencies: JvmExternalDependencies {
-                    repository_roots: vec![fixture.maven_repository_root()],
-                    ..JvmExternalDependencies::default()
-                },
-                dependency_discovery: crate::analyzer::JvmDependencyDiscoveryConfig {
-                    mode: crate::analyzer::JvmDependencyDiscoveryMode::Disabled,
-                    ..crate::analyzer::JvmDependencyDiscoveryConfig::default()
-                },
-                standard_library_discovery: crate::analyzer::JvmStandardLibraryDiscoveryConfig {
-                    discover_java_home: false,
-                    ..Default::default()
-                },
-            },
-            ..AnalyzerConfig::default()
-        };
-        let analyzer = JavaAnalyzer::from_project_with_config(
-            TestProject::new(fixture.project_root().to_path_buf(), Language::Java),
-            config,
-        );
-        let scope = AnalyzerQueryScope::new(&analyzer);
-        let token = scope.token();
-        assert!(!analyzer.is_known_type_name_in_file(token, None, &app, "ExternalService"));
-    }
-
-    #[test]
-    fn java_dependency_discovery_invalidates_only_for_build_inputs() {
-        let Some(fixture) = ExternalJarFixture::new(false) else {
-            return;
-        };
-        let app = ProjectFile::new(fixture.project_root().to_path_buf(), "src/App.java");
-        app.write(
-            "package app; import com.example.dep.ExternalService; class App { ExternalService service; }",
-        )
-        .unwrap();
-        let pom = ProjectFile::new(fixture.project_root().to_path_buf(), "pom.xml");
-        pom.write("<project><dependencies><dependency><groupId>com.example</groupId><artifactId>external-lib</artifactId></dependency></dependencies></project>")
-            .unwrap();
-        let config = AnalyzerConfig {
-            jvm: JvmAnalyzerConfig {
-                external_dependencies: JvmExternalDependencies {
-                    repository_roots: vec![fixture.maven_repository_root()],
-                    ..JvmExternalDependencies::default()
-                },
-                ..JvmAnalyzerConfig::default()
-            },
-            ..AnalyzerConfig::default()
-        };
-        let analyzer = JavaAnalyzer::from_project_with_config(
-            TestProject::new(fixture.project_root().to_path_buf(), Language::Java),
-            config,
-        );
-        let scope = AnalyzerQueryScope::new(&analyzer);
-        let token = scope.token();
-        assert!(!analyzer.is_known_type_name_in_file(token, None, &app, "ExternalService"));
-        let initial_index = analyzer.external_index.clone();
-
-        pom.write("<project><dependencies><dependency><groupId>com.example</groupId><artifactId>external-lib</artifactId><version>1.2.3</version></dependency></dependencies></project>")
-            .unwrap();
-        let updated = analyzer.update(&BTreeSet::from([pom.clone()]));
-        assert!(!Arc::ptr_eq(&initial_index, &updated.external_index));
-        assert!(updated.is_known_type_name_in_file(token, None, &app, "ExternalService"));
-
-        app.write(
-            "package app; import com.example.dep.ExternalService; class App { ExternalService changed; }",
-        )
-        .unwrap();
-        let java_only = updated.update(&BTreeSet::from([app]));
-        assert!(Arc::ptr_eq(
-            &updated.external_index,
-            &java_only.external_index
-        ));
-        let refreshed = java_only.update_all();
-        assert!(!Arc::ptr_eq(
-            &java_only.external_index,
-            &refreshed.external_index
-        ));
-    }
-
-    #[test]
-    fn java_dependency_discovery_routes_manifest_changes_through_multi_analyzer() {
-        let Some(fixture) = ExternalJarFixture::new(false) else {
-            return;
-        };
-        let app = ProjectFile::new(fixture.project_root().to_path_buf(), "src/App.java");
-        app.write(
-            "package app; import com.example.dep.ExternalService; class App { ExternalService service; }",
-        )
-        .unwrap();
-        ProjectFile::new(fixture.project_root().to_path_buf(), "tool.py")
-            .write("def tool():\n    pass\n")
-            .unwrap();
-        let pom = ProjectFile::new(fixture.project_root().to_path_buf(), "pom.xml");
-        pom.write("<project/>").unwrap();
-        let project = TestProject::with_languages(
-            fixture.project_root().to_path_buf(),
-            BTreeSet::from([Language::Java, Language::Python]),
-        );
-        let config = AnalyzerConfig {
-            jvm: JvmAnalyzerConfig {
-                external_dependencies: JvmExternalDependencies {
-                    repository_roots: vec![fixture.maven_repository_root()],
-                    ..JvmExternalDependencies::default()
-                },
-                ..JvmAnalyzerConfig::default()
-            },
-            ..AnalyzerConfig::default()
-        };
-        let multi = MultiAnalyzer::new(BTreeMap::from([
-            (
-                Language::Java,
-                AnalyzerDelegate::Java(JavaAnalyzer::from_project_with_config(
-                    project.clone(),
-                    config,
-                )),
-            ),
-            (
-                Language::Python,
-                AnalyzerDelegate::Python(PythonAnalyzer::from_project(project)),
-            ),
-        ]));
-        let java = resolve_analyzer::<JavaAnalyzer>(&multi).unwrap();
-        let scope = AnalyzerQueryScope::new(&multi);
-        let token = scope.token();
-        assert!(!java.is_known_type_name_in_file(token, None, &app, "ExternalService"));
-
-        pom.write("<project><dependencies><dependency><groupId>com.example</groupId><artifactId>external-lib</artifactId><version>1.2.3</version></dependency></dependencies></project>")
-            .unwrap();
-        let updated = multi.update(&BTreeSet::from([pom]));
-        let java = resolve_analyzer::<JavaAnalyzer>(&updated).unwrap();
-        assert!(java.is_known_type_name_in_file(token, None, &app, "ExternalService"));
     }
 
     #[cfg_attr(not(scheduled_tests), ignore = "scheduled-only")]
@@ -6941,76 +6768,6 @@ mod tests {
     }
 
     #[test]
-    fn jvm_external_declaration_omits_kotlin_types_a_consumer_cannot_name() {
-        let temp = tempfile::tempdir().unwrap();
-        let root = temp.path().canonicalize().unwrap();
-        let index = kotlin_source_jar_index(&root);
-
-        // `internal` is module-scoped and `private` is file-scoped, so neither
-        // is nameable from a different artifact.
-        assert!(index.get("kotlin.example.ModulePrivate").is_none());
-        assert!(index.get("kotlin.example.FilePrivate").is_none());
-        assert!(index.get("kotlin.example.Dependency.Hidden").is_none());
-
-        // The index answers "does this *type* exist"; top-level callables are
-        // not types, and the JVM facade Kotlin generates for them
-        // (`DependencyKt`) is a compiler artifact that never appears in a
-        // Kotlin identity.
-        assert!(index.get("kotlin.example.topLevelHelper").is_none());
-        assert!(index.get("kotlin.example.DependencyKt").is_none());
-    }
-
-    #[test]
-    fn kotlin_analyzer_shares_the_jvm_dependency_realm() {
-        let temp = tempfile::tempdir().unwrap();
-        let root = temp.path().canonicalize().unwrap();
-        let workspace_root = root.join("workspace");
-        fs::create_dir_all(&workspace_root).unwrap();
-        let source_jar = root.join("kotlin-library-sources.jar");
-        write_zip_entry(
-            &source_jar,
-            "kotlin/example/Dependency.kt",
-            KOTLIN_DEPENDENCY_SOURCE.as_bytes(),
-        );
-
-        ProjectFile::new(workspace_root.clone(), "src/App.kt")
-            .write("package app\n\nimport kotlin.example.Dependency\n\nclass App\n")
-            .unwrap();
-
-        let config = AnalyzerConfig {
-            jvm: JvmAnalyzerConfig {
-                external_dependencies: JvmExternalDependencies {
-                    artifact_paths: vec![JvmExternalArtifact {
-                        artifact_path: source_jar,
-                        source_artifact_path: None,
-                        ..JvmExternalArtifact::default()
-                    }],
-                    ..JvmExternalDependencies::default()
-                },
-                ..JvmAnalyzerConfig::default()
-            },
-            ..AnalyzerConfig::default()
-        };
-        let analyzer = crate::analyzer::KotlinAnalyzer::new_with_config(
-            Arc::new(TestProject::new(workspace_root, Language::Kotlin)),
-            config,
-        );
-
-        let index = analyzer.external_declaration_index();
-        assert!(
-            index
-                .resolve_explicit_import("kotlin.example.Dependency", "app")
-                .is_some(),
-            "the Kotlin analyzer must read the same jar-backed index Java and Scala use"
-        );
-        assert!(
-            index
-                .resolve_explicit_import("kotlin.example.ModulePrivate", "app")
-                .is_none()
-        );
-    }
-
-    #[test]
     fn java_external_declaration_ignores_missing_and_malformed_artifacts() {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().canonicalize().unwrap();
@@ -7099,6 +6856,766 @@ mod tests {
 
         let index = JvmExternalDeclarationIndex::build(&config, &root);
         assert!(index.is_empty());
+    }
+
+    /// Two workspaces over one unchanged dependency universe share one built
+    /// index through the process-wide memo; changing a resolved artifact's
+    /// bytes changes the evidence and rebuilds.
+    #[test]
+    fn build_for_project_memoizes_on_dependency_discovery_evidence() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let repo_dir = root.join("m2").join(GROUP_PATH);
+        fs::create_dir_all(&repo_dir).unwrap();
+        for workspace in ["workspace-a", "workspace-b"] {
+            fs::create_dir_all(root.join(workspace)).unwrap();
+        }
+        probe_class_jar(&repo_dir.join(BINARY_JAR));
+        let config = JvmAnalyzerConfig {
+            external_dependencies: JvmExternalDependencies {
+                coordinates: vec![JvmMavenCoordinate::new(
+                    "com.example",
+                    "external-lib",
+                    "1.2.3",
+                )],
+                repository_roots: vec![root.join("m2")],
+                ..JvmExternalDependencies::default()
+            },
+            ..JvmAnalyzerConfig::default()
+        };
+        let first = JvmExternalDeclarationIndex::build_for_project(
+            &config,
+            &TestProject::new(root.join("workspace-a"), Language::Java),
+        );
+        let second = JvmExternalDeclarationIndex::build_for_project(
+            &config,
+            &TestProject::new(root.join("workspace-b"), Language::Java),
+        );
+        assert!(
+            Arc::ptr_eq(&first, &second),
+            "identical dependency-discovery evidence must share one built index"
+        );
+
+        write_test_class_jar(
+            &repo_dir.join(BINARY_JAR),
+            &[TestClassFile {
+                internal_name: "com/example/probe/Replaced",
+                super_internal_name: "java/lang/Object",
+                methods: &[],
+                private_nested: false,
+            }],
+        );
+        let third = JvmExternalDeclarationIndex::build_for_project(
+            &config,
+            &TestProject::new(root.join("workspace-a"), Language::Java),
+        );
+        assert!(
+            !Arc::ptr_eq(&first, &third),
+            "a changed resolved artifact must rebuild the index"
+        );
+        assert!(
+            third
+                .resolve_qualified_name("com.example.probe.Replaced", "")
+                .is_some(),
+            "the rebuilt index must read the replaced artifact"
+        );
+    }
+
+    struct ExternalJarFixture {
+        _temp: tempfile::TempDir,
+        root: PathBuf,
+        workspace_root: PathBuf,
+    }
+
+    impl ExternalJarFixture {
+        fn new(include_sources: bool) -> Option<Self> {
+            if !jdk_tool_available("javac") || !jdk_tool_available("jar") {
+                eprintln!(
+                    "skipping Java external declaration fixture test: `javac` and `jar` are required"
+                );
+                return None;
+            }
+
+            let temp = tempfile::tempdir().unwrap();
+            let root = temp.path().canonicalize().unwrap();
+            let workspace_root = root.join("workspace");
+            let repo_dir = root.join("m2").join(GROUP_PATH);
+            let source_dir = root.join("dep-src");
+            let package_dir = source_dir.join("com/example/dep");
+            let other_package_dir = source_dir.join("com/example/other");
+            let classes_dir = root.join("dep-classes");
+            fs::create_dir_all(&workspace_root).unwrap();
+            fs::create_dir_all(&repo_dir).unwrap();
+            fs::create_dir_all(&package_dir).unwrap();
+            fs::create_dir_all(&other_package_dir).unwrap();
+            fs::create_dir_all(&classes_dir).unwrap();
+
+            fs::write(
+                package_dir.join("ExternalService.java"),
+                "package com.example.dep;\n\
+                 public class ExternalService {\n\
+                   public String echo(String name) { return name; }\n\
+                   public static class Nested {}\n\
+                   protected static class ProtectedNested {}\n\
+                   @Deprecated(since = \"public\") protected static class AnnotatedProtectedNested {}\n\
+                   static class PackageNested {}\n\
+                   private static class Hidden { public static class Leaks {} }\n\
+                 }\n",
+            )
+            .unwrap();
+            fs::write(
+                package_dir.join("ExternalInterface.java"),
+                "package com.example.dep; public interface ExternalInterface {}\n",
+            )
+            .unwrap();
+            fs::write(
+                package_dir.join("ExternalHelper.java"),
+                "package com.example.dep; public class ExternalHelper {}\n",
+            )
+            .unwrap();
+            fs::write(
+                package_dir.join("PackageHelper.java"),
+                "package com.example.dep; class PackageHelper {}\n",
+            )
+            .unwrap();
+            fs::write(
+                package_dir.join("PackageOuter.java"),
+                "package com.example.dep; class PackageOuter { public static class Nested {} }\n",
+            )
+            .unwrap();
+            fs::write(
+                package_dir.join("PublicApi.java"),
+                "package com.example.dep; public interface PublicApi { interface Callback {} }\n",
+            )
+            .unwrap();
+            fs::write(
+                package_dir.join("Foo.java"),
+                "package com.example.dep; public class Foo {}\n",
+            )
+            .unwrap();
+            fs::write(
+                other_package_dir.join("Foo.java"),
+                "package com.example.other; public class Foo {}\n",
+            )
+            .unwrap();
+
+            crate::test_support::run_command_success(
+                Command::new("javac")
+                    .arg("-d")
+                    .arg(&classes_dir)
+                    .arg(package_dir.join("ExternalService.java"))
+                    .arg(package_dir.join("ExternalInterface.java"))
+                    .arg(package_dir.join("ExternalHelper.java"))
+                    .arg(package_dir.join("PackageHelper.java"))
+                    .arg(package_dir.join("PackageOuter.java"))
+                    .arg(package_dir.join("PublicApi.java"))
+                    .arg(package_dir.join("Foo.java"))
+                    .arg(other_package_dir.join("Foo.java")),
+            );
+            crate::test_support::run_command_success(
+                Command::new("jar")
+                    .current_dir(&classes_dir)
+                    .arg("cf")
+                    .arg(repo_dir.join(BINARY_JAR))
+                    .arg("."),
+            );
+            if include_sources {
+                crate::test_support::run_command_success(
+                    Command::new("jar")
+                        .current_dir(&source_dir)
+                        .arg("cf")
+                        .arg(repo_dir.join(SOURCE_JAR))
+                        .arg("."),
+                );
+            }
+
+            Some(Self {
+                _temp: temp,
+                root,
+                workspace_root,
+            })
+        }
+
+        fn project_root(&self) -> &Path {
+            &self.workspace_root
+        }
+
+        fn jar_path(&self, name: &str) -> PathBuf {
+            self.root.join("m2").join(GROUP_PATH).join(name)
+        }
+
+        fn source_jar_path(&self) -> PathBuf {
+            self.jar_path(SOURCE_JAR)
+        }
+
+        fn binary_jar_path(&self) -> PathBuf {
+            self.jar_path(BINARY_JAR)
+        }
+
+        fn maven_repository_root(&self) -> PathBuf {
+            self.root.join("m2")
+        }
+
+        fn coordinate_config(&self) -> JvmExternalDependencies {
+            JvmExternalDependencies {
+                coordinates: vec![JvmMavenCoordinate::new(
+                    "com.example",
+                    "external-lib",
+                    "1.2.3",
+                )],
+                repository_roots: vec![self.root.join("m2")],
+                ..JvmExternalDependencies::default()
+            }
+        }
+    }
+
+    fn jdk_tool_available(tool: &str) -> bool {
+        Command::new(tool)
+            .arg("--version")
+            .output()
+            .is_ok_and(|output| output.status.success())
+    }
+
+    fn write_zip_entry(path: &Path, entry_name: &str, bytes: &[u8]) {
+        crate::test_support::zip_helpers::write_zip_unwrap(
+            path,
+            &[(entry_name, bytes)],
+            SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored),
+        );
+    }
+
+    fn write_zip_entries(path: &Path, entries: &[(&str, &[u8])]) {
+        crate::test_support::zip_helpers::write_zip_unwrap(
+            path,
+            entries,
+            SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored),
+        );
+    }
+
+    #[test]
+    #[ignore = "requires BIFROST_JDK_HOME pointing to a pinned JDK installation"]
+    fn pinned_jdk_home_preparation_is_cached() {
+        use crate::analyzer::JvmStandardLibraryDiscoveryConfig;
+        use crate::analyzer::semantic_model::{
+            CatalogOptions, DependencyPackPreparationStatus, SemanticPackCatalog,
+            prepare_dependency_semantic_packs,
+        };
+
+        let home =
+            PathBuf::from(std::env::var_os("BIFROST_JDK_HOME").expect("set BIFROST_JDK_HOME"));
+        let root = tempfile::tempdir().unwrap();
+        let project = TestProject::new(root.path(), Language::Java);
+        let config = JvmAnalyzerConfig {
+            dependency_discovery: crate::analyzer::JvmDependencyDiscoveryConfig {
+                mode: JvmDependencyDiscoveryMode::Disabled,
+                ..Default::default()
+            },
+            standard_library_discovery: JvmStandardLibraryDiscoveryConfig {
+                jdk_homes: vec![home],
+                discover_java_home: false,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let limits = DependencyPackLimits::default();
+        let discovered = resolve_jvm_semantic_pack_dependencies(&config, &project, &limits, None);
+        assert!(discovered.complete, "{discovered:#?}");
+        assert_eq!(discovered.dependencies.len(), 1, "{discovered:#?}");
+        let catalog = SemanticPackCatalog::open_ephemeral(CatalogOptions::default()).unwrap();
+        let prepared = prepare_dependency_semantic_packs(
+            &catalog,
+            &JvmDependencyPackAdapter,
+            &discovered.dependencies,
+            &limits,
+            None,
+        );
+        // Partial declaration coverage is expected, but the artifact must
+        // still install and leave exact activation evidence and a cache entry.
+        assert_eq!(prepared.packs.len(), 1, "{prepared:#?}");
+        assert_eq!(prepared.evidence.len(), 1, "{prepared:#?}");
+        assert_eq!(
+            prepared.packs[0].status,
+            DependencyPackPreparationStatus::Generated
+        );
+        let reused = prepare_dependency_semantic_packs(
+            &catalog,
+            &JvmDependencyPackAdapter,
+            &discovered.dependencies,
+            &limits,
+            None,
+        );
+        assert_eq!(reused.packs.len(), 1, "{reused:#?}");
+        assert_eq!(reused.profile.generated_packs, 0, "{reused:#?}");
+        assert_eq!(reused.evidence, prepared.evidence);
+    }
+
+    #[test]
+    fn missing_jmod_after_discovery_is_an_honest_preparation_failure() {
+        use crate::analyzer::JvmStandardLibraryDiscoveryConfig;
+        use crate::analyzer::semantic_model::{
+            CatalogOptions, SemanticPackCatalog, prepare_dependency_semantic_packs,
+        };
+
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path().join("jdk");
+        fs::create_dir_all(home.join("jmods")).unwrap();
+        fs::write(home.join("release"), "JAVA_VERSION=\"21.0.8\"\n").unwrap();
+        fs::write(home.join("jmods/java.base.jmod"), b"not a jmod").unwrap();
+        let config = JvmAnalyzerConfig {
+            standard_library_discovery: JvmStandardLibraryDiscoveryConfig {
+                jdk_homes: vec![home.clone()],
+                discover_java_home: false,
+                ..Default::default()
+            },
+            ..JvmAnalyzerConfig::default()
+        };
+        let project = TestProject::new(root.path(), Language::Java);
+        let limits = DependencyPackLimits::default();
+        let discovered = resolve_jvm_semantic_pack_dependencies(&config, &project, &limits, None);
+        assert_eq!(discovered.dependencies.len(), 1);
+        fs::remove_file(home.join("jmods/java.base.jmod")).unwrap();
+        let catalog = SemanticPackCatalog::open_ephemeral(CatalogOptions::default()).unwrap();
+        let prepared = prepare_dependency_semantic_packs(
+            &catalog,
+            &JvmDependencyPackAdapter,
+            &discovered.dependencies,
+            &limits,
+            None,
+        );
+        assert!(!prepared.complete);
+        assert!(prepared.packs.is_empty());
+        assert!(
+            prepared
+                .diagnostics
+                .iter()
+                .any(|diagnostic| { diagnostic.code == "artifact.metadata" })
+        );
+    }
+
+    #[test]
+    fn incomplete_kotlin_classification_never_falls_through_to_java() {
+        let temp = tempfile::tempdir().unwrap();
+        let source_jar = temp.path().join("unknown-sources.jar");
+        File::create(&source_jar)
+            .unwrap()
+            .set_len(MAX_ARTIFACT_BYTES + 1)
+            .unwrap();
+        let invalid_jar = temp.path().join("invalid-sources.jar");
+        fs::write(&invalid_jar, b"not a ZIP archive").unwrap();
+        for path in [source_jar, invalid_jar] {
+            let dependency = resolved_semantic_pack_dependency(ResolvedJvmArtifact {
+                artifact_path: temp.path().join("unknown.jar"),
+                source_artifact_path: Some(path),
+                coordinate: Some(JvmMavenCoordinate::new("example", "unknown", "1.0.0")),
+                origin: JvmDependencyOrigin::ExplicitPath,
+            });
+
+            assert_eq!(dependency.evidence.language, "kotlin");
+            assert_eq!(
+                dependency.artifacts[0].kind,
+                ExternalArtifactKind::KotlinSourceJar
+            );
+            assert!(dependency.provenance.iter().any(|entry| {
+                entry.key == "kotlin.classification" && entry.value == "incomplete"
+            }));
+        }
+    }
+
+    #[test]
+    fn unresolved_jvm_coordinate_is_actionable_incomplete_discovery() {
+        use crate::analyzer::semantic_model::{
+            DependencyPackLimits, prepare_discovered_dependency_semantic_packs,
+        };
+
+        let root = tempfile::tempdir().unwrap();
+        let project = TestProject::new(root.path(), Language::Java);
+        let config = JvmAnalyzerConfig {
+            external_dependencies: JvmExternalDependencies {
+                coordinates: vec![JvmMavenCoordinate {
+                    group_id: "com.example".to_owned(),
+                    artifact_id: "missing".to_owned(),
+                    version: "1.0.0".to_owned(),
+                }],
+                repository_roots: vec![root.path().join("repository")],
+                ..JvmExternalDependencies::default()
+            },
+            dependency_discovery: crate::analyzer::JvmDependencyDiscoveryConfig {
+                mode: JvmDependencyDiscoveryMode::Disabled,
+                ..crate::analyzer::JvmDependencyDiscoveryConfig::default()
+            },
+            standard_library_discovery: crate::analyzer::JvmStandardLibraryDiscoveryConfig {
+                discover_java_home: false,
+                ..Default::default()
+            },
+        };
+        let limits = DependencyPackLimits::default();
+        let discovery = resolve_jvm_semantic_pack_dependencies(&config, &project, &limits, None);
+
+        assert!(!discovery.complete);
+        assert!(discovery.dependencies.is_empty());
+        assert_eq!(discovery.diagnostics[0].code, "jvm.dependency_unresolved");
+        let catalog = crate::analyzer::semantic_model::SemanticPackCatalog::open_ephemeral(
+            Default::default(),
+        )
+        .unwrap();
+        let prepared = prepare_discovered_dependency_semantic_packs(
+            &catalog,
+            &JvmDependencyPackAdapter,
+            discovery,
+            &limits,
+            None,
+        );
+        assert!(!prepared.complete);
+        assert!(
+            prepared
+                .compose_activation_request(
+                    crate::analyzer::semantic_model::SemanticModelActivationRequest {
+                        bifrost_version: Version::parse(env!("CARGO_PKG_VERSION")).unwrap(),
+                        evidence: Vec::new(),
+                        controls: Vec::new(),
+                        limits: Default::default(),
+                    }
+                )
+                .is_none()
+        );
+    }
+    #[cfg_attr(not(scheduled_tests), ignore = "scheduled-only")]
+    #[test]
+    fn java_dependency_discovery_indexes_exact_maven_pom_coordinate() {
+        let Some(fixture) = ExternalJarFixture::new(true) else {
+            return;
+        };
+        let app = ProjectFile::new(fixture.project_root().to_path_buf(), "src/App.java");
+        app.write(
+            "package app; import com.example.dep.ExternalService; class App { ExternalService service; }",
+        )
+        .unwrap();
+        ProjectFile::new(fixture.project_root().to_path_buf(), "pom.xml")
+            .write(
+                "<project><groupId>app</groupId><artifactId>app</artifactId><version>1</version><dependencies><dependency><groupId>com.example</groupId><artifactId>external-lib</artifactId><version>1.2.3</version></dependency></dependencies></project>",
+            )
+            .unwrap();
+        let config = AnalyzerConfig {
+            jvm: JvmAnalyzerConfig {
+                external_dependencies: JvmExternalDependencies {
+                    repository_roots: vec![fixture.maven_repository_root()],
+                    ..JvmExternalDependencies::default()
+                },
+                ..JvmAnalyzerConfig::default()
+            },
+            ..AnalyzerConfig::default()
+        };
+        let analyzer = JavaAnalyzer::from_project_with_config(
+            TestProject::new(fixture.project_root().to_path_buf(), Language::Java),
+            config,
+        );
+        let scope = AnalyzerQueryScope::new(&analyzer);
+        let token = scope.token();
+        assert!(analyzer.is_known_type_name_in_file(token, None, &app, "ExternalService"));
+    }
+
+    #[test]
+    fn java_dependency_discovery_indexes_only_locked_gradle_coordinate_directory() {
+        let Some(fixture) = ExternalJarFixture::new(true) else {
+            return;
+        };
+        let gradle_cache = fixture.root.join("gradle-cache");
+        let locked_dir = gradle_cache.join("com.example/external-lib/1.2.3/binary-hash");
+        let source_dir = gradle_cache.join("com.example/external-lib/1.2.3/source-hash");
+        let unrelated_dir = gradle_cache.join("unrelated/example/9.9.9/hash");
+        fs::create_dir_all(&locked_dir).unwrap();
+        fs::create_dir_all(&source_dir).unwrap();
+        fs::create_dir_all(&unrelated_dir).unwrap();
+        fs::copy(fixture.binary_jar_path(), locked_dir.join(BINARY_JAR)).unwrap();
+        fs::copy(fixture.source_jar_path(), source_dir.join(SOURCE_JAR)).unwrap();
+        fs::copy(
+            fixture.binary_jar_path(),
+            unrelated_dir.join("example-9.9.9.jar"),
+        )
+        .unwrap();
+
+        let app = ProjectFile::new(fixture.project_root().to_path_buf(), "src/App.java");
+        app.write(
+            "package app; import com.example.dep.ExternalService; class App { ExternalService service; }",
+        )
+        .unwrap();
+        ProjectFile::new(fixture.project_root().to_path_buf(), "gradle.lockfile")
+            .write("com.example:external-lib:1.2.3=compileClasspath\n")
+            .unwrap();
+        let config = AnalyzerConfig {
+            jvm: JvmAnalyzerConfig {
+                external_dependencies: JvmExternalDependencies {
+                    repository_roots: vec![fixture.root.join("empty-maven")],
+                    gradle_cache_roots: vec![gradle_cache],
+                    ..JvmExternalDependencies::default()
+                },
+                ..JvmAnalyzerConfig::default()
+            },
+            ..AnalyzerConfig::default()
+        };
+        let analyzer = JavaAnalyzer::from_project_with_config(
+            TestProject::new(fixture.project_root().to_path_buf(), Language::Java),
+            config,
+        );
+        let scope = AnalyzerQueryScope::new(&analyzer);
+        let token = scope.token();
+        let resolution = analyzer
+            .resolve_type_name_with_external(token, None, &app, "ExternalService")
+            .unwrap();
+        let crate::analyzer::java::imports::JavaTypeResolution::External(external) = resolution
+        else {
+            panic!("dependency should resolve externally");
+        };
+        assert!(matches!(
+            external.source(),
+            JvmExternalDeclarationSource::SourceJar { .. }
+        ));
+    }
+
+    #[test]
+    fn java_dependency_discovery_skips_classifier_only_gradle_cache_entries() {
+        let Some(fixture) = ExternalJarFixture::new(false) else {
+            return;
+        };
+        let gradle_cache = fixture.root.join("gradle-cache");
+        let classifier_dir = gradle_cache.join("com.example/external-lib/1.2.3/classifier-hash");
+        fs::create_dir_all(&classifier_dir).unwrap();
+        fs::copy(
+            fixture.binary_jar_path(),
+            classifier_dir.join("external-lib-1.2.3-tests.jar"),
+        )
+        .unwrap();
+
+        let config = JvmExternalDependencies {
+            coordinates: vec![JvmMavenCoordinate::new(
+                "com.example",
+                "external-lib",
+                "1.2.3",
+            )],
+            gradle_cache_roots: vec![gradle_cache],
+            ..JvmExternalDependencies::default()
+        };
+        let index = JvmExternalDeclarationIndex::build(&config, fixture.project_root());
+        assert!(index.is_empty());
+    }
+    #[cfg_attr(not(scheduled_tests), ignore = "scheduled-only")]
+    #[test]
+    fn java_dependency_discovery_disabled_keeps_metadata_out_of_index() {
+        let Some(fixture) = ExternalJarFixture::new(false) else {
+            return;
+        };
+        let app = ProjectFile::new(fixture.project_root().to_path_buf(), "src/App.java");
+        app.write(
+            "package app; import com.example.dep.ExternalService; class App { ExternalService service; }",
+        )
+        .unwrap();
+        ProjectFile::new(fixture.project_root().to_path_buf(), "pom.xml")
+            .write(
+                "<project><dependencies><dependency><groupId>com.example</groupId><artifactId>external-lib</artifactId><version>1.2.3</version></dependency></dependencies></project>",
+            )
+            .unwrap();
+        let config = AnalyzerConfig {
+            jvm: JvmAnalyzerConfig {
+                external_dependencies: JvmExternalDependencies {
+                    repository_roots: vec![fixture.maven_repository_root()],
+                    ..JvmExternalDependencies::default()
+                },
+                dependency_discovery: crate::analyzer::JvmDependencyDiscoveryConfig {
+                    mode: crate::analyzer::JvmDependencyDiscoveryMode::Disabled,
+                    ..crate::analyzer::JvmDependencyDiscoveryConfig::default()
+                },
+                standard_library_discovery: crate::analyzer::JvmStandardLibraryDiscoveryConfig {
+                    discover_java_home: false,
+                    ..Default::default()
+                },
+            },
+            ..AnalyzerConfig::default()
+        };
+        let analyzer = JavaAnalyzer::from_project_with_config(
+            TestProject::new(fixture.project_root().to_path_buf(), Language::Java),
+            config,
+        );
+        let scope = AnalyzerQueryScope::new(&analyzer);
+        let token = scope.token();
+        assert!(!analyzer.is_known_type_name_in_file(token, None, &app, "ExternalService"));
+    }
+
+    #[test]
+    fn java_dependency_discovery_invalidates_only_for_build_inputs() {
+        let Some(fixture) = ExternalJarFixture::new(false) else {
+            return;
+        };
+        let app = ProjectFile::new(fixture.project_root().to_path_buf(), "src/App.java");
+        app.write(
+            "package app; import com.example.dep.ExternalService; class App { ExternalService service; }",
+        )
+        .unwrap();
+        let pom = ProjectFile::new(fixture.project_root().to_path_buf(), "pom.xml");
+        pom.write("<project><dependencies><dependency><groupId>com.example</groupId><artifactId>external-lib</artifactId></dependency></dependencies></project>")
+            .unwrap();
+        let config = AnalyzerConfig {
+            jvm: JvmAnalyzerConfig {
+                external_dependencies: JvmExternalDependencies {
+                    repository_roots: vec![fixture.maven_repository_root()],
+                    ..JvmExternalDependencies::default()
+                },
+                ..JvmAnalyzerConfig::default()
+            },
+            ..AnalyzerConfig::default()
+        };
+        let analyzer = JavaAnalyzer::from_project_with_config(
+            TestProject::new(fixture.project_root().to_path_buf(), Language::Java),
+            config,
+        );
+        let scope = AnalyzerQueryScope::new(&analyzer);
+        let token = scope.token();
+        assert!(!analyzer.is_known_type_name_in_file(token, None, &app, "ExternalService"));
+        let initial_index = analyzer.external_index.clone();
+
+        pom.write("<project><dependencies><dependency><groupId>com.example</groupId><artifactId>external-lib</artifactId><version>1.2.3</version></dependency></dependencies></project>")
+            .unwrap();
+        let updated = analyzer.update(&BTreeSet::from([pom.clone()]));
+        assert!(!Arc::ptr_eq(&initial_index, &updated.external_index));
+        assert!(updated.is_known_type_name_in_file(token, None, &app, "ExternalService"));
+
+        app.write(
+            "package app; import com.example.dep.ExternalService; class App { ExternalService changed; }",
+        )
+        .unwrap();
+        let java_only = updated.update(&BTreeSet::from([app]));
+        assert!(Arc::ptr_eq(
+            &updated.external_index,
+            &java_only.external_index
+        ));
+        let refreshed = java_only.update_all();
+        assert!(!Arc::ptr_eq(
+            &java_only.external_index,
+            &refreshed.external_index
+        ));
+    }
+
+    #[test]
+    fn java_dependency_discovery_routes_manifest_changes_through_multi_analyzer() {
+        let Some(fixture) = ExternalJarFixture::new(false) else {
+            return;
+        };
+        let app = ProjectFile::new(fixture.project_root().to_path_buf(), "src/App.java");
+        app.write(
+            "package app; import com.example.dep.ExternalService; class App { ExternalService service; }",
+        )
+        .unwrap();
+        ProjectFile::new(fixture.project_root().to_path_buf(), "tool.py")
+            .write("def tool():\n    pass\n")
+            .unwrap();
+        let pom = ProjectFile::new(fixture.project_root().to_path_buf(), "pom.xml");
+        pom.write("<project/>").unwrap();
+        let project = TestProject::with_languages(
+            fixture.project_root().to_path_buf(),
+            BTreeSet::from([Language::Java, Language::Python]),
+        );
+        let config = AnalyzerConfig {
+            jvm: JvmAnalyzerConfig {
+                external_dependencies: JvmExternalDependencies {
+                    repository_roots: vec![fixture.maven_repository_root()],
+                    ..JvmExternalDependencies::default()
+                },
+                ..JvmAnalyzerConfig::default()
+            },
+            ..AnalyzerConfig::default()
+        };
+        let multi = MultiAnalyzer::new(BTreeMap::from([
+            (
+                Language::Java,
+                AnalyzerDelegate::Java(JavaAnalyzer::from_project_with_config(
+                    project.clone(),
+                    config,
+                )),
+            ),
+            (
+                Language::Python,
+                AnalyzerDelegate::Python(PythonAnalyzer::from_project(project)),
+            ),
+        ]));
+        let java = resolve_analyzer::<JavaAnalyzer>(&multi).unwrap();
+        let scope = AnalyzerQueryScope::new(&multi);
+        let token = scope.token();
+        assert!(!java.is_known_type_name_in_file(token, None, &app, "ExternalService"));
+
+        pom.write("<project><dependencies><dependency><groupId>com.example</groupId><artifactId>external-lib</artifactId><version>1.2.3</version></dependency></dependencies></project>")
+            .unwrap();
+        let updated = multi.update(&BTreeSet::from([pom]));
+        let java = resolve_analyzer::<JavaAnalyzer>(&updated).unwrap();
+        assert!(java.is_known_type_name_in_file(token, None, &app, "ExternalService"));
+    }
+
+    #[test]
+    fn jvm_external_declaration_omits_kotlin_types_a_consumer_cannot_name() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let index = kotlin_source_jar_index(&root);
+
+        // `internal` is module-scoped and `private` is file-scoped, so neither
+        // is nameable from a different artifact.
+        assert!(index.get("kotlin.example.ModulePrivate").is_none());
+        assert!(index.get("kotlin.example.FilePrivate").is_none());
+        assert!(index.get("kotlin.example.Dependency.Hidden").is_none());
+
+        // The index answers "does this *type* exist"; top-level callables are
+        // not types, and the JVM facade Kotlin generates for them
+        // (`DependencyKt`) is a compiler artifact that never appears in a
+        // Kotlin identity.
+        assert!(index.get("kotlin.example.topLevelHelper").is_none());
+        assert!(index.get("kotlin.example.DependencyKt").is_none());
+    }
+
+    #[test]
+    fn kotlin_analyzer_shares_the_jvm_dependency_realm() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let workspace_root = root.join("workspace");
+        fs::create_dir_all(&workspace_root).unwrap();
+        let source_jar = root.join("kotlin-library-sources.jar");
+        write_zip_entry(
+            &source_jar,
+            "kotlin/example/Dependency.kt",
+            KOTLIN_DEPENDENCY_SOURCE.as_bytes(),
+        );
+
+        ProjectFile::new(workspace_root.clone(), "src/App.kt")
+            .write("package app\n\nimport kotlin.example.Dependency\n\nclass App\n")
+            .unwrap();
+
+        let config = AnalyzerConfig {
+            jvm: JvmAnalyzerConfig {
+                external_dependencies: JvmExternalDependencies {
+                    artifact_paths: vec![JvmExternalArtifact {
+                        artifact_path: source_jar,
+                        source_artifact_path: None,
+                        ..JvmExternalArtifact::default()
+                    }],
+                    ..JvmExternalDependencies::default()
+                },
+                ..JvmAnalyzerConfig::default()
+            },
+            ..AnalyzerConfig::default()
+        };
+        let analyzer = crate::analyzer::KotlinAnalyzer::new_with_config(
+            Arc::new(TestProject::new(workspace_root, Language::Kotlin)),
+            config,
+        );
+
+        let index = analyzer.external_declaration_index();
+        assert!(
+            index
+                .resolve_explicit_import("kotlin.example.Dependency", "app")
+                .is_some(),
+            "the Kotlin analyzer must read the same jar-backed index Java and Scala use"
+        );
+        assert!(
+            index
+                .resolve_explicit_import("kotlin.example.ModulePrivate", "app")
+                .is_none()
+        );
     }
 
     #[test]
@@ -7213,250 +7730,5 @@ mod tests {
                 .iter()
                 .all(|file| !file.rel_path().to_string_lossy().contains(".jar"))
         );
-    }
-
-    /// Two workspaces over one unchanged dependency universe share one built
-    /// index through the process-wide memo; changing a resolved artifact's
-    /// bytes changes the evidence and rebuilds.
-    #[test]
-    fn build_for_project_memoizes_on_dependency_discovery_evidence() {
-        let temp = tempfile::tempdir().unwrap();
-        let root = temp.path().canonicalize().unwrap();
-        let repo_dir = root.join("m2").join(GROUP_PATH);
-        fs::create_dir_all(&repo_dir).unwrap();
-        for workspace in ["workspace-a", "workspace-b"] {
-            fs::create_dir_all(root.join(workspace)).unwrap();
-        }
-        probe_class_jar(&repo_dir.join(BINARY_JAR));
-        let config = JvmAnalyzerConfig {
-            external_dependencies: JvmExternalDependencies {
-                coordinates: vec![JvmMavenCoordinate::new(
-                    "com.example",
-                    "external-lib",
-                    "1.2.3",
-                )],
-                repository_roots: vec![root.join("m2")],
-                ..JvmExternalDependencies::default()
-            },
-            ..JvmAnalyzerConfig::default()
-        };
-        let first = JvmExternalDeclarationIndex::build_for_project(
-            &config,
-            &TestProject::new(root.join("workspace-a"), Language::Java),
-        );
-        let second = JvmExternalDeclarationIndex::build_for_project(
-            &config,
-            &TestProject::new(root.join("workspace-b"), Language::Java),
-        );
-        assert!(
-            Arc::ptr_eq(&first, &second),
-            "identical dependency-discovery evidence must share one built index"
-        );
-
-        write_test_class_jar(
-            &repo_dir.join(BINARY_JAR),
-            &[TestClassFile {
-                internal_name: "com/example/probe/Replaced",
-                super_internal_name: "java/lang/Object",
-                methods: &[],
-                private_nested: false,
-            }],
-        );
-        let third = JvmExternalDeclarationIndex::build_for_project(
-            &config,
-            &TestProject::new(root.join("workspace-a"), Language::Java),
-        );
-        assert!(
-            !Arc::ptr_eq(&first, &third),
-            "a changed resolved artifact must rebuild the index"
-        );
-        assert!(
-            third
-                .resolve_qualified_name("com.example.probe.Replaced", "")
-                .is_some(),
-            "the rebuilt index must read the replaced artifact"
-        );
-    }
-
-    struct ExternalJarFixture {
-        _temp: tempfile::TempDir,
-        root: PathBuf,
-        workspace_root: PathBuf,
-    }
-
-    impl ExternalJarFixture {
-        fn new(include_sources: bool) -> Option<Self> {
-            if !jdk_tool_available("javac") || !jdk_tool_available("jar") {
-                eprintln!(
-                    "skipping Java external declaration fixture test: `javac` and `jar` are required"
-                );
-                return None;
-            }
-
-            let temp = tempfile::tempdir().unwrap();
-            let root = temp.path().canonicalize().unwrap();
-            let workspace_root = root.join("workspace");
-            let repo_dir = root.join("m2").join(GROUP_PATH);
-            let source_dir = root.join("dep-src");
-            let package_dir = source_dir.join("com/example/dep");
-            let other_package_dir = source_dir.join("com/example/other");
-            let classes_dir = root.join("dep-classes");
-            fs::create_dir_all(&workspace_root).unwrap();
-            fs::create_dir_all(&repo_dir).unwrap();
-            fs::create_dir_all(&package_dir).unwrap();
-            fs::create_dir_all(&other_package_dir).unwrap();
-            fs::create_dir_all(&classes_dir).unwrap();
-
-            fs::write(
-                package_dir.join("ExternalService.java"),
-                "package com.example.dep;\n\
-                 public class ExternalService {\n\
-                   public String echo(String name) { return name; }\n\
-                   public static class Nested {}\n\
-                   protected static class ProtectedNested {}\n\
-                   static class PackageNested {}\n\
-                   private static class Hidden { public static class Leaks {} }\n\
-                 }\n",
-            )
-            .unwrap();
-            fs::write(
-                package_dir.join("ExternalInterface.java"),
-                "package com.example.dep; public interface ExternalInterface {}\n",
-            )
-            .unwrap();
-            fs::write(
-                package_dir.join("ExternalHelper.java"),
-                "package com.example.dep; public class ExternalHelper {}\n",
-            )
-            .unwrap();
-            fs::write(
-                package_dir.join("PackageHelper.java"),
-                "package com.example.dep; class PackageHelper {}\n",
-            )
-            .unwrap();
-            fs::write(
-                package_dir.join("PackageOuter.java"),
-                "package com.example.dep; class PackageOuter { public static class Nested {} }\n",
-            )
-            .unwrap();
-            fs::write(
-                package_dir.join("PublicApi.java"),
-                "package com.example.dep; public interface PublicApi { interface Callback {} }\n",
-            )
-            .unwrap();
-            fs::write(
-                package_dir.join("Foo.java"),
-                "package com.example.dep; public class Foo {}\n",
-            )
-            .unwrap();
-            fs::write(
-                other_package_dir.join("Foo.java"),
-                "package com.example.other; public class Foo {}\n",
-            )
-            .unwrap();
-
-            run(Command::new("javac")
-                .arg("-d")
-                .arg(&classes_dir)
-                .arg(package_dir.join("ExternalService.java"))
-                .arg(package_dir.join("ExternalInterface.java"))
-                .arg(package_dir.join("ExternalHelper.java"))
-                .arg(package_dir.join("PackageHelper.java"))
-                .arg(package_dir.join("PackageOuter.java"))
-                .arg(package_dir.join("PublicApi.java"))
-                .arg(package_dir.join("Foo.java"))
-                .arg(other_package_dir.join("Foo.java")));
-            run(Command::new("jar")
-                .current_dir(&classes_dir)
-                .arg("cf")
-                .arg(repo_dir.join(BINARY_JAR))
-                .arg("."));
-            if include_sources {
-                run(Command::new("jar")
-                    .current_dir(&source_dir)
-                    .arg("cf")
-                    .arg(repo_dir.join(SOURCE_JAR))
-                    .arg("."));
-            }
-
-            Some(Self {
-                _temp: temp,
-                root,
-                workspace_root,
-            })
-        }
-
-        fn project_root(&self) -> &Path {
-            &self.workspace_root
-        }
-
-        fn source_jar_path(&self) -> PathBuf {
-            self.root.join("m2").join(GROUP_PATH).join(SOURCE_JAR)
-        }
-
-        fn binary_jar_path(&self) -> PathBuf {
-            self.root.join("m2").join(GROUP_PATH).join(BINARY_JAR)
-        }
-
-        fn maven_repository_root(&self) -> PathBuf {
-            self.root.join("m2")
-        }
-
-        fn coordinate_config(&self) -> JvmExternalDependencies {
-            JvmExternalDependencies {
-                coordinates: vec![JvmMavenCoordinate::new(
-                    "com.example",
-                    "external-lib",
-                    "1.2.3",
-                )],
-                repository_roots: vec![self.root.join("m2")],
-                ..JvmExternalDependencies::default()
-            }
-        }
-    }
-
-    fn jdk_tool_available(tool: &str) -> bool {
-        Command::new(tool)
-            .arg("--version")
-            .output()
-            .is_ok_and(|output| output.status.success())
-    }
-
-    fn run(command: &mut Command) {
-        let output = command
-            .output()
-            .unwrap_or_else(|err| panic!("failed to run JDK fixture command {command:?}: {err}"));
-        assert!(
-            output.status.success(),
-            "JDK fixture command failed: {command:?}\nstdout:\n{}\nstderr:\n{}",
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
-        );
-    }
-
-    fn write_zip_entry(path: &Path, entry_name: &str, bytes: &[u8]) {
-        let file = File::create(path).unwrap();
-        let mut zip = zip::ZipWriter::new(file);
-        zip.start_file(
-            entry_name,
-            SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored),
-        )
-        .unwrap();
-        zip.write_all(bytes).unwrap();
-        zip.finish().unwrap();
-    }
-
-    fn write_zip_entries(path: &Path, entries: &[(&str, &[u8])]) {
-        let file = File::create(path).unwrap();
-        let mut zip = zip::ZipWriter::new(file);
-        for (entry_name, bytes) in entries {
-            zip.start_file(
-                *entry_name,
-                SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored),
-            )
-            .unwrap();
-            zip.write_all(bytes).unwrap();
-        }
-        zip.finish().unwrap();
     }
 }

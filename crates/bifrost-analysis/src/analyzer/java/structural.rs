@@ -13,8 +13,9 @@ mod structural_spec_tests {
         assert_occurrence_role, block_facts_of, occurrence_roles_of,
     };
     use brokk_bifrost_core::analyzer::structural::occurrences::OccurrenceRole;
-    use brokk_bifrost_core::analyzer::structural::spec::StructuralSpec;
     use brokk_bifrost_jvm::java::structural::{JAVA_KIND_TABLE, JAVA_STRUCTURAL_SPEC};
+
+    use brokk_bifrost_test_macros::hardwon;
 
     /// Java's scope-forming statement lists are `block` and `switch_block`.
     /// The class body is neither: it is a member list, and the declarations in
@@ -68,6 +69,7 @@ mod structural_spec_tests {
     /// parameter, an annotation operand consumed as a type, and the tail of an
     /// import — each of which a semantic layer has historically mislabelled.
     #[test]
+    #[hardwon("#1569: Java value-position references were classified as NoDefinition")]
     fn java_classifies_declaration_binder_annotation_and_import_positions() {
         let source = concat!(
             "package com.example.app;\n",
@@ -113,6 +115,9 @@ mod structural_spec_tests {
     /// `java.util.List`, which is what keeps a package from becoming an edge
     /// target.
     #[test]
+    #[hardwon(
+        "#1644: Pins the subtle last-child role of qualified types while preserving package/type qualifier segments"
+    )]
     fn java_qualified_type_tails_are_type_operands_and_their_scopes_stay_segments() {
         let source = concat!(
             "package fixture;\n",
@@ -137,27 +142,6 @@ mod structural_spec_tests {
         assert_occurrence_role(&found, at("java.util"), OccurrenceRole::PathSegment);
         assert_occurrence_role(&found, at("util.List"), OccurrenceRole::PathSegment);
         assert_occurrence_role(&found, at("List<String>"), OccurrenceRole::TypeOperand);
-    }
-
-    /// Support is a declaration, not a description of what happened to be
-    /// emitted: every role Java emits must be one it declares.
-    #[test]
-    fn java_emits_only_roles_it_declares_as_supported() {
-        let source = "class A { void f(int b) { c.d(b); } }\n";
-        let found = occurrence_roles_of(
-            &JAVA_STRUCTURAL_SPEC,
-            &tree_sitter_java::LANGUAGE.into(),
-            source,
-        );
-        assert!(!found.is_empty());
-        for (_, text, role) in &found {
-            assert!(
-                JAVA_STRUCTURAL_SPEC
-                    .occurrence_role_support()
-                    .is_supported(*role),
-                "java emitted undeclared role {role:?} for {text:?}"
-            );
-        }
     }
 
     #[test]

@@ -1,0 +1,133 @@
+{
+  "schema_version": 2,
+  "pack_id": "bifrost.rust-url",
+  "version": "0.1.0",
+  "producer": {
+    "name": "bifrost-reviewed-codeql-rust-parity",
+    "version": "0.1.0"
+  },
+  "language": "rust",
+  "ecosystem": "cargo",
+  "compatibility": {
+    "bifrost": ">=0.12.0, <1.0.0",
+    "toolchains": []
+  },
+  "provenance": {
+    "source": "url crate Url::parse result flow used by the CodeQL Rust parity models",
+    "revision": "url-api-shape"
+  },
+  "license": "Apache-2.0",
+  "completeness": "complete",
+  "safety": {
+    "generated_code_only": false,
+    "review_required": false
+  },
+  "shards": [
+    {
+      "id": "declarations.rust-url",
+      "activation": [
+        {
+          "targets": [],
+          "configurations": []
+        }
+      ],
+      "payload": {
+        "kind": "declaration_facts",
+        "types": [
+          {
+            "id": "type.rust-url",
+            "name": "url",
+            "type_kind": "module",
+            "visibility": "public",
+            "locator": {
+              "kind": "artifact",
+              "path": "src/lib.rs",
+              "symbol": "url"
+            }
+          },
+          {
+            "id": "type.rust-url-url",
+            "name": "url.Url",
+            "type_kind": "struct",
+            "visibility": "public",
+            "locator": {
+              "kind": "artifact",
+              "path": "src/url.rs",
+              "symbol": "url.Url"
+            }
+          }
+        ],
+        "members": [
+          {
+            "id": "member.rust-url-url-parse",
+            "owner": "type.rust-url-url",
+            "name": "parse",
+            "member_kind": "method",
+            "visibility": "public",
+            "is_static": true,
+            "callable_family_complete": true,
+            "signature": {
+              "parameters": [
+                {
+                  "name": "input",
+                  "type": {
+                    "kind": "named",
+                    "name": "untyped"
+                  }
+                }
+              ],
+              "returns": {
+                "kind": "named",
+                "name": "std.result.Result"
+              }
+            },
+            "locator": {
+              "kind": "artifact",
+              "path": "src/parser.rs",
+              "symbol": "url.Url.parse"
+            }
+          }
+        ],
+        "relations": []
+      }
+    },
+    {
+      "id": "summaries.rust-url",
+      "activation": [
+        {
+          "targets": [],
+          "configurations": []
+        }
+      ],
+      "payload": {
+        "kind": "procedure_summaries",
+        "summaries": [
+          {
+            "id": "summary.rust-url-url-parse",
+            "target": {
+              "path": "src/parser.rs",
+              "symbol": "url.Url.parse",
+              "has_receiver": false,
+              "parameter_count": 1
+            },
+            "completeness": "complete",
+            "locations": [],
+            "transfers": [
+              {
+                "input": {
+                  "kind": "parameter",
+                  "ordinal": 0
+                },
+                "exit_kind": "normal",
+                "output": {
+                  "kind": "normal_return"
+                }
+              }
+            ],
+            "effects": []
+          }
+        ]
+      }
+    }
+  ]
+}

@@ -4,6 +4,7 @@ pub use annotation::{
     JavaAnnotationTypeResolution, JavaAnnotationTypeStatus, resolve_java_annotation_type,
 };
 mod cache;
+mod call_applicability;
 mod call_conversion;
 pub use call_conversion::{JavaLocalAssignmentConversionProver, JavaLocalAssignmentEvidence};
 mod checked_exceptions;
@@ -11,6 +12,8 @@ pub(crate) use call_conversion::{
     JavaFormalShape, declaration_declares_array, declared_type_node, formal_shapes,
     parse_declaring_file, primitive_actual_type, primitive_converts, primitive_for_name,
 };
+#[cfg(any(test, feature = "test-support"))]
+pub(crate) use call_conversion::{primitive_actual_type_from_syntax, primitive_type};
 mod clones;
 pub(crate) mod diagnostics;
 mod hierarchy;
@@ -37,17 +40,17 @@ use crate::analyzer::store::LimitedQueryRows;
 use crate::analyzer::{AnalyzerQueryScope, QueryScope};
 pub use brokk_bifrost_jvm::java::structural::{
     JavaCallResultUse, JavaCallResultUseIndex, JavaCallResultUseOpen,
+    JavaCallResultUseRelationIndex, java_call_result_use_site, java_plain_string_literal,
 };
 
-use crate::analyzer::clone_detection::{
-    CloneCandidateProfile, detect_structural_clone_smells, refine_clone_similarity_with_ast,
-};
+use crate::analyzer::clone_detection::detect_language_structural_clone_smells;
 use crate::analyzer::common::{is_unparseable_source, language_for_file as file_language};
 use crate::analyzer::languages::{
     DeadCodeBulkEdges, DeadCodeBulkPreflight, DeadCodeBulkProof, DeadCodeRouting, DeadCodeSupport,
     EdgePassId, EdgeSiteScanCtx, EdgeWeightScanCtx, LanguageEdgePass, LanguageEdgeSites,
     LanguageEdgeWeights, LanguageSupport, PatternBindingNameProvider, ProcedureSyntaxRoles,
-    analyzable_file_count, fqn_bulk_nodes, overloaded_function_fqns, package_fq_name,
+    analyzable_file_count, build_fqn_bulk_edges, overloaded_function_fqns, package_fq_name,
+    ready_preflight,
 };
 use crate::analyzer::loop_facts::{LoopKind, LoopSyntax};
 use crate::analyzer::semantic::ProcedureKind;
@@ -70,7 +73,9 @@ use std::sync::{Arc, Mutex};
 
 use crate::analyzer::java::imports::JavaTypeResolution;
 use crate::analyzer::jvm::dependency_discovery::is_jvm_dependency_input;
-use crate::analyzer::jvm::external::{JvmExternalDeclarationIndex, JvmExternalDeclarations};
+use crate::analyzer::jvm::external::{
+    JvmExternalDeclarationIndex, JvmExternalDeclarations, jvm_external_qualified_name_exists,
+};
 use crate::analyzer::jvm::retained_external_index_state;
 use crate::analyzer::structural::resolution::{BoundaryStatus, PrecedenceTier};
 pub(crate) use adapter::JavaAdapter;
@@ -105,6 +110,15 @@ pub struct JavaAnalyzer {
 crate::analyzer::impl_forward_query_provider!(JavaAnalyzer);
 
 impl JavaAnalyzer {
+    pub(crate) fn update_all_with_progress(&self, progress: Option<BuildProgress>) -> Self {
+        Self {
+            inner: self.inner.update_all_with_progress(progress),
+            memo_caches: Arc::new(JavaMemoCaches::new(self.memo_caches.budget_bytes())),
+            java_config: self.java_config.clone(),
+            external_index: Arc::new(std::sync::OnceLock::new()),
+        }
+    }
+
     pub(crate) fn selected_jdk_home_for_file(
         &self,
         file: &ProjectFile,
@@ -149,15 +163,17 @@ impl JavaAnalyzer {
     }
 
     pub fn new_with_config(project: Arc<dyn Project>, config: AnalyzerConfig) -> Self {
-        let memo_budget = config.memo_cache_budget_bytes();
         let java_config = config.jvm.clone();
-        let inner = TreeSitterAnalyzer::new_with_config(project, JavaAdapter, config);
-        Self {
-            inner,
-            memo_caches: Arc::new(JavaMemoCaches::new(memo_budget)),
-            java_config,
-            external_index: Arc::new(std::sync::OnceLock::new()),
-        }
+        TreeSitterAnalyzer::wrap_with_config(
+            config,
+            |config| TreeSitterAnalyzer::new_with_config(project, JavaAdapter, config),
+            |inner, memo_budget| Self {
+                inner,
+                memo_caches: Arc::new(JavaMemoCaches::new(memo_budget)),
+                java_config,
+                external_index: Arc::new(std::sync::OnceLock::new()),
+            },
+        )
     }
 
     pub fn new_with_progress<F>(project: Arc<dyn Project>, progress: F) -> Self
@@ -175,20 +191,24 @@ impl JavaAnalyzer {
     where
         F: Fn(BuildProgressEvent) + Send + Sync + 'static,
     {
-        let memo_budget = config.memo_cache_budget_bytes();
         let java_config = config.jvm.clone();
-        let inner = TreeSitterAnalyzer::new_with_config_and_progress(
-            project,
-            JavaAdapter,
+        TreeSitterAnalyzer::wrap_with_config(
             config,
-            progress,
-        );
-        Self {
-            inner,
-            memo_caches: Arc::new(JavaMemoCaches::new(memo_budget)),
-            java_config,
-            external_index: Arc::new(std::sync::OnceLock::new()),
-        }
+            |config| {
+                TreeSitterAnalyzer::new_with_config_and_progress(
+                    project,
+                    JavaAdapter,
+                    config,
+                    progress,
+                )
+            },
+            |inner, memo_budget| Self {
+                inner,
+                memo_caches: Arc::new(JavaMemoCaches::new(memo_budget)),
+                java_config,
+                external_index: Arc::new(std::sync::OnceLock::new()),
+            },
+        )
     }
 
     pub(crate) fn new_with_config_store_context(
@@ -197,21 +217,25 @@ impl JavaAnalyzer {
         store_context: AnalyzerStoreContext,
         progress: Option<BuildProgress>,
     ) -> Result<Self, crate::analyzer::store::StoreError> {
-        let memo_budget = config.memo_cache_budget_bytes();
         let java_config = config.jvm.clone();
-        let inner = TreeSitterAnalyzer::new_with_config_storage_context_and_progress(
-            project,
-            JavaAdapter,
+        TreeSitterAnalyzer::try_wrap_with_config(
             config,
-            store_context,
-            progress,
-        )?;
-        Ok(Self {
-            inner,
-            memo_caches: Arc::new(JavaMemoCaches::new(memo_budget)),
-            java_config,
-            external_index: Arc::new(std::sync::OnceLock::new()),
-        })
+            |config| {
+                TreeSitterAnalyzer::new_with_config_storage_context_and_progress(
+                    project,
+                    JavaAdapter,
+                    config,
+                    store_context,
+                    progress,
+                )
+            },
+            |inner, memo_budget| Self {
+                inner,
+                memo_caches: Arc::new(JavaMemoCaches::new(memo_budget)),
+                java_config,
+                external_index: Arc::new(std::sync::OnceLock::new()),
+            },
+        )
     }
 
     pub fn from_project<P>(project: P) -> Self
@@ -327,39 +351,35 @@ impl JavaAnalyzer {
         file: &ProjectFile,
         name: &str,
     ) -> (BoundaryStatus, Option<String>) {
-        if let Some(JavaTypeResolution::External(external_type)) =
-            self.resolve_type_name_with_external(token, packs.clone(), file, name)
-        {
-            return (
-                BoundaryStatus::ExternalIndexed,
-                Some(external_type.fqn().to_owned()),
-            );
-        }
-        if let Some(member) = self.resolve_member_name_with_external(token, packs, file, name) {
-            return (
-                BoundaryStatus::ExternalIndexed,
-                Some(member.fqn().to_owned()),
-            );
-        }
-        if self
-            .external_declaration_index()
-            .production_diagnostic_count()
-            > 0
-        {
-            return (BoundaryStatus::ExternalDeclaredUnindexed, None);
-        }
-        (BoundaryStatus::ExternalUnknown, None)
+        let type_evidence =
+            match self.resolve_type_name_with_external(token, packs.clone(), file, name) {
+                Some(JavaTypeResolution::External(external_type)) => {
+                    crate::analyzer::languages::ExternalTypeBoundaryEvidence::Indexed(Some(
+                        external_type.fqn().to_owned(),
+                    ))
+                }
+                _ => crate::analyzer::languages::ExternalTypeBoundaryEvidence::Unresolved,
+            };
+        crate::analyzer::languages::classify_jvm_external_boundary_evidence(
+            type_evidence,
+            || {
+                self.resolve_member_name_with_external(token, packs, file, name)
+                    .map(|member| member.fqn().to_owned())
+            },
+            || {
+                self.external_declaration_index()
+                    .production_diagnostic_count()
+                    > 0
+            },
+        )
     }
 
     pub(crate) fn external_declaration_index(&self) -> &JvmExternalDeclarationIndex {
-        self.external_index
-            .get_or_init(|| {
-                JvmExternalDeclarationIndex::build_for_project(
-                    &self.java_config,
-                    self.inner.project(),
-                )
-            })
-            .as_ref()
+        crate::analyzer::jvm::external::get_or_build_external_declaration_index(
+            &self.external_index,
+            &self.java_config,
+            self.inner.project(),
+        )
     }
 
     /// The external declaration surface Java resolution reads: this analyzer's
@@ -413,6 +433,18 @@ struct JavaFileClassIndex {
     classes_by_fqn: HashMap<String, Vec<CodeUnit>>,
 }
 
+fn java_type_syntax_is_array(root: tree_sitter::Node<'_>) -> bool {
+    let mut stack = vec![root];
+    while let Some(node) = stack.pop() {
+        if matches!(node.kind(), "array_type" | "dimensions") {
+            return true;
+        }
+        let mut cursor = node.walk();
+        stack.extend(node.named_children(&mut cursor));
+    }
+    false
+}
+
 impl JavaFileClassIndex {
     fn build(declarations: BTreeSet<CodeUnit>) -> Self {
         let mut classes_by_fqn: HashMap<String, Vec<CodeUnit>> = HashMap::default();
@@ -423,15 +455,10 @@ impl JavaFileClassIndex {
     }
 
     fn unique_class(&self, fqn: &str) -> brokk_bifrost_jvm::java::graph_support::UniqueClassInFile {
-        use brokk_bifrost_jvm::java::graph_support::UniqueClassInFile;
         let Some(units) = self.classes_by_fqn.get(fqn) else {
-            return UniqueClassInFile::None;
+            return brokk_bifrost_jvm::java::graph_support::UniqueClassInFile::None;
         };
-        let first = &units[0];
-        if units[1..].iter().any(|candidate| candidate != first) {
-            return UniqueClassInFile::Ambiguous;
-        }
-        UniqueClassInFile::Unique(first.clone())
+        brokk_bifrost_jvm::java::graph_support::unique_class_from_candidates(units.iter())
     }
 }
 
@@ -480,8 +507,7 @@ impl JavaSource for JavaAnalyzer {
         _token: QueryToken<'_>,
         read: &mut dyn FnMut(&dyn crate::analyzer::BoundedDefinitionLookup),
     ) {
-        let lookup = crate::analyzer::AnalyzerDefinitionLookup::new(self, Language::Java);
-        read(&lookup);
+        crate::analyzer::with_analyzer_usage_definitions(self, Language::Java, read);
     }
 
     fn unique_class_by_fqn_in_file(
@@ -567,8 +593,8 @@ impl JavaSource for JavaAnalyzer {
         self.inner.type_identifiers_of(file)
     }
 
-    fn raw_supertypes_of(&self, code_unit: &CodeUnit) -> Vec<String> {
-        self.inner.raw_supertypes_of(code_unit)
+    crate::analyzer::tree_sitter_analyzer::delegate_inner_methods! {
+        fn raw_supertypes_of(&self, code_unit: &CodeUnit) -> Vec<String>;
     }
 
     fn prepared_syntax(
@@ -585,9 +611,7 @@ impl JavaSource for JavaAnalyzer {
 
     fn retained_external_holds_qualified_name(&self, fqn: &str, access_package: &str) -> bool {
         self.external_index.get().is_some_and(|external| {
-            external
-                .resolve_qualified_name(fqn, access_package)
-                .is_some()
+            jvm_external_qualified_name_exists(external, fqn, access_package)
         })
     }
 
@@ -609,78 +633,77 @@ impl JavaSource for JavaAnalyzer {
 use crate::analyzer::CodeUnitIndex;
 
 impl CodeUnitIndex for JavaAnalyzer {
-    /// Forwarded so the request-scoped memo on the inner analyzer answers
-    /// (#2679); the trait default would rebuild uncached per call.
-    fn class_range_index(
+    crate::analyzer::tree_sitter_analyzer::delegate_inner_methods! {
+        /// Forwarded so the request-scoped memo on the inner analyzer answers
+        /// (#2679); the trait default would rebuild uncached per call.
+        fn class_range_index(
         &self,
         file: &ProjectFile,
-    ) -> std::sync::Arc<brokk_bifrost_core::analyzer::usages::inverted_edges::ClassRangeIndex> {
-        self.inner.class_range_index(file)
+    ) -> std::sync::Arc<brokk_bifrost_core::analyzer::usages::inverted_edges::ClassRangeIndex>;
     }
 
-    fn enclosing_code_unit(
+    crate::analyzer::tree_sitter_analyzer::delegate_inner_methods! {
+        fn enclosing_code_unit(
         &self,
         file: &ProjectFile,
         range: &crate::analyzer::Range,
-    ) -> Option<CodeUnit> {
-        self.inner.enclosing_code_unit(file, range)
+    ) -> Option<CodeUnit>;
     }
 
-    fn enclosing_code_unit_for_lines(
+    crate::analyzer::tree_sitter_analyzer::delegate_inner_methods! {
+        fn enclosing_code_unit_for_lines(
+            &self,
+            file: &ProjectFile,
+            start_line: usize,
+            end_line: usize,
+        ) -> Option<CodeUnit>;
+    }
+
+    crate::analyzer::tree_sitter_analyzer::delegate_inner_methods! {
+        fn top_level_declarations(&self, file: &ProjectFile) -> Vec<CodeUnit>;
+    }
+
+    crate::analyzer::tree_sitter_analyzer::delegate_inner_methods! {
+        fn summary_file_projection(
         &self,
         file: &ProjectFile,
-        start_line: usize,
-        end_line: usize,
-    ) -> Option<CodeUnit> {
-        self.inner
-            .enclosing_code_unit_for_lines(file, start_line, end_line)
+    ) -> Option<Arc<crate::analyzer::SummaryFileProjection>>;
     }
 
-    fn top_level_declarations(&self, file: &ProjectFile) -> Vec<CodeUnit> {
-        self.inner.top_level_declarations(file)
+    crate::analyzer::tree_sitter_analyzer::delegate_inner_methods! {
+        fn analyzed_files(&self) -> Vec<ProjectFile>;
     }
 
-    fn summary_file_projection(
-        &self,
-        file: &ProjectFile,
-    ) -> Option<Arc<crate::analyzer::SummaryFileProjection>> {
-        self.inner.summary_file_projection(file)
+    crate::analyzer::tree_sitter_analyzer::delegate_inner_methods! {
+        fn indexed_source(&self, file: &ProjectFile) -> Option<String>;
     }
 
-    fn analyzed_files(&self) -> Vec<ProjectFile> {
-        self.inner.analyzed_files()
+    crate::analyzer::tree_sitter_analyzer::delegate_inner_methods! {
+        fn location_declarations(&self, file: &ProjectFile) -> BTreeSet<CodeUnit>;
     }
 
-    fn indexed_source(&self, file: &ProjectFile) -> Option<String> {
-        self.inner.indexed_source(file)
+    crate::analyzer::tree_sitter_analyzer::delegate_inner_methods! {
+        fn location_ranges(&self, code_unit: &CodeUnit) -> Vec<crate::analyzer::Range>;
     }
 
-    fn location_declarations(&self, file: &ProjectFile) -> BTreeSet<CodeUnit> {
-        self.inner.location_declarations(file)
+    crate::analyzer::tree_sitter_analyzer::delegate_inner_methods! {
+        fn indexed_source_matches(&self, file: &ProjectFile, source: &str) -> bool;
     }
 
-    fn location_ranges(&self, code_unit: &CodeUnit) -> Vec<crate::analyzer::Range> {
-        self.inner.location_ranges(code_unit)
+    crate::analyzer::tree_sitter_analyzer::delegate_inner_methods! {
+        fn is_analyzed(&self, file: &ProjectFile) -> bool;
     }
 
-    fn indexed_source_matches(&self, file: &ProjectFile, source: &str) -> bool {
-        self.inner.indexed_source_matches(file, source)
-    }
-
-    fn is_analyzed(&self, file: &ProjectFile) -> bool {
-        self.inner.is_analyzed(file)
-    }
-
-    fn retain_analyzed(&self, candidates: &[ProjectFile]) -> Vec<ProjectFile> {
-        self.inner.retain_analyzed(candidates)
+    crate::analyzer::tree_sitter_analyzer::delegate_inner_methods! {
+        fn retain_analyzed(&self, candidates: &[ProjectFile]) -> Vec<ProjectFile>;
     }
 
     fn all_declarations(&self) -> Box<dyn Iterator<Item = CodeUnit> + '_> {
         self.inner.all_declarations()
     }
 
-    fn declarations_sharing_name(&self, unit: &CodeUnit) -> Vec<CodeUnit> {
-        self.inner.declarations_sharing_name(unit)
+    crate::analyzer::tree_sitter_analyzer::delegate_inner_methods! {
+        fn declarations_sharing_name(&self, unit: &CodeUnit) -> Vec<CodeUnit>;
     }
 
     fn all_declarations_with_primary_ranges(
@@ -689,16 +712,16 @@ impl CodeUnitIndex for JavaAnalyzer {
         self.inner.all_declarations_with_primary_ranges()
     }
 
-    fn declarations(&self, file: &ProjectFile) -> BTreeSet<CodeUnit> {
-        self.inner.declarations(file)
+    crate::analyzer::tree_sitter_analyzer::delegate_inner_methods! {
+        fn declarations(&self, file: &ProjectFile) -> BTreeSet<CodeUnit>;
     }
 
     fn definitions(&self, fq_name: &str) -> Box<dyn Iterator<Item = CodeUnit> + '_> {
         self.inner.definitions(fq_name)
     }
 
-    fn direct_children(&self, code_unit: &CodeUnit) -> Vec<CodeUnit> {
-        self.inner.direct_children(code_unit)
+    crate::analyzer::tree_sitter_analyzer::delegate_inner_methods! {
+        fn direct_children(&self, code_unit: &CodeUnit) -> Vec<CodeUnit>;
     }
 
     fn direct_children_in_file(&self, code_unit: &CodeUnit) -> Vec<CodeUnit> {
@@ -709,8 +732,8 @@ impl CodeUnitIndex for JavaAnalyzer {
         self.inner.structural_parent_of(code_unit)
     }
 
-    fn ranges(&self, code_unit: &CodeUnit) -> Vec<crate::analyzer::Range> {
-        self.inner.ranges(code_unit)
+    crate::analyzer::tree_sitter_analyzer::delegate_inner_methods! {
+        fn ranges(&self, code_unit: &CodeUnit) -> Vec<crate::analyzer::Range>;
     }
 
     fn ranges_with_limit(
@@ -727,66 +750,57 @@ impl CodeUnitIndex for JavaAnalyzer {
         self.inner.signatures(code_unit)
     }
 
-    fn signature_metadata(&self, code_unit: &CodeUnit) -> Vec<SignatureMetadata> {
-        self.inner.signature_metadata(code_unit)
+    crate::analyzer::tree_sitter_analyzer::delegate_inner_methods! {
+        fn signature_metadata(&self, code_unit: &CodeUnit) -> Vec<SignatureMetadata>;
     }
 
-    fn get_analyzed_files(&self) -> BTreeSet<ProjectFile> {
-        self.inner.get_analyzed_files()
+    crate::analyzer::tree_sitter_analyzer::delegate_inner_methods! {
+        fn languages(&self) -> BTreeSet<Language>;
     }
 
-    fn languages(&self) -> BTreeSet<Language> {
-        self.inner.languages()
+    crate::analyzer::tree_sitter_analyzer::delegate_inner_methods! {
+        fn project(&self) -> &dyn Project;
     }
 
-    fn project(&self) -> &dyn Project {
-        self.inner.project()
-    }
-
-    fn get_all_declarations(&self) -> Vec<CodeUnit> {
-        self.inner.get_all_declarations()
-    }
-
-    fn get_definitions(&self, fq_name: &str) -> Vec<CodeUnit> {
-        self.inner.get_definitions(fq_name)
+    crate::analyzer::tree_sitter_analyzer::delegate_inner_methods! {
+        fn get_all_declarations(&self) -> Vec<CodeUnit>;
     }
 
     fn get_skeleton(&self, code_unit: &CodeUnit) -> Option<String> {
         self.inner.get_skeleton(code_unit)
     }
 
-    fn get_skeleton_header(&self, code_unit: &CodeUnit) -> Option<String> {
-        self.inner.get_skeleton_header(code_unit)
+    crate::analyzer::tree_sitter_analyzer::delegate_inner_methods! {
+        fn get_skeleton_header(&self, code_unit: &CodeUnit) -> Option<String>;
     }
 
-    fn get_source(&self, code_unit: &CodeUnit, include_comments: bool) -> Option<String> {
-        self.inner.get_source(code_unit, include_comments)
+    crate::analyzer::tree_sitter_analyzer::delegate_inner_methods! {
+        fn get_source(&self, code_unit: &CodeUnit, include_comments: bool) -> Option<String>;
     }
 
-    fn get_sources(&self, code_unit: &CodeUnit, include_comments: bool) -> BTreeSet<String> {
-        self.inner.get_sources(code_unit, include_comments)
+    crate::analyzer::tree_sitter_analyzer::delegate_inner_methods! {
+        fn get_sources(&self, code_unit: &CodeUnit, include_comments: bool) -> BTreeSet<String>;
     }
 
-    fn search_definitions(&self, pattern: &str, auto_quote: bool) -> BTreeSet<CodeUnit> {
-        self.inner.search_definitions(pattern, auto_quote)
+    crate::analyzer::tree_sitter_analyzer::delegate_inner_methods! {
+        fn search_definitions(&self, pattern: &str, auto_quote: bool) -> BTreeSet<CodeUnit>;
     }
 
-    fn search_definitions_by_suffix_pattern(
+    crate::analyzer::tree_sitter_analyzer::delegate_inner_methods! {
+        fn search_definitions_by_suffix_pattern(
         &self,
         pattern: &str,
         terminal_identifiers: &[String],
         language: Language,
-    ) -> BTreeSet<CodeUnit> {
-        self.inner
-            .search_definitions_by_suffix_pattern(pattern, terminal_identifiers, language)
+    ) -> BTreeSet<CodeUnit>;
     }
 
-    fn lookup_candidates_by_short_name(&self, symbol: &str) -> BTreeSet<CodeUnit> {
-        self.inner.lookup_candidates_by_short_name(symbol)
+    crate::analyzer::tree_sitter_analyzer::delegate_inner_methods! {
+        fn lookup_candidates_by_short_name(&self, symbol: &str) -> BTreeSet<CodeUnit>;
     }
 
-    fn has_complete_symbol_lookup_index(&self) -> bool {
-        self.inner.has_complete_symbol_lookup_index()
+    crate::analyzer::tree_sitter_analyzer::delegate_inner_methods! {
+        fn has_complete_symbol_lookup_index(&self) -> bool;
     }
 
     fn lookup_candidates_by_identifier(&self, identifier: &str) -> BTreeSet<CodeUnit> {
@@ -795,6 +809,8 @@ impl CodeUnitIndex for JavaAnalyzer {
 }
 
 impl IAnalyzer for JavaAnalyzer {
+    crate::analyzer::tree_sitter_analyzer::delegate_inner_procedure_fact_methods!();
+
     crate::analyzer::i_analyzer::forward_relational_definition_batch!();
 
     #[cfg(any(test, feature = "test-support"))]
@@ -848,42 +864,42 @@ impl IAnalyzer for JavaAnalyzer {
         self.inner.end_query(context);
     }
 
-    fn prefetch_definitions(&self, fq_names: &[String]) {
-        self.inner.prefetch_definitions(fq_names);
+    crate::analyzer::tree_sitter_analyzer::delegate_inner_methods! {
+        fn prefetch_definitions(&self, fq_names: &[String]);
     }
 
-    fn record_query_failure(&self, error: crate::analyzer::store::StoreError) {
-        self.inner.record_query_failure(error);
+    crate::analyzer::tree_sitter_analyzer::delegate_inner_methods! {
+        fn record_query_failure(&self, error: crate::analyzer::store::StoreError);
     }
 
-    fn workspace_file_index_cell(&self) -> Option<crate::analyzer::WorkspaceFileIndexCell> {
-        self.inner.workspace_file_index_cell()
+    crate::analyzer::tree_sitter_analyzer::delegate_inner_methods! {
+        fn workspace_file_index_cell(&self) -> Option<crate::analyzer::WorkspaceFileIndexCell>;
     }
 
-    fn definition_lookup_memo(
+    crate::analyzer::tree_sitter_analyzer::delegate_inner_methods! {
+        fn definition_lookup_memo(
         &self,
-    ) -> Option<std::sync::Arc<crate::analyzer::DefinitionLookupMemo>> {
-        self.inner.definition_lookup_memo()
+    ) -> Option<std::sync::Arc<crate::analyzer::DefinitionLookupMemo>>;
     }
 
     fn declaration_syntax_kind(&self, code_unit: &CodeUnit) -> Option<&'static str> {
         self.inner.declaration_syntax_kind(code_unit)
     }
 
-    fn import_statements(&self, file: &ProjectFile) -> Vec<String> {
-        self.inner.import_statements(file)
+    crate::analyzer::tree_sitter_analyzer::delegate_inner_methods! {
+        fn import_statements(&self, file: &ProjectFile) -> Vec<String>;
     }
 
-    fn compute_cognitive_complexities(&self, file: &ProjectFile) -> Vec<(CodeUnit, u32)> {
-        self.inner.compute_cognitive_complexities(file)
+    crate::analyzer::tree_sitter_analyzer::delegate_inner_methods! {
+        fn compute_cognitive_complexities(&self, file: &ProjectFile) -> Vec<(CodeUnit, u32)>;
     }
 
     fn update(&self, changed_files: &BTreeSet<ProjectFile>) -> Self {
-        let external_index = if changed_files.iter().any(is_jvm_dependency_input) {
-            Arc::new(std::sync::OnceLock::new())
-        } else {
-            self.external_index.clone()
-        };
+        let external_index = crate::analyzer::updated_external_index(
+            &self.external_index,
+            changed_files,
+            is_jvm_dependency_input,
+        );
         Self {
             inner: self.inner.update(changed_files),
             memo_caches: Arc::new(JavaMemoCaches::new(self.memo_caches.budget_bytes())),
@@ -893,12 +909,7 @@ impl IAnalyzer for JavaAnalyzer {
     }
 
     fn update_all(&self) -> Self {
-        Self {
-            inner: self.inner.update_all(),
-            memo_caches: Arc::new(JavaMemoCaches::new(self.memo_caches.budget_bytes())),
-            java_config: self.java_config.clone(),
-            external_index: Arc::new(std::sync::OnceLock::new()),
-        }
+        self.update_all_with_progress(None)
     }
 
     fn import_analysis_provider(&self) -> Option<&dyn ImportAnalysisProvider> {
@@ -917,34 +928,34 @@ impl IAnalyzer for JavaAnalyzer {
         Some(self)
     }
 
-    fn structural_fact_providers(
+    crate::analyzer::tree_sitter_analyzer::delegate_inner_methods! {
+        fn structural_fact_providers(
         &self,
-    ) -> Vec<&dyn crate::analyzer::structural::StructuralFactProvider> {
-        self.inner.structural_fact_providers()
+    ) -> Vec<&dyn crate::analyzer::structural::StructuralFactProvider>;
     }
 
     fn snapshot_caches(&self) -> Option<&crate::analyzer::AnalyzerSnapshotCaches> {
         Some(self.inner.snapshot_caches())
     }
 
-    fn workspace_content_identities(
+    crate::analyzer::tree_sitter_analyzer::delegate_inner_methods! {
+        fn workspace_content_identities(
         &self,
-    ) -> Option<crate::analyzer::content_identity::WorkspaceContentIdentities> {
-        self.inner.workspace_content_identities()
+    ) -> Option<crate::analyzer::content_identity::WorkspaceContentIdentities>;
     }
 
-    fn workspace_fact_indexes(
+    crate::analyzer::tree_sitter_analyzer::delegate_inner_methods! {
+        fn workspace_fact_indexes(
         &self,
-    ) -> Vec<&dyn crate::analyzer::read_verification::WorkspaceFactIndex> {
-        self.inner.workspace_fact_indexes()
+    ) -> Vec<&dyn crate::analyzer::read_verification::WorkspaceFactIndex>;
     }
 
     fn parse_errors(&self, file: &ProjectFile) -> Option<Vec<crate::analyzer::ParseError>> {
         self.inner.parse_errors(file)
     }
 
-    fn extract_call_receiver(&self, reference: &str) -> Option<String> {
-        self.inner.extract_call_receiver(reference)
+    crate::analyzer::tree_sitter_analyzer::delegate_inner_methods! {
+        fn extract_call_receiver(&self, reference: &str) -> Option<String>;
     }
 
     fn is_access_expression(&self, file: &ProjectFile, start_byte: usize, end_byte: usize) -> bool {
@@ -1038,8 +1049,8 @@ impl IAnalyzer for JavaAnalyzer {
         self.inner.search_symbol_candidates(patterns, cancellation)
     }
 
-    fn contains_tests(&self, file: &ProjectFile) -> bool {
-        self.inner.contains_tests(file)
+    crate::analyzer::tree_sitter_analyzer::delegate_inner_methods! {
+        fn contains_tests(&self, file: &ProjectFile) -> bool;
     }
 
     fn in_test_region(&self, code_unit: &crate::analyzer::CodeUnit) -> bool {
@@ -1085,13 +1096,9 @@ impl IAnalyzer for JavaAnalyzer {
         file: &ProjectFile,
         weights: TestAssertionWeights,
     ) -> Vec<TestAssertionSmell> {
-        if file_language(file) != Language::Java || !self.contains_tests(file) {
-            return Vec::new();
-        }
-        let Ok(source) = self.inner.project().read_source(file) else {
-            return Vec::new();
-        };
-        detect_test_assertion_smells_java(self, file, &source, &weights)
+        crate::analyzer::test_assertion_smells_for_file(self, file, Language::Java, |source| {
+            detect_test_assertion_smells_java(self, file, source, &weights)
+        })
     }
 
     fn find_structural_clone_smells(
@@ -1107,33 +1114,9 @@ impl IAnalyzer for JavaAnalyzer {
         files: &[ProjectFile],
         weights: CloneSmellWeights,
     ) -> Vec<CloneSmell> {
-        let requested_files: Vec<ProjectFile> = files
-            .iter()
-            .filter(|file| file_language(file) == Language::Java)
-            .cloned()
-            .collect();
-        if requested_files.is_empty() {
-            return Vec::new();
-        }
-
-        let corpus_units =
-            crate::analyzer::clone_detection::clone_corpus_function_units(self, Language::Java);
-        let _query_scope = crate::analyzer::AnalyzerQueryScope::new(self);
-        let all_candidates: Vec<CloneCandidateProfile> = corpus_units
-            .iter()
-            .filter_map(|code_unit| build_clone_candidate_data(self, code_unit, weights))
-            .map(|candidate| CloneCandidateProfile::create(candidate, weights))
-            .collect();
-        if all_candidates.is_empty() {
-            return Vec::new();
-        }
-
-        detect_structural_clone_smells(
-            &requested_files,
-            all_candidates,
-            weights,
-            refine_clone_similarity_with_ast,
-        )
+        detect_language_structural_clone_smells(self, files, weights, Language::Java, |code_unit| {
+            build_clone_candidate_data(self, code_unit, weights)
+        })
     }
 }
 
@@ -1153,72 +1136,56 @@ impl crate::analyzer::AnalyzerTestHooks for JavaAnalyzer {
             .java_usage_evidence_cache_stats_for_test()
     }
 
-    fn reset_relational_definition_batch_call_count_for_test(&self) {
-        self.inner
-            .test_hooks()
-            .reset_relational_definition_batch_call_count_for_test();
+    crate::analyzer::tree_sitter_analyzer::delegate_inner_test_hook_methods! {
+        fn reset_relational_definition_batch_call_count_for_test(&self);
     }
 
-    fn relational_definition_batch_call_count_for_test(&self) -> usize {
-        self.inner
-            .test_hooks()
-            .relational_definition_batch_call_count_for_test()
+    crate::analyzer::tree_sitter_analyzer::delegate_inner_test_hook_methods! {
+        fn relational_definition_batch_call_count_for_test(&self) -> usize;
     }
 
-    fn reset_definition_candidates_query_count_for_test(&self) {
-        self.inner
-            .test_hooks()
-            .reset_definition_candidates_query_count_for_test();
+    crate::analyzer::tree_sitter_analyzer::delegate_inner_test_hook_methods! {
+        fn reset_definition_candidates_query_count_for_test(&self);
     }
 
-    fn definition_candidates_query_count_for_test(&self) -> usize {
-        self.inner
-            .test_hooks()
-            .definition_candidates_query_count_for_test()
+    crate::analyzer::tree_sitter_analyzer::delegate_inner_test_hook_methods! {
+        fn definition_candidates_query_count_for_test(&self) -> usize;
     }
 
-    fn reset_definition_prefetch_batch_count_for_test(&self) {
-        self.inner
-            .test_hooks()
-            .reset_definition_prefetch_batch_count_for_test();
+    crate::analyzer::tree_sitter_analyzer::delegate_inner_test_hook_methods! {
+        fn reset_definition_prefetch_batch_count_for_test(&self);
     }
 
-    fn definition_prefetch_batch_count_for_test(&self) -> usize {
-        self.inner
-            .test_hooks()
-            .definition_prefetch_batch_count_for_test()
+    crate::analyzer::tree_sitter_analyzer::delegate_inner_test_hook_methods! {
+        fn definition_prefetch_batch_count_for_test(&self) -> usize;
     }
 
-    fn reset_full_declaration_scan_count_for_test(&self) {
-        self.inner
-            .test_hooks()
-            .reset_full_declaration_scan_count_for_test();
+    crate::analyzer::tree_sitter_analyzer::delegate_inner_test_hook_methods! {
+        fn reset_full_declaration_scan_count_for_test(&self);
     }
 
-    fn full_declaration_scan_count_for_test(&self) -> usize {
-        self.inner
-            .test_hooks()
-            .full_declaration_scan_count_for_test()
+    crate::analyzer::tree_sitter_analyzer::delegate_inner_test_hook_methods! {
+        fn full_declaration_scan_count_for_test(&self) -> usize;
     }
 
     fn reset_candidate_hydration_count_for_test(&self) {
         self.inner.reset_full_hydration_count_for_test();
     }
 
-    fn candidate_hydration_count_for_test(&self) -> usize {
-        self.inner.full_hydration_count_for_test() + self.inner.bulk_hydration_count_for_test()
+    crate::analyzer::tree_sitter_analyzer::delegate_inner_test_hook_methods! {
+        fn full_candidate_hydration_count_for_test(&self) -> usize;
     }
 
-    fn reset_package_declaration_scan_count_for_test(&self) {
-        self.inner
-            .test_hooks()
-            .reset_package_declaration_scan_count_for_test();
+    crate::analyzer::tree_sitter_analyzer::delegate_inner_test_hook_methods! {
+        fn bulk_candidate_hydration_count_for_test(&self) -> usize;
     }
 
-    fn package_declaration_scan_count_for_test(&self) -> usize {
-        self.inner
-            .test_hooks()
-            .package_declaration_scan_count_for_test()
+    crate::analyzer::tree_sitter_analyzer::delegate_inner_test_hook_methods! {
+        fn reset_package_declaration_scan_count_for_test(&self);
+    }
+
+    crate::analyzer::tree_sitter_analyzer::delegate_inner_test_hook_methods! {
+        fn package_declaration_scan_count_for_test(&self) -> usize;
     }
 }
 
@@ -1327,7 +1294,7 @@ impl LanguageSupport for JavaSupport {
     fn native_rollout_points(
         &self,
     ) -> Option<&'static dyn crate::analyzer::languages::StructuralReceiverResolver> {
-        Some(&native_points::JavaNativeRolloutPoints)
+        Some(&crate::analyzer::jvm::native_points::JVM_NATIVE_ROLLOUT_POINTS)
     }
 
     fn is_configuration_input_path(&self, path: &std::path::Path) -> bool {
@@ -1338,10 +1305,30 @@ impl LanguageSupport for JavaSupport {
         Language::Java
     }
 
+    fn explicit_import_model_target(
+        &self,
+        analyzer: &dyn crate::analyzer::IAnalyzer,
+        token: brokk_bifrost_core::analyzer::query_token::QueryToken<'_>,
+        file: &crate::analyzer::ProjectFile,
+        reference: &crate::analyzer::usages::reference_site::ResolvedReferenceSite,
+    ) -> Option<String> {
+        crate::analyzer::jvm::import_routes::explicit_import_model_route(
+            analyzer, token, file, reference,
+        )
+        .map(|route| route.target)
+    }
+
+    fn call_applicability_adapter(
+        &self,
+    ) -> Option<&'static dyn crate::analyzer::resolution::CallApplicabilityAdapter> {
+        Some(&call_applicability::JAVA_CALL_APPLICABILITY_ADAPTER)
+    }
+
     fn procedure_syntax_roles(&self) -> Option<ProcedureSyntaxRoles> {
         Some(ProcedureSyntaxRoles {
             statement_kind: executable_statement_kind,
             loop_site: java_loop_site,
+            loop_site_with_source: None,
             procedure_matches: statement_procedure_matches,
             nested_procedure: statement_nested_procedure,
         })
@@ -1365,11 +1352,12 @@ impl LanguageSupport for JavaSupport {
         callee_text: &str,
         site: Option<&crate::analyzer::languages::ExternalCalleeSite<'_>>,
     ) -> Option<crate::analyzer::languages::ImportedExternalCallee> {
+        let site = site?;
         crate::analyzer::usages::get_definition::java::expand_java_external_static_import_callee(
             analyzer,
             file,
             callee_text,
-            site?,
+            site,
         )
     }
 
@@ -1433,8 +1421,9 @@ impl LanguageSupport for JavaSupport {
         unit: &CodeUnit,
         limit: usize,
     ) -> Option<LimitedQueryRows<Range>> {
-        resolve_analyzer::<JavaAnalyzer>(analyzer)
-            .map(|java| java.inner().ranges_limited(unit, limit))
+        crate::analyzer::languages::with_resolved_analyzer::<JavaAnalyzer, _>(analyzer, |java| {
+            java.inner().ranges_limited(unit, limit)
+        })
     }
 
     fn signatures_limited(
@@ -1451,18 +1440,19 @@ impl LanguageSupport for JavaSupport {
         &self,
         analyzer: &'a dyn IAnalyzer,
     ) -> Option<&'a dyn ForwardQueryProvider> {
-        resolve_analyzer::<JavaAnalyzer>(analyzer).map(|value| value as _)
+        crate::analyzer::forward_query_provider::<JavaAnalyzer>(analyzer)
     }
 
     fn ecosystem(&self) -> UsageEcosystem {
         UsageEcosystem::Jvm
     }
 
-    fn reference_plugin(&self) -> crate::analyzer::languages::ReferenceLanguagePlugin {
-        crate::analyzer::languages::ReferenceLanguagePlugin::new(
-            &JAVA_USAGE_STRATEGY,
-            &JavaEdgePass,
-        )
+    fn reference_usage_strategy(&self) -> &'static dyn crate::analyzer::usages::GraphUsageAnalyzer {
+        &JAVA_USAGE_STRATEGY
+    }
+
+    fn reference_graph_backend(&self) -> crate::analyzer::languages::LanguageGraphBackend {
+        crate::analyzer::languages::LanguageGraphBackend::Legacy(&JavaEdgePass)
     }
 
     fn dead_code(&self) -> DeadCodeSupport {
@@ -1577,10 +1567,7 @@ impl DeadCodeBulkProof for JavaDeadCodeBulk {
     }
 
     fn preflight(&self, analyzer: &dyn IAnalyzer) -> DeadCodeBulkPreflight {
-        DeadCodeBulkPreflight::Ready {
-            label: "Java",
-            files: analyzable_file_count(analyzer, Language::Java),
-        }
+        ready_preflight(analyzer, Language::Java, "Java")
     }
 
     fn build(
@@ -1588,14 +1575,9 @@ impl DeadCodeBulkProof for JavaDeadCodeBulk {
         analyzer: &dyn IAnalyzer,
         candidates: &[CodeUnit],
     ) -> Option<DeadCodeBulkEdges> {
-        let nodes = fqn_bulk_nodes(
-            analyzer,
-            Language::Java,
-            |unit| unit.is_function() || unit.is_class(),
-            candidates,
-        );
-        build_java_usage_edges(analyzer, &nodes, |_| true)
-            .map(|edges| DeadCodeBulkEdges::Fqn(Arc::new(edges)))
+        build_fqn_bulk_edges(analyzer, Language::Java, candidates, |analyzer, nodes| {
+            build_java_usage_edges(analyzer, nodes, |_| true)
+        })
     }
 }
 
@@ -1643,55 +1625,5 @@ impl crate::analyzer::usages::MemberFamilyProvider for JavaAnalyzer {
         cancellation: Option<&crate::cancellation::CancellationToken>,
     ) -> crate::analyzer::usages::ExternalMemberFamilyAnswer {
         self.resolve_external_member_family(self, identity, max_visits, cancellation)
-    }
-}
-
-#[cfg(test)]
-mod java_static_import_presence_tests {
-    use super::*;
-    use crate::analyzer::{EmptyAnalyzer, Language, OverlayProject, Project};
-    use crate::inline_project::InlineTestProject;
-
-    #[test]
-    fn comments_do_not_count_as_static_imports_but_active_imports_do() {
-        let project = InlineTestProject::with_language(Language::Java)
-            .file(
-                "com/example/Target.java",
-                "package com.example; class Target { static void run() {} }\n",
-            )
-            .file(
-                "com/example/Consumer.java",
-                "package com.example;\n// import static com.example.Target.run;\nclass Consumer {}\n",
-            )
-            .build();
-        let disk_analyzer = JavaAnalyzer::from_project(project.project().clone());
-        let disk_scope = AnalyzerQueryScope::new(&disk_analyzer);
-        assert!(!java_static_imports_present(
-            &disk_analyzer,
-            disk_scope.token()
-        ));
-
-        let overlay = Arc::new(OverlayProject::new(project.project_dyn()));
-        assert!(overlay.set(
-            project.file("com/example/Consumer.java").abs_path(),
-            "package com.example;\nimport /* keyword gap */ static com.example.Target.run;\nclass Consumer {}\n"
-                .to_owned(),
-        ));
-        let overlay_analyzer = JavaAnalyzer::new(overlay as Arc<dyn Project>);
-        let overlay_scope = AnalyzerQueryScope::new(&overlay_analyzer);
-        assert!(java_static_imports_present(
-            &overlay_analyzer,
-            overlay_scope.token()
-        ));
-    }
-
-    #[test]
-    fn missing_import_provider_keeps_precise_dead_code_route() {
-        let project = InlineTestProject::with_language(Language::Java)
-            .file("Sample.java", "class Sample {}\n")
-            .build();
-        let analyzer = EmptyAnalyzer::new(project.project_dyn());
-        let scope = AnalyzerQueryScope::new(&analyzer);
-        assert!(java_static_imports_present(&analyzer, scope.token()));
     }
 }

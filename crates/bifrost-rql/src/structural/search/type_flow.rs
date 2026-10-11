@@ -9,21 +9,24 @@
 //! solve, or a failed root is a diagnostic, never an empty answer that reads
 //! as "no classes" or "no finding".
 
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use super::semantic::SemanticProcedureValue;
-use super::witness_projection::{bounded_reason, saturating_u64};
+use super::witness_projection::{bounded_reason, record_omitted_witnesses, saturating_u64};
 use super::{
     CodeQueryAbsentMemberWitness, CodeQueryDiagnostic, CodeQueryDiagnosticCode,
-    CodeQueryDiagnosticImpact, CodeQueryExhaustedCharge, CodeQueryExhaustedRoot,
-    CodeQueryTypeFlowWork, CodeQueryValueFlowLimits, render_exhausted_roots,
+    CodeQueryExhaustedCharge, CodeQueryExhaustedRoot, CodeQueryTypeFlowWork,
+    CodeQueryValueFlowLimits, MAX_DIAGNOSTIC_LIST_MESSAGE_BYTES, incomplete_diagnostic,
+    push_deduplicated_diagnostic, render_exhausted_roots,
 };
 use crate::analyzer::common::language_for_file;
 use crate::analyzer::semantic::{
-    ClassIdentity, DeclarationSegmentKind, IcfgProvider, IcfgProviderBehaviorIdentity,
-    LengthDelimitedDigest, ProcedureHandle, SemanticBudget, SemanticBudgetDimension,
-    SemanticBudgetScopeSnapshot, SemanticIrVersion, SemanticWork, SourceSiteKind, SourceSpan,
-    StableDigest, TypeFlowAdapter, UnknownReason, WorkspaceIcfgProvider, WorkspaceRelativePath,
+    CandidateCoverage, ClassIdentity, DeclarationSegmentKind, ExactResultProducer, IcfgProvider,
+    IcfgProviderBehaviorIdentity, LengthDelimitedDigest, MemberAccessKind, MemberDeclaration,
+    ProcedureHandle, SemanticBudget, SemanticBudgetDimension, SemanticBudgetScopeSnapshot,
+    SemanticIrVersion, SemanticWork, SourceMappingKind, SourceSiteKind, SourceSpan, StableDigest,
+    TypeFlowAdapter, UnknownReason, WorkspaceIcfgProvider, WorkspaceRelativePath,
     type_flow_adapter,
 };
 use crate::analyzer::semantic_model::ActiveSemanticModelSnapshot;
@@ -42,11 +45,12 @@ use brokk_bifrost_flow::dataflow::{
 };
 use brokk_bifrost_flow::flow_state::procedure_public_digest;
 use brokk_bifrost_flow::type_flow::{
-    AbsentMemberProof, ClassSetStatus, FeedbackLimits, FieldSlotIndex,
+    AbsentMemberProof, ClassSetStatus, DynamicWriteEvidence, FeedbackLimits, FieldSlotIndex,
     FieldSlotIndexAcquisitionKind, FieldSlotIndexMissReason, ProcedureRefinements,
-    RootExhaustedLane, RootIncompleteEvidence, TypeFlowError, TypeFlowPlanError,
-    TypeFlowRootPersistenceStatus, TypeFlowRootResult, active_semantic_model_pack_digest,
-    solve_type_flow_for_root_with_refinements, sort_unknown_reasons,
+    ReceiverClassSet, RootExhaustedLane, RootIncompleteEvidence, TypeFlowError, TypeFlowPlanError,
+    TypeFlowRootPersistenceStatus, TypeFlowRootResult, TypeFlowSitePurpose,
+    active_semantic_model_pack_digest, solve_type_flow_for_root_with_refinements,
+    sort_unknown_reasons,
 };
 use brokk_bifrost_flow::value_flow::{ClosureLimits, ValueFlowCache, ValueFlowCacheStatsSnapshot};
 
@@ -55,12 +59,7 @@ use brokk_bifrost_flow::value_flow::{ClosureLimits, ValueFlowCache, ValueFlowCac
 const CLOSURE_LIMITS: ClosureLimits = ClosureLimits {
     max_procedures: 512,
 };
-const ROOT_RESULT_REPRESENTATION_VERSION: u32 = 2;
-/// Prose bound for one exhausted-work message. A policy report validates its
-/// diagnostic prose against `MAX_REPORT_PROSE_BYTES` (4 KiB) and drops a
-/// longer one, so the rendered list stops short of that and the complete
-/// attribution stays in the diagnostic's `exhausted_roots`.
-const MAX_EXHAUSTED_ROOT_MESSAGE_BYTES: usize = 3_584;
+const ROOT_RESULT_REPRESENTATION_VERSION: u32 = 4;
 
 fn field_slot_semantic_limits(caller: SemanticWork) -> SemanticWork {
     caller.component_max(SemanticWork::default_limits())
@@ -97,6 +96,30 @@ enum CachedTypeFlowAnalysis {
     },
     FindingFreeRows(Arc<[ClassSetRowValue]>),
     Failed,
+}
+
+#[derive(Debug, Clone)]
+pub(super) struct ExactReceiverDispatchProof {
+    pub(super) targets: Vec<(ClassIdentity, MemberDeclaration)>,
+    pub(super) member: String,
+}
+
+#[derive(Debug, Clone)]
+pub(super) enum ReceiverDispatchAssessment {
+    NotApplicable,
+    Open,
+    Closed(ExactReceiverDispatchProof),
+}
+
+pub(super) struct ReceiverDispatchQuery<'a> {
+    pub(super) workspace: &'a WorkspaceAnalyzer,
+    pub(super) procedure: &'a SemanticProcedureValue,
+    pub(super) file: &'a ProjectFile,
+    pub(super) range: Range,
+    pub(super) semantic_budget: &'a mut SemanticBudget,
+    pub(super) limits: CodeQueryValueFlowLimits,
+    pub(super) cancellation: &'a CancellationToken,
+    pub(super) active_semantic_model_snapshot: Option<Arc<ActiveSemanticModelSnapshot>>,
 }
 
 #[derive(Clone)]
@@ -208,6 +231,7 @@ pub(super) struct AbsentMemberFindingValue {
     pub(super) range: Range,
     pub(super) member: String,
     pub(super) class: String,
+    pub(super) class_name: String,
     /// The strongest tier any root established. `roots` holds only the roots
     /// that established this tier; a Conditional tier carries the sorted
     /// union of those roots' remainders.
@@ -222,6 +246,7 @@ pub(super) struct AbsentMemberRootEvidence {
     pub(super) origin_file: ProjectFile,
     pub(super) origin_range: Range,
     pub(super) origin_span: SourceSpan,
+    pub(super) origin_kind: SourceSiteKind,
     pub(super) also_fails_at: Vec<(ProjectFile, SourceSpan)>,
     /// Whether a narrowing guard, rather than value-producing syntax,
     /// introduced the class.
@@ -270,9 +295,13 @@ impl AbsentMemberFindingValue {
             }
             (AbsentMemberProof::Proven, AbsentMemberProof::Proven) => {}
             (
-                AbsentMemberProof::Conditional { remainders },
+                AbsentMemberProof::Conditional {
+                    remainders,
+                    unbounded_dynamic_writes,
+                },
                 AbsentMemberProof::Conditional {
                     remainders: other_remainders,
+                    unbounded_dynamic_writes: other_dynamic_writes,
                 },
             ) => {
                 for reason in other_remainders {
@@ -281,6 +310,7 @@ impl AbsentMemberFindingValue {
                     }
                 }
                 sort_unknown_reasons(remainders);
+                merge_dynamic_write_evidence(unbounded_dynamic_writes, other_dynamic_writes);
             }
         }
         for root in other.roots {
@@ -308,6 +338,18 @@ impl AbsentMemberFindingValue {
             }
         }
     }
+}
+
+fn merge_dynamic_write_evidence(
+    evidence: &mut Vec<DynamicWriteEvidence>,
+    additions: impl IntoIterator<Item = DynamicWriteEvidence>,
+) {
+    for addition in additions {
+        if !evidence.contains(&addition) {
+            evidence.push(addition);
+        }
+    }
+    evidence.sort_unstable_by_key(DynamicWriteEvidence::origin);
 }
 
 impl AbsentMemberWitnessValue {
@@ -370,6 +412,175 @@ impl TypeFlowQueryState {
         rows
     }
 
+    pub(super) fn receiver_dispatch_assessment(
+        &mut self,
+        query: ReceiverDispatchQuery<'_>,
+    ) -> ReceiverDispatchAssessment {
+        let ReceiverDispatchQuery {
+            workspace,
+            procedure,
+            file,
+            range,
+            semantic_budget,
+            limits,
+            cancellation,
+            active_semantic_model_snapshot,
+        } = query;
+        let Some(cached) = self.solve(
+            workspace,
+            procedure,
+            semantic_budget,
+            limits,
+            cancellation,
+            active_semantic_model_snapshot,
+        ) else {
+            return ReceiverDispatchAssessment::NotApplicable;
+        };
+        let CachedTypeFlowAnalysis::Live { result, .. } = cached else {
+            return ReceiverDispatchAssessment::NotApplicable;
+        };
+        if !result.complete || result.semantic_budget_exhausted {
+            return ReceiverDispatchAssessment::NotApplicable;
+        }
+        let matching = result
+            .class_sets
+            .iter()
+            .filter(|set| {
+                set.site.file == *file
+                    && set.site.kind == MemberAccessKind::Call
+                    && set.site.purpose == TypeFlowSitePurpose::MemberAccess
+                    && receiver_site_matches_call(set, range)
+            })
+            .collect::<Vec<_>>();
+        let [set] = matching.as_slice() else {
+            return if matching.iter().any(|set| {
+                set.constructor_origin.is_some()
+                    || set.classes.len() > 1
+                    || !set.unknown.is_empty()
+                    || !set.flow_unknown.is_empty()
+            }) {
+                ReceiverDispatchAssessment::Open
+            } else {
+                ReceiverDispatchAssessment::NotApplicable
+            };
+        };
+        let Some(origin) = set.constructor_origin.as_ref() else {
+            return if set.classes.len() > 1
+                || !set.unknown.is_empty()
+                || !set.flow_unknown.is_empty()
+                || !set.dynamic_writes.is_empty()
+            {
+                ReceiverDispatchAssessment::Open
+            } else {
+                ReceiverDispatchAssessment::NotApplicable
+            };
+        };
+        let open = || ReceiverDispatchAssessment::Open;
+        if set.status != ClassSetStatus::Known
+            || !set.unknown.is_empty()
+            || !set.flow_unknown.is_empty()
+            || !set.dynamic_writes.is_empty()
+        {
+            return open();
+        }
+        let Some(method_call) = set.site.call else {
+            return open();
+        };
+        let separate_exact_producer = match &origin.producer {
+            ExactResultProducer::Call(call) => {
+                *call != method_call
+                    && matches!(
+                        origin.source.kind,
+                        SourceSiteKind::ConstructorCall | SourceSiteKind::ExactCallResult
+                    )
+                    && (origin.source.kind != SourceSiteKind::ExactCallResult
+                        || origin.source.file == *file)
+            }
+            ExactResultProducer::MemoryLoad { .. } => {
+                origin.source.kind == SourceSiteKind::ExactAccessResult
+                    && origin.source.file == *file
+            }
+        };
+        let exact_access_result = matches!(
+            origin.source.kind,
+            SourceSiteKind::ExactCallResult | SourceSiteKind::ExactAccessResult
+        );
+        if !separate_exact_producer
+            || (exact_access_result && !set.exact_result_receiver_proven)
+            || origin.classes.len() != set.classes.len()
+            || set.classes.is_empty()
+        {
+            return open();
+        }
+        let origin_classes = origin.classes.iter().collect::<HashSet<_>>();
+        if origin_classes.len() != origin.classes.len()
+            || set
+                .classes
+                .iter()
+                .any(|(class, _)| !origin_classes.contains(class))
+        {
+            return open();
+        }
+        let mut targets = Vec::with_capacity(set.classes.len());
+        for (class, _) in &set.classes {
+            let declarations = set
+                .member_declarations
+                .iter()
+                .filter(|(declared_class, _)| declared_class == class)
+                .collect::<Vec<_>>();
+            let [(_, hit)] = declarations.as_slice() else {
+                return open();
+            };
+            if hit.dispatch_coverage != CandidateCoverage::Exhaustive {
+                return open();
+            }
+            targets.push((class.clone(), hit.declaration.clone()));
+        }
+        if targets.len() != set.member_declarations.len() {
+            return open();
+        }
+        ReceiverDispatchAssessment::Closed(ExactReceiverDispatchProof {
+            targets,
+            member: set.site.member.to_string(),
+        })
+    }
+
+    pub(super) fn python_iterator_return_sets(
+        &mut self,
+        workspace: &WorkspaceAnalyzer,
+        procedure: &SemanticProcedureValue,
+        semantic_budget: &mut SemanticBudget,
+        limits: CodeQueryValueFlowLimits,
+        cancellation: &CancellationToken,
+        active_semantic_model_snapshot: Option<Arc<ActiveSemanticModelSnapshot>>,
+    ) -> Vec<brokk_bifrost_flow::type_flow::ReceiverClassSet> {
+        if !is_python_iterator_method(procedure) {
+            return Vec::new();
+        }
+        let Some(result) = self.solve(
+            workspace,
+            procedure,
+            semantic_budget,
+            limits,
+            cancellation,
+            active_semantic_model_snapshot,
+        ) else {
+            return Vec::new();
+        };
+        let CachedTypeFlowAnalysis::Live { result, .. } = result else {
+            unreachable!("Python __iter__ roots bypass finding-free row hydration")
+        };
+        result
+            .class_sets
+            .iter()
+            .filter(|set| {
+                set.site.purpose == TypeFlowSitePurpose::PythonIteratorReturn
+                    && set.site.procedure == procedure.handle
+            })
+            .cloned()
+            .collect()
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub(super) fn absent_member_findings(
         &mut self,
@@ -421,12 +632,17 @@ impl TypeFlowQueryState {
                 range: source_range(finding.site.span),
                 member: finding.site.member.to_string(),
                 class: finding.class.qualified_name().to_string(),
+                class_name: match &finding.class {
+                    ClassIdentity::Workspace(unit) => unit.terminal_name().to_owned(),
+                    ClassIdentity::External { qualified_name, .. } => qualified_name.to_string(),
+                },
                 proof: finding.proof.clone(),
                 roots: vec![AbsentMemberRootEvidence {
                     root_procedure_id: super::semantic::procedure_wire_id(&finding.root),
                     origin_file: finding.origin.file.clone(),
                     origin_range: source_range(finding.origin.span),
                     origin_span: finding.origin.span,
+                    origin_kind: finding.origin.kind,
                     also_fails_at: finding.also_fails_at.clone(),
                     origin_is_guard: finding.origin.kind == SourceSiteKind::NarrowingGuard,
                     caller: caller.clone(),
@@ -533,12 +749,13 @@ impl TypeFlowQueryState {
     }
 
     fn record_witness_budget(&mut self, omitted_lower_bound: usize) {
-        self.work.witness_truncated = true;
-        self.work.omitted_witnesses = self
-            .work
-            .omitted_witnesses
-            .saturating_add(saturating_u64(omitted_lower_bound));
-        self.push_diagnostic(
+        record_omitted_witnesses(
+            &mut self.work.witness_truncated,
+            &mut self.work.omitted_witnesses,
+            omitted_lower_bound,
+        );
+        push_deduplicated_diagnostic(
+            &mut self.diagnostics,
             CodeQueryDiagnosticCode::TypeFlowWitnessTruncated,
             format!(
                 "absent-member witness projection omitted at least {omitted_lower_bound} witness(es)"
@@ -548,7 +765,8 @@ impl TypeFlowQueryState {
 
     fn record_witness_truncated(&mut self, omitted_lower_bound: usize) {
         self.work.witness_truncated = true;
-        self.push_diagnostic(
+        push_deduplicated_diagnostic(
+            &mut self.diagnostics,
             CodeQueryDiagnosticCode::TypeFlowWitnessTruncated,
             format!(
                 "absent-member witness projection omitted at least {omitted_lower_bound} step(s)"
@@ -557,7 +775,8 @@ impl TypeFlowQueryState {
     }
 
     fn record_witness_unavailable(&mut self, error: &SummaryWitnessError) {
-        self.push_diagnostic(
+        push_deduplicated_diagnostic(
+            &mut self.diagnostics,
             CodeQueryDiagnosticCode::TypeFlowWitnessUnavailable,
             format!(
                 "absent-member witness unavailable: {}",
@@ -577,7 +796,8 @@ impl TypeFlowQueryState {
     ) -> Option<CachedTypeFlowAnalysis> {
         let language = language_for_file(procedure.file());
         let Some(adapter) = type_flow_adapter(language) else {
-            self.push_diagnostic(
+            push_deduplicated_diagnostic(
+                &mut self.diagnostics,
                 CodeQueryDiagnosticCode::SemanticCapabilityUnsupported,
                 format!(
                     "class-set propagation is unsupported for {}",
@@ -689,7 +909,8 @@ impl TypeFlowQueryState {
                                 || "bounded adapter class resolution".to_string(),
                                 |exhaustion| exhaustion.to_string(),
                             );
-                            self.push_diagnostic(
+                            push_deduplicated_diagnostic(
+                                &mut self.diagnostics,
                                 CodeQueryDiagnosticCode::SemanticBudgetExhausted,
                                 format!(
                                     "class-set field index exceeded its semantic budget: {}",
@@ -711,7 +932,8 @@ impl TypeFlowQueryState {
                         } else {
                             CodeQueryDiagnosticCode::SemanticProviderFailed
                         };
-                        self.push_diagnostic(
+                        push_deduplicated_diagnostic(
+                            &mut self.diagnostics,
                             code,
                             format!("class-set field index failed: {error}"),
                         );
@@ -727,9 +949,13 @@ impl TypeFlowQueryState {
             provider_behavior,
             field_slots: field_slots.digest(),
         };
+        let python_iterator_root = is_python_iterator_method(procedure);
         match self.cache.get(&cache_key).cloned() {
-            Some(result @ CachedTypeFlowAnalysis::Live { .. })
-            | Some(result @ CachedTypeFlowAnalysis::FindingFreeRows(_)) => {
+            Some(result @ CachedTypeFlowAnalysis::Live { .. }) => {
+                self.work.cache_hits = self.work.cache_hits.saturating_add(1);
+                Some(result)
+            }
+            Some(result @ CachedTypeFlowAnalysis::FindingFreeRows(_)) if !python_iterator_root => {
                 self.work.cache_hits = self.work.cache_hits.saturating_add(1);
                 Some(result)
             }
@@ -737,21 +963,22 @@ impl TypeFlowQueryState {
                 self.work.cache_hits = self.work.cache_hits.saturating_add(1);
                 None
             }
-            None => {
-                let persistent_key = if field_slots.semantic_budget_exhausted() {
-                    None
-                } else {
-                    root_result_persistence_key(
-                        workspace,
-                        adapter,
-                        provider_behavior,
-                        &field_slots,
-                        &procedure.handle,
-                        active_semantic_model_snapshot.as_deref(),
-                        limits,
-                        semantic_budget.limits(),
-                    )
-                };
+            Some(CachedTypeFlowAnalysis::FindingFreeRows(_)) | None => {
+                let persistent_key =
+                    if field_slots.semantic_budget_exhausted() || python_iterator_root {
+                        None
+                    } else {
+                        root_result_persistence_key(
+                            workspace,
+                            adapter,
+                            provider_behavior,
+                            &field_slots,
+                            &procedure.handle,
+                            active_semantic_model_snapshot.as_deref(),
+                            limits,
+                            semantic_budget.limits(),
+                        )
+                    };
                 let mut persistent_store_failed = false;
                 if let (Some(store), Some(persistent_key)) =
                     (workspace.store(), persistent_key.as_ref())
@@ -788,7 +1015,8 @@ impl TypeFlowQueryState {
                                 self.work.root_result_persistence_misses.saturating_add(1);
                         }
                         Err(_) if cancellation.is_cancelled() => {
-                            self.push_diagnostic(
+                            push_deduplicated_diagnostic(
+                                &mut self.diagnostics,
                                 CodeQueryDiagnosticCode::Cancelled,
                                 "class-set root-result hydration was cancelled".to_string(),
                             );
@@ -904,6 +1132,15 @@ impl TypeFlowQueryState {
                         let projected_rows = if !persistent_store_failed
                             && result.persistence_status == TypeFlowRootPersistenceStatus::Eligible
                             && result.findings.is_empty()
+                            // Constructor-origin evidence is request-local:
+                            // the durable class-set projection does not carry
+                            // the binding, escape, and member-closure proof
+                            // that makes it usable by call_bindings.
+                            && !(adapter.language() == crate::analyzer::Language::Python
+                                && result
+                                    .class_sets
+                                    .iter()
+                                    .any(|set| set.constructor_origin.is_some()))
                             && let Some(persistent_key) = persistent_key.as_ref()
                         {
                             let projected: Arc<[ClassSetRowValue]> =
@@ -917,7 +1154,8 @@ impl TypeFlowQueryState {
                                 cancellation,
                             );
                             if publication == RootResultPublicationOutcome::Cancelled {
-                                self.push_diagnostic(
+                                push_deduplicated_diagnostic(
+                                    &mut self.diagnostics,
                                     CodeQueryDiagnosticCode::Cancelled,
                                     "class-set root-result publication was cancelled".to_string(),
                                 );
@@ -945,7 +1183,11 @@ impl TypeFlowQueryState {
                                 CodeQueryDiagnosticCode::SemanticProviderFailed
                             }
                         };
-                        self.push_diagnostic(code, format!("class-set analysis failed: {error}"));
+                        push_deduplicated_diagnostic(
+                            &mut self.diagnostics,
+                            code,
+                            format!("class-set analysis failed: {error}"),
+                        );
                         self.cache.insert(cache_key, CachedTypeFlowAnalysis::Failed);
                         None
                     }
@@ -1023,24 +1265,6 @@ impl TypeFlowQueryState {
         }
     }
 
-    fn push_diagnostic(&mut self, code: CodeQueryDiagnosticCode, message: String) {
-        if self
-            .diagnostics
-            .iter()
-            .any(|diagnostic| diagnostic.code == code && diagnostic.message == message)
-        {
-            return;
-        }
-        self.diagnostics.push(CodeQueryDiagnostic {
-            code,
-            impact: CodeQueryDiagnosticImpact::Incomplete,
-            branch: Vec::new(),
-            language: "workspace",
-            message,
-            exhausted_roots: Vec::new(),
-        });
-    }
-
     /// Attribute one root's semantic-budget stop to its semantic lanes.
     fn record_semantic_exhausted_root(
         &mut self,
@@ -1075,7 +1299,7 @@ impl TypeFlowQueryState {
             let message = render_exhausted_roots(
                 "class-set semantic input exceeded its budget",
                 &semantic_roots,
-                MAX_EXHAUSTED_ROOT_MESSAGE_BYTES,
+                MAX_DIAGNOSTIC_LIST_MESSAGE_BYTES,
             );
             self.push_exhaustion_diagnostic(
                 CodeQueryDiagnosticCode::SemanticBudgetExhausted,
@@ -1088,7 +1312,7 @@ impl TypeFlowQueryState {
             let message = render_exhausted_roots(
                 "class-set analysis retained incomplete semantic evidence",
                 &incomplete_roots,
-                MAX_EXHAUSTED_ROOT_MESSAGE_BYTES,
+                MAX_DIAGNOSTIC_LIST_MESSAGE_BYTES,
             );
             self.push_exhaustion_diagnostic(
                 CodeQueryDiagnosticCode::SemanticAnalysisPartial,
@@ -1105,14 +1329,12 @@ impl TypeFlowQueryState {
         message: String,
         exhausted_roots: Vec<CodeQueryExhaustedRoot>,
     ) {
-        self.diagnostics.push(CodeQueryDiagnostic {
+        self.diagnostics.push(incomplete_diagnostic(
             code,
-            impact: CodeQueryDiagnosticImpact::Incomplete,
-            branch: Vec::new(),
-            language: "workspace",
+            "workspace",
             message,
             exhausted_roots,
-        });
+        ));
     }
 
     pub(super) fn work(&self) -> CodeQueryTypeFlowWork {
@@ -1215,7 +1437,7 @@ fn root_result_semantics_digest(
     digest.finish()
 }
 
-const ROOT_RESULT_ALGORITHM_ID: &[u8] = b"type-flow-root-algorithm-v14";
+const ROOT_RESULT_ALGORITHM_ID: &[u8] = b"type-flow-root-algorithm-v16";
 
 fn push_usize(digest: &mut LengthDelimitedDigest, value: usize) {
     digest.push(
@@ -1223,6 +1445,23 @@ fn push_usize(digest: &mut LengthDelimitedDigest, value: usize) {
             .expect("bounded type-flow configuration fits in u64")
             .to_le_bytes(),
     );
+}
+
+fn receiver_site_matches_call(set: &ReceiverClassSet, range: Range) -> bool {
+    let Some(call_id) = set.site.call else {
+        return false;
+    };
+    let Some(call) = set.site.procedure.semantics().call_site(call_id) else {
+        return false;
+    };
+    let Some(mapping) = set.site.procedure.semantics().source_mapping(call.source) else {
+        return false;
+    };
+    if mapping.kind != SourceMappingKind::Exact {
+        return false;
+    }
+    let span = mapping.locator.anchor().span();
+    span.start_byte() as usize == range.start_byte && span.end_byte() as usize == range.end_byte
 }
 
 fn project_class_sets(result: &TypeFlowRootResult) -> Vec<ClassSetRowValue> {
@@ -1234,6 +1473,9 @@ fn project_class_sets(result: &TypeFlowRootResult) -> Vec<ClassSetRowValue> {
     let mut merged: Vec<MergedClassSet> = Vec::new();
     let mut site_index: HashMap<(ProjectFile, SourceSpan, &str), usize> = HashMap::default();
     for set in &result.class_sets {
+        if set.site.purpose != TypeFlowSitePurpose::MemberAccess {
+            continue;
+        }
         let key = (
             set.site.file.clone(),
             set.site.span,
@@ -1425,22 +1667,17 @@ fn persisted_class_set_row(
 }
 
 fn persisted_class_set_atom(row: &ClassSetRowValue) -> PersistedClassSetAtom {
-    match (row.origin.as_str(), row.class.as_deref()) {
-        ("workspace", Some(class)) => {
+    match class_set_row_atom_order(row) {
+        ClassSetRowAtomOrder::Workspace(class) => {
             PersistedClassSetAtom::WorkspaceClass(class.to_owned().into_boxed_str())
         }
-        ("external", Some(class)) => {
+        ClassSetRowAtomOrder::External(class) => {
             PersistedClassSetAtom::ExternalClass(class.to_owned().into_boxed_str())
         }
-        (origin, None) => PersistedClassSetAtom::Unknown(
-            UnknownReason::from_label(
-                origin
-                    .strip_prefix("unknown:")
-                    .expect("Unknown origins carry their typed reason label"),
-            )
-            .expect("Unknown origins carry a live typed reason label"),
-        ),
-        _ => unreachable!("live class-set projection preserves atom pairing"),
+        ClassSetRowAtomOrder::Unknown(reason) => PersistedClassSetAtom::Unknown(reason),
+        ClassSetRowAtomOrder::DynamicWrite(_) => {
+            unreachable!("dynamic field writes are filtered before persistence")
+        }
     }
 }
 
@@ -1569,6 +1806,19 @@ pub(super) fn procedure_name(root: &ProcedureHandle) -> String {
         .join(".")
 }
 
+fn is_python_iterator_method(procedure: &SemanticProcedureValue) -> bool {
+    language_for_file(procedure.file()) == crate::analyzer::Language::Python
+        && procedure
+            .handle
+            .semantics()
+            .locator()
+            .declaration()
+            .segments()
+            .last()
+            .and_then(|segment| segment.name())
+            == Some("__iter__")
+}
+
 fn class_set_row_id(
     root_procedure_id: &str,
     file: &ProjectFile,
@@ -1616,7 +1866,7 @@ fn absent_member_finding_id(
 mod tests {
     use super::{
         AbsentMemberFindingValue, AbsentMemberProof, AbsentMemberRootEvidence,
-        ROOT_RESULT_ALGORITHM_ID, TypeFlowQueryState, field_slot_semantic_limits,
+        ROOT_RESULT_ALGORITHM_ID, SourceSiteKind, TypeFlowQueryState, field_slot_semantic_limits,
         root_result_semantics_digest,
     };
     use crate::analyzer::semantic::{
@@ -1801,6 +2051,7 @@ mod tests {
             range,
             member: "missing".to_owned(),
             class: "app.Missing".to_owned(),
+            class_name: "Missing".to_owned(),
             proof: AbsentMemberProof::Proven,
             roots: vec![AbsentMemberRootEvidence {
                 root_procedure_id: "root".to_owned(),
@@ -1811,6 +2062,7 @@ mod tests {
                     SourcePosition::new(1, 0, 1),
                 )
                 .expect("ordered test span"),
+                origin_kind: SourceSiteKind::Unknown,
                 also_fails_at: Vec::new(),
                 origin_is_guard: false,
                 caller: "root".to_owned(),
@@ -1830,24 +2082,9 @@ mod tests {
     }
 
     #[test]
-    fn field_slot_prepass_keeps_finite_workspace_floors_and_larger_caller_lanes() {
-        assert_eq!(
-            field_slot_semantic_limits(SemanticWork::uniform(1)),
-            SemanticWork::default_limits()
-        );
-
-        let mut caller = SemanticWork::default_limits();
-        caller.source_mappings = caller.source_mappings.saturating_mul(2);
-        assert_eq!(
-            field_slot_semantic_limits(caller).source_mappings,
-            caller.source_mappings
-        );
-    }
-
-    #[test]
     fn root_result_semantics_rotates_with_solver_projection_and_semantic_limits() {
         assert_eq!(
-            ROOT_RESULT_ALGORITHM_ID, b"type-flow-root-algorithm-v14",
+            ROOT_RESULT_ALGORITHM_ID, b"type-flow-root-algorithm-v16",
             "a root cached as finding-free before the conditional absent-member tier may now carry a conditional finding"
         );
         let adapter = type_flow_adapter(Language::Python).expect("Python supports type flow");
@@ -2202,6 +2439,21 @@ mod tests {
         assert_diagnostic(
             &mut state,
             CodeQueryDiagnosticCode::TypeFlowWitnessTruncated,
+        );
+    }
+
+    #[test]
+    fn field_slot_prepass_keeps_finite_workspace_floors_and_larger_caller_lanes() {
+        assert_eq!(
+            field_slot_semantic_limits(SemanticWork::uniform(1)),
+            SemanticWork::default_limits()
+        );
+
+        let mut caller = SemanticWork::default_limits();
+        caller.source_mappings = caller.source_mappings.saturating_mul(2);
+        assert_eq!(
+            field_slot_semantic_limits(caller).source_mappings,
+            caller.source_mappings
         );
     }
 }

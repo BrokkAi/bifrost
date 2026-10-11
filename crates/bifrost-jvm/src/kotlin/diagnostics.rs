@@ -28,10 +28,12 @@ use brokk_bifrost_core::analyzer::model::{
 };
 use brokk_bifrost_core::analyzer::query_token::QueryToken;
 use brokk_bifrost_core::analyzer::semantic_diagnostics::node_range;
-use brokk_bifrost_core::analyzer::tree_walk::collect_parse_errors;
+use brokk_bifrost_core::analyzer::tree_walk::{
+    WalkControl, collect_parse_errors, walk_named_tree_preorder,
+};
 use brokk_bifrost_core::analyzer::{CodeUnitIndex, ProjectFile};
 use brokk_bifrost_core::text_utils::compute_line_starts;
-use tree_sitter::{Node, Parser, Tree};
+use tree_sitter::{Node, Tree};
 
 use crate::kotlin::graph_support::KotlinSource;
 use crate::kotlin::syntax::{kotlin_enclosing_import_header, kotlin_type_spelling};
@@ -114,11 +116,7 @@ pub fn collect_kotlin_semantic_diagnostics(
 }
 
 fn parse_kotlin_tree(source: &str) -> Option<Tree> {
-    let mut parser = Parser::new();
-    parser
-        .set_language(&crate::kotlin::language::LANGUAGE.into())
-        .ok()?;
-    parser.parse(source, None)
+    crate::kotlin::language::parse_tree(source)
 }
 
 struct KotlinDiagnosticCollector<'a> {
@@ -137,19 +135,20 @@ struct KotlinDiagnosticCollector<'a> {
 
 impl KotlinDiagnosticCollector<'_> {
     fn scan_tree(&mut self, token: QueryToken<'_>, root: Node<'_>) {
-        let mut stack = vec![root];
-        while let Some(node) = stack.pop() {
+        let mut truncated = false;
+        walk_named_tree_preorder(root, true, |node| {
             if self.errors >= MAX_KOTLIN_SEMANTIC_DIAGNOSTICS {
-                self.report
-                    .push_incomplete(None, vec![SemanticDiagnosticIncompleteReason::Truncated]);
-                break;
+                truncated = true;
+                return WalkControl::Break;
             }
             if node.kind() == "user_type" && kotlin_enclosing_import_header(node).is_none() {
                 self.check_user_type(token, node);
             }
-            let mut cursor = node.walk();
-            let children = node.named_children(&mut cursor).collect::<Vec<_>>();
-            stack.extend(children.into_iter().rev());
+            WalkControl::Continue
+        });
+        if truncated {
+            self.report
+                .push_incomplete(None, vec![SemanticDiagnosticIncompleteReason::Truncated]);
         }
     }
 

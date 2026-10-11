@@ -6,18 +6,24 @@
 //! a value shape is therefore a macro error, and every handler must match the
 //! generated enum exhaustively.
 
+use brokk_bifrost_analysis::analyzer::common::find_by_label;
 use brokk_bifrost_core::analyzer::configuration::{
     ConfigurationMemberRole, ConfigurationScalarKind, ConfigurationValueProvenance,
 };
+use brokk_bifrost_core::analyzer::cpp_class_facts::CppClassFactKind;
+use brokk_bifrost_core::analyzer::cpp_facts::CppProvenanceRule;
+use brokk_bifrost_core::analyzer::statement_facts::StatementFactKind;
 use brokk_bifrost_core::analyzer::structural::control_relation::{
     ALL_CONTROL_EXIT_PARTITIONS, ALL_CONTROL_RELATION_KINDS, ControlExitPartition,
     ControlRelationKind,
 };
 use brokk_bifrost_core::analyzer::structural::flow_state::{
     ALL_FLOW_CERTAINTIES, ALL_FLOW_RELATIONS, ALL_FLOW_SUBJECT_KINDS, ALL_STATE_EVENT_CLASSES,
-    FlowCertainty, FlowRelation, FlowSubjectKind, StateEventClass,
+    ALL_STATE_EVENT_READ_CAUSES, FlowCertainty, FlowRelation, FlowSubjectKind, StateEventClass,
 };
-use brokk_bifrost_core::analyzer::structural::materialization::ALL_DECLARATION_ORIGINS;
+use brokk_bifrost_core::analyzer::structural::materialization::{
+    ALL_DECLARATION_ORIGINS, ALL_EXPORT_FORMS, ALL_GENERATION_INPUT_CLASSES, ALL_GENERATION_KINDS,
+};
 use brokk_bifrost_core::analyzer::structural::occurrences::{
     ALL_NAMESPACES, ALL_OCCURRENCE_CLASSES, ALL_OCCURRENCE_ROLES,
 };
@@ -35,12 +41,12 @@ use brokk_bifrost_core::schema_version::{
     SchemaVersionDescriptor, SchemaVersionRegistry, SchemaVersionResolution,
     UnsupportedSchemaVersion,
 };
-use std::sync::OnceLock;
+use std::sync::{LazyLock, OnceLock};
 
 use super::ir::{
-    AbsentMemberProofFilter, AssignmentRelationKind, CandidateOutcomeLabel, FailureUseConsumer,
-    FailureUseProvenance, JsxElementIdentity, MAX_CAPTURE_LENGTH, MAX_KWARG_NAME_LENGTH,
-    SCHEMA_VERSION, UNATTRIBUTED_TIER_LABEL,
+    AbsentMemberProofFilter, AssignmentRelationKind, CandidateOutcomeLabel, FILE_OF_INPUT_KINDS,
+    FailureUseConsumer, FailureUseProvenance, JsxElementIdentity, MAX_CAPTURE_LENGTH,
+    MAX_KWARG_NAME_LENGTH, SCHEMA_VERSION, UNATTRIBUTED_TIER_LABEL,
 };
 
 /// Metadata for an explicitly typed row literal, shared by lowering and help.
@@ -379,6 +385,7 @@ pub enum ValueShape {
     PatternList,
     PatternMap,
     String,
+    CanonicalIntegerDecimal,
     ParameterName,
     CaptureName,
     RegexString,
@@ -387,9 +394,11 @@ pub enum ValueShape {
     StringPredicate,
     RegexPredicate,
     KindList,
+    AssignmentSequenceKind,
     DeclaredVisibilityList,
     LanguageList,
     PositiveInteger,
+    PermissionBitMask,
     NonNegativeInteger,
     Arity,
     ResultDetail,
@@ -433,11 +442,20 @@ pub enum ValueShape {
     ConfigurationProvenanceList,
     ConfigurationCompletenessList,
     ConfigurationFactsFilter,
+    CrossDomainCorrelation,
+    CrossDomainRequirement,
+    CrossDomainRelation,
+    ConfigurationCodeRelation,
+    CorrelationDocumentList,
+    DependencyConfigurationRelation,
+    CorrelationOverrideList,
+    DependencyEvidenceFilter,
     Boolean,
     UsageKindList,
     OwnerRelationList,
     SiteClassList,
     StateEventClassList,
+    StateEventReadCauseList,
     FlowSubjectKindList,
     FlowRelationList,
     FlowCertaintyList,
@@ -448,6 +466,7 @@ pub enum ValueShape {
     ControlRelationKindList,
     AssignmentRelationKindList,
     BranchRelationKindList,
+    CppProvenanceRuleList,
     ControlExitPartitionList,
     JsxElementIdentity,
     RuntimeFamily,
@@ -473,6 +492,7 @@ impl ValueShape {
             Self::PatternList => "a list/vector of patterns",
             Self::PatternMap => "a map of names to patterns",
             Self::String => "a string",
+            Self::CanonicalIntegerDecimal => "a canonical non-negative decimal integer string",
             Self::ParameterName => "a non-empty parameter name",
             Self::CaptureName => "a non-empty declared capture name",
             Self::RegexString => "a regular expression string",
@@ -483,11 +503,13 @@ impl ValueShape {
             Self::StringPredicate => "an exact string or regex predicate",
             Self::RegexPredicate => "a regex predicate object",
             Self::KindList => "a normalized kind or list of kinds",
+            Self::AssignmentSequenceKind => "list or tuple",
             Self::DeclaredVisibilityList => {
                 "a declared-visibility label or list of labels (public, protected, internal, package_private, private, crate_or_module, unknown)"
             }
             Self::LanguageList => "one or more language labels",
             Self::PositiveInteger => "a positive integer",
+            Self::PermissionBitMask => "a positive u32 permission bit mask",
             Self::NonNegativeInteger => "a non-negative integer",
             Self::Arity => "an exact non-negative count, or :min/:max argument-count bounds",
             Self::ResultDetail => "compact or full",
@@ -536,14 +558,33 @@ impl ValueShape {
             Self::ConfigurationFactOrdinalList => "one or more zero-based fact ordinals",
             Self::ConfigurationProvenanceList => "one or more configuration value provenances",
             Self::ConfigurationCompletenessList => "complete or incomplete",
+            Self::DependencyEvidenceFilter => "a static dependency evidence filter object",
             Self::ConfigurationFactsFilter => {
-                "a configuration-fact format/node/role/key/route/provenance filter object"
+                "a configuration-fact format/node/role/key/value/route/provenance filter object"
+            }
+            Self::CrossDomainCorrelation => {
+                "a registered relation, a code query, and a configuration query"
+            }
+            Self::CrossDomainRequirement => "a code query and a configuration query",
+            Self::CrossDomainRelation => "one registered cross-domain relation",
+            Self::ConfigurationCodeRelation => {
+                "a configuration-to-code match kind and optional anti-join flag"
+            }
+            Self::CorrelationDocumentList => {
+                "one or more exact workspace-relative configuration document paths"
+            }
+            Self::DependencyConfigurationRelation => {
+                "an explicit dependency owner, supported versions, exact document set, override edges, and mitigating property values"
+            }
+            Self::CorrelationOverrideList => {
+                "ordered pairs of lower and higher precedence declared documents"
             }
             Self::Boolean => "a boolean",
             Self::UsageKindList => "one or more usage kinds",
             Self::OwnerRelationList => "one or more owner relations",
             Self::SiteClassList => "use_site or declaration_site",
             Self::StateEventClassList => "one or more state-event classes",
+            Self::StateEventReadCauseList => "one or more synthetic state-event read causes",
             Self::FlowSubjectKindList => "binding or property",
             Self::FlowRelationList => "one or more flow relations",
             Self::FlowCertaintyList => "exact or may",
@@ -556,6 +597,7 @@ impl ValueShape {
                 "self_assignment, failed_swap, or overwritten_unread"
             }
             Self::BranchRelationKindList => "one or more branch relations",
+            Self::CppProvenanceRuleList => "one or more C/C++ provenance rules",
             Self::ControlExitPartitionList => "one or more control exit partitions",
             Self::JsxElementIdentity => "intrinsic, component, or unknown",
             Self::RuntimeFamily => "a supported runtime family",
@@ -617,6 +659,9 @@ impl CallTraversalCompleteness {
 pub enum RqlFormClass {
     Wrapper,
     Predicate,
+    /// A typed cross-domain relation, valid only as the `:relation` of
+    /// `correlate`. It is not a query and not a pattern property.
+    Relation,
 }
 
 /// Selects whether a CodeQuery returns ordinary results, a plan explanation,
@@ -666,7 +711,7 @@ macro_rules! query_step_ops {
     ($($variant:ident {
         shape: $shape:ident,
         label: $label:literal,
-        signature: $signature:literal,
+        signature: $signature:expr,
         description: $description:literal
         $(, semantic: [$($semantic:ident),*])?
         $(,)?
@@ -716,10 +761,8 @@ macro_rules! query_step_ops {
             /// decides whether an execution over one seed file can produce the
             /// same rows as the whole execution restricted to that file.
             ///
-            /// Assigned once here from the driver survey
-            /// (`.agents/docs/rql-seed-partition-map-2026-09.md`, section 2),
-            /// so a new step declares its shape beside its signature instead
-            /// of leaving a partition rule to infer one.
+            /// Assigned once here so a new step declares its shape beside its
+            /// signature instead of leaving a partition rule to infer one.
             pub const fn shape(self) -> QueryStepShape {
                 match self {
                     $(Self::$variant => QueryStepShape::$shape,)+
@@ -767,6 +810,64 @@ macro_rules! query_step_ops {
                 matches!(
                     self,
                     Self::Typestate | Self::ValueFlow | Self::Taint | Self::Witness
+                )
+            }
+
+            /// Whether this operation can put its output rows in a file other
+            /// than the file of the input row it read.
+            ///
+            /// A reverse relation (`call_sites_to`, `callers`, ...) yields the
+            /// referrer of its input. A forward relation (`callees`, `uses`,
+            /// `supertypes`, ...) yields the related declaration or site, not
+            /// the input. A containment relation (`members`, `owner`) can cross
+            /// files where a type and its members are declared apart (Rust
+            /// impl blocks, C++ out-of-line definitions, partial classes). The
+            /// build and generation relations yield rows that belong to build
+            /// files or generation sites. Steps that stay in the input's file
+            /// are not listed: `enclosing_decl`, `procedure_of`, filters,
+            /// projections, and the facts the analyzer derives about the input
+            /// itself (the Python hierarchy facts are located at their root).
+            ///
+            /// A consumer that evaluates a plan one seed file at a time and
+            /// indexes the rows by the file they lie in would ask the wrong
+            /// slice for these rows, so such a plan is not sliceable by file
+            /// (`PlanPartitioning::restricts_to_seed_file`).
+            pub fn rows_may_leave_seed_file(self) -> bool {
+                matches!(
+                    self,
+                    // Reverse relations: the row is the referrer.
+                    Self::Callers
+                        | Self::CallSitesTo
+                        | Self::ReferencesOf
+                        | Self::UsedBy
+                        | Self::OccurrencesOf
+                        | Self::EdgesOf
+                        | Self::FamilyEdges
+                        | Self::ImportersOf
+                        | Self::Subtypes
+                        | Self::StubsOf
+                        // Forward relations: the row is the related
+                        // declaration, file or site.
+                        | Self::Supertypes
+                        | Self::Uses
+                        | Self::Callees
+                        | Self::ImplementationOf
+                        | Self::ImportsOf
+                        | Self::EdgeTarget
+                        | Self::OccurrenceTarget
+                        | Self::CandidateTarget
+                        | Self::SegmentTarget
+                        | Self::ExportTarget
+                        | Self::DispatchTargets
+                        // Containment that can be declared apart.
+                        | Self::Members
+                        | Self::Owner
+                        // Rows that belong to generation sites and build files.
+                        | Self::Generates
+                        | Self::GeneratedBy
+                        | Self::TargetOf
+                        | Self::SourceSetOf
+                        | Self::TopologyEdgesOf
                 )
             }
 
@@ -864,7 +965,6 @@ pub enum QuerySemanticFacet {
     ControlEdges,
     SwitchFacts,
     Typestate,
-    Concurrency,
     ValueFlow,
     Taint,
 }
@@ -872,8 +972,13 @@ pub enum QuerySemanticFacet {
 query_step_ops! {
     Filter { shape: RowLocal, label: "filter", signature: "row -> row", description: "Retain rows satisfying every typed predicate over the input row's public field schema." }
     Project { shape: RowLocal, label: "project", signature: "row -> projected_row", description: "Publish selected public row fields, optionally under new field names, while preserving the row's source and evidence anchor." }
-    EnclosingDecl { shape: RowLocal, label: "enclosing_decl", signature: "structural_match -> declaration", description: "Map structural matches to their smallest real enclosing declarations." }
+    CaptureAnchor { shape: RowLocal, label: "anchor", signature: "structural_match -> structural_match", description: "For each distinct node bound to the named positive pattern capture, retain the structural match with that node's source range as its reported anchor." }
+    ConfigurationAbsence { shape: RowLocal, label: "configuration_absence", signature: "configuration_fact -> configuration_fact", description: "Apply a document-scoped anti-join to configuration facts. The inner configuration-facts query must select document roots; the result is retained only when no authored fact in that same document matches the filter. Incomplete ingestion is never treated as absence." }
+    StatementFacts { shape: RowLocal, label: "statement_facts", signature: "structural_match -> structural_match", description: "Retain structural matches for one registered CodeQL statement fact. C/C++-only kinds return no matches for other languages; nested-loops-with-same-variable is supplied by C++ and C# adapters." }
+    CppFacts { shape: RowLocal, label: "cpp_facts", signature: "structural_match -> structural_match", description: "Retain C++ structural matches that satisfy one registered CodeQL class-rule fact." }
+    EnclosingDecl { shape: RowLocal, label: "enclosing_decl", signature: "structural_match|dispatch_target -> declaration", description: "Map source-backed matches and dispatch targets to their smallest real enclosing declarations." }
     ProcedureOf { shape: RowLocal, label: "procedure_of", signature: "structural_match|declaration -> procedure", description: "Resolve each source-backed input to its smallest enclosing executable procedure.", semantic: [Procedures] }
+    ProgramPointOf { shape: RowLocal, label: "program_point_of", signature: "structural_match -> program_point", description: "Return the unique semantic program point mapped to a structural match; an absent or ambiguous mapping is incomplete.", semantic: [Procedures, ProgramPoints] }
     CfgEntry { shape: RowLocal, label: "cfg_entry", signature: "procedure -> program_point", description: "Return the validated entry program point of each procedure.", semantic: [Procedures, ProgramPoints] }
     CfgExits { shape: RowLocal, label: "cfg_exits", signature: "procedure -> program_point", description: "Return the validated normal and exceptional exit program points of each procedure.", semantic: [Procedures, ProgramPoints] }
     CfgSuccessorEdges { shape: RowLocal, label: "cfg_successor_edges", signature: "program_point -> control_edge", description: "Return one-hop outgoing control edges from each program point.", semantic: [Procedures, ProgramPoints, ControlEdges] }
@@ -881,26 +986,41 @@ query_step_ops! {
     CfgEdgeSource { shape: RowLocal, label: "cfg_edge_source", signature: "control_edge -> program_point", description: "Project each control edge to its source program point.", semantic: [Procedures, ProgramPoints, ControlEdges] }
     CfgEdgeTarget { shape: RowLocal, label: "cfg_edge_target", signature: "control_edge -> program_point", description: "Project each control edge to its target program point.", semantic: [Procedures, ProgramPoints, ControlEdges] }
     Typestate { shape: DerivedValue, label: "typestate", signature: "procedure -> typestate_finding", description: "Run one registered diagnostic-neutral typestate analysis for the exact procedure root.", semantic: [Procedures, Typestate] }
-    ConcurrentAccessConflicts { shape: DerivedValue, label: "concurrent_access_conflicts", signature: "procedure -> concurrent_access_conflict", description: "Build a bounded spawn-rooted task slice and project ordinary accesses to the same location that may execute concurrently, retaining conflict, ordered, and protected verdicts with explicit ordering, protection, proof, and coverage.", semantic: [Procedures, Dispatch, ProgramPoints, ControlEdges, Concurrency] }
     ValueFlow { shape: DerivedValue, label: "value_flow", signature: "procedure -> flow_endpoint", description: "Run one registered diagnostic-neutral value-flow plan for the exact procedure root.", semantic: [Procedures, ValueFlow] }
     ClassSet { shape: DerivedValue, label: "class_set", signature: "procedure -> class_set_row", description: "Propagate constructor, literal, and declared classes through every call reachable from the procedure and report, for each member access, the classes its receiver may hold. A row whose status is not known carries no proof. Class rows include a Boolean guard_only: true means membership follows only from a guard on an unmodeled producer and cannot support an absent-member finding. False does not prove full runtime path feasibility.", semantic: [Procedures, Dispatch, ValueFlow] }
-    AbsentMember { shape: DerivedValue, label: "absent_member", signature: "procedure -> absent_member_finding", description: "Report member accesses whose receiver class set is fully known and contains an independently admitted class that does not declare the member, with the site that introduced the class. A class inferred only by guarding an unmodeled producer is insufficient. The optional proof filter also selects conditional findings: the class certainly reaches the access and lacks the member, but other unclassified values may also reach it. Each row states its proof tier and, for a conditional row, the remainders that keep the set open.", semantic: [Procedures, Dispatch, ValueFlow] }
+    AbsentMember { shape: DerivedValue, label: "absent_member", signature: "procedure -> absent_member_finding", description: "Report member accesses whose receiver class set contains a class admitted by an origin, where that class does not declare the member; include the site that introduced it. A class inferred only by guarding an unmodeled producer is insufficient. The conditional tier can retain other unclassified receiver values, or a listed global dynamic write only when every matching write has no receiver bound and an Any member-name set; its condition names the write sites. A DeclaredParameter origin is admitted only when its annotation resolves to one workspace class and the existing surface checks establish no workspace subclasses, unresolved or unmodeled external bases, or attribute hooks such as __getattr__, __getattribute__, and __setattr__. Its condition states the annotated type and that no workspace subclass exists. Each row states its proof tier and, for a conditional row, the remainders that keep the result conditional.", semantic: [Procedures, Dispatch, ValueFlow] }
     Taint { shape: DerivedValue, label: "taint", signature: "procedure -> taint_finding", description: "Project findings retained by one host-registered production taint result for the exact procedure root.", semantic: [Procedures, Taint] }
     Witness { shape: DerivedValue, label: "witness", signature: "typestate_finding|flow_endpoint|absent_member_finding -> typestate_witness|flow_witness|absent_member_witness", description: "Project bounded retained evidence from each typestate finding, reached flow endpoint, or absent-member finding without rerunning analysis." }
-    FileOf { shape: RowLocal, label: "file_of", signature: "structural_match|declaration|procedure|program_point|control_edge|branch_relation|failure_handler_state|typestate_finding|typestate_witness|flow_endpoint|flow_witness|class_set_row|absent_member_finding|absent_member_witness|taint_finding|reference_site|call_site|expression_site|jsx_attribute_value|receiver_analysis|member_target_analysis|receiver_outcome|receiver_evidence|field_write_value|call_shape|call_argument_group|call_argument|call_binding|call_effect|call_result_contract|call_result_obligation|result_contract_use|result_contract_failure_use|procedure_effect|callable_signature|signature_parameter|decorated_parameter|callable_applicability|overload_selection|dispatch_outcome|dispatch_target|member_family|member_family_edge|state_event -> file", description: "Map structural matches, declarations, procedures, program points, control edges, typestate findings, typestate witnesses, flow endpoints, flow witnesses, class-set rows, absent-member findings, absent-member witnesses, taint findings, reference sites, call sites, expression sites, exact JSX attribute operands, receiver analyses, member-target analyses, receiver outcomes, receiver evidence, exact field-write operands, call-shape rows, call-result-contract rows, reviewed result-obligation rows, typed result-contract operation and failure-use rows, callable-signature rows, decorated-parameter rows, callable-applicability rows, overload-selection rows, dispatch rows, method-family rows, failure-handler state rows, or state-event rows to their workspace files." }
+    FileOf { shape: RowLocal, label: "file_of", signature: file_of_input_signature(), description: "Map structural matches, declarations, procedures, program points, control edges, typed C++ expression rows, typestate findings, typestate witnesses, flow endpoints, flow witnesses, class-set rows, absent-member findings, absent-member witnesses, taint findings, reference sites, call sites, expression sites, exact JSX attribute operands, receiver analyses, member-target analyses, receiver outcomes, receiver evidence, exact field-write operands, call-shape rows, call-result-contract rows, reviewed result-obligation rows, typed result-contract operation and failure-use rows, callable-signature and callable-metrics rows, pending-cleanup-flow rows, decorated-parameter rows, callable-applicability rows, overload-selection rows, dispatch rows, method-family rows, Python hierarchy facts, failure-handler state rows, Rust pointer finding rows, or state-event rows to their workspace files." }
     ImportsOf { shape: RowLocal, label: "imports_of", signature: "file -> file", description: "Traverse one direct project-local import edge forward." }
     ImportersOf { shape: DerivedValue, label: "importers_of", signature: "file -> file", description: "Traverse one direct project-local import edge backward." }
+    PythonImportSite { shape: RowLocal, label: "python_import_site", signature: "structural_match -> structural_match", description: "Enrich a Python import statement with parser-derived import leaves, local resolution, scope, repeated-group membership, the later-duplicate selector, exact except ImportError handler context, self-import, and __all__ facts." }
+    PythonImportCycles { shape: RowLocal, label: "python_import_cycles", signature: "structural_match -> structural_match", description: "Annotate Python import sites with confirmed cycles from the persisted workspace file graph. Missing paths remain incomplete because unresolved, external, dynamic, and path-derived package identities are not authoritative." }
+    PythonCommentedOutCode { shape: RowLocal, label: "python_commented_out_code", signature: "structural_match -> python_rule_fact", description: "Return one row for each Python comment block recognized by CodeQL's commented-out-code heuristics. The row preserves the full source span and exact comment lines; example-heavy, documentation-like, filler, path, URL, doctest, and end-of-line comments are excluded." }
+    PythonUnsafeCyclicImport { shape: RowLocal, label: "python_unsafe_cyclic_import", signature: "structural_match -> python_rule_fact", description: "Report module-level Python member uses and from-imports reached through a persisted import cycle before the target module binds that name. Function-body uses are deferred, while guarded routes and dynamic module attributes remain typed incomplete." }
+    PythonDocumentation { shape: RowLocal, label: "python_documentation", signature: "declaration -> python_rule_fact", description: "Report Python module, class, function, and method documentation facts, including public scope, decoded docstring, CodeQL-style code-line count, override status, property-accessor status, and typed incompleteness." }
+    PythonUselessClass { shape: RowLocal, label: "python_useless_class", signature: "declaration -> python_rule_fact", description: "Report Python class method counts and the inheritance, subclass, special-method, decorator, mixin, statefulness, and top-level exclusions used by the useless-class policy, with typed incompleteness." }
+    PythonAttributeShadowsMethod { shape: RowLocal, label: "python_attribute_shadows_method", signature: "declaration -> python_rule_fact", description: "Report a Python descendant method hidden by an attribute written through an ancestor initializer's self value. Uses complete C3 ancestry and direct declarations; unknown bases, dynamic setattr names, escaped self values, and unresolved local aliases remain typed incomplete." }
+    PythonModificationOfDefaultValue { shape: RowLocal, label: "python_modification_of_default_value", signature: "declaration -> python_rule_fact", description: "Report local mutations that can reach a list, dictionary, or set parameter default through direct local aliases. Rebinding and known emptiness guards stop flow; unresolved escapes and conditional local flow remain typed incomplete." }
+    PythonOverlyComplexDelete { shape: RowLocal, label: "python_overly_complex_delete", signature: "declaration -> python_rule_fact", description: "Report the reachable-block cyclomatic complexity of Python __del__ methods, pruning only exceptional paths and call continuations that exact semantic and handler evidence proves unlikely; unknown raised types retain their paths." , semantic: [Procedures, ProgramPoints, ControlEdges] }
     Supertypes { shape: DerivedValue, label: "supertypes", signature: "declaration -> declaration", description: "Traverse indexed supertypes from supported type declarations." }
     Subtypes { shape: DerivedValue, label: "subtypes", signature: "declaration -> declaration", description: "Traverse indexed subtypes from supported type declarations." }
+    ClassHierarchy { shape: DerivedValue, label: "class_hierarchy", signature: "declaration -> python_hierarchy_fact", description: "Report each selected Python class's typed C3 hierarchy outcome and definite per-base inference_failure facts for unresolved or non-class bases, retaining reason and coverage." }
+    ClassBases { shape: DerivedValue, label: "class_bases", signature: "declaration -> python_hierarchy_fact", description: "Return each written Python base in source order, retaining unresolved and non-class bases as typed facts." }
+    ClassMro { shape: DerivedValue, label: "class_mro", signature: "declaration -> python_hierarchy_fact", description: "Return each class in a complete Python C3 linearization in MRO order; incomplete hierarchies emit no partial MRO rows." }
+    MroMembers { shape: DerivedValue, label: "mro_members", signature: "declaration -> python_hierarchy_fact", description: "Return the effective declaration selected for each Python member name by C3 order, with declaring owner, rank, direct-base definition count, and class-level comparison and inherited-inequality facts." }
+    PythonOverrides { shape: DerivedValue, label: "python_overrides", signature: "declaration -> python_hierarchy_fact", description: "Return one typed outcome per Python method; an override row names the nearest inherited same-name method selected by C3." }
+    PythonCallRelations { shape: DerivedValue, label: "python_call_relations", signature: "declaration -> python_hierarchy_fact", description: "Report exact Python superclass lifecycle calls and super/delete context checks using C3, call shapes, bindings, and bounded dispatch; open evidence stays incomplete.", semantic: [Procedures, Dispatch] }
+    PythonOverrideSignatures { shape: DerivedValue, label: "python_override_signatures", signature: "declaration -> python_hierarchy_fact", description: "Join each Python override selected by C3 with every source and target callable-signature pair, retaining signature identity, arity, and coverage." }
     Members { shape: RowLocal, label: "members", signature: "declaration -> declaration", description: "Return direct indexed members of type declarations." }
     Owner { shape: RowLocal, label: "owner", signature: "declaration -> declaration", description: "Return the exact indexed declaring type of member declarations." }
     ReferencesOf { shape: DerivedValue, label: "references_of", signature: "declaration -> reference_site", description: "Return resolved source reference sites for exact indexed declarations." }
     UsedBy { shape: DerivedValue, label: "used_by", signature: "declaration -> declaration", description: "Return exact declarations containing references to each input declaration." }
     Uses { shape: RowLocal, label: "uses", signature: "declaration -> declaration", description: "Return exact declarations referenced by each input declaration." }
     Callers { shape: DerivedValue, label: "callers", signature: "declaration -> declaration", description: "Traverse resolved incoming call edges to caller declarations, optionally to a bounded depth." }
-    Callees { shape: RowLocal, label: "callees", signature: "declaration -> declaration", description: "Traverse resolved outgoing call edges to callee declarations, optionally to a bounded depth." }
-    CallSitesTo { shape: DerivedValue, label: "call_sites_to", signature: "declaration -> call_site", description: "Return structured call sites whose resolved callee is each input declaration." }
-    CallSitesFrom { shape: RowLocal, label: "call_sites_from", signature: "declaration -> call_site", description: "Return structured call sites lexically owned by each input declaration." }
+    Callees { shape: RowLocal, label: "callees", signature: "declaration -> declaration | procedure -> procedure", description: "Traverse resolved outgoing call edges from declarations. For an exact procedure row, also follow callback arguments only when the resolved callee body invokes the corresponding formal and points-to identity matches a source-backed callable creation." }
+    CallSitesTo { shape: DerivedValue, label: "call_sites_to", signature: "declaration -> call_site", description: "Return structured call sites whose resolved callee is each input declaration, with semantic identity when available." }
+    CallSitesFrom { shape: RowLocal, label: "call_sites_from", signature: "declaration -> call_site", description: "Return structured call sites lexically owned by each input declaration, with semantic identity when available." }
     CallInput { shape: RowLocal, label: "call_input", signature: "call_site -> expression_site", description: "Project one direct receiver or formal-parameter input from each call site." }
     JsxAttributeValue { shape: RowLocal, label: "jsx_attribute_value", signature: "structural_match -> jsx_attribute_value", description: "Project the exact normalized expression operand of JSX attributes, with intrinsic/component/unknown element identity and explicit incompleteness for unresolved semantic cases." }
     ReceiverTargets { shape: DerivedValue, label: "receiver_targets", signature: "structural_match|reference_site|call_site|expression_site|occurrence -> receiver_analysis", description: "Analyze a bounded receiver value using adapter-provided structured facts." }
@@ -910,27 +1030,61 @@ query_step_ops! {
     FieldWriteValue { shape: RowLocal, label: "field_write_value", signature: "member_target_analysis -> field_write_value", description: "Project the exact right-hand expression of a simple assignment whose static member and receiver identities were proven by member_targets, optionally retaining only exact receiver/member identities." }
     ReceiverOutcome { shape: RowLocal, label: "receiver_outcome", signature: "structural_match|reference_site|call_site|expression_site|occurrence|receiver_analysis|member_target_analysis -> receiver_outcome", description: "Analyze an ordinary call or member site directly, or project an existing receiver analysis, into its mandatory terminal outcome row." }
     ReceiverEvidence { shape: RowLocal, label: "receiver_evidence", signature: "structural_match|reference_site|call_site|expression_site|occurrence|receiver_analysis -> receiver_evidence", description: "Analyze an ordinary call or member site directly, or project an existing receiver analysis, into zero or more parent-linked evidence rows." }
+    PointsToCandidates { shape: RowLocal, label: "points_to_candidates", signature: "receiver_analysis -> points_to_candidate", description: "Expand the exact semantic object candidates retained by points_to before receiver/type projection can merge them, preserving each candidate's stable object identity, cardinality, proof, completeness, and set coverage.", semantic: [Procedures, ProgramPoints] }
     CallShape { shape: RowLocal, label: "call_shape", signature: "structural_match|call_site|occurrence -> call_shape", description: "Project the mandatory structured call-shape outcome row for each exact call site, including its structurally decoded callee token and written argument count when available." }
+    ExactExternalCallee { shape: RowLocal, label: "exact_external_callee", signature: "call_shape -> call_shape", description: "Attach the canonical Python external callee proved by the language resolver for a call shape, when available. Import aliases are resolved from structured import bindings; no callee spelling is treated as proof." }
     CallResults { shape: RowLocal, label: "call_results", signature: "call_shape -> call_result", description: "Project the ordered normal result ports of each exact semantic call represented by a call-shape row. Each row carries the structural site identity, semantic call and procedure identities, zero-based result ordinal, procedure-local value identity, result point, and evidence quality so it can join assignments and guards without inferring source order.", semantic: [Procedures, ProgramPoints] }
     CallArgumentGroups { shape: RowLocal, label: "call_argument_groups", signature: "call_shape -> call_argument_group", description: "Project the ordered argument-list group rows of each call shape." }
     CallArguments { shape: RowLocal, label: "call_arguments", signature: "call_argument_group -> call_argument", description: "Project the ordered argument rows of each argument-list group." }
     CallEffects { shape: RowLocal, label: "call_effects", signature: "call_shape -> call_effect", description: "Project the direct effect rows of each call shape: one row per (dispatch arm, declared effect) for every callee an active semantic-model pack declares effects for, carrying the effect id, the pack-authored timing, additive canonical execution timing, the certainty meet of the declaration and the dispatch proof, and the pack provenance. At least one row per call shape, so an unresolved, unmodeled or unsupported dispatch states that instead of answering empty. The callee set and its proof are the dispatch oracle's own answer; nothing is re-derived here.", semantic: [Procedures] }
     ResultContractCalls { shape: Batched, label: "result_contract_calls", signature: "call_shape -> call_shape", description: "Retain call shapes whose exhaustively resolved canonical dispatch arms unanimously select an activated semantic-model summary with at least one reviewed result contract. This lightweight positive candidate discovery uses structural call shapes, exact definition resolution (including Go package, bound-receiver, and conservative method-expression applicability), and activated model keys without materializing procedure semantics: conclusively unmodeled calls are omitted, while conflicts or interrupted dispatch make the query incomplete." }
     CallResultContracts { shape: Batched, label: "call_result_contracts", signature: "call_shape -> call_result_contract", description: "Project reviewed validity contracts for a call's normal results from the unique activated semantic-model summary for every possible dispatch arm. A positive row identifies the protected result ordinal and either a predicate over a separate condition result or a direct result-success predicate, derives only the exact normalized success-guard edges needed to instantiate that contract, counts reviewed member contracts, and reports whether every modeled arm declares a fresh allocation at that indexed result. It does not inspect resource-sensitive uses. At least one row per call shape; unresolved dispatch or conflicting models produce an explicit terminal row and incomplete query rather than an empty answer.", semantic: [Procedures, Dispatch, ProgramPoints, ControlEdges] }
-    CallResultObligations { shape: Batched, label: "call_result_obligations", signature: "call_shape -> call_result_obligation", description: "Project exact Java result-use and reviewed return-use obligations from the selected JDK artifact. A positive row requires exact discarded-result syntax, a resolver-owned call, an applicable reviewed model on every feasible dispatch arm, and no unaccounted dynamic target. Missing source, artifact, model, or dispatch proof produces an explicit incomplete terminal row.", semantic: [Procedures, Dispatch] }
+    CallResultObligations { shape: Batched, label: "call_result_obligations", signature: "call_shape -> call_result_obligation", description: "Project exact per-port call-result-use classifications for languages with structured adapters. Java rows join discarded calls to reviewed return-use obligations from the selected JDK artifact, Python and TypeScript rows may join reviewed pure builtin string transformations under their explicitly stated builtin-receiver assumptions, JavaScript rows require an exact literal/template or builtin String constructor receiver, and PHP rows may join reviewed global-function transformations and false-status obligations only after resolver-proven global-function identity and activated declaration evidence. Go rows may join a native predeclared-error obligation, Rust rows may join native Result or must_use obligations proved from resolved declaration signatures, and C/C++ rows may join native must-use obligations proved from structurally selected nodiscard or warn_unused_result declaration and workspace type attributes. Every row publishes obligation provenance and basis when present; missing source, syntax, model, signature, attribute, or dispatch proof remains explicit in coverage and reason fields.", semantic: [Procedures, Dispatch] }
+    ProcedureReturnProfile { shape: RowLocal, label: "procedure_return_profile", signature: "procedure -> python_rule_fact", description: "Project one typed Python callable return profile from reachable ProcedureReturn events and exact return syntax, including value/None counts, async/generator status, and explicit coverage.", semantic: [Procedures, ProgramPoints, ControlEdges] }
+    PythonIteratorReturnProtocol { shape: DerivedValue, label: "python_iterator_return_protocol", signature: "procedure -> python_rule_fact", description: "For each value returned by a Python __iter__ method, propagate its bounded runtime classes and check inherited __iter__ and __next__ members. Unknown or incomplete class sets stay open.", semantic: [Procedures, Dispatch, ValueFlow] }
+    PythonBuiltinIdentity { shape: RowLocal, label: "python_builtin_identity", signature: "occurrence -> python_rule_fact", description: "Resolve one unqualified Python builtin-name occurrence against its exact lexical binding and the Python builtin inventory. A local or module binding is reported as a partial shadow; the optional call_callee field selects only the exact function child of a parsed call expression." }
+    PythonUninitializedVariable { shape: RowLocal, label: "python_uninitialized_variable", signature: "occurrence -> python_rule_fact", description: "Join one exact Python value reference to its lexical binding and procedure-local CFG read. Emit a finding only when the binding may be uninitialized on a modeled path; module/class scopes, globals, builtins, closures and open flow identities remain incomplete.", semantic: [Procedures, ProgramPoints, ControlEdges] }
+    PythonVariableOf { shape: RowLocal, label: "python_variable_of", signature: "binding|occurrence -> python_rule_fact", description: "Map one Python lexical binding or identifier occurrence to its query-local lexical variable, grouping definitions and uses by resolved scope and name with global/nonlocal redirection." }
+    PythonVariableDefinitions { shape: RowLocal, label: "python_variable_definitions", signature: "python_rule_fact -> python_rule_fact", description: "Return the source-ordered definitions of one Python lexical variable with definition kind, first-definition status, reachability, and variable identity." }
+    PythonVariableUses { shape: RowLocal, label: "python_variable_uses", signature: "python_rule_fact -> python_rule_fact", description: "Return reads and writes of one Python lexical variable, including whether each use occurs in a nested scope." }
+    PythonVariablePeers { shape: RowLocal, label: "python_variable_peers", signature: "python_rule_fact -> python_rule_fact", description: "Return same-name Python lexical variables from other scopes in the same file, preserving both variable identities and module-definition exclusion facts." }
+    PythonVariableNestedLoops { shape: RowLocal, label: "python_variable_nested_loops", signature: "python_rule_fact -> python_rule_fact", description: "Return nested Python for-loop pairs that target one lexical variable, with outer-loop use and whether a later read observes the inner target after the inner loop." }
+    PythonRaiseNotImplemented { shape: RowLocal, label: "python_raise_not_implemented", signature: "structural_match -> python_rule_fact", description: "Resolve the exact value raised by a Python raise statement and report the builtin NotImplemented singleton, a partial local shadow, or open identity. Supports direct and call-form raises and one exact same-block local alias; unresolved identity remains open." }
+    CallResultUse { shape: RowLocal, label: "call_result_use", signature: "call_shape -> python_rule_fact", description: "Classify an exact Python call result as consumed, discarded, or open and include its resolved local callable return contract when proven. Module-level call use is structural and does not invent a module procedure.", semantic: [Procedures, Dispatch] }
+    PythonAssertionContext { shape: RowLocal, label: "python_assertion_context", signature: "structural_match -> python_rule_fact", description: "Classify the enclosing Python assertion test scope and whether the assertion is a direct statement in the terminal else suite of an elif chain. Unresolved unittest inheritance remains unknown." }
+    TupleReturnAssignment { shape: RowLocal, label: "tuple_return_assignment", signature: "structural_match -> python_rule_fact", description: "Resolve a direct Python tuple or list assignment from a local call and compare the exact return tuple arities with the direct assignment target count. Dynamic targets and incomplete return identities stay open.", semantic: [Procedures, Dispatch] }
+    PythonImplicitStringConcatenation { shape: RowLocal, label: "python_implicit_string_concatenation", signature: "structural_match -> python_rule_fact", description: "Emit one Python rule-fact row per implicit string literal part inside a list element that is concatenated with another string constant. Each row is anchored on the literal part." }
+    TupleReturnGroups { shape: RowLocal, label: "tuple_return_groups", signature: "procedure -> python_rule_fact", description: "Group exact Python tuple-return arities by callable, follow only supported local tuple identities, and preserve annotation exclusion and incomplete flow evidence.", semantic: [Procedures, ProgramPoints, ControlEdges] }
+    LambdaForwarding { shape: RowLocal, label: "lambda_forwarding", signature: "structural_match -> python_rule_fact", description: "Prove whether an exact Python lambda forwards its positional parameters unchanged to one exact local callable; changed arguments and unsupported or ambiguous forms remain explicit.", semantic: [Procedures, Dispatch] }
+    PythonFormatIssues { shape: RowLocal, label: "python_format_issues", signature: "structural_match -> python_rule_fact", description: "Project typed Python brace-format and percent-format issue rows from exact call and binary-expression nodes. Format values and single-initializer aliases are resolved structurally; unsupported argument or value shapes remain typed incomplete." }
+    PythonUrlConstruction { shape: RowLocal, label: "python_url_construction", signature: "structural_match -> python_rule_fact", description: "Project one typed URL-control fact per exact Python string-construction slot in concatenation, f-strings, percent formatting, and literal str.format calls. Decoded constant prefixes classify full versus partial URL control; unknown source shapes remain typed incomplete." }
+
+    PythonRaiseLegality { shape: RowLocal, label: "python_raise_legality", signature: "structural_match -> python_rule_fact", description: "Classify the exact operand of a Python raise statement as a proven exception class/instance, a proven non-exception value, or open when resolver or hierarchy evidence is incomplete." }
+    PythonSpecialMethodRaise { shape: RowLocal, label: "python_special_method_raise", signature: "structural_match -> python_rule_fact", description: "Compare an exact direct Python raise operand in a special method with CodeQL's documented exception families, retaining open results for incomplete CFG, hierarchy, handler, or inherited-method evidence.", semantic: [Procedures, ProgramPoints, ControlEdges] }
     ResultContractUses { shape: Batched, label: "result_contract_uses", signature: "call_result_contract -> call_result_contract", description: "Summarize operation-sensitive uses of each positive call-result-contract row while preserving acquisition identity. This optional enrichment counts every exact structured operation, reports the lower bound of reviewed required operations proved unguarded, and carries aggregate use-validation coverage. Terminal rows pass through unchanged; incomplete structured use evidence makes only this relation incomplete.", semantic: [Procedures, Dispatch, ProgramPoints, ControlEdges] }
     ResultSubjectUses { shape: Batched, label: "result_subject_uses", signature: "call_result -> result_subject_use", description: "Project procedure-local exact normal-result reference provenance to receiver uses. It makes no claim about freshness, non-nullness, distinctness, or provider behavior. Explicit terminal unknown rows pass through unchanged and preserve incomplete call-result discovery.", semantic: [Procedures, ProgramPoints, ControlEdges] }
     ResultContractOperationUses { shape: Batched, label: "result_contract_operation_uses", signature: "call_result_contract -> result_contract_use", description: "Project one typed row per structured operation on a protected result. Intrinsic dereference, field, and index operations are required uses. Receiver calls use exact complete member operation contracts. Exact positional call arguments use complete possible-target procedure-entry preconditions and carry parameter_ordinal. Missing, conflicting, expanded, or ambiguous operation evidence stays open. Each row is anchored at the operation and carries its acquisition identity, exact applicability, timing, required predicate, and guarded, unguarded, not_applicable, or unknown verdict.", semantic: [Procedures, Dispatch, ProgramPoints, ControlEdges] }
     ResultContractFailureUses { shape: Batched, label: "result_contract_failure_uses", signature: "call_result_contract -> result_contract_failure_use", description: "Project structured values returned or passed to calls inside the exact failure arm of a reviewed conditional result contract. Each row compares the operand's exact reaching binding/value provenance with the paired condition result and classifies condition_result, distinct_zero_binding, distinct_binding, independent, or unknown. Exact normalized failure-edge confinement and complete structured identity are required for closed proof; ambiguity remains an open unknown row.", semantic: [Procedures, Dispatch, ProgramPoints, ControlEdges] }
-    NilnessOperations { shape: RowLocal, label: "nilness_operations", signature: "procedure -> nilness_operation", description: "Project source-backed pointer operations with their procedure-local scalar nilness fact. Explicit dereferences and implicit pointer field loads or stores are intrinsic operations; receiver calls are included only when exhaustive reviewed models require a non-null receiver. Unsupported identity or scalar evidence stays explicit and open rather than becoming a finding.", semantic: [Procedures, Dispatch, ProgramPoints, ControlEdges] }
+    NilnessOperations { shape: RowLocal, label: "nilness_operations", signature: "procedure -> nilness_operation", description: "Project source-backed pointer operations with their procedure-local scalar nilness fact. Explicit dereferences and implicit pointer field loads or stores are intrinsic operations; receiver calls are included only when exhaustive reviewed models require a non-null receiver. Unsupported identity or scalar evidence stays explicit and open rather than becoming a finding. Only Go procedures are supported; for other languages the step yields no rows and the result carries an incomplete unsupported_structural_feature diagnostic.", semantic: [Procedures, Dispatch, ProgramPoints, ControlEdges] }
     SwitchCoverage { shape: RowLocal, label: "switch_coverage", signature: "procedure -> switch_coverage", description: "Project one source-backed coverage verdict for each switch. An explicit default is exhaustive; an exact Boolean expression selector is exhaustive only with both literal cases and non-exhaustive when a complete literal case set omits either value. Expressionless switches without default, type switches, open selector domains, and nonliteral case sets remain unknown.", semantic: [Procedures, ProgramPoints, ControlEdges, SwitchFacts] }
-    AssignmentRelations { shape: RowLocal, label: "assignment_relations", signature: "procedure -> assignment_relation", description: "Project source-backed assignment relation rows for C, Java, JavaScript, TypeScript, and Python by joining prepared syntax to exact local-binding, same-evaluation, and reaching-definition evidence. The default selects self-assignment; failed-swap is opt-in and requires crossed exact bindings and ordered writes. Unsupported candidates, dialects, and selected relations report incomplete coverage rather than certifying absence.", semantic: [Procedures, ProgramPoints, ControlEdges] }
+    AssignmentRelations { shape: RowLocal, label: "assignment_relations", signature: "procedure -> assignment_relation", description: "Project source-backed assignment and local-initializer relation rows by joining prepared syntax to exact local-binding, same-evaluation, and reaching-definition evidence. The default selects self-assignment; self-initializer and failed-swap are opt-in. Unsupported candidates, dialects, and selected relations report incomplete coverage rather than certifying absence.", semantic: [Procedures, ProgramPoints, ControlEdges] }
     DetachedTaskTransfers { shape: RowLocal, label: "detached_task_transfers", signature: "procedure -> detached_task_transfer", description: "Project receiver, argument, and exact local closure-capture values copied into calls whose semantic invocation mode is detached and whose execution timing is different_task. Each row carries stable value identity and an exact abstract-object identity when the heap oracle proves one closed candidate; absent, ambiguous, open, or unproven object sets remain explicit open terminal rows.", semantic: [Procedures, ProgramPoints] }
-    ProcedureEffects { shape: RowLocal, label: "procedure_effects", signature: "declaration -> procedure_effect", description: "Summarize the effects of each procedure over its reachable call graph: one row per (procedure, effect id), classified direct or transitive, with the hop count, the certainty and timing carried along the attributing chain, a bounded witness chain of call-site identities, and the coverage that says whether an absent effect is proven absent or merely unseen. At least one row per declaration. The walk is a bounded deterministic fixpoint over the same dispatch answers call_effects publishes.", semantic: [Procedures] }
+    ProcedureEffects { shape: RowLocal, label: "procedure_effects", signature: "declaration|procedure -> procedure_effect", description: "Summarize the effects of each declaration or exact procedure row over its reachable call graph: one row per (procedure, effect id), classified direct or transitive, with the hop count, the certainty and timing carried along the attributing chain, a bounded witness chain of call-site identities, and the coverage that says whether an absent effect is proven absent or merely unseen. At least one row per input procedure. The walk is a bounded deterministic fixpoint over the same dispatch answers call_effects publishes.", semantic: [Procedures] }
     CallBindings { shape: RowLocal, label: "call_bindings", signature: "call_shape -> call_binding", description: "Project the normalized actual-to-formal binding rows of each call shape: one row per written actual, carrying the call-shape argument identity it binds, the formal ordinal and name it was bound to, the binding kind, this row's mapping status, and the whole call's partition coverage. Beside them, a row for each fact no written actual accounts for: the receiver the call is made against, an argument the language supplies with no syntax, and a formal that no actual passed but whose declaration carries a default. Coverage describes the written actuals alone. Exact receiver rows carry a stable declaring-type identity. Selector proof is separate from runtime dispatch: it is derived for exact dispatch or for a resolver-proven receiverless external static target whose unique complete model supplies exact formals. It can also be authored-summary proof when a unique complete exact-member summary explicitly covers the sole unresolved override residual; full activated provenance is retained. Workspace arms, ambiguous overloads, partial or conflicting models, unproven owner identity, instance boundaries without a contract, other boundary kinds, and truncation remain inexact. The semantic dispatch identity, proof, completeness, and candidate coverage are still carried unchanged from the bounded dispatch answer. A source declaration is only an optional materialized view. At least one row per call shape, so an unreadable shape, an unresolved or ambiguous callee, unrecorded formals, or a call that binds nothing each state that instead of answering empty. The callee is the one the production definition resolver binds; no overload is re-decided here.", semantic: [Procedures, Dispatch] }
     ResolvedCall { shape: RowLocal, label: "resolved_call", signature: "call_binding -> call_binding", description: "Retain call-binding rows that prove one resolved callable identity with exact or declared selector proof and an optional exact receiver-type identity. Qualified RQL locators are resolved only at a loaded-policy boundary." }
+    ResolvedValue { shape: RowLocal, label: "resolved_value", signature: "call_binding|structural_match -> same row", description: "Retain a call actual, a Python/C# decorator attribute name, or a C# structured value node only when its selected non-call expression, class-constructor call, attribute name, or structured member expression resolves to the requested exact declaration identity. Unresolved, ambiguous, shadowed, unsupported, or budget-limited values make the query incomplete. Qualified locators are resolved at the loaded-policy boundary." }
     CallArgument { shape: RowLocal, label: "call_argument", signature: "call_binding -> call_binding", description: "Retain the source actual bound to one formal name or zero-based formal index, requiring exact mapping, exhaustive coverage, a non-terminal row, and argument identity." }
-    CallableSignature { shape: RowLocal, label: "callable_signature", signature: "declaration -> callable_signature", description: "Project the mandatory callable-signature rows of each declaration from the persisted signature contract: one row per persisted signature entry, so an overload set separates into one row per overload." }
+    CppBadStrncpySize { shape: RowLocal, label: "cpp_bad_strncpy_size", signature: "call_binding -> structural_match", description: "Retain source-backed C/C++ match rows for which a structurally resolved strncpy call passes a source fixed-array extent larger than the destination extent as its size argument. Compose this step after resolved-call and call-argument with the declared library identity; unresolved identity is never selected by callee name." }
+    CppNetworkToHostFunctionAsArrayBound { shape: RowLocal, label: "cpp_network_to_host_function_as_array_bound", signature: "call_binding -> structural_match", description: "Retain source-backed C/C++ match rows for which a structurally resolved ntohl call is the direct bound argument of memcpy. Compose this step after resolved-call and call-argument with the declared library identity; unresolved identity is never selected by callee name." }
+    CppNonConstantFormat { shape: RowLocal, label: "cpp_non_constant_format", signature: "call_binding -> structural_match", description: "Retain exact modeled C/C++ printf-family calls whose format argument is not a direct constant string literal, projected back to the source call seed. Unknown identifier value flow remains incomplete." }
+    CppWrongNumberFormatArguments { shape: RowLocal, label: "cpp_wrong_number_format_arguments", signature: "call_binding -> structural_match", description: "Retain exact modeled C/C++ printf-family calls whose complete literal format requires more variadic arguments than the call supplies, projected back to the source call seed." }
+    CppTooManyFormatArguments { shape: RowLocal, label: "cpp_too_many_format_arguments", signature: "call_binding -> structural_match", description: "Retain exact modeled C/C++ printf-family calls that supply more variadic arguments than their complete literal format consumes, projected back to the source call seed." }
+    CppWrongTypeFormatArgument { shape: RowLocal, label: "cpp_wrong_type_format_argument", signature: "call_binding -> structural_match", description: "Retain exact modeled C/C++ printf-family calls whose structured literal or parameter type is incompatible with a parsed conversion directive, projected back to the source call seed." }
+    CppNonPortablePrintf { shape: RowLocal, label: "cpp_non_portable_printf", signature: "call_binding -> structural_match", description: "Retain exact modeled C/C++ printf calls whose structured argument type depends on a non-portable integer width or pointer format contract, projected back to the source call seed." }
+    CppOverflowingSnprintf { shape: RowLocal, label: "cpp_overflowing_snprintf", signature: "call_binding -> structural_match", description: "Retain modeled snprintf calls only when a future bounded destination-extent and return-flow producer proves overflow; missing extent or flow evidence is incomplete. Positive rows are projected back to the source call seed." }
+    CallableSignature { shape: RowLocal, label: "callable_signature", signature: "declaration -> callable_signature", description: "Project the mandatory callable-signature rows of each declaration from the persisted signature contract: one row per persisted signature entry, so an overload set separates into one row per overload. Python special methods also carry a query-time protocol arity verdict derived from their prepared declaration body; placeholders and unavailable syntax are explicit." }
+    LiteralOccurrences { shape: RowLocal, label: "literal_occurrences", signature: "structural_match -> literal_occurrence", description: "Project one query-local scalar literal occurrence for each selected literal fact. Decoded strings, signed integers, booleans and nulls carry typed identities; unsupported, floating-point, character, collection, or recovered values remain incomplete rows." }
+    CallableMetrics { shape: RowLocal, label: "callable_metrics", signature: "declaration -> callable_metrics", description: "Project query-local structured cognitive complexity, maximum executable nesting, and owned executable span metrics for each source-backed callable. Incomplete parser or ownership evidence remains explicitly covered as incomplete." }
     SignatureParameters { shape: RowLocal, label: "signature_parameters", signature: "callable_signature -> signature_parameter", description: "Project the ordered declared parameter rows of each callable signature." }
     DecoratorBindings { shape: Batched, label: "decorator_bindings", signature: "structural_match -> decorated_parameter", description: "Project one typed decorator-binding row for each decorator applied to a parameter match. Semantic parameter identity is used only when an exact structural source identity selects one Parameter value; otherwise the row retains only a syntax explanation and explicitly incomplete coverage.", semantic: [Procedures] }
     CallableApplicability { shape: DerivedValue, label: "callable_applicability", signature: "occurrence -> callable_applicability", description: "Project one applicability row per candidate callable the production resolver considered for each reference occurrence: the verdict, the typed callable rejection reason when inapplicable, the precedence tier, and whether the resolver bound it. A candidate the resolver refused stays visible with its reason, so a losing overload is evidence rather than an absence." }
@@ -941,28 +1095,41 @@ query_step_ops! {
     MemberFamily { shape: DerivedValue, label: "member_family", signature: "declaration -> member_family", description: "Project the mandatory canonical method-family outcome row for each member declaration: the family id when the analyzer proves the family, the typed reason when it cannot, the per-relation edge counts, and the coverage. Exactly one row per input declaration, so an unsupported language or an unprovable overload identity is stated rather than silently empty." }
     FamilyEdges { shape: DerivedValue, label: "family_edges", signature: "declaration -> member_family_edge", description: "Project the typed method-family edges of each member declaration: the forward overrides/implements edges the analyzer proves, plus the bounded inversion of those same edges as overridden_by/implemented_by. Emitted only from a proven family, so an unproven or unsupported member yields no edge row and its outcome row says why." }
     OccurrencesOf { shape: DerivedValue, label: "occurrences_of", signature: "declaration -> occurrence", description: "Return the declaration-name occurrence of each declaration plus every reference-class occurrence resolving to it." }
-    OccurrencesIn { shape: RowLocal, label: "occurrences_in", signature: "structural_match|file -> occurrence", description: "Return classified identifier occurrences lexically inside each structural match or file." }
+    OccurrencesIn { shape: RowLocal, label: "occurrences_in", signature: "structural_match|call_shape|lexical_scope|file -> occurrence", description: "Return classified identifier occurrences lexically inside each structural match or call shape, in the exact innermost lexical scope, or in the file." }
     OccurrenceTarget { shape: DerivedValue, label: "occurrence_target", signature: "occurrence -> declaration", description: "Project the resolved semantic targets of reference-class occurrences." }
     ScopeOf { shape: RowLocal, label: "scope_of", signature: "binding|occurrence|structural_match -> lexical_scope", description: "Return the innermost lexical scope that owns each binding, occurrence, or structural match." }
     ScopeAncestors { shape: RowLocal, label: "scope_ancestors", signature: "lexical_scope -> lexical_scope", description: "Return the enclosing lexical scopes of each scope, innermost first, excluding the scope itself." }
     BindingsIn { shape: RowLocal, label: "bindings_in", signature: "lexical_scope|structural_match -> binding", description: "Return the bindings declared in each lexical scope, or in the scopes inside each structural match." }
     BindingOf { shape: RowLocal, label: "binding_of", signature: "occurrence -> binding", description: "Return the binding of the occurrence's name that is in effect at its exact position." }
     BindingOccurrence { shape: RowLocal, label: "binding_occurrence", signature: "binding -> occurrence", description: "Return the binder-class occurrence row of each binding's declaring token." }
+    BindingUses { shape: RowLocal, label: "binding_uses", signature: "binding -> occurrence", description: "Return reference occurrences whose exact lexical BindingOf result is this binding, deriving the join from per-file occurrence and binding facts." }
+    PythonComparisonConstants { shape: RowLocal, label: "python_comparison_constants", signature: "comparison -> comparison", description: "Retain Python comparisons whose two AST operands are supported constants: scalar and parenthesized literals, constant tuples, constant string concatenation, and unary not, numeric signs, or bitwise inversion over constants. Direct assert tests and unsupported computed expressions are excluded." }
+    PythonComparisonUsingIs { shape: RowLocal, label: "python_comparison_using_is", signature: "comparison -> comparison", description: "Retain Python is/is-not comparisons when a resolved operand has value equality through a builtin value type or an effective custom __eq__ in its complete MRO. Singleton identity checks and classes without custom equality are excluded; unresolved classes report incomplete." }
+    PythonComparisonUsingIsNonPortable { shape: RowLocal, label: "python_comparison_using_is_non_portable", signature: "comparison -> comparison", description: "Retain Python is/is-not comparisons against integer or string literals that CPython interns but Python implementations do not universally intern. Universal singleton, empty-string, and zero identities are excluded; unresolved operand classes report incomplete." }
+    IdenticalOperands { shape: RowLocal, label: "identical_operands", signature: "comparison -> comparison", description: "Retain Python comparisons whose bare-name operands resolve to one exact lexical binding, or whose static attribute paths have the same member segments and a root bound to that same identity. Unsupported computed operands are outside this relation; unresolved supported bindings make the query incomplete." }
+    PythonMissingSelf { shape: RowLocal, label: "python_missing_self", signature: "comparison -> comparison", description: "Retain Python method comparisons of the same bare name when that name has no local binding or explicit global/nonlocal directive and a grammar-selected self.<name> access exists in the same class with self bound to a method parameter." }
     CandidatesOf { shape: DerivedValue, label: "candidates_of", signature: "occurrence -> resolution_candidate", description: "Return the candidates the resolver considered for each reference-class occurrence, with tier, outcome, and boundary." }
     CandidateHierarchy { shape: DerivedValue, label: "candidate_hierarchy", signature: "occurrence -> candidate_hop", description: "Return the exact hierarchy hops each traced member candidate of a reference occurrence was found through. A depth-zero candidate contributes no hop, and a candidate the resolver recorded without member attribution contributes none either -- absence here is unattributed, never a claim that no hierarchy was walked; the mandatory outcome story is member_selection's." }
     CandidateTarget { shape: DerivedValue, label: "candidate_target", signature: "resolution_candidate -> declaration", description: "Project the workspace declarations of unit-backed resolution candidates." }
     EdgesOf { shape: DerivedValue, label: "edges_of", signature: "declaration -> reference_edge", description: "Return the canonical inverse reference edges of each declaration: every usage site the usage index enumerates, with kind, proof, usage kind, and owner relation." }
     EdgesFrom { shape: RowLocal, label: "edges_from", signature: "occurrence -> reference_edge", description: "Return the canonical forward reference edges of each occurrence: the resolver's own resolved targets for that exact token, with kind, proof, usage kind, and owner relation." }
     EdgeTarget { shape: DerivedValue, label: "edge_target", signature: "reference_edge -> declaration", description: "Project each reference edge to its exact indexed target declaration." }
-    StateEventsOf { shape: RowLocal, label: "state_events_of", signature: "procedure|declaration -> state_event", description: "Derive the flow-sensitive state events of each procedure from the production semantic IR: every establishment, kill, and read of a binding or of a property of a canonical binding base, anchored to a program point of that procedure's control-flow graph. Source order and containment are never evidence; an axis the lowering does not model is reported incomplete rather than approximated.", semantic: [Procedures, ProgramPoints] }
+    StateEventsOf { shape: RowLocal, label: "state_events_of", signature: "procedure|declaration -> state_event", description: "Derive flow-sensitive state events from the production semantic IR. Synthetic reads at async suspension points identify either a modeled post-resume use or a Rust binding kept live by its lexical scope and CFG paths; scope-only reads are syntactic and do not prove a binding is non-Copy. Source order is never used as CFG evidence.", semantic: [Procedures, ProgramPoints] }
+    BindingInitializerCallsOf { shape: RowLocal, label: "binding_initializer_calls_of", signature: "state_event -> binding_initializer_call", description: "For one Rust binding establishment, project exact call sites on the initializer result and method-receiver chain. The establishment event id and the call's site_ast_id are exposed as typed stable-id join keys; unsupported AST or semantic value links stay explicitly incomplete.", semantic: [Procedures] }
     FlowRelationsOf { shape: RowLocal, label: "flow_relations_of", signature: "state_event|procedure -> flow_relation", description: "Derive the flow relations between the state events of each procedure: reaching-definition, dominance, and same-evaluation, each with exact or may certainty. Seeded from a state event, only the relations incident to that event are returned. Budget exhaustion emits no rows and an explicit incomplete diagnostic; it is never reported as an absent relation.", semantic: [Procedures, ProgramPoints, ControlEdges] }
     FlowSource { shape: RowLocal, label: "flow_source", signature: "flow_relation -> state_event", description: "Project each flow relation to its source state event: the establishment or kill end." }
     FlowTarget { shape: RowLocal, label: "flow_target", signature: "flow_relation -> state_event", description: "Project each flow relation to its target state event: the read end." }
-    FailureHandlerState { shape: RowLocal, label: "failure_handler_state", signature: "structural_match -> failure_handler_state", description: "Classify the exact Java, JavaScript, TypeScript, C#, PHP, C++ or Kotlin catch body, Python except body, or Ruby rescue body from prepared syntax. Comments, empty statements, and Python pass or ellipsis are no-ops. Other languages produce an explicit unsupported unknown row. Empty and nonempty verdicts are structural facts with exact proof and exhaustive coverage. Recovered or unavailable syntax produces an explicit unknown row and incomplete coverage; this step makes no reachability claim." }
+    FailureHandlerState { shape: RowLocal, label: "failure_handler_state", signature: "structural_match -> failure_handler_state", description: "Classify the exact Java, JavaScript, TypeScript, C#, PHP, C++, Kotlin or Scala catch body, Python except body, Ruby rescue body, Rust-native Result::Err failure branch, or Go error/nil and recover failure branch from prepared syntax. Catch languages use catch seeds; Rust and Go use callable seeds and language-native branch hooks. Comments, empty statements, Python pass or ellipsis, Scala unit literals, Rust unit expressions, and direct discarded Go recover calls are no-ops. Scala catch expressions outside case blocks remain open. Rust branches are selected only when the resolver proves the standard Result variant; Go branches are selected only when the adapter proves predeclared error or recover identities; Option arms, unproven Go bindings, and unresolved or macro token-tree shapes remain outside the exact result or open. Other languages produce an explicit unsupported unknown row. Empty and nonempty verdicts are structural facts with exact proof and exhaustive coverage. Recovered, unresolved, or unavailable syntax produces an explicit unknown row and incomplete coverage; this step makes no reachability claim." }
     BranchRelations { shape: RowLocal, label: "branch_relations", signature: "structural_match -> branch_relation", description: "Compare ordered arms of one structural if fact using exact parsed syntax and lexical binding identities. Rows state proven, distinct, or open with an explicit reason. Relation filtering applies before completeness is assessed, so unrelated open relations do not taint a selected family." }
+    CppExpressions { shape: RowLocal, label: "cpp_expressions", signature: "structural_match -> cpp_expression", description: "Project typed, occurrence-keyed C++ expression facts from the exact source range, retaining scalar type, literal, array, bit-field, enum, signature, loop, and sizeof evidence with explicit open completeness." }
+    CppInconsistentLoopDirection { shape: RowLocal, label: "cpp_inconsistent_loop_direction", signature: "structural_match -> structural_match", description: "Retain C/C++ for-loop matches whose structured comparison direction and update direction disagree for the same loop variable. Missing syntax is incomplete; no source-text loop parser or general range analysis is used." }
+    CppUnsafeArrayForDaysOfTheYear { shape: RowLocal, label: "cpp_unsafe_array_for_days_of_the_year", signature: "structural_match -> structural_match", description: "Retain C/C++ numeric-literal matches where the structured literal 365 is a fixed array extent or vector-constructor extent. A literal with no such structured extent is not applicable." }
+    CppProvenance { shape: RowLocal, label: "cpp_provenance", signature: "structural_match|call_binding -> structural_match", description: "Filter a C/C++ source-backed seed through one procedure-local typed provenance rule. The terminal row remains the original return, assignment, or call anchor; unsupported aliases and unresolved call identities remain incomplete.", semantic: [Procedures] }
     LoopRelations { shape: RowLocal, label: "loop_relations", signature: "procedure -> loop_relation", description: "For an exact Java source loop, prove whether its reachable body can reach its own repeat edge before exiting. Rows preserve source and control gaps as open rather than claiming a nonrepeating body.", semantic: [Procedures, ProgramPoints, ControlEdges] }
     StatementReachability { shape: RowLocal, label: "statement_reachability", signature: "procedure -> statement_reachability", description: "Enumerate exact Java statement syntax and its producer-authored CFG entries. A statement is unreachable only when every entry is outside complete bounded entry reachability; source, control, and budget gaps remain open.", semantic: [Procedures, ProgramPoints, ControlEdges] }
-    ControlRelations { shape: RowLocal, label: "control_relations", signature: "procedure -> control_relation", description: "Derive the control relations of each procedure from the shared control-flow algorithms over the production semantic IR: dominance, postdominance, control dependence, entry reachability, and loop membership between the procedure's own program points, joined by the same stable ids the program_point and control_edge rows publish. Every row states the exit partition its claim was computed against, so a backward claim can never be read as a claim about a partition that was not computed. Budget exhaustion or cancellation emits no row for the affected relation and an explicit incomplete diagnostic; it is never reported as an absent relation.", semantic: [Procedures, ProgramPoints, ControlEdges] }
+    PendingCleanupFlows { shape: RowLocal, label: "pending_cleanup_flows", signature: "procedure -> pending_cleanup_flow", description: "Derive the effect of each lowered finally, ensure, defer, using, with, or resource cleanup on a pending return, throw, break, or continue. Exact override and preservation rows are emitted only when the cleanup-local CFG is exhaustive; missing edges, gaps, mixed outcomes, and unsupported cleanup syntax are explicit unknown/incomplete evidence.", semantic: [Procedures, ProgramPoints, ControlEdges] }
+    RustPointerFindings { shape: DerivedValue, label: "rust_pointer_findings", signature: "procedure -> rust_pointer_finding", description: "Run query-local Rust pointer provenance and project accesses whose same-origin scope-end, invalidation, or checked byte extent precedes the access. Rows retain must/may strength, path proof, bounds, and completeness; incomplete coverage stays diagnostic.", semantic: [Procedures, ValueFlow] }
+    ControlRelations { shape: RowLocal, label: "control_relations", signature: "procedure -> control_relation", description: "Derive the control relations of each procedure from the shared control-flow algorithms over the production semantic IR: dominance, postdominance, control dependence, entry reachability, procedure-local CFG reachability, and loop membership between the procedure's own program points, joined by the same stable ids the program_point and control_edge rows publish. Every row states the exit partition its claim was computed against, so a backward claim can never be read as a claim about a partition that was not computed. Budget exhaustion or cancellation emits no row for the affected relation and an explicit incomplete diagnostic; it is never reported as an absent relation.", semantic: [Procedures, ProgramPoints, ControlEdges] }
     GuardsOf { shape: RowLocal, label: "guards_of", signature: "procedure -> guard", description: "Return the normalized branch conditions the language adapter recorded for each procedure: which decision point each guard sits on, what its condition was normalized to -- a compile-time constant, a null comparison, a comparison against a constant, or an explicitly opaque condition -- and the stable ids of the true and false successor edges and target points. A constant condition is published even when lowering folded its dead arm away, which is the only place that evidence survives. An empty answer means the adapter records no guard facts for this language, which its own guard_facts capability states.", semantic: [Procedures, ProgramPoints, ControlEdges] }
     TargetOf { shape: DerivedValue, label: "target_of", signature: "file -> build_target", description: "Return the build target each file compiles into, as the workspace's own build files declare it. Ownership comes from build evidence alone: a file no read build file claims produces no row, and a build model this workspace cannot read produces an explicit incomplete diagnostic rather than an empty answer that reads as \"no target\"." }
     SourceSetOf { shape: DerivedValue, label: "source_set_of", signature: "file -> source_set", description: "Return the declared compilation input set each file belongs to, with the build file that fixes the layout. A file two declared source sets both claim is reported ambiguous rather than assigned to whichever was read first." }
@@ -986,6 +1153,19 @@ query_step_ops! {
 /// query_code` prints it out of that same schema, so a step added to the
 /// registry above documents itself on both surfaces and no help text anywhere
 /// repeats the vocabulary.
+/// The `file_of` registry signature, spelled from [`FILE_OF_INPUT_KINDS`] so
+/// the help text cannot name a different set than the transition accepts.
+fn file_of_input_signature() -> &'static str {
+    static SIGNATURE: LazyLock<String> = LazyLock::new(|| {
+        let labels = FILE_OF_INPUT_KINDS
+            .iter()
+            .map(|kind| kind.label())
+            .collect::<Vec<_>>();
+        format!("{} -> file", labels.join("|"))
+    });
+    SIGNATURE.as_str()
+}
+
 pub fn query_step_reference() -> String {
     let mut reference = String::new();
     for op in ALL_QUERY_STEP_OPS {
@@ -1109,8 +1289,11 @@ macro_rules! rql_forms {
                     | Self::Except
                     | Self::Filter
                     | Self::Project
+                    | Self::Anchor
+                    | Self::CppFacts
                     | Self::EnclosingDecl
                     | Self::ProcedureOf
+                    | Self::ProgramPointOf
                     | Self::CfgEntry
                     | Self::CfgExits
                     | Self::CfgSuccessorEdges
@@ -1118,8 +1301,8 @@ macro_rules! rql_forms {
                     | Self::CfgEdgeSource
                     | Self::CfgEdgeTarget
                     | Self::Typestate
-                    | Self::ConcurrentAccessConflicts
                     | Self::ValueFlow
+                    | Self::RustPointerFindings
                     | Self::ClassSet
                     | Self::AbsentMember
                     | Self::Taint
@@ -1127,8 +1310,17 @@ macro_rules! rql_forms {
                     | Self::FileOf
                     | Self::ImportsOf
                     | Self::ImportersOf
+                    | Self::PythonImportSite
+                    | Self::PythonImportCycles
                     | Self::Supertypes
                     | Self::Subtypes
+                    | Self::ClassHierarchy
+                    | Self::ClassBases
+                      | Self::ClassMro
+                      | Self::MroMembers
+                      | Self::PythonOverrides
+                      | Self::PythonCallRelations
+                      | Self::PythonOverrideSignatures
                     | Self::Members
                     | Self::Owner
                     | Self::ReferencesOf
@@ -1147,17 +1339,54 @@ macro_rules! rql_forms {
                     | Self::FieldWriteValue
                     | Self::ReceiverOutcome
                     | Self::ReceiverEvidence
+                    | Self::PointsToCandidates
                     | Self::CallShape
+                    | Self::ExactExternalCallee
                     | Self::CallResults
                     | Self::CallArgumentGroups
                     | Self::CallArguments
                     | Self::CallBindings
+                    | Self::CppBadStrncpySize
+                    | Self::CppNetworkToHostFunctionAsArrayBound
+                    | Self::CppNonConstantFormat
+                    | Self::CppWrongNumberFormatArguments
+                    | Self::CppTooManyFormatArguments
+                    | Self::CppWrongTypeFormatArgument
+                    | Self::CppNonPortablePrintf
+                    | Self::CppOverflowingSnprintf
+                    | Self::CppInconsistentLoopDirection
+                    | Self::CppUnsafeArrayForDaysOfTheYear
+                    | Self::CppProvenance
                     | Self::ResolvedCall
+                    | Self::ResolvedValue
                     | Self::CallArgument
                     | Self::CallEffects
                     | Self::ResultContractCalls
                     | Self::CallResultContracts
                     | Self::CallResultObligations
+                    | Self::ProcedureReturnProfile
+                    | Self::PythonIteratorReturnProtocol
+                    | Self::PythonBuiltinIdentity
+                    | Self::PythonUninitializedVariable
+                    | Self::PythonRaiseNotImplemented
+                    | Self::PythonUnsafeCyclicImport
+                    | Self::PythonCommentedOutCode
+                    | Self::PythonDocumentation
+                    | Self::PythonUselessClass
+                    | Self::PythonAttributeShadowsMethod
+                    | Self::PythonModificationOfDefaultValue
+                    | Self::PythonOverlyComplexDelete
+                    | Self::CallResultUse
+                    | Self::PythonAssertionContext
+                    | Self::TupleReturnAssignment
+                    | Self::PythonImplicitStringConcatenation
+                    | Self::TupleReturnGroups
+                    | Self::LambdaForwarding
+                    | Self::PythonFormatIssues
+                    | Self::PythonUrlConstruction
+
+                    | Self::PythonRaiseLegality
+                    | Self::PythonSpecialMethodRaise
                     | Self::ResultContractUses
                     | Self::ResultSubjectUses
                     | Self::ResultContractOperationUses
@@ -1168,6 +1397,8 @@ macro_rules! rql_forms {
                     | Self::DetachedTaskTransfers
                     | Self::ProcedureEffects
                     | Self::CallableSignature
+                    | Self::LiteralOccurrences
+                    | Self::CallableMetrics
                     | Self::SignatureParameters
                     | Self::DecoratorBindings
                     | Self::CallableApplicability
@@ -1191,11 +1422,29 @@ macro_rules! rql_forms {
                     | Self::BindingsIn
                     | Self::BindingOf
                     | Self::BindingOccurrence
+                    | Self::BindingUses
+                    | Self::PythonVariableOf
+                    | Self::PythonVariableDefinitions
+                    | Self::PythonVariableUses
+                    | Self::PythonVariablePeers
+                    | Self::PythonVariableNestedLoops
+                    | Self::PythonComparisonConstants
+                    | Self::PythonComparisonUsingIs
+                    | Self::PythonComparisonUsingIsNonPortable
+                    | Self::IdenticalOperands
+                    | Self::PythonMissingSelf
                     | Self::CandidatesOf
                     | Self::CandidateHierarchy
                     | Self::GenerationSites
                     | Self::Exports
+                    | Self::DependencyEvidence
                     | Self::ConfigurationFacts
+                    | Self::ConfigurationAbsence
+                    | Self::ConfigurationCode
+                    | Self::Correlate
+                    | Self::RequireBoth
+                    | Self::ConfigurationKey
+                    | Self::DependencyConfiguration
                     | Self::Generates
                     | Self::GeneratedBy
                     | Self::DeclarationStateOf
@@ -1207,23 +1456,49 @@ macro_rules! rql_forms {
                     | Self::EdgesFrom
                     | Self::EdgeTarget
                     | Self::StateEventsOf
+                    | Self::BindingInitializerCallsOf
                     | Self::FlowRelationsOf
                     | Self::FlowSource
                     | Self::FlowTarget
                     | Self::ControlRelations
                     | Self::FailureHandlerState
                     | Self::BranchRelations
+                    | Self::CppExpressions
                     | Self::LoopRelations
                     | Self::StatementReachability
+                    | Self::PendingCleanupFlows
                     | Self::TargetOf
                     | Self::SourceSetOf
                     | Self::TopologyEdgesOf
                     | Self::GuardsOf
-                    | Self::RewritePathsOf => None,
+                    | Self::RewritePathsOf
+                    | Self::StatementFacts => None,
                     Self::Name => Some(RqlProperty::Name),
+                    Self::StringValue => Some(RqlProperty::StringValue),
                     Self::NameRegex => Some(RqlProperty::NameRegex),
                     Self::TextRegex => Some(RqlProperty::TextRegex),
                     Self::BooleanValue => Some(RqlProperty::BooleanValue),
+                    Self::Async => Some(RqlProperty::Async),
+                    Self::Modifier => Some(RqlProperty::Modifier),
+                    Self::Parenthesized => Some(RqlProperty::Parenthesized),
+                    Self::IntegerValue => Some(RqlProperty::IntegerValue),
+                    Self::DuplicateKey => Some(RqlProperty::DuplicateKey),
+                    Self::IntegerHasAnyBits => Some(RqlProperty::IntegerHasAnyBits),
+                    Self::IntegerHasAllBits => Some(RqlProperty::IntegerHasAllBits),
+                    Self::IntegerHasNoBits => Some(RqlProperty::IntegerHasNoBits),
+                    Self::AssignmentTargetKind => Some(RqlProperty::AssignmentTargetKind),
+                    Self::AssignmentValueKind => Some(RqlProperty::AssignmentValueKind),
+                    Self::AssignmentTargetUnstarredCount => Some(RqlProperty::AssignmentTargetUnstarredCount),
+                    Self::AssignmentValueUnstarredCount => Some(RqlProperty::AssignmentValueUnstarredCount),
+                    Self::AssignmentTargetStarred => Some(RqlProperty::AssignmentTargetStarred),
+                    Self::AssignmentValueStarred => Some(RqlProperty::AssignmentValueStarred),
+                    Self::AssignmentUnstarredCountMismatch => Some(RqlProperty::AssignmentUnstarredCountMismatch),
+                    Self::Index => Some(RqlProperty::Index),
+                    Self::StringValueRegex => Some(RqlProperty::StringValueRegex),
+                    Self::Not => Some(RqlProperty::Not),
+                    Self::All => Some(RqlProperty::All),
+                    Self::Any => Some(RqlProperty::Any),
+                    Self::LocalValue => Some(RqlProperty::LocalValue),
                     Self::Capture => Some(RqlProperty::Capture),
                     Self::Has => Some(RqlProperty::Has),
                     Self::NotHas => Some(RqlProperty::NotHas),
@@ -1232,6 +1507,9 @@ macro_rules! rql_forms {
                     Self::Visibility => Some(RqlProperty::Visibility),
                     Self::ParameterType => Some(RqlProperty::ParameterType),
                     Self::ParameterTypeRegex => Some(RqlProperty::ParameterTypeRegex),
+                    Self::LanguageRule => Some(RqlProperty::LanguageRule),
+                    Self::BodyState => Some(RqlProperty::BodyState),
+                    Self::BodyOwner => Some(RqlProperty::BodyOwner),
                 }
             }
         }
@@ -1280,6 +1558,14 @@ rql_forms! {
         shape: Query,
         signature: "(profile query)",
         description: "Execute the query and include operator timing, work, cache, waiting, and concurrency measurements.",
+    }
+    CppFacts {
+        labels: ["cpp-facts", "cpp_facts"],
+        class: Wrapper,
+        shape: Query,
+        signature: "(cpp-facts :kind assignment-does-not-return-this|catch-by-value|constructor-delegation|constructor-used-as-copy-constructor|rule-of-three|rule-of-two|throwing-pointer|undisciplined-multiple-inheritance query)",
+        description: (QueryStepOp::CppFacts),
+        step: CppFacts,
     }
     Inside {
         labels: ["inside"],
@@ -1339,6 +1625,22 @@ rql_forms! {
         description: (QueryStepOp::Project),
         step: Project,
     }
+    Anchor {
+        labels: ["anchor"],
+        class: Wrapper,
+        shape: Query,
+        signature: "(anchor :capture \"name\" query)",
+        description: (QueryStepOp::CaptureAnchor),
+        step: CaptureAnchor,
+    }
+    StatementFacts {
+        labels: ["statement-facts", "statement_facts"],
+        class: Wrapper,
+        shape: Query,
+        signature: "(statement-facts :kind alloca-in-loop|complex-block|complex-condition|empty-block|long-switch|missing-case-in-switch|nested-loops-with-same-variable|use-of-goto query)",
+        description: (QueryStepOp::StatementFacts),
+        step: StatementFacts,
+    }
     EnclosingDecl {
         labels: ["enclosing-decl"],
         class: Wrapper,
@@ -1354,6 +1656,14 @@ rql_forms! {
         signature: "(procedure-of query)",
         description: (QueryStepOp::ProcedureOf),
         step: ProcedureOf,
+    }
+    ProgramPointOf {
+        labels: ["program-point-of", "program_point_of"],
+        class: Wrapper,
+        shape: Query,
+        signature: "(program-point-of structural-query)",
+        description: (QueryStepOp::ProgramPointOf),
+        step: ProgramPointOf,
     }
     CfgEntry {
         labels: ["cfg-entry", "cfg_entry"],
@@ -1410,14 +1720,6 @@ rql_forms! {
         signature: "(typestate :protocol-ref namespace:name query)",
         description: (QueryStepOp::Typestate),
         step: Typestate,
-    }
-    ConcurrentAccessConflicts {
-        labels: ["concurrent-access-conflicts", "concurrent_access_conflicts"],
-        class: Wrapper,
-        shape: Query,
-        signature: "(concurrent-access-conflicts query)",
-        description: (QueryStepOp::ConcurrentAccessConflicts),
-        step: ConcurrentAccessConflicts,
     }
     ValueFlow {
         labels: ["value-flow", "value_flow"],
@@ -1483,6 +1785,38 @@ rql_forms! {
         description: (QueryStepOp::ImportersOf),
         step: ImportersOf,
     }
+    PythonImportSite {
+        labels: ["python-import-site", "python_import_site"],
+        class: Wrapper,
+        shape: Query,
+        signature: "(python-import-site query)",
+        description: (QueryStepOp::PythonImportSite),
+        step: PythonImportSite,
+    }
+    PythonImportCycles {
+        labels: ["python-import-cycles", "python_import_cycles"],
+        class: Wrapper,
+        shape: Query,
+        signature: "(python-import-cycles query)",
+        description: (QueryStepOp::PythonImportCycles),
+        step: PythonImportCycles,
+    }
+    PythonCommentedOutCode {
+        labels: ["python-commented-out-code", "python_commented_out_code"],
+        class: Wrapper,
+        shape: Query,
+        signature: "(python-commented-out-code query)",
+        description: (QueryStepOp::PythonCommentedOutCode),
+        step: PythonCommentedOutCode,
+    }
+    PythonUnsafeCyclicImport {
+        labels: ["python-unsafe-cyclic-import", "python_unsafe_cyclic_import"],
+        class: Wrapper,
+        shape: Query,
+        signature: "(python-unsafe-cyclic-import query)",
+        description: (QueryStepOp::PythonUnsafeCyclicImport),
+        step: PythonUnsafeCyclicImport,
+    }
     Supertypes {
         labels: ["supertypes"],
         class: Wrapper,
@@ -1490,6 +1824,38 @@ rql_forms! {
         signature: "(supertypes [:depth count | :transitive true] query)",
         description: (QueryStepOp::Supertypes),
         step: Supertypes,
+    }
+    ClassHierarchy {
+        labels: ["class-hierarchy", "class_hierarchy"],
+        class: Wrapper,
+        shape: Query,
+        signature: "(class-hierarchy query)",
+        description: (QueryStepOp::ClassHierarchy),
+        step: ClassHierarchy,
+    }
+    ClassBases {
+        labels: ["class-bases", "class_bases"],
+        class: Wrapper,
+        shape: Query,
+        signature: "(class-bases query)",
+        description: (QueryStepOp::ClassBases),
+        step: ClassBases,
+    }
+    ClassMro {
+        labels: ["class-mro", "class_mro"],
+        class: Wrapper,
+        shape: Query,
+        signature: "(class-mro query)",
+        description: (QueryStepOp::ClassMro),
+        step: ClassMro,
+    }
+    MroMembers {
+        labels: ["mro-members", "mro_members"],
+        class: Wrapper,
+        shape: Query,
+        signature: "(mro-members query)",
+        description: (QueryStepOp::MroMembers),
+        step: MroMembers,
     }
     Subtypes {
         labels: ["subtypes"],
@@ -1643,6 +2009,14 @@ rql_forms! {
         description: (QueryStepOp::ReceiverEvidence),
         step: ReceiverEvidence,
     }
+    PointsToCandidates {
+        labels: ["points-to-candidates", "points_to_candidates"],
+        class: Wrapper,
+        shape: Query,
+        signature: "(points-to-candidates query)",
+        description: (QueryStepOp::PointsToCandidates),
+        step: PointsToCandidates,
+    }
     CallShape {
         labels: ["call-shape", "call_shape"],
         class: Wrapper,
@@ -1650,6 +2024,14 @@ rql_forms! {
         signature: "(call-shape query)",
         description: (QueryStepOp::CallShape),
         step: CallShape,
+    }
+    ExactExternalCallee {
+        labels: ["exact-external-callee", "exact_external_callee"],
+        class: Wrapper,
+        shape: Query,
+        signature: "(exact-external-callee query)",
+        description: (QueryStepOp::ExactExternalCallee),
+        step: ExactExternalCallee,
     }
     CallResults {
         labels: ["call-results", "call_results"],
@@ -1691,6 +2073,14 @@ rql_forms! {
         description: (QueryStepOp::ResolvedCall),
         step: ResolvedCall,
     }
+    ResolvedValue {
+        labels: ["resolved-value", "resolved_value"],
+        class: Wrapper,
+        shape: Query,
+        signature: "(resolved-value :resolves-to identity|\"qualified\" :proof exact query)",
+        description: (QueryStepOp::ResolvedValue),
+        step: ResolvedValue,
+    }
     CallArgument {
         labels: ["call-argument", "call_argument"],
         class: Wrapper,
@@ -1698,6 +2088,70 @@ rql_forms! {
         signature: "(call-argument (:formal-name name | :formal-index index) query)",
         description: (QueryStepOp::CallArgument),
         step: CallArgument,
+    }
+    CppBadStrncpySize {
+        labels: ["cpp-bad-strncpy-size", "cpp_bad_strncpy_size"],
+        class: Wrapper,
+        shape: Query,
+        signature: "(cpp-bad-strncpy-size query)",
+        description: (QueryStepOp::CppBadStrncpySize),
+        step: CppBadStrncpySize,
+    }
+    CppNetworkToHostFunctionAsArrayBound {
+        labels: ["cpp-network-to-host-function-as-array-bound", "cpp_network_to_host_function_as_array_bound"],
+        class: Wrapper,
+        shape: Query,
+        signature: "(cpp-network-to-host-function-as-array-bound query)",
+        description: (QueryStepOp::CppNetworkToHostFunctionAsArrayBound),
+        step: CppNetworkToHostFunctionAsArrayBound,
+    }
+    CppNonConstantFormat {
+        labels: ["cpp-non-constant-format", "cpp_non_constant_format"],
+        class: Wrapper,
+        shape: Query,
+        signature: "(cpp-non-constant-format query)",
+        description: (QueryStepOp::CppNonConstantFormat),
+        step: CppNonConstantFormat,
+    }
+    CppWrongNumberFormatArguments {
+        labels: ["cpp-wrong-number-format-arguments", "cpp_wrong_number_format_arguments"],
+        class: Wrapper,
+        shape: Query,
+        signature: "(cpp-wrong-number-format-arguments query)",
+        description: (QueryStepOp::CppWrongNumberFormatArguments),
+        step: CppWrongNumberFormatArguments,
+    }
+    CppTooManyFormatArguments {
+        labels: ["cpp-too-many-format-arguments", "cpp_too_many_format_arguments"],
+        class: Wrapper,
+        shape: Query,
+        signature: "(cpp-too-many-format-arguments query)",
+        description: (QueryStepOp::CppTooManyFormatArguments),
+        step: CppTooManyFormatArguments,
+    }
+    CppWrongTypeFormatArgument {
+        labels: ["cpp-wrong-type-format-argument", "cpp_wrong_type_format_argument"],
+        class: Wrapper,
+        shape: Query,
+        signature: "(cpp-wrong-type-format-argument query)",
+        description: (QueryStepOp::CppWrongTypeFormatArgument),
+        step: CppWrongTypeFormatArgument,
+    }
+    CppNonPortablePrintf {
+        labels: ["cpp-non-portable-printf", "cpp_non_portable_printf"],
+        class: Wrapper,
+        shape: Query,
+        signature: "(cpp-non-portable-printf query)",
+        description: (QueryStepOp::CppNonPortablePrintf),
+        step: CppNonPortablePrintf,
+    }
+    CppOverflowingSnprintf {
+        labels: ["cpp-overflowing-snprintf", "cpp_overflowing_snprintf"],
+        class: Wrapper,
+        shape: Query,
+        signature: "(cpp-overflowing-snprintf query)",
+        description: (QueryStepOp::CppOverflowingSnprintf),
+        step: CppOverflowingSnprintf,
     }
     CallEffects {
         labels: ["call-effects", "call_effects"],
@@ -1730,6 +2184,206 @@ rql_forms! {
         signature: "(call-result-obligations query)",
         description: (QueryStepOp::CallResultObligations),
         step: CallResultObligations,
+    }
+    ProcedureReturnProfile {
+        labels: ["procedure-return-profile", "procedure_return_profile"],
+        class: Wrapper,
+        shape: Query,
+        signature: "(procedure-return-profile query)",
+        description: (QueryStepOp::ProcedureReturnProfile),
+        step: ProcedureReturnProfile,
+    }
+    PythonIteratorReturnProtocol {
+        labels: ["python-iterator-return-protocol", "python_iterator_return_protocol"],
+        class: Wrapper,
+        shape: Query,
+        signature: "(python-iterator-return-protocol query)",
+        description: (QueryStepOp::PythonIteratorReturnProtocol),
+        step: PythonIteratorReturnProtocol,
+    }
+    PythonBuiltinIdentity {
+        labels: ["python-builtin-identity", "python_builtin_identity"],
+        class: Wrapper,
+        shape: Query,
+        signature: "(python-builtin-identity query)",
+        description: (QueryStepOp::PythonBuiltinIdentity),
+        step: PythonBuiltinIdentity,
+    }
+    PythonUninitializedVariable {
+        labels: ["python-uninitialized-variable", "python_uninitialized_variable"],
+        class: Wrapper,
+        shape: Query,
+        signature: "(python-uninitialized-variable query)",
+        description: (QueryStepOp::PythonUninitializedVariable),
+        step: PythonUninitializedVariable,
+    }
+    PythonVariableOf {
+        labels: ["python-variable-of", "python_variable_of"],
+        class: Wrapper,
+        shape: Query,
+        signature: "(python-variable-of query)",
+        description: (QueryStepOp::PythonVariableOf),
+        step: PythonVariableOf,
+    }
+    PythonVariableDefinitions {
+        labels: ["python-variable-definitions", "python_variable_definitions"],
+        class: Wrapper,
+        shape: Query,
+        signature: "(python-variable-definitions query)",
+        description: (QueryStepOp::PythonVariableDefinitions),
+        step: PythonVariableDefinitions,
+    }
+    PythonVariableUses {
+        labels: ["python-variable-uses", "python_variable_uses"],
+        class: Wrapper,
+        shape: Query,
+        signature: "(python-variable-uses query)",
+        description: (QueryStepOp::PythonVariableUses),
+        step: PythonVariableUses,
+    }
+    PythonVariablePeers {
+        labels: ["python-variable-peers", "python_variable_peers"],
+        class: Wrapper,
+        shape: Query,
+        signature: "(python-variable-peers query)",
+        description: (QueryStepOp::PythonVariablePeers),
+        step: PythonVariablePeers,
+    }
+    PythonVariableNestedLoops {
+        labels: ["python-variable-nested-loops", "python_variable_nested_loops"],
+        class: Wrapper,
+        shape: Query,
+        signature: "(python-variable-nested-loops query)",
+        description: (QueryStepOp::PythonVariableNestedLoops),
+        step: PythonVariableNestedLoops,
+    }
+    PythonRaiseNotImplemented {
+        labels: ["python-raise-not-implemented", "python_raise_not_implemented"],
+        class: Wrapper,
+        shape: Query,
+        signature: "(python-raise-not-implemented query)",
+        description: (QueryStepOp::PythonRaiseNotImplemented),
+        step: PythonRaiseNotImplemented,
+    }
+    PythonDocumentation {
+        labels: ["python-documentation", "python_documentation"],
+        class: Wrapper,
+        shape: Query,
+        signature: "(python-documentation query)",
+        description: (QueryStepOp::PythonDocumentation),
+        step: PythonDocumentation,
+    }
+    PythonUselessClass {
+        labels: ["python-useless-class", "python_useless_class"],
+        class: Wrapper,
+        shape: Query,
+        signature: "(python-useless-class query)",
+        description: (QueryStepOp::PythonUselessClass),
+        step: PythonUselessClass,
+    }
+    PythonAttributeShadowsMethod {
+        labels: ["python-attribute-shadows-method", "python_attribute_shadows_method"],
+        class: Wrapper,
+        shape: Query,
+        signature: "(python-attribute-shadows-method query)",
+        description: (QueryStepOp::PythonAttributeShadowsMethod),
+        step: PythonAttributeShadowsMethod,
+    }
+    PythonModificationOfDefaultValue {
+        labels: ["python-modification-of-default-value", "python_modification_of_default_value"],
+        class: Wrapper,
+        shape: Query,
+        signature: "(python-modification-of-default-value query)",
+        description: (QueryStepOp::PythonModificationOfDefaultValue),
+        step: PythonModificationOfDefaultValue,
+    }
+    PythonOverlyComplexDelete {
+        labels: ["python-overly-complex-delete", "python_overly_complex_delete"],
+        class: Wrapper,
+        shape: Query,
+        signature: "(python-overly-complex-delete query)",
+        description: (QueryStepOp::PythonOverlyComplexDelete),
+        step: PythonOverlyComplexDelete,
+    }
+    CallResultUse {
+        labels: ["call-result-use", "call_result_use"],
+        class: Wrapper,
+        shape: Query,
+        signature: "(call-result-use query)",
+        description: (QueryStepOp::CallResultUse),
+        step: CallResultUse,
+    }
+    PythonAssertionContext {
+        labels: ["python-assertion-context", "python_assertion_context"],
+        class: Wrapper,
+        shape: Query,
+        signature: "(python-assertion-context query)",
+        description: (QueryStepOp::PythonAssertionContext),
+        step: PythonAssertionContext,
+    }
+    TupleReturnAssignment {
+        labels: ["tuple-return-assignment", "tuple_return_assignment"],
+        class: Wrapper,
+        shape: Query,
+        signature: "(tuple-return-assignment query)",
+        description: (QueryStepOp::TupleReturnAssignment),
+        step: TupleReturnAssignment,
+    }
+    PythonImplicitStringConcatenation {
+        labels: ["python-implicit-string-concatenation", "python_implicit_string_concatenation"],
+        class: Wrapper,
+        shape: Query,
+        signature: "(python-implicit-string-concatenation query)",
+        description: (QueryStepOp::PythonImplicitStringConcatenation),
+        step: PythonImplicitStringConcatenation,
+    }
+    TupleReturnGroups {
+        labels: ["tuple-return-groups", "tuple_return_groups"],
+        class: Wrapper,
+        shape: Query,
+        signature: "(tuple-return-groups query)",
+        description: (QueryStepOp::TupleReturnGroups),
+        step: TupleReturnGroups,
+    }
+    LambdaForwarding {
+        labels: ["lambda-forwarding", "lambda_forwarding"],
+        class: Wrapper,
+        shape: Query,
+        signature: "(lambda-forwarding query)",
+        description: (QueryStepOp::LambdaForwarding),
+        step: LambdaForwarding,
+    }
+    PythonFormatIssues {
+        labels: ["python-format-issues", "python_format_issues"],
+        class: Wrapper,
+        shape: Query,
+        signature: "(python-format-issues query)",
+        description: (QueryStepOp::PythonFormatIssues),
+        step: PythonFormatIssues,
+    }
+    PythonUrlConstruction {
+        labels: ["python-url-construction", "python_url_construction"],
+        class: Wrapper,
+        shape: Query,
+        signature: "(python-url-construction query)",
+        description: (QueryStepOp::PythonUrlConstruction),
+        step: PythonUrlConstruction,
+    }
+    PythonRaiseLegality {
+        labels: ["python-raise-legality", "python_raise_legality"],
+        class: Wrapper,
+        shape: Query,
+        signature: "(python-raise-legality query)",
+        description: (QueryStepOp::PythonRaiseLegality),
+        step: PythonRaiseLegality,
+    }
+    PythonSpecialMethodRaise {
+        labels: ["python-special-method-raise", "python_special_method_raise"],
+        class: Wrapper,
+        shape: Query,
+        signature: "(python-special-method-raise query)",
+        description: (QueryStepOp::PythonSpecialMethodRaise),
+        step: PythonSpecialMethodRaise,
     }
     ResultContractUses {
         labels: ["result-contract-uses", "result_contract_uses"],
@@ -1783,7 +2437,7 @@ rql_forms! {
         labels: ["assignment-relations", "assignment_relations"],
         class: Wrapper,
         shape: Query,
-        signature: "(assignment-relations [:relation [self-assignment|failed-swap ...]] query)",
+        signature: "(assignment-relations [:relation [self-assignment|self-initializer|failed-swap ...]] query)",
         description: (QueryStepOp::AssignmentRelations),
         step: AssignmentRelations,
     }
@@ -1810,6 +2464,22 @@ rql_forms! {
         signature: "(callable-signature query)",
         description: (QueryStepOp::CallableSignature),
         step: CallableSignature,
+    }
+    LiteralOccurrences {
+        labels: ["literal-occurrences", "literal_occurrences"],
+        class: Wrapper,
+        shape: Query,
+        signature: "(literal-occurrences query)",
+        description: (QueryStepOp::LiteralOccurrences),
+        step: LiteralOccurrences,
+    }
+    CallableMetrics {
+        labels: ["callable-metrics", "callable_metrics"],
+        class: Wrapper,
+        shape: Query,
+        signature: "(callable-metrics query)",
+        description: (QueryStepOp::CallableMetrics),
+        step: CallableMetrics,
     }
     SignatureParameters {
         labels: ["signature-parameters", "signature_parameters"],
@@ -1882,6 +2552,30 @@ rql_forms! {
         signature: "(family-edges query)",
         description: (QueryStepOp::FamilyEdges),
         step: FamilyEdges,
+    }
+    PythonOverrides {
+        labels: ["python-overrides", "python_overrides"],
+        class: Wrapper,
+        shape: Query,
+        signature: "(python-overrides query)",
+        description: (QueryStepOp::PythonOverrides),
+        step: PythonOverrides,
+    }
+    PythonCallRelations {
+        labels: ["python-call-relations", "python_call_relations"],
+        class: Wrapper,
+        shape: Query,
+        signature: "(python-call-relations query)",
+        description: (QueryStepOp::PythonCallRelations),
+        step: PythonCallRelations,
+    }
+    PythonOverrideSignatures {
+        labels: ["python-override-signatures", "python_override_signatures"],
+        class: Wrapper,
+        shape: Query,
+        signature: "(python-override-signatures query)",
+        description: (QueryStepOp::PythonOverrideSignatures),
+        step: PythonOverrideSignatures,
     }
     Occurrences {
         labels: ["occurrences", "occurrence"],
@@ -1983,6 +2677,30 @@ rql_forms! {
         description: (QueryStepOp::BindingOf),
         step: BindingOf,
     }
+    PythonComparisonConstants {
+        labels: ["python-comparison-constants", "python_comparison_constants"],
+        class: Wrapper,
+        shape: Query,
+        signature: "(python-comparison-constants query)",
+        description: (QueryStepOp::PythonComparisonConstants),
+        step: PythonComparisonConstants,
+    }
+    PythonComparisonUsingIs {
+        labels: ["python-comparison-using-is", "python_comparison_using_is"],
+        class: Wrapper,
+        shape: Query,
+        signature: "(python-comparison-using-is query)",
+        description: (QueryStepOp::PythonComparisonUsingIs),
+        step: PythonComparisonUsingIs,
+    }
+    PythonComparisonUsingIsNonPortable {
+        labels: ["python-comparison-using-is-non-portable", "python_comparison_using_is_non_portable"],
+        class: Wrapper,
+        shape: Query,
+        signature: "(python-comparison-using-is-non-portable query)",
+        description: (QueryStepOp::PythonComparisonUsingIsNonPortable),
+        step: PythonComparisonUsingIsNonPortable,
+    }
     BindingOccurrence {
         labels: ["binding-occurrence", "binding_occurrence"],
         class: Wrapper,
@@ -1990,6 +2708,30 @@ rql_forms! {
         signature: "(binding-occurrence query)",
         description: (QueryStepOp::BindingOccurrence),
         step: BindingOccurrence,
+    }
+    BindingUses {
+        labels: ["binding-uses", "binding_uses"],
+        class: Wrapper,
+        shape: Query,
+        signature: "(binding-uses query)",
+        description: (QueryStepOp::BindingUses),
+        step: BindingUses,
+    }
+    IdenticalOperands {
+        labels: ["identical-operands", "identical_operands"],
+        class: Wrapper,
+        shape: Query,
+        signature: "(identical-operands query)",
+        description: (QueryStepOp::IdenticalOperands),
+        step: IdenticalOperands,
+    }
+    PythonMissingSelf {
+        labels: ["python-missing-self", "python_missing_self"],
+        class: Wrapper,
+        shape: Query,
+        signature: "(python-missing-self query)",
+        description: (QueryStepOp::PythonMissingSelf),
+        step: PythonMissingSelf,
     }
     CandidatesOf {
         labels: ["candidates-of", "candidates_of"],
@@ -2029,12 +2771,62 @@ rql_forms! {
         signature: "(exports [:form ...] [:name ...])",
         description: "Seed export rows directly from recorded materialization provenance.",
     }
+    DependencyEvidence {
+        labels: ["dependency-evidence", "dependency_evidence"],
+        class: Wrapper,
+        shape: DependencyEvidenceFilter,
+        signature: "(dependency-evidence [:ecosystem ...] [:package ...] [:kind ...] [:exact-version ...] [:version-range ...] [:source ...] [:declared-by ...] [:scope ...])",
+        description: "Read revision-selected static dependency file facts. Declarations, exact locks and unresolved associations remain separate; no dependency discovery or build runs during a query.",
+    }
     ConfigurationFacts {
         labels: ["configuration-facts", "configuration_facts"],
         class: Wrapper,
         shape: ConfigurationFactsFilter,
-        signature: "(configuration-facts [:format ...] [:node-kind ...] [:role ...] [:scalar-kind ...] [:key ...] [:route ...] [:fact-ordinal ...] [:provenance ...] [:completeness ...])",
-        description: "Seed authored configuration-document facts with exact key, route, node, provenance, and document-completeness constraints. Unsupported formats and recovered documents remain typed diagnostics instead of becoming clean empty answers.",
+        signature: "(configuration-facts [:format ...] [:node-kind ...] [:role ...] [:scalar-kind ...] [:key ...] [:value ...] [:value-ignore-case ...] [:value-lt ...] [:value-le ...] [:value-gt ...] [:value-ge ...] [:xml-parent-key ...] [:xml-preceding-sibling-key ...] [:xml-sibling-attribute-key ...] [:xml-sibling-attribute-value ...] [:xml-sibling-attribute-value-ignore-case ...] [:xml-reference-source-key ...] [:xml-reference-target-key ...] [:xml-reference-target-element-key ...] [:xml-reference-target-child-key ...] [:xml-peer-element-key ...] [:xml-peer-attribute-key ...] [:xml-peer-child-key ...] [:xml-peer-min-shared-children N] [:route ...] [:fact-ordinal ...] [:provenance ...] [:completeness ...])",
+        description: "Seed authored configuration-document facts with exact key/value, numeric value, XML structure, route, node, provenance, and document-completeness constraints. Unsupported formats and recovered documents remain typed diagnostics instead of becoming clean empty answers.",
+    }
+    ConfigurationAbsence {
+        labels: ["configuration-absence", "configuration_absence"],
+        class: Wrapper,
+        shape: Query,
+        signature: "(configuration-absence [:format ...] [:node-kind ...] [:role ...] [:scalar-kind ...] [:key ...] [:value ...] [:value-ignore-case ...] [:value-lt ...] [:value-le ...] [:value-gt ...] [:value-ge ...] [:route ...] [:fact-ordinal ...] [:provenance ...] [:completeness ...] query)",
+        description: "Apply a document-scoped anti-join to configuration facts. The inner configuration-facts query must select document roots; the result is retained only when no authored fact in that same document matches the filter. Incomplete ingestion is never treated as absence.",
+        step: ConfigurationAbsence,
+    }
+    Correlate {
+        labels: ["correlate"],
+        class: Wrapper,
+        shape: CrossDomainCorrelation,
+        signature: "(correlate :relation (configuration-key :documents [\"path\" ...]) :code query :configuration query)",
+        description: "Use a registered structural relation to pair code or dependency evidence with configuration facts. Dependency-configuration retains every dependency witness and proves mitigation only with complete applicability, version, precedence, and value evidence. Each cross_domain row retains exact input evidence and provenance; ordinary sets never combine code with configuration.",
+    }
+    RequireBoth {
+        labels: ["require-both", "require_both"],
+        class: Wrapper,
+        shape: CrossDomainRequirement,
+        signature: "(require-both :code query :configuration query)",
+        description: "Require a programming-code query and a configuration query to both produce rows. Returns each contributing row tagged with its own domain, only when both are satisfied, and never pairs a code row with a configuration row. An empty side that was incomplete keeps the answer incomplete.",
+    }
+    ConfigurationKey {
+        labels: ["configuration-key", "configuration_key"],
+        class: Relation,
+        shape: CorrelationDocumentList,
+        signature: "(configuration-key :documents [\"path\" ...])",
+        description: "Relate a plain string-literal argument bound to a resolver-proven callee (an expression_site row) to the .properties member whose single key segment equals that literal, inside one of the explicitly declared documents. Documents are exact paths, not globs; no name, spelling, file-name, or co-occurrence join is made.",
+    }
+    ConfigurationCode {
+        labels: ["configuration-code", "configuration_code"],
+        class: Relation,
+        shape: ConfigurationCodeRelation,
+        signature: "(configuration-code :match scalar-declaration|scalar-owner|scalar-member|same-project [:absence true|false])",
+        description: "Relate an authored configuration scalar or document to a declaration or same-project code fact using a structured identity join. `absence true` is a fail-closed anti-join and never treats incomplete inputs as clean.",
+    }
+    DependencyConfiguration {
+        labels: ["dependency-configuration", "dependency_configuration"],
+        class: Relation,
+        shape: DependencyConfigurationRelation,
+        signature: "(dependency-configuration :owner \"topology-id\" :ecosystem npm|cargo :version-ranges [\"range\" ...] :documents [\"path.properties\" ...] :values [\"value\" ...] [:overrides [[\"lower\" \"higher\"] ...]])",
+        description: "Keep each dependency witness and prove mitigation only for a complete locked or installed instance owned by the exact declared topology identity, in a supported ecosystem and version range, with a complete unique effective .properties value. Documents and lower-to-higher override edges are explicit reviewed applicability evidence; framework precedence, installation, runtime state, and member ownership are never guessed.",
     }
     Generates {
         labels: ["generates"],
@@ -2112,9 +2904,17 @@ rql_forms! {
         labels: ["state-events-of", "state_events_of"],
         class: Wrapper,
         shape: Query,
-        signature: "(state-events-of [:class [establish|kill|read ...]] [:subject [binding|property ...]] query)",
+        signature: "(state-events-of [:class [establish|kill|read ...]] [:subject [binding|property ...]] [:read-cause [post_resume_use|scope_end_drop ...]] query)",
         description: (QueryStepOp::StateEventsOf),
         step: StateEventsOf,
+    }
+    BindingInitializerCallsOf {
+        labels: ["binding-initializer-calls-of", "binding_initializer_calls_of"],
+        class: Wrapper,
+        shape: Query,
+        signature: "(binding-initializer-calls-of query)",
+        description: (QueryStepOp::BindingInitializerCallsOf),
+        step: BindingInitializerCallsOf,
     }
     FlowRelationsOf {
         labels: ["flow-relations-of", "flow_relations_of"],
@@ -2152,9 +2952,41 @@ rql_forms! {
         labels: ["branch-relations", "branch_relations"],
         class: Wrapper,
         shape: Query,
-        signature: "(branch-relations [:relation [identical-bodies|repeated-condition|contradictory-condition|subsumed-condition ...]] query)",
+        signature: "(branch-relations [:relation [identical-bodies|repeated-condition|contradictory-condition|subsumed-condition|empty-arm ...]] query)",
         description: (QueryStepOp::BranchRelations),
         step: BranchRelations,
+    }
+    CppExpressions {
+        labels: ["cpp-expressions", "cpp_expressions"],
+        class: Wrapper,
+        shape: Query,
+        signature: "(cpp-expressions query)",
+        description: (QueryStepOp::CppExpressions),
+        step: CppExpressions,
+    }
+    CppInconsistentLoopDirection {
+        labels: ["cpp-inconsistent-loop-direction", "cpp_inconsistent_loop_direction"],
+        class: Wrapper,
+        shape: Query,
+        signature: "(cpp-inconsistent-loop-direction query)",
+        description: (QueryStepOp::CppInconsistentLoopDirection),
+        step: CppInconsistentLoopDirection,
+    }
+    CppUnsafeArrayForDaysOfTheYear {
+        labels: ["cpp-leap-year-unsafe-array-for-days-of-the-year", "cpp_unsafe_array_for_days_of_the_year"],
+        class: Wrapper,
+        shape: Query,
+        signature: "(cpp-leap-year-unsafe-array-for-days-of-the-year query)",
+        description: (QueryStepOp::CppUnsafeArrayForDaysOfTheYear),
+        step: CppUnsafeArrayForDaysOfTheYear,
+    }
+    CppProvenance {
+        labels: ["cpp-provenance", "cpp_provenance"],
+        class: Wrapper,
+        shape: Query,
+        signature: "(cpp-provenance [:rule [incorrect-pointer-scaling-char|return-stack-allocated-memory|stack-address-escape|suspicious-pointer-scaling|suspicious-pointer-scaling-void|improper-null-termination ...]] query)",
+        description: (QueryStepOp::CppProvenance),
+        step: CppProvenance,
     }
     LoopRelations {
         labels: ["loop-relations", "loop_relations"],
@@ -2172,11 +3004,27 @@ rql_forms! {
         description: (QueryStepOp::StatementReachability),
         step: StatementReachability,
     }
+    PendingCleanupFlows {
+        labels: ["pending-cleanup-flows", "pending_cleanup_flows"],
+        class: Wrapper,
+        shape: Query,
+        signature: "(pending-cleanup-flows query)",
+        description: (QueryStepOp::PendingCleanupFlows),
+        step: PendingCleanupFlows,
+    }
+    RustPointerFindings {
+        labels: ["rust-pointer-findings", "rust_pointer_findings"],
+        class: Wrapper,
+        shape: Query,
+        signature: "(rust-pointer-findings procedure-query)",
+        description: (QueryStepOp::RustPointerFindings),
+        step: RustPointerFindings,
+    }
     ControlRelations {
         labels: ["control-relations", "control_relations"],
         class: Wrapper,
         shape: Query,
-        signature: "(control-relations [:relation [dominates|postdominates|control-depends-on|reachable|in-loop ...]] [:exit-partition [normal-and-exceptional ...]] query)",
+        signature: "(control-relations [:relation [dominates|postdominates|control-depends-on|reachable|reaches|in-loop ...]] [:exit-partition [normal-and-exceptional ...]] query)",
         description: (QueryStepOp::ControlRelations),
         step: ControlRelations,
     }
@@ -2227,6 +3075,13 @@ rql_forms! {
         signature: "(name \"exactName\")",
         description: "Match a node's normalized name exactly.",
     }
+    StringValue {
+        labels: ["value", "string-value", "string_value"],
+        class: Predicate,
+        shape: String,
+        signature: "(string-value \"exactValue\")",
+        description: "Match a string literal by its decoded value; unsupported or non-literal values remain incomplete.",
+    }
     NameRegex {
         labels: ["name/regex"],
         class: Predicate,
@@ -2247,6 +3102,153 @@ rql_forms! {
         shape: Boolean,
         signature: "(boolean-value true|false)",
         description: "Match a boolean literal by its normalized language-neutral value.",
+    }
+    Async {
+        labels: ["async"],
+        class: Predicate,
+        shape: Boolean,
+        signature: "(async true|false)",
+        description: "Match a callable by its AST-backed async modifier.",
+    }
+    Modifier {
+        labels: ["modifier"],
+        class: Predicate,
+        shape: String,
+        signature: "(modifier static|abstract)",
+        description: "Match a declaration by a modifier read from its structured modifier nodes.",
+    }
+    DuplicateKey {
+        labels: ["duplicate-key", "duplicate_key"],
+        class: Predicate,
+        shape: Boolean,
+        signature: "(duplicate-key true|false)",
+        description: "Match a Python dictionary entry by whether its decoded literal key repeats an earlier entry.",
+    }
+    Parenthesized {
+        labels: ["parenthesized"],
+        class: Predicate,
+        shape: Boolean,
+        signature: "(parenthesized true|false)",
+        description: "Match a string-literal expression by whether its syntax is parenthesized.",
+    }
+    IntegerValue {
+        labels: ["integer-value", "integer_value"],
+        class: Predicate,
+        shape: CanonicalIntegerDecimal,
+        signature: "(integer-value \"canonicalDecimal\")",
+        description: "Match an integer literal's exact canonical decimal value without narrowing it.",
+    }
+    IntegerHasAnyBits {
+        labels: ["integer-has-any-bits", "integer_has_any_bits"],
+        class: Predicate,
+        shape: PermissionBitMask,
+        signature: "(integer-has-any-bits positiveMask)",
+        description: "Match an integer literal with at least one requested low bit set.",
+    }
+    IntegerHasAllBits {
+        labels: ["integer-has-all-bits", "integer_has_all_bits"],
+        class: Predicate,
+        shape: PermissionBitMask,
+        signature: "(integer-has-all-bits positiveMask)",
+        description: "Match an integer literal with every requested low bit set.",
+    }
+    IntegerHasNoBits {
+        labels: ["integer-has-no-bits", "integer_has_no_bits"],
+        class: Predicate,
+        shape: PermissionBitMask,
+        signature: "(integer-has-no-bits positiveMask)",
+        description: "Match an integer literal with none of the requested low bits set.",
+    }
+    AssignmentTargetKind {
+        labels: ["assignment-target-kind", "assignment_target_kind"],
+        class: Predicate,
+        shape: AssignmentSequenceKind,
+        signature: "(assignment-target-kind list|tuple)",
+        description: "Match the direct target sequence kind of a tuple/list assignment.",
+    }
+    AssignmentValueKind {
+        labels: ["assignment-value-kind", "assignment_value_kind"],
+        class: Predicate,
+        shape: AssignmentSequenceKind,
+        signature: "(assignment-value-kind list|tuple)",
+        description: "Match the direct value sequence kind of a tuple/list assignment.",
+    }
+    AssignmentTargetUnstarredCount {
+        labels: ["assignment-target-unstarred-count", "assignment_target_unstarred_count"],
+        class: Predicate,
+        shape: NonNegativeInteger,
+        signature: "(assignment-target-unstarred-count count)",
+        description: "Match the number of non-starred direct target elements in a tuple/list assignment.",
+    }
+    AssignmentValueUnstarredCount {
+        labels: ["assignment-value-unstarred-count", "assignment_value_unstarred_count"],
+        class: Predicate,
+        shape: NonNegativeInteger,
+        signature: "(assignment-value-unstarred-count count)",
+        description: "Match the number of non-starred direct value elements in a tuple/list assignment.",
+    }
+    AssignmentTargetStarred {
+        labels: ["assignment-target-starred", "assignment_target_starred"],
+        class: Predicate,
+        shape: Boolean,
+        signature: "(assignment-target-starred true|false)",
+        description: "Match whether the direct target sequence has a starred element.",
+    }
+    AssignmentValueStarred {
+        labels: ["assignment-value-starred", "assignment_value_starred"],
+        class: Predicate,
+        shape: Boolean,
+        signature: "(assignment-value-starred true|false)",
+        description: "Match whether the direct value sequence has a starred element.",
+    }
+    AssignmentUnstarredCountMismatch {
+        labels: ["assignment-unstarred-count-mismatch", "assignment_unstarred_count_mismatch"],
+        class: Predicate,
+        shape: Boolean,
+        signature: "(assignment-unstarred-count-mismatch true|false)",
+        description: "Match whether the two direct sequence sides have different unstarred element counts.",
+    }
+    Index {
+        labels: ["index"],
+        class: Predicate,
+        shape: NonNegativeInteger,
+        signature: "(index zeroBasedPosition)",
+        description: "Match a child at this exact zero-based position in its parent's ordered list role, such as elements.",
+    }
+    StringValueRegex {
+        labels: ["value/regex", "string-value/regex", "string_value/regex"],
+        class: Predicate,
+        shape: RegexString,
+        signature: "(value/regex \"pattern\")",
+        description: "Match a normalized string literal's decoded value with a regular expression.",
+    }
+    Not {
+        labels: ["not"],
+        class: Predicate,
+        shape: Pattern,
+        signature: "(not pattern)",
+        description: "Exclude nodes matching the nested pattern.",
+    }
+    All {
+        labels: ["and"],
+        class: Predicate,
+        shape: PatternList,
+        signature: "(and pattern ...)",
+        description: "Require every nested pattern to match the same node.",
+    }
+    Any {
+        labels: ["or"],
+        class: Predicate,
+        shape: PatternList,
+        signature: "(or pattern ...)",
+        description: "Require at least one nested pattern to match the same node.",
+    }
+    LocalValue {
+        labels: ["local-value", "local_value"],
+        class: Predicate,
+        shape: Pattern,
+        signature: "(local-value value-pattern)",
+        description: "Match the unique, unconditional local assignment value for this variable read.",
     }
     Capture {
         labels: ["capture"],
@@ -2303,6 +3305,27 @@ rql_forms! {
         shape: String,
         signature: "(parameter-type/regex \"pattern\")",
         description: "Match a callable that has a parameter whose recorded type spelling matches this regular expression.",
+    }
+    LanguageRule {
+        labels: ["language-rule", "language_rule"],
+        class: Predicate,
+        shape: String,
+        signature: "(language-rule \"cpp/rule\"|\"cs/rule\"|\"java/rule\"|\"js/rule\")",
+        description: "Apply one closed relation from the language-rule registry to the root structural seed; the id prefix selects its language.",
+    }
+    BodyState {
+        labels: ["body-state", "body_state"],
+        class: Predicate,
+        shape: String,
+        signature: "(body-state empty|comment-only|code)",
+        description: "Match the structured state of a directly-owned branch or loop block.",
+    }
+    BodyOwner {
+        labels: ["body-owner", "body_owner"],
+        class: Predicate,
+        shape: String,
+        signature: "(body-owner if-consequence|if-alternative|loop-body)",
+        description: "Restrict a body-state match to its structured if or loop owner role.",
     }
 }
 
@@ -2370,6 +3393,12 @@ rql_properties! {
         signature: ":name \"exactName\"",
         description: "Match the normalized name exactly.",
     }
+    StringValue {
+        labels: ["value", "string-value", "string_value"],
+        shape: String,
+        signature: ":string-value \"exactValue\"",
+        description: "Match a string literal by its decoded value; unsupported or non-literal values remain incomplete.",
+    }
     NameRegex {
         labels: ["name/regex"],
         shape: RegexString,
@@ -2382,11 +3411,143 @@ rql_properties! {
         signature: ":text/regex \"pattern\"",
         description: "Match source text with a regular expression.",
     }
+    CommentBlockRegex {
+        labels: ["comment-block/regex", "comment_block/regex"],
+        shape: RegexString,
+        signature: ":comment-block/regex \"pattern\"",
+        description: "Match a comment using the source text of its maximal consecutive comment block.",
+    }
     BooleanValue {
         labels: ["boolean-value", "boolean_value"],
         shape: Boolean,
         signature: ":boolean-value true|false",
         description: "Match a boolean literal by its normalized language-neutral value.",
+    }
+    Async {
+        labels: ["async"],
+        shape: Boolean,
+        signature: ":async true|false",
+        description: "Match a callable by its AST-backed async modifier.",
+    }
+    Modifier {
+        labels: ["modifier"],
+        shape: String,
+        signature: ":modifier static|abstract",
+        description: "Match a declaration by a modifier read from its structured modifier nodes.",
+    }
+    DuplicateKey {
+        labels: ["duplicate-key", "duplicate_key"],
+        shape: Boolean,
+        signature: ":duplicate-key true|false",
+        description: "Match a Python dictionary entry by whether its decoded literal key repeats an earlier entry.",
+    }
+    Parenthesized {
+        labels: ["parenthesized"],
+        shape: Boolean,
+        signature: ":parenthesized true|false",
+        description: "Match a string-literal expression by whether its syntax is parenthesized.",
+    }
+    IntegerValue {
+        labels: ["integer-value", "integer_value"],
+        shape: CanonicalIntegerDecimal,
+        signature: ":integer-value \"canonicalDecimal\"",
+        description: "Match an integer literal's exact canonical decimal value without narrowing it.",
+    }
+    IntegerHasAnyBits {
+        labels: ["integer-has-any-bits", "integer_has_any_bits"],
+        shape: PermissionBitMask,
+        signature: ":integer-has-any-bits positiveMask",
+        description: "Match an integer literal with at least one requested low bit set.",
+    }
+    IntegerHasAllBits {
+        labels: ["integer-has-all-bits", "integer_has_all_bits"],
+        shape: PermissionBitMask,
+        signature: ":integer-has-all-bits positiveMask",
+        description: "Match an integer literal with every requested low bit set.",
+    }
+    IntegerHasNoBits {
+        labels: ["integer-has-no-bits", "integer_has_no_bits"],
+        shape: PermissionBitMask,
+        signature: ":integer-has-no-bits positiveMask",
+        description: "Match an integer literal with none of the requested low bits set.",
+    }
+    AssignmentTargetKind {
+        labels: ["assignment-target-kind", "assignment_target_kind"],
+        shape: AssignmentSequenceKind,
+        signature: ":assignment-target-kind list|tuple",
+        description: "Match the direct target sequence kind of a tuple/list assignment.",
+    }
+    AssignmentValueKind {
+        labels: ["assignment-value-kind", "assignment_value_kind"],
+        shape: AssignmentSequenceKind,
+        signature: ":assignment-value-kind list|tuple",
+        description: "Match the direct value sequence kind of a tuple/list assignment.",
+    }
+    AssignmentTargetUnstarredCount {
+        labels: ["assignment-target-unstarred-count", "assignment_target_unstarred_count"],
+        shape: NonNegativeInteger,
+        signature: ":assignment-target-unstarred-count count",
+        description: "Match the number of non-starred direct target elements in a tuple/list assignment.",
+    }
+    AssignmentValueUnstarredCount {
+        labels: ["assignment-value-unstarred-count", "assignment_value_unstarred_count"],
+        shape: NonNegativeInteger,
+        signature: ":assignment-value-unstarred-count count",
+        description: "Match the number of non-starred direct value elements in a tuple/list assignment.",
+    }
+    AssignmentTargetStarred {
+        labels: ["assignment-target-starred", "assignment_target_starred"],
+        shape: Boolean,
+        signature: ":assignment-target-starred true|false",
+        description: "Match whether the direct target sequence has a starred element.",
+    }
+    AssignmentValueStarred {
+        labels: ["assignment-value-starred", "assignment_value_starred"],
+        shape: Boolean,
+        signature: ":assignment-value-starred true|false",
+        description: "Match whether the direct value sequence has a starred element.",
+    }
+    AssignmentUnstarredCountMismatch {
+        labels: ["assignment-unstarred-count-mismatch", "assignment_unstarred_count_mismatch"],
+        shape: Boolean,
+        signature: ":assignment-unstarred-count-mismatch true|false",
+        description: "Match whether the two direct sequence sides have different unstarred element counts.",
+    }
+    Index {
+        labels: ["index"],
+        shape: NonNegativeInteger,
+        signature: ":index zeroBasedPosition",
+        description: "Match a child at this exact zero-based position in its parent's ordered list role, such as elements.",
+    }
+    StringValueRegex {
+        labels: ["string-value/regex", "string_value/regex"],
+        shape: RegexString,
+        signature: ":string-value/regex \"pattern\"",
+        description: "Match a normalized string literal's decoded value with a regular expression.",
+    }
+    Not {
+        labels: ["not"],
+        shape: Pattern,
+        signature: ":not pattern",
+        description: "Exclude nodes matching the nested pattern.",
+    }
+    All {
+        labels: ["and"],
+        shape: PatternList,
+        signature: ":and [pattern ...]",
+        description: "Require every nested pattern to match the same node.",
+    }
+    Any {
+        labels: ["or"],
+        shape: PatternList,
+        signature: ":or [pattern ...]",
+        description: "Require at least one nested pattern to match the same node.",
+    }
+    LocalValue {
+        labels: ["local-value", "local_value"],
+        shape: Pattern,
+        signature: ":local-value pattern",
+        description: "Match the unique, unconditional local assignment value for this variable read.",
     }
     Capture {
         labels: ["capture"],
@@ -2423,6 +3584,24 @@ rql_properties! {
         shape: RegexString,
         signature: ":parameter-type/regex \"pattern\"",
         description: "Match a callable that has a parameter whose recorded type spelling matches this regular expression.",
+    }
+    LanguageRule {
+        labels: ["language-rule", "language_rule"],
+        shape: String,
+        signature: ":language-rule \"cpp/rule\"|\"cs/rule\"|\"java/rule\"|\"js/rule\"",
+        description: "Apply one closed relation from the language-rule registry to the root structural seed; the id prefix selects its language.",
+    }
+    BodyState {
+        labels: ["body-state", "body_state"],
+        shape: String,
+        signature: ":body-state empty|comment-only|code",
+        description: "Match the structured state of a directly-owned branch or loop block.",
+    }
+    BodyOwner {
+        labels: ["body-owner", "body_owner"],
+        shape: String,
+        signature: ":body-owner if-consequence|if-alternative|loop-body",
+        description: "Restrict a body-state match to its structured if or loop owner role.",
     }
     Has {
         labels: ["has"],
@@ -2512,13 +3691,40 @@ json_fields! {
     Paths { label: "paths", shape: PathFilter, signature: "\"paths\": { \"min_segments\": N }", description: "Seed qualified-path rows directly from workspace facts." }
     GenerationSites { label: "generation_sites", shape: GenerationSiteFilter, signature: "\"generation_sites\": { \"kind\": [...], \"input\": [...] }", description: "Seed generation-site rows directly from recorded materialization provenance." }
     Exports { label: "exports", shape: ExportFilter, signature: "\"exports\": { \"form\": [...], \"name\": [...] }", description: "Seed export rows directly from recorded materialization provenance." }
-    ConfigurationFacts { label: "configuration_facts", shape: ConfigurationFactsFilter, signature: "\"configuration_facts\": { \"formats\": [...], \"node_kinds\": [...], \"roles\": [...], \"scalar_kinds\": [...], \"keys\": [...], \"routes\": [...], \"fact_ordinals\": [...], \"provenances\": [...], \"completenesses\": [...] }", description: "Seed authored configuration-document facts with exact key, route, node, provenance, and document-completeness constraints. Unsupported formats and recovered documents remain typed diagnostics instead of becoming clean empty answers." }
+    DependencyEvidence { label: "dependency_evidence", shape: DependencyEvidenceFilter, signature: "\"dependency_evidence\": { \"ecosystems\": [...], \"packages\": [...], \"kinds\": [...], \"exact_versions\": [...], \"version_ranges\": [...], \"sources\": [...], \"declared_by\": [...], \"scopes\": [...] }", description: "Read stored static dependency evidence with exact identity, ownership, scope and provenance. Uncertainty remains explicit." }
+    ConfigurationFacts { label: "configuration_facts", shape: ConfigurationFactsFilter, signature: "\"configuration_facts\": { \"formats\": [...], \"node_kinds\": [...], \"roles\": [...], \"scalar_kinds\": [...], \"keys\": [...], \"values\": [...], \"values_ignore_case\": [...], \"value_lt\": \"number\", \"value_le\": \"number\", \"value_gt\": \"number\", \"value_ge\": \"number\", \"xml_parent_keys\": [...], \"xml_preceding_sibling_keys\": [...], \"xml_sibling_attribute_keys\": [...], \"xml_sibling_attribute_values\": [...], \"xml_sibling_attribute_values_ignore_case\": [...], \"xml_reference_source_keys\": [...], \"xml_reference_target_keys\": [...], \"xml_reference_target_element_keys\": [...], \"xml_reference_target_child_keys\": [...], \"xml_peer_element_keys\": [...], \"xml_peer_attribute_keys\": [...], \"xml_peer_child_keys\": [...], \"xml_peer_min_shared_children\": 3, \"routes\": [...], \"fact_ordinals\": [...], \"provenances\": [...], \"completenesses\": [...] }", description: "Seed authored configuration-document facts with exact key/value, XML structural relations, same-document references, peer child-set comparisons, route, node, provenance, and document-completeness constraints. Unsupported formats and recovered documents remain typed diagnostics instead of becoming clean empty answers." }
+    Correlate { label: "correlate", shape: CrossDomainCorrelation, signature: "\"correlate\": { \"relation\": { \"configuration_key\": { \"documents\": [\"path\", ...] } }, \"code\": { query }, \"configuration\": { query } }", description: "Use a registered structural relation to pair input evidence, retaining dependency witnesses whenever mitigation cannot be proved." }
+    RequireBoth { label: "require_both", shape: CrossDomainRequirement, signature: "\"require_both\": { \"code\": { query }, \"configuration\": { query } }", description: "Require a programming-code query and a configuration query to both produce rows, without pairing them." }
 }
+
+/// Every source a query plan can name, in the order the decoder reports them.
+/// The first eleven are seeds; `union`, `intersect`, and `except` combine
+/// branches. A plan node authors exactly one. The decoder's missing-source and
+/// mutual-exclusion messages and the MCP `query_code` schema both read this
+/// list, so a source added here reaches both.
+pub const ALL_QUERY_PLAN_SOURCES: &[QueryField] = &[
+    QueryField::Match,
+    QueryField::Occurrences,
+    QueryField::Scopes,
+    QueryField::Bindings,
+    QueryField::GenerationSites,
+    QueryField::Exports,
+    QueryField::DependencyEvidence,
+    QueryField::ConfigurationFacts,
+    QueryField::Correlate,
+    QueryField::RequireBoth,
+    QueryField::Paths,
+    QueryField::Union,
+    QueryField::Intersect,
+    QueryField::Except,
+];
 
 json_fields! {
     QueryStepField,
     ALL_QUERY_STEP_FIELDS,
     Op { label: "op", shape: String, signature: "\"op\": \"step_name\"", description: "Select the typed pipeline transformation." }
+    StatementFactKind { label: "statement_fact_kind", shape: String, signature: "\"statement_fact_kind\": \"alloca-in-loop\" | \"complex-block\" | \"complex-condition\" | \"empty-block\" | \"long-switch\" | \"missing-case-in-switch\" | \"nested-loops-with-same-variable\" | \"use-of-goto\"", description: "Select one registered CodeQL statement fact. C/C++-only kinds return no matches for other languages; nested-loops-with-same-variable is supplied by C++ and C# adapters. The RQL spelling remains :kind." }
+    CppFactKind { label: "cpp_fact_kind", shape: String, signature: "\"kind\": \"assignment-does-not-return-this\" | \"catch-by-value\" | \"constructor-delegation\" | \"constructor-used-as-copy-constructor\" | \"rule-of-three\" | \"rule-of-two\" | \"throwing-pointer\" | \"undisciplined-multiple-inheritance\"", description: "Select the registered C++ CodeQL class-rule fact." }
     Depth { label: "depth", shape: PositiveInteger, signature: "\"depth\": positive integer", description: "Traverse all hierarchy edges from distance one through this depth." }
     Transitive { label: "transitive", shape: TrueBoolean, signature: "\"transitive\": true", description: "Traverse the complete indexed hierarchy under the execution budget." }
     ReferenceKinds { label: "reference_kinds", shape: ReferenceKindList, signature: "\"reference_kinds\": [\"field_write\", ...]", description: "Restrict traversal to structured source-reference kinds." }
@@ -2569,6 +3775,7 @@ json_fields! {
     EdgeSiteClasses { label: "site_class", shape: SiteClassList, signature: "\"site_class\": [\"use_site\", ...]", description: "Restrict edge rows to use sites or declaration sites." }
     StateEventClasses { label: "event_class", shape: StateEventClassList, signature: "\"event_class\": [\"establish\", \"read\", ...]", description: "Restrict state-event rows to one or more event classes." }
     StateEventSubjects { label: "subject", shape: FlowSubjectKindList, signature: "\"subject\": [\"binding\", \"property\"]", description: "Restrict state-event rows to binding subjects or property subjects." }
+    StateEventReadCauses { label: "read_cause", shape: StateEventReadCauseList, signature: "\"read_cause\": [\"post_resume_use\", \"scope_end_drop\"]", description: "Restrict synthetic suspension reads by why the binding is held in the future frame. `scope_end_drop` is syntactic liveness; combine it with initializer identity when selecting non-Copy resources." }
     FlowRelations { label: "flow_relation", shape: FlowRelationList, signature: "\"flow_relation\": [\"reaching\", ...]", description: "Restrict flow-relation rows to one or more relations." }
     RewriteDomains { label: "domain", shape: RewriteDomainList, signature: "\"domain\": [\"rust_import_alias\"]", description: "Restrict rewrite-path rows to one or more declared rewrite domains." }
     RewriteOutcomes { label: "rewrite_outcome", shape: RewriteOutcomeList, signature: "\"rewrite_outcome\": [\"converged\", \"cycle\", \"exceeded_budget\"]", description: "Restrict rewrite-path rows to one or more terminal outcomes." }
@@ -2577,16 +3784,32 @@ json_fields! {
     FailureUseConsumers { label: "consumer", shape: FailureUseConsumerList, signature: "\"consumer\": [\"return\", \"returned_call_argument\", \"call_argument\"]", description: "Restrict failure-use rows to one or more structured consumer classes." }
     BranchRelations { label: "branch_relation", shape: BranchRelationKindList, signature: "\"branch_relation\": [\"identical_bodies\", ...]", description: "Restrict branch-relation rows to one or more relation families." }
     ControlRelations { label: "control_relation", shape: ControlRelationKindList, signature: "\"control_relation\": [\"dominates\", ...]", description: "Restrict control-relation rows to one or more relations." }
-    AssignmentRelations { label: "assignment_relation", shape: AssignmentRelationKindList, signature: "\"assignment_relation\": [\"self_assignment\", \"failed_swap\", \"overwritten_unread\"]", description: "Select assignment obligations before deriving coverage. With no selection, only self-assignment is derived. Overwritten-unread supports Java, JavaScript, and TypeScript ordinary locals." }
+    AssignmentRelations { label: "assignment_relation", shape: AssignmentRelationKindList, signature: "\"assignment_relation\": [\"self_assignment\", \"self_initializer\", \"failed_swap\", \"overwritten_unread\"]", description: "Select assignment obligations before deriving coverage. With no selection, only self-assignment is derived. Self-initializer is currently a bounded C/C++ local declaration slice; overwritten-unread supports ordinary locals in C, C++, C#, Go, Java, JavaScript, Kotlin, PHP, Python, Ruby, Rust, Scala, and TypeScript." }
+    CppProvenance { label: "cpp_provenance_rule", shape: CppProvenanceRuleList, signature: "\"cpp_provenance_rule\": [\"incorrect_pointer_scaling_char\", ...]", description: "Select direct C/C++ provenance rule families." }
     ControlExitPartitions { label: "exit_partition", shape: ControlExitPartitionList, signature: "\"exit_partition\": [\"normal_and_exceptional\"]", description: "Restrict control-relation rows to one or more exit partitions the claim was computed against." }
-    ResolvesTo { label: "resolves_to", shape: CallIdentity, signature: "\"resolves_to\": { \"stable\" | \"qualified\" | \"workspace_declaration\" | \"active_semantic_model\": \"identity\" }", description: "Select one callable stable identity, qualified locator, or resolved typed identity." }
+    ResolvesTo { label: "resolves_to", shape: CallIdentity, signature: "\"resolves_to\": { \"stable\" | \"qualified\" | \"workspace_declaration\" | \"active_semantic_model\": \"identity\" }", description: "Select one stable identity, qualified locator, or resolved typed identity." }
     CallProof { label: "call_proof", shape: CallProof, signature: "\"call_proof\": \"exact\" | \"declared\"", description: "Require exact selector proof or a complete declared semantic-model callable." }
-    FindingProof { label: "finding_proof", shape: AbsentMemberProof, signature: "\"finding_proof\": \"proven\" | \"conditional\" | \"any\"", description: "Select absent-member findings by proof tier. proven (the default) keeps findings on a fully known receiver set. conditional keeps findings for a class that certainly reaches the access and lacks the member while other unclassified values may also reach it. any keeps both." }
+    FindingProof { label: "finding_proof", shape: AbsentMemberProof, signature: "\"finding_proof\": \"proven\" | \"conditional\" | \"any\"", description: "Select absent-member findings by proof tier. proven (the default) keeps findings on a fully known receiver set with no remainder. conditional keeps a class that certainly reaches the access and lacks the member while other receiver values may remain unclassified; it also permits a listed global write only when every matching write has no receiver bound and an Any member-name set. A DeclaredParameter origin is conditional only when its annotation names one workspace class with no workspace subclass, unresolved or unmodeled external base, or attribute hook such as __getattr__, __getattribute__, or __setattr__; the condition states the annotated type and closed workspace hierarchy. any keeps both tiers." }
     ReceiverType { label: "receiver_type", shape: ReceiverTypeConstraint, signature: "\"receiver_type\": call identity | { \"assignable_to\": call identity, \"resolved_identities\": [\"stable-id\", ...] }", description: "Require one exact receiver-type identity or the inclusive workspace family rooted at one type." }
     FormalName { label: "formal_name", shape: ParameterName, signature: "\"formal_name\": \"name\"", description: "Select one exact declared formal name." }
     FormalIndex { label: "formal_index", shape: NonNegativeInteger, signature: "\"formal_index\": non-negative integer", description: "Select one zero-based formal index." }
     RowWhere { label: "where", shape: RowPredicates, signature: "\"where\": [{ \"field\": FIELD, \"op\": OP, ... }]", description: "State a bounded conjunction of typed predicates over this step's input row." }
     Columns { label: "columns", shape: RowProjectionColumns, signature: "\"columns\": [{ \"source\": FIELD, \"name\": NEW_FIELD }, ...]", description: "Select and optionally rename public input-row fields." }
+}
+
+impl QueryStepField {
+    /// The public JSON name for a step field.
+    ///
+    /// `kind` is already owned by the binding step in the shared field
+    /// registry. C++ facts use the same JSON key in a different typed step,
+    /// so the registry identity stays unique while this contextual name
+    /// remains stable on the wire.
+    pub fn json_label(self) -> &'static str {
+        match self {
+            Self::CppFactKind => "kind",
+            _ => self.label(),
+        }
+    }
 }
 
 // The scope filter has exactly one axis, and its JSON key is `kind` -- the same
@@ -2621,13 +3844,72 @@ json_fields! {
     ALL_CONFIGURATION_FACTS_FILTER_FIELDS,
     Formats { label: "formats", shape: ConfigurationFormatList, signature: "\"formats\": [\"json\", ...]", description: "Restrict facts to one or more structured configuration formats." }
     NodeKinds { label: "node_kinds", shape: ConfigurationNodeKindList, signature: "\"node_kinds\": [\"member\", ...]", description: "Restrict facts to one or more configuration node kinds." }
-    Roles { label: "roles", shape: ConfigurationRoleList, signature: "\"roles\": [\"object_member\", ...]", description: "Restrict member facts to one or more configuration roles." }
+    Roles { label: "roles", shape: ConfigurationRoleList, signature: "\"roles\": [\"object-member\", ...]", description: "Restrict member facts to one or more configuration roles." }
     ScalarKinds { label: "scalar_kinds", shape: ConfigurationScalarKindList, signature: "\"scalar_kinds\": [\"string\", ...]", description: "Restrict scalar facts to one or more scalar kinds." }
     Keys { label: "keys", shape: ConfigurationKeyList, signature: "\"keys\": [\"host\", ...]", description: "Restrict facts to one or more exact configuration keys." }
+    Values { label: "values", shape: StringList, signature: "\"values\": [\"true\", ...]", description: "Restrict scalar-bearing facts to one or more exact decoded XML scalar values." }
+    ValuesIgnoreCase { label: "values_ignore_case", shape: StringList, signature: "\"values_ignore_case\": [\"true\", ...]", description: "Restrict scalar-bearing facts to one or more decoded XML scalar values using case-insensitive equality." }
+    ValueLt { label: "value_lt", shape: String, signature: "\"value_lt\": \"number\"", description: "Restrict scalar-bearing facts to finite numeric values less than the bound." }
+    ValueLe { label: "value_le", shape: String, signature: "\"value_le\": \"number\"", description: "Restrict scalar-bearing facts to finite numeric values less than or equal to the bound." }
+    ValueGt { label: "value_gt", shape: String, signature: "\"value_gt\": \"number\"", description: "Restrict scalar-bearing facts to finite numeric values greater than the bound." }
+    ValueGe { label: "value_ge", shape: String, signature: "\"value_ge\": \"number\"", description: "Restrict scalar-bearing facts to finite numeric values greater than or equal to the bound." }
+    XmlParentKeys { label: "xml_parent_keys", shape: StringList, signature: "\"xml_parent_keys\": [\"EditText\", ...]", description: "Restrict XML facts to those enclosed by an element with one of these exact names." }
+    XmlPrecedingSiblingKeys { label: "xml_preceding_sibling_keys", shape: StringList, signature: "\"xml_preceding_sibling_keys\": [\"bean\", ...]", description: "Restrict XML facts to those with a preceding element sibling with one of these exact names." }
+    XmlSiblingAttributeKeys { label: "xml_sibling_attribute_keys", shape: StringList, signature: "\"xml_sibling_attribute_keys\": [\"android:id\", ...]", description: "Restrict XML facts to those whose containing element has a sibling attribute with one of these exact names." }
+    XmlSiblingAttributeValues { label: "xml_sibling_attribute_values", shape: StringList, signature: "\"xml_sibling_attribute_values\": [\"@+id/password\", ...]", description: "Restrict XML facts to those whose required sibling attribute has one of these exact decoded values." }
+    XmlSiblingAttributeValuesIgnoreCase { label: "xml_sibling_attribute_values_ignore_case", shape: StringList, signature: "\"xml_sibling_attribute_values_ignore_case\": [\"true\", ...]", description: "Restrict XML facts to those whose required sibling attribute has one of these case-insensitive decoded values." }
+    XmlReferenceSourceKeys { label: "xml_reference_source_keys", shape: StringList, signature: "\"xml_reference_source_keys\": [\"parent\", \"bean\", ...]", description: "Require same-document XML references whose source attribute key is one of these exact names." }
+    XmlReferenceTargetKeys { label: "xml_reference_target_keys", shape: StringList, signature: "\"xml_reference_target_keys\": [\"id\", \"name\", ...]", description: "Identify same-document XML reference targets by one or more exact target attribute names." }
+    XmlReferenceTargetElementKeys { label: "xml_reference_target_element_keys", shape: StringList, signature: "\"xml_reference_target_element_keys\": [\"bean\", ...]", description: "Restrict same-document XML reference targets to elements with one of these exact names." }
+    XmlReferenceTargetChildKeys { label: "xml_reference_target_child_keys", shape: StringList, signature: "\"xml_reference_target_child_keys\": [\"property\", ...]", description: "Compare a selected XML child element with an equal child of its same-document reference target." }
+    XmlPeerElementKeys { label: "xml_peer_element_keys", shape: StringList, signature: "\"xml_peer_element_keys\": [\"bean\", ...]", description: "Restrict the generic XML peer relation to elements with one of these exact names." }
+    XmlPeerAttributeKeys { label: "xml_peer_attribute_keys", shape: StringList, signature: "\"xml_peer_attribute_keys\": [\"class\", ...]", description: "Require peer XML elements to share decoded values for these exact attribute names." }
+    XmlPeerChildKeys { label: "xml_peer_child_keys", shape: StringList, signature: "\"xml_peer_child_keys\": [\"property\", ...]", description: "Compare these direct XML child element signatures between peer elements." }
+    XmlPeerMinSharedChildren { label: "xml_peer_min_shared_children", shape: NonNegativeInteger, signature: "\"xml_peer_min_shared_children\": non-negative integer", description: "Require at least this many equal direct child signatures in the generic XML peer relation." }
     Routes { label: "routes", shape: ConfigurationRouteList, signature: "\"routes\": [[{ \"kind\": \"key\", \"key\": \"server\" }, ...], ...]", description: "Restrict facts to one or more exact-length ordered route alternatives; an empty route selects the document fact." }
     FactOrdinals { label: "fact_ordinals", shape: ConfigurationFactOrdinalList, signature: "\"fact_ordinals\": [0, ...]", description: "Select one or more zero-based fact occurrences, including duplicate-key occurrences." }
     Provenances { label: "provenances", shape: ConfigurationProvenanceList, signature: "\"provenances\": [\"authored\", ...]", description: "Restrict facts to one or more authored-value provenance classes." }
     Completenesses { label: "completenesses", shape: ConfigurationCompletenessList, signature: "\"completenesses\": [\"complete\", ...]", description: "Restrict facts to complete or recovered documents; recovery detail remains typed." }
+}
+
+json_fields! {
+    CrossDomainField,
+    ALL_CROSS_DOMAIN_FIELDS,
+    Relation { label: "relation", shape: CrossDomainRelation, signature: "\"relation\": { \"configuration_key\": { \"documents\": [\"path\", ...] } }", description: "The registered structural relation that pairs evidence or retains an unmitigated dependency witness. Only correlate takes a relation." }
+    Code { label: "code", shape: Query, signature: "\"code\": { query }", description: "The programming-code input query, or dependency_evidence input for dependency-configuration." }
+    Configuration { label: "configuration", shape: Query, signature: "\"configuration\": { query }", description: "The configuration_fact input query." }
+}
+
+json_fields! {
+    CrossDomainRelationField,
+    ALL_CROSS_DOMAIN_RELATION_FIELDS,
+    DependencyConfiguration { label: "dependency_configuration", shape: DependencyConfigurationRelation, signature: "\"dependency_configuration\": { \"owner\": \"topology-id\", \"ecosystem\": \"npm\", \"version_ranges\": [\"range\"], \"documents\": [\"path.properties\"], \"values\": [\"value\"], \"overrides\": [[\"lower\", \"higher\"]] }", description: "Prove a version-specific mitigation for an exactly owned dependency through explicit document applicability and acyclic precedence. Retain dependency witnesses when mitigation is not established." }
+    ConfigurationKey { label: "configuration_key", shape: CorrelationDocumentList, signature: "\"configuration_key\": { \"documents\": [\"path\", ...] }", description: "Relate a plain string-literal argument bound to a resolver-proven callee to the .properties member whose single key segment equals it, inside an explicitly declared document." }
+    ConfigurationCode { label: "configuration_code", shape: ConfigurationCodeRelation, signature: "\"configuration_code\": { \"match\": \"scalar-member\", \"absence\": true }", description: "Relate configuration scalar/document facts to code declarations or same-project code facts through a structured join. With absence true, emit only a complete configuration witness for which no complete code match exists." }
+}
+
+json_fields! {
+    ConfigurationKeyRelationField,
+    ALL_CONFIGURATION_KEY_RELATION_FIELDS,
+    Documents { label: "documents", shape: CorrelationDocumentList, signature: "\"documents\": [\"src/main/resources/app.properties\", ...]", description: "Exact workspace-relative .properties document paths the binding reads. Globs, `.` and `..` segments, and undeclared documents never correlate." }
+}
+
+json_fields! {
+    DependencyConfigurationRelationField,
+    ALL_DEPENDENCY_CONFIGURATION_RELATION_FIELDS,
+    Owner { label: "owner", shape: String, signature: "\"owner\": \"topology-id\"", description: "Exact nonempty declared_by topology identity of the consuming workspace package. Path proximity never establishes ownership." }
+    Ecosystem { label: "ecosystem", shape: String, signature: "\"ecosystem\": \"npm\" | \"cargo\"", description: "Supported ecosystem for version-specific mitigation; exactly npm or cargo." }
+    VersionRanges { label: "version_ranges", shape: StringList, signature: "\"version_ranges\": [\"range\", ...]", description: "One through 32 supported version ranges. Only complete locked or installed exact versions can satisfy them." }
+    Documents { label: "documents", shape: CorrelationDocumentList, signature: "\"documents\": [\"app.properties\", ...]", description: "One through 32 exact workspace-relative .properties documents explicitly applicable to this owner." }
+    Overrides { label: "overrides", shape: CorrelationOverrideList, signature: "\"overrides\": [[\"lower.properties\", \"higher.properties\"], ...]", description: "Up to 128 unique acyclic lower-to-higher precedence edges between declared documents. Omitted edges imply no precedence." }
+    Values { label: "values", shape: StringList, signature: "\"values\": [\"true\", ...]", description: "One through 32 exact plain .properties scalar spellings that mitigate the selected dependency version. Escaped, continued, or interpolated values require supported binding evidence." }
+}
+
+json_fields! {
+    ConfigurationCodeRelationField,
+    ALL_CONFIGURATION_CODE_RELATION_FIELDS,
+    Match { label: "match", shape: String, signature: "\"match\": \"scalar-declaration\" | \"scalar-owner\" | \"scalar-member\" | \"same-project\"", description: "Select the structured configuration-to-code join." }
+    Absence { label: "absence", shape: Boolean, signature: "\"absence\": true | false", description: "Use a document-scoped anti-join. A negative row is emitted only when both the configuration document and code input are complete." }
 }
 
 /// One RQL option owned by a typed query-step descriptor.
@@ -2741,6 +4023,13 @@ const RESOLVED_CALL_STEP_OPTIONS: &[QueryStepOption] = &[
         &[":receiver-type", ":receiver_type"],
     ),
 ];
+const RESOLVED_VALUE_STEP_OPTIONS: &[QueryStepOption] = &[
+    QueryStepOption::required(
+        QueryStepField::ResolvesTo,
+        &[":resolves-to", ":resolves_to"],
+    ),
+    QueryStepOption::required(QueryStepField::CallProof, &[":proof"]),
+];
 const CALL_ARGUMENT_STEP_OPTIONS: &[QueryStepOption] = &[
     QueryStepOption::optional(
         QueryStepField::FormalName,
@@ -2759,6 +4048,18 @@ const PROJECT_STEP_OPTIONS: &[QueryStepOption] = &[QueryStepOption::required(
     QueryStepField::Columns,
     &[":columns"],
 )];
+const CAPTURE_ANCHOR_STEP_OPTIONS: &[QueryStepOption] = &[QueryStepOption::required(
+    QueryStepField::Capture,
+    &[":capture"],
+)];
+const STATEMENT_FACTS_STEP_OPTIONS: &[QueryStepOption] = &[QueryStepOption::required(
+    QueryStepField::StatementFactKind,
+    &[":kind"],
+)];
+const CPP_FACTS_STEP_OPTIONS: &[QueryStepOption] = &[QueryStepOption::required(
+    QueryStepField::CppFactKind,
+    &[":kind"],
+)];
 /// Shared by the two occurrence-producing steps and by the `occurrences` seed,
 /// so an author spells the same filter the same way wherever it appears.
 pub const OCCURRENCE_STEP_OPTIONS: &[QueryStepOption] = &[
@@ -2770,11 +4071,15 @@ pub const OCCURRENCE_STEP_OPTIONS: &[QueryStepOption] = &[
     ),
 ];
 
-pub fn occurrence_option_for_rql_label(label: &str) -> Option<QueryStepOption> {
-    OCCURRENCE_STEP_OPTIONS
+fn option_for_rql_label(options: &[QueryStepOption], label: &str) -> Option<QueryStepOption> {
+    options
         .iter()
         .copied()
         .find(|option| option.accepts_rql_label(label))
+}
+
+pub fn occurrence_option_for_rql_label(label: &str) -> Option<QueryStepOption> {
+    option_for_rql_label(OCCURRENCE_STEP_OPTIONS, label)
 }
 
 /// Shared by the `bindings` seed and the `bindings-in` step (#1474).
@@ -2813,6 +4118,10 @@ pub const STATE_EVENT_STEP_OPTIONS: &[QueryStepOption] = &[
         QueryStepField::StateEventSubjects,
         &[":subject", ":subjects"],
     ),
+    QueryStepOption::optional(
+        QueryStepField::StateEventReadCauses,
+        &[":read-cause", ":read-causes"],
+    ),
 ];
 
 /// Options of the `flow-relations-of` step (#1480).
@@ -2837,10 +4146,7 @@ pub const RESULT_CONTRACT_FAILURE_USE_STEP_OPTIONS: &[QueryStepOption] = &[
 ];
 
 pub fn flow_state_option_for_rql_label(op: QueryStepOp, label: &str) -> Option<QueryStepOption> {
-    op.options()
-        .iter()
-        .copied()
-        .find(|option| option.accepts_rql_label(label))
+    option_for_rql_label(op.options(), label)
 }
 
 /// Options of the `branch-relations` step.
@@ -2864,6 +4170,12 @@ pub const CONTROL_RELATION_STEP_OPTIONS: &[QueryStepOption] = &[
 pub const ASSIGNMENT_RELATION_STEP_OPTIONS: &[QueryStepOption] = &[QueryStepOption::optional(
     QueryStepField::AssignmentRelations,
     &[":relation", ":relations"],
+)];
+
+/// Options of the direct C/C++ provenance step.
+pub const CPP_PROVENANCE_STEP_OPTIONS: &[QueryStepOption] = &[QueryStepOption::optional(
+    QueryStepField::CppProvenance,
+    &[":rule", ":rules"],
 )];
 
 /// Options of the `rewrite-paths-of` step (#1480).
@@ -2895,10 +4207,7 @@ pub const DECLARATION_STATE_STEP_OPTIONS: &[QueryStepOption] = &[
 ];
 
 pub fn declaration_state_option_for_rql_label(label: &str) -> Option<QueryStepOption> {
-    DECLARATION_STATE_STEP_OPTIONS
-        .iter()
-        .copied()
-        .find(|option| option.accepts_rql_label(label))
+    option_for_rql_label(DECLARATION_STATE_STEP_OPTIONS, label)
 }
 
 /// The RQL option spellings of the `generation-sites` seed (#1476), mapped to
@@ -2936,6 +4245,81 @@ pub fn configuration_facts_field_for_rql_label(
             Some(ConfigurationFactsFilterField::ScalarKinds)
         }
         ":key" | ":keys" => Some(ConfigurationFactsFilterField::Keys),
+        ":value" | ":values" => Some(ConfigurationFactsFilterField::Values),
+        ":value-ignore-case"
+        | ":value_ignore_case"
+        | ":values-ignore-case"
+        | ":values_ignore_case" => Some(ConfigurationFactsFilterField::ValuesIgnoreCase),
+        ":value-lt" | ":value_lt" => Some(ConfigurationFactsFilterField::ValueLt),
+        ":value-le" | ":value_le" => Some(ConfigurationFactsFilterField::ValueLe),
+        ":value-gt" | ":value_gt" => Some(ConfigurationFactsFilterField::ValueGt),
+        ":value-ge" | ":value_ge" => Some(ConfigurationFactsFilterField::ValueGe),
+        ":xml-parent-key" | ":xml_parent_key" | ":xml-parent-keys" | ":xml_parent_keys" => {
+            Some(ConfigurationFactsFilterField::XmlParentKeys)
+        }
+        ":xml-preceding-sibling-key"
+        | ":xml_preceding_sibling_key"
+        | ":xml-preceding-sibling-keys"
+        | ":xml_preceding_sibling_keys" => {
+            Some(ConfigurationFactsFilterField::XmlPrecedingSiblingKeys)
+        }
+        ":xml-sibling-attribute-key"
+        | ":xml_sibling_attribute_key"
+        | ":xml-sibling-attribute-keys"
+        | ":xml_sibling_attribute_keys" => {
+            Some(ConfigurationFactsFilterField::XmlSiblingAttributeKeys)
+        }
+        ":xml-sibling-attribute-value"
+        | ":xml_sibling_attribute_value"
+        | ":xml-sibling-attribute-values"
+        | ":xml_sibling_attribute_values" => {
+            Some(ConfigurationFactsFilterField::XmlSiblingAttributeValues)
+        }
+        ":xml-sibling-attribute-value-ignore-case"
+        | ":xml_sibling_attribute_value_ignore_case"
+        | ":xml-sibling-attribute-values-ignore-case"
+        | ":xml_sibling_attribute_values_ignore_case" => {
+            Some(ConfigurationFactsFilterField::XmlSiblingAttributeValuesIgnoreCase)
+        }
+        ":xml-reference-source-key"
+        | ":xml_reference_source_key"
+        | ":xml-reference-source-keys"
+        | ":xml_reference_source_keys" => {
+            Some(ConfigurationFactsFilterField::XmlReferenceSourceKeys)
+        }
+        ":xml-reference-target-key"
+        | ":xml_reference_target_key"
+        | ":xml-reference-target-keys"
+        | ":xml_reference_target_keys" => {
+            Some(ConfigurationFactsFilterField::XmlReferenceTargetKeys)
+        }
+        ":xml-reference-target-element-key"
+        | ":xml_reference_target_element_key"
+        | ":xml-reference-target-element-keys"
+        | ":xml_reference_target_element_keys" => {
+            Some(ConfigurationFactsFilterField::XmlReferenceTargetElementKeys)
+        }
+        ":xml-reference-target-child-key"
+        | ":xml_reference_target_child_key"
+        | ":xml-reference-target-child-keys"
+        | ":xml_reference_target_child_keys" => {
+            Some(ConfigurationFactsFilterField::XmlReferenceTargetChildKeys)
+        }
+        ":xml-peer-element-key"
+        | ":xml_peer_element_key"
+        | ":xml-peer-element-keys"
+        | ":xml_peer_element_keys" => Some(ConfigurationFactsFilterField::XmlPeerElementKeys),
+        ":xml-peer-attribute-key"
+        | ":xml_peer_attribute_key"
+        | ":xml-peer-attribute-keys"
+        | ":xml_peer_attribute_keys" => Some(ConfigurationFactsFilterField::XmlPeerAttributeKeys),
+        ":xml-peer-child-key"
+        | ":xml_peer_child_key"
+        | ":xml-peer-child-keys"
+        | ":xml_peer_child_keys" => Some(ConfigurationFactsFilterField::XmlPeerChildKeys),
+        ":xml-peer-min-shared-children" | ":xml_peer_min_shared_children" => {
+            Some(ConfigurationFactsFilterField::XmlPeerMinSharedChildren)
+        }
         ":route" | ":routes" => Some(ConfigurationFactsFilterField::Routes),
         ":fact-ordinal" | ":fact_ordinal" | ":fact-ordinals" | ":fact_ordinals" => {
             Some(ConfigurationFactsFilterField::FactOrdinals)
@@ -2946,14 +4330,62 @@ pub fn configuration_facts_field_for_rql_label(
     }
 }
 
+/// The RQL option spellings of `correlate` and `require-both`.
+pub fn cross_domain_field_for_rql_label(label: &str) -> Option<CrossDomainField> {
+    match label {
+        ":relation" => Some(CrossDomainField::Relation),
+        ":code" => Some(CrossDomainField::Code),
+        ":configuration" => Some(CrossDomainField::Configuration),
+        _ => None,
+    }
+}
+
+/// The RQL option spellings of the `configuration-key` relation.
+pub fn configuration_key_relation_field_for_rql_label(
+    label: &str,
+) -> Option<ConfigurationKeyRelationField> {
+    match label {
+        ":documents" | ":document" => Some(ConfigurationKeyRelationField::Documents),
+        _ => None,
+    }
+}
+
+/// The RQL option spellings of the `configuration-code` relation.
+pub fn configuration_code_relation_field_for_rql_label(
+    label: &str,
+) -> Option<ConfigurationCodeRelationField> {
+    match label {
+        ":match" => Some(ConfigurationCodeRelationField::Match),
+        ":absence" => Some(ConfigurationCodeRelationField::Absence),
+        _ => None,
+    }
+}
+
+/// Accepted options of the dependency-configuration relation.
+pub fn dependency_configuration_relation_field_for_rql_label(
+    label: &str,
+) -> Option<DependencyConfigurationRelationField> {
+    match label {
+        ":owner" => Some(DependencyConfigurationRelationField::Owner),
+        ":ecosystem" => Some(DependencyConfigurationRelationField::Ecosystem),
+        ":version-range" | ":version-ranges" | ":version_range" | ":version_ranges" => {
+            Some(DependencyConfigurationRelationField::VersionRanges)
+        }
+        ":document" | ":documents" => Some(DependencyConfigurationRelationField::Documents),
+        ":overrides" => Some(DependencyConfigurationRelationField::Overrides),
+        ":value" | ":values" => Some(DependencyConfigurationRelationField::Values),
+        _ => None,
+    }
+}
+
 /// Canonical visible labels for the configuration member-role vocabulary.
 pub fn configuration_member_role_label(role: ConfigurationMemberRole) -> &'static str {
     match role {
-        ConfigurationMemberRole::ObjectMember => "object_member",
-        ConfigurationMemberRole::TableEntry => "table_entry",
+        ConfigurationMemberRole::ObjectMember => "object-member",
+        ConfigurationMemberRole::TableEntry => "table-entry",
         ConfigurationMemberRole::Property => "property",
-        ConfigurationMemberRole::XmlAttribute => "xml_attribute",
-        ConfigurationMemberRole::XmlElement => "xml_element",
+        ConfigurationMemberRole::XmlAttribute => "xml-attribute",
+        ConfigurationMemberRole::XmlElement => "xml-element",
     }
 }
 
@@ -3006,17 +4438,11 @@ pub fn configuration_provenance_from_label(label: &str) -> Option<ConfigurationV
 }
 
 pub fn binding_option_for_rql_label(label: &str) -> Option<QueryStepOption> {
-    BINDING_STEP_OPTIONS
-        .iter()
-        .copied()
-        .find(|option| option.accepts_rql_label(label))
+    option_for_rql_label(BINDING_STEP_OPTIONS, label)
 }
 
 pub fn candidate_option_for_rql_label(label: &str) -> Option<QueryStepOption> {
-    CANDIDATE_STEP_OPTIONS
-        .iter()
-        .copied()
-        .find(|option| option.accepts_rql_label(label))
+    option_for_rql_label(CANDIDATE_STEP_OPTIONS, label)
 }
 
 impl QueryStepOp {
@@ -3024,6 +4450,9 @@ impl QueryStepOp {
         match self {
             Self::Filter => FILTER_STEP_OPTIONS,
             Self::Project => PROJECT_STEP_OPTIONS,
+            Self::CaptureAnchor => CAPTURE_ANCHOR_STEP_OPTIONS,
+            Self::StatementFacts => STATEMENT_FACTS_STEP_OPTIONS,
+            Self::CppFacts => CPP_FACTS_STEP_OPTIONS,
             Self::Typestate => TYPESTATE_STEP_OPTIONS,
             Self::ValueFlow => VALUE_FLOW_STEP_OPTIONS,
             Self::Taint => TAINT_STEP_OPTIONS,
@@ -3032,6 +4461,7 @@ impl QueryStepOp {
             Self::KeyedReadValue => KEYED_READ_VALUE_STEP_OPTIONS,
             Self::Witness => WITNESS_STEP_OPTIONS,
             Self::ResolvedCall => RESOLVED_CALL_STEP_OPTIONS,
+            Self::ResolvedValue => RESOLVED_VALUE_STEP_OPTIONS,
             Self::CallArgument => CALL_ARGUMENT_STEP_OPTIONS,
             Self::OccurrencesOf | Self::OccurrencesIn => OCCURRENCE_STEP_OPTIONS,
             Self::BindingsIn => BINDING_STEP_OPTIONS,
@@ -3045,6 +4475,7 @@ impl QueryStepOp {
             Self::ControlRelations => CONTROL_RELATION_STEP_OPTIONS,
             Self::AssignmentRelations => ASSIGNMENT_RELATION_STEP_OPTIONS,
             Self::BranchRelations => BRANCH_RELATION_STEP_OPTIONS,
+            Self::CppProvenance => CPP_PROVENANCE_STEP_OPTIONS,
             Self::RewritePathsOf => REWRITE_PATH_STEP_OPTIONS,
             Self::AbsentMember => ABSENT_MEMBER_STEP_OPTIONS,
             _ => &[],
@@ -3052,10 +4483,7 @@ impl QueryStepOp {
     }
 
     pub fn option_for_rql_label(self, label: &str) -> Option<QueryStepOption> {
-        self.options()
-            .iter()
-            .copied()
-            .find(|option| option.accepts_rql_label(label))
+        option_for_rql_label(self.options(), label)
     }
 }
 
@@ -3103,10 +4531,33 @@ pub fn reference_kind_label(kind: ReferenceKind) -> &'static str {
 }
 
 pub fn reference_kind_from_label(label: &str) -> Option<ReferenceKind> {
-    ALL_REFERENCE_KINDS
+    find_by_label(
+        ALL_REFERENCE_KINDS.iter().copied(),
+        label,
+        reference_kind_label,
+    )
+}
+
+/// The `kind` axis of the generation-site seed, in canonical registry order.
+pub fn generation_kind_labels() -> Vec<&'static str> {
+    ALL_GENERATION_KINDS
         .iter()
-        .copied()
-        .find(|kind| reference_kind_label(*kind) == label)
+        .map(|kind| kind.label())
+        .collect()
+}
+
+/// The `input` axis of the generation-site seed, in canonical registry order.
+pub fn generation_input_labels() -> Vec<&'static str> {
+    ALL_GENERATION_INPUT_CLASSES
+        .iter()
+        .map(|input| input.label())
+        .collect()
+}
+
+/// The `form` axis of the export seed, in canonical registry order. The `name`
+/// axis is open and has no vocabulary.
+pub fn export_form_labels() -> Vec<&'static str> {
+    ALL_EXPORT_FORMS.iter().map(|form| form.label()).collect()
 }
 
 /// The constrained-value vocabulary each occurrence filter axis accepts, in the
@@ -3180,6 +4631,10 @@ pub fn flow_state_filter_labels(field: QueryStepField) -> Vec<&'static str> {
             .iter()
             .map(|kind| kind.label())
             .collect(),
+        QueryStepField::StateEventReadCauses => ALL_STATE_EVENT_READ_CAUSES
+            .iter()
+            .map(|cause| cause.label())
+            .collect(),
         QueryStepField::FlowRelations => ALL_FLOW_RELATIONS
             .iter()
             .map(|relation| relation.label())
@@ -3196,6 +4651,18 @@ pub fn flow_state_filter_labels(field: QueryStepField) -> Vec<&'static str> {
 /// row family owns it. Parser, validator, hover and completion all read this
 /// one entry point, so a new constrained axis is spelled once (#1480).
 pub fn constrained_step_option_labels(field: QueryStepField) -> Vec<&'static str> {
+    if field == QueryStepField::StatementFactKind {
+        return StatementFactKind::ALL
+            .iter()
+            .map(|kind| kind.label())
+            .collect();
+    }
+    if field == QueryStepField::CppFactKind {
+        return CppClassFactKind::ALL
+            .iter()
+            .map(|kind| kind.label())
+            .collect();
+    }
     if field == QueryStepField::KeyKind {
         return RuntimeKeyKind::ALL
             .iter()
@@ -3223,12 +4690,19 @@ pub fn constrained_step_option_labels(field: QueryStepField) -> Vec<&'static str
     if field == QueryStepField::AssignmentRelations {
         return [
             AssignmentRelationKind::SelfAssignment,
+            AssignmentRelationKind::SelfInitializer,
             AssignmentRelationKind::FailedSwap,
             AssignmentRelationKind::OverwrittenUnread,
         ]
         .iter()
         .map(|kind| kind.label())
         .collect();
+    }
+    if field == QueryStepField::CppProvenance {
+        return CppProvenanceRule::ALL
+            .iter()
+            .map(|rule| rule.label())
+            .collect();
     }
     let branch = branch_relation_filter_labels(field);
     if !branch.is_empty() {
@@ -3252,14 +4726,12 @@ pub fn failure_use_filter_labels(field: QueryStepField) -> Vec<&'static str> {
 }
 
 pub fn branch_relation_filter_labels(field: QueryStepField) -> Vec<&'static str> {
-    if field == QueryStepField::BranchRelations {
-        super::ir::BranchRelationKind::ALL
-            .iter()
-            .map(|kind| kind.label())
-            .collect()
-    } else {
-        Vec::new()
-    }
+    filter_field_labels(
+        field,
+        QueryStepField::BranchRelations,
+        super::ir::BranchRelationKind::ALL,
+        |kind| kind.label(),
+    )
 }
 
 /// The constrained-value vocabulary each control-relation filter axis accepts,
@@ -3267,15 +4739,32 @@ pub fn branch_relation_filter_labels(field: QueryStepField) -> Vec<&'static str>
 /// read one table (#2443).
 pub fn control_relation_filter_labels(field: QueryStepField) -> Vec<&'static str> {
     match field {
-        QueryStepField::ControlRelations => ALL_CONTROL_RELATION_KINDS
-            .iter()
-            .map(|relation| relation.label())
-            .collect(),
-        QueryStepField::ControlExitPartitions => ALL_CONTROL_EXIT_PARTITIONS
-            .iter()
-            .map(|partition| partition.label())
-            .collect(),
+        QueryStepField::ControlRelations => filter_field_labels(
+            field,
+            QueryStepField::ControlRelations,
+            ALL_CONTROL_RELATION_KINDS,
+            |relation| relation.label(),
+        ),
+        QueryStepField::ControlExitPartitions => filter_field_labels(
+            field,
+            QueryStepField::ControlExitPartitions,
+            ALL_CONTROL_EXIT_PARTITIONS,
+            |partition| partition.label(),
+        ),
         _ => Vec::new(),
+    }
+}
+
+fn filter_field_labels<T>(
+    field: QueryStepField,
+    expected: QueryStepField,
+    values: &[T],
+    label_for: impl Fn(&T) -> &'static str,
+) -> Vec<&'static str> {
+    if field == expected {
+        values.iter().map(label_for).collect()
+    } else {
+        Vec::new()
     }
 }
 
@@ -3292,14 +4781,18 @@ pub fn control_exit_partition_from_label(label: &str) -> Option<ControlExitParti
 /// read one table (#1480).
 pub fn rewrite_path_filter_labels(field: QueryStepField) -> Vec<&'static str> {
     match field {
-        QueryStepField::RewriteDomains => ALL_REWRITE_DOMAIN_KINDS
-            .iter()
-            .map(|domain| domain.label())
-            .collect(),
-        QueryStepField::RewriteOutcomes => ALL_REWRITE_OUTCOME_KINDS
-            .iter()
-            .map(|outcome| outcome.label())
-            .collect(),
+        QueryStepField::RewriteDomains => filter_field_labels(
+            field,
+            QueryStepField::RewriteDomains,
+            ALL_REWRITE_DOMAIN_KINDS,
+            |domain| domain.label(),
+        ),
+        QueryStepField::RewriteOutcomes => filter_field_labels(
+            field,
+            QueryStepField::RewriteOutcomes,
+            ALL_REWRITE_OUTCOME_KINDS,
+            |outcome| outcome.label(),
+        ),
         _ => Vec::new(),
     }
 }
@@ -3362,19 +4855,22 @@ pub fn call_traversal_completeness_from_label(label: &str) -> Option<CallTravers
     }
 }
 
+const USAGE_HIT_SURFACE_LABELS: &[(UsageHitSurface, &str)] = &[
+    (UsageHitSurface::ExternalUsages, "external_usages"),
+    (UsageHitSurface::LspReferences, "lsp_references"),
+];
+
 pub fn usage_surface_label(surface: UsageHitSurface) -> &'static str {
-    match surface {
-        UsageHitSurface::ExternalUsages => "external_usages",
-        UsageHitSurface::LspReferences => "lsp_references",
-    }
+    USAGE_HIT_SURFACE_LABELS
+        .iter()
+        .find_map(|(candidate, label)| (*candidate == surface).then_some(*label))
+        .expect("every usage hit surface has a registered RQL label")
 }
 
 pub fn usage_surface_from_label(label: &str) -> Option<UsageHitSurface> {
-    match label {
-        "external_usages" => Some(UsageHitSurface::ExternalUsages),
-        "lsp_references" => Some(UsageHitSurface::LspReferences),
-        _ => None,
-    }
+    USAGE_HIT_SURFACE_LABELS
+        .iter()
+        .find_map(|(surface, candidate)| (*candidate == label).then_some(*surface))
 }
 
 /// Every usage kind an edge filter can name, in wire-label order. The labels
@@ -3385,15 +4881,17 @@ pub const ALL_USAGE_KINDS: &[UsageHitKind] = &[
     UsageHitKind::Import,
     UsageHitKind::Reexport,
     UsageHitKind::SelfReceiver,
+    UsageHitKind::DeclaredReference,
     UsageHitKind::Definition,
     UsageHitKind::OverrideDeclaration,
 ];
 
 pub fn usage_kind_from_label(label: &str) -> Option<UsageHitKind> {
-    ALL_USAGE_KINDS
-        .iter()
-        .copied()
-        .find(|kind| kind.wire_label() == label)
+    find_by_label(
+        ALL_USAGE_KINDS.iter().copied(),
+        label,
+        UsageHitKind::wire_label,
+    )
 }
 
 json_fields! {
@@ -3408,26 +4906,55 @@ json_fields! {
     Kind { label: "kind", shape: KindList, signature: "\"kind\": \"kind\" | [\"kinds\", ...]", description: "Match one or more normalized node kinds." }
     NotKind { label: "not_kind", shape: KindList, signature: "\"not_kind\": \"kind\" | [\"kinds\", ...]", description: "Exclude one or more normalized node kinds." }
     Name { label: "name", shape: StringPredicate, signature: "\"name\": \"exact\" | { \"regex\": \"pattern\" }", description: "Match the node's normalized name." }
+    Async { label: "async", shape: Boolean, signature: "\"async\": true | false", description: "Match a callable by its AST-backed async modifier." }
+    Modifier { label: "modifier", shape: String, signature: "\"modifier\": \"static\" | \"abstract\"", description: "Match a declaration by a modifier read from its structured modifier nodes." }
+    StringValue { label: "string_value", shape: StringPredicate, signature: "\"string_value\": \"exact\" | { \"regex\": \"pattern\" }", description: "Match a normalized string literal by its decoded value." }
     Text { label: "text", shape: RegexPredicate, signature: "\"text\": { \"regex\": \"pattern\" }", description: "Match the node's source text with a regular expression." }
+    CommentBlockText { label: "comment_block_text", shape: RegexPredicate, signature: "\"comment_block_text\": { \"regex\": \"pattern\" }", description: "Match a comment using the source text of its maximal consecutive comment block." }
     BooleanValue { label: "boolean_value", shape: Boolean, signature: "\"boolean_value\": true | false", description: "Match a boolean literal by its normalized language-neutral value." }
+    DuplicateKey { label: "duplicate_key", shape: Boolean, signature: "\"duplicate_key\": true | false", description: "Match a Python dictionary entry by whether its decoded literal key repeats an earlier entry." }
+    Parenthesized { label: "parenthesized", shape: Boolean, signature: "\"parenthesized\": true | false", description: "Match a string-literal expression by whether its syntax is parenthesized." }
+    IntegerValue { label: "integer_value", shape: CanonicalIntegerDecimal, signature: "\"integer_value\": \"canonicalDecimal\"", description: "Match an integer literal's exact canonical decimal value without narrowing it." }
+    IntegerHasAnyBits { label: "integer_has_any_bits", shape: PermissionBitMask, signature: "\"integer_has_any_bits\": positive u32 mask", description: "Match an integer literal with at least one requested low bit set." }
+    IntegerHasAllBits { label: "integer_has_all_bits", shape: PermissionBitMask, signature: "\"integer_has_all_bits\": positive u32 mask", description: "Match an integer literal with every requested low bit set." }
+    IntegerHasNoBits { label: "integer_has_no_bits", shape: PermissionBitMask, signature: "\"integer_has_no_bits\": positive u32 mask", description: "Match an integer literal with none of the requested low bits set." }
+    AssignmentTargetKind { label: "assignment_target_kind", shape: AssignmentSequenceKind, signature: "\"assignment_target_kind\": \"list\" | \"tuple\"", description: "Match the direct target sequence kind of a tuple/list assignment." }
+    AssignmentValueKind { label: "assignment_value_kind", shape: AssignmentSequenceKind, signature: "\"assignment_value_kind\": \"list\" | \"tuple\"", description: "Match the direct value sequence kind of a tuple/list assignment." }
+    AssignmentTargetUnstarredCount { label: "assignment_target_unstarred_count", shape: NonNegativeInteger, signature: "\"assignment_target_unstarred_count\": non-negative integer", description: "Match the number of non-starred direct target elements in a tuple/list assignment." }
+    AssignmentValueUnstarredCount { label: "assignment_value_unstarred_count", shape: NonNegativeInteger, signature: "\"assignment_value_unstarred_count\": non-negative integer", description: "Match the number of non-starred direct value elements in a tuple/list assignment." }
+    AssignmentTargetStarred { label: "assignment_target_starred", shape: Boolean, signature: "\"assignment_target_starred\": true | false", description: "Match whether the direct target sequence has a starred element." }
+    AssignmentValueStarred { label: "assignment_value_starred", shape: Boolean, signature: "\"assignment_value_starred\": true | false", description: "Match whether the direct value sequence has a starred element." }
+    AssignmentUnstarredCountMismatch { label: "assignment_unstarred_count_mismatch", shape: Boolean, signature: "\"assignment_unstarred_count_mismatch\": true | false", description: "Match whether the two direct sequence sides have different unstarred element counts." }
+    Index { label: "index", shape: NonNegativeInteger, signature: "\"index\": non-negative integer", description: "Match a child at this exact zero-based position in its parent's ordered list role, such as elements." }
     Capture { label: "capture", shape: String, signature: "\"capture\": \"label\"", description: "Capture the matching node under a result label." }
     Arity { label: "arity", shape: Arity, signature: "\"arity\": count | { \"min\": count, \"max\": count }", description: "Match a call by its positional argument count, or a collection literal by its element count: an exact count, or inclusive min/max bounds." }
     Visibility { label: "visibility", shape: DeclaredVisibilityList, signature: "\"visibility\": \"public\" | [\"public\", \"protected\", ...]", description: "Match a callable declaration by the visibility its adapter recorded from modifiers." }
     ParameterType { label: "parameter_type", shape: StringPredicate, signature: "\"parameter_type\": \"exact\" | { \"regex\": \"pattern\" }", description: "Match a callable that has a parameter whose recorded type spelling satisfies this predicate. The spelling is a discriminator, not a resolved type identity." }
     Has { label: "has", shape: Pattern, signature: "\"has\": { pattern }", description: "Require a matching descendant." }
     NotHas { label: "not_has", shape: Pattern, signature: "\"not_has\": { pattern }", description: "Exclude nodes containing a matching descendant." }
+    Not { label: "not", shape: Pattern, signature: "\"not\": { pattern }", description: "Exclude nodes matching the nested pattern." }
+    All { label: "all", shape: PatternList, signature: "\"all\": [{ pattern }, ...]", description: "Require every nested pattern to match the same node." }
+    Any { label: "any", shape: PatternList, signature: "\"any\": [{ pattern }, ...]", description: "Require at least one nested pattern to match the same node." }
+    LocalValue { label: "local_value", shape: Pattern, signature: "\"local_value\": { pattern }", description: "Match the unique, unconditional local assignment value for this variable read." }
+    LanguageRule { label: "language_rule", shape: String, signature: "\"language_rule\": \"cpp/rule\" | \"cs/rule\" | \"java/rule\" | \"js/rule\"", description: "Apply one closed relation from the language-rule registry to the root structural seed; the id prefix selects its language." }
+    BodyState { label: "body_state", shape: String, signature: "\"body_state\": \"empty\" | \"comment-only\" | \"code\"", description: "Match the structured state of a directly-owned branch or loop block." }
+    BodyOwner { label: "body_owner", shape: String, signature: "\"body_owner\": \"if-consequence\" | \"if-alternative\" | \"loop-body\"", description: "Restrict a body-state match to its structured if or loop owner role." }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use brokk_bifrost_core::schema_version::{SchemaVersionOrigin, SchemaVersionResolution};
+    use brokk_bifrost_test_macros::hardwon;
     use std::collections::HashSet;
 
     /// The `reference_kind` row fields publish this list as their value
     /// domain, so it must stay the exact image of `reference_kind_label` over
     /// the registry (issue #2515).
     #[test]
+    #[hardwon(
+        "#2515: The #2515 fix added value domains for enum predicates; this pins labels to the producer registry."
+    )]
     fn every_reference_kind_label_is_published_in_registry_order() {
         let mapped = ALL_REFERENCE_KINDS
             .iter()
@@ -3576,5 +5103,33 @@ mod tests {
             CodeQueryExecutionMode::default(),
             CodeQueryExecutionMode::Results
         );
+    }
+}
+
+json_fields! {
+ DependencyEvidenceFilterField,
+ ALL_DEPENDENCY_EVIDENCE_FILTER_FIELDS,
+ Ecosystems { label: "ecosystems", shape: StringList, signature: "\"ecosystems\": [\"...\"]", description: "Package ecosystem, currently cargo." }
+ Packages { label: "packages", shape: StringList, signature: "\"packages\": [\"...\"]", description: "Exact package identities, independent of dependency aliases." }
+ Kinds { label: "kinds", shape: StringList, signature: "\"kinds\": [\"...\"]", description: "declared, constraint, locked, installed or checksum file evidence." }
+ ExactVersions { label: "exact_versions", shape: StringList, signature: "\"exact_versions\": [\"...\"]", description: "Exact recorded versions; declarations never supply an exact version." }
+ VersionRanges { label: "version_ranges", shape: StringList, signature: "\"version_ranges\": [\"...\"]", description: "Version requirements matched against exact evidence using Cargo or npm semantics; requires exactly one supported ecosystem axis." }
+ Sources { label: "sources", shape: StringList, signature: "\"sources\": [\"...\"]", description: "Exact source identities, including registry URL or git revision." }
+ DeclaredBy { label: "declared_by", shape: StringList, signature: "\"declared_by\": [\"...\"]", description: "Established owning BuildProject IDs; lock co-occurrence never creates ownership." }
+ Scopes { label: "scopes", shape: StringList, signature: "\"scopes\": [\"...\"]", description: "Recorded compile, test, unknown or other dependency scope, without enabled configuration inference." }
+}
+pub fn dependency_evidence_field_for_rql_label(
+    label: &str,
+) -> Option<DependencyEvidenceFilterField> {
+    match label {
+        ":ecosystem" | ":ecosystems" => Some(DependencyEvidenceFilterField::Ecosystems),
+        ":package" | ":packages" => Some(DependencyEvidenceFilterField::Packages),
+        ":kind" | ":kinds" => Some(DependencyEvidenceFilterField::Kinds),
+        ":exact-version" | ":exact_versions" => Some(DependencyEvidenceFilterField::ExactVersions),
+        ":version-range" | ":version_ranges" => Some(DependencyEvidenceFilterField::VersionRanges),
+        ":source" | ":sources" => Some(DependencyEvidenceFilterField::Sources),
+        ":declared-by" | ":declared_by" => Some(DependencyEvidenceFilterField::DeclaredBy),
+        ":scope" | ":scopes" => Some(DependencyEvidenceFilterField::Scopes),
+        _ => None,
     }
 }

@@ -1,26 +1,9 @@
--- The draft schema of `.agents/docs/stack-graph-schema-draft-2026-09-18.md`
--- exactly as lane LD loaded it, so milestone 6 starts from what was measured.
+-- Historical draft of the stack-graph schema (2026-09-18), retained for design
+-- reference. No production or test code reads this file. The measurement
+-- loader that interpreted its section and foreign-key markers is retired.
 --
--- This file is read only by the ignored measurement test
--- `resolution_prepare::schema_loader`. No production code opens it.
---
--- How to read it:
---
--- * A line `-- @section <name>` starts a section. The loader concatenates the
---   sections a variant needs, in the order the variant lists them.
--- * A line whose first characters are `--+fk ` belongs to the foreign-key
---   variant only. The loader strips that prefix for that variant and drops the
---   line for every other variant. SQLite cannot add a foreign key to an
---   existing table, so the alternative was a second hand-maintained copy of
---   forty tables; one table list that cannot drift is worth the marker.
--- * Enumeration columns are INTEGER codes in the `draft` section: the code is
---   the value's declaration position in its `labelled_enum!` vocabulary. The
---   `enum_text` and `enum_code` sections load the two largest
---   enumeration-bearing tables both ways so decision 3 has a number.
---
--- Deviations from the draft are listed in
--- `.agents/docs/stack-graph-schema-loader-2026-09-18.md`; each one is marked
--- `-- deviation:` at the column it affects.
+-- Each deviation from the candidate schema is marked with `-- deviation:` at
+-- the column it affects.
 
 -- @section core
 
@@ -253,17 +236,64 @@ CREATE INDEX resolution_type_transfers_target
 CREATE TABLE resolution_type_components (
   blob_id INTEGER NOT NULL REFERENCES resolution_blob_facts(blob_id) ON DELETE CASCADE,
   container_slot INTEGER NOT NULL,
-  constructor INTEGER NOT NULL CHECK(constructor IN (0,1,2)),
+  constructor INTEGER NOT NULL CHECK(constructor IN (0,1,2,3,4)),
   kind INTEGER NOT NULL CHECK(kind IN (0,1,2)),
   component_slot INTEGER NOT NULL,
   PRIMARY KEY(blob_id, container_slot, kind),
-  CHECK((constructor IN (0,2) AND kind=0) OR (constructor=1 AND kind IN (1,2)))
+  CHECK((constructor IN (0,2,3,4) AND kind=0) OR (constructor=1 AND kind IN (1,2)))
 --+fk   , FOREIGN KEY(blob_id, container_slot) REFERENCES resolution_semantics(blob_id, semantic_key) DEFERRABLE INITIALLY DEFERRED
 --+fk   , FOREIGN KEY(blob_id, component_slot) REFERENCES resolution_semantics(blob_id, semantic_key) DEFERRABLE INITIALLY DEFERRED
 ) WITHOUT ROWID, STRICT;
 
 CREATE INDEX resolution_type_components_component
   ON resolution_type_components(blob_id, component_slot, container_slot);
+
+CREATE TABLE resolution_type_arguments (
+  blob_id INTEGER NOT NULL REFERENCES resolution_blob_facts(blob_id) ON DELETE CASCADE,
+  application_slot INTEGER NOT NULL,
+  ordinal INTEGER NOT NULL CHECK(ordinal >= 0),
+  argument_slot INTEGER NOT NULL,
+  indirection_delta INTEGER NOT NULL CHECK(indirection_delta BETWEEN -128 AND 127),
+  reference_indirection_delta INTEGER NOT NULL CHECK(reference_indirection_delta BETWEEN -128 AND 127),
+  PRIMARY KEY(blob_id, application_slot, ordinal)
+--+fk   , FOREIGN KEY(blob_id, application_slot) REFERENCES resolution_semantics(blob_id, semantic_key) DEFERRABLE INITIALLY DEFERRED
+--+fk   , FOREIGN KEY(blob_id, argument_slot) REFERENCES resolution_semantics(blob_id, semantic_key) DEFERRABLE INITIALLY DEFERRED
+) WITHOUT ROWID, STRICT;
+
+--+fk CREATE INDEX resolution_type_arguments_fk_argument_slot
+--+fk   ON resolution_type_arguments(blob_id, argument_slot);
+
+CREATE TABLE resolution_generic_type_alias_parameters (
+  blob_id INTEGER NOT NULL REFERENCES resolution_blob_facts(blob_id) ON DELETE CASCADE,
+  alias_definition INTEGER NOT NULL,
+  ordinal INTEGER NOT NULL CHECK(ordinal >= 0),
+  parameter_definition INTEGER NOT NULL,
+  target_slot INTEGER NOT NULL,
+  indirection_delta INTEGER NOT NULL CHECK(indirection_delta BETWEEN -128 AND 127),
+  reference_indirection_delta INTEGER NOT NULL CHECK(reference_indirection_delta BETWEEN -128 AND 127),
+  PRIMARY KEY(blob_id, alias_definition, ordinal),
+  UNIQUE(blob_id, parameter_definition)
+--+fk   , FOREIGN KEY(blob_id, alias_definition) REFERENCES resolution_semantics(blob_id, semantic_key) DEFERRABLE INITIALLY DEFERRED
+--+fk   , FOREIGN KEY(blob_id, parameter_definition) REFERENCES resolution_semantics(blob_id, semantic_key) DEFERRABLE INITIALLY DEFERRED
+--+fk   , FOREIGN KEY(blob_id, target_slot) REFERENCES resolution_semantics(blob_id, semantic_key) DEFERRABLE INITIALLY DEFERRED
+) WITHOUT ROWID, STRICT;
+
+CREATE INDEX resolution_generic_type_alias_parameters_target
+  ON resolution_generic_type_alias_parameters(blob_id, target_slot, alias_definition);
+
+CREATE TABLE resolution_generic_formals (
+  blob_id INTEGER NOT NULL REFERENCES resolution_blob_facts(blob_id) ON DELETE CASCADE,
+  owner_definition INTEGER NOT NULL,
+  ordinal INTEGER NOT NULL CHECK(ordinal >= 0),
+  parameter_definition INTEGER NOT NULL,
+  PRIMARY KEY(blob_id, owner_definition, ordinal),
+  UNIQUE(blob_id, parameter_definition)
+--+fk   , FOREIGN KEY(blob_id, owner_definition) REFERENCES resolution_semantics(blob_id, semantic_key) DEFERRABLE INITIALLY DEFERRED
+--+fk   , FOREIGN KEY(blob_id, parameter_definition) REFERENCES resolution_semantics(blob_id, semantic_key) DEFERRABLE INITIALLY DEFERRED
+) WITHOUT ROWID, STRICT;
+
+CREATE INDEX resolution_generic_formals_parameter
+  ON resolution_generic_formals(blob_id, parameter_definition, owner_definition);
 
 CREATE TABLE resolution_underlying_types (
   blob_id INTEGER NOT NULL REFERENCES resolution_blob_facts(blob_id) ON DELETE CASCADE,
@@ -403,6 +433,7 @@ CREATE TABLE resolution_supertypes (
   blob_id INTEGER NOT NULL REFERENCES resolution_blob_facts(blob_id) ON DELETE CASCADE,
   definition INTEGER NOT NULL, reference INTEGER NOT NULL,
   frontier INTEGER NOT NULL, kind INTEGER NOT NULL,
+  parent_ordinal INTEGER NOT NULL CHECK(parent_ordinal >= 0),
   PRIMARY KEY(blob_id, definition, reference)
 --+fk   , FOREIGN KEY(blob_id, definition) REFERENCES resolution_semantics(blob_id, semantic_key) DEFERRABLE INITIALLY DEFERRED
 --+fk   , FOREIGN KEY(blob_id, reference) REFERENCES resolution_semantics(blob_id, semantic_key) DEFERRABLE INITIALLY DEFERRED
@@ -411,6 +442,7 @@ CREATE TABLE resolution_supertypes (
 
 CREATE INDEX resolution_supertypes_reference ON resolution_supertypes(blob_id, reference, definition);
 CREATE INDEX resolution_supertypes_frontier  ON resolution_supertypes(blob_id, frontier, definition, reference);
+CREATE INDEX resolution_supertypes_parent_order ON resolution_supertypes(blob_id, definition, parent_ordinal, reference);
 
 CREATE TABLE resolution_definition_property_gaps (
   blob_id INTEGER NOT NULL REFERENCES resolution_blob_facts(blob_id) ON DELETE CASCADE,

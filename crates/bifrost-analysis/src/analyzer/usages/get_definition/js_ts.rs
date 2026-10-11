@@ -3,16 +3,18 @@ use crate::analyzer::BoundedDefinitionLookup;
 use crate::analyzer::js_ts::providers::resolve_js_ts_source;
 use crate::analyzer::usages::js_ts_graph::browser_global_property_shape;
 use crate::navigation::NavigationOperation;
+use brokk_bifrost_core::analyzer::common::node_source_text as node_text;
 use brokk_bifrost_core::analyzer::js_ts_facts::JsTsReceiverBinding;
 use brokk_bifrost_core::analyzer::structural::adapter_helpers::nearest_ancestor;
+use brokk_bifrost_core::analyzer::tree_walk::parent_if_field;
 use brokk_bifrost_js_ts::access_chain::{
     JsTsImportedMemberChainResolution, resolve_import_member_chain,
 };
 use brokk_bifrost_js_ts::graph::source::declaration_ids_for_unit;
 use brokk_bifrost_js_ts::imports::{
-    js_ts_module_identity, js_ts_module_specifier_probed_paths, require_call_module_specifier,
-    resolve_js_ts_direct_import_candidates, resolve_js_ts_imported_member_chain,
-    resolve_js_ts_module_binding_candidates,
+    js_ts_direct_import_export_name, js_ts_module_identity, js_ts_module_specifier_probed_paths,
+    require_call_module_specifier, resolve_js_ts_direct_import_candidates,
+    resolve_js_ts_imported_member_chain, resolve_js_ts_module_binding_candidates,
 };
 use brokk_bifrost_js_ts::providers::JsTsSource;
 use brokk_bifrost_js_ts::syntax::parse_js_ts_tree;
@@ -21,8 +23,9 @@ use brokk_bifrost_js_ts::syntax::{
     JsTsLexicalBindingIndex, JsTsModuleMemberMutation, MAX_STATIC_IMPORT_BINDINGS_PER_NAME,
     destructured_property_key_source, direct_property_definitions, is_declaration_identifier,
     is_explicit_object_literal_key, is_export_alias_identifier, is_known_js_ts_global,
-    js_program_is_external_module, js_ts_statement_module_specifier, pattern_binder_identifiers,
-    slice, static_member_property, typescript_enclosing_enum_initializer,
+    js_program_is_external_module, js_ts_is_var_scope_kind, js_ts_statement_module_specifier,
+    js_ts_var_declarator_binding_scope, pattern_binder_identifiers, slice, static_member_property,
+    typescript_enclosing_enum_initializer,
 };
 /// The receiver-owner / type-text cluster this route drives now lives beside the
 /// rest of the JS/TS language logic, so the usage graph can call it without
@@ -31,10 +34,12 @@ use brokk_bifrost_js_ts::syntax::{
 use brokk_bifrost_js_ts::ts_owners::{
     TsReceiverResolution, jsts_constructor_owner_candidates, jsts_enclosing_function_scope,
     jsts_identifier_candidates, jsts_member_candidates, node_text_matches,
-    ts_binding_is_assigned_before, ts_call_expression_callees, ts_direct_object_literal_value,
+    ts_binding_is_assigned_before, ts_call_expression_callees,
+    ts_contextual_object_literal_type_node, ts_direct_object_literal_value,
     ts_expand_call_return_property_owners, ts_nodes_for_code_unit, ts_parameter_name_node,
     ts_receiver_owner_candidates_at_byte, ts_resolve_type_node_to_property_owner_outcome,
-    ts_resolve_type_text_to_property_owners, ts_unwrap_expression,
+    ts_resolve_type_text_to_property_owners, ts_simple_call_reference_name, ts_unwrap_expression,
+    visit_local_receiver_binding_writes,
 };
 use brokk_bifrost_js_ts::type_text::{
     jsts_type_space_candidates, jsts_unit_is_type_only, jsts_value_space_candidates,
@@ -80,21 +85,19 @@ impl JsTsMemberFinds {
         found: &[CodeUnit],
         dispatch_tier: crate::analyzer::structural::MemberDispatchTier,
     ) {
-        use brokk_bifrost_core::analyzer::structural::callable::ApplicabilityVerdict;
-
         if !trace::recording() {
             return;
         }
         for candidate in found {
             self.by_fq_name.push((
                 candidate.fq_name(),
-                trace::MemberEnrichment {
-                    owner: owner.clone(),
-                    hierarchy_depth: 0,
+                trace::member_enrichment_with_tier(
+                    owner.clone(),
+                    0,
                     dispatch_tier,
-                    applicability: ApplicabilityVerdict::Unknown,
-                    route: Vec::new(),
-                },
+                    brokk_bifrost_core::analyzer::structural::callable::ApplicabilityVerdict::Unknown,
+                    Vec::new(),
+                ),
             ));
         }
     }
@@ -107,21 +110,19 @@ impl JsTsMemberFinds {
         hierarchy_depth: usize,
         route: &[trace::HierarchyHopRecord],
     ) {
-        use brokk_bifrost_core::analyzer::structural::callable::ApplicabilityVerdict;
-
         if !trace::recording() {
             return;
         }
         for candidate in found {
             self.by_fq_name.push((
                 candidate.fq_name(),
-                trace::MemberEnrichment {
-                    owner: owner.clone(),
+                trace::member_enrichment_with_tier(
+                    owner.clone(),
                     hierarchy_depth,
                     dispatch_tier,
-                    applicability: ApplicabilityVerdict::Unknown,
-                    route: route.to_vec(),
-                },
+                    brokk_bifrost_core::analyzer::structural::callable::ApplicabilityVerdict::Unknown,
+                    route.to_vec(),
+                ),
             ));
         }
     }
@@ -161,25 +162,22 @@ impl JsTsMemberHierarchy {
         use crate::analyzer::structural::HierarchyRelation;
 
         let depth = *self.depths.get(owner)?;
-        let mut chain = vec![owner.clone()];
-        while chain.last() != Some(receiver) {
-            let parent = self
-                .parents
-                .get(chain.last().expect("chain is never empty"))?;
-            chain.push(parent.clone());
+        let (route, reached_receiver) = trace::hierarchy_route_from_predecessors(
+            owner,
+            depth,
+            |current, _| current == receiver,
+            |current| {
+                self.parents
+                    .get(current)
+                    .cloned()
+                    .map(|parent| (parent, HierarchyRelation::Extends))
+            },
+            |unit| Some(unit.clone()),
+        )?;
+        if !reached_receiver {
+            return None;
         }
-        chain.reverse();
-        debug_assert_eq!(chain.len(), depth + 1);
-        let route = chain
-            .windows(2)
-            .enumerate()
-            .map(|(hop, pair)| trace::HierarchyHopRecord {
-                hop,
-                from: pair[0].clone(),
-                to: pair[1].clone(),
-                relation: HierarchyRelation::Extends,
-            })
-            .collect();
+        debug_assert_eq!(route.len(), depth);
         Some((depth, route))
     }
 }
@@ -481,14 +479,10 @@ fn modeled_external_call_at_site<'a>(
 
 fn enclosing_callee_call(mut node: Node<'_>) -> Option<Node<'_>> {
     for _ in 0..3 {
-        let parent = node.parent()?;
-        if parent.kind() == "call_expression"
-            && parent
-                .child_by_field_name("function")
-                .is_some_and(|function| function.id() == node.id())
-        {
-            return Some(parent);
+        if let Some(call) = parent_if_field(node, "call_expression", "function") {
+            return Some(call);
         }
+        let parent = node.parent()?;
         if !matches!(parent.kind(), "member_expression" | "subscript_expression") {
             return None;
         }
@@ -1609,7 +1603,11 @@ fn jsts_script_global_bare_candidates(
     let candidates = support
         .fqn(reference)
         .into_iter()
-        .filter(|candidate| jsts_candidate_is_script_global_binding(host, candidate, reference))
+        .filter(|candidate| {
+            brokk_bifrost_js_ts::graph::source::code_unit_is_script_global_binding(
+                host, candidate, reference,
+            )
+        })
         .collect();
     if value_position {
         jsts_value_space_candidates(host, candidates)
@@ -1627,23 +1625,6 @@ fn jsts_script_global_bare_candidates(
 /// another function is not indexed at all, so neither reaches this filter
 /// today, but a name that binds anywhere narrower than the program is not part
 /// of the shared global scope even if it does.
-fn jsts_candidate_is_script_global_binding(
-    host: &dyn JsTsSource,
-    candidate: &CodeUnit,
-    name: &str,
-) -> bool {
-    let Some(facts) = host.source_facts(candidate.source()) else {
-        return false;
-    };
-    if facts.facts.file_is_external_module {
-        return false;
-    }
-    let declarations = declaration_ids_for_unit(&facts, candidate);
-    facts.facts.declaration_bindings.iter().any(|binding| {
-        declarations.contains(&binding.declaration) && binding.name == name && binding.is_program
-    })
-}
-
 #[allow(clippy::too_many_arguments)]
 fn resolve_js_ts_visible_module_bindings(
     bindings: Vec<&crate::analyzer::usages::ImportBinding>,
@@ -1660,11 +1641,7 @@ fn resolve_js_ts_visible_module_bindings(
     let outcomes = bindings
         .into_iter()
         .map(|binding| {
-            let exported_name = match binding.kind {
-                ImportKind::Named => binding.imported_name.as_deref().unwrap_or(reference),
-                ImportKind::Default => "default",
-                _ => unreachable!("bindings were filtered to direct module imports"),
-            };
+            let exported_name = js_ts_direct_import_export_name(binding, reference);
             resolve_js_ts_module_binding(
                 file,
                 language,
@@ -1959,24 +1936,7 @@ fn ts_object_literal_property_at_key<'tree>(
     node: Node<'tree>,
     source: &str,
 ) -> Option<(Node<'tree>, Node<'tree>, String)> {
-    let property = match node.kind() {
-        "pair" | "shorthand_property_identifier" | "method_definition" => node,
-        _ => node.parent().filter(|parent| {
-            matches!(
-                parent.kind(),
-                "pair" | "shorthand_property_identifier" | "method_definition"
-            ) && parent
-                .child_by_field_name("key")
-                .or_else(|| parent.child_by_field_name("name"))
-                .or_else(|| parent.named_child(0))
-                .is_some_and(|key| key.id() == node.id())
-        })?,
-    };
-    let object = property
-        .parent()
-        .filter(|parent| parent.kind() == "object")?;
-    let name = brokk_bifrost_js_ts::typescript::ts_object_literal_property_name(property, source)?;
-    Some((property, object, name))
+    brokk_bifrost_js_ts::typescript::ts_object_literal_property_at_key(node, source)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1989,44 +1949,7 @@ fn ts_contextual_object_literal_owners(
     aliases: &AliasResolver,
     object: Node<'_>,
 ) -> Vec<CodeUnit> {
-    if let Some(variable) = object
-        .parent()
-        .filter(|parent| parent.kind() == "variable_declarator")
-        && variable
-            .child_by_field_name("value")
-            .is_some_and(|value| value.id() == object.id())
-        && let Some(type_node) = variable.child_by_field_name("type")
-    {
-        return ts_resolve_type_text_to_property_owners(
-            host,
-            support,
-            file,
-            source,
-            imports,
-            aliases,
-            ts_type_annotation_text(type_node, source).as_str(),
-            0,
-        );
-    }
-
-    let Some(return_statement) = object
-        .parent()
-        .filter(|parent| parent.kind() == "return_statement")
-    else {
-        return Vec::new();
-    };
-    let mut cursor = return_statement.walk();
-    if return_statement
-        .named_children(&mut cursor)
-        .next()
-        .is_none_or(|value| value.id() != object.id())
-    {
-        return Vec::new();
-    }
-    let Some(function) = jsts_enclosing_function_scope(object, object.start_byte()) else {
-        return Vec::new();
-    };
-    let Some(type_node) = function.child_by_field_name("return_type") else {
+    let Some(type_node) = ts_contextual_object_literal_type_node(object) else {
         return Vec::new();
     };
     ts_resolve_type_text_to_property_owners(
@@ -2747,11 +2670,13 @@ fn jsts_all_visible_import_bindings<'a>(
     name: &str,
     byte: usize,
 ) -> Vec<&'a crate::analyzer::usages::ImportBinding> {
-    if lexical_bindings.is_program_binding_at(name, byte, root) {
-        imports.bindings_for(name).collect()
-    } else {
-        Vec::new()
-    }
+    jsts_visible_program_bindings(
+        lexical_bindings,
+        root,
+        name,
+        byte,
+        imports.bindings_for(name),
+    )
 }
 
 fn jsts_visible_import_bindings<'a>(
@@ -2761,8 +2686,24 @@ fn jsts_visible_import_bindings<'a>(
     name: &str,
     byte: usize,
 ) -> Vec<&'a crate::analyzer::usages::ImportBinding> {
+    jsts_visible_program_bindings(
+        lexical_bindings,
+        root,
+        name,
+        byte,
+        imports.resolvable_direct_bindings_for(name),
+    )
+}
+
+fn jsts_visible_program_bindings<'a>(
+    lexical_bindings: &JsTsLexicalBindingIndex,
+    root: Node<'_>,
+    name: &str,
+    byte: usize,
+    bindings: impl Iterator<Item = &'a crate::analyzer::usages::ImportBinding>,
+) -> Vec<&'a crate::analyzer::usages::ImportBinding> {
     if lexical_bindings.is_program_binding_at(name, byte, root) {
-        imports.resolvable_direct_bindings_for(name).collect()
+        bindings.collect()
     } else {
         Vec::new()
     }
@@ -2914,19 +2855,15 @@ fn jsts_visible_receiver_binding_scope(
 }
 
 fn jsts_lexical_scope_kind(kind: &str) -> bool {
-    matches!(
-        kind,
-        "program"
-            | "statement_block"
-            | "for_statement"
-            | "for_in_statement"
-            | "switch_statement"
-            | "catch_clause"
-            | "function_declaration"
-            | "function_expression"
-            | "arrow_function"
-            | "method_definition"
-    )
+    js_ts_is_var_scope_kind(kind)
+        || matches!(
+            kind,
+            "statement_block"
+                | "for_statement"
+                | "for_in_statement"
+                | "switch_statement"
+                | "catch_clause"
+        )
 }
 
 fn jsts_scope_declares_name_before(
@@ -2956,14 +2893,7 @@ fn jsts_scope_contains_binding_before(
             continue;
         }
         if node.id() != root_id
-            && matches!(
-                node.kind(),
-                "function_declaration"
-                    | "function_expression"
-                    | "arrow_function"
-                    | "method_definition"
-                    | "class_declaration"
-            )
+            && (js_ts_is_var_scope_kind(node.kind()) || node.kind() == "class_declaration")
         {
             continue;
         }
@@ -2977,7 +2907,7 @@ fn jsts_scope_contains_binding_before(
             .child_by_field_name("pattern")
             .or_else(|| node.child_by_field_name("name"))
             && jsts_pattern_contains_name(pattern, source, name)
-            && jsts_binding_scope_for_declaration(node, source) == Some(scope_range)
+            && jsts_binding_scope_for_declaration(node) == Some(scope_range)
         {
             return true;
         }
@@ -2986,7 +2916,7 @@ fn jsts_scope_contains_binding_before(
             && source
                 .get(node.start_byte()..node.end_byte())
                 .is_some_and(|text| text.trim() == name)
-            && jsts_binding_scope_for_declaration(node, source) == Some(scope_range)
+            && jsts_binding_scope_for_declaration(node) == Some(scope_range)
         {
             return true;
         }
@@ -3011,46 +2941,22 @@ fn jsts_identifier_is_parameter(node: Node<'_>) -> bool {
                 .is_some_and(|parameter| parameter.id() == node.id()))
 }
 
-fn jsts_binding_scope_for_declaration(
-    node: Node<'_>,
-    source: &str,
-) -> Option<JstsReceiverBindingScope> {
-    if node.kind() == "variable_declarator" && jsts_variable_declarator_is_var(node, source) {
-        return jsts_nearest_var_scope(node);
+fn jsts_binding_scope_for_declaration(node: Node<'_>) -> Option<JstsReceiverBindingScope> {
+    if node.kind() == "variable_declarator"
+        && let Some(scope) = js_ts_var_declarator_binding_scope(node)
+    {
+        return Some(JstsReceiverBindingScope {
+            start_byte: scope.start_byte(),
+            end_byte: scope.end_byte(),
+        });
     }
     jsts_nearest_lexical_scope(node)
-}
-
-fn jsts_variable_declarator_is_var(node: Node<'_>, source: &str) -> bool {
-    let mut current = node.parent();
-    while let Some(parent) = current {
-        if matches!(
-            parent.kind(),
-            "variable_declaration" | "lexical_declaration"
-        ) {
-            return source
-                .get(parent.start_byte()..node.start_byte())
-                .is_some_and(|prefix| prefix.trim_start().starts_with("var"));
-        }
-        if jsts_lexical_scope_kind(parent.kind()) {
-            return false;
-        }
-        current = parent.parent();
-    }
-    false
 }
 
 fn jsts_nearest_var_scope(node: Node<'_>) -> Option<JstsReceiverBindingScope> {
     let mut current = node.parent();
     while let Some(parent) = current {
-        if matches!(
-            parent.kind(),
-            "program"
-                | "function_declaration"
-                | "function_expression"
-                | "arrow_function"
-                | "method_definition"
-        ) {
+        if js_ts_is_var_scope_kind(parent.kind()) {
             return Some(JstsReceiverBindingScope {
                 start_byte: parent.start_byte(),
                 end_byte: parent.end_byte(),
@@ -3344,10 +3250,6 @@ fn jsts_receiver_provider_member_candidates(
         )
         .map(|report| report.analysis.outcome)
         .unwrap_or(ReceiverAnalysisOutcome::Unknown)
-}
-
-fn node_text<'a>(node: Node<'_>, source: &'a str) -> &'a str {
-    crate::analyzer::common::node_source_text(node, source)
 }
 
 /// Resolve a renamed destructuring key as the property read it is (#2039).
@@ -3936,101 +3838,13 @@ fn ts_function_preserves_parameter_shape(
     };
     ts_nodes_for_code_unit(analyzer, callee, tree.root_node())
         .into_iter()
-        .any(|node| ts_function_node_preserves_parameter_shape(node, &source, parameter_index))
-}
-
-fn ts_function_node_preserves_parameter_shape(
-    function: Node<'_>,
-    source: &str,
-    parameter_index: usize,
-) -> bool {
-    let Some(parameter_name) = ts_function_parameter_name(function, source, parameter_index) else {
-        return false;
-    };
-    if function.kind() == "arrow_function"
-        && let Some(body) = function.child_by_field_name("body")
-        && ts_expression_preserves_parameter_shape(body, source, &parameter_name)
-    {
-        return true;
-    }
-    ts_function_returns_parameter_shape(function, function.id(), source, &parameter_name)
-}
-
-fn ts_function_parameter_name(
-    function: Node<'_>,
-    source: &str,
-    parameter_index: usize,
-) -> Option<String> {
-    let parameters = function.child_by_field_name("parameters")?;
-    let mut cursor = parameters.walk();
-    parameters
-        .named_children(&mut cursor)
-        .filter_map(ts_parameter_name_node)
-        .nth(parameter_index)
-        .and_then(|name| source.get(name.start_byte()..name.end_byte()))
-        .map(str::trim)
-        .filter(|name| !name.is_empty())
-        .map(str::to_string)
-}
-
-fn ts_function_returns_parameter_shape(
-    node: Node<'_>,
-    root_id: usize,
-    source: &str,
-    parameter_name: &str,
-) -> bool {
-    if node.id() != root_id
-        && matches!(
-            node.kind(),
-            "function_declaration"
-                | "function_expression"
-                | "arrow_function"
-                | "method_definition"
-                | "class_declaration"
-                | "abstract_class_declaration"
-                | "interface_declaration"
-        )
-    {
-        return false;
-    }
-    if node.kind() == "return_statement" {
-        let mut cursor = node.walk();
-        return node
-            .named_children(&mut cursor)
-            .next()
-            .is_some_and(|expression| {
-                ts_expression_preserves_parameter_shape(expression, source, parameter_name)
-            });
-    }
-    let mut cursor = node.walk();
-    node.named_children(&mut cursor)
-        .any(|child| ts_function_returns_parameter_shape(child, root_id, source, parameter_name))
-}
-
-fn ts_expression_preserves_parameter_shape(
-    expression: Node<'_>,
-    source: &str,
-    parameter_name: &str,
-) -> bool {
-    let Some(expression) = ts_unwrap_expression(expression) else {
-        return false;
-    };
-    if matches!(expression.kind(), "identifier" | "property_identifier")
-        && node_text_matches(expression, source, parameter_name)
-    {
-        return true;
-    }
-    if expression.kind() != "object" {
-        return false;
-    }
-    let mut cursor = expression.walk();
-    expression.named_children(&mut cursor).any(|child| {
-        child.kind() == "spread_element"
-            && child
-                .named_child(0)
-                .and_then(ts_unwrap_expression)
-                .is_some_and(|spread| node_text_matches(spread, source, parameter_name))
-    })
+        .any(|node| {
+            brokk_bifrost_js_ts::typescript::ts_function_node_preserves_parameter_shape(
+                node,
+                &source,
+                parameter_index,
+            )
+        })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -4293,29 +4107,8 @@ fn jsts_collect_local_new_receiver_owner_candidates(
     depth: usize,
     state: &mut LocalReceiverWrites,
 ) {
-    let mut stack = vec![node];
-    while let Some(node) = stack.pop() {
-        if node.start_byte() >= before_byte {
-            continue;
-        }
-        if node.id() != root_id
-            && matches!(
-                node.kind(),
-                "function_declaration"
-                    | "function_expression"
-                    | "arrow_function"
-                    | "method_definition"
-                    | "class_declaration"
-                    | "abstract_class_declaration"
-                    | "interface_declaration"
-            )
-        {
-            continue;
-        }
-
+    visit_local_receiver_binding_writes(node, root_id, source, receiver, before_byte, |node| {
         if node.kind() == "variable_declarator"
-            && let Some(name) = node.child_by_field_name("name")
-            && node_text_matches(name, source, receiver)
             && let Some(value) = node.child_by_field_name("value")
         {
             let owners = jsts_local_receiver_value_owner_candidates(
@@ -4335,11 +4128,7 @@ fn jsts_collect_local_new_receiver_owner_candidates(
             state.record(owners);
         }
 
-        if node.kind() == "assignment_expression"
-            && let Some(left) = node.child_by_field_name("left")
-            && matches!(left.kind(), "identifier" | "type_identifier")
-            && node_text_matches(left, source, receiver)
-        {
+        if node.kind() == "assignment_expression" {
             let owners = node
                 .child_by_field_name("right")
                 .map(|value| {
@@ -4361,11 +4150,7 @@ fn jsts_collect_local_new_receiver_owner_candidates(
                 .unwrap_or_default();
             state.record(owners);
         }
-
-        let mut cursor = node.walk();
-        let children: Vec<_> = node.named_children(&mut cursor).collect();
-        stack.extend(children.into_iter().rev());
-    }
+    });
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -4448,19 +4233,19 @@ fn jsts_call_expression_callees(
     aliases: &AliasResolver,
     function: Node<'_>,
 ) -> Vec<CodeUnit> {
-    match function.kind() {
-        "identifier" | "type_identifier" | "property_identifier" => source
-            .get(function.start_byte()..function.end_byte())
-            .map(str::trim)
-            .filter(|name| !name.is_empty())
-            .map(|name| {
-                jsts_identifier_candidates(
-                    host, support, language, file, source, imports, aliases, name, true,
-                )
-            })
-            .unwrap_or_default(),
-        _ => Vec::new(),
-    }
+    let name = ts_simple_call_reference_name(function, source).or_else(|| {
+        (function.kind() == "type_identifier")
+            .then(|| source.get(function.start_byte()..function.end_byte()))
+            .flatten()
+            .map(|name| name.trim().to_string())
+    });
+    name.filter(|name| !name.is_empty())
+        .map(|name| {
+            jsts_identifier_candidates(
+                host, support, language, file, source, imports, aliases, &name, true,
+            )
+        })
+        .unwrap_or_default()
 }
 
 fn jsts_reference_is_value_position(tree: &Tree, site: &ResolvedReferenceSite) -> bool {
@@ -4509,4 +4294,76 @@ fn jsts_reference_is_type_position(mut node: Node<'_>) -> bool {
 
 fn is_bare_js_ts_specifier(module: &str) -> bool {
     !module.starts_with("./") && !module.starts_with("../") && !module.starts_with('/')
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        JstsReceiverBindingScope, jsts_binding_scope_for_declaration, jsts_nearest_var_scope,
+        jsts_visible_receiver_binding_scope,
+    };
+    use brokk_bifrost_js_ts::syntax::slice;
+    use brokk_bifrost_js_ts::test_support::parse_javascript;
+    use brokk_bifrost_test_macros::hardwon;
+
+    #[test]
+    #[hardwon("#4271: a generator var was assigned to the enclosing program scope")]
+    fn generator_var_reference_binds_in_generator_scope() {
+        let source =
+            "var value = 1;\nfunction* generate() {\n  var value = 2;\n  return value;\n}\n";
+        let tree = parse_javascript(source);
+        let root = tree.root_node();
+        let mut nodes = vec![root];
+        let mut generator = None;
+        while let Some(node) = nodes.pop() {
+            if node.kind() == "generator_function_declaration" {
+                generator = Some(node);
+                break;
+            }
+            let mut cursor = node.walk();
+            nodes.extend(node.named_children(&mut cursor));
+        }
+        let generator = generator.expect("generator function declaration");
+        let expected_scope = JstsReceiverBindingScope {
+            start_byte: generator.start_byte(),
+            end_byte: generator.end_byte(),
+        };
+
+        let body = generator
+            .child_by_field_name("body")
+            .expect("generator body");
+        let mut nodes = vec![body];
+        let mut declaration = None;
+        let mut reference = None;
+        while let Some(node) = nodes.pop() {
+            if node.kind() == "variable_declarator"
+                && node
+                    .child_by_field_name("name")
+                    .is_some_and(|name| slice(name, source) == "value")
+            {
+                declaration = Some(node);
+            } else if node.kind() == "identifier"
+                && slice(node, source) == "value"
+                && node
+                    .parent()
+                    .is_some_and(|parent| parent.kind() == "return_statement")
+            {
+                reference = Some(node);
+            }
+            let mut cursor = node.walk();
+            nodes.extend(node.named_children(&mut cursor));
+        }
+        let declaration = declaration.expect("generator var declaration");
+        let reference = reference.expect("generator reference");
+
+        assert_eq!(
+            jsts_binding_scope_for_declaration(declaration),
+            Some(expected_scope)
+        );
+        assert_eq!(
+            jsts_visible_receiver_binding_scope(root, source, "value", reference.start_byte()),
+            Some(expected_scope)
+        );
+        assert_eq!(jsts_nearest_var_scope(declaration), Some(expected_scope));
+    }
 }

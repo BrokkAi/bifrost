@@ -27,12 +27,12 @@ use std::hash::Hash;
 use brokk_bifrost_core::analyzer::canonical_hash::CanonicalHasher;
 
 use crate::analyzer::structural::CandidateOutcome;
-use crate::hash::{HashMap, set_with_capacity};
+use crate::hash::HashMap;
 
 use super::model::{
     DerivationKey, PartialPath, PartialPathId, PrecedenceStep, ResolutionCompletion,
     StackEffectAlphaKey, WitnessStep, clone_completion_with_poll,
-    completion_values_equal_with_poll,
+    completion_values_equal_with_poll, first_occurrences_with_poll,
 };
 use super::never_cancelled;
 
@@ -70,16 +70,7 @@ impl SaturationBranch {
     where
         P: FnMut() -> bool,
     {
-        let mut checkpoints = Vec::with_capacity(self.checkpoints.len());
-        for checkpoint in self.checkpoints.iter() {
-            if cancelled() {
-                return None;
-            }
-            checkpoints.push(CycleCheckpoint {
-                transition: checkpoint.transition,
-                stack_effect: checkpoint.stack_effect.clone_with_poll(cancelled)?,
-            });
-        }
+        let checkpoints = self.clone_checkpoints_with_poll(0, cancelled)?;
         Some(Self {
             checkpoints: checkpoints.into_boxed_slice(),
         })
@@ -94,17 +85,12 @@ impl SaturationBranch {
     where
         P: FnMut() -> bool,
     {
-        let mut checkpoints = Vec::with_capacity(self.checkpoints.len() + 1);
-        for checkpoint in self.checkpoints.iter() {
-            if cancelled() {
-                return None;
-            }
-            debug_assert_ne!(checkpoint.transition, transition);
-            checkpoints.push(CycleCheckpoint {
-                transition: checkpoint.transition,
-                stack_effect: checkpoint.stack_effect.clone_with_poll(cancelled)?,
-            });
-        }
+        let mut checkpoints = self.clone_checkpoints_with_poll(1, cancelled)?;
+        debug_assert!(
+            checkpoints
+                .iter()
+                .all(|checkpoint| checkpoint.transition != transition)
+        );
         checkpoints.push(CycleCheckpoint {
             transition,
             stack_effect,
@@ -112,6 +98,27 @@ impl SaturationBranch {
         Some(Self {
             checkpoints: checkpoints.into_boxed_slice(),
         })
+    }
+
+    fn clone_checkpoints_with_poll<P>(
+        &self,
+        extra_capacity: usize,
+        cancelled: &mut P,
+    ) -> Option<Vec<CycleCheckpoint>>
+    where
+        P: FnMut() -> bool,
+    {
+        let mut checkpoints = Vec::with_capacity(self.checkpoints.len() + extra_capacity);
+        for checkpoint in self.checkpoints.iter() {
+            if cancelled() {
+                return None;
+            }
+            checkpoints.push(CycleCheckpoint {
+                transition: checkpoint.transition,
+                stack_effect: checkpoint.stack_effect.clone_with_poll(cancelled)?,
+            });
+        }
+        Some(checkpoints)
     }
 
     #[cfg(test)]
@@ -257,12 +264,8 @@ impl CycleCompletenessCertifier {
             return None;
         }
         let stack_effect = path.stack_effect_alpha_key_with_poll(cancelled)?;
-        let observable_stack_effect = stack_effect.clone_with_poll(cancelled)?;
-        let observable = ObservablePathKey::with_stack_effect_with_poll(
-            path,
-            observable_stack_effect,
-            cancelled,
-        )?;
+        let observable =
+            ObservablePathKey::with_stack_effect_with_poll(path, stack_effect, cancelled)?;
         let digest = observable.digest_with_poll(cancelled)?;
 
         // Branch history is only a termination certificate, never semantic
@@ -285,13 +288,19 @@ impl CycleCompletenessCertifier {
         }
 
         let next_branch = match branch.checkpoint_with_poll(transition, cancelled)? {
-            Some(previous) if !previous.equals_with_poll(&stack_effect, cancelled)? => {
+            Some(previous)
+                if !previous.equals_with_poll(&observable.stack_effect, cancelled)? =>
+            {
                 return Some(SaturationDecision::Uncertified(UncertifiedCycle {
                     transition,
                 }));
             }
             Some(_) => branch.clone_with_poll(cancelled)?,
-            None => branch.with_checkpoint_with_poll(transition, stack_effect, cancelled)?,
+            None => branch.with_checkpoint_with_poll(
+                transition,
+                observable.stack_effect.clone_with_poll(cancelled)?,
+                cancelled,
+            )?,
         };
 
         // All fallible construction and exact comparison finishes before the
@@ -423,32 +432,6 @@ impl ObservablePathKey {
     }
 }
 
-/// Preserve order while deleting later copies of an identical observation.
-///
-/// This operation is append-congruent: canonicalizing before or after appending
-/// another trace gives the same result.  For precedence it also preserves
-/// `path_shadows`: an identical earlier comparison either already decided the
-/// result or compared equal, so running it again cannot change the answer.
-fn first_occurrences_with_poll<T: Copy + Eq + Hash, P>(
-    values: &[T],
-    cancelled: &mut P,
-) -> Option<Box<[T]>>
-where
-    P: FnMut() -> bool,
-{
-    let mut seen = set_with_capacity(values.len());
-    let mut first = Vec::with_capacity(values.len());
-    for &value in values {
-        if cancelled() {
-            return None;
-        }
-        if seen.insert(value) {
-            first.push(value);
-        }
-    }
-    Some(first.into_boxed_slice())
-}
-
 fn hash_witness_step(hasher: &mut CanonicalHasher, step: WitnessStep) {
     match step {
         WitnessStep::Node(node) => {
@@ -501,28 +484,19 @@ where
 
 #[cfg(test)]
 mod tests {
+    use super::super::engine::identity_path;
+    use super::super::partial_path_id_for_test as path_id;
     use super::*;
     use crate::CancellationToken;
     use crate::analyzer::resolution::engine::CANCELLATION_QUANTUM;
     use crate::analyzer::resolution::model::{
         BindingNodeId, EndpointSignature, PartialScopedSymbol, SemanticId, StackPattern,
     };
+    use crate::analyzer::resolution::test_support::{endpoint, node, semantic};
     use crate::analyzer::structural::{CandidateOutcome, PrecedenceTier, RejectionReason};
-
-    fn semantic(value: &str) -> SemanticId {
-        SemanticId::for_test(value)
-    }
-
-    fn node(value: &str) -> BindingNodeId {
-        BindingNodeId::for_test(value)
-    }
 
     fn variable(value: &str) -> super::super::model::StackVariableId {
         super::super::model::StackVariableId::for_test(value)
-    }
-
-    fn path_id(value: &str) -> PartialPathId {
-        PartialPathId::for_test(value)
     }
 
     /// A path whose variables are renamed away from `path`'s own, which is
@@ -542,29 +516,6 @@ mod tests {
     fn first_occurrences<T: Copy + Eq + Hash>(values: &[T]) -> Box<[T]> {
         first_occurrences_with_poll(values, &mut || false)
             .expect("live test observable quotient completes")
-    }
-
-    fn endpoint(
-        node: BindingNodeId,
-        symbols: Vec<SemanticId>,
-        scopes: Vec<BindingNodeId>,
-    ) -> EndpointSignature {
-        EndpointSignature::new(
-            node,
-            StackPattern::closed(symbols),
-            StackPattern::closed(scopes),
-        )
-    }
-
-    fn identity(at: BindingNodeId) -> PartialPath {
-        let endpoint = endpoint(at, Vec::new(), Vec::new());
-        PartialPath::new(
-            endpoint.clone(),
-            endpoint,
-            Vec::new(),
-            vec![WitnessStep::Node(at)],
-            ResolutionCompletion::Complete,
-        )
     }
 
     #[test]
@@ -603,10 +554,10 @@ mod tests {
         assert_eq!(raw_work, reasons.len());
         assert_eq!(shared_work, 1);
 
-        let first = identity(node("completion-hash-collision")).with_additional_completion(
+        let first = identity_path(node("completion-hash-collision")).with_additional_completion(
             &ResolutionCompletion::Incomplete(vec![reasons[0], reasons[1]].into()),
         );
-        let second = identity(node("completion-hash-collision")).with_additional_completion(
+        let second = identity_path(node("completion-hash-collision")).with_additional_completion(
             &ResolutionCompletion::Incomplete(vec![reasons[1], reasons[0]].into()),
         );
         let first_key = ObservablePathKey::of_with_poll(&first, &mut || false).unwrap();
@@ -688,192 +639,6 @@ mod tests {
     }
 
     #[test]
-    fn polled_cycle_admission_matches_the_compatibility_decision() {
-        let at = node("polled-admit-at");
-        let other = node("polled-admit-other");
-        let seed = identity(at);
-        let path = closed_path(
-            at,
-            other,
-            vec![semantic("before")],
-            vec![semantic("after")],
-            vec![node("before-scope")],
-            vec![node("after-scope")],
-            vec![PrecedenceStep {
-                tier: PrecedenceTier::OwnMember,
-                ordinal: 3,
-                semantic: semantic("polled-admit-choice"),
-            }],
-            vec![WitnessStep::Node(other)],
-            ResolutionCompletion::Incomplete(
-                vec![
-                    super::super::model::ResolutionIncompleteReason::UnsupportedSemantic(semantic(
-                        "polled-admit-gap-b",
-                    )),
-                    super::super::model::ResolutionIncompleteReason::UnsupportedSemantic(semantic(
-                        "polled-admit-gap-a",
-                    )),
-                ]
-                .into_boxed_slice()
-                .into(),
-            ),
-        );
-        let branch = SaturationBranch::default();
-        let transition = path_id("polled-admit-transition");
-        let mut compatibility = CycleCompletenessCertifier::new(&seed);
-        let mut polled = CycleCompletenessCertifier::new(&seed);
-
-        let expected = compatibility.admit(&branch, transition, &path);
-        let actual = polled
-            .admit_with_poll(&branch, transition, &path, &mut || false)
-            .expect("uncancelled admission completes");
-
-        assert_eq!(actual, expected);
-        assert_eq!(polled.state_count(), compatibility.state_count());
-    }
-
-    #[test]
-    fn shallow_polled_certification_gates_before_construction_and_quotient_mutation() {
-        let at = node("shallow-polled-at");
-        let other = node("shallow-polled-other");
-        let seed = identity(at);
-        let candidate = closed_path(
-            at,
-            other,
-            Vec::new(),
-            Vec::new(),
-            Vec::new(),
-            Vec::new(),
-            Vec::new(),
-            Vec::new(),
-            ResolutionCompletion::Complete,
-        );
-
-        let mut initial_poll_count = 0_usize;
-        CycleCompletenessCertifier::from_initial_paths_with_poll([&seed], &mut || {
-            initial_poll_count += 1;
-            false
-        })
-        .expect("uncancelled shallow construction completes");
-        let mut final_initial_polls = 0_usize;
-        assert!(
-            CycleCompletenessCertifier::from_initial_paths_with_poll([&seed], &mut || {
-                final_initial_polls += 1;
-                final_initial_polls == initial_poll_count
-            })
-            .is_none(),
-            "the final construction gate must cancel before publishing the quotient"
-        );
-
-        let transition = path_id("shallow-polled-transition");
-        let mut baseline = CycleCompletenessCertifier::new(&seed);
-        let mut admission_poll_count = 0_usize;
-        assert!(matches!(
-            baseline.admit_with_poll(
-                &SaturationBranch::default(),
-                transition,
-                &candidate,
-                &mut || {
-                    admission_poll_count += 1;
-                    false
-                }
-            ),
-            Some(SaturationDecision::Expand(_))
-        ));
-
-        let mut cancelled = CycleCompletenessCertifier::new(&seed);
-        let initial_states = cancelled.state_count();
-        let mut final_admission_polls = 0_usize;
-        assert!(
-            cancelled
-                .admit_with_poll(
-                    &SaturationBranch::default(),
-                    transition,
-                    &candidate,
-                    &mut || {
-                        final_admission_polls += 1;
-                        final_admission_polls == admission_poll_count
-                    }
-                )
-                .is_none(),
-            "the precommit gate must cancel before quotient mutation"
-        );
-        assert_eq!(cancelled.state_count(), initial_states);
-    }
-
-    #[test]
-    fn cycle_admission_cancels_within_one_large_observable_without_mutation() {
-        let at = node("large-polled-admit-at");
-        let seed = identity(at);
-        let path = closed_path(
-            at,
-            at,
-            Vec::new(),
-            Vec::new(),
-            Vec::new(),
-            Vec::new(),
-            Vec::new(),
-            std::iter::repeat_n(WitnessStep::Node(at), CANCELLATION_QUANTUM + 1).collect(),
-            ResolutionCompletion::Complete,
-        );
-        let mut certifier = CycleCompletenessCertifier::new(&seed);
-        let initial_states = certifier.state_count();
-        let cancellation = CancellationToken::cancel_after_checks_for_test(1);
-        let mut work = 0_usize;
-
-        let decision = certifier.admit_with_poll(
-            &SaturationBranch::default(),
-            path_id("large-polled-admit-transition"),
-            &path,
-            &mut || {
-                work += 1;
-                work.is_multiple_of(CANCELLATION_QUANTUM) && cancellation.is_cancelled()
-            },
-        );
-
-        assert!(decision.is_none());
-        assert!(work >= CANCELLATION_QUANTUM);
-        assert_eq!(certifier.state_count(), initial_states);
-    }
-
-    #[test]
-    fn every_initial_alternative_seeds_the_observable_quotient() {
-        let at = node("multi-seed-at");
-        let other = node("multi-seed-other");
-        let first = identity(at);
-        let second = closed_path(
-            at,
-            other,
-            Vec::new(),
-            Vec::new(),
-            Vec::new(),
-            Vec::new(),
-            Vec::new(),
-            [WitnessStep::Node(other)].into(),
-            ResolutionCompletion::Complete,
-        );
-        let mut certifier = certifier_from_initial_paths([&second, &first]);
-
-        assert_eq!(certifier.state_count(), 2);
-        assert!(matches!(
-            certifier.admit(
-                &SaturationBranch::default(),
-                path_id("first-again"),
-                &alpha_renamed(&first)
-            ),
-            SaturationDecision::Subsumed
-        ));
-        assert!(matches!(
-            certifier.admit(
-                &SaturationBranch::default(),
-                path_id("second-again"),
-                &alpha_renamed(&second)
-            ),
-            SaturationDecision::Subsumed
-        ));
-    }
-
-    #[test]
     fn attached_scope_aliasing_participates_in_the_alpha_quotient() {
         let at = node("at");
         let shared = variable("shared-scope-tail");
@@ -918,7 +683,7 @@ mod tests {
     fn neutral_self_loop_is_certified_without_degrading_completeness() {
         let at = node("at");
         let transition = path_id("neutral-loop");
-        let seed = identity(at);
+        let seed = identity_path(at);
         let loop_path = closed_path(
             at,
             at,
@@ -947,121 +712,12 @@ mod tests {
     }
 
     #[test]
-    fn finite_precedence_and_witness_evidence_saturates_before_subsumption() {
-        let left = node("left");
-        let right = node("right");
-        let choice = semantic("choice");
-        let first_id = path_id("first-half");
-        let second_id = path_id("second-half");
-        let seed = identity(left);
-        let first = closed_path(
-            left,
-            right,
-            Vec::new(),
-            Vec::new(),
-            Vec::new(),
-            Vec::new(),
-            Vec::new(),
-            vec![WitnessStep::Node(right)],
-            ResolutionCompletion::Complete,
-        );
-        let second = closed_path(
-            right,
-            left,
-            Vec::new(),
-            Vec::new(),
-            Vec::new(),
-            Vec::new(),
-            vec![PrecedenceStep {
-                tier: PrecedenceTier::LexicalBinding,
-                ordinal: 0,
-                semantic: choice,
-            }],
-            vec![WitnessStep::Candidate {
-                semantic: choice,
-                outcome: CandidateOutcome::Selected,
-            }],
-            ResolutionCompletion::Complete,
-        );
-        let first_once = concatenate(&seed, &first);
-        let round_once = concatenate(&first_once, &second);
-        let first_twice = concatenate(&round_once, &first);
-        let round_twice = concatenate(&first_twice, &second);
-        let first_thrice = concatenate(&round_twice, &first);
-        let mut certifier = CycleCompletenessCertifier::new(&seed);
-
-        let SaturationDecision::Expand(first_branch) =
-            certifier.admit(&SaturationBranch::default(), first_id, &first_once)
-        else {
-            panic!("first half must expand");
-        };
-        let SaturationDecision::Expand(round_branch) =
-            certifier.admit(&first_branch, second_id, &round_once)
-        else {
-            panic!("first round must expand");
-        };
-        let SaturationDecision::Expand(enriched_branch) =
-            certifier.admit(&round_branch, first_id, &first_twice)
-        else {
-            panic!("one evidence-enriching neutral round must expand");
-        };
-        assert_eq!(enriched_branch.checkpoint_count(), 2);
-        assert!(matches!(
-            certifier.admit(&enriched_branch, second_id, &round_twice),
-            SaturationDecision::Subsumed
-        ));
-        assert!(matches!(
-            certifier.admit(&enriched_branch, first_id, &first_thrice),
-            SaturationDecision::Subsumed
-        ));
-    }
-
-    #[test]
-    fn productive_symbol_cycle_is_explicitly_uncertified() {
-        let at = node("at");
-        let name = semantic("name");
-        let tail = variable("symbol-tail");
-        let transition = path_id("push-symbol");
-        let seed = identity(at);
-        let push = PartialPath::new(
-            EndpointSignature::new_scoped(
-                at,
-                StackPattern::open(Vec::new(), tail),
-                StackPattern::closed(Vec::new()),
-            ),
-            EndpointSignature::new_scoped(
-                at,
-                StackPattern::open([PartialScopedSymbol::unscoped(name)], tail),
-                StackPattern::closed(Vec::new()),
-            ),
-            Vec::new(),
-            [WitnessStep::Node(at)],
-            ResolutionCompletion::Complete,
-        );
-        let once = concatenate(&seed, &push);
-        let twice = concatenate(&once, &push);
-        let mut certifier = CycleCompletenessCertifier::new(&seed);
-        let SaturationDecision::Expand(branch) =
-            certifier.admit(&SaturationBranch::default(), transition, &once)
-        else {
-            panic!("first push must expand");
-        };
-
-        let SaturationDecision::Uncertified(gap) = certifier.admit(&branch, transition, &twice)
-        else {
-            panic!("a repeated growing symbol stack must be uncertified");
-        };
-        assert_eq!(gap.transition(), transition);
-        assert_eq!(certifier.state_count(), 2);
-    }
-
-    #[test]
     fn productive_scope_cycle_is_explicitly_uncertified() {
         let at = node("at");
         let pushed_scope = node("pushed-scope");
         let tail = variable("scope-tail");
         let transition = path_id("push-scope");
-        let seed = identity(at);
+        let seed = identity_path(at);
         let push = PartialPath::new(
             EndpointSignature::new_scoped(
                 at,
@@ -1079,17 +735,7 @@ mod tests {
         );
         let once = concatenate(&seed, &push);
         let twice = concatenate(&once, &push);
-        let mut certifier = CycleCompletenessCertifier::new(&seed);
-        let SaturationDecision::Expand(branch) =
-            certifier.admit(&SaturationBranch::default(), transition, &once)
-        else {
-            panic!("first push must expand");
-        };
-
-        assert!(matches!(
-            certifier.admit(&branch, transition, &twice),
-            SaturationDecision::Uncertified(UncertifiedCycle { transition: id }) if id == transition
-        ));
+        assert_productive_stack_cycle_is_uncertified(&seed, transition, &once, &twice);
     }
 
     #[test]
@@ -1124,7 +770,7 @@ mod tests {
             arrived.witness().to_vec(),
             ResolutionCompletion::Complete,
         );
-        let seed = identity(at);
+        let seed = identity_path(at);
         let mut certifier = CycleCompletenessCertifier::new(&seed);
         let SaturationDecision::Expand(retained_branch) =
             certifier.admit(&SaturationBranch::default(), first_route, &arrived)
@@ -1140,56 +786,6 @@ mod tests {
             certifier.admit(&retained_branch, first_route, &grown),
             SaturationDecision::Uncertified(UncertifiedCycle { transition })
                 if transition == first_route
-        ));
-    }
-
-    #[test]
-    fn globally_explored_state_subsumes_an_unfavorable_branch_history() {
-        let at = node("at");
-        let cyclic_route = path_id("cyclic-route");
-        let acyclic_route = path_id("acyclic-route");
-        let arrived = closed_path(
-            at,
-            at,
-            Vec::new(),
-            Vec::new(),
-            Vec::new(),
-            Vec::new(),
-            vec![PrecedenceStep {
-                tier: PrecedenceTier::LexicalBinding,
-                ordinal: 0,
-                semantic: semantic("choice"),
-            }],
-            vec![WitnessStep::Node(at)],
-            ResolutionCompletion::Complete,
-        );
-        let grown = closed_path(
-            at,
-            at,
-            Vec::new(),
-            vec![semantic("grown")],
-            Vec::new(),
-            Vec::new(),
-            arrived.precedence().to_vec(),
-            arrived.witness().to_vec(),
-            ResolutionCompletion::Complete,
-        );
-        let seed = identity(at);
-        let root = SaturationBranch::default();
-        let mut certifier = CycleCompletenessCertifier::new(&seed);
-        let SaturationDecision::Expand(cyclic_branch) =
-            certifier.admit(&root, cyclic_route, &arrived)
-        else {
-            panic!("the first route must expand");
-        };
-        assert!(matches!(
-            certifier.admit(&root, acyclic_route, &grown),
-            SaturationDecision::Expand(_)
-        ));
-
-        assert!(matches!(
-            certifier.admit(&cyclic_branch, cyclic_route, &grown),
-            SaturationDecision::Subsumed
         ));
     }
 
@@ -1282,14 +878,275 @@ mod tests {
     }
 
     #[test]
-    fn rejected_witness_steps_are_finite_observations_too() {
-        let step = WitnessStep::Candidate {
-            semantic: semantic("candidate"),
-            outcome: CandidateOutcome::Rejected(RejectionReason::ShadowedByNearer),
-        };
-        assert_eq!(
-            first_occurrences(&[step, step, step]),
-            vec![step].into_boxed_slice()
+    fn shallow_polled_certification_gates_before_construction_and_quotient_mutation() {
+        let at = node("shallow-polled-at");
+        let other = node("shallow-polled-other");
+        let seed = identity_path(at);
+        let candidate = closed_path(
+            at,
+            other,
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            ResolutionCompletion::Complete,
         );
+
+        let mut initial_poll_count = 0_usize;
+        CycleCompletenessCertifier::from_initial_paths_with_poll([&seed], &mut || {
+            initial_poll_count += 1;
+            false
+        })
+        .expect("uncancelled shallow construction completes");
+        let mut final_initial_polls = 0_usize;
+        assert!(
+            CycleCompletenessCertifier::from_initial_paths_with_poll([&seed], &mut || {
+                final_initial_polls += 1;
+                final_initial_polls == initial_poll_count
+            })
+            .is_none(),
+            "the final construction gate must cancel before publishing the quotient"
+        );
+
+        let transition = path_id("shallow-polled-transition");
+        let mut baseline = CycleCompletenessCertifier::new(&seed);
+        let mut admission_poll_count = 0_usize;
+        assert!(matches!(
+            baseline.admit_with_poll(
+                &SaturationBranch::default(),
+                transition,
+                &candidate,
+                &mut || {
+                    admission_poll_count += 1;
+                    false
+                }
+            ),
+            Some(SaturationDecision::Expand(_))
+        ));
+
+        let mut cancelled = CycleCompletenessCertifier::new(&seed);
+        let initial_states = cancelled.state_count();
+        let mut final_admission_polls = 0_usize;
+        assert!(
+            cancelled
+                .admit_with_poll(
+                    &SaturationBranch::default(),
+                    transition,
+                    &candidate,
+                    &mut || {
+                        final_admission_polls += 1;
+                        final_admission_polls == admission_poll_count
+                    }
+                )
+                .is_none(),
+            "the precommit gate must cancel before quotient mutation"
+        );
+        assert_eq!(cancelled.state_count(), initial_states);
+    }
+
+    #[test]
+    fn cycle_admission_cancels_within_one_large_observable_without_mutation() {
+        let at = node("large-polled-admit-at");
+        let seed = identity_path(at);
+        let path = closed_path(
+            at,
+            at,
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            std::iter::repeat_n(WitnessStep::Node(at), CANCELLATION_QUANTUM + 1).collect(),
+            ResolutionCompletion::Complete,
+        );
+        let mut certifier = CycleCompletenessCertifier::new(&seed);
+        let initial_states = certifier.state_count();
+        let cancellation = CancellationToken::cancel_after_checks_for_test(1);
+        let mut work = 0_usize;
+
+        let decision = certifier.admit_with_poll(
+            &SaturationBranch::default(),
+            path_id("large-polled-admit-transition"),
+            &path,
+            &mut || {
+                work += 1;
+                work.is_multiple_of(CANCELLATION_QUANTUM) && cancellation.is_cancelled()
+            },
+        );
+
+        assert!(decision.is_none());
+        assert!(work >= CANCELLATION_QUANTUM);
+        assert_eq!(certifier.state_count(), initial_states);
+    }
+
+    #[test]
+    fn finite_precedence_and_witness_evidence_saturates_before_subsumption() {
+        let left = node("left");
+        let right = node("right");
+        let choice = semantic("choice");
+        let first_id = path_id("first-half");
+        let second_id = path_id("second-half");
+        let seed = identity_path(left);
+        let first = closed_path(
+            left,
+            right,
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            vec![WitnessStep::Node(right)],
+            ResolutionCompletion::Complete,
+        );
+        let second = closed_path(
+            right,
+            left,
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            vec![PrecedenceStep {
+                tier: PrecedenceTier::LexicalBinding,
+                ordinal: 0,
+                semantic: choice,
+            }],
+            vec![WitnessStep::Candidate {
+                semantic: choice,
+                outcome: CandidateOutcome::Selected,
+            }],
+            ResolutionCompletion::Complete,
+        );
+        let first_once = concatenate(&seed, &first);
+        let round_once = concatenate(&first_once, &second);
+        let first_twice = concatenate(&round_once, &first);
+        let round_twice = concatenate(&first_twice, &second);
+        let first_thrice = concatenate(&round_twice, &first);
+        let mut certifier = CycleCompletenessCertifier::new(&seed);
+
+        let SaturationDecision::Expand(first_branch) =
+            certifier.admit(&SaturationBranch::default(), first_id, &first_once)
+        else {
+            panic!("first half must expand");
+        };
+        let SaturationDecision::Expand(round_branch) =
+            certifier.admit(&first_branch, second_id, &round_once)
+        else {
+            panic!("first round must expand");
+        };
+        let SaturationDecision::Expand(enriched_branch) =
+            certifier.admit(&round_branch, first_id, &first_twice)
+        else {
+            panic!("one evidence-enriching neutral round must expand");
+        };
+        assert_eq!(enriched_branch.checkpoint_count(), 2);
+        assert!(matches!(
+            certifier.admit(&enriched_branch, second_id, &round_twice),
+            SaturationDecision::Subsumed
+        ));
+        assert!(matches!(
+            certifier.admit(&enriched_branch, first_id, &first_thrice),
+            SaturationDecision::Subsumed
+        ));
+    }
+
+    #[test]
+    fn productive_symbol_cycle_is_explicitly_uncertified() {
+        let at = node("at");
+        let name = semantic("name");
+        let tail = variable("symbol-tail");
+        let transition = path_id("push-symbol");
+        let seed = identity_path(at);
+        let push = PartialPath::new(
+            EndpointSignature::new_scoped(
+                at,
+                StackPattern::open(Vec::new(), tail),
+                StackPattern::closed(Vec::new()),
+            ),
+            EndpointSignature::new_scoped(
+                at,
+                StackPattern::open([PartialScopedSymbol::unscoped(name)], tail),
+                StackPattern::closed(Vec::new()),
+            ),
+            Vec::new(),
+            [WitnessStep::Node(at)],
+            ResolutionCompletion::Complete,
+        );
+        let once = concatenate(&seed, &push);
+        let twice = concatenate(&once, &push);
+        assert_eq!(
+            assert_productive_stack_cycle_is_uncertified(&seed, transition, &once, &twice),
+            2
+        );
+    }
+
+    #[test]
+    fn globally_explored_state_subsumes_an_unfavorable_branch_history() {
+        let at = node("at");
+        let cyclic_route = path_id("cyclic-route");
+        let acyclic_route = path_id("acyclic-route");
+        let arrived = closed_path(
+            at,
+            at,
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            vec![PrecedenceStep {
+                tier: PrecedenceTier::LexicalBinding,
+                ordinal: 0,
+                semantic: semantic("choice"),
+            }],
+            vec![WitnessStep::Node(at)],
+            ResolutionCompletion::Complete,
+        );
+        let grown = closed_path(
+            at,
+            at,
+            Vec::new(),
+            vec![semantic("grown")],
+            Vec::new(),
+            Vec::new(),
+            arrived.precedence().to_vec(),
+            arrived.witness().to_vec(),
+            ResolutionCompletion::Complete,
+        );
+        let seed = identity_path(at);
+        let root = SaturationBranch::default();
+        let mut certifier = CycleCompletenessCertifier::new(&seed);
+        let SaturationDecision::Expand(cyclic_branch) =
+            certifier.admit(&root, cyclic_route, &arrived)
+        else {
+            panic!("the first route must expand");
+        };
+        assert!(matches!(
+            certifier.admit(&root, acyclic_route, &grown),
+            SaturationDecision::Expand(_)
+        ));
+
+        assert!(matches!(
+            certifier.admit(&cyclic_branch, cyclic_route, &grown),
+            SaturationDecision::Subsumed
+        ));
+    }
+    fn assert_productive_stack_cycle_is_uncertified(
+        seed: &PartialPath,
+        transition: PartialPathId,
+        once: &PartialPath,
+        twice: &PartialPath,
+    ) -> usize {
+        let mut certifier = CycleCompletenessCertifier::new(seed);
+        let SaturationDecision::Expand(branch) =
+            certifier.admit(&SaturationBranch::default(), transition, once)
+        else {
+            panic!("first push must expand");
+        };
+        let SaturationDecision::Uncertified(gap) = certifier.admit(&branch, transition, twice)
+        else {
+            panic!("a repeated growing stack must be uncertified");
+        };
+        assert_eq!(gap.transition(), transition);
+        certifier.state_count()
     }
 }

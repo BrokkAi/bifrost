@@ -32,7 +32,7 @@ pub(in crate::analyzer) const PHP_SOURCE_HEADER_SQL: &str =
        AND source.publication_state = 'complete' AND meta.is_complete = 1 AND ready.available = 1";
 
 fn required<T>(value: Option<T>, label: &str) -> Result<T> {
-    value.ok_or_else(|| StoreError::new(format!("PHP source facts are missing {label}")))
+    crate::analyzer::store::required_source_value(value, "PHP source facts", label)
 }
 
 fn decode_alias_kind(value: i64) -> Result<PhpAliasKind> {

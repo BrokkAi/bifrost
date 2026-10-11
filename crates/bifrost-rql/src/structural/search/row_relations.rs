@@ -1,4 +1,30 @@
+use super::results::CodeQueryBindingInitializerCall;
 use super::*;
+use crate::analyzer::structural::OccurrenceFileResult;
+
+fn traced_occurrences_for_row(
+    analyzer: &dyn IAnalyzer,
+    environment_cache: &mut EnvironmentTraversalCache,
+    row: &OccurrenceRow,
+    cancellation: Option<&CancellationToken>,
+    row_exhausted: &mut bool,
+) -> Option<Arc<OccurrenceFileResult>> {
+    let traced = environment_cache.traced_occurrences_for(analyzer, &row.file, cancellation);
+    if traced.is_none() {
+        *row_exhausted = true;
+    }
+    traced
+}
+
+fn traced_occurrence_row<'a>(
+    traced: &'a OccurrenceFileResult,
+    row: &OccurrenceRow,
+) -> Option<&'a OccurrenceRow> {
+    traced
+        .rows
+        .iter()
+        .find(|other| other.node == row.node && other.role == row.role)
+}
 
 fn edge_filter_matches(
     filter: &EdgeFilter,
@@ -69,6 +95,36 @@ pub(super) fn occurrence_expansions_for_file(
         .collect()
 }
 
+/// Expand occurrences whose exact innermost lexical scope is `scope`.
+///
+/// Scope membership is answered by the same per-file environment result that
+/// produced the scope row; nested scopes are not treated as part of their
+/// parent's direct membership.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn occurrence_expansions_in_scope(
+    analyzer: &dyn IAnalyzer,
+    cache: &mut OccurrenceTraversalCache,
+    scope: &ScopeValue,
+    filter: &OccurrenceFilter,
+    cancellation: Option<&CancellationToken>,
+    diagnostics: &mut Vec<CodeQueryDiagnostic>,
+    row_exhausted: &mut bool,
+) -> Vec<PipelineExpansion> {
+    let Some(result) = cache.rows_for_file(analyzer, &scope.file, filter, cancellation) else {
+        *row_exhausted = true;
+        return Vec::new();
+    };
+    cache.report_completeness(&scope.file, &result, filter, diagnostics);
+    occurrences::select_rows(&result, filter)
+        .filter(|row| scope.result.innermost_scope(row.range.start_byte) == Some(scope.index))
+        .map(|row| {
+            pipeline_expansion(PipelineValue::Occurrence(OccurrenceValue {
+                row: Arc::new(row.clone()),
+            }))
+        })
+        .collect()
+}
+
 /// Every occurrence of one declaration: its own declaration-name row plus every
 /// reference-class row anywhere in the workspace whose resolved target is it.
 ///
@@ -124,7 +180,19 @@ pub(super) fn occurrences_of_declaration(
             break;
         };
         occurrence_cache.report_completeness(&file, &result, filter, diagnostics);
-        for row in occurrences::select_rows(&result, filter) {
+        let mut selected_rows = occurrences::select_rows(&result, filter)
+            .cloned()
+            .collect::<Vec<_>>();
+        if !occurrence_cache.resolve_targets_for_rows(
+            analyzer,
+            &file,
+            &mut selected_rows,
+            cancellation,
+        ) {
+            cancelled = true;
+            break;
+        }
+        for row in &selected_rows {
             let selected = match &row.target {
                 OccurrenceTarget::Resolved(units) => units.contains(&declaration.unit),
                 OccurrenceTarget::None => {
@@ -241,6 +309,106 @@ pub(super) fn binding_of_expansions(
     }
 }
 
+/// Resolve the lexical binding identity of one exact call argument. This is
+/// deliberately a query-local join over the existing occurrence and lexical
+/// environment facts; the call-binding producer does not infer identity from
+/// a spelling or a rendered range.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn binding_identity_for_range(
+    analyzer: &dyn IAnalyzer,
+    occurrence_cache: &mut OccurrenceTraversalCache,
+    environment_cache: &mut EnvironmentTraversalCache,
+    file: &ProjectFile,
+    facts: &FileFacts,
+    range: Range,
+    cancellation: Option<&CancellationToken>,
+    diagnostics: &mut Vec<CodeQueryDiagnostic>,
+) -> Option<String> {
+    let filter = OccurrenceFilter {
+        classes: vec![OccurrenceClass::Reference],
+        roles: vec![
+            OccurrenceRole::TypeOperand,
+            OccurrenceRole::PathSegment,
+            OccurrenceRole::ReceiverPosition,
+            OccurrenceRole::ValueReference,
+        ],
+        ..OccurrenceFilter::default()
+    };
+    let result = occurrence_cache.rows_for_file(analyzer, file, &filter, cancellation)?;
+    occurrence_cache.report_completeness(file, &result, &filter, diagnostics);
+    let identity_for = |start_byte: usize,
+                        end_byte: usize,
+                        environment_cache: &mut EnvironmentTraversalCache,
+                        diagnostics: &mut Vec<CodeQueryDiagnostic>| {
+        let identities = result
+            .rows
+            .iter()
+            .filter(|row| row.range.start_byte == start_byte && row.range.end_byte == end_byte)
+            .flat_map(|row| {
+                binding_of_expansions(analyzer, environment_cache, row, false, diagnostics)
+            })
+            .map(|expansion| match expansion.value {
+                PipelineValue::Binding(binding) => binding.id(),
+                _ => unreachable!("binding_of emits binding rows"),
+            })
+            .collect::<HashSet<_>>();
+        (identities.len() == 1).then(|| identities.into_iter().next().unwrap())
+    };
+    let mut identities = HashSet::default();
+    identities.extend(
+        result
+            .rows
+            .iter()
+            .filter(|row| row.range == range)
+            .flat_map(|row| {
+                binding_of_expansions(analyzer, environment_cache, row, false, diagnostics)
+            })
+            .map(|expansion| match expansion.value {
+                PipelineValue::Binding(binding) => binding.id(),
+                _ => unreachable!("binding_of emits binding rows"),
+            }),
+    );
+    let identity = (identities.len() == 1).then(|| identities.into_iter().next().unwrap())?;
+
+    let reassigned = facts
+        .nodes()
+        .iter()
+        .enumerate()
+        .filter(|(node_id, node)| {
+            node.kind == NormalizedKind::Assignment
+                && facts
+                    .role_targets(*node_id as u32, Role::Operator)
+                    .next()
+                    .is_some()
+        })
+        .flat_map(|(node_id, _)| facts.role_targets(node_id as u32, Role::Left))
+        .map(|target| target.span)
+        .filter_map(|target_range| {
+            identity_for(
+                target_range.start_byte,
+                target_range.end_byte,
+                environment_cache,
+                diagnostics,
+            )
+        })
+        .any(|target_identity| target_identity == identity);
+    if reassigned {
+        diagnostics.push(CodeQueryDiagnostic {
+            code: CodeQueryDiagnosticCode::OccurrenceResolutionIncomplete,
+            impact: CodeQueryDiagnosticImpact::Incomplete,
+            branch: Vec::new(),
+            language: crate::analyzer::common::language_for_file(file).config_label(),
+            message: format!(
+                "{} lexical path binding has an assignment write in its file; same-path identity is incomplete",
+                super::rel_path_string(file)
+            ),
+            exhausted_roots: Vec::new(),
+        });
+        return None;
+    }
+    Some(identity)
+}
+
 /// The binder-class occurrence row of one binding's declaring token.
 ///
 /// A binding whose local name is not spelled by a classified token has no
@@ -280,6 +448,130 @@ pub(super) fn binding_occurrence_expansions(
         .collect()
 }
 
+/// Reference occurrences whose exact lexical binding is `value`.
+///
+/// The relation is a query-local join over classified occurrences and
+/// `binding-of`; it retains no workspace-sized reverse index. Member names and
+/// import targets are excluded because their spelling does not name a lexical
+/// value binding.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn binding_uses_expansions(
+    analyzer: &dyn IAnalyzer,
+    occurrence_cache: &mut OccurrenceTraversalCache,
+    environment_cache: &mut EnvironmentTraversalCache,
+    value: &BindingValue,
+    cancellation: Option<&CancellationToken>,
+    diagnostics: &mut Vec<CodeQueryDiagnostic>,
+    row_exhausted: &mut bool,
+) -> Vec<PipelineExpansion> {
+    let filter = OccurrenceFilter {
+        classes: vec![OccurrenceClass::Reference],
+        roles: vec![
+            OccurrenceRole::TypeOperand,
+            OccurrenceRole::PathSegment,
+            OccurrenceRole::ReceiverPosition,
+            OccurrenceRole::ValueReference,
+        ],
+        ..OccurrenceFilter::default()
+    };
+    let Some(result) =
+        occurrence_cache.rows_for_file(analyzer, value.file(), &filter, cancellation)
+    else {
+        *row_exhausted = true;
+        return Vec::new();
+    };
+    occurrence_cache.report_completeness(value.file(), &result, &filter, diagnostics);
+    environment_cache.report_completeness(
+        value.file(),
+        &value.result,
+        environment::BINDING_QUERY_AXES,
+        diagnostics,
+    );
+    let binding_scope = value.result.scope(value.row().declaring_scope);
+    let dynamic_calls = environment_cache.python_dynamic_scope_calls(analyzer, value.file());
+    let contains_dynamic_call = dynamic_calls.iter().any(|call| {
+        binding_scope.range.start_byte <= call.start_byte
+            && call.end_byte <= binding_scope.range.end_byte
+    });
+    let mut unresolved_candidates = result
+        .rows
+        .iter()
+        .filter(|occurrence| {
+            binding_scope.contains(occurrence.range.start_byte)
+                && matches!(
+                    super::super::lexical_environment::binding_of(
+                        &value.result,
+                        occurrence.effective_spelling(),
+                        occurrence.range.start_byte,
+                        Some(occurrence.namespace),
+                    ),
+                    super::super::lexical_environment::BindingOfOutcome::NoBinding
+                )
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    if !occurrence_cache.resolve_targets_for_rows(
+        analyzer,
+        value.file(),
+        &mut unresolved_candidates,
+        cancellation,
+    ) {
+        *row_exhausted = true;
+        return Vec::new();
+    }
+    let contains_unresolved_reference = unresolved_candidates
+        .iter()
+        .any(|occurrence| matches!(&occurrence.target, OccurrenceTarget::Unresolved(_)));
+    let scope_complete = environment::BINDING_QUERY_AXES
+        .iter()
+        .all(|axis| value.result.completeness.covers(*axis))
+        && filter
+            .required_roles()
+            .iter()
+            .all(|role| result.completeness.covers(*role))
+        && !contains_dynamic_call
+        && !contains_unresolved_reference;
+    environment_cache.record_binding_use_completeness(value, scope_complete);
+    if contains_dynamic_call || contains_unresolved_reference {
+        let message = format!(
+            "{} lexical scope {} has unresolved or dynamic references; binding uses are incomplete",
+            super::rel_path_string(value.file()),
+            binding_scope.index
+        );
+        if !diagnostics.iter().any(|diagnostic| {
+            diagnostic.code == CodeQueryDiagnosticCode::OccurrenceResolutionIncomplete
+                && diagnostic.message == message
+        }) {
+            diagnostics.push(CodeQueryDiagnostic {
+                code: CodeQueryDiagnosticCode::OccurrenceResolutionIncomplete,
+                impact: CodeQueryDiagnosticImpact::Incomplete,
+                branch: Vec::new(),
+                language: crate::analyzer::common::language_for_file(value.file()).config_label(),
+                message,
+                exhausted_roots: Vec::new(),
+            });
+        }
+    }
+    let binding_id = value.id();
+    result
+        .rows
+        .iter()
+        .filter(|occurrence| {
+            binding_of_expansions(analyzer, environment_cache, occurrence, false, diagnostics)
+                .into_iter()
+                .any(|expansion| match expansion.value {
+                    PipelineValue::Binding(binding) => binding.id() == binding_id,
+                    _ => false,
+                })
+        })
+        .map(|row| {
+            pipeline_expansion(PipelineValue::Occurrence(OccurrenceValue {
+                row: Arc::new(row.clone()),
+            }))
+        })
+        .collect()
+}
+
 /// The candidates the resolver considered for one reference occurrence.
 ///
 /// The trace is a second, opt-in derivation of the occurrence's file, so this
@@ -295,16 +587,16 @@ pub(super) fn candidate_expansions(
     diagnostics: &mut Vec<CodeQueryDiagnostic>,
     row_exhausted: &mut bool,
 ) -> Vec<PipelineExpansion> {
-    let Some(traced) = environment_cache.traced_occurrences_for(analyzer, &row.file, cancellation)
-    else {
-        *row_exhausted = true;
+    let Some(traced) = traced_occurrences_for_row(
+        analyzer,
+        environment_cache,
+        row,
+        cancellation,
+        row_exhausted,
+    ) else {
         return Vec::new();
     };
-    let Some(traced_row) = traced
-        .rows
-        .iter()
-        .find(|other| other.node == row.node && other.role == row.role)
-    else {
+    let Some(traced_row) = traced_occurrence_row(&traced, row) else {
         return Vec::new();
     };
     let Some(trace) = &traced_row.candidates else {
@@ -349,16 +641,16 @@ pub(super) fn candidate_hierarchy_expansions(
     cancellation: Option<&CancellationToken>,
     row_exhausted: &mut bool,
 ) -> Vec<PipelineExpansion> {
-    let Some(traced) = environment_cache.traced_occurrences_for(analyzer, &row.file, cancellation)
-    else {
-        *row_exhausted = true;
+    let Some(traced) = traced_occurrences_for_row(
+        analyzer,
+        environment_cache,
+        row,
+        cancellation,
+        row_exhausted,
+    ) else {
         return Vec::new();
     };
-    let Some(traced_row) = traced
-        .rows
-        .iter()
-        .find(|other| other.node == row.node && other.role == row.role)
-    else {
+    let Some(traced_row) = traced_occurrence_row(&traced, row) else {
         return Vec::new();
     };
     let Some(trace) = &traced_row.candidates else {
@@ -494,6 +786,7 @@ pub(super) fn state_event_expansions(
                 event,
                 file: file.clone(),
                 procedure_id: Arc::clone(&procedure_id),
+                procedure: procedure.handle.clone(),
             },
         ))));
     }
@@ -523,6 +816,7 @@ pub(super) fn flow_relation_expansions(
         &file_state,
         procedure_index,
         &procedure_id,
+        &procedure.handle,
         &file,
         filter,
         None,
@@ -540,6 +834,7 @@ pub(super) fn flow_relations_of_event(
         &value.file_state,
         value.procedure_index,
         &value.procedure_id,
+        &value.procedure,
         &value.file,
         filter,
         Some(value.event),
@@ -550,6 +845,7 @@ fn relation_expansions(
     file_state: &Arc<super::super::flow_state::FileFlowState>,
     procedure_index: usize,
     procedure_id: &Arc<str>,
+    procedure: &crate::analyzer::semantic::ProcedureHandle,
     file: &ProjectFile,
     filter: &FlowRelationFilter,
     incident_to: Option<usize>,
@@ -574,16 +870,323 @@ fn relation_expansions(
                 relation,
                 file: file.clone(),
                 procedure_id: Arc::clone(procedure_id),
+                procedure: procedure.clone(),
             },
         ))));
     }
     expansions
 }
 
+/// Relate one Rust binding establishment to the exact call sites in its
+/// initializer result/receiver chain. The stable call AST identity is shared
+/// with call-effect and dispatch-target rows.
+pub(super) fn binding_initializer_call_expansions(
+    workspace: &WorkspaceAnalyzer,
+    event: &StateEventValue,
+    cancellation: Option<&CancellationToken>,
+    diagnostics: &mut Vec<CodeQueryDiagnostic>,
+) -> Vec<PipelineExpansion> {
+    let state = event.row();
+    if state.event_class
+        != brokk_bifrost_core::analyzer::structural::flow_state::StateEventClass::Establish
+        || !matches!(
+            &state.subject,
+            crate::structural::flow_state::FlowSubject::Binding { .. }
+        )
+    {
+        return Vec::new();
+    }
+
+    let file = &event.file;
+    let language = crate::analyzer::common::language_for_file(file);
+    if language != Language::Rust {
+        binding_initializer_incomplete(
+            diagnostics,
+            file,
+            language.config_label(),
+            "only Rust binding initializers have an exact structured result/receiver relation",
+        );
+        return Vec::new();
+    }
+    if cancellation.is_some_and(CancellationToken::is_cancelled) {
+        binding_initializer_incomplete(
+            diagnostics,
+            file,
+            language.config_label(),
+            "initializer projection was cancelled",
+        );
+        return Vec::new();
+    }
+
+    let Some(facts) = workspace
+        .analyzer()
+        .structural_fact_providers()
+        .into_iter()
+        .find(|provider| provider.structural_language() == Language::Rust)
+        .and_then(|provider| provider.structural_facts(file))
+    else {
+        binding_initializer_incomplete(
+            diagnostics,
+            file,
+            language.config_label(),
+            "Rust structural facts for the establishing event are unavailable",
+        );
+        return Vec::new();
+    };
+
+    let Some(event_ast_id) = state.site.ast_id.as_deref() else {
+        binding_initializer_incomplete(
+            diagnostics,
+            file,
+            language.config_label(),
+            "establishing event has no exact structural AST identity",
+        );
+        return Vec::new();
+    };
+    let matching_nodes = (0..facts.nodes().len())
+        .map(|node| node as u32)
+        .filter(|node| {
+            crate::analyzer::structural::occurrence_rows::ast_id(facts.source_identity(), *node)
+                == event_ast_id
+        })
+        .collect::<Vec<_>>();
+    let [establishment_node] = matching_nodes.as_slice() else {
+        binding_initializer_incomplete(
+            diagnostics,
+            file,
+            language.config_label(),
+            &format!(
+                "establishing AST identity matched {} structural nodes",
+                matching_nodes.len()
+            ),
+        );
+        return Vec::new();
+    };
+    if facts.node(*establishment_node).kind
+        != brokk_bifrost_core::analyzer::structural::kinds::NormalizedKind::Assignment
+    {
+        // Parameters and other non-assignment establishments have no
+        // initializer call site to relate.
+        return Vec::new();
+    }
+    let right_nodes = facts
+        .role_targets(
+            *establishment_node,
+            brokk_bifrost_core::analyzer::structural::kinds::Role::Right,
+        )
+        .filter_map(|target| target.node)
+        .collect::<Vec<_>>();
+    let [right_node] = right_nodes.as_slice() else {
+        if right_nodes.is_empty() {
+            // A declaration without an initializer has no call result to link.
+            return Vec::new();
+        }
+        binding_initializer_incomplete(
+            diagnostics,
+            file,
+            language.config_label(),
+            &format!(
+                "binding assignment has {} structured right-hand sides",
+                right_nodes.len()
+            ),
+        );
+        return Vec::new();
+    };
+    if facts.node(*right_node).kind
+        != brokk_bifrost_core::analyzer::structural::kinds::NormalizedKind::Call
+    {
+        return Vec::new();
+    }
+
+    let semantics = event.procedure.semantics();
+    let mut calls_by_span = crate::hash::HashMap::<
+        (usize, usize),
+        Vec<&crate::analyzer::semantic::SemanticCallSite>,
+    >::default();
+    for call in semantics.call_sites() {
+        let Some(mapping) = semantics.source_mapping(call.source) else {
+            continue;
+        };
+        if mapping.kind == crate::analyzer::semantic::SourceMappingKind::Exact {
+            let span = mapping.locator.anchor().span();
+            calls_by_span
+                .entry((span.start_byte() as usize, span.end_byte() as usize))
+                .or_default()
+                .push(call);
+        }
+    }
+
+    let mut initializer_calls = Vec::new();
+    let mut current_node = *right_node;
+    let mut current_call =
+        match exact_initializer_call(&facts, current_node, &calls_by_span, state.value, None) {
+            Ok(call) => call,
+            Err(reason) => {
+                binding_initializer_incomplete(diagnostics, file, language.config_label(), reason);
+                return Vec::new();
+            }
+        };
+    initializer_calls.push((current_node, current_call, "result"));
+
+    loop {
+        let receivers = facts
+            .role_targets(
+                current_node,
+                brokk_bifrost_core::analyzer::structural::kinds::Role::Receiver,
+            )
+            .filter_map(|target| target.node)
+            .filter(|node| {
+                facts.node(*node).kind
+                    == brokk_bifrost_core::analyzer::structural::kinds::NormalizedKind::Call
+            })
+            .collect::<Vec<_>>();
+        let receiver_node = match receivers.as_slice() {
+            [] => break,
+            [node] => *node,
+            _ => {
+                binding_initializer_incomplete(
+                    diagnostics,
+                    file,
+                    language.config_label(),
+                    &format!(
+                        "initializer call has {} call-valued receiver roles",
+                        receivers.len()
+                    ),
+                );
+                return Vec::new();
+            }
+        };
+        let receiver_value = current_call.receiver;
+        let next_call = match exact_initializer_call(
+            &facts,
+            receiver_node,
+            &calls_by_span,
+            receiver_value.unwrap_or(state.value),
+            receiver_value,
+        ) {
+            Ok(call) => call,
+            Err(reason) => {
+                binding_initializer_incomplete(diagnostics, file, language.config_label(), reason);
+                return Vec::new();
+            }
+        };
+        current_node = receiver_node;
+        current_call = next_call;
+        initializer_calls.push((current_node, current_call, "receiver"));
+    }
+
+    let establishment_event_id = event.id();
+    let path = rel_path_string(file);
+    initializer_calls
+        .into_iter()
+        .map(|(node, _call, initializer_role)| {
+            let site_ast_id =
+                crate::analyzer::structural::occurrence_rows::ast_id(facts.source_identity(), node);
+            let range = facts.node(node).range;
+            let row = CodeQueryBindingInitializerCall {
+                id: binding_initializer_call_id(
+                    &establishment_event_id,
+                    &site_ast_id,
+                    initializer_role,
+                ),
+                establishment_event_id: establishment_event_id.clone(),
+                site_ast_id,
+                initializer_role,
+                path: path.clone(),
+                language: language.config_label(),
+                range: super::render::public_range(&facts, range),
+                start_byte: range.start_byte,
+                end_byte: range.end_byte,
+            };
+            pipeline_expansion(PipelineValue::BindingInitializerCall(Box::new(
+                BindingInitializerCallValue {
+                    row,
+                    file: file.clone(),
+                },
+            )))
+        })
+        .collect()
+}
+
+fn exact_initializer_call<'a>(
+    facts: &crate::analyzer::structural::FileFacts,
+    node: u32,
+    calls_by_span: &crate::hash::HashMap<
+        (usize, usize),
+        Vec<&'a crate::analyzer::semantic::SemanticCallSite>,
+    >,
+    expected_result: crate::analyzer::semantic::ValueId,
+    receiver_result: Option<crate::analyzer::semantic::ValueId>,
+) -> Result<&'a crate::analyzer::semantic::SemanticCallSite, &'static str> {
+    let range = facts.node(node).range;
+    let span = (range.start_byte, range.end_byte);
+    let candidates = calls_by_span
+        .get(&span)
+        .map(Vec::as_slice)
+        .unwrap_or_default();
+    let [call] = candidates else {
+        return Err("initializer call AST identity has no unique exact semantic call site");
+    };
+    if let Some(receiver_result) = receiver_result {
+        if !call
+            .normal_result_values()
+            .any(|value| value == receiver_result)
+        {
+            return Err(
+                "receiver call result does not match the consuming call's semantic receiver",
+            );
+        }
+    } else if !call
+        .normal_result_values()
+        .any(|value| value == expected_result)
+    {
+        return Err("initializer call result does not match the binding establishment value");
+    }
+    Ok(*call)
+}
+
+fn binding_initializer_call_id(
+    establishment_event_id: &str,
+    site_ast_id: &str,
+    initializer_role: &str,
+) -> String {
+    let mut digest = crate::analyzer::semantic::LengthDelimitedDigest::new(
+        b"bifrost.code_query.binding_initializer_call.v1",
+    );
+    digest.push(establishment_event_id.as_bytes());
+    digest.push(site_ast_id.as_bytes());
+    digest.push(initializer_role.as_bytes());
+    digest.finish().to_string()
+}
+
+fn binding_initializer_incomplete(
+    diagnostics: &mut Vec<CodeQueryDiagnostic>,
+    file: &ProjectFile,
+    language: &'static str,
+    reason: &str,
+) {
+    let message = format!("binding_initializer_calls_of: {reason}");
+    if diagnostics.iter().any(|diagnostic| {
+        diagnostic.code == CodeQueryDiagnosticCode::SemanticAnalysisPartial
+            && diagnostic.language == language
+            && diagnostic.message == message
+    }) {
+        return;
+    }
+    diagnostics.push(CodeQueryDiagnostic {
+        code: CodeQueryDiagnosticCode::SemanticAnalysisPartial,
+        impact: CodeQueryDiagnosticImpact::Incomplete,
+        branch: Vec::new(),
+        language,
+        message: format!("{}: {message}", rel_path_string(file)),
+        exhausted_roots: Vec::new(),
+    });
+}
+
 /// Derive one seed procedure's file, locate the seed inside it, and report the
 /// derivation's completeness. `None` when the file's derivation produced no
 /// procedures at all -- which the reported diagnostics already explain.
-fn seed_derivation(
+pub(super) fn seed_derivation(
     workspace: &WorkspaceAnalyzer,
     flow_state_cache: &mut FlowStateTraversalCache,
     procedure: &SemanticProcedureValue,

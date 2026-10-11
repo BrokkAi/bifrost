@@ -5,8 +5,8 @@
 
 use super::*;
 use crate::analyzer::resolution::{
-    FactPageVisitor, SelectedResolutionMountContext, SelectedRootPathHalf,
-    visit_selected_root_export_half_pages, visit_selected_root_import_half_pages,
+    FactPageVisitor, ResolutionLookupSemanticRecipe, SelectedResolutionMountContext,
+    SelectedRootPathHalf, SharedNameId, SharedNameInterner, visit_selected_root_export_half_pages,
 };
 
 /// Unsaved Go replacements that keep their predecessor's package placement.
@@ -36,14 +36,41 @@ WHERE mask.storage_language = 'go' AND mounted.file_version_id IS NULL
 const TRANSIENT_PLACEMENT: &str =
     "SELECT file_version_id FROM temp.selected_go_transient_placements WHERE mount_ordinal = ?1";
 
-// A transient Go source without a proven placement may belong to any package
-// the Go tool would assign it, so no package's member set is complete.
-const UNPLACED_TRANSIENT_SOURCE: &str = r#"
-SELECT EXISTS(
-  SELECT 1 FROM temp.selected_resolution_mounts AS mounted
-  WHERE mounted.storage_language = 'go' AND mounted.file_version_id IS NULL
-    AND NOT EXISTS(SELECT 1 FROM temp.selected_go_transient_placements AS placed
-                   WHERE placed.mount_ordinal = mounted.mount_ordinal))
+// A transient Go source without a proven placement leaves only its containing
+// Go package's inventory open. Go package files share a directory.
+const UNPLACED_TRANSIENT_SOURCES: &str = r#"
+SELECT mounted.persisted_relative_path
+FROM temp.selected_resolution_mounts AS mounted
+WHERE mounted.storage_language = 'go' AND mounted.file_version_id IS NULL
+  AND NOT EXISTS(SELECT 1 FROM temp.selected_go_transient_placements AS placed
+                 WHERE placed.mount_ordinal = mounted.mount_ordinal)
+ORDER BY mounted.persisted_relative_path
+"#;
+
+// Go root-import paths have LexicalBinding tier code 0 and ordinal 0. Go root
+// reference paths use PackageOrModule, so this selects only import demands.
+const GO_ROOT_IMPORT_TERMINAL_TARGETS: &str = r#"
+SELECT DISTINCT root_terminal
+FROM main.resolution_paths INDEXED BY resolution_paths_root_terminal
+WHERE blob_id=?1 AND end_node=-1 AND root_terminal IS NOT NULL
+  AND json_extract(body, '$[8][0][0]')=0
+  AND json_extract(body, '$[8][0][1]')=0
+ORDER BY root_terminal
+"#;
+
+const PACKAGE_SOURCE_MOUNTS: &str = r#"
+SELECT mounted.mount_ordinal
+FROM main.go_context_source_files AS source
+JOIN temp.selected_resolution_mounts AS mounted
+  ON mounted.file_version_id=source.file_version_id
+WHERE source.context_id=?1 AND source.package_id=?2
+UNION
+SELECT placed.mount_ordinal
+FROM main.go_context_source_files AS source
+JOIN temp.selected_go_transient_placements AS placed
+  ON placed.file_version_id=source.file_version_id
+WHERE source.context_id=?1 AND source.package_id=?2
+ORDER BY 1
 "#;
 
 /// The selected file version whose package placement this mount uses: its
@@ -64,7 +91,19 @@ pub(in crate::analyzer::store) fn go_placement_file_version(
 // A context is usable only for the exact revision selected by this operation.
 // The head is checked again before a caller may publish its answer.
 const CONTEXT_SELECTION: &str = r#"
-SELECT c.complete, json(c.gaps), c.selection_id, c.publication_digest
+SELECT json(c.gaps),
+       (SELECT COUNT(*)
+        FROM json_each(c.gaps) AS gap
+        WHERE COALESCE(json_extract(gap.value, '$.code'), '') NOT IN (
+          'build_selection_unavailable',
+          'source_cgo_build_selection_unavailable',
+          'conflicting_source_package_names',
+          'source_import_provider_unavailable'
+        ) OR (
+          COALESCE(json_extract(gap.value, '$.code'), '') = 'build_selection_unavailable'
+          AND ?3 = 'xtest'
+        )),
+       c.selection_id, c.publication_digest
 FROM main.go_context_publications AS c
 JOIN main.go_context_selections AS s ON s.selection_id = c.selection_id
 JOIN main.go_context_heads AS h ON h.selection_id = s.selection_id AND h.context_id = c.context_id
@@ -122,8 +161,36 @@ WHERE caller.context_id = ?1 AND caller.file_version_id = ?2
   AND caller.source_role = ?3
 "#;
 
+#[derive(Clone, Default)]
+pub(crate) struct GoPackageInventoryState {
+    pub(crate) complete: bool,
+    pub(crate) fragments: HashMap<BindingFragmentId, bool>,
+}
+
+impl GoPackageInventoryState {
+    pub(crate) fn merge(&mut self, other: Self) {
+        self.complete |= other.complete;
+        for (fragment, is_complete) in other.fragments {
+            *self.fragments.entry(fragment).or_insert(true) &= is_complete;
+        }
+    }
+}
+
+#[derive(Clone)]
+pub(crate) struct GoContextSelection {
+    pub(crate) identity: super::super::GoContextIdentity,
+    evidence: String,
+    global_gap_count: i64,
+}
+
+// A transient return value: the ready payload is moved out immediately, so
+// boxing it would add an allocation to every context read.
+#[allow(clippy::large_enum_variant)]
 pub(crate) enum GoDotImportContext {
-    Ready(SelectedResolutionContextSet),
+    Ready {
+        context: SelectedResolutionContextSet,
+        inventory: GoPackageInventoryState,
+    },
     Unavailable,
     Cancelled,
 }
@@ -143,26 +210,68 @@ impl SelectedResolutionOperation<'_, '_> {
         if cancellation.is_cancelled() {
             return Ok(GoDotImportContext::Cancelled);
         }
+        let Some(selection) = self.go_context_selection(context_id, source_role)? else {
+            return Ok(GoDotImportContext::Unavailable);
+        };
+        let outcome = self.go_dot_import_context_for_selection(
+            context_id,
+            caller_path,
+            source_role,
+            &selection,
+            cancellation,
+        )?;
+        if let GoDotImportContext::Ready { inventory, .. } = &outcome {
+            self.record_go_package_inventory_state(inventory);
+        }
+        Ok(outcome)
+    }
+
+    pub(super) fn go_context_selection(
+        &self,
+        context_id: i64,
+        source_role: &str,
+    ) -> Result<Option<GoContextSelection>> {
+        // The selection is a constant of this operation (its workspace
+        // revision and the Go head are fixed for the request) but reading it
+        // scans the publication's whole gap list, so a request that prepares
+        // hundreds of files must not repeat it per file.
+        let memo_key = (context_id, source_role.to_owned());
+        if let Some(selection) = self.go_context_selections.borrow().get(&memo_key) {
+            return Ok(selection.clone());
+        }
+        let selection = self.read_go_context_selection(context_id, source_role)?;
+        self.go_context_selections
+            .borrow_mut()
+            .insert(memo_key, selection.clone());
+        Ok(selection)
+    }
+
+    fn read_go_context_selection(
+        &self,
+        context_id: i64,
+        source_role: &str,
+    ) -> Result<Option<GoContextSelection>> {
         let connection = self.ready.inventory.connection();
         let selected = connection
             .prepare_cached(CONTEXT_SELECTION)?
             .query_row(
-                [
+                rusqlite::params![
                     context_id,
                     super::super::go_package_context::DERIVATION_VERSION,
+                    source_role,
                 ],
                 |row| {
                     Ok((
-                        row.get::<_, bool>(0)?,
-                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(0)?,
+                        row.get::<_, i64>(1)?,
                         row.get::<_, i64>(2)?,
                         row.get::<_, Vec<u8>>(3)?,
                     ))
                 },
             )
             .optional()?;
-        let Some((complete, evidence, selection_id, digest)) = selected else {
-            return Ok(GoDotImportContext::Unavailable);
+        let Some((evidence, global_gap_count, selection_id, digest)) = selected else {
+            return Ok(None);
         };
         let publication = super::super::GoContextIdentity {
             selection_id,
@@ -177,6 +286,25 @@ impl SelectedResolutionOperation<'_, '_> {
                 "one query uses one selected Go publication"
             );
         }
+        Ok(Some(GoContextSelection {
+            identity: publication,
+            evidence,
+            global_gap_count,
+        }))
+    }
+
+    pub(super) fn go_dot_import_context_for_selection(
+        &self,
+        context_id: i64,
+        caller_path: &str,
+        source_role: &str,
+        selection: &GoContextSelection,
+        cancellation: &CancellationToken,
+    ) -> Result<GoDotImportContext> {
+        if cancellation.is_cancelled() {
+            return Ok(GoDotImportContext::Cancelled);
+        }
+        let connection = self.ready.inventory.connection();
         let Some(source) = self.mount_table().mount_for_path("go", caller_path)? else {
             return Ok(GoDotImportContext::Unavailable);
         };
@@ -189,29 +317,99 @@ impl SelectedResolutionOperation<'_, '_> {
         let Some(file_version) = go_placement_file_version(connection, &source_record)? else {
             return Ok(GoDotImportContext::Unavailable);
         };
+        let package_id: Option<i64> = connection
+            .prepare_cached(super::go_same_package::CALLER_PACKAGE)?
+            .query_row(
+                rusqlite::params![context_id, file_version, source_role],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let Some(package_id) = package_id else {
+            return Ok(GoDotImportContext::Unavailable);
+        };
+        let (package_complete, package_evidence): (bool, String) = connection
+            .query_row(
+                "SELECT complete, json(gaps) FROM main.go_package_instances
+                 WHERE context_id=?1 AND package_id=?2",
+                rusqlite::params![context_id, package_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?
+            .ok_or_else(|| StoreError::corrupt("selected Go caller package disappeared"))?;
         let identities = self.ready.context_identities.clone();
         let mut reasons = Vec::new();
-        if !complete {
+        if selection.global_gap_count != 0 {
             let mut hash = CanonicalHasher::new(b"bifrost-go-context-incomplete:v1");
             hash.field("context", &context_id.to_le_bytes());
-            hash.field("evidence", evidence.as_bytes());
+            hash.field("evidence", selection.evidence.as_bytes());
             reasons.push(identities.named_semantic(
                 hash.finish(),
                 "go-context-incomplete",
-                &evidence,
+                &selection.evidence,
             ));
         }
-        let unplaced: bool =
-            connection.query_row(UNPLACED_TRANSIENT_SOURCE, [], |row| row.get(0))?;
-        if unplaced {
-            let evidence =
-                "an unsaved Go source changed the inputs the Go tool uses to place it in a package";
-            let mut hash = CanonicalHasher::new(b"bifrost-go-transient-placement-unproven:v1");
+        if !package_complete {
+            let mut hash = CanonicalHasher::new(b"bifrost-go-package-incomplete:v1");
             hash.field("context", &context_id.to_le_bytes());
+            hash.field("package", &package_id.to_le_bytes());
+            hash.field("evidence", package_evidence.as_bytes());
+            reasons.push(identities.named_semantic(
+                hash.finish(),
+                "go-package-incomplete",
+                &package_evidence,
+            ));
+        }
+        let caller_directory =
+            std::path::Path::new(source_record.persisted_relative_path()).parent();
+        let mut unplaced_sources = connection.prepare_cached(UNPLACED_TRANSIENT_SOURCES)?;
+        let mut rows = unplaced_sources.query([])?;
+        let mut unplaced_source = None;
+        while let Some(row) = rows.next()? {
+            if cancellation.is_cancelled() {
+                return Ok(GoDotImportContext::Cancelled);
+            }
+            let path: String = row.get(0)?;
+            if std::path::Path::new(&path).parent() == caller_directory {
+                unplaced_source = Some(path);
+                break;
+            }
+        }
+        drop(rows);
+        drop(unplaced_sources);
+        let package_inventory_complete = package_complete && unplaced_source.is_none();
+        let mut package_fragments = vec![source.fragment()];
+        let mut statement = connection.prepare_cached(PACKAGE_SOURCE_MOUNTS)?;
+        let mut rows = statement.query(rusqlite::params![context_id, package_id])?;
+        while let Some(row) = rows.next()? {
+            if cancellation.is_cancelled() {
+                return Ok(GoDotImportContext::Cancelled);
+            }
+            let ordinal = SelectedResolutionMountOrdinal::new(row.get(0)?);
+            package_fragments.push(self.mount_table().mount_by_ordinal(ordinal)?.fragment());
+        }
+        drop(rows);
+        drop(statement);
+        package_fragments.sort_unstable();
+        package_fragments.dedup();
+        let inventory = GoPackageInventoryState {
+            complete: package_inventory_complete,
+            fragments: package_fragments
+                .into_iter()
+                .map(|fragment| (fragment, package_inventory_complete))
+                .collect(),
+        };
+        if let Some(path) = unplaced_source {
+            let evidence = format!(
+                "unsaved Go source {path:?} has no proven placement in the caller package directory"
+            );
+            let mut hash = CanonicalHasher::new(b"bifrost-go-transient-placement-unproven:v2");
+            hash.field("context", &context_id.to_le_bytes());
+            hash.field("package", &package_id.to_le_bytes());
+            hash.field("evidence", evidence.as_bytes());
             reasons.push(identities.named_semantic(
                 hash.finish(),
                 "go-transient-placement-unproven",
-                evidence,
+                &evidence,
             ));
         }
         let completion = if reasons.is_empty() {
@@ -224,20 +422,34 @@ impl SelectedResolutionOperation<'_, '_> {
             )
         };
         let lexical = self.ready.lexical_source();
-        let mut imports = Vec::new();
-        let outcome = visit_selected_root_import_half_pages(
-            &identities,
-            &lexical,
-            &lexical,
-            Some(&[source.ordinal()]),
-            cancellation,
-            &mut FactPageVisitor::new(&mut |page| {
-                imports.extend_from_slice(page);
-                Ok(true)
-            }),
-        )?;
-        if outcome.is_cancelled() {
+        if !self.go_import_inputs_loaded(source.ordinal())
+            && !self.load_go_import_inputs(
+                context_id,
+                &[(source.ordinal(), file_version, source_role)],
+                cancellation,
+            )?
+        {
             return Ok(GoDotImportContext::Cancelled);
+        }
+        // Only dot imports publish root import paths, and this reader uses
+        // import halves alone, so a file without a dot import skips the
+        // inventory of every root path it owns.
+        let mut imports = Vec::new();
+        if self.go_mount_has_dot_import(source.ordinal()) {
+            let outcome = visit_selected_root_import_half_pages(
+                &identities,
+                &lexical,
+                &lexical,
+                Some(&[source.ordinal()]),
+                cancellation,
+                &mut FactPageVisitor::new(&mut |page| {
+                    imports.extend_from_slice(page);
+                    Ok(true)
+                }),
+            )?;
+            if outcome.is_cancelled() {
+                return Ok(GoDotImportContext::Cancelled);
+            }
         }
         let mut bridges = Vec::new();
         for import in imports {
@@ -280,6 +492,18 @@ impl SelectedResolutionOperation<'_, '_> {
                 .map(ResolutionLookupSemanticRecipe::spelling)
                 .collect::<Vec<_>>()
                 .join("/");
+            let Some(import_completion) = self.go_import_completion(
+                context_id,
+                source.ordinal(),
+                file_version,
+                source_role,
+                &spelling,
+                &completion,
+                cancellation,
+            )?
+            else {
+                return Ok(GoDotImportContext::Cancelled);
+            };
             let mut statement = connection.prepare_cached(DOT_IMPORT_TARGET_MOUNTS)?;
             let rows = statement.query_map(
                 rusqlite::params![context_id, file_version, source_role, spelling],
@@ -332,7 +556,7 @@ impl SelectedResolutionOperation<'_, '_> {
                             recipes.clone(),
                             demand_recipe.clone(),
                             demand_recipe.clone(),
-                            completion.clone(),
+                            import_completion.clone(),
                         )
                         .with_selected_export(&self.ready.shared_names(), &export),
                     );
@@ -357,9 +581,116 @@ impl SelectedResolutionOperation<'_, '_> {
                     .map(|mount| (mount.ordinal(), mount.semantic_language())))
             },
         )?;
-        Ok(GoDotImportContext::Ready(reasons.into_iter().fold(
-            context,
-            SelectedResolutionContextSet::with_context_owned_inventory_reason,
+        Ok(GoDotImportContext::Ready {
+            context: reasons.into_iter().fold(
+                context,
+                SelectedResolutionContextSet::with_context_owned_inventory_reason,
+            ),
+            inventory,
+        })
+    }
+
+    fn go_root_import_terminal_targets(
+        &self,
+        blob_id: i64,
+        cancellation: &CancellationToken,
+    ) -> Result<Option<Vec<SharedNameId>>> {
+        if cancellation.is_cancelled() {
+            return Ok(None);
+        }
+        let connection = self.ready.inventory.connection();
+        let names = self.ready.shared_names();
+        let mut targets = Vec::new();
+        let mut statement = connection.prepare_cached(GO_ROOT_IMPORT_TERMINAL_TARGETS)?;
+        let mut rows = statement.query([blob_id])?;
+        while let Some(row) = rows.next()? {
+            if cancellation.is_cancelled() {
+                return Ok(None);
+            }
+            let persisted = SharedNameId::interned(row.get(0)?);
+            targets.push(names.from_persisted(persisted));
+        }
+        Ok(Some(targets))
+    }
+
+    pub(super) fn record_go_package_inventory_state(&self, inventory: &GoPackageInventoryState) {
+        let mut complete = self.ready.go_package_inventory_complete.borrow_mut();
+        *complete = Some(complete.unwrap_or(false) || inventory.complete);
+        drop(complete);
+        let mut fragments = self.ready.go_package_inventory_fragments.borrow_mut();
+        for (&fragment, &is_complete) in &inventory.fragments {
+            *fragments.entry(fragment).or_insert(true) &= is_complete;
+        }
+    }
+
+    /// Completion of one Go import spelling of a mounted file, from the file's
+    /// selected import rows. Loads them as a one-element batch when no
+    /// prefetch has; `None` means cancelled.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn go_import_completion(
+        &self,
+        context_id: i64,
+        mount: SelectedResolutionMountOrdinal,
+        file_version: i64,
+        source_role: &str,
+        spelling: &str,
+        base_completion: &ResolutionCompletion,
+        cancellation: &CancellationToken,
+    ) -> Result<Option<ResolutionCompletion>> {
+        if cancellation.is_cancelled() {
+            return Ok(None);
+        }
+        if !self.go_import_inputs_loaded(mount)
+            && !self.load_go_import_inputs(
+                context_id,
+                &[(mount, file_version, source_role)],
+                cancellation,
+            )?
+        {
+            return Ok(None);
+        }
+        let row = self.go_import_row(mount, spelling);
+        Ok(Some(self.go_import_completion_for(
+            context_id,
+            file_version,
+            source_role,
+            spelling,
+            row.as_ref(),
+            base_completion,
         )))
+    }
+
+    /// The completion a selected import row states; a spelling without a row
+    /// is incomplete.
+    pub(super) fn go_import_completion_for(
+        &self,
+        context_id: i64,
+        file_version: i64,
+        source_role: &str,
+        spelling: &str,
+        selected: Option<&super::go_named::GoFileImportRow>,
+        base_completion: &ResolutionCompletion,
+    ) -> ResolutionCompletion {
+        if selected.is_some_and(|row| row.complete) {
+            return base_completion.clone();
+        }
+        let evidence = selected.map_or_else(
+            || format!("missing selected Go import row for {source_role}:{spelling}"),
+            |row| row.gaps.clone(),
+        );
+        let mut hash = CanonicalHasher::new(b"bifrost-go-import-incomplete:v1");
+        hash.field("context", &context_id.to_le_bytes());
+        hash.field("file-version", &file_version.to_le_bytes());
+        hash.field("role", source_role.as_bytes());
+        hash.field("spelling", spelling.as_bytes());
+        hash.field("evidence", evidence.as_bytes());
+        let reason = self.ready.context_identities.named_semantic(
+            hash.finish(),
+            "go-import-incomplete",
+            &evidence,
+        );
+        base_completion.combine(&ResolutionCompletion::incomplete([
+            ResolutionIncompleteReason::UnsupportedSemantic(reason),
+        ]))
     }
 }

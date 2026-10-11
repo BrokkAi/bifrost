@@ -1,6 +1,5 @@
 use super::*;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
-use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -524,7 +523,7 @@ pub enum ObservationJoinError {
 }
 impl fmt::Display for ObservationJoinError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{self:?}")
+        super::fmt_debug(self, f)
     }
 }
 impl std::error::Error for ObservationJoinError {}
@@ -584,7 +583,7 @@ impl ObservationCodecError {
 }
 impl fmt::Display for ObservationCodecError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&self.0)
+        super::fmt_text(&self.0, f)
     }
 }
 impl std::error::Error for ObservationCodecError {}
@@ -707,26 +706,8 @@ fn decode<T: DeserializeOwned>(b: &[u8]) -> Result<T, ObservationCodecError> {
     serde_json::from_slice(b).map_err(|e| ObservationCodecError::new(e.to_string()))
 }
 fn canonical_bytes(v: &impl Serialize) -> Result<Vec<u8>, ObservationCodecError> {
-    let v = serde_json::to_value(v).map_err(|e| ObservationCodecError::new(e.to_string()))?;
-    let mut b =
-        serde_json::to_vec(&canonical(v)).map_err(|e| ObservationCodecError::new(e.to_string()))?;
-    b.push(b'\n');
-    Ok(b)
-}
-fn canonical(v: Value) -> Value {
-    match v {
-        Value::Object(m) => {
-            let mut e = m.into_iter().collect::<Vec<_>>();
-            e.sort_by(|a, b| a.0.cmp(&b.0));
-            Value::Object(
-                e.into_iter()
-                    .map(|(k, v)| (k, canonical(v)))
-                    .collect::<Map<_, _>>(),
-            )
-        }
-        Value::Array(a) => Value::Array(a.into_iter().map(canonical).collect()),
-        x => x,
-    }
+    super::codec::canonical_json_bytes(v)
+        .map_err(|error| ObservationCodecError::new(error.to_string()))
 }
 fn digest(v: &impl Serialize) -> Result<StableDigest, ObservationCodecError> {
     StableDigest::parse(format!("{:x}", Sha256::digest(canonical_bytes(v)?)))

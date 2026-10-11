@@ -12,6 +12,9 @@
 use super::*;
 use crate::analyzer::semantic::SemanticBudgetDimension;
 use crate::query::PlanPartitioning;
+use crate::structural::execution::plan::{
+    source_enumeration_constraint, source_file_matches_constraint,
+};
 use std::path::Path;
 
 /// Which files a query's seed enumeration runs over.
@@ -26,7 +29,7 @@ use std::path::Path;
 /// file counts. The caller computes `workspace_files` once and hands the same
 /// slice to every unit, which is what keeps unit-wise execution linear in the
 /// file count instead of quadratic.
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Default)]
 pub struct CodeQueryExecutionScope<'a> {
     seed_files: Option<&'a [ProjectFile]>,
     workspace_files: Option<&'a [ProjectFile]>,
@@ -34,6 +37,10 @@ pub struct CodeQueryExecutionScope<'a> {
     /// Optional policy expansion selection. This is query-specific: existing
     /// whole-workspace and per-seed execution scopes leave it unset.
     source_selection: Option<CodeQuerySourceSelection<'a>>,
+    /// Optional compilation-local call-target outcomes shared by selector
+    /// scans. The analyzer and model authority are rechecked at query entry.
+    shared_call_target_outcomes:
+        Option<crate::analyzer::usages::call_relations::CallTargetOutcomeCache>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -60,6 +67,7 @@ impl<'a> CodeQueryExecutionScope<'a> {
             workspace_files: None,
             branch_path: &[],
             source_selection: None,
+            shared_call_target_outcomes: None,
         }
     }
 
@@ -69,12 +77,7 @@ impl<'a> CodeQueryExecutionScope<'a> {
         seed_files: &'a [ProjectFile],
         workspace_files: &'a [ProjectFile],
     ) -> Self {
-        Self {
-            seed_files: Some(seed_files),
-            workspace_files: Some(workspace_files),
-            branch_path: &[],
-            source_selection: None,
-        }
+        Self::for_seed_files_with_branch_path(seed_files, workspace_files, &[])
     }
 
     /// Enumerate one seed file while retaining the authored union branch path.
@@ -88,6 +91,7 @@ impl<'a> CodeQueryExecutionScope<'a> {
             workspace_files: Some(workspace_files),
             branch_path,
             source_selection: None,
+            shared_call_target_outcomes: None,
         }
     }
 
@@ -106,26 +110,49 @@ impl<'a> CodeQueryExecutionScope<'a> {
                 suffix_steps,
                 source_rows,
             }),
+            shared_call_target_outcomes: None,
         }
     }
 
+    /// Attach the policy compilation's call-target cache when it has an
+    /// attested workspace authority.
+    #[doc(hidden)]
+    pub fn with_optional_shared_call_target_outcomes(
+        mut self,
+        outcomes: Option<&crate::analyzer::usages::call_relations::CallTargetOutcomeCache>,
+    ) -> Self {
+        self.shared_call_target_outcomes = outcomes.cloned();
+        self
+    }
+
+    pub(super) fn with_shared_call_target_outcomes_from(mut self, source: &Self) -> Self {
+        self.shared_call_target_outcomes = source.shared_call_target_outcomes.clone();
+        self
+    }
+
     /// The exact files seed enumeration is restricted to, if any.
-    pub const fn seed_files(self) -> Option<&'a [ProjectFile]> {
+    pub const fn seed_files(&self) -> Option<&'a [ProjectFile]> {
         self.seed_files
     }
 
     /// The whole-workspace enumeration, if the caller already computed it.
-    pub(super) const fn workspace_files(self) -> Option<&'a [ProjectFile]> {
+    pub(super) const fn workspace_files(&self) -> Option<&'a [ProjectFile]> {
         self.workspace_files
     }
 
     /// The authored branch path for a narrowed union leaf.
-    pub(super) const fn branch_path(self) -> &'a [usize] {
+    pub(super) const fn branch_path(&self) -> &'a [usize] {
         self.branch_path
     }
 
-    pub(super) const fn source_selection(self) -> Option<CodeQuerySourceSelection<'a>> {
+    pub(super) const fn source_selection(&self) -> Option<CodeQuerySourceSelection<'a>> {
         self.source_selection
+    }
+
+    pub(super) fn shared_call_target_outcomes(
+        &self,
+    ) -> Option<&crate::analyzer::usages::call_relations::CallTargetOutcomeCache> {
+        self.shared_call_target_outcomes.as_ref()
     }
 }
 
@@ -213,7 +240,8 @@ fn execute_seed_union_unit(
                 .workspace_files()
                 .expect("a seed-union unit requires whole-workspace files"),
             &branch_path,
-        );
+        )
+        .with_shared_call_target_outcomes_from(&scope);
         let detailed = execute_detailed_unit(
             analyzer,
             workspace,
@@ -365,10 +393,7 @@ fn execute_detailed_selector_unit(
     );
     let query_scope = AnalyzerQueryScope::new(workspace.analyzer());
     let token = query_scope.token();
-    let access_mode = match benchmark_structural_access_mode() {
-        StructuralAccessMode::ScanOnly => StructuralAccessMode::ScanOnly,
-        _ => StructuralAccessMode::EagerAuto,
-    };
+    let access_mode = super::eager_structural_access_mode();
     execute_internal_with_analysis_strategy(
         workspace.analyzer(),
         token,
@@ -384,7 +409,7 @@ fn execute_detailed_selector_unit(
         UnionExecutionStrategy::Auto,
         CODE_QUERY_SCHEDULER_WORKERS,
         access_mode,
-        OccurrenceDerivationOptions::ROWS_ONLY,
+        OccurrenceDerivationOptions::IDENTITY_ONLY,
         Some(SemanticQueryContinuation {
             parent_scope,
             child_semantic_limits: parent_semantic.remaining(),
@@ -410,10 +435,7 @@ fn execute_detailed_unit(
 ) -> DetailedCodeQueryResult {
     let query_scope = AnalyzerQueryScope::new(analyzer);
     let token = query_scope.token();
-    let access_mode = match benchmark_structural_access_mode() {
-        StructuralAccessMode::ScanOnly => StructuralAccessMode::ScanOnly,
-        _ => StructuralAccessMode::EagerAuto,
-    };
+    let access_mode = super::eager_structural_access_mode();
     execute_internal_with_analysis_strategy(
         analyzer,
         token,
@@ -429,7 +451,7 @@ fn execute_detailed_unit(
         UnionExecutionStrategy::Auto,
         CODE_QUERY_SCHEDULER_WORKERS,
         access_mode,
-        OccurrenceDerivationOptions::ROWS_ONLY,
+        OccurrenceDerivationOptions::IDENTITY_ONLY,
         None,
         None,
         scope,
@@ -488,6 +510,15 @@ impl UnitRowKeyBuilder {
         self
     }
 
+    /// Another family's complete key, length-prefixed so two nested keys
+    /// cannot run into each other.
+    fn nested(mut self, inner: UnitRowKey) -> Self {
+        self.parts.push(inner.arm);
+        self.parts.push(Box::from(inner.parts.len().to_string()));
+        self.parts.extend(inner.parts);
+        self
+    }
+
     /// A component whose only rendering is its variant name.
     ///
     /// Used exclusively for field-less enumerations, whose `Debug` output is
@@ -541,7 +572,7 @@ impl UnitRowKeyBuilder {
     }
 
     fn call_site_value(self, value: &CallSiteValue) -> Self {
-        let CallSiteValue(site, binding) = value;
+        let CallSiteValue(site, binding, site_id, _, _, _) = value;
         // A call site is identified by the exact call expression it covers and
         // the two declarations it connects. The argument rows the pipeline key
         // also holds are derived from that same expression, so they cannot
@@ -549,6 +580,7 @@ impl UnitRowKeyBuilder {
         self.path(&site.file)
             .range(site.range)
             .range(site.callee_range)
+            .text(site_id)
             .declaration(&site.caller)
             .declaration(&site.callee)
             .variant(site.kind)
@@ -577,16 +609,58 @@ impl UnitRowKeyBuilder {
 /// key that silently equals another family's.
 pub(super) fn unit_row_key(key_value: &PipelineKey) -> UnitRowKey {
     match key_value {
-        PipelineKey::StructuralMatch(file, node) => {
-            key("structural_match").path(file).number(node).finish()
-        }
+        PipelineKey::StructuralMatch(file, node, reported_range) => key("structural_match")
+            .path(file)
+            .number(node)
+            .optional(reported_range.map(|range| {
+                format!(
+                    "{}:{}:{}:{}",
+                    range.start_byte, range.end_byte, range.start_line, range.end_line
+                )
+            }))
+            .finish(),
         PipelineKey::Declaration(value) => key("declaration").declaration_value(value).finish(),
         PipelineKey::Semantic(value) => semantic_unit_row_key(value),
         PipelineKey::File(file) => key("file").path(file).finish(),
+        PipelineKey::DependencyEvidence(id) => key("dependency_evidence").text(id).finish(),
         PipelineKey::ConfigurationFact(value) => key("configuration_fact")
             .path(&value.file)
             .number(value.fact_index)
             .finish(),
+        PipelineKey::CrossDomain(value) => {
+            let fact_key = |fact: &ConfigurationFactKey| {
+                unit_row_key(&PipelineKey::ConfigurationFact(fact.clone()))
+            };
+            match value.as_ref() {
+                CrossDomainKey::DependencyConfiguration(code, mapping) => key("cross_domain")
+                    .text("dependency_configuration")
+                    .nested(unit_row_key(code))
+                    .text(mapping)
+                    .finish(),
+                CrossDomainKey::Correlated(code, fact) => key("cross_domain")
+                    .text("correlated")
+                    .nested(unit_row_key(code))
+                    .nested(fact_key(fact))
+                    .finish(),
+                CrossDomainKey::ConfigurationCode(code, fact) => key("cross_domain")
+                    .text("configuration_code")
+                    .nested(unit_row_key(code))
+                    .nested(fact_key(fact))
+                    .finish(),
+                CrossDomainKey::ConfigurationCodeAbsent(fact) => key("cross_domain")
+                    .text("configuration_code_absent")
+                    .nested(fact_key(fact))
+                    .finish(),
+                CrossDomainKey::CodeWitness(code) => key("cross_domain")
+                    .text("code")
+                    .nested(unit_row_key(code))
+                    .finish(),
+                CrossDomainKey::ConfigurationWitness(fact) => key("cross_domain")
+                    .text("configuration")
+                    .nested(fact_key(fact))
+                    .finish(),
+            }
+        }
         PipelineKey::ReferenceSite(site) => key("reference_site")
             .path(&site.file)
             .range(site.range)
@@ -625,6 +699,7 @@ pub(super) fn unit_row_key(key_value: &PipelineKey) -> UnitRowKey {
             .finish(),
         PipelineKey::ReceiverOutcome(id) => key("receiver_outcome").text(id).finish(),
         PipelineKey::ReceiverEvidence(id) => key("receiver_evidence").text(id).finish(),
+        PipelineKey::PointsToCandidate(id) => key("points_to_candidate").text(id).finish(),
         PipelineKey::FieldWriteValue(id) => key("field_write_value").text(id).finish(),
         PipelineKey::RuntimeKeyedReadValue(id) => key("keyed_read_value").text(id).finish(),
         PipelineKey::CallShape(id) => key("call_shape").text(id).finish(),
@@ -634,6 +709,7 @@ pub(super) fn unit_row_key(key_value: &PipelineKey) -> UnitRowKey {
         PipelineKey::CallEffect(id) => key("call_effect").text(id).finish(),
         PipelineKey::CallResultContract(id) => key("call_result_contract").text(id).finish(),
         PipelineKey::CallResultObligation(id) => key("call_result_obligation").text(id).finish(),
+        PipelineKey::PythonRuleFact(id) => key("python_rule_fact").text(id).finish(),
         PipelineKey::ResultSubjectUse(id) => key("result_subject_use").text(id).finish(),
         PipelineKey::ResultContractUse(id) => key("result_contract_use").text(id).finish(),
         PipelineKey::ResultContractFailureUse(id) => {
@@ -645,6 +721,8 @@ pub(super) fn unit_row_key(key_value: &PipelineKey) -> UnitRowKey {
         PipelineKey::DetachedTaskTransfer(id) => key("detached_task_transfer").text(id).finish(),
         PipelineKey::ProcedureEffect(id) => key("procedure_effect").text(id).finish(),
         PipelineKey::CallableSignature(id) => key("callable_signature").text(id).finish(),
+        PipelineKey::LiteralOccurrence(id) => key("literal_occurrence").text(id).finish(),
+        PipelineKey::CallableMetrics(id) => key("callable_metrics").text(id).finish(),
         PipelineKey::SignatureParameter(id) => key("signature_parameter").text(id).finish(),
         PipelineKey::DecoratedParameter(id) => key("decorated_parameter").text(id).finish(),
         PipelineKey::CallableApplicability(id) => key("callable_applicability").text(id).finish(),
@@ -654,6 +732,7 @@ pub(super) fn unit_row_key(key_value: &PipelineKey) -> UnitRowKey {
         PipelineKey::DispatchTarget(id) => key("dispatch_target").text(id).finish(),
         PipelineKey::MemberFamily(id) => key("member_family").text(id).finish(),
         PipelineKey::MemberFamilyEdge(id) => key("member_family_edge").text(id).finish(),
+        PipelineKey::PythonHierarchyFact(id) => key("python_hierarchy_fact").text(id).finish(),
         PipelineKey::Occurrence(occurrence) => key("occurrence")
             .path(&occurrence.file)
             .number(occurrence.node)
@@ -711,6 +790,9 @@ pub(super) fn unit_row_key(key_value: &PipelineKey) -> UnitRowKey {
             .text(&event.procedure)
             .number(event.event)
             .finish(),
+        PipelineKey::BindingInitializerCall(id) => {
+            key("binding_initializer_call").text(id).finish()
+        }
         PipelineKey::FlowRelation(relation) => key("flow_relation")
             .path(&relation.file)
             .text(&relation.procedure)
@@ -722,8 +804,10 @@ pub(super) fn unit_row_key(key_value: &PipelineKey) -> UnitRowKey {
             .finish(),
         PipelineKey::BranchRelation(id) => key("branch_relation").text(id).finish(),
         PipelineKey::LoopRelation(id) => key("loop_relation").text(id).finish(),
+        PipelineKey::CppExpression(id) => key("cpp_expression").text(id).finish(),
         PipelineKey::FailureHandlerState(id) => key("failure_handler_state").text(id).finish(),
         PipelineKey::StatementReachability(id) => key("statement_reachability").text(id).finish(),
+        PipelineKey::PendingCleanupFlow(id) => key("pending_cleanup_flow").text(id).finish(),
         PipelineKey::Guard(guard) => key("guard")
             .text(&guard.procedure)
             .number(guard.guard.index())
@@ -731,9 +815,6 @@ pub(super) fn unit_row_key(key_value: &PipelineKey) -> UnitRowKey {
         PipelineKey::SourceSet(entity) => key("source_set").text(&entity.id).finish(),
         PipelineKey::BuildTarget(entity) => key("build_target").text(&entity.id).finish(),
         PipelineKey::TopologyEdge(edge) => key("topology_edge").text(&edge.id).finish(),
-        PipelineKey::ConcurrentAccessConflict(id) => {
-            key("concurrent_access_conflict").text(id).finish()
-        }
         PipelineKey::ClassSetRow(id) => key("class_set_row").text(id).finish(),
         PipelineKey::AbsentMemberFinding(id) => key("absent_member_finding").text(id).finish(),
         PipelineKey::RewritePath(path) => key("rewrite_path")
@@ -781,6 +862,9 @@ fn semantic_unit_row_key(key_value: &SemanticPipelineKey) -> UnitRowKey {
             key("semantic_absent_member_witness").text(id).finish()
         }
         SemanticPipelineKey::TaintFinding(id) => key("semantic_taint_finding").text(id).finish(),
+        SemanticPipelineKey::RustPointerFinding(id) => {
+            key("semantic_rust_pointer_finding").text(id).finish()
+        }
     }
 }
 
@@ -858,17 +942,68 @@ pub struct UnitRowIdentityCandidate {
     pub candidate: CodeQueryStableOwnerCandidate,
 }
 
+fn project_provenance_ref_fields(
+    domain: DetailedCodeQueryDomain,
+    key: &DetailedCodeQueryKey,
+    file: &ProjectFile,
+    byte_span: &Option<std::ops::Range<usize>>,
+    display_range: Option<CodeQueryRange>,
+    identities: &DetailedCodeQueryProvenanceIdentities,
+    source_slice_sha256: Option<[u8; 32]>,
+) -> UnitRowProvenanceRef {
+    UnitRowProvenanceRef {
+        domain,
+        key: key.clone(),
+        rel_path: Box::from(rel_path_string(file).as_str()),
+        byte_span: byte_span.clone(),
+        display_range,
+        identities: UnitRowIdentities::project(identities),
+        source_slice_sha256,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn detailed_provenance_ref_fields(
+    domain: DetailedCodeQueryDomain,
+    key: &DetailedCodeQueryKey,
+    rel_path: &str,
+    byte_span: &Option<std::ops::Range<usize>>,
+    display_range: Option<CodeQueryRange>,
+    identities: &UnitRowIdentities,
+    source_slice_sha256: Option<[u8; 32]>,
+    root: &Path,
+) -> DetailedCodeQueryProvenanceRefEvidence {
+    DetailedCodeQueryProvenanceRefEvidence {
+        domain,
+        key: key.clone(),
+        file: ProjectFile::new(root, Path::new(rel_path)),
+        byte_span: byte_span.clone(),
+        display_range,
+        identities: identities.clone().into_detailed(root),
+        source_slice_sha256,
+    }
+}
+
 impl UnitRowEvidence {
     /// Project one execution's evidence row.
     pub fn project(evidence: &DetailedCodeQueryEvidence) -> Self {
+        let reference = project_provenance_ref_fields(
+            evidence.domain,
+            &evidence.key,
+            &evidence.file,
+            &evidence.byte_span,
+            None,
+            &evidence.identities,
+            evidence.source_slice_sha256,
+        );
         Self {
-            domain: evidence.domain,
-            key: evidence.key.clone(),
-            rel_path: Box::from(rel_path_string(&evidence.file).as_str()),
-            byte_span: evidence.byte_span.clone(),
+            domain: reference.domain,
+            key: reference.key,
+            rel_path: reference.rel_path,
+            byte_span: reference.byte_span,
             stable_owner_candidate: evidence.stable_owner_candidate.clone(),
-            identities: UnitRowIdentities::project(&evidence.identities),
-            source_slice_sha256: evidence.source_slice_sha256,
+            identities: reference.identities,
+            source_slice_sha256: reference.source_slice_sha256,
             provenance: evidence
                 .provenance
                 .iter()
@@ -882,15 +1017,25 @@ impl UnitRowEvidence {
     /// `decorated_parameter` is always `None`: a plan whose rows need it is
     /// never partitioned, so no unit row ever carried one to lose.
     pub fn to_detailed(&self, root: &Path, result_index: usize) -> DetailedCodeQueryEvidence {
+        let reference = detailed_provenance_ref_fields(
+            self.domain,
+            &self.key,
+            &self.rel_path,
+            &self.byte_span,
+            None,
+            &self.identities,
+            self.source_slice_sha256,
+            root,
+        );
         DetailedCodeQueryEvidence {
             result_index,
-            domain: self.domain,
-            key: self.key.clone(),
-            file: ProjectFile::new(root, Path::new(self.rel_path.as_ref())),
-            byte_span: self.byte_span.clone(),
+            domain: reference.domain,
+            key: reference.key,
+            file: reference.file,
+            byte_span: reference.byte_span,
             stable_owner_candidate: self.stable_owner_candidate.clone(),
-            identities: self.identities.clone().into_detailed(root),
-            source_slice_sha256: self.source_slice_sha256,
+            identities: reference.identities,
+            source_slice_sha256: reference.source_slice_sha256,
             provenance: self
                 .provenance
                 .iter()
@@ -905,18 +1050,21 @@ impl UnitRowEvidence {
 impl UnitRowProvenance {
     /// Project one execution's provenance trace.
     pub fn project(provenance: &DetailedCodeQueryProvenanceEvidence) -> Self {
+        let (branch, seed, steps) = project_provenance_trace(
+            &provenance.branch,
+            &provenance.seed,
+            provenance.steps.iter(),
+            UnitRowProvenanceRef::project,
+            |step| UnitRowProvenanceStep {
+                op: step.op.clone(),
+                result: UnitRowProvenanceRef::project(&step.result),
+                via: step.via.as_ref().map(UnitRowProvenanceRef::project),
+            },
+        );
         Self {
-            branch: provenance.branch.clone(),
-            seed: UnitRowProvenanceRef::project(&provenance.seed),
-            steps: provenance
-                .steps
-                .iter()
-                .map(|step| UnitRowProvenanceStep {
-                    op: step.op.clone(),
-                    result: UnitRowProvenanceRef::project(&step.result),
-                    via: step.via.as_ref().map(UnitRowProvenanceRef::project),
-                })
-                .collect(),
+            branch,
+            seed,
+            steps,
         }
     }
 
@@ -937,29 +1085,44 @@ impl UnitRowProvenance {
     }
 }
 
+fn project_provenance_trace<Seed, Step, ProjectedSeed, ProjectedStep>(
+    branch: &[usize],
+    seed: &Seed,
+    steps: impl Iterator<Item = Step>,
+    project_seed: impl Fn(&Seed) -> ProjectedSeed,
+    project_step: impl FnMut(Step) -> ProjectedStep,
+) -> (Vec<usize>, ProjectedSeed, Vec<ProjectedStep>) {
+    (
+        branch.to_vec(),
+        project_seed(seed),
+        steps.map(project_step).collect(),
+    )
+}
+
 impl UnitRowProvenanceRef {
     fn project(reference: &DetailedCodeQueryProvenanceRefEvidence) -> Self {
-        Self {
-            domain: reference.domain,
-            key: reference.key.clone(),
-            rel_path: Box::from(rel_path_string(&reference.file).as_str()),
-            byte_span: reference.byte_span.clone(),
-            display_range: reference.display_range,
-            identities: UnitRowIdentities::project(&reference.identities),
-            source_slice_sha256: reference.source_slice_sha256,
-        }
+        project_provenance_ref_fields(
+            reference.domain,
+            &reference.key,
+            &reference.file,
+            &reference.byte_span,
+            reference.display_range,
+            &reference.identities,
+            reference.source_slice_sha256,
+        )
     }
 
     fn to_detailed(&self, root: &Path) -> DetailedCodeQueryProvenanceRefEvidence {
-        DetailedCodeQueryProvenanceRefEvidence {
-            domain: self.domain,
-            key: self.key.clone(),
-            file: ProjectFile::new(root, Path::new(self.rel_path.as_ref())),
-            byte_span: self.byte_span.clone(),
-            display_range: self.display_range,
-            identities: self.identities.clone().into_detailed(root),
-            source_slice_sha256: self.source_slice_sha256,
-        }
+        detailed_provenance_ref_fields(
+            self.domain,
+            &self.key,
+            &self.rel_path,
+            &self.byte_span,
+            self.display_range,
+            &self.identities,
+            self.source_slice_sha256,
+            root,
+        )
     }
 }
 
@@ -1205,6 +1368,7 @@ pub enum UnitRowScalar {
     StableId(Box<str>),
     String(Box<str>),
     StringList(Vec<String>),
+    IntegerList(Vec<u64>),
     Integer(u64),
     Boolean(bool),
     ConstrainedEnum(Box<str>),
@@ -1217,6 +1381,7 @@ impl UnitRowScalar {
             CodeQueryRowScalarRef::StableId(value) => Self::StableId(boxed(value)),
             CodeQueryRowScalarRef::String(value) => Self::String(boxed(value)),
             CodeQueryRowScalarRef::StringList(value) => Self::StringList(value.to_vec()),
+            CodeQueryRowScalarRef::IntegerList(value) => Self::IntegerList(value.to_vec()),
             CodeQueryRowScalarRef::Integer(value) => Self::Integer(value),
             CodeQueryRowScalarRef::Boolean(value) => Self::Boolean(value),
             CodeQueryRowScalarRef::ConstrainedEnum(value) => Self::ConstrainedEnum(boxed(value)),
@@ -1231,6 +1396,7 @@ impl UnitRowScalar {
             Self::StableId(value) => CodeQueryRowScalarRef::StableId(value),
             Self::String(value) => CodeQueryRowScalarRef::String(value),
             Self::StringList(value) => CodeQueryRowScalarRef::StringList(value),
+            Self::IntegerList(value) => CodeQueryRowScalarRef::IntegerList(value),
             Self::Integer(value) => CodeQueryRowScalarRef::Integer(*value),
             Self::Boolean(value) => CodeQueryRowScalarRef::Boolean(*value),
             Self::ConstrainedEnum(value) => CodeQueryRowScalarRef::ConstrainedEnum(value),
@@ -1244,13 +1410,28 @@ impl UnitRowScalar {
 ///
 /// `SourcePosition` is the shared case: a row whose presentation is decided by
 /// its domain, path and range alone, and which no terminal result shape names.
-/// An analysis-only row has no terminal at all: those domains are refused by
-/// the match adapter before any field of theirs is read, so the projection
-/// carries none (`UnitRowItem::terminal` is `None`).
+/// An analysis-only row gets a source-position terminal only when it has an
+/// exact display range; the policy adapter also verifies its paired evidence
+/// before using that range as a finding anchor.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "terminal_kind", rename_all = "snake_case")]
 pub enum UnitRowItemTerminal {
     SourcePosition,
+    GenerationSite {
+        id: Box<str>,
+        ast_id: Option<Box<str>>,
+        kind: Box<str>,
+    },
+    /// A cross-domain row (#3284). The row itself is anchored at its code
+    /// row (or at the configuration fact of a configuration witness); the
+    /// configuration fact's own exact anchor travels here so a correlated
+    /// finding keeps both sides' evidence.
+    CrossDomain {
+        operator: Box<str>,
+        domain: Box<str>,
+        configuration: Option<UnitRowConfigurationAnchor>,
+        dependency_mitigation: Option<Box<UnitRowDependencyMitigation>>,
+    },
     StructuralMatch {
         kind: Box<str>,
         /// The matched node's own range, which is where an assertion subject
@@ -1264,6 +1445,19 @@ pub enum UnitRowItemTerminal {
     Declaration {
         kind: Box<str>,
         fq_name: Box<str>,
+    },
+    Binding {
+        id: Box<str>,
+        ast_id: Option<Box<str>>,
+        name: Box<str>,
+        kind: Box<str>,
+    },
+    Occurrence {
+        id: Box<str>,
+        ast_id: Box<str>,
+        class: Box<str>,
+        role: Box<str>,
+        namespace: Box<str>,
     },
     File,
     ReferenceSite {
@@ -1307,6 +1501,12 @@ pub enum UnitRowItemTerminal {
     },
     CallResult {
         proof: Box<str>,
+    },
+    /// A call-effect row selected from a structural seed. It keeps the
+    /// effect-domain terminal distinct while exposing the seed captures to
+    /// assertion policies that join loop/input evidence after filtering.
+    CallEffect {
+        captures: Vec<UnitRowCapture>,
     },
     ResultSubjectUse {
         proof: Box<str>,
@@ -1355,6 +1555,28 @@ impl UnitRowCapture {
     }
 }
 
+/// The exact anchor of the configuration fact a cross-domain row carries.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct UnitRowConfigurationAnchor {
+    pub path: Box<str>,
+    pub start_byte: usize,
+    pub end_byte: usize,
+    pub range: CodeQueryRange,
+}
+
+/// Query-lifetime/persisted unit projection of the dependency relation proof.
+/// This carries explicit reviewed mapping and bounded effective-file evidence,
+/// never a runtime safety assertion.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct UnitRowDependencyMitigation {
+    pub dependency_id: String,
+    pub owner: String,
+    pub mapping_id: String,
+    pub mitigated: bool,
+    pub effective: Option<serde_json::Value>,
+    pub contributors: Vec<UnitRowConfigurationAnchor>,
+}
+
 /// Borrow a public row string as the projection's owned form.
 fn boxed(value: &str) -> Box<str> {
     Box::from(value)
@@ -1374,7 +1596,25 @@ impl UnitRowItemTerminal {
                 kind: boxed(value.kind),
                 fq_name: boxed(&value.fq_name),
             },
+            CodeQueryResultValue::Binding { value } => UnitRowItemTerminal::Binding {
+                id: boxed(&value.id),
+                ast_id: value.ast_id.as_deref().map(boxed),
+                name: boxed(&value.name),
+                kind: boxed(value.kind),
+            },
+            CodeQueryResultValue::Occurrence { value } => UnitRowItemTerminal::Occurrence {
+                id: boxed(&value.id),
+                ast_id: boxed(&value.ast_id),
+                class: boxed(value.class),
+                role: boxed(value.role),
+                namespace: boxed(value.namespace),
+            },
             CodeQueryResultValue::File { .. } => UnitRowItemTerminal::File,
+            CodeQueryResultValue::GenerationSite { value } => UnitRowItemTerminal::GenerationSite {
+                id: boxed(&value.id),
+                ast_id: value.ast_id.as_deref().map(boxed),
+                kind: boxed(value.kind),
+            },
             CodeQueryResultValue::ReferenceSite { value } => UnitRowItemTerminal::ReferenceSite {
                 proof: boxed(value.proof),
                 target_fq_name: boxed(&value.target.fq_name),
@@ -1426,6 +1666,14 @@ impl UnitRowItemTerminal {
             CodeQueryResultValue::CallResult { value } => UnitRowItemTerminal::CallResult {
                 proof: boxed(value.proof),
             },
+            CodeQueryResultValue::CallEffect { value } => {
+                if value.captures.is_empty() {
+                    return None;
+                }
+                UnitRowItemTerminal::CallEffect {
+                    captures: value.captures.iter().map(UnitRowCapture::project).collect(),
+                }
+            }
             CodeQueryResultValue::ResultSubjectUse { value } => {
                 UnitRowItemTerminal::ResultSubjectUse {
                     proof: boxed(value.proof),
@@ -1449,19 +1697,21 @@ impl UnitRowItemTerminal {
                         .collect(),
                 }
             }
-            CodeQueryResultValue::Occurrence { .. }
-            | CodeQueryResultValue::LexicalScope { .. }
-            | CodeQueryResultValue::Binding { .. }
+            CodeQueryResultValue::LexicalScope { .. }
             | CodeQueryResultValue::ResolutionCandidate { .. }
-            | CodeQueryResultValue::GenerationSite { .. }
             | CodeQueryResultValue::StateEvent { .. }
+            | CodeQueryResultValue::BindingInitializerCall { .. }
             | CodeQueryResultValue::RewritePath { .. }
             | CodeQueryResultValue::FlowRelation { .. }
             | CodeQueryResultValue::ControlRelation { .. }
             | CodeQueryResultValue::BranchRelation { .. }
+            | CodeQueryResultValue::CppExpression { .. }
             | CodeQueryResultValue::LoopRelation { .. }
             | CodeQueryResultValue::FailureHandlerState { .. }
             | CodeQueryResultValue::StatementReachability { .. }
+            | CodeQueryResultValue::PendingCleanupFlow { .. }
+            | CodeQueryResultValue::PythonRuleFact { .. }
+            | CodeQueryResultValue::RustPointerFinding { .. }
             | CodeQueryResultValue::Guard { .. }
             | CodeQueryResultValue::ReferenceEdge { .. }
             | CodeQueryResultValue::QualifiedPath { .. }
@@ -1471,7 +1721,54 @@ impl UnitRowItemTerminal {
             | CodeQueryResultValue::SourceSet { .. }
             | CodeQueryResultValue::BuildTarget { .. }
             | CodeQueryResultValue::TopologyEdge { .. }
-            | CodeQueryResultValue::ConfigurationFact { .. } => UnitRowItemTerminal::SourcePosition,
+            | CodeQueryResultValue::DependencyEvidence { .. }
+            | CodeQueryResultValue::ConfigurationFact { .. }
+            | CodeQueryResultValue::PythonHierarchyFact { .. } => {
+                UnitRowItemTerminal::SourcePosition
+            }
+            CodeQueryResultValue::CrossDomain { value } => UnitRowItemTerminal::CrossDomain {
+                operator: boxed(value.operator),
+                domain: boxed(value.domain),
+                dependency_mitigation: value.mitigated.map(|mitigated| {
+                    Box::new(UnitRowDependencyMitigation {
+                        dependency_id: value
+                            .dependency_id
+                            .clone()
+                            .expect("dependency mitigation witnesses carry dependency identity"),
+                        owner: value
+                            .owner
+                            .clone()
+                            .expect("dependency mitigation witnesses carry owner mapping"),
+                        mapping_id: value
+                            .mapping_id
+                            .clone()
+                            .expect("dependency mitigation witnesses carry mapping identity"),
+                        mitigated,
+                        effective: value.effective_configuration.as_ref().map(|effective| {
+                            serde_json::to_value(effective)
+                                .expect("canonical effective configuration serializes")
+                        }),
+                        contributors: value
+                            .configuration_contributors
+                            .iter()
+                            .map(|fact| UnitRowConfigurationAnchor {
+                                path: boxed(&fact.path),
+                                start_byte: fact.start_byte,
+                                end_byte: fact.end_byte,
+                                range: fact.range,
+                            })
+                            .collect(),
+                    })
+                }),
+                configuration: value.configuration.as_ref().map(|configuration| {
+                    UnitRowConfigurationAnchor {
+                        path: boxed(&configuration.path),
+                        start_byte: configuration.start_byte,
+                        end_byte: configuration.end_byte,
+                        range: configuration.range,
+                    }
+                }),
+            },
             CodeQueryResultValue::Procedure { .. }
             | CodeQueryResultValue::ProgramPoint { .. }
             | CodeQueryResultValue::ControlEdge { .. }
@@ -1481,17 +1778,16 @@ impl UnitRowItemTerminal {
             | CodeQueryResultValue::FlowWitness { .. }
             | CodeQueryResultValue::AbsentMemberWitness { .. }
             | CodeQueryResultValue::TaintFinding { .. }
-            | CodeQueryResultValue::ConcurrentAccessConflict { .. }
             | CodeQueryResultValue::ClassSetRow { .. }
             | CodeQueryResultValue::ReceiverAnalysis { .. }
             | CodeQueryResultValue::MemberTargetAnalysis { .. }
             | CodeQueryResultValue::ReceiverOutcome { .. }
             | CodeQueryResultValue::ReceiverEvidence { .. }
+            | CodeQueryResultValue::PointsToCandidate { .. }
             | CodeQueryResultValue::CallShape { .. }
             | CodeQueryResultValue::CallArgumentGroup { .. }
             | CodeQueryResultValue::CallArgument { .. }
             | CodeQueryResultValue::CallBinding { .. }
-            | CodeQueryResultValue::CallEffect { .. }
             | CodeQueryResultValue::CallResultContract { .. }
             | CodeQueryResultValue::CallResultObligation { .. }
             | CodeQueryResultValue::ResultContractUse { .. }
@@ -1502,6 +1798,8 @@ impl UnitRowItemTerminal {
             | CodeQueryResultValue::DetachedTaskTransfer { .. }
             | CodeQueryResultValue::ProcedureEffect { .. }
             | CodeQueryResultValue::CallableSignature { .. }
+            | CodeQueryResultValue::LiteralOccurrence { .. }
+            | CodeQueryResultValue::CallableMetrics { .. }
             | CodeQueryResultValue::SignatureParameter { .. }
             | CodeQueryResultValue::CallableApplicability { .. }
             | CodeQueryResultValue::OverloadSelection { .. }
@@ -1510,7 +1808,13 @@ impl UnitRowItemTerminal {
             | CodeQueryResultValue::DispatchOutcome { .. }
             | CodeQueryResultValue::DispatchTarget { .. }
             | CodeQueryResultValue::MemberFamily { .. }
-            | CodeQueryResultValue::MemberFamilyEdge { .. } => return None,
+            | CodeQueryResultValue::MemberFamilyEdge { .. } => {
+                if value.display_range().is_some() {
+                    UnitRowItemTerminal::SourcePosition
+                } else {
+                    return None;
+                }
+            }
         };
         Some(terminal)
     }
@@ -1541,20 +1845,26 @@ fn row_path(value: &CodeQueryResultValue) -> &str {
         CodeQueryResultValue::ResolutionCandidate { value } => &value.path,
         CodeQueryResultValue::GenerationSite { value } => &value.path,
         CodeQueryResultValue::StateEvent { value } => &value.path,
+        CodeQueryResultValue::BindingInitializerCall { value } => &value.path,
         CodeQueryResultValue::RewritePath { value } => &value.path,
         CodeQueryResultValue::FlowRelation { value } => &value.path,
         CodeQueryResultValue::ControlRelation { value } => &value.path,
         CodeQueryResultValue::BranchRelation { value } => &value.path,
+        CodeQueryResultValue::CppExpression { value } => &value.path,
         CodeQueryResultValue::LoopRelation { value } => &value.path,
         CodeQueryResultValue::FailureHandlerState { value } => &value.path,
         CodeQueryResultValue::StatementReachability { value } => &value.path,
+        CodeQueryResultValue::PendingCleanupFlow { value } => &value.path,
+        CodeQueryResultValue::PythonRuleFact { value } => &value.path,
         CodeQueryResultValue::Guard { value } => &value.path,
         CodeQueryResultValue::ReferenceEdge { value } => &value.path,
         CodeQueryResultValue::QualifiedPath { value } => &value.path,
         CodeQueryResultValue::Export { value } => &value.path,
         CodeQueryResultValue::DeclarationState { value } => &value.path,
         CodeQueryResultValue::PathSegment { value } => &value.path,
+        CodeQueryResultValue::DependencyEvidence { value } => &value.path,
         CodeQueryResultValue::ConfigurationFact { value } => &value.path,
+        CodeQueryResultValue::CrossDomain { value } => &value.path,
         CodeQueryResultValue::SourceSet { value } => &value.build_file,
         CodeQueryResultValue::BuildTarget { value } => &value.build_file,
         CodeQueryResultValue::TopologyEdge { value } => &value.build_file,
@@ -1567,13 +1877,14 @@ fn row_path(value: &CodeQueryResultValue) -> &str {
         CodeQueryResultValue::FlowWitness { value } => &value.path,
         CodeQueryResultValue::AbsentMemberWitness { value } => &value.path,
         CodeQueryResultValue::TaintFinding { value } => &value.path,
-        CodeQueryResultValue::ConcurrentAccessConflict { value } => &value.path,
+        CodeQueryResultValue::RustPointerFinding { value } => &value.path,
         CodeQueryResultValue::ClassSetRow { value } => &value.file,
         CodeQueryResultValue::AbsentMemberFinding { value } => &value.file,
         CodeQueryResultValue::ReceiverAnalysis { value } => &value.path,
         CodeQueryResultValue::MemberTargetAnalysis { value } => &value.path,
         CodeQueryResultValue::ReceiverOutcome { value } => &value.path,
         CodeQueryResultValue::ReceiverEvidence { value } => &value.path,
+        CodeQueryResultValue::PointsToCandidate { value } => &value.path,
         CodeQueryResultValue::CallShape { value } => &value.path,
         CodeQueryResultValue::CallArgumentGroup { value } => &value.path,
         CodeQueryResultValue::CallArgument { value } => &value.path,
@@ -1590,6 +1901,8 @@ fn row_path(value: &CodeQueryResultValue) -> &str {
         CodeQueryResultValue::DetachedTaskTransfer { value } => &value.path,
         CodeQueryResultValue::ProcedureEffect { value } => &value.path,
         CodeQueryResultValue::CallableSignature { value } => &value.path,
+        CodeQueryResultValue::LiteralOccurrence { value } => &value.path,
+        CodeQueryResultValue::CallableMetrics { value } => &value.path,
         CodeQueryResultValue::SignatureParameter { value } => &value.path,
         CodeQueryResultValue::CallableApplicability { value } => &value.path,
         CodeQueryResultValue::OverloadSelection { value } => &value.path,
@@ -1599,6 +1912,7 @@ fn row_path(value: &CodeQueryResultValue) -> &str {
         CodeQueryResultValue::DispatchTarget { value } => &value.path,
         CodeQueryResultValue::MemberFamily { value } => &value.path,
         CodeQueryResultValue::MemberFamilyEdge { value } => &value.path,
+        CodeQueryResultValue::PythonHierarchyFact { value } => &value.path,
     }
 }
 
@@ -1639,12 +1953,39 @@ pub enum UnitRowItemRefValue {
         kind: Box<str>,
         node_range: Option<CodeQueryRange>,
     },
+    Binding {
+        id: Box<str>,
+        ast_id: Option<Box<str>>,
+        name: Box<str>,
+        kind: Box<str>,
+        range: CodeQueryRange,
+    },
+    LexicalScope {
+        id: Box<str>,
+        ast_id: Option<Box<str>>,
+        index: u32,
+        range: CodeQueryRange,
+    },
+    Occurrence {
+        id: Box<str>,
+        ast_id: Box<str>,
+        class: Box<str>,
+        role: Box<str>,
+        namespace: Box<str>,
+        range: CodeQueryRange,
+    },
     Declaration {
         kind: Box<str>,
         fq_name: Box<str>,
         node_range: Option<CodeQueryRange>,
     },
     File,
+    GenerationSite {
+        id: Box<str>,
+        ast_id: Option<Box<str>>,
+        kind: Box<str>,
+        range: CodeQueryRange,
+    },
     ReferenceSite {
         range: CodeQueryRange,
         target_fq_name: Box<str>,
@@ -1703,18 +2044,21 @@ pub enum UnitRowItemRefValue {
 
 impl UnitRowItemProvenance {
     fn project(provenance: &CodeQueryProvenance) -> Self {
+        let (branch, seed, steps) = project_provenance_trace(
+            &provenance.branch,
+            &provenance.seed,
+            provenance.steps.iter(),
+            UnitRowItemRef::project,
+            |step| UnitRowItemProvenanceStep {
+                op: boxed(step.op),
+                result: UnitRowItemRef::project(&step.result),
+                via: step.via.as_ref().map(UnitRowItemRef::project),
+            },
+        );
         Self {
-            branch: provenance.branch.clone(),
-            seed: UnitRowItemRef::project(&provenance.seed),
-            steps: provenance
-                .steps
-                .iter()
-                .map(|step| UnitRowItemProvenanceStep {
-                    op: boxed(step.op),
-                    result: UnitRowItemRef::project(&step.result),
-                    via: step.via.as_ref().map(UnitRowItemRef::project),
-                })
-                .collect(),
+            branch,
+            seed,
+            steps,
         }
     }
 }
@@ -1728,6 +2072,54 @@ impl UnitRowItemRef {
                 kind: boxed(kind),
                 node_range: *node_range,
             },
+            CodeQueryResultRef::PythonHierarchyFact {
+                range, fact_kind, ..
+            } => UnitRowItemRefValue::StructuralMatch {
+                kind: boxed(fact_kind),
+                node_range: Some(*range),
+            },
+            CodeQueryResultRef::Binding {
+                id,
+                ast_id,
+                name,
+                kind,
+                range,
+                ..
+            } => UnitRowItemRefValue::Binding {
+                id: boxed(id),
+                ast_id: ast_id.as_deref().map(boxed),
+                name: boxed(name),
+                kind: boxed(kind),
+                range: *range,
+            },
+            CodeQueryResultRef::LexicalScope {
+                id,
+                ast_id,
+                index,
+                range,
+                ..
+            } => UnitRowItemRefValue::LexicalScope {
+                id: boxed(id),
+                ast_id: ast_id.as_deref().map(boxed),
+                index: *index,
+                range: *range,
+            },
+            CodeQueryResultRef::Occurrence {
+                id,
+                ast_id,
+                class,
+                role,
+                namespace,
+                range,
+                ..
+            } => UnitRowItemRefValue::Occurrence {
+                id: boxed(id),
+                ast_id: boxed(ast_id),
+                class: boxed(class),
+                role: boxed(role),
+                namespace: boxed(namespace),
+                range: *range,
+            },
             CodeQueryResultRef::Declaration {
                 kind,
                 fq_name,
@@ -1739,6 +2131,18 @@ impl UnitRowItemRef {
                 node_range: *node_range,
             },
             CodeQueryResultRef::File { .. } => UnitRowItemRefValue::File,
+            CodeQueryResultRef::GenerationSite {
+                id,
+                ast_id,
+                range,
+                kind,
+                ..
+            } => UnitRowItemRefValue::GenerationSite {
+                id: boxed(id),
+                ast_id: ast_id.as_deref().map(boxed),
+                kind: boxed(kind),
+                range: *range,
+            },
             CodeQueryResultRef::ReferenceSite {
                 range,
                 target_fq_name,
@@ -1837,6 +2241,18 @@ impl UnitRowItemRef {
                 outcome: boxed(outcome),
                 capture: capture.as_deref().map(boxed),
             },
+            CodeQueryResultRef::PythonRuleFact {
+                range, relation, ..
+            } => UnitRowItemRefValue::StructuralMatch {
+                kind: boxed(relation),
+                node_range: Some(*range),
+            },
+            CodeQueryResultRef::RustPointerFinding {
+                range, relation, ..
+            } => UnitRowItemRefValue::StructuralMatch {
+                kind: boxed(relation),
+                node_range: Some(*range),
+            },
             CodeQueryResultRef::DecoratedParameter {
                 id,
                 parameter_id,
@@ -1847,6 +2263,12 @@ impl UnitRowItemRef {
                 parameter_id: boxed(parameter_id),
                 range: *range,
             },
+            CodeQueryResultRef::CppExpression { kind, range, .. } => {
+                UnitRowItemRefValue::StructuralMatch {
+                    kind: boxed(kind),
+                    node_range: Some(*range),
+                }
+            }
             _ => UnitRowItemRefValue::Unsupported,
         };
         Self {
@@ -2091,10 +2513,10 @@ pub fn structural_seed_file_order(left: &ProjectFile, right: &ProjectFile) -> st
 /// -- which languages it admits and which comparator its scanner sorts by --
 /// so they are stated here rather than restated by every caller.
 ///
-/// `files` is the analyzer's whole analyzed file set. Only the language filter
-/// is applied: a seed's `where` globs narrow the enumeration too, but the
-/// scanner applies them itself on every unit, and a unit that yields no row
-/// still records the reads that prove it yields none.
+/// `files` is the analyzer's whole analyzed file set. Language filters and the
+/// one recognized typed source constraint narrow enumeration: a seed's `where`
+/// globs narrow it too, but the scanner applies them itself on every unit, and
+/// a unit that yields no row still records the reads that prove it yields none.
 ///
 /// An eligible union enumerates the union of its leaf language filters and
 /// uses their common comparator. Other `Set` sources are [`Whole`] by
@@ -2108,8 +2530,8 @@ pub fn plan_seed_files(plan: &CodeQueryPlan, files: &[ProjectFile]) -> Vec<Proje
         let mut languages = Vec::new();
         let mut accepts_all_languages = false;
         let mut structural = None;
-        for (leaf, _) in leaves {
-            let (leaf_languages, leaf_structural) = seed_languages(&leaf);
+        for (leaf, _) in &leaves {
+            let (leaf_languages, leaf_structural) = seed_languages(leaf);
             structural.get_or_insert(leaf_structural);
             if leaf_languages.is_empty() {
                 accepts_all_languages = true;
@@ -2127,6 +2549,11 @@ pub fn plan_seed_files(plan: &CodeQueryPlan, files: &[ProjectFile]) -> Vec<Proje
                 accepts_all_languages
                     || languages.contains(&crate::analyzer::common::language_for_file(file))
             })
+            .filter(|file| {
+                leaves
+                    .iter()
+                    .any(|(leaf, _)| plan_accepts_seed_file(leaf, file))
+            })
             .cloned()
             .collect::<Vec<_>>();
         if structural.expect("an eligible union has at least one leaf") {
@@ -2140,8 +2567,9 @@ pub fn plan_seed_files(plan: &CodeQueryPlan, files: &[ProjectFile]) -> Vec<Proje
     let mut selected = files
         .iter()
         .filter(|file| {
-            languages.is_empty()
-                || languages.contains(&crate::analyzer::common::language_for_file(file))
+            (languages.is_empty()
+                || languages.contains(&crate::analyzer::common::language_for_file(file)))
+                && source_file_matches_constraint(file, source_enumeration_constraint(plan))
         })
         .cloned()
         .collect::<Vec<_>>();
@@ -2151,6 +2579,13 @@ pub fn plan_seed_files(plan: &CodeQueryPlan, files: &[ProjectFile]) -> Vec<Proje
         selected.sort_by(seed_file_order);
     }
     selected
+}
+
+fn plan_accepts_seed_file(plan: &CodeQueryPlan, file: &ProjectFile) -> bool {
+    let (languages, _) = seed_languages(plan);
+    let language = crate::analyzer::common::language_for_file(file);
+    (languages.is_empty() || languages.contains(&language))
+        && source_file_matches_constraint(file, source_enumeration_constraint(plan))
 }
 
 /// Return a seed's language filter and its seed-file comparator family.
@@ -2163,9 +2598,14 @@ fn seed_languages(plan: &CodeQueryPlan) -> (&[Language], bool) {
         CodeQueryPlanSource::Paths(seed) => (&seed.languages, false),
         CodeQueryPlanSource::GenerationSites(seed) => (&seed.languages, false),
         CodeQueryPlanSource::Exports(seed) => (&seed.languages, false),
-        CodeQueryPlanSource::ConfigurationFacts(_) => (&[], false),
+        CodeQueryPlanSource::DependencyEvidence(_) | CodeQueryPlanSource::ConfigurationFacts(_) => {
+            (&[], false)
+        }
         CodeQueryPlanSource::Set { .. } => {
             unreachable!("a union leaf has no set source")
+        }
+        CodeQueryPlanSource::Correlate(_) | CodeQueryPlanSource::RequireBoth(_) => {
+            unreachable!("cross-domain plans are whole and never union leaves")
         }
     }
 }

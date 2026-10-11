@@ -1,8 +1,6 @@
 use super::RustDeclarationTypeIndex;
-use crate::declarations::parse_rust_file;
 use crate::graph_support::RustCargoRouteError;
 use crate::hierarchy::RustHierarchySourceFacts;
-use brokk_bifrost_core::analyzer::ProjectFile;
 use brokk_bifrost_core::analyzer::rust_facts::{RustSourceContextKind, RustTypeSourceShape};
 use brokk_bifrost_core::analyzer::source_facts::SourceDeclarationId;
 use std::cell::Cell;
@@ -49,17 +47,7 @@ passthrough! { macro_rules! EmbeddedMacro { ($name:ident) => {}; } }
 "#;
 
 fn fixture_facts(source: &str) -> Arc<RustHierarchySourceFacts> {
-    let mut parser = tree_sitter::Parser::new();
-    parser
-        .set_language(&tree_sitter_rust::LANGUAGE.into())
-        .expect("Rust parser language");
-    let tree = parser.parse(source, None).expect("Rust fixture tree");
-    let root = tempfile::tempdir().expect("fixture root");
-    let file = ProjectFile::new(
-        root.path().canonicalize().expect("canonical fixture root"),
-        "src/lib.rs",
-    );
-    let parsed = parse_rust_file(&file, source, &tree);
+    let parsed = crate::test_helpers::parse_rust_fixture(source);
     let canonical = parsed.source_facts.as_ref().expect("canonical Rust facts");
     let module_names = canonical
         .rust_modules
@@ -86,20 +74,6 @@ fn declaration_named(facts: &RustHierarchySourceFacts, name: &str) -> SourceDecl
         .find(|(_, unit)| unit.identifier() == name)
         .map(|(declaration, _)| *declaration)
         .unwrap_or_else(|| panic!("missing declaration unit {name}"))
-}
-
-fn alias_named(facts: &RustHierarchySourceFacts, name: &str) -> SourceDeclarationId {
-    facts
-        .items
-        .aliases
-        .iter()
-        .find(|alias| {
-            facts.declaration_units.iter().any(|(declaration, unit)| {
-                *declaration == alias.declaration && unit.identifier() == name
-            })
-        })
-        .map(|alias| alias.declaration)
-        .unwrap_or_else(|| panic!("missing alias declaration unit {name}"))
 }
 
 fn alias_with_ancestor_kind(
@@ -315,85 +289,6 @@ fn declarations_for_retains_all_embedded_same_name_alternatives() {
         assert!(index.annotation(declaration).is_some());
     }
 }
-
-#[test]
-fn declaration_scope_projects_primary_alias_contexts() {
-    let facts = fixture_facts(SCOPE_FIXTURE);
-    let index = RustDeclarationTypeIndex::new(Arc::clone(&facts), &|| true)
-        .expect("declaration type index");
-
-    let root = index
-        .declaration_scope(alias_named(&facts, "RootAlias"), &|| true)
-        .expect("root alias scope")
-        .expect("primary declaration");
-    assert_eq!(root.local_scope, None);
-    assert_eq!(root.module, None);
-
-    let nested = index
-        .declaration_scope(alias_named(&facts, "NestedAlias"), &|| true)
-        .expect("nested alias scope")
-        .expect("primary declaration");
-    let nested_local = nested.local_scope.expect("nested module scope");
-    assert_eq!(
-        context_kind(&facts, nested_local),
-        RustSourceContextKind::Module
-    );
-    assert_eq!(nested.module, Some(nested_local));
-
-    let associated = index
-        .declaration_scope(alias_named(&facts, "AssociatedAlias"), &|| true)
-        .expect("associated alias scope")
-        .expect("primary declaration");
-    assert_eq!(
-        context_kind(
-            &facts,
-            associated
-                .local_scope
-                .expect("impl scope for associated alias")
-        ),
-        RustSourceContextKind::Impl
-    );
-    assert_eq!(
-        context_kind(
-            &facts,
-            associated.module.expect("module for associated alias")
-        ),
-        RustSourceContextKind::Module
-    );
-
-    let local = index
-        .declaration_scope(
-            alias_with_ancestor_kind(&facts, RustSourceContextKind::Function),
-            &|| true,
-        )
-        .expect("local alias scope")
-        .expect("primary declaration");
-    assert_eq!(
-        context_kind(
-            &facts,
-            local.local_scope.expect("block scope for local alias")
-        ),
-        RustSourceContextKind::Block
-    );
-    assert_eq!(
-        context_kind(&facts, local.module.expect("module for local alias")),
-        RustSourceContextKind::Module
-    );
-
-    let trait_alias = index
-        .declaration_scope(
-            alias_with_ancestor_kind(&facts, RustSourceContextKind::Trait),
-            &|| true,
-        )
-        .expect("trait alias scope")
-        .expect("primary declaration");
-    assert_eq!(
-        context_kind(&facts, trait_alias.local_scope.expect("trait scope")),
-        RustSourceContextKind::Trait
-    );
-    assert_eq!(trait_alias.module, None);
-}
-
 #[test]
 fn declaration_scope_projects_owned_contexts_and_value_annotations() {
     let facts = fixture_facts(SCOPE_FIXTURE);

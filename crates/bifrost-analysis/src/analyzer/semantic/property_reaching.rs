@@ -17,7 +17,7 @@ use super::ids::{ProgramPointId, SemanticLocator, SourceMappingId, SourceSpan, V
 use super::ir::{
     CaptureSource, EvidenceCompleteness, ExecutionTiming, MemoryAccessKind, MemoryLocationKind,
     ProcedureHandle, ProgramPointHandle, ProofStatus, SemanticEffect, SemanticGapImpact,
-    SemanticGapSubject, SemanticValueKind, ValueHandle,
+    SemanticGapSubject, ValueHandle,
 };
 use super::oracle::{
     AbstractLocation, AccessSelector, CandidateCoverage, DurableIdentityError,
@@ -98,8 +98,7 @@ pub struct PropertyStoreRecord {
 impl PropertyStoreRecord {
     /// Whether this store has complete, proven value-flow evidence.
     pub fn is_proven_complete(&self) -> bool {
-        matches!(self.proof, ProofStatus::Proven)
-            && matches!(self.completeness, EvidenceCompleteness::Complete)
+        self.proof.establishes_complete_evidence(&self.completeness)
     }
 
     pub const fn source_mapping(&self) -> SourceMappingId {
@@ -130,8 +129,7 @@ pub struct PropertyReadRecord {
 impl PropertyReadRecord {
     /// Whether this read has complete, proven value-flow evidence.
     pub fn is_proven_complete(&self) -> bool {
-        matches!(self.proof, ProofStatus::Proven)
-            && matches!(self.completeness, EvidenceCompleteness::Complete)
+        self.proof.establishes_complete_evidence(&self.completeness)
     }
 
     pub const fn source_mapping(&self) -> SourceMappingId {
@@ -164,8 +162,7 @@ pub struct PropertyReachingRelation {
 
 impl PropertyReachingRelation {
     pub fn is_proven_complete(&self) -> bool {
-        matches!(self.proof, ProofStatus::Proven)
-            && matches!(self.completeness, EvidenceCompleteness::Complete)
+        self.proof.establishes_complete_evidence(&self.completeness)
             && self.coverage.is_exhaustive()
     }
 }
@@ -234,8 +231,7 @@ pub struct EvaluationRelationRecord {
 
 impl EvaluationRelationRecord {
     pub fn is_proven_complete(&self) -> bool {
-        matches!(self.proof, ProofStatus::Proven)
-            && matches!(self.completeness, EvidenceCompleteness::Complete)
+        self.proof.establishes_complete_evidence(&self.completeness)
             && self.coverage.is_exhaustive()
             && self.timing.is_proven_complete()
     }
@@ -472,6 +468,13 @@ pub enum PropertyReachingIncompleteReason {
     ReachingPairs(CfgAlgorithmError<ProgramPointId>),
 }
 
+fn property_evidence_is_complete(
+    coverage: CandidateCoverage,
+    incomplete_reasons: &[PropertyReachingIncompleteReason],
+) -> bool {
+    coverage.is_exhaustive() && incomplete_reasons.is_empty()
+}
+
 /// All property stores, reads, and reaching rows for one exact procedure.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PropertyReachingResult {
@@ -527,7 +530,7 @@ impl PropertyReachingResult {
     /// absent.  Partial rows are intentionally retained even when this is
     /// false.
     pub fn is_complete(&self) -> bool {
-        self.coverage.is_exhaustive() && self.incomplete_reasons.is_empty()
+        property_evidence_is_complete(self.coverage, &self.incomplete_reasons)
     }
 
     /// Return a source-oriented view for an exact event mapping identity.
@@ -708,7 +711,7 @@ impl PropertySourceResult {
     }
 
     pub fn is_complete(&self) -> bool {
-        self.coverage.is_exhaustive() && self.incomplete_reasons.is_empty()
+        property_evidence_is_complete(self.coverage, &self.incomplete_reasons)
     }
 
     pub fn evaluations_complete(&self) -> bool {
@@ -2102,14 +2105,10 @@ fn record_evaluation_source_failure(
 }
 
 fn is_binding_id(procedure: &ProcedureHandle, value: ValueId) -> bool {
-    procedure.semantics().value(value).is_some_and(|value| {
-        matches!(
-            value.kind,
-            SemanticValueKind::Local
-                | SemanticValueKind::Parameter { .. }
-                | SemanticValueKind::Receiver { .. }
-        )
-    })
+    procedure
+        .semantics()
+        .value(value)
+        .is_some_and(|value| value.kind.is_binding())
 }
 
 fn relation_event<'a>(
@@ -2152,7 +2151,7 @@ fn source_locator(
     source: SourceMappingId,
     incomplete_reasons: &mut Vec<PropertyReachingIncompleteReason>,
 ) -> Option<SemanticLocator> {
-    let Some(mapping) = procedure.semantics().source_mapping(source) else {
+    let Some(locator) = procedure.source_locator(source) else {
         incomplete_reasons.push(PropertyReachingIncompleteReason::SourceMappingUnavailable {
             point,
             event_index,
@@ -2160,21 +2159,14 @@ fn source_locator(
         });
         return None;
     };
-    Some(mapping.locator.clone())
+    Some(locator.clone())
 }
 
 fn relation_source_mapping(
     procedure: &ProcedureHandle,
     relation: &ValueFlowRelation,
 ) -> SourceMappingId {
-    procedure
-        .semantics()
-        .point(relation.point.id())
-        .expect("a validated value-flow relation belongs to its retained point")
-        .events
-        .get(relation.event_index as usize)
-        .expect("a validated value-flow relation names a retained event")
-        .source
+    relation_event(procedure, relation).source
 }
 
 fn project_location(

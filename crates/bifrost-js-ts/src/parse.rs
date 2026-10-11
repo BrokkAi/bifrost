@@ -51,13 +51,8 @@ pub fn js_ts_tree_sitter_language_for_file(
         LanguageDialect::TypeScriptTsx | LanguageDialect::JavaScriptJsx => {
             Some(tree_sitter_typescript::LANGUAGE_TSX.into())
         }
-        LanguageDialect::Standard(Language::TypeScript) => {
-            Some(tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into())
-        }
-        LanguageDialect::Standard(Language::JavaScript) => {
-            Some(tree_sitter_javascript::LANGUAGE.into())
-        }
-        LanguageDialect::Standard(_) | LanguageDialect::CppC => None,
+        LanguageDialect::Standard(language) => tree_sitter_language_for(language),
+        LanguageDialect::CppC => None,
     }
 }
 
@@ -131,5 +126,64 @@ pub fn tree_sitter_language_for(language: Language) -> Option<TreeSitterLanguage
         Language::JavaScript => Some(tree_sitter_javascript::LANGUAGE.into()),
         Language::TypeScript => Some(tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into()),
         _ => None,
+    }
+}
+
+pub(crate) fn parse_with_language(
+    source: &str,
+    language: &TreeSitterLanguage,
+) -> Result<Option<tree_sitter::Tree>, tree_sitter::LanguageError> {
+    let mut parser = tree_sitter::Parser::new();
+    parser.set_language(language)?;
+    Ok(parser.parse(source, None))
+}
+
+#[cfg(test)]
+mod grammar_upgrade_tests {
+    use super::*;
+
+    #[test]
+    fn jsx_ampersands_preserve_entities_and_declarations_in_every_dialect() {
+        let source = r#"export const view = <p href="/x?a=1&b=2" tail="&" single='&'>Roles & Groups &amp;</p>;
+export function after() { return view; }"#;
+        for (path, language) in [
+            ("view.tsx", Language::TypeScript),
+            ("view.jsx", Language::JavaScript),
+            // Plain `.js` uses the JavaScript grammar, repaired in 0.25.3 (#4409).
+            ("view.js", Language::JavaScript),
+        ] {
+            let file = ProjectFile::new(std::env::current_dir().unwrap(), path);
+            let grammar = js_ts_tree_sitter_language_for_file(&file, language).unwrap();
+            let tree = parse_with_language(source, &grammar).unwrap().unwrap();
+            assert!(
+                !tree.root_node().has_error(),
+                "{path}: {}",
+                tree.root_node().to_sexp()
+            );
+            let mut nodes = vec![tree.root_node()];
+            let mut entities = Vec::new();
+            while let Some(node) = nodes.pop() {
+                if node.kind() == "html_character_reference" {
+                    entities.push(node.utf8_text(source.as_bytes()).unwrap());
+                }
+                let mut cursor = node.walk();
+                nodes.extend(node.named_children(&mut cursor));
+            }
+            assert_eq!(entities, vec!["&amp;"], "{path}");
+            let parsed = if language == Language::TypeScript {
+                crate::typescript::parse_typescript_file(&file, source, &tree)
+            } else {
+                crate::javascript::parse_javascript_file(&file, source, &tree)
+            };
+            for expected in ["view", "after"] {
+                assert!(
+                    parsed
+                        .declarations()
+                        .iter()
+                        .any(|unit| unit.identifier() == expected),
+                    "{path}: missing {expected}"
+                );
+            }
+        }
     }
 }

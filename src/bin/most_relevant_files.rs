@@ -1,3 +1,7 @@
+#[allow(dead_code)]
+#[path = "common/mod.rs"]
+mod common;
+
 use brokk_bifrost::{
     AnalyzerConfig, FilesystemProject, Language, WorkspaceAnalyzer,
     searchtools::{
@@ -5,6 +9,7 @@ use brokk_bifrost::{
         most_relevant_files_history_only,
     },
 };
+use common::finish_unit_result;
 use std::env;
 use std::path::Path;
 use std::process::ExitCode;
@@ -14,13 +19,7 @@ const DEFAULT_LIMIT: usize = 100;
 const DEFAULT_RECENCY_HALF_LIFE: f64 = 250.0;
 
 fn main() -> ExitCode {
-    match run() {
-        Ok(()) => ExitCode::SUCCESS,
-        Err(err) => {
-            eprintln!("{err}");
-            ExitCode::FAILURE
-        }
-    }
+    finish_unit_result(run())
 }
 
 fn run() -> Result<(), String> {
@@ -192,34 +191,4 @@ fn print_help() {
          --history-only ranks by Git co-change and skips import-graph expansion.\n\
          --exclude-tests drops the test and test_support lines from the ranked page, so it can print fewer results."
     );
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn parses_ranking_modes() {
-        assert_eq!(
-            parse_ranking_mode("cascade").unwrap(),
-            MostRelevantFilesRankingMode::Cascade
-        );
-        assert_eq!(
-            MostRelevantFilesRankingMode::Cascade,
-            MostRelevantFilesRankingMode::default()
-        );
-        assert_eq!(
-            parse_ranking_mode("history_imports").unwrap(),
-            MostRelevantFilesRankingMode::HistoryImports
-        );
-        assert_eq!(
-            parse_ranking_mode("usage_graph").unwrap(),
-            MostRelevantFilesRankingMode::UsageGraph
-        );
-        assert_eq!(
-            parse_ranking_mode("usage_graph_exact").unwrap(),
-            MostRelevantFilesRankingMode::UsageGraphExact
-        );
-        assert!(parse_ranking_mode("imports").is_err());
-    }
 }

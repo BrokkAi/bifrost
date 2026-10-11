@@ -4,6 +4,8 @@ import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { TextDecoder } from "node:util";
+import { isRecordObject, requireNonEmptyString } from "../lib/value-validation.mjs";
+import { parseMappedCliArgs } from "./cli-argument-helpers.mjs";
 
 const UTF8_DECODER = new TextDecoder("utf-8", { fatal: true });
 const DEPENDENCY_KINDS = new Set(["normal", "dev", "build"]);
@@ -33,7 +35,7 @@ function stringArray(value, label) {
 }
 
 function objectValue(value, label) {
-  if (value === null || typeof value !== "object" || Array.isArray(value)) {
+  if (!isRecordObject(value)) {
     throw new TypeError(`${label} must be an object.`);
   }
   return value;
@@ -243,41 +245,19 @@ function readJsonFile(filePath, label) {
 }
 
 function requiredArgument(value, label) {
-  if (typeof value !== "string" || value.length === 0) throw new Error(`${label} is required.`);
-  return value;
+  return requireNonEmptyString(value, `${label} is required.`);
 }
 
 export function parseCliArgs(argv) {
-  const options = {};
-  for (let index = 0; index < argv.length; index += 1) {
-    const flag = argv[index];
-    if (flag === "--help" || flag === "-h") return { help: true };
-    const value = argv[index + 1];
-    if (value === undefined || value.startsWith("--")) throw new Error(`Missing value for ${flag}.`);
-    switch (flag) {
-      case "--cargo-metadata-file":
-        options.cargoMetadataPath = value;
-        break;
-      case "--package":
-        options.packageName = value;
-        break;
-      case "--version":
-        options.version = value;
-        break;
-      case "--package-root":
-        options.packageRoot = value;
-        break;
-      case "--badges-file":
-        options.badgesPath = value;
-        break;
-      case "--output-file":
-        options.outputPath = value;
-        break;
-      default:
-        throw new Error(`Unknown option: ${flag}.`);
-    }
-    index += 1;
-  }
+  const options = parseMappedCliArgs(argv, {
+    "--cargo-metadata-file": "cargoMetadataPath",
+    "--package": "packageName",
+    "--version": "version",
+    "--package-root": "packageRoot",
+    "--badges-file": "badgesPath",
+    "--output-file": "outputPath",
+  });
+  if (options.help) return options;
   requiredArgument(options.cargoMetadataPath, "Cargo metadata file");
   requiredArgument(options.packageName, "Package name");
   requiredArgument(options.version, "Package version");

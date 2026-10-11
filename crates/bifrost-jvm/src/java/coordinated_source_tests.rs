@@ -1,22 +1,21 @@
 use brokk_bifrost_core::analyzer::model::StructuredImportPathKind;
-use brokk_bifrost_core::analyzer::parsed_file::{ParsedFile, ParsedSourceFacts};
+use brokk_bifrost_core::analyzer::parsed_file::ParsedFile;
 use brokk_bifrost_core::analyzer::resolution_facts::{
-    ResolutionGapFact, ResolutionGapKind, ResolutionImportRouteKind, ResolutionSiteKind,
+    ResolutionGapFact, ResolutionGapKind, ResolutionIdentifierRole, ResolutionImportRouteKind,
+    ResolutionScopeKind, ResolutionSiteKind,
 };
 use brokk_bifrost_core::analyzer::source_facts::{SourceDeclarationId, SourceOccurrenceProvenance};
 use brokk_bifrost_core::analyzer::structural::kinds::NormalizedKind;
-use brokk_bifrost_core::analyzer::tree_walk::{WalkControl, walk_named_tree_preorder};
 use brokk_bifrost_core::analyzer::{ProjectFile, Range};
-use tree_sitter::{Node, Parser, Tree};
+use tree_sitter::{Node, Tree};
+
+use brokk_bifrost_test_macros::hardwon;
 
 use super::declarations::parse_java_file;
+use super::test_support::source_facts;
 
 fn parse(source: &str) -> (ParsedFile, Tree) {
-    let mut parser = Parser::new();
-    parser
-        .set_language(&tree_sitter_java::LANGUAGE.into())
-        .expect("Java grammar is valid");
-    let tree = parser.parse(source, None).expect("Java source parses");
+    let tree = super::declarations::parse_tree(source).expect("Java source parses");
     let file = ProjectFile::new(
         std::env::current_dir()
             .expect("current directory")
@@ -27,13 +26,6 @@ fn parse(source: &str) -> (ParsedFile, Tree) {
     (parsed, tree)
 }
 
-fn source_facts(parsed: &ParsedFile) -> &ParsedSourceFacts {
-    parsed
-        .source_facts
-        .as_ref()
-        .expect("Java producer publishes coordinated source facts")
-}
-
 fn named_node<'tree>(
     root: Node<'tree>,
     source: &str,
@@ -41,55 +33,21 @@ fn named_node<'tree>(
     name: &str,
     ordinal: usize,
 ) -> Node<'tree> {
-    let mut matches = Vec::new();
-    walk_named_tree_preorder(root, true, |node| {
-        if node.kind() == kind
-            && node
-                .child_by_field_name("name")
-                .is_some_and(|name_node| super::declarations::node_text(name_node, source) == name)
-        {
-            matches.push(node);
-        }
-        WalkControl::Continue
-    });
+    let matches = super::test_support::named_nodes(root, source, kind, name);
     *matches
         .get(ordinal)
         .unwrap_or_else(|| panic!("missing {kind} {name:?} occurrence {ordinal}"))
 }
 
 fn declaration_for_node(parsed: &ParsedFile, node: Node<'_>) -> SourceDeclarationId {
-    let facts = source_facts(parsed);
-    let expected_name = node
-        .child_by_field_name("name")
-        .map(|name| (name.start_byte(), name.end_byte()));
-    let mut matches = parsed
-        .source_declaration_units
-        .iter()
-        .filter_map(|(declaration, _)| {
-            let row = facts.occurrences.declaration(*declaration);
-            let occurrence = facts.occurrences.occurrence(row.occurrence);
-            if occurrence.range.start_byte != node.start_byte()
-                || occurrence.range.end_byte != node.end_byte()
-            {
-                return None;
-            }
-            let name_matches = match (expected_name, row.name) {
-                (None, None) => true,
-                (Some((start, end)), Some(name_occurrence)) => {
-                    let range = facts.occurrences.occurrence(name_occurrence).range;
-                    range.start_byte == start && range.end_byte == end
-                }
-                _ => false,
-            };
-            name_matches.then_some(*declaration)
-        })
-        .collect::<Vec<_>>();
-    assert_eq!(
-        matches.len(),
-        1,
-        "one display source declaration must link to the exact AST node"
-    );
-    matches.pop().expect("display declaration match")
+    super::test_support::source_declaration_for_node(
+        parsed,
+        node,
+        parsed
+            .source_declaration_units
+            .iter()
+            .map(|(declaration, _)| *declaration),
+    )
 }
 
 fn assert_primary_declaration_span(parsed: &ParsedFile, node: Node<'_>) -> SourceDeclarationId {
@@ -188,6 +146,7 @@ enum Mode { FAST, SLOW { void custom() {} } }
 }
 
 #[test]
+#[hardwon("52fa45bf1e4f: local record components were counted as enclosing callable parameters")]
 fn nested_class_callables_have_captured_parameter_shapes() {
     let source = "class Sample { Object f(int x) { if (x == 1) { record R(int component) {} class Local { int local(int value) { return value; } } return new Object() { int anonymous(int value) { return value; } }; } else { enum E { A { int enumBody(int value) { return value; } } } class Local { int local(int value) { return value; } } return E.A; } } }";
     let (parsed, _) = parse(source);
@@ -201,9 +160,24 @@ fn nested_class_callables_have_captured_parameter_shapes() {
 
 #[test]
 fn package_identity_shares_structured_path_with_native_segments() {
-    let source = "@Anno(value=) package p /* package */ . q; class A {}";
+    let source =
+        "@Anno(value=) package p /* package */ . q; import p /* import */ . Target; class A {}";
     let (parsed, _) = parse(source);
+    let (second_parse, _) = parse(source);
     assert_eq!(parsed.package_name, "p.q");
+    assert_eq!(
+        parsed.resolution_facts, second_parse.resolution_facts,
+        "directive facts must remain deterministic"
+    );
+    assert_eq!(parsed.imports.len(), 1);
+    assert_eq!(
+        parsed.imports[0]
+            .path
+            .as_ref()
+            .expect("structured import path")
+            .segments,
+        vec!["p", "Target"]
+    );
 
     let facts = &parsed.resolution_facts;
     assert_eq!(facts.packages.len(), 1);
@@ -224,9 +198,24 @@ fn package_identity_shares_structured_path_with_native_segments() {
         facts
             .package_segments
             .iter()
-            .map(|segment| facts.names[segment.name.index()].spelling.as_str())
+            .map(|segment| facts.name(segment.name))
             .collect::<Vec<_>>(),
         vec!["p", "q"]
+    );
+
+    assert_eq!(facts.import_routes.len(), 1);
+    let route = facts.import_routes[0];
+    assert_eq!(
+        facts.name(route.bound_name.expect("single-type bound name")),
+        "Target"
+    );
+    assert_eq!(
+        facts
+            .import_route_segments
+            .iter()
+            .map(|segment| (segment.ordinal, facts.name(segment.name)))
+            .collect::<Vec<_>>(),
+        vec![(0, "p"), (1, "Target")]
     );
 
     let annotation = facts
@@ -275,15 +264,16 @@ import java.lang.String;
 import broken.;
 class C {}
 import late.Valid;
+import late.;
 "#;
     let (parsed, _) = parse(source);
     let facts = source_facts(&parsed);
-    assert_eq!(facts.imports.len(), 5);
-    assert_eq!(facts.generic_imports.len(), 5);
+    assert_eq!(facts.imports.len(), 6);
+    assert_eq!(facts.generic_imports.len(), 6);
     for (index, import_id) in facts.generic_imports.iter().enumerate() {
         assert_eq!(import_id.index(), index);
     }
-    assert_eq!(parsed.imports.len(), 5);
+    assert_eq!(parsed.imports.len(), 6);
 
     let wildcard = &facts.imports[0];
     assert!(wildcard.is_wildcard);
@@ -309,8 +299,15 @@ import late.Valid;
     assert!(facts.imports[3].path.is_none());
     assert!(facts.imports[3].target.is_none());
     assert!(parsed.imports[3].path.is_none());
+    assert_eq!(parsed.imports[3].raw_snippet, "import broken.;");
+    assert!(parsed.imports[3].binder_span.is_none());
     assert_eq!(parsed.imports[4].identifier.as_deref(), Some("Valid"));
     assert!(facts.imports[4].path.is_some());
+    assert!(facts.imports[5].path.is_none());
+    assert!(parsed.imports[5].path.is_none());
+    assert!(parsed.imports[5].binder_span.is_none());
+    assert!(!facts.native_declaration_sources.is_empty());
+    assert!(!parsed.source_declaration_units.is_empty());
 
     assert_eq!(
         parsed
@@ -377,10 +374,25 @@ import late.Valid;
             kind: ResolutionGapKind::UnsupportedRoute,
         }
     ));
+    let late_malformed_site = parsed
+        .resolution_facts
+        .sites
+        .iter()
+        .find(|site| {
+            site.kind == ResolutionSiteKind::ImportDeclaration
+                && &source[site.start_byte..site.end_byte] == "import late.;"
+        })
+        .expect("late malformed import native site");
+    assert!(parsed.resolution_facts.gaps.contains(
+        &brokk_bifrost_core::analyzer::resolution_facts::ResolutionGapFact {
+            site: late_malformed_site.id,
+            kind: ResolutionGapKind::UnsupportedRoute,
+        }
+    ));
 }
 
 #[test]
-fn structural_descendants_survive_native_unsupported_lambda_scope() {
+fn structural_descendants_and_references_survive_native_lambda_scope() {
     let source =
         "class A { Object f() { Object value = () -> { return hidden; }; return value; } }";
     let (parsed, _) = parse(source);
@@ -404,18 +416,33 @@ fn structural_descendants_survive_native_unsupported_lambda_scope() {
             && &source[range.start_byte..range.end_byte] == "return hidden;"
     }));
 
-    let lambda_gap = parsed
+    let lambda = parsed
         .resolution_facts
-        .gaps
+        .sites
         .iter()
-        .find(|gap| {
-            gap.kind == ResolutionGapKind::UnsupportedScopeOrBinder
-                && parsed.resolution_facts.sites[gap.site.index()].kind
-                    == ResolutionSiteKind::UnsupportedExpression
-                && source[parsed.resolution_facts.sites[gap.site.index()].start_byte
-                    ..parsed.resolution_facts.sites[gap.site.index()].end_byte]
-                    .contains("->")
+        .find(|site| {
+            site.kind == ResolutionSiteKind::UnsupportedExpression
+                && source[site.start_byte..site.end_byte].contains("->")
         })
-        .expect("native lambda unsupported gap");
-    assert!(lambda_gap.site.index() < parsed.resolution_facts.sites.len());
+        .expect("lambda expression value site");
+    assert!(parsed.resolution_facts.scopes.iter().any(|scope| {
+        scope.owner == Some(lambda.id) && scope.kind == ResolutionScopeKind::Executable
+    }));
+    assert!(
+        parsed
+            .resolution_facts
+            .identifiers
+            .iter()
+            .any(|identifier| {
+                identifier.role == ResolutionIdentifierRole::Reference
+                    && parsed.resolution_facts.name(identifier.name) == "hidden"
+            })
+    );
+    assert!(
+        parsed
+            .resolution_facts
+            .reference_enumeration_gaps
+            .iter()
+            .all(|gap| gap.site != lambda.id)
+    );
 }

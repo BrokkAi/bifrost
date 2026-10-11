@@ -11,20 +11,27 @@
 
 use std::path::{Path, PathBuf};
 
+use crate::analyzer::common::dependency_pack_warning as declaration_diagnostic;
+use crate::analyzer::dependency_support::{
+    cancelled_dependency_evidence_diagnostic, dependency_diagnostic as diagnostic,
+    dependency_provenance_entry as provenance_entry, read_bounded_declaration_file,
+    read_evidence_file_with_budget, require_non_empty_evidence_field,
+    resolve_dependency_path as resolve_path,
+};
+
 use semver::Version;
 use serde::Deserialize;
 
+use super::source_artifact::is_php_entry;
 use crate::CancellationToken;
 use crate::analyzer::canonical_hash::is_lower_sha256;
 use crate::analyzer::semantic_model::{
-    ArtifactProducerLimits, BoundedDependencyDiagnostics, CatalogCoordinate,
-    DependencyArtifactRole, DependencyDiscoveryOutcome, DependencyDiscoveryProfile,
-    DependencyPackDiagnostic, DependencyPackDiagnosticSeverity, DependencyPackLimits,
-    DependencyProvenance, ExternalArtifactKind, ProducerDiagnostic, ProducerDiagnosticSeverity,
-    ResolvedDependency, ResolvedDependencyArtifact, SemanticModelActivationEvidence,
-    read_exact_artifact_while,
+    BoundedDependencyDiagnostics, CatalogCoordinate, DependencyArtifactRole,
+    DependencyDiscoveryOutcome, DependencyDiscoveryProfile, DependencyPackDiagnostic,
+    DependencyPackLimits, DependencyProvenance, ExternalArtifactKind, ResolvedDependency,
+    ResolvedDependencyArtifact, SemanticModelActivationEvidence, StandardLibraryPackExpectation,
 };
-use crate::analyzer::{PhpAnalyzerConfig, PhpDependencyApiEvidence, Project};
+use crate::analyzer::{Language, PhpAnalyzerConfig, PhpDependencyApiEvidence, Project};
 use crate::hash::{HashMap, HashSet};
 
 use crate::analyzer::topology::DependencyScope;
@@ -52,12 +59,42 @@ pub fn resolve_php_semantic_pack_dependencies(
 
     // The runtime dependency is *declared*, not installed, so it is resolved
     // whether or not a host configured Composer evidence. A workspace that
-    // declares no PHP version resolves nothing here and stays complete.
-    match resolve_declared_php_runtime_dependency(project.root(), &mut metadata_inputs_considered) {
-        Ok(Some(runtime)) => dependencies.push(runtime),
-        Ok(None) => {}
-        Err(error) => diagnostics.push(error),
-    }
+    // declares no PHP version resolves nothing here and stays complete, but it
+    // records that it selects no builtin declaration pack, and why (#3464).
+    let runtime_expectation = match resolve_declared_php_runtime_dependency(
+        project.root(),
+        &mut metadata_inputs_considered,
+    ) {
+        Ok(Some(runtime)) => {
+            let expectation = StandardLibraryPackExpectation::declared(
+                Language::Php,
+                PHP_BUILTIN_PACK_ID,
+                vec![runtime.id.clone()],
+            );
+            dependencies.push(runtime);
+            expectation
+        }
+        Ok(None) => StandardLibraryPackExpectation::not_selected(
+            Language::Php,
+            PHP_BUILTIN_PACK_ID,
+            format!(
+                "the workspace declares no PHP version in {PHP_VERSION_FILE_NAME} or \
+                 {COMPOSER_MANIFEST_FILE_NAME}"
+            ),
+        ),
+        Err(error) => {
+            let expectation = StandardLibraryPackExpectation::not_selected(
+                Language::Php,
+                PHP_BUILTIN_PACK_ID,
+                match &error.location {
+                    Some(location) => format!("{location}: {}", error.message),
+                    None => error.message.clone(),
+                },
+            );
+            diagnostics.push(error);
+            expectation
+        }
+    };
 
     for configured in &config.dependency_api_evidence {
         if is_cancelled(cancellation) {
@@ -103,7 +140,7 @@ pub fn resolve_php_semantic_pack_dependencies(
         ));
     }
     let (diagnostics, suppressed_diagnostics) = diagnostics.finish();
-    DependencyDiscoveryOutcome {
+    let mut outcome = DependencyDiscoveryOutcome {
         profile: DependencyDiscoveryProfile {
             metadata_inputs_considered,
             dependencies_resolved: dependencies.len(),
@@ -114,7 +151,11 @@ pub fn resolve_php_semantic_pack_dependencies(
         diagnostics,
         suppressed_diagnostics,
         cancelled,
+    };
+    if project.analyzer_languages().contains(&Language::Php) {
+        outcome.expect_standard_library_pack(runtime_expectation);
     }
+    outcome
 }
 
 fn resolve_evidence(
@@ -140,6 +181,7 @@ fn resolve_evidence(
     }
 
     let lockfile = read_evidence_file_with_budget(
+        "Composer",
         &evidence.lockfile_path,
         limits,
         evidence_bytes_read,
@@ -383,7 +425,7 @@ fn collect_php_files(
     limits: &DependencyPackLimits,
     files: &mut Vec<PathBuf>,
 ) -> Result<(), DependencyPackDiagnostic> {
-    let Some(relative) = normalize_relative(relative) else {
+    let Some(relative) = crate::path_utils::normalize_relative_components(relative) else {
         return Err(diagnostic(
             "composer.autoload.path_escape",
             Some(install_dir),
@@ -408,7 +450,7 @@ fn collect_php_files(
         ));
     }
     if metadata.is_file() {
-        if is_php_file(&absolute) {
+        if is_php_entry(&absolute) {
             files.push(relative);
         }
         return Ok(());
@@ -460,7 +502,7 @@ fn collect_php_files(
             }
             if metadata.is_dir() {
                 directories.push(child);
-            } else if metadata.is_file() && is_php_file(&child) {
+            } else if metadata.is_file() && is_php_entry(&child) {
                 if files.len() >= limits.max_source_files_per_artifact {
                     return Err(diagnostic(
                         "limit.source_files",
@@ -577,7 +619,13 @@ fn read_installed_manifest(
             "Composer installed.json digest must be lowercase SHA-256",
         ));
     }
-    let artifact = read_evidence_file_with_budget(path, limits, evidence_bytes_read, cancellation)?;
+    let artifact = read_evidence_file_with_budget(
+        "Composer",
+        path,
+        limits,
+        evidence_bytes_read,
+        cancellation,
+    )?;
     if artifact.sha256() != expected_digest {
         return Err(diagnostic(
             "composer.evidence.installed_digest_mismatch",
@@ -640,64 +688,9 @@ fn evidence_paths_from_root(
     resolved
 }
 
-fn resolve_path(root: &Path, path: &Path) -> PathBuf {
-    if path.is_absolute() {
-        path.to_path_buf()
-    } else {
-        root.join(path)
-    }
-}
-
-fn normalize_relative(path: &Path) -> Option<PathBuf> {
-    let mut out = PathBuf::new();
-    for component in path.components() {
-        match component {
-            std::path::Component::CurDir => {}
-            std::path::Component::Normal(part) => out.push(part),
-            std::path::Component::ParentDir => return None,
-            std::path::Component::RootDir | std::path::Component::Prefix(_) => return None,
-        }
-    }
-    Some(out)
-}
-
-fn is_php_file(path: &Path) -> bool {
-    path.extension()
-        .is_some_and(|extension| extension.eq_ignore_ascii_case("php"))
-}
-
 fn sort_and_dedup(files: &mut Vec<PathBuf>) {
     files.sort();
     files.dedup();
-}
-
-fn read_evidence_file_with_budget(
-    path: &Path,
-    limits: &DependencyPackLimits,
-    evidence_bytes_read: &mut u64,
-    cancellation: Option<&CancellationToken>,
-) -> Result<crate::analyzer::semantic_model::ExactArtifact, DependencyPackDiagnostic> {
-    let remaining = limits
-        .max_total_artifact_bytes
-        .saturating_sub(*evidence_bytes_read);
-    if remaining == 0 {
-        return Err(diagnostic(
-            "limit.total_artifact_bytes",
-            Some(path),
-            format!(
-                "Composer dependency evidence exceeds the {} byte aggregate limit",
-                limits.max_total_artifact_bytes
-            ),
-        ));
-    }
-    let producer_limits = ArtifactProducerLimits {
-        max_artifact_bytes: limits.producer.max_artifact_bytes.min(remaining),
-        ..limits.producer
-    };
-    let artifact = read_exact_artifact_while(path, &producer_limits, || is_cancelled(cancellation))
-        .map_err(|producer| producer_diagnostic(path, producer))?;
-    *evidence_bytes_read = evidence_bytes_read.saturating_add(artifact.bytes().len() as u64);
-    Ok(artifact)
 }
 
 #[derive(Debug, Deserialize)]
@@ -799,6 +792,10 @@ const COMPOSER_MANIFEST_FILE_NAME: &str = "composer.json";
 /// The toolchain name a PHP runtime pack's activation selector matches.
 const PHP_TOOLCHAIN_NAME: &str = "php";
 
+/// The builtin declaration pack a declared `php` version selects
+/// (`semantic-packs/php/phpstorm-stubs-*.json`).
+const PHP_BUILTIN_PACK_ID: &str = "bifrost.php-builtin";
+
 /// The ecosystem term a PHP *runtime* dependency publishes. The runtime is not
 /// a Composer package, so it never carries the `composer` ecosystem.
 const PHP_RUNTIME_ECOSYSTEM: &str = "php";
@@ -825,9 +822,11 @@ fn resolve_declared_php_runtime_dependency(
     inputs_considered: &mut usize,
 ) -> Result<Option<ResolvedDependency>, DependencyPackDiagnostic> {
     let version_file = project_root.join(PHP_VERSION_FILE_NAME);
-    if let Some(source) = read_bounded_declaration_file(&version_file).map_err(|message| {
-        declaration_diagnostic("php.toolchain.version_file", &version_file, message)
-    })? {
+    if let Some(source) =
+        read_bounded_declaration_file(&version_file, MAX_PHP_TOOLCHAIN_DECLARATION_BYTES).map_err(
+            |message| declaration_diagnostic("php.toolchain.version_file", &version_file, message),
+        )?
+    {
         *inputs_considered += 1;
         let declared = source
             .lines()
@@ -858,9 +857,11 @@ fn resolve_declared_php_runtime_dependency(
     }
 
     let manifest_path = project_root.join(COMPOSER_MANIFEST_FILE_NAME);
-    let Some(source) = read_bounded_declaration_file(&manifest_path).map_err(|message| {
-        declaration_diagnostic("php.toolchain.composer_manifest", &manifest_path, message)
-    })?
+    let Some(source) =
+        read_bounded_declaration_file(&manifest_path, MAX_PHP_TOOLCHAIN_DECLARATION_BYTES)
+            .map_err(|message| {
+                declaration_diagnostic("php.toolchain.composer_manifest", &manifest_path, message)
+            })?
     else {
         return Ok(None);
     };
@@ -935,23 +936,6 @@ struct ComposerManifestPlatform {
 
 /// Read one workspace declaration file. Absent means "the workspace declares
 /// nothing here" and is not a diagnostic.
-fn read_bounded_declaration_file(path: &Path) -> Result<Option<String>, String> {
-    let metadata = match std::fs::metadata(path) {
-        Ok(metadata) => metadata,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => return Err(format!("could not inspect declaration file: {error}")),
-    };
-    if !metadata.is_file() || metadata.len() > MAX_PHP_TOOLCHAIN_DECLARATION_BYTES {
-        return Err(format!(
-            "declaration file is not a regular file within \
-             {MAX_PHP_TOOLCHAIN_DECLARATION_BYTES} bytes"
-        ));
-    }
-    std::fs::read_to_string(path)
-        .map(Some)
-        .map_err(|error| format!("could not read declaration file: {error}"))
-}
-
 /// Parse a plain dotted numeric PHP version with one to three components. A
 /// missing component means `.0`: declaring `8.2` pins the line's floor, which
 /// is the only version the declaration proves.
@@ -1045,7 +1029,7 @@ fn parse_php_constraint_version(text: &str) -> Option<Version> {
     parse_exact_php_version(text)
 }
 
-fn declared_php_runtime_dependency(
+pub(in crate::analyzer) fn declared_php_runtime_dependency(
     version: Version,
     source_file: &str,
     declared: &str,
@@ -1078,75 +1062,16 @@ fn declared_php_runtime_dependency(
     }
 }
 
-fn declaration_diagnostic(
-    code: &str,
-    location: &Path,
-    message: String,
-) -> DependencyPackDiagnostic {
-    DependencyPackDiagnostic {
-        severity: DependencyPackDiagnosticSeverity::Warning,
-        code: code.to_owned(),
-        dependency_id: None,
-        location: Some(location.display().to_string()),
-        message,
-    }
-}
-
-fn provenance_entry(key: &str, value: impl ToString) -> DependencyProvenance {
-    DependencyProvenance {
-        key: key.to_owned(),
-        value: value.to_string(),
-    }
-}
-
-fn producer_diagnostic(path: &Path, producer: ProducerDiagnostic) -> DependencyPackDiagnostic {
-    DependencyPackDiagnostic {
-        severity: match producer.severity {
-            ProducerDiagnosticSeverity::Warning => DependencyPackDiagnosticSeverity::Warning,
-            ProducerDiagnosticSeverity::Error => DependencyPackDiagnosticSeverity::Error,
-        },
-        code: producer.code,
-        dependency_id: None,
-        location: Some(path.to_string_lossy().into_owned()),
-        message: producer.message,
-    }
-}
-
 fn require_non_empty(field: &str, value: &str) -> Result<(), DependencyPackDiagnostic> {
-    if value.trim().is_empty() {
-        return Err(diagnostic(
-            "composer.evidence.empty_field",
-            None,
-            format!("Composer dependency evidence field {field} must not be empty"),
-        ));
-    }
-    Ok(())
+    require_non_empty_evidence_field("Composer", "composer.evidence.empty_field", field, value)
 }
 
 fn is_cancelled(cancellation: Option<&CancellationToken>) -> bool {
-    cancellation.is_some_and(CancellationToken::is_cancelled)
+    brokk_bifrost_core::cancellation::optional_is_cancelled(cancellation)
 }
 
 fn cancelled_diagnostic(path: Option<&Path>) -> DependencyPackDiagnostic {
-    diagnostic(
-        "composer.evidence.cancelled",
-        path,
-        "Composer dependency evidence decoding was cancelled",
-    )
-}
-
-fn diagnostic(
-    code: &str,
-    path: Option<&Path>,
-    message: impl Into<String>,
-) -> DependencyPackDiagnostic {
-    DependencyPackDiagnostic {
-        severity: DependencyPackDiagnosticSeverity::Error,
-        code: code.to_owned(),
-        dependency_id: None,
-        location: path.map(|value| value.to_string_lossy().into_owned()),
-        message: message.into(),
-    }
+    cancelled_dependency_evidence_diagnostic("Composer", "composer.evidence.cancelled", path)
 }
 
 /// Milestone 2 of issue #2374: the PHP runtime dependency a workspace declares.
@@ -1291,8 +1216,6 @@ mod declared_runtime_tests {
         );
     }
 
-    /// A workspace that declares nothing declares nothing: no dependency, no
-    /// diagnostic, and discovery stays complete.
     #[test]
     fn a_workspace_that_declares_no_php_version_resolves_nothing() {
         let outcome = discover(&[("src/App.php", "<?php\nclass App {}\n")]);

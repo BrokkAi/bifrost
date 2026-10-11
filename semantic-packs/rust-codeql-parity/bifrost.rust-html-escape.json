@@ -1,0 +1,122 @@
+{
+  "schema_version": 2,
+  "pack_id": "bifrost.rust-html-escape",
+  "version": "0.1.0",
+  "producer": {
+    "name": "bifrost-reviewed-rust-codeql-parity-models",
+    "version": "0.1.0"
+  },
+  "language": "rust",
+  "ecosystem": "cargo",
+  "compatibility": {
+    "bifrost": ">=0.12.0, <1.0.0",
+    "toolchains": []
+  },
+  "provenance": {
+    "source": "Reviewed html_escape::encode_text API-shape stub for CodeQL rust/xss; the summary transfers argument 0 to its normal String return and the policy owns the HTML sanitizer label removal.",
+    "revision": "api-shape; CodeQL ae741615f3e178ce61289a651790dc67fcc18e19"
+  },
+  "license": "Apache-2.0",
+  "completeness": "complete",
+  "safety": {
+    "generated_code_only": false,
+    "review_required": false
+  },
+  "shards": [
+    {
+      "id": "declarations.bifrost.rust-html-escape",
+      "activation": [
+        {
+          "targets": [],
+          "configurations": []
+        }
+      ],
+      "payload": {
+        "kind": "declaration_facts",
+        "types": [
+          {
+            "id": "type.rust-codeql.html-escape",
+            "name": "html_escape",
+            "type_kind": "module",
+            "visibility": "public",
+            "locator": {
+              "kind": "artifact",
+              "path": "src/api.rs",
+              "symbol": "html_escape"
+            }
+          }
+        ],
+        "members": [
+          {
+            "id": "member.rust-codeql.html-escape-encode-text",
+            "owner": "type.rust-codeql.html-escape",
+            "name": "encode_text",
+            "member_kind": "function",
+            "visibility": "public",
+            "is_static": true,
+            "callable_family_complete": true,
+            "signature": {
+              "parameters": [
+                {
+                  "name": "s",
+                  "type": {
+                    "kind": "named",
+                    "name": "untyped"
+                  }
+                }
+              ],
+              "returns": {
+                "kind": "named",
+                "name": "untyped"
+              }
+            },
+            "locator": {
+              "kind": "artifact",
+              "path": "src/api.rs",
+              "symbol": "html_escape.encode_text"
+            }
+          }
+        ],
+        "relations": []
+      }
+    },
+    {
+      "id": "summaries.bifrost.rust-html-escape",
+      "activation": [
+        {
+          "targets": [],
+          "configurations": []
+        }
+      ],
+      "payload": {
+        "kind": "procedure_summaries",
+        "summaries": [
+          {
+            "id": "summary.rust-codeql.html-escape-encode-text",
+            "target": {
+              "path": "src/api.rs",
+              "symbol": "html_escape.encode_text",
+              "has_receiver": false,
+              "parameter_count": 1
+            },
+            "completeness": "complete",
+            "locations": [],
+            "transfers": [
+              {
+                "input": {
+                  "kind": "parameter",
+                  "ordinal": 0
+                },
+                "exit_kind": "normal",
+                "output": {
+                  "kind": "normal_return"
+                }
+              }
+            ],
+            "effects": []
+          }
+        ]
+      }
+    }
+  ]
+}

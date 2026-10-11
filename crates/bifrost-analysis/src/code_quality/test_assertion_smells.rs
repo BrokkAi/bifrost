@@ -27,34 +27,30 @@ pub struct ReportTestAssertionSmellsParams {
     pub min_score: i32,
     #[serde(default)]
     pub max_findings: i32,
-    #[serde(default = "default_neg")]
+    #[serde(default = "crate::code_quality::default_weight_sentinel")]
     pub no_assertion_weight: i32,
-    #[serde(default = "default_neg")]
+    #[serde(default = "crate::code_quality::default_weight_sentinel")]
     pub tautological_assertion_weight: i32,
-    #[serde(default = "default_neg")]
+    #[serde(default = "crate::code_quality::default_weight_sentinel")]
     pub constant_truth_weight: i32,
-    #[serde(default = "default_neg")]
+    #[serde(default = "crate::code_quality::default_weight_sentinel")]
     pub constant_equality_weight: i32,
-    #[serde(default = "default_neg")]
+    #[serde(default = "crate::code_quality::default_weight_sentinel")]
     pub nullness_only_weight: i32,
-    #[serde(default = "default_neg")]
+    #[serde(default = "crate::code_quality::default_weight_sentinel")]
     pub shallow_assertion_only_weight: i32,
-    #[serde(default = "default_neg")]
+    #[serde(default = "crate::code_quality::default_weight_sentinel")]
     pub overspecified_literal_weight: i32,
-    #[serde(default = "default_neg")]
+    #[serde(default = "crate::code_quality::default_weight_sentinel")]
     pub anonymous_test_double_weight: i32,
-    #[serde(default = "default_neg")]
+    #[serde(default = "crate::code_quality::default_weight_sentinel")]
     pub repeated_anonymous_test_double_weight: i32,
-    #[serde(default = "default_neg")]
+    #[serde(default = "crate::code_quality::default_weight_sentinel")]
     pub meaningful_assertion_credit: i32,
-    #[serde(default = "default_neg")]
+    #[serde(default = "crate::code_quality::default_weight_sentinel")]
     pub meaningful_assertion_credit_cap: i32,
-    #[serde(default = "default_neg")]
+    #[serde(default = "crate::code_quality::default_weight_sentinel")]
     pub large_literal_length_threshold: i32,
-}
-
-fn default_neg() -> i32 {
-    -1
 }
 
 impl Default for ReportTestAssertionSmellsParams {

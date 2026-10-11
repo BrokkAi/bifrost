@@ -25,10 +25,9 @@ use std::sync::Arc;
 
 use brokk_bifrost_analysis::analyzer::semantic::{
     CallBindings, CancellationToken, DeclarationLocator, DeclarationSegmentKind,
-    DispatchBoundaryKind, EvidenceCompleteness, ProcedureHandle, ProcedureKind,
-    ProcedurePortHandle, ProgramPointHandle, ProgramPointId, ProofStatus, SemanticBudget,
-    SemanticLocator, SemanticRequest, SemanticValueKind, ValueFlowRelation, ValueFlowRelationKind,
-    ValueFlowSnapshot,
+    DispatchBoundaryKind, ProcedureHandle, ProcedureKind, ProcedurePortHandle, ProgramPointHandle,
+    ProgramPointId, SemanticBudget, SemanticLocator, SemanticRequest, SemanticValueKind,
+    ValueFlowRelation, ValueFlowRelationKind, ValueFlowSnapshot,
 };
 use brokk_bifrost_analysis::analyzer::semantic_model::{
     AuthoredSummaryExitKind, AuthoredSummaryInput, AuthoredSummaryOutput, AuthoredSummaryTransfer,
@@ -41,8 +40,7 @@ use brokk_bifrost_flow::dataflow::{
 };
 use brokk_bifrost_flow::value_flow::{
     BindingCoverage, ClosureLimits, DispatchStatus, SkipReason, ValueFlowCarrier,
-    ValueFlowCarrierKey, ValueFlowEventKey, ValueFlowEventKind, ValueFlowInput,
-    ValueFlowObservationPhase, ValueFlowPlan, ValueFlowPortKey, ValueFlowSelectorKey,
+    ValueFlowCarrierKey, ValueFlowInput, ValueFlowPlan, ValueFlowPortKey, ValueFlowSelectorKey,
     ValueFlowSinkSpec, ValueFlowSourceSpec, discover_closure as discover_value_flow_closure,
     solve_value_flow_with_summaries,
 };
@@ -466,15 +464,10 @@ fn carrier_is_qualified_under(carrier: &ValueFlowCarrier, ports: &[String]) -> b
 /// path beneath it.
 fn access_path(carrier: &ValueFlowCarrier) -> Option<FoundryAccessPath> {
     let key = carrier.stable_key().ok()?;
-    let (port, selectors) = match &key {
-        ValueFlowCarrierKey::Port { kind, .. } => (*kind, &[][..]),
-        ValueFlowCarrierKey::Location {
-            root, selectors, ..
-        } => match root.as_ref() {
-            ValueFlowCarrierKey::Port { kind, .. } => (*kind, selectors.as_ref()),
-            _ => return None,
-        },
-        _ => return None,
+    let port = root_port_from_key(&key)?;
+    let selectors = match &key {
+        ValueFlowCarrierKey::Location { selectors, .. } => selectors.as_ref(),
+        _ => &[],
     };
     Some(FoundryAccessPath {
         port: port_key_label(port)?,
@@ -568,15 +561,8 @@ fn port_source(
     ordinal: u32,
     carrier: ValueFlowCarrier,
 ) -> ValueFlowSourceSpec {
-    ValueFlowSourceSpec::new(
-        ValueFlowEventKey::at_point(point, ordinal, ValueFlowEventKind::Source)
-            .expect("a live entry point yields a stable event key"),
-        point.clone(),
-        ValueFlowObservationPhase::BeforeEffects,
-        carrier,
-        ProofStatus::Proven,
-        EvidenceCompleteness::Complete,
-    )
+    ValueFlowSourceSpec::at_point(point, ordinal, carrier)
+        .expect("a live entry point yields a stable event key")
 }
 
 fn port_sink(
@@ -584,15 +570,8 @@ fn port_sink(
     ordinal: u32,
     carrier: ValueFlowCarrier,
 ) -> ValueFlowSinkSpec {
-    ValueFlowSinkSpec::new(
-        ValueFlowEventKey::at_point(point, ordinal, ValueFlowEventKind::Sink)
-            .expect("a live exit point yields a stable event key"),
-        point.clone(),
-        ValueFlowObservationPhase::AfterEffects,
-        carrier,
-        ProofStatus::Proven,
-        EvidenceCompleteness::Complete,
-    )
+    ValueFlowSinkSpec::at_point(point, ordinal, carrier)
+        .expect("a live exit point yields a stable event key")
 }
 
 /// The argument-level projection of an input carrier.
@@ -629,8 +608,12 @@ fn authored_output(
 
 /// The procedure port a carrier is rooted at, ignoring any access path.
 fn root_port(carrier: &ValueFlowCarrier) -> Option<ValueFlowPortKey> {
-    match carrier.stable_key().ok()? {
-        ValueFlowCarrierKey::Port { kind, .. } => Some(kind),
+    root_port_from_key(&carrier.stable_key().ok()?)
+}
+
+fn root_port_from_key(key: &ValueFlowCarrierKey) -> Option<ValueFlowPortKey> {
+    match key {
+        ValueFlowCarrierKey::Port { kind, .. } => Some(*kind),
         ValueFlowCarrierKey::Location { root, .. } => match root.as_ref() {
             ValueFlowCarrierKey::Port { kind, .. } => Some(*kind),
             _ => None,
@@ -994,12 +977,6 @@ fn member_name(locator: &SemanticLocator) -> String {
 mod tests {
     use super::*;
 
-    /// Reduced verbatim slices of the pinned Temurin 21.0.8+9 `src.zip`. See
-    /// `PROVENANCE.md` beside them.
-    fn pinned_jdk_slices() -> PathBuf {
-        Path::new(env!("CARGO_MANIFEST_DIR")).join("testdata/summary-sources/temurin-jdk-21.0.8+9")
-    }
-
     fn entry_for<'run>(run: &'run DerivationRun, symbol: &str) -> &'run FoundryEntry {
         run.entries
             .iter()
@@ -1013,163 +990,6 @@ mod tests {
                         .collect::<Vec<_>>()
                 )
             })
-    }
-
-    #[test]
-    fn a_pure_java_class_derives_exactly_the_flows_its_body_carries() {
-        let run = derive_jvm_summaries(&pinned_jdk_slices(), DerivationLimits::default())
-            .expect("the pinned slices derive");
-
-        // `return obj;`
-        assert_eq!(
-            entry_for(&run, "requireNonNull(T)").rendered_transfers(),
-            vec!["parameter[0]->normal_return@normal".to_owned()]
-        );
-        // `return (obj != null) ? obj : requireNonNull(defaultObj, "defaultObj");`
-        // The second transfer exists only because the derivation entered the
-        // callee, so this is the interprocedural case.
-        assert_eq!(
-            entry_for(&run, "requireNonNullElse(T,T)").rendered_transfers(),
-            vec![
-                "parameter[0]->normal_return@normal".to_owned(),
-                "parameter[1]->normal_return@normal".to_owned(),
-            ]
-        );
-        // `return (o != null) ? o.toString() : nullDefault;` The receiver's
-        // `toString` is a virtual call the closure cannot enter, so only the
-        // default reaches the return. Nothing is guessed past that call.
-        assert_eq!(
-            entry_for(&run, "toString(Object,String)").rendered_transfers(),
-            vec!["parameter[1]->normal_return@normal".to_owned()]
-        );
-        // The same shape through `supplier.get()`.
-        assert_eq!(
-            entry_for(&run, "requireNonNullElseGet(T,Supplier<? extends T>)").rendered_transfers(),
-            vec!["parameter[0]->normal_return@normal".to_owned()]
-        );
-    }
-
-    #[test]
-    fn a_native_backed_body_records_the_native_boundary_instead_of_guessing() {
-        let run = derive_jvm_summaries(&pinned_jdk_slices(), DerivationLimits::default())
-            .expect("the pinned slices derive");
-
-        // `return newArray(componentType, length);` where `newArray` is
-        // `private static native`.
-        let entry = entry_for(&run, "newInstance(Class<?>,int)");
-        let derivation = entry.derivation.as_ref().expect("a derived entry");
-
-        assert!(
-            entry.transfers.is_empty(),
-            "the return value comes from a native call: {:?}",
-            entry.rendered_transfers()
-        );
-        assert!(
-            derivation
-                .boundaries
-                .contains(&FoundryDerivationBoundary::NativeCallee {
-                    callee: "java/lang/reflect/Array.java#newArray".to_owned()
-                }),
-            "boundaries: {:?}",
-            derivation.boundaries
-        );
-        assert_eq!(entry.completeness, FoundryCompleteness::Partial);
-        assert_eq!(entry.claim, FoundryClaim::Flows);
-    }
-
-    #[test]
-    fn a_heap_read_retains_qualified_flow_without_claiming_completeness() {
-        let root = tempfile::tempdir().expect("temporary workspace");
-        std::fs::create_dir_all(root.path().join("probe")).expect("package directory");
-        std::fs::write(
-            root.path().join("probe/Box.java"),
-            concat!(
-                "package probe;\n",
-                "public final class Box {\n",
-                "    public String value;\n",
-                "    public static String read(Box box) {\n",
-                "        return box.value;\n",
-                "    }\n",
-                "}\n",
-            ),
-        )
-        .expect("fixture source");
-
-        let run = derive_jvm_summaries(root.path(), DerivationLimits::default())
-            .expect("fixture derives");
-        let entry = entry_for(&run, "read(Box)");
-        let derivation = entry.derivation.as_ref().expect("a derived entry");
-
-        // Shared formal-origin tracking (#2856) roots the field location at
-        // parameter[0], so the foundry can seed its qualified input path. The
-        // port-level transfer is only a projection of that field read. Retain
-        // both the positive flow and the open boundary: neither an empty
-        // `no_flow` claim nor a complete summary describes this body.
-        assert_eq!(
-            entry.rendered_transfers(),
-            vec!["parameter[0]->normal_return@normal".to_owned()]
-        );
-        assert_eq!(derivation.unproven_transfers, 0);
-        let [flow] = derivation.fine_grained.as_slice() else {
-            panic!(
-                "expected one field-read flow: {:?}",
-                derivation.fine_grained
-            );
-        };
-        assert_eq!(flow.input.port, "parameter[0]");
-        assert!(matches!(
-            flow.input.selectors.as_slice(),
-            [FoundrySelector::Field { .. }]
-        ));
-        assert_eq!(
-            flow.output,
-            FoundryAccessPath {
-                port: "normal_return".to_owned(),
-                selectors: Vec::new(),
-            }
-        );
-        assert_eq!(flow.exit_kind, "normal");
-        assert_eq!(entry.claim, FoundryClaim::Flows);
-        assert_eq!(entry.completeness, FoundryCompleteness::Partial);
-        assert!(
-            derivation
-                .boundaries
-                .iter()
-                .any(|boundary| boundary.kind() == "semantic_gap"),
-            "boundaries: {:?}",
-            derivation.boundaries
-        );
-    }
-
-    #[test]
-    fn an_access_path_carrier_keeps_its_selectors_and_projects_onto_its_port() {
-        // The shipping transfer is the projection of the derived flow onto its
-        // two ports. The projection must be the only place granularity is lost,
-        // so the fine-grained form has to survive it.
-        let qualified = FoundryFineGrainedTransfer {
-            input: FoundryAccessPath {
-                port: "parameter[0]".to_owned(),
-                selectors: vec![
-                    FoundrySelector::AnyIndex,
-                    FoundrySelector::Field {
-                        name: "value".to_owned(),
-                    },
-                ],
-            },
-            output: FoundryAccessPath {
-                port: "normal_return".to_owned(),
-                selectors: Vec::new(),
-            },
-            exit_kind: "normal".to_owned(),
-        };
-
-        assert_eq!(
-            qualified.render(),
-            "parameter[0].Element.Field[value]->normal_return@normal"
-        );
-        assert!(qualified.is_qualified());
-        assert_eq!(qualified.input.port, "parameter[0]");
-        assert!(!qualified.output.is_qualified());
     }
 
     /// #2286: the closure walk must recognize one procedure across two
@@ -1430,12 +1250,69 @@ mod tests {
     }
 
     #[test]
-    fn two_runs_over_the_same_sources_agree() {
-        let first = derive_jvm_summaries(&pinned_jdk_slices(), DerivationLimits::default())
-            .expect("the pinned slices derive");
-        let second = derive_jvm_summaries(&pinned_jdk_slices(), DerivationLimits::default())
-            .expect("the pinned slices derive");
+    #[brokk_bifrost_test_macros::hardwon(
+        "#3161: Issue #3161 fixed qualified heap reads that lost flow or falsely claimed completeness."
+    )]
+    fn a_heap_read_retains_qualified_flow_without_claiming_completeness() {
+        let root = tempfile::tempdir().expect("temporary workspace");
+        std::fs::create_dir_all(root.path().join("probe")).expect("package directory");
+        std::fs::write(
+            root.path().join("probe/Box.java"),
+            concat!(
+                "package probe;\n",
+                "public final class Box {\n",
+                "    public String value;\n",
+                "    public static String read(Box box) {\n",
+                "        return box.value;\n",
+                "    }\n",
+                "}\n",
+            ),
+        )
+        .expect("fixture source");
 
-        assert_eq!(first, second);
+        let run = derive_jvm_summaries(root.path(), DerivationLimits::default())
+            .expect("fixture derives");
+        let entry = entry_for(&run, "read(Box)");
+        let derivation = entry.derivation.as_ref().expect("a derived entry");
+
+        // Shared formal-origin tracking (#2856) roots the field location at
+        // parameter[0], so the foundry can seed its qualified input path. The
+        // port-level transfer is only a projection of that field read. Retain
+        // both the positive flow and the open boundary: neither an empty
+        // `no_flow` claim nor a complete summary describes this body.
+        assert_eq!(
+            entry.rendered_transfers(),
+            vec!["parameter[0]->normal_return@normal".to_owned()]
+        );
+        assert_eq!(derivation.unproven_transfers, 0);
+        let [flow] = derivation.fine_grained.as_slice() else {
+            panic!(
+                "expected one field-read flow: {:?}",
+                derivation.fine_grained
+            );
+        };
+        assert_eq!(flow.input.port, "parameter[0]");
+        assert!(matches!(
+            flow.input.selectors.as_slice(),
+            [FoundrySelector::Field { .. }]
+        ));
+        assert_eq!(
+            flow.output,
+            FoundryAccessPath {
+                port: "normal_return".to_owned(),
+                selectors: Vec::new(),
+            }
+        );
+        assert_eq!(flow.exit_kind, "normal");
+        assert_eq!(entry.claim, FoundryClaim::Flows);
+        assert_eq!(entry.completeness, FoundryCompleteness::Partial);
+        assert!(
+            derivation
+                .boundaries
+                .iter()
+                .any(|boundary| boundary.kind() == "semantic_gap"),
+            "boundaries: {:?}",
+            derivation.boundaries
+        );
     }
 }

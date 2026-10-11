@@ -3,6 +3,7 @@ mod go_member_tests;
 #[path = "resolution_operation_go_spelling_tests.rs"]
 mod go_spelling_tests;
 
+use crate::analyzer::store::go_unit_summaries::go_unit_key;
 use brokk_bifrost_core::analyzer::project::WorkspaceOverlayContent;
 use brokk_bifrost_core::analyzer::resolution_facts::{
     FileResolutionFacts, ResolutionGapKind, ResolutionIdentifierRole, ResolutionMemberKind,
@@ -18,6 +19,7 @@ use brokk_bifrost_rust::selected_context::{
     RustCallerTargetKind, RustCallerTargetProfile, RustSelectedManifestMount,
     RustSelectedSourceMount, RustSelectedTopologySourceMount, build_rust_selected_context,
 };
+use brokk_bifrost_test_macros::hardwon;
 use git2::ObjectType;
 use git2::Oid;
 use rusqlite::params;
@@ -25,7 +27,7 @@ use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 use tree_sitter::Parser;
@@ -45,7 +47,9 @@ use crate::analyzer::resolution::{
     visit_selected_root_import_half_pages,
 };
 use crate::analyzer::rust::RustAdapter;
-use crate::analyzer::tree_sitter_analyzer::{FileState, LanguageAdapter, ParsedFile};
+use crate::analyzer::tree_sitter_analyzer::{
+    FileState, LanguageAdapter, ParsedFile, TreeSitterAnalyzer,
+};
 use crate::analyzer::{Language, OverlayProject, Project, ProjectFile, TestProject};
 
 use super::super::resolution_selection::{
@@ -54,8 +58,8 @@ use super::super::resolution_selection::{
 };
 use super::super::{
     AnalyzerStore, GenerationId, PersistBatchTargets, Result, StoreError,
-    WorkspaceConfigurationInput, WorkspaceFileRow, WorkspaceId, WorkspacePackageFileRow,
-    WorkspaceSnapshotId, WorkspaceSnapshots,
+    WorkspaceConfigurationInput, WorkspaceFileRow, WorkspaceId, WorkspaceSnapshotId,
+    WorkspaceSnapshots,
 };
 use super::*;
 
@@ -76,6 +80,123 @@ const SOURCE_PATH: &str = "src/A_Source.java";
 const PROVIDER_PATH: &str = "src/B_Provider.java";
 const REMOVED_PATH: &str = "src/C_Removed.java";
 const SECOND_REPLACEMENT_PATH: &str = "src/D_Replacement.java";
+
+fn persist_test_workspace_snapshot(
+    store: &AnalyzerStore,
+    workspace_id: &WorkspaceId,
+    language: &str,
+    generation: GenerationId,
+    file_versions: Vec<(String, String, String)>,
+) -> WorkspaceSnapshots {
+    let writer_workspace_id = workspace_id.as_str().to_owned();
+    let writer_language = language.to_owned();
+    let generation_value = generation.get();
+    store.conn.execute(move |conn| {
+        let tx = conn.transaction().unwrap();
+        tx.execute(
+            "INSERT INTO workspace_revisions(workspace_id, lang, generation, revision)
+             VALUES(?1, ?2, ?3, 1)",
+            params![writer_workspace_id, writer_language, generation_value],
+        )
+        .unwrap();
+        tx.execute(
+            "INSERT INTO workspace_heads(workspace_id, lang, generation, revision)
+             VALUES(?1, ?2, ?3, 1)",
+            params![writer_workspace_id, writer_language, generation_value],
+        )
+        .unwrap();
+        for (path, blob_oid, projection_digest) in file_versions {
+            tx.execute(
+                "INSERT INTO workspace_file_versions(
+                   workspace_id, lang, generation, rel_path, blob_oid,
+                   projection_digest, valid_from
+                 ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, 1)",
+                params![
+                    writer_workspace_id,
+                    writer_language,
+                    generation_value,
+                    path,
+                    blob_oid,
+                    projection_digest,
+                ],
+            )
+            .unwrap();
+        }
+        tx.commit().unwrap();
+    });
+
+    let mut snapshots = WorkspaceSnapshots::default();
+    snapshots.insert(
+        language.to_owned(),
+        WorkspaceSnapshotId {
+            workspace_id: workspace_id.clone(),
+            lang: language.to_owned(),
+            generation,
+            revision: 1,
+        },
+    );
+    snapshots
+}
+
+fn selected_operation_input<'project, 'selection>(
+    project: &'project dyn Project,
+    workspace_id: &'selection WorkspaceId,
+    snapshots: &'selection WorkspaceSnapshots,
+    languages: &'selection [SelectedResolutionLanguage],
+    overlay_masks: &'selection [SelectedResolutionOverlayMask],
+    content_mounts: Vec<SelectedResolutionContentMountRequest>,
+) -> SelectedResolutionOperationInput<'project, 'selection> {
+    SelectedResolutionOperationInput::new(
+        project,
+        workspace_id,
+        snapshots,
+        languages,
+        overlay_masks,
+    )
+    .with_content_mounts(content_mounts)
+}
+
+fn open_ready_operation<'store, 'project, 'selection>(
+    store: &'store AnalyzerStore,
+    input: SelectedResolutionOperationInput<'project, 'selection>,
+    cancellation: &CancellationToken,
+) -> SelectedResolutionOperation<'store, 'project> {
+    match store
+        .open_selected_resolution_operation(input, cancellation)
+        .expect("open selected resolution test operation")
+    {
+        SelectedResolutionOperationOpenOutcome::Ready(operation) => *operation,
+        outcome => panic!("selected resolution test operation must be Ready: {outcome:?}"),
+    }
+}
+
+fn content_mount_request(
+    publication: super::super::resolution_publication::ResolutionContentWitness,
+    path: &str,
+    blob_oid: Oid,
+) -> SelectedResolutionContentMountRequest {
+    SelectedResolutionContentMountRequest::new(
+        publication,
+        WorkspaceFileRow {
+            rel_path: path.to_owned(),
+            blob_oid,
+        },
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+    )
+}
+
+fn counterfactual_content_mount(
+    content: SelectedResolutionContentMountRequest,
+    original: &str,
+) -> SelectedResolutionContentMountRequest {
+    content.with_counterfactual_base_content_digest(
+        brokk_bifrost_core::analyzer::canonical_hash::sha256_bytes(original.as_bytes()),
+    )
+}
+
 /// The git blob oid of `RICH_JAVA_SOURCE`, which every persisted Java mount in
 /// these fixtures carries.
 ///
@@ -301,16 +422,28 @@ fn point_read_freshness_groups(cost: &ProductionSelectedSqlCost) -> usize {
     freshness_groups
 }
 
+struct ProductionSelectedSqlTraceContext {
+    cost: Mutex<ProductionSelectedSqlCost>,
+    executions: Mutex<crate::hash::HashMap<usize, usize>>,
+    failed: AtomicBool,
+}
+
+impl Default for ProductionSelectedSqlTraceContext {
+    fn default() -> Self {
+        Self {
+            cost: Mutex::new(ProductionSelectedSqlCost::default()),
+            executions: Mutex::new(crate::hash::HashMap::default()),
+            failed: AtomicBool::new(false),
+        }
+    }
+}
+
 thread_local! {
-    static PRODUCTION_SELECTED_SQL_TRACE: RefCell<Option<ProductionSelectedSqlCost>> =
+    static PRODUCTION_SELECTED_SQL_TRACE: RefCell<Option<Box<ProductionSelectedSqlTraceContext>>> =
         const { RefCell::new(None) };
-    static PRODUCTION_SELECTED_SQL_EXECUTIONS: RefCell<crate::hash::HashMap<usize, usize>> =
-        RefCell::new(crate::hash::HashMap::default());
     static TRACE_CONTEXT_PUBLICATION_WORK: std::cell::Cell<bool> =
         const { std::cell::Cell::new(false) };
     static TRACE_SELECTED_MOUNT_CALLERS: std::cell::Cell<bool> =
-        const { std::cell::Cell::new(false) };
-    static PRODUCTION_SELECTED_SQL_TRACE_FAILED: std::cell::Cell<bool> =
         const { std::cell::Cell::new(false) };
 }
 
@@ -353,93 +486,124 @@ pub(super) fn context_publication_work(
 
 unsafe extern "C" fn record_production_selected_sql(
     event: std::ffi::c_uint,
-    _context: *mut std::ffi::c_void,
+    context: *mut std::ffi::c_void,
     statement: *mut std::ffi::c_void,
     raw_sql: *mut std::ffi::c_void,
 ) -> std::ffi::c_int {
     let result = std::panic::catch_unwind(|| {
-        PRODUCTION_SELECTED_SQL_TRACE.with(|trace| {
-            let mut trace = trace.borrow_mut();
-            let trace = trace
-                .as_mut()
-                .expect("production selected SQL trace must be active");
-            match event {
-                rusqlite::ffi::SQLITE_TRACE_STMT => {
-                    assert!(!raw_sql.is_null(), "SQLite statement trace must name SQL");
-                    // SAFETY: SQLITE_TRACE_STMT supplies a callback-lifetime SQL C string.
-                    let sql = unsafe { std::ffi::CStr::from_ptr(raw_sql.cast()) }
-                        .to_string_lossy()
-                        .into_owned();
-                    if TRACE_SELECTED_MOUNT_CALLERS.with(std::cell::Cell::get)
-                        && sql.starts_with("SELECT mount_ordinal,fragment_id,workspace_id")
-                        && sql
-                            .contains("FROM temp.selected_resolution_mounts WHERE mount_ordinal=?1")
-                    {
-                        eprintln!(
-                            "selected mount-record caller: {}",
-                            std::backtrace::Backtrace::force_capture()
-                        );
-                    }
-                    assert!(!statement.is_null());
-                    PRODUCTION_SELECTED_SQL_EXECUTIONS.with(|executions| {
-                        executions
-                            .borrow_mut()
-                            .insert(statement as usize, trace.statements.len());
-                    });
-                    trace.statements.push(sql);
-                    trace.rows_by_statement.push(0);
+        assert!(!context.is_null(), "SQLite trace must have shared state");
+        // SAFETY: registration owns this stable boxed context until it removes
+        // the callback; SQLite invokes the callback synchronously per statement.
+        let trace = unsafe { &*context.cast::<ProductionSelectedSqlTraceContext>() };
+        match event {
+            rusqlite::ffi::SQLITE_TRACE_STMT => {
+                assert!(!raw_sql.is_null(), "SQLite statement trace must name SQL");
+                // SAFETY: SQLITE_TRACE_STMT supplies a callback-lifetime SQL C string.
+                let sql = unsafe { std::ffi::CStr::from_ptr(raw_sql.cast()) }
+                    .to_string_lossy()
+                    .into_owned();
+                if TRACE_SELECTED_MOUNT_CALLERS.with(std::cell::Cell::get)
+                    && sql.starts_with("SELECT mount_ordinal,fragment_id,workspace_id")
+                    && sql.contains("FROM temp.selected_resolution_mounts WHERE mount_ordinal=?1")
+                {
+                    eprintln!(
+                        "selected mount-record caller: {}",
+                        std::backtrace::Backtrace::force_capture()
+                    );
                 }
-                rusqlite::ffi::SQLITE_TRACE_ROW => {
-                    trace.decoded_rows = trace
-                        .decoded_rows
-                        .checked_add(1)
-                        .expect("production selected decoded row count fits usize");
-                    // SAFETY: SQLITE_TRACE_ROW supplies a live sqlite3_stmt.
-                    let sql = unsafe { rusqlite::ffi::sqlite3_sql(statement.cast()) };
-                    // Bundled SQLite skips SetSql while init.busy, suppressing
-                    // STMT in OP_Init; OP_ResultRow still emits every ROW.
-                    if sql.is_null() {
-                        trace.internal_schema_rows += 1;
-                    } else {
-                        let execution = PRODUCTION_SELECTED_SQL_EXECUTIONS
-                            .with(|executions| {
-                                executions.borrow().get(&(statement as usize)).copied()
-                            })
-                            .unwrap_or_else(|| {
-                                // SAFETY: sqlite3_sql text lives with this statement.
-                                let sql = unsafe { std::ffi::CStr::from_ptr(sql) };
-                                panic!("a named row requires its traced execution: {sql:?}");
-                            });
-                        trace.rows_by_statement[execution] += 1;
-                    }
-                }
-                _ => unreachable!("production selected SQL trace registered known events only"),
+                assert!(!statement.is_null());
+                let mut cost = trace.cost.lock().expect("production SQL trace cost lock");
+                let mut executions = trace
+                    .executions
+                    .lock()
+                    .expect("production SQL trace executions lock");
+                executions.insert(statement as usize, cost.statements.len());
+                cost.statements.push(sql);
+                cost.rows_by_statement.push(0);
             }
-        });
+            rusqlite::ffi::SQLITE_TRACE_ROW => {
+                let mut cost = trace.cost.lock().expect("production SQL trace cost lock");
+                cost.decoded_rows = cost
+                    .decoded_rows
+                    .checked_add(1)
+                    .expect("production selected decoded row count fits usize");
+                // SAFETY: SQLITE_TRACE_ROW supplies a live sqlite3_stmt.
+                let sql = unsafe { rusqlite::ffi::sqlite3_sql(statement.cast()) };
+                // Bundled SQLite skips SetSql while init.busy, suppressing
+                // STMT in OP_Init; OP_ResultRow still emits every ROW.
+                if sql.is_null() {
+                    cost.internal_schema_rows += 1;
+                } else {
+                    let execution = trace
+                        .executions
+                        .lock()
+                        .expect("production SQL trace executions lock")
+                        .get(&(statement as usize))
+                        .copied()
+                        .unwrap_or_else(|| {
+                            // SAFETY: sqlite3_sql text lives with this statement.
+                            let sql = unsafe { std::ffi::CStr::from_ptr(sql) };
+                            panic!("a named row requires its traced execution: {sql:?}");
+                        });
+                    cost.rows_by_statement[execution] += 1;
+                }
+            }
+            _ => unreachable!("production selected SQL trace registered known events only"),
+        }
     });
     if result.is_err() {
-        PRODUCTION_SELECTED_SQL_TRACE_FAILED.with(|failed| failed.set(true));
+        // SAFETY: the registered trace context outlives this callback.
+        unsafe { &*context.cast::<ProductionSelectedSqlTraceContext>() }
+            .failed
+            .store(true, Ordering::SeqCst);
     }
     0
 }
 
-#[test]
-fn production_selected_sql_trace_attributes_nested_cursor_rows() {
-    let connection = rusqlite::Connection::open_in_memory().unwrap();
-    PRODUCTION_SELECTED_SQL_TRACE.with(|trace| {
-        assert!(trace.borrow().is_none());
-        *trace.borrow_mut() = Some(ProductionSelectedSqlCost::default());
+fn begin_production_selected_sql_trace_on_connection(connection: &rusqlite::Connection) {
+    let context = PRODUCTION_SELECTED_SQL_TRACE.with(|slot| {
+        let mut slot = slot.borrow_mut();
+        assert!(slot.is_none(), "production selected SQL trace cannot nest");
+        *slot = Some(Box::default());
+        slot.as_deref_mut()
+            .expect("production selected SQL trace is installed")
+            as *mut ProductionSelectedSqlTraceContext
     });
-    // SAFETY: the connection outlives the callback and it is unregistered below.
+    // SAFETY: the connection outlives the callback; its user pointer names
+    // the stable Box retained until the callback is removed.
     let status = unsafe {
         rusqlite::ffi::sqlite3_trace_v2(
             connection.handle(),
             rusqlite::ffi::SQLITE_TRACE_STMT | rusqlite::ffi::SQLITE_TRACE_ROW,
             Some(record_production_selected_sql),
-            std::ptr::null_mut(),
+            context.cast(),
         )
     };
     assert_eq!(status, rusqlite::ffi::SQLITE_OK);
+}
+
+fn finish_production_selected_sql_trace_on_connection(
+    connection: &rusqlite::Connection,
+) -> ProductionSelectedSqlCost {
+    // SAFETY: this is the connection registered above. A zero mask removes
+    // the callback before its shared context is freed.
+    let status = unsafe {
+        rusqlite::ffi::sqlite3_trace_v2(connection.handle(), 0, None, std::ptr::null_mut())
+    };
+    assert_eq!(status, rusqlite::ffi::SQLITE_OK);
+    let cost = checkpoint_production_selected_sql_trace();
+    PRODUCTION_SELECTED_SQL_TRACE.with(|slot| {
+        slot.borrow_mut()
+            .take()
+            .expect("production selected SQL trace must be active");
+    });
+    cost
+}
+
+#[test]
+fn production_selected_sql_trace_attributes_nested_cursor_rows() {
+    let connection = rusqlite::Connection::open_in_memory().unwrap();
+    begin_production_selected_sql_trace_on_connection(&connection);
     // The table has one schema entry and no implicit index. SQLite's
     // OP_ParseSchema reads that entry through a SQL-less internal statement.
     connection
@@ -462,15 +626,7 @@ fn production_selected_sql_trace_attributes_nested_cursor_rows() {
         let mut rows = inner.query([]).unwrap();
         while rows.next().unwrap().is_some() {}
     }
-    // SAFETY: a zero mask removes the callback before assertions/teardown.
-    let status = unsafe {
-        rusqlite::ffi::sqlite3_trace_v2(connection.handle(), 0, None, std::ptr::null_mut())
-    };
-    assert_eq!(status, rusqlite::ffi::SQLITE_OK);
-    let repeated = checkpoint_production_selected_sql_trace();
-    PRODUCTION_SELECTED_SQL_TRACE.with(|trace| {
-        trace.borrow_mut().take().unwrap();
-    });
+    let repeated = finish_production_selected_sql_trace_on_connection(&connection);
     assert_eq!(schema.statement_count(), 1);
     assert_eq!(schema.rows_by_statement, [0]);
     assert_eq!(schema.internal_schema_rows, 1);
@@ -486,69 +642,38 @@ fn production_selected_sql_trace_attributes_nested_cursor_rows() {
 }
 
 fn begin_production_selected_sql_trace(store: &AnalyzerStore) {
-    PRODUCTION_SELECTED_SQL_EXECUTIONS.with(|executions| assert!(executions.borrow().is_empty()));
-    PRODUCTION_SELECTED_SQL_TRACE.with(|trace| {
-        let mut trace = trace.borrow_mut();
-        assert!(trace.is_none(), "production selected SQL trace cannot nest");
-        *trace = Some(ProductionSelectedSqlCost::default());
-    });
-    PRODUCTION_SELECTED_SQL_TRACE_FAILED.with(|failed| {
-        assert!(
-            !failed.replace(false),
-            "the preceding production selected SQL trace failed before teardown"
-        );
-    });
     let connection = store
         .active_read_conn()
         .expect("check out the next production selected reader");
-    // SAFETY: the reader is returned to this store's active pool and the test
-    // checks the same reader out to unregister the callback before teardown.
-    let status = unsafe {
-        rusqlite::ffi::sqlite3_trace_v2(
-            connection.handle(),
-            rusqlite::ffi::SQLITE_TRACE_STMT | rusqlite::ffi::SQLITE_TRACE_ROW,
-            Some(record_production_selected_sql),
-            std::ptr::null_mut(),
-        )
-    };
-    assert_eq!(status, rusqlite::ffi::SQLITE_OK);
+    begin_production_selected_sql_trace_on_connection(&connection);
 }
 
 fn checkpoint_production_selected_sql_trace() -> ProductionSelectedSqlCost {
     // Callers checkpoint after closing cursors. No execution crosses a checkpoint.
-    PRODUCTION_SELECTED_SQL_EXECUTIONS.with(|executions| {
-        *executions.borrow_mut() = crate::hash::HashMap::default();
-    });
-    let failed = PRODUCTION_SELECTED_SQL_TRACE_FAILED.with(|failed| failed.replace(false));
-    let cost = PRODUCTION_SELECTED_SQL_TRACE.with(|trace| {
-        let mut trace = trace.borrow_mut();
-        let trace = trace
-            .as_mut()
+    PRODUCTION_SELECTED_SQL_TRACE.with(|slot| {
+        let slot = slot.borrow();
+        let trace = slot
+            .as_deref()
             .expect("production selected SQL trace must be active");
-        std::mem::take(trace)
-    });
-    assert!(!failed, "production selected SQL trace callback panicked");
-    cost
+        let failed = trace.failed.swap(false, Ordering::SeqCst);
+        let mut cost = trace.cost.lock().expect("production SQL trace cost lock");
+        let mut executions = trace
+            .executions
+            .lock()
+            .expect("production SQL trace executions lock");
+        *executions = crate::hash::HashMap::default();
+        let result = std::mem::take(&mut *cost);
+        assert!(!failed, "production selected SQL trace callback panicked");
+        result
+    })
 }
 
 fn finish_production_selected_sql_trace(store: &AnalyzerStore) -> ProductionSelectedSqlCost {
     let connection = store
         .active_read_conn()
         .expect("check out the traced production selected reader");
-    // SAFETY: this is the same reader registered above. A zero mask removes
-    // the callback before its thread-local state is read.
-    let status = unsafe {
-        rusqlite::ffi::sqlite3_trace_v2(connection.handle(), 0, None, std::ptr::null_mut())
-    };
-    assert_eq!(status, rusqlite::ffi::SQLITE_OK);
+    let cost = finish_production_selected_sql_trace_on_connection(&connection);
     drop(connection);
-    let cost = checkpoint_production_selected_sql_trace();
-    PRODUCTION_SELECTED_SQL_TRACE.with(|trace| {
-        trace
-            .borrow_mut()
-            .take()
-            .expect("production selected SQL trace must be active");
-    });
     cost
 }
 
@@ -596,57 +721,28 @@ impl ResolutionOperationFixture {
         assert_eq!(outcomes.len(), 1);
         assert!(outcomes[0].error.is_none(), "{:#?}", outcomes[0].error);
         let workspace_id = WorkspaceId(WORKSPACE_ID.to_owned());
-        let writer_workspace_id = workspace_id.as_str().to_owned();
-        store.conn.execute(move |conn| {
-            let tx = conn.transaction().unwrap();
-            tx.execute(
-                "INSERT INTO workspace_revisions(workspace_id, lang, generation, revision)
-                 VALUES(?1, 'java', ?2, 1)",
-                params![writer_workspace_id, generation.get()],
+        let file_versions = [
+            SOURCE_PATH,
+            PROVIDER_PATH,
+            REMOVED_PATH,
+            SECOND_REPLACEMENT_PATH,
+        ]
+        .into_iter()
+        .enumerate()
+        .map(|(ordinal, path)| {
+            (
+                path.to_owned(),
+                persisted_oid().to_string(),
+                format!("{:064x}", ordinal + 1),
             )
-            .unwrap();
-            tx.execute(
-                "INSERT INTO workspace_heads(workspace_id, lang, generation, revision)
-                 VALUES(?1, 'java', ?2, 1)",
-                params![writer_workspace_id, generation.get()],
-            )
-            .unwrap();
-            for (ordinal, path) in [
-                SOURCE_PATH,
-                PROVIDER_PATH,
-                REMOVED_PATH,
-                SECOND_REPLACEMENT_PATH,
-            ]
-            .into_iter()
-            .enumerate()
-            {
-                tx.execute(
-                    "INSERT INTO workspace_file_versions(
-                       workspace_id, lang, generation, rel_path, blob_oid,
-                       projection_digest, valid_from
-                     ) VALUES(?1, 'java', ?2, ?3, ?4, ?5, 1)",
-                    params![
-                        writer_workspace_id,
-                        generation.get(),
-                        path,
-                        persisted_oid().to_string(),
-                        format!("{:064x}", ordinal + 1),
-                    ],
-                )
-                .unwrap();
-            }
-            tx.commit().unwrap();
-        });
-
-        let mut snapshots = WorkspaceSnapshots::default();
-        snapshots.insert(
-            "java".to_owned(),
-            WorkspaceSnapshotId {
-                workspace_id: workspace_id.clone(),
-                lang: "java".to_owned(),
-                generation,
-                revision: 1,
-            },
+        })
+        .collect();
+        let snapshots = persist_test_workspace_snapshot(
+            &store,
+            &workspace_id,
+            "java",
+            generation,
+            file_versions,
         );
         Self {
             store,
@@ -686,17 +782,7 @@ impl ResolutionOperationFixture {
         else {
             panic!("uncancelled actual Java fixture publication must succeed");
         };
-        SelectedResolutionContentMountRequest::new(
-            content.into_parts().0,
-            WorkspaceFileRow {
-                rel_path: path.to_owned(),
-                blob_oid: oid,
-            },
-            Vec::new(),
-            Vec::new(),
-            Vec::new(),
-            Vec::new(),
-        )
+        content_mount_request(content.into_parts().0, path, oid)
     }
 
     fn live_content(&self, path: &str, source: &str) -> SelectedResolutionContentMountRequest {
@@ -712,10 +798,7 @@ impl ResolutionOperationFixture {
         original: &str,
         source: &str,
     ) -> SelectedResolutionContentMountRequest {
-        self.published_content(path, source)
-            .with_counterfactual_base_content_digest(
-                brokk_bifrost_core::analyzer::canonical_hash::sha256_bytes(original.as_bytes()),
-            )
+        counterfactual_content_mount(self.published_content(path, source), original)
     }
 
     fn content_mount(&self, path: &str) -> SelectedResolutionContentMountRequest {
@@ -738,17 +821,7 @@ impl ResolutionOperationFixture {
         let ResolutionContentPublicationOutcome::Ready(content) = outcome else {
             panic!("real content fixture publication: {outcome:?}");
         };
-        SelectedResolutionContentMountRequest::new(
-            content.into_parts().0,
-            WorkspaceFileRow {
-                rel_path: path.to_owned(),
-                blob_oid: persisted_oid(),
-            },
-            Vec::new(),
-            Vec::new(),
-            Vec::new(),
-            Vec::new(),
-        )
+        content_mount_request(content.into_parts().0, path, persisted_oid())
     }
 
     fn second_replacement(&self) -> SelectedResolutionContentMountRequest {
@@ -778,14 +851,14 @@ impl ResolutionOperationFixture {
         cancellation: &CancellationToken,
     ) -> Result<SelectedResolutionOperationOpenOutcome<'a, 'a>> {
         self.store.open_selected_resolution_operation(
-            SelectedResolutionOperationInput::new(
+            selected_operation_input(
                 &self.project,
                 &self.workspace_id,
                 &self.snapshots,
                 &self.languages,
                 masks,
-            )
-            .with_content_mounts(replacements),
+                replacements,
+            ),
             cancellation,
         )
     }
@@ -796,10 +869,18 @@ impl ResolutionOperationFixture {
         replacements: Vec<SelectedResolutionContentMountRequest>,
         cancellation: &CancellationToken,
     ) -> SelectedResolutionOperation<'a, 'a> {
-        match self.open(masks, replacements, cancellation).unwrap() {
-            SelectedResolutionOperationOpenOutcome::Ready(operation) => *operation,
-            _ => panic!("complete operation fixture must open Ready"),
-        }
+        open_ready_operation(
+            &self.store,
+            selected_operation_input(
+                &self.project,
+                &self.workspace_id,
+                &self.snapshots,
+                &self.languages,
+                masks,
+                replacements,
+            ),
+            cancellation,
+        )
     }
 
     fn open_with_project<'a>(
@@ -810,14 +891,14 @@ impl ResolutionOperationFixture {
         cancellation: &CancellationToken,
     ) -> Result<SelectedResolutionOperationOpenOutcome<'a, 'a>> {
         self.store.open_selected_resolution_operation(
-            SelectedResolutionOperationInput::new(
+            selected_operation_input(
                 project,
                 &self.workspace_id,
                 &self.snapshots,
                 &self.languages,
                 masks,
-            )
-            .with_content_mounts(replacements),
+                replacements,
+            ),
             cancellation,
         )
     }
@@ -830,14 +911,14 @@ impl ResolutionOperationFixture {
         cancellation: &CancellationToken,
     ) -> Result<SelectedResolutionOperationOpenOutcome<'a, 'a>> {
         self.store.open_selected_resolution_operation(
-            SelectedResolutionOperationInput::new(
+            selected_operation_input(
                 project,
                 &self.workspace_id,
                 &self.snapshots,
                 &self.languages,
                 masks,
-            )
-            .with_content_mounts(content_mounts),
+                content_mounts,
+            ),
             cancellation,
         )
     }
@@ -866,7 +947,7 @@ func use(value *Item) *Item {
 }
 "#;
 
-fn parsed_go_state(
+pub(super) fn parsed_go_state(
     project_root: &Path,
     relative_path: &str,
     source: &str,
@@ -904,40 +985,13 @@ fn parsed_operation_source_state<A: LanguageAdapter>(
     let mut parsed: ParsedFile = adapter.parse_file(&file, &source, &tree);
     parsed.add_file_scope(&file, &source);
     let contains_tests = adapter.contains_tests(&file, &source, &tree, &parsed);
-    let declarations = parsed.declarations().clone();
-    let state = Arc::new(FileState {
+    let state = Arc::new(TreeSitterAnalyzer::<A>::file_state_from_parsed(
         source,
-        package_name: parsed.package_name,
-        content_qualifier: parsed.content_qualifier,
-        top_level_declarations: parsed.top_level_declarations,
-        declarations,
-        definition_lookup_units: parsed.definition_lookup_units,
-        imports: parsed.imports,
-        scala_exports: parsed.scala_exports,
-        rust_usage_facts: parsed.rust_usage_facts,
-        source_facts: parsed.source_facts,
-        source_declaration_units: parsed.source_declaration_units,
-        source_declaration_metadata: parsed.source_declaration_metadata,
-        resolution_facts: parsed.resolution_facts,
-        raw_supertypes: parsed.raw_supertypes,
-        supertype_lookup_paths: parsed.supertype_lookup_paths,
-        type_identifiers: parsed.type_identifiers,
-        signatures: parsed.signatures,
-        signature_metadata: parsed.signature_metadata,
-        signature_metadata_signature_ordinals: parsed.signature_metadata_signature_ordinals,
-        cpp_template_metadata: parsed.cpp_template_metadata,
-        ruby_method_dispatch_modes: parsed.ruby_method_dispatch_modes,
-        ranges: parsed.ranges,
-        children: parsed.children,
-        scala_traits: parsed.scala_traits,
-        type_aliases: parsed.type_aliases,
+        parsed,
         contains_tests,
-        test_region_units: parsed.test_region_units,
-        materialization_records: parsed.materialization_records,
-        parse_errors: Some(Vec::new()),
-        parse_complete: true,
-        additional_projections: Vec::new(),
-    });
+        Some(Vec::new()),
+        true,
+    ));
     let facts = state.resolution_facts.clone();
     (state, facts)
 }
@@ -1068,48 +1122,16 @@ impl GoResolutionOperationFixture {
         assert!(outcomes[0].error.is_none(), "{:#?}", outcomes[0].error);
 
         let workspace_id = WorkspaceId(GO_WORKSPACE_ID.to_owned());
-        let writer_workspace_id = workspace_id.as_str().to_owned();
-        let oid = oid.to_string();
-        store.conn.execute(move |conn| {
-            let tx = conn.transaction().unwrap();
-            tx.execute(
-                "INSERT INTO workspace_revisions(workspace_id, lang, generation, revision)
-                 VALUES(?1, 'go', ?2, 1)",
-                params![writer_workspace_id, generation.get()],
-            )
-            .unwrap();
-            tx.execute(
-                "INSERT INTO workspace_heads(workspace_id, lang, generation, revision)
-                 VALUES(?1, 'go', ?2, 1)",
-                params![writer_workspace_id, generation.get()],
-            )
-            .unwrap();
-            tx.execute(
-                "INSERT INTO workspace_file_versions(
-                   workspace_id, lang, generation, rel_path, blob_oid,
-                   projection_digest, valid_from
-                 ) VALUES(?1, 'go', ?2, ?3, ?4, ?5, 1)",
-                params![
-                    writer_workspace_id,
-                    generation.get(),
-                    GO_SOURCE_PATH,
-                    oid,
-                    format!("{:064x}", 701),
-                ],
-            )
-            .unwrap();
-            tx.commit().unwrap();
-        });
-
-        let mut snapshots = WorkspaceSnapshots::default();
-        snapshots.insert(
-            "go".to_owned(),
-            WorkspaceSnapshotId {
-                workspace_id: workspace_id.clone(),
-                lang: "go".to_owned(),
-                generation,
-                revision: 1,
-            },
+        let snapshots = persist_test_workspace_snapshot(
+            &store,
+            &workspace_id,
+            "go",
+            generation,
+            vec![(
+                GO_SOURCE_PATH.to_owned(),
+                oid.to_string(),
+                format!("{:064x}", 701),
+            )],
         );
         Self {
             store,
@@ -1127,23 +1149,18 @@ impl GoResolutionOperationFixture {
         &'a self,
         cancellation: &CancellationToken,
     ) -> SelectedResolutionOperation<'a, 'a> {
-        let outcome = self
-            .store
-            .open_selected_resolution_operation(
-                SelectedResolutionOperationInput::new(
-                    &self.project,
-                    &self.workspace_id,
-                    &self.snapshots,
-                    &self.languages,
-                    &self.overlay_masks,
-                ),
-                cancellation,
-            )
-            .expect("open persisted Go resolution operation");
-        match outcome {
-            SelectedResolutionOperationOpenOutcome::Ready(operation) => *operation,
-            _ => panic!("complete persisted Go operation must open Ready"),
-        }
+        open_ready_operation(
+            &self.store,
+            selected_operation_input(
+                &self.project,
+                &self.workspace_id,
+                &self.snapshots,
+                &self.languages,
+                &self.overlay_masks,
+                Vec::new(),
+            ),
+            cancellation,
+        )
     }
 }
 
@@ -1217,9 +1234,7 @@ fn default_unrelated_source(index: usize) -> String {
 /// the parameter names a type this workspace does not declare and the body
 /// calls a member on it.
 fn gapped_unrelated_source(index: usize) -> String {
-    format!(
-        "pub fn unrelated_{index:04}(value: UnresolvedUnrelated) -> usize {{ value.unresolved_member() }}\n"
-    )
+    gapped_source("unrelated", "UnresolvedUnrelated", index)
 }
 
 /// A scale file of the consumer's own crate whose resolution cannot complete,
@@ -1229,8 +1244,12 @@ fn gapped_unrelated_source(index: usize) -> String {
 /// The scale files are mounted under `app/src`, so their gaps are inside the
 /// consumer's dependency closure and the unrelated crate's gaps are outside it.
 fn gapped_scale_source(index: usize) -> String {
+    gapped_source("scale", "UnresolvedInClosure", index)
+}
+
+fn gapped_source(function_stem: &str, unresolved_type: &str, index: usize) -> String {
     format!(
-        "pub fn scale_{index:04}(value: UnresolvedInClosure) -> usize {{ value.unresolved_member() }}\n"
+        "pub fn {function_stem}_{index:04}(value: {unresolved_type}) -> usize {{ value.unresolved_member() }}\n"
     )
 }
 
@@ -1255,9 +1274,8 @@ const RUST_ROOT_PROVIDER_SOURCE: &str =
 /// point request that turns a candidate site into a proven reference.
 /// Production builds that callback from the analyzer
 /// (`rust/selected_reverse.rs::confirm_rust_reverse_references`); here the
-/// fixture opens the confirming operation from the same store, with the same
-/// per-site budget, so these tests read the shipped route's answer and not a
-/// stand-in for it.
+/// fixture uses the reverse route's selected operation and the same per-site
+/// budget, so these tests exercise the operation reuse that production uses.
 fn rust_row_reverse_answers(
     fixture: &RustRootResolutionOperationFixture,
     targets: &[CodeUnit],
@@ -1269,14 +1287,13 @@ fn rust_row_reverse_answers(
         .with_rust_row_reverse_queries(
             None,
             cancellation,
-            |root, locators| {
+            |confirming, root, locators| {
                 // Each site keeps the allowance it would have had as its own
                 // request, exactly as the analyzer's confirmation does.
                 let sites = locators.len().max(1);
                 let mut budget = ReceiverAnalysisBudget::default();
                 budget.max_summary_expansions = budget.max_summary_expansions.saturating_mul(sites);
                 budget.max_scope_nodes = budget.max_scope_nodes.saturating_mul(sites);
-                let confirming = fixture.open_ready(cancellation);
                 match confirming.confirm_rust_references_for_caller_bounded(
                     root,
                     locators,
@@ -1319,13 +1336,18 @@ fn rust_row_reverse_answers(
                     },
                 }
             },
-            |queries| match queries.references_to(targets)? {
-                SelectedRustReverseBatchOutcome::Ready(answers) => Ok(answers),
-                SelectedRustReverseBatchOutcome::Unavailable(reason) => {
-                    panic!("the fixture's reverse batch must be available: {reason:?}")
-                }
-                SelectedRustReverseBatchOutcome::Cancelled => {
-                    panic!("an uncancelled reverse batch must be ready")
+            |queries| {
+                let candidates = queries
+                    .candidate_sets(targets)?
+                    .expect("the fixture's reverse targets have candidate sets");
+                match queries.references_to(targets, &candidates)? {
+                    SelectedRustReverseBatchOutcome::Ready(answers) => Ok(answers),
+                    SelectedRustReverseBatchOutcome::Unavailable(reason) => {
+                        panic!("the fixture's reverse batch must be available: {reason:?}")
+                    }
+                    SelectedRustReverseBatchOutcome::Cancelled => {
+                        panic!("an uncancelled reverse batch must be ready")
+                    }
                 }
             },
         )
@@ -1562,6 +1584,9 @@ fn rust_workspace_reverse_preserves_unknown_prefix_gap_with_value_projection() {
 }
 
 #[test]
+#[brokk_bifrost_test_macros::hardwon(
+    "#4460: reverse confirmation must reuse its selected operation"
+)]
 fn selected_rust_associated_and_self_reverse_preserve_coordinate_roles_and_uncertainty() {
     for extra_call in ["", "Self::make();", "Missing::make();"] {
         let mut fixture = RustRootResolutionOperationFixture::new();
@@ -1788,37 +1813,6 @@ const RUST_PRIVATE_INHERENT_SOURCE: &str = concat!(
     "}\n",
 );
 
-#[test]
-fn rust_crate_access_preserves_retained_prepared_statements() {
-    use rusqlite::StatementStatus;
-
-    let fixture = RustRootResolutionOperationFixture::new();
-    let cancellation = CancellationToken::default();
-    let operation = fixture.open_ready(&cancellation);
-    for run in 1..=3 {
-        if run > 1 {
-            operation.crate_access_policy(Vec::new()).unwrap();
-            operation.crate_set_access_policy(Vec::new()).unwrap();
-        }
-        let mut statement = operation
-            .ready
-            .inventory
-            .connection()
-            .prepare_cached("SELECT 1 /* retained crate access plan */")
-            .unwrap();
-        assert_eq!(
-            statement.query_row([], |row| row.get::<_, i64>(0)).unwrap(),
-            1
-        );
-        assert_eq!(statement.get_status(StatementStatus::Run), run);
-        assert_eq!(
-            statement.get_status(StatementStatus::RePrepare),
-            0,
-            "crate access must not invalidate unrelated prepared SQL at run {run}"
-        );
-    }
-}
-
 struct RustRootResolutionOperationFixture {
     store: AnalyzerStore,
     _project_root: tempfile::TempDir,
@@ -1837,8 +1831,423 @@ struct RustRootResolutionOperationFixture {
 }
 
 #[test]
-fn named_root_route_absence_closes_the_mount_and_leaves_the_import_unbound() {
-    assert_named_root_route_completion("", true);
+#[brokk_bifrost_test_macros::hardwon(
+    "#4460: a crate-anchored `use` of a module left its qualified type route unplaced"
+)]
+fn selected_rust_crate_anchored_module_alias_places_qualified_type_route() {
+    let mut fixture = RustRootResolutionOperationFixture::new();
+    let (_, facts) = fixture.replace_persisted_consumer_source(
+        "pub mod local { pub struct Item; }\nuse crate::local::{self as alias};\npub fn caller(_: alias::Item) {}\n",
+    );
+    let declaration = site_for_identifier(
+        &facts,
+        "Item",
+        ResolutionIdentifierRole::Declaration,
+        ResolutionNamespace::Type,
+    );
+    let expected = facts
+        .definition_units
+        .iter()
+        .find(|crosswalk| crosswalk.declaration == declaration)
+        .expect("the local module's type definition unit")
+        .unit
+        .clone();
+    let reference = site_for_identifier(
+        &facts,
+        "Item",
+        ResolutionIdentifierRole::Reference,
+        ResolutionNamespace::Type,
+    );
+    let range = facts
+        .sites
+        .iter()
+        .find(|site| site.id == reference)
+        .expect("the aliased module's type reference range");
+    let cancellation = CancellationToken::new();
+    let operation = fixture.open_ready(&cancellation);
+    let SelectedRustFileContextOutcome::Ready { context, .. } = operation
+        .rust_test_crate_context(fixture.profile.clone(), &cancellation)
+        .expect("build selected Rust module alias context")
+    else {
+        panic!("selected Rust module alias context must be ready")
+    };
+    let result = operation
+        .resolve_rust_reference(
+            *context,
+            &SelectedSemanticLocator::for_reference_range(
+                "rust",
+                RUST_ROOT_CONSUMER_PATH,
+                range.start_byte,
+                range.end_byte,
+            ),
+            &cancellation,
+            &mut SelectedResolutionContextMetrics,
+        )
+        .expect("resolve type through crate-anchored module alias");
+    let SelectedResolutionOperationOutcome::Native(SelectedResolutionLocated::Found(result)) =
+        result
+    else {
+        panic!("the aliased module type reference must be found natively")
+    };
+    let result = only_rust_point_answer(result);
+    assert_eq!(result.definitions, [expected]);
+    assert_eq!(
+        result.resolution.completion(),
+        &ResolutionCompletion::Complete
+    );
+}
+
+#[test]
+#[brokk_bifrost_test_macros::hardwon(
+    "#4460: a nested unaliased `self` import did not place its module route"
+)]
+fn selected_rust_nested_unaliased_self_import_places_qualified_type_route() {
+    let mut fixture = RustRootResolutionOperationFixture::new();
+    let source = "pub mod local { pub struct Item; }\nmod consumer {\n    use crate::{local::{self}};\n    pub fn caller(_: local::Item) {}\n}\n";
+    let (state, facts) = fixture.replace_persisted_consumer_source(source);
+    let blob_oid = Oid::hash_object(ObjectType::Blob, source.as_bytes())
+        .expect("hash nested self import source")
+        .to_string();
+    assert_eq!(
+        state
+            .rust_usage_facts
+            .import_targets
+            .iter()
+            .filter(|target| target.bound_name.as_deref() == Some("local"))
+            .map(|target| (
+                target.module_path.join("::"),
+                target.imported_name.as_deref().unwrap_or("").to_owned(),
+            ))
+            .collect::<Vec<_>>(),
+        [("crate::local".to_owned(), "self".to_owned())]
+    );
+    let declaration = site_for_identifier(
+        &facts,
+        "Item",
+        ResolutionIdentifierRole::Declaration,
+        ResolutionNamespace::Type,
+    );
+    let expected = facts
+        .definition_units
+        .iter()
+        .find(|crosswalk| crosswalk.declaration == declaration)
+        .expect("the local module's type definition unit")
+        .unit
+        .clone();
+    let reference = site_for_identifier(
+        &facts,
+        "Item",
+        ResolutionIdentifierRole::Reference,
+        ResolutionNamespace::Type,
+    );
+    let range = facts
+        .sites
+        .iter()
+        .find(|site| site.id == reference)
+        .expect("the nested module's type reference range");
+    let source_blob_oid = blob_oid.clone();
+    let source_import = fixture.store.conn.execute(move |conn| {
+        conn.query_row(
+            "SELECT module_path, imported_name, bound_name FROM source_rust_import_targets
+             WHERE blob_id=(SELECT id FROM blobs WHERE blob_oid=?1 AND lang='rust')
+               AND bound_name='local'",
+            [&source_blob_oid],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            },
+        )
+        .expect("the nested `self` import's canonical source target")
+    });
+    assert_eq!(
+        source_import,
+        ("crate::local".into(), "self".into(), "local".into())
+    );
+    let binding_blob_oid = blob_oid.clone();
+    let module_binding = fixture.store.conn.execute(move |conn| {
+        conn.query_row(
+            "SELECT target_module_path, target_name FROM rust_crate_imports
+             WHERE blob_id=(SELECT id FROM blobs WHERE blob_oid=?1 AND lang='rust')
+               AND module_path='crate::consumer' AND bound_name='local' AND namespace='type'",
+            [&binding_blob_oid],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+        )
+        .expect("the nested `self` import's persisted module binding")
+    });
+    assert_eq!(module_binding, ("crate::local".into(), "self".into()));
+    let cancellation = CancellationToken::new();
+    let operation = fixture.open_ready(&cancellation);
+    let SelectedRustFileContextOutcome::Ready { context, .. } = operation
+        .rust_test_crate_context(fixture.profile.clone(), &cancellation)
+        .expect("build selected nested module import context")
+    else {
+        panic!("selected nested module import context must be ready")
+    };
+    let result = operation
+        .resolve_rust_reference(
+            *context,
+            &SelectedSemanticLocator::for_reference_range(
+                "rust",
+                RUST_ROOT_CONSUMER_PATH,
+                range.start_byte,
+                range.end_byte,
+            ),
+            &cancellation,
+            &mut SelectedResolutionContextMetrics,
+        )
+        .expect("resolve type through nested unaliased module import");
+    let SelectedResolutionOperationOutcome::Native(SelectedResolutionLocated::Found(result)) =
+        result
+    else {
+        panic!("the nested module type reference must be found natively")
+    };
+    let result = only_rust_point_answer(result);
+    assert_eq!(result.definitions, [expected]);
+    assert_eq!(
+        result.resolution.completion(),
+        &ResolutionCompletion::Complete
+    );
+}
+
+#[test]
+#[brokk_bifrost_test_macros::hardwon(
+    "#4460: an enum value-namespace member route was rejected as an unplaced prefix"
+)]
+fn selected_rust_external_module_enum_variant_value_route_resolves_through_type_prefix() {
+    let mut fixture = RustRootResolutionOperationFixture::new();
+    let variant_source = "#[cfg_attr(feature = \"serde\", derive(Deserialize, Serialize))]\n#[derive(Debug, PartialEq, Eq, Hash, Clone, Copy)]\n#[non_exhaustive]\npub enum Algorithm { Reserved, Unassigned(u8) }\nunexpanded_items!();\nimpl From<Algorithm> for u8 {\n    fn from(algorithm: Algorithm) -> Self {\n        match algorithm {\n            Algorithm::Unassigned(value) => value,\n            Algorithm::Reserved => 0,\n        }\n    }\n}\n#[cfg(test)]\nmod tests {\n    use crate::rr::rdata::sshfp::Algorithm;\n    pub fn reserved() -> Algorithm { Algorithm::Reserved }\n}\n";
+    let facts_by_path = fixture.replace_persisted_consumer_and_sources(
+        "pub mod rr;\n",
+        &[
+            ("app/src/rr.rs", "pub mod rdata;\n"),
+            ("app/src/rr/rdata.rs", "pub mod sshfp;\n"),
+            ("app/src/rr/rdata/sshfp.rs", variant_source),
+        ],
+    );
+    let facts = facts_by_path
+        .get("app/src/rr/rdata/sshfp.rs")
+        .expect("the external SSHFP module resolution facts");
+    let declaration = site_for_identifier(
+        facts,
+        "Unassigned",
+        ResolutionIdentifierRole::Declaration,
+        ResolutionNamespace::Constructor,
+    );
+    let expected = facts
+        .definition_units
+        .iter()
+        .find(|crosswalk| crosswalk.declaration == declaration)
+        .expect("the enum variant definition unit")
+        .unit
+        .clone();
+    let reference = site_for_identifier(
+        facts,
+        "Unassigned",
+        ResolutionIdentifierRole::Reference,
+        ResolutionNamespace::Value,
+    );
+    let range = facts
+        .sites
+        .iter()
+        .find(|site| site.id == reference)
+        .expect("the enum variant reference range");
+    let cancellation = CancellationToken::new();
+    let operation = fixture.open_ready(&cancellation);
+    let SelectedRustFileContextOutcome::Ready { context, .. } = operation
+        .rust_test_crate_context(fixture.profile.clone(), &cancellation)
+        .expect("build selected Rust enum variant context")
+    else {
+        panic!("selected Rust enum variant context must be ready")
+    };
+    let result = operation
+        .resolve_rust_reference(
+            *context,
+            &SelectedSemanticLocator::for_reference_range(
+                "rust",
+                "app/src/rr/rdata/sshfp.rs",
+                range.start_byte,
+                range.end_byte,
+            ),
+            &cancellation,
+            &mut SelectedResolutionContextMetrics,
+        )
+        .expect("resolve enum variant through its type prefix");
+    let SelectedResolutionOperationOutcome::Native(SelectedResolutionLocated::Found(result)) =
+        result
+    else {
+        panic!("the enum variant reference must be found natively")
+    };
+    let result = only_rust_point_answer(result);
+    assert_eq!(result.definitions, [expected]);
+    assert!(matches!(
+        result.resolution.completion(),
+        ResolutionCompletion::Incomplete(_)
+    ));
+}
+
+#[test]
+#[brokk_bifrost_test_macros::hardwon(
+    "#4460: `super::super` grouped `self` imports did not place their module route"
+)]
+fn selected_rust_super_relative_self_import_places_qualified_type_route() {
+    let mut fixture = RustRootResolutionOperationFixture::new();
+    let source = "pub mod dispatch { pub struct Sender; }\npub mod inner {\n    pub mod leaf {\n        use super::super::dispatch::{self};\n        pub fn caller(_: dispatch::Sender) {}\n    }\n}\n";
+    let (_, facts) = fixture.replace_persisted_consumer_source(source);
+    let declaration = site_for_identifier(
+        &facts,
+        "Sender",
+        ResolutionIdentifierRole::Declaration,
+        ResolutionNamespace::Type,
+    );
+    let expected = facts
+        .definition_units
+        .iter()
+        .find(|crosswalk| crosswalk.declaration == declaration)
+        .expect("the dispatch module type definition unit")
+        .unit
+        .clone();
+    let reference = site_for_identifier(
+        &facts,
+        "Sender",
+        ResolutionIdentifierRole::Reference,
+        ResolutionNamespace::Type,
+    );
+    let range = facts
+        .sites
+        .iter()
+        .find(|site| site.id == reference)
+        .expect("the super-relative module type reference range");
+    let cancellation = CancellationToken::new();
+    let operation = fixture.open_ready(&cancellation);
+    let SelectedRustFileContextOutcome::Ready { context, .. } = operation
+        .rust_test_crate_context(fixture.profile.clone(), &cancellation)
+        .expect("build selected super-relative module import context")
+    else {
+        panic!("selected super-relative module import context must be ready")
+    };
+    let result = operation
+        .resolve_rust_reference(
+            *context,
+            &SelectedSemanticLocator::for_reference_range(
+                "rust",
+                RUST_ROOT_CONSUMER_PATH,
+                range.start_byte,
+                range.end_byte,
+            ),
+            &cancellation,
+            &mut SelectedResolutionContextMetrics,
+        )
+        .expect("resolve type through a super-relative self import");
+    let SelectedResolutionOperationOutcome::Native(SelectedResolutionLocated::Found(result)) =
+        result
+    else {
+        panic!("the super-relative module type reference must be found natively")
+    };
+    let result = only_rust_point_answer(result);
+    assert_eq!(result.definitions, [expected]);
+    assert_eq!(
+        result.resolution.completion(),
+        &ResolutionCompletion::Complete
+    );
+}
+
+#[test]
+#[brokk_bifrost_test_macros::hardwon(
+    "#4460: a module-self import in an external module file did not place a receiver type route"
+)]
+fn selected_rust_external_module_self_import_places_receiver_type_route() {
+    let mut fixture = RustRootResolutionOperationFixture::new();
+    let facts_by_path = fixture.replace_persisted_consumer_and_sources(
+        "#[cfg(target_has_atomic = \"ptr\")]\npub mod base;\npub mod comparator;\npub mod map;\n",
+        &[
+            ("app/src/base.rs", "pub struct SkipList;\nimpl SkipList { pub fn back(&self) {} }\npub fn try_pin_loop() {}\n"),
+            ("app/src/comparator.rs", "pub struct BasicComparator;\npub trait Comparator { fn compare(); }\n"),
+            ("app/src/map.rs", "use crate::{base::{self, try_pin_loop}, comparator::{self, BasicComparator, Comparator}};\npub struct Map { inner: base::SkipList }\nimpl Map { pub fn back(&self) { self.inner.back(); try_pin_loop(); let _ = comparator::BasicComparator; } }\n"),
+        ],
+    );
+    let map_facts = facts_by_path
+        .get("app/src/map.rs")
+        .expect("external map module facts");
+    let reference = site_for_identifier(
+        map_facts,
+        "back",
+        ResolutionIdentifierRole::Reference,
+        ResolutionNamespace::Callable,
+    );
+    let range = map_facts
+        .sites
+        .iter()
+        .find(|site| site.id == reference)
+        .expect("receiver method reference range");
+    let base_facts = facts_by_path
+        .get("app/src/base.rs")
+        .expect("external base module facts");
+    let declaration = site_for_identifier(
+        base_facts,
+        "back",
+        ResolutionIdentifierRole::Declaration,
+        ResolutionNamespace::Value,
+    );
+    let expected = base_facts
+        .definition_units
+        .iter()
+        .find(|crosswalk| crosswalk.declaration == declaration)
+        .expect("the base module's back method definition unit")
+        .unit
+        .clone();
+    let blob_oid = Oid::hash_object(
+        ObjectType::Blob,
+        "use crate::{base::{self, try_pin_loop}, comparator::{self, BasicComparator, Comparator}};\npub struct Map { inner: base::SkipList }\nimpl Map { pub fn back(&self) { self.inner.back(); try_pin_loop(); let _ = comparator::BasicComparator; } }\n".as_bytes(),
+    )
+    .expect("hash external map source")
+    .to_string();
+    let source_binding = fixture.store.conn.execute(move |conn| {
+        conn.query_row(
+            "SELECT target_module_path, target_name FROM rust_crate_imports
+             WHERE blob_id=(SELECT id FROM blobs WHERE blob_oid=?1 AND lang='rust')
+               AND module_path='crate::map' AND bound_name='base' AND namespace='type'",
+            [&blob_oid],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+        )
+        .expect("external module's persisted self-import route")
+    });
+    assert_eq!(source_binding, ("crate::base".into(), "self".into()));
+
+    let cancellation = CancellationToken::new();
+    let operation = fixture.open_ready(&cancellation);
+    let SelectedRustFileContextOutcome::Ready { context, .. } = operation
+        .rust_test_crate_context(fixture.profile.clone(), &cancellation)
+        .expect("build external module import context")
+    else {
+        panic!("external module import context must be ready")
+    };
+    let result = operation
+        .resolve_rust_reference(
+            *context,
+            &SelectedSemanticLocator::for_reference_range(
+                "rust",
+                "app/src/map.rs",
+                range.start_byte,
+                range.end_byte,
+            ),
+            &cancellation,
+            &mut SelectedResolutionContextMetrics,
+        )
+        .expect("resolve receiver method through external module self-import");
+    let SelectedResolutionOperationOutcome::Native(SelectedResolutionLocated::Found(result)) =
+        result
+    else {
+        panic!("external module receiver method must be found natively")
+    };
+    let result = only_rust_point_answer(result);
+    assert_eq!(result.definitions, [expected]);
+    assert_eq!(
+        result.resolution.completion(),
+        &ResolutionCompletion::Complete
+    );
 }
 
 #[test]
@@ -2218,6 +2627,92 @@ impl RustRootResolutionOperationFixture {
         (state, facts)
     }
 
+    fn replace_persisted_consumer_and_sources(
+        &mut self,
+        consumer_source: &str,
+        extra_sources: &[(&str, &str)],
+    ) -> BTreeMap<String, FileResolutionFacts> {
+        let mut sources = self.source_rows();
+        let mut topology_sources = self.selected_sources.to_vec();
+        let mut prepared = Vec::new();
+        let mut facts_by_path = BTreeMap::new();
+        for (relative_path, source) in std::iter::once((RUST_ROOT_CONSUMER_PATH, consumer_source))
+            .chain(extra_sources.iter().copied())
+        {
+            ProjectFile::new(self._project_root.path(), relative_path)
+                .write(source)
+                .expect("write private Rust persisted source");
+            let (state, facts) = parsed_operation_state(
+                self._project_root.path(),
+                relative_path,
+                source,
+                &RustAdapter,
+            );
+            let oid = Oid::hash_object(ObjectType::Blob, source.as_bytes())
+                .expect("hash private Rust persisted source");
+            prepared.push(
+                AnalyzerStore::prepare_parsed_blob(
+                    oid,
+                    "rust",
+                    self.generation,
+                    &RustAdapter,
+                    Arc::clone(&state),
+                )
+                .expect("prepare private Rust persisted source"),
+            );
+            let relative_path = PathBuf::from(relative_path);
+            let source_row = crate::path_utils::rel_path_string(&ProjectFile::new(
+                self._project_root.path(),
+                &relative_path,
+            ));
+            if let Some(existing) = sources
+                .iter_mut()
+                .find(|existing| existing.rel_path == source_row)
+            {
+                existing.blob_oid = oid;
+            } else {
+                sources.push(WorkspaceFileRow {
+                    rel_path: source_row.clone(),
+                    blob_oid: oid,
+                });
+            }
+            topology_sources.retain(|existing| existing.relative_path != relative_path);
+            topology_sources.push(RustSelectedTopologySourceMount {
+                relative_path,
+                content_oid: oid,
+                facts: state.rust_usage_facts.clone(),
+            });
+            assert!(facts_by_path.insert(source_row, facts).is_none());
+        }
+        let (outcomes, _) = self
+            .store
+            .persist_prepared_blobs(prepared, PersistBatchTargets::PRODUCTION);
+        assert_eq!(outcomes.len(), extra_sources.len() + 1);
+        assert!(
+            outcomes.iter().all(|outcome| outcome.error.is_none()),
+            "{outcomes:#?}"
+        );
+        let snapshot = sync_rust_operation_inputs(
+            &self.store,
+            &self.workspace_id,
+            self.generation,
+            self._project_root.path(),
+            &sources,
+            &self.selected_manifests,
+        )
+        .expect("publish private Rust persisted sources");
+        self.snapshots
+            .get_mut("rust")
+            .expect("Rust private persisted snapshot")
+            .revision = snapshot.revision;
+        self.selected_sources = topology_sources.into_boxed_slice();
+        self.consumer_facts = facts_by_path
+            .get(RUST_ROOT_CONSUMER_PATH)
+            .expect("replacement Rust consumer facts")
+            .clone();
+        facts_by_path
+    }
+
     fn new_with_source_mount_count(source_mount_count: usize) -> Self {
         Self::new_with_counts(source_mount_count, 0)
     }
@@ -2554,17 +3049,7 @@ impl RustRootResolutionOperationFixture {
         else {
             panic!("live Rust replacement publication must succeed");
         };
-        SelectedResolutionContentMountRequest::new(
-            content.into_parts().0,
-            WorkspaceFileRow {
-                rel_path: path.to_owned(),
-                blob_oid: oid,
-            },
-            Vec::new(),
-            Vec::new(),
-            Vec::new(),
-            Vec::new(),
-        )
+        content_mount_request(content.into_parts().0, path, oid)
     }
 
     fn publish_counterfactual_content(
@@ -2577,10 +3062,10 @@ impl RustRootResolutionOperationFixture {
         let original = ProjectFile::new(self._project_root.path(), path)
             .read_to_string()
             .expect("read original counterfactual source");
-        self.publish_content(path, source, state, cancellation)
-            .with_counterfactual_base_content_digest(
-                brokk_bifrost_core::analyzer::canonical_hash::sha256_bytes(original.as_bytes()),
-            )
+        counterfactual_content_mount(
+            self.publish_content(path, source, state, cancellation),
+            &original,
+        )
     }
 
     fn open_content_selected<'a>(
@@ -2589,24 +3074,18 @@ impl RustRootResolutionOperationFixture {
         content_mounts: Vec<SelectedResolutionContentMountRequest>,
         cancellation: &CancellationToken,
     ) -> SelectedResolutionOperation<'a, 'a> {
-        match self
-            .store
-            .open_selected_resolution_operation(
-                SelectedResolutionOperationInput::new(
-                    &self.project,
-                    &self.workspace_id,
-                    &self.snapshots,
-                    &self.languages,
-                    masks,
-                )
-                .with_content_mounts(content_mounts),
-                cancellation,
-            )
-            .expect("open Rust operation with published content")
-        {
-            SelectedResolutionOperationOpenOutcome::Ready(operation) => *operation,
-            _ => panic!("complete published Rust content must open Ready"),
-        }
+        open_ready_operation(
+            &self.store,
+            selected_operation_input(
+                &self.project,
+                &self.workspace_id,
+                &self.snapshots,
+                &self.languages,
+                masks,
+                content_mounts,
+            ),
+            cancellation,
+        )
     }
 
     fn open_selected_with_project<'a>(
@@ -2615,23 +3094,18 @@ impl RustRootResolutionOperationFixture {
         masks: &'a [SelectedResolutionOverlayMask],
         cancellation: &CancellationToken,
     ) -> SelectedResolutionOperation<'a, 'a> {
-        match self
-            .store
-            .open_selected_resolution_operation(
-                SelectedResolutionOperationInput::new(
-                    project,
-                    &self.workspace_id,
-                    &self.snapshots,
-                    &self.languages,
-                    masks,
-                ),
-                cancellation,
-            )
-            .expect("open persisted Rust root resolution operation")
-        {
-            SelectedResolutionOperationOpenOutcome::Ready(operation) => *operation,
-            _ => panic!("complete persisted Rust root operation must open Ready"),
-        }
+        open_ready_operation(
+            &self.store,
+            selected_operation_input(
+                project,
+                &self.workspace_id,
+                &self.snapshots,
+                &self.languages,
+                masks,
+                Vec::new(),
+            ),
+            cancellation,
+        )
     }
 }
 
@@ -2887,28 +3361,26 @@ fn rust_root_half_read_work_is_bounded_by_its_mount_scope() {
 /// both now install it where the graph stage does. Measured before that: 1
 /// unrelated gapped file gave 1 decoded row and 200 gave 200.
 ///
-/// The owner decided on 2026-09-17 what a forward request's completion covers:
-/// a gap in a blob the request cannot bind into cannot qualify its answer,
-/// because nothing that blob hides was ever a candidate.
-/// `narrowed_forward_scope_keeps_in_closure_gap_reasons` pins the other half,
-/// that a gap inside the closure still qualifies it. The read itself is pinned
-/// by `the_candidate_gap_header_reads_are_driven_by_their_mount_scope` (the
-/// plan) and `the_candidate_gap_header_reads_answer_the_reads_they_replaced`
-/// (the answer).
+/// Known-terminal qualified gaps are endpoint and lookup scoped. Adding more
+/// such gaps outside the requested name must not grow the fragment-wide read.
 #[test]
-fn rust_candidate_gap_header_read_work_is_bounded_by_its_mount_scope() {
+fn rust_qualified_endpoint_gaps_are_not_loaded_as_fragment_wide_candidate_gaps() {
     let measurements = [1_usize, 200].map(|unrelated_crate_sources| {
         let fixture =
             RustRootResolutionOperationFixture::new_with_unrelated_gapped_crate_source_count(
                 unrelated_crate_sources,
             );
-        let workspace_gap_headers = fixture.store.conn.execute(|conn| {
+        let qualified_origin =
+            crate::analyzer::store::resolution_prepare::resolution_rows::gap_origin_code(
+                crate::analyzer::resolution::LoweringGapOrigin::QualifiedReference,
+            );
+        let (workspace_fragment_wide_gaps, keyed_qualified_gaps) = fixture.store.conn.execute(move |conn| {
             conn.query_row(
-                "SELECT COUNT(*) FROM resolution_gaps WHERE covers IN (0, 2, 3)",
-                [],
-                |row| row.get::<_, i64>(0),
+                "SELECT coalesce(sum(g.covers IN (0, 2, 3)), 0),\n                         coalesce(sum(r.origin = ?1 AND g.covers IN (5, 6)), 0)\n                 FROM resolution_gaps g\n                 JOIN resolution_gap_reasons r ON r.blob_id = g.blob_id AND r.reason = g.reason",
+                [qualified_origin],
+                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
             )
-            .expect("count the workspace's fragment-wide candidate gap headers")
+            .expect("count fragment-wide and keyed qualified candidate gap headers")
         });
         let reference = site_for_identifier(
             &fixture.consumer_facts,
@@ -2932,11 +3404,10 @@ fn rust_candidate_gap_header_read_work_is_bounded_by_its_mount_scope() {
         // The trace follows the reader the operation checks out, so it has to
         // be installed before the operation opens.
         begin_production_selected_sql_trace(&fixture.store);
-        let operation = fixture.open_ready(&cancellation);
+        let mut operation = fixture.open_ready(&cancellation);
         let _open = checkpoint_production_selected_sql_trace();
         let mount_count = operation.mount_table().mount_count();
-        // The request consumes the operation, which returns the traced reader
-        // so the trace can be removed below.
+        // The operation retains its selected reader across point requests.
         let answered = operation
             .resolve_rust_reference_for_caller_bounded(
                 Path::new(RUST_ROOT_CONSUMER_PATH),
@@ -2951,6 +3422,7 @@ fn rust_candidate_gap_header_read_work_is_bounded_by_its_mount_scope() {
             matches!(answered, BoundedResolution::Complete { .. }),
             "the point request must answer inside its budget"
         );
+        drop(operation);
         let search = finish_production_selected_sql_trace(&fixture.store);
         let gap_header_rows = search
             .rows_by_shape()
@@ -2961,24 +3433,30 @@ fn rust_candidate_gap_header_read_work_is_bounded_by_its_mount_scope() {
         (
             unrelated_crate_sources,
             mount_count,
-            workspace_gap_headers,
+            workspace_fragment_wide_gaps,
+            keyed_qualified_gaps,
             gap_header_rows,
         )
     });
     eprintln!(
-        "candidate gap header read (unrelated gapped sources, selected mounts, workspace fragment gap headers, decoded gap header rows): {measurements:?}"
+        "qualified gap read (unrelated gapped sources, selected mounts, workspace fragment-wide gaps, keyed qualified gaps, decoded gap rows): {measurements:?}"
     );
     assert!(
         measurements[1].1 > measurements[0].1,
         "the larger workspace must hold more selected mounts for this pin to mean anything: {measurements:?}"
     );
+    assert_eq!(
+        measurements.map(|measurement| measurement.2),
+        [0, 0],
+        "known-terminal qualified gaps must not become fragment-wide rows: {measurements:?}"
+    );
     assert!(
-        measurements[1].2 > measurements[0].2,
-        "the unrelated files must carry fragment-wide gap headers for this pin to mean anything: {measurements:?}"
+        measurements[1].3 > measurements[0].3,
+        "adding gapped files must add keyed qualified rows: {measurements:?}"
     );
     assert_eq!(
-        measurements[0].3, measurements[1].3,
-        "gap headers in a crate the request cannot bind into must cost it nothing: {measurements:?}"
+        measurements[0].4, measurements[1].4,
+        "unrelated keyed qualified gaps must not add rows to the point request: {measurements:?}"
     );
 }
 
@@ -3169,34 +3647,26 @@ fn a_blobs_gap_rows_name_reasons_and_identities_that_exist() {
     );
 }
 
-/// The other half of the closure rule: a gap inside the request's own crate
-/// closure still qualifies its answer.
-///
-/// `rust_candidate_gap_header_read_work_is_bounded_by_its_mount_scope` shows
-/// that a gap in a crate the request cannot bind into costs it nothing.
-/// Narrowing must not be read as "see fewer gaps": a blob the request can bind
-/// into can hide a candidate, so its gaps do qualify the answer and every one
-/// of them is in the box the request builds. The box is one reason per decoded
-/// header row, so the rows are the reasons.
-///
-/// Each fixture holds `in_closure_gapped_sources` gapped files in the
-/// consumer's own crate and exactly one in the unrelated crate, and the pin is
-/// an equality rather than a growth rate: the request reads the in-closure
-/// gaps and only those. A request that read the whole selection's gaps would
-/// decode one row more at both sizes, and one that read none would decode
-/// zero.
-///
-/// The reported completion is not the instrument here. The unconditional box
-/// reaches an answer through `scope_reverse_inventory_completion`, which keeps
-/// only the reasons whose semantic mounts in a reverse fragment the request
-/// admitted, so a request whose binding completes reports none of them however
-/// many its box holds. What this pin is about is which gaps reach the box.
+/// Known-terminal qualified gaps in and outside a forward closure have
+/// endpoint keys and do not belong in the fragment-wide reader.
 #[test]
-fn narrowed_forward_scope_keeps_in_closure_gap_reasons() {
+fn scoped_qualified_gaps_do_not_enter_the_fragment_wide_gap_reader() {
     let measurements = [1_usize, 4].map(|in_closure_gapped_sources| {
         let fixture = RustRootResolutionOperationFixture::new_with_in_closure_gapped_source_count(
             in_closure_gapped_sources,
         );
+        let qualified_origin =
+            crate::analyzer::store::resolution_prepare::resolution_rows::gap_origin_code(
+                crate::analyzer::resolution::LoweringGapOrigin::QualifiedReference,
+            );
+        let keyed_qualified_gaps = fixture.store.conn.execute(move |conn| {
+            conn.query_row(
+                "SELECT COUNT(*)\n                 FROM resolution_gaps g\n                 JOIN resolution_gap_reasons r ON r.blob_id = g.blob_id AND r.reason = g.reason\n                 WHERE r.origin = ?1 AND g.covers IN (5, 6)",
+                [qualified_origin],
+                |row| row.get::<_, i64>(0),
+            )
+            .expect("count keyed qualified gap rows in the fixture")
+        });
         let reference = site_for_identifier(
             &fixture.consumer_facts,
             "alias",
@@ -3217,7 +3687,7 @@ fn narrowed_forward_scope_keeps_in_closure_gap_reasons() {
         );
         let cancellation = CancellationToken::default();
         begin_production_selected_sql_trace(&fixture.store);
-        let operation = fixture.open_ready(&cancellation);
+        let mut operation = fixture.open_ready(&cancellation);
         let _open = checkpoint_production_selected_sql_trace();
         let answered = operation
             .resolve_rust_reference_for_caller_bounded(
@@ -3229,17 +3699,13 @@ fn narrowed_forward_scope_keeps_in_closure_gap_reasons() {
                 &mut ResolutionBatchMetrics::default(),
             )
             .expect("the point request answers");
+        drop(operation);
         let search = finish_production_selected_sql_trace(&fixture.store);
         assert!(
             matches!(answered, BoundedResolution::Complete { .. }),
             "the point request must answer inside its budget"
         );
         let shapes = search.rows_by_shape();
-        let gap_shapes = shapes
-            .iter()
-            .filter(|(_, _, sql)| sql.contains("resolution_gaps"))
-            .collect::<Vec<_>>();
-        eprintln!("in-closure sources {in_closure_gapped_sources}, complete gap SQL shapes: {gap_shapes:?}");
         let gap_header_rows = shapes
             .iter()
             .filter(|(_, _, sql)| {
@@ -3248,15 +3714,16 @@ fn narrowed_forward_scope_keeps_in_closure_gap_reasons() {
             })
             .map(|(rows, _, _)| *rows)
             .sum::<usize>();
-        (in_closure_gapped_sources, gap_header_rows)
+        (in_closure_gapped_sources, keyed_qualified_gaps, gap_header_rows)
     });
     eprintln!(
-        "in-closure candidate gaps (gapped sources in the caller's crate, decoded gap header rows): {measurements:?}"
+        "scoped qualified gaps (in-closure gapped sources, keyed qualified rows, fragment-wide rows decoded): {measurements:?}"
     );
-    for (in_closure_gapped_sources, gap_header_rows) in measurements {
+    for (in_closure_gapped_sources, keyed_qualified_gaps, gap_header_rows) in measurements {
+        assert!(keyed_qualified_gaps > in_closure_gapped_sources as i64);
         assert_eq!(
-            gap_header_rows, in_closure_gapped_sources,
-            "a forward request's gap box is exactly its closure's gaps: {measurements:?}"
+            gap_header_rows, 0,
+            "known-terminal qualified gaps must not enter the fragment-wide reader: {measurements:?}"
         );
     }
 }
@@ -3596,6 +4063,11 @@ fn production_rust_point_statement_and_decoded_row_work_is_repeatable() {
         // no row. A walk step no declared module answers also asks whether
         // the name is a crate re-exported as a module (`ROOT_REEXPORT`): +10
         // statements and no row.
+        // A named import can also place a module route: its source binding
+        // adds one indexed `IMPORT_MODULE_PREFIX_STARTS` read and no row.
+        // The re-export route is one extra indexed read in this fixture.
+        // Sharing prefix classification across the module walk and member
+        // decision avoids repeating the type and block-local probes.
         // An unanswered closed module can still re-export an external import:
         // checking the original binding on those eight steps adds +8/0.
         // The single-trait scope probe runs
@@ -3610,7 +4082,25 @@ fn production_rust_point_statement_and_decoded_row_work_is_repeatable() {
         // The selected type-component and declared-underlying row families
         // add eight cold-open schema statement/row events; Rust's warm point
         // search and its query work remain unchanged.
-        (220, 201, 539, 328),
+        // The selected type-argument and generic-alias-parameter row families
+        // (#3828) add their stage TEMP tables and indexes: 4 + 5 cold-open
+        // schema statement/row events. The search is unchanged.
+        // Java candidate evidence is skipped when the selection has no Java
+        // semantics, so it adds no probes to this Rust point search.
+        // The declared generic-argument table and its keyed index add four
+        // cold-open schema statement/row events; they are not read by Rust
+        // point queries.
+        // Generic-formal TEMP schema is created only when selected formals
+        // are inserted or read. This generic-free point adds no schema events.
+        // Request-scoped authority and site rows remove 120 point-search
+        // statement executions and 122 decoded rows from the earlier pinned
+        // count.
+        // Sharing prefix classification removes two more statement executions
+        // and one decoded row.
+        // Rust reason ownership probes the five mounted blobs in this fixture
+        // once each: +5 indexed statements and no decoded rows. On the merged
+        // line the reductions above (321 cold) carry the probes: 326.
+        (233, 214, 326, 205),
         "production Rust cold point SQL changed; the crate-key open and row-backed point search have exact statement and decoded-row counts"
     );
     assert_eq!(
@@ -3626,14 +4116,21 @@ fn production_rust_point_statement_and_decoded_row_work_is_repeatable() {
         // authority removes six statements/one row. The net is +172/+19.
         // Retained open removes one obsolete metadata statement and row.
         // Selected export authority then removes one export-source seek and
-        // row. The two joined seed reads remove another four statements/rows,
-        // with all other query shapes unchanged in the paired SQL traces.
+        // row. The two joined seed reads remove another four statements/rows.
+        // Request-scoped published-row reuse removes 120 additional statement
+        // executions and 122 decoded rows from the earlier pinned search.
+        // Shared prefix classification removes two more executions and one
+        // decoded row.
+        // Rust reason ownership probes the five mounted blobs in this fixture
+        // once each: +5 indexed statements and no decoded rows.
         // The callee signature read for call results adds +4/+3, as cold.
         // The macro-declared module lookup for a bare prefix adds +1/0, as
         // cold. `ROOT_REEXPORT` on unanswered walk steps adds +10/0, as cold.
+        // The indexed module-prefix re-export route adds +1/0 in this fixture.
         // The same eight original-external-binding seeks add +8/0, as cold.
-        // The single-trait scope probe adds +1/0 in each pass, as cold.
-        (5, 4, 533, 322),
+        // On the merged line the reductions above (315 warm) carry the probes
+        // too: 320.
+        (5, 4, 320, 199),
         "production Rust warm point SQL changed; exact relational selection verification and requested opening metadata keep the open at five statements while the row-backed search has exact statement and decoded-row counts"
     );
     assert_eq!(
@@ -3643,7 +4140,7 @@ fn production_rust_point_statement_and_decoded_row_work_is_repeatable() {
             second_warm.1.statement_count(),
             second_warm.1.decoded_rows,
         ),
-        (5, 4, 533, 322),
+        (5, 4, 320, 199),
         "repeated production Rust warm point SQL changed; the repeated retained selection and row-backed search have identical measured counts"
     );
     assert_eq!(cold.2, first_warm.2);
@@ -3655,6 +4152,267 @@ fn production_rust_point_statement_and_decoded_row_work_is_repeatable() {
     assert_eq!(cold.2.composition_attempts(), 4);
     assert_eq!(cold.2.successful_stitches(), 4);
     assert_eq!(cold.2.worklist_rounds(), 5);
+}
+
+#[derive(Debug, Clone, Copy)]
+enum ProductionGoPointKind {
+    Definition,
+    Type,
+}
+
+#[derive(Debug)]
+struct ProductionGoPointMeasurement {
+    open: ProductionSelectedSqlCost,
+    search: ProductionSelectedSqlCost,
+    work: ReceiverAnalysisWork,
+}
+
+fn measure_production_go_point_sql(
+    fixture: &GoRootResolutionOperationFixture,
+    context_id: i64,
+    kind: ProductionGoPointKind,
+) -> ProductionGoPointMeasurement {
+    let cancellation = CancellationToken::default();
+    let reference = site_for_identifier(
+        &fixture.consumer_facts,
+        "Item",
+        ResolutionIdentifierRole::Reference,
+        ResolutionNamespace::Type,
+    );
+    let reference_range = fixture
+        .consumer_facts
+        .sites
+        .iter()
+        .find(|site| site.id == reference)
+        .expect("Go point-cost reference range");
+    let locator = SelectedSemanticLocator::for_reference_range(
+        "go",
+        GO_ROOT_CONSUMER_PATH,
+        reference_range.start_byte,
+        reference_range.end_byte,
+    );
+
+    begin_production_selected_sql_trace(&fixture.store);
+    let mut operation = fixture.open_ready(&cancellation);
+    let open = checkpoint_production_selected_sql_trace();
+    let GoPreparedImportContextOutcome::Ready(prepared) = operation
+        .go_file_import_context(context_id, GO_ROOT_CONSUMER_PATH, &cancellation)
+        .expect("build production Go point-cost context")
+    else {
+        panic!("production Go point-cost context must be ready")
+    };
+    let _selected_imports = operation
+        .go_selected_external_imports(context_id, GO_ROOT_CONSUMER_PATH, &cancellation)
+        .expect("read Go point-cost selected imports");
+    let _unresolved_imports = operation
+        .go_selected_unresolved_imports(context_id, GO_ROOT_CONSUMER_PATH, &cancellation)
+        .expect("read Go point-cost unresolved imports");
+    let mut artifacts = crate::analyzer::resolution::ForwardCandidateArtifactCache::default();
+    let mut context_metrics = SelectedResolutionContextMetrics;
+    let mut point_metrics = ResolutionBatchMetrics::default();
+    let (work, binding_targets) = match kind {
+        ProductionGoPointKind::Definition => {
+            let outcome = operation
+                .resolve_native_reference_units_bounded_for_go_request(
+                    *prepared,
+                    None,
+                    &locator,
+                    ReceiverAnalysisBudget::default(),
+                    &cancellation,
+                    &mut context_metrics,
+                    &mut artifacts,
+                    &mut point_metrics,
+                )
+                .expect("run production Go definition point-cost search");
+            let BoundedResolution::Complete { value, work } = outcome else {
+                panic!("production Go definition point-cost search completes")
+            };
+            let SelectedResolutionOperationOutcome::Native(SelectedResolutionLocated::Found(
+                answer,
+            )) = value
+            else {
+                panic!("production Go definition point-cost search finds its provider")
+            };
+            (work, answer.answer.binding().targets().len())
+        }
+        ProductionGoPointKind::Type => {
+            let outcome = operation
+                .resolve_native_reference_types_bounded_for_go_request(
+                    *prepared,
+                    None,
+                    &locator,
+                    ReceiverAnalysisBudget::default(),
+                    &cancellation,
+                    &mut context_metrics,
+                    &mut artifacts,
+                    &mut point_metrics,
+                )
+                .expect("run production Go type point-cost search");
+            let BoundedResolution::Complete { value, work } = outcome else {
+                panic!("production Go type point-cost search completes")
+            };
+            let SelectedResolutionOperationOutcome::Native(SelectedResolutionLocated::Found(
+                answer,
+            )) = value
+            else {
+                panic!("production Go type point-cost search finds its provider")
+            };
+            (work, answer.answer.binding().targets().len())
+        }
+    };
+    // The trace is installed on the reader owned by the operation. Return the
+    // reader before checking it back out to remove the trace callback.
+    drop(operation);
+    let search = finish_production_selected_sql_trace(&fixture.store);
+    assert_eq!(binding_targets, 1, "Go point has one exact binding target");
+    ProductionGoPointMeasurement { open, search, work }
+}
+
+#[test]
+fn production_go_point_statement_decoded_row_and_engine_work_is_repeatable() {
+    for kind in [
+        ProductionGoPointKind::Definition,
+        ProductionGoPointKind::Type,
+    ] {
+        let fixture = GoRootResolutionOperationFixture::new();
+        let context_id = publish_go_root_fixture_context(&fixture, "example.test/root/provider");
+        let cold = measure_production_go_point_sql(&fixture, context_id, kind);
+        let first_warm = measure_production_go_point_sql(&fixture, context_id, kind);
+        let second_warm = measure_production_go_point_sql(&fixture, context_id, kind);
+        eprintln!(
+            "production Go point {kind:?} measured tuples: cold=({},{},{},{}) warm=({},{},{},{}) repeat=({},{},{},{})",
+            cold.open.statement_count(),
+            cold.open.decoded_rows,
+            cold.search.statement_count(),
+            cold.search.decoded_rows,
+            first_warm.open.statement_count(),
+            first_warm.open.decoded_rows,
+            first_warm.search.statement_count(),
+            first_warm.search.decoded_rows,
+            second_warm.open.statement_count(),
+            second_warm.open.decoded_rows,
+            second_warm.search.statement_count(),
+            second_warm.search.decoded_rows,
+        );
+        let expected_scope_nodes = match kind {
+            ProductionGoPointKind::Definition => 437,
+            ProductionGoPointKind::Type => 440,
+        };
+        // These generic-free fixtures no longer open the optional formal-row
+        // table and its indexes during cold point setup.
+        let (cold_open, cold_search, warm_open, warm_search) = match kind {
+            ProductionGoPointKind::Definition => ((233, 214), (216, 179), (5, 4), (167, 112)),
+            ProductionGoPointKind::Type => ((233, 214), (234, 175), (5, 4), (185, 108)),
+        };
+        for measurement in [&cold, &first_warm, &second_warm] {
+            assert_eq!(measurement.work.setup_nodes, 0);
+            assert_eq!(measurement.work.summary_expansions, 7);
+            assert_eq!(measurement.work.scope_nodes, expected_scope_nodes);
+        }
+        assert_eq!(
+            (
+                cold.open.statement_count(),
+                cold.open.decoded_rows,
+                cold.search.statement_count(),
+                cold.search.decoded_rows,
+            ),
+            (cold_open.0, cold_open.1, cold_search.0, cold_search.1),
+            "cold Go point SQL work is pinned"
+        );
+        for measurement in [&first_warm, &second_warm] {
+            assert_eq!(
+                (
+                    measurement.open.statement_count(),
+                    measurement.open.decoded_rows,
+                    measurement.search.statement_count(),
+                    measurement.search.decoded_rows,
+                ),
+                (warm_open.0, warm_open.1, warm_search.0, warm_search.1),
+                "warm Go point SQL work is pinned"
+            );
+        }
+        assert_eq!(cold.work, first_warm.work);
+        assert_eq!(first_warm.work, second_warm.work);
+        assert_eq!(
+            (
+                cold.open.statement_count(),
+                cold.open.decoded_rows,
+                cold.search.statement_count(),
+                cold.search.decoded_rows,
+            ),
+            (cold_open.0, cold_open.1, cold_search.0, cold_search.1),
+            "cold Go point SQL work is pinned"
+        );
+        assert!(
+            first_warm.open.statement_count() < cold.open.statement_count(),
+            "warm Go point opening must reuse selected read work"
+        );
+        assert!(
+            first_warm.search.statement_count() < cold.search.statement_count(),
+            "warm Go point search must reuse selected read work"
+        );
+        for measurement in [&first_warm, &second_warm] {
+            assert_eq!(
+                (
+                    measurement.open.statement_count(),
+                    measurement.open.decoded_rows,
+                    measurement.search.statement_count(),
+                    measurement.search.decoded_rows,
+                ),
+                (warm_open.0, warm_open.1, warm_search.0, warm_search.1),
+                "warm Go point SQL work is pinned"
+            );
+        }
+        assert_eq!(
+            (
+                first_warm.open.statement_count(),
+                first_warm.open.decoded_rows,
+                first_warm.search.statement_count(),
+                first_warm.search.decoded_rows,
+            ),
+            (
+                second_warm.open.statement_count(),
+                second_warm.open.decoded_rows,
+                second_warm.search.statement_count(),
+                second_warm.search.decoded_rows,
+            ),
+            "repeated warm Go point SQL work is identical"
+        );
+        eprintln!(
+            "production Go point {kind:?}: cold=({},{},{},{}, {:?}), warm=({},{},{},{}, {:?}), repeat=({},{},{},{}, {:?})",
+            cold.open.statement_count(),
+            cold.open.decoded_rows,
+            cold.search.statement_count(),
+            cold.search.decoded_rows,
+            cold.work,
+            first_warm.open.statement_count(),
+            first_warm.open.decoded_rows,
+            first_warm.search.statement_count(),
+            first_warm.search.decoded_rows,
+            first_warm.work,
+            second_warm.open.statement_count(),
+            second_warm.open.decoded_rows,
+            second_warm.search.statement_count(),
+            second_warm.search.decoded_rows,
+            second_warm.work,
+        );
+        assert_eq!(first_warm.work, second_warm.work);
+        assert_eq!(
+            (
+                first_warm.open.statement_count(),
+                first_warm.open.decoded_rows,
+                first_warm.search.statement_count(),
+                first_warm.search.decoded_rows,
+            ),
+            (
+                second_warm.open.statement_count(),
+                second_warm.open.decoded_rows,
+                second_warm.search.statement_count(),
+                second_warm.search.decoded_rows,
+            ),
+            "repeated Go point SQL work must be identical"
+        );
+    }
 }
 
 #[test]
@@ -3841,7 +4599,7 @@ fn measure_production_rust_point_scale(
 
     begin_production_selected_sql_trace(&fixture.store);
     let open_started = Instant::now();
-    let operation = fixture.open_ready(&cancellation);
+    let mut operation = fixture.open_ready(&cancellation);
     let open_elapsed_ns = open_started.elapsed().as_nanos();
     let open = checkpoint_production_selected_sql_trace();
     let source_mounts = operation.mount_table().mount_count();
@@ -3917,6 +4675,7 @@ fn measure_production_rust_point_scale(
         )
         .expect("run production Rust point-scale search");
     let point_elapsed_ns = point_started.elapsed().as_nanos();
+    drop(operation);
     let resolve_cost = finish_production_selected_sql_trace(&fixture.store);
     let search = ProductionSelectedSqlCost {
         statements: [
@@ -4225,7 +4984,11 @@ fn ignored_production_rust_point_scale_256_mounts() {
     // and the campaign's measured request pays only for the names no earlier
     // request in it asked about. Three of the twelve are left, and they are
     // the same three at 256, 1,024 and 2,048 mounts.
-    assert_production_rust_point_scale_measurement(&measurement, (6, 5, 175, 136), 326);
+    // The original pin predates the current 79daab1478 point path. That base
+    // measured (5, 4, 235, 91); request-scoped published-row reuse now measures
+    // (5, 4, 221, 77). The assigned base also measures 258 receiver scope nodes,
+    // so the earlier 326 work pin is stale. The eager route preserves the answer.
+    assert_production_rust_point_scale_measurement(&measurement, (5, 4, 221, 77), 258);
 }
 
 #[test]
@@ -4233,7 +4996,7 @@ fn ignored_production_rust_point_scale_256_mounts() {
 fn ignored_production_rust_point_scale_1024_mounts() {
     let measurement =
         run_production_rust_point_scale_campaign(1_024, ProductionRustPointScaleOutcome::Complete);
-    assert_production_rust_point_scale_measurement(&measurement, (6, 5, 175, 136), 326);
+    assert_production_rust_point_scale_measurement(&measurement, (5, 4, 221, 77), 258);
 }
 
 #[test]
@@ -4241,7 +5004,7 @@ fn ignored_production_rust_point_scale_1024_mounts() {
 fn ignored_production_rust_point_scale_2048_mounts() {
     let measurement =
         run_production_rust_point_scale_campaign(2_048, ProductionRustPointScaleOutcome::Complete);
-    assert_production_rust_point_scale_measurement(&measurement, (6, 5, 175, 136), 326);
+    assert_production_rust_point_scale_measurement(&measurement, (5, 4, 221, 77), 258);
 }
 
 #[test]
@@ -4624,6 +5387,7 @@ fn selected_rust_exports_match_fresh_derivation_after_content_changes() {
             scope: ResolutionScopeId::new(scope),
             edition,
             unmounted: false,
+            requested: true,
             overlay_completion: ResolutionCompletion::Complete,
         };
         let exports = RustCrateRows {
@@ -4850,6 +5614,7 @@ fn selected_rust_edited_macro_host_reopens_its_module_inventory() {
             scope: ResolutionScopeId::new(scope),
             edition,
             unmounted: false,
+            requested: true,
             overlay_completion: ResolutionCompletion::Complete,
         };
         let rows = RustCrateRows {
@@ -4998,11 +5763,6 @@ fn selected_rust_dirty_replacement_preserves_topology_and_definition_projection(
         .unit
         .clone();
     assert_eq!(result.definitions, [expected]);
-}
-
-#[test]
-fn selected_rust_dirty_constant_resolves_through_a_dependency_reexport() {
-    assert_dirty_constant_resolves_through_a_dependency_reexport("pub const target: usize = 7;\n");
 }
 
 #[test]
@@ -5761,8 +6521,9 @@ fn selected_rust_cargo_dependency_path_switch_preserves_caller_inputs() {
         caller_storage_before
     );
 
-    // A manifest overlay keeps the persisted crate's dependency rows. It does
-    // not publish a new revision or transiently rederive Cargo topology.
+    // A Cargo manifest overlay that differs from the selected revision is a
+    // configuration-input mismatch. The operation reports it as unavailable
+    // instead of answering from persisted routes, and publishes nothing.
     fixture.snapshots.insert("rust".to_owned(), snapshot_a);
     let overlay = Arc::new(OverlayProject::new(Arc::new(fixture.project.clone())));
     let app_manifest_file = ProjectFile::new(fixture._project_root.path(), "app/Cargo.toml");
@@ -5786,16 +6547,29 @@ fn selected_rust_cargo_dependency_path_switch_preserves_caller_inputs() {
             .expect("read workspace head around Cargo overlay")
     };
     let head_before_overlay = workspace_head(&fixture);
-    let overlay_snapshot = fixture.snapshots["rust"].clone();
-    let (overlay_definitions, overlay_mount, overlay_source) = resolve(
-        &mut fixture,
+    let input = SelectedResolutionOperationInput::new(
         frozen_overlay.as_ref(),
-        overlay_snapshot,
-        ALT_PROVIDER_PATH,
+        &fixture.workspace_id,
+        &fixture.snapshots,
+        &fixture.languages,
+        &[],
     );
-    assert_eq!(overlay_definitions, a_definitions);
-    assert_eq!(overlay_mount, a_mount);
-    assert_eq!(overlay_source, a_source);
+    let overlay_outcome = fixture
+        .store
+        .open_selected_resolution_operation(input, &CancellationToken::new())
+        .expect("open selected root operation with mismatching Cargo overlay");
+    assert!(
+        matches!(
+            &overlay_outcome,
+            SelectedResolutionOperationOpenOutcome::Unavailable(
+                SelectedResolutionUnavailable::MissingTransientOverlayInput {
+                    storage_language,
+                    persisted_relative_path,
+                }
+            ) if storage_language == "rust" && persisted_relative_path == "app/Cargo.toml"
+        ),
+        "mismatching Cargo manifest overlay must be unavailable: {overlay_outcome:?}"
+    );
     let head_after_overlay = workspace_head(&fixture);
     assert_eq!(head_after_overlay, head_before_overlay);
     assert_eq!(
@@ -5941,9 +6715,9 @@ fn selected_rust_caller_bounded_entry_charges_the_point_request_not_its_context(
             // A round whose demanded slots are unchanged reuses the slot
             // structure its evaluation read (`SlotPrep`) and no longer
             // repeats those reads, whose request and row steps were 51 here.
-            // Shared reference refinement now asks for transfer-owned type
-            // identities before call projections. This fixture pays five
-            // additional request-local reads; retained context work is unchanged.
+            // Shared reference refinement retains transfer-owned type
+            // identities before call projections. Java implicit-receiver
+            // provenance is skipped for this Rust-only selection.
             scope_nodes: 258,
         },
         "the interior's per-mount candidate paging charges the point request; tier-1 candidate and declaration work must remain exact"
@@ -6106,7 +6880,11 @@ impl GoRootResolutionOperationFixture {
                 )
                 .expect("prepare parsed Go root blob with resolution bundle"),
             );
-            versions.push((path.to_owned(), oid.to_string(), ordinal));
+            versions.push((
+                path.to_owned(),
+                oid.to_string(),
+                format!("{:064x}", 720 + ordinal),
+            ));
             assert!(facts_by_path.insert(path, facts).is_none());
         }
         let (outcomes, _) = store.persist_prepared_blobs(prepared, PersistBatchTargets::PRODUCTION);
@@ -6121,50 +6899,8 @@ impl GoRootResolutionOperationFixture {
         );
 
         let workspace_id = WorkspaceId(GO_ROOT_WORKSPACE_ID.to_owned());
-        let writer_workspace_id = workspace_id.as_str().to_owned();
-        store.conn.execute(move |conn| {
-            let tx = conn.transaction().unwrap();
-            tx.execute(
-                "INSERT INTO workspace_revisions(workspace_id, lang, generation, revision)
-                 VALUES(?1, 'go', ?2, 1)",
-                params![writer_workspace_id, generation.get()],
-            )
-            .unwrap();
-            tx.execute(
-                "INSERT INTO workspace_heads(workspace_id, lang, generation, revision)
-                 VALUES(?1, 'go', ?2, 1)",
-                params![writer_workspace_id, generation.get()],
-            )
-            .unwrap();
-            for (path, oid, ordinal) in versions {
-                tx.execute(
-                    "INSERT INTO workspace_file_versions(
-                       workspace_id, lang, generation, rel_path, blob_oid,
-                       projection_digest, valid_from
-                     ) VALUES(?1, 'go', ?2, ?3, ?4, ?5, 1)",
-                    params![
-                        writer_workspace_id,
-                        generation.get(),
-                        path,
-                        oid,
-                        format!("{:064x}", 720 + ordinal),
-                    ],
-                )
-                .unwrap();
-            }
-            tx.commit().unwrap();
-        });
-
-        let mut snapshots = WorkspaceSnapshots::default();
-        snapshots.insert(
-            "go".to_owned(),
-            WorkspaceSnapshotId {
-                workspace_id: workspace_id.clone(),
-                lang: "go".to_owned(),
-                generation,
-                revision: 1,
-            },
-        );
+        let snapshots =
+            persist_test_workspace_snapshot(&store, &workspace_id, "go", generation, versions);
         Self {
             store,
             _project_root: project_root,
@@ -6189,23 +6925,18 @@ impl GoRootResolutionOperationFixture {
         &'a self,
         cancellation: &CancellationToken,
     ) -> SelectedResolutionOperation<'a, 'a> {
-        match self
-            .store
-            .open_selected_resolution_operation(
-                SelectedResolutionOperationInput::new(
-                    &self.project,
-                    &self.workspace_id,
-                    &self.snapshots,
-                    &self.languages,
-                    &self.overlay_masks,
-                ),
-                cancellation,
-            )
-            .expect("open persisted Go root resolution operation")
-        {
-            SelectedResolutionOperationOpenOutcome::Ready(operation) => *operation,
-            _ => panic!("complete persisted Go root operation must open Ready"),
-        }
+        open_ready_operation(
+            &self.store,
+            selected_operation_input(
+                &self.project,
+                &self.workspace_id,
+                &self.snapshots,
+                &self.languages,
+                &self.overlay_masks,
+                Vec::new(),
+            ),
+            cancellation,
+        )
     }
 
     fn contexts_for(
@@ -6398,19 +7129,10 @@ fn try_site_for_identifier(
     role: ResolutionIdentifierRole,
     namespace: ResolutionNamespace,
 ) -> Option<ResolutionSiteId> {
-    let names = facts
-        .names
-        .iter()
-        .map(|name| (name.id, name.spelling.as_str()))
-        .collect::<std::collections::BTreeMap<_, _>>();
     facts
-        .identifiers
-        .iter()
-        .find(|identifier| {
-            identifier.role == role
-                && identifier.namespace == namespace
-                && names.get(&identifier.name).copied() == Some(spelling)
-        })
+        .identifiers_named(spelling, role, namespace)
+        .into_iter()
+        .next()
         .map(|identifier| identifier.site)
 }
 
@@ -6436,13 +7158,11 @@ fn semantic_at(
     site: ResolutionSiteId,
     role: LoweredSemanticRole,
 ) -> crate::analyzer::resolution::SemanticId {
-    artifact
-        .lexical()
-        .semantics()
-        .iter()
-        .find(|semantic| semantic.site() == site && semantic.role() == role)
-        .unwrap_or_else(|| panic!("lowered semantic {role:?} at {site:?}"))
-        .semantic()
+    crate::analyzer::resolution::test_support::lowered_semantic_at(
+        artifact.lexical().semantics(),
+        site,
+        role,
+    )
 }
 
 fn contexts_for(
@@ -6552,9 +7272,11 @@ impl PreloadedOracle {
             declarations.extend(artifact.typed().member_scopes().iter().map(|row| {
                 crate::analyzer::resolution::JavaInheritanceDeclaration {
                     definition: row.definition(),
+                    name: String::new(),
                     package: Some(package.to_owned()),
                     kind: crate::analyzer::resolution::JavaInheritanceDeclarationKind::Type {
                         is_interface: false,
+                        is_singleton: false,
                     },
                 }
             }));
@@ -6585,6 +7307,24 @@ struct StagerState {
 
 type StageHook = Box<dyn FnOnce() -> Result<()>>;
 
+fn stage_test_batch(
+    state: &Rc<RefCell<StagerState>>,
+    first_stage_hook: &mut Option<StageHook>,
+    batch: &FactReferenceBatchAnswer,
+) -> Result<()> {
+    state.borrow_mut().staged.push(batch.clone());
+    if let Some(hook) = first_stage_hook.take() {
+        hook()?;
+    }
+    Ok(())
+}
+
+fn rollback_test_batches(state: &Rc<RefCell<StagerState>>) {
+    let mut state = state.borrow_mut();
+    state.staged.clear();
+    state.rollback_count += 1;
+}
+
 struct RollbackStager {
     state: Rc<RefCell<StagerState>>,
     first_stage_hook: Option<StageHook>,
@@ -6613,11 +7353,7 @@ impl SelectedResolutionBroadStager for RollbackStager {
     type Published = PublishedBatches;
 
     fn stage(&mut self, batch: &FactReferenceBatchAnswer) -> Result<()> {
-        self.state.borrow_mut().staged.push(batch.clone());
-        if let Some(hook) = self.first_stage_hook.take() {
-            hook()?;
-        }
-        Ok(())
+        stage_test_batch(&self.state, &mut self.first_stage_hook, batch)
     }
 
     fn publish(mut self, summary: FactResolutionBatchSummary) -> Result<Self::Published> {
@@ -6634,9 +7370,7 @@ impl SelectedResolutionBroadStager for RollbackStager {
 impl Drop for RollbackStager {
     fn drop(&mut self) {
         if !self.published {
-            let mut state = self.state.borrow_mut();
-            state.staged.clear();
-            state.rollback_count += 1;
+            rollback_test_batches(&self.state);
         }
     }
 }
@@ -6665,11 +7399,7 @@ impl SelectedResolutionBroadStager for CountRollbackStager {
     type Published = usize;
 
     fn stage(&mut self, batch: &FactReferenceBatchAnswer) -> Result<()> {
-        self.state.borrow_mut().staged.push(batch.clone());
-        if let Some(hook) = self.first_stage_hook.take() {
-            hook()?;
-        }
-        Ok(())
+        stage_test_batch(&self.state, &mut self.first_stage_hook, batch)
     }
 
     fn publish(mut self, _summary: FactResolutionBatchSummary) -> Result<Self::Published> {
@@ -6688,9 +7418,7 @@ impl SelectedResolutionBroadStager for CountRollbackStager {
 impl Drop for CountRollbackStager {
     fn drop(&mut self) {
         if !self.published {
-            let mut state = self.state.borrow_mut();
-            state.staged.clear();
-            state.rollback_count += 1;
+            rollback_test_batches(&self.state);
         }
     }
 }
@@ -6783,18 +7511,25 @@ fn real_go_bundle_reopens_without_java_placement_and_matches_preload() {
         ResolutionIdentifierRole::Reference,
         ResolutionNamespace::TypeOrValue,
     );
-    let placement_gap = facts
+    let applicability_gaps = facts
+        .gaps
+        .iter()
+        .filter(|gap| gap.kind == ResolutionGapKind::UnsupportedCallApplicability)
+        .collect::<Vec<_>>();
+    assert_eq!(applicability_gaps.len(), 1);
+    assert_eq!(applicability_gaps[0].site, call_site);
+    let placement_gaps = facts
         .gaps
         .iter()
         .filter(|gap| gap.kind == ResolutionGapKind::UnsupportedPlacementBoundary)
         .collect::<Vec<_>>();
-    assert_eq!(placement_gap.len(), 1);
+    assert_eq!(placement_gaps.len(), 1);
+    assert_eq!(
+        facts.sites[placement_gaps[0].site.index()].scope,
+        ResolutionScopeId::new(0),
+        "placement uncertainty is owned by the compilation-unit boundary"
+    );
     assert_eq!(facts.gaps.len(), 2);
-    assert!(facts.gaps.iter().all(|gap| {
-        (gap.site == call_site && gap.kind == ResolutionGapKind::UnsupportedCallApplicability)
-            || (gap.site == placement_gap[0].site
-                && gap.kind == ResolutionGapKind::UnsupportedPlacementBoundary)
-    }));
     assert!(facts.reference_enumeration_gaps.is_empty());
     assert!(facts.import_routes.is_empty());
 
@@ -6828,10 +7563,22 @@ fn real_go_bundle_reopens_without_java_placement_and_matches_preload() {
     let reverse_definition =
         semantic_at(&lowered, definition_site, LoweredSemanticRole::Definition);
     let call_reference = semantic_at(&lowered, call_site, LoweredSemanticRole::Reference);
+    let go_lookup_spellings = facts
+        .identifiers
+        .iter()
+        .filter(|identifier| identifier.role == ResolutionIdentifierRole::Reference)
+        .map(|identifier| {
+            (
+                semantic_at(&lowered, identifier.site, LoweredSemanticRole::Reference),
+                facts.names[identifier.name.index()].spelling.clone(),
+            )
+        })
+        .collect::<Vec<_>>();
     let preload = PreloadedFactResolutionService::from_lowered_fragments(
         [lowered.lexical().clone()],
         [lowered.typed().clone()],
-    );
+    )
+    .with_go_lookup_spellings(go_lookup_spellings);
 
     let expected_point = preload
         .resolve_reference(point_reference, &cancellation)
@@ -7036,10 +7783,11 @@ fn selected_go_root_context_matches_preload_and_excludes_wrong_route() {
             .targets()
             .contains(&decoy_definition)
     );
-    assert!(matches!(
+    assert_eq!(
         expected_point.completion(),
-        ResolutionCompletion::Incomplete(_)
-    ));
+        &ResolutionCompletion::Complete,
+        "the structured dot-import route and export demand are complete"
+    );
 
     let point_locator = SelectedSemanticLocator::new(
         "go",
@@ -7076,6 +7824,7 @@ fn selected_go_root_context_matches_preload_and_excludes_wrong_route() {
         )
         .expect("preloaded cross-package Go reverse resolution");
     assert!(expected_reverse.references().contains(&reference));
+    // Reverse inventory still carries independent unsupported-semantic reasons.
     assert!(matches!(
         expected_reverse.completion(),
         ResolutionCompletion::Incomplete(_)
@@ -7130,8 +7879,9 @@ fn publish_go_root_fixture_context(
             (GO_ROOT_PROVIDER_PATH,"example.test/root/provider","provider"),
             (GO_ROOT_DECOY_PATH,"example.test/root/other/provider","provider"),
         ] {
-            tx.execute("INSERT INTO go_package_instances(context_id,tool_import_path,package_name,for_test,provider_directory,provider_digest,complete,gaps)
-                VALUES(?1,?2,?3,'','',zeroblob(32),0,jsonb('[]'))",params![context,import_path,name]).unwrap();
+            let unit_key = go_unit_key(import_path, "", "go");
+            tx.execute("INSERT INTO go_package_instances(context_id,tool_import_path,package_name,for_test,provider_directory,provider_digest,complete,gaps,unit_key)
+                VALUES(?1,?2,?3,'','',zeroblob(32),0,jsonb('[]'),?4)",params![context,import_path,name,unit_key.as_slice()]).unwrap();
             let package = tx.last_insert_rowid();
             packages.push(package);
             tx.execute("INSERT INTO go_package_files(package_id,file_version_id,source_role)
@@ -7200,7 +7950,9 @@ fn selected_go_package_rows_compose_dot_import_without_manual_bridges() {
     }
     let operation = fixture.open_ready(&cancellation);
     let expected = fixture.contexts_for(&operation);
-    let go_context::GoDotImportContext::Ready(derived) = operation
+    let go_context::GoDotImportContext::Ready {
+        context: derived, ..
+    } = operation
         .go_dot_import_context(context_id, GO_ROOT_CONSUMER_PATH, "go", &cancellation)
         .unwrap()
     else {
@@ -7252,7 +8004,9 @@ fn selected_go_package_rows_compose_dot_import_without_manual_bridges() {
         ResolutionCompletion::Incomplete(_)
     ));
     let operation = fixture.open_ready(&cancellation);
-    let go_context::GoDotImportContext::Ready(derived) = operation
+    let go_context::GoDotImportContext::Ready {
+        context: derived, ..
+    } = operation
         .go_dot_import_context(context_id, GO_ROOT_CONSUMER_PATH, "go", &cancellation)
         .unwrap()
     else {
@@ -7652,184 +8406,6 @@ fn published_replacements_are_exact_sorted_dense_mounts() {
 }
 
 #[test]
-#[should_panic(expected = "content mount package-file row belongs to a foreign path")]
-fn published_replacement_rejects_foreign_projection_path() {
-    let fixture = ResolutionOperationFixture::new();
-    let content = fixture.published_content(SECOND_REPLACEMENT_PATH, RICH_JAVA_SOURCE);
-    let witness = content.publication().clone();
-    let oid = witness.blob_oid();
-    SelectedResolutionContentMountRequest::new(
-        witness,
-        WorkspaceFileRow {
-            rel_path: SECOND_REPLACEMENT_PATH.to_owned(),
-            blob_oid: oid,
-        },
-        Vec::new(),
-        vec![WorkspacePackageFileRow {
-            package_name: "foreign".to_owned(),
-            rel_path: "src/Foreign.java".to_owned(),
-        }],
-        Vec::new(),
-        Vec::new(),
-    );
-}
-
-#[test]
-#[should_panic(expected = "content mount package-file natural key repeats")]
-fn published_replacement_rejects_duplicate_projection_key() {
-    let fixture = ResolutionOperationFixture::new();
-    let content = fixture.published_content(SECOND_REPLACEMENT_PATH, RICH_JAVA_SOURCE);
-    let witness = content.publication().clone();
-    let oid = witness.blob_oid();
-    SelectedResolutionContentMountRequest::new(
-        witness,
-        WorkspaceFileRow {
-            rel_path: SECOND_REPLACEMENT_PATH.to_owned(),
-            blob_oid: oid,
-        },
-        Vec::new(),
-        (0..2)
-            .map(|_| WorkspacePackageFileRow {
-                package_name: "duplicate".to_owned(),
-                rel_path: SECOND_REPLACEMENT_PATH.to_owned(),
-            })
-            .collect(),
-        Vec::new(),
-        Vec::new(),
-    );
-}
-
-#[test]
-fn selected_operation_rejects_an_unprepared_source_overlay_before_sql() {
-    let fixture = ResolutionOperationFixture::new();
-    let cancelled = CancellationToken::new();
-    cancelled.cancel();
-    begin_production_selected_sql_trace(&fixture.store);
-    let cancelled_result = fixture
-        .open_with_project_and_content_mounts(&fixture.project, &[], Vec::new(), &cancelled)
-        .expect("pre-cancelled selected operation must not fail the store call");
-    let cancelled_cost = finish_production_selected_sql_trace(&fixture.store);
-    assert!(matches!(
-        cancelled_result,
-        SelectedResolutionOperationOpenOutcome::Cancelled
-    ));
-    assert_eq!(
-        cancelled_cost.statement_count(),
-        0,
-        "pre-cancelled operation must not open selected SQL"
-    );
-
-    let overlay = OverlayProject::new(Arc::new(fixture.project.clone()));
-    let file = ProjectFile::new(fixture._project_root.path(), PROVIDER_PATH);
-    let source = "class Provider {}\n";
-    assert!(overlay.set(file.abs_path(), source.to_owned()));
-
-    begin_production_selected_sql_trace(&fixture.store);
-    let result = fixture
-        .open_with_project_and_content_mounts(
-            &overlay,
-            &[],
-            Vec::new(),
-            &CancellationToken::default(),
-        )
-        .expect("unprepared overlay preflight must not fail the store call");
-    let cost = finish_production_selected_sql_trace(&fixture.store);
-    assert_eq!(
-        cost.statement_count(),
-        0,
-        "overlay preflight must precede SQL"
-    );
-    assert!(matches!(
-        result,
-        SelectedResolutionOperationOpenOutcome::Unavailable(
-            SelectedResolutionUnavailable::MissingTransientOverlayInput {
-                storage_language,
-                persisted_relative_path,
-            }
-        ) if storage_language == "java" && persisted_relative_path == PROVIDER_PATH
-    ));
-
-    let removal_masks = [SelectedResolutionOverlayMask::removal(
-        "java",
-        PROVIDER_PATH,
-    )];
-    let result = fixture
-        .open_with_project_and_content_mounts(
-            &overlay,
-            &removal_masks,
-            Vec::new(),
-            &CancellationToken::default(),
-        )
-        .expect("removal-only overlay input must not fail the store call");
-    assert!(matches!(
-        result,
-        SelectedResolutionOperationOpenOutcome::Unavailable(
-            SelectedResolutionUnavailable::MissingTransientOverlayInput {
-                storage_language,
-                persisted_relative_path,
-            }
-        ) if storage_language == "java" && persisted_relative_path == PROVIDER_PATH
-    ));
-
-    let replacement_masks = [SelectedResolutionOverlayMask::replacement(
-        "java",
-        PROVIDER_PATH,
-    )];
-    let result = fixture
-        .open_with_project_and_content_mounts(
-            &overlay,
-            &replacement_masks,
-            Vec::new(),
-            &CancellationToken::default(),
-        )
-        .expect("a mask without its overlay payload must not fail the store call");
-    assert!(matches!(
-        result,
-        SelectedResolutionOperationOpenOutcome::Unavailable(
-            SelectedResolutionUnavailable::MissingTransientOverlayInput {
-                storage_language,
-                persisted_relative_path,
-            }
-        ) if storage_language == "java" && persisted_relative_path == PROVIDER_PATH
-    ));
-    let result = fixture
-        .open_with_project_and_content_mounts(
-            &overlay,
-            &replacement_masks,
-            vec![fixture.published_content(PROVIDER_PATH, source)],
-            &CancellationToken::default(),
-        )
-        .expect("unattested replacement must not fail the store call");
-    assert!(matches!(
-        result,
-        SelectedResolutionOperationOpenOutcome::Unavailable(
-            SelectedResolutionUnavailable::MissingTransientOverlayInput {
-                storage_language,
-                persisted_relative_path,
-            }
-        ) if storage_language == "java" && persisted_relative_path == PROVIDER_PATH
-    ));
-
-    let result = fixture
-        .open_with_project_and_content_mounts(
-            &overlay,
-            &[],
-            vec![fixture.live_content(PROVIDER_PATH, source)],
-            &CancellationToken::default(),
-        )
-        .expect("missing overlay mask preflight must not fail the store call");
-    assert!(matches!(
-        result,
-        SelectedResolutionOperationOpenOutcome::Unavailable(
-            SelectedResolutionUnavailable::MissingTransientOverlayInput {
-                storage_language,
-                persisted_relative_path,
-            }
-        ) if storage_language == "java" && persisted_relative_path == PROVIDER_PATH
-    ));
-}
-
-#[test]
 fn selected_operation_requires_the_live_overlay_digest_and_rejects_clear() {
     let fixture = ResolutionOperationFixture::new();
     let overlay = OverlayProject::new(Arc::new(fixture.project.clone()));
@@ -7889,62 +8465,6 @@ fn selected_operation_requires_the_live_overlay_digest_and_rejects_clear() {
         ) if storage_language == "java"
             && persisted_relative_path == PROVIDER_PATH
             && expected_content_digest == original_digest
-    ));
-}
-
-#[test]
-fn selected_operation_accepts_matching_live_and_counterfactual_overlay_authority() {
-    let fixture = ResolutionOperationFixture::new();
-    let overlay = OverlayProject::new(Arc::new(fixture.project.clone()));
-    let file = ProjectFile::new(fixture._project_root.path(), PROVIDER_PATH);
-    let base = "class Provider {}\n";
-    assert!(overlay.set(file.abs_path(), base.to_owned()));
-    let masks = [SelectedResolutionOverlayMask::replacement(
-        "java",
-        PROVIDER_PATH,
-    )];
-
-    let live = fixture
-        .open_with_project_and_content_mounts(
-            &overlay,
-            &masks,
-            vec![fixture.live_content(PROVIDER_PATH, base)],
-            &CancellationToken::default(),
-        )
-        .expect("matching live overlay must not fail the store call");
-    let SelectedResolutionOperationOpenOutcome::Ready(live) = live else {
-        panic!("matching live overlay must open Ready")
-    };
-    drop(live);
-
-    let counterfactual = fixture
-        .open_with_project_and_content_mounts(
-            &overlay,
-            &masks,
-            vec![fixture.counterfactual_content(PROVIDER_PATH, base, PROVIDER_JAVA_SOURCE)],
-            &CancellationToken::default(),
-        )
-        .expect("matching counterfactual base must not fail the store call");
-    let SelectedResolutionOperationOpenOutcome::Ready(counterfactual) = counterfactual else {
-        panic!("matching counterfactual base must open Ready")
-    };
-    drop(counterfactual);
-
-    let disk_counterfactual = fixture
-        .open_with_project_and_content_mounts(
-            &fixture.project,
-            &masks,
-            vec![fixture.counterfactual_content(
-                PROVIDER_PATH,
-                RICH_JAVA_SOURCE,
-                PROVIDER_JAVA_SOURCE,
-            )],
-            &CancellationToken::default(),
-        )
-        .expect("counterfactual base without a live overlay must be accepted");
-    assert!(matches!(
-        disk_counterfactual,
-        SelectedResolutionOperationOpenOutcome::Ready(_)
     ));
 }
 
@@ -8159,288 +8679,6 @@ fn selected_operation_revalidates_cached_content_publication_before_native() {
         result.unwrap(),
         SelectedResolutionOperationOutcome::Stale(SelectedResolutionStale::MountInventoryChanged)
     ));
-}
-
-#[test]
-fn selected_operation_precancelled_cached_content_mount_does_no_sql() {
-    let fixture = ResolutionOperationFixture::new();
-    let overlay = OverlayProject::new(Arc::new(fixture.project.clone()));
-    let file = ProjectFile::new(fixture._project_root.path(), PROVIDER_PATH);
-    let source = "class Provider {}\n";
-    assert!(overlay.set(file.abs_path(), source.to_owned()));
-    let digest = brokk_bifrost_core::analyzer::canonical_hash::sha256_bytes(source.as_bytes());
-    let masks = [SelectedResolutionOverlayMask::replacement(
-        "java",
-        PROVIDER_PATH,
-    )];
-    let cancellation = CancellationToken::new();
-    cancellation.cancel();
-    begin_production_selected_sql_trace(&fixture.store);
-    let result = fixture
-        .open_with_project_and_content_mounts(
-            &overlay,
-            &masks,
-            vec![
-                fixture
-                    .content_mount(PROVIDER_PATH)
-                    .with_live_overlay_content_digest(digest),
-            ],
-            &cancellation,
-        )
-        .expect("pre-cancelled cached content operation must not fail the store call");
-    let cost = finish_production_selected_sql_trace(&fixture.store);
-    assert_eq!(cost.statement_count(), 0);
-    assert!(matches!(
-        result,
-        SelectedResolutionOperationOpenOutcome::Cancelled
-    ));
-}
-
-#[test]
-fn unrelated_language_overlay_does_not_poison_selected_operation() {
-    let fixture = ResolutionOperationFixture::new();
-    let overlay = OverlayProject::new(Arc::new(fixture.project.clone()));
-    let file = ProjectFile::new(fixture._project_root.path(), "src/notes.py");
-    assert!(overlay.set(file.abs_path(), "value = 1\n".to_owned()));
-
-    let result = fixture
-        .open_with_project(&overlay, &[], Vec::new(), &CancellationToken::default())
-        .expect("unrelated overlay must not fail the store call");
-    assert!(matches!(
-        result,
-        SelectedResolutionOperationOpenOutcome::Ready(_)
-    ));
-}
-
-#[test]
-fn selected_fragment_inventory_replaces_shadow_with_published_content_membership() {
-    let fixture = ResolutionOperationFixture::new();
-    let cancellation = CancellationToken::default();
-    let baseline = fixture.open_ready(&[], Vec::new(), &cancellation);
-    let baseline_by_path = baseline
-        .mounts()
-        .unwrap()
-        .iter()
-        .map(|mount| (mount.persisted_relative_path().to_owned(), mount.fragment()))
-        .collect::<BTreeMap<_, _>>();
-    assert_eq!(baseline_by_path.len(), 4);
-    drop(baseline);
-
-    let masks = fixture.parity_masks();
-    let operation = fixture.open_parity_ready(&masks, &cancellation);
-    let expected = operation
-        .mounts()
-        .unwrap()
-        .iter()
-        .map(SelectedResolutionOperationMount::fragment)
-        .collect::<Vec<_>>();
-    assert_eq!(expected.len(), 2);
-    let provider = operation
-        .ready
-        .inventory
-        .mount_record_for_path("java", PROVIDER_PATH)
-        .unwrap()
-        .unwrap();
-    let expected_oid = Oid::hash_object(ObjectType::Blob, PROVIDER_JAVA_SOURCE.as_bytes()).unwrap();
-    assert!(
-        provider.file_version_id().is_none(),
-        "replacement uses published content authority"
-    );
-    assert_eq!(provider.blob_oid(), expected_oid);
-    let published_blob: i64 = operation
-        .ready
-        .inventory
-        .connection()
-        .query_row(
-            "SELECT id FROM blobs WHERE blob_oid=?1 AND lang='java' AND generation=?2",
-            params![expected_oid.to_string(), fixture.generation.get()],
-            |row| row.get(0),
-        )
-        .unwrap();
-    assert_eq!(provider.blob_id(), published_blob);
-    assert!(
-        operation
-            .ready
-            .inventory
-            .mount_record_for_path("java", REMOVED_PATH)
-            .unwrap()
-            .is_none()
-    );
-    assert!(
-        operation
-            .ready
-            .inventory
-            .mount_record_for_path("java", SECOND_REPLACEMENT_PATH)
-            .unwrap()
-            .is_none()
-    );
-    let selected_masks = operation.ready.inventory.overlay_masks().unwrap();
-    assert_eq!(selected_masks.len(), masks.len());
-    assert!(
-        selected_masks
-            .iter()
-            .any(|mask| mask.persisted_relative_path() == PROVIDER_PATH
-                && mask.intent() == SelectedResolutionOverlayIntent::Replacement)
-    );
-    assert!(baseline_by_path.contains_key(PROVIDER_PATH));
-
-    {
-        let source = operation.ready.typed_source();
-        let mut rows = Vec::new();
-        let outcome = {
-            let mut callback = |page: &[crate::analyzer::resolution::BindingFragmentId]| {
-                rows.extend_from_slice(page);
-                Ok(true)
-            };
-            let mut visitor = FactPageVisitor::new(&mut callback);
-            source
-                .visit_selected_fragment_pages(&cancellation, &mut visitor)
-                .expect("composite membership read")
-        };
-        assert!(outcome.is_exhausted());
-        rows.sort_unstable();
-        let mut expected = expected.clone();
-        expected.sort_unstable();
-        assert_eq!(rows, expected);
-        // A fragment is a mount ordinal, so a baseline fragment id cannot say
-        // whether persisted membership leaked: both selections number their
-        // own mounts from zero and the ids collide by construction. The
-        // composite membership is exactly this selection's mounts, which the
-        // comparison above states, and the masked paths are not among them.
-        for path in [REMOVED_PATH, SECOND_REPLACEMENT_PATH] {
-            assert!(
-                operation
-                    .mounts()
-                    .unwrap()
-                    .iter()
-                    .all(|mount| mount.persisted_relative_path() != path),
-                "masked persisted membership leaked for {path:?}"
-            );
-        }
-    }
-}
-
-#[test]
-fn persisted_and_transient_operations_match_preloaded_oracle_with_one_session_each() {
-    let fixture = ResolutionOperationFixture::new();
-    let masks = fixture.parity_masks();
-    let cancellation = CancellationToken::default();
-    let oracle_operation = fixture.open_parity_ready(&masks, &cancellation);
-    let oracle = PreloadedOracle::from_operation(&fixture, &oracle_operation);
-    assert_ne!(oracle.source_fragment, oracle.provider_fragment);
-    drop(oracle_operation);
-
-    let point_site = site_for_identifier(
-        &fixture.source_facts,
-        "method",
-        ResolutionIdentifierRole::Reference,
-        ResolutionNamespace::Callable,
-    );
-    let point_locator = locator(SOURCE_PATH, point_site, LoweredSemanticRole::Reference);
-    let expected_point = oracle
-        .service
-        .resolve_reference(oracle.point_reference, &cancellation)
-        .unwrap();
-    let point_operation = fixture.open_parity_ready(&masks, &cancellation);
-    let point_placements = contexts_for(&fixture, point_operation.mounts().unwrap());
-    reset_selected_fact_operation_construction_count_for_test();
-    let mut placement_metrics = SelectedResolutionContextMetrics;
-    let point = point_operation
-        .resolve_reference(
-            point_placements,
-            &point_locator,
-            &cancellation,
-            &mut placement_metrics,
-        )
-        .unwrap();
-    assert_eq!(selected_fact_operation_construction_count_for_test(), 1);
-    let SelectedResolutionOperationOutcome::Native(SelectedResolutionLocated::Found(point)) = point
-    else {
-        panic!("selected point operation must return a native found answer")
-    };
-    assert_eq!(point, expected_point);
-    assert!(
-        !point
-            .binding()
-            .targets()
-            .contains(&oracle.reverse_definition),
-        "the collapsed schema intentionally has no cross-file Java root bridge before Milestone 5"
-    );
-
-    let definition_site = provider_method_site(&fixture.provider_facts);
-    let definition_locator = locator(
-        PROVIDER_PATH,
-        definition_site,
-        LoweredSemanticRole::Definition,
-    );
-    let expected_reverse = oracle
-        .service
-        .references_to(oracle.reverse_definition, &cancellation)
-        .unwrap();
-    let reverse_operation = fixture.open_parity_ready(&masks, &cancellation);
-    let reverse_placements = contexts_for(&fixture, reverse_operation.mounts().unwrap());
-    reset_selected_fact_operation_construction_count_for_test();
-    let mut placement_metrics = SelectedResolutionContextMetrics;
-    let mut reverse_metrics = FactReverseResolutionMetrics::default();
-    let reverse = reverse_operation
-        .references_to_selected_definition(
-            reverse_placements,
-            2,
-            &definition_locator,
-            &cancellation,
-            &mut placement_metrics,
-            &mut reverse_metrics,
-        )
-        .unwrap();
-    assert_eq!(selected_fact_operation_construction_count_for_test(), 1);
-    let SelectedResolutionOperationOutcome::Native(SelectedResolutionLocated::Found(reverse)) =
-        reverse
-    else {
-        panic!("selected reverse operation must return a native found answer")
-    };
-    assert_eq!(reverse.answer(), &expected_reverse);
-    assert!(reverse_metrics.demanded_definition_count() > 0);
-    assert!(reverse_metrics.published_reference_count() > 0);
-    assert!(!reverse.references().contains(&oracle.point_reference));
-
-    let mut expected_batches = Vec::new();
-    let expected_summary = oracle
-        .service
-        .stage_all_reference_batches(2, &cancellation, &mut |batch| {
-            expected_batches.push(batch.clone());
-            Ok(())
-        })
-        .unwrap();
-    let broad_operation = fixture.open_parity_ready(&masks, &cancellation);
-    let broad_placements = contexts_for(&fixture, broad_operation.mounts().unwrap());
-    let (stager, _) = RollbackStager::new();
-    reset_selected_fact_operation_construction_count_for_test();
-    let mut placement_metrics = SelectedResolutionContextMetrics;
-    let broad = broad_operation
-        .stage_selected_reference_batches(
-            broad_placements,
-            2,
-            &cancellation,
-            &mut placement_metrics,
-            stager,
-        )
-        .unwrap();
-    assert_eq!(selected_fact_operation_construction_count_for_test(), 1);
-    let SelectedResolutionOperationOutcome::Native(broad) = broad else {
-        panic!("selected broad operation must return a native publication")
-    };
-    assert_semantic_summary_eq(&broad.summary, &expected_summary);
-    assert_eq!(
-        canonical_broad_rows(&broad.batches),
-        canonical_broad_rows(&expected_batches)
-    );
-    let fragments = broad
-        .batches
-        .iter()
-        .map(FactReferenceBatchAnswer::fragment)
-        .collect::<BTreeSet<_>>();
-    assert!(fragments.contains(&oracle.source_fragment));
-    assert!(fragments.contains(&oracle.provider_fragment));
 }
 
 #[test]
@@ -8804,53 +9042,6 @@ impl SelectedResolutionOperation<'_, '_> {
     }
 }
 
-#[test]
-fn rust_crate_point_context_does_not_prepare_workspace_profiles() {
-    let fixture = RustRootResolutionOperationFixture::new();
-    let cancellation = CancellationToken::new();
-    let owner = fixture.open_ready(&cancellation);
-    let keys = owner
-        .rust_crate_keys_for_file(Path::new(RUST_ROOT_CONSUMER_PATH), &cancellation)
-        .unwrap();
-    assert_eq!(keys.len(), 1);
-    let SelectedRustContextOutcome::Ready(context) = owner
-        .rust_crate_context(
-            crate::analyzer::resolution::SelectedContextIdentities::new(),
-            keys[0],
-            owner.mounts().unwrap(),
-            &cancellation,
-        )
-        .unwrap()
-    else {
-        panic!("crate context should be ready");
-    };
-    let site = site_for_identifier(
-        &fixture.consumer_facts,
-        "alias",
-        ResolutionIdentifierRole::Reference,
-        ResolutionNamespace::Value,
-    );
-    let locator = SelectedSemanticLocator::new(
-        "rust",
-        RUST_ROOT_CONSUMER_PATH,
-        site,
-        LoweredSemanticRole::Reference,
-    );
-    let mut context_metrics = SelectedResolutionContextMetrics;
-    let outcome = owner
-        .resolve_rust_reference(context, &locator, &cancellation, &mut context_metrics)
-        .unwrap();
-    let SelectedResolutionOperationOutcome::Native(SelectedResolutionLocated::Found(answers)) =
-        outcome
-    else {
-        panic!("native point answer");
-    };
-    assert!(
-        answers.iter().any(|answer| answer.definitions.len() == 1),
-        "crate rows must connect the imported alias to its definition"
-    );
-}
-
 fn active_macro_capsules(operation: &SelectedResolutionOperation<'_, '_>) -> Vec<(u32, u32)> {
     operation.ready.inventory.connection()
         .prepare("SELECT p.host_ordinal,a.invocation FROM temp.selected_resolution_stage_producers p JOIN temp.selected_resolution_admissions a USING(admission_id) WHERE a.input_kind=1 ORDER BY p.host_ordinal,a.invocation")
@@ -9102,7 +9293,17 @@ fn rust_macro_frontiers_only_prepare_the_demanded_file() {
             .unwrap(),
         SelectedResolutionStageOutcome::Ready
     ));
-    assert!(!operation.ready.macro_overlay.borrow().prepared);
+    assert!(
+        !operation
+            .ready
+            .macro_overlay
+            .borrow()
+            .prepared_files
+            .contains(&crate::path_utils::normalize_pattern(
+                RUST_ROOT_PROVIDER_PATH
+            )),
+        "the provider path has no prepared macro overlay"
+    );
     assert!(operation.ready.prepared_macro_files.borrow().is_empty());
     assert!(matches!(
         operation
@@ -9118,8 +9319,15 @@ fn rust_macro_frontiers_only_prepare_the_demanded_file() {
         .unwrap()
         .fragment();
     assert!(
-        operation.ready.macro_overlay.borrow().prepared,
-        "demanded macro file was prepared"
+        operation
+            .ready
+            .macro_overlay
+            .borrow()
+            .prepared_files
+            .contains(&crate::path_utils::normalize_pattern(
+                RUST_ROOT_CONSUMER_PATH
+            )),
+        "demanded caller path was prepared"
     );
     let admitted = active_macro_capsules(&operation);
     assert!(
@@ -9132,6 +9340,46 @@ fn rust_macro_frontiers_only_prepare_the_demanded_file() {
         [PathBuf::from(RUST_ROOT_CONSUMER_PATH)]
             .into_iter()
             .collect::<HashSet<_>>()
+    );
+}
+
+#[test]
+#[brokk_bifrost_test_macros::hardwon(
+    "#4457: expression-fragment reparsing split one canonical 0.0 token into two tuple selectors"
+)]
+fn selected_macro_tuple_index_chain_publishes_only_canonical_host_references() {
+    fn scale_source(index: usize) -> String {
+        if index == 0 {
+            "macro_rules! checked_as { ($value:expr, $target:ty) => { $value }; }\n".to_owned()
+        } else {
+            default_scale_source(index)
+        }
+    }
+
+    let mut fixture =
+        RustRootResolutionOperationFixture::new_with_scale_sources(4, 0, "", scale_source);
+    fixture.replace_persisted_consumer_source(
+        "#[macro_use]\nmod scale_0000;\n\
+         pub struct Pair(pub ((u8,),));\n\
+         pub fn caller(pair: Pair) { let _value = checked_as!(pair.0.0, u8); }\n",
+    );
+    let cancellation = CancellationToken::new();
+    let operation = fixture.open_ready(&cancellation);
+    assert!(
+        operation
+            .ensure_selected_rust_inputs(&cancellation)
+            .unwrap()
+    );
+    assert!(matches!(
+        operation
+            .prepare_selected_macro_frontiers(Path::new(RUST_ROOT_CONSUMER_PATH), &cancellation)
+            .unwrap(),
+        SelectedResolutionStageOutcome::Ready
+    ));
+    assert_eq!(
+        active_macro_capsules(&operation).len(),
+        1,
+        "the expression capsule keeps its internal positional-field lookups"
     );
 }
 
@@ -9524,6 +9772,125 @@ fn rust_macro_point_answer(
     }
 }
 
+#[hardwon("#4501: selected macro overlay queried the occurrence arena once per input")]
+#[test]
+fn selected_macro_overlay_scans_occurrence_arena_once_for_many_inputs() {
+    let mut fixture = RustRootResolutionOperationFixture::new_with_scale_sources(
+        4,
+        0,
+        "",
+        macro_definition_scale_source,
+    );
+    fixture.replace_persisted_consumer_source(
+        r#"
+#[macro_use]
+mod scale_0000;
+pub struct Tensor;
+impl Tensor {
+    pub fn datum_type(&self) -> u8 { 0 }
+}
+pub fn permute<T>(_dt: u8, _t: &Tensor) {}
+pub fn caller(t: &Tensor) {
+    let _first = dispatch!(permute(t.datum_type())(t));
+    let _second = dispatch!(permute(t.datum_type())(t));
+}
+"#,
+    );
+    let cancellation = CancellationToken::new();
+    let operation = fixture.open_ready(&cancellation);
+    assert!(
+        operation
+            .ensure_selected_rust_inputs(&cancellation)
+            .unwrap()
+    );
+    let host = operation
+        .ready
+        .inventory
+        .mount_record_for_path("rust", RUST_ROOT_CONSUMER_PATH)
+        .unwrap()
+        .unwrap();
+    let input_count: usize = operation
+        .ready
+        .inventory
+        .connection()
+        .query_row(
+            "SELECT count(*) FROM source_rust_macro_inputs WHERE blob_id=?1",
+            [host.blob_id()],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(
+        input_count >= 2,
+        "expected multiple macro inputs: {input_count}"
+    );
+
+    super::reset_selected_macro_occurrence_line_query_count_for_test();
+    assert!(matches!(
+        operation
+            .prepare_selected_macro_frontiers(Path::new(RUST_ROOT_CONSUMER_PATH), &cancellation)
+            .unwrap(),
+        SelectedResolutionStageOutcome::Ready
+    ));
+    assert_eq!(
+        super::selected_macro_occurrence_line_query_count_for_test(),
+        1,
+        "one JSONB arena scan supplies every selected macro input line"
+    );
+    assert!(matches!(
+        operation
+            .prepare_selected_macro_frontiers(Path::new(RUST_ROOT_CONSUMER_PATH), &cancellation)
+            .unwrap(),
+        SelectedResolutionStageOutcome::Ready
+    ));
+    assert_eq!(
+        super::selected_macro_occurrence_line_query_count_for_test(),
+        1,
+        "a repeated same-file request reuses the prepared overlay"
+    );
+}
+
+#[hardwon("#4501: identical macro include plans were rebuilt across caller operations")]
+#[test]
+fn selected_macro_include_overlay_reuses_plan_across_operations() {
+    let mut fixture = RustRootResolutionOperationFixture::new_with_scale_sources(
+        4,
+        0,
+        "",
+        macro_definition_scale_source,
+    );
+    fixture.replace_persisted_consumer_source(RUST_MACRO_CONSUMER_SOURCE);
+    let cancellation = CancellationToken::new();
+    let cache = &fixture.store.rust_macro_include_overlay_cache;
+    let initial_hits = cache.hit_count_for_test();
+    let initial_inserts = cache.insert_count_for_test();
+
+    let prepare = || {
+        let operation = fixture.open_ready(&cancellation);
+        assert!(matches!(
+            operation
+                .prepare_selected_macro_frontiers(Path::new(RUST_ROOT_CONSUMER_PATH), &cancellation)
+                .unwrap(),
+            SelectedResolutionStageOutcome::Ready
+        ));
+        active_macro_capsules(&operation)
+    };
+
+    let first = prepare();
+    assert!(
+        !first.is_empty(),
+        "the first operation publishes macro capsules"
+    );
+    assert_eq!(cache.insert_count_for_test(), initial_inserts + 1);
+    let second = prepare();
+    assert_eq!(second, first, "each request stages the same macro overlay");
+    assert_eq!(cache.hit_count_for_test(), initial_hits + 1);
+    assert_eq!(
+        cache.insert_count_for_test(),
+        initial_inserts + 1,
+        "the repeated operation reuses the prepared include plan"
+    );
+}
+
 /// A byte-identical replacement uses the persisted macro capsule; an edited
 /// one does not.
 ///
@@ -9596,7 +9963,17 @@ fn a_crate_stage_s_macro_overlay_is_dropped_with_everything_it_registered() {
         )
         .unwrap();
     operation.clear_selected_macro_overlay().unwrap();
-    assert!(!operation.ready.macro_overlay.borrow().prepared);
+    assert!(
+        !operation
+            .ready
+            .macro_overlay
+            .borrow()
+            .prepared_files
+            .contains(&crate::path_utils::normalize_pattern(
+                RUST_ROOT_CONSUMER_PATH
+            )),
+        "clearing the overlay removes the caller path from prepared coverage"
+    );
     assert_eq!(
         active_rows(),
         [0; 8],
@@ -10452,7 +10829,7 @@ fn persisted_reverse_exclusion_rejects_a_qualified_gap_owned_by_the_typed_route(
     let origin = crate::analyzer::store::resolution_prepare::resolution_rows::gap_origin_code(
         LoweringGapOrigin::QualifiedReference,
     );
-    let (ordinal,key)=operation.ready.inventory.connection().query_row("SELECT m.mount_ordinal,g.gap FROM temp.selected_resolution_mounts m JOIN resolution_gaps g ON g.blob_id=m.blob_id AND g.covers=3 JOIN resolution_gap_reasons r ON r.blob_id=g.blob_id AND r.reason=g.reason JOIN resolution_qualified_routes q ON q.blob_id=r.blob_id AND q.reference=r.site AND q.coarse_gap_reason=r.reason WHERE r.origin=?1 ORDER BY m.mount_ordinal,g.gap LIMIT 1",[origin],|row| Ok((row.get::<_,u32>(0)?,row.get::<_,u32>(1)?))).expect("fixture has an exact typed-owned qualified route gap");
+    let (ordinal,key)=operation.ready.inventory.connection().query_row("SELECT m.mount_ordinal,g.gap FROM temp.selected_resolution_mounts m JOIN resolution_gaps g ON g.blob_id=m.blob_id AND g.covers=6 AND g.subject=-1 AND g.lookup<>0 JOIN resolution_gap_reasons r ON r.blob_id=g.blob_id AND r.reason=g.reason JOIN resolution_qualified_routes q ON q.blob_id=r.blob_id AND q.reference=r.site AND q.coarse_gap_reason=r.reason WHERE r.origin=?1 ORDER BY m.mount_ordinal,g.gap LIMIT 1",[origin],|row| Ok((row.get::<_,u32>(0)?,row.get::<_,u32>(1)?))).expect("fixture has an exact typed-owned qualified route gap");
     let fragment = crate::analyzer::resolution::BindingFragmentId::at_ordinal(ordinal);
     let mut plan = ReverseCandidateGapExclusionPlan::new([ReverseCandidateGapIdentity::new(
         fragment,
@@ -10698,6 +11075,7 @@ fn a_republication_during_a_crate_stage_still_ends_stale() {
             inventory.requested_mount_rows(),
             inventory.persisted_mount_count(),
             inventory.authority_validations(),
+            inventory.authority_request_memo(),
         );
         let mount = inventory.mounts().unwrap()[0].clone();
         assert_eq!(
@@ -10728,6 +11106,121 @@ fn a_republication_during_a_crate_stage_still_ends_stale() {
             assert_eq!(reason, SelectedResolutionStale::MountInventoryChanged)
         }
         _ => panic!("a republication during the stage must end Stale"),
+    }
+}
+
+#[test]
+fn selected_operation_memoizes_published_authority_identities_and_site_rows() {
+    use super::super::resolution_authority::SelectedResolutionAuthority;
+
+    let fixture = ResolutionOperationFixture::new();
+    let cancellation = CancellationToken::default();
+    begin_production_selected_sql_trace(&fixture.store);
+    let mut operation_costs = Vec::new();
+    for _ in 0..2 {
+        let operation = fixture.open_ready(&[], Vec::new(), &cancellation);
+        let inventory = &operation.ready.inventory;
+        let mount = inventory.mounts().unwrap()[0].clone();
+        let (node_key, semantic_key, site_key) = inventory
+            .connection()
+            .query_row(
+                "SELECT (SELECT local_key FROM resolution_node_catalog WHERE blob_id=?1 ORDER BY local_key LIMIT 1), (SELECT local_key FROM resolution_semantic_catalog WHERE blob_id=?1 AND identity_digest IS NOT NULL ORDER BY local_key LIMIT 1), (SELECT site FROM resolution_sites WHERE blob_id=?1 AND role=1 ORDER BY site LIMIT 1)",
+                [mount.blob_id()],
+                |row| {
+                    Ok((
+                        row.get::<_, Option<i64>>(0)?,
+                        row.get::<_, Option<i64>>(1)?,
+                        row.get::<_, Option<i64>>(2)?,
+                    ))
+                },
+            )
+            .unwrap();
+        let node_key = u32::try_from(node_key.expect("fixture node identity"))
+            .expect("fixture node key fits u32");
+        let semantic_key = u32::try_from(semantic_key.expect("fixture semantic identity"))
+            .expect("fixture semantic key fits u32");
+        let site_key = u32::try_from(site_key.expect("fixture definition site"))
+            .expect("fixture site key fits u32");
+        let _setup = checkpoint_production_selected_sql_trace();
+
+        let authority = SelectedResolutionAuthority::from_selection(inventory);
+        let node = BindingNodeId::local(mount.ordinal().get(), node_key);
+        let node_first = authority
+            .node_catalog_provenance(node, &cancellation)
+            .unwrap();
+        let node_second = authority
+            .node_catalog_provenance(node, &cancellation)
+            .unwrap();
+        assert!(node_first.as_ref().is_some_and(Option::is_some));
+        assert_eq!(node_first, node_second);
+
+        let semantic = SemanticId::local(mount.ordinal().get(), semantic_key);
+        let semantic_first = authority
+            .semantic_catalog_provenance(semantic, &cancellation)
+            .unwrap();
+        let semantic_second = authority
+            .semantic_catalog_provenance(semantic, &cancellation)
+            .unwrap();
+        assert!(semantic_first.as_ref().is_some_and(Option::is_some));
+        assert_eq!(semantic_first, semantic_second);
+
+        let lexical = operation.ready.lexical_source();
+        let requests = [
+            (
+                mount.ordinal(),
+                BindingNodeId::local(mount.ordinal().get(), site_key),
+            ),
+            (
+                mount.ordinal(),
+                BindingNodeId::local(mount.ordinal().get(), u32::MAX),
+            ),
+        ];
+        let sites_first = lexical
+            .definition_source_sites(&requests, &cancellation)
+            .unwrap()
+            .unwrap();
+        let sites_second = lexical
+            .definition_source_sites(&requests, &cancellation)
+            .unwrap()
+            .unwrap();
+        assert_eq!(sites_first[0], Some(ResolutionSiteId::new(site_key)));
+        assert_eq!(sites_first[1], None);
+        assert_eq!(sites_first, sites_second);
+        operation_costs.push(checkpoint_production_selected_sql_trace());
+    }
+    let _cleanup = finish_production_selected_sql_trace(&fixture.store);
+
+    for cost in operation_costs {
+        let executions = |prefix: &str| {
+            cost.statements
+                .iter()
+                .filter(|sql| sql.starts_with(prefix))
+                .count()
+        };
+        assert_eq!(
+            executions("SELECT 1 FROM resolution_fragment_interiors"),
+            1,
+            "one published mount is checked once per operation: {:?}",
+            cost.statements
+        );
+        assert_eq!(
+            executions("SELECT identity_digest FROM resolution_node_catalog"),
+            1,
+            "one node identity is read once per operation: {:?}",
+            cost.statements
+        );
+        assert_eq!(
+            executions("SELECT identity_digest, shared_identity FROM resolution_semantic_catalog"),
+            1,
+            "one semantic identity is read once per operation: {:?}",
+            cost.statements
+        );
+        assert_eq!(
+            executions("SELECT site, role, namespace, site_kind"),
+            1,
+            "positive and negative site keys share one memoized batch read per operation: {:?}",
+            cost.statements
+        );
     }
 }
 
@@ -10849,12 +11342,13 @@ fn selected_go_import_names_bind_actual_file_definitions_without_basename_guessi
                 .iter()
                 .find_map(|reference| reference.prefix_reference)
                 .expect("positioned package qualifier");
-            let go_context::GoDotImportContext::Ready(context) = operation
+            let GoPreparedImportContextOutcome::Ready(prepared) = operation
                 .go_import_binding_context(context_id, GO_ROOT_CONSUMER_PATH, "go", &cancellation)
                 .unwrap()
             else {
                 panic!("selected source imports and canonical package names must compose");
             };
+            let context = prepared.context;
             let answer = operation
                 .resolve_reference(
                     context,
@@ -10955,8 +11449,8 @@ fn selected_go_qualified_imports_follow_bound_definitions_and_respect_local_shad
             ResolutionIdentifierRole::Reference,
             ResolutionNamespace::Type,
         );
-        let go_context::GoDotImportContext::Ready(context) = operation
-            .go_import_binding_context(context_id, GO_ROOT_CONSUMER_PATH, "go", &cancellation)
+        let go_context::GoDotImportContext::Ready { context, .. } = operation
+            .go_eager_import_binding_context(context_id, GO_ROOT_CONSUMER_PATH, "go", &cancellation)
             .unwrap()
         else {
             panic!("selected named import context");
@@ -11000,8 +11494,13 @@ fn selected_go_dot_import_excludes_a_test_variant_of_the_same_file() {
     let context_id = publish_go_root_fixture_context(&fixture, "example.test/root/provider");
     fixture.store.conn.execute(move |connection| {
         let transaction = connection.transaction().unwrap();
-        transaction.execute("INSERT INTO go_package_instances(context_id,tool_import_path,package_name,for_test,provider_directory,provider_digest,complete,gaps)
-            VALUES(?1,'example.test/root/consumer [example.test/root/consumer.test]','consumer','example.test/root/consumer','',zeroblob(32),0,jsonb('[]'))", [context_id]).unwrap();
+        let unit_key = go_unit_key(
+            "example.test/root/consumer [example.test/root/consumer.test]",
+            "example.test/root/consumer",
+            "test",
+        );
+        transaction.execute("INSERT INTO go_package_instances(context_id,tool_import_path,package_name,for_test,provider_directory,provider_digest,complete,gaps,unit_key)
+            VALUES(?1,'example.test/root/consumer [example.test/root/consumer.test]','consumer','example.test/root/consumer','',zeroblob(32),0,jsonb('[]'),?2)", params![context_id, unit_key.as_slice()]).unwrap();
         let variant = transaction.last_insert_rowid();
         transaction.execute("INSERT INTO go_package_files(package_id,file_version_id,source_role)
             SELECT ?2,files.file_version_id,'go' FROM go_context_source_files files
@@ -11014,7 +11513,7 @@ fn selected_go_dot_import_excludes_a_test_variant_of_the_same_file() {
     });
     let cancellation = CancellationToken::new();
     let operation = fixture.open_ready(&cancellation);
-    let go_context::GoDotImportContext::Ready(context) = operation
+    let go_context::GoDotImportContext::Ready { context, .. } = operation
         .go_dot_import_context(context_id, GO_ROOT_CONSUMER_PATH, "go", &cancellation)
         .unwrap()
     else {
@@ -11049,6 +11548,112 @@ fn selected_go_dot_import_excludes_a_test_variant_of_the_same_file() {
         1,
         "test variant must not add the decoy: {answer:?}"
     );
+}
+
+#[test]
+fn go_reverse_inventory_completeness_requires_live_unit_summaries() {
+    use super::super::planner_statistics::pinned_plans::{explain_pin, pinned};
+    use rusqlite::types::Value;
+
+    fn inventory_complete(
+        fixture: &GoRootResolutionOperationFixture,
+        context_id: i64,
+        file_version: i64,
+        include_tests: bool,
+    ) -> bool {
+        let snapshot = fixture.snapshots["go"].clone();
+        let workspace_id = snapshot.workspace_id.as_str().to_owned();
+        let generation = snapshot.generation.get();
+        let revision = snapshot.revision;
+        fixture.store.conn.execute(move |connection| {
+            super::super::go_unit_summaries::register_go_summary_sql_functions(connection).unwrap();
+            let producer_epoch: String = connection
+                .query_row(
+                    "SELECT producer_epoch FROM resolution_producer_epochs WHERE lang='go'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            connection
+                .query_row(
+                    super::go_reverse_rows::GO_REVERSE_INVENTORY_COMPLETE_SQL,
+                    params![
+                        context_id,
+                        file_version,
+                        true,
+                        include_tests,
+                        "[[1,\"type\"]]",
+                        workspace_id,
+                        generation,
+                        revision,
+                        producer_epoch,
+                        vec![0u8; 32],
+                        super::super::go_unit_summaries::GO_UNIT_SUMMARY_DERIVATION_VERSION,
+                    ],
+                    |row| row.get::<_, bool>(0),
+                )
+                .unwrap()
+        })
+    }
+
+    let fixture = GoRootResolutionOperationFixture::with_consumer(
+        "package consumer; import \"example.test/root/provider\"; var Use provider.Item",
+    );
+    let context_id = publish_go_root_fixture_context(&fixture, "example.test/root/provider");
+    let file_workspace_id = fixture.workspace_id.as_str().to_owned();
+    let file_generation = fixture.snapshots["go"].generation.get();
+    let file_version = fixture.store.conn.execute(move |connection| {
+        connection
+            .query_row(
+                "SELECT file_version_id FROM workspace_file_versions
+             WHERE workspace_id=?1 AND lang='go' AND generation=?2 AND rel_path=?3",
+                params![file_workspace_id, file_generation, GO_ROOT_PROVIDER_PATH],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap()
+    });
+    assert!(
+        !inventory_complete(&fixture, context_id, file_version, false),
+        "a Go reverse inventory without live summaries must remain incomplete"
+    );
+
+    let mut pin = pinned("go_reverse_inventory_complete");
+    pin.params = vec![
+        Value::Integer(context_id),
+        Value::Integer(file_version),
+        Value::Integer(1),
+        Value::Integer(0),
+        Value::Text("[[1,\"type\"]]".into()),
+        Value::Text(fixture.workspace_id.as_str().to_owned()),
+        Value::Integer(fixture.snapshots["go"].generation.get()),
+        Value::Integer(fixture.snapshots["go"].revision),
+        Value::Text("go-epoch".into()),
+        Value::Blob(vec![0; 32]),
+        Value::Integer(super::super::go_unit_summaries::GO_UNIT_SUMMARY_DERIVATION_VERSION),
+    ];
+    fixture.store.conn.execute(move |connection| {
+        super::super::go_unit_summaries::register_go_summary_sql_functions(connection).unwrap();
+        for statistics in brokk_bifrost_core::cache_gc::PlannerStatisticsState::BOTH {
+            statistics.install(connection);
+            let plan = explain_pin(connection, &pin);
+            assert!(
+                plan.iter()
+                    .any(|detail| detail.contains("resolution_unit_summary_dependencies_unit")),
+                "reverse package closure must seek summary dependents: {plan:?}"
+            );
+            assert!(
+                plan.iter()
+                    .any(|detail| detail.contains("resolution_unit_summary_versions")),
+                "reverse package closure must seek live summary versions: {plan:?}"
+            );
+            assert!(
+                !plan
+                    .iter()
+                    .any(|detail| detail.contains("SCAN resolution_unit_summary_dependencies")),
+                "reverse completeness must not scan summary dependency rows: {plan:?}"
+            );
+        }
+    });
 }
 
 #[test]
@@ -11095,8 +11700,8 @@ fn selected_go_external_tests_can_name_exports_from_the_selected_internal_test_v
             ),
             LoweredSemanticRole::Definition,
         );
-        let go_context::GoDotImportContext::Ready(context) = operation
-            .go_selected_import_context(context, GO_ROOT_CONSUMER_PATH, &cancellation)
+        let go_context::GoDotImportContext::Ready { context, .. } = operation
+            .go_eager_import_binding_context(context, GO_ROOT_CONSUMER_PATH, "xtest", &cancellation)
             .unwrap()
         else {
             panic!("selected external test package context");
@@ -11131,6 +11736,262 @@ fn selected_go_external_tests_can_name_exports_from_the_selected_internal_test_v
             "{source}: {answer:?}"
         );
     }
+}
+
+#[test]
+fn selected_go_demand_qualified_imports_match_the_eager_oracle_in_targets_and_completion() {
+    let mut saw_complete_eager_answer = false;
+    let mut saw_incomplete_eager_binding = false;
+    for (source_text, import_path, complete_inventory, member_name, member_namespace) in [
+        (
+            "package consumer; import \"example.test/root/strange\"; var Use provider.Item",
+            "example.test/root/strange",
+            false,
+            "Item",
+            ResolutionNamespace::Type,
+        ),
+        (
+            "package consumer; import renamed \"example.test/root/strange\"; var Use renamed.Item",
+            "example.test/root/strange",
+            false,
+            "Item",
+            ResolutionNamespace::Type,
+        ),
+        (
+            "package consumer; import _ \"example.test/root/strange\"; var Use provider.Item",
+            "example.test/root/strange",
+            false,
+            "Item",
+            ResolutionNamespace::Type,
+        ),
+        (
+            "package consumer; import renamed \"example.test/root/strange\"; var Use provider.Item",
+            "example.test/root/strange",
+            false,
+            "Item",
+            ResolutionNamespace::Type,
+        ),
+        (
+            "package consumer; import \"example.test/root/strange\"; func f() { type provider struct{}; var Use provider.Item; _ = Use }",
+            "example.test/root/strange",
+            false,
+            "Item",
+            ResolutionNamespace::Type,
+        ),
+        (
+            "package consumer; import \"example.test/root/provider\"; var Use provider.Item",
+            "example.test/root/provider",
+            true,
+            "Item",
+            ResolutionNamespace::Type,
+        ),
+        (
+            "package consumer; import \"example.test/root/provider\"; var Use provider.Missing",
+            "example.test/root/provider",
+            true,
+            "Missing",
+            ResolutionNamespace::Type,
+        ),
+        (
+            "package consumer; import \"example.test/root/provider\"; func Use() { var _ = provider.Missing }",
+            "example.test/root/provider",
+            true,
+            "Missing",
+            ResolutionNamespace::Value,
+        ),
+        (
+            "package consumer; import missing \"example.test/root/missing\"; var Use missing.Item",
+            "example.test/root/strange",
+            false,
+            "Item",
+            ResolutionNamespace::Type,
+        ),
+    ] {
+        let fixture = GoRootResolutionOperationFixture::with_consumer(source_text);
+        let context_id = publish_go_root_fixture_context(&fixture, import_path);
+        if complete_inventory {
+            fixture.store.conn.execute(move |connection| {
+                connection.execute(
+                    "UPDATE go_context_publications SET complete=1,gaps=jsonb('[]') WHERE context_id=?1",
+                    [context_id],
+                ).unwrap();
+                connection.execute(
+                    "UPDATE go_package_instances SET complete=1,gaps=jsonb('[]') WHERE context_id=?1",
+                    [context_id],
+                ).unwrap();
+                connection.execute(
+                    "UPDATE go_package_imports SET complete=1,gaps=jsonb('[]') WHERE context_id=?1",
+                    [context_id],
+                ).unwrap();
+            });
+        }
+        let cancellation = CancellationToken::new();
+        let operation = fixture.open_ready(&cancellation);
+        let reference_site = site_for_identifier(
+            &fixture.consumer_facts,
+            member_name,
+            ResolutionIdentifierRole::Reference,
+            member_namespace,
+        );
+        let locator = SelectedSemanticLocator::new(
+            "go",
+            GO_ROOT_CONSUMER_PATH,
+            reference_site,
+            LoweredSemanticRole::Reference,
+        );
+        let lexical = operation.ready.lexical_source();
+        let LocatedSemantic::Found(reference) = operation
+            .ready
+            .lookup_locator(&lexical, &locator, &cancellation)
+            .unwrap()
+        else {
+            panic!("qualified Go reference remains in selected source");
+        };
+        let prepared = match operation
+            .go_import_binding_context(context_id, GO_ROOT_CONSUMER_PATH, "go", &cancellation)
+            .unwrap()
+        {
+            GoPreparedImportContextOutcome::Ready(context) => *context,
+            _ => panic!("selected Go import context is available"),
+        };
+        let eager = match operation
+            .go_eager_import_binding_context(context_id, GO_ROOT_CONSUMER_PATH, "go", &cancellation)
+            .unwrap()
+        {
+            go_context::GoDotImportContext::Ready { context, .. } => context,
+            _ => panic!("eager Go oracle context is available"),
+        };
+        let prepare_blueprint = |context| {
+            let metrics = SelectedResolutionContextMetrics;
+            let SelectedResolutionContextValidationOutcome::Ready(context) = operation
+                .prepare_context(context, &cancellation, &metrics)
+                .unwrap()
+            else {
+                panic!("selected Go context validates");
+            };
+            let SelectedFactOperationBlueprintConstruction::Ready(blueprint) = operation
+                .ready
+                .collect_blueprint(context, &cancellation)
+                .unwrap()
+            else {
+                panic!("selected Go context blueprint is available");
+            };
+            assert!(matches!(
+                operation
+                    .ready
+                    .register_context(&blueprint, &cancellation)
+                    .unwrap(),
+                ContextRegistrationOutcome::Ready
+            ));
+            blueprint
+        };
+        let prepared_blueprint = prepare_blueprint(prepared.context);
+        let eager_blueprint = prepare_blueprint(eager);
+        let typed = operation.ready.typed_source();
+        let eager_answer = eager_blueprint
+            .with_forward_operation_in_session(
+                &lexical,
+                &lexical,
+                &typed,
+                &cancellation,
+                &ResolutionSession::unbounded(),
+                |resolver| {
+                    resolver.resolve_reference_with_metrics(
+                        reference,
+                        &mut ResolutionBatchMetrics::default(),
+                    )
+                },
+            )
+            .unwrap();
+        let demand_answer = operation
+            .with_go_forward_operation(
+                GoForwardOperationContext {
+                    blueprint: &prepared_blueprint,
+                    demand: prepared.demand,
+                    caller_path: GO_ROOT_CONSUMER_PATH,
+                    lexical: &lexical,
+                    typed: &typed,
+                    cancellation: &cancellation,
+                    session: &ResolutionSession::unbounded(),
+                },
+                None,
+                |resolver| {
+                    resolver.resolve_reference_with_metrics(
+                        reference,
+                        &mut ResolutionBatchMetrics::default(),
+                    )
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            demand_answer.binding().targets(),
+            eager_answer.binding().targets(),
+            "{source_text}: demand={demand_answer:?}, eager={eager_answer:?}"
+        );
+        assert_eq!(
+            demand_answer.binding().completion(),
+            eager_answer.binding().completion(),
+            "{source_text}: binding completion demand={demand_answer:?}, eager={eager_answer:?}"
+        );
+        assert_eq!(
+            demand_answer.completion(),
+            eager_answer.completion(),
+            "{source_text}: answer completion"
+        );
+        if complete_inventory {
+            assert_eq!(
+                eager_answer.completion(),
+                &ResolutionCompletion::Complete,
+                "the complete selected inventory has a complete eager answer: {eager_answer:?}"
+            );
+            assert_eq!(
+                demand_answer.completion(),
+                &ResolutionCompletion::Complete,
+                "the demand provider preserves the eager complete answer: {demand_answer:?}"
+            );
+            saw_complete_eager_answer = true;
+        }
+        if eager_answer.completion() == &ResolutionCompletion::Complete {
+            saw_complete_eager_answer = true;
+            assert_eq!(
+                demand_answer.completion(),
+                &ResolutionCompletion::Complete,
+                "the demand provider preserves the eager complete answer: {source_text}"
+            );
+        }
+        if matches!(
+            eager_answer.binding().completion(),
+            ResolutionCompletion::Incomplete(_)
+        ) {
+            saw_incomplete_eager_binding = true;
+            assert!(
+                matches!(
+                    demand_answer.binding().completion(),
+                    ResolutionCompletion::Incomplete(_)
+                ),
+                "an incomplete eager prefix binding remains incomplete on demand: {source_text}"
+            );
+        }
+        if source_text.contains("root/missing") {
+            assert_eq!(
+                demand_answer.binding().completion(),
+                &ResolutionCompletion::Complete,
+                "the eager path also treats an unresolved imported package as a complete binding"
+            );
+            assert_eq!(
+                eager_answer.binding().completion(),
+                &ResolutionCompletion::Complete
+            );
+        }
+    }
+    assert!(
+        saw_complete_eager_answer,
+        "the qualified-import fixtures include a complete eager answer"
+    );
+    assert!(
+        saw_incomplete_eager_binding,
+        "the qualified-import fixtures include an incomplete eager prefix binding"
+    );
 }
 
 fn stage_go_import_rows(
@@ -11171,7 +12032,9 @@ fn selected_go_import_readers_seek_populated_selected_rows() {
         let transaction = connection.transaction().unwrap();
         let version: i64 = transaction.query_row("SELECT file_version_id FROM go_context_source_files WHERE context_id=?1 AND rel_path=?2", params![context, GO_ROOT_PROVIDER_PATH], |row| row.get(0)).unwrap();
         for index in 0..512 {
-            transaction.execute("INSERT INTO go_package_instances(context_id,tool_import_path,package_name,for_test,provider_directory,provider_digest,complete,gaps) VALUES(?1,?2,'provider',?2,'',zeroblob(32),0,jsonb('[]'))", params![context, format!("example.test/variant{index}")]).unwrap();
+            let path = format!("example.test/variant{index}");
+            let unit_key = go_unit_key(&path, &path, "test");
+            transaction.execute("INSERT INTO go_package_instances(context_id,tool_import_path,package_name,for_test,provider_directory,provider_digest,complete,gaps,unit_key) VALUES(?1,?2,'provider',?2,'',zeroblob(32),0,jsonb('[]'),?3)", params![context, path, unit_key.as_slice()]).unwrap();
             let package = transaction.last_insert_rowid();
             transaction.execute("INSERT INTO go_package_files(package_id,file_version_id,source_role) VALUES(?1,?2,'go')", params![package,version]).unwrap();
         }
@@ -11229,32 +12092,29 @@ fn selected_go_import_readers_seek_populated_selected_rows() {
                 |row| row.get(0),
             )
             .unwrap();
-        let target: i64 = connection
+        let requested = format!("[[{},{version},\"go\"]]", source.ordinal().get());
+        let (provider_name, target): (String, i64) = connection
             .query_row(
-                go_named::IMPORT_PACKAGE_NAME,
-                params![context, caller, "go", "example.test/root/provider"],
-                |row| row.get(1),
+                go_named::GO_FILE_IMPORT_ROWS,
+                params![context, requested],
+                |row| Ok((row.get(4)?, row.get(5)?)),
             )
             .unwrap();
+        assert_eq!(provider_name, "provider");
         for (label, parameters, sought) in [
             (
                 "go_named_import_bindings",
-                vec![Integer(i64::from(source.ordinal().get()))],
+                vec![Text(format!("[{}]", source.ordinal().get()))],
                 "p",
             ),
             (
                 "go_named_stage_import_bindings",
-                vec![Integer(i64::from(source.ordinal().get()))],
+                vec![Text(format!("[{}]", source.ordinal().get()))],
                 "p",
             ),
             (
-                "go_named_import_package_name",
-                vec![
-                    Integer(context),
-                    Integer(caller),
-                    Text("go".into()),
-                    Text("example.test/root/provider".into()),
-                ],
+                "go_file_import_rows",
+                vec![Integer(context), Text(requested.clone())],
                 "imports",
             ),
             (

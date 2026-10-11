@@ -222,25 +222,14 @@ pub fn set_min_interval_secs_for_test(seconds: i64) -> GcIntervalGuard {
 
 #[cfg(test)]
 mod tests {
-    use std::path::Path;
+    use brokk_bifrost_test_macros::hardwon;
     use std::sync::Arc;
 
     use super::{AnalyzerGcCoordinator, AnalyzerStore, WorkerHold, run_gc};
-    use crate::analyzer::store::WorkspaceId;
+    use crate::analyzer::store::test_adapters::two_revision_collection_fixture;
     use crate::analyzer::workspace::WorkspaceAnalyzer;
     use crate::analyzer::{AnalyzerConfig, Language, Project, TestProject};
     use crate::gitblob::test_repo::{commit_all, init_repo};
-
-    /// The store's `(last_gc_at, blobs_at_last_gc)` collection accounting.
-    fn accounting(db_path: &Path) -> (i64, i64) {
-        let conn = rusqlite::Connection::open(db_path).expect("read the store's accounting");
-        conn.query_row(
-            "SELECT last_gc_at, blobs_at_last_gc FROM cache_state WHERE id = 1",
-            [],
-            |row| Ok((row.get(0)?, row.get(1)?)),
-        )
-        .expect("cache_state accounting")
-    }
 
     /// Issue #3170: a store created moments ago is not overdue for collection.
     ///
@@ -254,6 +243,7 @@ mod tests {
     /// The tuning guard pins the production cadence rather than changing it:
     /// the default interval is the subject here.
     #[test]
+    #[hardwon("#3170: a newly created store was immediately treated as due for collection")]
     fn a_fresh_store_is_not_born_due_for_collection() {
         let _tuning = crate::cache_gc::set_tuning_for_test(
             crate::cache_gc::GC_AUTO_BLOB_THRESHOLD,
@@ -287,7 +277,8 @@ mod tests {
             outcome.total_blobs_after > 0,
             "the build must persist blobs, or the scheduling condition is vacuous"
         );
-        let (last_gc_at, blobs_at_last_gc) = accounting(&db_path);
+        let (last_gc_at, blobs_at_last_gc) =
+            crate::cache_gc::gc_accounting_for_test(&db_path).expect("cache_state accounting");
         assert_eq!(
             blobs_at_last_gc, 0,
             "no collection ran, so the recorded blob count must still be the store's initial one"
@@ -312,56 +303,16 @@ mod tests {
     /// commits, each built, then the branch moves back to the first and the
     /// working tree with it, and the retained workspace projection is released.
     #[test]
+    #[hardwon(
+        "d78f9a16030c: readers kept stale query plans after garbage collection changed planner statistics"
+    )]
     fn a_collection_that_drops_rows_recycles_this_stores_readers() {
         let _statistics = brokk_bifrost_core::cache_gc::planner_statistics_test_lock()
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let _tuning = crate::cache_gc::set_tuning_for_test(0, 0);
-        let temp = tempfile::tempdir().unwrap();
-        let root = temp.path().canonicalize().unwrap();
-        let first = "pub fn widget() -> u32 { 1 }\n";
-        let second = "pub fn widget() -> u32 { 2 }\npub fn extra() -> u32 { 3 }\n";
-        std::fs::write(root.join(".gitignore"), ".bifrost/cache/\n").unwrap();
-        std::fs::write(root.join("app.rs"), first).unwrap();
-        let repository = init_repo(&root);
-        let first_commit = commit_all(&repository, "first content");
-        let project: Arc<dyn Project> = Arc::new(TestProject::new(root.clone(), Language::Rust));
-        let workspace = WorkspaceAnalyzer::build_persisted_without_automatic_gc(
-            Arc::clone(&project),
-            AnalyzerConfig::default(),
-        )
-        .expect("persisted analyzer should build");
-        let db_path = workspace
-            .persisted_store_path()
-            .expect("a persisted build reports its store path");
-        drop(workspace);
-
-        std::fs::write(root.join("app.rs"), second).unwrap();
-        commit_all(&repository, "second content");
-        drop(
-            WorkspaceAnalyzer::build_persisted_without_automatic_gc(
-                Arc::clone(&project),
-                AnalyzerConfig::default(),
-            )
-            .expect("persisted analyzer should rebuild"),
-        );
-
-        let head = repository.head().unwrap();
-        let branch = head.name().expect("a named branch").to_string();
-        repository
-            .reference(&branch, first_commit, true, "drop the second commit")
-            .unwrap();
-        std::fs::write(root.join("app.rs"), first).unwrap();
-
-        let store = AnalyzerStore::open_persistent(&db_path).expect("open the collected store");
-        // Both analyzers are gone. Release their retained revision history as
-        // well as the Git roots; only the explicit collection may reclaim facts.
-        assert!(
-            store
-                .delete_workspace_projection(&WorkspaceId::for_root(&root))
-                .expect("release the workspace projection")
-                > 0
-        );
+        let fixture = two_revision_collection_fixture();
+        let store = &fixture.store;
         drop(store.read_conn().expect("warm one pooled reader"));
         assert_eq!(
             store.readers.idle_len(),
@@ -369,7 +320,7 @@ mod tests {
             "the warmed reader must be back in the pool before the collection"
         );
 
-        let outcome = run_gc(&store, &repository, &root).expect("collection");
+        let outcome = run_gc(store, &fixture.repository, &fixture.root).expect("collection");
         assert!(
             outcome.analyzer_dropped > 0,
             "the setup must leave the second content collectable: {outcome:?}"
@@ -397,6 +348,7 @@ mod tests {
     /// exactly: the worker is parked before it does anything until the final
     /// drop is already waiting for it.
     #[test]
+    #[hardwon("#3349: dropping the last coordinator cancelled a scheduled collection")]
     fn a_collection_scheduled_before_the_final_drop_still_runs_and_the_drop_waits() {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().canonicalize().unwrap();
@@ -429,7 +381,10 @@ mod tests {
 
         // The worker has done nothing yet, and the final owner cannot finish
         // dropping while the worker is parked: the drop is waiting for it.
-        assert_eq!(accounting(&db_path), (0, 0));
+        assert_eq!(
+            crate::cache_gc::gc_accounting_for_test(&db_path).expect("cache_state accounting"),
+            (0, 0)
+        );
         assert!(
             !final_drop.is_finished(),
             "the final drop must join the scheduled collection, not return around it"
@@ -439,7 +394,8 @@ mod tests {
         final_drop
             .join()
             .expect("the final drop must not panic while joining the collection");
-        let (last_gc_at, blobs_at_last_gc) = accounting(&db_path);
+        let (last_gc_at, blobs_at_last_gc) =
+            crate::cache_gc::gc_accounting_for_test(&db_path).expect("cache_state accounting");
         assert!(
             last_gc_at > 0,
             "the collection scheduled before the final drop must have run"

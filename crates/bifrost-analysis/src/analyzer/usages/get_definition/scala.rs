@@ -21,9 +21,13 @@ use crate::analyzer::{
     StructuredImportScope,
 };
 use brokk_bifrost_core::analyzer::query_token::QueryToken;
+use brokk_bifrost_core::analyzer::scala_facts::scala_callable_role_for_parent;
 use brokk_bifrost_core::analyzer::structural::callable::ApplicabilityVerdict;
 use brokk_bifrost_core::analyzer::structural::callable::CallableRejectionReason;
 use brokk_bifrost_jvm::java::graph::resolver::java_callable_arity;
+use brokk_bifrost_jvm::scala::graph::inverted::scala_named_template_owner;
+pub(super) use brokk_bifrost_jvm::scala::graph::inverted::scala_postfix_operator_node as scala_postfix_method_node;
+use brokk_bifrost_jvm::scala::graph::inverted::scala_postfix_receiver_node;
 use brokk_bifrost_jvm::scala::graph::local::{
     ScalaLocalBinding, precise_scala_binding, seed_scala_binding,
     seed_scala_binding_with_receiver_declaration,
@@ -47,12 +51,14 @@ use brokk_bifrost_jvm::scala::graph::syntax::{
     enclosing_template_declarations, is_enclosing_template_qualifier_reference,
     is_extractor_reference, is_infix_type_operator_reference, is_scala_case_pattern_binder,
     is_scala_class_reference, is_scala_named_argument_assignment, is_semantic_call_argument,
-    named_argument_invocation_owner, qualified_stable_type_reference,
+    named_argument_label_owner, qualified_stable_type_reference,
     scala_callable_alternative_is_candidate, scala_callable_alternative_matches,
     scala_callable_alternative_mismatch, scala_callable_completes_call,
     scala_definition_binder_names, scala_method_value_site, scala_pattern_binder_names,
     template_self_types,
 };
+use brokk_bifrost_jvm::scala::supertypes::scala_type_lookup_segments_with;
+use brokk_bifrost_jvm::scala::wildcard_imports::ScalaWildcardImportOwner;
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, VecDeque};
 
@@ -392,20 +398,11 @@ impl BoundedDefinitionLookup for ScalaDefinitionProvider<'_> {
     }
 
     fn fqn_direct_children(&self, fqn: &str) -> Vec<CodeUnit> {
-        let mut children = Vec::new();
-        for owner in self.fqn(fqn) {
-            children.extend(self.direct_children(&owner));
-            if !self.session.observe_cancellation() {
-                return Vec::new();
-            }
-        }
-        sort_units(&mut children);
-        children.dedup();
-        children
-    }
-
-    fn fqn_exists(&self, fqn: &str) -> bool {
-        !self.fqn(fqn).is_empty()
+        super::fqn_direct_children(
+            self.fqn(fqn),
+            |owner| self.direct_children(owner),
+            || self.session.observe_cancellation(),
+        )
     }
 
     fn package_exists(&self, package: &str) -> bool {
@@ -415,11 +412,9 @@ impl BoundedDefinitionLookup for ScalaDefinitionProvider<'_> {
     }
 
     fn package_exists_in_language(&self, package: &str, language: Language) -> bool {
-        if language == Language::Scala {
+        crate::analyzer::scala::scala_package_exists_in_language(language, package, |package| {
             self.package_exists(package)
-        } else {
-            false
-        }
+        })
     }
 
     fn fqn_prefix_exists(&self, prefix: &str) -> bool {
@@ -507,21 +502,11 @@ impl<'a> ForwardScalaNameResolver<'a> {
     }
 
     fn resolve(&self, raw: &str) -> Option<String> {
-        match self.resolve_owner(raw, ScalaOwnerKind::Class) {
-            ScalaNameResolution::Resolved(owner) => Some(owner.fqn),
-            ScalaNameResolution::MissingExplicitImport
-            | ScalaNameResolution::Ambiguous(_)
-            | ScalaNameResolution::Unresolved => None,
-        }
+        scala_resolved_owner_fqn(self.resolve_owner(raw, ScalaOwnerKind::Class))
     }
 
     fn resolve_singleton(&self, raw: &str) -> Option<String> {
-        match self.resolve_owner(raw, ScalaOwnerKind::SingletonObject) {
-            ScalaNameResolution::Resolved(owner) => Some(owner.fqn),
-            ScalaNameResolution::MissingExplicitImport
-            | ScalaNameResolution::Ambiguous(_)
-            | ScalaNameResolution::Unresolved => None,
-        }
+        scala_resolved_owner_fqn(self.resolve_owner(raw, ScalaOwnerKind::SingletonObject))
     }
 
     fn resolve_explicit_singleton(&self, raw: &str) -> ScalaNameResolution {
@@ -795,14 +780,7 @@ impl<'a> ForwardScalaNameResolver<'a> {
         if environment.ambiguous {
             return ScalaNameResolution::Ambiguous(Vec::new());
         }
-        let mut candidates = environment
-            .owners
-            .into_iter()
-            .flat_map(|owner| {
-                let singleton = owner.is_singleton();
-                scala_nested_type_candidates(owner.fqn, segments, singleton)
-            })
-            .collect::<Vec<_>>();
+        let mut candidates = scala_wildcard_owner_segment_candidates(environment.owners, segments);
         candidates.extend(self.enclosing_owner_qualified_wildcard_candidates(segments));
         self.resolve_candidate_tier(candidates, kind)
     }
@@ -829,11 +807,9 @@ impl<'a> ForwardScalaNameResolver<'a> {
     /// (`resolve_owner_segments`), which keeps its existing tier order.
     fn resolve_nested_scope_term_owner(&self, segments: &[String]) -> ScalaNameResolution {
         // An explicit import binds one name in both namespaces, so both
-        // lookups belong to this tier: reporting the unindexed-import
-        // boundary after only the singleton-object lookup hid the imported
-        // class. `Unresolved` here means no visible explicit import spells
-        // the name at all, which is a kind-independent verdict, so the class
-        // lookup cannot answer either.
+        // lookups belong to this tier. An indexed target in the other
+        // namespace makes the first lookup `Unresolved`, so the class lookup
+        // must run for both `MissingExplicitImport` and `Unresolved`.
         match self.resolve_explicit_owner_segments(segments, ScalaOwnerKind::SingletonObject) {
             ScalaNameResolution::MissingExplicitImport => {
                 return match self.resolve_explicit_owner_segments(segments, ScalaOwnerKind::Class) {
@@ -841,7 +817,18 @@ impl<'a> ForwardScalaNameResolver<'a> {
                     outcome => outcome,
                 };
             }
-            ScalaNameResolution::Unresolved => {}
+            ScalaNameResolution::Unresolved => {
+                match self.resolve_explicit_owner_segments(segments, ScalaOwnerKind::Class) {
+                    ScalaNameResolution::Resolved(owner) => {
+                        return ScalaNameResolution::Resolved(owner);
+                    }
+                    ScalaNameResolution::Ambiguous(owners) => {
+                        return ScalaNameResolution::Ambiguous(owners);
+                    }
+                    ScalaNameResolution::MissingExplicitImport
+                    | ScalaNameResolution::Unresolved => {}
+                }
+            }
             outcome => return outcome,
         }
 
@@ -855,20 +842,13 @@ impl<'a> ForwardScalaNameResolver<'a> {
         if environment.ambiguous {
             return ScalaNameResolution::Ambiguous(Vec::new());
         }
-        let mut candidates = environment
-            .owners
-            .into_iter()
-            .filter(|owner| {
-                let import = imports
-                    .get(owner.import_index)
-                    .expect("wildcard owner indexes the import list it was resolved from");
-                self.import_is_template_nested(import)
-            })
-            .flat_map(|owner| {
-                let singleton = owner.is_singleton();
-                scala_nested_type_candidates(owner.fqn, segments, singleton)
-            })
-            .collect::<Vec<_>>();
+        let owners = environment.owners.into_iter().filter(|owner| {
+            let import = imports
+                .get(owner.import_index)
+                .expect("wildcard owner indexes the import list it was resolved from");
+            self.import_is_template_nested(import)
+        });
+        let mut candidates = scala_wildcard_owner_segment_candidates(owners, segments);
         candidates.extend(self.enclosing_owner_qualified_wildcard_candidates(segments));
         for kind in [ScalaOwnerKind::SingletonObject, ScalaOwnerKind::Class] {
             match self.resolve_candidate_tier(candidates.clone(), kind) {
@@ -942,6 +922,11 @@ impl<'a> ForwardScalaNameResolver<'a> {
             simple
         };
         let mut matching_explicit_import = false;
+        // A type-only import can share its spelling with a package-level
+        // object. If the import target exists under another Scala/JVM
+        // namespace, a miss in this owner namespace is not an external
+        // boundary; let the remaining name-resolution tiers answer it.
+        let mut indexed_import_target = false;
         let mut resolved = Vec::new();
         for import in self.visible_imports() {
             if declaration_range.is_some_and(|(start, end)| {
@@ -970,7 +955,7 @@ impl<'a> ForwardScalaNameResolver<'a> {
                 ]
             };
             for candidates in candidate_tiers {
-                match self.resolve_candidate_tier(candidates, kind) {
+                match self.resolve_candidate_tier(candidates.clone(), kind) {
                     ScalaNameResolution::Resolved(owner) => {
                         resolved.push(owner);
                         break;
@@ -978,8 +963,20 @@ impl<'a> ForwardScalaNameResolver<'a> {
                     ScalaNameResolution::Ambiguous(owners) => {
                         return ScalaNameResolution::Ambiguous(owners);
                     }
-                    ScalaNameResolution::MissingExplicitImport
-                    | ScalaNameResolution::Unresolved => {}
+                    ScalaNameResolution::MissingExplicitImport => {
+                        unreachable!("candidate-tier lookup does not classify explicit imports")
+                    }
+                    ScalaNameResolution::Unresolved => {
+                        if !indexed_import_target {
+                            indexed_import_target = candidates.iter().any(|candidate| {
+                                self.support
+                                    .fqn(candidate)
+                                    .into_iter()
+                                    .chain(self.support.fqn_in_language(candidate, Language::Java))
+                                    .any(|unit| unit.fq_name() == *candidate)
+                            });
+                        }
+                    }
                 }
             }
         }
@@ -988,7 +985,9 @@ impl<'a> ForwardScalaNameResolver<'a> {
         match resolved.as_slice() {
             [owner] => ScalaNameResolution::Resolved(owner.clone()),
             [_, _, ..] => ScalaNameResolution::Ambiguous(resolved),
-            [] if matching_explicit_import => ScalaNameResolution::MissingExplicitImport,
+            [] if matching_explicit_import && !indexed_import_target => {
+                ScalaNameResolution::MissingExplicitImport
+            }
             [] => ScalaNameResolution::Unresolved,
         }
     }
@@ -1457,21 +1456,21 @@ pub(crate) fn resolve_scala_bounded(
     budget: ReceiverAnalysisBudget,
     cancellation: Option<&CancellationToken>,
 ) -> BoundedResolution<DefinitionLookupOutcome> {
-    let session = ResolutionSession::bounded(budget, cancellation);
-    let Some(scala) = resolve_analyzer::<ScalaAnalyzer>(analyzer) else {
-        return session.finish(no_definition(
-            "scala_analyzer_unavailable",
-            "Scala analyzer is unavailable",
-        ));
-    };
-    let java = resolve_analyzer::<JavaAnalyzer>(analyzer);
-    let support = ScalaDefinitionProvider::new(scala, java, &session);
-    let batch = bounded_scala_definition_context(scala, token, file, &session);
-    let walk = ScalaBoundedWalk::new(&session);
-    let outcome = bounded_scala_definition_resolution(
-        scala, token, &support, &batch, file, source, tree, site, &walk,
-    );
-    session.finish(outcome)
+    ResolutionSession::run_bounded(budget, cancellation, |session| {
+        let Some(scala) = resolve_analyzer::<ScalaAnalyzer>(analyzer) else {
+            return no_definition(
+                "scala_analyzer_unavailable",
+                "Scala analyzer is unavailable",
+            );
+        };
+        let java = resolve_analyzer::<JavaAnalyzer>(analyzer);
+        let support = ScalaDefinitionProvider::new(scala, java, session);
+        let batch = bounded_scala_definition_context(scala, token, file, session);
+        let walk = ScalaBoundedWalk::new(session);
+        bounded_scala_definition_resolution(
+            scala, token, &support, &batch, file, source, tree, site, &walk,
+        )
+    })
 }
 
 struct ScalaBoundedWalk<'a> {
@@ -1806,30 +1805,16 @@ fn bounded_scala_definition_resolution(
 
 fn bounded_scala_smallest_named_node_covering<'tree>(
     walk: &ScalaBoundedWalk<'_>,
-    mut node: Node<'tree>,
+    node: Node<'tree>,
     start: usize,
     end: usize,
 ) -> Option<Node<'tree>> {
-    if !walk.step() || node.start_byte() > start || node.end_byte() < end {
-        return None;
-    }
-    loop {
-        let mut containing = None;
-        let mut cursor = node.walk();
-        for child in node.named_children(&mut cursor) {
-            if !walk.step() {
-                return None;
-            }
-            if child.start_byte() <= start && child.end_byte() >= end {
-                containing = Some(child);
-                break;
-            }
-        }
-        match containing {
-            Some(child) => node = child,
-            None => return Some(node),
-        }
-    }
+    brokk_bifrost_core::analyzer::usages::reference_site::smallest_named_node_covering_with_scope(
+        node,
+        start,
+        end,
+        || walk.step(),
+    )
 }
 
 fn bounded_scala_lexical_context(
@@ -1839,12 +1824,13 @@ fn bounded_scala_lexical_context(
     reference_node: Node<'_>,
     reference_byte: usize,
 ) -> Option<(Vec<String>, Vec<StructuredImportScope>)> {
-    let mut inspect = |_: Node<'_>| walk.step();
-    let package_prefixes =
-        scala_package_prefixes_at_checked(root, source, reference_byte, &mut inspect)?;
-    let lexical_scopes =
-        scala_lexical_scope_path_checked(reference_node, |_: Node<'_>| walk.step())?;
-    Some((package_prefixes, lexical_scopes))
+    scala_lexical_context_checked(
+        root,
+        source,
+        reference_node,
+        reference_byte,
+        |_: Node<'_>| walk.step(),
+    )
 }
 
 #[derive(Clone, Copy)]
@@ -2634,35 +2620,12 @@ fn bounded_scala_type_segments(
     ctx: &BoundedScalaCtx<'_, '_>,
     root: Node<'_>,
 ) -> Option<Vec<String>> {
-    let mut segments = Vec::new();
-    let mut stack = vec![root];
-    while let Some(node) = stack.pop() {
-        if !ctx.walk.step() {
-            return None;
-        }
-        match node.kind() {
-            "identifier" | "operator_identifier" | "type_identifier" => {
-                let segment = scala_node_text(node, ctx.source).trim();
-                if !segment.is_empty() {
-                    segments.push(segment.to_string());
-                }
-            }
-            "type_arguments" | "arguments" | "annotation" | "structural_type" => {}
-            _ => {
-                let mut cursor = node.walk();
-                let mut children = Vec::new();
-                for child in node.named_children(&mut cursor) {
-                    if !ctx.walk.step() {
-                        return None;
-                    }
-                    children.push(child);
-                }
-                children.reverse();
-                stack.extend(children);
-            }
-        }
-    }
-    (!segments.is_empty()).then_some(segments)
+    scala_type_lookup_segments_with(
+        root,
+        ctx.source,
+        |node, source| scala_node_text(node, source).to_string(),
+        || ctx.walk.step(),
+    )
 }
 
 fn bounded_scala_resolve_segments(
@@ -3287,20 +3250,18 @@ enum ScalaBoundedCandidateApplicability {
     Unknown,
 }
 
-fn bounded_scala_applicable_direct_members(
+fn bounded_scala_collect_member_candidates(
     ctx: &BoundedScalaCtx<'_, '_>,
-    owner: &CodeUnit,
-    name: &str,
-    call_shape: ScalaBoundedCallShape,
+    declarations: impl IntoIterator<Item = CodeUnit>,
+    mut applicability: impl FnMut(&CodeUnit) -> ScalaBoundedCandidateApplicability,
 ) -> ScalaBoundedMemberCandidates {
-    let direct = bounded_scala_direct_members(ctx, owner, name);
     let mut candidates = Vec::new();
     let mut overload_ambiguous = false;
-    for candidate in direct {
+    for candidate in declarations {
         if !ctx.walk.step() {
             return ScalaBoundedMemberCandidates::Unknown;
         }
-        match bounded_scala_direct_candidate_applicability(ctx, &candidate, call_shape) {
+        match applicability(&candidate) {
             ScalaBoundedCandidateApplicability::NotCandidate
             | ScalaBoundedCandidateApplicability::Inapplicable => {}
             ScalaBoundedCandidateApplicability::Applicable {
@@ -3324,6 +3285,42 @@ fn bounded_scala_applicable_direct_members(
             overload_ambiguous,
         }
     }
+}
+
+#[derive(Clone, Copy)]
+enum ScalaBoundedCallShapeApplicability {
+    Applicable,
+    Inapplicable,
+    Unknown,
+}
+
+fn bounded_scala_call_shape_applicability(
+    signature: &SignatureMetadata,
+    call_shape: ScalaBoundedCallShape,
+) -> ScalaBoundedCallShapeApplicability {
+    match call_shape {
+        ScalaBoundedCallShape::Access => ScalaBoundedCallShapeApplicability::Applicable,
+        ScalaBoundedCallShape::Ordinary(arity) => match signature.callable_arity() {
+            Some(callable_arity) if callable_arity.accepts(arity) => {
+                ScalaBoundedCallShapeApplicability::Applicable
+            }
+            Some(_) => ScalaBoundedCallShapeApplicability::Inapplicable,
+            None => ScalaBoundedCallShapeApplicability::Unknown,
+        },
+        ScalaBoundedCallShape::Unsupported => ScalaBoundedCallShapeApplicability::Unknown,
+    }
+}
+
+fn bounded_scala_applicable_direct_members(
+    ctx: &BoundedScalaCtx<'_, '_>,
+    owner: &CodeUnit,
+    name: &str,
+    call_shape: ScalaBoundedCallShape,
+) -> ScalaBoundedMemberCandidates {
+    let direct = bounded_scala_direct_members(ctx, owner, name);
+    bounded_scala_collect_member_candidates(ctx, direct, |candidate| {
+        bounded_scala_direct_candidate_applicability(ctx, candidate, call_shape)
+    })
 }
 
 fn bounded_scala_direct_candidate_applicability(
@@ -3359,16 +3356,12 @@ fn bounded_scala_direct_candidate_applicability(
             continue;
         }
         saw_ordinary = true;
-        match call_shape {
-            ScalaBoundedCallShape::Access => applicable = applicable.saturating_add(1),
-            ScalaBoundedCallShape::Ordinary(arity) => match signature.callable_arity() {
-                Some(callable_arity) if callable_arity.accepts(arity) => {
-                    applicable = applicable.saturating_add(1);
-                }
-                Some(_) => {}
-                None => saw_unknown = true,
-            },
-            ScalaBoundedCallShape::Unsupported => saw_unknown = true,
+        match bounded_scala_call_shape_applicability(&signature, call_shape) {
+            ScalaBoundedCallShapeApplicability::Applicable => {
+                applicable = applicable.saturating_add(1);
+            }
+            ScalaBoundedCallShapeApplicability::Inapplicable => {}
+            ScalaBoundedCallShapeApplicability::Unknown => saw_unknown = true,
         }
     }
     if !saw_ordinary {
@@ -3596,38 +3589,9 @@ fn bounded_scala_select_extension_candidates(
     receiver: &CodeUnit,
     call_shape: ScalaBoundedCallShape,
 ) -> ScalaBoundedMemberCandidates {
-    let mut candidates = Vec::new();
-    let mut overload_ambiguous = false;
-    for candidate in declarations {
-        if !ctx.walk.step() {
-            return ScalaBoundedMemberCandidates::Unknown;
-        }
-        match bounded_scala_extension_candidate_applicability(
-            ctx, token, &candidate, receiver, call_shape,
-        ) {
-            ScalaBoundedCandidateApplicability::NotCandidate
-            | ScalaBoundedCandidateApplicability::Inapplicable => {}
-            ScalaBoundedCandidateApplicability::Applicable {
-                overload_ambiguous: candidate_ambiguous,
-            } => {
-                overload_ambiguous |= candidate_ambiguous;
-                candidates.push(candidate);
-            }
-            ScalaBoundedCandidateApplicability::Unknown => {
-                return ScalaBoundedMemberCandidates::Unknown;
-            }
-        }
-    }
-    sort_units(&mut candidates);
-    candidates.dedup();
-    if candidates.is_empty() {
-        ScalaBoundedMemberCandidates::NoMatch
-    } else {
-        ScalaBoundedMemberCandidates::Found {
-            candidates,
-            overload_ambiguous,
-        }
-    }
+    bounded_scala_collect_member_candidates(ctx, declarations, |candidate| {
+        bounded_scala_extension_candidate_applicability(ctx, token, candidate, receiver, call_shape)
+    })
 }
 
 fn bounded_scala_extension_candidate_applicability(
@@ -3694,16 +3658,12 @@ fn bounded_scala_extension_candidate_applicability(
                 continue;
             }
         }
-        match call_shape {
-            ScalaBoundedCallShape::Access => applicable = applicable.saturating_add(1),
-            ScalaBoundedCallShape::Ordinary(arity) => match signature.callable_arity() {
-                Some(callable_arity) if callable_arity.accepts(arity) => {
-                    applicable = applicable.saturating_add(1);
-                }
-                Some(_) => {}
-                None => saw_unknown = true,
-            },
-            ScalaBoundedCallShape::Unsupported => saw_unknown = true,
+        match bounded_scala_call_shape_applicability(&signature, call_shape) {
+            ScalaBoundedCallShapeApplicability::Applicable => {
+                applicable = applicable.saturating_add(1);
+            }
+            ScalaBoundedCallShapeApplicability::Inapplicable => {}
+            ScalaBoundedCallShapeApplicability::Unknown => saw_unknown = true,
         }
     }
     if !saw_extension {
@@ -4463,6 +4423,32 @@ fn scala_import_reference_outcome(
             {
                 let prefix_segments = &structured_path.segments[..=focus_index];
                 let prefix = prefix_segments.join(".");
+                if prefix_segments.len() == 1
+                    && !scala_lexical_binding_declares_name_before(
+                        root,
+                        source,
+                        &prefix,
+                        node.start_byte(),
+                    )
+                    && let Some(owner) =
+                        scala_enclosing_class(analyzer, support, file, import.start_byte())
+                {
+                    match scala_exact_owner_member_candidate_units(
+                        ctx, token, &owner, &prefix, false,
+                    ) {
+                        ScalaExactMemberResolution::Found(candidates) => {
+                            return Some(candidates_outcome(candidates));
+                        }
+                        ScalaExactMemberResolution::Ambiguous(contenders) => {
+                            return Some(scala_ambiguous_outcome(
+                                "ambiguous_scala_enclosing_member",
+                                contenders,
+                                format!("`{prefix}` has multiple enclosing-owner definitions"),
+                            ));
+                        }
+                        ScalaExactMemberResolution::NoMatch => {}
+                    }
+                }
                 if let Some(outcome) = scala_wildcard_import_owner_outcome(
                     ctx,
                     token,
@@ -5397,7 +5383,7 @@ fn scala_exact_qualified_apply_outcome(
             token,
             &owner._declaration,
             &display,
-            call_site_shape_for_reference(node).as_ref(),
+            call_site_shape_for_reference(node, ctx.source).as_ref(),
         )),
         ScalaNameResolution::Ambiguous(_) => Some(no_definition(
             "ambiguous_scala_callable",
@@ -5411,7 +5397,7 @@ fn scala_exact_qualified_apply_outcome(
                         token,
                         &owner._declaration,
                         &format!("{display}.apply"),
-                        call_site_shape_for_reference(node).as_ref(),
+                        call_site_shape_for_reference(node, ctx.source).as_ref(),
                     ))
                 }
                 ScalaNameResolution::Ambiguous(_) => Some(no_definition(
@@ -5647,20 +5633,21 @@ fn scala_exact_terminal_member_candidates(
         ScalaQualifiedTerminalRole::Any | ScalaQualifiedTerminalRole::Term
     ) {
         let exact_fqn = format!("{}.{member}", owner.fq_name());
-        candidates.extend(
-            support
-                .fqn(&exact_fqn)
-                .into_iter()
-                .filter(|unit| unit.fq_name() == exact_fqn)
-                .filter(|unit| !unit.is_class() && !scala.is_type_alias(unit))
-                .filter(|unit| scala.structural_parent_of(unit).as_ref() == Some(owner)),
-        );
+        candidates.extend(scala_exact_structural_candidates_for_owner(
+            scala,
+            support,
+            owner,
+            &exact_fqn,
+            |unit| !unit.is_class() && !scala.is_type_alias(unit),
+        ));
         let singleton_fqn = format!("{}.{}$", owner.fq_name(), member);
-        candidates.extend(support.fqn(&singleton_fqn).into_iter().filter(|unit| {
-            unit.is_class()
-                && unit.fq_name() == singleton_fqn
-                && scala.structural_parent_of(unit).as_ref() == Some(owner)
-        }));
+        candidates.extend(scala_exact_structural_candidates_for_owner(
+            scala,
+            support,
+            owner,
+            &singleton_fqn,
+            |unit| unit.is_class(),
+        ));
     }
     if matches!(
         role,
@@ -5682,6 +5669,22 @@ fn scala_exact_terminal_member_candidates(
     sort_units(&mut candidates);
     candidates.dedup();
     candidates
+}
+
+fn scala_exact_structural_candidates_for_owner(
+    scala: &ScalaAnalyzer,
+    support: &dyn BoundedDefinitionLookup,
+    owner: &CodeUnit,
+    candidate_fqn: &str,
+    matches: impl Fn(&CodeUnit) -> bool,
+) -> Vec<CodeUnit> {
+    support
+        .fqn(candidate_fqn)
+        .into_iter()
+        .filter(|unit| unit.fq_name() == candidate_fqn)
+        .filter(|unit| matches(unit))
+        .filter(|unit| scala.structural_parent_of(unit).as_ref() == Some(owner))
+        .collect()
 }
 
 /// The terminal `member` declarations reachable through a tie between owners.
@@ -5747,17 +5750,7 @@ fn scala_exact_enclosing_singleton_path(
         let mut matched = index > 0;
         while index < segments.len() {
             let segment = &segments[index];
-            let mut children = ctx
-                .support
-                .fqn_direct_children(&owner.fq_name())
-                .into_iter()
-                .filter(|unit| unit.is_class() && unit.fq_name().ends_with('$'))
-                .filter(|unit| unit.identifier().trim_end_matches('$') == segment)
-                .filter(|unit| unit.source() == owner.source())
-                .filter(|unit| ctx.scala.structural_parent_of(unit).as_ref() == Some(&owner))
-                .collect::<Vec<_>>();
-            sort_units(&mut children);
-            children.dedup();
+            let children = scala_exact_singleton_children(ctx, &owner, segment);
             match children.as_slice() {
                 [child] => {
                     owner = child.clone();
@@ -5970,7 +5963,7 @@ fn resolve_scala_parser_proven_term_role(
             return None;
         }
         let display_name = reference.segments.join(".");
-        let call_shape = call_site_shape_for_reference(reference.expression);
+        let call_shape = call_site_shape_for_reference(reference.expression, ctx.source);
         // Scope-major: a scope nested inside the compilation unit answers from
         // both namespaces before the compilation-unit-and-outward walk runs
         // (#2224).
@@ -6116,14 +6109,14 @@ fn resolve_scala_parser_proven_term_role(
                 ctx,
                 &owner,
                 name,
-                call_site_shape_for_reference(node).as_ref(),
+                call_site_shape_for_reference(node, ctx.source).as_ref(),
             )
         }
         ScalaNameResolution::Resolved(owner) => scala_extractor_outcome(
             ctx,
             &owner,
             name,
-            call_site_shape_for_reference(node).as_ref(),
+            call_site_shape_for_reference(node, ctx.source).as_ref(),
         ),
         // gated upstream: resolver-verdict arm (workspace check is the resolver's).
         ScalaNameResolution::MissingExplicitImport => boundary_unchecked(
@@ -6145,7 +6138,7 @@ fn resolve_scala_parser_proven_term_role(
                     ctx,
                     &owner,
                     name,
-                    call_site_shape_for_reference(node).as_ref(),
+                    call_site_shape_for_reference(node, ctx.source).as_ref(),
                 ),
                 // gated upstream: resolver-verdict arm (workspace check is the resolver's).
                 ScalaNameResolution::MissingExplicitImport => boundary_unchecked(
@@ -6310,23 +6303,9 @@ fn scala_extractor_outcome(
         })
         .collect::<Vec<_>>();
     if let [class] = class_units.as_slice() {
-        let constructor_name = scala_constructor_member_name(class_fqn);
-        let constructor_fqn = format!("{class_fqn}.{constructor_name}");
-        let constructors = ctx
-            .support
-            .fqn(&constructor_fqn)
-            .into_iter()
-            .filter(|unit| unit.is_function() && unit.fq_name() == constructor_fqn)
-            .filter(|unit| ctx.scala.structural_parent_of(unit).as_ref() == Some(class))
-            .collect::<Vec<_>>();
         match scala_physical_callable_candidates(
             ctx.scala,
-            scala_filter_callable_units(
-                ctx.scala,
-                constructors,
-                call_shape,
-                ScalaCallableSiteRole::PrimaryConstruction,
-            ),
+            scala_primary_constructor_candidates(ctx, class, call_shape),
         ) {
             ScalaPhysicalCallableCandidates::Unique(candidates) => {
                 return candidates_outcome(candidates);
@@ -6361,24 +6340,9 @@ fn scala_parser_proven_class_outcome(
     reference: &str,
     call_shape: Option<&ScalaCallSiteShape>,
 ) -> DefinitionLookupOutcome {
-    let class_fqn = class.fqn.trim_end_matches('$');
-    let constructor_name = scala_constructor_member_name(class_fqn);
-    let constructor_fqn = format!("{class_fqn}.{constructor_name}");
-    let constructors = ctx
-        .support
-        .fqn(&constructor_fqn)
-        .into_iter()
-        .filter(|unit| unit.is_function() && unit.fq_name() == constructor_fqn)
-        .filter(|unit| ctx.scala.structural_parent_of(unit).as_ref() == Some(&class._declaration))
-        .collect::<Vec<_>>();
     match scala_physical_callable_candidates(
         ctx.scala,
-        scala_filter_callable_units(
-            ctx.scala,
-            constructors,
-            call_shape,
-            ScalaCallableSiteRole::PrimaryConstruction,
-        ),
+        scala_primary_constructor_candidates(ctx, &class._declaration, call_shape),
     ) {
         ScalaPhysicalCallableCandidates::Unique(candidates) => {
             if ctx.scala.is_full_enum_case_declaration(&class._declaration) {
@@ -6396,6 +6360,29 @@ fn scala_parser_proven_class_outcome(
             format!("`{reference}` has no indexed synthetic extractor constructor"),
         ),
     }
+}
+
+fn scala_primary_constructor_candidates(
+    ctx: ScalaLookupCtx<'_>,
+    class: &CodeUnit,
+    call_shape: Option<&ScalaCallSiteShape>,
+) -> Vec<CodeUnit> {
+    let class_name = class.fq_name();
+    let class_fqn = class_name.trim_end_matches('$');
+    let constructor_fqn = format!("{class_fqn}.{}", scala_constructor_member_name(class_fqn));
+    let constructors = ctx
+        .support
+        .fqn(&constructor_fqn)
+        .into_iter()
+        .filter(|unit| unit.is_function() && unit.fq_name() == constructor_fqn)
+        .filter(|unit| ctx.scala.structural_parent_of(unit).as_ref() == Some(class))
+        .collect();
+    scala_filter_callable_units(
+        ctx.scala,
+        constructors,
+        call_shape,
+        ScalaCallableSiteRole::PrimaryConstruction,
+    )
 }
 
 fn scala_exact_extractor_class_owner(
@@ -6582,20 +6569,7 @@ fn scala_exact_lexical_singleton_for_call(
         if !owner.is_class() {
             continue;
         }
-        let mut candidates = ctx
-            .support
-            .fqn_direct_children(&owner.fq_name())
-            .into_iter()
-            .filter(|candidate| {
-                candidate.is_class()
-                    && candidate.identifier().trim_end_matches('$') == name
-                    && candidate.fq_name().ends_with('$')
-            })
-            .filter(|candidate| candidate.source() == owner.source())
-            .filter(|candidate| ctx.scala.structural_parent_of(candidate).as_ref() == Some(&owner))
-            .collect::<Vec<_>>();
-        sort_units(&mut candidates);
-        candidates.dedup();
+        let candidates = scala_exact_singleton_children(ctx, &owner, name);
         match candidates.len() {
             0 => {}
             1 => {
@@ -6625,6 +6599,28 @@ fn scala_exact_lexical_singleton_for_call(
     ScalaExactMemberResolution::NoMatch
 }
 
+fn scala_exact_singleton_children(
+    ctx: ScalaLookupCtx<'_>,
+    owner: &CodeUnit,
+    name: &str,
+) -> Vec<CodeUnit> {
+    let mut candidates = ctx
+        .support
+        .fqn_direct_children(&owner.fq_name())
+        .into_iter()
+        .filter(|candidate| {
+            candidate.is_class()
+                && candidate.identifier().trim_end_matches('$') == name
+                && candidate.fq_name().ends_with('$')
+                && candidate.source() == owner.source()
+                && ctx.scala.structural_parent_of(candidate).as_ref() == Some(owner)
+        })
+        .collect::<Vec<_>>();
+    sort_units(&mut candidates);
+    candidates.dedup();
+    candidates
+}
+
 fn scala_exact_singleton_apply_outcome(
     ctx: ScalaLookupCtx<'_>,
     token: QueryToken<'_>,
@@ -6632,28 +6628,7 @@ fn scala_exact_singleton_apply_outcome(
     reference: &str,
     call_shape: Option<&ScalaCallSiteShape>,
 ) -> DefinitionLookupOutcome {
-    let apply_fqn = format!("{}.apply", owner.fq_name());
-    let mut units = ctx
-        .support
-        .fqn(&apply_fqn)
-        .into_iter()
-        .filter(|unit| unit.is_function() && unit.fq_name() == apply_fqn)
-        .filter(|unit| ctx.scala.structural_parent_of(unit).as_ref() == Some(owner))
-        .collect::<Vec<_>>();
-    sort_units(&mut units);
-    let candidates = scala_filter_callable_units(
-        ctx.scala,
-        units,
-        call_shape,
-        ScalaCallableSiteRole::Ordinary,
-    );
-    let candidates = scala_prefer_fixed_callable_candidates(
-        ctx.scala,
-        token,
-        ctx.support,
-        candidates,
-        call_shape,
-    );
+    let candidates = scala_exact_owner_apply_candidates(ctx, token, owner, call_shape);
     match scala_physical_callable_candidates(ctx.scala, candidates) {
         ScalaPhysicalCallableCandidates::Unique(candidates) => candidates_outcome(candidates),
         ScalaPhysicalCallableCandidates::Ambiguous => no_definition(
@@ -6665,6 +6640,40 @@ fn scala_exact_singleton_apply_outcome(
             format!("`{reference}` has no applicable lexical singleton `apply`"),
         ),
     }
+}
+
+fn scala_exact_owner_apply_candidates(
+    ctx: ScalaLookupCtx<'_>,
+    token: QueryToken<'_>,
+    owner: &CodeUnit,
+    call_shape: Option<&ScalaCallSiteShape>,
+) -> Vec<CodeUnit> {
+    let apply_fqn = format!("{}.apply", owner.fq_name());
+    let mut units = ctx
+        .support
+        .fqn(&apply_fqn)
+        .into_iter()
+        .filter(|unit| unit.is_function() && unit.fq_name() == apply_fqn)
+        .filter(|unit| ctx.scala.structural_parent_of(unit).as_ref() == Some(owner))
+        .collect::<Vec<_>>();
+    sort_units(&mut units);
+    scala_filter_apply_candidates(ctx.scala, token, ctx.support, units, call_shape)
+}
+
+fn scala_filter_apply_candidates(
+    scala: &ScalaAnalyzer,
+    token: QueryToken<'_>,
+    support: &dyn BoundedDefinitionLookup,
+    candidates: Vec<CodeUnit>,
+    call_shape: Option<&ScalaCallSiteShape>,
+) -> Vec<CodeUnit> {
+    let candidates = scala_filter_callable_units(
+        scala,
+        candidates,
+        call_shape,
+        ScalaCallableSiteRole::Ordinary,
+    );
+    scala_prefer_fixed_callable_candidates(scala, token, support, candidates, call_shape)
 }
 
 /// Apply Scala's fixed-arity precedence after ordinary shape applicability.
@@ -6788,25 +6797,8 @@ fn scala_exact_type_apply_or_constructor_outcome(
         );
     }
     if let Some(companion) = companions.first() {
-        let apply_fqn = format!("{companion_fqn}.apply");
-        let apply_candidates = scala_filter_callable_units(
-            ctx.scala,
-            ctx.support
-                .fqn(&apply_fqn)
-                .into_iter()
-                .filter(|unit| unit.is_function() && unit.fq_name() == apply_fqn)
-                .filter(|unit| ctx.scala.structural_parent_of(unit).as_ref() == Some(companion))
-                .collect(),
-            call_shape,
-            ScalaCallableSiteRole::Ordinary,
-        );
-        let apply_candidates = scala_prefer_fixed_callable_candidates(
-            ctx.scala,
-            token,
-            ctx.support,
-            apply_candidates,
-            call_shape,
-        );
+        let apply_candidates =
+            scala_exact_owner_apply_candidates(ctx, token, companion, call_shape);
         if !apply_candidates.is_empty() {
             return candidates_outcome(apply_candidates);
         }
@@ -6857,20 +6849,18 @@ fn scala_apply_or_constructor_outcome(
         .filter(|unit| unit.source() == reference_file)
         .cloned()
         .collect::<Vec<_>>();
-    let apply_candidates = scala_filter_callable_units(
+    let apply_candidates = scala_filter_apply_candidates(
         scala,
+        token,
+        support,
         if same_file_apply_units.is_empty() {
             apply_units
         } else {
             same_file_apply_units
         },
         call_shape,
-        ScalaCallableSiteRole::Ordinary,
     );
-    let apply_candidates = scala_physical_callable_candidates(
-        scala,
-        scala_prefer_fixed_callable_candidates(scala, token, support, apply_candidates, call_shape),
-    );
+    let apply_candidates = scala_physical_callable_candidates(scala, apply_candidates);
     match apply_candidates {
         ScalaPhysicalCallableCandidates::Unique(candidates) => {
             return candidates_outcome(candidates);
@@ -6949,10 +6939,7 @@ enum ScalaReferenceNode<'tree> {
 
 /// A named-argument identifier (`a` in `Foo(a = 3)` or `new Foo(a = 3)`).
 fn scala_named_argument(node: Node<'_>) -> Option<ScalaReferenceNode<'_>> {
-    if node.kind() != "identifier" {
-        return None;
-    }
-    let owner = named_argument_invocation_owner(node)?;
+    let owner = named_argument_label_owner(node)?;
     Some(ScalaReferenceNode::NamedArgument { owner, name: node })
 }
 
@@ -7025,21 +7012,14 @@ fn scala_reference_node(node: Node<'_>) -> Option<ScalaReferenceNode<'_>> {
     }
 
     match current.kind() {
-        "call_expression" => Some(ScalaReferenceNode::Call(current)),
-        "infix_expression" => Some(ScalaReferenceNode::InfixCall(current)),
-        "postfix_expression" => Some(ScalaReferenceNode::PostfixCall(current)),
         "instance_expression" => Some(ScalaReferenceNode::Constructor(current)),
-        "generic_function" => scala_unapplied_generic_reference(current),
-        "field_expression" => Some(ScalaReferenceNode::Field(current)),
-        "stable_identifier" => Some(ScalaReferenceNode::StableIdentifier(current)),
         "type_identifier"
         | "stable_type_identifier"
         | "generic_type"
         | "annotated_type"
         | "applied_constructor_type"
         | "projected_type" => Some(ScalaReferenceNode::Type(current)),
-        "identifier" | "operator_identifier" => Some(ScalaReferenceNode::Identifier(current)),
-        _ => None,
+        _ => scala_unapplied_generic_reference(current),
     }
 }
 
@@ -7160,7 +7140,7 @@ struct ScalaLookupCtx<'a> {
 
 impl ScalaLookupCtx<'_> {
     fn scope_step(self) -> bool {
-        self.session.is_none_or(ResolutionSession::scope_step)
+        super::session_scope_step(self.session)
     }
 
     fn direct_children_for_owner(&self, owner: &CodeUnit) -> Vec<CodeUnit> {
@@ -7179,33 +7159,16 @@ impl ScalaLookupCtx<'_> {
 
 fn scala_smallest_named_node_covering<'tree>(
     session: Option<&ResolutionSession>,
-    mut node: Node<'tree>,
+    node: Node<'tree>,
     start: usize,
     end: usize,
 ) -> Option<Node<'tree>> {
-    if !session.is_none_or(ResolutionSession::scope_step)
-        || node.start_byte() > start
-        || node.end_byte() < end
-    {
-        return None;
-    }
-    loop {
-        let mut containing = None;
-        let mut cursor = node.walk();
-        for child in node.named_children(&mut cursor) {
-            if !session.is_none_or(ResolutionSession::scope_step) {
-                return None;
-            }
-            if child.start_byte() <= start && child.end_byte() >= end {
-                containing = Some(child);
-                break;
-            }
-        }
-        match containing {
-            Some(child) => node = child,
-            None => return Some(node),
-        }
-    }
+    brokk_bifrost_core::analyzer::usages::reference_site::smallest_named_node_covering_with_scope(
+        node,
+        start,
+        end,
+        || session.is_none_or(ResolutionSession::scope_step),
+    )
 }
 
 fn scala_charge_ancestor_path(session: Option<&ResolutionSession>, mut node: Node<'_>) -> bool {
@@ -7231,11 +7194,25 @@ fn scala_lexical_context_at(
             scala_lexical_scope_path_at(root, reference_byte),
         ));
     };
-    let mut inspect = |_: Node<'_>| session.scope_step();
+    scala_lexical_context_checked(
+        root,
+        source,
+        reference_node,
+        reference_byte,
+        |_: Node<'_>| session.scope_step(),
+    )
+}
+
+fn scala_lexical_context_checked(
+    root: Node<'_>,
+    source: &str,
+    reference_node: Node<'_>,
+    reference_byte: usize,
+    mut inspect: impl FnMut(Node<'_>) -> bool,
+) -> Option<(Vec<String>, Vec<StructuredImportScope>)> {
     let package_prefixes =
         scala_package_prefixes_at_checked(root, source, reference_byte, &mut inspect)?;
-    let lexical_scopes =
-        scala_lexical_scope_path_checked(reference_node, |_: Node<'_>| session.scope_step())?;
+    let lexical_scopes = scala_lexical_scope_path_checked(reference_node, inspect)?;
     Some((package_prefixes, lexical_scopes))
 }
 
@@ -7245,7 +7222,7 @@ fn scala_call_site_shape(
     root: Node<'_>,
     reference: Node<'_>,
 ) -> Option<ScalaCallSiteShape> {
-    let Some(shape) = call_site_shape_for_reference(reference) else {
+    let Some(shape) = call_site_shape_for_reference(reference, ctx.source) else {
         // No argument list is written. Where a value is expected the site is a
         // method value: Scala eta-expands the callable the reference names,
         // and the expected function type -- not a written list -- states the
@@ -7290,7 +7267,7 @@ fn scala_forward_method_value_arity(
     if function.kind() == "generic_function" {
         function = function.child_by_field_name("function")?;
     }
-    let call_arities = call_arities_for_reference(function)?;
+    let call_arities = call_arities_for_reference(function, ctx.source)?;
     let methods = scala_forward_method_value_callee_units(ctx, token, root, function);
     let mut resolved = None;
     let actual = ScalaCallSiteShape::ordinary(&call_arities);
@@ -7415,15 +7392,14 @@ fn scala_forward_member_callee_units(
     };
     let resolver = ScalaNameResolver::for_file(ctx.scala, token, ctx.support, ctx.file)
         .with_lexical_context(package_prefixes, lexical_scopes, expression.start_byte());
-    let bindings = matches!(receiver.kind(), "identifier" | "type_identifier")
-        .then(|| scala_bindings_before(ctx, token, &resolver, root, expression.start_byte()));
-    let owner = match bindings.as_ref() {
-        Some(bindings) => {
-            scala_receiver_owner_with_bindings(ctx, token, &resolver, receiver, bindings)
-        }
-        None => scala_non_identifier_receiver_type_fqn(ctx, token, &resolver, receiver)
-            .map(ScalaReceiverOwner::Logical),
-    };
+    let (_, owner) = scala_member_receiver_owner(
+        ctx,
+        token,
+        &resolver,
+        root,
+        receiver,
+        expression.start_byte(),
+    );
     match owner {
         Some(ScalaReceiverOwner::Exact(owner)) => {
             match scala_exact_owner_member_candidate_units(ctx, token, &owner, member, false) {
@@ -7827,16 +7803,22 @@ fn scala_projected_type_outcome(
     }
 }
 
-fn scala_enclosing_type_definition_range(mut node: Node<'_>) -> Option<(usize, usize)> {
-    loop {
-        if matches!(
-            node.kind(),
+fn scala_enclosing_type_definition_range(node: Node<'_>) -> Option<(usize, usize)> {
+    let is_type_definition = |kind: &str| {
+        matches!(
+            kind,
             "class_definition" | "object_definition" | "trait_definition" | "enum_definition"
-        ) {
-            return Some((node.start_byte(), node.end_byte()));
-        }
-        node = node.parent()?;
-    }
+        )
+    };
+    let definition = if is_type_definition(node.kind()) {
+        node
+    } else {
+        brokk_bifrost_core::analyzer::structural::adapter_helpers::nearest_ancestor(
+            node,
+            is_type_definition,
+        )?
+    };
+    Some((definition.start_byte(), definition.end_byte()))
 }
 
 fn scala_compiler_intrinsic_type_reference(segments: &[String]) -> Option<&str> {
@@ -8474,6 +8456,56 @@ fn scala_direct_application_target(mut function: Node<'_>) -> Option<Node<'_>> {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
+fn scala_resolve_member_call_target(
+    ctx: ScalaLookupCtx<'_>,
+    token: QueryToken<'_>,
+    resolver: &ScalaNameResolver,
+    root: Node<'_>,
+    receiver: Node<'_>,
+    member: &str,
+    reference_byte: usize,
+    call_shape: Option<&ScalaCallSiteShape>,
+) -> Option<DefinitionLookupOutcome> {
+    if let Some(owner) =
+        scala_receiver_type_fqn(ctx, token, resolver, root, receiver, reference_byte)
+    {
+        let raw_candidates = scala_member_candidate_units(ctx, token, &owner, member, false);
+        let candidates = scala_filter_callable_units(
+            ctx.scala,
+            raw_candidates.clone(),
+            call_shape,
+            ScalaCallableSiteRole::Ordinary,
+        );
+        if !candidates.is_empty() {
+            return Some(candidates_outcome(candidates));
+        }
+        if raw_candidates
+            .iter()
+            .any(|unit| scala_unit_has_callable_role(ctx.scala, unit, ScalaCallableRole::Ordinary))
+        {
+            return Some(no_definition(
+                "no_applicable_scala_callable",
+                format!(
+                    "`{member}` has an ordinary member tier, but no overload matches this call"
+                ),
+            ));
+        }
+        return Some(scala_extension_candidates(
+            ctx,
+            token,
+            resolver,
+            member,
+            Some(&owner),
+            call_shape,
+        ));
+    }
+
+    let extension_candidates =
+        scala_extension_candidate_units(ctx, token, resolver, member, None, call_shape);
+    (!extension_candidates.is_empty()).then(|| candidates_outcome(extension_candidates))
+}
+
 fn resolve_scala_infix_call(
     ctx: ScalaLookupCtx<'_>,
     token: QueryToken<'_>,
@@ -8503,42 +8535,18 @@ fn resolve_scala_infix_call(
             "Scala infix expression has no semantic receiver",
         );
     };
-    let call_shape = call_site_shape_for_reference(operator);
-    if let Some(owner) =
-        scala_receiver_type_fqn(ctx, token, resolver, root, receiver, operator.start_byte())
-    {
-        let raw_candidates = scala_member_candidate_units(ctx, token, &owner, name, false);
-        let candidates = scala_filter_callable_units(
-            ctx.scala,
-            raw_candidates.clone(),
-            call_shape.as_ref(),
-            ScalaCallableSiteRole::Ordinary,
-        );
-        if !candidates.is_empty() {
-            return candidates_outcome(candidates);
-        }
-        if raw_candidates
-            .iter()
-            .any(|unit| scala_unit_has_callable_role(ctx.scala, unit, ScalaCallableRole::Ordinary))
-        {
-            return no_definition(
-                "no_applicable_scala_callable",
-                format!("`{name}` has an ordinary member tier, but no overload matches this call"),
-            );
-        }
-        return scala_extension_candidates(
-            ctx,
-            token,
-            resolver,
-            name,
-            Some(&owner),
-            call_shape.as_ref(),
-        );
-    }
-    let extension_candidates =
-        scala_extension_candidate_units(ctx, token, resolver, name, None, call_shape.as_ref());
-    if !extension_candidates.is_empty() {
-        return candidates_outcome(extension_candidates);
+    let call_shape = call_site_shape_for_reference(operator, ctx.source);
+    if let Some(outcome) = scala_resolve_member_call_target(
+        ctx,
+        token,
+        resolver,
+        root,
+        receiver,
+        name,
+        operator.start_byte(),
+        call_shape.as_ref(),
+    ) {
+        return outcome;
     }
     no_definition(
         SCALA_UNSUPPORTED_RECEIVER,
@@ -8574,59 +8582,22 @@ fn resolve_scala_postfix_call(
     if name.is_empty() {
         return no_definition("no_function_name", "Scala postfix method is blank");
     }
-    if let Some(owner) =
-        scala_receiver_type_fqn(ctx, token, resolver, root, receiver, method.start_byte())
-    {
-        let raw_candidates = scala_member_candidate_units(ctx, token, &owner, name, false);
-        let candidates = scala_filter_callable_units(
-            ctx.scala,
-            raw_candidates.clone(),
-            None,
-            ScalaCallableSiteRole::Ordinary,
-        );
-        if !candidates.is_empty() {
-            return candidates_outcome(candidates);
-        }
-        if raw_candidates
-            .iter()
-            .any(|unit| scala_unit_has_callable_role(ctx.scala, unit, ScalaCallableRole::Ordinary))
-        {
-            return no_definition(
-                "no_applicable_scala_callable",
-                format!("`{name}` has an ordinary member tier, but no overload matches this call"),
-            );
-        }
-        return scala_extension_candidates(ctx, token, resolver, name, Some(&owner), None);
-    }
-    let extension_candidates =
-        scala_extension_candidate_units(ctx, token, resolver, name, None, None);
-    if !extension_candidates.is_empty() {
-        return candidates_outcome(extension_candidates);
+    if let Some(outcome) = scala_resolve_member_call_target(
+        ctx,
+        token,
+        resolver,
+        root,
+        receiver,
+        name,
+        method.start_byte(),
+        None,
+    ) {
+        return outcome;
     }
     no_definition(
         SCALA_UNSUPPORTED_RECEIVER,
         format!("receiver for Scala postfix member `{name}` is not resolved"),
     )
-}
-
-pub(super) fn scala_postfix_method_node(node: Node<'_>) -> Option<Node<'_>> {
-    let mut cursor = node.walk();
-    let mut method = None;
-    for child in node.named_children(&mut cursor) {
-        if matches!(child.kind(), "identifier" | "operator_identifier") {
-            method = Some(child);
-        }
-    }
-    method
-}
-
-fn scala_postfix_receiver_node<'tree>(
-    node: Node<'tree>,
-    method: Node<'tree>,
-) -> Option<Node<'tree>> {
-    let mut cursor = node.walk();
-    node.named_children(&mut cursor)
-        .find(|child| child.end_byte() <= method.start_byte())
 }
 
 fn resolve_scala_constructor(
@@ -8654,7 +8625,7 @@ fn resolve_scala_constructor(
     };
     let owner_fqn = exact_owner.fq_name();
     let member = scala_constructor_member_name(&owner_fqn);
-    let call_shape = call_site_shape_for_reference(type_node);
+    let call_shape = call_site_shape_for_reference(type_node, ctx.source);
     if crate::analyzer::common::language_for_target(&exact_owner) == Language::Java {
         return resolve_java_constructor_from_scala(
             ctx,
@@ -8849,15 +8820,8 @@ fn resolve_scala_field(
             "Scala field expression has no receiver",
         );
     };
-    let bindings = matches!(receiver.kind(), "identifier" | "type_identifier")
-        .then(|| scala_bindings_before(ctx, token, resolver, root, field.start_byte()));
-    let owner = match bindings.as_ref() {
-        Some(bindings) => {
-            scala_receiver_owner_with_bindings(ctx, token, resolver, receiver, bindings)
-        }
-        None => scala_non_identifier_receiver_type_fqn(ctx, token, resolver, receiver)
-            .map(ScalaReceiverOwner::Logical),
-    };
+    let (bindings, owner) =
+        scala_member_receiver_owner(ctx, token, resolver, root, receiver, field.start_byte());
     if let Some(owner) = owner {
         let owner_fqn = owner.fq_name();
         if member == "copy"
@@ -9004,19 +8968,9 @@ fn resolve_scala_field(
 }
 
 fn scala_case_class_owner(ctx: ScalaLookupCtx<'_>, owner_fqn: &str) -> Option<CodeUnit> {
-    let mut candidates = ctx
-        .support
-        .fqn(owner_fqn)
-        .into_iter()
-        .filter(|candidate| candidate.is_class() && candidate.fq_name() == owner_fqn)
-        .filter(|candidate| ctx.scala.is_case_class_declaration(candidate))
-        .collect::<Vec<_>>();
-    sort_units(&mut candidates);
-    candidates.dedup();
-    match candidates.as_slice() {
-        [candidate] => Some(candidate.clone()),
-        _ => None,
-    }
+    scala_unique_exact_class_owner(ctx, owner_fqn, |candidate| {
+        ctx.scala.is_case_class_declaration(candidate)
+    })
 }
 
 /// The canonical external identity a Scala member access publishes when the
@@ -9063,21 +9017,20 @@ fn scala_logical_owner_external_member_outcome(
     // jar-indexed and pack-declared owners, and this owner's workspace
     // members, stable terms and extensions already answered nothing above, so
     // the route is external by construction.
-    trace::record_named_boundary(canonical.clone());
-    let mut outcome = boundary_unchecked(
-        format!(
-            "`{canonical}` names a member of a Scala type declared outside the indexed workspace"
-        ),
-        UnindexedClaim::external_boundary(canonical.clone(), ClaimSubjectRole::Member),
-    );
-    outcome.reference = Some(ResolvedReferenceSite {
+    let reference = ResolvedReferenceSite {
         path: ctx.file.to_string(),
-        text: canonical,
+        text: canonical.clone(),
         range: node_range(field),
         focus_start_byte: member_node.start_byte(),
         focus_end_byte: member_node.end_byte(),
-    });
-    Some(outcome)
+    };
+    Some(super::external_member_boundary_outcome(
+        canonical.clone(),
+        format!(
+            "`{canonical}` names a member of a Scala type declared outside the indexed workspace"
+        ),
+        Some(reference),
+    ))
 }
 
 /// What a Scala member access reports when its receiver is not a type this
@@ -9387,41 +9340,26 @@ fn scala_stable_term_member_candidate_units(
     owner_fqn: &str,
     member: &str,
 ) -> Vec<CodeUnit> {
-    let mut candidates =
+    let candidates =
         scala_stable_term_member_candidate_units_without_ancestors(ctx.support, owner_fqn, member);
     if !candidates.is_empty() {
         return candidates;
     }
-
-    let mut matching_depth = None;
-    for owner in ctx
-        .support
-        .fqn(owner_fqn)
-        .into_iter()
-        .filter(|unit| unit.is_class() && unit.fq_name() == owner_fqn)
-    {
-        // Expected gap (#1477 rule 2): the stable-term ladder answers with
-        // singleton terminals reached through the same ancestor walk, but it
-        // returns them without the owner it read them from, so nothing here
-        // holds an owner to attribute. Its candidates stay unattributed.
-        for (ancestor, depth) in scala_ancestor_owners(ctx.scala, token, ctx.support, owner, None) {
-            if matching_depth.is_some_and(|found| depth > found) {
-                break;
-            }
-            let direct = scala_stable_term_member_candidate_units_without_ancestors(
+    scala_nearest_ancestor_member_candidates(
+        ctx.scala,
+        ctx.support,
+        token,
+        owner_fqn,
+        member,
+        None,
+        |owner_fqn, member| {
+            scala_stable_term_member_candidate_units_without_ancestors(
                 ctx.support,
-                &ancestor.fq_name(),
+                owner_fqn,
                 member,
-            );
-            if !direct.is_empty() {
-                matching_depth = Some(depth);
-                candidates.extend(direct);
-            }
-        }
-    }
-    sort_units(&mut candidates);
-    candidates.dedup();
-    candidates
+            )
+        },
+    )
 }
 
 /// Stable singleton terminals for an exact receiver must remain in the
@@ -9434,17 +9372,13 @@ fn scala_exact_stable_term_member_candidate_units(
     member: &str,
 ) -> Vec<CodeUnit> {
     let singleton_fqn = format!("{}.{}$", owner.fq_name(), member);
-    let mut candidates = ctx
-        .support
-        .fqn(&singleton_fqn)
-        .into_iter()
-        .filter(|candidate| {
-            candidate.is_class()
-                && candidate.fq_name() == singleton_fqn
-                && candidate.source() == owner.source()
-                && ctx.scala.structural_parent_of(candidate).as_ref() == Some(owner)
-        })
-        .collect::<Vec<_>>();
+    let mut candidates = scala_exact_structural_candidates_for_owner(
+        ctx.scala,
+        ctx.support,
+        owner,
+        &singleton_fqn,
+        |candidate| candidate.is_class() && candidate.source() == owner.source(),
+    );
     sort_units(&mut candidates);
     candidates.dedup();
     candidates
@@ -9822,8 +9756,15 @@ fn scala_exact_constructed_argument(
     } else {
         return None;
     };
-    let mut cursor = instance.walk();
-    let type_node = instance.named_children(&mut cursor).find(|child| {
+    let type_node = scala_constructed_type_child(instance)?;
+    scala_resolve_visible_type_declaration(ctx, token, resolver, type_node)
+        .filter(|declaration| declaration.is_class() && !ctx.scala.is_type_alias(declaration))
+        .map(ScalaExactArgument::Constructed)
+}
+
+fn scala_constructed_type_child(node: Node<'_>) -> Option<Node<'_>> {
+    let mut cursor = node.walk();
+    node.named_children(&mut cursor).find(|child| {
         matches!(
             child.kind(),
             "type_identifier"
@@ -9834,10 +9775,7 @@ fn scala_exact_constructed_argument(
                 | "singleton_type"
                 | "annotated_type"
         )
-    })?;
-    scala_resolve_visible_type_declaration(ctx, token, resolver, type_node)
-        .filter(|declaration| declaration.is_class() && !ctx.scala.is_type_alias(declaration))
-        .map(ScalaExactArgument::Constructed)
+    })
 }
 
 fn scala_callable_matches_constructed_arguments(
@@ -9961,16 +9899,9 @@ fn scala_callable_matches_exact_arguments(
     }
 }
 
-/// The static type of a literal argument node, with the numeric suffix
-/// consulted so `1L`/`1.0f` do not masquerade as `Int`/`Double`.
+/// The static type of a literal argument node.
 fn scala_exact_literal_argument_type(node: Node<'_>, source: &str) -> Option<&'static str> {
-    let base = scala_literal_type_name(node.kind())?;
-    let text = scala_node_text(node, source).trim();
-    Some(match base {
-        "Int" if text.ends_with(['l', 'L']) => "Long",
-        "Double" if text.ends_with(['f', 'F']) => "Float",
-        other => other,
-    })
+    scala_literal_type_name(source, node)
 }
 
 /// Exact-identity relation between a literal argument's builtin type and a
@@ -10102,9 +10033,7 @@ impl ScalaMemberTrace {
     }
 
     fn record_companion(&mut self, owner: &CodeUnit, companion: &CodeUnit) {
-        self.companion_of
-            .entry(companion.clone())
-            .or_insert_with(|| owner.clone());
+        super::record_companion_owner(&mut self.companion_of, owner, companion);
     }
 
     /// Attribute every candidate the walk just read out of `scope`, which sits
@@ -10153,35 +10082,26 @@ impl ScalaMemberTrace {
         let Some(find) = self.found.get(candidate) else {
             return Vec::new();
         };
-        let mut reversed = Vec::new();
-        let mut current = find.owner.clone();
-        while current != self.base {
-            let step = if let Some(class) = self.companion_of.get(&current) {
-                (class.clone(), HierarchyRelation::Embedded)
-            } else if let Some((parent, relation)) = self.parents.get(&current) {
-                (parent.clone(), *relation)
-            } else {
-                break;
-            };
-            reversed.push((step.0.clone(), current, step.1));
-            current = step.0;
-        }
+        let (route, _) = trace::hierarchy_route_from_predecessors(
+            &find.owner,
+            find.depth,
+            |current, _| current == &self.base,
+            |current| {
+                self.companion_of
+                    .get(current)
+                    .cloned()
+                    .map(|class| (class, HierarchyRelation::Embedded))
+                    .or_else(|| self.parents.get(current).cloned())
+            },
+            |unit| Some(unit.clone()),
+        )
+        .expect("Scala hierarchy route nodes always have declaration identities");
         debug_assert_eq!(
-            reversed.len(),
+            route.len(),
             find.depth,
             "the first-discovery route must be exactly the recorded depth"
         );
-        reversed.reverse();
-        reversed
-            .into_iter()
-            .enumerate()
-            .map(|(hop, (from, to, relation))| trace::HierarchyHopRecord {
-                hop,
-                from,
-                to,
-                relation,
-            })
-            .collect()
+        route
     }
 
     /// The attribution for `candidate`, with the applicability the seam that
@@ -10193,26 +10113,22 @@ impl ScalaMemberTrace {
         applicability: ApplicabilityVerdict,
     ) -> Option<trace::MemberEnrichment> {
         let find = self.found.get(candidate)?;
-        Some(trace::MemberEnrichment {
-            owner: find.owner.clone(),
-            hierarchy_depth: find.depth,
-            dispatch_tier: find.dispatch_tier,
+        Some(trace::member_enrichment_with_tier(
+            find.owner.clone(),
+            find.depth,
+            find.dispatch_tier,
             applicability,
-            route: self.route(candidate),
-        })
+            self.route(candidate),
+        ))
     }
 
     /// Scala's precedence ladder for a member find, which follows the hierarchy
     /// level: a companion of the receiver's own type is that type's own member,
     /// not an inherited one.
     fn precedence_tier(&self, candidate: &CodeUnit) -> Option<PrecedenceTier> {
-        self.found.get(candidate).map(|find| {
-            if find.level == 0 {
-                PrecedenceTier::OwnMember
-            } else {
-                PrecedenceTier::InheritedMember
-            }
-        })
+        self.found
+            .get(candidate)
+            .map(|find| super::member_precedence_tier(find.level))
     }
 
     /// Stage attribution for the candidates the walk is about to return, for
@@ -10221,13 +10137,12 @@ impl ScalaMemberTrace {
     /// applicability filter: the filter reports its own losers from this same
     /// record (see [`scala_filter_callable_units`]).
     fn stage_selection(&self, candidates: &[CodeUnit]) {
-        if let Some(tier) = candidates
-            .iter()
-            .filter_map(|unit| self.precedence_tier(unit))
-            .min()
-        {
-            trace::stage_tier(tier, candidates.iter().map(|unit| unit.fq_name()).collect());
-        }
+        trace::stage_winner_tier(
+            candidates,
+            candidates
+                .iter()
+                .filter_map(|unit| self.precedence_tier(unit)),
+        );
         scala_stage_member_context(
             candidates,
             candidates
@@ -10244,8 +10159,7 @@ impl ScalaMemberTrace {
 /// Stage member attribution for `candidates`, dropping any fq name this channel
 /// cannot address unambiguously.
 ///
-/// Scala indexes one declaration per overload (see
-/// `.agents/plans/scala-per-overload-code-units-1327.md`) and overloads share a
+/// Scala indexes one declaration per overload (#1327), and overloads share a
 /// fq name, while the staging channel is keyed by fq name. A name is therefore
 /// staged only when every candidate carrying it was attributed identically.
 /// Where one overload was attributed and a same-named one was not -- an
@@ -10301,11 +10215,19 @@ fn scala_hierarchy_relation(
 /// that does not name exactly one declaration leaves the candidates
 /// unattributed rather than attributed to a guess.
 fn scala_owner_declaration(ctx: ScalaLookupCtx<'_>, owner_fqn: &str) -> Option<CodeUnit> {
+    scala_unique_exact_class_owner(ctx, owner_fqn, |_| true)
+}
+
+fn scala_unique_exact_class_owner(
+    ctx: ScalaLookupCtx<'_>,
+    owner_fqn: &str,
+    mut accepts: impl FnMut(&CodeUnit) -> bool,
+) -> Option<CodeUnit> {
     let mut owners = ctx
         .support
         .fqn(owner_fqn)
         .into_iter()
-        .filter(|unit| unit.is_class() && unit.fq_name() == owner_fqn)
+        .filter(|unit| unit.is_class() && unit.fq_name() == owner_fqn && accepts(unit))
         .collect::<Vec<_>>();
     sort_units(&mut owners);
     owners.dedup();
@@ -10531,13 +10453,13 @@ fn scala_direct_member_candidate_units_for_owner(
     member: &str,
 ) -> Vec<CodeUnit> {
     let exact_fqn = format!("{}.{member}", owner.fq_name());
-    let mut candidates = ctx
-        .support
-        .fqn(&exact_fqn)
-        .into_iter()
-        .filter(|unit| unit.fq_name() == exact_fqn)
-        .filter(|unit| ctx.scala.structural_parent_of(unit).as_ref() == Some(owner))
-        .collect::<Vec<_>>();
+    let mut candidates = scala_exact_structural_candidates_for_owner(
+        ctx.scala,
+        ctx.support,
+        owner,
+        &exact_fqn,
+        |_| true,
+    );
     sort_units(&mut candidates);
     candidates.dedup();
     candidates
@@ -11109,16 +11031,8 @@ fn scala_member_unit_applies(
 }
 
 fn scala_fallback_callable_role(scala: &ScalaAnalyzer, unit: &CodeUnit) -> ScalaCallableRole {
-    if unit.is_synthetic() {
-        ScalaCallableRole::PrimaryConstructor
-    } else if scala
-        .structural_parent_of(unit)
-        .is_some_and(|owner| owner.identifier().trim_end_matches('$') == unit.identifier())
-    {
-        ScalaCallableRole::SecondaryConstructor
-    } else {
-        ScalaCallableRole::Ordinary
-    }
+    let parent = scala.structural_parent_of(unit);
+    scala_callable_role_for_parent(unit, parent.as_ref())
 }
 
 /// Whether a physical callable represents only construction syntax.
@@ -11523,36 +11437,50 @@ fn scala_ancestor_member_candidate_units(
     token: QueryToken<'_>,
     owner_fqn: &str,
     member: &str,
-    mut member_trace: Option<&mut ScalaMemberTrace>,
+    member_trace: Option<&mut ScalaMemberTrace>,
 ) -> Vec<CodeUnit> {
-    let owners = ctx
-        .support
-        .fqn(owner_fqn)
-        .into_iter()
-        .filter(|unit| unit.is_class() && unit.fq_name() == owner_fqn);
+    scala_nearest_ancestor_member_candidates(
+        ctx.scala,
+        ctx.support,
+        token,
+        owner_fqn,
+        member,
+        member_trace,
+        |owner_fqn, member| scala_direct_member_candidate_units(ctx.support, owner_fqn, member),
+    )
+}
+
+fn scala_nearest_ancestor_member_candidates(
+    scala: &ScalaAnalyzer,
+    support: &dyn BoundedDefinitionLookup,
+    token: QueryToken<'_>,
+    owner_fqn: &str,
+    member: &str,
+    mut member_trace: Option<&mut ScalaMemberTrace>,
+    mut candidates_for_owner: impl FnMut(&str, &str) -> Vec<CodeUnit>,
+) -> Vec<CodeUnit> {
     let mut matching_depth = None;
     let mut matches = Vec::new();
-    for owner in owners {
-        // Routes start at one declaration. A second physical declaration of the
-        // same logical name still answers, unattributed.
+    for owner in support
+        .fqn(owner_fqn)
+        .into_iter()
+        .filter(|unit| unit.is_class() && unit.fq_name() == owner_fqn)
+    {
+        // Stable-term lookups pass no trace: their candidates carry no owner
+        // identity to attribute. Exact member lookups retain their rooted path.
         let mut owner_trace = member_trace
             .as_deref_mut()
             .filter(|state| state.is_rooted_at(&owner));
-        for (ancestor, depth) in scala_ancestor_owners(
-            ctx.scala,
-            token,
-            ctx.support,
-            owner,
-            owner_trace.as_deref_mut(),
-        ) {
+        for (ancestor, depth) in
+            scala_ancestor_owners(scala, token, support, owner, owner_trace.as_deref_mut())
+        {
             if matching_depth.is_some_and(|found| depth > found) {
                 break;
             }
-            let direct =
-                scala_direct_member_candidate_units(ctx.support, &ancestor.fq_name(), member);
+            let direct = candidates_for_owner(&ancestor.fq_name(), member);
             if !direct.is_empty() {
                 if let Some(state) = owner_trace.as_deref_mut() {
-                    state.record_found(ctx.scala, &direct, &ancestor, depth);
+                    state.record_found(scala, &direct, &ancestor, depth);
                 }
                 matching_depth = Some(depth);
                 matches.extend(direct);
@@ -11764,17 +11692,13 @@ fn scala_source_ancestor_member_units(
     Vec::new()
 }
 
-fn scala_enclosing_definition_node(mut node: Node<'_>) -> Option<Node<'_>> {
-    while let Some(parent) = node.parent() {
-        if matches!(
-            parent.kind(),
+fn scala_enclosing_definition_node(node: Node<'_>) -> Option<Node<'_>> {
+    brokk_bifrost_core::analyzer::structural::adapter_helpers::nearest_ancestor(node, |kind| {
+        matches!(
+            kind,
             "class_definition" | "object_definition" | "trait_definition" | "enum_definition"
-        ) {
-            return Some(parent);
-        }
-        node = parent;
-    }
-    None
+        )
+    })
 }
 
 fn scala_collect_extends_type_text(node: Node<'_>, source: &str, out: &mut Vec<String>) {
@@ -11911,8 +11835,31 @@ fn scala_non_identifier_receiver_type_fqn(
     match receiver.kind() {
         // `new Foo().member` — the receiver is typed by the constructed class.
         "instance_expression" => scala_constructed_type(ctx, token, receiver, resolver),
-        kind => scala_literal_type_name(kind).map(str::to_string),
+        _ => scala_literal_type_name(ctx.source, receiver).map(str::to_string),
     }
+}
+
+fn scala_member_receiver_owner(
+    ctx: ScalaLookupCtx<'_>,
+    token: QueryToken<'_>,
+    resolver: &ScalaNameResolver<'_>,
+    root: Node<'_>,
+    receiver: Node<'_>,
+    reference_byte: usize,
+) -> (
+    Option<LocalInferenceEngine<ScalaLocalBinding>>,
+    Option<ScalaReceiverOwner>,
+) {
+    let bindings = matches!(receiver.kind(), "identifier" | "type_identifier")
+        .then(|| scala_bindings_before(ctx, token, resolver, root, reference_byte));
+    let owner = match bindings.as_ref() {
+        Some(bindings) => {
+            scala_receiver_owner_with_bindings(ctx, token, resolver, receiver, bindings)
+        }
+        None => scala_non_identifier_receiver_type_fqn(ctx, token, resolver, receiver)
+            .map(ScalaReceiverOwner::Logical),
+    };
+    (bindings, owner)
 }
 
 fn scala_imported_member_return_type(
@@ -12181,11 +12128,42 @@ fn scala_parameters_declare_name_before(
     name: &str,
     cutoff_start: usize,
 ) -> bool {
+    scala_parameters_declare_name_before_with_step(
+        node,
+        cutoff_start,
+        || true,
+        |child| {
+            Some(scala_node_declares_name_before(
+                child,
+                source,
+                name,
+                0,
+                cutoff_start,
+            ))
+        },
+    )
+    .expect("unbounded Scala parameter lookup cannot exhaust its scope")
+}
+
+fn scala_parameters_declare_name_before_with_step(
+    node: Node<'_>,
+    cutoff_start: usize,
+    mut scope_step: impl FnMut() -> bool,
+    mut declares_before: impl FnMut(Node<'_>) -> Option<bool>,
+) -> Option<bool> {
     let mut cursor = node.walk();
-    node.named_children(&mut cursor)
-        .filter(|child| matches!(child.kind(), "parameters" | "class_parameters"))
-        .filter(|child| child.start_byte() < cutoff_start)
-        .any(|child| scala_node_declares_name_before(child, source, name, 0, cutoff_start))
+    for child in node.named_children(&mut cursor) {
+        if !scope_step() {
+            return None;
+        }
+        if matches!(child.kind(), "parameters" | "class_parameters")
+            && child.start_byte() < cutoff_start
+            && declares_before(child)?
+        {
+            return Some(true);
+        }
+    }
+    Some(false)
 }
 
 fn scala_parameters_declare_name_before_bounded(
@@ -12195,26 +12173,14 @@ fn scala_parameters_declare_name_before_bounded(
     name: &str,
     cutoff_start: usize,
 ) -> Option<bool> {
-    let mut cursor = node.walk();
-    for child in node.named_children(&mut cursor) {
-        if !session.scope_step() {
-            return None;
-        }
-        if matches!(child.kind(), "parameters" | "class_parameters")
-            && child.start_byte() < cutoff_start
-            && scala_node_declares_name_before_bounded(
-                session,
-                child,
-                source,
-                name,
-                0,
-                cutoff_start,
-            )?
-        {
-            return Some(true);
-        }
-    }
-    Some(false)
+    scala_parameters_declare_name_before_with_step(
+        node,
+        cutoff_start,
+        || session.scope_step(),
+        |child| {
+            scala_node_declares_name_before_bounded(session, child, source, name, 0, cutoff_start)
+        },
+    )
 }
 
 fn scala_active_path_declares_name_after(
@@ -12380,14 +12346,7 @@ fn scala_enumerator_visible_pattern(
     enumerator: Node<'_>,
     reference_byte: usize,
 ) -> Option<Node<'_>> {
-    let pattern = enumerator
-        .named_child(0)
-        .filter(|child| child.kind() != "guard")?;
-    enumerator
-        .named_children(&mut enumerator.walk())
-        .find(|child| child.start_byte() >= pattern.end_byte() && child.kind() != "guard")
-        .filter(|expression| expression.end_byte() <= reference_byte)
-        .map(|_| pattern)
+    scala_enumerator_visible_pattern_checked(enumerator, reference_byte, || true).flatten()
 }
 
 fn scala_enumerator_visible_pattern_bounded<'tree>(
@@ -12395,10 +12354,18 @@ fn scala_enumerator_visible_pattern_bounded<'tree>(
     enumerator: Node<'tree>,
     reference_byte: usize,
 ) -> Option<Option<Node<'tree>>> {
+    scala_enumerator_visible_pattern_checked(enumerator, reference_byte, || session.scope_step())
+}
+
+fn scala_enumerator_visible_pattern_checked<'tree>(
+    enumerator: Node<'tree>,
+    reference_byte: usize,
+    mut scope_step: impl FnMut() -> bool,
+) -> Option<Option<Node<'tree>>> {
     let Some(pattern) = enumerator.named_child(0) else {
         return Some(None);
     };
-    if !session.scope_step() {
+    if !scope_step() {
         return None;
     }
     if pattern.kind() == "guard" {
@@ -12406,7 +12373,7 @@ fn scala_enumerator_visible_pattern_bounded<'tree>(
     }
     let mut cursor = enumerator.walk();
     for child in enumerator.named_children(&mut cursor) {
-        if !session.scope_step() {
+        if !scope_step() {
             return None;
         }
         if child.start_byte() >= pattern.end_byte() && child.kind() != "guard" {
@@ -12458,40 +12425,16 @@ fn scala_is_direct_member_value_definition_bounded(
     session: &ResolutionSession,
     node: Node<'_>,
 ) -> Option<bool> {
-    let mut current = node.parent();
-    while let Some(ancestor) = current {
-        if !session.scope_step() {
-            return None;
-        }
-        if SCALA_LOCAL_DEFINITION_BOUNDARIES.contains(&ancestor.kind()) {
-            return Some(false);
-        }
-        if SCALA_TEMPLATE_MEMBER_BOUNDARIES.contains(&ancestor.kind()) {
-            return Some(true);
-        }
-        current = ancestor.parent();
-    }
-    Some(false)
+    scala_definition_boundary_with_step(node, || session.scope_step())
+        .map(|boundary| boundary == ScalaDefinitionBoundary::TemplateMember)
 }
 
 fn scala_is_local_function_definition_bounded(
     session: &ResolutionSession,
     node: Node<'_>,
 ) -> Option<bool> {
-    let mut current = node.parent();
-    while let Some(ancestor) = current {
-        if !session.scope_step() {
-            return None;
-        }
-        if SCALA_LOCAL_DEFINITION_BOUNDARIES.contains(&ancestor.kind()) {
-            return Some(true);
-        }
-        if SCALA_TEMPLATE_MEMBER_BOUNDARIES.contains(&ancestor.kind()) {
-            return Some(false);
-        }
-        current = ancestor.parent();
-    }
-    Some(false)
+    scala_definition_boundary_with_step(node, || session.scope_step())
+        .map(|boundary| boundary == ScalaDefinitionBoundary::Local)
 }
 
 fn scala_existing_package_type_fqn(
@@ -12598,15 +12541,7 @@ fn scala_resolve_visible_type_node(
     if segments.is_empty() {
         return None;
     }
-    match scala_exact_lexical_type_namespace(ctx, token, resolver, node) {
-        ScalaTypeNamespaceResolution::Resolved(declaration) => {
-            return Some(declaration.fq_name());
-        }
-        ScalaTypeNamespaceResolution::AuthoritativeMiss
-        | ScalaTypeNamespaceResolution::Ambiguous(_) => return None,
-        ScalaTypeNamespaceResolution::NoMatch => {}
-    }
-    match scala_exact_exported_qualified_type(ctx, resolver, node) {
+    match scala_early_visible_type_resolution(ctx, token, resolver, node) {
         ScalaTypeNamespaceResolution::Resolved(declaration) => {
             return Some(declaration.fq_name());
         }
@@ -12623,13 +12558,7 @@ fn scala_resolve_visible_type_declaration(
     resolver: &ScalaNameResolver<'_>,
     node: Node<'_>,
 ) -> Option<CodeUnit> {
-    match scala_exact_lexical_type_namespace(ctx, token, resolver, node) {
-        ScalaTypeNamespaceResolution::Resolved(declaration) => return Some(declaration),
-        ScalaTypeNamespaceResolution::AuthoritativeMiss
-        | ScalaTypeNamespaceResolution::Ambiguous(_) => return None,
-        ScalaTypeNamespaceResolution::NoMatch => {}
-    }
-    match scala_exact_exported_qualified_type(ctx, resolver, node) {
+    match scala_early_visible_type_resolution(ctx, token, resolver, node) {
         ScalaTypeNamespaceResolution::Resolved(declaration) => return Some(declaration),
         ScalaTypeNamespaceResolution::AuthoritativeMiss
         | ScalaTypeNamespaceResolution::Ambiguous(_) => return None,
@@ -12672,6 +12601,41 @@ fn scala_resolve_visible_type_declaration(
         | ScalaNameResolution::Ambiguous(_)
         | ScalaNameResolution::Unresolved => None,
     }
+}
+
+fn scala_wildcard_owner_segment_candidates(
+    owners: impl IntoIterator<Item = ScalaWildcardImportOwner>,
+    segments: &[String],
+) -> Vec<String> {
+    owners
+        .into_iter()
+        .flat_map(|owner| {
+            let singleton = owner.is_singleton();
+            scala_nested_type_candidates(owner.fqn, segments, singleton)
+        })
+        .collect()
+}
+
+fn scala_resolved_owner_fqn(resolution: ScalaNameResolution) -> Option<String> {
+    match resolution {
+        ScalaNameResolution::Resolved(owner) => Some(owner.fqn),
+        ScalaNameResolution::MissingExplicitImport
+        | ScalaNameResolution::Ambiguous(_)
+        | ScalaNameResolution::Unresolved => None,
+    }
+}
+
+fn scala_early_visible_type_resolution(
+    ctx: ScalaLookupCtx<'_>,
+    token: QueryToken<'_>,
+    resolver: &ScalaNameResolver<'_>,
+    node: Node<'_>,
+) -> ScalaTypeNamespaceResolution {
+    match scala_exact_lexical_type_namespace(ctx, token, resolver, node) {
+        ScalaTypeNamespaceResolution::NoMatch => {}
+        resolution => return resolution,
+    }
+    scala_exact_exported_qualified_type(ctx, resolver, node)
 }
 
 fn scala_resolve_visible_type_node_after_lexical_miss(
@@ -12731,15 +12695,10 @@ fn scala_enclosing_template_units(
         start_line: node.start_position().row,
         end_line: node.end_position().row,
     };
-    let mut owners = Vec::new();
-    let mut current = analyzer.enclosing_code_unit(file, &range);
-    while let Some(unit) = current {
-        current = scala.structural_parent_of(&unit);
-        if unit.is_class() {
-            owners.push(unit);
-        }
-    }
-    owners
+    brokk_bifrost_jvm::scala::imports::scala_enclosing_template_owner_units(
+        analyzer.enclosing_code_unit(file, &range),
+        |unit| scala.structural_parent_of(unit),
+    )
 }
 
 /// The innermost `template_body` enclosing `node`: the scope in which the
@@ -13051,7 +13010,7 @@ fn scala_type_member_before_anonymous_refinement(
                     };
                     (owner, instance == binding_instance)
                 } else {
-                    let Some(named_owner) = scala_named_template_owner_for_forward(node) else {
+                    let Some(named_owner) = scala_named_template_owner(node) else {
                         return ScalaTypeNamespaceResolution::AuthoritativeMiss;
                     };
                     let ranges = ctx.analyzer.class_range_index(ctx.file);
@@ -13093,19 +13052,6 @@ fn scala_type_member_before_anonymous_refinement(
         current = node.parent();
     }
     ScalaTypeNamespaceResolution::AuthoritativeMiss
-}
-
-fn scala_named_template_owner_for_forward(mut template: Node<'_>) -> Option<Node<'_>> {
-    while let Some(parent) = template.parent() {
-        match parent.kind() {
-            "class_definition" | "object_definition" | "trait_definition" | "enum_definition" => {
-                return Some(parent);
-            }
-            "instance_expression" | "template_body" => return None,
-            _ => template = parent,
-        }
-    }
-    None
 }
 
 fn scala_exact_owner_namespace_children(
@@ -13436,18 +13382,8 @@ fn scala_fqn_outcome(
     fqn: &str,
     reference: &str,
 ) -> DefinitionLookupOutcome {
-    let mut candidates = support.fqn(fqn);
-    if candidates.is_empty() {
-        candidates = support.fqn_in_language(fqn, Language::Java);
-    }
-    if candidates.is_empty() {
-        no_definition(
-            "no_indexed_definition",
-            format!("`{reference}` resolved to `{fqn}`, but no indexed definition was found"),
-        )
-    } else {
-        candidates_outcome(candidates)
-    }
+    let candidates = scala_fqn_candidates(support, fqn, |_| true);
+    scala_fqn_lookup_outcome(candidates, fqn, reference)
 }
 
 fn scala_type_fqn_outcome(
@@ -13456,20 +13392,37 @@ fn scala_type_fqn_outcome(
     reference: &str,
     kind: ScalaOwnerKind,
 ) -> DefinitionLookupOutcome {
-    let mut candidates = ctx
-        .support
+    let candidates = scala_fqn_candidates(ctx.support, fqn, |unit| {
+        scala_unit_matches_owner_kind(ctx.scala, unit, kind)
+    });
+    scala_fqn_lookup_outcome(candidates, fqn, reference)
+}
+
+fn scala_fqn_candidates(
+    support: &dyn BoundedDefinitionLookup,
+    fqn: &str,
+    mut accepts: impl FnMut(&CodeUnit) -> bool,
+) -> Vec<CodeUnit> {
+    let mut candidates = support
         .fqn(fqn)
         .into_iter()
-        .filter(|unit| scala_unit_matches_owner_kind(ctx.scala, unit, kind))
+        .filter(|unit| accepts(unit))
         .collect::<Vec<_>>();
     if candidates.is_empty() {
-        candidates = ctx
-            .support
+        candidates = support
             .fqn_in_language(fqn, Language::Java)
             .into_iter()
-            .filter(|unit| scala_unit_matches_owner_kind(ctx.scala, unit, kind))
+            .filter(|unit| accepts(unit))
             .collect();
     }
+    candidates
+}
+
+fn scala_fqn_lookup_outcome(
+    candidates: Vec<CodeUnit>,
+    fqn: &str,
+    reference: &str,
+) -> DefinitionLookupOutcome {
     if candidates.is_empty() {
         no_definition(
             "no_indexed_definition",
@@ -14215,20 +14168,7 @@ fn scala_constructed_type(
     ) {
         return None;
     }
-    let mut cursor = node.walk();
-    node.named_children(&mut cursor)
-        .find(|child| {
-            matches!(
-                child.kind(),
-                "type_identifier"
-                    | "stable_type_identifier"
-                    | "generic_type"
-                    | "applied_constructor_type"
-                    | "projected_type"
-                    | "singleton_type"
-                    | "annotated_type"
-            )
-        })
+    scala_constructed_type_child(node)
         .or_else(|| {
             matches!(
                 node.kind(),
@@ -14310,17 +14250,7 @@ const SCALA_LOCAL_DEFINITION_BOUNDARIES: [&str; 6] = [
 ];
 
 fn scala_is_direct_member_definition(node: Node<'_>) -> bool {
-    let mut current = node.parent();
-    while let Some(ancestor) = current {
-        if SCALA_LOCAL_DEFINITION_BOUNDARIES.contains(&ancestor.kind()) {
-            return false;
-        }
-        if SCALA_TEMPLATE_MEMBER_BOUNDARIES.contains(&ancestor.kind()) {
-            return true;
-        }
-        current = ancestor.parent();
-    }
-    false
+    scala_definition_boundary(node) == ScalaDefinitionBoundary::TemplateMember
 }
 
 fn scala_is_direct_member_value_definition(node: Node<'_>) -> bool {
@@ -14328,17 +14258,39 @@ fn scala_is_direct_member_value_definition(node: Node<'_>) -> bool {
 }
 
 fn scala_is_local_function_definition(node: Node<'_>) -> bool {
+    scala_definition_boundary(node) == ScalaDefinitionBoundary::Local
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ScalaDefinitionBoundary {
+    Local,
+    TemplateMember,
+    Outside,
+}
+
+fn scala_definition_boundary(node: Node<'_>) -> ScalaDefinitionBoundary {
+    scala_definition_boundary_with_step(node, || true)
+        .expect("unbounded Scala definition lookup cannot exhaust its scope")
+}
+
+fn scala_definition_boundary_with_step(
+    node: Node<'_>,
+    mut scope_step: impl FnMut() -> bool,
+) -> Option<ScalaDefinitionBoundary> {
     let mut current = node.parent();
     while let Some(ancestor) = current {
+        if !scope_step() {
+            return None;
+        }
         if SCALA_LOCAL_DEFINITION_BOUNDARIES.contains(&ancestor.kind()) {
-            return true;
+            return Some(ScalaDefinitionBoundary::Local);
         }
         if SCALA_TEMPLATE_MEMBER_BOUNDARIES.contains(&ancestor.kind()) {
-            return false;
+            return Some(ScalaDefinitionBoundary::TemplateMember);
         }
         current = ancestor.parent();
     }
-    false
+    Some(ScalaDefinitionBoundary::Outside)
 }
 
 fn scala_import_boundary_for_name(
@@ -14391,6 +14343,7 @@ fn scala_simple_name(name: &str) -> &str {
 mod bounded_ast_tests {
     use super::*;
     use crate::analyzer::usages::receiver_analysis::{ReceiverAnalysisBudget, ReceiverBudgetLimit};
+    use crate::analyzer::usages::test_support::assert_scope_budget_exceeded;
     use crate::analyzer::{
         AnalyzerConfig, InformationTier, Language, Project, Range, TestProject, WorkspaceAnalyzer,
     };
@@ -14398,14 +14351,12 @@ mod bounded_ast_tests {
     use crate::test_support::AnalyzerFixture;
     use git2::{IndexAddOption, Repository, Signature};
     use std::sync::Arc;
-    use tree_sitter::Parser;
 
     fn parse_scala(source: &str) -> Tree {
-        let mut parser = Parser::new();
-        parser
-            .set_language(&crate::analyzer::scala::language::LANGUAGE.into())
-            .expect("Scala grammar");
-        parser.parse(source, None).expect("Scala tree")
+        crate::test_support::parse_fixture_tree(
+            source,
+            crate::analyzer::scala::language::LANGUAGE.into(),
+        )
     }
 
     #[test]
@@ -14430,13 +14381,8 @@ object Demo {
         let session = ResolutionSession::bounded(budget, None);
 
         assert!(scala_lexical_context_at(Some(&session), root, source, reference, start).is_none());
-        assert!(matches!(
-            session.finish(()),
-            BoundedResolution::Exceeded {
-                limit: ReceiverBudgetLimit::ScopeNodes,
-                work,
-            } if work.scope_nodes == budget.max_scope_nodes
-        ));
+        let outcome = session.finish(());
+        assert_scope_budget_exceeded(&outcome, budget);
     }
 
     #[test]

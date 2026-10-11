@@ -13,53 +13,39 @@
 //! rather than duplicated.
 
 use super::*;
+use crate::analyzer::common::is_comment_kind;
+/// Whether a Kotlin node carries an anonymous operator token as a direct child.
+pub(super) use brokk_bifrost_core::analyzer::tree_walk::has_token_child as has_token;
 
+pub(super) use brokk_bifrost_jvm::kotlin::declarations::kotlin_has_modifier as has_modifier;
 pub(super) use brokk_bifrost_jvm::kotlin::syntax::{
-    kotlin_binding_type_node, kotlin_call_arity, kotlin_callee, kotlin_declared_return_type_node,
-    kotlin_named_argument_label, kotlin_navigation_receiver, kotlin_unwrap_receiver,
+    KotlinScalarType, kotlin_binding_name_nodes as binding_names,
+    kotlin_binding_node as binding_node, kotlin_binding_type_node, kotlin_call_arity,
+    kotlin_call_trailing_lambda_body as trailing_lambda, kotlin_callee,
+    kotlin_decimal_integer_value, kotlin_declared_return_type_node, kotlin_declared_scalar_type,
+    kotlin_first_token as first_token, kotlin_literal_scalar_type, kotlin_named_argument_label,
+    kotlin_navigation_member as navigation_member, kotlin_navigation_receiver,
+    kotlin_property_delegate_expression as property_delegate_expression, kotlin_unwrap_receiver,
     kotlin_value_arguments,
 };
 
 /// Named children with comments removed.
 pub(super) fn named_children(node: Node<'_>) -> Vec<Node<'_>> {
-    let mut cursor = node.walk();
-    node.named_children(&mut cursor)
+    brokk_bifrost_core::analyzer::tree_walk::named_children_iter(node)
         .filter(|child| !is_comment_kind(child.kind()))
         .collect()
 }
 
 pub(super) fn first_named_child(node: Node<'_>) -> Option<Node<'_>> {
-    let mut cursor = node.walk();
-    node.named_children(&mut cursor)
-        .find(|child| !is_comment_kind(child.kind()))
+    brokk_bifrost_core::analyzer::tree_walk::first_named_child_matching(node, |child| {
+        !is_comment_kind(child.kind())
+    })
 }
 
 pub(super) fn child_of_kind<'tree>(node: Node<'tree>, kind: &str) -> Option<Node<'tree>> {
-    named_children(node)
-        .into_iter()
-        .find(|child| child.kind() == kind)
-}
-
-fn is_comment_kind(kind: &str) -> bool {
-    matches!(kind, "line_comment" | "multiline_comment" | "comment")
-}
-
-/// Whether `node` carries the anonymous operator token `token` as a direct
-/// child. The Kotlin grammar spells `?.`, `!!`, `?:`, `!`, `else`, and the
-/// `jump_expression` keywords as anonymous tokens rather than fields.
-pub(super) fn has_token(node: Node<'_>, token: &str) -> bool {
-    let mut cursor = node.walk();
-    node.children(&mut cursor)
-        .any(|child| !child.is_named() && child.kind() == token)
-}
-
-/// The first anonymous token of `node`, used to classify `jump_expression`
-/// (`return`, `return@`, `break`, `break@`, `continue`, `continue@`, `throw`).
-pub(super) fn first_token(node: Node<'_>) -> Option<&'static str> {
-    let mut cursor = node.walk();
-    node.children(&mut cursor)
-        .find(|child| !child.is_named())
-        .map(|child| child.kind())
+    brokk_bifrost_core::analyzer::tree_walk::first_named_child_matching(node, |child| {
+        !is_comment_kind(child.kind()) && child.kind() == kind
+    })
 }
 
 /// Syntax that owns its own executable boundary, and therefore terminates a
@@ -87,21 +73,12 @@ pub(super) fn body_contains_free_this(
     body: Node<'_>,
     cancellation: &CancellationToken,
 ) -> Result<bool, LoweringCancelled> {
-    let mut found = false;
-    try_walk_named_tree_preorder(body, true, |node| {
-        if cancellation.is_cancelled() {
-            return Err(LoweringCancelled);
-        }
-        if node.id() != body.id() && is_kotlin_nested_execution_boundary(node) {
-            return Ok(WalkControl::SkipChildren);
-        }
-        if node.kind() == "this_expression" {
-            found = true;
-            return Ok(WalkControl::Break);
-        }
-        Ok(WalkControl::Continue)
-    })?;
-    Ok(found)
+    crate::analyzer::semantic::lowering::body_contains_matching_node(
+        body,
+        cancellation,
+        |node| node.id() != body.id() && is_kotlin_nested_execution_boundary(node),
+        |node| node.kind() == "this_expression",
+    )
 }
 
 /// The declaration container a node opens, if any.
@@ -165,37 +142,6 @@ pub(super) fn property_initializer(node: Node<'_>) -> Option<Node<'_>> {
 
 pub(super) use brokk_bifrost_jvm::kotlin::syntax::kotlin_parameter_default as class_parameter_default;
 
-/// The delegate expression of a `val x by expr` property.
-pub(super) fn property_delegate_expression(node: Node<'_>) -> Option<Node<'_>> {
-    child_of_kind(node, "property_delegate").and_then(first_named_child)
-}
-
-/// The binding a property or `for` introduces: one `variable_declaration`, or
-/// the `multi_variable_declaration` of a destructuring form.
-pub(super) fn binding_node(node: Node<'_>) -> Option<Node<'_>> {
-    named_children(node).into_iter().find(|child| {
-        matches!(
-            child.kind(),
-            "variable_declaration" | "multi_variable_declaration"
-        )
-    })
-}
-
-/// Every `simple_identifier` a binding introduces, in source order.
-pub(super) fn binding_names(node: Node<'_>) -> Vec<Node<'_>> {
-    match node.kind() {
-        "variable_declaration" => child_of_kind(node, "simple_identifier")
-            .into_iter()
-            .collect(),
-        "multi_variable_declaration" => named_children(node)
-            .into_iter()
-            .filter(|child| child.kind() == "variable_declaration")
-            .filter_map(|child| child_of_kind(child, "simple_identifier"))
-            .collect(),
-        _ => Vec::new(),
-    }
-}
-
 /// How a `function_body` (or accessor body) carries its statements.
 #[derive(Debug, Clone, Copy)]
 pub(super) enum BodyShape<'tree> {
@@ -229,15 +175,6 @@ pub(super) fn control_structure_body_content(node: Node<'_>) -> Option<Node<'_>>
 /// The grammar groups modifiers by category (`inheritance_modifier`,
 /// `member_modifier`, …) rather than naming each keyword, so the keyword is
 /// read from the modifier leaf's own text.
-pub(super) fn has_modifier(source: &str, node: Node<'_>, modifier: &str) -> bool {
-    let Some(modifiers) = child_of_kind(node, "modifiers") else {
-        return false;
-    };
-    named_children(modifiers)
-        .into_iter()
-        .any(|child| node_text(source, child) == Some(modifier))
-}
-
 /// The type declaration a member belongs to, stopping at the first enclosing
 /// body so a nested class does not answer for its outer class.
 pub(super) fn enclosing_type_declaration(node: Node<'_>) -> Option<Node<'_>> {
@@ -262,16 +199,16 @@ pub(super) fn enclosing_type_declaration(node: Node<'_>) -> Option<Node<'_>> {
 /// Kotlin classes and members are final unless opened, which inverts Java's
 /// default: only `open`/`abstract`/`sealed` declarations, and interfaces,
 /// admit an override.
-pub(super) fn type_admits_overrides(source: &str, declaration: Node<'_>) -> bool {
+pub(super) fn type_admits_overrides(declaration: Node<'_>) -> bool {
     if declaration.kind() != "class_declaration" {
         // `object`, `companion object`, and anonymous object literals cannot be
         // subclassed, so their members are never overridden.
         return false;
     }
     has_token(declaration, "interface")
-        || has_modifier(source, declaration, "open")
-        || has_modifier(source, declaration, "abstract")
-        || has_modifier(source, declaration, "sealed")
+        || has_modifier(declaration, "open")
+        || has_modifier(declaration, "abstract")
+        || has_modifier(declaration, "sealed")
 }
 
 /// Whether a `navigation_expression` selects through the null-safe `?.`
@@ -282,14 +219,6 @@ pub(super) fn is_safe_navigation(node: Node<'_>) -> bool {
 }
 
 /// The member selected by a `navigation_expression`.
-pub(super) fn navigation_member(node: Node<'_>) -> Option<Node<'_>> {
-    child_of_kind(node, "navigation_suffix").and_then(|suffix| {
-        named_children(suffix)
-            .into_iter()
-            .find(|child| child.kind() != "type_arguments")
-    })
-}
-
 /// The operand of a `postfix_expression` or `prefix_expression`.
 pub(super) fn unary_operand(node: Node<'_>) -> Option<Node<'_>> {
     named_children(node)
@@ -424,6 +353,20 @@ pub(super) fn for_statement_parts<'tree>(
 pub(super) fn while_statement_parts<'tree>(
     node: Node<'tree>,
 ) -> Option<(Node<'tree>, Option<Node<'tree>>)> {
+    loop_statement_condition_and_body(node)
+}
+
+/// The optional body and condition of a `do … while`.
+pub(super) fn do_while_statement_parts<'tree>(
+    node: Node<'tree>,
+) -> Option<(Option<Node<'tree>>, Node<'tree>)> {
+    let (condition, body) = loop_statement_condition_and_body(node)?;
+    Some((body, condition))
+}
+
+fn loop_statement_condition_and_body<'tree>(
+    node: Node<'tree>,
+) -> Option<(Node<'tree>, Option<Node<'tree>>)> {
     let children = named_children(node);
     let condition = children
         .iter()
@@ -433,21 +376,6 @@ pub(super) fn while_statement_parts<'tree>(
         .into_iter()
         .find(|child| child.kind() == "control_structure_body");
     Some((condition, body))
-}
-
-/// The optional body and condition of a `do … while`.
-pub(super) fn do_while_statement_parts<'tree>(
-    node: Node<'tree>,
-) -> Option<(Option<Node<'tree>>, Node<'tree>)> {
-    let children = named_children(node);
-    let body = children
-        .iter()
-        .copied()
-        .find(|child| child.kind() == "control_structure_body");
-    let condition = children
-        .into_iter()
-        .find(|child| child.kind() != "control_structure_body")?;
-    Some((body, condition))
 }
 
 /// The target and value of an `assignment`.
@@ -525,12 +453,6 @@ pub(super) fn indexing_parts<'tree>(
 }
 
 /// The trailing lambda a call passes outside its parentheses.
-pub(super) fn trailing_lambda(call: Node<'_>) -> Option<Node<'_>> {
-    child_of_kind(call, "call_suffix")
-        .and_then(|suffix| child_of_kind(suffix, "annotated_lambda"))
-        .and_then(|annotated| child_of_kind(annotated, "lambda_literal"))
-}
-
 /// One argument of a call, with the expansion and domain its syntax proves.
 #[derive(Debug, Clone, Copy)]
 pub(super) struct CallArgumentNode<'tree> {
@@ -690,24 +612,17 @@ pub(super) fn result_expression(node: Node<'_>) -> Option<Node<'_>> {
 
 /// The scope a local binding is visible in.
 pub(super) fn kotlin_local_scope(node: Node<'_>) -> Option<(usize, usize)> {
-    let mut current = node.parent();
-    while let Some(parent) = current {
-        if matches!(
+    brokk_bifrost_core::analyzer::tree_walk::find_ancestor(node, |parent| {
+        matches!(
             parent.kind(),
             "statements"
                 | "control_structure_body"
                 | "when_entry"
                 | "catch_block"
                 | "for_statement"
-        ) {
-            return Some((parent.start_byte(), parent.end_byte()));
-        }
-        if is_kotlin_nested_execution_boundary(parent) {
-            return Some((parent.start_byte(), parent.end_byte()));
-        }
-        current = parent.parent();
-    }
-    None
+        ) || is_kotlin_nested_execution_boundary(parent)
+    })
+    .map(|scope| (scope.start_byte(), scope.end_byte()))
 }
 
 pub(super) fn expression_value_kind(node: Node<'_>) -> SemanticValueKind {
@@ -720,6 +635,30 @@ pub(super) fn expression_value_kind(node: Node<'_>) -> SemanticValueKind {
         | "string_literal" => SemanticValueKind::Constant,
         _ => SemanticValueKind::Temporary,
     }
+}
+
+/// Refine a generic expression value with the exact constants Kotlin's
+/// grammar represents structurally. A literal inferred through a non-literal
+/// expression is deliberately left generic; callers must have a declaration
+/// type or one of these literal nodes before publishing scalar facts.
+pub(super) fn typed_expression_value_kind(source: &str, node: Node<'_>) -> SemanticValueKind {
+    if let Some(value) = kotlin_decimal_integer_value(node, source) {
+        return if value < 0 {
+            SemanticValueKind::SignedInteger(value)
+        } else {
+            SemanticValueKind::UnsignedInteger(value as u128)
+        };
+    }
+    if node.kind() == "boolean_literal"
+        && let Some(value) = node_text(source, node).and_then(|text| match text {
+            "true" => Some(true),
+            "false" => Some(false),
+            _ => None,
+        })
+    {
+        return SemanticValueKind::Boolean(value);
+    }
+    expression_value_kind(node)
 }
 
 /// Leaves with no further runtime structure to schedule.
@@ -778,8 +717,7 @@ pub(super) fn required_child<'tree>(
     node: Node<'tree>,
     slot: &str,
 ) -> Result<Node<'tree>, KotlinLoweringError> {
-    node.child_by_field_name(slot)
-        .ok_or_else(|| missing_slot(node, slot))
+    crate::analyzer::semantic::lowering::required_field_or_else(node, slot, missing_slot)
 }
 
 pub(super) fn missing_slot(node: Node<'_>, slot: &str) -> KotlinLoweringError {
@@ -791,25 +729,7 @@ pub(super) fn missing_slot(node: Node<'_>, slot: &str) -> KotlinLoweringError {
     ))
 }
 
-pub(super) fn node_range(node: Node<'_>) -> Range {
-    Range {
-        start_byte: node.start_byte(),
-        end_byte: node.end_byte(),
-        start_line: node.start_position().row + 1,
-        end_line: node.end_position().row + 1,
-    }
-}
-
-pub(super) const fn completion_label(kind: CompletionKind) -> &'static str {
-    match kind {
-        CompletionKind::Normal => "normal",
-        CompletionKind::Return => "return",
-        CompletionKind::Throw => "throw",
-        CompletionKind::Break => "break",
-        CompletionKind::Continue => "continue",
-        CompletionKind::Yield => "yield",
-    }
-}
+pub(super) use brokk_bifrost_core::analyzer::tree_walk::node_range;
 
 /// Procedure syntax roles for the Kotlin lowering. Every child of a
 /// `statements` block, and a non-block loop or branch body, is a statement;
@@ -840,6 +760,7 @@ pub(crate) const PROCEDURE_SYNTAX_ROLES: crate::analyzer::languages::ProcedureSy
                 _ => None,
             }
         },
+        loop_site_with_source: None,
         // Initializer procedures (class properties, primary-constructor
         // defaults, enum entries) have expression bodies and no statements.
         procedure_matches: |_, node| {

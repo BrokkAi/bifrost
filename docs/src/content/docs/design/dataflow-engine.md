@@ -176,9 +176,13 @@ can establish a class conditional on entering its arm even when its input
 comes from an unmodeled load or call. That class remains useful for member
 lookup and dispatch, but a guard-only origin cannot support a Proven
 missing-member finding. The finding client requires an independent same-class
-source or an unconstrained entry parameter that admits the guarded class.
-Conditional origins stay conditional through later guards; when independent
-and conditional sources meet, the independent origin takes precedence.
+source or an unconstrained entry parameter that admits the guarded class. For
+Conditional findings, Python may also admit a declared parameter whose
+annotation names one workspace class with no workspace subclasses, unresolved
+or unmodeled external bases, or dynamic-attribute hooks; the finding states
+that annotated-type premise. Conditional origins stay conditional through
+later guards; when independent and conditional sources meet, the independent
+origin takes precedence.
 The raw receiver result retains this source provenance. The `class_set`
 projection exposes `guard_only: true` for such class rows and preserves it on
 persistent replay. Unknown rows omit that field. Its `known` status reports
@@ -193,7 +197,11 @@ receiver and mutation site. It composes caller bindings with ordered local
 writes, then opens only the possible receiver classes. Declared receiver bounds
 include known subclasses; unbound entry parameters contribute only the classes
 supplied by workspace callers. An unbounded receiver or an incomplete survey
-keeps the surface open with an explicit reason naming the mutation site.
+keeps the surface open with an explicit reason naming the mutation site. A
+Conditional absent-member finding may carry that uncertainty only when every
+matching global dynamic write has no receiver bound and an Any member-name set; its
+condition names each possible write site. Bounded writes and other incomplete
+surveys still block the finding.
 The preliminary survey does not use member absence to exclude classes. It
 repeats as affected field slots open until the effects stabilize, within shared
 semantic and solver budgets. Member guards such as `hasattr` consult that same survey
@@ -253,7 +261,8 @@ the remainder there instead of carrying it through. The replacement is the
 exact class set when the check names the runtime class outright or every named
 class is closed under the known workspace hierarchy, and the named classes with
 an open bound otherwise, because a subclass satisfies the same check with a
-member surface the named class does not describe. A receiver whose only
+member surface the named class does not describe. An open subclass bound alone
+does not prove that the named class lacks a member. A receiver whose only
 evidence was the remainder is then named rather than emptied. The false arm
 keeps the remainder, a predicate that proves no class keeps it on both arms,
 and the replacement ends with the arm exactly as the unmodeled remainder does.
@@ -271,6 +280,48 @@ cannot decide them, preserving both outcomes. These summaries are derived
 from current indexed syntax during plan construction. Their edge removals
 participate in the existing reusable solver identity; no separate guard-summary
 table is persisted.
+
+### Python module-global seeds and `with` suppression
+
+These rules define observable Python analyzer behavior, so they belong in this
+human-facing dataflow contract. A function, class body, or lambda can receive an
+exact class seed from a module global only when the name has one binding
+statement, and that statement is a single `NAME = value` assignment (possibly
+inside module-level `if`, `try`, `with`, or `for` bodies). No function,
+lambda, or class body may declare it `global`. The module may not write through
+`globals()` or no-argument `vars()` (subscript assignment, deletion, `update`,
+`setdefault`, `pop`, or `clear`), use `exec`, or import a wildcard after the
+assignment. Count every binding form: other assignments,
+augmented or annotated assignments, deletion, imports, definitions, loop and
+`with` targets, and walrus bindings; comprehension targets do not count. No
+other workspace file may write that module attribute through an imported
+module alias, including assignment, deletion, `setattr`, `__dict__`, or patch
+APIs. The initializer uses the same classifier as a local assignment; an
+unrecognized value remains unknown.
+
+`sys.modules` is a registry of module objects, not module namespaces. A literal
+lookup through subscription, `get`, `pop`, or `setdefault` can alias module M
+only when its key is M's name (or `__name__` inside M); another literal is
+unrelated. A dynamic-key read may alias M. Track that value through existing
+alias rules: reads are harmless, but writing through it or letting it escape
+keeps the module-global proof open. A dominating `if`/`elif` consequence, or a
+prior same-block `if not condition` that exits via `continue`, `return`, `raise`,
+or `break`, may prove the key cannot be M's name. Evaluate supported literal
+string comparisons, membership, substring, prefix, and suffix tests with
+three-valued logic over `and`, `or`, and `not`; unknown predicates and a key
+rebound between guard and read remain conservative. A subscript assignment,
+`setdefault`, or `update` blocks only when the stored value is or may be M.
+Deleting an entry, an unused `pop`, or clearing the registry does not change M's
+globals. Escaping the registry itself remains conservative.
+
+For a `with` item, keep the suppression-resume edge unless every possible
+manager class has a resolved `__exit__` proven to return `None`. A workspace
+method qualifies only when it has no decorator and every return is bare or
+returns `None`; an external method needs a declared `None` return. A generator
+containing `yield`, decorated method, bool or other possibly truthy return,
+missing declaration, or unknown manager keeps the edge. The `__exit__` result
+remains unused, and return, break, and continue routes keep their existing
+semantics.
 
 Each client keeps separate plans and result types. A taint class, protocol
 state, and inferred class identity retain distinct types. Language-specific

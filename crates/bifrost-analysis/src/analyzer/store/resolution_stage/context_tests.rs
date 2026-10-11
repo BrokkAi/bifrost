@@ -42,12 +42,12 @@ fn path(reason: u64) -> PartialPath {
 }
 
 fn read(
-    connection: &Connection,
+    selection: &crate::analyzer::store::resolution_selection::SelectedResolutionMountInventory<'_>,
     context: SelectedContextPathToken,
     identity: CandidatePathIdentity,
 ) -> PartialPath {
-    require_context(connection, context).unwrap();
-    connection.query_row(
+    require_context(selection, context).unwrap();
+    selection.connection().query_row(
         "SELECT start_node,end_node,json(body) FROM temp.selected_resolution_context_paths WHERE context_id=?1 AND host_ordinal=?2 AND path=?3",
         params![context.get(),identity.fragment().ordinal(),codec::encode_path_id(identity.path())],
         |row| Ok(codec::decode_path(row.get(0)?,row.get(1)?,&row.get::<_,String>(2)?)),
@@ -84,8 +84,8 @@ fn context_paths_are_atomic_isolated_and_live_only_for_the_request() {
             .unwrap()
             .unwrap();
         assert_ne!(first, second);
-        assert_eq!(read(selection.connection(), first, identity), first_path);
-        assert_eq!(read(selection.connection(), second, identity), second_path);
+        assert_eq!(read(&selection, first, identity), first_path);
+        assert_eq!(read(&selection, second, identity), second_path);
         let count = || {
             selection
                 .connection()
@@ -128,9 +128,9 @@ fn context_paths_are_atomic_isolated_and_live_only_for_the_request() {
         assert_eq!(count(), 2);
         assert!(selection.connection().is_autocommit());
         stage.clear_facts().unwrap();
-        assert_eq!(read(selection.connection(), first, identity), first_path);
+        assert_eq!(read(&selection, first, identity), first_path);
         assert_eq!(selection.candidate_coverage_fingerprint(), base_authority);
-        assert!(require_context(other_selection.connection(), first).is_err());
+        assert!(require_context(&other_selection, first).is_err());
         let header: (Option<i64>,Option<i64>,Option<i64>,Option<i64>) = selection.connection().query_row(
             "SELECT start_lead_key,start_lead_shared,end_lead_key,end_lead_shared FROM temp.selected_resolution_context_paths WHERE context_id=?1",[first.get()],
             |row|Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?)),
@@ -162,7 +162,7 @@ fn context_paths_are_atomic_isolated_and_live_only_for_the_request() {
         71,
         "the retained physical reader was reused"
     );
-    assert!(require_context(reused.connection(), first).is_err());
+    assert!(require_context(&reused, first).is_err());
     assert_eq!(
         reused
             .connection()

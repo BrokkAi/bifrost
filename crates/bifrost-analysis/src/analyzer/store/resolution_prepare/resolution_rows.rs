@@ -5,8 +5,8 @@
 //! `hydrate_candidate_paths`, from the in-heap interior to keyed rows, and
 //! `lookup_semantic_recipes` beside it. This module is the one place that
 //! knows the body encoding of milestone 5's draft section 4, so the writer in
-//! `store/resolution.rs`, the reader in `store/resolution_lexical.rs` and the
-//! measurement loader in `schema_loader.rs` all speak the same encoding.
+//! `store/resolution.rs` and the reader in `store/resolution_lexical.rs` speak
+//! the same encoding.
 //!
 //! The body is a positional JSONB array and is decoded by exactly one Rust
 //! decoder; no SQL reads inside it. Its positions are
@@ -33,6 +33,8 @@
 
 use std::fmt::Write as _;
 
+use super::variable_number;
+
 use brokk_bifrost_core::analyzer::Language;
 use brokk_bifrost_core::analyzer::resolution_facts::{
     ALL_RESOLUTION_CALLABLE_RECEIVER_ORIGINS, ALL_RESOLUTION_NAMESPACES, ALL_RESOLUTION_SITE_KINDS,
@@ -48,9 +50,9 @@ use crate::analyzer::resolution::{
     BindingFragmentId, BindingNodeId, EndpointSignature, LoweredCandidateDirection,
     LoweredCoverageGap, LoweredSemanticRole, LoweredSemanticSite, LoweringCoverageFrontier,
     LoweringGapOrigin, PartialPath, PartialPathId, PartialScopedSymbol, PrecedenceStep,
-    ResolutionCompletion, ResolutionIdentityCatalog, ResolutionIncompleteReason,
-    ResolutionLookupSemanticRecipe, SemanticId, SharedNameId, StackPattern, StackVariableId,
-    WitnessStep,
+    ResolutionCompletion, ResolutionIdentityCatalog, ResolutionIdentityDomain,
+    ResolutionIncompleteReason, ResolutionLookupSemanticRecipe, SemanticId, SharedNameId,
+    StackPattern, StackVariableId, WitnessStep,
 };
 use crate::hash::HashMap;
 
@@ -66,7 +68,7 @@ use super::ResolutionLocalKeys;
 /// A primary-key seek over `resolution_paths(blob_id, path)`, so it needs no
 /// `INDEXED BY` and no index of its own. The keys arrive as one JSON array
 /// because the caller already holds every one of them (milestone 6's rule).
-pub(crate) const RESOLUTION_PATHS_BY_KEY_SQL: &str = "SELECT path, start_node, end_node, json(body) FROM resolution_paths \
+pub(crate) const RESOLUTION_PATHS_BY_KEY_SQL: &str = "SELECT path, start_node, end_node, json(body), activation_ordinal FROM resolution_paths \
      WHERE blob_id = ?1 AND path IN (SELECT value FROM json_each(?2))";
 
 // Questions #11 to #14, the forward candidate match, and #15 to #18, the
@@ -131,12 +133,16 @@ CROSS JOIN resolution_paths AS p INDEXED BY resolution_paths_forward \
   ON p.blob_id = ?1 \
  AND p.start_node = r.value ->> 1";
 
-/// One reverse batch: non-root lead buckets and complete root-prefix seeks.
+/// One reverse batch: non-root lead buckets, root-prefix seeks, and explicit
+/// root-terminal targets.
 ///
 /// Bind 5 carries [ordinal, canonical key, requested tail, fully representable,
 /// proper-prefix byte offsets]. Canonical cells are ASCII, so SQLite character
 /// offsets equal byte offsets. Each shorter key is transient inside its seek;
 /// Rust never materializes the quadratic collection of proper-prefix strings.
+/// Bind 6 carries exact `[ordinal, root_terminal, imports_only]` targets for
+/// callers that know their structured root demands. Import-only targets filter
+/// qualified-reference paths before they are returned to Rust.
 pub(crate) const RESOLUTION_REVERSE_CANDIDATE_MATCH_SQL: &str = "\
 SELECT r.value ->> 0, p.path, p.start_node, p.end_node, json_extract(p.body, '$[4]', '$[5]', '$[6]', '$[7]') \
 FROM json_each(?2) AS r \
@@ -183,7 +189,15 @@ CROSS JOIN resolution_paths AS p INDEXED BY resolution_paths_reverse_root_prefix
  AND p.end_fixed_key >= substr(r.value ->> 1, 1, length(r.value ->> 1) - 1) COLLATE BINARY \
  AND p.end_fixed_key < CASE WHEN length(r.value ->> 1) = 2 THEN char(92) \
      ELSE substr(r.value ->> 1, 1, length(r.value ->> 1) - 2) || '^' END COLLATE BINARY \
-WHERE r.value ->> 2 = 1 AND r.value ->> 3 = 1";
+WHERE r.value ->> 2 = 1 AND r.value ->> 3 = 1 \
+UNION ALL \
+SELECT r.value ->> 0, p.path, p.start_node, p.end_node, json_extract(p.body, '$[4]', '$[5]', '$[6]', '$[7]') \
+FROM json_each(?6) AS r \
+CROSS JOIN resolution_paths AS p INDEXED BY resolution_paths_root_terminal \
+  ON p.blob_id = ?1 AND p.end_node = -1 \
+ AND p.root_terminal = r.value ->> 1 \
+WHERE r.value ->> 2 = 0 OR (json_extract(p.body, '$[8][0][0]') = 0 \
+ AND json_extract(p.body, '$[8][0][1]') = 0)";
 
 /// Question #67, `root_terminal_paths`: the universal-root-terminated paths of
 /// one blob that end in one shared name.
@@ -221,6 +235,8 @@ pub(crate) const fn import_route_kind_label(
         TypeOnDemand => "type_on_demand",
         SingleStatic => "single_static",
         StaticOnDemand => "static_on_demand",
+        Named => "named",
+        Star => "star",
     }
 }
 
@@ -252,6 +268,28 @@ pub(crate) fn language_code(language: Language) -> i64 {
 
 fn language_from_code(value: i64) -> Language {
     from_code(&Language::ALL, value, "language")
+}
+
+const JVM_IDENTITY_DOMAIN_CODE: i64 = -1;
+
+pub(crate) fn identity_domain_code(domain: ResolutionIdentityDomain) -> i64 {
+    match domain {
+        ResolutionIdentityDomain::Jvm => JVM_IDENTITY_DOMAIN_CODE,
+        ResolutionIdentityDomain::Language(language) => language_code(language),
+    }
+}
+
+fn identity_domain_from_code(value: i64) -> ResolutionIdentityDomain {
+    if value == JVM_IDENTITY_DOMAIN_CODE {
+        return ResolutionIdentityDomain::Jvm;
+    }
+    let language = language_from_code(value);
+    assert_ne!(
+        language,
+        Language::None,
+        "a persisted lookup recipe needs an analyzable identity domain"
+    );
+    ResolutionIdentityDomain::Language(language)
 }
 
 pub(crate) fn namespace_code(namespace: ResolutionNamespace) -> i64 {
@@ -314,13 +352,14 @@ pub(super) fn node_key(keys: &ResolutionLocalKeys, node: BindingNodeId) -> i64 {
 ///
 /// `Shared` is a position in [`PreparedPathRows::shared`] rather than an id,
 /// because the id does not exist until the writer interns the digest.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum PathBodyToken {
     Open,
     Close,
     Null,
     Int(i64),
     Shared(u32),
+    Text(Box<str>),
 }
 
 /// One `resolution_paths` row, with every shared name still a slot.
@@ -338,6 +377,7 @@ pub(crate) struct PreparedPathRow {
     pub(crate) root_terminal: Option<u32>,
     pub(crate) root_endpoint: Option<PreparedRootEndpoint>,
     pub(crate) body: Vec<PathBodyToken>,
+    pub(crate) root_import_activation: Option<u32>,
 }
 
 /// A root endpoint still names shared identities by the writer's intern slots.
@@ -516,6 +556,7 @@ pub(super) fn prepare_path_rows(
             root_terminal,
             root_endpoint,
             body,
+            root_import_activation: path.root_import_activation(),
         });
     }
     PreparedPathRows {
@@ -713,10 +754,7 @@ pub(super) fn prepare_lookup_recipe_rows(
                 .expect("every lookup recipe is a shared identity");
             PreparedLookupRecipeRow {
                 identity_digest: identities.shared_name_digest(name),
-                semantic_language: language_code(
-                    Language::from_config_label(recipe.semantic_language())
-                        .expect("a recipe's semantic language is a configured language"),
-                ),
+                semantic_language: identity_domain_code(recipe.identity_domain()),
                 namespace: namespace_code(recipe.namespace()),
                 spelling: recipe.spelling().to_owned(),
             }
@@ -764,22 +802,7 @@ pub(super) fn prepare_site_rows(
         .collect()
 }
 
-/// One symbol inside a path body: `>= 0` a local semantic key, `< 0` minus the
-/// interned id of a shared name.
-fn signed_semantic(
-    shared: &mut SharedNames,
-    keys: &ResolutionLocalKeys,
-    identities: &ResolutionIdentityCatalog,
-    semantic: SemanticId,
-) -> PathBodyToken {
-    let identity = identities
-        .semantic_identity(semantic)
-        .expect("an emitted semantic is in its blob's catalog");
-    match identity.shared_name() {
-        None => PathBodyToken::Int(keys.semantic(semantic)),
-        Some(name) => PathBodyToken::Shared(shared.slot(identities.shared_name_digest(name))),
-    }
-}
+use super::{signed_semantic, stored_integer as integer};
 
 /// `(lead_local, lead_shared, lead_scoped)` for one endpoint.
 fn endpoint_lead(
@@ -788,7 +811,7 @@ fn endpoint_lead(
     identities: &ResolutionIdentityCatalog,
     endpoint: &EndpointSignature,
 ) -> (Option<i64>, Option<u32>, bool) {
-    let Some(symbol) = endpoint.symbols().fixed().first() else {
+    let Some(symbol) = endpoint.first_fixed_symbol() else {
         return (None, None, false);
     };
     let scoped = symbol.scopes().is_some();
@@ -826,22 +849,13 @@ fn root_terminal_identity(
 
 /// The per-path number of one stack variable, in order of first appearance in
 /// the body's serialization order.
-fn variable_number(variables: &mut Vec<(StackVariableId, i64)>, variable: StackVariableId) -> i64 {
-    if let Some((_, number)) = variables.iter().find(|(known, _)| *known == variable) {
-        return *number;
-    }
-    let number = i64::try_from(variables.len()).expect("a path's variables fit an integer");
-    variables.push((variable, number));
-    number
-}
-
 fn push_option(out: &mut Vec<PathBodyToken>, value: Option<i64>) {
     out.push(value.map_or(PathBodyToken::Null, PathBodyToken::Int));
 }
 
 /// `[start_symbols, start_symbol_tail, start_scopes, start_scope_tail,
 /// end_symbols, end_symbol_tail, end_scopes, end_scope_tail, precedence,
-/// witness, completion]`.
+/// witness, completion, owner_continued]`.
 fn path_body(
     shared: &mut SharedNames,
     keys: &ResolutionLocalKeys,
@@ -930,6 +944,7 @@ fn path_body(
     }
     out.push(PathBodyToken::Close);
     write_completion(&mut out, keys, path.completion());
+    out.push(PathBodyToken::Int(i64::from(path.owner_continued())));
     out.push(PathBodyToken::Close);
     out
 }
@@ -972,7 +987,7 @@ fn write_completion(
 pub(crate) fn render_path_body(body: &[PathBodyToken], shared_ids: &[i64]) -> String {
     let mut out = String::with_capacity(body.len() * 3);
     for token in body {
-        if !out.is_empty() && !out.ends_with('[') && *token != PathBodyToken::Close {
+        if !out.is_empty() && !out.ends_with('[') && !matches!(token, PathBodyToken::Close) {
             out.push(',');
         }
         match token {
@@ -985,6 +1000,9 @@ pub(crate) fn render_path_body(body: &[PathBodyToken], shared_ids: &[i64]) -> St
                 assert!(id > 0, "an interned identity id is positive: {id}");
                 out.push('-');
                 out.push_str(&id.to_string());
+            }
+            PathBodyToken::Text(value) => {
+                out.push_str(&serde_json::to_string(value).expect("body text serializes as JSON"))
             }
         }
     }
@@ -1024,17 +1042,11 @@ impl PathBodyContext {
         if key == -1 {
             return BindingNodeId::universal_root();
         }
-        BindingNodeId::local(
-            self.fragment.ordinal(),
-            u32::try_from(key).expect("stored local node fits u32"),
-        )
+        super::stored_local_node(self.fragment.ordinal(), key)
     }
 
     fn path(&self, key: i64) -> PartialPathId {
-        PartialPathId::local(
-            self.fragment.ordinal(),
-            u32::try_from(key).expect("stored local path fits u32"),
-        )
+        super::stored_local_path(self.fragment.ordinal(), key)
     }
 
     /// A body's stack variables are numbered per path, so a number is the
@@ -1054,15 +1066,9 @@ impl PathBodyContext {
 type Element = serde_json::Value;
 
 fn array<'value>(value: &'value Element, what: &str) -> &'value [Element] {
-    value
-        .as_array()
-        .unwrap_or_else(|| panic!("a stored path body's {what} is an array, got {value}"))
-}
-
-fn integer(value: &Element, what: &str) -> i64 {
-    value
-        .as_i64()
-        .unwrap_or_else(|| panic!("a stored path body's {what} is an integer, got {value}"))
+    super::require_array(value, |value| {
+        format!("a stored path body's {what} is an array, got {value}")
+    })
 }
 
 fn optional_integer(value: &Element, what: &str) -> Option<i64> {
@@ -1079,7 +1085,10 @@ pub(crate) fn parse_path_body(body: &str) -> ParsedPathBody {
     let document: Element =
         serde_json::from_str(body).expect("a stored path body is the JSON this module wrote");
     let cells = array(&document, "body").to_vec();
-    assert_eq!(cells.len(), 11, "a stored path body has eleven positions");
+    assert!(
+        matches!(cells.len(), 11 | 12),
+        "a stored path body has eleven legacy or twelve current positions"
+    );
     ParsedPathBody(cells)
 }
 
@@ -1092,6 +1101,7 @@ pub(crate) fn decode_path_row(
     start_node: i64,
     end_node: i64,
     body: &ParsedPathBody,
+    root_import_activation: Option<u32>,
 ) -> PartialPath {
     let cells = &body.0;
     let start = decode_endpoint(context, context.node(start_node), &cells[0..4]);
@@ -1117,13 +1127,28 @@ pub(crate) fn decode_path_row(
         .iter()
         .map(|step| decode_witness_step(context, step))
         .collect::<Vec<_>>();
-    PartialPath::new(
+    let owner_continued = match body
+        .0
+        .get(11)
+        .map(|cell| integer(cell, "owner continuation"))
+    {
+        None | Some(0) => false,
+        Some(1) => true,
+        Some(value) => panic!("a path owner-continuation bit is 0 or 1, got {value}"),
+    };
+    let path = PartialPath::new(
         start,
         end,
         precedence,
         witness,
         decode_completion(context, &cells[10]),
     )
+    .with_root_import_activation(root_import_activation);
+    if owner_continued {
+        path.with_owner_continued()
+    } else {
+        path
+    }
 }
 
 /// The four positions of one endpoint, as the candidate match selects them.
@@ -1132,6 +1157,7 @@ pub(crate) fn decode_path_row(
 /// bucket offers, so it reads those four positions and never the rest of the
 /// path. The whole body is read only where a path is needed, by
 /// `hydrate_candidate_paths`.
+#[derive(Clone)]
 pub(crate) struct ParsedEndpointCells(Vec<Element>);
 
 pub(crate) fn parse_endpoint_cells(cells: &str) -> ParsedEndpointCells {
@@ -1266,9 +1292,35 @@ pub(crate) fn decode_lookup_recipe(
     namespace: i64,
     spelling: &str,
 ) -> ResolutionLookupSemanticRecipe {
-    ResolutionLookupSemanticRecipe::new(
-        language_from_code(semantic_language),
+    ResolutionLookupSemanticRecipe::new_in_domain(
+        identity_domain_from_code(semantic_language),
         namespace_from_code(namespace),
         spelling,
     )
+}
+
+#[cfg(test)]
+mod identity_domain_tests {
+    use super::*;
+
+    #[test]
+    fn lookup_identity_domain_storage_codes_round_trip_without_changing_non_jvm_codes() {
+        let rust = ResolutionIdentityDomain::Language(Language::Rust);
+        let go = ResolutionIdentityDomain::Language(Language::Go);
+
+        assert_eq!(identity_domain_code(ResolutionIdentityDomain::Jvm), -1);
+        assert_eq!(
+            identity_domain_from_code(identity_domain_code(ResolutionIdentityDomain::Jvm)),
+            ResolutionIdentityDomain::Jvm
+        );
+        for domain in [rust, go] {
+            let code = identity_domain_code(domain);
+            let language = match domain {
+                ResolutionIdentityDomain::Language(language) => language,
+                ResolutionIdentityDomain::Jvm => unreachable!(),
+            };
+            assert_eq!(code, language_code(language));
+            assert_eq!(identity_domain_from_code(code), domain);
+        }
+    }
 }

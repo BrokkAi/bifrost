@@ -57,10 +57,15 @@ pub(super) const MATCH_SELECTOR_PATH: &str = "/analysis/selector";
 /// - an `assertion` policy that carries a relational row plan answers through
 ///   the relational adapter, which replays candidate joins and group keys.
 ///
+/// A `flow` or `taint` candidate is a pair of positions and is answered by
+/// [`super::explain_flow_candidate`].
+///
 /// # Errors
 ///
-/// - [`ExplainError::ExplanationAdapterUnavailable`] for a `taint`, `flow`, or
-///   `typestate` policy. The error names the families that *are* supported.
+/// - [`ExplainError::CandidateSourceRequired`] for a `flow` or `taint` policy:
+///   one position does not say which value the question is about.
+/// - [`ExplainError::ExplanationAdapterUnavailable`] for a `typestate` policy.
+///   The error names the families that *are* supported.
 /// - [`ExplainError::RelationalPlanUnavailable`] for an assertion policy whose
 ///   assertions are the capture-oriented families rather than a row plan.
 /// - Everything the chosen adapter can return.
@@ -83,6 +88,11 @@ pub fn explain_candidate(
             super::why_not_relational::explain_relational_candidate(
                 policy, plan, context, candidate, budget, limits,
             )
+        }
+        PolicyAnalysis::Flow { .. } | PolicyAnalysis::Taint { .. } => {
+            Err(ExplainError::CandidateSourceRequired {
+                analysis_type: policy.definition().analysis.analysis_type(),
+            })
         }
         other => Err(ExplainError::adapter_unavailable(
             other.analysis_type(),
@@ -173,7 +183,7 @@ impl ExplanationCandidate {
 ///   row's exclusive end is outside it.
 /// - A **degenerate empty row** `[p, p)` covers exactly the point candidate at
 ///   `p`, and no range candidate.
-pub(super) fn row_covers_candidate(
+pub(crate) fn row_covers_candidate(
     row_span: Option<&Range<usize>>,
     candidate: &ExplanationCandidate,
 ) -> bool {
@@ -841,11 +851,8 @@ fn evidence_covers_candidate(
     evidence: &DetailedCodeQueryEvidence,
     candidate: &ExplanationCandidate,
 ) -> bool {
-    evidence
-        .file
-        .rel_path()
-        .to_str()
-        .and_then(|path| WorkspaceRelativePath::new(path).ok())
+    WorkspaceRelativePath::try_from_path(evidence.file.rel_path())
+        .ok()
         .is_some_and(|path| path == candidate.path)
         && row_covers_candidate(evidence.byte_span.as_ref(), candidate)
 }
@@ -949,7 +956,7 @@ fn provenance_is_prefix(
 /// diagnostic codes through the evaluator's existing code-to-reason mapping,
 /// so a `why-not` answer names incompleteness in the same vocabulary a run
 /// does.
-pub(super) fn absence_reasons(
+pub(crate) fn absence_reasons(
     completion: &CodeQueryCompletion,
     truncated: bool,
 ) -> Vec<PolicyIncompleteReason> {
@@ -1065,7 +1072,10 @@ const fn plan_source_label(source: &CodeQueryPlanSource) -> &'static str {
         CodeQueryPlanSource::Paths(_) => "paths",
         CodeQueryPlanSource::GenerationSites(_) => "generation_sites",
         CodeQueryPlanSource::Exports(_) => "exports",
+        CodeQueryPlanSource::DependencyEvidence(_) => "dependency_evidence",
         CodeQueryPlanSource::ConfigurationFacts(_) => "configuration_facts",
+        CodeQueryPlanSource::Correlate(_) => "correlate",
+        CodeQueryPlanSource::RequireBoth(_) => "require_both",
         CodeQueryPlanSource::Set { op, .. } => match op {
             SetOperator::Union => "union",
             SetOperator::Intersect => "intersect",

@@ -15,22 +15,25 @@
 //! the unproven channel rather than being guessed into the proven set or dropped.
 
 use super::KotlinGraphSource;
-use crate::kotlin::graph::hits;
 use crate::kotlin::graph::resolver::{
     KotlinNameResolver, KotlinResolutionCtx, ReceiverTargetMatch, TargetKind, TargetSpec,
-    kotlin_callable_arities, member_unit, receiver_is_same_owner, receiver_matches_target,
-    receiver_type_fq_name,
+    binding_type_fq_name, kotlin_callable_arities, nearest_enclosing_member_unit,
+    receiver_is_same_owner, receiver_matches_target,
+};
+use crate::kotlin::graph::{
+    hits, kotlin_constructed_type_components, kotlin_navigation_receiver_identifier,
+    kotlin_outer_user_type_segments, visit_resolved_type_name_prefixes,
 };
 use crate::kotlin::syntax::{
-    kotlin_binding_type_components, kotlin_call_arity, kotlin_call_with_callee, kotlin_callee,
-    kotlin_class_literal_type, kotlin_declared_type_parameter_names,
-    kotlin_dotted_navigation_segments, kotlin_import_header_segments, kotlin_is_declaration_name,
-    kotlin_is_expression_kind, kotlin_is_navigation_kind, kotlin_named_argument_label,
-    kotlin_navigation_member, kotlin_navigation_receiver, kotlin_user_type_segments,
+    kotlin_call_arity, kotlin_call_with_callee, kotlin_callee, kotlin_class_literal_type,
+    kotlin_class_literal_type_segments, kotlin_constructed_type_name_nodes,
+    kotlin_declared_type_parameter_names, kotlin_import_header_segments,
+    kotlin_is_declaration_name, kotlin_is_navigation_kind, kotlin_named_argument_label,
+    kotlin_navigation_member, kotlin_navigation_receiver, kotlin_value_declaration_name,
 };
 use brokk_bifrost_core::analyzer::query_token::QueryToken;
 use brokk_bifrost_core::analyzer::tree_walk::{
-    TreeWalkAction, first_named_child_of_kind, named_children, walk_tree_iterative,
+    TreeWalkAction, first_named_child_of_kind, walk_tree_iterative,
 };
 use brokk_bifrost_core::analyzer::usages::common::node_text;
 use brokk_bifrost_core::analyzer::usages::local_inference::{
@@ -40,6 +43,7 @@ use brokk_bifrost_core::analyzer::usages::model::UsageHit;
 use brokk_bifrost_core::analyzer::{CodeUnit, ProjectFile};
 use brokk_bifrost_core::hash::HashMap;
 use std::collections::BTreeSet;
+use std::ops::ControlFlow;
 use tree_sitter::Node;
 
 /// Node kinds that open a Kotlin binding scope.
@@ -286,53 +290,15 @@ fn walk(
 /// object `Registry` in value positions, so a later `Registry.length` is not a
 /// reference to the object.
 fn seed_value_declarations(node: Node<'_>, token: QueryToken<'_>, ctx: &mut ScanCtx<'_>) {
-    if !matches!(
-        node.kind(),
-        "variable_declaration" | "parameter" | "class_parameter" | "parameter_with_optional_type"
-    ) {
-        return;
-    }
-    let Some(name_node) = first_named_child_of_kind(node, "simple_identifier") else {
+    let Some(name) = kotlin_value_declaration_name(node, ctx.source) else {
         return;
     };
-    let name = node_text(name_node, ctx.source).to_string();
-    if name.is_empty() {
-        return;
-    }
-    match binding_type_fq_name(node, token, ctx) {
-        Some(fqn) => ctx.bindings.seed_symbol(name, fqn),
-        None => ctx.bindings.declare_shadow(name),
-    }
+    let target = binding_type_fq_name(node, token, ctx);
+    ctx.bindings.seed_or_shadow(name, target);
 }
 
 /// The type a binding has: the type it writes, or the type its initializer
 /// proves.
-fn binding_type_fq_name(
-    binding: Node<'_>,
-    token: QueryToken<'_>,
-    ctx: &mut ScanCtx<'_>,
-) -> Option<String> {
-    if let Some(components) = kotlin_binding_type_components(binding, ctx.source)
-        && let Some(fqn) = ctx
-            .names
-            .resolve_type_components(&components, binding.start_byte())
-    {
-        return Some(fqn);
-    }
-    // A `variable_declaration` holds only the name and the written type; the
-    // initializer is its sibling under the enclosing `property_declaration`.
-    let owner = if binding.kind() == "variable_declaration" {
-        binding.parent()?
-    } else {
-        binding
-    };
-    let initializer = named_children(owner)
-        .into_iter()
-        .rev()
-        .find(|child| kotlin_is_expression_kind(child.kind()))?;
-    receiver_type_fq_name(initializer, token, ctx, 0)
-}
-
 fn record_reference(
     node: Node<'_>,
     token: QueryToken<'_>,
@@ -399,43 +365,14 @@ fn constructed_type_components<'tree>(
     callee: Node<'tree>,
     ctx: &ScanCtx<'_>,
 ) -> Option<(Node<'tree>, Vec<String>)> {
-    match callee.kind() {
-        "simple_identifier" => {
-            let name = node_text(callee, ctx.source);
-            (!name.is_empty() && !ctx.bindings.is_shadowed(name))
-                .then(|| (callee, vec![name.to_string()]))
-        }
-        // `: Base(1)` in a supertype list spells its callee as a `user_type`.
-        "user_type" => {
-            let segments = kotlin_user_type_segments(callee);
-            let last = segments.last().copied()?;
-            let components = segments
-                .iter()
-                .map(|segment| node_text(*segment, ctx.source))
-                .filter(|component| !component.is_empty())
-                .map(str::to_string)
-                .collect::<Vec<_>>();
-            (!components.is_empty()).then_some((last, components))
-        }
-        // `lib.Base(1)`.
-        kind if kotlin_is_navigation_kind(kind) => {
-            let member = kotlin_navigation_member(callee)?;
-            let components = dotted_navigation_components(callee, ctx)?;
-            Some((member, components))
-        }
-        _ => None,
+    let (terminal, segments) = kotlin_constructed_type_name_nodes(callee)?;
+    let components = kotlin_constructed_type_components(callee.kind(), &segments, ctx.source)?;
+    if callee.kind() == "simple_identifier"
+        && ctx.bindings.is_shadowed(node_text(terminal, ctx.source))
+    {
+        return None;
     }
-}
-
-/// The dotted name a navigation spells, when every link of it is a plain name.
-fn dotted_navigation_components(navigation: Node<'_>, ctx: &ScanCtx<'_>) -> Option<Vec<String>> {
-    let segments = kotlin_dotted_navigation_segments(navigation)?;
-    let names: Vec<&str> = segments
-        .iter()
-        .map(|segment| node_text(*segment, ctx.source))
-        .collect();
-    (!names.iter().any(|name| name.is_empty()))
-        .then(|| names.into_iter().map(str::to_string).collect())
+    Some((terminal, components))
 }
 
 /// Record a reference to a function: a call, a callable reference, or a
@@ -537,15 +474,13 @@ fn record_bare_reference(token: Node<'_>, ctx: &mut ScanCtx<'_>, arity: Option<u
     // is same-owner under the uniform #1014 policy — but only when the name
     // really does resolve to the target from here.
     let owners = ctx.enclosing_owner_fq_names(token);
-    for owner in &owners {
-        if let Some(found) = member_unit(owner, &ctx.spec.member_name, arity, ctx) {
-            if found.fq_name() == ctx.spec.fq_name {
-                hits::push_self_receiver_hit(token, ctx);
-            }
-            // The nearest enclosing owner that declares the name is the one the
-            // reference binds to; a further-out one cannot also answer it.
-            return;
+    if let Some(found) = nearest_enclosing_member_unit(&owners, &ctx.spec.member_name, arity, ctx) {
+        if found.fq_name() == ctx.spec.fq_name {
+            hits::push_self_receiver_hit(token, ctx);
         }
+        // The nearest enclosing owner that declares the name is the one the
+        // reference binds to; a further-out one cannot also answer it.
+        return;
     }
     // Not reachable through any enclosing scope: an import may still bring it in.
     if ctx
@@ -562,10 +497,7 @@ fn record_bare_reference(token: Node<'_>, ctx: &mut ScanCtx<'_>, arity: Option<u
 
 /// Record `::name`, a callable reference.
 fn record_callable_reference(reference: Node<'_>, ctx: &mut ScanCtx<'_>) {
-    let Some(name_node) = named_children(reference)
-        .into_iter()
-        .find(|child| child.kind() == "simple_identifier")
-    else {
+    let Some(name_node) = first_named_child_of_kind(reference, "simple_identifier") else {
         return;
     };
     if node_text(name_node, ctx.source) != ctx.spec.member_name {
@@ -730,18 +662,8 @@ fn record_class_literal_reference(
     let Some(literal) = kotlin_class_literal_type(node) else {
         return;
     };
-    let segments = match literal.kind() {
-        // A bare name, aliased to `type_identifier` by the callable-reference
-        // form and left a `simple_identifier` by the navigation one.
-        "type_identifier" | "simple_identifier" => vec![literal],
-        kind if kotlin_is_navigation_kind(kind) => {
-            let Some(segments) = kotlin_dotted_navigation_segments(literal) else {
-                return;
-            };
-            segments
-        }
-        // `f()::class` names the runtime class of a call's result.
-        _ => return,
+    let Some(segments) = kotlin_class_literal_type_segments(literal) else {
+        return;
     };
     let Some(leading) = segments.first() else {
         return;
@@ -822,18 +744,10 @@ fn record_user_type_reference(
     ctx: &mut ScanCtx<'_>,
     types: &TypeParameterScopes,
 ) {
-    // A nested `user_type` is reached through its parent's segment walk, so
-    // visiting it again would record the same token twice. Generic arguments are
-    // not nested `user_type`s of their owner (they sit inside `type_arguments`),
-    // so they are still visited in their own right.
-    if user_type
-        .parent()
-        .is_some_and(|parent| parent.kind() == "user_type")
-    {
+    let Some(segments) = kotlin_outer_user_type_segments(user_type) else {
         return;
-    }
-
-    record_type_name_segments(&kotlin_user_type_segments(user_type), ctx, types);
+    };
+    record_type_name_segments(&segments, ctx, types);
 }
 
 /// Record the one segment of a dotted type name whose prefix resolves to the
@@ -844,30 +758,20 @@ fn record_type_name_segments(
     ctx: &mut ScanCtx<'_>,
     types: &TypeParameterScopes,
 ) {
-    let mut components = Vec::new();
-    for (index, segment) in segments.iter().enumerate() {
-        let name = node_text(*segment, ctx.source);
-        if name.is_empty() {
-            return;
-        }
-        // A generic parameter shadows a class of the same name for the whole
-        // declaration that introduced it: inside `class Box<Base>`, every `Base`
-        // is the parameter. Only the *leading* segment can be shadowed -- a
-        // parameter is a single name, so it can never be the `Inner` of
-        // `Outer.Inner`.
-        if index == 0 && type_parameter_in_scope(types, name) {
-            return;
-        }
-        components.push(name.to_string());
-        if ctx
-            .names
-            .resolve_type_components(&components, segment.start_byte())
-            .is_some_and(|resolved| resolved == ctx.spec.fq_name)
-        {
-            hits::push_hit(*segment, ctx);
-            return;
-        }
+    if segments
+        .first()
+        .is_some_and(|segment| type_parameter_in_scope(types, node_text(*segment, ctx.source)))
+    {
+        return;
     }
+    visit_resolved_type_name_prefixes(segments, ctx.source, ctx.names, |segment, resolved| {
+        if resolved == ctx.spec.fq_name {
+            hits::push_hit(segment, ctx);
+            ControlFlow::Break(())
+        } else {
+            ControlFlow::Continue(())
+        }
+    });
 }
 
 /// Record a reference to the target used as a *qualifier*: the receiver of a
@@ -880,20 +784,13 @@ fn record_type_name_segments(
 /// binding — `val Base = 1; Base.length` is a property access on a string, not a
 /// reference to the class.
 fn record_qualifier_reference(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
-    if kotlin_is_declaration_name(node) {
-        return;
-    }
-    let name = node_text(node, ctx.source);
-    if name.is_empty() || name != ctx.spec.member_name || ctx.bindings.is_shadowed(name) {
-        return;
-    }
-    let Some(navigation) = node
-        .parent()
-        .filter(|parent| parent.kind() == "navigation_expression")
-    else {
+    let Some((navigation, name)) = kotlin_navigation_receiver_identifier(node, ctx.source) else {
         return;
     };
-    if kotlin_navigation_receiver(navigation).is_none_or(|receiver| receiver.id() != node.id()) {
+    if navigation.kind() != "navigation_expression"
+        || name != ctx.spec.member_name
+        || ctx.bindings.is_shadowed(name)
+    {
         return;
     }
     if ctx

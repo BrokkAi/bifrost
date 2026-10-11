@@ -10,19 +10,23 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use super::{
-    ActivationSelector, CatalogCoordinate, CatalogMiss, CatalogPackSourceKind,
-    CollectionFlowsPayload, CompiledClassDecoratorIdentity, CompiledConcurrencyEffect,
-    CompiledConditionalIndirectWrite, CompiledConditionalResultRefinement, CompiledDeclaredEffect,
-    CompiledNormalReturnRefinement, CompiledNormalReturnTypeRefinement,
-    CompiledOperationPrecondition, CompiledPackManifest, CompiledProcedureSummary,
-    CompiledProcedureTarget, CompiledResultContract, CompiledResultUseObligation, CompiledShard,
-    DeclarationGuard, GeneratorRule, MemberFact, PayloadKind, RelationFact, RuleTrigger,
-    RuntimeValuesPayload, SemanticModelOverlay, SemanticModelOverlayBuildError,
-    SemanticPackCatalog, SemanticPackSelectorQuery, TypeFact,
+    ActivationSelector, AuthoredProcedureFormal, AuthoredProcedureFormalPassingMode,
+    AuthoredProcedureFormalVariadicKind, CatalogCoordinate, CatalogMiss, CatalogPackSourceKind,
+    CatalogRuntimeSourceReader, CollectionFlowsPayload, CompiledClassDecoratorIdentity,
+    CompiledConcurrencyEffect, CompiledConditionalIndirectWrite,
+    CompiledConditionalResultRefinement, CompiledDeclaredEffect, CompiledNormalReturnRefinement,
+    CompiledNormalReturnTypeRefinement, CompiledOperationPrecondition, CompiledPackManifest,
+    CompiledProcedureSummary, CompiledProcedureTarget, CompiledResultContract,
+    CompiledResultUseObligation, CompiledShard, DeclarationGuard, GeneratorRule, MemberFact,
+    PayloadKind, RelationFact, RuleTrigger, RuntimeValuesPayload, SemanticModelOverlay,
+    SemanticModelOverlayBuildError, SemanticPackCatalog, SemanticPackSelectorQuery, TypeFact,
 };
 use crate::CancellationToken;
-use crate::analyzer::canonical_hash::{is_lower_sha256, parse_lower_sha256};
+use crate::analyzer::canonical_hash::{is_lower_sha256, parse_lower_sha256, write_length_prefixed};
 use crate::analyzer::complete_value_cache::{CompleteValueAcquisition, CompleteValueCache};
+use crate::analyzer::lexical_definitions::{
+    FormalParameterLayout, FormalParameterPassingMode, FormalParameterSlot, FormalVariadicKind,
+};
 use crate::analyzer::semantic::{
     SemanticLocator, StableDigest, UnmaterializedExternalTarget, authored_procedure_target_identity,
 };
@@ -31,6 +35,7 @@ use crate::analyzer::store::{
 };
 use crate::analyzer::{IAnalyzer, Language, LanguageDialect, semantic_pack_realm};
 use crate::hash::{HashMap, map_with_capacity};
+use brokk_bifrost_core::util::elapsed_ns;
 
 /// The encoding version of the resolved semantic-model runtime.
 ///
@@ -40,8 +45,10 @@ use crate::hash::{HashMap, map_with_capacity};
 /// resolves a Kotlin or Scala call differently than the label-exact keying did.
 /// A recorded identity from before this change must not satisfy the new
 /// contract, so the version moves even though no pack changed. Version 8
-/// retains the explicit no-concurrency-effects procedure claim.
-pub const SEMANTIC_MODEL_RUNTIME_REPRESENTATION_VERSION: u32 = 8;
+/// retained no-concurrency-effects claims; version 9 includes directional
+/// variadic summary-formal binding; version 10 retains independently accepted
+/// review receipts in the active proof identity.
+pub const SEMANTIC_MODEL_RUNTIME_REPRESENTATION_VERSION: u32 = 10;
 
 type DependencyEvidencePublication = (Box<[Language]>, super::DependencyDiscoveryEvidence);
 
@@ -57,6 +64,130 @@ pub struct SemanticModelActivationEvidence {
     pub artifact_sha256: Option<String>,
 }
 
+/// The reviewed proof basis attached to a result-use obligation binding.
+///
+/// The label is deliberately smaller than the typed basis. Query consumers
+/// project the label, while the typed value prevents a language adapter from
+/// silently treating an unrelated builtin as the reviewed receiver. Java's
+/// existing binder continues to publish its established dispatch basis; a
+/// future Java adapter can use this shared carrier after the native-engine
+/// refactor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum ReviewedObligationBasis {
+    DispatchAgreement,
+    BuiltinReceiverAssumption(ReviewedBuiltinReceiverAssumption),
+    LibcStandardDeclaration,
+    PythonStandardLibraryFunction,
+    /// A JavaScript receiver is proved from an exact literal/template or the
+    /// unshadowed builtin `String(...)` constructor result. This is proof from
+    /// source and type flow, not an ecosystem-wide receiver assumption.
+    ExactLiteralReceiver,
+}
+
+impl ReviewedObligationBasis {
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::DispatchAgreement => "dispatch_agreement",
+            Self::BuiltinReceiverAssumption(_) => "builtin_receiver_assumption",
+            Self::LibcStandardDeclaration => "libc_standard_declaration",
+            Self::PythonStandardLibraryFunction => "python_stdlib_function",
+            Self::ExactLiteralReceiver => "exact_literal_receiver",
+        }
+    }
+}
+
+/// A reviewed builtin receiver assumption. The receiver detail remains typed
+/// in the runtime and is described by the semantic-pack provenance; only the
+/// stable public basis label is projected into RQL rows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum ReviewedBuiltinReceiverAssumption {
+    PythonStr,
+    RubyString,
+    TypeScriptString,
+}
+
+impl ReviewedBuiltinReceiverAssumption {
+    pub const fn language(self) -> &'static str {
+        match self {
+            Self::PythonStr => "python",
+            Self::RubyString => "ruby",
+            Self::TypeScriptString => "typescript",
+        }
+    }
+
+    pub const fn receiver(self) -> &'static str {
+        match self {
+            Self::PythonStr => "builtins.str",
+            Self::RubyString => "String",
+            Self::TypeScriptString => "String",
+        }
+    }
+}
+
+/// A target carrier for one reviewed result-use binding.
+///
+/// `evidence` is the exact activation row selected for the summary shard. It
+/// is carried separately from the unmaterialized call target because Python's
+/// builtin assumption is type-flow evidence rather than resolver-owned
+/// installed-artifact evidence. The same carrier supports a future adapter
+/// that selects a JVM, npm, or another language-specific artifact.
+#[derive(Debug, Clone, Copy)]
+pub struct ReviewedObligationTarget<'a> {
+    pub target: &'a UnmaterializedExternalTarget,
+    pub evidence: &'a SemanticModelActivationEvidence,
+    pub basis: ReviewedObligationBasis,
+}
+
+impl<'a> ReviewedObligationTarget<'a> {
+    pub const fn new(
+        target: &'a UnmaterializedExternalTarget,
+        evidence: &'a SemanticModelActivationEvidence,
+        basis: ReviewedObligationBasis,
+    ) -> Self {
+        Self {
+            target,
+            evidence,
+            basis,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReviewedObligationBindFailure {
+    NoObligation,
+    LanguageMismatch,
+    EvidenceUnselected,
+    CallShapeMismatch,
+    BasisMismatch,
+}
+
+/// The result of binding reviewed obligations to one exact call shape.
+#[derive(Debug, Clone, Copy)]
+pub struct ReviewedObligationBinding<'a> {
+    obligations: &'a [CompiledResultUseObligation],
+    basis: ReviewedObligationBasis,
+    ordinary_heap_unchanged: bool,
+    covers_overrides: bool,
+}
+
+impl<'a> ReviewedObligationBinding<'a> {
+    pub fn obligations(self) -> &'a [CompiledResultUseObligation] {
+        self.obligations
+    }
+
+    pub const fn basis(self) -> ReviewedObligationBasis {
+        self.basis
+    }
+
+    pub const fn ordinary_heap_unchanged(self) -> bool {
+        self.ordinary_heap_unchanged
+    }
+
+    pub const fn covers_overrides(self) -> bool {
+        self.covers_overrides
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum SemanticModelControlScope {
     User,
@@ -67,6 +198,8 @@ pub enum SemanticModelControlScope {
 pub enum SemanticModelControlAction {
     Enable,
     Disable,
+    /// Exact consumer acceptance of reviewed contracts; does not activate.
+    AcceptReviewed,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -187,6 +320,9 @@ pub struct ActiveSemanticModelShard {
     /// representative above remains the ordinary matcher input; an exact
     /// call-artifact proof must select its own row from this complete set.
     pub matching_evidence: Vec<SemanticModelActivationEvidence>,
+    /// Explicit authorization retained from the activation control decision.
+    /// This is distinct from the pack payload's review requirement flag.
+    pub review_accepted: bool,
     evidence_rank: EvidenceRank,
     source_rank: u8,
 }
@@ -214,6 +350,7 @@ impl ActiveSemanticModelShard {
 #[derive(Debug)]
 pub struct ResolvedActiveSemanticModels {
     active_model_set_hash: String,
+    source_reader: Option<CatalogRuntimeSourceReader>,
     shards: Vec<ActiveSemanticModelShard>,
     indexes: MatcherIndexes,
     extraction_gaps: Vec<ActivePackExtractionGap>,
@@ -283,6 +420,19 @@ impl ActiveSemanticModelSnapshot {
         self.semantic_model_overlay.as_ref()
     }
 
+    /// Whether this snapshot publishes a complete declaration surface for a
+    /// language. Consumers that make absence claims must use this predicate
+    /// rather than treating any overlay as complete coverage.
+    pub fn publishes_complete_declaration_surface_for(&self, language: &str) -> bool {
+        self.semantic_model_overlay
+            .as_ref()
+            .is_some_and(|overlay| overlay.publishes_complete_declaration_surface_for(language))
+    }
+
+    pub(crate) fn overlay(&self) -> Option<Arc<SemanticModelOverlay>> {
+        self.semantic_model_overlay.as_ref().map(Arc::clone)
+    }
+
     pub fn overlay_measurement(&self) -> Option<SemanticModelOverlayMeasurement> {
         self.overlay_measurement
     }
@@ -312,6 +462,12 @@ pub struct ActivePackExtractionGap {
 }
 
 impl ResolvedActiveSemanticModels {
+    /// Fixed SQL handles belonging to this activation publication. Source rows
+    /// are read on demand and remain owned by one query.
+    pub(crate) fn source_reader(&self) -> Option<&CatalogRuntimeSourceReader> {
+        self.source_reader.as_ref()
+    }
+
     pub fn active_model_set_hash(&self) -> &str {
         &self.active_model_set_hash
     }
@@ -524,20 +680,32 @@ impl ResolvedActiveSemanticModels {
             &parameter_counts,
             |shard, summary| {
                 let artifact_applies = python_artifact_applies_to_target(shard, target);
-                let shape_applies =
-                    procedure_summary_shape_applies_to_target(shard, summary, target);
+                let actual_to_formal = procedure_summary_actual_to_formal(shard, summary, target);
                 if python_shard_requires_distribution_artifact(shard, target) && !artifact_applies {
                     rejected_artifact.set(true);
                 }
-                if python_shard_requires_distribution_artifact(shard, target)
-                    && !shape_applies
-                    && artifact_applies
+                if artifact_applies
+                    && actual_to_formal.is_none()
+                    && (!summary.target.formals.is_empty()
+                        || python_shard_requires_distribution_artifact(shard, target))
                 {
                     incomplete.set(true);
                 }
-                artifact_applies && shape_applies
+                if !artifact_applies {
+                    ProcedureSummaryAcceptance::Reject
+                } else if let Some(mapping) = actual_to_formal {
+                    ProcedureSummaryAcceptance::Accept(mapping)
+                } else {
+                    ProcedureSummaryAcceptance::Reject
+                }
             },
         );
+        for record in &mut matched.records {
+            record.matched_target_locator = Some(target.locator().clone());
+            record.matched_call_arguments = target
+                .call_arguments()
+                .map(|arguments| arguments.to_vec().into_boxed_slice());
+        }
         if incomplete.get() || (matched.records.is_empty() && rejected_artifact.get()) {
             matched.applicability = ProcedureSummaryApplicability::Incomplete;
         }
@@ -569,18 +737,30 @@ impl ResolvedActiveSemanticModels {
             .get(semantic_pack_realm("java"))
             .and_then(|owners| owners.get(target.owner_fqn()))
             .and_then(|members| members.get(target.member()));
-        resolve_applicable_procedure_postings_where(
+        let mut matched = resolve_applicable_procedure_postings_where(
             &self.shards,
             shapes,
             target.has_receiver(),
             target.arity(),
             |shard, record| {
-                shard.manifest.language == "java"
+                if shard.manifest.language == "java"
                     && shard.manifest.ecosystem == "jdk"
                     && shard.matching_evidence.binary_search(selected).is_ok()
                     && !record.result_use_obligations.is_empty()
+                {
+                    ProcedureSummaryAcceptance::Accept(None)
+                } else {
+                    ProcedureSummaryAcceptance::Reject
+                }
             },
-        )
+        );
+        for record in &mut matched.records {
+            record.matched_target_locator = Some(target.locator().clone());
+            record.matched_call_arguments = target
+                .call_arguments()
+                .map(|arguments| arguments.to_vec().into_boxed_slice());
+        }
+        matched
     }
 
     /// Cheap candidate filter before resolving a receiver's exact owner. This
@@ -625,7 +805,6 @@ impl ResolvedActiveSemanticModels {
             .procedure_summaries_by_target
             .get(semantic_pack_realm(target.language))
             .and_then(|paths| paths.get(target.path));
-        let maximum_variadic_formals = target.parameter_count.saturating_add(1);
         let postings = symbols.into_iter().flat_map(|symbols| {
             symbols
                 .iter()
@@ -634,19 +813,7 @@ impl ResolvedActiveSemanticModels {
                         .is_some_and(|(_, member)| member == target.member)
                 })
                 .flat_map(move |(_, shapes)| {
-                    shapes
-                        .fixed
-                        .get(&(target.has_receiver, target.parameter_count))
-                        .into_iter()
-                        .chain(
-                            shapes
-                                .variadic
-                                .range(
-                                    (target.has_receiver, 1)
-                                        ..=(target.has_receiver, maximum_variadic_formals),
-                                )
-                                .map(|(_, posting)| posting),
-                        )
+                    fixed_and_variadic_postings(shapes, target.has_receiver, target.parameter_count)
                 })
         });
         resolve_procedure_postings(&self.shards, postings, procedure_declaration_claims_agree)
@@ -797,21 +964,58 @@ fn python_shard_requires_distribution_artifact(
         })
 }
 
-fn procedure_summary_shape_applies_to_target(
+fn procedure_summary_actual_to_formal(
     shard: &ActiveSemanticModelShard,
     summary: &CompiledProcedureSummary,
     target: &UnmaterializedExternalTarget,
-) -> bool {
+) -> Option<Option<Box<[u32]>>> {
     if python_shard_requires_distribution_artifact(shard, target) {
-        let reordered = target.python_actual_to_formal().is_some_and(|mapping| {
-            mapping
-                .iter()
-                .enumerate()
-                .any(|(actual, formal)| actual != *formal as usize)
-        });
-        // Parameter transfers use the proven alias map. Other formal-input
-        // consumers do not yet carry that map, so their claims stay
-        // inapplicable for reordered calls instead of reading the wrong value.
+        if target.python_formal_parameter_count() != Some(summary.target.parameter_count)
+            || target.python_formal_call_shape_accepts_arity(target.arity()) != Some(true)
+        {
+            return None;
+        }
+        let external_mapping = target.python_actual_to_formal()?;
+        if summary.target.formals.is_empty() {
+            // Empty formals preserve the legacy positional summary contract:
+            // Python default omission is callable, but this summary cannot
+            // prove the omitted formal's default-aware transfer semantics.
+            if summary.target.variadic || target.arity() != summary.target.parameter_count {
+                return None;
+            }
+        }
+        let summary_mapping = if summary.target.formals.is_empty() {
+            None
+        } else {
+            if summary.target.formals.len() != summary.target.parameter_count as usize
+                || target.python_defaulted_formals().is_none_or(|defaults| {
+                    defaults.len() != summary.target.formals.len()
+                        || defaults
+                            .iter()
+                            .zip(&summary.target.formals)
+                            .any(|(defaulted, formal)| *defaulted != formal.optional)
+                })
+            {
+                return None;
+            }
+            let layout = summary_formal_layout(&summary.target)?;
+            let summary_mapping =
+                crate::analyzer::usages::call_binding::bind_semantic_call_arguments(
+                    target.call_arguments()?,
+                    &layout,
+                )?;
+            if summary_mapping.as_ref() != external_mapping {
+                return None;
+            }
+            Some(summary_mapping)
+        };
+        let mapping = summary_mapping
+            .as_deref()
+            .unwrap_or(external_mapping.as_ref());
+        let reordered = mapping_reorders_fixed_formals(mapping, &summary.target.formals);
+        // The retained mapping reaches summary transfers. Other formal-input
+        // consumers do not yet carry it, so keep their claims incomplete when
+        // a keyword call reorders those inputs.
         let mapped_claims_supported = !reordered
             || (summary.locations.is_empty()
                 && summary.effects.is_empty()
@@ -824,13 +1028,104 @@ fn procedure_summary_shape_applies_to_target(
                 && summary.normal_return_refinements.is_empty()
                 && summary.normal_return_type_refinements.is_empty()
                 && summary.class_decorator_identity.is_none());
-        mapped_claims_supported
-            && !summary.target.variadic
-            && target.python_formal_parameter_count() == Some(summary.target.parameter_count)
-            && target.python_formal_call_shape_accepts_arity(target.arity()) == Some(true)
+        mapped_claims_supported.then(|| Some(mapping.to_vec().into_boxed_slice()))
+    } else if !summary.target.formals.is_empty() {
+        let layout = summary_formal_layout(&summary.target)?;
+        let mapping = crate::analyzer::usages::call_binding::bind_semantic_call_arguments(
+            target.call_arguments()?,
+            &layout,
+        )?;
+        if mapping.len() != target.arity() as usize {
+            return None;
+        }
+        let reordered = mapping_reorders_fixed_formals(&mapping, &summary.target.formals);
+        let mapped_claims_supported = !reordered
+            || (summary.locations.is_empty()
+                && summary.effects.is_empty()
+                && summary.concurrency_effects.is_empty()
+                && summary.preconditions.as_ref().is_none_or(Vec::is_empty)
+                && summary.result_contracts.is_empty()
+                && summary.result_use_obligations.is_empty()
+                && summary.conditional_result_refinements.is_empty()
+                && summary.conditional_indirect_writes.is_empty()
+                && summary.normal_return_refinements.is_empty()
+                && summary.normal_return_type_refinements.is_empty()
+                && summary.class_decorator_identity.is_none());
+        mapped_claims_supported.then_some(Some(mapping))
     } else {
-        summary.target.accepts_parameter_count(target.arity())
+        summary
+            .target
+            .accepts_parameter_count(target.arity())
+            .then_some(None)
     }
+}
+
+fn summary_formal_layout(target: &CompiledProcedureTarget) -> Option<FormalParameterLayout> {
+    if target.formals.len() != target.parameter_count as usize {
+        return None;
+    }
+    let sentinel = crate::analyzer::Range {
+        start_byte: 0,
+        end_byte: 0,
+        start_line: 0,
+        end_line: 0,
+    };
+    Some(FormalParameterLayout {
+        slots: target
+            .formals
+            .iter()
+            .map(|formal| FormalParameterSlot {
+                names: vec![formal.name.clone()],
+                declaration_range: sentinel,
+                receiver: false,
+                passing_mode: match formal.passing_mode {
+                    AuthoredProcedureFormalPassingMode::PositionalOnly => {
+                        FormalParameterPassingMode::PositionalOnly
+                    }
+                    AuthoredProcedureFormalPassingMode::PositionalOrNamed => {
+                        FormalParameterPassingMode::PositionalOrNamed
+                    }
+                    AuthoredProcedureFormalPassingMode::NamedOnly => {
+                        FormalParameterPassingMode::NamedOnly
+                    }
+                },
+                variadic: formal.variadic_kind.map(|kind| match kind {
+                    AuthoredProcedureFormalVariadicKind::Positional => {
+                        FormalVariadicKind::Positional
+                    }
+                    AuthoredProcedureFormalVariadicKind::Keyword => FormalVariadicKind::Keyword,
+                    AuthoredProcedureFormalVariadicKind::Both => FormalVariadicKind::Both,
+                }),
+                default_range: formal.optional.then_some(sentinel),
+            })
+            .collect(),
+        python_binding: None,
+    })
+}
+
+fn mapping_reorders_fixed_formals(mapping: &[u32], formals: &[AuthoredProcedureFormal]) -> bool {
+    // Fixed-arity summaries without declared slots still carry the exact
+    // external mapping; only its identity permutation leaves inputs in place.
+    if formals.is_empty() {
+        return mapping
+            .iter()
+            .enumerate()
+            .any(|(actual, formal)| actual != *formal as usize);
+    }
+    let mut previous_fixed_formal = None;
+    for formal in mapping {
+        let Some(formal_shape) = formals.get(*formal as usize) else {
+            return true;
+        };
+        if formal_shape.variadic_kind.is_some() {
+            continue;
+        }
+        if previous_fixed_formal.is_some_and(|previous| *formal < previous) {
+            return true;
+        }
+        previous_fixed_formal = Some(*formal);
+    }
+    false
 }
 
 fn evidence_is_exact_python_distribution_artifact(
@@ -970,12 +1265,15 @@ impl<'a> ProcedureSummaryMemberKey<'a> {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 #[non_exhaustive]
 pub struct ActivatedProcedureSummary<'a> {
     pub record: &'a CompiledProcedureSummary,
     pub shard: &'a ActiveSemanticModelShard,
     pub payload: &'a [CompiledProcedureSummary],
+    actual_to_formal: Option<Box<[u32]>>,
+    matched_target_locator: Option<SemanticLocator>,
+    matched_call_arguments: Option<Box<[crate::analyzer::semantic::SemanticCallArgument]>>,
 }
 
 /// Analyzer-minted evidence that one activated authored summary applies to one
@@ -994,6 +1292,7 @@ pub struct UnmaterializedExternalSummaryCallShapeBinding {
     content: StableDigest,
     contract_version: u32,
     covers_overrides: bool,
+    review_accepted: bool,
 }
 
 impl UnmaterializedExternalSummaryCallShapeBinding {
@@ -1026,9 +1325,17 @@ impl UnmaterializedExternalSummaryCallShapeBinding {
     pub const fn covers_overrides(&self) -> bool {
         self.covers_overrides
     }
+
+    pub const fn review_accepted(&self) -> bool {
+        self.review_accepted
+    }
 }
 
 impl<'a> ActivatedProcedureSummary<'a> {
+    pub const fn review_accepted(&self) -> bool {
+        self.shard.review_accepted
+    }
+
     /// Prove that this activated record applies to the resolver-owned exact
     /// call shape. This is an applicability proof, not a consumer-specific
     /// winner selection: consumers may impose stricter conflict semantics.
@@ -1043,7 +1350,8 @@ impl<'a> ActivatedProcedureSummary<'a> {
                 .language()
                 .accepts_semantic_pack_language(&self.shard.manifest.language)
             || self.record.target.has_receiver != target.has_receiver()
-            || !procedure_summary_shape_applies_to_target(self.shard, self.record, target)
+            || self.matched_target_locator.as_ref() != Some(target.locator())
+            || self.matched_call_arguments.as_deref() != target.call_arguments()
             || target.locator_for_arity(target.arity()) != *target.locator()
             || authored_procedure_target_identity(
                 &self.record.target.path,
@@ -1056,12 +1364,13 @@ impl<'a> ActivatedProcedureSummary<'a> {
         }
         Some(UnmaterializedExternalSummaryCallShapeBinding {
             actual_locator: target.locator().clone(),
-            actual_to_formal: target.python_actual_to_formal().map(Into::into),
+            actual_to_formal: self.actual_to_formal.clone(),
             formal_locator: target.formal_summary_locator(self.record.target.parameter_count),
             model_id: self.record.model_id.clone().into_boxed_str(),
             content: StableDigest::from_array(content),
             contract_version: self.record.contract_version,
             covers_overrides: self.record.covers_overrides,
+            review_accepted: self.shard.review_accepted,
         })
     }
 
@@ -1139,6 +1448,122 @@ impl<'a> ActivatedProcedureSummary<'a> {
         Some(&self.record.result_use_obligations)
     }
 
+    /// Bind reviewed result-use obligations to one exact call shape for any
+    /// language adapter. The caller supplies the activation row selected by
+    /// that adapter; this method verifies that the row is one of this shard's
+    /// actual matching evidence and that the analyzer-minted call shape agrees
+    /// with the authored summary. Dispatch-arm agreement remains a consumer
+    /// operation over these bindings, so the same proof can serve Java later
+    /// without changing the existing Java adapter today.
+    pub fn bind_reviewed_result_use_obligations(
+        &self,
+        target: ReviewedObligationTarget<'_>,
+    ) -> Result<ReviewedObligationBinding<'a>, ReviewedObligationBindFailure> {
+        if self.record.result_use_obligations.is_empty() {
+            return Err(ReviewedObligationBindFailure::NoObligation);
+        }
+        if !target
+            .target
+            .language()
+            .accepts_semantic_pack_language(&self.shard.manifest.language)
+        {
+            return Err(ReviewedObligationBindFailure::LanguageMismatch);
+        }
+        if self
+            .shard
+            .matching_evidence
+            .binary_search(target.evidence)
+            .is_err()
+        {
+            return Err(ReviewedObligationBindFailure::EvidenceUnselected);
+        }
+        if let ReviewedObligationBasis::BuiltinReceiverAssumption(assumption) = target.basis
+            && (target.target.language().semantic_pack_label() != assumption.language()
+                || !target.target.has_receiver()
+                || target.target.owner_fqn() != assumption.receiver())
+        {
+            return Err(ReviewedObligationBindFailure::BasisMismatch);
+        }
+        if matches!(
+            target.basis,
+            ReviewedObligationBasis::PythonStandardLibraryFunction
+        ) && (target.target.language().semantic_pack_label() != "python"
+            || !target.target.has_resolver_owned_call_shape()
+            || target.target.has_receiver()
+            || target.evidence.language != "python"
+            || target.evidence.ecosystem != "python"
+            || target
+                .evidence
+                .toolchain
+                .as_ref()
+                .map(|toolchain| toolchain.name.as_str())
+                != Some("cpython"))
+        {
+            return Err(ReviewedObligationBindFailure::BasisMismatch);
+        }
+        if matches!(target.basis, ReviewedObligationBasis::ExactLiteralReceiver)
+            && (target.target.language() != LanguageDialect::Standard(Language::JavaScript)
+                || !target.target.has_receiver()
+                || target.target.owner_fqn() != "String")
+        {
+            return Err(ReviewedObligationBindFailure::BasisMismatch);
+        }
+        if self.bind_unmaterialized_call_shape(target.target).is_none() {
+            return Err(ReviewedObligationBindFailure::CallShapeMismatch);
+        }
+        Ok(ReviewedObligationBinding {
+            obligations: &self.record.result_use_obligations,
+            basis: target.basis,
+            ordinary_heap_unchanged: self.record.ordinary_heap_unchanged,
+            covers_overrides: self.record.covers_overrides,
+        })
+    }
+
+    /// Bind reviewed result-use obligations to an artifact-backed external
+    /// declaration. The declaration locator is resolver-owned evidence, so it
+    /// supplies the path and member shape that an unmaterialized target cannot
+    /// carry. Callers still select the exact generated external artifact
+    /// before invoking this method.
+    pub fn bind_reviewed_result_use_obligations_for_declaration(
+        &self,
+        target: ProcedureSummaryDeclarationKey<'_>,
+        evidence: &SemanticModelActivationEvidence,
+        basis: ReviewedObligationBasis,
+    ) -> Result<ReviewedObligationBinding<'a>, ReviewedObligationBindFailure> {
+        if self.record.result_use_obligations.is_empty() {
+            return Err(ReviewedObligationBindFailure::NoObligation);
+        }
+        let Some(language) = LanguageDialect::from_config_label(target.language) else {
+            return Err(ReviewedObligationBindFailure::LanguageMismatch);
+        };
+        if !language.accepts_semantic_pack_language(&self.shard.manifest.language) {
+            return Err(ReviewedObligationBindFailure::LanguageMismatch);
+        }
+        if self
+            .shard
+            .matching_evidence
+            .binary_search(evidence)
+            .is_err()
+        {
+            return Err(ReviewedObligationBindFailure::EvidenceUnselected);
+        }
+        let record_target = &self.record.target;
+        if record_target.path != target.path
+            || record_target.has_receiver != target.has_receiver
+            || record_target.parameter_count != target.parameter_count
+            || authored_procedure_target_identity(&record_target.path, &record_target.symbol)
+                .is_none_or(|(_, member)| member != target.member)
+        {
+            return Err(ReviewedObligationBindFailure::CallShapeMismatch);
+        }
+        Ok(ReviewedObligationBinding {
+            obligations: &self.record.result_use_obligations,
+            basis,
+            ordinary_heap_unchanged: self.record.ordinary_heap_unchanged,
+            covers_overrides: self.record.covers_overrides,
+        })
+    }
+
     /// Outcome-sensitive predicate effects this reviewed summary attributes to
     /// its boolean normal results.
     pub fn conditional_result_refinements(&self) -> &'a [CompiledConditionalResultRefinement] {
@@ -1210,6 +1635,11 @@ pub struct ProcedureSummaryMatch<'a> {
     pub fallback_candidates_examined: usize,
 }
 
+enum ProcedureSummaryAcceptance {
+    Reject,
+    Accept(Option<Box<[u32]>>),
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RuleTriggerKey<'a> {
     LanguageConstruct(&'a str),
@@ -1229,10 +1659,15 @@ struct RecordAddress {
 #[derive(Debug, Default)]
 struct ProcedureSummaryShapePostings {
     fixed: HashMap<(bool, u32), Vec<RecordAddress>>,
-    /// Variadic postings are keyed by total formal count, including the final
-    /// variadic formal. Ordered storage makes the applicable-prefix scan both
-    /// bounded by the number of authored shapes and deterministic.
+    /// Variadic postings keyed by total formal count, including the final rest
+    /// formal, for exact declaration lookup.
     variadic: BTreeMap<(bool, u32), Vec<RecordAddress>>,
+    /// Applicability postings keyed by the minimum number of direct actuals
+    /// required by structured fixed formals.
+    variadic_by_minimum_arity: BTreeMap<(bool, u32), Vec<RecordAddress>>,
+    /// Optional-formal postings are keyed by receiver shape, minimum required
+    /// actual count, and total formal count for exact external-call binding.
+    optional_fixed: BTreeMap<(bool, u32, u32), Vec<RecordAddress>>,
     /// Coarse construction hint, split by receiver shape. A true bit says only
     /// that some indexed record authored the claim; matcher precedence and
     /// conflicts still decide the effective candidate index below.
@@ -1540,6 +1975,35 @@ impl MatcherIndexes {
                             &mut working_bytes,
                             limits,
                         )?;
+                        if !summary.target.formals.is_empty()
+                            && summary.target.formals.iter().any(|formal| formal.optional)
+                        {
+                            let minimum_actual_count = u32::try_from(
+                                summary
+                                    .target
+                                    .formals
+                                    .iter()
+                                    .filter(|formal| !formal.optional)
+                                    .count(),
+                            )
+                            .expect("validated formal count fits u32");
+                            let formal_count = summary.target.parameter_count;
+                            charge_posting_entry(
+                                member_key_bytes.saturating_add(size_of::<u32>() * 2),
+                                &mut entries,
+                                &mut working_bytes,
+                                limits,
+                            )?;
+                            shapes
+                                .optional_fixed
+                                .entry((
+                                    summary.target.has_receiver,
+                                    minimum_actual_count,
+                                    formal_count,
+                                ))
+                                .or_default()
+                                .push(address);
+                        }
                         shapes.raw_normal_continuation_absence_claim
                             [usize::from(summary.target.has_receiver)] |=
                             summary.normal_continuation_absent;
@@ -1720,9 +2184,9 @@ fn build_normal_continuation_absence_candidates(
                     poll_matcher_cancellation(cancellation, 0)?;
 
                     // A fixed record exists only at A, while a variadic record
-                    // begins at F-1 and remains applicable. The candidate set
-                    // can therefore change only at each fixed A, immediately
-                    // after it disappears, or at a variadic minimum.
+                    // begins at its required fixed-formal count and remains
+                    // applicable. The candidate set changes at each fixed A,
+                    // immediately after it disappears, or at a variadic minimum.
                     let mut representative_arities = Vec::new();
                     for &(receiver, arity) in shapes.fixed.keys() {
                         if receiver != has_receiver {
@@ -1733,15 +2197,12 @@ fn build_normal_continuation_absence_candidates(
                             representative_arities.push(successor);
                         }
                     }
-                    for &(receiver, formal_count) in shapes.variadic.keys() {
+                    for &(receiver, minimum_actual_count) in shapes.variadic_by_minimum_arity.keys()
+                    {
                         if receiver != has_receiver {
                             continue;
                         }
-                        assert!(
-                            formal_count > 0,
-                            "validated variadic summaries declare their final formal"
-                        );
-                        representative_arities.push(formal_count - 1);
+                        representative_arities.push(minimum_actual_count);
                     }
                     representative_arities.sort_unstable();
                     representative_arities.dedup();
@@ -1751,16 +2212,15 @@ fn build_normal_continuation_absence_candidates(
                     // fixed posting address once, rather than rescanning the
                     // full variadic prefix at every boundary.
                     let mut variadic_postings = shapes
-                        .variadic
-                        .range((has_receiver, 1)..=(has_receiver, u32::MAX))
+                        .variadic_by_minimum_arity
+                        .range((has_receiver, 0)..=(has_receiver, u32::MAX))
                         .peekable();
                     let mut effective_variadic = EffectiveProcedureClaims::default();
                     let mut effective = false;
                     for arity in representative_arities {
                         poll_matcher_cancellation(cancellation, 0)?;
-                        let maximum_variadic_formals = arity.saturating_add(1);
                         while let Some((shape, _posting)) = variadic_postings.peek() {
-                            if shape.1 > maximum_variadic_formals {
+                            if shape.1 > arity {
                                 break;
                             }
                             let (_shape, posting) = variadic_postings
@@ -1858,6 +2318,20 @@ fn charge_posting_entry(
     )
 }
 
+fn procedure_summary_minimum_actual_count(target: &CompiledProcedureTarget) -> u32 {
+    if target.formals.is_empty() {
+        return target.parameter_count.saturating_sub(1);
+    }
+    u32::try_from(
+        target
+            .formals
+            .iter()
+            .filter(|formal| !formal.optional && formal.variadic_kind.is_none())
+            .count(),
+    )
+    .expect("validated procedure formal count fits u32")
+}
+
 fn charge_index_entry(
     retained_bytes: usize,
     entries: &mut usize,
@@ -1893,6 +2367,20 @@ fn insert_procedure_posting(
     if target.variadic {
         charge_posting_entry(key_bytes, entries, working_bytes, limits)?;
         shapes.variadic.entry(key).or_default().push(address);
+        charge_posting_entry(
+            key_bytes.saturating_add(size_of::<u32>()),
+            entries,
+            working_bytes,
+            limits,
+        )?;
+        shapes
+            .variadic_by_minimum_arity
+            .entry((
+                target.has_receiver,
+                procedure_summary_minimum_actual_count(target),
+            ))
+            .or_default()
+            .push(address);
         Ok(())
     } else {
         insert_posting(
@@ -2066,6 +2554,7 @@ fn procedure_claims_agree(
         && left.normal_return_refinements == right.normal_return_refinements
         && left.normal_return_type_refinements == right.normal_return_type_refinements
         && left.class_decorator_identity == right.class_decorator_identity
+        && left.target.formals == right.target.formals
 }
 
 fn resolve_exact_procedure_postings<'a>(
@@ -2098,7 +2587,7 @@ fn resolve_applicable_procedure_postings<'a>(
         shapes,
         has_receiver,
         actual_parameter_count,
-        |_, _| true,
+        |_, _| ProcedureSummaryAcceptance::Accept(None),
     )
 }
 
@@ -2107,7 +2596,10 @@ fn resolve_applicable_procedure_postings_where<'a>(
     shapes: Option<&ProcedureSummaryShapePostings>,
     has_receiver: bool,
     actual_parameter_count: u32,
-    accepts_record: impl Fn(&ActiveSemanticModelShard, &CompiledProcedureSummary) -> bool,
+    accepts_record: impl Fn(
+        &ActiveSemanticModelShard,
+        &CompiledProcedureSummary,
+    ) -> ProcedureSummaryAcceptance,
 ) -> ProcedureSummaryMatch<'a> {
     resolve_applicable_procedure_postings_where_for_counts(
         shards,
@@ -2123,7 +2615,10 @@ fn resolve_applicable_procedure_postings_where_for_counts<'a>(
     shapes: Option<&ProcedureSummaryShapePostings>,
     has_receiver: bool,
     actual_parameter_counts: &[u32],
-    accepts_record: impl Fn(&ActiveSemanticModelShard, &CompiledProcedureSummary) -> bool,
+    accepts_record: impl Fn(
+        &ActiveSemanticModelShard,
+        &CompiledProcedureSummary,
+    ) -> ProcedureSummaryAcceptance,
 ) -> ProcedureSummaryMatch<'a> {
     let Some(shapes) = shapes else {
         return empty_procedure_match();
@@ -2133,19 +2628,39 @@ fn resolve_applicable_procedure_postings_where_for_counts<'a>(
     parameter_counts.dedup();
     let mut postings = Vec::new();
     for actual_parameter_count in parameter_counts {
-        // A variadic target's total formal count is one greater than its
-        // minimum accepted actual count. Saturation keeps the full valid
-        // prefix available for the largest representable call shape.
-        let maximum_variadic_formals = actual_parameter_count.saturating_add(1);
-        postings.extend(shapes.fixed.get(&(has_receiver, actual_parameter_count)));
+        postings.extend(fixed_and_variadic_postings(
+            shapes,
+            has_receiver,
+            actual_parameter_count,
+        ));
         postings.extend(
             shapes
-                .variadic
-                .range((has_receiver, 1)..=(has_receiver, maximum_variadic_formals))
+                .optional_fixed
+                .range(
+                    (has_receiver, 0, actual_parameter_count)
+                        ..=(has_receiver, actual_parameter_count, u32::MAX),
+                )
                 .map(|(_key, posting)| posting),
         );
     }
     resolve_procedure_postings_where(shards, postings, procedure_claims_agree, accepts_record)
+}
+
+fn fixed_and_variadic_postings<'a>(
+    shapes: &'a ProcedureSummaryShapePostings,
+    has_receiver: bool,
+    parameter_count: u32,
+) -> impl Iterator<Item = &'a Vec<RecordAddress>> + 'a {
+    shapes
+        .fixed
+        .get(&(has_receiver, parameter_count))
+        .into_iter()
+        .chain(
+            shapes
+                .variadic_by_minimum_arity
+                .range((has_receiver, 0)..=(has_receiver, parameter_count))
+                .map(|(_, posting)| posting),
+        )
 }
 
 fn procedure_match_proves_normal_continuation_absent(matched: &ProcedureSummaryMatch<'_>) -> bool {
@@ -2171,14 +2686,19 @@ fn resolve_procedure_postings<'a, 'posting>(
     postings: impl IntoIterator<Item = &'posting Vec<RecordAddress>>,
     claims_agree: fn(&CompiledProcedureSummary, &CompiledProcedureSummary) -> bool,
 ) -> ProcedureSummaryMatch<'a> {
-    resolve_procedure_postings_where(shards, postings, claims_agree, |_, _| true)
+    resolve_procedure_postings_where(shards, postings, claims_agree, |_, _| {
+        ProcedureSummaryAcceptance::Accept(None)
+    })
 }
 
 fn resolve_procedure_postings_where<'a, 'posting>(
     shards: &'a [ActiveSemanticModelShard],
     postings: impl IntoIterator<Item = &'posting Vec<RecordAddress>>,
     claims_agree: fn(&CompiledProcedureSummary, &CompiledProcedureSummary) -> bool,
-    accepts_record: impl Fn(&ActiveSemanticModelShard, &CompiledProcedureSummary) -> bool,
+    accepts_record: impl Fn(
+        &ActiveSemanticModelShard,
+        &CompiledProcedureSummary,
+    ) -> ProcedureSummaryAcceptance,
 ) -> ProcedureSummaryMatch<'a> {
     let mut candidates_examined = 0usize;
     let mut best_rank = None;
@@ -2195,7 +2715,14 @@ fn resolve_procedure_postings_where<'a, 'posting>(
             let record = payload
                 .get(address.record as usize)
                 .expect("procedure-summary index address must resolve to its record");
-            if !accepts_record(shard, record) {
+            let actual_to_formal = match accepts_record(shard, record) {
+                ProcedureSummaryAcceptance::Reject => continue,
+                ProcedureSummaryAcceptance::Accept(mapping) => mapping,
+            };
+            if records.iter().any(|candidate| {
+                claims_agree(candidate.record, record)
+                    && candidate.actual_to_formal == actual_to_formal
+            }) {
                 continue;
             }
             let rank = (shard.evidence_rank, shard.source_rank);
@@ -2216,6 +2743,9 @@ fn resolve_procedure_postings_where<'a, 'posting>(
                 record,
                 shard,
                 payload,
+                actual_to_formal,
+                matched_target_locator: None,
+                matched_call_arguments: None,
             });
         }
     }
@@ -2236,7 +2766,9 @@ fn procedure_declaration_claims_agree(
     left: &CompiledProcedureSummary,
     right: &CompiledProcedureSummary,
 ) -> bool {
-    left.target.variadic == right.target.variadic && procedure_claims_agree(left, right)
+    left.target.variadic == right.target.variadic
+        && left.target.formals == right.target.formals
+        && procedure_claims_agree(left, right)
 }
 
 #[derive(Debug)]
@@ -2359,8 +2891,8 @@ impl SemanticModelRuntimeCache {
         }
     }
 
-    /// Retain one discovery run's evidence for every language its ecosystem serves.
-    /// Production hosts use the atomic activation method instead.
+    /// Retain discovery evidence for trace tests without invoking discovery
+    /// from the query path.
     #[cfg(test)]
     pub(crate) fn retain_dependency_discovery_evidence(
         &self,
@@ -2378,7 +2910,6 @@ impl SemanticModelRuntimeCache {
                 .insert(*language, Arc::clone(&evidence));
         }
     }
-
     pub(crate) fn dependency_discovery_evidence(
         &self,
         language: Language,
@@ -2414,8 +2945,7 @@ impl SemanticModelRuntimeCache {
     }
 
     pub(crate) fn overlay(&self) -> Option<Arc<SemanticModelOverlay>> {
-        self.snapshot()
-            .and_then(|snapshot| snapshot.semantic_model_overlay().map(Arc::clone))
+        self.snapshot().and_then(|snapshot| snapshot.overlay())
     }
 
     fn publish_overlay(
@@ -2644,7 +3174,7 @@ pub fn resolve_active_semantic_models(
         }
     }
     report.catalog_candidates = candidates.len();
-    report.phase_measurements.selection_nanos = elapsed_nanos(selection_started);
+    report.phase_measurements.selection_nanos = elapsed_ns(selection_started);
 
     let mut selected = Vec::<CandidateSelection>::new();
     let mut incomplete = false;
@@ -2674,7 +3204,7 @@ pub fn resolve_active_semantic_models(
                 continue;
             }
         };
-        decode_hydration_nanos = decode_hydration_nanos.saturating_add(elapsed_nanos(load_started));
+        decode_hydration_nanos = decode_hydration_nanos.saturating_add(elapsed_ns(load_started));
         report.loaded_shards = report.loaded_shards.saturating_add(1);
         report.loaded_records = report
             .loaded_records
@@ -2765,12 +3295,22 @@ pub fn resolve_active_semantic_models(
         }
 
         let descriptor = candidate.descriptor();
+        let review_accepted = request.controls.iter().any(|receipt| {
+            receipt.action == SemanticModelControlAction::AcceptReviewed
+                && receipt.selector.pack_id == loaded.manifest.pack_id
+                && receipt.selector.manifest_digest.as_deref()
+                    == Some(loaded.manifest.content_sha256.as_str())
+                && receipt.selector.version.as_ref().is_none_or(|range| {
+                    Version::parse(&loaded.manifest.version)
+                        .is_ok_and(|version| range.matches(&version))
+                })
+        });
         selected.push(CandidateSelection {
             semantic_sha256: descriptor.semantic_sha256.clone(),
             payload_kind: descriptor.payload_kind,
             evidence_rank,
             matched_requirements,
-            source_rank: source_rank(loaded.source_kind),
+            source_rank: loaded.source_kind.precedence(),
             active: ActiveSemanticModelShard {
                 manifest: loaded.manifest,
                 shard: loaded.shard,
@@ -2778,8 +3318,9 @@ pub fn resolve_active_semantic_models(
                 source_id: loaded.source_id,
                 matched_evidence,
                 matching_evidence,
+                review_accepted,
                 evidence_rank,
-                source_rank: source_rank(loaded.source_kind),
+                source_rank: loaded.source_kind.precedence(),
             },
         });
     }
@@ -2950,7 +3491,7 @@ pub fn resolve_active_semantic_models(
             };
         }
     };
-    report.phase_measurements.matcher_construction_nanos = elapsed_nanos(matcher_started);
+    report.phase_measurements.matcher_construction_nanos = elapsed_ns(matcher_started);
     report.phase_measurements.catalog_sql_statements = catalog
         .sql_statement_count()
         .saturating_sub(activation_sql_start);
@@ -2961,6 +3502,7 @@ pub fn resolve_active_semantic_models(
         )
     });
     let resolved = ResolvedActiveSemanticModels {
+        source_reader: Some(catalog.runtime_source_reader()),
         active_model_set_hash,
         shards,
         indexes,
@@ -2976,10 +3518,6 @@ pub fn resolve_active_semantic_models(
     } else {
         SemanticModelResolutionOutcome::Ready(resolved)
     }
-}
-
-fn elapsed_nanos(started: Instant) -> u64 {
-    started.elapsed().as_nanos().try_into().unwrap_or(u64::MAX)
 }
 
 pub fn acquire_active_semantic_models(
@@ -3344,6 +3882,7 @@ fn runtime_request_key(request: &SemanticModelActivationRequest) -> Result<Strin
             hasher.update([match control.action {
                 SemanticModelControlAction::Enable => 0,
                 SemanticModelControlAction::Disable => 1,
+                SemanticModelControlAction::AcceptReviewed => 2,
             }]);
             hash_key_part(&mut hasher, &control.selector.pack_id);
             hash_optional_key_part(
@@ -3392,8 +3931,7 @@ fn runtime_request_key(request: &SemanticModelActivationRequest) -> Result<Strin
 }
 
 fn hash_key_part(hasher: &mut Sha256, value: &str) {
-    hasher.update((value.len() as u64).to_be_bytes());
-    hasher.update(value.as_bytes());
+    write_length_prefixed(hasher, value.as_bytes());
 }
 
 fn hash_optional_key_part(hasher: &mut Sha256, value: Option<&str>) {
@@ -3467,7 +4005,11 @@ fn validate_and_canonicalize_request(
         }
     }
     let mut control_actions = BTreeMap::new();
-    for control in &request.controls {
+    for control in request
+        .controls
+        .iter()
+        .filter(|control| control.action != SemanticModelControlAction::AcceptReviewed)
+    {
         let key = (
             control.scope,
             control.selector.pack_id.as_str(),
@@ -3717,12 +4259,16 @@ fn strict_coordinate_matches(
     match (selector, evidence) {
         (None, _) => true,
         (Some(_), None) => false,
-        (Some(selector), Some(evidence)) if selector.name != evidence.name => false,
+        (Some(selector), Some(evidence))
+            if !strict_coordinate_names_match(Some(selector), Some(evidence)) =>
+        {
+            false
+        }
         (Some(selector), Some(evidence)) => match (&selector.version, &evidence.version) {
             (None, _) => true,
             (Some(_), None) => false,
             (Some(requirement), Some(version)) => {
-                VersionReq::parse(requirement).is_ok_and(|requirement| requirement.matches(version))
+                coordinate_version_matches(requirement, version).is_ok_and(std::convert::identity)
             }
         },
     }
@@ -3733,8 +4279,10 @@ fn strict_coordinate_matches(
 /// explanation names the workspace version and the pack requirement (#1884).
 /// When no evidence row names a coordinate the selector requires at all, the
 /// explanation names the missing coordinate and the selector's remaining
-/// predicates, so a caller can act on it (#3462). Every other rejection keeps
-/// the generic statement.
+/// predicates, so a caller can act on it (#3462). When a row names the
+/// coordinate but misses the selector's target, configuration, or artifact
+/// digest, the explanation names those predicates (#3464). Every other
+/// rejection keeps the generic statement.
 fn strict_activation_mismatch_reason(
     manifest: &CompiledPackManifest,
     shard: &CompiledShard,
@@ -3778,6 +4326,7 @@ fn strict_activation_mismatch_reason(
             };
         }
     }
+    let mut unmet_predicates = None;
     for selector in shard.activation() {
         for row in scoped() {
             if !strict_coordinate_names_match(selector.package.as_ref(), row.package.as_ref())
@@ -3789,20 +4338,35 @@ fn strict_activation_mismatch_reason(
             {
                 continue;
             }
-            let non_version_predicates_pass = (selector.targets.is_empty()
-                || row
+            let mut unmet = Vec::new();
+            if !selector.targets.is_empty()
+                && !row
                     .target
                     .as_ref()
-                    .is_some_and(|target| selector.targets.contains(target)))
-                && (selector.configurations.is_empty()
-                    || row.configuration.as_ref().is_some_and(|configuration| {
-                        selector.configurations.contains(configuration)
-                    }))
-                && selector
-                    .artifact_sha256
+                    .is_some_and(|target| selector.targets.contains(target))
+            {
+                unmet.push(format!("target {}", selector.targets.join(", ")));
+            }
+            if !selector.configurations.is_empty()
+                && !row
+                    .configuration
                     .as_ref()
-                    .is_none_or(|expected| row.artifact_sha256.as_ref() == Some(expected));
-            if !non_version_predicates_pass {
+                    .is_some_and(|configuration| selector.configurations.contains(configuration))
+            {
+                unmet.push(format!(
+                    "profile configuration {}",
+                    selector.configurations.join(", ")
+                ));
+            }
+            if let Some(expected) = &selector.artifact_sha256
+                && row.artifact_sha256.as_ref() != Some(expected)
+            {
+                unmet.push(format!("artifact sha256 {expected}"));
+            }
+            if !unmet.is_empty() {
+                unmet_predicates.get_or_insert_with(|| {
+                    named_coordinate_unmet_predicates_reason(selector, &unmet)
+                });
                 continue;
             }
             for (axis, coordinate_selector, coordinate_evidence) in [
@@ -3857,7 +4421,40 @@ fn strict_activation_mismatch_reason(
             return reason;
         }
     }
-    "complete activation evidence does not satisfy the manifest and shard selector".to_owned()
+    unmet_predicates.unwrap_or_else(|| {
+        "complete activation evidence does not satisfy the manifest and shard selector".to_owned()
+    })
+}
+
+/// Name the selector predicates an evidence row that names the selector's
+/// coordinate does not satisfy. A declared toolchain names the coordinate of a
+/// pack whose selector also binds the exact artifact it was produced from, and
+/// without this the rejection read as the generic statement.
+fn named_coordinate_unmet_predicates_reason(
+    selector: &ActivationSelector,
+    unmet: &[String],
+) -> String {
+    let named = [
+        ("package", &selector.package),
+        ("module", &selector.module),
+        ("toolchain", &selector.toolchain),
+    ]
+    .into_iter()
+    .filter_map(|(axis, coordinate)| {
+        coordinate
+            .as_ref()
+            .map(|coordinate| format!("{axis} {}", coordinate.name))
+    })
+    .collect::<Vec<_>>();
+    let evidence = if named.is_empty() {
+        "the language and ecosystem".to_owned()
+    } else {
+        named.join(" and ")
+    };
+    format!(
+        "activation evidence names {evidence}, but the shard selector also requires {}",
+        unmet.join(", ")
+    )
 }
 
 /// Name the activation evidence a selector requires when no evidence row names
@@ -3899,7 +4496,7 @@ fn missing_activation_evidence_reason(selector: &ActivationSelector) -> Option<S
 
 /// The name half of `strict_coordinate_matches`: whether the evidence names
 /// the selector's coordinate at all.
-fn strict_coordinate_names_match(
+pub(super) fn strict_coordinate_names_match(
     selector: Option<&super::NameSelector>,
     evidence: Option<&CatalogCoordinate>,
 ) -> bool {
@@ -3908,6 +4505,13 @@ fn strict_coordinate_names_match(
         (Some(_), None) => false,
         (Some(selector), Some(evidence)) => selector.name == evidence.name,
     }
+}
+
+pub(super) fn coordinate_version_matches(
+    requirement: &str,
+    version: &Version,
+) -> Result<bool, semver::Error> {
+    Ok(VersionReq::parse(requirement)?.matches(version))
 }
 
 fn selector_rank(selector: &ActivationSelector) -> EvidenceRank {
@@ -3938,7 +4542,8 @@ fn effective_control(
     let mut matched = controls
         .iter()
         .filter(|control| {
-            control.selector.pack_id == manifest.pack_id
+            control.action != SemanticModelControlAction::AcceptReviewed
+                && control.selector.pack_id == manifest.pack_id
                 && control
                     .selector
                     .version
@@ -3991,17 +4596,6 @@ fn compare_selection(left: &CandidateSelection, right: &CandidateSelection) -> O
         .then_with(|| left.active.source_id.cmp(&right.active.source_id))
 }
 
-fn source_rank(kind: CatalogPackSourceKind) -> u8 {
-    match kind {
-        CatalogPackSourceKind::Embedded => 0,
-        CatalogPackSourceKind::PreShipped => 1,
-        CatalogPackSourceKind::Installed => 2,
-        CatalogPackSourceKind::Generated => 3,
-        CatalogPackSourceKind::WorkspaceProduced => 4,
-        CatalogPackSourceKind::EphemeralWorkspace => 5,
-    }
-}
-
 fn active_model_set_hash(
     active: &[CandidateSelection],
     extraction_gaps: &[ActivePackExtractionGap],
@@ -4049,6 +4643,7 @@ fn active_model_set_hash(
             EvidenceRank::ExactArtifact => 3,
         }]);
         hasher.update([selection.source_rank]);
+        hasher.update([u8::from(selection.active.review_accepted)]);
         hash_activation_evidence(&mut hasher, &selection.active.matched_evidence);
         hasher.update((selection.active.matching_evidence.len() as u64).to_be_bytes());
         for evidence in &selection.active.matching_evidence {
@@ -4130,9 +4725,10 @@ fn push_explanation(
 #[cfg(test)]
 mod semantic_diagnostic_runtime_tests {
     use super::*;
-    use crate::analyzer::SemanticDiagnosticIncompleteReason;
+    use brokk_bifrost_test_macros::hardwon;
 
     #[test]
+    #[hardwon("#3815: cached pack activation ignored the supported schema and engine contract")]
     fn runtime_request_key_binds_engine_and_supported_schema_contract() {
         let request = |bifrost_version| SemanticModelActivationRequest {
             bifrost_version,
@@ -4149,35 +4745,6 @@ mod semantic_diagnostic_runtime_tests {
         let _supported_schemas_are_bound_by_runtime_request_key =
             super::super::SEMANTIC_MODEL_SUPPORTED_SCHEMA_VERSIONS;
     }
-
-    #[test]
-    fn runtime_outcomes_map_to_shared_suppression_reasons() {
-        let report = SemanticModelActivationReport::default();
-        assert_eq!(
-            SemanticModelRuntimeOutcome::Cancelled(report.clone())
-                .semantic_diagnostic_incomplete_reasons(),
-            vec![SemanticDiagnosticIncompleteReason::Cancelled]
-        );
-
-        let incomplete = SemanticModelRuntimeOutcome::Incomplete {
-            usable: None,
-            report: report.clone(),
-        }
-        .semantic_diagnostic_incomplete_reasons();
-        assert!(matches!(
-            incomplete.as_slice(),
-            [SemanticDiagnosticIncompleteReason::RuntimeUnavailable { detail }]
-                if detail.starts_with("incomplete activation:")
-        ));
-
-        let unavailable = SemanticModelRuntimeOutcome::Unavailable(report)
-            .semantic_diagnostic_incomplete_reasons();
-        assert!(matches!(
-            unavailable.as_slice(),
-            [SemanticDiagnosticIncompleteReason::RuntimeUnavailable { detail }]
-                if detail.starts_with("unavailable activation:")
-        ));
-    }
 }
 
 #[cfg(test)]
@@ -4191,6 +4758,7 @@ mod unmaterialized_call_shape_binding_tests {
     use crate::analyzer::semantic_model::{
         CompilerOptions, DecodeLimits, SourceFormat, compile_source, decode_shard,
     };
+    use brokk_bifrost_test_macros::hardwon;
 
     const PACK: &[u8] = br#"{
       "schema_version": 2,
@@ -4325,6 +4893,7 @@ mod unmaterialized_call_shape_binding_tests {
             source_id: format!("test:pypi:{}", evidence.artifact_sha256.as_deref().unwrap()),
             matched_evidence: evidence.clone(),
             matching_evidence: vec![evidence.clone()],
+            review_accepted: false,
             evidence_rank: EvidenceRank::ExactArtifact,
             source_rank,
         }
@@ -4359,6 +4928,7 @@ mod unmaterialized_call_shape_binding_tests {
             source_id: "test:pypi-wildcard".to_owned(),
             matched_evidence: evidence.clone(),
             matching_evidence: vec![evidence.clone()],
+            review_accepted: false,
             evidence_rank: EvidenceRank::NamedCoordinate,
             source_rank,
         }
@@ -4398,9 +4968,182 @@ mod unmaterialized_call_shape_binding_tests {
             source_id: "test:generic-python".to_owned(),
             matched_evidence: evidence.clone(),
             matching_evidence: vec![evidence],
+            review_accepted: false,
             evidence_rank: EvidenceRank::Language,
             source_rank: 0,
         }
+    }
+
+    #[test]
+    fn structured_variadic_summary_binds_both_rest_domains_and_uses_required_arity() {
+        let source = serde_json::json!({
+            "schema_version": 14,
+            "pack_id": "test.variadic-formals",
+            "version": "1.0.0",
+            "producer": {"name": "test", "version": "1.0.0"},
+            "language": "java",
+            "ecosystem": "maven",
+            "compatibility": {"toolchains": []},
+            "provenance": {"source": "test:variadic-formals"},
+            "license": "Apache-2.0",
+            "completeness": "complete",
+            "safety": {"generated_code_only": false, "review_required": false},
+            "shards": [{
+                "id": "summaries",
+                "activation": [{}],
+                "payload": {"kind": "procedure_summaries", "summaries": [{
+                    "id": "summary.variadic",
+                    "target": {
+                        "path": "com/acme/Variadic.class",
+                        "symbol": "com.acme.Api.variadic(first, args, flag, kwargs)",
+                        "has_receiver": false,
+                        "variadic": true,
+                        "parameter_count": 4,
+                        "formals": [
+                            {"name": "first"},
+                            {
+                                "name": "args",
+                                "passing_mode": "positional_only",
+                                "variadic_kind": "positional"
+                            },
+                            {
+                                "name": "flag",
+                                "optional": true,
+                                "passing_mode": "named_only"
+                            },
+                            {
+                                "name": "kwargs",
+                                "passing_mode": "named_only",
+                                "variadic_kind": "keyword"
+                            }
+                        ]
+                    },
+                    "completeness": "complete",
+                    "transfers": [{
+                        "input": {"kind": "parameter", "ordinal": 0},
+                        "exit_kind": "normal",
+                        "output": {"kind": "normal_return"}
+                    }]
+                }]}
+            }]
+        });
+        let compiled = compile_source(
+            SourceFormat::Json,
+            &serde_json::to_vec(&source).unwrap(),
+            &CompilerOptions::default(),
+        )
+        .expect("schema-14 variadic summary compiles");
+        let shard = decode_shard(
+            &compiled.shards[0].descriptor,
+            &compiled.shards[0].bytes,
+            &DecodeLimits::default(),
+        )
+        .expect("schema-14 summary decodes");
+        let evidence = SemanticModelActivationEvidence {
+            language: "java".to_owned(),
+            ecosystem: "maven".to_owned(),
+            package: None,
+            module: None,
+            toolchain: None,
+            target: None,
+            configuration: None,
+            artifact_sha256: None,
+        };
+        let active_shard = ActiveSemanticModelShard {
+            manifest: Arc::new(compiled.manifest),
+            shard,
+            source_kind: CatalogPackSourceKind::Embedded,
+            source_id: "test:variadic-formals".to_owned(),
+            matched_evidence: evidence.clone(),
+            matching_evidence: vec![evidence],
+            review_accepted: false,
+            evidence_rank: EvidenceRank::Language,
+            source_rank: 0,
+        };
+        let mut report = SemanticModelActivationReport::default();
+        let indexes = MatcherIndexes::build(
+            std::slice::from_ref(&active_shard),
+            SemanticModelRuntimeLimits::default(),
+            &CancellationToken::default(),
+            &mut report,
+        )
+        .expect("variadic summary indexes");
+        let active = ResolvedActiveSemanticModels {
+            source_reader: None,
+            active_model_set_hash: "test:variadic-formals".to_owned(),
+            shards: vec![active_shard],
+            indexes,
+            extraction_gaps: Vec::new(),
+            extraction_gaps_by_declaration: HashMap::default(),
+            report,
+        };
+        let direct = |id| {
+            crate::analyzer::semantic::SemanticCallArgument::direct(
+                crate::analyzer::semantic::ValueId::new(id),
+                crate::analyzer::semantic::ArgumentDomain::Positional,
+            )
+        };
+        let keyword = |id, name| {
+            crate::analyzer::semantic::SemanticCallArgument::keyword(
+                crate::analyzer::semantic::ValueId::new(id),
+                name,
+            )
+        };
+        let arguments = [
+            direct(0),
+            direct(1),
+            direct(2),
+            keyword(3, "flag"),
+            keyword(4, "trace"),
+            keyword(5, "context"),
+        ];
+        let target = target_for_language(
+            crate::analyzer::Language::Java,
+            "com.acme.Api",
+            "variadic",
+            arguments.len() as u32,
+        )
+        .with_call_arguments(&arguments);
+        let matched = active.procedure_summaries_for_external_target(&target);
+        assert_eq!(matched.disposition, SemanticModelMatchDisposition::Unique);
+        let binding = matched.records[0]
+            .bind_unmaterialized_call_shape(&target)
+            .expect("both direct rest domains bind exactly");
+        assert_eq!(
+            binding.actual_to_formal(),
+            Some([0, 1, 1, 2, 3, 3].as_slice())
+        );
+
+        let only_required = [direct(6)];
+        let target = target_for_language(
+            crate::analyzer::Language::Java,
+            "com.acme.Api",
+            "variadic",
+            only_required.len() as u32,
+        )
+        .with_call_arguments(&only_required);
+        let matched = active.procedure_summaries_for_external_target(&target);
+        assert_eq!(matched.disposition, SemanticModelMatchDisposition::Unique);
+        let binding = matched.records[0]
+            .bind_unmaterialized_call_shape(&target)
+            .expect("empty rest collections and defaulted fixed formals are exact");
+        assert_eq!(binding.actual_to_formal(), Some([0].as_slice()));
+
+        let no_required = [];
+        let target = target_for_language(
+            crate::analyzer::Language::Java,
+            "com.acme.Api",
+            "variadic",
+            0,
+        )
+        .with_call_arguments(&no_required);
+        assert_eq!(
+            active
+                .procedure_summaries_for_external_target(&target)
+                .disposition,
+            SemanticModelMatchDisposition::Empty,
+            "the summary is not a candidate below its fixed-formal minimum"
+        );
     }
 
     #[test]
@@ -4447,6 +5190,7 @@ mod unmaterialized_call_shape_binding_tests {
     }
 
     #[test]
+    #[hardwon("#3464: activation omitted JDK artifacts that matched the declared toolchain range")]
     fn jdk_compatibility_is_checked_against_each_matching_artifact() {
         let source = std::str::from_utf8(PACK)
             .expect("fixture is UTF-8")
@@ -4492,7 +5236,69 @@ mod unmaterialized_call_shape_binding_tests {
         assert_eq!(matched.matching_evidence, vec![java21]);
     }
 
+    /// A declared toolchain names the coordinate of a pack whose selector also
+    /// binds the exact artifact it was produced from. The rejection names that
+    /// unmet digest rather than the generic statement (#3464).
     #[test]
+    #[hardwon(
+        "#3464: artifact-bound selection reported a toolchain name instead of the missing digest"
+    )]
+    fn a_named_coordinate_without_the_bound_artifact_names_the_missing_digest() {
+        let digest = "a".repeat(64);
+        let source = std::str::from_utf8(PACK)
+            .expect("fixture is UTF-8")
+            .replace("\"ecosystem\": \"maven\"", "\"ecosystem\": \"jdk\"")
+            .replace(
+                "\"compatibility\": {\"bifrost\": \">=0.8.0, <1.0.0\"}",
+                "\"compatibility\": {\"bifrost\": \">=0.8.0, <1.0.0\", \"toolchains\": [{\"name\": \"jdk\", \"requirement\": \">=21.0.0, <22.0.0\"}]}",
+            )
+            .replace(
+                "\"activation\": [{}]",
+                &format!(
+                    "\"activation\": [{{\"toolchain\": {{\"name\": \"jdk\"}}, \
+                     \"artifact_sha256\": \"{digest}\"}}]"
+                ),
+            );
+        let compiled = compile_source(
+            SourceFormat::Json,
+            source.as_bytes(),
+            &CompilerOptions::default(),
+        )
+        .expect("artifact-bound fixture compiles");
+        let shard = decode_shard(
+            &compiled.shards[0].descriptor,
+            &compiled.shards[0].bytes,
+            &DecodeLimits::default(),
+        )
+        .expect("artifact-bound fixture decodes");
+        let declared = SemanticModelActivationEvidence {
+            language: "java".to_owned(),
+            ecosystem: "jdk".to_owned(),
+            package: None,
+            module: None,
+            toolchain: Some(CatalogCoordinate {
+                name: "jdk".to_owned(),
+                version: Some(Version::parse("21.0.8").expect("valid JDK version")),
+            }),
+            target: None,
+            configuration: None,
+            artifact_sha256: None,
+        };
+        assert_eq!(
+            strict_activation_mismatch_reason(
+                &compiled.manifest,
+                &shard,
+                std::slice::from_ref(&declared)
+            ),
+            format!(
+                "activation evidence names toolchain jdk, but the shard selector also requires \
+                 artifact sha256 {digest}"
+            )
+        );
+    }
+
+    #[test]
+    #[hardwon("#3815: schema-8 activation applied the legacy engine-version gate")]
     fn schema8_activation_is_engine_independent_but_keeps_toolchain_and_artifact_checks() {
         let artifact_sha256 = "a".repeat(64);
         let mut source: serde_json::Value = serde_json::from_slice(PACK).unwrap();
@@ -4586,7 +5392,7 @@ mod unmaterialized_call_shape_binding_tests {
         );
 
         let mut unknown_schema = compiled.manifest.clone();
-        unknown_schema.schema_version = 9;
+        unknown_schema.schema_version = super::super::SEMANTIC_MODEL_SCHEMA_VERSION + 1;
         assert!(
             strict_activation_match(
                 &unknown_schema,
@@ -4599,6 +5405,7 @@ mod unmaterialized_call_shape_binding_tests {
     }
 
     #[test]
+    #[hardwon("74238a905cc7: reviewed JDK fixture omitted the matched call locator")]
     fn reviewed_jdk_result_obligation_requires_the_exact_selected_artifact_and_call_shape() {
         let mut source: serde_json::Value = serde_json::from_slice(PACK).unwrap();
         source["schema_version"] = 5.into();
@@ -4644,6 +5451,7 @@ mod unmaterialized_call_shape_binding_tests {
             source_id: "test:reviewed-jdk-obligation".to_owned(),
             matched_evidence: second.clone(),
             matching_evidence: vec![first.clone(), second.clone()],
+            review_accepted: false,
             evidence_rank: EvidenceRank::Language,
             source_rank: 0,
         };
@@ -4652,6 +5460,9 @@ mod unmaterialized_call_shape_binding_tests {
             record: &payload[0],
             shard: &active,
             payload,
+            actual_to_formal: None,
+            matched_target_locator: Some(target("fixed", 3).locator().clone()),
+            matched_call_arguments: None,
         };
         assert_eq!(
             reviewed
@@ -4706,6 +5517,7 @@ mod unmaterialized_call_shape_binding_tests {
                 ),
                 matched_evidence: evidence.clone(),
                 matching_evidence: vec![evidence],
+                review_accepted: false,
                 evidence_rank: EvidenceRank::Language,
                 source_rank: 0,
             })
@@ -4731,6 +5543,7 @@ mod unmaterialized_call_shape_binding_tests {
             source_id: "test:higher-rank-unannotated-jdk-summary".to_owned(),
             matched_evidence: second.clone(),
             matching_evidence: vec![second.clone()],
+            review_accepted: false,
             evidence_rank: EvidenceRank::Language,
             source_rank: 1,
         });
@@ -4743,6 +5556,7 @@ mod unmaterialized_call_shape_binding_tests {
         )
         .expect("two equal-summary JDK shards index");
         let active_set = ResolvedActiveSemanticModels {
+            source_reader: None,
             active_model_set_hash: "test:two-jdk-artifacts".to_owned(),
             shards: separate,
             indexes,
@@ -4787,6 +5601,7 @@ mod unmaterialized_call_shape_binding_tests {
         )
         .expect("same-spelling Python artifact shards index");
         let active = ResolvedActiveSemanticModels {
+            source_reader: None,
             active_model_set_hash: "test:two-python-artifacts".to_owned(),
             shards,
             indexes,
@@ -4840,6 +5655,9 @@ mod unmaterialized_call_shape_binding_tests {
             record: &payload[0],
             shard: selected_shard,
             payload,
+            actual_to_formal: None,
+            matched_target_locator: None,
+            matched_call_arguments: None,
         };
         let missing_target = target_for_language(
             crate::analyzer::Language::Python,
@@ -4915,6 +5733,9 @@ mod unmaterialized_call_shape_binding_tests {
             record: &other_payload[0],
             shard: other_shard,
             payload: other_payload,
+            actual_to_formal: None,
+            matched_target_locator: None,
+            matched_call_arguments: None,
         };
         assert!(
             other_summary
@@ -4932,6 +5753,7 @@ mod unmaterialized_call_shape_binding_tests {
         )
         .expect("generic Python summary indexes");
         let generic_active = ResolvedActiveSemanticModels {
+            source_reader: None,
             active_model_set_hash: "test:generic-python".to_owned(),
             shards: vec![generic_shard],
             indexes: generic_indexes,
@@ -5006,6 +5828,7 @@ mod unmaterialized_call_shape_binding_tests {
             source_id: "test:pypi:variadic-model".to_owned(),
             matched_evidence: evidence.clone(),
             matching_evidence: vec![evidence.clone()],
+            review_accepted: false,
             evidence_rank: EvidenceRank::ExactArtifact,
             source_rank: 1,
         };
@@ -5025,6 +5848,7 @@ mod unmaterialized_call_shape_binding_tests {
         )
         .expect("same-artifact Python models index");
         let active = ResolvedActiveSemanticModels {
+            source_reader: None,
             active_model_set_hash: "test:same-python-artifact-two-models".to_owned(),
             shards,
             indexes,
@@ -5092,6 +5916,7 @@ mod unmaterialized_call_shape_binding_tests {
         )
         .expect("PyPI wildcard summary indexes");
         let active = ResolvedActiveSemanticModels {
+            source_reader: None,
             active_model_set_hash: "test:pypi-wildcard".to_owned(),
             shards: vec![shard],
             indexes,
@@ -5140,14 +5965,29 @@ mod unmaterialized_call_shape_binding_tests {
     }
 
     #[test]
+    #[hardwon(
+        "1a59441d70d0: identity Python argument mappings were rejected when fixed-arity summaries omitted formal rows"
+    )]
     fn python_argument_permutations_have_distinct_aliases_and_checked_formals() {
         let evidence = python_evidence('a');
         let shard = python_artifact_shard(&evidence, 0);
-        let payload = shard.shard.payload().procedure_summaries().unwrap();
-        let selected = ActivatedProcedureSummary {
-            record: &payload[0],
-            shard: &shard,
-            payload,
+        let manifest_sha256 = shard.manifest.content_sha256.clone();
+        let mut report = SemanticModelActivationReport::default();
+        let indexes = MatcherIndexes::build(
+            std::slice::from_ref(&shard),
+            SemanticModelRuntimeLimits::default(),
+            &CancellationToken::default(),
+            &mut report,
+        )
+        .expect("exact Python summary indexes");
+        let active = ResolvedActiveSemanticModels {
+            source_reader: None,
+            active_model_set_hash: "test:python-argument-permutations".to_owned(),
+            shards: vec![shard],
+            indexes,
+            extraction_gaps: Vec::new(),
+            extraction_gaps_by_declaration: HashMap::default(),
+            report,
         };
         let target = || {
             target_for_language(
@@ -5157,15 +5997,27 @@ mod unmaterialized_call_shape_binding_tests {
                 3,
             )
             .with_selected_python_for_test(evidence.clone())
-            .with_python_model_manifest_for_test(&shard.manifest.content_sha256)
+            .with_python_model_manifest_for_test(&manifest_sha256)
         };
         let positional = target().with_python_mapping_for_test(Some(vec![0, 1, 2]));
         let reordered = target().with_python_mapping_for_test(Some(vec![2, 0, 1]));
         assert_ne!(positional.locator(), reordered.locator());
-        let positional_binding = selected
+        let positional_match = active.procedure_summaries_for_external_target(&positional);
+        let reordered_match = active.procedure_summaries_for_external_target(&reordered);
+        assert_eq!(
+            positional_match.disposition,
+            SemanticModelMatchDisposition::Unique
+        );
+        assert_eq!(
+            reordered_match.disposition,
+            SemanticModelMatchDisposition::Unique
+        );
+        let positional_binding = positional_match.records[0]
             .bind_unmaterialized_call_shape(&positional)
             .unwrap();
-        let reordered_binding = selected.bind_unmaterialized_call_shape(&reordered).unwrap();
+        let reordered_binding = reordered_match.records[0]
+            .bind_unmaterialized_call_shape(&reordered)
+            .unwrap();
         assert_eq!(
             positional_binding.formal_locator(),
             reordered_binding.formal_locator()
@@ -5180,36 +6032,39 @@ mod unmaterialized_call_shape_binding_tests {
             Some(vec![0, 1]),
             Some(vec![0, 1, 3]),
         ] {
-            assert!(
-                selected
-                    .bind_unmaterialized_call_shape(&target().with_python_mapping_for_test(mapping))
-                    .is_none()
+            let invalid = target().with_python_mapping_for_test(mapping);
+            assert_eq!(
+                active
+                    .procedure_summaries_for_external_target(&invalid)
+                    .disposition,
+                SemanticModelMatchDisposition::Empty
             );
         }
+        let payload = active.shards[0]
+            .shard
+            .payload()
+            .procedure_summaries()
+            .unwrap();
         let mut unsupported = payload[0].clone();
         unsupported.ordinary_heap_unchanged = true;
         unsupported.preconditions = Some(vec![super::super::CompiledOperationPrecondition {
             input: super::super::CompiledSummaryInput::Parameter { ordinal: 0 },
             predicate: super::super::CompiledResultPredicate::NonNull,
         }]);
-        let selected_unsupported = ActivatedProcedureSummary {
-            record: &unsupported,
-            shard: &shard,
-            payload,
-        };
         assert!(
-            selected_unsupported
-                .bind_unmaterialized_call_shape(&reordered)
+            procedure_summary_actual_to_formal(&active.shards[0], &unsupported, &reordered)
                 .is_none()
         );
         assert!(
-            selected_unsupported
-                .bind_unmaterialized_call_shape(&positional)
+            procedure_summary_actual_to_formal(&active.shards[0], &unsupported, &positional)
                 .is_some()
         );
     }
 
     #[test]
+    #[hardwon(
+        "d6d760cab6de: Python omitted-default calls must not bind legacy exact-arity summaries"
+    )]
     fn python_omitted_default_boundary_is_incomplete_but_full_positional_call_binds() {
         let evidence = python_evidence('a');
         let shard = python_artifact_shard(&evidence, 0);
@@ -5222,6 +6077,7 @@ mod unmaterialized_call_shape_binding_tests {
         )
         .expect("exact Python summary indexes");
         let active = ResolvedActiveSemanticModels {
+            source_reader: None,
             active_model_set_hash: "test:python-formal-shape".to_owned(),
             shards: vec![shard],
             indexes,
@@ -5303,50 +6159,76 @@ mod unmaterialized_call_shape_binding_tests {
             configuration: None,
             artifact_sha256: None,
         };
-        let active = ActiveSemanticModelShard {
+        let active_shard = ActiveSemanticModelShard {
             manifest: std::sync::Arc::new(compiled.manifest),
             shard,
             source_kind: CatalogPackSourceKind::Embedded,
             source_id: "test:call-shape".to_owned(),
             matching_evidence: vec![matched_evidence.clone()],
             matched_evidence,
+            review_accepted: false,
             evidence_rank: EvidenceRank::Language,
             source_rank: 0,
         };
-        let payload = active
-            .shard
-            .payload()
-            .procedure_summaries()
-            .expect("the fixture carries procedure summaries");
-        let activated = |index| ActivatedProcedureSummary {
-            record: &payload[index],
-            shard: &active,
-            payload,
+        let mut report = SemanticModelActivationReport::default();
+        let indexes = MatcherIndexes::build(
+            std::slice::from_ref(&active_shard),
+            SemanticModelRuntimeLimits::default(),
+            &CancellationToken::default(),
+            &mut report,
+        )
+        .expect("call-shape summary indexes");
+        let active = ResolvedActiveSemanticModels {
+            source_reader: None,
+            active_model_set_hash: "test:call-shape".to_owned(),
+            shards: vec![active_shard],
+            indexes,
+            extraction_gaps: Vec::new(),
+            extraction_gaps_by_declaration: HashMap::default(),
+            report,
         };
-
-        let fixed = activated(0);
+        let fixed_target = target("fixed", 3);
+        let fixed_match = active.procedure_summaries_for_external_target(&fixed_target);
+        assert_eq!(
+            fixed_match.disposition,
+            SemanticModelMatchDisposition::Unique
+        );
+        let fixed = &fixed_match.records[0];
         assert!(
             fixed
-                .bind_unmaterialized_call_shape(&target("fixed", 3))
+                .bind_unmaterialized_call_shape(&fixed_target)
                 .is_some(),
             "a fixed summary proves only its exact actual arity"
         );
+        let too_many_fixed_actuals = target("fixed", 4);
+        let too_many_match =
+            active.procedure_summaries_for_external_target(&too_many_fixed_actuals);
+        assert_eq!(
+            too_many_match.disposition,
+            SemanticModelMatchDisposition::Empty
+        );
         assert!(
             fixed
-                .bind_unmaterialized_call_shape(&target("fixed", 4))
+                .bind_unmaterialized_call_shape(&too_many_fixed_actuals)
                 .is_none(),
             "an opaque proof cannot be minted to relabel a fixed summary"
         );
 
-        let variadic = activated(1);
+        let below_minimum = target("variadic", 1);
+        let variadic_low_match = active.procedure_summaries_for_external_target(&below_minimum);
+        assert_eq!(
+            variadic_low_match.disposition,
+            SemanticModelMatchDisposition::Empty
+        );
         assert!(
-            variadic
-                .bind_unmaterialized_call_shape(&target("variadic", 1))
-                .is_none(),
+            variadic_low_match.records.is_empty(),
             "an actual arity below the variadic minimum has no proof"
         );
         for arity in [2, 3, 4] {
             let actual = target("variadic", arity);
+            let matched = active.procedure_summaries_for_external_target(&actual);
+            assert_eq!(matched.disposition, SemanticModelMatchDisposition::Unique);
+            let variadic = &matched.records[0];
             let binding = variadic
                 .bind_unmaterialized_call_shape(&actual)
                 .unwrap_or_else(|| panic!("variadic actual arity {arity} is applicable"));
@@ -5449,6 +6331,7 @@ mod active_model_set_identity_tests {
                 source_id: format!("test:{pack_id}"),
                 matching_evidence: vec![matched_evidence.clone()],
                 matched_evidence,
+                review_accepted: false,
                 evidence_rank,
                 source_rank: 0,
             },
@@ -5497,6 +6380,7 @@ mod active_model_set_identity_tests {
         )
         .expect("identity fixture matcher builds");
         ResolvedActiveSemanticModels {
+            source_reader: None,
             active_model_set_hash,
             shards,
             indexes,
@@ -5508,7 +6392,7 @@ mod active_model_set_identity_tests {
 
     #[test]
     fn value_semantics_schema_rotates_active_set_identity() {
-        assert_eq!(SEMANTIC_MODEL_RUNTIME_REPRESENTATION_VERSION, 8);
+        assert_eq!(SEMANTIC_MODEL_RUNTIME_REPRESENTATION_VERSION, 10);
         let mut previous = Sha256::new();
         previous.update(b"bifrost.semantic-model.active-set.v2\0");
         previous.update(2u32.to_be_bytes());
@@ -5559,21 +6443,17 @@ mod active_model_set_identity_tests {
 
 /// The conflict gate for procedure-summary lookup (#1871). The canonical member
 /// key cannot tell same-arity overloads apart, so a posting legitimately carries
-/// several records; whether that is one answer or a refusal is decided entirely
-/// by [`procedure_claims_agree`]. These pin BOTH directions, because only the
-/// second protects soundness: a weakened predicate would silently let two
-/// disagreeing models resolve to whichever record happened to be indexed first.
+/// several records. The #2738 regression pins that conflicting override
+/// coverage cannot be resolved to whichever model was indexed first.
 #[cfg(test)]
 mod procedure_claim_agreement_tests {
     use super::*;
     use crate::analyzer::semantic_model::{
-        CompiledConditionalIndirectWrite, CompiledConditionalResultRefinement,
-        CompiledDeclaredEffect, CompiledDeclaredEffectCertainty, CompiledDeclaredEffectTiming,
-        CompiledIndirectWriteTarget, CompiledPredicateProofEffect, CompiledProcedureSummary,
-        CompiledProcedureTarget, CompiledResultContract, CompiledResultPredicate,
-        CompiledSummaryExitKind, CompiledSummaryInput, CompiledSummaryLocation,
-        CompiledSummaryLocationKind, CompiledSummaryOutput, CompiledSummaryTransfer, Completeness,
+        CompiledPredicateProofEffect, CompiledProcedureSummary, CompiledProcedureTarget,
+        CompiledResultPredicate, CompiledSummaryExitKind, CompiledSummaryInput,
+        CompiledSummaryOutput, CompiledSummaryTransfer, Completeness,
     };
+    use brokk_bifrost_test_macros::hardwon;
 
     fn transfer(input: CompiledSummaryInput) -> CompiledSummaryTransfer {
         CompiledSummaryTransfer {
@@ -5599,6 +6479,7 @@ mod procedure_claim_agreement_tests {
                 has_receiver: true,
                 variadic: false,
                 parameter_count: 1,
+                formals: Vec::new(),
             },
             completeness: Completeness::Complete,
             ordinary_heap_unchanged: false,
@@ -5611,6 +6492,7 @@ mod procedure_claim_agreement_tests {
             transfer_partitions: Vec::new(),
             effects: Vec::new(),
             concurrency_effects: Vec::new(),
+            returned_callables: Vec::new(),
             declared_effects: Vec::new(),
             preconditions: None,
             result_contracts: Vec::new(),
@@ -5624,19 +6506,17 @@ mod procedure_claim_agreement_tests {
     }
 
     #[test]
-    fn identity_fields_do_not_make_two_records_disagree() {
+    #[hardwon("#2738: same-key interface contract claims disagreed on override coverage")]
+    fn a_different_override_coverage_claim_is_a_disagreement() {
         let left = overload("valueof-int", "java.lang.String.valueOf(int)");
-        let right = overload(
+        let mut right = overload(
             "valueof-object",
             "java.lang.String.valueOf(java.lang.Object)",
         );
-        assert_ne!(
-            left, right,
-            "the two records are genuinely distinct records"
-        );
+        right.covers_overrides = true;
         assert!(
-            procedure_claims_agree(&left, &right),
-            "records differing only in id, model id, digest, and target spelling make one claim"
+            !procedure_claims_agree(&left, &right),
+            "override coverage is a trust claim, so conflicting records must refuse"
         );
     }
 
@@ -5656,20 +6536,6 @@ mod procedure_claim_agreement_tests {
     }
 
     #[test]
-    fn a_different_completeness_is_a_disagreement() {
-        let left = overload("valueof-int", "java.lang.String.valueOf(int)");
-        let mut right = overload(
-            "valueof-object",
-            "java.lang.String.valueOf(java.lang.Object)",
-        );
-        right.completeness = Completeness::Partial;
-        assert!(
-            !procedure_claims_agree(&left, &right),
-            "completeness decides whether a run may conclude ProvenBySummary, so it must refuse"
-        );
-    }
-
-    #[test]
     fn a_different_normal_continuation_claim_is_a_disagreement() {
         let mut left = overload("valueof-int", "java.lang.String.valueOf(int)");
         left.normal_continuation_absent = true;
@@ -5686,81 +6552,6 @@ mod procedure_claim_agreement_tests {
         assert!(
             procedure_claims_agree(&left, &right),
             "two explicit absence claims make one runtime claim"
-        );
-    }
-
-    #[test]
-    fn a_different_normal_return_type_refinement_is_a_disagreement() {
-        let left = overload("valueof-int", "java.lang.String.valueOf(int)");
-        let mut right = overload(
-            "valueof-object",
-            "java.lang.String.valueOf(java.lang.Object)",
-        );
-        right
-            .normal_return_type_refinements
-            .push(CompiledNormalReturnTypeRefinement {
-                parameter_ordinal: 0,
-                class_parameter_ordinal: 1,
-                required_receiver_members: Vec::new(),
-            });
-        assert!(!procedure_claims_agree(&left, &right));
-    }
-
-    #[test]
-    fn a_different_class_decorator_identity_is_a_disagreement() {
-        let left = overload("valueof-int", "java.lang.String.valueOf(int)");
-        let mut right = overload(
-            "valueof-object",
-            "java.lang.String.valueOf(java.lang.Object)",
-        );
-        right.class_decorator_identity = Some(CompiledClassDecoratorIdentity {
-            direct: true,
-            factory_keywords: None,
-        });
-        assert!(!procedure_claims_agree(&left, &right));
-
-        let mut matching = left.clone();
-        matching.class_decorator_identity = right.class_decorator_identity.clone();
-        assert!(procedure_claims_agree(&matching, &right));
-    }
-
-    #[test]
-    fn a_different_normal_return_receiver_dependency_is_a_disagreement() {
-        let mut left = overload("valueof-int", "java.lang.String.valueOf(int)");
-        let mut right = overload(
-            "valueof-object",
-            "java.lang.String.valueOf(java.lang.Object)",
-        );
-        left.normal_return_type_refinements
-            .push(CompiledNormalReturnTypeRefinement {
-                parameter_ordinal: 0,
-                class_parameter_ordinal: 1,
-                required_receiver_members: vec!["fail".to_owned()],
-            });
-        right
-            .normal_return_type_refinements
-            .push(CompiledNormalReturnTypeRefinement {
-                parameter_ordinal: 0,
-                class_parameter_ordinal: 1,
-                required_receiver_members: vec!["helper".to_owned()],
-            });
-        assert!(!procedure_claims_agree(&left, &right));
-
-        right.normal_return_type_refinements[0].required_receiver_members = vec!["fail".to_owned()];
-        assert!(procedure_claims_agree(&left, &right));
-    }
-
-    #[test]
-    fn a_different_override_coverage_claim_is_a_disagreement() {
-        let left = overload("valueof-int", "java.lang.String.valueOf(int)");
-        let mut right = overload(
-            "valueof-object",
-            "java.lang.String.valueOf(java.lang.Object)",
-        );
-        right.covers_overrides = true;
-        assert!(
-            !procedure_claims_agree(&left, &right),
-            "override coverage is a trust claim, so conflicting records must refuse"
         );
     }
 
@@ -5804,164 +6595,6 @@ mod procedure_claim_agreement_tests {
     }
 
     #[test]
-    fn a_different_transfer_set_is_a_disagreement() {
-        let left = overload("valueof-int", "java.lang.String.valueOf(int)");
-        let mut right = overload(
-            "valueof-object",
-            "java.lang.String.valueOf(java.lang.Object)",
-        );
-        right.transfers = vec![transfer(CompiledSummaryInput::Receiver {})];
-        assert!(
-            !procedure_claims_agree(&left, &right),
-            "a different transfer set propagates differently and must refuse"
-        );
-    }
-
-    #[test]
-    fn a_different_location_set_is_a_disagreement() {
-        let left = overload("valueof-int", "java.lang.String.valueOf(int)");
-        let mut right = overload(
-            "valueof-object",
-            "java.lang.String.valueOf(java.lang.Object)",
-        );
-        right.locations = vec![CompiledSummaryLocation {
-            id: "buffer".to_owned(),
-            location_kind: CompiledSummaryLocationKind::Heap,
-        }];
-        assert!(
-            !procedure_claims_agree(&left, &right),
-            "named locations are ports the transfers bind, so they are part of the claim"
-        );
-    }
-
-    /// #2437: a declared effect is a claim a policy can read, so two records
-    /// that disagree about it must refuse rather than resolve to whichever one
-    /// the index happened to reach first.
-    #[test]
-    fn a_different_declared_effect_set_is_a_disagreement() {
-        let left = overload("valueof-int", "java.lang.String.valueOf(int)");
-        let mut right = overload(
-            "valueof-object",
-            "java.lang.String.valueOf(java.lang.Object)",
-        );
-        right.declared_effects = vec![CompiledDeclaredEffect {
-            id: "acme.network_io".to_owned(),
-            timing: CompiledDeclaredEffectTiming::Immediate,
-            certainty: CompiledDeclaredEffectCertainty::Definite,
-        }];
-        assert!(
-            !procedure_claims_agree(&left, &right),
-            "one record claiming an effect the other does not is a disagreement"
-        );
-
-        let mut same_id_different_certainty = right.clone();
-        same_id_different_certainty.declared_effects[0].certainty =
-            CompiledDeclaredEffectCertainty::Possible;
-        assert!(
-            !procedure_claims_agree(&right, &same_id_different_certainty),
-            "certainty is part of the claim, not decoration"
-        );
-
-        let mut same_id_different_timing = right.clone();
-        same_id_different_timing.declared_effects[0].timing =
-            CompiledDeclaredEffectTiming::Deferred;
-        assert!(
-            !procedure_claims_agree(&right, &same_id_different_timing),
-            "timing is part of the claim, not decoration"
-        );
-
-        let mut identical = right.clone();
-        identical.id = "valueof-charseq".to_owned();
-        identical.model_id = "model.valueof-charseq".to_owned();
-        assert!(
-            procedure_claims_agree(&right, &identical),
-            "two records declaring the same effects still make one claim"
-        );
-    }
-
-    #[test]
-    fn a_different_procedure_precondition_is_a_disagreement() {
-        let left = overload("valueof-int", "java.lang.String.valueOf(int)");
-        let mut right = overload(
-            "valueof-object",
-            "java.lang.String.valueOf(java.lang.Object)",
-        );
-        right.preconditions = Some(vec![CompiledOperationPrecondition {
-            input: CompiledSummaryInput::Parameter { ordinal: 0 },
-            predicate: CompiledResultPredicate::NonNull,
-        }]);
-        assert!(
-            !procedure_claims_agree(&left, &right),
-            "an unreviewed precondition facet cannot agree with a required predicate"
-        );
-
-        let mut reviewed_empty = left.clone();
-        reviewed_empty.preconditions = Some(Vec::new());
-        assert!(
-            !procedure_claims_agree(&left, &reviewed_empty),
-            "reviewed-empty and unreviewed are distinct procedure claims"
-        );
-
-        let mut identical = right.clone();
-        identical.id = "valueof-charseq".to_owned();
-        identical.model_id = "model.valueof-charseq".to_owned();
-        assert!(
-            procedure_claims_agree(&right, &identical),
-            "identical reviewed preconditions still make one claim"
-        );
-    }
-
-    #[test]
-    fn a_different_result_contract_is_a_disagreement() {
-        let mut left = overload("valueof-int", "java.lang.String.valueOf(int)");
-        left.normal_result_count = Some(2);
-        left.result_contracts = vec![CompiledResultContract {
-            result_ordinal: 0,
-            condition_result_ordinal: Some(1),
-            predicate: Some(CompiledResultPredicate::Null),
-            result_success_predicate: None,
-            member_contracts: Vec::new(),
-        }];
-        let mut right = left.clone();
-        right.result_contracts[0].predicate = Some(CompiledResultPredicate::NonNull);
-
-        assert!(
-            !procedure_claims_agree(&left, &right),
-            "opposite validity predicates cannot resolve as one modeled answer"
-        );
-
-        right = left.clone();
-        right.result_contracts[0].result_success_predicate = Some(CompiledResultPredicate::NonNull);
-        assert!(
-            !procedure_claims_agree(&left, &right),
-            "a reviewed result-side success correlation is part of the modeled claim"
-        );
-
-        right.result_contracts = left.result_contracts.clone();
-        right.normal_result_count = Some(3);
-        assert!(
-            !procedure_claims_agree(&left, &right),
-            "the declared result-port shape is part of the modeled claim"
-        );
-    }
-
-    #[test]
-    fn a_different_normal_return_refinement_is_a_disagreement() {
-        let mut left = overload("valueof-int", "java.lang.String.valueOf(int)");
-        left.normal_return_refinements = vec![CompiledNormalReturnRefinement {
-            parameter_ordinal: 0,
-            predicate: CompiledResultPredicate::Null,
-        }];
-        let mut right = left.clone();
-        right.normal_return_refinements[0].predicate = CompiledResultPredicate::NonNull;
-
-        assert!(
-            !procedure_claims_agree(&left, &right),
-            "opposite normal-return predicates cannot resolve as one modeled answer"
-        );
-    }
-
-    #[test]
     fn a_different_conditional_result_refinement_is_a_disagreement() {
         let mut left = overload("valueof-int", "java.lang.String.valueOf(int)");
         left.normal_result_count = Some(1);
@@ -5986,25 +6619,6 @@ mod procedure_claim_agreement_tests {
         assert!(
             !procedure_claims_agree(&left, &right),
             "the boolean result outcome is part of the modeled claim"
-        );
-    }
-
-    #[test]
-    fn a_different_conditional_indirect_write_is_a_disagreement() {
-        let mut left = overload("errors-as", "errors.As(error, any)");
-        left.normal_result_count = Some(1);
-        left.conditional_indirect_writes = vec![CompiledConditionalIndirectWrite {
-            result_ordinal: 0,
-            outcome: true,
-            parameter_ordinal: 0,
-            target: CompiledIndirectWriteTarget::Pointee,
-        }];
-        let mut right = left.clone();
-        right.conditional_indirect_writes[0].outcome = false;
-
-        assert!(
-            !procedure_claims_agree(&left, &right),
-            "the outcome controlling an indirect write is part of the modeled claim"
         );
     }
 }

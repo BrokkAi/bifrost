@@ -1,3 +1,4 @@
+use brokk_bifrost_core::analyzer::tree_walk::find_ancestor;
 use tree_sitter::Node;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -29,7 +30,8 @@ pub fn classify_rust_field_name(mut focused: Node<'_>) -> RustFieldNameRole<'_> 
             }
             "field_initializer" | "shorthand_field_initializer" => {
                 if let Some(name) = initializer_name(focused)
-                    && let Some(container) = enclosing_container(focused, "struct_expression")
+                    && let Some(container) =
+                        find_ancestor(focused, |parent| parent.kind() == "struct_expression")
                     && let Some(owner_type) = container.child_by_field_name("name")
                 {
                     return RustFieldNameRole::Reference {
@@ -41,7 +43,8 @@ pub fn classify_rust_field_name(mut focused: Node<'_>) -> RustFieldNameRole<'_> 
             }
             "field_pattern" => {
                 if let Some(name) = focused.child_by_field_name("name")
-                    && let Some(container) = enclosing_container(focused, "struct_pattern")
+                    && let Some(container) =
+                        find_ancestor(focused, |parent| parent.kind() == "struct_pattern")
                     && let Some(owner_type) = container.child_by_field_name("type")
                 {
                     return RustFieldNameRole::Reference {
@@ -107,14 +110,4 @@ fn initializer_name(node: Node<'_>) -> Option<Node<'_>> {
         "shorthand_field_initializer" => node.named_child(0),
         _ => None,
     }
-}
-
-fn enclosing_container<'tree>(mut node: Node<'tree>, kind: &str) -> Option<Node<'tree>> {
-    while let Some(parent) = node.parent() {
-        if parent.kind() == kind {
-            return Some(parent);
-        }
-        node = parent;
-    }
-    None
 }

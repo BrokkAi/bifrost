@@ -176,6 +176,13 @@ pub(super) struct TopologyEntityValue {
     pub(super) build_file: ProjectFile,
 }
 
+fn effective_completeness(
+    row: TopologyCompleteness,
+    topology: &WorkspaceTopology,
+) -> TopologyCompleteness {
+    row.meet(topology.completeness())
+}
+
 impl TopologyEntityValue {
     pub(super) fn row(&self) -> &TopologyEntity {
         &self.topology.entities()[self.entity]
@@ -189,7 +196,7 @@ impl TopologyEntityValue {
     /// derivation's. A complete entity read out of an incomplete topology is
     /// still evidence about a build nobody saw all of.
     fn completeness(&self) -> TopologyCompleteness {
-        self.row().completeness.meet(self.topology.completeness())
+        effective_completeness(self.row().completeness, &self.topology)
     }
 
     pub(super) fn key(&self) -> TopologyEntityKey {
@@ -221,7 +228,7 @@ impl TopologyEdgeValue {
     }
 
     fn completeness(&self) -> TopologyCompleteness {
-        self.row().completeness.meet(self.topology.completeness())
+        effective_completeness(self.row().completeness, &self.topology)
     }
 
     pub(super) fn key(&self) -> TopologyEdgeKey {
@@ -267,13 +274,15 @@ pub(super) fn build_targets_of_file(
     file: &ProjectFile,
     diagnostics: &mut Vec<CodeQueryDiagnostic>,
 ) -> Vec<TopologyEntityValue> {
-    let topology = cache.workspace(analyzer);
-    cache.report_axis(&topology, TopologyAxis::Targets, diagnostics);
-    let ownership = topology.ownership_of(file.rel_path());
-    let Some(name) = owner_name(cache, file, &ownership, |owner| owner.target, diagnostics) else {
-        return Vec::new();
-    };
-    entity_rows(&topology, TopologyEntityKind::Target, name, file)
+    entities_owned_by_file(
+        cache,
+        analyzer,
+        file,
+        TopologyAxis::Targets,
+        TopologyEntityKind::Target,
+        |owner| owner.target,
+        diagnostics,
+    )
 }
 
 /// The `source_set` rows of one file: the compilation input set the build says
@@ -284,19 +293,33 @@ pub(super) fn source_sets_of_file(
     file: &ProjectFile,
     diagnostics: &mut Vec<CodeQueryDiagnostic>,
 ) -> Vec<TopologyEntityValue> {
-    let topology = cache.workspace(analyzer);
-    cache.report_axis(&topology, TopologyAxis::SourceSets, diagnostics);
-    let ownership = topology.ownership_of(file.rel_path());
-    let Some(name) = owner_name(
+    entities_owned_by_file(
         cache,
+        analyzer,
         file,
-        &ownership,
+        TopologyAxis::SourceSets,
+        TopologyEntityKind::SourceSet,
         |owner| owner.source_set,
         diagnostics,
-    ) else {
+    )
+}
+
+fn entities_owned_by_file(
+    cache: &mut TopologyTraversalCache,
+    analyzer: &dyn IAnalyzer,
+    file: &ProjectFile,
+    axis: TopologyAxis,
+    kind: TopologyEntityKind,
+    select_owner: impl FnOnce(FileOwnership) -> Option<String>,
+    diagnostics: &mut Vec<CodeQueryDiagnostic>,
+) -> Vec<TopologyEntityValue> {
+    let topology = cache.workspace(analyzer);
+    cache.report_axis(&topology, axis, diagnostics);
+    let ownership = topology.ownership_of(file.rel_path());
+    let Some(name) = owner_name(cache, file, &ownership, select_owner, diagnostics) else {
         return Vec::new();
     };
-    entity_rows(&topology, TopologyEntityKind::SourceSet, name, file)
+    entity_rows(&topology, kind, name, file)
 }
 
 /// The declared name of one file's owner on one axis, or nothing plus the

@@ -10,13 +10,15 @@ use std::collections::{BTreeMap, BTreeSet};
 use brokk_bifrost_core::analyzer::Language;
 use brokk_bifrost_core::analyzer::model::CodeUnit;
 use brokk_bifrost_core::analyzer::resolution_facts::{
-    BindingProjectionKind, ResolutionCallableReceiverOrigin, ResolutionGapKind,
-    ResolutionNamespace, ResolutionSiteKind, ResolutionTypeSlotRole, ResolutionTypeTransferKind,
+    BindingProjectionKind, ResolutionGapKind, ResolutionNamespace, ResolutionSiteKind,
+    ResolutionTypeSlotRole, ResolutionTypeTransferKind,
 };
+use brokk_bifrost_core::analyzer::structural::kinds::NormalizedKind;
 use brokk_bifrost_core::analyzer::structural::resolution::{
     DeclaredVisibility, ResolutionCompletionReasonKind,
 };
 
+use self::resolution_rows::PathBodyToken;
 use crate::CancellationToken;
 use crate::analyzer::resolution::{
     BindingNodeId, BindingNodeKind, LoweredBindingProjection, LoweredCallApplicabilityObligation,
@@ -25,32 +27,87 @@ use crate::analyzer::resolution::{
     LoweredMemberOwnerProperty, LoweredMemberScopeProperty, LoweredQualifiedSeededRoute,
     LoweredResolutionFactsWithIdentityCatalog, LoweredSemanticRole, LoweredSemanticSite,
     LoweredSupertypeProperty, LoweredTypedFrontier, LoweringCoverageFrontier, LoweringGapOrigin,
-    PartialPath, ResolutionCompletion, ResolutionIdentityCatalog, ResolutionIncompleteReason,
-    ResolutionSemanticIdentitySpace, SemanticId, TypeTransferValueTransform,
+    PartialPath, PartialPathId, ResolutionCompletion, ResolutionIdentityCatalog,
+    ResolutionIncompleteReason, ResolutionSemanticIdentitySpace, SemanticId, SharedNameId,
+    TypeTransferValueTransform, language_identity_domain,
 };
 use crate::hash::{HashMap, HashSet};
+
+fn signed_semantic(
+    names: &mut resolution_rows::SharedNames,
+    keys: &ResolutionLocalKeys,
+    identities: &ResolutionIdentityCatalog,
+    semantic: SemanticId,
+) -> PathBodyToken {
+    let identity = identities
+        .semantic_identity(semantic)
+        .unwrap_or_else(|| panic!("an emitted semantic is in its blob's catalog: {semantic}"));
+    match identity.shared_name() {
+        None => PathBodyToken::Int(keys.semantic(semantic)),
+        Some(name) => PathBodyToken::Shared(names.slot(identities.shared_name_digest(name))),
+    }
+}
+
+fn variable_number(
+    variables: &mut Vec<(crate::analyzer::resolution::StackVariableId, i64)>,
+    variable: crate::analyzer::resolution::StackVariableId,
+) -> i64 {
+    if let Some((_, number)) = variables.iter().find(|(known, _)| *known == variable) {
+        return *number;
+    }
+    let number = i64::try_from(variables.len()).expect("a path's variables fit an integer");
+    variables.push((variable, number));
+    number
+}
 
 use super::resolution::{
     PreparedResolutionBundle, PreparedResolutionBundleRows, PreparedResolutionRow,
     PreparedResolutionValue, TypedFactRelation,
 };
 
-/// Lane LD's throwaway loader for the milestone 5 draft schema. It is a child
-/// module so that it can reuse `ResolutionLocalKeys` rather than assign a
-/// second set of dense per-blob keys.
-#[cfg(test)]
-mod schema_loader;
+pub(crate) fn require_array(
+    value: &serde_json::Value,
+    invalid_message: impl FnOnce(&serde_json::Value) -> String,
+) -> &[serde_json::Value] {
+    value
+        .as_array()
+        .unwrap_or_else(|| panic!("{}", invalid_message(value)))
+}
+
+/// Decode an integer cell from a persisted resolution body.
+pub(crate) fn stored_integer(value: &serde_json::Value, what: &str) -> i64 {
+    value
+        .as_i64()
+        .unwrap_or_else(|| panic!("stored {what} is an integer, got {value}"))
+}
+
+pub(crate) fn stored_local_node(ordinal: u32, key: i64) -> BindingNodeId {
+    BindingNodeId::local(
+        ordinal,
+        u32::try_from(key).expect("stored local node fits u32"),
+    )
+}
+
+pub(crate) fn stored_local_path(ordinal: u32, key: i64) -> PartialPathId {
+    PartialPathId::local(
+        ordinal,
+        u32::try_from(key).expect("stored local path fits u32"),
+    )
+}
+
+fn digest_for_shared_name(
+    name: Option<SharedNameId>,
+    identities: &ResolutionIdentityCatalog,
+) -> Option<[u8; 32]> {
+    name.map(|name| identities.shared_name_digest(name))
+}
 
 /// The `resolution_paths` and `resolution_identities` recipe encodings, shared
-/// by the writer (`store/resolution.rs`), the reader
-/// (`store/resolution_lexical.rs`) and the measurement loader above.
+/// by this producer, the writer (`store/resolution.rs`), and the reader
+/// (`store/resolution_lexical.rs`).
 ///
-/// It is a child module of `resolution_prepare` for the same reason
-/// `schema_loader` is: it needs `ResolutionLocalKeys`, the producer's own dense
-/// per-blob key assignment, and that type is private to this module. Its
-/// natural home is `store/resolution_rows.rs`, which needs one line in
-/// `store/mod.rs`; that file is integrator-only for this lane, so the exact
-/// diff is in the lane document instead.
+/// It is a child module because it needs `ResolutionLocalKeys`, the producer's
+/// own dense per-blob key assignment, and that type is private to this module.
 pub(crate) mod resolution_rows;
 
 pub(crate) mod authority_rows;
@@ -59,6 +116,30 @@ pub(crate) mod rust_authority;
 /// block 4, lane TF). A child module of `resolution_prepare` for the same
 /// reason `resolution_rows` is: it needs `ResolutionLocalKeys`.
 pub(crate) mod typed_rows;
+
+/// Namespace identity used by a generic reference spelling lookup.
+pub(crate) fn reference_lookup_namespace_codes(namespace: ResolutionNamespace) -> Vec<i64> {
+    vec![resolution_rows::namespace_code(namespace)]
+}
+
+/// Namespace identities accepted by a Go source-level TypeOrValue spelling
+/// lookup, whose declarations can also be indexed as callables.
+pub(crate) fn go_reference_lookup_namespace_codes(namespace: ResolutionNamespace) -> Vec<i64> {
+    let namespaces = if namespace == ResolutionNamespace::TypeOrValue {
+        vec![
+            ResolutionNamespace::TypeOrValue,
+            ResolutionNamespace::Type,
+            ResolutionNamespace::Value,
+            ResolutionNamespace::Callable,
+        ]
+    } else {
+        vec![namespace]
+    };
+    namespaces
+        .into_iter()
+        .map(resolution_rows::namespace_code)
+        .collect()
+}
 
 pub(crate) enum ResolutionInteriorPreparation {
     Prepared(Box<PreparedResolutionBundle>),
@@ -402,6 +483,8 @@ pub(crate) fn prepare_resolution_bundle_with_unit_keys(
         lowered,
         unit_keys,
         PreparedResolutionBundleRows::default(),
+        None,
+        None,
         cancellation,
     )
 }
@@ -410,6 +493,7 @@ pub(crate) fn prepare_resolution_bundle_with_source_facts(
     lowered: &LoweredResolutionFactsWithIdentityCatalog,
     unit_keys: &HashMap<CodeUnit, i64>,
     source: Option<&brokk_bifrost_core::analyzer::parsed_file::ParsedSourceFacts>,
+    source_text: Option<&str>,
     cancellation: &CancellationToken,
 ) -> super::Result<ResolutionInteriorPreparation> {
     let mut rows = PreparedResolutionBundleRows::default();
@@ -428,6 +512,8 @@ pub(crate) fn prepare_resolution_bundle_with_source_facts(
         lowered,
         Some(unit_keys),
         rows,
+        source,
+        source_text,
         cancellation,
     ))
 }
@@ -436,6 +522,8 @@ fn prepare_resolution_bundle_rows(
     lowered: &LoweredResolutionFactsWithIdentityCatalog,
     unit_keys: Option<&HashMap<CodeUnit, i64>>,
     mut rows: PreparedResolutionBundleRows,
+    source: Option<&brokk_bifrost_core::analyzer::parsed_file::ParsedSourceFacts>,
+    source_text: Option<&str>,
     cancellation: &CancellationToken,
 ) -> ResolutionInteriorPreparation {
     if cancellation.is_cancelled() {
@@ -461,8 +549,15 @@ fn prepare_resolution_bundle_rows(
     if !prepare_lexical_rows(lowered, &keys, &mut rows, cancellation) {
         return ResolutionInteriorPreparation::Cancelled;
     }
-    if !prepare_common_rows(lowered, &keys, unit_keys, &mut rows, cancellation)
-        || !prepare_typed_rows(lowered, &keys, &mut rows, cancellation)
+    if !prepare_common_rows(
+        lowered,
+        &keys,
+        unit_keys,
+        source,
+        source_text,
+        &mut rows,
+        cancellation,
+    ) || !prepare_typed_rows(lowered, &keys, &mut rows, cancellation)
         || !prepare_typed_fact_lookups(lowered, &mut rows, cancellation)
         || cancellation.is_cancelled()
     {
@@ -526,6 +621,8 @@ fn prepare_common_rows(
     lowered: &LoweredResolutionFactsWithIdentityCatalog,
     keys: &ResolutionLocalKeys,
     unit_keys: Option<&HashMap<CodeUnit, i64>>,
+    source: Option<&brokk_bifrost_core::analyzer::parsed_file::ParsedSourceFacts>,
+    source_text: Option<&str>,
     rows: &mut PreparedResolutionBundleRows,
     cancellation: &CancellationToken,
 ) -> bool {
@@ -544,8 +641,9 @@ fn prepare_common_rows(
         }
         rows.package_references.push(row![
             keys.semantic(fact.token),
-            keys.semantic(fact.domain),
             keys.semantic(fact.reference),
+            keys.semantic(fact.domain),
+            keys.semantic(fact.choice.expect("package choice is lowered")),
             fact.source_site.get(),
             keys.node(fact.root_scope),
             fact.namespace.label(),
@@ -661,6 +759,230 @@ fn prepare_common_rows(
             ]);
         }
     }
+    for fact in &common.shared_language.aliases {
+        if cancellation.is_cancelled() {
+            return false;
+        }
+        rows.jvm_aliases.push(row![
+            fact.alias.get(),
+            fact.declaration.get(),
+            fact.member_name.as_str(),
+            fact.kind.label(),
+            fact.is_static,
+            fact.parameter_count,
+            fact.status.label(),
+        ]);
+        for (ordinal, name) in fact.owner_segments.iter().enumerate() {
+            if cancellation.is_cancelled() {
+                return false;
+            }
+            rows.jvm_alias_owner_segments.push(row![
+                fact.alias.get(),
+                u32::try_from(ordinal).expect("JVM owner path fits its u32 ordinal"),
+                name.as_str(),
+            ]);
+        }
+    }
+    for fact in &common.shared_language.call_argument_lists {
+        if cancellation.is_cancelled() {
+            return false;
+        }
+        rows.call_argument_lists
+            .push(row![fact.call.get(), fact.list_ordinal,]);
+    }
+    for fact in &common.shared_language.call_arguments {
+        if cancellation.is_cancelled() {
+            return false;
+        }
+        rows.call_arguments.push(row![
+            fact.call.get(),
+            fact.list_ordinal,
+            fact.ordinal,
+            keys.semantic(fact.value),
+            fact.label.as_deref(),
+        ]);
+    }
+    for fact in &common.shared_language.named_argument_labels {
+        if cancellation.is_cancelled() {
+            return false;
+        }
+        rows.named_argument_labels.push(row![
+            fact.call.get(),
+            fact.reference.get(),
+            fact.label.as_str(),
+        ]);
+    }
+    for fact in &common.shared_language.callable_parameter_lists {
+        if cancellation.is_cancelled() {
+            return false;
+        }
+        rows.callable_parameter_lists
+            .push(row![fact.callable.get(), fact.list_ordinal,]);
+    }
+    for fact in &common.shared_language.callable_parameter_semantics {
+        if cancellation.is_cancelled() {
+            return false;
+        }
+        rows.callable_parameter_semantics.push(row![
+            fact.callable.get(),
+            fact.parameter.get(),
+            fact.list_ordinal,
+            fact.ordinal,
+            fact.label.as_str(),
+            fact.has_default,
+        ]);
+    }
+    for fact in &common.shared_language.extension_receivers {
+        if cancellation.is_cancelled() {
+            return false;
+        }
+        rows.extension_receivers
+            .push(row![fact.callable.get(), keys.semantic(fact.receiver_type),]);
+    }
+    for fact in &common.shared_language.import_selectors {
+        if cancellation.is_cancelled() {
+            return false;
+        }
+        rows.import_selectors.push(row![
+            fact.site.get(),
+            fact.kind.label(),
+            fact.source_name.as_deref(),
+            fact.local_name.as_deref(),
+        ]);
+    }
+    for fact in &common.shared_language.singleton_relations {
+        if cancellation.is_cancelled() {
+            return false;
+        }
+        rows.singleton_relations.push(row![
+            fact.declaration.get(),
+            fact.enclosing_type.map(|site| site.get()),
+            fact.kind.label(),
+        ]);
+    }
+    for fact in &common.shared_language.invocation_roles {
+        if cancellation.is_cancelled() {
+            return false;
+        }
+        rows.invocation_roles.push(row![
+            fact.site.get(),
+            fact.role.label(),
+            fact.receiver.map(|semantic| keys.semantic(semantic)),
+            fact.result.map(|semantic| keys.semantic(semantic)),
+        ]);
+    }
+    for fact in &common.shared_language.package_object_exports {
+        if cancellation.is_cancelled() {
+            return false;
+        }
+        rows.package_object_exports.push(row![
+            fact.package_object.get(),
+            fact.member.get(),
+            keys.node(fact.package_scope),
+        ]);
+    }
+    for fact in &common.package_routes {
+        if cancellation.is_cancelled() {
+            return false;
+        }
+        let package_scope = keys.node(fact.root_scope);
+        rows.package_routes.push(row![
+            package_scope,
+            fact.declaration.map(|site| site.get()),
+            fact.placement_gap_site.get(),
+        ]);
+        for (ordinal, spelling) in fact.segments.iter().enumerate() {
+            if cancellation.is_cancelled() {
+                return false;
+            }
+            rows.package_route_segments.push(row![
+                package_scope,
+                u32::try_from(ordinal).expect("package route fits its u32 ordinal"),
+                spelling.as_str(),
+            ]);
+        }
+    }
+    let macro_candidates = if lowered.lexical().language() == Language::Rust {
+        source.map(|source| rust_macro_gap_candidates(source, source_text))
+    } else {
+        None
+    };
+    let mut common_candidates_by_site = BTreeMap::<_, (bool, BTreeSet<(String, String)>)>::new();
+    for candidate in &common.rust_reverse_gap_candidates {
+        if cancellation.is_cancelled() {
+            return false;
+        }
+        let entry = common_candidates_by_site
+            .entry(candidate.site)
+            .or_insert_with(|| (false, BTreeSet::new()));
+        entry.0 |= candidate.macro_frontier;
+        if let Some(name) = &candidate.name {
+            entry.1.insert((
+                name.clone(),
+                candidate
+                    .namespace
+                    .map_or("*", ResolutionNamespace::label)
+                    .to_owned(),
+            ));
+        }
+    }
+    for (site, (macro_frontier, common_candidates)) in common_candidates_by_site {
+        if cancellation.is_cancelled() {
+            return false;
+        }
+        let glob_import_site =
+            source.is_some_and(|source| rust_gap_is_glob_import_site(site, source));
+        // Macro candidates are the complete structured view for their site,
+        // including the wildcard when that view is uncertain.
+        if macro_candidates
+            .as_ref()
+            .is_some_and(|candidates| candidates.contains_key(&site))
+        {
+            continue;
+        }
+        let ast_candidates = if macro_frontier {
+            None
+        } else if glob_import_site {
+            Some(BTreeSet::new())
+        } else {
+            source.zip(source_text).and_then(|(source, source_text)| {
+                rust_structural_gap_candidate_names(site, source, source_text)
+            })
+        };
+        if !glob_import_site {
+            for (name, namespace) in common_candidates {
+                rows.rust_reverse_gap_candidates
+                    .push(row![site.get(), name, namespace,]);
+            }
+        }
+        match ast_candidates {
+            Some(candidates) => rows.rust_reverse_gap_candidates.extend(
+                candidates
+                    .into_iter()
+                    .map(|name| row![site.get(), name, "*"]),
+            ),
+            None => rows
+                .rust_reverse_gap_candidates
+                .push(row![site.get(), "*", "*"]),
+        }
+    }
+    if let Some(macro_candidates) = macro_candidates {
+        for (site, candidates) in macro_candidates {
+            if cancellation.is_cancelled() {
+                return false;
+            }
+            match candidates {
+                Some(candidates) => rows.rust_reverse_gap_candidates.extend(
+                    candidates
+                        .into_iter()
+                        .map(|name| row![site.get(), name, "*"]),
+                ),
+                None => rows
+                    .rust_reverse_gap_candidates
+                    .push(row![site.get(), "*", "*"]),
+            }
+        }
+    }
     true
 }
 
@@ -673,7 +995,7 @@ fn lookup_spelling(identities: &ResolutionIdentityCatalog, semantic: SemanticId)
 }
 
 /// Give every lookup recipe its storage-local key, and hold that each one
-/// speaks the artifact's semantic language.
+/// uses the identity domain selected for the artifact's language.
 ///
 /// This pass wrote a row until the name-mention relation was deleted. The
 /// shared slice of the identity catalog is no longer a relation of its own: it
@@ -691,9 +1013,9 @@ fn prepare_lookup_recipe_keys(
             return false;
         }
         assert_eq!(
-            recipe.semantic_language(),
-            lowered.lexical().language().config_label(),
-            "lookup recipe language must equal the artifact semantic language"
+            recipe.identity_domain(),
+            language_identity_domain(lowered.lexical().language()),
+            "lookup recipe identity domain must match the artifact language"
         );
         keys.semantic(*semantic);
     }
@@ -882,8 +1204,7 @@ fn prepare_lexical_rows(
                                     ResolutionSiteKind::CallableReference
                                         | ResolutionSiteKind::MemberReference
                                 )
-                                && metadata.unqualified()
-                                    == (origin == ResolutionCallableReceiverOrigin::Implicit)
+                                && origin.is_reference_qualification_valid(metadata.unqualified())
                         }),
                         "a callable receiver origin needs a callable reference site: {metadata:?}"
                     );
@@ -949,11 +1270,240 @@ fn prepare_lexical_rows(
             path,
             sites_by_node.get(&path.start().node()).copied(),
             identities,
+            &lowered.common().reference_lookup_identities,
             rows,
         );
     }
 
     !cancellation.is_cancelled()
+}
+
+/// Names inside a non-macro gap, selected from names attached to structured
+/// Rust AST nodes. `None` means the source cannot prove a closed name set.
+fn rust_gap_is_glob_import_site(
+    site: brokk_bifrost_core::analyzer::resolution_facts::ResolutionSiteId,
+    source: &brokk_bifrost_core::analyzer::parsed_file::ParsedSourceFacts,
+) -> bool {
+    let Some(occurrence) = source.native_site_occurrences.get(site.index()).copied() else {
+        return false;
+    };
+    let gap = source.occurrences.occurrence(occurrence).range;
+    source.imports.iter().any(|import| {
+        if !import.is_wildcard {
+            return false;
+        }
+        let range = source.occurrences.occurrence(import.declaration).range;
+        range.start_byte <= gap.end_byte && gap.start_byte <= range.end_byte
+    })
+}
+
+fn rust_structural_gap_candidate_names(
+    site: brokk_bifrost_core::analyzer::resolution_facts::ResolutionSiteId,
+    source: &brokk_bifrost_core::analyzer::parsed_file::ParsedSourceFacts,
+    source_text: &str,
+) -> Option<BTreeSet<String>> {
+    let occurrence = *source.native_site_occurrences.get(site.index())?;
+    let gap = source.occurrences.occurrence(occurrence).range;
+    let overlaps = |start: usize, end: usize| {
+        if start == end {
+            gap.start_byte <= start && start <= gap.end_byte
+        } else {
+            start < gap.end_byte && gap.start_byte < end
+        }
+    };
+    if source.structural.recovered_regions().iter().any(|region| {
+        let (start, end) = (region.start_byte, region.end_byte);
+        if start == end {
+            gap.start_byte <= start && start <= gap.end_byte
+        } else {
+            start < gap.end_byte && gap.start_byte < end
+        }
+    }) {
+        return None;
+    }
+    if source.imports.iter().any(|import| {
+        if import.path.is_some() {
+            return false;
+        }
+        let range = source.occurrences.occurrence(import.declaration).range;
+        overlaps(range.start_byte, range.end_byte)
+    }) {
+        return None;
+    }
+
+    let mut candidates = BTreeSet::new();
+    for node in source.structural.nodes() {
+        let node_range = source.occurrences.occurrence(node.occurrence).range;
+        let Some(name) = node.name else {
+            // Calls and field accesses are structural wrappers. Their callee
+            // or field identifier carries the candidate spelling when one
+            // exists; treating a nameless wrapper as an unknown identifier
+            // would make every such gap a wildcard.
+            if node.kind == NormalizedKind::Identifier
+                && overlaps(node_range.start_byte, node_range.end_byte)
+            {
+                return None;
+            }
+            continue;
+        };
+        let range = source.occurrences.occurrence(name).range;
+        if range.start_byte < gap.start_byte || range.end_byte > gap.end_byte {
+            continue;
+        }
+        let spelling = source_text.get(range.start_byte..range.end_byte)?;
+        let spelling =
+            brokk_bifrost_core::analyzer::symbol_path::strip_raw_identifier_prefix(spelling);
+        if spelling.is_empty() {
+            return None;
+        }
+        candidates.insert(spelling.to_owned());
+    }
+    Some(candidates)
+}
+
+/// Candidate names from an unresolved macro frontier. A visible `macro_rules!`
+/// definition is precise enough to use its invocation tokens and transcriber
+/// identifiers, even when parsing the invocation interior failed. Unknown
+/// definitions and identifier synthesis stay wildcard.
+fn rust_macro_definition_is_visible(
+    source: &brokk_bifrost_core::analyzer::parsed_file::ParsedSourceFacts,
+    definition: &brokk_bifrost_core::analyzer::rust_facts::RustMacroDefinitionSourceFact,
+    invocation: &brokk_bifrost_core::analyzer::rust_facts::RustItemMacroSourceFact,
+) -> bool {
+    let definition_range = source
+        .occurrences
+        .occurrence(
+            source
+                .occurrences
+                .declaration(definition.declaration)
+                .occurrence,
+        )
+        .range;
+    let invocation_range = source.occurrences.occurrence(invocation.invocation).range;
+    if definition_range.end_byte > invocation_range.start_byte {
+        return false;
+    }
+    let mut context = Some(invocation.context);
+    while let Some(current) = context {
+        if current == definition.context {
+            return true;
+        }
+        context = source
+            .rust_items
+            .contexts
+            .iter()
+            .find(|fact| fact.context == current)
+            .and_then(|fact| fact.parent);
+    }
+    false
+}
+
+fn rust_macro_gap_candidates(
+    source: &brokk_bifrost_core::analyzer::parsed_file::ParsedSourceFacts,
+    source_text: Option<&str>,
+) -> BTreeMap<
+    brokk_bifrost_core::analyzer::resolution_facts::ResolutionSiteId,
+    Option<BTreeSet<String>>,
+> {
+    let mut result = BTreeMap::new();
+    let Some(module_facts) = source.rust_modules.as_ref() else {
+        return result;
+    };
+    for input in &source.rust_items.macro_inputs {
+        let Some((site, _scope)) = input.native_frontier else {
+            continue;
+        };
+        let invocation_name = module_facts
+            .invocations
+            .iter()
+            .find(|invocation| invocation.occurrence == input.invocation)
+            .map(|invocation| invocation.name.as_str());
+        let invocation_fact = source
+            .rust_items
+            .macros
+            .iter()
+            .find(|fact| fact.invocation == input.invocation);
+        let definitions = invocation_name
+            .zip(invocation_fact)
+            .map(|(name, invocation)| {
+                source
+                    .rust_items
+                    .macro_definitions
+                    .iter()
+                    .filter(|definition| {
+                        let Some(source_text) = source_text else {
+                            return false;
+                        };
+                        let declaration = source.occurrences.declaration(definition.declaration);
+                        let Some(name_occurrence) = declaration.name else {
+                            return false;
+                        };
+                        let range = source.occurrences.occurrence(name_occurrence).range;
+                        source_text
+                        .get(range.start_byte..range.end_byte)
+                        .is_some_and(|spelling| {
+                            brokk_bifrost_core::analyzer::symbol_path::strip_raw_identifier_prefix(
+                                spelling,
+                            ) == name
+                        })
+                        && rust_macro_definition_is_visible(source, definition, invocation)
+                    })
+                    .collect::<Vec<_>>()
+            });
+        let Some(definitions) = definitions.filter(|definitions| {
+            !definitions.is_empty()
+                && definitions
+                    .iter()
+                    .all(|definition| definition.is_macro_rules)
+        }) else {
+            result.insert(site, None);
+            continue;
+        };
+        if definitions
+            .iter()
+            .flat_map(|definition| &definition.arms)
+            .any(|arm| {
+                arm.transcriber_identifiers.is_none()
+                    || arm
+                        .transcriber_identifiers
+                        .as_ref()
+                        .is_some_and(|identifiers| {
+                            identifiers.iter().any(|name| {
+                                matches!(name.as_str(), "paste" | "concat_idents" | "format_ident")
+                            })
+                        })
+            })
+        {
+            result.insert(site, None);
+            continue;
+        }
+        let mut candidates = BTreeSet::new();
+        for token in &input.tree.tokens {
+            if !matches!(
+                token.syntax_kind.as_str(),
+                "identifier" | "type_identifier" | "field_identifier" | "primitive_type"
+            ) {
+                continue;
+            }
+            let spelling = input.tree.token_text(token);
+            let spelling =
+                brokk_bifrost_core::analyzer::symbol_path::strip_raw_identifier_prefix(spelling);
+            if !spelling.is_empty() {
+                candidates.insert(spelling.to_owned());
+            }
+        }
+        for definition in definitions {
+            for arm in &definition.arms {
+                candidates.extend(
+                    arm.transcriber_identifiers
+                        .iter()
+                        .flat_map(|identifiers| identifiers.iter().cloned()),
+                );
+            }
+        }
+        result.insert(site, Some(candidates));
+    }
+    result
 }
 
 /// The shared identity a reference in this blob looks up through the crate
@@ -1025,6 +1575,7 @@ fn prepare_root_route(
     path: &PartialPath,
     start_site: Option<&LoweredSemanticSite>,
     identities: &ResolutionIdentityCatalog,
+    reference_lookup_identities: &[crate::analyzer::resolution::LoweredReferenceLookupIdentity],
     rows: &mut PreparedResolutionBundleRows,
 ) {
     if path.end().node() != BindingNodeId::universal_root() {
@@ -1040,6 +1591,20 @@ fn prepare_root_route(
     let Some(metadata) = site.site_metadata() else {
         return;
     };
+    // A qualified macro path starts its crate route at the positioned Type
+    // reference to its first segment. That reference semantic is deliberately
+    // not a lookup recipe, so the generic path-symbol projection below drops
+    // the route. The common facts retain the exact source-prefix-to-name link;
+    // use it only for MacroReference paths, where the first segment is a
+    // module or crate path rather than a type receiver.
+    let macro_prefix = (metadata.namespace() == ResolutionNamespace::Macro)
+        .then(|| {
+            reference_lookup_identities
+                .binary_search_by_key(&site.semantic(), |row| row.reference)
+                .ok()
+                .map(|index| &reference_lookup_identities[index])
+        })
+        .flatten();
     let Some(terminal) = identities.lookup_recipe(
         fixed
             .last()
@@ -1050,7 +1615,18 @@ fn prepare_root_route(
     };
     let segments = fixed[1..fixed.len() - 2]
         .iter()
-        .map(|symbol| identities.lookup_recipe(symbol.symbol()))
+        .map(|symbol| {
+            let semantic = symbol.symbol();
+            identities.lookup_recipe(semantic).or_else(|| {
+                macro_prefix
+                    .filter(|prefix| prefix.prefix_reference == semantic)
+                    .map(|prefix| {
+                        identities
+                            .lookup_recipe(prefix.lookup)
+                            .expect("a qualified macro prefix has a lookup recipe")
+                    })
+            })
+        })
         .collect::<Option<Vec<_>>>();
     let Some(segments) = segments else {
         return;
@@ -1096,13 +1672,11 @@ fn push_reference_lookup_identity(
     let Some(identity) = identities.semantic_identity(lookup) else {
         return;
     };
-    let Some(name) = identity.shared_name() else {
+    let Some(digest) = digest_for_shared_name(identity.shared_name(), identities) else {
         return;
     };
-    rows.reference_lookup_identities.push(row![
-        keys.semantic(reference),
-        identities.shared_name_digest(name)
-    ]);
+    rows.reference_lookup_identities
+        .push(row![keys.semantic(reference), digest]);
 }
 
 /// The tier-1 discovery headers of one universal-root-rooted partial path.
@@ -1250,6 +1824,7 @@ fn prepare_typed_rows(
                     rule.value_transform(),
                     TypeTransferValueTransform::Preserve
                         | TypeTransferValueTransform::AddressableRuntimeOnly
+                        | TypeTransferValueTransform::ToRuntime { addressable: false }
                 ) && rule.reference_indirection_delta() == 0
                     && rule.indirection_delta() == 0
                     && matches!(
@@ -1261,6 +1836,41 @@ fn prepare_typed_rows(
                     )
                     && target_role == Some(ResolutionTypeSlotRole::DeclaredValue),
                 "initialization transfer has inconsistent roles or transform: {rule:?}"
+            ),
+            ResolutionTypeTransferKind::Contextual => assert!(
+                matches!(
+                    rule.value_transform(),
+                    TypeTransferValueTransform::Preserve
+                        | TypeTransferValueTransform::ToRuntime { addressable: false }
+                ) && rule.reference_indirection_delta() == 0
+                    && rule.indirection_delta() == 0
+                    && matches!(
+                        source_role,
+                        Some(
+                            ResolutionTypeSlotRole::DeclaredValue
+                                | ResolutionTypeSlotRole::ExpressionValue
+                                | ResolutionTypeSlotRole::CallResult
+                        )
+                    )
+                    && target_role == Some(ResolutionTypeSlotRole::ExpressionValue),
+                "contextual type transfer has inconsistent roles or transform: {rule:?}"
+            ),
+            ResolutionTypeTransferKind::ExpressionResult => assert!(
+                matches!(
+                    rule.value_transform(),
+                    TypeTransferValueTransform::Preserve
+                        | TypeTransferValueTransform::ToRuntime { addressable: false }
+                ) && rule.reference_indirection_delta() == 0
+                    && rule.indirection_delta() == 0
+                    && matches!(
+                        source_role,
+                        Some(
+                            ResolutionTypeSlotRole::ExpressionValue
+                                | ResolutionTypeSlotRole::CallResult
+                        )
+                    )
+                    && target_role == Some(ResolutionTypeSlotRole::ExpressionValue),
+                "expression-result transfer has inconsistent roles or transform: {rule:?}"
             ),
             ResolutionTypeTransferKind::TypeIdentity | ResolutionTypeTransferKind::TypeUnion => {
                 assert!(
@@ -1333,6 +1943,7 @@ fn prepare_typed_rows(
                 | BindingProjectionKind::TargetMemberOwnerType =>
                     ResolutionTypeSlotRole::TargetTypeIdentity,
                 BindingProjectionKind::TargetCallableResultType
+                | BindingProjectionKind::TargetCallableLaterResultType
                 | BindingProjectionKind::TargetConstructorOwnerType =>
                     ResolutionTypeSlotRole::CallResult,
                 BindingProjectionKind::TargetDeclaredValueType
@@ -1346,6 +1957,33 @@ fn prepare_typed_rows(
             projected_slots.insert(projection.output_slot()),
             "one typed frontier has one producer: {:?}",
             projection.output_slot()
+        );
+    }
+    for argument in typed.type_arguments() {
+        if cancellation.is_cancelled() {
+            return false;
+        }
+        keys.semantic(argument.application());
+        keys.semantic(argument.argument());
+        assert_eq!(
+            frontier_roles.get(&argument.application()),
+            Some(&ResolutionTypeSlotRole::TargetTypeIdentity)
+        );
+        assert_eq!(
+            frontier_roles.get(&argument.argument()),
+            Some(&ResolutionTypeSlotRole::TargetTypeIdentity)
+        );
+    }
+    for parameter in typed.generic_type_alias_parameters() {
+        if cancellation.is_cancelled() {
+            return false;
+        }
+        keys.semantic(parameter.alias());
+        keys.semantic(parameter.parameter());
+        keys.semantic(parameter.target());
+        assert_eq!(
+            frontier_roles.get(&parameter.target()),
+            Some(&ResolutionTypeSlotRole::TargetTypeIdentity)
         );
     }
     for transfer in typed.transfers() {
@@ -1524,6 +2162,39 @@ fn prepare_typed_fact_lookups(
             projection.output_slot(),
         );
     }
+    for argument in typed.type_arguments() {
+        if cancellation.is_cancelled() {
+            return false;
+        }
+        push_typed_fact_lookup(
+            rows,
+            identities,
+            TypedFactRelation::TypeArgumentApplication,
+            argument.application(),
+        );
+    }
+    for parameter in typed.generic_type_alias_parameters() {
+        if cancellation.is_cancelled() {
+            return false;
+        }
+        push_typed_fact_lookup(
+            rows,
+            identities,
+            TypedFactRelation::GenericTypeAliasDefinition,
+            parameter.alias(),
+        );
+    }
+    for formal in typed.generic_formals() {
+        if cancellation.is_cancelled() {
+            return false;
+        }
+        push_typed_fact_lookup(
+            rows,
+            identities,
+            TypedFactRelation::GenericFormalOwner,
+            formal.owner(),
+        );
+    }
     for route in typed.qualified_routes() {
         if cancellation.is_cancelled() {
             return false;
@@ -1586,6 +2257,17 @@ fn prepare_typed_fact_lookups(
             identities,
             TypedFactRelation::TypeTransferTargetSlot,
             transfer.rule().target_slot(),
+        );
+    }
+    for argument in typed.declared_type_arguments() {
+        if cancellation.is_cancelled() {
+            return false;
+        }
+        push_typed_fact_lookup(
+            rows,
+            identities,
+            TypedFactRelation::DeclaredTypeArgumentOwner,
+            argument.owner(),
         );
     }
     for property in typed.declaration_types() {
@@ -1786,11 +2468,10 @@ fn push_typed_fact_lookup(
             relation.label()
         )
     });
-    let Some(name) = identity.shared_name() else {
+    let Some(digest) = digest_for_shared_name(identity.shared_name(), identities) else {
         return;
     };
-    rows.typed_fact_lookups
-        .push(row![relation.code(), identities.shared_name_digest(name)]);
+    rows.typed_fact_lookups.push(row![relation.code(), digest]);
 }
 
 /// `resolution_fragment_interiors_validate_typed_semantic_ownership` proved
@@ -2123,7 +2804,7 @@ fn dense_key(index: usize) -> i64 {
 }
 
 fn usize_i64(value: usize) -> i64 {
-    i64::try_from(value).expect("resolution row count fits SQLite INTEGER")
+    crate::analyzer::store::sqlite_integer(value).expect("resolution row count fits SQLite INTEGER")
 }
 
 const fn qualified_namespace_label(namespace: ResolutionNamespace) -> &'static str {
@@ -2153,40 +2834,17 @@ const fn definition_gap_kind_label(kind: ResolutionGapKind) -> &'static str {
 mod tests {
     use std::panic::{AssertUnwindSafe, catch_unwind};
 
-    use brokk_bifrost_core::analyzer::resolution_facts::{
-        FileResolutionFacts, ResolutionGapFact, ResolutionScopeFact, ResolutionScopeId,
-        ResolutionScopeInheritance, ResolutionScopeKind, ResolutionSiteFact, ResolutionSiteId,
-        ResolutionSiteKind,
-    };
+    use brokk_bifrost_core::analyzer::resolution_facts::FileResolutionFacts;
 
-    use crate::analyzer::resolution::{BindingFragmentId, rich_java_resolution_facts_for_test};
+    use crate::analyzer::resolution::{
+        BindingFragmentId, rich_java_resolution_facts_for_test,
+        test_support::unsupported_expression_gap_facts,
+    };
 
     use super::*;
 
     fn gap_facts() -> FileResolutionFacts {
-        FileResolutionFacts {
-            scopes: vec![ResolutionScopeFact {
-                id: ResolutionScopeId::new(0),
-                parent: None,
-                owner: None,
-                kind: ResolutionScopeKind::CompilationUnit,
-                inheritance: ResolutionScopeInheritance::Lexical,
-                start_byte: 0,
-                end_byte: 100,
-            }],
-            sites: vec![ResolutionSiteFact {
-                id: ResolutionSiteId::new(0),
-                scope: ResolutionScopeId::new(0),
-                kind: ResolutionSiteKind::UnsupportedExpression,
-                start_byte: 20,
-                end_byte: 21,
-            }],
-            gaps: vec![ResolutionGapFact {
-                site: ResolutionSiteId::new(0),
-                kind: ResolutionGapKind::UnsupportedExpression,
-            }],
-            ..FileResolutionFacts::default()
-        }
+        unsupported_expression_gap_facts()
     }
 
     fn prepared(
@@ -2200,6 +2858,112 @@ mod tests {
             &gap_facts(),
         );
         prepare_resolution_bundle_with_unit_keys(&lowered, None, cancellation)
+    }
+
+    #[test]
+    fn source_aware_preparation_has_known_empty_non_rust_authority_and_requires_rust_source() {
+        let cancellation = CancellationToken::new();
+        let lowered = crate::analyzer::resolution::lower_resolution_facts_for_selection(
+            BindingFragmentId::for_test(b"empty-authority"),
+            crate::analyzer::resolution::test_shared_names(),
+            Language::Java,
+            &gap_facts(),
+        );
+        let ResolutionInteriorPreparation::Prepared(bundle) =
+            prepare_resolution_bundle_with_source_facts(
+                &lowered,
+                &HashMap::default(),
+                None,
+                None,
+                &cancellation,
+            )
+            .unwrap()
+        else {
+            panic!("live preparation");
+        };
+        let columns = super::super::resolution::RESOLUTION_MANIFEST_COUNT_COLUMNS;
+        let counts = bundle.family_counts();
+        for name in [
+            "expected_rust_reference_context_count",
+            "expected_rust_declaration_authority_count",
+        ] {
+            assert_eq!(
+                counts[columns.iter().position(|column| *column == name).unwrap()],
+                0
+            );
+        }
+        let rust = crate::analyzer::resolution::lower_resolution_facts_for_selection(
+            BindingFragmentId::for_test(b"missing-source"),
+            crate::analyzer::resolution::test_shared_names(),
+            Language::Rust,
+            &gap_facts(),
+        );
+        assert!(
+            catch_unwind(AssertUnwindSafe(|| {
+                prepare_resolution_bundle_with_source_facts(
+                    &rust,
+                    &HashMap::default(),
+                    None,
+                    None,
+                    &cancellation,
+                )
+            }))
+            .is_err(),
+            "Rust publication requires canonical source input even when no reference authority rows result"
+        );
+    }
+
+    #[test]
+    fn preparation_rebases_mounted_ids_to_equal_storage_local_bundles() {
+        let ResolutionInteriorPreparation::Prepared(first) =
+            prepared(1, &CancellationToken::default())
+        else {
+            panic!("uncancelled preparation must finish")
+        };
+        let ResolutionInteriorPreparation::Prepared(second) =
+            prepared(2, &CancellationToken::default())
+        else {
+            panic!("uncancelled preparation must finish")
+        };
+
+        assert_eq!(first.semantic_language(), Language::Rust);
+        assert_eq!(first, second);
+        // The fixture's one unsupported expression is interior detail from
+        // end to end, so what the rebasing must reproduce exactly is the
+        // bundle itself, digest and accounting included.
+        assert_eq!(first.interior_digest(), second.interior_digest());
+    }
+
+    #[test]
+    fn java_root_shadow_preparation_is_storage_local_across_a_to_b_to_a() {
+        let facts = rich_java_resolution_facts_for_test();
+        let cancellation = CancellationToken::default();
+        let bundles = [1_u8, 2, 1].map(|fragment_byte| {
+            let lowered = crate::analyzer::resolution::lower_resolution_facts_for_selection(
+                BindingFragmentId::for_test([fragment_byte]),
+                crate::analyzer::resolution::test_shared_names(),
+                Language::Java,
+                &facts,
+            );
+            let ResolutionInteriorPreparation::Prepared(bundle) =
+                prepare_resolution_bundle_with_unit_keys(&lowered, None, &cancellation)
+            else {
+                panic!("uncancelled Java root-shadow preparation must finish")
+            };
+            *bundle
+        });
+
+        assert_eq!(bundles[0], bundles[1]);
+        assert_eq!(bundles[0], bundles[2]);
+        assert_eq!(
+            bundles[0].producer_epoch(),
+            crate::analyzer::store::resolution::resolution_bundle_epoch(Language::Java)
+        );
+        let endpoint_header_family = super::super::resolution::RESOLUTION_MANIFEST_COUNT_COLUMNS
+            .iter()
+            .position(|column| *column == "expected_path_endpoint_header_count")
+            .expect("path endpoint header manifest family");
+        assert!(bundles[0].family_counts()[endpoint_header_family] > 1);
     }
 
     #[test]
@@ -2293,192 +3057,128 @@ mod tests {
     }
 
     #[test]
-    fn source_aware_preparation_has_known_empty_non_rust_authority_and_requires_rust_source() {
-        let cancellation = CancellationToken::new();
-        let lowered = crate::analyzer::resolution::lower_resolution_facts_for_selection(
-            BindingFragmentId::for_test(b"empty-authority"),
-            crate::analyzer::resolution::test_shared_names(),
-            Language::Java,
-            &gap_facts(),
+    fn rust_structural_gap_candidates_read_ast_selected_identifier_names() {
+        let source = "fn check() { callbacks[0]().inspect(); }";
+        let mut parser = tree_sitter::Parser::new();
+        parser
+            .set_language(&tree_sitter_rust::LANGUAGE.into())
+            .expect("configure Rust parser");
+        let tree = parser.parse(source, None).expect("parse Rust fixture");
+        let file = crate::analyzer::ProjectFile::new(
+            std::env::temp_dir().join("rust-structural-gap-candidates"),
+            "lib.rs",
         );
-        let ResolutionInteriorPreparation::Prepared(bundle) =
-            prepare_resolution_bundle_with_source_facts(
-                &lowered,
-                &HashMap::default(),
-                None,
-                &cancellation,
-            )
-            .unwrap()
-        else {
-            panic!("live preparation");
-        };
-        let columns = super::super::resolution::RESOLUTION_MANIFEST_COUNT_COLUMNS;
-        let counts = bundle.family_counts();
-        for name in [
-            "expected_rust_reference_context_count",
-            "expected_rust_declaration_authority_count",
-        ] {
-            assert_eq!(
-                counts[columns.iter().position(|column| *column == name).unwrap()],
-                0
-            );
-        }
-        let rust = crate::analyzer::resolution::lower_resolution_facts_for_selection(
-            BindingFragmentId::for_test(b"missing-source"),
-            crate::analyzer::resolution::test_shared_names(),
-            Language::Rust,
-            &gap_facts(),
-        );
-        assert!(
-            catch_unwind(AssertUnwindSafe(|| {
-                prepare_resolution_bundle_with_source_facts(
-                    &rust,
-                    &HashMap::default(),
-                    None,
-                    &cancellation,
-                )
-            }))
-            .is_err(),
-            "Rust publication requires canonical source input even when no reference authority rows result"
-        );
-    }
-
-    #[test]
-    fn preparation_rebases_mounted_ids_to_equal_storage_local_bundles() {
-        let ResolutionInteriorPreparation::Prepared(first) =
-            prepared(1, &CancellationToken::default())
-        else {
-            panic!("uncancelled preparation must finish")
-        };
-        let ResolutionInteriorPreparation::Prepared(second) =
-            prepared(2, &CancellationToken::default())
-        else {
-            panic!("uncancelled preparation must finish")
-        };
-
-        assert_eq!(first.semantic_language(), Language::Rust);
-        assert_eq!(first, second);
-        // The fixture's one unsupported expression is interior detail from
-        // end to end, so what the rebasing must reproduce exactly is the
-        // bundle itself, digest and accounting included.
-        assert_eq!(first.interior_digest(), second.interior_digest());
-    }
-
-    #[test]
-    fn java_root_shadow_preparation_is_storage_local_across_a_to_b_to_a() {
-        let facts = rich_java_resolution_facts_for_test();
-        let cancellation = CancellationToken::default();
-        let bundles = [1_u8, 2, 1].map(|fragment_byte| {
-            let lowered = crate::analyzer::resolution::lower_resolution_facts_for_selection(
-                BindingFragmentId::for_test([fragment_byte]),
-                crate::analyzer::resolution::test_shared_names(),
-                Language::Java,
-                &facts,
-            );
-            let ResolutionInteriorPreparation::Prepared(bundle) =
-                prepare_resolution_bundle_with_unit_keys(&lowered, None, &cancellation)
-            else {
-                panic!("uncancelled Java root-shadow preparation must finish")
-            };
-            *bundle
-        });
-
-        assert_eq!(bundles[0], bundles[1]);
-        assert_eq!(bundles[0], bundles[2]);
-        assert_eq!(
-            bundles[0].producer_epoch(),
-            crate::analyzer::store::resolution::resolution_bundle_epoch(Language::Java)
-        );
-        let endpoint_header_family = super::super::resolution::RESOLUTION_MANIFEST_COUNT_COLUMNS
+        let parsed = brokk_bifrost_rust::declarations::parse_rust_file(&file, source, &tree);
+        let source_facts = parsed
+            .source_facts
+            .as_ref()
+            .expect("Rust parser publishes canonical source facts");
+        let site = parsed
+            .resolution_facts
+            .gaps
             .iter()
-            .position(|column| *column == "expected_path_endpoint_header_count")
-            .expect("path endpoint header manifest family");
-        assert!(bundles[0].family_counts()[endpoint_header_family] > 1);
+            .find_map(|gap| {
+                let occurrence = source_facts.native_site_occurrences[gap.site.index()];
+                let range = source_facts.occurrences.occurrence(occurrence).range;
+                (source.get(range.start_byte..range.end_byte) == Some("inspect"))
+                    .then_some(gap.site)
+            })
+            .expect("unsupported receiver gap is positioned on the inspect method");
+        let names = rust_structural_gap_candidate_names(site, source_facts, source)
+            .expect("valid AST facts close the method gap's name set");
+        assert!(names.contains("inspect"), "AST names: {names:?}");
     }
 
     #[test]
-    fn preparation_returns_explicit_cancellation_before_publication() {
-        let cancellation = CancellationToken::default();
-        cancellation.cancel();
-        assert!(matches!(
-            prepared(1, &cancellation),
-            ResolutionInteriorPreparation::Cancelled
+    fn rust_structural_gap_candidates_include_simple_call_callee_names() {
+        let source = "use renamed::missing::*; fn caller() { target(); }";
+        let mut parser = tree_sitter::Parser::new();
+        parser
+            .set_language(&tree_sitter_rust::LANGUAGE.into())
+            .expect("configure Rust parser");
+        let tree = parser.parse(source, None).expect("parse Rust fixture");
+        let file = crate::analyzer::ProjectFile::new(
+            std::env::temp_dir().join("rust-simple-call-gap-candidates"),
+            "lib.rs",
+        );
+        let parsed = brokk_bifrost_rust::declarations::parse_rust_file(&file, source, &tree);
+        let source_facts = parsed
+            .source_facts
+            .as_ref()
+            .expect("Rust parser publishes canonical source facts");
+        let site = parsed
+            .resolution_facts
+            .gaps
+            .iter()
+            .find_map(|gap| {
+                let occurrence = source_facts.native_site_occurrences[gap.site.index()];
+                let range = source_facts.occurrences.occurrence(occurrence).range;
+                (source.get(range.start_byte..range.end_byte) == Some("target")).then_some(gap.site)
+            })
+            .expect("simple call publishes a target-spelled applicability gap");
+        let names = rust_structural_gap_candidate_names(site, source_facts, source)
+            .expect("valid AST facts close the call gap's name set");
+        assert!(names.contains("target"), "AST names: {names:?}");
+    }
+
+    #[test]
+    fn visible_macro_rules_names_survive_unavailable_invocation_parse() {
+        let source =
+            "macro_rules! visible { () => { target_marker(); }; }\nfn caller() { visible!(); }\n";
+        let mut parser = tree_sitter::Parser::new();
+        parser
+            .set_language(&tree_sitter_rust::LANGUAGE.into())
+            .expect("configure Rust parser");
+        let tree = parser.parse(source, None).expect("parse Rust fixture");
+        let file = crate::analyzer::ProjectFile::new(
+            std::env::temp_dir().join("rust-visible-macro-gap-candidates"),
+            "lib.rs",
+        );
+        let parsed = brokk_bifrost_rust::declarations::parse_rust_file(&file, source, &tree);
+        let mut source_facts = parsed
+            .source_facts
+            .clone()
+            .expect("Rust parser publishes canonical source facts");
+        let invocation = source_facts
+            .rust_modules
+            .as_ref()
+            .expect("Rust module facts are available")
+            .invocations
+            .iter()
+            .find(|invocation| invocation.name == "visible")
+            .expect("fixture invocation is recorded")
+            .occurrence;
+        let input = source_facts
+            .rust_items
+            .macro_inputs
+            .iter_mut()
+            .find(|input| input.invocation == invocation)
+            .expect("macro invocation input is recorded");
+        let site = brokk_bifrost_core::analyzer::resolution_facts::ResolutionSiteId::new(0);
+        input.native_frontier = Some((
+            site,
+            brokk_bifrost_core::analyzer::resolution_facts::ResolutionScopeId::new(0),
         ));
-    }
+        source_facts
+            .rust_items
+            .macros
+            .iter_mut()
+            .find(|fact| fact.invocation == invocation)
+            .expect("macro parse outcome is recorded")
+            .expansion =
+            brokk_bifrost_core::analyzer::rust_facts::RustItemMacroExpansion::Unavailable(
+                brokk_bifrost_core::analyzer::rust_facts::RustMacroParseFailure::ParseUnavailable,
+            );
 
-    #[test]
-    fn local_keys_are_exact_indexes_into_descriptor_sorted_catalogs() {
-        let lowered = crate::analyzer::resolution::lower_resolution_facts_for_selection(
-            BindingFragmentId::for_test(b"digest-3"),
-            crate::analyzer::resolution::test_shared_names(),
-            Language::Java,
-            &rich_java_resolution_facts_for_test(),
-        );
-        let keys = ResolutionLocalKeys::new(&lowered, &CancellationToken::default())
-            .expect("uncancelled key construction");
-        let catalog = lowered.identities();
-        assert!(!catalog.semantics().is_empty());
-        assert!(!catalog.nodes().is_empty());
-        assert!(!catalog.paths().is_empty());
-        assert!(!catalog.stack_variables().is_empty());
-
-        for (index, &(mounted, expected)) in catalog.semantics().iter().enumerate() {
-            let key = keys.semantic(mounted);
-            assert_eq!(key, dense_key(index));
-            assert_eq!(
-                catalog_identity_at(catalog.semantics(), mounted, key, "semantic test catalog"),
-                expected
+        let candidates = rust_macro_gap_candidates(&source_facts, Some(source));
+        let Some(Some(candidates)) = candidates.get(&site) else {
+            panic!(
+                "visible macro_rules definition bounds the unavailable frontier: {candidates:?}"
             );
-        }
-        for (index, &(mounted, expected)) in catalog.nodes().iter().enumerate() {
-            let key = keys.node(mounted);
-            assert_eq!(key, dense_key(index));
-            assert_eq!(
-                catalog_identity_at(catalog.nodes(), mounted, key, "node test catalog"),
-                expected
-            );
-        }
-        for (index, &(mounted, expected)) in catalog.paths().iter().enumerate() {
-            let key = keys.path(mounted);
-            assert_eq!(key, dense_key(index));
-            assert_eq!(
-                catalog_identity_at(catalog.paths(), mounted, key, "path test catalog"),
-                expected
-            );
-        }
-        for (index, &(mounted, expected)) in catalog.stack_variables().iter().enumerate() {
-            let key = keys.variable(mounted);
-            assert_eq!(key, dense_key(index));
-            assert_eq!(
-                catalog_identity_at(
-                    catalog.stack_variables(),
-                    mounted,
-                    key,
-                    "stack-variable test catalog",
-                ),
-                expected
-            );
-        }
-
-        assert_eq!(
-            keys.node_coordinate(BindingNodeId::universal_root()),
-            PreparedNodeCoordinate {
-                local_key: PreparedResolutionValue::Null,
-                boundary_key: BindingNodeId::UNIVERSAL_ROOT_BOUNDARY_KEY.into(),
-            }
-        );
-        let local_node = lowered.lexical().nodes()[0].0;
-        assert_eq!(
-            keys.node_coordinate(local_node),
-            PreparedNodeCoordinate {
-                local_key: keys.node(local_node).into(),
-                boundary_key: PreparedResolutionValue::Null,
-            }
-        );
-        let unknown = BindingNodeId::for_test(b"unknown-non-root-node");
+        };
         assert!(
-            catch_unwind(AssertUnwindSafe(|| keys.node_coordinate(unknown))).is_err(),
-            "only the exact universal root may bypass the local identity catalog"
+            candidates.contains("target_marker"),
+            "transcriber names remain target candidates: {candidates:?}"
         );
     }
 }

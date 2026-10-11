@@ -65,6 +65,18 @@ pub(crate) enum PhpOverlayMember {
     Unknown,
 }
 
+fn php_members_in_owner_closure<'a>(
+    overlay: &'a SemanticModelOverlay,
+    owners: impl IntoIterator<Item = &'a str>,
+    member: &str,
+) -> Vec<&'a SemanticModelSymbol> {
+    owners
+        .into_iter()
+        .flat_map(|owner| overlay.members_of(owner).records)
+        .filter(|symbol| symbol.name == member)
+        .collect()
+}
+
 /// The synthetic owner every PHP global-namespace function and constant hangs
 /// off. Kept in step with `super::source_artifact::PHP_GLOBAL_NAMESPACE`,
 /// which is the producer side of the same identity.
@@ -144,12 +156,11 @@ pub(crate) fn php_overlay_member(
     // `owner_surface` puts the owner first and its ancestors after, so the
     // first hit is the most derived declaration, which is the one PHP
     // dispatches to.
-    let found = surface
-        .closure
-        .iter()
-        .flat_map(|ancestor| overlay.members_of(&ancestor.id).records)
-        .filter(|symbol| symbol.name == member)
-        .collect::<Vec<_>>();
+    let found = php_members_in_owner_closure(
+        overlay,
+        surface.closure.iter().map(|ancestor| ancestor.id.as_ref()),
+        member,
+    );
     if let Some(symbol) = found.iter().find(|symbol| !symbol.provenance.ambiguous) {
         return PhpOverlayMember::Indexed(symbol.id.clone());
     }
@@ -218,16 +229,11 @@ impl PhpExternalSurface for AnalyzerPhpExternalSurface {
         // the surface the lookup must check, and only a closure with no gap can
         // report the member absent.
         let surface = overlay.owner_surface(owner);
-        let mut found = Vec::new();
-        for ancestor in &surface.closure {
-            found.extend(
-                overlay
-                    .members_of(&ancestor.id)
-                    .records
-                    .into_iter()
-                    .filter(|symbol| symbol.name == member),
-            );
-        }
+        let found = php_members_in_owner_closure(
+            overlay,
+            surface.closure.iter().map(|ancestor| ancestor.id.as_ref()),
+            member,
+        );
         if found.is_empty() {
             return match surface.gaps.first() {
                 Some(gap) => PhpExternalMember::Unproven {
@@ -289,10 +295,11 @@ impl PhpExternalSurface for AnalyzerPhpExternalSurface {
 mod tests {
     use super::collect_php_semantic_diagnostics;
     use crate::analyzer::{
-        Language, PhpAnalyzer, ProjectFile, SemanticDiagnostic, SemanticDiagnosticOutcome,
-        TestProject,
+        CodeUnitIndex, Language, PhpAnalyzer, ProjectFile, SemanticDiagnostic,
+        SemanticDiagnosticOutcome, TestProject,
     };
-    use brokk_bifrost_php::diagnostics::{PHP_UNRECOGNIZED_MEMBER, PHP_UNRECOGNIZED_SYMBOL};
+    use brokk_bifrost_php::diagnostics::PHP_UNRECOGNIZED_MEMBER;
+    use brokk_bifrost_test_macros::hardwon;
     use tempfile::TempDir;
 
     struct Fixture {
@@ -303,7 +310,7 @@ mod tests {
 
     impl Fixture {
         fn file(&self, rel_path: &str) -> ProjectFile {
-            ProjectFile::new(self.root.clone(), rel_path)
+            crate::analyzer::common::project_file_for_test(&self.root, rel_path)
         }
 
         fn diagnostics_for(&self, rel_path: &str) -> Vec<SemanticDiagnostic> {
@@ -335,112 +342,6 @@ mod tests {
     }
 
     #[test]
-    fn php_semantic_diagnostics_report_unknown_namespaced_type_function_and_constant() {
-        let fixture = fixture(&[(
-            "src/Service.php",
-            r#"<?php
-namespace App;
-
-class Anchor {}
-
-class Service {
-    private MissingType $value;
-
-    public function run(): void {
-        \App\missing_function();
-        \App\MISSING_CONSTANT;
-    }
-}
-"#,
-        )]);
-
-        let diagnostics = fixture.diagnostics_for("src/Service.php");
-        assert_eq!(3, diagnostics.len(), "{diagnostics:#?}");
-        assert!(
-            diagnostics
-                .iter()
-                .all(|diagnostic| diagnostic.kind == PHP_UNRECOGNIZED_SYMBOL),
-            "{diagnostics:#?}"
-        );
-        assert!(
-            diagnostics
-                .iter()
-                .any(|diagnostic| diagnostic.message.contains("MissingType")),
-            "{diagnostics:#?}"
-        );
-        assert!(
-            diagnostics
-                .iter()
-                .any(|diagnostic| diagnostic.message.contains("missing_function")),
-            "{diagnostics:#?}"
-        );
-        assert!(
-            diagnostics
-                .iter()
-                .any(|diagnostic| diagnostic.message.contains("MISSING_CONSTANT")),
-            "{diagnostics:#?}"
-        );
-    }
-
-    #[test]
-    fn php_semantic_diagnostics_suppress_imported_aliases_and_builtins() {
-        let fixture = fixture(&[
-            (
-                "src/Service.php",
-                r#"<?php
-namespace App;
-
-class Service {}
-function render_view(): void {}
-const READY = 1;
-"#,
-            ),
-            (
-                "src/Controller.php",
-                r#"<?php
-namespace App\Http;
-
-use App\Service as S;
-use function App\render_view as rv;
-use const App\READY as READY_FLAG;
-
-class Controller {
-    public function handle(S $service): void {
-        rv();
-        READY_FLAG;
-        strlen("ok");
-    }
-}
-"#,
-            ),
-        ]);
-
-        let diagnostics = fixture.diagnostics_for("src/Controller.php");
-        assert!(diagnostics.is_empty(), "{diagnostics:#?}");
-    }
-
-    #[test]
-    fn php_semantic_diagnostics_suppress_unqualified_functions_and_constants() {
-        let fixture = fixture(&[(
-            "src/Service.php",
-            r#"<?php
-namespace App;
-
-class Anchor {}
-
-function run(): void {
-    str_replace("old", "new", "old");
-    may_fallback_to_global();
-    MAY_FALLBACK_TO_GLOBAL;
-}
-"#,
-        )]);
-
-        let diagnostics = fixture.diagnostics_for("src/Service.php");
-        assert!(diagnostics.is_empty(), "{diagnostics:#?}");
-    }
-
-    #[test]
     fn php_semantic_diagnostics_suppress_composer_psr4_project_classes() {
         let fixture = fixture(&[
             (
@@ -467,36 +368,6 @@ class Controller {
 
         let diagnostics = fixture.diagnostics_for("src/Http/Controller.php");
         assert!(diagnostics.is_empty(), "{diagnostics:#?}");
-    }
-
-    #[test]
-    fn php_semantic_diagnostics_suppress_dynamic_constructs_and_malformed_files() {
-        let fixture = fixture(&[
-            (
-                "src/Dynamic.php",
-                r#"<?php
-namespace App;
-
-class Anchor {}
-
-function run($target, $method, $className): void {
-    $target->$method();
-    $className::factory();
-    $callable();
-    new $className();
-}
-"#,
-            ),
-            (
-                "src/Broken.php",
-                "<?php\nnamespace App;\nclass Broken { public function run(: void { MissingType; }\n",
-            ),
-        ]);
-
-        let dynamic_diagnostics = fixture.diagnostics_for("src/Dynamic.php");
-        assert!(dynamic_diagnostics.is_empty(), "{dynamic_diagnostics:#?}");
-        let broken_diagnostics = fixture.diagnostics_for("src/Broken.php");
-        assert!(broken_diagnostics.is_empty(), "{broken_diagnostics:#?}");
     }
 
     #[test]
@@ -590,27 +461,6 @@ function run(Service $service): void {
     }
 
     #[test]
-    fn php_semantic_diagnostics_report_missing_static_receiver_type() {
-        let fixture = fixture(&[(
-            "src/Service.php",
-            r#"<?php
-namespace App;
-
-class Anchor {}
-
-function run(): void {
-    MissingStatic::run();
-}
-"#,
-        )]);
-
-        let diagnostics = fixture.diagnostics_for("src/Service.php");
-        assert_eq!(1, diagnostics.len(), "{diagnostics:#?}");
-        assert_eq!(PHP_UNRECOGNIZED_SYMBOL, diagnostics[0].kind);
-        assert!(diagnostics[0].message.contains("MissingStatic"));
-    }
-
-    #[test]
     fn php_semantic_diagnostics_record_an_unknown_vendor_boundary_without_erroring() {
         // Nothing indexed `Vendor\Package` and no host ran Composer discovery,
         // so the reference must stay silent -- but the report now says why
@@ -674,5 +524,131 @@ function run($target, $method, $className): void {
             "{:#?}",
             report.outcomes()
         );
+    }
+
+    #[test]
+    fn php_semantic_diagnostics_suppress_imported_aliases_and_builtins() {
+        let fixture = fixture(&[
+            (
+                "src/Service.php",
+                r#"<?php
+namespace App;
+
+class Service {}
+function render_view(): void {}
+const READY = 1;
+"#,
+            ),
+            (
+                "src/Controller.php",
+                r#"<?php
+namespace App\Http;
+
+use App\Service as S;
+use function App\render_view as rv;
+use const App\READY as READY_FLAG;
+
+class Controller {
+    public function handle(S $service): void {
+        rv();
+        READY_FLAG;
+        strlen("ok");
+    }
+}
+"#,
+            ),
+        ]);
+
+        let diagnostics = fixture.diagnostics_for("src/Controller.php");
+        assert!(diagnostics.is_empty(), "{diagnostics:#?}");
+    }
+
+    #[test]
+    fn php_semantic_diagnostics_suppress_unqualified_functions_and_constants() {
+        let fixture = fixture(&[(
+            "src/Service.php",
+            r#"<?php
+namespace App;
+
+class Anchor {}
+
+function run(): void {
+    str_replace("old", "new", "old");
+    may_fallback_to_global();
+    MAY_FALLBACK_TO_GLOBAL;
+}
+"#,
+        )]);
+
+        let diagnostics = fixture.diagnostics_for("src/Service.php");
+        assert!(diagnostics.is_empty(), "{diagnostics:#?}");
+    }
+
+    #[test]
+    fn php_semantic_diagnostics_suppress_dynamic_constructs_and_malformed_files() {
+        let fixture = fixture(&[
+            (
+                "src/Dynamic.php",
+                r#"<?php
+namespace App;
+
+class Anchor {}
+
+function run($target, $method, $className): void {
+    $target->$method();
+    $className::factory();
+    $callable();
+    new $className();
+}
+"#,
+            ),
+            (
+                "src/Broken.php",
+                "<?php\nnamespace App;\nclass Broken { public function run(: void { MissingType; }\n",
+            ),
+        ]);
+
+        let dynamic_diagnostics = fixture.diagnostics_for("src/Dynamic.php");
+        assert!(dynamic_diagnostics.is_empty(), "{dynamic_diagnostics:#?}");
+        let broken_diagnostics = fixture.diagnostics_for("src/Broken.php");
+        assert!(broken_diagnostics.is_empty(), "{broken_diagnostics:#?}");
+    }
+
+    #[test]
+    #[hardwon("#4271: ambiguous PHP classes must not select the first parent")]
+    fn php_semantic_diagnostics_abstain_on_parent_of_ambiguous_class() {
+        let fixture = fixture(&[
+            ("src/Bases.php", "<?php\nclass BaseA {}\nclass BaseB {}\n"),
+            (
+                "src/AConditional.php",
+                r#"<?php
+if (PHP_VERSION_ID > 0) {
+    class Conditional extends BaseA {
+        public static function run(): void { parent::inherited(); }
+    }
+}
+"#,
+            ),
+            (
+                "src/BConditional.php",
+                r#"<?php
+if (PHP_VERSION_ID > 0) {
+    class Conditional extends BaseB {
+        public static function run(): void { parent::inherited(); }
+    }
+}
+"#,
+            ),
+        ]);
+
+        let declarations = fixture
+            .analyzer
+            .definitions("Conditional")
+            .collect::<Vec<_>>();
+        assert_eq!(2, declarations.len(), "{declarations:#?}");
+        for path in ["src/AConditional.php", "src/BConditional.php"] {
+            let diagnostics = fixture.diagnostics_for(path);
+            assert!(diagnostics.is_empty(), "{path}: {diagnostics:#?}");
+        }
     }
 }

@@ -2,9 +2,20 @@ use super::rust_privacy::complete_access_source_read;
 use super::*;
 use crate::analyzer::resolution::{
     DeclarationAccessDecision, DeclarationAccessRequest, DeclarationAccessRow, FactPageVisitor,
-    LoweredRustDeclarationAuthority, LoweredRustReferenceContext, SelectedDeclarationAccessSource,
-    SelectedTypedFactSource, SelectedTypedRow, TypedFactReadOutcome, TypedFactRequest,
+    LoweredRustDeclarationAuthority, LoweredRustReferenceContext, ReasonOwnerRow,
+    SelectedDeclarationAccessSource, SelectedTypedFactSource, SelectedTypedRow,
+    TypedFactReadOutcome, TypedFactRequest,
 };
+
+pub(crate) const REASON_OWNERS_SQL: &str = "SELECT gap.reason, authority.semantic_key
+FROM resolution_gap_reasons AS gap
+CROSS JOIN resolution_sites AS site
+  ON site.blob_id=gap.blob_id AND site.site=gap.site AND site.role=1
+CROSS JOIN resolution_rust_declaration_authorities AS authority
+  ON authority.blob_id=site.blob_id AND authority.source_site=site.site
+WHERE gap.blob_id=?1
+  AND gap.reason IN (SELECT value FROM json_each(?2))
+ORDER BY gap.reason";
 
 #[derive(Debug)]
 pub(super) struct RustCrateAccessPolicy {
@@ -25,7 +36,7 @@ pub(super) struct RustCrateSetAccessPolicy {
 }
 
 trait RustAccessDecisionSource: Send + Sync {
-    fn access_identity(&self) -> SemanticId;
+    fn identity(&self) -> SemanticId;
     fn decide(
         &self,
         facts: &dyn SelectedTypedFactSource,
@@ -34,9 +45,55 @@ trait RustAccessDecisionSource: Send + Sync {
     ) -> Result<DeclarationAccessDecision>;
 }
 
+/// Rust declaration-authority rows are keyed by a declaration in one source
+/// fragment. A shared name is a lookup recipe, not a concrete declaration.
+fn local_rust_authority_definition(definition: SemanticId) -> Option<SemanticId> {
+    definition.local_key().map(|_| definition)
+}
+
+pub(super) fn site_cfg_activation(
+    atoms: &BTreeSet<String>,
+    detached: bool,
+    condition: &brokk_bifrost_core::analyzer::rust_facts::RustCfgCondition,
+) -> (
+    brokk_bifrost_rust::selected_context::RustSelectedActivation,
+    bool,
+    Option<brokk_bifrost_rust::cfg::RustCfgSiteAssignment>,
+) {
+    if detached {
+        brokk_bifrost_rust::cfg::detached_site_cfg_activation(atoms, condition)
+    } else {
+        brokk_bifrost_rust::cfg::crate_site_cfg_activation(atoms, condition)
+    }
+}
+
+fn site_cfg_context<'a>(
+    rows: impl IntoIterator<Item = (&'a BTreeSet<String>, bool)>,
+    condition: &brokk_bifrost_core::analyzer::rust_facts::RustCfgCondition,
+) -> (
+    brokk_bifrost_rust::selected_context::RustSelectedActivation,
+    bool,
+    Option<brokk_bifrost_rust::cfg::RustCfgSiteAssignment>,
+) {
+    use brokk_bifrost_rust::selected_context::RustSelectedActivation;
+
+    let mut selected = None;
+    for (atoms, detached) in rows {
+        let context = site_cfg_activation(atoms, detached, condition);
+        if selected
+            .as_ref()
+            .is_some_and(|previous| previous != &context)
+        {
+            return (RustSelectedActivation::Unknown, false, None);
+        }
+        selected = Some(context);
+    }
+    selected.unwrap_or((RustSelectedActivation::Unknown, false, None))
+}
+
 impl<T: RustAccessDecisionSource> SelectedDeclarationAccessSource for T {
     fn identity(&self) -> SemanticId {
-        self.access_identity()
+        RustAccessDecisionSource::identity(self)
     }
 
     fn declaration_activation(
@@ -46,6 +103,9 @@ impl<T: RustAccessDecisionSource> SelectedDeclarationAccessSource for T {
         cancellation: &CancellationToken,
         session: Option<&ResolutionSession>,
     ) -> Result<Option<(DeclarationAccessDecision, Option<SemanticId>)>> {
+        let Some(definition) = local_rust_authority_definition(definition) else {
+            return Ok(Some((DeclarationAccessDecision::Allowed, None)));
+        };
         let mut authority = None;
         let mut collect = |rows: &[SelectedTypedRow<LoweredRustDeclarationAuthority>]| {
             for row in rows {
@@ -112,7 +172,10 @@ impl<T: RustAccessDecisionSource> SelectedDeclarationAccessSource for T {
             definitions.insert(request.definition);
         }
         let references = references.into_iter().collect::<Vec<_>>();
-        let definitions = definitions.into_iter().collect::<Vec<_>>();
+        let definitions = definitions
+            .into_iter()
+            .filter_map(local_rust_authority_definition)
+            .collect::<Vec<_>>();
 
         let mut reference_rows = BTreeMap::new();
         let mut collect_references = |rows: &[SelectedTypedRow<LoweredRustReferenceContext>]| {
@@ -225,6 +288,8 @@ impl<T: RustAccessDecisionSource> SelectedDeclarationAccessSource for T {
                 decision,
                 activation_reason: definition
                     .and_then(|definition| definition.row().activation_reason()),
+                visibility_applies: false,
+                subclass_access: None,
             });
             if page.len() == MAX_SOURCE_ROWS_PER_BATCH {
                 if !visitor.visit_page(&page)? {
@@ -255,6 +320,31 @@ impl<T: RustAccessDecisionSource> SelectedDeclarationAccessSource for T {
         } else {
             TypedFactReadOutcome::exhausted(ResolutionCompletion::Complete)
         })
+    }
+
+    fn visit_reason_owners(
+        &self,
+        facts: &dyn SelectedTypedFactSource,
+        reasons: TypedFactRequest<SemanticId>,
+        cancellation: &CancellationToken,
+        visitor: &mut FactPageVisitor<'_, ReasonOwnerRow>,
+    ) -> Result<TypedFactReadOutcome> {
+        let maximum_rows = visitor.maximum_rows().min(MAX_SOURCE_ROWS_PER_BATCH);
+        let session = visitor.resolution_session();
+        let mut adapt = |page: &[(SemanticId, SemanticId)]| {
+            let rows = page
+                .iter()
+                .map(|&(reason, definition)| ReasonOwnerRow { reason, definition })
+                .collect::<Vec<_>>();
+            visitor.visit_page(&rows)
+        };
+        let mut typed_visitor = match session {
+            Some(session) => {
+                FactPageVisitor::with_maximum_rows_in_session(&mut adapt, maximum_rows, session)
+            }
+            None => FactPageVisitor::with_maximum_rows(&mut adapt, maximum_rows),
+        };
+        facts.visit_rust_reason_owners(reasons, cancellation, &mut typed_visitor)
     }
 }
 
@@ -480,10 +570,40 @@ pub(crate) fn access(
     {
         return Ok(None);
     }
+    // A definition-only check is declaration self-activation (including the
+    // reverse-usage preflight). Its own cfg is the premise until concrete
+    // reference sites are checked below with their site cfgs.
+    let site_condition = reference
+        .map(|row| row.row().cfg_condition())
+        .or_else(|| definition.map(|row| row.row().cfg_condition()))
+        .expect("Rust access has a reference or declaration cfg");
+    let site_rows = if reference.is_some() {
+        &references
+    } else {
+        &definitions
+    };
+    let (site_activation, _, assignment) = site_cfg_context(
+        site_rows.iter().map(|(_, _, atoms)| (atoms, false)),
+        site_condition,
+    );
+    match site_activation {
+        RustSelectedActivation::Unknown => {
+            return Ok(Some(DeclarationAccessDecision::UnknownActivation));
+        }
+        RustSelectedActivation::Inactive => {
+            return Ok(Some(DeclarationAccessDecision::InactiveActivation));
+        }
+        RustSelectedActivation::Active => (),
+    }
     let activation = |rows: &[CratePlacement], condition: &RustCfgCondition| {
         let mut active = false;
         for (_, _, atoms) in rows {
-            match brokk_bifrost_rust::cfg::crate_activation(atoms, condition) {
+            let selected = brokk_bifrost_rust::cfg::crate_activation_under_site_cfg(
+                atoms,
+                condition,
+                assignment.as_ref(),
+            );
+            match selected {
                 RustSelectedActivation::Unknown => return RustSelectedActivation::Unknown,
                 RustSelectedActivation::Active => active = true,
                 RustSelectedActivation::Inactive => (),
@@ -608,13 +728,48 @@ pub(crate) fn set_access(
     {
         return Ok(None);
     }
+    // A definition-only check is declaration self-activation (including the
+    // reverse-usage preflight). Its own cfg is the premise until concrete
+    // reference sites are checked below with their site cfgs.
+    let site_condition = reference
+        .map(|row| row.row().cfg_condition())
+        .or_else(|| definition.map(|row| row.row().cfg_condition()))
+        .expect("Rust access has a reference or declaration cfg");
+    let site_rows = if reference.is_some() {
+        &reference_memberships
+    } else {
+        &definition_memberships
+    };
+    let (site_activation, _, assignment) = site_cfg_context(
+        site_rows
+            .iter()
+            .map(|(_, atoms, kind)| (atoms, kind == "detached")),
+        site_condition,
+    );
+    match site_activation {
+        RustSelectedActivation::Unknown => {
+            return Ok(Some(DeclarationAccessDecision::UnknownActivation));
+        }
+        RustSelectedActivation::Inactive => {
+            return Ok(Some(DeclarationAccessDecision::InactiveActivation));
+        }
+        RustSelectedActivation::Active => (),
+    }
     let activation = |rows: &[CrateMembership], condition: &RustCfgCondition| {
         let mut active = false;
         for (_, atoms, kind) in rows {
             let state = if kind == "detached" {
-                brokk_bifrost_rust::cfg::detached_activation(atoms, condition)
+                brokk_bifrost_rust::cfg::detached_activation_under_site_cfg(
+                    atoms,
+                    condition,
+                    assignment.as_ref(),
+                )
             } else {
-                brokk_bifrost_rust::cfg::crate_activation(atoms, condition)
+                brokk_bifrost_rust::cfg::crate_activation_under_site_cfg(
+                    atoms,
+                    condition,
+                    assignment.as_ref(),
+                )
             };
             match state {
                 RustSelectedActivation::Unknown => return RustSelectedActivation::Unknown,
@@ -698,7 +853,7 @@ fn finish_access(
 }
 
 impl RustAccessDecisionSource for RustCrateAccessPolicy {
-    fn access_identity(&self) -> SemanticId {
+    fn identity(&self) -> SemanticId {
         self.identity
     }
 
@@ -753,7 +908,7 @@ impl RustAccessDecisionSource for RustCrateAccessPolicy {
 }
 
 impl RustAccessDecisionSource for RustCrateSetAccessPolicy {
-    fn access_identity(&self) -> SemanticId {
+    fn identity(&self) -> SemanticId {
         self.identity
     }
 

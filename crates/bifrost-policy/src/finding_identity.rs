@@ -3,6 +3,9 @@
 use std::fmt;
 use std::str::FromStr;
 
+use super::identity::{update_length_prefixed, write_lower_hex};
+use super::render::should_escape_text_character;
+use brokk_bifrost_analysis::analyzer::identifier::is_lower_alphanumeric;
 use serde::de;
 use serde::ser::SerializeStruct;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
@@ -11,13 +14,30 @@ use sha2::{Digest, Sha256};
 use brokk_bifrost_analysis::analyzer::semantic::WorkspaceRelativePath;
 
 use super::definition::{PolicyAnalysisType, PolicyId};
-use super::retained::{RetainedSize, retained_extra};
+use super::retained::{
+    RetainedSize, retained_extra, retained_size_with_extra, retained_size_with_extras,
+};
 
 const POLICY_FINDING_DOMAIN: &[u8] = b"bifrost-policy-finding/v1";
 const POLICY_VULNERABILITY_DOMAIN: &[u8] = b"bifrost-policy-vulnerability/v1";
 const MAX_ADAPTER_NAMESPACE_BYTES: usize = 128;
 const MAX_OPAQUE_ID_BYTES: usize = 256;
 const MAX_SEMANTIC_KEY_BYTES: usize = 256;
+
+fn policy_finding_hasher(policy_id: &PolicyId, analysis_type: PolicyAnalysisType) -> Sha256 {
+    let mut hasher = Sha256::new();
+    update_length_prefixed(&mut hasher, POLICY_FINDING_DOMAIN);
+    update_analysis_kind(&mut hasher, analysis_type);
+    update_length_prefixed(&mut hasher, policy_id.as_str().as_bytes());
+    hasher
+}
+
+fn vulnerability_hasher(analysis_type: PolicyAnalysisType) -> Sha256 {
+    let mut hasher = Sha256::new();
+    update_length_prefixed(&mut hasher, POLICY_VULNERABILITY_DOMAIN);
+    update_analysis_kind(&mut hasher, analysis_type);
+    hasher
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -47,6 +67,8 @@ pub enum MatchResultDomain {
     QualifiedPath,
     PathSegment,
     ConfigurationFact,
+    CrossDomain,
+    DependencyEvidence,
     File,
 }
 
@@ -70,7 +92,9 @@ impl MatchResultDomain {
             Self::ReferenceEdge => "reference_edge",
             Self::QualifiedPath => "qualified_path",
             Self::PathSegment => "path_segment",
+            Self::DependencyEvidence => "dependency_evidence",
             Self::ConfigurationFact => "configuration_fact",
+            Self::CrossDomain => "cross_domain",
             Self::File => "file",
         }
     }
@@ -390,7 +414,7 @@ fn validate_semantic_key(value: &str) -> Result<(), StableSemanticIdentityError>
             max_bytes: MAX_SEMANTIC_KEY_BYTES,
         });
     }
-    if value.chars().any(is_unsafe_identifier_character) {
+    if value.chars().any(should_escape_text_character) {
         return Err(StableSemanticIdentityError::UnsafeSemanticKeyCharacter);
     }
     if has_absolute_or_native_path_prefix(value) {
@@ -605,25 +629,6 @@ fn validate_namespace(value: &str) -> Result<(), AdapterNamespaceError> {
     Ok(())
 }
 
-const fn is_lower_alphanumeric(byte: u8) -> bool {
-    byte.is_ascii_lowercase() || byte.is_ascii_digit()
-}
-
-const fn is_bidi_control(character: char) -> bool {
-    matches!(
-        character,
-        '\u{061c}'
-            | '\u{200e}'
-            | '\u{200f}'
-            | '\u{202a}'..='\u{202e}'
-            | '\u{2066}'..='\u{2069}'
-    )
-}
-
-fn is_unsafe_identifier_character(character: char) -> bool {
-    character.is_control() || is_bidi_control(character)
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AdapterOpaqueIdError {
     Namespace(AdapterNamespaceError),
@@ -662,7 +667,7 @@ fn namespaced_opaque_id(
     if value.is_empty() {
         return Err(AdapterOpaqueIdError::EmptyValue);
     }
-    if value.chars().any(is_unsafe_identifier_character) {
+    if value.chars().any(should_escape_text_character) {
         return Err(AdapterOpaqueIdError::UnsafeCharacter);
     }
     let length = namespace
@@ -746,6 +751,15 @@ macro_rules! define_adapter_opaque_id {
 
 define_adapter_opaque_id!(OpaqueFindingKey);
 define_adapter_opaque_id!(EvidenceRef);
+
+pub(crate) fn retain_sorted_evidence_refs(
+    evidence_refs: &mut Vec<EvidenceRef>,
+    retained: &[EvidenceRef],
+) -> bool {
+    let original_len = evidence_refs.len();
+    evidence_refs.retain(|reference| retained.binary_search(reference).is_ok());
+    evidence_refs.len() != original_len
+}
 define_adapter_opaque_id!(WitnessId);
 define_adapter_opaque_id!(AnalysisFindingId);
 define_adapter_opaque_id!(AnalysisEventRef);
@@ -777,7 +791,7 @@ impl Serialize for SourceSliceHash {
     where
         S: Serializer,
     {
-        serializer.collect_str(self)
+        crate::serialize_display_value(self, serializer)
     }
 }
 
@@ -790,12 +804,6 @@ impl<'de> Deserialize<'de> for SourceSliceHash {
         super::definition::parse_lower_sha256(&wire)
             .map(Self)
             .map_err(de::Error::custom)
-    }
-}
-
-impl RetainedSize for SourceSliceHash {
-    fn retained_size(&self) -> usize {
-        std::mem::size_of::<Self>()
     }
 }
 
@@ -902,13 +910,6 @@ impl MatchFindingAnchor {
         })
     }
 
-    pub const fn stability(&self) -> FindingIdentityStability {
-        match self {
-            Self::Strong(_) => FindingIdentityStability::Strong,
-            Self::Weak(_) => FindingIdentityStability::Weak,
-        }
-    }
-
     pub const fn result_domain(&self) -> MatchResultDomain {
         match self {
             Self::Strong(anchor) => anchor.result_domain,
@@ -924,6 +925,8 @@ impl MatchFindingAnchor {
     }
 }
 
+crate::impl_finding_anchor_stability!(MatchFindingAnchor);
+
 impl RetainedSize for StableSemanticIdentity {
     fn retained_size(&self) -> usize {
         std::mem::size_of::<Self>()
@@ -938,26 +941,34 @@ impl RetainedSize for StableSemanticIdentity {
 
 impl RetainedSize for MatchStrongAnchor {
     fn retained_size(&self) -> usize {
-        std::mem::size_of::<Self>()
-            .saturating_add(self.path.as_str().len())
-            .saturating_add(self.semantic_owner.as_ref().map_or(0, retained_extra))
+        retained_size_with_extras(
+            self,
+            [
+                self.path.as_str().len(),
+                self.semantic_owner.as_ref().map_or(0, retained_extra),
+            ],
+        )
     }
 }
 
 impl RetainedSize for MatchWeakAnchor {
     fn retained_size(&self) -> usize {
-        std::mem::size_of::<Self>()
-            .saturating_add(self.path.as_str().len())
-            .saturating_add(retained_extra(&self.typed_key))
+        retained_size_with_extras(
+            self,
+            [self.path.as_str().len(), retained_extra(&self.typed_key)],
+        )
     }
 }
 
 impl RetainedSize for MatchFindingAnchor {
     fn retained_size(&self) -> usize {
-        std::mem::size_of::<Self>().saturating_add(match self {
-            Self::Strong(anchor) => retained_extra(anchor),
-            Self::Weak(anchor) => retained_extra(anchor),
-        })
+        retained_size_with_extra(
+            self,
+            match self {
+                Self::Strong(anchor) => retained_extra(anchor),
+                Self::Weak(anchor) => retained_extra(anchor),
+            },
+        )
     }
 }
 
@@ -1085,10 +1096,7 @@ pub type PolicyFindingIdParseError = super::definition::Sha256ValueError;
 
 impl PolicyFindingId {
     pub fn from_match_anchor(policy_id: &PolicyId, anchor: &MatchFindingAnchor) -> Self {
-        let mut hasher = Sha256::new();
-        update_length_prefixed(&mut hasher, POLICY_FINDING_DOMAIN);
-        update_analysis_kind(&mut hasher, PolicyAnalysisType::Match);
-        update_length_prefixed(&mut hasher, policy_id.as_str().as_bytes());
+        let mut hasher = policy_finding_hasher(policy_id, PolicyAnalysisType::Match);
         match anchor {
             MatchFindingAnchor::Strong(anchor) => {
                 update_length_prefixed(&mut hasher, b"strong");
@@ -1119,10 +1127,7 @@ impl PolicyFindingId {
     }
 
     pub fn from_assertion_anchor(policy_id: &PolicyId, anchor: &AssertionFindingAnchor) -> Self {
-        let mut hasher = Sha256::new();
-        update_length_prefixed(&mut hasher, POLICY_FINDING_DOMAIN);
-        update_analysis_kind(&mut hasher, PolicyAnalysisType::Assertion);
-        update_length_prefixed(&mut hasher, policy_id.as_str().as_bytes());
+        let mut hasher = policy_finding_hasher(policy_id, PolicyAnalysisType::Assertion);
         update_length_prefixed(&mut hasher, b"strong");
         update_length_prefixed(&mut hasher, anchor.path.as_str().as_bytes());
         update_length_prefixed(&mut hasher, anchor.subject_ast_id.as_bytes());
@@ -1173,9 +1178,7 @@ impl FromStr for PolicyFindingId {
 }
 
 pub(crate) fn assertion_vulnerability_digest(anchor: &AssertionFindingAnchor) -> [u8; 32] {
-    let mut hasher = Sha256::new();
-    update_length_prefixed(&mut hasher, POLICY_VULNERABILITY_DOMAIN);
-    update_analysis_kind(&mut hasher, PolicyAnalysisType::Assertion);
+    let mut hasher = vulnerability_hasher(PolicyAnalysisType::Assertion);
     update_length_prefixed(&mut hasher, b"strong");
     update_length_prefixed(&mut hasher, anchor.path.as_str().as_bytes());
     update_length_prefixed(&mut hasher, anchor.subject_ast_id.as_bytes());
@@ -1184,9 +1187,7 @@ pub(crate) fn assertion_vulnerability_digest(anchor: &AssertionFindingAnchor) ->
 }
 
 pub(crate) fn match_vulnerability_digest(anchor: &MatchFindingAnchor) -> [u8; 32] {
-    let mut hasher = Sha256::new();
-    update_length_prefixed(&mut hasher, POLICY_VULNERABILITY_DOMAIN);
-    update_analysis_kind(&mut hasher, PolicyAnalysisType::Match);
+    let mut hasher = vulnerability_hasher(PolicyAnalysisType::Match);
     match anchor {
         MatchFindingAnchor::Strong(anchor) => {
             update_length_prefixed(&mut hasher, b"strong");
@@ -1227,7 +1228,7 @@ impl Serialize for PolicyFindingId {
     where
         S: Serializer,
     {
-        serializer.collect_str(self)
+        crate::serialize_display_value(self, serializer)
     }
 }
 
@@ -1236,8 +1237,7 @@ impl<'de> Deserialize<'de> for PolicyFindingId {
     where
         D: Deserializer<'de>,
     {
-        let wire = String::deserialize(deserializer)?;
-        wire.parse().map_err(de::Error::custom)
+        super::serde_utils::deserialize_from_string(deserializer)
     }
 }
 
@@ -1327,12 +1327,6 @@ impl<'de> Deserialize<'de> for AssertionFindingAnchor {
     }
 }
 
-impl RetainedSize for PolicyFindingId {
-    fn retained_size(&self) -> usize {
-        std::mem::size_of::<Self>()
-    }
-}
-
 fn update_analysis_kind(hasher: &mut Sha256, analysis_type: PolicyAnalysisType) {
     let value = match analysis_type {
         PolicyAnalysisType::Match => b"match".as_slice(),
@@ -1344,7 +1338,10 @@ fn update_analysis_kind(hasher: &mut Sha256, analysis_type: PolicyAnalysisType) 
     update_length_prefixed(hasher, value);
 }
 
-fn update_stable_semantic_identity(hasher: &mut Sha256, identity: &StableSemanticIdentity) {
+pub(crate) fn update_stable_semantic_identity(
+    hasher: &mut Sha256,
+    identity: &StableSemanticIdentity,
+) {
     update_length_prefixed(hasher, identity.namespace().as_bytes());
     update_length_prefixed(hasher, identity.path().as_str().as_bytes());
     match &identity.identity {
@@ -1362,19 +1359,6 @@ fn update_stable_semantic_identity(hasher: &mut Sha256, identity: &StableSemanti
     }
 }
 
-fn update_length_prefixed(hasher: &mut Sha256, value: &[u8]) {
-    let length = u64::try_from(value.len()).expect("usize fits in u64 on supported targets");
-    hasher.update(length.to_be_bytes());
-    hasher.update(value);
-}
-
-fn write_lower_hex(bytes: &[u8; 32], formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-    for byte in bytes {
-        write!(formatter, "{byte:02x}")?;
-    }
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1386,41 +1370,6 @@ mod tests {
 
     fn declaration_id(byte: char) -> String {
         format!("decl:v1:{}", byte.to_string().repeat(64))
-    }
-
-    #[test]
-    fn stable_semantic_identity_accepts_producer_contract_keys() {
-        let declaration_id = declaration_id('a');
-        let identity =
-            StableSemanticIdentity::analyzer_declaration_id("rust", path(), &declaration_id)
-                .unwrap();
-        assert_eq!(identity.declaration_id(), Some(declaration_id.as_str()));
-        assert_eq!(identity.derivation(), None);
-        assert_eq!(identity.semantic_key(), None);
-        let wire = serde_json::to_value(&identity).unwrap();
-        assert_eq!(
-            wire,
-            json!({
-                "namespace": "rust",
-                "path": "src/app.rs",
-                "id": declaration_id,
-            })
-        );
-        assert_eq!(
-            serde_json::from_value::<StableSemanticIdentity>(wire).unwrap(),
-            identity
-        );
-
-        let canonical = StableSemanticIdentity::canonical_ast_identity(
-            "rust",
-            path(),
-            r#"[["function_item","run"],["call_expression","sink"]]"#,
-        )
-        .unwrap();
-        assert_eq!(
-            canonical.derivation(),
-            Some(StableIdentityDerivation::CanonicalAstIdentity)
-        );
     }
 
     #[test]
@@ -1590,6 +1539,41 @@ mod tests {
     }
 
     #[test]
+    fn stable_semantic_identity_accepts_producer_contract_keys() {
+        let declaration_id = declaration_id('a');
+        let identity =
+            StableSemanticIdentity::analyzer_declaration_id("rust", path(), &declaration_id)
+                .unwrap();
+        assert_eq!(identity.declaration_id(), Some(declaration_id.as_str()));
+        assert_eq!(identity.derivation(), None);
+        assert_eq!(identity.semantic_key(), None);
+        let wire = serde_json::to_value(&identity).unwrap();
+        assert_eq!(
+            wire,
+            json!({
+                "namespace": "rust",
+                "path": "src/app.rs",
+                "id": declaration_id,
+            })
+        );
+        assert_eq!(
+            serde_json::from_value::<StableSemanticIdentity>(wire).unwrap(),
+            identity
+        );
+
+        let canonical = StableSemanticIdentity::canonical_ast_identity(
+            "rust",
+            path(),
+            r#"[["function_item","run"],["call_expression","sink"]]"#,
+        )
+        .unwrap();
+        assert_eq!(
+            canonical.derivation(),
+            Some(StableIdentityDerivation::CanonicalAstIdentity)
+        );
+    }
+
+    #[test]
     fn finding_id_parser_round_trips_only_exact_lowercase_sha256() {
         let text = "ecc560daa8640be23c53c93ad906a27bf978dcf6e0b13948d0dbbace13a1e47b";
         let parsed: PolicyFindingId = text.parse().unwrap();
@@ -1630,18 +1614,6 @@ mod tests {
                 "path": "src/app.rs",
                 "typed_key": "test-adapter:snapshot-key-7",
             })
-        );
-    }
-
-    #[test]
-    fn opaque_ids_are_bounded_and_reject_unsafe_text() {
-        assert!(OpaqueFindingKey::try_new("Adapter", "key").is_err());
-        assert!(OpaqueFindingKey::try_new("adapter", "").is_err());
-        assert!(OpaqueFindingKey::try_new("adapter", "bad\nkey").is_err());
-        assert!(OpaqueFindingKey::try_new("adapter", "x".repeat(256)).is_err());
-        assert_eq!(
-            EvidenceRef::try_new("query", "proof-1").unwrap().as_str(),
-            "query:proof-1"
         );
     }
 }

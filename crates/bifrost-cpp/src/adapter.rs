@@ -81,9 +81,8 @@ pub fn parse_cpp_file_with_object_macro_fields(
 /// A header carries no compilation language of its own, so its blob has two
 /// legitimate readings: under [`LanguageDialect::CppC`] a tag declared inside
 /// an aggregate member list has file scope (C17 6.2.1), under the plain C++
-/// dialect it is a nested class. Milestone 3 of
-/// `.agents/plans/c-compilation-language-tag-scope.md` stores both readings of
-/// a header when they differ, so extraction has to be reachable under a
+/// dialect it is a nested class. The analyzer stores both readings of a header
+/// when they differ, so extraction has to be reachable under a
 /// dialect the path itself does not name.
 ///
 /// This entry point owns the whole tree's work, including the parent index the
@@ -96,9 +95,7 @@ pub fn parse_cpp_file_in_dialect(
 ) -> ParsedFile {
     let root = tree.root_node();
     let ancestry = ParentIndex::new(root);
-    parse_cpp_readings(file, source, root, &ancestry, &[dialect])
-        .pop()
-        .expect("one dialect reading")
+    parse_cpp_file_from_root(file, source, root, &ancestry, dialect)
 }
 
 /// Extract the primary dialect from a caller-owned tree and parent index.
@@ -109,6 +106,16 @@ pub fn parse_cpp_file_with_ancestry<'tree>(
     ancestry: &ParentIndex<'tree>,
 ) -> ParsedFile {
     let dialect = LanguageDialect::for_path(Language::Cpp, file.rel_path());
+    parse_cpp_file_from_root(file, source, root, ancestry, dialect)
+}
+
+fn parse_cpp_file_from_root<'tree>(
+    file: &ProjectFile,
+    source: &str,
+    root: Node<'tree>,
+    ancestry: &ParentIndex<'tree>,
+    dialect: LanguageDialect,
+) -> ParsedFile {
     parse_cpp_readings(file, source, root, ancestry, &[dialect])
         .pop()
         .expect("one dialect reading")
@@ -160,14 +167,7 @@ pub fn cpp_projections_differ(left: &ParsedFile, right: &ParsedFile) -> bool {
 }
 
 pub fn cpp_extract_call_receiver(reference: &str) -> Option<String> {
-    let trimmed = reference.trim();
-    let before_args = trimmed
-        .split_once('(')
-        .map(|(head, _)| head)
-        .unwrap_or(trimmed);
-    before_args
-        .rsplit_once("::")
-        .or_else(|| before_args.rsplit_once('.'))
+    brokk_bifrost_core::analyzer::common::extract_call_reference_parts(reference, &["::", "."])
         .map(|(receiver, _)| receiver.to_string())
 }
 
@@ -178,11 +178,7 @@ mod tests {
     use tree_sitter::Parser;
 
     fn cpp_tree(source: &str) -> tree_sitter::Tree {
-        let mut parser = Parser::new();
-        parser
-            .set_language(&tree_sitter_cpp::LANGUAGE.into())
-            .expect("C++ grammar");
-        parser.parse(source, None).expect("C++ tree")
+        crate::diagnostics::parse_cpp_tree(source)
     }
 
     /// Everything one reading publishes, rendered so that two readings can be
@@ -268,20 +264,6 @@ mod tests {
         map.iter().map(|entry| format!("{entry:?}")).collect()
     }
 
-    /// The two readings of one header, taken the way production takes them,
-    /// publish exactly what two independent extractions publish.
-    ///
-    /// Milestone 3b of `.agents/plans/immutable-revision-persisted-fact-reuse.md`
-    /// stopped the C reading from rebuilding the parent index, re-sweeping
-    /// includes and identifiers, and re-running the quoted-include line scan
-    /// that the C++ reading of the same tree had already produced. That is a
-    /// deduplication and nothing else: if any published fact moved, something
-    /// believed dialect-insensitive is not.
-    ///
-    /// The error-recovery shapes are the interesting half. Their walks reparse
-    /// byte regions into trees of their own and re-own sibling nodes under
-    /// recovered class scopes, so they are where a shared index would show up
-    /// if sharing were unsound.
     #[test]
     fn a_shared_reading_publishes_what_an_independent_one_publishes() {
         let fixtures: &[(&str, &str, bool, bool)] = &[
@@ -532,10 +514,6 @@ class PROJECT_PUBLIC_API(2, 0) RecoveryOwner : public virtual BaseKey {
             }
         }
     }
-
-    /// A tag nested in an aggregate is the whole reason the second reading
-    /// exists, so the fixture above must actually produce two different
-    /// readings; otherwise the comparison would pass on two empty answers.
     #[test]
     fn the_nested_tag_fixture_really_has_two_readings() {
         let source = "struct outer { struct inner { int v; } i; };\nstruct inner *p;\n";
@@ -555,7 +533,6 @@ class PROJECT_PUBLIC_API(2, 0) RecoveryOwner : public virtual BaseKey {
             c_reading.declarations()
         );
     }
-
     #[test]
     fn projection_difference_includes_resolution_facts() {
         let source = "struct Widget {};\n";
@@ -577,16 +554,6 @@ class PROJECT_PUBLIC_API(2, 0) RecoveryOwner : public virtual BaseKey {
             });
         assert!(cpp_projections_differ(&primary, &fact_only_difference));
     }
-
-    /// Every `#include` is an include claim, wherever it is written. The
-    /// declaration walk descends only through declaration scopes, so a
-    /// directive inside a function body (llama.cpp's `sycl/info/aspects.def`
-    /// inside a `switch`) or inside a class body (Eigen's
-    /// `EIGEN_DENSEBASE_PLUGIN` in `DenseBase.h`) used to be invisible.
-    ///
-    /// The nested directive here is not a quoted include, so the established
-    /// `recover_quoted_includes` line scan cannot supply it: only the preorder
-    /// sweep over the tree can.
     #[test]
     fn includes_are_recorded_at_every_depth() {
         let source = r#"

@@ -8,6 +8,8 @@
 #[cfg(feature = "download")]
 pub mod download;
 #[cfg(any(feature = "release-tooling", feature = "download"))]
+pub mod prepared_registry;
+#[cfg(any(feature = "release-tooling", feature = "download"))]
 pub mod release_bundle;
 #[cfg(feature = "release-tooling")]
 pub mod summary_foundry;
@@ -20,6 +22,11 @@ use brokk_bifrost_analysis::analyzer::semantic_model::{
     SemanticPackCatalog, SessionPackSource, SessionPackSourceKind, decode_manifest,
     decode_shard_for_manifest,
 };
+
+#[cfg(any(feature = "download", feature = "release-tooling"))]
+pub(crate) fn fmt_string_error(message: &str, formatter: &mut Formatter<'_>) -> fmt::Result {
+    formatter.write_str(message)
+}
 
 /// One immutable compiled pack embedded in a Bifrost distribution.
 ///
@@ -173,11 +180,33 @@ const PYTHON_PROCESS_INPUT_SHARDS: &[&[u8]] = &[include_bytes!(
     "../embedded/python-process-inputs/shards/runtime.python-process-inputs.deflate"
 )];
 const PYTHON_OS_COMMAND_DECLARATION_SHARDS: &[&[u8]] = &[include_bytes!(
-    "../embedded/python-os-command-declarations/shards/declarations.python-os-system.json"
+    "../embedded/python-os-command-declarations/shards/declarations.python-os-commands.deflate"
 )];
 const PYTHON_OS_COMMAND_SUMMARY_SHARDS: &[&[u8]] = &[include_bytes!(
     "../embedded/python-os-command-summaries/shards/summaries.python-os-system.json"
 )];
+const PYTHON_SECURITY_SINK_SUMMARY_SHARDS: &[&[u8]] = &[include_bytes!(
+    "../embedded/python-security-sink-summaries/shards/summaries.python-security-sinks.deflate"
+)];
+const PYTHON_SECURITY_SINK_DECLARATION_SHARDS: &[&[u8]] = &[include_bytes!(
+    "../embedded/python-security-sink-declarations/shards/declarations.python-security-sink-apis.deflate"
+)];
+const PYTHON_STDLIB_API_DECLARATION_SHARDS: &[&[u8]] = &[
+    include_bytes!(
+        "../embedded/python-stdlib-api-declarations/shards/declarations.python-ssl-legacy-api.deflate"
+    ),
+    include_bytes!(
+        "../embedded/python-stdlib-api-declarations/shards/declarations.python-stdlib-security-apis.deflate"
+    ),
+];
+const PYTHON_STR_RESULT_USE_SHARDS: &[&[u8]] = &[
+    include_bytes!(
+        "../embedded/python-str-result-use-obligations/shards/python.str.reviewed-declarations.deflate"
+    ),
+    include_bytes!(
+        "../embedded/python-str-result-use-obligations/shards/python.str.reviewed-result-use.deflate"
+    ),
+];
 const NODE_BUFFER_JAVASCRIPT_DECLARATION_SHARDS: &[&[u8]] = &[include_bytes!(
     "../embedded/node-buffer-javascript-declarations/shards/declarations.buffer.deflate"
 )];
@@ -339,7 +368,7 @@ const BIFROST_EMBEDDED_PACK_ENTRIES: &[EmbeddedSemanticPack<'static>] = &[
         PYTHON_PROCESS_INPUT_SHARDS,
     ),
     EmbeddedSemanticPack::new(
-        "bifrost.python-os-command-declarations@0.1.0",
+        "bifrost.python-os-command-declarations@0.2.0",
         include_bytes!("../embedded/python-os-command-declarations/manifest.json"),
         PYTHON_OS_COMMAND_DECLARATION_SHARDS,
     ),
@@ -347,6 +376,26 @@ const BIFROST_EMBEDDED_PACK_ENTRIES: &[EmbeddedSemanticPack<'static>] = &[
         "bifrost.python-os-command-summaries@0.1.0",
         include_bytes!("../embedded/python-os-command-summaries/manifest.json"),
         PYTHON_OS_COMMAND_SUMMARY_SHARDS,
+    ),
+    EmbeddedSemanticPack::new(
+        "bifrost.python-security-sink-summaries@0.3.2",
+        include_bytes!("../embedded/python-security-sink-summaries/manifest.json"),
+        PYTHON_SECURITY_SINK_SUMMARY_SHARDS,
+    ),
+    EmbeddedSemanticPack::new(
+        "bifrost.python-security-sink-declarations@0.1.0",
+        include_bytes!("../embedded/python-security-sink-declarations/manifest.json"),
+        PYTHON_SECURITY_SINK_DECLARATION_SHARDS,
+    ),
+    EmbeddedSemanticPack::new(
+        "bifrost.python-stdlib-api-declarations@0.4.1",
+        include_bytes!("../embedded/python-stdlib-api-declarations/manifest.json"),
+        PYTHON_STDLIB_API_DECLARATION_SHARDS,
+    ),
+    EmbeddedSemanticPack::new(
+        "bifrost.python.str-result-use-obligations@1.0.0",
+        include_bytes!("../embedded/python-str-result-use-obligations/manifest.json"),
+        PYTHON_STR_RESULT_USE_SHARDS,
     ),
     EmbeddedSemanticPack::new(
         "bifrost.node-buffer-javascript-declarations@0.1.0",
@@ -454,12 +503,12 @@ const BIFROST_EMBEDDED_PACK_ENTRIES: &[EmbeddedSemanticPack<'static>] = &[
         GO_STDLIB_TESTING_SHARDS,
     ),
     EmbeddedSemanticPack::new(
-        "bifrost.go.concurrency@1.3.0",
+        "bifrost.go.concurrency@1.6.0",
         include_bytes!("../embedded/go-concurrency/manifest.json"),
         GO_CONCURRENCY_SHARDS,
     ),
     EmbeddedSemanticPack::new(
-        "bifrost.go.concurrency-declarations@1.0.0",
+        "bifrost.go.concurrency-declarations@1.2.0",
         include_bytes!("../embedded/go-concurrency-declarations/manifest.json"),
         GO_CONCURRENCY_DECLARATION_SHARDS,
     ),
@@ -553,6 +602,10 @@ impl From<CatalogError> for EmbeddedPackError {
 mod inline_project;
 
 #[cfg(test)]
+#[path = "../../../test-support/zip.rs"]
+mod zip_test_support;
+
+#[cfg(test)]
 mod tests {
     use std::collections::{BTreeMap, BTreeSet};
     use std::path::PathBuf;
@@ -561,7 +614,7 @@ mod tests {
     use std::time::Duration;
 
     use brokk_bifrost_analysis::analyzer::semantic_model::{
-        CatalogCoordinate, CatalogOptions, CompiledConcurrencyEffect, CompiledCondWaiters,
+        CatalogOptions, CompiledConcurrencyEffect, CompiledCondWaiters,
         CompiledConditionalIndirectWrite, CompiledConditionalResultRefinement,
         CompiledDeclaredEffect, CompiledDeclaredEffectCertainty, CompiledDeclaredEffectTiming,
         CompiledIndirectWriteTarget, CompiledLockCondition, CompiledLockMode,
@@ -587,10 +640,47 @@ mod tests {
     use brokk_bifrost_analysis::analyzer::{
         GoAnalyzerConfig, GoDependencyDiscoveryMode, resolve_go_semantic_pack_dependencies,
     };
-    use brokk_bifrost_analysis::{AnalyzerConfig, CancellationToken, Language};
+    use brokk_bifrost_analysis::{AnalyzerConfig, CancellationToken, Language, WorkspaceAnalyzer};
+    use brokk_bifrost_test_macros::hardwon;
 
     use super::inline_project::InlineTestProject;
     use super::*;
+
+    fn activate_go_stdlib_models(workspace: &WorkspaceAnalyzer) -> SemanticPackCatalog {
+        let catalog = SemanticPackCatalog::open_ephemeral(CatalogOptions::default())
+            .expect("ephemeral semantic-pack catalog");
+        BIFROST_EMBEDDED_PACKS
+            .register_all(&catalog, &DecodeLimits::default())
+            .expect("shipped semantic packs register");
+        let outcome = acquire_active_semantic_models(
+            workspace.analyzer(),
+            &catalog,
+            None,
+            &SemanticModelActivationRequest {
+                bifrost_version: env!("CARGO_PKG_VERSION")
+                    .parse()
+                    .expect("crate version is semver"),
+                evidence: vec![SemanticModelActivationEvidence {
+                    language: "go".to_owned(),
+                    ecosystem: "go".to_owned(),
+                    package: None,
+                    module: None,
+                    toolchain: None,
+                    target: None,
+                    configuration: None,
+                    artifact_sha256: None,
+                }],
+                controls: Vec::new(),
+                limits: SemanticModelRuntimeLimits::default(),
+            },
+            &CancellationToken::default(),
+        );
+        assert!(
+            matches!(outcome, SemanticModelRuntimeOutcome::Ready { .. }),
+            "Go stdlib activation completes: {outcome:#?}"
+        );
+        catalog
+    }
 
     const PACK_SOURCE: &[u8] = br#"{
       "schema_version": 2,
@@ -661,6 +751,61 @@ mod tests {
         assert_eq!(first[0].manifest_digest, compiled.manifest.content_sha256);
     }
 
+    fn assert_shipped_pack_matches_authored_source(source_id: &str, source: &[u8]) {
+        let compiled = compile_source(SourceFormat::Json, source, &CompilerOptions::default())
+            .unwrap_or_else(|diagnostics| {
+                panic!("{source_id} authored source compiles: {diagnostics:#?}")
+            });
+        let embedded = BIFROST_EMBEDDED_PACKS
+            .packs()
+            .iter()
+            .find(|pack| pack.source_id() == source_id)
+            .unwrap_or_else(|| panic!("{source_id} is registered"))
+            .decode(&DecodeLimits::default())
+            .unwrap_or_else(|error| panic!("{source_id} embedded pack decodes: {error}"));
+        assert_eq!(
+            embedded.manifest.content_sha256, compiled.manifest.content_sha256,
+            "{source_id} manifest matches its authored source"
+        );
+        assert_eq!(embedded.shards.len(), compiled.shards.len(), "{source_id}");
+        for (embedded, compiled) in embedded.shards.iter().zip(&compiled.shards) {
+            assert_eq!(embedded.descriptor.shard_id, compiled.descriptor.shard_id);
+            assert_eq!(embedded.bytes, compiled.bytes, "{source_id}");
+        }
+    }
+
+    #[test]
+    fn shipped_python_stdlib_packs_match_authored_sources() {
+        assert_shipped_pack_matches_authored_source(
+            "bifrost.python-os-command-declarations@0.2.0",
+            include_bytes!(
+                "../../../semantic-packs/python/os-command/bifrost.python-os-command-declarations.json"
+            ),
+        );
+        assert_shipped_pack_matches_authored_source(
+            "bifrost.python-security-sink-summaries@0.3.2",
+            include_bytes!(
+                "../../../semantic-packs/python/security-sinks/bifrost.python-security-sink-summaries.json"
+            ),
+        );
+        assert_shipped_pack_matches_authored_source(
+            "bifrost.python-security-sink-declarations@0.1.0",
+            include_bytes!(
+                "../../../semantic-packs/python/security-sinks/bifrost.python-security-sink-declarations.json"
+            ),
+        );
+        assert_shipped_pack_matches_authored_source(
+            "bifrost.python-stdlib-api-declarations@0.4.1",
+            include_bytes!(
+                "../../../semantic-packs/python/stdlib-apis/bifrost.python-stdlib-api-declarations.json"
+            ),
+        );
+        assert_shipped_pack_matches_authored_source(
+            "bifrost.python.str-result-use-obligations@1.0.0",
+            include_bytes!("../models/python-str-result-use-obligations.json"),
+        );
+    }
+
     #[test]
     fn shipped_jdk21_result_use_obligations_match_reviewed_source() {
         let source = include_bytes!("../models/jdk21-result-use-obligations.json");
@@ -713,40 +858,405 @@ mod tests {
             Some(CompiledResultPredicate::False)
         );
     }
+    #[test]
+    fn every_shipped_pack_decodes() {
+        for pack in BIFROST_EMBEDDED_PACKS.packs() {
+            pack.decode(&DecodeLimits::default())
+                .unwrap_or_else(|error| panic!("{} failed to decode: {error}", pack.source_id()));
+        }
+    }
+
+    fn discover_local_go_dependencies(
+        testify_version: &str,
+        import_testify_from_test: bool,
+    ) -> Option<DependencyDiscoveryOutcome> {
+        if Command::new("go").arg("version").output().is_err() {
+            return None;
+        }
+        let test_source = if import_testify_from_test {
+            r#"package sample
+
+import (
+	"testing"
+
+	"github.com/stretchr/testify/require"
+)
+
+func TestValue(t *testing.T) {
+	require.NoError(t, nil)
+}
+"#
+        } else {
+            r#"package sample
+
+import "testing"
+
+func TestValue(t *testing.T) {
+	if Value() == "" {
+		t.Fatal("empty value")
+	}
+}
+"#
+        };
+        let project = InlineTestProject::with_language(Language::Go)
+            .file(
+                "go.mod",
+                format!(
+                    "module example.com/sample\n\ngo 1.21\n\nrequire (\n\texample.com/ordinary v1.0.0\n\tgithub.com/stretchr/testify v{testify_version}\n)\n\nreplace example.com/ordinary => ./ordinary\nreplace github.com/stretchr/testify => ./testify\n"
+                ),
+            )
+            .file(
+                "sample.go",
+                "package sample\n\nimport \"example.com/ordinary\"\n\nfunc Value() string { return ordinary.Value() }\n",
+            )
+            .file("sample_test.go", test_source)
+            .file(
+                "ordinary/go.mod",
+                "module example.com/ordinary\n\ngo 1.21\n",
+            )
+            .file(
+                "ordinary/ordinary.go",
+                "package ordinary\n\nfunc Value() string { return \"ordinary\" }\n",
+            )
+            .file(
+                "testify/go.mod",
+                "module github.com/stretchr/testify\n\ngo 1.21\n",
+            )
+            .file(
+                "testify/require/require.go",
+                "package require\n\nfunc NoError(t interface{}, err error, msgAndArgs ...interface{}) {}\n",
+            )
+            .build();
+        let mut config = GoAnalyzerConfig::default();
+        config.dependency_discovery.mode = GoDependencyDiscoveryMode::CuratedPackEvidence;
+        config.dependency_discovery.go_executable = Some(PathBuf::from("go"));
+        config.dependency_discovery.workspace_patterns = vec![".".to_owned()];
+        config.dependency_discovery.timeout = Duration::from_secs(30);
+        let outcome = resolve_go_semantic_pack_dependencies(
+            &config,
+            project.project(),
+            &DependencyPackLimits::default(),
+            None,
+        );
+        assert!(outcome.complete, "{:#?}", outcome.diagnostics);
+        Some(outcome)
+    }
+
+    fn testify_candidates_for_evidence(
+        catalog: &SemanticPackCatalog,
+        evidence: &[SemanticModelActivationEvidence],
+    ) -> BTreeSet<String> {
+        evidence
+            .iter()
+            .flat_map(|evidence| {
+                catalog
+                    .candidates(&SemanticPackSelectorQuery {
+                        language: evidence.language.clone(),
+                        ecosystem: evidence.ecosystem.clone(),
+                        package: evidence.package.clone(),
+                        module: evidence.module.clone(),
+                        toolchain: evidence.toolchain.clone(),
+                        target: evidence.target.clone(),
+                        configuration: evidence.configuration.clone(),
+                        artifact_sha256: evidence.artifact_sha256.clone(),
+                        bifrost_version: env!("CARGO_PKG_VERSION")
+                            .parse()
+                            .expect("crate version is semver"),
+                    })
+                    .expect("catalog query completes")
+            })
+            .map(|candidate| candidate.source_id().to_owned())
+            .filter(|source_id| source_id.starts_with("bifrost.go.testify."))
+            .collect()
+    }
 
     #[test]
-    fn registry_preserves_declared_registration_order() {
+    #[hardwon("258d03c22047: test-only Go imports now activate reviewed Testify packs")]
+    fn test_only_go_dependency_selects_reviewed_testify_packs() {
+        let catalog = SemanticPackCatalog::open_ephemeral(CatalogOptions::default())
+            .expect("ephemeral semantic-pack catalog");
+        BIFROST_EMBEDDED_PACKS
+            .register_all(&catalog, &DecodeLimits::default())
+            .expect("shipped semantic packs register");
+        let expected = BTreeSet::from([
+            "bifrost.go.testify.assert@1.0.0".to_owned(),
+            "bifrost.go.testify.assert-declarations@1.0.0".to_owned(),
+            "bifrost.go.testify.require@1.0.0".to_owned(),
+            "bifrost.go.testify.require-declarations@1.0.0".to_owned(),
+        ]);
+
+        let Some(reviewed) = discover_local_go_dependencies("1.11.1", true) else {
+            return;
+        };
+        assert!(
+            reviewed
+                .dependencies
+                .iter()
+                .all(|dependency| dependency.artifacts.is_empty())
+        );
+        assert!(reviewed.dependencies.iter().any(|dependency| {
+            let evidence = &dependency.evidence;
+            evidence.module.as_ref().is_some_and(|module| {
+                module.name == "example.com/ordinary"
+                    && module.version == Some("1.0.0".parse().expect("fixture version"))
+            })
+        }));
+        assert!(reviewed.dependencies.iter().any(|dependency| {
+            let evidence = &dependency.evidence;
+            evidence.ecosystem == "go-module"
+                && evidence.module.as_ref().is_some_and(|module| {
+                    module.name == "github.com/stretchr/testify"
+                        && module.version == Some("1.11.1".parse().expect("fixture version"))
+                })
+        }));
+        let reviewed_preparation = prepare_compatible_installed_semantic_packs(
+            &catalog,
+            &reviewed.dependencies,
+            &DependencyPackLimits::default(),
+            None,
+        );
+        assert!(
+            reviewed_preparation.complete,
+            "{:#?}",
+            reviewed_preparation.diagnostics
+        );
+        assert!(reviewed_preparation.packs.is_empty());
+        assert_eq!(reviewed_preparation.profile.artifacts_read, 0);
+        assert_eq!(reviewed_preparation.profile.artifact_bytes_read, 0);
+        assert_eq!(reviewed_preparation.profile.generated_packs, 0);
+        assert_eq!(reviewed_preparation.profile.installed_packs, 1);
+        assert_eq!(
+            reviewed_preparation.installed_packs[0]
+                .manifest_digests
+                .len(),
+            4
+        );
+        assert_eq!(
+            testify_candidates_for_evidence(&catalog, &reviewed_preparation.evidence),
+            expected
+        );
+        let activation_project = InlineTestProject::with_language(Language::Go)
+            .file("go.mod", "module example.com/activation\n\ngo 1.21\n")
+            .file("main.go", "package activation\n")
+            .build();
+        let activation_workspace = activation_project.workspace_analyzer(AnalyzerConfig::default());
+        let runtime = acquire_active_semantic_models(
+            activation_workspace.analyzer(),
+            &catalog,
+            None,
+            &SemanticModelActivationRequest {
+                bifrost_version: env!("CARGO_PKG_VERSION")
+                    .parse()
+                    .expect("crate version is semver"),
+                evidence: reviewed_preparation.evidence.clone(),
+                controls: Vec::new(),
+                limits: SemanticModelRuntimeLimits::default(),
+            },
+            &CancellationToken::default(),
+        );
+        let SemanticModelRuntimeOutcome::Ready { active, .. } = runtime else {
+            panic!("exact reviewed Testify evidence activates: {runtime:#?}");
+        };
+        let active_testify = active
+            .shards()
+            .iter()
+            .map(|shard| format!("{}@{}", shard.manifest.pack_id, shard.manifest.version))
+            .filter(|pack_id| pack_id.starts_with("bifrost.go.testify."))
+            .collect::<BTreeSet<_>>();
+        assert_eq!(active_testify, expected);
+
+        let installed_catalog = SemanticPackCatalog::open_ephemeral(CatalogOptions::default())
+            .expect("ephemeral installed-pack catalog");
+        let partial_declarations = BIFROST_EMBEDDED_PACKS
+            .packs()
+            .iter()
+            .find(|pack| pack.source_id() == "bifrost.go.testify.require-declarations@1.0.0")
+            .expect("partial Testify declaration pack ships")
+            .decode(&DecodeLimits::default())
+            .expect("partial Testify declaration pack decodes");
+        installed_catalog
+            .install(
+                &partial_declarations,
+                &DurablePackSource {
+                    kind: DurablePackSourceKind::Installed,
+                    source_id: "test-arbitrary-local-install".to_owned(),
+                },
+            )
+            .expect("partial pack installs without release accounting");
+        let arbitrary_partial = prepare_compatible_installed_semantic_packs(
+            &installed_catalog,
+            &reviewed.dependencies,
+            &DependencyPackLimits::default(),
+            None,
+        );
+        assert!(
+            arbitrary_partial.complete,
+            "{:#?}",
+            arbitrary_partial.diagnostics
+        );
+        assert!(arbitrary_partial.installed_packs.is_empty());
+        assert!(arbitrary_partial.evidence.is_empty());
+
+        let mixed_catalog = SemanticPackCatalog::open_ephemeral(CatalogOptions::default())
+            .expect("ephemeral mixed-source catalog");
+        let complete_shipped = BIFROST_EMBEDDED_PACKS
+            .packs()
+            .iter()
+            .find(|pack| pack.source_id() == "bifrost.go.testify.require@1.0.0")
+            .expect("complete Testify behavior pack ships");
+        EmbeddedPackRegistry::new(std::slice::from_ref(complete_shipped))
+            .register_all(&mixed_catalog, &DecodeLimits::default())
+            .expect("complete shipped pack registers");
+        mixed_catalog
+            .install(
+                &partial_declarations,
+                &DurablePackSource {
+                    kind: DurablePackSourceKind::Installed,
+                    source_id: "test-mixed-arbitrary-local-install".to_owned(),
+                },
+            )
+            .expect("partial local pack installs alongside shipped pack");
+        let mixed_preparation = prepare_compatible_installed_semantic_packs(
+            &mixed_catalog,
+            &reviewed.dependencies,
+            &DependencyPackLimits::default(),
+            None,
+        );
+        assert!(
+            mixed_preparation.complete,
+            "{:#?}",
+            mixed_preparation.diagnostics
+        );
+        assert!(mixed_preparation.installed_packs.is_empty());
+        assert!(mixed_preparation.evidence.is_empty());
+        let mixed_runtime = acquire_active_semantic_models(
+            activation_workspace.analyzer(),
+            &mixed_catalog,
+            None,
+            &SemanticModelActivationRequest {
+                bifrost_version: env!("CARGO_PKG_VERSION")
+                    .parse()
+                    .expect("crate version is semver"),
+                evidence: mixed_preparation.evidence,
+                controls: Vec::new(),
+                limits: SemanticModelRuntimeLimits::default(),
+            },
+            &CancellationToken::default(),
+        );
+        let SemanticModelRuntimeOutcome::Ready {
+            active: mixed_active,
+            ..
+        } = mixed_runtime
+        else {
+            panic!("empty refused evidence resolves without Testify: {mixed_runtime:#?}");
+        };
+        assert!(
+            mixed_active
+                .shards()
+                .iter()
+                .all(|shard| { !shard.manifest.pack_id.starts_with("bifrost.go.testify.") })
+        );
+
+        let Some(unused) = discover_local_go_dependencies("1.11.1", false) else {
+            return;
+        };
+        assert!(unused.dependencies.iter().any(|dependency| {
+            let evidence = &dependency.evidence;
+            evidence
+                .module
+                .as_ref()
+                .is_some_and(|module| module.name == "example.com/ordinary")
+        }));
+        assert!(!unused.dependencies.iter().any(|dependency| {
+            let evidence = &dependency.evidence;
+            evidence
+                .module
+                .as_ref()
+                .is_some_and(|module| module.name == "github.com/stretchr/testify")
+        }));
+        let unused_preparation = prepare_compatible_installed_semantic_packs(
+            &catalog,
+            &unused.dependencies,
+            &DependencyPackLimits::default(),
+            None,
+        );
+        assert!(
+            unused_preparation.complete,
+            "{:#?}",
+            unused_preparation.diagnostics
+        );
+        assert!(unused_preparation.installed_packs.is_empty());
+        assert!(testify_candidates_for_evidence(&catalog, &unused_preparation.evidence).is_empty());
+
+        let Some(unreviewed) = discover_local_go_dependencies("1.10.0", true) else {
+            return;
+        };
+        assert!(unreviewed.dependencies.iter().any(|dependency| {
+            let evidence = &dependency.evidence;
+            evidence.ecosystem == "go-module"
+                && evidence.module.as_ref().is_some_and(|module| {
+                    module.name == "github.com/stretchr/testify"
+                        && module.version == Some("1.10.0".parse().expect("fixture version"))
+                })
+        }));
+        let unreviewed_preparation = prepare_compatible_installed_semantic_packs(
+            &catalog,
+            &unreviewed.dependencies,
+            &DependencyPackLimits::default(),
+            None,
+        );
+        assert!(
+            unreviewed_preparation.complete,
+            "{:#?}",
+            unreviewed_preparation.diagnostics
+        );
+        assert!(unreviewed_preparation.installed_packs.is_empty());
+        assert!(
+            unreviewed_preparation
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == "dependency.pack_version_mismatch")
+        );
+        assert!(
+            testify_candidates_for_evidence(&catalog, &unreviewed_preparation.evidence).is_empty()
+        );
+    }
+
+    #[test]
+    fn registry_validates_every_pack_before_catalog_registration() {
         let compiled = compiled_fixture();
-        let shard_bytes = compiled
+        let valid_shards = compiled
             .shards
             .iter()
             .map(|shard| shard.bytes.as_slice())
             .collect::<Vec<_>>();
+        let missing_shards: [&[u8]; 0] = [];
         let packs = [
             EmbeddedSemanticPack::new(
-                "bifrost.fixture.second@1",
+                "bifrost.fixture.valid@1",
                 &compiled.manifest_bytes,
-                &shard_bytes,
+                &valid_shards,
             ),
             EmbeddedSemanticPack::new(
-                "bifrost.fixture.first@1",
+                "bifrost.fixture.invalid@1",
                 &compiled.manifest_bytes,
-                &shard_bytes,
+                &missing_shards,
             ),
         ];
         let catalog = SemanticPackCatalog::open_ephemeral(CatalogOptions::default()).unwrap();
 
-        let registrations = EmbeddedPackRegistry::new(&packs)
+        let error = EmbeddedPackRegistry::new(&packs)
             .register_all(&catalog, &DecodeLimits::default())
-            .unwrap();
+            .unwrap_err();
 
-        assert_eq!(
-            registrations
-                .iter()
-                .map(|registration| registration.source_id.as_str())
-                .collect::<Vec<_>>(),
-            ["bifrost.fixture.second@1", "bifrost.fixture.first@1"]
-        );
+        assert!(matches!(
+            error,
+            EmbeddedPackError::ShardCount {
+                declared: 1,
+                embedded: 0
+            }
+        ));
+        assert_eq!(catalog.accounting().unwrap().logical_shard_count, 0);
     }
 
     #[test]
@@ -782,7 +1292,7 @@ mod tests {
             .payload()
             .procedure_summaries()
             .expect("the Go sync shard carries procedure summaries");
-        assert_eq!(summaries.len(), 29);
+        assert_eq!(summaries.len(), 34);
         assert!(summaries.iter().any(|summary| {
             summary.id == "context.context.done"
                 && summary.transfers
@@ -792,6 +1302,30 @@ mod tests {
                         output: CompiledSummaryOutput::NormalReturn {},
                         value_transfer: None,
                     }]
+        }));
+
+        for id in ["context.background", "context.todo"] {
+            let summary = summaries
+                .iter()
+                .find(|summary| summary.id == id)
+                .unwrap_or_else(|| panic!("Go context pack lacks {id}: {summaries:#?}"));
+            assert!(summary.no_concurrency_effects, "{id}: {summary:#?}");
+        }
+        let with_cancel = summaries
+            .iter()
+            .find(|summary| summary.id == "context.with-cancel")
+            .expect("Go context pack carries WithCancel");
+        assert!(
+            with_cancel
+                .concurrency_effects
+                .iter()
+                .any(|effect| matches!(
+                    effect,
+                    CompiledConcurrencyEffect::ChannelClosePropagate { .. }
+                ))
+        );
+        assert!(with_cancel.returned_callables.iter().any(|callable| {
+            callable.result_ordinal == 1 && !callable.concurrency_effects.is_empty()
         }));
 
         let time = concurrency
@@ -1109,6 +1643,7 @@ mod tests {
                 .declaration_facts()
                 .expect("a Go concurrency declaration shard carries declaration facts");
             assert!(relations.is_empty());
+            let mut noncanonical_member_ids = Vec::new();
             for fact in types {
                 assert_eq!(
                     fact.id,
@@ -1145,16 +1680,23 @@ mod tests {
                     parameter_variadics: &parameter_variadics,
                     return_type: signature.returns.as_ref(),
                 });
-                assert_eq!(
-                    member.id, expected,
-                    "the authored concurrency member ID uses the canonical Go identity"
-                );
+                if member.id != expected {
+                    noncanonical_member_ids.push((
+                        member.name.clone(),
+                        member.id.clone(),
+                        expected,
+                    ));
+                }
             }
+            assert!(
+                noncanonical_member_ids.is_empty(),
+                "authored concurrency member IDs use canonical Go identities: {noncanonical_member_ids:#?}"
+            );
             declaration_type_count += types.len();
             declaration_member_count += members.len();
         }
-        assert_eq!(declaration_type_count, 16);
-        assert_eq!(declaration_member_count, 39);
+        assert_eq!(declaration_type_count, 17);
+        assert_eq!(declaration_member_count, 48);
 
         let time_declarations = concurrency_declarations
             .shards
@@ -1173,8 +1715,8 @@ mod tests {
             .declaration_facts()
             .expect("the Go time declaration shard carries declaration facts");
         assert!(relations.is_empty());
-        assert_eq!(time_types.len(), 4);
-        assert_eq!(time_members.len(), 5);
+        assert_eq!(time_types.len(), 5);
+        assert_eq!(time_members.len(), 9);
         let time_module = time_types
             .iter()
             .find(|fact| fact.name == "time")
@@ -1191,9 +1733,14 @@ mod tests {
             .iter()
             .find(|fact| fact.name == "time.Timer")
             .expect("time.Timer is declared");
+        let ticker_type = time_types
+            .iter()
+            .find(|fact| fact.name == "time.Ticker")
+            .expect("time.Ticker is declared");
         assert_eq!(time_type.type_kind, TypeKind::Struct);
         assert_eq!(duration_type.type_kind, TypeKind::Class);
         assert_eq!(timer_type.type_kind, TypeKind::Struct);
+        assert_eq!(ticker_type.type_kind, TypeKind::Struct);
 
         let now = time_members
             .iter()
@@ -1204,6 +1751,33 @@ mod tests {
             now.signature.as_ref().and_then(|signature| signature.returns.as_ref()),
             Some(TypeRef::Declared { id, arguments, nullable })
                 if id == &time_type.id && arguments.is_empty() && !nullable
+        ));
+
+        let new_ticker = time_members
+            .iter()
+            .find(|member| member.name == "NewTicker")
+            .expect("time.NewTicker is declared");
+        assert_eq!(new_ticker.owner, time_module.id);
+        assert!(matches!(
+            new_ticker.signature.as_ref(),
+            Some(signature)
+                if matches!(
+                    signature.parameters.as_slice(),
+                    [parameter]
+                        if matches!(
+                            &parameter.r#type,
+                            TypeRef::Declared { id, arguments, nullable }
+                                if id == &duration_type.id && arguments.is_empty() && !nullable
+                        )
+                ) && matches!(
+                    signature.returns.as_ref(),
+                    Some(TypeRef::Pointer { element })
+                        if matches!(
+                            element.as_ref(),
+                            TypeRef::Declared { id, arguments, nullable }
+                                if id == &ticker_type.id && arguments.is_empty() && !nullable
+                        )
+                )
         ));
 
         let sub = time_members
@@ -1236,13 +1810,28 @@ mod tests {
 
         let stop = time_members
             .iter()
-            .find(|member| member.name == "Stop")
+            .find(|member| member.name == "Stop" && member.owner == timer_type.id)
             .expect("time.Timer.Stop is declared");
         assert_eq!(stop.owner, timer_type.id);
         assert_eq!(
             stop.receiver.as_ref().map(|receiver| receiver.pointer),
             Some(true)
         );
+
+        let ticker_stop = time_members
+            .iter()
+            .find(|member| member.owner == ticker_type.id && member.name == "Stop")
+            .expect("time.Ticker.Stop is declared");
+        assert_eq!(
+            ticker_stop
+                .receiver
+                .as_ref()
+                .map(|receiver| receiver.pointer),
+            Some(true)
+        );
+        assert!(ticker_stop.signature.as_ref().is_some_and(|signature| {
+            signature.parameters.is_empty() && signature.returns.is_none()
+        }));
         assert!(matches!(
             stop.signature.as_ref().and_then(|signature| signature.returns.as_ref()),
             Some(TypeRef::Named { name, arguments, nullable })
@@ -1251,7 +1840,7 @@ mod tests {
 
         let reset = time_members
             .iter()
-            .find(|member| member.name == "Reset")
+            .find(|member| member.name == "Reset" && member.owner == timer_type.id)
             .expect("time.Timer.Reset is declared");
         assert_eq!(reset.owner, timer_type.id);
         assert_eq!(
@@ -1307,6 +1896,54 @@ mod tests {
                         if id == &timer_type.id && arguments.is_empty() && !nullable
                 )
         ));
+
+        // #3787: a receiver typed by a constructor result resolves only when
+        // the constructor's declared result names the receiver's type.
+        let returns_pointer_to = |name: &str, target: &str| {
+            let member = time_members
+                .iter()
+                .find(|member| member.name == name && member.owner == time_module.id)
+                .unwrap_or_else(|| panic!("time.{name} is declared"));
+            assert!(
+                matches!(
+                    member.signature.as_ref().map(|signature| (
+                        signature.parameters.as_slice(),
+                        signature.returns.as_ref()
+                    )),
+                    Some(([duration], Some(TypeRef::Pointer { element })))
+                        if matches!(
+                            &duration.r#type,
+                            TypeRef::Declared { id, .. } if id == &duration_type.id
+                        ) && matches!(
+                            element.as_ref(),
+                            TypeRef::Declared { id, arguments, nullable }
+                                if id == target && arguments.is_empty() && !nullable
+                        )
+                ),
+                "time.{name}(d time.Duration) returns its pointer type: {member:#?}"
+            );
+        };
+        returns_pointer_to("NewTicker", &ticker_type.id);
+        returns_pointer_to("NewTimer", &timer_type.id);
+        for (name, parameter_count) in [("Stop", 0), ("Reset", 1)] {
+            let member = time_members
+                .iter()
+                .find(|member| member.name == name && member.owner == ticker_type.id)
+                .unwrap_or_else(|| panic!("time.Ticker.{name} is declared"));
+            assert_eq!(
+                member.receiver.as_ref().map(|receiver| receiver.pointer),
+                Some(true)
+            );
+            let signature = member
+                .signature
+                .as_ref()
+                .unwrap_or_else(|| panic!("time.Ticker.{name} has a signature"));
+            assert_eq!(signature.parameters.len(), parameter_count);
+            assert!(
+                signature.returns.is_none(),
+                "time.Ticker.{name} returns nothing"
+            );
+        }
 
         let atomic = decoded
             .iter()
@@ -2137,913 +2774,6 @@ mod tests {
     }
 
     #[test]
-    fn shipped_go_encoding_pem_pack_preserves_direct_contract_and_canonical_declarations() {
-        let behavior = BIFROST_EMBEDDED_PACKS
-            .packs()
-            .iter()
-            .find(|pack| pack.source_id() == "bifrost.go.stdlib.encoding-pem@1.0.0")
-            .expect("the Go encoding/pem behavior pack ships")
-            .decode(&DecodeLimits::default())
-            .expect("the Go encoding/pem behavior pack decodes");
-        assert_eq!(behavior.manifest.pack_id, "bifrost.go.stdlib.encoding-pem");
-        assert_eq!(behavior.manifest.completeness, Completeness::Complete);
-        assert_eq!(
-            behavior.manifest.provenance.source,
-            "https://pkg.go.dev/encoding/pem"
-        );
-        assert_eq!(
-            behavior.manifest.provenance.revision.as_deref(),
-            Some("go1.26.0")
-        );
-        let [shard] = behavior.shards.as_slice() else {
-            panic!("the Go encoding/pem behavior pack has one shard: {behavior:#?}");
-        };
-        let shard = decode_shard_for_manifest(
-            &behavior.manifest,
-            &shard.descriptor,
-            &shard.bytes,
-            &DecodeLimits::default(),
-        )
-        .expect("the Go encoding/pem behavior shard decodes");
-        let summaries = shard
-            .payload()
-            .procedure_summaries()
-            .expect("the Go encoding/pem behavior shard carries procedure summaries");
-        let [decode] = summaries else {
-            panic!("the Go encoding/pem behavior pack carries only Decode: {summaries:#?}");
-        };
-        assert_eq!(decode.id, "encoding-pem.decode");
-        assert_eq!(decode.target.path, "src/encoding/pem/pem.go");
-        assert_eq!(decode.target.symbol, "encoding/pem.Decode(data []byte)");
-        assert!(!decode.target.has_receiver);
-        assert!(!decode.target.variadic);
-        assert_eq!(decode.target.parameter_count, 1);
-        assert_eq!(decode.normal_result_count, Some(2));
-        assert_eq!(decode.completeness, Completeness::Complete);
-        assert!(decode.transfers.is_empty());
-        assert!(decode.effects.is_empty());
-        let [contract] = decode.result_contracts.as_slice() else {
-            panic!("encoding/pem.Decode has one direct result contract: {decode:#?}");
-        };
-        assert_eq!(contract.result_ordinal, 0);
-        assert_eq!(contract.condition_result_ordinal, None);
-        assert_eq!(contract.predicate, None);
-        assert_eq!(
-            contract.result_success_predicate,
-            Some(CompiledResultPredicate::NonNull)
-        );
-        assert!(contract.member_contracts.is_empty());
-
-        let declarations = BIFROST_EMBEDDED_PACKS
-            .packs()
-            .iter()
-            .find(|pack| pack.source_id() == "bifrost.go.stdlib.encoding-pem-declarations@1.0.0")
-            .expect("the Go encoding/pem declaration pack ships")
-            .decode(&DecodeLimits::default())
-            .expect("the Go encoding/pem declaration pack decodes");
-        assert_eq!(
-            declarations.manifest.pack_id,
-            "bifrost.go.stdlib.encoding-pem-declarations"
-        );
-        assert_eq!(declarations.manifest.completeness, Completeness::Partial);
-        let [shard] = declarations.shards.as_slice() else {
-            panic!("the Go encoding/pem declaration pack has one shard: {declarations:#?}");
-        };
-        let shard = decode_shard_for_manifest(
-            &declarations.manifest,
-            &shard.descriptor,
-            &shard.bytes,
-            &DecodeLimits::default(),
-        )
-        .expect("the Go encoding/pem declaration shard decodes");
-        let (types, members, relations) = shard
-            .payload()
-            .declaration_facts()
-            .expect("the Go encoding/pem declaration shard carries declaration facts");
-        assert!(relations.is_empty());
-        assert_eq!(types.len(), 2, "only encoding/pem and Block are reviewed");
-        for fact in types {
-            assert_eq!(
-                fact.id,
-                type_declaration_id(TypeIdentity {
-                    ecosystem: "go",
-                    name: &fact.name,
-                }),
-                "the authored type ID uses the Go artifact producer's canonical identity"
-            );
-        }
-        let module = types
-            .iter()
-            .find(|fact| fact.name == "encoding/pem")
-            .expect("the encoding/pem module declaration ships");
-        assert_eq!(module.type_kind, TypeKind::Module);
-        assert_eq!(
-            module.id,
-            "type.523ee6b9392fc5418155ad19c06446eb7eaceddbc940e19a6b37c264962f1bab"
-        );
-        let block = types
-            .iter()
-            .find(|fact| fact.name == "encoding/pem.Block")
-            .expect("the encoding/pem.Block declaration ships");
-        assert_eq!(block.type_kind, TypeKind::Struct);
-        assert_eq!(
-            block.id,
-            "type.502f31c39e30446071dc33aad9163f6dbce9fd0dd0cdbe6c02f6d9c35f4f84c3"
-        );
-
-        assert_eq!(
-            members.len(),
-            4,
-            "Decode and the three public Block fields are reviewed"
-        );
-        for member in members {
-            let signature = member
-                .signature
-                .as_ref()
-                .unwrap_or_else(|| panic!("{} has a structured signature", member.name));
-            let parameter_types = signature
-                .parameters
-                .iter()
-                .map(|parameter| parameter.r#type.clone())
-                .collect::<Vec<_>>();
-            let parameter_variadics = signature
-                .parameters
-                .iter()
-                .map(|parameter| parameter.variadic)
-                .collect::<Vec<_>>();
-            assert_eq!(
-                member.id,
-                member_declaration_id(MemberIdentity {
-                    owner_id: &member.owner,
-                    kind: member.member_kind,
-                    is_static: member.is_static,
-                    parameter_arity: parameter_types.len(),
-                    name: &member.name,
-                    generic_arity: signature.type_parameters.len(),
-                    parameter_types: &parameter_types,
-                    parameter_variadics: &parameter_variadics,
-                    return_type: signature.returns.as_ref(),
-                }),
-                "the authored member ID uses the Go artifact producer's canonical identity"
-            );
-        }
-
-        let decode_declaration = members
-            .iter()
-            .find(|member| member.name == "Decode")
-            .expect("encoding/pem.Decode declaration ships");
-        assert_eq!(
-            decode_declaration.id,
-            "member.bb759c857a5e84d42a5a6028af28ff437269463c0abd0a5fe73529d904c0cbf8"
-        );
-        assert_eq!(decode_declaration.owner, module.id);
-        assert_eq!(decode_declaration.member_kind, MemberKind::Function);
-        assert!(decode_declaration.is_static);
-        assert!(decode_declaration.receiver.is_none());
-        assert!(matches!(
-            &decode_declaration.locator,
-            Locator::Artifact { path, symbol }
-                if path == "encoding/pem/pem.go" && symbol == "encoding/pem.Decode"
-        ));
-        let signature = decode_declaration
-            .signature
-            .as_ref()
-            .expect("encoding/pem.Decode has a structured signature");
-        assert!(signature.type_parameters.is_empty());
-        let [data] = signature.parameters.as_slice() else {
-            panic!("encoding/pem.Decode has one parameter: {signature:#?}");
-        };
-        assert_eq!(data.name.as_deref(), Some("data"));
-        assert!(!data.optional);
-        assert!(!data.variadic);
-        assert!(matches!(
-            &data.r#type,
-            TypeRef::Slice { element }
-                if matches!(
-                    element.as_ref(),
-                    TypeRef::Named { name, arguments, nullable }
-                        if name == "byte" && arguments.is_empty() && !nullable
-                )
-        ));
-        let Some(TypeRef::Tuple { elements }) = signature.returns.as_ref() else {
-            panic!("encoding/pem.Decode returns (*Block, []byte): {signature:#?}");
-        };
-        let [decoded_block, rest] = elements.as_slice() else {
-            panic!("encoding/pem.Decode returns two results: {signature:#?}");
-        };
-        assert!(matches!(
-            decoded_block,
-            TypeRef::Pointer { element }
-                if matches!(
-                    element.as_ref(),
-                    TypeRef::Declared { id, arguments, nullable }
-                        if id == &block.id && arguments.is_empty() && !nullable
-                )
-        ));
-        assert!(matches!(
-            rest,
-            TypeRef::Slice { element }
-                if matches!(
-                    element.as_ref(),
-                    TypeRef::Named { name, arguments, nullable }
-                        if name == "byte" && arguments.is_empty() && !nullable
-                )
-        ));
-
-        for (name, expected_id) in [
-            (
-                "Type",
-                "member.3f0d9ca8f7462d2cdc7d21d1d70e04cf37acbadff593bc8319c0b80e28924389",
-            ),
-            (
-                "Headers",
-                "member.f6a87143d5cd7d9bfc4a9fe7b1b960b3087cfd166e3e8b34900d0d1a32ce48b4",
-            ),
-            (
-                "Bytes",
-                "member.5aaed0395fdc8573e6c6c4921dc6ec3efbab63b17f4f429a65afa78916809ee8",
-            ),
-        ] {
-            let field = members
-                .iter()
-                .find(|member| member.name == name)
-                .unwrap_or_else(|| panic!("encoding/pem.Block.{name} declaration ships"));
-            assert_eq!(field.id, expected_id);
-            assert_eq!(field.owner, block.id);
-            assert_eq!(field.member_kind, MemberKind::Field);
-            assert!(!field.is_static);
-            assert!(field.receiver.is_none());
-            assert!(matches!(
-                &field.locator,
-                Locator::Artifact { path, symbol }
-                    if path == "encoding/pem/pem.go"
-                        && symbol == &format!("encoding/pem.Block.{name}")
-            ));
-            let signature = field
-                .signature
-                .as_ref()
-                .unwrap_or_else(|| panic!("encoding/pem.Block.{name} has a signature"));
-            assert!(signature.type_parameters.is_empty());
-            assert!(signature.parameters.is_empty());
-            match name {
-                "Type" => assert!(matches!(
-                    signature.returns.as_ref(),
-                    Some(TypeRef::Named { name, arguments, nullable })
-                        if name == "string" && arguments.is_empty() && !nullable
-                )),
-                "Headers" => {
-                    let Some(TypeRef::Map { key, value }) = signature.returns.as_ref() else {
-                        panic!(
-                            "encoding/pem.Block.Headers returns map[string]string: {signature:#?}"
-                        );
-                    };
-                    for part in [key.as_ref(), value.as_ref()] {
-                        assert!(matches!(
-                            part,
-                            TypeRef::Named { name, arguments, nullable }
-                                if name == "string" && arguments.is_empty() && !nullable
-                        ));
-                    }
-                }
-                "Bytes" => assert!(matches!(
-                    signature.returns.as_ref(),
-                    Some(TypeRef::Slice { element })
-                        if matches!(
-                            element.as_ref(),
-                            TypeRef::Named { name, arguments, nullable }
-                                if name == "byte" && arguments.is_empty() && !nullable
-                        )
-                )),
-                _ => unreachable!("the reviewed Block field matrix is exhaustive"),
-            }
-        }
-    }
-
-    #[test]
-    fn shipped_go_bytes_declaration_preserves_trim_space_arity() {
-        let declarations = BIFROST_EMBEDDED_PACKS
-            .packs()
-            .iter()
-            .find(|pack| pack.source_id() == "bifrost.go.stdlib.bytes-declarations@1.0.0")
-            .expect("the Go bytes declaration pack ships")
-            .decode(&DecodeLimits::default())
-            .expect("the Go bytes declaration pack decodes");
-        assert_eq!(declarations.manifest.completeness, Completeness::Partial);
-        assert_eq!(
-            declarations.manifest.provenance.revision.as_deref(),
-            Some("go1.26.0")
-        );
-        let [shard] = declarations.shards.as_slice() else {
-            panic!("the Go bytes declaration pack has one shard: {declarations:#?}");
-        };
-        let shard = decode_shard_for_manifest(
-            &declarations.manifest,
-            &shard.descriptor,
-            &shard.bytes,
-            &DecodeLimits::default(),
-        )
-        .expect("the Go bytes declaration shard decodes");
-        let ([module], [function], []) = shard
-            .payload()
-            .declaration_facts()
-            .expect("the Go bytes shard carries declaration facts")
-        else {
-            panic!("only the reviewed module and TrimSpace declaration ship");
-        };
-        assert_eq!(module.name, "bytes");
-        assert_eq!(module.type_kind, TypeKind::Module);
-        assert_eq!(
-            module.id,
-            type_declaration_id(TypeIdentity {
-                ecosystem: "go",
-                name: "bytes",
-            })
-        );
-        assert_eq!(function.owner, module.id);
-        assert_eq!(function.name, "TrimSpace");
-        assert_eq!(function.member_kind, MemberKind::Function);
-        assert!(function.is_static);
-        let signature = function
-            .signature
-            .as_ref()
-            .expect("bytes.TrimSpace has a structured signature");
-        let [input] = signature.parameters.as_slice() else {
-            panic!("bytes.TrimSpace has one input parameter: {signature:#?}");
-        };
-        for r#type in [&input.r#type, signature.returns.as_ref().unwrap()] {
-            assert!(matches!(
-                r#type,
-                TypeRef::Slice { element }
-                    if matches!(
-                        element.as_ref(),
-                        TypeRef::Named { name, arguments, nullable }
-                            if name == "byte" && arguments.is_empty() && !nullable
-                    )
-            ));
-        }
-        let parameter_types = [input.r#type.clone()];
-        let parameter_variadics = [input.variadic];
-        assert_eq!(
-            function.id,
-            member_declaration_id(MemberIdentity {
-                owner_id: &function.owner,
-                kind: function.member_kind,
-                is_static: function.is_static,
-                parameter_arity: 1,
-                name: &function.name,
-                generic_arity: 0,
-                parameter_types: &parameter_types,
-                parameter_variadics: &parameter_variadics,
-                return_type: signature.returns.as_ref(),
-            })
-        );
-    }
-
-    #[test]
-    fn shipped_go_crypto_x509_pack_preserves_exact_parameter_precondition_and_declaration() {
-        let behavior = BIFROST_EMBEDDED_PACKS
-            .packs()
-            .iter()
-            .find(|pack| pack.source_id() == "bifrost.go.stdlib.crypto-x509@1.0.0")
-            .expect("the Go crypto/x509 behavior pack ships")
-            .decode(&DecodeLimits::default())
-            .expect("the Go crypto/x509 behavior pack decodes");
-        assert_eq!(behavior.manifest.completeness, Completeness::Complete);
-        assert_eq!(
-            behavior.manifest.provenance.source,
-            "https://pkg.go.dev/crypto/x509"
-        );
-        assert_eq!(
-            behavior.manifest.provenance.revision.as_deref(),
-            Some("go1.26.0")
-        );
-        let [shard] = behavior.shards.as_slice() else {
-            panic!("the Go crypto/x509 behavior pack has one shard: {behavior:#?}");
-        };
-        let shard = decode_shard_for_manifest(
-            &behavior.manifest,
-            &shard.descriptor,
-            &shard.bytes,
-            &DecodeLimits::default(),
-        )
-        .expect("the Go crypto/x509 behavior shard decodes");
-        let [summary] = shard
-            .payload()
-            .procedure_summaries()
-            .expect("the Go crypto/x509 shard carries procedure summaries")
-        else {
-            panic!("the Go crypto/x509 behavior pack carries one reviewed function");
-        };
-        assert_eq!(summary.id, "crypto-x509.is-encrypted-pem-block");
-        assert_eq!(summary.target.path, "src/crypto/x509/pem_decrypt.go");
-        assert_eq!(
-            summary.target.symbol,
-            "crypto/x509.IsEncryptedPEMBlock(b *pem.Block)"
-        );
-        assert!(!summary.target.has_receiver);
-        assert_eq!(summary.target.parameter_count, 1);
-        assert_eq!(summary.completeness, Completeness::Complete);
-        assert_eq!(summary.normal_result_count, Some(1));
-        assert_eq!(
-            summary.preconditions,
-            Some(vec![CompiledOperationPrecondition {
-                input: CompiledSummaryInput::Parameter { ordinal: 0 },
-                predicate: CompiledResultPredicate::NonNull,
-            }])
-        );
-
-        let declarations = BIFROST_EMBEDDED_PACKS
-            .packs()
-            .iter()
-            .find(|pack| pack.source_id() == "bifrost.go.stdlib.crypto-x509-declarations@1.0.0")
-            .expect("the Go crypto/x509 declaration pack ships")
-            .decode(&DecodeLimits::default())
-            .expect("the Go crypto/x509 declaration pack decodes");
-        assert_eq!(declarations.manifest.completeness, Completeness::Partial);
-        let [shard] = declarations.shards.as_slice() else {
-            panic!("the Go crypto/x509 declaration pack has one shard: {declarations:#?}");
-        };
-        let shard = decode_shard_for_manifest(
-            &declarations.manifest,
-            &shard.descriptor,
-            &shard.bytes,
-            &DecodeLimits::default(),
-        )
-        .expect("the Go crypto/x509 declaration shard decodes");
-        let ([module], [function], []) = shard
-            .payload()
-            .declaration_facts()
-            .expect("the Go crypto/x509 shard carries declaration facts")
-        else {
-            panic!("only the reviewed module and function declaration ship");
-        };
-        assert_eq!(module.name, "crypto/x509");
-        assert_eq!(module.type_kind, TypeKind::Module);
-        assert_eq!(
-            module.id,
-            type_declaration_id(TypeIdentity {
-                ecosystem: "go",
-                name: "crypto/x509",
-            })
-        );
-        assert_eq!(function.owner, module.id);
-        assert_eq!(function.name, "IsEncryptedPEMBlock");
-        assert_eq!(function.member_kind, MemberKind::Function);
-        assert!(function.is_static);
-        let signature = function
-            .signature
-            .as_ref()
-            .expect("IsEncryptedPEMBlock has a structured signature");
-        let [block] = signature.parameters.as_slice() else {
-            panic!("IsEncryptedPEMBlock has one block parameter: {signature:#?}");
-        };
-        assert!(matches!(
-            &block.r#type,
-            TypeRef::Pointer { element }
-                if matches!(
-                    element.as_ref(),
-                    TypeRef::Named { name, arguments, nullable }
-                        if name == "encoding/pem.Block" && arguments.is_empty() && !nullable
-                )
-        ));
-        let parameter_types = [block.r#type.clone()];
-        let parameter_variadics = [block.variadic];
-        assert_eq!(
-            function.id,
-            member_declaration_id(MemberIdentity {
-                owner_id: &function.owner,
-                kind: function.member_kind,
-                is_static: function.is_static,
-                parameter_arity: 1,
-                name: &function.name,
-                generic_arity: 0,
-                parameter_types: &parameter_types,
-                parameter_variadics: &parameter_variadics,
-                return_type: signature.returns.as_ref(),
-            })
-        );
-    }
-
-    #[test]
-    fn testify_packs_require_the_reviewed_module_version() {
-        let catalog = SemanticPackCatalog::open_ephemeral(CatalogOptions::default())
-            .expect("ephemeral semantic-pack catalog");
-        BIFROST_EMBEDDED_PACKS
-            .register_all(&catalog, &DecodeLimits::default())
-            .expect("shipped semantic packs register");
-
-        let candidates = |ecosystem: &str, module: Option<CatalogCoordinate>| -> BTreeSet<String> {
-            testify_candidates_for_evidence(
-                &catalog,
-                &[SemanticModelActivationEvidence {
-                    language: "go".to_owned(),
-                    ecosystem: ecosystem.to_owned(),
-                    package: None,
-                    module,
-                    toolchain: None,
-                    target: None,
-                    configuration: None,
-                    artifact_sha256: None,
-                }],
-            )
-        };
-
-        assert!(candidates("go", None).is_empty());
-        assert!(
-            candidates(
-                "go-module",
-                Some(CatalogCoordinate {
-                    name: "github.com/stretchr/testify".to_owned(),
-                    version: None,
-                }),
-            )
-            .is_empty(),
-            "a local replacement without reviewed version evidence stays inactive"
-        );
-        assert!(
-            candidates(
-                "go-module",
-                Some(CatalogCoordinate {
-                    name: "github.com/stretchr/testify".to_owned(),
-                    version: Some("1.10.0".parse().expect("fixture version")),
-                }),
-            )
-            .is_empty(),
-            "an unreviewed Testify version stays inactive"
-        );
-        assert_eq!(
-            candidates(
-                "go-module",
-                Some(CatalogCoordinate {
-                    name: "github.com/stretchr/testify".to_owned(),
-                    version: Some("1.11.1".parse().expect("fixture version")),
-                }),
-            ),
-            BTreeSet::from([
-                "bifrost.go.testify.assert@1.0.0".to_owned(),
-                "bifrost.go.testify.assert-declarations@1.0.0".to_owned(),
-                "bifrost.go.testify.require@1.0.0".to_owned(),
-                "bifrost.go.testify.require-declarations@1.0.0".to_owned(),
-            ])
-        );
-    }
-
-    fn discover_local_go_dependencies(
-        testify_version: &str,
-        import_testify_from_test: bool,
-    ) -> Option<DependencyDiscoveryOutcome> {
-        if Command::new("go").arg("version").output().is_err() {
-            return None;
-        }
-        let test_source = if import_testify_from_test {
-            r#"package sample
-
-import (
-	"testing"
-
-	"github.com/stretchr/testify/require"
-)
-
-func TestValue(t *testing.T) {
-	require.NoError(t, nil)
-}
-"#
-        } else {
-            r#"package sample
-
-import "testing"
-
-func TestValue(t *testing.T) {
-	if Value() == "" {
-		t.Fatal("empty value")
-	}
-}
-"#
-        };
-        let project = InlineTestProject::with_language(Language::Go)
-            .file(
-                "go.mod",
-                format!(
-                    "module example.com/sample\n\ngo 1.21\n\nrequire (\n\texample.com/ordinary v1.0.0\n\tgithub.com/stretchr/testify v{testify_version}\n)\n\nreplace example.com/ordinary => ./ordinary\nreplace github.com/stretchr/testify => ./testify\n"
-                ),
-            )
-            .file(
-                "sample.go",
-                "package sample\n\nimport \"example.com/ordinary\"\n\nfunc Value() string { return ordinary.Value() }\n",
-            )
-            .file("sample_test.go", test_source)
-            .file(
-                "ordinary/go.mod",
-                "module example.com/ordinary\n\ngo 1.21\n",
-            )
-            .file(
-                "ordinary/ordinary.go",
-                "package ordinary\n\nfunc Value() string { return \"ordinary\" }\n",
-            )
-            .file(
-                "testify/go.mod",
-                "module github.com/stretchr/testify\n\ngo 1.21\n",
-            )
-            .file(
-                "testify/require/require.go",
-                "package require\n\nfunc NoError(t interface{}, err error, msgAndArgs ...interface{}) {}\n",
-            )
-            .build();
-        let mut config = GoAnalyzerConfig::default();
-        config.dependency_discovery.mode = GoDependencyDiscoveryMode::CuratedPackEvidence;
-        config.dependency_discovery.go_executable = Some(PathBuf::from("go"));
-        config.dependency_discovery.workspace_patterns = vec![".".to_owned()];
-        config.dependency_discovery.timeout = Duration::from_secs(30);
-        let outcome = resolve_go_semantic_pack_dependencies(
-            &config,
-            project.project(),
-            &DependencyPackLimits::default(),
-            None,
-        );
-        assert!(outcome.complete, "{:#?}", outcome.diagnostics);
-        Some(outcome)
-    }
-
-    fn testify_candidates_for_evidence(
-        catalog: &SemanticPackCatalog,
-        evidence: &[SemanticModelActivationEvidence],
-    ) -> BTreeSet<String> {
-        evidence
-            .iter()
-            .flat_map(|evidence| {
-                catalog
-                    .candidates(&SemanticPackSelectorQuery {
-                        language: evidence.language.clone(),
-                        ecosystem: evidence.ecosystem.clone(),
-                        package: evidence.package.clone(),
-                        module: evidence.module.clone(),
-                        toolchain: evidence.toolchain.clone(),
-                        target: evidence.target.clone(),
-                        configuration: evidence.configuration.clone(),
-                        artifact_sha256: evidence.artifact_sha256.clone(),
-                        bifrost_version: env!("CARGO_PKG_VERSION")
-                            .parse()
-                            .expect("crate version is semver"),
-                    })
-                    .expect("catalog query completes")
-            })
-            .map(|candidate| candidate.source_id().to_owned())
-            .filter(|source_id| source_id.starts_with("bifrost.go.testify."))
-            .collect()
-    }
-
-    #[test]
-    fn test_only_go_dependency_selects_reviewed_testify_packs() {
-        let catalog = SemanticPackCatalog::open_ephemeral(CatalogOptions::default())
-            .expect("ephemeral semantic-pack catalog");
-        BIFROST_EMBEDDED_PACKS
-            .register_all(&catalog, &DecodeLimits::default())
-            .expect("shipped semantic packs register");
-        let expected = BTreeSet::from([
-            "bifrost.go.testify.assert@1.0.0".to_owned(),
-            "bifrost.go.testify.assert-declarations@1.0.0".to_owned(),
-            "bifrost.go.testify.require@1.0.0".to_owned(),
-            "bifrost.go.testify.require-declarations@1.0.0".to_owned(),
-        ]);
-
-        let Some(reviewed) = discover_local_go_dependencies("1.11.1", true) else {
-            return;
-        };
-        assert!(
-            reviewed
-                .dependencies
-                .iter()
-                .all(|dependency| dependency.artifacts.is_empty())
-        );
-        assert!(reviewed.dependencies.iter().any(|dependency| {
-            let evidence = &dependency.evidence;
-            evidence.module.as_ref().is_some_and(|module| {
-                module.name == "example.com/ordinary"
-                    && module.version == Some("1.0.0".parse().expect("fixture version"))
-            })
-        }));
-        assert!(reviewed.dependencies.iter().any(|dependency| {
-            let evidence = &dependency.evidence;
-            evidence.ecosystem == "go-module"
-                && evidence.module.as_ref().is_some_and(|module| {
-                    module.name == "github.com/stretchr/testify"
-                        && module.version == Some("1.11.1".parse().expect("fixture version"))
-                })
-        }));
-        let reviewed_preparation = prepare_compatible_installed_semantic_packs(
-            &catalog,
-            &reviewed.dependencies,
-            &DependencyPackLimits::default(),
-            None,
-        );
-        assert!(
-            reviewed_preparation.complete,
-            "{:#?}",
-            reviewed_preparation.diagnostics
-        );
-        assert!(reviewed_preparation.packs.is_empty());
-        assert_eq!(reviewed_preparation.profile.artifacts_read, 0);
-        assert_eq!(reviewed_preparation.profile.artifact_bytes_read, 0);
-        assert_eq!(reviewed_preparation.profile.generated_packs, 0);
-        assert_eq!(reviewed_preparation.profile.installed_packs, 1);
-        assert_eq!(
-            reviewed_preparation.installed_packs[0]
-                .manifest_digests
-                .len(),
-            4
-        );
-        assert_eq!(
-            testify_candidates_for_evidence(&catalog, &reviewed_preparation.evidence),
-            expected
-        );
-        let activation_project = InlineTestProject::with_language(Language::Go)
-            .file("go.mod", "module example.com/activation\n\ngo 1.21\n")
-            .file("main.go", "package activation\n")
-            .build();
-        let activation_workspace = activation_project.workspace_analyzer(AnalyzerConfig::default());
-        let runtime = acquire_active_semantic_models(
-            activation_workspace.analyzer(),
-            &catalog,
-            None,
-            &SemanticModelActivationRequest {
-                bifrost_version: env!("CARGO_PKG_VERSION")
-                    .parse()
-                    .expect("crate version is semver"),
-                evidence: reviewed_preparation.evidence.clone(),
-                controls: Vec::new(),
-                limits: SemanticModelRuntimeLimits::default(),
-            },
-            &CancellationToken::default(),
-        );
-        let SemanticModelRuntimeOutcome::Ready { active, .. } = runtime else {
-            panic!("exact reviewed Testify evidence activates: {runtime:#?}");
-        };
-        let active_testify = active
-            .shards()
-            .iter()
-            .map(|shard| format!("{}@{}", shard.manifest.pack_id, shard.manifest.version))
-            .filter(|pack_id| pack_id.starts_with("bifrost.go.testify."))
-            .collect::<BTreeSet<_>>();
-        assert_eq!(active_testify, expected);
-
-        let installed_catalog = SemanticPackCatalog::open_ephemeral(CatalogOptions::default())
-            .expect("ephemeral installed-pack catalog");
-        let partial_declarations = BIFROST_EMBEDDED_PACKS
-            .packs()
-            .iter()
-            .find(|pack| pack.source_id() == "bifrost.go.testify.require-declarations@1.0.0")
-            .expect("partial Testify declaration pack ships")
-            .decode(&DecodeLimits::default())
-            .expect("partial Testify declaration pack decodes");
-        installed_catalog
-            .install(
-                &partial_declarations,
-                &DurablePackSource {
-                    kind: DurablePackSourceKind::Installed,
-                    source_id: "test-arbitrary-local-install".to_owned(),
-                },
-            )
-            .expect("partial pack installs without release accounting");
-        let arbitrary_partial = prepare_compatible_installed_semantic_packs(
-            &installed_catalog,
-            &reviewed.dependencies,
-            &DependencyPackLimits::default(),
-            None,
-        );
-        assert!(
-            arbitrary_partial.complete,
-            "{:#?}",
-            arbitrary_partial.diagnostics
-        );
-        assert!(arbitrary_partial.installed_packs.is_empty());
-        assert!(arbitrary_partial.evidence.is_empty());
-
-        let mixed_catalog = SemanticPackCatalog::open_ephemeral(CatalogOptions::default())
-            .expect("ephemeral mixed-source catalog");
-        let complete_shipped = BIFROST_EMBEDDED_PACKS
-            .packs()
-            .iter()
-            .find(|pack| pack.source_id() == "bifrost.go.testify.require@1.0.0")
-            .expect("complete Testify behavior pack ships");
-        EmbeddedPackRegistry::new(std::slice::from_ref(complete_shipped))
-            .register_all(&mixed_catalog, &DecodeLimits::default())
-            .expect("complete shipped pack registers");
-        mixed_catalog
-            .install(
-                &partial_declarations,
-                &DurablePackSource {
-                    kind: DurablePackSourceKind::Installed,
-                    source_id: "test-mixed-arbitrary-local-install".to_owned(),
-                },
-            )
-            .expect("partial local pack installs alongside shipped pack");
-        let mixed_preparation = prepare_compatible_installed_semantic_packs(
-            &mixed_catalog,
-            &reviewed.dependencies,
-            &DependencyPackLimits::default(),
-            None,
-        );
-        assert!(
-            mixed_preparation.complete,
-            "{:#?}",
-            mixed_preparation.diagnostics
-        );
-        assert!(mixed_preparation.installed_packs.is_empty());
-        assert!(mixed_preparation.evidence.is_empty());
-        let mixed_runtime = acquire_active_semantic_models(
-            activation_workspace.analyzer(),
-            &mixed_catalog,
-            None,
-            &SemanticModelActivationRequest {
-                bifrost_version: env!("CARGO_PKG_VERSION")
-                    .parse()
-                    .expect("crate version is semver"),
-                evidence: mixed_preparation.evidence,
-                controls: Vec::new(),
-                limits: SemanticModelRuntimeLimits::default(),
-            },
-            &CancellationToken::default(),
-        );
-        let SemanticModelRuntimeOutcome::Ready {
-            active: mixed_active,
-            ..
-        } = mixed_runtime
-        else {
-            panic!("empty refused evidence resolves without Testify: {mixed_runtime:#?}");
-        };
-        assert!(
-            mixed_active
-                .shards()
-                .iter()
-                .all(|shard| { !shard.manifest.pack_id.starts_with("bifrost.go.testify.") })
-        );
-
-        let Some(unused) = discover_local_go_dependencies("1.11.1", false) else {
-            return;
-        };
-        assert!(unused.dependencies.iter().any(|dependency| {
-            let evidence = &dependency.evidence;
-            evidence
-                .module
-                .as_ref()
-                .is_some_and(|module| module.name == "example.com/ordinary")
-        }));
-        assert!(!unused.dependencies.iter().any(|dependency| {
-            let evidence = &dependency.evidence;
-            evidence
-                .module
-                .as_ref()
-                .is_some_and(|module| module.name == "github.com/stretchr/testify")
-        }));
-        let unused_preparation = prepare_compatible_installed_semantic_packs(
-            &catalog,
-            &unused.dependencies,
-            &DependencyPackLimits::default(),
-            None,
-        );
-        assert!(
-            unused_preparation.complete,
-            "{:#?}",
-            unused_preparation.diagnostics
-        );
-        assert!(unused_preparation.installed_packs.is_empty());
-        assert!(testify_candidates_for_evidence(&catalog, &unused_preparation.evidence).is_empty());
-
-        let Some(unreviewed) = discover_local_go_dependencies("1.10.0", true) else {
-            return;
-        };
-        assert!(unreviewed.dependencies.iter().any(|dependency| {
-            let evidence = &dependency.evidence;
-            evidence.ecosystem == "go-module"
-                && evidence.module.as_ref().is_some_and(|module| {
-                    module.name == "github.com/stretchr/testify"
-                        && module.version == Some("1.10.0".parse().expect("fixture version"))
-                })
-        }));
-        let unreviewed_preparation = prepare_compatible_installed_semantic_packs(
-            &catalog,
-            &unreviewed.dependencies,
-            &DependencyPackLimits::default(),
-            None,
-        );
-        assert!(
-            unreviewed_preparation.complete,
-            "{:#?}",
-            unreviewed_preparation.diagnostics
-        );
-        assert!(unreviewed_preparation.installed_packs.is_empty());
-        assert!(
-            unreviewed_preparation
-                .diagnostics
-                .iter()
-                .any(|diagnostic| diagnostic.code == "dependency.pack_version_mismatch")
-        );
-        assert!(
-            testify_candidates_for_evidence(&catalog, &unreviewed_preparation.evidence).is_empty()
-        );
-    }
-
-    #[test]
     fn shipped_go_log_pack_is_the_exact_package_and_logger_method_matrix() {
         let pack = BIFROST_EMBEDDED_PACKS
             .packs()
@@ -3313,38 +3043,7 @@ func packageAlias() {
             .file("main.go", source)
             .build();
         let workspace = project.workspace_analyzer(AnalyzerConfig::default());
-        let catalog = SemanticPackCatalog::open_ephemeral(CatalogOptions::default())
-            .expect("ephemeral semantic-pack catalog");
-        BIFROST_EMBEDDED_PACKS
-            .register_all(&catalog, &DecodeLimits::default())
-            .expect("shipped semantic packs register");
-        let outcome = acquire_active_semantic_models(
-            workspace.analyzer(),
-            &catalog,
-            None,
-            &SemanticModelActivationRequest {
-                bifrost_version: env!("CARGO_PKG_VERSION")
-                    .parse()
-                    .expect("crate version is semver"),
-                evidence: vec![SemanticModelActivationEvidence {
-                    language: "go".to_owned(),
-                    ecosystem: "go".to_owned(),
-                    package: None,
-                    module: None,
-                    toolchain: None,
-                    target: None,
-                    configuration: None,
-                    artifact_sha256: None,
-                }],
-                controls: Vec::new(),
-                limits: SemanticModelRuntimeLimits::default(),
-            },
-            &CancellationToken::default(),
-        );
-        assert!(
-            matches!(outcome, SemanticModelRuntimeOutcome::Ready { .. }),
-            "Go stdlib activation completes: {outcome:#?}"
-        );
+        let _catalog = activate_go_stdlib_models(&workspace);
 
         let file = project.file("main.go");
         let provider = workspace
@@ -3547,38 +3246,7 @@ func methodExpression(t *testing.T) {
             .file("main.go", source)
             .build();
         let workspace = project.workspace_analyzer(AnalyzerConfig::default());
-        let catalog = SemanticPackCatalog::open_ephemeral(CatalogOptions::default())
-            .expect("ephemeral semantic-pack catalog");
-        BIFROST_EMBEDDED_PACKS
-            .register_all(&catalog, &DecodeLimits::default())
-            .expect("shipped semantic packs register");
-        let outcome = acquire_active_semantic_models(
-            workspace.analyzer(),
-            &catalog,
-            None,
-            &SemanticModelActivationRequest {
-                bifrost_version: env!("CARGO_PKG_VERSION")
-                    .parse()
-                    .expect("crate version is semver"),
-                evidence: vec![SemanticModelActivationEvidence {
-                    language: "go".to_owned(),
-                    ecosystem: "go".to_owned(),
-                    package: None,
-                    module: None,
-                    toolchain: None,
-                    target: None,
-                    configuration: None,
-                    artifact_sha256: None,
-                }],
-                controls: Vec::new(),
-                limits: SemanticModelRuntimeLimits::default(),
-            },
-            &CancellationToken::default(),
-        );
-        assert!(
-            matches!(outcome, SemanticModelRuntimeOutcome::Ready { .. }),
-            "Go stdlib activation completes: {outcome:#?}"
-        );
+        let _catalog = activate_go_stdlib_models(&workspace);
 
         let file = project.file("main.go");
         let provider = workspace
@@ -3663,43 +3331,6 @@ func methodExpression(t *testing.T) {
     }
 
     #[test]
-    fn registry_validates_every_pack_before_catalog_registration() {
-        let compiled = compiled_fixture();
-        let valid_shards = compiled
-            .shards
-            .iter()
-            .map(|shard| shard.bytes.as_slice())
-            .collect::<Vec<_>>();
-        let missing_shards: [&[u8]; 0] = [];
-        let packs = [
-            EmbeddedSemanticPack::new(
-                "bifrost.fixture.valid@1",
-                &compiled.manifest_bytes,
-                &valid_shards,
-            ),
-            EmbeddedSemanticPack::new(
-                "bifrost.fixture.invalid@1",
-                &compiled.manifest_bytes,
-                &missing_shards,
-            ),
-        ];
-        let catalog = SemanticPackCatalog::open_ephemeral(CatalogOptions::default()).unwrap();
-
-        let error = EmbeddedPackRegistry::new(&packs)
-            .register_all(&catalog, &DecodeLimits::default())
-            .unwrap_err();
-
-        assert!(matches!(
-            error,
-            EmbeddedPackError::ShardCount {
-                declared: 1,
-                embedded: 0
-            }
-        ));
-        assert_eq!(catalog.accounting().unwrap().logical_shard_count, 0);
-    }
-
-    #[test]
     fn activated_go_os_pack_binds_fd_only_to_the_reviewed_file_receiver() {
         let source = r#"package sample
 
@@ -3724,38 +3355,7 @@ func calls(local *localFile) uintptr {
             .file("main.go", source)
             .build();
         let workspace = project.workspace_analyzer(AnalyzerConfig::default());
-        let catalog = SemanticPackCatalog::open_ephemeral(CatalogOptions::default())
-            .expect("ephemeral semantic-pack catalog");
-        BIFROST_EMBEDDED_PACKS
-            .register_all(&catalog, &DecodeLimits::default())
-            .expect("shipped semantic packs register");
-        let outcome = acquire_active_semantic_models(
-            workspace.analyzer(),
-            &catalog,
-            None,
-            &SemanticModelActivationRequest {
-                bifrost_version: env!("CARGO_PKG_VERSION")
-                    .parse()
-                    .expect("crate version is semver"),
-                evidence: vec![SemanticModelActivationEvidence {
-                    language: "go".to_owned(),
-                    ecosystem: "go".to_owned(),
-                    package: None,
-                    module: None,
-                    toolchain: None,
-                    target: None,
-                    configuration: None,
-                    artifact_sha256: None,
-                }],
-                controls: Vec::new(),
-                limits: SemanticModelRuntimeLimits::default(),
-            },
-            &CancellationToken::default(),
-        );
-        assert!(
-            matches!(outcome, SemanticModelRuntimeOutcome::Ready { .. }),
-            "Go stdlib activation completes: {outcome:#?}"
-        );
+        let _catalog = activate_go_stdlib_models(&workspace);
 
         let file = project.file("main.go");
         let provider = workspace
@@ -3848,279 +3448,6 @@ func calls(local *localFile) uintptr {
         assert_eq!(local_arm.key.member, "Fd");
         assert!(local_arm.key.has_receiver);
         assert_eq!(local_arm.key.parameter_count, 0);
-        assert!(
-            near_miss.adjudicable_workspace_names.is_empty(),
-            "a keyed workspace target is a positive arm, not a negative-only name: {near_miss:#?}"
-        );
-    }
-
-    #[test]
-    fn shipped_go_net_pack_preserves_exact_contracts_and_canonical_declarations() {
-        let behavior = BIFROST_EMBEDDED_PACKS
-            .packs()
-            .iter()
-            .find(|pack| pack.source_id() == "bifrost.go.stdlib.net@1.1.0")
-            .expect("the Go net behavior pack ships")
-            .decode(&DecodeLimits::default())
-            .expect("the Go net behavior pack decodes");
-        assert_eq!(behavior.manifest.completeness, Completeness::Complete);
-        assert_eq!(
-            behavior.manifest.provenance.source,
-            "https://pkg.go.dev/net"
-        );
-        assert_eq!(
-            behavior.manifest.provenance.revision.as_deref(),
-            Some("go1.26.0")
-        );
-        let [shard] = behavior.shards.as_slice() else {
-            panic!("the Go net behavior pack has one shard: {behavior:#?}");
-        };
-        let shard = decode_shard_for_manifest(
-            &behavior.manifest,
-            &shard.descriptor,
-            &shard.bytes,
-            &DecodeLimits::default(),
-        )
-        .expect("the Go net behavior shard decodes");
-        let summaries = shard
-            .payload()
-            .procedure_summaries()
-            .expect("the Go net behavior shard carries procedure summaries");
-        let conn_operation_matrix = BTreeMap::from([
-            ("Close", 0),
-            ("LocalAddr", 0),
-            ("Read", 1),
-            ("RemoteAddr", 0),
-            ("SetDeadline", 1),
-            ("SetReadDeadline", 1),
-            ("SetWriteDeadline", 1),
-            ("Write", 1),
-        ]);
-        let listener_operation_matrix = BTreeMap::from([("Accept", 0), ("Addr", 0), ("Close", 0)]);
-        let summary_matrix = [
-            (
-                "net.dial",
-                "net.Dial(network, address string)",
-                2,
-                &conn_operation_matrix,
-            ),
-            (
-                "net.dial-timeout",
-                "net.DialTimeout(network, address string, timeout time.Duration)",
-                3,
-                &conn_operation_matrix,
-            ),
-            (
-                "net.listen",
-                "net.Listen(network, address string)",
-                2,
-                &listener_operation_matrix,
-            ),
-        ];
-        assert_eq!(summaries.len(), summary_matrix.len());
-        for (id, symbol, parameter_count, operation_matrix) in summary_matrix {
-            let summary = summaries
-                .iter()
-                .find(|summary| summary.id == id)
-                .unwrap_or_else(|| panic!("the reviewed net summary {id} ships"));
-            assert_eq!(summary.target.path, "src/net/dial.go");
-            assert_eq!(summary.target.symbol, symbol);
-            assert!(!summary.target.has_receiver);
-            assert!(!summary.target.variadic);
-            assert_eq!(summary.target.parameter_count, parameter_count);
-            assert_eq!(summary.normal_result_count, Some(2));
-            assert_eq!(summary.completeness, Completeness::Complete);
-            assert!(summary.transfers.is_empty());
-            assert!(summary.effects.is_empty());
-            let [contract] = summary.result_contracts.as_slice() else {
-                panic!("{id} has one success-conditioned result: {summary:#?}");
-            };
-            assert_eq!(contract.result_ordinal, 0);
-            assert_eq!(contract.condition_result_ordinal, Some(1));
-            assert_eq!(contract.predicate, Some(CompiledResultPredicate::Null));
-            assert_eq!(
-                contract.result_success_predicate,
-                Some(CompiledResultPredicate::NonNull)
-            );
-            assert_eq!(contract.member_contracts.len(), operation_matrix.len());
-            for member in &contract.member_contracts {
-                assert_eq!(
-                    operation_matrix.get(member.member.as_str()),
-                    Some(&member.parameter_count),
-                    "only the reviewed operation surface for {id} is modeled: {member:#?}"
-                );
-                assert_eq!(member.completeness, Completeness::Complete);
-                assert_eq!(
-                    member.preconditions,
-                    Some(vec![CompiledOperationPrecondition {
-                        input: CompiledSummaryInput::Receiver {},
-                        predicate: CompiledResultPredicate::NonNull,
-                    }])
-                );
-                assert!(member.declared_effects.is_empty());
-            }
-        }
-
-        let declarations = BIFROST_EMBEDDED_PACKS
-            .packs()
-            .iter()
-            .find(|pack| pack.source_id() == "bifrost.go.stdlib.net-declarations@1.1.0")
-            .expect("the Go net declaration pack ships")
-            .decode(&DecodeLimits::default())
-            .expect("the Go net declaration pack decodes");
-        assert_eq!(declarations.manifest.completeness, Completeness::Partial);
-        let [shard] = declarations.shards.as_slice() else {
-            panic!("the Go net declaration pack has one shard: {declarations:#?}");
-        };
-        let shard = decode_shard_for_manifest(
-            &declarations.manifest,
-            &shard.descriptor,
-            &shard.bytes,
-            &DecodeLimits::default(),
-        )
-        .expect("the Go net declaration shard decodes");
-        let (types, members, relations) = shard
-            .payload()
-            .declaration_facts()
-            .expect("the Go net declaration shard carries declaration facts");
-        assert!(relations.is_empty());
-        assert_eq!(
-            types.len(),
-            4,
-            "net, net.Conn, net.Listener, and net.Addr are reviewed"
-        );
-        for fact in types {
-            assert_eq!(
-                fact.id,
-                type_declaration_id(TypeIdentity {
-                    ecosystem: "go",
-                    name: &fact.name,
-                }),
-                "the authored type ID uses the Go artifact producer's canonical identity"
-            );
-        }
-        let module = types
-            .iter()
-            .find(|fact| fact.name == "net")
-            .expect("the net module declaration ships");
-        assert_eq!(module.type_kind, TypeKind::Module);
-        assert_eq!(
-            module.id,
-            "type.d38a97811c1f5377b31ce35fec4044aade55f1f9cabbd6d84bb45563d695de48"
-        );
-        let conn = types
-            .iter()
-            .find(|fact| fact.name == "net.Conn")
-            .expect("the net.Conn interface declaration ships");
-        assert_eq!(conn.type_kind, TypeKind::Interface);
-        assert!(conn.is_abstract);
-        assert_eq!(
-            conn.id,
-            "type.e787bbcd3ab1d2d588b3b05c3f88fa0dcdd40bb4ecba196ca5cc8e5638016f77"
-        );
-        let listener = types
-            .iter()
-            .find(|fact| fact.name == "net.Listener")
-            .expect("the net.Listener interface declaration ships");
-        assert_eq!(listener.type_kind, TypeKind::Interface);
-        assert!(listener.is_abstract);
-        assert_eq!(
-            listener.id,
-            "type.d5d96e805db6a6ba6abef788cfe33345bb3d78948c5b1fe95abb810898505e3d"
-        );
-        let addr = types
-            .iter()
-            .find(|fact| fact.name == "net.Addr")
-            .expect("the net.Addr interface declaration ships");
-        assert_eq!(addr.type_kind, TypeKind::Interface);
-        assert!(addr.is_abstract);
-        assert_eq!(
-            addr.id,
-            "type.fdff4962d361a2e29fa9b73643fd573cd0ebab82d9d459416bfe025d698bd1ae"
-        );
-
-        assert_eq!(
-            members.len(),
-            conn_operation_matrix.len() + listener_operation_matrix.len() + 3
-        );
-        for member in members {
-            let signature = member
-                .signature
-                .as_ref()
-                .unwrap_or_else(|| panic!("{} has a structured signature", member.name));
-            let parameter_types = signature
-                .parameters
-                .iter()
-                .map(|parameter| parameter.r#type.clone())
-                .collect::<Vec<_>>();
-            let parameter_variadics = signature
-                .parameters
-                .iter()
-                .map(|parameter| parameter.variadic)
-                .collect::<Vec<_>>();
-            assert_eq!(
-                member.id,
-                member_declaration_id(MemberIdentity {
-                    owner_id: &member.owner,
-                    kind: member.member_kind,
-                    is_static: member.is_static,
-                    parameter_arity: parameter_types.len(),
-                    name: &member.name,
-                    generic_arity: signature.type_parameters.len(),
-                    parameter_types: &parameter_types,
-                    parameter_variadics: &parameter_variadics,
-                    return_type: signature.returns.as_ref(),
-                }),
-                "the authored member ID uses the Go artifact producer's canonical identity"
-            );
-            if member.owner == module.id {
-                assert_eq!(member.member_kind, MemberKind::Function);
-                assert!(member.is_static);
-                assert!(matches!(
-                    member.name.as_str(),
-                    "Dial" | "DialTimeout" | "Listen"
-                ));
-            } else {
-                let operation_matrix = if member.owner == conn.id {
-                    &conn_operation_matrix
-                } else {
-                    assert_eq!(member.owner, listener.id);
-                    &listener_operation_matrix
-                };
-                assert_eq!(member.member_kind, MemberKind::Method);
-                assert!(!member.is_static);
-                assert!(member.is_abstract);
-                assert!(member.is_virtual);
-                assert_eq!(
-                    operation_matrix.get(member.name.as_str()),
-                    Some(&u32::try_from(signature.parameters.len()).expect("Go arity fits u32"))
-                );
-            }
-        }
-        let dial = members
-            .iter()
-            .find(|member| member.name == "Dial")
-            .expect("net.Dial declaration ships");
-        assert_eq!(
-            dial.id,
-            "member.d0aa465e92136c45be3c6a1d2b6f54fb1addae8b625dd4ce3b9c8e2a51f1dd17"
-        );
-        let dial_timeout = members
-            .iter()
-            .find(|member| member.name == "DialTimeout")
-            .expect("net.DialTimeout declaration ships");
-        assert_eq!(
-            dial_timeout.id,
-            "member.ead53a44232a9997505b0c78665160d60989ad5374576153b2a28ee96ac1ef57"
-        );
-        let listen = members
-            .iter()
-            .find(|member| member.name == "Listen")
-            .expect("net.Listen declaration ships");
-        assert_eq!(
-            listen.id,
-            "member.7e970dc0ebba4aec16eaf04bffd6ef9ce97abecd540ebe6c1613cd59d5dd3cb1"
-        );
     }
 
     #[test]
@@ -4159,38 +3486,7 @@ func receiverNearMiss(d *net.Dialer, config *localListenerConfig) {
             .file("main.go", source)
             .build();
         let workspace = project.workspace_analyzer(AnalyzerConfig::default());
-        let catalog = SemanticPackCatalog::open_ephemeral(CatalogOptions::default())
-            .expect("ephemeral semantic-pack catalog");
-        BIFROST_EMBEDDED_PACKS
-            .register_all(&catalog, &DecodeLimits::default())
-            .expect("shipped semantic packs register");
-        let outcome = acquire_active_semantic_models(
-            workspace.analyzer(),
-            &catalog,
-            None,
-            &SemanticModelActivationRequest {
-                bifrost_version: env!("CARGO_PKG_VERSION")
-                    .parse()
-                    .expect("crate version is semver"),
-                evidence: vec![SemanticModelActivationEvidence {
-                    language: "go".to_owned(),
-                    ecosystem: "go".to_owned(),
-                    package: None,
-                    module: None,
-                    toolchain: None,
-                    target: None,
-                    configuration: None,
-                    artifact_sha256: None,
-                }],
-                controls: Vec::new(),
-                limits: SemanticModelRuntimeLimits::default(),
-            },
-            &CancellationToken::default(),
-        );
-        assert!(
-            matches!(outcome, SemanticModelRuntimeOutcome::Ready { .. }),
-            "Go stdlib activation completes: {outcome:#?}"
-        );
+        let _catalog = activate_go_stdlib_models(&workspace);
 
         let file = project.file("main.go");
         let provider = workspace

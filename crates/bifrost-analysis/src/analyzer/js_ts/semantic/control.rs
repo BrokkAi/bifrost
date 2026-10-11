@@ -1,3 +1,5 @@
+use crate::analyzer::semantic::lowering::schedule_sequential_work;
+
 use super::syntax::*;
 use super::values::stable_member_key;
 use super::*;
@@ -532,7 +534,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 terminal,
                 SemanticEffect::ValueFlow {
                     kind: ValueFlowKind::IntegerOffset {
-                        offset: integer_offset(offset),
+                        offset: SignedIntegerMagnitude::from_i128(offset),
                     },
                     source: left_value,
                     target: result,
@@ -615,7 +617,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 terminal,
                 SemanticEffect::ValueFlow {
                     kind: ValueFlowKind::IntegerOffset {
-                        offset: integer_offset(offset),
+                        offset: SignedIntegerMagnitude::from_i128(offset),
                     },
                     source: original,
                     target,
@@ -809,29 +811,20 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             return Ok(());
         }
         match (node.kind(), short_circuit_operator(node)) {
-            ("binary_expression", Some("&&")) => {
+            ("binary_expression", Some(operator @ ("&&" | "||"))) => {
                 let left = required_field(node, "left")?;
                 let right = required_field(node, "right")?;
                 let right_entry = self.point(builder, right, Vec::new())?;
+                let kind = match operator {
+                    "&&" => ShortCircuitKind::And,
+                    "||" => ShortCircuitKind::Or,
+                    _ => unreachable!(
+                        "the match arm selects JavaScript/TypeScript boolean operators"
+                    ),
+                };
                 schedule_short_circuit_condition(
                     stack,
-                    ShortCircuitKind::And,
-                    (left, entry),
-                    (right, right_entry),
-                    when_true,
-                    when_false,
-                    scope,
-                    Work::condition,
-                );
-                Ok(())
-            }
-            ("binary_expression", Some("||")) => {
-                let left = required_field(node, "left")?;
-                let right = required_field(node, "right")?;
-                let right_entry = self.point(builder, right, Vec::new())?;
-                schedule_short_circuit_condition(
-                    stack,
-                    ShortCircuitKind::Or,
+                    kind,
                     (left, entry),
                     (right, right_entry),
                     when_true,
@@ -2554,85 +2547,54 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         let increment_entry = increment
             .map(|increment| self.point(builder, increment, Vec::new()))
             .transpose()?;
-        let continue_target = increment_entry.unwrap_or(condition_entry);
-        let loop_scope = builder.push_scope(
-            Some(scope),
-            ScopeBinding::Loop {
-                label: label.map(Box::<str>::from),
-                break_target: next.point,
-                break_edge_kind: next.kind,
-                continue_target,
-                continue_edge_kind: if increment.is_some() {
-                    ControlEdgeKind::Normal
+        let initializers = initializer.map(|initializer| (initializer, entry));
+        let updates = increment.zip(increment_entry);
+        schedule_loop_flow(
+            builder,
+            &self.session,
+            entry,
+            next,
+            scope,
+            label.map(Box::<str>::from),
+            initializers.as_slice(),
+            condition.map(|condition| (condition, condition_entry)),
+            condition_entry,
+            initial_condition_target,
+            (body, body_entry),
+            updates.as_slice(),
+            stack,
+            |node, entry, next, scope| {
+                if matches!(node.kind(), "lexical_declaration" | "variable_declaration") {
+                    Work::Statement {
+                        node,
+                        entry,
+                        next,
+                        scope,
+                    }
                 } else {
-                    ControlEdgeKind::LoopBack
-                },
+                    Work::Expression {
+                        node,
+                        entry,
+                        next,
+                        scope,
+                    }
+                }
             },
-        );
-        if let Some(increment) = increment {
-            stack.push(Work::Expression {
-                node: increment,
-                entry: increment_entry.expect("increment entry exists"),
-                next: EdgeTarget {
-                    point: condition_entry,
-                    kind: ControlEdgeKind::LoopBack,
-                },
-                scope: loop_scope,
-            });
-        }
-        stack.push(Work::Statement {
-            node: body,
-            entry: body_entry,
-            next: EdgeTarget {
-                point: continue_target,
-                kind: if increment.is_some() {
-                    ControlEdgeKind::Normal
-                } else {
-                    ControlEdgeKind::LoopBack
-                },
+            |node, entry, next, scope| Work::Expression {
+                node,
+                entry,
+                next,
+                scope,
             },
-            scope: loop_scope,
-        });
-        if let Some(condition) = condition {
-            stack.push(Work::Condition {
-                node: condition,
-                entry: condition_entry,
-                when_true: EdgeTarget {
-                    point: body_entry,
-                    kind: ControlEdgeKind::ConditionalTrue,
-                },
-                when_false: EdgeTarget {
-                    point: next.point,
-                    kind: ControlEdgeKind::ConditionalFalse,
-                },
-                scope: loop_scope,
-            });
-        } else {
-            self.edge(builder, condition_entry, EdgeTarget::normal(body_entry))?;
-        }
-        if let Some(initializer) = initializer {
-            if matches!(
-                initializer.kind(),
-                "lexical_declaration" | "variable_declaration"
-            ) {
-                stack.push(Work::Statement {
-                    node: initializer,
-                    entry,
-                    next: initial_condition_target,
-                    scope: loop_scope,
-                });
-            } else {
-                stack.push(Work::Expression {
-                    node: initializer,
-                    entry,
-                    next: initial_condition_target,
-                    scope: loop_scope,
-                });
-            }
-        } else if entry != condition_entry {
-            self.edge(builder, entry, EdgeTarget::normal(condition_entry))?;
-        }
-        Ok(())
+            |node, entry, next, scope| Work::Statement {
+                node,
+                entry,
+                next,
+                scope,
+            },
+            Work::condition,
+        )
+        .map(|_| ())
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -3770,12 +3732,9 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                     let has_condition = current
                         .child_by_field_name("condition")
                         .is_some_and(|condition| condition.kind() != "empty_statement");
-                    if has_condition {
-                        false
-                    } else if let Some(body) = current.child_by_field_name("body") {
-                        !self.has_potential_break(body)?
-                    } else {
-                        false
+                    match (has_condition, current.child_by_field_name("body")) {
+                        (true, _) | (false, None) => false,
+                        (false, Some(body)) => !self.has_potential_break(body)?,
                     }
                 }
                 "labeled_statement" => {
@@ -3861,19 +3820,19 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             .map(|child| self.point(builder, *child, Vec::new()))
             .collect::<Result<Vec<_>, _>>()?;
         self.edge(builder, entry, EdgeTarget::normal(entries[0]))?;
-        for index in (0..children.len()).rev() {
-            let child_next = entries
-                .get(index + 1)
-                .copied()
-                .map(EdgeTarget::normal)
-                .unwrap_or(next);
-            stack.push(Work::Expression {
-                node: children[index],
-                entry: entries[index],
-                next: child_next,
+        schedule_sequential_work(
+            stack,
+            children,
+            &entries,
+            next,
+            scope,
+            |_, node, entry, next, scope| Work::Expression {
+                node,
+                entry,
+                next,
                 scope,
-            });
-        }
+            },
+        );
         Ok(())
     }
 
@@ -3891,7 +3850,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             if matches!(kind, CompletionKind::Break | CompletionKind::Continue) {
                 let detail = format!(
                     "{} completion has no matching represented label target",
-                    completion_label(kind)
+                    kind.label()
                 );
                 self.add_gap(
                     builder,
@@ -3905,7 +3864,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             }
             return Err(TsLoweringError::Invalid(format!(
                 "{} completion has no matching structured continuation",
-                completion_label(kind)
+                kind.label()
             )));
         };
         self.route(builder, from, &route, stack)
@@ -4146,9 +4105,5 @@ pub(super) fn counted_for_starts_true(
 }
 
 pub(super) fn boolean_literal_condition(node: Node<'_>) -> Option<bool> {
-    match node.kind() {
-        "true" => Some(true),
-        "false" => Some(false),
-        _ => None,
-    }
+    brokk_bifrost_core::analyzer::structural::adapter_helpers::boolean_literal_value(node.kind())
 }

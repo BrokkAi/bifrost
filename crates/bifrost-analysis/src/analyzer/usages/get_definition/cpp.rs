@@ -1,14 +1,12 @@
 use super::*;
 use crate::analyzer::cpp::{
     CppOccurrenceRole, cpp_callable_definitions_share_identity_evidence_with_visibility,
-    cpp_header_body_files_are_related, cpp_indexed_callable_linkage, cpp_is_range_for_binding_name,
+    cpp_header_body_files_are_related, cpp_is_range_for_binding_name,
     cpp_range_is_pure_virtual_declaration,
 };
 use crate::analyzer::resolve_include_targets_with_index;
 use crate::analyzer::store::LimitedQueryRows;
-use crate::analyzer::structural::resolution::{
-    HierarchyRelation, MemberDispatchTier, PrecedenceTier, RejectionReason,
-};
+use crate::analyzer::structural::resolution::{HierarchyRelation, PrecedenceTier, RejectionReason};
 use crate::analyzer::tree_walk::subtree_contains;
 use crate::analyzer::usages::applicability::{
     ApplicabilityOutcome, CandidateApplicability, arity_verdict,
@@ -22,24 +20,35 @@ use brokk_bifrost_core::analyzer::source_facts::SourceDeclarationId;
 use brokk_bifrost_core::analyzer::structural::callable::ApplicabilityVerdict;
 use brokk_bifrost_core::analyzer::structural::callable::CallableRejectionReason;
 use brokk_bifrost_cpp::call_match::{
-    CppArgType, CppRefQualifier, cpp_filter_candidates_by_args_with_parameter_types,
-    cpp_forwarding_call_argument, cpp_literal_arg_type, cpp_parameter_type_text,
-    cpp_signature_ref_qualifier, cpp_type_text_pointer_depth, normalize_cpp_type_name,
+    CppArgType, CppArgumentApplicability, CppRefQualifier, cpp_candidate_argument_applicability,
+    cpp_filter_candidates_by_args_with_parameter_types, cpp_forwarding_call_argument,
+    cpp_literal_arg_type, cpp_parameter_type_text, cpp_signature_ref_qualifier,
+    cpp_type_text_pointer_depth, normalize_cpp_type_name,
 };
 use brokk_bifrost_cpp::graph::CppGraphSource;
-use brokk_bifrost_cpp::graph::extractor::{QualifiedReceiverBase, qualified_receiver_base};
+use brokk_bifrost_cpp::graph::extractor::{
+    QualifiedReceiverBase, error_contains_class_header as cpp_error_contains_class_header,
+    is_malformed_wrapper_function_definition as cpp_malformed_wrapper_function_definition,
+    macro_fracture_boundary as cpp_macro_fracture_boundary, qualified_receiver_base,
+};
 use brokk_bifrost_cpp::graph::resolver::lexical_component_tiers;
 use brokk_bifrost_cpp::graph::resolver::{
     CppClassDeclarationStrength, MacroLocalBinding, OrdinaryMacroReferenceResolution,
-    anonymous_aggregate_owner, c_offsetof_member_parts, cpp_class_declaration_strength,
-    cpp_field_expression_receiver, cpp_qualified_name_has_scope_suffix, field_declared_binding,
-    field_initializer_holds_subobject, guard_requirements_hold_at_reference,
-    is_c_offsetof_member_node, is_c_sizeof_expression_type_candidate, is_c_source_file,
-    is_type_shaped_template_argument_name, preprocessor_guard_environment,
-    recovered_c_new_expression_argument_at, recovered_macro_decorated_declarator_type,
-    same_logical_symbol, same_visible_symbol, type_owner_of,
+    anonymous_aggregate_owner, c_offsetof_member_parts, cpp_binding_parts,
+    cpp_class_declaration_strength, cpp_field_expression_receiver, cpp_new_expression_type_node,
+    cpp_qualified_name_has_scope_suffix, cpp_template_function_has_type_owner,
+    declaration_declarator, field_declared_binding, field_initializer_holds_subobject,
+    guard_requirements_hold_at_reference, is_c_offsetof_member_node,
+    is_c_sizeof_expression_type_candidate, is_c_source_file, is_type_shaped_template_argument_name,
+    preprocessor_guard_environment, recovered_c_new_expression_argument_at,
+    recovered_macro_decorated_declarator_type, same_logical_symbol, same_visible_symbol,
+    select_alias_spelling_with_agreed_targets, type_owner_of,
+};
+use brokk_bifrost_cpp::graph::resolver::{
+    cpp_tag_specifier_ancestors_before_type_reference_context, cpp_tag_specifier_declares_name,
 };
 use brokk_bifrost_cpp::graph_support::CppSource;
+use brokk_bifrost_cpp::identity::cpp_same_node;
 use std::time::Instant;
 
 pub(crate) const CPP_UNPROVEN_LINK_UNIT_DIAGNOSTIC: &str = "unproven_cpp_link_unit";
@@ -311,8 +320,9 @@ pub(super) fn select_navigation_targets(
             .collect::<HashSet<_>>()
             .len()
             == 1;
-    let truncated = source_ranges_truncated || selected.len() > context.navigation_target_limit;
-    selected.truncate(context.navigation_target_limit);
+    let truncated =
+        source_ranges_truncated || selected.len() > super::MAX_NAVIGATION_TARGETS_PER_RESULT;
+    selected.truncate(super::MAX_NAVIGATION_TARGETS_PER_RESULT);
     CppNavigationSelection {
         targets: selected
             .into_iter()
@@ -1021,46 +1031,254 @@ pub(crate) struct CppBoundedTypeResolution {
     pub(crate) ambiguous: bool,
 }
 
-struct CppBoundedProvider<'a> {
+#[derive(Clone, Copy)]
+struct CppBoundedLocalBinding<'tree> {
+    scope_start: usize,
+    scope_end: usize,
+    declaration_start: usize,
+    type_node: Node<'tree>,
+}
+
+pub(crate) struct CppBoundedLocalBindingIndex<'tree> {
+    bindings: HashMap<Box<str>, Vec<CppBoundedLocalBinding<'tree>>>,
+}
+
+impl<'tree> CppBoundedLocalBindingIndex<'tree> {
+    fn binding_type_node(&self, source: &str, reference: Node<'tree>) -> Option<Node<'tree>> {
+        let name = cpp_node_text(reference, source);
+        let bindings = self.bindings.get(name)?;
+        bindings
+            .iter()
+            .filter(|binding| {
+                binding.declaration_start <= reference.start_byte()
+                    && binding.scope_start <= reference.start_byte()
+                    && reference.start_byte() < binding.scope_end
+            })
+            .min_by_key(|binding| {
+                (
+                    binding.scope_end.saturating_sub(binding.scope_start),
+                    usize::MAX.saturating_sub(binding.declaration_start),
+                )
+            })
+            .map(|binding| binding.type_node)
+    }
+}
+
+/// Build the declaration/type candidates used by bounded C++ receiver lookup.
+///
+/// The ordinary resolver discovers these by walking the enclosing callable for
+/// every reference. Semantic call resolution already has one callable-local
+/// batch, so retain the same structured candidates in a short-lived index and
+/// select among them by lexical scope at each reference.
+pub(crate) fn cpp_bounded_local_binding_index<'tree>(
+    callable: Node<'tree>,
+    source: &str,
+) -> CppBoundedLocalBindingIndex<'tree> {
+    let mut bindings: HashMap<Box<str>, Vec<CppBoundedLocalBinding<'tree>>> = HashMap::default();
+    let mut stack = vec![callable];
+    while let Some(node) = stack.pop() {
+        if node.id() != callable.id() && cpp_bounded_callable_declaration(node) {
+            continue;
+        }
+        let type_node = node.child_by_field_name("type");
+        if matches!(
+            node.kind(),
+            "parameter_declaration" | "optional_parameter_declaration"
+        ) {
+            if let Some(type_node) = type_node
+                && let Some(declarator) = node.child_by_field_name("declarator")
+                && let Some(name_node) =
+                    brokk_bifrost_cpp::structural::declarator_name_node(declarator)
+                && let Some(name) = source.get(name_node.byte_range())
+            {
+                let binding = CppBoundedLocalBinding {
+                    scope_start: callable.start_byte(),
+                    scope_end: callable.end_byte(),
+                    declaration_start: node.start_byte(),
+                    type_node,
+                };
+                bindings
+                    .entry(Box::<str>::from(name))
+                    .or_default()
+                    .push(binding);
+            }
+        } else if node.kind() == "declaration"
+            && let Some(type_node) = type_node
+        {
+            let mut cursor = node.walk();
+            let mut declarators = node
+                .children_by_field_name("declarator", &mut cursor)
+                .collect::<Vec<_>>();
+            if declarators.is_empty() {
+                declarators.extend(
+                    node.named_children(&mut cursor)
+                        .filter(|child| child.kind() == "init_declarator"),
+                );
+            }
+            for declarator in declarators {
+                let Some(name_node) =
+                    brokk_bifrost_cpp::structural::declarator_name_node(declarator)
+                else {
+                    continue;
+                };
+                let Some(name) = source.get(name_node.byte_range()) else {
+                    continue;
+                };
+                let (scope_start, scope_end) = cpp_bounded_local_scope_range(node, callable);
+                let binding = CppBoundedLocalBinding {
+                    scope_start,
+                    scope_end,
+                    declaration_start: node.start_byte(),
+                    type_node,
+                };
+                bindings
+                    .entry(Box::<str>::from(name))
+                    .or_default()
+                    .push(binding);
+            }
+        }
+        let mut cursor = node.walk();
+        let children = node.named_children(&mut cursor).collect::<Vec<_>>();
+        stack.extend(children.into_iter().rev());
+    }
+    CppBoundedLocalBindingIndex { bindings }
+}
+
+fn cpp_bounded_local_scope_range(node: Node<'_>, fallback: Node<'_>) -> (usize, usize) {
+    let mut current = node.parent();
+    while let Some(candidate) = current {
+        if candidate.kind() == "compound_statement" {
+            return (candidate.start_byte(), candidate.end_byte());
+        }
+        if candidate.id() == fallback.id() {
+            break;
+        }
+        current = candidate.parent();
+    }
+    (fallback.start_byte(), fallback.end_byte())
+}
+
+struct CppBoundedProvider<'a, 'tree> {
     analyzer: &'a dyn IAnalyzer,
     cpp: &'a CppAnalyzer,
     session: &'a ResolutionSession,
+    known_local_names: Option<&'a HashSet<Box<str>>>,
+    local_bindings: Option<&'a CppBoundedLocalBindingIndex<'tree>>,
+    known_macro_names: Option<&'a HashSet<Box<str>>>,
 }
 
-impl CppBoundedProvider<'_> {
+impl<'a, 'tree> CppBoundedProvider<'a, 'tree> {
+    fn binding_type_node(
+        &self,
+        file: &ProjectFile,
+        source: &str,
+        root: Node<'tree>,
+        reference: Node<'tree>,
+    ) -> Option<Node<'tree>> {
+        let name = cpp_node_text(reference, source);
+        if self
+            .known_local_names
+            .is_some_and(|names| !names.contains(name))
+        {
+            return None;
+        }
+        if let Some(bindings) = self.local_bindings
+            && bindings.bindings.contains_key(name)
+        {
+            return bindings.binding_type_node(source, reference);
+        }
+        cpp_bounded_binding_type_node(file, source, root, reference, self.session)
+    }
+
+    fn limited_identifier_candidates(&self, identifier: &str) -> Vec<CodeUnit> {
+        let memo = self.analyzer.definition_lookup_memo();
+        if let Some(cached) = memo
+            .as_ref()
+            .and_then(|memo| memo.limited_identifier(Language::Cpp, identifier))
+        {
+            return self.session.query_limited_rows(|limit| {
+                if cached.len() >= limit {
+                    LimitedQueryRows::incomplete(cached.into_iter().take(limit).collect(), limit)
+                } else {
+                    let inspected = cached.len();
+                    LimitedQueryRows::complete(cached, inspected)
+                }
+            });
+        }
+        let rows = self.session.query_limited_rows(|limit| {
+            self.cpp
+                .identifier_candidates_limited(identifier, limit, || {
+                    self.session.observe_cancellation()
+                })
+        });
+        if self.session.observe_cancellation()
+            && let Some(memo) = memo
+        {
+            memo.remember_limited_identifier(Language::Cpp, identifier, rows.clone());
+        }
+        rows
+    }
+
+    fn limited_fqn_candidates(&self, fqn: &str, normalized: bool) -> Vec<CodeUnit> {
+        let memo = self.analyzer.definition_lookup_memo();
+        if let Some(cached) = memo
+            .as_ref()
+            .and_then(|memo| memo.limited_fqn(Language::Cpp, normalized, fqn))
+        {
+            return self.session.query_limited_rows(|limit| {
+                if cached.len() >= limit {
+                    LimitedQueryRows::incomplete(cached.into_iter().take(limit).collect(), limit)
+                } else {
+                    let inspected = cached.len();
+                    LimitedQueryRows::complete(cached, inspected)
+                }
+            });
+        }
+        let rows = self.session.query_limited_rows(|limit| {
+            self.cpp.fqn_candidates_limited(fqn, normalized, limit, || {
+                self.session.observe_cancellation()
+            })
+        });
+        if self.session.observe_cancellation()
+            && let Some(memo) = memo
+        {
+            memo.remember_limited_fqn(Language::Cpp, normalized, fqn, rows.clone());
+        }
+        rows
+    }
+
     fn definitions_named(&self, fqn: &str, terminal_name: &str) -> Vec<CodeUnit> {
         let relational = AnalyzerDefinitionLookup::new(self.analyzer, Language::Cpp);
-        let exact = self.session.query_limited_rows(|limit| {
-            let mut rows = relational.fqn(fqn);
-            let inspected = rows.len();
-            if inspected > limit {
-                rows.truncate(limit);
-                LimitedQueryRows::incomplete(rows, inspected)
-            } else {
-                LimitedQueryRows::complete(rows, inspected)
-            }
-        });
+        // The bounded physical index is cheap and already keyed by the
+        // terminal identifier. Probe it before the relational FQN projections:
+        // unresolved built-in spellings such as `unsigned` otherwise make a
+        // large projection scan before the index can prove there is no target.
+        // Keep the exact FQN filter as the resolution criterion, including for
+        // live and overlay rows; a miss falls through to the relational paths.
+        let raw_candidates = self.limited_identifier_candidates(terminal_name);
+        let raw_matches = raw_candidates
+            .iter()
+            .filter(|candidate| candidate.fq_name() == fqn)
+            .cloned()
+            .collect::<Vec<_>>();
+        if !raw_matches.is_empty() {
+            return raw_matches;
+        }
+        let exact = self.limited_fqn_candidates(fqn, false);
         if !exact.is_empty() {
             return exact;
         }
-        let normalized = self.session.query_limited_rows(|limit| {
-            let mut rows = relational.by_normalized_fqn(fqn);
-            let inspected = rows.len();
-            if inspected > limit {
-                rows.truncate(limit);
-                LimitedQueryRows::incomplete(rows, inspected)
-            } else {
-                LimitedQueryRows::complete(rows, inspected)
-            }
-        });
+        let normalized = self.limited_fqn_candidates(fqn, true);
         if !normalized.is_empty() {
             return normalized;
         }
-        // Some live C++ declarations are held in the definition-lookup
-        // projection rather than the persisted-FQN projection. The bounded
-        // identifier query is only a retrieval index: the exact AST-derived
-        // FQN filter below remains the resolution criterion.
-        self.session
+
+        // Some live C++ declarations are held in the identifier projection
+        // rather than the persisted-FQN projection. Keep this as the final
+        // retrieval fallback after the exact paths, preserving the historical
+        // exact-FQN filter for rekeyed rows.
+        let reconciled_matches = self
+            .session
             .query_limited_rows(|limit| {
                 let mut rows = relational.identifier(terminal_name);
                 let inspected = rows.len();
@@ -1073,7 +1291,11 @@ impl CppBoundedProvider<'_> {
             })
             .into_iter()
             .filter(|candidate| candidate.fq_name() == fqn)
-            .collect()
+            .collect::<Vec<_>>();
+        if !reconciled_matches.is_empty() {
+            return reconciled_matches;
+        }
+        Vec::new()
     }
 
     fn members_named(&self, owner: &CodeUnit, member: &str) -> Vec<CodeUnit> {
@@ -1100,7 +1322,7 @@ impl CppBoundedProvider<'_> {
 }
 
 fn cpp_bounded_canonical_type_candidates(
-    provider: &CppBoundedProvider<'_>,
+    provider: &CppBoundedProvider<'_, '_>,
     file: &ProjectFile,
     reference: Node<'_>,
     candidates: Vec<CodeUnit>,
@@ -1146,6 +1368,60 @@ pub(crate) fn resolve_cpp_bounded(
     budget: ReceiverAnalysisBudget,
     cancellation: Option<&CancellationToken>,
 ) -> BoundedResolution<DefinitionLookupOutcome> {
+    resolve_cpp_bounded_impl(
+        analyzer,
+        file,
+        source,
+        tree,
+        site,
+        budget,
+        cancellation,
+        None,
+        None,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn resolve_cpp_bounded_with_known_local_names(
+    analyzer: &dyn IAnalyzer,
+    file: &ProjectFile,
+    source: &str,
+    tree: Option<&Tree>,
+    site: &ResolvedReferenceSite,
+    budget: ReceiverAnalysisBudget,
+    cancellation: Option<&CancellationToken>,
+    known_local_names: &HashSet<Box<str>>,
+    local_bindings: Option<&CppBoundedLocalBindingIndex<'_>>,
+    known_macro_names: Option<&HashSet<Box<str>>>,
+) -> BoundedResolution<DefinitionLookupOutcome> {
+    resolve_cpp_bounded_impl(
+        analyzer,
+        file,
+        source,
+        tree,
+        site,
+        budget,
+        cancellation,
+        Some(known_local_names),
+        local_bindings,
+        known_macro_names,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn resolve_cpp_bounded_impl(
+    analyzer: &dyn IAnalyzer,
+    file: &ProjectFile,
+    source: &str,
+    tree: Option<&Tree>,
+    site: &ResolvedReferenceSite,
+    budget: ReceiverAnalysisBudget,
+    cancellation: Option<&CancellationToken>,
+    known_local_names: Option<&HashSet<Box<str>>>,
+    local_bindings: Option<&CppBoundedLocalBindingIndex<'_>>,
+    known_macro_names: Option<&HashSet<Box<str>>>,
+) -> BoundedResolution<DefinitionLookupOutcome> {
     let session = ResolutionSession::bounded(budget, cancellation);
     let Some(cpp) = resolve_analyzer::<CppAnalyzer>(analyzer) else {
         return session.finish(no_definition(
@@ -1169,13 +1445,16 @@ pub(crate) fn resolve_cpp_bounded(
         analyzer,
         cpp,
         session: &session,
+        known_local_names,
+        local_bindings,
+        known_macro_names,
     };
     let outcome = resolve_cpp_bounded_in_session(&provider, file, source, tree.root_node(), site);
     session.finish(outcome)
 }
 
 fn resolve_cpp_bounded_in_session(
-    provider: &CppBoundedProvider<'_>,
+    provider: &CppBoundedProvider<'_, '_>,
     file: &ProjectFile,
     source: &str,
     root: Node<'_>,
@@ -1349,7 +1628,7 @@ fn cpp_bounded_reference_node<'tree>(
 }
 
 fn resolve_cpp_bounded_member(
-    provider: &CppBoundedProvider<'_>,
+    provider: &CppBoundedProvider<'_, '_>,
     file: &ProjectFile,
     source: &str,
     root: Node<'_>,
@@ -1371,8 +1650,9 @@ fn resolve_cpp_bounded_member(
     if member.is_empty() {
         return no_definition("no_member_name", "C++ member name is blank");
     }
-    let external_owner_name =
-        cpp_external_receiver_type_name_from_ast(file, source, root, receiver, provider.session);
+    let external_owner_name = cpp_external_receiver_type_name_from_bounded_provider(
+        provider, file, source, root, receiver,
+    );
     let Some(resolution) =
         cpp_bounded_type_resolution_for_node(provider, file, source, root, receiver)
     else {
@@ -1552,15 +1832,46 @@ fn resolve_cpp_bounded_member(
     outcome
 }
 
+fn cpp_external_receiver_type_name_from_bounded_provider(
+    provider: &CppBoundedProvider<'_, '_>,
+    file: &ProjectFile,
+    source: &str,
+    root: Node<'_>,
+    receiver: Node<'_>,
+) -> Option<String> {
+    let type_node = match receiver.kind() {
+        "identifier" | "field_identifier" => {
+            provider.binding_type_node(file, source, root, receiver)?
+        }
+        "new_expression" | "compound_literal_expression" => receiver
+            .child_by_field_name("type")
+            .or_else(|| cpp_constructor_type_node(receiver))?,
+        _ => return None,
+    };
+    let type_name = cpp_bounded_structured_type_path(type_node, source, provider.session)
+        .map(|path| path.fqn)
+        .or_else(|| {
+            cpp_bounded_type_name_node(type_node, provider.session)
+                .map(|name| cpp_node_text(name, source).to_owned())
+        })?;
+    (!type_name.is_empty()).then_some(type_name)
+}
+
 fn cpp_external_receiver_type_name_from_ast(
     file: &ProjectFile,
     source: &str,
     root: Node<'_>,
     receiver: Node<'_>,
+    known_local_names: Option<&HashSet<Box<str>>>,
     session: &ResolutionSession,
 ) -> Option<String> {
     let type_node = match receiver.kind() {
         "identifier" | "field_identifier" => {
+            if known_local_names
+                .is_some_and(|names| !names.contains(cpp_node_text(receiver, source)))
+            {
+                return None;
+            }
             cpp_bounded_binding_type_node(file, source, root, receiver, session)?
         }
         "new_expression" | "compound_literal_expression" => receiver
@@ -1596,7 +1907,7 @@ struct CppBoundedBaseEdge {
 }
 
 fn cpp_bounded_direct_ancestor_edges(
-    provider: &CppBoundedProvider<'_>,
+    provider: &CppBoundedProvider<'_, '_>,
     owner: &CodeUnit,
 ) -> Vec<CppBoundedBaseEdge> {
     if !owner.is_class() {
@@ -1641,7 +1952,7 @@ fn cpp_bounded_direct_ancestor_edges(
 }
 
 fn resolve_cpp_bounded_callable(
-    provider: &CppBoundedProvider<'_>,
+    provider: &CppBoundedProvider<'_, '_>,
     file: &ProjectFile,
     source: &str,
     root: Node<'_>,
@@ -1657,8 +1968,52 @@ fn resolve_cpp_bounded_callable(
         );
     };
     let name = cpp_node_text(name_node, source);
+    if name_node.kind() == "primitive_type"
+        || matches!(
+            name,
+            "bool"
+                | "char"
+                | "char8_t"
+                | "char16_t"
+                | "char32_t"
+                | "double"
+                | "float"
+                | "int"
+                | "long"
+                | "short"
+                | "signed"
+                | "static_cast"
+                | "dynamic_cast"
+                | "const_cast"
+                | "sizeof"
+                | "alignof"
+                | "decltype"
+                | "noexcept"
+                | "reinterpret_cast"
+                | "typeid"
+                | "unsigned"
+                | "void"
+                | "wchar_t"
+        )
+    {
+        return no_definition(
+            "no_indexed_definition",
+            format!("C++ callable `{name}` is not indexed"),
+        );
+    }
+    if provider
+        .known_macro_names
+        .is_some_and(|names| names.contains(name))
+    {
+        return no_definition(
+            "no_indexed_definition",
+            format!("C++ callable `{name}` is not indexed"),
+        );
+    }
     if node.id() == name_node.id()
-        && cpp_bounded_binding_type_node(file, source, root, name_node, provider.session).is_some()
+        && provider
+            .binding_type_node(file, source, root, name_node)
+            .is_some()
     {
         return no_definition(
             "local_callable_reference",
@@ -1677,6 +2032,19 @@ fn resolve_cpp_bounded_callable(
             "C++ callable resolution exhausted its bounded lexical traversal",
         );
     };
+    let mut lookup_fqns = Vec::with_capacity(lexical_scopes.len() + 1);
+    if !structured_path
+        .as_ref()
+        .is_some_and(|path| path.is_absolute)
+    {
+        lookup_fqns.extend(
+            lexical_scopes
+                .iter()
+                .rev()
+                .map(|scope| format!("{scope}.{relative_fqn}")),
+        );
+    }
+    lookup_fqns.push(relative_fqn.to_owned());
     let mut candidates = Vec::new();
     if !structured_path
         .as_ref()
@@ -1718,7 +2086,7 @@ fn resolve_cpp_bounded_callable(
 }
 
 fn resolve_cpp_bounded_call_target(
-    provider: &CppBoundedProvider<'_>,
+    provider: &CppBoundedProvider<'_, '_>,
     file: &ProjectFile,
     source: &str,
     root: Node<'_>,
@@ -1747,6 +2115,9 @@ pub(crate) fn cpp_type_lookup_resolution_in_session(
         analyzer,
         cpp,
         session,
+        known_local_names: None,
+        local_bindings: None,
+        known_macro_names: None,
     };
     let node = cpp_bounded_smallest_node(
         tree.root_node(),
@@ -1761,7 +2132,7 @@ pub(crate) fn cpp_type_lookup_resolution_in_session(
 }
 
 fn cpp_bounded_type_resolution_for_node(
-    provider: &CppBoundedProvider<'_>,
+    provider: &CppBoundedProvider<'_, '_>,
     file: &ProjectFile,
     source: &str,
     root: Node<'_>,
@@ -1804,8 +2175,7 @@ fn cpp_bounded_type_resolution_for_node(
     match node.kind() {
         "this" => cpp_bounded_current_receiver_type(provider, file, source, node),
         "identifier" | "field_identifier" => {
-            let type_node =
-                cpp_bounded_binding_type_node(file, source, root, node, provider.session)?;
+            let type_node = provider.binding_type_node(file, source, root, node)?;
             cpp_bounded_type_candidates(provider, file, source, type_node)
         }
         "new_expression" | "compound_literal_expression" => {
@@ -1851,7 +2221,7 @@ fn cpp_bounded_type_resolution_for_node(
 }
 
 fn cpp_bounded_field_type(
-    provider: &CppBoundedProvider<'_>,
+    provider: &CppBoundedProvider<'_, '_>,
     file: &ProjectFile,
     definitions: &[CodeUnit],
 ) -> Option<CppBoundedTypeResolution> {
@@ -1876,7 +2246,7 @@ fn cpp_bounded_field_type(
 }
 
 fn cpp_bounded_callable_return_type(
-    provider: &CppBoundedProvider<'_>,
+    provider: &CppBoundedProvider<'_, '_>,
     definitions: &[CodeUnit],
 ) -> Option<CppBoundedTypeResolution> {
     if definitions.is_empty() {
@@ -1926,34 +2296,46 @@ fn cpp_bounded_callable_return_type(
     })
 }
 
+fn cpp_bounded_first_type_candidates(
+    provider: &CppBoundedProvider<'_, '_>,
+    scope_candidates: impl Iterator<Item = String>,
+    mut candidates_for: impl FnMut(&str) -> Vec<CodeUnit>,
+) -> Option<Vec<CodeUnit>> {
+    for candidate_fqn in scope_candidates {
+        if !provider.session.scope_step() {
+            return None;
+        }
+        let candidates = candidates_for(&candidate_fqn);
+        if !candidates.is_empty() {
+            return Some(candidates);
+        }
+    }
+    Some(Vec::new())
+}
+
 fn cpp_bounded_type_candidates_for_name(
-    provider: &CppBoundedProvider<'_>,
+    provider: &CppBoundedProvider<'_, '_>,
     name: &StructuredTypeName,
 ) -> Option<CppBoundedTypeResolution> {
     let terminal = name.path().last()?;
-    let mut candidates = Vec::new();
     let first_scope_depth = if name.is_absolute() {
         0
     } else {
         name.lexical_scope().len()
     };
-    for scope_depth in (0..=first_scope_depth).rev() {
-        if !provider.session.scope_step() {
-            return None;
-        }
+    let scope_candidates = (0..=first_scope_depth).rev().map(|scope_depth| {
         let mut components = Vec::with_capacity(scope_depth.saturating_add(name.path().len()));
         components.extend_from_slice(&name.lexical_scope()[..scope_depth]);
         components.extend_from_slice(name.path());
-        let fqn = components.join(".");
-        candidates = provider
-            .definitions_named(&fqn, terminal)
+        components.join(".")
+    });
+    let mut candidates = cpp_bounded_first_type_candidates(provider, scope_candidates, |fqn| {
+        provider
+            .definitions_named(fqn, terminal)
             .into_iter()
             .filter(CodeUnit::is_class)
-            .collect();
-        if !candidates.is_empty() {
-            break;
-        }
-    }
+            .collect()
+    })?;
     sort_units(&mut candidates);
     candidates.dedup();
     if candidates.is_empty() {
@@ -1976,7 +2358,7 @@ fn cpp_bounded_type_candidates_for_name(
 }
 
 fn cpp_bounded_name_has_any_declaration(
-    provider: &CppBoundedProvider<'_>,
+    provider: &CppBoundedProvider<'_, '_>,
     lexical_scopes: &[String],
     relative_fqn: &str,
     name: &str,
@@ -1996,7 +2378,7 @@ fn cpp_bounded_name_has_any_declaration(
 }
 
 fn cpp_bounded_type_candidates(
-    provider: &CppBoundedProvider<'_>,
+    provider: &CppBoundedProvider<'_, '_>,
     file: &ProjectFile,
     source: &str,
     node: Node<'_>,
@@ -2027,27 +2409,28 @@ fn cpp_bounded_type_candidates(
         .map(|path| path.fqn.as_str())
         .unwrap_or(name);
     let lexical_scopes = cpp_bounded_lexical_scope_fqns(node, source, provider.session)?;
-    let mut candidates = Vec::new();
-    if !structured_path
+    let mut candidates = if structured_path
         .as_ref()
         .is_some_and(|path| path.is_absolute)
     {
-        for scope in lexical_scopes.iter().rev() {
-            if !provider.session.scope_step() {
-                return None;
-            }
-            let candidate_fqn = format!("{scope}.{relative_fqn}");
-            candidates = cpp_bounded_canonical_type_candidates(
-                provider,
-                file,
-                node,
-                provider.definitions_named(&candidate_fqn, name),
-            );
-            if !candidates.is_empty() {
-                break;
-            }
-        }
-    }
+        Vec::new()
+    } else {
+        cpp_bounded_first_type_candidates(
+            provider,
+            lexical_scopes
+                .iter()
+                .rev()
+                .map(|scope| format!("{scope}.{relative_fqn}")),
+            |candidate_fqn| {
+                cpp_bounded_canonical_type_candidates(
+                    provider,
+                    file,
+                    node,
+                    provider.definitions_named(candidate_fqn, name),
+                )
+            },
+        )?
+    };
     if candidates.is_empty() {
         candidates = cpp_bounded_canonical_type_candidates(
             provider,
@@ -2125,7 +2508,7 @@ fn cpp_bounded_type_candidates(
 }
 
 fn cpp_bounded_current_receiver_type(
-    provider: &CppBoundedProvider<'_>,
+    provider: &CppBoundedProvider<'_, '_>,
     file: &ProjectFile,
     source: &str,
     node: Node<'_>,
@@ -2167,7 +2550,7 @@ fn cpp_bounded_binding_type_node<'tree>(
         if node.start_byte() > reference.start_byte() {
             continue;
         }
-        if node.id() != callable.id() && cpp_bounded_nested_callable(node) {
+        if node.id() != callable.id() && cpp_bounded_callable_declaration(node) {
             continue;
         }
         if let Some(binding) = cpp_c_autoptr_statement_binding(file, source, node)
@@ -2268,10 +2651,6 @@ fn cpp_bounded_callable_declaration(node: Node<'_>) -> bool {
         node.kind(),
         "function_definition" | "lambda_expression" | "operator_cast_definition"
     )
-}
-
-fn cpp_bounded_nested_callable(node: Node<'_>) -> bool {
-    cpp_bounded_callable_declaration(node)
 }
 
 fn cpp_bounded_enclosing_scope<'tree>(
@@ -2563,27 +2942,12 @@ fn cpp_bounded_smallest_node<'tree>(
     if start >= end {
         return None;
     }
-    let mut current = root;
-    loop {
-        if !session.scope_step() {
-            return None;
-        }
-        let mut cursor = current.walk();
-        let mut containing = None;
-        for child in current.named_children(&mut cursor) {
-            if !session.scope_step() {
-                return None;
-            }
-            if child.start_byte() <= start && child.end_byte() >= end {
-                containing = Some(child);
-                break;
-            }
-        }
-        let Some(child) = containing else {
-            return (current.start_byte() <= start && current.end_byte() >= end).then_some(current);
-        };
-        current = child;
-    }
+    brokk_bifrost_core::analyzer::usages::reference_site::smallest_named_node_covering_with_scope(
+        root,
+        start,
+        end,
+        || session.scope_step(),
+    )
 }
 
 #[cfg(test)]
@@ -2714,6 +3078,17 @@ fn cpp_reference_node(node: Node<'_>) -> Option<CppReferenceNode<'_>> {
         | "qualified_identifier"
         | "template_type"
         | "scoped_type_identifier" => Some(CppReferenceNode::Type(current)),
+        // ABI 15 can recover the nested template-id in the issue #1537
+        // return type as a `template_function` directly in the outer
+        // template argument list.  Admit this shape only when that list is
+        // owned by a template type and the owner reaches a type descriptor
+        // through real AST fields. The type resolver must still prove a
+        // visible type binding; this syntax path alone establishes no identity.
+        // Expression-shaped template functions
+        // stop before this path at their call/pointer expression.
+        "template_function" if cpp_template_function_has_type_owner(current) => {
+            Some(CppReferenceNode::Type(current))
+        }
         "identifier"
         | "field_identifier"
         | "preproc_arg"
@@ -2766,10 +3141,7 @@ fn cpp_type_node_is_parameter_type(mut node: Node<'_>) -> bool {
             parent.kind(),
             "parameter_declaration" | "optional_parameter_declaration"
         ) {
-            return parent.child_by_field_name("type").is_some_and(|type_node| {
-                type_node.start_byte() <= node.start_byte()
-                    && node.end_byte() <= type_node.end_byte()
-            });
+            return brokk_bifrost_cpp::declarations::cpp_type_field_contains_node(parent, node);
         }
         if matches!(
             parent.kind(),
@@ -2792,10 +3164,7 @@ fn cpp_type_node_is_declaration_type(mut node: Node<'_>) -> bool {
                 | "field_declaration"
                 | "function_definition"
         ) {
-            return parent.child_by_field_name("type").is_some_and(|type_node| {
-                type_node.start_byte() <= node.start_byte()
-                    && node.end_byte() <= type_node.end_byte()
-            });
+            return brokk_bifrost_cpp::declarations::cpp_type_field_contains_node(parent, node);
         }
         if matches!(
             parent.kind(),
@@ -2934,20 +3303,16 @@ fn cpp_resolve_qualified_via_enclosing_namespaces(
         .take_while(|&&id| interner.resolve(id).1 == crate::analyzer::fq_name::SegmentKind::Package)
         .count();
 
-    for prefix_len in (0..=namespace_len).rev() {
-        let mut candidate = crate::analyzer::fq_name::FqName::new();
-        for &id in &scope.segments()[..prefix_len] {
-            candidate.push(id);
-        }
-        for &id in reference_fq.segments() {
-            candidate.push(id);
-        }
-        let candidate_str = candidate.display_native(Language::Cpp, interner);
-        if let Some(unit) = analyzer.definitions(&candidate_str).find(&accept) {
-            return Some(unit);
-        }
-    }
-    None
+    super::resolve_qualified_name_in_fq_prefixes(
+        Language::Cpp,
+        scope,
+        &reference_fq,
+        interner,
+        (0..=namespace_len).rev(),
+        || true,
+        |candidate| analyzer.definitions(candidate).collect(),
+        accept,
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3451,7 +3816,8 @@ fn cpp_qualified_type_candidate_matches_reference(
 }
 
 fn cpp_template_application_node(mut node: Node<'_>) -> Option<Node<'_>> {
-    let mut application = (node.kind() == "template_type").then_some(node);
+    let mut application =
+        matches!(node.kind(), "template_type" | "template_function").then_some(node);
     while let Some(parent) = node.parent() {
         if parent.kind() == "template_type" && parent.child_by_field_name("name") == Some(node) {
             node = parent;
@@ -3719,6 +4085,7 @@ fn cpp_type_candidates_without_focused_qualifier(
                 let member_candidates = cpp_direct_member_candidates_traced(
                     analyzer,
                     token,
+                    visibility,
                     std::slice::from_ref(&owner),
                     &member,
                     member_trace.as_mut(),
@@ -3758,7 +4125,7 @@ fn cpp_type_candidates_without_focused_qualifier(
                 if let Some(state) = member_trace.as_ref() {
                     // No call shape reaches this seam, so nothing here can
                     // decide applicability.
-                    state.stage_winners(analyzer, &candidates, None);
+                    state.stage_winners(visibility, &candidates, None);
                 }
                 return CppTypeCandidates::outcome(candidates_outcome(candidates));
             }
@@ -3788,6 +4155,7 @@ fn cpp_type_candidates_without_focused_qualifier(
                 let candidates = cpp_direct_member_candidates(
                     analyzer,
                     token,
+                    visibility,
                     std::slice::from_ref(&parameter),
                     &member,
                 )
@@ -4111,10 +4479,14 @@ fn cpp_type_alias_declaration_contains_node(
     node: Node<'_>,
 ) -> bool {
     cpp_unit_is_type_alias(analyzer, candidate)
-        && analyzer
-            .ranges(candidate)
-            .into_iter()
-            .any(|range| range.start_byte <= node.start_byte() && node.end_byte() <= range.end_byte)
+        && cpp_unit_range_contains_node(analyzer, candidate, node)
+}
+
+fn cpp_unit_range_contains_node(analyzer: &dyn IAnalyzer, unit: &CodeUnit, node: Node<'_>) -> bool {
+    analyzer
+        .ranges(unit)
+        .into_iter()
+        .any(|range| range.start_byte <= node.start_byte() && node.end_byte() <= range.end_byte)
 }
 
 fn cpp_active_template_parameter_reference(node: Node<'_>, source: &str) -> bool {
@@ -4133,10 +4505,12 @@ fn cpp_active_template_parameter_reference(node: Node<'_>, source: &str) -> bool
             && parent
                 .child_by_field_name("parameters")
                 .is_some_and(|parameters| {
-                    parameters
-                        .named_children(&mut parameters.walk())
-                        .filter_map(|parameter| cpp_template_parameter_name(parameter, source))
-                        .any(|parameter| parameter == *name)
+                    brokk_bifrost_cpp::declarations::cpp_template_parameter_name_matches(
+                        parameters,
+                        name,
+                        |parameter| cpp_template_parameter_name(parameter, source),
+                    )
+                    .any_parameter
                 })
         {
             return true;
@@ -4313,8 +4687,7 @@ fn cpp_template_parameter_name(node: Node<'_>, source: &str) -> Option<String> {
         candidate.kind(),
         "identifier" | "type_identifier" | "field_identifier"
     ) {
-        let name = cpp_node_text(candidate, source).trim();
-        return (!name.is_empty()).then(|| name.to_string());
+        return brokk_bifrost_cpp::declarations::direct_identifier_name(candidate, source);
     }
     extract_variable_name(candidate, source)
 }
@@ -4423,12 +4796,7 @@ fn cpp_indexed_type_alias_for_node(
         .filter(|candidate| {
             candidate.source() == file && cpp_unit_is_type_alias(analyzer, candidate)
         })
-        .find(|candidate| {
-            analyzer.ranges(candidate).into_iter().any(|range| {
-                range.start_byte <= alias_node.start_byte()
-                    && alias_node.end_byte() <= range.end_byte
-            })
-        })
+        .find(|candidate| cpp_unit_range_contains_node(analyzer, candidate, alias_node))
 }
 
 fn cpp_type_alias_declaration_name(node: Node<'_>, source: &str) -> Option<String> {
@@ -4442,8 +4810,7 @@ fn cpp_type_alias_declaration_name(node: Node<'_>, source: &str) -> Option<Strin
         candidate.kind(),
         "identifier" | "type_identifier" | "field_identifier"
     ) {
-        let name = cpp_node_text(candidate, source).trim();
-        return (!name.is_empty()).then(|| name.to_string());
+        return brokk_bifrost_cpp::declarations::direct_identifier_name(candidate, source);
     }
     extract_variable_name(candidate, source)
 }
@@ -4463,10 +4830,7 @@ fn cpp_malformed_class_alias_candidate(
     loop {
         let parent = function.parent()?;
         if parent.kind() == "function_definition" {
-            if !parent.child_by_field_name("type").is_some_and(|type_node| {
-                type_node.start_byte() <= node.start_byte()
-                    && node.end_byte() <= type_node.end_byte()
-            }) {
+            if !brokk_bifrost_cpp::declarations::cpp_type_field_contains_node(parent, node) {
                 return None;
             }
             function = parent;
@@ -4542,37 +4906,6 @@ fn cpp_malformed_class_alias_candidate(
                 range.start_byte < node.start_byte() && range.end_byte <= node.start_byte()
             })
         })
-}
-
-fn cpp_error_contains_class_header(node: Node<'_>) -> bool {
-    let mut pending = vec![(node, 0usize)];
-    while let Some((current, depth)) = pending.pop() {
-        if matches!(current.kind(), "class" | "struct" | "union") {
-            let mut sibling = current.next_sibling();
-            let mut saw_name = false;
-            while let Some(candidate) = sibling {
-                match candidate.kind() {
-                    "comment" => {}
-                    "{" | "base_class_clause" | ":" => return saw_name,
-                    "identifier" | "type_identifier" if !saw_name => saw_name = true,
-                    _ if !candidate.is_named() => {}
-                    _ => break,
-                }
-                sibling = candidate.next_sibling();
-            }
-        }
-        if depth >= 1 {
-            continue;
-        }
-        let mut cursor = current.walk();
-        pending.extend(
-            current
-                .children(&mut cursor)
-                .filter(|child| child.kind() != "compound_statement")
-                .map(|child| (child, depth + 1)),
-        );
-    }
-    false
 }
 
 fn cpp_out_of_line_function_owner_for_type(
@@ -4873,9 +5206,27 @@ fn cpp_type_definition_candidates(
     reference: Node<'_>,
     unit: CodeUnit,
 ) -> Vec<CodeUnit> {
+    let spellings = cpp_reachable_identical_alias(analyzer, visibility, file, support, &unit)
+        .unwrap_or_else(|| vec![unit]);
+    spellings
+        .into_iter()
+        .flat_map(|spelling| {
+            cpp_type_definition_candidates_for_spelling(
+                analyzer, visibility, file, support, reference, spelling,
+            )
+        })
+        .collect()
+}
+
+fn cpp_type_definition_candidates_for_spelling(
+    analyzer: &dyn IAnalyzer,
+    visibility: &CppVisibilityIndex,
+    file: &ProjectFile,
+    support: &dyn BoundedDefinitionLookup,
+    reference: Node<'_>,
+    unit: CodeUnit,
+) -> Vec<CodeUnit> {
     let reference_byte = reference.start_byte();
-    let unit =
-        cpp_reachable_identical_alias(analyzer, visibility, file, support, &unit).unwrap_or(unit);
     let target = cpp_navigation_type_target(analyzer, visibility, file, reference, unit);
     let dispatch = CppDispatch::new(analyzer, visibility.token());
     let graph_source = dispatch.source();
@@ -5031,7 +5382,7 @@ fn cpp_reachable_identical_alias(
     file: &ProjectFile,
     support: &dyn BoundedDefinitionLookup,
     unit: &CodeUnit,
-) -> Option<CodeUnit> {
+) -> Option<Vec<CodeUnit>> {
     if !cpp_unit_is_type_alias(analyzer, unit) {
         return None;
     }
@@ -5058,13 +5409,24 @@ fn cpp_reachable_identical_alias(
     {
         return None;
     }
-    collapse_same_fqn_alias_spellings(analyzer, visibility, file, &mut aliases);
-    debug_assert_eq!(
-        aliases.len(),
-        1,
-        "one same-logical-symbol alias family must collapse to one physical spelling"
-    );
-    aliases.into_iter().next()
+    let visible = aliases
+        .iter()
+        .filter(|candidate| visibility.is_physically_visible(file, candidate))
+        .collect::<Vec<_>>();
+    let selection = if visible.is_empty() {
+        aliases.iter().collect::<Vec<_>>()
+    } else {
+        visible.to_vec()
+    };
+    if let Some(alias) = select_alias_spelling_with_agreed_targets(&selection, |candidate| {
+        cpp_structured_alias_target(analyzer, candidate)
+    }) {
+        Some(vec![alias.clone()])
+    } else if visible.is_empty() {
+        Some(aliases)
+    } else {
+        Some(visible.into_iter().cloned().collect())
+    }
 }
 
 /// Answer one navigation target per identical type alias, preferring the
@@ -5094,26 +5456,92 @@ fn collapse_same_fqn_alias_spellings(
     file: &ProjectFile,
     candidates: &mut Vec<CodeUnit>,
 ) {
-    let mut kept: Vec<CodeUnit> = Vec::with_capacity(candidates.len());
-    for candidate in candidates.drain(..) {
-        if !cpp_unit_is_type_alias(analyzer, &candidate) {
-            kept.push(candidate);
+    collapse_same_fqn_alias_spellings_with_targets(
+        candidates,
+        |candidate| cpp_unit_is_type_alias(analyzer, candidate),
+        |candidate| visibility.is_physically_visible(file, candidate),
+        |candidate| cpp_structured_alias_target(analyzer, candidate),
+    );
+}
+
+fn collapse_same_fqn_alias_spellings_with_targets<T: Eq>(
+    candidates: &mut Vec<CodeUnit>,
+    mut is_alias: impl FnMut(&CodeUnit) -> bool,
+    is_visible: impl Fn(&CodeUnit) -> bool,
+    mut structured_target: impl FnMut(&CodeUnit) -> Option<T>,
+) {
+    let input = std::mem::take(candidates);
+    let mut retained = vec![true; input.len()];
+    let mut grouped = vec![false; input.len()];
+    for index in 0..input.len() {
+        if grouped[index] || !is_alias(&input[index]) {
             continue;
         }
-        let Some(spelling) = kept
-            .iter_mut()
-            .find(|kept| same_logical_symbol(kept, &candidate))
-        else {
-            kept.push(candidate);
+        let group = (index..input.len())
+            .filter(|candidate_index| {
+                !grouped[*candidate_index]
+                    && is_alias(&input[*candidate_index])
+                    && same_logical_symbol(&input[index], &input[*candidate_index])
+            })
+            .collect::<Vec<_>>();
+        for candidate_index in &group {
+            grouped[*candidate_index] = true;
+        }
+        if group.len() == 1 {
             continue;
+        }
+
+        let visible_indices = group
+            .iter()
+            .copied()
+            .filter(|candidate_index| is_visible(&input[*candidate_index]))
+            .collect::<Vec<_>>();
+        let visible = visible_indices
+            .iter()
+            .map(|candidate_index| &input[*candidate_index])
+            .collect::<Vec<_>>();
+        let selection = if visible.is_empty() {
+            group
+                .iter()
+                .map(|candidate_index| &input[*candidate_index])
+                .collect::<Vec<_>>()
+        } else {
+            visible
         };
-        if !visibility.is_physically_visible(file, spelling)
-            && visibility.is_physically_visible(file, &candidate)
+        if let Some(selected) =
+            select_alias_spelling_with_agreed_targets(&selection, &mut structured_target)
         {
-            *spelling = candidate;
+            let selected_index = group
+                .iter()
+                .copied()
+                .find(|candidate_index| std::ptr::eq(selected, &input[*candidate_index]))
+                .expect("selected alias spelling belongs to its logical-symbol group");
+            for candidate_index in group {
+                retained[candidate_index] = candidate_index == selected_index;
+            }
+        } else if !visible_indices.is_empty() {
+            for candidate_index in group {
+                retained[candidate_index] = visible_indices.contains(&candidate_index);
+            }
         }
     }
-    *candidates = kept;
+    *candidates = input
+        .into_iter()
+        .zip(retained)
+        .filter_map(|(candidate, keep)| keep.then_some(candidate))
+        .collect();
+}
+
+fn cpp_structured_alias_target(
+    analyzer: &dyn IAnalyzer,
+    unit: &CodeUnit,
+) -> Option<CppStructuredAliasTarget> {
+    let facts = cpp_canonical_declaration_properties(analyzer, unit)?;
+    let first = facts.first()?.alias_target.as_ref()?;
+    facts
+        .iter()
+        .all(|fact| fact.alias_target.as_ref() == Some(first))
+        .then(|| first.clone())
 }
 
 fn cpp_selected_type_definition_candidates(
@@ -5124,22 +5552,26 @@ fn cpp_selected_type_definition_candidates(
     reference: Node<'_>,
     unit: CodeUnit,
 ) -> Vec<CodeUnit> {
-    let unit =
-        cpp_reachable_identical_alias(analyzer, visibility, file, support, &unit).unwrap_or(unit);
-    let target = cpp_navigation_type_target(analyzer, visibility, file, reference, unit);
-    let indexed = support
-        .fqn(&target.fq_name())
-        .into_iter()
-        .filter(|candidate| {
-            candidate.source() == target.source()
-                && cpp_unit_matches_kind(analyzer, support, candidate, CppTargetKind::Type)
-        })
-        .collect::<Vec<_>>();
-    if indexed.is_empty() {
-        vec![target]
-    } else {
-        indexed
+    let spellings = cpp_reachable_identical_alias(analyzer, visibility, file, support, &unit)
+        .unwrap_or_else(|| vec![unit]);
+    let mut definitions = Vec::new();
+    for spelling in spellings {
+        let target = cpp_navigation_type_target(analyzer, visibility, file, reference, spelling);
+        let indexed = support
+            .fqn(&target.fq_name())
+            .into_iter()
+            .filter(|candidate| {
+                candidate.source() == target.source()
+                    && cpp_unit_matches_kind(analyzer, support, candidate, CppTargetKind::Type)
+            })
+            .collect::<Vec<_>>();
+        if indexed.is_empty() {
+            definitions.push(target);
+        } else {
+            definitions.extend(indexed);
+        }
     }
+    definitions
 }
 
 fn cpp_navigation_type_target(
@@ -5292,7 +5724,7 @@ fn resolve_cpp_call(
                     ctx.visibility,
                     ctx.file,
                 );
-                if qualified_call_has_applicable_arity(&candidates, call_arity, ctx.analyzer) {
+                if qualified_call_has_applicable_arity(&candidates, call_arity, ctx.visibility) {
                     return cpp_callable_candidates_outcome(candidates);
                 }
                 candidates.clear();
@@ -5339,6 +5771,49 @@ fn resolve_cpp_call(
                 candidates.dedup();
                 if !candidates.is_empty() {
                     return cpp_callable_candidates_outcome(candidates);
+                }
+
+                // A qualified standard-library call is resolved by the
+                // generated header overlay only after every workspace route
+                // above has answered nothing. The owner/member pair and the
+                // reached header are both proved from structured records; the
+                // callee spelling is never used as a name-only fallback.
+                if !ctx.support.fqn(&text).into_iter().any(|candidate| {
+                    cpp_unit_matches_kind(
+                        ctx.analyzer,
+                        ctx.support,
+                        &candidate,
+                        CppTargetKind::FreeFunction,
+                    )
+                }) && let Some((header_function, arity)) = cpp_header_namespace_function_call(
+                    ctx,
+                    function,
+                    owner_components,
+                    member,
+                    call_arity,
+                ) {
+                    let proof = ExactExternalCallProof::cpp_header_function(
+                        &header_function.namespace,
+                        member,
+                        arity,
+                    );
+                    evidence.call_application = proof.call_application();
+                    evidence.dispatch_extensibility = proof.dispatch_extensibility();
+                    evidence.exact_external_call = Some(proof);
+                    evidence.external_callee_identity =
+                        Some(ResolverOwnedExternalCalleeIdentity::new(
+                            Language::Cpp,
+                            header_function.namespace.as_str(),
+                            member.as_str(),
+                        ));
+                    super::trace::record_named_boundary_with_target(
+                        text.clone(),
+                        header_function.symbol_id,
+                    );
+                    return boundary_unchecked(
+                        format!("`{text}` is the namespace function the reached header declares"),
+                        UnindexedClaim::external_boundary(text, ClaimSubjectRole::Member),
+                    );
                 }
             }
             if construction_boundary {
@@ -5679,19 +6154,20 @@ fn resolve_cpp_call(
             // because its declaring header is outside it (#3466).
             //
             // A plain lowercase name is the free-function shape, the one a
-            // header can export into this scope; a capitalized one is the
+            // header can export into this scope. C APIs also commonly use
+            // capitalized names (`EVP_des_cbc`), so C source keeps the header
+            // path open for those names; in C++, a capitalized one remains the
             // construction shape (`Absent("boom")`), whose class declaration
-            // must come from the workspace's own types, so its miss stays a
-            // workspace miss (#1832) exactly as
-            // [`cpp_unresolved_include_boundary`] draws the same split for the
-            // member and qualified arms.
+            // must come from the workspace's own types. That C++ miss stays a
+            // workspace miss (#1832), exactly as [`cpp_unresolved_include_boundary`]
+            // draws the same split for the member and qualified arms.
             //
             // gated upstream: the include fact is the external signal and the
             // exhaustive workspace lookup above is the workspace half, so the
             // claim stands unless this very file declares the name -- the
             // same-file honesty probe (#3285) answers that case with what the
             // index holds instead.
-            if !cpp_written_reference_is_type_shaped(name)
+            if (is_c_source_file(ctx.file) || !cpp_written_reference_is_type_shaped(name))
                 && ctx
                     .visibility
                     .has_unresolved_include_visible_before(ctx.file, name_node.start_byte())
@@ -5797,6 +6273,33 @@ fn c_header_function_call(
         cpp,
         overlay.as_deref(),
         ctx.file,
+        name,
+        arity,
+    )
+    .map(|header_function| (header_function, arity))
+}
+
+fn cpp_header_namespace_function_call(
+    ctx: CppLookupCtx<'_, '_>,
+    function: Node<'_>,
+    namespace_path: &[String],
+    name: &str,
+    call_arity: Option<usize>,
+) -> Option<(
+    crate::analyzer::cpp::external::CppHeaderNamespaceFunction,
+    u32,
+)> {
+    if is_c_source_file(ctx.file) || function.kind() != "qualified_identifier" {
+        return None;
+    }
+    let arity = u32::try_from(call_arity?).ok()?;
+    let cpp = resolve_analyzer::<CppAnalyzer>(ctx.analyzer)?;
+    let overlay = ctx.analyzer.semantic_model_overlay();
+    crate::analyzer::cpp::external::reached_header_namespace_function(
+        cpp,
+        overlay.as_deref(),
+        ctx.file,
+        namespace_path,
         name,
         arity,
     )
@@ -5915,10 +6418,9 @@ fn cpp_bare_call_target_outcome(
         CppBareCallTargetResolution::FreeFunctions(units) => {
             let mut candidates =
                 cpp_bare_free_function_definition_candidates(ctx, token, units, call.start_byte());
-            candidates = cpp_filter_candidates_by_call_lazy(
-                candidates,
-                call_arity,
-                || {
+            let considered = trace::recording().then(|| candidates.clone());
+            let arg_types = trace::recording()
+                .then(|| {
                     cpp_call_argument_types(
                         ctx.analyzer,
                         token,
@@ -5929,12 +6431,51 @@ fn cpp_bare_call_target_outcome(
                         ctx.root,
                         call,
                     )
-                },
-                ctx.analyzer,
-                token,
-                ctx.visibility,
-                ctx.file,
-            );
+                })
+                .flatten();
+            candidates = if let Some(arg_types) = arg_types.as_deref() {
+                cpp_filter_candidates_by_call(
+                    candidates,
+                    call_arity,
+                    Some(arg_types),
+                    ctx.analyzer,
+                    token,
+                    ctx.visibility,
+                    ctx.file,
+                )
+            } else {
+                cpp_filter_candidates_by_call_lazy(
+                    candidates,
+                    call_arity,
+                    || {
+                        cpp_call_argument_types(
+                            ctx.analyzer,
+                            token,
+                            ctx.support,
+                            ctx.visibility,
+                            ctx.file,
+                            ctx.source,
+                            ctx.root,
+                            call,
+                        )
+                    },
+                    ctx.analyzer,
+                    token,
+                    ctx.visibility,
+                    ctx.file,
+                )
+            };
+            if let Some(considered) = considered.as_deref() {
+                cpp_record_bare_call_applicability(
+                    ctx.analyzer,
+                    considered,
+                    &candidates,
+                    call_arity,
+                    arg_types.as_deref(),
+                    ctx.visibility,
+                    ctx.file,
+                );
+            }
             Some(cpp_callable_candidates_outcome(candidates))
         }
         CppBareCallTargetResolution::UnprovenFreeFunctions(units) => {
@@ -6015,11 +6556,7 @@ fn cpp_callable_name_node(node: Node<'_>) -> Option<Node<'_>> {
                 current.child_by_field_name("name")?
             }
             "qualified_identifier" | "scoped_identifier" | "scoped_type_identifier" => {
-                let mut cursor = current.walk();
-                current
-                    .children_by_field_name("name", &mut cursor)
-                    .filter(|child| child.is_named())
-                    .last()?
+                brokk_bifrost_core::analyzer::tree_walk::last_named_field_child(current, "name")?
             }
             "field_expression" => current.child_by_field_name("field")?,
             "parenthesized_expression" => {
@@ -6267,6 +6804,7 @@ fn resolve_cpp_field(
         ctx.source,
         ctx.root,
         receiver,
+        None,
         &external_session,
     );
     let owners = cpp_field_receiver_type_units(
@@ -6619,20 +7157,14 @@ fn cpp_is_recovered_template_forward_declaration_name(node: Node<'_>) -> bool {
     {
         return false;
     }
-    let mut current = specifier.parent();
-    while let Some(ancestor) = current {
-        match ancestor.kind() {
-            "type_descriptor"
-            | "parameter_declaration"
-            | "optional_parameter_declaration"
-            | "template_argument_list"
-            | "cast_expression" => return false,
-            "template_declaration" => return true,
-            "declaration" | "field_declaration" | "translation_unit" => return false,
-            _ => current = ancestor.parent(),
-        }
-    }
-    false
+    cpp_tag_specifier_ancestors_before_type_reference_context(specifier)
+        .find(|ancestor| {
+            matches!(
+                ancestor.kind(),
+                "template_declaration" | "declaration" | "field_declaration" | "translation_unit"
+            )
+        })
+        .is_some_and(|ancestor| ancestor.kind() == "template_declaration")
 }
 
 fn cpp_is_out_of_line_destructor_type_name(node: Node<'_>) -> bool {
@@ -6727,38 +7259,6 @@ fn cpp_terminal_declarator_name_target(node: Node<'_>) -> Node<'_> {
     } else {
         node
     }
-}
-
-fn cpp_same_node(left: Node<'_>, right: Node<'_>) -> bool {
-    left.id() == right.id()
-        && left.start_byte() == right.start_byte()
-        && left.end_byte() == right.end_byte()
-}
-
-fn cpp_tag_specifier_declares_name(specifier: Node<'_>) -> bool {
-    if specifier.child_by_field_name("body").is_some() {
-        return true;
-    }
-    let mut current = specifier.parent();
-    while let Some(ancestor) = current {
-        match ancestor.kind() {
-            "type_descriptor"
-            | "parameter_declaration"
-            | "optional_parameter_declaration"
-            | "template_argument_list"
-            | "cast_expression" => return false,
-            "declaration" | "field_declaration" => {
-                let mut cursor = ancestor.walk();
-                return ancestor
-                    .children_by_field_name("declarator", &mut cursor)
-                    .next()
-                    .is_none();
-            }
-            "translation_unit" => return true,
-            _ => current = ancestor.parent(),
-        }
-    }
-    false
 }
 
 fn cpp_is_non_reference_preprocessor_token(node: Node<'_>) -> bool {
@@ -6880,9 +7380,10 @@ fn cpp_is_unqualified_field(
 }
 
 fn cpp_unit_is_type_alias(analyzer: &dyn IAnalyzer, unit: &CodeUnit) -> bool {
-    analyzer
-        .type_alias_provider()
-        .is_some_and(|provider| provider.is_type_alias(unit))
+    brokk_bifrost_core::analyzer::capabilities::provider_declares_type_alias(
+        analyzer.type_alias_provider(),
+        unit,
+    )
 }
 
 /// The per-candidate attribution the C++ member walk records while it runs,
@@ -6897,7 +7398,7 @@ fn cpp_unit_is_type_alias(analyzer: &dyn IAnalyzer, unit: &CodeUnit) -> bool {
 /// structured modifier reaches here. The scope-qualified spelling is not proof
 /// either -- `&Owner::field` and `receiver->Base::method()` take the same form
 /// for non-static members -- so no candidate here claims
-/// [`MemberDispatchTier::StaticOrCompanion`]. A direct member is attributed as
+/// [`crate::analyzer::structural::MemberDispatchTier::StaticOrCompanion`]. A direct member is attributed as
 /// what the lookup proved: a member declared on the named owner itself.
 #[derive(Default)]
 struct CppMemberTrace {
@@ -6911,11 +7412,7 @@ struct CppMemberTrace {
 
 impl CppMemberTrace {
     fn record_found(&mut self, candidates: &[CodeUnit], found_on: &CodeUnit, depth: usize) {
-        for candidate in candidates {
-            self.found
-                .entry(candidate.clone())
-                .or_insert_with(|| (found_on.clone(), depth));
-        }
+        super::record_member_trace_found(&mut self.found, candidates, || found_on.clone(), depth);
     }
 
     /// The exact base-class route from the receiver's own type to the class
@@ -6930,32 +7427,25 @@ impl CppMemberTrace {
         let Some((found_on, depth)) = self.found.get(candidate) else {
             return Vec::new();
         };
-        let mut chain = vec![found_on.clone()];
-        while chain.len() <= *depth {
-            let Some(parent) = self
-                .parents
-                .get(chain.last().expect("chain is never empty"))
-            else {
-                break;
-            };
-            chain.push(parent.clone());
-        }
-        chain.reverse();
+        let (route, _) = trace::hierarchy_route_from_predecessors(
+            found_on,
+            *depth,
+            |_, hops| hops >= *depth,
+            |current| {
+                self.parents
+                    .get(current)
+                    .cloned()
+                    .map(|parent| (parent, HierarchyRelation::Extends))
+            },
+            |unit| Some(unit.clone()),
+        )
+        .expect("C++ hierarchy route nodes always have declaration identities");
         debug_assert_eq!(
-            chain.len(),
-            depth + 1,
+            route.len(),
+            *depth,
             "the first-discovery chain must be exactly the base-class depth"
         );
-        chain
-            .windows(2)
-            .enumerate()
-            .map(|(hop, pair)| trace::HierarchyHopRecord {
-                hop,
-                from: pair[0].clone(),
-                to: pair[1].clone(),
-                relation: HierarchyRelation::Extends,
-            })
-            .collect()
+        route
     }
 
     fn enrichment(
@@ -6964,28 +7454,18 @@ impl CppMemberTrace {
         applicability: ApplicabilityVerdict,
     ) -> Option<trace::MemberEnrichment> {
         let (found_on, depth) = self.found.get(candidate)?;
-        let dispatch_tier = if *depth == 0 {
-            MemberDispatchTier::InherentOrDirect
-        } else {
-            MemberDispatchTier::InheritedOrPromoted
-        };
-        Some(trace::MemberEnrichment {
-            owner: found_on.clone(),
-            hierarchy_depth: *depth,
-            dispatch_tier,
+        Some(trace::member_enrichment(
+            found_on.clone(),
+            *depth,
             applicability,
-            route: self.route(candidate),
-        })
+            self.route(candidate),
+        ))
     }
 
     fn precedence_tier(&self, candidate: &CodeUnit) -> Option<PrecedenceTier> {
-        self.found.get(candidate).map(|(_, depth)| {
-            if *depth == 0 {
-                PrecedenceTier::OwnMember
-            } else {
-                PrecedenceTier::InheritedMember
-            }
-        })
+        self.found
+            .get(candidate)
+            .map(|(_, depth)| super::member_precedence_tier(*depth))
     }
 
     /// Record every candidate the walk computed and then discarded.
@@ -6997,26 +7477,20 @@ impl CppMemberTrace {
         callable: Option<&ApplicabilityOutcome>,
     ) {
         for loser in dropped {
-            let mut row = trace::TraceCandidate::rejected(
-                trace::TraceCandidateRef::Unit(loser.clone()),
+            trace::record_rejected_unit(
+                loser,
                 self.precedence_tier(loser),
                 reason,
+                callable
+                    .and_then(|outcome| {
+                        outcome
+                            .verdicts
+                            .iter()
+                            .find(|verdict| verdict.candidate == *loser)
+                    })
+                    .map(trace::CallableApplicabilityRecord::from),
+                self.enrichment(loser, applicability),
             );
-            if let Some(verdict) = callable.and_then(|outcome| {
-                outcome
-                    .verdicts
-                    .iter()
-                    .find(|verdict| verdict.candidate == *loser)
-            }) {
-                row = row.with_callable(trace::CallableApplicabilityRecord {
-                    verdict: verdict.verdict,
-                    reason: verdict.reason,
-                });
-            }
-            if let Some(enrichment) = self.enrichment(loser, applicability) {
-                row = row.with_member(enrichment);
-            }
-            trace::record(row);
         }
     }
 
@@ -7028,7 +7502,7 @@ impl CppMemberTrace {
     /// call-shape filter refused is exactly the #1478 boundary.
     fn record_call_seam_selection(
         &self,
-        analyzer: &dyn IAnalyzer,
+        visibility: &CppVisibilityIndex,
         winners: &[CodeUnit],
         considered: &[CodeUnit],
         non_callable: &[CodeUnit],
@@ -7042,14 +7516,15 @@ impl CppMemberTrace {
             ApplicabilityVerdict::Unknown,
             None,
         );
-        let applicability = cpp_candidate_applicability(analyzer, considered, arity);
+        let applicability =
+            cpp_candidate_applicability_in_visibility(considered, arity, visibility);
         self.record_rejected(
             considered.iter().filter(|unit| !winners.contains(unit)),
             RejectionReason::CallableApplicabilityDeferred,
             ApplicabilityVerdict::Inapplicable,
             Some(&applicability),
         );
-        self.stage_winners(analyzer, winners, arity);
+        self.stage_winners(visibility, winners, arity);
     }
 
     /// Stage attribution for `winners` on the outcome the caller is about to
@@ -7057,50 +7532,22 @@ impl CppMemberTrace {
     /// what the arity check proved about it, so an overload whose parameter
     /// list the analyzer never recorded stays `unknown` rather than being
     /// promoted to `applicable` by surviving a filter that never refused it.
-    fn stage_winners(&self, analyzer: &dyn IAnalyzer, winners: &[CodeUnit], arity: Option<usize>) {
-        let winner_tier = winners
-            .iter()
-            .filter_map(|unit| self.found.get(unit))
-            .map(|(_, depth)| *depth)
-            .min()
-            .map(|depth| {
-                if depth == 0 {
-                    PrecedenceTier::OwnMember
-                } else {
-                    PrecedenceTier::InheritedMember
-                }
-            });
-        if let Some(tier) = winner_tier {
-            trace::stage_tier(tier, winners.iter().map(|unit| unit.fq_name()).collect());
-        }
+    fn stage_winners(
+        &self,
+        visibility: &CppVisibilityIndex,
+        winners: &[CodeUnit],
+        arity: Option<usize>,
+    ) {
+        trace::stage_winner_tier(
+            winners,
+            winners.iter().filter_map(|unit| self.precedence_tier(unit)),
+        );
         // One computation for the member axis and the callable axis both: the
         // verdict staged here is the one the arity filter itself produced.
-        let applicability = cpp_candidate_applicability(analyzer, winners, arity);
-        trace::stage_member_context(
-            applicability
-                .verdicts
-                .iter()
-                .filter_map(|verdict| {
-                    self.enrichment(&verdict.candidate, verdict.verdict)
-                        .map(|enrichment| (verdict.candidate.fq_name(), enrichment))
-                })
-                .collect(),
-        );
-        trace::stage_callable_context(
-            applicability
-                .verdicts
-                .iter()
-                .map(|verdict| {
-                    (
-                        verdict.candidate.fq_name(),
-                        trace::CallableApplicabilityRecord {
-                            verdict: verdict.verdict,
-                            reason: verdict.reason,
-                        },
-                    )
-                })
-                .collect(),
-        );
+        let applicability = cpp_candidate_applicability_in_visibility(winners, arity, visibility);
+        trace::stage_applicability_context(winners, &applicability, |unit, verdict| {
+            self.enrichment(unit, verdict)
+        });
     }
 }
 
@@ -7119,10 +7566,20 @@ impl CppMemberTrace {
 /// A field call is also undecidable because its declared value type owns the
 /// call operator or function-pointer signature. Both stay reachable and report
 /// `unknown` rather than claiming a check the resolver did not make.
-fn cpp_candidate_applicability(
-    analyzer: &dyn IAnalyzer,
+fn cpp_candidate_applicability_in_visibility(
     candidates: &[CodeUnit],
     arity: Option<usize>,
+    visibility: &CppVisibilityIndex,
+) -> ApplicabilityOutcome {
+    cpp_candidate_applicability_with_arity(candidates, arity, |unit| {
+        visibility.callable_arity(unit)
+    })
+}
+
+fn cpp_candidate_applicability_with_arity(
+    candidates: &[CodeUnit],
+    arity: Option<usize>,
+    known_callable_arity: impl Fn(&CodeUnit) -> Option<crate::analyzer::CallableArity>,
 ) -> ApplicabilityOutcome {
     let Some(expected) = arity else {
         return ApplicabilityOutcome::undecidable(candidates);
@@ -7140,14 +7597,130 @@ fn cpp_candidate_applicability(
                         CallableRejectionReason::CallKindMismatch,
                     );
                 }
-                arity_verdict(
-                    unit,
-                    cpp_known_callable_arity(analyzer, unit).as_slice().into(),
-                    expected,
-                )
+                arity_verdict(unit, known_callable_arity(unit).as_slice().into(), expected)
             })
             .collect(),
     )
+}
+
+/// Add the direct written-type evidence to the C++ callable trace without
+/// changing the resolver's conservative winner set. The argument filter may
+/// retain every candidate when no exact overload is known; that is still a
+/// useful typed result for a policy, while the navigation resolver remains
+/// responsible for its existing best-effort binding.
+fn cpp_candidate_applicability_with_args(
+    analyzer: &dyn IAnalyzer,
+    candidates: &[CodeUnit],
+    arity: Option<usize>,
+    arg_types: Option<&[Option<CppType>]>,
+    visibility: &CppVisibilityIndex,
+    file: &ProjectFile,
+) -> ApplicabilityOutcome {
+    let arity_outcome = cpp_candidate_applicability_in_visibility(candidates, arity, visibility);
+    let Some(arg_types) = arg_types else {
+        return arity_outcome;
+    };
+    let shared_arg_types = arg_types
+        .iter()
+        .map(|arg| arg.as_ref().map(CppType::as_arg_type))
+        .collect::<Vec<_>>();
+    let parameter_types = |candidate: &CodeUnit| visibility.callable_parameter_types(candidate);
+    let is_template = |candidate: &CodeUnit| {
+        cpp_canonical_declaration_properties(analyzer, candidate)
+            .is_some_and(|facts| facts.iter().any(|fact| fact.callable_is_template))
+    };
+    let resolve_type = |name: &str| cpp_resolve_type_unit(analyzer, visibility, file, name);
+    let assignable = |arg_type: &CodeUnit, parameter_type: &CodeUnit| {
+        cpp_type_assignable_to(analyzer, arg_type, parameter_type)
+    };
+    let verdicts = arity_outcome
+        .verdicts
+        .into_iter()
+        .map(|verdict| {
+            if verdict.verdict == ApplicabilityVerdict::Inapplicable {
+                return verdict;
+            }
+            match cpp_candidate_argument_applicability(
+                &verdict.candidate,
+                &shared_arg_types,
+                &parameter_types,
+                &is_template,
+                &resolve_type,
+                &assignable,
+            ) {
+                CppArgumentApplicability::Applicable => {
+                    CandidateApplicability::applicable(verdict.candidate)
+                }
+                CppArgumentApplicability::Inapplicable => CandidateApplicability::inapplicable(
+                    verdict.candidate,
+                    CallableRejectionReason::PrimitiveTypeMismatch,
+                ),
+                CppArgumentApplicability::Unknown => {
+                    CandidateApplicability::unknown(verdict.candidate)
+                }
+            }
+        })
+        .collect();
+    ApplicabilityOutcome::from_verdicts(verdicts)
+}
+
+/// Stage typed applicability for a bare workspace function call. Rejected
+/// candidates are recorded here because the shared outcome constructor only
+/// emits selected declarations; selected candidates receive the same pending
+/// attribution through the normal trace seam.
+fn cpp_record_bare_call_applicability(
+    analyzer: &dyn IAnalyzer,
+    considered: &[CodeUnit],
+    winners: &[CodeUnit],
+    arity: Option<usize>,
+    arg_types: Option<&[Option<CppType>]>,
+    visibility: &CppVisibilityIndex,
+    file: &ProjectFile,
+) {
+    let applicability = cpp_candidate_applicability_with_args(
+        analyzer, considered, arity, arg_types, visibility, file,
+    );
+    for candidate in considered
+        .iter()
+        .filter(|candidate| !winners.contains(candidate))
+    {
+        let verdict = applicability
+            .verdicts
+            .iter()
+            .find(|verdict| verdict.candidate == *candidate)
+            .expect("every traced C++ call candidate has an applicability verdict");
+        trace::record(
+            trace::TraceCandidate::rejected(
+                trace::TraceCandidateRef::Unit((*candidate).clone()),
+                None,
+                RejectionReason::CallableApplicabilityDeferred,
+            )
+            .with_callable(trace::CallableApplicabilityRecord {
+                verdict: verdict.verdict,
+                reason: verdict.reason,
+            }),
+        );
+    }
+    trace::stage_callable_context(
+        winners
+            .iter()
+            .filter_map(|candidate| {
+                applicability
+                    .verdicts
+                    .iter()
+                    .find(|verdict| verdict.candidate == *candidate)
+                    .map(|verdict| {
+                        (
+                            candidate.fq_name(),
+                            trace::CallableApplicabilityRecord {
+                                verdict: verdict.verdict,
+                                reason: verdict.reason,
+                            },
+                        )
+                    })
+            })
+            .collect(),
+    );
 }
 
 /// The C++ member lookup itself: the receiver's own members first, and the
@@ -7162,6 +7735,7 @@ fn cpp_member_lookup(
     let candidates = cpp_direct_member_candidates_traced(
         ctx.analyzer,
         token,
+        ctx.visibility,
         owners,
         member,
         member_trace.as_deref_mut(),
@@ -7239,6 +7813,7 @@ fn cpp_merge_using_introduced_members(
         let introduced = cpp_direct_member_candidates_traced(
             ctx.analyzer,
             token,
+            ctx.visibility,
             std::slice::from_ref(&base),
             member,
             member_trace.as_deref_mut(),
@@ -7337,7 +7912,7 @@ fn cpp_parameter_type_list(
     ctx: CppLookupCtx<'_, '_>,
     unit: &CodeUnit,
 ) -> Option<CppParameterTypeList> {
-    let types = cpp_candidate_parameter_types(ctx.analyzer, unit)?;
+    let types = ctx.visibility.callable_parameter_types(unit)?;
     let facts = cpp_canonical_declaration_properties(ctx.analyzer, unit)?;
     let first = facts.first()?;
     if !facts
@@ -7472,14 +8047,15 @@ fn cpp_member_candidates(
         // it actually lost on. A candidate the *argument-type* filter dropped
         // has no arity verdict to state, and is left unattributed rather than
         // given one the arity check never produced.
-        let applicability = cpp_candidate_applicability(ctx.analyzer, &considered, arity);
+        let applicability =
+            cpp_candidate_applicability_in_visibility(&considered, arity, ctx.visibility);
         state.record_rejected(
             considered.iter().filter(|unit| !candidates.contains(unit)),
             RejectionReason::CallableApplicabilityDeferred,
             ApplicabilityVerdict::Inapplicable,
             Some(&applicability),
         );
-        state.stage_winners(ctx.analyzer, &candidates, arity);
+        state.stage_winners(ctx.visibility, &candidates, arity);
     }
     candidates
 }
@@ -7495,6 +8071,41 @@ fn cpp_member_candidates_lazy<F>(
 where
     F: FnOnce() -> Option<Vec<Option<CppType>>>,
 {
+    cpp_member_candidates_lazy_with_filter(
+        ctx,
+        token,
+        owners,
+        member,
+        arity,
+        resolve_arg_types,
+        move |found, resolve_arg_types| {
+            cpp_filter_candidates_by_call_lazy(
+                found,
+                arity,
+                resolve_arg_types,
+                ctx.analyzer,
+                token,
+                ctx.visibility,
+                ctx.file,
+            )
+        },
+    )
+    .0
+}
+
+fn cpp_member_candidates_lazy_with_filter<F, Filter>(
+    ctx: CppLookupCtx<'_, '_>,
+    token: QueryToken<'_>,
+    owners: Vec<CodeUnit>,
+    member: &str,
+    arity: Option<usize>,
+    resolve_arg_types: F,
+    filter_candidates: Filter,
+) -> (Vec<CodeUnit>, bool)
+where
+    F: FnOnce() -> Option<Vec<Option<CppType>>>,
+    Filter: FnOnce(Vec<CodeUnit>, F) -> Vec<CodeUnit>,
+{
     let mut member_trace = trace::recording().then(CppMemberTrace::default);
     let mut found = cpp_member_lookup(ctx, token, &owners, member, member_trace.as_mut());
     let non_callable = member_trace.is_some().then(|| {
@@ -7517,28 +8128,21 @@ where
             .cloned()
             .collect::<Vec<_>>()
     });
-    let mut candidates = cpp_filter_candidates_by_call_lazy(
-        found,
-        arity,
-        resolve_arg_types,
-        ctx.analyzer,
-        token,
-        ctx.visibility,
-        ctx.file,
-    );
+    let had_callable = !found.is_empty() || !callable_values.is_empty();
+    let mut candidates = filter_candidates(found, resolve_arg_types);
     candidates.extend(callable_values);
     sort_units(&mut candidates);
     candidates.dedup();
     if let Some(state) = member_trace.as_ref() {
         state.record_call_seam_selection(
-            ctx.analyzer,
+            ctx.visibility,
             &candidates,
             &considered.expect("a recording walk always keeps its considered set"),
             &non_callable.expect("a recording walk always keeps its non-callable set"),
             arity,
         );
     }
-    candidates
+    (candidates, had_callable)
 }
 
 fn cpp_member_candidates_lazy_with_presence<F>(
@@ -7552,50 +8156,24 @@ fn cpp_member_candidates_lazy_with_presence<F>(
 where
     F: FnOnce() -> Option<Vec<Option<CppType>>>,
 {
-    let mut member_trace = trace::recording().then(CppMemberTrace::default);
-    let mut found = cpp_member_lookup(ctx, token, &owners, member, member_trace.as_mut());
-    let non_callable = member_trace.is_some().then(|| {
-        found
-            .iter()
-            .filter(|unit| !unit.is_callable() && !unit.is_field())
-            .cloned()
-            .collect::<Vec<_>>()
-    });
-    let callable_values = found
-        .iter()
-        .filter(|unit| unit.is_field())
-        .cloned()
-        .collect::<Vec<_>>();
-    found.retain(CodeUnit::is_callable);
-    let had_callable = !found.is_empty() || !callable_values.is_empty();
-    let considered = member_trace.is_some().then(|| {
-        found
-            .iter()
-            .chain(&callable_values)
-            .cloned()
-            .collect::<Vec<_>>()
-    });
-    let mut candidates = cpp_filter_candidates_by_call_lazy_strict(
-        found,
+    cpp_member_candidates_lazy_with_filter(
+        ctx,
+        token,
+        owners,
+        member,
         arity,
         resolve_arg_types,
-        ctx.analyzer,
-        ctx.visibility,
-        ctx.file,
-    );
-    candidates.extend(callable_values);
-    sort_units(&mut candidates);
-    candidates.dedup();
-    if let Some(state) = member_trace.as_ref() {
-        state.record_call_seam_selection(
-            ctx.analyzer,
-            &candidates,
-            &considered.expect("a recording walk always keeps its considered set"),
-            &non_callable.expect("a recording walk always keeps its non-callable set"),
-            arity,
-        );
-    }
-    (candidates, had_callable)
+        move |found, resolve_arg_types| {
+            cpp_filter_candidates_by_call_lazy_strict(
+                found,
+                arity,
+                resolve_arg_types,
+                ctx.analyzer,
+                ctx.visibility,
+                ctx.file,
+            )
+        },
+    )
 }
 
 fn cpp_filter_candidates_by_call_lazy_strict<F>(
@@ -7609,23 +8187,43 @@ fn cpp_filter_candidates_by_call_lazy_strict<F>(
 where
     F: FnOnce() -> Option<Vec<Option<CppType>>>,
 {
-    let arity_filtered = cpp_filter_candidates_by_arity_strict(candidates, arity, analyzer);
-    if arity_filtered.len() <= 1 {
-        return arity_filtered;
+    let arity_filtered = cpp_filter_candidates_by_arity_strict(candidates, arity, visibility);
+    cpp_filter_candidates_after_arity(
+        arity_filtered,
+        resolve_arg_types,
+        analyzer,
+        visibility,
+        file,
+    )
+}
+
+fn cpp_filter_candidates_after_arity<F>(
+    candidates: Vec<CodeUnit>,
+    resolve_arg_types: F,
+    analyzer: &dyn IAnalyzer,
+    visibility: &CppVisibilityIndex,
+    file: &ProjectFile,
+) -> Vec<CodeUnit>
+where
+    F: FnOnce() -> Option<Vec<Option<CppType>>>,
+{
+    if candidates.len() <= 1 {
+        return candidates;
     }
     let Some(arg_types) = resolve_arg_types() else {
-        return arity_filtered;
+        return candidates;
     };
-    cpp_filter_candidates_by_call_arg_types(arity_filtered, &arg_types, analyzer, visibility, file)
+    cpp_filter_candidates_by_call_arg_types(candidates, &arg_types, analyzer, visibility, file)
 }
 
 fn cpp_direct_member_candidates(
     analyzer: &dyn IAnalyzer,
     token: QueryToken<'_>,
+    visibility: &CppVisibilityIndex,
     owners: &[CodeUnit],
     member: &str,
 ) -> Vec<CodeUnit> {
-    cpp_direct_member_candidates_traced(analyzer, token, owners, member, None, 0)
+    cpp_direct_member_candidates_traced(analyzer, token, visibility, owners, member, None, 0)
 }
 
 /// The same lookup, telling the trace which owner each candidate came from.
@@ -7635,6 +8233,7 @@ fn cpp_direct_member_candidates(
 fn cpp_direct_member_candidates_traced(
     analyzer: &dyn IAnalyzer,
     token: QueryToken<'_>,
+    visibility: &CppVisibilityIndex,
     owners: &[CodeUnit],
     member: &str,
     mut member_trace: Option<&mut CppMemberTrace>,
@@ -7650,16 +8249,18 @@ fn cpp_direct_member_candidates_traced(
             )
             .into_iter()
             .filter(|candidate| {
-                candidate.source() == owner.source()
-                    || (matches!(
-                        cpp_indexed_callable_linkage(analyzer, candidate),
-                        Some(crate::analyzer::CallableLinkage::External)
-                    ) && cpp_header_body_files_are_related(
-                        analyzer,
-                        token,
-                        owner.source(),
-                        candidate.source(),
-                    ))
+                if candidate.source() == owner.source() {
+                    return true;
+                }
+                matches!(
+                    visibility.callable_linkage(candidate),
+                    Some(crate::analyzer::CallableLinkage::External)
+                ) && cpp_header_body_files_are_related(
+                    analyzer,
+                    token,
+                    owner.source(),
+                    candidate.source(),
+                )
             })
             .collect();
         if let Some(state) = member_trace.as_deref_mut() {
@@ -7731,6 +8332,7 @@ fn cpp_inherited_member_candidates(
         let direct = cpp_direct_member_candidates_traced(
             ctx.analyzer,
             token,
+            ctx.visibility,
             &bases,
             member,
             member_trace.as_deref_mut(),
@@ -7782,13 +8384,13 @@ where
 {
     let arity_filtered =
         cpp_filter_candidates_by_arity(candidates, arity, analyzer, token, visibility);
-    if arity_filtered.len() <= 1 {
-        return arity_filtered;
-    }
-    let Some(arg_types) = resolve_arg_types() else {
-        return arity_filtered;
-    };
-    cpp_filter_candidates_by_call_arg_types(arity_filtered, &arg_types, analyzer, visibility, file)
+    cpp_filter_candidates_after_arity(
+        arity_filtered,
+        resolve_arg_types,
+        analyzer,
+        visibility,
+        file,
+    )
 }
 
 /// Keep qualified-call lookup open when every free-function candidate has a known,
@@ -7798,13 +8400,15 @@ where
 fn qualified_call_has_applicable_arity(
     candidates: &[CodeUnit],
     arity: Option<usize>,
-    analyzer: &dyn IAnalyzer,
+    visibility: &CppVisibilityIndex,
 ) -> bool {
     let Some(expected) = arity else {
         return true;
     };
     candidates.iter().any(|candidate| {
-        cpp_known_callable_arity(analyzer, candidate).is_none_or(|known| known.accepts(expected))
+        visibility
+            .callable_arity(candidate)
+            .is_none_or(|known| known.accepts(expected))
     })
 }
 
@@ -7822,7 +8426,7 @@ fn cpp_filter_candidates_by_call_arg_types(
     cpp_filter_candidates_by_args_with_parameter_types(
         candidates,
         &shared_arg_types,
-        &|candidate| cpp_candidate_parameter_types(analyzer, candidate),
+        &|candidate| visibility.callable_parameter_types(candidate),
         &|candidate| {
             cpp_canonical_declaration_properties(analyzer, candidate)
                 .is_some_and(|facts| facts.iter().any(|fact| fact.callable_is_template))
@@ -7842,7 +8446,8 @@ fn cpp_filter_candidates_by_arity(
     let Some(expected) = arity else {
         return candidates;
     };
-    let filtered = cpp_candidate_applicability(analyzer, &candidates, arity).winners;
+    let filtered =
+        cpp_candidate_applicability_in_visibility(&candidates, arity, visibility).winners;
     if filtered.is_empty() {
         candidates
     } else {
@@ -7861,7 +8466,8 @@ fn cpp_filter_candidates_by_arity(
                             visibility,
                             declaration,
                             candidate,
-                        ) && cpp_known_callable_arity(analyzer, candidate)
+                        ) && visibility
+                            .callable_arity(candidate)
                             .is_none_or(|candidate_arity| candidate_arity.accepts(expected))
                     })
             })
@@ -7890,34 +8496,16 @@ fn cpp_callable_overload_identity_matches(
         && cpp_callable_definitions_share_identity_evidence_with_visibility(
             analyzer, token, graph, visibility, left, right,
         )
-        && (cpp_candidate_parameter_types(analyzer, left)
-            == cpp_candidate_parameter_types(analyzer, right)
+        && (visibility.callable_parameter_types(left) == visibility.callable_parameter_types(right)
             || visibility.same_logical_callable(graph, left, right))
 }
 
 fn cpp_filter_candidates_by_arity_strict(
     candidates: Vec<CodeUnit>,
     arity: Option<usize>,
-    analyzer: &dyn IAnalyzer,
+    visibility: &CppVisibilityIndex,
 ) -> Vec<CodeUnit> {
-    cpp_candidate_applicability(analyzer, &candidates, arity).winners
-}
-
-fn cpp_candidate_parameter_types(analyzer: &dyn IAnalyzer, unit: &CodeUnit) -> Option<Vec<String>> {
-    analyzer
-        .signature_metadata(unit)
-        .into_iter()
-        .find_map(|metadata| metadata.callable_parameter_types().map(<[String]>::to_vec))
-}
-
-fn cpp_known_callable_arity(
-    analyzer: &dyn IAnalyzer,
-    unit: &CodeUnit,
-) -> Option<crate::analyzer::CallableArity> {
-    analyzer
-        .signature_metadata(unit)
-        .into_iter()
-        .find_map(|metadata| metadata.callable_arity())
+    cpp_candidate_applicability_in_visibility(&candidates, arity, visibility).winners
 }
 
 /// Whether `arg_type` is `param_type` or derives from it.
@@ -8183,6 +8771,20 @@ fn cpp_type_descriptor_type(
     ))
 }
 
+fn cpp_member_field_type_from_candidates(
+    analyzer: &dyn IAnalyzer,
+    visibility: &CppVisibilityIndex,
+    file: &ProjectFile,
+    candidates: &[CodeUnit],
+) -> Option<CppType> {
+    cpp_unanimous_field_type(
+        analyzer,
+        visibility,
+        file,
+        candidates.iter().filter(|unit| unit.is_field()),
+    )
+}
+
 #[allow(clippy::too_many_arguments)]
 fn cpp_field_expression_type(
     analyzer: &dyn IAnalyzer,
@@ -8236,12 +8838,7 @@ fn cpp_field_expression_type(
             "BIFROST_CPP_FIELD_TYPE_STATS member={member} candidate_types={candidate_types:?}"
         );
     }
-    cpp_unanimous_field_type(
-        analyzer,
-        visibility,
-        file,
-        candidates.iter().filter(|unit| unit.is_field()),
-    )
+    cpp_member_field_type_from_candidates(analyzer, visibility, file, &candidates)
 }
 
 fn cpp_field_declared_type(
@@ -8751,15 +9348,10 @@ fn cpp_enclosing_class_member_candidates(
 fn cpp_enclosing_class_chain(analyzer: &dyn IAnalyzer, innermost: CodeUnit) -> Vec<CodeUnit> {
     // The innermost owner is whatever enclosing-owner resolution produced, so
     // it is kept as given; only the walk outward is filtered to classes.
-    let mut chain = vec![innermost.clone()];
-    chain.extend(
-        crate::analyzer::usages::common::enclosing_owner_chain(innermost, |unit| {
-            analyzer.parent_of(unit)
-        })
-        .skip(1)
-        .take_while(CodeUnit::is_class),
-    );
-    chain
+    crate::analyzer::usages::common::enclosing_class_chain(innermost, |unit| {
+        analyzer.parent_of(unit)
+    })
+    .collect()
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -8838,13 +9430,7 @@ fn cpp_function_definition_owner(
     function: Node<'_>,
     byte: usize,
 ) -> Option<CodeUnit> {
-    let declarator = function.child_by_field_name("declarator")?;
-    let qualified = cpp_declarator_qualified_name_node(declarator)?;
-    let mut owner_parts = cpp_type_name_components(qualified, source)?;
-    owner_parts.pop()?;
-    if owner_parts.is_empty() {
-        return None;
-    }
+    let (qualified, owner_parts) = cpp_function_owner_parts(source, function)?;
     let owner = owner_parts.join("::");
     let globally_qualified = is_globally_qualified_cpp_name(qualified);
     cpp_resolve_owner_type_in_lexical_namespace(
@@ -8889,13 +9475,7 @@ fn cpp_namespace_scope_for_function(
     source: &str,
     function: Node<'_>,
 ) -> Option<Vec<String>> {
-    let declarator = function.child_by_field_name("declarator")?;
-    let qualified = cpp_declarator_qualified_name_node(declarator)?;
-    let mut owner_parts = cpp_type_name_components(qualified, source)?;
-    owner_parts.pop()?;
-    if owner_parts.is_empty() {
-        return None;
-    }
+    let (_, owner_parts) = cpp_function_owner_parts(source, function)?;
     // C++ module FQNs use dot-separated package components in the indexed
     // declaration key. The parts come from the tree-sitter qualified name.
     let owner_fqn = owner_parts.join(".");
@@ -8904,6 +9484,17 @@ fn cpp_namespace_scope_for_function(
         .into_iter()
         .any(|unit| unit.is_module())
         .then_some(owner_parts)
+}
+
+fn cpp_function_owner_parts<'tree>(
+    source: &str,
+    function: Node<'tree>,
+) -> Option<(Node<'tree>, Vec<String>)> {
+    let declarator = function.child_by_field_name("declarator")?;
+    let qualified = cpp_declarator_qualified_name_node(declarator)?;
+    let mut owner_parts = cpp_type_name_components(qualified, source)?;
+    owner_parts.pop()?;
+    (!owner_parts.is_empty()).then_some((qualified, owner_parts))
 }
 
 fn cpp_declarator_qualified_name_node(node: Node<'_>) -> Option<Node<'_>> {
@@ -9093,12 +9684,7 @@ fn cpp_enclosing_member_field_type(
         class_ranges: None,
     };
     let candidates = cpp_member_candidates(ctx, token, vec![owner], name, None, None);
-    cpp_unanimous_field_type(
-        analyzer,
-        visibility,
-        file,
-        candidates.iter().filter(|unit| unit.is_field()),
-    )
+    cpp_member_field_type_from_candidates(analyzer, visibility, file, &candidates)
 }
 
 const CPP_SCOPE_NODES: &[&str] = &[
@@ -9221,35 +9807,6 @@ fn cpp_macro_fractured_function_before(root: Node<'_>, cutoff_start: usize) -> O
         }
     }
     candidate
-}
-
-fn cpp_macro_fracture_boundary(node: Node<'_>) -> Option<usize> {
-    let first_orphan = node.next_named_sibling()?;
-    if !matches!(
-        first_orphan.kind(),
-        "expression_statement"
-            | "if_statement"
-            | "for_statement"
-            | "while_statement"
-            | "do_statement"
-            | "return_statement"
-    ) {
-        return None;
-    }
-    let mut sibling = Some(first_orphan);
-    while let Some(current) = sibling {
-        if current.kind() == "ERROR" {
-            return Some(current.end_byte());
-        }
-        if matches!(
-            current.kind(),
-            "function_definition" | "declaration" | "type_definition"
-        ) {
-            return None;
-        }
-        sibling = current.next_named_sibling();
-    }
-    None
 }
 
 #[cfg(test)]
@@ -9639,18 +10196,6 @@ fn cpp_recovered_function_declaration_scope(node: Node<'_>) -> bool {
         .any(|child| child.kind() == "ERROR" && child.start_byte() >= declarator.end_byte())
 }
 
-fn cpp_malformed_wrapper_function_definition(node: Node<'_>) -> bool {
-    node.has_error()
-        && node
-            .child_by_field_name("declarator")
-            .is_some_and(|declarator| {
-                declarator.kind() != "function_declarator"
-                    && !subtree_contains(declarator, |candidate| {
-                        candidate.kind() == "function_declarator"
-                    })
-            })
-}
-
 #[allow(clippy::too_many_arguments)]
 fn cpp_seed_typed_binding(
     analyzer: &dyn IAnalyzer,
@@ -9662,18 +10207,12 @@ fn cpp_seed_typed_binding(
     node: Node<'_>,
     bindings: &mut LocalInferenceEngine<CppType>,
 ) {
-    let Some(declarator) = node.child_by_field_name("declarator") else {
-        return;
-    };
-    let Some(name) = extract_variable_name(declarator, source) else {
+    let Some((name, declarator, type_node)) = cpp_binding_parts(node, source) else {
         return;
     };
     let type_text =
         cpp_declaration_type_text_for_declarator(visibility, file, node, declarator, source)
             .or_else(|| cpp_declaration_type_text(visibility, file, node, source));
-    let type_node = node
-        .child_by_field_name("type")
-        .or_else(|| cpp_first_type_child(node));
     cpp_seed_binding(
         analyzer,
         token,
@@ -9705,19 +10244,11 @@ fn cpp_seed_for_range_binding(
     {
         return;
     }
-    let Some(declarator) = node.child_by_field_name("declarator") else {
+    let Some((name, declarator, type_node)) = cpp_binding_parts(node, ctx.source) else {
         return;
     };
-    let Some(name) = extract_variable_name(declarator, ctx.source) else {
-        return;
-    };
-    let type_text = node
-        .child_by_field_name("type")
-        .or_else(|| cpp_first_type_child(node))
+    let type_text = type_node
         .map(|type_node| cpp_normalize_declared_type_text(cpp_node_text(type_node, ctx.source)));
-    let type_node = node
-        .child_by_field_name("type")
-        .or_else(|| cpp_first_type_child(node));
     cpp_seed_binding(
         ctx.analyzer,
         token,
@@ -9751,13 +10282,7 @@ fn cpp_seed_variable_declaration(
     let mut seeded_structured_declarator = false;
     let mut cursor = node.walk();
     for child in node.named_children(&mut cursor) {
-        let declarator = if child.kind() == "init_declarator" {
-            child.child_by_field_name("declarator")
-        } else if cpp_is_declarator_node(child) {
-            Some(child)
-        } else {
-            None
-        };
+        let declarator = declaration_declarator(node, child);
         let Some(declarator) = declarator else {
             continue;
         };
@@ -10025,20 +10550,9 @@ fn cpp_declarator_name_path_contains(declarator: Node<'_>, candidate: Node<'_>) 
     let Some(name) = cpp_declarator_name_node(declarator) else {
         return false;
     };
-    let mut current = Some(declarator);
-    while let Some(node) = current {
-        if cpp_same_node(node, candidate) {
-            return true;
-        }
-        if cpp_same_node(node, name) {
-            return false;
-        }
-        current = node
-            .child_by_field_name("declarator")
-            .or_else(|| node.child_by_field_name("name"))
-            .or_else(|| node.child_by_field_name("field"));
-    }
-    false
+    brokk_bifrost_cpp::graph::resolver::declarator_path_contains_before_name(
+        declarator, name, candidate,
+    )
 }
 
 fn cpp_normalize_declared_type_for_visibility(
@@ -10500,10 +11014,9 @@ fn cpp_type_unit_matches_name(unit: &CodeUnit, name: &str) -> bool {
 }
 
 fn cpp_namespace_relative_names(namespace: &str, name: &str) -> Vec<String> {
-    let parts = crate::analyzer::symbol_lookup::parse_symbol_path(Language::Cpp, namespace);
-    (1..=parts.len())
-        .rev()
-        .map(|len| format!("{}::{name}", parts[..len].join("::")))
+    brokk_bifrost_cpp::graph::resolver::namespace_prefixes(namespace)
+        .into_iter()
+        .map(|prefix| format!("{prefix}::{name}"))
         .collect()
 }
 
@@ -10680,9 +11193,8 @@ fn cpp_infer_type_from_value(
 ) -> Option<CppType> {
     match node.kind() {
         "new_expression" => {
-            let text = cpp_node_text(node, source).trim();
-            let rest = text.strip_prefix("new ").unwrap_or(text);
-            let type_text = rest.split(['(', '{']).next().unwrap_or(rest);
+            let type_node = cpp_new_expression_type_node(node)?;
+            let type_text = cpp_node_text(type_node, source);
             Some(CppType::from_text(analyzer, visibility, file, type_text, 1))
         }
         "call_expression" => cpp_call_return_type(
@@ -10730,6 +11242,7 @@ fn cpp_call_return_type(
                 cpp_direct_member_candidates(
                     analyzer,
                     token,
+                    visibility,
                     &[owner],
                     cpp_node_text(name, source),
                 ),
@@ -10919,16 +11432,11 @@ fn cpp_indexed_same_file_outcome(
 
 fn cpp_lexical_namespace(node: Node<'_>, source: &str) -> Option<String> {
     let mut names = Vec::new();
-    let mut current = node.parent();
-    while let Some(parent) = current {
-        if parent.kind() == "namespace_definition"
-            && let Some(name) = parent.child_by_field_name("name")
-        {
+    for parent in brokk_bifrost_cpp::declarations::enclosing_cpp_namespace_nodes(node) {
+        if let Some(name) = parent.child_by_field_name("name") {
             names.push(cpp_node_text(name, source).trim().to_string());
         }
-        current = parent.parent();
     }
-    names.reverse();
     (!names.is_empty()).then(|| names.join("::"))
 }
 
@@ -10944,12 +11452,331 @@ fn cpp_canonical_declaration_properties(
 #[cfg(test)]
 mod bounded_tests {
     use super::*;
-    use crate::analyzer::usages::receiver_analysis::ReceiverBudgetLimit;
-    use crate::path_utils::rel_path_string;
+
     use crate::searchtools::{DefinitionReferenceQuery, GetDefinitionParams};
     use crate::test_support::AnalyzerFixture;
+    use brokk_bifrost_core::analyzer::model::CodeUnitType;
+    use brokk_bifrost_test_macros::hardwon;
 
     #[test]
+    #[hardwon("#4271: visible same-FQN aliases with different structured targets were collapsed")]
+    fn cpp_visible_same_fqn_aliases_with_different_targets_stay_distinct() {
+        let root = std::env::temp_dir();
+        let first_file = ProjectFile::new(&root, "first.hpp");
+        let second_file = ProjectFile::new(&root, "second.hpp");
+        let first = CodeUnit::with_signature(
+            first_file.clone(),
+            CodeUnitType::Class,
+            "pkg",
+            "Choice",
+            Some("using Choice = Target;".to_string()),
+            false,
+        );
+        let second = CodeUnit::with_signature(
+            second_file.clone(),
+            CodeUnitType::Class,
+            "pkg",
+            "Choice",
+            Some("using Choice = Target;".to_string()),
+            false,
+        );
+        assert!(same_logical_symbol(&first, &second));
+        let first_target = CppStructuredAliasTarget::Named {
+            components: vec!["FirstTarget".to_string()],
+            global: false,
+            arguments: None,
+        };
+        let second_target = CppStructuredAliasTarget::Named {
+            components: vec!["SecondTarget".to_string()],
+            global: false,
+            arguments: None,
+        };
+        let mut aliases = vec![first, second];
+
+        collapse_same_fqn_alias_spellings_with_targets(
+            &mut aliases,
+            |_| true,
+            |_| true,
+            |unit| {
+                if unit.source() == &first_file {
+                    Some(first_target.clone())
+                } else {
+                    Some(second_target.clone())
+                }
+            },
+        );
+
+        assert_eq!(aliases.len(), 2, "distinct targets must stay ambiguous");
+    }
+
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#4407: ABI 15 template type references must retain type identity"
+    )]
+    fn cpp_template_type_classifier_rejects_expression_shapes() {
+        let source = r#"
+namespace app {
+namespace matchers {
+    template <typename T> class MatcherBase {};
+    namespace detail {
+        template <typename... Ts> class MatchAllOfGeneric {};
+    }
+    using Positive = detail::MatchAllOfGeneric<int, MatcherBase<long>>;
+}
+}
+template <typename T> constexpr int make_value();
+void valid_function_body() {
+    int value = make_value<int>();
+    auto address = &make_value<int>;
+    using CallType = decltype(make_value<int>());
+    (void)value;
+    (void)address;
+}
+namespace public_api {
+template <typename T> struct Gate {};
+namespace detail {
+    template <typename... Ts> struct Pair {};
+    template <typename T, typename U> struct Box {};
+}
+template <typename L, typename R>
+detail::Box<L, detail::Pair<L, Gate<R>>> ready(L lhs, R rhs) { return {}; }
+}
+"#;
+        let tree = parse_cpp_tree(source).expect("C++ tree");
+        let node_for = |needle: &str, occurrence: usize| {
+            let start = source
+                .match_indices(needle)
+                .nth(occurrence)
+                .map(|(start, _)| start)
+                .expect("needle occurrence");
+            tree.root_node()
+                .named_descendant_for_byte_range(start, start + needle.len())
+                .expect("named node at needle")
+        };
+
+        let positive = node_for("MatcherBase<long>", 0);
+        assert_eq!(positive.kind(), "template_type");
+        let positive_name = positive.child_by_field_name("name").expect("positive name");
+        assert!(matches!(
+            cpp_reference_node(positive_name),
+            Some(CppReferenceNode::Type(_))
+        ));
+
+        let public_positive = node_for("Gate<R>", 0);
+        assert_eq!(public_positive.kind(), "template_function");
+        let public_arguments = public_positive
+            .parent()
+            .expect("public positive template arguments");
+        assert_eq!(public_arguments.kind(), "template_argument_list");
+        let public_template = public_arguments
+            .parent()
+            .expect("public positive template type");
+        assert_eq!(public_template.kind(), "template_type");
+        assert_eq!(
+            public_template.child_by_field_name("arguments"),
+            Some(public_arguments)
+        );
+        let public_qualified = public_template
+            .parent()
+            .expect("public positive qualified identifier");
+        assert_eq!(public_qualified.kind(), "qualified_identifier");
+        assert_eq!(
+            public_qualified.child_by_field_name("name"),
+            Some(public_template)
+        );
+        let public_descriptor = public_qualified
+            .parent()
+            .expect("public positive type descriptor");
+        assert_eq!(public_descriptor.kind(), "type_descriptor");
+        assert_eq!(
+            public_descriptor.child_by_field_name("type"),
+            Some(public_qualified)
+        );
+        let public_name = public_positive
+            .child_by_field_name("name")
+            .expect("public positive name");
+        assert!(matches!(
+            cpp_reference_node(public_name),
+            Some(CppReferenceNode::Type(_))
+        ));
+
+        let call = node_for("make_value<int>", 0);
+        assert_eq!(call.kind(), "template_function");
+        let call_name = call.child_by_field_name("name").expect("call name");
+        assert!(matches!(
+            cpp_reference_node(call_name),
+            Some(CppReferenceNode::Call(_))
+        ));
+
+        let address = node_for("make_value<int>", 1);
+        assert_eq!(address.kind(), "template_function");
+        let address_name = address.child_by_field_name("name").expect("address name");
+        assert!(cpp_reference_node(address_name).is_none());
+
+        let decltype_call = node_for("make_value<int>", 2);
+        assert_eq!(decltype_call.kind(), "template_function");
+        let decltype_name = decltype_call
+            .child_by_field_name("name")
+            .expect("decltype call name");
+        assert!(matches!(
+            cpp_reference_node(decltype_name),
+            Some(CppReferenceNode::Call(_))
+        ));
+    }
+
+    #[test]
+    #[hardwon(
+        "cd472d9c1eff: Checks a focused C++ namespace qualifier does not navigate to a neighboring type with similar range context"
+    )]
+    fn focused_namespace_qualifier_does_not_return_the_adjacent_type() {
+        let fixture = AnalyzerFixture::new_for_language(
+            Language::Cpp,
+            &[(
+                "main.cpp",
+                "namespace helpers { struct Pool {}; }\nvoid owner() { helpers::Pool p; }\n",
+            )],
+        );
+        let result = crate::searchtools::get_definitions_by_reference(
+            fixture.analyzer.analyzer(),
+            crate::searchtools::GetDefinitionByReferenceParams {
+                references: vec![crate::searchtools::DefinitionContextReferenceQuery {
+                    symbol: "owner".to_string(),
+                    context: "void owner() { helpers::Pool p; }".to_string(),
+                    target: "helpers".to_string(),
+                }],
+            },
+        );
+
+        assert!(
+            result.results[0]
+                .definitions
+                .iter()
+                .all(|definition| definition.name != "Pool"),
+            "{result:#?}"
+        );
+    }
+
+    #[test]
+    #[hardwon(
+        "1c570a35813e: Parser-recovery case verifies a recovered C++ function declaration still defines a local scope boundary"
+    )]
+    fn recovered_function_declaration_is_a_local_scope() {
+        let source =
+            "namespace n {\nprivate:\nvoid flatten(const T& value) BROKEN {\n{ value.type(); }\n";
+        let tree = parse_cpp_tree(source).expect("C++ recovery tree");
+        let focus = source.find("value.type").expect("parameter receiver");
+        let node = tree
+            .root_node()
+            .named_descendant_for_byte_range(focus, focus + "value".len())
+            .expect("focused receiver node");
+        let scope = cpp_enclosing_local_scope(node).expect("recovered function scope");
+
+        assert_eq!(scope.kind(), "declaration");
+        assert!(cpp_recovered_function_declaration_scope(scope));
+        assert_eq!(
+            scope
+                .child_by_field_name("declarator")
+                .map(|node| node.kind()),
+            Some("function_declarator")
+        );
+    }
+
+    #[test]
+    #[hardwon(
+        "31982bd4d78a: Preprocessor fixture ensures recovered local declarations bind only within the same conditional branch"
+    )]
+    fn local_binding_recovery_matches_only_the_same_preprocessor_branch() {
+        let source = r#"void use(int value);
+void run(void) {
+#if OUTER
+    int same = 1;
+#if INNER
+    int nested = 2;
+#else
+    int sibling = 3;
+#endif
+    use(same);
+#else
+    int other = 4;
+#endif
+}
+"#;
+        let tree = parse_cpp_tree(source).expect("C++ tree");
+        let node_at = |needle: &str, token: &str| {
+            let start = source.find(needle).expect("fixture needle")
+                + needle.find(token).expect("token in fixture needle");
+            tree.root_node()
+                .named_descendant_for_byte_range(start, start + token.len())
+                .expect("fixture token node")
+        };
+        let reference = node_at("use(same)", "same");
+        let same = node_at("int same", "same");
+        let nested = node_at("int nested", "nested");
+        let sibling = node_at("int sibling", "sibling");
+        let other = node_at("int other", "other");
+
+        assert!(cpp_nodes_share_preprocessor_branch(same, reference));
+        assert!(!cpp_nodes_share_preprocessor_branch(nested, reference));
+        assert!(!cpp_nodes_share_preprocessor_branch(sibling, reference));
+        assert!(!cpp_nodes_share_preprocessor_branch(other, reference));
+    }
+
+    #[test]
+    #[hardwon(
+        "0e6df36dfa5d: C++ template fixture prevents a class alias from resolving recursively inside its own declaration argument"
+    )]
+    fn class_alias_is_not_visible_in_its_own_template_argument() {
+        let source = r#"
+namespace lib {
+template<typename T> struct wrapper {};
+struct value_type {};
+struct holder {
+    using value_type = wrapper<value_type>;
+};
+}
+"#;
+        let fixture = AnalyzerFixture::new_for_language(Language::Cpp, &[("alias.hpp", source)]);
+        let analyzer = fixture.analyzer.analyzer();
+        let alias = analyzer
+            .get_all_declarations()
+            .into_iter()
+            .find(|unit| unit.fq_name().ends_with("holder$value_type"))
+            .expect("member alias");
+        let tree = parse_cpp_tree(source).expect("C++ tree");
+        let start = source
+            .find("wrapper<value_type>")
+            .expect("alias right-hand type")
+            + "wrapper<".len();
+        let node = tree
+            .root_node()
+            .named_descendant_for_byte_range(start, start + "value_type".len())
+            .expect("alias right-hand type node");
+
+        assert_eq!(node.kind(), "type_identifier");
+        assert!(cpp_type_alias_declaration_contains_node(
+            analyzer, &alias, node
+        ));
+    }
+
+    #[test]
+    fn capitalized_c_api_names_keep_the_c_cpp_shape_split() {
+        let root = std::env::temp_dir();
+        let c_file = ProjectFile::new(root.clone(), "main.c");
+        let cpp_file = ProjectFile::new(root, "main.cpp");
+
+        assert!(is_c_source_file(&c_file));
+        assert!(!is_c_source_file(&cpp_file));
+        assert!(cpp_written_reference_is_type_shaped("PQexec"));
+        assert!(!cpp_written_reference_is_type_shaped("getenv"));
+        assert!(is_c_source_file(&c_file) || !cpp_written_reference_is_type_shaped("PQexec"));
+        assert!(!(is_c_source_file(&cpp_file) || !cpp_written_reference_is_type_shaped("PQexec")));
+        assert!(is_c_source_file(&cpp_file) || !cpp_written_reference_is_type_shaped("getenv"));
+    }
+
+    #[test]
+    #[hardwon(
+        "0029e7d9886a: an unknown-arity C macro suppressed unanimous call-result receiver inference"
+    )]
     fn unknown_macro_arity_uses_unanimous_c_call_return_type_for_receiver() {
         let source = r#"#include UNKNOWN_BUILD_HEADER
 struct pending { struct pending *next; };
@@ -10989,6 +11816,7 @@ void advance(ring_t *ring) { get(ring, ring->count - 2)->next = 0; }
     }
 
     #[test]
+    #[hardwon("8ff0108f8253: definition navigation entered a non-callable prototype declaration")]
     fn definition_navigation_enters_only_callable_prototype_declarations() {
         let fixture = AnalyzerFixture::new_for_language(
             Language::Cpp,
@@ -11024,35 +11852,9 @@ void advance(ring_t *ring) { get(ring, ring->count - 2)->next = 0; }
     }
 
     #[test]
-    fn focused_namespace_qualifier_does_not_return_the_adjacent_type() {
-        let fixture = AnalyzerFixture::new_for_language(
-            Language::Cpp,
-            &[(
-                "main.cpp",
-                "namespace helpers { struct Pool {}; }\nvoid owner() { helpers::Pool p; }\n",
-            )],
-        );
-        let result = crate::searchtools::get_definitions_by_reference(
-            fixture.analyzer.analyzer(),
-            crate::searchtools::GetDefinitionByReferenceParams {
-                references: vec![crate::searchtools::DefinitionContextReferenceQuery {
-                    symbol: "owner".to_string(),
-                    context: "void owner() { helpers::Pool p; }".to_string(),
-                    target: "helpers".to_string(),
-                }],
-            },
-        );
-
-        assert!(
-            result.results[0]
-                .definitions
-                .iter()
-                .all(|definition| definition.name != "Pool"),
-            "{result:#?}"
-        );
-    }
-
-    #[test]
+    #[hardwon(
+        "a787c7778210: canonical navigation lost a tagged struct body behind an identical typedef"
+    )]
     fn reachable_identical_typedef_still_navigates_to_its_tagged_struct_body() {
         let fixture = AnalyzerFixture::new_for_language(
             Language::Cpp,
@@ -11094,6 +11896,7 @@ void advance(ring_t *ring) { get(ring, ring->count - 2)->next = 0; }
     }
 
     #[test]
+    #[hardwon("2cdd8b65c095: owner lookup failed through a reference declarator")]
     fn qualified_name_descends_through_reference_declarator() {
         let source = "C& C::operator<<(bool) { return helper(); }";
         let tree = parse_cpp_tree(source).expect("C++ tree");
@@ -11126,166 +11929,20 @@ void advance(ring_t *ring) { get(ring, ring->count - 2)->next = 0; }
             "struct Service {{ void run() {{}} }};\n\n\
              void use(Service* service) {{\n{statements}    {expression};\n}}\n"
         );
-        let fixture =
-            AnalyzerFixture::new_for_language(Language::Cpp, &[("receiver.cpp", &source)]);
-        let file = ProjectFile::new(fixture.project_root(), "receiver.cpp");
-        let tree = parse_cpp_tree(&source).expect("C++ tree");
-        let expression_start = source.rfind(&expression).expect("C++ member call");
-        let start_byte = expression_start + expression.rfind("run").expect("member name");
-        let end_byte = start_byte + "run".len();
-        let start_line = source[..start_byte]
-            .bytes()
-            .filter(|byte| *byte == b'\n')
-            .count()
-            + 1;
-        let site = ResolvedReferenceSite {
-            path: rel_path_string(&file),
-            text: "run".to_string(),
-            range: Range {
-                start_byte,
-                end_byte,
-                start_line,
-                end_line: start_line,
-            },
-            focus_start_byte: start_byte,
-            focus_end_byte: end_byte,
-        };
-        (fixture, file, source, tree, site)
+        crate::analyzer::usages::test_support::wide_deep_member_fixture(
+            Language::Cpp,
+            "receiver.cpp",
+            source,
+            &expression,
+            "run",
+            parse_cpp_tree,
+        )
     }
 
     #[test]
-    fn recovered_function_declaration_is_a_local_scope() {
-        let source =
-            "namespace n {\nprivate:\nvoid flatten(const T& value) BROKEN {\n{ value.type(); }\n";
-        let tree = parse_cpp_tree(source).expect("C++ recovery tree");
-        let focus = source.find("value.type").expect("parameter receiver");
-        let node = tree
-            .root_node()
-            .named_descendant_for_byte_range(focus, focus + "value".len())
-            .expect("focused receiver node");
-        let scope = cpp_enclosing_local_scope(node).expect("recovered function scope");
-
-        assert_eq!(scope.kind(), "declaration");
-        assert!(cpp_recovered_function_declaration_scope(scope));
-        assert_eq!(
-            scope
-                .child_by_field_name("declarator")
-                .map(|node| node.kind()),
-            Some("function_declarator")
-        );
-    }
-
-    #[test]
-    fn local_binding_recovery_matches_only_the_same_preprocessor_branch() {
-        let source = r#"void use(int value);
-void run(void) {
-#if OUTER
-    int same = 1;
-#if INNER
-    int nested = 2;
-#else
-    int sibling = 3;
-#endif
-    use(same);
-#else
-    int other = 4;
-#endif
-}
-"#;
-        let tree = parse_cpp_tree(source).expect("C++ tree");
-        let node_at = |needle: &str, token: &str| {
-            let start = source.find(needle).expect("fixture needle")
-                + needle.find(token).expect("token in fixture needle");
-            tree.root_node()
-                .named_descendant_for_byte_range(start, start + token.len())
-                .expect("fixture token node")
-        };
-        let reference = node_at("use(same)", "same");
-        let same = node_at("int same", "same");
-        let nested = node_at("int nested", "nested");
-        let sibling = node_at("int sibling", "sibling");
-        let other = node_at("int other", "other");
-
-        assert!(cpp_nodes_share_preprocessor_branch(same, reference));
-        assert!(!cpp_nodes_share_preprocessor_branch(nested, reference));
-        assert!(!cpp_nodes_share_preprocessor_branch(sibling, reference));
-        assert!(!cpp_nodes_share_preprocessor_branch(other, reference));
-    }
-
-    #[test]
-    fn class_alias_is_not_visible_in_its_own_template_argument() {
-        let source = r#"
-namespace lib {
-template<typename T> struct wrapper {};
-struct value_type {};
-struct holder {
-    using value_type = wrapper<value_type>;
-};
-}
-"#;
-        let fixture = AnalyzerFixture::new_for_language(Language::Cpp, &[("alias.hpp", source)]);
-        let analyzer = fixture.analyzer.analyzer();
-        let alias = analyzer
-            .get_all_declarations()
-            .into_iter()
-            .find(|unit| unit.fq_name().ends_with("holder$value_type"))
-            .expect("member alias");
-        let tree = parse_cpp_tree(source).expect("C++ tree");
-        let start = source
-            .find("wrapper<value_type>")
-            .expect("alias right-hand type")
-            + "wrapper<".len();
-        let node = tree
-            .root_node()
-            .named_descendant_for_byte_range(start, start + "value_type".len())
-            .expect("alias right-hand type node");
-
-        assert_eq!(node.kind(), "type_identifier");
-        assert!(cpp_type_alias_declaration_contains_node(
-            analyzer, &alias, node
-        ));
-    }
-
-    #[test]
-    fn bounded_cpp_wide_deep_walk_stops_without_partial_result() {
-        let (fixture, file, source, tree, site) = wide_deep_member_fixture();
-        let outcome = resolve_cpp_bounded(
-            fixture.analyzer.analyzer(),
-            &file,
-            &source,
-            Some(&tree),
-            &site,
-            ReceiverAnalysisBudget::tiny(),
-            None,
-        );
-
-        assert!(matches!(
-            outcome,
-            BoundedResolution::Exceeded {
-                limit: ReceiverBudgetLimit::ScopeNodes,
-                ..
-            }
-        ));
-    }
-
-    #[test]
-    fn bounded_cpp_wide_deep_walk_honors_mid_walk_cancellation() {
-        let (fixture, file, source, tree, site) = wide_deep_member_fixture();
-        let cancellation = CancellationToken::cancel_after_checks_for_test(12);
-        let outcome = resolve_cpp_bounded(
-            fixture.analyzer.analyzer(),
-            &file,
-            &source,
-            Some(&tree),
-            &site,
-            ReceiverAnalysisBudget::default(),
-            Some(&cancellation),
-        );
-
-        assert!(matches!(outcome, BoundedResolution::Cancelled { .. }));
-    }
-
-    #[test]
+    #[hardwon(
+        "eff59cd0d2a2: initializer inference rebuilt C++ bindings instead of reusing the seeded binding"
+    )]
     fn initializer_inference_reuses_seeded_bindings() {
         let declarations = (1..=16)
             .map(|index| format!("    auto& value{index} = value{}.next();\n", index - 1))
@@ -11348,5 +12005,44 @@ struct holder {
             builds, 1,
             "initializer inference must reuse the source-ordered binding engine"
         );
+    }
+
+    #[test]
+    fn bounded_cpp_wide_deep_walk_stops_without_partial_result() {
+        let (fixture, file, source, tree, site) = wide_deep_member_fixture();
+        let outcome = resolve_cpp_bounded(
+            fixture.analyzer.analyzer(),
+            &file,
+            &source,
+            Some(&tree),
+            &site,
+            ReceiverAnalysisBudget::tiny(),
+            None,
+        );
+
+        assert!(matches!(
+            outcome,
+            BoundedResolution::Exceeded {
+                limit: ReceiverBudgetLimit::ScopeNodes,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn bounded_cpp_wide_deep_walk_honors_mid_walk_cancellation() {
+        let (fixture, file, source, tree, site) = wide_deep_member_fixture();
+        let cancellation = CancellationToken::cancel_after_checks_for_test(12);
+        let outcome = resolve_cpp_bounded(
+            fixture.analyzer.analyzer(),
+            &file,
+            &source,
+            Some(&tree),
+            &site,
+            ReceiverAnalysisBudget::default(),
+            Some(&cancellation),
+        );
+
+        assert!(matches!(outcome, BoundedResolution::Cancelled { .. }));
     }
 }

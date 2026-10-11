@@ -1,11 +1,12 @@
 use super::dependency::admit_into_full_diagnostics;
 use super::validate::is_canonical_relative_path;
 use super::{
-    ActivationSelector, AuthoredSemanticModelPack, Compatibility, Completeness, Provenance, Safety,
-    SuppressedDiagnostics,
+    ActivationSelector, AuthoredSemanticModelPack, AuthoredShard, Compatibility, Completeness,
+    Producer, Provenance, Safety, SuppressedDiagnostics, carried_source_paths,
 };
 use crate::CancellationToken;
 use crate::analyzer::canonical_hash::{lower_hex_string, sha256_bytes};
+use crate::analyzer::common::bounded_message;
 use std::fs::File;
 use std::io::Read;
 use std::path::{Component, Path, PathBuf};
@@ -118,6 +119,73 @@ impl ArtifactProduction {
     }
 }
 
+pub(crate) fn failed_artifact_production(
+    code: &str,
+    message: impl Into<String>,
+    limits: &ArtifactProducerLimits,
+) -> ArtifactProduction {
+    ArtifactProduction::failed(
+        ProducerDiagnostic {
+            severity: ProducerDiagnosticSeverity::Error,
+            source_entry: None,
+            code: code.to_owned(),
+            location: None,
+            declaration: None,
+            message: message.into(),
+        },
+        limits,
+    )
+}
+
+pub(crate) fn finish_authored_pack_production(
+    request: &ArtifactProductionRequest,
+    artifact_sha256: &str,
+    producer_name: &str,
+    language: &str,
+    diagnostics: Vec<ProducerDiagnostic>,
+    suppressed_diagnostics: SuppressedDiagnostics,
+    mut shards: Vec<AuthoredShard>,
+) -> ArtifactProduction {
+    for shard in &mut shards {
+        for selector in &mut shard.activation {
+            selector.artifact_sha256 = Some(artifact_sha256.to_owned());
+        }
+    }
+    let completeness = if diagnostics.is_empty() && suppressed_diagnostics.total() == 0 {
+        Completeness::Complete
+    } else {
+        Completeness::Partial
+    };
+    let carried_sources = carried_source_paths(&shards);
+    let pack = (!shards.is_empty()).then(|| AuthoredSemanticModelPack {
+        schema_version: super::SEMANTIC_MODEL_SCHEMA_VERSION,
+        pack_id: request.pack_id.clone(),
+        version: request.pack_version.clone(),
+        producer: Producer {
+            name: producer_name.to_owned(),
+            version: env!("CARGO_PKG_VERSION").to_owned(),
+        },
+        language: language.to_owned(),
+        ecosystem: request.ecosystem.clone(),
+        compatibility: request.compatibility.clone(),
+        provenance: request.provenance.clone(),
+        license: request.license.clone(),
+        completeness,
+        safety: request.safety.clone(),
+        carried_sources,
+        cpp_portability: None,
+        python_correspondence: None,
+        shards,
+    });
+    ArtifactProduction {
+        artifact_sha256: Some(artifact_sha256.to_owned()),
+        pack,
+        completeness,
+        diagnostics,
+        suppressed_diagnostics,
+    }
+}
+
 pub trait ExternalArtifactPackProducer {
     fn produce_exact_artifact(
         &self,
@@ -173,6 +241,69 @@ impl ExactSourceEntry {
 }
 
 impl ExactArtifact {
+    /// Reconstruct an exact source-set artifact from durable source rows.
+    ///
+    /// The digest is derived from the normalized paths and bytes. Callers
+    /// cannot provide or override it, and the path is used only as diagnostic
+    /// context; it never participates in the source identity.
+    pub fn from_source_entries(
+        path: PathBuf,
+        entries: Vec<(String, Vec<u8>)>,
+        max_path_depth: usize,
+        limits: &ArtifactProducerLimits,
+    ) -> Result<Self, ProducerDiagnostic> {
+        let mut normalized = entries
+            .into_iter()
+            .map(|(path, bytes)| {
+                let (normalized, _) =
+                    normalize_source_set_path(Path::new(&path), max_path_depth, limits)?;
+                Ok(ExactSourceEntry {
+                    relative_path: normalized,
+                    bytes,
+                })
+            })
+            .collect::<Result<Vec<_>, ProducerDiagnostic>>()?;
+        if normalized.is_empty() {
+            return Err(source_set_diagnostic(
+                "artifact.source_set_empty",
+                &path,
+                "exact source set must contain at least one selected file",
+                limits,
+            ));
+        }
+        normalized.sort_by(|left, right| left.relative_path.cmp(&right.relative_path));
+        if normalized
+            .windows(2)
+            .any(|entries| entries[0].relative_path == entries[1].relative_path)
+        {
+            return Err(source_set_diagnostic(
+                "artifact.source_set_duplicate",
+                &path,
+                "exact source set contains a duplicate normalized path",
+                limits,
+            ));
+        }
+        let bytes = canonical_source_set_bytes(&normalized);
+        if bytes.len() as u64 > limits.max_artifact_bytes {
+            return Err(source_set_diagnostic(
+                "limit.artifact_bytes",
+                &path,
+                format!(
+                    "exact source set exceeds {} bytes",
+                    limits.max_artifact_bytes
+                ),
+                limits,
+            ));
+        }
+        let sha256 = lower_hex_string(&sha256_bytes(&bytes));
+        Ok(Self {
+            path,
+            bytes,
+            source_entries: normalized,
+            sha256,
+        })
+    }
+
     pub fn path(&self) -> &Path {
         &self.path
     }
@@ -394,10 +525,8 @@ pub(crate) fn read_exact_source_set_while(
         ));
     }
 
-    let mut entries = Vec::with_capacity(normalized_paths.len());
-    let mut canonical_bytes = Vec::new();
-    canonical_bytes.extend_from_slice(b"bifrost.exact-source-set.v1\0");
-    canonical_bytes.extend_from_slice(&(normalized_paths.len() as u64).to_le_bytes());
+    let selected_path_count = normalized_paths.len();
+    let mut entries = Vec::with_capacity(selected_path_count);
     for (normalized, relative) in normalized_paths {
         if is_cancelled() {
             return Err(source_set_diagnostic(
@@ -441,7 +570,15 @@ pub(crate) fn read_exact_source_set_while(
                 limits,
             ));
         }
-        let consumed = canonical_bytes.len() as u64;
+        let consumed = entries
+            .iter()
+            .map(|entry: &ExactSourceEntry| {
+                16_u64
+                    .saturating_add(entry.relative_path.len() as u64)
+                    .saturating_add(entry.bytes.len() as u64)
+            })
+            .sum::<u64>()
+            .saturating_add(36);
         let framing_bytes = 16_u64.saturating_add(normalized.len() as u64);
         let remaining = limits
             .max_artifact_bytes
@@ -500,22 +637,34 @@ pub(crate) fn read_exact_source_set_while(
             }
             bytes.extend_from_slice(&buffer[..read]);
         }
-        canonical_bytes.extend_from_slice(&(normalized.len() as u64).to_le_bytes());
-        canonical_bytes.extend_from_slice(normalized.as_bytes());
-        canonical_bytes.extend_from_slice(&(bytes.len() as u64).to_le_bytes());
-        canonical_bytes.extend_from_slice(&bytes);
         entries.push(ExactSourceEntry {
             relative_path: normalized,
             bytes,
         });
     }
 
-    Ok(ExactArtifact {
-        path: root.to_path_buf(),
-        sha256: lower_hex_string(&sha256_bytes(&canonical_bytes)),
-        bytes: canonical_bytes,
-        source_entries: entries,
-    })
+    ExactArtifact::from_source_entries(
+        root.to_path_buf(),
+        entries
+            .into_iter()
+            .map(|entry| (entry.relative_path, entry.bytes))
+            .collect(),
+        max_path_depth,
+        limits,
+    )
+}
+
+fn canonical_source_set_bytes(entries: &[ExactSourceEntry]) -> Vec<u8> {
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(b"bifrost.exact-source-set.v1\0");
+    bytes.extend_from_slice(&(entries.len() as u64).to_le_bytes());
+    for entry in entries {
+        bytes.extend_from_slice(&(entry.relative_path.len() as u64).to_le_bytes());
+        bytes.extend_from_slice(entry.relative_path.as_bytes());
+        bytes.extend_from_slice(&(entry.bytes.len() as u64).to_le_bytes());
+        bytes.extend_from_slice(&entry.bytes);
+    }
+    bytes
 }
 
 fn normalize_source_set_path(
@@ -676,14 +825,7 @@ impl BoundedProducerDiagnostics {
         location: Option<String>,
         message: impl Into<String>,
     ) {
-        self.push(
-            ProducerDiagnosticSeverity::Warning,
-            code,
-            location,
-            None,
-            None,
-            message,
-        );
+        self.warning_for_source_entry(code, location, None, message);
     }
 
     pub fn warning_for_declaration(
@@ -810,21 +952,10 @@ impl BoundedProducerDiagnostics {
     }
 }
 
-fn bounded_message(mut message: String, max_bytes: usize) -> String {
-    if message.len() <= max_bytes {
-        return message;
-    }
-    let mut boundary = max_bytes;
-    while boundary > 0 && !message.is_char_boundary(boundary) {
-        boundary -= 1;
-    }
-    message.truncate(boundary);
-    message
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use brokk_bifrost_test_macros::hardwon;
     use std::cell::Cell;
     use std::io::Write;
 
@@ -968,6 +1099,7 @@ mod tests {
     }
 
     #[test]
+    #[hardwon("#2876: producer diagnostic cap failed to retain errors and bound messages")]
     fn diagnostic_collection_is_count_and_message_bounded() {
         let limits = ArtifactProducerLimits {
             max_diagnostics: 1,
@@ -1026,6 +1158,7 @@ mod tests {
     }
 
     #[test]
+    #[hardwon("#2761: rejected source paths could be mistaken for exact entry identity")]
     fn source_entry_identity_is_kept_exact_or_left_anonymous() {
         let limits = ArtifactProducerLimits {
             max_diagnostic_message_bytes: 16,

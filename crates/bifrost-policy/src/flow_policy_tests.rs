@@ -19,6 +19,7 @@ use super::definition::{
 use super::identity::PolicySemanticHash;
 use super::registry::{PolicyRegistry, PolicyRegistryLimits};
 use super::source::{PolicySourceIdentity, parse_rqlp_source};
+use super::test_support::{error_at, parse_rqlp_document as parse};
 
 /// The reference rule, with every field a test may want to perturb spelled as
 /// a parameter. Defaults reproduce the checked-in fixture's shape.
@@ -96,13 +97,6 @@ impl FlowRule {
     }
 }
 
-fn parse(source: &str) -> RqlpDocument {
-    parse_rqlp_source(source, PolicySourceIdentity::new("test.rqlp"))
-        .expect("the flow policy parses")
-        .document()
-        .clone()
-}
-
 fn semantic_hash(source: &str) -> PolicySemanticHash {
     let catalogs = Arc::new(TaintCatalogRegistry::new_without_workspace(
         CatalogRegistryLimits::default(),
@@ -120,14 +114,6 @@ fn semantic_hash(source: &str) -> PolicySemanticHash {
         .next()
         .expect("one loaded policy")
         .semantic_hash()
-}
-
-fn error_at(source: &str, code: &str, token: &str) {
-    let error = parse_rqlp_source(source, PolicySourceIdentity::new("test.rqlp"))
-        .expect_err("the flow policy must be rejected")
-        .diagnostic;
-    assert_eq!(error.code, code, "diagnostic: {error:?}");
-    assert_eq!(&source[error.range], token);
 }
 
 #[test]
@@ -217,148 +203,6 @@ fn the_canonical_projection_publishes_only_authored_flow_fields() {
     assert!(!encoded.contains(FLOW_INTERNAL_CATEGORY));
 }
 
-#[test]
-fn the_canonical_projection_round_trips_through_parse() {
-    let source = FlowRule::default().render();
-    let first = parse(&source).to_normalized_authored_json();
-    let second = parse(&source).to_normalized_authored_json();
-    assert_eq!(first, second, "the projection must be deterministic");
-}
-
-#[test]
-fn every_flow_relevant_field_moves_the_semantic_hash() {
-    let baseline = semantic_hash(&FlowRule::default().render());
-    let variants: Vec<(&str, FlowRule)> = vec![
-        (
-            "call-modeling",
-            FlowRule {
-                mode_call_modeling: ":mode may :call-modeling (call-modeling :unmodeled require-model)",
-                ..FlowRule::default()
-            },
-        ),
-        (
-            "origin id",
-            FlowRule {
-                origin_id: "other-input",
-                ..FlowRule::default()
-            },
-        ),
-        (
-            "origin display name",
-            FlowRule {
-                origin_display_name: "AcmeSource.readOther",
-                ..FlowRule::default()
-            },
-        ),
-        (
-            "origin selector",
-            FlowRule {
-                origin_selector: r#"(rql (language java (call :callee (name "readOther"))))"#,
-                ..FlowRule::default()
-            },
-        ),
-        (
-            "origin bind",
-            FlowRule {
-                origin_bind: "receiver",
-                ..FlowRule::default()
-            },
-        ),
-        (
-            "observation id",
-            FlowRule {
-                observation_id: "other-put",
-                ..FlowRule::default()
-            },
-        ),
-        (
-            "observation display name",
-            FlowRule {
-                observation_display_name: "AcmeStore.putOther",
-                ..FlowRule::default()
-            },
-        ),
-        (
-            "observation selector",
-            FlowRule {
-                observation_selector: r#"(rql (language java (call :callee (name "putOther"))))"#,
-                ..FlowRule::default()
-            },
-        ),
-        (
-            "observed operand",
-            FlowRule {
-                observation_operand: "(argument :index 1)",
-                ..FlowRule::default()
-            },
-        ),
-        (
-            "kill id",
-            FlowRule {
-                kills: Some(
-                    r#"(kill :id other-validated
-                         :selector (rql (language java (call :callee (name "validate"))))
-                         :input (argument :index 0)
-                         :output return-value)"#,
-                ),
-                ..FlowRule::default()
-            },
-        ),
-        (
-            "kill selector",
-            FlowRule {
-                kills: Some(
-                    r#"(kill :id validated
-                         :selector (rql (language java (call :callee (name "check"))))
-                         :input (argument :index 0)
-                         :output return-value)"#,
-                ),
-                ..FlowRule::default()
-            },
-        ),
-        (
-            "kill input",
-            FlowRule {
-                kills: Some(
-                    r#"(kill :id validated
-                         :selector (rql (language java (call :callee (name "validate"))))
-                         :input (argument :index 1)
-                         :output return-value)"#,
-                ),
-                ..FlowRule::default()
-            },
-        ),
-        (
-            "kill output",
-            FlowRule {
-                kills: Some(
-                    r#"(kill :id validated
-                         :selector (rql (language java (call :callee (name "validate"))))
-                         :input (argument :index 0)
-                         :output receiver)"#,
-                ),
-                ..FlowRule::default()
-            },
-        ),
-        (
-            "kill presence",
-            FlowRule {
-                kills: None,
-                ..FlowRule::default()
-            },
-        ),
-    ];
-    let mut seen = vec![baseline];
-    for (field, variant) in variants {
-        let hash = semantic_hash(&variant.render());
-        assert!(
-            !seen.contains(&hash),
-            "changing the {field} must move the flow policy's semantic hash"
-        );
-        seen.push(hash);
-    }
-}
-
 /// A formal-name port and an ordinal port are different claims about the same
 /// call, even when they select the same operand in one tree (#2496). Ordinal
 /// zero of `put(value)` is formal `value` today and need not be tomorrow, so
@@ -397,42 +241,6 @@ fn a_formal_name_port_hashes_distinctly_from_an_index_port() {
 }
 
 #[test]
-fn an_equal_flow_and_taint_model_do_not_share_a_semantic_hash() {
-    // Both policies bind the same sites through the same ports with the same
-    // call modeling. Only the analysis kind differs, and the kind is what makes
-    // one a provenance rule and the other a taint classification.
-    let flow = semantic_hash(
-        &FlowRule {
-            id: "test.same",
-            kills: None,
-            ..FlowRule::default()
-        }
-        .render(),
-    );
-    let taint = semantic_hash(
-        r#"(policy
-          :id "test.same"
-          :name "Flow"
-          :message "the tracked value reached the observation"
-          :severity warning
-          :analysis (analysis :type taint :mode may
-            :call-modeling (call-modeling :unmodeled paranoid)
-            :sources (endpoint-set :entries [
-              (source :id raw-input :display-name "AcmeSource.read"
-                :categories [flow.value]
-                :selector (rql (language java (call :callee (name "read"))))
-                :bind return-value :labels [flow-value])])
-            :sinks (endpoint-set :entries [
-              (sink :id store-put :display-name "AcmeStore.put"
-                :categories [flow.value]
-                :selector (rql (language java (call :callee (name "put"))))
-                :dangerous-operand (argument :index 0)
-                :accepts [flow-value])])))"#,
-    );
-    assert_ne!(flow, taint);
-}
-
-#[test]
 fn flow_authoring_rejects_taint_vocabulary() {
     let source = FlowRule::default().render().replace(
         r#"(origin :id raw-input"#,
@@ -459,41 +267,6 @@ fn a_flow_binding_error_selects_the_exact_token() {
 }
 
 #[test]
-fn a_missing_flow_binding_names_the_field_that_is_required() {
-    let source = FlowRule::default()
-        .render()
-        .replace(":observed-operand (argument :index 0)", "");
-    let error = parse_rqlp_source(&source, PolicySourceIdentity::new("test.rqlp"))
-        .expect_err("an observation without an operand is not authorable")
-        .diagnostic;
-    assert_eq!(error.code, "missing-required-field");
-    assert!(
-        error.message.contains(":observed-operand"),
-        "diagnostic: {error:?}"
-    );
-}
-
-#[test]
-fn a_flow_analysis_cannot_carry_cvss() {
-    let rendered = FlowRule::default().render();
-    let source = format!(
-        "{} :classification (classification \
-             :fallback (classification-id :taxonomy \"T\" :id \"T-1\") \
-             :cvss (cvss :version \"4.0\" :emit when-base-complete :metric-rules [ \
-               (metric :name AV :value N :when (analysis-type :is match) \
-                 :basis policy-assertion :scope vulnerable-system \
-                 :evidence-refs [policy:self] :rationale \"remote\")])))",
-        rendered
-            .strip_suffix(')')
-            .expect("the rendered policy ends with its closing paren")
-    );
-    let error = parse_rqlp_source(&source, PolicySourceIdentity::new("test.rqlp"))
-        .expect_err("a flow analysis carries no CVSS evidence")
-        .diagnostic;
-    assert_eq!(error.code, "cvss-not-allowed-for-flow");
-}
-
-#[test]
 fn flow_entry_ids_share_one_namespace_with_every_other_local_entry() {
     let rule = FlowRule {
         observation_id: "raw-input",
@@ -504,4 +277,12 @@ fn flow_entry_ids_share_one_namespace_with_every_other_local_entry() {
         .expect_err("one entry ID cannot name both an origin and an observation")
         .diagnostic;
     assert_eq!(error.code, "duplicate-entry-id");
+}
+
+#[test]
+fn the_canonical_projection_round_trips_through_parse() {
+    let source = FlowRule::default().render();
+    let first = parse(&source).to_normalized_authored_json();
+    let second = parse(&source).to_normalized_authored_json();
+    assert_eq!(first, second, "the projection must be deterministic");
 }

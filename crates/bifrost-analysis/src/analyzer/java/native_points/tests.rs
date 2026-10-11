@@ -1,6 +1,8 @@
 use super::*;
 use crate::CancellationToken;
 use crate::analyzer::Language;
+use crate::analyzer::native_points::native_point_operation_inputs;
+use crate::analyzer::store::resolution_selection::SelectedResolutionLanguage;
 use crate::analyzer::usages::get_definition::{DefinitionLookupStatus, ResolvedReferenceSite};
 use crate::analyzer::{AnalyzerConfig, CodeUnitIndex, Project, Range};
 use crate::inline_project::{BuiltInlineTestProject, InlineTestProject};
@@ -45,8 +47,324 @@ fn complete(result: BoundedResolution<DefinitionLookupOutcome>) -> DefinitionLoo
     value
 }
 
+fn complete_with_evidence(
+    result: BoundedResolution<JavaNativeDefinitionResolution>,
+) -> JavaNativeDefinitionResolution {
+    let BoundedResolution::Complete { value, .. } = result else {
+        panic!("{result:?}")
+    };
+    value
+}
+
+fn native_evidence_at(
+    analyzer: &dyn crate::analyzer::IAnalyzer,
+    file: &crate::analyzer::ProjectFile,
+    source: &str,
+    focus_start_byte: usize,
+    focus_length: usize,
+) -> JavaNativeDefinitionResolution {
+    let tree = super::super::parse_tree(source).expect("Java source parses");
+    let site = ResolvedReferenceSite {
+        path: file.to_string(),
+        text: source[focus_start_byte..focus_start_byte + focus_length].to_owned(),
+        range: Range {
+            start_byte: focus_start_byte,
+            end_byte: focus_start_byte + focus_length,
+            start_line: 0,
+            end_line: 0,
+        },
+        focus_start_byte,
+        focus_end_byte: focus_start_byte + focus_length,
+    };
+    complete_with_evidence(resolve_java_definition_with_evidence_bounded(
+        BoundedReceiverQuery {
+            analyzer,
+            file,
+            source,
+            tree: Some(&tree),
+            site: &site,
+            budget: ReceiverAnalysisBudget::default(),
+            cancellation: None,
+        },
+        || {},
+    ))
+}
+
 #[test]
-fn java_native_point_retains_import_target_and_incomplete_evidence() {
+fn java_native_call_adapter_retains_source_authority() {
+    let source = "class App { void accept(String value) {} void caller() { accept(\"x\"); } }";
+    let fixture = InlineTestProject::with_language(Language::Java)
+        .file("App.java", source)
+        .build();
+    let analyzer = JavaAnalyzer::new(fixture.project_dyn());
+    let file = fixture.file("App.java");
+    let focus = source.rfind("accept").expect("call name");
+    let resolved = native_evidence_at(&analyzer, &file, source, focus, "accept".len());
+    assert_eq!(
+        resolved.evidence.authority,
+        crate::analyzer::usages::get_definition::DefinitionResolutionAuthority::NativeJavaSelected
+    );
+    assert_eq!(
+        resolved.evidence.call_application(),
+        crate::analyzer::usages::get_definition::CallApplicationKind::BoundReceiver
+    );
+    assert!(
+        resolved.evidence.exact_external_call().is_none(),
+        "a source call has no external proof: {resolved:?}"
+    );
+    assert!(
+        resolved.evidence.external_callee_identity().is_none(),
+        "a source call has no external identity: {resolved:?}"
+    );
+}
+
+#[test]
+fn java_native_point_resolves_qualified_static_call_across_same_package_files() {
+    let library_path = "src/main/java/conformance/JavaLibrary.java";
+    let caller_path = "src/main/java/conformance/JavaCaller.java";
+    let library_source =
+        "package conformance; final class JavaLibrary { static int javaLeaf() { return 7; } }";
+    let caller_source = "package conformance; final class JavaCaller { static int javaRoot() { return JavaLibrary.javaLeaf(); } }";
+    let fixture = InlineTestProject::with_language(Language::Java)
+        .file("pom.xml", "<project><modelVersion>4.0.0</modelVersion><groupId>test</groupId><artifactId>native-call</artifactId><version>1</version></project>")
+        .file(library_path, library_source)
+        .file(caller_path, caller_source)
+        .build();
+    let analyzer = JavaAnalyzer::new(fixture.project_dyn());
+    let file = fixture.file(caller_path);
+    let owner_focus = caller_source.find("JavaLibrary").expect("type qualifier");
+    let owner = native_evidence_at(
+        &analyzer,
+        &file,
+        caller_source,
+        owner_focus,
+        "JavaLibrary".len(),
+    );
+    assert_eq!(owner.outcome.definitions.len(), 1, "{owner:?}");
+    assert_eq!(
+        owner.outcome.definitions[0].short_name(),
+        "JavaLibrary",
+        "{owner:?}"
+    );
+    let focus = caller_source.rfind("javaLeaf").expect("call name");
+    let resolved = native_evidence_at(&analyzer, &file, caller_source, focus, "javaLeaf".len());
+
+    assert_eq!(
+        resolved.outcome.status,
+        DefinitionLookupStatus::Resolved,
+        "{resolved:?}"
+    );
+    assert_eq!(resolved.outcome.definitions.len(), 1, "{resolved:?}");
+    assert_eq!(
+        resolved.evidence.call_application(),
+        crate::analyzer::usages::get_definition::CallApplicationKind::PackageFunction
+    );
+    assert_eq!(
+        resolved.evidence.dispatch_extensibility(),
+        Some(crate::analyzer::DispatchExtensibility::Closed)
+    );
+}
+
+#[test]
+fn java_native_point_resolves_inherited_nested_type_in_class_body() {
+    let source = r#"package app;
+
+class Holder { static class Carried {} }
+class Middle extends Holder {}
+class Leaf extends Middle {
+    static class Uses extends Carried {}
+}
+"#;
+    let project = InlineTestProject::with_language(Language::Java)
+        .file("app/NestedScope.java", source)
+        .build();
+    let analyzer = JavaAnalyzer::new(project.project_dyn());
+    let file = project.file("app/NestedScope.java");
+    let focus = source.rfind("Carried").expect("inherited nested type");
+    let resolved = native_evidence_at(&analyzer, &file, source, focus, "Carried".len());
+
+    assert_eq!(
+        resolved.outcome.status,
+        DefinitionLookupStatus::Resolved,
+        "{resolved:?}"
+    );
+    assert_eq!(resolved.outcome.definitions.len(), 1, "{resolved:?}");
+    assert_eq!(
+        resolved.outcome.definitions[0].short_name(),
+        "Holder.Carried",
+        "{resolved:?}"
+    );
+}
+
+#[test]
+fn java_native_overload_selection_uses_strict_primitive_widening() {
+    let source = "class App { void choose(long value) {} void choose(float value) {} void caller() { choose(1); } }";
+    let project = InlineTestProject::with_language(Language::Java)
+        .file("App.java", source)
+        .build();
+    let workspace = project.workspace_analyzer(AnalyzerConfig::default());
+    let analyzer = workspace.analyzer();
+    let file = project.file("App.java");
+    let focus = source.rfind("choose").expect("call name");
+    let resolved = native_evidence_at(analyzer, &file, source, focus, "choose".len());
+
+    assert_eq!(
+        resolved.outcome.status,
+        DefinitionLookupStatus::Resolved,
+        "{resolved:?}"
+    );
+    let [definition] = resolved.outcome.definitions.as_slice() else {
+        panic!("one most-specific overload: {resolved:?}");
+    };
+    let ranges = analyzer.ranges_of(definition);
+    let [range] = ranges.as_slice() else {
+        panic!("one declaration range: {definition:?}");
+    };
+    assert_eq!(
+        range.start_byte,
+        source.find("void choose(long").expect("long overload")
+    );
+}
+
+#[test]
+fn java_native_call_adapter_proves_external_receiver_and_static_import_shapes() {
+    use crate::analyzer::jvm::external::{TestClassFile, TestClassMethod, write_test_class_jar};
+    use crate::{AnalyzerConfig, JvmAnalyzerConfig, JvmExternalArtifact, JvmExternalDependencies};
+
+    let source = "import static java.net.URLDecoder.decode; class App { void run(String raw) { java.net.URLDecoder.decode(raw); java.net.URLDecoder.decode(1); decode(raw); } }";
+    let jar_dir = tempfile::tempdir().expect("jar directory");
+    let jar_path = jar_dir.path().join("native-call-evidence.jar");
+    write_test_class_jar(
+        &jar_path,
+        &[
+            TestClassFile {
+                internal_name: "java/lang/String",
+                super_internal_name: "java/lang/Object",
+                methods: &[],
+                private_nested: false,
+            },
+            TestClassFile {
+                internal_name: "java/net/URLDecoder",
+                super_internal_name: "java/lang/Object",
+                methods: &[TestClassMethod {
+                    name: "decode",
+                    descriptor: "(Ljava/lang/String;)Ljava/lang/String;",
+                    is_static: true,
+                }],
+                private_nested: false,
+            },
+        ],
+    );
+    let project = InlineTestProject::with_language(Language::Java)
+        .file("App.java", source)
+        .build();
+    let config = AnalyzerConfig {
+        jvm: JvmAnalyzerConfig {
+            external_dependencies: JvmExternalDependencies {
+                artifact_paths: vec![JvmExternalArtifact {
+                    artifact_path: jar_path,
+                    ..JvmExternalArtifact::default()
+                }],
+                ..JvmExternalDependencies::default()
+            },
+            ..JvmAnalyzerConfig::default()
+        },
+        ..AnalyzerConfig::default()
+    };
+    let workspace = project.workspace_analyzer(config);
+    let analyzer = workspace.analyzer();
+    let file = project.file("App.java");
+
+    let qualified_start = source.find("decode(raw)").expect("qualified call");
+    let qualified = native_evidence_at(analyzer, &file, source, qualified_start, "decode".len());
+    let qualified_proof = qualified
+        .evidence
+        .exact_external_call()
+        .expect("the selected external static method has one applicable signature");
+    assert_eq!(
+        qualified_proof.canonical_callee(),
+        "java.net.URLDecoder.decode"
+    );
+    assert_eq!(qualified_proof.parameter_count(), 1);
+    assert_eq!(
+        qualified.evidence.call_application(),
+        crate::analyzer::usages::get_definition::CallApplicationKind::PackageFunction
+    );
+    assert_eq!(qualified.evidence.dispatch_extensibility(), None);
+    assert_eq!(
+        qualified.outcome.resolved_reference_target(),
+        Some("java.net.URLDecoder.decode")
+    );
+
+    let mismatched_start = source.find("decode(1)").expect("mismatched argument");
+    let mismatched = native_evidence_at(analyzer, &file, source, mismatched_start, "decode".len());
+    assert!(
+        mismatched.evidence.exact_external_call().is_none(),
+        "a unique arity match is not applicable to an int actual and String formal: {mismatched:?}"
+    );
+
+    let imported_start = source.rfind("decode(raw)").expect("static import call");
+    let imported = native_evidence_at(analyzer, &file, source, imported_start, "decode".len());
+    let imported_proof = imported
+        .evidence
+        .exact_external_call()
+        .expect("selected static import has one exact external declaration");
+    assert_eq!(
+        imported_proof.canonical_callee(),
+        "java.net.URLDecoder.decode"
+    );
+    assert_eq!(imported_proof.parameter_count(), 1);
+    assert_eq!(
+        imported
+            .evidence
+            .external_callee_identity()
+            .map(|identity| { (identity.owner_fqn(), identity.member()) }),
+        Some(("java.net.URLDecoder", "decode"))
+    );
+}
+
+#[test]
+fn java_native_operation_mounts_every_selected_jvm_snapshot() {
+    let fixture = InlineTestProject::with_language(Language::Java)
+        .file("src/main/java/use/Use.java", "package use; class Use {}")
+        .build();
+    let analyzer = JavaAnalyzer::new(fixture.project_dyn());
+    let store = analyzer.inner.analyzer_store();
+    let workspace_id = analyzer.inner.workspace_id();
+    for storage_language in ["kotlin", "scala"] {
+        let generation = store
+            .ensure_language_epoch_value(storage_language, "native-jvm-mount-test")
+            .unwrap();
+        store
+            .sync_workspace_inputs_for_workspace(
+                workspace_id,
+                storage_language,
+                generation,
+                &[],
+                &[],
+                &[],
+                &[],
+                &[],
+                &[],
+                &[],
+                &[],
+            )
+            .unwrap();
+    }
+
+    let (snapshots, languages) = native_point_operation_inputs(&analyzer.inner).unwrap();
+    assert_eq!(snapshots.len(), 3);
+    assert_eq!(
+        languages
+            .iter()
+            .map(SelectedResolutionLanguage::storage_language)
+            .collect::<Vec<_>>(),
+        ["java", "kotlin", "scala"]
+    );
+}
+
+#[test]
+fn java_native_point_resolves_import_target_from_unique_workspace_rows() {
     let (fixture, analyzer) = fixture();
     let file = fixture.file(CALLER_PATH);
     let site = site(CALLER);
@@ -64,7 +382,7 @@ fn java_native_point_retains_import_target_and_incomplete_evidence() {
     ));
     assert_eq!(
         outcome.status,
-        DefinitionLookupStatus::Incomplete,
+        DefinitionLookupStatus::Resolved,
         "{outcome:?}"
     );
     assert_eq!(outcome.definitions.len(), 1, "{outcome:?}");
@@ -73,6 +391,193 @@ fn java_native_point_retains_import_target_and_incomplete_evidence() {
         &fixture.file(PROVIDER_PATH)
     );
     assert_eq!(outcome.reference.as_ref().unwrap().text, "Target");
+    assert!(
+        !outcome
+            .diagnostics
+            .iter()
+            .any(|reason| reason.kind == "incomplete_binding"),
+        "{outcome:?}"
+    );
+}
+
+#[test]
+fn java_native_point_resolves_declared_method_when_runtime_hierarchy_is_open() {
+    let source = "package p; class Worker { public void send(long value) {} } class Use { void run(Worker worker) { worker.send(1); } }";
+    let path = "src/p/Use.java";
+    let fixture = InlineTestProject::with_language(Language::Java)
+        .file(path, source)
+        .build();
+    let analyzer = JavaAnalyzer::new(fixture.project_dyn());
+    let file = fixture.file(path);
+    let start = source.find("send(1)").expect("call name");
+    let site = ResolvedReferenceSite {
+        path: path.into(),
+        text: "send".into(),
+        range: Range {
+            start_byte: start,
+            end_byte: start + "send".len(),
+            start_line: 0,
+            end_line: 0,
+        },
+        focus_start_byte: start,
+        focus_end_byte: start + "send".len(),
+    };
+    let outcome = complete(resolve_java_definition_bounded(
+        BoundedReceiverQuery {
+            analyzer: &analyzer,
+            file: &file,
+            source,
+            tree: None,
+            site: &site,
+            budget: ReceiverAnalysisBudget::default(),
+            cancellation: None,
+        },
+        || {},
+    ));
+    assert_eq!(
+        outcome.status,
+        DefinitionLookupStatus::Resolved,
+        "{outcome:?}"
+    );
+    assert_eq!(outcome.definitions.len(), 1, "{outcome:?}");
+    assert_eq!(outcome.definitions[0].fq_name(), "p.Worker.send");
+}
+
+#[test]
+fn java_native_point_resolves_explicit_and_implicit_this_to_one_method() {
+    let source = "class Sample { int value() { return 1; } int f(boolean c) { if (c) return this.value(); else return value(); } }";
+    let path = "src/Sample.java";
+    let fixture = InlineTestProject::with_language(Language::Java)
+        .file(path, source)
+        .build();
+    let analyzer = JavaAnalyzer::new(fixture.project_dyn());
+    let file = fixture.file(path);
+    let resolve_at = |start_byte| {
+        let site = ResolvedReferenceSite {
+            path: path.into(),
+            text: "value".into(),
+            range: Range {
+                start_byte,
+                end_byte: start_byte + "value".len(),
+                start_line: 0,
+                end_line: 0,
+            },
+            focus_start_byte: start_byte,
+            focus_end_byte: start_byte + "value".len(),
+        };
+        complete(resolve_java_definition_bounded(
+            BoundedReceiverQuery {
+                analyzer: &analyzer,
+                file: &file,
+                source,
+                tree: None,
+                site: &site,
+                budget: ReceiverAnalysisBudget::default(),
+                cancellation: None,
+            },
+            || {},
+        ))
+    };
+    let explicit = resolve_at(source.find("this.value()").unwrap() + "this.".len());
+    let implicit = resolve_at(source.rfind("value()").unwrap());
+    assert_eq!(
+        explicit.status,
+        DefinitionLookupStatus::Resolved,
+        "{explicit:?}"
+    );
+    assert_eq!(
+        implicit.status,
+        DefinitionLookupStatus::Resolved,
+        "{implicit:?}"
+    );
+    assert_eq!(explicit.definitions, implicit.definitions);
+    assert_eq!(explicit.definitions.len(), 1);
+}
+
+#[test]
+fn java_native_point_excludes_comments_from_call_arguments() {
+    let source = "class Sample { static String newBuilder(String scheme, int length, String path) { return scheme; } static String withComment(String scheme, int port, String path) { return newBuilder(scheme, (port >= 0 ? 6 : 0), /* not an argument */ path); } }";
+    let path = "src/Sample.java";
+    let fixture = InlineTestProject::with_language(Language::Java)
+        .file(path, source)
+        .build();
+    let analyzer = JavaAnalyzer::new(fixture.project_dyn());
+    let file = fixture.file(path);
+    let start_byte = source.rfind("newBuilder").unwrap();
+    let site = ResolvedReferenceSite {
+        path: path.into(),
+        text: "newBuilder".into(),
+        range: Range {
+            start_byte,
+            end_byte: start_byte + "newBuilder".len(),
+            start_line: 0,
+            end_line: 0,
+        },
+        focus_start_byte: start_byte,
+        focus_end_byte: start_byte + "newBuilder".len(),
+    };
+    let outcome = complete(resolve_java_definition_bounded(
+        BoundedReceiverQuery {
+            analyzer: &analyzer,
+            file: &file,
+            source,
+            tree: None,
+            site: &site,
+            budget: ReceiverAnalysisBudget::default(),
+            cancellation: None,
+        },
+        || {},
+    ));
+    assert_eq!(
+        outcome.status,
+        DefinitionLookupStatus::Resolved,
+        "{outcome:?}"
+    );
+    assert_eq!(outcome.definitions.len(), 1, "{outcome:?}");
+    assert_eq!(outcome.definitions[0].fq_name(), "Sample.newBuilder");
+}
+
+#[test]
+fn java_native_point_infers_var_receiver_from_factory_result() {
+    let source = "package p; public final class Store { public static native Store open(); public native void put(); } class Use { void run() { var store = Store.open(); store.put(); } }";
+    let path = "src/p/Store.java";
+    let fixture = InlineTestProject::with_language(Language::Java)
+        .file(path, source)
+        .build();
+    let analyzer = JavaAnalyzer::new(fixture.project_dyn());
+    let file = fixture.file(path);
+    let start = source.find("store.put").expect("instance call") + "store.".len();
+    let site = ResolvedReferenceSite {
+        path: path.into(),
+        text: "put".into(),
+        range: Range {
+            start_byte: start,
+            end_byte: start + "put".len(),
+            start_line: 0,
+            end_line: 0,
+        },
+        focus_start_byte: start,
+        focus_end_byte: start + "put".len(),
+    };
+    let outcome = complete(resolve_java_definition_bounded(
+        BoundedReceiverQuery {
+            analyzer: &analyzer,
+            file: &file,
+            source,
+            tree: None,
+            site: &site,
+            budget: ReceiverAnalysisBudget::default(),
+            cancellation: None,
+        },
+        || {},
+    ));
+    assert_eq!(
+        outcome.status,
+        DefinitionLookupStatus::Incomplete,
+        "{outcome:?}"
+    );
+    assert_eq!(outcome.definitions.len(), 1, "{outcome:?}");
+    assert_eq!(outcome.definitions[0].fq_name(), "p.Store.put");
     assert!(
         outcome
             .diagnostics
@@ -363,11 +868,42 @@ fn java_native_type_retains_imported_nominal_and_primitive_results() {
             );
             assert_eq!(
                 value.status,
-                TypeLookupStatus::Incomplete,
-                "import boundary remains open"
+                TypeLookupStatus::Resolved,
+                "unique selected single-type import proves the workspace declaration"
             );
         }
     }
+}
+
+#[test]
+fn java_generic_field_type_does_not_use_go_positional_substitution() {
+    use crate::analyzer::usages::get_type::TypeLookupStatus;
+
+    let source = "package use; class Box<T> { T value; } class Use { String read(Box<String> box) { return box.value; } }";
+    let fixture = InlineTestProject::with_language(Language::Java)
+        .file("pom.xml", "<project><modelVersion>4.0.0</modelVersion><groupId>test</groupId><artifactId>generic-parity</artifactId><version>1</version></project>")
+        .file(CALLER_PATH, source)
+        .build();
+    let analyzer = JavaAnalyzer::new(fixture.project_dyn());
+    let file = fixture.file(CALLER_PATH);
+    let site = site_at(CALLER_PATH, source, "box.value", "value");
+    let result = resolve_java_type_bounded(
+        BoundedReceiverQuery {
+            analyzer: &analyzer,
+            file: &file,
+            source,
+            tree: None,
+            site: &site,
+            budget: ReceiverAnalysisBudget::default(),
+            cancellation: None,
+        },
+        || {},
+    );
+    let BoundedResolution::Complete { value, .. } = result else {
+        panic!("{result:?}")
+    };
+    assert_eq!(value.status, TypeLookupStatus::Incomplete, "{value:?}");
+    assert!(value.types.is_empty(), "{value:?}");
 }
 
 #[test]
@@ -663,6 +1199,23 @@ fn native_java_definition_at(
 }
 
 #[test]
+fn java_native_bounded_type_parameter_retains_its_selected_bound_member() {
+    let source = "package p; interface Node { Node child(); } class Tree<T extends Node> { void walk(T value) { value.child(); } }";
+    let outcome = native_java_definition_at("src/p/Tree.java", source, "value.child()", "child");
+    // `child()` is a zero-argument exact match on the indexed interface, so a
+    // proven exact selection on an indexed owner closes the owner's ancestor
+    // frontier: an implicit-root member of the same signature is overridden by
+    // `Node.child`, and one of any other shape is not applicable.
+    assert_eq!(
+        outcome.status,
+        DefinitionLookupStatus::Resolved,
+        "a proven exact selection on an indexed owner closes the owner's ancestor frontier: {outcome:?}"
+    );
+    assert_eq!(outcome.definitions.len(), 1, "{outcome:?}");
+    assert_eq!(outcome.definitions[0].fq_name(), "p.Node.child");
+}
+
+#[test]
 fn java_native_local_type_is_visible_after_its_declaration() {
     let source = "package p; class Owner { Object make() { class Local { Local value; } Local value = new Local(); return value; } }";
     let outcome = native_java_definition_at("src/p/Owner.java", source, "Local value =", "Local");
@@ -683,18 +1236,6 @@ fn java_native_local_type_is_visible_after_its_declaration() {
 }
 
 #[test]
-fn java_native_anonymous_body_field_has_its_own_owner() {
-    let source = "package p; class Owner { Object make() { return new Object() { int value; int read() { return value; } }; } }";
-    let outcome = native_java_definition_at("src/p/Owner.java", source, "return value", "value");
-    assert_eq!(
-        outcome.status,
-        DefinitionLookupStatus::Resolved,
-        "{outcome:?}"
-    );
-    assert_eq!(outcome.definitions.len(), 1, "{outcome:?}");
-}
-
-#[test]
 fn java_native_enum_switch_label_uses_the_selector_enum_owner() {
     let source = "package p; enum State { IDLE, BUSY } class Owner { int pick(State state) { switch (state) { case IDLE: return 1; default: return 0; } } }";
     let outcome = native_java_definition_at("src/p/Owner.java", source, "case IDLE", "IDLE");
@@ -706,6 +1247,9 @@ fn java_native_enum_switch_label_uses_the_selector_enum_owner() {
     assert_eq!(outcome.definitions.len(), 1, "{outcome:?}");
 }
 
+#[brokk_bifrost_test_macros::hardwon(
+    "d1238c7e808b: Separately covers arrow-switch AST shape and verifies the selected enum constant identity"
+)]
 #[test]
 fn java_native_arrow_switch_label_uses_the_selector_enum_owner() {
     let source = "package p; enum State { IDLE, BUSY } class Owner { int pick(State state) { return switch (state) { case IDLE -> 1; default -> 0; }; } }";
@@ -769,6 +1313,9 @@ fn java_native_switch_enum_label_beats_same_named_imported_type() {
     );
 }
 
+#[brokk_bifrost_test_macros::hardwon(
+    "211faf231fb6: a Java type pattern was not lowered as a type reference"
+)]
 #[test]
 fn java_native_switch_type_pattern_keeps_its_type_reference() {
     let source = "package p; class Circle {} class Owner { int pick(Object value) { return switch (value) { case Circle circle -> 1; default -> 0; }; } }";
@@ -782,6 +1329,9 @@ fn java_native_switch_type_pattern_keeps_its_type_reference() {
     assert_eq!(outcome.definitions.len(), 1, "{outcome:?}");
 }
 
+#[brokk_bifrost_test_macros::hardwon(
+    "211faf231fb6: a this-field switch selector used the enum type declared for that field"
+)]
 #[test]
 fn java_native_this_field_switch_selector_uses_its_declared_enum_type() {
     let source = "package p; enum State { IDLE, BUSY } class Owner { State state; int pick() { return switch (this.state) { case IDLE -> 1; default -> 0; }; } }";
@@ -812,18 +1362,6 @@ fn java_native_synchronized_expression_resolves_an_inherited_field() {
 }
 
 #[test]
-fn java_native_same_file_superclass_field_is_visible_to_subclass() {
-    let source = "package p; class Root { int shared; } class Leaf extends Root { int read() { return shared; } }";
-    let outcome = native_java_definition_at("src/p/Tree.java", source, "return shared", "shared");
-    assert_eq!(
-        outcome.status,
-        DefinitionLookupStatus::Resolved,
-        "{outcome:?}"
-    );
-    assert_eq!(outcome.definitions.len(), 1, "{outcome:?}");
-}
-
-#[test]
 fn java_native_static_import_boundary_names_the_imported_owner() {
     let source =
         "package use; import static com.external.Owner.lint; class Use { void run() { lint(); } }";
@@ -842,6 +1380,9 @@ fn java_native_static_import_boundary_names_the_imported_owner() {
     assert_eq!(claim.subjects, vec!["com.external.Owner.lint".to_string()]);
 }
 
+#[brokk_bifrost_test_macros::hardwon(
+    "d1238c7e808b: A real package-collision fixture proves an external static import remains authoritative over a local same-package declaration"
+)]
 #[test]
 fn java_native_static_import_keeps_external_owner_authoritative() {
     let caller = "package butterknife.lint; import static com.android.tools.lint.checks.infrastructure.TestLintTask.lint; class InvalidR2UsageDetectorTest { void run() { lint().run(); } }";
@@ -894,6 +1435,9 @@ fn java_native_static_import_keeps_external_owner_authoritative() {
     );
 }
 
+#[brokk_bifrost_test_macros::hardwon(
+    "d1238c7e808b: Checks the distinct java.* static-import boundary and exact owner claim for a nested call expression"
+)]
 #[test]
 fn java_native_static_import_of_jdk_method_keeps_owner_authority() {
     let source = "package app; import static java.net.URLDecoder.decode; class App { String source() { return \"x\"; } void sink(String value) {} void run() { sink(decode(source(), \"UTF-8\")); } }";
@@ -916,6 +1460,9 @@ fn java_native_static_import_of_jdk_method_keeps_owner_authority() {
     );
 }
 
+#[brokk_bifrost_test_macros::hardwon(
+    "d1238c7e808b: Maven source-root metadata closes source access and a cross-file inherited method resolves to the base declaration"
+)]
 #[test]
 fn java_native_inherited_member_query_keeps_the_selected_base_declaration() {
     const POM: &str = "<project><modelVersion>4.0.0</modelVersion><groupId>test</groupId><artifactId>inherited</artifactId><version>1</version></project>";
@@ -967,6 +1514,9 @@ fn java_native_inherited_member_query_keeps_the_selected_base_declaration() {
     );
 }
 
+#[brokk_bifrost_test_macros::hardwon(
+    "d1238c7e808b: One fixture checks ownership for both a named local class field and an anonymous-class field"
+)]
 #[test]
 fn java_native_local_field_stays_in_its_declaring_type_scope() {
     let source = "package p; class Owner { int outer; Object make() { class Local { int local; int read() { return local; } } return new Object() { int marker; int read() { return marker; } }; } }";
@@ -992,6 +1542,9 @@ fn java_native_local_field_stays_in_its_declaring_type_scope() {
     );
 }
 
+#[brokk_bifrost_test_macros::hardwon(
+    "d1238c7e808b: Checks nested anonymous owner qualification and enum field ownership as separate nested type forms"
+)]
 #[test]
 fn java_native_nested_anonymous_and_enum_fields_keep_their_owners() {
     let nested = "package p; class Owner { Object make() { return new Object() { Object nested() { return new Object() { int leaf; int read() { return leaf; } }; } }; } }";
@@ -1026,5 +1579,68 @@ fn java_native_nested_anonymous_and_enum_fields_keep_their_owners() {
             .short_name()
             .ends_with("State.marker"),
         "{enum_outcome:?}"
+    );
+}
+
+#[test]
+fn java_native_point_resolves_nested_unqualified_same_class_calls() {
+    let source = "class Token {} class Other {} class App { static Token source() { return null; } static void sink(Token value) {} static void sink(Other value) {} void run() { sink(source()); } }";
+    let path = "src/App.java";
+    let fixture = InlineTestProject::with_language(Language::Java)
+        .file(path, source)
+        .build();
+    let analyzer = JavaAnalyzer::new(fixture.project_dyn());
+    let file = fixture.file(path);
+    let resolve_at = |needle: &str, method: &str| {
+        let start_byte = source.rfind(needle).expect("call site");
+        let site = ResolvedReferenceSite {
+            path: path.into(),
+            text: method.into(),
+            range: Range {
+                start_byte,
+                end_byte: start_byte + method.len(),
+                start_line: 0,
+                end_line: 0,
+            },
+            focus_start_byte: start_byte,
+            focus_end_byte: start_byte + method.len(),
+        };
+        complete(resolve_java_definition_bounded(
+            BoundedReceiverQuery {
+                analyzer: &analyzer,
+                file: &file,
+                source,
+                tree: None,
+                site: &site,
+                budget: ReceiverAnalysisBudget::default(),
+                cancellation: None,
+            },
+            || {},
+        ))
+    };
+
+    let source_call = resolve_at("source());", "source");
+    let sink_call = resolve_at("sink(source())", "sink");
+    assert_eq!(
+        source_call.status,
+        DefinitionLookupStatus::Resolved,
+        "{source_call:?}"
+    );
+    assert_eq!(source_call.definitions[0].fq_name(), "App.source");
+    assert_eq!(
+        sink_call.status,
+        DefinitionLookupStatus::Resolved,
+        "{sink_call:?}"
+    );
+    let [sink] = sink_call.definitions.as_slice() else {
+        panic!("nested source-call result selects one sink overload: {sink_call:?}");
+    };
+    let ranges = analyzer.ranges_of(sink);
+    let [range] = ranges.as_slice() else {
+        panic!("one sink declaration range: {sink:?}");
+    };
+    assert!(
+        source[range.start_byte..].starts_with("static void sink(Token"),
+        "the nested call result selects the Token formal: {sink_call:?}"
     );
 }

@@ -13,11 +13,13 @@ mod cache;
 mod clones;
 mod default_arguments;
 pub(crate) mod diagnostics;
+mod exception_identity;
 pub mod external;
 mod guard_summary;
 mod hierarchy;
 mod imports;
 pub(crate) mod lexical_scope;
+pub mod packaging;
 pub mod runtime_artifact;
 pub(crate) mod runtime_binding;
 pub(crate) mod runtime_environment;
@@ -29,21 +31,24 @@ mod structural;
 mod type_flow;
 use crate::analyzer::QueryToken;
 use crate::analyzer::Range;
+pub(crate) use type_flow::{
+    python_exact_external_receiver_identities, python_external_class_call_identity,
+    python_external_member_declaration,
+};
 
 pub(crate) use brokk_bifrost_python::syntax::{
     python_deferred_annotation_identifier_ranges, python_node_is_in_annotation,
 };
 
-use crate::analyzer::clone_detection::{
-    CloneCandidateProfile, detect_structural_clone_smells, refine_clone_similarity_with_ast,
-};
-use crate::analyzer::common::language_for_file as file_language;
+use crate::analyzer::cache_weight::weight_code_unit_vec;
+use crate::analyzer::clone_detection::detect_language_structural_clone_smells;
 use crate::analyzer::languages::{
     BoundedReceiverQuery, CandidateAugmentation, CandidateCtx, DeadCodeBulkEdges,
     DeadCodeBulkPreflight, DeadCodeBulkProof, DeadCodeRouting, DeadCodeSupport, EdgePassId,
-    EdgeSiteScanCtx, EdgeWeightScanCtx, LanguageEdgePass, LanguageEdgeSites, LanguageEdgeWeights,
-    LanguageSupport, StructuralReceiverResolver, analyzable_file_count, candidate_fqns,
-    fqn_bulk_nodes,
+    EdgeSiteScanCtx, EdgeWeightScanCtx, ExternalCalleeSite, ImportedExternalCallee,
+    LanguageEdgePass, LanguageEdgeSites, LanguageEdgeWeights, LanguageSupport,
+    SavedDefaultArgumentSafety, StructuralReceiverResolver, candidate_fqns, fqn_bulk_nodes,
+    ready_preflight,
 };
 use crate::analyzer::store::LimitedQueryRows;
 use crate::analyzer::usages::get_definition::{
@@ -57,7 +62,7 @@ use crate::analyzer::usages::python_graph::{
 use crate::analyzer::usages::workspace_graph::UsageEcosystem;
 use crate::analyzer::usages::{ExportIndex, ImportBinder};
 use crate::analyzer::weighted_cache::{
-    build_weighted_cache, weight_code_unit_set, weight_project_file_set,
+    build_weighted_cache, weight_code_unit_set, weight_export_index, weight_project_file_set,
 };
 use crate::analyzer::{
     AnalyzerConfig, AnalyzerStoreContext, BuildProgress, BulkFileStateSource, CloneSmell,
@@ -93,10 +98,12 @@ pub(crate) use brokk_bifrost_python::usage_index::{
     ModuleBindingEventKind, ModuleBindingTimeline, usage_resolve_module_files,
 };
 use cache::{
-    PythonUsageEdgesKey, weight_code_unit_vec, weight_export_index, weight_import_binder,
-    weight_python_usage_edges,
+    PythonClassMutationKey, PythonModuleMemberMutationKey, PythonUsageEdgesKey,
+    build_python_class_mutation_cache, build_python_module_member_mutation_cache,
+    weight_import_binder, weight_module_global_source_facts, weight_python_usage_edges,
 };
 use clones::build_clone_candidate_data;
+pub use exception_identity::{python_builtin_exception_is_subclass, python_builtin_exception_name};
 
 pub use brokk_bifrost_python::imports::{
     PythonImportBinding, parse_python_import_bindings, parse_python_import_infos,
@@ -112,6 +119,10 @@ pub struct PythonAnalyzer {
     source_facts: Cache<
         (crate::analyzer::store::GenerationId, git2::Oid, ProjectFile),
         Arc<brokk_bifrost_python::source_facts::PythonFileSourceFacts>,
+    >,
+    module_global_source_facts: Cache<
+        (crate::analyzer::store::GenerationId, git2::Oid, ProjectFile),
+        Arc<brokk_bifrost_python::source_facts::PythonModuleGlobalSourceFacts>,
     >,
     // Every source file this file's imports resolve to, keyed on the file itself -- NOT deduped by
     // binding name like `imported_code_units` (a HashMap<String, CodeUnit> would silently drop an
@@ -133,6 +144,8 @@ pub struct PythonAnalyzer {
     // queries do not reparse the entire Python workspace.
     usage_edges:
         Cache<PythonUsageEdgesKey, Arc<crate::analyzer::usages::inverted_edges::UsageEdges>>,
+    class_member_mutation_free: Cache<PythonClassMutationKey, bool>,
+    module_member_mutation_free: Cache<PythonModuleMemberMutationKey, bool>,
     // PoolSafeMemo, not OnceLock: same constraint as `usage_index` below. The
     // build walks every workspace class and is reached from rayon workers, so a
     // blocking get_or_init parks each arriving worker behind one initializer.
@@ -153,16 +166,24 @@ pub struct PythonAnalyzer {
     // workspace listing, but every import that names no indexed module asks
     // for it, so it must not be recomputed per import.
     module_spellings: Arc<PoolSafeMemo<PythonModuleSpellings>>,
-    // PoolSafeMemo, not OnceLock: this whole-workspace scan is reached from
-    // rayon workers and must not park a worker behind a build that can enter
-    // the same query machinery. The bool is the closed (true) or explicitly
-    // mutable/open (false) metadata fact; an incomplete scan is not cached.
+    // Cache only the all-closed fast path. Detailed per-function evidence stays
+    // query-local so it cannot retain a workspace-sized map.
     saved_default_arguments: Arc<PoolSafeMemo<bool>>,
 }
 
 crate::analyzer::impl_forward_query_provider!(PythonAnalyzer);
 
 impl PythonAnalyzer {
+    pub(crate) fn update_all_with_progress(
+        &self,
+        progress: Option<crate::analyzer::BuildProgress>,
+    ) -> Self {
+        Self::from_inner(
+            self.inner.update_all_with_progress(progress),
+            self.memo_budget,
+        )
+    }
+
     pub(crate) fn install_python_runtime_snapshot(
         &self,
         base: &crate::analyzer::store::WorkspaceSnapshotId,
@@ -208,22 +229,8 @@ impl PythonAnalyzer {
         limit: usize,
         continue_query: impl FnMut() -> bool,
     ) -> LimitedQueryRows<CodeUnit> {
-        let Some(identifier) = fqn.rsplit('.').next().filter(|name| !name.is_empty()) else {
-            return LimitedQueryRows::complete(Vec::new(), 0);
-        };
-        let mut candidates = self
-            .inner
-            .lookup_non_module_declarations_by_identifier_limited(
-                identifier,
-                limit,
-                continue_query,
-            );
-        if candidates.complete {
-            candidates
-                .rows
-                .retain(|candidate| candidate.fq_name() == fqn);
-        }
-        candidates
+        self.inner
+            .lookup_non_module_declarations_by_fqn_limited(fqn, limit, continue_query)
     }
 
     /// A Python class body is one contiguous region of one file, so a member
@@ -262,30 +269,30 @@ impl PythonAnalyzer {
         self.inner.ranges_limited(code_unit, limit)
     }
 
-    pub(crate) fn signature_metadata_limited(
+    crate::analyzer::tree_sitter_analyzer::delegate_inner_methods! {
+        pub(crate) fn signature_metadata_limited(
         &self,
         code_unit: &CodeUnit,
         limit: usize,
-    ) -> LimitedQueryRows<SignatureMetadata> {
-        self.inner.signature_metadata_limited(code_unit, limit)
+    ) -> LimitedQueryRows<SignatureMetadata>;
     }
 
-    pub(crate) fn signatures_limited(
+    crate::analyzer::tree_sitter_analyzer::delegate_inner_methods! {
+        pub(crate) fn signatures_limited(
         &self,
         code_unit: &CodeUnit,
         limit: usize,
-    ) -> LimitedQueryRows<String> {
-        self.inner.signatures_limited(code_unit, limit)
+    ) -> LimitedQueryRows<String>;
     }
 
-    #[doc(hidden)]
-    pub fn reset_full_hydration_count_for_test(&self) {
-        self.inner.reset_full_hydration_count_for_test();
+    crate::analyzer::tree_sitter_analyzer::delegate_inner_methods! {
+        #[doc(hidden)]
+        pub fn reset_full_hydration_count_for_test(&self);
     }
 
-    #[doc(hidden)]
-    pub fn full_hydration_count_for_test(&self) -> usize {
-        self.inner.full_hydration_count_for_test()
+    crate::analyzer::tree_sitter_analyzer::delegate_inner_methods! {
+        #[doc(hidden)]
+        pub fn full_hydration_count_for_test(&self) -> usize;
     }
 
     #[cfg(test)]
@@ -307,6 +314,8 @@ impl PythonAnalyzer {
         clone.module_spellings = Arc::new(PoolSafeMemo::new());
         clone.usage_index = Arc::new(PoolSafeMemo::new());
         clone.usage_edges = build_weighted_cache(self.memo_budget / 8, weight_python_usage_edges);
+        clone.class_member_mutation_free = build_python_class_mutation_cache();
+        clone.module_member_mutation_free = build_python_module_member_mutation_cache();
         clone.saved_default_arguments = Arc::new(PoolSafeMemo::new());
         clone
     }
@@ -316,9 +325,11 @@ impl PythonAnalyzer {
     }
 
     pub fn new_with_config(project: Arc<dyn Project>, config: AnalyzerConfig) -> Self {
-        let memo_budget = config.memo_cache_budget_bytes();
-        let inner = TreeSitterAnalyzer::new_with_config(project, PythonAdapter, config);
-        Self::from_inner(inner, memo_budget)
+        TreeSitterAnalyzer::wrap_with_config(
+            config,
+            |config| TreeSitterAnalyzer::new_with_config(project, PythonAdapter, config),
+            Self::from_inner,
+        )
     }
 
     pub(crate) fn new_with_config_store_context(
@@ -327,15 +338,19 @@ impl PythonAnalyzer {
         store_context: AnalyzerStoreContext,
         progress: Option<BuildProgress>,
     ) -> Result<Self, crate::analyzer::store::StoreError> {
-        let memo_budget = config.memo_cache_budget_bytes();
-        let inner = TreeSitterAnalyzer::new_with_config_storage_context_and_progress(
-            project,
-            PythonAdapter,
+        TreeSitterAnalyzer::try_wrap_with_config(
             config,
-            store_context,
-            progress,
-        )?;
-        Ok(Self::from_inner(inner, memo_budget))
+            |config| {
+                TreeSitterAnalyzer::new_with_config_storage_context_and_progress(
+                    project,
+                    PythonAdapter,
+                    config,
+                    store_context,
+                    progress,
+                )
+            },
+            Self::from_inner,
+        )
     }
 
     fn from_inner(inner: TreeSitterAnalyzer<PythonAdapter>, memo_budget: u64) -> Self {
@@ -349,12 +364,18 @@ impl PythonAnalyzer {
                     u32::try_from(value.estimated_retained_bytes()).unwrap_or(u32::MAX)
                 },
             ),
+            module_global_source_facts: build_weighted_cache(
+                memo_budget / 16,
+                weight_module_global_source_facts,
+            ),
             imported_target_files: build_weighted_cache(memo_budget / 8, weight_project_file_set),
             referencing_files: build_weighted_cache(memo_budget / 8, weight_project_file_set),
             export_index: build_weighted_cache(memo_budget / 8, weight_export_index),
             import_binder: build_weighted_cache(memo_budget / 8, weight_import_binder),
             direct_ancestors: build_weighted_cache(memo_budget / 8, weight_code_unit_vec),
             usage_edges: build_weighted_cache(memo_budget / 8, weight_python_usage_edges),
+            class_member_mutation_free: build_python_class_mutation_cache(),
+            module_member_mutation_free: build_python_module_member_mutation_cache(),
             direct_descendant_index: Arc::new(KeyedPoolSafeMemo::new()),
             reverse_import_index: Arc::new(PoolSafeMemo::new()),
             usage_index: Arc::new(PoolSafeMemo::new()),
@@ -363,12 +384,22 @@ impl PythonAnalyzer {
         }
     }
 
-    /// Whether this analyzer generation has a complete, closed view of saved
-    /// Python defaults. `None` means the bounded workspace scan could not
-    /// inspect every analyzed file and therefore must not authorize default
-    /// bindings.
-    pub(crate) fn saved_default_arguments_available(&self) -> Option<bool> {
-        default_arguments::saved_default_arguments_available(self)
+    /// Query-local, scoped mutability evidence for Python's saved defaults.
+    /// An incomplete bounded scan returns `None` and cannot authorize a
+    /// default binding.
+    pub(crate) fn saved_default_argument_safety(&self) -> Option<SavedDefaultArgumentSafety> {
+        if self.saved_default_arguments.is_ready() {
+            return Some(SavedDefaultArgumentSafety::default());
+        }
+
+        let safety = default_arguments::saved_default_argument_safety(self)?;
+        if safety.all_defaults_available() {
+            let cached_available = self
+                .saved_default_arguments
+                .get_or_build_pool_independent(|| true);
+            assert!(*cached_available);
+        }
+        Some(safety)
     }
 
     pub fn from_project<P>(project: P) -> Self
@@ -387,6 +418,41 @@ impl PythonAnalyzer {
         let key = PythonUsageEdgesKey::new(nodes, targets);
         self.usage_edges
             .optionally_get_with(key, || build().map(Arc::new))
+    }
+
+    pub(super) fn cached_class_member_mutation_free(
+        &self,
+        identity_groups: &[Vec<&str>],
+        member: &str,
+        scan: impl FnOnce() -> bool,
+    ) -> bool {
+        self.class_member_mutation_free
+            .get_with(PythonClassMutationKey::new(identity_groups, member), scan)
+    }
+
+    pub(crate) fn cached_module_member_mutation_free(
+        &self,
+        module: &str,
+        member: &str,
+        scan: impl FnOnce() -> Option<bool>,
+    ) -> bool {
+        self.module_member_mutation_free
+            .optionally_get_with(PythonModuleMemberMutationKey::new(module, member), scan)
+            .unwrap_or(false)
+    }
+
+    pub(crate) fn module_global_source_facts(
+        &self,
+        file: &ProjectFile,
+        prepared: &crate::analyzer::tree_sitter_analyzer::PreparedSyntaxTree,
+        keep_going: &dyn Fn() -> bool,
+    ) -> Option<Arc<brokk_bifrost_python::source_facts::PythonModuleGlobalSourceFacts>> {
+        self.inner.cached_python_module_global_source_facts(
+            file,
+            prepared,
+            &self.module_global_source_facts,
+            keep_going,
+        )
     }
 
     #[doc(hidden)]
@@ -434,15 +500,19 @@ impl PythonAnalyzer {
         token: QueryToken<'_>,
         file: &ProjectFile,
     ) -> Arc<HashSet<ProjectFile>> {
-        self.imported_target_files.get_with(file.clone(), || {
-            let imports = self.inner.import_info_of(token, file);
-            let targets: HashSet<ProjectFile> = resolve_imports_batched(self, file, &imports)
-                .into_iter()
-                .flatten()
-                .map(|(_, code_unit)| code_unit.source().clone())
-                .collect();
-            Arc::new(targets)
-        })
+        crate::analyzer::common::import_target_files_from_cache(
+            &self.imported_target_files,
+            file,
+            || {
+                let imports = self.inner.import_info_of(token, file);
+                let targets: HashSet<ProjectFile> = resolve_imports_batched(self, file, &imports)
+                    .into_iter()
+                    .flatten()
+                    .map(|(_, code_unit)| code_unit.source().clone())
+                    .collect();
+                targets
+            },
+        )
     }
 
     fn build_reverse_import_index(&self) -> Arc<HashMap<ProjectFile, Arc<HashSet<ProjectFile>>>> {
@@ -521,9 +591,7 @@ impl PythonSource for PythonAnalyzer {
     }
 
     fn import_binder_of(&self, file: &ProjectFile) -> Arc<ImportBinder> {
-        let scope = AnalyzerQueryScope::new(self);
-        let token = scope.token();
-        self.import_binder_of(token, file)
+        crate::analyzer::with_query_scope(self, |token| self.import_binder_of(token, file))
     }
 
     fn export_index_of(&self, file: &ProjectFile) -> Arc<ExportIndex> {
@@ -570,82 +638,81 @@ impl PythonUsageSource for PythonAnalyzer {
 }
 
 impl CodeUnitIndex for PythonAnalyzer {
-    /// Forwarded so the request-scoped memo on the inner analyzer answers
-    /// (#2679); the trait default would rebuild uncached per call.
-    fn class_range_index(
+    crate::analyzer::tree_sitter_analyzer::delegate_inner_methods! {
+        /// Forwarded so the request-scoped memo on the inner analyzer answers
+        /// (#2679); the trait default would rebuild uncached per call.
+        fn class_range_index(
         &self,
         file: &ProjectFile,
-    ) -> std::sync::Arc<brokk_bifrost_core::analyzer::usages::inverted_edges::ClassRangeIndex> {
-        self.inner.class_range_index(file)
+    ) -> std::sync::Arc<brokk_bifrost_core::analyzer::usages::inverted_edges::ClassRangeIndex>;
     }
 
-    fn enclosing_code_unit(
+    crate::analyzer::tree_sitter_analyzer::delegate_inner_methods! {
+        fn enclosing_code_unit(
         &self,
         file: &ProjectFile,
         range: &crate::analyzer::Range,
-    ) -> Option<CodeUnit> {
-        self.inner.enclosing_code_unit(file, range)
+    ) -> Option<CodeUnit>;
     }
 
-    fn enclosing_code_unit_for_lines(
+    crate::analyzer::tree_sitter_analyzer::delegate_inner_methods! {
+        fn enclosing_code_unit_for_lines(
+            &self,
+            file: &ProjectFile,
+            start_line: usize,
+            end_line: usize,
+        ) -> Option<CodeUnit>;
+    }
+
+    crate::analyzer::tree_sitter_analyzer::delegate_inner_methods! {
+        fn top_level_declarations(&self, file: &ProjectFile) -> Vec<CodeUnit>;
+    }
+
+    crate::analyzer::tree_sitter_analyzer::delegate_inner_methods! {
+        fn summary_file_projection(
         &self,
         file: &ProjectFile,
-        start_line: usize,
-        end_line: usize,
-    ) -> Option<CodeUnit> {
-        self.inner
-            .enclosing_code_unit_for_lines(file, start_line, end_line)
+    ) -> Option<Arc<crate::analyzer::SummaryFileProjection>>;
     }
 
-    fn top_level_declarations(&self, file: &ProjectFile) -> Vec<CodeUnit> {
-        self.inner.top_level_declarations(file)
+    crate::analyzer::tree_sitter_analyzer::delegate_inner_methods! {
+        fn analyzed_files(&self) -> Vec<ProjectFile>;
     }
 
-    fn summary_file_projection(
-        &self,
-        file: &ProjectFile,
-    ) -> Option<Arc<crate::analyzer::SummaryFileProjection>> {
-        self.inner.summary_file_projection(file)
+    crate::analyzer::tree_sitter_analyzer::delegate_inner_methods! {
+        fn indexed_source(&self, file: &ProjectFile) -> Option<String>;
     }
 
-    fn analyzed_files(&self) -> Vec<ProjectFile> {
-        self.inner.analyzed_files()
+    crate::analyzer::tree_sitter_analyzer::delegate_inner_methods! {
+        fn location_declarations(&self, file: &ProjectFile) -> BTreeSet<CodeUnit>;
     }
 
-    fn indexed_source(&self, file: &ProjectFile) -> Option<String> {
-        self.inner.indexed_source(file)
+    crate::analyzer::tree_sitter_analyzer::delegate_inner_methods! {
+        fn location_ranges(&self, code_unit: &CodeUnit) -> Vec<crate::analyzer::Range>;
     }
 
-    fn location_declarations(&self, file: &ProjectFile) -> BTreeSet<CodeUnit> {
-        self.inner.location_declarations(file)
+    crate::analyzer::tree_sitter_analyzer::delegate_inner_methods! {
+        fn indexed_source_matches(&self, file: &ProjectFile, source: &str) -> bool;
     }
 
-    fn location_ranges(&self, code_unit: &CodeUnit) -> Vec<crate::analyzer::Range> {
-        self.inner.location_ranges(code_unit)
+    crate::analyzer::tree_sitter_analyzer::delegate_inner_methods! {
+        fn is_analyzed(&self, file: &ProjectFile) -> bool;
     }
 
-    fn indexed_source_matches(&self, file: &ProjectFile, source: &str) -> bool {
-        self.inner.indexed_source_matches(file, source)
-    }
-
-    fn is_analyzed(&self, file: &ProjectFile) -> bool {
-        self.inner.is_analyzed(file)
-    }
-
-    fn retain_analyzed(&self, candidates: &[ProjectFile]) -> Vec<ProjectFile> {
-        self.inner.retain_analyzed(candidates)
+    crate::analyzer::tree_sitter_analyzer::delegate_inner_methods! {
+        fn retain_analyzed(&self, candidates: &[ProjectFile]) -> Vec<ProjectFile>;
     }
 
     fn all_declarations(&self) -> Box<dyn Iterator<Item = CodeUnit> + '_> {
         self.inner.all_declarations()
     }
 
-    fn declarations_sharing_name(&self, unit: &CodeUnit) -> Vec<CodeUnit> {
-        self.inner.declarations_sharing_name(unit)
+    crate::analyzer::tree_sitter_analyzer::delegate_inner_methods! {
+        fn declarations_sharing_name(&self, unit: &CodeUnit) -> Vec<CodeUnit>;
     }
 
-    fn declarations(&self, file: &ProjectFile) -> BTreeSet<CodeUnit> {
-        self.inner.declarations(file)
+    crate::analyzer::tree_sitter_analyzer::delegate_inner_methods! {
+        fn declarations(&self, file: &ProjectFile) -> BTreeSet<CodeUnit>;
     }
 
     fn materialization_records(
@@ -659,16 +726,16 @@ impl CodeUnitIndex for PythonAnalyzer {
         self.inner.definitions(fq_name)
     }
 
-    fn prefetch_definitions(&self, fq_names: &[String]) {
-        self.inner.prefetch_definitions(fq_names);
+    crate::analyzer::tree_sitter_analyzer::delegate_inner_methods! {
+        fn prefetch_definitions(&self, fq_names: &[String]);
     }
 
-    fn direct_children(&self, code_unit: &CodeUnit) -> Vec<CodeUnit> {
-        self.inner.direct_children(code_unit)
+    crate::analyzer::tree_sitter_analyzer::delegate_inner_methods! {
+        fn direct_children(&self, code_unit: &CodeUnit) -> Vec<CodeUnit>;
     }
 
-    fn ranges(&self, code_unit: &CodeUnit) -> Vec<crate::analyzer::Range> {
-        self.inner.ranges(code_unit)
+    crate::analyzer::tree_sitter_analyzer::delegate_inner_methods! {
+        fn ranges(&self, code_unit: &CodeUnit) -> Vec<crate::analyzer::Range>;
     }
 
     fn ranges_with_limit(
@@ -685,55 +752,36 @@ impl CodeUnitIndex for PythonAnalyzer {
         self.inner.signatures(code_unit)
     }
 
-    fn signature_metadata(&self, code_unit: &CodeUnit) -> Vec<SignatureMetadata> {
-        self.inner.signature_metadata(code_unit)
+    crate::analyzer::tree_sitter_analyzer::delegate_inner_methods! {
+        fn signature_metadata(&self, code_unit: &CodeUnit) -> Vec<SignatureMetadata>;
     }
 
-    fn get_analyzed_files(&self) -> BTreeSet<ProjectFile> {
-        self.inner.get_analyzed_files()
+    crate::analyzer::tree_sitter_analyzer::delegate_inner_methods! {
+        fn languages(&self) -> BTreeSet<Language>;
     }
 
-    fn languages(&self) -> BTreeSet<Language> {
-        self.inner.languages()
-    }
-
-    fn project(&self) -> &dyn Project {
-        self.inner.project()
+    crate::analyzer::tree_sitter_analyzer::delegate_inner_methods! {
+        fn project(&self) -> &dyn Project;
     }
 
     fn parent_of(&self, code_unit: &CodeUnit) -> Option<CodeUnit> {
         self.inner.structural_parent_of(code_unit)
     }
 
-    fn get_all_declarations(&self) -> Vec<CodeUnit> {
-        self.inner.get_all_declarations()
-    }
-
-    fn get_definitions(&self, fq_name: &str) -> Vec<CodeUnit> {
-        self.inner.get_definitions(fq_name)
+    crate::analyzer::tree_sitter_analyzer::delegate_inner_methods! {
+        fn get_all_declarations(&self) -> Vec<CodeUnit>;
     }
 
     fn get_skeleton(&self, code_unit: &CodeUnit) -> Option<String> {
         let mut rendered = String::new();
         render_skeleton_recursive(self, code_unit, "", false, &mut rendered);
-        let trimmed = rendered.trim_end();
-        (!trimmed.is_empty()).then(|| trimmed.to_string())
+        crate::analyzer::common::normalize_skeleton(rendered)
     }
 
     fn get_skeleton_header(&self, code_unit: &CodeUnit) -> Option<String> {
         let mut rendered = String::new();
         render_skeleton_recursive(self, code_unit, "", true, &mut rendered);
-        let trimmed = rendered.trim_end();
-        (!trimmed.is_empty()).then(|| trimmed.to_string())
-    }
-
-    fn get_source(&self, code_unit: &CodeUnit, include_comments: bool) -> Option<String> {
-        let sources = self.get_sources(code_unit, include_comments);
-        if sources.is_empty() {
-            None
-        } else {
-            Some(sources.into_iter().collect::<Vec<_>>().join("\n\n"))
-        }
+        crate::analyzer::common::normalize_skeleton(rendered)
     }
 
     fn get_sources(&self, code_unit: &CodeUnit, include_comments: bool) -> BTreeSet<String> {
@@ -767,26 +815,25 @@ impl CodeUnitIndex for PythonAnalyzer {
             .collect()
     }
 
-    fn search_definitions(&self, pattern: &str, auto_quote: bool) -> BTreeSet<CodeUnit> {
-        self.inner.search_definitions(pattern, auto_quote)
+    crate::analyzer::tree_sitter_analyzer::delegate_inner_methods! {
+        fn search_definitions(&self, pattern: &str, auto_quote: bool) -> BTreeSet<CodeUnit>;
     }
 
-    fn search_definitions_by_suffix_pattern(
+    crate::analyzer::tree_sitter_analyzer::delegate_inner_methods! {
+        fn search_definitions_by_suffix_pattern(
         &self,
         pattern: &str,
         terminal_identifiers: &[String],
         language: Language,
-    ) -> BTreeSet<CodeUnit> {
-        self.inner
-            .search_definitions_by_suffix_pattern(pattern, terminal_identifiers, language)
+    ) -> BTreeSet<CodeUnit>;
     }
 
-    fn lookup_candidates_by_short_name(&self, symbol: &str) -> BTreeSet<CodeUnit> {
-        self.inner.lookup_candidates_by_short_name(symbol)
+    crate::analyzer::tree_sitter_analyzer::delegate_inner_methods! {
+        fn lookup_candidates_by_short_name(&self, symbol: &str) -> BTreeSet<CodeUnit>;
     }
 
-    fn has_complete_symbol_lookup_index(&self) -> bool {
-        self.inner.has_complete_symbol_lookup_index()
+    crate::analyzer::tree_sitter_analyzer::delegate_inner_methods! {
+        fn has_complete_symbol_lookup_index(&self) -> bool;
     }
 
     fn lookup_candidates_by_identifier(&self, identifier: &str) -> BTreeSet<CodeUnit> {
@@ -795,6 +842,8 @@ impl CodeUnitIndex for PythonAnalyzer {
 }
 
 impl IAnalyzer for PythonAnalyzer {
+    crate::analyzer::tree_sitter_analyzer::delegate_inner_procedure_fact_methods!();
+
     crate::analyzer::i_analyzer::forward_relational_definition_batch!();
 
     #[cfg(any(test, feature = "test-support"))]
@@ -816,30 +865,30 @@ impl IAnalyzer for PythonAnalyzer {
         self.inner.end_query(context);
     }
 
-    fn prefetch_definitions(&self, fq_names: &[String]) {
-        self.inner.prefetch_definitions(fq_names);
+    crate::analyzer::tree_sitter_analyzer::delegate_inner_methods! {
+        fn prefetch_definitions(&self, fq_names: &[String]);
     }
 
-    fn record_query_failure(&self, error: crate::analyzer::store::StoreError) {
-        self.inner.record_query_failure(error);
+    crate::analyzer::tree_sitter_analyzer::delegate_inner_methods! {
+        fn record_query_failure(&self, error: crate::analyzer::store::StoreError);
     }
 
-    fn workspace_file_index_cell(&self) -> Option<crate::analyzer::WorkspaceFileIndexCell> {
-        self.inner.workspace_file_index_cell()
+    crate::analyzer::tree_sitter_analyzer::delegate_inner_methods! {
+        fn workspace_file_index_cell(&self) -> Option<crate::analyzer::WorkspaceFileIndexCell>;
     }
 
-    fn definition_lookup_memo(
+    crate::analyzer::tree_sitter_analyzer::delegate_inner_methods! {
+        fn definition_lookup_memo(
         &self,
-    ) -> Option<std::sync::Arc<crate::analyzer::DefinitionLookupMemo>> {
-        self.inner.definition_lookup_memo()
+    ) -> Option<std::sync::Arc<crate::analyzer::DefinitionLookupMemo>>;
     }
 
-    fn import_statements(&self, file: &ProjectFile) -> Vec<String> {
-        self.inner.import_statements(file)
+    crate::analyzer::tree_sitter_analyzer::delegate_inner_methods! {
+        fn import_statements(&self, file: &ProjectFile) -> Vec<String>;
     }
 
-    fn compute_cognitive_complexities(&self, file: &ProjectFile) -> Vec<(CodeUnit, u32)> {
-        self.inner.compute_cognitive_complexities(file)
+    crate::analyzer::tree_sitter_analyzer::delegate_inner_methods! {
+        fn compute_cognitive_complexities(&self, file: &ProjectFile) -> Vec<(CodeUnit, u32)>;
     }
 
     fn update(&self, changed_files: &BTreeSet<ProjectFile>) -> Self {
@@ -847,7 +896,7 @@ impl IAnalyzer for PythonAnalyzer {
     }
 
     fn update_all(&self) -> Self {
-        Self::from_inner(self.inner.update_all(), self.memo_budget)
+        self.update_all_with_progress(None)
     }
 
     fn parse_errors(&self, file: &ProjectFile) -> Option<Vec<crate::analyzer::ParseError>> {
@@ -863,23 +912,22 @@ impl IAnalyzer for PythonAnalyzer {
         diagnostics::collect_python_semantic_diagnostics(self, scope.token(), file, source)
     }
 
-    fn extract_call_receiver(&self, reference: &str) -> Option<String> {
-        self.inner.extract_call_receiver(reference)
+    crate::analyzer::tree_sitter_analyzer::delegate_inner_methods! {
+        fn extract_call_receiver(&self, reference: &str) -> Option<String>;
     }
 
-    fn is_access_expression(&self, file: &ProjectFile, start_byte: usize, end_byte: usize) -> bool {
-        self.inner.is_access_expression(file, start_byte, end_byte)
+    crate::analyzer::tree_sitter_analyzer::delegate_inner_methods! {
+        fn is_access_expression(&self, file: &ProjectFile, start_byte: usize, end_byte: usize) -> bool;
     }
 
-    fn find_nearest_declaration(
-        &self,
-        file: &ProjectFile,
-        start_byte: usize,
-        end_byte: usize,
-        ident: &str,
-    ) -> Option<crate::analyzer::DeclarationInfo> {
-        self.inner
-            .find_nearest_declaration(file, start_byte, end_byte, ident)
+    crate::analyzer::tree_sitter_analyzer::delegate_inner_methods! {
+        fn find_nearest_declaration(
+            &self,
+            file: &ProjectFile,
+            start_byte: usize,
+            end_byte: usize,
+            ident: &str,
+        ) -> Option<crate::analyzer::DeclarationInfo>;
     }
 
     fn search_symbol_candidates(
@@ -898,34 +946,42 @@ impl IAnalyzer for PythonAnalyzer {
         Some(self)
     }
 
+    fn python_class_hierarchy_provider_for(
+        &self,
+        _declaration: &CodeUnit,
+    ) -> Option<&dyn crate::analyzer::usages::python_class_hierarchy::PythonClassHierarchyProvider>
+    {
+        Some(self)
+    }
+
     fn test_detection_provider(&self) -> Option<&dyn TestDetectionProvider> {
         Some(self)
     }
 
-    fn structural_fact_providers(
+    crate::analyzer::tree_sitter_analyzer::delegate_inner_methods! {
+        fn structural_fact_providers(
         &self,
-    ) -> Vec<&dyn crate::analyzer::structural::StructuralFactProvider> {
-        self.inner.structural_fact_providers()
+    ) -> Vec<&dyn crate::analyzer::structural::StructuralFactProvider>;
     }
 
     fn snapshot_caches(&self) -> Option<&crate::analyzer::AnalyzerSnapshotCaches> {
         Some(self.inner.snapshot_caches())
     }
 
-    fn workspace_content_identities(
+    crate::analyzer::tree_sitter_analyzer::delegate_inner_methods! {
+        fn workspace_content_identities(
         &self,
-    ) -> Option<crate::analyzer::content_identity::WorkspaceContentIdentities> {
-        self.inner.workspace_content_identities()
+    ) -> Option<crate::analyzer::content_identity::WorkspaceContentIdentities>;
     }
 
-    fn workspace_fact_indexes(
+    crate::analyzer::tree_sitter_analyzer::delegate_inner_methods! {
+        fn workspace_fact_indexes(
         &self,
-    ) -> Vec<&dyn crate::analyzer::read_verification::WorkspaceFactIndex> {
-        self.inner.workspace_fact_indexes()
+    ) -> Vec<&dyn crate::analyzer::read_verification::WorkspaceFactIndex>;
     }
 
-    fn contains_tests(&self, file: &ProjectFile) -> bool {
-        self.inner.contains_tests(file)
+    crate::analyzer::tree_sitter_analyzer::delegate_inner_methods! {
+        fn contains_tests(&self, file: &ProjectFile) -> bool;
     }
 
     fn in_test_region(&self, code_unit: &crate::analyzer::CodeUnit) -> bool {
@@ -937,13 +993,9 @@ impl IAnalyzer for PythonAnalyzer {
         file: &ProjectFile,
         weights: TestAssertionWeights,
     ) -> Vec<TestAssertionSmell> {
-        if !self.contains_tests(file) || file_language(file) != Language::Python {
-            return Vec::new();
-        }
-        let Ok(source) = self.inner.project().read_source(file) else {
-            return Vec::new();
-        };
-        detect_python_test_assertion_smells(file, &source, &weights)
+        crate::analyzer::test_assertion_smells_for_file(self, file, Language::Python, |source| {
+            detect_python_test_assertion_smells(file, source, &weights)
+        })
     }
 
     fn find_structural_clone_smells(
@@ -959,98 +1011,64 @@ impl IAnalyzer for PythonAnalyzer {
         files: &[ProjectFile],
         weights: CloneSmellWeights,
     ) -> Vec<CloneSmell> {
-        let requested_files: Vec<ProjectFile> = files
-            .iter()
-            .filter(|file| file_language(file) == Language::Python)
-            .cloned()
-            .collect();
-        if requested_files.is_empty() {
-            return Vec::new();
-        }
-
-        let corpus_units =
-            crate::analyzer::clone_detection::clone_corpus_function_units(self, Language::Python);
-        let _query_scope = crate::analyzer::AnalyzerQueryScope::new(self);
-        let all_candidates: Vec<CloneCandidateProfile> = corpus_units
-            .iter()
-            .filter_map(|code_unit| build_clone_candidate_data(self, code_unit, weights))
-            .map(|candidate| CloneCandidateProfile::create(candidate, weights))
-            .collect();
-        if all_candidates.is_empty() {
-            return Vec::new();
-        }
-
-        detect_structural_clone_smells(
-            &requested_files,
-            all_candidates,
+        detect_language_structural_clone_smells(
+            self,
+            files,
             weights,
-            refine_clone_similarity_with_ast,
+            Language::Python,
+            |code_unit| build_clone_candidate_data(self, code_unit, weights),
         )
     }
 }
 
 #[cfg(any(test, feature = "test-support"))]
 impl crate::analyzer::AnalyzerTestHooks for PythonAnalyzer {
-    fn reset_relational_definition_batch_call_count_for_test(&self) {
-        self.inner
-            .test_hooks()
-            .reset_relational_definition_batch_call_count_for_test();
+    crate::analyzer::tree_sitter_analyzer::delegate_inner_test_hook_methods! {
+        fn reset_relational_definition_batch_call_count_for_test(&self);
     }
 
-    fn relational_definition_batch_call_count_for_test(&self) -> usize {
-        self.inner
-            .test_hooks()
-            .relational_definition_batch_call_count_for_test()
+    crate::analyzer::tree_sitter_analyzer::delegate_inner_test_hook_methods! {
+        fn relational_definition_batch_call_count_for_test(&self) -> usize;
     }
 
-    fn reset_definition_candidates_query_count_for_test(&self) {
-        self.inner
-            .test_hooks()
-            .reset_definition_candidates_query_count_for_test();
+    crate::analyzer::tree_sitter_analyzer::delegate_inner_test_hook_methods! {
+        fn reset_definition_candidates_query_count_for_test(&self);
     }
 
-    fn definition_candidates_query_count_for_test(&self) -> usize {
-        self.inner
-            .test_hooks()
-            .definition_candidates_query_count_for_test()
+    crate::analyzer::tree_sitter_analyzer::delegate_inner_test_hook_methods! {
+        fn definition_candidates_query_count_for_test(&self) -> usize;
     }
 
-    fn reset_definition_prefetch_batch_count_for_test(&self) {
-        self.inner
-            .test_hooks()
-            .reset_definition_prefetch_batch_count_for_test();
+    crate::analyzer::tree_sitter_analyzer::delegate_inner_test_hook_methods! {
+        fn reset_definition_prefetch_batch_count_for_test(&self);
     }
 
-    fn definition_prefetch_batch_count_for_test(&self) -> usize {
-        self.inner
-            .test_hooks()
-            .definition_prefetch_batch_count_for_test()
+    crate::analyzer::tree_sitter_analyzer::delegate_inner_test_hook_methods! {
+        fn definition_prefetch_batch_count_for_test(&self) -> usize;
     }
 
-    fn reset_full_declaration_scan_count_for_test(&self) {
-        self.inner
-            .test_hooks()
-            .reset_full_declaration_scan_count_for_test();
+    crate::analyzer::tree_sitter_analyzer::delegate_inner_test_hook_methods! {
+        fn reset_full_declaration_scan_count_for_test(&self);
     }
 
-    fn full_declaration_scan_count_for_test(&self) -> usize {
-        self.inner
-            .test_hooks()
-            .full_declaration_scan_count_for_test()
+    crate::analyzer::tree_sitter_analyzer::delegate_inner_test_hook_methods! {
+        fn full_declaration_scan_count_for_test(&self) -> usize;
     }
 
     fn reset_candidate_hydration_count_for_test(&self) {
         self.inner.reset_full_hydration_count_for_test();
     }
 
-    fn candidate_hydration_count_for_test(&self) -> usize {
-        self.inner.full_hydration_count_for_test() + self.inner.bulk_hydration_count_for_test()
+    crate::analyzer::tree_sitter_analyzer::delegate_inner_test_hook_methods! {
+        fn full_candidate_hydration_count_for_test(&self) -> usize;
     }
 
-    fn reset_workspace_path_scan_count_for_test(&self) {
-        self.inner
-            .test_hooks()
-            .reset_workspace_path_scan_count_for_test();
+    crate::analyzer::tree_sitter_analyzer::delegate_inner_test_hook_methods! {
+        fn bulk_candidate_hydration_count_for_test(&self) -> usize;
+    }
+
+    crate::analyzer::tree_sitter_analyzer::delegate_inner_test_hook_methods! {
+        fn reset_workspace_path_scan_count_for_test(&self);
     }
 
     fn workspace_path_scan_count_for_test(&self) -> usize {
@@ -1065,9 +1083,56 @@ static PYTHON_USAGE_STRATEGY: PythonExportUsageGraphStrategy =
 
 pub(crate) struct PythonSupport;
 
+fn unshadowed_builtin_print_parameter_count(site: &ExternalCalleeSite<'_>) -> Option<u32> {
+    let start = site.callee_start_byte;
+    let end = start.saturating_add("print".len());
+    let reference = site
+        .tree
+        .root_node()
+        .named_descendant_for_byte_range(start, end)?;
+    let call = reference.parent()?;
+    if reference.kind() != "identifier"
+        || reference.utf8_text(site.source.as_bytes()).ok() != Some("print")
+        || call.kind() != "call"
+        || call
+            .child_by_field_name("function")
+            .is_none_or(|function| function.id() != reference.id())
+        || type_flow::builtin_base_is_unshadowed(reference, site.source) != Some(true)
+    {
+        return None;
+    }
+    let arguments = call.child_by_field_name("arguments")?;
+    let mut cursor = arguments.walk();
+    u32::try_from(arguments.named_children(&mut cursor).count()).ok()
+}
+
 impl LanguageSupport for PythonSupport {
     fn language(&self) -> Language {
         Language::Python
+    }
+
+    fn expand_imported_external_callee(
+        &self,
+        _analyzer: &dyn IAnalyzer,
+        _file: &ProjectFile,
+        callee_text: &str,
+        site: Option<&ExternalCalleeSite<'_>>,
+    ) -> Option<ImportedExternalCallee> {
+        if callee_text != "print" {
+            return None;
+        }
+        let parameter_count = unshadowed_builtin_print_parameter_count(site?)?;
+        Some(ImportedExternalCallee::proven(
+            crate::analyzer::usages::get_definition::ExactExternalCallProof::python_builtin_call(
+                "builtins.print",
+                parameter_count,
+            ),
+            crate::analyzer::semantic::ResolverOwnedExternalCalleeIdentity::new(
+                Language::Python,
+                "builtins",
+                "print",
+            ),
+        ))
     }
 
     fn procedure_syntax_roles(&self) -> Option<crate::analyzer::languages::ProcedureSyntaxRoles> {
@@ -1105,15 +1170,17 @@ impl LanguageSupport for PythonSupport {
         unit: &CodeUnit,
         limit: usize,
     ) -> Option<LimitedQueryRows<Range>> {
-        resolve_analyzer::<PythonAnalyzer>(analyzer)
-            .map(|python| python.ranges_limited(unit, limit))
+        crate::analyzer::languages::with_resolved_analyzer::<PythonAnalyzer, _>(
+            analyzer,
+            |python| python.ranges_limited(unit, limit),
+        )
     }
 
     fn forward_query_provider<'a>(
         &self,
         analyzer: &'a dyn IAnalyzer,
     ) -> Option<&'a dyn ForwardQueryProvider> {
-        resolve_analyzer::<PythonAnalyzer>(analyzer).map(|value| value as _)
+        crate::analyzer::forward_query_provider::<PythonAnalyzer>(analyzer)
     }
 
     fn refine_resolved_call_targets(
@@ -1146,20 +1213,24 @@ impl LanguageSupport for PythonSupport {
         }
     }
 
-    fn saved_default_arguments_available(&self, analyzer: &dyn IAnalyzer) -> Option<bool> {
+    fn saved_default_argument_safety(
+        &self,
+        analyzer: &dyn IAnalyzer,
+    ) -> Option<SavedDefaultArgumentSafety> {
         resolve_analyzer::<PythonAnalyzer>(analyzer)
-            .and_then(PythonAnalyzer::saved_default_arguments_available)
+            .and_then(PythonAnalyzer::saved_default_argument_safety)
     }
 
     fn ecosystem(&self) -> UsageEcosystem {
         UsageEcosystem::Python
     }
 
-    fn reference_plugin(&self) -> crate::analyzer::languages::ReferenceLanguagePlugin {
-        crate::analyzer::languages::ReferenceLanguagePlugin::new(
-            &PYTHON_USAGE_STRATEGY,
-            &PythonEdgePass,
-        )
+    fn reference_usage_strategy(&self) -> &'static dyn crate::analyzer::usages::GraphUsageAnalyzer {
+        &PYTHON_USAGE_STRATEGY
+    }
+
+    fn reference_graph_backend(&self) -> crate::analyzer::languages::LanguageGraphBackend {
+        crate::analyzer::languages::LanguageGraphBackend::Legacy(&PythonEdgePass)
     }
 
     fn dead_code(&self) -> DeadCodeSupport {
@@ -1244,18 +1315,18 @@ impl StructuralReceiverResolver for PythonSupport {
         &self,
         query: BoundedReceiverQuery<'_>,
     ) -> BoundedResolution<DefinitionLookupOutcome> {
-        let scope = AnalyzerQueryScope::new(query.analyzer);
-        let token = scope.token();
-        resolve_python_bounded(
-            query.analyzer,
-            token,
-            query.file,
-            query.source,
-            query.tree,
-            query.site,
-            query.budget,
-            query.cancellation,
-        )
+        crate::analyzer::languages::with_bounded_receiver_query(query, |query, token| {
+            resolve_python_bounded(
+                query.analyzer,
+                token,
+                query.file,
+                query.source,
+                query.tree,
+                query.site,
+                query.budget,
+                query.cancellation,
+            )
+        })
     }
 }
 
@@ -1271,10 +1342,7 @@ impl DeadCodeBulkProof for PythonDeadCodeBulk {
     }
 
     fn preflight(&self, analyzer: &dyn IAnalyzer) -> DeadCodeBulkPreflight {
-        DeadCodeBulkPreflight::Ready {
-            label: "Python",
-            files: analyzable_file_count(analyzer, Language::Python),
-        }
+        ready_preflight(analyzer, Language::Python, "Python")
     }
 
     /// The only proof that resolves a bounded *target* set. Dead-code analysis needs

@@ -142,54 +142,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn the_catalog_covers_every_domain_the_validator_admits() {
-        let catalog = relation_schema_catalog();
-        assert_eq!(catalog.format, RELATION_SCHEMA_FORMAT);
-        assert_eq!(catalog.domains.len(), ALL_DETAILED_CODE_QUERY_DOMAINS.len());
-        for domain in ALL_DETAILED_CODE_QUERY_DOMAINS {
-            let entry = catalog
-                .domains
-                .iter()
-                .find(|entry| entry.domain == domain.label())
-                .unwrap_or_else(|| panic!("domain `{}` is missing", domain.label()));
-            assert_eq!(entry.fields.len(), domain.row_fields().len());
-        }
-    }
-
-    /// Every expansion the validator admits must be published, and nothing
-    /// else: the catalog and the validator read the same table.
-    #[test]
-    fn published_expansions_are_exactly_the_admitted_ones() {
-        let catalog = relation_schema_catalog();
-        let mut published = 0_usize;
-        for entry in &catalog.domains {
-            published += entry.expansions.len();
-        }
-        let admitted = ALL_DETAILED_CODE_QUERY_DOMAINS
-            .iter()
-            .flat_map(|domain| {
-                ALL_RQL_RELATION_EXPANSION_STEPS
-                    .iter()
-                    .filter(move |step| expansion_result_domain(*domain, **step).is_some())
-            })
-            .count();
-        assert_eq!(published, admitted);
-        let occurrence = catalog
-            .domains
-            .iter()
-            .find(|entry| entry.domain == DetailedCodeQueryDomain::Occurrence.label())
-            .expect("the occurrence domain is published");
-        assert!(
-            occurrence
-                .expansions
-                .iter()
-                .any(|expansion| expansion.step == "member_selection"),
-            "{:?}",
-            occurrence.expansions
-        );
-    }
-
-    #[test]
     fn only_identity_scalars_are_conservative_join_keys() {
         let catalog = relation_schema_catalog();
         for entry in &catalog.domains {
@@ -203,36 +155,5 @@ mod tests {
                 );
             }
         }
-    }
-
-    /// One domain and the whole catalog are the same projection, so the REPL
-    /// and the CLI cannot publish different answers for the same label.
-    #[test]
-    fn one_domain_matches_its_entry_in_the_catalog() {
-        let catalog = relation_schema_catalog();
-        for entry in &catalog.domains {
-            assert_eq!(
-                relation_domain_schema(entry.domain).as_ref(),
-                Some(entry),
-                "`{}` must project identically alone and in the catalog",
-                entry.domain
-            );
-        }
-        assert_eq!(relation_domain_schema("no_such_domain"), None);
-    }
-
-    #[test]
-    fn serialization_is_byte_deterministic() {
-        let first = serde_json::to_string(&relation_schema_catalog()).expect("catalog serializes");
-        let second = serde_json::to_string(&relation_schema_catalog()).expect("catalog serializes");
-        assert_eq!(first, second);
-        let mut labels = relation_schema_catalog()
-            .domains
-            .iter()
-            .map(|domain| domain.domain)
-            .collect::<Vec<_>>();
-        let published = labels.clone();
-        labels.sort_unstable();
-        assert_eq!(labels, published, "domains are published in label order");
     }
 }

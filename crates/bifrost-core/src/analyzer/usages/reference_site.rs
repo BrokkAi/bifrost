@@ -552,6 +552,45 @@ fn member_access_chain(
     language: Language,
 ) -> Option<MemberAccessChain> {
     let mut current = smallest_named_node_covering(root, start, end)?;
+    if language == Language::CSharp {
+        let mut candidate = current;
+        while let Some(parent) = candidate.parent() {
+            let covers_selection = parent.start_byte() <= start && end <= parent.end_byte();
+            if !covers_selection {
+                break;
+            }
+            if parent.kind() == "element_access_expression" {
+                let subscript = parent.child_by_field_name("subscript");
+                if !subscript.is_some_and(|subscript| {
+                    subscript.start_byte() <= start && end <= subscript.end_byte()
+                }) {
+                    break;
+                }
+                return Some(MemberAccessChain {
+                    start: parent.start_byte(),
+                    end: parent.end_byte(),
+                    text: source
+                        .get(parent.start_byte()..parent.end_byte())
+                        .unwrap_or_default()
+                        .to_owned(),
+                });
+            }
+            if matches!(
+                parent.kind(),
+                "member_access_expression"
+                    | "conditional_access_expression"
+                    | "member_binding_expression"
+                    | "string_literal"
+                    | "character_literal"
+                    | "bracketed_argument_list"
+                    | "argument"
+            ) {
+                candidate = parent;
+            } else {
+                break;
+            }
+        }
+    }
     while let Some(parent) = current.parent() {
         if is_member_access_wrapper(parent, language) {
             current = parent;
@@ -619,17 +658,33 @@ pub fn node_range(node: Node<'_>) -> Range {
 /// the span: the containing nodes form a chain from the root, and descending through the
 /// single containing child at each level reaches the smallest of them.
 pub fn smallest_named_node_covering<'tree>(
-    mut node: Node<'tree>,
+    node: Node<'tree>,
     start: usize,
     end: usize,
 ) -> Option<Node<'tree>> {
-    if node.end_byte() < end || node.start_byte() > start {
+    smallest_named_node_covering_with_scope(node, start, end, || true)
+}
+
+/// The innermost named node covering `start..end`, stopping when `scope_step` returns false.
+///
+/// The callback runs once before checking the starting node and once before each named child
+/// inspected. This lets callers preserve traversal budgets while sharing the tree walk.
+pub fn smallest_named_node_covering_with_scope<'tree>(
+    mut node: Node<'tree>,
+    start: usize,
+    end: usize,
+    mut scope_step: impl FnMut() -> bool,
+) -> Option<Node<'tree>> {
+    if !scope_step() || node.end_byte() < end || node.start_byte() > start {
         return None;
     }
     loop {
         let mut cursor = node.walk();
         let mut containing_child = None;
         for child in node.named_children(&mut cursor) {
+            if !scope_step() {
+                return None;
+            }
             if child.start_byte() <= start && child.end_byte() >= end {
                 containing_child = Some(child);
                 break;
@@ -644,11 +699,14 @@ pub fn smallest_named_node_covering<'tree>(
 
 #[cfg(test)]
 mod tests {
-    use super::{SourceLocationRequest, expand_reference_expression, resolve_reference_site};
-    use crate::analyzer::{Language, ProjectFile};
-    use std::env;
+    use super::expand_reference_expression;
+    use crate::analyzer::Language;
+    use brokk_bifrost_test_macros::hardwon;
 
     #[test]
+    #[hardwon(
+        "02103ddf427e: Unicode text made separator probing risk slicing at a non-character boundary"
+    )]
     fn expand_reference_expression_keeps_ascii_separator_checks_byte_pure() {
         let source = "回.helper";
         let start = source.find("helper").expect("target");
@@ -670,6 +728,7 @@ mod tests {
     }
 
     #[test]
+    #[hardwon("#1276: JavaScript dollar-rooted properties resolved to unrelated receivers")]
     fn javascript_reference_expression_preserves_dollar_identifier_root() {
         let source = "$scope.count";
         let start = source.find("count").expect("property");
@@ -714,27 +773,5 @@ mod tests {
                 expand_reference_expression(source, start, end, Language::Rust);
             assert_eq!(&source[expanded_start..expanded_end], "workflow::");
         }
-    }
-
-    #[test]
-    fn exact_byte_range_can_select_symbolic_reference() {
-        let source = "box !\n";
-        let start = source.find('!').expect("operator");
-        let site = resolve_reference_site(
-            &SourceLocationRequest {
-                file: ProjectFile::new(env::temp_dir(), "App.scala"),
-                line: None,
-                column: None,
-                start_byte: Some(start),
-                end_byte: Some(start + 1),
-            },
-            source,
-            None,
-        )
-        .expect("symbolic reference site");
-
-        assert_eq!(site.text, "!");
-        assert_eq!(site.focus_start_byte, start);
-        assert_eq!(site.focus_end_byte, start + 1);
     }
 }

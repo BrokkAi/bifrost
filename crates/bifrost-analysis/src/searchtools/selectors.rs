@@ -7,8 +7,11 @@ use crate::analyzer::languages::language_support;
 use crate::analyzer::symbol_lookup::{FuzzyResolveBudget, resolve_codeunit_fuzzy_bounded_with};
 #[cfg(test)]
 use crate::analyzer::{AnalyzerQueryScope, QueryScope};
-use crate::analyzer::{CallableLinkage, CppCallableUnitRole, cpp_header_body_files_are_related};
+use crate::analyzer::{
+    CallableLinkage, CppCallableUnitRole, ParseCompleteness, cpp_header_body_files_are_related,
+};
 use brokk_bifrost_core::analyzer::query_token::QueryToken;
+use brokk_bifrost_cpp::identity::cpp_callable_unit_role;
 
 pub(super) type DefinitionCandidateKey = (
     String,
@@ -54,6 +57,95 @@ pub struct DefinitionCandidate {
     #[serde(skip_serializing_if = "Option::is_none")]
     #[schemars(schema_with = "super::navigation::semantic_model_overlay_schema")]
     pub semantic_model: Option<crate::analyzer::semantic_model::SemanticModelProvenance>,
+    /// Set when the declaration lies inside a construct the parse of its file
+    /// never closed (#3501): its scope and nesting are then a recovery claim,
+    /// not a reading of a completed tree.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub inside_unclosed_construct: Option<UnclosedConstruct>,
+}
+
+/// Where the outermost construct a C/C++ file's parse left open begins
+/// (#3501). The file's parse errors name its opening token.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, schemars::JsonSchema)]
+pub struct UnclosedConstruct {
+    pub start_byte: usize,
+    pub line: usize,
+}
+
+/// The diagnostic kind a definition answer carries when a definition it reports
+/// lies inside a construct its file's parse never closed (#3501).
+pub(super) const CPP_DECLARATION_INSIDE_UNCLOSED_CONSTRUCT: &str =
+    "cpp_declaration_inside_unclosed_construct";
+
+/// The diagnostic that makes a definition answer incomplete when any
+/// definition it reports was placed by recovery inside an unclosed construct.
+pub(super) fn unclosed_construct_diagnostic(
+    definitions: &[DefinitionCandidate],
+) -> Option<DefinitionDiagnostic> {
+    let inside: Vec<_> = definitions
+        .iter()
+        .filter_map(|candidate| {
+            let construct = candidate.inside_unclosed_construct.as_ref()?;
+            Some((candidate.fqn.as_deref(), candidate.path.as_str(), construct))
+        })
+        .collect();
+    (!inside.is_empty()).then(|| DefinitionDiagnostic {
+        claim: None,
+        kind: CPP_DECLARATION_INSIDE_UNCLOSED_CONSTRUCT.to_string(),
+        message: format!(
+            "the parse of the file ended inside a construct it never closed, so these definitions are placed by parser recovery and their scope may be wrong (fqn, path, outermost unclosed construct): {inside:?}"
+        ),
+    })
+}
+
+/// Per request: for each C/C++ file persisted as partial, the declarations its
+/// extraction recorded as recovered over an interval that runs to the end of
+/// the file, which is the record a parse left inside an unclosed construct
+/// produces (#3501). A file persisted as complete has none and is not read.
+#[derive(Default)]
+pub(super) struct UnclosedConstructCache {
+    files: HashMap<ProjectFile, HashMap<CodeUnit, UnclosedConstruct>>,
+}
+
+impl UnclosedConstructCache {
+    /// The unclosed construct `unit` lies inside, given the length of the
+    /// file content the answer reads.
+    pub(super) fn around(
+        &mut self,
+        analyzer: &dyn IAnalyzer,
+        unit: &CodeUnit,
+        file_len: usize,
+    ) -> Option<UnclosedConstruct> {
+        if language_for_target(unit) != Language::Cpp {
+            return None;
+        }
+        self.files
+            .entry(unit.source().clone())
+            .or_insert_with(|| {
+                if analyzer.parse_completeness(unit.source()) != ParseCompleteness::Partial {
+                    return HashMap::default();
+                }
+                analyzer
+                    .materialization_records(unit.source())
+                    .into_iter()
+                    .filter_map(|record| match record {
+                        crate::analyzer::structural::materialization::MaterializationRecord::RecoveredDeclaration {
+                            recovery,
+                            unit,
+                        } if recovery.end_byte == file_len => Some((
+                            unit,
+                            UnclosedConstruct {
+                                start_byte: recovery.start_byte,
+                                line: recovery.start_line,
+                            },
+                        )),
+                        _ => None,
+                    })
+                    .collect()
+            })
+            .get(unit)
+            .cloned()
+    }
 }
 
 #[derive(Debug, Clone, Serialize, schemars::JsonSchema)]
@@ -109,7 +201,10 @@ pub(super) fn definition_lookup_incomplete_reason_for_kind(
         "definition_candidate_lookup_failed"
         | "definition_candidate_lookup_incomplete"
         | "analysis_incomplete"
-        | "partial_import_boundary"
+        // partial_import_unresolved stays here, unlike a boundary: it carries no
+        // claim that the competing target lies outside the index, and its
+        // candidate statuses (not found, invalid location, unsupported language)
+        // do not all describe index coverage.
         | "partial_import_unresolved"
         | "cpp_analyzer_unavailable"
         | "csharp_analyzer_unavailable"
@@ -133,9 +228,14 @@ pub(super) fn definition_lookup_incomplete_reason_for_kind(
         | "scala_parse_failed"
         | "read_failed"
         | "file_read_failed" => DefinitionLookupIncompleteReason::AnalysisFailure,
+        // One competing import reaches a module outside the indexed workspace.
+        // The analysis ran; the candidate's structure is not indexed, the same
+        // gap as `csharp_receiver_type_unindexed`. It is not an analysis failure.
         "cpp_navigation_structure_unavailable"
+        | CPP_DECLARATION_INSIDE_UNCLOSED_CONSTRUCT
         | "source_unavailable"
-        | "csharp_receiver_type_unindexed" => {
+        | "csharp_receiver_type_unindexed"
+        | "partial_import_boundary" => {
             DefinitionLookupIncompleteReason::StructureUnavailable
         }
         "navigation_targets_truncated" => DefinitionLookupIncompleteReason::NavigationTargets,
@@ -146,9 +246,19 @@ pub(super) fn definition_lookup_incomplete_reason_for_kind(
 pub(super) fn definition_lookup_incomplete_reason(
     diagnostics: &[DefinitionDiagnostic],
 ) -> Option<DefinitionLookupIncompleteReason> {
-    diagnostics
-        .iter()
-        .find_map(|diagnostic| definition_lookup_incomplete_reason_for_kind(&diagnostic.kind))
+    definition_lookup_incomplete_reason_for_kinds(
+        diagnostics
+            .iter()
+            .map(|diagnostic| diagnostic.kind.as_str()),
+    )
+}
+
+pub(super) fn definition_lookup_incomplete_reason_for_kinds<'a>(
+    kinds: impl IntoIterator<Item = &'a str>,
+) -> Option<DefinitionLookupIncompleteReason> {
+    kinds
+        .into_iter()
+        .find_map(definition_lookup_incomplete_reason_for_kind)
 }
 
 pub(super) const fn definition_lookup_complete_default() -> bool {
@@ -347,6 +457,7 @@ pub(super) fn lexical_definition_candidate(
         canonical_selector: None,
         occurrence_role: None,
         semantic_model: None,
+        inside_unclosed_construct: None,
         language: language_name(language_for_file(file)),
     })
 }
@@ -500,6 +611,7 @@ impl CppIdentityRenderCache {
 pub(super) struct DefinitionCandidateRenderCache {
     contexts: HashMap<ProjectFile, Option<DeclarationNameRangeContext>>,
     cpp_identity: CppIdentityRenderCache,
+    unclosed_constructs: UnclosedConstructCache,
 }
 
 impl DefinitionCandidateRenderCache {
@@ -622,11 +734,21 @@ impl DefinitionCandidateRenderCache {
         columns: Option<(usize, usize)>,
     ) -> DefinitionCandidate {
         let _scope = profiling::scope("searchtools::definition_candidate.render");
+        // Declaration-site navigation can select a physical extraction row.
+        // Publish the shared structural identity for both FQN and selector.
+        let unit = analyzer.canonical_code_unit(unit, None);
         let (canonical_selector, occurrence_role) =
-            self.identity_metadata(analyzer, token, unit, identity_range);
-        let mut candidate = definition_candidate_from_range_base(analyzer, unit, range, columns);
+            self.identity_metadata(analyzer, token, &unit, identity_range);
+        let mut candidate = definition_candidate_from_range_base(analyzer, &unit, range, columns);
         candidate.canonical_selector = canonical_selector;
         candidate.occurrence_role = occurrence_role;
+        let file_len = self
+            .contexts
+            .get(unit.source())
+            .and_then(Option::as_ref)
+            .map(|context| context.content().len());
+        candidate.inside_unclosed_construct = file_len
+            .and_then(|file_len| self.unclosed_constructs.around(analyzer, &unit, file_len));
         candidate
     }
 }
@@ -733,6 +855,7 @@ fn definition_candidate_from_range_base(
         canonical_selector: None,
         occurrence_role: None,
         semantic_model: None,
+        inside_unclosed_construct: None,
     }
 }
 
@@ -779,6 +902,7 @@ pub(super) fn semantic_model_definition_candidate(
         canonical_selector: Some(symbol.location.identity().to_string()),
         occurrence_role: None,
         semantic_model: Some(symbol.provenance.clone()),
+        inside_unclosed_construct: None,
     }
 }
 
@@ -940,7 +1064,10 @@ pub(super) fn anchor_scoped_codeunit_resolution_bounded(
     lookup: &str,
     budget: FuzzyResolveBudget<'_>,
 ) -> Result<CodeUnitResolution, FuzzyResolveStop> {
-    let in_anchor = |unit: &CodeUnit| rel_path_string(unit.source()) == anchor;
+    let (kind, lookup) = split_kind_qualified_lookup(lookup);
+    let in_anchor = |unit: &CodeUnit| {
+        rel_path_string(unit.source()) == anchor && kind.is_none_or(|kind| unit.kind() == kind)
+    };
     if !is_bare_symbol_query(analyzer, lookup) {
         let exact: Vec<_> = resolve_codeunit_exact(analyzer, lookup)
             .into_iter()
@@ -977,14 +1104,10 @@ pub(super) fn resolve_selectable_definitions(
     input: &str,
     resolve: impl Fn(&dyn IAnalyzer, &str) -> CodeUnitResolution,
 ) -> SelectableDefinitionResolution {
-    resolve_selectable_definitions_bounded(
-        analyzer,
-        token,
+    selectable_resolution_from_groups(
         input,
-        FuzzyResolveBudget::unbounded(),
-        |analyzer, lookup| Ok(resolve(analyzer, lookup)),
+        resolve_selectable_definition_groups(analyzer, token, input, resolve),
     )
-    .expect("an unbounded selectable resolution has no stop condition")
 }
 
 /// [`resolve_selectable_definitions`] with a resolver that can report the
@@ -999,23 +1122,29 @@ pub(super) fn resolve_selectable_definitions_bounded(
     budget: FuzzyResolveBudget<'_>,
     resolve: impl Fn(&dyn IAnalyzer, &str) -> Result<CodeUnitResolution, FuzzyResolveStop>,
 ) -> Result<SelectableDefinitionResolution, FuzzyResolveStop> {
-    Ok(
-        match resolve_selectable_definition_groups_bounded(analyzer, token, input, budget, resolve)?
-        {
-            SelectableDefinitionGroups::NotFound(missing) => {
-                SelectableDefinitionResolution::NotFound(missing)
-            }
-            SelectableDefinitionGroups::Groups(groups) => match groups.as_slice() {
-                [_] => SelectableDefinitionResolution::Resolved(
-                    groups.into_iter().flat_map(|(_, units)| units).collect(),
-                ),
-                _ => SelectableDefinitionResolution::Ambiguous(capped_ambiguous_symbol(
-                    input,
-                    groups.into_iter().map(|(selector, _)| selector).collect(),
-                )),
-            },
+    let groups =
+        resolve_selectable_definition_groups_bounded(analyzer, token, input, budget, resolve)?;
+    Ok(selectable_resolution_from_groups(input, groups))
+}
+
+fn selectable_resolution_from_groups(
+    input: &str,
+    groups: SelectableDefinitionGroups,
+) -> SelectableDefinitionResolution {
+    match groups {
+        SelectableDefinitionGroups::NotFound(missing) => {
+            SelectableDefinitionResolution::NotFound(missing)
+        }
+        SelectableDefinitionGroups::Groups(groups) => match groups.as_slice() {
+            [_] => SelectableDefinitionResolution::Resolved(
+                groups.into_iter().flat_map(|(_, units)| units).collect(),
+            ),
+            _ => SelectableDefinitionResolution::Ambiguous(capped_ambiguous_symbol(
+                input,
+                groups.into_iter().map(|(selector, _)| selector).collect(),
+            )),
         },
-    )
+    }
 }
 
 /// [`resolve_selectable_definitions`] without the one-vs-many verdict: every
@@ -1111,7 +1240,8 @@ fn resolve_selectable_definition_groups_bounded(
             // for diagnostics: candidates elsewhere mean the symbol exists
             // but not here (the anchor recovery note's case); nothing
             // anywhere is a genuine not-found.
-            let global_candidates = match resolve(analyzer, lookup)? {
+            let (_, bare_lookup) = split_kind_qualified_lookup(lookup);
+            let global_candidates = match resolve(analyzer, bare_lookup)? {
                 CodeUnitResolution::Resolved(units) | CodeUnitResolution::Ambiguous(units) => units,
                 CodeUnitResolution::NotFound => Vec::new(),
             };
@@ -1319,12 +1449,11 @@ pub(super) fn split_definition_selector_with_workspace_files<'a>(
 /// *before* the input is bound to a language, so it cannot parse `r#type` into
 /// a single (raw-identifier) `Member` segment to prove the `#` is intra-token —
 /// only a language-aware `parse_symbol_path_fq` could, and threading language
-/// into the pre-resolution splitter is a larger change than M2's zero-behavior
-/// bar allows. The `anchor_is_file` resolver check — which the plan keeps as
-/// the semantic validation — already resolves the `DbColumn.r#type` case
-/// correctly (`DbColumn.r` is not a file), so the heuristic is not yet
-/// redundant. The #1128/#1131 anchor canaries pin this behavior unchanged. See
-/// the M2 Decision Log in `.agents/plans/fqname-interned-segments.md`.
+/// into the pre-resolution splitter is a larger change. The `anchor_is_file`
+/// resolver check is the semantic validation and already resolves the
+/// `DbColumn.r#type` case correctly (`DbColumn.r` is not a file), so the
+/// heuristic is not yet redundant. The #1128/#1131 anchor canaries pin this
+/// behavior unchanged.
 fn split_definition_selector_with_resolver<'a>(
     input: &'a str,
     anchor_is_file: impl Fn(&str) -> bool,
@@ -1472,6 +1601,35 @@ pub(super) fn file_anchored_definition_selector(unit: &CodeUnit) -> String {
     format!("{}#{}", rel_path_string(unit.source()), unit.fq_name())
 }
 
+/// The file-anchored selector that names one unit by kind as well as name, for
+/// a macro and a declaration that share a spelling in one file (#4413). The
+/// kind word is the one the outputs print in their `kind` field.
+pub(super) fn kind_qualified_definition_selector(unit: &CodeUnit) -> String {
+    format!(
+        "{}#{}#{}",
+        rel_path_string(unit.source()),
+        unit.kind().display_lowercase(),
+        unit.fq_name()
+    )
+}
+
+/// Splits a kind qualifier off an anchored lookup: `macro#NAME` in a
+/// `path#macro#NAME` selector names the macro `NAME` in that file. A lookup
+/// whose first `#` segment is not a kind word is a plain name, so every legacy
+/// selector keeps its meaning.
+pub(super) fn split_kind_qualified_lookup(lookup: &str) -> (Option<CodeUnitType>, &str) {
+    let Some((keyword, name)) = lookup.split_once('#') else {
+        return (None, lookup);
+    };
+    match CodeUnitType::ALL
+        .into_iter()
+        .find(|kind| kind.display_lowercase() == keyword)
+    {
+        Some(kind) => (Some(kind), name),
+        None => (None, lookup),
+    }
+}
+
 /// Rendered signatures for selector keying: the language's complete bounded
 /// persisted projection when it provides one, otherwise the analyzer's full
 /// read (which may hydrate the owning `FileState`).
@@ -1512,10 +1670,11 @@ impl CppSelectorFacts {
                 );
             facts
                 .roles
-                .insert(unit.clone(), cpp_callable_role_from_metadata(&metadata));
-            facts
-                .linkages
-                .insert(unit.clone(), cpp_callable_linkage_from_metadata(&metadata));
+                .insert(unit.clone(), cpp_callable_unit_role(analyzer, unit));
+            facts.linkages.insert(
+                unit.clone(),
+                brokk_bifrost_cpp::identity::cpp_callable_linkage_from_metadata(metadata),
+            );
 
             let first_range_start = support
                 .declaration_ranges_limited(analyzer, unit, usize::MAX)
@@ -1559,37 +1718,6 @@ impl CppSelectorFacts {
             .copied()
             .unwrap_or(usize::MAX)
     }
-}
-
-fn cpp_callable_role_from_metadata(
-    metadata: &[crate::analyzer::SignatureMetadata],
-) -> CppCallableUnitRole {
-    let declaration = metadata
-        .iter()
-        .any(|metadata| metadata.is_declaration_only());
-    let definition = metadata
-        .iter()
-        .any(|metadata| !metadata.is_declaration_only());
-    match (declaration, definition) {
-        (true, false) => CppCallableUnitRole::DeclarationOnly,
-        (false, true) => CppCallableUnitRole::Definition,
-        (true, true) => CppCallableUnitRole::Both,
-        (false, false) => CppCallableUnitRole::Unknown,
-    }
-}
-
-fn cpp_callable_linkage_from_metadata(
-    metadata: &[crate::analyzer::SignatureMetadata],
-) -> Option<CallableLinkage> {
-    let mut external = false;
-    for metadata in metadata {
-        match metadata.callable_linkage() {
-            Some(CallableLinkage::Internal) => return Some(CallableLinkage::Internal),
-            Some(CallableLinkage::External) => external = true,
-            None => {}
-        }
-    }
-    external.then_some(CallableLinkage::External)
 }
 
 fn cpp_selector_definitions_share_identity_evidence(
@@ -1788,6 +1916,25 @@ fn cpp_canonical_selectors_with_facts(
 /// files are file-anchored so every ambiguity candidate can be re-queried.
 /// Structured canonical selectors may prove that declarations in several files
 /// form one logical definition (currently C++ declaration/definition families).
+/// The `(file, fqn)` spellings that name both a macro and a non-macro
+/// declaration. A macro lives in the preprocessor's namespace, so these two
+/// identities cannot share the plain `path#name` selector (#4413). Two units of
+/// one kind keep sharing it, as overloads always have.
+fn macro_spelling_collisions(overloads: &[CodeUnit]) -> HashSet<(String, String)> {
+    let mut macro_spellings = HashSet::default();
+    let mut declaration_spellings = HashSet::default();
+    for unit in overloads {
+        let spelling = (rel_path_string(unit.source()), unit.fq_name());
+        if unit.kind() == CodeUnitType::Macro {
+            macro_spellings.insert(spelling);
+        } else {
+            declaration_spellings.insert(spelling);
+        }
+    }
+    macro_spellings.retain(|spelling| declaration_spellings.contains(spelling));
+    macro_spellings
+}
+
 pub(super) fn distinct_definitions(
     analyzer: &dyn IAnalyzer,
     token: QueryToken<'_>,
@@ -1801,6 +1948,7 @@ pub(super) fn distinct_definitions(
     let mut scala_fqns_by_display: HashMap<String, HashSet<String>> = HashMap::default();
     let cpp_facts = CppSelectorFacts::load(analyzer, &overloads);
     let cpp_canonical = cpp_canonical_selectors_with_facts(analyzer, token, &overloads, &cpp_facts);
+    let macro_collisions = macro_spelling_collisions(&overloads);
     let mut addressable_sources_by_fqn: HashMap<String, HashSet<String>> = HashMap::default();
     for unit in &overloads {
         let language = language_for_target(unit);
@@ -1834,7 +1982,10 @@ pub(super) fn distinct_definitions(
                     .get(display)
                     .is_some_and(|fqns| fqns.len() > 1)
             });
-        let selector = if spans_addressable_sources {
+        let selector = if macro_collisions.contains(&(rel_path_string(unit.source()), fqn.clone()))
+        {
+            kind_qualified_definition_selector(&unit)
+        } else if spans_addressable_sources {
             cpp_canonical
                 .get(&unit)
                 .cloned()
@@ -2163,22 +2314,7 @@ pub(super) fn likely_file_target_extension(extension: &str) -> bool {
 }
 
 pub(super) fn language_name(language: Language) -> String {
-    match language {
-        Language::None => "none",
-        Language::Java => "java",
-        Language::Go => "go",
-        Language::Cpp => "cpp",
-        Language::JavaScript => "javascript",
-        Language::TypeScript => "typescript",
-        Language::Python => "python",
-        Language::Rust => "rust",
-        Language::Php => "php",
-        Language::Scala => "scala",
-        Language::CSharp => "csharp",
-        Language::Ruby => "ruby",
-        Language::Kotlin => "kotlin",
-    }
-    .to_string()
+    language.config_label().to_string()
 }
 
 #[cfg(test)]
@@ -2192,51 +2328,8 @@ mod tests {
     use crate::test_support::AnalyzerFixture;
     use std::sync::Arc;
 
-    #[test]
-    fn definition_outcome_key_keeps_complete_and_incomplete_misses_distinct() {
-        use crate::analyzer::usages::get_definition::{
-            DefinitionLookupDiagnostic, DefinitionLookupOutcome, DefinitionLookupStatus,
-        };
-        let fixture = crate::inline_project::InlineTestProject::with_language(Language::Cpp)
-            .file("widget.cpp", "struct Widget {};\n")
-            .build();
-        let analyzer = CppAnalyzer::from_project(fixture.project().clone());
-        let scope = AnalyzerQueryScope::new(&analyzer);
-        let complete = DefinitionLookupOutcome {
-            modeled_definitions: Vec::new(),
-            status: DefinitionLookupStatus::NoDefinition,
-            reference: None,
-            definitions: Vec::new(),
-            lexical_definition: None,
-            diagnostics: Vec::new(),
-        };
-        let mut cancelled = complete.clone();
-        cancelled.diagnostics.push(DefinitionLookupDiagnostic {
-            kind: "cancelled".to_string(),
-            message: "cancelled fixture lookup".to_string(),
-            claim: None,
-        });
-        let result = crate::searchtools::definitions::collapse_context_outcomes(
-            &analyzer,
-            scope.token(),
-            DefinitionContextReferenceQuery {
-                symbol: "Widget".to_string(),
-                context: "Missing Missing".to_string(),
-                target: "Missing".to_string(),
-            },
-            vec![complete, cancelled],
-        );
-        assert_eq!(result.status, "ambiguous", "{result:?}");
-        assert!(!result.complete, "{result:?}");
-        assert_eq!(
-            result.incomplete_reason,
-            Some(DefinitionLookupIncompleteReason::Cancelled)
-        );
-    }
-
-    /// Prove, for one language, that persisted selector projections carry the
-    /// same grouping as a freshly built workspace and that rendering the
-    /// selectors from a reopened workspace hydrates no `FileState`.
+    /// Prove that persisted selector projections match fresh grouping without
+    /// hydrating file states from the reopened workspace.
     fn assert_selector_parity_without_full_hydration(
         language: Language,
         files: &[(&str, &str)],
@@ -2282,113 +2375,95 @@ mod tests {
     }
 
     #[test]
-    fn go_selectors_match_persisted_projection_without_full_hydration() {
-        assert_selector_parity_without_full_hydration(
-            Language::Go,
-            &[
-                (
-                    "alpha/one.go",
-                    "package alpha\n\nfunc compute(value int) int { return value }\n",
-                ),
-                (
-                    "alpha/two.go",
-                    "package alpha\n\nfunc compute(value int) int { return value }\n",
-                ),
-            ],
-            "alpha.compute",
-            |analyzer| {
-                resolve_analyzer::<GoAnalyzer>(analyzer)
-                    .expect("Go analyzer")
-                    .reset_full_hydration_count_for_test();
+    #[brokk_bifrost_test_macros::hardwon(
+        "#3078: Combines a conclusive missing definition with a cancelled miss and checks aggregation preserves ambiguous-but-incomplete status"
+    )]
+    fn definition_outcome_key_keeps_complete_and_incomplete_misses_distinct() {
+        use crate::analyzer::usages::get_definition::{
+            DefinitionLookupDiagnostic, DefinitionLookupOutcome, DefinitionLookupStatus,
+        };
+        let fixture = crate::inline_project::InlineTestProject::with_language(Language::Cpp)
+            .file("widget.cpp", "struct Widget {};\n")
+            .build();
+        let analyzer = CppAnalyzer::from_project(fixture.project().clone());
+        let scope = AnalyzerQueryScope::new(&analyzer);
+        let complete = DefinitionLookupOutcome {
+            modeled_definitions: Vec::new(),
+            status: DefinitionLookupStatus::NoDefinition,
+            reference: None,
+            definitions: Vec::new(),
+            lexical_definition: None,
+            diagnostics: Vec::new(),
+        };
+        let mut cancelled = complete.clone();
+        cancelled.diagnostics.push(DefinitionLookupDiagnostic {
+            kind: "cancelled".to_string(),
+            message: "cancelled fixture lookup".to_string(),
+            claim: None,
+        });
+        let result = crate::searchtools::definitions::collapse_context_outcomes(
+            &analyzer,
+            scope.token(),
+            DefinitionContextReferenceQuery {
+                symbol: "Widget".to_string(),
+                context: "Missing Missing".to_string(),
+                target: "Missing".to_string(),
             },
-            |analyzer| {
-                resolve_analyzer::<GoAnalyzer>(analyzer)
-                    .expect("Go analyzer")
-                    .full_hydration_count_for_test()
-            },
+            vec![complete, cancelled],
+        );
+        assert_eq!(result.status, "ambiguous", "{result:?}");
+        assert!(!result.complete, "{result:?}");
+        assert_eq!(
+            result.incomplete_reason,
+            Some(DefinitionLookupIncompleteReason::Cancelled)
         );
     }
 
     #[test]
-    fn python_selectors_match_persisted_projection_without_full_hydration() {
-        assert_selector_parity_without_full_hydration(
-            Language::Python,
+    #[brokk_bifrost_test_macros::hardwon(
+        "#1707: Checks C++ declaration and definition collapse to the canonical header selector using persisted facts only"
+    )]
+    fn cpp_canonical_selectors_use_persisted_facts_without_full_hydration() {
+        let fixture = AnalyzerFixture::new_for_language(
+            Language::Cpp,
             &[
-                ("alpha.py", "def compute(value):\n    return value\n"),
+                ("include/api.h", "int compute(int value);\n"),
                 (
-                    "alpha/__init__.py",
-                    "def compute(value):\n    return value\n",
+                    "src/api.cpp",
+                    "#include \"../include/api.h\"\nint compute(int value) { return value; }\n",
                 ),
             ],
-            "alpha.compute",
-            |analyzer| {
-                resolve_analyzer::<PythonAnalyzer>(analyzer)
-                    .expect("Python analyzer")
-                    .reset_full_hydration_count_for_test();
-            },
-            |analyzer| {
-                resolve_analyzer::<PythonAnalyzer>(analyzer)
-                    .expect("Python analyzer")
-                    .full_hydration_count_for_test()
-            },
+        );
+        let initial = fixture.analyzer.analyzer();
+        assert_eq!(2, initial.definitions("compute").count());
+
+        let reopened = WorkspaceAnalyzer::build_ephemeral_footgun(
+            Arc::new(fixture.test_project().clone()),
+            AnalyzerConfig::default(),
+        )
+        .expect("ephemeral workspace should build");
+        let analyzer = reopened.analyzer();
+        let cpp = resolve_analyzer::<CppAnalyzer>(analyzer).expect("C++ analyzer");
+        let definitions: Vec<_> = analyzer.definitions("compute").collect();
+        assert_eq!(2, definitions.len());
+
+        cpp.reset_full_hydration_count_for_test();
+        let scope = AnalyzerQueryScope::new(analyzer);
+        let token = scope.token();
+        let selectors = cpp_canonical_selectors(analyzer, token, &definitions);
+        assert!(
+            selectors
+                .values()
+                .all(|selector| selector == "include/api.h#compute")
+        );
+        assert_eq!(
+            0,
+            cpp.full_hydration_count_for_test(),
+            "selector facts must not hydrate the persisted header or implementation"
         );
     }
 
-    #[test]
-    fn rust_selectors_match_persisted_projection_without_full_hydration() {
-        assert_selector_parity_without_full_hydration(
-            Language::Rust,
-            &[
-                (
-                    "src/alpha.rs",
-                    "pub fn compute(value: i32) -> i32 { value }\n",
-                ),
-                (
-                    "src/alpha/mod.rs",
-                    "pub fn compute(value: i32) -> i32 { value }\n",
-                ),
-            ],
-            "alpha.compute",
-            |analyzer| {
-                resolve_analyzer::<RustAnalyzer>(analyzer)
-                    .expect("Rust analyzer")
-                    .reset_full_hydration_count_for_test();
-            },
-            |analyzer| {
-                resolve_analyzer::<RustAnalyzer>(analyzer)
-                    .expect("Rust analyzer")
-                    .full_hydration_count_for_test()
-            },
-        );
-    }
-
-    #[test]
-    fn kotlin_selectors_match_persisted_projection_without_full_hydration() {
-        assert_selector_parity_without_full_hydration(
-            Language::Kotlin,
-            &[
-                (
-                    "alpha/One.kt",
-                    "package alpha\n\nfun compute(value: Int): Int = value\n",
-                ),
-                (
-                    "alpha/Two.kt",
-                    "package alpha\n\nfun compute(value: Int): Int = value\n",
-                ),
-            ],
-            "alpha.compute",
-            |analyzer| {
-                resolve_analyzer::<KotlinAnalyzer>(analyzer)
-                    .expect("Kotlin analyzer")
-                    .reset_full_hydration_count_for_test();
-            },
-            |analyzer| {
-                resolve_analyzer::<KotlinAnalyzer>(analyzer)
-                    .expect("Kotlin analyzer")
-                    .full_hydration_count_for_test()
-            },
-        );
-    }
+    // Restored persisted-projection coverage for each removed language adapter.
 
     #[test]
     fn php_selectors_match_persisted_projection_without_full_hydration() {
@@ -2591,43 +2666,111 @@ mod tests {
     }
 
     #[test]
-    fn cpp_canonical_selectors_use_persisted_facts_without_full_hydration() {
-        let fixture = AnalyzerFixture::new_for_language(
-            Language::Cpp,
+    fn go_selectors_match_persisted_projection_without_full_hydration() {
+        assert_selector_parity_without_full_hydration(
+            Language::Go,
             &[
-                ("include/api.h", "int compute(int value);\n"),
                 (
-                    "src/api.cpp",
-                    "#include \"../include/api.h\"\nint compute(int value) { return value; }\n",
+                    "alpha/one.go",
+                    "package alpha\n\nfunc compute(value int) int { return value }\n",
+                ),
+                (
+                    "alpha/two.go",
+                    "package alpha\n\nfunc compute(value int) int { return value }\n",
                 ),
             ],
+            "alpha.compute",
+            |analyzer| {
+                resolve_analyzer::<GoAnalyzer>(analyzer)
+                    .expect("Go analyzer")
+                    .reset_full_hydration_count_for_test();
+            },
+            |analyzer| {
+                resolve_analyzer::<GoAnalyzer>(analyzer)
+                    .expect("Go analyzer")
+                    .full_hydration_count_for_test()
+            },
         );
-        let initial = fixture.analyzer.analyzer();
-        assert_eq!(2, initial.definitions("compute").count());
+    }
 
-        let reopened = WorkspaceAnalyzer::build_ephemeral_footgun(
-            Arc::new(fixture.test_project().clone()),
-            AnalyzerConfig::default(),
-        )
-        .expect("ephemeral workspace should build");
-        let analyzer = reopened.analyzer();
-        let cpp = resolve_analyzer::<CppAnalyzer>(analyzer).expect("C++ analyzer");
-        let definitions: Vec<_> = analyzer.definitions("compute").collect();
-        assert_eq!(2, definitions.len());
-
-        cpp.reset_full_hydration_count_for_test();
-        let scope = AnalyzerQueryScope::new(analyzer);
-        let token = scope.token();
-        let selectors = cpp_canonical_selectors(analyzer, token, &definitions);
-        assert!(
-            selectors
-                .values()
-                .all(|selector| selector == "include/api.h#compute")
+    #[test]
+    fn python_selectors_match_persisted_projection_without_full_hydration() {
+        assert_selector_parity_without_full_hydration(
+            Language::Python,
+            &[
+                ("alpha.py", "def compute(value):\n    return value\n"),
+                (
+                    "alpha/__init__.py",
+                    "def compute(value):\n    return value\n",
+                ),
+            ],
+            "alpha.compute",
+            |analyzer| {
+                resolve_analyzer::<PythonAnalyzer>(analyzer)
+                    .expect("Python analyzer")
+                    .reset_full_hydration_count_for_test();
+            },
+            |analyzer| {
+                resolve_analyzer::<PythonAnalyzer>(analyzer)
+                    .expect("Python analyzer")
+                    .full_hydration_count_for_test()
+            },
         );
-        assert_eq!(
-            0,
-            cpp.full_hydration_count_for_test(),
-            "selector facts must not hydrate the persisted header or implementation"
+    }
+
+    #[test]
+    fn rust_selectors_match_persisted_projection_without_full_hydration() {
+        assert_selector_parity_without_full_hydration(
+            Language::Rust,
+            &[
+                (
+                    "src/alpha.rs",
+                    "pub fn compute(value: i32) -> i32 { value }\n",
+                ),
+                (
+                    "src/alpha/mod.rs",
+                    "pub fn compute(value: i32) -> i32 { value }\n",
+                ),
+            ],
+            "alpha.compute",
+            |analyzer| {
+                resolve_analyzer::<RustAnalyzer>(analyzer)
+                    .expect("Rust analyzer")
+                    .reset_full_hydration_count_for_test();
+            },
+            |analyzer| {
+                resolve_analyzer::<RustAnalyzer>(analyzer)
+                    .expect("Rust analyzer")
+                    .full_hydration_count_for_test()
+            },
+        );
+    }
+
+    #[test]
+    fn kotlin_selectors_match_persisted_projection_without_full_hydration() {
+        assert_selector_parity_without_full_hydration(
+            Language::Kotlin,
+            &[
+                (
+                    "alpha/One.kt",
+                    "package alpha\n\nfun compute(value: Int): Int = value\n",
+                ),
+                (
+                    "alpha/Two.kt",
+                    "package alpha\n\nfun compute(value: Int): Int = value\n",
+                ),
+            ],
+            "alpha.compute",
+            |analyzer| {
+                resolve_analyzer::<KotlinAnalyzer>(analyzer)
+                    .expect("Kotlin analyzer")
+                    .reset_full_hydration_count_for_test();
+            },
+            |analyzer| {
+                resolve_analyzer::<KotlinAnalyzer>(analyzer)
+                    .expect("Kotlin analyzer")
+                    .full_hydration_count_for_test()
+            },
         );
     }
 }

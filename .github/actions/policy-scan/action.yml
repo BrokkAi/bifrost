@@ -19,13 +19,51 @@ inputs:
       install and uses a release or debug `bifrost` binary from the checkout,
       otherwise the `bifrost` already on PATH.
     required: false
-    default: v0.13.0
-  policy-packs:
-    description: Space-separated built-in pack IDs to run.
+    default: v0.13.1
+  packs-source:
+    description: >-
+      Trusted JSON source selection with repository, exact rules_version and
+      manifest_sha256 plus semantic_manifest_sha256. Optional inventory_url and inventory_sha256 select an
+      HTTPS archive mirror. Invalid explicit selections never fall back.
+      When empty and the scan needs host content, the action acquires the exact
+      public 0.1.1 rules and semantic descriptor pins. An empty value with
+      caller-prepared roots, or with only policy files, acquires nothing.
     required: false
-    default: bifrost.code-smells
+    default: ''
+  packs-token:
+    description: >-
+      Existing Actions secret with contents read on the selected private GitHub
+      repository. Used only during acquisition on trusted push/workflow_dispatch
+      events; prohibited on PRs. Authenticated content is never saved to Actions cache.
+    required: false
+    default: ''
+  packs-cache:
+    description: Restore and save verified external content for this exact source and engine profile.
+    required: false
+    default: 'true'
+  packs-offline:
+    description: Require verified cached external content without network requests. A miss fails.
+    required: false
+    default: 'false'
+  policy-packs:
+    description: >-
+      Space-separated pack IDs from the selected host catalog to run. Leave unset
+      to run bifrost.code-smells, unless policy-ids or policy-categories is set;
+      then only those selectors run. An explicit value, including '', is used as
+      given and intersects with the other selectors.
+    required: false
+    # Sentinel, not a pack ID: an unset input and an explicit '' must differ.
+    # The "Resolve policy pack selection" step maps it. Keep the two in sync.
+    default: '<default>'
   policy-ids:
     description: Space-separated policy IDs to run.
+    required: false
+    default: ''
+  exclude-policy-ids:
+    description: >-
+      Space-separated built-in policy IDs to skip after the selection inputs
+      resolve. Each must be selected by them, and at least one policy must
+      remain. Excluded policies are recorded in the report evaluation context.
     required: false
     default: ''
   policy-categories:
@@ -76,7 +114,7 @@ inputs:
     required: false
     default: bifrost-policy
   cache:
-    description: Restore and save the shared repository analyzer cache, scoped to this working directory and exact build.
+    description: Restore and save the shared analyzer cache for this workspace and build; disabled for authenticated pack acquisition.
     required: false
     default: 'true'
   working-directory:
@@ -85,6 +123,12 @@ inputs:
     default: '.'
 
 outputs:
+  pack-selection-id:
+    description: Exact verified content selection identity; acquisition does not prove scan coverage.
+    value: ${{ steps.packs.outputs.selection-id }}
+  pack-cache-reused:
+    description: Whether verified extracted content was reused after rechecking all bytes.
+    value: ${{ steps.packs.outputs.cache-reused }}
   analyzer-cache-hit:
     description: Whether a compatible analyzer cache snapshot was restored (empty when caching is disabled).
     value: ${{ steps.analyzer-cache.outputs.cache-matched-key != '' }}
@@ -104,6 +148,17 @@ outputs:
 runs:
   using: composite
   steps:
+    - name: Clear previous scan output
+      id: scan-output
+      shell: bash
+      env:
+        WORKDIR: ${{ inputs.working-directory }}
+        SARIF_FILE: ${{ inputs.sarif-file }}
+      run: |
+        set -euo pipefail
+        cd "${WORKDIR}"
+        rm -f -- "${SARIF_FILE}" "${SARIF_FILE}.stderr.log"
+
     - name: Install bifrost
       id: install
       shell: bash
@@ -162,9 +217,121 @@ runs:
         # executable lives inside it, next to the license files.
         echo "bifrost_bin=${dir}/${stage}/${bin}" >> "${GITHUB_OUTPUT}"
 
+    - name: Resolve policy pack selection
+      id: policy-selection
+      shell: bash
+      env:
+        POLICY_PACKS: ${{ inputs.policy-packs }}
+        POLICY_IDS: ${{ inputs.policy-ids }}
+        POLICY_CATEGORIES: ${{ inputs.policy-categories }}
+      run: |
+        set -euo pipefail
+        packs="${POLICY_PACKS}"
+        # The default pack applies only when the caller left policy-packs unset
+        # and named no policy-ids or policy-categories. An explicit selector
+        # replaces the default pack instead of intersecting with it (#3845).
+        if [ "${packs}" = '<default>' ]; then
+          if [ -n "${POLICY_IDS}" ] || [ -n "${POLICY_CATEGORIES}" ]; then
+            packs=''
+          else
+            packs=bifrost.code-smells
+          fi
+        fi
+        echo "packs=${packs}" >> "${GITHUB_OUTPUT}"
+
+    - name: Resolve pack acquisition identity
+      id: pack-identity
+      shell: bash
+      env:
+        BIFROST_BIN: ${{ steps.install.outputs.bifrost_bin }}
+        PACK_SOURCE: ${{ inputs.packs-source }}
+        DEFAULT_PACK_SOURCE: '{"repository":"https://github.com/BrokkAi/bifrost-packs","rules_version":"0.1.1","manifest_sha256":"6f188826fe5b4918967100d8c0816c8b230a13d4a47300497d2294390a112388","semantic_manifest_sha256":"f28356cb17e85d84de3432de837f2d045e554e6d3d8d1f08018015e4960446d8"}'
+        POLICY_ROOT: ${{ env.BIFROST_OPEN_POLICY_PACK_ROOT }}
+        SEMANTIC_ROOT: ${{ env.BIFROST_OPEN_SEMANTIC_PACK_BUNDLE }}
+        POLICY_PACKS: ${{ steps.policy-selection.outputs.packs }}
+        POLICY_IDS: ${{ inputs.policy-ids }}
+        POLICY_CATEGORIES: ${{ inputs.policy-categories }}
+        POLICY_FILES: ${{ inputs.policy-files }}
+      run: |
+        set -euo pipefail
+        state=$(mktemp -d "${RUNNER_TEMP}/bifrost-pack-action.XXXXXX")
+        echo "state=${state}" >> "$GITHUB_OUTPUT"
+        acquire=true
+        if [ -z "${PACK_SOURCE}" ] && { [ -n "${POLICY_ROOT}" ] || [ -n "${SEMANTIC_ROOT}" ]; }; then
+          if [ -z "${POLICY_ROOT}" ] || [ -z "${SEMANTIC_ROOT}" ]; then
+            echo '::error::Caller-prepared content requires both policy and semantic roots.'
+            exit 1
+          fi
+          acquire=false
+        elif [ -z "${PACK_SOURCE}" ] && [ -z "${POLICY_PACKS}" ] && [ -z "${POLICY_IDS}" ] && [ -z "${POLICY_CATEGORIES}" ] && [ -n "${POLICY_FILES}" ]; then
+          acquire=false
+        fi
+        echo "acquire=${acquire}" >> "$GITHUB_OUTPUT"
+        if [ "${acquire}" = false ]; then
+          echo 'identity=' >> "$GITHUB_OUTPUT"
+          echo 'cache-path=' >> "$GITHUB_OUTPUT"
+          echo 'source=' >> "$GITHUB_OUTPUT"
+          exit 0
+        fi
+        # Apply the public pin only after deciding to acquire: an empty input
+        # must still mean "no source" for the caller-prepared and file-only cases.
+        export PACK_SOURCE="${PACK_SOURCE:-${DEFAULT_PACK_SOURCE}}"
+        echo "source=${PACK_SOURCE}" >> "$GITHUB_OUTPUT"
+        cache_path="${RUNNER_TEMP}/bifrost-action-packs"
+        identity_json="$("${BIFROST_BIN}" prepare-open-packs --cache-dir "${cache_path}" --identity-only)"
+        identity="$(jq -er '.identity | select(test("^[0-9a-f]{64}$"))' <<<"${identity_json}")"
+        echo "identity=${identity}" >> "$GITHUB_OUTPUT"
+        echo "cache-path=${cache_path}" >> "$GITHUB_OUTPUT"
+
+    - name: Restore pinned content cache
+      id: pack-cache
+      if: steps.pack-identity.outputs.acquire == 'true' && inputs.packs-cache == 'true' && inputs.packs-token == ''
+      uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+      with:
+        path: ${{ steps.pack-identity.outputs.cache-path }}
+        key: bifrost-action-packs-v1-${{ runner.os }}-${{ runner.arch }}-${{ steps.pack-identity.outputs.identity }}-selection-pending
+        restore-keys: |
+          bifrost-action-packs-v1-${{ runner.os }}-${{ runner.arch }}-${{ steps.pack-identity.outputs.identity }}-
+
+    - name: Acquire and reverify selected external content
+      id: packs
+      if: steps.pack-identity.outputs.acquire == 'true'
+      shell: bash
+      env:
+        PACK_TOKEN: ${{ inputs.packs-token }}
+        PACK_OFFLINE: ${{ inputs.packs-offline }}
+        PACK_SOURCE: ${{ steps.pack-identity.outputs.source }}
+        BIFROST_BIN: ${{ steps.install.outputs.bifrost_bin }}
+        CACHE_PATH: ${{ steps.pack-identity.outputs.cache-path }}
+        STATE_PATH: ${{ steps.pack-identity.outputs.state }}
+      run: |
+        set -euo pipefail
+        if [ -n "${PACK_TOKEN}" ] && [[ "${GITHUB_EVENT_NAME}" != push && "${GITHUB_EVENT_NAME}" != workflow_dispatch ]]; then
+          echo '::error::Private pack credentials require a trusted push or manually approved workflow.'
+          exit 1
+        fi
+        if [ "${PACK_OFFLINE}" = true ]; then export BIFROST_OPEN_PACKS_OFFLINE=1; fi
+        receipt="${STATE_PATH}/receipt.json"
+        env_file="${STATE_PATH}/environment.json"
+        "${BIFROST_BIN}" prepare-open-packs --cache-dir "${CACHE_PATH}" --receipt-path "${receipt}" --env-path "${env_file}"
+        jq -e 'type == "object" and .status == "selected" and (.selection.selection_id | type == "string" and length > 0) and (.selection.cache_reused | type == "boolean") and .selection.receipt.status == "qualified"' "${receipt}" >/dev/null
+        jq -e 'type == "object" and ((keys | sort) == ["BIFROST_OPEN_POLICY_PACK_ROOT", "BIFROST_SEMANTIC_PACK_CACHE_ROOT"] or (keys | sort) == ["BIFROST_OPEN_POLICY_PACK_ROOT", "BIFROST_OPEN_SEMANTIC_PACK_BUNDLE", "BIFROST_SEMANTIC_PACK_CACHE_ROOT"]) and all(.[]; type == "string" and length > 0)' "${env_file}" >/dev/null
+        echo "selection-id=$(jq -er '.selection.selection_id' "${receipt}")" >> "${GITHUB_OUTPUT}"
+        echo "cache-reused=$(jq -er '.selection.cache_reused' "${receipt}")" >> "${GITHUB_OUTPUT}"
+        echo "policy-root=$(jq -er '.BIFROST_OPEN_POLICY_PACK_ROOT' "${env_file}")" >> "${GITHUB_OUTPUT}"
+        echo "semantic-bundle=$(jq -r '.BIFROST_OPEN_SEMANTIC_PACK_BUNDLE // empty' "${env_file}")" >> "${GITHUB_OUTPUT}"
+        echo "semantic-cache=$(jq -er '.BIFROST_SEMANTIC_PACK_CACHE_ROOT' "${env_file}")" >> "${GITHUB_OUTPUT}"
+
+    - name: Save verified selected content cache
+      if: steps.packs.outputs.selection-id != '' && inputs.packs-cache == 'true' && inputs.packs-token == '' && inputs.packs-offline != 'true'
+      uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+      with:
+        path: ${{ steps.pack-identity.outputs.cache-path }}
+        key: bifrost-action-packs-v1-${{ runner.os }}-${{ runner.arch }}-${{ steps.pack-identity.outputs.identity }}-${{ steps.packs.outputs.selection-id }}
+
     - name: Resolve analyzer cache identity
       id: analyzer-cache-identity
-      if: inputs.cache == 'true'
+      if: inputs.cache == 'true' && inputs.packs-token == ''
       shell: bash
       env:
         BIFROST_BIN: ${{ steps.install.outputs.bifrost_bin }}
@@ -221,7 +388,7 @@ runs:
 
     - name: Restore analyzer cache
       id: analyzer-cache
-      if: inputs.cache == 'true'
+      if: inputs.cache == 'true' && inputs.packs-token == ''
       uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
       with:
         path: ${{ steps.analyzer-cache-identity.outputs.cache-path }}
@@ -233,22 +400,31 @@ runs:
       id: run
       shell: bash
       env:
+        SELECTED_POLICY_ROOT: ${{ steps.packs.outputs.policy-root }}
+        SELECTED_SEMANTIC_BUNDLE: ${{ steps.packs.outputs.semantic-bundle }}
+        SELECTED_SEMANTIC_CACHE: ${{ steps.packs.outputs.semantic-cache }}
         WORKDIR: ${{ inputs.working-directory }}
         SARIF_FILE: ${{ inputs.sarif-file }}
         FAIL_ON: ${{ inputs.fail-on }}
-        POLICY_PACKS: ${{ inputs.policy-packs }}
+        POLICY_PACKS: ${{ steps.policy-selection.outputs.packs }}
         POLICY_IDS: ${{ inputs.policy-ids }}
+        EXCLUDE_POLICY_IDS: ${{ inputs.exclude-policy-ids }}
         POLICY_CATEGORIES: ${{ inputs.policy-categories }}
         POLICY_FILES: ${{ inputs.policy-files }}
         DIFF_BASE: ${{ inputs.diff-base }}
         FULL_EVALUATION: ${{ inputs.full-evaluation }}
-        MANAGED_CACHE: ${{ inputs.cache }}
+        MANAGED_CACHE: ${{ inputs.cache == 'true' && inputs.packs-token == '' }}
         MANAGED_CACHE_ROOT: ${{ steps.analyzer-cache-identity.outputs.cache-root }}
         POLICY_TIMINGS: ${{ inputs.policy-timings }}
         BIFROST_BIN: ${{ steps.install.outputs.bifrost_bin }}
       run: |
         set -euo pipefail
         cd "${WORKDIR}"
+        if [ -n "${SELECTED_POLICY_ROOT:-}" ]; then
+          export BIFROST_OPEN_POLICY_PACK_ROOT="${SELECTED_POLICY_ROOT}"
+          export BIFROST_OPEN_SEMANTIC_PACK_BUNDLE="${SELECTED_SEMANTIC_BUNDLE}"
+          export BIFROST_SEMANTIC_PACK_CACHE_ROOT="${SELECTED_SEMANTIC_CACHE}"
+        fi
         if [ "${MANAGED_CACHE:-false}" = true ]; then
           unset BIFROST_CACHE_ROOT
           # This is the standard repository cache directory used by CLI and
@@ -259,6 +435,7 @@ runs:
         args=(--root . --format sarif --output "${SARIF_FILE}" --fail-on "${FAIL_ON}")
         for p in ${POLICY_PACKS}; do args+=(--policy-pack "${p}"); done
         for p in ${POLICY_IDS}; do args+=(--policy-id "${p}"); done
+        for p in ${EXCLUDE_POLICY_IDS}; do args+=(--exclude-policy-id "${p}"); done
         for p in ${POLICY_CATEGORIES}; do args+=(--policy-category "${p}"); done
         for p in ${POLICY_FILES}; do args+=(--policy-file "${p}"); done
         if [ -n "${DIFF_BASE}" ]; then args+=(--diff-base "${DIFF_BASE}"); fi
@@ -306,7 +483,7 @@ runs:
 
     - name: Qualify analyzer cache snapshot
       id: analyzer-cache-qualification
-      if: always() && inputs.cache == 'true'
+      if: always() && inputs.cache == 'true' && inputs.packs-token == ''
       shell: bash
       env:
         CODE: ${{ steps.run.outputs.exit-code }}
@@ -359,14 +536,14 @@ runs:
     # policy-gate failure. Restore prefixes still require exact build/workspace
     # identity, and incomplete scans never publish a snapshot.
     - name: Save analyzer cache
-      if: always() && inputs.cache == 'true' && steps.analyzer-cache-qualification.outputs.eligible == 'true'
+      if: always() && inputs.cache == 'true' && inputs.packs-token == '' && steps.analyzer-cache-qualification.outputs.eligible == 'true'
       uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
       with:
         path: ${{ steps.analyzer-cache-identity.outputs.cache-path }}
         key: ${{ steps.analyzer-cache.outputs.cache-primary-key }}
 
     - name: Retain SARIF report and diagnostics
-      if: always() && inputs.artifact-name != ''
+      if: always() && inputs.artifact-name != '' && steps.scan-output.outcome == 'success'
       uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
       with:
         name: ${{ inputs.artifact-name }}
@@ -443,10 +620,19 @@ runs:
         FAIL_ON: ${{ inputs.fail-on }}
         DIFF_BASE: ${{ inputs.diff-base }}
         SARIF_PATH: ${{ steps.run.outputs.sarif-file }}
+        STDERR_PATH: ${{ steps.run.outputs.stderr-file }}
       run: |
         set -euo pipefail
         if [ ! -f "${SARIF_PATH}" ]; then
-          echo "::error::Bifrost policy scan did not emit a SARIF report at ${SARIF_PATH}."
+          # bifrost writes no SARIF when it rejects the selection before a scan,
+          # for example when policy-packs, policy-ids and policy-categories
+          # intersect to nothing. Its stderr names the selectors.
+          if [ -s "${STDERR_PATH:-}" ]; then
+            echo "::group::Bifrost stderr (no SARIF report was written)"
+            cat "${STDERR_PATH}"
+            echo "::endgroup::"
+          fi
+          echo "::error::Bifrost policy scan did not emit a SARIF report at ${SARIF_PATH} (bifrost exit status ${CODE:-unknown}). The stderr above names the cause."
           exit 1
         fi
         if ! command -v jq >/dev/null 2>&1; then
@@ -471,9 +657,13 @@ runs:
         case "${CODE}" in
           0)
             if ! jq -e '
-              all(.runs[]; all(.invocations[]; .executionSuccessful == true))
+              all(.runs[];
+                all(.invocations[]; .executionSuccessful == true)
+                and (.properties["bifrost.policyRuns"] | type == "array" and length > 0)
+                and all(.properties["bifrost.policyRuns"][];
+                  .completion.type == "complete" or .completion.type == "proven_by_summary"))
             ' "${SARIF_PATH}" >/dev/null; then
-              echo "::error::Bifrost returned clean status 0 but the SARIF report contains an unsuccessful invocation."
+              echo "::error::Bifrost returned clean status 0 but SARIF lacks successful completed policy execution."
               exit 1
             fi
             echo "Bifrost policy scan is clean."

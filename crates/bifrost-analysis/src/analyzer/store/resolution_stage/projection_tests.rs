@@ -1,4 +1,5 @@
 use super::*;
+use crate::analyzer::Language;
 use crate::analyzer::resolution::{
     BindingFragmentId, BindingNodeId, PartialPathId, ResolutionRegisteredIdentities,
     SelectedResolutionMountOrdinal, StackVariableId, lower_resolution_facts_for_selection,
@@ -218,6 +219,7 @@ fn ordinary_identity_lookup_preserves_late_shared_alias() {
         selection.requested_mount_rows(),
         selection.persisted_mount_count(),
         selection.authority_validations(),
+        selection.authority_request_memo(),
     );
     let live = CancellationToken::new();
     let identity = ResolutionSemanticIdentity::shared(request);
@@ -1037,6 +1039,7 @@ fn ordinary_lookup_families_preserve_missing_and_late_shared_aliases() {
             selection.requested_mount_rows(),
             selection.persisted_mount_count(),
             selection.authority_validations(),
+            selection.authority_request_memo(),
         );
         let semantic = SemanticId::shared_name(request);
         assert_eq!(

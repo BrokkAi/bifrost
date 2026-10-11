@@ -226,7 +226,12 @@ pub(super) fn call_declaration_expansions(
             }
             budget.provenance_steps += next_depth;
             budget.pipeline_rows += 1;
-            let call_site = CallSiteValue(site, CallBindingStatus::Unavailable);
+            let call_site = CallSiteValue::new(
+                site,
+                CallBindingStatus::Unavailable,
+                None,
+                CallSiteIdentityFacts::default(),
+            );
             let path_tail = paths.len();
             paths.push(CallPathNode {
                 value: next.clone(),
@@ -287,23 +292,19 @@ fn call_path_contains(
 
 fn call_trace_values(
     paths: &[CallPathNode],
-    mut tail: usize,
+    tail: usize,
     depth: usize,
 ) -> Vec<(PipelineTraceValue, Option<PipelineVia>)> {
-    let mut values = Vec::with_capacity(depth);
-    loop {
-        let node = &paths[tail];
-        values.push((
-            PipelineTraceValue::Declaration(node.value.clone()),
-            Some(PipelineVia::CallSite(node.via.clone())),
-        ));
-        let Some(parent) = node.parent else {
-            break;
-        };
-        tail = parent;
-    }
-    values.reverse();
-    values
+    super::parent_path_values(tail, depth, |index| {
+        let node = &paths[index];
+        (
+            (
+                PipelineTraceValue::Declaration(node.value.clone()),
+                Some(PipelineVia::CallSite(node.via.clone())),
+            ),
+            node.parent,
+        )
+    })
 }
 
 #[allow(clippy::too_many_arguments)]

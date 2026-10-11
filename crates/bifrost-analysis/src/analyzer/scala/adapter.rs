@@ -15,7 +15,9 @@ use brokk_bifrost_jvm::scala::test_detection::scala_contains_tests;
 use brokk_bifrost_jvm::scala::{scala_normalize_full_name, scala_simple_type_name};
 use tree_sitter::Tree;
 
-use crate::analyzer::tree_sitter_analyzer::lookup_suffix_candidates;
+use crate::analyzer::tree_sitter_analyzer::{
+    DOT_LOOKUP_CANDIDATE_SEPARATORS, lookup_suffix_candidates,
+};
 
 #[derive(Debug, Clone, Default)]
 pub(crate) struct ScalaAdapter;
@@ -62,7 +64,7 @@ impl LanguageAdapter for ScalaAdapter {
     /// Scala peels on `.` alone: its cons class is named `::`, so a `::` in a
     /// scala spelling is a declaration's own name and never a join.
     fn lookup_candidate_separators(&self) -> &'static [&'static str] {
-        &["."]
+        DOT_LOOKUP_CANDIDATE_SEPARATORS
     }
 
     fn lookup_candidate_short_names(&self, normalized_fq_name: &str) -> Vec<String> {

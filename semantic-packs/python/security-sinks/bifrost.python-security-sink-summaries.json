@@ -1,0 +1,1845 @@
+{
+  "schema_version": 14,
+  "pack_id": "bifrost.python-security-sink-summaries",
+  "version": "0.3.2",
+  "producer": {
+    "name": "bifrost-reviewed-python-models",
+    "version": "0.1.0"
+  },
+  "language": "python",
+  "ecosystem": "python",
+  "compatibility": {
+    "toolchains": [
+      {
+        "name": "cpython",
+        "requirement": ">=3.13.5, <3.13.6"
+      }
+    ]
+  },
+  "provenance": {
+    "source": "Python standard-library reference and pinned Typeshed stubs for socket, XML, regex, logging, builtins.print, file-output, and credential APIs",
+    "revision": "Typeshed 1620e225476597f34177351ef913dc8390dade30; CPython v3.13.5; reviewed polynomial ReDoS transfers from issues #4324/#4342"
+  },
+  "license": "PSF-2.0",
+  "completeness": "complete",
+  "safety": {
+    "generated_code_only": false,
+    "review_required": false
+  },
+  "shards": [
+    {
+      "id": "summaries.python-security-sinks",
+      "activation": [
+        {
+          "targets": [],
+          "configurations": []
+        }
+      ],
+      "payload": {
+        "kind": "procedure_summaries",
+        "summaries": [
+          {
+            "id": "summary.python.socket.socket.bind",
+            "target": {
+              "path": "socket.pyi",
+              "symbol": "socket.socket.bind(address)",
+              "has_receiver": true,
+              "parameter_count": 1,
+              "formals": [
+                {
+                  "name": "address"
+                }
+              ]
+            },
+            "completeness": "complete",
+            "covers_overrides": false,
+            "locations": [],
+            "transfers": [],
+            "effects": [
+              {
+                "kind": "escape",
+                "event": "python.socket.socket.bind.address",
+                "input": {
+                  "kind": "parameter",
+                  "ordinal": 0
+                }
+              }
+            ]
+          },
+          {
+            "id": "summary.python.hmac.new",
+            "target": {
+              "path": "hmac.pyi",
+              "symbol": "hmac.new(key, msg, digestmod)",
+              "has_receiver": false,
+              "parameter_count": 3,
+              "formals": [
+                {
+                  "name": "key"
+                },
+                {
+                  "name": "msg"
+                },
+                {
+                  "name": "digestmod"
+                }
+              ]
+            },
+            "completeness": "complete",
+            "covers_overrides": false,
+            "locations": [],
+            "transfers": [],
+            "effects": [
+              {
+                "kind": "escape",
+                "event": "python.hmac.new.key",
+                "input": {
+                  "kind": "parameter",
+                  "ordinal": 0
+                }
+              }
+            ]
+          },
+          {
+            "id": "summary.python.hmac.new-keyword-digestmod",
+            "target": {
+              "path": "hmac.pyi",
+              "symbol": "hmac.new(key, *, digestmod)",
+              "has_receiver": false,
+              "parameter_count": 2,
+              "formals": [
+                {
+                  "name": "key"
+                },
+                {
+                  "name": "digestmod",
+                  "passing_mode": "named_only"
+                }
+              ]
+            },
+            "completeness": "complete",
+            "covers_overrides": false,
+            "locations": [],
+            "transfers": [],
+            "effects": [
+              {
+                "kind": "escape",
+                "event": "python.hmac.new.key",
+                "input": {
+                  "kind": "parameter",
+                  "ordinal": 0
+                }
+              }
+            ]
+          },
+          {
+            "id": "summary.python.xml.etree-elementtree-fromstring",
+            "target": {
+              "path": "xml/etree/ElementTree.pyi",
+              "symbol": "xml.etree.ElementTree.fromstring(text, parser)",
+              "has_receiver": false,
+              "parameter_count": 2,
+              "formals": [
+                {
+                  "name": "text"
+                },
+                {
+                  "name": "parser",
+                  "optional": true
+                }
+              ]
+            },
+            "completeness": "complete",
+            "locations": [],
+            "transfers": [],
+            "effects": [
+              {
+                "kind": "escape",
+                "event": "python.xml.etree.fromstring.text",
+                "input": {
+                  "kind": "parameter",
+                  "ordinal": 0
+                }
+              }
+            ],
+            "covers_overrides": false
+          },
+          {
+            "id": "summary.python.xml.sax-parsestring",
+            "target": {
+              "path": "xml/sax.pyi",
+              "symbol": "xml.sax.parseString(string, handler, errorHandler)",
+              "has_receiver": false,
+              "parameter_count": 3,
+              "formals": [
+                {
+                  "name": "string"
+                },
+                {
+                  "name": "handler"
+                },
+                {
+                  "name": "errorHandler",
+                  "optional": true
+                }
+              ]
+            },
+            "completeness": "complete",
+            "locations": [],
+            "transfers": [],
+            "effects": [
+              {
+                "kind": "escape",
+                "event": "python.xml.sax.parsestring.string",
+                "input": {
+                  "kind": "parameter",
+                  "ordinal": 0
+                }
+              }
+            ],
+            "covers_overrides": false
+          },
+          {
+            "id": "summary.python.xml.dom.minidom-parsestring",
+            "target": {
+              "path": "xml/dom/minidom.pyi",
+              "symbol": "xml.dom.minidom.parseString(string, parser)",
+              "has_receiver": false,
+              "parameter_count": 2,
+              "formals": [
+                {
+                  "name": "string"
+                },
+                {
+                  "name": "parser",
+                  "optional": true
+                }
+              ]
+            },
+            "completeness": "complete",
+            "locations": [],
+            "transfers": [],
+            "effects": [
+              {
+                "kind": "escape",
+                "event": "python.xml.dom.minidom.parsestring.string",
+                "input": {
+                  "kind": "parameter",
+                  "ordinal": 0
+                }
+              }
+            ],
+            "covers_overrides": false
+          },
+          {
+            "id": "summary.python.re.match",
+            "target": {
+              "path": "re.pyi",
+              "symbol": "re.match(pattern, string, flags)",
+              "has_receiver": false,
+              "parameter_count": 3,
+              "formals": [
+                {
+                  "name": "pattern"
+                },
+                {
+                  "name": "string"
+                },
+                {
+                  "name": "flags",
+                  "optional": true
+                }
+              ]
+            },
+            "completeness": "complete",
+            "covers_overrides": false,
+            "locations": [],
+            "transfers": [
+              {
+                "input": {
+                  "kind": "parameter",
+                  "ordinal": 1
+                },
+                "exit_kind": "normal",
+                "output": {
+                  "kind": "normal_return"
+                }
+              }
+            ],
+            "effects": []
+          },
+          {
+            "id": "summary.python.re.search",
+            "target": {
+              "path": "re.pyi",
+              "symbol": "re.search(pattern, string, flags)",
+              "has_receiver": false,
+              "parameter_count": 3,
+              "formals": [
+                {
+                  "name": "pattern"
+                },
+                {
+                  "name": "string"
+                },
+                {
+                  "name": "flags",
+                  "optional": true
+                }
+              ]
+            },
+            "completeness": "complete",
+            "covers_overrides": false,
+            "locations": [],
+            "transfers": [
+              {
+                "input": {
+                  "kind": "parameter",
+                  "ordinal": 1
+                },
+                "exit_kind": "normal",
+                "output": {
+                  "kind": "normal_return"
+                }
+              }
+            ],
+            "effects": []
+          },
+          {
+            "id": "summary.python.re.fullmatch",
+            "target": {
+              "path": "re.pyi",
+              "symbol": "re.fullmatch(pattern, string, flags)",
+              "has_receiver": false,
+              "parameter_count": 3,
+              "formals": [
+                {
+                  "name": "pattern"
+                },
+                {
+                  "name": "string"
+                },
+                {
+                  "name": "flags",
+                  "optional": true
+                }
+              ]
+            },
+            "completeness": "complete",
+            "covers_overrides": false,
+            "locations": [],
+            "transfers": [
+              {
+                "input": {
+                  "kind": "parameter",
+                  "ordinal": 1
+                },
+                "exit_kind": "normal",
+                "output": {
+                  "kind": "normal_return"
+                }
+              }
+            ],
+            "effects": []
+          },
+          {
+            "id": "summary.python.re.sub",
+            "target": {
+              "path": "re.pyi",
+              "symbol": "re.sub(pattern, repl, string, count, flags)",
+              "has_receiver": false,
+              "parameter_count": 5,
+              "formals": [
+                {
+                  "name": "pattern"
+                },
+                {
+                  "name": "repl"
+                },
+                {
+                  "name": "string"
+                },
+                {
+                  "name": "count",
+                  "optional": true
+                },
+                {
+                  "name": "flags",
+                  "optional": true
+                }
+              ]
+            },
+            "completeness": "complete",
+            "covers_overrides": false,
+            "locations": [],
+            "transfers": [
+              {
+                "input": {
+                  "kind": "parameter",
+                  "ordinal": 1
+                },
+                "exit_kind": "normal",
+                "output": {
+                  "kind": "normal_return"
+                }
+              },
+              {
+                "input": {
+                  "kind": "parameter",
+                  "ordinal": 2
+                },
+                "exit_kind": "normal",
+                "output": {
+                  "kind": "normal_return"
+                }
+              }
+            ],
+            "effects": []
+          },
+          {
+            "id": "summary.python.re.split",
+            "target": {
+              "path": "re.pyi",
+              "symbol": "re.split(pattern, string, maxsplit, flags)",
+              "has_receiver": false,
+              "parameter_count": 4,
+              "formals": [
+                {
+                  "name": "pattern"
+                },
+                {
+                  "name": "string"
+                },
+                {
+                  "name": "maxsplit",
+                  "optional": true
+                },
+                {
+                  "name": "flags",
+                  "optional": true
+                }
+              ]
+            },
+            "completeness": "complete",
+            "covers_overrides": false,
+            "locations": [],
+            "transfers": [
+              {
+                "input": {
+                  "kind": "parameter",
+                  "ordinal": 1
+                },
+                "exit_kind": "normal",
+                "output": {
+                  "kind": "normal_return"
+                }
+              }
+            ],
+            "effects": []
+          },
+          {
+            "id": "summary.python.re.findall",
+            "target": {
+              "path": "re.pyi",
+              "symbol": "re.findall(pattern, string, flags)",
+              "has_receiver": false,
+              "parameter_count": 3,
+              "formals": [
+                {
+                  "name": "pattern"
+                },
+                {
+                  "name": "string"
+                },
+                {
+                  "name": "flags",
+                  "optional": true
+                }
+              ]
+            },
+            "completeness": "complete",
+            "covers_overrides": false,
+            "locations": [],
+            "transfers": [
+              {
+                "input": {
+                  "kind": "parameter",
+                  "ordinal": 1
+                },
+                "exit_kind": "normal",
+                "output": {
+                  "kind": "normal_return"
+                }
+              }
+            ],
+            "effects": []
+          },
+          {
+            "id": "summary.python.re.finditer",
+            "target": {
+              "path": "re.pyi",
+              "symbol": "re.finditer(pattern, string, flags)",
+              "has_receiver": false,
+              "parameter_count": 3,
+              "formals": [
+                {
+                  "name": "pattern"
+                },
+                {
+                  "name": "string"
+                },
+                {
+                  "name": "flags",
+                  "optional": true
+                }
+              ]
+            },
+            "completeness": "complete",
+            "covers_overrides": false,
+            "locations": [],
+            "transfers": [
+              {
+                "input": {
+                  "kind": "parameter",
+                  "ordinal": 1
+                },
+                "exit_kind": "normal",
+                "output": {
+                  "kind": "normal_return"
+                }
+              }
+            ],
+            "effects": []
+          },
+          {
+            "id": "summary.python.re.compile",
+            "target": {
+              "path": "re.pyi",
+              "symbol": "re.compile(pattern, flags)",
+              "has_receiver": false,
+              "parameter_count": 2,
+              "formals": [
+                {
+                  "name": "pattern"
+                },
+                {
+                  "name": "flags",
+                  "optional": true
+                }
+              ]
+            },
+            "completeness": "complete",
+            "covers_overrides": false,
+            "locations": [],
+            "transfers": [
+              {
+                "input": {
+                  "kind": "parameter",
+                  "ordinal": 0
+                },
+                "exit_kind": "normal",
+                "output": {
+                  "kind": "normal_return"
+                }
+              }
+            ],
+            "effects": []
+          },
+          {
+            "id": "summary.python.re.pattern.search",
+            "target": {
+              "path": "re.pyi",
+              "symbol": "re.Pattern.search(string, pos, endpos)",
+              "has_receiver": true,
+              "parameter_count": 3,
+              "formals": [
+                {
+                  "name": "string"
+                },
+                {
+                  "name": "pos",
+                  "optional": true
+                },
+                {
+                  "name": "endpos",
+                  "optional": true
+                }
+              ]
+            },
+            "completeness": "complete",
+            "covers_overrides": false,
+            "locations": [],
+            "transfers": [
+              {
+                "input": {
+                  "kind": "parameter",
+                  "ordinal": 0
+                },
+                "exit_kind": "normal",
+                "output": {
+                  "kind": "normal_return"
+                }
+              }
+            ],
+            "effects": []
+          },
+          {
+            "id": "summary.python.textwrap.shorten",
+            "target": {
+              "path": "textwrap.pyi",
+              "symbol": "textwrap.shorten(text, width)",
+              "has_receiver": false,
+              "parameter_count": 2,
+              "formals": [
+                {
+                  "name": "text"
+                },
+                {
+                  "name": "width"
+                }
+              ]
+            },
+            "completeness": "complete",
+            "covers_overrides": false,
+            "locations": [],
+            "transfers": [
+              {
+                "input": {
+                  "kind": "parameter",
+                  "ordinal": 0
+                },
+                "exit_kind": "normal",
+                "output": {
+                  "kind": "normal_return"
+                }
+              }
+            ],
+            "effects": []
+          },
+          {
+            "id": "summary.python.logging.debug",
+            "target": {
+              "path": "logging/__init__.pyi",
+              "symbol": "logging.debug(msg, *args, *, exc_info, stack_info, stacklevel, extra)",
+              "has_receiver": false,
+              "parameter_count": 6,
+              "variadic": true,
+              "formals": [
+                {
+                  "name": "msg"
+                },
+                {
+                  "name": "args",
+                  "passing_mode": "positional_only",
+                  "variadic_kind": "positional"
+                },
+                {
+                  "name": "exc_info",
+                  "optional": true,
+                  "passing_mode": "named_only"
+                },
+                {
+                  "name": "stack_info",
+                  "optional": true,
+                  "passing_mode": "named_only"
+                },
+                {
+                  "name": "stacklevel",
+                  "optional": true,
+                  "passing_mode": "named_only"
+                },
+                {
+                  "name": "extra",
+                  "optional": true,
+                  "passing_mode": "named_only"
+                }
+              ]
+            },
+            "completeness": "complete",
+            "covers_overrides": false,
+            "locations": [],
+            "transfers": [],
+            "effects": [
+              {
+                "kind": "escape",
+                "event": "python.logging.debug.message",
+                "input": {
+                  "kind": "parameter",
+                  "ordinal": 0
+                }
+              }
+            ]
+          },
+          {
+            "id": "summary.python.logging.logger.debug",
+            "target": {
+              "path": "logging/__init__.pyi",
+              "symbol": "logging.Logger.debug(msg, *args, *, exc_info, stack_info, stacklevel, extra)",
+              "has_receiver": true,
+              "parameter_count": 6,
+              "variadic": true,
+              "formals": [
+                {
+                  "name": "msg"
+                },
+                {
+                  "name": "args",
+                  "passing_mode": "positional_only",
+                  "variadic_kind": "positional"
+                },
+                {
+                  "name": "exc_info",
+                  "optional": true,
+                  "passing_mode": "named_only"
+                },
+                {
+                  "name": "stack_info",
+                  "optional": true,
+                  "passing_mode": "named_only"
+                },
+                {
+                  "name": "stacklevel",
+                  "optional": true,
+                  "passing_mode": "named_only"
+                },
+                {
+                  "name": "extra",
+                  "optional": true,
+                  "passing_mode": "named_only"
+                }
+              ]
+            },
+            "completeness": "complete",
+            "covers_overrides": false,
+            "locations": [],
+            "transfers": [],
+            "effects": [
+              {
+                "kind": "escape",
+                "event": "python.logging.logger.debug.message",
+                "input": {
+                  "kind": "parameter",
+                  "ordinal": 0
+                }
+              }
+            ]
+          },
+          {
+            "id": "summary.python.logging.info",
+            "target": {
+              "path": "logging/__init__.pyi",
+              "symbol": "logging.info(msg, *args, *, exc_info, stack_info, stacklevel, extra)",
+              "has_receiver": false,
+              "parameter_count": 6,
+              "variadic": true,
+              "formals": [
+                {
+                  "name": "msg"
+                },
+                {
+                  "name": "args",
+                  "passing_mode": "positional_only",
+                  "variadic_kind": "positional"
+                },
+                {
+                  "name": "exc_info",
+                  "optional": true,
+                  "passing_mode": "named_only"
+                },
+                {
+                  "name": "stack_info",
+                  "optional": true,
+                  "passing_mode": "named_only"
+                },
+                {
+                  "name": "stacklevel",
+                  "optional": true,
+                  "passing_mode": "named_only"
+                },
+                {
+                  "name": "extra",
+                  "optional": true,
+                  "passing_mode": "named_only"
+                }
+              ]
+            },
+            "completeness": "complete",
+            "covers_overrides": false,
+            "locations": [],
+            "transfers": [],
+            "effects": [
+              {
+                "kind": "escape",
+                "event": "python.logging.info.message",
+                "input": {
+                  "kind": "parameter",
+                  "ordinal": 0
+                }
+              }
+            ]
+          },
+          {
+            "id": "summary.python.logging.logger.info",
+            "target": {
+              "path": "logging/__init__.pyi",
+              "symbol": "logging.Logger.info(msg, *args, *, exc_info, stack_info, stacklevel, extra)",
+              "has_receiver": true,
+              "parameter_count": 6,
+              "variadic": true,
+              "formals": [
+                {
+                  "name": "msg"
+                },
+                {
+                  "name": "args",
+                  "passing_mode": "positional_only",
+                  "variadic_kind": "positional"
+                },
+                {
+                  "name": "exc_info",
+                  "optional": true,
+                  "passing_mode": "named_only"
+                },
+                {
+                  "name": "stack_info",
+                  "optional": true,
+                  "passing_mode": "named_only"
+                },
+                {
+                  "name": "stacklevel",
+                  "optional": true,
+                  "passing_mode": "named_only"
+                },
+                {
+                  "name": "extra",
+                  "optional": true,
+                  "passing_mode": "named_only"
+                }
+              ]
+            },
+            "completeness": "complete",
+            "covers_overrides": false,
+            "locations": [],
+            "transfers": [],
+            "effects": [
+              {
+                "kind": "escape",
+                "event": "python.logging.logger.info.message",
+                "input": {
+                  "kind": "parameter",
+                  "ordinal": 0
+                }
+              }
+            ]
+          },
+          {
+            "id": "summary.python.logging.warning",
+            "target": {
+              "path": "logging/__init__.pyi",
+              "symbol": "logging.warning(msg, *args, *, exc_info, stack_info, stacklevel, extra)",
+              "has_receiver": false,
+              "parameter_count": 6,
+              "variadic": true,
+              "formals": [
+                {
+                  "name": "msg"
+                },
+                {
+                  "name": "args",
+                  "passing_mode": "positional_only",
+                  "variadic_kind": "positional"
+                },
+                {
+                  "name": "exc_info",
+                  "optional": true,
+                  "passing_mode": "named_only"
+                },
+                {
+                  "name": "stack_info",
+                  "optional": true,
+                  "passing_mode": "named_only"
+                },
+                {
+                  "name": "stacklevel",
+                  "optional": true,
+                  "passing_mode": "named_only"
+                },
+                {
+                  "name": "extra",
+                  "optional": true,
+                  "passing_mode": "named_only"
+                }
+              ]
+            },
+            "completeness": "complete",
+            "covers_overrides": false,
+            "locations": [],
+            "transfers": [],
+            "effects": [
+              {
+                "kind": "escape",
+                "event": "python.logging.warning.message",
+                "input": {
+                  "kind": "parameter",
+                  "ordinal": 0
+                }
+              }
+            ]
+          },
+          {
+            "id": "summary.python.logging.logger.warning",
+            "target": {
+              "path": "logging/__init__.pyi",
+              "symbol": "logging.Logger.warning(msg, *args, *, exc_info, stack_info, stacklevel, extra)",
+              "has_receiver": true,
+              "parameter_count": 6,
+              "variadic": true,
+              "formals": [
+                {
+                  "name": "msg"
+                },
+                {
+                  "name": "args",
+                  "passing_mode": "positional_only",
+                  "variadic_kind": "positional"
+                },
+                {
+                  "name": "exc_info",
+                  "optional": true,
+                  "passing_mode": "named_only"
+                },
+                {
+                  "name": "stack_info",
+                  "optional": true,
+                  "passing_mode": "named_only"
+                },
+                {
+                  "name": "stacklevel",
+                  "optional": true,
+                  "passing_mode": "named_only"
+                },
+                {
+                  "name": "extra",
+                  "optional": true,
+                  "passing_mode": "named_only"
+                }
+              ]
+            },
+            "completeness": "complete",
+            "covers_overrides": false,
+            "locations": [],
+            "transfers": [],
+            "effects": [
+              {
+                "kind": "escape",
+                "event": "python.logging.logger.warning.message",
+                "input": {
+                  "kind": "parameter",
+                  "ordinal": 0
+                }
+              }
+            ]
+          },
+          {
+            "id": "summary.python.logging.error",
+            "target": {
+              "path": "logging/__init__.pyi",
+              "symbol": "logging.error(msg, *args, *, exc_info, stack_info, stacklevel, extra)",
+              "has_receiver": false,
+              "parameter_count": 6,
+              "variadic": true,
+              "formals": [
+                {
+                  "name": "msg"
+                },
+                {
+                  "name": "args",
+                  "passing_mode": "positional_only",
+                  "variadic_kind": "positional"
+                },
+                {
+                  "name": "exc_info",
+                  "optional": true,
+                  "passing_mode": "named_only"
+                },
+                {
+                  "name": "stack_info",
+                  "optional": true,
+                  "passing_mode": "named_only"
+                },
+                {
+                  "name": "stacklevel",
+                  "optional": true,
+                  "passing_mode": "named_only"
+                },
+                {
+                  "name": "extra",
+                  "optional": true,
+                  "passing_mode": "named_only"
+                }
+              ]
+            },
+            "completeness": "complete",
+            "covers_overrides": false,
+            "locations": [],
+            "transfers": [],
+            "effects": [
+              {
+                "kind": "escape",
+                "event": "python.logging.error.message",
+                "input": {
+                  "kind": "parameter",
+                  "ordinal": 0
+                }
+              }
+            ]
+          },
+          {
+            "id": "summary.python.logging.logger.error",
+            "target": {
+              "path": "logging/__init__.pyi",
+              "symbol": "logging.Logger.error(msg, *args, *, exc_info, stack_info, stacklevel, extra)",
+              "has_receiver": true,
+              "parameter_count": 6,
+              "variadic": true,
+              "formals": [
+                {
+                  "name": "msg"
+                },
+                {
+                  "name": "args",
+                  "passing_mode": "positional_only",
+                  "variadic_kind": "positional"
+                },
+                {
+                  "name": "exc_info",
+                  "optional": true,
+                  "passing_mode": "named_only"
+                },
+                {
+                  "name": "stack_info",
+                  "optional": true,
+                  "passing_mode": "named_only"
+                },
+                {
+                  "name": "stacklevel",
+                  "optional": true,
+                  "passing_mode": "named_only"
+                },
+                {
+                  "name": "extra",
+                  "optional": true,
+                  "passing_mode": "named_only"
+                }
+              ]
+            },
+            "completeness": "complete",
+            "covers_overrides": false,
+            "locations": [],
+            "transfers": [],
+            "effects": [
+              {
+                "kind": "escape",
+                "event": "python.logging.logger.error.message",
+                "input": {
+                  "kind": "parameter",
+                  "ordinal": 0
+                }
+              }
+            ]
+          },
+          {
+            "id": "summary.python.logging.critical",
+            "target": {
+              "path": "logging/__init__.pyi",
+              "symbol": "logging.critical(msg, *args, *, exc_info, stack_info, stacklevel, extra)",
+              "has_receiver": false,
+              "parameter_count": 6,
+              "variadic": true,
+              "formals": [
+                {
+                  "name": "msg"
+                },
+                {
+                  "name": "args",
+                  "passing_mode": "positional_only",
+                  "variadic_kind": "positional"
+                },
+                {
+                  "name": "exc_info",
+                  "optional": true,
+                  "passing_mode": "named_only"
+                },
+                {
+                  "name": "stack_info",
+                  "optional": true,
+                  "passing_mode": "named_only"
+                },
+                {
+                  "name": "stacklevel",
+                  "optional": true,
+                  "passing_mode": "named_only"
+                },
+                {
+                  "name": "extra",
+                  "optional": true,
+                  "passing_mode": "named_only"
+                }
+              ]
+            },
+            "completeness": "complete",
+            "covers_overrides": false,
+            "locations": [],
+            "transfers": [],
+            "effects": [
+              {
+                "kind": "escape",
+                "event": "python.logging.critical.message",
+                "input": {
+                  "kind": "parameter",
+                  "ordinal": 0
+                }
+              }
+            ]
+          },
+          {
+            "id": "summary.python.logging.logger.critical",
+            "target": {
+              "path": "logging/__init__.pyi",
+              "symbol": "logging.Logger.critical(msg, *args, *, exc_info, stack_info, stacklevel, extra)",
+              "has_receiver": true,
+              "parameter_count": 6,
+              "variadic": true,
+              "formals": [
+                {
+                  "name": "msg"
+                },
+                {
+                  "name": "args",
+                  "passing_mode": "positional_only",
+                  "variadic_kind": "positional"
+                },
+                {
+                  "name": "exc_info",
+                  "optional": true,
+                  "passing_mode": "named_only"
+                },
+                {
+                  "name": "stack_info",
+                  "optional": true,
+                  "passing_mode": "named_only"
+                },
+                {
+                  "name": "stacklevel",
+                  "optional": true,
+                  "passing_mode": "named_only"
+                },
+                {
+                  "name": "extra",
+                  "optional": true,
+                  "passing_mode": "named_only"
+                }
+              ]
+            },
+            "completeness": "complete",
+            "covers_overrides": false,
+            "locations": [],
+            "transfers": [],
+            "effects": [
+              {
+                "kind": "escape",
+                "event": "python.logging.logger.critical.message",
+                "input": {
+                  "kind": "parameter",
+                  "ordinal": 0
+                }
+              }
+            ]
+          },
+          {
+            "id": "summary.python.logging.exception",
+            "target": {
+              "path": "logging/__init__.pyi",
+              "symbol": "logging.exception(msg, *args, *, exc_info, stack_info, stacklevel, extra)",
+              "has_receiver": false,
+              "parameter_count": 6,
+              "variadic": true,
+              "formals": [
+                {
+                  "name": "msg"
+                },
+                {
+                  "name": "args",
+                  "passing_mode": "positional_only",
+                  "variadic_kind": "positional"
+                },
+                {
+                  "name": "exc_info",
+                  "optional": true,
+                  "passing_mode": "named_only"
+                },
+                {
+                  "name": "stack_info",
+                  "optional": true,
+                  "passing_mode": "named_only"
+                },
+                {
+                  "name": "stacklevel",
+                  "optional": true,
+                  "passing_mode": "named_only"
+                },
+                {
+                  "name": "extra",
+                  "optional": true,
+                  "passing_mode": "named_only"
+                }
+              ]
+            },
+            "completeness": "complete",
+            "covers_overrides": false,
+            "locations": [],
+            "transfers": [],
+            "effects": [
+              {
+                "kind": "escape",
+                "event": "python.logging.exception.message",
+                "input": {
+                  "kind": "parameter",
+                  "ordinal": 0
+                }
+              }
+            ]
+          },
+          {
+            "id": "summary.python.logging.logger.exception",
+            "target": {
+              "path": "logging/__init__.pyi",
+              "symbol": "logging.Logger.exception(msg, *args, *, exc_info, stack_info, stacklevel, extra)",
+              "has_receiver": true,
+              "parameter_count": 6,
+              "variadic": true,
+              "formals": [
+                {
+                  "name": "msg"
+                },
+                {
+                  "name": "args",
+                  "passing_mode": "positional_only",
+                  "variadic_kind": "positional"
+                },
+                {
+                  "name": "exc_info",
+                  "optional": true,
+                  "passing_mode": "named_only"
+                },
+                {
+                  "name": "stack_info",
+                  "optional": true,
+                  "passing_mode": "named_only"
+                },
+                {
+                  "name": "stacklevel",
+                  "optional": true,
+                  "passing_mode": "named_only"
+                },
+                {
+                  "name": "extra",
+                  "optional": true,
+                  "passing_mode": "named_only"
+                }
+              ]
+            },
+            "completeness": "complete",
+            "covers_overrides": false,
+            "locations": [],
+            "transfers": [],
+            "effects": [
+              {
+                "kind": "escape",
+                "event": "python.logging.logger.exception.message",
+                "input": {
+                  "kind": "parameter",
+                  "ordinal": 0
+                }
+              }
+            ]
+          },
+          {
+            "id": "summary.python.logging.log",
+            "target": {
+              "path": "logging/__init__.pyi",
+              "symbol": "logging.log(level, msg, *args, *, exc_info, stack_info, stacklevel, extra)",
+              "has_receiver": false,
+              "parameter_count": 7,
+              "variadic": true,
+              "formals": [
+                {
+                  "name": "level"
+                },
+                {
+                  "name": "msg"
+                },
+                {
+                  "name": "args",
+                  "passing_mode": "positional_only",
+                  "variadic_kind": "positional"
+                },
+                {
+                  "name": "exc_info",
+                  "optional": true,
+                  "passing_mode": "named_only"
+                },
+                {
+                  "name": "stack_info",
+                  "optional": true,
+                  "passing_mode": "named_only"
+                },
+                {
+                  "name": "stacklevel",
+                  "optional": true,
+                  "passing_mode": "named_only"
+                },
+                {
+                  "name": "extra",
+                  "optional": true,
+                  "passing_mode": "named_only"
+                }
+              ]
+            },
+            "completeness": "complete",
+            "covers_overrides": false,
+            "locations": [],
+            "transfers": [],
+            "effects": [
+              {
+                "kind": "escape",
+                "event": "python.logging.log.message",
+                "input": {
+                  "kind": "parameter",
+                  "ordinal": 1
+                }
+              }
+            ]
+          },
+          {
+            "id": "summary.python.logging.logger.log",
+            "target": {
+              "path": "logging/__init__.pyi",
+              "symbol": "logging.Logger.log(level, msg, *args, *, exc_info, stack_info, stacklevel, extra)",
+              "has_receiver": true,
+              "parameter_count": 7,
+              "variadic": true,
+              "formals": [
+                {
+                  "name": "level"
+                },
+                {
+                  "name": "msg"
+                },
+                {
+                  "name": "args",
+                  "passing_mode": "positional_only",
+                  "variadic_kind": "positional"
+                },
+                {
+                  "name": "exc_info",
+                  "optional": true,
+                  "passing_mode": "named_only"
+                },
+                {
+                  "name": "stack_info",
+                  "optional": true,
+                  "passing_mode": "named_only"
+                },
+                {
+                  "name": "stacklevel",
+                  "optional": true,
+                  "passing_mode": "named_only"
+                },
+                {
+                  "name": "extra",
+                  "optional": true,
+                  "passing_mode": "named_only"
+                }
+              ]
+            },
+            "completeness": "complete",
+            "covers_overrides": false,
+            "locations": [],
+            "transfers": [],
+            "effects": [
+              {
+                "kind": "escape",
+                "event": "python.logging.logger.log.message",
+                "input": {
+                  "kind": "parameter",
+                  "ordinal": 1
+                }
+              }
+            ]
+          },
+          {
+            "id": "summary.python.json.dump",
+            "target": {
+              "path": "json/__init__.pyi",
+              "symbol": "json.dump(obj, fp, *, skipkeys, ensure_ascii, check_circular, allow_nan, cls, indent, separators, default, sort_keys, **kw)",
+              "has_receiver": false,
+              "parameter_count": 12,
+              "variadic": true,
+              "formals": [
+                {
+                  "name": "obj"
+                },
+                {
+                  "name": "fp"
+                },
+                {
+                  "name": "skipkeys",
+                  "optional": true,
+                  "passing_mode": "named_only"
+                },
+                {
+                  "name": "ensure_ascii",
+                  "optional": true,
+                  "passing_mode": "named_only"
+                },
+                {
+                  "name": "check_circular",
+                  "optional": true,
+                  "passing_mode": "named_only"
+                },
+                {
+                  "name": "allow_nan",
+                  "optional": true,
+                  "passing_mode": "named_only"
+                },
+                {
+                  "name": "cls",
+                  "optional": true,
+                  "passing_mode": "named_only"
+                },
+                {
+                  "name": "indent",
+                  "optional": true,
+                  "passing_mode": "named_only"
+                },
+                {
+                  "name": "separators",
+                  "optional": true,
+                  "passing_mode": "named_only"
+                },
+                {
+                  "name": "default",
+                  "optional": true,
+                  "passing_mode": "named_only"
+                },
+                {
+                  "name": "sort_keys",
+                  "optional": true,
+                  "passing_mode": "named_only"
+                },
+                {
+                  "name": "kw",
+                  "passing_mode": "named_only",
+                  "variadic_kind": "keyword"
+                }
+              ]
+            },
+            "completeness": "complete",
+            "covers_overrides": false,
+            "locations": [],
+            "transfers": [],
+            "effects": [
+              {
+                "kind": "escape",
+                "event": "python.json.dump",
+                "input": {
+                  "kind": "parameter",
+                  "ordinal": 0
+                }
+              }
+            ]
+          },
+          {
+            "id": "summary.python.pickle.dump",
+            "target": {
+              "path": "pickle.pyi",
+              "symbol": "pickle.dump(obj, file, protocol, *, fix_imports, buffer_callback)",
+              "has_receiver": false,
+              "parameter_count": 5,
+              "formals": [
+                {
+                  "name": "obj"
+                },
+                {
+                  "name": "file"
+                },
+                {
+                  "name": "protocol",
+                  "optional": true
+                },
+                {
+                  "name": "fix_imports",
+                  "optional": true,
+                  "passing_mode": "named_only"
+                },
+                {
+                  "name": "buffer_callback",
+                  "optional": true,
+                  "passing_mode": "named_only"
+                }
+              ]
+            },
+            "completeness": "complete",
+            "covers_overrides": false,
+            "locations": [],
+            "transfers": [],
+            "effects": [
+              {
+                "kind": "escape",
+                "event": "python.pickle.dump",
+                "input": {
+                  "kind": "parameter",
+                  "ordinal": 0
+                }
+              }
+            ]
+          },
+          {
+            "id": "summary.python.marshal.dump",
+            "target": {
+              "path": "marshal.pyi",
+              "symbol": "marshal.dump(value, file, version, *, allow_code)",
+              "has_receiver": false,
+              "parameter_count": 4,
+              "formals": [
+                {
+                  "name": "value",
+                  "passing_mode": "positional_only"
+                },
+                {
+                  "name": "file",
+                  "passing_mode": "positional_only"
+                },
+                {
+                  "name": "version",
+                  "optional": true,
+                  "passing_mode": "positional_only"
+                },
+                {
+                  "name": "allow_code",
+                  "optional": true,
+                  "passing_mode": "named_only"
+                }
+              ]
+            },
+            "completeness": "complete",
+            "covers_overrides": false,
+            "locations": [],
+            "transfers": [],
+            "effects": [
+              {
+                "kind": "escape",
+                "event": "python.marshal.dump",
+                "input": {
+                  "kind": "parameter",
+                  "ordinal": 0
+                }
+              }
+            ]
+          },
+          {
+            "id": "summary.python.io.text-iowrapper.write",
+            "target": {
+              "path": "io.pyi",
+              "symbol": "io.TextIOWrapper.write(s)",
+              "has_receiver": true,
+              "parameter_count": 1,
+              "formals": [
+                {
+                  "name": "s"
+                }
+              ]
+            },
+            "completeness": "complete",
+            "covers_overrides": false,
+            "locations": [],
+            "transfers": [],
+            "effects": [
+              {
+                "kind": "escape",
+                "event": "python.io.text-iowrapper.write",
+                "input": {
+                  "kind": "parameter",
+                  "ordinal": 0
+                }
+              }
+            ]
+          },
+          {
+            "id": "summary.python.pathlib.path.write_text",
+            "target": {
+              "path": "pathlib/__init__.pyi",
+              "symbol": "pathlib.Path.write_text(data, encoding, errors, newline)",
+              "has_receiver": true,
+              "parameter_count": 4,
+              "formals": [
+                {
+                  "name": "data"
+                },
+                {
+                  "name": "encoding",
+                  "optional": true
+                },
+                {
+                  "name": "errors",
+                  "optional": true
+                },
+                {
+                  "name": "newline",
+                  "optional": true
+                }
+              ]
+            },
+            "completeness": "complete",
+            "covers_overrides": false,
+            "locations": [],
+            "transfers": [],
+            "effects": [
+              {
+                "kind": "escape",
+                "event": "python.pathlib.path.write_text",
+                "input": {
+                  "kind": "parameter",
+                  "ordinal": 0
+                }
+              }
+            ]
+          },
+          {
+            "id": "summary.python.pathlib.path.write_bytes",
+            "target": {
+              "path": "pathlib/__init__.pyi",
+              "symbol": "pathlib.Path.write_bytes(data)",
+              "has_receiver": true,
+              "parameter_count": 1,
+              "formals": [
+                {
+                  "name": "data"
+                }
+              ]
+            },
+            "completeness": "complete",
+            "covers_overrides": false,
+            "locations": [],
+            "transfers": [],
+            "effects": [
+              {
+                "kind": "escape",
+                "event": "python.pathlib.path.write_bytes",
+                "input": {
+                  "kind": "parameter",
+                  "ordinal": 0
+                }
+              }
+            ]
+          },
+          {
+            "id": "summary.python.smtplib.smtp.login",
+            "target": {
+              "path": "smtplib.pyi",
+              "symbol": "smtplib.SMTP.login(user, password, initial_response_ok)",
+              "has_receiver": true,
+              "parameter_count": 3,
+              "formals": [
+                {
+                  "name": "user"
+                },
+                {
+                  "name": "password"
+                },
+                {
+                  "name": "initial_response_ok",
+                  "optional": true,
+                  "passing_mode": "named_only"
+                }
+              ]
+            },
+            "completeness": "complete",
+            "covers_overrides": false,
+            "locations": [],
+            "transfers": [],
+            "effects": [
+              {
+                "kind": "escape",
+                "event": "python.smtplib.smtp.login",
+                "input": {
+                  "kind": "parameter",
+                  "ordinal": 0
+                }
+              },
+              {
+                "kind": "escape",
+                "event": "python.smtplib.smtp.login",
+                "input": {
+                  "kind": "parameter",
+                  "ordinal": 1
+                }
+              }
+            ]
+          },
+          {
+            "id": "summary.python.ftplib.ftp.login",
+            "target": {
+              "path": "ftplib.pyi",
+              "symbol": "ftplib.FTP.login(user, passwd, acct)",
+              "has_receiver": true,
+              "parameter_count": 3,
+              "formals": [
+                {
+                  "name": "user",
+                  "optional": true
+                },
+                {
+                  "name": "passwd",
+                  "optional": true
+                },
+                {
+                  "name": "acct",
+                  "optional": true
+                }
+              ]
+            },
+            "completeness": "complete",
+            "covers_overrides": false,
+            "locations": [],
+            "transfers": [],
+            "effects": [
+              {
+                "kind": "escape",
+                "event": "python.ftplib.ftp.login",
+                "input": {
+                  "kind": "parameter",
+                  "ordinal": 0
+                }
+              },
+              {
+                "kind": "escape",
+                "event": "python.ftplib.ftp.login",
+                "input": {
+                  "kind": "parameter",
+                  "ordinal": 1
+                }
+              },
+              {
+                "kind": "escape",
+                "event": "python.ftplib.ftp.login",
+                "input": {
+                  "kind": "parameter",
+                  "ordinal": 2
+                }
+              }
+            ]
+          },
+          {
+            "id": "summary.python._pickle.dump",
+            "target": {
+              "path": "_pickle.pyi",
+              "symbol": "_pickle.dump(obj, file, protocol, *, fix_imports, buffer_callback)",
+              "has_receiver": false,
+              "parameter_count": 5,
+              "formals": [
+                {
+                  "name": "obj"
+                },
+                {
+                  "name": "file"
+                },
+                {
+                  "name": "protocol",
+                  "optional": true
+                },
+                {
+                  "name": "fix_imports",
+                  "optional": true,
+                  "passing_mode": "named_only"
+                },
+                {
+                  "name": "buffer_callback",
+                  "optional": true,
+                  "passing_mode": "named_only"
+                }
+              ]
+            },
+            "completeness": "complete",
+            "covers_overrides": false,
+            "locations": [],
+            "transfers": [],
+            "effects": [
+              {
+                "kind": "escape",
+                "event": "python.pickle.dump",
+                "input": {
+                  "kind": "parameter",
+                  "ordinal": 0
+                }
+              }
+            ]
+          },
+          {
+            "id": "summary.python.builtins.print",
+            "target": {
+              "path": "builtins.pyi",
+              "symbol": "builtins.print(*objects, sep, end, file, flush)",
+              "has_receiver": false,
+              "parameter_count": 5,
+              "variadic": true,
+              "formals": [
+                {
+                  "name": "objects",
+                  "optional": true,
+                  "passing_mode": "positional_only",
+                  "variadic_kind": "positional"
+                },
+                {
+                  "name": "sep",
+                  "optional": true,
+                  "passing_mode": "named_only"
+                },
+                {
+                  "name": "end",
+                  "optional": true,
+                  "passing_mode": "named_only"
+                },
+                {
+                  "name": "file",
+                  "optional": true,
+                  "passing_mode": "named_only"
+                },
+                {
+                  "name": "flush",
+                  "optional": true,
+                  "passing_mode": "named_only"
+                }
+              ]
+            },
+            "completeness": "complete",
+            "covers_overrides": false,
+            "locations": [],
+            "transfers": [],
+            "effects": [
+              {
+                "kind": "escape",
+                "event": "python.builtins.print.objects",
+                "input": {
+                  "kind": "parameter",
+                  "ordinal": 0
+                }
+              }
+            ]
+          }
+        ]
+      }
+    }
+  ]
+}

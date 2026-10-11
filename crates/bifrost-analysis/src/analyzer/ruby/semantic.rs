@@ -8,15 +8,21 @@
 use brokk_bifrost_ruby::local_bindings::{
     LocalBindingBudget, LocalBindingTimeline, callable_parameters,
 };
+use brokk_bifrost_ruby::structural::ruby_unconditional_loop_body;
 use tree_sitter::Node;
 
 use super::{is_runtime_node, ruby_semantic_identifier_range, ruby_symbol_name};
+use crate::analyzer::declared_scalar::{DeclaredScalarType, binding_nodes};
 use crate::analyzer::lexical_definitions::formal_parameter_slots_for_owner;
 use crate::analyzer::semantic::cfg::{
     CleanupRegionId, CompletionKind, CompletionRequest, CompletionRoute, ProcedureCfgBuilder,
     ScopeBinding, ScopeFrameId,
 };
-use crate::analyzer::semantic::lowering::formal_multiplicity;
+use crate::analyzer::semantic::lowering::{
+    ConditionTargets, ProcedureWork, ProcedureWorkHandler, ShortCircuitKind,
+    dispatch_procedure_work, formal_multiplicity, resolve_binding_value, schedule_sequential_work,
+    schedule_short_circuit_condition, source_anchor_between_nodes, source_anchor_from_positions,
+};
 use crate::analyzer::semantic::service::{ProgramSemanticsLowerer, SemanticAdapterIdentity};
 use crate::analyzer::semantic::*;
 use crate::analyzer::tree_sitter_analyzer::PreparedSyntaxTree;
@@ -24,7 +30,7 @@ use crate::analyzer::tree_walk::named_children;
 use crate::analyzer::{Language, ProjectFile, RubyAnalyzer};
 use crate::hash::{HashMap, HashSet};
 
-const ADAPTER_VERSION: &[u8] = b"ruby-value-semantics-v9";
+const ADAPTER_VERSION: &[u8] = b"ruby-value-semantics-v12";
 
 impl_program_semantics_provider!(RubyAnalyzer, RubySemanticLowerer);
 
@@ -96,6 +102,124 @@ fn branch_statements(node: Node<'_>) -> Vec<Node<'_>> {
 fn statement_definitely_abrupt(node: Node<'_>) -> bool {
     matches!(node.kind(), "return" | "break" | "next" | "redo" | "retry")
 }
+
+fn ruby_statement_position(node: Node<'_>) -> bool {
+    let Some(parent) = node.parent() else {
+        return false;
+    };
+    let is_field = |field: &str| {
+        parent
+            .child_by_field_name(field)
+            .is_some_and(|candidate| candidate.id() == node.id())
+    };
+    match parent.kind() {
+        "program" | "body_statement" | "block_body" | "then" | "else" | "do" | "ensure" => true,
+        "if" | "unless" | "elsif" | "if_modifier" | "unless_modifier" | "conditional" => {
+            is_field("consequence") || is_field("alternative") || is_field("body")
+        }
+        "while" | "until" | "while_modifier" | "until_modifier" | "for" => is_field("body"),
+        "rescue" | "when" | "in_clause" => is_field("body"),
+        _ => false,
+    }
+}
+
+fn ruby_callable_syntax(node: Node<'_>) -> bool {
+    match node.kind() {
+        "method" | "singleton_method" | "lambda" | "class" | "module" | "singleton_class" => true,
+        "block" | "do_block" => node.parent().is_none_or(|parent| parent.kind() != "lambda"),
+        _ => false,
+    }
+}
+
+fn ruby_statement_kind(node: Node<'_>) -> Option<&'static str> {
+    if !ruby_statement_position(node)
+        || matches!(
+            node.kind(),
+            "body_statement"
+                | "block_body"
+                | "then"
+                | "else"
+                | "do"
+                | "ensure"
+                | "rescue"
+                | "when"
+                | "in_clause"
+        )
+        || ruby_callable_syntax(node)
+        || (node.kind() == "call" && node.child_by_field_name("block").is_some())
+    {
+        return None;
+    }
+    Some(match node.kind() {
+        "return" => "return",
+        "break" => "break",
+        "next" => "next",
+        "redo" => "redo",
+        "retry" => "retry",
+        "if" | "unless" | "elsif" | "if_modifier" | "unless_modifier" | "conditional" => "if",
+        "while" | "until" | "while_modifier" | "until_modifier" => "while",
+        "for" => "for",
+        "begin" => "try",
+        "case" | "case_match" => "case",
+        _ => "expression",
+    })
+}
+
+/// Ruby `for ... in` is an iteration loop and is intentionally omitted from
+/// B3; receiverless `loop do` is supplied by the source-aware hook below.
+fn ruby_loop_site(node: Node<'_>) -> Option<crate::analyzer::loop_facts::LoopSyntax<'_>> {
+    use crate::analyzer::loop_facts::{LoopKind, LoopSyntax};
+    let kind = match node.kind() {
+        "while" => LoopKind::While,
+        "until" | "until_modifier" => LoopKind::Until,
+        "while_modifier" => LoopKind::Do,
+        _ => return None,
+    };
+    Some(LoopSyntax {
+        kind,
+        body: node.child_by_field_name("body"),
+        condition: node.child_by_field_name("condition"),
+    })
+}
+
+fn ruby_loop_site_with_source<'tree>(
+    node: Node<'tree>,
+    source: &str,
+) -> Option<crate::analyzer::loop_facts::LoopSyntax<'tree>> {
+    use crate::analyzer::loop_facts::{LoopKind, LoopSyntax};
+    ruby_loop_site(node).or_else(|| {
+        ruby_unconditional_loop_body(node, source).map(|body| LoopSyntax {
+            // The shared loop model uses `For` for unconditional loops, as
+            // it does for Rust `loop` and Go `for {}`.
+            kind: LoopKind::For,
+            body: Some(body),
+            condition: None,
+        })
+    })
+}
+
+pub(crate) const PROCEDURE_SYNTAX_ROLES: crate::analyzer::languages::ProcedureSyntaxRoles =
+    crate::analyzer::languages::ProcedureSyntaxRoles {
+        statement_kind: ruby_statement_kind,
+        loop_site: ruby_loop_site,
+        loop_site_with_source: Some(ruby_loop_site_with_source),
+        procedure_matches: |kind, node| match kind {
+            ProcedureKind::Method | ProcedureKind::Constructor => {
+                matches!(node.kind(), "method" | "singleton_method")
+            }
+            ProcedureKind::Lambda => node.kind() == "lambda",
+            ProcedureKind::Closure => {
+                matches!(node.kind(), "block" | "do_block")
+                    && node.parent().is_none_or(|parent| parent.kind() != "lambda")
+            }
+            ProcedureKind::Initializer => matches!(
+                node.kind(),
+                "program" | "class" | "module" | "singleton_class"
+            ),
+            _ => false,
+        },
+        nested_procedure: ruby_callable_syntax,
+    };
 
 /// The bounded Ruby rescue form whose payload can be carried without making
 /// ordinary `raise` calls intrinsic: one receiverless `raise local` call is
@@ -234,16 +358,40 @@ fn call_arguments(node: Node<'_>) -> Vec<Node<'_>> {
 }
 
 fn first_runtime_named_child(node: Node<'_>) -> Option<Node<'_>> {
-    named_children(node)
-        .into_iter()
-        .find(|child| is_runtime_node(child.kind()))
+    brokk_bifrost_core::analyzer::tree_walk::first_named_child_matching(node, |child| {
+        is_runtime_node(child.kind())
+    })
+}
+
+fn ruby_logical_not_operand<'tree>(source: &str, node: Node<'tree>) -> Option<Node<'tree>> {
+    if node.kind() != "unary"
+        || node
+            .child_by_field_name("operator")
+            .and_then(|operator| node_text(source, operator))
+            .is_none_or(|operator| !matches!(operator, "!" | "not"))
+    {
+        return None;
+    }
+    node.child_by_field_name("operand")
+}
+
+fn peel_ruby_condition_parentheses(mut node: Node<'_>) -> Node<'_> {
+    while node.kind() == "parenthesized_statements" {
+        let Some(inner) = first_runtime_named_child(node) else {
+            break;
+        };
+        node = inner;
+    }
+    node
 }
 
 /// The boolean value of a Ruby condition that is a literal, optionally wrapped
-/// in one parenthesized statement list. A multi-statement parenthesized body is
-/// intentionally not folded because its value depends on evaluation order.
-fn ruby_folded_boolean_constant(node: Node<'_>) -> Option<bool> {
+/// in parenthesized statement lists and logical negation. A multi-statement
+/// parenthesized body is intentionally not folded because its value depends on
+/// evaluation order.
+fn ruby_folded_boolean_constant(source: &str, node: Node<'_>) -> Option<bool> {
     let mut current = node;
+    let mut negated = false;
     while current.kind() == "parenthesized_statements" {
         let children = runtime_expression_children(current);
         if children.len() != 1 {
@@ -251,25 +399,26 @@ fn ruby_folded_boolean_constant(node: Node<'_>) -> Option<bool> {
         }
         current = children[0];
     }
+    while let Some(operand) = ruby_logical_not_operand(source, current) {
+        negated = !negated;
+        current = operand;
+        while current.kind() == "parenthesized_statements" {
+            let children = runtime_expression_children(current);
+            if children.len() != 1 {
+                return None;
+            }
+            current = children[0];
+        }
+    }
     match current.kind() {
-        "true" => Some(true),
-        "false" => Some(false),
+        "true" => Some(!negated),
+        "false" => Some(negated),
         _ => None,
     }
 }
 
 fn required_field<'tree>(node: Node<'tree>, field: &str) -> Result<Node<'tree>, RubyLoweringError> {
-    node.child_by_field_name(field)
-        .ok_or_else(|| missing_field(node, field))
-}
-
-fn missing_field(node: Node<'_>, field: &str) -> RubyLoweringError {
-    RubyLoweringError::Invalid(format!(
-        "{} node at bytes {}..{} is missing structured field {field}",
-        node.kind(),
-        node.start_byte(),
-        node.end_byte()
-    ))
+    crate::analyzer::semantic::lowering::required_field_or_else(node, field, missing_field)
 }
 
 fn is_short_circuit_binary(source: &str, node: Node<'_>) -> bool {
@@ -775,64 +924,36 @@ fn collect_local_bindings(
     })
 }
 
-fn source_anchor_between(
-    start_node: Node<'_>,
-    end_node: Node<'_>,
-    occurrence: u32,
-) -> Result<SourceAnchor, String> {
-    let start_position = start_node.start_position();
-    let end_position = end_node.end_position();
-    let start = SourcePosition::new(
-        u32::try_from(start_node.start_byte()).map_err(|_| "source start exceeds u32")?,
-        u32::try_from(start_position.row).map_err(|_| "source start line exceeds u32")?,
-        u32::try_from(start_position.column).map_err(|_| "source start column exceeds u32")?,
-    );
-    let end = SourcePosition::new(
-        u32::try_from(end_node.end_byte()).map_err(|_| "source end exceeds u32")?,
-        u32::try_from(end_position.row).map_err(|_| "source end line exceeds u32")?,
-        u32::try_from(end_position.column).map_err(|_| "source end column exceeds u32")?,
-    );
-    let span = SourceSpan::new(start, end).map_err(|error| error.to_string())?;
-    Ok(SourceAnchor::new(span, occurrence))
-}
-
 fn callable_source_anchor(
     callable: Node<'_>,
     body: Node<'_>,
     occurrence: u32,
 ) -> Result<SourceAnchor, String> {
     let start_position = callable.start_position();
-    let start = SourcePosition::new(
-        u32::try_from(callable.start_byte()).map_err(|_| "source start exceeds u32")?,
-        u32::try_from(start_position.row).map_err(|_| "source start line exceeds u32")?,
-        u32::try_from(start_position.column).map_err(|_| "source start column exceeds u32")?,
-    );
-    let end = if body.start_byte() > callable.start_byte() {
-        let end_position = body.start_position();
-        SourcePosition::new(
-            u32::try_from(body.start_byte()).map_err(|_| "source end exceeds u32")?,
-            u32::try_from(end_position.row).map_err(|_| "source end line exceeds u32")?,
-            u32::try_from(end_position.column).map_err(|_| "source end column exceeds u32")?,
-        )
+    let (end_byte, end_position) = if body.start_byte() > callable.start_byte() {
+        (body.start_byte(), body.start_position())
     } else {
-        start
+        (callable.start_byte(), start_position)
     };
-    let span = SourceSpan::new(start, end).map_err(|error| error.to_string())?;
-    Ok(SourceAnchor::new(span, occurrence))
+    source_anchor_from_positions(
+        callable.start_byte(),
+        start_position,
+        end_byte,
+        end_position,
+        occurrence,
+    )
 }
 
 struct RubySemanticLowerer;
 
 impl ProgramSemanticsLowerer for RubySemanticLowerer {
     fn identity(&self) -> SemanticAdapterIdentity {
-        SemanticAdapterIdentity {
-            adapter: AdapterSemanticsVersion::hash_bytes("ruby", ADAPTER_VERSION)
-                .expect("adapter name is non-empty"),
-            configuration: ConfigurationFingerprint::hash_bytes(
-                b"ruby-intrafile-execution-defaults-v1",
-            ),
-            dependencies: DependencyFingerprint::hash_bytes(b"no-intrafile-dependencies"),
-        }
+        SemanticAdapterIdentity::for_adapter(
+            "ruby",
+            ADAPTER_VERSION,
+            b"ruby-intrafile-execution-defaults-v1",
+            DependencyFingerprint::hash_bytes(b"no-intrafile-dependencies"),
+        )
     }
 
     fn capabilities(&self) -> SemanticCapabilities {
@@ -883,29 +1004,29 @@ impl ProgramSemanticsLowerer for RubySemanticLowerer {
             Err(RubyLoweringError::Cancelled(work)) => {
                 return Ok(SemanticOutcome::Cancelled {
                     partial: None,
-                    work: sum_lowering_work(inventory_work, *work),
+                    work: inventory_work.conservative_add(*work),
                 });
             }
             Err(RubyLoweringError::Budget(exceeded, work)) => {
                 return Ok(SemanticOutcome::ExceededBudget {
                     partial: None,
                     exceeded,
-                    work: sum_lowering_work(inventory_work, *work),
+                    work: inventory_work.conservative_add(*work),
                 });
             }
             Err(RubyLoweringError::Invalid(detail)) => {
                 return Err(SemanticProviderError::internal(detail));
             }
         };
-        initial_work = sum_lowering_work(initial_work, properties.work);
-        inventory_work = sum_lowering_work(inventory_work, properties.work);
+        initial_work = initial_work.conservative_add(properties.work);
+        inventory_work = inventory_work.conservative_add(properties.work);
         let property_inventory = properties.inventory;
 
         let mut bindings_by_procedure: Vec<ProcedureBindings> = Vec::with_capacity(specs.len());
         let mut binding_work = SemanticWork::default();
         for spec in &specs {
             let mut staged_budget = budget.clone();
-            let observed = sum_lowering_work(inventory_work, binding_work);
+            let observed = inventory_work.conservative_add(binding_work);
             if let Err(exceeded) = staged_budget.charge(observed) {
                 return Ok(SemanticOutcome::ExceededBudget {
                     partial: None,
@@ -932,11 +1053,11 @@ impl ProgramSemanticsLowerer for RubySemanticLowerer {
                 Err(RubyLoweringError::Cancelled(work)) => {
                     return Ok(SemanticOutcome::Cancelled {
                         partial: None,
-                        work: sum_lowering_work(observed, *work),
+                        work: observed.conservative_add(*work),
                     });
                 }
                 Err(RubyLoweringError::Budget(exceeded, work)) => {
-                    let work = sum_lowering_work(observed, *work);
+                    let work = observed.conservative_add(*work);
                     let exceeded = budget.check(work).err().unwrap_or(exceeded);
                     return Ok(SemanticOutcome::ExceededBudget {
                         partial: None,
@@ -948,8 +1069,8 @@ impl ProgramSemanticsLowerer for RubySemanticLowerer {
                     return Err(SemanticProviderError::internal(detail));
                 }
             };
-            let candidate = sum_lowering_work(binding_work, collection.work);
-            let observed_candidate = sum_lowering_work(inventory_work, candidate);
+            let candidate = binding_work.conservative_add(collection.work);
+            let observed_candidate = inventory_work.conservative_add(candidate);
             if let Err(exceeded) = budget.check(observed_candidate) {
                 return Ok(SemanticOutcome::ExceededBudget {
                     partial: None,
@@ -964,7 +1085,7 @@ impl ProgramSemanticsLowerer for RubySemanticLowerer {
             });
         }
 
-        let prepass_observed = sum_lowering_work(inventory_work, binding_work);
+        let prepass_observed = inventory_work.conservative_add(binding_work);
         let mut prepass_budget = budget.clone();
         if let Err(exceeded) = prepass_budget.charge(prepass_observed) {
             return Ok(SemanticOutcome::ExceededBudget {
@@ -984,11 +1105,11 @@ impl ProgramSemanticsLowerer for RubySemanticLowerer {
             Err(RubyLoweringError::Cancelled(work)) => {
                 return Ok(SemanticOutcome::Cancelled {
                     partial: None,
-                    work: sum_lowering_work(prepass_observed, *work),
+                    work: prepass_observed.conservative_add(*work),
                 });
             }
             Err(RubyLoweringError::Budget(exceeded, work)) => {
-                let work = sum_lowering_work(prepass_observed, *work);
+                let work = prepass_observed.conservative_add(*work);
                 let exceeded = budget.check(work).err().unwrap_or(exceeded);
                 return Ok(SemanticOutcome::ExceededBudget {
                     partial: None,
@@ -1000,11 +1121,11 @@ impl ProgramSemanticsLowerer for RubySemanticLowerer {
                 return Err(SemanticProviderError::internal(detail));
             }
         };
-        binding_work = sum_lowering_work(binding_work, prepass_work);
+        binding_work = binding_work.conservative_add(prepass_work);
 
         lower_procedure_batch(
             specs.iter().zip(&bindings_by_procedure),
-            sum_lowering_work(initial_work, binding_work),
+            initial_work.conservative_add(binding_work),
             budget,
             cancellation,
             |(spec, local_bindings), staged_budget, cancellation| {
@@ -1026,42 +1147,10 @@ impl ProgramSemanticsLowerer for RubySemanticLowerer {
 }
 
 fn ruby_capabilities() -> SemanticCapabilities {
-    let mut builder = SemanticCapabilities::builder();
+    let mut builder = crate::analyzer::semantic::capabilities::tree_sitter_adapter_capabilities();
     for capability in [
-        SemanticCapability::Procedures,
-        SemanticCapability::EntryBoundary,
-        SemanticCapability::NormalExitBoundary,
-        SemanticCapability::ExceptionalExitBoundary,
-        SemanticCapability::BasicBlocks,
-        SemanticCapability::ProgramPoints,
-        SemanticCapability::ReturnFlow,
-        SemanticCapability::NormalCallContinuation,
-        SemanticCapability::ExceptionalCallContinuation,
-    ] {
-        builder = builder.complete(capability);
-    }
-    for capability in [
-        SemanticCapability::NormalControlFlow,
-        SemanticCapability::ExceptionalControlFlow,
-        SemanticCapability::CleanupControlFlow,
-        SemanticCapability::Calls,
-        SemanticCapability::DynamicDispatch,
-        SemanticCapability::CallableReferences,
-        SemanticCapability::Values,
-        SemanticCapability::Assignments,
-        SemanticCapability::FieldMemory,
-        SemanticCapability::IndexMemory,
-        SemanticCapability::Allocations,
-        SemanticCapability::LocalFlow,
-        SemanticCapability::ParameterFlow,
-        SemanticCapability::ReceiverFlow,
-        SemanticCapability::Captures,
         SemanticCapability::GeneratorSuspension,
-        SemanticCapability::DeferredExecution,
         SemanticCapability::ConcurrentSpawn,
-        SemanticCapability::NonLocalControl,
-        SemanticCapability::ResourceManagement,
-        SemanticCapability::GuardFacts,
     ] {
         builder = builder.partial(capability);
     }
@@ -1379,15 +1468,12 @@ fn declaration_container_name(source: &str, node: Node<'_>) -> Option<Box<str>> 
     if node.kind() == "singleton_class" {
         return Some("<singleton-class>".into());
     }
-    node.child_by_field_name("name")
-        .and_then(|name| node_text(source, name))
-        .filter(|name| !name.is_empty())
-        .map(Box::<str>::from)
+    crate::analyzer::common::declaration_container_name(source, node)
 }
 
 fn callable_name(source: &str, node: Node<'_>, kind: ProcedureKind) -> Option<Box<str>> {
     match node.kind() {
-        "program" => Some("<file>".into()),
+        "program" => Some(FILE_INITIALIZER_SEGMENT_NAME.into()),
         "class" | "module" => declaration_container_name(source, node),
         "singleton_class" => Some("<singleton-class>".into()),
         "method" | "singleton_method" => node
@@ -1429,28 +1515,7 @@ type RubyLoweringError = ProcedureLoweringError;
 
 type EdgeTarget = ControlTarget;
 
-#[derive(Debug, Clone, Copy)]
-enum Work<'tree> {
-    Statement {
-        node: Node<'tree>,
-        entry: ProgramPointId,
-        next: EdgeTarget,
-        scope: ScopeFrameId,
-    },
-    Expression {
-        node: Node<'tree>,
-        entry: ProgramPointId,
-        next: EdgeTarget,
-        scope: ScopeFrameId,
-    },
-    Condition {
-        node: Node<'tree>,
-        entry: ProgramPointId,
-        when_true: EdgeTarget,
-        when_false: EdgeTarget,
-        scope: ScopeFrameId,
-    },
-}
+type Work<'tree> = ProcedureWork<'tree>;
 
 #[derive(Debug, Clone, Copy)]
 struct CleanupRegion<'tree> {
@@ -1500,6 +1565,56 @@ struct LoweringContext<'tree, 'targets> {
     function_value_targets: &'targets RubyFunctionValueTargets,
 }
 
+impl<'tree, 'targets> ProcedureWorkHandler<'tree> for LoweringContext<'tree, 'targets> {
+    fn cancellation_token(&self) -> &CancellationToken {
+        self.session.cancellation()
+    }
+
+    fn lower_statement(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        node: Node<'tree>,
+        entry: ProgramPointId,
+        next: ControlTarget,
+        scope: ScopeFrameId,
+        stack: &mut Vec<ProcedureWork<'tree>>,
+    ) -> Result<(), RubyLoweringError> {
+        self.statement(builder, node, entry, next, scope, stack)
+    }
+
+    fn lower_expression(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        node: Node<'tree>,
+        entry: ProgramPointId,
+        next: ControlTarget,
+        scope: ScopeFrameId,
+        stack: &mut Vec<ProcedureWork<'tree>>,
+    ) -> Result<(), RubyLoweringError> {
+        self.expression(builder, node, entry, next, scope, stack)
+    }
+
+    fn lower_condition(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        node: Node<'tree>,
+        entry: ProgramPointId,
+        targets: ConditionTargets,
+        scope: ScopeFrameId,
+        stack: &mut Vec<ProcedureWork<'tree>>,
+    ) -> Result<(), RubyLoweringError> {
+        self.condition(
+            builder,
+            node,
+            entry,
+            targets.when_true,
+            targets.when_false,
+            scope,
+            stack,
+        )
+    }
+}
+
 struct RubyProcedureIndexes<'targets> {
     properties: &'targets RubyPropertyInventory,
     local_bindings: &'targets LocalBindingTimeline,
@@ -1523,6 +1638,15 @@ fn lower_procedure<'tree, 'request>(
     );
     parts.lexical_parent = spec.lexical_parent;
     parts.properties = spec.properties;
+    let source_anchor = source_anchor(spec.callable, 0).map_err(RubyLoweringError::Invalid)?;
+    let source_locator = SemanticLocator::new(
+        spec.locator.mount(),
+        spec.locator.path().clone(),
+        spec.locator.language(),
+        spec.locator.declaration().clone(),
+        SemanticRole::SourceMapping,
+        source_anchor,
+    );
     let ProcedureLoweringStart {
         mut builder,
         session,
@@ -1530,7 +1654,12 @@ fn lower_procedure<'tree, 'request>(
         normal_exit,
         exceptional_exit,
         function_scope,
-    } = ProcedureLoweringSession::start(parts, budget, cancellation)?;
+    } = ProcedureLoweringSession::start_with_source_locator(
+        parts,
+        budget,
+        cancellation,
+        source_locator,
+    )?;
     let runtime_body = if matches!(spec.body.kind(), "block" | "do_block") {
         spec.body.child_by_field_name("body").unwrap_or(spec.body)
     } else {
@@ -1583,7 +1712,7 @@ fn lower_procedure<'tree, 'request>(
                 "Ruby default parameter evaluation may raise before the callable body",
             ),
         ] {
-            context.add_gap(
+            context.session.record_gap(
                 &mut builder,
                 entry,
                 SemanticGapSubject::Point,
@@ -1594,7 +1723,7 @@ fn lower_procedure<'tree, 'request>(
         }
     }
     if spec.kind == ProcedureKind::Closure {
-        context.add_gap(
+        context.session.record_gap(
             &mut builder,
             entry,
             SemanticGapSubject::Procedure,
@@ -1604,7 +1733,7 @@ fn lower_procedure<'tree, 'request>(
         )?;
     }
     if spec.lexical_parent.is_some() {
-        context.add_gap(
+        context.session.record_gap(
             &mut builder,
             entry,
             SemanticGapSubject::Procedure,
@@ -1614,7 +1743,7 @@ fn lower_procedure<'tree, 'request>(
         )?;
     }
     if spec.kind == ProcedureKind::Initializer && spec.callable.kind() != "program" {
-        context.add_gap(
+        context.session.record_gap(
             &mut builder,
             entry,
             SemanticGapSubject::Procedure,
@@ -1703,7 +1832,7 @@ fn lower_procedure<'tree, 'request>(
             let source = context.expression_value(
                 &mut builder,
                 result_node,
-                expression_value_kind(result_node),
+                expression_value_kind(prepared.source(), result_node),
             )?;
             context.append_effect(
                 &mut builder,
@@ -1720,17 +1849,21 @@ fn lower_procedure<'tree, 'request>(
             implicit_return,
             SemanticEffect::ProcedureReturn { value: Some(value) },
         )?;
-        context.edge(
+        context.session.add_target_edge(
             &mut builder,
             implicit_return,
             EdgeTarget::normal(normal_exit),
         )?;
         EdgeTarget::normal(implicit_return)
     };
-    context.edge(&mut builder, entry, EdgeTarget::normal(body_entry))?;
+    context
+        .session
+        .add_target_edge(&mut builder, entry, EdgeTarget::normal(body_entry))?;
 
     let initial = if spec.empty_body {
-        context.edge(&mut builder, body_entry, body_next)?;
+        context
+            .session
+            .add_target_edge(&mut builder, body_entry, body_next)?;
         None
     } else {
         Some(Work::Statement {
@@ -1747,7 +1880,7 @@ fn lower_procedure<'tree, 'request>(
         normal_exit,
         exceptional_exit,
         cancellation,
-        |builder, work, stack| context.step(builder, work, stack),
+        |builder, work, stack| dispatch_procedure_work(&mut context, builder, work, stack),
     )
 }
 
@@ -1761,7 +1894,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         // methods, class/module bodies, and nested callables.  Nested
         // callables retain a capture gap below, but publishing the port keeps
         // their structured `self` reads connected to one stable identity.
-        let receiver_metadata = self.value_mapping(builder, callable)?;
+        let receiver_metadata = self.session.add_value_mapping(builder, callable)?;
         let receiver = self.session.add_value_with_metadata(
             builder,
             receiver_metadata,
@@ -1788,9 +1921,11 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             let mapping_node = slot
                 .names
                 .iter()
-                .find_map(|name| ruby_binding_name_node(declaration, self.source, name))
+                .find_map(|name| {
+                    crate::analyzer::tree_walk::find_identifier_node(declaration, self.source, name)
+                })
                 .unwrap_or(declaration);
-            let metadata = self.value_mapping(builder, mapping_node)?;
+            let metadata = self.session.add_value_mapping(builder, mapping_node)?;
             let parameter_name = slot.unique_name().map(Box::<str>::from);
             let passing_mode = slot.passing_mode;
             let value = self.session.add_value_with_metadata(
@@ -1834,7 +1969,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 .named_descendant_for_byte_range(start, end)
                 .filter(|node| node.kind() == "identifier")
                 .unwrap_or(callable);
-            let metadata = self.value_mapping(builder, node)?;
+            let metadata = self.session.add_value_mapping(builder, node)?;
             let value = self.session.add_value_with_metadata(
                 builder,
                 metadata,
@@ -1846,20 +1981,11 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
     }
 
     fn binding_value(&self, name: &str) -> Option<(ValueId, ValueFlowKind)> {
-        self.locals
-            .get(name)
-            .copied()
-            .map(|value| (value, ValueFlowKind::Local))
-            .or_else(|| {
-                self.parameters.get(name).copied().map(|value| {
-                    let kind = if Some(value) == self.receiver {
-                        ValueFlowKind::Receiver
-                    } else {
-                        ValueFlowKind::Parameter
-                    };
-                    (value, kind)
-                })
-            })
+        resolve_binding_value(
+            self.locals.get(name).copied(),
+            self.parameters.get(name).copied(),
+            self.receiver,
+        )
     }
 
     fn expression_value(
@@ -1868,18 +1994,13 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         node: Node<'tree>,
         kind: SemanticValueKind,
     ) -> Result<ValueId, RubyLoweringError> {
-        if let Some(value) = self.expression_values.get(&node.id()) {
-            return Ok(*value);
-        }
-        let metadata = self.value_mapping(builder, node)?;
-        let value = self.session.insert_cached_value_with_metadata(
+        self.session.cached_node_value(
             builder,
             &mut self.expression_values,
-            node.id(),
-            metadata,
+            node,
             kind,
-        )?;
-        Ok(value)
+            |session, builder, node| session.add_value_mapping(builder, node),
+        )
     }
 
     fn assignment_is_direct_in_body(&self, node: Node<'tree>) -> bool {
@@ -2184,14 +2305,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         }
         let anchor = source_anchor(node, 0).ok()?;
         let procedure = self.session.locator();
-        let locator = SemanticLocator::new(
-            procedure.mount(),
-            procedure.path().clone(),
-            procedure.language(),
-            procedure.declaration().clone(),
-            SemanticRole::MemoryLocation,
-            anchor,
-        );
+        let locator = procedure.memory_location_at(anchor);
         self.instance_field_locators
             .insert(name.into(), locator.clone());
         Some(locator)
@@ -2235,9 +2349,13 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         else {
             return Ok(None);
         };
-        if let Some(value) = self.constant_index_values.get(&index) {
-            self.expression_values.insert(node.id(), *value);
-            return Ok(Some(*value));
+        if let Some(value) = crate::analyzer::common::reuse_cached_expression_value(
+            &self.constant_index_values,
+            &mut self.expression_values,
+            index,
+            node.id(),
+        ) {
+            return Ok(Some(value));
         }
         let value = self.expression_value(builder, node, SemanticValueKind::Constant)?;
         self.constant_index_values.insert(index, value);
@@ -2250,29 +2368,12 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         point: ProgramPointId,
         location: MemoryLocationId,
     ) -> Result<(), RubyLoweringError> {
-        self.session.add_gap_with_impacts(
+        self.session.add_unprojected_index_gap(
             builder,
             point,
-            SemanticGapSubject::MemoryLocation(location),
-            SemanticCapability::IndexMemory,
-            SemanticGapImpacts::single(SemanticGapImpact::HeapRead)
-                .with(SemanticGapImpact::HeapWrite)
-                .with(SemanticGapImpact::Aliasing),
-            SemanticGapKind::Unsupported,
+            location,
             "Ruby dynamic element index identity is not proven",
-        )?;
-        Ok(())
-    }
-
-    fn source_value(
-        &mut self,
-        builder: &mut ProcedureCfgBuilder,
-        node: Node<'tree>,
-        kind: SemanticValueKind,
-    ) -> Result<ValueId, RubyLoweringError> {
-        let metadata = self.value_mapping(builder, node)?;
-        self.session
-            .add_value_with_metadata(builder, metadata, kind)
+        )
     }
 
     fn semantic_call_argument(
@@ -2302,8 +2403,11 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 CallArgumentExpansion::Direct(ArgumentDomain::Positional),
             ),
         };
-        let value =
-            self.expression_value(builder, value_node, expression_value_kind(value_node))?;
+        let value = self.expression_value(
+            builder,
+            value_node,
+            expression_value_kind(self.source, value_node),
+        )?;
         let keyword = if argument.kind() == "pair" {
             argument.child_by_field_name("key").and_then(|key| {
                 if !matches!(key.kind(), "simple_symbol" | "hash_key_symbol") {
@@ -2338,50 +2442,9 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         let Some((source, kind)) = self.binding_value(name) else {
             return Ok(false);
         };
-        if source != target {
-            self.append_effect(
-                builder,
-                point,
-                SemanticEffect::ValueFlow {
-                    kind,
-                    source,
-                    target,
-                },
-            )?;
-        }
+        self.session
+            .append_value_flow_if_distinct(builder, point, kind, source, target)?;
         Ok(true)
-    }
-
-    fn step(
-        &mut self,
-        builder: &mut ProcedureCfgBuilder,
-        work: Work<'tree>,
-        stack: &mut Vec<Work<'tree>>,
-    ) -> Result<(), RubyLoweringError> {
-        if self.session.cancellation().is_cancelled() {
-            return Err(RubyLoweringError::Cancelled(Box::default()));
-        }
-        match work {
-            Work::Statement {
-                node,
-                entry,
-                next,
-                scope,
-            } => self.statement(builder, node, entry, next, scope, stack),
-            Work::Expression {
-                node,
-                entry,
-                next,
-                scope,
-            } => self.expression(builder, node, entry, next, scope, stack),
-            Work::Condition {
-                node,
-                entry,
-                when_true,
-                when_false,
-                scope,
-            } => self.condition(builder, node, entry, when_true, when_false, scope, stack),
-        }
     }
 
     fn next_label(&mut self, role: &str) -> Box<str> {
@@ -2391,8 +2454,10 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
     }
 
     fn copy_controls(&mut self, parent: ScopeFrameId, child: ScopeFrameId) {
-        let controls = self.controls.get(&parent).cloned().unwrap_or_default();
-        self.controls.insert(child, controls);
+        self.controls.insert(
+            child,
+            crate::analyzer::semantic::lowering::copy_scope_frames(&self.controls, parent),
+        );
     }
 
     fn extend_controls(
@@ -2401,13 +2466,10 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         child: ScopeFrameId,
         frame: RubyControlFrame,
     ) {
-        let mut controls = self
-            .controls
-            .get(&parent)
-            .map(|controls| controls.to_vec())
-            .unwrap_or_default();
-        controls.push(frame);
-        self.controls.insert(child, controls.into_boxed_slice());
+        self.controls.insert(
+            child,
+            crate::analyzer::semantic::lowering::extend_scope_frames(&self.controls, parent, frame),
+        );
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -2420,6 +2482,9 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         scope: ScopeFrameId,
         stack: &mut Vec<Work<'tree>>,
     ) -> Result<(), RubyLoweringError> {
+        if ruby_statement_kind(node).is_some() {
+            self.session.record_statement_entry(builder, node, entry)?;
+        }
         match node.kind() {
             "program" | "block_body" | "do" | "then" | "else" | "ensure" => {
                 let children = runtime_statement_children(node);
@@ -2436,9 +2501,14 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             "parenthesized_statements" => {
                 let children = runtime_statement_children(node);
                 let terminal = self.point(builder, node, Vec::new())?;
-                let result = self.expression_value(builder, node, expression_value_kind(node))?;
+                let result =
+                    self.expression_value(builder, node, expression_value_kind(self.source, node))?;
                 let source = if let Some(last) = children.last() {
-                    self.expression_value(builder, *last, expression_value_kind(*last))?
+                    self.expression_value(
+                        builder,
+                        *last,
+                        expression_value_kind(self.source, *last),
+                    )?
                 } else {
                     self.value(builder, terminal, SemanticValueKind::Null)?
                 };
@@ -2451,7 +2521,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                         target: result,
                     },
                 )?;
-                self.edge(builder, terminal, next)?;
+                self.session.add_target_edge(builder, terminal, next)?;
                 self.schedule_statements(
                     builder,
                     entry,
@@ -2486,7 +2556,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                     });
                     Ok(())
                 } else {
-                    self.edge(builder, entry, next)
+                    self.session.add_target_edge(builder, entry, next)
                 }
             }
             "begin" => self.try_body(builder, node, entry, next, scope, stack),
@@ -2589,9 +2659,10 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             }
             "super" => self.unsupported_super(builder, node, entry, next, scope, stack),
             _ if is_runtime_leaf(node.kind()) => {
-                let value = self.expression_value(builder, node, expression_value_kind(node))?;
+                let value =
+                    self.expression_value(builder, node, expression_value_kind(self.source, node))?;
                 self.emit_lexical_input_flow(builder, node, entry, value)?;
-                self.edge(builder, entry, next)
+                self.session.add_target_edge(builder, entry, next)
             }
             _ => {
                 let children = runtime_expression_children(node);
@@ -2600,29 +2671,14 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         }
     }
 
-    fn instance_variable_access(
+    fn emit_field_memory_load(
         &mut self,
         builder: &mut ProcedureCfgBuilder,
-        node: Node<'tree>,
-        entry: ProgramPointId,
-        next: EdgeTarget,
+        access: ProgramPointId,
+        base: ValueId,
+        member: SemanticLocator,
+        result: ValueId,
     ) -> Result<(), RubyLoweringError> {
-        let result = self.expression_value(builder, node, expression_value_kind(node))?;
-        let Some(member) = self.instance_field_member_locator(node) else {
-            self.add_gap(
-                builder,
-                entry,
-                SemanticGapSubject::Point,
-                SemanticCapability::FieldMemory,
-                SemanticGapKind::Unsupported,
-                "Ruby instance-variable reads outside an ordinary instance method are not receiver-rooted",
-            )?;
-            return self.edge(builder, entry, next);
-        };
-        let base = self
-            .receiver
-            .expect("an ordinary Ruby instance method has a receiver value");
-        let access = self.point(builder, node, Vec::new())?;
         let location = self.session.add_memory_location(
             builder,
             access,
@@ -2636,9 +2692,37 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 location,
                 result,
             },
-        )?;
-        self.edge(builder, entry, EdgeTarget::normal(access))?;
-        self.edge(builder, access, next)
+        )
+    }
+
+    fn instance_variable_access(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        node: Node<'tree>,
+        entry: ProgramPointId,
+        next: EdgeTarget,
+    ) -> Result<(), RubyLoweringError> {
+        let result =
+            self.expression_value(builder, node, expression_value_kind(self.source, node))?;
+        let Some(member) = self.instance_field_member_locator(node) else {
+            self.session.record_gap(
+                builder,
+                entry,
+                SemanticGapSubject::Point,
+                SemanticCapability::FieldMemory,
+                SemanticGapKind::Unsupported,
+                "Ruby instance-variable reads outside an ordinary instance method are not receiver-rooted",
+            )?;
+            return self.session.add_target_edge(builder, entry, next);
+        };
+        let base = self
+            .receiver
+            .expect("an ordinary Ruby instance method has a receiver value");
+        let access = self.point(builder, node, Vec::new())?;
+        self.emit_field_memory_load(builder, access, base, member, result)?;
+        self.session
+            .add_target_edge(builder, entry, EdgeTarget::normal(access))?;
+        self.session.add_target_edge(builder, access, next)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -2652,9 +2736,9 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         scope: ScopeFrameId,
         stack: &mut Vec<Work<'tree>>,
     ) -> Result<(), RubyLoweringError> {
-        if let Some(value) = ruby_folded_boolean_constant(node) {
+        if let Some(value) = ruby_folded_boolean_constant(self.source, node) {
             let taken = if value { when_true } else { when_false };
-            self.edge(builder, entry, taken)?;
+            self.session.add_target_edge(builder, entry, taken)?;
             return self.record_guard(
                 builder,
                 entry,
@@ -2664,99 +2748,86 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 (!value).then_some(when_false),
             );
         }
-        if node.kind() == "binary" {
-            let operator = node
-                .child_by_field_name("operator")
-                .and_then(|operator| node_text(self.source, operator));
-            if matches!(operator, Some("&&" | "and")) {
-                let left = required_field(node, "left")?;
-                let right = required_field(node, "right")?;
-                let right_entry = self.point(builder, right, Vec::new())?;
-                stack.push(Work::Condition {
-                    node: right,
-                    entry: right_entry,
-                    when_true,
-                    when_false,
-                    scope,
-                });
-                stack.push(Work::Condition {
-                    node: left,
-                    entry,
-                    when_true: EdgeTarget {
-                        point: right_entry,
-                        kind: ControlEdgeKind::ConditionalTrue,
-                    },
-                    when_false,
-                    scope,
-                });
-                return Ok(());
-            }
-            if matches!(operator, Some("||" | "or")) {
-                let left = required_field(node, "left")?;
-                let right = required_field(node, "right")?;
-                let right_entry = self.point(builder, right, Vec::new())?;
-                stack.push(Work::Condition {
-                    node: right,
-                    entry: right_entry,
-                    when_true,
-                    when_false,
-                    scope,
-                });
-                stack.push(Work::Condition {
-                    node: left,
-                    entry,
-                    when_true,
-                    when_false: EdgeTarget {
-                        point: right_entry,
-                        kind: ControlEdgeKind::ConditionalFalse,
-                    },
-                    scope,
-                });
-                return Ok(());
-            }
-        }
-        if node.kind() == "unary"
-            && node
-                .child_by_field_name("operator")
-                .and_then(|operator| node_text(self.source, operator))
-                .is_some_and(|operator| matches!(operator, "!" | "not"))
-        {
-            let operand = required_field(node, "operand")?;
-            let decision = self.point(builder, node, Vec::new())?;
-            self.negation_gaps(builder, decision)?;
-            self.edge(builder, decision, when_true)?;
-            self.edge(builder, decision, when_false)?;
-            let subject = self.expression_value(builder, node, expression_value_kind(node))?;
-            self.record_guard(
-                builder,
-                decision,
-                GuardPredicate::Opaque {
-                    digest: GuardConditionDigest::from_syntax_kind(node.kind()),
-                },
-                Some(subject),
-                Some(when_true),
-                Some(when_false),
-            )?;
-            stack.push(Work::Expression {
+        if let Some(operand) = ruby_logical_not_operand(self.source, node) {
+            stack.push(Work::Condition {
                 node: operand,
                 entry,
-                next: EdgeTarget::normal(decision),
+                when_true: when_false,
+                when_false: when_true,
                 scope,
             });
             return Ok(());
         }
-
+        if node.kind() == "parenthesized_statements" {
+            let children = runtime_expression_children(node);
+            if let [child] = children.as_slice() {
+                stack.push(Work::Condition {
+                    node: *child,
+                    entry,
+                    when_true,
+                    when_false,
+                    scope,
+                });
+                return Ok(());
+            }
+        }
+        if node.kind() == "binary" {
+            let operator = node
+                .child_by_field_name("operator")
+                .and_then(|operator| node_text(self.source, operator));
+            if let Some(operator @ ("&&" | "and" | "||" | "or")) = operator {
+                let left = required_field(node, "left")?;
+                let right = required_field(node, "right")?;
+                let right_entry = self.point(builder, right, Vec::new())?;
+                let kind = match operator {
+                    "&&" | "and" => ShortCircuitKind::And,
+                    "||" | "or" => ShortCircuitKind::Or,
+                    _ => unreachable!("the match arm selects Ruby boolean operators"),
+                };
+                schedule_short_circuit_condition(
+                    stack,
+                    kind,
+                    (left, entry),
+                    (right, right_entry),
+                    when_true,
+                    when_false,
+                    scope,
+                    |node, entry, when_true, when_false, scope| Work::Condition {
+                        node,
+                        entry,
+                        when_true,
+                        when_false,
+                        scope,
+                    },
+                );
+                return Ok(());
+            }
+        }
         let decision = self.point(builder, node, Vec::new())?;
-        self.edge(builder, decision, when_true)?;
-        self.edge(builder, decision, when_false)?;
-        let subject = self.expression_value(builder, node, expression_value_kind(node))?;
+        self.session.add_target_edge(builder, decision, when_true)?;
+        self.session
+            .add_target_edge(builder, decision, when_false)?;
+        let (predicate, subject) = self.normalize_condition(builder, node)?.unwrap_or_else(|| {
+            (
+                GuardPredicate::Opaque {
+                    digest: GuardConditionDigest::from_syntax_kind(node.kind()),
+                },
+                None,
+            )
+        });
+        let subject = match subject {
+            Some(subject) => Some(subject),
+            None => Some(self.expression_value(
+                builder,
+                node,
+                expression_value_kind(self.source, node),
+            )?),
+        };
         self.record_guard(
             builder,
             decision,
-            GuardPredicate::Opaque {
-                digest: GuardConditionDigest::from_syntax_kind(node.kind()),
-            },
-            Some(subject),
+            predicate,
+            subject,
             Some(when_true),
             Some(when_false),
         )?;
@@ -2769,11 +2840,230 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         Ok(())
     }
 
+    fn ruby_condition_binding(&self, node: Node<'tree>) -> Option<ValueId> {
+        if node.kind() != "identifier" {
+            return None;
+        }
+        let name = node_text(self.source, node)?;
+        let (value, flow) = self.binding_value(name)?;
+        matches!(flow, ValueFlowKind::Local).then_some(value)
+    }
+
+    /// A truth test is admitted only for a local whose exact plain writes are
+    /// all Boolean literals. Integer locals are deliberately left open: Ruby
+    /// treats zero as truthy, so a generic scalar truth refinement would model
+    /// a different language's falsiness rules.
+    fn ruby_boolean_condition_binding(&self, node: Node<'tree>) -> Option<ValueId> {
+        let value = self.ruby_condition_binding(node)?;
+        let name = node_text(self.source, node)?;
+        let mut callable = node;
+        while let Some(parent) = callable.parent() {
+            callable = parent;
+            if ruby_callable_syntax(callable) {
+                break;
+            }
+        }
+        let mut saw_boolean = false;
+        let mut stack = vec![callable];
+        while let Some(current) = stack.pop() {
+            if current.id() != callable.id() && ruby_callable_syntax(current) {
+                continue;
+            }
+            if current.kind() == "operator_assignment"
+                && current.child_by_field_name("left").is_some_and(|left| {
+                    left.kind() == "identifier" && node_text(self.source, left) == Some(name)
+                })
+            {
+                return None;
+            }
+            if current.kind() == "assignment"
+                && let (Some(left), Some(right)) = (
+                    current.child_by_field_name("left"),
+                    current.child_by_field_name("right"),
+                )
+                && left.kind() == "identifier"
+                && node_text(self.source, left) == Some(name)
+            {
+                if matches!(
+                    ruby_scalar_literal_value_kind(self.source, right),
+                    Some(SemanticValueKind::Boolean(_))
+                ) {
+                    saw_boolean = true;
+                } else {
+                    return None;
+                }
+            }
+            stack.extend(named_children(current));
+        }
+        saw_boolean.then_some(value)
+    }
+
+    fn is_scalar_operator_syntax(&self, node: Node<'tree>) -> bool {
+        match node.kind() {
+            "binary" => {
+                let operator = node
+                    .child_by_field_name("operator")
+                    .and_then(|operator| node_text(self.source, operator));
+                if !matches!(operator, Some("<" | "<=" | ">" | ">=" | "==" | "!=")) {
+                    return false;
+                }
+                let Some(left) = node.child_by_field_name("left") else {
+                    return false;
+                };
+                let Some(right) = node.child_by_field_name("right") else {
+                    return false;
+                };
+                self.is_scalar_operator_operand(left) && self.is_scalar_operator_operand(right)
+            }
+            "unary" => {
+                node.child_by_field_name("operator")
+                    .and_then(|operator| node_text(self.source, operator))
+                    .is_some_and(|operator| matches!(operator, "!" | "not"))
+                    && node.child_by_field_name("operand").is_some_and(|operand| {
+                        self.ruby_boolean_condition_binding(operand).is_some()
+                            || matches!(
+                                ruby_scalar_literal_value_kind(self.source, operand),
+                                Some(SemanticValueKind::Boolean(_))
+                            )
+                    })
+            }
+            _ => false,
+        }
+    }
+
+    fn is_scalar_operator_operand(&self, node: Node<'tree>) -> bool {
+        let node = peel_ruby_condition_parentheses(node);
+        self.ruby_condition_binding(node).is_some()
+            || matches!(
+                ruby_scalar_literal_value_kind(self.source, node),
+                Some(
+                    SemanticValueKind::SignedInteger(_)
+                        | SemanticValueKind::UnsignedInteger(_)
+                        | SemanticValueKind::Boolean(_)
+                )
+            )
+    }
+
+    fn normalize_condition(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        node: Node<'tree>,
+    ) -> Result<Option<(GuardPredicate, Option<ValueId>)>, RubyLoweringError> {
+        let mut cursor = node;
+        let mut negated = false;
+        loop {
+            if cursor.kind() == "parenthesized_statements" {
+                let children = runtime_expression_children(cursor);
+                let [inner] = children.as_slice() else {
+                    return Ok(None);
+                };
+                cursor = *inner;
+            } else if let Some(operand) = ruby_logical_not_operand(self.source, cursor) {
+                negated = !negated;
+                cursor = operand;
+            } else {
+                break;
+            }
+        }
+        if let Some(value) = ruby_folded_boolean_constant(self.source, cursor) {
+            return Ok(Some((
+                GuardPredicate::ConstantBoolean {
+                    value: value != negated,
+                },
+                None,
+            )));
+        }
+        if let Some(value) = self.ruby_boolean_condition_binding(cursor) {
+            return Ok(Some((
+                GuardPredicate::Truthy {
+                    value: self.expression_value(
+                        builder,
+                        cursor,
+                        expression_value_kind(self.source, cursor),
+                    )?,
+                },
+                Some(value),
+            )));
+        }
+        if cursor.kind() != "binary" {
+            return Ok(None);
+        }
+        let (Some(operator), Some(left), Some(right)) = (
+            cursor
+                .child_by_field_name("operator")
+                .and_then(|operator| node_text(self.source, operator)),
+            cursor.child_by_field_name("left"),
+            cursor.child_by_field_name("right"),
+        ) else {
+            return Ok(None);
+        };
+        let left = peel_ruby_condition_parentheses(left);
+        let right = peel_ruby_condition_parentheses(right);
+        let left_binding = self.ruby_condition_binding(left);
+        let right_binding = self.ruby_condition_binding(right);
+        let left_integer = matches!(
+            ruby_scalar_literal_value_kind(self.source, left),
+            Some(SemanticValueKind::SignedInteger(_) | SemanticValueKind::UnsignedInteger(_))
+        );
+        let right_integer = matches!(
+            ruby_scalar_literal_value_kind(self.source, right),
+            Some(SemanticValueKind::SignedInteger(_) | SemanticValueKind::UnsignedInteger(_))
+        );
+        let (subject_node, constant, reversed) = match (left_binding, right_binding) {
+            (Some(_), None) if right_integer => (left, right, false),
+            (None, Some(_)) if left_integer => (right, left, true),
+            _ => return Ok(None),
+        };
+        let Some(subject_value) = self.ruby_condition_binding(subject_node) else {
+            return Ok(None);
+        };
+        let constant = self.expression_value(
+            builder,
+            constant,
+            expression_value_kind(self.source, constant),
+        )?;
+        let predicate = match operator {
+            "<" | "<=" | ">" | ">=" => {
+                let relation = match operator {
+                    "<" => IntegerComparison::LessThan,
+                    "<=" => IntegerComparison::LessThanOrEqual,
+                    ">" => IntegerComparison::GreaterThan,
+                    ">=" => IntegerComparison::GreaterThanOrEqual,
+                    _ => unreachable!("ordered operator was matched"),
+                };
+                let relation = if reversed {
+                    relation.reverse()
+                } else {
+                    relation
+                };
+                GuardPredicate::OrderedIntegerComparison {
+                    relation: if negated { relation.negate() } else { relation },
+                    constant,
+                }
+            }
+            "==" | "!=" => GuardPredicate::ConstantEquality {
+                negated: (operator == "!=") != negated,
+                constant,
+            },
+            _ => return Ok(None),
+        };
+        let subject = self.expression_value(
+            builder,
+            subject_node,
+            expression_value_kind(self.source, subject_node),
+        )?;
+        debug_assert_eq!(
+            self.ruby_condition_binding(subject_node),
+            Some(subject_value)
+        );
+        Ok(Some((predicate, Some(subject))))
+    }
+
     /// Publish one guard fact for a decision this lowerer just made.
     ///
     /// Arms must already have been added as edges; the IR validator enforces
-    /// that. Ruby's general truthiness and overloadable operators remain
-    /// opaque.
+    /// that. Exact local scalar guards use the documented built-in core
+    /// Integer/operator assumption; unresolved Ruby dispatch remains opaque.
     #[allow(clippy::too_many_arguments)]
     fn record_guard(
         &mut self,
@@ -2784,21 +3074,9 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         when_true: Option<EdgeTarget>,
         when_false: Option<EdgeTarget>,
     ) -> Result<(), RubyLoweringError> {
-        let arm = |target: Option<EdgeTarget>| {
-            target.map(|target| GuardArm {
-                target_point: target.point,
-                kind: target.kind,
-            })
-        };
-        self.session.add_guard_fact(
-            builder,
-            point,
-            predicate,
-            subject,
-            arm(when_true),
-            arm(when_false),
-        )?;
-        Ok(())
+        self.session
+            .add_guard_for_targets(builder, point, predicate, subject, when_true, when_false)
+            .map(|_| ())
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -2826,7 +3104,8 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         let alternative_target = alternative_entry.map(EdgeTarget::normal).unwrap_or(next);
         let inverted = matches!(node.kind(), "unless" | "unless_modifier");
         let condition_entry = self.point(builder, condition, Vec::new())?;
-        self.edge(builder, entry, EdgeTarget::normal(condition_entry))?;
+        self.session
+            .add_target_edge(builder, entry, EdgeTarget::normal(condition_entry))?;
         stack.push(Work::Condition {
             node: condition,
             entry: condition_entry,
@@ -2879,6 +3158,14 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         } else {
             self.point(builder, body, Vec::new())?
         };
+        let post_test = matches!(node.kind(), "while_modifier" | "until_modifier");
+        self.session.record_loop_site_with_body_source(
+            builder,
+            node,
+            body,
+            condition_entry,
+            body_entry,
+        )?;
         let body_scope = self.push_loop_scopes(builder, scope, next, condition_entry, body_entry);
         let inverted = matches!(node.kind(), "until" | "until_modifier");
         let body_target = EdgeTarget {
@@ -2915,13 +3202,54 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             scope,
         });
 
-        let post_test =
-            matches!(node.kind(), "while_modifier" | "until_modifier") && body.kind() == "begin";
         if post_test {
-            self.edge(builder, entry, EdgeTarget::normal(body_entry))
+            self.session
+                .add_target_edge(builder, entry, EdgeTarget::normal(body_entry))
         } else {
-            self.edge(builder, entry, EdgeTarget::normal(condition_entry))
+            self.session
+                .add_target_edge(builder, entry, EdgeTarget::normal(condition_entry))
         }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn unconditional_loop_call(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        node: Node<'tree>,
+        entry: ProgramPointId,
+        next: EdgeTarget,
+        scope: ScopeFrameId,
+        stack: &mut Vec<Work<'tree>>,
+    ) -> Result<(), RubyLoweringError> {
+        let body = ruby_unconditional_loop_body(node, self.source)
+            .expect("unconditional loop call has a structured block body");
+        let body_entry = self.point(builder, body, Vec::new())?;
+        self.session
+            .record_loop_site(builder, node, body_entry, body_entry)?;
+        if matches!(body.kind(), "block" | "do_block") {
+            self.session
+                .add_target_edge(builder, entry, EdgeTarget::normal(body_entry))?;
+            return self.session.add_target_edge(
+                builder,
+                body_entry,
+                EdgeTarget {
+                    point: body_entry,
+                    kind: ControlEdgeKind::LoopBack,
+                },
+            );
+        }
+        let body_scope = self.push_loop_scopes(builder, scope, next, body_entry, body_entry);
+        stack.push(Work::Statement {
+            node: body,
+            entry: body_entry,
+            next: EdgeTarget {
+                point: body_entry,
+                kind: ControlEdgeKind::LoopBack,
+            },
+            scope: body_scope,
+        });
+        self.session
+            .add_target_edge(builder, entry, EdgeTarget::normal(body_entry))
     }
 
     fn push_loop_scopes(
@@ -2986,33 +3314,38 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         let body = required_field(node, "body")?;
         let decision = self.point(builder, value_wrapper, Vec::new())?;
         let body_entry = self.point(builder, body, Vec::new())?;
-        for (capability, kind, detail) in [
-            (
-                SemanticCapability::Calls,
-                SemanticGapKind::Unsupported,
-                "Ruby for iteration protocol calls are not emitted as synthetic call sites",
-            ),
-            (
-                SemanticCapability::Values,
-                SemanticGapKind::Unknown,
-                "per-iteration destructuring and loop-variable binding require value refinement",
-            ),
-            (
-                SemanticCapability::ExceptionalControlFlow,
-                SemanticGapKind::Unknown,
-                "iteration protocol lookup and execution may raise",
-            ),
-        ] {
-            self.add_gap(
-                builder,
-                decision,
-                SemanticGapSubject::Point,
-                capability,
-                kind,
-                detail,
-            )?;
-        }
-        self.edge(
+        self.session.record_gap(
+            builder,
+            decision,
+            SemanticGapSubject::Point,
+            SemanticCapability::Calls,
+            SemanticGapKind::Unsupported,
+            "Ruby for iteration protocol calls are not emitted as synthetic call sites",
+        )?;
+        self.session.record_gap(
+            builder,
+            decision,
+            SemanticGapSubject::Point,
+            SemanticCapability::Values,
+            SemanticGapKind::Unknown,
+            "per-iteration destructuring and loop-variable binding require value refinement",
+        )?;
+        let discharge = if builder.throw_exits_procedure(scope) {
+            SemanticGapDischarge::NonRejoiningExceptionalExit
+        } else {
+            SemanticGapDischarge::None
+        };
+        self.session.add_gap_with_impacts_and_discharge(
+            builder,
+            decision,
+            SemanticGapSubject::Point,
+            SemanticCapability::ExceptionalControlFlow,
+            SemanticGapImpacts::NONE,
+            SemanticGapKind::Unknown,
+            discharge,
+            "iteration protocol lookup and execution may raise",
+        )?;
+        self.session.add_target_edge(
             builder,
             decision,
             EdgeTarget {
@@ -3020,7 +3353,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 kind: ControlEdgeKind::ConditionalTrue,
             },
         )?;
-        self.edge(
+        self.session.add_target_edge(
             builder,
             decision,
             EdgeTarget {
@@ -3105,7 +3438,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             let point = self.point(builder, node, Vec::new())?;
             let value = self.value(builder, point, SemanticValueKind::Exception)?;
             self.append_effect(builder, point, SemanticEffect::Throw { value: Some(value) })?;
-            self.add_gap(
+            self.session.record_gap(
                 builder,
                 point,
                 SemanticGapSubject::Point,
@@ -3149,7 +3482,8 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                     scope,
                 });
             } else {
-                self.edge(builder, body_entries[index], next)?;
+                self.session
+                    .add_target_edge(builder, body_entries[index], next)?;
             }
 
             let guard = clause.child_by_field_name("guard");
@@ -3164,7 +3498,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                     .unwrap_or(clause_no_match);
                 let implicit_matching = clause.kind() == "in_clause" || has_case_value;
                 if implicit_matching {
-                    self.add_gap(
+                    self.session.record_gap(
                         builder,
                         decision,
                         SemanticGapSubject::Point,
@@ -3176,7 +3510,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                             "Ruby pattern deconstruction invokes implicit protocol methods that are not emitted synthetically"
                         },
                     )?;
-                    self.add_gap(
+                    self.session.record_gap(
                         builder,
                         decision,
                         SemanticGapSubject::Point,
@@ -3185,7 +3519,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                         "Ruby implicit case matching may raise",
                     )?;
                 }
-                self.add_gap(
+                self.session.record_gap(
                     builder,
                     decision,
                     SemanticGapSubject::Point,
@@ -3200,7 +3534,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
 
                 if let (Some(guard), Some(guard_entry)) = (guard, guard_entry) {
                     let guard_condition = guard.child_by_field_name("condition").unwrap_or(guard);
-                    self.edge(
+                    self.session.add_target_edge(
                         builder,
                         decision,
                         EdgeTarget {
@@ -3208,7 +3542,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                             kind: ControlEdgeKind::SwitchCase,
                         },
                     )?;
-                    self.edge(builder, decision, no_match)?;
+                    self.session.add_target_edge(builder, decision, no_match)?;
                     let unless = guard.kind() == "unless_guard";
                     stack.push(Work::Condition {
                         node: guard_condition,
@@ -3226,7 +3560,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                         scope,
                     });
                 } else {
-                    self.edge(
+                    self.session.add_target_edge(
                         builder,
                         decision,
                         EdgeTarget {
@@ -3234,7 +3568,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                             kind: ControlEdgeKind::SwitchCase,
                         },
                     )?;
-                    self.edge(builder, decision, no_match)?;
+                    self.session.add_target_edge(builder, decision, no_match)?;
                 }
                 if let Some(pattern) = pattern {
                     stack.push(Work::Expression {
@@ -3260,7 +3594,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 scope,
             });
         } else {
-            self.edge(builder, entry, first)?;
+            self.session.add_target_edge(builder, entry, first)?;
         }
         Ok(())
     }
@@ -3304,7 +3638,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         let normal_destination = if cleanup_region.is_some() && next.kind != ControlEdgeKind::Normal
         {
             let relay = self.point(builder, node, Vec::new())?;
-            self.edge(builder, relay, next)?;
+            self.session.add_target_edge(builder, relay, next)?;
             relay
         } else {
             next.point
@@ -3349,7 +3683,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         } else {
             let dispatcher = self.point(builder, node, Vec::new())?;
             if precise_rescue.is_none() {
-                self.add_gap(
+                self.session.record_gap(
                     builder,
                     dispatcher,
                     SemanticGapSubject::Point,
@@ -3360,7 +3694,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             }
             for rescue in &parts.rescues {
                 let rescue_entry = self.point(builder, *rescue, Vec::new())?;
-                self.edge(
+                self.session.add_target_edge(
                     builder,
                     dispatcher,
                     EdgeTarget {
@@ -3391,7 +3725,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                     },
                 );
                 if precise_rescue.is_none() && rescue.child_by_field_name("exceptions").is_some() {
-                    self.add_gap(
+                    self.session.record_gap(
                         builder,
                         rescue_entry,
                         SemanticGapSubject::Point,
@@ -3401,7 +3735,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                     )?;
                 }
                 if precise_rescue.is_none() && rescue.child_by_field_name("variable").is_some() {
-                    self.add_gap(
+                    self.session.record_gap(
                         builder,
                         rescue_entry,
                         SemanticGapSubject::Point,
@@ -3432,11 +3766,11 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 } else if let Some(route) = &normal_route {
                     self.route(builder, rescue_entry, route, stack)?;
                 } else {
-                    self.edge(builder, rescue_entry, next)?;
+                    self.session.add_target_edge(builder, rescue_entry, next)?;
                 }
             }
             let unmatched = self.point(builder, node, Vec::new())?;
-            self.edge(
+            self.session.add_target_edge(
                 builder,
                 dispatcher,
                 EdgeTarget {
@@ -3461,7 +3795,8 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         };
 
         if parts.protected.is_empty() {
-            self.edge(builder, entry, after_protected)?;
+            self.session
+                .add_target_edge(builder, entry, after_protected)?;
         } else {
             self.schedule_statements(
                 builder,
@@ -3489,7 +3824,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         let handler = required_field(node, "handler")?;
         let dispatcher = self.point(builder, node, Vec::new())?;
         let handler_entry = self.point(builder, handler, Vec::new())?;
-        self.add_gap(
+        self.session.record_gap(
             builder,
             dispatcher,
             SemanticGapSubject::Point,
@@ -3497,7 +3832,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             SemanticGapKind::Unknown,
             "rescue modifier handles StandardError-compatible exceptions only",
         )?;
-        self.edge(
+        self.session.add_target_edge(
             builder,
             dispatcher,
             EdgeTarget {
@@ -3506,7 +3841,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             },
         )?;
         let unmatched = self.point(builder, node, Vec::new())?;
-        self.edge(
+        self.session.add_target_edge(
             builder,
             dispatcher,
             EdgeTarget {
@@ -3554,7 +3889,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             self.point(builder, node, Vec::new())?
         };
         if self.procedure_kind == ProcedureKind::Closure {
-            self.add_gap(
+            self.session.record_gap(
                 builder,
                 terminal,
                 SemanticGapSubject::Point,
@@ -3562,7 +3897,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 SemanticGapKind::Unsupported,
                 "return from an ordinary Ruby block targets its defining method, not the block procedure",
             )?;
-            self.add_gap(
+            self.session.record_gap(
                 builder,
                 terminal,
                 SemanticGapSubject::Point,
@@ -3584,7 +3919,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 stack,
             )?;
         } else if self.procedure_kind == ProcedureKind::Initializer {
-            self.add_gap(
+            self.session.record_gap(
                 builder,
                 terminal,
                 SemanticGapSubject::Point,
@@ -3615,7 +3950,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 let source = self.expression_value(
                     builder,
                     *source_node,
-                    expression_value_kind(*source_node),
+                    expression_value_kind(self.source, *source_node),
                 )?;
                 self.append_effect(
                     builder,
@@ -3627,7 +3962,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                     },
                 )?;
             } else if arguments.len() > 1 {
-                self.add_gap(
+                self.session.record_gap(
                     builder,
                     terminal,
                     SemanticGapSubject::Value(value),
@@ -3708,7 +4043,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             }
             self.abrupt(builder, terminal, scope, kind, Some(label), stack)?;
         } else {
-            self.add_gap(
+            self.session.record_gap(
                 builder,
                 terminal,
                 SemanticGapSubject::Point,
@@ -3723,7 +4058,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 },
             )?;
             if matches!(node.kind(), "break" | "retry") {
-                self.add_gap(
+                self.session.record_gap(
                     builder,
                     terminal,
                     SemanticGapSubject::Point,
@@ -3778,6 +4113,9 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         if self.precise_raise_binders.contains_key(&node.id()) {
             return self.precise_raise(builder, node, entry, scope, stack);
         }
+        if ruby_unconditional_loop_body(node, self.source).is_some() {
+            return self.unconditional_loop_call(builder, node, entry, next, scope, stack);
+        }
         if node
             .child_by_field_name("method")
             .is_some_and(|method| method.kind() == "super")
@@ -3788,13 +4126,21 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         let normal = self.point(builder, node, Vec::new())?;
         let exceptional = self.point(builder, node, Vec::new())?;
         let method_node = node.child_by_field_name("method").unwrap_or(node);
-        let callee = self.source_value(builder, method_node, SemanticValueKind::Callable)?;
+        let callee =
+            self.session
+                .add_node_value(builder, method_node, SemanticValueKind::Callable)?;
         let result = self.expression_value(builder, node, SemanticValueKind::Temporary)?;
-        let thrown = self.source_value(builder, method_node, SemanticValueKind::Exception)?;
+        let thrown =
+            self.session
+                .add_node_value(builder, method_node, SemanticValueKind::Exception)?;
         let receiver_node = node.child_by_field_name("receiver");
         let receiver = receiver_node
             .map(|receiver| {
-                self.expression_value(builder, receiver, expression_value_kind(receiver))
+                self.expression_value(
+                    builder,
+                    receiver,
+                    expression_value_kind(self.source, receiver),
+                )
             })
             .transpose()?;
         let method = node
@@ -3871,8 +4217,9 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             self.session
                 .add_allocation(builder, normal, result, AllocationKind::Object)?;
         }
-        self.edge(builder, invoke, EdgeTarget::normal(normal))?;
-        self.edge(
+        self.session
+            .add_target_edge(builder, invoke, EdgeTarget::normal(normal))?;
+        self.session.add_target_edge(
             builder,
             invoke,
             EdgeTarget {
@@ -3880,10 +4227,10 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 kind: ControlEdgeKind::Exceptional,
             },
         )?;
-        self.edge(builder, normal, next)?;
+        self.session.add_target_edge(builder, normal, next)?;
         self.route_call_exceptional(builder, exceptional, next, scope, stack)?;
         self.resolution_gaps(builder, invoke, callee, call_site, &resolution)?;
-        self.add_gap(
+        self.session.record_gap(
             builder,
             invoke,
             SemanticGapSubject::CallSite(call_site),
@@ -3905,7 +4252,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             .and_then(|operator| node_text(self.source, operator))
             == Some("&.");
         if safe_navigation {
-            self.add_gap(
+            self.session.record_gap(
                 builder,
                 invoke,
                 SemanticGapSubject::Value(result),
@@ -3923,7 +4270,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 scope,
                 stack,
             )?;
-            self.edge(
+            self.session.add_target_edge(
                 builder,
                 decision,
                 EdgeTarget {
@@ -3939,7 +4286,8 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                     scope,
                 });
             } else {
-                self.edge(builder, entry, EdgeTarget::normal(decision))?;
+                self.session
+                    .add_target_edge(builder, entry, EdgeTarget::normal(decision))?;
             }
             return Ok(());
         }
@@ -4025,23 +4373,15 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             .property_parts(node)
             .expect("property access is selected structurally");
         let access = self.point(builder, node, Vec::new())?;
-        let result = self.expression_value(builder, node, expression_value_kind(node))?;
-        let base = self.expression_value(builder, receiver, expression_value_kind(receiver))?;
-        let location = self.session.add_memory_location(
+        let result =
+            self.expression_value(builder, node, expression_value_kind(self.source, node))?;
+        let base = self.expression_value(
             builder,
-            access,
-            MemoryLocationKind::Field { base, member },
+            receiver,
+            expression_value_kind(self.source, receiver),
         )?;
-        self.append_effect(
-            builder,
-            access,
-            SemanticEffect::MemoryLoad {
-                kind: MemoryAccessKind::Field,
-                location,
-                result,
-            },
-        )?;
-        self.edge(builder, access, next)?;
+        self.emit_field_memory_load(builder, access, base, member, result)?;
+        self.session.add_target_edge(builder, access, next)?;
         stack.push(Work::Expression {
             node: receiver,
             entry,
@@ -4086,7 +4426,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 "yield argument, block parameter, and result bindings require value refinement",
             ),
         ] {
-            self.add_gap(
+            self.session.record_gap(
                 builder,
                 boundary,
                 SemanticGapSubject::Point,
@@ -4095,7 +4435,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 detail,
             )?;
         }
-        self.edge(builder, boundary, next)?;
+        self.session.add_target_edge(builder, boundary, next)?;
         self.abrupt(builder, boundary, scope, CompletionKind::Throw, None, stack)?;
         if arguments.is_empty() {
             return Ok(());
@@ -4129,9 +4469,59 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 SemanticGapKind::Unknown,
                 "an attached Ruby block is a separate callable whose invocation timing depends on the callee",
             )?;
+            self.session.record_gap(
+                builder,
+                point,
+                SemanticGapSubject::CallSite(call_site),
+                SemanticCapability::NonLocalControl,
+                SemanticGapKind::Unknown,
+                "an attached Ruby block may return or transfer control to its defining method",
+            )?;
+        }
+        if matches!(
+            method,
+            Some("binding" | "eval" | "local_variable_get" | "local_variable_set")
+        ) {
+            self.session.record_gap(
+                builder,
+                point,
+                SemanticGapSubject::CallSite(call_site),
+                SemanticCapability::LocalFlow,
+                SemanticGapKind::Unknown,
+                "Ruby binding and eval APIs may inspect or rewrite the local-variable table",
+            )?;
+        }
+        let control_gap = match method {
+            Some("raise") => Some((
+                SemanticCapability::ExceptionalControlFlow,
+                "Ruby raise dispatch may transfer to a handler or leave the procedure",
+            )),
+            Some("throw") => Some((
+                SemanticCapability::NonLocalControl,
+                "Ruby throw/catch non-local transfer is not resolved through dynamic tags",
+            )),
+            Some("catch") => Some((
+                SemanticCapability::NonLocalControl,
+                "Ruby catch/throw transfer across an attached block is not resolved",
+            )),
+            Some("exit" | "exit!") => Some((
+                SemanticCapability::NonLocalControl,
+                "Ruby process exit may terminate without returning to the following statement",
+            )),
+            _ => None,
+        };
+        if let Some((capability, detail)) = control_gap {
+            self.session.record_gap(
+                builder,
+                point,
+                SemanticGapSubject::CallSite(call_site),
+                capability,
+                SemanticGapKind::Unknown,
+                detail,
+            )?;
         }
         if matches!(method, Some("send" | "public_send")) {
-            self.add_gap(
+            self.session.record_gap(
                 builder,
                 point,
                 SemanticGapSubject::Point,
@@ -4141,7 +4531,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             )?;
         }
         if method == Some("define_method") {
-            self.add_gap(
+            self.session.record_gap(
                 builder,
                 point,
                 SemanticGapSubject::Point,
@@ -4149,7 +4539,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 SemanticGapKind::Unknown,
                 "define_method publishes a dynamically named callable target",
             )?;
-            self.add_gap(
+            self.session.record_gap(
                 builder,
                 point,
                 SemanticGapSubject::CallSite(call_site),
@@ -4159,7 +4549,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             )?;
         }
         if receiver == Some("Fiber") && matches!(method, Some("new" | "yield")) {
-            self.add_gap(
+            self.session.record_gap(
                 builder,
                 point,
                 SemanticGapSubject::CallSite(call_site),
@@ -4169,7 +4559,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             )?;
         }
         if matches!(receiver, Some("Thread" | "Ractor")) && method == Some("new") {
-            self.add_gap(
+            self.session.record_gap(
                 builder,
                 point,
                 SemanticGapSubject::CallSite(call_site),
@@ -4191,7 +4581,8 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
     ) -> Result<(), RubyLoweringError> {
         let departure = if normal_next.kind == ControlEdgeKind::Exceptional {
             let relay = self.point_from(builder, exceptional, Vec::new())?;
-            self.edge(builder, exceptional, EdgeTarget::normal(relay))?;
+            self.session
+                .add_target_edge(builder, exceptional, EdgeTarget::normal(relay))?;
             relay
         } else {
             exceptional
@@ -4220,16 +4611,13 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             entry,
             SemanticEffect::CallableCreation {
                 result,
-                callable: CallableValue {
-                    kind: CallableReferenceKind::Lambda,
-                    targets: CallableTargetResolution::Unknown,
-                    target_evidence: metadata.evidence,
-                    bound_receiver: None,
-                    environment: None,
-                },
+                callable: CallableValue::unknown_target(
+                    CallableReferenceKind::Lambda,
+                    metadata.evidence,
+                ),
             },
         )?;
-        self.add_gap(
+        self.session.record_gap(
             builder,
             entry,
             SemanticGapSubject::Value(result),
@@ -4241,7 +4629,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 "nested Ruby callable target mapping is not yet published"
             },
         )?;
-        self.edge(builder, entry, next)
+        self.session.add_target_edge(builder, entry, next)
     }
 
     fn type_declaration(
@@ -4253,7 +4641,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         scope: ScopeFrameId,
         stack: &mut Vec<Work<'tree>>,
     ) -> Result<(), RubyLoweringError> {
-        self.add_gap(
+        self.session.record_gap(
             builder,
             entry,
             SemanticGapSubject::Point,
@@ -4277,7 +4665,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             });
             Ok(())
         } else {
-            self.edge(builder, entry, next)
+            self.session.add_target_edge(builder, entry, next)
         }
     }
 
@@ -4298,7 +4686,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 "calls inside a BEGIN/END lifecycle body are withheld from the surrounding callable",
             ),
         ] {
-            self.add_gap(
+            self.session.record_gap(
                 builder,
                 entry,
                 SemanticGapSubject::Point,
@@ -4308,7 +4696,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             )?;
         }
         if node.kind() == "begin_block" {
-            self.add_gap(
+            self.session.record_gap(
                 builder,
                 entry,
                 SemanticGapSubject::Point,
@@ -4317,7 +4705,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 "BEGIN execution occurs while the file is being loaded, not at this lexical statement position",
             )?;
         }
-        self.edge(builder, entry, next)
+        self.session.add_target_edge(builder, entry, next)
     }
 
     fn boolean_value(
@@ -4358,7 +4746,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             .child_by_field_name("operator")
             .and_then(|operator| node_text(self.source, operator));
         if operator == Some("defined?") {
-            self.add_gap(
+            self.session.record_gap(
                 builder,
                 entry,
                 SemanticGapSubject::Point,
@@ -4366,7 +4754,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 SemanticGapKind::Unsupported,
                 "defined? inspects syntax without ordinarily evaluating its operand",
             )?;
-            self.add_gap(
+            self.session.record_gap(
                 builder,
                 entry,
                 SemanticGapSubject::Point,
@@ -4374,13 +4762,20 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 SemanticGapKind::Unknown,
                 "defined? behavior depends on the structured operand category",
             )?;
-            return self.edge(builder, entry, next);
+            return self.session.add_target_edge(builder, entry, next);
         }
         let terminal = self.point(builder, node, Vec::new())?;
         if matches!(operator, Some("!" | "not")) {
-            self.negation_gaps(builder, terminal)?;
+            if !self.is_scalar_operator_syntax(node) {
+                self.negation_gaps(builder, terminal)?;
+            }
+        } else if self.is_scalar_operator_syntax(node) {
+            // The scalar consumer admits this syntax only after exact local
+            // literal facts establish the Ruby Integer/Boolean domain. Keep
+            // the operator-dispatch gap out of that proof path; all other
+            // Ruby calls retain their ordinary dynamic-dispatch gaps.
         } else {
-            self.add_gap(
+            self.session.record_gap(
                 builder,
                 terminal,
                 SemanticGapSubject::Point,
@@ -4388,7 +4783,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 SemanticGapKind::Unsupported,
                 "Ruby operators dispatch through methods that are not emitted as synthetic call sites",
             )?;
-            self.add_gap(
+            self.session.record_gap(
                 builder,
                 terminal,
                 SemanticGapSubject::Point,
@@ -4397,7 +4792,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 "operator dispatch and coercion may raise",
             )?;
         }
-        self.edge(builder, terminal, next)?;
+        self.session.add_target_edge(builder, terminal, next)?;
         let operands = match node.kind() {
             "binary" => {
                 let mut nodes = children_by_field_name(node, "left");
@@ -4438,7 +4833,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 "negation branch selection may depend on overrideable Ruby method behavior",
             ),
         ] {
-            self.add_gap(
+            self.session.record_gap(
                 builder,
                 point,
                 SemanticGapSubject::Point,
@@ -4513,7 +4908,8 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         let mut assigned_value = None;
         if let Some(member) = instance_field_place {
             modeled_store = true;
-            let value = self.expression_value(builder, right, expression_value_kind(right))?;
+            let value =
+                self.expression_value(builder, right, expression_value_kind(self.source, right))?;
             let base = self
                 .receiver
                 .expect("an ordinary Ruby instance method has a receiver value");
@@ -4534,8 +4930,13 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             assigned_value = Some(value);
         } else if let Some((receiver, member)) = property_place {
             modeled_store = true;
-            let value = self.expression_value(builder, right, expression_value_kind(right))?;
-            let base = self.expression_value(builder, receiver, expression_value_kind(receiver))?;
+            let value =
+                self.expression_value(builder, right, expression_value_kind(self.source, right))?;
+            let base = self.expression_value(
+                builder,
+                receiver,
+                expression_value_kind(self.source, receiver),
+            )?;
             let location = self.session.add_memory_location(
                 builder,
                 terminal,
@@ -4552,8 +4953,10 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             )?;
             assigned_value = Some(value);
         } else if let Some((object, index_node)) = element_place {
-            let value = self.expression_value(builder, right, expression_value_kind(right))?;
-            let base = self.expression_value(builder, object, expression_value_kind(object))?;
+            let value =
+                self.expression_value(builder, right, expression_value_kind(self.source, right))?;
+            let base =
+                self.expression_value(builder, object, expression_value_kind(self.source, object))?;
             let index = self.constant_index_value(builder, index_node)?;
             modeled_store = index.is_some();
             let location = self.session.add_memory_location(
@@ -4582,7 +4985,11 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         } else if identity_assignment {
             let name = node_text(self.source, left).unwrap_or_default();
             if let Some((target, flow_kind)) = self.binding_value(name) {
-                let value = self.expression_value(builder, right, expression_value_kind(right))?;
+                let value = self.expression_value(
+                    builder,
+                    right,
+                    expression_value_kind(self.source, right),
+                )?;
                 self.append_effect(
                     builder,
                     terminal,
@@ -4599,7 +5006,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 )?;
                 assigned_value = Some(value);
             } else {
-                self.add_gap(
+                self.session.record_gap(
                     builder,
                     terminal,
                     SemanticGapSubject::Point,
@@ -4609,7 +5016,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 )?;
             }
         } else {
-            self.add_gap(
+            self.session.record_gap(
                 builder,
                 merge.unwrap_or(terminal),
                 SemanticGapSubject::Point,
@@ -4635,7 +5042,8 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         // identity and publish the selected value into it.
         let assignment_result = assigned_value
             .map(|value| {
-                let result = self.expression_value(builder, node, expression_value_kind(node))?;
+                let result =
+                    self.expression_value(builder, node, expression_value_kind(self.source, node))?;
                 self.append_effect(
                     builder,
                     terminal,
@@ -4649,7 +5057,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             })
             .transpose()?;
         if node.kind() == "operator_assignment" && !short_circuit {
-            self.add_gap(
+            self.session.record_gap(
                 builder,
                 terminal,
                 SemanticGapSubject::Point,
@@ -4657,7 +5065,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 SemanticGapKind::Unsupported,
                 "Ruby operator assignment may dispatch through reader, operator, and writer methods",
             )?;
-            self.add_gap(
+            self.session.record_gap(
                 builder,
                 terminal,
                 SemanticGapSubject::Point,
@@ -4666,13 +5074,13 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 "Ruby operator-assignment dispatch and coercion may raise",
             )?;
         }
-        self.edge(
+        self.session.add_target_edge(
             builder,
             terminal,
             merge.map(EdgeTarget::normal).unwrap_or(next),
         )?;
         if let Some(merge) = merge {
-            self.edge(builder, merge, next)?;
+            self.session.add_target_edge(builder, merge, next)?;
         }
 
         let target_evaluations = assignment_target_runtime_nodes(left);
@@ -4697,7 +5105,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                             target: result,
                         },
                     )?;
-                    self.edge(
+                    self.session.add_target_edge(
                         builder,
                         bypass,
                         EdgeTarget::normal(merge.expect("short-circuit assignment has a merge")),
@@ -4717,7 +5125,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                         ControlEdgeKind::ConditionalTrue,
                     )
                 };
-                self.edge(
+                self.session.add_target_edge(
                     builder,
                     decision,
                     EdgeTarget {
@@ -4725,7 +5133,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                         kind: right_kind,
                     },
                 )?;
-                self.edge(
+                self.session.add_target_edge(
                     builder,
                     decision,
                     EdgeTarget {
@@ -4740,7 +5148,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
 
             let first_decision = if safe_navigation {
                 let decision = self.point(builder, left, Vec::new())?;
-                self.edge(
+                self.session.add_target_edge(
                     builder,
                     decision,
                     EdgeTarget {
@@ -4748,7 +5156,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                         kind: ControlEdgeKind::ConditionalTrue,
                     },
                 )?;
-                self.edge(
+                self.session.add_target_edge(
                     builder,
                     decision,
                     EdgeTarget {
@@ -4833,7 +5241,9 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         let terminal = self.point(builder, node, Vec::new())?;
         let value_ids = values
             .iter()
-            .map(|value| self.expression_value(builder, *value, expression_value_kind(*value)))
+            .map(|value| {
+                self.expression_value(builder, *value, expression_value_kind(self.source, *value))
+            })
             .collect::<Result<Vec<_>, _>>()?;
 
         for (target_node, value) in targets.iter().zip(value_ids.iter().copied()) {
@@ -4864,8 +5274,9 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         if !self.assignment_is_direct_in_body(node)
             || self.expression_values.contains_key(&node.id())
         {
-            let result = self.expression_value(builder, node, expression_value_kind(node))?;
-            self.add_gap(
+            let result =
+                self.expression_value(builder, node, expression_value_kind(self.source, node))?;
+            self.session.record_gap(
                 builder,
                 terminal,
                 SemanticGapSubject::Value(result),
@@ -4875,7 +5286,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             )?;
         }
 
-        self.edge(builder, terminal, next)?;
+        self.session.add_target_edge(builder, terminal, next)?;
         self.schedule_expressions(
             builder,
             entry,
@@ -4892,7 +5303,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         point: ProgramPointId,
         short_circuit: bool,
     ) -> Result<(), RubyLoweringError> {
-        self.add_gap(
+        self.session.record_gap(
             builder,
             point,
             SemanticGapSubject::Point,
@@ -4904,7 +5315,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 "Ruby attribute or element assignment invokes reader or writer methods that are not emitted as synthetic call sites"
             },
         )?;
-        self.add_gap(
+        self.session.record_gap(
             builder,
             point,
             SemanticGapSubject::Point,
@@ -4921,7 +5332,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         entry: ProgramPointId,
         next: EdgeTarget,
     ) -> Result<(), RubyLoweringError> {
-        self.add_gap(
+        self.session.record_gap(
             builder,
             entry,
             SemanticGapSubject::Point,
@@ -4933,7 +5344,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 "Ruby undef mutates the current callable table without evaluating its method-name operands"
             },
         )?;
-        self.edge(builder, entry, next)
+        self.session.add_target_edge(builder, entry, next)
     }
 
     fn element_reference(
@@ -4948,8 +5359,10 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         let terminal = self.point(builder, node, Vec::new())?;
         let mut modeled_load = false;
         if let Some((object, index_node)) = self.element_parts(node) {
-            let result = self.expression_value(builder, node, expression_value_kind(node))?;
-            let base = self.expression_value(builder, object, expression_value_kind(object))?;
+            let result =
+                self.expression_value(builder, node, expression_value_kind(self.source, node))?;
+            let base =
+                self.expression_value(builder, object, expression_value_kind(self.source, object))?;
             let index = self.constant_index_value(builder, index_node)?;
             modeled_load = index.is_some();
             let location = self.session.add_memory_location(
@@ -4976,7 +5389,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             )?;
         }
         if !modeled_load {
-            self.add_gap(
+            self.session.record_gap(
             builder,
             terminal,
             SemanticGapSubject::Point,
@@ -4984,7 +5397,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             SemanticGapKind::Unsupported,
             "Ruby element lookup dispatches through [] and is not emitted as a synthetic call site",
             )?;
-            self.add_gap(
+            self.session.record_gap(
                 builder,
                 terminal,
                 SemanticGapSubject::Point,
@@ -4993,7 +5406,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 "element lookup and index coercion may raise",
             )?;
         }
-        self.edge(builder, terminal, next)?;
+        self.session.add_target_edge(builder, terminal, next)?;
         let object = required_field(node, "object")?;
         let mut evaluations = vec![object];
         evaluations.extend(named_children(node).into_iter().filter(|child| {
@@ -5022,7 +5435,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         if self.local_bindings.is_active_at(name, node.start_byte()) {
             let value = self.expression_value(builder, node, SemanticValueKind::Temporary)?;
             if !self.emit_lexical_input_flow(builder, node, entry, value)? {
-                self.add_gap(
+                self.session.record_gap(
                     builder,
                     entry,
                     SemanticGapSubject::Value(value),
@@ -5031,7 +5444,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                     "Ruby lexical binding is active but its capture or implicit block port is not represented",
                 )?;
             }
-            return self.edge(builder, entry, next);
+            return self.session.add_target_edge(builder, entry, next);
         }
         self.bare_call_expression(builder, node, entry, next, scope, stack)
     }
@@ -5085,8 +5498,9 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 exceptional_continuation: exceptional,
             },
         )?;
-        self.edge(builder, invoke, EdgeTarget::normal(normal))?;
-        self.edge(
+        self.session
+            .add_target_edge(builder, invoke, EdgeTarget::normal(normal))?;
+        self.session.add_target_edge(
             builder,
             invoke,
             EdgeTarget {
@@ -5094,10 +5508,12 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 kind: ControlEdgeKind::Exceptional,
             },
         )?;
-        self.edge(builder, normal, next)?;
+        self.session.add_target_edge(builder, normal, next)?;
         self.route_call_exceptional(builder, exceptional, next, scope, stack)?;
+        let name = node_text(self.source, node).expect("bare identifier spans source");
+        self.ruby_call_gaps(builder, invoke, call_site, None, Some(name), false)?;
         self.resolution_gaps(builder, invoke, callee, call_site, &resolution)?;
-        self.add_gap(
+        self.session.record_gap(
             builder,
             invoke,
             SemanticGapSubject::CallSite(call_site),
@@ -5127,7 +5543,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 "super actual/formal and receiver bindings are not represented",
             ),
         ] {
-            self.add_gap(
+            self.session.record_gap(
                 builder,
                 boundary,
                 SemanticGapSubject::Point,
@@ -5136,7 +5552,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 detail,
             )?;
         }
-        self.edge(builder, boundary, next)?;
+        self.session.add_target_edge(builder, boundary, next)?;
         self.abrupt(builder, boundary, scope, CompletionKind::Throw, None, stack)?;
         let arguments = call_arguments(node);
         self.schedule_expressions(
@@ -5159,26 +5575,27 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         stack: &mut Vec<Work<'tree>>,
     ) -> Result<(), RubyLoweringError> {
         if children.is_empty() {
-            return self.edge(builder, entry, next);
+            return self.session.add_target_edge(builder, entry, next);
         }
         let entries = children
             .iter()
             .map(|child| self.statement_point(builder, *child))
             .collect::<Result<Vec<_>, _>>()?;
-        self.edge(builder, entry, EdgeTarget::normal(entries[0]))?;
-        for index in (0..children.len()).rev() {
-            let child_next = entries
-                .get(index + 1)
-                .copied()
-                .map(EdgeTarget::normal)
-                .unwrap_or(next);
-            stack.push(Work::Statement {
-                node: children[index],
-                entry: entries[index],
-                next: child_next,
+        self.session
+            .add_target_edge(builder, entry, EdgeTarget::normal(entries[0]))?;
+        schedule_sequential_work(
+            stack,
+            children,
+            &entries,
+            next,
+            scope,
+            |_, node, entry, next, scope| Work::Statement {
+                node,
+                entry,
+                next,
                 scope,
-            });
-        }
+            },
+        );
         Ok(())
     }
 
@@ -5197,19 +5614,19 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             .iter()
             .map(|child| self.statement_point(builder, *child))
             .collect::<Result<Vec<_>, _>>()?;
-        for index in (0..children.len()).rev() {
-            let child_next = entries
-                .get(index + 1)
-                .copied()
-                .map(EdgeTarget::normal)
-                .unwrap_or(next);
-            stack.push(Work::Statement {
-                node: children[index],
-                entry: entries[index],
-                next: child_next,
+        schedule_sequential_work(
+            stack,
+            children,
+            &entries,
+            next,
+            scope,
+            |_, node, entry, next, scope| Work::Statement {
+                node,
+                entry,
+                next,
                 scope,
-            });
-        }
+            },
+        );
         Ok(entries.first().copied())
     }
 
@@ -5222,8 +5639,8 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         scope: ScopeFrameId,
         stack: &mut Vec<Work<'tree>>,
     ) -> Result<(), RubyLoweringError> {
-        let Some((first, rest)) = children.split_first() else {
-            return self.edge(builder, entry, next);
+        let Some((_, rest)) = children.split_first() else {
+            return self.session.add_target_edge(builder, entry, next);
         };
         let mut entries = Vec::with_capacity(children.len());
         entries.push(entry);
@@ -5232,19 +5649,19 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 .map(|child| self.statement_point(builder, *child))
                 .collect::<Result<Vec<_>, _>>()?,
         );
-        for index in (0..children.len()).rev() {
-            let child_next = entries
-                .get(index + 1)
-                .copied()
-                .map(EdgeTarget::normal)
-                .unwrap_or(next);
-            stack.push(Work::Statement {
-                node: if index == 0 { *first } else { children[index] },
-                entry: entries[index],
-                next: child_next,
+        schedule_sequential_work(
+            stack,
+            children,
+            &entries,
+            next,
+            scope,
+            |_, node, entry, next, scope| Work::Statement {
+                node,
+                entry,
+                next,
                 scope,
-            });
-        }
+            },
+        );
         Ok(())
     }
 
@@ -5298,7 +5715,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         stack: &mut Vec<Work<'tree>>,
     ) -> Result<(), RubyLoweringError> {
         if children.is_empty() {
-            return self.edge(
+            return self.session.add_target_edge(
                 builder,
                 entry,
                 EdgeTarget {
@@ -5311,7 +5728,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             .iter()
             .map(|child| self.point(builder, *child, Vec::new()))
             .collect::<Result<Vec<_>, _>>()?;
-        self.edge(
+        self.session.add_target_edge(
             builder,
             entry,
             EdgeTarget {
@@ -5319,19 +5736,19 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 kind: first_edge_kind,
             },
         )?;
-        for index in (0..children.len()).rev() {
-            let child_next = entries
-                .get(index + 1)
-                .copied()
-                .map(EdgeTarget::normal)
-                .unwrap_or(next);
-            stack.push(Work::Expression {
-                node: children[index],
-                entry: entries[index],
-                next: child_next,
+        schedule_sequential_work(
+            stack,
+            children,
+            &entries,
+            next,
+            scope,
+            |_, node, entry, next, scope| Work::Expression {
+                node,
+                entry,
+                next,
                 scope,
-            });
-        }
+            },
+        );
         Ok(())
     }
 
@@ -5347,7 +5764,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         let Some(route) = builder.resolve_completion(scope, &CompletionRequest::new(kind, label))
         else {
             if matches!(kind, CompletionKind::Break | CompletionKind::Continue) {
-                self.add_gap(
+                self.session.record_gap(
                     builder,
                     from,
                     SemanticGapSubject::Point,
@@ -5372,7 +5789,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         stack: &mut Vec<Work<'tree>>,
     ) -> Result<(), RubyLoweringError> {
         let target = self.route_target(builder, route, stack)?;
-        self.edge(builder, from, target)
+        self.session.add_target_edge(builder, from, target)
     }
 
     fn route_target(
@@ -5424,8 +5841,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         node: Node<'tree>,
         effects: Vec<SemanticEffect>,
     ) -> Result<ProgramPointId, RubyLoweringError> {
-        let metadata = self.mapping(builder, node)?;
-        self.add_point_with_metadata(builder, metadata, effects)
+        self.session.add_node_point(builder, node, effects)
     }
 
     fn point_through(
@@ -5437,8 +5853,8 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
     ) -> Result<ProgramPointId, RubyLoweringError> {
         let range = (start.start_byte(), end.end_byte());
         let occurrence = self.session.next_source_occurrence(range.0, range.1);
-        let anchor =
-            source_anchor_between(start, end, occurrence).map_err(RubyLoweringError::Invalid)?;
+        let anchor = source_anchor_between_nodes(start, end, occurrence)
+            .map_err(RubyLoweringError::Invalid)?;
         let metadata = self.add_mapping(builder, anchor)?;
         self.add_point_with_metadata(builder, metadata, effects)
     }
@@ -5474,24 +5890,6 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         effects: Vec<SemanticEffect>,
     ) -> Result<ProgramPointId, RubyLoweringError> {
         self.session.add_point(builder, metadata, effects)
-    }
-
-    fn mapping(
-        &mut self,
-        builder: &mut ProcedureCfgBuilder,
-        node: Node<'tree>,
-    ) -> Result<PointMetadata, RubyLoweringError> {
-        self.session.add_node_mapping(builder, node)
-    }
-
-    fn value_mapping(
-        &mut self,
-        builder: &mut ProcedureCfgBuilder,
-        node: Node<'tree>,
-    ) -> Result<PointMetadata, RubyLoweringError> {
-        let anchor = source_anchor(node, 0).map_err(RubyLoweringError::Invalid)?;
-        self.session
-            .add_mapping(builder, anchor, SourceMappingKind::Exact)
     }
 
     fn add_mapping(
@@ -5532,45 +5930,6 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
     ) -> Result<(), RubyLoweringError> {
         self.session.append_effect(builder, point, effect)
     }
-
-    fn add_gap(
-        &mut self,
-        builder: &mut ProcedureCfgBuilder,
-        point: ProgramPointId,
-        subject: SemanticGapSubject,
-        capability: SemanticCapability,
-        kind: SemanticGapKind,
-        detail: &str,
-    ) -> Result<(), RubyLoweringError> {
-        self.session
-            .add_gap(builder, point, subject, capability, kind, detail)?;
-        Ok(())
-    }
-
-    fn edge(
-        &self,
-        builder: &mut ProcedureCfgBuilder,
-        source_point: ProgramPointId,
-        target: EdgeTarget,
-    ) -> Result<(), RubyLoweringError> {
-        self.session
-            .add_edge(builder, source_point, target.point, target.kind)
-    }
-}
-
-fn ruby_binding_name_node<'tree>(
-    root: Node<'tree>,
-    source: &str,
-    expected: &str,
-) -> Option<Node<'tree>> {
-    let mut stack = vec![root];
-    while let Some(node) = stack.pop() {
-        if node.kind() == "identifier" && node_text(source, node) == Some(expected) {
-            return Some(node);
-        }
-        stack.extend(named_children(node).into_iter().rev());
-    }
-    None
 }
 
 fn ruby_implicit_result_node(node: Node<'_>) -> Option<Node<'_>> {
@@ -5586,7 +5945,158 @@ fn ruby_implicit_result_node(node: Node<'_>) -> Option<Node<'_>> {
     (!statement_definitely_abrupt(node)).then_some(node)
 }
 
-fn expression_value_kind(node: Node<'_>) -> SemanticValueKind {
+/// The exact scalar value kind of a Ruby integer or Boolean literal. Ruby
+/// Integers are arbitrary precision; the semantic IR represents values through
+/// `i128`, so a literal outside that representation stays a generic constant
+/// and consequently remains open to the scalar consumer.
+fn ruby_scalar_literal_value_kind(source: &str, mut node: Node<'_>) -> Option<SemanticValueKind> {
+    let mut negative = false;
+    loop {
+        match node.kind() {
+            "parenthesized_statements" => node = first_runtime_named_child(node)?,
+            "unary"
+                if node
+                    .child_by_field_name("operator")
+                    .and_then(|operator| node_text(source, operator))
+                    .is_some_and(|operator| matches!(operator, "+" | "-")) =>
+            {
+                let operator = node
+                    .child_by_field_name("operator")
+                    .and_then(|operator| node_text(source, operator))
+                    .expect("matched Ruby numeric unary operator");
+                negative ^= operator == "-";
+                node = node.child_by_field_name("operand")?;
+            }
+            _ => break,
+        }
+    }
+    match node.kind() {
+        "integer" => {
+            let value = ruby_integer_literal(node_text(source, node)?)?;
+            let value = if negative {
+                value.checked_neg()?
+            } else {
+                value
+            };
+            Some(SemanticValueKind::SignedInteger(value))
+        }
+        "true" if !negative => Some(SemanticValueKind::Boolean(true)),
+        "false" if !negative => Some(SemanticValueKind::Boolean(false)),
+        _ => None,
+    }
+}
+
+fn ruby_integer_literal(text: &str) -> Option<i128> {
+    let text = text.replace('_', "");
+    let (radix, digits) = if let Some(digits) = text.strip_prefix("0x") {
+        (16, digits)
+    } else if let Some(digits) = text.strip_prefix("0X") {
+        (16, digits)
+    } else if let Some(digits) = text.strip_prefix("0b") {
+        (2, digits)
+    } else if let Some(digits) = text.strip_prefix("0B") {
+        (2, digits)
+    } else if let Some(digits) = text.strip_prefix("0o") {
+        (8, digits)
+    } else if let Some(digits) = text.strip_prefix("0O") {
+        (8, digits)
+    } else if text.len() > 1 && text.starts_with('0') {
+        (8, text.as_str())
+    } else {
+        (10, text.as_str())
+    };
+    i128::from_str_radix(digits, radix).ok()
+}
+
+/// Ruby local bindings are scalar only when a literal initializer establishes
+/// their type in the exact callable. Parameters have no declared type in Ruby,
+/// and later non-literal writes are left to the scalar solver as unknown.
+pub fn ruby_declared_scalar_types(
+    procedure: &ProcedureHandle,
+    prepared: &PreparedSyntaxTree,
+) -> Vec<(ValueId, DeclaredScalarType)> {
+    let bindings = binding_nodes(procedure, prepared);
+    let Some((_, _, first_binding)) = bindings.first().copied() else {
+        return Vec::new();
+    };
+    let mut callable = first_binding;
+    while let Some(parent) = callable.parent() {
+        callable = parent;
+        if ruby_callable_syntax(callable) {
+            break;
+        }
+    }
+
+    let source = prepared.source();
+    let binding_names: Vec<(ValueId, Box<str>)> = bindings
+        .iter()
+        .filter_map(|(value, parameter, node)| {
+            (!*parameter)
+                .then(|| node_text(source, *node).map(|name| (*value, name.into())))
+                .flatten()
+        })
+        .collect::<Vec<_>>();
+    if binding_names.is_empty() {
+        return Vec::new();
+    }
+
+    let mut literal_types = HashMap::<Box<str>, Option<DeclaredScalarType>>::default();
+    let mut stack = vec![callable];
+    while let Some(node) = stack.pop() {
+        if node.id() != callable.id() && ruby_callable_syntax(node) {
+            continue;
+        }
+        if node.kind() == "assignment"
+            && let (Some(left), Some(right)) = (
+                node.child_by_field_name("left"),
+                node.child_by_field_name("right"),
+            )
+            && left.kind() == "identifier"
+            && let Some(name) = node_text(source, left)
+            && binding_names
+                .iter()
+                .any(|(_, binding)| binding.as_ref() == name)
+            && let Some(kind) = ruby_scalar_literal_declared_type(source, right)
+        {
+            match literal_types.get(name).copied() {
+                None => {
+                    literal_types.insert(name.into(), Some(kind));
+                }
+                Some(Some(previous)) if previous == kind => {}
+                Some(_) => {
+                    literal_types.insert(name.into(), None);
+                }
+            }
+        }
+        stack.extend(named_children(node));
+    }
+
+    binding_names
+        .into_iter()
+        .filter_map(|(value, name)| {
+            literal_types
+                .get(name.as_ref())
+                .copied()
+                .flatten()
+                .map(|scalar_type| (value, scalar_type))
+        })
+        .collect()
+}
+
+fn ruby_scalar_literal_declared_type(source: &str, node: Node<'_>) -> Option<DeclaredScalarType> {
+    match ruby_scalar_literal_value_kind(source, node)? {
+        SemanticValueKind::SignedInteger(_) | SemanticValueKind::UnsignedInteger(_) => {
+            Some(DeclaredScalarType::Signed(128))
+        }
+        SemanticValueKind::Boolean(_) => Some(DeclaredScalarType::Boolean),
+        _ => None,
+    }
+}
+
+fn expression_value_kind(source: &str, node: Node<'_>) -> SemanticValueKind {
+    if let Some(kind) = ruby_scalar_literal_value_kind(source, node) {
+        return kind;
+    }
     match node.kind() {
         "method" | "singleton_method" | "lambda" | "block" | "do_block" => {
             SemanticValueKind::Callable
@@ -5932,8 +6442,9 @@ mod tests {
     use super::*;
     use crate::analyzer::LanguageDialect;
     use crate::analyzer::tree_sitter_analyzer::{PreparedSourceOrigin, PreparedSyntaxSource};
-    use crate::analyzer::tree_walk::descendants_of_kind;
+    use crate::analyzer::tree_walk::descendants_or_self_of_kind;
     use crate::text_utils::compute_line_starts;
+    use brokk_bifrost_test_macros::hardwon;
 
     fn parsed_method(source: &str) -> (tree_sitter::Tree, usize) {
         let mut parser = tree_sitter::Parser::new();
@@ -5946,17 +6457,6 @@ mod tests {
             .position(|node| node.kind() == "method")
             .expect("fixture has a method");
         (tree, method_index)
-    }
-
-    fn descendants_by_kind<'tree>(node: Node<'tree>, kind: &str) -> Vec<Node<'tree>> {
-        // Preorder, including `node` itself if it matches (matches this test
-        // helper's original hand-rolled stack walk).
-        let mut matches = Vec::new();
-        if node.kind() == kind {
-            matches.push(node);
-        }
-        matches.extend(descendants_of_kind(node, kind));
-        matches
     }
 
     fn function_value_targets(
@@ -6034,6 +6534,7 @@ mod tests {
     }
 
     #[test]
+    #[hardwon("#2757: stable Ruby local lambda calls failed to resolve their target")]
     fn stable_local_lambda_invocation_names_exact_mounted_target() {
         let source = "def caller\n  local = ->(value) { target(value) }\n  local.(1)\nend\n\ndef target(value)\nend\n";
         let (prepared, caller_id, Some(lambda_id), targets) = function_value_targets(source) else {
@@ -6045,7 +6546,7 @@ mod tests {
             .named_child(0)
             .expect("fixture has caller method");
         let caller_body = caller.child_by_field_name("body").unwrap_or(caller);
-        let invocation = descendants_by_kind(caller_body, "call")
+        let invocation = descendants_or_self_of_kind(caller_body, "call")
             .into_iter()
             .find(|call| {
                 ruby_function_value_reference_node(*call, prepared.source())
@@ -6061,6 +6562,7 @@ mod tests {
     }
 
     #[test]
+    #[hardwon("#2757: unstable Ruby function values must remain unresolved")]
     fn function_value_near_misses_remain_unresolved() {
         for source in [
             "def caller(callable)\n  callable.(1)\nend\n",
@@ -6077,7 +6579,7 @@ mod tests {
                 .named_child(0)
                 .expect("fixture has caller method");
             let caller_body = caller.child_by_field_name("body").unwrap_or(caller);
-            let local_invocations = descendants_by_kind(caller_body, "call")
+            let local_invocations = descendants_or_self_of_kind(caller_body, "call")
                 .into_iter()
                 .filter(|call| {
                     ruby_function_value_reference_node(*call, prepared.source())
@@ -6094,6 +6596,7 @@ mod tests {
     }
 
     #[test]
+    #[hardwon("#2906: property inventory ignored request cancellation")]
     fn property_inventory_honors_pre_cancelled_requests() {
         let source = "class Holder\n  attr_accessor :value\nend\n\ndef sample\nend\n";
         let (tree, _) = parsed_method(source);
@@ -6115,6 +6618,7 @@ mod tests {
     }
 
     #[test]
+    #[hardwon("#2906: property inventory failed to stop at the work limit")]
     fn property_inventory_charges_iterative_visits_deterministically() {
         let source = "class Holder\n  attr_accessor :value\nend\n\ndef sample\nend\n";
         let (tree, _) = parsed_method(source);
@@ -6206,7 +6710,7 @@ mod tests {
             &CancellationToken::default(),
         )
         .expect("binding collection succeeds");
-        let targets = descendants_by_kind(body, "identifier")
+        let targets = descendants_or_self_of_kind(body, "identifier")
             .into_iter()
             .filter(|node| node_text(source, *node) == Some("target"))
             .collect::<Vec<_>>();
@@ -6244,7 +6748,7 @@ mod tests {
             &CancellationToken::default(),
         )
         .expect("binding collection succeeds");
-        let body_read = descendants_by_kind(body, "identifier")
+        let body_read = descendants_or_self_of_kind(body, "identifier")
             .into_iter()
             .find(|node| node_text(source, *node) == Some("default_binding"))
             .expect("method body contains the default-expression binding read");
@@ -6271,7 +6775,7 @@ mod tests {
             let (tree, method_index) = parsed_method(source);
             let method = named_children(tree.root_node())[method_index];
             let method_body = method.child_by_field_name("body").unwrap_or(method);
-            let lambda = descendants_by_kind(method_body, "lambda")[0];
+            let lambda = descendants_or_self_of_kind(method_body, "lambda")[0];
             let lambda_body = lambda.child_by_field_name("body").unwrap_or(lambda);
             let parent = collect_local_bindings(
                 source,
@@ -6291,7 +6795,7 @@ mod tests {
                 &CancellationToken::default(),
             )
             .expect("child binding collection succeeds");
-            let first_target = descendants_by_kind(lambda_body, "identifier")
+            let first_target = descendants_or_self_of_kind(lambda_body, "identifier")
                 .into_iter()
                 .find(|node| node_text(source, *node) == Some("target"))
                 .expect("lambda contains target identifier");

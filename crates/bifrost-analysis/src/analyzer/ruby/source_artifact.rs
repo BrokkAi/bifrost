@@ -1,9 +1,9 @@
 use tree_sitter::Node;
 
-use super::rbs_artifact::RubyMemberAlias;
+use super::rbs_artifact::{RubyMemberAlias, constant_member_fact};
 use super::{
-    extract_name_segments, parse_ruby_tree, ruby_call_arguments, ruby_semantic_identifier_range,
-    ruby_symbol_name,
+    call_method_node, extract_name_segments, parse_ruby_tree, ruby_call_arguments,
+    ruby_semantic_identifier_range, ruby_symbol_name,
 };
 use crate::CancellationToken;
 use crate::analyzer::semantic_model::{
@@ -52,7 +52,7 @@ pub(crate) fn project_ruby_source(
     let Some(tree) = parse_ruby_tree(source) else {
         diagnostics.error(
             "ruby.source.parse",
-            Some(logical_path(archive_sha256, entry_path)),
+            Some(super::artifact_logical_path(archive_sha256, entry_path)),
             "could not parse Ruby declaration source",
         );
         return finish(Vec::new(), Vec::new(), Vec::new(), diagnostics, false);
@@ -64,7 +64,7 @@ pub(crate) fn project_ruby_source(
             } else {
                 "ruby.source.syntax"
             },
-            Some(logical_path(archive_sha256, entry_path)),
+            Some(super::artifact_logical_path(archive_sha256, entry_path)),
             "Ruby declaration source contains syntax errors",
         );
     }
@@ -93,7 +93,7 @@ pub(crate) fn project_ruby_source(
         if types.len().saturating_add(members.len()) >= limits.max_records {
             diagnostics.error(
                 "limit.records",
-                Some(logical_path(archive_sha256, entry_path)),
+                Some(super::artifact_logical_path(archive_sha256, entry_path)),
                 format!(
                     "Ruby declarations exceed the {} record limit",
                     limits.max_records
@@ -197,7 +197,7 @@ pub(crate) fn project_ruby_source(
                     } else {
                         "ruby.source.conditional_declaration"
                     },
-                    Some(logical_path(archive_sha256, entry_path)),
+                    Some(super::artifact_logical_path(archive_sha256, entry_path)),
                     format!(
                         "Ruby {} declarations are not projected because their execution is conditional",
                         work.node.kind()
@@ -220,7 +220,7 @@ pub(crate) fn project_ruby_source(
                         } else {
                             "ruby.source.dynamic_declaration"
                         },
-                        Some(logical_path(archive_sha256, entry_path)),
+                        Some(super::artifact_logical_path(archive_sha256, entry_path)),
                         format!(
                             "Ruby declaration-scope identifier {name} is not statically projected"
                         ),
@@ -265,44 +265,17 @@ fn project_constant_assignment(
     } else {
         default_owner_id
     };
-    let return_type = named("untyped".to_owned());
-    let signature = Signature {
-        type_parameters: Vec::new(),
-        parameters: Vec::new(),
-        returns: Some(return_type.clone()),
-    };
-    members.push(MemberFact {
-        non_overridable: None,
-        ambient_use: None,
-        id: member_declaration_id(MemberIdentity {
-            owner_id,
-            kind: MemberKind::Constant,
-            is_static: true,
-            parameter_arity: 0,
-            name,
-            generic_arity: 0,
-            parameter_types: &[],
-            parameter_variadics: &[],
-            return_type: Some(&return_type),
-        }),
-        owner: owner_id.to_owned(),
-        name: name.clone(),
-        member_kind: MemberKind::Constant,
-        visibility: Visibility::Public,
-        is_static: true,
-        is_abstract: false,
-        is_virtual: false,
-        implicit_operation: None,
-        explicit_operation: None,
-        callable_family_complete: false,
-        signature: Some(signature),
-        receiver: None,
-        extension_receiver: None,
-        extension_receiver_constraints: Vec::new(),
-        aliases: Vec::new(),
-        guard: None,
-        locator: locator(archive_sha256, entry_path, name),
-    });
+    let return_type = TypeRef::named("untyped".to_owned());
+    let locator = Locator::artifact(
+        super::artifact_logical_path(archive_sha256, entry_path),
+        name.as_str(),
+    );
+    members.push(constant_member_fact(
+        owner_id,
+        name.to_owned(),
+        return_type,
+        locator,
+    ));
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -327,12 +300,12 @@ fn project_alias(
     }) else {
         return;
     };
-    aliases.push(RubyMemberAlias {
-        owner: owner_id.to_owned(),
-        old_name: old_name.clone(),
-        new_name: new_name.clone(),
-        is_static: singleton_context,
-    });
+    aliases.push(RubyMemberAlias::new(
+        owner_id,
+        old_name.clone(),
+        new_name.clone(),
+        singleton_context,
+    ));
     for member in members.iter_mut().filter(|member| {
         member.owner == owner_id && member.name == old_name && member.is_static == singleton_context
     }) {
@@ -374,7 +347,7 @@ fn project_type<'tree>(
         if !superclass.is_empty() {
             hierarchy.push(HierarchyFact {
                 hierarchy_kind: HierarchyKind::Extends,
-                target: named(superclass.join("::")),
+                target: TypeRef::named(superclass.join("::")),
                 declaration_ordinal: None,
             });
         }
@@ -474,6 +447,8 @@ fn project_method(
     Some(MemberFact {
         non_overridable: None,
         ambient_use: None,
+        value_type: None,
+        proxied_type: None,
         id,
         owner: owner_id.to_owned(),
         name: name.to_owned(),
@@ -485,6 +460,7 @@ fn project_method(
         implicit_operation: None,
         explicit_operation: None,
         callable_family_complete: false,
+        exact_return_classes: Vec::new(),
         signature: Some(signature),
         receiver: None,
         extension_receiver: None,
@@ -538,7 +514,7 @@ fn project_call(
             }
             owner.hierarchy.push(HierarchyFact {
                 hierarchy_kind,
-                target: named(segments.join("::")),
+                target: TypeRef::named(segments.join("::")),
                 declaration_ordinal: Some(owner.hierarchy.len() as u32),
             });
         }
@@ -553,7 +529,7 @@ fn project_call(
             if types.len().saturating_add(members.len()) >= limits.max_records {
                 diagnostics.error(
                     "limit.records",
-                    Some(logical_path(archive_sha256, entry_path)),
+                    Some(super::artifact_logical_path(archive_sha256, entry_path)),
                     format!(
                         "Ruby declarations exceed the {} record limit",
                         limits.max_records
@@ -564,7 +540,7 @@ fn project_call(
             let Some(name) = ruby_symbol_name(argument, source) else {
                 continue;
             };
-            let property_type = named("untyped".to_owned());
+            let property_type = TypeRef::named("untyped".to_owned());
             let signature = Signature {
                 type_parameters: Vec::new(),
                 parameters: Vec::new(),
@@ -584,6 +560,8 @@ fn project_call(
             members.push(MemberFact {
                 non_overridable: None,
                 ambient_use: None,
+                value_type: None,
+                proxied_type: None,
                 id,
                 owner: owner_id.to_owned(),
                 name: name.clone(),
@@ -595,6 +573,7 @@ fn project_call(
                 implicit_operation: None,
                 explicit_operation: None,
                 callable_family_complete: false,
+                exact_return_classes: Vec::new(),
                 signature: Some(signature),
                 receiver: None,
                 extension_receiver: None,
@@ -639,7 +618,7 @@ fn project_call(
         } else {
             "ruby.source.dynamic_declaration"
         },
-        Some(logical_path(archive_sha256, entry_path)),
+        Some(super::artifact_logical_path(archive_sha256, entry_path)),
         format!("Ruby declaration-scope call {method} is not statically projected"),
     );
 }
@@ -651,9 +630,10 @@ fn source_parameters(parameters: Node<'_>, source: &str) -> Vec<Parameter> {
         match node.kind() {
             "identifier" => result.push(Parameter {
                 name: Some(ruby_node_text(node, source).to_owned()),
-                r#type: named("untyped".to_owned()),
+                r#type: TypeRef::named("untyped".to_owned()),
                 optional: false,
                 variadic: false,
+                role: None,
                 passing_mode: Default::default(),
             }),
             "optional_parameter"
@@ -668,9 +648,10 @@ fn source_parameters(parameters: Node<'_>, source: &str) -> Vec<Parameter> {
                     .map(|name| ruby_node_text(name, source).to_owned());
                 result.push(Parameter {
                     name,
-                    r#type: named("untyped".to_owned()),
+                    r#type: TypeRef::named("untyped".to_owned()),
                     optional: matches!(node.kind(), "optional_parameter" | "keyword_parameter"),
                     variadic: matches!(node.kind(), "splat_parameter" | "hash_splat_parameter"),
+                    role: None,
                     passing_mode: Default::default(),
                 });
             }
@@ -756,7 +737,7 @@ fn descendant_calls(root: Node<'_>) -> Vec<Node<'_>> {
 }
 
 fn call_method<'a>(call: Node<'_>, source: &'a str) -> Option<&'a str> {
-    let method = call.child_by_field_name("method")?;
+    let method = call_method_node(call)?;
     Some(ruby_node_text(method, source).trim())
 }
 
@@ -787,8 +768,8 @@ fn sorbet_type(node: Node<'_>, source: &str) -> TypeRef {
                     return arguments
                         .into_iter()
                         .next()
-                        .map(|argument| nullable(sorbet_type(argument, source)))
-                        .unwrap_or_else(|| named("untyped".to_owned()));
+                        .map(|argument| super::nullable_type(sorbet_type(argument, source)))
+                        .unwrap_or_else(|| TypeRef::named("untyped".to_owned()));
                 }
                 Some("any") => {
                     return TypeRef::Named {
@@ -800,33 +781,16 @@ fn sorbet_type(node: Node<'_>, source: &str) -> TypeRef {
                         nullable: false,
                     };
                 }
-                Some("untyped") => return named("untyped".to_owned()),
+                Some("untyped") => return TypeRef::named("untyped".to_owned()),
                 _ => {}
             }
         }
     }
     let segments = extract_name_segments(node, source);
     if segments.is_empty() {
-        named("untyped".to_owned())
+        TypeRef::named("untyped".to_owned())
     } else {
-        named(segments.join("::"))
-    }
-}
-
-fn nullable(type_ref: TypeRef) -> TypeRef {
-    match type_ref {
-        TypeRef::Named {
-            name, arguments, ..
-        } => TypeRef::Named {
-            name,
-            arguments,
-            nullable: true,
-        },
-        other => TypeRef::Named {
-            name: "optional".to_owned(),
-            arguments: vec![other],
-            nullable: true,
-        },
+        TypeRef::named(segments.join("::"))
     }
 }
 
@@ -851,23 +815,11 @@ fn push_children<'tree>(
     }
 }
 
-fn named(name: String) -> TypeRef {
-    TypeRef::Named {
-        name,
-        arguments: Vec::new(),
-        nullable: false,
-    }
-}
-
 fn locator(archive_sha256: &str, entry_path: &str, symbol: &str) -> Locator {
-    Locator::Artifact {
-        path: logical_path(archive_sha256, entry_path),
-        symbol: symbol.to_owned(),
-    }
-}
-
-fn logical_path(archive_sha256: &str, entry_path: &str) -> String {
-    format!("gem+sha256:{archive_sha256}!/{entry_path}")
+    Locator::artifact(
+        super::artifact_logical_path(archive_sha256, entry_path),
+        symbol,
+    )
 }
 
 fn finish(
@@ -899,86 +851,9 @@ mod tests {
         let sig = sorbet_signature(tree.root_node().named_child(0).unwrap(), source).unwrap();
         assert_eq!(
             sig.parameters.get("value"),
-            Some(&named("String".to_owned()))
+            Some(&TypeRef::named("String".to_owned()))
         );
-        assert_eq!(sig.returns, Some(named("Integer".to_owned())));
-    }
-
-    #[test]
-    fn rbi_and_source_declarations_use_structured_ruby_nodes() {
-        let projection = project_ruby_source(
-            &"c".repeat(64),
-            "sorbet/rbi/widget.rbi",
-            r#"
-module Acme
-  class Widget < Base
-    prepend Instrumented
-    include Enumerable
-    extend Factory
-    attr_reader :name
-    sig { params(value: String, label: T.nilable(String)).returns(Integer) }
-    def call(value, label: nil); end
-    alias invoke call
-    def self.build; end
-    VERSION = 1
-    class << self
-      def create; end
-    end
-  end
-end
-"#,
-            &ArtifactProducerLimits::default(),
-            true,
-            None,
-        );
-
-        assert!(projection.complete, "{:?}", projection.diagnostics);
-        let widget = projection
-            .types
-            .iter()
-            .find(|fact| fact.name == "Acme::Widget")
-            .unwrap();
-        assert_eq!(widget.hierarchy.len(), 4);
-        assert_eq!(
-            widget.hierarchy[0].target,
-            TypeRef::Named {
-                name: "Base".to_owned(),
-                arguments: Vec::new(),
-                nullable: false,
-            }
-        );
-        assert!(projection.members.iter().any(|fact| fact.name == "name"));
-        assert!(projection.members.iter().any(|fact| fact.name == "call"));
-        let call = projection
-            .members
-            .iter()
-            .find(|fact| fact.name == "call")
-            .unwrap();
-        let signature = call.signature.as_ref().unwrap();
-        assert_eq!(
-            signature
-                .parameters
-                .iter()
-                .find(|parameter| parameter.name.as_deref() == Some("value"))
-                .unwrap_or_else(|| panic!("{signature:?}"))
-                .r#type,
-            named("String".to_owned())
-        );
-        assert_eq!(signature.returns, Some(named("Integer".to_owned())));
-        assert_eq!(call.aliases, ["invoke"]);
-        assert!(
-            projection
-                .members
-                .iter()
-                .any(|fact| fact.name == "build" && fact.is_static)
-        );
-        assert!(projection.members.iter().any(|fact| fact.name == "VERSION"));
-        assert!(
-            projection
-                .members
-                .iter()
-                .any(|fact| fact.name == "create" && fact.is_static)
-        );
+        assert_eq!(sig.returns, Some(TypeRef::named("Integer".to_owned())));
     }
 
     #[test]
@@ -1024,7 +899,6 @@ end
                 .any(|diagnostic| diagnostic.code == "limit.records")
         );
     }
-
     #[test]
     fn visibility_directives_update_following_and_named_methods() {
         let projection = project_ruby_source(

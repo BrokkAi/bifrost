@@ -3,7 +3,8 @@
 use crate::local_bindings::{
     LocalBindingTimeline, UnboundedLocalBindingBudget, collect_local_bindings,
 };
-use crate::syntax::single_static_string_content_node;
+use crate::syntax::{call_method_node, ruby_call_arguments, ruby_static_string_content_node};
+use brokk_bifrost_core::analyzer::common::node_source_text as node_text;
 use brokk_bifrost_core::analyzer::structural::adapter_helpers::{
     attach_argument_role_with_derived_name, attach_role_with_derived_name, attach_terminal_callee,
     field_name_in_parent, first_named_child, nearest_ancestor,
@@ -12,7 +13,9 @@ use brokk_bifrost_core::analyzer::structural::callable::CallSiteContext;
 use brokk_bifrost_core::analyzer::structural::edges::{
     INVERSE_REFERENCE_EDGE_SUPPORT, ReferenceEdgeSupport,
 };
-use brokk_bifrost_core::analyzer::structural::facts::Span;
+use brokk_bifrost_core::analyzer::structural::facts::{
+    IntegerLiteralValue, Span, decode_integer_literal_digits,
+};
 use brokk_bifrost_core::analyzer::structural::kinds::{NormalizedKind, Role};
 use brokk_bifrost_core::analyzer::structural::materialization::{
     DeclarationMaterializationSupport, RUBY_MATERIALIZATION_SUPPORT,
@@ -24,10 +27,14 @@ use brokk_bifrost_core::analyzer::structural::resolution::{
     BindingActivation, BindingKind, EnvironmentAxis, HoistingClass, LexicalEnvironmentSupport,
     ScopeFormation,
 };
+use brokk_bifrost_core::analyzer::structural::result_use::{
+    CallResultUse, CallResultUseIndex, CallResultUseOpenReason, CallResultUseSite,
+};
 use brokk_bifrost_core::analyzer::structural::routes::{
     IdentityRouteSupport, NO_IDENTITY_ROUTE_SUPPORT,
 };
 use brokk_bifrost_core::analyzer::structural::spec::{RoleSink, StructuralSpec};
+use brokk_bifrost_core::analyzer::tree_walk::first_named_child_of_kind;
 use brokk_bifrost_core::analyzer::{Language, Range};
 use brokk_bifrost_core::hash::HashSet;
 use tree_sitter::Node;
@@ -37,7 +44,177 @@ pub struct RubyStructuralSpec;
 
 pub static RUBY_STRUCTURAL_SPEC: RubyStructuralSpec = RubyStructuralSpec;
 
+/// Classify the syntax around one exact Ruby call expression.
+///
+/// Ruby's `body_statement` node is a statement list, but its final expression
+/// supplies the value of a method or ordinary block.  A call in any earlier
+/// statement position drops its result.  Assignment is an ordinary value
+/// context in Ruby, including `_ = call()`, so it is consumed rather than an
+/// explicit discard.  Branch bodies and other wrappers whose enclosing value
+/// is not established here stay open when the call is their final expression.
+pub fn ruby_call_result_use(call: Node<'_>, source: &str) -> CallResultUseSite {
+    let default = if call.kind() != "call"
+        || call.has_error()
+        || has_recovery_ancestor(call)
+        || has_recovery_descendant(call)
+    {
+        CallResultUse::Open(CallResultUseOpenReason::RecoveredSyntax)
+    } else if has_deferred_ancestor(call, source) {
+        CallResultUse::Open(CallResultUseOpenReason::DeferredContext)
+    } else {
+        let mut expression = call;
+        loop {
+            let Some(parent) = expression.parent() else {
+                break CallResultUse::Open(CallResultUseOpenReason::UnclassifiedSyntax);
+            };
+            if parent.is_error() || parent.is_missing() {
+                break CallResultUse::Open(CallResultUseOpenReason::RecoveredSyntax);
+            }
+            match parent.kind() {
+                "parenthesized_statements"
+                    if parent.named_child_count() == 1
+                        && parent
+                            .named_child(0)
+                            .is_some_and(|child| child.id() == expression.id()) =>
+                {
+                    expression = parent;
+                }
+                "assignment"
+                    if parent
+                        .child_by_field_name("right")
+                        .is_some_and(|right| right.id() == expression.id()) =>
+                {
+                    break CallResultUse::Consumed;
+                }
+                "return" => break CallResultUse::Consumed,
+                "program" => break CallResultUse::Discarded,
+                "body_statement" | "block_body"
+                    if parent
+                        .named_children(&mut parent.walk())
+                        .any(|child| child.id() == expression.id()) =>
+                {
+                    break body_statement_result_use(parent, expression);
+                }
+                _ => break CallResultUse::Consumed,
+            }
+        }
+    };
+    CallResultUseSite::new(call.start_byte(), call.end_byte(), default)
+}
+
+fn body_statement_result_use(body: Node<'_>, expression: Node<'_>) -> CallResultUse {
+    let is_last = body
+        .named_child(body.named_child_count().saturating_sub(1))
+        .is_some_and(|child| child.id() == expression.id());
+    if !is_last {
+        return CallResultUse::Discarded;
+    }
+
+    let Some(owner) = body.parent() else {
+        return CallResultUse::Open(CallResultUseOpenReason::UnclassifiedSyntax);
+    };
+    let is_callable_body = match owner.kind() {
+        "method" | "singleton_method" => owner
+            .child_by_field_name("body")
+            .is_some_and(|candidate| candidate.id() == body.id()),
+        "block" | "do_block" => owner
+            .child_by_field_name("body")
+            .is_some_and(|candidate| candidate.id() == body.id()),
+        _ => false,
+    };
+    if is_callable_body {
+        CallResultUse::Consumed
+    } else if matches!(
+        owner.kind(),
+        "program" | "class" | "module" | "singleton_class"
+    ) {
+        CallResultUse::Discarded
+    } else {
+        CallResultUse::Open(CallResultUseOpenReason::UnclassifiedSyntax)
+    }
+}
+
+fn has_recovery_ancestor(mut node: Node<'_>) -> bool {
+    while let Some(parent) = node.parent() {
+        if parent.is_error() || parent.is_missing() {
+            return true;
+        }
+        node = parent;
+    }
+    false
+}
+
+fn has_recovery_descendant(root: Node<'_>) -> bool {
+    let mut stack = vec![root];
+    while let Some(node) = stack.pop() {
+        if node.id() != root.id() && (node.is_error() || node.is_missing()) {
+            return true;
+        }
+        for index in (0..node.named_child_count()).rev() {
+            stack.push(node.named_child(index).expect("named child exists"));
+        }
+    }
+    false
+}
+
+fn has_deferred_ancestor(mut node: Node<'_>, source: &str) -> bool {
+    while let Some(parent) = node.parent() {
+        if parent.kind() == "lambda" {
+            return true;
+        }
+        if matches!(parent.kind(), "block" | "do_block")
+            && parent.parent().is_some_and(|owner| {
+                owner.kind() == "call"
+                    && owner
+                        .child_by_field_name("method")
+                        .is_some_and(|method| node_text(method, source) == "lambda")
+            })
+        {
+            return true;
+        }
+        node = parent;
+    }
+    false
+}
+
+/// One source-snapshot index of exact Ruby call spans.
+#[derive(Debug, Clone)]
+pub struct RubyCallResultUseIndex {
+    inner: CallResultUseIndex,
+}
+
+impl RubyCallResultUseIndex {
+    pub fn new(root: Node<'_>, source: &str) -> Self {
+        let mut sites = Vec::new();
+        let mut stack = vec![root];
+        while let Some(node) = stack.pop() {
+            if node.kind() == "call" {
+                sites.push(ruby_call_result_use(node, source));
+            }
+            for index in (0..node.named_child_count()).rev() {
+                stack.push(node.named_child(index).expect("named child exists"));
+            }
+        }
+        Self {
+            inner: CallResultUseIndex::new(sites),
+        }
+    }
+
+    pub fn at_span(
+        &self,
+        start_byte: usize,
+        end_byte: usize,
+    ) -> Result<&CallResultUseSite, CallResultUseOpenReason> {
+        self.inner.at_span(start_byte, end_byte)
+    }
+
+    pub fn sites(&self) -> &[CallResultUseSite] {
+        self.inner.sites()
+    }
+}
+
 pub const RUBY_KIND_TABLE: &[(&str, NormalizedKind)] = &[
+    ("comment", NormalizedKind::Comment),
     ("call", NormalizedKind::Call),
     ("method", NormalizedKind::Function),
     ("singleton_method", NormalizedKind::Method),
@@ -106,25 +283,19 @@ fn symbol_name_node(node: Node<'_>) -> Option<Node<'_>> {
     first_named_child_of_kind(node, "string_content").or(Some(node))
 }
 
-fn first_named_child_of_kind<'tree>(node: Node<'tree>, kind: &str) -> Option<Node<'tree>> {
-    (0..node.named_child_count())
-        .filter_map(|index| node.named_child(index))
-        .find(|child| child.kind() == kind)
-}
-
 fn is_numeric_literal_node(node: Node<'_>) -> bool {
     matches!(node.kind(), "integer" | "float")
 }
 
 fn is_signed_numeric_unary(node: Node<'_>) -> bool {
     node.kind() == "unary"
-        && node
-            .child_by_field_name("operator")
-            .is_some_and(|operator| matches!(operator.kind(), "+" | "-"))
-        && node
-            .child_by_field_name("operand")
-            .map(expression_target_node)
-            .is_some_and(is_numeric_literal_node)
+        && brokk_bifrost_core::analyzer::tree_walk::is_signed_numeric_operand(
+            node.child_by_field_name("operand")
+                .map(expression_target_node),
+            node.child_by_field_name("operator")
+                .map(|operator| operator.kind()),
+            is_numeric_literal_node,
+        )
 }
 
 fn is_inside_signed_numeric_wrapper(node: Node<'_>) -> bool {
@@ -132,10 +303,6 @@ fn is_inside_signed_numeric_wrapper(node: Node<'_>) -> bool {
         return false;
     };
     is_signed_numeric_unary(parent)
-}
-
-fn call_method_node(node: Node<'_>) -> Option<Node<'_>> {
-    node.child_by_field_name("method")
 }
 
 /// Whether `node` opens a new local-variable scope nested inside another
@@ -148,6 +315,28 @@ pub(crate) fn is_nested_scope_root(node: Node<'_>) -> bool {
         "block" | "do_block" => node.parent().is_none_or(|parent| parent.kind() != "lambda"),
         _ => false,
     }
+}
+
+/// Return the body of Ruby's receiverless `loop do` form. An empty block is
+/// represented by its block node because the grammar has no body field then.
+///
+/// `loop` and iteration methods such as `each` share the same `call` and
+/// `do_block` grammar nodes. The method identifier and argument list are the
+/// structured distinction, so callers can recognize the unconditional loop
+/// without searching source text for a statement shape.
+pub fn ruby_unconditional_loop_body<'tree>(node: Node<'tree>, source: &str) -> Option<Node<'tree>> {
+    if node.kind() != "call"
+        || node.child_by_field_name("receiver").is_some()
+        || node.child_by_field_name("block").is_none()
+        || !ruby_call_arguments(node).is_empty()
+    {
+        return None;
+    }
+    let method = node.child_by_field_name("method")?;
+    (node_text(method, source) == "loop")
+        .then(|| node.child_by_field_name("block"))
+        .flatten()
+        .map(|block| block.child_by_field_name("body").unwrap_or(block))
 }
 
 /// Whether an identifier at this grammatical position is a value read: a
@@ -260,29 +449,26 @@ fn bare_call_identifier_starts(root: Node<'_>, source: &str) -> HashSet<usize> {
 }
 
 fn attach_argument_roles(sink: &mut RoleSink<'_>, arguments: Node<'_>) {
-    for index in 0..arguments.named_child_count() {
-        if !sink.should_continue() {
-            break;
-        }
-        let Some(argument) = arguments.named_child(index) else {
-            continue;
-        };
-        if argument.kind() == "pair" {
-            if let Some(key) = argument.child_by_field_name("key")
-                && let Some(value) = argument
-                    .child_by_field_name("value")
-                    .map(expression_target_node)
-            {
-                sink.kwarg(expression_name_node(key).unwrap_or(key), value);
+    brokk_bifrost_core::analyzer::structural::adapter_helpers::for_each_argument(
+        arguments,
+        |argument| {
+            if !sink.should_continue() {
+                return false;
             }
-        } else {
-            attach_argument_role_with_derived_name(sink, argument, expression_name_node);
-        }
-    }
-}
-
-fn node_text<'source>(node: Node<'_>, source: &'source str) -> &'source str {
-    node.utf8_text(source.as_bytes()).unwrap_or("")
+            if argument.kind() == "pair" {
+                if let Some(key) = argument.child_by_field_name("key")
+                    && let Some(value) = argument
+                        .child_by_field_name("value")
+                        .map(expression_target_node)
+                {
+                    sink.kwarg(expression_name_node(key).unwrap_or(key), value);
+                }
+            } else {
+                attach_argument_role_with_derived_name(sink, argument, expression_name_node);
+            }
+            true
+        },
+    );
 }
 
 fn module_argument_node(node: Node<'_>) -> Option<Node<'_>> {
@@ -307,14 +493,135 @@ fn is_import_call(node: Node<'_>, source: &str) -> bool {
 }
 
 fn static_string_content_span(node: Node<'_>) -> Option<Span> {
-    if node.kind() != "string" {
-        return None;
-    }
-    let content = single_static_string_content_node(node)?;
+    let content = ruby_static_string_content_node(node)?;
     Some(Span {
         start_byte: content.start_byte(),
         end_byte: content.end_byte(),
     })
+}
+
+fn ruby_escape_value(escape: &str, quote: char) -> Option<Option<char>> {
+    let escaped = escape.strip_prefix('\\')?;
+    if quote == '\'' {
+        return match escaped {
+            "\\" => Some(Some('\\')),
+            "'" => Some(Some('\'')),
+            "\n" | "\r\n" => Some(None),
+            _ => None,
+        };
+    }
+    if matches!(escaped, "\n" | "\r\n") {
+        return Some(None);
+    }
+    let character = match escaped {
+        "a" => '\u{0007}',
+        "b" => '\u{0008}',
+        "e" => '\u{001b}',
+        "f" => '\u{000c}',
+        "n" => '\n',
+        "r" => '\r',
+        "s" => ' ',
+        "t" => '\t',
+        "v" => '\u{000b}',
+        "\\" => '\\',
+        "'" => '\'',
+        "\"" => '\"',
+        _ if escaped.starts_with('x') => {
+            let digits = escaped.get(1..)?;
+            if digits.is_empty()
+                || digits.len() > 2
+                || !digits.bytes().all(|byte| byte.is_ascii_hexdigit())
+            {
+                return None;
+            }
+            char::from_u32(u32::from_str_radix(digits, 16).ok()?)?
+        }
+        _ if !escaped.is_empty()
+            && escaped.len() <= 3
+            && escaped.bytes().all(|byte| (b'0'..=b'7').contains(&byte)) =>
+        {
+            char::from_u32(u32::from_str_radix(escaped, 8).ok()?)?
+        }
+        _ => return None,
+    };
+    Some(Some(character))
+}
+
+fn ruby_string_literal_value(node: Node<'_>, source: &str) -> Option<String> {
+    if node.kind() != "string" {
+        return None;
+    }
+    let spelling = node_text(node, source);
+    let quote = spelling.chars().next()?;
+    if !matches!(quote, '\'' | '"') {
+        return None;
+    }
+    let mut value = String::new();
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        match child.kind() {
+            "string_content" => value.push_str(node_text(child, source)),
+            "escape_sequence" => {
+                if let Some(character) = ruby_escape_value(node_text(child, source), quote)? {
+                    value.push(character);
+                }
+            }
+            // Interpolation makes the final value depend on runtime state.
+            _ => return None,
+        }
+    }
+    Some(value)
+}
+
+fn ruby_integer_literal_value(node: Node<'_>, source: &str) -> Option<IntegerLiteralValue> {
+    let literal = if node.kind() == "unary" {
+        let operator = node.child_by_field_name("operator")?;
+        if !matches!(operator.kind(), "+" | "-") {
+            return None;
+        }
+        let literal = node
+            .child_by_field_name("operand")
+            .or_else(|| first_named_child(node))?;
+        let value = ruby_integer_literal_value(literal, source)?;
+        return if operator.kind() == "-" {
+            Some(value.negated())
+        } else {
+            Some(value)
+        };
+    } else {
+        node
+    };
+    if literal.kind() != "integer" {
+        return None;
+    }
+    let text = node_text(literal, source);
+    let compact = text.replace('_', "");
+    let (radix, digits) = if let Some(digits) = compact
+        .strip_prefix("0x")
+        .or_else(|| compact.strip_prefix("0X"))
+    {
+        (16, digits)
+    } else if let Some(digits) = compact
+        .strip_prefix("0b")
+        .or_else(|| compact.strip_prefix("0B"))
+    {
+        (2, digits)
+    } else if let Some(digits) = compact
+        .strip_prefix("0o")
+        .or_else(|| compact.strip_prefix("0O"))
+    {
+        (8, digits)
+    } else if let Some(digits) = compact
+        .strip_prefix("0d")
+        .or_else(|| compact.strip_prefix("0D"))
+    {
+        (10, digits)
+    } else if compact.len() > 1 && compact.starts_with('0') {
+        (8, compact.as_str())
+    } else {
+        (10, compact.as_str())
+    };
+    decode_integer_literal_digits(radix, digits.as_bytes())
 }
 
 /// Climb the one grammar wrapper that stands between a bare name and the node
@@ -552,6 +859,26 @@ impl StructuralSpec for RubyStructuralSpec {
         true
     }
 
+    fn supports_string_literal_value(&self) -> bool {
+        true
+    }
+
+    fn string_literal_value_may_be_absent(&self, node: Node<'_>, source: &str) -> bool {
+        node.kind() == "string" && ruby_string_literal_value(node, source).is_none()
+    }
+
+    fn string_literal_value(&self, node: Node<'_>, source: &str) -> Option<String> {
+        ruby_string_literal_value(node, source)
+    }
+
+    fn supports_integer_literal_value(&self) -> bool {
+        true
+    }
+
+    fn integer_literal_value(&self, node: Node<'_>, source: &str) -> Option<IntegerLiteralValue> {
+        ruby_integer_literal_value(node, source)
+    }
+
     fn kind_table(&self) -> &'static [(&'static str, NormalizedKind)] {
         RUBY_KIND_TABLE
     }
@@ -609,11 +936,11 @@ impl StructuralSpec for RubyStructuralSpec {
     }
 
     fn supports_kind(&self, kind: NormalizedKind) -> bool {
-        kind == NormalizedKind::Import
-            || self
-                .kind_table()
-                .iter()
-                .any(|(_, fact_kind)| fact_kind.satisfies(kind))
+        brokk_bifrost_core::analyzer::structural::spec::supports_kind_from_table(
+            kind,
+            &[NormalizedKind::Import, NormalizedKind::SyntaxError],
+            self.kind_table(),
+        )
     }
 
     fn supports_role(&self, role: Role) -> bool {
@@ -746,13 +1073,10 @@ impl StructuralSpec for RubyStructuralSpec {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use brokk_bifrost_test_macros::hardwon;
 
     fn parse(source: &str) -> tree_sitter::Tree {
-        let mut parser = tree_sitter::Parser::new();
-        parser
-            .set_language(&tree_sitter_ruby::LANGUAGE.into())
-            .expect("Ruby grammar is valid");
-        parser.parse(source, None).expect("source parses")
+        crate::declarations::parse_ruby_tree(source).expect("source parses")
     }
 
     /// The start byte of the `occurrence`-th (0-based) appearance of `needle`
@@ -864,6 +1188,7 @@ mod tests {
     /// position is a call; the enclosing `dfb_sink(...)` is a `call` grammar
     /// node whose method identifier is not separately classified.
     #[test]
+    #[hardwon("#1956: a value-position bare call lacked its structural call row")]
     fn argument_position_bare_call_is_classified() {
         let source = "def dfb_source\n  \"tainted\"\nend\n\ndef dfb_sink(value)\nend\n\ndef run\n  dfb_sink(dfb_source)\nend\n";
         assert_bare_call(source, "dfb_source", 1, true);
@@ -873,6 +1198,7 @@ mod tests {
     /// The assignment-value form: the right side is a call, the assigned
     /// local on the left is not, and the later read of the local is not.
     #[test]
+    #[hardwon("#1956: assignment values were omitted or confused with local binders")]
     fn assignment_value_bare_call_is_classified_and_the_local_is_not() {
         let source = "def dfb_source\n  \"tainted\"\nend\n\ndef dfb_sink(value)\nend\n\ndef run\n  value = dfb_source\n  dfb_sink(value)\nend\n";
         assert_bare_call(source, "dfb_source", 1, true);
@@ -884,6 +1210,7 @@ mod tests {
     /// parenthesized form never enters the identifier path (its `call` node
     /// is the call; the method identifier is a field of it).
     #[test]
+    #[hardwon("#1956: value-position call extraction changed ordinary call classification")]
     fn statement_position_and_parenthesized_forms_are_unchanged() {
         let source =
             "def dfb_source\n  \"tainted\"\nend\n\ndef run\n  dfb_source\n  dfb_source()\nend\n";
@@ -895,6 +1222,7 @@ mod tests {
     /// once assigned, reads of the name stay identifiers. The assignment's
     /// own right side is a bare call to another name.
     #[test]
+    #[hardwon("#1956: an assigned local was misclassified as a bare call")]
     fn assigned_local_shadows_the_same_named_bare_call() {
         let source = "def run\n  dfb_source = compute\n  dfb_sink(dfb_source)\nend\n";
         assert_bare_call(source, "compute", 0, true);
@@ -905,6 +1233,7 @@ mod tests {
     /// A parameter named like the source method makes every read a local
     /// read over the whole body.
     #[test]
+    #[hardwon("#1956: a parameter read was misclassified as a bare call")]
     fn parameter_shadows_the_same_named_bare_call() {
         let source = "def run(dfb_source)\n  dfb_sink(dfb_source)\nend\n";
         assert_bare_call(source, "dfb_source", 1, false);
@@ -914,6 +1243,7 @@ mod tests {
     /// business: its method identifier is not classified, its bound receiver
     /// is a local read, and an unbound receiver is itself a bare call.
     #[test]
+    #[hardwon("#1956: receiver calls misclassified member names and local receivers")]
     fn receiver_calls_classify_only_the_unbound_receiver() {
         let source =
             "def run\n  helper = Helper.new\n  helper.dfb_source\n  unbound.dfb_source\nend\n";
@@ -925,6 +1255,7 @@ mod tests {
 
     /// Nested argument positions classify the innermost bare call.
     #[test]
+    #[hardwon("#1956: nested value-position calls were missing from structural rows")]
     fn nested_argument_positions_are_classified() {
         let source = "def run\n  dfb_sink(wrap(dfb_source))\nend\n";
         assert_bare_call(source, "dfb_source", 0, true);
@@ -935,6 +1266,7 @@ mod tests {
     /// assigned before the block stays a local inside it, and a free name
     /// inside the block is a bare call.
     #[test]
+    #[hardwon("#1956: block calls ignored captured local bindings")]
     fn blocks_inherit_active_bindings() {
         let source = "def run\n  captured = 1\n  items.each do |x|\n    dfb_sink(captured)\n    dfb_sink(free_name)\n    dfb_sink(x)\n  end\nend\n";
         assert_bare_call(source, "captured", 1, false);
@@ -946,6 +1278,7 @@ mod tests {
     /// The binding rule is lexical: a read before the assignment to the same
     /// name is a bare call at that byte.
     #[test]
+    #[hardwon("#1956: bare-call classification ignored source-order binder activation")]
     fn reads_before_the_activating_assignment_are_bare_calls() {
         let source = "def run\n  dfb_sink(v)\n  v = 1\n  dfb_sink(v)\nend\n";
         assert_bare_call(source, "v", 0, true);
@@ -957,6 +1290,7 @@ mod tests {
     /// a parameter is a local read, not a call (parity with the semantic
     /// lowering, which models it as a lexical input flow).
     #[test]
+    #[hardwon("#1956: a trailing local read was mistaken for a bare call")]
     fn trailing_local_reads_in_statement_position_stay_identifiers() {
         let source = "def run(x)\n  compute\n  x\nend\n";
         assert_bare_call(source, "compute", 0, true);
@@ -966,6 +1300,7 @@ mod tests {
     /// `defined?(name)` observes the name without evaluating it, in both the
     /// parenthesized and the bare-operand spelling.
     #[test]
+    #[hardwon("#1956: defined? operands were emitted as evaluated bare calls")]
     fn defined_operands_are_not_classified() {
         let source = "def run\n  defined?(maybe_missing)\n  defined? bare_operand\nend\n";
         assert_bare_call(source, "maybe_missing", 0, false);
@@ -974,6 +1309,7 @@ mod tests {
 
     /// Top-level program statements are a scope of their own.
     #[test]
+    #[hardwon("#1956: top-level local reads and bare calls were conflated")]
     fn top_level_reads_follow_the_program_scope_timeline() {
         let source = "x = 1\nx\nfree_top_level\n";
         assert_bare_call(source, "x", 1, false);
@@ -984,6 +1320,7 @@ mod tests {
     /// are classified; binder positions (parameters, assignment targets,
     /// pattern binders) never are.
     #[test]
+    #[hardwon("#1956: calls in conditions, operands, and interpolation were omitted")]
     fn condition_and_operand_positions_are_classified() {
         let source = "def run(bound)\n  if cond_call\n    bound + operand_call\n  end\n  cond_call ? bound : other_call\n  \"#{interp_call}\"\nend\n";
         assert_bare_call(source, "cond_call", 0, true);
@@ -997,6 +1334,7 @@ mod tests {
     /// Pattern-match binders and their reads stay identifiers; the matched
     /// subject is a read.
     #[test]
+    #[hardwon("#1956: Ruby pattern binders were misclassified as bare calls")]
     fn pattern_binders_are_preserved_as_identifiers() {
         let source =
             "def run\n  case subject_call\n  in [first, second]\n    dfb_sink(first)\n  end\nend\n";
@@ -1009,221 +1347,12 @@ mod tests {
     /// Methods do not inherit enclosing locals: the same name that is a local
     /// outside is a bare call inside a nested method or class body.
     #[test]
+    #[hardwon("#1956: nested method and class bodies inherited enclosing locals")]
     fn methods_and_classes_do_not_inherit_locals() {
         let source = "outer = 1\nouter\ndef run\n  outer\nend\nclass Widget\n  outer\nend\n";
         assert_bare_call(source, "outer", 1, false);
         assert_bare_call(source, "outer", 2, true);
         assert_bare_call(source, "outer", 3, true);
-    }
-
-    /// Ruby places ordinary and safe-navigation member names in the `method`
-    /// field of a `call` node. The receiver, declaration and parameter names,
-    /// hash key, bare call, and unrelated identifier in this fixture all have
-    /// different AST positions and must remain unclassified.
-    #[test]
-    fn member_positions_are_limited_to_receiver_calls() {
-        let source = concat!(
-            "class Widget\n",
-            "  def run(target, label:)\n",
-            "    declared = compute\n",
-            "    target.run\n",
-            "    target&.safe_call\n",
-            "    target.assigned = declared\n",
-            "    bare_call\n",
-            "    process(label: target)\n",
-            "    { label: target }\n",
-            "    unrelated_identifier\n",
-            "  end\n",
-            "end\n",
-        );
-        let expected = vec![
-            (
-                source.find("target.run").expect("ordinary member call") + "target.".len(),
-                "run".to_owned(),
-            ),
-            (
-                source
-                    .find("target&.safe_call")
-                    .expect("safe-navigation member call")
-                    + "target&.".len(),
-                "safe_call".to_owned(),
-            ),
-            (
-                source.find("target.assigned").expect("setter member call") + "target.".len(),
-                "assigned".to_owned(),
-            ),
-        ];
-        assert_eq!(member_positions(source), expected);
-
-        let support = RUBY_STRUCTURAL_SPEC.occurrence_role_support();
-        let supported: Vec<OccurrenceRole> = support
-            .iter()
-            .filter(|(_, support)| support.is_supported())
-            .map(|(role, _)| role)
-            .collect();
-        assert_eq!(
-            supported,
-            vec![
-                OccurrenceRole::DeclarationName,
-                OccurrenceRole::Binder,
-                OccurrenceRole::ReceiverPosition,
-                OccurrenceRole::MemberPosition,
-                OccurrenceRole::ValueReference,
-            ],
-            "the declared role set is exactly what `ruby_occurrence_role` \
-             classifies; a role this adapter cannot establish structurally \
-             (an import binder, a label, a type operand) must stay unsupported"
-        );
-    }
-
-    /// Every position that introduces a local, in one file: method and block
-    /// parameters in each spelling, a plain and a multiple assignment, a `for`
-    /// variable, a rescue exception variable, and pattern binders. The tokens
-    /// that look like binders but are not -- a pinned pattern read, a pattern
-    /// class, an instance variable, a constant -- are absent by construction.
-    #[test]
-    fn every_local_introducing_position_is_classified_as_a_binder() {
-        let source = concat!(
-            "def run(plain, opt = 1, *rest, key:, **kw, &blk)\n",
-            "  total = 0\n",
-            "  first, second = pair\n",
-            "  for step in 1..3\n",
-            "    total += step\n",
-            "  end\n",
-            "  rows.each do |row, (left, right); scratch|\n",
-            "    scratch = row\n",
-            "  end\n",
-            "  begin\n",
-            "    risky\n",
-            "  rescue => error\n",
-            "    error\n",
-            "  end\n",
-            "  case value\n",
-            "  in [head, *tail]\n",
-            "    head\n",
-            "  in {name:, age: years}\n",
-            "    name\n",
-            "  in Point(x:)\n",
-            "    x\n",
-            "  in ^pinned\n",
-            "    1\n",
-            "  in other => whole\n",
-            "    whole\n",
-            "  end\n",
-            "  @member = total\n",
-            "  CONST = total\n",
-            "end\n",
-        );
-        assert_eq!(
-            tokens_with_role(source, OccurrenceRole::Binder),
-            vec![
-                "plain", "opt", "rest", "key", "kw", "blk", "total", "first", "second", "step",
-                // `total += step` rebinds the local, exactly as a second
-                // assignment to the same name would.
-                "total", "row", "left", "right", "scratch", "scratch", "error", "head", "tail",
-                "name", "years", "x", "other", "whole",
-            ],
-            "classified roles: {:?}",
-            occurrence_roles(source)
-        );
-        assert!(
-            !tokens_with_role(source, OccurrenceRole::Binder)
-                .iter()
-                .any(|token| matches!(token.as_str(), "pinned" | "Point" | "@member" | "CONST")),
-            "a pinned read, a pattern class, an instance variable and a \
-             constant are never lexical binders"
-        );
-    }
-
-    /// `@x`, `@@x` and `$x` are their own grammar node kinds, so excluding
-    /// them from the binder role needs no spelling test: they are value
-    /// references wherever they appear, including on the left of an
-    /// assignment, because no binder introduces them.
-    #[test]
-    fn member_and_global_variables_are_value_references_never_binders() {
-        let source = "def run(seed)\n  @size = seed\n  @@count = @size\n  $global = @@count\nend\n";
-        assert_eq!(
-            tokens_with_role(source, OccurrenceRole::Binder),
-            vec!["seed"]
-        );
-        assert_eq!(
-            tokens_with_role(source, OccurrenceRole::ValueReference),
-            vec!["@size", "seed", "@@count", "@size", "$global", "@@count"]
-        );
-    }
-
-    /// Declaration names cover every named declaration form, and a constant
-    /// assignment names the constant it declares rather than binding a local.
-    #[test]
-    fn declaration_names_cover_the_named_declaration_forms() {
-        let source = concat!(
-            "module Api\n",
-            "  class Widget\n",
-            "    LIMIT = 3\n",
-            "    def render\n",
-            "    end\n",
-            "    def self.build\n",
-            "    end\n",
-            "    def size=(value)\n",
-            "    end\n",
-            "  end\n",
-            "end\n",
-        );
-        assert_eq!(
-            tokens_with_role(source, OccurrenceRole::DeclarationName),
-            vec!["Api", "Widget", "LIMIT", "render", "build", "size"],
-            "classified roles: {:?}",
-            occurrence_roles(source)
-        );
-    }
-
-    /// `A::B` is the same two-part shape as `receiver.member`, so the scope is
-    /// a receiver and the selected name is a member position.
-    #[test]
-    fn a_scope_resolution_reads_as_a_receiver_and_a_member() {
-        let source = "value = Api::Widget\n";
-        assert_eq!(
-            tokens_with_role(source, OccurrenceRole::ReceiverPosition),
-            vec!["Api"]
-        );
-        assert_eq!(
-            tokens_with_role(source, OccurrenceRole::MemberPosition),
-            vec!["Widget"]
-        );
-    }
-
-    /// Ruby's scope set is exactly the forms that open a local-variable
-    /// scope. A `while`, a `for` and a `rescue` normalize to kinds every
-    /// C-family adapter scopes; Ruby must not, because a local first assigned
-    /// inside one is still in effect after it.
-    #[test]
-    fn only_the_local_variable_forms_open_a_ruby_scope() {
-        for kind in [
-            NormalizedKind::Function,
-            NormalizedKind::Method,
-            NormalizedKind::Lambda,
-            NormalizedKind::Class,
-            NormalizedKind::Module,
-        ] {
-            assert_eq!(
-                RUBY_STRUCTURAL_SPEC.scope_formation(kind),
-                ScopeFormation::BindingScope,
-                "{kind:?} opens a Ruby local-variable scope whose binders are locals"
-            );
-        }
-        for kind in [
-            NormalizedKind::ForLoop,
-            NormalizedKind::WhileLoop,
-            NormalizedKind::Catch,
-            NormalizedKind::Block,
-            NormalizedKind::If,
-        ] {
-            assert_eq!(
-                RUBY_STRUCTURAL_SPEC.scope_formation(kind),
-                ScopeFormation::NotAScope,
-                "{kind:?} does not scope a Ruby local"
-            );
-        }
     }
 
     /// The activation each binder form states: parameters are scope-wide over
@@ -1309,24 +1438,6 @@ mod tests {
         );
     }
 
-    /// The support table names exactly the two producer axes Ruby answers.
-    /// The other two are not gaps in the implementation but statements about
-    /// the language: a `require` binds no local name, and a Ruby file states
-    /// no package.
-    #[test]
-    fn ruby_declares_scopes_and_binding_intervals_only() {
-        let support = RUBY_STRUCTURAL_SPEC.lexical_environment_support();
-        let supported: Vec<EnvironmentAxis> = support
-            .iter()
-            .filter(|(_, support)| support.is_supported())
-            .map(|(axis, _)| axis)
-            .collect();
-        assert_eq!(
-            supported,
-            vec![EnvironmentAxis::Scopes, EnvironmentAxis::BindingIntervals]
-        );
-    }
-
     /// `field_name_in_parent` answers exactly what indexing the child list
     /// answers, for every (parent, child) pair in a parsed tree.
     ///
@@ -1337,6 +1448,7 @@ mod tests {
     /// Ruby carries the check because Ruby is where the pathology surfaced,
     /// but the helper is shared by every language adapter.
     #[test]
+    #[hardwon("cec1a3a5bab4: cursor traversal changed a child field answer")]
     fn field_name_in_parent_matches_the_indexed_reference() {
         fn indexed_reference(
             parent: tree_sitter::Node<'_>,
@@ -1407,6 +1519,256 @@ end
         assert!(
             with_field > 20,
             "expected many named fields, found {with_field}"
+        );
+    }
+
+    #[test]
+    fn member_positions_are_limited_to_receiver_calls() {
+        let source = concat!(
+            "class Widget\n",
+            "  def run(target, label:)\n",
+            "    declared = compute\n",
+            "    target.run\n",
+            "    target&.safe_call\n",
+            "    target.assigned = declared\n",
+            "    bare_call\n",
+            "    process(label: target)\n",
+            "    { label: target }\n",
+            "    unrelated_identifier\n",
+            "  end\n",
+            "end\n",
+        );
+        let expected = vec![
+            (
+                source.find("target.run").expect("ordinary member call") + "target.".len(),
+                "run".to_owned(),
+            ),
+            (
+                source
+                    .find("target&.safe_call")
+                    .expect("safe-navigation member call")
+                    + "target&.".len(),
+                "safe_call".to_owned(),
+            ),
+            (
+                source.find("target.assigned").expect("setter member call") + "target.".len(),
+                "assigned".to_owned(),
+            ),
+        ];
+        assert_eq!(member_positions(source), expected);
+
+        let support = RUBY_STRUCTURAL_SPEC.occurrence_role_support();
+        let supported: Vec<OccurrenceRole> = support
+            .iter()
+            .filter(|(_, support)| support.is_supported())
+            .map(|(role, _)| role)
+            .collect();
+        assert_eq!(
+            supported,
+            vec![
+                OccurrenceRole::DeclarationName,
+                OccurrenceRole::Binder,
+                OccurrenceRole::ReceiverPosition,
+                OccurrenceRole::MemberPosition,
+                OccurrenceRole::ValueReference,
+            ],
+            "the declared role set is exactly what `ruby_occurrence_role` \
+             classifies; a role this adapter cannot establish structurally \
+             (an import binder, a label, a type operand) must stay unsupported"
+        );
+    }
+    #[test]
+    fn every_local_introducing_position_is_classified_as_a_binder() {
+        let source = concat!(
+            "def run(plain, opt = 1, *rest, key:, **kw, &blk)\n",
+            "  total = 0\n",
+            "  first, second = pair\n",
+            "  for step in 1..3\n",
+            "    total += step\n",
+            "  end\n",
+            "  rows.each do |row, (left, right); scratch|\n",
+            "    scratch = row\n",
+            "  end\n",
+            "  begin\n",
+            "    risky\n",
+            "  rescue => error\n",
+            "    error\n",
+            "  end\n",
+            "  case value\n",
+            "  in [head, *tail]\n",
+            "    head\n",
+            "  in {name:, age: years}\n",
+            "    name\n",
+            "  in Point(x:)\n",
+            "    x\n",
+            "  in ^pinned\n",
+            "    1\n",
+            "  in other => whole\n",
+            "    whole\n",
+            "  end\n",
+            "  @member = total\n",
+            "  CONST = total\n",
+            "end\n",
+        );
+        assert_eq!(
+            tokens_with_role(source, OccurrenceRole::Binder),
+            vec![
+                "plain", "opt", "rest", "key", "kw", "blk", "total", "first", "second", "step",
+                // `total += step` rebinds the local, exactly as a second
+                // assignment to the same name would.
+                "total", "row", "left", "right", "scratch", "scratch", "error", "head", "tail",
+                "name", "years", "x", "other", "whole",
+            ],
+            "classified roles: {:?}",
+            occurrence_roles(source)
+        );
+        assert!(
+            !tokens_with_role(source, OccurrenceRole::Binder)
+                .iter()
+                .any(|token| matches!(token.as_str(), "pinned" | "Point" | "@member" | "CONST")),
+            "a pinned read, a pattern class, an instance variable and a \
+             constant are never lexical binders"
+        );
+    }
+    #[test]
+    fn member_and_global_variables_are_value_references_never_binders() {
+        let source = "def run(seed)\n  @size = seed\n  @@count = @size\n  $global = @@count\nend\n";
+        assert_eq!(
+            tokens_with_role(source, OccurrenceRole::Binder),
+            vec!["seed"]
+        );
+        assert_eq!(
+            tokens_with_role(source, OccurrenceRole::ValueReference),
+            vec!["@size", "seed", "@@count", "@size", "$global", "@@count"]
+        );
+    }
+    #[test]
+    fn declaration_names_cover_the_named_declaration_forms() {
+        let source = concat!(
+            "module Api\n",
+            "  class Widget\n",
+            "    LIMIT = 3\n",
+            "    def render\n",
+            "    end\n",
+            "    def self.build\n",
+            "    end\n",
+            "    def size=(value)\n",
+            "    end\n",
+            "  end\n",
+            "end\n",
+        );
+        assert_eq!(
+            tokens_with_role(source, OccurrenceRole::DeclarationName),
+            vec!["Api", "Widget", "LIMIT", "render", "build", "size"],
+            "classified roles: {:?}",
+            occurrence_roles(source)
+        );
+    }
+    #[test]
+    fn a_scope_resolution_reads_as_a_receiver_and_a_member() {
+        let source = "value = Api::Widget\n";
+        assert_eq!(
+            tokens_with_role(source, OccurrenceRole::ReceiverPosition),
+            vec!["Api"]
+        );
+        assert_eq!(
+            tokens_with_role(source, OccurrenceRole::MemberPosition),
+            vec!["Widget"]
+        );
+    }
+    #[test]
+    fn only_the_local_variable_forms_open_a_ruby_scope() {
+        for kind in [
+            NormalizedKind::Function,
+            NormalizedKind::Method,
+            NormalizedKind::Lambda,
+            NormalizedKind::Class,
+            NormalizedKind::Module,
+        ] {
+            assert_eq!(
+                RUBY_STRUCTURAL_SPEC.scope_formation(kind),
+                ScopeFormation::BindingScope,
+                "{kind:?} opens a Ruby local-variable scope whose binders are locals"
+            );
+        }
+        for kind in [
+            NormalizedKind::ForLoop,
+            NormalizedKind::WhileLoop,
+            NormalizedKind::Catch,
+            NormalizedKind::Block,
+            NormalizedKind::If,
+        ] {
+            assert_eq!(
+                RUBY_STRUCTURAL_SPEC.scope_formation(kind),
+                ScopeFormation::NotAScope,
+                "{kind:?} does not scope a Ruby local"
+            );
+        }
+    }
+
+    fn result_use_calls(source: &str) -> Vec<(String, CallResultUse)> {
+        let tree = parse(source);
+        let mut calls = Vec::new();
+        let mut stack = vec![tree.root_node()];
+        while let Some(node) = stack.pop() {
+            if node.kind() == "call"
+                && call_method_node(node).is_some_and(|method| node_text(method, source) == "strip")
+            {
+                calls.push((
+                    node_text(node, source).to_owned(),
+                    ruby_call_result_use(node, source).default_use(),
+                ));
+            }
+            for index in (0..node.named_child_count()).rev() {
+                stack.push(node.named_child(index).expect("named child exists"));
+            }
+        }
+        calls
+    }
+
+    #[test]
+    fn result_use_tracks_method_block_and_assignment_value_contexts() {
+        let source = concat!(
+            "def direct\n",
+            "  \"x\".strip\n",
+            "  \"y\".strip\n",
+            "end\n",
+            "def assigned\n",
+            "  value = \"x\".strip\n",
+            "  _ = \"y\".strip\n",
+            "end\n",
+            "items.each do\n",
+            "  \"x\".strip\n",
+            "end\n",
+            "items.each do\n",
+            "  \"x\".strip\n",
+            "  \"y\".strip\n",
+            "end\n",
+            "lambda { \"x\".strip }\n",
+        );
+        assert_eq!(
+            result_use_calls(source),
+            vec![
+                ("\"x\".strip".to_owned(), CallResultUse::Discarded),
+                ("\"y\".strip".to_owned(), CallResultUse::Consumed),
+                ("\"x\".strip".to_owned(), CallResultUse::Consumed),
+                ("\"y\".strip".to_owned(), CallResultUse::Consumed),
+                ("\"x\".strip".to_owned(), CallResultUse::Consumed),
+                ("\"x\".strip".to_owned(), CallResultUse::Discarded),
+                ("\"y\".strip".to_owned(), CallResultUse::Consumed),
+                (
+                    "\"x\".strip".to_owned(),
+                    CallResultUse::Open(CallResultUseOpenReason::DeferredContext)
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn top_level_last_expression_is_still_a_discard() {
+        assert_eq!(
+            result_use_calls("\"x\".strip\n"),
+            vec![("\"x\".strip".to_owned(), CallResultUse::Discarded)]
         );
     }
 }

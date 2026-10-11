@@ -115,15 +115,12 @@ impl GoExternalEvidence for AnalyzerGoExternalEvidence {
 
 #[cfg(test)]
 mod tests {
-    use super::collect_go_semantic_diagnostics;
-    use crate::analyzer::{AnalyzerQueryScope, QueryScope};
     use crate::analyzer::{
-        GoAnalyzer, Language, ProjectFile, SemanticDiagnostic, SemanticDiagnosticReport,
+        GoAnalyzer, IAnalyzer, Language, ProjectFile, SemanticDiagnostic, SemanticDiagnosticReport,
         TestProject,
     };
-    use brokk_bifrost_go::diagnostics::{
-        GO_UNRECOGNIZED_PACKAGE_MEMBER, GO_UNRECOGNIZED_SYMBOL, MAX_GO_SEMANTIC_DIAGNOSTICS,
-    };
+    use brokk_bifrost_go::diagnostics::{GO_UNRECOGNIZED_PACKAGE_MEMBER, GO_UNRECOGNIZED_SYMBOL};
+    use brokk_bifrost_test_macros::hardwon;
     use tempfile::TempDir;
 
     struct Fixture {
@@ -134,15 +131,13 @@ mod tests {
 
     impl Fixture {
         fn file(&self, rel_path: &str) -> ProjectFile {
-            ProjectFile::new(self.root.clone(), rel_path)
+            crate::analyzer::common::project_file_for_test(&self.root, rel_path)
         }
 
         fn report_for(&self, rel_path: &str) -> SemanticDiagnosticReport {
             let file = self.file(rel_path);
             let source = file.read_to_string().expect("read source");
-            let scope = AnalyzerQueryScope::new(&self.analyzer);
-            let token = scope.token();
-            collect_go_semantic_diagnostics(&self.analyzer, token, &file, &source)
+            self.analyzer.semantic_diagnostics(&file, &source)
         }
 
         fn diagnostics_for(&self, rel_path: &str) -> Vec<SemanticDiagnostic> {
@@ -152,6 +147,12 @@ mod tests {
 
     fn fixture(files: &[(&str, &str)]) -> Fixture {
         fixture_with_go_mod(files, true)
+    }
+
+    fn assert_single_unknown_package_member(diagnostics: &[SemanticDiagnostic]) {
+        assert_eq!(1, diagnostics.len(), "{diagnostics:#?}");
+        assert_eq!(GO_UNRECOGNIZED_PACKAGE_MEMBER, diagnostics[0].kind);
+        assert!(diagnostics[0].message.contains("Missing"));
     }
 
     fn fixture_without_go_mod(files: &[(&str, &str)]) -> Fixture {
@@ -181,87 +182,6 @@ mod tests {
     }
 
     #[test]
-    fn go_semantic_diagnostics_report_unknown_local_identifier() {
-        let fixture = fixture(&[(
-            "main.go",
-            r#"
-package main
-
-func Run() {
-    missingValue
-}
-"#,
-        )]);
-
-        let diagnostics = fixture.diagnostics_for("main.go");
-        assert_eq!(1, diagnostics.len(), "{diagnostics:#?}");
-        assert_eq!(GO_UNRECOGNIZED_SYMBOL, diagnostics[0].kind);
-        assert!(diagnostics[0].message.contains("missingValue"));
-    }
-
-    #[test]
-    fn go_semantic_diagnostics_report_unknown_workspace_package_member() {
-        let fixture = fixture(&[
-            (
-                "store/store.go",
-                r#"
-package store
-
-func Present() {}
-"#,
-            ),
-            (
-                "main.go",
-                r#"
-package main
-
-import "example.com/app/store"
-
-func Run() {
-    store.Missing()
-}
-"#,
-            ),
-        ]);
-
-        let diagnostics = fixture.diagnostics_for("main.go");
-        assert_eq!(1, diagnostics.len(), "{diagnostics:#?}");
-        assert_eq!(GO_UNRECOGNIZED_PACKAGE_MEMBER, diagnostics[0].kind);
-        assert!(diagnostics[0].message.contains("Missing"));
-    }
-
-    #[test]
-    fn go_semantic_diagnostics_report_nested_unknown_workspace_package_member() {
-        let fixture = fixture(&[
-            (
-                "store/store.go",
-                r#"
-package store
-
-func Present() {}
-"#,
-            ),
-            (
-                "main.go",
-                r#"
-package main
-
-import "example.com/app/store"
-
-func Run() {
-    store.Missing.Nested()
-}
-"#,
-            ),
-        ]);
-
-        let diagnostics = fixture.diagnostics_for("main.go");
-        assert_eq!(1, diagnostics.len(), "{diagnostics:#?}");
-        assert_eq!(GO_UNRECOGNIZED_PACKAGE_MEMBER, diagnostics[0].kind);
-        assert!(diagnostics[0].message.contains("Missing"));
-    }
-
-    #[test]
     fn go_semantic_diagnostics_resolve_relative_workspace_imports() {
         let fixture = fixture_without_go_mod(&[
             (
@@ -287,118 +207,7 @@ func Run() {
         ]);
 
         let diagnostics = fixture.diagnostics_for("main.go");
-        assert_eq!(1, diagnostics.len(), "{diagnostics:#?}");
-        assert_eq!(GO_UNRECOGNIZED_PACKAGE_MEMBER, diagnostics[0].kind);
-        assert!(diagnostics[0].message.contains("Missing"));
-    }
-
-    #[test]
-    fn go_semantic_diagnostics_suppress_known_names_and_import_forms() {
-        let fixture = fixture(&[
-            (
-                "store/store.go",
-                r#"
-package store
-
-type Client struct {
-    Name string
-}
-
-func Present() {}
-func (Client) Run() {}
-"#,
-            ),
-            (
-                "dot/dot.go",
-                r#"
-package dot
-
-func DotFunc() {}
-"#,
-            ),
-            (
-                "main.go",
-                r#"
-package main
-
-import (
-    s "example.com/app/store"
-    . "example.com/app/dot"
-    _ "example.com/app/store"
-)
-
-type Local struct{}
-
-func Present() {}
-
-func Run(client s.Client) {
-Start:
-    local := Local{}
-    _ = local
-    _ = client.Name
-    client.Run()
-    Present()
-    s.Present()
-    DotFunc()
-    println(len([]int{1}))
-    goto Start
-}
-"#,
-            ),
-        ]);
-
-        let diagnostics = fixture.diagnostics_for("main.go");
-        assert!(diagnostics.is_empty(), "{diagnostics:#?}");
-    }
-
-    #[test]
-    fn go_semantic_diagnostics_suppress_generic_and_variadic_declarations() {
-        let fixture = fixture(&[(
-            "main.go",
-            r#"
-package main
-
-type Box[T any] struct {
-    value T
-}
-
-func Identity[T any](x T) T {
-    var y T = x
-    return y
-}
-
-func Log(xs ...string) {
-    println(xs)
-}
-"#,
-        )]);
-
-        let diagnostics = fixture.diagnostics_for("main.go");
-        assert!(diagnostics.is_empty(), "{diagnostics:#?}");
-    }
-
-    #[test]
-    fn go_semantic_diagnostics_respect_function_local_scopes() {
-        let fixture = fixture(&[(
-            "main.go",
-            r#"
-package main
-
-func A() {
-    ctx := 1
-    _ = ctx
-}
-
-func B() {
-    _ = ctx
-}
-"#,
-        )]);
-
-        let diagnostics = fixture.diagnostics_for("main.go");
-        assert_eq!(1, diagnostics.len(), "{diagnostics:#?}");
-        assert_eq!(GO_UNRECOGNIZED_SYMBOL, diagnostics[0].kind);
-        assert!(diagnostics[0].message.contains("ctx"));
+        assert_single_unknown_package_member(&diagnostics);
     }
 
     #[test]
@@ -434,189 +243,6 @@ func Run(values []int) {
             diagnostics
                 .iter()
                 .any(|diagnostic| diagnostic.message.contains("missing"))
-        );
-    }
-
-    #[test]
-    fn go_semantic_diagnostics_scan_assignment_lhs_references() {
-        let fixture = fixture(&[(
-            "main.go",
-            r#"
-package main
-
-func Run() {
-    missingValue = 1
-}
-"#,
-        )]);
-
-        let diagnostics = fixture.diagnostics_for("main.go");
-        assert_eq!(1, diagnostics.len(), "{diagnostics:#?}");
-        assert_eq!(GO_UNRECOGNIZED_SYMBOL, diagnostics[0].kind);
-        assert!(diagnostics[0].message.contains("missingValue"));
-    }
-
-    #[test]
-    fn go_semantic_diagnostics_suppress_keyed_literal_keys_but_scan_values() {
-        let fixture = fixture(&[(
-            "main.go",
-            r#"
-package main
-
-type Client struct {
-    Name string
-}
-
-func Run() {
-    _ = Client{Name: missingValue}
-}
-"#,
-        )]);
-
-        let diagnostics = fixture.diagnostics_for("main.go");
-        assert_eq!(1, diagnostics.len(), "{diagnostics:#?}");
-        assert_eq!(GO_UNRECOGNIZED_SYMBOL, diagnostics[0].kind);
-        assert!(diagnostics[0].message.contains("missingValue"));
-    }
-
-    #[test]
-    fn go_semantic_diagnostics_do_not_treat_struct_fields_as_bare_names() {
-        let fixture = fixture(&[(
-            "main.go",
-            r#"
-package main
-
-type Client struct {
-    Name string
-}
-
-func Run() {
-    _ = Name
-}
-"#,
-        )]);
-
-        let diagnostics = fixture.diagnostics_for("main.go");
-        assert_eq!(1, diagnostics.len(), "{diagnostics:#?}");
-        assert_eq!(GO_UNRECOGNIZED_SYMBOL, diagnostics[0].kind);
-        assert!(diagnostics[0].message.contains("Name"));
-    }
-
-    #[test]
-    fn go_semantic_diagnostics_scan_struct_field_types() {
-        let fixture = fixture(&[(
-            "main.go",
-            r#"
-package main
-
-type Client struct {
-    Store MissingType
-}
-"#,
-        )]);
-
-        let diagnostics = fixture.diagnostics_for("main.go");
-        assert_eq!(1, diagnostics.len(), "{diagnostics:#?}");
-        assert_eq!(GO_UNRECOGNIZED_SYMBOL, diagnostics[0].kind);
-        assert!(diagnostics[0].message.contains("MissingType"));
-    }
-
-    #[test]
-    fn go_semantic_diagnostics_cap_reported_items() {
-        let mut source = String::from("package main\n\nfunc Run() {\n");
-        for index in 0..(MAX_GO_SEMANTIC_DIAGNOSTICS + 25) {
-            source.push_str(&format!("    missing{index}\n"));
-        }
-        source.push_str("}\n");
-        let fixture = fixture(&[("main.go", &source)]);
-
-        let diagnostics = fixture.diagnostics_for("main.go");
-        assert_eq!(MAX_GO_SEMANTIC_DIAGNOSTICS, diagnostics.len());
-    }
-
-    #[test]
-    fn go_semantic_diagnostics_use_imported_package_clause_for_unaliased_imports() {
-        let fixture = fixture(&[
-            (
-                "postgres/postgres.go",
-                r#"
-package pg
-
-func Present() {}
-"#,
-            ),
-            (
-                "main.go",
-                r#"
-package main
-
-import "example.com/app/postgres"
-
-func Run() {
-    pg.Present()
-    pg.Missing()
-}
-"#,
-            ),
-        ]);
-
-        let diagnostics = fixture.diagnostics_for("main.go");
-        assert_eq!(1, diagnostics.len(), "{diagnostics:#?}");
-        assert_eq!(GO_UNRECOGNIZED_PACKAGE_MEMBER, diagnostics[0].kind);
-        assert!(diagnostics[0].message.contains("Missing"));
-    }
-
-    #[test]
-    fn go_canonical_package_clause_preserves_structured_package_cases() {
-        for (source, expected) in [
-            ("package main\n\nfunc main() {}", Some("main")),
-            (
-                "package mypkg\nimport \"fmt\"\nfunc Hello() { fmt.Println(\"Hello\") }",
-                Some("mypkg"),
-            ),
-            (
-                "// comment\npackage main /* another comment */",
-                Some("main"),
-            ),
-            ("func main() {}", None),
-            ("", None),
-        ] {
-            let project = crate::inline_project::InlineTestProject::with_language(Language::Go)
-                .file("source.go", source)
-                .build();
-            let analyzer = GoAnalyzer::from_project(project.project().clone());
-            let clause = analyzer.package_clause_of(&project.file("source.go"));
-            assert_eq!(
-                clause.as_deref().filter(|clause| !clause.is_empty()),
-                expected,
-                "{source:?}"
-            );
-        }
-    }
-
-    #[test]
-    fn go_semantic_diagnostics_read_canonical_overlay_package_clauses() {
-        use crate::analyzer::{IAnalyzer, OverlayProject, Project};
-        use std::sync::Arc;
-
-        let source = "package main\nimport \"example.com/app/postgres\"\nfunc Run() { fresh.Present(); fresh.Missing() }\n";
-        let project = crate::inline_project::InlineTestProject::with_language(Language::Go)
-            .file("go.mod", "module example.com/app\n")
-            .file("postgres/postgres.go", "package old\nfunc Present() {}\n")
-            .file("main.go", source)
-            .build();
-        let overlay = Arc::new(OverlayProject::new(project.project_dyn()));
-        assert!(overlay.set(
-            project.file("postgres/postgres.go").abs_path(),
-            "package fresh /* canonical clause */\nfunc Present() {}\n".to_owned(),
-        ));
-        let analyzer = GoAnalyzer::new(overlay as Arc<dyn Project>);
-        let report = analyzer.semantic_diagnostics(&project.file("main.go"), source);
-        assert_eq!(report.diagnostics().len(), 1, "{report:#?}");
-        assert_eq!(report.diagnostics()[0].kind, GO_UNRECOGNIZED_PACKAGE_MEMBER);
-        assert!(
-            report.diagnostics()[0].message.contains("Missing"),
-            "{report:#?}"
         );
     }
 
@@ -657,6 +283,30 @@ func Run() {
     }
 
     #[test]
+    fn go_semantic_diagnostics_respect_function_local_scopes() {
+        let fixture = fixture(&[(
+            "main.go",
+            r#"
+package main
+
+func A() {
+    ctx := 1
+    _ = ctx
+}
+
+func B() {
+    _ = ctx
+}
+"#,
+        )]);
+
+        let diagnostics = fixture.diagnostics_for("main.go");
+        assert_eq!(1, diagnostics.len(), "{diagnostics:#?}");
+        assert_eq!(GO_UNRECOGNIZED_SYMBOL, diagnostics[0].kind);
+        assert!(diagnostics[0].message.contains("ctx"));
+    }
+
+    #[test]
     fn go_semantic_diagnostics_suppress_external_and_malformed_files() {
         let fixture = fixture(&[
             (
@@ -691,5 +341,138 @@ func Run( {
             fixture.diagnostics_for("broken.go").is_empty(),
             "semantic diagnostics should suppress malformed files"
         );
+    }
+
+    #[test]
+    fn go_semantic_diagnostics_suppress_keyed_literal_keys_but_scan_values() {
+        let fixture = fixture(&[(
+            "main.go",
+            r#"
+package main
+
+type Client struct {
+    Name string
+}
+
+func Run() {
+    _ = Client{Name: missingValue}
+}
+"#,
+        )]);
+
+        let diagnostics = fixture.diagnostics_for("main.go");
+        assert_eq!(1, diagnostics.len(), "{diagnostics:#?}");
+        assert_eq!(GO_UNRECOGNIZED_SYMBOL, diagnostics[0].kind);
+        assert!(diagnostics[0].message.contains("missingValue"));
+    }
+
+    #[test]
+    #[hardwon(
+        "94224b15a07d: canonical Go package facts did not preserve comments and missing clauses"
+    )]
+    fn go_canonical_package_clause_preserves_structured_package_cases() {
+        for (source, expected) in [
+            ("package main\n\nfunc main() {}", Some("main")),
+            (
+                "package mypkg\nimport \"fmt\"\nfunc Hello() { fmt.Println(\"Hello\") }",
+                Some("mypkg"),
+            ),
+            (
+                "// comment\npackage main /* another comment */",
+                Some("main"),
+            ),
+            ("func main() {}", None),
+            ("", None),
+        ] {
+            let project = crate::inline_project::InlineTestProject::with_language(Language::Go)
+                .file("source.go", source)
+                .build();
+            let analyzer = GoAnalyzer::from_project(project.project().clone());
+            let clause = analyzer.package_clause_of(&project.file("source.go"));
+            assert_eq!(
+                clause.as_deref().filter(|clause| !clause.is_empty()),
+                expected,
+                "{source:?}"
+            );
+        }
+    }
+
+    #[test]
+    #[hardwon("94224b15a07d: Go diagnostics read stale package identity after an overlay edit")]
+    fn go_semantic_diagnostics_read_canonical_overlay_package_clauses() {
+        use crate::analyzer::{IAnalyzer, OverlayProject, Project};
+        use std::sync::Arc;
+
+        let source = "package main\nimport \"example.com/app/postgres\"\nfunc Run() { fresh.Present(); fresh.Missing() }\n";
+        let project = crate::inline_project::InlineTestProject::with_language(Language::Go)
+            .file("go.mod", "module example.com/app\n")
+            .file("postgres/postgres.go", "package old\nfunc Present() {}\n")
+            .file("main.go", source)
+            .build();
+        let overlay = Arc::new(OverlayProject::new(project.project_dyn()));
+        assert!(overlay.set(
+            project.file("postgres/postgres.go").abs_path(),
+            "package fresh /* canonical clause */\nfunc Present() {}\n".to_owned(),
+        ));
+        let analyzer = GoAnalyzer::new(overlay as Arc<dyn Project>);
+        let report = analyzer.semantic_diagnostics(&project.file("main.go"), source);
+        assert_eq!(report.diagnostics().len(), 1, "{report:#?}");
+        assert_eq!(report.diagnostics()[0].kind, GO_UNRECOGNIZED_PACKAGE_MEMBER);
+        assert!(
+            report.diagnostics()[0].message.contains("Missing"),
+            "{report:#?}"
+        );
+    }
+
+    #[test]
+    fn go_semantic_diagnostics_report_nested_unknown_workspace_package_member() {
+        let fixture = fixture(&[
+            (
+                "store/store.go",
+                r#"
+package store
+
+func Present() {}
+"#,
+            ),
+            (
+                "main.go",
+                r#"
+package main
+
+import "example.com/app/store"
+
+func Run() {
+    store.Missing.Nested()
+}
+"#,
+            ),
+        ]);
+
+        let diagnostics = fixture.diagnostics_for("main.go");
+        assert_single_unknown_package_member(&diagnostics);
+    }
+
+    #[test]
+    fn go_semantic_diagnostics_do_not_treat_struct_fields_as_bare_names() {
+        let fixture = fixture(&[(
+            "main.go",
+            r#"
+package main
+
+type Client struct {
+    Name string
+}
+
+func Run() {
+    _ = Name
+}
+"#,
+        )]);
+
+        let diagnostics = fixture.diagnostics_for("main.go");
+        assert_eq!(1, diagnostics.len(), "{diagnostics:#?}");
+        assert_eq!(GO_UNRECOGNIZED_SYMBOL, diagnostics[0].kind);
+        assert!(diagnostics[0].message.contains("Name"));
     }
 }

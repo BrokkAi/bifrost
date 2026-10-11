@@ -33,12 +33,15 @@ pub(crate) mod java_graph;
 pub(crate) mod java_usage_evidence_cache;
 pub(crate) mod js_ts_graph;
 pub(crate) mod kotlin_graph;
+#[cfg(test)]
+pub(crate) mod test_support;
 pub use cpp_graph::macro_lexical;
 pub mod member_completion;
 pub mod member_family;
 pub mod overload_selection;
 pub(crate) mod parsed_tree;
 pub(crate) mod php_graph;
+pub mod python_class_hierarchy;
 pub(crate) mod python_graph;
 pub mod receiver_query;
 pub(crate) mod receiver_sites;
@@ -58,6 +61,60 @@ pub(crate) mod workspace_graph_cache;
 // `pub(crate)` rather than re-publishing core's promoted `pub` items.
 use brokk_bifrost_core::analyzer::usages::{local_inference, model};
 pub use brokk_bifrost_core::analyzer::usages::{outcome, receiver_analysis, reference_site};
+
+pub(super) fn read_source(file: &crate::analyzer::ProjectFile) -> Result<String, String> {
+    file.read_to_string().map_err(|err| {
+        format!(
+            "failed to read `{}`: {err}",
+            crate::path_utils::rel_path_string(file)
+        )
+    })
+}
+
+pub(crate) fn range_for_span(
+    facts: &crate::analyzer::structural::FileFacts,
+    span: crate::analyzer::structural::Span,
+) -> crate::analyzer::Range {
+    brokk_bifrost_core::analyzer::semantic_diagnostics::range_for_byte_offsets(
+        facts.line_starts(),
+        span.start_byte,
+        span.end_byte,
+    )
+}
+
+pub(crate) const fn proof_rank(proof: crate::analyzer::usages::UsageProof) -> u8 {
+    match proof {
+        crate::analyzer::usages::UsageProof::Proven => 0,
+        crate::analyzer::usages::UsageProof::Unproven => 1,
+    }
+}
+
+pub(crate) fn source_location_request(
+    file: &crate::analyzer::ProjectFile,
+    line: Option<usize>,
+    column: Option<usize>,
+    start_byte: Option<usize>,
+    end_byte: Option<usize>,
+) -> brokk_bifrost_core::analyzer::usages::reference_site::SourceLocationRequest {
+    brokk_bifrost_core::analyzer::usages::reference_site::SourceLocationRequest {
+        file: file.clone(),
+        line,
+        column,
+        start_byte,
+        end_byte,
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn test_unit(name: &str) -> crate::analyzer::CodeUnit {
+    let file = crate::analyzer::ProjectFile::new(std::env::temp_dir(), "Main.java");
+    crate::analyzer::CodeUnit::new(
+        file,
+        crate::analyzer::CodeUnitType::Function,
+        "app",
+        format!("Widget.{name}"),
+    )
+}
 
 #[cfg(any(test, feature = "test-support"))]
 pub use call_relations::CallArgument;

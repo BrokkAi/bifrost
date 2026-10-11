@@ -4,6 +4,7 @@ use std::{cmp::Ordering, error::Error, fmt};
 
 use crate::analyzer::semantic::{
     IcfgNodeId, IcfgSnapshot, SemanticBudgetExceeded, SemanticCapability, SemanticOutcome,
+    SemanticWork,
 };
 
 /// Quality retained from the semantic outcome that produced an ICFG snapshot.
@@ -41,6 +42,42 @@ impl SemanticInputStatus {
                 exceeded: *exceeded,
             },
             SemanticOutcome::Cancelled { .. } => Self::Cancelled,
+        }
+    }
+
+    pub fn snapshot_outcome(self, snapshot: IcfgSnapshot) -> SemanticOutcome<IcfgSnapshot> {
+        let work = SemanticWork::default();
+        match self {
+            Self::Complete => SemanticOutcome::Complete {
+                value: snapshot,
+                work,
+            },
+            Self::Ambiguous => SemanticOutcome::Ambiguous {
+                candidates: snapshot,
+                work,
+            },
+            Self::Unknown => SemanticOutcome::Unknown {
+                partial: Some(snapshot),
+                work,
+            },
+            Self::Unsupported { capability } => SemanticOutcome::Unsupported {
+                capability,
+                partial: Some(snapshot),
+                work,
+            },
+            Self::Unproven => SemanticOutcome::Unproven {
+                partial: snapshot,
+                work,
+            },
+            Self::ExceededBudget { exceeded } => SemanticOutcome::ExceededBudget {
+                partial: Some(snapshot),
+                exceeded,
+                work,
+            },
+            Self::Cancelled => SemanticOutcome::Cancelled {
+                partial: Some(snapshot),
+                work,
+            },
         }
     }
 
@@ -256,18 +293,6 @@ mod tests {
             .expect_err("source budget should be exceeded")
     }
 
-    fn procedure_budget_error(limit: usize, attempted: usize) -> SemanticBudgetExceeded {
-        let mut limits = SemanticBudget::default().limits();
-        limits.procedures = limit;
-        SemanticBudget::new(limits)
-            .expect("positive budget")
-            .check(SemanticWork {
-                procedures: attempted,
-                ..SemanticWork::default()
-            })
-            .expect_err("procedure budget should be exceeded")
-    }
-
     #[test]
     fn semantic_input_status_merge_is_a_deterministic_join() {
         let statuses = [
@@ -285,7 +310,7 @@ mod tests {
                 exceeded: source_budget_error(1, 2),
             },
             SemanticInputStatus::ExceededBudget {
-                exceeded: procedure_budget_error(2, 3),
+                exceeded: crate::test_support::procedure_budget_error(2, 3),
             },
             SemanticInputStatus::Cancelled,
         ];

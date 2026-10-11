@@ -27,8 +27,7 @@
 use std::path::{Path, PathBuf};
 
 use super::dependency_discovery::{
-    MAX_BUILD_METADATA_BYTES, expand_maven_value, is_maven_pom, maven_project_properties,
-    parse_xml, read_bounded_source,
+    MAX_BUILD_METADATA_BYTES, expand_maven_value, is_maven_pom, maven_project_properties, parse_xml,
 };
 use crate::analyzer::Project;
 use crate::analyzer::topology::{
@@ -155,7 +154,16 @@ fn maven_topology(project: &dyn Project) -> WorkspaceTopology {
     let configurations: Vec<_> = files
         .iter()
         .filter(|file| is_maven_pom(file))
-        .map(|file| (file.rel_path(), read_bounded_source(project, file)))
+        .map(|file| {
+            (
+                file.rel_path(),
+                crate::analyzer::common::read_bounded_source(
+                    project,
+                    file,
+                    MAX_BUILD_METADATA_BYTES,
+                ),
+            )
+        })
         .collect();
     maven_topology_from_inputs(
         files.iter().map(|file| file.rel_path()),

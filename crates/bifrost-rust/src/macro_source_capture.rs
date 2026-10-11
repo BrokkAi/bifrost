@@ -45,6 +45,10 @@ pub(crate) fn capture_macro_definition<'tree>(
     }
 }
 
+#[cfg(test)]
+#[path = "macro_source_capture_tests.rs"]
+mod macro_source_capture_tests;
+
 fn capture_arm<'tree>(
     arm: Node<'tree>,
     source: &str,
@@ -57,6 +61,7 @@ fn capture_arm<'tree>(
             pattern: None,
             patterns: Vec::new(),
             ident_roles: Vec::new(),
+            transcriber_identifiers: None,
         };
     };
     let root_occurrence = sink.intern_node(left);
@@ -106,12 +111,36 @@ fn capture_arm<'tree>(
             name: name.to_string(),
         })
         .collect();
+    let transcriber_identifiers = right.map(|right| {
+        let mut identifiers = Vec::new();
+        let mut seen = HashSet::default();
+        let mut pending = vec![right];
+        while let Some(node) = pending.pop() {
+            if matches!(
+                node.kind(),
+                "identifier" | "type_identifier" | "field_identifier" | "primitive_type"
+            ) {
+                let spelling = rust_node_text(node, source);
+                if seen.insert(spelling) {
+                    identifiers.push(spelling.to_owned());
+                }
+            }
+            let mut cursor = node.walk();
+            // Rust's token-tree grammar exposes many literal tokens as
+            // anonymous nodes. Walk every structured child so identifiers
+            // in the transcriber are retained after hydration.
+            let children = node.children(&mut cursor).collect::<Vec<_>>();
+            pending.extend(children.into_iter().rev());
+        }
+        identifiers
+    });
 
     RustMacroArmSourceFact {
         occurrence,
         pattern: Some(root_occurrence),
         patterns,
         ident_roles,
+        transcriber_identifiers,
     }
 }
 
@@ -163,7 +192,3 @@ fn pattern_kind_and_children<'tree>(
         ),
     }
 }
-
-#[cfg(test)]
-#[path = "macro_source_capture_tests.rs"]
-mod macro_source_capture_tests;

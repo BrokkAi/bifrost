@@ -5,7 +5,7 @@ use super::*;
 /// than a hand-maintained keyword list.
 /// Which lexical-environment filter vocabulary a form accepts (#1474).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum EnvironmentOptionKind {
+pub(crate) enum EnvironmentOptionKind {
     Scope,
     Binding,
     Candidate,
@@ -16,7 +16,7 @@ pub(super) enum EnvironmentOptionKind {
 }
 
 impl EnvironmentOptionKind {
-    pub(super) fn accepted(self) -> &'static str {
+    pub(crate) fn accepted(self) -> &'static str {
         match self {
             Self::Scope => ":kind",
             Self::Binding => ":kind, :name, and :hoisting",
@@ -96,21 +96,13 @@ impl EnvironmentOptionField {
     pub(super) fn accepted_values(self) -> Option<Vec<&'static str>> {
         match self {
             Self::ScopeKinds => Some(ALL_KINDS.iter().map(|kind| kind.label()).collect()),
-            Self::GenerationSite(GenerationSiteFilterField::Kinds) => Some(
-                ALL_GENERATION_KINDS
-                    .iter()
-                    .map(|kind| kind.label())
-                    .collect(),
-            ),
-            Self::GenerationSite(GenerationSiteFilterField::Inputs) => Some(
-                ALL_GENERATION_INPUT_CLASSES
-                    .iter()
-                    .map(|input| input.label())
-                    .collect(),
-            ),
-            Self::Export(ExportFilterField::Forms) => {
-                Some(ALL_EXPORT_FORMS.iter().map(|form| form.label()).collect())
+            Self::GenerationSite(GenerationSiteFilterField::Kinds) => {
+                Some(generation_kind_labels())
             }
+            Self::GenerationSite(GenerationSiteFilterField::Inputs) => {
+                Some(generation_input_labels())
+            }
+            Self::Export(ExportFilterField::Forms) => Some(export_form_labels()),
             Self::Export(ExportFilterField::Names) => None,
             Self::Step(QueryStepField::BindingNames) => None,
             Self::Step(QueryStepField::IncludeShadowed) => Some(vec!["true"]),
@@ -149,28 +141,37 @@ pub(super) fn validate_capture_name(
     analysis: &mut Analysis,
 ) {
     let shape = QueryStepField::Capture.value_shape();
-    if !shape.accepts_string(name) {
-        let (minimum, maximum) = shape
-            .string_length_bounds()
-            .expect("capture-name shape has string bounds");
-        analysis.error(
-            range,
-            code,
-            format!("{label} must be between {minimum} and {maximum} bytes"),
-        );
-    }
+    validate_name_shape(name, range, shape, code, label, analysis);
 }
 
 pub(super) fn validate_parameter_name(name: &str, range: Range<usize>, analysis: &mut Analysis) {
     let shape = QueryStepField::ParameterName.value_shape();
+    validate_name_shape(
+        name,
+        range,
+        shape,
+        "invalid-query",
+        "parameter name",
+        analysis,
+    );
+}
+
+fn validate_name_shape(
+    name: &str,
+    range: Range<usize>,
+    shape: super::schema::ValueShape,
+    code: &'static str,
+    label: &str,
+    analysis: &mut Analysis,
+) {
     if !shape.accepts_string(name) {
         let (minimum, maximum) = shape
             .string_length_bounds()
-            .expect("parameter-name shape has string bounds");
+            .expect("query name shape has string bounds");
         analysis.error(
             range,
-            "invalid-query",
-            format!("parameter name must be between {minimum} and {maximum} bytes"),
+            code,
+            format!("{label} must be between {minimum} and {maximum} bytes"),
         );
     }
 }

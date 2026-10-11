@@ -271,21 +271,21 @@ impl<Fact, Value, EdgeFunction> IdeSummaryDataflowResult<Fact, Value, EdgeFuncti
     pub fn reached_jump_functions(
         &self,
     ) -> impl Iterator<Item = (&SummaryReachedFact, &EdgeFunction)> {
-        self.fact_result
-            .reached()
-            .iter()
-            .zip(self.reached_jump_functions.iter().copied())
-            .filter_map(|(reached, function)| Some((reached, self.edge_function(function?)?)))
+        jump_functions(
+            self.fact_result.reached(),
+            &self.reached_jump_functions,
+            &self.edge_functions,
+        )
     }
 
     pub fn end_summary_jump_functions(
         &self,
     ) -> impl Iterator<Item = (&TabulationEndSummary, &EdgeFunction)> {
-        self.fact_result
-            .end_summaries()
-            .iter()
-            .zip(self.end_summary_jump_functions.iter().copied())
-            .filter_map(|(summary, function)| Some((summary, self.edge_function(function?)?)))
+        jump_functions(
+            self.fact_result.end_summaries(),
+            &self.end_summary_jump_functions,
+            &self.edge_functions,
+        )
     }
 
     pub fn entry_transfers(&self) -> impl Iterator<Item = (&IdeEntryTransfer, &EdgeFunction)> {
@@ -348,4 +348,14 @@ impl<Fact, Value, EdgeFunction> IdeSummaryDataflowResult<Fact, Value, EdgeFuncti
                     .fold(0usize, usize::saturating_add),
             )
     }
+}
+
+fn jump_functions<'a, Row, EdgeFunction>(
+    rows: &'a [Row],
+    ids: &'a [Option<IdeEdgeFunctionId>],
+    functions: &'a [EdgeFunction],
+) -> impl Iterator<Item = (&'a Row, &'a EdgeFunction)> + 'a {
+    rows.iter()
+        .zip(ids.iter().copied())
+        .filter_map(|(row, function)| Some((row, functions.get(function?.index())?)))
 }

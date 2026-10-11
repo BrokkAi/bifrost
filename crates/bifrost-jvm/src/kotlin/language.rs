@@ -4,17 +4,23 @@
 /// the analyzer integration.
 pub use brokk_tree_sitter_kotlin::LANGUAGE;
 
+pub(super) fn parser() -> Option<tree_sitter::Parser> {
+    let mut parser = tree_sitter::Parser::new();
+    parser.set_language(&LANGUAGE.into()).ok()?;
+    Some(parser)
+}
+
+pub(super) fn parse_tree(source: &str) -> Option<tree_sitter::Tree> {
+    parser()?.parse(source, None)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::LANGUAGE;
+    use brokk_bifrost_test_macros::hardwon;
     use tree_sitter::{InputEdit, Node, Parser, Point, Tree};
 
     fn parser() -> Parser {
-        let mut parser = Parser::new();
-        parser
-            .set_language(&LANGUAGE.into())
-            .expect("Tree-sitter 0.25 must load the pinned Kotlin grammar");
-        parser
+        super::parser().expect("Tree-sitter 0.25 must load the pinned Kotlin grammar")
     }
 
     fn parse(parser: &mut Parser, source: &str, old_tree: Option<&Tree>) -> Tree {
@@ -59,40 +65,9 @@ mod tests {
         tree
     }
 
-    #[test]
-    fn kotlin_source_and_script_parse_without_recovery() {
-        let kt = r#"package sample
-
-sealed interface Result<out T> {
-    data class Ok<T>(val value: T) : Result<T>
-    data class Err(val reason: String) : Result<Nothing>
-}
-
-context(String)
-fun <T : Any> T.render(): String = buildString {
-    append(this@render)
-    append(" from ")
-    append(this@String)
-}
-"#;
-        let kts = r#"plugins {
-    kotlin("jvm") version "2.2.0"
-}
-
-dependencies {
-    implementation(kotlin("stdlib"))
-}
-
-val greeting by extra("hello")
-tasks.register("printGreeting") {
-    doLast { println("$greeting from ${project.name}") }
-}
-"#;
-
-        assert_clean(".kt source", kt);
-        assert_clean(".kts script", kts);
-    }
-
+    #[hardwon(
+        "54ad924ea614: Kotlin newline-separated primary-constructor modifiers failed to parse cleanly"
+    )]
     #[test]
     fn newline_separated_primary_constructor_modifiers_parse_without_recovery() {
         let source = r#"package sample

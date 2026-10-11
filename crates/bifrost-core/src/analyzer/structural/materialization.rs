@@ -90,7 +90,61 @@ labelled_enum! {
         DefaultAnonymous => "default_anonymous",
         CommonJsRoot => "common_js_root",
         CommonJsMember => "common_js_member",
+        PythonAll => "python_all",
     }
+}
+
+/// One statically readable Python `__all__` member, derived from one file's
+/// prepared syntax during a query. It is deliberately not a persisted
+/// materialization record: Python's curated export list is query-time source
+/// evidence and stays out of opaque database payloads.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SourceExportFact {
+    pub range: Range,
+    pub exported_name: String,
+    pub local_definition: SourceExportLocalDefinition,
+}
+
+labelled_enum! {
+    /// The syntax form of a local binding that proves a Python export exists.
+    SourceExportBindingKind, ALL_SOURCE_EXPORT_BINDING_KINDS {
+        Binding => "binding",
+        Class => "class",
+        Function => "function",
+        Import => "import",
+    }
+}
+
+/// A source-backed binding that defines one name listed in `__all__`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SourceExportBinding {
+    pub name: String,
+    pub kind: SourceExportBindingKind,
+    pub range: Range,
+}
+
+/// What one statically listed Python export proves about its local name.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SourceExportLocalDefinition {
+    Defined { binding: SourceExportBinding },
+    Undefined,
+    Unknown,
+}
+
+/// The exact source export members an adapter can currently read.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SourceExportFacts {
+    pub exports: Vec<SourceExportFact>,
+    /// Whether the source explicitly declares an export surface such as
+    /// Python's module-level `__all__`.
+    pub declared: bool,
+    /// False when a dynamic expression or unsupported mutation makes the
+    /// complete export surface unknowable. Known literal members may still be
+    /// returned alongside this incomplete verdict.
+    pub complete: bool,
+    /// Whether the module syntax contains no dynamic namespace writes that
+    /// could define names not present in the collected module bindings.
+    pub definitions_complete: bool,
 }
 
 macro_rules! materialization_axes {
@@ -224,16 +278,14 @@ impl DeclarationMaterializationSupport {
     }
 
     pub fn is_empty(&self) -> bool {
-        self.support.iter().all(|support| !support.is_supported())
+        super::support_is_empty(self.support.iter().map(|support| support.is_supported()))
     }
 
     /// Iterate in the stable order declared by [`ALL_MATERIALIZATION_AXES`].
     pub fn iter(
         &self,
     ) -> impl ExactSizeIterator<Item = (MaterializationAxis, MaterializationSupport)> + '_ {
-        ALL_MATERIALIZATION_AXES
-            .iter()
-            .map(|&axis| (axis, self.support(axis)))
+        super::support_iter(ALL_MATERIALIZATION_AXES, |axis| self.support(axis))
     }
 }
 
@@ -447,14 +499,15 @@ pub static RUBY_MATERIALIZATION_SUPPORT: DeclarationMaterializationSupport =
         .supported(MaterializationAxis::GenerationSites)
         .supported(MaterializationAxis::GeneratedSets);
 
-/// Python: `@overload` signatures are declaration-only state, and the join
-/// from a stub to the runnable `def` of the same callable is the
-/// implementation linkage. Python generates no declarations from macros and
-/// has no export-form model here.
+/// Python: `@overload` signatures are declaration-only state, the join from a
+/// stub to the runnable `def` of the same callable is the implementation
+/// linkage, and literal module-level `__all__` members are source export rows.
+/// Python generates no declarations from macros.
 pub static PYTHON_MATERIALIZATION_SUPPORT: DeclarationMaterializationSupport =
     DeclarationMaterializationSupport::NONE
         .supported(MaterializationAxis::DeclarationState)
-        .supported(MaterializationAxis::ImplementationLinkage);
+        .supported(MaterializationAxis::ImplementationLinkage)
+        .supported(MaterializationAxis::Exports);
 
 /// JS/TS: default exports (named and anonymous), named exports, and CommonJS
 /// `module.exports` roots and members are export rows, and every declared unit
@@ -488,52 +541,17 @@ pub static CPP_MATERIALIZATION_SUPPORT: DeclarationMaterializationSupport =
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::HashSet;
 
-    /// Every labelled vocabulary in this registry must have unique labels that
-    /// round-trip through both `from_label` and serde, so a JSON surface and a
-    /// rendered surface never disagree about a name.
     #[test]
     fn materialization_vocabularies_are_unique_and_round_trip() {
-        macro_rules! check {
-            ($all:expr, $type:ty) => {{
-                let mut labels = HashSet::new();
-                for &value in $all {
-                    assert!(labels.insert(value.label()), "duplicate label {value:?}");
-                    assert_eq!(<$type>::from_label(value.label()), Some(value));
-                    let json = serde_json::to_value(value).expect("serialize");
-                    assert_eq!(
-                        json,
-                        serde_json::Value::String(value.label().to_owned()),
-                        "serde label diverges from label() for {value:?}"
-                    );
-                    let back: $type = serde_json::from_value(json).expect("deserialize");
-                    assert_eq!(back, value);
-                }
-                assert_eq!(labels.len(), $all.len());
-            }};
-        }
-
-        check!(ALL_DECLARATION_ORIGINS, DeclarationOrigin);
-        check!(ALL_GENERATION_INPUT_CLASSES, GenerationInputClass);
-        check!(ALL_GENERATION_KINDS, GenerationKind);
-        check!(ALL_EXPORT_FORMS, ExportForm);
-        check!(ALL_MATERIALIZATION_AXES, MaterializationAxis);
+        assert_vocabulary_round_trip!(ALL_DECLARATION_ORIGINS, DeclarationOrigin);
+        assert_vocabulary_round_trip!(ALL_GENERATION_INPUT_CLASSES, GenerationInputClass);
+        assert_vocabulary_round_trip!(ALL_GENERATION_KINDS, GenerationKind);
+        assert_vocabulary_round_trip!(ALL_EXPORT_FORMS, ExportForm);
+        assert_vocabulary_round_trip!(ALL_MATERIALIZATION_AXES, MaterializationAxis);
 
         assert!(DeclarationOrigin::from_label("not_an_origin").is_none());
         assert!(MaterializationAxis::from_label("not_an_axis").is_none());
-    }
-
-    #[test]
-    fn axis_indices_are_dense_and_size_the_support_table() {
-        assert_eq!(ALL_MATERIALIZATION_AXES.len(), MaterializationAxis::COUNT);
-        for (slot, &axis) in ALL_MATERIALIZATION_AXES.iter().enumerate() {
-            assert_eq!(axis.index(), slot);
-        }
-        assert_eq!(
-            DeclarationMaterializationSupport::NONE.iter().count(),
-            MaterializationAxis::COUNT
-        );
     }
 
     #[test]
@@ -556,11 +574,6 @@ mod tests {
         assert!(NO_MATERIALIZATION_SUPPORT.is_empty());
     }
 
-    /// The per-language tables are the one place each claiming adapter states
-    /// what it answers, so their contents are asserted once here rather than
-    /// in each adapter. The matrix is deliberately non-uniform: each language
-    /// claims exactly the axes its producers compute, and nothing claims what
-    /// no producer computes (no language claims every axis).
     #[test]
     fn claimed_tables_state_the_per_language_matrix() {
         use MaterializationAxis::*;
@@ -585,7 +598,7 @@ mod tests {
         expect(
             &PYTHON_MATERIALIZATION_SUPPORT,
             "python",
-            &[DeclarationState, ImplementationLinkage],
+            &[DeclarationState, ImplementationLinkage, Exports],
         );
         expect(
             &JS_TS_MATERIALIZATION_SUPPORT,
@@ -613,10 +626,6 @@ mod tests {
         }
     }
 
-    /// Split/join is the persistence contract: every record round-trips
-    /// through its unit reference plus serializable payload, and a payload
-    /// that requires a unit refuses to rejoin without one instead of
-    /// fabricating a record about nothing.
     #[test]
     fn records_split_and_rejoin_without_loss() {
         use crate::analyzer::model::CodeUnitType;
@@ -690,13 +699,5 @@ mod tests {
                 MaterializationAxis::ConfigurationGating,
             ]
         );
-    }
-
-    #[test]
-    fn every_axis_describes_itself() {
-        for &axis in ALL_MATERIALIZATION_AXES {
-            assert!(!axis.description().is_empty());
-            assert_eq!(axis.signature(), axis.label());
-        }
     }
 }

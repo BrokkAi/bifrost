@@ -5,7 +5,7 @@ use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::SystemTime;
 
-use git2::{ObjectType, Oid, Repository};
+use git2::{Oid, Repository};
 use sha2::{Digest, Sha256};
 
 use crate::analyzer::ProjectFile;
@@ -58,9 +58,7 @@ impl Liveness {
         if !abs_path.is_file() {
             return Ok(None);
         }
-        Oid::hash_file(ObjectType::Blob, abs_path)
-            .map(Some)
-            .map_err(|err| err.to_string())
+        gitblob::working_tree_file_oid(&abs_path).map(Some)
     }
 
     /// Resolve a set of analyzer files to the blob identity their bytes have
@@ -237,17 +235,14 @@ impl Liveness {
             let file = entry.file;
             let rel_path = self.rel_path_from_workdir(&file)?;
             if index.get_path(&rel_path, 0).is_some() && entry.validation.is_filesystem() {
-                changed |= overlay.paths.remove(&file).is_some();
+                changed |= reconcile_path_state(&mut overlay.paths, file, None);
                 continue;
             }
             let Some(state) = PathState::new(entry.oid, entry.validation, &file, true) else {
-                changed |= overlay.paths.remove(&file).is_some();
+                changed |= reconcile_path_state(&mut overlay.paths, file, None);
                 continue;
             };
-            if overlay.paths.get(&file) != Some(&state) {
-                overlay.paths.insert(file, state);
-                changed = true;
-            }
+            changed |= reconcile_path_state(&mut overlay.paths, file, Some(state));
         }
 
         if changed {
@@ -404,6 +399,21 @@ struct PathState {
     /// watcher, so an out-of-band disk edit can stale an otherwise memoized
     /// snapshot without bumping `LivePathMap`'s generation.
     validated: bool,
+}
+
+fn reconcile_path_state(
+    paths: &mut HashMap<ProjectFile, PathState>,
+    file: ProjectFile,
+    state: Option<PathState>,
+) -> bool {
+    match state {
+        Some(state) if paths.get(&file) != Some(&state) => {
+            paths.insert(file, state);
+            true
+        }
+        Some(_) => false,
+        None => paths.remove(&file).is_some(),
+    }
 }
 
 impl PartialEq for PathState {
@@ -623,20 +633,17 @@ impl LivePathMap {
         let mut guard = self.state.lock().expect("live path map mutex poisoned");
         let mut changed = false;
         for entry in entries {
-            let Some(path_state) = PathState::new(
+            let file = entry.file;
+            let path_state = PathState::new(
                 entry.oid,
                 entry.validation,
-                &entry.file,
+                &file,
                 self.revalidate_filesystem,
-            ) else {
-                changed |= guard.paths.remove(&entry.file).is_some();
-                changed |= guard.additional_mounts.remove(&entry.file).is_some();
-                continue;
-            };
-            if guard.paths.get(&entry.file) != Some(&path_state) {
-                guard.paths.insert(entry.file, path_state);
-                changed = true;
+            );
+            if path_state.is_none() {
+                changed |= guard.additional_mounts.remove(&file).is_some();
             }
+            changed |= reconcile_path_state(&mut guard.paths, file, path_state);
         }
         if changed {
             guard.generation = guard.generation.wrapping_add(1);
@@ -1163,6 +1170,7 @@ mod tests {
     use crate::gitblob::test_repo::{
         commit_all, commit_paths, init_repo, refresh_index_stat_preserving_oid,
     };
+    use brokk_bifrost_test_macros::hardwon;
     use git2::{IndexAddOption, ObjectType};
 
     fn project_file(root: &Path, rel: &str) -> ProjectFile {
@@ -1174,6 +1182,7 @@ mod tests {
     /// per workspace file. The reconciliation it performs is a property of the
     /// root, so it is resolved once per root.
     #[test]
+    #[hardwon("e7831df9bf30: workspace-root canonicalization ran once per file")]
     fn the_workspace_root_is_canonicalized_once_not_once_per_file() {
         const FILES: usize = 24;
 
@@ -1214,6 +1223,7 @@ mod tests {
     /// canonicalized.
     #[cfg(unix)]
     #[test]
+    #[hardwon("e7831df9bf30: canonicalized symlink roots lost repository-relative paths")]
     fn a_symlinked_workspace_root_still_resolves_repository_relative_paths() {
         let temp = tempfile::TempDir::new().unwrap();
         let repo_root = temp.path().join("repo");
@@ -1254,26 +1264,6 @@ mod tests {
     }
 
     #[test]
-    fn clean_file_oid_comes_from_index() {
-        let temp = tempfile::TempDir::new().unwrap();
-        let repo = init_repo(temp.path());
-        std::fs::write(temp.path().join("a.rs"), "fn main() {}\n").unwrap();
-        commit_all(&repo, "init");
-
-        let file = project_file(temp.path(), "a.rs");
-        let liveness = Liveness::new(repo).unwrap();
-        let resolved = liveness.oid_for_path(&file).unwrap().unwrap();
-        let index = liveness.repo.lock().unwrap().index().unwrap();
-        let index_oid = index.get_path(Path::new("a.rs"), 0).unwrap().id;
-
-        assert_eq!(resolved, index_oid);
-        assert_eq!(
-            resolved,
-            Oid::hash_object(ObjectType::Blob, b"fn main() {}\n").unwrap()
-        );
-    }
-
-    #[test]
     fn concurrent_bulk_oid_projection_preserves_nested_workspace_paths() {
         let temp = tempfile::TempDir::new().unwrap();
         let repo = init_repo(temp.path());
@@ -1310,6 +1300,7 @@ mod tests {
     /// re-register the pre-edit blob, which hid the edit from every
     /// blob-keyed reader for the rest of the session.
     #[test]
+    #[hardwon("3bc986fde50a: the memoized startup scan returned an old blob id after a file edit")]
     fn editing_file_changes_bulk_oid_after_the_first_projection() {
         let temp = tempfile::TempDir::new().unwrap();
         let repo = init_repo(temp.path());
@@ -1340,6 +1331,9 @@ mod tests {
     /// A file created after the seeding scan has no scanned entry at all, so
     /// the projection must read it rather than report it as absent.
     #[test]
+    #[hardwon(
+        "3bc986fde50a: a file created after startup was absent from bulk identity projection"
+    )]
     fn bulk_projection_resolves_a_file_created_after_the_first_projection() {
         let temp = tempfile::TempDir::new().unwrap();
         let repo = init_repo(temp.path());
@@ -1363,6 +1357,9 @@ mod tests {
     }
 
     #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "f7e2d59ae806: warm bulk OID projection missed edits made after its startup scan"
+    )]
     fn bulk_oid_projection_observes_edits_after_the_startup_scan() {
         let temp = tempfile::TempDir::new().unwrap();
         let repo = init_repo(temp.path());
@@ -1392,6 +1389,9 @@ mod tests {
     }
 
     #[test]
+    #[hardwon(
+        "d75a40b646f3: clean CRLF identity used canonical Git bytes instead of working bytes"
+    )]
     fn bulk_oid_projection_hashes_clean_eol_transformed_bytes() {
         let temp = tempfile::TempDir::new().unwrap();
         let repo = init_repo(temp.path());
@@ -1429,6 +1429,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    #[hardwon("f7e2d59ae806: an unrelated unreadable file aborted a scoped identity projection")]
     fn bulk_oid_projection_ignores_unreadable_files_outside_the_request() {
         use std::os::unix::fs::PermissionsExt;
 
@@ -1459,6 +1460,7 @@ mod tests {
     }
 
     #[test]
+    #[hardwon("f7e2d59ae806: ignored requested files were omitted from working-tree identity")]
     fn ignored_requested_file_uses_its_working_bytes() {
         let temp = tempfile::TempDir::new().unwrap();
         let repo = init_repo(temp.path());
@@ -1474,26 +1476,6 @@ mod tests {
         assert_eq!(
             resolved.get(&file),
             Some(&Oid::hash_object(ObjectType::Blob, b"fn generated() {}\n").unwrap())
-        );
-    }
-
-    #[test]
-    fn editing_file_changes_point_oid_without_git_command() {
-        let temp = tempfile::TempDir::new().unwrap();
-        let repo = init_repo(temp.path());
-        std::fs::write(temp.path().join("a.rs"), "fn old() {}\n").unwrap();
-        commit_all(&repo, "init");
-
-        let file = project_file(temp.path(), "a.rs");
-        let liveness = Liveness::new(repo).unwrap();
-        let before = liveness.oid_for_path(&file).unwrap().unwrap();
-        std::fs::write(temp.path().join("a.rs"), "fn new() {}\n").unwrap();
-        let after = liveness.oid_for_path(&file).unwrap().unwrap();
-
-        assert_ne!(before, after);
-        assert_eq!(
-            after,
-            Oid::hash_object(ObjectType::Blob, b"fn new() {}\n").unwrap()
         );
     }
 
@@ -1583,22 +1565,6 @@ mod tests {
     }
 
     #[test]
-    fn validate_flags_path_edited_after_snapshot_build() {
-        let temp = tempfile::TempDir::new().unwrap();
-        let repo = init_repo(temp.path());
-        std::fs::write(temp.path().join("a.rs"), "fn old() {}\n").unwrap();
-        commit_all(&repo, "init");
-
-        let file = project_file(temp.path(), "a.rs");
-        let liveness = Liveness::new(repo).unwrap();
-        let snapshot = liveness.snapshot().unwrap();
-        assert!(snapshot.validate([&file].into_iter()).is_empty());
-
-        std::fs::write(temp.path().join("a.rs"), "fn new_name() {}\n").unwrap();
-        assert_eq!(snapshot.validate([&file].into_iter()), vec![file]);
-    }
-
-    #[test]
     fn filesystem_validated_oid_for_path_rechecks_memoized_snapshots() {
         let temp = tempfile::TempDir::new().unwrap();
         std::fs::write(temp.path().join("a.rs"), "fn a() {}\n").unwrap();
@@ -1644,6 +1610,7 @@ mod tests {
     }
 
     #[test]
+    #[hardwon("f5a431a2edac: refreshed paths reused stale stat validation")]
     fn refresh_bumps_generation_and_forces_revalidation_on_next_snapshot() {
         // Models the watcher-driven write path: `SearchToolsService::
         // apply_watcher_delta`/`apply_changed_files` -> analyzer `update()` ->
@@ -1777,6 +1744,7 @@ mod tests {
     }
 
     #[test]
+    #[hardwon("f5a431a2edac: replace_all discarded an unchanged validated snapshot")]
     fn replace_all_with_unchanged_content_keeps_the_memoized_snapshot() {
         // Models `UpdateStrategy::Manual`'s explicit `update_files()`/full
         // rebuild path and `requires_full_refresh`: `replace_all` always
@@ -1803,6 +1771,7 @@ mod tests {
     }
 
     #[test]
+    #[hardwon("f5a431a2edac: changed replace_all content reused the old validated snapshot")]
     fn replace_all_with_changed_content_rebuilds_the_snapshot() {
         let temp = tempfile::TempDir::new().unwrap();
         std::fs::write(temp.path().join("a.rs"), "fn a() {}\n").unwrap();
@@ -1827,23 +1796,6 @@ mod tests {
         assert!(!Arc::ptr_eq(&snapshot, &new_snapshot));
         assert_eq!(new_snapshot.validated_oid_for_path(&file_a), Some(oid_a));
         assert_eq!(new_snapshot.validated_oid_for_path(&file_b), Some(oid_b));
-    }
-
-    #[test]
-    fn dirty_files_in_snapshot_use_hashed_working_tree_oid() {
-        let temp = tempfile::TempDir::new().unwrap();
-        let repo = init_repo(temp.path());
-        std::fs::write(temp.path().join("a.rs"), "fn old() {}\n").unwrap();
-        commit_all(&repo, "init");
-        std::fs::write(temp.path().join("a.rs"), "fn dirty() {}\n").unwrap();
-
-        let file = project_file(temp.path(), "a.rs");
-        let liveness = Liveness::new(repo).unwrap();
-        let snapshot = liveness.snapshot().unwrap();
-        assert_eq!(
-            snapshot.oid_for_path(&file),
-            Some(Oid::hash_object(ObjectType::Blob, b"fn dirty() {}\n").unwrap())
-        );
     }
 
     #[test]

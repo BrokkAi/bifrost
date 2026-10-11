@@ -24,7 +24,7 @@ patterns whether matching files are tracked by Git or not.
 
 Matching files are excluded from analyzer-backed behavior. They contribute no
 declarations or references to symbol search, summaries, navigation, usage
-analysis, structural queries, policies, diagnostics, or the semantic index.
+analysis, structural queries, policies, or diagnostics.
 
 ## File Tools Still See Excluded Files
 
@@ -37,6 +37,36 @@ This differs from `.gitignore`. Bifrost's workspace inventory follows Git's
 ignore rules for untracked files but deliberately keeps tracked files visible.
 `.bifrostignore` adds a separate, analysis-only boundary for tracked or
 untracked content.
+
+## Which Files Are in the Workspace
+
+Bifrost builds the workspace file inventory this way:
+
+- Inside a Git repository, the inventory is every tracked file that exists in
+  the working tree, plus every untracked file that Git does not ignore. Files
+  in initialized submodules are included. Bifrost reads the Git index and
+  working tree; it does not fetch or initialize submodules.
+- Outside a Git repository, Bifrost walks the directory tree. It honors
+  `.gitignore` files, the global Git ignore file, and `.git/info/exclude`. It
+  does not honor `.ignore` files.
+- Hidden files and directories, such as `.github/`, are included.
+- A `.git` directory is never walked.
+- If the root is inside a Git repository whose ignore rules hide the whole
+  root, Bifrost walks the root directly instead, without the ancestor
+  repository's ignore files.
+
+## Files That Are Never Parsed
+
+Some files stay in the inventory but are never parsed, so they get no code
+intelligence even when no ignore rule matches them:
+
+- Binary files: a file that contains a NUL byte.
+- Files with a very long line: a file with a line longer than 16000 bytes,
+  such as a minified JavaScript bundle. Set `BIFROST_MAX_LINE_LENGTH` to change
+  the limit, or to `0` to turn it off. See
+  [Environment Variables](/reference/environment/).
+
+File-level tools can still read these files.
 
 ## Explicit One-Shot Sources Win
 
@@ -51,14 +81,15 @@ bifrost --root /path/to/project \
   --args '{"symbols":["vendor/generated/parser.c"]}'
 ```
 
-Explicit selections are useful for one-off inspection. Ordinary whole-workspace
-CLI, MCP, LSP, Python, and Rust-library analyzer construction continues to honor
-`.bifrostignore`.
+Explicit selections are useful for one-off inspection. Ordinary
+whole-workspace CLI, MCP, Python, and Rust-library analyzer construction
+continues to honor `.bifrostignore`.
 
 ## Live Sessions
 
 Long-running MCP sessions watch `.bifrostignore`. Creating, changing, renaming,
-or removing a root or relevant nested file invalidates the configured analysis
-scope and triggers a full re-analysis. LSP sessions do the same when the editor
-reports the change through `workspace/didChangeWatchedFiles`. File-level tools
-continue to use the complete workspace inventory before and after that refresh.
+or removing a root or nested `.bifrostignore` file invalidates the analysis
+scope and starts a full re-analysis. File-level tools use the complete
+workspace inventory before and after that refresh. When file watching is off
+(`BIFROST_MCP_FILE_WATCHER=off`), call the `refresh` tool after you change a
+`.bifrostignore` file.

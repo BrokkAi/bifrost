@@ -61,7 +61,6 @@ mod imp {
     };
     use semver::Version;
     use serde::Serialize;
-    use sha2::{Digest, Sha256};
     use tempfile::NamedTempFile;
 
     pub fn run() -> Result<(), String> {
@@ -95,17 +94,9 @@ mod imp {
 
     fn sha256_file(path: &Path) -> Result<String, String> {
         let bytes = fs::read(path).map_err(|error| format!("read {}: {error}", path.display()))?;
-        let mut hasher = Sha256::new();
-        hasher.update(&bytes);
-        Ok(hex_lower(&hasher.finalize()))
-    }
-
-    fn hex_lower(bytes: &[u8]) -> String {
-        let mut out = String::with_capacity(bytes.len() * 2);
-        for byte in bytes {
-            out.push_str(&format!("{byte:02x}"));
-        }
-        out
+        Ok(brokk_bifrost::analyzer::semantic_model::csmi::sha256_hex(
+            &bytes,
+        ))
     }
 
     fn promote_esapi(args: &[String]) -> Result<(), String> {
@@ -301,17 +292,8 @@ mod imp {
     }
 
     fn git_head(root: &Path) -> Option<String> {
-        let output = std::process::Command::new("git")
-            .arg("-C")
-            .arg(root)
-            .args(["rev-parse", "HEAD"])
-            .output()
-            .ok()?;
-        output
-            .status
-            .success()
-            .then(|| String::from_utf8_lossy(&output.stdout).trim().to_owned())
-            .filter(|s| !s.is_empty())
+        let commit = brokk_bifrost_analysis::git_commit(root)?;
+        (!commit.is_empty()).then_some(commit)
     }
 
     #[derive(Serialize)]

@@ -1,6 +1,84 @@
+use super::super::facts::RecoveredRegion;
 use super::*;
 use crate::analyzer::content_identity::WorkspaceContentIdentity;
-use crate::query::QueryPathScope;
+use crate::analyzer::structural::resolution::EnvironmentAxis;
+use crate::query::{LanguageRule, QueryPathScope};
+use crate::structural::execution::plan::{
+    SourceEnumerationConstraint, source_file_matches_constraint,
+};
+
+pub(super) enum SeedFileScanStatus {
+    Scanned,
+    BudgetExhausted,
+    Cancelled,
+}
+
+pub(super) fn desired_seed_rows(
+    terminal_cap: Option<usize>,
+    state: &QueryExecutionState<'_>,
+    limits: CodeQueryExecutionLimits,
+    diagnostics: &mut Vec<CodeQueryDiagnostic>,
+) -> Option<usize> {
+    let budget_cap = limits
+        .max_pipeline_rows
+        .saturating_sub(state.budget.pipeline_rows);
+    let desired_rows = terminal_cap.unwrap_or(budget_cap).min(budget_cap);
+    if desired_rows == 0 {
+        push_pipeline_budget_diagnostic(diagnostics, &state.budget);
+        None
+    } else {
+        Some(desired_rows)
+    }
+}
+
+pub(super) fn empty_truncated_seed_execution() -> PlanExecution {
+    PlanExecution {
+        rows: Vec::new(),
+        truncated: true,
+        cancelled: false,
+        pipeline_halted: false,
+    }
+}
+
+pub(super) fn scan_seed_file(
+    state: &mut QueryExecutionState<'_>,
+    limits: CodeQueryExecutionLimits,
+    diagnostics: &mut Vec<CodeQueryDiagnostic>,
+) -> SeedFileScanStatus {
+    if state
+        .cancellation
+        .is_some_and(CancellationToken::is_cancelled)
+    {
+        return SeedFileScanStatus::Cancelled;
+    }
+    let mut projected = state.budget;
+    projected.scanned_files = projected.scanned_files.saturating_add(1);
+    if projected.scanned_files > limits.max_scanned_files {
+        push_budget_diagnostic(diagnostics, &projected);
+        return SeedFileScanStatus::BudgetExhausted;
+    }
+    state.budget.scanned_files = projected.scanned_files;
+    SeedFileScanStatus::Scanned
+}
+
+pub(super) fn record_seed_row(
+    rows: &mut Vec<PipelineRow>,
+    indexes: &mut HashMap<PipelineKey, usize>,
+    visited_rows: &mut usize,
+    state: &mut QueryExecutionState<'_>,
+    desired_rows: usize,
+    value: impl FnOnce() -> Option<PipelineValue>,
+) -> bool {
+    if *visited_rows >= desired_rows {
+        return false;
+    }
+    *visited_rows = (*visited_rows).saturating_add(1);
+    state.budget.pipeline_rows = state.budget.pipeline_rows.saturating_add(1);
+    if let Some(value) = value() {
+        insert_pipeline_row(rows, indexes, value, Vec::new(), false);
+    }
+    true
+}
 
 #[derive(Clone)]
 pub(super) enum SeedStructuralAccess {
@@ -574,40 +652,25 @@ pub(super) fn execute_occurrence_seed(
     limits: CodeQueryExecutionLimits,
     diagnostics: &mut Vec<CodeQueryDiagnostic>,
 ) -> PlanExecution {
-    let budget_cap = limits
-        .max_pipeline_rows
-        .saturating_sub(state.budget.pipeline_rows);
-    let desired_rows = terminal_cap.unwrap_or(budget_cap).min(budget_cap);
-    if desired_rows == 0 {
-        push_pipeline_budget_diagnostic(diagnostics, &state.budget);
-        return PlanExecution {
-            rows: Vec::new(),
-            truncated: true,
-            cancelled: false,
-            pipeline_halted: false,
-        };
-    }
+    let Some(desired_rows) = desired_seed_rows(terminal_cap, state, limits, diagnostics) else {
+        return empty_truncated_seed_execution();
+    };
 
     let files = seed_scan_files(state, &seed.languages, &seed.where_globs);
 
     let mut rows: Vec<PipelineRow> = Vec::new();
     let mut indexes: HashMap<PipelineKey, usize> = HashMap::default();
     let mut truncated = false;
+    let mut visited_rows = 0;
     for file in files {
-        if state
-            .cancellation
-            .is_some_and(CancellationToken::is_cancelled)
-        {
-            return cancelled_plan_execution();
+        match scan_seed_file(state, limits, diagnostics) {
+            SeedFileScanStatus::Scanned => {}
+            SeedFileScanStatus::BudgetExhausted => {
+                truncated = true;
+                break;
+            }
+            SeedFileScanStatus::Cancelled => return cancelled_plan_execution(),
         }
-        let mut projected = state.budget;
-        projected.scanned_files = projected.scanned_files.saturating_add(1);
-        if projected.scanned_files > limits.max_scanned_files {
-            push_budget_diagnostic(diagnostics, &projected);
-            truncated = true;
-            break;
-        }
-        state.budget.scanned_files = projected.scanned_files;
 
         let Some(result) = state.occurrence_cache.rows_for_file(
             state.analyzer,
@@ -621,7 +684,18 @@ pub(super) fn execute_occurrence_seed(
             .occurrence_cache
             .report_completeness(&file, &result, &seed.filter, diagnostics);
         for row in occurrences::select_rows(&result, &seed.filter) {
-            if rows.len() >= desired_rows {
+            if !record_seed_row(
+                &mut rows,
+                &mut indexes,
+                &mut visited_rows,
+                state,
+                desired_rows,
+                || {
+                    Some(PipelineValue::Occurrence(OccurrenceValue {
+                        row: Arc::new(row.clone()),
+                    }))
+                },
+            ) {
                 truncated = true;
                 diagnostics.push(CodeQueryDiagnostic {
                     code: CodeQueryDiagnosticCode::OccurrenceRowBudgetExhausted,
@@ -635,16 +709,6 @@ pub(super) fn execute_occurrence_seed(
                 });
                 break;
             }
-            state.budget.pipeline_rows = state.budget.pipeline_rows.saturating_add(1);
-            insert_pipeline_row(
-                &mut rows,
-                &mut indexes,
-                PipelineValue::Occurrence(OccurrenceValue {
-                    row: Arc::new(row.clone()),
-                }),
-                Vec::new(),
-                false,
-            );
         }
         if truncated {
             break;
@@ -680,19 +744,9 @@ pub(super) fn execute_environment_seed(
     limits: CodeQueryExecutionLimits,
     diagnostics: &mut Vec<CodeQueryDiagnostic>,
 ) -> PlanExecution {
-    let budget_cap = limits
-        .max_pipeline_rows
-        .saturating_sub(state.budget.pipeline_rows);
-    let desired_rows = terminal_cap.unwrap_or(budget_cap).min(budget_cap);
-    if desired_rows == 0 {
-        push_pipeline_budget_diagnostic(diagnostics, &state.budget);
-        return PlanExecution {
-            rows: Vec::new(),
-            truncated: true,
-            cancelled: false,
-            pipeline_halted: false,
-        };
-    }
+    let Some(desired_rows) = desired_seed_rows(terminal_cap, state, limits, diagnostics) else {
+        return empty_truncated_seed_execution();
+    };
 
     let files = seed_scan_files(state, languages, where_globs);
 
@@ -705,20 +759,14 @@ pub(super) fn execute_environment_seed(
     let mut truncated = false;
     let mut visited_rows = 0_usize;
     for file in files {
-        if state
-            .cancellation
-            .is_some_and(CancellationToken::is_cancelled)
-        {
-            return cancelled_plan_execution();
+        match scan_seed_file(state, limits, diagnostics) {
+            SeedFileScanStatus::Scanned => {}
+            SeedFileScanStatus::BudgetExhausted => {
+                truncated = true;
+                break;
+            }
+            SeedFileScanStatus::Cancelled => return cancelled_plan_execution(),
         }
-        let mut projected = state.budget;
-        projected.scanned_files = projected.scanned_files.saturating_add(1);
-        if projected.scanned_files > limits.max_scanned_files {
-            push_budget_diagnostic(diagnostics, &projected);
-            truncated = true;
-            break;
-        }
-        state.budget.scanned_files = projected.scanned_files;
 
         let result = state
             .environment_cache
@@ -758,7 +806,14 @@ pub(super) fn execute_environment_seed(
                 .collect(),
         };
         for (value, retain) in values {
-            if visited_rows >= desired_rows {
+            if !record_seed_row(
+                &mut rows,
+                &mut indexes,
+                &mut visited_rows,
+                state,
+                desired_rows,
+                || retain.then_some(value),
+            ) {
                 truncated = true;
                 diagnostics.push(CodeQueryDiagnostic {
                     code: CodeQueryDiagnosticCode::EnvironmentRowBudgetExhausted,
@@ -771,11 +826,6 @@ pub(super) fn execute_environment_seed(
                 exhausted_roots: Vec::new(),
                 });
                 break;
-            }
-            visited_rows = visited_rows.saturating_add(1);
-            state.budget.pipeline_rows = state.budget.pipeline_rows.saturating_add(1);
-            if retain {
-                insert_pipeline_row(&mut rows, &mut indexes, value, Vec::new(), false);
             }
         }
         if truncated {
@@ -810,19 +860,9 @@ pub(super) fn execute_materialization_seed(
     limits: CodeQueryExecutionLimits,
     diagnostics: &mut Vec<CodeQueryDiagnostic>,
 ) -> PlanExecution {
-    let budget_cap = limits
-        .max_pipeline_rows
-        .saturating_sub(state.budget.pipeline_rows);
-    let desired_rows = terminal_cap.unwrap_or(budget_cap).min(budget_cap);
-    if desired_rows == 0 {
-        push_pipeline_budget_diagnostic(diagnostics, &state.budget);
-        return PlanExecution {
-            rows: Vec::new(),
-            truncated: true,
-            cancelled: false,
-            pipeline_halted: false,
-        };
-    }
+    let Some(desired_rows) = desired_seed_rows(terminal_cap, state, limits, diagnostics) else {
+        return empty_truncated_seed_execution();
+    };
 
     let files = seed_scan_files(state, languages, where_globs);
 
@@ -833,21 +873,16 @@ pub(super) fn execute_materialization_seed(
     let mut rows: Vec<PipelineRow> = Vec::new();
     let mut indexes: HashMap<PipelineKey, usize> = HashMap::default();
     let mut truncated = false;
+    let mut visited_rows = 0;
     for file in files {
-        if state
-            .cancellation
-            .is_some_and(CancellationToken::is_cancelled)
-        {
-            return cancelled_plan_execution();
+        match scan_seed_file(state, limits, diagnostics) {
+            SeedFileScanStatus::Scanned => {}
+            SeedFileScanStatus::BudgetExhausted => {
+                truncated = true;
+                break;
+            }
+            SeedFileScanStatus::Cancelled => return cancelled_plan_execution(),
         }
-        let mut projected = state.budget;
-        projected.scanned_files = projected.scanned_files.saturating_add(1);
-        if projected.scanned_files > limits.max_scanned_files {
-            push_budget_diagnostic(diagnostics, &projected);
-            truncated = true;
-            break;
-        }
-        state.budget.scanned_files = projected.scanned_files;
 
         let result = state
             .materialization_cache
@@ -880,7 +915,14 @@ pub(super) fn execute_materialization_seed(
             }
         };
         for value in values {
-            if rows.len() >= desired_rows {
+            if !record_seed_row(
+                &mut rows,
+                &mut indexes,
+                &mut visited_rows,
+                state,
+                desired_rows,
+                || Some(value),
+            ) {
                 truncated = true;
                 diagnostics.push(CodeQueryDiagnostic {
                     code: CodeQueryDiagnosticCode::MaterializationRowBudgetExhausted,
@@ -894,8 +936,6 @@ pub(super) fn execute_materialization_seed(
                 });
                 break;
             }
-            state.budget.pipeline_rows = state.budget.pipeline_rows.saturating_add(1);
-            insert_pipeline_row(&mut rows, &mut indexes, value, Vec::new(), false);
         }
         if truncated {
             break;
@@ -919,40 +959,25 @@ pub(super) fn execute_path_seed(
     limits: CodeQueryExecutionLimits,
     diagnostics: &mut Vec<CodeQueryDiagnostic>,
 ) -> PlanExecution {
-    let budget_cap = limits
-        .max_pipeline_rows
-        .saturating_sub(state.budget.pipeline_rows);
-    let desired_rows = terminal_cap.unwrap_or(budget_cap).min(budget_cap);
-    if desired_rows == 0 {
-        push_pipeline_budget_diagnostic(diagnostics, &state.budget);
-        return PlanExecution {
-            rows: Vec::new(),
-            truncated: true,
-            cancelled: false,
-            pipeline_halted: false,
-        };
-    }
+    let Some(desired_rows) = desired_seed_rows(terminal_cap, state, limits, diagnostics) else {
+        return empty_truncated_seed_execution();
+    };
 
     let files = seed_scan_files(state, languages, where_globs);
 
     let mut rows: Vec<PipelineRow> = Vec::new();
     let mut indexes: HashMap<PipelineKey, usize> = HashMap::default();
     let mut truncated = false;
+    let mut visited_rows = 0;
     for file in files {
-        if state
-            .cancellation
-            .is_some_and(CancellationToken::is_cancelled)
-        {
-            return cancelled_plan_execution();
+        match scan_seed_file(state, limits, diagnostics) {
+            SeedFileScanStatus::Scanned => {}
+            SeedFileScanStatus::BudgetExhausted => {
+                truncated = true;
+                break;
+            }
+            SeedFileScanStatus::Cancelled => return cancelled_plan_execution(),
         }
-        let mut projected = state.budget;
-        projected.scanned_files = projected.scanned_files.saturating_add(1);
-        if projected.scanned_files > limits.max_scanned_files {
-            push_budget_diagnostic(diagnostics, &projected);
-            truncated = true;
-            break;
-        }
-        state.budget.scanned_files = projected.scanned_files;
 
         let Some(result) =
             state
@@ -982,7 +1007,14 @@ pub(super) fn execute_path_seed(
             })
             .collect();
         for value in values {
-            if rows.len() >= desired_rows {
+            if !record_seed_row(
+                &mut rows,
+                &mut indexes,
+                &mut visited_rows,
+                state,
+                desired_rows,
+                || Some(value),
+            ) {
                 truncated = true;
                 diagnostics.push(CodeQueryDiagnostic {
                     code: CodeQueryDiagnosticCode::EnvironmentRowBudgetExhausted,
@@ -996,8 +1028,6 @@ pub(super) fn execute_path_seed(
                 });
                 break;
             }
-            state.budget.pipeline_rows = state.budget.pipeline_rows.saturating_add(1);
-            insert_pipeline_row(&mut rows, &mut indexes, value, Vec::new(), false);
         }
         if truncated {
             break;
@@ -1011,14 +1041,151 @@ pub(super) fn execute_path_seed(
         pipeline_halted: false,
     }
 }
+/// Report a file whose recovered syntax could hide a node `seed` selects
+/// (#3777). The file is still searched: a row found in it is real, but no row
+/// is not a complete answer for it. Which regions count is
+/// [`RecoveredRegion::may_hide`]'s rule for the seed's selected kinds.
+fn push_recovered_syntax_diagnostic(
+    diagnostics: &mut Vec<CodeQueryDiagnostic>,
+    seed: &CodeQuerySeed,
+    language: Language,
+    file: &ProjectFile,
+    regions: &[RecoveredRegion],
+) {
+    let hiding = regions
+        .iter()
+        .filter(|region| region.may_hide(&seed.root.kinds))
+        .collect::<Vec<_>>();
+    if hiding.is_empty() {
+        return;
+    }
+    let selected = if seed.root.kinds.is_empty() {
+        "node of any kind".to_string()
+    } else {
+        let kinds = seed
+            .root
+            .kinds
+            .iter()
+            .map(|kind| format!("`{}`", kind.label()))
+            .collect::<Vec<_>>();
+        format!("{} node", kinds.join(" or "))
+    };
+    let reason = format!(
+        "parser error recovery may have left a selected {selected} without a structural fact, so the structural selection is incomplete for {}",
+        rel_path_string(file)
+    );
+    // One line per region, bounded so a policy report keeps the prose; the
+    // complete set is the file's recovered-region rows in the store.
+    let noun = if hiding.len() == 1 {
+        "recovered region"
+    } else {
+        "recovered regions"
+    };
+    let mut message = format!("{reason}: {} {noun}", hiding.len());
+    for (index, region) in hiding.iter().enumerate() {
+        let containment = match region.inside_callable {
+            Some(true) => "inside a callable",
+            Some(false) => "outside every callable",
+            None => "callable containment unanswered",
+        };
+        let line = format!(
+            "\n- lines {}-{}, bytes {}..{}, {containment}",
+            region.range.start_line,
+            region.range.end_line,
+            region.range.start_byte,
+            region.range.end_byte
+        );
+        let elision = format!("\n- [{} more]", hiding.len() - index);
+        if message.len() + line.len() + elision.len() > MAX_DIAGNOSTIC_LIST_MESSAGE_BYTES {
+            message.push_str(&elision);
+            break;
+        }
+        message.push_str(&line);
+    }
+    diagnostics.push(CodeQueryDiagnostic {
+        code: CodeQueryDiagnosticCode::RecoveredSyntaxIncomplete,
+        impact: CodeQueryDiagnosticImpact::Incomplete,
+        branch: Vec::new(),
+        language: language.config_label(),
+        message,
+        exhausted_roots: Vec::new(),
+    });
+}
+
+fn seed_constrains_comparison_pair_roles(seed: &CodeQuerySeed) -> bool {
+    let mut patterns = vec![&seed.root];
+    patterns.extend(seed.inside.iter());
+    patterns.extend(seed.inside_decl.iter());
+    patterns.extend(seed.not_inside.iter());
+    while let Some(pattern) = patterns.pop() {
+        let can_match_chain = pattern
+            .kinds
+            .iter()
+            .any(|kind| NormalizedKind::ComparisonChain.satisfies(*kind))
+            && !pattern
+                .not_kinds
+                .iter()
+                .any(|kind| NormalizedKind::ComparisonChain.satisfies(*kind));
+        if can_match_chain
+            && (pattern.left.is_some() || pattern.right.is_some() || pattern.operator.is_some())
+        {
+            return true;
+        }
+        patterns.extend(pattern.has.as_deref());
+        patterns.extend(pattern.local_value.as_deref());
+        patterns.extend(pattern.not_has.as_deref());
+        for &role in Role::single_target_roles() {
+            patterns.extend(pattern.single_role_pattern(role));
+        }
+        for &role in Role::list_target_roles() {
+            patterns.extend(pattern.list_role_patterns(role));
+        }
+        patterns.extend(pattern.kwargs.iter().map(|(_, nested)| nested));
+    }
+    false
+}
+
+fn push_comparison_chain_roles_diagnostic(
+    diagnostics: &mut Vec<CodeQueryDiagnostic>,
+    seed: &CodeQuerySeed,
+    language: Language,
+    file: &ProjectFile,
+    facts: &FileFacts,
+) {
+    if language != Language::Python || !seed_constrains_comparison_pair_roles(seed) {
+        return;
+    }
+    let ranges = facts
+        .nodes()
+        .iter()
+        .filter(|node| node.kind == NormalizedKind::ComparisonChain)
+        .map(|node| (node.range.start_byte, node.range.end_byte))
+        .collect::<Vec<_>>();
+    if ranges.is_empty() {
+        return;
+    }
+    diagnostics.push(CodeQueryDiagnostic {
+        code: CodeQueryDiagnosticCode::UnsupportedStructuralFeature,
+        impact: CodeQueryDiagnosticImpact::Incomplete,
+        branch: Vec::new(),
+        language: language.config_label(),
+        message: format!(
+            "Python comparison chains do not expose singular left/right/operator roles required by this query in {} at byte ranges {ranges:?}",
+            rel_path_string(file)
+        ),
+        exhausted_roots: Vec::new(),
+    });
+}
+
 pub(super) fn execute_seed(
     seed: &CodeQuerySeed,
+    source_enumeration_constraint: Option<SourceEnumerationConstraint>,
     terminal_cap: Option<usize>,
     state: &mut QueryExecutionState<'_>,
     limits: CodeQueryExecutionLimits,
     diagnostics: &mut Vec<CodeQueryDiagnostic>,
 ) -> PlanExecution {
-    let cache_key = seed.canonical_cache_key();
+    let cache_key = SeedCacheKey::new(seed, source_enumeration_constraint);
     let parallel_budget = state.parallel_seed_budget.clone();
     if parallel_budget.is_some() {
         debug_assert!(
@@ -1070,7 +1237,23 @@ pub(super) fn execute_seed(
     }
 
     let diagnostic_start = diagnostics.len();
-    let plan = QueryPlan::for_query(seed);
+    // Typed source relations are constraints on the root seed. The ordinary
+    // matcher still verifies the root kind and all other pattern fields,
+    // while the relation evaluator supplies exact AST spans. Clear the fields
+    // in the private matcher copy so they cannot affect generic structural
+    // planning or be silently treated as ordinary predicates.
+    let language_rule = seed.root.language_rule;
+    let body_state = seed.root.body_state;
+    let body_owner = seed.root.body_owner;
+    let modifier = seed.root.modifier;
+    let body_relation = body_state.is_some() || body_owner.is_some();
+    let has_custom_rule = language_rule.is_some() || body_relation || modifier.is_some();
+    let mut matcher_seed = seed.clone();
+    matcher_seed.root.language_rule = None;
+    matcher_seed.root.body_state = None;
+    matcher_seed.root.body_owner = None;
+    matcher_seed.root.modifier = None;
+    let plan = QueryPlan::for_query(&matcher_seed);
     let analyzer = state.analyzer;
     let mut providers = analyzer.structural_fact_providers();
     providers.sort_by_key(|provider| provider.structural_language());
@@ -1088,6 +1271,9 @@ pub(super) fn execute_seed(
         workspace_files_for_scope(state, &mut owned_workspace_files)
     };
     let mut scoped_languages = BTreeSet::new();
+    // Missing-adapter diagnostics describe the selected source scope. Keep
+    // the typed dialect boundary here, while the provider loop below retains
+    // its language-based `explicitly_requested` gate for unsupported features.
     for file in workspace_files {
         if state
             .cancellation
@@ -1102,7 +1288,10 @@ pub(super) fn execute_seed(
         }
         let language = crate::analyzer::common::language_for_file(file);
         let requested = seed.languages.is_empty() || seed.languages.contains(&language);
-        if requested && file_matches_globs(file, seed) {
+        if requested
+            && file_matches_globs(file, seed)
+            && source_file_matches_constraint(file, source_enumeration_constraint)
+        {
             scoped_languages.insert(language);
         }
     }
@@ -1145,10 +1334,18 @@ pub(super) fn execute_seed(
                 state,
                 Some(index),
             );
-            let mut files = match &access {
-                SeedStructuralAccess::Indexed { candidates, .. } => {
-                    candidates.files().cloned().collect()
-                }
+            let mut files: Vec<ProjectFile> = match &access {
+                // A node that syntax recovery removed has no posting, so the
+                // candidate files cannot name a file whose recovered regions
+                // may hide the selection. The loop below reports such a file
+                // before it skips it for having no candidates (#3777).
+                SeedStructuralAccess::Indexed {
+                    index, candidates, ..
+                } => candidates
+                    .files()
+                    .chain(index.files_with_recovered_regions())
+                    .cloned()
+                    .collect(),
                 SeedStructuralAccess::Scan => {
                     let (mut files, _) =
                         provider_scope_files(state, provider, language, workspace_files);
@@ -1156,13 +1353,17 @@ pub(super) fn execute_seed(
                     files
                 }
             };
+            files
+                .retain(|file| source_file_matches_constraint(file, source_enumeration_constraint));
             files.sort();
+            files.dedup();
             provider_scopes.push((language, provider, files, access));
             continue;
         }
         let (mut files, provider_file_count) =
             provider_scope_files(state, provider, language, workspace_files);
         files.retain(|file| file_matches_globs(file, seed));
+        files.retain(|file| source_file_matches_constraint(file, source_enumeration_constraint));
         files.sort();
         if !files.is_empty() || explicitly_requested {
             diagnostics.extend(unsupported_features());
@@ -1261,6 +1462,13 @@ pub(super) fn execute_seed(
         } else {
             None
         };
+        let custom_source = if has_custom_rule && source.is_none() {
+            provider
+                .structural_source(&file)
+                .or_else(|| analyzer.indexed_source(&file))
+        } else {
+            None
+        };
         if source_index.requires_source() && !source_definitely_absent && source.is_none() {
             push_seed_provider_omission(diagnostics, language, &file, "indexed source snapshot");
             truncated = true;
@@ -1327,10 +1535,24 @@ pub(super) fn execute_seed(
             continue;
         }
         let candidate_ids = access.candidate_facts(&file);
+        // A node that syntax recovery removed has no posting, so the index
+        // cannot say the file holds none; report before skipping it.
+        if let Some(indexed) = indexed_file {
+            push_recovered_syntax_diagnostic(
+                diagnostics,
+                seed,
+                language,
+                &file,
+                &indexed.recovered_regions,
+            );
+        }
         // A sound candidate relation with no facts in this file means the
         // matcher will examine nothing here: skip before charging fact-node
         // budget for work that will not happen.
-        if indexed_file.is_some() && candidate_ids.is_some_and(|ids| ids.is_empty()) {
+        if indexed_file.is_some()
+            && candidate_ids.is_some_and(|ids| ids.is_empty())
+            && !has_custom_rule
+        {
             continue;
         }
         let mut facts = None;
@@ -1349,6 +1571,13 @@ pub(super) fn execute_seed(
                 cache_complete = cache_complete.map(|_| false);
                 continue;
             };
+            push_recovered_syntax_diagnostic(
+                diagnostics,
+                seed,
+                language,
+                &file,
+                loaded.recovered_regions(),
+            );
             let count = loaded.work_item_count();
             if let Some(profile) = &mut state.profile {
                 profile.access_path.materialized_files =
@@ -1368,7 +1597,16 @@ pub(super) fn execute_seed(
             }
             count
         };
-        let selected_facts = candidate_ids.unwrap_or(&[]);
+        let custom_candidate_ids = has_custom_rule.then(|| {
+            let node_count = facts
+                .as_ref()
+                .map_or(fact_nodes, |facts| facts.nodes().len());
+            (0..u32::try_from(node_count).expect("FileFacts node ids fit in u32"))
+                .collect::<Vec<_>>()
+        });
+        let selected_facts = custom_candidate_ids
+            .as_deref()
+            .unwrap_or_else(|| candidate_ids.unwrap_or(&[]));
         // Posting-based access examines only the selected candidates plus the
         // facts the verifier actually walks, so charge that work instead of
         // the whole file: the candidates now, the verifier walk after
@@ -1491,7 +1729,78 @@ pub(super) fn execute_seed(
                 loaded
             }
         };
-        let remaining = match_cap.saturating_sub(pending.len());
+        push_comparison_chain_roles_diagnostic(diagnostics, seed, language, &file, &facts);
+        let remaining = if has_custom_rule {
+            facts.nodes().len()
+        } else {
+            match_cap.saturating_sub(pending.len())
+        };
+        let custom_ranges = if let Some(rule) = language_rule {
+            source
+                .as_deref()
+                .or(custom_source.as_deref())
+                .map(|relation_source| {
+                    let result = match (language, rule) {
+                        (Language::Cpp, LanguageRule::Cpp(rule)) => {
+                            cpp_language_rules::matches_for_file(
+                                analyzer,
+                                &file,
+                                relation_source,
+                                rule,
+                            )
+                        }
+                        (Language::CSharp, LanguageRule::CSharp(rule)) => {
+                            csharp_language_rules::matches_for_file(
+                                analyzer,
+                                &file,
+                                relation_source,
+                                rule,
+                            )
+                        }
+                        (Language::Java, LanguageRule::Java(rule)) => {
+                            java_language_rules::matches_for_file(
+                                analyzer,
+                                &file,
+                                relation_source,
+                                rule,
+                            )
+                        }
+                        (Language::JavaScript | Language::TypeScript, LanguageRule::Js(rule)) => {
+                            js_language_rules::matches_for_file(
+                                analyzer,
+                                &file,
+                                relation_source,
+                                rule,
+                            )
+                        }
+                        _ => super::language_rules::LanguageRuleMatches::default(),
+                    };
+                    diagnostics.extend(result.diagnostics);
+                    result.ranges
+                })
+        } else if let Some(state) = body_state {
+            source
+                .as_deref()
+                .or(custom_source.as_deref())
+                .map(|relation_source| {
+                    body_relations::matches_for_file(
+                        &file,
+                        relation_source,
+                        language,
+                        state,
+                        body_owner,
+                    )
+                })
+        } else if let Some(modifier) = modifier {
+            source
+                .as_deref()
+                .or(custom_source.as_deref())
+                .map(|relation_source| {
+                    modifier_relations::matches_for_file(&file, relation_source, language, modifier)
+                })
+        } else {
+            None
+        };
         let signature_oracle = seed.constrains_callable_signature().then(|| {
             super::relations::FileCallableSignatureOracle::for_file(state.analyzer, &file)
         });
@@ -1503,15 +1812,50 @@ pub(super) fn execute_seed(
         let owner_oracle = owner_oracle
             .as_ref()
             .map(|oracle| oracle as &dyn super::super::matcher::DeclarationOwnerOracle);
+        let local_value_oracle = if seed.constrains_local_value() && language == Language::Python {
+            let environment = state
+                .environment_cache
+                .environment_for(state.analyzer, &file);
+            state.environment_cache.report_completeness(
+                &file,
+                &environment,
+                &[EnvironmentAxis::Scopes, EnvironmentAxis::BindingIntervals],
+                diagnostics,
+            );
+            let dynamic_scope_calls = state
+                .environment_cache
+                .python_dynamic_scope_calls(state.analyzer, &file);
+            state
+                .environment_cache
+                .python_variable_index_for(
+                    &file,
+                    facts.source_identity(),
+                    facts.source(),
+                    &environment,
+                )
+                .map(|index| {
+                    super::python_variables::local_value_oracle(
+                        &index,
+                        &facts,
+                        &dynamic_scope_calls,
+                    )
+                })
+        } else {
+            None
+        };
+        let local_value_oracle = local_value_oracle
+            .as_ref()
+            .map(|oracle| oracle as &dyn super::super::matcher::LocalValueOracle);
         let matches = if indexed_file.is_some() {
             let mut examined = 0u64;
             let matches = super::super::matcher::match_query_candidates(
-                seed,
+                &matcher_seed,
                 &facts,
                 selected_facts.iter().copied(),
                 remaining,
                 &mut examined,
                 oracle,
+                local_value_oracle,
                 owner_oracle,
                 &signature_incomplete,
             );
@@ -1565,15 +1909,21 @@ pub(super) fn execute_seed(
             }
             let mut examined = 0u64;
             super::super::matcher::match_query_candidates(
-                seed,
+                &matcher_seed,
                 &facts,
                 0..u32::try_from(facts.nodes().len()).expect("FileFacts node ids fit in u32"),
                 remaining,
                 &mut examined,
                 oracle,
+                local_value_oracle,
                 owner_oracle,
                 &signature_incomplete,
             )
+        };
+        let matches = if let Some(ranges) = &custom_ranges {
+            language_rule_matches(&facts, matches, ranges)
+        } else {
+            matches
         };
         if let Some(lease) = &parallel_budget {
             for fact_match in matches {
@@ -1630,6 +1980,39 @@ pub(super) fn execute_seed(
         exhausted_roots: Vec::new(),
         });
     }
+    if signature_incomplete
+        .duplicate_dictionary_key_unrecorded
+        .get()
+    {
+        diagnostics.push(CodeQueryDiagnostic {
+            code: CodeQueryDiagnosticCode::UnsupportedStructuralFeature,
+            impact: CodeQueryDiagnosticImpact::Incomplete,
+            branch: Vec::new(),
+            language: "workspace",
+            message: "duplicate dictionary-key equality is incomplete because at least one Python key form is unsupported".to_string(),
+            exhausted_roots: Vec::new(),
+        });
+    }
+    if signature_incomplete.string_literal_value_unrecorded.get() {
+        diagnostics.push(CodeQueryDiagnostic {
+            code: CodeQueryDiagnosticCode::UnsupportedStructuralFeature,
+            impact: CodeQueryDiagnosticImpact::Incomplete,
+            branch: Vec::new(),
+            language: "workspace",
+            message: "decoded string-value comparison is incomplete because at least one selected value is non-literal or has an unsupported Python escape form".to_string(),
+            exhausted_roots: Vec::new(),
+        });
+    }
+    if signature_incomplete.local_value_unresolved.get() {
+        diagnostics.push(CodeQueryDiagnostic {
+            code: CodeQueryDiagnosticCode::UnsupportedStructuralFeature,
+            impact: CodeQueryDiagnosticImpact::Incomplete,
+            branch: Vec::new(),
+            language: "python",
+            message: "Python local-value matching could not prove a unique unconditional assignment and exact normalized RHS for at least one selected variable read".to_string(),
+            exhausted_roots: Vec::new(),
+        });
+    }
     if selected_index_content
         .iter()
         .any(|content| !state.analyzer.workspace_content_matches(*content))
@@ -1665,6 +2048,7 @@ pub(super) fn execute_seed(
                 file,
                 facts,
                 fact_match,
+                python_import: None,
             });
             PipelineRow {
                 value: PipelineValue::StructuralMatch(Arc::clone(&seed)),
@@ -1706,4 +2090,34 @@ pub(super) fn execute_seed(
         cancelled: false,
         pipeline_halted: false,
     }
+}
+
+/// Retain the normalized roots selected by a language relation and carry its
+/// exact source span into rendering. Most relations select the root fact
+/// itself; declaration/type-shape relations may select a nested AST node that
+/// the language-neutral vocabulary does not represent as a fact.
+fn language_rule_matches(
+    facts: &FileFacts,
+    matches: Vec<FactMatch>,
+    ranges: &[Range],
+) -> Vec<FactMatch> {
+    ranges
+        .iter()
+        .filter_map(|range| {
+            let mut fact_match = matches
+                .iter()
+                .filter(|fact_match| range_contains(facts.node(fact_match.node).range, *range))
+                .min_by_key(|fact_match| {
+                    let fact = facts.node(fact_match.node).range;
+                    fact.end_byte.saturating_sub(fact.start_byte)
+                })
+                .cloned()?;
+            fact_match.reported_range = Some(*range);
+            Some(fact_match)
+        })
+        .collect()
+}
+
+fn range_contains(outer: Range, inner: Range) -> bool {
+    outer.start_byte <= inner.start_byte && inner.end_byte <= outer.end_byte
 }

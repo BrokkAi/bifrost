@@ -14,8 +14,8 @@ pub use brokk_bifrost_core::cache_gc::{
 // in both planner-statistics states (issue #3016).
 #[cfg(any(test, feature = "test-support"))]
 pub use brokk_bifrost_core::cache_gc::{
-    GcTuningGuard, PlannerStatisticsState, set_accounting_for_test, set_tuning_for_test,
-    total_blob_count_for_test,
+    GcTuningGuard, PlannerStatisticsState, gc_accounting_for_test, set_accounting_for_test,
+    set_tuning_for_test, total_blob_count_for_test,
 };
 
 use brokk_bifrost_core::cache_gc::{force_gc, maybe_gc};

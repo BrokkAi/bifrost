@@ -6,6 +6,18 @@ WITH RECURSIVE exposed(topology_id, crate_key, module_path, namespace, name,
   SELECT exports.topology_id, owner.crate_key, exports.module_path,
          exports.namespace, exports.name, exports.visibility, 0
   FROM rust_crate_exports AS exports INDEXED BY rust_crate_exports_declaration
+  -- Content-identical blobs retain their selected physical declaration mount.
+  -- `#[macro_export]` publishes at the crate root even when its declaration
+  -- blob is mounted under a nested module container. Keep that exact
+  -- declaration in the reverse seed; the macro export row already supplies
+  -- the canonical crate-root route.
+  CROSS JOIN rust_crate_container_sources AS source
+    INDEXED BY rust_crate_containers_path
+    ON source.topology_id=exports.topology_id
+   AND source.rel_path=?3
+   AND (source.container_path=exports.module_path
+        OR (exports.namespace='macro' AND exports.module_path='crate'))
+   AND source.blob_id=exports.declaration_blob_id
   CROSS JOIN selected_rust_crates AS owner
     ON owner.topology_id = exports.topology_id
   WHERE exports.declaration_blob_id = ?1 AND exports.declaration_site = ?2

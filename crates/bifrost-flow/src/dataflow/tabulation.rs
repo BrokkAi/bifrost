@@ -98,7 +98,11 @@ where
     Fact: Copy + Eq + std::hash::Hash,
 {
     fn should_continue(&self) -> bool {
-        !self.cancellation.is_cancelled() && self.invalid_node.is_none() && self.exceeded.is_none()
+        super::should_continue(
+            self.cancellation,
+            self.invalid_node.is_some(),
+            self.exceeded.is_some(),
+        )
     }
 
     fn emit(&mut self, seed: DataflowSeed<Fact>) -> bool {
@@ -118,20 +122,12 @@ where
         if self.exceeded.is_some() {
             return false;
         }
-        if self.values.contains(&seed) {
-            return true;
-        }
-
-        let callback_rows = self.values.len().saturating_add(1);
-        if let Err(exceeded) = self.budget.check(SolverWork {
-            callback_rows,
-            ..SolverWork::uniform(0)
-        }) {
+        if let Err(exceeded) =
+            super::emit_bounded_callback_output(&mut self.values, seed, self.budget)
+        {
             self.exceeded = Some(exceeded);
             return false;
         }
-
-        self.values.insert(seed);
         true
     }
 }
@@ -172,29 +168,10 @@ where
     where
         P: BoundedSnapshotDataflowProblem<Fact = Fact>,
     {
-        if request.cancellation.is_cancelled() {
-            return Ok(Some(SolverTermination::Cancelled));
-        }
-
-        let zero_fact = problem.zero_fact();
-        let (invalid_node, sink_exceeded, emitted_seeds) = {
-            let mut seed_outputs =
-                BoundedSeedOutputs::new(self.snapshot, request.budget, request.cancellation);
-            problem.seeds(&mut seed_outputs);
-            let invalid_node = seed_outputs.invalid_node();
-            let exceeded = seed_outputs.exceeded();
-            (invalid_node, exceeded, seed_outputs.into_values())
-        };
-
-        if request.cancellation.is_cancelled() {
-            return Ok(Some(SolverTermination::Cancelled));
-        }
-        self.initialize_seed_values(
-            zero_fact,
-            invalid_node,
-            sink_exceeded,
-            emitted_seeds,
+        self.initialize_with_seeds(
             request,
+            || problem.zero_fact(),
+            |seeds| problem.seeds(seeds),
         )
     }
 
@@ -206,15 +183,28 @@ where
     where
         P: BoundedSnapshotBackwardDataflowProblem<Fact = Fact>,
     {
+        self.initialize_with_seeds(
+            request,
+            || problem.zero_fact(),
+            |seeds| problem.backward_seeds(seeds),
+        )
+    }
+
+    fn initialize_with_seeds(
+        &mut self,
+        request: &mut DataflowRequest<'_>,
+        zero_fact: impl FnOnce() -> Fact,
+        emit_seeds: impl FnOnce(&mut dyn DataflowOutput<DataflowSeed<Fact>>),
+    ) -> Result<Option<SolverTermination>, DataflowError> {
         if request.cancellation.is_cancelled() {
             return Ok(Some(SolverTermination::Cancelled));
         }
 
-        let zero_fact = problem.zero_fact();
+        let zero_fact = zero_fact();
         let (invalid_node, sink_exceeded, emitted_seeds) = {
             let mut seed_outputs =
                 BoundedSeedOutputs::new(self.snapshot, request.budget, request.cancellation);
-            problem.backward_seeds(&mut seed_outputs);
+            emit_seeds(&mut seed_outputs);
             let invalid_node = seed_outputs.invalid_node();
             let exceeded = seed_outputs.exceeded();
             (invalid_node, exceeded, seed_outputs.into_values())
@@ -525,6 +515,32 @@ where
     }
 }
 
+fn solve_with_callbacks<'graph, Fact>(
+    input: IcfgSolveInput<'graph>,
+    request: &mut DataflowRequest<'_>,
+    initialize: impl FnOnce(
+        &mut TabulationState<'graph, Fact>,
+        &mut DataflowRequest<'_>,
+    ) -> Result<Option<SolverTermination>, DataflowError>,
+    propagate: impl FnOnce(
+        &mut TabulationState<'graph, Fact>,
+        &mut DataflowRequest<'_>,
+    ) -> Result<SolverTermination, DataflowError>,
+) -> Result<DataflowResult<Fact>, DataflowError>
+where
+    Fact: Copy + Eq + std::hash::Hash + Ord,
+{
+    let initial_work = request.budget.used();
+    let mut state = TabulationState::new(input.snapshot());
+    let termination = if let Some(termination) = initialize(&mut state, request)? {
+        termination
+    } else {
+        propagate(&mut state, request)?
+    };
+    let work = request.budget.used().saturating_sub(initial_work);
+    Ok(state.finish(input.status(), termination, work))
+}
+
 /// Solve one finite distributive may-data-flow problem over an already
 /// materialized bounded ICFG snapshot.
 ///
@@ -540,16 +556,12 @@ pub fn solve_on_snapshot<P>(
 where
     P: BoundedSnapshotDataflowProblem,
 {
-    let initial_work = request.budget.used();
-    let mut state = TabulationState::new(input.snapshot());
-
-    let termination = if let Some(termination) = state.initialize(problem, request)? {
-        termination
-    } else {
-        state.propagate(problem, request)?
-    };
-    let work = request.budget.used().saturating_sub(initial_work);
-    Ok(state.finish(input.status(), termination, work))
+    solve_with_callbacks::<P::Fact>(
+        input,
+        request,
+        |state, request| state.initialize(problem, request),
+        |state, request| state.propagate(problem, request),
+    )
 }
 
 /// Solve one finite distributive may-data-flow problem over a bounded ICFG.
@@ -585,16 +597,12 @@ pub fn solve_backward_on_snapshot<P>(
 where
     P: BoundedSnapshotBackwardDataflowProblem,
 {
-    let initial_work = request.budget.used();
-    let mut state = TabulationState::new(input.snapshot());
-
-    let termination = if let Some(termination) = state.initialize_backward(problem, request)? {
-        termination
-    } else {
-        state.propagate_backward(problem, request)?
-    };
-    let work = request.budget.used().saturating_sub(initial_work);
-    Ok(state.finish(input.status(), termination, work))
+    solve_with_callbacks::<P::Fact>(
+        input,
+        request,
+        |state, request| state.initialize_backward(problem, request),
+        |state, request| state.propagate_backward(problem, request),
+    )
 }
 
 /// Solve one finite distributive predecessor relation over a bounded ICFG.

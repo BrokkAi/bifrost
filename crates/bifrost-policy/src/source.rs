@@ -298,7 +298,7 @@ pub(crate) fn parse_rqlp_source_with_context(
     Decoder::new(identity).decode_document_with_context(&expr, context)
 }
 
-fn parse_rqlp_expr(source: &str) -> Result<Expr, PolicySourceError> {
+pub(crate) fn parse_rqlp_expr(source: &str) -> Result<Expr, PolicySourceError> {
     if source.len() > MAX_RQLP_SOURCE_BYTES {
         return Err(source_error(
             "source-too-large",
@@ -360,6 +360,8 @@ pub fn rqlp_source_help_at(source: &str, byte_offset: usize) -> Option<PolicySou
     if source.len() > MAX_RQLP_SOURCE_BYTES || byte_offset > source.len() {
         return None;
     }
+    // Editor help inspects partial buffers; the document parser rejects
+    // recoverable incomplete forms that still have a useful tree.
     let parsed = parse_sexp_with_limits(
         source,
         SexpParseLimits::new(MAX_RQLP_SEXP_DEPTH, MAX_RQLP_SEXP_NODES),
@@ -379,6 +381,8 @@ pub fn rqlp_source_completion_at(
     {
         return None;
     }
+    // Editor completion inspects partial buffers; the document parser rejects
+    // recoverable incomplete forms that still have a useful tree.
     let parsed = parse_sexp_with_limits(
         source,
         SexpParseLimits::new(MAX_RQLP_SEXP_DEPTH, MAX_RQLP_SEXP_NODES),
@@ -388,7 +392,7 @@ pub fn rqlp_source_completion_at(
     completion_in_expr(&expr, byte_offset)
 }
 
-fn source_error(
+pub(crate) fn source_error(
     code: &'static str,
     range: Range<usize>,
     message: impl Into<String>,
@@ -1635,6 +1639,7 @@ impl Decoder {
                 .map(|value| self.decode_call_modeling(value, PolicyAnalysisKind::Flow))
                 .transpose()?
                 .unwrap_or_default(),
+            threat_models: Vec::new(),
             sources: origins,
             sinks: observations,
             sanitizers: kills,
@@ -1660,26 +1665,13 @@ impl Decoder {
             false,
             path,
         )?;
-        let mut entries = Vec::with_capacity(parts.entries.len());
-        let mut ids = HashSet::with_capacity(parts.entries.len());
-        for entry in &parts.entries {
-            let value = self.decode_flow_origin(entry, path)?;
-            if !ids.insert(value.id.as_str().to_string()) {
-                return Err(source_error(
-                    "duplicate-entry-id",
-                    entry.range.clone(),
-                    format!("duplicate origin ID `{}`", value.id),
-                ));
-            }
-            entries.push(value);
-        }
-        entries.sort_by(|left, right| left.id.as_str().cmp(right.id.as_str()));
-        Ok(TaintEndpointSet {
-            include_sets: parts.include_sets,
-            include_matches: parts.include_matches,
-            include_files: parts.include_files,
-            entries,
-        })
+        self.decode_taint_endpoint_set(
+            parts,
+            path,
+            Self::decode_flow_origin,
+            |value: &TaintSourceSpec| value.id.as_str(),
+            |value| format!("duplicate origin ID `{}`", value.id),
+        )
     }
 
     fn decode_flow_observation_set(
@@ -1694,26 +1686,13 @@ impl Decoder {
             false,
             path,
         )?;
-        let mut entries = Vec::with_capacity(parts.entries.len());
-        let mut ids = HashSet::with_capacity(parts.entries.len());
-        for entry in &parts.entries {
-            let value = self.decode_flow_observation(entry, path)?;
-            if !ids.insert(value.id.as_str().to_string()) {
-                return Err(source_error(
-                    "duplicate-entry-id",
-                    entry.range.clone(),
-                    format!("duplicate observation ID `{}`", value.id),
-                ));
-            }
-            entries.push(value);
-        }
-        entries.sort_by(|left, right| left.id.as_str().cmp(right.id.as_str()));
-        Ok(TaintEndpointSet {
-            include_sets: parts.include_sets,
-            include_matches: parts.include_matches,
-            include_files: parts.include_files,
-            entries,
-        })
+        self.decode_taint_endpoint_set(
+            parts,
+            path,
+            Self::decode_flow_observation,
+            |value: &TaintSinkSpec| value.id.as_str(),
+            |value| format!("duplicate observation ID `{}`", value.id),
+        )
     }
 
     fn decode_flow_kill_set(
@@ -1728,26 +1707,13 @@ impl Decoder {
             false,
             path,
         )?;
-        let mut entries = Vec::with_capacity(parts.entries.len());
-        let mut ids = HashSet::with_capacity(parts.entries.len());
-        for entry in &parts.entries {
-            let value = self.decode_flow_kill(entry, path)?;
-            if !ids.insert(value.id.as_str().to_string()) {
-                return Err(source_error(
-                    "duplicate-entry-id",
-                    entry.range.clone(),
-                    format!("duplicate kill ID `{}`", value.id),
-                ));
-            }
-            entries.push(value);
-        }
-        entries.sort_by(|left, right| left.id.as_str().cmp(right.id.as_str()));
-        Ok(TaintEndpointSet {
-            include_sets: parts.include_sets,
-            include_matches: parts.include_matches,
-            include_files: parts.include_files,
-            entries,
-        })
+        self.decode_taint_endpoint_set(
+            parts,
+            path,
+            Self::decode_flow_kill,
+            |value: &TaintSanitizerSpec| value.id.as_str(),
+            |value| format!("duplicate kill ID `{}`", value.id),
+        )
     }
 
     fn decode_flow_transform_set(
@@ -1762,26 +1728,13 @@ impl Decoder {
             false,
             path,
         )?;
-        let mut entries = Vec::with_capacity(parts.entries.len());
-        let mut ids = HashSet::with_capacity(parts.entries.len());
-        for entry in &parts.entries {
-            let value = self.decode_flow_transform(entry, path)?;
-            if !ids.insert(value.id.as_str().to_string()) {
-                return Err(source_error(
-                    "duplicate-entry-id",
-                    entry.range.clone(),
-                    format!("duplicate transform ID `{}`", value.id),
-                ));
-            }
-            entries.push(value);
-        }
-        entries.sort_by(|left, right| left.id.as_str().cmp(right.id.as_str()));
-        Ok(TaintEndpointSet {
-            include_sets: parts.include_sets,
-            include_matches: parts.include_matches,
-            include_files: parts.include_files,
-            entries,
-        })
+        self.decode_taint_endpoint_set(
+            parts,
+            path,
+            Self::decode_flow_transform,
+            |value: &TaintTransformSpec| value.id.as_str(),
+            |value| format!("duplicate transform ID `{}`", value.id),
+        )
     }
 
     fn decode_flow_origin(
@@ -1791,27 +1744,23 @@ impl Decoder {
     ) -> Result<TaintSourceSpec, PolicySourceError> {
         let context = DecodeContext::policy(PolicyAnalysisKind::Flow);
         let fields = RecordCursor::parse(expr, PolicyRecord::Origin, context)?;
-        let id: TaintEntryId = parse_identifier(fields.required("id"), "origin ID")?;
-        self.register_local_taint_entry(&id, fields.required("id"))?;
-        let selector_path = format!(
-            "{path}/entries/{}/selector",
-            json_pointer_segment(id.as_str())
-        );
+        let (id, selector_path) = self.decode_local_taint_entry(&fields, path, "origin ID")?;
+        let display_name = expect_string(
+            fields.required("display-name"),
+            "origin display name",
+            MAX_DISPLAY_TEXT_BYTES,
+        )?;
+        let categories = vec![flow_internal_category()];
+        let (selector, bind) =
+            self.decode_selector_and_port(&fields, context, &selector_path, "bind")?;
         Ok(TaintSourceSpec {
             id,
-            display_name: expect_string(
-                fields.required("display-name"),
-                "origin display name",
-                MAX_DISPLAY_TEXT_BYTES,
-            )?,
-            categories: vec![flow_internal_category()],
-            selector: self.decode_selector(fields.required("selector"), context, &selector_path)?,
-            bind: decoded_binding_to_port(decode_binding(
-                fields.required("bind"),
-                context,
-                PolicyValueShape::PolicyPort,
-            )?),
+            display_name,
+            categories,
+            selector,
+            bind,
             labels: vec![flow_internal_label()],
+            threat_model: None,
             evidence: None,
         })
     }
@@ -1823,26 +1772,21 @@ impl Decoder {
     ) -> Result<TaintSinkSpec, PolicySourceError> {
         let context = DecodeContext::policy(PolicyAnalysisKind::Flow);
         let fields = RecordCursor::parse(expr, PolicyRecord::Observation, context)?;
-        let id: TaintEntryId = parse_identifier(fields.required("id"), "observation ID")?;
-        self.register_local_taint_entry(&id, fields.required("id"))?;
-        let selector_path = format!(
-            "{path}/entries/{}/selector",
-            json_pointer_segment(id.as_str())
-        );
+        let (id, selector_path) = self.decode_local_taint_entry(&fields, path, "observation ID")?;
+        let display_name = expect_string(
+            fields.required("display-name"),
+            "observation display name",
+            MAX_DISPLAY_TEXT_BYTES,
+        )?;
+        let categories = vec![flow_internal_category()];
+        let (selector, dangerous_operand) =
+            self.decode_selector_and_port(&fields, context, &selector_path, "observed-operand")?;
         Ok(TaintSinkSpec {
             id,
-            display_name: expect_string(
-                fields.required("display-name"),
-                "observation display name",
-                MAX_DISPLAY_TEXT_BYTES,
-            )?,
-            categories: vec![flow_internal_category()],
-            selector: self.decode_selector(fields.required("selector"), context, &selector_path)?,
-            dangerous_operand: decoded_binding_to_port(decode_binding(
-                fields.required("observed-operand"),
-                context,
-                PolicyValueShape::PolicyPort,
-            )?),
+            display_name,
+            categories,
+            selector,
+            dangerous_operand,
             accepts: vec![flow_internal_label()],
             tags: Vec::new(),
             impacts: Vec::new(),
@@ -1856,25 +1800,14 @@ impl Decoder {
     ) -> Result<TaintSanitizerSpec, PolicySourceError> {
         let context = DecodeContext::policy(PolicyAnalysisKind::Flow);
         let fields = RecordCursor::parse(expr, PolicyRecord::Kill, context)?;
-        let id: TaintEntryId = parse_identifier(fields.required("id"), "kill ID")?;
-        self.register_local_taint_entry(&id, fields.required("id"))?;
-        let selector_path = format!(
-            "{path}/entries/{}/selector",
-            json_pointer_segment(id.as_str())
-        );
+        let (id, selector_path) = self.decode_local_taint_entry(&fields, path, "kill ID")?;
+        let (selector, input, output) =
+            self.decode_selector_input_output(&fields, context, &selector_path)?;
         Ok(TaintSanitizerSpec {
             id,
-            selector: self.decode_selector(fields.required("selector"), context, &selector_path)?,
-            input: decoded_binding_to_port(decode_binding(
-                fields.required("input"),
-                context,
-                PolicyValueShape::PolicyPort,
-            )?),
-            output: decoded_binding_to_port(decode_binding(
-                fields.required("output"),
-                context,
-                PolicyValueShape::PolicyPort,
-            )?),
+            selector,
+            input,
+            output,
             removes: vec![flow_internal_label()],
         })
     }
@@ -1886,28 +1819,56 @@ impl Decoder {
     ) -> Result<TaintTransformSpec, PolicySourceError> {
         let context = DecodeContext::policy(PolicyAnalysisKind::Flow);
         let fields = RecordCursor::parse(expr, PolicyRecord::TransformEntry, context)?;
-        let id: TaintEntryId = parse_identifier(fields.required("id"), "transform ID")?;
+        let (id, selector_path) = self.decode_local_taint_entry(&fields, path, "transform ID")?;
+        let (selector, input, output) =
+            self.decode_selector_input_output(&fields, context, &selector_path)?;
+        Ok(TaintTransformSpec {
+            id,
+            selector,
+            input,
+            output,
+            removes: Vec::new(),
+            adds: Vec::new(),
+        })
+    }
+
+    fn decode_local_taint_entry(
+        &mut self,
+        fields: &RecordCursor<'_>,
+        path: &str,
+        id_description: &str,
+    ) -> Result<(TaintEntryId, String), PolicySourceError> {
+        let id: TaintEntryId = parse_identifier(fields.required("id"), id_description)?;
         self.register_local_taint_entry(&id, fields.required("id"))?;
         let selector_path = format!(
             "{path}/entries/{}/selector",
             json_pointer_segment(id.as_str())
         );
-        Ok(TaintTransformSpec {
-            id,
-            selector: self.decode_selector(fields.required("selector"), context, &selector_path)?,
-            input: decoded_binding_to_port(decode_binding(
-                fields.required("input"),
-                context,
-                PolicyValueShape::PolicyPort,
-            )?),
-            output: decoded_binding_to_port(decode_binding(
-                fields.required("output"),
-                context,
-                PolicyValueShape::PolicyPort,
-            )?),
-            removes: Vec::new(),
-            adds: Vec::new(),
-        })
+        Ok((id, selector_path))
+    }
+
+    fn decode_selector_and_port(
+        &mut self,
+        fields: &RecordCursor<'_>,
+        context: DecodeContext,
+        selector_path: &str,
+        port_field: &str,
+    ) -> Result<(PolicySelector, PolicyPort), PolicySourceError> {
+        let selector = self.decode_selector(fields.required("selector"), context, selector_path)?;
+        let port = decode_policy_port(fields.required(port_field), context)?;
+        Ok((selector, port))
+    }
+
+    fn decode_selector_input_output(
+        &mut self,
+        fields: &RecordCursor<'_>,
+        context: DecodeContext,
+        selector_path: &str,
+    ) -> Result<(PolicySelector, PolicyPort, PolicyPort), PolicySourceError> {
+        let (selector, input) =
+            self.decode_selector_and_port(fields, context, selector_path, "input")?;
+        let output = decode_policy_port(fields.required("output"), context)?;
+        Ok((selector, input, output))
     }
 
     fn decode_taint_analysis(
@@ -1954,6 +1915,15 @@ impl Decoder {
             })
             .transpose()?
             .unwrap_or_default();
+        let threat_models = fields
+            .get("threat-models")
+            .map(|value| {
+                decode_unique_values(value, "threat models", 1, 6, decode_threat_model, |model| {
+                    model.label().to_owned()
+                })
+            })
+            .transpose()?
+            .unwrap_or_else(|| vec![TaintThreatModel::Remote]);
         Ok(TaintPolicySpec {
             mode: MayMode::May,
             call_modeling: fields
@@ -1961,6 +1931,7 @@ impl Decoder {
                 .map(|value| self.decode_call_modeling(value, PolicyAnalysisKind::Taint))
                 .transpose()?
                 .unwrap_or_default(),
+            threat_models,
             sources,
             sinks,
             sanitizers,
@@ -1986,26 +1957,13 @@ impl Decoder {
             true,
             path,
         )?;
-        let mut entries = Vec::with_capacity(parts.entries.len());
-        let mut ids = HashSet::with_capacity(parts.entries.len());
-        for entry in &parts.entries {
-            let value = self.decode_taint_source(entry, path)?;
-            if !ids.insert(value.id.as_str().to_string()) {
-                return Err(source_error(
-                    "duplicate-entry-id",
-                    entry.range.clone(),
-                    format!("duplicate source ID `{}`", value.id),
-                ));
-            }
-            entries.push(value);
-        }
-        entries.sort_by(|left, right| left.id.as_str().cmp(right.id.as_str()));
-        Ok(TaintEndpointSet {
-            include_sets: parts.include_sets,
-            include_matches: parts.include_matches,
-            include_files: parts.include_files,
-            entries,
-        })
+        self.decode_taint_endpoint_set(
+            parts,
+            path,
+            Self::decode_taint_source,
+            |value: &TaintSourceSpec| value.id.as_str(),
+            |value| format!("duplicate source ID `{}`", value.id),
+        )
     }
 
     fn decode_sink_set(
@@ -2020,26 +1978,13 @@ impl Decoder {
             true,
             path,
         )?;
-        let mut entries = Vec::with_capacity(parts.entries.len());
-        let mut ids = HashSet::with_capacity(parts.entries.len());
-        for entry in &parts.entries {
-            let value = self.decode_taint_sink(entry, path)?;
-            if !ids.insert(value.id.as_str().to_string()) {
-                return Err(source_error(
-                    "duplicate-entry-id",
-                    entry.range.clone(),
-                    format!("duplicate sink ID `{}`", value.id),
-                ));
-            }
-            entries.push(value);
-        }
-        entries.sort_by(|left, right| left.id.as_str().cmp(right.id.as_str()));
-        Ok(TaintEndpointSet {
-            include_sets: parts.include_sets,
-            include_matches: parts.include_matches,
-            include_files: parts.include_files,
-            entries,
-        })
+        self.decode_taint_endpoint_set(
+            parts,
+            path,
+            Self::decode_taint_sink,
+            |value: &TaintSinkSpec| value.id.as_str(),
+            |value| format!("duplicate sink ID `{}`", value.id),
+        )
     }
 
     fn decode_sanitizer_set(
@@ -2054,26 +1999,13 @@ impl Decoder {
             false,
             path,
         )?;
-        let mut entries = Vec::with_capacity(parts.entries.len());
-        let mut ids = HashSet::with_capacity(parts.entries.len());
-        for entry in &parts.entries {
-            let value = self.decode_sanitizer(entry, path)?;
-            if !ids.insert(value.id.as_str().to_string()) {
-                return Err(source_error(
-                    "duplicate-entry-id",
-                    entry.range.clone(),
-                    "duplicate sanitizer ID",
-                ));
-            }
-            entries.push(value);
-        }
-        entries.sort_by(|left, right| left.id.as_str().cmp(right.id.as_str()));
-        Ok(TaintEndpointSet {
-            include_sets: parts.include_sets,
-            include_matches: parts.include_matches,
-            include_files: parts.include_files,
-            entries,
-        })
+        self.decode_taint_endpoint_set(
+            parts,
+            path,
+            Self::decode_sanitizer,
+            |value: &TaintSanitizerSpec| value.id.as_str(),
+            |_| "duplicate sanitizer ID".to_owned(),
+        )
     }
 
     fn decode_entry_point_set(
@@ -2088,26 +2020,13 @@ impl Decoder {
             false,
             path,
         )?;
-        let mut entries = Vec::with_capacity(parts.entries.len());
-        let mut ids = HashSet::with_capacity(parts.entries.len());
-        for entry in &parts.entries {
-            let value = self.decode_entry_point(entry, path)?;
-            if !ids.insert(value.id.as_str().to_string()) {
-                return Err(source_error(
-                    "duplicate-entry-id",
-                    entry.range.clone(),
-                    "duplicate entry-point ID",
-                ));
-            }
-            entries.push(value);
-        }
-        entries.sort_by(|left, right| left.id.as_str().cmp(right.id.as_str()));
-        Ok(TaintEndpointSet {
-            include_sets: parts.include_sets,
-            include_matches: parts.include_matches,
-            include_files: parts.include_files,
-            entries,
-        })
+        self.decode_taint_endpoint_set(
+            parts,
+            path,
+            Self::decode_entry_point,
+            |value: &TaintEntryPointSpec| value.id.as_str(),
+            |_| "duplicate entry-point ID".to_owned(),
+        )
     }
 
     fn decode_transform_set(
@@ -2122,26 +2041,13 @@ impl Decoder {
             false,
             path,
         )?;
-        let mut entries = Vec::with_capacity(parts.entries.len());
-        let mut ids = HashSet::with_capacity(parts.entries.len());
-        for entry in &parts.entries {
-            let value = self.decode_transform(entry, path)?;
-            if !ids.insert(value.id.as_str().to_string()) {
-                return Err(source_error(
-                    "duplicate-entry-id",
-                    entry.range.clone(),
-                    "duplicate transform ID",
-                ));
-            }
-            entries.push(value);
-        }
-        entries.sort_by(|left, right| left.id.as_str().cmp(right.id.as_str()));
-        Ok(TaintEndpointSet {
-            include_sets: parts.include_sets,
-            include_matches: parts.include_matches,
-            include_files: parts.include_files,
-            entries,
-        })
+        self.decode_taint_endpoint_set(
+            parts,
+            path,
+            Self::decode_transform,
+            |value: &TaintTransformSpec| value.id.as_str(),
+            |_| "duplicate transform ID".to_owned(),
+        )
     }
 
     fn decode_external_model_set(
@@ -2156,20 +2062,37 @@ impl Decoder {
             false,
             path,
         )?;
+        self.decode_taint_endpoint_set(
+            parts,
+            path,
+            Self::decode_external_model,
+            |value: &TaintExternalModelSpec| value.id.as_str(),
+            |_| "duplicate external-model ID".to_owned(),
+        )
+    }
+
+    fn decode_taint_endpoint_set<T>(
+        &mut self,
+        parts: DecodedTaintSetParts<'_>,
+        path: &str,
+        mut decode: impl FnMut(&mut Self, &Expr, &str) -> Result<T, PolicySourceError>,
+        id: impl for<'a> Fn(&'a T) -> &'a str,
+        duplicate_message: impl Fn(&T) -> String,
+    ) -> Result<TaintEndpointSet<T>, PolicySourceError> {
         let mut entries = Vec::with_capacity(parts.entries.len());
         let mut ids = HashSet::with_capacity(parts.entries.len());
         for entry in &parts.entries {
-            let value = self.decode_external_model(entry, path)?;
-            if !ids.insert(value.id.as_str().to_string()) {
+            let value = decode(self, entry, path)?;
+            if !ids.insert(id(&value).to_owned()) {
                 return Err(source_error(
                     "duplicate-entry-id",
                     entry.range.clone(),
-                    "duplicate external-model ID",
+                    duplicate_message(&value),
                 ));
             }
             entries.push(value);
         }
-        entries.sort_by(|left, right| left.id.as_str().cmp(right.id.as_str()));
+        entries.sort_by(|left, right| id(left).cmp(id(right)));
         Ok(TaintEndpointSet {
             include_sets: parts.include_sets,
             include_matches: parts.include_matches,
@@ -2227,31 +2150,20 @@ impl Decoder {
     ) -> Result<TaintStoreWriteSpec, PolicySourceError> {
         let context = DecodeContext::policy(PolicyAnalysisKind::Taint);
         let fields = RecordCursor::parse(expr, PolicyRecord::StoreWrite, context)?;
-        let id: TaintEntryId = parse_identifier(fields.required("id"), "store-write ID")?;
-        self.register_local_taint_entry(&id, fields.required("id"))?;
-        let selector_path = format!(
-            "{path}/entries/{}/selector",
-            json_pointer_segment(id.as_str())
-        );
+        let (id, selector_path) = self.decode_local_taint_entry(&fields, path, "store-write ID")?;
+        let DecodedStoreEntryFields {
+            selector,
+            store,
+            key,
+            instance,
+        } = self.decode_store_entry_fields(&fields, context, &selector_path)?;
         Ok(TaintStoreWriteSpec {
             id,
-            selector: self.decode_selector(fields.required("selector"), context, &selector_path)?,
-            store: parse_identifier(fields.required("store"), "store name")?,
-            key: fields
-                .get("key")
-                .map(|value| decode_binding(value, context, PolicyValueShape::PolicyPort))
-                .transpose()?
-                .map(decoded_binding_to_port),
-            instance: fields
-                .get("instance")
-                .map(|value| decode_binding(value, context, PolicyValueShape::PolicyPort))
-                .transpose()?
-                .map(decoded_binding_to_port),
-            input: decoded_binding_to_port(decode_binding(
-                fields.required("input"),
-                context,
-                PolicyValueShape::PolicyPort,
-            )?),
+            selector,
+            store,
+            key,
+            instance,
+            input: decode_policy_port(fields.required("input"), context)?,
         })
     }
 
@@ -2262,31 +2174,40 @@ impl Decoder {
     ) -> Result<TaintStoreReadSpec, PolicySourceError> {
         let context = DecodeContext::policy(PolicyAnalysisKind::Taint);
         let fields = RecordCursor::parse(expr, PolicyRecord::StoreRead, context)?;
-        let id: TaintEntryId = parse_identifier(fields.required("id"), "store-read ID")?;
-        self.register_local_taint_entry(&id, fields.required("id"))?;
-        let selector_path = format!(
-            "{path}/entries/{}/selector",
-            json_pointer_segment(id.as_str())
-        );
+        let (id, selector_path) = self.decode_local_taint_entry(&fields, path, "store-read ID")?;
+        let DecodedStoreEntryFields {
+            selector,
+            store,
+            key,
+            instance,
+        } = self.decode_store_entry_fields(&fields, context, &selector_path)?;
         Ok(TaintStoreReadSpec {
             id,
-            selector: self.decode_selector(fields.required("selector"), context, &selector_path)?,
+            selector,
+            store,
+            key,
+            instance,
+            output: decode_policy_port(fields.required("output"), context)?,
+        })
+    }
+
+    fn decode_store_entry_fields(
+        &mut self,
+        fields: &RecordCursor<'_>,
+        context: DecodeContext,
+        selector_path: &str,
+    ) -> Result<DecodedStoreEntryFields, PolicySourceError> {
+        Ok(DecodedStoreEntryFields {
+            selector: self.decode_selector(fields.required("selector"), context, selector_path)?,
             store: parse_identifier(fields.required("store"), "store name")?,
             key: fields
                 .get("key")
-                .map(|value| decode_binding(value, context, PolicyValueShape::PolicyPort))
-                .transpose()?
-                .map(decoded_binding_to_port),
+                .map(|value| decode_policy_port(value, context))
+                .transpose()?,
             instance: fields
                 .get("instance")
-                .map(|value| decode_binding(value, context, PolicyValueShape::PolicyPort))
-                .transpose()?
-                .map(decoded_binding_to_port),
-            output: decoded_binding_to_port(decode_binding(
-                fields.required("output"),
-                context,
-                PolicyValueShape::PolicyPort,
-            )?),
+                .map(|value| decode_policy_port(value, context))
+                .transpose()?,
         })
     }
 
@@ -2584,27 +2505,26 @@ impl Decoder {
     ) -> Result<TaintSourceSpec, PolicySourceError> {
         let context = DecodeContext::policy(PolicyAnalysisKind::Taint);
         let fields = RecordCursor::parse(expr, PolicyRecord::Source, context)?;
-        let id: TaintEntryId = parse_identifier(fields.required("id"), "source ID")?;
-        self.register_local_taint_entry(&id, fields.required("id"))?;
-        let selector_path = format!(
-            "{path}/entries/{}/selector",
-            json_pointer_segment(id.as_str())
-        );
+        let (id, selector_path) = self.decode_local_taint_entry(&fields, path, "source ID")?;
+        let display_name = expect_string(
+            fields.required("display-name"),
+            "source display name",
+            MAX_DISPLAY_TEXT_BYTES,
+        )?;
+        let categories = decode_id_set(fields.required("categories"), "source categories", 1, 64)?;
+        let (selector, bind) =
+            self.decode_selector_and_port(&fields, context, &selector_path, "bind")?;
         Ok(TaintSourceSpec {
             id,
-            display_name: expect_string(
-                fields.required("display-name"),
-                "source display name",
-                MAX_DISPLAY_TEXT_BYTES,
-            )?,
-            categories: decode_id_set(fields.required("categories"), "source categories", 1, 64)?,
-            selector: self.decode_selector(fields.required("selector"), context, &selector_path)?,
-            bind: decoded_binding_to_port(decode_binding(
-                fields.required("bind"),
-                context,
-                PolicyValueShape::PolicyPort,
-            )?),
+            display_name,
+            categories,
+            selector,
+            bind,
             labels: decode_id_set(fields.required("labels"), "source labels", 1, 64)?,
+            threat_model: fields
+                .get("threat-model")
+                .map(decode_threat_model)
+                .transpose()?,
             evidence: fields
                 .get("evidence")
                 .map(|value| self.decode_source_evidence(value, context))
@@ -2619,26 +2539,21 @@ impl Decoder {
     ) -> Result<TaintSinkSpec, PolicySourceError> {
         let context = DecodeContext::policy(PolicyAnalysisKind::Taint);
         let fields = RecordCursor::parse(expr, PolicyRecord::Sink, context)?;
-        let id: TaintEntryId = parse_identifier(fields.required("id"), "sink ID")?;
-        self.register_local_taint_entry(&id, fields.required("id"))?;
-        let selector_path = format!(
-            "{path}/entries/{}/selector",
-            json_pointer_segment(id.as_str())
-        );
+        let (id, selector_path) = self.decode_local_taint_entry(&fields, path, "sink ID")?;
+        let display_name = expect_string(
+            fields.required("display-name"),
+            "sink display name",
+            MAX_DISPLAY_TEXT_BYTES,
+        )?;
+        let categories = decode_id_set(fields.required("categories"), "sink categories", 1, 64)?;
+        let (selector, dangerous_operand) =
+            self.decode_selector_and_port(&fields, context, &selector_path, "dangerous-operand")?;
         Ok(TaintSinkSpec {
             id,
-            display_name: expect_string(
-                fields.required("display-name"),
-                "sink display name",
-                MAX_DISPLAY_TEXT_BYTES,
-            )?,
-            categories: decode_id_set(fields.required("categories"), "sink categories", 1, 64)?,
-            selector: self.decode_selector(fields.required("selector"), context, &selector_path)?,
-            dangerous_operand: decoded_binding_to_port(decode_binding(
-                fields.required("dangerous-operand"),
-                context,
-                PolicyValueShape::PolicyPort,
-            )?),
+            display_name,
+            categories,
+            selector,
+            dangerous_operand,
             accepts: decode_id_set(fields.required("accepts"), "accepted labels", 1, 64)?,
             tags: fields
                 .get("tags")
@@ -2660,25 +2575,14 @@ impl Decoder {
     ) -> Result<TaintSanitizerSpec, PolicySourceError> {
         let context = DecodeContext::policy(PolicyAnalysisKind::Taint);
         let fields = RecordCursor::parse(expr, PolicyRecord::Sanitizer, context)?;
-        let id: TaintEntryId = parse_identifier(fields.required("id"), "sanitizer ID")?;
-        self.register_local_taint_entry(&id, fields.required("id"))?;
-        let selector_path = format!(
-            "{path}/entries/{}/selector",
-            json_pointer_segment(id.as_str())
-        );
+        let (id, selector_path) = self.decode_local_taint_entry(&fields, path, "sanitizer ID")?;
+        let (selector, input, output) =
+            self.decode_selector_input_output(&fields, context, &selector_path)?;
         Ok(TaintSanitizerSpec {
             id,
-            selector: self.decode_selector(fields.required("selector"), context, &selector_path)?,
-            input: decoded_binding_to_port(decode_binding(
-                fields.required("input"),
-                context,
-                PolicyValueShape::PolicyPort,
-            )?),
-            output: decoded_binding_to_port(decode_binding(
-                fields.required("output"),
-                context,
-                PolicyValueShape::PolicyPort,
-            )?),
+            selector,
+            input,
+            output,
             removes: decode_id_set(fields.required("removes"), "removed labels", 1, 64)?,
         })
     }
@@ -2690,12 +2594,7 @@ impl Decoder {
     ) -> Result<TaintEntryPointSpec, PolicySourceError> {
         let context = DecodeContext::policy(PolicyAnalysisKind::Taint);
         let fields = RecordCursor::parse(expr, PolicyRecord::EntryPoint, context)?;
-        let id: TaintEntryId = parse_identifier(fields.required("id"), "entry-point ID")?;
-        self.register_local_taint_entry(&id, fields.required("id"))?;
-        let selector_path = format!(
-            "{path}/entries/{}/selector",
-            json_pointer_segment(id.as_str())
-        );
+        let (id, selector_path) = self.decode_local_taint_entry(&fields, path, "entry-point ID")?;
         Ok(TaintEntryPointSpec {
             id,
             selector: self.decode_selector(fields.required("selector"), context, &selector_path)?,
@@ -2711,8 +2610,7 @@ impl Decoder {
     ) -> Result<TaintTransformSpec, PolicySourceError> {
         let context = DecodeContext::policy(PolicyAnalysisKind::Taint);
         let fields = RecordCursor::parse(expr, PolicyRecord::TransformEntry, context)?;
-        let id: TaintEntryId = parse_identifier(fields.required("id"), "transform ID")?;
-        self.register_local_taint_entry(&id, fields.required("id"))?;
+        let (id, selector_path) = self.decode_local_taint_entry(&fields, path, "transform ID")?;
         let removes = fields
             .get("removes")
             .map(|value| decode_id_set(value, "removed labels", 0, 64))
@@ -2730,26 +2628,13 @@ impl Decoder {
                 "transform requires at least one removed or added label",
             ));
         }
+        let (selector, input, output) =
+            self.decode_selector_input_output(&fields, context, &selector_path)?;
         Ok(TaintTransformSpec {
-            selector: self.decode_selector(
-                fields.required("selector"),
-                context,
-                &format!(
-                    "{path}/entries/{}/selector",
-                    json_pointer_segment(id.as_str())
-                ),
-            )?,
+            selector,
             id,
-            input: decoded_binding_to_port(decode_binding(
-                fields.required("input"),
-                context,
-                PolicyValueShape::PolicyPort,
-            )?),
-            output: decoded_binding_to_port(decode_binding(
-                fields.required("output"),
-                context,
-                PolicyValueShape::PolicyPort,
-            )?),
+            input,
+            output,
             removes,
             adds,
         })
@@ -3391,6 +3276,10 @@ impl Decoder {
             subject_expr.range.clone(),
         )?;
         let phase = decode_observation_phase(fields.required("phase"))?;
+        let argument_condition = fields
+            .get("condition")
+            .map(|value| self.decode_argument_condition(value))
+            .transpose()?;
         if matches!(
             subject,
             TypestateCallBinding::ReturnValue | TypestateCallBinding::ResultIndex { .. }
@@ -3419,7 +3308,45 @@ impl Decoder {
             )?,
             subject,
             phase,
+            argument_condition,
         })
+    }
+
+    fn decode_argument_condition(
+        &mut self,
+        expr: &Expr,
+    ) -> Result<TypestateArgumentCondition, PolicySourceError> {
+        let context = DecodeContext::policy(PolicyAnalysisKind::Typestate);
+        let fields = RecordCursor::parse(expr, PolicyRecord::ArgumentCondition, context)?;
+        let argument_expr = fields.required("argument");
+        let argument = decode_binding(
+            argument_expr,
+            context,
+            PolicyValueShape::TypestateCallBinding,
+        )?;
+        let index = match argument {
+            DecodedBinding::ArgumentIndex(index) => index,
+            DecodedBinding::ArgumentName(_) => {
+                return Err(source_error(
+                    "invalid-argument-condition-binding",
+                    argument_expr.range.clone(),
+                    "argument conditions require a positional argument index",
+                ));
+            }
+            DecodedBinding::Receiver
+            | DecodedBinding::ReturnValue
+            | DecodedBinding::ResultIndex(_)
+            | DecodedBinding::MatchedValue
+            | DecodedBinding::FieldOf { .. } => {
+                return Err(source_error(
+                    "invalid-argument-condition-binding",
+                    argument_expr.range.clone(),
+                    "argument conditions require an argument binding",
+                ));
+            }
+        };
+        let equals = decode_boolean(fields.required("equals"), "argument condition Boolean")?;
+        Ok(TypestateArgumentCondition { index, equals })
     }
 
     fn decode_terminal_expectation(
@@ -3676,19 +3603,11 @@ impl Decoder {
                     1,
                     256,
                 )?;
-                let mut predicates = Vec::with_capacity(values.len());
-                for value in values {
-                    let predicate =
-                        self.decode_classification_predicate(value, context, depth + 1, budget)?;
-                    if predicates.contains(&predicate) {
-                        return Err(source_error(
-                            "duplicate-set-value",
-                            value.range.clone(),
-                            "duplicate classification predicate",
-                        ));
-                    }
-                    predicates.push(predicate);
-                }
+                let predicates = decode_nested_predicates(
+                    values,
+                    "duplicate classification predicate",
+                    |value| self.decode_classification_predicate(value, context, depth + 1, budget),
+                )?;
                 if any {
                     Ok(ClassificationPredicate::Any { predicates })
                 } else {
@@ -3987,19 +3906,11 @@ impl Decoder {
                     1,
                     256,
                 )?;
-                let mut predicates = Vec::with_capacity(values.len());
-                for value in values {
-                    let predicate =
-                        self.decode_cvss_predicate(value, context, depth + 1, budget)?;
-                    if predicates.contains(&predicate) {
-                        return Err(source_error(
-                            "duplicate-set-value",
-                            value.range.clone(),
-                            "duplicate CVSS evidence predicate",
-                        ));
-                    }
-                    predicates.push(predicate);
-                }
+                let predicates = decode_nested_predicates(
+                    values,
+                    "duplicate CVSS evidence predicate",
+                    |value| self.decode_cvss_predicate(value, context, depth + 1, budget),
+                )?;
                 if any {
                     Ok(CvssEvidencePredicate::Any { predicates })
                 } else {
@@ -4403,6 +4314,7 @@ impl Decoder {
                 )?;
                 Ok(EndpointTaintSemantics::Source {
                     labels: decode_id_set(fields.required("labels"), "source labels", 1, 64)?,
+                    threat_model: None,
                     evidence: fields
                         .get("evidence")
                         .map(|value| self.decode_source_evidence(value, DecodeContext::ENDPOINT))
@@ -4703,7 +4615,7 @@ fn relational_error_range(
                     .flatten()
             })
         }),
-        Error::EmptyJoin { left, right } => plan
+        Error::EmptyJoin { left, right } | Error::CrossDomainJoin { left, right } => plan
             .joins
             .iter()
             .rev()
@@ -4749,6 +4661,13 @@ struct DecodedStoreSet {
     include_files: Vec<EndpointSetFileRef>,
 }
 
+struct DecodedStoreEntryFields {
+    selector: PolicySelector,
+    store: TaintStoreName,
+    key: Option<PolicyPort>,
+    instance: Option<PolicyPort>,
+}
+
 struct DecodedMatchEndpointSet {
     set: MatchEndpointSetRef,
     role: Option<EndpointRole>,
@@ -4759,6 +4678,7 @@ fn empty_taint_policy_spec() -> TaintPolicySpec {
     TaintPolicySpec {
         mode: MayMode::May,
         call_modeling: CallModelingSpec::default(),
+        threat_models: Vec::new(),
         sources: TaintEndpointSet::default(),
         sinks: TaintEndpointSet::default(),
         sanitizers: TaintEndpointSet::default(),
@@ -5265,6 +5185,29 @@ where
     Ok(decoded)
 }
 
+fn decode_nested_predicates<T>(
+    values: &[Expr],
+    duplicate_message: &'static str,
+    mut decode: impl FnMut(&Expr) -> Result<T, PolicySourceError>,
+) -> Result<Vec<T>, PolicySourceError>
+where
+    T: PartialEq,
+{
+    let mut predicates = Vec::with_capacity(values.len());
+    for value in values {
+        let predicate = decode(value)?;
+        if predicates.contains(&predicate) {
+            return Err(source_error(
+                "duplicate-set-value",
+                value.range.clone(),
+                duplicate_message,
+            ));
+        }
+        predicates.push(predicate);
+    }
+    Ok(predicates)
+}
+
 fn parse_identifier<T>(expr: &Expr, what: &str) -> Result<T, PolicySourceError>
 where
     T: FromStr,
@@ -5387,25 +5330,19 @@ where
     T: FromStr + AsRef<str>,
     T::Err: fmt::Display,
 {
-    let values = expect_vector(expr, what, min, max)?;
-    let mut decoded = Vec::with_capacity(values.len());
-    let mut seen = HashSet::with_capacity(values.len());
-    for value_expr in values {
-        let value: T = parse_identifier(value_expr, what)?;
-        if !seen.insert(value.as_ref().to_string()) {
-            return Err(source_error(
-                "duplicate-set-value",
-                value_expr.range.clone(),
-                format!("duplicate value in {what}"),
-            ));
-        }
-        decoded.push(SpannedValue {
-            value,
-            range: value_expr.range.clone(),
-        });
-    }
-    decoded.sort_by(|left, right| left.value.as_ref().cmp(right.value.as_ref()));
-    Ok(decoded)
+    decode_unique_values(
+        expr,
+        what,
+        min,
+        max,
+        |value_expr| {
+            Ok(SpannedValue {
+                value: parse_identifier(value_expr, what)?,
+                range: value_expr.range.clone(),
+            })
+        },
+        |value: &SpannedValue<T>| value.value.as_ref().to_string(),
+    )
 }
 
 fn decode_endpoint_role(expr: &Expr) -> Result<EndpointRole, PolicySourceError> {
@@ -5483,6 +5420,18 @@ fn decode_finding_severity(expr: &Expr) -> Result<FindingSeverity, PolicySourceE
         PolicyAtomValue::SeverityWarning => Ok(FindingSeverity::Warning),
         PolicyAtomValue::SeverityError => Ok(FindingSeverity::Error),
         value => unreachable!("Severity registry returned {value:?}"),
+    }
+}
+
+fn decode_threat_model(expr: &Expr) -> Result<TaintThreatModel, PolicySourceError> {
+    match expect_atom(expr, AtomDomain::ThreatModel, "threat model")? {
+        PolicyAtomValue::ThreatRemote => Ok(TaintThreatModel::Remote),
+        PolicyAtomValue::ThreatCommandArgs => Ok(TaintThreatModel::CommandArgs),
+        PolicyAtomValue::ThreatEnvironment => Ok(TaintThreatModel::Environment),
+        PolicyAtomValue::ThreatStdin => Ok(TaintThreatModel::Stdin),
+        PolicyAtomValue::ThreatFile => Ok(TaintThreatModel::File),
+        PolicyAtomValue::ThreatDatabase => Ok(TaintThreatModel::Database),
+        value => unreachable!("ThreatModel registry returned {value:?}"),
     }
 }
 
@@ -5674,6 +5623,13 @@ fn decoded_binding_to_port(binding: DecodedBinding) -> PolicyPort {
             name,
         },
     }
+}
+
+fn decode_policy_port(
+    expr: &Expr,
+    context: DecodeContext,
+) -> Result<PolicyPort, PolicySourceError> {
+    decode_binding(expr, context, PolicyValueShape::PolicyPort).map(decoded_binding_to_port)
 }
 
 fn decoded_binding_to_seed(binding: DecodedBinding) -> TypestateSeedBinding {
@@ -6143,19 +6099,30 @@ fn decode_row_literal(expr: &Expr) -> Result<RowLiteral, PolicySourceError> {
     Ok(match &expr.kind {
         ExprKind::String(value) => RowLiteral::String(value.clone()),
         ExprKind::List(values) | ExprKind::Vector(values) => {
-            let values = values
+            let integer_values = values
                 .iter()
-                .map(|value| {
-                    value.as_string().map(str::to_owned).ok_or_else(|| {
-                        source_error(
-                            "invalid-row-literal",
-                            value.range.clone(),
-                            "string-list row literals contain only strings",
-                        )
-                    })
+                .map(|value| match &value.kind {
+                    ExprKind::Number(number) => Some(*number),
+                    _ => None,
                 })
-                .collect::<Result<Vec<_>, _>>()?;
-            RowLiteral::StringList(values)
+                .collect::<Option<Vec<_>>>();
+            if let Some(integer_values) = integer_values.filter(|_| !values.is_empty()) {
+                RowLiteral::IntegerList(integer_values)
+            } else {
+                let values = values
+                    .iter()
+                    .map(|value| {
+                        value.as_string().map(str::to_owned).ok_or_else(|| {
+                            source_error(
+                                "invalid-row-literal",
+                                value.range.clone(),
+                                "row list literals contain only strings or only integers",
+                            )
+                        })
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                RowLiteral::StringList(values)
+            }
         }
         ExprKind::Number(value) => RowLiteral::Integer(*value),
         ExprKind::Symbol(value) if value == "true" => RowLiteral::Boolean(true),
@@ -6616,6 +6583,23 @@ fn decode_resolution_assert(expr: &Expr) -> Result<ResolutionAssert, PolicySourc
     Ok(assertion)
 }
 
+fn reject_self_containment_assert(
+    at: &str,
+    relative_to: &str,
+    relative_to_expr: &Expr,
+) -> Result<(), PolicySourceError> {
+    if relative_to == at {
+        return Err(source_error(
+            "contradictory-assert-containment",
+            relative_to_expr.range.clone(),
+            format!(
+                "`:relative-to` names the same capture as `:at` (`{at}`), whose containment is fixed"
+            ),
+        ));
+    }
+    Ok(())
+}
+
 fn decode_binding_scope_assert(expr: &Expr) -> Result<BindingScopeAssert, PolicySourceError> {
     let fields = RecordCursor::parse(
         expr,
@@ -6638,15 +6622,7 @@ fn decode_binding_scope_assert(expr: &Expr) -> Result<BindingScopeAssert, Policy
     let relative_to = decode_assert_capture(relative_to_expr, "assert related capture name")?;
     // A node is trivially inside itself and never outside itself, so comparing
     // a capture against itself states a verdict rather than a rule.
-    if relative_to == at {
-        return Err(source_error(
-            "contradictory-assert-containment",
-            relative_to_expr.range.clone(),
-            format!(
-                "`:relative-to` names the same capture as `:at` (`{at}`), whose containment is fixed"
-            ),
-        ));
-    }
+    reject_self_containment_assert(&at, &relative_to, relative_to_expr)?;
     Ok(BindingScopeAssert {
         id,
         at,
@@ -6678,15 +6654,7 @@ fn decode_value_origin_assert(expr: &Expr) -> Result<ValueOriginAssert, PolicySo
     let relative_to = decode_assert_capture(relative_to_expr, "assert related capture name")?;
     // A node is trivially inside itself and never outside itself, so comparing
     // a capture against itself states a verdict rather than a rule.
-    if relative_to == at {
-        return Err(source_error(
-            "contradictory-assert-containment",
-            relative_to_expr.range.clone(),
-            format!(
-                "`:relative-to` names the same capture as `:at` (`{at}`), whose containment is fixed"
-            ),
-        ));
-    }
+    reject_self_containment_assert(&at, &relative_to, relative_to_expr)?;
     Ok(ValueOriginAssert {
         id,
         at,
@@ -6801,15 +6769,24 @@ fn decode_edge_surface(
         .transpose()
 }
 
+fn decode_edge_assert_header(
+    fields: &RecordCursor<'_>,
+    role_what: &str,
+) -> Result<(PolicyAssertId, String, OccurrenceRole), PolicySourceError> {
+    Ok((
+        parse_identifier(fields.required("id"), "assert ID")?,
+        decode_assert_capture(fields.required("at"), "assert capture name")?,
+        decode_edge_role(fields.required("role"), role_what)?,
+    ))
+}
+
 fn decode_edge_parity_assert(expr: &Expr) -> Result<EdgeParityAssert, PolicySourceError> {
     let fields = RecordCursor::parse(
         expr,
         PolicyRecord::AssertEdgeParity,
         DecodeContext::policy(PolicyAnalysisKind::Assertion),
     )?;
-    let id: PolicyAssertId = parse_identifier(fields.required("id"), "assert ID")?;
-    let at = decode_assert_capture(fields.required("at"), "assert capture name")?;
-    let role = decode_edge_role(fields.required("role"), "`assert-edge-parity`")?;
+    let (id, at, role) = decode_edge_assert_header(&fields, "`assert-edge-parity`")?;
     let surface = decode_edge_surface(&fields)?;
     Ok(EdgeParityAssert {
         id,
@@ -6862,9 +6839,7 @@ fn decode_edge_class_assert(expr: &Expr) -> Result<EdgeClassAssert, PolicySource
         PolicyRecord::AssertEdgeClass,
         DecodeContext::policy(PolicyAnalysisKind::Assertion),
     )?;
-    let id: PolicyAssertId = parse_identifier(fields.required("id"), "assert ID")?;
-    let at = decode_assert_capture(fields.required("at"), "assert capture name")?;
-    let role = decode_edge_role(fields.required("role"), "`assert-edge-class`")?;
+    let (id, at, role) = decode_edge_assert_header(&fields, "`assert-edge-class`")?;
     let axis_expr = fields.required("axis");
     let axis = expect_atom(axis_expr, AtomDomain::EdgeClassAxis, "edge class axis")?;
     let require_expr = fields.get("require");
@@ -7276,10 +7251,6 @@ fn evidence_ref_key(reference: &PolicyEvidenceRef) -> String {
     }
 }
 
-fn json_pointer_segment(value: &str) -> String {
-    value.replace('~', "~0").replace('/', "~1")
-}
-
 fn validate_named_graph(values: &[NamedGraphNode], what: &str) -> Result<(), PolicySourceError> {
     let indices = values
         .iter()
@@ -7353,6 +7324,7 @@ fn validate_named_graph(values: &[NamedGraphNode], what: &str) -> Result<(), Pol
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::error_at as assert_error_token;
     use brokk_bifrost_analysis::schema_version::SchemaVersionOrigin;
     use brokk_bifrost_rql::QueryStep;
 
@@ -7384,12 +7356,6 @@ mod tests {
         )
     }
 
-    fn assert_error_token(source: &str, code: &str, token: &str) {
-        let error = parse(source).unwrap_err().diagnostic;
-        assert_eq!(error.code, code);
-        assert_eq!(&source[error.range], token);
-    }
-
     #[test]
     fn standalone_endpoint_set_preserves_typed_import_edges_and_ranges() {
         let source = r#"(endpoint-set-document
@@ -7417,47 +7383,6 @@ mod tests {
             parsed.document().to_normalized_authored_json()["set"]["include_files"],
             serde_json::json!([{ "path": "nested.rqlp" }])
         );
-    }
-
-    #[test]
-    fn standalone_endpoint_set_fields_have_schema_hover_help() {
-        let source = r#"(endpoint-set-document
-            :schema-version 1
-            :kind sources
-            :set (endpoint-set :include-files [
-                (endpoint-set-file
-                  :path "nested.rqlp"
-                  :sha256 "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef")]))"#;
-        for (token, signature) in [
-            (
-                "endpoint-set-document",
-                "(endpoint-set-document [:schema-version N] :kind KIND [:language LANGUAGE] [:rql-schema-version N] :set (endpoint-set ...))",
-            ),
-            (
-                ":kind",
-                ":kind sources|sinks|sanitizers|entry-points|transforms|external-models|stores|origins|observations|kills|flow-transforms",
-            ),
-            (":set", ":set (endpoint-set ...)"),
-            (
-                ":include-files",
-                ":include-files [(endpoint-set-file :path \"workspace-relative.rqlp\" [:sha256 HEX])...]",
-            ),
-            (
-                "endpoint-set-file",
-                "(endpoint-set-file :path \"workspace-relative.rqlp\" [:sha256 HEX])",
-            ),
-            (":path", ":path \"workspace-relative.rqlp\""),
-            (":sha256", ":sha256 \"64-lower-hex\""),
-        ] {
-            let offset = source.find(token).expect("hover token") + token.len().min(2);
-            let help = rqlp_source_help_at(source, offset).expect("schema-driven hover help");
-            assert_eq!(help.signature, signature, "hover for {token}");
-            assert_eq!(
-                &source[help.range.clone()],
-                token,
-                "hover range for {token}"
-            );
-        }
     }
 
     #[test]
@@ -7519,31 +7444,6 @@ mod tests {
         assert_eq!(plan.assertions[0].id.as_str(), "by-site-winners");
     }
 
-    /// One inner-joined plan whose fold carries the predicate under test, so
-    /// a predicate can name a field of either joined relation.
-    /// The same invariant written with a row-local RQL filter and a semi join.
-    fn filter_plan(predicate: &str) -> String {
-        format!(
-            r#"(policy
-              :id "test.relational.filtered"
-              :name "Filtered relational assertion"
-              :message "M"
-              :severity warning
-              :analysis
-                (analysis :type assertion
-                  (bind :name site :query
-                    (rql (occurrences :role [member_position])))
-                  (bind :name cand :query
-                    (rql (filter :where (({predicate}))
-                      (occurrences :role [member_position]))))
-                  (join :left site :right cand :kind semi :on ((ast_id ast_id)))
-                  (group :name by-site :by (site.ast_id)
-                    (aggregate :name reach :op max :value site.target_count))
-                  (assert :group by-site :value reach
-                    :cardinality (at-most 1))))"#
-        )
-    }
-
     fn extended_relational_plan(source: &str) -> RelationalAssertionPlan {
         let parsed = parse(source).expect("the extended relational policy parses");
         let RqlpDocument::Policy { definition } = parsed.document else {
@@ -7553,54 +7453,6 @@ mod tests {
             panic!("expected assertion policy")
         };
         spec.relational.expect("relational plan")
-    }
-
-    #[test]
-    fn decodes_rql_filter_and_projection_steps_inside_bindings() {
-        let plan = extended_relational_plan(&filter_plan("target_count gt 0"));
-        assert_eq!(plan.joins[0].kind, RowJoinKind::Semi);
-        assert_eq!(plan.groups[0].aggregates[0].op, RowAggregateOp::Max);
-        let RowBindingSource::Query(PolicySelector::Inline { query, .. }) =
-            &plan.bindings[1].source
-        else {
-            panic!("fixture uses an inline query")
-        };
-        assert!(matches!(
-            query.plan.steps.last(),
-            Some(QueryStep::Filter(_))
-        ));
-
-        let source = r#"(policy
-          :id "test.relational.project" :name "Project" :message "M" :severity warning
-          :analysis (analysis :type assertion
-            (bind :name narrow :query
-              (rql (project :columns (ast_id (hits total))
-                (project :columns (ast_id (target_count hits))
-                  (occurrences :role [member_position])))))
-            (group :name by-site :by (narrow.ast_id)
-              (aggregate :name reach :op max :value narrow.total))
-            (assert :group by-site :value reach :cardinality (at-most 1))))"#;
-        let plan = extended_relational_plan(source);
-        let RowBindingSource::Query(PolicySelector::Inline { query, .. }) =
-            &plan.bindings[0].source
-        else {
-            panic!("fixture uses an inline query")
-        };
-        assert!(matches!(
-            query.plan.steps.last(),
-            Some(QueryStep::Project(_))
-        ));
-        let ir = crate::relational::lower_relational_assertion_plan(&plan)
-            .expect("projected query schema should lower");
-        assert_eq!(
-            ir.relations[0]
-                .schema
-                .fields()
-                .iter()
-                .map(|field| field.column.to_string())
-                .collect::<Vec<_>>(),
-            vec!["narrow.ast_id", "narrow.total"]
-        );
     }
 
     #[test]
@@ -7650,26 +7502,23 @@ mod tests {
         )
     }
 
-    fn call_argument_policy(step: &str) -> String {
+    fn call_policy(id: &str, name: &str, binding: &str, step: &str) -> String {
         format!(
             r#"(policy
-              :id "test.call-argument" :name "Call argument" :message "M" :severity warning
+              :id "{id}" :name "{name}" :message "M" :severity warning
               :analysis (analysis :type assertion
-                (bind :name args :query
+                (bind :name {binding} :query
                   (rql ({step}
                     (call-bindings (call-shape (call :callee "run"))))))))"#
         )
     }
 
+    fn call_argument_policy(step: &str) -> String {
+        call_policy("test.call-argument", "Call argument", "args", step)
+    }
+
     fn exact_call_policy(step: &str) -> String {
-        format!(
-            r#"(policy
-              :id "test.call" :name "Call" :message "M" :severity warning
-              :analysis (analysis :type assertion
-                (bind :name calls :query
-                  (rql ({step}
-                    (call-bindings (call-shape (call :callee "run"))))))))"#
-        )
+        call_policy("test.call", "Call", "calls", step)
     }
 
     #[test]
@@ -7740,22 +7589,6 @@ mod tests {
     }
 
     #[test]
-    fn ordered_equal_vocabulary_is_registered_for_hover() {
-        let source = ordered_equal_policy(
-            "arg.argument_index arg.name",
-            "param.parameter_index param.label",
-        );
-        let help = rqlp_source_help_at(&source, source.find("ordered-equal").unwrap() + 2)
-            .expect("registered atom has hover help");
-        assert_eq!(help.signature, "ordered-equal");
-        assert!(
-            help.description.contains("position by position"),
-            "{}",
-            help.description
-        );
-    }
-
-    #[test]
     fn row_local_call_steps_decode_inside_policy_bindings() {
         let argument = call_argument_policy(r#"call-argument :formal-name "timeout""#);
         let plan = extended_relational_plan(&argument);
@@ -7816,114 +7649,6 @@ mod tests {
         ));
     }
 
-    /// The Milestone 4 sugar: it must add no evaluation rule of its own, so
-    /// the decoded plan is exactly the join, group, aggregate and assertion an
-    /// author could have written by hand.
-    #[test]
-    fn selected_in_winning_tier_lowers_to_existing_relational_operations() {
-        let parsed = parse(
-            r#"(policy
-              :id "test.winning-tier" :name "Winning tier" :message "M" :severity warning
-              :analysis (analysis :type assertion
-                (bind :name site :query
-                  (rql (overload-selection (occurrences :role [member_position]))))
-                (bind :name cand :query
-                  (rql (callable-applicability (occurrences :role [member_position]))))
-                (assert-selected-in-winning-tier :id one-winner
-                  :site site :candidates cand)))"#,
-        )
-        .unwrap();
-        let RqlpDocument::Policy { definition } = parsed.document else {
-            panic!("expected policy")
-        };
-        let PolicyAnalysis::Assertion { spec } = definition.analysis else {
-            panic!("expected assertion policy")
-        };
-        let plan = spec.relational.expect("relational plan");
-
-        assert_eq!(plan.joins.len(), 1);
-        assert_eq!(plan.joins[0].left.as_str(), "site");
-        assert_eq!(plan.joins[0].right.as_str(), "cand");
-        assert_eq!(plan.joins[0].kind, RowJoinKind::Inner);
-        assert_eq!(plan.joins[0].on[0].left_field, "site_ast_id");
-        assert_eq!(plan.joins[0].on[0].right_field, "site_ast_id");
-
-        assert_eq!(plan.groups.len(), 1);
-        assert_eq!(plan.groups[0].name.as_str(), "one-winner");
-        assert_eq!(plan.groups[0].by[0].field, "site_ast_id");
-        let aggregate = &plan.groups[0].aggregates[0];
-        assert_eq!(aggregate.op, RowAggregateOp::Count);
-        let predicates = aggregate
-            .predicate
-            .iter()
-            .map(|predicate| (predicate.field.field.as_str(), predicate.operand.clone()))
-            .collect::<Vec<_>>();
-        assert_eq!(
-            predicates
-                .iter()
-                .map(|(field, operand)| (*field, format!("{operand:?}")))
-                .collect::<Vec<_>>(),
-            vec![
-                (
-                    "selected",
-                    format!(
-                        "{:?}",
-                        RowPredicateOperand::Literal(RowLiteral::Boolean(true))
-                    )
-                ),
-                (
-                    "verdict",
-                    format!(
-                        "{:?}",
-                        RowPredicateOperand::Literal(RowLiteral::ConstrainedEnum(
-                            "applicable".to_string()
-                        ))
-                    )
-                ),
-            ]
-        );
-
-        assert_eq!(plan.assertions.len(), 1);
-        assert_eq!(plan.assertions[0].id.as_str(), "one-winner");
-        assert_eq!(plan.assertions[0].group.as_str(), "one-winner");
-        assert_eq!(
-            plan.assertions[0].cardinality,
-            AssertCardinality::Exactly(1),
-            "omitting the cardinality means the uniquely resolved site"
-        );
-    }
-
-    /// Zero and many stay assertable: an unresolved site accepted nothing, and
-    /// an ambiguous one accepted several.
-    #[test]
-    fn selected_in_winning_tier_states_zero_one_and_many_honestly() {
-        for (authored, expected) in [
-            (":cardinality (exactly 0)", AssertCardinality::Exactly(0)),
-            (":cardinality (at-least 2)", AssertCardinality::AtLeast(2)),
-        ] {
-            let source = format!(
-                r#"(policy
-                  :id "test.winning-tier" :name "Winning tier" :message "M" :severity warning
-                  :analysis (analysis :type assertion
-                    (bind :name site :query
-                      (rql (overload-selection (occurrences :role [member_position]))))
-                    (bind :name cand :query
-                      (rql (callable-applicability (occurrences :role [member_position]))))
-                    (assert-selected-in-winning-tier :id outcome
-                      :site site :candidates cand {authored})))"#
-            );
-            let parsed = parse(&source).unwrap();
-            let RqlpDocument::Policy { definition } = parsed.document else {
-                panic!("expected policy")
-            };
-            let PolicyAnalysis::Assertion { spec } = definition.analysis else {
-                panic!("expected assertion policy")
-            };
-            let plan = spec.relational.expect("relational plan");
-            assert_eq!(plan.assertions[0].cardinality, expected);
-        }
-    }
-
     /// The sugar names bindings, and a binding whose rows have no
     /// `site_ast_id` is reported before any workspace query runs.
     #[test]
@@ -7950,35 +7675,6 @@ mod tests {
             error.message.ends_with("see `bifrost --list-row-schemas`"),
             "{}",
             error.message
-        );
-    }
-
-    #[test]
-    fn selected_in_winning_tier_is_registered_for_hover() {
-        let source = r#"(policy
-          :id "test.winning-tier" :name "Winning tier" :message "M" :severity warning
-          :analysis (analysis :type assertion
-            (bind :name site :query
-              (rql (overload-selection (occurrences :role [member_position]))))
-            (bind :name cand :query
-              (rql (callable-applicability (occurrences :role [member_position]))))
-            (assert-selected-in-winning-tier :id one-winner
-              :site site :candidates cand)))"#;
-        let help = rqlp_source_help_at(
-            source,
-            source.find("assert-selected-in-winning-tier").unwrap() + 2,
-        )
-        .expect("registered record has hover help");
-        assert!(
-            help.signature
-                .starts_with("(assert-selected-in-winning-tier"),
-            "{}",
-            help.signature
-        );
-        assert!(
-            help.description.contains("winning applicability tier"),
-            "{}",
-            help.description
         );
     }
 
@@ -8069,55 +7765,6 @@ mod tests {
     }
 
     #[test]
-    fn an_unknown_verdict_spelling_names_every_accepted_value() {
-        let invalid = taint_policy(":on-unknown (on-unknown :verdict shrug)");
-        let error = parse(&invalid).unwrap_err().diagnostic;
-        assert_eq!(error.code, "invalid-enum-value");
-        assert_eq!(&invalid[error.range], "shrug");
-        assert_eq!(
-            error.message,
-            "invalid unknown-result verdict `shrug`; accepted values are abstain, \
-             warn-unreliable, fail-closed, treat-may-as-finding"
-        );
-    }
-
-    #[test]
-    fn on_unknown_records_and_verdicts_carry_hover_help() {
-        let source = taint_policy(":on-unknown (on-unknown :verdict warn-unreliable)");
-        let record = rqlp_source_help_at(&source, source.find("(on-unknown").unwrap() + 2)
-            .expect("registered record has hover help");
-        assert_eq!(
-            record.signature,
-            "(on-unknown :verdict abstain|warn-unreliable|fail-closed|treat-may-as-finding)"
-        );
-        assert!(
-            record
-                .description
-                .contains("unknown or incomplete evidence"),
-            "{}",
-            record.description
-        );
-
-        let atom = rqlp_source_help_at(&source, source.find("warn-unreliable").unwrap() + 2)
-            .expect("registered atom has hover help");
-        assert_eq!(atom.signature, "warn-unreliable");
-        assert!(
-            atom.description.contains("exit on the findings alone"),
-            "{}",
-            atom.description
-        );
-    }
-
-    #[test]
-    fn treat_may_as_finding_has_atom_hover_help() {
-        let source = taint_policy(":on-unknown (on-unknown :verdict treat-may-as-finding)");
-        let atom =
-            rqlp_source_help_at(&source, source.find("treat-may-as-finding").unwrap() + 2).unwrap();
-        assert_eq!(atom.signature, "treat-may-as-finding");
-        assert!(atom.description.contains("unmet coverage obligations"));
-    }
-
-    #[test]
     fn shared_analysis_scope_decodes_with_source_maps_and_inherited_pin() {
         let source = r#"(policy :id "shared.scope" :name "Shared scope" :message "m" :severity warning :analysis (analysis :type match :languages [jvm java] :where ["src/**"] :rql-schema-version 1 :selector (rql (call :callee (name "eval")))))"#;
         let parsed = parse(source).unwrap();
@@ -8195,79 +7842,6 @@ mod tests {
         assert_eq!(&source[diagnostic.range], "3");
         assert_eq!(&source[diagnostic.related[0].range.clone()], "1");
     }
-    #[test]
-    fn analysis_rql_pin_must_be_supported() {
-        let source = r#"(policy :id "shared.unsupported" :name "Unsupported" :message "m" :severity warning :analysis (analysis :type match :rql-schema-version 99 :selector (rql (call :callee (name "eval")))))"#;
-        let error = parse(source).unwrap_err();
-        assert_eq!(error.diagnostic.code, "unsupported-rql-schema-version");
-    }
-
-    #[test]
-    fn shared_language_labels_must_expand() {
-        let source = r#"(policy :id "shared.lang" :name "Lang" :message "m" :severity warning :analysis (analysis :type match :languages [notalang] :selector (rql (call :callee (name "eval")))))"#;
-        let error = parse(source).unwrap_err();
-        assert_eq!(error.diagnostic.code, "invalid-language-label");
-    }
-
-    #[test]
-    fn shared_scope_fields_carry_hover_help() {
-        let source = r#"(policy :id "shared.hover" :name "Hover" :message "m" :severity warning :analysis (analysis :type match :languages [jvm] :rql-schema-version 1 :selector (rql (call :callee (name "eval")))))"#;
-        let help = rqlp_source_help_at(source, source.find(":rql-schema-version").unwrap() + 2)
-            .expect("registered field has hover help");
-        assert_eq!(help.signature, ":rql-schema-version N");
-        let help = rqlp_source_help_at(source, source.find(":languages").unwrap() + 2)
-            .expect("registered field has hover help");
-        assert_eq!(help.signature, ":languages [LANGUAGE...]");
-        assert!(help.description.contains("js-ts"), "{}", help.description);
-    }
-
-    #[test]
-    fn shared_scope_fields_complete_from_partials() {
-        let prefix = r#"(policy :id "shared.complete" :name "Complete" :message "m" :severity warning :analysis (analysis :type match "#;
-        let suffix = r#" :selector (rql (call :callee (name "eval")))))"#;
-        let complete = |partial: &str| {
-            let source = format!("{prefix}{partial}{suffix}");
-            let offset = source.find(partial).unwrap() + partial.len() - 1;
-            rqlp_source_completion_at(&source, offset)
-                .unwrap_or_else(|| panic!("partial {partial} did not complete"))
-                .label
-        };
-        assert_eq!(complete(":lang"), ":languages");
-        assert_eq!(complete(":whe"), ":where");
-        assert_eq!(complete(":rql-s"), ":rql-schema-version");
-    }
-
-    #[test]
-    fn decodes_exact_match_policy_and_infers_compatible_versions() {
-        let parsed = parse(
-            r#"(policy
-              :id "bifrost.security.dynamic-eval"
-              :name "No dynamic evaluation"
-              :message "Dynamic evaluation is forbidden"
-              :severity warning
-              :analysis
-                (analysis :type match :selector
-                  (rql (language python (call :callee (name "eval"))))))"#,
-        )
-        .unwrap();
-        assert_eq!(
-            parsed.schema_resolution.origin,
-            SchemaVersionOrigin::ImplicitCompatible
-        );
-        let RqlpDocument::Policy { definition } = parsed.document else {
-            panic!("expected policy")
-        };
-        let PolicyAnalysis::Match { spec } = definition.analysis else {
-            panic!("expected match policy")
-        };
-        let PolicySelector::Inline { schema, query, .. } = spec.selector else {
-            panic!("expected inline selector")
-        };
-        let compatible_rql_version = resolve_rql_schema_version(None).unwrap().version;
-        assert_eq!(schema.version, compatible_rql_version);
-        assert_eq!(schema.origin, SchemaVersionOrigin::ImplicitCompatible);
-        assert_eq!(query.schema_version, u64::from(compatible_rql_version));
-    }
 
     #[test]
     fn decodes_diagnostic_neutral_endpoint() {
@@ -8323,40 +7897,6 @@ mod tests {
         let help = rqlp_source_help_at(source, result_offset).expect("result record hover help");
         assert_eq!(help.signature, "(result :index N)");
         assert!(help.description.contains("zero-based normal call result"));
-    }
-
-    #[test]
-    fn help_uri_requires_a_well_formed_http_url_with_a_host() {
-        for uri in [
-            "https://",
-            "https://[",
-            "https:example.test",
-            "https:/example.test",
-            "https:///example.test",
-            "https:////example.test",
-            r"https://example.test\path",
-            "https://example.test/%1",
-            "https://example.test/%zz",
-        ] {
-            let authored_uri = uri.replace('\\', "\\\\");
-            let source = format!(
-                r#"(policy :id "test.help" :name "Help" :help-uri "{authored_uri}"
-                  :message "M" :severity warning
-                  :analysis (analysis :type match :selector (rql (call))))"#
-            );
-            let error = parse(&source).unwrap_err().diagnostic;
-            assert_eq!(error.code, "invalid-help-uri");
-            assert_eq!(&source[error.range], format!(r#""{authored_uri}""#));
-        }
-
-        for uri in ["https://example.test/policy", "http://127.0.0.1/policy"] {
-            let source = format!(
-                r#"(policy :id "test.help" :name "Help" :help-uri "{uri}"
-                  :message "M" :severity warning
-                  :analysis (analysis :type match :selector (rql (call))))"#
-            );
-            parse(&source).unwrap();
-        }
     }
 
     #[test]
@@ -8839,95 +8379,6 @@ mod tests {
     }
 
     #[test]
-    fn enforces_source_and_syntax_tree_limits() {
-        let oversized = " ".repeat(MAX_RQLP_SOURCE_BYTES + 1);
-        assert_eq!(
-            parse(&oversized).unwrap_err().diagnostic.code,
-            "source-too-large"
-        );
-
-        let many_nodes = format!(
-            "(policy {})",
-            (0..MAX_RQLP_SEXP_NODES)
-                .map(|_| ":x 1")
-                .collect::<Vec<_>>()
-                .join(" ")
-        );
-        assert!(matches!(
-            parse(&many_nodes).unwrap_err().diagnostic.code,
-            "invalid-s-expression"
-        ));
-    }
-
-    #[test]
-    fn source_validation_caps_recovered_diagnostics() {
-        let unknown_fields = (0..MAX_RQLP_SOURCE_DIAGNOSTICS + 8)
-            .map(|index| format!(":unknown-{index} {index}"))
-            .collect::<Vec<_>>()
-            .join(" ");
-        let source = format!("(policy {unknown_fields})");
-
-        let diagnostics = validate_rqlp_source(&source);
-
-        assert_eq!(diagnostics.len(), MAX_RQLP_SOURCE_DIAGNOSTICS);
-        assert!(
-            diagnostics
-                .iter()
-                .all(|diagnostic| diagnostic.code == "unknown-field")
-        );
-    }
-
-    #[test]
-    fn schema_help_distinguishes_inferred_pinned_inline_and_deferred_versions() {
-        let omitted_policy = r#"(policy :id "p")"#;
-        let help = rqlp_source_help_at(omitted_policy, omitted_policy.find("policy").unwrap())
-            .expect("policy head help");
-        assert!(help.description.contains(":schema-version` is omitted"));
-        assert!(help.description.contains("currently `1`"));
-        assert!(help.description.contains("`:schema-version 1`"));
-
-        let pinned_endpoint = r#"(endpoint :schema-version 1 :id "e")"#;
-        let help = rqlp_source_help_at(
-            pinned_endpoint,
-            pinned_endpoint.find(":schema-version").unwrap(),
-        )
-        .expect("endpoint schema field help");
-        assert!(
-            help.description
-                .contains("explicitly pins policy schema version `1`")
-        );
-
-        let inline = r#"(policy :analysis (analysis :selector (rql (call))))"#;
-        let rql_offset = inline.find("(rql").unwrap() + 1;
-        let help = rqlp_source_help_at(inline, rql_offset).expect("inline RQL help");
-        assert!(help.description.contains("inline RQL selector"));
-        let compatible_rql_version = resolve_rql_schema_version(None).unwrap().version;
-        assert!(
-            help.description
-                .contains(&format!("currently `{compatible_rql_version}`"))
-        );
-
-        let deferred =
-            r#"(policy :analysis (analysis :selector (rql-file :path "queries/q.rql")))"#;
-        let rql_file_offset = deferred.find("rql-file").unwrap();
-        let help = rqlp_source_help_at(deferred, rql_file_offset).expect("deferred RQL help");
-        assert!(
-            help.description
-                .contains("resolved by the workspace loader")
-        );
-        assert!(help.description.contains("source-only validation"));
-
-        let pinned_inline =
-            r#"(policy :analysis (analysis :selector (rql :schema-version 1 (call))))"#;
-        let rql_offset = pinned_inline.find("(rql").unwrap() + 1;
-        let help = rqlp_source_help_at(pinned_inline, rql_offset).expect("pinned RQL help");
-        assert!(
-            help.description
-                .contains("explicitly pins RQL schema version `1`")
-        );
-    }
-
-    #[test]
     fn schema_version_completion_uses_registry_versions_and_exact_partial_range() {
         let policy = r#"(policy :id "😀" :sch"#;
         let completion = rqlp_source_completion_at(policy, policy.len())
@@ -8992,34 +8443,5 @@ mod tests {
                 .is_none()
         );
         assert!(canonical["analysis"]["transforms"][0].get("adds").is_none());
-    }
-
-    #[test]
-    fn flow_transforms_reject_taint_label_effect_fields() {
-        let source = flow_policy(
-            r#":transforms (endpoint-set :entries [
-                (transform :id normalize
-                  :selector (rql (language java (call :callee (name "normalize"))))
-                  :input (argument :index 0)
-                  :output return-value
-                  :removes [user-input])])"#,
-        );
-        assert_error_token(&source, "field-not-allowed", ":removes");
-    }
-
-    #[test]
-    fn taint_transforms_still_require_a_non_empty_effect() {
-        let source = taint_policy(
-            r#":transforms (endpoint-set :entries [
-                (transform :id normalize
-                  :selector (rql (language java (call :callee (name "normalize"))))
-                  :input (argument :index 0)
-                  :output return-value)])"#,
-        );
-        let error = parse(&source)
-            .expect_err("an empty taint transform must be rejected")
-            .diagnostic;
-        assert_eq!(error.code, "empty-transform");
-        assert!(source[error.range].starts_with("(transform"));
     }
 }

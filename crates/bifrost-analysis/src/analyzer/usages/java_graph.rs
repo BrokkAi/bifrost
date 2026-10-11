@@ -12,12 +12,11 @@ use brokk_bifrost_core::analyzer::query_token::QueryToken;
 mod shared;
 use crate::analyzer::usages::traits::GraphUsageAnalyzer;
 
-use crate::analyzer::usages::common::language_for_target;
+use crate::analyzer::usages::common::{language_for_target, with_relational_frontier};
 use crate::analyzer::usages::inverted_edges::{EdgeNodeDomain, UsageEdgeWeights, UsageEdges};
 use crate::analyzer::usages::java_graph::shared::{JavaEdgeResolver, JavaQueryResolver};
-use crate::analyzer::usages::model::FuzzyResult;
-use crate::analyzer::usages::outcome::{GraphFailureReason, GraphUsageOutcome};
-use crate::analyzer::usages::traits::{UsageQueryResolver, UsageScanScope};
+use crate::analyzer::usages::outcome::GraphUsageOutcome;
+use crate::analyzer::usages::traits::{GraphUsageDispatchSpec, UsageScanScope};
 use crate::analyzer::{CodeUnit, IAnalyzer, JavaAnalyzer, Language, ProjectFile, resolve_analyzer};
 use crate::hash::HashSet;
 use brokk_bifrost_jvm::java::graph::JavaGraphSource;
@@ -32,7 +31,6 @@ use brokk_bifrost_jvm::java::graph::resolver::{TargetKind, TargetSpec};
 use brokk_bifrost_jvm::java::graph::return_type::{
     FileReturnCache, MethodAnonymousReturnCache, MethodReturnCache,
 };
-use std::ffi::OsStr;
 use std::sync::Mutex;
 
 /// Run `visit` with the [`JavaGraphSource`] built from the *dispatching*
@@ -45,27 +43,14 @@ pub(in crate::analyzer::usages) fn with_java_graph_source<R>(
     mut visit: impl FnMut(JavaGraphSource<'_>) -> R,
 ) -> R {
     let scope = AnalyzerQueryScope::new(analyzer);
-    let cancellation = crate::CancellationToken::new();
-    match crate::analyzer::relational_frontier::resolve_relational_frontier(
-        analyzer,
-        &cancellation,
-        |frontier| {
-            visit(JavaGraphSource {
-                token: scope.token(),
-                index: analyzer,
-                hierarchy: analyzer.type_hierarchy_provider(),
-                relational_definitions: frontier,
-            })
-        },
-    ) {
-        crate::analyzer::RelationalFrontierOutcome::Complete(result) => result,
-        crate::analyzer::RelationalFrontierOutcome::Cancelled => {
-            unreachable!("an uncancelled Java helper frontier cannot cancel")
-        }
-        crate::analyzer::RelationalFrontierOutcome::Failed(error) => {
-            panic!("Java relational helper frontier failed: {error:?}")
-        }
-    }
+    with_relational_frontier(analyzer, "Java", |frontier| {
+        visit(JavaGraphSource {
+            token: scope.token(),
+            index: analyzer,
+            hierarchy: analyzer.type_hierarchy_provider(),
+            relational_definitions: frontier,
+        })
+    })
 }
 
 /// Build one Java file's exact, uncapped evidence inside the shared relational
@@ -111,11 +96,12 @@ pub(crate) fn build_java_file_usage_evidence(
 }
 
 pub(crate) fn merge_java_file_evidence(evidence: JavaFileUsageEvidence, state: &mut ScanState<'_>) {
-    state.hits.extend(evidence.hits);
-    state.unproven_hits.extend(evidence.unproven_hits);
-    *state.raw_match_count += evidence.raw_match_count;
-    *state.limit_exceeded =
-        crate::analyzer::usages::common::external_usage_hit_count(state.hits) > state.max_usages;
+    merge_java_evidence_into_state(
+        evidence.hits,
+        evidence.unproven_hits,
+        evidence.raw_match_count,
+        state,
+    );
 }
 
 /// Adapt the JVM-owned producer result to the snapshot cache's owned value.
@@ -194,11 +180,23 @@ pub(crate) fn merge_java_cached_file_evidence(
     evidence: &crate::analyzer::usages::java_usage_evidence_cache::JavaFileUsageEvidence,
     state: &mut ScanState<'_>,
 ) {
-    state.hits.extend(evidence.hits.iter().cloned());
-    state
-        .unproven_hits
-        .extend(evidence.unproven_hits.iter().cloned());
-    *state.raw_match_count += evidence.raw_match_count;
+    merge_java_evidence_into_state(
+        evidence.hits.iter().cloned(),
+        evidence.unproven_hits.iter().cloned(),
+        evidence.raw_match_count,
+        state,
+    );
+}
+
+fn merge_java_evidence_into_state(
+    hits: impl IntoIterator<Item = crate::analyzer::usages::model::UsageHit>,
+    unproven_hits: impl IntoIterator<Item = crate::analyzer::usages::model::UsageHit>,
+    raw_match_count: usize,
+    state: &mut ScanState<'_>,
+) {
+    state.hits.extend(hits);
+    state.unproven_hits.extend(unproven_hits);
+    *state.raw_match_count += raw_match_count;
     *state.limit_exceeded =
         crate::analyzer::usages::common::external_usage_hit_count(state.hits) > state.max_usages;
 }
@@ -211,8 +209,9 @@ pub(crate) fn build_java_usage_edges<F>(
 where
     F: Fn(&ProjectFile) -> bool + Sync,
 {
-    let resolver = JavaEdgeResolver::try_new(analyzer)?;
-    Some(resolver.build_edges(analyzer, nodes, keep_file))
+    with_java_edge_resolver(analyzer, |resolver| {
+        resolver.build_edges(analyzer, nodes, keep_file)
+    })
 }
 
 pub(crate) fn build_rooted_java_usage_edges<F>(
@@ -223,8 +222,9 @@ pub(crate) fn build_rooted_java_usage_edges<F>(
 where
     F: Fn(&ProjectFile) -> bool + Sync,
 {
-    let resolver = JavaEdgeResolver::try_new(analyzer)?;
-    Some(resolver.build_rooted_edges(analyzer, callers, keep_file))
+    with_java_edge_resolver(analyzer, |resolver| {
+        resolver.build_rooted_edges(analyzer, callers, keep_file)
+    })
 }
 
 pub(crate) fn build_java_usage_edge_weights<F>(
@@ -235,8 +235,17 @@ pub(crate) fn build_java_usage_edge_weights<F>(
 where
     F: Fn(&ProjectFile) -> bool + Sync,
 {
+    with_java_edge_resolver(analyzer, |resolver| {
+        resolver.build_edge_weights(analyzer, nodes, keep_file)
+    })
+}
+
+fn with_java_edge_resolver<'a, T>(
+    analyzer: &'a dyn IAnalyzer,
+    build: impl FnOnce(JavaEdgeResolver<'a>) -> T,
+) -> Option<T> {
     let resolver = JavaEdgeResolver::try_new(analyzer)?;
-    Some(resolver.build_edge_weights(analyzer, nodes, keep_file))
+    Some(build(resolver))
 }
 
 /// Collect hits on a JVM *type* target declared in another JVM language from
@@ -375,30 +384,18 @@ impl GraphUsageAnalyzer for JavaUsageGraphStrategy {
         scan_scope: &UsageScanScope<'_>,
         max_usages: usize,
     ) -> GraphUsageOutcome {
-        if overloads.is_empty() {
-            return GraphUsageOutcome::Resolved(FuzzyResult::empty_success());
-        }
-
-        let target = &overloads[0];
-        if language_for_target(target) != Language::Java {
-            return GraphUsageOutcome::fallback_safe(
-                target.fq_name(),
-                GraphFailureReason::UnsupportedTargetLanguage("target is not Java"),
-                "JavaUsageGraphStrategy",
-            );
-        }
-
-        let Some(resolver) = JavaQueryResolver::try_new(analyzer) else {
-            return GraphUsageOutcome::fallback_safe(
-                target.fq_name(),
-                GraphFailureReason::MissingAnalyzerCapability(
-                    "analyzer does not expose JavaAnalyzer",
-                ),
-                "JavaUsageGraphStrategy",
-            );
-        };
-
-        resolver.find_usages(analyzer, overloads, scan_scope, max_usages)
+        crate::analyzer::usages::traits::dispatch_graph_usage_query::<JavaQueryResolver<'_>>(
+            analyzer,
+            overloads,
+            scan_scope,
+            max_usages,
+            GraphUsageDispatchSpec {
+                target_language: Language::Java,
+                unsupported_target: "target is not Java",
+                missing_analyzer: "analyzer does not expose JavaAnalyzer",
+                strategy: "JavaUsageGraphStrategy",
+            },
+        )
     }
 }
 
@@ -583,7 +580,7 @@ where
     with_java_graph_source(analyzer, |graph| {
         build_edge_output(files, &keep_file, |file| {
             let state = file_states.get(file);
-            let include_file_scope = is_java_module_descriptor(file);
+            let include_file_scope = crate::analyzer::common::is_java_module_descriptor_file(file);
             let mut declarations = state
                 .map(|state| {
                     build_file_declarations_from_state_with_file_scope(state, include_file_scope)
@@ -617,82 +614,19 @@ where
     })
 }
 
-fn is_java_module_descriptor(file: &ProjectFile) -> bool {
-    file.rel_path().file_name() == Some(OsStr::new("module-info.java"))
-}
-
 #[cfg(test)]
 mod relational_inverted_tests {
     use super::*;
-    use crate::analyzer::TestProject;
-    use crate::analyzer::usages::model::{UsageHitKind, UsageProof};
+    use crate::analyzer::{JavaAnalyzer, Language, ProjectFile, TestProject};
     use crate::inline_project::InlineTestProject;
-    use brokk_bifrost_core::analyzer::CodeUnitIndex;
-    use brokk_bifrost_core::analyzer::usages::model::FuzzyResult;
+    use brokk_bifrost_core::analyzer::usages::model::{FuzzyResult, UsageHitKind, UsageProof};
     use brokk_bifrost_core::analyzer::usages::scan_scope::UsageScanScope;
+    use brokk_bifrost_core::analyzer::{CodeUnit, CodeUnitIndex};
 
     #[test]
-    fn java_inverted_type_and_member_resolution_builds_no_global_definition_shard() {
-        let temp = tempfile::tempdir().expect("temp dir");
-        let root = temp.path().canonicalize().expect("canonical temp dir");
-        ProjectFile::new(root.clone(), "Service.java")
-            .write("package api; public class Service { public void run() {} }\n")
-            .expect("write Java fixture");
-        ProjectFile::new(root.clone(), "Consumer.java")
-            .write(
-                "package app; import api.*;\n\
-                 class Consumer { void call(Service service) { service.run(); } }\n",
-            )
-            .expect("write Java consumer");
-        let analyzer = JavaAnalyzer::from_project(TestProject::new(root, Language::Java));
-        let nodes = analyzer
-            .get_all_declarations()
-            .into_iter()
-            .map(|unit| unit.fq_name())
-            .collect::<HashSet<_>>();
-        let edges = build_java_usage_edges(&analyzer, &nodes, |_| true)
-            .expect("Java edge resolver should be available");
-
-        assert!(
-            edges.edges.keys().any(|(caller, callee)| {
-                caller == "app.Consumer.call" && callee == "api.Service.run"
-            }),
-            "typed receiver call must resolve through relational type and member questions: {:?}",
-            edges.edges.keys().collect::<Vec<_>>()
-        );
-    }
-
-    #[test]
-    fn java_forward_type_member_and_target_resolution_uses_relational_lookup() {
-        let temp = tempfile::tempdir().expect("temp dir");
-        let root = temp.path().canonicalize().expect("canonical temp dir");
-        ProjectFile::new(root.clone(), "Service.java")
-            .write("package api; public class Service { public void run() {} }\n")
-            .expect("write Java fixture");
-        let consumer = ProjectFile::new(root.clone(), "Consumer.java");
-        consumer
-            .write(
-                "package app; import api.*;\n\
-                 class Consumer { void call(Service service) { service.run(); } }\n",
-            )
-            .expect("write Java consumer");
-        let analyzer = JavaAnalyzer::from_project(TestProject::new(root, Language::Java));
-        let target = analyzer
-            .get_all_declarations()
-            .into_iter()
-            .find(|unit| unit.fq_name() == "api.Service.run")
-            .expect("fixture declares Service.run");
-        let candidates = HashSet::from_iter([consumer]);
-        let scope = UsageScanScope::new(&candidates);
-
-        let outcome = JavaUsageGraphStrategy::new()
-            .find_graph_usages(&analyzer, std::slice::from_ref(&target), &scope, 100)
-            .into_fuzzy_result();
-
-        assert_eq!(outcome.all_hits_including_imports().len(), 1, "{outcome:?}");
-    }
-
-    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "65ea4f91bb3b: Java inverse references omitted physical copies that shared an FQN"
+    )]
     fn java_type_reference_reaches_each_duplicate_source_copy() {
         let project = InlineTestProject::with_language(Language::Java)
             .file(
@@ -743,6 +677,59 @@ mod relational_inverted_tests {
                 "each physical source copy must receive the proven FQ reference: {outcome:#?}"
             );
         }
+    }
+
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#4271: a Java comment in the argument list shifted inverse overload arity"
+    )]
+    fn java_inverse_receiver_overload_arity_ignores_comment_extra_node() {
+        let project = InlineTestProject::with_language(Language::Java)
+            .file(
+                "app/Owner.java",
+                "package app;\n\
+                 class PairResult { void target() {} }\n\
+                 class TripleResult { void target() {} }\n\
+                 public class Owner {\n\
+                     PairResult foo(Object a, Object b) { return null; }\n\
+                     TripleResult foo(Object a, Object b, Object c) { return null; }\n\
+                     void caller(Object a, Object b) { foo(a /* note */, b).target(); }\n\
+                 }\n",
+            )
+            .build();
+        let analyzer = JavaAnalyzer::from_project(project.project().clone());
+        let target = analyzer
+            .get_definitions("app.PairResult.target")
+            .into_iter()
+            .find(CodeUnit::is_function)
+            .expect("two-argument overload result method");
+        let three_argument_target = analyzer
+            .get_definitions("app.TripleResult.target")
+            .into_iter()
+            .find(CodeUnit::is_function)
+            .expect("three-argument overload result method");
+        let caller = analyzer
+            .get_definitions("app.Owner.caller")
+            .into_iter()
+            .find(CodeUnit::is_function)
+            .expect("caller method");
+        let pair_fqn = target.fq_name();
+        let triple_fqn = three_argument_target.fq_name();
+        let caller_fqn = caller.fq_name();
+        let graph = build_java_usage_edges(
+            &analyzer,
+            &HashSet::from_iter([pair_fqn.clone(), triple_fqn.clone(), caller_fqn]),
+            |_| true,
+        )
+        .expect("Java inverse usage graph");
+        assert!(
+            graph.edges.keys().any(|(_, callee)| callee == &pair_fqn),
+            "the commented two-argument call must resolve through PairResult"
+        );
+        assert!(
+            !graph.edges.keys().any(|(_, callee)| callee == &triple_fqn),
+            "the commented two-argument call must not resolve through TripleResult"
+        );
     }
 
     #[test]

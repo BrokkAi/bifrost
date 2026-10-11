@@ -4,13 +4,13 @@ use crate::graph::resolver::{
     CSharpBuiltinValueArguments, CSharpCallArgumentOwners, CSharpInitializerOwnerLookups,
     TargetKind, TargetSpec, UnqualifiedMethodGroupResolution,
     applicable_member_candidates_for_owner, argument_count, binding_scope_node,
-    call_argument_parameter_index, callable_parameter_type_fq_name, class_unit_for_fq_name,
-    collection_target_element_type_node, csharp_invocation_member, enclosing_declared_type,
-    extension_visibility_site_key, filter_call_argument_method_candidates, first_type_child,
-    is_type_reference_node, member_declared_collection_element_type_fq_name,
-    member_name_is_locally_bound, nearest_member_candidates_for_owner, node_text,
-    normalize_type_text, object_initializer_for_label, object_initializer_owners,
-    receiver_targets_owner, reference_type_text, resolve_arity_free_type_fq_name_at,
+    callable_parameter_type_fq_name, class_unit_for_fq_name, collection_target_element_type_node,
+    csharp_invocation_member, enclosing_declared_type, extension_visibility_site_key,
+    filter_call_argument_method_candidates, first_type_child, is_type_reference_node,
+    member_declared_collection_element_type_fq_name, member_name_is_locally_bound,
+    nearest_member_candidates_for_owner, node_text, normalize_type_text,
+    object_initializer_for_label, object_initializer_owners, receiver_targets_owner,
+    reference_type_text, resolve_arity_free_type_fq_name_at, resolve_call_argument_owners,
     resolve_type_fq_name_at, resolve_unqualified_method_group_for_owner, resolves_to_target,
     resolves_to_target_at, same_node, seed_visible_bindings_at, type_identity_matches,
     unqualified_member_has_local_binding, unqualified_member_has_structured_shadow,
@@ -23,9 +23,10 @@ use crate::syntax::{
     CSharpNamedArgumentLabel, csharp_attribute_terminal_name,
     csharp_cast_relational_generic_call_for_name, csharp_conditional_member_access,
     csharp_constant_pattern_type_candidate, csharp_implicit_accessor_value,
-    csharp_local_binder_name, csharp_member_access_type_receiver, csharp_member_name,
-    csharp_named_argument_label, csharp_nameof_type_candidates, csharp_relational_generic_call,
-    csharp_relational_generic_call_for_argument, csharp_type_leftmost_identifier,
+    csharp_local_binder_name, csharp_member_access_receiver, csharp_member_access_type_receiver,
+    csharp_member_name, csharp_named_argument_label, csharp_nameof_type_candidates,
+    csharp_relational_generic_call, csharp_relational_generic_call_for_argument,
+    csharp_transparent_expression_parent, csharp_type_leftmost_identifier,
     csharp_type_reference_root, csharp_type_terminal_identifier,
     csharp_unqualified_invocation_for_name,
 };
@@ -105,23 +106,17 @@ pub fn scan_prepared_file(
         return;
     }
 
-    let mut ctx = ScanCtx {
+    let mut ctx = ScanCtx::new(
         csharp,
         graph,
         file,
-        source: &prepared.source,
-        line_starts: &prepared.line_starts,
+        prepared,
         spec,
-        hits: state.hits,
-        unproven_hits: state.unproven_hits,
-        max_usages: state.max_usages,
-        limit_exceeded: state.limit_exceeded,
-        enclosing_cache: HashMap::default(),
-        nearest_member_target_cache: HashMap::default(),
-        extension_target_cache: HashMap::default(),
-        class_ranges: prepared.class_ranges.clone(),
-        using_aliases: &prepared.using_aliases,
-    };
+        state.max_usages,
+        state.hits,
+        state.unproven_hits,
+        state.limit_exceeded,
+    );
     scan_nodes(
         prepared.tree.root_node(),
         token,
@@ -139,22 +134,18 @@ pub fn scan_prepared_file_batch<'a>(
 ) {
     let mut contexts: Vec<_> = scans
         .iter_mut()
-        .map(|scan| ScanCtx {
-            csharp,
-            graph,
-            file,
-            source: &prepared.source,
-            line_starts: &prepared.line_starts,
-            spec: scan.spec,
-            hits: &mut *scan.hits,
-            unproven_hits: &mut *scan.unproven_hits,
-            max_usages: scan.max_usages,
-            limit_exceeded: &mut *scan.limit_exceeded,
-            enclosing_cache: HashMap::default(),
-            nearest_member_target_cache: HashMap::default(),
-            extension_target_cache: HashMap::default(),
-            class_ranges: prepared.class_ranges.clone(),
-            using_aliases: &prepared.using_aliases,
+        .map(|scan| {
+            ScanCtx::new(
+                csharp,
+                graph,
+                file,
+                prepared,
+                scan.spec,
+                scan.max_usages,
+                &mut *scan.hits,
+                &mut *scan.unproven_hits,
+                &mut *scan.limit_exceeded,
+            )
         })
         .collect();
     scan_nodes(prepared.tree.root_node(), token, &mut contexts);
@@ -177,6 +168,39 @@ pub(super) struct ScanCtx<'a> {
     extension_target_cache: HashMap<ExtensionTargetCacheKey, TargetMemberResolution>,
     pub(super) class_ranges: ClassRangeIndex,
     using_aliases: &'a HashMap<String, String>,
+}
+
+impl<'a> ScanCtx<'a> {
+    #[allow(clippy::too_many_arguments)]
+    fn new(
+        csharp: &'a dyn CSharpSource,
+        graph: &'a CSharpGraphSource<'a>,
+        file: &'a ProjectFile,
+        prepared: &'a PreparedCSharpFile,
+        spec: &'a TargetSpec,
+        max_usages: usize,
+        hits: &'a mut BTreeSet<UsageHit>,
+        unproven_hits: &'a mut BTreeSet<UsageHit>,
+        limit_exceeded: &'a mut bool,
+    ) -> Self {
+        Self {
+            csharp,
+            graph,
+            file,
+            source: &prepared.source,
+            line_starts: &prepared.line_starts,
+            spec,
+            hits,
+            unproven_hits,
+            max_usages,
+            limit_exceeded,
+            enclosing_cache: HashMap::default(),
+            nearest_member_target_cache: HashMap::default(),
+            extension_target_cache: HashMap::default(),
+            class_ranges: prepared.class_ranges.clone(),
+            using_aliases: &prepared.using_aliases,
+        }
+    }
 }
 
 type ExtensionTargetCacheKey = (
@@ -1103,11 +1127,7 @@ fn containing_method_group_value_context(node: Node<'_>) -> bool {
 }
 
 fn transparent_expression_parent(current: Node<'_>, parent: Node<'_>) -> bool {
-    matches!(
-        parent.kind(),
-        "parenthesized_expression" | "checked_expression"
-    ) || (parent.kind() == "cast_expression"
-        && parent.child_by_field_name("value") == Some(current))
+    csharp_transparent_expression_parent(current, parent)
         || is_delegate_binary_operand(current, parent)
         || (parent.kind() == "postfix_unary_expression"
             && parent.named_child(0) == Some(current)
@@ -1370,37 +1390,24 @@ impl CSharpInitializerOwnerLookups for InverseInitializerOwnerLookups<'_, '_> {
 
     fn call_argument_owners(&mut self, call: Node<'_>, index: usize) -> CSharpCallArgumentOwners {
         let candidates = inverse_call_argument_method_candidates(call, self.token, self.ctx);
-        if candidates.len() != 1 {
-            return CSharpCallArgumentOwners {
-                owners: Vec::new(),
-                ambiguous_call_candidates: candidates,
-            };
-        }
-        let method = &candidates[0];
-        let metadata = self.ctx.csharp.signature_metadata(method);
-        let Some(metadata) = metadata.first() else {
-            return CSharpCallArgumentOwners {
-                owners: Vec::new(),
-                ambiguous_call_candidates: Vec::new(),
-            };
-        };
-        let Some(parameter_index) =
-            call_argument_parameter_index(call, index, metadata, self.ctx.source)
-        else {
-            return CSharpCallArgumentOwners {
-                owners: Vec::new(),
-                ambiguous_call_candidates: Vec::new(),
-            };
-        };
-        let owners =
-            callable_parameter_type_fq_name(self.ctx.csharp, self.token, method, parameter_index)
+        resolve_call_argument_owners(
+            call,
+            index,
+            self.ctx.source,
+            candidates,
+            |method| self.ctx.csharp.signature_metadata(method),
+            |method, parameter_index| {
+                callable_parameter_type_fq_name(
+                    self.ctx.csharp,
+                    self.token,
+                    method,
+                    parameter_index,
+                )
                 .and_then(|fqn| class_unit_for_fq_name(self.ctx.csharp, self.token, &fqn))
                 .into_iter()
-                .collect();
-        CSharpCallArgumentOwners {
-            owners,
-            ambiguous_call_candidates: Vec::new(),
-        }
+                .collect()
+            },
+        )
     }
 
     fn collection_target_owners(&mut self, target: Node<'_>) -> Vec<CodeUnit> {
@@ -1434,15 +1441,7 @@ impl CSharpInitializerOwnerLookups for InverseInitializerOwnerLookups<'_, '_> {
             )
             .is_empty()
             {
-                return member_declared_collection_element_type_fq_name(
-                    self.ctx.csharp,
-                    self.token,
-                    &owner,
-                    name,
-                )
-                .and_then(|fqn| class_unit_for_fq_name(self.ctx.csharp, self.token, &fqn))
-                .into_iter()
-                .collect();
+                return self.member_element_type_owners(&owner, name);
             }
             match self.ctx.csharp.parent_of(&owner) {
                 Some(parent) => owner = parent,
@@ -1709,8 +1708,7 @@ pub fn is_statement_label(node: Node<'_>) -> bool {
 }
 
 pub fn member_access_receiver(node: Node<'_>) -> Option<Node<'_>> {
-    node.child_by_field_name("expression")
-        .or_else(|| node.named_child(0))
+    csharp_member_access_receiver(node)
 }
 
 pub fn member_access_name(node: Node<'_>) -> Option<Node<'_>> {

@@ -1,5 +1,6 @@
 //! Graph projections of published JavaScript/TypeScript source facts.
 
+use crate::providers::JsTsSource;
 use crate::source_facts::JsTsFileSourceFacts;
 use brokk_bifrost_core::analyzer::js_ts_facts::{JsTsExportKind, JsTsSourceFacts};
 use brokk_bifrost_core::analyzer::model::CodeUnit;
@@ -38,6 +39,23 @@ pub fn declaration_ids_for_unit(
                 .then_some(*declaration)
         })
         .collect()
+}
+
+pub fn code_unit_is_script_global_binding(
+    host: &dyn JsTsSource,
+    candidate: &CodeUnit,
+    name: &str,
+) -> bool {
+    let Some(facts) = host.source_facts(candidate.source()) else {
+        return false;
+    };
+    if facts.facts.file_is_external_module {
+        return false;
+    }
+    let declarations = declaration_ids_for_unit(&facts, candidate);
+    facts.facts.declaration_bindings.iter().any(|binding| {
+        declarations.contains(&binding.declaration) && binding.name == name && binding.is_program
+    })
 }
 
 /// Project canonical JS/TS export rows into the graph's export index.

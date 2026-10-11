@@ -717,7 +717,8 @@ fn nonempty_stage_body_families_round_trip_through_indexed_rows() {
     )
     .with_type_argument_slots(vec![type_argument])
     .with_owner_type_arguments(Some(owner_segment), vec![owner_type_argument])
-    .with_expected_result_slot(Some(expected));
+    .with_expected_result_slot(Some(expected))
+    .with_language(Language::Java);
     let deferred = LoweredDeferredMemberOwner::new(
         definition,
         parameter_slot,
@@ -768,7 +769,7 @@ fn nonempty_stage_body_families_round_trip_through_indexed_rows() {
     assert_eq!(actual, signature);
     let actual=connection.query_row("SELECT *,json(body) AS body_json FROM temp.selected_resolution_stage_deferred_member_owners WHERE producer_id=1",[],|row|Ok(decode_deferred_owner(row).unwrap())).unwrap();
     assert_eq!(actual, deferred);
-    let actual=connection.query_row("SELECT *,json(argument_slots) AS argument_slots_json,json(type_argument_slots) AS type_argument_slots_json,json(eligible_rules) AS eligible_rules_json,json(completion) AS completion_json FROM temp.selected_resolution_stage_call_obligations WHERE producer_id=1",[],|row|Ok(decode_call_obligation(row).unwrap())).unwrap();
+    let actual=connection.query_row("SELECT call.*,mount.semantic_language,json(call.argument_slots) AS argument_slots_json,json(call.type_argument_slots) AS type_argument_slots_json,json(call.eligible_rules) AS eligible_rules_json,json(call.completion) AS completion_json FROM temp.selected_resolution_stage_call_obligations call JOIN temp.selected_resolution_mounts mount ON mount.mount_ordinal=call.host_ordinal WHERE call.producer_id=1",[],|row|Ok(decode_call_obligation(row).unwrap())).unwrap();
     assert_eq!(actual, call);
     connection.execute_batch("ROLLBACK").unwrap();
 }

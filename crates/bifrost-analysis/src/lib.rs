@@ -30,19 +30,20 @@ pub mod file_tools;
 pub mod model_context;
 pub mod navigation;
 pub mod path_utils;
-pub mod process;
+pub use brokk_bifrost_core::process;
 pub mod relevance;
 pub mod searchtools;
 pub mod searchtools_render;
 pub mod summary;
 pub mod symbol_rename;
-#[cfg(test)]
-mod test_support;
+#[cfg(any(test, feature = "test-support"))]
+pub mod test_support;
 pub mod workspace_document;
 
+pub use brokk_bifrost_core::benchmark_provenance::git_commit;
 pub use brokk_bifrost_core::{
     cache_db, cancellation, compact_graph, define_identifier, git_file, gitblob, hash,
-    panic_report, path_normalization, profiling, schema_version, text_utils, util,
+    panic_report, path_normalization, profiling, schema_version, sqlite_template, text_utils, util,
 };
 
 /// The reader seam's per-method counters (`BIFROST_SEAM_PROFILE`).
@@ -67,13 +68,14 @@ pub use analyzer::{
     ImportReachability, IngestedSource, JavaAnalyzer, JavascriptAnalyzer, JvmAnalyzerConfig,
     JvmDependencyDiscoveryConfig, JvmDependencyDiscoveryMode, JvmExternalArtifact,
     JvmExternalDependencies, JvmMavenCoordinate, JvmStandardLibraryDiscoveryConfig, KotlinAnalyzer,
-    Language, MultiAnalyzer, MultiRootProject, OverlayProject, ParseError, ParseErrorKind,
-    PhpAnalyzer, PhpAnalyzerConfig, PhpDependencyApiEvidence, PhpDependencyPackAdapter, Project,
-    ProjectCoverage, ProjectFile, PythonAnalyzer, PythonSemanticModelWorkspaceContext, Range,
-    RubyAnalyzer, RubyAnalyzerConfig, RubyDependencyApiEvidence, RubyDependencyPackAdapter,
-    RubyGemApiArtifact, RustAnalyzer, RustAnalyzerConfig, RustDependencyApiEvidence,
-    RustDependencyPackAdapter, RustPackageApiArtifact, RustSelectedTarget, RustdocJsonPackProducer,
-    ScalaAnalyzer, SourceContent, SourceIngestionError, SourceIngestionKind, SubsetCoverage,
+    Language, MultiAnalyzer, MultiRootProject, OverlayProject, ParseCompleteness, ParseError,
+    ParseErrorKind, PhpAnalyzer, PhpAnalyzerConfig, PhpDependencyApiEvidence,
+    PhpDependencyPackAdapter, Project, ProjectCoverage, ProjectFile, PythonAnalyzer,
+    PythonSemanticModelWorkspaceContext, Range, RubyAnalyzer, RubyAnalyzerConfig,
+    RubyDependencyApiEvidence, RubyDependencyPackAdapter, RubyGemApiArtifact, RustAnalyzer,
+    RustAnalyzerConfig, RustDependencyApiEvidence, RustDependencyPackAdapter,
+    RustPackageApiArtifact, RustSelectedTarget, RustdocJsonPackProducer, ScalaAnalyzer,
+    SourceContent, SourceIngestionError, SourceIngestionKind, SubsetCoverage,
     TestAssertionAnalysis, TestAssertionSmell, TestAssertionWeights, TestDetectionProvider,
     TestProject, TreeSitterAnalyzer, TypeAliasProvider, TypeHierarchyProvider, TypescriptAnalyzer,
     WorkspaceAnalyzer, WorkspaceFileListingCache, collect_workspace_files,
@@ -94,6 +96,7 @@ pub use summary::{RenderedSummary, SummaryInput, summarize_inputs};
 /// Shipped builds do not expose this module.
 #[cfg(any(test, feature = "test-support"))]
 pub mod native_resolution_test_support {
+    pub use crate::analyzer::jvm::jmod_artifact::test_module_info_class_bytes as jmod_module_info_class_bytes;
     pub use crate::analyzer::resolution::*;
     pub use crate::analyzer::usages::workspace_graph::{
         SelectedWorkspaceUsageRankingBuildOutcome, SelectedWorkspaceUsageRankingGraph,
@@ -110,7 +113,9 @@ pub mod native_resolution_test_support {
         JavaNativeSelectedReferenceIndex, JavaNativeUsageStrategy, JavaSelectedReverseOutcome,
         java_native_incoming_calls, java_native_rename, java_selected_inverse_for,
     };
-    pub use crate::analyzer::{NativeTypeProbe, probe_native_definition, probe_native_type};
+    pub use crate::analyzer::{
+        NativeTypeProbe, probe_native_definition, probe_native_definition_trace, probe_native_type,
+    };
     pub use crate::analyzer::{
         RustSelectedReverseOutcome, RustSelectedReverseQueries, with_rust_selected_reverse_queries,
     };
@@ -186,14 +191,15 @@ pub mod native_resolution_test_support {
         file: &brokk_bifrost_core::analyzer::ProjectFile,
         source: &str,
     ) -> FileResolutionFacts {
-        let mut parser = tree_sitter::Parser::new();
-        parser
-            .set_language(&tree_sitter_java::LANGUAGE.into())
-            .expect("Java grammar must match the shared tree-sitter runtime");
-        let tree = parser
-            .parse(source, None)
-            .expect("Java differential fixture must produce a syntax tree");
-        brokk_bifrost_jvm::java::declarations::parse_java_file(file, source, &tree).resolution_facts
+        parse_resolution_facts(
+            file,
+            source,
+            tree_sitter_java::LANGUAGE.into(),
+            |file, source, tree| {
+                brokk_bifrost_jvm::java::declarations::parse_java_file(file, source, tree)
+                    .resolution_facts
+            },
+        )
     }
 
     /// Run the production Rust parse walk and return only its target-independent
@@ -202,13 +208,35 @@ pub mod native_resolution_test_support {
         file: &brokk_bifrost_core::analyzer::ProjectFile,
         source: &str,
     ) -> FileResolutionFacts {
+        parse_resolution_facts(
+            file,
+            source,
+            tree_sitter_rust::LANGUAGE.into(),
+            |file, source, tree| {
+                brokk_bifrost_rust::declarations::parse_rust_file(file, source, tree)
+                    .resolution_facts
+            },
+        )
+    }
+
+    fn parse_resolution_facts(
+        file: &brokk_bifrost_core::analyzer::ProjectFile,
+        source: &str,
+        language: tree_sitter::Language,
+        parse: impl FnOnce(
+            &brokk_bifrost_core::analyzer::ProjectFile,
+            &str,
+            &tree_sitter::Tree,
+        )
+            -> brokk_bifrost_core::analyzer::resolution_facts::FileResolutionFacts,
+    ) -> FileResolutionFacts {
         let mut parser = tree_sitter::Parser::new();
         parser
-            .set_language(&tree_sitter_rust::LANGUAGE.into())
-            .expect("Rust grammar must match the shared tree-sitter runtime");
+            .set_language(&language)
+            .expect("grammar must match the shared tree-sitter runtime");
         let tree = parser
             .parse(source, None)
-            .expect("Rust differential fixture must produce a syntax tree");
-        brokk_bifrost_rust::declarations::parse_rust_file(file, source, &tree).resolution_facts
+            .expect("differential fixture must produce a syntax tree");
+        parse(file, source, &tree)
     }
 }

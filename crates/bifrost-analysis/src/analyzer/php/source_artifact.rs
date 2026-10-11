@@ -6,7 +6,7 @@
 
 use std::path::Path;
 
-use tree_sitter::{Node, Parser, Tree};
+use tree_sitter::Node;
 
 use crate::CancellationToken;
 use crate::analyzer::semantic_model::{
@@ -16,8 +16,9 @@ use crate::analyzer::semantic_model::{
     member_declaration_id, type_declaration_id,
 };
 use brokk_bifrost_core::analyzer::semantic_diagnostics::node_text;
+use brokk_bifrost_core::analyzer::tree_walk::child_by_field_or_named_child_of_kinds;
 use brokk_bifrost_php::aliases::{
-    PhpFileContext, PhpFileContextIndex, php_namespace_to_fq, resolve_php_type,
+    PhpFileContext, PhpFileContextIndex, parse_php_tree, php_namespace_to_fq, resolve_php_type,
 };
 use brokk_bifrost_php::graph::syntax::declaration_doc_comment;
 
@@ -540,11 +541,7 @@ fn project_type<'tree>(
 }
 
 fn type_body(node: Node<'_>) -> Option<Node<'_>> {
-    node.child_by_field_name("body").or_else(|| {
-        let mut cursor = node.walk();
-        node.named_children(&mut cursor)
-            .find(|child| child.kind() == "declaration_list")
-    })
+    child_by_field_or_named_child_of_kinds(node, "body", &["declaration_list"])
 }
 
 fn hierarchy_of(node: Node<'_>, source: &str, ctx: &PhpFileContext) -> Vec<HierarchyFact> {
@@ -643,6 +640,8 @@ fn project_callable(
     Some(MemberFact {
         non_overridable: None,
         ambient_use: None,
+        value_type: None,
+        proxied_type: None,
         id,
         owner: owner.id,
         name: name.clone(),
@@ -654,6 +653,7 @@ fn project_callable(
         implicit_operation: None,
         explicit_operation: None,
         callable_family_complete: false,
+        exact_return_classes: Vec::new(),
         signature: Some(signature),
         receiver: None,
         extension_receiver: None,
@@ -703,6 +703,7 @@ fn callable_signature(node: Node<'_>, source: &str, ctx: &PhpFileContext) -> Sig
                     .unwrap_or_else(unknown_type),
                 optional: child.child_by_field_name("default_value").is_some(),
                 variadic: child.kind() == "variadic_parameter",
+                role: None,
                 passing_mode: Default::default(),
             });
         }
@@ -766,6 +767,8 @@ fn project_properties(
         members.push(MemberFact {
             non_overridable: None,
             ambient_use: None,
+            value_type: None,
+            proxied_type: None,
             id,
             owner: owner.id.clone(),
             name: name.to_owned(),
@@ -777,6 +780,7 @@ fn project_properties(
             implicit_operation: None,
             explicit_operation: None,
             callable_family_complete: false,
+            exact_return_classes: Vec::new(),
             signature: Some(signature),
             receiver: None,
             extension_receiver: None,
@@ -851,6 +855,8 @@ fn constant_member(
     MemberFact {
         non_overridable: None,
         ambient_use: None,
+        value_type: None,
+        proxied_type: None,
         id,
         owner: owner.id,
         name: name.clone(),
@@ -862,6 +868,7 @@ fn constant_member(
         implicit_operation: None,
         explicit_operation: None,
         callable_family_complete: false,
+        exact_return_classes: Vec::new(),
         signature: None,
         receiver: None,
         extension_receiver: None,
@@ -1034,8 +1041,8 @@ fn unknown_type() -> TypeRef {
 }
 
 fn declaration_name(node: Node<'_>, source: &str) -> Option<String> {
-    let name = node.child_by_field_name("name")?;
-    let text = node_text(name, source).trim();
+    let name = crate::analyzer::common::declaration_container_name(source, node)?;
+    let text = name.trim();
     (!text.is_empty()).then(|| text.to_owned())
 }
 
@@ -1045,11 +1052,7 @@ fn visibility_of(node: Node<'_>, source: &str) -> Visibility {
         if child.kind() != "visibility_modifier" {
             continue;
         }
-        return match node_text(child, source).trim() {
-            "private" => Visibility::Private,
-            "protected" => Visibility::Protected,
-            _ => Visibility::Public,
-        };
+        return crate::analyzer::common::visibility_from_modifier_text(node_text(child, source));
     }
     Visibility::Public
 }
@@ -1065,11 +1068,7 @@ fn has_modifier(node: Node<'_>, source: &str, modifier: &str) -> bool {
 }
 
 fn qualify(namespace: &str, name: &str) -> String {
-    if namespace.is_empty() {
-        name.to_owned()
-    } else {
-        format!("{namespace}.{name}")
-    }
+    brokk_bifrost_core::analyzer::common::qualify_dotted_name(namespace, name)
 }
 
 fn artifact_locator(
@@ -1078,10 +1077,7 @@ fn artifact_locator(
     entry_path: &str,
     symbol: &str,
 ) -> Locator {
-    Locator::Artifact {
-        path: logical_path(origin, artifact_sha256, entry_path),
-        symbol: symbol.to_owned(),
-    }
+    Locator::artifact(logical_path(origin, artifact_sha256, entry_path), symbol)
 }
 
 fn logical_path(
@@ -1092,21 +1088,13 @@ fn logical_path(
     format!("{}+sha256:{artifact_sha256}!/{entry_path}", origin.scheme)
 }
 
-fn parse_php_tree(source: &str) -> Option<Tree> {
-    let mut parser = Parser::new();
-    parser
-        .set_language(&tree_sitter_php::LANGUAGE_PHP.into())
-        .ok()?;
-    parser.parse(source, None)
-}
-
 fn is_cancelled(cancellation: Option<&CancellationToken>) -> bool {
-    cancellation.is_some_and(CancellationToken::is_cancelled)
+    brokk_bifrost_core::cancellation::optional_is_cancelled(cancellation)
 }
 
 /// Whether `path` names a PHP source file.
-pub(crate) fn is_php_entry(path: &str) -> bool {
-    Path::new(path)
+pub(crate) fn is_php_entry(path: impl AsRef<Path>) -> bool {
+    path.as_ref()
         .extension()
         .is_some_and(|extension| extension.eq_ignore_ascii_case("php"))
 }

@@ -110,14 +110,6 @@ require_archive_file brokk-bifrost-jvm resources/treesitter/java/identifiers.scm
 require_archive_file brokk-bifrost-jvm resources/treesitter/java/imports.scm
 require_archive_file brokk-bifrost-jvm resources/treesitter/scala/definitions.scm
 require_archive_file brokk-bifrost-jvm resources/treesitter/scala/imports.scm
-# The Scala parser is vendored: archive-only consumers need the C build inputs,
-# and downstream redistributors need its license and regeneration provenance.
-for grammar_file in LICENSE README.md build.rs grammar.js tree-sitter.json \
-  queries/highlights.scm src/parser.c src/scanner.c src/grammar.json \
-  src/node-types.json src/tree_sitter/alloc.h src/tree_sitter/array.h \
-  src/tree_sitter/parser.h; do
-  require_archive_file brokk-bifrost-jvm "src/scala/grammar/$grammar_file"
-done
 require_archive_file brokk-bifrost-jvm resources/treesitter/kotlin/highlights.scm
 require_archive_file brokk-bifrost-php resources/treesitter/php/definitions.scm
 require_archive_file brokk-bifrost-php resources/treesitter/php/imports.scm
@@ -187,7 +179,12 @@ require_archive_file brokk-bifrost-semantic-packs embedded/node-runtime-values-t
 require_archive_file brokk-bifrost-semantic-packs embedded/python-process-inputs/manifest.json
 require_archive_file brokk-bifrost-semantic-packs embedded/python-process-inputs/shards/runtime.python-process-inputs.deflate
 require_archive_file brokk-bifrost-semantic-packs embedded/python-os-command-declarations/manifest.json
-require_archive_file brokk-bifrost-semantic-packs embedded/python-os-command-declarations/shards/declarations.python-os-system.json
+require_archive_file brokk-bifrost-semantic-packs embedded/python-os-command-declarations/shards/declarations.python-os-commands.deflate
+require_archive_file brokk-bifrost-semantic-packs embedded/python-security-sink-declarations/manifest.json
+require_archive_file brokk-bifrost-semantic-packs embedded/python-security-sink-declarations/shards/declarations.python-security-sink-apis.deflate
+require_archive_file brokk-bifrost-semantic-packs embedded/python-stdlib-api-declarations/manifest.json
+require_archive_file brokk-bifrost-semantic-packs embedded/python-stdlib-api-declarations/shards/declarations.python-stdlib-security-apis.deflate
+require_archive_file brokk-bifrost-semantic-packs embedded/python-stdlib-api-declarations/shards/declarations.python-ssl-legacy-api.deflate
 require_archive_file brokk-bifrost-semantic-packs embedded/python-os-command-summaries/manifest.json
 require_archive_file brokk-bifrost-semantic-packs embedded/python-os-command-summaries/shards/summaries.python-os-system.json
 require_archive_file brokk-bifrost-runtime src/extension/mod.rs

@@ -1,17 +1,17 @@
-use crate::analyzer::clone_detection::{
-    CloneCandidateProfile, detect_structural_clone_smells, refine_clone_similarity_with_ast,
-};
+use crate::analyzer::clone_detection::detect_language_structural_clone_smells;
 use crate::analyzer::common::language_for_file as file_language;
 use crate::analyzer::js_ts::cache::JsTsMemoCaches;
 use crate::analyzer::js_ts::clones::build_js_ts_clone_candidate_data;
 use crate::analyzer::js_ts::diagnostics::collect_javascript_semantic_diagnostics;
 use crate::analyzer::js_ts::providers::{self, JsTsMemoSource};
 use crate::analyzer::js_ts::{
-    contains_tests as js_ts_contains_tests, path_contains_tests as js_ts_path_contains_tests,
+    contains_tests as js_ts_contains_tests,
     synthesize_hydrated_module as synthesize_js_ts_hydrated_module_unit,
     synthesize_summary_module as synthesize_js_ts_summary_module_unit,
 };
-use crate::analyzer::tree_sitter_analyzer::lookup_suffix_candidates;
+use crate::analyzer::tree_sitter_analyzer::{
+    DOT_LOOKUP_CANDIDATE_SEPARATORS, lookup_suffix_candidates,
+};
 use crate::analyzer::usages::js_ts_graph::JsTsUsageIndex;
 use crate::analyzer::{
     AliasResolver, AnalyzerConfig, AnalyzerStoreContext, BuildProgress, CodeUnit, IAnalyzer,
@@ -109,26 +109,19 @@ impl LanguageAdapter for JavascriptAdapter {
     }
 
     fn should_persist_code_unit(&self, code_unit: &CodeUnit) -> bool {
-        !code_unit.is_file_scope() && !code_unit.is_module()
+        crate::analyzer::common::should_persist_code_unit(code_unit)
     }
 
     fn lookup_candidate_separators(&self) -> &'static [&'static str] {
-        &["."]
+        DOT_LOOKUP_CANDIDATE_SEPARATORS
     }
 
     fn lookup_candidate_short_names(&self, normalized_fq_name: &str) -> Vec<String> {
         lookup_suffix_candidates(normalized_fq_name, self.lookup_candidate_separators())
     }
 
-    fn storage_contains_tests(
-        &self,
-        state: &crate::analyzer::tree_sitter_analyzer::FileState,
-    ) -> bool {
-        state.contains_tests
-    }
-
     fn hydrate_contains_tests(&self, stored: bool, file: &ProjectFile, _source: &str) -> bool {
-        stored || js_ts_path_contains_tests(file)
+        super::js_ts::hydrate_contains_tests(stored, file)
     }
 
     fn synthesize_hydrated_units(
@@ -232,15 +225,15 @@ impl JsTsSource for JavascriptAnalyzer {
     }
 
     fn bulk_import_infos(&self, files: &[ProjectFile]) -> HashMap<ProjectFile, Vec<ImportInfo>> {
-        self.inner.bulk_import_infos(files.iter().cloned())
+        self.inner.bulk_import_infos_for_files(files)
     }
 
-    fn raw_supertypes_of(&self, code_unit: &CodeUnit) -> Vec<String> {
-        self.inner.raw_supertypes_of(code_unit)
+    crate::analyzer::tree_sitter_analyzer::delegate_inner_methods! {
+        fn raw_supertypes_of(&self, code_unit: &CodeUnit) -> Vec<String>;
     }
 
-    fn import_statements(&self, file: &ProjectFile) -> Vec<String> {
-        self.inner.import_statements(file)
+    crate::analyzer::tree_sitter_analyzer::delegate_inner_methods! {
+        fn import_statements(&self, file: &ProjectFile) -> Vec<String>;
     }
 
     fn is_type_alias(&self, code_unit: &CodeUnit) -> bool {
@@ -256,8 +249,7 @@ impl JsTsSource for JavascriptAnalyzer {
         _token: QueryToken<'_>,
         read: &mut dyn FnMut(&dyn brokk_bifrost_core::analyzer::BoundedDefinitionLookup),
     ) {
-        let lookup = crate::analyzer::AnalyzerDefinitionLookup::new(self, Language::JavaScript);
-        read(&lookup);
+        crate::analyzer::with_analyzer_usage_definitions(self, Language::JavaScript, read);
     }
 
     fn usage_index(
@@ -284,6 +276,20 @@ impl JsTsMemoSource for JavascriptAnalyzer {
 crate::analyzer::impl_forward_query_provider!(JavascriptAnalyzer);
 
 impl JavascriptAnalyzer {
+    pub(crate) fn update_all_with_progress(
+        &self,
+        progress: Option<crate::analyzer::BuildProgress>,
+    ) -> Self {
+        let inner = self.inner.update_all_with_progress(progress);
+        let alias_resolver = Arc::new(AliasResolver::new(inner.shared_project()));
+        Self {
+            inner,
+            memo_budget: self.memo_budget,
+            memo_caches: Arc::new(JsTsMemoCaches::new(self.memo_budget)),
+            alias_resolver,
+        }
+    }
+
     pub(crate) fn clone_with_project(&self, project: Arc<dyn Project>) -> Self {
         // The clone keeps this analyzer's `alias_resolver`, whose config memo is
         // keyed on the root it was built with. Re-projecting is a same-root
@@ -321,21 +327,25 @@ impl JavascriptAnalyzer {
         store_context: AnalyzerStoreContext,
         progress: Option<BuildProgress>,
     ) -> Result<Self, crate::analyzer::store::StoreError> {
-        let memo_budget = config.memo_cache_budget_bytes();
         let alias_resolver = Arc::new(AliasResolver::new(Arc::clone(&project)));
-        let inner = TreeSitterAnalyzer::new_with_config_storage_context_and_progress(
-            project,
-            JavascriptAdapter,
+        TreeSitterAnalyzer::try_wrap_with_config(
             config,
-            store_context,
-            progress,
-        )?;
-        Ok(Self {
-            inner,
-            memo_budget,
-            memo_caches: Arc::new(JsTsMemoCaches::new(memo_budget)),
-            alias_resolver,
-        })
+            |config| {
+                TreeSitterAnalyzer::new_with_config_storage_context_and_progress(
+                    project,
+                    JavascriptAdapter,
+                    config,
+                    store_context,
+                    progress,
+                )
+            },
+            |inner, memo_budget| Self {
+                inner,
+                memo_budget,
+                memo_caches: Arc::new(JsTsMemoCaches::new(memo_budget)),
+                alias_resolver,
+            },
+        )
     }
 
     pub fn from_project<P>(project: P) -> Self
@@ -458,82 +468,81 @@ impl TestDetectionProvider for JavascriptAnalyzer {}
 use crate::analyzer::CodeUnitIndex;
 
 impl CodeUnitIndex for JavascriptAnalyzer {
-    /// Forwarded so the request-scoped memo on the inner analyzer answers
-    /// (#2679); the trait default would rebuild uncached per call.
-    fn class_range_index(
+    crate::analyzer::tree_sitter_analyzer::delegate_inner_methods! {
+        /// Forwarded so the request-scoped memo on the inner analyzer answers
+        /// (#2679); the trait default would rebuild uncached per call.
+        fn class_range_index(
         &self,
         file: &ProjectFile,
-    ) -> std::sync::Arc<brokk_bifrost_core::analyzer::usages::inverted_edges::ClassRangeIndex> {
-        self.inner.class_range_index(file)
+    ) -> std::sync::Arc<brokk_bifrost_core::analyzer::usages::inverted_edges::ClassRangeIndex>;
     }
 
-    fn enclosing_code_unit(
+    crate::analyzer::tree_sitter_analyzer::delegate_inner_methods! {
+        fn enclosing_code_unit(
         &self,
         file: &ProjectFile,
         range: &crate::analyzer::Range,
-    ) -> Option<CodeUnit> {
-        self.inner.enclosing_code_unit(file, range)
+    ) -> Option<CodeUnit>;
     }
 
-    fn enclosing_code_unit_for_lines(
+    crate::analyzer::tree_sitter_analyzer::delegate_inner_methods! {
+        fn enclosing_code_unit_for_lines(
+            &self,
+            file: &ProjectFile,
+            start_line: usize,
+            end_line: usize,
+        ) -> Option<CodeUnit>;
+    }
+
+    crate::analyzer::tree_sitter_analyzer::delegate_inner_methods! {
+        fn top_level_declarations(&self, file: &ProjectFile) -> Vec<CodeUnit>;
+    }
+
+    crate::analyzer::tree_sitter_analyzer::delegate_inner_methods! {
+        fn summary_file_projection(
         &self,
         file: &ProjectFile,
-        start_line: usize,
-        end_line: usize,
-    ) -> Option<CodeUnit> {
-        self.inner
-            .enclosing_code_unit_for_lines(file, start_line, end_line)
+    ) -> Option<Arc<crate::analyzer::SummaryFileProjection>>;
     }
 
-    fn top_level_declarations(&self, file: &ProjectFile) -> Vec<CodeUnit> {
-        self.inner.top_level_declarations(file)
+    crate::analyzer::tree_sitter_analyzer::delegate_inner_methods! {
+        fn analyzed_files(&self) -> Vec<ProjectFile>;
     }
 
-    fn summary_file_projection(
-        &self,
-        file: &ProjectFile,
-    ) -> Option<Arc<crate::analyzer::SummaryFileProjection>> {
-        self.inner.summary_file_projection(file)
+    crate::analyzer::tree_sitter_analyzer::delegate_inner_methods! {
+        fn indexed_source(&self, file: &ProjectFile) -> Option<String>;
     }
 
-    fn analyzed_files(&self) -> Vec<ProjectFile> {
-        self.inner.analyzed_files()
+    crate::analyzer::tree_sitter_analyzer::delegate_inner_methods! {
+        fn location_declarations(&self, file: &ProjectFile) -> BTreeSet<CodeUnit>;
     }
 
-    fn indexed_source(&self, file: &ProjectFile) -> Option<String> {
-        self.inner.indexed_source(file)
+    crate::analyzer::tree_sitter_analyzer::delegate_inner_methods! {
+        fn location_ranges(&self, code_unit: &CodeUnit) -> Vec<crate::analyzer::Range>;
     }
 
-    fn location_declarations(&self, file: &ProjectFile) -> BTreeSet<CodeUnit> {
-        self.inner.location_declarations(file)
+    crate::analyzer::tree_sitter_analyzer::delegate_inner_methods! {
+        fn indexed_source_matches(&self, file: &ProjectFile, source: &str) -> bool;
     }
 
-    fn location_ranges(&self, code_unit: &CodeUnit) -> Vec<crate::analyzer::Range> {
-        self.inner.location_ranges(code_unit)
+    crate::analyzer::tree_sitter_analyzer::delegate_inner_methods! {
+        fn is_analyzed(&self, file: &ProjectFile) -> bool;
     }
 
-    fn indexed_source_matches(&self, file: &ProjectFile, source: &str) -> bool {
-        self.inner.indexed_source_matches(file, source)
-    }
-
-    fn is_analyzed(&self, file: &ProjectFile) -> bool {
-        self.inner.is_analyzed(file)
-    }
-
-    fn retain_analyzed(&self, candidates: &[ProjectFile]) -> Vec<ProjectFile> {
-        self.inner.retain_analyzed(candidates)
+    crate::analyzer::tree_sitter_analyzer::delegate_inner_methods! {
+        fn retain_analyzed(&self, candidates: &[ProjectFile]) -> Vec<ProjectFile>;
     }
 
     fn all_declarations(&self) -> Box<dyn Iterator<Item = CodeUnit> + '_> {
         self.inner.all_declarations()
     }
 
-    fn declarations_sharing_name(&self, unit: &CodeUnit) -> Vec<CodeUnit> {
-        self.inner.declarations_sharing_name(unit)
+    crate::analyzer::tree_sitter_analyzer::delegate_inner_methods! {
+        fn declarations_sharing_name(&self, unit: &CodeUnit) -> Vec<CodeUnit>;
     }
 
-    fn declarations(&self, file: &ProjectFile) -> BTreeSet<CodeUnit> {
-        self.inner.declarations(file)
+    crate::analyzer::tree_sitter_analyzer::delegate_inner_methods! {
+        fn declarations(&self, file: &ProjectFile) -> BTreeSet<CodeUnit>;
     }
 
     fn materialization_records(
@@ -547,12 +556,12 @@ impl CodeUnitIndex for JavascriptAnalyzer {
         self.inner.definitions(fq_name)
     }
 
-    fn direct_children(&self, code_unit: &CodeUnit) -> Vec<CodeUnit> {
-        self.inner.direct_children(code_unit)
+    crate::analyzer::tree_sitter_analyzer::delegate_inner_methods! {
+        fn direct_children(&self, code_unit: &CodeUnit) -> Vec<CodeUnit>;
     }
 
-    fn ranges(&self, code_unit: &CodeUnit) -> Vec<crate::analyzer::Range> {
-        self.inner.ranges(code_unit)
+    crate::analyzer::tree_sitter_analyzer::delegate_inner_methods! {
+        fn ranges(&self, code_unit: &CodeUnit) -> Vec<crate::analyzer::Range>;
     }
 
     fn ranges_with_limit(
@@ -569,20 +578,16 @@ impl CodeUnitIndex for JavascriptAnalyzer {
         self.inner.signatures(code_unit)
     }
 
-    fn signature_metadata(&self, code_unit: &CodeUnit) -> Vec<SignatureMetadata> {
-        self.inner.signature_metadata(code_unit)
+    crate::analyzer::tree_sitter_analyzer::delegate_inner_methods! {
+        fn signature_metadata(&self, code_unit: &CodeUnit) -> Vec<SignatureMetadata>;
     }
 
-    fn get_analyzed_files(&self) -> BTreeSet<ProjectFile> {
-        self.inner.get_analyzed_files()
+    crate::analyzer::tree_sitter_analyzer::delegate_inner_methods! {
+        fn languages(&self) -> BTreeSet<Language>;
     }
 
-    fn languages(&self) -> BTreeSet<Language> {
-        self.inner.languages()
-    }
-
-    fn project(&self) -> &dyn Project {
-        self.inner.project()
+    crate::analyzer::tree_sitter_analyzer::delegate_inner_methods! {
+        fn project(&self) -> &dyn Project;
     }
 
     fn parent_of(&self, code_unit: &CodeUnit) -> Option<CodeUnit> {
@@ -603,30 +608,29 @@ impl CodeUnitIndex for JavascriptAnalyzer {
             .or_else(|| self.inner.get_skeleton_header(code_unit))
     }
 
-    fn get_source(&self, code_unit: &CodeUnit, include_comments: bool) -> Option<String> {
-        self.inner.get_source(code_unit, include_comments)
+    crate::analyzer::tree_sitter_analyzer::delegate_inner_methods! {
+        fn get_source(&self, code_unit: &CodeUnit, include_comments: bool) -> Option<String>;
     }
 
-    fn get_sources(&self, code_unit: &CodeUnit, include_comments: bool) -> BTreeSet<String> {
-        self.inner.get_sources(code_unit, include_comments)
+    crate::analyzer::tree_sitter_analyzer::delegate_inner_methods! {
+        fn get_sources(&self, code_unit: &CodeUnit, include_comments: bool) -> BTreeSet<String>;
     }
 
-    fn search_definitions(&self, pattern: &str, auto_quote: bool) -> BTreeSet<CodeUnit> {
-        self.inner.search_definitions(pattern, auto_quote)
+    crate::analyzer::tree_sitter_analyzer::delegate_inner_methods! {
+        fn search_definitions(&self, pattern: &str, auto_quote: bool) -> BTreeSet<CodeUnit>;
     }
 
-    fn search_definitions_by_suffix_pattern(
+    crate::analyzer::tree_sitter_analyzer::delegate_inner_methods! {
+        fn search_definitions_by_suffix_pattern(
         &self,
         pattern: &str,
         terminal_identifiers: &[String],
         language: Language,
-    ) -> BTreeSet<CodeUnit> {
-        self.inner
-            .search_definitions_by_suffix_pattern(pattern, terminal_identifiers, language)
+    ) -> BTreeSet<CodeUnit>;
     }
 
-    fn lookup_candidates_by_short_name(&self, symbol: &str) -> BTreeSet<CodeUnit> {
-        self.inner.lookup_candidates_by_short_name(symbol)
+    crate::analyzer::tree_sitter_analyzer::delegate_inner_methods! {
+        fn lookup_candidates_by_short_name(&self, symbol: &str) -> BTreeSet<CodeUnit>;
     }
 
     // #1088: every other language wrapper (TypeScript, Ruby, PHP, Go, Python,
@@ -647,6 +651,26 @@ impl CodeUnitIndex for JavascriptAnalyzer {
 }
 
 impl IAnalyzer for JavascriptAnalyzer {
+    crate::analyzer::tree_sitter_analyzer::delegate_inner_procedure_fact_methods!();
+
+    fn dependency_file_evidence(
+        &self,
+    ) -> crate::analyzer::store::Result<crate::analyzer::semantic_model::DependencyFileEvidence>
+    {
+        self.inner.dependency_file_evidence()
+    }
+
+    fn dependency_file_locations(
+        &self,
+    ) -> crate::analyzer::store::Result<
+        Vec<(
+            String,
+            crate::analyzer::semantic_model::DependencyEvidenceLocation,
+        )>,
+    > {
+        self.inner.dependency_file_locations()
+    }
+
     crate::analyzer::i_analyzer::forward_relational_definition_batch!();
 
     crate::analyzer::i_analyzer::forward_file_identity_invalidation!();
@@ -668,30 +692,30 @@ impl IAnalyzer for JavascriptAnalyzer {
         self.inner.end_query(context);
     }
 
-    fn prefetch_definitions(&self, fq_names: &[String]) {
-        self.inner.prefetch_definitions(fq_names);
+    crate::analyzer::tree_sitter_analyzer::delegate_inner_methods! {
+        fn prefetch_definitions(&self, fq_names: &[String]);
     }
 
-    fn record_query_failure(&self, error: crate::analyzer::store::StoreError) {
-        self.inner.record_query_failure(error);
+    crate::analyzer::tree_sitter_analyzer::delegate_inner_methods! {
+        fn record_query_failure(&self, error: crate::analyzer::store::StoreError);
     }
 
-    fn workspace_file_index_cell(&self) -> Option<crate::analyzer::WorkspaceFileIndexCell> {
-        self.inner.workspace_file_index_cell()
+    crate::analyzer::tree_sitter_analyzer::delegate_inner_methods! {
+        fn workspace_file_index_cell(&self) -> Option<crate::analyzer::WorkspaceFileIndexCell>;
     }
 
-    fn definition_lookup_memo(
+    crate::analyzer::tree_sitter_analyzer::delegate_inner_methods! {
+        fn definition_lookup_memo(
         &self,
-    ) -> Option<std::sync::Arc<crate::analyzer::DefinitionLookupMemo>> {
-        self.inner.definition_lookup_memo()
+    ) -> Option<std::sync::Arc<crate::analyzer::DefinitionLookupMemo>>;
     }
 
-    fn import_statements(&self, file: &ProjectFile) -> Vec<String> {
-        self.inner.import_statements(file)
+    crate::analyzer::tree_sitter_analyzer::delegate_inner_methods! {
+        fn import_statements(&self, file: &ProjectFile) -> Vec<String>;
     }
 
-    fn compute_cognitive_complexities(&self, file: &ProjectFile) -> Vec<(CodeUnit, u32)> {
-        self.inner.compute_cognitive_complexities(file)
+    crate::analyzer::tree_sitter_analyzer::delegate_inner_methods! {
+        fn compute_cognitive_complexities(&self, file: &ProjectFile) -> Vec<(CodeUnit, u32)>;
     }
 
     fn update(&self, changed_files: &BTreeSet<ProjectFile>) -> Self {
@@ -707,14 +731,7 @@ impl IAnalyzer for JavascriptAnalyzer {
     }
 
     fn update_all(&self) -> Self {
-        let inner = self.inner.update_all();
-        let alias_resolver = Arc::new(AliasResolver::new(inner.shared_project()));
-        Self {
-            inner,
-            memo_budget: self.memo_budget,
-            memo_caches: Arc::new(JsTsMemoCaches::new(self.memo_budget)),
-            alias_resolver,
-        }
+        self.update_all_with_progress(None)
     }
 
     fn parse_errors(&self, file: &ProjectFile) -> Option<Vec<crate::analyzer::ParseError>> {
@@ -729,23 +746,22 @@ impl IAnalyzer for JavascriptAnalyzer {
         collect_javascript_semantic_diagnostics(self, file, source)
     }
 
-    fn extract_call_receiver(&self, reference: &str) -> Option<String> {
-        self.inner.extract_call_receiver(reference)
+    crate::analyzer::tree_sitter_analyzer::delegate_inner_methods! {
+        fn extract_call_receiver(&self, reference: &str) -> Option<String>;
     }
 
-    fn is_access_expression(&self, file: &ProjectFile, start_byte: usize, end_byte: usize) -> bool {
-        self.inner.is_access_expression(file, start_byte, end_byte)
+    crate::analyzer::tree_sitter_analyzer::delegate_inner_methods! {
+        fn is_access_expression(&self, file: &ProjectFile, start_byte: usize, end_byte: usize) -> bool;
     }
 
-    fn find_nearest_declaration(
-        &self,
-        file: &ProjectFile,
-        start_byte: usize,
-        end_byte: usize,
-        ident: &str,
-    ) -> Option<crate::analyzer::DeclarationInfo> {
-        self.inner
-            .find_nearest_declaration(file, start_byte, end_byte, ident)
+    crate::analyzer::tree_sitter_analyzer::delegate_inner_methods! {
+        fn find_nearest_declaration(
+            &self,
+            file: &ProjectFile,
+            start_byte: usize,
+            end_byte: usize,
+            ident: &str,
+        ) -> Option<crate::analyzer::DeclarationInfo>;
     }
 
     fn search_symbol_candidates(
@@ -768,30 +784,30 @@ impl IAnalyzer for JavascriptAnalyzer {
         Some(self)
     }
 
-    fn structural_fact_providers(
+    crate::analyzer::tree_sitter_analyzer::delegate_inner_methods! {
+        fn structural_fact_providers(
         &self,
-    ) -> Vec<&dyn crate::analyzer::structural::StructuralFactProvider> {
-        self.inner.structural_fact_providers()
+    ) -> Vec<&dyn crate::analyzer::structural::StructuralFactProvider>;
     }
 
     fn snapshot_caches(&self) -> Option<&crate::analyzer::AnalyzerSnapshotCaches> {
         Some(self.inner.snapshot_caches())
     }
 
-    fn workspace_content_identities(
+    crate::analyzer::tree_sitter_analyzer::delegate_inner_methods! {
+        fn workspace_content_identities(
         &self,
-    ) -> Option<crate::analyzer::content_identity::WorkspaceContentIdentities> {
-        self.inner.workspace_content_identities()
+    ) -> Option<crate::analyzer::content_identity::WorkspaceContentIdentities>;
     }
 
-    fn workspace_fact_indexes(
+    crate::analyzer::tree_sitter_analyzer::delegate_inner_methods! {
+        fn workspace_fact_indexes(
         &self,
-    ) -> Vec<&dyn crate::analyzer::read_verification::WorkspaceFactIndex> {
-        self.inner.workspace_fact_indexes()
+    ) -> Vec<&dyn crate::analyzer::read_verification::WorkspaceFactIndex>;
     }
 
-    fn contains_tests(&self, file: &ProjectFile) -> bool {
-        self.inner.contains_tests(file)
+    crate::analyzer::tree_sitter_analyzer::delegate_inner_methods! {
+        fn contains_tests(&self, file: &ProjectFile) -> bool;
     }
 
     fn in_test_region(&self, code_unit: &crate::analyzer::CodeUnit) -> bool {
@@ -803,18 +819,20 @@ impl IAnalyzer for JavascriptAnalyzer {
         file: &ProjectFile,
         weights: TestAssertionWeights,
     ) -> Vec<TestAssertionSmell> {
-        if !self.contains_tests(file) || file_language(file) != Language::JavaScript {
-            return Vec::new();
-        }
-        let Ok(source) = self.inner.project().read_source(file) else {
-            return Vec::new();
-        };
-        let Some(grammar) =
-            crate::analyzer::parser_language_for_path(Language::JavaScript, file.rel_path())
-        else {
-            return Vec::new();
-        };
-        detect_js_ts_test_assertion_smells(file, &source, grammar, &weights)
+        crate::analyzer::test_assertion_smells_for_file(
+            self,
+            file,
+            Language::JavaScript,
+            |source| {
+                let Some(grammar) = crate::analyzer::parser_language_for_path(
+                    Language::JavaScript,
+                    file.rel_path(),
+                ) else {
+                    return Vec::new();
+                };
+                detect_js_ts_test_assertion_smells(file, source, grammar, &weights)
+            },
+        )
     }
 
     fn find_structural_clone_smells(
@@ -830,110 +848,74 @@ impl IAnalyzer for JavascriptAnalyzer {
         files: &[ProjectFile],
         weights: CloneSmellWeights,
     ) -> Vec<CloneSmell> {
-        let requested_files: Vec<ProjectFile> = files
-            .iter()
-            .filter(|file| file_language(file) == Language::JavaScript)
-            .cloned()
-            .collect();
-        if requested_files.is_empty() {
-            return Vec::new();
-        }
-
-        let corpus_units = crate::analyzer::clone_detection::clone_corpus_function_units(
+        detect_language_structural_clone_smells(
             self,
+            files,
+            weights,
             Language::JavaScript,
-        );
-        let _query_scope = crate::analyzer::AnalyzerQueryScope::new(self);
-        // The grammar is the one this unit's own file is parsed with, not the
-        // language's default: `.jsx` is read by the TSX grammar (#3322), and
-        // parsing it with tree-sitter-javascript would compare a clone
-        // candidate built from ERROR-recovery soup against real trees.
-        let all_candidates: Vec<CloneCandidateProfile> = corpus_units
-            .iter()
-            .filter_map(|code_unit| {
+            |code_unit| {
+                // The grammar is the one this unit's own file is parsed with,
+                // not the language's default: `.jsx` is read by the TSX
+                // grammar (#3322), and parsing it with tree-sitter-javascript
+                // would compare an ERROR-recovery candidate against real trees.
                 let grammar = crate::analyzer::parser_language_for_path(
                     Language::JavaScript,
                     code_unit.source().rel_path(),
                 )?;
                 build_js_ts_clone_candidate_data(self, code_unit, weights, grammar)
-            })
-            .map(|candidate| CloneCandidateProfile::create(candidate, weights))
-            .collect();
-        if all_candidates.is_empty() {
-            return Vec::new();
-        }
-
-        detect_structural_clone_smells(
-            &requested_files,
-            all_candidates,
-            weights,
-            refine_clone_similarity_with_ast,
+            },
         )
     }
 }
 
 #[cfg(any(test, feature = "test-support"))]
 impl crate::analyzer::AnalyzerTestHooks for JavascriptAnalyzer {
-    fn reset_relational_definition_batch_call_count_for_test(&self) {
-        self.inner
-            .test_hooks()
-            .reset_relational_definition_batch_call_count_for_test();
+    crate::analyzer::tree_sitter_analyzer::delegate_inner_test_hook_methods! {
+        fn reset_relational_definition_batch_call_count_for_test(&self);
     }
 
-    fn relational_definition_batch_call_count_for_test(&self) -> usize {
-        self.inner
-            .test_hooks()
-            .relational_definition_batch_call_count_for_test()
+    crate::analyzer::tree_sitter_analyzer::delegate_inner_test_hook_methods! {
+        fn relational_definition_batch_call_count_for_test(&self) -> usize;
     }
 
-    fn reset_definition_candidates_query_count_for_test(&self) {
-        self.inner
-            .test_hooks()
-            .reset_definition_candidates_query_count_for_test();
+    crate::analyzer::tree_sitter_analyzer::delegate_inner_test_hook_methods! {
+        fn reset_definition_candidates_query_count_for_test(&self);
     }
 
-    fn definition_candidates_query_count_for_test(&self) -> usize {
-        self.inner
-            .test_hooks()
-            .definition_candidates_query_count_for_test()
+    crate::analyzer::tree_sitter_analyzer::delegate_inner_test_hook_methods! {
+        fn definition_candidates_query_count_for_test(&self) -> usize;
     }
 
-    fn reset_definition_prefetch_batch_count_for_test(&self) {
-        self.inner
-            .test_hooks()
-            .reset_definition_prefetch_batch_count_for_test();
+    crate::analyzer::tree_sitter_analyzer::delegate_inner_test_hook_methods! {
+        fn reset_definition_prefetch_batch_count_for_test(&self);
     }
 
-    fn definition_prefetch_batch_count_for_test(&self) -> usize {
-        self.inner
-            .test_hooks()
-            .definition_prefetch_batch_count_for_test()
+    crate::analyzer::tree_sitter_analyzer::delegate_inner_test_hook_methods! {
+        fn definition_prefetch_batch_count_for_test(&self) -> usize;
     }
 
-    fn reset_full_declaration_scan_count_for_test(&self) {
-        self.inner
-            .test_hooks()
-            .reset_full_declaration_scan_count_for_test();
+    crate::analyzer::tree_sitter_analyzer::delegate_inner_test_hook_methods! {
+        fn reset_full_declaration_scan_count_for_test(&self);
     }
 
-    fn full_declaration_scan_count_for_test(&self) -> usize {
-        self.inner
-            .test_hooks()
-            .full_declaration_scan_count_for_test()
+    crate::analyzer::tree_sitter_analyzer::delegate_inner_test_hook_methods! {
+        fn full_declaration_scan_count_for_test(&self) -> usize;
     }
 
     fn reset_candidate_hydration_count_for_test(&self) {
         self.inner.reset_full_hydration_count_for_test();
     }
 
-    fn candidate_hydration_count_for_test(&self) -> usize {
-        self.inner.full_hydration_count_for_test() + self.inner.bulk_hydration_count_for_test()
+    crate::analyzer::tree_sitter_analyzer::delegate_inner_test_hook_methods! {
+        fn full_candidate_hydration_count_for_test(&self) -> usize;
     }
 
-    fn reset_workspace_path_scan_count_for_test(&self) {
-        self.inner
-            .test_hooks()
-            .reset_workspace_path_scan_count_for_test();
+    crate::analyzer::tree_sitter_analyzer::delegate_inner_test_hook_methods! {
+        fn bulk_candidate_hydration_count_for_test(&self) -> usize;
+    }
+
+    crate::analyzer::tree_sitter_analyzer::delegate_inner_test_hook_methods! {
+        fn reset_workspace_path_scan_count_for_test(&self);
     }
 
     fn workspace_path_scan_count_for_test(&self) -> usize {

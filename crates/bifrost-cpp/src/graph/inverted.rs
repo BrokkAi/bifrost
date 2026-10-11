@@ -42,13 +42,14 @@ use crate::graph::resolver::{
     LexicalCallableValueResolution, LexicalTypeResolution, OrdinaryMacroReferenceResolution,
     OrdinaryTypeImportCell, TargetKind, VisibilityIndex, VisibleMemberResolution,
     anonymous_aggregate_owner, c_offsetof_member_parts, canonical_cpp_scope_components,
-    cast_expression_type_node, constructor_style_local_declaration, cpp_callable_arity,
-    cpp_field_expression_receiver, cpp_template_reference_arguments, cpp_type_name_components,
-    declarator_name_node, designated_initializer_owner, extract_variable_name, first_type_child,
-    function_terminal_node, has_ancestor_kind, infer_cpp_initializer_binding,
-    infer_cpp_initializer_type, initialized_type_declaration_with_cast, is_c_offsetof_member_node,
+    cast_expression_type_node, constructor_style_local_declaration, cpp_binding_parts,
+    cpp_callable_arity, cpp_field_expression_receiver, cpp_template_reference_arguments,
+    cpp_type_name_components, declaration_declarator, declarator_name_node,
+    designated_initializer_owner, extract_variable_name, first_type_child, function_terminal_node,
+    has_ancestor_kind, infer_cpp_initializer_binding, infer_cpp_initializer_type,
+    initialized_type_declaration_with_cast, is_c_offsetof_member_node,
     is_c_sizeof_expression_type_candidate, is_cpp_template_argument_type_leaf, is_declaration_name,
-    is_declarator_node, is_globally_qualified_cpp_name, is_nested_type_node,
+    is_globally_qualified_cpp_name, is_nested_type_node,
     is_recovered_qualified_friend_class_type_reference, normalize_type_text,
     out_of_line_member_definition_owner, parameter_belongs_to_callable_scope,
     qualified_alias_reference_preserves_target, qualified_alias_reference_requires_terminal,
@@ -58,6 +59,7 @@ use crate::graph::resolver::{
     same_visible_global_field_symbol, same_visible_symbol, type_reference_hit_node,
     unique_macro_replacement_type_candidate,
 };
+use crate::graph::syntax::receiver_is_self_like;
 use crate::graph::syntax::{object_macro_replacement_type_references, qualified_callable_value};
 use brokk_bifrost_core::analyzer::tree_walk::{TreeWalkAction, walk_tree_iterative};
 use brokk_bifrost_core::analyzer::usages::common::same_node;
@@ -147,13 +149,7 @@ impl CppScan<'_> {
     }
 
     fn record(&mut self, callee: String, node: Node<'_>) {
-        self.edges.record_kind(
-            self.input,
-            callee,
-            classify_reference_node(node),
-            node.start_byte(),
-            node.end_byte(),
-        );
+        self.edges.record_reference(self.input, callee, node);
     }
 
     fn record_range(&mut self, callee: String, anchor: Node<'_>, start: usize, end: usize) {
@@ -168,7 +164,7 @@ impl CppScan<'_> {
 
     fn record_unproven(&mut self, name: &str, node: Node<'_>) {
         self.edges
-            .record_unproven_name(self.input, name, node.start_byte(), node.end_byte());
+            .record_unproven_name_at_node(self.input, name, node);
     }
 }
 
@@ -1314,32 +1310,9 @@ fn enclosing_callable_owner(node: Node<'_>, ctx: &CppScan<'_>) -> Option<CodeUni
     })
 }
 
-/// Whether `receiver` is the implicit-object receiver of a member call.
-///
-/// `reference_is_c` is the compilation language the reference is read in
-/// (#1970): `this` is the C++ implicit object only where C++ compiles the
-/// source, and is an ordinary identifier in a `.c` file or a header every
-/// reaching translation unit compiles as C.
-fn receiver_is_self_like(receiver: Node<'_>, reference_is_c: bool) -> bool {
-    match receiver.kind() {
-        "this" => !reference_is_c,
-        "parenthesized_expression" | "pointer_expression" => receiver
-            .child_by_field_name("argument")
-            .or_else(|| receiver.named_child(0))
-            .is_some_and(|inner| receiver_is_self_like(inner, reference_is_c)),
-        _ => false,
-    }
-}
-
 /// If `node` is the `function` of a namespace-qualified free-function call, its target.
 fn scoped_free_function(node: Node<'_>, ctx: &CppScan<'_>) -> Option<CodeUnit> {
-    if node.kind() != "qualified_identifier" {
-        return None;
-    }
-    let parent = node.parent()?;
-    if parent.kind() != "call_expression" || parent.child_by_field_name("function") != Some(node) {
-        return None;
-    }
+    let node = scoped_call_function(node)?;
     ctx.visibility.resolve_named(
         ctx.file,
         node_text(node, ctx.source),
@@ -1349,13 +1322,7 @@ fn scoped_free_function(node: Node<'_>, ctx: &CppScan<'_>) -> Option<CodeUnit> {
 
 /// If `node` is the `function` of a `X::m(..)` call, the fqn of `X`'s type.
 fn scoped_call_owner(node: Node<'_>, ctx: &CppScan<'_>) -> Option<String> {
-    if node.kind() != "qualified_identifier" {
-        return None;
-    }
-    let parent = node.parent()?;
-    if parent.kind() != "call_expression" || parent.child_by_field_name("function") != Some(node) {
-        return None;
-    }
+    let node = scoped_call_function(node)?;
     let scope = node.child_by_field_name("scope")?;
     match resolve_type_node_lexically(
         scope,
@@ -1368,6 +1335,17 @@ fn scoped_call_owner(node: Node<'_>, ctx: &CppScan<'_>) -> Option<String> {
         LexicalTypeResolution::Resolved { unit, .. } => Some(unit.fq_name()),
         LexicalTypeResolution::Ambiguous | LexicalTypeResolution::Missing => None,
     }
+}
+
+fn scoped_call_function(node: Node<'_>) -> Option<Node<'_>> {
+    if node.kind() != "qualified_identifier" {
+        return None;
+    }
+    let parent = node.parent()?;
+    if parent.kind() != "call_expression" || parent.child_by_field_name("function") != Some(node) {
+        return None;
+    }
+    Some(node)
 }
 
 /// The trailing member name of a `X::m` qualified identifier.
@@ -1575,10 +1553,7 @@ fn seed_function_macro_local_binding(
                 .and_then(|type_node| ctx.resolve_type_node_result(type_node).ok().flatten())
         })
         .or_else(|| ctx.resolve_type(&binding.type_name));
-    match unit {
-        Some(unit) => bindings.seed_symbol(binding.name, unit),
-        None => bindings.declare_shadow(binding.name),
-    }
+    bindings.seed_or_shadow(binding.name, unit);
 }
 
 fn seed_function_macro_container_binding(
@@ -1603,10 +1578,7 @@ fn seed_function_macro_container_binding(
             })
             .or_else(|| ctx.resolve_type(&binding.type_name))
     });
-    match unit {
-        Some(unit) => bindings.seed_symbol(binding.name, unit),
-        None => bindings.declare_shadow(binding.name),
-    }
+    bindings.seed_or_shadow(binding.name, unit);
 }
 
 fn seed_typed_binding(
@@ -1617,15 +1589,9 @@ fn seed_typed_binding(
     if !parameter_belongs_to_callable_scope(node) {
         return;
     }
-    let Some(declarator) = node.child_by_field_name("declarator") else {
+    let Some((name, _, type_node)) = cpp_binding_parts(node, ctx.source) else {
         return;
     };
-    let Some(name) = extract_variable_name(declarator, ctx.source) else {
-        return;
-    };
-    let type_node = node
-        .child_by_field_name("type")
-        .or_else(|| first_type_child(node));
     seed_binding(&name, type_node, None, ctx, bindings);
 }
 
@@ -1634,15 +1600,9 @@ fn seed_range_binding(
     ctx: &CppScan<'_>,
     bindings: &mut LocalInferenceEngine<CodeUnit>,
 ) {
-    let Some(declarator) = node.child_by_field_name("declarator") else {
+    let Some((name, _, type_node)) = cpp_binding_parts(node, ctx.source) else {
         return;
     };
-    let Some(name) = extract_variable_name(declarator, ctx.source) else {
-        return;
-    };
-    let type_node = node
-        .child_by_field_name("type")
-        .or_else(|| first_type_child(node));
     seed_binding(&name, type_node, None, ctx, bindings);
 }
 
@@ -1658,13 +1618,7 @@ fn seed_variable_declaration(
         type_node.map(|type_node| normalize_type_text(node_text(type_node, ctx.source)));
     let mut cursor = node.walk();
     for child in node.named_children(&mut cursor) {
-        let declarator = if child.kind() == "init_declarator" {
-            child.child_by_field_name("declarator")
-        } else if is_declarator_node(child) {
-            Some(child)
-        } else {
-            None
-        };
+        let declarator = declaration_declarator(node, child);
         let Some(declarator) = declarator else {
             continue;
         };
@@ -1694,15 +1648,7 @@ fn seed_variable_declaration(
     }
 }
 
-fn has_function_scope_ancestor(mut node: Node<'_>) -> bool {
-    while let Some(parent) = node.parent() {
-        if matches!(parent.kind(), "function_definition" | "lambda_expression") {
-            return true;
-        }
-        node = parent;
-    }
-    false
-}
+use crate::graph::syntax::has_function_scope_ancestor;
 
 fn seed_binding(
     name: &str,
@@ -1729,26 +1675,14 @@ fn seed_binding(
         }),
         None => value.and_then(|value| infer_type_from_value(value, ctx)),
     };
-    match resolved {
-        Some(unit) => bindings.seed_symbol(name.to_string(), unit),
-        None => bindings.declare_shadow(name.to_string()),
-    }
+    bindings.seed_or_shadow(name.to_string(), resolved);
 }
 
 fn resolve_type_node_with_recovered_scope(node: Node<'_>, ctx: &CppScan<'_>) -> Option<CodeUnit> {
     if let Some(owner) = anonymous_aggregate_owner(&ctx.analyzer, ctx.file, node) {
         return Some(owner);
     }
-    let scope = recovered_or_indexed_lexical_scope(node, ctx)?;
-    let components = cpp_type_name_components(node, ctx.source)?;
-    let global = is_globally_qualified_cpp_name(node);
-    match ctx.visibility.resolve_type_components_lexically(
-        &ctx.analyzer,
-        ctx.file,
-        &components,
-        global,
-        &scope,
-    ) {
+    match recovered_sentinel_type_resolution(node, ctx)? {
         LexicalTypeResolution::Resolved { unit, .. } => Some(unit),
         LexicalTypeResolution::Ambiguous | LexicalTypeResolution::Missing => None,
     }

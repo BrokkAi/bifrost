@@ -429,7 +429,7 @@ fn declaration_kind(path: &Path) -> Option<RubyGemDeclarationKind> {
 }
 
 fn cancelled(cancellation: Option<&CancellationToken>) -> bool {
-    cancellation.is_some_and(CancellationToken::is_cancelled)
+    brokk_bifrost_core::cancellation::optional_is_cancelled(cancellation)
 }
 
 fn finish(
@@ -452,8 +452,7 @@ fn finish(
 
 #[cfg(test)]
 mod tests {
-    use flate2::Compression;
-    use flate2::write::GzEncoder;
+    use crate::test_support::ruby_gem_archive as gem_archive;
 
     use super::*;
 
@@ -525,35 +524,5 @@ mod tests {
         );
         assert!(!bounded.complete);
         assert_eq!(bounded.diagnostics[0].code, "limit.archive_bytes");
-    }
-
-    fn gem_archive(entries: &[(&str, &[u8])]) -> Vec<u8> {
-        let mut compressed = Vec::new();
-        {
-            let encoder = GzEncoder::new(&mut compressed, Compression::default());
-            let mut data = tar::Builder::new(encoder);
-            for (path, bytes) in entries {
-                let mut header = tar::Header::new_gnu();
-                header.set_size(bytes.len() as u64);
-                header.set_mode(0o644);
-                header.set_cksum();
-                data.append_data(&mut header, path, *bytes).unwrap();
-            }
-            data.into_inner().unwrap().finish().unwrap();
-        }
-
-        let mut gem = Vec::new();
-        {
-            let mut outer = tar::Builder::new(&mut gem);
-            let mut header = tar::Header::new_gnu();
-            header.set_size(compressed.len() as u64);
-            header.set_mode(0o644);
-            header.set_cksum();
-            outer
-                .append_data(&mut header, "data.tar.gz", compressed.as_slice())
-                .unwrap();
-            outer.finish().unwrap();
-        }
-        gem
     }
 }

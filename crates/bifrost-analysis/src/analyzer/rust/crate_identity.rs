@@ -43,8 +43,7 @@
 //! discovery, runs `cargo` or `rustdoc`, or reads `target/doc`.
 
 use crate::analyzer::semantic_model::{
-    SemanticModelCompleteness, SemanticModelOverlay, SemanticModelOverlayDisposition,
-    SemanticModelSymbol, SemanticModelSymbolKind, Visibility,
+    SemanticModelCompleteness, SemanticModelOverlay, SemanticModelSymbol, SemanticModelSymbolKind,
 };
 use brokk_bifrost_rust::diagnostics::RustCrateSurface;
 
@@ -76,17 +75,14 @@ impl<'a> RustOverlayCrates<'a> {
     /// trace nor a diagnostic picks an arbitrary winner between, say, two
     /// versions of the same crate.
     pub(crate) fn unique_symbol(&self, qualified_name: &str) -> Option<&'a SemanticModelSymbol> {
-        let matched = self.overlay?.symbols_named(qualified_name);
-        (matched.disposition == SemanticModelOverlayDisposition::Unique)
-            .then(|| matched.records.first().copied())
-            .flatten()
+        self.overlay?.symbols_named(qualified_name).unique()
     }
 
     /// The unique symbol a Rust reference may resolve to: one visible, public
     /// Rust declaration.
     fn visible_symbol(&self, qualified_name: &str) -> Option<&'a SemanticModelSymbol> {
         let symbol = self.unique_symbol(qualified_name)?;
-        (symbol.language == "rust" && symbol.visibility == Visibility::Public).then_some(symbol)
+        SemanticModelOverlay::symbol_is_visible_public(symbol, "rust").then_some(symbol)
     }
 
     /// Whether `symbol` is a crate root that `spelling` names.

@@ -156,6 +156,31 @@ def load_module(path: Path):
 
 
 class GeneratePythonQueryModelsTest(unittest.TestCase):
+    def test_nullable_array_keeps_item_schema(self) -> None:
+        schema = {
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "title": "NullableArray",
+            "type": "object",
+            "properties": {
+                "items": {
+                    "type": ["array", "null"],
+                    "items": {"type": "string"},
+                }
+            },
+            "required": ["items"],
+            "additionalProperties": False,
+        }
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            output = Path(temporary_directory) / "nullable_array_models.py"
+            result = run_generator(schema, output)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            models = load_module(output)
+            decoded = models.Root.from_dict({"items": ["a", "b"]})
+            self.assertEqual(decoded.items, ["a", "b"])
+            self.assertIsNone(models.Root.from_dict({"items": None}).items)
+            with self.assertRaises(models.DecoderError):
+                models.Root.from_dict({"items": [1]})
+
     def test_numeric_bounds_are_enforced_faithfully(self) -> None:
         schema = {
             "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -183,6 +208,78 @@ class GeneratePythonQueryModelsTest(unittest.TestCase):
             with self.assertRaises(models.DecoderError):
                 models.Root.from_dict({"formal_index": 0, "ratio": 1.1})
 
+    def test_nullable_integer_array_preserves_items_and_unsigned_bounds(self) -> None:
+        # Hard-won #4676: Rust's nullable tuple_return_arities schema lost its
+        # items contract when the generator expanded the type array.
+        schema = {
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "title": "TupleReturnArities",
+            "type": "object",
+            "properties": {
+                "tuple_return_arities": {
+                    "type": ["array", "null"],
+                    "items": {"type": "integer", "format": "uint64", "minimum": 0},
+                },
+            },
+            "required": ["tuple_return_arities"],
+            "additionalProperties": False,
+        }
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            output = Path(temporary_directory) / "nullable_array_models.py"
+            result = run_generator(schema, output)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            models = load_module(output)
+            for value in (None, [], [0, 2, 3]):
+                decoded = models.Root.from_dict({"tuple_return_arities": value})
+                self.assertEqual(decoded.tuple_return_arities, value)
+            for value in ([-1], [True], [1.5], ["2"], "2"):
+                with self.subTest(value=value), self.assertRaises(models.DecoderError):
+                    models.Root.from_dict({"tuple_return_arities": value})
+
+    def test_nullable_containers_and_bounded_primitives_keep_sibling_keywords(self) -> None:
+        # A `type: [X, "null"]` node carries its qualifiers (items, minimum, ...)
+        # as siblings of `type`, and they apply to the concrete alternative.
+        # Dropping them made a nullable array lose its element schema, so the
+        # generator aborted the whole run with "arrays must declare items" and
+        # the checked-in models could not be regenerated.
+        schema = {
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "title": "Nullable",
+            "type": "object",
+            "properties": {
+                "comment_block_lines": {
+                    "type": ["array", "null"],
+                    "items": {"type": "string"},
+                },
+                "formal_index": {"type": ["integer", "null"], "minimum": 0},
+            },
+            "required": ["comment_block_lines", "formal_index"],
+            "additionalProperties": False,
+        }
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            output = Path(temporary_directory) / "nullable_models.py"
+            result = run_generator(schema, output)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            models = load_module(output)
+            decoded = models.Root.from_dict(
+                {"comment_block_lines": ["a", "b"], "formal_index": 3}
+            )
+            self.assertEqual(decoded.comment_block_lines, ["a", "b"])
+            self.assertEqual(decoded.formal_index, 3)
+            nulls = models.Root.from_dict(
+                {"comment_block_lines": None, "formal_index": None}
+            )
+            self.assertIsNone(nulls.comment_block_lines)
+            self.assertIsNone(nulls.formal_index)
+            with self.assertRaises(models.DecoderError):
+                models.Root.from_dict(
+                    {"comment_block_lines": [1], "formal_index": 3}
+                )
+            with self.assertRaises(models.DecoderError):
+                models.Root.from_dict(
+                    {"comment_block_lines": ["a"], "formal_index": -1}
+                )
+
     def test_generate_decode_determinism_and_check(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
             output = Path(temporary_directory) / "generated_models.py"
@@ -197,6 +294,10 @@ class GeneratePythonQueryModelsTest(unittest.TestCase):
             stale = run_generator(SCHEMA, output, check=True)
             self.assertEqual(stale.returncode, 1)
             self.assertIn("stale generated output", stale.stderr)
+            self.assertIn(f"--- {output}\n", stale.stderr)
+            self.assertIn(f"+++ {output} (generated)\n", stale.stderr)
+            self.assertIn("-# stale\n", stale.stderr)
+            self.assertEqual(output.read_text(encoding="utf-8"), generated + "\n# stale\n")
 
             output.write_text(generated, encoding="utf-8")
             current = run_generator(SCHEMA, output, check=True)
@@ -207,6 +308,12 @@ class GeneratePythonQueryModelsTest(unittest.TestCase):
             self.assertEqual(decoded.name, "workspace")
             self.assertEqual(decoded.level, 7)
             self.assertIsNone(decoded.note)
+            # Hard-won: canonical Rust PythonRuleFact emitted owner_id=null,
+            # which the generated nullable-string decoder rejected.
+            self.assertIsNone(models.Root.from_dict({**DOCUMENT, "note": None}).note)
+            self.assertEqual(models.Root.from_dict({**DOCUMENT, "note": "kept"}).note, "kept")
+            with self.assertRaises(models.DecoderError):
+                models.Root.from_dict({**DOCUMENT, "note": 17})
             self.assertEqual(len(decoded.entries), 2)
             self.assertIsInstance(decoded.entries[0], models.Score)
             self.assertEqual(decoded.entries[0].direction, models.Direction.UP)

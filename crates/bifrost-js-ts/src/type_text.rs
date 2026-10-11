@@ -28,31 +28,33 @@ pub fn jsts_value_space_candidates(
     host: &dyn JsTsSource,
     candidates: Vec<CodeUnit>,
 ) -> Vec<CodeUnit> {
-    let value_candidates: Vec<_> = candidates
-        .iter()
-        .filter(|candidate| !jsts_unit_is_type_only(host, candidate))
-        .cloned()
-        .collect();
-    if value_candidates.is_empty() {
-        candidates
-    } else {
-        value_candidates
-    }
+    retain_matching_candidates_or_all(candidates, |candidate| {
+        !jsts_unit_is_type_only(host, candidate)
+    })
 }
 
 pub fn jsts_type_space_candidates(
     host: &dyn JsTsSource,
     candidates: Vec<CodeUnit>,
 ) -> Vec<CodeUnit> {
-    let type_candidates: Vec<_> = candidates
+    retain_matching_candidates_or_all(candidates, |candidate| {
+        jsts_unit_is_type_only(host, candidate)
+    })
+}
+
+fn retain_matching_candidates_or_all(
+    candidates: Vec<CodeUnit>,
+    mut matches: impl FnMut(&CodeUnit) -> bool,
+) -> Vec<CodeUnit> {
+    let matching: Vec<_> = candidates
         .iter()
-        .filter(|candidate| jsts_unit_is_type_only(host, candidate))
+        .filter(|candidate| matches(candidate))
         .cloned()
         .collect();
-    if type_candidates.is_empty() {
+    if matching.is_empty() {
         candidates
     } else {
-        type_candidates
+        matching
     }
 }
 

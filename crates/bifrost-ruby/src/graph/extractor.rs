@@ -7,13 +7,15 @@ use crate::graph::hits::{
 use crate::graph::resolver::{
     ExplicitReceiverLookup, FactoryInferenceFrame, FactoryInferenceKey, FactoryMethodOutcome,
     ReceiverMode, ReceiverType, RubyMethodLookupMode, RubySemanticIndex, RubyTargetKind,
-    RubyTargetSpec, ruby_method_lookup_mode_matches,
+    RubyTargetSpec, resolve_constant_reference, ruby_method_lookup_mode_matches,
 };
+use crate::graph::scope::{RubyScopeExit, exit_scope};
 use crate::graph::syntax::{
-    constant_hit_node, dynamic_dispatch_target_argument, is_call_method_identifier,
-    is_declaration_constant, is_declaration_identifier, method_receiver_mode, node_text,
+    constant_hit_node, dynamic_dispatch_target_argument, for_each_ruby_superclass_constant,
+    is_bare_method_reference_identifier, method_receiver_mode, node_text, ruby_call_is_same_owner,
     symbol_or_string_value,
 };
+use crate::syntax::ruby_parameter_binding_name_nodes;
 use brokk_bifrost_core::analyzer::model::Range;
 use brokk_bifrost_core::analyzer::tree_walk::{TreeWalkAction, walk_tree_iterative};
 use brokk_bifrost_core::analyzer::usages::local_inference::{
@@ -58,20 +60,13 @@ impl RubyFileScan<'_> {
     }
 }
 
-enum RubyExit {
-    Type { has_lexical_owner: bool },
-    Method,
-    SingletonClass,
-    LocalScope,
-}
-
 struct RubyWalkState<'a, 'b> {
     scan: &'a mut RubyFileScan<'b>,
     locals: LocalInferenceEngine<String>,
     lexical_stack: Vec<String>,
     method_stack: Vec<ReceiverMode>,
     receiver_context: Vec<ReceiverMode>,
-    exits: Vec<RubyExit>,
+    exits: Vec<RubyScopeExit>,
 }
 
 impl RubyWalkState<'_, '_> {
@@ -84,7 +79,7 @@ impl RubyWalkState<'_, '_> {
                     self.lexical_stack.push(owner.clone());
                 }
                 self.receiver_context.push(ReceiverMode::Instance);
-                self.exits.push(RubyExit::Type {
+                self.exits.push(RubyScopeExit::Type {
                     has_lexical_owner: owner.is_some(),
                 });
                 self.record_reference(node);
@@ -97,19 +92,19 @@ impl RubyWalkState<'_, '_> {
                     node,
                     self.receiver_context.last().copied(),
                 ));
-                self.exits.push(RubyExit::Method);
+                self.exits.push(RubyScopeExit::Method);
                 return TreeWalkAction::DescendWithExit;
             }
             "singleton_class" => {
                 self.locals.enter_scope();
                 self.method_stack.push(ReceiverMode::Class);
                 self.receiver_context.push(ReceiverMode::Class);
-                self.exits.push(RubyExit::SingletonClass);
+                self.exits.push(RubyScopeExit::SingletonClass);
                 return TreeWalkAction::DescendWithExit;
             }
             "block" | "do_block" => {
                 self.locals.enter_scope();
-                self.exits.push(RubyExit::LocalScope);
+                self.exits.push(RubyScopeExit::LocalScope);
                 return TreeWalkAction::DescendWithExit;
             }
             "assignment" => self.seed_assignment(node),
@@ -120,33 +115,13 @@ impl RubyWalkState<'_, '_> {
     }
 
     fn exit(&mut self) {
-        match self.exits.pop() {
-            Some(RubyExit::Type { has_lexical_owner }) => {
-                assert!(
-                    matches!(self.receiver_context.pop(), Some(ReceiverMode::Instance)),
-                    "type receiver context must match its exit"
-                );
-                if has_lexical_owner {
-                    self.lexical_stack.pop();
-                }
-            }
-            Some(RubyExit::Method) => {
-                self.method_stack.pop();
-                self.locals.exit_scope();
-            }
-            Some(RubyExit::SingletonClass) => {
-                assert!(
-                    matches!(self.receiver_context.pop(), Some(ReceiverMode::Class)),
-                    "singleton-class receiver context must match its exit"
-                );
-                self.method_stack.pop();
-                self.locals.exit_scope();
-            }
-            Some(RubyExit::LocalScope) => {
-                self.locals.exit_scope();
-            }
-            None => {}
-        }
+        exit_scope(
+            self.exits.pop(),
+            &mut self.receiver_context,
+            &mut self.lexical_stack,
+            &mut self.method_stack,
+            &mut self.locals,
+        );
     }
 
     fn type_owner(&self, node: Node<'_>) -> Option<String> {
@@ -172,18 +147,7 @@ impl RubyWalkState<'_, '_> {
         if self.scan.spec.kind != RubyTargetKind::TypeOrConstant {
             return;
         }
-        let Some(superclass) = node.child_by_field_name("superclass") else {
-            return;
-        };
-        let mut stack = vec![superclass];
-        while let Some(current) = stack.pop() {
-            self.record_constant_reference(current);
-            for index in (0..current.named_child_count()).rev() {
-                if let Some(child) = current.named_child(index) {
-                    stack.push(child);
-                }
-            }
-        }
+        for_each_ruby_superclass_constant(node, |current| self.record_constant_reference(current));
     }
 
     fn record_field_reference(&mut self, node: Node<'_>) {
@@ -244,38 +208,23 @@ impl RubyWalkState<'_, '_> {
     }
 
     fn record_constant_reference(&mut self, node: Node<'_>) {
-        if crate::imports::is_ruby_autoload_symbol_argument(node, self.scan.source) {
-            self.record_autoload_symbol_constant_reference(node);
-            return;
-        }
-        if !matches!(node.kind(), "constant" | "scope_resolution") || is_declaration_constant(node)
-        {
-            return;
-        }
-        if let Some(unit) = self.scan.semantic.resolve_constant(
+        let Some(reference) = resolve_constant_reference(
+            self.scan.semantic,
             self.scan.file,
             &self.scan.visible_files,
             &self.lexical_stack,
             node,
             self.scan.source,
-        ) && self.scan.semantic.target_matches_constant(&unit)
-        {
-            self.record_hit(constant_hit_node(node));
-        }
-    }
-
-    fn record_autoload_symbol_constant_reference(&mut self, node: Node<'_>) {
-        let Some(name) = crate::imports::ruby_symbol_name(node, self.scan.source) else {
+        ) else {
             return;
         };
-        if let Some(unit) = self.scan.semantic.resolve_constant_name(
-            self.scan.file,
-            &self.scan.visible_files,
-            &self.lexical_stack,
-            &name,
-        ) && self.scan.semantic.target_matches_constant(&unit)
-        {
-            self.record_hit(node);
+        if self.scan.semantic.target_matches_constant(&reference.unit) {
+            let hit_node = if reference.is_autoload_symbol {
+                node
+            } else {
+                constant_hit_node(node)
+            };
+            self.record_hit(hit_node);
         }
     }
 
@@ -301,16 +250,17 @@ impl RubyWalkState<'_, '_> {
         if let Some(aliased_method) =
             alias_method_target_argument(node, self.scan.source, &self.scan.spec.member_name)
         {
-            // `alias_method :new, :old` inside a class references the class's own
-            // method — a same-owner site.
-            self.record_bare_method_hit_for_receiver(
-                &self.enclosing_receiver().unwrap_or_else(|| ReceiverType {
-                    owner_fq_name: String::new(),
-                    mode: ReceiverMode::TopLevel,
-                }),
-                aliased_method,
-                true,
-            );
+            // A class-body `alias_method` acts on the instance method table even
+            // though its implicit receiver is the class. A singleton-class body
+            // keeps class-side mode for its method table.
+            let mut receiver = self.enclosing_receiver().unwrap_or_else(|| ReceiverType {
+                owner_fq_name: String::new(),
+                mode: ReceiverMode::TopLevel,
+            });
+            if let Some(mode) = self.receiver_context.last() {
+                receiver.mode = *mode;
+            }
+            self.record_bare_method_hit_for_receiver(&receiver, aliased_method, true);
             return;
         }
         let Some(method) = node.child_by_field_name("method") else {
@@ -326,8 +276,7 @@ impl RubyWalkState<'_, '_> {
         let name = node_text(node, self.scan.source);
         if name != self.scan.spec.member_name
             || self.locals.is_shadowed(name)
-            || is_declaration_identifier(node)
-            || is_call_method_identifier(node)
+            || !is_bare_method_reference_identifier(node)
         {
             return;
         }
@@ -382,10 +331,7 @@ impl RubyWalkState<'_, '_> {
         // / own class — a same-owner site (#1014 facet B). An explicit variable /
         // constant receiver, even of the same type, is a different instance and
         // stays external.
-        let same_owner = match receiver_node {
-            None => true,
-            Some(receiver) => receiver.kind() == "self",
-        };
+        let same_owner = ruby_call_is_same_owner(call);
         let receiver = match receiver_node {
             Some(receiver) => self.receiver_type(receiver),
             None => self.enclosing_receiver(),
@@ -514,10 +460,7 @@ pub fn language_for_file(file: &ProjectFile) -> Language {
 }
 
 pub fn first_precise(bindings: &LocalInferenceEngine<String>, symbol: &str) -> Option<String> {
-    bindings
-        .resolve_symbol(symbol)
-        .as_precise()
-        .and_then(|targets| targets.iter().next().cloned())
+    brokk_bifrost_core::analyzer::usages::inverted_edges::first_precise(bindings, symbol)
 }
 
 pub fn ruby_type_owner(
@@ -849,26 +792,42 @@ fn ruby_bare_new_outcome(
     semantic: &RubySemanticIndex<'_>,
     frame: &FactoryInferenceFrame,
 ) -> FactoryMethodOutcome {
-    let Some(visible_files) = semantic.visible_files_from(frame.method.source()) else {
+    let Some(overrides) = ruby_factory_method_frames(
+        semantic,
+        frame.method.source(),
+        &frame.invocation_owner_fq_name,
+        "new",
+    ) else {
         return FactoryMethodOutcome::Unknown;
     };
-    let receiver = ReceiverType {
-        owner_fq_name: frame.invocation_owner_fq_name.clone(),
-        mode: ReceiverMode::Class,
-    };
-    let mut overrides = Vec::new();
-    (semantic.graph.definitions)(&mut |support| {
-        overrides = semantic.resolve_method_candidates(support, &visible_files, &receiver, "new");
-    });
     if overrides.is_empty() {
         return FactoryMethodOutcome::Owner(frame.invocation_owner_fq_name.clone());
     }
-    FactoryMethodOutcome::Chain(
-        overrides
+    FactoryMethodOutcome::Chain(overrides)
+}
+
+fn ruby_factory_method_frames(
+    semantic: &RubySemanticIndex<'_>,
+    file: &ProjectFile,
+    owner_fq_name: &str,
+    method_name: &str,
+) -> Option<Vec<FactoryInferenceFrame>> {
+    let visible_files = semantic.visible_files_from(file)?;
+    let receiver = ReceiverType {
+        owner_fq_name: owner_fq_name.to_string(),
+        mode: ReceiverMode::Class,
+    };
+    let mut candidates = Vec::new();
+    (semantic.graph.definitions)(&mut |support| {
+        candidates =
+            semantic.resolve_method_candidates(support, &visible_files, &receiver, method_name);
+    });
+    Some(
+        candidates
             .into_iter()
             .map(|method| FactoryInferenceFrame {
                 method,
-                invocation_owner_fq_name: frame.invocation_owner_fq_name.clone(),
+                invocation_owner_fq_name: owner_fq_name.to_string(),
             })
             .collect(),
     )
@@ -999,18 +958,17 @@ fn ruby_factory_new_receiver_outcome(
     receiver: Node<'_>,
 ) -> FactoryMethodOutcome {
     let lexical_stack = ruby_lexical_stack_for_owner(owner_fq_name);
+    if let Some(owner) = ruby_factory_class_receiver_owner(
+        semantic,
+        file,
+        source,
+        &lexical_stack,
+        invocation_owner_fq_name,
+        receiver,
+    ) {
+        return FactoryMethodOutcome::Owner(owner);
+    }
     match receiver.kind() {
-        "self" => FactoryMethodOutcome::Owner(invocation_owner_fq_name.to_string()),
-        "constant" | "scope_resolution" => {
-            let Some(visible_files) = semantic.visible_files_from(file) else {
-                return FactoryMethodOutcome::Unknown;
-            };
-            semantic
-                .resolve_constant(file, &visible_files, &lexical_stack, receiver, source)
-                .filter(|unit| unit.is_class() || unit.is_module())
-                .map(|unit| FactoryMethodOutcome::Owner(unit.fq_name()))
-                .unwrap_or(FactoryMethodOutcome::Unknown)
-        }
         "call" => ruby_factory_chained_call_outcome(
             semantic,
             file,
@@ -1048,25 +1006,10 @@ fn ruby_factory_chained_call_outcome(
     ) else {
         return FactoryMethodOutcome::Unknown;
     };
-    let Some(visible_files) = semantic.visible_files_from(file) else {
+    let Some(frames) = ruby_factory_method_frames(semantic, file, &owner_fq_name, method_name)
+    else {
         return FactoryMethodOutcome::Unknown;
     };
-    let class = ReceiverType {
-        owner_fq_name: owner_fq_name.clone(),
-        mode: ReceiverMode::Class,
-    };
-    let mut candidates = Vec::new();
-    (semantic.graph.definitions)(&mut |support| {
-        candidates =
-            semantic.resolve_method_candidates(support, &visible_files, &class, method_name);
-    });
-    let frames = candidates
-        .into_iter()
-        .map(|method| FactoryInferenceFrame {
-            method,
-            invocation_owner_fq_name: owner_fq_name.clone(),
-        })
-        .collect();
     FactoryMethodOutcome::Chain(frames)
 }
 
@@ -1120,10 +1063,7 @@ pub fn ruby_enclosing_receiver(
     }
 
     let owner_fq_name = lexical_stack.last()?.clone();
-    let mode = method_stack
-        .last()
-        .copied()
-        .unwrap_or(ReceiverMode::Instance);
+    let mode = method_stack.last().copied().unwrap_or(ReceiverMode::Class);
     Some(ReceiverType {
         owner_fq_name,
         mode,
@@ -1203,19 +1143,12 @@ pub fn ruby_seed_parameter_shadows(
     source: &str,
 ) {
     if let Some(parameters) = node.child_by_field_name("parameters") {
-        let mut stack = vec![parameters];
-        while let Some(current) = stack.pop() {
-            if current.kind() == "identifier" {
-                let name = node_text(current, source);
-                if !name.is_empty() {
-                    locals.declare_shadow(name.to_string());
-                }
-                continue;
-            }
-            for index in (0..current.named_child_count()).rev() {
-                if let Some(child) = current.named_child(index) {
-                    stack.push(child);
-                }
+        let names = ruby_parameter_binding_name_nodes(parameters, || true)
+            .expect("unbounded Ruby parameter binding walk cannot stop");
+        for binding in names {
+            let name = node_text(binding, source);
+            if !name.is_empty() {
+                locals.declare_shadow(name.to_string());
             }
         }
     }

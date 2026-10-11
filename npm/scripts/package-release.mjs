@@ -5,6 +5,7 @@ import os from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
 import { fileURLToPath } from "node:url";
+import { archiveName as buildArchiveName } from "../../scripts/lib/release-archive.mjs";
 
 const execFile = promisify(execFileCallback);
 const npmRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
@@ -120,7 +121,7 @@ export function rootManifest(version) {
   return {
     name: ROOT_PACKAGE,
     ...baseManifest(version),
-    description: "Native Bifrost code analysis CLI, MCP server, and language server",
+    description: "Native Bifrost code analysis CLI and MCP server",
     type: "module",
     bin: { bifrost: "bin/bifrost.js" },
     files: ["bin/", "README.md", "LICENSE.md"],
@@ -140,7 +141,7 @@ function packageDirectory(packageName) {
 }
 
 function archiveName(version, platform) {
-  return `bifrost-v${version}-${platform.target}${platform.extension}`;
+  return buildArchiveName(platform.target, version, platform.extension);
 }
 
 async function writeManifest(directory, manifest) {

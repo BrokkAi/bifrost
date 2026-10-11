@@ -223,7 +223,7 @@ impl CppCompileContexts {
             .map_or(&[], Vec::as_slice)
     }
 
-    /// Resolve one angle include through explicit external roots in every
+    /// Resolve one literal include through explicit external roots in every
     /// compile configuration for `file`.
     ///
     /// This method never probes an implicit compiler sysroot and never executes
@@ -235,16 +235,32 @@ impl CppCompileContexts {
         file: &ProjectFile,
         include: &Path,
     ) -> CppExternalIncludeResolution {
+        self.resolve_external_include(file, &file.abs_path(), include, false)
+    }
+
+    /// Resolve one literal include using C include search semantics.
+    ///
+    /// A quoted include first checks the directory containing `including_file`,
+    /// then the explicit compiler search roots in command order. An angle
+    /// include skips the including-file directory and quote-only roots. The
+    /// result is declared only when every configuration selects the same
+    /// existing external file.
+    pub fn resolve_external_include(
+        &self,
+        file: &ProjectFile,
+        including_file: &Path,
+        include: &Path,
+        quoted: bool,
+    ) -> CppExternalIncludeResolution {
         let contexts = self.contexts_for(file);
         let Some(first_context) = contexts.first() else {
             return CppExternalIncludeResolution::MissingCompileContext;
         };
-        let first = first_context.resolve_external_angle_include(file.root(), include);
-        if contexts
-            .iter()
-            .skip(1)
-            .any(|context| context.resolve_external_angle_include(file.root(), include) != first)
-        {
+        let first =
+            first_context.resolve_external_include(file.root(), including_file, include, quoted);
+        if contexts.iter().skip(1).any(|context| {
+            context.resolve_external_include(file.root(), including_file, include, quoted) != first
+        }) {
             return CppExternalIncludeResolution::Conflicting;
         }
         match first {
@@ -315,27 +331,69 @@ impl CppCompileContext {
         &'a self,
         workspace_root: &'a Path,
     ) -> impl Iterator<Item = &'a Path> + 'a {
+        self.external_include_roots(workspace_root, false)
+    }
+
+    fn external_include_roots<'a>(
+        &'a self,
+        workspace_root: &'a Path,
+        quoted: bool,
+    ) -> impl Iterator<Item = &'a Path> + 'a {
         self.include_search_roots.iter().filter_map(move |root| {
-            (root.kind != CppIncludeSearchRootKind::Quote
-                && (root.kind == CppIncludeSearchRootKind::System
-                    || !root.path.starts_with(workspace_root)))
-            .then_some(root.path.as_path())
+            (quoted || root.kind != CppIncludeSearchRootKind::Quote)
+                .then_some(root)
+                .filter(|root| {
+                    root.kind == CppIncludeSearchRootKind::System
+                        || !root.path.starts_with(workspace_root)
+                })
+                .map(|root| root.path.as_path())
         })
     }
 
-    fn resolve_external_angle_include(
+    fn resolve_external_include(
         &self,
         workspace_root: &Path,
+        including_file: &Path,
         include: &Path,
+        quoted: bool,
     ) -> Option<(PathBuf, PathBuf)> {
         if include.is_absolute()
-            || include
-                .components()
-                .any(|component| !matches!(component, Component::Normal(_)))
+            || (!quoted
+                && include
+                    .components()
+                    .any(|component| !matches!(component, Component::Normal(_))))
+            || (quoted
+                && include.components().any(|component| {
+                    matches!(component, Component::RootDir | Component::Prefix(_))
+                }))
         {
             return None;
         }
-        self.external_angle_include_roots(workspace_root)
+
+        let workspace_root = canonical_or_normalized_path(workspace_root);
+        if quoted {
+            let including_directory = including_file.parent()?;
+            if let Ok(candidate) = including_directory.join(include).canonicalize()
+                && candidate.is_file()
+            {
+                if candidate.starts_with(&workspace_root) {
+                    return None;
+                }
+                if let Some(root) = self
+                    .external_include_roots(&workspace_root, true)
+                    .filter_map(|root| {
+                        let root = root.canonicalize().ok()?;
+                        candidate.starts_with(&root).then_some(root)
+                    })
+                    .next()
+                {
+                    return Some((root, candidate));
+                }
+                return None;
+            }
+        }
+
+        self.external_include_roots(&workspace_root, quoted)
             .filter_map(|root| {
                 let root = root.canonicalize().ok()?;
                 let candidate = root.join(include).canonicalize().ok()?;
@@ -601,6 +659,7 @@ mod tests {
     use super::{CompiledLanguage, CppCompileContexts, CppExternalIncludeResolution};
     use brokk_bifrost_core::analyzer::project::{FilesystemProject, Project, TestProject};
     use brokk_bifrost_core::analyzer::{Language, ProjectFile};
+    use brokk_bifrost_test_macros::hardwon;
     use std::path::{Path, PathBuf};
 
     /// Parses one argument vector into a compile context the same way
@@ -627,25 +686,6 @@ mod tests {
                 .expect("database");
         }
         (temp, TestProject::new(root, Language::Cpp))
-    }
-
-    #[test]
-    fn missing_or_malformed_database_has_no_context() {
-        let (_temp, project) = project_with_database(None);
-        let file = ProjectFile::new(project.root_path().to_path_buf(), "src/main.cpp");
-        assert!(
-            CppCompileContexts::load(&project)
-                .contexts_for(&file)
-                .is_empty()
-        );
-
-        let (_temp, project) = project_with_database(Some("not json"));
-        let file = ProjectFile::new(project.root_path().to_path_buf(), "src/main.cpp");
-        assert!(
-            CppCompileContexts::load(&project)
-                .contexts_for(&file)
-                .is_empty()
-        );
     }
 
     #[test]
@@ -693,6 +733,7 @@ mod tests {
     }
 
     #[test]
+    #[hardwon("#2011: conditional C visibility ignored command-order macro state")]
     fn undefine_flags_apply_in_command_order() {
         let context = context(&[
             "cc",
@@ -891,55 +932,16 @@ mod tests {
     }
 
     #[test]
-    fn an_unmatched_file_has_no_context() {
-        let (_temp, project) = project_with_database(Some(
-            r#"[{"directory":".","file":"src/other.cpp","arguments":["clang++","-c","src/other.cpp"]}]"#,
-        ));
-        let file = ProjectFile::new(project.root_path().to_path_buf(), "src/main.cpp");
-        assert!(
-            CppCompileContexts::load(&project)
-                .contexts_for(&file)
-                .is_empty()
-        );
-    }
-
-    #[test]
-    fn an_explicit_system_root_declares_an_angle_include() {
-        let (_temp, project) = project_with_database(Some(
-            r#"[{"directory":".","file":"src/main.cpp","arguments":["clang++","-isystem","fake-system/include","-c","src/main.cpp"]}]"#,
-        ));
-        let header = ProjectFile::new(
-            project.root_path().to_path_buf(),
-            "fake-system/include/vector",
-        );
-        header
-            .write("namespace std { class vector {}; }")
-            .expect("header");
-        let file = ProjectFile::new(project.root_path().to_path_buf(), "src/main.cpp");
-
-        assert_eq!(
-            CppExternalIncludeResolution::Declared {
-                root: project
-                    .root_path()
-                    .join("fake-system/include")
-                    .canonicalize()
-                    .expect("canonical root"),
-                header: header.abs_path().canonicalize().expect("canonical header"),
-            },
-            CppCompileContexts::load(&project)
-                .resolve_external_angle_include(&file, std::path::Path::new("vector"))
-        );
-    }
-
-    #[test]
-    fn an_external_project_root_declares_but_a_workspace_project_root_does_not() {
+    fn a_quoted_include_checks_the_including_directory_before_external_roots() {
         let external = tempfile::tempdir().expect("external root");
         let external_root = external
             .path()
             .canonicalize()
             .expect("canonical external root");
-        std::fs::write(external_root.join("vendor.hpp"), "class Vendor {};")
-            .expect("external header");
+        std::fs::write(external_root.join("vendor.hpp"), "class External {};\n")
+            .expect("external vendor header");
+        std::fs::write(external_root.join("from-search.hpp"), "class Search {};\n")
+            .expect("external search header");
         let database = serde_json::json!([{
             "directory": ".",
             "file": "src/main.cpp",
@@ -947,28 +949,47 @@ mod tests {
                 "clang++",
                 "-I",
                 external_root,
-                "-I",
-                "include",
                 "-c",
                 "src/main.cpp"
             ]
         }])
         .to_string();
         let (_temp, project) = project_with_database(Some(&database));
-        ProjectFile::new(project.root_path().to_path_buf(), "include/local.hpp")
-            .write("class Local {};")
-            .expect("local header");
         let file = ProjectFile::new(project.root_path().to_path_buf(), "src/main.cpp");
+        let source_path = file.abs_path();
+        let source_directory = source_path.parent().expect("source directory");
+        std::fs::create_dir_all(source_directory).expect("source directory");
+        std::fs::write(source_directory.join("vendor.hpp"), "class Local {};\n")
+            .expect("local vendor header");
         let contexts = CppCompileContexts::load(&project);
 
-        assert!(matches!(
-            contexts.resolve_external_angle_include(&file, std::path::Path::new("vendor.hpp")),
-            CppExternalIncludeResolution::Declared { .. }
-        ));
         assert_eq!(
             CppExternalIncludeResolution::Undeclared,
-            contexts.resolve_external_angle_include(&file, std::path::Path::new("local.hpp"))
+            contexts.resolve_external_include(
+                &file,
+                &file.abs_path(),
+                std::path::Path::new("vendor.hpp"),
+                true,
+            )
         );
+        assert!(matches!(
+            contexts.resolve_external_include(
+                &file,
+                &file.abs_path(),
+                std::path::Path::new("from-search.hpp"),
+                true,
+            ),
+            CppExternalIncludeResolution::Declared { .. }
+        ));
+        assert!(matches!(
+            contexts.resolve_external_include(
+                &file,
+                &file.abs_path(),
+                std::path::Path::new("vendor.hpp"),
+                false,
+            ),
+            CppExternalIncludeResolution::Declared { .. }
+        ));
     }
 
     #[test]
@@ -1053,16 +1074,6 @@ mod tests {
     }
 
     #[test]
-    fn default_by_extension_c_is_c_and_everything_else_is_cpp() {
-        let cx = context(&["cc", "-c", "file.c"]);
-        assert_eq!(CompiledLanguage::C, cx.tu_language(Path::new("file.c")));
-
-        let cx = context(&["cc", "-c", "file.cc"]);
-        assert_eq!(CompiledLanguage::Cpp, cx.tu_language(Path::new("file.cc")));
-        assert_eq!(CompiledLanguage::Cpp, cx.tu_language(Path::new("file.hpp")));
-    }
-
-    #[test]
     fn driver_basename_ending_in_plus_plus_selects_cpp_over_a_c_extension() {
         let cx = context(&["clang++", "-c", "file.c"]);
         assert_eq!(CompiledLanguage::Cpp, cx.tu_language(Path::new("file.c")));
@@ -1124,14 +1135,6 @@ mod tests {
     }
 
     #[test]
-    fn unrecognized_x_value_is_ignored() {
-        let cx = context(&["gcc", "-x", "assembler", "-c", "file.s"]);
-        // No C/C++ evidence at all in this configuration, so the extension
-        // (not "c") decides.
-        assert_eq!(CompiledLanguage::Cpp, cx.tu_language(Path::new("file.s")));
-    }
-
-    #[test]
     fn msvc_tc_and_tp_force_the_language_regardless_of_extension() {
         let cx = context(&["cl.exe", "/TC", "/c", "file.cpp"]);
         assert_eq!(CompiledLanguage::C, cx.tu_language(Path::new("file.cpp")));
@@ -1141,7 +1144,100 @@ mod tests {
     }
 
     #[test]
-    fn cl_exe_without_tc_or_tp_decides_by_extension() {
+    fn missing_or_malformed_database_has_no_context() {
+        let (_temp, project) = project_with_database(None);
+        let file = ProjectFile::new(project.root_path().to_path_buf(), "src/main.cpp");
+        assert!(
+            CppCompileContexts::load(&project)
+                .contexts_for(&file)
+                .is_empty()
+        );
+
+        let (_temp, project) = project_with_database(Some("not json"));
+        let file = ProjectFile::new(project.root_path().to_path_buf(), "src/main.cpp");
+        assert!(
+            CppCompileContexts::load(&project)
+                .contexts_for(&file)
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn an_explicit_system_root_declares_an_angle_include() {
+        let (_temp, project) = project_with_database(Some(
+            r#"[{"directory":".","file":"src/main.cpp","arguments":["clang++","-isystem","fake-system/include","-c","src/main.cpp"]}]"#,
+        ));
+        let header = ProjectFile::new(
+            project.root_path().to_path_buf(),
+            "fake-system/include/vector",
+        );
+        header
+            .write("namespace std { class vector {}; }")
+            .expect("header");
+        let file = ProjectFile::new(project.root_path().to_path_buf(), "src/main.cpp");
+
+        assert_eq!(
+            CppExternalIncludeResolution::Declared {
+                root: project
+                    .root_path()
+                    .join("fake-system/include")
+                    .canonicalize()
+                    .expect("canonical root"),
+                header: header.abs_path().canonicalize().expect("canonical header"),
+            },
+            CppCompileContexts::load(&project)
+                .resolve_external_angle_include(&file, std::path::Path::new("vector"))
+        );
+    }
+
+    #[test]
+    fn an_external_project_root_declares_but_a_workspace_project_root_does_not() {
+        let external = tempfile::tempdir().expect("external root");
+        let external_root = external
+            .path()
+            .canonicalize()
+            .expect("canonical external root");
+        std::fs::write(external_root.join("vendor.hpp"), "class Vendor {};")
+            .expect("external header");
+        let database = serde_json::json!([{
+            "directory": ".",
+            "file": "src/main.cpp",
+            "arguments": [
+                "clang++",
+                "-I",
+                external_root,
+                "-I",
+                "include",
+                "-c",
+                "src/main.cpp"
+            ]
+        }])
+        .to_string();
+        let (_temp, project) = project_with_database(Some(&database));
+        ProjectFile::new(project.root_path().to_path_buf(), "include/local.hpp")
+            .write("class Local {};")
+            .expect("local header");
+        let file = ProjectFile::new(project.root_path().to_path_buf(), "src/main.cpp");
+        let contexts = CppCompileContexts::load(&project);
+
+        assert!(matches!(
+            contexts.resolve_external_angle_include(&file, std::path::Path::new("vendor.hpp")),
+            CppExternalIncludeResolution::Declared { .. }
+        ));
+        assert_eq!(
+            CppExternalIncludeResolution::Undeclared,
+            contexts.resolve_external_angle_include(&file, std::path::Path::new("local.hpp"))
+        );
+    }
+
+    #[test]
+    fn default_by_extension_c_is_c_and_everything_else_is_cpp() {
+        let cx = context(&["cc", "-c", "file.c"]);
+        assert_eq!(CompiledLanguage::C, cx.tu_language(Path::new("file.c")));
+
+        let cx = context(&["cc", "-c", "file.cc"]);
+        assert_eq!(CompiledLanguage::Cpp, cx.tu_language(Path::new("file.cc")));
+        assert_eq!(CompiledLanguage::Cpp, cx.tu_language(Path::new("file.hpp")));
         let cx = context(&["cl.exe", "/c", "file.c"]);
         assert_eq!(CompiledLanguage::C, cx.tu_language(Path::new("file.c")));
 

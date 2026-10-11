@@ -14,10 +14,13 @@ use crate::graph::extractor::{
     ruby_enclosing_receiver, ruby_receiver_type, ruby_seed_assignment, ruby_seed_parameter_shadows,
     ruby_type_owner,
 };
-use crate::graph::resolver::{ReceiverMode, ReceiverType, RubySemanticIndex};
+use crate::graph::resolver::{
+    ReceiverMode, ReceiverType, RubySemanticIndex, resolve_constant_reference,
+};
+use crate::graph::scope::{RubyScopeExit, exit_scope};
 use crate::graph::syntax::{
-    dynamic_dispatch_target_argument, is_call_method_identifier, is_declaration_constant,
-    is_declaration_identifier, method_receiver_mode, node_text,
+    dynamic_dispatch_target_argument, for_each_ruby_superclass_constant,
+    is_bare_method_reference_identifier, method_receiver_mode, node_text, ruby_call_is_same_owner,
 };
 use crate::graph_support::RubySource;
 use crate::syntax::ruby_semantic_identifier_range;
@@ -108,20 +111,13 @@ impl RubyEdgeScan<'_> {
     }
 }
 
-enum RubyEdgeExit {
-    Type { has_lexical_owner: bool },
-    Method,
-    SingletonClass,
-    LocalScope,
-}
-
 struct RubyEdgeWalkState<'scan, 'ctx> {
     scan: &'scan mut RubyEdgeScan<'ctx>,
     locals: LocalInferenceEngine<String>,
     lexical_stack: Vec<String>,
     method_stack: Vec<ReceiverMode>,
     receiver_context: Vec<ReceiverMode>,
-    exits: Vec<RubyEdgeExit>,
+    exits: Vec<RubyScopeExit>,
 }
 
 impl RubyEdgeWalkState<'_, '_> {
@@ -134,7 +130,7 @@ impl RubyEdgeWalkState<'_, '_> {
                     self.lexical_stack.push(owner.clone());
                 }
                 self.receiver_context.push(ReceiverMode::Instance);
-                self.exits.push(RubyEdgeExit::Type {
+                self.exits.push(RubyScopeExit::Type {
                     has_lexical_owner: owner.is_some(),
                 });
                 self.record_reference(node);
@@ -147,19 +143,19 @@ impl RubyEdgeWalkState<'_, '_> {
                     node,
                     self.receiver_context.last().copied(),
                 ));
-                self.exits.push(RubyEdgeExit::Method);
+                self.exits.push(RubyScopeExit::Method);
                 return TreeWalkAction::DescendWithExit;
             }
             "singleton_class" => {
                 self.locals.enter_scope();
                 self.method_stack.push(ReceiverMode::Class);
                 self.receiver_context.push(ReceiverMode::Class);
-                self.exits.push(RubyEdgeExit::SingletonClass);
+                self.exits.push(RubyScopeExit::SingletonClass);
                 return TreeWalkAction::DescendWithExit;
             }
             "block" | "do_block" => {
                 self.locals.enter_scope();
-                self.exits.push(RubyEdgeExit::LocalScope);
+                self.exits.push(RubyScopeExit::LocalScope);
                 return TreeWalkAction::DescendWithExit;
             }
             "assignment" => self.seed_assignment(node),
@@ -170,33 +166,13 @@ impl RubyEdgeWalkState<'_, '_> {
     }
 
     fn exit(&mut self) {
-        match self.exits.pop() {
-            Some(RubyEdgeExit::Type { has_lexical_owner }) => {
-                assert!(
-                    matches!(self.receiver_context.pop(), Some(ReceiverMode::Instance)),
-                    "type receiver context must match its exit"
-                );
-                if has_lexical_owner {
-                    self.lexical_stack.pop();
-                }
-            }
-            Some(RubyEdgeExit::Method) => {
-                self.method_stack.pop();
-                self.locals.exit_scope();
-            }
-            Some(RubyEdgeExit::SingletonClass) => {
-                assert!(
-                    matches!(self.receiver_context.pop(), Some(ReceiverMode::Class)),
-                    "singleton-class receiver context must match its exit"
-                );
-                self.method_stack.pop();
-                self.locals.exit_scope();
-            }
-            Some(RubyEdgeExit::LocalScope) => {
-                self.locals.exit_scope();
-            }
-            None => {}
-        }
+        exit_scope(
+            self.exits.pop(),
+            &mut self.receiver_context,
+            &mut self.lexical_stack,
+            &mut self.method_stack,
+            &mut self.locals,
+        );
     }
 
     fn type_owner(&self, node: Node<'_>) -> Option<String> {
@@ -216,53 +192,22 @@ impl RubyEdgeWalkState<'_, '_> {
     }
 
     fn record_superclass_reference(&mut self, node: Node<'_>) {
-        let Some(superclass) = node.child_by_field_name("superclass") else {
-            return;
-        };
-        let mut stack = vec![superclass];
-        while let Some(current) = stack.pop() {
-            self.record_constant_reference(current);
-            for index in (0..current.named_child_count()).rev() {
-                if let Some(child) = current.named_child(index) {
-                    stack.push(child);
-                }
-            }
-        }
+        for_each_ruby_superclass_constant(node, |current| self.record_constant_reference(current));
     }
 
     fn record_constant_reference(&mut self, node: Node<'_>) {
-        if crate::imports::is_ruby_autoload_symbol_argument(node, self.scan.source) {
-            self.record_autoload_symbol_constant_reference(node);
-            return;
-        }
-        if !matches!(node.kind(), "constant" | "scope_resolution") || is_declaration_constant(node)
-        {
-            return;
-        }
-        if let Some(unit) = self.scan.semantic.resolve_constant(
+        let Some(reference) = resolve_constant_reference(
+            self.scan.semantic,
             self.scan.file,
             &self.scan.visible_files,
             &self.lexical_stack,
             node,
             self.scan.source,
-        ) && (unit.is_class() || unit.is_module())
-        {
-            self.scan.record(unit.fq_name(), node);
-        }
-    }
-
-    fn record_autoload_symbol_constant_reference(&mut self, node: Node<'_>) {
-        let Some(name) = crate::imports::ruby_symbol_name(node, self.scan.source) else {
+        ) else {
             return;
         };
-        if let Some(unit) = self.scan.semantic.resolve_constant_name(
-            self.scan.file,
-            &self.scan.visible_files,
-            &self.lexical_stack,
-            &name,
-        ) && (unit.is_class() || unit.is_module())
-        {
-            self.scan.record(unit.fq_name(), node);
+        if reference.unit.is_class() || reference.unit.is_module() {
+            self.scan.record(reference.unit.fq_name(), node);
         }
     }
 
@@ -315,10 +260,7 @@ impl RubyEdgeWalkState<'_, '_> {
         // A `self.method` or implicit-self (bare) call is on the current instance
         // / own class — a same-owner site (#1138). An explicit variable/constant
         // receiver stays external.
-        let same_owner = match receiver_node {
-            None => true,
-            Some(receiver) => receiver.kind() == "self",
-        };
+        let same_owner = ruby_call_is_same_owner(node);
         let receiver = match receiver_node {
             Some(receiver) => self.receiver_type(receiver),
             None => self.enclosing_receiver(node.start_byte()),
@@ -354,8 +296,7 @@ impl RubyEdgeWalkState<'_, '_> {
         let name = node_text(node, self.scan.source);
         if name.is_empty()
             || self.locals.is_shadowed(name)
-            || is_declaration_identifier(node)
-            || is_call_method_identifier(node)
+            || !is_bare_method_reference_identifier(node)
         {
             return;
         }

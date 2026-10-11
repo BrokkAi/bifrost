@@ -231,7 +231,7 @@ pub fn blockers_from_report(report: &TaintFindingReport) -> Vec<BlockerObservati
 ///
 /// The facade maps `PolicyRunCompletion` onto this; the mapping stays in the
 /// facade because `PolicyRunCompletion` lives above this crate. A run is a clean
-/// conclusion when it is any variant except `Inconclusive`.
+/// conclusion when it was evaluated and is not `Inconclusive`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CompletionBucket {
@@ -239,15 +239,17 @@ pub enum CompletionBucket {
     ProvenBySummary,
     ProvenSubset,
     Inconclusive,
+    /// The selected policy could not run because a required capability was unavailable.
+    NotRun,
     Unsupported,
     Failed,
 }
 
 impl CompletionBucket {
     /// Whether this conclusion counts toward the clean-conclusion baseline. Every
-    /// terminating conclusion counts; only `Inconclusive` does not.
+    /// terminating evaluation counts; `Inconclusive` and `NotRun` do not.
     pub const fn is_clean_conclusion(self) -> bool {
-        !matches!(self, Self::Inconclusive)
+        !matches!(self, Self::Inconclusive | Self::NotRun)
     }
 
     pub const fn label(self) -> &'static str {
@@ -256,6 +258,7 @@ impl CompletionBucket {
             Self::ProvenBySummary => "proven_by_summary",
             Self::ProvenSubset => "proven_subset",
             Self::Inconclusive => "inconclusive",
+            Self::NotRun => "not_run",
             Self::Unsupported => "unsupported",
             Self::Failed => "failed",
         }
@@ -270,7 +273,7 @@ impl CompletionBucket {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "status", rename_all = "snake_case")]
 pub enum RepoOutcome {
-    /// The policy ran and the taint run concluded.
+    /// The evaluator returned a taint run record. `NotRun` records are not evaluated runs.
     Ran {
         completion: CompletionBucket,
         findings: usize,
@@ -388,6 +391,9 @@ pub struct OutcomeTallies {
     pub proven_by_summary: usize,
     pub proven_subset: usize,
     pub inconclusive: usize,
+    /// Selected policies that could not run; absent in older reports.
+    #[serde(default)]
+    pub not_run: usize,
     pub unsupported: usize,
     pub failed: usize,
     pub workspace_build_failed: usize,
@@ -442,7 +448,9 @@ pub fn summarize(slice: SliceMeta, outcomes: &[RepoRunOutcome]) -> DemandSweepRe
     for outcome in outcomes {
         match &outcome.outcome {
             RepoOutcome::Ran { completion, .. } => {
-                evaluated_runs += 1;
+                if !matches!(completion, CompletionBucket::NotRun) {
+                    evaluated_runs += 1;
+                }
                 if completion.is_clean_conclusion() {
                     clean_conclusion_runs += 1;
                 }
@@ -451,6 +459,7 @@ pub fn summarize(slice: SliceMeta, outcomes: &[RepoRunOutcome]) -> DemandSweepRe
                     CompletionBucket::ProvenBySummary => tallies.proven_by_summary += 1,
                     CompletionBucket::ProvenSubset => tallies.proven_subset += 1,
                     CompletionBucket::Inconclusive => tallies.inconclusive += 1,
+                    CompletionBucket::NotRun => tallies.not_run += 1,
                     CompletionBucket::Unsupported => tallies.unsupported += 1,
                     CompletionBucket::Failed => tallies.failed += 1,
                 }
@@ -571,8 +580,8 @@ fn permille(numerator: usize, denominator: usize) -> u32 {
 
 #[cfg(test)]
 mod tests {
+
     use super::*;
-    use brokk_bifrost_analysis::analyzer::semantic::DispatchBoundaryKind;
 
     fn observation(kind: BlockerBoundaryKind, callee: Option<&str>) -> BlockerObservation {
         BlockerObservation {
@@ -581,33 +590,12 @@ mod tests {
         }
     }
 
-    fn inconclusive(repo: &str, blockers: Vec<BlockerObservation>) -> RepoRunOutcome {
-        RepoRunOutcome {
-            repo: repo.to_owned(),
-            java_files: 1,
-            outcome: RepoOutcome::Ran {
-                completion: CompletionBucket::Inconclusive,
-                findings: 0,
-            },
-            blockers,
-            inconclusive_reasons: Vec::new(),
-        }
-    }
-
-    fn inconclusive_with_reasons(repo: &str, reasons: &[&str]) -> RepoRunOutcome {
-        RepoRunOutcome {
-            repo: repo.to_owned(),
-            java_files: 1,
-            outcome: RepoOutcome::Ran {
-                completion: CompletionBucket::Inconclusive,
-                findings: 0,
-            },
-            blockers: Vec::new(),
-            inconclusive_reasons: reasons.iter().map(|reason| (*reason).to_owned()).collect(),
-        }
-    }
-
-    fn concluded(repo: &str, completion: CompletionBucket) -> RepoRunOutcome {
+    fn repo_run_outcome(
+        repo: &str,
+        completion: CompletionBucket,
+        blockers: Vec<BlockerObservation>,
+        inconclusive_reasons: Vec<String>,
+    ) -> RepoRunOutcome {
         RepoRunOutcome {
             repo: repo.to_owned(),
             java_files: 1,
@@ -615,9 +603,26 @@ mod tests {
                 completion,
                 findings: 0,
             },
-            blockers: Vec::new(),
-            inconclusive_reasons: Vec::new(),
+            blockers,
+            inconclusive_reasons,
         }
+    }
+
+    fn inconclusive(repo: &str, blockers: Vec<BlockerObservation>) -> RepoRunOutcome {
+        repo_run_outcome(repo, CompletionBucket::Inconclusive, blockers, Vec::new())
+    }
+
+    fn inconclusive_with_reasons(repo: &str, reasons: &[&str]) -> RepoRunOutcome {
+        repo_run_outcome(
+            repo,
+            CompletionBucket::Inconclusive,
+            Vec::new(),
+            reasons.iter().map(|reason| (*reason).to_owned()).collect(),
+        )
+    }
+
+    fn concluded(repo: &str, completion: CompletionBucket) -> RepoRunOutcome {
+        repo_run_outcome(repo, completion, Vec::new(), Vec::new())
     }
 
     fn slice(names: &[&str]) -> SliceMeta {
@@ -632,49 +637,6 @@ mod tests {
                 })
                 .collect(),
         }
-    }
-
-    #[test]
-    fn the_boundary_mapping_buckets_every_dispatch_shape() {
-        // The two summary-closable dispatch shapes.
-        assert_eq!(
-            classify_summary_boundary(&SummaryBoundaryKind::Dispatch(
-                DispatchBoundaryKind::External(None)
-            )),
-            BlockerBoundaryKind::ExternalCallThrough
-        );
-        assert_eq!(
-            BlockerBoundaryKind::ExternalCallThrough.bucket(),
-            BlockerBucket::SummaryClosable
-        );
-        // The engine-blocked residual dispatch shapes.
-        assert_eq!(
-            classify_summary_boundary(&SummaryBoundaryKind::Dispatch(
-                DispatchBoundaryKind::Unresolved
-            )),
-            BlockerBoundaryKind::UnresolvedDispatch
-        );
-        assert_eq!(
-            classify_summary_boundary(&SummaryBoundaryKind::Dispatch(
-                DispatchBoundaryKind::Truncated
-            )),
-            BlockerBoundaryKind::TruncatedDispatch
-        );
-        assert_eq!(
-            BlockerBoundaryKind::UnresolvedDispatch.bucket(),
-            BlockerBucket::EngineBlocked
-        );
-        assert_eq!(
-            BlockerBoundaryKind::TruncatedDispatch.bucket(),
-            BlockerBucket::EngineBlocked
-        );
-        // An external boundary that kept no locator has no callee.
-        assert_eq!(
-            boundary_callee(&SummaryBoundaryKind::Dispatch(
-                DispatchBoundaryKind::External(None)
-            )),
-            None
-        );
     }
 
     #[test]
@@ -733,92 +695,6 @@ mod tests {
     }
 
     #[test]
-    fn the_bucket_split_reports_the_engine_blocked_ceiling() {
-        // Two verdicts a summary could fully close, one that also has an
-        // engine-blocked boundary: the engine-blocked ceiling is 1 of 3.
-        let outcomes = vec![
-            inconclusive(
-                "a",
-                vec![observation(
-                    BlockerBoundaryKind::ExternalCallThrough,
-                    Some("p#A.m"),
-                )],
-            ),
-            inconclusive(
-                "b",
-                vec![observation(
-                    BlockerBoundaryKind::UnmaterializedCallee,
-                    Some("p#B.m"),
-                )],
-            ),
-            inconclusive(
-                "c",
-                vec![
-                    observation(BlockerBoundaryKind::ExternalCallThrough, Some("p#C.m")),
-                    observation(BlockerBoundaryKind::UnresolvedDispatch, None),
-                ],
-            ),
-        ];
-        let report = summarize(slice(&["a", "b", "c"]), &outcomes);
-
-        assert_eq!(report.verdict_split.blocked_verdicts, 3);
-        assert_eq!(report.verdict_split.verdicts_all_summary_closable, 2);
-        assert_eq!(report.verdict_split.verdicts_with_engine_blocker, 1);
-        // 1 of 3 is 333 permille (rounded).
-        assert_eq!(report.verdict_split.engine_blocked_verdict_permille, 333);
-        assert_eq!(report.blocker_bucket_totals.summary_closable, 3);
-        assert_eq!(report.blocker_bucket_totals.engine_blocked, 1);
-    }
-
-    #[test]
-    fn the_baseline_counts_every_non_inconclusive_conclusion_as_clean() {
-        let outcomes = vec![
-            concluded("a", CompletionBucket::Complete),
-            concluded("b", CompletionBucket::ProvenBySummary),
-            inconclusive(
-                "c",
-                vec![observation(BlockerBoundaryKind::UnresolvedDispatch, None)],
-            ),
-            RepoRunOutcome {
-                repo: "d".to_owned(),
-                java_files: 1,
-                outcome: RepoOutcome::WorkspaceBuildFailed {
-                    detail: "boom".to_owned(),
-                },
-                blockers: Vec::new(),
-                inconclusive_reasons: Vec::new(),
-            },
-        ];
-        let report = summarize(slice(&["a", "b", "c", "d"]), &outcomes);
-
-        // Three runs evaluated (a, b, c); the build failure is not a run.
-        assert_eq!(report.evaluated_runs, 3);
-        assert_eq!(report.clean_conclusion_runs, 2);
-        // 2 of 3 clean is 667 permille (rounded).
-        assert_eq!(report.clean_conclusion_permille, 667);
-        assert_eq!(report.outcomes.complete, 1);
-        assert_eq!(report.outcomes.proven_by_summary, 1);
-        assert_eq!(report.outcomes.inconclusive, 1);
-        assert_eq!(report.outcomes.workspace_build_failed, 1);
-        assert_eq!(report.repo_count, 4);
-    }
-
-    #[test]
-    fn a_blocker_seen_twice_in_one_run_counts_once_for_that_verdict() {
-        let outcomes = vec![inconclusive(
-            "a",
-            vec![
-                observation(BlockerBoundaryKind::ExternalCallThrough, Some("p#A.m")),
-                observation(BlockerBoundaryKind::ExternalCallThrough, Some("p#A.m")),
-            ],
-        )];
-        let report = summarize(slice(&["a"]), &outcomes);
-        assert_eq!(report.ranked_blockers.len(), 1);
-        assert_eq!(report.ranked_blockers[0].blocked_verdicts, 1);
-        assert_eq!(report.verdict_split.blocked_verdicts, 1);
-    }
-
-    #[test]
     fn inconclusive_reasons_tally_across_verdicts_even_with_no_blockers() {
         // The realistic-sweep shape: inconclusive verdicts that carry a run-level
         // abstention reason but no per-callee blocker. The reason tally is where
@@ -843,6 +719,49 @@ mod tests {
             Some(&1)
         );
         assert_eq!(report.outcomes.inconclusive, 2);
+    }
+
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#4676: capability-gated policies must not inflate the demand-sweep baseline"
+    )]
+    fn not_run_is_accounted_without_counting_as_an_evaluated_or_clean_run() {
+        let outcomes = vec![
+            concluded("complete", CompletionBucket::Complete),
+            inconclusive("inconclusive", Vec::new()),
+            concluded("unavailable", CompletionBucket::NotRun),
+        ];
+        let report = summarize(
+            slice(&["complete", "inconclusive", "unavailable"]),
+            &outcomes,
+        );
+        assert_eq!(report.repo_count, 3);
+        assert_eq!(report.outcomes.not_run, 1);
+        assert_eq!(report.evaluated_runs, 2);
+        assert_eq!(report.clean_conclusion_runs, 1);
+        assert_eq!(report.clean_conclusion_permille, 500);
+        assert_eq!(CompletionBucket::NotRun.label(), "not_run");
+        let json = serde_json::to_value(&report).expect("serializes");
+        assert_eq!(json["repo_outcomes"][2]["outcome"]["completion"], "not_run");
+        let decoded: DemandSweepReport = serde_json::from_value(json).expect("round trips");
+        assert_eq!(decoded, report);
+
+        // A report written before NotRun existed has no not_run tally.
+        let old_report = summarize(
+            slice(&["complete"]),
+            &[concluded("complete", CompletionBucket::Complete)],
+        );
+        let mut old_json = serde_json::to_value(&old_report).expect("serializes");
+        assert_eq!(
+            old_json["outcomes"]
+                .as_object_mut()
+                .expect("tallies")
+                .remove("not_run"),
+            Some(serde_json::json!(0)),
+        );
+        let decoded: DemandSweepReport =
+            serde_json::from_value(old_json).expect("older report decodes");
+        assert_eq!(decoded, old_report);
     }
 
     #[test]

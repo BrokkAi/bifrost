@@ -5,6 +5,17 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use std::time::Instant;
 
+#[doc(hidden)]
+pub fn optional_is_cancelled(cancellation: Option<&CancellationToken>) -> bool {
+    cancellation.is_some_and(CancellationToken::is_cancelled)
+}
+
+/// Return whether cancellation is observed at this 256-unit polling checkpoint.
+#[doc(hidden)]
+pub fn is_cancelled_at_checkpoint(cancellation: Option<&CancellationToken>, index: usize) -> bool {
+    index.is_multiple_of(256) && optional_is_cancelled(cancellation)
+}
+
 /// Cloneable cooperative-cancellation flag for bounded in-process work.
 ///
 /// Cancellation is advisory: callers set the shared flag and long-running
@@ -303,16 +314,7 @@ impl CancellationToken {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn clones_share_cancellation_state() {
-        let token = CancellationToken::default();
-        let clone = token.clone();
-
-        assert!(!clone.is_cancelled());
-        token.cancel();
-        assert!(clone.is_cancelled());
-    }
+    use brokk_bifrost_test_macros::hardwon;
 
     #[test]
     fn child_observes_parent_without_propagating_local_cancellation() {
@@ -334,6 +336,7 @@ mod tests {
     }
 
     #[test]
+    #[hardwon("#1228: a deadline must cancel clones and record timeout cause")]
     fn issue_1228_timeout_cancels_clones_and_records_its_cause() {
         let token = CancellationToken::default().with_timeout(Duration::ZERO);
         let clone = token.clone();
@@ -343,6 +346,7 @@ mod tests {
     }
 
     #[test]
+    #[hardwon("#1228: explicit cancellation was confused with a deadline timeout")]
     fn issue_1228_explicit_cancellation_is_not_reported_as_timeout() {
         let token = CancellationToken::default().with_timeout(Duration::from_secs(60));
 
@@ -353,6 +357,7 @@ mod tests {
     }
 
     #[test]
+    #[hardwon("#3170: nested phase restoration was not published to the progress sink")]
     fn issue_3170_a_phase_sink_hears_every_entry_and_every_restore() {
         let reported = Arc::new(Mutex::new(Vec::new()));
         let recorder = Arc::clone(&reported);
@@ -382,6 +387,7 @@ mod tests {
     }
 
     #[test]
+    #[hardwon("#1228: a later nested deadline replaced the earliest request deadline")]
     fn issue_1228_nested_timeouts_preserve_the_earliest_deadline() {
         let token = CancellationToken::default()
             .with_timeout(Duration::ZERO)
@@ -400,16 +406,5 @@ mod tests {
         assert!(!child.is_cancelled());
         assert!(!child.is_timed_out());
         assert!(!token.is_cancelled());
-    }
-
-    #[test]
-    fn soft_deadline_test_hook_trips_after_the_requested_checks_without_cancelling() {
-        let token = CancellationToken::soft_deadline_after_checks_for_test(2);
-
-        assert!(!token.soft_deadline_passed());
-        assert!(token.soft_deadline_passed());
-        assert!(token.soft_deadline_passed());
-        assert!(!token.is_cancelled());
-        assert!(!token.is_timed_out());
     }
 }

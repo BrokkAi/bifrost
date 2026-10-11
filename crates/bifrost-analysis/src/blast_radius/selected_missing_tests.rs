@@ -5,7 +5,7 @@
 
 use super::*;
 #[cfg(test)]
-use crate::analyzer::RustSelectedReferenceIndex;
+use crate::analyzer::RustAnalyzer;
 #[cfg(any(test, feature = "test-support"))]
 use crate::analyzer::resolution::{
     FactReferenceEdgeCatalog, FactResolutionSource, SelectedFactResolutionSnapshot,
@@ -14,16 +14,10 @@ use crate::analyzer::resolution::{
 };
 use crate::analyzer::store::Result as StoreResult;
 use crate::analyzer::structural::reference_edges::{
-    EdgeCompleteness, EdgeDerivationResult, EdgeIncompleteReason,
+    EdgeCompleteness, EdgeDerivationResult, EdgeIncompleteReason, SelectedInverseReferenceIndex,
 };
 use crate::analyzer::structural::{EdgeAxis, EdgeProvenance};
 use crate::analyzer::usages::{UsageHitKind, UsageHitSurface, UsageProof};
-#[cfg(test)]
-use crate::analyzer::{Language, RustAnalyzer, resolve_analyzer};
-#[cfg(test)]
-use crate::analyzer::{
-    RustSelectedReverseOutcome, RustSelectedReverseQueries, with_rust_selected_reverse_queries,
-};
 #[cfg(any(test, feature = "test-support"))]
 use crate::diff_analysis::Snapshot;
 use serde::Serialize;
@@ -62,11 +56,6 @@ struct SelectedInverseFrontierCache {
     results: HashMap<CodeUnit, Arc<EdgeDerivationResult>>,
 }
 
-trait MissingTestsInverseIndex {
-    fn generation(&self) -> u64;
-    fn inverse_for(&self, target: &CodeUnit) -> EdgeDerivationResult;
-}
-
 /// Fallible, mutable reverse queries used by the selected traversal.
 ///
 /// The provider owns one selected resolution session. A `None` result is an
@@ -84,7 +73,7 @@ struct EagerMissingTestsInverseQueries<'a, I> {
     index: &'a I,
 }
 
-impl<I: MissingTestsInverseIndex> MissingTestsInverseQueries
+impl<I: SelectedInverseReferenceIndex> MissingTestsInverseQueries
     for EagerMissingTestsInverseQueries<'_, I>
 {
     fn generation(&self) -> u64 {
@@ -104,39 +93,8 @@ impl<I: MissingTestsInverseIndex> MissingTestsInverseQueries
     }
 }
 
-#[cfg(test)]
-struct RustMissingTestsInverseQueries<'a> {
-    queries: &'a mut dyn RustSelectedReverseQueries,
-    generation: u64,
-}
-
-#[cfg(test)]
-impl MissingTestsInverseQueries for RustMissingTestsInverseQueries<'_> {
-    fn generation(&self) -> u64 {
-        self.generation
-    }
-
-    fn inverse_for(
-        &mut self,
-        targets: &[CodeUnit],
-    ) -> StoreResult<Option<Vec<EdgeDerivationResult>>> {
-        self.queries.inverse_for(targets)
-    }
-}
-
-#[cfg(test)]
-impl MissingTestsInverseIndex for RustSelectedReferenceIndex {
-    fn generation(&self) -> u64 {
-        RustSelectedReferenceIndex::generation(self)
-    }
-
-    fn inverse_for(&self, target: &CodeUnit) -> EdgeDerivationResult {
-        RustSelectedReferenceIndex::inverse_for(self, target)
-    }
-}
-
 #[cfg(any(test, feature = "test-support"))]
-impl MissingTestsInverseIndex for SelectedReferenceInverseIndex {
+impl SelectedInverseReferenceIndex for SelectedReferenceInverseIndex {
     fn generation(&self) -> u64 {
         SelectedReferenceInverseIndex::generation(self)
     }
@@ -410,7 +368,7 @@ where
 
     let mut frontier_cache = SelectedInverseFrontierCache::default();
     if let Some(graph) = target_evidence.graph.as_ref() {
-        for group in selected_candidate_file_groups(target_analyzer, graph, &mut work.candidates) {
+        for group in candidate_file_groups(target_analyzer, graph, &mut work.candidates) {
             match trace_selected_test_reachability(
                 target_analyzer,
                 &index,
@@ -496,248 +454,6 @@ where
         ));
     }
     Ok(result)
-}
-
-/// Test-only mixed-language diagnostic for the exact #2767 workload. Rust
-/// candidates are the only ones allowed through the selected native reverse
-/// callback; all other languages retain the incumbent exact usage traversal.
-/// The native callback is opened once for every Rust group so its fact session
-/// and frontier cache span the complete Rust demand, not one changed file.
-#[cfg(test)]
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn missing_tests_at_root_with_mixed_selected_reverse(
-    root: &Path,
-    params: MissingTestsParams,
-    options: &DiffAnalysisOptions,
-    cancellation: &CancellationToken,
-    telemetry: &mut SelectedMissingTestsTelemetry,
-) -> Result<MissingTestsResult, String> {
-    *telemetry = SelectedMissingTestsTelemetry::default();
-    let mut work = prepare_missing_tests_at_root(root, params, options, cancellation)?;
-    if work.candidates.is_empty() {
-        return Ok(finish_missing_tests(
-            work,
-            MissingTestsMode::FileGraphNarrowedBindingReachability,
-            false,
-            false,
-            Vec::new(),
-        ));
-    }
-    if cancellation.is_cancelled() {
-        return Ok(finish_all_indeterminate(
-            work,
-            MissingTestsMode::FileGraphNarrowedBindingReachability,
-            MissingTestsIncompleteReason::TargetGraphCancelled,
-            true,
-            false,
-            Vec::new(),
-        ));
-    }
-
-    let target_context = build_target_file_dependency_analyzer(&work.prepared, None)?;
-    let target_analyzer = target_context.analyzer();
-    let expected_generation = target_analyzer.project().analysis_generation();
-    let target_evidence = collect_target_evidence(
-        target_analyzer,
-        &target_diff_paths(&work.prepared),
-        cancellation,
-    );
-    if target_evidence.graph_cancelled || cancellation.is_cancelled() {
-        return Ok(finish_all_indeterminate(
-            work,
-            MissingTestsMode::FileGraphNarrowedBindingReachability,
-            MissingTestsIncompleteReason::TargetGraphCancelled,
-            true,
-            target_evidence.graph_incomplete,
-            target_evidence.unresolved,
-        ));
-    }
-    if target_analyzer.project().analysis_generation() != expected_generation {
-        return Ok(finish_all_indeterminate(
-            work,
-            MissingTestsMode::FileGraphNarrowedBindingReachability,
-            MissingTestsIncompleteReason::ReferenceGraphStale,
-            false,
-            target_evidence.graph_incomplete,
-            target_evidence.unresolved,
-        ));
-    }
-    let groups = target_evidence
-        .graph
-        .as_ref()
-        .map(|graph| selected_candidate_file_groups(target_analyzer, graph, &mut work.candidates))
-        .unwrap_or_default();
-    let has_rust_candidates = groups.iter().any(|group| {
-        group
-            .candidate_indices
-            .iter()
-            .any(|&index| candidate_is_rust(target_analyzer, &work.candidates[index]))
-    });
-
-    if has_rust_candidates {
-        let rust = resolve_analyzer::<RustAnalyzer>(target_analyzer).ok_or_else(|| {
-            "native Rust diagnostic found Rust candidates without a Rust analyzer".to_string()
-        })?;
-        let native = with_rust_selected_reverse_queries(rust, cancellation, |queries| {
-            let mut provider = RustMissingTestsInverseQueries {
-                queries,
-                generation: expected_generation,
-            };
-            let mut frontier_cache = SelectedInverseFrontierCache::default();
-            let mut control = SelectedTraceControl::Complete;
-            for group in &groups {
-                let rust_indices = group
-                    .candidate_indices
-                    .iter()
-                    .copied()
-                    .filter(|&index| candidate_is_rust(target_analyzer, &work.candidates[index]))
-                    .collect::<Vec<_>>();
-                if rust_indices.is_empty() {
-                    continue;
-                }
-                control = trace_selected_test_reachability_with_queries(
-                    target_analyzer,
-                    &mut provider,
-                    &mut frontier_cache,
-                    &group.allowed_files,
-                    &rust_indices,
-                    &mut work.candidates,
-                    cancellation,
-                    telemetry,
-                );
-                if !matches!(&control, SelectedTraceControl::Complete) {
-                    break;
-                }
-            }
-            Ok(control)
-        });
-        let control = match native {
-            RustSelectedReverseOutcome::Ready(control) => control,
-            RustSelectedReverseOutcome::Cancelled => SelectedTraceControl::Cancelled,
-            RustSelectedReverseOutcome::Stale(_reason) => SelectedTraceControl::Stale,
-            RustSelectedReverseOutcome::Unavailable(reason) => {
-                return Err(format!("native Rust missing_tests unavailable: {reason}"));
-            }
-            RustSelectedReverseOutcome::StoreError(error) => {
-                return Err(format!("native Rust missing_tests store error: {error}"));
-            }
-        };
-        match control {
-            SelectedTraceControl::Complete => {}
-            SelectedTraceControl::Cancelled => {
-                return Ok(finish_all_indeterminate(
-                    work,
-                    MissingTestsMode::FileGraphNarrowedBindingReachability,
-                    MissingTestsIncompleteReason::ReferenceGraphCancelled,
-                    false,
-                    target_evidence.graph_incomplete,
-                    target_evidence.unresolved,
-                ));
-            }
-            SelectedTraceControl::Stale => {
-                return Ok(finish_all_indeterminate(
-                    work,
-                    MissingTestsMode::FileGraphNarrowedBindingReachability,
-                    MissingTestsIncompleteReason::ReferenceGraphStale,
-                    false,
-                    target_evidence.graph_incomplete,
-                    target_evidence.unresolved,
-                ));
-            }
-            SelectedTraceControl::Failed(error) => return Err(error),
-        }
-    }
-
-    let exact_scope = AnalyzerQueryScope::with_cancellation(target_analyzer, cancellation);
-    let exact_context = ScanUsagesExecutionContext::for_composite_query(cancellation.clone());
-    for group in &groups {
-        let non_rust_indices = group
-            .candidate_indices
-            .iter()
-            .copied()
-            .filter(|&index| !candidate_is_rust(target_analyzer, &work.candidates[index]))
-            .collect::<Vec<_>>();
-        if non_rust_indices.is_empty() {
-            continue;
-        }
-        trace_exact_test_reachability(
-            target_analyzer,
-            exact_scope.token(),
-            &exact_context,
-            &group.allowed_files,
-            &non_rust_indices,
-            &mut work.candidates,
-        );
-    }
-    if cancellation.is_cancelled() {
-        return Ok(finish_all_indeterminate(
-            work,
-            MissingTestsMode::FileGraphNarrowedBindingReachability,
-            MissingTestsIncompleteReason::ReferenceGraphCancelled,
-            false,
-            target_evidence.graph_incomplete,
-            target_evidence.unresolved,
-        ));
-    }
-    if target_analyzer.project().analysis_generation() != expected_generation {
-        return Ok(finish_all_indeterminate(
-            work,
-            MissingTestsMode::FileGraphNarrowedBindingReachability,
-            MissingTestsIncompleteReason::ReferenceGraphStale,
-            false,
-            target_evidence.graph_incomplete,
-            target_evidence.unresolved,
-        ));
-    }
-    Ok(finish_missing_tests(
-        work,
-        MissingTestsMode::FileGraphNarrowedBindingReachability,
-        false,
-        target_evidence.graph_incomplete,
-        target_evidence.unresolved,
-    ))
-}
-
-fn selected_candidate_file_groups(
-    analyzer: &dyn IAnalyzer,
-    graph: &crate::analyzer::usages::workspace_graph::WorkspaceUsageRankingGraph,
-    candidates: &mut [CandidateState],
-) -> Vec<CandidateFileGroup> {
-    let mut grouped_indices = BTreeMap::<String, Vec<usize>>::new();
-    for (index, candidate) in candidates.iter().enumerate() {
-        grouped_indices
-            .entry(candidate.record.after.path.clone())
-            .or_default()
-            .push(index);
-    }
-    let mut groups = Vec::with_capacity(grouped_indices.len());
-    for (path, candidate_indices) in grouped_indices {
-        let Some(seed_file) = analyzer
-            .project()
-            .file_by_rel_path(Path::new(&path))
-            .filter(|file| graph.node_indices_by_file.contains_key(file))
-        else {
-            for index in candidate_indices {
-                candidates[index]
-                    .incomplete_reasons
-                    .insert(MissingTestsIncompleteReason::UnresolvedChangedPath);
-            }
-            continue;
-        };
-        groups.push(CandidateFileGroup {
-            allowed_files: reverse_reachable_files(graph, std::iter::once(&seed_file)),
-            candidate_indices,
-        });
-    }
-    groups
-}
-
-#[cfg(test)]
-fn candidate_is_rust(analyzer: &dyn IAnalyzer, candidate: &CandidateState) -> bool {
-    analyzer
-        .project()
-        .file_by_rel_path(Path::new(&candidate.record.after.path))
-        .is_some_and(|file| crate::analyzer::common::language_for_file(&file) == Language::Rust)
 }
 
 #[cfg(any(test, feature = "test-support"))]
@@ -1044,32 +760,13 @@ fn trace_selected_test_reachability_with_queries(
             outcomes.insert(id, outcome);
         }
 
-        let current = std::mem::take(&mut pending);
-        for (candidate_index, id) in current {
-            if candidates[candidate_index].reached || !visited.insert((candidate_index, id.clone()))
-            {
-                continue;
-            }
-            let outcome = &outcomes[&id];
-            if outcome.reaches_test_context {
-                candidates[candidate_index].reached = true;
-                continue;
-            }
-            candidates[candidate_index]
-                .incomplete_reasons
-                .extend(outcome.incomplete_reasons.iter().copied());
-            for caller_id in outcome.callers.keys() {
-                if !visited.contains(&(candidate_index, caller_id.clone())) {
-                    pending.insert((candidate_index, caller_id.clone()));
-                }
-            }
-        }
+        propagate_reachability_frontier(&mut pending, &mut visited, &outcomes, candidates);
     }
     SelectedTraceControl::Complete
 }
 
 #[allow(clippy::too_many_arguments)]
-fn trace_selected_test_reachability<I: MissingTestsInverseIndex>(
+fn trace_selected_test_reachability<I: SelectedInverseReferenceIndex>(
     analyzer: &dyn IAnalyzer,
     index: &I,
     cache: &mut SelectedInverseFrontierCache,
@@ -1094,6 +791,7 @@ fn trace_selected_test_reachability<I: MissingTestsInverseIndex>(
 
 #[cfg(test)]
 mod tests {
+    use super::super::commit_all;
     use super::*;
     use crate::analyzer::Language;
     use crate::analyzer::resolution::{
@@ -1107,36 +805,7 @@ mod tests {
         OverlayProject,
     };
     use crate::inline_project::InlineTestProject;
-    use git2::{IndexAddOption, Repository, Signature};
-    use std::path::PathBuf;
-
-    fn commit_all(repo: &Repository, message: &str) -> git2::Oid {
-        let mut index = repo.index().expect("repository index");
-        index
-            .add_all(["*"], IndexAddOption::DEFAULT, None)
-            .expect("stage fixture");
-        index.update_all(["*"], None).expect("stage deletions");
-        index.write().expect("write fixture index");
-        let tree = repo
-            .find_tree(index.write_tree().expect("fixture tree oid"))
-            .expect("fixture tree");
-        let signature = Signature::now("Tester", "tester@example.com").expect("signature");
-        let parent = repo
-            .head()
-            .ok()
-            .and_then(|head| head.target())
-            .map(|oid| repo.find_commit(oid).expect("fixture parent"));
-        let parents = parent.iter().collect::<Vec<_>>();
-        repo.commit(
-            Some("HEAD"),
-            &signature,
-            &signature,
-            message,
-            &tree,
-            &parents,
-        )
-        .expect("fixture commit")
-    }
+    use git2::Repository;
 
     fn java_method(analyzer: &dyn IAnalyzer, name: &str) -> CodeUnit {
         analyzer
@@ -1205,6 +874,7 @@ mod tests {
             target: target.clone(),
             reference_kind: None,
             proof,
+            ambiguous_candidate: false,
             usage_kind,
             site_class: SiteClass::UseSite,
             owner_relation: if enclosing == Some(target) {
@@ -1231,121 +901,6 @@ mod tests {
             .build();
         let analyzer = JavaAnalyzer::new(project.project_dyn());
         (project, analyzer)
-    }
-
-    #[test]
-    fn rust_missing_tests_consumer_queries_one_native_frontier_wave_at_a_time() {
-        let project = InlineTestProject::with_language(Language::Rust)
-            .file(
-                "Cargo.toml",
-                "[package]\nname = \"missing-tests-rust\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
-            )
-            .file(
-                "src/lib.rs",
-                "pub fn changed() {}\npub fn helper() { changed(); }\nmod tests {\n    #[test]\n    fn reaches_test_context() { super::helper(); }\n}\n",
-            )
-            .build();
-        let rust = RustAnalyzer::new(project.project_dyn());
-        let changed = rust
-            .all_declarations()
-            .find(|unit| unit.is_function() && unit.terminal_name() == "changed")
-            .expect("Rust changed declaration");
-        let mut candidates = vec![candidate_state_with_language(&rust, &changed, "rust")];
-        let mut cache = SelectedInverseFrontierCache::default();
-        let mut telemetry = SelectedMissingTestsTelemetry::default();
-        let cancellation = CancellationToken::new();
-        let generation = rust.project().analysis_generation();
-        let result = with_rust_selected_reverse_queries(&rust, &cancellation, |queries| {
-            let mut provider = RustMissingTestsInverseQueries {
-                queries,
-                generation,
-            };
-            let control = trace_selected_test_reachability_with_queries(
-                &rust,
-                &mut provider,
-                &mut cache,
-                &BTreeSet::new(),
-                &[0],
-                &mut candidates,
-                &cancellation,
-                &mut telemetry,
-            );
-            assert_eq!(SelectedTraceControl::Complete, control);
-            Ok(candidates[0].reached)
-        });
-        assert!(matches!(result, RustSelectedReverseOutcome::Ready(true)));
-        assert!(telemetry.frontier_requests >= 3);
-    }
-
-    // R4.6 (#3250): on the native route an unproven reference edge must not
-    // advance test reachability, and the candidate it fails to reach must carry
-    // an incomplete reason. finish_missing_tests routes an unreached candidate
-    // with a reason to indeterminate_functions and one without a reason to
-    // missing_functions, so the reason is what separates "no test calls this"
-    // from "Bifrost could not tell". Without it an unprovable edge would be
-    // published as a confident negative.
-    #[test]
-    fn rust_missing_tests_keeps_an_unproven_native_edge_indeterminate() {
-        let project = InlineTestProject::with_language(Language::Rust)
-            .file(
-                "Cargo.toml",
-                "[package]\nname = \"missing-tests-rust-unproven\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
-            )
-            .file(
-                "src/lib.rs",
-                "pub fn changed() {}\npub fn helper() { changed(); }\nmod tests {\n    #[test]\n    fn reaches_test_context() { super::helper(); }\n}\n",
-            )
-            .build();
-        let rust = RustAnalyzer::new(project.project_dyn());
-        let declaration = |name: &str| {
-            rust.all_declarations()
-                .find(|unit| unit.is_function() && unit.terminal_name() == name)
-                .unwrap_or_else(|| panic!("missing Rust declaration {name}"))
-        };
-        let changed = declaration("changed");
-        let helper = declaration("helper");
-        let generation = rust.project().analysis_generation();
-        let index = SelectedReferenceInverseIndex::from_forward_rows_for_test_support(
-            generation,
-            vec![changed.clone()],
-            EdgeCompleteness::Complete,
-            1,
-            vec![selected_row(
-                &rust,
-                &changed,
-                Some(&helper),
-                UsageProof::Unproven,
-                UsageHitKind::Reference,
-                generation,
-            )],
-        );
-        let mut candidates = vec![candidate_state_with_language(&rust, &changed, "rust")];
-        let mut cache = SelectedInverseFrontierCache::default();
-        let mut telemetry = SelectedMissingTestsTelemetry::default();
-
-        assert_eq!(
-            SelectedTraceControl::Complete,
-            trace_selected_test_reachability(
-                &rust,
-                &index,
-                &mut cache,
-                &BTreeSet::new(),
-                &[0],
-                &mut candidates,
-                &CancellationToken::new(),
-                &mut telemetry,
-            )
-        );
-        assert!(
-            !candidates[0].reached,
-            "an unproven edge is not a proven path to a test context"
-        );
-        assert_eq!(
-            BTreeSet::from([MissingTestsIncompleteReason::UnprovenBindingEdge]),
-            candidates[0].incomplete_reasons,
-            "the unreached candidate must say why, so it is reported indeterminate"
-        );
-        assert_eq!(1, telemetry.unproven_rows_observed);
     }
 
     #[test]
@@ -1481,39 +1036,6 @@ mod tests {
         assert_eq!(vec![64, 1], queries.batch_sizes);
         assert_eq!(2, queries.batch_targets.len());
         assert_eq!(65, telemetry.frontier_cache_hits);
-    }
-
-    #[test]
-    #[ignore = "exact #2767 mixed Rust/Python diagnostic; set BIFROST_MISSING_TESTS_2767_ROOT"]
-    fn ignored_exact_2767_mixed_native_missing_tests_diagnostic() {
-        let Some(root) = std::env::var_os("BIFROST_MISSING_TESTS_2767_ROOT") else {
-            return;
-        };
-        const TARGET: &str = "57fb66322ce75c1612b7ce5a426e1797d5ba9935";
-        let mut telemetry = SelectedMissingTestsTelemetry::default();
-        let result = missing_tests_at_root_with_mixed_selected_reverse(
-            &PathBuf::from(root),
-            MissingTestsParams {
-                base: Some(format!("{TARGET}^")),
-                target: Some(TARGET.to_string()),
-            },
-            &DiffAnalysisOptions::default(),
-            &CancellationToken::new(),
-            &mut telemetry,
-        )
-        .expect("exact #2767 mixed native missing-tests diagnostic");
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&serde_json::json!({
-                "result": &result,
-                "telemetry": telemetry,
-            }))
-            .expect("diagnostic result serializes")
-        );
-        assert_eq!(10, result.analysis.candidate_function_count);
-        assert_eq!(3, result.analysis.reached_function_count);
-        assert_eq!(6, result.analysis.missing_function_count);
-        assert_eq!(1, result.analysis.indeterminate_function_count);
     }
 
     #[test]
@@ -1805,7 +1327,6 @@ mod tests {
             candidate[0].incomplete_reasons
         );
     }
-
     #[test]
     fn selected_inverse_bfs_obeys_branch_cycle_and_usage_surface_laws() {
         let (_project, analyzer) = selected_java_bfs_project();
@@ -2002,7 +1523,6 @@ mod tests {
             );
         }
     }
-
     #[test]
     fn selected_missing_tests_rejects_mixed_language_inverse_coverage_without_a_prefix() {
         const BASE_JAVA: &str =
@@ -2089,7 +1609,6 @@ mod tests {
         assert_eq!(1, telemetry.failed_inverse_index_builds);
         assert_eq!(0, telemetry.frontier_requests);
     }
-
     #[test]
     fn selected_missing_tests_total_result_covers_empty_cancelled_and_stale_requests() {
         const BASE_JAVA: &str =

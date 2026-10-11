@@ -128,3 +128,14 @@ threads-required = "num-cpus"
 [[profile.default.overrides]]
 filter = 'test(issue_3006_release_zero_config)'
 threads-required = "num-cpus"
+
+# semantic_ir_rows_round_trip_every_workspace_crate_source runs only under
+# `--cfg scheduled_tests`: it lowers, stores and decodes every Rust file under
+# crates/ (about 1,500, some over 200 KB) on every available CPU, largest file
+# first. The Rust lowerer alone takes 270 s to 530 s on each of the three
+# largest files in a debug build on a loaded host (2026-10-08), so the test
+# cannot meet the 600 s threshold; it gets 30 minutes instead.
+[[profile.default.overrides]]
+filter = 'test(semantic_ir_rows_round_trip_every_workspace_crate_source)'
+threads-required = "num-cpus"
+slow-timeout = { period = "60s", terminate-after = 30 }

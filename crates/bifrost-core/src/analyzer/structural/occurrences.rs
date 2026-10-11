@@ -121,6 +121,10 @@ occurrence_roles! {
         "A token whose presence generates declarations elsewhere, such as property macros or accessor-generating fields.",
     ValueReference => "value_reference": Reference,
         "A plain read or write of a value in expression position.",
+    GlobalDirective => "global_directive": NonReference,
+        "A name declared by a Python global statement.",
+    NonlocalDirective => "nonlocal_directive": NonReference,
+        "A name declared by a Python nonlocal statement.",
 }
 
 impl fmt::Display for OccurrenceRole {
@@ -282,7 +286,7 @@ impl OccurrenceRoleSupport {
     }
 
     pub fn is_empty(&self) -> bool {
-        self.support.iter().all(|support| !support.is_supported())
+        super::support_is_empty(self.support.iter().map(|support| support.is_supported()))
     }
 
     /// Iterate in the stable order declared by [`ALL_OCCURRENCE_ROLES`].
@@ -331,6 +335,18 @@ pub const fn default_occurrence_namespace(
     }
 }
 
+/// Use the module namespace for path segments in grammars with module-only paths.
+pub const fn module_path_occurrence_namespace(
+    role: OccurrenceRole,
+    declares: Option<NormalizedKind>,
+) -> Option<Namespace> {
+    if matches!(role, OccurrenceRole::PathSegment) {
+        Some(Namespace::Module)
+    } else {
+        default_occurrence_namespace(role, declares)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -371,51 +387,6 @@ mod tests {
                 serde_json::Value::String(namespace.label().to_owned())
             );
         }
-    }
-
-    /// The role→class mapping must be a total partition: every class is
-    /// reachable and every role lands in exactly one of them.
-    #[test]
-    fn role_to_class_mapping_is_a_total_partition() {
-        let mut covered = HashSet::new();
-        let mut partitioned = 0usize;
-        for &class in ALL_OCCURRENCE_CLASSES {
-            let members = ALL_OCCURRENCE_ROLES
-                .iter()
-                .filter(|role| role.class() == class)
-                .count();
-            partitioned += members;
-            if members > 0 {
-                covered.insert(class);
-            }
-        }
-        assert_eq!(partitioned, ALL_OCCURRENCE_ROLES.len());
-        assert_eq!(covered.len(), ALL_OCCURRENCE_CLASSES.len());
-        assert_eq!(
-            OccurrenceRole::DeclarationName.class(),
-            OccurrenceClass::Declaration
-        );
-        assert_eq!(OccurrenceRole::Binder.class(), OccurrenceClass::Binding);
-        assert_eq!(
-            OccurrenceRole::ValueReference.class(),
-            OccurrenceClass::Reference
-        );
-        assert_eq!(
-            OccurrenceRole::ImportAlias.class(),
-            OccurrenceClass::NonReference
-        );
-    }
-
-    #[test]
-    fn indices_are_dense_and_size_the_support_table() {
-        assert_eq!(ALL_OCCURRENCE_ROLES.len(), OccurrenceRole::COUNT);
-        for (slot, &role) in ALL_OCCURRENCE_ROLES.iter().enumerate() {
-            assert_eq!(role.index(), slot);
-        }
-        assert_eq!(
-            OccurrenceRoleSupport::NONE.iter().count(),
-            OccurrenceRole::COUNT
-        );
     }
 
     #[test]

@@ -611,24 +611,24 @@ impl CompiledProtocol {
         state: ProtocolStateId,
         event: ProtocolEventId,
     ) -> impl Iterator<Item = &CompiledProtocolTransition> {
-        let start = self
-            .transitions
-            .partition_point(|transition| (transition.from, transition.on) < (state, event));
-        self.transitions[start..]
-            .iter()
-            .take_while(move |transition| (transition.from, transition.on) == (state, event))
+        let key = (state, event);
+        let range =
+            crate::dataflow::sorted_equal_range_by(&self.transitions, &key, |transition, key| {
+                (transition.from, transition.on).cmp(key)
+            });
+        self.transitions[range].iter()
     }
 
     fn outgoing_transitions(
         &self,
         state: ProtocolStateId,
     ) -> impl Iterator<Item = &CompiledProtocolTransition> {
-        let start = self
-            .transitions
-            .partition_point(|transition| transition.from < state);
-        self.transitions[start..]
-            .iter()
-            .take_while(move |transition| transition.from == state)
+        let range = crate::dataflow::sorted_equal_range_by(
+            &self.transitions,
+            &state,
+            |transition, state| transition.from.cmp(state),
+        );
+        self.transitions[range].iter()
     }
 
     pub fn transition_for(
@@ -1350,14 +1350,16 @@ impl fmt::Write for BoundedDebugWriter {
 }
 
 fn bounded_debug_display(value: &impl fmt::Display) -> Box<str> {
-    let mut writer = BoundedDebugWriter::new();
-    let _ = write!(&mut writer, "{value}");
-    writer.finish().into_boxed_str()
+    bounded_debug(value).into_boxed_str()
 }
 
 fn bounded_debug_value(value: &str) -> String {
+    bounded_debug(&value)
+}
+
+fn bounded_debug(value: &impl fmt::Display) -> String {
     let mut writer = BoundedDebugWriter::new();
-    let _ = writer.write_str(value);
+    let _ = write!(&mut writer, "{value}");
     writer.finish()
 }
 
@@ -1370,16 +1372,10 @@ fn parse_state_set(
     let mut retained = HashSet::new();
     for (index, value) in values.iter().take(MAX_PROTOCOL_STATES).enumerate() {
         let path = format!("{field}[{index}]");
-        let Some(key) = parse_key::<ProtocolStateKey>(value, &path, diagnostics) else {
+        let Some(key) = parse_declared_state(value, &path, states, diagnostics) else {
             continue;
         };
-        if !states.contains_key(&key) {
-            diagnostics.push(ProtocolDiagnostic::new(
-                ProtocolDiagnosticCode::UnknownState,
-                path,
-                format!("state `{key}` is not declared"),
-            ));
-        } else if !retained.insert(key.clone()) {
+        if !retained.insert(key.clone()) {
             diagnostics.push(ProtocolDiagnostic::new(
                 ProtocolDiagnosticCode::DuplicateClassification,
                 path,
@@ -1388,6 +1384,25 @@ fn parse_state_set(
         }
     }
     retained
+}
+
+fn parse_declared_state(
+    value: &str,
+    path: &str,
+    states: &HashMap<ProtocolStateKey, usize>,
+    diagnostics: &mut DiagnosticCollector,
+) -> Option<ProtocolStateKey> {
+    let key = parse_key::<ProtocolStateKey>(value, path, diagnostics)?;
+    if states.contains_key(&key) {
+        Some(key)
+    } else {
+        diagnostics.push(ProtocolDiagnostic::new(
+            ProtocolDiagnosticCode::UnknownState,
+            path.to_owned(),
+            format!("state `{key}` is not declared"),
+        ));
+        None
+    }
 }
 
 fn normalize_guard(
@@ -1552,16 +1567,10 @@ fn parse_expected_states(
     *remaining_memberships -= retain_count;
     for (index, value) in values.iter().take(retain_count).enumerate() {
         let item_path = format!("{path}[{index}]");
-        let Some(key) = parse_key::<ProtocolStateKey>(value, &item_path, diagnostics) else {
+        let Some(key) = parse_declared_state(value, &item_path, states, diagnostics) else {
             continue;
         };
-        if !states.contains_key(&key) {
-            diagnostics.push(ProtocolDiagnostic::new(
-                ProtocolDiagnosticCode::UnknownState,
-                item_path,
-                format!("state `{key}` is not declared"),
-            ));
-        } else if !accepting.contains(&key) {
+        if !accepting.contains(&key) {
             diagnostics.push(ProtocolDiagnostic::new(
                 ProtocolDiagnosticCode::NonAcceptingExpectedState,
                 item_path,
@@ -1807,18 +1816,25 @@ fn compare_compiled_transitions(
     left: &CompiledProtocolTransition,
     right: &CompiledProtocolTransition,
 ) -> Ordering {
-    (left.from, left.on)
-        .cmp(&(right.from, right.on))
-        .then_with(|| left.guard.cmp(&right.guard))
-        .then_with(|| left.to.cmp(&right.to))
+    compare_transition_parts(
+        (&left.from, &left.on, &left.guard, &left.to),
+        (&right.from, &right.on, &right.guard, &right.to),
+    )
 }
 
 fn compare_canonical_transitions(
     left: &CanonicalTransition,
     right: &CanonicalTransition,
 ) -> Ordering {
-    (&left.from, &left.on)
-        .cmp(&(&right.from, &right.on))
-        .then_with(|| left.guard.cmp(&right.guard))
-        .then_with(|| left.to.cmp(&right.to))
+    compare_transition_parts(
+        (&left.from, &left.on, &left.guard, &left.to),
+        (&right.from, &right.on, &right.guard, &right.to),
+    )
+}
+
+fn compare_transition_parts<From: Ord, Event: Ord, Guard: Ord, To: Ord>(
+    left: (&From, &Event, &Guard, &To),
+    right: (&From, &Event, &Guard, &To),
+) -> Ordering {
+    left.cmp(&right)
 }

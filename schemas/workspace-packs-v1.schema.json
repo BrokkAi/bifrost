@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://bifrost.dev/schemas/workspace-packs-v1.schema.json",
   "title": "Bifrost Workspace Semantic-Pack Activation",
-  "description": "The shared .bifrost/packs.json document read by the CLI, MCP, and LSP hosts. The loader additionally enforces that catalog is a portable workspace-relative path and that the document is at most 256 KiB.",
+  "description": "The shared .bifrost/packs.json document read by the bifrost CLI policy runner, the MCP host, and other hosts built on the Bifrost library. The loader additionally enforces that catalog and every python_runtime_environments path is a portable workspace-relative path and that the document is at most 256 KiB.",
   "type": "object",
   "additionalProperties": false,
   "properties": {
@@ -14,7 +14,7 @@
       "type": "string",
       "minLength": 1,
       "maxLength": 1024,
-      "description": "Optional workspace-relative catalog directory. When omitted, activation uses an ephemeral catalog. Absolute paths, parent components, and platform-prefixed paths are rejected by the loader."
+      "description": "Optional workspace-relative catalog directory. When omitted, a persisted analyzer, or a session that sets BIFROST_SEMANTIC_PACK_CACHE_ROOT, BIFROST_CACHE_DIR, or BIFROST_CACHE_ROOT, uses the default versioned catalog in the repository's .bifrost cache; an analyzer built with ephemeral storage uses an in-memory catalog. Absolute paths, parent components, and platform-prefixed paths are rejected by the loader."
     },
     "ecosystems": {
       "type": "array",
@@ -41,10 +41,336 @@
       "items": {
         "type": "string"
       }
+    },
+    "python_runtime_environments": {
+      "type": "array",
+      "description": "Optional explicit bindings from a workspace source tree to installed Python wheel contents. Bifrost verifies each installed tree against its original wheel without running Python. The entries are added to the Python runtime-environment configuration used for activation.",
+      "items": {
+        "$ref": "#/$defs/PythonRuntimeEnvironment"
+      }
     }
   },
   "required": [
     "schema_version",
     "ecosystems"
-  ]
+  ],
+  "$defs": {
+    "PythonRuntimeEnvironment": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "source_root": {
+          "type": "string",
+          "description": "Workspace-relative path of the source tree bound to this installed environment. \".\" binds the whole workspace."
+        },
+        "artifacts": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/PythonRuntimeArtifact"
+          }
+        },
+        "declared_environment": {
+          "description": "Optional, explicitly declared filesystem-import environment. It describes the declared launch configuration, not an interpreter that is running now.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/PythonDeclaredEnvironment"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "required": [
+        "source_root",
+        "artifacts"
+      ]
+    },
+    "PythonRuntimeArtifact": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "archive_path": {
+          "type": "string",
+          "description": "Workspace-relative path to the original wheel archive."
+        },
+        "installed_root": {
+          "type": "string",
+          "description": "Workspace-relative root that contains the installed wheel contents."
+        }
+      },
+      "required": [
+        "archive_path",
+        "installed_root"
+      ]
+    },
+    "PythonDeclaredEnvironment": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "producer_version": {
+          "type": "string",
+          "description": "Version of the producer that wrote this declared descriptor."
+        },
+        "resolver_version": {
+          "type": "string",
+          "description": "Version of the declared resolver semantics, not of the running runtime."
+        },
+        "interpreter": {
+          "$ref": "#/$defs/PythonDeclaredInterpreter"
+        },
+        "launch": {
+          "$ref": "#/$defs/PythonDeclaredLaunch"
+        },
+        "entry_point": {
+          "$ref": "#/$defs/PythonDeclaredEntryPoint"
+        },
+        "extras": {
+          "type": "array",
+          "description": "Ordered enabled-extra spellings used by the declaration.",
+          "items": {
+            "type": "string"
+          }
+        },
+        "config_inputs": {
+          "type": "array",
+          "description": "Exact content inputs used to declare launch and resolver semantics.",
+          "items": {
+            "$ref": "#/$defs/PythonDeclaredConfigInput"
+          }
+        },
+        "root_slots": {
+          "type": "array",
+          "description": "Import roots in declared resolver order.",
+          "items": {
+            "$ref": "#/$defs/PythonDeclaredRootSlot"
+          }
+        }
+      },
+      "required": [
+        "producer_version",
+        "resolver_version",
+        "interpreter",
+        "launch",
+        "entry_point",
+        "extras",
+        "config_inputs",
+        "root_slots"
+      ]
+    },
+    "PythonDeclaredInterpreter": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "path": {
+          "type": "string",
+          "description": "Workspace-relative path to the exact interpreter file identified by sha256."
+        },
+        "sha256": {
+          "type": "string"
+        },
+        "implementation": {
+          "type": "string"
+        },
+        "python_version": {
+          "type": "string"
+        },
+        "abi": {
+          "type": "string"
+        },
+        "platform": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "path",
+        "sha256",
+        "implementation",
+        "python_version",
+        "abi",
+        "platform"
+      ]
+    },
+    "PythonDeclaredLaunch": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "isolation": {
+          "type": "string",
+          "enum": [
+            "isolated",
+            "environment_sensitive"
+          ]
+        },
+        "site_startup": {
+          "type": "string",
+          "enum": [
+            "disabled",
+            "enabled"
+          ]
+        },
+        "environment": {
+          "type": "string",
+          "enum": [
+            "cleared",
+            "explicit_inputs",
+            "ambient"
+          ]
+        },
+        "import_path": {
+          "type": "string",
+          "enum": [
+            "declared_roots_only",
+            "environment_augmented"
+          ]
+        },
+        "finder": {
+          "type": "string",
+          "enum": [
+            "standard_filesystem",
+            "custom_hooks"
+          ]
+        },
+        "editable_installs": {
+          "type": "string",
+          "enum": [
+            "disabled",
+            "enabled"
+          ]
+        },
+        "native_extensions": {
+          "type": "string",
+          "enum": [
+            "disabled",
+            "enabled"
+          ]
+        }
+      },
+      "required": [
+        "isolation",
+        "site_startup",
+        "environment",
+        "import_path",
+        "finder",
+        "editable_installs",
+        "native_extensions"
+      ]
+    },
+    "PythonDeclaredEntryPoint": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "mode": {
+          "type": "string",
+          "enum": [
+            "script",
+            "module",
+            "command_string"
+          ]
+        },
+        "root_slot_id": {
+          "type": "string"
+        },
+        "relative_path": {
+          "type": "string",
+          "description": "Entry path relative to its declared root slot."
+        },
+        "working_directory_root_slot_id": {
+          "type": "string"
+        },
+        "working_directory": {
+          "type": "string",
+          "description": "Working directory relative to its declared root slot."
+        }
+      },
+      "required": [
+        "mode",
+        "root_slot_id",
+        "relative_path",
+        "working_directory_root_slot_id",
+        "working_directory"
+      ]
+    },
+    "PythonDeclaredConfigInput": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "ordinal": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 4294967295,
+          "description": "Zero-based position in the exact producer-input list."
+        },
+        "input_id": {
+          "type": "string"
+        },
+        "role": {
+          "type": "string",
+          "enum": [
+            "resolver_configuration",
+            "startup_configuration",
+            "environment_configuration",
+            "extras_configuration",
+            "entry_configuration"
+          ]
+        },
+        "path": {
+          "type": "string",
+          "description": "Workspace-relative path to the exact bytes identified by sha256."
+        },
+        "sha256": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "ordinal",
+        "input_id",
+        "role",
+        "path",
+        "sha256"
+      ]
+    },
+    "PythonDeclaredRootSlot": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "ordinal": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 4294967295,
+          "description": "Zero-based position in the declared resolver search order."
+        },
+        "slot_id": {
+          "type": "string"
+        },
+        "role": {
+          "type": "string",
+          "enum": [
+            "source",
+            "standard_library",
+            "installed_distribution"
+          ]
+        },
+        "path": {
+          "type": "string",
+          "description": "Workspace-relative host binding for this root slot."
+        },
+        "artifact_index": {
+          "description": "Index into artifacts. Required for installed_distribution roots.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0,
+          "maximum": 4294967295
+        }
+      },
+      "required": [
+        "ordinal",
+        "slot_id",
+        "role",
+        "path"
+      ]
+    }
+  }
 }

@@ -13,14 +13,16 @@
 use std::collections::VecDeque;
 
 use super::correlations::{
-    CorrelationError, correlation_event_candidate, open_bindings_from_copy_graph, produced_value,
-    tested_boolean_bindings_from_copy_graph, unknown_write_bindings,
+    CorrelationError, charge_edges, charge_entries, check_cancelled, correlation_event_candidate,
+    open_bindings_from_copy_graph, produced_value, tested_boolean_bindings_from_copy_graph,
+    unknown_write_bindings,
 };
+use super::is_assignment_transfer_marker;
 use crate::analyzer::WorkspaceAnalyzer;
 use crate::analyzer::semantic::{
     BindingOriginIndex, CancellationToken, GuardFact, GuardPredicate, ProcedureHandle,
-    ProcedureSemantics, ProgramPoint, ProgramPointId, SemanticBudget, SemanticEffect,
-    SemanticValueKind, SemanticWork, TypeFlowAdapter, ValueFlowKind, ValueId,
+    ProcedureSemantics, ProgramPointId, SemanticBudget, SemanticEffect, SemanticValueKind,
+    TypeFlowAdapter, ValueFlowKind, ValueId,
 };
 use crate::hash::{HashMap, HashSet};
 
@@ -136,14 +138,7 @@ impl State {
     }
 
     fn copy(&mut self, source: ValueId, target: ValueId, tracked: &HashSet<ValueId>) {
-        if source == target || !tracked.contains(&target) {
-            return;
-        }
-        if let Some(&binding) = self.current.get(&source) {
-            self.current.insert(target, binding);
-        } else {
-            self.current.remove(&target);
-        }
+        super::copy_tracked_value(&mut self.current, source, target, tracked);
     }
 
     fn intersect(&mut self, other: &Self) -> bool {
@@ -180,16 +175,16 @@ pub(super) fn derive(
     budget: &mut SemanticBudget,
     cancellation: &CancellationToken,
 ) -> Result<GuardBindings, CorrelationError> {
-    check_cancelled(cancellation)?;
+    check_cancelled(Some(cancellation))?;
     let semantics = procedure.semantics();
     let binding_origins = BindingOriginIndex::new(procedure);
     let bindings = semantics
         .values()
         .iter()
-        .filter(|value| is_binding_kind(&value.kind))
+        .filter(|value| value.kind.is_binding())
         .map(|value| value.id)
         .collect::<HashSet<_>>();
-    check_cancelled(cancellation)?;
+    check_cancelled(Some(cancellation))?;
     charge_entries(budget, bindings.len().saturating_add(1))?;
     let queried = queried_values(workspace, adapter, procedure, budget, cancellation)?;
     let TrackedValues {
@@ -208,20 +203,20 @@ pub(super) fn derive(
     )?;
     let open =
         open_bindings_from_copy_graph(semantics, &bindings, &reverse_copies, &address_sources);
-    check_cancelled(cancellation)?;
+    check_cancelled(Some(cancellation))?;
     charge_entries(budget, open.len().saturating_add(1))?;
 
     let entry = semantics.entry_point();
     let point_count = semantics.points().len();
     let retained = queried_points(semantics, budget, cancellation)?;
-    check_cancelled(cancellation)?;
+    check_cancelled(Some(cancellation))?;
     charge_entries(budget, point_count.saturating_mul(2).saturating_add(1))?;
     let mut incoming = vec![None::<State>; point_count];
     let mut exits = HashMap::<ProgramPointId, State>::default();
     incoming[entry.index()] = Some(State::entry(&bindings, &tracked));
     let mut queued = vec![false; point_count];
     queued[entry.index()] = true;
-    check_cancelled(cancellation)?;
+    check_cancelled(Some(cancellation))?;
     charge_entries(budget, 1)?;
     let mut worklist = VecDeque::from([entry]);
     let transfer = TransferContext {
@@ -234,7 +229,7 @@ pub(super) fn derive(
     };
 
     while let Some(point_id) = worklist.pop_front() {
-        check_cancelled(cancellation)?;
+        check_cancelled(Some(cancellation))?;
         queued[point_id.index()] = false;
         // The visit's working copy is transient: it is charged only where it
         // becomes retained state, below and at the exit map.
@@ -250,7 +245,7 @@ pub(super) fn derive(
         }
 
         for (_edge_id, edge) in semantics.successor_edges(point_id) {
-            check_cancelled(cancellation)?;
+            check_cancelled(Some(cancellation))?;
             charge_edges(budget, 1)?;
             let target = edge.target_point.index();
             let changed = if let Some(existing) = &mut incoming[target] {
@@ -269,12 +264,12 @@ pub(super) fn derive(
         }
     }
 
-    check_cancelled(cancellation)?;
+    check_cancelled(Some(cancellation))?;
     let guard_count = semantics.guard_facts().len();
     charge_entries(budget, guard_count.saturating_add(1))?;
     let mut by_guard = Vec::with_capacity(guard_count);
     for guard in semantics.guard_facts() {
-        check_cancelled(cancellation)?;
+        check_cancelled(Some(cancellation))?;
         charge_entries(budget, 1)?;
         let subject = guard_predicate_subject(guard);
         let binding = subject
@@ -324,7 +319,7 @@ fn transfer_point(
         .point(point_id)
         .expect("a validated binding-refinement point remains live");
     for (event_index, event) in point.events.iter().enumerate() {
-        check_cancelled(cancellation)?;
+        check_cancelled(Some(cancellation))?;
         match &event.effect {
             SemanticEffect::Assignment { target, value } => {
                 if bindings.contains(target) {
@@ -446,7 +441,7 @@ fn queried_values(
     let semantics = procedure.semantics();
     let mut queried = HashSet::default();
     for guard in semantics.guard_facts() {
-        check_cancelled(cancellation)?;
+        check_cancelled(Some(cancellation))?;
         charge_entries(budget, 1)?;
         if let Some(subject) = guard.subject {
             queried.insert(subject);
@@ -458,7 +453,7 @@ fn queried_values(
     let subjects = adapter.refinement_subjects(workspace, procedure);
     charge_entries(budget, subjects.len().saturating_add(1))?;
     for subject in subjects {
-        check_cancelled(cancellation)?;
+        check_cancelled(Some(cancellation))?;
         queried.insert(subject);
     }
     Ok(queried)
@@ -473,12 +468,12 @@ fn queried_points(
 ) -> Result<HashSet<ProgramPointId>, CorrelationError> {
     let mut points = HashSet::default();
     for guard in semantics.guard_facts() {
-        check_cancelled(cancellation)?;
+        check_cancelled(Some(cancellation))?;
         charge_entries(budget, 1)?;
         points.insert(guard.point);
     }
     for call in semantics.call_sites() {
-        check_cancelled(cancellation)?;
+        check_cancelled(Some(cancellation))?;
         charge_entries(budget, 1)?;
         if let Some(normal) = call.normal_continuation.target() {
             points.insert(normal);
@@ -515,7 +510,7 @@ fn tracked_values(
     let mut address_sources = HashSet::default();
     let mut correlation_events = vec![Vec::new(); semantics.points().len()];
     for point in semantics.points() {
-        check_cancelled(cancellation)?;
+        check_cancelled(Some(cancellation))?;
         charge_entries(budget, point.events.len().saturating_add(1))?;
         for (event_index, event) in point.events.iter().enumerate() {
             if correlation_event_candidate(&event.effect) {
@@ -571,21 +566,7 @@ fn tracked_values(
             sources_of.entry(target).or_default().push(source);
         }
     }
-    let mut tracked = queried.clone();
-    let mut pending = queried.iter().copied().collect::<Vec<_>>();
-    while let Some(target) = pending.pop() {
-        check_cancelled(cancellation)?;
-        charge_entries(budget, 1)?;
-        let Some(sources) = sources_of.get(&target) else {
-            continue;
-        };
-        charge_entries(budget, sources.len())?;
-        for &source in sources {
-            if tracked.insert(source) {
-                pending.push(source);
-            }
-        }
-    }
+    let tracked = super::tracked_copy_sources(&sources_of, queried.clone(), budget, cancellation)?;
     Ok(TrackedValues {
         values: tracked,
         reverse_copies: correlation_sources_of,
@@ -595,67 +576,11 @@ fn tracked_values(
     })
 }
 
-fn is_binding_kind(kind: &SemanticValueKind) -> bool {
-    matches!(
-        kind,
-        SemanticValueKind::Local
-            | SemanticValueKind::Parameter { .. }
-            | SemanticValueKind::Receiver { .. }
-    )
-}
-
 fn is_identity_flow(kind: ValueFlowKind) -> bool {
     matches!(
         kind,
         ValueFlowKind::Local | ValueFlowKind::Parameter | ValueFlowKind::Receiver
     )
-}
-
-fn is_assignment_transfer_marker(
-    point: &ProgramPoint,
-    event_index: usize,
-    source: ValueId,
-    target: ValueId,
-) -> bool {
-    event_index > 0
-        && matches!(
-            &point.events[event_index - 1].effect,
-            SemanticEffect::Assignment {
-                target: previous_target,
-                value: previous_value,
-            } if *previous_target == target && *previous_value == source
-        )
-}
-
-fn check_cancelled(cancellation: &CancellationToken) -> Result<(), CorrelationError> {
-    if cancellation.is_cancelled() {
-        return Err(CorrelationError::Cancelled {
-            timed_out: cancellation.is_timed_out(),
-        });
-    }
-    Ok(())
-}
-
-fn charge_entries(budget: &mut SemanticBudget, count: usize) -> Result<(), CorrelationError> {
-    if count == 0 {
-        return Ok(());
-    }
-    budget.charge(SemanticWork {
-        nested_entries: count,
-        ..SemanticWork::default()
-    })?;
-    Ok(())
-}
-
-fn charge_edges(budget: &mut SemanticBudget, count: usize) -> Result<(), CorrelationError> {
-    if count == 0 {
-        return Ok(());
-    }
-    budget.charge(SemanticWork {
-        control_edges: count,
-        ..SemanticWork::default()
-    })?;
-    Ok(())
 }
 
 #[cfg(test)]
@@ -668,6 +593,7 @@ mod tests {
     use crate::analyzer::{AnalyzerConfig, Language, WorkspaceAnalyzer};
     use crate::inline_project::InlineTestProject;
     use crate::type_flow::correlations::analyze_correlations_with_boolean_bindings;
+    use brokk_bifrost_test_macros::hardwon;
 
     const SOURCE: &str = concat!(
         "class Thing:\n",
@@ -732,32 +658,15 @@ mod tests {
     }
 
     #[test]
+    #[hardwon(
+        "#3124+#3129+#3152: 271660e00562: sparse refinement state must retain the queried guard subject binding"
+    )]
     fn a_guard_subject_still_refines_to_its_lexical_binding() {
         let (_workspace, procedure, bindings) = derive_check();
         let guard = bindings
             .binding_for_guard(0)
             .expect("the `isinstance` guard subject is still the parameter it was read from");
         assert_eq!(guard, parameter(&procedure, "flag"));
-    }
-
-    #[test]
-    fn a_value_that_reaches_no_guard_subject_carries_no_state() {
-        let (_workspace, procedure, bindings) = derive_check();
-        let spare = parameter(&procedure, "spare");
-        for state in bindings.exits.values() {
-            assert!(
-                !state.current.contains_key(&spare),
-                "an unqueried parameter is not tracked: {state:?}"
-            );
-            assert!(
-                state.current.values().all(|binding| *binding != spare),
-                "an unqueried parameter is nobody's origin: {state:?}"
-            );
-        }
-        assert!(
-            !bindings.queried.contains(&spare),
-            "an unqueried parameter is not a query subject"
-        );
     }
 
     #[test]

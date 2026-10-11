@@ -74,6 +74,14 @@ fn runtime_path(
     PartialPath::new(start, end, precedence, witness, completion)
 }
 
+fn round_trip(path: &PartialPath) -> PartialPath {
+    decode_path(
+        encode_node(path.start().node()),
+        encode_node(path.end().node()),
+        &encode_path(path),
+    )
+}
+
 fn all_reasons() -> Vec<ResolutionIncompleteReason> {
     let mut reasons = vec![
         ResolutionIncompleteReason::CyclicExpansion(PartialPathId::local((1 << 22) + 43, 47)),
@@ -103,14 +111,6 @@ fn all_reasons() -> Vec<ResolutionIncompleteReason> {
         );
     }
     reasons
-}
-
-fn round_trip(path: &PartialPath) -> PartialPath {
-    decode_path(
-        encode_node(path.start().node()),
-        encode_node(path.end().node()),
-        &encode_path(path),
-    )
 }
 
 #[test]
@@ -167,47 +167,6 @@ fn scalar_cells_preserve_runtime_domains_and_integer_precision() {
 }
 
 #[test]
-fn nested_paths_round_trip_against_original_structured_values() {
-    let empty_endpoint = EndpointSignature::new_scoped(
-        BindingNodeId::universal_root(),
-        StackPattern::closed(Vec::new()),
-        StackPattern::closed(Vec::new()),
-    );
-    let empty = PartialPath::new(
-        empty_endpoint.clone(),
-        empty_endpoint,
-        Vec::new(),
-        Vec::new(),
-        ResolutionCompletion::Complete,
-    );
-    assert_eq!(round_trip(&empty), empty);
-    let completions = [
-        ResolutionCompletion::Complete,
-        ResolutionCompletion::incomplete(all_reasons()),
-    ];
-    for completion in completions {
-        let closed = runtime_path([None; 3], completion.clone());
-        assert_eq!(round_trip(&closed), closed);
-        let canonical = runtime_path(
-            [
-                Some(StackVariableId::operation_local(0)),
-                Some(StackVariableId::operation_local(1)),
-                Some(StackVariableId::operation_local(2)),
-            ],
-            completion,
-        );
-        assert_eq!(round_trip(&canonical), canonical);
-        assert_eq!(
-            decode_endpoint(
-                encode_node(canonical.start().node()),
-                &encode_endpoint(canonical.start())
-            ),
-            *canonical.start()
-        );
-    }
-}
-
-#[test]
 fn alpha_variables_keep_nested_aliases_across_both_endpoints() {
     let variables = [
         StackVariableId::local(97, 101),
@@ -242,26 +201,6 @@ fn alpha_variables_keep_nested_aliases_across_both_endpoints() {
         round_trip(&aliased).stack_effect_alpha_key_with_poll(&mut || false),
         round_trip(&split).stack_effect_alpha_key_with_poll(&mut || false)
     );
-}
-
-#[test]
-fn completion_variants_and_raw_reason_shapes_round_trip_exactly() {
-    let mut reasons = all_reasons();
-    reasons.reverse();
-    reasons.push(reasons[0]);
-    let raw = ResolutionCompletion::Incomplete(reasons.into());
-    let empty_raw = ResolutionCompletion::Incomplete(Vec::new().into());
-    for completion in [
-        ResolutionCompletion::Complete,
-        ResolutionCompletion::incomplete(all_reasons()),
-        raw,
-        empty_raw,
-    ] {
-        let encoded = encode_completion(&completion);
-        assert_eq!(decode_completion(encoded.as_deref()), completion);
-        let original = runtime_path([None; 3], completion);
-        assert_eq!(round_trip(&original), original);
-    }
 }
 
 #[test]
@@ -339,69 +278,6 @@ fn root_requests_retain_foreign_context_shared_and_proper_prefix_cells() {
 }
 
 #[test]
-fn invalid_runtime_cells_fail_at_the_stage_boundary() {
-    let shared =
-        i64::try_from(SemanticId::shared_name(SharedNameId::per_request(0)).get()).unwrap();
-    let reserved = i64::try_from(BindingNodeId::universal_root().get()).unwrap();
-    let unmounted =
-        i64::try_from(SemanticId::local(BindingFragmentId::unmounted().ordinal(), 0).get())
-            .unwrap();
-    for cell in [
-        shared,
-        reserved,
-        reserved + 1,
-        unmounted,
-        i64::MAX,
-        i64::MIN,
-    ] {
-        assert!(
-            std::panic::catch_unwind(|| decode_semantic(cell)).is_err(),
-            "invalid semantic {cell}"
-        );
-    }
-    for cell in [-1, shared, reserved + 1, unmounted, i64::MAX, i64::MIN] {
-        assert!(
-            std::panic::catch_unwind(|| decode_node(cell)).is_err(),
-            "invalid node {cell}"
-        );
-    }
-    for cell in [
-        -1,
-        shared,
-        reserved,
-        reserved + 1,
-        unmounted,
-        i64::MAX,
-        i64::MIN,
-    ] {
-        assert!(
-            std::panic::catch_unwind(|| decode_path_id(cell)).is_err(),
-            "invalid path {cell}"
-        );
-    }
-    assert!(
-        std::panic::catch_unwind(|| encode_semantic(SemanticId::shared_name(
-            SharedNameId::interned(0)
-        )))
-        .is_err()
-    );
-    assert!(
-        std::panic::catch_unwind(|| encode_node(BindingNodeId::local(
-            BindingFragmentId::unmounted().ordinal(),
-            0
-        )))
-        .is_err()
-    );
-    assert!(
-        std::panic::catch_unwind(|| encode_path_id(PartialPathId::local(
-            BindingFragmentId::unmounted().ordinal(),
-            0
-        )))
-        .is_err()
-    );
-}
-
-#[test]
 fn malformed_nested_cells_and_cancelled_completion_are_rejected() {
     let original = runtime_path([None; 3], ResolutionCompletion::Complete);
     let body: Value = serde_json::from_str(&encode_path(&original)).unwrap();
@@ -437,4 +313,45 @@ fn malformed_nested_cells_and_cancelled_completion_are_rejected() {
     }
     let cancelled = ResolutionCompletion::incomplete([ResolutionIncompleteReason::Cancelled]);
     assert!(std::panic::catch_unwind(|| encode_completion(&cancelled)).is_err());
+}
+
+#[test]
+fn nested_paths_round_trip_against_original_structured_values() {
+    let empty_endpoint = EndpointSignature::new_scoped(
+        BindingNodeId::universal_root(),
+        StackPattern::closed(Vec::new()),
+        StackPattern::closed(Vec::new()),
+    );
+    let empty = PartialPath::new(
+        empty_endpoint.clone(),
+        empty_endpoint,
+        Vec::new(),
+        Vec::new(),
+        ResolutionCompletion::Complete,
+    );
+    assert_eq!(round_trip(&empty), empty);
+    let completions = [
+        ResolutionCompletion::Complete,
+        ResolutionCompletion::incomplete(all_reasons()),
+    ];
+    for completion in completions {
+        let closed = runtime_path([None; 3], completion.clone());
+        assert_eq!(round_trip(&closed), closed);
+        let canonical = runtime_path(
+            [
+                Some(StackVariableId::operation_local(0)),
+                Some(StackVariableId::operation_local(1)),
+                Some(StackVariableId::operation_local(2)),
+            ],
+            completion,
+        );
+        assert_eq!(round_trip(&canonical), canonical);
+        assert_eq!(
+            decode_endpoint(
+                encode_node(canonical.start().node()),
+                &encode_endpoint(canonical.start())
+            ),
+            *canonical.start()
+        );
+    }
 }

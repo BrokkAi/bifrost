@@ -3,9 +3,9 @@ title: Import Traversal
 description: Find declaring files and direct importers across query_code language adapters.
 ---
 
-> Last verified end to end: 2026-07-14 (`query_code` schema version 1).
+> Last verified end to end: 2026-10-01 (`query_code` schema version 1).
 
-Import traversal starts with an indexed project declaration, not an import spelling. Convert that declaration to its file with `file-of`, then follow either a forward (`imports-of`) or reverse (`importers-of`) direct project-local edge. This keeps the result honest: Bifrost reports the files connected by a resolved import, not a guess that every importer calls a particular member.
+Import traversal starts with an indexed project declaration, not an import spelling. Convert that declaration to its file with `file-of`, then follow either a forward (`imports-of`) or reverse (`importers-of`) project-local file edge. This keeps the result honest: Bifrost reports the files connected by a resolved import, not a guess that every importer calls a particular member. Rust also follows `pub use` re-exports, including chained, glob, and module re-exports, to the file that defines the item. That edge can point past the file that holds the re-export.
 
 ## The Four Steps Together
 
@@ -59,7 +59,7 @@ For example, the Ruby form is directly runnable as RQL or JSON:
 
 ## Direct Import Forms By Language
 
-The same reverse pipeline above is verified against a target declaration and one direct importer for every adapter that provides structured import-file analysis.
+Every adapter provides structured import-file analysis. The reverse pipeline above returns the importer, and the forward pipeline returns the target file, for each row of this table.
 
 | Query label | Target declaration | Direct importer |
 | --- | --- | --- |
@@ -73,13 +73,15 @@ The same reverse pipeline above is verified against a target declaration and one
 | `scala` | `def target(): Unit = ()` in `example/Target.scala` | `import example.Target` |
 | `csharp` | `public static void target() {}` in `Target.cs` | `using Example;` |
 | `ruby` | `def target; end` in `target.rb` | `require_relative 'target'` |
+| `php` | `namespace Ex; function target() {}` in `target.php` | `require_once __DIR__ . '/target.php';` |
+| `kotlin` | `package example` and `fun target() {}` in `example/Target.kt` | `import example.target` |
 
-The query does not need to duplicate each language's import grammar. The language adapter obtains the structured import facts, and the shared pipeline only sees project files and direct edges.
+The query does not need to duplicate each language's import grammar. The language adapter obtains the structured import facts, and the shared pipeline only sees project files and resolved file edges. For Rust, the adapter follows structured `pub use` routes across Cargo crates. It records the item's defining file as an import target, in addition to the module file that the `use` path names. A single file edge still does not say that the importer calls or otherwise uses a particular declaration.
 
 ## Boundary: External Libraries And Member Uses
 
 The table intentionally uses project-local targets. An import of an out-of-scope package can be observed structurally with an `import` pattern, but it has no indexed project declaration or file to start this traversal. Bifrost does not create a synthetic declaration for that package, its types, or its methods.
 
-PHP currently supports structural `import` matching and the declaration/file steps, but does not provide structured import-file analysis. `imports-of` and `importers-of` therefore return a diagnostic for affected PHP files instead of silently guessing.
+PHP edges come from namespace `use` declarations and from `include`, `include_once`, `require`, and `require_once` expressions whose paths can be folded from plain string literals, `__DIR__`, `dirname(__FILE__)`, `dirname(__DIR__)`, and string concatenation. A bare relative literal is resolved from the including file's directory. These file edges are a workspace-local approximation of PHP's include resolution rules. Dynamic expressions such as `require $path` do not create an edge; import traversal reports the affected workspace-relative files with the incomplete `dynamic_import_target` diagnostic.
 
-Likewise, a reverse edge says that a file imports the target file—not that it calls `target`. Use [Reference Traversal](../reference-traversal/) to traverse an indexed declaration to exact reference sites or semantic users. Because reference sites compose with `file-of`, a proven symbol edge can also feed `imports-of` or `importers-of` without turning the import relationship into a synthetic symbol identity.
+Likewise, a reverse edge says that a file imports the target file, not that it calls `target`. Use [Reference Traversal](/code-query-tutorials/reference-traversal/) to traverse an indexed declaration to exact reference sites or semantic users. Because reference sites compose with `file-of`, a proven symbol edge can also feed `imports-of` or `importers-of` without turning the import relationship into a synthetic symbol identity.

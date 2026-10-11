@@ -28,6 +28,8 @@ impl TaintPolicyEvaluator for SiblingTaintAdapter {
         _budget: &PolicyBudget,
     ) -> TaintProjectionPayload {
         TaintProjectionPayload {
+            engine: None,
+            scope: None,
             projections: Vec::new(),
             completion: PolicyRunCompletion::Complete,
             diagnostics: Vec::new(),

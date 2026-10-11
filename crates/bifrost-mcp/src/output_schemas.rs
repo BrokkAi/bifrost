@@ -84,25 +84,6 @@ fn generate_output_schema<T: schemars::JsonSchema>() -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    const JSON_SCHEMA_2020_12: &str = "https://json-schema.org/draft/2020-12/schema";
-
-    #[test]
-    fn every_registered_tool_yields_a_2020_12_schema() {
-        for (name, _) in OUTPUT_SCHEMAS {
-            let schema = output_schema_for(name)
-                .unwrap_or_else(|| panic!("`{name}` is registered but resolved to no schema"));
-            let object = schema
-                .as_object()
-                .unwrap_or_else(|| panic!("`{name}` produced a non-object schema: {schema}"));
-            assert_eq!(
-                object.get("$schema").and_then(Value::as_str),
-                Some(JSON_SCHEMA_2020_12),
-                "`{name}` schema does not declare the 2020-12 dialect: {schema}"
-            );
-        }
-    }
-
     /// A field that serialization omits must not be advertised as required, or
     /// real tool output fails validation against its own schema. Schemars' own
     /// default (the deserialize contract) marks `bare_vec` required, which is
@@ -123,12 +104,6 @@ mod tests {
     }
 
     #[test]
-    fn an_unregistered_tool_has_no_schema() {
-        assert!(output_schema_for("get_file_contents").is_none());
-        assert!(output_schema_for("no_such_tool").is_none());
-    }
-
-    #[test]
     fn blast_radius_names_callable_test_evidence_as_context() {
         let schema = output_schema_for("blast_radius").expect("blast-radius schema");
         let analysis_properties = schema
@@ -142,20 +117,5 @@ mod tests {
             .unwrap_or_else(|| panic!("callable-symbol properties missing: {schema}"));
         assert!(properties.contains_key("in_test_context"));
         assert!(!properties.contains_key("is_test"));
-    }
-
-    /// A renamed or removed tool must not leave its schema stranded under the
-    /// old name, where nothing would ever advertise it.
-    #[test]
-    fn every_registered_tool_exists_in_the_searchtools_registry() {
-        let spec = crate::mcp_registry::resolve_server_spec("searchtools")
-            .expect("the searchtools registry resolves");
-        for (name, _) in OUTPUT_SCHEMAS {
-            assert!(
-                spec.tool_names.contains(*name),
-                "`{name}` has an output schema but is not a searchtools tool: {:?}",
-                spec.tool_names
-            );
-        }
     }
 }

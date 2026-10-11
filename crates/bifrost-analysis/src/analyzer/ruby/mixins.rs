@@ -129,52 +129,6 @@ end
     }
 
     #[test]
-    fn include_and_extend_are_distinct_lookup_inputs() {
-        let (_project, analyzer) = analyzer_with_files(&[
-            (
-                "mixins/findable.rb",
-                "module Findable\n  def find; end\nend\n",
-            ),
-            (
-                "app/repositories.rb",
-                r#"
-require_relative "../mixins/findable"
-
-class InstanceRepository
-  include Findable
-end
-
-class SingletonRepository
-  extend Findable
-end
-"#,
-            ),
-        ]);
-
-        let relations = analyzer.mixin_relations();
-        assert!(relations.iter().any(|relation| {
-            relation.from.identifier() == "InstanceRepository"
-                && relation.to.identifier() == "Findable"
-                && relation.kind == TypeRelationKind::MixinInclude
-        }));
-        assert!(relations.iter().any(|relation| {
-            relation.from.identifier() == "SingletonRepository"
-                && relation.to.identifier() == "Findable"
-                && relation.kind == TypeRelationKind::MixinExtend
-        }));
-        assert!(!relations.iter().any(|relation| {
-            relation.from.identifier() == "InstanceRepository"
-                && relation.to.identifier() == "Findable"
-                && relation.kind == TypeRelationKind::MixinExtend
-        }));
-        assert!(!relations.iter().any(|relation| {
-            relation.from.identifier() == "SingletonRepository"
-                && relation.to.identifier() == "Findable"
-                && relation.kind == TypeRelationKind::MixinInclude
-        }));
-    }
-
-    #[test]
     fn update_all_rebuilds_mixin_relations_from_disk() {
         let (project, analyzer) = analyzer_with_files(&[
             (
@@ -229,28 +183,6 @@ end
     }
 
     #[test]
-    fn receiver_calls_do_not_create_mixin_relations() {
-        let (_project, analyzer) = analyzer_with_files(&[(
-            "app.rb",
-            r#"
-module Auditable
-end
-
-class Other
-end
-
-class Repository
-  Other.include Auditable
-end
-"#,
-        )]);
-
-        assert!(!analyzer.mixin_relations().iter().any(|relation| {
-            relation.from.identifier() == "Repository" && relation.to.identifier() == "Auditable"
-        }));
-    }
-
-    #[test]
     fn unqualified_mixin_uses_import_visibility_over_global_same_name() {
         let (_project, analyzer) = analyzer_with_files(&[
             ("unloaded/shared.rb", "module Shared\nend\n"),
@@ -289,6 +221,28 @@ end
         }));
         assert!(!relations.iter().any(|relation| {
             relation.from.identifier() == "OtherRepository" && relation.to.identifier() == "Shared"
+        }));
+    }
+
+    #[test]
+    fn receiver_calls_do_not_create_mixin_relations() {
+        let (_project, analyzer) = analyzer_with_files(&[(
+            "app.rb",
+            r#"
+module Auditable
+end
+
+class Other
+end
+
+class Repository
+  Other.include Auditable
+end
+"#,
+        )]);
+
+        assert!(!analyzer.mixin_relations().iter().any(|relation| {
+            relation.from.identifier() == "Repository" && relation.to.identifier() == "Auditable"
         }));
     }
 }

@@ -209,9 +209,7 @@ pub fn weight_forward_import_edges(
     _key: &ProjectFile,
     value: &Arc<Vec<crate::usage::RustImportEdge>>,
 ) -> u32 {
-    let size = value.iter().map(weight_import_edge).sum::<usize>()
-        + size_of::<Vec<crate::usage::RustImportEdge>>();
-    size.min(u32::MAX as usize) as u32
+    weight_import_edges(value).min(u32::MAX as usize) as u32
 }
 
 /// Byte weight of the import edges that bind one symbol identity.
@@ -219,13 +217,13 @@ pub fn weight_binding_edges(
     key: &crate::usage::RustSymbolIdentity,
     value: &Arc<Vec<crate::usage::RustImportEdge>>,
 ) -> u32 {
-    let size = key.file.rel_path().to_string_lossy().len()
-        + key.module.weight_bytes()
-        + key.name.len()
-        + size_of::<crate::usage::RustSymbolIdentity>()
-        + value.iter().map(weight_import_edge).sum::<usize>()
-        + size_of::<Vec<crate::usage::RustImportEdge>>();
+    let size = weight_identity(key) + weight_import_edges(value);
     size.min(u32::MAX as usize) as u32
+}
+
+fn weight_import_edges(edges: &[crate::usage::RustImportEdge]) -> usize {
+    edges.iter().map(weight_import_edge).sum::<usize>()
+        + size_of::<Vec<crate::usage::RustImportEdge>>()
 }
 
 fn weight_import_edge(edge: &crate::usage::RustImportEdge) -> usize {

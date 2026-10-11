@@ -1,11 +1,17 @@
 use tree_sitter::{Node, Tree};
 
 use crate::analyzer::reference_candidates::reference_candidate_requires_point_lookup;
-use crate::analyzer::structural::{FileFacts, NormalizedKind, Role, Span};
+use crate::analyzer::scala::case_block_is_partial_function;
+use crate::analyzer::structural::{FileFacts, NormalizedKind, Role};
+use crate::analyzer::usages::range_for_span;
 use crate::analyzer::{Language, ProjectFile, Range};
+use brokk_bifrost_core::analyzer::usages::reference_site::node_range;
 
-use super::{parse_tree_for_language, scala::scala_postfix_method_node};
+use super::{
+    parse_tree_for_language, ruby_is_call_method_identifier, scala::scala_postfix_method_node,
+};
 use crate::analyzer::common::language_for_file;
+use brokk_bifrost_core::analyzer::tree_walk::last_named_field_child as last_named_child_by_field;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CallSignatureContext {
@@ -171,7 +177,7 @@ pub(crate) fn range_is_call_keyword_label(
         .nodes()
         .iter()
         .enumerate()
-        .filter(|(_, node)| node.kind == NormalizedKind::Call)
+        .filter(|(_, node)| node.kind.satisfies(NormalizedKind::Call))
         .any(|(call_id, _)| {
             facts.roles(call_id as u32).iter().any(|target| {
                 target.role == Role::Kwarg
@@ -191,7 +197,7 @@ pub(crate) fn call_site_syntax_for_reference(
         .nodes()
         .iter()
         .enumerate()
-        .filter(|(_, node)| node.kind == NormalizedKind::Call)
+        .filter(|(_, node)| node.kind.satisfies(NormalizedKind::Call))
         .filter(|(_, node)| {
             node.name
                 .is_some_and(|name| name.start_byte <= start_byte && end_byte <= name.end_byte)
@@ -250,15 +256,6 @@ pub(crate) fn call_site_syntax_for_reference(
     })
 }
 
-fn range_for_span(facts: &FileFacts, span: Span) -> Range {
-    Range {
-        start_byte: span.start_byte,
-        end_byte: span.end_byte,
-        start_line: facts.line_of_byte(span.start_byte),
-        end_line: facts.line_of_byte(span.end_byte),
-    }
-}
-
 pub fn call_signature_context(
     file: &ProjectFile,
     source: &str,
@@ -309,6 +306,9 @@ fn call_signature_context_for_node(
     {
         return Some(context);
     }
+    if language == Language::Rust && node.kind() == "macro_invocation" {
+        return None;
+    }
     if !is_call_expression_node(node, language) {
         return None;
     }
@@ -347,7 +347,7 @@ fn is_call_expression_node(node: Node<'_>, language: Language) -> bool {
             matches!(node.kind(), "call_expression" | "new_expression")
         }
         Language::Python => node.kind() == "call",
-        Language::Rust => node.kind() == "call_expression",
+        Language::Rust => matches!(node.kind(), "call_expression" | "macro_invocation"),
         Language::Php => matches!(
             node.kind(),
             "function_call_expression"
@@ -402,6 +402,7 @@ fn scala_call_signature_context_for_node(
 
 fn callee_node_for_call<'tree>(node: Node<'tree>, language: Language) -> Option<Node<'tree>> {
     match language {
+        Language::Rust if node.kind() == "macro_invocation" => node.child_by_field_name("macro"),
         Language::Java => node
             .child_by_field_name("name")
             .or_else(|| node.child_by_field_name("type")),
@@ -482,8 +483,9 @@ fn scala_callee_node_for_call(node: Node<'_>) -> Option<Node<'_>> {
     match node.kind() {
         "call_expression" => node.child_by_field_name("function"),
         "instance_expression" => scala_constructor_type_node(node),
-        "infix_expression" => node.child_by_field_name("operator"),
-        "postfix_expression" => scala_postfix_method_node(node),
+        "infix_expression" | "postfix_expression" => {
+            brokk_bifrost_jvm::scala::structural::scala_call_function_node(node)
+        }
         _ => None,
     }
 }
@@ -584,18 +586,8 @@ fn cpp_terminal_callee_leaf(mut node: Node<'_>) -> Option<Node<'_>> {
     }
 }
 
-fn last_named_child_by_field<'tree>(node: Node<'tree>, field: &str) -> Option<Node<'tree>> {
-    let mut cursor = node.walk();
-    node.children_by_field_name(field, &mut cursor)
-        .filter(|child| child.is_named())
-        .last()
-}
-
 fn only_named_child(node: Node<'_>) -> Option<Node<'_>> {
-    let mut cursor = node.walk();
-    let mut children = node.named_children(&mut cursor);
-    let child = children.next()?;
-    children.next().is_none().then_some(child)
+    crate::analyzer::tree_walk::single_named_child_matching(node, |_| true)
 }
 
 fn contains_call_expression_node(node: Node<'_>, language: Language) -> bool {
@@ -634,15 +626,6 @@ fn active_parameter(arguments: Node<'_>, byte_offset: usize) -> u32 {
         }
     }
     active
-}
-
-fn node_range(node: Node<'_>) -> Range {
-    Range {
-        start_byte: node.start_byte(),
-        end_byte: node.end_byte(),
-        start_line: node.start_position().row,
-        end_line: node.end_position().row,
-    }
 }
 
 fn collect_call_reference_ranges(
@@ -707,7 +690,7 @@ fn is_nested_callable_node(node: Node<'_>, language: Language, search_range: &Ra
     }
     if language == Language::Scala
         && (node.kind() == "given_definition"
-            || (node.kind() == "case_block" && scala_case_block_is_partial_function(node)))
+            || (node.kind() == "case_block" && case_block_is_partial_function(node)))
     {
         return true;
     }
@@ -740,15 +723,6 @@ fn is_nested_callable_node(node: Node<'_>, language: Language, search_range: &Ra
             | "impl_item"
             | "object_definition"
     )
-}
-
-fn scala_case_block_is_partial_function(node: Node<'_>) -> bool {
-    !node.parent().is_some_and(|parent| {
-        matches!(
-            parent.kind(),
-            "match_expression" | "catch_clause" | "try_expression"
-        )
-    })
 }
 
 fn ruby_nested_callable_node(node: Node<'_>) -> bool {
@@ -851,20 +825,16 @@ fn cpp_explicit_operator_name(call: Node<'_>) -> Option<Node<'_>> {
 }
 
 fn java_call_reference_candidate(node: Node<'_>) -> bool {
-    let mut current = node;
-    while let Some(parent) = current.parent() {
-        match parent.kind() {
-            "method_invocation" if parent.child_by_field_name("name") == Some(current) => {
-                return true;
-            }
-            "object_creation_expression" if parent.child_by_field_name("type") == Some(current) => {
-                return true;
-            }
-            "scoped_type_identifier" | "generic_type" => current = parent,
-            _ => return false,
-        }
-    }
-    false
+    enclosing_call_reference_candidate(
+        node,
+        |parent, current| {
+            (parent.kind() == "method_invocation"
+                && parent.child_by_field_name("name") == Some(current))
+                || (parent.kind() == "object_creation_expression"
+                    && parent.child_by_field_name("type") == Some(current))
+        },
+        |parent| matches!(parent.kind(), "scoped_type_identifier" | "generic_type"),
+    )
 }
 
 fn go_call_reference_candidate(node: Node<'_>) -> bool {
@@ -943,6 +913,9 @@ fn rust_call_reference_candidate(node: Node<'_>) -> bool {
     let mut current = node;
     while let Some(parent) = current.parent() {
         match parent.kind() {
+            "macro_invocation" if parent.child_by_field_name("macro") == Some(current) => {
+                return true;
+            }
             "call_expression" if parent.child_by_field_name("function") == Some(current) => {
                 return true;
             }
@@ -1001,15 +974,47 @@ fn scala_call_reference_candidate(node: Node<'_>) -> bool {
 fn csharp_call_reference_candidate(node: Node<'_>) -> bool {
     let mut current = node;
     while let Some(parent) = current.parent() {
-        match parent.kind() {
-            "invocation_expression" if parent.child_by_field_name("function") == Some(current) => {
-                return true;
-            }
-            "object_creation_expression" if parent.child_by_field_name("type") == Some(current) => {
-                return true;
-            }
-            "member_access_expression" | "qualified_name" => current = parent,
-            _ => return false,
+        if (parent.kind() == "invocation_expression"
+            && parent.child_by_field_name("function") == Some(current))
+            || (parent.kind() == "object_creation_expression"
+                && parent.child_by_field_name("type") == Some(current))
+        {
+            return true;
+        }
+        // Only the member name dispatches a C# member-access call. The
+        // receiver is also nested under this node, but it is a value/type
+        // reference and resolving it as a call candidate creates a spurious
+        // unresolved outgoing relation.
+        if parent.kind() == "member_access_expression"
+            && parent.child_by_field_name("name") == Some(current)
+        {
+            current = parent;
+            continue;
+        }
+        if parent.kind() == "qualified_name" && parent.child_by_field_name("name") == Some(current)
+        {
+            current = parent;
+            continue;
+        }
+        return false;
+    }
+    false
+}
+
+fn enclosing_call_reference_candidate<'tree>(
+    node: Node<'tree>,
+    is_call_target: impl Fn(Node<'tree>, Node<'tree>) -> bool,
+    is_transparent_wrapper: impl Fn(Node<'tree>) -> bool,
+) -> bool {
+    let mut current = node;
+    while let Some(parent) = current.parent() {
+        if is_call_target(parent, current) {
+            return true;
+        }
+        if is_transparent_wrapper(parent) {
+            current = parent;
+        } else {
+            return false;
         }
     }
     false
@@ -1048,10 +1053,7 @@ fn ruby_callable_object_call(node: Node<'_>) -> bool {
 }
 
 fn ruby_exact_bare_call_identifier(node: Node<'_>) -> bool {
-    node.kind() == "identifier"
-        && !node.parent().is_some_and(|parent| {
-            parent.kind() == "call" && parent.child_by_field_name("method") == Some(node)
-        })
+    node.kind() == "identifier" && !ruby_is_call_method_identifier(node)
 }
 
 #[cfg(test)]
@@ -1063,6 +1065,7 @@ mod tests {
         call_reference_ranges_in_tree, call_signature_context, call_site_syntax_for_reference,
         exact_call_reference_for_call,
     };
+
     use crate::analyzer::ruby::structural::RUBY_STRUCTURAL_SPEC;
     use crate::analyzer::structural::extract::extract_file_facts;
     use crate::analyzer::usages::get_definition::parse_tree_for_language;
@@ -1076,59 +1079,48 @@ mod tests {
         source.find(needle).expect("needle exists") + needle.len()
     }
 
+    fn assert_signature_context(
+        path: &str,
+        source: &str,
+        cursor_after: &str,
+        callee: &str,
+        active_parameter: u32,
+    ) {
+        let context =
+            call_signature_context(&file(path), source, offset_after(source, cursor_after))
+                .expect("signature context");
+        assert_eq!(
+            &source[context.callee_range.start_byte..context.callee_range.end_byte],
+            callee
+        );
+        assert_eq!(context.active_parameter, active_parameter);
+    }
+
     fn byte_range(source: &str, needle: &str) -> Range {
-        let start_byte = source.rfind(needle).expect("call expression exists");
-        Range {
-            start_byte,
-            end_byte: start_byte + needle.len(),
-            start_line: 0,
-            end_line: 0,
+        crate::analyzer::usages::test_support::byte_range(source, needle)
+    }
+
+    fn assert_nested_call_reference_names(path: &str, language: Language, source: &str) {
+        let file = file(path);
+        let tree = parse_tree_for_language(&file, language, source).expect("syntax tree");
+        for (call, expected) in [("outer(inner())", "outer"), ("inner()", "inner")] {
+            let reference =
+                call_reference_range_for_call(&tree, language, &byte_range(source, call))
+                    .expect("call reference");
+            assert_eq!(&source[reference.start_byte..reference.end_byte], expected);
         }
     }
 
     #[test]
     fn exact_call_span_distinguishes_outer_and_inner_callees() {
         let source = "function outer(value: number) { return value; }\nfunction inner() { return 1; }\nouter(inner());\n";
-        let file = file("nested.ts");
-        let tree = parse_tree_for_language(&file, Language::TypeScript, source)
-            .expect("TypeScript syntax tree");
-
-        let outer = call_reference_range_for_call(
-            &tree,
-            Language::TypeScript,
-            &byte_range(source, "outer(inner())"),
-        )
-        .expect("outer call reference");
-        let inner = call_reference_range_for_call(
-            &tree,
-            Language::TypeScript,
-            &byte_range(source, "inner()"),
-        )
-        .expect("inner call reference");
-
-        assert_eq!(&source[outer.start_byte..outer.end_byte], "outer");
-        assert_eq!(&source[inner.start_byte..inner.end_byte], "inner");
+        assert_nested_call_reference_names("nested.ts", Language::TypeScript, source);
     }
 
     #[test]
     fn exact_java_call_span_uses_the_named_method_field() {
         let source = "class Nested { static int outer(int value) { return value; } static int inner() { return 1; } int call() { return outer(inner()); } }";
-        let file = file("Nested.java");
-        let tree =
-            parse_tree_for_language(&file, Language::Java, source).expect("Java syntax tree");
-
-        let outer = call_reference_range_for_call(
-            &tree,
-            Language::Java,
-            &byte_range(source, "outer(inner())"),
-        )
-        .expect("outer Java call reference");
-        let inner =
-            call_reference_range_for_call(&tree, Language::Java, &byte_range(source, "inner()"))
-                .expect("inner Java call reference");
-
-        assert_eq!(&source[outer.start_byte..outer.end_byte], "outer");
-        assert_eq!(&source[inner.start_byte..inner.end_byte], "inner");
+        assert_nested_call_reference_names("Nested.java", Language::Java, source);
     }
 
     #[test]
@@ -1155,9 +1147,7 @@ mod tests {
         assert_eq!(&source[make.start_byte..make.end_byte], "make");
     }
 
-    #[test]
-    fn exact_cpp_call_spans_follow_only_the_terminal_callable_spine() {
-        let source = r#"
+    const CPP_CALL_SITE_SOURCE: &str = r#"
 namespace ns {
 template <typename T> void make(T) {}
 template <typename T> struct Box {};
@@ -1175,6 +1165,10 @@ void caller(ns::Widget& receiver) {
   receiver.~Widget();
 }
 "#;
+
+    #[test]
+    fn exact_cpp_call_spans_follow_only_the_terminal_callable_spine() {
+        let source = CPP_CALL_SITE_SOURCE;
         let file = file("calls.cpp");
         let tree = parse_tree_for_language(&file, Language::Cpp, source).expect("C++ syntax tree");
         for (call, callee) in [
@@ -1197,24 +1191,7 @@ void caller(ns::Widget& receiver) {
 
     #[test]
     fn cpp_call_candidates_exclude_receivers_qualifiers_and_template_arguments() {
-        let source = r#"
-namespace ns {
-template <typename T> void make(T) {}
-template <typename T> struct Box {};
-struct Widget {
-  template <typename T> void run(T) {}
-  Widget& operator+(int) { return *this; }
-  ~Widget() {}
-};
-}
-void caller(ns::Widget& receiver) {
-  ns::make<int>(1);
-  receiver.run<int>(1);
-  new ns::Box<int>();
-  receiver.operator+(1);
-  receiver.~Widget();
-}
-"#;
+        let source = CPP_CALL_SITE_SOURCE;
         let file = file("calls.cpp");
         let tree = parse_tree_for_language(&file, Language::Cpp, source).expect("C++ syntax tree");
         let body = byte_range(
@@ -1281,23 +1258,6 @@ object Calls {
     }
 
     #[test]
-    fn scala_call_candidates_exclude_receivers_arguments_and_type_arguments() {
-        let source = "object Calls { def caller(service: Service, value: Int, label: String) = service.curried[String](value)(label) }";
-        let file = file("Calls.scala");
-        let tree =
-            parse_tree_for_language(&file, Language::Scala, source).expect("Scala syntax tree");
-        let call = byte_range(source, "service.curried[String](value)(label)");
-
-        let references = call_reference_ranges_in_tree(&tree, Language::Scala, &call, 20);
-        let names = references
-            .iter()
-            .map(|range| &source[range.start_byte..range.end_byte])
-            .collect::<Vec<_>>();
-
-        assert_eq!(names, vec!["curried"]);
-    }
-
-    #[test]
     fn scala_parameterless_selection_is_not_an_immediate_call_candidate() {
         let source = "object Calls { def caller(service: Service) = service.value }";
         let file = file("Calls.scala");
@@ -1308,23 +1268,6 @@ object Calls {
         let references = call_reference_ranges_in_tree(&tree, Language::Scala, &selection, 20);
 
         assert!(references.is_empty(), "{references:#?}");
-    }
-
-    #[test]
-    fn scala_constructor_candidates_exclude_qualifiers_arguments_and_type_arguments() {
-        let source = "object Calls { def caller(value: Int) = new pkg.Box[String](value) }";
-        let file = file("Calls.scala");
-        let tree =
-            parse_tree_for_language(&file, Language::Scala, source).expect("Scala syntax tree");
-        let call = byte_range(source, "new pkg.Box[String](value)");
-
-        let references = call_reference_ranges_in_tree(&tree, Language::Scala, &call, 20);
-        let names = references
-            .iter()
-            .map(|range| &source[range.start_byte..range.end_byte])
-            .collect::<Vec<_>>();
-
-        assert_eq!(names, vec!["Box"]);
     }
 
     #[test]
@@ -1383,42 +1326,6 @@ object Calls {
             .collect::<Vec<_>>();
 
         assert_eq!(names, vec!["run"]);
-    }
-
-    #[test]
-    fn exact_call_span_rejects_an_enclosing_statement() {
-        let source = "function target() {}\ntarget();\n";
-        let file = file("statement.ts");
-        let tree = parse_tree_for_language(&file, Language::TypeScript, source)
-            .expect("TypeScript syntax tree");
-
-        assert!(
-            call_reference_range_for_call(
-                &tree,
-                Language::TypeScript,
-                &byte_range(source, "target();"),
-            )
-            .is_none()
-        );
-    }
-
-    #[test]
-    fn ruby_bare_call_has_a_structured_call_site() {
-        let source = "def target; end\ndef caller; target; end\n";
-        let grammar = tree_sitter_ruby::LANGUAGE.into();
-        let facts = extract_file_facts(&RUBY_STRUCTURAL_SPEC, &grammar, source)
-            .expect("Ruby structural facts");
-        let start = source.rfind("target").expect("call target");
-        let site = call_site_syntax_for_reference(&facts, start, start + "target".len())
-            .expect("bare Ruby call site");
-        assert_eq!(
-            &source[site.callee_range.start_byte..site.callee_range.end_byte],
-            "target"
-        );
-        assert_eq!(
-            &source[site.range.start_byte..site.range.end_byte],
-            "target"
-        );
     }
 
     #[test]
@@ -1576,51 +1483,9 @@ end"#;
     }
 
     #[test]
-    fn signature_context_counts_active_parameter_after_comma() {
-        let source =
-            "class A { int target(int left, int right) { return 0; } void f() { target(1, 2); } }";
-        let context = call_signature_context(&file("A.java"), source, offset_after(source, "1, "))
-            .expect("signature context");
-
-        assert_eq!(context.active_parameter, 1);
-        assert_eq!(
-            &source[context.callee_range.start_byte..context.callee_range.end_byte],
-            "target"
-        );
-    }
-
-    #[test]
     fn signature_context_prefers_innermost_call() {
         let source = "function inner(value: number) { return value; }\nfunction outer(value: number) { return value; }\nouter(inner(1));\n";
-        let context = call_signature_context(
-            &file("sample.ts"),
-            source,
-            offset_after(source, "outer(inner("),
-        )
-        .expect("signature context");
-
-        assert_eq!(
-            &source[context.callee_range.start_byte..context.callee_range.end_byte],
-            "inner"
-        );
-        assert_eq!(context.active_parameter, 0);
-    }
-
-    #[test]
-    fn signature_context_handles_empty_argument_list() {
-        let source = "fn target() {}\nfn caller() { target(); }\n";
-        let context = call_signature_context(
-            &file("lib.rs"),
-            source,
-            offset_after(source, "caller() { target("),
-        )
-        .expect("signature context");
-
-        assert_eq!(
-            &source[context.callee_range.start_byte..context.callee_range.end_byte],
-            "target"
-        );
-        assert_eq!(context.active_parameter, 0);
+        assert_signature_context("sample.ts", source, "outer(inner(", "inner", 0);
     }
 
     #[test]
@@ -1642,12 +1507,12 @@ end"#;
     }
 
     #[test]
-    fn signature_context_handles_ruby_bare_call() {
-        let source = "def target(left, right)\nend\n\ntarget(1, 2)\n";
+    fn signature_context_handles_ruby_command_call_with_block() {
+        let source = "target 1, 2 do |item|\n  item\nend\n";
         let context = call_signature_context(
             &file("sample.rb"),
             source,
-            offset_after(source, "target(1, "),
+            offset_after(source, "target 1, "),
         )
         .expect("signature context");
 
@@ -1656,6 +1521,155 @@ end"#;
             "target"
         );
         assert_eq!(context.active_parameter, 1);
+    }
+
+    #[test]
+    fn signature_context_prefers_innermost_ruby_call() {
+        let source = "outer(inner(1), 2)\n";
+        assert_signature_context("sample.rb", source, "inner(", "inner", 0);
+    }
+
+    #[test]
+    fn signature_context_handles_scala_infix_call() {
+        let source = "object App {\n  class Box { def combine(value: Int): Int = value }\n  val box = new Box\n  val result = box combine 1\n}\n";
+        let context = call_signature_context(
+            &file("App.scala"),
+            source,
+            offset_after(source, "box combine "),
+        )
+        .expect("signature context");
+
+        assert_eq!(
+            &source[context.callee_range.start_byte..context.callee_range.end_byte],
+            "combine"
+        );
+        assert_eq!(context.active_parameter, 0);
+    }
+
+    #[test]
+    fn signature_context_handles_scala_postfix_operator_call() {
+        let source = "object App {\n  class Box { def ! : Boolean = true }\n  val box = new Box\n  val result = box !\n}\n";
+        let context =
+            call_signature_context(&file("App.scala"), source, offset_after(source, "box !"))
+                .expect("signature context");
+
+        assert_eq!(
+            &source[context.callee_range.start_byte..context.callee_range.end_byte],
+            "!"
+        );
+        assert_eq!(context.active_parameter, 0);
+    }
+
+    #[test]
+    fn signature_context_rejects_higher_order_call_callee() {
+        let source = "function factory() { return (value: number) => value; }\nconst result = factory()(1);\n";
+        let context = call_signature_context(
+            &file("sample.ts"),
+            source,
+            offset_after(source, "factory()("),
+        );
+
+        assert_eq!(context, None);
+    }
+
+    #[test]
+    fn scala_call_candidates_exclude_receivers_arguments_and_type_arguments() {
+        let source = "object Calls { def caller(service: Service, value: Int, label: String) = service.curried[String](value)(label) }";
+        let file = file("Calls.scala");
+        let tree =
+            parse_tree_for_language(&file, Language::Scala, source).expect("Scala syntax tree");
+        let call = byte_range(source, "service.curried[String](value)(label)");
+
+        let references = call_reference_ranges_in_tree(&tree, Language::Scala, &call, 20);
+        let names = references
+            .iter()
+            .map(|range| &source[range.start_byte..range.end_byte])
+            .collect::<Vec<_>>();
+
+        assert_eq!(names, vec!["curried"]);
+    }
+
+    #[test]
+    fn scala_constructor_candidates_exclude_qualifiers_arguments_and_type_arguments() {
+        let source = "object Calls { def caller(value: Int) = new pkg.Box[String](value) }";
+        let file = file("Calls.scala");
+        let tree =
+            parse_tree_for_language(&file, Language::Scala, source).expect("Scala syntax tree");
+        let call = byte_range(source, "new pkg.Box[String](value)");
+
+        let references = call_reference_ranges_in_tree(&tree, Language::Scala, &call, 20);
+        let names = references
+            .iter()
+            .map(|range| &source[range.start_byte..range.end_byte])
+            .collect::<Vec<_>>();
+
+        assert_eq!(names, vec!["Box"]);
+    }
+
+    #[test]
+    fn exact_call_span_rejects_an_enclosing_statement() {
+        let source = "function target() {}\ntarget();\n";
+        let file = file("statement.ts");
+        let tree = parse_tree_for_language(&file, Language::TypeScript, source)
+            .expect("TypeScript syntax tree");
+
+        assert!(
+            call_reference_range_for_call(
+                &tree,
+                Language::TypeScript,
+                &byte_range(source, "target();"),
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn ruby_bare_call_has_a_structured_call_site() {
+        let source = "def target; end\ndef caller; target; end\n";
+        let grammar = tree_sitter_ruby::LANGUAGE.into();
+        let facts = extract_file_facts(&RUBY_STRUCTURAL_SPEC, &grammar, source)
+            .expect("Ruby structural facts");
+        let start = source.rfind("target").expect("call target");
+        let site = call_site_syntax_for_reference(&facts, start, start + "target".len())
+            .expect("bare Ruby call site");
+        assert_eq!(
+            &source[site.callee_range.start_byte..site.callee_range.end_byte],
+            "target"
+        );
+        assert_eq!(
+            &source[site.range.start_byte..site.range.end_byte],
+            "target"
+        );
+    }
+
+    #[test]
+    fn signature_context_counts_active_parameter_after_comma() {
+        let source =
+            "class A { int target(int left, int right) { return 0; } void f() { target(1, 2); } }";
+        assert_signature_context("A.java", source, "1, ", "target", 1);
+    }
+
+    #[test]
+    fn signature_context_handles_empty_argument_list() {
+        let source = "fn target() {}\nfn caller() { target(); }\n";
+        let context = call_signature_context(
+            &file("lib.rs"),
+            source,
+            offset_after(source, "caller() { target("),
+        )
+        .expect("signature context");
+
+        assert_eq!(
+            &source[context.callee_range.start_byte..context.callee_range.end_byte],
+            "target"
+        );
+        assert_eq!(context.active_parameter, 0);
+    }
+
+    #[test]
+    fn signature_context_handles_ruby_bare_call() {
+        let source = "def target(left, right)\nend\n\ntarget(1, 2)\n";
+        assert_signature_context("sample.rb", source, "target(1, ", "target", 1);
     }
 
     #[test]
@@ -1693,54 +1707,6 @@ end"#;
     }
 
     #[test]
-    fn signature_context_handles_ruby_command_call_with_block() {
-        let source = "target 1, 2 do |item|\n  item\nend\n";
-        let context = call_signature_context(
-            &file("sample.rb"),
-            source,
-            offset_after(source, "target 1, "),
-        )
-        .expect("signature context");
-
-        assert_eq!(
-            &source[context.callee_range.start_byte..context.callee_range.end_byte],
-            "target"
-        );
-        assert_eq!(context.active_parameter, 1);
-    }
-
-    #[test]
-    fn signature_context_prefers_innermost_ruby_call() {
-        let source = "outer(inner(1), 2)\n";
-        let context =
-            call_signature_context(&file("sample.rb"), source, offset_after(source, "inner("))
-                .expect("signature context");
-
-        assert_eq!(
-            &source[context.callee_range.start_byte..context.callee_range.end_byte],
-            "inner"
-        );
-        assert_eq!(context.active_parameter, 0);
-    }
-
-    #[test]
-    fn signature_context_handles_scala_infix_call() {
-        let source = "object App {\n  class Box { def combine(value: Int): Int = value }\n  val box = new Box\n  val result = box combine 1\n}\n";
-        let context = call_signature_context(
-            &file("App.scala"),
-            source,
-            offset_after(source, "box combine "),
-        )
-        .expect("signature context");
-
-        assert_eq!(
-            &source[context.callee_range.start_byte..context.callee_range.end_byte],
-            "combine"
-        );
-        assert_eq!(context.active_parameter, 0);
-    }
-
-    #[test]
     fn signature_context_handles_scala_postfix_call() {
         let source = "object App {\n  class Box { def ready: Boolean = true }\n  val box = new Box\n  val result = box ready\n}\n";
         let context = call_signature_context(
@@ -1755,31 +1721,5 @@ end"#;
             "ready"
         );
         assert_eq!(context.active_parameter, 0);
-    }
-
-    #[test]
-    fn signature_context_handles_scala_postfix_operator_call() {
-        let source = "object App {\n  class Box { def ! : Boolean = true }\n  val box = new Box\n  val result = box !\n}\n";
-        let context =
-            call_signature_context(&file("App.scala"), source, offset_after(source, "box !"))
-                .expect("signature context");
-
-        assert_eq!(
-            &source[context.callee_range.start_byte..context.callee_range.end_byte],
-            "!"
-        );
-        assert_eq!(context.active_parameter, 0);
-    }
-
-    #[test]
-    fn signature_context_rejects_higher_order_call_callee() {
-        let source = "function factory() { return (value: number) => value; }\nconst result = factory()(1);\n";
-        let context = call_signature_context(
-            &file("sample.ts"),
-            source,
-            offset_after(source, "factory()("),
-        );
-
-        assert_eq!(context, None);
     }
 }

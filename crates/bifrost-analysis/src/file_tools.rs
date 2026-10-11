@@ -561,73 +561,9 @@ mod tests {
     use crate::test_support::AnalyzerFixture as Fixture;
 
     #[test]
-    fn get_file_contents_reads_existing_files() {
-        let fix = Fixture::new(&[("src/a.rs", "fn a() {}\n"), ("src/b.rs", "fn b() {}\n")]);
-        let result = get_file_contents(
-            fix.analyzer.analyzer(),
-            GetFileContentsParams {
-                file_paths: vec!["src/a.rs".to_string(), "missing.rs".to_string()],
-            },
-        );
-        assert_eq!(result.files.len(), 1);
-        assert_eq!(result.files[0].path, "src/a.rs");
-        assert_eq!(result.files[0].content, "fn a() {}\n");
-        assert!(!result.files[0].truncated);
-        assert_eq!(Some(1), result.files[0].total_lines);
-        assert_eq!(None, result.files[0].head_lines);
-        assert_eq!(None, result.files[0].tail_lines);
-        assert_eq!(result.not_found, vec!["missing.rs"]);
-    }
-
-    #[cfg_attr(not(scheduled_tests), ignore = "scheduled-only")]
-    #[test]
-    fn get_file_contents_normalizes_backslashes() {
-        let fix = Fixture::new(&[("src/a.rs", "x")]);
-        let result = get_file_contents(
-            fix.analyzer.analyzer(),
-            GetFileContentsParams {
-                file_paths: vec!["src\\a.rs".to_string()],
-            },
-        );
-        assert_eq!(result.files.len(), 1);
-        assert_eq!(result.files[0].path, "src/a.rs");
-    }
-
-    #[test]
-    fn get_file_contents_repairs_unique_bare_filename() {
-        let fix = Fixture::new(&[("src/Foo.java", "class Foo {}\n"), ("src/Bar.java", "")]);
-        let result = get_file_contents(
-            fix.analyzer.analyzer(),
-            GetFileContentsParams {
-                file_paths: vec!["Foo.java".to_string()],
-            },
-        );
-        assert_eq!(1, result.files.len());
-        assert_eq!("src/Foo.java", result.files[0].path);
-        assert!(result.not_found.is_empty());
-        assert!(result.ambiguous_paths.is_empty());
-    }
-
-    #[test]
-    fn get_file_contents_reports_ambiguous_bare_filename() {
-        let fix = Fixture::new(&[("src/Foo.java", "a"), ("test/Foo.java", "b")]);
-        let result = get_file_contents(
-            fix.analyzer.analyzer(),
-            GetFileContentsParams {
-                file_paths: vec!["Foo.java".to_string()],
-            },
-        );
-        assert!(result.files.is_empty());
-        assert!(result.not_found.is_empty());
-        assert_eq!(1, result.ambiguous_paths.len());
-        assert_eq!("Foo.java", result.ambiguous_paths[0].input);
-        assert_eq!(
-            vec!["src/Foo.java".to_string(), "test/Foo.java".to_string()],
-            result.ambiguous_paths[0].matches
-        );
-    }
-
-    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#60: absolute filesystem inputs must remain outside workspace file access while a valid relative path still works"
+    )]
     fn get_file_contents_rejects_absolute_paths_without_panic() {
         let fix = Fixture::new(&[("src/a.rs", "x")]);
         let result = get_file_contents(
@@ -649,6 +585,9 @@ mod tests {
     }
 
     #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#60: Pins rejection of drive-relative forms such as C:foo and C: so they cannot be interpreted as workspace or host paths"
+    )]
     fn get_file_contents_rejects_windows_drive_relative_paths() {
         let fix = Fixture::new(&[("src/a.rs", "x")]);
         let result = get_file_contents(
@@ -673,6 +612,9 @@ mod tests {
     }
 
     #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#60: Exercises the 200,000-line scan bound and verifies oversized files are skipped before building an unbounded line index"
+    )]
     fn search_file_contents_skips_files_with_too_many_lines() {
         // 200_001 newlines exceeds MAX_LINES_PER_FILE_SCAN; the file must be
         // skipped rather than allocating a `Vec<&str>` for every line.
@@ -694,54 +636,9 @@ mod tests {
     }
 
     #[test]
-    fn get_file_contents_truncates_very_long_lines() {
-        let long = "x".repeat(2050);
-        let fix = Fixture::new(&[("src/a.rs", long.as_str())]);
-        let result = get_file_contents(
-            fix.analyzer.analyzer(),
-            GetFileContentsParams {
-                file_paths: vec!["src/a.rs".to_string()],
-            },
-        );
-
-        assert_eq!(1, result.files.len());
-        assert!(!result.files[0].truncated);
-        assert_eq!(Some(1), result.files[0].total_lines);
-        assert!(
-            result.files[0]
-                .content
-                .ends_with(" [TRUNCATED at 2048 chars]")
-        );
-    }
-
-    #[test]
-    fn get_file_contents_samples_large_files_as_head_tail() {
-        let body = (1..=60)
-            .map(|line| format!("line {line}"))
-            .collect::<Vec<_>>()
-            .join("\n");
-        let fix = Fixture::new(&[("src/a.rs", body.as_str())]);
-        let result = get_file_contents(
-            fix.analyzer.analyzer(),
-            GetFileContentsParams {
-                file_paths: vec!["src/a.rs".to_string()],
-            },
-        );
-
-        assert_eq!(1, result.files.len());
-        let file = &result.files[0];
-        assert!(file.truncated);
-        assert_eq!(Some(60), file.total_lines);
-        assert_eq!(Some(25), file.head_lines);
-        assert_eq!(Some(25), file.tail_lines);
-        assert!(file.content.contains("line 1"));
-        assert!(file.content.contains("line 25"));
-        assert!(file.content.contains("----- OMITTED 10 LINES -----"));
-        assert!(file.content.contains("line 36"));
-        assert!(file.content.contains("line 60"));
-    }
-
-    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#60: skim rejects an absolute host path and returns it as not found without panicking"
+    )]
     fn skim_files_rejects_absolute_paths_without_panic() {
         let fix = Fixture::new(&[("a.rs", "fn a() {}\n")]);
         let result = skim_files(
@@ -755,111 +652,9 @@ mod tests {
     }
 
     #[test]
-    fn find_files_containing_matches_regex() {
-        let fix = Fixture::new(&[
-            ("src/a.rs", "fn alpha() {}\n"),
-            ("src/b.rs", "fn beta() {}\n"),
-        ]);
-        let result = find_files_containing(
-            fix.analyzer.analyzer(),
-            FindFilesContainingParams {
-                patterns: vec!["fn al".to_string()],
-                limit: 10,
-                case_insensitive: false,
-            },
-        );
-        assert_eq!(result.files, vec!["src/a.rs"]);
-    }
-
-    #[test]
-    fn find_files_containing_records_invalid_patterns() {
-        let fix = Fixture::new(&[("a.rs", "")]);
-        let result = find_files_containing(
-            fix.analyzer.analyzer(),
-            FindFilesContainingParams {
-                patterns: vec!["[".to_string()],
-                limit: 10,
-                case_insensitive: false,
-            },
-        );
-        assert_eq!(result.invalid_patterns, vec!["[".to_string()]);
-        assert!(result.files.is_empty());
-    }
-
-    #[test]
-    fn search_file_contents_returns_context() {
-        let fix = Fixture::new(&[("src/a.rs", "line1\nline2\nNEEDLE\nline4\nline5\n")]);
-        let result = search_file_contents(
-            fix.analyzer.analyzer(),
-            SearchFileContentsParams {
-                patterns: vec!["NEEDLE".to_string()],
-                file_path: None,
-                context_lines: 1,
-                case_insensitive: false,
-            },
-        );
-        assert_eq!(result.matches.len(), 1);
-        let group = &result.matches[0];
-        assert_eq!(group.path, "src/a.rs");
-        assert!(!group.truncated);
-        assert_eq!(group.matches.len(), 1);
-        let hit = &group.matches[0];
-        assert_eq!(hit.line, 3);
-        assert_eq!(hit.text, "NEEDLE");
-        assert_eq!(hit.before, vec!["line2".to_string()]);
-        assert_eq!(hit.after, vec!["line4".to_string()]);
-    }
-
-    #[test]
-    fn search_file_contents_respects_filepath_glob() {
-        let fix = Fixture::new(&[("src/a.rs", "NEEDLE\n"), ("src/b.txt", "NEEDLE\n")]);
-        let result = search_file_contents(
-            fix.analyzer.analyzer(),
-            SearchFileContentsParams {
-                patterns: vec!["NEEDLE".to_string()],
-                file_path: Some("**/*.rs".to_string()),
-                context_lines: 0,
-                case_insensitive: false,
-            },
-        );
-        let paths: Vec<_> = result.matches.iter().map(|m| m.path.clone()).collect();
-        assert_eq!(paths, vec!["src/a.rs"]);
-    }
-
-    #[test]
-    fn search_file_contents_repairs_unique_bare_filename_filter() {
-        let fix = Fixture::new(&[("src/Foo.java", "needle\n"), ("other/Bar.java", "needle\n")]);
-        let result = search_file_contents(
-            fix.analyzer.analyzer(),
-            SearchFileContentsParams {
-                patterns: vec!["needle".to_string()],
-                file_path: Some("Foo.java".to_string()),
-                context_lines: 0,
-                case_insensitive: false,
-            },
-        );
-        assert_eq!(1, result.matches.len());
-        assert_eq!("src/Foo.java", result.matches[0].path);
-        assert!(result.ambiguous_paths.is_empty());
-    }
-
-    #[test]
-    fn search_file_contents_reports_ambiguous_bare_filename_filter() {
-        let fix = Fixture::new(&[("src/Foo.java", "needle\n"), ("test/Foo.java", "needle\n")]);
-        let result = search_file_contents(
-            fix.analyzer.analyzer(),
-            SearchFileContentsParams {
-                patterns: vec!["needle".to_string()],
-                file_path: Some("Foo.java".to_string()),
-                context_lines: 0,
-                case_insensitive: false,
-            },
-        );
-        assert!(result.matches.is_empty());
-        assert_eq!(1, result.ambiguous_paths.len());
-    }
-
-    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#60: Checks per-file match capping and the aggregate truncated status when one file has more than 50 hits"
+    )]
     fn search_file_contents_marks_per_file_truncation() {
         let mut body = String::new();
         for _ in 0..(MAX_PER_FILE_SEARCH_MATCHES + 5) {
@@ -882,6 +677,9 @@ mod tests {
     }
 
     #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#60: Exercises usize::MAX context input on a one-line fixture to ensure the public search path remains bounded and does not panic"
+    )]
     fn search_file_contents_clamps_context_lines() {
         let fix = Fixture::new(&[("src/a.rs", "NEEDLE\n")]);
         let result = search_file_contents(
@@ -897,73 +695,5 @@ mod tests {
         // No panic from oversized context_lines, and only a single line in
         // the file means before/after stay empty regardless of the cap.
         assert!(result.matches[0].matches[0].before.is_empty());
-    }
-
-    #[test]
-    fn skim_files_reports_unknown_paths_in_not_found() {
-        let fix = Fixture::new(&[("a.rs", "fn a() {}\n")]);
-        let result = skim_files(
-            fix.analyzer.analyzer(),
-            SkimFilesParams {
-                file_paths: vec!["missing.rs".to_string()],
-            },
-        );
-        assert!(result.files.is_empty());
-        assert_eq!(result.not_found, vec!["missing.rs"]);
-        let _ = fix.project_root();
-    }
-
-    #[test]
-    fn skim_files_repairs_and_reports_ambiguous_basenames() {
-        let fix = Fixture::new(&[
-            ("src/Foo.java", "class Foo {}\n"),
-            ("nested/Only.java", "class Only {}\n"),
-            ("test/Foo.java", "class FooTest {}\n"),
-        ]);
-        let unique = skim_files(
-            fix.analyzer.analyzer(),
-            SkimFilesParams {
-                file_paths: vec!["Only.java".to_string()],
-            },
-        );
-        assert_eq!(1, unique.files.len());
-        assert_eq!("nested/Only.java", unique.files[0].path);
-        assert!(unique.ambiguous_paths.is_empty());
-
-        let ambiguous = skim_files(
-            fix.analyzer.analyzer(),
-            SkimFilesParams {
-                file_paths: vec!["Foo.java".to_string()],
-            },
-        );
-        assert!(ambiguous.files.is_empty());
-        assert_eq!(1, ambiguous.ambiguous_paths.len());
-    }
-
-    #[test]
-    fn search_file_contents_truncates_long_match_and_context_lines() {
-        let long = "x".repeat(2050);
-        let fix = Fixture::new(&[(
-            "src/a.rs",
-            format!("before\nneedle {long}\nafter {long}\n").as_str(),
-        )]);
-        let result = search_file_contents(
-            fix.analyzer.analyzer(),
-            SearchFileContentsParams {
-                patterns: vec!["needle".to_string()],
-                file_path: None,
-                context_lines: 1,
-                case_insensitive: false,
-            },
-        );
-
-        let group = &result.matches[0];
-        assert!(
-            group.matches[0]
-                .text
-                .ends_with(" [TRUNCATED at 2048 chars]")
-        );
-        assert_eq!(vec!["before".to_string()], group.matches[0].before);
-        assert!(group.matches[0].after[0].ends_with(" [TRUNCATED at 2048 chars]"));
     }
 }

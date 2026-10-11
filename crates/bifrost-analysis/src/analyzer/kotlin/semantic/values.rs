@@ -169,14 +169,38 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 .parent()
                 .filter(|parent| parent.kind() == "variable_declaration")
             {
-                if let Some(written) = kotlin_binding_type_node(binding) {
+                let property = binding
+                    .parent()
+                    .filter(|parent| parent.kind() == "property_declaration");
+                let written = kotlin_binding_type_node(binding);
+                let delegated = property
+                    .is_some_and(|property| property_delegate_expression(property).is_some());
+                if let Some(written) = written {
                     self.bind_carrier(value, Some(written), KotlinCarrier::Unrelated);
                 }
-                if binding
-                    .parent()
-                    .is_some_and(|property| property_delegate_expression(property).is_some())
-                {
+                if delegated {
                     self.delegated_locals.insert(value);
+                }
+                let inferred = property.and_then(property_initializer);
+                if !delegated {
+                    let scalar = match written {
+                        Some(written) => {
+                            kotlin_declared_scalar_type(written, self.prepared.source())
+                        }
+                        None => inferred.and_then(|initializer| {
+                            kotlin_literal_scalar_type(initializer, self.prepared.source())
+                        }),
+                    };
+                    if let Some(scalar) = scalar {
+                        self.scalar_types.insert(value, scalar);
+                    }
+                }
+                if property
+                    .and_then(|property| child_of_kind(property, "binding_pattern_kind"))
+                    .and_then(|kind| node_text(self.prepared.source(), kind))
+                    == Some("var")
+                {
+                    self.mutable_locals.insert(value);
                 }
             }
             self.locals
@@ -272,13 +296,29 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 })?;
                 value
             };
+            let binding = match node.kind() {
+                "parameter" | "class_parameter" => node,
+                "simple_identifier" => node
+                    .parent()
+                    .filter(|parent| matches!(parent.kind(), "parameter" | "class_parameter"))
+                    .unwrap_or(node),
+                _ => node,
+            };
             // A formal's written type is what decides which JVM carrier the
             // parameter holds, so it is recorded with the binding itself.
             self.bind_carrier(
                 value,
-                kotlin_binding_type_node(node),
+                kotlin_binding_type_node(binding),
                 KotlinCarrier::Unrelated,
             );
+            let class_property = binding.kind() == "class_parameter"
+                && child_of_kind(binding, "binding_pattern_kind").is_some();
+            if !class_property
+                && let Some(written) = kotlin_binding_type_node(binding)
+                && let Some(scalar) = kotlin_declared_scalar_type(written, self.prepared.source())
+            {
+                self.scalar_types.insert(value, scalar);
+            }
             for name in slot.names {
                 self.parameters.insert(name.into_boxed_str(), value);
             }
@@ -331,6 +371,12 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             return Ok(*value);
         }
         let metadata = self.value_mapping(builder, node)?;
+        let kind = match kind {
+            SemanticValueKind::Temporary | SemanticValueKind::Constant => {
+                typed_expression_value_kind(self.prepared.source(), node)
+            }
+            kind => kind,
+        };
         let value = self.session.insert_cached_value_with_metadata(
             builder,
             &mut self.expression_values,
@@ -764,6 +810,16 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         let name = node_text(self.prepared.source(), node)?;
         self.local_at(name, node.start_byte())
             .or_else(|| self.parameters.get(name).copied())
+    }
+
+    /// The primitive scalar type proven for a bare local or parameter name.
+    /// Members, receivers, delegated properties, and captured bindings are
+    /// intentionally absent from this lexical proof.
+    pub(super) fn scalar_type(&self, node: Node<'tree>) -> Option<KotlinScalarType> {
+        (node.kind() == "simple_identifier")
+            .then(|| self.bound_value(node))
+            .flatten()
+            .and_then(|value| self.scalar_types.get(&value).copied())
     }
 
     /// Record what a binding's written type says it carries, and what its type

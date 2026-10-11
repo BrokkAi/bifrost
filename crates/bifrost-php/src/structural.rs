@@ -1,5 +1,6 @@
 //! PHP structural spec for `query_code`.
 
+use brokk_bifrost_core::analyzer::common::try_node_source_text as node_text;
 use brokk_bifrost_core::analyzer::structural::adapter_helpers::{
     attach_role_with_derived_name, attach_terminal_callee, field_name_in_parent, first_named_child,
     is_spread_argument_node, nearest_ancestor,
@@ -8,21 +9,29 @@ use brokk_bifrost_core::analyzer::structural::callable::CallSiteContext;
 use brokk_bifrost_core::analyzer::structural::edges::{
     INVERSE_REFERENCE_EDGE_SUPPORT, ReferenceEdgeSupport,
 };
+use brokk_bifrost_core::analyzer::structural::facts::{
+    IntegerLiteralValue, decode_integer_literal_digits,
+};
 use brokk_bifrost_core::analyzer::structural::kinds::{NormalizedKind, Role};
 use brokk_bifrost_core::analyzer::structural::materialization::{
     DeclarationMaterializationSupport, NO_MATERIALIZATION_SUPPORT,
 };
 use brokk_bifrost_core::analyzer::structural::occurrences::{
-    Namespace, OccurrenceRole, OccurrenceRoleSupport, default_occurrence_namespace,
+    Namespace, OccurrenceRole, OccurrenceRoleSupport, module_path_occurrence_namespace,
 };
 use brokk_bifrost_core::analyzer::structural::resolution::{
     BindingActivation, BindingKind, EnvironmentAxis, HoistingClass, ImportActivation,
     LexicalEnvironmentSupport, ScopeFormation,
 };
+use brokk_bifrost_core::analyzer::structural::result_use::{
+    CallResultUse, CallResultUseIndex, CallResultUseOpenReason, CallResultUseSite,
+};
 use brokk_bifrost_core::analyzer::structural::routes::{
     CuratedExportSurface, IdentityRouteSupport, NO_IDENTITY_ROUTE_SUPPORT, RouteHopKind,
 };
 use brokk_bifrost_core::analyzer::structural::spec::{RoleSink, StructuralSpec};
+use brokk_bifrost_core::analyzer::tree_walk::first_named_child_matching;
+use brokk_bifrost_core::analyzer::tree_walk::first_named_child_of_kind as first_child_named_kind;
 use brokk_bifrost_core::analyzer::{Language, Range};
 use tree_sitter::Node;
 
@@ -31,7 +40,114 @@ pub struct PhpStructuralSpec;
 
 pub static PHP_STRUCTURAL_SPEC: PhpStructuralSpec = PhpStructuralSpec;
 
+/// Classify the syntax around one exact PHP function call.
+///
+/// PHP's error-suppression operator is transparent to value use: `@f()` still
+/// yields the call's return value, so a bare expression statement discards it
+/// just like `f()`. Every assignment, return, argument, and other expression
+/// context consumes the value. Dynamic calls remain syntactically classified;
+/// dispatch resolution, not this AST-local classification, keeps them open.
+pub fn php_call_result_use(call: Node<'_>) -> CallResultUseSite {
+    let default = if call.kind() != "function_call_expression"
+        || call.has_error()
+        || has_result_use_recovery_ancestor(call)
+        || has_result_use_recovery_descendant(call)
+    {
+        CallResultUse::Open(CallResultUseOpenReason::RecoveredSyntax)
+    } else {
+        let mut expression = call;
+        loop {
+            let Some(parent) = expression.parent() else {
+                break CallResultUse::Open(CallResultUseOpenReason::UnclassifiedSyntax);
+            };
+            if parent.is_error() || parent.is_missing() {
+                break CallResultUse::Open(CallResultUseOpenReason::RecoveredSyntax);
+            }
+            match parent.kind() {
+                "parenthesized_expression" | "error_suppression_expression"
+                    if parent.named_child_count() == 1
+                        && parent
+                            .named_child(0)
+                            .is_some_and(|child| child.id() == expression.id()) =>
+                {
+                    expression = parent;
+                }
+                "expression_statement"
+                    if parent.named_child_count() == 1
+                        && parent
+                            .named_child(0)
+                            .is_some_and(|child| child.id() == expression.id()) =>
+                {
+                    break CallResultUse::Discarded;
+                }
+                _ => break CallResultUse::Consumed,
+            }
+        }
+    };
+    CallResultUseSite::new(call.start_byte(), call.end_byte(), default)
+}
+
+fn has_result_use_recovery_ancestor(mut node: Node<'_>) -> bool {
+    while let Some(parent) = node.parent() {
+        if parent.is_error() || parent.is_missing() {
+            return true;
+        }
+        node = parent;
+    }
+    false
+}
+
+fn has_result_use_recovery_descendant(root: Node<'_>) -> bool {
+    let mut stack = vec![root];
+    while let Some(node) = stack.pop() {
+        if node.id() != root.id() && (node.is_error() || node.is_missing()) {
+            return true;
+        }
+        for index in (0..node.named_child_count()).rev() {
+            stack.push(node.named_child(index).expect("named child exists"));
+        }
+    }
+    false
+}
+
+/// One source-snapshot index of exact PHP function-call spans.
+#[derive(Debug, Clone)]
+pub struct PhpCallResultUseIndex {
+    inner: CallResultUseIndex,
+}
+
+impl PhpCallResultUseIndex {
+    pub fn new(root: Node<'_>) -> Self {
+        let mut sites = Vec::new();
+        let mut stack = vec![root];
+        while let Some(node) = stack.pop() {
+            if node.kind() == "function_call_expression" {
+                sites.push(php_call_result_use(node));
+            }
+            for index in (0..node.named_child_count()).rev() {
+                stack.push(node.named_child(index).expect("named child exists"));
+            }
+        }
+        Self {
+            inner: CallResultUseIndex::new(sites),
+        }
+    }
+
+    pub fn at_span(
+        &self,
+        start_byte: usize,
+        end_byte: usize,
+    ) -> Result<&CallResultUseSite, CallResultUseOpenReason> {
+        self.inner.at_span(start_byte, end_byte)
+    }
+
+    pub fn sites(&self) -> &[CallResultUseSite] {
+        self.inner.sites()
+    }
+}
+
 pub const PHP_KIND_TABLE: &[(&str, NormalizedKind)] = &[
+    ("comment", NormalizedKind::Comment),
     ("function_call_expression", NormalizedKind::Call),
     ("member_call_expression", NormalizedKind::Call),
     ("nullsafe_member_call_expression", NormalizedKind::Call),
@@ -94,21 +210,7 @@ pub const PHP_KIND_TABLE: &[(&str, NormalizedKind)] = &[
     ("do_statement", NormalizedKind::WhileLoop),
 ];
 
-fn last_named_child<'tree>(node: Node<'tree>) -> Option<Node<'tree>> {
-    (0..node.named_child_count())
-        .rev()
-        .find_map(|index| node.named_child(index))
-}
-
-fn expression_target_node(mut node: Node<'_>) -> Node<'_> {
-    while matches!(node.kind(), "expression" | "parenthesized_expression") {
-        let Some(child) = first_named_child(node) else {
-            break;
-        };
-        node = child;
-    }
-    node
-}
+use brokk_bifrost_core::analyzer::tree_walk::{expression_target_node, last_named_child};
 
 fn expression_name_node<'tree>(expression: Node<'tree>) -> Option<Node<'tree>> {
     let mut current = expression_target_node(expression);
@@ -136,6 +238,119 @@ fn expression_name_node<'tree>(expression: Node<'tree>) -> Option<Node<'tree>> {
 
 fn is_numeric_literal_node(node: Node<'_>) -> bool {
     matches!(node.kind(), "integer" | "float")
+}
+
+fn php_escape_value(escape: &str, quote: char) -> Option<Option<char>> {
+    let escaped = escape.strip_prefix('\\')?;
+    if quote == '\'' {
+        return match escaped {
+            "\\" => Some(Some('\\')),
+            "'" => Some(Some('\'')),
+            _ => None,
+        };
+    }
+    let character = match escaped {
+        "n" => '\n',
+        "r" => '\r',
+        "t" => '\t',
+        "v" => '\u{000b}',
+        "e" => '\u{001b}',
+        "f" => '\u{000c}',
+        "\\" => '\\',
+        "$" => '$',
+        "\"" => '\"',
+        _ if escaped.starts_with('x') => {
+            let digits = escaped.get(1..)?;
+            if digits.is_empty()
+                || digits.len() > 2
+                || !digits.bytes().all(|byte| byte.is_ascii_hexdigit())
+            {
+                return None;
+            }
+            char::from_u32(u32::from_str_radix(digits, 16).ok()?)?
+        }
+        _ if !escaped.is_empty()
+            && escaped.len() <= 3
+            && escaped.bytes().all(|byte| (b'0'..=b'7').contains(&byte)) =>
+        {
+            char::from_u32(u32::from_str_radix(escaped, 8).ok()?)?
+        }
+        // PHP preserves an unrecognized backslash escape. Returning it as an
+        // open value is safer than silently claiming a different scalar.
+        _ => return None,
+    };
+    Some(Some(character))
+}
+
+fn php_string_literal_value(node: Node<'_>, source: &str) -> Option<String> {
+    if node.kind() != "string" {
+        return None;
+    }
+    let spelling = node_text(node, source)?;
+    let quote = spelling.chars().next()?;
+    if !matches!(quote, '\'' | '"') {
+        return None;
+    }
+    let mut value = String::new();
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        match child.kind() {
+            "string_content" => value.push_str(node_text(child, source)?),
+            "escape_sequence" => {
+                if let Some(character) = php_escape_value(node_text(child, source)?, quote)? {
+                    value.push(character);
+                }
+            }
+            _ => return None,
+        }
+    }
+    Some(value)
+}
+
+fn php_integer_literal_value(node: Node<'_>, source: &str) -> Option<IntegerLiteralValue> {
+    let literal = if node.kind() == "unary_op_expression" {
+        let operator = node.child_by_field_name("operator")?;
+        if !matches!(operator.kind(), "+" | "-") {
+            return None;
+        }
+        let literal = node
+            .child_by_field_name("argument")
+            .or_else(|| first_named_child(node))?;
+        let value = php_integer_literal_value(literal, source)?;
+        return if operator.kind() == "-" {
+            Some(value.negated())
+        } else {
+            Some(value)
+        };
+    } else {
+        node
+    };
+    if literal.kind() != "integer" {
+        return None;
+    }
+    let text = node_text(literal, source)?;
+    let compact = text.replace('_', "");
+    let (radix, digits) = if let Some(digits) = compact
+        .strip_prefix("0x")
+        .or_else(|| compact.strip_prefix("0X"))
+    {
+        (16, digits)
+    } else if let Some(digits) = compact
+        .strip_prefix("0b")
+        .or_else(|| compact.strip_prefix("0B"))
+    {
+        (2, digits)
+    } else if let Some(digits) = compact
+        .strip_prefix("0o")
+        .or_else(|| compact.strip_prefix("0O"))
+    {
+        (8, digits)
+    } else if compact.len() > 1 && compact.starts_with('0') {
+        (8, compact.as_str())
+    } else {
+        (10, compact.as_str())
+    };
+    decode_integer_literal_digits(radix, digits.as_bytes())
 }
 
 fn unary_argument(node: Node<'_>) -> Option<Node<'_>> {
@@ -171,9 +386,7 @@ fn object_creation_callee(node: Node<'_>) -> Option<Node<'_>> {
 }
 
 fn object_creation_arguments(node: Node<'_>) -> Option<Node<'_>> {
-    (0..node.named_child_count())
-        .filter_map(|index| node.named_child(index))
-        .find(|child| child.kind() == "arguments")
+    first_child_named_kind(node, "arguments")
 }
 
 fn argument_value_node<'tree>(
@@ -233,18 +446,6 @@ fn attach_decorators(sink: &mut RoleSink<'_>, declaration: Node<'_>) {
     }
 }
 
-fn first_child_named_kind<'tree>(node: Node<'tree>, kind: &str) -> Option<Node<'tree>> {
-    (0..node.named_child_count())
-        .filter_map(|index| node.named_child(index))
-        .find(|child| child.kind() == kind)
-}
-
-fn first_child_not_named_kind<'tree>(node: Node<'tree>, kind: &str) -> Option<Node<'tree>> {
-    (0..node.named_child_count())
-        .filter_map(|index| node.named_child(index))
-        .find(|child| child.kind() != kind)
-}
-
 fn last_import_clause_name(node: Node<'_>) -> Option<Node<'_>> {
     (0..node.named_child_count())
         .rev()
@@ -300,7 +501,7 @@ fn attach_import_modules(sink: &mut RoleSink<'_>, node: Node<'_>) {
 }
 
 fn const_element_value(node: Node<'_>) -> Option<Node<'_>> {
-    first_child_not_named_kind(node, "name").map(expression_target_node)
+    first_named_child_matching(node, |child| child.kind() != "name").map(expression_target_node)
 }
 
 static PHP_OCCURRENCE_ROLE_SUPPORT: OccurrenceRoleSupport = OccurrenceRoleSupport::NONE
@@ -381,7 +582,8 @@ fn php_is_binding_target(subject: Node<'_>, host: Node<'_>) -> bool {
 /// Whether a `namespace_name` is a path written for its own sake -- the
 /// `name` field of a `namespace` declaration -- rather than the prefix of a
 /// qualified name or of a group `use`.
-fn php_namespace_name_declares(namespace_name: Node<'_>) -> bool {
+/// Whether this namespace-name node is the declared name of a namespace.
+pub fn php_namespace_name_declares(namespace_name: Node<'_>) -> bool {
     namespace_name.parent().is_some_and(|parent| {
         parent.kind() == "namespace_definition"
             && field_name_in_parent(parent, namespace_name) == Some("name")
@@ -610,6 +812,26 @@ impl StructuralSpec for PhpStructuralSpec {
         Language::Php
     }
 
+    fn supports_string_literal_value(&self) -> bool {
+        true
+    }
+
+    fn string_literal_value_may_be_absent(&self, node: Node<'_>, source: &str) -> bool {
+        node.kind() == "string" && php_string_literal_value(node, source).is_none()
+    }
+
+    fn string_literal_value(&self, node: Node<'_>, source: &str) -> Option<String> {
+        php_string_literal_value(node, source)
+    }
+
+    fn supports_integer_literal_value(&self) -> bool {
+        true
+    }
+
+    fn integer_literal_value(&self, node: Node<'_>, source: &str) -> Option<IntegerLiteralValue> {
+        php_integer_literal_value(node, source)
+    }
+
     fn kind_table(&self) -> &'static [(&'static str, NormalizedKind)] {
         PHP_KIND_TABLE
     }
@@ -653,16 +875,20 @@ impl StructuralSpec for PhpStructuralSpec {
     }
 
     fn supports_kind(&self, kind: NormalizedKind) -> bool {
-        kind == NormalizedKind::Constructor
-            || self
-                .kind_table()
-                .iter()
-                .any(|(_, fact_kind)| fact_kind.satisfies(kind))
+        matches!(
+            kind,
+            NormalizedKind::Constructor | NormalizedKind::SyntaxError
+        ) || self
+            .kind_table()
+            .iter()
+            .any(|(_, fact_kind)| fact_kind.satisfies(kind))
     }
 
     fn supports_role(&self, role: Role) -> bool {
         // #2647: not yet extracted by this adapter.
-        !matches!(role, Role::Iterable | Role::Element)
+        brokk_bifrost_core::analyzer::structural::spec::supports_role_without_iterable_or_element(
+            role,
+        )
     }
 
     fn occurrence_role_support(&self) -> &OccurrenceRoleSupport {
@@ -718,10 +944,7 @@ impl StructuralSpec for PhpStructuralSpec {
         role: OccurrenceRole,
         declares: Option<NormalizedKind>,
     ) -> Option<Namespace> {
-        match role {
-            OccurrenceRole::PathSegment => Some(Namespace::Module),
-            _ => default_occurrence_namespace(role, declares),
-        }
+        module_path_occurrence_namespace(role, declares)
     }
 
     fn reference_edge_support(&self) -> &ReferenceEdgeSupport {
@@ -746,7 +969,11 @@ impl StructuralSpec for PhpStructuralSpec {
                         .or_else(|| node.child_by_field_name("name"))
                 };
                 if let Some(function) = function {
-                    attach_terminal_callee(sink, function, expression_name_node(function));
+                    let target = expression_target_node(function);
+                    let name = (target.kind() == "variable_name")
+                        .then_some(target)
+                        .or_else(|| expression_name_node(target));
+                    attach_terminal_callee(sink, target, name);
                 }
                 let receiver = match node.kind() {
                     "member_call_expression" | "nullsafe_member_call_expression" => {
@@ -877,7 +1104,7 @@ impl StructuralSpec for PhpStructuralSpec {
 
 #[cfg(test)]
 mod tests {
-    use super::php_occurrence_role;
+    use super::{PHP_STRUCTURAL_SPEC, php_occurrence_role};
     use brokk_bifrost_core::analyzer::structural::occurrences::OccurrenceRole;
     use brokk_bifrost_core::analyzer::structural::spec::StructuralSpec;
     use tree_sitter::Parser;
@@ -964,12 +1191,9 @@ mod tests {
         }
     }
 
-    /// Every role the classifier can answer must be declared supported, and
-    /// every role it never answers must not be: an undeclared role read as
-    /// "no such occurrence" would be a silent empty answer (#2962).
     #[test]
     fn php_support_declares_exactly_the_roles_the_classifier_answers() {
-        let support = super::PHP_STRUCTURAL_SPEC.occurrence_role_support();
+        let support = PHP_STRUCTURAL_SPEC.occurrence_role_support();
         for role in [
             OccurrenceRole::DeclarationName,
             OccurrenceRole::Binder,
@@ -990,8 +1214,6 @@ mod tests {
         assert!(!support.is_supported(OccurrenceRole::GeneratedSource));
     }
 
-    /// Every binder, import and declaration shape the environment layer reads,
-    /// classified from the grammar fields alone.
     #[test]
     fn php_classifies_binders_imports_and_declaration_names() {
         let source = r#"<?php

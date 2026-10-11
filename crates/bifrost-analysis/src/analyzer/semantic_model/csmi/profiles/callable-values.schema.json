@@ -1,0 +1,320 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://csmi.brokk.ai/schema/profiles/callable-values/0.1/schema.json",
+  "title": "CSMI callable values profile 0.1.0",
+  "oneOf": [
+    {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "kind",
+        "callable",
+        "result",
+        "target"
+      ],
+      "properties": {
+        "kind": {
+          "const": "returned-callable"
+        },
+        "callable": {
+          "$ref": "#/$defs/localId"
+        },
+        "result": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "target": {
+          "$ref": "#/$defs/localId"
+        }
+      }
+    },
+    {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "kind",
+        "callable",
+        "callback",
+        "shape",
+        "arguments",
+        "timing",
+        "modality"
+      ],
+      "properties": {
+        "kind": {
+          "const": "callback-invocation"
+        },
+        "callable": {
+          "$ref": "#/$defs/localId"
+        },
+        "callback": {
+          "$ref": "#/$defs/inputLocation"
+        },
+        "shape": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "parameters",
+            "results"
+          ],
+          "properties": {
+            "parameters": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 65535
+            },
+            "results": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 65535
+            }
+          }
+        },
+        "arguments": {
+          "type": "array",
+          "maxItems": 65535,
+          "items": {
+            "$ref": "#/$defs/argument"
+          }
+        },
+        "timing": {
+          "const": "during-call"
+        },
+        "modality": {
+          "const": "may"
+        }
+      }
+    }
+  ],
+  "$defs": {
+    "inputLocation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "root"
+      ],
+      "properties": {
+        "root": {
+          "$ref": "#/$defs/inputBoundaryRoot"
+        },
+        "projection": {
+          "$ref": "#/$defs/projection"
+        }
+      }
+    },
+    "inputBoundaryRoot": {
+      "oneOf": [
+        {
+          "$ref": "#/$defs/inputReceiverRoot"
+        },
+        {
+          "$ref": "#/$defs/inputParameterRoot"
+        },
+        {
+          "$ref": "#/$defs/inputCaptureRoot"
+        }
+      ]
+    },
+    "inputReceiverRoot": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "phase",
+        "role"
+      ],
+      "properties": {
+        "phase": {
+          "const": "input"
+        },
+        "role": {
+          "const": "receiver"
+        }
+      }
+    },
+    "inputParameterRoot": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "phase",
+        "role",
+        "position"
+      ],
+      "properties": {
+        "phase": {
+          "const": "input"
+        },
+        "role": {
+          "const": "parameter"
+        },
+        "position": {
+          "type": "integer",
+          "minimum": 0
+        }
+      }
+    },
+    "inputCaptureRoot": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "phase",
+        "role",
+        "symbol"
+      ],
+      "properties": {
+        "phase": {
+          "const": "input"
+        },
+        "role": {
+          "const": "capture"
+        },
+        "symbol": {
+          "$ref": "#/$defs/localId"
+        }
+      }
+    },
+    "localId": {
+      "type": "string",
+      "pattern": "^[A-Za-z][A-Za-z0-9._-]*$"
+    },
+    "projection": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "scheme",
+        "schemeVersion",
+        "steps"
+      ],
+      "properties": {
+        "scheme": {
+          "const": "csmi.structured-locations"
+        },
+        "schemeVersion": {
+          "const": "0.1.0"
+        },
+        "steps": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "$ref": "#/$defs/projectionStep"
+          },
+          "maxItems": 16
+        }
+      }
+    },
+    "nonEmptyString": {
+      "type": "string",
+      "minLength": 1
+    },
+    "projectionStep": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "kind",
+        "args"
+      ],
+      "properties": {
+        "kind": {
+          "const": "field"
+        },
+        "args": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "symbol"
+          ],
+          "properties": {
+            "symbol": {
+              "$ref": "#/$defs/localId"
+            }
+          }
+        }
+      }
+    },
+    "argument": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "kind",
+            "source"
+          ],
+          "properties": {
+            "kind": {
+              "const": "input"
+            },
+            "source": {
+              "$ref": "#/$defs/inputLocation"
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "kind",
+            "limitation"
+          ],
+          "properties": {
+            "kind": {
+              "const": "unknown"
+            },
+            "limitation": {
+              "$ref": "#/$defs/limitation"
+            }
+          }
+        }
+      ]
+    },
+    "limitation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "kind"
+      ],
+      "properties": {
+        "kind": {
+          "$ref": "#/$defs/nonEmptyString"
+        },
+        "diagnostic": {
+          "$ref": "#/$defs/diagnostic"
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "kind": {
+                "const": "other"
+              }
+            },
+            "required": [
+              "kind"
+            ]
+          },
+          "then": {
+            "required": [
+              "diagnostic"
+            ]
+          }
+        }
+      ]
+    },
+    "diagnostic": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "message"
+      ],
+      "properties": {
+        "message": {
+          "$ref": "#/$defs/nonEmptyString"
+        },
+        "code": {
+          "$ref": "#/$defs/nonEmptyString"
+        },
+        "details": true
+      }
+    }
+  }
+}

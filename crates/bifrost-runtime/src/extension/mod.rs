@@ -27,6 +27,8 @@
 //! let _: StableDigest = dense.into();
 //! ```
 
+use std::fmt;
+
 mod artifacts;
 mod codec;
 mod identity;
@@ -68,3 +70,11 @@ pub use workspace::{
     ExtensionWorkspaceOptions, LanguageCapabilityReport, OperationCapability, StructuralRequest,
     StructuralResult,
 };
+
+fn fmt_text(value: &str, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+    formatter.write_str(value)
+}
+
+fn fmt_debug<T: fmt::Debug + ?Sized>(value: &T, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+    fmt::Debug::fmt(value, formatter)
+}

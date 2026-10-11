@@ -19,6 +19,7 @@
 //! the downcasts that produce those arguments.
 
 pub mod adapter;
+pub mod build_files;
 pub mod declarations;
 pub mod diagnostics;
 pub mod graph;

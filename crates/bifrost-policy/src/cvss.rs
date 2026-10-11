@@ -27,8 +27,14 @@ use super::definition::{
     PolicyId,
 };
 use super::finding::PolicyIncompleteReason;
-use super::finding_identity::{EvidenceRef, PolicyFindingId, SourceScenarioId, WitnessId};
-use super::retained::{RetainedSize, retained_extra};
+use super::finding_identity::{
+    EvidenceRef, PolicyFindingId, SourceScenarioId, WitnessId, retain_sorted_evidence_refs,
+};
+use super::identity::write_lower_hex;
+use super::retained::{
+    RetainedSize, ensure_truncation_consistency, retained_extra, retained_size_with_extra,
+    retained_size_with_extras, retained_size_with_field_extra,
+};
 
 const MAX_CVSS_ASSUMPTIONS: usize = 64;
 const MAX_CVSS_EVIDENCE_RECORDS: usize = 256;
@@ -105,9 +111,15 @@ pub enum CvssEvidenceBasis {
     AnalystOverride,
 }
 
-impl RetainedSize for CvssEvidenceBasis {
-    fn retained_size(&self) -> usize {
-        std::mem::size_of::<Self>()
+impl CvssEvidenceBasis {
+    pub(crate) const fn label(self) -> &'static str {
+        match self {
+            Self::StaticWitness => "static_witness",
+            Self::PolicyAssertion => "policy_assertion",
+            Self::EnvironmentProfile => "environment_profile",
+            Self::ThreatFeed => "threat_feed",
+            Self::AnalystOverride => "analyst_override",
+        }
     }
 }
 
@@ -237,10 +249,8 @@ impl CvssMetricEvidence {
     }
 
     pub(crate) fn retain_evidence_refs(&mut self, retained: &[EvidenceRef]) {
-        let original_len = self.evidence_refs.len();
-        self.evidence_refs
-            .retain(|reference| retained.binary_search(reference).is_ok());
-        self.evidence_refs_truncated |= self.evidence_refs.len() != original_len;
+        self.evidence_refs_truncated |=
+            retain_sorted_evidence_refs(&mut self.evidence_refs, retained);
     }
 
     pub fn rationale(&self) -> &str {
@@ -282,11 +292,7 @@ impl CvssMetricEvidence {
             self.content_hash,
         )
         .and_then(|normalized| {
-            if normalized == *self {
-                Ok(())
-            } else {
-                Err(CvssValidationError::NonCanonicalEvidence)
-            }
+            ensure_canonical(self, normalized, CvssValidationError::NonCanonicalEvidence)
         })
     }
 
@@ -301,12 +307,16 @@ impl CvssMetricEvidence {
 
 impl RetainedSize for CvssMetricEvidence {
     fn retained_size(&self) -> usize {
-        std::mem::size_of::<Self>()
-            .saturating_add(retained_extra(&self.evidence_refs))
-            .saturating_add(retained_extra(&self.rationale))
-            .saturating_add(retained_extra(&self.assumptions))
-            .saturating_add(retained_extra(&self.assessor_or_tool))
-            .saturating_add(retained_extra(&self.assessed_at))
+        retained_size_with_extras(
+            self,
+            [
+                retained_extra(&self.evidence_refs),
+                retained_extra(&self.rationale),
+                retained_extra(&self.assumptions),
+                retained_extra(&self.assessor_or_tool),
+                retained_extra(&self.assessed_at),
+            ],
+        )
     }
 }
 
@@ -478,7 +488,7 @@ impl CvssComponentResult {
 
 impl RetainedSize for CvssComponentResult {
     fn retained_size(&self) -> usize {
-        std::mem::size_of::<Self>().saturating_add(retained_extra(&self.vector))
+        retained_size_with_field_extra(self, &self.vector)
     }
 }
 
@@ -504,12 +514,6 @@ impl Serialize for CvssNomenclature {
     }
 }
 
-impl RetainedSize for CvssNomenclature {
-    fn retained_size(&self) -> usize {
-        std::mem::size_of::<Self>()
-    }
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CvssSeverity {
@@ -518,12 +522,6 @@ pub enum CvssSeverity {
     Medium,
     High,
     Critical,
-}
-
-impl RetainedSize for CvssSeverity {
-    fn retained_size(&self) -> usize {
-        std::mem::size_of::<Self>()
-    }
 }
 
 /// Canonical provenance shared by scored and unscored assessments.
@@ -589,11 +587,15 @@ impl CvssAssessmentProvenance {
 
 impl RetainedSize for CvssAssessmentProvenance {
     fn retained_size(&self) -> usize {
-        std::mem::size_of::<Self>()
-            .saturating_add(retained_extra(&self.reducer))
-            .saturating_add(retained_extra(&self.evidence_refs))
-            .saturating_add(retained_extra(&self.overlay_scopes))
-            .saturating_add(retained_extra(&self.content_hashes))
+        retained_size_with_extras(
+            self,
+            [
+                retained_extra(&self.reducer),
+                retained_extra(&self.evidence_refs),
+                retained_extra(&self.overlay_scopes),
+                retained_extra(&self.content_hashes),
+            ],
+        )
     }
 }
 
@@ -726,9 +728,13 @@ impl CvssAssessmentSet {
 
 impl RetainedSize for CvssAssessmentSet {
     fn retained_size(&self) -> usize {
-        std::mem::size_of::<Self>()
-            .saturating_add(retained_extra(&self.variants))
-            .saturating_add(retained_extra(&self.selection_rationale))
+        retained_size_with_extras(
+            self,
+            [
+                retained_extra(&self.variants),
+                retained_extra(&self.selection_rationale),
+            ],
+        )
     }
 }
 
@@ -838,21 +844,21 @@ impl CvssAssessmentVariant {
             self.assessment.clone(),
         )
         .and_then(|normalized| {
-            if normalized == *self {
-                Ok(())
-            } else {
-                Err(CvssValidationError::NonCanonicalVariant)
-            }
+            ensure_canonical(self, normalized, CvssValidationError::NonCanonicalVariant)
         })
     }
 }
 
 impl RetainedSize for CvssAssessmentVariant {
     fn retained_size(&self) -> usize {
-        std::mem::size_of::<Self>()
-            .saturating_add(retained_extra(&self.source_scenarios))
-            .saturating_add(retained_extra(&self.witness_refs))
-            .saturating_add(retained_extra(&self.assessment))
+        retained_size_with_extras(
+            self,
+            [
+                retained_extra(&self.source_scenarios),
+                retained_extra(&self.witness_refs),
+                retained_extra(&self.assessment),
+            ],
+        )
     }
 }
 
@@ -1075,38 +1081,41 @@ impl CvssAssessment {
                 provenance.clone(),
             )?,
         };
-        if &normalized == self {
-            Ok(())
-        } else {
-            Err(CvssValidationError::NonCanonicalAssessment)
-        }
+        ensure_canonical(
+            self,
+            normalized,
+            CvssValidationError::NonCanonicalAssessment,
+        )
     }
 }
 
 impl RetainedSize for CvssAssessment {
     fn retained_size(&self) -> usize {
-        std::mem::size_of::<Self>().saturating_add(match self {
-            Self::Scored {
-                vector,
-                components,
-                metrics,
-                provenance,
-                ..
-            } => retained_extra(vector)
-                .saturating_add(retained_extra(components))
-                .saturating_add(retained_extra(metrics))
-                .saturating_add(retained_extra(provenance)),
-            Self::Unscored {
-                established,
-                missing_base_metrics,
-                reasons,
-                provenance,
-                ..
-            } => retained_extra(established)
-                .saturating_add(retained_extra(missing_base_metrics))
-                .saturating_add(retained_extra(reasons))
-                .saturating_add(retained_extra(provenance)),
-        })
+        retained_size_with_extra(
+            self,
+            match self {
+                Self::Scored {
+                    vector,
+                    components,
+                    metrics,
+                    provenance,
+                    ..
+                } => retained_extra(vector)
+                    .saturating_add(retained_extra(components))
+                    .saturating_add(retained_extra(metrics))
+                    .saturating_add(retained_extra(provenance)),
+                Self::Unscored {
+                    established,
+                    missing_base_metrics,
+                    reasons,
+                    provenance,
+                    ..
+                } => retained_extra(established)
+                    .saturating_add(retained_extra(missing_base_metrics))
+                    .saturating_add(retained_extra(reasons))
+                    .saturating_add(retained_extra(provenance)),
+            },
+        )
     }
 }
 
@@ -1127,6 +1136,60 @@ pub enum PolicyOverlayScope {
         finding: PolicyFindingId,
         scenario: SourceScenarioId,
     },
+}
+
+impl PolicyOverlayScope {
+    pub(crate) fn applies_to(
+        &self,
+        policy_id: &PolicyId,
+        finding_id: &PolicyFindingId,
+        source_scenarios: &[SourceScenarioId],
+    ) -> bool {
+        match self {
+            Self::AllFindings => true,
+            Self::Policy {
+                policy_id: expected,
+            } => expected == policy_id,
+            Self::Finding {
+                finding_id: expected,
+            } => expected == finding_id,
+            Self::SourceScenario { scenario_id } => source_scenarios.contains(scenario_id),
+            Self::FindingScenario { finding, scenario } => {
+                finding == finding_id && source_scenarios.contains(scenario)
+            }
+        }
+    }
+
+    pub(crate) fn strictly_refines(&self, broader: &Self) -> bool {
+        use PolicyOverlayScope as Scope;
+        match (self, broader) {
+            (Scope::Policy { .. }, Scope::AllFindings) => true,
+            (
+                Scope::Finding { .. } | Scope::SourceScenario { .. },
+                Scope::AllFindings | Scope::Policy { .. },
+            ) => true,
+            (
+                Scope::FindingScenario {
+                    finding: left_finding,
+                    ..
+                },
+                Scope::Finding {
+                    finding_id: right_finding,
+                },
+            ) => left_finding == right_finding,
+            (
+                Scope::FindingScenario {
+                    scenario: left_scenario,
+                    ..
+                },
+                Scope::SourceScenario {
+                    scenario_id: right_scenario,
+                },
+            ) => left_scenario == right_scenario,
+            (Scope::FindingScenario { .. }, Scope::AllFindings | Scope::Policy { .. }) => true,
+            _ => false,
+        }
+    }
 }
 
 impl Serialize for PolicyOverlayScope {
@@ -1442,10 +1505,23 @@ fn validate_truncation(
     truncated: bool,
     omitted_lower_bound: u64,
 ) -> Result<(), CvssValidationError> {
-    if truncated != (omitted_lower_bound > 0) {
-        return Err(CvssValidationError::InvalidTruncation { field });
+    ensure_truncation_consistency(
+        truncated,
+        omitted_lower_bound,
+        CvssValidationError::InvalidTruncation { field },
+    )
+}
+
+fn ensure_canonical<T: PartialEq, E>(
+    original: &T,
+    normalized: T,
+    noncanonical: E,
+) -> Result<(), E> {
+    if normalized == *original {
+        Ok(())
+    } else {
+        Err(noncanonical)
     }
-    Ok(())
 }
 
 fn validate_cvss_vector(vector: &str) -> Result<(), CvssValidationError> {
@@ -1732,16 +1808,10 @@ impl Serialize for CvssEvidenceScope {
     }
 }
 
-fn write_lower_hex(bytes: &[u8; 32], formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-    for byte in bytes {
-        write!(formatter, "{byte:02x}")?;
-    }
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::cvss_assessment_provenance as provenance;
     use serde_json::json;
 
     fn evidence_ref(value: &str) -> EvidenceRef {
@@ -1749,45 +1819,168 @@ mod tests {
     }
 
     fn base_value(metric: CvssBaseMetric) -> CvssMetricValue {
-        let token = match metric {
-            CvssBaseMetric::Ac => CvssMetricValueToken::L,
-            CvssBaseMetric::At | CvssBaseMetric::Av | CvssBaseMetric::Pr | CvssBaseMetric::Ui => {
-                CvssMetricValueToken::N
-            }
-            CvssBaseMetric::Vc
-            | CvssBaseMetric::Vi
-            | CvssBaseMetric::Va
-            | CvssBaseMetric::Sc
-            | CvssBaseMetric::Si
-            | CvssBaseMetric::Sa => CvssMetricValueToken::H,
-        };
-        CvssMetricValue::try_new(CvssMetric::Base { metric }, token).unwrap()
+        crate::test_support::cvss_base_metric_value(metric)
     }
 
     fn metric_evidence(metric: CvssBaseMetric, byte: u8) -> CvssMetricEvidence {
-        CvssMetricEvidence::try_new(
-            CvssMetric::Base { metric },
-            base_value(metric),
-            CvssEvidenceBasis::PolicyAssertion,
-            vec![evidence_ref(metric.first_label())],
-            "Verified policy assertion".to_string(),
-            vec!["Deployment matches the policy model".to_string()],
-            "bifrost-policy".to_string(),
-            None,
-            metric.required_scope(),
-            CvssEvidenceContentHash::from_bytes([byte; 32]),
-        )
-        .unwrap()
+        crate::test_support::cvss_test_metric_evidence(metric, byte, "cvss")
     }
 
-    fn provenance() -> CvssAssessmentProvenance {
-        CvssAssessmentProvenance::try_new(
+    #[test]
+    fn evidence_enforces_metric_value_basis_scope_and_provenance() {
+        let av = CvssMetric::Base {
+            metric: CvssBaseMetric::Av,
+        };
+        assert!(
+            CvssMetricEvidence::try_new(
+                av,
+                base_value(CvssBaseMetric::Ac),
+                CvssEvidenceBasis::PolicyAssertion,
+                vec![evidence_ref("proof")],
+                "reason".to_string(),
+                Vec::new(),
+                "tool".to_string(),
+                None,
+                CvssBaseMetric::Av.required_scope(),
+                CvssEvidenceContentHash::from_bytes([1; 32]),
+            )
+            .is_err()
+        );
+        assert!(
+            CvssMetricEvidence::try_new(
+                av,
+                base_value(CvssBaseMetric::Av),
+                CvssEvidenceBasis::ThreatFeed,
+                vec![evidence_ref("proof")],
+                "reason".to_string(),
+                Vec::new(),
+                "tool".to_string(),
+                None,
+                CvssBaseMetric::Av.required_scope(),
+                CvssEvidenceContentHash::from_bytes([1; 32]),
+            )
+            .is_err()
+        );
+
+        let first = metric_evidence(CvssBaseMetric::Av, 7);
+        let second = CvssMetricEvidence::try_new(
+            first.metric(),
+            first.value(),
+            first.basis(),
+            first.evidence_refs().to_vec(),
+            "A different fact cannot reuse the digest".to_string(),
+            first.assumptions().to_vec(),
+            first.assessor_or_tool().to_string(),
+            first.assessed_at().map(str::to_string),
+            first.system_scope(),
+            first.content_hash(),
+        )
+        .unwrap();
+        assert!(matches!(
+            normalize_metric_evidence(&mut vec![first, second], false),
+            Err(CvssValidationError::ConflictingEvidenceContentHash)
+        ));
+    }
+
+    #[test]
+    fn provenance_bounds_unique_overlay_scopes_after_normalization() {
+        let provenance = CvssAssessmentProvenance::try_new(
             "bifrost.cvss-v4".to_string(),
             Vec::new(),
-            vec![PolicyOverlayScope::AllFindings],
+            vec![PolicyOverlayScope::AllFindings; MAX_CVSS_OVERLAYS + 1],
             Vec::new(),
         )
-        .unwrap()
+        .unwrap();
+        assert_eq!(
+            provenance.overlay_scopes(),
+            &[PolicyOverlayScope::AllFindings]
+        );
+    }
+
+    #[test]
+    fn scored_and_unscored_assessments_normalize_deterministically() {
+        let base_metrics = [
+            CvssBaseMetric::Av,
+            CvssBaseMetric::Ac,
+            CvssBaseMetric::At,
+            CvssBaseMetric::Pr,
+            CvssBaseMetric::Ui,
+            CvssBaseMetric::Vc,
+            CvssBaseMetric::Vi,
+            CvssBaseMetric::Va,
+            CvssBaseMetric::Sc,
+            CvssBaseMetric::Si,
+            CvssBaseMetric::Sa,
+        ];
+        let metrics = base_metrics
+            .into_iter()
+            .rev()
+            .enumerate()
+            .map(|(index, metric)| metric_evidence(metric, u8::try_from(index + 1).unwrap()))
+            .collect();
+        let component = CvssComponentResult::try_new(
+            CvssNomenclature::B,
+            "CVSS:4.0/AV:N/AC:L/AT:N/PR:N/UI:N/VC:H/VI:H/VA:H/SC:H/SI:H/SA:H".to_string(),
+            10.0,
+            CvssSeverity::Critical,
+        )
+        .unwrap();
+        let assessment = CvssAssessment::scored(
+            CvssVersion::V4_0,
+            CvssNomenclature::B,
+            component.vector().to_string(),
+            vec![component],
+            metrics,
+            provenance(),
+        )
+        .unwrap();
+        let variant = CvssAssessmentVariant::try_new(
+            VulnerabilityIdentity::from_bytes([3; 32]),
+            Vec::new(),
+            false,
+            0,
+            SourceScenarioSetHash::from_bytes([4; 32]),
+            Vec::new(),
+            false,
+            assessment,
+        )
+        .unwrap();
+        let selected = variant.id();
+        let set = CvssAssessmentSet::try_new(vec![variant], Some(selected)).unwrap();
+        assert_eq!(set.variants().len(), 1);
+        assert_eq!(set.selection_rationale(), Some(SELECTED_VARIANT_RATIONALE));
+        assert_eq!(set.selected_severity(), Some(CvssSeverity::Critical));
+        let mut tampered = set.variants()[0].clone();
+        tampered.id = CvssAssessmentVariantId::from_bytes([99; 32]);
+        assert!(matches!(
+            tampered.validate(),
+            Err(CvssValidationError::NonCanonicalVariant)
+        ));
+
+        let unscored = CvssAssessment::unscored(
+            CvssVersion::V4_0,
+            Vec::new(),
+            vec![CvssBaseMetric::Sa, CvssBaseMetric::Av, CvssBaseMetric::Sa],
+            vec![CvssUnscoredReason::MissingBaseEvidence],
+            provenance(),
+        )
+        .unwrap();
+        let json = serde_json::to_value(&unscored).unwrap();
+        assert_eq!(json["type"], "unscored");
+        assert_eq!(json["missing_base_metrics"], json!(["AV", "SA"]));
+        let unscored_variant = CvssAssessmentVariant::try_new(
+            VulnerabilityIdentity::from_bytes([6; 32]),
+            Vec::new(),
+            false,
+            0,
+            SourceScenarioSetHash::from_bytes([7; 32]),
+            Vec::new(),
+            false,
+            unscored,
+        )
+        .unwrap();
+        let unscored_set = CvssAssessmentSet::try_new(vec![unscored_variant], None).unwrap();
+        assert_eq!(unscored_set.selected_severity(), None);
     }
 
     #[test]
@@ -1972,188 +2165,6 @@ mod tests {
             .into_iter()
             .map(serde_json::Value::from)
             .collect::<Vec<_>>()
-        );
-    }
-
-    #[test]
-    fn evidence_enforces_metric_value_basis_scope_and_provenance() {
-        let av = CvssMetric::Base {
-            metric: CvssBaseMetric::Av,
-        };
-        assert!(
-            CvssMetricEvidence::try_new(
-                av,
-                base_value(CvssBaseMetric::Ac),
-                CvssEvidenceBasis::PolicyAssertion,
-                vec![evidence_ref("proof")],
-                "reason".to_string(),
-                Vec::new(),
-                "tool".to_string(),
-                None,
-                CvssBaseMetric::Av.required_scope(),
-                CvssEvidenceContentHash::from_bytes([1; 32]),
-            )
-            .is_err()
-        );
-        assert!(
-            CvssMetricEvidence::try_new(
-                av,
-                base_value(CvssBaseMetric::Av),
-                CvssEvidenceBasis::ThreatFeed,
-                vec![evidence_ref("proof")],
-                "reason".to_string(),
-                Vec::new(),
-                "tool".to_string(),
-                None,
-                CvssBaseMetric::Av.required_scope(),
-                CvssEvidenceContentHash::from_bytes([1; 32]),
-            )
-            .is_err()
-        );
-
-        let first = metric_evidence(CvssBaseMetric::Av, 7);
-        let second = CvssMetricEvidence::try_new(
-            first.metric(),
-            first.value(),
-            first.basis(),
-            first.evidence_refs().to_vec(),
-            "A different fact cannot reuse the digest".to_string(),
-            first.assumptions().to_vec(),
-            first.assessor_or_tool().to_string(),
-            first.assessed_at().map(str::to_string),
-            first.system_scope(),
-            first.content_hash(),
-        )
-        .unwrap();
-        assert!(matches!(
-            normalize_metric_evidence(&mut vec![first, second], false),
-            Err(CvssValidationError::ConflictingEvidenceContentHash)
-        ));
-    }
-
-    #[test]
-    fn provenance_bounds_unique_overlay_scopes_after_normalization() {
-        let provenance = CvssAssessmentProvenance::try_new(
-            "bifrost.cvss-v4".to_string(),
-            Vec::new(),
-            vec![PolicyOverlayScope::AllFindings; MAX_CVSS_OVERLAYS + 1],
-            Vec::new(),
-        )
-        .unwrap();
-        assert_eq!(
-            provenance.overlay_scopes(),
-            &[PolicyOverlayScope::AllFindings]
-        );
-    }
-
-    #[test]
-    fn scored_and_unscored_assessments_normalize_deterministically() {
-        let base_metrics = [
-            CvssBaseMetric::Av,
-            CvssBaseMetric::Ac,
-            CvssBaseMetric::At,
-            CvssBaseMetric::Pr,
-            CvssBaseMetric::Ui,
-            CvssBaseMetric::Vc,
-            CvssBaseMetric::Vi,
-            CvssBaseMetric::Va,
-            CvssBaseMetric::Sc,
-            CvssBaseMetric::Si,
-            CvssBaseMetric::Sa,
-        ];
-        let metrics = base_metrics
-            .into_iter()
-            .rev()
-            .enumerate()
-            .map(|(index, metric)| metric_evidence(metric, u8::try_from(index + 1).unwrap()))
-            .collect();
-        let component = CvssComponentResult::try_new(
-            CvssNomenclature::B,
-            "CVSS:4.0/AV:N/AC:L/AT:N/PR:N/UI:N/VC:H/VI:H/VA:H/SC:H/SI:H/SA:H".to_string(),
-            10.0,
-            CvssSeverity::Critical,
-        )
-        .unwrap();
-        let assessment = CvssAssessment::scored(
-            CvssVersion::V4_0,
-            CvssNomenclature::B,
-            component.vector().to_string(),
-            vec![component],
-            metrics,
-            provenance(),
-        )
-        .unwrap();
-        let variant = CvssAssessmentVariant::try_new(
-            VulnerabilityIdentity::from_bytes([3; 32]),
-            Vec::new(),
-            false,
-            0,
-            SourceScenarioSetHash::from_bytes([4; 32]),
-            Vec::new(),
-            false,
-            assessment,
-        )
-        .unwrap();
-        let selected = variant.id();
-        let set = CvssAssessmentSet::try_new(vec![variant], Some(selected)).unwrap();
-        assert_eq!(set.variants().len(), 1);
-        assert_eq!(set.selection_rationale(), Some(SELECTED_VARIANT_RATIONALE));
-        assert_eq!(set.selected_severity(), Some(CvssSeverity::Critical));
-        let mut tampered = set.variants()[0].clone();
-        tampered.id = CvssAssessmentVariantId::from_bytes([99; 32]);
-        assert!(matches!(
-            tampered.validate(),
-            Err(CvssValidationError::NonCanonicalVariant)
-        ));
-
-        let unscored = CvssAssessment::unscored(
-            CvssVersion::V4_0,
-            Vec::new(),
-            vec![CvssBaseMetric::Sa, CvssBaseMetric::Av, CvssBaseMetric::Sa],
-            vec![CvssUnscoredReason::MissingBaseEvidence],
-            provenance(),
-        )
-        .unwrap();
-        let json = serde_json::to_value(&unscored).unwrap();
-        assert_eq!(json["type"], "unscored");
-        assert_eq!(json["missing_base_metrics"], json!(["AV", "SA"]));
-        let unscored_variant = CvssAssessmentVariant::try_new(
-            VulnerabilityIdentity::from_bytes([6; 32]),
-            Vec::new(),
-            false,
-            0,
-            SourceScenarioSetHash::from_bytes([7; 32]),
-            Vec::new(),
-            false,
-            unscored,
-        )
-        .unwrap();
-        let unscored_set = CvssAssessmentSet::try_new(vec![unscored_variant], None).unwrap();
-        assert_eq!(unscored_set.selected_severity(), None);
-    }
-
-    #[test]
-    fn component_score_severity_and_truncation_are_coherent() {
-        assert!(
-            CvssComponentResult::try_new(
-                CvssNomenclature::B,
-                "CVSS:4.0/AV:N".to_string(),
-                9.0,
-                CvssSeverity::High,
-            )
-            .is_err()
-        );
-        assert!(
-            CvssUnscoredReason::conflicting_metric_evidence(
-                CvssMetric::Base {
-                    metric: CvssBaseMetric::Av,
-                },
-                CvssEvidenceSetHash::from_bytes([1; 32]),
-                vec![evidence_ref("proof")],
-                true,
-                0,
-            )
-            .is_err()
         );
     }
 }

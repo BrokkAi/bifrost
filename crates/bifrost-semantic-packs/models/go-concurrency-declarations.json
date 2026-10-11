@@ -1,13 +1,13 @@
 {
   "schema_version": 2,
   "pack_id": "bifrost.go.concurrency-declarations",
-  "version": "1.0.0",
+  "version": "1.2.0",
   "producer": { "name": "bifrost", "version": "0.10.7" },
   "language": "go",
   "ecosystem": "go",
   "compatibility": { "bifrost": ">=0.10.7, <1.0.0", "toolchains": [] },
   "provenance": {
-    "source": "https://go.dev/src/context/, https://go.dev/src/sync/, https://go.dev/src/time/time.go (time.Time, time.Duration, time.Time.Sub, time.Now), https://go.dev/src/time/sleep.go (time.Timer, time.Timer.Stop, time.AfterFunc), and https://pkg.go.dev/golang.org/x/sync/errgroup",
+    "source": "https://go.dev/src/context/, https://go.dev/src/sync/, https://go.dev/src/time/time.go (time.Time, time.Duration, time.Time.Sub, time.Now), https://go.dev/src/time/sleep.go (time.Timer, time.Timer.Stop, time.Timer.Reset, time.AfterFunc, time.NewTimer), https://go.dev/src/time/tick.go (time.Ticker, time.NewTicker, time.Ticker.Stop, time.Ticker.Reset), and https://pkg.go.dev/golang.org/x/sync/errgroup",
     "revision": "go1.26.0;x-sync-v0.15.0"
   },
   "license": "BSD-3-Clause",
@@ -194,6 +194,152 @@
             "signature": { "type_parameters": [], "parameters": [] },
             "aliases": [],
             "locator": { "kind": "artifact", "path": "context/context.go", "symbol": "context.Context.Done" }
+          },
+          {
+            "id": "member.96a84ed297c62f1b862e11816765d645682eb33878b830ca61499d51f2f9f994",
+            "owner": "type.61971fc0466768ab56c2f2c4fa06968ec687f49427c0528f20ba1e5cf94eb397",
+            "name": "Background",
+            "member_kind": "function",
+            "visibility": "public",
+            "is_static": true,
+            "is_abstract": false,
+            "is_virtual": false,
+            "signature": {
+              "type_parameters": [],
+              "parameters": [],
+              "returns": {
+                "kind": "declared",
+                "id": "type.7c42ff1ed8f4a3e31ee44524dac120b89582c07a15deb268c9922cd07ee7b9a0",
+                "arguments": [],
+                "nullable": false
+              }
+            },
+            "aliases": [],
+            "locator": { "kind": "artifact", "path": "context/context.go", "symbol": "context.Background" }
+          },
+          {
+            "id": "member.9e708067ce54883765eaa72464f87680442535acc7dc4dad40b97d8b60286b9b",
+            "owner": "type.61971fc0466768ab56c2f2c4fa06968ec687f49427c0528f20ba1e5cf94eb397",
+            "name": "TODO",
+            "member_kind": "function",
+            "visibility": "public",
+            "is_static": true,
+            "is_abstract": false,
+            "is_virtual": false,
+            "signature": {
+              "type_parameters": [],
+              "parameters": [],
+              "returns": {
+                "kind": "declared",
+                "id": "type.7c42ff1ed8f4a3e31ee44524dac120b89582c07a15deb268c9922cd07ee7b9a0",
+                "arguments": [],
+                "nullable": false
+              }
+            },
+            "aliases": [],
+            "locator": { "kind": "artifact", "path": "context/context.go", "symbol": "context.TODO" }
+          },
+          {
+            "id": "member.2a28be67c4f05e2cd132d619203987de97886301f7a991389eba9f54ea41b6b5",
+            "owner": "type.61971fc0466768ab56c2f2c4fa06968ec687f49427c0528f20ba1e5cf94eb397",
+            "name": "WithCancel",
+            "member_kind": "function",
+            "visibility": "public",
+            "is_static": true,
+            "is_abstract": false,
+            "is_virtual": false,
+            "signature": {
+              "type_parameters": [],
+              "parameters": [
+                {
+                  "name": "parent",
+                  "type": { "kind": "declared", "id": "type.7c42ff1ed8f4a3e31ee44524dac120b89582c07a15deb268c9922cd07ee7b9a0", "arguments": [], "nullable": false },
+                  "optional": false,
+                  "variadic": false
+                }
+              ],
+              "returns": {
+                "kind": "tuple",
+                "elements": [
+                  { "kind": "declared", "id": "type.7c42ff1ed8f4a3e31ee44524dac120b89582c07a15deb268c9922cd07ee7b9a0", "arguments": [], "nullable": false },
+                  { "kind": "function", "parameters": [] }
+                ]
+              }
+            },
+            "aliases": [],
+            "locator": { "kind": "artifact", "path": "context/context.go", "symbol": "context.WithCancel" }
+          },
+          {
+            "id": "member.906c9eb57d8a30101a392f9d41d9f0cbb7bd427442b10f0aae8ccf1a1426e6f9",
+            "owner": "type.61971fc0466768ab56c2f2c4fa06968ec687f49427c0528f20ba1e5cf94eb397",
+            "name": "WithDeadline",
+            "member_kind": "function",
+            "visibility": "public",
+            "is_static": true,
+            "is_abstract": false,
+            "is_virtual": false,
+            "signature": {
+              "type_parameters": [],
+              "parameters": [
+                {
+                  "name": "parent",
+                  "type": { "kind": "declared", "id": "type.7c42ff1ed8f4a3e31ee44524dac120b89582c07a15deb268c9922cd07ee7b9a0", "arguments": [], "nullable": false },
+                  "optional": false,
+                  "variadic": false
+                },
+                {
+                  "name": "deadline",
+                  "type": { "kind": "declared", "id": "type.f5792b534655089a8504502abdf42fa2ef9ed01136f10cde59a3d9c689b237a9", "arguments": [], "nullable": false },
+                  "optional": false,
+                  "variadic": false
+                }
+              ],
+              "returns": {
+                "kind": "tuple",
+                "elements": [
+                  { "kind": "declared", "id": "type.7c42ff1ed8f4a3e31ee44524dac120b89582c07a15deb268c9922cd07ee7b9a0", "arguments": [], "nullable": false },
+                  { "kind": "function", "parameters": [] }
+                ]
+              }
+            },
+            "aliases": [],
+            "locator": { "kind": "artifact", "path": "context/context.go", "symbol": "context.WithDeadline" }
+          },
+          {
+            "id": "member.5a44e5be2bd5791f1532107d5f71ef9b8fbc740bce867f5646048afb103c9404",
+            "owner": "type.61971fc0466768ab56c2f2c4fa06968ec687f49427c0528f20ba1e5cf94eb397",
+            "name": "WithTimeout",
+            "member_kind": "function",
+            "visibility": "public",
+            "is_static": true,
+            "is_abstract": false,
+            "is_virtual": false,
+            "signature": {
+              "type_parameters": [],
+              "parameters": [
+                {
+                  "name": "parent",
+                  "type": { "kind": "declared", "id": "type.7c42ff1ed8f4a3e31ee44524dac120b89582c07a15deb268c9922cd07ee7b9a0", "arguments": [], "nullable": false },
+                  "optional": false,
+                  "variadic": false
+                },
+                {
+                  "name": "timeout",
+                  "type": { "kind": "declared", "id": "type.093f2445cc8f7389a5299fa7e7d70ae8fadd6fa2291af0d0b16069cc3433b19f", "arguments": [], "nullable": false },
+                  "optional": false,
+                  "variadic": false
+                }
+              ],
+              "returns": {
+                "kind": "tuple",
+                "elements": [
+                  { "kind": "declared", "id": "type.7c42ff1ed8f4a3e31ee44524dac120b89582c07a15deb268c9922cd07ee7b9a0", "arguments": [], "nullable": false },
+                  { "kind": "function", "parameters": [] }
+                ]
+              }
+            },
+            "aliases": [],
+            "locator": { "kind": "artifact", "path": "context/context.go", "symbol": "context.WithTimeout" }
           },
           {
             "id": "member.999637b0a4169337d8835796c8fa621e33cf6ea05a9c997ee0e294f7ce2d8d32",
@@ -654,6 +800,22 @@
             "locator": { "kind": "artifact", "path": "src/time/sleep.go", "symbol": "time.Timer" }
           },
           {
+            "id": "type.0c4f9c482347a51768e49e26ff6b4c5df0a1794de09a74bcd39abc34f4d66e2f",
+            "name": "time.Ticker",
+            "type_kind": "struct",
+            "visibility": "public",
+            "is_abstract": false,
+            "is_sealed": false,
+            "has_explicit_type_terms": false,
+            "type_parameters": [],
+            "type_parameter_constraints": [],
+            "embedded_types": [],
+            "hierarchy": [],
+            "aliases": [],
+            "extension_surfaces": [],
+            "locator": { "kind": "artifact", "path": "src/time/tick.go", "symbol": "time.Ticker" }
+          },
+          {
             "id": "type.0e5eb8274d8a136652db26087e21a5a350ee36c3b7d9c47f2ffca11ec56d98e0",
             "name": "time",
             "type_kind": "module",
@@ -775,6 +937,80 @@
             },
             "aliases": [],
             "locator": { "kind": "artifact", "path": "src/time/sleep.go", "symbol": "time.AfterFunc" }
+          },
+          {
+            "id": "member.2504ad0cfc795f8916cc986a0bbf0edea6ad7fe3bdf0c1305b79ece34cab4d55",
+            "owner": "type.0e5eb8274d8a136652db26087e21a5a350ee36c3b7d9c47f2ffca11ec56d98e0",
+            "name": "NewTimer",
+            "member_kind": "function",
+            "visibility": "public",
+            "is_static": true,
+            "is_abstract": false,
+            "is_virtual": false,
+            "signature": {
+              "type_parameters": [],
+              "parameters": [
+                { "name": "d", "type": { "kind": "declared", "id": "type.093f2445cc8f7389a5299fa7e7d70ae8fadd6fa2291af0d0b16069cc3433b19f", "arguments": [], "nullable": false }, "optional": false, "variadic": false }
+              ],
+              "returns": { "kind": "pointer", "element": { "kind": "declared", "id": "type.2fd0aa06a7ead591780725343ef0ad1392e76f63c7759ee4578483f9badf438f", "arguments": [], "nullable": false } }
+            },
+            "aliases": [],
+            "locator": { "kind": "artifact", "path": "src/time/sleep.go", "symbol": "time.NewTimer" }
+          },
+          {
+            "id": "member.3f16a4377a4b60d8937a36cca9ab84a9fb5fed30ddb74bbadfc37b8296f926c7",
+            "owner": "type.0e5eb8274d8a136652db26087e21a5a350ee36c3b7d9c47f2ffca11ec56d98e0",
+            "name": "NewTicker",
+            "member_kind": "function",
+            "visibility": "public",
+            "is_static": true,
+            "is_abstract": false,
+            "is_virtual": false,
+            "signature": {
+              "type_parameters": [],
+              "parameters": [
+                { "name": "d", "type": { "kind": "declared", "id": "type.093f2445cc8f7389a5299fa7e7d70ae8fadd6fa2291af0d0b16069cc3433b19f", "arguments": [], "nullable": false }, "optional": false, "variadic": false }
+              ],
+              "returns": { "kind": "pointer", "element": { "kind": "declared", "id": "type.0c4f9c482347a51768e49e26ff6b4c5df0a1794de09a74bcd39abc34f4d66e2f", "arguments": [], "nullable": false } }
+            },
+            "aliases": [],
+            "locator": { "kind": "artifact", "path": "src/time/tick.go", "symbol": "time.NewTicker" }
+          },
+          {
+            "id": "member.d2689f4c752616bb6cf473b7a5a731429bae0c2d06f5a391331030174d22bd26",
+            "owner": "type.0c4f9c482347a51768e49e26ff6b4c5df0a1794de09a74bcd39abc34f4d66e2f",
+            "name": "Stop",
+            "member_kind": "method",
+            "visibility": "public",
+            "is_static": false,
+            "is_abstract": false,
+            "is_virtual": false,
+            "signature": {
+              "type_parameters": [],
+              "parameters": []
+            },
+            "receiver": { "pointer": true },
+            "aliases": [],
+            "locator": { "kind": "artifact", "path": "src/time/tick.go", "symbol": "time.Ticker.Stop" }
+          },
+          {
+            "id": "member.a06a9771a50abe1fca57c103e210f5f8844f1d6e4873c83cd606bc83c7e0d1b4",
+            "owner": "type.0c4f9c482347a51768e49e26ff6b4c5df0a1794de09a74bcd39abc34f4d66e2f",
+            "name": "Reset",
+            "member_kind": "method",
+            "visibility": "public",
+            "is_static": false,
+            "is_abstract": false,
+            "is_virtual": false,
+            "signature": {
+              "type_parameters": [],
+              "parameters": [
+                { "name": "d", "type": { "kind": "declared", "id": "type.093f2445cc8f7389a5299fa7e7d70ae8fadd6fa2291af0d0b16069cc3433b19f", "arguments": [], "nullable": false }, "optional": false, "variadic": false }
+              ]
+            },
+            "receiver": { "pointer": true },
+            "aliases": [],
+            "locator": { "kind": "artifact", "path": "src/time/tick.go", "symbol": "time.Ticker.Reset" }
           }
         ],
         "relations": []

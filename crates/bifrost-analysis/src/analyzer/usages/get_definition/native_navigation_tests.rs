@@ -213,6 +213,9 @@ fn native_navigation_keeps_semantic_uncertainty_distinct_from_source_authority_f
 }
 
 #[test]
+#[brokk_bifrost_test_macros::hardwon(
+    "e19f76a305ff: unavailable navigation leaked unauthorized partial targets"
+)]
 fn unavailable_navigation_discards_definition_and_lexical_leftovers() {
     let source = "pub struct Target {}\nfn caller(parameter: Target) -> Target { parameter }\n";
     let (fixture, analyzer) = project(source);
@@ -257,6 +260,9 @@ fn unavailable_navigation_discards_definition_and_lexical_leftovers() {
 }
 
 #[test]
+#[brokk_bifrost_test_macros::hardwon(
+    "e19f76a305ff: C++ navigation failed to select the matching declaration body"
+)]
 fn cpp_navigation_selects_own_body_from_one_logical_symbol() {
     let fixture = InlineTestProject::with_language(Language::Cpp)
         .file("api.h", "int compute(int value);\n")
@@ -297,6 +303,9 @@ fn cpp_navigation_selects_own_body_from_one_logical_symbol() {
 }
 
 #[test]
+#[brokk_bifrost_test_macros::hardwon(
+    "e19f76a305ff: C++ bodiless overloads were lost beside defined overloads"
+)]
 fn cpp_navigation_keeps_bodiless_overload_beside_another_overloads_body() {
     let source = concat!(
         "#include MISSING_HEADER\n#include \"api.h\"\n",
@@ -345,6 +354,9 @@ fn cpp_navigation_keeps_bodiless_overload_beside_another_overloads_body() {
 }
 
 #[test]
+#[brokk_bifrost_test_macros::hardwon(
+    "e19f76a305ff: exhaustive C++ conditional definitions stayed ambiguous"
+)]
 fn cpp_navigation_selects_one_exhaustive_conditional_family_occurrence() {
     let fixture = InlineTestProject::with_language(Language::Cpp)
         .file(
@@ -396,6 +408,9 @@ fn cpp_navigation_selects_one_exhaustive_conditional_family_occurrence() {
 }
 
 #[test]
+#[brokk_bifrost_test_macros::hardwon(
+    "e19f76a305ff: non-virtual diamond ambiguity was erased in navigation"
+)]
 fn cpp_navigation_preserves_same_declaration_nonvirtual_base_ambiguity() {
     let source = concat!(
         "struct Base { void run() {} };\n",

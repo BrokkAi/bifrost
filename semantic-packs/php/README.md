@@ -1,5 +1,10 @@
 # PHP runtime semantic packs
 
+> Legacy transition copy: product pack authoring belongs in `bifrost-packs`
+> or the private premium pack repository. Follow [the placement policy](../../CONTRIBUTING.md#release-process).
+> Sources here are frozen pending verified v0.13.0 release and dependency migration.
+> The technical notes below describe retained contracts and test tooling.
+
 This directory pins the source inputs used to build Bifrost's published PHP
 builtin declaration pack. Generated manifests and shards are release assets;
 they are not checked into Git.

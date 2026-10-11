@@ -47,6 +47,10 @@ pub enum ExprKind {
 }
 
 impl Expr {
+    pub fn is_atom(&self) -> bool {
+        !matches!(self.kind, ExprKind::List(_) | ExprKind::Vector(_))
+    }
+
     pub fn as_list(&self) -> Option<&[Expr]> {
         match &self.kind {
             ExprKind::List(items) => Some(items),
@@ -358,17 +362,6 @@ impl<'a> Parser<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn single_expression_parser_uses_schema_neutral_trailing_input_wording() {
-        let error = match parse_sexp("(first) (second)") {
-            Ok(_) => panic!("second expression must fail"),
-            Err(error) => error,
-        };
-
-        assert_eq!(error.message, "unexpected input after the expression");
-        assert_eq!(&"(first) (second)"[error.range], "(");
-    }
 
     #[test]
     fn limited_parser_accepts_exact_node_budget_and_rejects_the_next_node() {

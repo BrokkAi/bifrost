@@ -1,22 +1,20 @@
 use super::artifact::{
-    ArtifactEncoding, ArtifactError, CompiledAtomicOperation, CompiledClassDecoratorIdentity,
-    CompiledClassDecoratorKeyword, CompiledConcurrencyEffect, CompiledCondWaiters,
-    CompiledConditionalIndirectWrite, CompiledConditionalResultRefinement, CompiledDeclaredEffect,
-    CompiledDeclaredEffectCertainty, CompiledDeclaredEffectTiming, CompiledIndirectWriteTarget,
-    CompiledLockCondition, CompiledLockMode, CompiledNormalReturnRefinement,
+    ArtifactEncoding, ArtifactError, CompiledClassDecoratorIdentity, CompiledClassDecoratorKeyword,
+    CompiledConditionalIndirectWrite, CompiledConditionalResultRefinement,
+    CompiledIndirectWriteTarget, CompiledNormalReturnRefinement,
     CompiledNormalReturnTypeRefinement, CompiledOperationPrecondition, CompiledPackManifest,
     CompiledPayload, CompiledPredicateProofEffect, CompiledProcedureSummary,
     CompiledProcedureTarget, CompiledResultContract, CompiledResultMemberContract,
-    CompiledResultPredicate, CompiledResultUseObligation, CompiledSemanticModelPack, CompiledShard,
-    CompiledShardArtifact, CompiledShardDescriptor, CompiledSummaryEffect, CompiledSummaryExitKind,
-    CompiledSummaryInput, CompiledSummaryLocation, CompiledSummaryLocationKind,
-    CompiledSummaryMoveInvalidation, CompiledSummaryOutput, CompiledSummaryTransfer,
-    CompiledSummaryValuePreservation, CompiledSummaryValueTransfer,
-    CompiledSummaryValueTransferKind, CompiledSummaryValueTransferLimitation,
-    CompiledSummaryValueTransferLimitationKind, CompiledSummaryValueTransferOperation,
-    CompiledSyncMapOperation, CompiledTaskSpawnCondition, DecodeLimits, canonical_json,
-    content_digest, manifest_content_digest, manifest_semantic_digest, routing_keys,
-    semantic_digest, shard_inventory, stored_digest,
+    CompiledResultUseObligation, CompiledReturnedCallable, CompiledSemanticModelPack,
+    CompiledShard, CompiledShardArtifact, CompiledShardDescriptor, CompiledSummaryExitKind,
+    CompiledSummaryLocation, CompiledSummaryLocationKind, CompiledSummaryTransfer, DecodeLimits,
+    canonical_json, content_digest, manifest_content_digest, manifest_semantic_digest,
+    routing_keys, semantic_digest, shard_inventory,
+};
+use super::conversion::{
+    compile_concurrency_effect, compile_declared_effect, compile_result_predicate,
+    compile_summary_effect, compile_summary_input, compile_summary_output,
+    compile_summary_value_transfer,
 };
 use super::model::*;
 use super::source::{SourceFormat, parse_source};
@@ -121,6 +119,7 @@ pub fn compile_pack(
             collection_flows: shard.collection_flows.clone(),
             deferred_yields: shard.deferred_yields.clone(),
             conditional_type_refinements: shard.conditional_type_refinements.clone(),
+            callable_values: shard.callable_values.clone(),
             cpp_portability: normalized.cpp_portability.clone(),
             python_correspondence: normalized.python_correspondence.clone(),
             payload: compile_payload(&normalized.pack_id, &shard.payload)
@@ -182,7 +181,7 @@ pub fn compile_pack(
             referenced_ids,
             semantic_sha256: semantic_digest(&compiled).map_err(artifact_diagnostic)?,
             content_sha256: content_digest(&raw),
-            stored_sha256: stored_digest(&bytes),
+            stored_sha256: content_digest(&bytes),
         };
         artifacts.push(CompiledShardArtifact { descriptor, bytes });
     }
@@ -248,6 +247,25 @@ fn compression_is_worthwhile(raw: usize, compressed: usize) -> bool {
         && compressed.saturating_mul(100) <= raw.saturating_mul(95)
 }
 
+/// Canonically orders callable-values records and their unordered members.
+/// Distinct facts and diagnostic alternatives are retained, even when their
+/// semantic payloads compare equal.
+pub fn normalize_callable_values_payload(payload: &mut CallableValuesPayload) {
+    for fact in &mut payload.facts {
+        fact.provenance.sort_unstable();
+    }
+    payload.facts.sort_by_cached_key(canonical_sort_key);
+
+    for coverage in &mut payload.coverage {
+        coverage.provenance.sort_unstable();
+        coverage.limitations.sort_by_cached_key(canonical_sort_key);
+    }
+    payload.coverage.sort_by_cached_key(canonical_sort_key);
+    payload
+        .anonymous_callables
+        .sort_by_cached_key(canonical_sort_key);
+}
+
 pub(crate) fn normalize(mut pack: AuthoredSemanticModelPack) -> AuthoredSemanticModelPack {
     pack.compatibility.toolchains.sort_by(|left, right| {
         (&left.name, &left.requirement).cmp(&(&right.name, &right.requirement))
@@ -308,6 +326,9 @@ pub(crate) fn normalize(mut pack: AuthoredSemanticModelPack) -> AuthoredSemantic
                 .yields
                 .sort_by_cached_key(canonical_sort_key);
             deferred_yields.yields.dedup();
+        }
+        if let Some(callable_values) = &mut shard.callable_values {
+            normalize_callable_values_payload(callable_values);
         }
         match &mut shard.payload {
             AuthoredPayload::DeclarationFacts {
@@ -464,7 +485,7 @@ fn hierarchy_sort_key(hierarchy: &HierarchyFact) -> Vec<u8> {
 }
 
 fn canonical_sort_key(value: &impl serde::Serialize) -> Vec<u8> {
-    serde_json::to_vec(value).expect("authoring model is JSON serializable")
+    super::compact_json_bytes(value).expect("authoring model is JSON serializable")
 }
 
 fn compile_payload(
@@ -509,6 +530,7 @@ fn compile_procedure_summary(
             has_receiver: summary.target.has_receiver,
             variadic: summary.target.variadic,
             parameter_count: summary.target.parameter_count,
+            formals: summary.target.formals.clone(),
         },
         completeness: summary.completeness,
         ordinary_heap_unchanged: summary.ordinary_heap_unchanged,
@@ -549,6 +571,19 @@ fn compile_procedure_summary(
             .concurrency_effects
             .iter()
             .map(compile_concurrency_effect)
+            .collect(),
+        returned_callables: summary
+            .returned_callables
+            .iter()
+            .map(|callable| CompiledReturnedCallable {
+                result_ordinal: callable.result_ordinal,
+                at_most_once: callable.at_most_once,
+                concurrency_effects: callable
+                    .concurrency_effects
+                    .iter()
+                    .map(compile_concurrency_effect)
+                    .collect(),
+            })
             .collect(),
         declared_effects: summary
             .declared_effects
@@ -672,328 +707,150 @@ fn compile_procedure_summary(
     })
 }
 
-fn compile_summary_value_transfer(transfer: &SummaryValueTransfer) -> CompiledSummaryValueTransfer {
-    CompiledSummaryValueTransfer {
-        kind: match transfer.kind {
-            SummaryValueTransferKind::Copy {} => CompiledSummaryValueTransferKind::Copy {},
-            SummaryValueTransferKind::AggregateCopy {} => {
-                CompiledSummaryValueTransferKind::AggregateCopy {}
-            }
-            SummaryValueTransferKind::Move { invalidation } => {
-                CompiledSummaryValueTransferKind::Move {
-                    invalidation: match invalidation {
-                        SummaryMoveInvalidation::Invalidated => {
-                            CompiledSummaryMoveInvalidation::Invalidated
-                        }
-                        SummaryMoveInvalidation::Unknown => {
-                            CompiledSummaryMoveInvalidation::Unknown
-                        }
+#[cfg(test)]
+mod callable_values_normalization_tests {
+    use super::*;
+    use crate::analyzer::semantic_model::csmi::{
+        CsmiCallableValuesArgument, CsmiCallableValuesDiagnostic, CsmiCallableValuesLimitation,
+        CsmiCallableValuesModality, CsmiCallableValuesPayload, CsmiCallableValuesShape,
+        CsmiCallableValuesTiming, CsmiCoverageStatus, CsmiInputBoundaryRoot, CsmiInputLocation,
+        CsmiInputParameterRoot, CsmiInputPhase, CsmiParameterRootRole,
+    };
+
+    fn input_location(position: u32) -> CsmiInputLocation {
+        CsmiInputLocation {
+            root: CsmiInputBoundaryRoot::Parameter(CsmiInputParameterRoot {
+                phase: CsmiInputPhase::Input,
+                role: CsmiParameterRootRole::Parameter,
+                position,
+            }),
+            projection: None,
+        }
+    }
+
+    fn callback_fact(message: &str, provenance: &[&str]) -> CallableValuesFact {
+        CallableValuesFact {
+            payload: CsmiCallableValuesPayload::CallbackInvocation {
+                callable: "callback".to_owned(),
+                callback: input_location(0),
+                shape: CsmiCallableValuesShape {
+                    parameters: 1,
+                    results: 0,
+                },
+                arguments: vec![CsmiCallableValuesArgument::Unknown {
+                    limitation: CsmiCallableValuesLimitation {
+                        kind: "other".to_owned(),
+                        diagnostic: Some(CsmiCallableValuesDiagnostic {
+                            message: message.to_owned(),
+                            code: Some("origin.unknown".to_owned()),
+                            details: Some(serde_json::json!({"source": message})),
+                        }),
                     },
-                }
-            }
-            SummaryValueTransferKind::Conversion { preservation } => {
-                CompiledSummaryValueTransferKind::Conversion {
-                    preservation: match preservation {
-                        SummaryValuePreservation::Identity => {
-                            CompiledSummaryValuePreservation::Identity
-                        }
-                        SummaryValuePreservation::Preserving => {
-                            CompiledSummaryValuePreservation::Preserving
-                        }
-                        SummaryValuePreservation::Changing => {
-                            CompiledSummaryValuePreservation::Changing
-                        }
-                        SummaryValuePreservation::Unknown => {
-                            CompiledSummaryValuePreservation::Unknown
-                        }
-                    },
-                }
-            }
-            SummaryValueTransferKind::Boxing {} => CompiledSummaryValueTransferKind::Boxing {},
-            SummaryValueTransferKind::Unboxing {} => CompiledSummaryValueTransferKind::Unboxing {},
-        },
-        operation: match &transfer.operation {
-            SummaryValueTransferOperation::None {} => {
-                CompiledSummaryValueTransferOperation::None {}
-            }
-            SummaryValueTransferOperation::Implicit { member } => {
-                CompiledSummaryValueTransferOperation::Implicit {
-                    member: member.clone(),
-                }
-            }
-            SummaryValueTransferOperation::Unknown { limitation } => {
-                CompiledSummaryValueTransferOperation::Unknown {
-                    limitation: CompiledSummaryValueTransferLimitation {
-                        kind: match limitation.kind {
-                            SummaryValueTransferLimitationKind::BudgetExhausted => {
-                                CompiledSummaryValueTransferLimitationKind::BudgetExhausted
-                            }
-                            SummaryValueTransferLimitationKind::Cancelled => {
-                                CompiledSummaryValueTransferLimitationKind::Cancelled
-                            }
-                            SummaryValueTransferLimitationKind::Unsupported => {
-                                CompiledSummaryValueTransferLimitationKind::Unsupported
-                            }
-                            SummaryValueTransferLimitationKind::UnresolvedIdentity => {
-                                CompiledSummaryValueTransferLimitationKind::UnresolvedIdentity
-                            }
-                            SummaryValueTransferLimitationKind::AmbiguousIdentity => {
-                                CompiledSummaryValueTransferLimitationKind::AmbiguousIdentity
-                            }
-                            SummaryValueTransferLimitationKind::IncompleteInput => {
-                                CompiledSummaryValueTransferLimitationKind::IncompleteInput
-                            }
-                            SummaryValueTransferLimitationKind::Other => {
-                                CompiledSummaryValueTransferLimitationKind::Other
-                            }
+                }],
+                timing: CsmiCallableValuesTiming::DuringCall,
+                modality: CsmiCallableValuesModality::May,
+            },
+            provenance: provenance.iter().map(|id| (*id).to_owned()).collect(),
+        }
+    }
+
+    fn coverage(code: &str, provenance: &[&str]) -> CallableValuesCoverage {
+        CallableValuesCoverage {
+            family: CallableValuesFamily::CallbackInvocations,
+            callable: "callback".to_owned(),
+            status: CsmiCoverageStatus::Partial,
+            limitations: vec![
+                crate::analyzer::semantic_model::csmi::CsmiLimitation {
+                    kind: format!("{code}-first"),
+                    diagnostic: Some(
+                        crate::analyzer::semantic_model::csmi::CsmiDiagnosticMetadata {
+                            code: Some(format!("{code}.first")),
+                            message: Some("first coverage explanation".to_owned()),
                         },
-                        message: limitation.message.clone(),
-                    },
-                }
-            }
-        },
-    }
-}
-
-fn compile_result_predicate(predicate: AuthoredResultPredicate) -> CompiledResultPredicate {
-    match predicate {
-        AuthoredResultPredicate::Null => CompiledResultPredicate::Null,
-        AuthoredResultPredicate::NonNull => CompiledResultPredicate::NonNull,
-        AuthoredResultPredicate::True => CompiledResultPredicate::True,
-        AuthoredResultPredicate::False => CompiledResultPredicate::False,
-    }
-}
-
-fn compile_declared_effect(effect: &AuthoredDeclaredEffect) -> CompiledDeclaredEffect {
-    CompiledDeclaredEffect {
-        id: effect.id.clone(),
-        timing: match effect.timing {
-            DeclaredEffectTiming::Immediate => CompiledDeclaredEffectTiming::Immediate,
-            DeclaredEffectTiming::Deferred => CompiledDeclaredEffectTiming::Deferred,
-            DeclaredEffectTiming::Unknown => CompiledDeclaredEffectTiming::Unknown,
-        },
-        certainty: match effect.certainty {
-            DeclaredEffectCertainty::Definite => CompiledDeclaredEffectCertainty::Definite,
-            DeclaredEffectCertainty::Possible => CompiledDeclaredEffectCertainty::Possible,
-        },
-    }
-}
-
-fn compile_summary_input(input: &AuthoredSummaryInput) -> CompiledSummaryInput {
-    match input {
-        AuthoredSummaryInput::Receiver {} => CompiledSummaryInput::Receiver {},
-        AuthoredSummaryInput::Parameter { ordinal } => {
-            CompiledSummaryInput::Parameter { ordinal: *ordinal }
-        }
-    }
-}
-
-fn compile_concurrency_effect(effect: &AuthoredConcurrencyEffect) -> CompiledConcurrencyEffect {
-    match effect {
-        AuthoredConcurrencyEffect::Unsupported { protocol } => {
-            CompiledConcurrencyEffect::Unsupported {
-                protocol: protocol.clone(),
-            }
-        }
-        AuthoredConcurrencyEffect::TaskSpawn {
-            callable,
-            group,
-            condition,
-            timer,
-        } => CompiledConcurrencyEffect::TaskSpawn {
-            callable: compile_summary_input(callable),
-            group: group.as_ref().map(compile_summary_input),
-            condition: condition.map(|condition| match condition {
-                AuthoredTaskSpawnCondition::CallResultTrue => {
-                    CompiledTaskSpawnCondition::CallResultTrue
-                }
-            }),
-            timer: timer.as_ref().map(compile_summary_output),
-        },
-        AuthoredConcurrencyEffect::TaskJoin { group } => CompiledConcurrencyEffect::TaskJoin {
-            group: compile_summary_input(group),
-        },
-        AuthoredConcurrencyEffect::OnceDo { once, callable } => CompiledConcurrencyEffect::OnceDo {
-            once: compile_summary_input(once),
-            callable: compile_summary_input(callable),
-        },
-        AuthoredConcurrencyEffect::LockAcquire {
-            lock,
-            mode,
-            condition,
-        } => CompiledConcurrencyEffect::LockAcquire {
-            lock: compile_summary_input(lock),
-            mode: match mode {
-                AuthoredLockMode::Shared => CompiledLockMode::Shared,
-                AuthoredLockMode::Exclusive => CompiledLockMode::Exclusive,
-            },
-            condition: condition.map(|condition| match condition {
-                AuthoredLockCondition::CallResultTrue => CompiledLockCondition::CallResultTrue,
-            }),
-        },
-        AuthoredConcurrencyEffect::LockRelease { lock, mode } => {
-            CompiledConcurrencyEffect::LockRelease {
-                lock: compile_summary_input(lock),
-                mode: match mode {
-                    AuthoredLockMode::Shared => CompiledLockMode::Shared,
-                    AuthoredLockMode::Exclusive => CompiledLockMode::Exclusive,
+                    ),
                 },
-            }
-        }
-        AuthoredConcurrencyEffect::WaitGroupAdd { group, delta } => {
-            CompiledConcurrencyEffect::WaitGroupAdd {
-                group: compile_summary_input(group),
-                delta: compile_summary_input(delta),
-            }
-        }
-        AuthoredConcurrencyEffect::WaitGroupDone { group } => {
-            CompiledConcurrencyEffect::WaitGroupDone {
-                group: compile_summary_input(group),
-            }
-        }
-        AuthoredConcurrencyEffect::WaitGroupWait { group } => {
-            CompiledConcurrencyEffect::WaitGroupWait {
-                group: compile_summary_input(group),
-            }
-        }
-        AuthoredConcurrencyEffect::Atomic {
-            location,
-            operation,
-        } => CompiledConcurrencyEffect::Atomic {
-            location: compile_summary_input(location),
-            operation: match operation {
-                AuthoredAtomicOperation::Load => CompiledAtomicOperation::Load,
-                AuthoredAtomicOperation::Store => CompiledAtomicOperation::Store,
-                AuthoredAtomicOperation::ReadModifyWrite => {
-                    CompiledAtomicOperation::ReadModifyWrite
-                }
-            },
-        },
-        AuthoredConcurrencyEffect::CondBind { condition, lock } => {
-            CompiledConcurrencyEffect::CondBind {
-                condition: compile_summary_output(condition),
-                lock: compile_summary_input(lock),
-            }
-        }
-        AuthoredConcurrencyEffect::CondWait { condition } => CompiledConcurrencyEffect::CondWait {
-            condition: compile_summary_input(condition),
-        },
-        AuthoredConcurrencyEffect::CondNotify { condition, waiters } => {
-            CompiledConcurrencyEffect::CondNotify {
-                condition: compile_summary_input(condition),
-                waiters: match waiters {
-                    AuthoredCondWaiters::One => CompiledCondWaiters::One,
-                    AuthoredCondWaiters::All => CompiledCondWaiters::All,
+                crate::analyzer::semantic_model::csmi::CsmiLimitation {
+                    kind: format!("{code}-second"),
+                    diagnostic: Some(
+                        crate::analyzer::semantic_model::csmi::CsmiDiagnosticMetadata {
+                            code: Some(format!("{code}.second")),
+                            message: Some("second coverage explanation".to_owned()),
+                        },
+                    ),
                 },
-            }
-        }
-        AuthoredConcurrencyEffect::SyncMap {
-            map,
-            key,
-            operation,
-        } => CompiledConcurrencyEffect::SyncMap {
-            map: compile_summary_input(map),
-            key: key.as_ref().map(compile_summary_input),
-            operation: match operation {
-                AuthoredSyncMapOperation::Store => CompiledSyncMapOperation::Store,
-                AuthoredSyncMapOperation::Delete => CompiledSyncMapOperation::Delete,
-                AuthoredSyncMapOperation::Clear => CompiledSyncMapOperation::Clear,
-                AuthoredSyncMapOperation::Load => CompiledSyncMapOperation::Load,
-                AuthoredSyncMapOperation::Range => CompiledSyncMapOperation::Range,
-                AuthoredSyncMapOperation::LoadOrStore => CompiledSyncMapOperation::LoadOrStore,
-                AuthoredSyncMapOperation::LoadAndDelete => CompiledSyncMapOperation::LoadAndDelete,
-                AuthoredSyncMapOperation::Swap => CompiledSyncMapOperation::Swap,
-                AuthoredSyncMapOperation::CompareAndSwap => {
-                    CompiledSyncMapOperation::CompareAndSwap
-                }
-                AuthoredSyncMapOperation::CompareAndDelete => {
-                    CompiledSyncMapOperation::CompareAndDelete
-                }
-            },
-        },
-        AuthoredConcurrencyEffect::TimerStop { timer } => CompiledConcurrencyEffect::TimerStop {
-            timer: compile_summary_input(timer),
-        },
-        AuthoredConcurrencyEffect::TimerReset { timer } => CompiledConcurrencyEffect::TimerReset {
-            timer: compile_summary_input(timer),
-        },
-        AuthoredConcurrencyEffect::SubtestRun { callable, group } => {
-            CompiledConcurrencyEffect::SubtestRun {
-                callable: compile_summary_input(callable),
-                group: compile_summary_input(group),
-            }
-        }
-        AuthoredConcurrencyEffect::SubtestParallel { receiver } => {
-            CompiledConcurrencyEffect::SubtestParallel {
-                receiver: compile_summary_input(receiver),
-            }
-        }
-        AuthoredConcurrencyEffect::SubtestCleanup { callable, group } => {
-            CompiledConcurrencyEffect::SubtestCleanup {
-                callable: compile_summary_input(callable),
-                group: compile_summary_input(group),
-            }
+            ],
+            provenance: provenance.iter().map(|id| (*id).to_owned()).collect(),
         }
     }
-}
 
-fn compile_summary_output(output: &AuthoredSummaryOutput) -> CompiledSummaryOutput {
-    match output {
-        AuthoredSummaryOutput::NormalReturn {} => CompiledSummaryOutput::NormalReturn {},
-        AuthoredSummaryOutput::IndexedNormalReturn { ordinal } => {
-            CompiledSummaryOutput::IndexedNormalReturn { ordinal: *ordinal }
-        }
-        AuthoredSummaryOutput::Receiver {} => CompiledSummaryOutput::Receiver {},
-        AuthoredSummaryOutput::Capture { location } => CompiledSummaryOutput::Capture {
-            location: location.clone(),
-        },
-        AuthoredSummaryOutput::Heap { location } => CompiledSummaryOutput::Heap {
-            location: location.clone(),
-        },
-        AuthoredSummaryOutput::ExceptionalReturn {} => CompiledSummaryOutput::ExceptionalReturn {},
-    }
-}
+    #[test]
+    fn callable_values_normalization_is_order_independent_and_preserves_alternatives() {
+        let first = callback_fact("alpha diagnostic", &["z", "a"]);
+        let second = callback_fact("beta diagnostic", &["y", "b"]);
+        let mut permuted_a_coverage = coverage("unknown.a", &["b", "y"]);
+        permuted_a_coverage.limitations.reverse();
+        let mut permuted_b_coverage = coverage("unknown.b", &["a", "z"]);
+        permuted_b_coverage.limitations.reverse();
+        let mut left = CallableValuesPayload {
+            facts: vec![first.clone(), second.clone(), first.clone()],
+            coverage: vec![
+                coverage("unknown.b", &["z", "a"]),
+                coverage("unknown.a", &["y", "b"]),
+            ],
+            anonymous_callables: Vec::new(),
+        };
+        let mut right = CallableValuesPayload {
+            facts: vec![second.clone(), first.clone(), first],
+            coverage: vec![permuted_a_coverage, permuted_b_coverage],
+            anonymous_callables: Vec::new(),
+        };
 
-fn compile_summary_effect(effect: &AuthoredSummaryEffect) -> CompiledSummaryEffect {
-    match effect {
-        AuthoredSummaryEffect::Allocation { event, output } => CompiledSummaryEffect::Allocation {
-            event: event.clone(),
-            output: compile_summary_output(output),
-        },
-        AuthoredSummaryEffect::Call { event, callee } => CompiledSummaryEffect::Call {
-            event: event.clone(),
-            callee: callee.clone(),
-        },
-        AuthoredSummaryEffect::Escape { event, input } => CompiledSummaryEffect::Escape {
-            event: event.clone(),
-            input: compile_summary_input(input),
-        },
-        AuthoredSummaryEffect::UnknownCall { event, input } => CompiledSummaryEffect::UnknownCall {
-            event: event.clone(),
-            input: compile_summary_input(input),
-        },
-        AuthoredSummaryEffect::UnknownCallBoundary { event } => {
-            CompiledSummaryEffect::UnknownCallBoundary {
-                event: event.clone(),
-            }
-        }
-        AuthoredSummaryEffect::AmbiguousCall {
-            event,
-            input,
-            candidates,
-        } => CompiledSummaryEffect::AmbiguousCall {
-            event: event.clone(),
-            input: compile_summary_input(input),
-            candidates: candidates.clone(),
-        },
-        AuthoredSummaryEffect::Sanitize {
-            input,
-            output,
-            removes,
-        } => CompiledSummaryEffect::Sanitize {
-            input: compile_summary_input(input),
-            output: compile_summary_output(output),
-            removes: removes.clone(),
-        },
+        normalize_callable_values_payload(&mut left);
+        normalize_callable_values_payload(&mut right);
+
+        assert_eq!(left, right);
+        assert_eq!(left.facts.len(), 3, "duplicate alternatives are retained");
+        assert_eq!(left.coverage.len(), 2);
+        assert!(
+            left.facts
+                .iter()
+                .all(|fact| fact.provenance.windows(2).all(|pair| pair[0] <= pair[1]))
+        );
+        assert!(
+            left.coverage
+                .iter()
+                .all(|item| item.provenance.windows(2).all(|pair| pair[0] <= pair[1]))
+        );
+        let diagnostics: Vec<_> = left
+            .facts
+            .iter()
+            .filter_map(|fact| match &fact.payload {
+                CsmiCallableValuesPayload::CallbackInvocation { arguments, .. } => {
+                    match &arguments[0] {
+                        CsmiCallableValuesArgument::Unknown { limitation } => {
+                            limitation.diagnostic.as_ref()
+                        }
+                        CsmiCallableValuesArgument::Input { .. } => None,
+                    }
+                }
+                CsmiCallableValuesPayload::ReturnedCallable { .. } => None,
+            })
+            .collect();
+        assert_eq!(diagnostics.len(), 3);
+        assert!(
+            diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.message == "alpha diagnostic")
+        );
+        assert!(
+            diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.message == "beta diagnostic")
+        );
+        assert!(
+            diagnostics
+                .iter()
+                .all(|diagnostic| diagnostic.details.is_some())
+        );
     }
 }

@@ -8,10 +8,10 @@
     {
       "path": "policies/contradictory-condition.rqlp",
       "id": "bifrost.correctness.contradictory-condition",
-      "authored_hash": "c4fdc7e9265957a72f9c246c1909ab96ecde0faf83b71c0f7b5443c3584d4a99",
-      "resolved_semantic_hash": "c4fdc7e9265957a72f9c246c1909ab96ecde0faf83b71c0f7b5443c3584d4a99",
+      "authored_hash": "f0a0b7d900c669e7c88ca343739781a291cfd25ab0431130d9961a513894b3e8",
+      "resolved_semantic_hash": "f0a0b7d900c669e7c88ca343739781a291cfd25ab0431130d9961a513894b3e8",
       "category": "correctness",
-      "supported_languages": ["java", "javascript", "typescript", "python", "go"],
+      "supported_languages": ["java", "javascript", "typescript", "python", "go", "csharp", "rust", "kotlin", "scala", "php", "ruby", "c", "cpp"],
       "required_capabilities": ["structural-match", "branch-relations", "semantic-guard-facts", "scalar-state"],
       "severity_rationale": "A proven constant condition outcome makes one conditional arm unreachable.",
       "remediation": "Review the scalar assumptions and intended branch test before changing the code; no automatic rewrite is supplied."
@@ -19,13 +19,13 @@
     {
       "path": "policies/discarded-pure-result.rqlp",
       "id": "bifrost.correctness.discarded-pure-result",
-      "authored_hash": "c8e561066136209b0b38f1278db2e084a0d0eb3f9ac3e77e1d6afdf992bcf3a1",
-      "resolved_semantic_hash": "c8e561066136209b0b38f1278db2e084a0d0eb3f9ac3e77e1d6afdf992bcf3a1",
+      "authored_hash": "ed7c1d9501c52f0d373e66eb0afb913f42fef0b4e3f6882169385304f8724231",
+      "resolved_semantic_hash": "ed7c1d9501c52f0d373e66eb0afb913f42fef0b4e3f6882169385304f8724231",
       "category": "correctness",
-      "supported_languages": ["java"],
-      "required_capabilities": ["normalized-call", "canonical-external-dispatch", "exact-result-use", "reviewed-jdk-result-obligation"],
-      "severity_rationale": "An exact JDK 21 String.trim() result is a pure transformed value and the caller discards it.",
-      "remediation": "Use or return the transformed value if intended; review why the call was made before removing it. No automatic fix is supplied."
+      "supported_languages": ["java", "python", "rust", "c", "cpp"],
+      "required_capabilities": ["normalized-call", "canonical-external-dispatch", "exact-result-use", "reviewed-jdk-result-obligation", "reviewed-python-builtin-result-obligation", "native-result-obligation"],
+      "severity_rationale": "An exact JDK 21 String.trim() result, a reviewed Python builtins.str transformation result, or a native must-use result is discarded by the caller.",
+      "remediation": "Use or return the transformed or must-use value if intended; review why the call was made before removing it. No automatic fix is supplied."
     },
     {
       "path": "policies/dynamic-evaluation.rqlp",
@@ -48,8 +48,8 @@
     {
       "path": "policies/identical-conditional-branches.rqlp",
       "id": "bifrost.correctness.identical-conditional-branches",
-      "authored_hash": "c7ef030a3929a4ca5877d5fc164d1abd27aee8e0e6a260d14d044c0ff115c2f0",
-      "resolved_semantic_hash": "c7ef030a3929a4ca5877d5fc164d1abd27aee8e0e6a260d14d044c0ff115c2f0",
+      "authored_hash": "28e3dee19cdd3b5ba0b43b219c44ccfdf76f15a50b8375b687eef75cc20d1617",
+      "resolved_semantic_hash": "28e3dee19cdd3b5ba0b43b219c44ccfdf76f15a50b8375b687eef75cc20d1617",
       "category": "correctness",
       "supported_languages": ["java", "javascript", "typescript", "python", "rust", "scala", "php", "ruby", "kotlin", "csharp", "go", "c", "cpp"],
       "required_capabilities": ["structural-match", "branch-relations", "lexical-environment"],
@@ -59,19 +59,19 @@
     {
       "path": "policies/ignored-status-result.rqlp",
       "id": "bifrost.correctness.ignored-status-result",
-      "authored_hash": "b5b653845c718f0881ed46ea0ee2a1a4bae35cbba97a766d4e893c55ad86c32b",
-      "resolved_semantic_hash": "b5b653845c718f0881ed46ea0ee2a1a4bae35cbba97a766d4e893c55ad86c32b",
+      "authored_hash": "9f6c57a43fc9585e0605241ccdf5195b3b2b4c34372907f436fa8ec1de1cb2ed",
+      "resolved_semantic_hash": "9f6c57a43fc9585e0605241ccdf5195b3b2b4c34372907f436fa8ec1de1cb2ed",
       "category": "correctness",
-      "supported_languages": ["java"],
-      "required_capabilities": ["normalized-call", "canonical-external-dispatch", "exact-result-use", "reviewed-jdk-result-obligation"],
-      "severity_rationale": "An exact JDK 21 Files.deleteIfExists(Path) call returns a status indicating whether a file was deleted; a proved expression-statement, for-header or void-functional use discards it.",
-      "remediation": "Handle or deliberately ignore the status according to the caller's intent. I/O exceptions are separate; no automatic fix is supplied."
+      "supported_languages": ["java", "go", "rust"],
+      "required_capabilities": ["normalized-call", "canonical-external-dispatch", "exact-result-use", "reviewed-jdk-result-obligation", "native-result-obligation"],
+      "severity_rationale": "An exact JDK 21 Files.deleteIfExists(Path) status or a native Go error result is discarded by a proved result-use relation.",
+      "remediation": "Handle or deliberately ignore the fallible result according to the caller's intent. I/O exceptions are separate; no automatic fix is supplied."
     },
     {
       "path": "policies/repeated-branch-condition.rqlp",
       "id": "bifrost.correctness.repeated-branch-condition",
-      "authored_hash": "196d53ca6944990559881637d53e6038bc274ed13d44c85ce7d5e071c90a1b1a",
-      "resolved_semantic_hash": "196d53ca6944990559881637d53e6038bc274ed13d44c85ce7d5e071c90a1b1a",
+      "authored_hash": "66da6dbbf639a745011d67a0dc7cd3ad449694b86f03624ab04e80049716de9f",
+      "resolved_semantic_hash": "66da6dbbf639a745011d67a0dc7cd3ad449694b86f03624ab04e80049716de9f",
       "category": "correctness",
       "supported_languages": ["java", "javascript", "typescript", "python", "rust", "scala", "php", "ruby", "kotlin", "csharp", "go", "c", "cpp"],
       "required_capabilities": ["structural-match", "branch-relations", "lexical-environment"],
@@ -81,8 +81,8 @@
     {
       "path": "policies/redundant-boolean-branches.rqlp",
       "id": "bifrost.correctness.redundant-boolean-branches",
-      "authored_hash": "8fb9beeb952ee58cfe38f1d65ceaeaeb6175ee92a3305fb09a42b96e813d7f2a",
-      "resolved_semantic_hash": "8fb9beeb952ee58cfe38f1d65ceaeaeb6175ee92a3305fb09a42b96e813d7f2a",
+      "authored_hash": "960d5ff006eadb39d6128c71d3e7cbc28444a309c312a63134b8649c3aef4b6e",
+      "resolved_semantic_hash": "960d5ff006eadb39d6128c71d3e7cbc28444a309c312a63134b8649c3aef4b6e",
       "category": "correctness",
       "supported_languages": ["java", "javascript", "typescript", "python", "rust", "scala", "php", "ruby", "csharp", "kotlin", "go", "c", "cpp"],
       "required_capabilities": ["structural-match", "branch-relations"],
@@ -123,8 +123,8 @@
     {
       "path": "policies/python-absent-member-conditional.rqlp",
       "id": "bifrost.correctness.python-absent-member-conditional",
-      "authored_hash": "9852a7e38bc9887448eb3616f81f8eba4cb8ddafc972a6235f217008796fe81e",
-      "resolved_semantic_hash": "9852a7e38bc9887448eb3616f81f8eba4cb8ddafc972a6235f217008796fe81e",
+      "authored_hash": "94746a09f80eca2aa2590311ce16695d0aeb6ef2d71fa25777cd0499d2002390",
+      "resolved_semantic_hash": "94746a09f80eca2aa2590311ce16695d0aeb6ef2d71fa25777cd0499d2002390",
       "category": "correctness",
       "supported_languages": ["python"],
       "required_capabilities": [
@@ -132,28 +132,8 @@
         "python-declaration-models",
         "absent-member"
       ],
-      "severity_rationale": "A class certainly reaches this access and its complete member surface lacks the member, so the access fails whenever that class arrives; other receivers remain unclassified, so the failure is conditional rather than proven for every run.",
+      "severity_rationale": "A class certainly reaches this access and lacks the member, but other receivers may remain unclassified or a listed global write with no receiver bound and an Any name set may install it; a declared parameter qualifies only for one annotated workspace class with a closed hierarchy, so each finding states its remaining premise.",
       "remediation": "Check whether the stated input can reach the access. If it can, handle that class before the access or correct the member name. Inspect the class origin, the listed remainders, and the retained witness before changing the caller."
-    },
-    {
-      "path": "policies/go-data-race.rqlp",
-      "id": "bifrost.correctness.go-data-race",
-      "authored_hash": "4e2a3cc7715440600870e968765ec8b8b503b43f13c84845ecc0d78e4e79636f",
-      "resolved_semantic_hash": "4e2a3cc7715440600870e968765ec8b8b503b43f13c84845ecc0d78e4e79636f",
-      "category": "correctness",
-      "supported_languages": [
-        "go"
-      ],
-      "required_capabilities": [
-        "structural-match",
-        "normalized-concurrent-spawn",
-        "concurrent-access-conflicts",
-        "canonical-workspace-dispatch",
-        "heap-location-identity",
-        "reviewed-concurrency-models"
-      ],
-      "severity_rationale": "Two exact conflicting accesses without ordering or compatible protection violate Go's data-race-free execution contract and can produce undefined program behavior.",
-      "remediation": "Order the accesses with a channel or completed task group, protect both accesses with the same compatible mutex, use an appropriate atomic operation consistently, or stop sharing the location."
     },
     {
       "path": "policies/go-nil-dereference.rqlp",
@@ -201,10 +181,10 @@
     {
       "path": "policies/empty-failure-handler.rqlp",
       "id": "bifrost.correctness.empty-failure-handler",
-      "authored_hash": "04aac31ec8e97ff376eeea39adf87da668503b5657452b5747fd808fd65dd1eb",
-      "resolved_semantic_hash": "04aac31ec8e97ff376eeea39adf87da668503b5657452b5747fd808fd65dd1eb",
+      "authored_hash": "a8964bf111ac90cd0e0b49bcc1785d1ed1e71823c302363577e5ec472245b26f",
+      "resolved_semantic_hash": "a8964bf111ac90cd0e0b49bcc1785d1ed1e71823c302363577e5ec472245b26f",
       "category": "correctness",
-      "supported_languages": ["java", "javascript", "typescript", "python", "csharp", "php", "cpp", "kotlin", "ruby"],
+      "supported_languages": ["java", "javascript", "typescript", "python", "csharp", "php", "cpp", "kotlin", "scala", "ruby", "rust", "go"],
       "required_capabilities": ["structural-match", "prepared-syntax", "failure-handler-state"],
       "severity_rationale": "An empty catch or except body may silently discard failures when the handler is reached; this rule reports the structural body regardless of reachability.",
       "remediation": "Review whether to handle or propagate the exception deliberately. No automatic fix is supplied."
@@ -212,12 +192,10 @@
     {
       "path": "policies/c-self-assignment.rqlp",
       "id": "bifrost.correctness.c-self-assignment",
-      "authored_hash": "613655d61b87df1aa17143ae1d8b1c4f2138300fa20d17fe09fa221bcc1b7dc9",
-      "resolved_semantic_hash": "613655d61b87df1aa17143ae1d8b1c4f2138300fa20d17fe09fa221bcc1b7dc9",
+      "authored_hash": "028caa36639b0da2c59d39507e2aa5746c2e469dec1f59d441d125d4e27ad1d5",
+      "resolved_semantic_hash": "028caa36639b0da2c59d39507e2aa5746c2e469dec1f59d441d125d4e27ad1d5",
       "category": "correctness",
-      "supported_languages": [
-        "c"
-      ],
+      "supported_languages": ["c"],
       "required_capabilities": [
         "prepared-c-syntax",
         "assignment-relations",
@@ -230,10 +208,10 @@
     {
       "path": "policies/local-self-assignment.rqlp",
       "id": "bifrost.correctness.local-self-assignment",
-      "authored_hash": "be6743acb277dd8b7451ab1144ab0ce32e99f1e0f6e54682e09356103d62adb8",
-      "resolved_semantic_hash": "be6743acb277dd8b7451ab1144ab0ce32e99f1e0f6e54682e09356103d62adb8",
+      "authored_hash": "9329fed1d9dc86659dd83ad73f45fff6eb0b3ced681f367cfd5ee71eff2886a0",
+      "resolved_semantic_hash": "9329fed1d9dc86659dd83ad73f45fff6eb0b3ced681f367cfd5ee71eff2886a0",
       "category": "correctness",
-      "supported_languages": ["java", "javascript", "typescript", "python", "csharp", "kotlin", "go", "rust"],
+      "supported_languages": ["java", "javascript", "typescript", "python", "csharp", "kotlin", "go", "rust", "scala", "php", "ruby", "c", "cpp"],
       "required_capabilities": ["prepared-syntax", "assignment-relations", "reaching-definitions", "same-evaluation"],
       "severity_rationale": "Writing an initialized ordinary local back to the same binding is usually an accidental no-op.",
       "remediation": "Remove the assignment or use the intended source or target binding."
@@ -241,10 +219,10 @@
     {
       "path": "policies/failed-swap.rqlp",
       "id": "bifrost.correctness.failed-swap",
-      "authored_hash": "f0cb96dfd96d5a7a1689611a3f032afdbbcdeb3b62d6c2cc6c67e4571ac2b0e7",
-      "resolved_semantic_hash": "f0cb96dfd96d5a7a1689611a3f032afdbbcdeb3b62d6c2cc6c67e4571ac2b0e7",
+      "authored_hash": "4c518f9628234cf1f163a7abb48b8704e8c81f8e355090f763b004ede194b778",
+      "resolved_semantic_hash": "4c518f9628234cf1f163a7abb48b8704e8c81f8e355090f763b004ede194b778",
       "category": "correctness",
-      "supported_languages": ["java", "javascript", "typescript", "python", "csharp", "kotlin", "go", "rust"],
+      "supported_languages": ["java", "javascript", "typescript", "python", "csharp", "kotlin", "go", "rust", "scala", "php", "ruby", "c", "cpp"],
       "required_capabilities": ["prepared-syntax", "assignment-relations", "reaching-definitions", "same-evaluation"],
       "severity_rationale": "Adjacent crossed writes copy the first assigned value back into the second local, suggesting a failed swap.",
       "remediation": "Review the intended operation; if a swap was intended, preserve the original value in a temporary or use the language's simultaneous assignment."
@@ -252,10 +230,10 @@
     {
       "path": "policies/overwritten-unread-value.rqlp",
       "id": "bifrost.correctness.overwritten-unread-value",
-      "authored_hash": "3ceb1580efd2f9cb7b71646b8043a239390ff9b7f7db654d264df1ee79d0ed26",
-      "resolved_semantic_hash": "3ceb1580efd2f9cb7b71646b8043a239390ff9b7f7db654d264df1ee79d0ed26",
+      "authored_hash": "93708f01e548678513737fb8e2d2bac9ab51cfdebb9cd98b3afcb2956eec169f",
+      "resolved_semantic_hash": "93708f01e548678513737fb8e2d2bac9ab51cfdebb9cd98b3afcb2956eec169f",
       "category": "correctness",
-      "supported_languages": ["java", "javascript", "typescript", "python", "go", "csharp", "kotlin", "rust"],
+      "supported_languages": ["java", "javascript", "typescript", "python", "go", "csharp", "kotlin", "rust", "scala", "php", "ruby", "c", "cpp"],
       "required_capabilities": ["prepared-syntax", "assignment-relations", "reaching-definitions"],
       "severity_rationale": "An exact ordinary local value is replaced on every modeled continuation before any read, so its original value is unused.",
       "remediation": "Review the original assignment and its right-hand-side effects before changing it."
@@ -263,23 +241,23 @@
     {
       "path": "policies/loop-body-never-repeats.rqlp",
       "id": "bifrost.correctness.loop-body-never-repeats",
-      "authored_hash": "49b53237d6a329fd4631cdc6f215ac28d64772a25f219b3a321e0eedd5607f2d",
-      "resolved_semantic_hash": "49b53237d6a329fd4631cdc6f215ac28d64772a25f219b3a321e0eedd5607f2d",
+      "authored_hash": "288974628ee39c301ee3ecf22b931dc38d86b5f02662560245dea87ae4394817",
+      "resolved_semantic_hash": "288974628ee39c301ee3ecf22b931dc38d86b5f02662560245dea87ae4394817",
       "category": "correctness",
-      "supported_languages": ["java", "javascript", "typescript", "python", "csharp", "kotlin", "go", "rust", "php"],
+      "supported_languages": ["java", "javascript", "typescript", "python", "csharp", "kotlin", "go", "rust", "php", "scala", "ruby", "c", "cpp"],
       "required_capabilities": ["prepared-syntax", "loop-relations", "semantic-control-flow"],
-      "severity_rationale": "A reachable Java loop body cannot reach the same loop's repeat edge on any modeled continuation.",
+      "severity_rationale": "A reachable loop body cannot reach the same loop's repeat edge on any modeled continuation.",
       "remediation": "Review the early exits and whether a loop is intended; no automatic rewrite is supplied."
     },
     {
       "path": "policies/unreachable-statement.rqlp",
       "id": "bifrost.correctness.unreachable-statement",
-      "authored_hash": "039716e1ab124f213971bf511df721e002ed351bf7c0641083370be5409d51cb",
-      "resolved_semantic_hash": "039716e1ab124f213971bf511df721e002ed351bf7c0641083370be5409d51cb",
+      "authored_hash": "d92240ee27f089971fd44b9210ea00bf40ecd549e02ef8d7fd48bc10012f4246",
+      "resolved_semantic_hash": "d92240ee27f089971fd44b9210ea00bf40ecd549e02ef8d7fd48bc10012f4246",
       "category": "correctness",
-      "supported_languages": ["java", "javascript", "typescript", "python", "csharp", "kotlin", "go", "rust", "php"],
+      "supported_languages": ["java", "javascript", "typescript", "python", "csharp", "kotlin", "go", "rust", "php", "scala", "ruby", "c", "cpp"],
       "required_capabilities": ["prepared-syntax", "statement-reachability", "semantic-control-flow"],
-      "severity_rationale": "All producer-authored entries to an exact Java statement are outside complete entry reachability.",
+      "severity_rationale": "All producer-authored entries to an exact statement are outside complete entry reachability.",
       "remediation": "Review the preceding control flow and the intended statement before removing unreachable code."
     },
     {

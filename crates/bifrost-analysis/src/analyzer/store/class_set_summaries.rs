@@ -6,7 +6,7 @@
 //! constrained columns.
 
 use rusqlite::{OptionalExtension, TransactionBehavior, params};
-use sha2::{Digest, Sha256};
+use sha2::Sha256;
 use std::sync::LazyLock;
 
 use super::read_keys::{ReadKeyColumns, decode_read_key};
@@ -695,22 +695,19 @@ fn require_flow_source(source: &ClassSetSummaryFactSourceRow) -> Result<()> {
 struct CanonicalDigest(Sha256);
 impl CanonicalDigest {
     fn new(domain: &[u8]) -> Self {
-        let mut value = Self(Sha256::new());
-        value.bytes(domain);
-        value
+        Self(super::new_sha256_with_length_prefixed_domain(domain))
     }
     fn bytes(&mut self, bytes: &[u8]) {
-        self.0.update((bytes.len() as u64).to_le_bytes());
-        self.0.update(bytes);
+        super::update_sha256_with_length_prefix(&mut self.0, bytes);
     }
     fn text(&mut self, text: &str) {
-        self.bytes(text.as_bytes());
+        super::update_sha256_with_length_prefixed_text(&mut self.0, text);
     }
     fn tag(&mut self, value: u8) {
-        self.bytes(&[value]);
+        super::update_sha256_with_length_prefixed_byte(&mut self.0, value);
     }
     fn u64(&mut self, value: u64) {
-        self.bytes(&value.to_le_bytes());
+        super::update_sha256_with_length_prefixed_u64(&mut self.0, value);
     }
     fn source(&mut self, source: &ClassSetSummaryFactSourceRow) {
         match source {
@@ -748,7 +745,7 @@ impl CanonicalDigest {
         }
     }
     fn finish(self) -> [u8; 32] {
-        self.0.finalize().into()
+        brokk_bifrost_core::analyzer::canonical_hash::finish_sha256(self.0)
     }
 }
 
@@ -1142,23 +1139,13 @@ fn validate_summary_for_publication(
 
 fn live_owner_blob_id(conn: &rusqlite::Connection, summary: &ClassSetSummaryRow) -> Result<i64> {
     let lang = summary.header.attachment.language.config_label();
-    conn.query_row(
-        &format!(
-            "SELECT meta.blob_id FROM blob_meta AS meta
-             JOIN blobs ON blobs.id = meta.blob_id
-             WHERE blobs.blob_oid = ?1 AND blobs.lang = ?2
-               AND {PARSED_BLOB_COMPLETE_CONDITION}"
-        ),
-        params![&summary.header.attachment.blob_oid, lang],
-        |row| row.get::<_, i64>(0),
-    )
-    .optional()?
-    .ok_or_else(|| {
-        StoreError::new(format!(
-            "class-set summary owner blob {}/{} is absent",
-            summary.header.attachment.blob_oid, lang
-        ))
-    })
+    super::live_class_set_owner_blob_id(conn, &summary.header.attachment.blob_oid, lang)?
+        .ok_or_else(|| {
+            StoreError::new(format!(
+                "class-set summary owner blob {}/{} is absent",
+                summary.header.attachment.blob_oid, lang
+            ))
+        })
 }
 
 fn validate_root_surface(conn: &rusqlite::Connection, summary: &ClassSetSummaryRow) -> Result<()> {
@@ -1207,20 +1194,12 @@ fn validate_root_surface(conn: &rusqlite::Connection, summary: &ClassSetSummaryR
 }
 
 fn ensure_not_cancelled(cancellation: &CancellationToken) -> Result<()> {
-    if cancellation.is_cancelled() {
-        Err(StoreError::new("class-set summary publication cancelled"))
-    } else {
-        Ok(())
-    }
+    super::ensure_store_not_cancelled(cancellation, "class-set summary publication cancelled")
 }
 
 fn digest(bytes: Vec<u8>, field: &str) -> Result<[u8; 32]> {
-    bytes.try_into().map_err(|bytes: Vec<u8>| {
-        StoreError::new(format!(
-            "class-set summary {field} has {} bytes",
-            bytes.len()
-        ))
-    })
+    super::checked_fixed_digest(bytes)
+        .map_err(|length| StoreError::new(format!("class-set summary {field} has {length} bytes")))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1873,6 +1852,10 @@ mod tests {
     use crate::analyzer::read_ledger::{LookupKind, LookupQuestion, ProcedureCallSiteLocator};
     use crate::analyzer::semantic::ids::StableDigest;
     use crate::analyzer::store::planner_statistics::tests::{explain_pin, pinned};
+    use crate::analyzer::store::test_adapters::{
+        ephemeral_store_with_complete_python_blob, insert_complete_python_blob,
+        stored_blob_cascade_costs,
+    };
     use brokk_bifrost_core::cache_gc::PlannerStatisticsState;
 
     const BLOB: &str = "1111111111111111111111111111111111111111";
@@ -1882,35 +1865,8 @@ mod tests {
         [value; 32]
     }
 
-    fn insert_complete_blob(store: &AnalyzerStore, oid: &str, generation: i64) {
-        let conn = store.conn.lock().unwrap();
-        conn.execute(
-            "INSERT INTO blobs(blob_oid, lang, generation) VALUES(?1, 'python', ?2)",
-            params![oid, generation],
-        )
-        .unwrap();
-        conn.execute(
-            "INSERT INTO blob_meta(
-               blob_id, lang, contains_tests, content_package, stored_unit_count,
-               range_count, signature_count, signature_metadata_count, supertype_count,
-               child_count, import_statement_count, type_identifier_count, is_complete
-             )
-             SELECT id, lang, 0, '', 0, 0, 0, 0, 0, 0, 0, 0, 1
-             FROM blobs WHERE blob_oid = ?1 AND lang = 'python'",
-            params![oid],
-        )
-        .unwrap();
-        conn.execute(
-            "INSERT INTO blob_payload_costs(blob_id, payload_bytes)
-             SELECT id, 0 FROM blobs WHERE blob_oid = ?1 AND lang = 'python'",
-            params![oid],
-        )
-        .unwrap();
-    }
-
     fn store_with_blob() -> AnalyzerStore {
-        let store = AnalyzerStore::open_ephemeral().unwrap();
-        insert_complete_blob(&store, BLOB, 0);
+        let store = ephemeral_store_with_complete_python_blob(BLOB, 0);
         store
             .publish_class_set_procedure_surface(root_surface(), &CancellationToken::new())
             .unwrap();
@@ -2114,23 +2070,29 @@ mod tests {
     }
 
     fn replacement_row() -> ClassSetSummaryRow {
-        let mut replacement = row(1);
-        replacement.header.dependency_digest = digest_byte(81);
+        let mut replacement = replacement_with_dependency_evidence(81, 82, 83);
         replacement.reached[0].point_id = 8;
-        replacement.dependencies[0].expected_output_digest =
-            ClassSetSummaryOutputDigest::new(digest_byte(82));
-        replacement.dependencies[0].consumed_child_lookup_digest = digest_byte(83);
         replacement.content_digest = replacement.canonical_content_digest();
         replacement
     }
 
     fn evidence_only_replacement_row() -> ClassSetSummaryRow {
-        let mut replacement = row(1);
-        replacement.header.dependency_digest = digest_byte(91);
-        replacement.dependencies[0].expected_output_digest =
-            ClassSetSummaryOutputDigest::new(digest_byte(92));
-        replacement.dependencies[0].consumed_child_lookup_digest = digest_byte(93);
+        let mut replacement = replacement_with_dependency_evidence(91, 92, 93);
         replacement.content_digest = replacement.canonical_content_digest();
+        replacement
+    }
+
+    fn replacement_with_dependency_evidence(
+        dependency_digest: u8,
+        expected_output_digest: u8,
+        consumed_child_lookup_digest: u8,
+    ) -> ClassSetSummaryRow {
+        let mut replacement = row(1);
+        replacement.header.dependency_digest = digest_byte(dependency_digest);
+        replacement.dependencies[0].expected_output_digest =
+            ClassSetSummaryOutputDigest::new(digest_byte(expected_output_digest));
+        replacement.dependencies[0].consumed_child_lookup_digest =
+            digest_byte(consumed_child_lookup_digest);
         replacement
     }
 
@@ -2242,17 +2204,6 @@ mod tests {
                 summary.output_digest()
             );
         }
-    }
-
-    #[test]
-    fn relation_only_output_digest_rejects_an_absent_fact_reference() {
-        let summary = row(1);
-        let mut exits = summary.exits.clone();
-        exits[0].fact_ordinal = 99;
-
-        let error =
-            class_set_summary_output_digest(&summary.facts, &exits, &summary.reached).unwrap_err();
-        assert!(error.to_string().contains("absent fact 99"), "{error}");
     }
 
     #[test]
@@ -2761,7 +2712,7 @@ mod tests {
             None
         );
 
-        insert_complete_blob(&store, REPLACEMENT_BLOB, 1);
+        insert_complete_python_blob(&store, REPLACEMENT_BLOB, 1);
         let prior_surface = root_surface();
         let mut refreshed_surface_header = prior_surface.header.clone();
         refreshed_surface_header.owner_blob_oid = REPLACEMENT_BLOB.to_string();
@@ -2838,13 +2789,7 @@ mod tests {
     }
 
     fn stored_cascade_cost(store: &AnalyzerStore, oid: &str) -> (usize, usize) {
-        let conn = store.conn.lock().unwrap();
-        conn.query_row(
-            &super::super::stored_blob_cascade_costs_sql(1),
-            params![oid, "python"],
-            |row| Ok((row.get(3)?, row.get::<_, Option<usize>>(4)?.unwrap())),
-        )
-        .unwrap()
+        stored_blob_cascade_costs(store, oid)
     }
 
     #[test]
@@ -2906,35 +2851,6 @@ mod tests {
                 !detail.contains("SCAN summary_cost") && !detail.contains("SCAN child_cost")
             }),
             "{state}: {plan:#?}"
-        );
-    }
-
-    #[test]
-    fn deleting_the_owner_blob_cascades_the_whole_summary() {
-        let store = store_with_blob();
-        let original = row(1);
-        store
-            .publish_class_set_summary(original.clone(), &CancellationToken::new())
-            .unwrap();
-        store
-            .replace_class_set_summary(
-                *original.content_digest(),
-                replacement_row(),
-                &CancellationToken::new(),
-            )
-            .unwrap();
-        store
-            .conn
-            .lock()
-            .unwrap()
-            .execute(
-                "DELETE FROM blobs WHERE blob_oid = ?1 AND lang = 'python'",
-                params![BLOB],
-            )
-            .unwrap();
-        assert_eq!(
-            store.class_set_summary_for_digest(digest_byte(1)).unwrap(),
-            None
         );
     }
 
@@ -3114,5 +3030,45 @@ mod tests {
                 "{table} {state}: {plan:#?}"
             );
         }
+    }
+
+    #[test]
+    fn relation_only_output_digest_rejects_an_absent_fact_reference() {
+        let summary = row(1);
+        let mut exits = summary.exits.clone();
+        exits[0].fact_ordinal = 99;
+
+        let error =
+            class_set_summary_output_digest(&summary.facts, &exits, &summary.reached).unwrap_err();
+        assert!(error.to_string().contains("absent fact 99"), "{error}");
+    }
+
+    #[test]
+    fn deleting_the_owner_blob_cascades_the_whole_summary() {
+        let store = store_with_blob();
+        let original = row(1);
+        store
+            .publish_class_set_summary(original.clone(), &CancellationToken::new())
+            .unwrap();
+        store
+            .replace_class_set_summary(
+                *original.content_digest(),
+                replacement_row(),
+                &CancellationToken::new(),
+            )
+            .unwrap();
+        store
+            .conn
+            .lock()
+            .unwrap()
+            .execute(
+                "DELETE FROM blobs WHERE blob_oid = ?1 AND lang = 'python'",
+                params![BLOB],
+            )
+            .unwrap();
+        assert_eq!(
+            store.class_set_summary_for_digest(digest_byte(1)).unwrap(),
+            None
+        );
     }
 }

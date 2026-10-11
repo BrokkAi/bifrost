@@ -71,7 +71,7 @@ pub fn validate_identifier(
     Ok(())
 }
 
-const fn is_lower_alphanumeric(byte: u8) -> bool {
+pub const fn is_lower_alphanumeric(byte: u8) -> bool {
     byte.is_ascii_lowercase() || byte.is_ascii_digit()
 }
 

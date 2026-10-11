@@ -3,7 +3,6 @@ use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime};
 
-use sha2::{Digest, Sha256};
 use tempfile::NamedTempFile;
 
 use super::CatalogError;
@@ -103,7 +102,7 @@ pub(super) fn publish(
     bytes: &[u8],
 ) -> Result<(PathBuf, bool), CatalogError> {
     validate_digest(digest)?;
-    if sha256(bytes) != digest {
+    if crate::analyzer::semantic_model::csmi::sha256_hex(bytes) != digest {
         return Err(CatalogError::Integrity(
             "object bytes do not match their stored digest".to_owned(),
         ));
@@ -344,7 +343,7 @@ fn verify(path: &Path, digest: &str, stored_size: u64) -> Result<(), CatalogErro
         )));
     }
     let bytes = fs::read(path).map_err(|error| CatalogError::io("verify catalog object", error))?;
-    if sha256(&bytes) != digest {
+    if crate::analyzer::semantic_model::csmi::sha256_hex(&bytes) != digest {
         return Err(CatalogError::Integrity(format!(
             "catalog object digest mismatch for {digest}"
         )));
@@ -383,11 +382,6 @@ fn validate_digest(digest: &str) -> Result<(), CatalogError> {
             "catalog digest must be lowercase SHA-256 hex".to_owned(),
         ))
     }
-}
-
-fn sha256(bytes: &[u8]) -> String {
-    let digest = Sha256::digest(bytes);
-    format!("{digest:x}")
 }
 
 fn reject_object_tree(root: &Path, prefix: &Path) -> Result<(), CatalogError> {

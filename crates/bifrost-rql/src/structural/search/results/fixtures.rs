@@ -32,7 +32,7 @@ impl Default for CodeQueryFlowCarrierSymbol {
     }
 }
 
-/// Serialize one default-valued instance of every canonical result variant.
+/// Serialize one instance of every canonical result variant.
 ///
 /// The schema comparison makes a newly added variant fail this fixture path
 /// until its real Rust value is included. Python then decodes these serde bytes,
@@ -58,9 +58,6 @@ pub fn code_query_result_fixtures_json() -> Value {
         CodeQueryResultValue::TypestateFinding {
             value: Default::default(),
         },
-        CodeQueryResultValue::ConcurrentAccessConflict {
-            value: Default::default(),
-        },
         CodeQueryResultValue::TypestateWitness {
             value: Default::default(),
         },
@@ -83,6 +80,9 @@ pub fn code_query_result_fixtures_json() -> Value {
             value: Default::default(),
         },
         CodeQueryResultValue::File {
+            value: Default::default(),
+        },
+        CodeQueryResultValue::DependencyEvidence {
             value: Default::default(),
         },
         CodeQueryResultValue::ConfigurationFact {
@@ -110,6 +110,9 @@ pub fn code_query_result_fixtures_json() -> Value {
             value: Default::default(),
         },
         CodeQueryResultValue::ReceiverEvidence {
+            value: Default::default(),
+        },
+        CodeQueryResultValue::PointsToCandidate {
             value: Default::default(),
         },
         CodeQueryResultValue::FieldWriteValue {
@@ -140,7 +143,10 @@ pub fn code_query_result_fixtures_json() -> Value {
             value: Default::default(),
         },
         CodeQueryResultValue::CallResultObligation {
-            value: Default::default(),
+            value: Box::new(CodeQueryCallResultObligation {
+                provenance: Some("native_go_error"),
+                ..Default::default()
+            }),
         },
         CodeQueryResultValue::ResultSubjectUse {
             value: Default::default(),
@@ -167,6 +173,12 @@ pub fn code_query_result_fixtures_json() -> Value {
             value: Default::default(),
         },
         CodeQueryResultValue::CallableSignature {
+            value: Default::default(),
+        },
+        CodeQueryResultValue::LiteralOccurrence {
+            value: Default::default(),
+        },
+        CodeQueryResultValue::CallableMetrics {
             value: Default::default(),
         },
         CodeQueryResultValue::SignatureParameter {
@@ -209,6 +221,9 @@ pub fn code_query_result_fixtures_json() -> Value {
         CodeQueryResultValue::MemberFamilyEdge {
             value: Default::default(),
         },
+        CodeQueryResultValue::PythonHierarchyFact {
+            value: Default::default(),
+        },
         CodeQueryResultValue::Occurrence {
             value: Default::default(),
         },
@@ -239,6 +254,9 @@ pub fn code_query_result_fixtures_json() -> Value {
         CodeQueryResultValue::StateEvent {
             value: Default::default(),
         },
+        CodeQueryResultValue::BindingInitializerCall {
+            value: Default::default(),
+        },
         CodeQueryResultValue::FlowRelation {
             value: Default::default(),
         },
@@ -248,6 +266,9 @@ pub fn code_query_result_fixtures_json() -> Value {
         CodeQueryResultValue::BranchRelation {
             value: Default::default(),
         },
+        CodeQueryResultValue::CppExpression {
+            value: Default::default(),
+        },
         CodeQueryResultValue::LoopRelation {
             value: Default::default(),
         },
@@ -255,6 +276,15 @@ pub fn code_query_result_fixtures_json() -> Value {
             value: Default::default(),
         },
         CodeQueryResultValue::StatementReachability {
+            value: Default::default(),
+        },
+        CodeQueryResultValue::PendingCleanupFlow {
+            value: Default::default(),
+        },
+        CodeQueryResultValue::PythonRuleFact {
+            value: Default::default(),
+        },
+        CodeQueryResultValue::RustPointerFinding {
             value: Default::default(),
         },
         CodeQueryResultValue::Guard {
@@ -278,15 +308,32 @@ pub fn code_query_result_fixtures_json() -> Value {
         CodeQueryResultValue::TopologyEdge {
             value: Default::default(),
         },
+        CodeQueryResultValue::CrossDomain {
+            value: Default::default(),
+        },
     ];
     let result = CodeQueryResult {
         results: values
             .into_iter()
-            .map(|value| CodeQueryResultItem {
-                value,
-                provenance: Vec::new(),
-                provenance_truncated: false,
-                row_projection: Vec::new(),
+            .map(|value| {
+                let provenance =
+                    if matches!(value, CodeQueryResultValue::CallResultObligation { .. }) {
+                        vec![CodeQueryProvenance {
+                            branch: Vec::new(),
+                            seed: CodeQueryResultRef::File {
+                                path: "main.go".to_owned(),
+                            },
+                            steps: Vec::new(),
+                        }]
+                    } else {
+                        Vec::new()
+                    };
+                CodeQueryResultItem {
+                    value,
+                    provenance,
+                    provenance_truncated: false,
+                    row_projection: Vec::new(),
+                }
             })
             .collect(),
         truncated: false,

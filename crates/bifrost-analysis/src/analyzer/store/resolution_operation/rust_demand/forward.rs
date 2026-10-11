@@ -5,13 +5,16 @@
 //! reachable re-export relation and publishes one immutable query relation.
 //! The eager topology compiler remains only as an independent test oracle.
 
+use super::super::demand::{
+    DemandLanguage, LanguageClosure, LanguageContextPreparation, LanguagePrefixInputs,
+    LanguageRootDiscovery,
+};
 use super::super::source_demand::{SourceDemandKey as RustSourceDemandKey, root_source_key};
 use super::super::*;
 use super::relations::{ClosedEndpointRegistration, ClosedRelations};
 use crate::analyzer::resolution::{
-    BatchCandidateRequest, DemandRootDiscovery, DemandRootPlan, DemandRootProvider,
-    DemandRootUnavailableReason, DemandSelectedOverlayBlueprint, EndpointSignature,
-    FactResolutionAnswer, SelectedContextPathSource,
+    BatchCandidateRequest, DemandRootUnavailableReason, DemandSelectedOverlayBlueprint,
+    EndpointSignature, FactResolutionAnswer, SelectedContextPathSource,
 };
 
 /// A demand handle retains no file, crate, profile, or endpoint inventory.
@@ -140,8 +143,6 @@ pub(crate) struct ForwardProvider<'a, 'store, 'input> {
     pub(crate) arena: &'a RefCell<ClosedRelations>,
     pub(crate) session: &'a ResolutionSession,
     pub(crate) cancellation: &'a CancellationToken,
-    pub(crate) plans: HashMap<EndpointSignature, super::rows::RowRootPlan>,
-    pub(crate) prefix_inputs: Vec<SemanticId>,
 }
 
 impl<'a, 'store, 'input> ForwardProvider<'a, 'store, 'input> {
@@ -156,21 +157,21 @@ impl<'a, 'store, 'input> ForwardProvider<'a, 'store, 'input> {
             arena,
             session,
             cancellation,
-            plans: HashMap::default(),
-            prefix_inputs: Vec::new(),
         }
     }
 }
 
 impl ForwardProvider<'_, '_, '_> {
     fn stopped(&self, evidence: &ResolutionCompletion) -> ResolutionCompletion {
-        evidence.combine(&ResolutionCompletion::incomplete([
-            ResolutionIncompleteReason::Cancelled,
-        ]))
+        evidence.combine(&crate::analyzer::resolution::cancelled_completion())
     }
 }
 
-impl DemandRootProvider for ForwardProvider<'_, '_, '_> {
+impl DemandLanguage for ForwardProvider<'_, '_, '_> {
+    type RootQuestion = super::rows::RowRootPlan;
+    type ContextKey = ();
+    type ContextData = ();
+
     fn reverse_dependencies(
         &mut self,
         endpoint: &EndpointSignature,
@@ -345,15 +346,18 @@ impl DemandRootProvider for ForwardProvider<'_, '_, '_> {
         }
     }
 
-    fn discover(&mut self, endpoint: &EndpointSignature) -> Result<DemandRootDiscovery> {
+    fn discover_root(
+        &mut self,
+        endpoint: &EndpointSignature,
+    ) -> Result<LanguageRootDiscovery<Self::RootQuestion>> {
         if self.cancellation.is_cancelled() || !self.session.scope_step() {
-            return Ok(DemandRootDiscovery::Cancelled(
+            return Ok(LanguageRootDiscovery::Cancelled(
                 self.stopped(&self.prepared.demand.completion),
             ));
         }
         {
             let arena = self.arena.borrow();
-            if let Some(retained) = arena.registrations.get(endpoint) {
+            if let Some(retained) = arena.rust.registrations.get(endpoint) {
                 assert!(arena.endpoints.contains_key(endpoint));
                 if matches!(
                     self.prepared.ready.register_context_in_session(
@@ -363,11 +367,11 @@ impl DemandRootProvider for ForwardProvider<'_, '_, '_> {
                     )?,
                     ContextRegistrationOutcome::Cancelled
                 ) {
-                    return Ok(DemandRootDiscovery::Cancelled(
+                    return Ok(LanguageRootDiscovery::Cancelled(
                         self.stopped(&retained.completion),
                     ));
                 }
-                return Ok(DemandRootDiscovery::AlreadyReady {
+                return Ok(LanguageRootDiscovery::AlreadyReady {
                     completion: retained.completion.clone(),
                 });
             }
@@ -385,11 +389,11 @@ impl DemandRootProvider for ForwardProvider<'_, '_, '_> {
                 Some(crate::analyzer::resolution::SelectedNodeMount::FragmentLocal(_))
             );
             return Ok(if known_local {
-                DemandRootDiscovery::AlreadyReady {
+                LanguageRootDiscovery::AlreadyReady {
                     completion: self.prepared.demand.completion.clone(),
                 }
             } else {
-                DemandRootDiscovery::Unavailable {
+                LanguageRootDiscovery::Unavailable {
                     reason: DemandRootUnavailableReason::MissingSourceProvenance,
                     completion: self.prepared.demand.completion.clone(),
                 }
@@ -400,7 +404,7 @@ impl DemandRootProvider for ForwardProvider<'_, '_, '_> {
             .borrow()
             .generated_base_completion(endpoint, self.session);
         if self.cancellation.is_cancelled() || !self.session.observe_cancellation() {
-            return Ok(DemandRootDiscovery::Cancelled(
+            return Ok(LanguageRootDiscovery::Cancelled(
                 self.stopped(&self.prepared.demand.completion),
             ));
         }
@@ -410,19 +414,9 @@ impl DemandRootProvider for ForwardProvider<'_, '_, '_> {
             } else {
                 self.arena.borrow_mut().empty_ready.insert(endpoint.clone());
             }
-            return Ok(DemandRootDiscovery::AlreadyReady { completion });
+            return Ok(LanguageRootDiscovery::AlreadyReady { completion });
         }
         note_rust_point_work("demand_discover_generated", self.session);
-        if let Some(plan) = self.plans.get(endpoint) {
-            return Ok(DemandRootDiscovery::Ready(DemandRootPlan {
-                prefixes: plan
-                    .prefixes
-                    .iter()
-                    .map(|operand| operand.reference)
-                    .collect(),
-                completion: plan.completion.clone(),
-            }));
-        }
         let key = root_source_key(
             self.prepared.ready,
             self.prepared.base,
@@ -433,11 +427,11 @@ impl DemandRootProvider for ForwardProvider<'_, '_, '_> {
         note_rust_point_work("demand_discover_source_key", self.session);
         let Some(source) = key else {
             if self.cancellation.is_cancelled() || !self.session.observe_cancellation() {
-                return Ok(DemandRootDiscovery::Cancelled(
+                return Ok(LanguageRootDiscovery::Cancelled(
                     self.stopped(&self.prepared.demand.completion),
                 ));
             }
-            return Ok(DemandRootDiscovery::Unavailable {
+            return Ok(LanguageRootDiscovery::Unavailable {
                 reason: DemandRootUnavailableReason::MissingSourceProvenance,
                 completion: self.prepared.demand.completion.clone(),
             });
@@ -501,7 +495,7 @@ impl DemandRootProvider for ForwardProvider<'_, '_, '_> {
                 .unconditional_completion()
                 .contains_reason(ResolutionIncompleteReason::Cancelled)
         {
-            return Ok(DemandRootDiscovery::Cancelled(
+            return Ok(LanguageRootDiscovery::Cancelled(
                 self.stopped(coverage.unconditional_completion()),
             ));
         }
@@ -515,34 +509,60 @@ impl DemandRootProvider for ForwardProvider<'_, '_, '_> {
             // contributes only the evidence established by its crate rows.
             completion: ResolutionCompletion::Complete,
         };
-        let prefixes = plan
-            .prefixes
-            .iter()
-            .map(|operand| operand.reference)
-            .collect::<BTreeSet<_>>()
-            .into_iter()
-            .collect();
         let completion = plan.completion.clone();
         note_rust_point_work("demand_discover_plan", self.session);
-        assert!(self.plans.insert(endpoint.clone(), plan).is_none());
-        Ok(DemandRootDiscovery::Ready(DemandRootPlan {
-            prefixes,
+        Ok(LanguageRootDiscovery::Ready {
+            question: plan,
             completion,
-        }))
+        })
     }
 
-    fn close(
+    fn context_key(&self, _question: &Self::RootQuestion) -> Option<Self::ContextKey> {
+        None
+    }
+
+    fn prepare_context(
+        &mut self,
+        _key: &Self::ContextKey,
+        _question: &Self::RootQuestion,
+    ) -> Result<LanguageContextPreparation<Self::ContextData>> {
+        Ok(LanguageContextPreparation::Ready {
+            data: (),
+            completion: ResolutionCompletion::Complete,
+        })
+    }
+
+    fn prefix_inputs(
+        &mut self,
+        question: &mut Self::RootQuestion,
+        _context: Option<&Self::ContextData>,
+    ) -> Result<LanguagePrefixInputs> {
+        Ok(LanguagePrefixInputs {
+            references: question
+                .prefixes
+                .iter()
+                .map(|operand| operand.reference)
+                .collect::<BTreeSet<_>>()
+                .into_iter()
+                .collect(),
+            completion: ResolutionCompletion::Complete,
+        })
+    }
+
+    fn close_root(
         &mut self,
         endpoint: &EndpointSignature,
+        plan: &Self::RootQuestion,
+        _context: Option<&Self::ContextData>,
         inputs: &[(SemanticId, &FactResolutionAnswer)],
-    ) -> Result<ResolutionCompletion> {
-        if let Some(retained) = self.arena.borrow().registrations.get(endpoint) {
-            return Ok(retained.completion.clone());
+    ) -> Result<LanguageClosure> {
+        if let Some(retained) = self.arena.borrow().rust.registrations.get(endpoint) {
+            return Ok(LanguageClosure {
+                completion: retained.completion.clone(),
+                closed: true,
+                discharges: None,
+            });
         }
-        let plan = self
-            .plans
-            .get(endpoint)
-            .expect("only discovered relations may close");
         let expected = plan
             .prefixes
             .iter()
@@ -566,7 +586,11 @@ impl DemandRootProvider for ForwardProvider<'_, '_, '_> {
             evidence = evidence.combine(answer.completion());
         }
         if self.cancellation.is_cancelled() || !self.session.scope_step() {
-            return Ok(self.stopped(&evidence));
+            return Ok(LanguageClosure {
+                completion: self.stopped(&evidence),
+                closed: false,
+                discharges: None,
+            });
         }
         let rows = super::rows::EndpointRows {
             ready: self.prepared.ready,
@@ -575,7 +599,11 @@ impl DemandRootProvider for ForwardProvider<'_, '_, '_> {
             topologies: &self.prepared.demand.topologies,
         };
         let Some(descriptors) = rows.close(plan, inputs)? else {
-            return Ok(self.stopped(&evidence));
+            return Ok(LanguageClosure {
+                completion: self.stopped(&evidence),
+                closed: false,
+                discharges: None,
+            });
         };
         for descriptor in &descriptors {
             evidence = evidence.combine(descriptor.completion());
@@ -625,7 +653,11 @@ impl DemandRootProvider for ForwardProvider<'_, '_, '_> {
             &selected_mount_of,
         )?;
         let Some(contexts) = contexts else {
-            return Ok(self.stopped(&evidence));
+            return Ok(LanguageClosure {
+                completion: self.stopped(&evidence),
+                closed: false,
+                discharges: None,
+            });
         };
         let SelectedResolutionContextValidationOutcome::Ready(contexts) = contexts
             .validate_exact_mounts_in_session(
@@ -635,7 +667,11 @@ impl DemandRootProvider for ForwardProvider<'_, '_, '_> {
                 self.session,
             )?
         else {
-            return Ok(self.stopped(&evidence));
+            return Ok(LanguageClosure {
+                completion: self.stopped(&evidence),
+                closed: false,
+                discharges: None,
+            });
         };
         let SelectedFactOperationBlueprintConstruction::Ready(registration) =
             self.prepared.ready.collect_blueprint_in_session(
@@ -644,7 +680,11 @@ impl DemandRootProvider for ForwardProvider<'_, '_, '_> {
                 self.session,
             )?
         else {
-            return Ok(self.stopped(&evidence));
+            return Ok(LanguageClosure {
+                completion: self.stopped(&evidence),
+                closed: false,
+                discharges: None,
+            });
         };
         if matches!(
             self.prepared.ready.register_context_in_session(
@@ -654,16 +694,28 @@ impl DemandRootProvider for ForwardProvider<'_, '_, '_> {
             )?,
             ContextRegistrationOutcome::Cancelled
         ) {
-            return Ok(self.stopped(&evidence));
+            return Ok(LanguageClosure {
+                completion: self.stopped(&evidence),
+                closed: false,
+                discharges: None,
+            });
         }
         note_rust_point_work("demand_close_register_context", self.session);
         let relation = DemandSelectedOverlayBlueprint::new(registration.context_token());
         let Some(paths) = relation.added_candidate_paths(self.prepared.paths, self.cancellation)?
         else {
-            return Ok(self.stopped(&evidence));
+            return Ok(LanguageClosure {
+                completion: self.stopped(&evidence),
+                closed: false,
+                discharges: None,
+            });
         };
         if self.cancellation.is_cancelled() || !self.session.scope_step() {
-            return Ok(self.stopped(&evidence));
+            return Ok(LanguageClosure {
+                completion: self.stopped(&evidence),
+                closed: false,
+                discharges: None,
+            });
         }
         let generated = self.prepared.generated_base_endings(&paths, &plan.halves);
         let prefix_has_target = inputs
@@ -676,6 +728,7 @@ impl DemandRootProvider for ForwardProvider<'_, '_, '_> {
             arena.publish(endpoint.clone(), relation, paths);
             assert!(
                 arena
+                    .rust
                     .registrations
                     .insert(
                         endpoint.clone(),
@@ -688,7 +741,6 @@ impl DemandRootProvider for ForwardProvider<'_, '_, '_> {
                 "one endpoint closes once per retained selection"
             );
             for (id, source) in generated {
-                let plan = self.plans.get(endpoint).unwrap();
                 let matching_prefixes = plan.halves.iter().filter_map(|half| {
                     let SelectedRootPathHalf::Reference {
                         identity,
@@ -712,19 +764,21 @@ impl DemandRootProvider for ForwardProvider<'_, '_, '_> {
                     .into_iter()
                     .any(|prefix| prefix_has_target[&prefix])
                 {
-                    arena.generated_base_suppressed.insert(id);
+                    arena.rust.generated_base_suppressed.insert(id);
                 }
                 let fixed = arena.paths[&id].end().symbols().fixed();
                 let key = (fixed[0].symbol(), fixed[1].symbol());
-                let bucket = arena.generated_base_endings.entry(key).or_default();
+                let bucket = arena.rust.generated_base_endings.entry(key).or_default();
                 if !bucket.contains(&id) {
                     bucket.push(id);
                 }
             }
         }
         note_rust_point_work("demand_close_published", self.session);
-        self.prefix_inputs
-            .extend(inputs.iter().map(|(reference, _)| *reference));
-        Ok(evidence)
+        Ok(LanguageClosure {
+            completion: evidence,
+            closed: true,
+            discharges: None,
+        })
     }
 }

@@ -4,19 +4,25 @@
 //! established inside the selected operation before public result projection.
 
 use super::RustAnalyzer;
+use crate::CancellationToken;
 use crate::analyzer::languages::BoundedReceiverQuery;
+use crate::analyzer::lexical_definitions::LexicalDefinition;
 use crate::analyzer::resolution::{
     FactResolutionAnswer, ResolutionBatchMetrics, ResolutionCompletion, ResolutionSlotValue,
     SelectedSemanticLocator, SemanticId,
 };
 use crate::analyzer::store::resolution_operation::{
-    SelectedResolutionContextMetrics, SelectedResolutionLocated, SelectedResolutionOperationInput,
-    SelectedResolutionOperationOpenOutcome, SelectedResolutionOperationOutcome,
-    SelectedRustCallerReferenceOutcome, SelectedRustReferenceAnswer, SelectedRustSourceDefinition,
+    SelectedResolutionContextMetrics, SelectedResolutionLocated, SelectedResolutionOperation,
+    SelectedResolutionOperationInput, SelectedResolutionOperationOpenOutcome,
+    SelectedResolutionOperationOutcome, SelectedRustCallerReferenceOutcome,
+    SelectedRustReferenceAnswer, SelectedRustSourceDefinition,
     SelectedRustSourceDefinitionProjection, SelectedRustTypeProjection,
 };
 use crate::analyzer::store::resolution_publication::SelectedResolutionOverlayInputsOutcome;
-use crate::analyzer::store::resolution_selection::SelectedResolutionLanguage;
+use crate::analyzer::store::resolution_selection::{
+    SelectedResolutionContentMountRequest, SelectedResolutionLanguage,
+    SelectedResolutionOverlayMask,
+};
 use crate::analyzer::usages::get_definition::{
     BoundedResolution, ClaimSubjectRole, DefinitionLookupDiagnostic, DefinitionLookupOutcome,
     DefinitionLookupStatus, UnindexedClaim,
@@ -28,13 +34,263 @@ use crate::analyzer::usages::get_type::{
 use crate::analyzer::usages::target_kind::TypeLookupTargetKind;
 use crate::analyzer::{CodeUnit, Language, resolve_analyzer};
 use crate::path_utils::rel_path_string;
-use brokk_bifrost_core::analyzer::resolution_facts::{BindingProjectionKind, ResolutionSiteKind};
+use brokk_bifrost_core::analyzer::resolution_facts::{
+    BindingProjectionKind, ResolutionNamespace, ResolutionSiteKind,
+};
 use brokk_bifrost_core::analyzer::usages::receiver_analysis::ReceiverAnalysisWork;
 use std::collections::BTreeMap;
+use std::sync::{Arc, OnceLock};
 
 #[cfg(test)]
 #[path = "native_points/tests.rs"]
 mod tests;
+
+/// Inputs for selected Rust point operations in one source-definition batch.
+/// The factory retains overlay masks and content mounts across that batch's
+/// selected operations.
+pub(crate) struct RustDefinitionOperationFactory<'analyzer> {
+    rust: &'analyzer RustAnalyzer,
+    snapshots: Arc<crate::analyzer::store::WorkspaceSnapshots>,
+    languages: [SelectedResolutionLanguage; 1],
+    overlay_inputs: OnceLock<RustDefinitionOverlayInputs>,
+}
+
+struct RustDefinitionOverlayInputs {
+    masks: Vec<SelectedResolutionOverlayMask>,
+    content_mounts: Vec<SelectedResolutionContentMountRequest>,
+}
+
+pub(crate) enum RustDefinitionOperationOpenFailure {
+    Unavailable(String),
+    Stale(String),
+    Cancelled,
+    StoreError(String),
+}
+
+impl<'analyzer> RustDefinitionOperationFactory<'analyzer> {
+    pub(crate) fn new(
+        analyzer: &'analyzer dyn crate::analyzer::IAnalyzer,
+        cancellation: &CancellationToken,
+    ) -> Option<Self> {
+        let rust = resolve_analyzer::<RustAnalyzer>(analyzer)?;
+        if cancellation.is_cancelled()
+            || !rust.inner.workspace_declaration_identities_authoritative()
+        {
+            return None;
+        }
+        let snapshots = rust.inner.selected_workspace_snapshots();
+        let languages = [SelectedResolutionLanguage::new("rust", Language::Rust)];
+        Some(Self {
+            rust,
+            snapshots,
+            languages,
+            overlay_inputs: OnceLock::new(),
+        })
+    }
+
+    pub(crate) fn open(
+        &self,
+        cancellation: &CancellationToken,
+    ) -> crate::analyzer::store::Result<SelectedResolutionOperationOpenOutcome<'analyzer, 'analyzer>>
+    {
+        if self.overlay_inputs.get().is_none() {
+            note_rust_definition_overlay_preparation();
+            let inputs = match self
+                .rust
+                .inner
+                .selected_rust_resolution_overlay_inputs(self.snapshots.as_ref(), cancellation)?
+            {
+                SelectedResolutionOverlayInputsOutcome::Ready {
+                    masks,
+                    content_mounts,
+                } => RustDefinitionOverlayInputs {
+                    masks,
+                    content_mounts,
+                },
+                SelectedResolutionOverlayInputsOutcome::Unavailable(reason) => {
+                    return Ok(SelectedResolutionOperationOpenOutcome::Unavailable(reason));
+                }
+                SelectedResolutionOverlayInputsOutcome::Stale(reason) => {
+                    return Ok(SelectedResolutionOperationOpenOutcome::Stale(reason));
+                }
+                SelectedResolutionOverlayInputsOutcome::Cancelled => {
+                    return Ok(SelectedResolutionOperationOpenOutcome::Cancelled);
+                }
+            };
+            assert!(
+                self.overlay_inputs.set(inputs).is_ok(),
+                "selected Rust batch overlay inputs initialize once"
+            );
+        }
+        let overlay_inputs = self
+            .overlay_inputs
+            .get()
+            .expect("selected Rust batch overlay inputs were initialized");
+        note_rust_definition_operation_open();
+        self.rust
+            .inner
+            .analyzer_store()
+            .open_selected_resolution_operation(
+                SelectedResolutionOperationInput::new(
+                    self.rust.inner.project(),
+                    self.rust.inner.workspace_id(),
+                    self.snapshots.as_ref(),
+                    &self.languages,
+                    &overlay_inputs.masks,
+                )
+                .with_content_mounts(overlay_inputs.content_mounts.clone()),
+                cancellation,
+            )
+    }
+
+    pub(crate) fn resolve(
+        &self,
+        operation: &mut SelectedResolutionOperation<'_, '_>,
+        query: BoundedReceiverQuery<'_>,
+    ) -> BoundedResolution<DefinitionLookupOutcome> {
+        resolve_rust_definition_in_operation(query, operation)
+    }
+
+    pub(crate) fn resolve_many(
+        &self,
+        operation: &mut SelectedResolutionOperation<'_, '_>,
+        queries: &[BoundedReceiverQuery<'_>],
+        cancellation: &CancellationToken,
+    ) -> Vec<Option<BoundedResolution<DefinitionLookupOutcome>>> {
+        resolve_rust_definitions_in_operation(self.rust, operation, queries, cancellation)
+    }
+
+    pub(crate) fn resolve_bounded(
+        &self,
+        query: BoundedReceiverQuery<'_>,
+    ) -> BoundedResolution<DefinitionLookupOutcome> {
+        let cancellation = query.cancellation.cloned().unwrap_or_default();
+        match self.open(&cancellation) {
+            Ok(SelectedResolutionOperationOpenOutcome::Ready(mut operation)) => {
+                self.resolve(&mut operation, query)
+            }
+            outcome => resolve_rust_definition_open_failure(query, outcome),
+        }
+    }
+}
+
+pub(crate) fn resolve_rust_definition_open_failure(
+    query: BoundedReceiverQuery<'_>,
+    outcome: crate::analyzer::store::Result<SelectedResolutionOperationOpenOutcome<'_, '_>>,
+) -> BoundedResolution<DefinitionLookupOutcome> {
+    match outcome {
+        Ok(SelectedResolutionOperationOpenOutcome::Unavailable(reason)) => {
+            resolve_rust_definition_open_failure_for_batch(
+                query,
+                &RustDefinitionOperationOpenFailure::Unavailable(format!("{reason:?}")),
+            )
+        }
+        Ok(SelectedResolutionOperationOpenOutcome::Stale(reason)) => {
+            resolve_rust_definition_open_failure_for_batch(
+                query,
+                &RustDefinitionOperationOpenFailure::Stale(format!("{reason:?}")),
+            )
+        }
+        Ok(SelectedResolutionOperationOpenOutcome::Cancelled) => {
+            resolve_rust_definition_open_failure_for_batch(
+                query,
+                &RustDefinitionOperationOpenFailure::Cancelled,
+            )
+        }
+        Ok(SelectedResolutionOperationOpenOutcome::Ready(_)) => {
+            unreachable!("ready selected Rust operation is not an open failure")
+        }
+        Err(error) => resolve_rust_definition_open_failure_for_batch(
+            query,
+            &RustDefinitionOperationOpenFailure::StoreError(error.to_string()),
+        ),
+    }
+}
+
+pub(crate) fn resolve_rust_definition_open_failure_for_batch(
+    query: BoundedReceiverQuery<'_>,
+    failure: &RustDefinitionOperationOpenFailure,
+) -> BoundedResolution<DefinitionLookupOutcome> {
+    match failure {
+        RustDefinitionOperationOpenFailure::Unavailable(reason) => complete_definition(
+            query.site,
+            DefinitionLookupStatus::Unavailable,
+            "native_unavailable",
+            format!("selected Rust point operation is unavailable: {reason}"),
+        )
+        .into_complete_resolution(),
+        RustDefinitionOperationOpenFailure::Stale(reason) => complete_definition(
+            query.site,
+            DefinitionLookupStatus::Unavailable,
+            "native_stale",
+            format!("selected Rust point operation is stale: {reason}"),
+        )
+        .into_complete_resolution(),
+        RustDefinitionOperationOpenFailure::Cancelled => BoundedResolution::Cancelled {
+            work: ReceiverAnalysisWork::default(),
+        },
+        RustDefinitionOperationOpenFailure::StoreError(error) => complete_definition(
+            query.site,
+            DefinitionLookupStatus::Unavailable,
+            "native_store_error",
+            format!("selected Rust point operation failed to open: {error}"),
+        )
+        .into_complete_resolution(),
+    }
+}
+
+pub(crate) fn resolve_rust_definition_in_operation(
+    query: BoundedReceiverQuery<'_>,
+    operation: &mut SelectedResolutionOperation<'_, '_>,
+) -> BoundedResolution<DefinitionLookupOutcome> {
+    let cancellation = query.cancellation.cloned().unwrap_or_default();
+    let Some(rust) = resolve_analyzer::<RustAnalyzer>(query.analyzer) else {
+        return complete_definition(
+            query.site,
+            DefinitionLookupStatus::Unavailable,
+            "rust_analyzer_unavailable",
+            "Rust analyzer is unavailable for the selected native point operation",
+        )
+        .into_complete_resolution();
+    };
+    resolve_rust_definition_with_operation(query, rust, operation, &cancellation)
+}
+
+#[cfg(test)]
+thread_local! {
+    static RUST_DEFINITION_OPERATION_OPENS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static RUST_DEFINITION_OVERLAY_PREPARATIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+fn note_rust_definition_operation_open() {
+    #[cfg(test)]
+    RUST_DEFINITION_OPERATION_OPENS.with(|count| count.set(count.get() + 1));
+}
+
+fn note_rust_definition_overlay_preparation() {
+    #[cfg(test)]
+    RUST_DEFINITION_OVERLAY_PREPARATIONS.with(|count| count.set(count.get() + 1));
+}
+
+#[cfg(test)]
+pub(crate) fn reset_rust_definition_operation_open_count_for_test() {
+    RUST_DEFINITION_OPERATION_OPENS.with(|count| count.set(0));
+}
+
+#[cfg(test)]
+pub(crate) fn rust_definition_operation_open_count_for_test() -> usize {
+    RUST_DEFINITION_OPERATION_OPENS.with(std::cell::Cell::get)
+}
+
+#[cfg(test)]
+pub(crate) fn reset_rust_definition_overlay_preparation_count_for_test() {
+    RUST_DEFINITION_OVERLAY_PREPARATIONS.with(|count| count.set(0));
+}
+
+#[cfg(test)]
+pub(crate) fn rust_definition_overlay_preparation_count_for_test() -> usize {
+    RUST_DEFINITION_OVERLAY_PREPARATIONS.with(std::cell::Cell::get)
+}
 
 /// Adapt one selected native Rust reference into the definition lookup
 /// vocabulary without consulting a legacy candidate or lexical resolver.
@@ -73,6 +329,7 @@ pub(crate) fn resolve_rust_definition_bounded_with_after_open(
 
     let snapshots = rust.inner.selected_workspace_snapshots();
     let languages = [SelectedResolutionLanguage::new("rust", Language::Rust)];
+    note_rust_definition_overlay_preparation();
     let (masks, content_mounts) = match rust
         .inner
         .selected_rust_resolution_overlay_inputs(snapshots.as_ref(), &cancellation)
@@ -123,6 +380,7 @@ pub(crate) fn resolve_rust_definition_bounded_with_after_open(
     )
     .with_content_mounts(content_mounts);
 
+    note_rust_definition_operation_open();
     let mut operation = match rust
         .inner
         .analyzer_store()
@@ -164,6 +422,15 @@ pub(crate) fn resolve_rust_definition_bounded_with_after_open(
     };
     after_open();
 
+    resolve_rust_definition_with_operation(query, rust, &mut operation, &cancellation)
+}
+
+fn resolve_rust_definition_with_operation(
+    query: BoundedReceiverQuery<'_>,
+    rust: &RustAnalyzer,
+    operation: &mut SelectedResolutionOperation<'_, '_>,
+    cancellation: &CancellationToken,
+) -> BoundedResolution<DefinitionLookupOutcome> {
     let source_matches = rust
         .inner
         .source_matches_selected_native_content(query.file, query.source);
@@ -286,58 +553,58 @@ pub(crate) fn resolve_rust_definition_bounded_with_after_open(
         .into_complete_resolution();
     }
 
-    // Declaration self-navigation and body references need the same selected
-    // activation as ordinary endpoint resolution. Read the retained AST, never
-    // interpret source text or assume a host in the producer.
-    if let Some(node) = query.tree.and_then(|tree| {
-        tree.root_node()
-            .descendant_for_byte_range(query.site.focus_start_byte, query.site.focus_end_byte)
-    }) {
-        let condition =
-            brokk_bifrost_rust::lexical_scope::rust_effective_cfg_condition(node, query.source);
-        if condition != brokk_bifrost_core::analyzer::rust_facts::RustCfgCondition::Always {
-            use brokk_bifrost_rust::selected_context::RustSelectedActivation;
-            match operation.rust_cfg_activation_for_caller(
+    let conditional_site_cfg = match super::site_activation::rust_site_activation(
+        query.tree,
+        query.source,
+        query.site.focus_start_byte..query.site.focus_end_byte,
+        |condition| {
+            operation.rust_cfg_activation_for_caller_under_site_cfg(
                 query.file.rel_path(),
-                &condition,
-                &cancellation,
-            ) {
-                Ok(Some(RustSelectedActivation::Active)) => {}
-                Ok(Some(RustSelectedActivation::Inactive)) => {
-                    return complete_definition(
-                        query.site,
-                        DefinitionLookupStatus::NoDefinition,
-                        "inactive_cfg",
-                        "the selected Rust cfg predicate is refuted",
-                    )
-                    .into_complete_resolution();
-                }
-                Ok(Some(RustSelectedActivation::Unknown)) => {
-                    return complete_definition(
-                        query.site,
-                        DefinitionLookupStatus::Incomplete,
-                        "unknown_activation",
-                        "the selected Rust cfg predicate contains an undecidable atom",
-                    )
-                    .into_complete_resolution();
-                }
-                Ok(None) => {
-                    return BoundedResolution::Cancelled {
-                        work: ReceiverAnalysisWork::default(),
-                    };
-                }
-                Err(error) => {
-                    return complete_definition(
-                        query.site,
-                        DefinitionLookupStatus::Unavailable,
-                        "native_store_error",
-                        format!("selected Rust cfg lookup failed: {error}"),
-                    )
-                    .into_complete_resolution();
-                }
-            }
+                condition,
+                cancellation,
+            )
+        },
+    ) {
+        Ok(Some(super::site_activation::RustSiteActivation::Active)) => None,
+        Ok(Some(super::site_activation::RustSiteActivation::Unknown {
+            conditional_site_cfg: Some(condition),
+        })) => Some(condition),
+        Ok(Some(super::site_activation::RustSiteActivation::NoNode)) => None,
+        Ok(Some(super::site_activation::RustSiteActivation::Inactive)) => {
+            return complete_definition(
+                query.site,
+                DefinitionLookupStatus::NoDefinition,
+                "inactive_cfg",
+                "the selected Rust cfg predicate is refuted",
+            )
+            .into_complete_resolution();
         }
-    }
+        Ok(Some(super::site_activation::RustSiteActivation::Unknown {
+            conditional_site_cfg: None,
+        })) => {
+            return complete_definition(
+                query.site,
+                DefinitionLookupStatus::Incomplete,
+                "unknown_activation",
+                "the selected Rust cfg predicate contains an undecidable atom",
+            )
+            .into_complete_resolution();
+        }
+        Ok(None) => {
+            return BoundedResolution::Cancelled {
+                work: ReceiverAnalysisWork::default(),
+            };
+        }
+        Err(error) => {
+            return complete_definition(
+                query.site,
+                DefinitionLookupStatus::Unavailable,
+                "native_store_error",
+                format!("selected Rust cfg lookup failed: {error}"),
+            )
+            .into_complete_resolution();
+        }
+    };
 
     let macro_invocation = query.tree.and_then(|tree| {
         let token = tree
@@ -366,7 +633,7 @@ pub(crate) fn resolve_rust_definition_bounded_with_after_open(
                 invocation.start_byte(),
                 arguments.start_byte(),
                 &query.source[head.byte_range()],
-                &cancellation,
+                cancellation,
             ) {
                 Ok(matched) => matched,
                 Err(error) => {
@@ -497,7 +764,7 @@ pub(crate) fn resolve_rust_definition_bounded_with_after_open(
             query.site.focus_end_byte,
         ),
         query.budget,
-        &cancellation,
+        cancellation,
     );
     match declaration {
         Ok(None) => {}
@@ -508,7 +775,15 @@ pub(crate) fn resolve_rust_definition_bounded_with_after_open(
                 }
                 BoundedResolution::Cancelled { work } => BoundedResolution::Cancelled { work },
                 BoundedResolution::Complete { value, work } => BoundedResolution::Complete {
-                    value: adapt_declaration_value(query.site, value),
+                    value: {
+                        let mut value = adapt_declaration_value(query.site, value);
+                        if let Some(condition) = &conditional_site_cfg {
+                            value
+                                .diagnostics
+                                .push(conditional_cfg_diagnostic(condition));
+                        }
+                        value
+                    },
                     work,
                 },
             };
@@ -534,11 +809,11 @@ pub(crate) fn resolve_rust_definition_bounded_with_after_open(
     // one shape `claim_external_route_head` reads it for.
     let (head_names_macro_module, head_workspace_crate) = if focused_route_head(&query) {
         match operation
-            .rust_reference_names_macro_module(&locator, &cancellation)
+            .rust_reference_names_macro_module(&locator, cancellation)
             .and_then(|macro_module| {
                 Ok((
                     macro_module,
-                    operation.rust_reference_names_workspace_crate(&locator, &cancellation)?,
+                    operation.rust_reference_names_workspace_crate(&locator, cancellation)?,
                 ))
             }) {
             Ok(names) => names,
@@ -561,7 +836,7 @@ pub(crate) fn resolve_rust_definition_bounded_with_after_open(
         query.file.rel_path(),
         &locator,
         query.budget,
-        &cancellation,
+        cancellation,
         &mut context_metrics,
         &mut point_metrics,
     );
@@ -583,6 +858,11 @@ pub(crate) fn resolve_rust_definition_bounded_with_after_open(
         BoundedResolution::Cancelled { work } => BoundedResolution::Cancelled { work },
         BoundedResolution::Complete { value, work } => {
             let mut outcome = adapt_definition_value(&query, value);
+            if let Some(condition) = &conditional_site_cfg {
+                outcome
+                    .diagnostics
+                    .push(conditional_cfg_diagnostic(condition));
+            }
             outcome.diagnostics.extend(matcher_diagnostic);
             name_unresolved_receiver_owner(query.tree, query.source, query.site, &mut outcome);
             claim_external_route_head(
@@ -600,6 +880,213 @@ pub(crate) fn resolve_rust_definition_bounded_with_after_open(
                 }
             }
         }
+    }
+}
+
+fn resolve_rust_definitions_in_operation(
+    rust: &RustAnalyzer,
+    operation: &mut SelectedResolutionOperation<'_, '_>,
+    queries: &[BoundedReceiverQuery<'_>],
+    cancellation: &CancellationToken,
+) -> Vec<Option<BoundedResolution<DefinitionLookupOutcome>>> {
+    let mut results = std::iter::repeat_with(|| None)
+        .take(queries.len())
+        .collect::<Vec<_>>();
+    if queries.len() < 2 || cancellation.is_cancelled() {
+        return results;
+    }
+    let first = &queries[0];
+    if queries.iter().any(|query| {
+        query.file != first.file
+            || query.source.as_ptr() != first.source.as_ptr()
+            || query.source.len() != first.source.len()
+    }) || !rust
+        .inner
+        .source_matches_selected_native_content(first.file, first.source)
+    {
+        return results;
+    }
+
+    let mut positions = Vec::new();
+    let mut locators = Vec::new();
+    let mut conditional_cfgs = Vec::new();
+    for (index, query) in queries.iter().enumerate() {
+        if cancellation.is_cancelled() {
+            return results;
+        }
+        let Some(tree) = query.tree else {
+            continue;
+        };
+        let Some(token) = tree
+            .root_node()
+            .descendant_for_byte_range(query.site.focus_start_byte, query.site.focus_end_byte)
+        else {
+            continue;
+        };
+        if brokk_bifrost_rust::macro_matcher::enclosing_macro_invocation_for_argument(token)
+            .is_some()
+        {
+            continue;
+        }
+        let condition =
+            brokk_bifrost_rust::lexical_scope::rust_effective_cfg_condition(token, query.source);
+        let conditional_cfg =
+            if condition != brokk_bifrost_core::analyzer::rust_facts::RustCfgCondition::Always {
+                use brokk_bifrost_rust::selected_context::RustSelectedActivation;
+                match operation.rust_cfg_activation_for_caller_under_site_cfg(
+                    query.file.rel_path(),
+                    &condition,
+                    cancellation,
+                ) {
+                    Ok(Some((RustSelectedActivation::Active, conditional))) => {
+                        conditional.then_some(condition)
+                    }
+                    Ok(Some((RustSelectedActivation::Inactive, _))) => {
+                        results[index] = Some(
+                            complete_definition(
+                                query.site,
+                                DefinitionLookupStatus::NoDefinition,
+                                "inactive_cfg",
+                                "the selected Rust cfg predicate is refuted",
+                            )
+                            .into_complete_resolution(),
+                        );
+                        continue;
+                    }
+                    Ok(Some((RustSelectedActivation::Unknown, _))) => {
+                        results[index] = Some(
+                            complete_definition(
+                                query.site,
+                                DefinitionLookupStatus::Incomplete,
+                                "unknown_activation",
+                                "the selected Rust cfg predicate contains an undecidable atom",
+                            )
+                            .into_complete_resolution(),
+                        );
+                        continue;
+                    }
+                    Ok(None) => {
+                        results[index] = Some(BoundedResolution::Cancelled {
+                            work: ReceiverAnalysisWork::default(),
+                        });
+                        continue;
+                    }
+                    Err(error) => {
+                        results[index] = Some(
+                            complete_definition(
+                                query.site,
+                                DefinitionLookupStatus::Unavailable,
+                                "native_store_error",
+                                format!("selected Rust cfg lookup failed: {error}"),
+                            )
+                            .into_complete_resolution(),
+                        );
+                        continue;
+                    }
+                }
+            } else {
+                None
+            };
+        if focused_route_head(query) {
+            continue;
+        }
+        if super::external_calls::call_path_for_site(tree, query.site).is_none() {
+            continue;
+        }
+        let declaration_locator = SelectedSemanticLocator::for_declaration_range(
+            "rust",
+            rel_path_string(query.file),
+            query.site.focus_start_byte,
+            query.site.focus_end_byte,
+        );
+        match operation.rust_declaration_at_range_bounded(
+            &declaration_locator,
+            query.budget,
+            cancellation,
+        ) {
+            Ok(None) => {}
+            Ok(Some(_)) | Err(_) => continue,
+        }
+        positions.push(index);
+        conditional_cfgs.push(conditional_cfg);
+        locators.push(SelectedSemanticLocator::for_reference_range(
+            "rust",
+            rel_path_string(query.file),
+            query.site.focus_start_byte,
+            query.site.focus_end_byte,
+        ));
+    }
+    if locators.len() < 2 {
+        return results;
+    }
+    let budget = queries[positions[0]].budget;
+    assert!(
+        positions
+            .iter()
+            .all(|&index| queries[index].budget == budget)
+    );
+    let locator_refs = locators.iter().collect::<Vec<_>>();
+    let references = match operation.resolve_rust_references_for_caller_bounded_per_locator(
+        first.file.rel_path(),
+        &locator_refs,
+        budget,
+        cancellation,
+    ) {
+        Ok(references) => references,
+        Err(error) => {
+            for &index in &positions {
+                results[index] = Some(
+                    complete_definition(
+                        queries[index].site,
+                        DefinitionLookupStatus::Unavailable,
+                        "native_store_error",
+                        format!("selected Rust point operation failed: {error}"),
+                    )
+                    .into_complete_resolution(),
+                );
+            }
+            return results;
+        }
+    };
+    assert_eq!(references.len(), positions.len());
+    for ((index, conditional_cfg), query_result) in
+        positions.into_iter().zip(conditional_cfgs).zip(references)
+    {
+        let query = &queries[index];
+        results[index] = Some(match query_result {
+            BoundedResolution::Exceeded { limit, work } => {
+                BoundedResolution::Exceeded { limit, work }
+            }
+            BoundedResolution::Cancelled { work } => BoundedResolution::Cancelled { work },
+            BoundedResolution::Complete { value, work } => {
+                let mut outcome = adapt_definition_value(query, value);
+                if let Some(condition) = &conditional_cfg {
+                    outcome
+                        .diagnostics
+                        .push(conditional_cfg_diagnostic(condition));
+                }
+                name_unresolved_receiver_owner(query.tree, query.source, query.site, &mut outcome);
+                if cancellation.is_cancelled() {
+                    BoundedResolution::Cancelled { work }
+                } else {
+                    BoundedResolution::Complete {
+                        value: outcome,
+                        work,
+                    }
+                }
+            }
+        });
+    }
+    results
+}
+
+fn conditional_cfg_diagnostic(
+    condition: &brokk_bifrost_core::analyzer::rust_facts::RustCfgCondition,
+) -> DefinitionLookupDiagnostic {
+    DefinitionLookupDiagnostic {
+        claim: None,
+        kind: "conditional_cfg".to_owned(),
+        message: format!("the answer is conditional on Rust cfg {condition:?}"),
     }
 }
 
@@ -776,6 +1263,23 @@ fn focused_route_head(query: &BoundedReceiverQuery<'_>) -> bool {
                     "scoped_identifier" | "scoped_type_identifier" | "scoped_use_list"
                 ) && path.child_by_field_name("path").map(|head| head.id()) == Some(token.id())
                     && !matches!(token.kind(), "crate" | "self" | "super" | "metavariable")
+            })
+    })
+}
+
+fn focused_qualified_type_route(query: &BoundedReceiverQuery<'_>) -> bool {
+    if focused_route_head(query) {
+        return true;
+    }
+    query.tree.is_some_and(|tree| {
+        tree.root_node()
+            .descendant_for_byte_range(query.site.focus_start_byte, query.site.focus_end_byte)
+            .and_then(|token| Some((token, token.parent()?)))
+            .is_some_and(|(token, path)| {
+                matches!(path.kind(), "scoped_identifier" | "scoped_type_identifier")
+                    && path
+                        .child_by_field_name("name")
+                        .is_some_and(|name| name.id() == token.id())
             })
     })
 }
@@ -1027,6 +1531,8 @@ pub(crate) fn resolve_rust_type_bounded(
         .into_complete_resolution();
     }
 
+    let mut conditional_site_cfg = None;
+
     // A type answer cannot escape the activation of its enclosing source body.
     if let Some(node) = query.tree.and_then(|tree| {
         tree.root_node()
@@ -1036,13 +1542,17 @@ pub(crate) fn resolve_rust_type_bounded(
             brokk_bifrost_rust::lexical_scope::rust_effective_cfg_condition(node, query.source);
         if condition != brokk_bifrost_core::analyzer::rust_facts::RustCfgCondition::Always {
             use brokk_bifrost_rust::selected_context::RustSelectedActivation;
-            match operation.rust_cfg_activation_for_caller(
+            match operation.rust_cfg_activation_for_caller_under_site_cfg(
                 query.file.rel_path(),
                 &condition,
                 &cancellation,
             ) {
-                Ok(Some(RustSelectedActivation::Active)) => {}
-                Ok(Some(RustSelectedActivation::Inactive)) => {
+                Ok(Some((RustSelectedActivation::Active, conditional))) => {
+                    if conditional {
+                        conditional_site_cfg = Some(condition.clone());
+                    }
+                }
+                Ok(Some((RustSelectedActivation::Inactive, _))) => {
                     return complete_type(
                         query.site,
                         TypeLookupStatus::NoType,
@@ -1052,7 +1562,7 @@ pub(crate) fn resolve_rust_type_bounded(
                     )
                     .into_complete_resolution();
                 }
-                Ok(Some(RustSelectedActivation::Unknown)) => {
+                Ok(Some((RustSelectedActivation::Unknown, _))) => {
                     return complete_type(
                         query.site,
                         TypeLookupStatus::Incomplete,
@@ -1129,6 +1639,12 @@ pub(crate) fn resolve_rust_type_bounded(
             {
                 value.target_kind = TypeLookupTargetKind::ValueExpression;
             }
+            if let Some(condition) = &conditional_site_cfg {
+                value.diagnostics.push(TypeLookupDiagnostic {
+                    kind: "conditional_cfg".to_owned(),
+                    message: format!("the answer is conditional on Rust cfg {condition:?}"),
+                });
+            }
             BoundedResolution::Complete { value, work }
         }
     }
@@ -1161,7 +1677,8 @@ fn adapt_definition_value(
                 answer,
             )) => {
                 let modeled = modeled_macro_definitions(query, &answer);
-                let mut outcome = adapt_definition_answer(site, answer);
+                let mut outcome =
+                    adapt_definition_answer(site, answer, focused_qualified_type_route(query));
                 match modeled {
                     Ok(definitions) if !definitions.is_empty() => {
                         outcome.status =
@@ -1430,14 +1947,225 @@ fn modeled_macro_definitions(
     Ok(records.into_iter().cloned().collect())
 }
 
+/// The attribute-macro frontiers that cannot change which declaration one Rust
+/// callable reference binds to, and the shape that closes them.
+enum AttributeFrontierClosure {
+    /// The reference binds a written inherent method.
+    WrittenInherentMethod(
+        Vec<crate::analyzer::store::resolution_operation::SelectedRustGapFrontier>,
+    ),
+    /// The reference is an unqualified macro invocation that no workspace
+    /// declaration answers and that names a standard prelude macro.
+    ExternalMacro(Vec<crate::analyzer::store::resolution_operation::SelectedRustGapFrontier>),
+}
+
+/// Decide whether the attribute-macro frontiers a lookup retained can be
+/// ignored for the binding of one callable reference.
+///
+/// An attribute macro can add items, so a frontier is a gap in what the
+/// module may declare. It cannot change the binding in these two shapes:
+///
+/// - A written inherent method. A duplicate inherent method would be a
+///   compile error, and inherent methods take precedence over trait methods.
+/// - An unqualified standard prelude macro (`println!`, `format!`, ...) that
+///   no workspace declaration answers. An attribute expansion could change
+///   this binding only by defining a `macro_rules!` with the same name earlier
+///   in the module. This is an accepted assumption: Bifrost assumes no
+///   attribute expansion does that, which matches what an expanding analyzer
+///   sees for this binding. Owner decision, 2026-10-09, for the Rust
+///   cleartext-logging parity work.
+///
+/// The native lookup has no prelude model for the macro namespace, so the
+/// prelude macro has no canonical target or definition. Its name is decided
+/// by the same standard-macro table the dispatch side uses.
+fn rust_attribute_frontier_cannot_change_binding(
+    answers: &[SelectedRustReferenceAnswer],
+    completion: &ResolutionCompletion,
+    canonical_targets: &std::collections::BTreeSet<SemanticId>,
+    definitions: &[CodeUnit],
+    lexical: &[LexicalDefinition],
+    callee_name: &str,
+) -> Option<AttributeFrontierClosure> {
+    rust_written_inherent_method_frontiers(
+        answers,
+        completion,
+        canonical_targets,
+        definitions,
+        lexical,
+    )
+    .map(AttributeFrontierClosure::WrittenInherentMethod)
+    .or_else(|| {
+        rust_external_macro_frontiers(
+            answers,
+            completion,
+            canonical_targets,
+            definitions,
+            lexical,
+            callee_name,
+        )
+        .map(AttributeFrontierClosure::ExternalMacro)
+    })
+}
+
+/// The written inherent method shape. Its gate is the one on master: every
+/// retained frontier must be an attribute-macro frontier, and the reference
+/// must bind exactly one written inherent method.
+fn rust_written_inherent_method_frontiers(
+    answers: &[SelectedRustReferenceAnswer],
+    completion: &ResolutionCompletion,
+    canonical_targets: &std::collections::BTreeSet<SemanticId>,
+    definitions: &[CodeUnit],
+    lexical: &[LexicalDefinition],
+) -> Option<Vec<crate::analyzer::store::resolution_operation::SelectedRustGapFrontier>> {
+    let target = canonical_targets.iter().next()?;
+    let [definition] = definitions else {
+        return None;
+    };
+    if canonical_targets.len() != 1
+        || !lexical.is_empty()
+        || definition.is_synthetic()
+        || !definition.is_callable()
+    {
+        return None;
+    }
+    let ResolutionCompletion::Incomplete(reasons) = completion else {
+        return None;
+    };
+    if reasons.is_empty() {
+        return None;
+    }
+    let retained_gap_frontiers = answers
+        .iter()
+        .flat_map(|answer| answer.retained_gap_frontiers.iter().copied())
+        .collect::<Vec<_>>();
+    let retained_semantics = retained_gap_frontiers
+        .iter()
+        .map(|frontier| frontier.semantic)
+        .collect::<std::collections::BTreeSet<_>>();
+    if !reasons.iter().all(|reason| {
+        matches!(
+            reason,
+            crate::analyzer::resolution::ResolutionIncompleteReason::UnsupportedSemantic(semantic)
+                if retained_semantics.contains(semantic)
+        )
+    }) || retained_gap_frontiers.is_empty()
+        || retained_gap_frontiers
+            .iter()
+            .any(|frontier| !frontier.kind.is_attribute_macro_frontier())
+    {
+        return None;
+    }
+    let callable_member_reference = answers.iter().any(|answer| {
+        answer.resolution.site_metadata().is_some_and(|metadata| {
+            metadata.namespace() == ResolutionNamespace::Callable
+                && matches!(
+                    metadata.site_kind(),
+                    ResolutionSiteKind::CallableReference | ResolutionSiteKind::MemberReference
+                )
+        })
+    });
+    if !callable_member_reference {
+        return None;
+    }
+    let mut matching_inherent_members = answers
+        .iter()
+        .flat_map(|answer| answer.member_attributions.iter())
+        .filter(|attribution| attribution.target == *target)
+        .filter(|attribution| {
+            matches!(
+                &attribution.reach,
+                crate::analyzer::store::resolution_operation::SelectedRustMemberReach::Direct {
+                    declared_by_trait_implementation: false
+                }
+            ) && attribution.owner.is_class()
+                && !attribution.owner.is_synthetic()
+        });
+    let _written_method = matching_inherent_members.next()?;
+    if matching_inherent_members.next().is_some() {
+        return None;
+    }
+    Some(retained_gap_frontiers)
+}
+
+/// The unqualified standard prelude macro shape. The reference must be an
+/// unqualified macro reference whose name the standard-macro table owns, and
+/// the lookup must have no workspace answer. Every incomplete reason must be
+/// an operation-minted reason, or an unsupported semantic that names a
+/// retained attribute-macro frontier.
+fn rust_external_macro_frontiers(
+    answers: &[SelectedRustReferenceAnswer],
+    completion: &ResolutionCompletion,
+    canonical_targets: &std::collections::BTreeSet<SemanticId>,
+    definitions: &[CodeUnit],
+    lexical: &[LexicalDefinition],
+    callee_name: &str,
+) -> Option<Vec<crate::analyzer::store::resolution_operation::SelectedRustGapFrontier>> {
+    if !canonical_targets.is_empty()
+        || !definitions.is_empty()
+        || !lexical.is_empty()
+        || super::format_macro_dispatch::rust_standard_macro_prelude_owner(callee_name).is_none()
+    {
+        return None;
+    }
+    let unqualified_macro_reference = answers.iter().any(|answer| {
+        answer.resolution.site_metadata().is_some_and(|metadata| {
+            metadata.namespace() == ResolutionNamespace::Macro
+                && metadata.site_kind() == ResolutionSiteKind::MacroReference
+                && metadata.unqualified()
+        })
+    });
+    if !unqualified_macro_reference {
+        return None;
+    }
+    let ResolutionCompletion::Incomplete(reasons) = completion else {
+        return None;
+    };
+    let retained_gap_frontiers = answers
+        .iter()
+        .flat_map(|answer| answer.retained_gap_frontiers.iter().copied())
+        .collect::<Vec<_>>();
+    let mut frontiers = Vec::new();
+    for reason in reasons.iter() {
+        let crate::analyzer::resolution::ResolutionIncompleteReason::UnsupportedSemantic(semantic) =
+            reason
+        else {
+            return None;
+        };
+        // An operation-minted reason is generated-surface noise to the same
+        // gate in `generated_surface_only_completion`. Only this shape admits it.
+        if semantic.operation_local_number().is_some() {
+            continue;
+        }
+        let frontier = retained_gap_frontiers
+            .iter()
+            .find(|frontier| frontier.semantic == *semantic)?;
+        if !frontier.kind.is_attribute_macro_frontier() {
+            return None;
+        }
+        frontiers.push(*frontier);
+    }
+    // A completion of operation-minted reasons alone names no attribute
+    // frontier, so it does not close on the frontier this rule is about.
+    if frontiers.is_empty() {
+        return None;
+    }
+    frontiers.sort_unstable_by_key(|frontier| (frontier.semantic, frontier.kind.evidence_name()));
+    frontiers.dedup();
+    Some(frontiers)
+}
+
 fn adapt_definition_answer(
     site: &crate::analyzer::usages::get_definition::ResolvedReferenceSite,
     answers: Vec<SelectedRustReferenceAnswer>,
+    qualified_route_head: bool,
 ) -> DefinitionLookupOutcome {
     let canonical_targets = answers
         .iter()
         .flat_map(|answer| answer.resolution.binding().targets().iter().copied())
         .collect::<std::collections::BTreeSet<_>>();
+    let authored_member_candidate = answers
+        .iter()
+        .any(|answer| !answer.member_attributions.is_empty());
     let completion = answers
         .iter()
         .fold(ResolutionCompletion::Complete, |completion, answer| {
@@ -1453,6 +2181,68 @@ fn adapt_definition_answer(
         .collect::<Vec<_>>();
     inventory_details.sort_unstable();
     inventory_details.dedup();
+    let undecided_macro_module = inventory_details.iter().any(|detail| {
+        let parsed: serde_json::Value =
+            serde_json::from_str(detail).expect("an open inventory detail is JSON");
+        parsed["evidence"].as_array().is_some_and(|evidence| {
+            evidence.iter().any(|item| {
+                item["reason"] == "UnsupportedMacroGeneratedModule"
+                    && item["decided"].as_bool() == Some(false)
+            })
+        })
+    });
+    let macro_expansion_gaps = answers
+        .iter()
+        .flat_map(|answer| answer.macro_expansion_gaps.iter().cloned())
+        .collect::<Vec<_>>();
+    let generated_surface_gaps = answers
+        .iter()
+        .flat_map(|answer| answer.generated_surface_gaps.iter().copied())
+        .collect::<std::collections::BTreeSet<_>>();
+    let generated_item_surface = answers.iter().any(|answer| {
+        answer
+            .named_reasons
+            .iter()
+            .any(|(kind, _)| *kind == "GeneratedItemSurface")
+    }) || inventory_details.iter().any(|detail| {
+        let parsed: serde_json::Value =
+            serde_json::from_str(detail).expect("an open inventory detail is JSON");
+        parsed["evidence"].as_array().is_some_and(|evidence| {
+            evidence
+                .iter()
+                .any(|item| item["reason"] == "GeneratedItemSurface")
+        })
+    });
+    let macro_generated_surface = macro_expansion_gaps
+        .iter()
+        .any(|gap| gap.macro_name != "include")
+        || answers.iter().any(|answer| {
+            answer.named_reasons.iter().any(|(kind, evidence)| {
+                *kind == "UnsupportedMacroGeneratedModule"
+                    && !evidence.contains("\"macro\":\"include\"")
+            })
+        });
+    let callable_generated_surface = answers.iter().any(|answer| {
+        answer.resolution.site_metadata().is_some_and(|metadata| {
+            metadata.namespace() == ResolutionNamespace::Value
+                && metadata.site_kind() == ResolutionSiteKind::CallableReference
+        })
+    }) && (generated_item_surface || macro_generated_surface);
+    let member_generated_surface = macro_generated_surface
+        && answers.iter().any(|answer| {
+            answer
+                .resolution
+                .site_metadata()
+                .is_some_and(|metadata| metadata.site_kind() == ResolutionSiteKind::MemberReference)
+        });
+    let qualified_type_generated_surface = generated_item_surface
+        && qualified_route_head
+        && answers.iter().any(|answer| {
+            answer.resolution.site_metadata().is_some_and(|metadata| {
+                metadata.namespace() == ResolutionNamespace::Type
+                    && metadata.site_kind() == ResolutionSiteKind::TypeReference
+            })
+        });
     let mut named_reasons = answers
         .iter()
         .flat_map(|answer| answer.named_reasons.iter().cloned())
@@ -1465,16 +2255,25 @@ fn adapt_definition_answer(
         .collect::<Vec<_>>();
     boundary_import_names.sort_unstable();
     boundary_import_names.dedup();
+    let prelude_value_member_reference = named_reasons
+        .iter()
+        .any(|(name, _)| *name == "rust_prelude_item")
+        && answers.iter().any(|answer| {
+            answer.resolution.site_metadata().is_some_and(|metadata| {
+                metadata.site_kind() == ResolutionSiteKind::MemberReference
+                    && metadata.namespace() == ResolutionNamespace::Value
+            })
+        });
     stage_rust_member_attribution(&answers);
     let mut definitions = Vec::new();
     let mut lexical = Vec::new();
     let mut examined_answers = 0usize;
-    for answer in answers {
+    for answer in &answers {
         if !definition_answer_abstains(&answer.resolution) {
             examined_answers += 1;
         }
-        definitions.extend(answer.definitions);
-        lexical.extend(answer.lexical_definitions);
+        definitions.extend(answer.definitions.iter().cloned());
+        lexical.extend(answer.lexical_definitions.iter().cloned());
     }
     definitions.sort_unstable();
     definitions.dedup();
@@ -1532,6 +2331,35 @@ fn adapt_definition_answer(
                 }),
         )
         .collect::<Vec<_>>();
+    for gap in &macro_expansion_gaps {
+        diagnostics.push(DefinitionLookupDiagnostic {
+            claim: None,
+            kind: "UnsupportedMacroGeneratedSurface".to_owned(),
+            message: serde_json::json!({
+                "evidence": [{
+                    "reason": "UnexpandedMacroBoundary",
+                    "macro": gap.macro_name,
+                    "rel_path": gap.relative_path,
+                    "start_byte": gap.start_byte,
+                    "end_byte": gap.end_byte,
+                }]
+            })
+            .to_string(),
+        });
+    }
+    for semantic in &generated_surface_gaps {
+        diagnostics.push(DefinitionLookupDiagnostic {
+            claim: None,
+            kind: "GeneratedItemSurface".to_owned(),
+            message: serde_json::json!({
+                "evidence": [{
+                    "reason": "GeneratedItemSurface",
+                    "semantic": semantic.to_string(),
+                }]
+            })
+            .to_string(),
+        });
+    }
     if lexical.len() > 1 {
         diagnostics.push(DefinitionLookupDiagnostic {
             claim: None,
@@ -1541,6 +2369,17 @@ fn adapt_definition_answer(
             ),
         });
     }
+    // The shape and its reasons are decided by
+    // `rust_attribute_frontier_cannot_change_binding`, which documents why an
+    // attribute frontier cannot change this binding.
+    let attribute_frontier_closure = rust_attribute_frontier_cannot_change_binding(
+        &answers,
+        &completion,
+        &canonical_targets,
+        &definitions,
+        &lexical,
+        &site.text,
+    );
     // A reference that reached a block-local item names it, although the item
     // has no parser unit; see `rust_block_local_binding_is_decided`.
     let binding_complete = matches!(completion, ResolutionCompletion::Complete)
@@ -1548,7 +2387,8 @@ fn adapt_definition_answer(
             &definitions,
             &lexical,
             &completion,
-        );
+        )
+        || attribute_frontier_closure.is_some();
     let lexical_count = lexical.len();
     let lexical_definition = (lexical_count == 1).then(|| lexical.remove(0));
     // Display CodeUnits can compare equal for distinct source declarations.
@@ -1565,7 +2405,11 @@ fn adapt_definition_answer(
             reason,
             crate::analyzer::resolution::ResolutionIncompleteReason::InconsistentPrecedence(_)
         )));
-    let external_boundary = canonical_target_count == 0
+    // A value member reached through a named Rust prelude item is still an
+    // open member lookup. The prelude boundary does not establish that the
+    // selected member belongs to std.
+    let external_boundary = !prelude_value_member_reference
+        && canonical_target_count == 0
         && lexical_definition.is_none()
         && matches!(&completion, ResolutionCompletion::Incomplete(reasons)
         if reasons.iter().all(|reason| matches!(reason,
@@ -1574,6 +2418,112 @@ fn adapt_definition_answer(
                 ..
             }
         )));
+    // A selected source or lexical candidate can be only the authored side of
+    // an unexpanded generated surface. When the completion contains no other
+    // kind of gap and no displayable definition, preserve the partial local
+    // binding while grading the missing generated member as a boundary.
+    let macro_module_boundary = diagnostics.iter().any(|diagnostic| {
+        diagnostic.kind == "UnsupportedMacroGeneratedModule"
+            && !diagnostic.message.contains("\"macro\":\"include\"")
+    });
+    let private_macro_module_boundary = macro_expansion_gaps
+        .iter()
+        .any(|gap| gap.private_module_route);
+    let generated_surface_completion = macro_module_boundary
+        || callable_generated_surface
+        || member_generated_surface
+        || qualified_type_generated_surface
+        || diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.kind == "UnplacedRoutePrefix")
+        || !generated_surface_gaps.is_empty();
+    let generated_surface_only_completion = generated_surface_completion
+        && matches!(&completion, ResolutionCompletion::Incomplete(reasons)
+        if !reasons.is_empty() && reasons.iter().all(|reason| match reason {
+            crate::analyzer::resolution::ResolutionIncompleteReason::UnsupportedSemantic(semantic) => {
+                generated_surface_gaps.contains(semantic)
+                    || semantic.operation_local_number().is_some()
+                    || callable_generated_surface
+                    || member_generated_surface
+                    || qualified_type_generated_surface
+            }
+            crate::analyzer::resolution::ResolutionIncompleteReason::OpenBoundary { .. } => {
+                callable_generated_surface
+            }
+            _ => false,
+        }));
+    // Keep the specific structured reason beside the boundary status so
+    // census consumers distinguish unsupported macro/attribute surfaces from
+    // external crates.
+    let generated_surface_evidence = generated_surface_only_completion
+        && ((callable_generated_surface && (generated_item_surface || macro_module_boundary))
+            || (macro_module_boundary && private_macro_module_boundary)
+            || member_generated_surface
+            || qualified_type_generated_surface
+            || !generated_surface_gaps.is_empty())
+        && diagnostics.iter().any(|diagnostic| {
+            matches!(
+                diagnostic.kind.as_str(),
+                "UnsupportedMacroGeneratedModule"
+                    | "UnsupportedMacroGeneratedSurface"
+                    | "UnloweredDeclaration"
+                    | "GeneratedItemSurface"
+            )
+        });
+    // A macro boundary on an ordinary member lookup leaves the authored
+    // member candidate undecided. An explicit generated-item or generated
+    // module fact is required before that surface closes the lookup.
+    let member_generated_surface_boundary = member_generated_surface
+        && (generated_item_surface || !generated_surface_gaps.is_empty() || macro_module_boundary);
+    // A macro gate in a different module file is a concrete selected route
+    // from this reference to that generated surface. A direct lookup in the
+    // file with the undecided module declaration stays open.
+    let explicit_macro_gated_import_route = macro_module_boundary
+        && macro_expansion_gaps
+            .iter()
+            .any(|gap| gap.relative_path != site.path);
+    let has_external_declared_unindexed_boundary = matches!(
+        &completion,
+        ResolutionCompletion::Incomplete(reasons)
+            if reasons.iter().any(|reason| matches!(
+                reason,
+                crate::analyzer::resolution::ResolutionIncompleteReason::OpenBoundary {
+                    status: crate::analyzer::structural::BoundaryStatus::ExternalDeclaredUnindexed,
+                    ..
+                }
+            ))
+    );
+    let generated_surface_boundary = generated_surface_evidence
+        && !authored_member_candidate
+        && definitions.is_empty()
+        && lexical_count == 0
+        && (!undecided_macro_module
+            || explicit_macro_gated_import_route
+            || (member_generated_surface_boundary && !has_external_declared_unindexed_boundary))
+        && (!member_generated_surface || member_generated_surface_boundary);
+    // An undecided macro module accounts for the unresolved name, so its
+    // generic route gap adds nothing. An unrelated generated surface must not
+    // erase the evidence for a genuine unplaced prefix.
+    let generated_surface_replaces_route_gap =
+        generated_surface_boundary || (macro_module_boundary && undecided_macro_module);
+    if generated_surface_replaces_route_gap {
+        diagnostics.retain(|diagnostic| diagnostic.kind != "UnplacedRoutePrefix");
+    }
+    if generated_surface_boundary {
+        diagnostics.push(DefinitionLookupDiagnostic {
+            claim: None,
+            kind: crate::analyzer::usages::get_definition::RUST_UNSUPPORTED_GENERATED_SURFACE_BOUNDARY_DIAGNOSTIC_KIND
+                .to_owned(),
+            message: "selected Rust binding stops at a structured macro or attribute surface"
+                .to_owned(),
+        });
+    }
+    let inactive_cfg_boundary = diagnostics
+        .iter()
+        .any(|diagnostic| diagnostic.kind == "InactiveCfgPlacement");
+    if inactive_cfg_boundary {
+        diagnostics.retain(|diagnostic| diagnostic.kind != "UnplacedRoutePrefix");
+    }
     let status = if external_boundary {
         diagnostics.push(DefinitionLookupDiagnostic {
             claim: (!boundary_import_names.is_empty()).then(|| {
@@ -1582,6 +2532,8 @@ fn adapt_definition_answer(
             kind: "unindexed_import_boundary".to_owned(),
             message: format!("selected Rust binding reaches an unindexed import: {completion:?}"),
         });
+        DefinitionLookupStatus::UnresolvableImportBoundary
+    } else if generated_surface_boundary || inactive_cfg_boundary {
         DefinitionLookupStatus::UnresolvableImportBoundary
     } else if unordered_candidates {
         diagnostics.push(DefinitionLookupDiagnostic {
@@ -1638,6 +2590,65 @@ fn adapt_definition_answer(
         });
         DefinitionLookupStatus::Ambiguous
     };
+    let mut attribute_frontier_evidence = answers
+        .iter()
+        .flat_map(|answer| answer.retained_gap_frontiers.iter().copied())
+        .filter(|frontier| frontier.kind.is_attribute_macro_frontier())
+        .collect::<Vec<_>>();
+    attribute_frontier_evidence
+        .sort_unstable_by_key(|frontier| (frontier.semantic, frontier.kind.evidence_name()));
+    attribute_frontier_evidence.dedup();
+    if attribute_frontier_closure.is_none() {
+        for frontier in attribute_frontier_evidence {
+            diagnostics.push(DefinitionLookupDiagnostic {
+                claim: None,
+                kind: "GeneratedItemSurface".to_owned(),
+                message: serde_json::json!({
+                    "evidence": [{
+                        "reason": "GeneratedItemSurface",
+                        "semantic": frontier.semantic.to_string(),
+                        "gap_kind": frontier.kind.evidence_name(),
+                        "native_macro_invocation": false,
+                    }]
+                })
+                .to_string(),
+            });
+        }
+    }
+    if let Some(closure) = attribute_frontier_closure {
+        let (kind, reason, frontiers) = match closure {
+            AttributeFrontierClosure::WrittenInherentMethod(frontiers) => (
+                "attribute_macro_frontier_cannot_change_inherent_dispatch",
+                "attribute macro frontier cannot change inherent dispatch",
+                frontiers,
+            ),
+            AttributeFrontierClosure::ExternalMacro(frontiers) => (
+                "attribute_macro_frontier_cannot_change_external_macro_binding",
+                "attribute macro frontier cannot change external macro binding",
+                frontiers,
+            ),
+        };
+        diagnostics.push(DefinitionLookupDiagnostic {
+            claim: None,
+            kind: kind.to_owned(),
+            message: serde_json::json!({
+                "reason": reason,
+                "evidence": frontiers.iter().map(|frontier| serde_json::json!({
+                    "semantic": frontier.semantic.to_string(),
+                    "gap_kind": frontier.kind.evidence_name(),
+                })).collect::<Vec<_>>(),
+            })
+            .to_string(),
+        });
+    }
+    if generated_surface_evidence && status == DefinitionLookupStatus::Incomplete {
+        let incomplete = diagnostics
+            .iter()
+            .position(|diagnostic| diagnostic.kind == "incomplete_binding")
+            .expect("an incomplete generated surface has an incomplete-binding diagnostic");
+        let diagnostic = diagnostics.remove(incomplete);
+        diagnostics.insert(0, diagnostic);
+    }
     if status == DefinitionLookupStatus::Ambiguous
         && !diagnostics
             .iter()

@@ -4,8 +4,10 @@ use super::super::resolution::with_resolution_read_progress_handler;
 use super::super::resolution_prepare::resolution_rows::{code, from_code, namespace_code};
 use super::super::resolution_prepare::typed_rows::{self, TypedBodyDecoder};
 use super::super::resolution_selection::SelectedResolutionMountInventory;
+use super::super::resolution_typed::{PageOutcome, SelectedResolutionTypedSource};
 use super::super::{Result, StoreError};
 use super::codec;
+use super::lexical::semantic_cells as semantic_pair;
 use crate::CancellationToken;
 use crate::analyzer::resolution::*;
 #[cfg(test)]
@@ -26,15 +28,6 @@ impl TypedBodyDecoder for StageBodyDecoder {
     }
     fn completion(self, body: Option<&str>) -> ResolutionCompletion {
         codec::decode_completion(body)
-    }
-}
-
-fn semantic_pair(semantic: SemanticId) -> (Option<i64>, Option<i64>) {
-    let cell = codec::encode_semantic(semantic);
-    if cell < 0 {
-        (None, Some(-cell))
-    } else {
-        (Some(cell), None)
     }
 }
 
@@ -64,12 +57,13 @@ impl EncodedRow {
         self.values.push(value.into());
     }
     fn semantic(&mut self, name: &str, value: SemanticId) {
-        let (key, shared) = semantic_pair(value);
-        self.cell(&format!("{name}_key"), json!(key));
-        self.cell(&format!("{name}_shared"), json!(shared));
+        self.semantic_cells(name, semantic_pair(value));
     }
     fn optional_semantic(&mut self, name: &str, value: Option<SemanticId>) {
         let (key, shared) = value.map(semantic_pair).unwrap_or((None, None));
+        self.semantic_cells(name, (key, shared));
+    }
+    fn semantic_cells(&mut self, name: &str, (key, shared): (Option<i64>, Option<i64>)) {
         self.cell(&format!("{name}_key"), json!(key));
         self.cell(&format!("{name}_shared"), json!(shared));
     }
@@ -129,6 +123,47 @@ fn encode_rows(
         );
         row.body("completion", completion_value(item.rule().completion()));
         emit("type_transfers", sequence, row)?;
+    }
+    for (sequence, item) in typed.type_arguments().iter().enumerate() {
+        if cancellation.is_cancelled() {
+            return Ok(false);
+        }
+        let mut row = EncodedRow::new();
+        row.semantic("application_slot", item.application());
+        row.semantic("argument_slot", item.argument());
+        row.cell("ordinal", i64::from(item.ordinal()));
+        row.cell("indirection_delta", item.indirection_delta());
+        row.cell(
+            "reference_indirection_delta",
+            item.reference_indirection_delta(),
+        );
+        emit("type_arguments", sequence, row)?;
+    }
+    for (sequence, item) in typed.generic_type_alias_parameters().iter().enumerate() {
+        if cancellation.is_cancelled() {
+            return Ok(false);
+        }
+        let mut row = EncodedRow::new();
+        row.semantic("alias_definition", item.alias());
+        row.semantic("parameter_definition", item.parameter());
+        row.semantic("target_slot", item.target());
+        row.cell("ordinal", i64::from(item.ordinal()));
+        row.cell("indirection_delta", item.indirection_delta());
+        row.cell(
+            "reference_indirection_delta",
+            item.reference_indirection_delta(),
+        );
+        emit("generic_type_alias_parameters", sequence, row)?;
+    }
+    for (sequence, item) in typed.generic_formals().iter().enumerate() {
+        if cancellation.is_cancelled() {
+            return Ok(false);
+        }
+        let mut row = EncodedRow::new();
+        row.semantic("owner_definition", item.owner());
+        row.cell("ordinal", i64::from(item.ordinal()));
+        row.semantic("parameter_definition", item.parameter());
+        emit("generic_formals", sequence, row)?;
     }
     for (sequence, item) in typed.intrinsic_seeds().iter().enumerate() {
         if cancellation.is_cancelled() {
@@ -301,6 +336,7 @@ fn encode_rows(
         row.semantic("reference", item.reference());
         row.semantic("frontier", item.frontier());
         row.cell("kind", code(ALL_RESOLUTION_SUPERTYPE_KINDS, item.kind()));
+        row.cell("parent_ordinal", i64::from(item.parent_ordinal()));
         emit("supertypes", sequence, row)?;
     }
     for (sequence, item) in typed.property_gaps().iter().enumerate() {
@@ -334,13 +370,18 @@ fn encode_rows(
         );
         row.body(
             "argument_slots",
-            json!(
-                item.argument_slots()
+            json!([
+                item.arguments()
                     .iter()
-                    .copied()
-                    .map(codec::encode_semantic)
-                    .collect::<Vec<_>>()
-            ),
+                    .map(|argument| json!([
+                        argument.list_ordinal(),
+                        argument.ordinal(),
+                        codec::encode_semantic(argument.slot()),
+                        argument.label(),
+                    ]))
+                    .collect::<Vec<_>>(),
+                item.argument_lists(),
+            ]),
         );
         row.body(
             "type_argument_slots",
@@ -419,7 +460,19 @@ fn encode_rows(
                 item.result_types()
                     .iter()
                     .map(|result| json!([result.ordinal(), codec::encode_semantic(result.slot())]))
-                    .collect::<Vec<_>>()
+                    .collect::<Vec<_>>(),
+                item.parameter_lists(),
+                item.parameter_applicability()
+                    .iter()
+                    .map(|parameter| json!([
+                        parameter.ordinal(),
+                        parameter.list_ordinal(),
+                        parameter.label(),
+                        parameter.has_default(),
+                        parameter.semantics_known(),
+                    ]))
+                    .collect::<Vec<_>>(),
+                item.extension_receiver().map(codec::encode_semantic),
             ]),
         );
         emit("callable_signatures", sequence, row)?;
@@ -637,21 +690,15 @@ fn decode_frontier(row: &Row<'_>) -> Result<LoweredTypedFrontier> {
 }
 fn decode_transfer(row: &Row<'_>) -> Result<LoweredTypeTransfer> {
     let completion: Option<String> = row.get("completion_json")?;
-    Ok(LoweredTypeTransfer::new(
+    Ok(typed_rows::decode_type_transfer_fields(
         row_semantic(row, "source_slot")?,
-        from_code(
-            ALL_RESOLUTION_TYPE_TRANSFER_KINDS,
-            row.get("kind")?,
-            "stage transfer kind",
-        ),
-        TypeTransferRule::new_with_reference_indirection(
-            row_semantic(row, "rule")?,
-            row_semantic(row, "target_slot")?,
-            row.get("indirection_delta")?,
-            row.get("reference_indirection_delta")?,
-            typed_rows::value_transform_from_code(row.get("value_transform")?),
-            codec::decode_completion(completion.as_deref()),
-        ),
+        row_semantic(row, "rule")?,
+        row_semantic(row, "target_slot")?,
+        row.get("kind")?,
+        row.get("indirection_delta")?,
+        row.get("reference_indirection_delta")?,
+        row.get("value_transform")?,
+        codec::decode_completion(completion.as_deref()),
     ))
 }
 fn decode_type_component(row: &Row<'_>) -> Result<LoweredTypeComponent> {
@@ -670,6 +717,43 @@ fn decode_type_component(row: &Row<'_>) -> Result<LoweredTypeComponent> {
         row_semantic(row, "component_slot")?,
     ))
 }
+fn decode_declared_type_argument(row: &Row<'_>) -> Result<LoweredDeclaredTypeArgument> {
+    let position: i64 = row.get("ordinal")?;
+    Ok(LoweredDeclaredTypeArgument::new(
+        row_semantic(row, "owner_slot")?,
+        u32::try_from(position).expect("declared type argument ordinal fits u32"),
+        row_semantic(row, "argument_slot")?,
+    ))
+}
+
+fn decode_type_argument(row: &Row<'_>) -> Result<LoweredTypeArgument> {
+    Ok(LoweredTypeArgument::new(
+        row_semantic(row, "application_slot")?,
+        u32::try_from(row.get::<_, i64>("ordinal")?).expect("stage type argument ordinal fits u32"),
+        row_semantic(row, "argument_slot")?,
+        row.get("indirection_delta")?,
+        row.get("reference_indirection_delta")?,
+    ))
+}
+fn decode_generic_type_alias_parameter(row: &Row<'_>) -> Result<LoweredGenericTypeAliasParameter> {
+    Ok(LoweredGenericTypeAliasParameter::new(
+        row_semantic(row, "alias_definition")?,
+        u32::try_from(row.get::<_, i64>("ordinal")?)
+            .expect("stage generic alias parameter ordinal fits u32"),
+        row_semantic(row, "parameter_definition")?,
+        row_semantic(row, "target_slot")?,
+        row.get("indirection_delta")?,
+        row.get("reference_indirection_delta")?,
+    ))
+}
+fn decode_generic_formal(row: &Row<'_>) -> Result<LoweredGenericFormal> {
+    Ok(LoweredGenericFormal::new(
+        row_semantic(row, "owner_definition")?,
+        u32::try_from(row.get::<_, i64>("ordinal")?)
+            .expect("stage generic formal ordinal fits u32"),
+        row_semantic(row, "parameter_definition")?,
+    ))
+}
 fn decode_underlying_type(row: &Row<'_>) -> Result<LoweredUnderlyingType> {
     Ok(LoweredUnderlyingType::new(
         row_semantic(row, "definition")?,
@@ -680,40 +764,38 @@ fn decode_intrinsic(row: &Row<'_>) -> Result<LoweredIntrinsicSeed> {
     let values: String = row.get("possible_values_json")?;
     let completion: Option<String> = row.get("completion_json")?;
     let spelling: String = row.get("spelling")?;
-    Ok(LoweredIntrinsicSeed::new(
+    Ok(typed_rows::decode_intrinsic_seed_fields(
+        row_semantic(row, "slot")?,
+        row.get("kind")?,
+        &spelling,
+        typed_rows::decode_intrinsic_values(StageBodyDecoder, &values),
+        codec::decode_completion(completion.as_deref()),
+    ))
+}
+
+fn decode_intrinsic_type_descriptor(row: &Row<'_>) -> Result<LoweredIntrinsicTypeDescriptor> {
+    Ok(LoweredIntrinsicTypeDescriptor::new(
+        row_semantic(row, "identity")?,
         from_code(
             ALL_INTRINSIC_TYPE_KINDS,
             row.get("kind")?,
-            "stage intrinsic kind",
+            "stage intrinsic type kind",
         ),
-        spelling,
-        TypedFrontierState::new(
-            row_semantic(row, "slot")?,
-            typed_rows::decode_intrinsic_values(StageBodyDecoder, &values),
-            codec::decode_completion(completion.as_deref()),
-        ),
+        row.get::<_, String>("spelling")?,
     ))
 }
 fn decode_projection(row: &Row<'_>) -> Result<LoweredBindingProjection> {
-    Ok(LoweredBindingProjection::new(
+    Ok(typed_rows::decode_binding_projection_fields(
         row_semantic(row, "reference")?,
         row_semantic(row, "output_slot")?,
-        from_code(
-            ALL_BINDING_PROJECTION_KINDS,
-            row.get("kind")?,
-            "stage projection kind",
-        ),
+        row.get("kind")?,
     ))
 }
 fn decode_declaration_type(row: &Row<'_>) -> Result<LoweredDeclarationTypeProperty> {
-    Ok(LoweredDeclarationTypeProperty::new(
+    Ok(typed_rows::decode_declaration_type_fields(
         row_semantic(row, "definition")?,
         row_semantic(row, "slot")?,
-        from_code(
-            ALL_DECLARATION_TYPE_ROLES,
-            row.get("role")?,
-            "stage declaration role",
-        ),
+        row.get("role")?,
     ))
 }
 fn decode_visibility(row: &Row<'_>) -> Result<LoweredDeclarationVisibilityProperty> {
@@ -733,13 +815,13 @@ fn decode_member_owner(row: &Row<'_>) -> Result<LoweredMemberOwnerProperty> {
     let kind: String = row.get("member_kind")?;
     let access: String = row.get("member_access")?;
     let compatibility: String = row.get("qualifier_compatibility")?;
-    Ok(LoweredMemberOwnerProperty::new(
+    Ok(typed_rows::decode_member_owner_fields(
         row_semantic(row, "definition")?,
         row_semantic(row, "owner_definition")?,
         codec::decode_node(row.get("owner_scope_head_node")?),
-        typed_rows::member_kind_from_label(&kind),
-        typed_rows::member_access_from_label(&access),
-        typed_rows::member_qualifier_compatibility_from_label(&compatibility),
+        &kind,
+        &access,
+        &compatibility,
     ))
 }
 fn decode_deferred_owner(row: &Row<'_>) -> Result<LoweredDeferredMemberOwner> {
@@ -754,39 +836,28 @@ fn decode_deferred_owner(row: &Row<'_>) -> Result<LoweredDeferredMemberOwner> {
 fn decode_construction_requirement(
     row: &Row<'_>,
 ) -> Result<LoweredConstructionRequirementProperty> {
-    Ok(LoweredConstructionRequirementProperty::new(
+    Ok(typed_rows::decode_construction_requirement_fields(
         row_semantic(row, "definition")?,
         row_semantic(row, "required_owner_definition")?,
-        from_code(
-            ALL_RESOLUTION_CONSTRUCTION_REQUIREMENT_KINDS,
-            row.get("kind")?,
-            "stage construction kind",
-        ),
+        row.get("kind")?,
     ))
 }
 fn decode_supertype(row: &Row<'_>) -> Result<LoweredSupertypeProperty> {
-    Ok(LoweredSupertypeProperty::new(
+    Ok(typed_rows::decode_supertype_fields(
         row_semantic(row, "definition")?,
         row_semantic(row, "reference")?,
         row_semantic(row, "frontier")?,
-        from_code(
-            ALL_RESOLUTION_SUPERTYPE_KINDS,
-            row.get("kind")?,
-            "stage supertype kind",
-        ),
+        row.get("kind")?,
+        row.get("parent_ordinal")?,
     ))
 }
 fn decode_property_gap(row: &Row<'_>) -> Result<LoweredDefinitionPropertyGap> {
-    Ok(LoweredDefinitionPropertyGap::new(
+    Ok(typed_rows::decode_definition_property_gap_fields(
         row_semantic(row, "definition")?,
-        ResolutionSiteId::try_from_index(row.get("source_site")?).expect("stage source site fits"),
-        from_code(
-            ALL_RESOLUTION_GAP_KINDS,
-            row.get("kind")?,
-            "stage property gap kind",
-        ),
+        row.get("kind")?,
         row_semantic(row, "frontier")?,
         row_semantic(row, "reason")?,
+        row.get("source_site")?,
     ))
 }
 fn decode_signature(row: &Row<'_>) -> Result<LoweredCallableSignatureProperty> {
@@ -825,10 +896,42 @@ pub(in crate::analyzer::store) fn visit_type_transfer_pages_from_sources(
     cancellation: &CancellationToken,
     visitor: &mut TypedFactPageVisitor<'_, SelectedTypedRow<LoweredTypeTransfer>>,
 ) -> Result<TypedFactReadOutcome> {
-    visit_stage_rows(
+    visit_type_transfer_pages(
         selection,
         VISIT_TYPE_TRANSFER_PAGES_FROM_SOURCES_SQL,
-        &[&semantic_request_json(request)],
+        request,
+        cancellation,
+        visitor,
+    )
+}
+
+pub(in crate::analyzer::store) fn visit_type_transfer_pages_to_targets(
+    selection: &SelectedResolutionMountInventory<'_>,
+    request: TypedFactRequest<'_, SemanticId>,
+    cancellation: &CancellationToken,
+    visitor: &mut TypedFactPageVisitor<'_, SelectedTypedRow<LoweredTypeTransfer>>,
+) -> Result<TypedFactReadOutcome> {
+    visit_type_transfer_pages(
+        selection,
+        VISIT_TYPE_TRANSFER_PAGES_TO_TARGETS_SQL,
+        request,
+        cancellation,
+        visitor,
+    )
+}
+
+fn visit_type_transfer_pages(
+    selection: &SelectedResolutionMountInventory<'_>,
+    sql: &str,
+    request: TypedFactRequest<'_, SemanticId>,
+    cancellation: &CancellationToken,
+    visitor: &mut TypedFactPageVisitor<'_, SelectedTypedRow<LoweredTypeTransfer>>,
+) -> Result<TypedFactReadOutcome> {
+    let request = semantic_request_json(request);
+    visit_stage_rows(
+        selection,
+        sql,
+        &[&request],
         cancellation,
         visitor,
         decode_transfer,
@@ -837,23 +940,6 @@ pub(in crate::analyzer::store) fn visit_type_transfer_pages_from_sources(
 }
 
 pub(in crate::analyzer::store) const VISIT_TYPE_TRANSFER_PAGES_TO_TARGETS_SQL: &str = "SELECT fact.*,json(fact.completion) AS completion_json FROM json_each(?1) request CROSS JOIN temp.selected_resolution_stage_type_transfers fact ON fact.target_slot_key IS request.value->>0 AND fact.target_slot_shared IS request.value->>1 JOIN temp.selected_resolution_scope_mounts scope ON scope.mount_ordinal=fact.host_ordinal";
-
-pub(in crate::analyzer::store) fn visit_type_transfer_pages_to_targets(
-    selection: &SelectedResolutionMountInventory<'_>,
-    request: TypedFactRequest<'_, SemanticId>,
-    cancellation: &CancellationToken,
-    visitor: &mut TypedFactPageVisitor<'_, SelectedTypedRow<LoweredTypeTransfer>>,
-) -> Result<TypedFactReadOutcome> {
-    visit_stage_rows(
-        selection,
-        VISIT_TYPE_TRANSFER_PAGES_TO_TARGETS_SQL,
-        &[&semantic_request_json(request)],
-        cancellation,
-        visitor,
-        decode_transfer,
-        |row, evidence| evidence.include(row.rule().completion()),
-    )
-}
 
 pub(in crate::analyzer::store) const VISIT_TYPE_COMPONENT_PAGES_FOR_CONTAINERS_SQL: &str = "SELECT fact.* FROM json_each(?1) request CROSS JOIN temp.selected_resolution_stage_type_components fact ON fact.container_slot_key IS request.value->>0 AND fact.container_slot_shared IS request.value->>1 JOIN temp.selected_resolution_scope_mounts scope ON scope.mount_ordinal=fact.host_ordinal";
 
@@ -870,6 +956,83 @@ pub(in crate::analyzer::store) fn visit_type_component_pages_for_containers(
         cancellation,
         visitor,
         decode_type_component,
+        |_, _| {},
+    )
+}
+
+pub(in crate::analyzer::store) const VISIT_DECLARED_TYPE_ARGUMENT_PAGES_FOR_OWNERS_SQL: &str = "SELECT fact.* FROM json_each(?1) request CROSS JOIN temp.selected_resolution_stage_declared_type_arguments fact ON fact.owner_slot_key IS request.value->>0 AND fact.owner_slot_shared IS request.value->>1 JOIN temp.selected_resolution_scope_mounts scope ON scope.mount_ordinal=fact.host_ordinal";
+
+pub(in crate::analyzer::store) fn visit_declared_type_argument_pages_for_owners(
+    selection: &SelectedResolutionMountInventory<'_>,
+    request: TypedFactRequest<'_, SemanticId>,
+    cancellation: &CancellationToken,
+    visitor: &mut TypedFactPageVisitor<'_, SelectedTypedRow<LoweredDeclaredTypeArgument>>,
+) -> Result<TypedFactReadOutcome> {
+    visit_stage_rows(
+        selection,
+        VISIT_DECLARED_TYPE_ARGUMENT_PAGES_FOR_OWNERS_SQL,
+        &[&semantic_request_json(request)],
+        cancellation,
+        visitor,
+        decode_declared_type_argument,
+        |_, _| {},
+    )
+}
+
+pub(in crate::analyzer::store) const VISIT_TYPE_ARGUMENT_PAGES_FOR_APPLICATIONS_SQL: &str = "SELECT fact.* FROM json_each(?1) request CROSS JOIN temp.selected_resolution_stage_type_arguments fact ON fact.application_slot_key IS request.value->>0 AND fact.application_slot_shared IS request.value->>1 JOIN temp.selected_resolution_scope_mounts scope ON scope.mount_ordinal=fact.host_ordinal";
+
+pub(in crate::analyzer::store) fn visit_type_argument_pages_for_applications(
+    selection: &SelectedResolutionMountInventory<'_>,
+    request: TypedFactRequest<'_, SemanticId>,
+    cancellation: &CancellationToken,
+    visitor: &mut TypedFactPageVisitor<'_, SelectedTypedRow<LoweredTypeArgument>>,
+) -> Result<TypedFactReadOutcome> {
+    visit_stage_rows(
+        selection,
+        VISIT_TYPE_ARGUMENT_PAGES_FOR_APPLICATIONS_SQL,
+        &[&semantic_request_json(request)],
+        cancellation,
+        visitor,
+        decode_type_argument,
+        |_, _| {},
+    )
+}
+
+pub(in crate::analyzer::store) const VISIT_GENERIC_TYPE_ALIAS_PARAMETER_PAGES_FOR_DEFINITIONS_SQL: &str = "SELECT fact.* FROM json_each(?1) request CROSS JOIN temp.selected_resolution_stage_generic_type_alias_parameters fact ON fact.alias_definition_key IS request.value->>0 AND fact.alias_definition_shared IS request.value->>1 JOIN temp.selected_resolution_scope_mounts scope ON scope.mount_ordinal=fact.host_ordinal";
+
+pub(in crate::analyzer::store) fn visit_generic_type_alias_parameter_pages_for_definitions(
+    selection: &SelectedResolutionMountInventory<'_>,
+    request: TypedFactRequest<'_, SemanticId>,
+    cancellation: &CancellationToken,
+    visitor: &mut TypedFactPageVisitor<'_, SelectedTypedRow<LoweredGenericTypeAliasParameter>>,
+) -> Result<TypedFactReadOutcome> {
+    visit_stage_rows(
+        selection,
+        VISIT_GENERIC_TYPE_ALIAS_PARAMETER_PAGES_FOR_DEFINITIONS_SQL,
+        &[&semantic_request_json(request)],
+        cancellation,
+        visitor,
+        decode_generic_type_alias_parameter,
+        |_, _| {},
+    )
+}
+
+pub(in crate::analyzer::store) const VISIT_GENERIC_FORMAL_PAGES_FOR_OWNERS_SQL: &str = "SELECT fact.* FROM json_each(?1) request CROSS JOIN temp.selected_resolution_stage_generic_formals fact ON fact.owner_definition_key IS request.value->>0 AND fact.owner_definition_shared IS request.value->>1 JOIN temp.selected_resolution_scope_mounts scope ON scope.mount_ordinal=fact.host_ordinal";
+
+pub(in crate::analyzer::store) fn visit_generic_formal_pages_for_owners(
+    selection: &SelectedResolutionMountInventory<'_>,
+    request: TypedFactRequest<'_, SemanticId>,
+    cancellation: &CancellationToken,
+    visitor: &mut TypedFactPageVisitor<'_, SelectedTypedRow<LoweredGenericFormal>>,
+) -> Result<TypedFactReadOutcome> {
+    selection.ensure_generic_formals_schema(selection.connection())?;
+    visit_stage_rows(
+        selection,
+        VISIT_GENERIC_FORMAL_PAGES_FOR_OWNERS_SQL,
+        &[&semantic_request_json(request)],
+        cancellation,
+        visitor,
+        decode_generic_formal,
         |_, _| {},
     )
 }
@@ -1265,6 +1428,25 @@ pub(in crate::analyzer::store) fn visit_intrinsic_seed_pages_for_type_identities
     )
 }
 
+pub(in crate::analyzer::store) const INTRINSIC_TYPE_DESCRIPTORS_SQL: &str = "SELECT DISTINCT fact.host_ordinal,named.identity_key AS identity_key,named.identity_shared AS identity_shared,fact.kind,fact.spelling FROM json_each(?1) request CROSS JOIN temp.selected_resolution_stage_intrinsic_seed_identities named ON named.identity_key IS request.value->>0 AND named.identity_shared IS request.value->>1 JOIN temp.selected_resolution_stage_intrinsic_seeds fact ON fact.host_ordinal=named.host_ordinal AND fact.slot_key IS named.slot_key AND fact.slot_shared IS named.slot_shared JOIN temp.selected_resolution_scope_mounts scope ON scope.mount_ordinal=fact.host_ordinal ORDER BY fact.host_ordinal,named.identity_key,named.identity_shared,fact.kind,fact.spelling";
+
+pub(in crate::analyzer::store) fn visit_intrinsic_type_descriptor_pages_for_type_identities(
+    selection: &SelectedResolutionMountInventory<'_>,
+    type_identities: TypedFactRequest<'_, SemanticId>,
+    cancellation: &CancellationToken,
+    visitor: &mut TypedFactPageVisitor<'_, SelectedTypedRow<LoweredIntrinsicTypeDescriptor>>,
+) -> Result<TypedFactReadOutcome> {
+    visit_stage_rows(
+        selection,
+        INTRINSIC_TYPE_DESCRIPTORS_SQL,
+        &[&semantic_request_json(type_identities)],
+        cancellation,
+        visitor,
+        decode_intrinsic_type_descriptor,
+        |_, _| {},
+    )
+}
+
 pub(in crate::analyzer::store) const MEMBER_SCOPE_HEAD_SQL: &str = "SELECT fact.* FROM json_each(?1) request CROSS JOIN temp.selected_resolution_stage_member_scopes fact ON fact.scope_head_node=request.value JOIN temp.selected_resolution_scope_mounts scope ON scope.mount_ordinal=fact.host_ordinal";
 pub(in crate::analyzer::store) fn visit_member_scope_pages_for_heads(
     selection: &SelectedResolutionMountInventory<'_>,
@@ -1319,29 +1501,9 @@ pub(in crate::analyzer::store) fn visit_deferred_member_owner_pages_for_lookup_n
 }
 
 fn decode_call_obligation(row: &Row<'_>) -> Result<LoweredCallApplicabilityObligation> {
-    let arguments: Vec<i64> = serde_json::from_str(&row.get::<_, String>("argument_slots_json")?)
-        .expect("argument cells are integers");
-    let type_argument_cells: Vec<serde_json::Value> =
-        serde_json::from_str(&row.get::<_, String>("type_argument_slots_json")?)
-            .expect("type argument cells are a JSON array");
-    assert!(
-        (4..=5).contains(&type_argument_cells.len()),
-        "stage call type argument body has legacy or result-extended shape"
-    );
-    let type_arguments: Vec<i64> = serde_json::from_value(type_argument_cells[0].clone())
-        .expect("call type arguments are integers");
-    let owner_type_arguments: Vec<i64> = serde_json::from_value(type_argument_cells[1].clone())
-        .expect("owner type arguments are integers");
-    let expected: Option<i64> = serde_json::from_value(type_argument_cells[2].clone())
-        .expect("expected result slot is an optional integer");
-    let segment: Option<i64> = serde_json::from_value(type_argument_cells[3].clone())
-        .expect("owner type segment is an optional integer");
-    let extra_result_slots: Vec<i64> = type_argument_cells
-        .get(4)
-        .map(|cell| serde_json::from_value(cell.clone()).expect("extra result slots are integers"))
-        .unwrap_or_default();
-    let rules: Vec<i64> = serde_json::from_str(&row.get::<_, String>("eligible_rules_json")?)
-        .expect("rule cells are integers");
+    let arguments: String = row.get("argument_slots_json")?;
+    let type_arguments: String = row.get("type_argument_slots_json")?;
+    let rules: String = row.get("eligible_rules_json")?;
     let completion: Option<String> = row.get("completion_json")?;
     let receiver_key: Option<i64> = row.get("receiver_slot_key")?;
     let receiver_shared: Option<i64> = row.get("receiver_slot_shared")?;
@@ -1349,47 +1511,29 @@ fn decode_call_obligation(row: &Row<'_>) -> Result<LoweredCallApplicabilityOblig
         (None, None) => None,
         _ => Some(row_semantic(row, "receiver_slot")?),
     };
-    Ok(LoweredCallApplicabilityObligation::new(
-        row_semantic(row, "call")?,
+    let language_label: String = row.get("semantic_language")?;
+    let language = brokk_bifrost_core::analyzer::Language::from_config_label(&language_label)
+        .ok_or_else(|| {
+            StoreError::corrupt(format!("unknown selected language {language_label:?}"))
+        })?;
+    Ok(typed_rows::decode_call_obligation_body(
+        StageBodyDecoder,
+        language,
         row_semantic(row, "callee_reference")?,
+        row_semantic(row, "call")?,
         receiver,
         row_semantic(row, "result_slot")?,
-        arguments
-            .into_iter()
-            .map(codec::decode_semantic)
-            .collect::<Vec<_>>(),
-        rules
-            .into_iter()
-            .map(|rule| from_code(ALL_RESOLUTION_ENGINE_RULE_KINDS, rule, "stage call rule"))
-            .collect::<Vec<_>>(),
         row.get("explicit_type_argument_count")?,
         row_semantic(row, "applicability_reason")?,
-        codec::decode_completion(completion.as_deref()),
-    )
-    .with_extra_result_slots(
-        extra_result_slots
-            .into_iter()
-            .map(codec::decode_semantic)
-            .collect::<Vec<_>>(),
-    )
-    .with_type_argument_slots(
-        type_arguments
-            .into_iter()
-            .map(codec::decode_semantic)
-            .collect::<Vec<_>>(),
-    )
-    .with_owner_type_arguments(
-        segment.map(codec::decode_semantic),
-        owner_type_arguments
-            .into_iter()
-            .map(codec::decode_semantic)
-            .collect::<Vec<_>>(),
-    )
-    .with_expected_result_slot(expected.map(codec::decode_semantic)))
+        &arguments,
+        &type_arguments,
+        &rules,
+        completion.as_deref(),
+    ))
 }
 
 pub(in crate::analyzer::store) const VISIT_CALL_APPLICABILITY_PAGES_FOR_CALLEE_REFERENCES_SQL:
-    &str = "SELECT fact.*,json(fact.argument_slots) AS argument_slots_json,json(fact.type_argument_slots) AS type_argument_slots_json,json(fact.eligible_rules) AS eligible_rules_json,json(fact.completion) AS completion_json FROM json_each(?1) request CROSS JOIN temp.selected_resolution_stage_call_obligations fact ON fact.callee_reference_key IS request.value->>0 AND fact.callee_reference_shared IS request.value->>1 JOIN temp.selected_resolution_scope_mounts scope ON scope.mount_ordinal=fact.host_ordinal";
+    &str = "SELECT fact.*,mount.semantic_language,json(fact.argument_slots) AS argument_slots_json,json(fact.type_argument_slots) AS type_argument_slots_json,json(fact.eligible_rules) AS eligible_rules_json,json(fact.completion) AS completion_json FROM json_each(?1) request CROSS JOIN temp.selected_resolution_stage_call_obligations fact ON fact.callee_reference_key IS request.value->>0 AND fact.callee_reference_shared IS request.value->>1 JOIN temp.selected_resolution_scope_mounts scope ON scope.mount_ordinal=fact.host_ordinal JOIN temp.selected_resolution_mounts mount ON mount.mount_ordinal=fact.host_ordinal";
 pub(in crate::analyzer::store) fn visit_call_applicability_pages_for_callee_references(
     selection: &SelectedResolutionMountInventory<'_>,
     request: TypedFactRequest<'_, SemanticId>,
@@ -1407,7 +1551,7 @@ pub(in crate::analyzer::store) fn visit_call_applicability_pages_for_callee_refe
     )
 }
 
-pub(in crate::analyzer::store) const VISIT_CALL_APPLICABILITY_PAGES_FOR_GAP_REASONS_SQL: &str = "SELECT fact.*,json(fact.argument_slots) AS argument_slots_json,json(fact.type_argument_slots) AS type_argument_slots_json,json(fact.eligible_rules) AS eligible_rules_json,json(fact.completion) AS completion_json FROM json_each(?1) request CROSS JOIN temp.selected_resolution_stage_call_obligations fact ON fact.applicability_reason_key IS request.value->>0 AND fact.applicability_reason_shared IS request.value->>1 JOIN temp.selected_resolution_scope_mounts scope ON scope.mount_ordinal=fact.host_ordinal";
+pub(in crate::analyzer::store) const VISIT_CALL_APPLICABILITY_PAGES_FOR_GAP_REASONS_SQL: &str = "SELECT fact.*,mount.semantic_language,json(fact.argument_slots) AS argument_slots_json,json(fact.type_argument_slots) AS type_argument_slots_json,json(fact.eligible_rules) AS eligible_rules_json,json(fact.completion) AS completion_json FROM json_each(?1) request CROSS JOIN temp.selected_resolution_stage_call_obligations fact ON fact.applicability_reason_key IS request.value->>0 AND fact.applicability_reason_shared IS request.value->>1 JOIN temp.selected_resolution_scope_mounts scope ON scope.mount_ordinal=fact.host_ordinal JOIN temp.selected_resolution_mounts mount ON mount.mount_ordinal=fact.host_ordinal";
 pub(in crate::analyzer::store) fn visit_call_applicability_pages_for_gap_reasons(
     selection: &SelectedResolutionMountInventory<'_>,
     request: TypedFactRequest<'_, SemanticId>,
@@ -1466,23 +1610,15 @@ fn read_stage_rows<T>(
 }
 
 fn decode_route(row: &Row<'_>) -> Result<LoweredQualifiedSeededRoute> {
-    Ok(LoweredQualifiedSeededRoute::new_with_source_lookup(
+    Ok(typed_rows::decode_qualified_route_parts(
         row_semantic(row, "reference")?,
+        row.get("precedence_ordinal")?,
         row_semantic(row, "qualifier_slot")?,
         row_semantic(row, "lookup")?,
-        from_code(
-            ALL_RESOLUTION_NAMESPACES,
-            row.get("namespace")?,
-            "stage route namespace",
-        ),
+        row.get("namespace")?,
         row_semantic(row, "source_lookup")?,
-        row.get("precedence_ordinal")?,
         row_semantic(row, "projection_output_slot")?,
-        from_code(
-            ALL_BINDING_PROJECTION_KINDS,
-            row.get("projection_kind")?,
-            "stage route projection kind",
-        ),
+        row.get("projection_kind")?,
         row_semantic(row, "coarse_gap_reason")?,
         row.get::<_, i64>("open_member_surface")? != 0,
     ))
@@ -1758,7 +1894,7 @@ SELECT 'deferred owner definition' AS invariant,new.sequence AS sequence FROM te
 UNION ALL
 SELECT 'construction tuple' AS invariant,new.sequence AS sequence FROM temp.selected_resolution_stage_construction_requirements new CROSS JOIN temp.selected_resolution_mounts mount ON mount.mount_ordinal=?2 CROSS JOIN main.resolution_construction_requirements old ON old.blob_id=mount.blob_id AND old.definition=new.definition_key-?3 AND new.required_owner_definition_key=?3+old.required_owner_definition AND new.kind=old.kind WHERE new.producer_id=?1 AND new.definition_key BETWEEN ?3 AND ?4
 UNION ALL
-SELECT 'supertype tuple' AS invariant,new.sequence AS sequence FROM temp.selected_resolution_stage_supertypes new CROSS JOIN temp.selected_resolution_mounts mount ON mount.mount_ordinal=?2 CROSS JOIN main.resolution_supertypes old ON old.blob_id=mount.blob_id AND old.definition=new.definition_key-?3 AND new.reference_key=?3+old.reference AND new.frontier_key=?3+old.frontier AND new.kind=old.kind WHERE new.producer_id=?1 AND new.definition_key BETWEEN ?3 AND ?4
+SELECT 'supertype tuple' AS invariant,new.sequence AS sequence FROM temp.selected_resolution_stage_supertypes new CROSS JOIN temp.selected_resolution_mounts mount ON mount.mount_ordinal=?2 CROSS JOIN main.resolution_supertypes old ON old.blob_id=mount.blob_id AND old.definition=new.definition_key-?3 AND new.reference_key=?3+old.reference AND new.frontier_key=?3+old.frontier AND new.kind=old.kind AND new.parent_ordinal=old.parent_ordinal WHERE new.producer_id=?1 AND new.definition_key BETWEEN ?3 AND ?4
 UNION ALL
 SELECT 'property gap tuple' AS invariant,new.sequence AS sequence FROM temp.selected_resolution_stage_definition_property_gaps new CROSS JOIN temp.selected_resolution_mounts mount ON mount.mount_ordinal=?2 CROSS JOIN main.resolution_definition_property_gaps old ON old.blob_id=mount.blob_id AND old.definition=new.definition_key-?3 AND new.reason_key=?3+old.reason AND new.frontier_key=?3+old.frontier WHERE new.producer_id=?1 AND new.definition_key BETWEEN ?3 AND ?4
 UNION ALL
@@ -1829,26 +1965,11 @@ fn page_stage_answer<T>(
     visitor: &mut TypedFactPageVisitor<'_, T>,
     evidence: PolledCompletionAccumulator<'_>,
 ) -> Result<TypedFactReadOutcome> {
-    for page in answer.chunks(visitor.maximum_rows()) {
-        if cancellation.is_cancelled() {
-            return Ok(TypedFactReadOutcome::cancelled(
-                evidence.finish_semantic().0,
-            ));
-        }
-        let keep_going = visitor.visit_page(page)?;
-        if cancellation.is_cancelled() {
-            return Ok(TypedFactReadOutcome::cancelled(
-                evidence.finish_semantic().0,
-            ));
-        }
-        if !keep_going {
-            return Ok(TypedFactReadOutcome::stopped(evidence.finish_semantic().0));
-        }
-    }
-    Ok(if cancellation.is_cancelled() {
-        TypedFactReadOutcome::cancelled(evidence.finish_semantic().0)
-    } else {
-        TypedFactReadOutcome::exhausted(ResolutionCompletion::Complete)
+    let outcome = SelectedResolutionTypedSource::page_out(answer, cancellation, visitor)?;
+    Ok(match outcome {
+        PageOutcome::Exhausted => TypedFactReadOutcome::exhausted(ResolutionCompletion::Complete),
+        PageOutcome::Stopped => TypedFactReadOutcome::stopped(evidence.finish_semantic().0),
+        PageOutcome::Cancelled => TypedFactReadOutcome::cancelled(evidence.finish_semantic().0),
     })
 }
 

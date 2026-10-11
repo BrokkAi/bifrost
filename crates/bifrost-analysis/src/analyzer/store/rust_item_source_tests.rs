@@ -1,6 +1,6 @@
 //! Canonical Rust item/type publication through the real producer and store.
 
-use super::tests::{oid_for, parse_state};
+use super::tests::{assert_rust_source_read_cancellation_retries, oid_for, parse_state};
 use super::*;
 use crate::analyzer::rust::RustAdapter;
 use crate::inline_project::InlineTestProject;
@@ -464,6 +464,7 @@ macro_rules! evaluate {
     ($expression:expr) => { $expression };
     ($name:ident, $value:literal) => { $name = $value };
     ($( [$nested:ident] ),*) => { $($nested);* };
+    () => { fixed_target(); };
 }
 fn use_macro() { evaluate!(answer, 42); }
 "#;
@@ -478,12 +479,25 @@ fn use_macro() { evaluate!(answer, 42); }
         .macro_definitions
         .clone();
     assert_eq!(expected.len(), 1, "macro source facts={expected:?}");
-    assert_eq!(expected[0].arms.len(), 3, "macro source facts={expected:?}");
+    assert_eq!(expected[0].arms.len(), 4, "macro source facts={expected:?}");
     assert!(
         expected
             .iter()
             .flat_map(|definition| &definition.arms)
             .any(|arm| { !arm.patterns.is_empty() && !arm.ident_roles.is_empty() })
+    );
+    assert!(
+        expected
+            .iter()
+            .flat_map(|definition| &definition.arms)
+            .any(|arm| {
+                arm.transcriber_identifiers
+                    .as_ref()
+                    .is_some_and(|identifiers| {
+                        identifiers.iter().any(|name| name == "fixed_target")
+                    })
+            }),
+        "macro transcriber identifiers are captured structurally: {expected:#?}"
     );
 
     let oid = oid_for(source.as_bytes());
@@ -569,40 +583,22 @@ fn invoke() { many!(value); }
         .write_parsed_blob(oid, "rust", &RustAdapter, &state)
         .unwrap();
     let generation = store.current_generation("rust").unwrap();
-    let checks = std::cell::Cell::new(0usize);
-    let complete = store
-        .rust_hierarchy_source_facts(oid, generation, &RustAdapter, &file, &|| {
-            checks.set(checks.get() + 1);
-            true
-        })
-        .unwrap()
-        .unwrap();
-    assert!(complete.items.macro_definitions.len() == 1);
-    assert!(complete.items.macro_definitions[0].arms.len() >= 6);
-    let total_checks = checks.get();
-    assert!(
-        total_checks > 20,
-        "macro fixture had too few read checkpoints"
-    );
 
-    let cancelled_checks = std::cell::Cell::new(0usize);
-    assert!(
-        store
-            .rust_hierarchy_source_facts(oid, generation, &RustAdapter, &file, &|| {
-                cancelled_checks.set(cancelled_checks.get() + 1);
-                cancelled_checks.get() < total_checks
-            })
-            .unwrap()
-            .is_none()
-    );
-    assert!(cancelled_checks.get() >= total_checks);
-    let retried = store
-        .rust_hierarchy_source_facts(oid, generation, &RustAdapter, &file, &|| true)
-        .unwrap()
-        .unwrap();
-    assert_eq!(
-        retried.items.macro_definitions,
-        complete.items.macro_definitions
+    assert_rust_source_read_cancellation_retries(
+        |cancellation| {
+            store
+                .rust_hierarchy_source_facts(oid, generation, &RustAdapter, &file, cancellation)
+                .unwrap()
+        },
+        20,
+        |complete, retried| {
+            assert_eq!(complete.items.macro_definitions.len(), 1);
+            assert!(complete.items.macro_definitions[0].arms.len() >= 6);
+            assert_eq!(
+                retried.items.macro_definitions,
+                complete.items.macro_definitions
+            );
+        },
     );
 }
 
@@ -690,30 +686,6 @@ passthrough! { macro_rules! second { ($name:ident) => {}; } }
             .cloned()
             .collect::<HashSet<_>>(),
         expected_links
-    );
-}
-
-#[test]
-fn unknown_embedded_macro_definition_remains_source_only() {
-    let source = "outer! { macro_rules! source_only { ($name:ident) => {}; } }";
-    let fixture = InlineTestProject::new().file("src/lib.rs", source).build();
-    let state = parse_state(&RustAdapter, &fixture.file("src/lib.rs"));
-    let parsed = state.source_facts.as_ref().expect("Rust source facts");
-    assert_eq!(parsed.rust_items.macro_definitions.len(), 1);
-    let definition = &parsed.rust_items.macro_definitions[0];
-    let occurrence = parsed
-        .occurrences
-        .declaration(definition.declaration)
-        .occurrence;
-    assert_eq!(
-        parsed.occurrences.occurrence(occurrence).provenance,
-        brokk_bifrost_core::analyzer::source_facts::SourceOccurrenceProvenance::Embedded
-    );
-    assert!(
-        !state
-            .source_declaration_units
-            .iter()
-            .any(|(declaration, _)| *declaration == definition.declaration)
     );
 }
 

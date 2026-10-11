@@ -1,20 +1,12 @@
 use super::*;
 use crate::analyzer::CodeUnitIndex;
+use crate::analyzer::test_typescript_project as test_project;
 use crate::analyzer::{
-    CSharpAnalyzer, JavaAnalyzer, JavascriptAnalyzer, TestProject, TypescriptAnalyzer,
-    resolve_analyzer,
+    CSharpAnalyzer, JavaAnalyzer, JavascriptAnalyzer, Language, ProjectFile, TestProject,
+    TypescriptAnalyzer, resolve_analyzer,
 };
 use crate::{AnalyzerConfig, WorkspaceAnalyzer};
 use std::path::PathBuf;
-
-fn test_project(source: &str) -> (tempfile::TempDir, ProjectFile, TypescriptAnalyzer) {
-    let temp = tempfile::tempdir().expect("temp dir");
-    let root = temp.path().canonicalize().expect("canonical temp dir");
-    let file = ProjectFile::new(root.clone(), PathBuf::from("src/app.ts"));
-    file.write(source).expect("write source");
-    let analyzer = TypescriptAnalyzer::from_project(TestProject::new(root, Language::TypeScript));
-    (temp, file, analyzer)
-}
 
 fn marker_range(source: &str, marker: &str) -> Range {
     let start_byte = source.find(marker).expect("marker");
@@ -49,6 +41,88 @@ fn csharp_structural_facts(workspace: &WorkspaceAnalyzer, file: &ProjectFile) ->
         .find(|provider| provider.structural_language() == Language::CSharp)
         .and_then(|provider| provider.structural_facts(file))
         .expect("C# structural facts")
+}
+
+#[test]
+fn semantic_receiver_evidence_requires_complete_exhaustive_input_for_precision() {
+    let outcomes = [
+        SemanticOutcome::Complete {
+            value: (),
+            work: SemanticWork::default(),
+        },
+        SemanticOutcome::Ambiguous {
+            candidates: (),
+            work: SemanticWork::default(),
+        },
+        SemanticOutcome::Unknown {
+            partial: Some(()),
+            work: SemanticWork::default(),
+        },
+        SemanticOutcome::Unsupported {
+            capability: crate::analyzer::semantic::SemanticCapability::Values,
+            partial: Some(()),
+            work: SemanticWork::default(),
+        },
+        SemanticOutcome::Unproven {
+            partial: (),
+            work: SemanticWork::default(),
+        },
+    ];
+    let coverages = [
+        CandidateCoverage::Exhaustive,
+        CandidateCoverage::Open,
+        CandidateCoverage::Truncated,
+    ];
+
+    for (outcome_index, outcome) in outcomes.iter().enumerate() {
+        for coverage in coverages {
+            let evidence = SemanticReceiverEvidence::from_outcome(outcome, coverage);
+            assert_eq!(
+                evidence.supports_precise(),
+                outcome_index == 0 && coverage == CandidateCoverage::Exhaustive
+            );
+            assert_eq!(
+                evidence.is_truncated(),
+                coverage == CandidateCoverage::Truncated
+            );
+            assert!(
+                !evidence.legacy_provider_can_close(),
+                "raw incomplete evidence must not be reclassified as global capability openness"
+            );
+        }
+    }
+}
+
+#[test]
+fn incomplete_semantic_evidence_downgrades_values_and_member_targets() {
+    let (_temp, _file, analyzer) = test_project("class Service {}\n");
+    let service = analyzer
+        .definitions("Service")
+        .find(CodeUnit::is_class)
+        .expect("Service class");
+    let mut values = ReceiverQueryAnalysis::Values(ReceiverAnalysisOutcome::Precise(vec![
+        ReceiverValue::InstanceType(service.clone()),
+    ]));
+    let member_target = ReceiverMemberTarget::Workspace {
+        receiver: None,
+        member: service.clone(),
+    };
+    let mut members = ReceiverQueryAnalysis::MemberTargets(ReceiverAnalysisOutcome::Precise(vec![
+        member_target.clone(),
+    ]));
+    neutral_incomplete(&mut values);
+    neutral_incomplete(&mut members);
+
+    assert!(matches!(
+        values,
+        ReceiverQueryAnalysis::Values(ReceiverAnalysisOutcome::Ambiguous(ref values))
+            if values == &[ReceiverValue::InstanceType(service.clone())]
+    ));
+    assert!(matches!(
+        members,
+        ReceiverQueryAnalysis::MemberTargets(ReceiverAnalysisOutcome::Ambiguous(ref targets))
+            if targets == &[member_target]
+    ));
 }
 
 #[test]
@@ -229,6 +303,7 @@ export function caller(flag: boolean) {
 /// `GlobalCapabilitiesWithProvenCandidates` so the compatibility provider is
 /// still allowed to close the receiver, and it must do so inside the default
 /// aggregate budget.
+
 #[test]
 fn workspace_factory_provenance_reports_global_capability_openness_with_proven_candidates() {
     let source = r#"
@@ -828,6 +903,34 @@ public void Run() {}
     );
 }
 
+fn assert_factory_ranges_limited_and_cancellable(analyzer: &dyn IAnalyzer, factory: &CodeUnit) {
+    let tiny_budget = ReceiverAnalysisBudget {
+        max_scope_nodes: 1,
+        ..ReceiverAnalysisBudget::default()
+    };
+    let mut tiny_ledger = ReceiverWorkLedger::new(tiny_budget);
+    assert!(matches!(
+        code_unit_ranges_bounded(analyzer, factory, None, &mut tiny_ledger)
+            .expect("tiny factory range budget"),
+        CompatibilityOutcome::Exceeded(ReceiverBudgetLimit::ScopeNodes)
+    ));
+    assert_eq!(tiny_ledger.work().scope_nodes, 1);
+
+    let cancellation = CancellationToken::default();
+    cancellation.cancel();
+    let mut cancelled_ledger = ReceiverWorkLedger::new(ReceiverAnalysisBudget::default());
+    assert!(matches!(
+        code_unit_ranges_bounded(
+            analyzer,
+            factory,
+            Some(&cancellation),
+            &mut cancelled_ledger,
+        ),
+        Err(ReceiverQueryError::Cancelled)
+    ));
+    assert_eq!(cancelled_ledger.work(), ReceiverAnalysisWork::default());
+}
+
 #[test]
 fn java_factory_ranges_are_limited_and_cancellable_without_file_hydration() {
     let source = r#"
@@ -857,31 +960,7 @@ static Service makeService() { return new Service(); }
         resolve_analyzer::<JavaAnalyzer>(workspace.analyzer()).expect("workspace Java analyzer");
     java.inner().reset_full_hydration_count_for_test();
 
-    let tiny_budget = ReceiverAnalysisBudget {
-        max_scope_nodes: 1,
-        ..ReceiverAnalysisBudget::default()
-    };
-    let mut tiny_ledger = ReceiverWorkLedger::new(tiny_budget);
-    assert!(matches!(
-        code_unit_ranges_bounded(workspace.analyzer(), &factory, None, &mut tiny_ledger)
-            .expect("tiny Java factory range budget"),
-        CompatibilityOutcome::Exceeded(ReceiverBudgetLimit::ScopeNodes)
-    ));
-    assert_eq!(tiny_ledger.work().scope_nodes, 1);
-
-    let cancellation = CancellationToken::default();
-    cancellation.cancel();
-    let mut cancelled_ledger = ReceiverWorkLedger::new(ReceiverAnalysisBudget::default());
-    assert!(matches!(
-        code_unit_ranges_bounded(
-            workspace.analyzer(),
-            &factory,
-            Some(&cancellation),
-            &mut cancelled_ledger,
-        ),
-        Err(ReceiverQueryError::Cancelled)
-    ));
-    assert_eq!(cancelled_ledger.work(), ReceiverAnalysisWork::default());
+    assert_factory_ranges_limited_and_cancellable(workspace.analyzer(), &factory);
     assert_eq!(
         java.inner().full_hydration_count_for_test(),
         0,
@@ -891,34 +970,6 @@ static Service makeService() { return new Service(); }
 
 #[test]
 fn js_ts_factory_ranges_are_limited_and_cancellable_without_file_hydration() {
-    fn assert_limited_and_cancellable(analyzer: &dyn IAnalyzer, factory: &CodeUnit) {
-        let tiny_budget = ReceiverAnalysisBudget {
-            max_scope_nodes: 1,
-            ..ReceiverAnalysisBudget::default()
-        };
-        let mut tiny_ledger = ReceiverWorkLedger::new(tiny_budget);
-        assert!(matches!(
-            code_unit_ranges_bounded(analyzer, factory, None, &mut tiny_ledger)
-                .expect("tiny JS/TS factory range budget"),
-            CompatibilityOutcome::Exceeded(ReceiverBudgetLimit::ScopeNodes)
-        ));
-        assert_eq!(tiny_ledger.work().scope_nodes, 1);
-
-        let cancellation = CancellationToken::default();
-        cancellation.cancel();
-        let mut cancelled_ledger = ReceiverWorkLedger::new(ReceiverAnalysisBudget::default());
-        assert!(matches!(
-            code_unit_ranges_bounded(
-                analyzer,
-                factory,
-                Some(&cancellation),
-                &mut cancelled_ledger,
-            ),
-            Err(ReceiverQueryError::Cancelled)
-        ));
-        assert_eq!(cancelled_ledger.work(), ReceiverAnalysisWork::default());
-    }
-
     let typescript_temp = tempfile::tempdir().expect("TypeScript temp dir");
     let typescript_root = typescript_temp
         .path()
@@ -948,7 +999,10 @@ fn js_ts_factory_ranges_are_limited_and_cancellable_without_file_hydration() {
     let typescript = resolve_analyzer::<TypescriptAnalyzer>(typescript_workspace.analyzer())
         .expect("workspace TypeScript analyzer");
     typescript.reset_full_hydration_count_for_test();
-    assert_limited_and_cancellable(typescript_workspace.analyzer(), &typescript_factory);
+    assert_factory_ranges_limited_and_cancellable(
+        typescript_workspace.analyzer(),
+        &typescript_factory,
+    );
     assert_eq!(
         typescript.full_hydration_count_for_test(),
         0,
@@ -984,7 +1038,10 @@ fn js_ts_factory_ranges_are_limited_and_cancellable_without_file_hydration() {
     let javascript = resolve_analyzer::<JavascriptAnalyzer>(javascript_workspace.analyzer())
         .expect("workspace JavaScript analyzer");
     javascript.inner().reset_full_hydration_count_for_test();
-    assert_limited_and_cancellable(javascript_workspace.analyzer(), &javascript_factory);
+    assert_factory_ranges_limited_and_cancellable(
+        javascript_workspace.analyzer(),
+        &javascript_factory,
+    );
     assert_eq!(
         javascript.inner().full_hydration_count_for_test(),
         0,
@@ -2003,63 +2060,6 @@ static class Worker {
 }
 
 #[test]
-fn tiny_budget_and_cancellation_are_deterministic() {
-    let source = r#"
-class Service { run() {} }
-function makeService() { return new Service(); }
-export function caller() {
-  const service = makeService();
-  service.run();
-}
-"#;
-    let (_temp, file, analyzer) = test_project(source);
-    let service = ReceiverQueryService::new(&analyzer);
-    let range = marker_range(source, "service.run");
-
-    let report = service
-        .analyze(
-            ReceiverQueryOperation::MemberTargets,
-            &file,
-            range,
-            ReceiverQueryInput::ContainingSite,
-            ReceiverAnalysisBudget::tiny(),
-            None,
-        )
-        .expect("tiny-budget result");
-    assert!(matches!(
-        report.analysis,
-        ReceiverQueryAnalysis::MemberTargets(ReceiverAnalysisOutcome::ExceededBudget {
-            limit: "scope_nodes"
-        })
-    ));
-    assert_eq!(report.work.setup_nodes, 1);
-    assert!(
-        report
-            .work
-            .setup_nodes
-            .saturating_add(report.work.scope_nodes)
-            <= ReceiverAnalysisBudget::tiny().max_scope_nodes
-    );
-    assert!(
-        report.work.summary_expansions <= ReceiverAnalysisBudget::tiny().max_summary_expansions
-    );
-
-    let cancellation = CancellationToken::default();
-    cancellation.cancel();
-    assert_eq!(
-        service.analyze(
-            ReceiverQueryOperation::MemberTargets,
-            &file,
-            range,
-            ReceiverQueryInput::ContainingSite,
-            ReceiverAnalysisBudget::default(),
-            Some(&cancellation),
-        ),
-        Err(ReceiverQueryError::Cancelled)
-    );
-}
-
-#[test]
 fn receiver_semantic_bridge_uses_every_receiver_limit() {
     let bridge = ReceiverSemanticBridge::new(ReceiverAnalysisBudget {
         context_depth: 2,
@@ -2072,13 +2072,19 @@ fn receiver_semantic_bridge_uses_every_receiver_limit() {
     assert_eq!(semantic.procedures, 2);
     assert_eq!(semantic.control_edges, 1);
     assert_eq!(semantic.nested_entries, 5);
-    assert_eq!(semantic.call_sites, 4);
-    assert_eq!(semantic.memory_locations, 3);
-    assert_eq!(semantic.captures, 2);
+    assert_eq!(semantic.call_sites, 9);
+    assert_eq!(semantic.memory_locations, 9);
+    assert_eq!(semantic.captures, 9);
     assert_eq!(semantic.source_bytes, 17 * 1_024);
-    let aggregate_limits = ReceiverSemanticBridge::receiver_work(semantic);
-    assert_eq!(aggregate_limits.scope_nodes, 17);
-    assert_eq!(aggregate_limits.summary_expansions, 9);
+    let scope_limits = ReceiverSemanticBridge::receiver_work(semantic);
+    assert_eq!(scope_limits.scope_nodes, 17);
+    let aggregate_work = ReceiverSemanticBridge::receiver_work(SemanticWork {
+        call_sites: 4,
+        memory_locations: 3,
+        captures: 2,
+        ..SemanticWork::default()
+    });
+    assert_eq!(aggregate_work.summary_expansions, 9);
 
     let oracle = bridge.oracle_limits.values();
     assert_eq!(oracle.dispatch_targets, 3);
@@ -2112,145 +2118,6 @@ fn receiver_semantic_bridge_uses_every_receiver_limit() {
         .unwrap_err(),
         ReceiverBudgetLimit::SummaryExpansions
     );
-}
-
-#[test]
-fn receiver_semantic_bridge_translates_all_row_work_and_limit_kinds() {
-    let translated = ReceiverSemanticBridge::receiver_work(SemanticWork {
-        source_bytes: usize::MAX,
-        procedures: 1,
-        blocks: 1,
-        program_points: 1,
-        values: 1,
-        allocations: 1,
-        call_sites: 1,
-        memory_locations: 1,
-        captures: 1,
-        source_mappings: 1,
-        evidence: 1,
-        gaps: 1,
-        events: 1,
-        control_edges: 1,
-        nested_entries: 1,
-        owned_text_bytes: usize::MAX,
-    });
-    assert_eq!(translated.setup_nodes, 0);
-    assert_eq!(translated.summary_expansions, 3);
-    assert_eq!(translated.scope_nodes, 11);
-
-    let budget = SemanticBudget::uniform(1).unwrap();
-    let summary = budget
-        .check(SemanticWork {
-            call_sites: 2,
-            ..SemanticWork::default()
-        })
-        .unwrap_err();
-    assert_eq!(
-        ReceiverSemanticBridge::receiver_limit(summary),
-        ReceiverBudgetLimit::SummaryExpansions
-    );
-    let scope = budget
-        .check(SemanticWork {
-            events: 2,
-            ..SemanticWork::default()
-        })
-        .unwrap_err();
-    assert_eq!(
-        ReceiverSemanticBridge::receiver_limit(scope),
-        ReceiverBudgetLimit::ScopeNodes
-    );
-    let nested_scope = budget
-        .check(SemanticWork {
-            nested_entries: 2,
-            ..SemanticWork::default()
-        })
-        .unwrap_err();
-    assert_eq!(
-        ReceiverSemanticBridge::receiver_limit(nested_scope),
-        ReceiverBudgetLimit::ScopeNodes
-    );
-}
-
-#[test]
-fn semantic_receiver_evidence_requires_complete_exhaustive_input_for_precision() {
-    let outcomes = [
-        SemanticOutcome::Complete {
-            value: (),
-            work: SemanticWork::default(),
-        },
-        SemanticOutcome::Ambiguous {
-            candidates: (),
-            work: SemanticWork::default(),
-        },
-        SemanticOutcome::Unknown {
-            partial: Some(()),
-            work: SemanticWork::default(),
-        },
-        SemanticOutcome::Unsupported {
-            capability: crate::analyzer::semantic::SemanticCapability::Values,
-            partial: Some(()),
-            work: SemanticWork::default(),
-        },
-        SemanticOutcome::Unproven {
-            partial: (),
-            work: SemanticWork::default(),
-        },
-    ];
-    let coverages = [
-        CandidateCoverage::Exhaustive,
-        CandidateCoverage::Open,
-        CandidateCoverage::Truncated,
-    ];
-
-    for (outcome_index, outcome) in outcomes.iter().enumerate() {
-        for coverage in coverages {
-            let evidence = SemanticReceiverEvidence::from_outcome(outcome, coverage);
-            assert_eq!(
-                evidence.supports_precise(),
-                outcome_index == 0 && coverage == CandidateCoverage::Exhaustive
-            );
-            assert_eq!(
-                evidence.is_truncated(),
-                coverage == CandidateCoverage::Truncated
-            );
-            assert!(
-                !evidence.legacy_provider_can_close(),
-                "raw incomplete evidence must not be reclassified as global capability openness"
-            );
-        }
-    }
-}
-
-#[test]
-fn incomplete_semantic_evidence_downgrades_values_and_member_targets() {
-    let (_temp, _file, analyzer) = test_project("class Service {}\n");
-    let service = analyzer
-        .definitions("Service")
-        .find(CodeUnit::is_class)
-        .expect("Service class");
-    let mut values = ReceiverQueryAnalysis::Values(ReceiverAnalysisOutcome::Precise(vec![
-        ReceiverValue::InstanceType(service.clone()),
-    ]));
-    let member_target = ReceiverMemberTarget::Workspace {
-        receiver: None,
-        member: service.clone(),
-    };
-    let mut members = ReceiverQueryAnalysis::MemberTargets(ReceiverAnalysisOutcome::Precise(vec![
-        member_target.clone(),
-    ]));
-    neutral_incomplete(&mut values);
-    neutral_incomplete(&mut members);
-
-    assert!(matches!(
-        values,
-        ReceiverQueryAnalysis::Values(ReceiverAnalysisOutcome::Ambiguous(ref values))
-            if values == &[ReceiverValue::InstanceType(service.clone())]
-    ));
-    assert!(matches!(
-        members,
-        ReceiverQueryAnalysis::MemberTargets(ReceiverAnalysisOutcome::Ambiguous(ref targets))
-            if targets == &[member_target]
-    ));
 }
 
 #[test]

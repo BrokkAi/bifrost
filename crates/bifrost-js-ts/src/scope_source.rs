@@ -8,6 +8,8 @@ use crate::syntax::{JsTsLexicalBindingIndex, pattern_binder_identifiers};
 use crate::typescript::ts_is_global_internal_module;
 use brokk_bifrost_core::hash::HashSet;
 use tree_sitter::Node;
+#[cfg(test)]
+use tree_sitter::Parser;
 
 /// File-level module facts computed once while the primary tree is live.
 ///
@@ -213,26 +215,33 @@ fn owns_declaration_binders(node: Node<'_>) -> bool {
     )
 }
 
-fn is_declaration_scope(node: Node<'_>) -> bool {
+/// Whether `node` is one of the core lexical scopes shared by analysis users.
+pub fn is_core_binding_scope(node: Node<'_>) -> bool {
     matches!(
         node.kind(),
         "program"
             | "statement_block"
-            | "for_statement"
-            | "for_in_statement"
-            | "switch_body"
-            | "catch_clause"
             | "function_declaration"
-            | "generator_function_declaration"
             | "function_expression"
-            | "generator_function"
             | "arrow_function"
             | "method_definition"
-            | "internal_module"
     )
 }
 
-/// Return binder identifiers owned directly by one syntax node.
+fn is_declaration_scope(node: Node<'_>) -> bool {
+    is_core_binding_scope(node)
+        || matches!(
+            node.kind(),
+            "for_statement"
+                | "for_in_statement"
+                | "switch_body"
+                | "catch_clause"
+                | "generator_function_declaration"
+                | "generator_function"
+                | "internal_module"
+        )
+}
+
 fn declaration_binders<'tree>(node: Node<'tree>) -> Vec<Node<'tree>> {
     match node.kind() {
         "variable_declaration" | "lexical_declaration" => {
@@ -280,121 +289,102 @@ fn declaration_binders<'tree>(node: Node<'tree>) -> Vec<Node<'tree>> {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::syntax::JsTsLexicalBindingIndex;
-    use tree_sitter::Parser;
+fn declaration_bindings_for(source: &str, kind: &str) -> Vec<(String, bool)> {
+    let mut parser = Parser::new();
+    parser
+        .set_language(&tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into())
+        .expect("TypeScript grammar");
+    let tree = parser.parse(source, None).expect("parse");
+    let root = tree.root_node();
+    let lexical = JsTsLexicalBindingIndex::build(root, source);
+    let mut stack = vec![root];
+    while let Some(node) = stack.pop() {
+        if node.kind() == kind {
+            return JsTsDeclarationScopeIndex::new(root, source)
+                .declaration_bindings(node, None, &lexical)
+                .into_iter()
+                .map(|binding| {
+                    (
+                        binding
+                            .binder
+                            .utf8_text(source.as_bytes())
+                            .expect("binder text")
+                            .to_string(),
+                        binding.is_program,
+                    )
+                })
+                .collect();
+        }
+        for child_index in (0..node.named_child_count()).rev() {
+            if let Some(child) = node.named_child(child_index) {
+                stack.push(child);
+            }
+        }
+    }
+    Vec::new()
+}
 
-    fn declaration_bindings_for(source: &str, kind: &str) -> Vec<(String, bool)> {
+#[test]
+fn owner_links_keep_exact_variable_binder_without_siblings() {
+    let bindings = declaration_bindings_for(
+        "const first = {}, second = { method() {} };",
+        "method_definition",
+    );
+    assert_eq!(bindings, vec![("second".to_string(), true)]);
+    let local = declaration_bindings_for(
+        "function outer() { var second = { method() {} }; }",
+        "method_definition",
+    );
+    assert!(local.contains(&("second".to_string(), false)));
+    assert!(local.contains(&("outer".to_string(), true)));
+}
+
+#[test]
+fn global_status_follows_structured_namespace_ancestry() {
+    for (source, expected) in [
+        ("export {}; declare global { interface Item {} }", true),
+        ("export {}; namespace Local { interface Item {} }", false),
+        ("namespace Local { interface Item {} }", true),
+    ] {
         let mut parser = Parser::new();
         parser
             .set_language(&tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into())
-            .expect("TypeScript grammar");
-        let tree = parser.parse(source, None).expect("parse");
-        let root = tree.root_node();
-        let lexical = JsTsLexicalBindingIndex::build(root, source);
-        let mut stack = vec![root];
+            .unwrap();
+        let tree = parser.parse(source, None).unwrap();
+        let scopes = JsTsDeclarationScopeIndex::new(tree.root_node(), source);
+        let mut stack = vec![tree.root_node()];
+        let mut found = false;
         while let Some(node) = stack.pop() {
-            if node.kind() == kind {
-                return JsTsDeclarationScopeIndex::new(root, source)
-                    .declaration_bindings(node, None, &lexical)
-                    .into_iter()
-                    .map(|binding| {
-                        (
-                            binding
-                                .binder
-                                .utf8_text(source.as_bytes())
-                                .expect("binder text")
-                                .to_string(),
-                            binding.is_program,
-                        )
-                    })
-                    .collect();
+            if node.kind() == "interface_declaration" {
+                assert_eq!(scopes.declaration_is_global(node), expected, "{source}");
+                found = true;
             }
-            for child_index in (0..node.named_child_count()).rev() {
-                if let Some(child) = node.named_child(child_index) {
-                    stack.push(child);
-                }
-            }
+            stack.extend(node.named_children(&mut node.walk()));
         }
-        Vec::new()
+        assert!(found);
     }
+}
 
-    #[test]
-    fn owner_links_keep_exact_variable_binder_without_siblings() {
-        let bindings = declaration_bindings_for(
-            "const first = {}, second = { method() {} };",
-            "method_definition",
-        );
-        assert_eq!(bindings, vec![("second".to_string(), true)]);
-        let local = declaration_bindings_for(
-            "function outer() { var second = { method() {} }; }",
-            "method_definition",
-        );
-        assert!(local.contains(&("second".to_string(), false)));
-        assert!(local.contains(&("outer".to_string(), true)));
-    }
+#[test]
+fn includes_program_scope_owner_for_class_member() {
+    let bindings =
+        declaration_bindings_for("class Foo { method() { return 1; } }", "method_definition");
+    assert!(
+        bindings
+            .iter()
+            .any(|(name, is_program)| name == "Foo" && *is_program)
+    );
+}
 
-    #[test]
-    fn global_status_follows_structured_namespace_ancestry() {
-        for (source, expected) in [
-            ("export {}; declare global { interface Item {} }", true),
-            ("export {}; namespace Local { interface Item {} }", false),
-            ("namespace Local { interface Item {} }", true),
-        ] {
-            let mut parser = Parser::new();
-            parser
-                .set_language(&tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into())
-                .unwrap();
-            let tree = parser.parse(source, None).unwrap();
-            let scopes = JsTsDeclarationScopeIndex::new(tree.root_node(), source);
-            let mut stack = vec![tree.root_node()];
-            let mut found = false;
-            while let Some(node) = stack.pop() {
-                if node.kind() == "interface_declaration" {
-                    assert_eq!(scopes.declaration_is_global(node), expected, "{source}");
-                    found = true;
-                }
-                stack.extend(node.named_children(&mut node.walk()));
-            }
-            assert!(found);
-        }
-    }
-
-    #[test]
-    fn includes_program_scope_owner_for_class_member() {
-        let bindings =
-            declaration_bindings_for("class Foo { method() { return 1; } }", "method_definition");
-        assert!(
-            bindings
-                .iter()
-                .any(|(name, is_program)| name == "Foo" && *is_program)
-        );
-    }
-
-    #[test]
-    fn class_inside_function_is_not_program_scope() {
-        let bindings = declaration_bindings_for(
-            "function outer() { class Foo { method() {} } }",
-            "method_definition",
-        );
-        assert!(
-            bindings
-                .iter()
-                .any(|(name, is_program)| name == "Foo" && !*is_program)
-        );
-    }
-
-    #[test]
-    fn interface_and_namespace_use_structured_scope() {
-        let bindings = declaration_bindings_for(
-            "namespace Local { interface Item {} } interface Root {}",
-            "interface_declaration",
-        );
-        assert!(
-            bindings
-                .iter()
-                .any(|(name, is_program)| name == "Item" && !*is_program)
-        );
-    }
+#[test]
+fn interface_and_namespace_use_structured_scope() {
+    let bindings = declaration_bindings_for(
+        "namespace Local { interface Item {} } interface Root {}",
+        "interface_declaration",
+    );
+    assert!(
+        bindings
+            .iter()
+            .any(|(name, is_program)| name == "Item" && !*is_program)
+    );
 }

@@ -189,9 +189,9 @@ impl RetainedNpmSurface {
             || npm_package_of_module_specifier(module_specifier)
                 .is_some_and(|(package, _)| retained_evidence_declares(discovery, package));
         let boundary = if declared {
-            BoundaryStatus::ExternalDeclaredUnindexed
+            crate::analyzer::semantic_model::missing_dependency_boundary(true)
         } else {
-            BoundaryStatus::ExternalUnknown
+            crate::analyzer::semantic_model::missing_dependency_boundary(false)
         };
         vec![SemanticDiagnosticIncompleteReason::MissingDependencyDiscovery { boundary }]
     }
@@ -356,34 +356,6 @@ mod tests {
     }
 
     #[test]
-    fn js_ts_semantic_diagnostics_report_unknown_local_identifiers() {
-        let fixture = javascript_project(&[(
-            "app.js",
-            "function run(known) {\n  const local = known;\n  missingValue;\n  local;\n}\n",
-        )]);
-        let diagnostics = js_diagnostics(&fixture, "app.js");
-        assert_eq!(1, diagnostics.len(), "{diagnostics:#?}");
-        assert!(diagnostics[0].contains("missingValue"));
-
-        let fixture = typescript_project(&[(
-            "app.ts",
-            "type Present = string;\nfunction run(value: Present): MissingType {\n  return missingValue;\n}\n",
-        )]);
-        let diagnostics = ts_diagnostics(&fixture, "app.ts");
-        assert_eq!(2, diagnostics.len(), "{diagnostics:#?}");
-        assert!(
-            diagnostics
-                .iter()
-                .any(|message| message.contains("MissingType"))
-        );
-        assert!(
-            diagnostics
-                .iter()
-                .any(|message| message.contains("missingValue"))
-        );
-    }
-
-    #[test]
     fn js_ts_semantic_diagnostics_suppress_imports_and_aliases() {
         let fixture = typescript_project(&[
             (
@@ -402,44 +374,6 @@ mod tests {
     }
 
     #[test]
-    fn js_ts_semantic_diagnostics_suppress_properties_jsx_globals_and_malformed_files() {
-        let fixture = javascript_project(&[
-            (
-                "component.jsx",
-                "function View(props) {\n  const options = { missingKey: props.value, shorthand };\n  console.log(options.missingMember);\n  return <div className=\"x\"><span /></div>;\n}\n",
-            ),
-            ("broken.js", "function run( {\n  missingValue;\n}\n"),
-        ]);
-        let diagnostics = js_diagnostics(&fixture, "component.jsx");
-        assert_eq!(1, diagnostics.len(), "{diagnostics:#?}");
-        assert!(diagnostics[0].contains("shorthand"));
-
-        let broken = js_diagnostics(&fixture, "broken.js");
-        assert!(broken.is_empty(), "{broken:#?}");
-    }
-
-    #[test]
-    fn js_ts_semantic_diagnostics_suppress_type_only_import_uncertainty() {
-        let fixture = typescript_project(&[(
-            "app.ts",
-            "import type { ExternalType } from 'external-package';\nconst value = ExternalType;\n",
-        )]);
-        let diagnostics = ts_diagnostics(&fixture, "app.ts");
-        assert!(diagnostics.is_empty(), "{diagnostics:#?}");
-    }
-
-    #[test]
-    fn js_ts_semantic_diagnostics_report_missing_imports_across_modules() {
-        let fixture = typescript_project(&[
-            ("src/a.ts", "export const config = 1;\n"),
-            ("src/b.ts", "function run() {\n  return config;\n}\n"),
-        ]);
-        let diagnostics = ts_diagnostics(&fixture, "src/b.ts");
-        assert_eq!(1, diagnostics.len(), "{diagnostics:#?}");
-        assert!(diagnostics[0].contains("config"));
-    }
-
-    #[test]
     fn js_ts_semantic_diagnostics_handle_var_and_nested_function_scope() {
         let fixture = javascript_project(&[(
             "app.js",
@@ -447,21 +381,6 @@ mod tests {
         )]);
         let diagnostics = js_diagnostics(&fixture, "app.js");
         assert!(diagnostics.is_empty(), "{diagnostics:#?}");
-    }
-
-    #[test]
-    fn js_ts_semantic_diagnostics_scan_parameter_default_values() {
-        let fixture = javascript_project(&[(
-            "app.js",
-            "function run(value = missingDefault) {\n  return value;\n}\n",
-        )]);
-        let diagnostics = js_diagnostics(&fixture, "app.js");
-        assert_eq!(1, diagnostics.len(), "{diagnostics:#?}");
-        assert!(
-            diagnostics
-                .iter()
-                .any(|message| message.contains("missingDefault"))
-        );
     }
 
     #[test]

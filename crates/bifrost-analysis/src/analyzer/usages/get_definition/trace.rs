@@ -39,6 +39,7 @@ use crate::analyzer::structural::resolution::{
     BoundaryStatus, CandidateOutcome, DeclaredVisibility, HierarchyRelation, MemberDispatchTier,
     PrecedenceTier, RejectionReason,
 };
+use crate::analyzer::usages::applicability::{ApplicabilityOutcome, CandidateApplicability};
 use crate::analyzer::{CodeUnit, IAnalyzer, ProjectFile};
 use crate::cancellation::CancellationToken;
 use brokk_bifrost_core::analyzer::structural::callable::{
@@ -46,6 +47,10 @@ use brokk_bifrost_core::analyzer::structural::callable::{
 };
 use std::cell::RefCell;
 use std::sync::Arc;
+
+#[cfg(test)]
+#[path = "../../../../../../test-support/declaration_facts_pack.rs"]
+mod declaration_facts_pack;
 
 /// What a trace row points at.
 ///
@@ -107,6 +112,42 @@ pub struct HierarchyHopRecord {
     pub relation: HierarchyRelation,
 }
 
+pub(crate) fn hierarchy_route_from_predecessors<Key>(
+    found_on: &Key,
+    depth: usize,
+    is_base: impl Fn(&Key, usize) -> bool,
+    mut predecessor: impl FnMut(&Key) -> Option<(Key, HierarchyRelation)>,
+    mut code_unit: impl FnMut(&Key) -> Option<CodeUnit>,
+) -> Option<(Vec<HierarchyHopRecord>, bool)>
+where
+    Key: Clone + Eq,
+{
+    let mut reversed = Vec::with_capacity(depth);
+    let mut current = found_on.clone();
+    while !is_base(&current, reversed.len()) {
+        let Some((parent, relation)) = predecessor(&current) else {
+            break;
+        };
+        reversed.push((parent.clone(), current, relation));
+        current = parent;
+    }
+    let reached_base = is_base(&current, reversed.len());
+    reversed.reverse();
+    let route = reversed
+        .into_iter()
+        .enumerate()
+        .map(|(hop, (from, to, relation))| {
+            Some(HierarchyHopRecord {
+                hop,
+                from: code_unit(&from)?,
+                to: code_unit(&to)?,
+                relation,
+            })
+        })
+        .collect::<Option<Vec<_>>>()?;
+    Some((route, reached_base))
+}
+
 /// Member-selection attribution for one candidate (#1477): the exact owner the
 /// resolver found the member on, how many hierarchy hops away that owner is,
 /// which language-neutral dispatch bucket the find belongs to, whether the
@@ -127,6 +168,36 @@ pub struct MemberEnrichment {
     pub route: Vec<HierarchyHopRecord>,
 }
 
+pub(crate) fn member_enrichment(
+    owner: CodeUnit,
+    hierarchy_depth: usize,
+    applicability: ApplicabilityVerdict,
+    route: Vec<HierarchyHopRecord>,
+) -> MemberEnrichment {
+    let dispatch_tier = if hierarchy_depth == 0 {
+        MemberDispatchTier::InherentOrDirect
+    } else {
+        MemberDispatchTier::InheritedOrPromoted
+    };
+    member_enrichment_with_tier(owner, hierarchy_depth, dispatch_tier, applicability, route)
+}
+
+pub(crate) fn member_enrichment_with_tier(
+    owner: CodeUnit,
+    hierarchy_depth: usize,
+    dispatch_tier: MemberDispatchTier,
+    applicability: ApplicabilityVerdict,
+    route: Vec<HierarchyHopRecord>,
+) -> MemberEnrichment {
+    MemberEnrichment {
+        owner,
+        hierarchy_depth,
+        dispatch_tier,
+        applicability,
+        route,
+    }
+}
+
 /// Callable-applicability attribution for one candidate (#1478): whether the
 /// candidate's declared parameter list accepts this call site's argument shape,
 /// and the typed reason it does not.
@@ -145,6 +216,15 @@ pub struct CallableApplicabilityRecord {
     pub verdict: ApplicabilityVerdict,
     /// Set only when `verdict` is [`ApplicabilityVerdict::Inapplicable`].
     pub reason: Option<CallableRejectionReason>,
+}
+
+impl From<&CandidateApplicability> for CallableApplicabilityRecord {
+    fn from(verdict: &CandidateApplicability) -> Self {
+        Self {
+            verdict: verdict.verdict,
+            reason: verdict.reason,
+        }
+    }
 }
 
 /// One candidate the resolver considered for one reference.
@@ -382,7 +462,7 @@ fn with_recorder<R>(action: impl FnOnce(&mut Recorder) -> R) -> Option<R> {
 
 /// Append one row. Callers guard with [`recording`] before building the row.
 pub(crate) fn record(candidate: TraceCandidate) {
-    with_recorder(|recorder| recorder.candidates.push(candidate));
+    record_all([candidate]);
 }
 
 pub(crate) fn record_all(rows: impl IntoIterator<Item = TraceCandidate>) {
@@ -393,6 +473,75 @@ pub(crate) fn record_all(rows: impl IntoIterator<Item = TraceCandidate>) {
 /// `fq_names`.
 pub(crate) fn stage_tier(tier: PrecedenceTier, fq_names: Vec<String>) {
     with_recorder(|recorder| recorder.pending = Some(PendingSelection { tier, fq_names }));
+}
+
+/// Stage the least precedence tier among the candidates a member walk returned.
+/// The candidate tiers come from the walk itself; names include every returned
+/// candidate, even when the walk could not attribute one to a tier.
+pub(crate) fn stage_winner_tier(
+    winners: &[CodeUnit],
+    tiers: impl IntoIterator<Item = PrecedenceTier>,
+) {
+    if let Some(tier) = tiers.into_iter().min() {
+        stage_tier(tier, winners.iter().map(CodeUnit::fq_name).collect());
+    }
+}
+
+/// Stage the member and callable facts for a selection. The walk supplies its
+/// own enrichment function; an absent callable verdict stays unknown on the
+/// member axis and absent on the callable axis.
+pub(crate) fn stage_applicability_context(
+    winners: &[CodeUnit],
+    applicability: &ApplicabilityOutcome,
+    enrichment: impl Fn(&CodeUnit, ApplicabilityVerdict) -> Option<MemberEnrichment>,
+) {
+    let verdict_of = |unit: &CodeUnit| {
+        applicability
+            .verdicts
+            .iter()
+            .find(|verdict| verdict.candidate == *unit)
+    };
+    stage_member_context(
+        winners
+            .iter()
+            .filter_map(|unit| {
+                let verdict = verdict_of(unit)
+                    .map(|verdict| verdict.verdict)
+                    .unwrap_or(ApplicabilityVerdict::Unknown);
+                enrichment(unit, verdict).map(|member| (unit.fq_name(), member))
+            })
+            .collect(),
+    );
+    stage_callable_context(
+        winners
+            .iter()
+            .filter_map(|unit| {
+                verdict_of(unit)
+                    .map(CallableApplicabilityRecord::from)
+                    .map(|callable| (unit.fq_name(), callable))
+            })
+            .collect(),
+    );
+}
+
+/// Record a rejected workspace candidate with the attribution the resolver
+/// already knows at this discard point.
+pub(crate) fn record_rejected_unit(
+    candidate: &CodeUnit,
+    tier: Option<PrecedenceTier>,
+    reason: RejectionReason,
+    callable: Option<CallableApplicabilityRecord>,
+    member: Option<MemberEnrichment>,
+) {
+    let mut row =
+        TraceCandidate::rejected(TraceCandidateRef::Unit(candidate.clone()), tier, reason);
+    if let Some(callable) = callable {
+        row = row.with_callable(callable);
+    }
+    if let Some(member) = member {
+        row = row.with_member(member);
+    }
+    record(row);
 }
 
 /// Stage member attribution for the next outcome constructor whose candidates
@@ -501,16 +650,16 @@ pub(crate) fn deep_scope_is(name: &str) -> bool {
 }
 
 /// Install a recorder for the extent of one batch.
-pub(super) struct TraceSession;
+pub(crate) struct TraceSession;
 
 impl TraceSession {
-    pub(super) fn install() -> Self {
+    pub(crate) fn install() -> Self {
         RECORDER.with(|recorder| *recorder.borrow_mut() = Some(Recorder::default()));
         Self
     }
 
     /// Drain the rows recorded for the request that just finished.
-    pub(super) fn take_request(&self) -> Vec<TraceCandidate> {
+    pub(crate) fn take_request(&self) -> Vec<TraceCandidate> {
         with_recorder(|recorder| {
             recorder.pending = None;
             recorder.pending_member = None;
@@ -737,6 +886,19 @@ fn trace_completeness_for(file: &ProjectFile) -> TraceCompleteness {
     if language_for_file(file) == crate::analyzer::Language::Rust {
         return TraceCompleteness::SelectionOnly;
     }
+    if language_for_file(file) == crate::analyzer::Language::Java
+        && std::env::var_os("BIFROST_TRIAL_NATIVE_JAVA").is_some()
+    {
+        return TraceCompleteness::SelectionOnly;
+    }
+    #[cfg(any(test, feature = "test-support"))]
+    if (language_for_file(file) == crate::analyzer::Language::Scala
+        && std::env::var_os("BIFROST_TRIAL_NATIVE_SCALA").is_some())
+        || (language_for_file(file) == crate::analyzer::Language::Kotlin
+            && std::env::var_os("BIFROST_TRIAL_NATIVE_KOTLIN").is_some())
+    {
+        return TraceCompleteness::SelectionOnly;
+    }
 
     let instrumented = structural_spec_for(language_for_file(file)).is_some_and(|spec| {
         spec.lexical_environment_support()
@@ -904,7 +1066,14 @@ pub fn boundary_evidence(
             };
             match evidence {
                 Some((BoundaryStatus::ExternalUnknown, target)) => {
-                    if declared_by_retained_discovery(analyzer, language, name) {
+                    let discovery = analyzer.dependency_discovery_evidence(language);
+                    if declared_by_retained_discovery(analyzer, language, name)
+                        || discovery.as_deref().is_some_and(|evidence| {
+                            declared_jvm_import_or_implicit_root(
+                                analyzer, file, language, name, evidence,
+                            )
+                        })
+                    {
                         (BoundaryStatus::ExternalDeclaredUnindexed, None)
                     } else {
                         (BoundaryStatus::ExternalUnknown, target)
@@ -1235,6 +1404,49 @@ fn declared_by_retained_discovery(
     )
 }
 
+/// Whether a JVM spelling routes through a selected import or a language
+/// implicit root that retained dependency discovery declared but did not
+/// index. The imports come from the analyzer's structured import provider; the
+/// root packages come from the same language hook that keeps native lookup
+/// completeness open.
+fn declared_jvm_import_or_implicit_root(
+    analyzer: &dyn IAnalyzer,
+    file: &ProjectFile,
+    language: crate::analyzer::Language,
+    name: &str,
+    evidence: &crate::analyzer::semantic_model::DependencyDiscoveryEvidence,
+) -> bool {
+    use crate::analyzer::resolution::{JvmImplicitRootProvider, language_implicit_root_providers};
+
+    let scope = crate::analyzer::AnalyzerQueryScope::new(analyzer);
+    let token = scope.token();
+    let Some(leading) = name.split('.').next().filter(|head| !head.is_empty()) else {
+        return false;
+    };
+    let imported = analyzer
+        .import_analysis_provider_for_file(file)
+        .is_some_and(|provider| {
+            provider.import_info_of(token, file).iter().any(|import| {
+                let binds = import.is_wildcard || import.local_name() == Some(leading);
+                binds
+                    && import.path.as_ref().is_some_and(|path| {
+                        evidence.declares_module_path(&path.render_segments("."))
+                    })
+            })
+        });
+    imported
+        || (!name.contains('.')
+            && language_implicit_root_providers(language)
+                .iter()
+                .any(|provider| {
+                    let package = match provider {
+                        JvmImplicitRootProvider::Package(package) => *package,
+                        JvmImplicitRootProvider::ScalaPredef => "scala.Predef",
+                    };
+                    evidence.declares_module_path(package)
+                }))
+}
+
 /// Whether the import that binds `name`'s leading segment in `file` routes
 /// through a module the retained discovery evidence declares.
 ///
@@ -1292,6 +1504,7 @@ mod tests {
     use super::*;
     use crate::analyzer::DeclarationKind;
     use crate::analyzer::Range;
+    use brokk_bifrost_test_macros::hardwon;
 
     fn lexical(identifier: &str) -> LexicalDefinition {
         LexicalDefinition {
@@ -1313,55 +1526,7 @@ mod tests {
         }
     }
 
-    fn empty_outcome() -> DefinitionLookupOutcome {
-        DefinitionLookupOutcome {
-            modeled_definitions: Vec::new(),
-            status: DefinitionLookupStatus::NoDefinition,
-            reference: None,
-            definitions: Vec::new(),
-            lexical_definition: None,
-            diagnostics: Vec::new(),
-        }
-    }
-
-    /// The consistency rule is the one guard that a future emission site cannot
-    /// route around: a `Selected` row must name something its outcome reports.
-    #[test]
-    #[should_panic(expected = "trace selected lexical")]
-    fn a_selected_row_that_the_outcome_does_not_report_fails_at_the_construction_point() {
-        let rows = vec![TraceCandidate::selected(
-            TraceCandidateRef::Lexical(lexical("shadowed")),
-            Some(PrecedenceTier::LexicalBinding),
-        )];
-        debug_assert_selection_agrees(&rows, &empty_outcome());
-    }
-
-    #[test]
-    fn an_agreeing_selection_passes_the_same_check() {
-        let definition = lexical("local");
-        let mut outcome = empty_outcome();
-        outcome.status = DefinitionLookupStatus::Resolved;
-        outcome.lexical_definition = Some(definition.clone());
-        let rows = vec![TraceCandidate::selected(
-            TraceCandidateRef::Lexical(definition),
-            Some(PrecedenceTier::LexicalBinding),
-        )];
-        debug_assert_selection_agrees(&rows, &outcome);
-    }
-
-    /// Nothing is recorded unless a session is installed, so an ordinary
-    /// resolution cannot pay for a trace nobody asked for.
-    #[test]
-    fn emission_is_inert_without_a_session() {
-        assert!(!recording());
-        record(TraceCandidate::selected(
-            TraceCandidateRef::Lexical(lexical("ignored")),
-            None,
-        ));
-        stage_tier(PrecedenceTier::ExplicitImport, vec!["a.B".to_owned()]);
-        assert!(!deep_scope_is("ignored"));
-    }
-
+    #[hardwon("#1569: a session collects rows and drains them per request")]
     #[test]
     fn a_session_collects_rows_and_drains_them_per_request() {
         let session = TraceSession::install();
@@ -1379,6 +1544,7 @@ mod tests {
         assert!(!recording());
     }
 
+    #[hardwon("#1569: a deep scope restores the name it replaced")]
     #[test]
     fn a_deep_scope_restores_the_name_it_replaced() {
         let _session = TraceSession::install();
@@ -1391,16 +1557,6 @@ mod tests {
         assert!(deep_scope_is("outer"));
         drop(outer);
         assert!(!deep_scope_is("outer"));
-    }
-
-    #[test]
-    fn completeness_defaults_to_selection_only() {
-        assert_eq!(
-            TraceCompleteness::default(),
-            TraceCompleteness::SelectionOnly
-        );
-        assert!(!TraceCompleteness::SelectionOnly.covers_rejections());
-        assert!(TraceCompleteness::Full.covers_rejections());
     }
 }
 
@@ -1419,16 +1575,61 @@ mod tests {
 #[cfg(test)]
 mod boundary_evidence_tests {
     use super::*;
-    use crate::analyzer::semantic_model::{
-        CatalogCoordinate, DependencyDiscoveryOutcome, ResolvedDependency,
-        SemanticModelActivationEvidence,
-    };
+    use crate::analyzer::semantic_model::SemanticModelActivationEvidence;
     use crate::analyzer::structural::occurrences::OccurrenceRole;
     use crate::analyzer::usages::get_definition::DefinitionLookupRequest;
-    use crate::analyzer::{AnalyzerConfig, Language, Project, TestProject, WorkspaceAnalyzer};
-    use crate::analyzer::{AnalyzerQueryScope, QueryScope};
+    use crate::analyzer::{
+        AnalyzerConfig, AnalyzerQueryScope, Language, Project, QueryScope, TestProject,
+        WorkspaceAnalyzer,
+    };
+    use crate::test_support::activation_evidence;
+    use brokk_bifrost_test_macros::hardwon;
     use std::path::{Path, PathBuf};
     use std::sync::Arc;
+
+    const PHP_USE_ALIAS_SOURCE: &str = concat!(
+        "<?php\n",
+        "\n",
+        "namespace App\\Model {\n",
+        "    class Widget {}\n",
+        "}\n",
+        "\n",
+        "namespace App\\Util {\n",
+        "    use App\\Model\\Widget as Gadget;\n",
+        "\n",
+        "    function make(): Gadget {\n",
+        "        return new Gadget();\n",
+        "    }\n",
+        "}\n",
+    );
+
+    const KOTLIN_BOUNDARY_SOURCE: &str = concat!(
+        "package app\n",
+        "import com.acme.Gadget\n",
+        "class Caller {\n",
+        "  fun build(): Gadget? = null\n",
+        "}\n",
+    );
+
+    const JVM_PACK_JAVA_SOURCE: &str = concat!(
+        "package app;\n",
+        "\n",
+        "import java.util.ArrayList;\n",
+        "import java.util.Collections;\n",
+        "\n",
+        "class Caller {\n",
+        "  Collections helper() { return null; }\n",
+        "  ArrayList names() { return null; }\n",
+        "}\n",
+    );
+
+    const JVM_PACK_KOTLIN_SOURCE: &str = concat!(
+        "package app\n",
+        "import java.util.Collections\n",
+        "class Caller {\n",
+        "  fun helper(): Collections? = null\n",
+        "}\n",
+    );
 
     struct BoundaryFixture {
         _temp: tempfile::TempDir,
@@ -1475,17 +1676,7 @@ mod boundary_evidence_tests {
         /// The traced resolution of the reference whose first token starts
         /// `needle`.
         fn trace(&self, needle: &str) -> (DefinitionLookupOutcome, ResolutionTraceResult) {
-            let start = self
-                .source
-                .find(needle)
-                .unwrap_or_else(|| panic!("fixture does not contain {needle:?}"));
-            let requests = vec![DefinitionLookupRequest {
-                file: self.file.clone(),
-                line: None,
-                column: None,
-                start_byte: Some(start),
-                end_byte: None,
-            }];
+            let requests = vec![self.request_for(needle)];
             resolve_definition_batch_with_trace(
                 self.workspace.analyzer(),
                 requests,
@@ -1497,26 +1688,27 @@ mod boundary_evidence_tests {
             .expect("one traced outcome per request")
         }
 
-        /// The same traced resolution as [`Self::trace`], reached through the
-        /// public probe entry point (#1885) instead of the crate-internal one
-        /// [`resolve_definition_batch_with_trace`] wraps. Tests that exercise
-        /// this method prove the widened surface produces the resolver's own
-        /// answer, not a parallel one.
-        fn trace_via_probe_entry_point(
-            &self,
-            needle: &str,
-        ) -> (DefinitionLookupOutcome, ResolutionTraceResult) {
+        fn request_for(&self, needle: &str) -> DefinitionLookupRequest {
             let start = self
                 .source
                 .find(needle)
                 .unwrap_or_else(|| panic!("fixture does not contain {needle:?}"));
-            let requests = vec![DefinitionLookupRequest {
+            DefinitionLookupRequest {
                 file: self.file.clone(),
                 line: None,
                 column: None,
                 start_byte: Some(start),
                 end_byte: None,
-            }];
+            }
+        }
+
+        /// The same traced resolution as [`Self::trace`], reached through the
+        /// public probe entry point (#1885).
+        fn trace_via_probe_entry_point(
+            &self,
+            needle: &str,
+        ) -> (DefinitionLookupOutcome, ResolutionTraceResult) {
+            let requests = vec![self.request_for(needle)];
             super::super::resolve_definition_batch_with_source_traced(
                 self.workspace.analyzer(),
                 requests,
@@ -1542,19 +1734,25 @@ mod boundary_evidence_tests {
     }
 
     fn route_rows(trace: &ResolutionTraceResult) -> Vec<(BoundaryStatus, Option<String>)> {
-        trace
-            .candidates
-            .iter()
-            .filter(|row| matches!(row.candidate, TraceCandidateRef::ExternalRoute { .. }))
+        crate::test_support::external_route_candidates(trace)
+            .into_iter()
             .map(|row| (row.boundary, row.external_target.clone()))
             .collect()
     }
 
+    fn assert_declared_unindexed_routes(routes: &[(BoundaryStatus, Option<String>)]) {
+        assert!(
+            routes
+                .iter()
+                .all(|(boundary, _)| *boundary == BoundaryStatus::ExternalDeclaredUnindexed),
+            "a declared but unread dependency stays accountable: {routes:?}"
+        );
+    }
+
     /// The written names of one trace's external-route rows, in order.
     fn route_names(trace: &ResolutionTraceResult) -> Vec<String> {
-        trace
-            .candidates
-            .iter()
+        crate::test_support::external_route_candidates(trace)
+            .into_iter()
             .filter_map(|row| match &row.candidate {
                 TraceCandidateRef::ExternalRoute { name } => Some(name.clone()),
                 _ => None,
@@ -1642,43 +1840,8 @@ mod boundary_evidence_tests {
         );
     }
 
-    /// A discovery outcome declaring exactly `modules` for `language`, in the
-    /// shape the per-language resolvers produce; `complete: false` marks a run
-    /// that could not read everything the build declared.
-    fn discovery_declaring(
-        language: &str,
-        modules: &[&str],
-        complete: bool,
-    ) -> DependencyDiscoveryOutcome {
-        let mut outcome = DependencyDiscoveryOutcome::complete(
-            modules
-                .iter()
-                .map(|module| ResolvedDependency {
-                    id: format!("test:distribution:{module}"),
-                    evidence: SemanticModelActivationEvidence {
-                        language: language.to_owned(),
-                        ecosystem: "test".to_owned(),
-                        package: None,
-                        module: Some(CatalogCoordinate {
-                            name: (*module).to_owned(),
-                            version: None,
-                        }),
-                        toolchain: None,
-                        target: None,
-                        configuration: None,
-                        artifact_sha256: None,
-                    },
-                    provenance: Vec::new(),
-                    artifacts: Vec::new(),
-                    scope: crate::analyzer::topology::DependencyScope::Unknown,
-                    declared_by: None,
-                })
-                .collect(),
-        );
-        outcome.complete = complete;
-        outcome
-    }
-
+    /// A discovery outcome declaring exactly `modules` for `language`; an
+    /// incomplete outcome records that the build could not be read fully.
     fn write_source_jar(path: &Path, entry_name: &str, bytes: &[u8]) {
         use std::io::Write;
         let file = std::fs::File::create(path).expect("create source jar");
@@ -1800,26 +1963,6 @@ mod boundary_evidence_tests {
         );
     }
 
-    fn activation_evidence(
-        language: &str,
-        ecosystem: &str,
-        package: &str,
-    ) -> SemanticModelActivationEvidence {
-        SemanticModelActivationEvidence {
-            language: language.to_owned(),
-            ecosystem: ecosystem.to_owned(),
-            package: Some(CatalogCoordinate {
-                name: package.to_owned(),
-                version: None,
-            }),
-            module: None,
-            toolchain: None,
-            target: None,
-            configuration: None,
-            artifact_sha256: None,
-        }
-    }
-
     /// One declaration-facts pack with a single public type, carrying whatever
     /// `members` the caller declares on it.
     fn single_type_pack(
@@ -1831,39 +1974,29 @@ mod boundary_evidence_tests {
         type_name: &str,
         members: serde_json::Value,
     ) -> serde_json::Value {
-        serde_json::json!({
-            "schema_version": 2,
-            "pack_id": pack_id,
-            "version": "1.0.0",
-            "producer": { "name": format!("{language}-fixture"), "version": "1.0.0" },
-            "language": language,
-            "ecosystem": ecosystem,
-            "compatibility": { "bifrost": "*", "toolchains": [] },
-            "provenance": { "source": "fixture" },
-            "license": "NOASSERTION",
-            "completeness": "complete",
-            "safety": { "generated_code_only": false, "review_required": false },
-            "shards": [{
-                "id": format!("declarations.{pack_id}"),
-                "activation": [{ "package": { "name": package } }],
-                "payload": {
-                    "kind": "declaration_facts",
-                    "types": [{
-                        "id": type_id,
-                        "name": type_name,
-                        "type_kind": "class",
-                        "visibility": "public",
-                        "hierarchy": [],
-                        "locator": {
-                            "kind": "artifact",
-                            "path": "fixture-source",
-                            "symbol": type_name
-                        }
-                    }],
-                    "members": members,
-                    "relations": []
+        declaration_facts_pack::build(declaration_facts_pack::DeclarationFactsPack {
+            pack_id,
+            version: "1.0.0",
+            producer_name: &format!("{language}-fixture"),
+            language,
+            ecosystem,
+            toolchains: serde_json::json!([]),
+            completeness: "complete",
+            shard_id: &format!("declarations.{pack_id}"),
+            activation: serde_json::json!([{ "package": { "name": package } }]),
+            types: serde_json::json!([{
+                "id": type_id,
+                "name": type_name,
+                "type_kind": "class",
+                "visibility": "public",
+                "hierarchy": [],
+                "locator": {
+                    "kind": "artifact",
+                    "path": "fixture-source",
+                    "symbol": type_name
                 }
-            }]
+            }]),
+            members,
         })
     }
 
@@ -1903,52 +2036,6 @@ mod boundary_evidence_tests {
                     && target.as_deref() == Some("com.acme.Gadget")
             }),
             "the jar index resolves `Gadget` through the explicit import: {routes:?}"
-        );
-    }
-
-    #[test]
-    fn a_scala_import_of_a_declared_unread_dependency_reports_declared_unindexed() {
-        let fixture = BoundaryFixture::with_config(
-            Language::Scala,
-            "app/Caller.scala",
-            SCALA_BOUNDARY_SOURCE,
-            |_| jvm_config_with_artifact_jar(None),
-        );
-        fixture.workspace.retain_dependency_discovery_evidence(
-            &[Language::Scala],
-            &discovery_declaring("scala", &["com.acme"], false),
-        );
-        let (_, trace) = fixture.trace("Gadget = null");
-        let routes = external_routes(&trace);
-        assert!(
-            routes
-                .iter()
-                .all(|(boundary, _)| *boundary == BoundaryStatus::ExternalDeclaredUnindexed),
-            "a truncated JVM discovery keeps the name accountable: {routes:?}"
-        );
-    }
-
-    #[test]
-    fn a_csharp_reference_into_a_declared_unindexed_package_reports_declared_unindexed() {
-        let source = concat!(
-            "using Newtonsoft.Json;\n",
-            "namespace App;\n",
-            "class Caller {\n",
-            "    Newtonsoft.Json.JsonConvert Ping() { return default; }\n",
-            "}\n",
-        );
-        let fixture = BoundaryFixture::new(Language::CSharp, "src/App.cs", source);
-        fixture.workspace.retain_dependency_discovery_evidence(
-            &[Language::CSharp],
-            &discovery_declaring("csharp", &["Newtonsoft.Json"], true),
-        );
-        let (_, trace) = fixture.trace("JsonConvert Ping");
-        let routes = external_routes(&trace);
-        assert!(
-            routes
-                .iter()
-                .all(|(boundary, _)| *boundary == BoundaryStatus::ExternalDeclaredUnindexed),
-            "the build declares `Newtonsoft.Json`, so the miss is declared-unindexed: {routes:?}"
         );
     }
 
@@ -2001,296 +2088,17 @@ mod boundary_evidence_tests {
         );
     }
 
-    /// A PHP reference written through a `use` alias reports the candidate the
-    /// resolver considered and selected.
-    ///
-    /// The alias names a declaration this workspace holds, so the trace
-    /// carries a unit-backed `selected` row naming that declaration's FQ name
-    /// rather than a boundary route. The trace's completeness stays
-    /// `SelectionOnly`, which is exactly what PHP's adapter declares: it
-    /// supports `candidate_selection` and not `candidate_rejection` (#2962),
-    /// so an absent rejection row for PHP means nothing rather than "the
-    /// resolver rejected nothing here".
-    const PHP_USE_ALIAS_SOURCE: &str = concat!(
-        "<?php\n",
-        "\n",
-        "namespace App\\Model {\n",
-        "    class Widget {}\n",
-        "}\n",
-        "\n",
-        "namespace App\\Util {\n",
-        "    use App\\Model\\Widget as Gadget;\n",
-        "\n",
-        "    function make(): Gadget {\n",
-        "        return new Gadget();\n",
-        "    }\n",
-        "}\n",
-    );
-
-    #[test]
-    fn a_php_use_alias_reports_the_workspace_candidate_it_selected() {
-        let fixture = BoundaryFixture::new(Language::Php, "src/Service.php", PHP_USE_ALIAS_SOURCE);
-        let (outcome, trace) = fixture.trace("Gadget();");
-        assert!(
-            !outcome.definitions.is_empty(),
-            "the alias names a workspace declaration: {outcome:?}"
-        );
-        let selected: Vec<String> = trace
-            .selected()
-            .map(|candidate| match &candidate.candidate {
-                TraceCandidateRef::Unit(unit) => unit.fq_name(),
-                other => panic!("expected a unit-backed candidate, got {other:?}"),
-            })
-            .collect();
-        assert_eq!(
-            selected,
-            ["App.Model.Widget"],
-            "the trace names the declaration the alias resolved to: {:?}",
-            trace.candidates
-        );
-        assert_eq!(
-            trace.completeness,
-            TraceCompleteness::SelectionOnly,
-            "PHP declares candidate_selection and not candidate_rejection"
-        );
-        assert!(
-            route_rows(&trace).is_empty(),
-            "a name the workspace declares draws no boundary: {:?}",
-            trace.candidates
-        );
-    }
-
-    #[test]
-    fn a_php_use_of_a_declared_unread_composer_dependency_reports_declared_unindexed() {
-        let fixture = BoundaryFixture::new(Language::Php, "src/Service.php", PHP_BOUNDARY_SOURCE);
-        fixture.workspace.retain_dependency_discovery_evidence(
-            &[Language::Php],
-            &discovery_declaring("php", &["Vendor.Widget"], false),
-        );
-        let (_, trace) = fixture.trace("Helper $helper");
-        let routes = external_routes(&trace);
-        assert!(
-            routes
-                .iter()
-                .all(|(boundary, _)| *boundary == BoundaryStatus::ExternalDeclaredUnindexed),
-            "a truncated Composer discovery keeps the name accountable: {routes:?}"
-        );
-    }
-
     // -----------------------------------------------------------------------
     // Kotlin: end-to-end through the resolver's own boundary outcome (#1889).
     // -----------------------------------------------------------------------
-
-    const KOTLIN_BOUNDARY_SOURCE: &str = concat!(
-        "package app\n",
-        "import com.acme.Gadget\n",
-        "class Caller {\n",
-        "  fun build(): Gadget? = null\n",
-        "}\n",
-    );
-
-    #[test]
-    fn a_kotlin_import_of_an_indexed_external_type_reports_external_indexed() {
-        let fixture = BoundaryFixture::with_config(
-            Language::Kotlin,
-            "app/Caller.kt",
-            KOTLIN_BOUNDARY_SOURCE,
-            |root| {
-                let jar = root.join("acme-lib-sources.jar");
-                write_source_jar(
-                    &jar,
-                    "com/acme/Gadget.kt",
-                    b"package com.acme\nclass Gadget\n",
-                );
-                jvm_config_with_artifact_jar(Some(jar))
-            },
-        );
-        let (_, trace) = fixture.trace("Gadget? = null");
-        let routes = external_routes(&trace);
-        assert!(
-            routes.iter().all(|(boundary, target)| {
-                *boundary == BoundaryStatus::ExternalIndexed
-                    && target.as_deref() == Some("com.acme.Gadget")
-            }),
-            "the jar index resolves `Gadget` through the explicit import: {routes:?}"
-        );
-    }
-
-    #[test]
-    fn a_kotlin_import_of_a_declared_unread_dependency_reports_declared_unindexed() {
-        let fixture = BoundaryFixture::with_config(
-            Language::Kotlin,
-            "app/Caller.kt",
-            KOTLIN_BOUNDARY_SOURCE,
-            |_| jvm_config_with_artifact_jar(None),
-        );
-        let (_, trace) = fixture.trace("Gadget? = null");
-        assert!(
-            external_routes(&trace)
-                .iter()
-                .all(|(boundary, _)| *boundary == BoundaryStatus::ExternalUnknown),
-            "with no index and no retained discovery, nothing is known: {:?}",
-            trace.candidates
-        );
-        fixture.workspace.retain_dependency_discovery_evidence(
-            &[Language::Kotlin],
-            &discovery_declaring("kotlin", &["com.acme"], false),
-        );
-        let (_, trace) = fixture.trace("Gadget? = null");
-        let routes = external_routes(&trace);
-        assert!(
-            routes
-                .iter()
-                .all(|(boundary, _)| *boundary == BoundaryStatus::ExternalDeclaredUnindexed),
-            "a truncated JVM discovery keeps the name accountable: {routes:?}"
-        );
-    }
-
-    #[cfg_attr(not(scheduled_tests), ignore = "scheduled-only")]
-    #[test]
-    fn a_kotlin_import_of_a_workspace_package_stays_a_plain_miss() {
-        // The import target is the workspace's own package, so the failing
-        // segment never leaves it and the honest answer is `no_definition`.
-        let fixture = BoundaryFixture::new(
-            Language::Kotlin,
-            "app/Caller.kt",
-            concat!(
-                "package app\n",
-                "import app.Helper\n",
-                "class Caller {\n",
-                "  fun build(): Helper? = null\n",
-                "}\n",
-            ),
-        );
-        assert_no_boundary_was_drawn("Helper? = null", &fixture);
-    }
-
-    #[cfg_attr(not(scheduled_tests), ignore = "scheduled-only")]
-    #[test]
-    fn a_kotlin_reference_with_no_import_at_all_stays_a_plain_miss() {
-        let fixture = BoundaryFixture::new(
-            Language::Kotlin,
-            "app/Caller.kt",
-            concat!(
-                "package app\n",
-                "class Caller {\n",
-                "  fun build(): Helper? = null\n",
-                "}\n",
-            ),
-        );
-        assert_no_boundary_was_drawn("Helper? = null", &fixture);
-    }
 
     // -----------------------------------------------------------------------
     // Ruby: end-to-end through the resolver's own boundary outcome (#1889).
     // -----------------------------------------------------------------------
 
-    #[test]
-    fn a_ruby_reference_to_an_indexed_gem_constant_reports_external_indexed() {
-        use crate::analyzer::semantic_model::{TypeIdentity, type_declaration_id};
-
-        let fixture = BoundaryFixture::new(Language::Ruby, "app.rb", "Widget::Config\n");
-        let type_id = type_declaration_id(TypeIdentity {
-            ecosystem: "rubygems",
-            name: "Widget::Config",
-        });
-        activate_fixture_pack(
-            &fixture,
-            "fixture.ruby.widget",
-            &single_type_pack(
-                "fixture.ruby.widget",
-                "ruby",
-                "rubygems",
-                "widget",
-                &type_id,
-                "Widget::Config",
-                serde_json::json!([]),
-            ),
-            activation_evidence("ruby", "rubygems", "widget"),
-        );
-        let (_, trace) = fixture.trace("Config");
-        let routes = external_routes(&trace);
-        assert!(
-            routes.iter().all(|(boundary, target)| {
-                *boundary == BoundaryStatus::ExternalIndexed
-                    && target.as_deref() == Some(type_id.as_str())
-            }),
-            "the activated pack publishes `Widget::Config`: {routes:?}"
-        );
-    }
-
-    #[test]
-    fn a_ruby_reference_into_a_declared_unread_gem_reports_declared_unindexed() {
-        let fixture = BoundaryFixture::new(Language::Ruby, "app.rb", "Widget::Config\n");
-        let (_, trace) = fixture.trace("Config");
-        assert!(
-            external_routes(&trace)
-                .iter()
-                .all(|(boundary, _)| *boundary == BoundaryStatus::ExternalUnknown),
-            "with no overlay and no retained discovery, nothing is known: {:?}",
-            trace.candidates
-        );
-        fixture.workspace.retain_dependency_discovery_evidence(
-            &[Language::Ruby],
-            &discovery_declaring("ruby", &["widget"], false),
-        );
-        let (_, trace) = fixture.trace("Config");
-        let routes = external_routes(&trace);
-        assert!(
-            routes
-                .iter()
-                .all(|(boundary, _)| *boundary == BoundaryStatus::ExternalDeclaredUnindexed),
-            "a truncated gem discovery keeps the name accountable: {routes:?}"
-        );
-    }
-
-    #[test]
-    fn a_ruby_path_under_a_workspace_namespace_stays_a_plain_miss() {
-        // `Widget` is a workspace module, so the miss is inside the workspace
-        // however the path continues.
-        let fixture = BoundaryFixture::new(
-            Language::Ruby,
-            "app.rb",
-            concat!("module Widget\n", "end\n", "\n", "Widget::Missing\n"),
-        );
-        assert_no_boundary_was_drawn("Missing", &fixture);
-    }
-
-    #[test]
-    fn a_bare_ruby_constant_never_draws_a_boundary() {
-        // Ruby's top-level surface includes the core library and everything a
-        // loaded gem defines as a side effect, none of which Bifrost publishes,
-        // so a bare miss says nothing about where the name lives (#1624).
-        let fixture = BoundaryFixture::new(Language::Ruby, "app.rb", "Missing\n");
-        assert_no_boundary_was_drawn("Missing", &fixture);
-    }
-
     // -----------------------------------------------------------------------
     // JVM declaration-facts packs: the same route the source jars feed (#1893).
     // -----------------------------------------------------------------------
-
-    /// One file whose two imports are both standard-library types, only one of
-    /// which the activated pack declares. The pair is the whole point: the pack
-    /// must decide its own type and must leave the other one alone.
-    const JVM_PACK_JAVA_SOURCE: &str = concat!(
-        "package app;\n",
-        "\n",
-        "import java.util.ArrayList;\n",
-        "import java.util.Collections;\n",
-        "\n",
-        "class Caller {\n",
-        "  Collections helper() { return null; }\n",
-        "  ArrayList names() { return null; }\n",
-        "}\n",
-    );
-
-    const JVM_PACK_KOTLIN_SOURCE: &str = concat!(
-        "package app\n",
-        "import java.util.Collections\n",
-        "class Caller {\n",
-        "  fun helper(): Collections? = null\n",
-        "}\n",
-    );
 
     /// One file whose standard-library call spells a *member*: the whole
     /// written name `Collections.sort` has a type for its head and a member for
@@ -2354,318 +2162,10 @@ mod boundary_evidence_tests {
         }])
     }
 
-    #[test]
-    fn a_java_import_of_a_pack_declared_type_reports_external_indexed() {
-        // #1893 acceptance: no source jar, no class jar, no JDK home -- the
-        // activated pack's declaration facts are the only external evidence
-        // there is, and they carry the reference all the way to the same
-        // `external_indexed` verdict the source-jar route produces.
-        let fixture = BoundaryFixture::with_config(
-            Language::Java,
-            "app/Caller.java",
-            JVM_PACK_JAVA_SOURCE,
-            |_| jvm_config_with_artifact_jar(None),
-        );
-        let pack = jdk_collections_pack(serde_json::json!([]));
-        activate_fixture_pack(
-            &fixture,
-            "fixture.jdk",
-            &pack,
-            activation_evidence("java", "jdk", "java.base"),
-        );
-
-        let (_, trace) = fixture.trace("Collections helper");
-        let routes = external_routes(&trace);
-        assert!(
-            routes.iter().all(|(boundary, target)| {
-                *boundary == BoundaryStatus::ExternalIndexed
-                    && target.as_deref() == Some("java.util.Collections")
-            }),
-            "the activated pack declares `java.util.Collections`: {routes:?}"
-        );
-
-        // Boundary honesty: a pack decides the types it declares and nothing
-        // else. `java.util.ArrayList` is imported from the same package and is
-        // not in the pack, so it keeps the answer it had before activation.
-        let (_, trace) = fixture.trace("ArrayList names");
-        let routes = external_routes(&trace);
-        assert!(
-            routes
-                .iter()
-                .all(|(boundary, _)| *boundary == BoundaryStatus::ExternalUnknown),
-            "a type the pack does not declare must not be upgraded: {routes:?}"
-        );
-    }
-
-    #[test]
-    fn a_java_reference_without_the_pack_stays_external_unknown() {
-        // The same fixture with no activation at all: the honest answer before
-        // #1893 and after it, so the test above measures the pack and not the
-        // fixture.
-        let fixture = BoundaryFixture::with_config(
-            Language::Java,
-            "app/Caller.java",
-            JVM_PACK_JAVA_SOURCE,
-            |_| jvm_config_with_artifact_jar(None),
-        );
-        let (_, trace) = fixture.trace("Collections helper");
-        let routes = external_routes(&trace);
-        assert!(
-            routes
-                .iter()
-                .all(|(boundary, _)| *boundary == BoundaryStatus::ExternalUnknown),
-            "with nothing activated and no artifact, nothing is known: {routes:?}"
-        );
-    }
-
     // -----------------------------------------------------------------------
     // Milestone 1 (#1885): the public probe entry points read the same
     // resolver decisions as the crate-internal ones they wrap.
     // -----------------------------------------------------------------------
-
-    #[test]
-    fn the_public_traced_batch_reports_workspace_local_for_an_in_workspace_reference() {
-        // A reference that never leaves the workspace draws no boundary route
-        // at all; `TraceCandidate::selected` defaults every row's boundary to
-        // `WorkspaceLocal`, so that is the honest reading for a plain
-        // in-workspace hit rather than a value `finish_boundary` stamped.
-        let fixture = BoundaryFixture::new(
-            Language::Java,
-            "app/Caller.java",
-            concat!(
-                "package app;\n",
-                "class Helper {}\n",
-                "class Caller {\n",
-                "  Helper helper() { return null; }\n",
-                "}\n",
-            ),
-        );
-        let (outcome, trace) = fixture.trace_via_probe_entry_point("Helper helper");
-        assert_eq!(outcome.status, DefinitionLookupStatus::Resolved);
-        let selected: Vec<_> = trace.selected().collect();
-        assert!(
-            !selected.is_empty(),
-            "a resolved reference reports the candidate it selected: {:?}",
-            trace.candidates
-        );
-        assert!(
-            selected
-                .iter()
-                .all(|row| row.boundary == BoundaryStatus::WorkspaceLocal),
-            "an in-workspace selection is workspace-local: {selected:?}"
-        );
-        assert_eq!(
-            dispatch_quality_for_status(Some(outcome.status), None),
-            DispatchQuality::Complete
-        );
-    }
-
-    #[test]
-    fn the_public_traced_batch_agrees_with_direct_boundary_evidence_for_a_pack_indexed_reference() {
-        let fixture = BoundaryFixture::with_config(
-            Language::Java,
-            "app/Caller.java",
-            JVM_PACK_JAVA_SOURCE,
-            |_| jvm_config_with_artifact_jar(None),
-        );
-        let pack = jdk_collections_pack(serde_json::json!([]));
-        activate_fixture_pack(
-            &fixture,
-            "fixture.jdk",
-            &pack,
-            activation_evidence("java", "jdk", "java.base"),
-        );
-
-        let (outcome, trace) = fixture.trace_via_probe_entry_point("Collections helper");
-        assert_eq!(
-            outcome.status,
-            DefinitionLookupStatus::UnresolvableImportBoundary
-        );
-        let routes = external_routes(&trace);
-        assert!(
-            routes.iter().all(|(boundary, target)| {
-                *boundary == BoundaryStatus::ExternalIndexed
-                    && target.as_deref() == Some("java.util.Collections")
-            }),
-            "the activated pack declares `java.util.Collections`: {routes:?}"
-        );
-
-        // Chain-link agreement (#1885): the direct evidence call must name the
-        // same boundary and target the trace already stamped on the row,
-        // because both read the same `boundary_evidence` fact.
-        let (direct_status, direct_target) = boundary_evidence(
-            fixture.workspace.analyzer(),
-            &fixture.file,
-            "java.util.Collections",
-        );
-        assert_eq!(direct_status, BoundaryStatus::ExternalIndexed);
-        assert_eq!(direct_target.as_deref(), Some("java.util.Collections"));
-
-        assert_eq!(
-            dispatch_quality_for_status(Some(outcome.status), Some(direct_status)),
-            DispatchQuality::Complete
-        );
-    }
-
-    #[test]
-    fn the_public_traced_batch_agrees_with_direct_boundary_evidence_without_the_pack() {
-        // Same reference, no pack activated: dependency discovery never ran
-        // for this fixture (`jvm_config_with_artifact_jar` disables it), so
-        // there is no retained evidence to refine the miss into
-        // `ExternalDeclaredUnindexed`. The honest answer here is
-        // `ExternalUnknown`, matching
-        // `a_java_reference_without_the_pack_stays_external_unknown` above.
-        let fixture = BoundaryFixture::with_config(
-            Language::Java,
-            "app/Caller.java",
-            JVM_PACK_JAVA_SOURCE,
-            |_| jvm_config_with_artifact_jar(None),
-        );
-
-        let (outcome, trace) = fixture.trace_via_probe_entry_point("Collections helper");
-        assert_eq!(
-            outcome.status,
-            DefinitionLookupStatus::UnresolvableImportBoundary
-        );
-        let routes = external_routes(&trace);
-        assert!(
-            routes
-                .iter()
-                .all(|(boundary, _)| *boundary == BoundaryStatus::ExternalUnknown),
-            "with nothing activated and no artifact, nothing is known: {routes:?}"
-        );
-
-        let (direct_status, direct_target) = boundary_evidence(
-            fixture.workspace.analyzer(),
-            &fixture.file,
-            "java.util.Collections",
-        );
-        assert_eq!(direct_status, BoundaryStatus::ExternalUnknown);
-        assert_eq!(direct_target, None);
-
-        assert_eq!(
-            dispatch_quality_for_status(Some(outcome.status), Some(direct_status)),
-            DispatchQuality::Unknown
-        );
-    }
-
-    #[test]
-    fn a_kotlin_import_of_a_pack_declared_jvm_type_reports_external_indexed() {
-        // Java, Kotlin and Scala share one classpath and therefore one external
-        // declaration surface, so a pack published for `language: java` answers
-        // a Kotlin reference to the same type.
-        let fixture = BoundaryFixture::with_config(
-            Language::Kotlin,
-            "app/Caller.kt",
-            JVM_PACK_KOTLIN_SOURCE,
-            |_| jvm_config_with_artifact_jar(None),
-        );
-        let pack = jdk_collections_pack(serde_json::json!([]));
-        activate_fixture_pack(
-            &fixture,
-            "fixture.jdk",
-            &pack,
-            activation_evidence("java", "jdk", "java.base"),
-        );
-        let (_, trace) = fixture.trace("Collections? = null");
-        let routes = external_routes(&trace);
-        assert!(
-            routes.iter().all(|(boundary, target)| {
-                *boundary == BoundaryStatus::ExternalIndexed
-                    && target.as_deref() == Some("java.util.Collections")
-            }),
-            "the activated pack declares `java.util.Collections`: {routes:?}"
-        );
-    }
-
-    #[test]
-    fn a_pack_for_another_language_never_answers_a_jvm_name() {
-        // Near miss: an activated pack that publishes the very same qualified
-        // name for a different ecosystem's language. The JVM realm is Java,
-        // Kotlin and Scala, so this one is not on the classpath and must not
-        // upgrade the reference.
-        use crate::analyzer::semantic_model::{TypeIdentity, type_declaration_id};
-
-        let fixture = BoundaryFixture::with_config(
-            Language::Java,
-            "app/Caller.java",
-            JVM_PACK_JAVA_SOURCE,
-            |_| jvm_config_with_artifact_jar(None),
-        );
-        let type_id = type_declaration_id(TypeIdentity {
-            ecosystem: "composer",
-            name: "java.util.Collections",
-        });
-        activate_fixture_pack(
-            &fixture,
-            "fixture.php.impostor",
-            &single_type_pack(
-                "fixture.php.impostor",
-                "php",
-                "composer",
-                "vendor/impostor",
-                &type_id,
-                "java.util.Collections",
-                serde_json::json!([]),
-            ),
-            activation_evidence("php", "composer", "vendor/impostor"),
-        );
-        let (_, trace) = fixture.trace("Collections helper");
-        let routes = external_routes(&trace);
-        assert!(
-            routes
-                .iter()
-                .all(|(boundary, _)| *boundary == BoundaryStatus::ExternalUnknown),
-            "a pack for another language declares nothing on the classpath: {routes:?}"
-        );
-    }
-
-    #[test]
-    fn an_indexed_external_route_is_the_selection_and_an_unknown_one_is_not() {
-        // The trace's outcome column, not just its boundary column: a route
-        // that named an exact external declaration is what the reference
-        // resolved to, so a policy asking "did this resolve through a real
-        // route" has a selection to read. A route that named nothing stays
-        // rejected, so the same question is honestly unanswerable.
-        let fixture = BoundaryFixture::with_config(
-            Language::Java,
-            "app/Caller.java",
-            JVM_PACK_JAVA_SOURCE,
-            |_| jvm_config_with_artifact_jar(None),
-        );
-        let pack = jdk_collections_pack(serde_json::json!([]));
-        activate_fixture_pack(
-            &fixture,
-            "fixture.jdk",
-            &pack,
-            activation_evidence("java", "jdk", "java.base"),
-        );
-
-        let (_, trace) = fixture.trace("Collections helper");
-        let declared: Vec<_> = trace
-            .candidates
-            .iter()
-            .filter(|row| matches!(row.candidate, TraceCandidateRef::ExternalRoute { .. }))
-            .collect();
-        assert!(
-            !declared.is_empty()
-                && declared.iter().all(|row| {
-                    row.is_selected() && row.tier == Some(PrecedenceTier::ExternalRoot)
-                }),
-            "the pack named the declaration, so the route is the selection: {declared:?}"
-        );
-
-        let (_, trace) = fixture.trace("ArrayList names");
-        let unknown: Vec<_> = trace
-            .candidates
-            .iter()
-            .filter(|row| matches!(row.candidate, TraceCandidateRef::ExternalRoute { .. }))
-            .collect();
-        assert!(
-            !unknown.is_empty() && unknown.iter().all(|row| !row.is_selected()),
-            "nothing named this declaration, so nothing was selected: {unknown:?}"
-        );
-    }
 
     // -----------------------------------------------------------------------
     // JVM declaration-facts packs: member declarations (#1900).
@@ -2818,35 +2318,8 @@ mod boundary_evidence_tests {
     /// com.example.probe.BaseRegistry`, written without a JDK so the test runs
     /// everywhere.
     fn write_probe_class_jar(path: &Path) {
-        use crate::analyzer::jvm::external::{
-            TestClassFile, TestClassMethod, write_test_class_jar,
-        };
-
-        write_test_class_jar(
-            path,
-            &[
-                TestClassFile {
-                    internal_name: "com/example/probe/Registry",
-                    super_internal_name: "com/example/probe/BaseRegistry",
-                    methods: &[TestClassMethod {
-                        name: "register",
-                        descriptor: "(Ljava/lang/String;)V",
-                        is_static: true,
-                    }],
-                    private_nested: false,
-                },
-                TestClassFile {
-                    internal_name: "com/example/probe/BaseRegistry",
-                    super_internal_name: "java/lang/Object",
-                    methods: &[TestClassMethod {
-                        name: "reset",
-                        descriptor: "()V",
-                        is_static: true,
-                    }],
-                    private_nested: false,
-                },
-            ],
-        );
+        let classes = crate::analyzer::jvm::external::probe_registry_base_class_files();
+        crate::analyzer::jvm::external::write_test_class_jar(path, &classes);
     }
 
     #[test]
@@ -2986,6 +2459,9 @@ mod boundary_evidence_tests {
     /// #3466 the outcome stayed `NoDefinition` and the trace had no row, while
     /// `call_bindings` read the same call's canonical identity end to end.
     #[test]
+    #[hardwon(
+        "#3466: A real instance receiver call publishes one route row that joins the corresponding occurrence candidate"
+    )]
     fn instance_receiver_member_call_publishes_the_external_route_row() {
         let jars = tempfile::tempdir().expect("jar dir");
         let jar = jars.path().join("servlet-api.jar");
@@ -3032,6 +2508,9 @@ mod boundary_evidence_tests {
     /// still an ordinary in-workspace resolution. Nothing about the external
     /// call makes a same-name workspace member a boundary.
     #[test]
+    #[hardwon(
+        "#3466: A workspace declaration with the same member spelling wins without publishing an external route"
+    )]
     fn workspace_same_name_member_decoy_stays_in_workspace() {
         let jars = tempfile::tempdir().expect("jar dir");
         let jar = jars.path().join("servlet-api.jar");
@@ -3074,6 +2553,9 @@ mod boundary_evidence_tests {
     /// the same call answered `unsupported_csharp_receiver` with no route row
     /// while `call_bindings` resolved the identical written reference.
     #[test]
+    #[hardwon(
+        "#3466: A C# static call over a declared but unindexed type publishes the route joined by its occurrence row"
+    )]
     fn a_csharp_static_member_call_on_an_unindexed_type_publishes_its_route_row() {
         let source = concat!(
             "namespace App;\n",
@@ -3118,6 +2600,9 @@ mod boundary_evidence_tests {
     /// call's written `<receiver>.<member>` identity is one boundary row, the
     /// same identity `call_bindings` reports for the call site.
     #[test]
+    #[hardwon(
+        "#3466: A Ruby external constant receiver call publishes one candidate route for the matching occurrence"
+    )]
     fn a_ruby_external_constant_receiver_call_publishes_its_route_row() {
         let fixture = BoundaryFixture::new(Language::Ruby, "app.rb", "ENV.fetch(\"PATH\")\n");
         let (outcome, trace) = fixture.trace("fetch");
@@ -3150,6 +2635,9 @@ mod boundary_evidence_tests {
     /// The workspace guard beside it: a constant receiver the workspace does
     /// declare is an ordinary in-workspace miss, not a boundary.
     #[test]
+    #[hardwon(
+        "#3466: A Ruby constant receiver declared in the workspace does not turn its missing member into an external boundary"
+    )]
     fn a_ruby_constant_receiver_declared_in_the_workspace_stays_a_plain_miss() {
         let fixture = BoundaryFixture::new(
             Language::Ruby,
@@ -3165,6 +2653,9 @@ mod boundary_evidence_tests {
     /// and the identifier call arm had no include-boundary decision. Both
     /// halves now publish one `getenv` row.
     #[test]
+    #[hardwon(
+        "#3466: A C call through an unindexed system include publishes one route and the occurrence row joins it"
+    )]
     fn a_c_free_function_call_across_an_unindexed_include_publishes_one_row() {
         let fixture = BoundaryFixture::new(
             Language::Cpp,
@@ -3198,31 +2689,41 @@ mod boundary_evidence_tests {
         assert_boundary_route_joins_occurrence(&fixture, "getenv", OccurrenceRole::ValueReference);
     }
 
-    /// The C++ half of the same witness: `#include <cstdlib>` and a plain
-    /// `getenv` call.
+    /// C APIs are not required to use lowercase names. Keep a capitalized
+    /// file-scope call on the same unresolved-include boundary as `getenv`;
+    /// the C++ construction-shape guard must not reject a C source file.
     #[test]
-    fn a_cpp_free_function_call_across_an_unindexed_include_publishes_one_row() {
+    fn a_c_capitalized_free_function_call_across_an_unindexed_include_publishes_one_row() {
         let fixture = BoundaryFixture::new(
             Language::Cpp,
-            "main.cpp",
-            "#include <cstdlib>\nint main() { return getenv(\"PATH\") != nullptr; }\n",
+            "main.c",
+            "#include <openssl/evp.h>\nint main(void) { return EVP_des_cbc() != 0; }\n",
         );
-        let (outcome, trace) = fixture.trace("getenv");
+        let (outcome, trace) = fixture.trace("EVP_des_cbc");
         assert_eq!(
             outcome.status,
             DefinitionLookupStatus::UnresolvableImportBoundary,
-            "the unresolved `<cstdlib>` above the call makes the callee a boundary: {:?}",
+            "the unresolved `<openssl/evp.h>` above the call makes the C API a boundary: {:?}",
+            outcome.diagnostics
+        );
+        assert_eq!(
+            outcome.resolved_reference_target(),
+            Some("EVP_des_cbc"),
+            "the boundary names the written capitalized C callee: {:?}",
             outcome.diagnostics
         );
         assert_eq!(
             route_names(&trace),
-            vec!["getenv".to_string()],
-            "the trace publishes one route row: {:#?}",
+            vec!["EVP_des_cbc".to_string()],
+            "the trace publishes one route row for the capitalized C callee: {:#?}",
             trace.candidates
         );
-        assert_boundary_route_joins_occurrence(&fixture, "getenv", OccurrenceRole::ValueReference);
+        assert_boundary_route_joins_occurrence(
+            &fixture,
+            "EVP_des_cbc",
+            OccurrenceRole::ValueReference,
+        );
     }
-
     #[test]
     fn a_class_jar_the_index_could_not_read_proves_nothing_about_its_members() {
         // The honesty rule #1900 names, on the artifact half: a jar the bounded
@@ -3262,95 +2763,6 @@ mod boundary_evidence_tests {
             route_rows(&trace).is_empty(),
             "nothing declares the member, so no route out of the workspace: {:?}",
             trace.candidates
-        );
-    }
-
-    #[test]
-    fn the_shared_surface_answers_a_kotlin_and_a_scala_member_spelling() {
-        // Java, Kotlin and Scala share one classpath and therefore one external
-        // declaration surface, members included: a pack published for
-        // `language: java` answers a member spelling written in any of them,
-        // each resolved through its own language's import ladder for the owner.
-        //
-        // This asserts at the boundary-evidence seam; the two tests below carry
-        // the same claim end to end through each resolver's own boundary gate.
-        const KOTLIN_MEMBER_SOURCE: &str = concat!(
-            "package app\n",
-            "import java.util.Collections\n",
-            "class Caller {\n",
-            "  fun order(names: MutableList<String>) { Collections.sort(names) }\n",
-            "}\n",
-        );
-        const SCALA_MEMBER_SOURCE: &str = concat!(
-            "package app\n",
-            "import java.util.Collections\n",
-            "class Caller {\n",
-            "  def order(names: java.util.List[String]): Unit = Collections.sort(names)\n",
-            "}\n",
-        );
-
-        let kotlin = BoundaryFixture::with_config(
-            Language::Kotlin,
-            "app/Caller.kt",
-            KOTLIN_MEMBER_SOURCE,
-            |_| jvm_config_with_artifact_jar(None),
-        );
-        activate_fixture_pack(
-            &kotlin,
-            "fixture.jdk",
-            &jdk_collections_pack(collections_sort_member()),
-            activation_evidence("java", "jdk", "java.base"),
-        );
-        let analyzer = kotlin.workspace.analyzer();
-        let scope = AnalyzerQueryScope::new(analyzer);
-        let token = scope.token();
-        let evidence =
-            crate::analyzer::resolve_analyzer::<crate::analyzer::KotlinAnalyzer>(analyzer)
-                .expect("the Kotlin fixture has a Kotlin analyzer")
-                .external_boundary_evidence(
-                    token,
-                    analyzer.semantic_model_overlay(),
-                    &kotlin.file,
-                    "Collections.sort",
-                );
-        assert_eq!(
-            evidence,
-            (
-                BoundaryStatus::ExternalIndexed,
-                Some("java.util.Collections.sort".to_owned())
-            ),
-            "Kotlin's import ladder reaches the pack-declared member"
-        );
-
-        let scala = BoundaryFixture::with_config(
-            Language::Scala,
-            "app/Caller.scala",
-            SCALA_MEMBER_SOURCE,
-            |_| jvm_config_with_artifact_jar(None),
-        );
-        activate_fixture_pack(
-            &scala,
-            "fixture.jdk",
-            &jdk_collections_pack(collections_sort_member()),
-            activation_evidence("java", "jdk", "java.base"),
-        );
-        let analyzer = scala.workspace.analyzer();
-        let evidence =
-            crate::analyzer::resolve_analyzer::<crate::analyzer::ScalaAnalyzer>(analyzer)
-                .expect("the Scala fixture has a Scala analyzer")
-                .external_boundary_evidence(
-                    token,
-                    analyzer.semantic_model_overlay(),
-                    &scala.file,
-                    "Collections.sort",
-                );
-        assert_eq!(
-            evidence,
-            (
-                BoundaryStatus::ExternalIndexed,
-                Some("java.util.Collections.sort".to_owned())
-            ),
-            "Scala's import ladder reaches the pack-declared member"
         );
     }
 
@@ -3713,5 +3125,695 @@ mod boundary_evidence_tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn a_scala_import_of_a_declared_unread_dependency_reports_declared_unindexed() {
+        let fixture = BoundaryFixture::with_config(
+            Language::Scala,
+            "app/Caller.scala",
+            SCALA_BOUNDARY_SOURCE,
+            |_| jvm_config_with_artifact_jar(None),
+        );
+        fixture.workspace.retain_dependency_discovery_evidence(
+            &[Language::Scala],
+            &crate::test_support::incomplete_discovery_declaring("scala", &["com.acme"], |_| {
+                Vec::new()
+            }),
+        );
+        let (_, trace) = fixture.trace("Gadget = null");
+        let routes = external_routes(&trace);
+        assert_declared_unindexed_routes(&routes);
+    }
+
+    #[test]
+    fn a_csharp_reference_into_a_declared_unindexed_package_reports_declared_unindexed() {
+        let source = concat!(
+            "using Newtonsoft.Json;\n",
+            "namespace App;\n",
+            "class Caller {\n",
+            "    Newtonsoft.Json.JsonConvert Ping() { return default; }\n",
+            "}\n",
+        );
+        let fixture = BoundaryFixture::new(Language::CSharp, "src/App.cs", source);
+        fixture.workspace.retain_dependency_discovery_evidence(
+            &[Language::CSharp],
+            &crate::test_support::discovery_declaring("csharp", &["Newtonsoft.Json"], |_| {
+                Vec::new()
+            }),
+        );
+        let (_, trace) = fixture.trace("JsonConvert Ping");
+        let routes = external_routes(&trace);
+        assert!(
+            routes
+                .iter()
+                .all(|(boundary, _)| *boundary == BoundaryStatus::ExternalDeclaredUnindexed),
+            "the build declares `Newtonsoft.Json`, so the miss is declared-unindexed: {routes:?}"
+        );
+    }
+    #[test]
+    fn a_php_use_alias_reports_the_workspace_candidate_it_selected() {
+        let fixture = BoundaryFixture::new(Language::Php, "src/Service.php", PHP_USE_ALIAS_SOURCE);
+        let (outcome, trace) = fixture.trace("Gadget();");
+        assert!(
+            !outcome.definitions.is_empty(),
+            "the alias names a workspace declaration: {outcome:?}"
+        );
+        let selected: Vec<String> = trace
+            .selected()
+            .map(|candidate| match &candidate.candidate {
+                TraceCandidateRef::Unit(unit) => unit.fq_name(),
+                other => panic!("expected a unit-backed candidate, got {other:?}"),
+            })
+            .collect();
+        assert_eq!(
+            selected,
+            ["App.Model.Widget"],
+            "the trace names the declaration the alias resolved to: {:?}",
+            trace.candidates
+        );
+        assert_eq!(
+            trace.completeness,
+            TraceCompleteness::SelectionOnly,
+            "PHP declares candidate_selection and not candidate_rejection"
+        );
+        assert!(
+            route_rows(&trace).is_empty(),
+            "a name the workspace declares draws no boundary: {:?}",
+            trace.candidates
+        );
+    }
+
+    #[test]
+    fn a_php_use_of_a_declared_unread_composer_dependency_reports_declared_unindexed() {
+        let fixture = BoundaryFixture::new(Language::Php, "src/Service.php", PHP_BOUNDARY_SOURCE);
+        fixture.workspace.retain_dependency_discovery_evidence(
+            &[Language::Php],
+            &crate::test_support::incomplete_discovery_declaring("php", &["Vendor.Widget"], |_| {
+                Vec::new()
+            }),
+        );
+        let (_, trace) = fixture.trace("Helper $helper");
+        let routes = external_routes(&trace);
+        assert!(
+            routes
+                .iter()
+                .all(|(boundary, _)| *boundary == BoundaryStatus::ExternalDeclaredUnindexed),
+            "a truncated Composer discovery keeps the name accountable: {routes:?}"
+        );
+    }
+    #[hardwon("#1889: Kotlin imports failed to report the indexed external boundary")]
+    #[test]
+    fn a_kotlin_import_of_an_indexed_external_type_reports_external_indexed() {
+        let fixture = BoundaryFixture::with_config(
+            Language::Kotlin,
+            "app/Caller.kt",
+            KOTLIN_BOUNDARY_SOURCE,
+            |root| {
+                let jar = root.join("acme-lib-sources.jar");
+                write_source_jar(
+                    &jar,
+                    "com/acme/Gadget.kt",
+                    b"package com.acme\nclass Gadget\n",
+                );
+                jvm_config_with_artifact_jar(Some(jar))
+            },
+        );
+        let (_, trace) = fixture.trace("Gadget? = null");
+        let routes = external_routes(&trace);
+        assert!(
+            routes.iter().all(|(boundary, target)| {
+                *boundary == BoundaryStatus::ExternalIndexed
+                    && target.as_deref() == Some("com.acme.Gadget")
+            }),
+            "the jar index resolves `Gadget` through the explicit import: {routes:?}"
+        );
+    }
+    #[hardwon("#1889: Kotlin imports failed to report declared but unread dependencies")]
+    #[test]
+    fn a_kotlin_import_of_a_declared_unread_dependency_reports_declared_unindexed() {
+        let fixture = BoundaryFixture::with_config(
+            Language::Kotlin,
+            "app/Caller.kt",
+            KOTLIN_BOUNDARY_SOURCE,
+            |_| jvm_config_with_artifact_jar(None),
+        );
+        let (_, trace) = fixture.trace("Gadget? = null");
+        assert!(
+            external_routes(&trace)
+                .iter()
+                .all(|(boundary, _)| *boundary == BoundaryStatus::ExternalUnknown),
+            "with no index and no retained discovery, nothing is known: {:?}",
+            trace.candidates
+        );
+        fixture.workspace.retain_dependency_discovery_evidence(
+            &[Language::Kotlin],
+            &crate::test_support::incomplete_discovery_declaring("kotlin", &["com.acme"], |_| {
+                Vec::new()
+            }),
+        );
+        let (_, trace) = fixture.trace("Gadget? = null");
+        let routes = external_routes(&trace);
+        assert_declared_unindexed_routes(&routes);
+    }
+    #[cfg_attr(not(scheduled_tests), ignore = "scheduled-only")]
+    #[hardwon("#1889: Kotlin workspace packages were at risk of false external classification")]
+    #[test]
+    fn a_kotlin_import_of_a_workspace_package_stays_a_plain_miss() {
+        // The import target is the workspace's own package, so the failing
+        // segment never leaves it and the honest answer is `no_definition`.
+        let fixture = BoundaryFixture::new(
+            Language::Kotlin,
+            "app/Caller.kt",
+            concat!(
+                "package app\n",
+                "import app.Helper\n",
+                "class Caller {\n",
+                "  fun build(): Helper? = null\n",
+                "}\n",
+            ),
+        );
+        assert_no_boundary_was_drawn("Helper? = null", &fixture);
+    }
+    #[cfg_attr(not(scheduled_tests), ignore = "scheduled-only")]
+    #[hardwon(
+        "#1889: Kotlin names without import evidence were at risk of false external classification"
+    )]
+    #[test]
+    fn a_kotlin_reference_with_no_import_at_all_stays_a_plain_miss() {
+        let fixture = BoundaryFixture::new(
+            Language::Kotlin,
+            "app/Caller.kt",
+            concat!(
+                "package app\n",
+                "class Caller {\n",
+                "  fun build(): Helper? = null\n",
+                "}\n",
+            ),
+        );
+        assert_no_boundary_was_drawn("Helper? = null", &fixture);
+    }
+    #[hardwon("#1889: qualified Ruby gem constants failed to report indexed external boundaries")]
+    #[test]
+    fn a_ruby_reference_to_an_indexed_gem_constant_reports_external_indexed() {
+        use crate::analyzer::semantic_model::{TypeIdentity, type_declaration_id};
+
+        let fixture = BoundaryFixture::new(Language::Ruby, "app.rb", "Widget::Config\n");
+        let type_id = type_declaration_id(TypeIdentity {
+            ecosystem: "rubygems",
+            name: "Widget::Config",
+        });
+        activate_fixture_pack(
+            &fixture,
+            "fixture.ruby.widget",
+            &single_type_pack(
+                "fixture.ruby.widget",
+                "ruby",
+                "rubygems",
+                "widget",
+                &type_id,
+                "Widget::Config",
+                serde_json::json!([]),
+            ),
+            activation_evidence("ruby", "rubygems", "widget"),
+        );
+        let (_, trace) = fixture.trace("Config");
+        let routes = external_routes(&trace);
+        assert!(
+            routes.iter().all(|(boundary, target)| {
+                *boundary == BoundaryStatus::ExternalIndexed
+                    && target.as_deref() == Some(type_id.as_str())
+            }),
+            "the activated pack publishes `Widget::Config`: {routes:?}"
+        );
+    }
+    #[hardwon("#1889: qualified Ruby gem constants failed to report declared unread boundaries")]
+    #[test]
+    fn a_ruby_reference_into_a_declared_unread_gem_reports_declared_unindexed() {
+        let fixture = BoundaryFixture::new(Language::Ruby, "app.rb", "Widget::Config\n");
+        let (_, trace) = fixture.trace("Config");
+        assert!(
+            external_routes(&trace)
+                .iter()
+                .all(|(boundary, _)| *boundary == BoundaryStatus::ExternalUnknown),
+            "with no overlay and no retained discovery, nothing is known: {:?}",
+            trace.candidates
+        );
+        fixture.workspace.retain_dependency_discovery_evidence(
+            &[Language::Ruby],
+            &crate::test_support::incomplete_discovery_declaring("ruby", &["widget"], |_| {
+                Vec::new()
+            }),
+        );
+        let (_, trace) = fixture.trace("Config");
+        let routes = external_routes(&trace);
+        assert_declared_unindexed_routes(&routes);
+    }
+    #[hardwon("#1889: Ruby workspace namespaces were at risk of false external classification")]
+    #[test]
+    fn a_ruby_path_under_a_workspace_namespace_stays_a_plain_miss() {
+        // `Widget` is a workspace module, so the miss is inside the workspace
+        // however the path continues.
+        let fixture = BoundaryFixture::new(
+            Language::Ruby,
+            "app.rb",
+            concat!("module Widget\n", "end\n", "\n", "Widget::Missing\n"),
+        );
+        assert_no_boundary_was_drawn("Missing", &fixture);
+    }
+    #[hardwon("#1889: bare Ruby constants were at risk of false external classification")]
+    #[test]
+    fn a_bare_ruby_constant_never_draws_a_boundary() {
+        // Ruby's top-level surface includes the core library and everything a
+        // loaded gem defines as a side effect, none of which Bifrost publishes,
+        // so a bare miss says nothing about where the name lives (#1624).
+        let fixture = BoundaryFixture::new(Language::Ruby, "app.rb", "Missing\n");
+        assert_no_boundary_was_drawn("Missing", &fixture);
+    }
+    #[hardwon("#1893: Java resolution ignored selected declaration-facts packs")]
+    #[test]
+    fn a_java_import_of_a_pack_declared_type_reports_external_indexed() {
+        // #1893 acceptance: no source jar, no class jar, no JDK home -- the
+        // activated pack's declaration facts are the only external evidence
+        // there is, and they carry the reference all the way to the same
+        // `external_indexed` verdict the source-jar route produces.
+        let fixture = BoundaryFixture::with_config(
+            Language::Java,
+            "app/Caller.java",
+            JVM_PACK_JAVA_SOURCE,
+            |_| jvm_config_with_artifact_jar(None),
+        );
+        let pack = jdk_collections_pack(serde_json::json!([]));
+        activate_fixture_pack(
+            &fixture,
+            "fixture.jdk",
+            &pack,
+            activation_evidence("java", "jdk", "java.base"),
+        );
+
+        let (_, trace) = fixture.trace("Collections helper");
+        let routes = external_routes(&trace);
+        assert!(
+            routes.iter().all(|(boundary, target)| {
+                *boundary == BoundaryStatus::ExternalIndexed
+                    && target.as_deref() == Some("java.util.Collections")
+            }),
+            "the activated pack declares `java.util.Collections`: {routes:?}"
+        );
+
+        // Boundary honesty: a pack decides the types it declares and nothing
+        // else. `java.util.ArrayList` is imported from the same package and is
+        // not in the pack, so it keeps the answer it had before activation.
+        let (_, trace) = fixture.trace("ArrayList names");
+        let routes = external_routes(&trace);
+        assert!(
+            routes
+                .iter()
+                .all(|(boundary, _)| *boundary == BoundaryStatus::ExternalUnknown),
+            "a type the pack does not declare must not be upgraded: {routes:?}"
+        );
+    }
+    #[hardwon(
+        "#1893: Java resolution must not infer external declarations without an activated pack"
+    )]
+    #[test]
+    fn a_java_reference_without_the_pack_stays_external_unknown() {
+        // The same fixture with no activation at all: the honest answer before
+        // #1893 and after it, so the test above measures the pack and not the
+        // fixture.
+        let fixture = BoundaryFixture::with_config(
+            Language::Java,
+            "app/Caller.java",
+            JVM_PACK_JAVA_SOURCE,
+            |_| jvm_config_with_artifact_jar(None),
+        );
+        let (_, trace) = fixture.trace("Collections helper");
+        let routes = external_routes(&trace);
+        assert!(
+            routes
+                .iter()
+                .all(|(boundary, _)| *boundary == BoundaryStatus::ExternalUnknown),
+            "with nothing activated and no artifact, nothing is known: {routes:?}"
+        );
+    }
+
+    #[test]
+    fn the_public_traced_batch_reports_workspace_local_for_an_in_workspace_reference() {
+        // A reference that never leaves the workspace draws no boundary route
+        // at all; `TraceCandidate::selected` defaults every row's boundary to
+        // `WorkspaceLocal`, so that is the honest reading for a plain
+        // in-workspace hit rather than a value `finish_boundary` stamped.
+        let fixture = BoundaryFixture::new(
+            Language::Java,
+            "app/Caller.java",
+            concat!(
+                "package app;\n",
+                "class Helper {}\n",
+                "class Caller {\n",
+                "  Helper helper() { return null; }\n",
+                "}\n",
+            ),
+        );
+        let (outcome, trace) = fixture.trace_via_probe_entry_point("Helper helper");
+        assert_eq!(outcome.status, DefinitionLookupStatus::Resolved);
+        let selected: Vec<_> = trace.selected().collect();
+        assert!(
+            !selected.is_empty(),
+            "a resolved reference reports the candidate it selected: {:?}",
+            trace.candidates
+        );
+        assert!(
+            selected
+                .iter()
+                .all(|row| row.boundary == BoundaryStatus::WorkspaceLocal),
+            "an in-workspace selection is workspace-local: {selected:?}"
+        );
+        assert_eq!(
+            dispatch_quality_for_status(Some(outcome.status), None),
+            DispatchQuality::Complete
+        );
+    }
+
+    #[test]
+    fn the_public_traced_batch_agrees_with_direct_boundary_evidence_for_a_pack_indexed_reference() {
+        let fixture = BoundaryFixture::with_config(
+            Language::Java,
+            "app/Caller.java",
+            JVM_PACK_JAVA_SOURCE,
+            |_| jvm_config_with_artifact_jar(None),
+        );
+        let pack = jdk_collections_pack(serde_json::json!([]));
+        activate_fixture_pack(
+            &fixture,
+            "fixture.jdk",
+            &pack,
+            activation_evidence("java", "jdk", "java.base"),
+        );
+
+        let (outcome, trace) = fixture.trace_via_probe_entry_point("Collections helper");
+        assert_eq!(
+            outcome.status,
+            DefinitionLookupStatus::UnresolvableImportBoundary
+        );
+        let routes = external_routes(&trace);
+        assert!(
+            routes.iter().all(|(boundary, target)| {
+                *boundary == BoundaryStatus::ExternalIndexed
+                    && target.as_deref() == Some("java.util.Collections")
+            }),
+            "the activated pack declares `java.util.Collections`: {routes:?}"
+        );
+
+        // Chain-link agreement (#1885): the direct evidence call must name the
+        // same boundary and target the trace already stamped on the row,
+        // because both read the same `boundary_evidence` fact.
+        let (direct_status, direct_target) = boundary_evidence(
+            fixture.workspace.analyzer(),
+            &fixture.file,
+            "java.util.Collections",
+        );
+        assert_eq!(direct_status, BoundaryStatus::ExternalIndexed);
+        assert_eq!(direct_target.as_deref(), Some("java.util.Collections"));
+
+        assert_eq!(
+            dispatch_quality_for_status(Some(outcome.status), Some(direct_status)),
+            DispatchQuality::Complete
+        );
+    }
+
+    #[test]
+    fn the_public_traced_batch_agrees_with_direct_boundary_evidence_without_the_pack() {
+        // Same reference, no pack activated: dependency discovery never ran
+        // for this fixture (`jvm_config_with_artifact_jar` disables it), so
+        // there is no retained evidence to refine the miss into
+        // `ExternalDeclaredUnindexed`. The honest answer here is
+        // `ExternalUnknown`, matching
+        // `a_java_reference_without_the_pack_stays_external_unknown` above.
+        let fixture = BoundaryFixture::with_config(
+            Language::Java,
+            "app/Caller.java",
+            JVM_PACK_JAVA_SOURCE,
+            |_| jvm_config_with_artifact_jar(None),
+        );
+
+        let (outcome, trace) = fixture.trace_via_probe_entry_point("Collections helper");
+        assert_eq!(
+            outcome.status,
+            DefinitionLookupStatus::UnresolvableImportBoundary
+        );
+        let routes = external_routes(&trace);
+        assert!(
+            routes
+                .iter()
+                .all(|(boundary, _)| *boundary == BoundaryStatus::ExternalUnknown),
+            "with nothing activated and no artifact, nothing is known: {routes:?}"
+        );
+
+        let (direct_status, direct_target) = boundary_evidence(
+            fixture.workspace.analyzer(),
+            &fixture.file,
+            "java.util.Collections",
+        );
+        assert_eq!(direct_status, BoundaryStatus::ExternalUnknown);
+        assert_eq!(direct_target, None);
+
+        assert_eq!(
+            dispatch_quality_for_status(Some(outcome.status), Some(direct_status)),
+            DispatchQuality::Unknown
+        );
+    }
+    #[hardwon("#1893: Kotlin resolution ignored selected JVM declaration-facts packs")]
+    #[test]
+    fn a_kotlin_import_of_a_pack_declared_jvm_type_reports_external_indexed() {
+        // Java, Kotlin and Scala share one classpath and therefore one external
+        // declaration surface, so a pack published for `language: java` answers
+        // a Kotlin reference to the same type.
+        let fixture = BoundaryFixture::with_config(
+            Language::Kotlin,
+            "app/Caller.kt",
+            JVM_PACK_KOTLIN_SOURCE,
+            |_| jvm_config_with_artifact_jar(None),
+        );
+        let pack = jdk_collections_pack(serde_json::json!([]));
+        activate_fixture_pack(
+            &fixture,
+            "fixture.jdk",
+            &pack,
+            activation_evidence("java", "jdk", "java.base"),
+        );
+        let (_, trace) = fixture.trace("Collections? = null");
+        let routes = external_routes(&trace);
+        assert!(
+            routes.iter().all(|(boundary, target)| {
+                *boundary == BoundaryStatus::ExternalIndexed
+                    && target.as_deref() == Some("java.util.Collections")
+            }),
+            "the activated pack declares `java.util.Collections`: {routes:?}"
+        );
+    }
+
+    #[test]
+    fn a_pack_for_another_language_never_answers_a_jvm_name() {
+        // Near miss: an activated pack that publishes the very same qualified
+        // name for a different ecosystem's language. The JVM realm is Java,
+        // Kotlin and Scala, so this one is not on the classpath and must not
+        // upgrade the reference.
+        use crate::analyzer::semantic_model::{TypeIdentity, type_declaration_id};
+
+        let fixture = BoundaryFixture::with_config(
+            Language::Java,
+            "app/Caller.java",
+            JVM_PACK_JAVA_SOURCE,
+            |_| jvm_config_with_artifact_jar(None),
+        );
+        let type_id = type_declaration_id(TypeIdentity {
+            ecosystem: "composer",
+            name: "java.util.Collections",
+        });
+        activate_fixture_pack(
+            &fixture,
+            "fixture.php.impostor",
+            &single_type_pack(
+                "fixture.php.impostor",
+                "php",
+                "composer",
+                "vendor/impostor",
+                &type_id,
+                "java.util.Collections",
+                serde_json::json!([]),
+            ),
+            activation_evidence("php", "composer", "vendor/impostor"),
+        );
+        let (_, trace) = fixture.trace("Collections helper");
+        let routes = external_routes(&trace);
+        assert!(
+            routes
+                .iter()
+                .all(|(boundary, _)| *boundary == BoundaryStatus::ExternalUnknown),
+            "a pack for another language declares nothing on the classpath: {routes:?}"
+        );
+    }
+    #[hardwon("#1893: indexed external routes were incorrectly recorded as rejected candidates")]
+    #[test]
+    fn an_indexed_external_route_is_the_selection_and_an_unknown_one_is_not() {
+        // The trace's outcome column, not just its boundary column: a route
+        // that named an exact external declaration is what the reference
+        // resolved to, so a policy asking "did this resolve through a real
+        // route" has a selection to read. A route that named nothing stays
+        // rejected, so the same question is honestly unanswerable.
+        let fixture = BoundaryFixture::with_config(
+            Language::Java,
+            "app/Caller.java",
+            JVM_PACK_JAVA_SOURCE,
+            |_| jvm_config_with_artifact_jar(None),
+        );
+        let pack = jdk_collections_pack(serde_json::json!([]));
+        activate_fixture_pack(
+            &fixture,
+            "fixture.jdk",
+            &pack,
+            activation_evidence("java", "jdk", "java.base"),
+        );
+
+        let (_, trace) = fixture.trace("Collections helper");
+        let declared: Vec<_> = trace
+            .candidates
+            .iter()
+            .filter(|row| matches!(row.candidate, TraceCandidateRef::ExternalRoute { .. }))
+            .collect();
+        assert!(
+            !declared.is_empty()
+                && declared.iter().all(|row| {
+                    row.is_selected() && row.tier == Some(PrecedenceTier::ExternalRoot)
+                }),
+            "the pack named the declaration, so the route is the selection: {declared:?}"
+        );
+
+        let (_, trace) = fixture.trace("ArrayList names");
+        let unknown: Vec<_> = trace
+            .candidates
+            .iter()
+            .filter(|row| matches!(row.candidate, TraceCandidateRef::ExternalRoute { .. }))
+            .collect();
+        assert!(
+            !unknown.is_empty() && unknown.iter().all(|row| !row.is_selected()),
+            "nothing named this declaration, so nothing was selected: {unknown:?}"
+        );
+    }
+    #[hardwon(
+        "#3466: lowercase C++ free-function calls across unresolved includes published no candidate row"
+    )]
+    #[test]
+    fn a_cpp_free_function_call_across_an_unindexed_include_publishes_one_row() {
+        let fixture = BoundaryFixture::new(
+            Language::Cpp,
+            "main.cpp",
+            "#include <cstdlib>\nint main() { return getenv(\"PATH\") != nullptr; }\n",
+        );
+        let (outcome, trace) = fixture.trace("getenv");
+        assert_eq!(
+            outcome.status,
+            DefinitionLookupStatus::UnresolvableImportBoundary,
+            "the unresolved `<cstdlib>` above the call makes the callee a boundary: {:?}",
+            outcome.diagnostics
+        );
+        assert_eq!(
+            route_names(&trace),
+            vec!["getenv".to_string()],
+            "the trace publishes one route row: {:#?}",
+            trace.candidates
+        );
+        assert_boundary_route_joins_occurrence(&fixture, "getenv", OccurrenceRole::ValueReference);
+    }
+    #[hardwon(
+        "#1900: Kotlin and Scala member spellings did not reach the shared JVM external member surface"
+    )]
+    #[test]
+    fn the_shared_surface_answers_a_kotlin_and_a_scala_member_spelling() {
+        // Java, Kotlin and Scala share one classpath and therefore one external
+        // declaration surface, members included: a pack published for
+        // `language: java` answers a member spelling written in any of them,
+        // each resolved through its own language's import ladder for the owner.
+        //
+        // This asserts at the boundary-evidence seam; the two tests below carry
+        // the same claim end to end through each resolver's own boundary gate.
+        const KOTLIN_MEMBER_SOURCE: &str = concat!(
+            "package app\n",
+            "import java.util.Collections\n",
+            "class Caller {\n",
+            "  fun order(names: MutableList<String>) { Collections.sort(names) }\n",
+            "}\n",
+        );
+        const SCALA_MEMBER_SOURCE: &str = concat!(
+            "package app\n",
+            "import java.util.Collections\n",
+            "class Caller {\n",
+            "  def order(names: java.util.List[String]): Unit = Collections.sort(names)\n",
+            "}\n",
+        );
+
+        let kotlin = BoundaryFixture::with_config(
+            Language::Kotlin,
+            "app/Caller.kt",
+            KOTLIN_MEMBER_SOURCE,
+            |_| jvm_config_with_artifact_jar(None),
+        );
+        activate_fixture_pack(
+            &kotlin,
+            "fixture.jdk",
+            &jdk_collections_pack(collections_sort_member()),
+            activation_evidence("java", "jdk", "java.base"),
+        );
+        let analyzer = kotlin.workspace.analyzer();
+        let scope = AnalyzerQueryScope::new(analyzer);
+        let token = scope.token();
+        let evidence =
+            crate::analyzer::resolve_analyzer::<crate::analyzer::KotlinAnalyzer>(analyzer)
+                .expect("the Kotlin fixture has a Kotlin analyzer")
+                .external_boundary_evidence(
+                    token,
+                    analyzer.semantic_model_overlay(),
+                    &kotlin.file,
+                    "Collections.sort",
+                );
+        assert_eq!(
+            evidence,
+            (
+                BoundaryStatus::ExternalIndexed,
+                Some("java.util.Collections.sort".to_owned())
+            ),
+            "Kotlin's import ladder reaches the pack-declared member"
+        );
+
+        let scala = BoundaryFixture::with_config(
+            Language::Scala,
+            "app/Caller.scala",
+            SCALA_MEMBER_SOURCE,
+            |_| jvm_config_with_artifact_jar(None),
+        );
+        activate_fixture_pack(
+            &scala,
+            "fixture.jdk",
+            &jdk_collections_pack(collections_sort_member()),
+            activation_evidence("java", "jdk", "java.base"),
+        );
+        let analyzer = scala.workspace.analyzer();
+        let evidence =
+            crate::analyzer::resolve_analyzer::<crate::analyzer::ScalaAnalyzer>(analyzer)
+                .expect("the Scala fixture has a Scala analyzer")
+                .external_boundary_evidence(
+                    token,
+                    analyzer.semantic_model_overlay(),
+                    &scala.file,
+                    "Collections.sort",
+                );
+        assert_eq!(
+            evidence,
+            (
+                BoundaryStatus::ExternalIndexed,
+                Some("java.util.Collections.sort".to_owned())
+            ),
+            "Scala's import ladder reaches the pack-declared member"
+        );
     }
 }

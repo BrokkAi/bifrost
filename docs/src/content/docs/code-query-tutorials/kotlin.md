@@ -3,9 +3,9 @@ title: Kotlin
 description: Query Kotlin named arguments, block calls, annotations, imports, and assignments with query_code.
 ---
 
-> Last verified end to end: 2026-07-30 (`query_code` schema version 1).
+> Last verified end to end: 2026-10-01 (`query_code` schema version 1).
 
-For exact inbound and outbound symbol edges, proof tiers, and adapter-specific caveats, see [Reference Traversal](../reference-traversal/).
+For exact inbound and outbound symbol edges, proof tiers, and adapter-specific caveats, see [Reference Traversal](/code-query-tutorials/reference-traversal/).
 
 Kotlin's grammar is field-poor: callees, navigation members, and named-argument labels are recovered positionally rather than through dedicated tree-sitter fields. The normalized adapter keeps named arguments in `kwargs`, while real `val`/`var` declarations remain `assignment` facts even though a named argument's `code = "named"` shares assignment-like syntax.
 

@@ -1,10 +1,14 @@
+use super::conversion::{
+    authored_concurrency_effect_from_compiled, authored_declared_effect_from_compiled,
+    authored_result_predicate_from_compiled, authored_summary_effect_from_compiled,
+    authored_summary_input_from_compiled, authored_summary_output_from_compiled,
+    authored_summary_value_transfer_from_compiled,
+};
 use super::model::*;
 use super::validate::{
     Diagnostic, ValidationLimits, is_canonical_relative_path, validate_pack_locally,
 };
-use crate::analyzer::canonical_hash::{
-    hash_domain_bytes, is_lower_sha256, lower_hex_string, sha256_bytes,
-};
+use crate::analyzer::canonical_hash::{hash_domain_bytes, is_lower_sha256, lower_hex_string};
 use crate::analyzer::identifier::validate_identifier;
 use brokk_bifrost_core::analyzer::model::CallableArity;
 use flate2::bufread::DeflateDecoder;
@@ -82,6 +86,19 @@ pub struct CompiledPackManifest {
     pub shards: Vec<CompiledShardDescriptor>,
 }
 
+impl CompiledPackManifest {
+    pub fn matches_generated_identity(
+        &self,
+        producer_name: &str,
+        producer_version: &str,
+        schema_version: u32,
+    ) -> bool {
+        self.producer.name == producer_name
+            && self.producer.version == producer_version
+            && self.schema_version == schema_version
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct CompiledShard {
@@ -108,6 +125,8 @@ pub struct CompiledShard {
     pub(crate) deferred_yields: Option<DeferredYieldsPayload>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) conditional_type_refinements: Option<ConditionalTypeRefinementsPayload>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) callable_values: Option<CallableValuesPayload>,
     /// The pack-level native C/C++ evidence is repeated in each shard wire
     /// envelope so a shard remains self-describing after extraction.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -151,6 +170,11 @@ impl CompiledShard {
                 self.conditional_type_refinements
                     .as_ref()
                     .map_or(0, ConditionalTypeRefinementsPayload::record_count),
+            )
+            .saturating_add(
+                self.callable_values
+                    .as_ref()
+                    .map_or(0, CallableValuesPayload::record_count),
             )
     }
 
@@ -204,6 +228,10 @@ impl CompiledShard {
 
     pub fn deferred_yields(&self) -> Option<&DeferredYieldsPayload> {
         self.deferred_yields.as_ref()
+    }
+
+    pub fn callable_values(&self) -> Option<&CallableValuesPayload> {
+        self.callable_values.as_ref()
     }
 }
 
@@ -264,6 +292,8 @@ pub struct CompiledProcedureSummary {
     pub effects: Vec<CompiledSummaryEffect>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub concurrency_effects: Vec<CompiledConcurrencyEffect>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub returned_callables: Vec<CompiledReturnedCallable>,
     /// Namespaced effect identifiers declared for this exact procedure (#2437).
     /// Serialized only when non-empty, so a summary that declares none keeps the
     /// compiled bytes -- and therefore the shard digests -- it had before the
@@ -288,6 +318,22 @@ pub struct CompiledProcedureSummary {
     pub normal_return_type_refinements: Vec<CompiledNormalReturnTypeRefinement>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub class_decorator_identity: Option<CompiledClassDecoratorIdentity>,
+}
+
+/// Whether two compiled summaries make the same flow-observable claims.
+pub fn compiled_flow_claims_agree(
+    left: &CompiledProcedureSummary,
+    right: &CompiledProcedureSummary,
+) -> bool {
+    left.completeness == right.completeness
+        && left.covers_overrides == right.covers_overrides
+        && left.normal_continuation_absent == right.normal_continuation_absent
+        && left.normal_result_count == right.normal_result_count
+        && left.locations == right.locations
+        && left.transfers == right.transfers
+        && left.effects == right.effects
+        && left.concurrency_effects == right.concurrency_effects
+        && left.returned_callables == right.returned_callables
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -407,6 +453,10 @@ pub enum CompiledResultPredicate {
     NonNull,
     True,
     False,
+    Eof,
+    #[serde(rename = "nonzero")]
+    NonZero,
+    MinusOne,
 }
 
 /// Compiled mirror of `AuthoredDeclaredEffect` (#2437).
@@ -445,6 +495,10 @@ pub struct CompiledProcedureTarget {
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub variadic: bool,
     pub parameter_count: u32,
+    /// Structured fixed-formal binding shape. Empty preserves legacy exact
+    /// arity behavior; populated targets carry every fixed formal in order.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub formals: Vec<AuthoredProcedureFormal>,
 }
 
 impl CompiledProcedureTarget {
@@ -506,6 +560,13 @@ pub enum CompiledSummaryOutput {
     Capture { location: String },
     Heap { location: String },
     ExceptionalReturn {},
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum CompiledSummaryPort {
+    Input { input: CompiledSummaryInput },
+    Output { output: CompiledSummaryOutput },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -735,6 +796,19 @@ pub enum CompiledConcurrencyEffect {
     TimerReset {
         timer: CompiledSummaryInput,
     },
+    ChannelClose {
+        channel: CompiledSummaryPort,
+        fresh: bool,
+    },
+    ChannelCloseAsync {
+        channel: CompiledSummaryPort,
+        fresh: bool,
+    },
+    ChannelClosePropagate {
+        source: CompiledSummaryPort,
+        target: CompiledSummaryPort,
+        target_fresh: bool,
+    },
     /// One `testing.T.Run` call: `callable` is the subtest callback and
     /// `group` is the parent test node (issue #3383). The solver spawns the
     /// callback on every path and joins it at the call exactly when no
@@ -757,6 +831,16 @@ pub enum CompiledConcurrencyEffect {
         callable: CompiledSummaryInput,
         group: CompiledSummaryInput,
     },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CompiledReturnedCallable {
+    pub result_ordinal: u32,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub at_most_once: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub concurrency_effects: Vec<CompiledConcurrencyEffect>,
 }
 
 /// The documented entry-level classification of one `sync.Map` operation
@@ -889,6 +973,8 @@ struct WireCompiledShard {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     conditional_type_refinements: Option<ConditionalTypeRefinementsPayload>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    callable_values: Option<CallableValuesPayload>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     cpp_portability: Option<CppPortabilityEvidence>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     python_correspondence: Option<PythonCorrespondenceEvidence>,
@@ -976,8 +1062,7 @@ impl fmt::Display for ArtifactError {
             Self::DigestMismatch(kind) => write!(formatter, "{kind} digest mismatch"),
             Self::SemanticValidation(diagnostics) => write!(
                 formatter,
-                "artifact failed semantic validation with {} diagnostic(s)",
-                diagnostics.len()
+                "artifact failed semantic validation: {diagnostics:?}"
             ),
             Self::Decompression(error) => write!(formatter, "DEFLATE decode failed: {error}"),
             Self::Allocation => formatter.write_str("artifact allocation failed"),
@@ -1129,7 +1214,8 @@ pub fn decode_shard(
     if canonical_json(&wire)? != raw {
         return Err(ArtifactError::NonCanonical);
     }
-    let authored = authored_pack_from_wire(&wire);
+    let shard = compiled_from_wire(wire);
+    let authored = authored_pack_from_compiled_shard(&shard);
     let diagnostics = validate_pack_locally(
         &authored,
         ValidationLimits {
@@ -1143,11 +1229,10 @@ pub fn decode_shard(
     if !diagnostics.is_empty() {
         return Err(ArtifactError::SemanticValidation(diagnostics));
     }
-    validate_compiled_procedure_metadata(&wire, &authored)?;
+    validate_compiled_procedure_metadata(&shard, &authored)?;
     if super::compiler::normalize(authored.clone()) != authored {
         return Err(ArtifactError::NonCanonical);
     }
-    let shard = compiled_from_wire(wire);
     if shard.shard_id != descriptor.shard_id {
         return Err(ArtifactError::InvalidDescriptor(
             "shard id does not match payload".to_owned(),
@@ -1196,7 +1281,7 @@ fn read_shard_wire(
             actual: actual_stored,
         });
     }
-    if stored_digest(bytes) != descriptor.stored_sha256 {
+    if content_digest(bytes) != descriptor.stored_sha256 {
         return Err(ArtifactError::DigestMismatch("stored"));
     }
 
@@ -1243,10 +1328,10 @@ pub(super) fn hydrate_certified_shard(
 }
 
 fn validate_compiled_procedure_metadata(
-    wire: &WireCompiledShard,
+    shard: &CompiledShard,
     authored: &AuthoredSemanticModelPack,
 ) -> Result<(), ArtifactError> {
-    let CompiledPayload::ProcedureSummaries { summaries } = &wire.payload else {
+    let CompiledPayload::ProcedureSummaries { summaries } = &shard.payload else {
         return Ok(());
     };
     let AuthoredPayload::ProcedureSummaries {
@@ -1268,7 +1353,7 @@ fn validate_compiled_procedure_metadata(
                 "procedure summary contract version is unsupported".to_owned(),
             ));
         }
-        if compiled.model_id != format!("{}#{}", wire.pack_id, compiled.id) {
+        if compiled.model_id != format!("{}#{}", shard.pack_id, compiled.id) {
             return Err(ArtifactError::InvalidDescriptor(
                 "procedure summary model id was not derived from the pack and record ids"
                     .to_owned(),
@@ -1305,6 +1390,7 @@ fn compiled_from_wire(wire: WireCompiledShard) -> CompiledShard {
         collection_flows: wire.collection_flows,
         deferred_yields: wire.deferred_yields,
         conditional_type_refinements: wire.conditional_type_refinements,
+        callable_values: wire.callable_values,
         cpp_portability: wire.cpp_portability,
         python_correspondence: wire.python_correspondence,
         payload: wire.payload,
@@ -1482,7 +1568,7 @@ fn validate_descriptor(
 }
 
 pub(crate) fn canonical_json<T: Serialize>(value: &T) -> Result<Vec<u8>, ArtifactError> {
-    serde_json::to_vec(value).map_err(|error| ArtifactError::InvalidJson(error.to_string()))
+    super::compact_json_bytes(value).map_err(|error| ArtifactError::InvalidJson(error.to_string()))
 }
 
 pub(crate) fn semantic_digest(shard: &CompiledShard) -> Result<String, ArtifactError> {
@@ -1508,6 +1594,8 @@ pub(crate) fn semantic_digest(shard: &CompiledShard) -> Result<String, ArtifactE
         #[serde(skip_serializing_if = "Option::is_none")]
         conditional_type_refinements: &'a Option<ConditionalTypeRefinementsPayload>,
         #[serde(skip_serializing_if = "Option::is_none")]
+        callable_values: &'a Option<CallableValuesPayload>,
+        #[serde(skip_serializing_if = "Option::is_none")]
         cpp_portability: &'a Option<CppPortabilityEvidence>,
         #[serde(skip_serializing_if = "Option::is_none")]
         python_correspondence: &'a Option<PythonCorrespondenceEvidence>,
@@ -1528,6 +1616,7 @@ pub(crate) fn semantic_digest(shard: &CompiledShard) -> Result<String, ArtifactE
         collection_flows: &shard.collection_flows,
         deferred_yields: &shard.deferred_yields,
         conditional_type_refinements: &shard.conditional_type_refinements,
+        callable_values: &shard.callable_values,
         cpp_portability: &shard.cpp_portability,
         python_correspondence: &shard.python_correspondence,
         payload: &shard.payload,
@@ -1621,11 +1710,7 @@ pub(crate) fn manifest_content_digest(
 }
 
 pub(crate) fn content_digest(bytes: &[u8]) -> String {
-    lower_hex_string(&sha256_bytes(bytes))
-}
-
-pub(crate) fn stored_digest(bytes: &[u8]) -> String {
-    lower_hex_string(&sha256_bytes(bytes))
+    crate::analyzer::semantic_model::csmi::sha256_hex(bytes)
 }
 
 pub(crate) fn routing_keys(
@@ -1667,8 +1752,11 @@ pub(crate) fn routing_keys(
 }
 
 pub(crate) fn shard_inventory(shard: &CompiledShard) -> (Vec<String>, Vec<String>) {
-    use super::csmi::{CsmiConditionalTypeOutcome, CsmiTypeExpression};
-    let (defined, mut referenced) = payload_inventory(&shard.payload);
+    use super::csmi::{
+        CsmiCallableValuesArgument, CsmiCallableValuesPayload, CsmiConditionalTypeOutcome,
+        CsmiTypeExpression,
+    };
+    let (mut defined, mut referenced) = payload_inventory(&shard.payload);
     if let Some(payload) = &shard.conditional_type_refinements {
         let mut pending = Vec::new();
         for fact in &payload.refinements {
@@ -1690,10 +1778,72 @@ pub(crate) fn shard_inventory(shard: &CompiledShard) -> (Vec<String>, Vec<String
                 CsmiTypeExpression::Unknown(_) => {}
             }
         }
-        referenced.sort_unstable();
-        referenced.dedup();
     }
+    if let Some(payload) = &shard.callable_values {
+        defined.extend(
+            payload
+                .anonymous_callables
+                .iter()
+                .map(|identity| identity.id.clone()),
+        );
+        for fact in &payload.facts {
+            match &fact.payload {
+                CsmiCallableValuesPayload::ReturnedCallable {
+                    callable, target, ..
+                } => {
+                    referenced.push(callable.clone());
+                    referenced.push(target.clone());
+                }
+                CsmiCallableValuesPayload::CallbackInvocation {
+                    callable,
+                    callback,
+                    arguments,
+                    ..
+                } => {
+                    referenced.push(callable.clone());
+                    callable_values_location_inventory(callback, &mut referenced);
+                    for argument in arguments {
+                        if let CsmiCallableValuesArgument::Input { source } = argument {
+                            callable_values_location_inventory(source, &mut referenced);
+                        }
+                    }
+                }
+            }
+        }
+        referenced.extend(
+            payload
+                .coverage
+                .iter()
+                .map(|coverage| coverage.callable.clone()),
+        );
+    }
+    defined.sort_unstable();
+    defined.dedup();
+    referenced.sort_unstable();
+    referenced.dedup();
     (defined, referenced)
+}
+
+fn callable_values_location_inventory(
+    location: &super::csmi::CsmiInputLocation,
+    referenced: &mut Vec<String>,
+) {
+    if let super::csmi::CsmiInputBoundaryRoot::Capture(root) = &location.root {
+        referenced.push(root.symbol.clone());
+    }
+    let Some(projection) = &location.projection else {
+        return;
+    };
+    for step in &projection.steps {
+        if let Some(symbol) = step
+            .args
+            .as_ref()
+            .and_then(|args| args.get("symbol"))
+            .and_then(serde_json::Value::as_str)
+        {
+            referenced.push(symbol.to_owned());
+        }
+    }
 }
 
 pub(crate) fn payload_inventory(payload: &CompiledPayload) -> (Vec<String>, Vec<String>) {
@@ -1814,37 +1964,12 @@ fn valid_inventory_id(id: &str) -> bool {
 }
 
 fn collect_declared_type_refs(root: &TypeRef, ids: &mut HashSet<String>) {
-    let mut stack = vec![root];
-    while let Some(reference) = stack.pop() {
-        match reference {
-            TypeRef::Named { arguments, .. } | TypeRef::Declared { arguments, .. } => {
-                if let TypeRef::Declared { id, .. } = reference {
-                    ids.insert(id.clone());
-                }
-                stack.extend(arguments);
-            }
-            TypeRef::Array { element }
-            | TypeRef::ByRef { element, .. }
-            | TypeRef::Pointer { element }
-            | TypeRef::Slice { element }
-            | TypeRef::FixedArray { element, .. }
-            | TypeRef::Channel { element, .. } => stack.push(element),
-            TypeRef::Map { key, value } => {
-                stack.push(key);
-                stack.push(value);
-            }
-            TypeRef::Wildcard { bound, .. } => stack.extend(bound.as_deref()),
-            TypeRef::Tuple { elements } => stack.extend(elements),
-            TypeRef::Function { parameters, result } => {
-                stack.extend(result.as_deref());
-                stack.extend(parameters.iter().map(|parameter| &parameter.r#type));
-            }
-            TypeRef::TypeParameter { .. } => {}
-        }
-    }
+    crate::analyzer::common::visit_declared_type_refs(std::iter::once(root), |id| {
+        ids.insert(id.to_owned());
+    });
 }
 
-fn authored_pack_from_wire(shard: &WireCompiledShard) -> AuthoredSemanticModelPack {
+fn authored_pack_from_compiled_shard(shard: &CompiledShard) -> AuthoredSemanticModelPack {
     AuthoredSemanticModelPack {
         schema_version: shard.schema_version,
         pack_id: shard.pack_id.clone(),
@@ -1860,16 +1985,7 @@ fn authored_pack_from_wire(shard: &WireCompiledShard) -> AuthoredSemanticModelPa
         carried_sources: Vec::new(),
         cpp_portability: shard.cpp_portability.clone(),
         python_correspondence: shard.python_correspondence.clone(),
-        shards: vec![AuthoredShard {
-            id: shard.shard_id.clone(),
-            activation: shard.activation.clone(),
-            payload: authored_payload_from_compiled(&shard.payload),
-            runtime_values: shard.runtime_values.clone(),
-            runtime_contracts: shard.runtime_contracts.clone(),
-            collection_flows: shard.collection_flows.clone(),
-            deferred_yields: shard.deferred_yields.clone(),
-            conditional_type_refinements: shard.conditional_type_refinements.clone(),
-        }],
+        shards: vec![authored_shard_from_compiled(shard)],
     }
 }
 
@@ -1892,19 +2008,21 @@ pub(crate) fn authored_pack_from_decoded_shards(
         carried_sources: manifest.carried_sources.clone(),
         cpp_portability: manifest.cpp_portability.clone(),
         python_correspondence: manifest.python_correspondence.clone(),
-        shards: shards
-            .iter()
-            .map(|shard| AuthoredShard {
-                id: shard.shard_id.clone(),
-                activation: shard.activation.clone(),
-                payload: authored_payload_from_compiled(&shard.payload),
-                runtime_values: shard.runtime_values.clone(),
-                runtime_contracts: shard.runtime_contracts.clone(),
-                collection_flows: shard.collection_flows.clone(),
-                deferred_yields: shard.deferred_yields.clone(),
-                conditional_type_refinements: shard.conditional_type_refinements.clone(),
-            })
-            .collect(),
+        shards: shards.iter().map(authored_shard_from_compiled).collect(),
+    }
+}
+
+fn authored_shard_from_compiled(shard: &CompiledShard) -> AuthoredShard {
+    AuthoredShard {
+        id: shard.shard_id.clone(),
+        activation: shard.activation.clone(),
+        payload: authored_payload_from_compiled(&shard.payload),
+        runtime_values: shard.runtime_values.clone(),
+        runtime_contracts: shard.runtime_contracts.clone(),
+        collection_flows: shard.collection_flows.clone(),
+        deferred_yields: shard.deferred_yields.clone(),
+        conditional_type_refinements: shard.conditional_type_refinements.clone(),
+        callable_values: shard.callable_values.clone(),
     }
 }
 
@@ -1942,6 +2060,7 @@ fn authored_procedure_summary_from_compiled(
             has_receiver: summary.target.has_receiver,
             variadic: summary.target.variadic,
             parameter_count: summary.target.parameter_count,
+            formals: summary.target.formals.clone(),
         },
         completeness: summary.completeness,
         ordinary_heap_unchanged: summary.ordinary_heap_unchanged,
@@ -1986,6 +2105,19 @@ fn authored_procedure_summary_from_compiled(
             .concurrency_effects
             .iter()
             .map(authored_concurrency_effect_from_compiled)
+            .collect(),
+        returned_callables: summary
+            .returned_callables
+            .iter()
+            .map(|callable| AuthoredReturnedCallable {
+                result_ordinal: callable.result_ordinal,
+                at_most_once: callable.at_most_once,
+                concurrency_effects: callable
+                    .concurrency_effects
+                    .iter()
+                    .map(authored_concurrency_effect_from_compiled)
+                    .collect(),
+            })
             .collect(),
         declared_effects: summary
             .declared_effects
@@ -2117,340 +2249,6 @@ fn authored_procedure_summary_from_compiled(
     }
 }
 
-fn authored_summary_value_transfer_from_compiled(
-    transfer: &CompiledSummaryValueTransfer,
-) -> SummaryValueTransfer {
-    SummaryValueTransfer {
-        kind: match transfer.kind {
-            CompiledSummaryValueTransferKind::Copy {} => SummaryValueTransferKind::Copy {},
-            CompiledSummaryValueTransferKind::AggregateCopy {} => {
-                SummaryValueTransferKind::AggregateCopy {}
-            }
-            CompiledSummaryValueTransferKind::Move { invalidation } => {
-                SummaryValueTransferKind::Move {
-                    invalidation: match invalidation {
-                        CompiledSummaryMoveInvalidation::Invalidated => {
-                            SummaryMoveInvalidation::Invalidated
-                        }
-                        CompiledSummaryMoveInvalidation::Unknown => {
-                            SummaryMoveInvalidation::Unknown
-                        }
-                    },
-                }
-            }
-            CompiledSummaryValueTransferKind::Conversion { preservation } => {
-                SummaryValueTransferKind::Conversion {
-                    preservation: match preservation {
-                        CompiledSummaryValuePreservation::Identity => {
-                            SummaryValuePreservation::Identity
-                        }
-                        CompiledSummaryValuePreservation::Preserving => {
-                            SummaryValuePreservation::Preserving
-                        }
-                        CompiledSummaryValuePreservation::Changing => {
-                            SummaryValuePreservation::Changing
-                        }
-                        CompiledSummaryValuePreservation::Unknown => {
-                            SummaryValuePreservation::Unknown
-                        }
-                    },
-                }
-            }
-            CompiledSummaryValueTransferKind::Boxing {} => SummaryValueTransferKind::Boxing {},
-            CompiledSummaryValueTransferKind::Unboxing {} => SummaryValueTransferKind::Unboxing {},
-        },
-        operation: match &transfer.operation {
-            CompiledSummaryValueTransferOperation::None {} => {
-                SummaryValueTransferOperation::None {}
-            }
-            CompiledSummaryValueTransferOperation::Implicit { member } => {
-                SummaryValueTransferOperation::Implicit {
-                    member: member.clone(),
-                }
-            }
-            CompiledSummaryValueTransferOperation::Unknown { limitation } => {
-                SummaryValueTransferOperation::Unknown {
-                    limitation: SummaryValueTransferLimitation {
-                        kind: match limitation.kind {
-                            CompiledSummaryValueTransferLimitationKind::BudgetExhausted => {
-                                SummaryValueTransferLimitationKind::BudgetExhausted
-                            }
-                            CompiledSummaryValueTransferLimitationKind::Cancelled => {
-                                SummaryValueTransferLimitationKind::Cancelled
-                            }
-                            CompiledSummaryValueTransferLimitationKind::Unsupported => {
-                                SummaryValueTransferLimitationKind::Unsupported
-                            }
-                            CompiledSummaryValueTransferLimitationKind::UnresolvedIdentity => {
-                                SummaryValueTransferLimitationKind::UnresolvedIdentity
-                            }
-                            CompiledSummaryValueTransferLimitationKind::AmbiguousIdentity => {
-                                SummaryValueTransferLimitationKind::AmbiguousIdentity
-                            }
-                            CompiledSummaryValueTransferLimitationKind::IncompleteInput => {
-                                SummaryValueTransferLimitationKind::IncompleteInput
-                            }
-                            CompiledSummaryValueTransferLimitationKind::Other => {
-                                SummaryValueTransferLimitationKind::Other
-                            }
-                        },
-                        message: limitation.message.clone(),
-                    },
-                }
-            }
-        },
-    }
-}
-
-fn authored_result_predicate_from_compiled(
-    predicate: CompiledResultPredicate,
-) -> AuthoredResultPredicate {
-    match predicate {
-        CompiledResultPredicate::Null => AuthoredResultPredicate::Null,
-        CompiledResultPredicate::NonNull => AuthoredResultPredicate::NonNull,
-        CompiledResultPredicate::True => AuthoredResultPredicate::True,
-        CompiledResultPredicate::False => AuthoredResultPredicate::False,
-    }
-}
-
-fn authored_declared_effect_from_compiled(
-    effect: &CompiledDeclaredEffect,
-) -> AuthoredDeclaredEffect {
-    AuthoredDeclaredEffect {
-        id: effect.id.clone(),
-        timing: match effect.timing {
-            CompiledDeclaredEffectTiming::Immediate => DeclaredEffectTiming::Immediate,
-            CompiledDeclaredEffectTiming::Deferred => DeclaredEffectTiming::Deferred,
-            CompiledDeclaredEffectTiming::Unknown => DeclaredEffectTiming::Unknown,
-        },
-        certainty: match effect.certainty {
-            CompiledDeclaredEffectCertainty::Definite => DeclaredEffectCertainty::Definite,
-            CompiledDeclaredEffectCertainty::Possible => DeclaredEffectCertainty::Possible,
-        },
-    }
-}
-
-fn authored_summary_input_from_compiled(input: &CompiledSummaryInput) -> AuthoredSummaryInput {
-    match input {
-        CompiledSummaryInput::Receiver {} => AuthoredSummaryInput::Receiver {},
-        CompiledSummaryInput::Parameter { ordinal } => {
-            AuthoredSummaryInput::Parameter { ordinal: *ordinal }
-        }
-    }
-}
-
-fn authored_concurrency_effect_from_compiled(
-    effect: &CompiledConcurrencyEffect,
-) -> AuthoredConcurrencyEffect {
-    match effect {
-        CompiledConcurrencyEffect::Unsupported { protocol } => {
-            AuthoredConcurrencyEffect::Unsupported {
-                protocol: protocol.clone(),
-            }
-        }
-        CompiledConcurrencyEffect::TaskSpawn {
-            callable,
-            group,
-            condition,
-            timer,
-        } => AuthoredConcurrencyEffect::TaskSpawn {
-            callable: authored_summary_input_from_compiled(callable),
-            group: group.as_ref().map(authored_summary_input_from_compiled),
-            condition: condition.map(|condition| match condition {
-                CompiledTaskSpawnCondition::CallResultTrue => {
-                    AuthoredTaskSpawnCondition::CallResultTrue
-                }
-            }),
-            timer: timer.as_ref().map(authored_summary_output_from_compiled),
-        },
-        CompiledConcurrencyEffect::TaskJoin { group } => AuthoredConcurrencyEffect::TaskJoin {
-            group: authored_summary_input_from_compiled(group),
-        },
-        CompiledConcurrencyEffect::OnceDo { once, callable } => AuthoredConcurrencyEffect::OnceDo {
-            once: authored_summary_input_from_compiled(once),
-            callable: authored_summary_input_from_compiled(callable),
-        },
-        CompiledConcurrencyEffect::LockAcquire {
-            lock,
-            mode,
-            condition,
-        } => AuthoredConcurrencyEffect::LockAcquire {
-            lock: authored_summary_input_from_compiled(lock),
-            mode: match mode {
-                CompiledLockMode::Shared => AuthoredLockMode::Shared,
-                CompiledLockMode::Exclusive => AuthoredLockMode::Exclusive,
-            },
-            condition: condition.map(|condition| match condition {
-                CompiledLockCondition::CallResultTrue => AuthoredLockCondition::CallResultTrue,
-            }),
-        },
-        CompiledConcurrencyEffect::LockRelease { lock, mode } => {
-            AuthoredConcurrencyEffect::LockRelease {
-                lock: authored_summary_input_from_compiled(lock),
-                mode: match mode {
-                    CompiledLockMode::Shared => AuthoredLockMode::Shared,
-                    CompiledLockMode::Exclusive => AuthoredLockMode::Exclusive,
-                },
-            }
-        }
-        CompiledConcurrencyEffect::WaitGroupAdd { group, delta } => {
-            AuthoredConcurrencyEffect::WaitGroupAdd {
-                group: authored_summary_input_from_compiled(group),
-                delta: authored_summary_input_from_compiled(delta),
-            }
-        }
-        CompiledConcurrencyEffect::WaitGroupDone { group } => {
-            AuthoredConcurrencyEffect::WaitGroupDone {
-                group: authored_summary_input_from_compiled(group),
-            }
-        }
-        CompiledConcurrencyEffect::WaitGroupWait { group } => {
-            AuthoredConcurrencyEffect::WaitGroupWait {
-                group: authored_summary_input_from_compiled(group),
-            }
-        }
-        CompiledConcurrencyEffect::Atomic {
-            location,
-            operation,
-        } => AuthoredConcurrencyEffect::Atomic {
-            location: authored_summary_input_from_compiled(location),
-            operation: match operation {
-                CompiledAtomicOperation::Load => AuthoredAtomicOperation::Load,
-                CompiledAtomicOperation::Store => AuthoredAtomicOperation::Store,
-                CompiledAtomicOperation::ReadModifyWrite => {
-                    AuthoredAtomicOperation::ReadModifyWrite
-                }
-            },
-        },
-        CompiledConcurrencyEffect::CondBind { condition, lock } => {
-            AuthoredConcurrencyEffect::CondBind {
-                condition: authored_summary_output_from_compiled(condition),
-                lock: authored_summary_input_from_compiled(lock),
-            }
-        }
-        CompiledConcurrencyEffect::CondWait { condition } => AuthoredConcurrencyEffect::CondWait {
-            condition: authored_summary_input_from_compiled(condition),
-        },
-        CompiledConcurrencyEffect::CondNotify { condition, waiters } => {
-            AuthoredConcurrencyEffect::CondNotify {
-                condition: authored_summary_input_from_compiled(condition),
-                waiters: match waiters {
-                    CompiledCondWaiters::One => AuthoredCondWaiters::One,
-                    CompiledCondWaiters::All => AuthoredCondWaiters::All,
-                },
-            }
-        }
-        CompiledConcurrencyEffect::SyncMap {
-            map,
-            key,
-            operation,
-        } => AuthoredConcurrencyEffect::SyncMap {
-            map: authored_summary_input_from_compiled(map),
-            key: key.as_ref().map(authored_summary_input_from_compiled),
-            operation: match operation {
-                CompiledSyncMapOperation::Store => AuthoredSyncMapOperation::Store,
-                CompiledSyncMapOperation::Delete => AuthoredSyncMapOperation::Delete,
-                CompiledSyncMapOperation::Clear => AuthoredSyncMapOperation::Clear,
-                CompiledSyncMapOperation::Load => AuthoredSyncMapOperation::Load,
-                CompiledSyncMapOperation::Range => AuthoredSyncMapOperation::Range,
-                CompiledSyncMapOperation::LoadOrStore => AuthoredSyncMapOperation::LoadOrStore,
-                CompiledSyncMapOperation::LoadAndDelete => AuthoredSyncMapOperation::LoadAndDelete,
-                CompiledSyncMapOperation::Swap => AuthoredSyncMapOperation::Swap,
-                CompiledSyncMapOperation::CompareAndSwap => {
-                    AuthoredSyncMapOperation::CompareAndSwap
-                }
-                CompiledSyncMapOperation::CompareAndDelete => {
-                    AuthoredSyncMapOperation::CompareAndDelete
-                }
-            },
-        },
-        CompiledConcurrencyEffect::TimerStop { timer } => AuthoredConcurrencyEffect::TimerStop {
-            timer: authored_summary_input_from_compiled(timer),
-        },
-        CompiledConcurrencyEffect::TimerReset { timer } => AuthoredConcurrencyEffect::TimerReset {
-            timer: authored_summary_input_from_compiled(timer),
-        },
-        CompiledConcurrencyEffect::SubtestRun { callable, group } => {
-            AuthoredConcurrencyEffect::SubtestRun {
-                callable: authored_summary_input_from_compiled(callable),
-                group: authored_summary_input_from_compiled(group),
-            }
-        }
-        CompiledConcurrencyEffect::SubtestParallel { receiver } => {
-            AuthoredConcurrencyEffect::SubtestParallel {
-                receiver: authored_summary_input_from_compiled(receiver),
-            }
-        }
-        CompiledConcurrencyEffect::SubtestCleanup { callable, group } => {
-            AuthoredConcurrencyEffect::SubtestCleanup {
-                callable: authored_summary_input_from_compiled(callable),
-                group: authored_summary_input_from_compiled(group),
-            }
-        }
-    }
-}
-
-fn authored_summary_output_from_compiled(output: &CompiledSummaryOutput) -> AuthoredSummaryOutput {
-    match output {
-        CompiledSummaryOutput::NormalReturn {} => AuthoredSummaryOutput::NormalReturn {},
-        CompiledSummaryOutput::IndexedNormalReturn { ordinal } => {
-            AuthoredSummaryOutput::IndexedNormalReturn { ordinal: *ordinal }
-        }
-        CompiledSummaryOutput::Receiver {} => AuthoredSummaryOutput::Receiver {},
-        CompiledSummaryOutput::Capture { location } => AuthoredSummaryOutput::Capture {
-            location: location.clone(),
-        },
-        CompiledSummaryOutput::Heap { location } => AuthoredSummaryOutput::Heap {
-            location: location.clone(),
-        },
-        CompiledSummaryOutput::ExceptionalReturn {} => AuthoredSummaryOutput::ExceptionalReturn {},
-    }
-}
-
-fn authored_summary_effect_from_compiled(effect: &CompiledSummaryEffect) -> AuthoredSummaryEffect {
-    match effect {
-        CompiledSummaryEffect::Allocation { event, output } => AuthoredSummaryEffect::Allocation {
-            event: event.clone(),
-            output: authored_summary_output_from_compiled(output),
-        },
-        CompiledSummaryEffect::Call { event, callee } => AuthoredSummaryEffect::Call {
-            event: event.clone(),
-            callee: callee.clone(),
-        },
-        CompiledSummaryEffect::Escape { event, input } => AuthoredSummaryEffect::Escape {
-            event: event.clone(),
-            input: authored_summary_input_from_compiled(input),
-        },
-        CompiledSummaryEffect::UnknownCall { event, input } => AuthoredSummaryEffect::UnknownCall {
-            event: event.clone(),
-            input: authored_summary_input_from_compiled(input),
-        },
-        CompiledSummaryEffect::UnknownCallBoundary { event } => {
-            AuthoredSummaryEffect::UnknownCallBoundary {
-                event: event.clone(),
-            }
-        }
-        CompiledSummaryEffect::AmbiguousCall {
-            event,
-            input,
-            candidates,
-        } => AuthoredSummaryEffect::AmbiguousCall {
-            event: event.clone(),
-            input: authored_summary_input_from_compiled(input),
-            candidates: candidates.clone(),
-        },
-        CompiledSummaryEffect::Sanitize {
-            input,
-            output,
-            removes,
-        } => AuthoredSummaryEffect::Sanitize {
-            input: authored_summary_input_from_compiled(input),
-            output: authored_summary_output_from_compiled(output),
-            removes: removes.clone(),
-        },
-    }
-}
-
 /// Prove the whole-manifest inventory invariants: no payload record id is
 /// defined twice across shards, and every referenced id is defined.
 ///
@@ -2528,7 +2326,8 @@ fn digest_hex(domain: &[u8], bytes: &[u8]) -> String {
 mod tests {
     use super::*;
     use crate::analyzer::semantic_model::{
-        CompilerOptions, CompressionPolicy, SourceFormat, compile_pack, compile_source,
+        CompilerOptions, CompressionPolicy, SourceFormat,
+        VERSION_INDEPENDENT_COMPATIBILITY_SCHEMA_VERSION, compile_pack, compile_source,
     };
     use flate2::Compression;
     use flate2::write::DeflateEncoder;
@@ -2540,6 +2339,47 @@ mod tests {
         include_bytes!("../../../testdata/semantic-model-packs/procedure-summaries-v1.json");
 
     #[test]
+    fn structured_procedure_formals_require_schema_eleven_and_round_trip() {
+        let mut source: serde_json::Value = serde_json::from_slice(PROCEDURE_SUMMARIES).unwrap();
+        source["schema_version"] = 11.into();
+        source["compatibility"]
+            .as_object_mut()
+            .unwrap()
+            .remove("bifrost");
+        source["shards"][0]["payload"]["summaries"][0]["target"]["formals"] =
+            serde_json::json!([{"name": "value", "optional": true}]);
+        let compiled = compile_source(
+            SourceFormat::Json,
+            &serde_json::to_vec(&source).unwrap(),
+            &CompilerOptions::default(),
+        )
+        .expect("schema eleven accepts structured procedure formals");
+        let shard = decode_shard(
+            &compiled.shards[0].descriptor,
+            &compiled.shards[0].bytes,
+            &DecodeLimits::default(),
+        )
+        .expect("structured procedure formals decode");
+        let summaries = shard.payload().procedure_summaries().unwrap();
+        assert_eq!(summaries[0].target.formals.len(), 1);
+        assert_eq!(summaries[0].target.formals[0].name, "value");
+        assert!(summaries[0].target.formals[0].optional);
+
+        source["schema_version"] = 10.into();
+        let diagnostics = compile_source(
+            SourceFormat::Json,
+            &serde_json::to_vec(&source).unwrap(),
+            &CompilerOptions::default(),
+        )
+        .expect_err("schema ten cannot carry structured formals");
+        assert!(
+            diagnostics
+                .iter()
+                .any(|diagnostic| { diagnostic.code == "summary.formals_schema_version" })
+        );
+    }
+
+    #[test]
     fn schema_eight_compiles_without_engine_gate_and_keeps_partial_state() {
         let mut authored: AuthoredSemanticModelPack = serde_json::from_slice(DECLARATIONS).unwrap();
         let legacy = compile_pack(&authored, &CompilerOptions::default()).unwrap();
@@ -2547,13 +2387,16 @@ mod tests {
         assert!(legacy.manifest.compatibility.bifrost.is_some());
         decode_manifest(&legacy.manifest_bytes, &DecodeLimits::default()).unwrap();
 
-        authored.schema_version = SEMANTIC_MODEL_SCHEMA_VERSION;
+        authored.schema_version = VERSION_INDEPENDENT_COMPATIBILITY_SCHEMA_VERSION;
         authored.compatibility.bifrost = None;
         authored.completeness = Completeness::Partial;
         let compiled = compile_pack(&authored, &CompilerOptions::default()).unwrap();
         let manifest_json: serde_json::Value =
             serde_json::from_slice(&compiled.manifest_bytes).unwrap();
-        assert_eq!(manifest_json["schema_version"], 8);
+        assert_eq!(
+            manifest_json["schema_version"],
+            VERSION_INDEPENDENT_COMPATIBILITY_SCHEMA_VERSION
+        );
         assert!(manifest_json["compatibility"].get("bifrost").is_none());
         assert!(manifest_json["compatibility"].get("toolchains").is_some());
         let decoded = decode_manifest(&compiled.manifest_bytes, &DecodeLimits::default()).unwrap();
@@ -2565,7 +2408,7 @@ mod tests {
         let forbidden_gate_bytes = canonical_json(&forbidden_gate).unwrap();
         assert!(matches!(
             decode_manifest(&forbidden_gate_bytes, &DecodeLimits::default()),
-            Err(ArtifactError::InvalidDescriptor(message)) if message.contains("forbids")
+            Err(ArtifactError::InvalidDescriptor(message)) if message == "schema 8 and later forbid compatibility.bifrost"
         ));
 
         let mut null_gate = manifest_json.clone();
@@ -2588,12 +2431,15 @@ mod tests {
             Err(ArtifactError::InvalidDescriptor(message)) if message.contains("requires")
         ));
 
+        let unsupported_schema_version = SEMANTIC_MODEL_SCHEMA_VERSION + 1;
         let mut unknown_schema = manifest_json.clone();
-        unknown_schema["schema_version"] = serde_json::json!(9);
+        unknown_schema["schema_version"] = serde_json::json!(unsupported_schema_version);
         let unknown_schema_bytes = canonical_json(&unknown_schema).unwrap();
         assert_eq!(
             decode_manifest(&unknown_schema_bytes, &DecodeLimits::default()),
-            Err(ArtifactError::UnsupportedVersion(9))
+            Err(ArtifactError::UnsupportedVersion(
+                unsupported_schema_version
+            ))
         );
 
         let mut missing_legacy = authored.clone();
@@ -2615,7 +2461,7 @@ mod tests {
         );
 
         let mut unknown_schema = authored;
-        unknown_schema.schema_version = 9;
+        unknown_schema.schema_version = unsupported_schema_version;
         assert!(
             compile_pack(&unknown_schema, &CompilerOptions::default())
                 .unwrap_err()
@@ -2624,6 +2470,9 @@ mod tests {
         );
     }
 
+    #[brokk_bifrost_test_macros::hardwon(
+        "#3815: schema-aware native-pack compatibility disagreed across authoring and compilation"
+    )]
     #[test]
     fn authoring_schema_and_rust_compiler_agree_on_engine_gate_shapes() {
         let schema: serde_json::Value =
@@ -2699,6 +2548,412 @@ mod tests {
                 .unwrap_err()
                 .iter()
                 .any(|diagnostic| diagnostic.code == "schema.callable_surface_version")
+        );
+    }
+
+    fn callable_values_authored_pack() -> AuthoredSemanticModelPack {
+        let mut authored: AuthoredSemanticModelPack = serde_json::from_slice(DECLARATIONS).unwrap();
+        authored.schema_version = CALLABLE_VALUES_MIN_SCHEMA_VERSION;
+        authored.compatibility.bifrost = None;
+        authored.language = "go".to_owned();
+        let digest = "b".repeat(64);
+        for selector in &mut authored.shards[0].activation {
+            selector.artifact_sha256 = Some(digest.clone());
+        }
+        let literal_id = "go.literal.callback".to_owned();
+        authored.shards[0].callable_values = Some(CallableValuesPayload {
+            facts: vec![CallableValuesFact {
+                payload: crate::analyzer::semantic_model::csmi::CsmiCallableValuesPayload::ReturnedCallable {
+                    callable: "member.widget.create".to_owned(),
+                    result: 0,
+                    target: literal_id.clone(),
+                },
+                provenance: vec!["opaque.producer.fact".to_owned()],
+            }],
+            coverage: vec![CallableValuesCoverage {
+                family: CallableValuesFamily::ReturnedCallables,
+                callable: "member.widget.create".to_owned(),
+                status: crate::analyzer::semantic_model::csmi::CsmiCoverageStatus::Partial,
+                limitations: Vec::new(),
+                provenance: vec!["opaque.producer.coverage".to_owned()],
+            }],
+            anonymous_callables: vec![AnonymousCallableIdentity {
+                id: literal_id,
+                artifact_sha256: digest,
+                package_identity: "example.test/module/pkg".to_owned(),
+                anchor: crate::analyzer::semantic_model::SourceAnchor {
+                    file: "callbacks.go".to_owned(),
+                    byte_range: crate::analyzer::semantic_model::SourceByteRange { start: 20, end: 50 },
+                    kind: crate::analyzer::semantic_model::SourceDeclarationKind::FunctionLiteral,
+                },
+                lexical_owner_chain: vec![crate::analyzer::semantic_model::SourceAnchor {
+                    file: "callbacks.go".to_owned(),
+                    byte_range: crate::analyzer::semantic_model::SourceByteRange { start: 0, end: 100 },
+                    kind: crate::analyzer::semantic_model::SourceDeclarationKind::Function,
+                }],
+                signature: crate::analyzer::semantic_model::SourceCallableShape {
+                    function_type: crate::analyzer::semantic_model::SourceTypeNode {
+                        file: "callbacks.go".to_owned(),
+                        byte_range: crate::analyzer::semantic_model::SourceByteRange { start: 20, end: 35 },
+                    },
+                    parameters: Vec::new(),
+                    results: Vec::new(),
+                    declaration_chain: Vec::new(),
+                },
+            }],
+        });
+        authored
+    }
+
+    #[test]
+    fn callable_values_encode_decode_hash_and_preserve_old_wire_shape() {
+        let authored = callable_values_authored_pack();
+        let compiled = compile_pack(&authored, &CompilerOptions::default()).unwrap();
+        assert_eq!(
+            compiled.manifest.schema_version,
+            CALLABLE_VALUES_MIN_SCHEMA_VERSION
+        );
+        use crate::analyzer::semantic_model::csmi::{
+            CsmiArtifactEvidence, CsmiExportError, CsmiExportOptions, export_csmi_pack,
+            export_runtime_contracts_csmi_pack,
+        };
+        let options = CsmiExportOptions::default();
+        let artifact = CsmiArtifactEvidence::new("pkg:generic/test@1.0.0", "a".repeat(64));
+        // This generic selector is insufficient for the artifact-local Go
+        // source mapping. Standard export now supports properly pinned Go
+        // callable-values; runtime-contract export still refuses the carrier.
+        assert!(matches!(
+            export_csmi_pack(&compiled, &artifact, &options).unwrap_err(),
+            CsmiExportError::InvalidEvidence(message)
+                if message.contains("exact versioned pkg:golang PURL")
+        ));
+        assert!(matches!(
+            export_runtime_contracts_csmi_pack(&compiled, &options).unwrap_err(),
+            CsmiExportError::Unsupported { path, .. } if path.ends_with(".callable_values")
+        ));
+        let (wire, _) = read_shard_wire(
+            &compiled.shards[0].descriptor,
+            &compiled.shards[0].bytes,
+            &DecodeLimits::default(),
+        )
+        .unwrap();
+        assert!(wire.callable_values.is_some());
+
+        let decoded = decode_shard_for_manifest(
+            &compiled.manifest,
+            &compiled.shards[0].descriptor,
+            &compiled.shards[0].bytes,
+            &DecodeLimits::default(),
+        )
+        .unwrap();
+        let callable_values = decoded.callable_values().expect("carrier round-trips");
+        assert_eq!(callable_values.record_count(), 3);
+        assert_eq!(callable_values.anonymous_callables.len(), 1);
+        assert_eq!(
+            callable_values.anonymous_callables[0].id,
+            "go.literal.callback"
+        );
+        assert!(
+            compiled.shards[0]
+                .descriptor
+                .defined_ids
+                .iter()
+                .any(|id| id == "go.literal.callback")
+        );
+        assert!(
+            compiled.shards[0]
+                .descriptor
+                .referenced_ids
+                .iter()
+                .any(|id| id == "go.literal.callback")
+        );
+        assert_eq!(
+            decoded.record_count(),
+            compiled.shards[0].descriptor.record_count as usize
+        );
+
+        let mut changed = authored.clone();
+        changed.shards[0].callable_values.as_mut().unwrap().facts[0]
+            .provenance
+            .push("opaque.producer.changed".to_owned());
+        let changed_compiled = compile_pack(&changed, &CompilerOptions::default()).unwrap();
+        assert_ne!(
+            compiled.shards[0].descriptor.semantic_sha256,
+            changed_compiled.shards[0].descriptor.semantic_sha256
+        );
+
+        let legacy: AuthoredSemanticModelPack = serde_json::from_slice(DECLARATIONS).unwrap();
+        let legacy_compiled = compile_pack(&legacy, &CompilerOptions::default()).unwrap();
+        let (legacy_wire, _) = read_shard_wire(
+            &legacy_compiled.shards[0].descriptor,
+            &legacy_compiled.shards[0].bytes,
+            &DecodeLimits::default(),
+        )
+        .unwrap();
+        assert!(legacy_wire.callable_values.is_none());
+    }
+
+    #[test]
+    fn callable_values_schema_floor_and_bad_references_fail_closed() {
+        let mut old_schema = callable_values_authored_pack();
+        old_schema.schema_version = CALLABLE_VALUES_MIN_SCHEMA_VERSION - 1;
+        let diagnostics = compile_pack(&old_schema, &CompilerOptions::default()).unwrap_err();
+        assert!(
+            diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == "schema.callable_values_version")
+        );
+
+        let mut bad_reference = callable_values_authored_pack();
+        let Some(CallableValuesPayload { facts, .. }) =
+            bad_reference.shards[0].callable_values.as_mut()
+        else {
+            unreachable!();
+        };
+        let crate::analyzer::semantic_model::csmi::CsmiCallableValuesPayload::ReturnedCallable {
+            target,
+            ..
+        } = &mut facts[0].payload
+        else {
+            unreachable!();
+        };
+        *target = "missing.callable".to_owned();
+        let diagnostics = compile_pack(&bad_reference, &CompilerOptions::default()).unwrap_err();
+        assert!(
+            diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == "callable_values.symbol_reference")
+        );
+    }
+
+    #[test]
+    fn anonymous_callable_targets_require_exact_artifact_owner_range_and_unique_id() {
+        let mut wrong_artifact = callable_values_authored_pack();
+        wrong_artifact.shards[0]
+            .callable_values
+            .as_mut()
+            .unwrap()
+            .anonymous_callables[0]
+            .artifact_sha256 = "c".repeat(64);
+        let diagnostics = compile_pack(&wrong_artifact, &CompilerOptions::default()).unwrap_err();
+        assert!(
+            diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == "callable_values.anonymous_artifact")
+        );
+
+        let mut wrong_owner = callable_values_authored_pack();
+        wrong_owner.shards[0]
+            .callable_values
+            .as_mut()
+            .unwrap()
+            .anonymous_callables[0]
+            .lexical_owner_chain[0]
+            .byte_range
+            .start = 25;
+        let diagnostics = compile_pack(&wrong_owner, &CompilerOptions::default()).unwrap_err();
+        assert!(
+            diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == "callable_values.anonymous_owner")
+        );
+
+        let mut wrong_range = callable_values_authored_pack();
+        wrong_range.shards[0]
+            .callable_values
+            .as_mut()
+            .unwrap()
+            .anonymous_callables[0]
+            .signature
+            .function_type
+            .byte_range
+            .start = 21;
+        let diagnostics = compile_pack(&wrong_range, &CompilerOptions::default()).unwrap_err();
+        assert!(
+            diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == "callable_values.anonymous_signature")
+        );
+
+        let mut duplicate = callable_values_authored_pack();
+        let identity = duplicate.shards[0]
+            .callable_values
+            .as_ref()
+            .unwrap()
+            .anonymous_callables[0]
+            .clone();
+        duplicate.shards[0]
+            .callable_values
+            .as_mut()
+            .unwrap()
+            .anonymous_callables
+            .push(identity);
+        let diagnostics = compile_pack(&duplicate, &CompilerOptions::default()).unwrap_err();
+        assert!(
+            diagnostics
+                .iter()
+                .any(|diagnostic| { diagnostic.code == "callable_values.anonymous_duplicate_id" })
+        );
+    }
+
+    #[test]
+    fn field_member_with_signature_is_not_a_callable_values_factory() {
+        let mut authored = callable_values_authored_pack();
+        let AuthoredPayload::DeclarationFacts { members, .. } = &mut authored.shards[0].payload
+        else {
+            unreachable!();
+        };
+        let factory = members
+            .iter_mut()
+            .find(|member| member.id == "member.widget.create")
+            .expect("fixture factory member");
+        factory.member_kind = MemberKind::Field;
+        let diagnostics = compile_pack(&authored, &CompilerOptions::default()).unwrap_err();
+        assert!(
+            diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == "callable_values.factory")
+        );
+    }
+
+    #[test]
+    fn unknown_type_refs_compile_and_decode_in_schema_nine() {
+        let mut authored: AuthoredSemanticModelPack = serde_json::from_slice(DECLARATIONS).unwrap();
+        authored.schema_version = UNKNOWN_TYPE_MIN_SCHEMA_VERSION;
+        authored.compatibility.bifrost = None;
+        let AuthoredPayload::DeclarationFacts { members, .. } = &mut authored.shards[0].payload
+        else {
+            unreachable!();
+        };
+        let signature = members[0]
+            .signature
+            .as_mut()
+            .expect("fixture member has a signature");
+        let original_parameter_count = signature.parameters.len();
+        let original_parameter_name = signature.parameters[0].name.clone();
+        let original_parameter_optional = signature.parameters[0].optional;
+        let original_parameter_variadic = signature.parameters[0].variadic;
+        let original_passing_mode = signature.parameters[0].passing_mode;
+        signature.parameters[0].r#type = TypeRef::Named {
+            name: "typing.Optional".to_owned(),
+            arguments: vec![TypeRef::Unknown],
+            nullable: false,
+        };
+        signature.returns = Some(TypeRef::Unknown);
+
+        let compiled = compile_pack(&authored, &CompilerOptions::default()).unwrap();
+        let decoded = decode_shard_for_manifest(
+            &compiled.manifest,
+            &compiled.shards[0].descriptor,
+            &compiled.shards[0].bytes,
+            &DecodeLimits::default(),
+        )
+        .unwrap();
+        let (_, members, _) = decoded.payload().declaration_facts().unwrap();
+        let signature = members[0]
+            .signature
+            .as_ref()
+            .expect("decoded fixture member has a signature");
+        assert!(signature.contains_unknown_types());
+        assert_eq!(signature.parameters.len(), original_parameter_count);
+        assert_eq!(signature.parameters[0].name, original_parameter_name);
+        assert_eq!(
+            signature.parameters[0].optional,
+            original_parameter_optional
+        );
+        assert_eq!(
+            signature.parameters[0].variadic,
+            original_parameter_variadic
+        );
+        assert_eq!(signature.parameters[0].passing_mode, original_passing_mode);
+        assert_eq!(
+            signature.parameters[0].r#type,
+            TypeRef::Named {
+                name: "typing.Optional".to_owned(),
+                arguments: vec![TypeRef::Unknown],
+                nullable: false,
+            }
+        );
+        assert_eq!(signature.returns, Some(TypeRef::Unknown));
+
+        authored.schema_version = UNKNOWN_TYPE_MIN_SCHEMA_VERSION - 1;
+        assert!(
+            compile_pack(&authored, &CompilerOptions::default())
+                .unwrap_err()
+                .iter()
+                .any(|diagnostic| {
+                    diagnostic.code == "schema.unknown_type_version"
+                        && diagnostic.path.ends_with("signature.returns")
+                })
+        );
+    }
+
+    #[test]
+    fn callable_parameter_roles_require_schema_fifteen_and_round_trip() {
+        let mut authored: AuthoredSemanticModelPack = serde_json::from_slice(DECLARATIONS).unwrap();
+        authored.schema_version = TYPED_VALUES_AND_PARAMETER_ROLES_MIN_SCHEMA_VERSION;
+        authored.compatibility.bifrost = None;
+        let AuthoredPayload::DeclarationFacts { members, .. } = &mut authored.shards[0].payload
+        else {
+            unreachable!();
+        };
+        members[0]
+            .signature
+            .as_mut()
+            .expect("fixture member has a signature")
+            .parameters[0]
+            .role = Some(ParameterRole::Request);
+
+        let compiled = compile_pack(&authored, &CompilerOptions::default()).unwrap();
+        let decoded = decode_shard_for_manifest(
+            &compiled.manifest,
+            &compiled.shards[0].descriptor,
+            &compiled.shards[0].bytes,
+            &DecodeLimits::default(),
+        )
+        .unwrap();
+        let (_, members, _) = decoded.payload().declaration_facts().unwrap();
+        assert_eq!(
+            members[0].signature.as_ref().unwrap().parameters[0].role,
+            Some(ParameterRole::Request)
+        );
+
+        authored.schema_version -= 1;
+        assert!(
+            compile_pack(&authored, &CompilerOptions::default())
+                .unwrap_err()
+                .iter()
+                .any(|diagnostic| diagnostic.code == "parameter.role_schema_version")
+        );
+    }
+
+    #[test]
+    fn exact_return_class_sets_require_schema_sixteen() {
+        let mut authored: AuthoredSemanticModelPack = serde_json::from_slice(DECLARATIONS).unwrap();
+        authored.schema_version = EXACT_RETURN_CLASSES_MIN_SCHEMA_VERSION;
+        authored.compatibility.bifrost = None;
+        let AuthoredPayload::DeclarationFacts { members, .. } = &mut authored.shards[0].payload
+        else {
+            unreachable!();
+        };
+        members[0].exact_return_classes = members[0]
+            .signature
+            .as_ref()
+            .and_then(|signature| signature.returns.clone())
+            .into_iter()
+            .collect();
+
+        compile_pack(&authored, &CompilerOptions::default()).unwrap();
+
+        authored.schema_version = EXACT_RETURN_CLASSES_MIN_SCHEMA_VERSION - 1;
+        assert!(
+            compile_pack(&authored, &CompilerOptions::default())
+                .unwrap_err()
+                .iter()
+                .any(|diagnostic| {
+                    diagnostic.code == "declaration.exact_return_classes_schema_version"
+                        && diagnostic.path.ends_with("exact_return_classes")
+                })
         );
     }
 
@@ -3238,6 +3493,7 @@ mod tests {
             has_receiver: false,
             variadic: false,
             parameter_count: 1,
+            formals: Vec::new(),
         };
         assert!(
             diagnostics_for(
@@ -3405,22 +3661,7 @@ mod tests {
         // shard, and manifest identities byte-for-byte compatible within the
         // same schema version.
         let compiled = compile_pack(&authored, &CompilerOptions::default()).unwrap();
-        assert_eq!(
-            compiled.manifest.semantic_sha256,
-            "c95c929e580da66b273670232922084f7bf76495fdd609e0338e1cb832538932"
-        );
-        assert_eq!(
-            compiled.manifest.content_sha256,
-            "bbddac2ff793463700951d9a2b5377facb90741a779e029468b50df07e985b53"
-        );
-        assert_eq!(
-            compiled.shards[0].descriptor.semantic_sha256,
-            "9db53e8ae41538e727785153a35935b000fae2efd916b0dfa85a226aafbe00a2"
-        );
-        assert_eq!(
-            compiled.shards[0].descriptor.content_sha256,
-            "5db9b5f2535724a7c173425fe1b6b07ceeccdb7e09c45736ab2f73a85328eec9"
-        );
+        crate::test_support::assert_no_optional_claim_pack_v2_digests(&compiled);
 
         let decoded = decode_shard_for_manifest(
             &compiled.manifest,
@@ -3746,6 +3987,93 @@ mod tests {
                 "missing {expected_code} in {diagnostics:#?}"
             );
         }
+    }
+
+    #[test]
+    fn returned_callable_channel_effect_requires_schema_eleven_and_valid_results() {
+        fn with_returned_callable(result_ordinal: u32) -> AuthoredSemanticModelPack {
+            let mut authored: AuthoredSemanticModelPack =
+                serde_json::from_slice(PROCEDURE_SUMMARIES).unwrap();
+            authored.schema_version = SEMANTIC_MODEL_SCHEMA_VERSION;
+            authored.compatibility.bifrost = None;
+            let AuthoredPayload::ProcedureSummaries { summaries } = &mut authored.shards[0].payload
+            else {
+                unreachable!()
+            };
+            let summary = &mut summaries[1];
+            summary.normal_result_count = Some(2);
+            summary.returned_callables = vec![AuthoredReturnedCallable {
+                result_ordinal,
+                at_most_once: false,
+                concurrency_effects: vec![AuthoredConcurrencyEffect::ChannelClose {
+                    channel: AuthoredSummaryPort::Output {
+                        output: AuthoredSummaryOutput::IndexedNormalReturn { ordinal: 0 },
+                    },
+                    fresh: false,
+                }],
+            }];
+            authored
+        }
+
+        let authored = with_returned_callable(1);
+        let expected = match &authored.shards[0].payload {
+            AuthoredPayload::ProcedureSummaries { summaries } => {
+                summaries[1].returned_callables.clone()
+            }
+            _ => unreachable!(),
+        };
+        let compiled = compile_pack(&authored, &CompilerOptions::default()).unwrap();
+        let decoded = decode_shard_for_manifest(
+            &compiled.manifest,
+            &compiled.shards[0].descriptor,
+            &compiled.shards[0].bytes,
+            &DecodeLimits::default(),
+        )
+        .unwrap();
+        let summary = &decoded.payload().procedure_summaries().unwrap()[1];
+        assert_eq!(
+            authored_procedure_summary_from_compiled(summary).returned_callables,
+            expected
+        );
+
+        let mut old_schema = authored.clone();
+        old_schema.schema_version = CHANNEL_CLOSE_EFFECTS_MIN_SCHEMA_VERSION - 1;
+        assert!(
+            compile_pack(&old_schema, &CompilerOptions::default())
+                .unwrap_err()
+                .iter()
+                .any(|diagnostic| diagnostic.code == "summary.channel_close_schema_version")
+        );
+
+        let invalid_ordinal = with_returned_callable(2);
+        assert!(
+            compile_pack(&invalid_ordinal, &CompilerOptions::default())
+                .unwrap_err()
+                .iter()
+                .any(|diagnostic| diagnostic.code == "summary.invalid_returned_callable_ordinal")
+        );
+
+        let mut self_target = with_returned_callable(1);
+        let AuthoredPayload::ProcedureSummaries { summaries } = &mut self_target.shards[0].payload
+        else {
+            unreachable!()
+        };
+        let AuthoredConcurrencyEffect::ChannelClose { channel, .. } =
+            &mut summaries[1].returned_callables[0].concurrency_effects[0]
+        else {
+            unreachable!()
+        };
+        *channel = AuthoredSummaryPort::Output {
+            output: AuthoredSummaryOutput::IndexedNormalReturn { ordinal: 1 },
+        };
+        assert!(
+            compile_pack(&self_target, &CompilerOptions::default())
+                .unwrap_err()
+                .iter()
+                .any(|diagnostic| {
+                    diagnostic.code == "summary.invalid_returned_callable_effect_target"
+                })
+        );
     }
 
     #[test]
@@ -4148,7 +4476,7 @@ mod tests {
         descriptor.raw_size = raw.len() as u64;
         descriptor.stored_size = raw.len() as u64;
         descriptor.content_sha256 = content_digest(&raw);
-        descriptor.stored_sha256 = stored_digest(&raw);
+        descriptor.stored_sha256 = content_digest(&raw);
 
         assert_eq!(
             decode_shard(&descriptor, &raw, &DecodeLimits::default()).unwrap_err(),
@@ -4212,6 +4540,69 @@ mod tests {
     }
 
     #[test]
+    fn positional_vararg_named_application_is_not_a_keyword_collector() {
+        let mut source: serde_json::Value = serde_json::from_slice(DECLARATIONS).unwrap();
+        source["schema_version"] = 8.into();
+        source["compatibility"]
+            .as_object_mut()
+            .unwrap()
+            .remove("bifrost");
+        source["shards"][0]["payload"]["members"][0]["signature"]["parameters"] = serde_json::json!([
+            {
+                "name": "values", "type": {"kind": "named", "name": "java.lang.String"},
+                "variadic": true, "passing_mode": "positional_or_named"
+            },
+            {
+                "name": "separator", "type": {"kind": "named", "name": "java.lang.String"},
+                "passing_mode": "named_only", "optional": true
+            }
+        ]);
+        let compiled = compile_source(
+            SourceFormat::Json,
+            &serde_json::to_vec(&source).unwrap(),
+            &CompilerOptions::default(),
+        )
+        .expect("a positional vararg can accept its own name before named-only formals");
+        let shard = decode_shard(
+            &compiled.shards[0].descriptor,
+            &compiled.shards[0].bytes,
+            &DecodeLimits::default(),
+        )
+        .expect("directional signature survives artifact validation");
+        assert_eq!(shard.schema_version, 8);
+
+        source["shards"][0]["payload"]["members"][0]["signature"]["parameters"][1]["passing_mode"] =
+            "positional_or_named".into();
+        let diagnostics = compile_source(
+            SourceFormat::Json,
+            &serde_json::to_vec(&source).unwrap(),
+            &CompilerOptions::default(),
+        )
+        .expect_err("a positional fixed formal cannot follow a positional vararg");
+        assert!(
+            diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == "parameter.positional_after_variadic")
+        );
+
+        source["shards"][0]["payload"]["members"][0]["signature"]["parameters"][1]["passing_mode"] =
+            "named_only".into();
+        source["shards"][0]["payload"]["members"][0]["signature"]["parameters"][0]["passing_mode"] =
+            "named_only".into();
+        let diagnostics = compile_source(
+            SourceFormat::Json,
+            &serde_json::to_vec(&source).unwrap(),
+            &CompilerOptions::default(),
+        )
+        .expect_err("a keyword collector must still be final");
+        assert!(
+            diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == "parameter.named_variadic_not_final")
+        );
+    }
+
+    #[test]
     fn shard_decoder_rejects_rehashed_semantically_invalid_payload() {
         let compiled = compile_source(
             SourceFormat::Json,
@@ -4228,12 +4619,20 @@ mod tests {
             unreachable!()
         };
         types[0].aliases.push("invalid alias".to_owned());
+        types[0].aliases.push("another invalid alias".to_owned());
         let (descriptor, raw) = rehash_raw_descriptor(&artifact.descriptor, &wire);
 
-        assert!(matches!(
-            decode_shard(&descriptor, &raw, &DecodeLimits::default()),
-            Err(ArtifactError::SemanticValidation(_))
-        ));
+        let error = decode_shard(&descriptor, &raw, &DecodeLimits::default()).unwrap_err();
+        let message = error.to_string();
+        let ArtifactError::SemanticValidation(diagnostics) = error else {
+            panic!("expected semantic validation failure");
+        };
+        assert_eq!(diagnostics.len(), 2);
+        for diagnostic in diagnostics {
+            assert!(message.contains(&diagnostic.code));
+            assert!(message.contains(&diagnostic.path));
+            assert!(message.contains(&diagnostic.message));
+        }
     }
 
     #[test]
@@ -4425,7 +4824,7 @@ mod tests {
         descriptor.stored_size = raw.len() as u64;
         descriptor.semantic_sha256 = semantic_digest(&shard).unwrap();
         descriptor.content_sha256 = content_digest(&raw);
-        descriptor.stored_sha256 = stored_digest(&raw);
+        descriptor.stored_sha256 = content_digest(&raw);
         (descriptor.defined_ids, descriptor.referenced_ids) = payload_inventory(&wire.payload);
         (descriptor, raw)
     }
@@ -4447,7 +4846,7 @@ mod tests {
             referenced_ids: Vec::new(),
             semantic_sha256: "0".repeat(64),
             content_sha256: content_digest(raw),
-            stored_sha256: stored_digest(stored),
+            stored_sha256: content_digest(stored),
         }
     }
 }

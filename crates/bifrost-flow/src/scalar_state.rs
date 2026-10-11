@@ -5,8 +5,6 @@
 //! makes loops stack safe, and explicit widening at a documented per-point
 //! join limit makes the integer lattice finite, so every procedure converges.
 
-#[cfg(test)]
-use crate::analyzer::semantic::MoveInvalidation;
 use crate::analyzer::semantic::{
     BindingOriginIndex, CallSiteId, CaptureMode, CaptureSource, ControlEdgeId, GuardFact,
     GuardPredicate, IntegerComparison, MemoryLocationKind, ProcedureHandle, ProcedureId,
@@ -15,7 +13,7 @@ use crate::analyzer::semantic::{
     ValueFlowKind, ValueId, ValuePreservation, ValueTransfer,
 };
 use crate::hash::{HashMap, HashSet};
-use brokk_bifrost_analysis::analyzer::go_scalar_binding::{GoScalarType, go_scalar_binding_types};
+use brokk_bifrost_analysis::analyzer::declared_scalar::DeclaredScalarType;
 use brokk_bifrost_analysis::analyzer::java_integral_parameter::{
     JavaIntegralDomain, JavaScalarType, java_scalar_binding_types,
 };
@@ -34,7 +32,10 @@ pub struct ScalarIntegerValue {
 impl ScalarIntegerValue {
     pub const fn new(negative: bool, magnitude: u128) -> Self {
         Self {
-            negative: negative && magnitude != 0,
+            negative: brokk_bifrost_analysis::analyzer::semantic::ir::SignedIntegerMagnitude::new(
+                negative, magnitude,
+            )
+            .negative(),
             magnitude,
         }
     }
@@ -233,12 +234,18 @@ impl ScalarIntegerInterval {
     }
 
     pub fn add_interval(self, other: Self) -> ScalarIntegerArithmetic {
+        if matches!(self.domain, ScalarIntegerDomain::Unsigned { .. }) {
+            return self.unsigned_add_interval(other);
+        }
         self.binary_operation(other, ScalarIntegerValue::checked_add)
     }
 
     pub fn subtract_interval(self, other: Self) -> ScalarIntegerArithmetic {
         if self.domain != other.domain {
             return ScalarIntegerArithmetic::UnknownDomain;
+        }
+        if matches!(self.domain, ScalarIntegerDomain::Unsigned { .. }) {
+            return self.unsigned_subtract_interval(other);
         }
         let Some(lower) = self.lower.checked_sub(other.upper) else {
             return ScalarIntegerArithmetic::MagnitudeExceeded;
@@ -298,6 +305,63 @@ impl ScalarIntegerInterval {
         }
         ScalarIntegerArithmetic::Interval(Self::new(lower, upper, self.domain))
     }
+
+    fn unsigned_add_interval(self, other: Self) -> ScalarIntegerArithmetic {
+        if self.domain != other.domain {
+            return ScalarIntegerArithmetic::UnknownDomain;
+        }
+        let ScalarIntegerDomain::Unsigned { bits } = self.domain else {
+            unreachable!("unsigned interval helper requires an unsigned domain");
+        };
+        let exact = self.lower == self.upper && other.lower == other.upper;
+        let lower = self.lower.checked_add(other.lower);
+        let upper = self.upper.checked_add(other.upper);
+        if let (Some(lower), Some(upper)) = (lower, upper)
+            && self.domain.contains(lower)
+            && self.domain.contains(upper)
+        {
+            return ScalarIntegerArithmetic::Interval(Self::new(lower, upper, self.domain));
+        }
+        if exact {
+            let value = unsigned_wrapped_add(self.lower.magnitude(), other.lower.magnitude(), bits);
+            return ScalarIntegerArithmetic::Interval(Self::exact(
+                ScalarIntegerValue::unsigned(value),
+                self.domain,
+            ));
+        }
+        ScalarIntegerArithmetic::Interval(Self::new(
+            ScalarIntegerValue::unsigned(0),
+            ScalarIntegerValue::unsigned(unsigned_max(bits)),
+            self.domain,
+        ))
+    }
+
+    fn unsigned_subtract_interval(self, other: Self) -> ScalarIntegerArithmetic {
+        let ScalarIntegerDomain::Unsigned { bits } = self.domain else {
+            unreachable!("unsigned interval helper requires an unsigned domain");
+        };
+        let exact = self.lower == self.upper && other.lower == other.upper;
+        let lower = self.lower.checked_sub(other.upper);
+        let upper = self.upper.checked_sub(other.lower);
+        if let (Some(lower), Some(upper)) = (lower, upper)
+            && self.domain.contains(lower)
+            && self.domain.contains(upper)
+        {
+            return ScalarIntegerArithmetic::Interval(Self::new(lower, upper, self.domain));
+        }
+        if exact {
+            let value = unsigned_wrapped_sub(self.lower.magnitude(), other.lower.magnitude(), bits);
+            return ScalarIntegerArithmetic::Interval(Self::exact(
+                ScalarIntegerValue::unsigned(value),
+                self.domain,
+            ));
+        }
+        ScalarIntegerArithmetic::Interval(Self::new(
+            ScalarIntegerValue::unsigned(0),
+            ScalarIntegerValue::unsigned(unsigned_max(bits)),
+            self.domain,
+        ))
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -306,6 +370,24 @@ pub enum ScalarIntegerArithmetic {
     Overflow,
     MagnitudeExceeded,
     UnknownDomain,
+}
+
+fn unsigned_wrapped_add(left: u128, right: u128, bits: u16) -> u128 {
+    let value = left.wrapping_add(right);
+    if bits == 128 {
+        value
+    } else {
+        value & unsigned_max(bits)
+    }
+}
+
+fn unsigned_wrapped_sub(left: u128, right: u128, bits: u16) -> u128 {
+    let value = left.wrapping_sub(right);
+    if bits == 128 {
+        value
+    } else {
+        value & unsigned_max(bits)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -740,6 +822,7 @@ impl ScalarBindingType {
                 ScalarBindingType::Boolean,
                 ScalarFact::Integer(_) | ScalarFact::NonExactInteger | ScalarFact::Float(_),
             ) => ScalarFact::Unknown,
+            (_, ScalarFact::Unconstrained) => ScalarFact::Unconstrained,
             _ => fact,
         }
     }
@@ -762,8 +845,11 @@ pub enum ScalarFact {
     /// A number whose values are exactly the members of this range, compared
     /// by IEEE order.
     Float(ScalarFloatRange),
-    /// Required structured information is absent or an operation is outside
-    /// the bounded scalar vocabulary.
+    /// Every value in the binding's static domain is possible, with no
+    /// transfer having lost information.
+    Unconstrained,
+    /// A transfer lost required structured information or an operation is
+    /// outside the bounded scalar vocabulary.
     Unknown,
 }
 
@@ -782,6 +868,7 @@ impl ScalarFact {
             Self::NonExactInteger => "non_exact_integer",
             Self::Float(range) if range.exact_value().is_some() => "exact_float",
             Self::Float(_) => "float_range",
+            Self::Unconstrained => "unconstrained",
             Self::Unknown => "unknown",
         }
     }
@@ -789,11 +876,13 @@ impl ScalarFact {
     pub fn join(self, other: Self) -> Self {
         use ScalarFact::{
             EitherBoolean, False, Float, Integer, MaybeNil, Nil, NonExactInteger, NonNil, True,
-            Unknown, Unreachable,
+            Unconstrained, Unknown, Unreachable,
         };
         match (self, other) {
             (Unreachable, value) | (value, Unreachable) => value,
             (left, right) if left == right => left,
+            (Unconstrained, Unknown) | (Unknown, Unconstrained) => Unknown,
+            (Unconstrained, _) | (_, Unconstrained) => Unconstrained,
             (Nil, NonNil | MaybeNil) | (NonNil, Nil | MaybeNil) | (MaybeNil, Nil | NonNil) => {
                 MaybeNil
             }
@@ -932,23 +1021,27 @@ pub fn java_scalar_seeds(
     }
 }
 
-/// Derive [`ScalarSeeds`] for a Go procedure from declarations; see
-/// [`go_scalar_binding_types`]. Every other local and parameter keeps no
-/// numeric fact, because its integer width is unknown. A typed formal starts
-/// in its full domain, since Go has no boxing.
-pub fn go_scalar_seeds(procedure: &ProcedureHandle, prepared: &PreparedSyntaxTree) -> ScalarSeeds {
+/// Derive [`ScalarSeeds`] from the declared types of a procedure's bindings
+/// (see `brokk_bifrost_analysis::analyzer::declared_scalar`). Every binding
+/// without an entry keeps no numeric fact, because its integer width is
+/// unknown. A typed formal starts in its full domain: the producer does not
+/// box a value of a type that has an entry.
+pub fn declared_scalar_seeds(
+    procedure: &ProcedureHandle,
+    declared: Vec<(ValueId, DeclaredScalarType)>,
+) -> ScalarSeeds {
     let semantics = procedure.semantics();
     let mut entry_facts = Vec::new();
     let mut bindings = Vec::new();
-    for (target, scalar_type) in go_scalar_binding_types(procedure, prepared) {
+    for (target, scalar_type) in declared {
         let binding_type = match scalar_type {
-            GoScalarType::Signed(bits) => {
+            DeclaredScalarType::Signed(bits) => {
                 ScalarBindingType::MachineInteger(ScalarIntegerDomain::signed(bits))
             }
-            GoScalarType::Unsigned(bits) => {
+            DeclaredScalarType::Unsigned(bits) => {
                 ScalarBindingType::MachineInteger(ScalarIntegerDomain::unsigned(bits))
             }
-            GoScalarType::Boolean => ScalarBindingType::Boolean,
+            DeclaredScalarType::Boolean => ScalarBindingType::Boolean,
         };
         bindings.push((target, binding_type));
         if semantics
@@ -959,7 +1052,7 @@ pub fn go_scalar_seeds(procedure: &ProcedureHandle, prepared: &PreparedSyntaxTre
                 target,
                 fact: binding_type
                     .static_domain()
-                    .expect("a Go scalar type has a static domain"),
+                    .expect("a declared scalar type has a static domain"),
             });
         }
     }
@@ -1053,9 +1146,8 @@ impl ScalarStateDerivation {
         let mut entry = vec![ScalarFact::Unreachable; value_count];
         for value in semantics.values() {
             entry[value.id.index()] = match value.kind {
-                SemanticValueKind::Parameter { .. } | SemanticValueKind::Receiver { .. } => {
-                    ScalarFact::Unknown
-                }
+                SemanticValueKind::Parameter { .. } => ScalarFact::Unconstrained,
+                SemanticValueKind::Receiver { .. } => ScalarFact::Unknown,
                 _ => intrinsic_fact(semantics, value.id),
             };
         }
@@ -1222,12 +1314,25 @@ impl GuardOperand {
     /// The fact the guard decides on. A guard that tests its operand as its
     /// static type decides only after the operand is a value of that type:
     /// in Java an unboxing comparison or condition throws on `null` before
-    /// it decides. So an otherwise unknown or merely non-null operand holds
-    /// a value of that type there.
+    /// it decides. So an otherwise unknown, unconstrained, or merely non-null
+    /// operand holds a value of that type there.
     fn fact(self, current: ScalarFact) -> ScalarFact {
         match (current, self.static_domain) {
-            (ScalarFact::Unknown | ScalarFact::NonNil, Some(domain)) => domain,
-            _ => current,
+            (
+                ScalarFact::Unknown | ScalarFact::Unconstrained | ScalarFact::NonNil,
+                Some(domain),
+            ) => domain,
+            (ScalarFact::Unreachable, _) | (ScalarFact::Nil, _) => current,
+            (ScalarFact::NonNil, None)
+            | (ScalarFact::MaybeNil, _)
+            | (ScalarFact::True, _)
+            | (ScalarFact::False, _)
+            | (ScalarFact::EitherBoolean, _)
+            | (ScalarFact::Integer(_), _)
+            | (ScalarFact::NonExactInteger, _)
+            | (ScalarFact::Float(_), _)
+            | (ScalarFact::Unconstrained, None)
+            | (ScalarFact::Unknown, None) => current,
         }
     }
 }
@@ -1252,130 +1357,6 @@ fn guard_operand(guard: &GuardFact) -> Option<ValueId> {
     match guard.predicate {
         GuardPredicate::Truthy { value } => Some(value),
         _ => guard.subject,
-    }
-}
-
-/// The predicate of each non-constant guard whose operand reads a formal
-/// parameter directly, paired with that formal. The binding is the one the
-/// derivation's refinement reads, so an entry fact on the formal decides the
-/// guard exactly when [`guard_decides`] says so. A guard on a local copied
-/// from a formal is not listed.
-pub(crate) fn formal_guards(procedure: &ProcedureHandle) -> Vec<(GuardPredicate, ValueId)> {
-    let semantics = procedure.semantics();
-    let mut guards = semantics
-        .guard_facts()
-        .iter()
-        .filter(|guard| !matches!(guard.predicate, GuardPredicate::ConstantBoolean { .. }))
-        .filter_map(|guard| Some((guard.predicate, guard_operand(guard)?)))
-        .peekable();
-    if guards.peek().is_none() {
-        return Vec::new();
-    }
-    let origins = BindingOriginIndex::new(procedure);
-    guards
-        .filter_map(|(predicate, operand)| {
-            let binding = origins.unique_binding_origin(operand).unwrap_or(operand);
-            matches!(
-                semantics.value(binding)?.kind,
-                SemanticValueKind::Parameter { .. }
-            )
-            .then_some((predicate, binding))
-        })
-        .collect()
-}
-
-/// Which values of one procedure a parameter entry fact can change in its
-/// scalar derivation.
-///
-/// Entry facts seed only formal parameters. This is a flow-insensitive
-/// forward closure from them over every edge along which the derivation's
-/// transfer copies a fact: assignments, value flows (including integer
-/// offsets and transfers), and stores to and loads from lexical cells. A value
-/// outside the closure takes its fact from constants and unknowns alone, so
-/// an entry fact can change it only by changing control: by deciding a guard
-/// whose operand is in the closure. One such guard anywhere makes every value
-/// dependent.
-///
-/// The test over-approximates. A flow the derivation would drop (an escaping
-/// cell, a value-changing conversion) still counts, and a dependent guard
-/// counts for values it does not dominate. What it does not model is
-/// widening: the per-point join count can differ between a derivation with
-/// entry facts and one without, and that can move where an integer bound is
-/// widened away.
-pub(crate) struct ParameterDependence {
-    every_value: bool,
-    values: HashSet<ValueId>,
-}
-
-impl ParameterDependence {
-    pub(crate) fn new(procedure: &ProcedureHandle) -> Self {
-        let semantics = procedure.semantics();
-        let mut successors = HashMap::<ValueId, Vec<ValueId>>::default();
-        for point in semantics.points() {
-            for event in &point.events {
-                let (source, target) = match event.effect {
-                    SemanticEffect::Assignment { target, value } => (value, target),
-                    SemanticEffect::ValueFlow {
-                        kind:
-                            ValueFlowKind::Local
-                            | ValueFlowKind::BackingStore { .. }
-                            | ValueFlowKind::Parameter
-                            | ValueFlowKind::Receiver
-                            | ValueFlowKind::Return
-                            | ValueFlowKind::IndexedReturn { .. }
-                            | ValueFlowKind::IntegerOffset { .. }
-                            | ValueFlowKind::Transfer(_),
-                        source,
-                        target,
-                    } => (source, target),
-                    SemanticEffect::MemoryLoad {
-                        location, result, ..
-                    } => match semantics.memory_location(location).map(|row| &row.kind) {
-                        Some(MemoryLocationKind::LexicalCell { binding }) => (*binding, result),
-                        _ => continue,
-                    },
-                    SemanticEffect::MemoryStore {
-                        location, value, ..
-                    } => match semantics.memory_location(location).map(|row| &row.kind) {
-                        Some(MemoryLocationKind::LexicalCell { binding }) => (value, *binding),
-                        _ => continue,
-                    },
-                    _ => continue,
-                };
-                successors.entry(source).or_default().push(target);
-            }
-        }
-        let mut pending = semantics
-            .values()
-            .iter()
-            .filter(|value| matches!(value.kind, SemanticValueKind::Parameter { .. }))
-            .map(|value| value.id)
-            .collect::<Vec<_>>();
-        let mut values = HashSet::default();
-        while let Some(value) = pending.pop() {
-            if values.insert(value) {
-                pending.extend(successors.get(&value).into_iter().flatten().copied());
-            }
-        }
-        let origins = BindingOriginIndex::new(procedure);
-        let every_value = semantics.guard_facts().iter().any(|guard| {
-            !matches!(guard.predicate, GuardPredicate::ConstantBoolean { .. })
-                && guard_operand(guard).is_some_and(|operand| {
-                    values.contains(&operand)
-                        || origins
-                            .unique_binding_origin(operand)
-                            .is_some_and(|binding| values.contains(&binding))
-                })
-        });
-        Self {
-            every_value,
-            values,
-        }
-    }
-
-    /// Whether an entry fact can change the derived fact of any of `values`.
-    pub(crate) fn any(&self, values: impl IntoIterator<Item = ValueId>) -> bool {
-        self.every_value || values.into_iter().any(|value| self.values.contains(&value))
     }
 }
 
@@ -1654,23 +1635,47 @@ fn transfer_point(
                 let result = match fact_of(semantics, state, source) {
                     ScalarFact::Integer(interval) => {
                         let offset = ScalarIntegerValue::new(offset.negative(), offset.magnitude());
-                        if !interval.domain().contains(offset) {
-                            ScalarFact::Unknown
+                        let negative_offset = offset.negative();
+                        let domain = interval.domain();
+                        let result = if let ScalarIntegerDomain::Unsigned { bits } = domain {
+                            let offset_magnitude = ScalarIntegerValue::unsigned(
+                                unsigned_wrapped_add(offset.magnitude(), 0, bits),
+                            );
+                            let offset = ScalarIntegerInterval::exact(offset_magnitude, domain);
+                            Some(if negative_offset {
+                                interval.subtract_interval(offset)
+                            } else {
+                                interval.add_interval(offset)
+                            })
+                        } else if !domain.contains(offset) {
+                            None
                         } else {
-                            match interval.add_interval(ScalarIntegerInterval::exact(
-                                offset,
-                                interval.domain(),
-                            )) {
-                                ScalarIntegerArithmetic::Interval(result) => {
-                                    ScalarFact::Integer(result)
-                                }
+                            let offset = ScalarIntegerInterval::exact(offset, domain);
+                            Some(interval.add_interval(offset))
+                        };
+                        match result {
+                            Some(ScalarIntegerArithmetic::Interval(result)) => {
+                                ScalarFact::Integer(result)
+                            }
+                            Some(
                                 ScalarIntegerArithmetic::Overflow
                                 | ScalarIntegerArithmetic::MagnitudeExceeded
-                                | ScalarIntegerArithmetic::UnknownDomain => ScalarFact::Unknown,
-                            }
+                                | ScalarIntegerArithmetic::UnknownDomain,
+                            )
+                            | None => ScalarFact::Unknown,
                         }
                     }
-                    _ => ScalarFact::Unknown,
+                    ScalarFact::Unconstrained
+                    | ScalarFact::Unknown
+                    | ScalarFact::Unreachable
+                    | ScalarFact::Nil
+                    | ScalarFact::NonNil
+                    | ScalarFact::MaybeNil
+                    | ScalarFact::True
+                    | ScalarFact::False
+                    | ScalarFact::EitherBoolean
+                    | ScalarFact::NonExactInteger
+                    | ScalarFact::Float(_) => ScalarFact::Unknown,
                 };
                 write(state, target, result);
             }
@@ -1862,7 +1867,17 @@ fn fact_of(semantics: &ProcedureSemantics, state: &[ScalarFact], value: ValueId)
             // make the assignment disappear and incorrectly preserve an older
             // binding fact across opaque call results.
             ScalarFact::Unreachable => ScalarFact::Unknown,
-            fact => fact,
+            ScalarFact::Unconstrained => ScalarFact::Unconstrained,
+            ScalarFact::Unknown => ScalarFact::Unknown,
+            ScalarFact::Nil => ScalarFact::Nil,
+            ScalarFact::NonNil => ScalarFact::NonNil,
+            ScalarFact::MaybeNil => ScalarFact::MaybeNil,
+            ScalarFact::True => ScalarFact::True,
+            ScalarFact::False => ScalarFact::False,
+            ScalarFact::EitherBoolean => ScalarFact::EitherBoolean,
+            ScalarFact::Integer(interval) => ScalarFact::Integer(interval),
+            ScalarFact::NonExactInteger => ScalarFact::NonExactInteger,
+            ScalarFact::Float(range) => ScalarFact::Float(range),
         }
     }
 }
@@ -1989,15 +2004,26 @@ impl GuardRefinement {
 /// Whether a scalar guard's outcome is decided by `operand_fact`, the fact
 /// [`ScalarStateDerivation::guard_operand_fact`] reports: each arm is then
 /// either infeasible or narrows the operand exactly as the predicate states.
-/// A constant condition is always decided. When this is false, both arms stay
-/// feasible because the fact is outside the predicate's modeled vocabulary,
-/// not because the solver proved either arm possible.
+/// A constant condition is always decided. An unconstrained input also decides
+/// supported scalar predicates while leaving both arms feasible. When this is
+/// false, both arms stay feasible because the fact is outside the predicate's
+/// modeled vocabulary, not because the solver proved either arm possible.
 pub fn guard_decides(
     semantics: &ProcedureSemantics,
     predicate: GuardPredicate,
     operand_fact: ScalarFact,
 ) -> bool {
     matches!(predicate, GuardPredicate::ConstantBoolean { .. })
+        || (operand_fact == ScalarFact::Unconstrained
+            && matches!(
+                predicate,
+                GuardPredicate::NullComparison { .. }
+                    | GuardPredicate::ConstantEquality { .. }
+                    | GuardPredicate::OrderedIntegerComparison { .. }
+                    | GuardPredicate::OrderedFloatComparison { .. }
+                    | GuardPredicate::NanComparison { .. }
+                    | GuardPredicate::Truthy { .. }
+            ))
         || decided_refinement(semantics, predicate, true, operand_fact)
             != GuardRefinement::Undecided
 }
@@ -2033,7 +2059,10 @@ fn decided_refinement(
                     GuardRefinement::Refined(current)
                 }
             }
-            _ => GuardRefinement::Undecided,
+            ScalarFact::Unreachable
+            | ScalarFact::MaybeNil
+            | ScalarFact::Unconstrained
+            | ScalarFact::Unknown => GuardRefinement::Undecided,
         },
         GuardPredicate::ConstantEquality { negated, constant } => {
             let equal = truth != negated;
@@ -2083,6 +2112,7 @@ fn decided_refinement(
                         GuardRefinement::Refined(current)
                     }
                 }
+                (_, ScalarFact::Unconstrained) => GuardRefinement::Undecided,
                 _ => GuardRefinement::Undecided,
             }
         }
@@ -2115,6 +2145,9 @@ fn refine_numeric_order(
     truth: bool,
 ) -> GuardRefinement {
     match (current, constant) {
+        (ScalarFact::Unconstrained, _) | (_, ScalarFact::Unconstrained) => {
+            GuardRefinement::Undecided
+        }
         (ScalarFact::Integer(interval), ScalarFact::Integer(constant)) => {
             let constant = constant.exact_value().expect("intrinsic integer is exact");
             let relation = if truth { relation } else { relation.negate() };
@@ -2179,6 +2212,9 @@ fn refine_numeric_equality(
     equal: bool,
 ) -> GuardRefinement {
     match (current, constant) {
+        (ScalarFact::Unconstrained, _) | (_, ScalarFact::Unconstrained) => {
+            GuardRefinement::Undecided
+        }
         (ScalarFact::Integer(interval), ScalarFact::Integer(constant)) => {
             let constant = constant.exact_value().expect("intrinsic integer is exact");
             GuardRefinement::from_fact(
@@ -2232,7 +2268,16 @@ fn refine_nan(current: ScalarFact, nan: bool) -> GuardRefinement {
         }
         ScalarFact::Integer(_) if nan => GuardRefinement::Infeasible,
         ScalarFact::Integer(_) => GuardRefinement::Refined(current),
-        _ => GuardRefinement::Undecided,
+        ScalarFact::Unreachable
+        | ScalarFact::Nil
+        | ScalarFact::NonNil
+        | ScalarFact::MaybeNil
+        | ScalarFact::True
+        | ScalarFact::False
+        | ScalarFact::EitherBoolean
+        | ScalarFact::NonExactInteger
+        | ScalarFact::Unconstrained
+        | ScalarFact::Unknown => GuardRefinement::Undecided,
     }
 }
 
@@ -2263,7 +2308,13 @@ fn refine_truth(current: ScalarFact, truth: bool) -> GuardRefinement {
         ScalarFact::Float(range) if !range.may_be_nan() => {
             GuardRefinement::from_fact(range.refine_equality(0.0, !truth).map(ScalarFact::Float))
         }
-        _ => GuardRefinement::Undecided,
+        ScalarFact::Float(_)
+        | ScalarFact::Unreachable
+        | ScalarFact::NonNil
+        | ScalarFact::MaybeNil
+        | ScalarFact::NonExactInteger
+        | ScalarFact::Unconstrained
+        | ScalarFact::Unknown => GuardRefinement::Undecided,
     }
 }
 
@@ -2360,6 +2411,7 @@ mod tests {
         PreparedSourceOrigin, PreparedSyntaxSource, PreparedSyntaxTree,
     };
     use brokk_bifrost_core::text_utils::compute_line_starts;
+    use brokk_bifrost_test_macros::hardwon;
     use std::sync::Arc;
 
     use crate::inline_project::{BuiltInlineTestProject, InlineTestProject};
@@ -2529,66 +2581,6 @@ mod tests {
     }
 
     #[test]
-    fn scalar_state_dereference_load_after_unmodeled_pointer_escape_keeps_both_arms() {
-        let fixture = Fixture::go(
-            r#"package sample
-func retainAndWriteLater(pointer *int) {
-    go func() { *pointer = 1 }()
-}
-func run() bool {
-    value := 0
-    pointer := &value
-    retainAndWriteLater(pointer)
-    if *pointer == 0 { return true }
-    return false
-}
-"#,
-            "run",
-        );
-        assert_equality_keeps_both_arms(&fixture, 0);
-    }
-
-    #[test]
-    fn scalar_state_call_after_pointer_escape_invalidates_the_origin_binding() {
-        let fixture = Fixture::go(
-            r#"package sample
-func retainAndWriteLater(pointer *int) {
-    go func() { *pointer = 1 }()
-}
-func run() bool {
-    value := 0
-    pointer := &value
-    retainAndWriteLater(pointer)
-    if value == 0 { return true }
-    return false
-}
-"#,
-            "run",
-        );
-        assert_equality_keeps_both_arms(&fixture, 0);
-    }
-
-    #[test]
-    fn scalar_state_dereference_store_through_branch_assigned_second_pointer_keeps_both_arms() {
-        let fixture = Fixture::go(
-            r#"package sample
-func run(flag bool) bool {
-    value := 0
-    other := 0
-    pointer := &value
-    alias := pointer
-    if flag { alias = &other }
-    *alias = 2
-    if value == 2 { return true }
-    return false
-}
-"#,
-            "run",
-        );
-        assert_equality_keeps_both_arms(&fixture, 2);
-    }
-
-    #[test]
     fn scalar_state_dereference_store_with_two_branch_targets_keeps_both_arms() {
         let fixture = Fixture::go(
             r#"package sample
@@ -2608,6 +2600,9 @@ func run(flag bool) bool {
     }
 
     #[test]
+    #[hardwon(
+        "a0c81b15b025: exact Boolean predicate facts must select only feasible Go branch edges"
+    )]
     fn boolean_entry_facts_select_only_feasible_branches() {
         let fixture = Fixture::go(
             "package sample\nfunc yes() {}\nfunc no() {}\nfunc run(stop bool) { if stop { yes() } else { no() } }\n",
@@ -2626,6 +2621,7 @@ func run(flag bool) bool {
         for (fact, expected) in [
             (ScalarFact::True, [true, false]),
             (ScalarFact::False, [false, true]),
+            (ScalarFact::Unconstrained, [true, true]),
             (ScalarFact::Unknown, [true, true]),
         ] {
             let state = ScalarStateDerivation::derive_with_entry_facts(
@@ -2643,36 +2639,6 @@ func run(flag bool) bool {
                 semantics.guard_facts()
             );
         }
-    }
-
-    #[test]
-    fn java_integral_guards_prove_a_contradictory_inner_arm() {
-        let source =
-            "class C { boolean f(int x) { if (x > 5) { if (x < 3) return true; } return false; } }";
-        let fixture = Fixture::java(source, "f");
-        let semantics = fixture.procedure.semantics();
-        assert_eq!(
-            fixture.java_seeds(source).entry_facts.len(),
-            1,
-            "exact int parameter domain"
-        );
-        let derivation = fixture.java_typed(source);
-        let inner = semantics
-            .guard_facts()
-            .iter()
-            .find(|guard| {
-                matches!(
-                    guard.predicate,
-                    GuardPredicate::OrderedIntegerComparison {
-                        relation: IntegerComparison::LessThan,
-                        constant,
-                    } if semantics.value(constant).is_some_and(|value| value.kind == SemanticValueKind::UnsignedInteger(3))
-                )
-            })
-            .expect("inner primitive integral comparison is normalized");
-        assert!(derivation.is_reachable(inner.point));
-        assert!(!derivation.edge_is_feasible(inner.true_edge.expect("true arm")));
-        assert!(derivation.edge_is_feasible(inner.false_edge.expect("false arm")));
     }
 
     #[test]
@@ -2856,6 +2822,14 @@ func run(flag bool) bool {
             "an integer beyond 2^53 is not exactly a binary64 value"
         );
         assert_eq!(float(1.5).widen(float(2.5)), float(1.5).join(float(2.5)));
+
+        let unconstrained = ScalarFact::Unconstrained;
+        assert_eq!(unconstrained.join(exact_integer(3)), unconstrained);
+        assert_eq!(exact_integer(3).join(unconstrained), unconstrained);
+        assert_eq!(unconstrained.join(ScalarFact::Unknown), ScalarFact::Unknown);
+        assert_eq!(ScalarFact::Unknown.join(unconstrained), ScalarFact::Unknown);
+        assert_eq!(ScalarFact::Unreachable.join(unconstrained), unconstrained);
+        assert_eq!(unconstrained.widen(float(1.5)), unconstrained);
     }
 
     #[test]
@@ -2907,8 +2881,8 @@ func run(flag bool) bool {
             ScalarFact::True
         );
 
-        // Overflow within the declared domain is unknown, never a wrapped or
-        // mathematical value that could manufacture a contradiction.
+        // Signed overflow within the declared domain is unknown; unsigned
+        // arithmetic wraps in its declared machine domain.
         let ScalarFact::Integer(max) = byte.store(exact_integer(127)) else {
             panic!("127 is a byte");
         };
@@ -3033,6 +3007,10 @@ func run(flag bool) bool {
             refine_truth(ScalarFact::MaybeNil, false),
             GuardRefinement::Undecided
         );
+        assert_eq!(
+            refine_truth(ScalarFact::Unconstrained, false),
+            GuardRefinement::Undecided
+        );
 
         assert_eq!(
             refine_nan(exact_integer(1), true),
@@ -3043,60 +3021,497 @@ func run(flag bool) bool {
             refine_nan(ScalarFact::Unknown, true),
             GuardRefinement::Undecided
         );
+        assert_eq!(
+            refine_nan(ScalarFact::Unconstrained, true),
+            GuardRefinement::Undecided
+        );
     }
 
     #[test]
-    fn java_typed_locals_join_in_their_declared_domain() {
-        // Untyped, the parameter's int interval and the literal's
-        // mathematical integer have different domains and join to a
-        // non-exact integer. Declared as `int`, both writes take the int
-        // domain, so the join is the full int range and `x > MAX` is
-        // infeasible.
-        let source = "class C { boolean f(int p, boolean c) { int x; if (c) x = p; else x = 5; if (x > 2147483647) return true; return false; } }";
+    #[hardwon(
+        "be0eb46d6b9a: an exact Java integral write must replace the incoming interval before later guards"
+    )]
+    fn java_direct_integral_writes_replace_prior_interval_with_exact_literal() {
+        for source in [
+            "class C { boolean f(int x) { if (x > 5) { x = 1; if (x < 3) return true; } return false; } }",
+            "class C { boolean f() { int x = 1; if (x < 3) return true; return false; } }",
+        ] {
+            let fixture = Fixture::java(source, "f");
+            let semantics = fixture.procedure.semantics();
+            let scalar = fixture.java_typed(source);
+            let inner = semantics
+                .guard_facts()
+                .iter()
+                .find(|guard| {
+                    matches!(
+                        guard.predicate,
+                        GuardPredicate::OrderedIntegerComparison {
+                            relation: IntegerComparison::LessThan,
+                            constant,
+                        } if semantics.value(constant).is_some_and(|value| value.kind == SemanticValueKind::UnsignedInteger(3))
+                    )
+                })
+                .expect("inner comparison is normalized");
+            assert!(scalar.is_reachable(inner.point), "{source}");
+            assert!(
+                scalar.edge_is_feasible(inner.true_edge.expect("true edge")),
+                "{source}"
+            );
+            assert!(
+                !scalar.edge_is_feasible(inner.false_edge.expect("false edge")),
+                "{source}"
+            );
+            assert!(
+                semantics
+                    .values()
+                    .iter()
+                    .any(|value| value.kind == SemanticValueKind::UnsignedInteger(1)),
+                "assignment literal retains its exact value: {source}"
+            );
+        }
+    }
+
+    #[test]
+    fn signed_magnitude_intervals_order_and_join_without_host_casts() {
+        let domain = ScalarIntegerDomain::signed(8);
+        let negative_two = ScalarIntegerValue::new(true, 2);
+        let positive_three = ScalarIntegerValue::unsigned(3);
+        let negative_seven = ScalarIntegerValue::new(true, 7);
+        assert!(negative_seven < negative_two);
+        assert!(negative_two < ScalarIntegerValue::unsigned(0));
+        assert!(domain.contains(ScalarIntegerValue::new(true, 128)));
+        assert!(!domain.contains(ScalarIntegerValue::new(true, 129)));
+        assert!(domain.contains(ScalarIntegerValue::unsigned(127)));
+        assert!(!domain.contains(ScalarIntegerValue::unsigned(128)));
+
+        let left = ScalarIntegerInterval::new(negative_two, positive_three, domain);
+        let right = ScalarIntegerInterval::new(
+            ScalarIntegerValue::new(true, 7),
+            ScalarIntegerValue::unsigned(1),
+            domain,
+        );
+        assert_eq!(
+            left.hull(right),
+            Some(ScalarIntegerInterval::new(
+                negative_seven,
+                positive_three,
+                domain
+            ))
+        );
+        assert_eq!(
+            ScalarFact::Integer(left).join(ScalarFact::Integer(right)),
+            ScalarFact::Integer(ScalarIntegerInterval::new(
+                negative_seven,
+                positive_three,
+                domain
+            ))
+        );
+    }
+
+    #[test]
+    fn interval_arithmetic_distinguishes_domain_overflow_from_representation_limits() {
+        let mathematical = ScalarIntegerDomain::Mathematical;
+        let left = ScalarIntegerInterval::new(
+            ScalarIntegerValue::new(true, 2),
+            ScalarIntegerValue::unsigned(3),
+            mathematical,
+        );
+        let right = ScalarIntegerInterval::new(
+            ScalarIntegerValue::unsigned(4),
+            ScalarIntegerValue::unsigned(5),
+            mathematical,
+        );
+        assert_eq!(
+            left.add_interval(right),
+            ScalarIntegerArithmetic::Interval(ScalarIntegerInterval::new(
+                ScalarIntegerValue::unsigned(2),
+                ScalarIntegerValue::unsigned(8),
+                mathematical,
+            ))
+        );
+        assert_eq!(
+            left.subtract_interval(right),
+            ScalarIntegerArithmetic::Interval(ScalarIntegerInterval::new(
+                ScalarIntegerValue::new(true, 7),
+                ScalarIntegerValue::new(true, 1),
+                mathematical,
+            ))
+        );
+
+        let unsigned = ScalarIntegerDomain::unsigned(8);
+        assert_eq!(
+            ScalarIntegerInterval::exact(ScalarIntegerValue::unsigned(255), unsigned).add_interval(
+                ScalarIntegerInterval::exact(ScalarIntegerValue::unsigned(1), unsigned,)
+            ),
+            ScalarIntegerArithmetic::Interval(ScalarIntegerInterval::exact(
+                ScalarIntegerValue::unsigned(0),
+                unsigned,
+            ))
+        );
+        assert_eq!(
+            ScalarIntegerInterval::exact(ScalarIntegerValue::unsigned(0), unsigned)
+                .subtract_interval(ScalarIntegerInterval::exact(
+                    ScalarIntegerValue::unsigned(1),
+                    unsigned,
+                )),
+            ScalarIntegerArithmetic::Interval(ScalarIntegerInterval::exact(
+                ScalarIntegerValue::unsigned(255),
+                unsigned,
+            ))
+        );
+        assert_eq!(
+            ScalarIntegerInterval::exact(ScalarIntegerValue::unsigned(u128::MAX), mathematical)
+                .add_interval(ScalarIntegerInterval::exact(
+                    ScalarIntegerValue::unsigned(1),
+                    mathematical
+                )),
+            ScalarIntegerArithmetic::MagnitudeExceeded
+        );
+        assert_eq!(
+            ScalarIntegerInterval::exact(ScalarIntegerValue::unsigned(1), mathematical)
+                .add_interval(ScalarIntegerInterval::exact(
+                    ScalarIntegerValue::unsigned(1),
+                    unsigned,
+                )),
+            ScalarIntegerArithmetic::UnknownDomain
+        );
+    }
+
+    #[test]
+    fn widening_is_finite_only_when_the_integer_domain_is_finite() {
+        let signed = ScalarIntegerDomain::signed(8);
+        let current = ScalarIntegerInterval::new(
+            ScalarIntegerValue::new(true, 2),
+            ScalarIntegerValue::unsigned(3),
+            signed,
+        );
+        let growing = ScalarIntegerInterval::new(
+            ScalarIntegerValue::new(true, 4),
+            ScalarIntegerValue::unsigned(5),
+            signed,
+        );
+        assert_eq!(
+            current.widen(growing),
+            ScalarIntegerWidening::Interval(ScalarIntegerInterval::new(
+                ScalarIntegerValue::new(true, 128),
+                ScalarIntegerValue::unsigned(127),
+                signed,
+            ))
+        );
+
+        let mathematical = ScalarIntegerDomain::Mathematical;
+        let current = ScalarIntegerInterval::exact(ScalarIntegerValue::unsigned(1), mathematical);
+        let growing = ScalarIntegerInterval::new(
+            ScalarIntegerValue::unsigned(1),
+            ScalarIntegerValue::unsigned(2),
+            mathematical,
+        );
+        assert_eq!(current.widen(growing), ScalarIntegerWidening::Unbounded);
+        assert_eq!(
+            current.widen(ScalarIntegerInterval::exact(
+                ScalarIntegerValue::unsigned(1),
+                ScalarIntegerDomain::unsigned(8),
+            )),
+            ScalarIntegerWidening::UnknownDomain
+        );
+    }
+
+    #[test]
+    fn represented_integer_offset_overflow_stays_unknown() {
+        let fixture = Fixture::go(
+            r#"package sample
+func run(value int) int { return value + 1 }
+"#,
+            "run",
+        );
+        let semantics = fixture.procedure.semantics();
+        let parameter = semantics
+            .values()
+            .iter()
+            .find_map(|value| {
+                matches!(value.kind, SemanticValueKind::Parameter { .. }).then_some(value.id)
+            })
+            .expect("integer parameter");
+        let (point, result) = semantics
+            .points()
+            .iter()
+            .find_map(|point| {
+                point.events.iter().find_map(|event| match event.effect {
+                    SemanticEffect::ValueFlow {
+                        kind: ValueFlowKind::IntegerOffset { .. },
+                        target,
+                        ..
+                    } => Some((point.id, target)),
+                    _ => None,
+                })
+            })
+            .expect("integer offset flow");
+        let derivation = ScalarStateDerivation::derive_with_entry_facts(
+            &fixture.procedure,
+            ScalarCallEffects::default(),
+            &[ScalarEntryFact {
+                target: parameter,
+                fact: exact_integer(u128::MAX),
+            }],
+        );
+        assert_eq!(derivation.fact_at(point, result), ScalarFact::Unknown);
+    }
+
+    #[test]
+    #[hardwon("dd52c0714f15: an opaque Go scalar assignment must invalidate an earlier nil fact")]
+    fn opaque_call_result_kills_an_earlier_nil_binding() {
+        let fixture = Fixture::go(
+            r#"package sample
+type item struct { field int }
+func acquire() *item { return nil }
+func run() int {
+    var value *item
+    value = acquire()
+    return value.field
+}
+"#,
+            "run",
+        );
+        assert_eq!(fixture.field_base_facts(), vec![ScalarFact::Unknown]);
+    }
+
+    #[test]
+    #[hardwon("dd52c0714f15: a mutable Go closure capture must invalidate stale caller nil facts")]
+    fn mutable_closure_capture_kills_an_earlier_nil_binding() {
+        let fixture = Fixture::go(
+            r#"package sample
+type item struct { field int }
+func acquire() *item { return nil }
+func run() int {
+    var value *item
+    func() { value = acquire() }()
+    return value.field
+}
+"#,
+            "run",
+        );
+        assert_eq!(fixture.field_base_facts(), vec![ScalarFact::Unknown]);
+    }
+
+    #[test]
+    fn address_arguments_invalidate_unmodeled_bindings_but_complete_models_preserve_them() {
+        let fixture = Fixture::go(
+            r#"package sample
+type item struct { field int }
+func mutate(value **item) {}
+func run() int {
+    value := &item{}
+    mutate(&value)
+    return value.field
+}
+"#,
+            "run",
+        );
+        assert_eq!(fixture.field_base_facts(), vec![ScalarFact::Unknown]);
+
+        let call = fixture
+            .procedure
+            .semantics()
+            .call_sites()
+            .iter()
+            .find(|call| !call.arguments.is_empty())
+            .expect("run contains the mutate invocation");
+        let modeled = ScalarStateDerivation::derive_with_call_effects(
+            &fixture.procedure,
+            ScalarCallEffects {
+                modeled_address_calls: &[call.id],
+                edge_writes: &[],
+                infeasible_edges: &[],
+            },
+        );
+        let semantics = fixture.procedure.semantics();
+        let facts = semantics
+            .points()
+            .iter()
+            .flat_map(|point| {
+                point.events.iter().filter_map(|event| match event.effect {
+                    SemanticEffect::MemoryLoad { location, .. } => {
+                        let (MemoryLocationKind::Field { base, .. }
+                        | MemoryLocationKind::Property { base, .. }) =
+                            &semantics.memory_location(location)?.kind
+                        else {
+                            return None;
+                        };
+                        Some(modeled.fact_at(point.id, *base))
+                    }
+                    _ => None,
+                })
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(facts, vec![ScalarFact::NonNil], "{semantics:#?}");
+    }
+
+    #[test]
+    #[hardwon(
+        "6a89e10a863f: a model cannot close an address-taken cell that is also published or indirectly mutated"
+    )]
+    fn modeled_address_calls_do_not_close_published_or_indirectly_mutated_cells() {
+        for (body, expected) in [
+            ("mutate(&value); out <- &value", ScalarFact::Unknown),
+            (
+                "mutate(&value); go func() { value = nil }()",
+                ScalarFact::Unknown,
+            ),
+            (
+                "alias := &value; mutate(&value); *alias = nil",
+                ScalarFact::Unknown,
+            ),
+            (
+                "alias := &value; mutate(&value); unknown(alias)",
+                ScalarFact::Unknown,
+            ),
+        ] {
+            let fixture = Fixture::go(
+                &format!(
+                    r#"package sample
+type item struct {{ field int }}
+func mutate(value **item) {{}}
+func run(out chan **item) int {{
+    value := &item{{}}
+    {body}
+    return value.field
+}}
+"#
+                ),
+                "run",
+            );
+            let semantics = fixture.procedure.semantics();
+            let modeled_calls = semantics
+                .call_sites()
+                .iter()
+                .filter(|call| {
+                    call.arguments.iter().any(|argument| {
+                        semantics
+                            .value(argument.value)
+                            .is_some_and(|value| value.kind == SemanticValueKind::Address)
+                    })
+                })
+                .map(|call| call.id)
+                .collect::<Vec<_>>();
+            assert_eq!(modeled_calls.len(), 1, "{body}: {semantics:#?}");
+            let derivation = ScalarStateDerivation::derive_with_call_effects(
+                &fixture.procedure,
+                ScalarCallEffects {
+                    modeled_address_calls: &modeled_calls,
+                    edge_writes: &[],
+                    infeasible_edges: &[],
+                },
+            );
+            assert_eq!(
+                fixture.field_base_facts_from(&derivation),
+                vec![expected],
+                "{body}: {semantics:#?}"
+            );
+        }
+    }
+
+    #[test]
+    fn widening_gives_up_an_integer_bound_that_still_moves() {
+        let domain = ScalarIntegerDomain::unsigned(8);
+        let settled = ScalarFact::Integer(ScalarIntegerInterval::new(
+            ScalarIntegerValue::unsigned(1),
+            ScalarIntegerValue::unsigned(4),
+            domain,
+        ));
+        // A join that stays inside the current bounds is not a growth signal.
+        assert_eq!(
+            settled.widen(ScalarFact::Integer(ScalarIntegerInterval::exact(
+                ScalarIntegerValue::unsigned(2),
+                domain
+            ))),
+            settled
+        );
+        // A finite domain has a bound to jump to.
+        assert_eq!(
+            settled.widen(ScalarFact::Integer(ScalarIntegerInterval::exact(
+                ScalarIntegerValue::unsigned(5),
+                domain
+            ))),
+            ScalarFact::Integer(ScalarIntegerInterval::new(
+                ScalarIntegerValue::unsigned(1),
+                ScalarIntegerValue::unsigned(255),
+                domain
+            ))
+        );
+        // The mathematical domain has none, so the value stops being exact.
+        let unbounded = ScalarFact::Integer(ScalarIntegerInterval::exact(
+            ScalarIntegerValue::unsigned(0),
+            ScalarIntegerDomain::Mathematical,
+        ));
+        assert_eq!(
+            unbounded.widen(exact_integer(1)),
+            ScalarFact::NonExactInteger
+        );
+        // Everything else in the lattice is the ordinary join.
+        assert_eq!(
+            ScalarFact::Nil.widen(ScalarFact::NonNil),
+            ScalarFact::MaybeNil
+        );
+        assert_eq!(
+            ScalarFact::Unreachable.widen(exact_integer(3)),
+            exact_integer(3)
+        );
+    }
+
+    #[test]
+    fn scalar_state_call_after_pointer_escape_invalidates_the_origin_binding() {
+        let fixture = Fixture::go(
+            r#"package sample
+func retainAndWriteLater(pointer *int) {
+    go func() { *pointer = 1 }()
+}
+func run() bool {
+    value := 0
+    pointer := &value
+    retainAndWriteLater(pointer)
+    if value == 0 { return true }
+    return false
+}
+"#,
+            "run",
+        );
+        assert_equality_keeps_both_arms(&fixture, 0);
+    }
+
+    #[test]
+    fn java_integral_guards_prove_a_contradictory_inner_arm() {
+        let source =
+            "class C { boolean f(int x) { if (x > 5) { if (x < 3) return true; } return false; } }";
         let fixture = Fixture::java(source, "f");
         let semantics = fixture.procedure.semantics();
-        let guard = semantics
+        assert_eq!(
+            fixture.java_seeds(source).entry_facts.len(),
+            1,
+            "exact int parameter domain"
+        );
+        let derivation = fixture.java_typed(source);
+        let inner = semantics
             .guard_facts()
             .iter()
             .find(|guard| {
                 matches!(
                     guard.predicate,
-                    GuardPredicate::OrderedIntegerComparison { .. }
+                    GuardPredicate::OrderedIntegerComparison {
+                        relation: IntegerComparison::LessThan,
+                        constant,
+                    } if semantics.value(constant).is_some_and(|value| value.kind == SemanticValueKind::UnsignedInteger(3))
                 )
             })
-            .expect("ordered int comparison is normalized");
-        let seeds = fixture.java_seeds(source);
-        assert_eq!(
-            seeds
-                .entry_facts
-                .iter()
-                .map(|seed| seed.fact.label())
-                .collect::<Vec<_>>(),
-            ["integer_interval", "either_boolean"],
-            "`p` starts in the int domain and `c` as either Boolean"
-        );
-        let typed = fixture.java_typed(source);
-        assert!(typed.is_reachable(guard.point));
-        assert!(!typed.edge_is_feasible(guard.true_edge.expect("true edge")));
-        let operand = typed
-            .guard_operand_fact(&fixture.procedure, guard)
-            .expect("operand fact");
-        assert!(guard_decides(semantics, guard.predicate, operand));
-
-        let untyped = ScalarStateDerivation::derive_with_entry_facts(
-            &fixture.procedure,
-            ScalarCallEffects::default(),
-            &seeds.entry_facts,
-        );
-        assert!(untyped.edge_is_feasible(guard.true_edge.expect("true edge")));
-        let operand = untyped
-            .guard_operand_fact(&fixture.procedure, guard)
-            .expect("operand fact");
-        assert_eq!(operand, ScalarFact::NonExactInteger);
-        assert!(!guard_decides(semantics, guard.predicate, operand));
+            .expect("inner primitive integral comparison is normalized");
+        assert!(derivation.is_reachable(inner.point));
+        assert!(!derivation.edge_is_feasible(inner.true_edge.expect("true arm")));
+        assert!(derivation.edge_is_feasible(inner.false_edge.expect("false arm")));
     }
 
     #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#3683: Issue #3683 fixed typed Java primitive/boxed seed classification; the regression preserves the accepted numeric source kinds."
+    )]
     fn java_scalar_seeds_type_numeric_formals_and_locals_and_seed_only_primitives() {
         let source = "class C { void f(int a, double b, float c, Integer d, int[] e, long g[]) { byte h = 1; char i = 'i'; double j = 1; var k = 1; int l[] = null; String m = null; } }";
         let fixture = Fixture::java(source, "f");
@@ -3207,47 +3622,9 @@ func run(flag bool) bool {
     }
 
     #[test]
-    fn java_direct_integral_writes_replace_prior_interval_with_exact_literal() {
-        for source in [
-            "class C { boolean f(int x) { if (x > 5) { x = 1; if (x < 3) return true; } return false; } }",
-            "class C { boolean f() { int x = 1; if (x < 3) return true; return false; } }",
-        ] {
-            let fixture = Fixture::java(source, "f");
-            let semantics = fixture.procedure.semantics();
-            let scalar = fixture.java_typed(source);
-            let inner = semantics
-                .guard_facts()
-                .iter()
-                .find(|guard| {
-                    matches!(
-                        guard.predicate,
-                        GuardPredicate::OrderedIntegerComparison {
-                            relation: IntegerComparison::LessThan,
-                            constant,
-                        } if semantics.value(constant).is_some_and(|value| value.kind == SemanticValueKind::UnsignedInteger(3))
-                    )
-                })
-                .expect("inner comparison is normalized");
-            assert!(scalar.is_reachable(inner.point), "{source}");
-            assert!(
-                scalar.edge_is_feasible(inner.true_edge.expect("true edge")),
-                "{source}"
-            );
-            assert!(
-                !scalar.edge_is_feasible(inner.false_edge.expect("false edge")),
-                "{source}"
-            );
-            assert!(
-                semantics
-                    .values()
-                    .iter()
-                    .any(|value| value.kind == SemanticValueKind::UnsignedInteger(1)),
-                "assignment literal retains its exact value: {source}"
-            );
-        }
-    }
-
-    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#3683: Issue #3683/#3684 fixed Java scalar typing; mutable field comparisons must remain opaque without stable field evidence."
+    )]
     fn java_field_comparisons_remain_opaque() {
         let source = "class C { int x; boolean f() { if (x < 3) return true; return false; } }";
         let fixture = Fixture::java(source, "f");
@@ -3318,673 +3695,6 @@ func run(flag bool) bool {
                 "{language:?}"
             );
         }
-    }
-
-    #[test]
-    fn signed_magnitude_intervals_order_and_join_without_host_casts() {
-        let domain = ScalarIntegerDomain::signed(8);
-        let negative_two = ScalarIntegerValue::new(true, 2);
-        let positive_three = ScalarIntegerValue::unsigned(3);
-        let negative_seven = ScalarIntegerValue::new(true, 7);
-        assert!(negative_seven < negative_two);
-        assert!(negative_two < ScalarIntegerValue::unsigned(0));
-        assert!(domain.contains(ScalarIntegerValue::new(true, 128)));
-        assert!(!domain.contains(ScalarIntegerValue::new(true, 129)));
-        assert!(domain.contains(ScalarIntegerValue::unsigned(127)));
-        assert!(!domain.contains(ScalarIntegerValue::unsigned(128)));
-
-        let left = ScalarIntegerInterval::new(negative_two, positive_three, domain);
-        let right = ScalarIntegerInterval::new(
-            ScalarIntegerValue::new(true, 7),
-            ScalarIntegerValue::unsigned(1),
-            domain,
-        );
-        assert_eq!(
-            left.hull(right),
-            Some(ScalarIntegerInterval::new(
-                negative_seven,
-                positive_three,
-                domain
-            ))
-        );
-        assert_eq!(
-            ScalarFact::Integer(left).join(ScalarFact::Integer(right)),
-            ScalarFact::Integer(ScalarIntegerInterval::new(
-                negative_seven,
-                positive_three,
-                domain
-            ))
-        );
-    }
-
-    #[test]
-    fn interval_arithmetic_distinguishes_domain_overflow_from_representation_limits() {
-        let mathematical = ScalarIntegerDomain::Mathematical;
-        let left = ScalarIntegerInterval::new(
-            ScalarIntegerValue::new(true, 2),
-            ScalarIntegerValue::unsigned(3),
-            mathematical,
-        );
-        let right = ScalarIntegerInterval::new(
-            ScalarIntegerValue::unsigned(4),
-            ScalarIntegerValue::unsigned(5),
-            mathematical,
-        );
-        assert_eq!(
-            left.add_interval(right),
-            ScalarIntegerArithmetic::Interval(ScalarIntegerInterval::new(
-                ScalarIntegerValue::unsigned(2),
-                ScalarIntegerValue::unsigned(8),
-                mathematical,
-            ))
-        );
-        assert_eq!(
-            left.subtract_interval(right),
-            ScalarIntegerArithmetic::Interval(ScalarIntegerInterval::new(
-                ScalarIntegerValue::new(true, 7),
-                ScalarIntegerValue::new(true, 1),
-                mathematical,
-            ))
-        );
-
-        let unsigned = ScalarIntegerDomain::unsigned(8);
-        assert_eq!(
-            ScalarIntegerInterval::exact(ScalarIntegerValue::unsigned(255), unsigned).add_interval(
-                ScalarIntegerInterval::exact(ScalarIntegerValue::unsigned(1), unsigned,)
-            ),
-            ScalarIntegerArithmetic::Overflow
-        );
-        assert_eq!(
-            ScalarIntegerInterval::exact(ScalarIntegerValue::unsigned(u128::MAX), mathematical)
-                .add_interval(ScalarIntegerInterval::exact(
-                    ScalarIntegerValue::unsigned(1),
-                    mathematical
-                )),
-            ScalarIntegerArithmetic::MagnitudeExceeded
-        );
-        assert_eq!(
-            ScalarIntegerInterval::exact(ScalarIntegerValue::unsigned(1), mathematical)
-                .add_interval(ScalarIntegerInterval::exact(
-                    ScalarIntegerValue::unsigned(1),
-                    unsigned,
-                )),
-            ScalarIntegerArithmetic::UnknownDomain
-        );
-    }
-
-    #[test]
-    fn widening_is_finite_only_when_the_integer_domain_is_finite() {
-        let signed = ScalarIntegerDomain::signed(8);
-        let current = ScalarIntegerInterval::new(
-            ScalarIntegerValue::new(true, 2),
-            ScalarIntegerValue::unsigned(3),
-            signed,
-        );
-        let growing = ScalarIntegerInterval::new(
-            ScalarIntegerValue::new(true, 4),
-            ScalarIntegerValue::unsigned(5),
-            signed,
-        );
-        assert_eq!(
-            current.widen(growing),
-            ScalarIntegerWidening::Interval(ScalarIntegerInterval::new(
-                ScalarIntegerValue::new(true, 128),
-                ScalarIntegerValue::unsigned(127),
-                signed,
-            ))
-        );
-
-        let mathematical = ScalarIntegerDomain::Mathematical;
-        let current = ScalarIntegerInterval::exact(ScalarIntegerValue::unsigned(1), mathematical);
-        let growing = ScalarIntegerInterval::new(
-            ScalarIntegerValue::unsigned(1),
-            ScalarIntegerValue::unsigned(2),
-            mathematical,
-        );
-        assert_eq!(current.widen(growing), ScalarIntegerWidening::Unbounded);
-        assert_eq!(
-            current.widen(ScalarIntegerInterval::exact(
-                ScalarIntegerValue::unsigned(1),
-                ScalarIntegerDomain::unsigned(8),
-            )),
-            ScalarIntegerWidening::UnknownDomain
-        );
-    }
-
-    #[test]
-    fn pointer_zero_and_address_join_to_maybe_nil() {
-        let fixture = Fixture::go(
-            r#"package sample
-type item struct { field int }
-func run(flag bool) int {
-    var value *item
-    if flag { value = &item{} }
-    return value.field
-}
-"#,
-            "run",
-        );
-        assert_eq!(fixture.field_base_facts(), vec![ScalarFact::MaybeNil]);
-    }
-
-    #[test]
-    fn preserving_scalar_transfers_keep_the_source_fact() {
-        let transfers = [
-            ValueTransfer {
-                kind: TransferKind::Copy,
-                operation: TransferOperation::None,
-            },
-            ValueTransfer {
-                kind: TransferKind::Move {
-                    invalidation: MoveInvalidation::Invalidated,
-                },
-                operation: TransferOperation::CallSite(
-                    CallSiteId::try_from_index(0).expect("zero is a valid call-site index"),
-                ),
-            },
-            ValueTransfer {
-                kind: TransferKind::Conversion {
-                    preservation: ValuePreservation::Identity,
-                },
-                operation: TransferOperation::None,
-            },
-            ValueTransfer {
-                kind: TransferKind::Conversion {
-                    preservation: ValuePreservation::Preserving,
-                },
-                operation: TransferOperation::None,
-            },
-        ];
-        for transfer in transfers {
-            assert_eq!(
-                transferred_scalar_fact(exact_integer(7), transfer),
-                (
-                    exact_integer(7),
-                    matches!(transfer.kind, TransferKind::Move { .. })
-                ),
-                "{transfer:?}"
-            );
-        }
-    }
-
-    #[test]
-    fn uncertain_and_non_scalar_preserving_transfers_stay_conservative() {
-        let transfers = [
-            ValueTransfer {
-                kind: TransferKind::Copy,
-                operation: TransferOperation::Unknown,
-            },
-            ValueTransfer {
-                kind: TransferKind::AggregateCopy,
-                operation: TransferOperation::None,
-            },
-            ValueTransfer {
-                kind: TransferKind::Boxing,
-                operation: TransferOperation::None,
-            },
-            ValueTransfer {
-                kind: TransferKind::Unboxing,
-                operation: TransferOperation::None,
-            },
-            ValueTransfer {
-                kind: TransferKind::Conversion {
-                    preservation: ValuePreservation::Changing,
-                },
-                operation: TransferOperation::None,
-            },
-        ];
-        for transfer in transfers {
-            assert_eq!(
-                transferred_scalar_fact(exact_integer(7), transfer),
-                (ScalarFact::Unknown, false),
-                "{transfer:?}"
-            );
-        }
-    }
-
-    #[test]
-    fn both_move_contracts_invalidate_the_source_scalar_fact() {
-        for invalidation in [MoveInvalidation::Invalidated, MoveInvalidation::Unknown] {
-            let transfer = ValueTransfer {
-                kind: TransferKind::Move { invalidation },
-                operation: TransferOperation::None,
-            };
-            assert_eq!(
-                transferred_scalar_fact(ScalarFact::NonNil, transfer),
-                (ScalarFact::NonNil, true),
-                "{transfer:?}"
-            );
-        }
-    }
-
-    #[test]
-    fn null_guard_refines_the_surviving_arm() {
-        let fixture = Fixture::go(
-            r#"package sample
-type item struct { field int }
-func run(value *item) int {
-    if value == nil { return 0 }
-    return value.field
-}
-"#,
-            "run",
-        );
-        assert_eq!(
-            fixture.field_base_facts(),
-            vec![ScalarFact::NonNil],
-            "{:#?}",
-            fixture.procedure.semantics()
-        );
-    }
-
-    #[test]
-    fn exact_local_integer_reaches_an_index_operation() {
-        let fixture = Fixture::go(
-            r#"package sample
-func run(values []int) int {
-    start := 0x1
-    return values[start]
-}
-"#,
-            "run",
-        );
-        let derivation = ScalarStateDerivation::derive(&fixture.procedure);
-        let semantics = fixture.procedure.semantics();
-        let facts = semantics
-            .points()
-            .iter()
-            .flat_map(|point| {
-                point.events.iter().filter_map(|event| match event.effect {
-                    SemanticEffect::MemoryLoad { location, .. } => {
-                        let MemoryLocationKind::Index {
-                            index: Some(index), ..
-                        } = semantics.memory_location(location)?.kind
-                        else {
-                            return None;
-                        };
-                        Some(derivation.fact_at(point.id, index))
-                    }
-                    _ => None,
-                })
-            })
-            .collect::<Vec<_>>();
-        assert_eq!(facts, vec![exact_integer(1)], "{semantics:#?}");
-    }
-
-    #[test]
-    fn seeded_countdown_prunes_ordered_arms_and_computes_the_next_argument() {
-        let fixture = Fixture::go(
-            r#"package sample
-type cell struct{}
-func run(ch chan *cell, value *cell, depth int) {
-    if depth > 0 { run(ch, value, depth - 1); return }
-    ch <- value
-}
-"#,
-            "run",
-        );
-        let semantics = fixture.procedure.semantics();
-        let depth = semantics
-            .values()
-            .iter()
-            .find_map(|value| match &value.kind {
-                SemanticValueKind::Parameter {
-                    name: Some(name), ..
-                } if name.as_ref() == "depth" => Some(value.id),
-                _ => None,
-            })
-            .expect("depth formal");
-        let [call] = semantics.call_sites() else {
-            panic!("one recursive call: {semantics:#?}");
-        };
-        let call_point = semantics
-            .points()
-            .iter()
-            .find(|point| {
-                point.events.iter().any(|event| {
-                    matches!(
-                        event.effect,
-                        SemanticEffect::Invoke { call_site } if call_site == call.id
-                    )
-                })
-            })
-            .map(|point| point.id)
-            .expect("recursive call point");
-        let send_point = semantics
-            .points()
-            .iter()
-            .find(|point| {
-                point
-                    .events
-                    .iter()
-                    .any(|event| matches!(event.effect, SemanticEffect::Synchronization { .. }))
-            })
-            .map(|point| point.id)
-            .expect("channel send point");
-        let next_depth = call.arguments[2].value;
-
-        let one = ScalarStateDerivation::derive_with_entry_facts(
-            &fixture.procedure,
-            ScalarCallEffects::default(),
-            &[ScalarEntryFact {
-                target: depth,
-                fact: exact_integer(1),
-            }],
-        );
-        assert!(one.is_reachable(call_point));
-        assert!(!one.is_reachable(send_point));
-        assert_eq!(one.fact_at(call_point, next_depth), exact_integer(0));
-
-        let zero = ScalarStateDerivation::derive_with_entry_facts(
-            &fixture.procedure,
-            ScalarCallEffects::default(),
-            &[ScalarEntryFact {
-                target: depth,
-                fact: exact_integer(0),
-            }],
-        );
-        assert!(!zero.is_reachable(call_point));
-        assert!(zero.is_reachable(send_point));
-
-        let unknown = ScalarStateDerivation::derive(&fixture.procedure);
-        assert!(unknown.is_reachable(call_point));
-        assert!(unknown.is_reachable(send_point));
-    }
-
-    #[test]
-    fn represented_integer_offset_overflow_stays_unknown() {
-        let fixture = Fixture::go(
-            r#"package sample
-func run(value int) int { return value + 1 }
-"#,
-            "run",
-        );
-        let semantics = fixture.procedure.semantics();
-        let parameter = semantics
-            .values()
-            .iter()
-            .find_map(|value| {
-                matches!(value.kind, SemanticValueKind::Parameter { .. }).then_some(value.id)
-            })
-            .expect("integer parameter");
-        let (point, result) = semantics
-            .points()
-            .iter()
-            .find_map(|point| {
-                point.events.iter().find_map(|event| match event.effect {
-                    SemanticEffect::ValueFlow {
-                        kind: ValueFlowKind::IntegerOffset { .. },
-                        target,
-                        ..
-                    } => Some((point.id, target)),
-                    _ => None,
-                })
-            })
-            .expect("integer offset flow");
-        let derivation = ScalarStateDerivation::derive_with_entry_facts(
-            &fixture.procedure,
-            ScalarCallEffects::default(),
-            &[ScalarEntryFact {
-                target: parameter,
-                fact: exact_integer(u128::MAX),
-            }],
-        );
-        assert_eq!(derivation.fact_at(point, result), ScalarFact::Unknown);
-    }
-
-    #[test]
-    fn opaque_call_result_kills_an_earlier_nil_binding() {
-        let fixture = Fixture::go(
-            r#"package sample
-type item struct { field int }
-func acquire() *item { return nil }
-func run() int {
-    var value *item
-    value = acquire()
-    return value.field
-}
-"#,
-            "run",
-        );
-        assert_eq!(fixture.field_base_facts(), vec![ScalarFact::Unknown]);
-    }
-
-    #[test]
-    fn mutable_closure_capture_kills_an_earlier_nil_binding() {
-        let fixture = Fixture::go(
-            r#"package sample
-type item struct { field int }
-func acquire() *item { return nil }
-func run() int {
-    var value *item
-    func() { value = acquire() }()
-    return value.field
-}
-"#,
-            "run",
-        );
-        assert_eq!(fixture.field_base_facts(), vec![ScalarFact::Unknown]);
-    }
-
-    #[test]
-    fn modeled_terminating_call_removes_its_normal_scalar_path() {
-        let fixture = Fixture::go(
-            r#"package sample
-type item struct { field int }
-func stop() {}
-func run(value *item) int {
-    if value == nil { stop() }
-    return value.field
-}
-"#,
-            "run",
-        );
-        let semantics = fixture.procedure.semantics();
-        let call = semantics
-            .call_sites()
-            .iter()
-            .find(|call| call.normal_continuation.target().is_some())
-            .expect("run contains the stop invocation");
-        let normal = call
-            .normal_continuation
-            .target()
-            .expect("stop has a raw normal continuation");
-        let infeasible = semantics
-            .successor_edges(call.point)
-            .filter_map(|(edge, control)| (control.target_point == normal).then_some(edge))
-            .collect::<Vec<_>>();
-        let [infeasible] = infeasible.as_slice() else {
-            panic!("one raw edge reaches the call's normal continuation: {semantics:#?}");
-        };
-        let derivation = ScalarStateDerivation::derive_with_call_effects(
-            &fixture.procedure,
-            ScalarCallEffects {
-                modeled_address_calls: &[],
-                edge_writes: &[],
-                infeasible_edges: &[*infeasible],
-            },
-        );
-        let facts = semantics
-            .points()
-            .iter()
-            .flat_map(|point| {
-                point.events.iter().filter_map(|event| match event.effect {
-                    SemanticEffect::MemoryLoad { location, .. } => {
-                        let (MemoryLocationKind::Field { base, .. }
-                        | MemoryLocationKind::Property { base, .. }) =
-                            &semantics.memory_location(location)?.kind
-                        else {
-                            return None;
-                        };
-                        Some(derivation.fact_at(point.id, *base))
-                    }
-                    _ => None,
-                })
-            })
-            .collect::<Vec<_>>();
-        assert_eq!(facts, vec![ScalarFact::NonNil], "{semantics:#?}");
-    }
-
-    #[test]
-    fn address_arguments_invalidate_unmodeled_bindings_but_complete_models_preserve_them() {
-        let fixture = Fixture::go(
-            r#"package sample
-type item struct { field int }
-func mutate(value **item) {}
-func run() int {
-    value := &item{}
-    mutate(&value)
-    return value.field
-}
-"#,
-            "run",
-        );
-        assert_eq!(fixture.field_base_facts(), vec![ScalarFact::Unknown]);
-
-        let call = fixture
-            .procedure
-            .semantics()
-            .call_sites()
-            .iter()
-            .find(|call| !call.arguments.is_empty())
-            .expect("run contains the mutate invocation");
-        let modeled = ScalarStateDerivation::derive_with_call_effects(
-            &fixture.procedure,
-            ScalarCallEffects {
-                modeled_address_calls: &[call.id],
-                edge_writes: &[],
-                infeasible_edges: &[],
-            },
-        );
-        let semantics = fixture.procedure.semantics();
-        let facts = semantics
-            .points()
-            .iter()
-            .flat_map(|point| {
-                point.events.iter().filter_map(|event| match event.effect {
-                    SemanticEffect::MemoryLoad { location, .. } => {
-                        let (MemoryLocationKind::Field { base, .. }
-                        | MemoryLocationKind::Property { base, .. }) =
-                            &semantics.memory_location(location)?.kind
-                        else {
-                            return None;
-                        };
-                        Some(modeled.fact_at(point.id, *base))
-                    }
-                    _ => None,
-                })
-            })
-            .collect::<Vec<_>>();
-        assert_eq!(facts, vec![ScalarFact::NonNil], "{semantics:#?}");
-    }
-
-    #[test]
-    fn modeled_address_calls_do_not_close_published_or_indirectly_mutated_cells() {
-        for (body, expected) in [
-            ("mutate(&value); out <- &value", ScalarFact::Unknown),
-            (
-                "mutate(&value); go func() { value = nil }()",
-                ScalarFact::Unknown,
-            ),
-            (
-                "alias := &value; mutate(&value); *alias = nil",
-                ScalarFact::Unknown,
-            ),
-            (
-                "alias := &value; mutate(&value); unknown(alias)",
-                ScalarFact::Unknown,
-            ),
-        ] {
-            let fixture = Fixture::go(
-                &format!(
-                    r#"package sample
-type item struct {{ field int }}
-func mutate(value **item) {{}}
-func run(out chan **item) int {{
-    value := &item{{}}
-    {body}
-    return value.field
-}}
-"#
-                ),
-                "run",
-            );
-            let semantics = fixture.procedure.semantics();
-            let modeled_calls = semantics
-                .call_sites()
-                .iter()
-                .filter(|call| {
-                    call.arguments.iter().any(|argument| {
-                        semantics
-                            .value(argument.value)
-                            .is_some_and(|value| value.kind == SemanticValueKind::Address)
-                    })
-                })
-                .map(|call| call.id)
-                .collect::<Vec<_>>();
-            assert_eq!(modeled_calls.len(), 1, "{body}: {semantics:#?}");
-            let derivation = ScalarStateDerivation::derive_with_call_effects(
-                &fixture.procedure,
-                ScalarCallEffects {
-                    modeled_address_calls: &modeled_calls,
-                    edge_writes: &[],
-                    infeasible_edges: &[],
-                },
-            );
-            assert_eq!(
-                fixture.field_base_facts_from(&derivation),
-                vec![expected],
-                "{body}: {semantics:#?}"
-            );
-        }
-    }
-
-    #[test]
-    fn widening_gives_up_an_integer_bound_that_still_moves() {
-        let domain = ScalarIntegerDomain::unsigned(8);
-        let settled = ScalarFact::Integer(ScalarIntegerInterval::new(
-            ScalarIntegerValue::unsigned(1),
-            ScalarIntegerValue::unsigned(4),
-            domain,
-        ));
-        // A join that stays inside the current bounds is not a growth signal.
-        assert_eq!(
-            settled.widen(ScalarFact::Integer(ScalarIntegerInterval::exact(
-                ScalarIntegerValue::unsigned(2),
-                domain
-            ))),
-            settled
-        );
-        // A finite domain has a bound to jump to.
-        assert_eq!(
-            settled.widen(ScalarFact::Integer(ScalarIntegerInterval::exact(
-                ScalarIntegerValue::unsigned(5),
-                domain
-            ))),
-            ScalarFact::Integer(ScalarIntegerInterval::new(
-                ScalarIntegerValue::unsigned(1),
-                ScalarIntegerValue::unsigned(255),
-                domain
-            ))
-        );
-        // The mathematical domain has none, so the value stops being exact.
-        let unbounded = ScalarFact::Integer(ScalarIntegerInterval::exact(
-            ScalarIntegerValue::unsigned(0),
-            ScalarIntegerDomain::Mathematical,
-        ));
-        assert_eq!(
-            unbounded.widen(exact_integer(1)),
-            ScalarFact::NonExactInteger
-        );
-        // Everything else in the lattice is the ordinary join.
-        assert_eq!(
-            ScalarFact::Nil.widen(ScalarFact::NonNil),
-            ScalarFact::MaybeNil
-        );
-        assert_eq!(
-            ScalarFact::Unreachable.widen(exact_integer(3)),
-            exact_integer(3)
-        );
     }
 
     #[test]

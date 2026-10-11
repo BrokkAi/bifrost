@@ -1,4 +1,4 @@
-use crate::mcp_common::{McpRenderOptions, run_stdio_server, tool_descriptor};
+use crate::mcp_common::{McpRenderOptions, run_named_stdio_server, tool_descriptor};
 use crate::rql::{
     ALL_KINDS, ALL_OWNER_RELATIONS, ALL_SITE_CLASSES, DEFAULT_LIMIT, MAX_BINDING_NAME_LENGTH,
     MAX_CAPTURE_LENGTH, MAX_GLOB_LENGTH, MAX_KWARG_NAME_LENGTH, MAX_KWARGS, MAX_LANGUAGE_FILTERS,
@@ -6,10 +6,13 @@ use crate::rql::{
     MAX_ROLE_LIST_ENTRIES, MAX_STRING_PREDICATE_LENGTH, MAX_WHERE_GLOBS, SCHEMA_VERSION,
 };
 use brokk_bifrost_rql::schema::{
-    ALL_CODE_QUERY_EXECUTION_MODES, ALL_QUERY_STEP_OPS, ALL_REFERENCE_KINDS, ALL_USAGE_KINDS,
-    QueryField, QueryStepField, control_relation_filter_labels, environment_filter_labels,
-    flow_state_filter_labels, occurrence_filter_labels, reference_kind_label,
-    rewrite_path_filter_labels, supported_query_schema_versions,
+    ALL_CODE_QUERY_EXECUTION_MODES, ALL_CONFIGURATION_FACTS_FILTER_FIELDS,
+    ALL_CROSS_DOMAIN_RELATION_FIELDS, ALL_QUERY_PLAN_SOURCES, ALL_QUERY_STEP_OPS,
+    ALL_REFERENCE_KINDS, ALL_USAGE_KINDS, ConfigurationFactsFilterField, ExportFilterField,
+    GenerationSiteFilterField, QueryField, QueryStepField, control_relation_filter_labels,
+    environment_filter_labels, export_form_labels, flow_state_filter_labels,
+    generation_input_labels, generation_kind_labels, occurrence_filter_labels,
+    reference_kind_label, rewrite_path_filter_labels, supported_query_schema_versions,
 };
 use serde_json::{Value, json};
 use std::path::PathBuf;
@@ -79,8 +82,7 @@ pub fn run_extended_stdio_server(
     root: PathBuf,
     render_options: McpRenderOptions,
 ) -> Result<(), String> {
-    let spec = crate::mcp_registry::resolve_server_spec("extended")?;
-    run_stdio_server(Some(root), render_options, &spec, None)
+    run_named_stdio_server(root, render_options, "extended")
 }
 
 fn query_step_input_variants() -> Vec<Value> {
@@ -632,10 +634,7 @@ fn binding_hoisting_array() -> Value {
 }
 
 fn candidate_tier_array() -> Value {
-    constrained_label_array(
-        environment_filter_labels(QueryStepField::CandidateTiers),
-        QueryStepField::CandidateTiers.description(),
-    )
+    candidate_filter_array(QueryStepField::CandidateTiers)
 }
 
 fn candidate_outcome_array() -> Value {
@@ -646,10 +645,11 @@ fn candidate_outcome_array() -> Value {
 }
 
 fn candidate_boundary_array() -> Value {
-    constrained_label_array(
-        environment_filter_labels(QueryStepField::CandidateBoundaries),
-        QueryStepField::CandidateBoundaries.description(),
-    )
+    candidate_filter_array(QueryStepField::CandidateBoundaries)
+}
+
+fn candidate_filter_array(field: QueryStepField) -> Value {
+    constrained_label_array(environment_filter_labels(field), field.description())
 }
 
 /// One explanation adapter's supported analysis families, as prose.
@@ -865,6 +865,12 @@ fn query_plan_properties(
         "scopes": scope_seed_filter_schema(),
         "bindings": binding_seed_filter_schema(),
         "paths": path_seed_filter_schema(),
+        "dependency_evidence": dependency_evidence_filter_schema(),
+        "generation_sites": generation_site_filter_schema(),
+        "exports": export_filter_schema(),
+        "configuration_facts": configuration_facts_filter_schema(),
+        "correlate": correlate_filter_schema(),
+        "require_both": require_both_filter_schema(),
         "steps": {
             "type": "array",
             "maxItems": MAX_QUERY_STEPS,
@@ -877,31 +883,160 @@ fn query_plan_properties(
     .clone()
 }
 
+/// The `generation_sites` seed's filter object.
+fn generation_site_filter_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "kind": constrained_label_array(generation_kind_labels(), GenerationSiteFilterField::Kinds.description()),
+            "input": constrained_label_array(generation_input_labels(), GenerationSiteFilterField::Inputs.description())
+        },
+        "additionalProperties": false,
+        "description": QueryField::GenerationSites.description()
+    })
+}
+
+/// The `exports` seed's filter object.
+fn export_filter_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "form": constrained_label_array(export_form_labels(), ExportFilterField::Forms.description()),
+            "name": {
+                "type": "array",
+                "minItems": 1,
+                "uniqueItems": true,
+                "items": { "type": "string", "minLength": 1, "maxLength": MAX_BINDING_NAME_LENGTH },
+                "description": ExportFilterField::Names.description()
+            }
+        },
+        "additionalProperties": false,
+        "description": QueryField::Exports.description()
+    })
+}
+
+/// The `configuration_facts` seed's filter object. Numeric bounds, ordinals,
+/// and routes keep their JSON shapes; the label axes are string arrays that the
+/// engine validates against the configuration vocabulary.
+fn configuration_facts_filter_schema() -> Value {
+    let properties = ALL_CONFIGURATION_FACTS_FILTER_FIELDS
+        .iter()
+        .map(|field| {
+            (
+                field.label().to_owned(),
+                configuration_facts_axis_schema(*field),
+            )
+        })
+        .collect::<serde_json::Map<String, Value>>();
+    json!({
+        "type": "object",
+        "properties": properties,
+        "additionalProperties": false,
+        "description": QueryField::ConfigurationFacts.description()
+    })
+}
+
+fn configuration_facts_axis_schema(field: ConfigurationFactsFilterField) -> Value {
+    let description = field.description();
+    match field {
+        ConfigurationFactsFilterField::ValueLt
+        | ConfigurationFactsFilterField::ValueLe
+        | ConfigurationFactsFilterField::ValueGt
+        | ConfigurationFactsFilterField::ValueGe => {
+            json!({ "type": "number", "description": description })
+        }
+        ConfigurationFactsFilterField::XmlPeerMinSharedChildren => {
+            json!({ "type": "integer", "minimum": 0, "description": description })
+        }
+        ConfigurationFactsFilterField::FactOrdinals => json!({
+            "type": "array",
+            "items": { "type": "integer", "minimum": 0 },
+            "description": description
+        }),
+        ConfigurationFactsFilterField::Routes => {
+            json!({ "type": "array", "description": description })
+        }
+        _ => json!({
+            "type": "array",
+            "items": { "type": "string" },
+            "description": description
+        }),
+    }
+}
+
+/// The `correlate` seed's input object: one registered relation over a code
+/// query and a configuration query.
+fn correlate_filter_schema() -> Value {
+    let relation_labels = ALL_CROSS_DOMAIN_RELATION_FIELDS
+        .iter()
+        .map(|relation| relation.label())
+        .collect::<Vec<_>>();
+    json!({
+        "type": "object",
+        "properties": {
+            "relation": {
+                "type": "object",
+                "minProperties": 1,
+                "maxProperties": 1,
+                "propertyNames": { "enum": relation_labels },
+                "description": "Exactly one registered relation, keyed by its label."
+            },
+            "code": { "$ref": "#/$defs/queryPlan" },
+            "configuration": { "$ref": "#/$defs/queryPlan" }
+        },
+        "required": ["relation", "code", "configuration"],
+        "additionalProperties": false,
+        "description": QueryField::Correlate.description()
+    })
+}
+
+/// The `require_both` seed's input object: a code query and a configuration
+/// query that must both produce rows, without relating them.
+fn require_both_filter_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "code": { "$ref": "#/$defs/queryPlan" },
+            "configuration": { "$ref": "#/$defs/queryPlan" }
+        },
+        "required": ["code", "configuration"],
+        "additionalProperties": false,
+        "description": QueryField::RequireBoth.description()
+    })
+}
+
+fn dependency_evidence_filter_schema() -> Value {
+    let properties=brokk_bifrost_rql::schema::ALL_DEPENDENCY_EVIDENCE_FILTER_FIELDS.iter().map(|field| {
+        (field.label().to_owned(),json!({"type":"array","maxItems":128,"items":{"type":"string","minLength":1},"description":field.description()}))
+    }).collect::<serde_json::Map<String,Value>>();
+    json!({"type":"object","properties":properties,"additionalProperties":false,"description":brokk_bifrost_rql::schema::QueryField::DependencyEvidence.description()})
+}
+
 fn query_plan_source_variants() -> Vec<Value> {
     let seed_scope_fields = ["inside", "inside_decl", "not_inside", "where", "languages"];
-    let sources = [
-        "match",
-        "occurrences",
-        "scopes",
-        "bindings",
-        "paths",
-        "union",
-        "intersect",
-        "except",
-    ];
+    let sources = ALL_QUERY_PLAN_SOURCES
+        .iter()
+        .map(|source| source.label())
+        .collect::<Vec<_>>();
     sources
-        .into_iter()
+        .iter()
         .map(|source| {
             let mut excluded = sources
-                .into_iter()
+                .iter()
                 .filter(|candidate| *candidate != source)
+                .copied()
                 .collect::<Vec<_>>();
             // `where` and `languages` scope an occurrence seed exactly as they
             // scope a structural one; only the pattern-containment fields are
-            // structural-seed-only.
-            match source {
+            // structural-seed-only. The configuration seed has no language axis,
+            // and dependency evidence has an ecosystem axis instead.
+            match *source {
                 "match" => {}
-                "occurrences" | "scopes" | "bindings" | "paths" => {
+                "dependency_evidence" | "configuration_facts" => {
+                    excluded.extend(["inside", "inside_decl", "not_inside", "languages"])
+                }
+                "occurrences" | "scopes" | "bindings" | "paths" | "generation_sites"
+                | "exports" | "correlate" | "require_both" => {
                     excluded.extend(["inside", "inside_decl", "not_inside"]);
                 }
                 _ => excluded.extend(seed_scope_fields),
@@ -1117,7 +1252,7 @@ pub(crate) fn extended_tool_descriptors() -> Vec<Value> {
                         "type": "string",
                         "minLength": 1,
                         "maxLength": crate::policy::MAX_POLICY_SUPPRESSION_PATH_BYTES,
-                        "description": "Optional workspace-relative suppression JSON path. Defaults to .bifrost/suppressions.json."
+                        "description": "Optional workspace-relative suppression JSON path. When set, it replaces the default files. By default Bifrost reads .bifrost/suppressions.json, .bifrost/suppressions.private.json, and .bifrost/suppressions.local.json, in that order."
                     },
                     "scope_file": {
                         "type": "string",
@@ -1147,6 +1282,11 @@ pub(crate) fn extended_tool_descriptors() -> Vec<Value> {
                         "minLength": 1,
                         "maxLength": MAX_RUN_POLICY_DIFF_BASE_BYTES,
                         "description": "Optional git revision to diff against: the same policies also evaluate that commit's content, each finding is classified new or persisting, and only new findings gate. Any revision git rev-parse accepts."
+                    },
+                    "diff_scoped": {
+                        "type": "boolean",
+                        "default": false,
+                        "description": "When true, with diff_base, the taint composition binds sinks only in the files the diff base changed, and reports only findings whose sink lies in them. The run carries a scope record that names the examined files; an empty result is then no claim about sinks outside them. Other policies and the ICFG taint engine still run over the whole workspace and say so in their scope record. Requires diff_base and incremental true."
                     },
                     "incremental": {
                         "type": "boolean",
@@ -1178,7 +1318,10 @@ pub(crate) fn extended_tool_descriptors() -> Vec<Value> {
                 "Explain one policy's verdict against the active immutable workspace snapshot. \
                  Pass `finding_id` to ask why a retained finding exists, `candidate` to ask why \
                  one explicit source position produced none, or `near_misses` to ask which \
-                 subjects came closest. The first two return a bounded, deterministic {} \
+                 subjects came closest. For a flow or taint policy a candidate is a pair: \
+                 `candidate` is the observation (sink) position and `candidate_source` the \
+                 origin (source) position, and the answer runs the production solver over only \
+                 the analysis regions that bind both. The first two return a bounded, deterministic {} \
                  document: a node tree whose every node carries an outcome of satisfied, failed, \
                  or unknown, where unknown means the analyzer could not decide and is never \
                  evidence of absence. `near_misses` returns the sibling {} document: subjects \
@@ -1187,8 +1330,8 @@ pub(crate) fn extended_tool_descriptors() -> Vec<Value> {
                  same rule that unknown is never evidence of absence and never counts as \
                  distance. This is a query about a policy, not a gate: it returns no status and \
                  no exit code. The selection must resolve to exactly one policy. `finding_id` is \
-                 answered for {} policies, and `candidate` and `near_misses` for {} policies; any \
-                 other family reports an explicit adapter-unavailable condition. Candidates are \
+                 answered for {} policies, `candidate` for {} policies, and `near_misses` for {} \
+                 policies; any other family reports an explicit adapter-unavailable condition. Candidates are \
                  never scanned for by default: supply the position you want explained, supply the \
                  list you want ranked, or ask `near_misses.enumerate_from_policy_seed` for a \
                  separately budgeted search that the policy's own seed scope bounds. Every answer \
@@ -1199,6 +1342,7 @@ pub(crate) fn extended_tool_descriptors() -> Vec<Value> {
                 brokk_bifrost_policy::POLICY_NEAR_MISS_FORMAT,
                 analysis_type_list(brokk_bifrost_policy::WHY_ADAPTER_ANALYSIS_TYPES),
                 analysis_type_list(brokk_bifrost_policy::WHY_NOT_ADAPTER_ANALYSIS_TYPES),
+                analysis_type_list(brokk_bifrost_policy::NEAR_MISS_ADAPTER_ANALYSIS_TYPES),
             ),
             json!({
                 "type": "object",
@@ -1260,7 +1404,10 @@ pub(crate) fn extended_tool_descriptors() -> Vec<Value> {
                         "description": "Ask why: the stable identity of a finding the policy's own run retains, as run_policy reports it."
                     },
                     "candidate": explain_policy_candidate_schema(
-                        "Ask why-not: one explicit source position the policy did not report."
+                        "Ask why-not: one explicit source position the policy did not report. For a flow or taint policy this is the observation (sink) position."
+                    ),
+                    "candidate_source": explain_policy_candidate_schema(
+                        "With `candidate`, for a flow or taint policy only: the origin (source) position the tracked value enters at. Required for those families and refused for the others."
                     ),
                     "workspace_generation": {
                         "type": "string",
@@ -1307,9 +1454,9 @@ pub(crate) fn extended_tool_descriptors() -> Vec<Value> {
                     }
                 },
                 "oneOf": [
-                    { "required": ["finding_id"], "not": { "anyOf": [{ "required": ["candidate"] }, { "required": ["near_misses"] }] } },
+                    { "required": ["finding_id"], "not": { "anyOf": [{ "required": ["candidate"] }, { "required": ["candidate_source"] }, { "required": ["near_misses"] }] } },
                     { "required": ["candidate"], "not": { "anyOf": [{ "required": ["finding_id"] }, { "required": ["near_misses"] }] } },
-                    { "required": ["near_misses"], "not": { "anyOf": [{ "required": ["finding_id"] }, { "required": ["candidate"] }] } }
+                    { "required": ["near_misses"], "not": { "anyOf": [{ "required": ["finding_id"] }, { "required": ["candidate"] }, { "required": ["candidate_source"] }] } }
                 ],
                 "anyOf": [
                     { "required": ["policy_files"] },
@@ -1374,33 +1521,42 @@ pub(crate) fn extended_tool_descriptors() -> Vec<Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use brokk_bifrost_test_macros::hardwon;
     use std::collections::HashSet;
 
     #[test]
-    fn steps_parameter_schema_documents_every_registry_step() {
+    #[hardwon(
+        "#3839: the query_code schema omitted generation_sites, exports, configuration_facts, correlate, and require_both"
+    )]
+    fn query_code_schema_names_every_plan_source() {
         let query_code = extended_tool_descriptors()
             .into_iter()
             .find(|descriptor| descriptor["name"] == "query_code")
             .expect("query_code descriptor");
-        let steps_description = query_code["inputSchema"]["properties"]["steps"]["description"]
-            .as_str()
-            .expect("steps parameter description")
-            .to_string();
-        assert!(steps_description.starts_with(QUERY_STEPS_DESCRIPTION_PREFACE));
-        // The reference is what an MCP client reads instead of the tool
-        // description, so every step the build accepts has to be in it with
-        // the signature and meaning the registry states.
-        for op in ALL_QUERY_STEP_OPS {
-            let line = format!("{} ({}): {}", op.label(), op.signature(), op.description());
+        let properties = &query_code["inputSchema"]["properties"];
+        let variants = query_code["inputSchema"]["$defs"]["queryPlan"]["oneOf"]
+            .as_array()
+            .expect("query plan source variants");
+        assert_eq!(variants.len(), ALL_QUERY_PLAN_SOURCES.len());
+        for source in ALL_QUERY_PLAN_SOURCES {
+            let label = source.label();
             assert!(
-                steps_description.lines().any(|rendered| rendered == line),
-                "steps parameter schema is missing step `{}`",
-                op.label()
+                properties.get(label).is_some(),
+                "query_code has no property for source {label}"
+            );
+            assert!(
+                variants
+                    .iter()
+                    .any(|variant| variant["required"] == json!([label])),
+                "query plan has no oneOf variant for source {label}"
             );
         }
     }
 
     #[test]
+    #[hardwon(
+        "63f9a52c1f86: query_code advertised a schema version default a JSON client could not submit"
+    )]
     fn tool_schema_enums_are_strings_and_query_version_default_decodes() {
         for descriptor in extended_tool_descriptors() {
             let mut pending = vec![&descriptor["inputSchema"]];
@@ -1429,6 +1585,67 @@ mod tests {
                     version["default"]
                 );
             }
+        }
+    }
+
+    #[test]
+    #[hardwon(
+        "#1575: test-file classification was hidden behind a filter and ordinary tests leaked into results"
+    )]
+    fn most_relevant_files_schema_exposes_ranking_modes() {
+        let descriptor = extended_tool_descriptors()
+            .into_iter()
+            .find(|descriptor| descriptor["name"] == "most_relevant_files")
+            .expect("most_relevant_files descriptor");
+        let mode = &descriptor["inputSchema"]["properties"]["ranking_mode"];
+        assert_eq!(
+            mode["enum"],
+            json!([
+                "cascade",
+                "history_imports",
+                "usage_graph",
+                "usage_graph_exact"
+            ])
+        );
+        assert_eq!(mode["default"], "cascade");
+        // #1575: the boolean test filter is gone; each result carries its own
+        // classification and the caller applies the policy.
+        assert!(
+            descriptor["inputSchema"]["properties"]
+                .get("include_tests")
+                .is_none(),
+            "{descriptor:#}"
+        );
+        assert!(
+            descriptor["description"]
+                .as_str()
+                .expect("description")
+                .contains("test_support"),
+            "{descriptor:#}"
+        );
+    }
+
+    #[test]
+    fn steps_parameter_schema_documents_every_registry_step() {
+        let query_code = extended_tool_descriptors()
+            .into_iter()
+            .find(|descriptor| descriptor["name"] == "query_code")
+            .expect("query_code descriptor");
+        let steps_description = query_code["inputSchema"]["properties"]["steps"]["description"]
+            .as_str()
+            .expect("steps parameter description")
+            .to_string();
+        assert!(steps_description.starts_with(QUERY_STEPS_DESCRIPTION_PREFACE));
+        // The reference is what an MCP client reads instead of the tool
+        // description, so every step the build accepts has to be in it with
+        // the signature and meaning the registry states.
+        for op in ALL_QUERY_STEP_OPS {
+            let line = format!("{} ({}): {}", op.label(), op.signature(), op.description());
+            assert!(
+                steps_description.lines().any(|rendered| rendered == line),
+                "steps parameter schema is missing step `{}`",
+                op.label()
+            );
         }
     }
 
@@ -1789,6 +2006,7 @@ mod tests {
             "inside_decl",
             "not_inside",
             "occurrences",
+            "dependency_evidence",
             "where",
             "languages",
             "union",
@@ -1828,24 +2046,12 @@ mod tests {
                 .collect::<std::collections::BTreeSet<_>>();
             assert_eq!(
                 excluded,
-                [
-                    "match",
-                    "occurrences",
-                    "scopes",
-                    "bindings",
-                    "paths",
-                    "union",
-                    "intersect",
-                    "except",
-                    "inside",
-                    "inside_decl",
-                    "languages",
-                    "not_inside",
-                    "where",
-                ]
-                .into_iter()
-                .filter(|field| *field != op)
-                .collect()
+                ALL_QUERY_PLAN_SOURCES
+                    .iter()
+                    .map(|source| source.label())
+                    .chain(["inside", "inside_decl", "languages", "not_inside", "where",])
+                    .filter(|field| *field != op)
+                    .collect()
             );
         }
         let query_file_variant = &query_code["inputSchema"]["oneOf"][1];
@@ -1865,43 +2071,6 @@ mod tests {
         assert_eq!(excluded, inline_properties);
     }
 
-    #[test]
-    fn most_relevant_files_schema_exposes_ranking_modes() {
-        let descriptor = extended_tool_descriptors()
-            .into_iter()
-            .find(|descriptor| descriptor["name"] == "most_relevant_files")
-            .expect("most_relevant_files descriptor");
-        let mode = &descriptor["inputSchema"]["properties"]["ranking_mode"];
-        assert_eq!(
-            mode["enum"],
-            json!([
-                "cascade",
-                "history_imports",
-                "usage_graph",
-                "usage_graph_exact"
-            ])
-        );
-        assert_eq!(mode["default"], "cascade");
-        // #1575: the boolean test filter is gone; each result carries its own
-        // classification and the caller applies the policy.
-        assert!(
-            descriptor["inputSchema"]["properties"]
-                .get("include_tests")
-                .is_none(),
-            "{descriptor:#}"
-        );
-        assert!(
-            descriptor["description"]
-                .as_str()
-                .expect("description")
-                .contains("test_support"),
-            "{descriptor:#}"
-        );
-    }
-
-    /// Issue 2439 slice 3: the explanation surface is a separate tool, not a
-    /// `run_policy` mode, and its input schema is bounded and mutually
-    /// exclusive by construction.
     #[test]
     fn explain_policy_schema_is_bounded_to_one_policy_and_one_question() {
         let descriptor = extended_tool_descriptors()
@@ -1937,14 +2106,19 @@ mod tests {
             "at least one selector is required"
         );
 
-        // One question: the three targets exclude each other pairwise.
+        // One question: the three targets exclude each other pairwise, and a
+        // flow candidate's source position belongs to the candidate question.
         assert_eq!(
             schema["oneOf"],
             json!([
-                { "required": ["finding_id"], "not": { "anyOf": [{ "required": ["candidate"] }, { "required": ["near_misses"] }] } },
+                { "required": ["finding_id"], "not": { "anyOf": [{ "required": ["candidate"] }, { "required": ["candidate_source"] }, { "required": ["near_misses"] }] } },
                 { "required": ["candidate"], "not": { "anyOf": [{ "required": ["finding_id"] }, { "required": ["near_misses"] }] } },
-                { "required": ["near_misses"], "not": { "anyOf": [{ "required": ["finding_id"] }, { "required": ["candidate"] }] } }
+                { "required": ["near_misses"], "not": { "anyOf": [{ "required": ["finding_id"] }, { "required": ["candidate"] }, { "required": ["candidate_source"] }] } }
             ])
+        );
+        assert_eq!(
+            schema["properties"]["candidate_source"]["required"],
+            json!(["path", "byte_start"])
         );
         let finding_id = &schema["properties"]["finding_id"];
         assert_eq!(finding_id["pattern"], "^[0-9a-f]{64}$");

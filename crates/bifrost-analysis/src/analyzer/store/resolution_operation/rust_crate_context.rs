@@ -6,6 +6,9 @@ use rusqlite::params;
 use rusqlite::params_from_iter;
 use rusqlite::types::Value;
 
+pub(super) const GENERATED_ITEM_SURFACE_REASON: &str = "GeneratedItemSurface";
+pub(super) const UNLOWERED_EXPORT_REASON: &str = "UnloweredExportedDeclaration";
+
 pub(in crate::analyzer::store) const SELECTED_MODULE_PLACEMENTS_SCHEMA_SQL: &str =
     include_str!("rust_selected_module_placements.sql");
 
@@ -19,7 +22,8 @@ pub(super) const MACRO_IMPORT_TARGET_RANGE: &str = "SELECT
  json_extract(spans, '$[' || ?2 || '][0]'),
  json_extract(spans, '$[' || ?2 || '][1]')
  FROM source_occurrence_arenas WHERE blob_id = ?1";
-pub(super) const CFG: &str = "SELECT json(cfg_atoms) FROM selected_rust_crates WHERE crate_key=?1";
+pub(super) const CFG: &str =
+    "SELECT json(cfg_atoms),target_kind FROM selected_rust_crates WHERE crate_key=?1";
 pub(super) const CRATE: &str = "SELECT topology_id FROM selected_rust_crates WHERE crate_key = ?1";
 pub(super) const CRATE_KEYS: &str = "SELECT crate_key FROM selected_rust_crates ORDER BY crate_key";
 pub(super) const CRATE_MEMBER_FILES: &str =
@@ -84,16 +88,29 @@ pub(super) const ROOT_REEXPORT: &str = concat!(
     include_str!("rust_crate_point_targets.sql"),
     "SELECT DISTINCT topology_id FROM targets WHERE module_path='crate' AND name='self'"
 );
-/// The crate roots a bare route prefix that bound nothing lexically names in
-/// `module`: a dependency's extern name, or a name this module binds to a
-/// crate's root (`use dep as alias;`, `use dep::{self as alias};`,
-/// `pub use dep;`), each as that crate's `crate` module. The point route
+/// The module containers reached by the same point-route walk used for an
+/// imported name, including named re-exports through the requesting crate.
+const MODULE_PREFIX_ROUTE: &str = concat!(
+    include_str!("rust_crate_point_targets.sql"),
+    "SELECT DISTINCT targets.topology_id,",
+    " CASE WHEN targets.name='self' THEN targets.module_path",
+    " ELSE targets.module_path || '::' || targets.name END AS container_path",
+    " FROM targets",
+    " CROSS JOIN rust_crate_containers AS container ON container.topology_id=targets.topology_id",
+    " AND container.kind='module'",
+    " AND container.container_path=CASE WHEN targets.name='self' THEN targets.module_path",
+    " ELSE targets.module_path || '::' || targets.name END"
+);
+/// The module starts available for a type-namespace prefix: a dependency's
+/// extern name, a crate-root reexport, or a named import that resolves to a
+/// module container. Callers first check that a local type does not shadow it. The point route
 /// (`rust_demand/rows.rs`) and the graph route below both start a prefix's
 /// module walk here, so the two cannot drift.
-pub(super) fn crate_root_prefix_starts(
+pub(super) fn route_prefix_module_starts(
     conn: &rusqlite::Connection,
     module: &Module,
     name: &str,
+    binder_scope: u32,
 ) -> Result<Vec<(i64, String)>> {
     let mut starts = Vec::new();
     for row in conn
@@ -115,40 +132,434 @@ pub(super) fn crate_root_prefix_starts(
     )? {
         starts.push((row?, "crate".to_owned()));
     }
+    for row in conn.prepare_cached(MODULE_PREFIX_ROUTE)?.query_map(
+        params![
+            module.topology,
+            module.path,
+            "type",
+            name,
+            module.topology,
+            module.path
+        ],
+        |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
+    )? {
+        starts.push(row?);
+    }
+    let mut import_scopes = vec![binder_scope, module.scope.get()];
+    import_scopes.sort_unstable();
+    import_scopes.dedup();
+    for import_scope in import_scopes {
+        let bindings = conn
+            .prepare_cached(IMPORT_MODULE_PREFIX_STARTS)?
+            .query_map(
+                params![
+                    module.topology,
+                    module.path,
+                    module.blob,
+                    import_scope,
+                    name,
+                    "type",
+                    module.selected_blob
+                ],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
+                },
+            )?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        for (topology, target_module_path, target_name) in bindings {
+            for row in conn.prepare_cached(IMPORT_MODULE_PREFIX_ROUTE)?.query_map(
+                params![
+                    topology,
+                    target_module_path,
+                    "type",
+                    target_name,
+                    module.topology,
+                    module.path
+                ],
+                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
+            )? {
+                starts.push(row?);
+            }
+        }
+    }
     starts.sort_unstable();
     starts.dedup();
     Ok(starts)
 }
+
+/// Structured macro gates for a selected module import whose target module
+/// has an unknown activation. The importer and target route come from the
+/// persisted Cargo rows; the gate is tied to its source macro invocation.
+/// This keeps a route behind an unexpanded item macro an explicit boundary
+/// without treating the macro's tokens as expanded module declarations.
+pub(super) fn macro_gated_import_route_details(
+    conn: &rusqlite::Connection,
+    module: &Module,
+    name: &str,
+    binder_scope: u32,
+) -> Result<Vec<String>> {
+    conn.prepare_cached(MACRO_GATED_IMPORT_ROUTE)?
+        .query_map(
+            params![
+                module.topology,
+                module.path,
+                module.blob,
+                binder_scope,
+                name,
+                module.selected_blob
+            ],
+            |row| row.get::<_, String>(0),
+        )?
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(Into::into)
+}
+
+pub(super) fn macro_gated_unmounted_file_details(
+    conn: &rusqlite::Connection,
+    relative_path: &str,
+) -> Result<Vec<String>> {
+    conn.prepare_cached(MACRO_GATED_UNMOUNTED_FILE)?
+        .query_map([relative_path], |row| row.get::<_, String>(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(Into::into)
+}
+
+pub(super) fn inactive_cfg_unmounted_file_details(
+    conn: &rusqlite::Connection,
+    relative_path: &str,
+) -> Result<Vec<String>> {
+    conn.prepare_cached(INACTIVE_CFG_UNMOUNTED_FILE)?
+        .query_map([relative_path], |row| row.get::<_, String>(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(Into::into)
+}
+
+pub(super) fn macro_gated_route_boundary(
+    identities: &SelectedContextIdentities,
+    details: &[String],
+) -> ResolutionCompletion {
+    ResolutionCompletion::incomplete(details.iter().map(|detail| {
+        let mut digest = CanonicalHasher::new(b"bifrost-rust-unsupported-macro-route:v1");
+        digest.field("evidence", detail.as_bytes());
+        ResolutionIncompleteReason::UnsupportedSemantic(identities.named_semantic(
+            digest.finish(),
+            "UnsupportedMacroGeneratedModule",
+            detail,
+        ))
+    }))
+}
+
+pub(super) fn inactive_cfg_route_boundary(
+    identities: &SelectedContextIdentities,
+    details: &[String],
+) -> ResolutionCompletion {
+    ResolutionCompletion::incomplete(details.iter().map(|detail| {
+        let mut digest = CanonicalHasher::new(b"bifrost-rust-inactive-cfg-route:v1");
+        digest.field("evidence", detail.as_bytes());
+        ResolutionIncompleteReason::UnsupportedSemantic(identities.named_semantic(
+            digest.finish(),
+            "InactiveCfgPlacement",
+            detail,
+        ))
+    }))
+}
+
+pub(super) fn generated_item_surface_boundary(
+    conn: &rusqlite::Connection,
+    identities: &SelectedContextIdentities,
+    targets: &[SemanticId],
+) -> Result<ResolutionCompletion> {
+    let origin = crate::analyzer::store::resolution_prepare::resolution_rows::gap_origin_code(
+        crate::analyzer::resolution::LoweringGapOrigin::Extracted(
+            brokk_bifrost_core::analyzer::resolution_facts::ResolutionGapKind::GeneratedItemSurface,
+        ),
+    );
+    let mut details = Vec::new();
+    for semantic in targets {
+        let (Some(ordinal), Some(key)) = (semantic.ordinal(), semantic.local_key()) else {
+            continue;
+        };
+        if conn
+            .prepare_cached(REASON_GAP_ORIGIN)?
+            .query_row(rusqlite::params![ordinal, key], |row| row.get::<_, i64>(0))
+            .optional()?
+            != Some(origin)
+        {
+            continue;
+        }
+        details.push(
+            serde_json::json!({
+                "evidence": [{
+                    "reason": "GeneratedItemSurface",
+                    "semantic": semantic.to_string(),
+                }]
+            })
+            .to_string(),
+        );
+    }
+    details.sort_unstable();
+    details.dedup();
+    if details.is_empty() {
+        return Ok(ResolutionCompletion::Complete);
+    }
+    Ok(ResolutionCompletion::incomplete(details.iter().map(
+        |detail| {
+            let mut digest = CanonicalHasher::new(b"bifrost-rust-generated-item-surface:v1");
+            digest.field("evidence", detail.as_bytes());
+            ResolutionIncompleteReason::UnsupportedSemantic(identities.named_semantic(
+                digest.finish(),
+                GENERATED_ITEM_SURFACE_REASON,
+                detail,
+            ))
+        },
+    )))
+}
+
+/// The source declaration whose persisted attribute facts leave its generated
+/// surface open. This covers a same-file qualified prefix whose route has no
+/// semantic target to pass to `generated_item_surface_boundary`.
+pub(super) fn generated_surface_prefix_boundary(
+    conn: &rusqlite::Connection,
+    identities: &SelectedContextIdentities,
+    modules: &[Module],
+    prefix_mount: Option<u32>,
+    spelling: Option<&str>,
+    route: &[ResolutionLookupSemanticRecipe],
+) -> Result<ResolutionCompletion> {
+    let Some(spelling) = spelling else {
+        return Ok(ResolutionCompletion::Complete);
+    };
+    let mut detail = if let Some(prefix_mount) = prefix_mount {
+        conn.prepare_cached(GENERATED_SURFACE_PREFIX)?
+            .query_row(rusqlite::params![prefix_mount, spelling], |row| {
+                row.get::<_, String>(0)
+            })
+            .optional()?
+    } else {
+        None
+    };
+    if detail.is_none()
+        && let Some(prefix_mount) = prefix_mount
+    {
+        detail = conn
+            .prepare_cached(GENERATED_SURFACE_MODULE_PREFIX)?
+            .query_row(rusqlite::params![prefix_mount, spelling], |row| {
+                row.get::<_, String>(0)
+            })
+            .optional()?;
+    }
+    if detail.is_none()
+        && let Some(prefix_mount) = prefix_mount
+    {
+        detail = conn
+            .prepare_cached(GENERATED_SURFACE_MODULE_DECLARATION_PREFIX)?
+            .query_row(rusqlite::params![prefix_mount, spelling], |row| {
+                row.get::<_, String>(0)
+            })
+            .optional()?;
+    }
+    if detail.is_none() {
+        for name in std::iter::once(spelling).chain(route.iter().map(|segment| segment.spelling()))
+        {
+            if is_module_anchor(name) {
+                continue;
+            }
+            if let Some(prefix_mount) = prefix_mount {
+                detail = conn
+                    .prepare_cached(GENERATED_SURFACE_MODULE_PREFIX)?
+                    .query_row(rusqlite::params![prefix_mount, name], |row| {
+                        row.get::<_, String>(0)
+                    })
+                    .optional()?;
+            }
+            if detail.is_none()
+                && let Some(prefix_mount) = prefix_mount
+            {
+                detail = conn
+                    .prepare_cached(GENERATED_SURFACE_MODULE_DECLARATION_PREFIX)?
+                    .query_row(rusqlite::params![prefix_mount, name], |row| {
+                        row.get::<_, String>(0)
+                    })
+                    .optional()?;
+            }
+            if detail.is_none() {
+                for module in modules {
+                    detail = conn
+                        .prepare_cached(GENERATED_SURFACE_SOURCE_MODULE_PREFIX)?
+                        .query_row(
+                            rusqlite::params![module.blob, name, module.rel_path],
+                            |row| row.get::<_, String>(0),
+                        )
+                        .optional()?;
+                    if detail.is_some() {
+                        break;
+                    }
+                }
+            }
+            if detail.is_some() {
+                break;
+            }
+        }
+    }
+    let Some(detail) = detail else {
+        return Ok(ResolutionCompletion::Complete);
+    };
+    let mut digest = CanonicalHasher::new(b"bifrost-rust-generated-item-surface:v1");
+    digest.field("evidence", detail.as_bytes());
+    Ok(ResolutionCompletion::incomplete([
+        ResolutionIncompleteReason::UnsupportedSemantic(identities.named_semantic(
+            digest.finish(),
+            GENERATED_ITEM_SURFACE_REASON,
+            &detail,
+        )),
+    ]))
+}
+/// The selected import targets for a module prefix. The selected blob supplies
+/// the bound name; the persisted import row supplies its already-proved route.
+const IMPORT_MODULE_PREFIX_STARTS: &str = concat!(
+    "WITH binding(target_crate_key, target_module_path, target_name) AS (",
+    " SELECT imports.target_crate_key, imports.target_module_path, imports.target_name",
+    " FROM rust_crate_imports AS imports",
+    " WHERE ?7=?3 AND imports.topology_id=?1 AND imports.module_path=?2 AND imports.blob_id=?3",
+    " AND imports.binder_scope=?4 AND imports.bound_name=?5 AND imports.namespace=?6",
+    " UNION ALL",
+    " SELECT imports.target_crate_key, imports.target_module_path, selected.imported_name",
+    " FROM rust_crate_imports AS imports",
+    " CROSS JOIN source_rust_import_targets AS selected",
+    " ON selected.blob_id=?7 AND selected.ordinal=imports.import_ordinal",
+    " WHERE ?7<>?3 AND imports.topology_id=?1 AND imports.module_path=?2 AND imports.blob_id=?3",
+    " AND imports.binder_scope=?4 AND imports.namespace=?6 AND selected.bound_name=?5",
+    ")",
+    " SELECT DISTINCT target.topology_id, binding.target_module_path, binding.target_name",
+    " FROM binding",
+    " CROSS JOIN selected_rust_crates AS target ON target.crate_key=binding.target_crate_key"
+);
+
+/// Module containers reached by following a selected import target through
+/// the same re-export route used for point lookups.
+const IMPORT_MODULE_PREFIX_ROUTE: &str = concat!(
+    include_str!("rust_crate_point_targets.sql"),
+    "SELECT DISTINCT targets.topology_id,",
+    " CASE WHEN targets.name='self' THEN targets.module_path",
+    " ELSE targets.module_path || '::' || targets.name END AS container_path",
+    " FROM targets",
+    " CROSS JOIN rust_crate_containers AS container ON container.topology_id=targets.topology_id",
+    " AND container.kind='module'",
+    " AND container.container_path=CASE WHEN targets.name='self' THEN targets.module_path",
+    " ELSE targets.module_path || '::' || targets.name END"
+);
+
+const MACRO_GATED_IMPORT_ROUTE: &str =
+    "WITH binding(target_crate_key, target_module_path, target_name) AS (
+ SELECT imports.target_crate_key, imports.target_module_path, imports.target_name
+ FROM rust_crate_imports AS imports
+ WHERE imports.topology_id=?1 AND imports.module_path=?2 AND imports.blob_id=?3
+  AND imports.binder_scope=?4 AND imports.bound_name=?5 AND imports.namespace='type'
+ UNION
+ SELECT imports.target_crate_key, imports.target_module_path, selected.imported_name
+ FROM rust_crate_imports AS imports
+ CROSS JOIN source_rust_import_targets AS selected
+  ON selected.blob_id=?6 AND selected.ordinal=imports.import_ordinal
+ WHERE imports.topology_id=?1 AND imports.module_path=?2 AND imports.blob_id=?3
+  AND imports.binder_scope=?4 AND imports.namespace='type' AND selected.bound_name=?5
+)
+SELECT DISTINCT json_object('evidence', json_array(json_object(
+ 'reason', 'UnsupportedMacroGeneratedModule',
+ 'member_blob', route.blob_id,
+ 'invocation_occurrence', gate.invocation_occurrence_id,
+ 'macro', invocation.macro_name,
+ 'replay_covered', json('false'),
+ 'route_subject', gap.subject)))
+FROM binding
+CROSS JOIN selected_rust_crates AS target ON target.crate_key=binding.target_crate_key
+CROSS JOIN rust_crate_gaps AS gap ON gap.topology_id=target.topology_id
+ AND gap.gap_kind='unknown_activation'
+ AND gap.subject=binding.target_module_path || '::' || binding.target_name
+CROSS JOIN source_rust_module_routes AS route
+ ON route.blob_id=json_extract(gap.detail, '$.member_blob')
+ AND route.declaration_id=json_extract(gap.detail, '$.declaration_id')
+CROSS JOIN source_rust_module_route_gates AS gate
+ ON gate.blob_id=route.blob_id AND gate.route_ordinal=route.ordinal
+CROSS JOIN source_rust_macro_invocations AS invocation
+ ON invocation.blob_id=gate.blob_id AND invocation.occurrence_id=gate.invocation_occurrence_id";
+
+const MACRO_GATED_UNMOUNTED_FILE: &str = "WITH RECURSIVE ancestors(path) AS (
+ SELECT ?1
+ UNION ALL SELECT cr_parent(path) FROM ancestors WHERE path NOT IN ('', '.')
+)
+SELECT DISTINCT json_object('evidence', json_array(json_object(
+ 'reason', 'UnsupportedMacroGeneratedModule',
+ 'member_blob', route.blob_id,
+ 'invocation_occurrence', gate.invocation_occurrence_id,
+ 'macro', invocation.macro_name,
+ 'replay_covered', json('false'),
+ 'route_subject', gap.subject)))
+FROM ancestors
+CROSS JOIN rust_crate_container_sources AS parent
+CROSS JOIN selected_rust_crates AS selected ON selected.topology_id=parent.topology_id
+CROSS JOIN source_rust_module_routes AS route ON route.blob_id=parent.blob_id
+CROSS JOIN source_rust_module_declarations AS declaration
+ ON declaration.blob_id=route.blob_id AND declaration.declaration_id=route.declaration_id
+CROSS JOIN rust_crate_gaps AS gap ON gap.topology_id=parent.topology_id
+ AND gap.gap_kind='unknown_activation'
+ AND gap.subject=parent.container_path || '::' || declaration.module_name
+CROSS JOIN source_rust_module_route_gates AS gate
+ ON gate.blob_id=route.blob_id AND gate.route_ordinal=route.ordinal
+CROSS JOIN source_rust_macro_invocations AS invocation
+ ON invocation.blob_id=gate.blob_id AND invocation.occurrence_id=gate.invocation_occurrence_id
+WHERE ancestors.path=cr_join(cr_parent(parent.rel_path), declaration.module_name)";
+
+const INACTIVE_CFG_UNMOUNTED_FILE: &str =
+    "SELECT DISTINCT json_object('evidence', json_array(json_object(
+ 'reason', 'InactiveCfgPlacement',
+ 'rel_path', json_extract(gap.detail, '$.path'),
+ 'route_subject', gap.subject,
+ 'activation', json_extract(gap.detail, '$.activation'))))
+FROM rust_crate_gaps AS gap
+CROSS JOIN selected_rust_crates AS selected ON selected.topology_id=gap.topology_id
+WHERE gap.gap_kind='inactive_placement'
+ AND json_extract(gap.detail, '$.path')=?1
+ AND json_extract(gap.detail, '$.activation')=0
+ORDER BY gap.subject";
 pub(super) const PARENT: &str = "SELECT parent.container_path FROM rust_crate_containers AS parent WHERE parent.topology_id=?1 AND EXISTS (SELECT 1 FROM rust_crate_container_sources AS source CROSS JOIN source_rust_module_declarations AS declaration ON declaration.blob_id=source.blob_id WHERE source.topology_id=parent.topology_id AND source.container_path=parent.container_path AND parent.container_path || '::' || declaration.module_name = ?2)";
 pub(super) const EXPORT: &str = concat!(
     include_str!("rust_crate_point_targets.sql"),
     include_str!("rust_crate_point_export.sql")
 );
-pub(super) const SERDE_DERIVE_BINDING: &str = concat!(
-    include_str!("rust_crate_point_targets.sql"),
-    include_str!("rust_crate_point_serde_derive.sql")
-);
-/// The selected module-level structs and enums whose `serde` helper waits on
-/// the crate route (`source_rust_declaration_properties.serde_helper_derive`),
-/// with the open binder gap the producer left on each one's declaration site
-/// (origin ?1) and the module placements of the declaration.
-pub(super) const SERDE_HELPER_CONDITIONS: &str = "SELECT mount.mount_ordinal, gap.reason,
- property.serde_helper_derive, placement.topology_id, placement.container_path
- FROM temp.selected_resolution_mounts AS mount
+/// The derive-helper attribute names of the module-level declarations a
+/// lookup reached, with the open binder gap the producer left on each
+/// declaration site (origin ?1) and every placement of the declaration.
+///
+/// `?2` is a JSON array of `[mount_ordinal, reason]` pairs naming what the
+/// lookup reached: a `null` reason names every candidate declaration of the
+/// mount's blob, a number names the one declaration whose gap carries that
+/// reason. A blob holds few derive-helper declarations and the partial index
+/// reads only them, so both forms cost one seek per reached mount.
+pub(super) const DERIVE_HELPER_CONDITIONS: &str = "SELECT mount.mount_ordinal, gap.reason,
+ helper.value, placement.topology_id, placement.container_path
+ FROM json_each(?2) AS reached
+ CROSS JOIN temp.selected_resolution_mounts AS mount
+  ON mount.mount_ordinal=reached.value->>0
  CROSS JOIN source_rust_declaration_properties AS property
-  INDEXED BY source_rust_declaration_properties_serde_helper
-  ON property.blob_id=mount.blob_id AND property.serde_helper_derive IS NOT NULL
+  INDEXED BY source_rust_declaration_properties_derive_helpers
+  ON property.blob_id=mount.blob_id AND property.derive_helper_attributes IS NOT NULL
+ CROSS JOIN json_each(property.derive_helper_attributes) AS helper
  CROSS JOIN source_native_declaration_bridges AS bridge
   ON bridge.blob_id=property.blob_id AND bridge.declaration_id=property.declaration_id
  CROSS JOIN resolution_gap_reasons AS gap
   ON gap.blob_id=bridge.blob_id AND gap.site=bridge.source_site AND gap.origin=?1
+  AND (reached.value->>1 IS NULL OR gap.reason=reached.value->>1)
  CROSS JOIN resolution_rust_declaration_authorities AS authority
   ON authority.blob_id=bridge.blob_id AND authority.semantic_key=bridge.source_site
  CROSS JOIN selected_rust_module_placements AS placement
   ON placement.mount_ordinal=mount.mount_ordinal
   AND placement.module_declaration IS authority.module_declaration
  WHERE mount.storage_language='rust' AND property.nearest_declaration_boundary=0
- ORDER BY mount.mount_ordinal, gap.reason";
+ ORDER BY mount.mount_ordinal, gap.reason, helper.value, placement.topology_id, placement.container_path";
 pub(super) const EXTERNAL_BINDING: &str = concat!(
     include_str!("rust_crate_point_targets.sql"),
     include_str!("rust_crate_point_external.sql")
@@ -249,6 +660,10 @@ SELECT DISTINCT source.rel_path
 pub(super) const OPEN_INVENTORY: &str = concat!(
     include_str!("rust_crate_point_targets.sql"),
     include_str!("rust_crate_point_inventory.sql"),
+);
+pub(super) const UNINDEXED_SCOPE: &str = concat!(
+    include_str!("rust_crate_point_targets.sql"),
+    include_str!("rust_crate_point_unindexed_scope.sql"),
 );
 pub(super) const OPEN_ROUTE: &str = "SELECT json(detail) FROM rust_crate_gaps WHERE topology_id=?1 AND gap_kind IN ('unknown_activation','unplaced_module','duplicate_placement') AND subject=?2 || '::' || ?3";
 pub(super) const GAP_DETAILS: &str = include_str!("rust_crate_point_gap_details.sql");
@@ -482,6 +897,9 @@ pub(super) struct Module {
     /// workspace. It is a file left out of a build that exists that nothing
     /// can answer for.
     pub(super) unmounted: bool,
+    /// The module topology is a requested root or a selected Cargo dependency
+    /// of one of those roots.
+    pub(super) requested: bool,
     pub(super) overlay_completion: ResolutionCompletion,
 }
 
@@ -1129,6 +1547,7 @@ impl SelectedResolutionOperation<'_, '_> {
                     scope: ResolutionScopeId::new(scope),
                     edition,
                     unmounted,
+                    requested: true,
                     overlay_completion: (super::rust_crate_rows::RustCrateRows {
                         ready: &self.ready,
                     })
@@ -1212,15 +1631,24 @@ impl SelectedResolutionOperation<'_, '_> {
             return Ok(SelectedRustContextOutcome::Cancelled);
         }
         let Some(scope_ordinals) = persisted.node_scope_ordinals(
-            halves.iter().filter_map(|half| match half {
-                SelectedRootPathHalf::Import {
-                    source_scope_head, ..
-                }
-                | SelectedRootPathHalf::Reference {
-                    source_scope_head, ..
-                } => Some(*source_scope_head),
-                SelectedRootPathHalf::Export { .. } => None,
-            }),
+            halves
+                .iter()
+                .filter_map(|half| match half {
+                    SelectedRootPathHalf::Import {
+                        source_scope_head, ..
+                    }
+                    | SelectedRootPathHalf::Reference {
+                        source_scope_head, ..
+                    } => Some(*source_scope_head),
+                    SelectedRootPathHalf::Export { .. } => None,
+                })
+                .chain(halves.iter().filter_map(|half| match half {
+                    SelectedRootPathHalf::Reference {
+                        lexical_scope_head: Some(scope_head),
+                        ..
+                    } => Some(*scope_head),
+                    _ => None,
+                })),
             cancellation,
         )?
         else {
@@ -1241,6 +1669,7 @@ impl SelectedResolutionOperation<'_, '_> {
                         route,
                         anchor,
                         anchor_semantic,
+                        activation: _,
                     } => (
                         *identity,
                         *source_scope_head,
@@ -1649,9 +2078,7 @@ impl SelectedResolutionOperation<'_, '_> {
         let absent_prefixes = prefixes
             .iter()
             .filter_map(|(reference, resolution)| {
-                (resolution.targets.is_empty()
-                    && resolution.completion == ResolutionCompletion::Complete)
-                    .then_some(*reference)
+                resolution.targets.is_empty().then_some(*reference)
             })
             .collect::<Vec<_>>();
         for page in absent_prefixes.chunks(MAX_SOURCE_ROWS_PER_BATCH) {
@@ -1665,6 +2092,7 @@ impl SelectedResolutionOperation<'_, '_> {
             let SelectedRootPathHalf::Reference {
                 identity,
                 source_scope_head,
+                lexical_scope_head,
                 prefix_reference: Some(prefix),
                 token,
                 demand,
@@ -1692,6 +2120,29 @@ impl SelectedResolutionOperation<'_, '_> {
                         .expect("prefix route recipe")
                 })
                 .collect::<Vec<_>>();
+            let prefix_import_scope = lexical_scope_head
+                .map(|scope_head| {
+                    let Some((fragment, scope)) = scope_ordinals
+                        .get(&scope_head)
+                        .expect("prefix lexical scope was batched")
+                        .as_ref()
+                    else {
+                        panic!("prefix lexical scope must have source scope authority")
+                    };
+                    assert_eq!(*fragment, identity.fragment());
+                    scope.get()
+                })
+                .unwrap_or_else(|| {
+                    let Some((fragment, source_scope)) = scope_ordinals
+                        .get(source_scope_head)
+                        .expect("reference source scope was batched")
+                        .as_ref()
+                    else {
+                        panic!("reference source scope must have source scope authority")
+                    };
+                    assert_eq!(*fragment, identity.fragment());
+                    source_scope.get()
+                });
             let before = additions.len();
             // A crate-declared macro item this request did not stage: the
             // name exists and binds nothing here, which the dead end names.
@@ -1716,18 +2167,32 @@ impl SelectedResolutionOperation<'_, '_> {
                     scoped_modules.push(module);
                 }
             }
+            let prefix_kind = route_prefix_kind(
+                &self.ready,
+                prefix_names.get(prefix).map(String::as_str),
+                &resolved.targets,
+                &resolved.completion,
+            )?;
             for module in scoped_modules {
-                if resolved.targets.is_empty() || *anchor == ResolutionRootImportAnchor::Absolute {
+                if resolved.targets.is_empty()
+                    || *anchor == ResolutionRootImportAnchor::Absolute
+                    || !prefix_kind.is_type()
+                {
                     let mut continuation = resolved.completion.combine(&module.overlay_completion);
                     let mut starts = Vec::new();
                     if *anchor == ResolutionRootImportAnchor::Absolute {
                         starts.push((module.topology, module.path.clone()));
                     } else if let Some(name) = prefix_names.get(prefix) {
                         // The native half consumes its positioned prefix before
-                        // exposing the remaining route. An extern alias has no
-                        // local Type declaration; consult its crate row only
-                        // after lexical lookup has proved there is no shadow.
-                        starts.extend(crate_root_prefix_starts(conn, module, name)?);
+                        // exposing the remaining route. A prefix that is not a
+                        // type can name a module through a dependency or a
+                        // named import, so consult its selected route here.
+                        starts.extend(route_prefix_module_starts(
+                            conn,
+                            module,
+                            name,
+                            prefix_import_scope,
+                        )?);
                         // A module an item macro declares in this module has no
                         // lexical binder; the crate row places it. The point
                         // route's copy is in `rust_demand/rows.rs`.
@@ -1738,6 +2203,38 @@ impl SelectedResolutionOperation<'_, '_> {
                             })?
                         {
                             starts.push(row?);
+                        }
+                        if starts.is_empty() {
+                            let mut details = macro_gated_import_route_details(
+                                conn,
+                                module,
+                                name,
+                                prefix_import_scope,
+                            )?;
+                            if details.is_empty() && module.unmounted {
+                                details.extend(macro_gated_unmounted_file_details(
+                                    conn,
+                                    &module.rel_path,
+                                )?);
+                            }
+                            if !details.is_empty() {
+                                known_prefix = true;
+                                continuation = continuation.combine(&macro_gated_route_boundary(
+                                    &self.ready.context_identities,
+                                    &details,
+                                ));
+                            } else if module.unmounted {
+                                let details =
+                                    inactive_cfg_unmounted_file_details(conn, &module.rel_path)?;
+                                if !details.is_empty() {
+                                    known_prefix = true;
+                                    continuation =
+                                        continuation.combine(&inactive_cfg_route_boundary(
+                                            &self.ready.context_identities,
+                                            &details,
+                                        ));
+                                }
+                            }
                         }
                     }
                     known_prefix |= !starts.is_empty();
@@ -2003,28 +2500,27 @@ impl SelectedResolutionOperation<'_, '_> {
                 additions.len() == before && unstaged_items != ResolutionCompletion::Complete;
             // A type prefix is handled by the typed member route, not by a
             // crate module walk. `Self` and type parameters retain their
-            // existing selected-member behavior; nominal types require a
-            // complete prefix binding or the exact block-local type gap
-            // discharge checked by `route_prefix_is_a_type`.
+            // existing selected-member behavior. A known nominal type is
+            // likewise a usable route prefix when unrelated lexical gaps keep
+            // its full binding answer open; retain those reasons below.
             let type_member = additions.len() == before
                 && unknown
                 && !mixed
                 && !unstaged_only
                 && route.is_empty()
-                && route_prefix_is_a_type(
-                    &self.ready,
-                    self.ready
-                        .rust_prefix_spellings(
-                            &self.ready.lexical_source(),
-                            &[*prefix],
-                            cancellation,
-                        )?
-                        .get(prefix)
-                        .map(String::as_str),
-                    demand.namespace(),
-                    &resolved.targets,
-                    &resolved.completion,
-                )?;
+                && prefix_kind == RoutePrefixKind::MemberType;
+            if type_member && resolved.completion != ResolutionCompletion::Complete {
+                additions.push(deadend(
+                    identity.fragment(),
+                    *token,
+                    *anchor,
+                    *anchor_semantic,
+                    Some(*prefix),
+                    &route,
+                    &demand,
+                    resolved.completion.combine(&unstaged_items),
+                ));
+            }
             // The bare two-segment shape of the same question the route-head
             // guard above answers: `ext_crate::Widget` carries its root as the
             // prefix reference, whose lexical lookup and whose Cargo dependency
@@ -2040,10 +2536,14 @@ impl SelectedResolutionOperation<'_, '_> {
                 && !known_prefix
                 && !bound_in_the_crate
                 && !type_member
+                && prefix_kind == RoutePrefixKind::Other
                 && super::rust_prefix::rust_prefix_left_the_workspace(resolved);
+            // A known block-local type has a selected declaration but no
+            // crate module projection for the remaining path.
             if ((additions.len() == before && (!module_targets.is_empty() || unknown))
                 || mixed
-                || unstaged_only)
+                || unstaged_only
+                || prefix_kind == RoutePrefixKind::BlockLocalType)
                 && !type_member
             {
                 let mut completion = resolved.completion.combine(&unstaged_items);
@@ -2088,15 +2588,17 @@ impl SelectedResolutionOperation<'_, '_> {
                     } else {
                         None
                     };
-                    completion = completion.combine(&route_dead_end(
-                        &self.ready.context_identities,
-                        dead_end,
-                        rel_path.as_deref(),
-                        prefix_spelling.as_deref(),
-                        prefix_class,
-                        &route,
-                        &demand,
-                    ));
+                    if prefix_class != Some(RoutePrefixClass::OpenInventory) {
+                        completion = completion.combine(&route_dead_end(
+                            &self.ready.context_identities,
+                            dead_end,
+                            rel_path.as_deref(),
+                            prefix_spelling.as_deref(),
+                            prefix_class,
+                            &route,
+                            &demand,
+                        ));
+                    }
                 }
                 additions.push(deadend(
                     identity.fragment(),
@@ -2494,6 +2996,74 @@ const IMPORT_ROOTS: &str = "SELECT segment.segment FROM temp.selected_resolution
  CROSS JOIN source_rust_import_module_segments AS segment
   ON segment.blob_id=import.blob_id AND segment.import_ordinal=import.ordinal AND segment.ordinal=0
  WHERE mount.mount_ordinal=?1 AND import.bound_name=?2 AND import.is_glob=0";
+/// Whether a selected declaration with this route prefix has a structured
+/// attribute-generated surface fact. The prefix name comes from its parsed
+/// route; the boundary decision comes from the persisted declaration property.
+const GENERATED_SURFACE_PREFIX: &str = "SELECT json_object('evidence', json_array(json_object(
+ 'reason', 'GeneratedItemSurface',
+ 'member_blob', declaration.blob_id,
+ 'declaration_id', declaration.declaration_id,
+ 'rel_path', mount.persisted_relative_path)))
+FROM temp.selected_resolution_mounts AS mount
+CROSS JOIN source_rust_declaration_properties AS properties
+ ON properties.blob_id=mount.blob_id AND properties.generated_surface=1
+CROSS JOIN source_declarations AS declaration
+ ON declaration.blob_id=properties.blob_id AND declaration.declaration_id=properties.declaration_id
+CROSS JOIN source_declaration_units AS mapping
+ ON mapping.blob_id=declaration.blob_id AND mapping.declaration_id=declaration.declaration_id
+CROSS JOIN code_units AS unit
+ ON unit.blob_id=mapping.blob_id AND unit.unit_key=mapping.unit_key
+WHERE mount.mount_ordinal=?1 AND unit.identifier=?2
+ AND properties.nearest_declaration_boundary=0
+LIMIT 1";
+/// Whether the route enters an attribute-generated inline module in this
+/// source file, such as the declaration carried by `#[cxx::bridge]`.
+const GENERATED_SURFACE_MODULE_PREFIX: &str =
+    "SELECT json_object('evidence', json_array(json_object(
+ 'reason', 'GeneratedItemSurface',
+ 'member_blob', scope.blob_id,
+ 'declaration_id', scope.declaration_id,
+ 'rel_path', mount.persisted_relative_path,
+ 'module', scope.module_name)))
+FROM temp.selected_resolution_mounts AS mount
+CROSS JOIN source_rust_module_scopes AS scope
+ ON scope.blob_id=mount.blob_id AND scope.module_name=?2
+CROSS JOIN source_rust_declaration_properties AS properties
+ ON properties.blob_id=scope.blob_id AND properties.declaration_id=scope.declaration_id
+WHERE mount.mount_ordinal=?1 AND scope.declaration_id IS NOT NULL
+ AND properties.generated_surface=1
+LIMIT 1";
+/// Whether a selected module declaration has a generated attribute boundary,
+/// including when its module scope was withheld by that attribute.
+const GENERATED_SURFACE_MODULE_DECLARATION_PREFIX: &str =
+    "SELECT json_object('evidence', json_array(json_object(
+ 'reason', 'GeneratedItemSurface',
+ 'member_blob', declaration.blob_id,
+ 'declaration_id', declaration.declaration_id,
+ 'rel_path', mount.persisted_relative_path,
+ 'module', declaration.module_name)))
+FROM temp.selected_resolution_mounts AS mount
+CROSS JOIN source_rust_module_declarations AS declaration
+ ON declaration.blob_id=mount.blob_id AND declaration.module_name=?2
+CROSS JOIN source_rust_declaration_properties AS properties
+ ON properties.blob_id=declaration.blob_id AND properties.declaration_id=declaration.declaration_id
+WHERE mount.mount_ordinal=?1 AND properties.generated_surface=1
+LIMIT 1";
+/// Whether an unmounted source file declares a module scope with a persisted
+/// attribute-generated surface, such as a `#[cxx::bridge]` module.
+const GENERATED_SURFACE_SOURCE_MODULE_PREFIX: &str =
+    "SELECT json_object('evidence', json_array(json_object(
+ 'reason', 'GeneratedItemSurface',
+ 'member_blob', scope.blob_id,
+ 'declaration_id', scope.declaration_id,
+ 'rel_path', ?3,
+ 'module', scope.module_name)))
+FROM source_rust_module_scopes AS scope
+CROSS JOIN source_rust_declaration_properties AS properties
+ ON properties.blob_id=scope.blob_id AND properties.declaration_id=scope.declaration_id
+WHERE scope.blob_id=?1 AND scope.module_name=?2 AND scope.declaration_id IS NOT NULL
+ AND properties.generated_surface=1 AND properties.nearest_declaration_boundary=0
+LIMIT 1";
 /// Whether a mounted target is a generic type parameter's declaration.
 const GENERIC_TYPE_PARAMETER_TARGET: &str = "SELECT EXISTS(SELECT 1
  FROM temp.selected_resolution_mounts AS mount
@@ -2508,9 +3078,9 @@ const GENERIC_TYPE_PARAMETER_TARGET: &str = "SELECT EXISTS(SELECT 1
   AND parameter.name_occurrence_id=declaration.name_occurrence_id
   AND parameter.syntax_kind='type_parameter'
  WHERE mount.mount_ordinal=?1)";
-/// Whether a mounted target is a non-module type declaration. Module paths
-/// continue through crate rows; nominal types and associated types are handled
-/// by the typed member route instead.
+/// Whether a mounted target is a non-module, non-block-local type declaration.
+/// Module paths continue through crate rows; block-local declarations have no
+/// placed module continuation and keep the route dead-end classification.
 const NOMINAL_TYPE_TARGET: &str = "SELECT EXISTS(SELECT 1
  FROM temp.selected_resolution_mounts AS mount
  CROSS JOIN resolution_semantic_sites AS semantic
@@ -2519,7 +3089,8 @@ const NOMINAL_TYPE_TARGET: &str = "SELECT EXISTS(SELECT 1
   ON bridge.blob_id=semantic.blob_id AND bridge.source_site=semantic.source_site
  CROSS JOIN source_rust_declaration_properties AS properties
   ON properties.blob_id=bridge.blob_id AND properties.declaration_id=bridge.declaration_id
- WHERE mount.mount_ordinal=?1 AND properties.declaration_kind IN (0,1,2,3,13,14))";
+ WHERE mount.mount_ordinal=?1 AND properties.nearest_declaration_boundary=0
+  AND properties.declaration_kind IN (0,1,2,3,13,14))";
 /// Whether a target is a block-local type declaration whose binder is known
 /// even though its missing parser-unit projection left a gap on the item.
 const BLOCK_LOCAL_TYPE_TARGET: &str = "SELECT EXISTS(SELECT 1
@@ -2675,29 +3246,40 @@ pub(super) fn block_local_type_prefix_binding_is_decided(
     Ok(true)
 }
 
-/// Whether a route prefix is a type whose members the typed member route
-/// answers, so a route through it is a member lookup and not a module walk:
-/// `Self`, a generic type parameter, or a nominal type declaration. An
-/// incomplete block-local type binding counts only when every reason is a
-/// known gap on that exact declaration. `spelling` is the prefix's spelling.
-pub(super) fn route_prefix_is_a_type(
+/// How a route prefix participates in continuation. A block-local type
+/// shadows a module route, but its missing parser-unit projection cannot
+/// answer a member lookup; that path remains an explicit unplaced-route gap.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum RoutePrefixKind {
+    MemberType,
+    BlockLocalType,
+    Other,
+}
+
+impl RoutePrefixKind {
+    pub(super) const fn is_type(self) -> bool {
+        matches!(self, Self::MemberType | Self::BlockLocalType)
+    }
+}
+
+/// Classify a positioned Rust path prefix using its selected binding and the
+/// exact incomplete reasons attached to that binding.
+pub(super) fn route_prefix_kind(
     ready: &ReadySelectedResolution<'_, '_>,
     spelling: Option<&str>,
-    namespace: ResolutionNamespace,
     targets: &[SemanticId],
     completion: &ResolutionCompletion,
-) -> Result<bool> {
+) -> Result<RoutePrefixKind> {
     if spelling == Some("Self") || prefix_names_type_parameters(ready, targets)? {
-        return Ok(true);
+        return Ok(RoutePrefixKind::MemberType);
     }
-    if namespace != ResolutionNamespace::Type {
-        return Ok(false);
+    if block_local_type_prefix_binding_is_decided(ready, targets, completion)? {
+        return Ok(RoutePrefixKind::BlockLocalType);
     }
-    if !prefix_names_nominal_types(ready, targets)? {
-        return Ok(false);
+    if prefix_names_nominal_types(ready, targets)? {
+        return Ok(RoutePrefixKind::MemberType);
     }
-    Ok(matches!(completion, ResolutionCompletion::Complete)
-        || block_local_type_prefix_binding_is_decided(ready, targets, completion)?)
+    Ok(RoutePrefixKind::Other)
 }
 
 /// Classify the prefix a route stopped at. `spelling` is the prefix path's
@@ -2719,14 +3301,11 @@ pub(super) fn classify_route_prefix(
     if spelling == Some("Self") {
         return Ok(RoutePrefixClass::SelfQualifier);
     }
-    if !resolved.targets.is_empty() {
-        return Ok(if prefix_names_type_parameters(ready, &resolved.targets)? {
-            RoutePrefixClass::GenericParameter
-        } else {
-            RoutePrefixClass::Other
-        });
+    let has_targets = !resolved.targets.is_empty();
+    if has_targets && prefix_names_type_parameters(ready, &resolved.targets)? {
+        return Ok(RoutePrefixClass::GenericParameter);
     }
-    if spelling.is_some_and(|spelling| PRIMITIVE_TYPES.contains(&spelling)) {
+    if !has_targets && spelling.is_some_and(|spelling| PRIMITIVE_TYPES.contains(&spelling)) {
         return Ok(RoutePrefixClass::Primitive);
     }
     let standard = |spelling: &str| STANDARD_CRATES.contains(&spelling);
@@ -2744,7 +3323,7 @@ pub(super) fn classify_route_prefix(
             _ => RoutePrefixClass::ExternalCrate,
         }))
     };
-    if let Some(spelling) = spelling {
+    if !has_targets && let Some(spelling) = spelling {
         if let Some(class) = crate_class(spelling)? {
             return Ok(class);
         }
@@ -2766,36 +3345,30 @@ pub(super) fn classify_route_prefix(
             }
         }
     }
-    let ResolutionCompletion::Incomplete(reasons) = &resolved.completion else {
-        // Bound to nothing and proved so: the head is an extern-prelude name.
-        return Ok(match spelling {
-            Some(spelling) if head && standard(spelling) => RoutePrefixClass::Std,
-            Some(_) if head => RoutePrefixClass::ExternalCrate,
-            _ => RoutePrefixClass::Other,
-        });
-    };
     let mut boundary_roots = Vec::new();
     let mut prelude_gap = false;
     let mut unsupported = Vec::new();
-    for reason in reasons.iter() {
-        match reason {
-            ResolutionIncompleteReason::OpenBoundary {
-                semantic,
-                status: crate::analyzer::structural::BoundaryStatus::ExternalDeclaredUnindexed,
-            } => boundary_roots.push(*semantic),
-            ResolutionIncompleteReason::UnsupportedSemantic(semantic) => {
-                unsupported.push(*semantic);
-                if let (Some(ordinal), Some(key)) = (semantic.ordinal(), semantic.local_key())
-                    && let Some(origin) = conn
-                        .prepare_cached(REASON_GAP_ORIGIN)?
-                        .query_row(params![ordinal, key], |row| row.get::<_, i64>(0))
-                        .optional()?
-                {
-                    prelude_gap |= crate::analyzer::store::resolution_prepare::resolution_rows::gap_origin_from_code(origin)
-                        == crate::analyzer::resolution::LoweringGapOrigin::ExternalPreludeBoundary;
+    if let ResolutionCompletion::Incomplete(reasons) = &resolved.completion {
+        for reason in reasons.iter() {
+            match reason {
+                ResolutionIncompleteReason::OpenBoundary {
+                    semantic,
+                    status: crate::analyzer::structural::BoundaryStatus::ExternalDeclaredUnindexed,
+                } if !has_targets => boundary_roots.push(*semantic),
+                ResolutionIncompleteReason::UnsupportedSemantic(semantic) => {
+                    unsupported.push(*semantic);
+                    if let (Some(ordinal), Some(key)) = (semantic.ordinal(), semantic.local_key())
+                        && let Some(origin) = conn
+                            .prepare_cached(REASON_GAP_ORIGIN)?
+                            .query_row(params![ordinal, key], |row| row.get::<_, i64>(0))
+                            .optional()?
+                    {
+                        prelude_gap |= crate::analyzer::store::resolution_prepare::resolution_rows::gap_origin_from_code(origin)
+                            == crate::analyzer::resolution::LoweringGapOrigin::ExternalPreludeBoundary;
+                    }
                 }
+                _ => {}
             }
-            _ => {}
         }
     }
     if !boundary_roots.is_empty() {
@@ -2820,6 +3393,17 @@ pub(super) fn classify_route_prefix(
                 return Ok(RoutePrefixClass::OpenInventory);
             }
         }
+    }
+    if has_targets {
+        return Ok(RoutePrefixClass::Other);
+    }
+    if !matches!(resolved.completion, ResolutionCompletion::Incomplete(_)) {
+        // Bound to nothing and proved so: the head is an extern-prelude name.
+        return Ok(match spelling {
+            Some(spelling) if head && standard(spelling) => RoutePrefixClass::Std,
+            Some(_) if head => RoutePrefixClass::ExternalCrate,
+            _ => RoutePrefixClass::Other,
+        });
     }
     Ok(if prelude_gap {
         RoutePrefixClass::Std
@@ -2895,7 +3479,7 @@ pub(super) fn unlowered_export_declaration(
     let mut digest = CanonicalHasher::new(b"bifrost-rust-unlowered-export:v1");
     digest.field("evidence", evidence.as_bytes());
     ResolutionCompletion::incomplete([ResolutionIncompleteReason::UnsupportedSemantic(
-        identities.named_semantic(digest.finish(), "UnloweredExportedDeclaration", &evidence),
+        identities.named_semantic(digest.finish(), UNLOWERED_EXPORT_REASON, &evidence),
     )])
 }
 
@@ -3165,12 +3749,53 @@ pub(super) fn sql_pins() -> Vec<(&'static str, &'static str, usize)> {
         ("rust_point_export", EXPORT, 6),
         ("rust_point_anchored_import_binds", ANCHORED_IMPORT_BINDS, 2),
         ("rust_point_root_reexport", ROOT_REEXPORT, 6),
-        ("rust_point_serde_derive_binding", SERDE_DERIVE_BINDING, 6),
+        ("rust_point_module_prefix_route", MODULE_PREFIX_ROUTE, 6),
         (
-            "rust_point_serde_helper_conditions",
-            SERDE_HELPER_CONDITIONS,
+            "rust_point_module_import_prefix_starts",
+            IMPORT_MODULE_PREFIX_STARTS,
+            7,
+        ),
+        (
+            "rust_point_module_import_prefix_route",
+            IMPORT_MODULE_PREFIX_ROUTE,
+            6,
+        ),
+        (
+            "rust_point_macro_gated_import_route",
+            MACRO_GATED_IMPORT_ROUTE,
+            6,
+        ),
+        (
+            "rust_point_macro_gated_unmounted_file",
+            MACRO_GATED_UNMOUNTED_FILE,
             1,
         ),
+        (
+            "rust_point_generated_surface_prefix",
+            GENERATED_SURFACE_PREFIX,
+            2,
+        ),
+        (
+            "rust_point_generated_surface_module_prefix",
+            GENERATED_SURFACE_MODULE_PREFIX,
+            2,
+        ),
+        (
+            "rust_point_generated_surface_module_declaration_prefix",
+            GENERATED_SURFACE_MODULE_DECLARATION_PREFIX,
+            2,
+        ),
+        (
+            "rust_point_generated_surface_source_module_prefix",
+            GENERATED_SURFACE_SOURCE_MODULE_PREFIX,
+            3,
+        ),
+        (
+            "rust_point_derive_helper_conditions",
+            DERIVE_HELPER_CONDITIONS,
+            2,
+        ),
+        ("rust_point_unindexed_scope", UNINDEXED_SCOPE, 6),
         ("rust_point_external_binding", EXTERNAL_BINDING, 7),
         ("rust_point_definition_module", DEFINITION_MODULE, 4),
         ("rust_point_macro_item_module", MACRO_ITEM_MODULE, 5),
@@ -3315,9 +3940,112 @@ fn crate_access_digest(domain: &[u8], crate_keys: &[[u8; 32]]) -> [u8; 32] {
 mod tests {
     use crate::AnalyzerConfig;
     use crate::analyzer::store::planner_statistics::pinned_plans::{explain_pin, pinned_queries};
-    use crate::inline_project::InlineTestProject;
+    use crate::inline_project::{BuiltInlineTestProject, InlineTestProject};
     use brokk_bifrost_core::cache_gc::PlannerStatisticsState;
+    use brokk_bifrost_test_macros::hardwon;
     use rusqlite::types::Value;
+
+    /// External globs can bind any namespace, while a root macro-use import
+    /// contributes to every macro lookup from its crate. Keep these checks in
+    /// helper proof and keep ordinary point lookup inventory closed.
+    #[test]
+    #[hardwon("#4458: unindexed external imports left derive-helper proof falsely closed")]
+    fn unindexed_helper_scope_does_not_open_point_inventory() {
+        let project = InlineTestProject::new()
+            .file(
+                "Cargo.toml",
+                "[package]\nname='app'\nversion='0.1.0'\nedition='2024'\n[dependencies]\nunindexed='1'\n",
+            )
+            .file(
+                "src/lib.rs",
+                "#[macro_use] extern crate unindexed; pub mod inner { use unindexed::prelude::*; }",
+            )
+            .build();
+        let analyzer = project.workspace_analyzer(AnalyzerConfig::default());
+        let store = analyzer.store().expect("the fixture builds a store");
+        let conn = store.conn.lock().expect("the fixture store lock");
+        crate::analyzer::store::ensure_revisioned_workspace_views(&conn).unwrap();
+        crate::analyzer::store::planner_statistics::pinned_plans::prepare_pin_context(&conn);
+        crate::analyzer::store::rust_crates::register_point_export_functions(&conn).unwrap();
+        conn.execute(
+            "INSERT INTO selected_workspace_revisions SELECT workspace_id,lang,generation,revision FROM workspace_heads WHERE lang='rust'",
+            [],
+        )
+        .unwrap();
+        let (topology, blob): (i64, i64) = conn
+            .query_row(
+                "SELECT topology_id,blob_id FROM selected_rust_crate_containers WHERE container_path='crate' AND rel_path='src/lib.rs'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        conn.execute(
+            "INSERT INTO selected_resolution_mounts(mount_ordinal,blob_id,storage_language,semantic_language,persisted_relative_path) VALUES(0,?1,'rust','rust','src/lib.rs')",
+            [blob],
+        )
+        .unwrap();
+
+        for (module, namespace, name, expected) in [
+            (
+                "crate::inner",
+                "macro",
+                "missing_macro",
+                "UnindexedExternalGlobImport",
+            ),
+            (
+                "crate",
+                "macro",
+                "missing_macro",
+                "UnindexedExternalMacroUseImport",
+            ),
+        ] {
+            let helper_scope_open = conn
+                .prepare(super::UNINDEXED_SCOPE)
+                .unwrap()
+                .exists(rusqlite::params![
+                    topology, module, namespace, name, topology, module
+                ])
+                .unwrap();
+            assert!(helper_scope_open, "{module} {namespace} {name}: {expected}");
+            if expected == "UnindexedExternalGlobImport" {
+                let point_inventory = conn
+                    .prepare(super::OPEN_INVENTORY)
+                    .unwrap()
+                    .query_map(
+                        rusqlite::params![topology, module, namespace, name, topology, module],
+                        |row| row.get::<_, String>(0),
+                    )
+                    .unwrap()
+                    .collect::<rusqlite::Result<Vec<_>>>()
+                    .unwrap();
+                assert!(
+                    point_inventory.is_empty(),
+                    "an external glob stays an external boundary for ordinary name lookups: {point_inventory:?}"
+                );
+            }
+        }
+    }
+
+    fn assert_rust_workspace_graph_builds(project: &BuiltInlineTestProject, failure: &str) {
+        use crate::analyzer::rust::build_rust_native_workspace_graph_for_files;
+        use crate::analyzer::{IAnalyzer, Language, RustAnalyzer};
+
+        let analyzer = RustAnalyzer::from_project(project.project().clone());
+        let files = analyzer
+            .source_file_inventory()
+            .rows
+            .into_iter()
+            .filter(|file| crate::analyzer::common::language_for_file(file) == Language::Rust)
+            .collect::<Vec<_>>();
+        if let Err(error) = build_rust_native_workspace_graph_for_files(
+            &analyzer,
+            &files,
+            8,
+            &crate::CancellationToken::new(),
+        ) {
+            panic!("{failure}: {error}");
+        }
+    }
 
     /// The three answers a file no Cargo target mounts must give, and the one
     /// workspace shape that is not that case.
@@ -3329,6 +4057,7 @@ mod tests {
     /// the whole-workspace projection called itself complete and the dead-code
     /// report published "dead, 0 usages" for every declaration in the file.
     #[test]
+    #[hardwon("fef6e65216dc: a detached file under no Cargo target is incomplete, not absent")]
     fn a_file_under_no_cargo_target_answers_incomplete_and_stops_the_projection() {
         use crate::analyzer::rust::{
             RustNativeWorkspaceGraphOutcome, build_rust_native_workspace_graph_for_files,
@@ -3483,10 +4212,8 @@ mod tests {
     /// publication. That is the store error Bifrost's own whole-workspace
     /// `usage_graph` raised.
     #[test]
+    #[hardwon("77aab427cd16: one source import must not derive a duplicate dead end")]
     fn one_import_site_derives_one_dead_end_when_its_file_is_compiled_twice() {
-        use crate::analyzer::rust::build_rust_native_workspace_graph_for_files;
-        use crate::analyzer::{IAnalyzer, Language, RustAnalyzer};
-
         let project = InlineTestProject::new()
             .file(
                 "Cargo.toml",
@@ -3502,21 +4229,7 @@ mod tests {
                 "use app::Thing;\npub fn use_it() { let _ = Thing; }\n",
             )
             .build();
-        let analyzer = RustAnalyzer::from_project(project.project().clone());
-        let files = analyzer
-            .source_file_inventory()
-            .rows
-            .into_iter()
-            .filter(|file| crate::analyzer::common::language_for_file(file) == Language::Rust)
-            .collect::<Vec<_>>();
-        if let Err(error) = build_rust_native_workspace_graph_for_files(
-            &analyzer,
-            &files,
-            8,
-            &crate::CancellationToken::new(),
-        ) {
-            panic!("one import site must derive one dead end: {error}");
-        }
+        assert_rust_workspace_graph_builds(&project, "one import site must derive one dead end");
     }
 
     /// The same answer when the two placements are in one crate.
@@ -3532,10 +4245,8 @@ mod tests {
     /// publication into the store error: from the bin `app` names the lib with
     /// an open inventory, and from the lib `app` names nothing.
     #[test]
+    #[hardwon("80645bcc16c2: module placement identity must not duplicate a file import")]
     fn two_placements_of_one_file_in_one_crate_derive_one_dead_end() {
-        use crate::analyzer::rust::build_rust_native_workspace_graph_for_files;
-        use crate::analyzer::{IAnalyzer, Language, RustAnalyzer};
-
         let project = InlineTestProject::new()
             .file(
                 "Cargo.toml",
@@ -3559,21 +4270,10 @@ mod tests {
                 "use app::Thing;\npub fn use_it() { let _ = Thing; }\n",
             )
             .build();
-        let analyzer = RustAnalyzer::from_project(project.project().clone());
-        let files = analyzer
-            .source_file_inventory()
-            .rows
-            .into_iter()
-            .filter(|file| crate::analyzer::common::language_for_file(file) == Language::Rust)
-            .collect::<Vec<_>>();
-        if let Err(error) = build_rust_native_workspace_graph_for_files(
-            &analyzer,
-            &files,
-            8,
-            &crate::CancellationToken::new(),
-        ) {
-            panic!("two placements in one crate must derive one dead end: {error}");
-        }
+        assert_rust_workspace_graph_builds(
+            &project,
+            "two placements in one crate must derive one dead end",
+        );
     }
 
     /// The scope of the reason above, which a reader must not widen by
@@ -3583,6 +4283,7 @@ mod tests {
     /// every file in it "unmounted" would turn the whole non-Cargo Rust surface
     /// into an abstention.
     #[test]
+    #[hardwon("fef6e65216dc: Cargo-free workspaces remain answerable")]
     fn a_workspace_with_no_cargo_target_at_all_is_not_an_unmounted_file() {
         use crate::analyzer::RustAnalyzer;
         use crate::analyzer::usages::get_definition::{
@@ -3692,171 +4393,6 @@ mod tests {
         .expect("one request has one outcome")
     }
 
-    /// The three answers gate 6 named, and the two the visibility filter owns.
-    ///
-    /// The first three fixtures are byte-identical apart from their impls and
-    /// must not give one answer: no impl leaves the member to what the rows
-    /// cannot see, one impl reaches the trait's member, and two visible impls
-    /// are the Rust error (E0034) whose two candidates the answer names as an
-    /// ambiguity. Before the join all three answered `NoDefinition`, which is
-    /// why the ambiguity parity row and
-    /// `rust_ufcs_trait_method_requires_visible_trait` passed vacuously: they
-    /// asserted an empty answer, and every fixture in the group had one.
-    ///
-    /// Neither remaining negative is a proved absence. Rust cannot close a
-    /// type's member surface -- a blanket `impl<T> Trait for T`, which leaves
-    /// no crate row, a derive, or a trait from an unindexed crate can each
-    /// supply the member -- and the producer declares the surface open for
-    /// every qualified reference, so a member nothing indexed supplies is an
-    /// open boundary.
-    #[test]
-    fn a_type_qualified_member_reaches_the_traits_the_type_implements_and_the_reference_can_name() {
-        use crate::analyzer::usages::get_definition::DefinitionLookupStatus;
-
-        let no_impl = "struct Foo;\ntrait Trait {\n    fn frobnicate();\n}\n\nfn bar() {\n    Foo::frobnicate();\n}\n";
-        assert_eq!(
-            qualified_member_definitions(&[("t.rs", no_impl)], "t.rs", "Foo::frobnicate"),
-            (
-                DefinitionLookupStatus::UnresolvableImportBoundary,
-                Vec::new()
-            ),
-            "a type whose indexed impls lend no such member leaves it to what the rows cannot see"
-        );
-
-        let one_impl = "struct Foo;\ntrait Trait {\n    fn frobnicate();\n}\nimpl Trait for Foo {}\n\nfn bar() {\n    Foo::frobnicate();\n}\n";
-        assert_eq!(
-            qualified_member_definitions(&[("t.rs", one_impl)], "t.rs", "Foo::frobnicate"),
-            (
-                DefinitionLookupStatus::Resolved,
-                vec!["Trait.frobnicate".to_owned()]
-            ),
-            "one implemented trait lends its member to the qualified path"
-        );
-
-        let two_impls = "struct Foo;\ntrait One {\n    fn frobnicate();\n}\ntrait Two {\n    fn frobnicate();\n}\nimpl One for Foo {}\nimpl Two for Foo {}\n\nfn bar() {\n    Foo::frobnicate();\n}\n";
-        assert_eq!(
-            qualified_member_definitions(&[("t.rs", two_impls)], "t.rs", "Foo::frobnicate"),
-            (
-                DefinitionLookupStatus::Ambiguous,
-                vec!["One.frobnicate".to_owned(), "Two.frobnicate".to_owned()]
-            ),
-            "two visible traits that both declare the member is a Rust error, not a choice"
-        );
-
-        // A trait that declares no such member lends nothing, and does not
-        // make the one that does ambiguous.
-        let unrelated = "struct Foo;\ntrait One {\n    fn frobnicate();\n}\ntrait Two {\n    fn other();\n}\nimpl One for Foo {}\nimpl Two for Foo {}\n\nfn bar() {\n    Foo::frobnicate();\n}\n";
-        assert_eq!(
-            qualified_member_definitions(&[("t.rs", unrelated)], "t.rs", "Foo::frobnicate"),
-            (
-                DefinitionLookupStatus::Resolved,
-                vec!["One.frobnicate".to_owned()]
-            ),
-            "only a trait that declares the member competes for it"
-        );
-
-        // An implemented trait the call site cannot name lends nothing, which
-        // is what separates this fixture from the one below it.
-        let hidden = [
-            (
-                "src/service.rs",
-                "pub struct Foo;\npub trait Trait {\n    fn frobnicate();\n}\nimpl Trait for Foo {}\n",
-            ),
-            (
-                "src/main.rs",
-                "mod service;\n\nfn bar() {\n    service::Foo::frobnicate();\n}\n",
-            ),
-        ];
-        assert_eq!(
-            qualified_member_definitions(&hidden, "src/main.rs", "service::Foo::frobnicate"),
-            (
-                DefinitionLookupStatus::UnresolvableImportBoundary,
-                Vec::new()
-            ),
-            "an implemented trait that is nameable nowhere at the call site lends nothing"
-        );
-
-        let imported = [
-            (
-                "src/service.rs",
-                "pub struct Foo;\npub trait Trait {\n    fn frobnicate();\n}\nimpl Trait for Foo {}\n",
-            ),
-            (
-                "src/main.rs",
-                "mod service;\nuse service::Trait;\n\nfn bar() {\n    service::Foo::frobnicate();\n}\n",
-            ),
-        ];
-        assert_eq!(
-            qualified_member_definitions(&imported, "src/main.rs", "service::Foo::frobnicate"),
-            (
-                DefinitionLookupStatus::Resolved,
-                vec!["Trait.frobnicate".to_owned()]
-            ),
-            "the same workspace with the trait imported resolves it"
-        );
-    }
-
-    /// The other half of the join, which this lane did not close.
-    ///
-    /// `Self::frobnicate()` reaches the join through the crate route: the
-    /// producer publishes a root reference for a `Self` head, and `Self` names
-    /// the implementing type. `foo.frobnicate()` has no root path at all,
-    /// because its prefix is a value and not a path, so the typed member route
-    /// asks the same crate rows keyed by the type the receiver evaluated to
-    /// (`rust_implemented_traits_nameable_at`).
-    #[test]
-    fn a_self_qualified_and_a_receiver_member_reach_the_implemented_trait_too() {
-        use crate::analyzer::usages::get_definition::DefinitionLookupStatus;
-
-        let self_qualified = "struct Foo;\ntrait Trait {\n    fn frobnicate();\n}\nimpl Trait for Foo {}\nimpl Foo {\n    fn call() {\n        Self::frobnicate();\n    }\n}\n";
-        assert_eq!(
-            qualified_member_definitions(&[("t.rs", self_qualified)], "t.rs", "Self::frobnicate"),
-            (
-                DefinitionLookupStatus::Resolved,
-                vec!["Trait.frobnicate".to_owned()]
-            ),
-            "Self names the implementing type"
-        );
-
-        let receiver = "struct Foo;\ntrait Trait {\n    fn frobnicate(&self);\n}\nimpl Trait for Foo {}\n\nfn bar(foo: Foo) {\n    foo.frobnicate();\n}\n";
-        assert_eq!(
-            qualified_member_definitions(&[("t.rs", receiver)], "t.rs", "foo.frobnicate"),
-            (
-                DefinitionLookupStatus::Resolved,
-                vec!["Trait.frobnicate".to_owned()]
-            ),
-            "a receiver whose impl body is empty still reaches the trait's member"
-        );
-    }
-
-    /// A receiver reaches a trait's own member only where the trait is in
-    /// scope: Rust rejects `service.run()` when `Runner` is implemented but
-    /// not nameable in the calling module, and accepts it once the module
-    /// imports the trait. The two fixtures differ by that one `use`, so the
-    /// visibility arms of the crate-row read are what decides.
-    #[test]
-    fn a_receiver_reaches_a_trait_member_only_where_the_trait_is_in_scope() {
-        use crate::analyzer::usages::get_definition::DefinitionLookupStatus;
-
-        let unimported = "mod inner {\n    pub struct Service;\n    pub trait Runner {\n        fn run(&self) {}\n    }\n    impl Runner for Service {}\n}\n\nfn caller(service: inner::Service) {\n    service.run();\n}\n";
-        let (status, names) =
-            qualified_member_definitions(&[("t.rs", unimported)], "t.rs", "service.run");
-        assert!(
-            names.is_empty(),
-            "a trait that is not in scope lends no member: {status:?} {names:?}"
-        );
-
-        let imported = "mod inner {\n    pub struct Service;\n    pub trait Runner {\n        fn run(&self) {}\n    }\n    impl Runner for Service {}\n}\nuse inner::Runner;\n\nfn caller(service: inner::Service) {\n    service.run();\n}\n";
-        assert_eq!(
-            qualified_member_definitions(&[("t.rs", imported)], "t.rs", "service.run"),
-            (
-                DefinitionLookupStatus::Resolved,
-                vec!["inner.Runner.run".to_owned()]
-            ),
-            "an imported trait lends its default method to the receiver"
-        );
-    }
-
     /// The join's read is bounded by the subject, not by the crate's impls.
     ///
     /// The plan pin above proves the statement seeks
@@ -3946,51 +4482,6 @@ mod tests {
         }
     }
 
-    /// The same bridge, read in the other direction.
-    ///
-    /// The overlay indexes every added candidate path by both endpoints, so
-    /// the path this join publishes into the trait's member scope is a reverse
-    /// candidate of that scope as well as a forward one. Nothing else was
-    /// written for this: the reverse scan builds the same crate context over
-    /// the candidate file, the same half publishes the same bridge, and the
-    /// trait method's usages reach the `Foo::frobnicate()` call site. The
-    /// measurement is here rather than in the report because a later change
-    /// that publishes the bridge only forwards would otherwise go unnoticed.
-    #[test]
-    fn a_trait_methods_usages_reach_the_type_qualified_call_site_through_the_same_bridge() {
-        use crate::searchtools::{
-            ScanUsagesByLocationParams, ScanUsagesTarget, scan_usages_by_location,
-        };
-        const ONE: &str = "struct Foo;\ntrait Trait {\n    fn frobnicate();\n}\nimpl Trait for Foo {}\n\nfn bar() {\n    Foo::frobnicate();\n}\n";
-        let project = InlineTestProject::new().file("t.rs", ONE).build();
-        let workspace = project.workspace_analyzer(AnalyzerConfig::default());
-        let result = scan_usages_by_location(
-            workspace.analyzer(),
-            ScanUsagesByLocationParams {
-                targets: vec![ScanUsagesTarget {
-                    path: "t.rs".to_owned(),
-                    line: 3,
-                    column: None,
-                    symbol: None,
-                }],
-                include_tests: true,
-                paths: None,
-                include_same_owner: true,
-            },
-        );
-        assert_eq!(result.summary.found, 1, "{result:#?}");
-        let entry = &result.results[0];
-        assert_eq!(entry.symbol.as_deref(), Some("Trait.frobnicate"));
-        assert!(entry.complete, "{entry:#?}");
-        assert_eq!(entry.total_hits, Some(1), "{entry:#?}");
-        let hits = &entry.files[0].hits;
-        assert_eq!(
-            (entry.files[0].path.as_str(), hits[0].line),
-            ("t.rs", 8),
-            "the trait method's one usage is the type-qualified call: {entry:#?}"
-        );
-    }
-
     /// A method nothing indexed supplies is an open boundary, never a proved
     /// absence, in both call forms.
     ///
@@ -4049,79 +4540,6 @@ mod tests {
         }
     }
 
-    /// An impl item of one trait and another in-scope trait's default for the
-    /// same method are one candidate set, so the call is E0034 too, in both
-    /// call forms. The implementation-first order still answers an inherent
-    /// method alone: Rust tries inherent methods before any trait's.
-    #[test]
-    fn an_impl_item_and_another_traits_default_for_one_method_are_an_ambiguity() {
-        use crate::analyzer::usages::get_definition::DefinitionLookupStatus;
-
-        for (label, call, path) in [
-            ("receiver", "service.run();", "service.run"),
-            ("type-qualified", "Service::run(&service);", "Service::run"),
-        ] {
-            let source = format!(
-                "struct Service;\ntrait One {{\n    fn run(&self);\n}}\ntrait Two {{\n    fn run(&self) {{}}\n}}\nimpl One for Service {{\n    fn run(&self) {{}}\n}}\nimpl Two for Service {{}}\n\nfn caller(service: Service) {{\n    {call}\n}}\n"
-            );
-            let outcome = qualified_member_outcome(&[("t.rs", &source)], "t.rs", path);
-            let names = outcome
-                .definitions
-                .iter()
-                .map(|unit| unit.short_name().to_owned())
-                .collect::<Vec<_>>();
-            assert_eq!(
-                (outcome.status, names),
-                (
-                    DefinitionLookupStatus::Ambiguous,
-                    vec!["Service.run".to_owned(), "Two.run".to_owned()]
-                ),
-                "{label}: {outcome:?}"
-            );
-            assert!(
-                outcome
-                    .diagnostics
-                    .iter()
-                    .any(|diagnostic| diagnostic.kind == "unordered_candidates"),
-                "{label}: the ambiguity names its cause: {outcome:?}"
-            );
-        }
-
-        let inherent = "struct Service;\ntrait Two {\n    fn run(&self) {}\n}\nimpl Service {\n    fn run(&self) {}\n}\nimpl Two for Service {}\n\nfn caller(service: Service) {\n    service.run();\n}\n";
-        assert_eq!(
-            qualified_member_definitions(&[("t.rs", inherent)], "t.rs", "service.run"),
-            (
-                DefinitionLookupStatus::Resolved,
-                vec!["Service.run".to_owned()]
-            ),
-            "an inherent method outranks every trait's"
-        );
-    }
-
-    /// Two traits' impl items for one method, with parameter types an argument
-    /// could tell apart, are still E0034: arguments only infer one trait's type
-    /// arguments and never choose between traits, so the coercion filter
-    /// leaves the tie whole.
-    #[test]
-    fn argument_types_do_not_choose_between_tied_traits() {
-        use crate::analyzer::usages::get_definition::DefinitionLookupStatus;
-
-        let tied = "struct Shape;\ntrait Scale {\n    fn scale(&self, factor: f32);\n}\ntrait Grow {\n    fn scale(&self, factor: f64);\n}\nimpl Scale for Shape {\n    fn scale(&self, factor: f32) {}\n}\nimpl Grow for Shape {\n    fn scale(&self, factor: f64) {}\n}\n\nfn caller(shape: Shape, factor: f32) {\n    shape.scale(factor);\n}\n";
-        let outcome = qualified_member_outcome(&[("t.rs", tied)], "t.rs", "shape.scale");
-        assert_eq!(
-            (outcome.status, outcome.definitions.len()),
-            (DefinitionLookupStatus::Ambiguous, 2),
-            "{outcome:?}"
-        );
-        assert!(
-            outcome
-                .diagnostics
-                .iter()
-                .any(|diagnostic| diagnostic.kind == "unordered_candidates"),
-            "{outcome:?}"
-        );
-    }
-
     /// The reverse half: the impl item and the other trait's default each see
     /// the tied call as a usage they cannot prove.
     #[test]
@@ -4129,47 +4547,6 @@ mod tests {
         const TIED: &str = "struct Service;\ntrait One {\n    fn run(&self);\n}\ntrait Two {\n    fn run(&self) {}\n}\nimpl One for Service {\n    fn run(&self) {}\n}\nimpl Two for Service {}\n\nfn caller(service: Service) {\n    service.run();\n}\n";
         for (line, symbol) in [(9, "Service.run"), (6, "Two.run")] {
             assert_one_unproven_usage(&scan_usages_at(TIED, line), symbol, 14);
-        }
-    }
-
-    /// Two traits a type implements, both in scope and both supplying a
-    /// default for the called method: rustc rejects the call (E0034) and
-    /// lists both candidates. The answer is those two declarations as an
-    /// ambiguity whose cause is named, in both call forms -- never two targets
-    /// stated as one complete binding, and never an empty answer.
-    #[test]
-    fn two_in_scope_trait_defaults_for_one_method_are_an_ambiguity_with_a_named_cause() {
-        use crate::analyzer::usages::get_definition::DefinitionLookupStatus;
-
-        for (label, call, path) in [
-            ("receiver", "service.run();", "service.run"),
-            ("type-qualified", "Service::run(&service);", "Service::run"),
-        ] {
-            let source = format!(
-                "struct Service;\ntrait One {{\n    fn run(&self) {{}}\n}}\ntrait Two {{\n    fn run(&self) {{}}\n}}\nimpl One for Service {{}}\nimpl Two for Service {{}}\n\nfn caller(service: Service) {{\n    {call}\n}}\n"
-            );
-            let outcome = qualified_member_outcome(&[("t.rs", &source)], "t.rs", path);
-            let names = outcome
-                .definitions
-                .iter()
-                .map(|unit| unit.short_name().to_owned())
-                .collect::<Vec<_>>();
-            assert_eq!(
-                (outcome.status, names),
-                (
-                    DefinitionLookupStatus::Ambiguous,
-                    vec!["One.run".to_owned(), "Two.run".to_owned()]
-                ),
-                "{label}: {outcome:?}"
-            );
-            assert!(
-                outcome
-                    .diagnostics
-                    .iter()
-                    .any(|diagnostic| diagnostic.kind == "unordered_candidates"
-                        && diagnostic.message.contains("E0034")),
-                "{label}: the ambiguity names its cause: {outcome:?}"
-            );
         }
     }
 
@@ -4321,6 +4698,7 @@ mod tests {
     }
 
     #[test]
+    #[hardwon("#2767: an extern alias in an included member keeps its crate-root route")]
     fn crate_point_root_extern_alias_is_visible_in_include_member() {
         let project = InlineTestProject::new()
             .file("Cargo.toml", "[package]\nname='demo'\nversion='0.1.0'\nedition='2024'\n[dependencies]\ndep={path='dep'}\n")
@@ -4396,6 +4774,7 @@ mod tests {
     /// Pinned on a populated store under both statistics states, with the
     /// answer each file gives.
     #[test]
+    #[hardwon("53b66d27a224: macro ancestry reads were repeated for each reference")]
     fn macro_walk_ancestry_reads_every_parent_in_one_statement() {
         let lib = "macro_rules! shout { () => {} }\npub mod inner;\n";
         let inner = "pub mod deep;\npub mod host { include!(\"table.rs\"); }\n";
@@ -4646,7 +5025,9 @@ mod tests {
             {
                 pin.params = match pin.name.as_str() {
                     "rust_point_macro_import_target_range" => vec![int(blob), int(0)],
-                    "rust_point_demand_modules" => vec![int(blob), text("src/lib.rs")],
+                    "rust_point_demand_modules" => {
+                        vec![int(blob), text("src/lib.rs"), text(&format!("[{topology}]"))]
+                    }
                     "rust_point_demand_export_node" => vec![int(blob), int(0)],
                     "rust_point_demand_reverse_export_names" => {
                         vec![int(target_blob), int(target_site), text("type"), int(0)]
@@ -4661,7 +5042,8 @@ mod tests {
                     "rust_point_overlay_import_targets" => vec![int(blob), int(0)],
                     "rust_point_file_blob"
                     | "rust_point_gap_details"
-                    | "rust_point_macro_hosts" => {
+                    | "rust_point_macro_hosts"
+                    | "rust_point_macro_gated_unmounted_file" => {
                         vec![text("src/lib.rs")]
                     }
                     "rust_point_access_placements" | "rust_point_access_reference_placements" => {
@@ -4696,19 +5078,40 @@ mod tests {
                     "rust_point_open_inventory" => {
                         vec![int(topology), text("crate"), text("type"), text("Thing"), int(topology), text("crate")]
                     }
+                    "rust_point_unindexed_scope" => {
+                        vec![int(topology), text("crate::inner"), text("macro"), text("helper"), int(topology), text("crate")]
+                    }
                     "rust_point_open_route" => vec![int(topology), text("crate"), text("inner")],
-                    "rust_point_parent" => vec![int(topology), text("crate::inner")],
-                    "rust_point_anchored_import_binds" => vec![int(0), text("Alias")],
-                    "rust_point_root_reexport" => vec![int(topology), text("crate"), text("type"), text("Alias"), int(topology), text("crate")],
-                    "rust_point_serde_derive_binding" => vec![
+                    "rust_point_module_prefix_route"
+                    | "rust_point_module_import_prefix_route" => vec![
                         int(topology),
                         text("crate"),
-                        text("macro"),
-                        text("Serialize"),
+                        text("type"),
+                        text("Thing"),
                         int(topology),
                         text("crate"),
                     ],
-                    "rust_point_serde_helper_conditions" => vec![int(3)],
+                    "rust_point_parent" => vec![int(topology), text("crate::inner")],
+                    "rust_point_anchored_import_binds" => vec![int(0), text("Alias")],
+                    "rust_point_root_reexport" => vec![int(topology), text("crate"), text("type"), text("Alias"), int(topology), text("crate")],
+                    "rust_point_module_import_prefix_starts" => vec![int(topology), text("crate"), int(blob), int(0), text("alias"), text("type"), int(blob)],
+                    "rust_point_macro_gated_import_route" => vec![
+                        int(topology),
+                        text("crate"),
+                        int(blob),
+                        int(0),
+                        text("Alias"),
+                        int(blob),
+                    ],
+                    "rust_point_generated_surface_prefix"
+                    | "rust_point_generated_surface_module_prefix"
+                    | "rust_point_generated_surface_module_declaration_prefix" => {
+                        vec![int(0), text("Thing")]
+                    }
+                    "rust_point_generated_surface_source_module_prefix" => {
+                        vec![int(blob), text("Thing"), text("src/lib.rs")]
+                    }
+                    "rust_point_derive_helper_conditions" => vec![int(3), text("[[0,null]]")],
                     "rust_point_external_binding" => vec![
                         int(topology), text("crate::inner"), text("type"), text("Thing"), int(topology), text("crate"),
                         int(crate::analyzer::store::resolution_prepare::resolution_rows::namespace_code(brokk_bifrost_core::analyzer::resolution_facts::ResolutionNamespace::Type)),
@@ -4844,6 +5247,26 @@ mod tests {
                         "{state:?} {} has no indexed lookup: {plan:?}",
                         pin.name
                     );
+                    // The derive-helper read is driven by the mounts a lookup
+                    // reached: the mount is sought by ordinal and the
+                    // candidate declarations come from the partial index, so
+                    // the only scans are the two `json_each` tables and the
+                    // placement view's own scope-alignment recursion.
+                    if pin.name == "rust_point_derive_helper_conditions" {
+                        assert!(
+                            plan.iter().any(|step| step
+                                .contains("source_rust_declaration_properties_derive_helpers")),
+                            "{state:?} derive-helper read skips its partial index: {plan:?}"
+                        );
+                        assert!(
+                            plan.iter().all(|step| !step.starts_with("SCAN ")
+                                || step.contains("reached")
+                                || step.contains("helper")
+                                || step == "SCAN CONSTANT ROW"
+                                || step == "SCAN aligned"),
+                            "{state:?} derive-helper read scans a table: {plan:?}"
+                        );
+                    }
                     if pin.name == "rust_point_named" {
                         assert!(
                             !plan.iter().any(|step| step.contains("SCAN imports")),
@@ -4884,6 +5307,7 @@ mod tests {
     /// such an item as one of an unnameable trait made the replay find `Op`
     /// again and report a false E0034 tie. rustc calls the override.
     #[test]
+    #[hardwon("2150d85feb2f: an impl override was counted twice as an E0034 tie")]
     fn an_override_does_not_tie_with_the_method_it_overrides() {
         let source = "unexpanded_item_macro!();\ntrait Op {\n    fn name(&self) -> u8 {\n        0\n    }\n}\nstruct Service;\nimpl Op for Service {\n    fn name(&self) -> u8 {\n        1\n    }\n}\n\nfn caller(service: Service) {\n    service.name();\n}\n";
         let outcome = qualified_member_outcome(&[("t.rs", source)], "t.rs", "service.name");
@@ -5005,6 +5429,7 @@ mod tests {
     /// Bifrost sites, all calls from another crate, tied the override with
     /// the declaration it overrides.
     #[test]
+    #[hardwon("2cb71a73a409: a module re-export must not create a false override tie")]
     fn a_cross_crate_override_does_not_tie_through_a_module_import_reexport() {
         assert_override_alone(
             MODULE_IMPORT_REEXPORT,
@@ -5014,6 +5439,7 @@ mod tests {
     }
 
     #[test]
+    #[hardwon("2cb71a73a409: a direct re-export must preserve the impl trait owner")]
     fn a_cross_crate_override_does_not_tie_through_a_direct_reexport() {
         assert_override_alone(
             "pub mod java;\npub use core_crate::analyzer::code_unit_index::CodeUnitIndex;\n",
@@ -5025,6 +5451,7 @@ mod tests {
     /// A `#[cfg(test)] mod` beside the impl leaves a placement gap in the
     /// file; it does not make the override tie.
     #[test]
+    #[hardwon("2cb71a73a409: cfg test modules must not change cross-crate override identity")]
     fn a_cross_crate_override_does_not_tie_beside_a_cfg_test_module() {
         assert_override_alone(
             MODULE_IMPORT_REEXPORT,
@@ -5037,6 +5464,7 @@ mod tests {
     /// `get_definitions`, so the answer is not proven, but the override still
     /// does not tie with the declaration it overrides.
     #[test]
+    #[hardwon("2cb71a73a409: a qualified item macro must not create a false trait candidate")]
     fn a_cross_crate_override_does_not_tie_beside_a_qualified_item_macro() {
         assert_override_alone(
             "pub mod java;\nmacro_rules! fwd { ($t:ty) => { impl $t { pub fn extra(&self) {} } }; }\npub(crate) use fwd;\nuse core_crate::analyzer::{code_unit_index};\npub use code_unit_index::CodeUnitIndex;\n",
@@ -5052,6 +5480,7 @@ mod tests {
     /// request compiles no route for the library's `crate::`. The lookup used
     /// to claim a complete absence, so the call answered `NoDefinition`.
     #[test]
+    #[hardwon("2cb71a73a409: an unbridged dependency root cannot prove absence")]
     fn a_lookup_through_another_crates_root_is_incomplete_not_absent() {
         let files: Vec<(&str, &str)> = vec![
             (
@@ -5093,6 +5522,7 @@ mod tests {
     /// tract `TDim::from` sites answered a tie between `impl From<Symbol> for
     /// TDim` and `impl From<&Symbol> for TDim`, beside `from_i!`'s impls.
     #[test]
+    #[hardwon("140ac61e6887: impls of one unnameable trait were reported as an E0034 tie")]
     fn impls_of_one_unnameable_trait_are_undecided_not_a_tie() {
         for call in [
             "fn caller() {\n    let d = TDim::from(12);\n}\n",
@@ -5134,6 +5564,7 @@ mod tests {
     /// coercion filter proves every other impl's parameter cannot take it:
     /// a `u8` value binds no `&str` parameter.
     #[test]
+    #[hardwon("140ac61e6887: argument evidence must narrow impls of one unnameable trait")]
     fn the_argument_decides_among_impls_of_one_unnameable_trait() {
         let source = "pub struct W;\nimpl From<u8> for W {\n    fn from(v: u8) -> W {\n        W\n    }\n}\nimpl<'a> From<&'a str> for W {\n    fn from(v: &'a str) -> W {\n        W\n    }\n}\n\nfn caller(x: u8) {\n    let w = W::from(x);\n}\n";
         let outcome = qualified_member_outcome(&[("t.rs", source)], "t.rs", "W::from");
@@ -5217,6 +5648,7 @@ mod tests {
     /// census (2026-09-24): Bifrost's JavaScript and TypeScript import tests
     /// answered a tie between the two.
     #[test]
+    #[hardwon("6b483a993525: an out of scope trait method was admitted as a candidate")]
     fn a_trait_method_out_of_scope_at_the_call_is_not_a_candidate() {
         assert_eq!(
             trait_scope_outcome("use core_crate::iface::IAnalyzer;"),
@@ -5226,6 +5658,7 @@ mod tests {
 
     /// With both traits in scope the call is rustc's E0034, and stays a tie.
     #[test]
+    #[hardwon("6b483a993525: scope filtering must preserve the real E0034 tie")]
     fn two_trait_methods_in_scope_at_the_call_stay_a_tie() {
         assert_eq!(
             trait_scope_outcome(
@@ -5241,6 +5674,7 @@ mod tests {
 
     /// A glob import brings a trait into scope as a named import does.
     #[test]
+    #[hardwon("6b483a993525: a trait introduced by a glob import was omitted")]
     fn a_trait_in_scope_through_a_glob_import_is_a_candidate() {
         assert_eq!(
             trait_scope_outcome("use core_crate::iface::*;"),
@@ -5256,6 +5690,7 @@ mod tests {
     /// a persisted catalog and failed every point request in the file with a
     /// store error (678 tract sites in the point-answer census, 2026-09-24).
     #[test]
+    #[hardwon("b29b68d51e93: included source used the wrong staged catalog at its host")]
     fn an_include_spliced_module_resolves_through_its_hosts_glob_imports() {
         for both_hosts in [false, true] {
             let mut files = vec![
@@ -5314,6 +5749,7 @@ mod tests {
     /// found 31 such rows answering `invalid_location`), and the `Self::`
     /// path still resolves through the bound.
     #[test]
+    #[hardwon("f2faba63346c: a synthetic Self lower bound published a fake source span")]
     fn a_traits_self_lower_bound_publishes_no_reference_row() {
         let source = "pub trait Model {\n    type Fact;\n    fn fact(&self) -> Self::Fact;\n}\n";
         let outcome = qualified_member_outcome(&[("t.rs", source)], "t.rs", "Self::Fact");
@@ -5345,6 +5781,7 @@ mod tests {
     /// receiver slot had no producer, and the answer was incomplete with
     /// `missing-slot-producer` (the point-answer census, 2026-09-24).
     #[test]
+    #[hardwon("365b87dd9c25: try receiver slots lost their operand producer")]
     fn a_try_receiver_reaches_the_unwrapped_values_member() {
         for body in [
             "fn f(s: S) -> Result<(), ()> { s.maybe()?.b(); Ok(()) }",
@@ -5371,6 +5808,7 @@ mod tests {
     /// unsupported-expression gap, a fragment-local reason, not the
     /// operation's `missing-slot-producer` service reason.
     #[test]
+    #[hardwon("365b87dd9c25: an index receiver reported the wrong incomplete reason")]
     fn an_index_receivers_member_names_its_unsupported_receiver() {
         let source = format!("{RECEIVER_SHAPES}fn f(s: S) {{ s.ts[0].b(); }}\n");
         let outcome = qualified_member_outcome(&[("t.rs", &source)], "t.rs", "].b");
@@ -5410,6 +5848,7 @@ mod tests {
     /// Opaque external type identities travel through normal type transfers.
     /// They can name a candidate but never prove external member completeness.
     #[test]
+    #[hardwon("0f37730c3963: external import identity was lost through receiver type flow")]
     fn a_workspace_impl_for_an_external_type_supplies_the_receivers_member() {
         use crate::analyzer::usages::get_definition::DefinitionLookupStatus;
         let head = "use std::path::PathBuf;\npub trait NormalizePath {\n    fn normalize(&self) -> u8;\n}\nimpl NormalizePath for PathBuf {\n    fn normalize(&self) -> u8 { 7 }\n}\n";
@@ -5452,6 +5891,7 @@ mod tests {
     }
 
     #[test]
+    #[hardwon("0f37730c3963: external aliases and same-spelled local types shared an identity")]
     fn external_subject_identity_keeps_aliases_and_unrelated_bindings_distinct() {
         use crate::analyzer::usages::get_definition::DefinitionLookupStatus;
         for (source, expected) in [
@@ -5503,6 +5943,7 @@ mod tests {
     /// boundary, never a proved absence, in type, bound and value positions
     /// alike, and members of a value typed through it are not decided absent.
     #[test]
+    #[hardwon("f5fb9c487416: prelude names were incorrectly treated as proved absences")]
     fn a_prelude_name_is_an_unindexed_import_boundary() {
         use crate::analyzer::usages::get_definition::DefinitionLookupStatus::UnresolvableImportBoundary;
         for (lib, path) in [
@@ -5528,6 +5969,7 @@ mod tests {
     /// A lexical binding of a prelude name wins over the prelude, as in rustc.
     /// A struct's private constructor is such a binding in its own module.
     #[test]
+    #[hardwon("f5fb9c487416: a local item must shadow its implicit prelude spelling")]
     fn a_local_item_shadows_the_prelude() {
         for (lib, name) in [
             ("pub type A = Vec;\npub struct Vec;\n", "Vec"),
@@ -5556,6 +5998,7 @@ mod tests {
     /// that is the variant's own member scope, not the enum's, exactly as a
     /// struct literal writes them. Explicit and shorthand fields alike.
     #[test]
+    #[hardwon("#3746: a variant pattern field resolved against the enum scope")]
     fn a_variant_struct_pattern_field_resolves_on_the_variant() {
         for body in [
             "pub fn f(e: E) { let E::V { ty: x } = e; let _ = x; }\n",
@@ -5581,6 +6024,7 @@ mod tests {
     /// joined the prelude in 2021, `#![no_std]` selects core's prelude, which
     /// has `Option` but not `String`, and `#![no_core]` has no prelude.
     #[test]
+    #[hardwon("f5fb9c487416: edition and no_std prelude names were classified incorrectly")]
     fn the_crates_edition_and_prelude_kind_select_the_prelude_names() {
         use crate::analyzer::usages::get_definition::DefinitionLookupStatus::{
             NoDefinition, UnresolvableImportBoundary,
@@ -5631,6 +6075,7 @@ mod tests {
     /// the item answers alone and complete: the rows enumerated every trait the
     /// call site can name, and none supplies the method.
     #[test]
+    #[hardwon("21a0f8b34f4a: an unnameable trait item was lost from a real candidate tie")]
     fn an_impl_item_of_an_unnameable_trait_meets_the_nameable_traits() {
         use crate::analyzer::usages::get_definition::DefinitionLookupStatus;
 
@@ -5674,6 +6119,9 @@ mod tests {
     /// The reverse half: the unnameable trait's impl item and the nameable
     /// trait's default each see the tied call as a usage they cannot prove.
     #[test]
+    #[hardwon(
+        "21a0f8b34f4a: both candidates in an unnameable-trait tie need unproven reverse edges"
+    )]
     fn an_unnameable_trait_items_tie_is_an_unproven_usage_of_each_candidate() {
         for (line, symbol) in [(7, "Service.fmt"), (4, "Two.fmt")] {
             assert_one_unproven_usage(&scan_usages_at(UNNAMEABLE_TRAIT_TIE, line), symbol, 14);

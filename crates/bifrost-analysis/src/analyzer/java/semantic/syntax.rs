@@ -1,4 +1,7 @@
 use super::*;
+use crate::analyzer::common::is_comment_kind;
+use crate::analyzer::semantic::lowering::field_matches;
+pub(super) use brokk_bifrost_jvm::java::declarations::java_field_access_is_selector_object;
 
 pub(super) fn declaration_container_kind(node: Node<'_>) -> Option<DeclarationSegmentKind> {
     match node.kind() {
@@ -18,17 +21,12 @@ pub(super) fn declaration_container_kind(node: Node<'_>) -> Option<DeclarationSe
     }
 }
 
-pub(super) fn declaration_container_name(source: &str, node: Node<'_>) -> Option<Box<str>> {
-    node.child_by_field_name("name")
-        .and_then(|name| nonempty_node_text(source, name))
-        .map(Box::<str>::from)
-}
+pub(super) use crate::analyzer::common::declaration_container_name;
 
 pub(super) fn callable_name(source: &str, node: Node<'_>) -> Option<Box<str>> {
-    node.child_by_field_name("name")
-        .and_then(|name| nonempty_node_text(source, name))
-        .map(Box::<str>::from)
-        .or_else(|| enclosing_variable_name(source, node))
+    crate::analyzer::semantic::lowering::callable_name_with_binding(source, node, || {
+        enclosing_variable_name(source, node)
+    })
 }
 
 fn enclosing_variable_name(source: &str, node: Node<'_>) -> Option<Box<str>> {
@@ -224,12 +222,6 @@ pub(super) fn has_modifier(node: Node<'_>, modifier: &str) -> bool {
         .any(|keyword| keyword == modifier)
 }
 
-fn field_matches(parent: Node<'_>, field: &str, child: Node<'_>) -> bool {
-    parent
-        .child_by_field_name(field)
-        .is_some_and(|candidate| candidate.id() == child.id())
-}
-
 pub(super) fn java_switch_arms(body: Node<'_>) -> Vec<JavaSwitchArm<'_>> {
     named_children(body)
         .into_iter()
@@ -273,9 +265,7 @@ pub(super) fn switch_label_has_pattern(label: Node<'_>) -> bool {
 }
 
 pub(super) fn switch_label_guard(label: Node<'_>) -> Option<Node<'_>> {
-    named_children(label)
-        .into_iter()
-        .find(|child| child.kind() == "guard")
+    brokk_bifrost_core::analyzer::tree_walk::first_named_child_of_kind(label, "guard")
         .and_then(first_named_child)
 }
 
@@ -304,10 +294,7 @@ pub(super) fn method_reference_qualifier(node: Node<'_>) -> Option<Node<'_>> {
     })
 }
 
-pub(super) fn has_child_kind(node: Node<'_>, kind: &str) -> bool {
-    let mut cursor = node.walk();
-    node.children(&mut cursor).any(|child| child.kind() == kind)
-}
+pub(super) use brokk_bifrost_core::analyzer::tree_walk::has_child_of_kind as has_child_kind;
 
 pub(super) fn runtime_expression_children(node: Node<'_>) -> Vec<Node<'_>> {
     let fields: &[&str] = match node.kind() {
@@ -381,16 +368,15 @@ fn is_annotation_kind(kind: &str) -> bool {
 }
 
 pub(super) fn named_children(node: Node<'_>) -> Vec<Node<'_>> {
-    let mut cursor = node.walk();
-    node.named_children(&mut cursor)
+    brokk_bifrost_core::analyzer::tree_walk::named_children_iter(node)
         .filter(|child| !is_comment_kind(child.kind()))
         .collect()
 }
 
 pub(super) fn first_named_child(node: Node<'_>) -> Option<Node<'_>> {
-    let mut cursor = node.walk();
-    node.named_children(&mut cursor)
-        .find(|child| !is_comment_kind(child.kind()))
+    brokk_bifrost_core::analyzer::tree_walk::first_named_child_matching(node, |child| {
+        !is_comment_kind(child.kind())
+    })
 }
 
 pub(super) fn catch_parameter_has_precise_type(parameter: Node<'_>) -> bool {
@@ -415,25 +401,11 @@ pub(super) fn catch_parameter_has_precise_type(parameter: Node<'_>) -> bool {
         )
 }
 
-fn is_comment_kind(kind: &str) -> bool {
-    matches!(kind, "line_comment" | "block_comment" | "comment")
-}
-
 pub(super) fn required_field<'tree>(
     node: Node<'tree>,
     field: &str,
 ) -> Result<Node<'tree>, JavaLoweringError> {
-    node.child_by_field_name(field)
-        .ok_or_else(|| missing_field(node, field))
-}
-
-pub(super) fn missing_field(node: Node<'_>, field: &str) -> JavaLoweringError {
-    JavaLoweringError::Invalid(format!(
-        "{} node at bytes {}..{} is missing structured field {field}",
-        node.kind(),
-        node.start_byte(),
-        node.end_byte()
-    ))
+    crate::analyzer::semantic::lowering::required_field_or_else(node, field, missing_field)
 }
 
 pub(super) fn is_java_nested_execution_boundary(node: Node<'_>) -> bool {
@@ -456,21 +428,12 @@ pub(super) fn body_contains_free_this(
     body: Node<'_>,
     cancellation: &CancellationToken,
 ) -> Result<bool, LoweringCancelled> {
-    let mut found = false;
-    try_walk_named_tree_preorder(body, true, |node| {
-        if cancellation.is_cancelled() {
-            return Err(LoweringCancelled);
-        }
-        if is_java_nested_execution_boundary(node) {
-            return Ok(WalkControl::SkipChildren);
-        }
-        if node.kind() == "this" {
-            found = true;
-            return Ok(WalkControl::Break);
-        }
-        Ok(WalkControl::Continue)
-    })?;
-    Ok(found)
+    crate::analyzer::semantic::lowering::body_contains_matching_node(
+        body,
+        cancellation,
+        is_java_nested_execution_boundary,
+        |node| node.kind() == "this",
+    )
 }
 
 #[derive(Clone, Copy)]
@@ -519,9 +482,8 @@ pub(super) fn java_binding_type(node: Node<'_>) -> Option<Node<'_>> {
 }
 
 pub(super) fn java_local_scope(node: Node<'_>) -> Option<(usize, usize)> {
-    let mut current = node.parent();
-    while let Some(parent) = current {
-        if matches!(
+    brokk_bifrost_core::analyzer::tree_walk::find_ancestor(node, |parent| {
+        matches!(
             parent.kind(),
             "block"
                 | "constructor_body"
@@ -530,15 +492,9 @@ pub(super) fn java_local_scope(node: Node<'_>) -> Option<(usize, usize)> {
                 | "switch_block_statement_group"
                 | "switch_rule"
                 | "catch_clause"
-        ) {
-            return Some((parent.start_byte(), parent.end_byte()));
-        }
-        if is_java_nested_execution_boundary(parent) {
-            return Some((parent.start_byte(), parent.end_byte()));
-        }
-        current = parent.parent();
-    }
-    None
+        ) || is_java_nested_execution_boundary(parent)
+    })
+    .map(|scope| (scope.start_byte(), scope.end_byte()))
 }
 
 pub(super) fn expression_value_kind(node: Node<'_>) -> SemanticValueKind {
@@ -665,13 +621,6 @@ fn java_outermost_selector_field_access(mut node: Node<'_>) -> Node<'_> {
     node
 }
 
-fn java_field_access_is_selector_object(node: Node<'_>) -> bool {
-    node.parent().is_some_and(|parent| {
-        matches!(parent.kind(), "field_access" | "method_invocation")
-            && parent.child_by_field_name("object") == Some(node)
-    })
-}
-
 /// A `field_access` that is only a type or package qualifier, not heap memory.
 ///
 /// The proof is JLS 6.5 reclassification of a PackageOrTypeName, not "the
@@ -735,15 +684,4 @@ pub(super) fn is_runtime_leaf(kind: &str) -> bool {
             | "line_comment"
             | "block_comment"
     )
-}
-
-pub(super) const fn completion_label(kind: CompletionKind) -> &'static str {
-    match kind {
-        CompletionKind::Normal => "normal",
-        CompletionKind::Return => "return",
-        CompletionKind::Throw => "throw",
-        CompletionKind::Break => "break",
-        CompletionKind::Continue => "continue",
-        CompletionKind::Yield => "yield",
-    }
 }

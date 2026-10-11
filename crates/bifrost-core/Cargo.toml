@@ -48,10 +48,20 @@ tempfile = "3.23.0"
 tree-sitter = "0.25.10"
 walkdir = "2.5.0"
 
-[target.'cfg(target_os = "linux")'.dependencies]
+[target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61.2", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_System_Diagnostics_ToolHelp",
+    "Win32_System_JobObjects",
+    "Win32_System_Threading",
+] }
+
 [dev-dependencies]
+brokk-bifrost-test-macros = { path = "../bifrost-test-macros" }
 # Generative property tests for the construction-point invariants (FqName
 # round-trips, line tables, workspace-relative paths). See issue #1189 for the
 # model assertion these generators feed.

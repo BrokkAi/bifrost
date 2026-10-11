@@ -8,15 +8,94 @@ use crate::analyzer::resolution::{LoweredPackageMember, LoweredPackageReference}
 pub(crate) struct SelectedPackageBridgeDescriptor {
     pub(super) source_fragment: BindingFragmentId,
     pub(super) target_fragment: BindingFragmentId,
-    pub(super) language: Language,
+    source_language: Language,
+    target_language: Language,
     source_token: SemanticId,
     target_token: SemanticId,
-    domain: SemanticId,
-    lookup: SemanticId,
+    source_domain: SemanticId,
+    source_lookup: SemanticId,
+    target_domain: SemanticId,
+    target_lookup: SemanticId,
+    target_definition: Option<BindingNodeId>,
+    route_identity: [u8; 32],
+    precedence: Option<PrecedenceStep>,
+    jvm_evidence: Option<SelectedJvmBridgeEvidence>,
     completion: ResolutionCompletion,
 }
 
 impl SelectedPackageBridgeDescriptor {
+    pub(super) fn matches_qualified_reference(
+        &self,
+        source_fragment: BindingFragmentId,
+        source_token: SemanticId,
+        source_lookups: &[SemanticId],
+    ) -> bool {
+        self.source_fragment == source_fragment
+            && self.source_token == source_token
+            && source_lookups.contains(&self.source_lookup)
+    }
+
+    pub(crate) fn qualified_root_reference_bridge(
+        &self,
+        source_token: SemanticId,
+        anchor: ResolutionRootImportAnchor,
+        anchor_semantic: SemanticId,
+        route: &[ResolutionLookupSemanticRecipe],
+        source_demand: &ResolutionLookupSemanticRecipe,
+    ) -> Option<SelectedRootBridgeDescriptor> {
+        let target_definition = self.target_definition?;
+        assert_eq!(
+            source_demand.identity_domain(),
+            language_identity_domain(self.source_language)
+        );
+        if let Some(evidence) = self.jvm_evidence {
+            assert_eq!(source_demand.namespace(), evidence.source_namespace);
+        }
+        let target_demand = ResolutionLookupSemanticRecipe::new(
+            self.target_language,
+            source_demand.namespace(),
+            source_demand.spelling(),
+        );
+        let bridge = if let Some(evidence) = self.jvm_evidence {
+            SelectedRootBridgeDescriptor::from_selected_path_tokens_with_jvm_evidence(
+                self.source_fragment,
+                self.source_language,
+                source_token,
+                anchor,
+                anchor_semantic,
+                self.target_fragment,
+                self.target_language,
+                self.target_token,
+                None,
+                route.to_vec(),
+                source_demand.clone(),
+                target_demand,
+                evidence,
+                self.completion.clone(),
+            )
+        } else {
+            SelectedRootBridgeDescriptor::from_selected_path_tokens(
+                self.source_fragment,
+                self.source_language,
+                source_token,
+                anchor,
+                anchor_semantic,
+                self.target_fragment,
+                self.target_language,
+                self.target_token,
+                route.to_vec(),
+                source_demand.clone(),
+                target_demand,
+                self.completion.clone(),
+            )
+        };
+        Some(
+            bridge
+                .with_precedence(self.precedence)
+                .with_selected_member_definition(target_definition),
+        )
+    }
+
     /// Both metadata rows must come from the operation's selected catalogs.
     /// Package identity and visibility are established by the language's SQL
     /// context reader before this constructor is called.
@@ -38,11 +117,274 @@ impl SelectedPackageBridgeDescriptor {
         Self {
             source_fragment,
             target_fragment,
-            language,
+            source_language: language,
+            target_language: language,
             source_token: reference.token,
             target_token: member.token,
-            domain: reference.domain,
-            lookup: reference.lookup,
+            source_domain: reference.domain,
+            source_lookup: reference.lookup,
+            target_domain: member.domain,
+            target_lookup: member.lookup,
+            target_definition: None,
+            route_identity: [0; 32],
+            precedence: None,
+            jvm_evidence: None,
+            completion,
+        }
+    }
+
+    /// Connect package identities from distinct selected JVM languages only
+    /// after the store reader has proved the structured package relation,
+    /// exact target and source-root/dependency authority.
+    /// The endpoint identities and bridge proof remain separate inputs so the
+    /// constructor can validate each against its selected row.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn new_jvm(
+        source_fragment: BindingFragmentId,
+        target_fragment: BindingFragmentId,
+        source_language: Language,
+        target_language: Language,
+        reference: &LoweredPackageReference,
+        member: &LoweredPackageMember,
+        evidence: SelectedJvmBridgeEvidence,
+        completion: ResolutionCompletion,
+    ) -> Self {
+        assert!(matches!(
+            source_language,
+            Language::Java | Language::Kotlin | Language::Scala
+        ));
+        assert!(matches!(
+            target_language,
+            Language::Java | Language::Kotlin | Language::Scala
+        ));
+        assert_ne!(source_language, target_language);
+        assert_eq!(reference.namespace, evidence.source_namespace);
+        assert_eq!(member.namespace, evidence.target_namespace);
+        assert_eq!(evidence.source_namespace, evidence.target_namespace);
+        assert_eq!(member.definition, evidence.target_declaration);
+        match evidence.provenance {
+            SelectedJvmBridgeProvenance::StructuredPackageType {
+                source_package,
+                target_package,
+            } => {
+                assert_eq!(source_package, reference.domain);
+                assert_eq!(target_package, member.domain);
+            }
+            SelectedJvmBridgeProvenance::AliasFact { .. } => {
+                panic!("selected package bridge requires structured package identity")
+            }
+        }
+        assert!(reference.domain.shared_name_id().is_some());
+        assert!(reference.lookup.shared_name_id().is_some());
+        assert!(member.domain.shared_name_id().is_some());
+        assert!(member.lookup.shared_name_id().is_some());
+        assert!(!completion.contains_reason(ResolutionIncompleteReason::Cancelled));
+        if evidence.visibility == SelectedJvmBridgeVisibility::Open {
+            assert!(matches!(&completion, ResolutionCompletion::Incomplete(_)));
+        }
+        Self {
+            source_fragment,
+            target_fragment,
+            source_language,
+            target_language,
+            source_token: reference.token,
+            target_token: member.token,
+            source_domain: reference.domain,
+            source_lookup: reference.lookup,
+            target_domain: member.domain,
+            target_lookup: member.lookup,
+            target_definition: None,
+            route_identity: [0; 32],
+            precedence: None,
+            jvm_evidence: Some(evidence),
+            completion,
+        }
+    }
+
+    /// Connect one selected import selector to a selected package member.
+    /// The caller proves the package route and selector row before invoking
+    /// this constructor; cross-language routes additionally carry the exact
+    /// JVM target and visibility evidence.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn new_jvm_import(
+        source_fragment: BindingFragmentId,
+        target_fragment: BindingFragmentId,
+        source_language: Language,
+        target_language: Language,
+        reference: &LoweredPackageReference,
+        member: &LoweredPackageMember,
+        source_lookup: &ResolutionLookupSemanticRecipe,
+        target_lookup: &ResolutionLookupSemanticRecipe,
+        target_definition: BindingNodeId,
+        route_identity: [u8; 32],
+        precedence: Option<PrecedenceStep>,
+        names: &dyn SharedNameInterner,
+        evidence: Option<SelectedJvmBridgeEvidence>,
+        completion: ResolutionCompletion,
+    ) -> Self {
+        assert!(matches!(
+            source_language,
+            Language::Java | Language::Kotlin | Language::Scala
+        ));
+        assert!(matches!(
+            target_language,
+            Language::Java | Language::Kotlin | Language::Scala
+        ));
+        assert_eq!(
+            source_lookup.identity_domain(),
+            language_identity_domain(source_language)
+        );
+        assert_eq!(
+            target_lookup.identity_domain(),
+            language_identity_domain(target_language)
+        );
+        assert_eq!(source_lookup.namespace(), target_lookup.namespace());
+        assert_eq!(source_lookup.namespace(), reference.namespace);
+        assert_eq!(target_lookup.namespace(), member.namespace);
+        assert_eq!(source_lookup.spelling(), target_lookup.spelling());
+        assert_eq!(reference.lookup, source_lookup.semantic(names));
+        assert_eq!(member.lookup, target_lookup.semantic(names));
+        if let Some(step) = precedence {
+            assert_eq!(source_language, Language::Kotlin);
+            assert_eq!(
+                step.semantic,
+                reference
+                    .choice
+                    .expect("selected Kotlin package choice is persisted")
+            );
+            assert_eq!(step.ordinal, 0);
+            assert!(matches!(
+                step.tier,
+                PrecedenceTier::PackageOrModule | PrecedenceTier::DefaultImport
+            ));
+        }
+        assert_eq!(
+            source_language == target_language,
+            evidence.is_none(),
+            "a cross-language JVM import requires explicit bridge evidence"
+        );
+        assert!(reference.domain.shared_name_id().is_some());
+        assert!(member.domain.shared_name_id().is_some());
+        assert!(!completion.contains_reason(ResolutionIncompleteReason::Cancelled));
+        if let Some(evidence) = evidence {
+            assert_ne!(source_language, target_language);
+            assert_eq!(evidence.source_namespace, source_lookup.namespace());
+            assert_eq!(evidence.target_namespace, target_lookup.namespace());
+            assert_eq!(evidence.target_declaration, member.definition);
+            assert_eq!(evidence.target_definition, target_definition);
+            assert_eq!(
+                evidence.provenance,
+                SelectedJvmBridgeProvenance::StructuredPackageType {
+                    source_package: reference.domain,
+                    target_package: member.domain,
+                }
+            );
+            if evidence.visibility == SelectedJvmBridgeVisibility::Open {
+                assert!(matches!(&completion, ResolutionCompletion::Incomplete(_)));
+            }
+        } else {
+            assert_eq!(source_language, target_language);
+            assert_eq!(reference.domain, member.domain);
+        }
+        Self {
+            source_fragment,
+            target_fragment,
+            source_language,
+            target_language,
+            source_token: reference.token,
+            target_token: member.token,
+            source_domain: reference.domain,
+            source_lookup: source_lookup.semantic(names),
+            target_domain: member.domain,
+            target_lookup: target_lookup.semantic(names),
+            target_definition: Some(target_definition),
+            route_identity,
+            precedence,
+            jvm_evidence: evidence,
+            completion,
+        }
+    }
+
+    /// Direct selected route to a member reached through an imported JVM
+    /// singleton such as Scala's `Predef`. The relation is admitted only for
+    /// one exact selected declaration and its typed owner route.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn new_jvm_selected_definition_import(
+        source_fragment: BindingFragmentId,
+        target_fragment: BindingFragmentId,
+        source_language: Language,
+        target_language: Language,
+        reference: &LoweredPackageReference,
+        source_lookup: &ResolutionLookupSemanticRecipe,
+        target_declaration: SemanticId,
+        target_definition: BindingNodeId,
+        target_domain: SemanticId,
+        target_lookup: &ResolutionLookupSemanticRecipe,
+        route_identity: [u8; 32],
+        names: &dyn SharedNameInterner,
+        evidence: Option<SelectedJvmBridgeEvidence>,
+        completion: ResolutionCompletion,
+    ) -> Self {
+        assert!(matches!(
+            source_language,
+            Language::Java | Language::Kotlin | Language::Scala
+        ));
+        assert!(matches!(
+            target_language,
+            Language::Java | Language::Kotlin | Language::Scala
+        ));
+        assert_eq!(
+            source_lookup.identity_domain(),
+            language_identity_domain(source_language)
+        );
+        assert_eq!(
+            target_lookup.identity_domain(),
+            language_identity_domain(target_language)
+        );
+        assert_eq!(source_lookup.namespace(), target_lookup.namespace());
+        assert_eq!(source_lookup.namespace(), reference.namespace);
+        assert_eq!(reference.lookup, source_lookup.semantic(names));
+        assert_eq!(
+            source_language == target_language,
+            evidence.is_none(),
+            "a cross-language singleton import requires explicit JVM evidence"
+        );
+        assert!(reference.domain.shared_name_id().is_some());
+        assert!(target_domain.shared_name_id().is_some());
+        assert!(!completion.contains_reason(ResolutionIncompleteReason::Cancelled));
+        if let Some(evidence) = evidence {
+            assert_eq!(evidence.source_namespace, source_lookup.namespace());
+            assert_eq!(evidence.target_namespace, target_lookup.namespace());
+            assert_eq!(evidence.target_declaration, target_declaration);
+            assert_eq!(evidence.target_definition, target_definition);
+            assert_eq!(
+                evidence.provenance,
+                SelectedJvmBridgeProvenance::StructuredPackageType {
+                    source_package: reference.domain,
+                    target_package: target_domain,
+                }
+            );
+            if evidence.visibility == SelectedJvmBridgeVisibility::Open {
+                assert!(matches!(&completion, ResolutionCompletion::Incomplete(_)));
+            }
+        } else {
+            assert_eq!(reference.domain, target_domain);
+        }
+        Self {
+            source_fragment,
+            target_fragment,
+            source_language,
+            target_language,
+            source_token: reference.token,
+            target_token: target_declaration,
+            source_domain: reference.domain,
+            source_lookup: source_lookup.semantic(names),
+            target_domain,
+            target_lookup: target_lookup.semantic(names),
+            target_definition: Some(target_definition),
+            route_identity,
+            precedence: None,
+            jvm_evidence: evidence,
             completion,
         }
     }
@@ -51,16 +393,87 @@ impl SelectedPackageBridgeDescriptor {
         let mut hash = CanonicalHasher::new(domain);
         hash.field("source", &self.source_fragment.as_bytes());
         hash.field("target", &self.target_fragment.as_bytes());
-        hash.field("language", self.language.config_label().as_bytes());
+        hash.field(
+            "source_language",
+            self.source_language.config_label().as_bytes(),
+        );
+        hash.field(
+            "target_language",
+            self.target_language.config_label().as_bytes(),
+        );
         hash.field("source_token", &self.source_token.as_bytes());
         hash.field("target_token", &self.target_token.as_bytes());
-        hash.field("domain", &self.domain.as_bytes());
-        hash.field("lookup", &self.lookup.as_bytes());
+        hash.field("source_domain", &self.source_domain.as_bytes());
+        hash.field("source_lookup", &self.source_lookup.as_bytes());
+        hash.field("target_domain", &self.target_domain.as_bytes());
+        hash.field("target_lookup", &self.target_lookup.as_bytes());
+        hash.field("route_identity", &self.route_identity);
+        if let Some(step) = self.precedence {
+            hash.field("precedence_tier", step.tier.label().as_bytes());
+            hash.field("precedence_ordinal", &step.ordinal.to_le_bytes());
+            hash.field("precedence_choice", &step.semantic.as_bytes());
+        }
+        if let Some(definition) = self.target_definition {
+            hash.field("target_definition", &definition.as_bytes());
+        }
+        if let Some(evidence) = self.jvm_evidence {
+            hash.field("dependency_identity", &evidence.dependency_identity);
+            hash.field(
+                "target_declaration",
+                &evidence.target_declaration.as_bytes(),
+            );
+            hash.field("target_definition", &evidence.target_definition.as_bytes());
+            hash.field(
+                "source_namespace",
+                evidence.source_namespace.identity_label().as_bytes(),
+            );
+            hash.field(
+                "target_namespace",
+                evidence.target_namespace.identity_label().as_bytes(),
+            );
+            hash.field(
+                "visibility",
+                match evidence.visibility {
+                    SelectedJvmBridgeVisibility::Public => b"public".as_slice(),
+                    SelectedJvmBridgeVisibility::Protected => b"protected".as_slice(),
+                    SelectedJvmBridgeVisibility::Package => b"package".as_slice(),
+                    SelectedJvmBridgeVisibility::Open => b"open".as_slice(),
+                },
+            );
+            match evidence.provenance {
+                SelectedJvmBridgeProvenance::StructuredPackageType {
+                    source_package,
+                    target_package,
+                } => {
+                    hash.field("provenance", b"structured_package_type");
+                    hash.field("source_package", &source_package.as_bytes());
+                    hash.field("target_package", &target_package.as_bytes());
+                }
+                SelectedJvmBridgeProvenance::AliasFact { alias } => {
+                    hash.field("provenance", b"alias_fact");
+                    hash.field("alias", &alias.as_bytes());
+                }
+            }
+        }
         hash.finish()
     }
 
-    pub(crate) fn shared_identities(&self) -> [ResolutionSemanticIdentity; 2] {
-        [self.domain, self.lookup].map(|semantic| {
+    pub(crate) const fn source_language(&self) -> Language {
+        self.source_language
+    }
+
+    pub(crate) const fn target_language(&self) -> Language {
+        self.target_language
+    }
+
+    pub(crate) fn shared_identities(&self) -> [ResolutionSemanticIdentity; 4] {
+        [
+            self.source_domain,
+            self.source_lookup,
+            self.target_domain,
+            self.target_lookup,
+        ]
+        .map(|semantic| {
             ResolutionSemanticIdentity::Shared(
                 semantic.shared_name_id().expect("shared package symbol"),
             )
@@ -81,23 +494,74 @@ impl SelectedPackageBridgeDescriptor {
         let path = identities.path(self.digest(b"bifrost-selected-package-path:v1"));
         let tail = identities.stack_variable(self.digest(b"bifrost-selected-package-tail:v1"));
         let root = BindingNodeId::universal_root();
+        let (end_node, export, witness) = if let Some(definition) = self.target_definition {
+            (definition, Vec::new(), vec![WitnessStep::Node(definition)])
+        } else {
+            (
+                BindingNodeId::universal_root(),
+                vec![self.target_lookup, self.target_domain, self.target_token],
+                Vec::new(),
+            )
+        };
         Some((
             CandidatePathIdentity::new(self.source_fragment, path),
             PartialPath::new(
                 EndpointSignature::new(
                     root,
-                    StackPattern::open([self.domain, self.source_token, self.lookup], tail),
+                    StackPattern::open(
+                        [self.source_domain, self.source_token, self.source_lookup],
+                        tail,
+                    ),
                     StackPattern::closed([]),
                 ),
                 EndpointSignature::new(
-                    root,
-                    StackPattern::open([self.lookup, self.domain, self.target_token], tail),
+                    end_node,
+                    StackPattern::open(export, tail),
                     StackPattern::closed([]),
                 ),
-                [],
-                [],
+                self.precedence.into_iter().collect::<Vec<_>>(),
+                witness,
                 self.completion.clone(),
             ),
         ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn selected_kotlin_default_bridge_emits_its_default_import_tier() {
+        let step = PrecedenceStep {
+            tier: PrecedenceTier::DefaultImport,
+            ordinal: 0,
+            semantic: SemanticId::for_test(b"kotlin-default-import-choice"),
+        };
+        let bridge = SelectedPackageBridgeDescriptor {
+            source_fragment: BindingFragmentId::for_test(b"kotlin-import-source"),
+            target_fragment: BindingFragmentId::for_test(b"kotlin-import-target"),
+            source_language: Language::Kotlin,
+            target_language: Language::Kotlin,
+            source_token: SemanticId::for_test(b"kotlin-source-token"),
+            target_token: SemanticId::for_test(b"kotlin-target-token"),
+            source_domain: SemanticId::for_test(b"kotlin-source-domain"),
+            source_lookup: SemanticId::for_test(b"kotlin-source-lookup"),
+            target_domain: SemanticId::for_test(b"kotlin-target-domain"),
+            target_lookup: SemanticId::for_test(b"kotlin-target-lookup"),
+            target_definition: Some(BindingNodeId::universal_root()),
+            route_identity: [0; 32],
+            precedence: Some(step),
+            jvm_evidence: None,
+            completion: ResolutionCompletion::Complete,
+        };
+        let compiled = bridge
+            .compile(
+                &SelectedContextIdentities::new(),
+                &CancellationToken::default(),
+                &ResolutionSession::unbounded(),
+            )
+            .expect("a live selected package bridge compiles");
+        assert_eq!(compiled.1.precedence(), &[step]);
     }
 }

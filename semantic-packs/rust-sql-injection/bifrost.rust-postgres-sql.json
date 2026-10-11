@@ -1,0 +1,408 @@
+{
+  "schema_version": 2,
+  "pack_id": "bifrost.rust-postgres-sql",
+  "version": "0.1.0",
+  "producer": {
+    "name": "bifrost-reviewed-rust-sql-models",
+    "version": "0.1.0"
+  },
+  "language": "rust",
+  "ecosystem": "cargo",
+  "compatibility": {
+    "bifrost": ">=0.12.0, <1.0.0",
+    "toolchains": []
+  },
+  "provenance": {
+    "source": "postgres crate API shape: the synchronous postgres::Client SQL entry points. The SQL text is parameter 0; bound values are parameter 1 and reach neither the result nor the client.",
+    "revision": "api-shape"
+  },
+  "license": "Apache-2.0",
+  "completeness": "complete",
+  "safety": {
+    "generated_code_only": false,
+    "review_required": false
+  },
+  "shards": [
+    {
+      "id": "declarations.rust-sql.postgres",
+      "activation": [
+        {
+          "targets": [],
+          "configurations": []
+        }
+      ],
+      "payload": {
+        "kind": "declaration_facts",
+        "types": [
+          {
+            "id": "type.rust-sql.postgres",
+            "name": "postgres",
+            "type_kind": "module",
+            "visibility": "public",
+            "locator": {
+              "kind": "artifact",
+              "path": "src/lib.rs",
+              "symbol": "postgres"
+            }
+          },
+          {
+            "id": "type.rust-sql.postgres-client",
+            "name": "postgres.Client",
+            "type_kind": "struct",
+            "visibility": "public",
+            "locator": {
+              "kind": "artifact",
+              "path": "src/client.rs",
+              "symbol": "postgres.Client"
+            }
+          }
+        ],
+        "members": [
+          {
+            "id": "member.rust-sql.postgres-client.execute",
+            "owner": "type.rust-sql.postgres-client",
+            "name": "execute",
+            "member_kind": "method",
+            "visibility": "public",
+            "is_static": false,
+            "callable_family_complete": true,
+            "signature": {
+              "parameters": [
+                {
+                  "name": "query",
+                  "type": {
+                    "kind": "named",
+                    "name": "untyped"
+                  }
+                },
+                {
+                  "name": "params",
+                  "type": {
+                    "kind": "named",
+                    "name": "untyped"
+                  }
+                }
+              ],
+              "returns": {
+                "kind": "named",
+                "name": "std.result.Result"
+              }
+            },
+            "locator": {
+              "kind": "artifact",
+              "path": "src/client.rs",
+              "symbol": "postgres.Client.execute"
+            }
+          },
+          {
+            "id": "member.rust-sql.postgres-client.query",
+            "owner": "type.rust-sql.postgres-client",
+            "name": "query",
+            "member_kind": "method",
+            "visibility": "public",
+            "is_static": false,
+            "callable_family_complete": true,
+            "signature": {
+              "parameters": [
+                {
+                  "name": "query",
+                  "type": {
+                    "kind": "named",
+                    "name": "untyped"
+                  }
+                },
+                {
+                  "name": "params",
+                  "type": {
+                    "kind": "named",
+                    "name": "untyped"
+                  }
+                }
+              ],
+              "returns": {
+                "kind": "named",
+                "name": "std.result.Result"
+              }
+            },
+            "locator": {
+              "kind": "artifact",
+              "path": "src/client.rs",
+              "symbol": "postgres.Client.query"
+            }
+          },
+          {
+            "id": "member.rust-sql.postgres-client.query-one",
+            "owner": "type.rust-sql.postgres-client",
+            "name": "query_one",
+            "member_kind": "method",
+            "visibility": "public",
+            "is_static": false,
+            "callable_family_complete": true,
+            "signature": {
+              "parameters": [
+                {
+                  "name": "query",
+                  "type": {
+                    "kind": "named",
+                    "name": "untyped"
+                  }
+                },
+                {
+                  "name": "params",
+                  "type": {
+                    "kind": "named",
+                    "name": "untyped"
+                  }
+                }
+              ],
+              "returns": {
+                "kind": "named",
+                "name": "std.result.Result"
+              }
+            },
+            "locator": {
+              "kind": "artifact",
+              "path": "src/client.rs",
+              "symbol": "postgres.Client.query_one"
+            }
+          },
+          {
+            "id": "member.rust-sql.postgres-client.query-opt",
+            "owner": "type.rust-sql.postgres-client",
+            "name": "query_opt",
+            "member_kind": "method",
+            "visibility": "public",
+            "is_static": false,
+            "callable_family_complete": true,
+            "signature": {
+              "parameters": [
+                {
+                  "name": "query",
+                  "type": {
+                    "kind": "named",
+                    "name": "untyped"
+                  }
+                },
+                {
+                  "name": "params",
+                  "type": {
+                    "kind": "named",
+                    "name": "untyped"
+                  }
+                }
+              ],
+              "returns": {
+                "kind": "named",
+                "name": "std.result.Result"
+              }
+            },
+            "locator": {
+              "kind": "artifact",
+              "path": "src/client.rs",
+              "symbol": "postgres.Client.query_opt"
+            }
+          },
+          {
+            "id": "member.rust-sql.postgres-client.batch-execute",
+            "owner": "type.rust-sql.postgres-client",
+            "name": "batch_execute",
+            "member_kind": "method",
+            "visibility": "public",
+            "is_static": false,
+            "callable_family_complete": true,
+            "signature": {
+              "parameters": [
+                {
+                  "name": "query",
+                  "type": {
+                    "kind": "named",
+                    "name": "untyped"
+                  }
+                }
+              ],
+              "returns": {
+                "kind": "named",
+                "name": "std.result.Result"
+              }
+            },
+            "locator": {
+              "kind": "artifact",
+              "path": "src/client.rs",
+              "symbol": "postgres.Client.batch_execute"
+            }
+          },
+          {
+            "id": "member.rust-sql.postgres-client.prepare",
+            "owner": "type.rust-sql.postgres-client",
+            "name": "prepare",
+            "member_kind": "method",
+            "visibility": "public",
+            "is_static": false,
+            "callable_family_complete": true,
+            "signature": {
+              "parameters": [
+                {
+                  "name": "query",
+                  "type": {
+                    "kind": "named",
+                    "name": "untyped"
+                  }
+                }
+              ],
+              "returns": {
+                "kind": "named",
+                "name": "std.result.Result"
+              }
+            },
+            "locator": {
+              "kind": "artifact",
+              "path": "src/client.rs",
+              "symbol": "postgres.Client.prepare"
+            }
+          }
+        ],
+        "relations": []
+      }
+    },
+    {
+      "id": "summaries.rust-sql.postgres",
+      "activation": [
+        {
+          "targets": [],
+          "configurations": []
+        }
+      ],
+      "payload": {
+        "kind": "procedure_summaries",
+        "summaries": [
+          {
+            "id": "summary.rust-sql.postgres-client.execute",
+            "target": {
+              "path": "src/client.rs",
+              "symbol": "postgres.Client.execute",
+              "has_receiver": true,
+              "parameter_count": 2
+            },
+            "completeness": "complete",
+            "locations": [],
+            "transfers": [],
+            "effects": [
+              {
+                "kind": "allocation",
+                "event": "event.rust-sql.postgres-client.execute.result",
+                "output": {
+                  "kind": "normal_return"
+                }
+              }
+            ]
+          },
+          {
+            "id": "summary.rust-sql.postgres-client.query",
+            "target": {
+              "path": "src/client.rs",
+              "symbol": "postgres.Client.query",
+              "has_receiver": true,
+              "parameter_count": 2
+            },
+            "completeness": "complete",
+            "locations": [],
+            "transfers": [],
+            "effects": [
+              {
+                "kind": "allocation",
+                "event": "event.rust-sql.postgres-client.query.result",
+                "output": {
+                  "kind": "normal_return"
+                }
+              }
+            ]
+          },
+          {
+            "id": "summary.rust-sql.postgres-client.query-one",
+            "target": {
+              "path": "src/client.rs",
+              "symbol": "postgres.Client.query_one",
+              "has_receiver": true,
+              "parameter_count": 2
+            },
+            "completeness": "complete",
+            "locations": [],
+            "transfers": [],
+            "effects": [
+              {
+                "kind": "allocation",
+                "event": "event.rust-sql.postgres-client.query-one.result",
+                "output": {
+                  "kind": "normal_return"
+                }
+              }
+            ]
+          },
+          {
+            "id": "summary.rust-sql.postgres-client.query-opt",
+            "target": {
+              "path": "src/client.rs",
+              "symbol": "postgres.Client.query_opt",
+              "has_receiver": true,
+              "parameter_count": 2
+            },
+            "completeness": "complete",
+            "locations": [],
+            "transfers": [],
+            "effects": [
+              {
+                "kind": "allocation",
+                "event": "event.rust-sql.postgres-client.query-opt.result",
+                "output": {
+                  "kind": "normal_return"
+                }
+              }
+            ]
+          },
+          {
+            "id": "summary.rust-sql.postgres-client.batch-execute",
+            "target": {
+              "path": "src/client.rs",
+              "symbol": "postgres.Client.batch_execute",
+              "has_receiver": true,
+              "parameter_count": 1
+            },
+            "completeness": "complete",
+            "locations": [],
+            "transfers": [],
+            "effects": [
+              {
+                "kind": "allocation",
+                "event": "event.rust-sql.postgres-client.batch-execute.result",
+                "output": {
+                  "kind": "normal_return"
+                }
+              }
+            ]
+          },
+          {
+            "id": "summary.rust-sql.postgres-client.prepare",
+            "target": {
+              "path": "src/client.rs",
+              "symbol": "postgres.Client.prepare",
+              "has_receiver": true,
+              "parameter_count": 1
+            },
+            "completeness": "complete",
+            "locations": [],
+            "transfers": [],
+            "effects": [
+              {
+                "kind": "allocation",
+                "event": "event.rust-sql.postgres-client.prepare.result",
+                "output": {
+                  "kind": "normal_return"
+                }
+              }
+            ]
+          }
+        ]
+      }
+    }
+  ]
+}

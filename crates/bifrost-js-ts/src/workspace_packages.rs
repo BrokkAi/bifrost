@@ -169,13 +169,28 @@ fn read_manifest(path: &Path) -> Option<(String, Vec<String>)> {
         return None;
     }
     let text = std::fs::read_to_string(path).ok()?;
-    let manifest: Value = serde_json::from_str(&text).ok()?;
+    let manifest = decode_package_manifest(text.as_bytes(), MAX_MANIFEST_BYTES).ok()?;
     let name = manifest
         .get("name")
         .and_then(Value::as_str)
         .filter(|name| !name.is_empty())?
         .to_string();
     Some((name, entry_targets(&manifest)))
+}
+
+/// Decode caller-supplied manifest bytes without accessing the installed tree.
+/// Snapshot-aware evidence preparation shares this decoder with workspace
+/// entry resolution. Exact ranges and duplicate-key checks belong to the
+/// maintained configuration parser at the preparation boundary.
+pub fn decode_package_manifest(bytes: &[u8], max_bytes: u64) -> Result<Value, String> {
+    if bytes.len() as u64 > max_bytes {
+        return Err(format!("package.json exceeds configured limit {max_bytes}"));
+    }
+    let manifest: Value = serde_json::from_slice(bytes).map_err(|error| error.to_string())?;
+    if !manifest.is_object() {
+        return Err("package.json must contain an object".to_owned());
+    }
+    Ok(manifest)
 }
 
 /// The entry targets a manifest offers for the package root, ordered so the
@@ -260,12 +275,14 @@ fn collect_condition_targets(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use brokk_bifrost_test_macros::hardwon;
 
     fn targets(manifest: &str) -> Vec<String> {
         entry_targets(&serde_json::from_str(manifest).unwrap())
     }
 
     #[test]
+    #[hardwon("#2169: workspace package exports did not outrank published runtime entries")]
     fn custom_condition_outranks_published_runtime_and_type_conditions() {
         // The TanStack shape: only the custom condition names workspace source.
         assert_eq!(
@@ -298,6 +315,7 @@ mod tests {
     }
 
     #[test]
+    #[hardwon("#2169: explicit source conditions lost to custom export conditions")]
     fn explicit_source_condition_outranks_a_custom_one() {
         assert_eq!(
             targets(
@@ -315,6 +333,7 @@ mod tests {
     }
 
     #[test]
+    #[hardwon("#2169: root condition maps were mistaken for subpath maps")]
     fn a_conditions_map_without_subpath_keys_conditions_the_root_entry() {
         // The "sugar" form: `exports` is the root entry's condition map.
         assert_eq!(
@@ -324,6 +343,7 @@ mod tests {
     }
 
     #[test]
+    #[hardwon("#2169: subpath-only exports hid legacy workspace package entries")]
     fn a_subpath_map_without_a_root_entry_offers_only_the_legacy_fields() {
         assert_eq!(
             targets(r#"{"name": "pkg", "main": "index.js", "exports": {"./sub": "./sub.js"}}"#),
@@ -332,6 +352,7 @@ mod tests {
     }
 
     #[test]
+    #[hardwon("#2169: package fallback entries lost their declared order")]
     fn a_fallback_array_keeps_its_written_order() {
         assert_eq!(
             targets(r#"{"name": "pkg", "exports": {".": ["./a.js", "./b.js"]}}"#),
@@ -340,6 +361,7 @@ mod tests {
     }
 
     #[test]
+    #[hardwon("#2169: nameless package manifests entered workspace resolution")]
     fn a_manifest_without_a_name_is_not_a_workspace_package() {
         let dir = tempfile::tempdir().unwrap();
         let manifest = dir.path().join("package.json");

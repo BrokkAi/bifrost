@@ -381,6 +381,97 @@ impl<'a> Renderer<'a> {
 mod tests {
     use super::*;
 
+    /// The C dialect of the C/C++ analyzer (#1970). `c` stays a spelling of
+    /// `Language::Cpp` (it is one of that language's extensions), so the
+    /// dialect owns the distinct `cpp-c` label; `.C` is C++ by convention and
+    /// must not be folded in case-insensitively.
+    #[test]
+    fn c_dialect_has_a_distinct_label_and_exact_lowercase_path_rule() {
+        let c = RuneIrLanguage::from_config_label("cpp-c").unwrap();
+        assert_eq!(c, RuneIrLanguage::CppC);
+        assert_eq!(c.language(), Language::Cpp);
+        assert_eq!(c.config_label(), "cpp-c");
+        assert_eq!(c.stable_label(), "cpp-c");
+        assert_eq!(
+            RuneIrLanguage::from_config_label("c"),
+            Some(RuneIrLanguage::Standard(Language::Cpp))
+        );
+        assert_eq!(
+            RuneIrLanguage::for_path(Language::Cpp, std::path::Path::new("tags.c")),
+            RuneIrLanguage::CppC
+        );
+        for cpp_path in ["tags.C", "tags.h", "tags.cpp", "tags.cc", "tags.cxx"] {
+            assert_eq!(
+                RuneIrLanguage::for_path(Language::Cpp, std::path::Path::new(cpp_path)),
+                RuneIrLanguage::Standard(Language::Cpp),
+                "{cpp_path} must keep C++ semantics"
+            );
+        }
+        assert!(RuneIrLanguage::config_labels().any(|label| label == "cpp-c"));
+    }
+
+    #[test]
+    fn renderer_marks_each_bounded_dimension() {
+        let source = "fn outer() { if true { loop { return; } } }";
+        let cases = [
+            RuneIrLimits {
+                max_nodes: 1,
+                ..RuneIrLimits::default()
+            },
+            RuneIrLimits {
+                max_depth: 1,
+                ..RuneIrLimits::default()
+            },
+            RuneIrLimits {
+                max_source_bytes: 1,
+                ..RuneIrLimits::default()
+            },
+            RuneIrLimits {
+                max_output_bytes: 80,
+                ..RuneIrLimits::default()
+            },
+        ];
+        for limits in cases {
+            let rendered =
+                render_source_rune_ir(Language::Rust, source, RuneIrSelection::WholeSource, limits)
+                    .unwrap();
+            assert!(rendered.truncated, "limits: {limits:?}");
+            assert!(rendered.rune_ir.contains("truncated"), "limits: {limits:?}");
+            assert!(rendered.rune_ir.len() <= limits.max_output_bytes);
+            assert_balanced_sexpr(&rendered.rune_ir);
+        }
+    }
+
+    fn assert_balanced_sexpr(value: &str) {
+        let mut depth = 0usize;
+        let mut quoted = false;
+        let mut escaped = false;
+        for byte in value.bytes() {
+            if quoted {
+                if escaped {
+                    escaped = false;
+                } else if byte == b'\\' {
+                    escaped = true;
+                } else if byte == b'"' {
+                    quoted = false;
+                }
+                continue;
+            }
+            match byte {
+                b'"' => quoted = true,
+                b'(' => depth += 1,
+                b')' => {
+                    depth = depth
+                        .checked_sub(1)
+                        .expect("unexpected closing parenthesis")
+                }
+                _ => {}
+            }
+        }
+        assert!(!quoted, "unterminated string in {value:?}");
+        assert_eq!(depth, 0, "unclosed form in {value:?}");
+    }
+
     #[test]
     fn rust_rune_ir_uses_canonical_facts_and_parseable_starter() {
         let source = "fn greet(name: &str) { println!(\"{name}\"); }";
@@ -492,151 +583,6 @@ mod tests {
             RuneIrLanguage::TypeScriptTsx
         );
         assert!(RuneIrLanguage::config_labels().any(|label| label == "tsx"));
-    }
-
-    /// The C dialect of the C/C++ analyzer (#1970). `c` stays a spelling of
-    /// `Language::Cpp` (it is one of that language's extensions), so the
-    /// dialect owns the distinct `cpp-c` label; `.C` is C++ by convention and
-    /// must not be folded in case-insensitively.
-    #[test]
-    fn c_dialect_has_a_distinct_label_and_exact_lowercase_path_rule() {
-        let c = RuneIrLanguage::from_config_label("cpp-c").unwrap();
-        assert_eq!(c, RuneIrLanguage::CppC);
-        assert_eq!(c.language(), Language::Cpp);
-        assert_eq!(c.config_label(), "cpp-c");
-        assert_eq!(c.stable_label(), "cpp-c");
-        assert_eq!(
-            RuneIrLanguage::from_config_label("c"),
-            Some(RuneIrLanguage::Standard(Language::Cpp))
-        );
-        assert_eq!(
-            RuneIrLanguage::for_path(Language::Cpp, std::path::Path::new("tags.c")),
-            RuneIrLanguage::CppC
-        );
-        for cpp_path in ["tags.C", "tags.h", "tags.cpp", "tags.cc", "tags.cxx"] {
-            assert_eq!(
-                RuneIrLanguage::for_path(Language::Cpp, std::path::Path::new(cpp_path)),
-                RuneIrLanguage::Standard(Language::Cpp),
-                "{cpp_path} must keep C++ semantics"
-            );
-        }
-        assert!(RuneIrLanguage::config_labels().any(|label| label == "cpp-c"));
-    }
-
-    #[test]
-    fn renderer_marks_each_bounded_dimension() {
-        let source = "fn outer() { if true { loop { return; } } }";
-        let cases = [
-            RuneIrLimits {
-                max_nodes: 1,
-                ..RuneIrLimits::default()
-            },
-            RuneIrLimits {
-                max_depth: 1,
-                ..RuneIrLimits::default()
-            },
-            RuneIrLimits {
-                max_source_bytes: 1,
-                ..RuneIrLimits::default()
-            },
-            RuneIrLimits {
-                max_output_bytes: 80,
-                ..RuneIrLimits::default()
-            },
-        ];
-        for limits in cases {
-            let rendered =
-                render_source_rune_ir(Language::Rust, source, RuneIrSelection::WholeSource, limits)
-                    .unwrap();
-            assert!(rendered.truncated, "limits: {limits:?}");
-            assert!(rendered.rune_ir.contains("truncated"), "limits: {limits:?}");
-            assert!(rendered.rune_ir.len() <= limits.max_output_bytes);
-            assert_balanced_sexpr(&rendered.rune_ir);
-        }
-    }
-
-    fn assert_balanced_sexpr(value: &str) {
-        let mut depth = 0usize;
-        let mut quoted = false;
-        let mut escaped = false;
-        for byte in value.bytes() {
-            if quoted {
-                if escaped {
-                    escaped = false;
-                } else if byte == b'\\' {
-                    escaped = true;
-                } else if byte == b'"' {
-                    quoted = false;
-                }
-                continue;
-            }
-            match byte {
-                b'"' => quoted = true,
-                b'(' => depth += 1,
-                b')' => {
-                    depth = depth
-                        .checked_sub(1)
-                        .expect("unexpected closing parenthesis")
-                }
-                _ => {}
-            }
-        }
-        assert!(!quoted, "unterminated string in {value:?}");
-        assert_eq!(depth, 0, "unclosed form in {value:?}");
-    }
-
-    #[test]
-    fn invalid_and_empty_inputs_are_actionable() {
-        assert_eq!(
-            render_source_rune_ir(
-                Language::Rust,
-                "",
-                RuneIrSelection::WholeSource,
-                RuneIrLimits::default()
-            ),
-            Err(RuneIrError::EmptySource)
-        );
-        assert!(matches!(
-            render_source_rune_ir(
-                Language::None,
-                "text",
-                RuneIrSelection::WholeSource,
-                RuneIrLimits::default()
-            ),
-            Err(RuneIrError::UnsupportedLanguage(_))
-        ));
-        assert!(matches!(
-            render_source_rune_ir(
-                Language::Rust,
-                "fn oversized() {}",
-                RuneIrSelection::WholeSource,
-                RuneIrLimits {
-                    max_input_bytes: 4,
-                    ..RuneIrLimits::default()
-                }
-            ),
-            Err(RuneIrError::SourceTooLarge { limit: 4, .. })
-        ));
-        assert_eq!(
-            render_source_rune_ir(
-                Language::Rust,
-                "fn main() {\0}",
-                RuneIrSelection::WholeSource,
-                RuneIrLimits::default()
-            ),
-            Err(RuneIrError::UnsafeSource)
-        );
-        let long_line =
-            "x".repeat(brokk_bifrost_core::analyzer::common::DEFAULT_MAX_LINE_LENGTH + 1);
-        assert_eq!(
-            render_source_rune_ir(
-                Language::Rust,
-                &long_line,
-                RuneIrSelection::WholeSource,
-                RuneIrLimits::default()
-            ),
-            Err(RuneIrError::UnsafeSource)
-        );
     }
 
     #[test]

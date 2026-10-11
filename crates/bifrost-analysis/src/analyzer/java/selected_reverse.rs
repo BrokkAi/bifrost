@@ -1,15 +1,14 @@
-//! Test-support Java inverse references over selected forward resolution.
+//! Test-support Java-target inverse references over selected JVM forward resolution.
 //!
-//! Candidate discovery uses the shared indexed reference-identity rows, and
-//! every candidate is confirmed in its own selected Java import context. This
-//! Candidate confirmation covers Java source files. Selected Kotlin and Scala
-//! reference identities can keep a Java target's inverse explicitly open.
+//! Candidate discovery uses shared indexed reference paths, and every candidate
+//! is confirmed in its own language's selected JVM import context. Current
+//! producer and consumer coverage can keep peer-language absence explicitly open.
 
 use super::JavaAnalyzer;
 use crate::CancellationToken;
 use crate::analyzer::resolution::ResolutionCompletion;
 use crate::analyzer::store::resolution_operation::java_reverse_rows::{
-    JavaReverseCandidateOutcome, JavaReverseConfirmed,
+    JvmReverseCandidateOutcome, JvmReverseConfirmed,
 };
 use crate::analyzer::store::resolution_operation::{
     SelectedResolutionContextMetrics, SelectedResolutionOperationInput,
@@ -176,17 +175,17 @@ fn java_selected_inverse_for_inner(
         }
     };
     let generation = java.inner.project().analysis_generation();
-    let candidates = match operation.java_reverse_candidate_sites(target, cancellation)? {
-        JavaReverseCandidateOutcome::Ready(candidates) => candidates,
-        JavaReverseCandidateOutcome::Unavailable(reason) => {
+    let candidates = match operation.jvm_reverse_candidate_sites(target, cancellation)? {
+        JvmReverseCandidateOutcome::Ready(candidates) => candidates,
+        JvmReverseCandidateOutcome::Unavailable(reason) => {
             return Ok(JavaSelectedReverseOutcome::Unavailable(reason));
         }
-        JavaReverseCandidateOutcome::Cancelled => {
+        JvmReverseCandidateOutcome::Cancelled => {
             return Ok(JavaSelectedReverseOutcome::Cancelled);
         }
     };
     let mut context_metrics = SelectedResolutionContextMetrics;
-    let confirmed = match operation.confirm_java_reverse_candidates(
+    let confirmed = match operation.confirm_jvm_reverse_candidates(
         candidates,
         cancellation,
         &mut context_metrics,
@@ -222,7 +221,7 @@ fn project_confirmed_references(
     java: &JavaAnalyzer,
     target: &CodeUnit,
     generation: u64,
-    confirmed: JavaReverseConfirmed,
+    confirmed: JvmReverseConfirmed,
     cancellation: &CancellationToken,
 ) -> Result<JavaSelectedInverseResolution> {
     let peer_language_inventory_open = confirmed.peer_language_inventory_open;
@@ -334,6 +333,7 @@ fn project_confirmed_references(
             } else {
                 UsageProof::Unproven
             },
+            ambiguous_candidate: false,
             usage_kind: selected_usage_kind(metadata),
             site_class: SiteClass::UseSite,
             owner_relation: crate::analyzer::structural::OwnerRelation::Unknown,

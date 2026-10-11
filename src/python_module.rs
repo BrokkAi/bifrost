@@ -53,12 +53,7 @@ impl SearchToolsNativeSession {
     fn call_tool_json(&self, py: Python<'_>, name: &str, arguments_json: &str) -> PyResult<String> {
         let name = name.to_owned();
         let arguments_json = arguments_json.to_owned();
-        let result = py.detach(|| self.inner.call_tool_json(&name, &arguments_json));
-
-        match result {
-            Ok(payload) => Ok(payload),
-            Err(err) => Err(service_error_to_py(err)),
-        }
+        detach_tool_call(py, || self.inner.call_tool_json(&name, &arguments_json))
     }
 
     fn call_tool_payload_json(
@@ -70,7 +65,7 @@ impl SearchToolsNativeSession {
     ) -> PyResult<String> {
         let name = name.to_owned();
         let arguments_json = arguments_json.to_owned();
-        let result = py.detach(|| {
+        detach_tool_call(py, || {
             self.inner.call_tool_payload_json(
                 &name,
                 &arguments_json,
@@ -78,12 +73,7 @@ impl SearchToolsNativeSession {
                     render_line_numbers,
                 },
             )
-        });
-
-        match result {
-            Ok(payload) => Ok(payload),
-            Err(err) => Err(service_error_to_py(err)),
-        }
+        })
     }
 
     fn close(&self) -> PyResult<()> {
@@ -96,6 +86,13 @@ impl SearchToolsNativeSession {
         py.detach(|| self.inner.request_cache_gc())
             .map_err(service_error_to_py)
     }
+}
+
+fn detach_tool_call(
+    py: Python<'_>,
+    call: impl FnOnce() -> Result<String, SearchToolsServiceError> + Send,
+) -> PyResult<String> {
+    py.detach(call).map_err(service_error_to_py)
 }
 
 fn service_error_to_py(err: SearchToolsServiceError) -> PyErr {

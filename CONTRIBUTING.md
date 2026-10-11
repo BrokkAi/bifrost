@@ -296,14 +296,7 @@ To cut a release:
    rm -rf "$plugin_smoke_root"
    policy_smoke_root="$(mktemp -d "${TMPDIR:-/tmp}/bifrost-policy-pretag.XXXXXX")"
    trap 'rm -rf -- "$policy_smoke_root"' EXIT
-   node scripts/public/prepare-open-packs.mjs \
-     --binary "$(pwd)/target/release/bifrost" \
-     --cache-dir "$policy_smoke_root/cache" \
-     --receipt-path "$policy_smoke_root/open-pack-receipt.json" \
-     --env-path "$policy_smoke_root/open-pack-env.json"
-   BIFROST_SEMANTIC_PACK_CACHE_ROOT="$(jq -r '.BIFROST_SEMANTIC_PACK_CACHE_ROOT' "$policy_smoke_root/open-pack-env.json")" \
-   BIFROST_OPEN_SEMANTIC_PACK_BUNDLE="$(jq -r '.BIFROST_OPEN_SEMANTIC_PACK_BUNDLE' "$policy_smoke_root/open-pack-env.json")" \
-   BIFROST_OPEN_POLICY_PACK_ROOT="$(jq -r '.BIFROST_OPEN_POLICY_PACK_ROOT' "$policy_smoke_root/open-pack-env.json")" \
+   BIFROST_LAUNCHER_CACHE_DIR="$policy_smoke_root/cache" \
      target/release/bifrost \
      --root . \
      --format sarif \
@@ -371,6 +364,21 @@ semantic-pack installer and authoring tooling needed by pack producers.
 Engine CI may still generate focused fixtures to test analyzer behavior; that
 does not publish a pack release.
 
+Bifrost no longer ships packs built in. Standard-library-style packs belong
+in `bifrost-packs`; other packs, including third-party library models,
+typically belong in the private premium pack authoring repository. Content
+required by WebGoat or another popular open benchmark may have a public home
+after an explicit review of the coverage need, rationale and licensing. This
+exception does not make all library content public.
+
+Do not author new product content in the engine's legacy pack directories.
+Use minimal test-only fixtures for engine regressions and preserve parser,
+type/declaration and tooling assets according to their actual role. Run
+`node scripts/check-pack-authoring-drift.mjs` in the private engine checkout;
+the transitional sources and embedded payloads are frozen until their
+dependencies are rewired after verified v0.13.0 release. This cleanup must not
+change or block the frozen release candidate.
+
 During v0.13.0 preparation, plugin acquisition must select compatible pack
 metadata and verify artifact hashes before exposing a cache to the server.
 A pending pack release or a matching version label does not establish runtime
@@ -381,6 +389,9 @@ published crate archives. Hosts own external rule acquisition and activation.
 Core qualification records the empty catalog and an explicit not-evaluated
 scan separately from requested external-content acceptance. Parser assets and
 separate semantic/type/declaration packs retain their existing boundaries.
+Legacy authored and embedded semantic content still present in the checkout
+is transition debt, not a second authoring stream; its source removal is a
+separate post-release migration.
 
 After the **Release** workflow succeeds, `publish-npm.yml` packages each native
 archive as a platform package. It publishes the platform packages first. It

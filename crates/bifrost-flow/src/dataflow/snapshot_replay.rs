@@ -2,11 +2,11 @@
 
 use crate::analyzer::semantic::{
     CallSiteHandle, CallSiteId, CallTransferSet, DispatchOracle, DispatchResult, IcfgProvider,
-    IcfgSnapshot, IcfgSnapshotLimits, ProcedureHandle, ProgramPointHandle, SemanticOutcome,
-    SemanticProviderError, SemanticRequest, SemanticWork,
+    IcfgSnapshot, IcfgSnapshotLimits, OracleCallContext, ProcedureHandle, ProgramPointHandle,
+    SemanticOutcome, SemanticProviderError, SemanticRequest,
 };
 
-use super::{IcfgInputStatus, IcfgSolveInput};
+use super::IcfgSolveInput;
 
 /// Replays one already-built snapshot while delegating semantic operations
 /// that are not represented by the snapshot to the original provider.
@@ -36,6 +36,16 @@ where
     ) -> Result<SemanticOutcome<DispatchResult>, SemanticProviderError> {
         self.provider.resolve_call(call, request)
     }
+
+    fn resolve_call_in_context(
+        &self,
+        call: &CallSiteHandle,
+        context: &OracleCallContext,
+        request: &mut SemanticRequest<'_>,
+    ) -> Result<SemanticOutcome<DispatchResult>, SemanticProviderError> {
+        self.provider
+            .resolve_call_in_context(call, context, request)
+    }
 }
 
 impl<Provider> IcfgProvider for SnapshotReplayProvider<'_, '_, Provider>
@@ -49,6 +59,17 @@ where
         request: &mut SemanticRequest<'_>,
     ) -> Result<SemanticOutcome<CallTransferSet>, SemanticProviderError> {
         self.provider.call_transfers(caller, call, request)
+    }
+
+    fn call_transfers_in_context(
+        &self,
+        caller: &ProcedureHandle,
+        call: CallSiteId,
+        context: &OracleCallContext,
+        request: &mut SemanticRequest<'_>,
+    ) -> Result<SemanticOutcome<CallTransferSet>, SemanticProviderError> {
+        self.provider
+            .call_transfers_in_context(caller, call, context, request)
     }
 
     fn snapshot(
@@ -73,38 +94,5 @@ where
 }
 
 fn snapshot_outcome(input: IcfgSolveInput<'_>) -> SemanticOutcome<IcfgSnapshot> {
-    let snapshot = input.snapshot().clone();
-    let work = SemanticWork::default();
-    match input.status() {
-        IcfgInputStatus::Complete => SemanticOutcome::Complete {
-            value: snapshot,
-            work,
-        },
-        IcfgInputStatus::Ambiguous => SemanticOutcome::Ambiguous {
-            candidates: snapshot,
-            work,
-        },
-        IcfgInputStatus::Unknown => SemanticOutcome::Unknown {
-            partial: Some(snapshot),
-            work,
-        },
-        IcfgInputStatus::Unsupported { capability } => SemanticOutcome::Unsupported {
-            capability,
-            partial: Some(snapshot),
-            work,
-        },
-        IcfgInputStatus::Unproven => SemanticOutcome::Unproven {
-            partial: snapshot,
-            work,
-        },
-        IcfgInputStatus::ExceededBudget { exceeded } => SemanticOutcome::ExceededBudget {
-            partial: Some(snapshot),
-            exceeded,
-            work,
-        },
-        IcfgInputStatus::Cancelled => SemanticOutcome::Cancelled {
-            partial: Some(snapshot),
-            work,
-        },
-    }
+    input.status().snapshot_outcome(input.snapshot().clone())
 }

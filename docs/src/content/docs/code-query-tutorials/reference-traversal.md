@@ -3,7 +3,7 @@ title: Reference Traversal
 description: Traverse exact source references and semantic users with query_code.
 ---
 
-> Last verified end to end: 2026-07-18 (`query_code` schema version 1).
+> Last verified end to end: 2026-10-01 (`query_code` schema version 1).
 
 Reference traversal starts from an exact indexed declaration. `references-of` returns each exact source site, `used-by` returns the smallest exact declaration enclosing each site, and `uses` traverses in the other direction from one exact declaration to the declarations referenced by its body or signature. No operation resolves a display name back into an identity.
 
@@ -116,7 +116,7 @@ The write-only form is executable against `WriteTarget.count`:
 {"results":[{"result_type":"reference_site","path":"Writer.java","language":"java","range":{"start_line":1,"start_column":57,"end_line":1,"end_column":62},"target":{"path":"WriteTarget.java","language":"java","kind":"field","fq_name":"WriteTarget.count","start_line":1,"end_line":1,"signature":"int count;"},"enclosing_declaration":{"path":"Writer.java","language":"java","kind":"function","fq_name":"Writer.update","start_line":1,"end_line":1,"signature":"(WriteTarget)"},"usage_kind":"reference","proof":"proven","reference_kind":"field_write","provenance":[{"seed":{"result_type":"structural_match","path":"WriteTarget.java","kind":"class","start_line":1,"end_line":1},"steps":[{"op":"enclosing_decl","result":{"result_type":"declaration","path":"WriteTarget.java","kind":"class","fq_name":"WriteTarget","start_line":1,"end_line":1}},{"op":"members","result":{"result_type":"declaration","path":"WriteTarget.java","kind":"field","fq_name":"WriteTarget.count","start_line":1,"end_line":1}},{"op":"references_of","result":{"result_type":"reference_site","path":"Writer.java","range":{"start_line":1,"start_column":57,"end_line":1,"end_column":62},"target_fq_name":"WriteTarget.count","proof":"proven","reference_kind":"field_write"}}]}]}],"truncated":false}
 ```
 
-Accepted kinds are `method_call`, `constructor_call`, `field_read`, `field_write`, `type_reference`, `static_reference`, `super_call`, and `inheritance`. A supplied kind filter excludes structured hits an adapter cannot classify. With no kind filter, classified and unclassified hits remain visible. `proof` accepts `proven` or `unproven`.
+Accepted kinds are `method_call`, `constructor_call`, `field_read`, `field_write`, `type_reference`, `self_type_alias`, `static_reference`, `super_call`, and `inheritance`. A supplied kind filter excludes structured hits an adapter cannot classify. With no kind filter, classified and unclassified hits remain visible. `proof` accepts `proven` or `unproven`.
 
 `external_usages` is the default and preserves the existing agent/search surface: imports and self-receiver noise are excluded. Use `lsp_references` when the editor-visible import and `self`/`this` occurrences are part of the question.
 
@@ -248,7 +248,7 @@ The same inbound and outbound pipeline is executable in the test suite for every
 
 | Query label | Exact declarations and calls | Notable structured classifications |
 | --- | --- | --- |
-| `python` | functions, methods, properties | dynamic candidates may be `unproven` |
+| `python` | functions, methods, properties | import-resolved functions and constructor-created receivers |
 | `java` | overloads, fields, constructors, types | field read/write and receiver identity |
 | `javascript` | module declarations, imports, methods | `this` surface separation |
 | `typescript` | JavaScript forms plus typed declarations | type and module identity |
@@ -258,7 +258,9 @@ The same inbound and outbound pipeline is executable in the test suite for every
 | `php` | functions, methods, fields, types | namespace and `$this` ownership |
 | `scala` | methods, fields, types, inheritance | receiver and overload resolution |
 | `csharp` | methods, fields, constructors, types | receiver and overload resolution |
-| `ruby` | methods, fields, constants | dynamic candidates may be `unproven` |
+| `ruby` | methods, fields, constants | receivers created by `Class.new` |
 | `kotlin` | functions, methods, constructors, properties, types | inheritance, companion objects, extensions, and receiver chains |
 
-External library declarations appear only when they are genuinely indexed and have a renderable source range. Reference traversal itself does not produce alias sets, receiver values, allocation sites, control flow, or data flow. Reference-site rows may compose into the separate bounded [`member_targets` receiver analysis](../receiver-traversal/#compose-from-a-reference-site) when the selected adapter exposes the necessary structured facts; that still does not provide whole-program points-to, general alias analysis, path-sensitive control flow, taint, or general data flow.
+Any adapter can return `unproven` sites. An adapter marks a site `unproven` when the receiver type is unknown or several declarations are possible, for example a call through a Java `var` whose initializer has an unknown type, or a Go call through an interface that several types implement. Check `proof` in every language; use `:proof proven` when you need exact edges only.
+
+External library declarations appear only when they are genuinely indexed and have a renderable source range. Reference traversal itself does not produce alias sets, receiver values, allocation sites, control flow, or data flow. Reference-site rows may compose into the separate bounded [`member_targets` receiver analysis](/code-query-tutorials/receiver-traversal/#compose-from-a-reference-site) when the selected adapter exposes the necessary structured facts; that still does not provide whole-program points-to, general alias analysis, path-sensitive control flow, taint, or general data flow.

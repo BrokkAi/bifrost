@@ -7,12 +7,14 @@ use crate::analyzer::semantic::{
 };
 use crate::analyzer::{Language, LanguageDialect, ProjectFile};
 use crate::test_support::AnalyzerFixture;
+use brokk_bifrost_test_macros::hardwon;
 
 fn javascript_fixture() -> AnalyzerFixture {
     AnalyzerFixture::new_for_language(Language::JavaScript, &[("probe.js", "")])
 }
 
 #[test]
+#[hardwon("#3534: repeated Python procedures caused repeated source parsing")]
 fn many_python_procedures_share_syntax_but_keep_distinct_runtime_candidates() {
     let mut source = String::from("import sys\n");
     for index in 0..64 {
@@ -76,6 +78,7 @@ fn many_python_procedures_share_syntax_but_keep_distinct_runtime_candidates() {
 }
 
 #[test]
+#[hardwon("#3534: independent oracles reparsed syntax within one budget scope")]
 fn independent_oracles_reuse_runtime_syntax_within_a_budget_scope() {
     let fixture = javascript_fixture();
     let dialect = LanguageDialect::Standard(Language::JavaScript);
@@ -164,6 +167,7 @@ fn complete_snapshot(
 }
 
 #[test]
+#[hardwon("#3534: warm Python syntax differed from the cold parse")]
 fn cold_and_warm_runtime_syntax_agree_and_share_arc() {
     let fixture = javascript_fixture();
     let oracle = fixture.analyzer.semantic_oracle_provider();
@@ -251,6 +255,7 @@ fn cold_and_warm_runtime_syntax_agree_and_share_arc() {
 }
 
 #[test]
+#[hardwon("#3534: a warm syntax hit bypassed a fresh budget scope census")]
 fn a_fresh_budget_warm_hit_still_needs_the_full_census() {
     let fixture = javascript_fixture();
     let oracle = fixture.analyzer.semantic_oracle_provider();
@@ -297,6 +302,7 @@ fn a_fresh_budget_warm_hit_still_needs_the_full_census() {
 }
 
 #[test]
+#[hardwon("#3534: a failed budget charge published partial cached syntax")]
 fn a_tiny_budget_does_not_publish_and_a_funded_retry_succeeds() {
     let fixture = javascript_fixture();
     let oracle = fixture.analyzer.semantic_oracle_provider();
@@ -327,6 +333,7 @@ fn a_tiny_budget_does_not_publish_and_a_funded_retry_succeeds() {
 }
 
 #[test]
+#[hardwon("#3534: a nested-entry rejection published a partial syntax census")]
 fn a_cold_nested_entry_limit_does_not_publish_and_funded_retry_succeeds() {
     let fixture = javascript_fixture();
     let oracle = fixture.analyzer.semantic_oracle_provider();
@@ -365,38 +372,7 @@ fn a_cold_nested_entry_limit_does_not_publish_and_funded_retry_succeeds() {
 }
 
 #[test]
-fn cancellation_does_not_publish_and_a_retry_succeeds() {
-    let fixture = javascript_fixture();
-    let oracle = fixture.analyzer.semantic_oracle_provider();
-    let dialect = LanguageDialect::Standard(Language::JavaScript);
-    let source = "function first() { return process.env.FIRST; }";
-    let cancelled = CancellationToken::default();
-    cancelled.cancel();
-    let mut cancelled_budget = SemanticBudget::default();
-    let first = oracle
-        .runtime_syntax_for_source(
-            dialect,
-            source,
-            &mut crate::analyzer::semantic::SemanticRequest::new(&mut cancelled_budget, &cancelled),
-        )
-        .expect("cancelled extraction");
-    assert!(matches!(first, SemanticOutcome::Cancelled { .. }));
-
-    let mut funded_budget = SemanticBudget::default();
-    let retry = oracle
-        .runtime_syntax_for_source(
-            dialect,
-            source,
-            &mut crate::analyzer::semantic::SemanticRequest::new(
-                &mut funded_budget,
-                &CancellationToken::default(),
-            ),
-        )
-        .expect("retry after cancellation");
-    assert!(matches!(retry, SemanticOutcome::Complete { .. }));
-}
-
-#[test]
+#[hardwon("#3534: syntax cache hits crossed source or dialect identity")]
 fn source_and_dialect_change_cache_identity() {
     let fixture = javascript_fixture();
     let oracle = fixture.analyzer.semantic_oracle_provider();
@@ -418,6 +394,7 @@ fn source_and_dialect_change_cache_identity() {
 }
 
 #[test]
+#[hardwon("#3534: parser-error snapshots were reused without their error state")]
 fn parser_errors_are_complete_snapshots_with_error_marked() {
     let fixture = javascript_fixture();
     let oracle = fixture.analyzer.semantic_oracle_provider();
@@ -432,6 +409,7 @@ fn parser_errors_are_complete_snapshots_with_error_marked() {
 }
 
 #[test]
+#[hardwon("#3534: a traversal-capped syntax scan was cached as complete")]
 fn an_execution_traversal_cap_is_unproven_and_not_cached() {
     let fixture = javascript_fixture();
     let oracle = fixture.analyzer.semantic_oracle_provider();
@@ -477,6 +455,7 @@ fn an_execution_traversal_cap_is_unproven_and_not_cached() {
 }
 
 #[test]
+#[hardwon("#3534: same-file procedures repeated syntax scans and admitted stale source")]
 fn same_file_procedures_reuse_one_syntax_census_and_reject_stale_source() {
     let source = "function first() { return process.env.FIRST; }\nfunction second() { return process.env.SECOND; }\n";
     let fixture = AnalyzerFixture::new_for_language(Language::JavaScript, &[("probe.js", source)]);
@@ -576,4 +555,37 @@ fn same_file_procedures_reuse_one_syntax_census_and_reject_stale_source() {
         stale_result.limitations,
         vec![RuntimeReadLimitation::StaleEvidence]
     );
+}
+
+#[test]
+#[hardwon("#3534: cancellation must not leave an incomplete runtime-syntax cache entry")]
+fn cancellation_does_not_publish_and_a_retry_succeeds() {
+    let fixture = javascript_fixture();
+    let oracle = fixture.analyzer.semantic_oracle_provider();
+    let dialect = LanguageDialect::Standard(Language::JavaScript);
+    let source = "function first() { return process.env.FIRST; }";
+    let cancelled = CancellationToken::default();
+    cancelled.cancel();
+    let mut cancelled_budget = SemanticBudget::default();
+    let first = oracle
+        .runtime_syntax_for_source(
+            dialect,
+            source,
+            &mut crate::analyzer::semantic::SemanticRequest::new(&mut cancelled_budget, &cancelled),
+        )
+        .expect("cancelled extraction");
+    assert!(matches!(first, SemanticOutcome::Cancelled { .. }));
+
+    let mut funded_budget = SemanticBudget::default();
+    let retry = oracle
+        .runtime_syntax_for_source(
+            dialect,
+            source,
+            &mut crate::analyzer::semantic::SemanticRequest::new(
+                &mut funded_budget,
+                &CancellationToken::default(),
+            ),
+        )
+        .expect("retry after cancellation");
+    assert!(matches!(retry, SemanticOutcome::Complete { .. }));
 }

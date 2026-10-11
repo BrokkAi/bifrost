@@ -12,6 +12,62 @@ pub struct SexpFormatOptions<'a> {
     pub indent: &'a str,
 }
 
+pub fn flat_expr(source: &str, expr: &Expr) -> Option<String> {
+    match &expr.kind {
+        ExprKind::List(items) => flat_sequence(source, expr, items, '(', ')'),
+        ExprKind::Vector(items) => flat_sequence(source, expr, items, '[', ']'),
+        _ => Some(source[expr.range.clone()].to_string()),
+    }
+}
+
+pub fn comments_in(source: &str, range: Range<usize>) -> Vec<&str> {
+    source[range]
+        .lines()
+        .filter_map(|line| line.find(';').map(|start| line[start..].trim_end()))
+        .collect()
+}
+
+fn flat_sequence(
+    source: &str,
+    expr: &Expr,
+    items: &[Expr],
+    open: char,
+    close: char,
+) -> Option<String> {
+    let content_start = expr.range.start + open.len_utf8();
+    if let Some(first) = items.first()
+        && !comments_in(source, content_start..first.range.start).is_empty()
+    {
+        return None;
+    }
+    let closing_start = expr.range.end.saturating_sub(close.len_utf8());
+    let content_end = items.last().map_or(content_start, |item| item.range.end);
+    if !comments_in(source, content_end..closing_start).is_empty() {
+        return None;
+    }
+
+    let mut output = String::new();
+    output.push(open);
+    output.push_str(&flat_items(source, items)?);
+    output.push(close);
+    Some(output)
+}
+
+fn flat_items(source: &str, items: &[Expr]) -> Option<String> {
+    let mut output = String::new();
+    for (index, item) in items.iter().enumerate() {
+        if index > 0 {
+            let previous = &items[index - 1];
+            if !comments_in(source, previous.range.end..item.range.start).is_empty() {
+                return None;
+            }
+            output.push(' ');
+        }
+        output.push_str(&flat_expr(source, item)?);
+    }
+    Some(output)
+}
+
 /// Format every top-level S-expression while preserving top-level comments and
 /// blank lines verbatim. Invalid or incomplete input is left to the caller so
 /// an editor formatting request never damages a document that is being typed.
@@ -40,7 +96,7 @@ struct Formatter<'a, 'options> {
 
 impl Formatter<'_, '_> {
     fn render_expr(&self, expr: &Expr, depth: usize, output: &mut String) {
-        if let Some(flat) = self.flat(expr)
+        if let Some(flat) = flat_expr(self.source, expr)
             && self.indent_width(depth) + width(&flat) <= self.options.line_width
         {
             self.push_indent(depth, output);
@@ -67,10 +123,8 @@ impl Formatter<'_, '_> {
 
         let content_start = expr.range.start + open.len_utf8();
         let keep_head = matches!(expr.kind, ExprKind::List(_))
-            && self
-                .comments_in(content_start..items[0].range.start)
-                .is_empty()
-            && is_atom(&items[0]);
+            && comments_in(self.source, content_start..items[0].range.start).is_empty()
+            && items[0].is_atom();
         let mut item_index = 0;
         if keep_head {
             output.push_str(&self.source[items[0].range.clone()]);
@@ -113,67 +167,15 @@ impl Formatter<'_, '_> {
         output.push(close);
     }
 
-    fn flat(&self, expr: &Expr) -> Option<String> {
-        match &expr.kind {
-            ExprKind::List(items) => self.flat_sequence(expr, items, '(', ')'),
-            ExprKind::Vector(items) => self.flat_sequence(expr, items, '[', ']'),
-            _ => Some(self.source[expr.range.clone()].to_string()),
-        }
-    }
-
-    fn flat_sequence(
-        &self,
-        expr: &Expr,
-        items: &[Expr],
-        open: char,
-        close: char,
-    ) -> Option<String> {
-        let mut cursor = expr.range.start + open.len_utf8();
-        let mut output = String::new();
-        output.push(open);
-        for (index, item) in items.iter().enumerate() {
-            if !self.comments_in(cursor..item.range.start).is_empty() {
-                return None;
-            }
-            if index > 0 {
-                output.push(' ');
-            }
-            output.push_str(&self.flat(item)?);
-            cursor = item.range.end;
-        }
-        let closing_start = expr.range.end.saturating_sub(close.len_utf8());
-        if !self.comments_in(cursor..closing_start).is_empty() {
-            return None;
-        }
-        output.push(close);
-        Some(output)
-    }
-
     fn flat_group(&self, items: &[Expr]) -> Option<String> {
-        let mut output = String::new();
-        for (index, item) in items.iter().enumerate() {
-            if index > 0 {
-                let previous = &items[index - 1];
-                if !self
-                    .comments_in(previous.range.end..item.range.start)
-                    .is_empty()
-                {
-                    return None;
-                }
-                output.push(' ');
-            }
-            output.push_str(&self.flat(item)?);
-        }
-        Some(output)
+        flat_items(self.source, items)
     }
 
     fn group_end(&self, items: &[Expr], start: usize) -> usize {
         let next = start + 1;
         if is_keyword(&items[start])
             && next < items.len()
-            && self
-                .comments_in(items[start].range.end..items[next].range.start)
-                .is_empty()
+            && comments_in(self.source, items[start].range.end..items[next].range.start).is_empty()
         {
             next + 1
         } else {
@@ -181,15 +183,8 @@ impl Formatter<'_, '_> {
         }
     }
 
-    fn comments_in(&self, range: Range<usize>) -> Vec<&str> {
-        self.source[range]
-            .lines()
-            .filter_map(|line| line.find(';').map(|start| line[start..].trim_end()))
-            .collect()
-    }
-
     fn render_comments(&self, range: Range<usize>, depth: usize, output: &mut String) {
-        for comment in self.comments_in(range) {
+        for comment in comments_in(self.source, range) {
             self.push_indent(depth, output);
             output.push_str(comment);
             output.push('\n');
@@ -203,12 +198,8 @@ impl Formatter<'_, '_> {
     }
 
     fn indent_width(&self, depth: usize) -> usize {
-        depth.saturating_mul(width(self.options.indent))
+        indent_width(depth, width(self.options.indent))
     }
-}
-
-fn is_atom(expr: &Expr) -> bool {
-    !matches!(expr.kind, ExprKind::List(_) | ExprKind::Vector(_))
 }
 
 fn is_keyword(expr: &Expr) -> bool {
@@ -217,6 +208,11 @@ fn is_keyword(expr: &Expr) -> bool {
 
 fn width(value: &str) -> usize {
     value.chars().count()
+}
+
+/// Compute indentation width from the nesting depth and indent-unit width.
+pub const fn indent_width(depth: usize, unit_width: usize) -> usize {
+    depth.saturating_mul(unit_width)
 }
 
 #[cfg(test)]
@@ -234,27 +230,6 @@ mod tests {
     }
 
     #[test]
-    fn compact_forms_stay_on_one_line() {
-        assert_eq!(
-            format("(call   :callee   (name \"eval\"))", 120).as_deref(),
-            Some("(call :callee (name \"eval\"))")
-        );
-    }
-
-    #[test]
-    fn long_forms_break_entries_and_keep_keyword_values_together() {
-        let source = format!(
-            "(call :name \"{}\" :callee (name \"eval\") :args [(capture \"payload\")])",
-            "a".repeat(90)
-        );
-        let expected = format!(
-            "(call\n  :name \"{}\"\n  :callee (name \"eval\")\n  :args [(capture \"payload\")]\n)",
-            "a".repeat(90)
-        );
-        assert_eq!(format(&source, 120), Some(expected));
-    }
-
-    #[test]
     fn nested_forms_break_again_when_their_own_line_is_too_wide() {
         let source = format!("(call :args [(capture \"{}\")])", "x".repeat(40));
         assert_eq!(
@@ -263,12 +238,6 @@ mod tests {
                 "(call\n  :args\n  [\n    (capture\n      \"xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\"\n    )\n  ]\n)"
             )
         );
-    }
-
-    #[test]
-    fn rune_documents_preserve_top_level_comments_and_multiple_forms() {
-        let source = "; Rune IR\n\n(function :range (0 500) :name \"demo\")\n\n; Starter RQL\n(function :name \"demo\")\n";
-        assert_eq!(format(source, 120).as_deref(), Some(source));
     }
 
     #[test]

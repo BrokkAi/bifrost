@@ -5,13 +5,17 @@ use std::collections::VecDeque;
 use std::sync::Arc;
 
 use crate::analyzer::semantic::{
-    CallBoundary, CallSiteHandle, CallTransfer, CallTransferSet, ControlContinuation,
-    EvidenceCompleteness, IcfgEdgeKind, IcfgExitProfile, IcfgProvider, MatchedReturnProjection,
-    ProcedureHandle, ProcedureIcfgBoundary, ProcedureIcfgEdge, ProgramPointHandle, ProgramPointId,
-    ProofStatus, SemanticBudget, SemanticOutcome, SemanticProviderError, SemanticRequest,
-    SemanticWork, compare_relation_provenance,
+    CallBoundary, CallSiteHandle, CallTransfer, CallTransferSet, EvidenceCompleteness,
+    IcfgEdgeKind, IcfgExitProfile, IcfgProvider, MatchedReturnProjection, OracleCallContext,
+    OracleLimits, ProcedureHandle, ProcedureIcfgBoundary, ProcedureIcfgEdge, ProgramPointHandle,
+    ProgramPointId, ProofStatus, SemanticBudget, SemanticOutcome, SemanticProviderError,
+    SemanticRequest, SemanticWork,
 };
 use crate::hash::{HashMap, HashSet};
+use crate::ordering::{
+    compare_boundary_evidence, compare_call_sites, compare_completeness, compare_continuations,
+    compare_optional_call_sites, compare_points, compare_procedures, compare_proof,
+};
 
 use super::transfer::{TransferEvaluation, TransferScratch, evaluate_transfer};
 use super::witness::{
@@ -32,6 +36,18 @@ type CachedCallOutcome = Arc<SemanticOutcome<CallTransferSet>>;
 type CachedExitOutcome = Arc<SemanticOutcome<Arc<IcfgExitProfile>>>;
 type ExitCacheKey = (ProcedureHandle, ProgramPointId, ProgramPointId);
 type ProviderCacheLookup<T> = Result<(T, bool), SolverTermination>;
+
+fn edge_needs_coverage(
+    request: &DataflowRequest<'_>,
+    proof: &ProofStatus,
+    completeness: &EvidenceCompleteness,
+) -> Result<bool, SolverTermination> {
+    if request.cancellation.is_cancelled() {
+        return Err(SolverTermination::Cancelled);
+    }
+    Ok(!matches!(proof, ProofStatus::Proven)
+        || !matches!(completeness, EvidenceCompleteness::Complete))
+}
 
 /// One validated reusable entry-to-exit relation remapped into live facts.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -228,7 +244,7 @@ impl From<SolverTermination> for ReusableSummaryError {
     }
 }
 
-struct NoReusableSummaries;
+pub(crate) struct NoReusableSummaries;
 
 impl<Fact> ReusableSummaryProvider<Fact> for NoReusableSummaries {
     fn summary_for(
@@ -278,6 +294,7 @@ pub struct SummarySolveInput<'input, Fact> {
     entry_facts: &'input [Fact],
     point_seeds: &'input [SummaryPointSeed<Fact>],
     witness_retention: WitnessRetentionLimits,
+    call_context_limits: Option<OracleLimits>,
 }
 
 impl<'input, Fact> SummarySolveInput<'input, Fact> {
@@ -287,7 +304,15 @@ impl<'input, Fact> SummarySolveInput<'input, Fact> {
             entry_facts,
             point_seeds: &[],
             witness_retention: WitnessRetentionLimits::disabled(),
+            call_context_limits: None,
         }
+    }
+
+    /// Keep bounded caller identity in query-local summary entries and dispatch.
+    /// Reusable context-independent summaries are refused in this mode.
+    pub const fn with_call_context(mut self, limits: OracleLimits) -> Self {
+        self.call_context_limits = Some(limits);
+        self
     }
 
     pub const fn root(self) -> &'input ProcedureHandle {
@@ -322,6 +347,7 @@ impl<'input, Fact> SummarySolveInput<'input, Fact> {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 struct EntryKey {
+    context: usize,
     procedure: usize,
     entry_point: ProgramPointId,
     entry_fact: FactId,
@@ -375,6 +401,7 @@ struct IncomingCall {
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct MatchedReturnCacheKey {
+    context: usize,
     origin: CallSiteHandle,
     transfer_index: usize,
     callee_entry: ProgramPointHandle,
@@ -455,7 +482,7 @@ impl PathWitnessSource<'_> {
                 WitnessEvidenceNode::summary_application_retained_bytes(return_edge)
             }
             Self::ReusableSummaryApplication { return_edge, .. } => {
-                WitnessEvidenceNode::reusable_summary_application_retained_bytes(return_edge)
+                WitnessEvidenceNode::summary_application_retained_bytes(return_edge)
             }
         }
     }
@@ -588,6 +615,9 @@ struct SummaryState<Fact> {
     /// field rather than a literal so the reusable-summary guard names what it
     /// means (#2285).
     root: usize,
+    contexts: Vec<OracleCallContext>,
+    context_ids: HashMap<OracleCallContext, usize>,
+    call_context_limits: Option<OracleLimits>,
     procedures: Vec<ProcedureHandle>,
     procedure_ids: HashMap<ProcedureHandle, usize>,
     point_seeds: HashMap<(usize, ProgramPointId), Vec<Fact>>,
@@ -601,9 +631,9 @@ struct SummaryState<Fact> {
     incoming_ids: HashMap<IncomingKey, usize>,
     incoming_by_entry: HashMap<EntryKey, Vec<usize>>,
     reusable_entries: HashSet<EntryKey>,
-    call_cache: HashMap<CallSiteHandle, CachedCallOutcome>,
+    call_cache: HashMap<(CallSiteHandle, usize), CachedCallOutcome>,
     exit_cache: HashMap<ExitCacheKey, CachedExitOutcome>,
-    call_to_return_cache: HashMap<CallSiteHandle, Arc<[ProcedureIcfgEdge]>>,
+    call_to_return_cache: HashMap<(CallSiteHandle, usize), Arc<[ProcedureIcfgEdge]>>,
     matched_return_cache: HashMap<MatchedReturnCacheKey, Arc<CachedMatchedReturnProjection>>,
     transfer_scratch: TransferScratch<Fact>,
     unproven_edges: HashSet<Arc<SummaryEdge>>,
@@ -624,6 +654,9 @@ where
         Self {
             zero_fact,
             root: 0,
+            contexts: vec![OracleCallContext::empty()],
+            context_ids: HashMap::from_iter([(OracleCallContext::empty(), 0)]),
+            call_context_limits: None,
             facts: Vec::new(),
             fact_ids: HashMap::default(),
             procedures: Vec::new(),
@@ -713,6 +746,7 @@ where
             return Ok(Some(SolverTermination::Cancelled));
         }
 
+        self.call_context_limits = input.call_context_limits;
         let root = self.intern_procedure(input.root().clone());
         self.root = root;
         let entry_point = input
@@ -812,6 +846,7 @@ where
                 (
                     PathEdgeKey {
                         entry: EntryKey {
+                            context: 0,
                             procedure: root,
                             entry_point: entry_point.id(),
                             entry_fact: relative_entry_fact,
@@ -1158,17 +1193,21 @@ where
     fn observe_edge(
         &mut self,
         edge: &ProcedureIcfgEdge,
+        context: usize,
         request: &mut DataflowRequest<'_>,
     ) -> Option<SolverTermination> {
-        if request.cancellation.is_cancelled() {
-            return Some(SolverTermination::Cancelled);
-        }
-        if matches!(edge.proof, ProofStatus::Proven)
-            && matches!(edge.completeness, EvidenceCompleteness::Complete)
-        {
+        let needs_coverage = match edge_needs_coverage(request, &edge.proof, &edge.completeness) {
+            Ok(needs_coverage) => needs_coverage,
+            Err(termination) => return Some(termination),
+        };
+        if !needs_coverage {
             return None;
         }
-        self.observe_summary_edge(Arc::new(SummaryEdge::from_procedure_edge(edge)), request)
+        let row = Arc::new(SummaryEdge::from_procedure_edge(
+            edge,
+            &self.contexts[context],
+        ));
+        self.observe_summary_edge(row, request)
     }
 
     fn observe_summary_edge(
@@ -1176,12 +1215,11 @@ where
         row: Arc<SummaryEdge>,
         request: &mut DataflowRequest<'_>,
     ) -> Option<SolverTermination> {
-        if request.cancellation.is_cancelled() {
-            return Some(SolverTermination::Cancelled);
-        }
-        if matches!(row.proof(), ProofStatus::Proven)
-            && matches!(row.completeness(), EvidenceCompleteness::Complete)
-        {
+        let needs_coverage = match edge_needs_coverage(request, row.proof(), row.completeness()) {
+            Ok(needs_coverage) => needs_coverage,
+            Err(termination) => return Some(termination),
+        };
+        if !needs_coverage {
             return None;
         }
         let retain_unproven = !matches!(row.proof(), ProofStatus::Proven)
@@ -1204,9 +1242,11 @@ where
     fn observe_boundary(
         &mut self,
         boundary: ProcedureIcfgBoundary,
+        context: usize,
         request: &mut DataflowRequest<'_>,
     ) -> Option<SolverTermination> {
-        self.retain_boundary(SummaryBoundary::from_procedure_boundary(boundary), request)
+        let row = SummaryBoundary::from_procedure_boundary(boundary, &self.contexts[context]);
+        self.retain_boundary(row, request)
     }
 
     fn retain_boundary(
@@ -1231,15 +1271,19 @@ where
         &mut self,
         at: &ProgramPointHandle,
         origin: Option<CallSiteHandle>,
+        context: usize,
         outcome: &SemanticOutcome<T>,
         request: &mut DataflowRequest<'_>,
     ) -> Option<SolverTermination> {
         let status = SummarySemanticStatus::from_outcome(outcome);
         if !status.is_complete() {
-            return self.retain_boundary(
-                SummaryBoundary::new(at.clone(), origin, SummaryBoundaryKind::Semantic(status)),
-                request,
+            let row = SummaryBoundary::new(
+                at.clone(),
+                origin,
+                SummaryBoundaryKind::Semantic(status),
+                &self.contexts[context],
             );
+            return self.retain_boundary(row, request);
         }
         None
     }
@@ -1264,6 +1308,7 @@ where
         provider: &Provider,
         point: &ProgramPointHandle,
         call: crate::analyzer::semantic::CallSiteId,
+        context: usize,
         semantic_budget: &mut SemanticBudget,
         request: &mut DataflowRequest<'_>,
     ) -> Result<ProviderCacheLookup<CachedCallOutcome>, SummaryDataflowError>
@@ -1277,7 +1322,7 @@ where
             .procedure()
             .call_site_handle(call)
             .ok_or_else(|| SemanticProviderError::internal("failed to scope summary call"))?;
-        if let Some(cached) = self.call_cache.get(&origin) {
+        if let Some(cached) = self.call_cache.get(&(origin.clone(), context)) {
             self.metrics.provider_cache_hits = self.metrics.provider_cache_hits.saturating_add(1);
             return Ok(Ok((Arc::clone(cached), false)));
         }
@@ -1286,7 +1331,12 @@ where
         }
         let mut semantic_request = SemanticRequest::new(semantic_budget, request.cancellation);
         let outcome = provider
-            .call_transfers(point.procedure(), call, &mut semantic_request)?
+            .call_transfers_in_context(
+                point.procedure(),
+                call,
+                &self.contexts[context],
+                &mut semantic_request,
+            )?
             .map(canonicalize_call_transfer_set);
         if let Some(transfers) = outcome.available_value() {
             let semantic_call = point
@@ -1303,7 +1353,8 @@ where
             )?;
         }
         let outcome = Arc::new(outcome);
-        self.call_cache.insert(origin, Arc::clone(&outcome));
+        self.call_cache
+            .insert((origin, context), Arc::clone(&outcome));
         Ok(Ok((outcome, true)))
     }
 
@@ -1454,15 +1505,18 @@ where
             .procedure()
             .point_handle(queued.key.entry.entry_point)
             .ok_or_else(|| SemanticProviderError::internal("summary entry point is stale"))?;
-        let (outcome, newly_materialized) =
+        let (outcome, _) =
             match self.cached_exit_profile(provider, &entry, point, semantic_budget, request)? {
                 Ok(outcome) => outcome,
                 Err(termination) => return Ok(Some(termination)),
             };
-        if newly_materialized
-            && let Some(termination) =
-                self.observe_semantic_outcome(point, None, outcome.as_ref(), request)
-        {
+        if let Some(termination) = self.observe_semantic_outcome(
+            point,
+            None,
+            queued.key.entry.context,
+            outcome.as_ref(),
+            request,
+        ) {
             return Ok(Some(termination));
         }
         if matches!(outcome.as_ref(), SemanticOutcome::Cancelled { .. })
@@ -1508,19 +1562,24 @@ where
         let origin = caller
             .call_site_handle(call)
             .ok_or_else(|| SemanticProviderError::internal("failed to scope summary invoke"))?;
-        let (outcome, newly_materialized) =
-            match self.cached_call_transfers(provider, point, call, semantic_budget, request)? {
-                Ok(outcome) => outcome,
-                Err(termination) => return Ok(Some(termination)),
-            };
-        if newly_materialized
-            && let Some(termination) = self.observe_semantic_outcome(
-                point,
-                Some(origin.clone()),
-                outcome.as_ref(),
-                request,
-            )
-        {
+        let (outcome, newly_materialized) = match self.cached_call_transfers(
+            provider,
+            point,
+            call,
+            queued.key.entry.context,
+            semantic_budget,
+            request,
+        )? {
+            Ok(outcome) => outcome,
+            Err(termination) => return Ok(Some(termination)),
+        };
+        if let Some(termination) = self.observe_semantic_outcome(
+            point,
+            Some(origin.clone()),
+            queued.key.entry.context,
+            outcome.as_ref(),
+            request,
+        ) {
             return Ok(Some(termination));
         }
         if matches!(outcome.as_ref(), SemanticOutcome::Cancelled { .. })
@@ -1535,6 +1594,12 @@ where
         // whole behavior, and mounting an intentionally opaque body would
         // open the exact gaps the model exists to close.
         let replaced = problem.call_replaced_by_model(&origin);
+        // A model proven complete in every transfer is the call's whole
+        // behavior at the derived tier (#3757): facts cross the call on the
+        // caller's own continuation scaffolding, and the dispatch boundary is
+        // retained for completion accounting only, so its weaker evidence
+        // does not lower the quality of a path through a fully modeled call.
+        let replaced_by_proven_model = replaced && problem.call_replaced_by_proven_model(&origin);
         if let Some(transfers) = outcome.available_value() {
             let call_to_return_edges = if newly_materialized {
                 let mut projected_edges = Vec::new();
@@ -1542,11 +1607,13 @@ where
                     if request.cancellation.is_cancelled() {
                         return Ok(Some(SolverTermination::Cancelled));
                     }
+                    let call_context = self.contexts[queued.key.entry.context].clone();
                     if let Some(termination) = self.retain_boundary(
                         SummaryBoundary::from_dispatch(
                             point.clone(),
                             boundary.origin.clone(),
                             &boundary.dispatch,
+                            &call_context,
                         ),
                         request,
                     ) {
@@ -1558,12 +1625,14 @@ where
                         boundary,
                     )?;
                     for boundary in projection.boundaries {
-                        if let Some(termination) = self.observe_boundary(boundary, request) {
+                        if let Some(termination) =
+                            self.observe_boundary(boundary, queued.key.entry.context, request)
+                        {
                             return Ok(Some(termination));
                         }
                     }
-                    for edge in projection.edges {
-                        projected_edges.push(edge);
+                    if !replaced_by_proven_model {
+                        projected_edges.extend(projection.edges);
                     }
                 }
                 // A resolved call also carries the caller's own control
@@ -1578,7 +1647,8 @@ where
                 // transfer is applied once with the boundary's evidence.
                 if problem.resolved_call_to_return()
                     && (!transfers.transfers.is_empty()
-                        || (replaced && transfers.boundaries.is_empty()))
+                        || (replaced
+                            && (transfers.boundaries.is_empty() || replaced_by_proven_model)))
                 {
                     for (kind, continuation) in [
                         (
@@ -1617,17 +1687,21 @@ where
                     if request.cancellation.is_cancelled() {
                         return Ok(Some(SolverTermination::Cancelled));
                     }
-                    if let Some(termination) = self.observe_edge(edge, request) {
+                    if let Some(termination) =
+                        self.observe_edge(edge, queued.key.entry.context, request)
+                    {
                         return Ok(Some(termination));
                     }
                 }
                 let projected_edges = Arc::<[ProcedureIcfgEdge]>::from(projected_edges);
-                self.call_to_return_cache
-                    .insert(origin.clone(), Arc::clone(&projected_edges));
+                self.call_to_return_cache.insert(
+                    (origin.clone(), queued.key.entry.context),
+                    Arc::clone(&projected_edges),
+                );
                 projected_edges
             } else {
                 self.call_to_return_cache
-                    .get(&origin)
+                    .get(&(origin.clone(), queued.key.entry.context))
                     .cloned()
                     .ok_or_else(|| {
                         SemanticProviderError::internal(
@@ -1665,7 +1739,10 @@ where
                     completeness: transfer.completeness.clone(),
                     boundary: None,
                 };
-                if newly_materialized && let Some(termination) = self.observe_edge(&edge, request) {
+                if newly_materialized
+                    && let Some(termination) =
+                        self.observe_edge(&edge, queued.key.entry.context, request)
+                {
                     return Ok(Some(termination));
                 }
                 let incoming_quality = queued
@@ -1673,6 +1750,7 @@ where
                     .through_evidence(&edge.proof, &edge.completeness);
                 let descriptor = descriptor(&edge)
                     .with_call_transfer(transfer)
+                    .with_call_context(&self.contexts[queued.key.entry.context])
                     .with_summary_entry_fact(self.facts[queued.key.entry.entry_fact.index()]);
                 let outputs = match evaluate_transfer(
                     problem,
@@ -1842,7 +1920,9 @@ where
     where
         P: DistributiveDataflowProblem<Fact = Fact>,
     {
-        if observe_evidence && let Some(termination) = self.observe_edge(edge, request) {
+        if observe_evidence
+            && let Some(termination) = self.observe_edge(edge, entry.context, request)
+        {
             return Ok(Some(termination));
         }
         let output_quality = input_quality.through_evidence(&edge.proof, &edge.completeness);
@@ -1900,6 +1980,9 @@ where
         Provider: IcfgProvider + ?Sized,
         Reusable: ReusableSummaryProvider<Fact> + ?Sized,
     {
+        if self.call_context_limits.is_some() {
+            return Ok(None);
+        }
         for &entry_fact in entry_facts {
             if request.cancellation.is_cancelled() {
                 return Ok(Some(SolverTermination::Cancelled));
@@ -1919,6 +2002,7 @@ where
                 )
             })?;
             let entry = EntryKey {
+                context: 0,
                 procedure,
                 entry_point: transfer.callee_entry.id(),
                 entry_fact: entry_fact_id,
@@ -2034,11 +2118,14 @@ where
             // observations forward the way the taint route does, or accept that
             // the rows below its callee are absent. Do not read a missing row
             // from a reuse-backed solve as a proven negative.
-            if summary.exits.iter().any(|row| row.qualities.is_empty())
-                || summary.reached.iter().any(|row| {
-                    row.qualities.is_empty() || row.point.procedure() != &transfer.callee
-                })
-            {
+            if !super::reusable_summary_rows_are_valid(
+                &transfer.callee,
+                summary.exits.iter().map(|row| row.qualities.as_ref()),
+                summary
+                    .reached
+                    .iter()
+                    .map(|row| (row.qualities.as_ref(), row.point.procedure())),
+            ) {
                 self.metrics.reusable_summary_misses =
                     self.metrics.reusable_summary_misses.saturating_add(1);
                 continue;
@@ -2117,7 +2204,7 @@ where
                 let exit_point = transfer.callee.point_handle(exit_point).ok_or_else(|| {
                     SemanticProviderError::internal("reusable callee exit point is stale")
                 })?;
-                let (outcome, newly_materialized) = match self.cached_exit_profile(
+                let (outcome, _) = match self.cached_exit_profile(
                     provider,
                     &transfer.callee_entry,
                     &exit_point,
@@ -2127,10 +2214,13 @@ where
                     Ok(outcome) => outcome,
                     Err(termination) => return Ok(Some(termination)),
                 };
-                if newly_materialized
-                    && let Some(termination) =
-                        self.observe_semantic_outcome(&exit_point, None, outcome.as_ref(), request)
-                {
+                if let Some(termination) = self.observe_semantic_outcome(
+                    &exit_point,
+                    None,
+                    entry.context,
+                    outcome.as_ref(),
+                    request,
+                ) {
                     return Ok(Some(termination));
                 }
                 let Some(exit) = outcome.available_value().cloned() else {
@@ -2175,6 +2265,9 @@ where
         Provider: IcfgProvider + ?Sized,
         Reusable: ReusableSummaryProvider<Fact> + ?Sized,
     {
+        if self.call_context_limits.is_some() {
+            return Ok(None);
+        }
         if request.cancellation.is_cancelled() {
             return Ok(Some(SolverTermination::Cancelled));
         }
@@ -2189,6 +2282,7 @@ where
             .point_handle(root.semantics().entry_point())
             .ok_or_else(|| SemanticProviderError::internal("summary root entry point is stale"))?;
         let entry = EntryKey {
+            context: 0,
             procedure: self.root,
             entry_point: entry_point.id(),
             entry_fact: ZERO_FACT_ID,
@@ -2249,12 +2343,14 @@ where
                 .saturating_add(1);
             return Ok(None);
         }
-        if summary.exits.iter().any(|row| row.qualities.is_empty())
-            || summary
+        if !super::reusable_summary_rows_are_valid(
+            &root,
+            summary.exits.iter().map(|row| row.qualities.as_ref()),
+            summary
                 .reached
                 .iter()
-                .any(|row| row.qualities.is_empty() || row.point.procedure() != &root)
-        {
+                .map(|row| (row.qualities.as_ref(), row.point.procedure())),
+        ) {
             reusable.discard_root_summary(&root);
             self.metrics.reusable_summary_misses =
                 self.metrics.reusable_summary_misses.saturating_add(1);
@@ -2363,7 +2459,7 @@ where
             let exit_point = root.point_handle(exit_point).ok_or_else(|| {
                 SemanticProviderError::internal("reusable root exit point is stale")
             })?;
-            let (outcome, newly_materialized) = match self.cached_exit_profile(
+            let (outcome, _) = match self.cached_exit_profile(
                 provider,
                 &entry_point,
                 &exit_point,
@@ -2373,10 +2469,13 @@ where
                 Ok(outcome) => outcome,
                 Err(termination) => return Ok(Some(termination)),
             };
-            if newly_materialized
-                && let Some(termination) =
-                    self.observe_semantic_outcome(&exit_point, None, outcome.as_ref(), request)
-            {
+            if let Some(termination) = self.observe_semantic_outcome(
+                &exit_point,
+                None,
+                entry.context,
+                outcome.as_ref(),
+                request,
+            ) {
                 return Ok(Some(termination));
             }
             let Some(exit) = outcome.available_value().cloned() else {
@@ -2428,6 +2527,29 @@ where
                 "enabled call propagation has no caller evidence",
             ));
         }
+        let callee_context = if let Some(limits) = self.call_context_limits {
+            let context =
+                self.contexts[caller_path.entry.context].extended(transfer.origin.clone(), limits);
+            if let Some(id) = self.context_ids.get(&context) {
+                *id
+            } else {
+                if let Some(termination) = request.reserve(SolverWork {
+                    callback_rows: context.calls().len(),
+                    ..SolverWork::default()
+                }) {
+                    return Ok(Some(termination));
+                }
+                if let Some(termination) = self.reserve_provider_materialization(request) {
+                    return Ok(Some(termination));
+                }
+                let id = self.contexts.len();
+                self.contexts.push(context.clone());
+                self.context_ids.insert(context, id);
+                id
+            }
+        } else {
+            0
+        };
         let callee_procedure = self
             .procedure_ids
             .get(&transfer.callee)
@@ -2468,6 +2590,7 @@ where
                     .expect("prospective fact IDs were validated during exact sizing")
             });
             let callee = EntryKey {
+                context: callee_context,
                 procedure: callee_procedure,
                 entry_point: transfer.callee_entry.id(),
                 entry_fact: fact,
@@ -2517,6 +2640,7 @@ where
                 return Ok(Some(SolverTermination::Cancelled));
             }
             let callee = EntryKey {
+                context: callee_context,
                 procedure: callee_procedure,
                 entry_point: transfer.callee_entry.id(),
                 entry_fact: fact,
@@ -3108,7 +3232,7 @@ where
         incoming: &IncomingCall,
     ) -> Result<&CallTransfer, SummaryDataflowError> {
         self.call_cache
-            .get(&incoming.origin)
+            .get(&(incoming.origin.clone(), incoming.key.caller.context))
             .and_then(|outcome| outcome.available_value())
             .and_then(|transfers| transfers.transfers.get(incoming.key.transfer_index))
             .ok_or_else(|| {
@@ -3133,6 +3257,7 @@ where
             let summary = &self.summaries[summary_id];
             debug_assert_eq!(incoming.key.callee, summary.key.entry);
             MatchedReturnCacheKey {
+                context: incoming.key.caller.context,
                 origin: incoming.origin.clone(),
                 transfer_index: incoming.key.transfer_index,
                 callee_entry: summary.exit.callee_entry().clone(),
@@ -3154,9 +3279,13 @@ where
                 MatchedReturnProjection::Edge {
                     edge,
                     implicit_abort_only,
-                } => CachedMatchedReturnProjection::Edge(Arc::new(
-                    SummaryEdge::from_matched_return(edge, implicit_abort_only),
-                )),
+                } => {
+                    CachedMatchedReturnProjection::Edge(Arc::new(SummaryEdge::from_matched_return(
+                        edge,
+                        implicit_abort_only,
+                        &self.contexts[key.context],
+                    )))
+                }
                 MatchedReturnProjection::Absent => CachedMatchedReturnProjection::Absent,
                 MatchedReturnProjection::Boundary(boundary) => {
                     CachedMatchedReturnProjection::Boundary(boundary)
@@ -3233,7 +3362,9 @@ where
                 Ok(None)
             }
             CachedMatchedReturnProjection::Boundary(boundary) => {
-                if let Some(termination) = self.observe_boundary(boundary.clone(), request) {
+                if let Some(termination) =
+                    self.observe_boundary(boundary.clone(), caller.context, request)
+                {
                     return Ok(Some(termination));
                 }
                 self.metrics.summary_applications =
@@ -3255,6 +3386,7 @@ where
                     .through_evidence(edge.proof(), edge.completeness());
                 let target = edge.target().id();
                 let flow = summary_descriptor(edge)
+                    .with_call_context(&self.contexts[caller.context])
                     .with_summary_entry_fact(self.facts[summary_entry_fact.index()]);
                 let outputs = match evaluate_transfer(
                     problem,
@@ -3377,7 +3509,8 @@ where
                     .point_handle(key.point)
                     .expect("published summary path point remains valid");
                 SummaryReachedFact::new(
-                    SummaryEntry::new(procedure, entry_point, key.entry.entry_fact),
+                    SummaryEntry::new(procedure, entry_point, key.entry.entry_fact)
+                        .with_call_context(self.contexts[key.entry.context].clone()),
                     point,
                     key.fact,
                     qualities,
@@ -3397,7 +3530,8 @@ where
                     .point_handle(row.key.entry.entry_point)
                     .expect("published summary entry point remains valid");
                 TabulationEndSummary::new(
-                    SummaryEntry::new(procedure, entry_point, row.key.entry.entry_fact),
+                    SummaryEntry::new(procedure, entry_point, row.key.entry.entry_fact)
+                        .with_call_context(self.contexts[row.key.entry.context].clone()),
                     row.exit,
                     row.key.exit_fact,
                     row.qualities,
@@ -3427,12 +3561,14 @@ where
                         caller_procedure,
                         caller_entry_point,
                         row.key.caller.entry_fact,
-                    ),
+                    )
+                    .with_call_context(self.contexts[row.key.caller.context].clone()),
                     SummaryEntry::new(
                         callee_procedure,
                         callee_entry_point,
                         row.key.callee.entry_fact,
-                    ),
+                    )
+                    .with_call_context(self.contexts[row.key.callee.context].clone()),
                     call_point,
                     row.key.call_fact,
                     row.origin.clone(),
@@ -3464,12 +3600,14 @@ where
                             callee_procedure,
                             callee_entry_point,
                             row.key.callee.entry_fact,
-                        ),
+                        )
+                        .with_call_context(self.contexts[row.key.callee.context].clone()),
                         SummaryEntry::new(
                             caller_procedure,
                             caller_entry_point,
                             row.key.caller.entry_fact,
-                        ),
+                        )
+                        .with_call_context(self.contexts[row.key.caller.context].clone()),
                         call_point,
                         row.key.call_fact,
                         row.origin,
@@ -3681,8 +3819,8 @@ fn summary_descriptor<Fact>(edge: &SummaryEdge) -> DataflowEdge<'_, Fact> {
 }
 
 fn compare_procedure_edges(left: &ProcedureIcfgEdge, right: &ProcedureIcfgEdge) -> Ordering {
-    compare_program_points(&left.source, &right.source)
-        .then_with(|| compare_program_points(&left.target, &right.target))
+    compare_points(&left.source, &right.source)
+        .then_with(|| compare_points(&left.target, &right.target))
         .then_with(|| left.kind.label().cmp(right.kind.label()))
         .then_with(|| compare_optional_call_sites(left.origin.as_ref(), right.origin.as_ref()))
         .then_with(|| left.boundary.cmp(&right.boundary))
@@ -3690,25 +3828,12 @@ fn compare_procedure_edges(left: &ProcedureIcfgEdge, right: &ProcedureIcfgEdge) 
         .then_with(|| compare_completeness(&left.completeness, &right.completeness))
 }
 
-fn compare_program_points(left: &ProgramPointHandle, right: &ProgramPointHandle) -> Ordering {
-    compare_procedures(left.procedure(), right.procedure()).then_with(|| left.id().cmp(&right.id()))
-}
-
-fn compare_optional_call_sites(
-    left: Option<&CallSiteHandle>,
-    right: Option<&CallSiteHandle>,
-) -> Ordering {
-    match (left, right) {
-        (None, None) => Ordering::Equal,
-        (None, Some(_)) => Ordering::Less,
-        (Some(_), None) => Ordering::Greater,
-        (Some(left), Some(right)) => compare_call_sites(left, right),
-    }
-}
-
 fn is_procedure_exit(point: &ProgramPointHandle) -> bool {
-    let semantics = point.procedure().semantics();
-    point.id() == semantics.normal_exit_point() || point.id() == semantics.exceptional_exit_point()
+    super::is_procedure_exit_kind(point, crate::analyzer::semantic::ReturnTransferKind::Normal)
+        || super::is_procedure_exit_kind(
+            point,
+            crate::analyzer::semantic::ReturnTransferKind::Exceptional,
+        )
 }
 
 fn compare_call_transfers(left: &CallTransfer, right: &CallTransfer) -> Ordering {
@@ -3730,62 +3855,16 @@ fn compare_call_boundaries(left: &CallBoundary, right: &CallBoundary) -> Orderin
     compare_call_sites(&left.origin, &right.origin)
         .then_with(|| compare_dispatch_boundary_kind(&left.dispatch.kind, &right.dispatch.kind))
         .then_with(|| compare_call_to_return_model(left.model, right.model))
-        .then_with(|| compare_proof(&left.dispatch.proof, &right.dispatch.proof))
         .then_with(|| {
-            compare_completeness(&left.dispatch.completeness, &right.dispatch.completeness)
+            compare_boundary_evidence(
+                Some(&left.dispatch.proof),
+                Some(&left.dispatch.completeness),
+                &left.dispatch.provenance,
+                Some(&right.dispatch.proof),
+                Some(&right.dispatch.completeness),
+                &right.dispatch.provenance,
+            )
         })
-        .then_with(|| {
-            compare_relation_provenance(&left.dispatch.provenance, &right.dispatch.provenance)
-        })
-}
-
-fn compare_procedures(left: &ProcedureHandle, right: &ProcedureHandle) -> Ordering {
-    left.artifact()
-        .key()
-        .cmp(right.artifact().key())
-        .then_with(|| left.semantics().locator().cmp(right.semantics().locator()))
-        .then_with(|| left.id().cmp(&right.id()))
-        .then_with(|| {
-            Arc::as_ptr(left.artifact())
-                .cast::<()>()
-                .cmp(&Arc::as_ptr(right.artifact()).cast::<()>())
-        })
-}
-
-fn compare_call_sites(left: &CallSiteHandle, right: &CallSiteHandle) -> Ordering {
-    compare_procedures(left.procedure(), right.procedure()).then_with(|| left.id().cmp(&right.id()))
-}
-
-fn compare_continuations(left: ControlContinuation, right: ControlContinuation) -> Ordering {
-    let key = |continuation| match continuation {
-        ControlContinuation::Target(point) => (0, point.get()),
-        ControlContinuation::Absent => (1, 0),
-        ControlContinuation::Unknown => (2, 0),
-        ControlContinuation::Unsupported => (3, 0),
-        ControlContinuation::Unproven => (4, 0),
-        ControlContinuation::ExceededBudget => (5, 0),
-    };
-    key(left).cmp(&key(right))
-}
-
-fn compare_proof(left: &ProofStatus, right: &ProofStatus) -> Ordering {
-    match (left, right) {
-        (ProofStatus::Proven, ProofStatus::Proven) => Ordering::Equal,
-        (ProofStatus::Proven, ProofStatus::Unproven(_)) => Ordering::Less,
-        (ProofStatus::Unproven(_), ProofStatus::Proven) => Ordering::Greater,
-        (ProofStatus::Unproven(left), ProofStatus::Unproven(right)) => left.cmp(right),
-    }
-}
-
-fn compare_completeness(left: &EvidenceCompleteness, right: &EvidenceCompleteness) -> Ordering {
-    match (left, right) {
-        (EvidenceCompleteness::Complete, EvidenceCompleteness::Complete) => Ordering::Equal,
-        (EvidenceCompleteness::Complete, EvidenceCompleteness::Partial(_)) => Ordering::Less,
-        (EvidenceCompleteness::Partial(_), EvidenceCompleteness::Complete) => Ordering::Greater,
-        (EvidenceCompleteness::Partial(left), EvidenceCompleteness::Partial(right)) => {
-            left.cmp(right)
-        }
-    }
 }
 
 fn compare_call_to_return_model(

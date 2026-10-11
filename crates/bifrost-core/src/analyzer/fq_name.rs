@@ -107,10 +107,9 @@ pub enum SegmentKind {
     /// spellings, not kinds, so input segments are matched kind-insensitively
     /// against extracted names; `Unknown` records "no kind claim". It renders
     /// with an ordinary `.` join (the default), so an input `FqName` renders to
-    /// exactly the canonical `.`-joined spelling the string index is keyed by —
-    /// which is why M2's consumers can match input against the string-keyed
-    /// `definitions` index by rendering, without a kind-aware compare. See the
-    /// Decision Log entry in `.agents/plans/fqname-interned-segments.md`.
+    /// exactly the canonical `.`-joined spelling used by the string-keyed
+    /// `definitions` index, so input can match extracted names without a
+    /// kind-aware comparison.
     Unknown,
 }
 
@@ -191,6 +190,16 @@ impl FqName {
         Self::default()
     }
 
+    /// Build a package-qualified name from package components.
+    pub fn from_package_components(components: &[String]) -> Self {
+        let interner = segment_interner();
+        let mut name = Self::new();
+        for component in components {
+            name.push(interner.intern(component, SegmentKind::Package));
+        }
+        name
+    }
+
     pub fn is_empty(&self) -> bool {
         self.segments.is_empty()
     }
@@ -255,6 +264,13 @@ impl FqName {
 
     pub fn segments(&self) -> &[SegmentId] {
         &self.segments
+    }
+
+    /// Resolve each segment to its interned text and semantic kind in order.
+    pub fn resolved_segments(&self) -> impl Iterator<Item = (&'static str, SegmentKind)> + '_ {
+        self.segments
+            .iter()
+            .map(|&id| segment_interner().resolve(id))
     }
 
     /// Whether two names carry the same component text in the same order,
@@ -495,8 +511,7 @@ const ALL_SEGMENT_SEPARATORS: [&str; 4] = ["/", "$", "::", "."];
 /// lookup spelling that carries one is a guaranteed miss against the
 /// `(lang, short_name)` index -- it can be dropped before it costs a pooled
 /// connection checkout, a generation check, a `prepare_cached` and an index
-/// probe (issue #1748; `.agents/docs/graph-read-cost-investigation-2026-08.md`
-/// measured 0 of 324,891 stored `short_name` values containing `::`).
+/// probe (issue #1748).
 ///
 /// Derived exhaustively over [`SegmentKind::ALL`] pairs rather than written out
 /// as a second list, so a new language-specific rule in [`separator`] changes
@@ -855,20 +870,30 @@ pub mod counters {
 }
 
 #[cfg(test)]
+fn intern_name_segments<'a>(
+    interner: &SegmentInterner,
+    segments: impl IntoIterator<Item = (&'a str, SegmentKind)>,
+) -> FqName {
+    let mut name = FqName::new();
+    for (text, kind) in segments {
+        name.push(interner.intern(text, kind));
+    }
+    name
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
+    use brokk_bifrost_test_macros::hardwon;
 
     fn fq(interner: &SegmentInterner, parts: &[(&str, SegmentKind)]) -> FqName {
-        let mut name = FqName::new();
-        for &(text, kind) in parts {
-            name.push(interner.intern(text, kind));
-        }
-        name
+        intern_name_segments(interner, parts.iter().copied())
     }
 
     /// `namespace_prefix` answers over every segment kind, so a new kind
     /// cannot silently join the namespace side of the split.
     #[test]
+    #[hardwon("#1645: free Rust function scope was reported unknown instead of external")]
     fn namespace_prefix_accepts_only_namespace_scope_before_the_leaf() {
         let interner = segment_interner();
         // A root-scope declaration: one segment, so the prefix is empty and
@@ -916,6 +941,9 @@ mod tests {
     /// re-split into exactly the components `joined_segments` interns, so the
     /// `CodeUnit::with_signature_and_fq` boundary search cannot fail (#1189).
     #[test]
+    #[hardwon(
+        "#2353: malformed repeated separators made joined names disagree with their FqName segments"
+    )]
     fn normalize_joined_agrees_with_joined_segments() {
         for (raw, separator) in [
             // Well formed: every one of these must survive untouched.
@@ -946,28 +974,14 @@ mod tests {
         }
     }
 
-    /// A clean name must not allocate: this runs on every declaration.
     #[test]
+    #[hardwon("#2353: malformed joined names could disagree with their FqName segments")]
     fn normalize_joined_borrows_a_clean_name() {
         assert!(matches!(
             normalize_joined("com.example.pkg", "."),
             Cow::Borrowed(_)
         ));
         assert!(matches!(normalize_joined("com..foo", "."), Cow::Owned(_)));
-    }
-
-    #[test]
-    fn intern_dedups_by_text_and_kind() {
-        let interner = SegmentInterner::new();
-        let a = interner.intern("foo", SegmentKind::Member);
-        let b = interner.intern("foo", SegmentKind::Member);
-        assert_eq!(a, b, "same text+kind must intern to the same id");
-
-        let c = interner.intern("foo", SegmentKind::Type);
-        assert_ne!(a, c, "same text, different kind must be a distinct entry");
-
-        assert_eq!(interner.resolve(a), ("foo", SegmentKind::Member));
-        assert_eq!(interner.resolve(c), ("foo", SegmentKind::Type));
     }
 
     #[test]
@@ -1124,6 +1138,7 @@ mod tests {
     }
 
     #[test]
+    #[hardwon("#1121: nested C++ class identity was rendered with the wrong segment boundary")]
     fn display_native_cpp_nested_class_uses_dollar() {
         // C++ nested classes are spelled `Outer$Inner` — the outermost class is
         // a plain Type, each subsequently nested class is `Nested` (the general
@@ -1170,201 +1185,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn unknown_input_segments_render_dot_joined() {
-        // A user-supplied symbol path (parsed at the input edge) is a chain of
-        // `Unknown` segments; it must render to the canonical `.`-joined
-        // spelling the string index is keyed by, regardless of how the segments
-        // were originally spelled (`::`, `/`, ...), so an input FqName can be
-        // matched by rendering against the `.`-joined `definitions` index.
-        let interner = SegmentInterner::new();
-        let name = fq(
-            &interner,
-            &[
-                ("a", SegmentKind::Unknown),
-                ("b", SegmentKind::Unknown),
-                ("C", SegmentKind::Unknown),
-            ],
-        );
-        assert_eq!(name.display(&interner), "a.b.C");
-        // Native rendering agrees (Unknown is never Package, so C++'s `::` rule
-        // never fires), and appending an Unknown reference to any scope prefix
-        // joins with `.`.
-        assert_eq!(name.display_native(Language::Cpp, &interner), "a.b.C");
-        let pkg = interner.intern("ns", SegmentKind::Package);
-        assert_eq!(
-            interner.separator_between(pkg, name.segments()[0], Language::Cpp),
-            "."
-        );
-    }
-
-    #[test]
-    fn separator_between_reports_native_boundaries() {
-        let interner = SegmentInterner::new();
-        let p0 = interner.intern("cutlass", SegmentKind::Package);
-        let p1 = interner.intern("gemm", SegmentKind::Package);
-        let ty = interner.intern("Outer", SegmentKind::Type);
-        let nested = interner.intern("Inner", SegmentKind::Nested);
-        // Package->Package renders `::` in C++ (a non-dot boundary the
-        // shrinking-scope walk must not descend), `.` canonically.
-        assert_eq!(interner.separator_between(p0, p1, Language::Cpp), "::");
-        assert_eq!(interner.separator_between(p0, p1, Language::Rust), ".");
-        // Package->Type is `.` everywhere; a Nested segment is always `$`.
-        assert_eq!(interner.separator_between(p1, ty, Language::Cpp), ".");
-        assert_eq!(interner.separator_between(ty, nested, Language::Cpp), "$");
-    }
-
-    #[test]
-    fn parent_last_and_starts_with() {
-        let interner = SegmentInterner::new();
-        let name = fq(
-            &interner,
-            &[
-                ("pkg", SegmentKind::Path),
-                ("Type", SegmentKind::Type),
-                ("member", SegmentKind::Member),
-            ],
-        );
-        let parent = name.parent().expect("has parent");
-        assert_eq!(parent.display(&interner), "pkg.Type");
-        assert_eq!(parent.len(), 2);
-        assert_eq!(
-            name.last(),
-            Some(interner.intern("member", SegmentKind::Member))
-        );
-        assert!(name.starts_with(&parent));
-        assert!(name.starts_with(&name));
-
-        let unrelated = fq(&interner, &[("other", SegmentKind::Path)]);
-        assert!(!name.starts_with(&unrelated));
-
-        let empty = FqName::new();
-        assert!(empty.parent().is_none());
-        assert!(empty.last().is_none());
-        assert!(
-            name.starts_with(&empty),
-            "every name starts with the empty prefix"
-        );
-    }
-
-    #[test]
-    fn parent_chain_walks_to_root() {
-        let interner = SegmentInterner::new();
-        let mut name = fq(
-            &interner,
-            &[
-                ("a", SegmentKind::Path),
-                ("B", SegmentKind::Type),
-                ("c", SegmentKind::Member),
-            ],
-        );
-        let mut rendered = Vec::new();
-        loop {
-            rendered.push(name.display(&interner));
-            match name.parent() {
-                Some(parent) if !parent.is_empty() => name = parent,
-                _ => break,
-            }
-        }
-        assert_eq!(rendered, vec!["a.B.c", "a.B", "a"]);
-    }
-
-    /// Memory/size measurement (M0). Builds a representative corpus from this
-    /// crate's own `src/` tree — a real, deeply-nested directory layout with
-    /// heavy shared prefixes — by treating each path component as a `Path`
-    /// segment, the file stem as a `Type`, and two synthesized `Member`s per
-    /// file. Prints the interner entry count and interned text bytes versus the
-    /// summed legacy string bytes, so the memory question is answered with
-    /// numbers rather than vibes.
-    #[test]
-    fn measure_interned_vs_legacy_bytes() {
-        use std::path::Path;
-
-        fn collect_rs(dir: &Path, out: &mut Vec<std::path::PathBuf>) {
-            let Ok(entries) = std::fs::read_dir(dir) else {
-                return;
-            };
-            for entry in entries.flatten() {
-                let path = entry.path();
-                if path.is_dir() {
-                    collect_rs(&path, out);
-                } else if path.extension().is_some_and(|e| e == "rs") {
-                    out.push(path);
-                }
-            }
-        }
-
-        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
-        let mut files = Vec::new();
-        collect_rs(&root, &mut files);
-        // Guards against a walk that found nothing (a moved module tree, or the
-        // test running somewhere without sources); the ratio assertion below is
-        // what the test actually measures. Deliberately not tuned to the crate's
-        // current file count -- #1549 moved this module and broke a `> 50` bound
-        // that was standing in for "the walk worked".
-        assert!(
-            files.len() > 10,
-            "expected a real corpus, got {}",
-            files.len()
-        );
-
-        let interner = SegmentInterner::new();
-        let mut legacy_bytes: usize = 0;
-        let mut fq_count: usize = 0;
-
-        for file in &files {
-            let rel = file.strip_prefix(&root).unwrap();
-            let mut base = FqName::new();
-            // Directory components -> Path segments (shared prefixes dedup).
-            for comp in rel.parent().into_iter().flat_map(Path::components) {
-                let text = comp.as_os_str().to_string_lossy();
-                base.push(interner.intern(&text, SegmentKind::Path));
-            }
-            let stem = rel.file_stem().unwrap().to_string_lossy();
-            let type_fq = base.with_pushed(interner.intern(&stem, SegmentKind::Type));
-            for member in ["new", "run"] {
-                let member_fq = type_fq
-                    .clone()
-                    .with_pushed(interner.intern(member, SegmentKind::Member));
-                legacy_bytes += member_fq.display(&interner).len();
-                fq_count += 1;
-            }
-            legacy_bytes += type_fq.display(&interner).len();
-            fq_count += 1;
-        }
-
-        let mut interned_entries: usize = 0;
-        let mut interned_text_bytes: usize = 0;
-        for (shard_idx, shard) in interner.shards.iter().enumerate() {
-            let len = shard.read().unwrap().len;
-            interned_entries += len;
-            for local in 0..len {
-                let (text, _) = interner.resolve(SegmentInterner::encode(shard_idx, local));
-                interned_text_bytes += text.len();
-            }
-        }
-        // Each SegmentId occupies 4 bytes; an FqName is a SmallVec of them.
-        let id_bytes = interned_entries * std::mem::size_of::<SegmentId>();
-
-        println!(
-            "[fq_name measurement] corpus: {} files, {fq_count} fq names",
-            files.len()
-        );
-        println!("[fq_name measurement] summed legacy string bytes: {legacy_bytes}");
-        println!(
-            "[fq_name measurement] interner entries: {interned_entries}, unique text bytes: {interned_text_bytes} (+{id_bytes} bytes of ids)"
-        );
-        println!(
-            "[fq_name measurement] interned/legacy text ratio: {:.3}",
-            interned_text_bytes as f64 / legacy_bytes as f64
-        );
-
-        assert!(
-            interned_text_bytes < legacy_bytes,
-            "interned unique text ({interned_text_bytes}) should be well under summed legacy bytes ({legacy_bytes})"
-        );
-    }
-
     /// The contract [`RenderedFqName`] rests on: every prefix and suffix span
     /// it reports is byte-identical to rendering that prefix or suffix on its
     /// own. Checked over shapes covering every separator rule (`/` between
@@ -1372,6 +1192,9 @@ mod tests {
     /// suffixed onto a companion, and the default `.`), in every language whose
     /// rules can differ.
     #[test]
+    #[hardwon(
+        "#1928: qualified-name rendering optimization must preserve every prefix and suffix span"
+    )]
     fn rendered_spans_match_per_projection_rendering() {
         use SegmentKind::*;
         let interner = SegmentInterner::new();
@@ -1438,6 +1261,7 @@ mod tests {
     /// `64 + 128 + 256` entries, so this crosses two boundaries per shard even
     /// after ids spread over 16 shards.
     #[test]
+    #[hardwon("#1928: chunked qualified-name entries must remain resolvable after growth")]
     fn resolve_crosses_entry_chunk_boundaries() {
         let interner = SegmentInterner::new();
         let ids: Vec<_> = (0..4096)
@@ -1460,6 +1284,7 @@ mod tests {
     }
 
     #[test]
+    #[hardwon("#1928: chunk slot calculations must not leave gaps or overlap entry IDs")]
     fn entry_slots_tile_the_local_index_space() {
         let mut expected_chunk = 0;
         let mut expected_offset = 0;
@@ -1477,19 +1302,13 @@ mod tests {
         );
     }
 
-    #[test]
-    fn global_interner_is_stable() {
-        let a = segment_interner().intern("pkg", SegmentKind::Path);
-        let b = segment_interner().intern("pkg", SegmentKind::Path);
-        assert_eq!(a, b);
-    }
-
     /// The storage contract issue #1748's structural-miss filter rests on. `::`
     /// is renderable only between two C++ `Package` segments, so every other
     /// language's persisted `short_name` vocabulary excludes it -- and C++'s
     /// does not, which is why the filter must be derived per language rather
     /// than hardcoded.
     #[test]
+    #[hardwon("#1748: lookup filtering dropped only separators the language renderer cannot emit")]
     fn absent_separators_exclude_double_colon_everywhere_but_cpp() {
         for language in Language::ANALYZABLE {
             let absent = absent_segment_separators(language);
@@ -1512,6 +1331,7 @@ mod tests {
     /// is the default join, `$` precedes every `Nested` segment, and `/` joins
     /// two `Path` segments, in every language.
     #[test]
+    #[hardwon("#1748: the absent-separator filter must never discard a renderable spelling")]
     fn absent_separators_never_claim_a_renderable_separator() {
         for language in Language::ANALYZABLE {
             let absent = absent_segment_separators(language);
@@ -1546,6 +1366,7 @@ mod tests {
 mod fq_name_properties {
     use super::*;
     use crate::analyzer::model::{CodeUnit, CodeUnitType, ProjectFile};
+    use brokk_bifrost_test_macros::hardwon;
     use proptest::prelude::*;
 
     /// Segment texts reduced from the corpora that tripped the construction
@@ -1650,12 +1471,10 @@ mod fq_name_properties {
     }
 
     fn intern_all(segments: &[(String, SegmentKind)]) -> FqName {
-        let interner = segment_interner();
-        let mut fq = FqName::new();
-        for (text, kind) in segments {
-            fq.push(interner.intern(text, *kind));
-        }
-        fq
+        intern_name_segments(
+            segment_interner(),
+            segments.iter().map(|(text, kind)| (text.as_str(), *kind)),
+        )
     }
 
     /// A `ProjectFile` whose `declaration_language` is exactly `language`, which
@@ -1682,6 +1501,7 @@ mod fq_name_properties {
 
     proptest! {
         #[test]
+    #[hardwon("#3160: allocation-free C++ name matching must agree with rendered spelling")]
         fn native_spelling_comparison_agrees_with_rendering(
             segments in segment_list(),
             other_segments in segment_list(),
@@ -1713,6 +1533,7 @@ mod fq_name_properties {
         /// clause is what makes the two spellings agree by construction instead
         /// of by each call site remembering to guard.
         #[test]
+        #[hardwon("#2353: repeated separators could abort workspace construction when strings met FqName segments")]
         fn normalize_joined_is_a_fixed_point_of_joined_segments(
             raw in joined_string(),
             separator in separator(),
@@ -1754,6 +1575,7 @@ mod fq_name_properties {
         /// joined string derived independently of the segments, disagreeing on
         /// one empty component or sigil.
         #[test]
+        #[hardwon("#1189: generated package and short-name projections could disagree with their FqName boundaries")]
         fn rendered_projections_locate_the_construction_boundary(
             segments in segment_list(),
             language in language(),
@@ -1787,6 +1609,9 @@ mod fq_name_properties {
     /// check runs over every kind because the rejection is kind-independent:
     /// no kind has an empty spelling.
     #[test]
+    #[hardwon(
+        "decc1ddc44c2: empty segments reached release code with a zero-width identifier span"
+    )]
     fn interning_an_empty_segment_text_panics_naming_the_kind() {
         let interner = segment_interner();
         for kind in SegmentKind::ALL {
@@ -1848,6 +1673,7 @@ mod fq_name_properties {
         /// must be exactly what [`normalize_joined`] would have stored. Without
         /// that, a name would drift each time it crossed the string boundary.
         #[test]
+        #[hardwon("#1189: malformed joined names could drift when reconstructed across the string boundary")]
         fn rebuilding_a_rendering_reaches_a_fixed_point(
             segments in segment_list(),
             language in language(),

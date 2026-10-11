@@ -6,6 +6,7 @@
 //! store can therefore publish the facts once and consumers can mount the
 //! exact source occurrence arena beside them.
 
+use crate::analyzer::CodeUnit;
 use crate::analyzer::dense_id::define_dense_id;
 use crate::analyzer::model::CallableArity;
 use crate::analyzer::source_facts::{SourceDeclarationId, SourceFactRows, SourceOccurrenceId};
@@ -38,11 +39,52 @@ pub struct ScalaGenericOwnerSourceFacts {
     pub supertypes: Vec<ScalaTypeExpressionPath>,
 }
 
+impl ScalaGenericOwnerSourceFacts {
+    pub fn estimated_retained_bytes(&self) -> usize {
+        self.type_parameters
+            .capacity()
+            .saturating_mul(std::mem::size_of::<String>())
+            .saturating_add(
+                self.type_parameters
+                    .iter()
+                    .map(String::capacity)
+                    .sum::<usize>(),
+            )
+            .saturating_add(
+                self.supertypes
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<ScalaTypeExpressionPath>()),
+            )
+            .saturating_add(
+                self.supertypes
+                    .iter()
+                    .map(ScalaTypeExpressionPath::estimated_retained_bytes)
+                    .sum::<usize>(),
+            )
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ScalaCallableRole {
     Ordinary,
     PrimaryConstructor,
     SecondaryConstructor,
+}
+
+/// Classify a fallback Scala callable role from its unit and resolved parent.
+pub fn scala_callable_role_for_parent(
+    unit: &CodeUnit,
+    parent: Option<&CodeUnit>,
+) -> ScalaCallableRole {
+    if unit.is_synthetic() {
+        ScalaCallableRole::PrimaryConstructor
+    } else if parent
+        .is_some_and(|owner| owner.identifier().trim_end_matches('$') == unit.identifier())
+    {
+        ScalaCallableRole::SecondaryConstructor
+    } else {
+        ScalaCallableRole::Ordinary
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -188,6 +230,18 @@ pub struct ScalaCallableSourceAlternative {
     pub return_type_path: Option<Vec<String>>,
     pub return_type_is_singleton: bool,
     pub return_type_expression: Option<ScalaTypeExpressionPath>,
+}
+
+impl ScalaCallableSourceAlternative {
+    pub fn estimated_retained_bytes(&self) -> usize {
+        callable_bytes(self)
+    }
+}
+
+impl ScalaTypeExpressionPath {
+    pub fn estimated_retained_bytes(&self) -> usize {
+        expression_bytes(self)
+    }
 }
 
 /// All source-owned properties attached to one declaration identity.  A fact

@@ -24,3 +24,9 @@ targets = [
     "x86_64-pc-windows-msvc",
     "aarch64-pc-windows-msvc",
 ]
+
+# Mirrors the owner-approved exception in licenses/deny.toml (2026-10-06):
+# version-ranges is a required dependency of pep508_rs, MPL-2.0 is a
+# file-level reciprocal license, and Bifrost uses the crate unmodified.
+[version-ranges]
+accepted = ["MPL-2.0"]

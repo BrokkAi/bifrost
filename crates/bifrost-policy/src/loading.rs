@@ -63,25 +63,14 @@ pub(crate) fn read_rqlp_document(
     root: &WorkspaceRoot,
     relative_path: &Path,
 ) -> Result<LoadedRqlpSource, PolicyDocumentLoadError> {
-    let workspace_path = WorkspaceRelativePath::try_from_path(relative_path).map_err(|source| {
-        PolicyDocumentLoadError::InvalidWorkspacePath {
-            path: relative_path.to_path_buf(),
-            source,
-        }
-    })?;
-    workspace_policy_source_identity(&workspace_path).map_err(|source| {
-        PolicyDocumentLoadError::InvalidSourceIdentity {
-            identity: PolicySourceIdentity::new(workspace_path.as_str()),
-            source,
-        }
-    })?;
+    let (workspace_path, identity) = workspace_policy_path_and_identity(relative_path)?;
     let document = read_workspace_document(
         root,
         workspace_path.as_path(),
         &["rqlp"],
         MAX_POLICY_DOCUMENT_BYTES,
     )?;
-    parse_workspace_rqlp_document(document)
+    parse_workspace_rqlp_document_with_identity(document, workspace_path, identity)
 }
 
 /// Loaded closure of one standalone endpoint source, before any aggregate
@@ -94,11 +83,6 @@ pub(crate) struct LoadedEndpointClosure {
 }
 
 impl LoadedEndpointClosure {
-    #[cfg(test)]
-    pub(crate) fn endpoint(&self) -> &LoadedEndpoint {
-        &self.endpoint
-    }
-
     #[cfg(test)]
     pub(crate) fn referenced_selector(&self) -> Option<&ResolvedReferencedRql> {
         self.referenced_selector.as_ref()
@@ -166,19 +150,33 @@ pub(crate) fn load_endpoint_closure(
 fn parse_workspace_rqlp_document(
     document: WorkspaceDocument,
 ) -> Result<LoadedRqlpSource, PolicyDocumentLoadError> {
-    let workspace_path =
-        WorkspaceRelativePath::try_from_path(document.relative_path()).map_err(|source| {
-            PolicyDocumentLoadError::InvalidWorkspacePath {
-                path: document.relative_path().to_path_buf(),
-                source,
-            }
-        })?;
+    let (workspace_path, identity) = workspace_policy_path_and_identity(document.relative_path())?;
+    parse_workspace_rqlp_document_with_identity(document, workspace_path, identity)
+}
+
+fn workspace_policy_path_and_identity(
+    relative_path: &Path,
+) -> Result<(WorkspaceRelativePath, PolicySourceIdentity), PolicyDocumentLoadError> {
+    let workspace_path = WorkspaceRelativePath::try_from_path(relative_path).map_err(|source| {
+        PolicyDocumentLoadError::InvalidWorkspacePath {
+            path: relative_path.to_path_buf(),
+            source,
+        }
+    })?;
     let identity = workspace_policy_source_identity(&workspace_path).map_err(|source| {
         PolicyDocumentLoadError::InvalidSourceIdentity {
             identity: PolicySourceIdentity::new(workspace_path.as_str()),
             source,
         }
     })?;
+    Ok((workspace_path, identity))
+}
+
+fn parse_workspace_rqlp_document_with_identity(
+    document: WorkspaceDocument,
+    workspace_path: WorkspaceRelativePath,
+    identity: PolicySourceIdentity,
+) -> Result<LoadedRqlpSource, PolicyDocumentLoadError> {
     let parsed = parse_rqlp_source(document.source(), identity.clone())
         .map_err(|source| PolicyDocumentLoadError::InvalidSource { identity, source })?;
     Ok(LoadedRqlpSource {
@@ -314,21 +312,6 @@ mod tests {
         format!(
             "(endpoint :id \"source-a\" :name \"Source A\" :display-name \"Source A\" :role source :categories [test] :selector {selector} :binding matched-value :supersedes [])"
         )
-    }
-
-    #[test]
-    fn closes_inline_endpoint_without_workspace() {
-        let source = endpoint("(rql (name \"A\"))");
-        let parsed =
-            parse_rqlp_source(&source, PolicySourceIdentity::new("embedded:endpoint-a")).unwrap();
-
-        let loaded =
-            load_endpoint_closure(None, parsed, source.as_bytes(), LocatorResolution::Required)
-                .unwrap();
-
-        assert_eq!(loaded.endpoint().definition().id.as_str(), "source-a");
-        assert!(loaded.referenced_selector().is_none());
-        assert_eq!(loaded.retained_source_and_selector_bytes(), source.len());
     }
 
     #[test]

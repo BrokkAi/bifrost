@@ -34,14 +34,19 @@ use crate::analyzer::semantic::{
     SemanticGapImpact, SemanticGapSubject, SemanticLocator, SemanticValueKind,
     SynchronizationPayload, ValueFlowKind, ValueUseKind,
 };
-use crate::analyzer::semantic::{LengthDelimitedDigest, UnmaterializedExternalTarget};
+use crate::analyzer::semantic::{
+    ExactExternalProcedureTarget, LengthDelimitedDigest, SemanticLanguage,
+    UnmaterializedExternalTarget,
+};
 use crate::analyzer::semantic_model::{
     CompiledConditionalIndirectWrite, CompiledConditionalResultRefinement,
     CompiledIndirectWriteTarget, CompiledNormalReturnRefinement, CompiledOperationPrecondition,
     CompiledPredicateProofEffect, CompiledResultContract, CompiledResultMemberContract,
     CompiledResultPredicate, CompiledResultUseObligation, CompiledSummaryInput, Completeness,
-    ResolvedActiveSemanticModels, ResultUseObligationKind, SemanticModelCallableKey,
-    SemanticModelMatchDisposition, SemanticModelOverlay,
+    ProcedureSummaryDeclarationKey, ResolvedActiveSemanticModels, ResultUseObligationKind,
+    ReviewedBuiltinReceiverAssumption, ReviewedObligationBasis, ReviewedObligationTarget,
+    SemanticModelActivationEvidence, SemanticModelCallableKey, SemanticModelMatchDisposition,
+    SemanticModelOverlay,
 };
 use crate::analyzer::usages::CallRelationLimits;
 use crate::analyzer::usages::call_shape::{call_shape_for_call, call_shapes_in_file};
@@ -49,24 +54,57 @@ use crate::analyzer::usages::effects::{
     ArmLookup, BoundDeclaredEffect, CallEffectArm, CallEffectReport, CallEffectSiteStatus,
     EffectCertainty, EffectCoverage, EffectGraph, EffectGraphEdge, EffectGraphProcedure,
     EffectNodeBasis, EffectProof, EffectReason, ModeledCallApplication, ModeledCallTargetCoverage,
-    ModeledCallTargetLookup, ModeledProcedureKey, ModeledProcedureName, ProcedureEffectBudget,
+    ModeledCallTargetLookup, ModeledProcedureKey, NativeCallTargetLookup, ProcedureEffectBudget,
     ProcedureEffectReport, call_effect_report, modeled_call_targets_for_shapes,
-    modeled_procedure_key_for_unit, summarize_procedure_effects,
+    modeled_procedure_key_for_unit, native_call_targets_for_shapes, summarize_procedure_effects,
 };
-use crate::analyzer::{JavaCallResultUse, JavaCallResultUseIndex, JavaCallResultUseOpen};
+use crate::analyzer::{
+    CSharpCallResultUseIndex, CallResultUse, CallResultUseOpenReason, CallResultUseSite,
+    CppCallResultUseIndex, GoCallResultUseIndex, JavaCallResultUse, JavaCallResultUseOpen,
+    JavaCallResultUseRelationIndex, NativeResultObligationBasis, PhpCallResultUseIndex,
+    RubyCallResultUseIndex, RustCallResultUseIndex, RustNativeObligationProof,
+};
 use crate::structural::NormalizedKind;
 use crate::structural::flow_state::{FlowStateIncompleteReason, GuardDominanceAnswer};
 use brokk_bifrost_core::analyzer::model::{CallableArity, SignatureMetadata};
-use brokk_bifrost_core::analyzer::structural::callable::{
-    ArgumentListKind, CallKind, CallShapeCoverage,
-};
+use brokk_bifrost_core::analyzer::structural::callable::{ArgumentListKind, CallKind};
 use brokk_bifrost_core::analyzer::structural::flow_state::{
     FlowCertainty, FlowRelation, FlowStateAxis, StateEventClass,
 };
+use brokk_bifrost_core::analyzer::structural::native_obligation::NativeResultObligation;
 
 /// How many call nodes one procedure body contributes to the reachable call
 /// graph before the walk reports itself truncated.
 const MAX_CALL_SITES_PER_PROCEDURE: usize = 512;
+
+/// Native C/C++ B4 rows are processed in one file window. Keep the
+/// declaration projection bounded even if a malformed structural result
+/// repeats ranges.
+const MAX_NATIVE_CPP_DISPATCH_CACHE: usize = 2048;
+
+/// Keep native C/C++ target projections available across repeated policy
+/// branches in one query. The explicit bound keeps this query-local cache
+/// from growing with the workspace while allowing a C and C++ branch that
+/// canonicalize to the same analyzer language to share its file work.
+const MAX_NATIVE_CPP_DISPATCH_QUERY_CACHE: usize = 32_768;
+
+fn is_cpp_native_file(file: &ProjectFile) -> bool {
+    crate::analyzer::common::language_for_file(file) == Language::Cpp
+        && file
+            .rel_path()
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .is_some_and(|extension| Language::Cpp.extensions().contains(&extension))
+}
+
+fn is_c_translation_unit(file: &ProjectFile) -> bool {
+    is_cpp_native_file(file)
+        && file
+            .rel_path()
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .is_some_and(|extension| extension == "c")
+}
 
 /// Wrapper composition is recursive only across this deliberately tiny,
 /// request-local bound. This makes stack depth independent of repository call
@@ -84,6 +122,10 @@ const EXTERNAL_EFFECT_PROCEDURE_ID_DOMAIN: &[u8] =
 #[derive(Debug, Clone)]
 pub(super) struct CallEffectValue {
     pub(super) report: Arc<CallEffectReport>,
+    /// The structural seed that selected the call shape. Assertion policies
+    /// need its captures after the effect relation has filtered the row, so
+    /// loop and value-origin assertions can still join on the same AST facts.
+    pub(super) seed: Option<Arc<SeedMatch>>,
     /// The workspace declaration behind each dispatch arm, keyed by the arm's
     /// target identity, so rendering never re-resolves a callee.
     pub(super) callees: Arc<BTreeMap<String, DeclarationValue>>,
@@ -379,7 +421,10 @@ pub(super) struct CallResultObligationValue {
     pub(super) result_ordinal: Option<u32>,
     pub(super) obligation_kind: Option<&'static str>,
     pub(super) failure_predicate: Option<&'static str>,
+    pub(super) provenance: Option<&'static str>,
+    pub(super) obligation_basis: Option<&'static str>,
     pub(super) result_use: &'static str,
+    pub(super) result_use_detail: Option<&'static str>,
     pub(super) coverage: EffectCoverage,
     pub(super) reason: Option<&'static str>,
     pub(super) pack_id: Option<String>,
@@ -533,6 +578,8 @@ impl CallEffectValue {
 #[derive(Debug, Clone)]
 pub(super) struct ProcedureEffectSubject {
     pub(super) declaration: DeclarationValue,
+    pub(super) range: Range,
+    pub(super) site_id: String,
     pub(super) report: Arc<ProcedureEffectReport>,
 }
 
@@ -580,6 +627,35 @@ enum ModelAnswer {
     Empty,
 }
 
+#[derive(Debug, Clone)]
+enum NativeCallResultUseIndex {
+    Go(GoCallResultUseIndex),
+    Rust(RustCallResultUseIndex),
+    Cpp(CppCallResultUseIndex),
+    JsTs(crate::analyzer::JsTsCallResultUseIndex),
+    CSharp(CSharpCallResultUseIndex),
+    Php(PhpCallResultUseIndex),
+    Ruby(RubyCallResultUseIndex),
+}
+
+impl NativeCallResultUseIndex {
+    fn at_span(
+        &self,
+        start_byte: usize,
+        end_byte: usize,
+    ) -> Result<&CallResultUseSite, CallResultUseOpenReason> {
+        match self {
+            Self::Go(index) => index.at_span(start_byte, end_byte),
+            Self::Rust(index) => index.at_span(start_byte, end_byte),
+            Self::Cpp(index) => index.at_span(start_byte, end_byte),
+            Self::JsTs(index) => index.at_span(start_byte, end_byte),
+            Self::CSharp(index) => index.at_span(start_byte, end_byte),
+            Self::Php(index) => index.at_span(start_byte, end_byte),
+            Self::Ruby(index) => index.at_span(start_byte, end_byte),
+        }
+    }
+}
+
 /// Per-query state shared by every effect row a single query derives.
 #[derive(Default)]
 pub(super) struct EffectTraversalCache {
@@ -590,17 +666,21 @@ pub(super) struct EffectTraversalCache {
     result_contract_names: Option<ResultContractNameInventory>,
     reports: HashMap<String, Arc<ProcedureEffectReport>>,
     facts: HashMap<ProjectFile, Option<Arc<FileFacts>>>,
+    rust_static_const_initializer_calls: HashMap<ProjectFile, Arc<HashSet<(usize, usize)>>>,
     result_member_call_shapes: Option<ResultMemberCallShapeWindow>,
     result_use_indexes: Option<ResultUseIndexWindow>,
-    java_result_use_indexes: HashMap<(ProjectFile, ContentIdentity), JavaCallResultUseIndex>,
+    java_result_use_indexes:
+        HashMap<(ProjectFile, ContentIdentity), JavaCallResultUseRelationIndex>,
     java_lambda_result_uses: HashMap<
         (ProjectFile, ContentIdentity, Range),
         Result<JavaCallResultUse, JavaCallResultUseOpen>,
     >,
+    native_result_use_indexes: HashMap<(ProjectFile, ContentIdentity), NativeCallResultUseIndex>,
     result_assignment_conversion_proofs:
         std::cell::RefCell<HashMap<ResultAssignmentConversionProofKey, bool>>,
     exact_sources: HashMap<ProjectFile, Option<Arc<str>>>,
     exact_source_identities: std::cell::RefCell<HashMap<ProjectFile, Option<ContentIdentity>>>,
+    native_cpp_dispatches: HashMap<(ProjectFile, Range), Arc<NativeCallTargetLookup>>,
     modeled_call_targets: Option<ModeledCallTargetWindow>,
     conditional_wrapper_answers: HashMap<CodeUnit, ConditionalProcedureSummaryAnswer>,
     conditional_wrapper_visiting: HashSet<CodeUnit>,
@@ -1188,22 +1268,12 @@ impl ResultUseIndex {
         &self,
         source: crate::analyzer::semantic::ValueId,
     ) -> Vec<usize> {
-        let mut events = self
-            .assignment_conversions
-            .get(&source)
-            .into_iter()
-            .flatten()
-            .flat_map(|converted| {
-                self.establishment_events_by_value
-                    .get(converted)
-                    .into_iter()
-                    .flatten()
-                    .copied()
-            })
-            .collect::<Vec<_>>();
-        events.sort_unstable();
-        events.dedup();
-        events
+        self.establishment_events_for_converted_values(
+            self.assignment_conversions
+                .get(&source)
+                .into_iter()
+                .flatten(),
+        )
     }
 
     fn exact_converted_establishments_from(
@@ -1402,14 +1472,19 @@ impl ResultUseIndex {
         &self,
         bindings: &HashSet<crate::analyzer::semantic::ValueId>,
     ) -> Vec<usize> {
-        let mut events = bindings
-            .iter()
-            .flat_map(|binding| {
-                self.converted_values_by_binding
-                    .get(binding)
-                    .into_iter()
-                    .flatten()
-            })
+        self.establishment_events_for_converted_values(bindings.iter().flat_map(|binding| {
+            self.converted_values_by_binding
+                .get(binding)
+                .into_iter()
+                .flatten()
+        }))
+    }
+
+    fn establishment_events_for_converted_values<'a>(
+        &self,
+        converted_values: impl Iterator<Item = &'a crate::analyzer::semantic::ValueId>,
+    ) -> Vec<usize> {
+        let mut events = converted_values
             .flat_map(|converted| {
                 self.establishment_events_by_value
                     .get(converted)
@@ -1494,13 +1569,9 @@ pub(super) fn is_go_assignment_conversion_target(
     semantics: &crate::analyzer::semantic::ProcedureSemantics,
     target: crate::analyzer::semantic::ValueId,
 ) -> bool {
-    semantics.value(target).is_some_and(|value| {
-        matches!(
-            &value.kind,
-            SemanticValueKind::LanguageDefined(kind)
-                if kind.as_ref() == "go.assignment_conversion"
-        )
-    })
+    semantics
+        .value(target)
+        .is_some_and(|value| value.kind.is_language_defined("go.assignment_conversion"))
 }
 
 fn build_result_use_index(
@@ -2003,7 +2074,6 @@ fn build_result_use_index(
 
 #[derive(Default)]
 struct ResultContractNameInventory {
-    exact: HashMap<ModeledProcedureName, ResultContractArities>,
     members: HashMap<(String, String, bool), ResultContractArities>,
 }
 
@@ -2040,6 +2110,15 @@ impl EffectTraversalCache {
             .clone()
     }
 
+    fn reviewed_cpp_libc_model_active(&mut self, analyzer: &dyn IAnalyzer) -> bool {
+        self.models(analyzer).is_some_and(|models| {
+            models
+                .shards()
+                .iter()
+                .any(|shard| shard.manifest.pack_id == REVIEWED_LIBC_RESULT_USE_PACK_ID)
+        })
+    }
+
     /// Reuse one typed dispatch answer across effect classifications of the
     /// same exact call. The projected answer owns no semantic handles, so it
     /// remains valid across this query's artifact windows while avoiding a
@@ -2057,6 +2136,58 @@ impl EffectTraversalCache {
         let answer = Arc::new(semantic.dispatch_at_source(file, range));
         self.dispatch_answers.insert(key, Arc::clone(&answer));
         answer
+    }
+
+    fn native_cpp_dispatch_for_shape(
+        &self,
+        shape: &CallShapeValue,
+    ) -> Option<Arc<NativeCallTargetLookup>> {
+        let file = &shape.report.outcome.file;
+        is_cpp_native_file(file)
+            .then(|| {
+                self.native_cpp_dispatches
+                    .get(&(file.clone(), shape.report.outcome.range))
+                    .cloned()
+            })
+            .flatten()
+    }
+
+    fn has_native_cpp_dispatch(&self, file: &ProjectFile, range: Range) -> bool {
+        self.native_cpp_dispatches
+            .contains_key(&(file.clone(), range))
+    }
+
+    /// Exact Rust calls whose nearest enclosing executable context is a
+    /// `static_item` or `const_item` initializer. Such expressions are
+    /// evaluated independently of the function that lexically contains a
+    /// local item declaration.
+    fn rust_static_const_initializer_calls(
+        &mut self,
+        file: &ProjectFile,
+        source: &str,
+    ) -> Arc<HashSet<(usize, usize)>> {
+        if crate::analyzer::common::language_for_file(file) != Language::Rust {
+            return Arc::new(HashSet::default());
+        }
+        Arc::clone(
+            self.rust_static_const_initializer_calls
+                .entry(file.clone())
+                .or_insert_with(|| {
+                    Arc::new(rust_static_const_initializer_call_ranges(file, source))
+                }),
+        )
+    }
+
+    fn is_rust_static_const_initializer_call(
+        &mut self,
+        file: &ProjectFile,
+        source: &str,
+        range: Range,
+    ) -> bool {
+        crate::analyzer::common::language_for_file(file) == Language::Rust
+            && self
+                .rust_static_const_initializer_calls(file, source)
+                .contains(&(range.start_byte, range.end_byte))
     }
 
     /// Classify the exact call span against the same source snapshot that
@@ -2087,16 +2218,33 @@ impl EffectTraversalCache {
             let tree = parser
                 .parse(source, None)
                 .ok_or(JavaCallResultUseOpen::UnclassifiedSyntax)?;
-            self.java_result_use_indexes
-                .insert(key.clone(), JavaCallResultUseIndex::new(tree.root_node()));
+            self.java_result_use_indexes.insert(
+                key.clone(),
+                JavaCallResultUseRelationIndex::new(tree.root_node()),
+            );
         }
         let syntactic = self
             .java_result_use_indexes
             .get(&key)
             .expect("the source index was just installed")
             .at_span(outcome.range.start_byte, outcome.range.end_byte);
-        if syntactic != Err(JavaCallResultUseOpen::UnclassifiedSyntax) {
-            return syntactic;
+        match syntactic {
+            Ok(site) => match site.for_port(0) {
+                CallResultUse::Discarded => return Ok(JavaCallResultUse::Discarded),
+                CallResultUse::Consumed => return Ok(JavaCallResultUse::OtherContext),
+                CallResultUse::Open(CallResultUseOpenReason::UnclassifiedSyntax) => {}
+                CallResultUse::Open(_) | CallResultUse::IntentionalDiscard(_) => {
+                    return Err(JavaCallResultUseOpen::UnclassifiedSyntax);
+                }
+            },
+            Err(CallResultUseOpenReason::UnclassifiedSyntax) => {}
+            Err(CallResultUseOpenReason::MissingCall) => {
+                return Err(JavaCallResultUseOpen::MissingCall);
+            }
+            Err(CallResultUseOpenReason::AmbiguousCall) => {
+                return Err(JavaCallResultUseOpen::AmbiguousCall);
+            }
+            Err(_) => return Err(JavaCallResultUseOpen::UnclassifiedSyntax),
         }
         let lambda_key = (key.0, key.1, outcome.range);
         if let Some(result) = self.java_lambda_result_uses.get(&lambda_key) {
@@ -2107,6 +2255,92 @@ impl EffectTraversalCache {
             .ok_or(JavaCallResultUseOpen::UnclassifiedSyntax);
         self.java_lambda_result_uses.insert(lambda_key, result);
         result
+    }
+
+    fn java_result_use_site_for_shape(
+        &mut self,
+        analyzer: &dyn IAnalyzer,
+        semantic: &mut SemanticQueryContext<'_>,
+        shape: &CallShapeValue,
+    ) -> Result<CallResultUseSite, CallResultUseOpenReason> {
+        let result_use = self
+            .java_result_use_for_shape(analyzer, semantic, shape)
+            .map_err(|reason| match reason {
+                JavaCallResultUseOpen::MissingCall => CallResultUseOpenReason::MissingCall,
+                JavaCallResultUseOpen::AmbiguousCall => CallResultUseOpenReason::AmbiguousCall,
+                JavaCallResultUseOpen::UnclassifiedSyntax => {
+                    CallResultUseOpenReason::UnclassifiedSyntax
+                }
+            })?;
+        let result_use = match result_use {
+            JavaCallResultUse::Discarded => CallResultUse::Discarded,
+            JavaCallResultUse::OtherContext => CallResultUse::Consumed,
+        };
+        let outcome = &shape.report.outcome;
+        Ok(CallResultUseSite::new(
+            outcome.range.start_byte,
+            outcome.range.end_byte,
+            result_use,
+        ))
+    }
+
+    fn native_result_use_for_shape(
+        &mut self,
+        shape: &CallShapeValue,
+    ) -> Result<CallResultUseSite, CallResultUseOpenReason> {
+        let source = shape
+            .source
+            .as_deref()
+            .ok_or(CallResultUseOpenReason::UnclassifiedSyntax)?;
+        let outcome = &shape.report.outcome;
+        let language = crate::analyzer::common::language_for_file(&outcome.file);
+        let key = (
+            outcome.file.clone(),
+            ContentIdentity::hash_bytes(source.as_bytes()),
+        );
+        if !self.native_result_use_indexes.contains_key(&key) {
+            let mut parser = tree_sitter::Parser::new();
+            let grammar = crate::analyzer::parser_language_for(language)
+                .expect("the native result-use language grammar is installed");
+            parser
+                .set_language(&grammar)
+                .expect("the native result-use grammar matches tree-sitter");
+            let tree = parser
+                .parse(source, None)
+                .ok_or(CallResultUseOpenReason::RecoveredSyntax)?;
+            let index =
+                match language {
+                    crate::analyzer::Language::Go => NativeCallResultUseIndex::Go(
+                        GoCallResultUseIndex::new(tree.root_node(), source),
+                    ),
+                    crate::analyzer::Language::Rust => NativeCallResultUseIndex::Rust(
+                        RustCallResultUseIndex::new(tree.root_node(), source),
+                    ),
+                    crate::analyzer::Language::Cpp => NativeCallResultUseIndex::Cpp(
+                        CppCallResultUseIndex::new(tree.root_node(), source),
+                    ),
+                    crate::analyzer::Language::JavaScript
+                    | crate::analyzer::Language::TypeScript => NativeCallResultUseIndex::JsTs(
+                        crate::analyzer::JsTsCallResultUseIndex::new(tree.root_node(), source),
+                    ),
+                    crate::analyzer::Language::CSharp => NativeCallResultUseIndex::CSharp(
+                        CSharpCallResultUseIndex::new(tree.root_node(), source),
+                    ),
+                    crate::analyzer::Language::Php => {
+                        NativeCallResultUseIndex::Php(PhpCallResultUseIndex::new(tree.root_node()))
+                    }
+                    crate::analyzer::Language::Ruby => NativeCallResultUseIndex::Ruby(
+                        RubyCallResultUseIndex::new(tree.root_node(), source),
+                    ),
+                    _ => return Err(CallResultUseOpenReason::UnsupportedSyntax),
+                };
+            self.native_result_use_indexes.insert(key.clone(), index);
+        }
+        self.native_result_use_indexes
+            .get(&key)
+            .expect("the native source index was just installed")
+            .at_span(outcome.range.start_byte, outcome.range.end_byte)
+            .cloned()
     }
 
     /// The canonical identity of one workspace callable, cached per unit.
@@ -2152,7 +2386,7 @@ impl EffectTraversalCache {
                         if summary.result_contracts.is_empty() {
                             continue;
                         }
-                        let Some((owner, member)) =
+                        let Some((_, member)) =
                             crate::analyzer::semantic::authored_procedure_target_identity(
                                 &summary.target.path,
                                 &summary.target.symbol,
@@ -2161,14 +2395,7 @@ impl EffectTraversalCache {
                             continue;
                         };
                         let language = shard.manifest.language.clone();
-                        let name = ModeledProcedureName {
-                            language: language.clone(),
-                            owner: owner.into_owned(),
-                            member: member.to_owned(),
-                            has_receiver: summary.target.has_receiver,
-                        };
                         let arity = summary.target.callable_arity();
-                        inventory.exact.entry(name).or_default().insert(arity);
                         inventory
                             .members
                             .entry((language, member.to_owned(), summary.target.has_receiver))
@@ -2182,23 +2409,6 @@ impl EffectTraversalCache {
         self.result_contract_names
             .as_ref()
             .expect("result-contract name inventory was initialized")
-    }
-
-    fn has_result_contract_name(
-        &mut self,
-        analyzer: &dyn IAnalyzer,
-        name: &ModeledProcedureName,
-        actual_parameter_count: usize,
-        application: ModeledCallApplication,
-    ) -> bool {
-        let arities = self.result_contract_names(analyzer).exact.get(name);
-        application_accepts_result_contract(
-            application,
-            &name.language,
-            name.has_receiver,
-            actual_parameter_count,
-            |parameter_count| arities.is_some_and(|arities| arities.accepts(parameter_count)),
-        )
     }
 
     fn may_name_result_contract(
@@ -2400,8 +2610,58 @@ impl EffectTraversalCache {
         self.result_assignment_conversion_proofs.get_mut().clear();
         self.result_member_call_shapes = None;
         self.result_use_indexes = None;
+        // Native target projections are bounded query-local results. Keep
+        // them across file windows so repeated policy branches do not rerun
+        // the same resolver work for the same call sites.
         self.modeled_call_targets = None;
     }
+}
+
+/// Collect exact call-expression spans nested in a Rust static or constant
+/// initializer, stopping at a nearer function or deferred executable body.
+/// The AST kinds are required here: normalized structural facts intentionally
+/// do not retain item-specific syntax kinds.
+fn rust_static_const_initializer_call_ranges(
+    file: &ProjectFile,
+    source: &str,
+) -> HashSet<(usize, usize)> {
+    let Some(tree) = crate::analyzer::usages::get_definition::parse_tree_for_language(
+        file,
+        Language::Rust,
+        source,
+    ) else {
+        return HashSet::default();
+    };
+    let mut result = HashSet::default();
+    let mut stack = vec![tree.root_node()];
+    while let Some(node) = stack.pop() {
+        if node.kind() == "call_expression" {
+            let mut ancestor = node.parent();
+            while let Some(current) = ancestor {
+                match current.kind() {
+                    "function_item" | "closure_expression" | "async_block" => break,
+                    "static_item" | "const_item" => {
+                        if current
+                            .child_by_field_name("value")
+                            .is_some_and(|initializer| {
+                                initializer.start_byte() <= node.start_byte()
+                                    && node.end_byte() <= initializer.end_byte()
+                            })
+                        {
+                            result.insert((node.start_byte(), node.end_byte()));
+                        }
+                        break;
+                    }
+                    _ => ancestor = current.parent(),
+                }
+            }
+        }
+        let mut cursor = node.walk();
+        let mut children = node.named_children(&mut cursor).collect::<Vec<_>>();
+        children.reverse();
+        stack.extend(children);
+    }
+    result
 }
 
 fn application_accepts_result_contract(
@@ -2552,6 +2812,11 @@ pub(super) fn call_effect_expansions(
     shape: &CallShapeValue,
 ) -> Vec<PipelineExpansion> {
     let outcome = &shape.report.outcome;
+    if shape.source.as_deref().is_some_and(|source| {
+        cache.is_rust_static_const_initializer_call(&outcome.file, source, outcome.range)
+    }) {
+        return Vec::new();
+    }
     let DispatchedArms {
         status,
         arms,
@@ -2586,6 +2851,7 @@ pub(super) fn call_effect_expansions(
         .map(|index| {
             pipeline_expansion(PipelineValue::CallEffect(Box::new(CallEffectValue {
                 report: Arc::clone(&report),
+                seed: shape.seed.clone(),
                 callees: Arc::clone(&rendered_callees),
                 index,
             })))
@@ -2613,31 +2879,6 @@ pub(super) fn result_contract_call_expansions(
     else {
         return Vec::new();
     };
-    if !answer.adjudicable_workspace_names.is_empty() {
-        let actual_parameter_count = shape.report.arguments.len();
-        if answer.adjudicable_workspace_names.iter().all(|name| {
-            cache.has_result_contract_name(
-                analyzer,
-                name,
-                actual_parameter_count,
-                answer.call_application,
-            )
-        }) {
-            record_result_contract_dispatch_coverage(
-                cache,
-                diagnostics,
-                &outcome.file,
-                EffectCoverage::Open,
-            );
-        }
-        // A name absent from the active result-contract inventory is one exact
-        // non-modeled dispatch alternative and therefore disproves universal
-        // contract applicability. When every name has an active target that
-        // accepts the actual arity, the missing receiver/signature
-        // evidence remains typed open. Neither case manufactures a positive
-        // target arm.
-        return Vec::new();
-    }
     if answer.arms.is_empty() {
         if matches!(
             answer.coverage,
@@ -2733,6 +2974,71 @@ pub(super) fn prepare_result_contract_call_lookups(
     cache.exact_source_identities.get_mut().remove(file);
 }
 
+/// Resolve C/C++ targets once for the current B4 file window. The native
+/// declaration proof can consume the shared resolver's target projection
+/// without materializing a semantic artifact for every call site when the
+/// resolver closes the target set.
+pub(super) fn prepare_native_cpp_dispatches(
+    analyzer: &dyn IAnalyzer,
+    cache: &mut EffectTraversalCache,
+    limits: CodeQueryExecutionLimits,
+    cancellation: Option<&CancellationToken>,
+    file_shapes: &[&CallShapeValue],
+) {
+    let Some(first) = file_shapes.first() else {
+        return;
+    };
+    let file = &first.report.outcome.file;
+    debug_assert!(
+        file_shapes
+            .iter()
+            .all(|shape| &shape.report.outcome.file == file)
+    );
+    if !is_cpp_native_file(file) || file_shapes.len() > MAX_NATIVE_CPP_DISPATCH_CACHE {
+        return;
+    }
+    let Some(exact_source) = cache.exact_source(analyzer, file) else {
+        return;
+    };
+    let dispatch_shapes = file_shapes
+        .iter()
+        .copied()
+        .filter(|shape| {
+            !cache.has_native_cpp_dispatch(file, shape.report.outcome.range)
+                && cache.native_result_use_for_shape(shape).is_ok_and(|site| {
+                    site.overrides().is_empty()
+                        && matches!(site.for_port(0), CallResultUse::Discarded)
+                })
+        })
+        .collect::<Vec<_>>();
+    if dispatch_shapes.is_empty() {
+        return;
+    }
+    let reports = dispatch_shapes
+        .iter()
+        .map(|shape| shape.report.as_ref())
+        .collect::<Vec<_>>();
+    let lookups = native_call_targets_for_shapes(
+        analyzer,
+        &reports,
+        exact_source,
+        CallRelationLimits {
+            max_files: 1,
+            max_source_bytes: limits.semantic.max_source_bytes,
+            max_candidates: limits.max_fact_nodes,
+        },
+        cancellation,
+    );
+    for (shape, lookup) in dispatch_shapes.into_iter().zip(lookups) {
+        if cache.native_cpp_dispatches.len() >= MAX_NATIVE_CPP_DISPATCH_QUERY_CACHE {
+            break;
+        }
+        cache
+            .native_cpp_dispatches
+            .insert((file.clone(), shape.report.outcome.range), Arc::new(lookup));
+    }
+}
+
 fn prepare_modeled_call_target_lookups(
     analyzer: &dyn IAnalyzer,
     cache: &mut EffectTraversalCache,
@@ -2751,7 +3057,6 @@ fn prepare_modeled_call_target_lookups(
                         shape.outcome.site_id.clone(),
                         ModeledCallTargetLookup {
                             arms: Vec::new(),
-                            adjudicable_workspace_names: Vec::new(),
                             call_application: ModeledCallApplication::Unknown,
                             coverage: ModeledCallTargetCoverage::Unsupported,
                         },
@@ -3055,11 +3360,1232 @@ pub(super) fn call_result_contract_expansions(
         .collect()
 }
 
-/// A result-use obligation is a positive only when the exact Java call is an
-/// discarded expression or adapts to a void functional method, and every
-/// feasible dispatch arm binds the same
-/// reviewed obligation from that arm's selected JDK artifact.
-pub(super) fn call_result_obligation_expansions(
+/// Join Rust's native `Result` and `#[must_use]` declaration proof to the
+/// shared exact result-use relation. Rust has one result port per callable, so
+/// the declaration proof is intentionally evaluated only after dispatch has
+/// closed to a concrete workspace target. Trait and implementation targets
+/// must independently agree before a native obligation is published.
+fn native_rust_call_result_obligation_expansions(
+    analyzer: &dyn IAnalyzer,
+    semantic: &mut SemanticQueryContext<'_>,
+    cache: &mut EffectTraversalCache,
+    diagnostics: &mut Vec<CodeQueryDiagnostic>,
+    shape: &CallShapeValue,
+) -> Vec<PipelineExpansion> {
+    let outcome = &shape.report.outcome;
+    let classification = cache.native_result_use_for_shape(shape);
+    if let Ok(site) = &classification {
+        let result_use = site.for_port(0);
+        if matches!(result_use, CallResultUse::Consumed) {
+            let row = CallResultObligationValue {
+                file: outcome.file.clone(),
+                range: outcome.range,
+                id: result_use_row_id(&outcome.site_id, 0),
+                site_id: outcome.site_id.clone(),
+                site_ast_id: outcome.site_ast_id.clone(),
+                result_ordinal: Some(0),
+                obligation_kind: None,
+                failure_predicate: None,
+                provenance: None,
+                obligation_basis: None,
+                result_use: result_use.label(),
+                result_use_detail: result_use.detail(),
+                coverage: EffectCoverage::Exhaustive,
+                reason: None,
+                pack_id: None,
+                model_id: None,
+                summary_id: None,
+                arm_count: 0,
+                modeled_arm_count: 0,
+                terminal: true,
+            };
+            record_result_obligation_coverage(
+                cache,
+                diagnostics,
+                &outcome.file,
+                EffectCoverage::Exhaustive,
+            );
+            return vec![pipeline_expansion(PipelineValue::CallResultObligation(
+                Box::new(row),
+            ))];
+        }
+    }
+    let answer = cache.dispatch_at_source(semantic, &outcome.file, outcome.range);
+    let standard_drop_wrapper = shape.source.as_deref().is_some_and(|source| {
+        crate::analyzer::rust_call_is_standard_drop(analyzer, &outcome.file, source, outcome.range)
+    });
+    let dispatch_coverage = coverage_for(answer.coverage);
+    let dispatch_can_close = standard_drop_wrapper
+        || (dispatch_coverage == EffectCoverage::Exhaustive
+            && answer.unnamed_boundaries.is_empty()
+            && !answer.arms.is_empty());
+
+    let (result_use, result_use_detail, use_coverage, use_reason) = match &classification {
+        Ok(site) => {
+            let result_use = site.for_port(0);
+            let detail = result_use.detail();
+            let coverage = if matches!(result_use, CallResultUse::Open(_)) {
+                EffectCoverage::Open
+            } else {
+                EffectCoverage::Exhaustive
+            };
+            let reason = matches!(result_use, CallResultUse::Open(_))
+                .then_some(detail)
+                .flatten();
+            (result_use.label(), detail, coverage, reason)
+        }
+        Err(open_reason) => (
+            CallResultUse::Open(*open_reason).label(),
+            Some(open_reason.label()),
+            EffectCoverage::Open,
+            Some(open_reason.label()),
+        ),
+    };
+
+    let mut native_obligation = None;
+    let mut modeled_arm_count = 0;
+    let mut reason = use_reason;
+    let mut proof_complete = false;
+    if dispatch_can_close {
+        let mut common: Option<Option<NativeResultObligation>> = None;
+        let mut all_proofs_agree = true;
+        for arm in &answer.arms {
+            let Some(target) = arm.target_unit.as_ref() else {
+                all_proofs_agree = false;
+                reason = Some("native_target_unknown");
+                continue;
+            };
+            let candidate =
+                match crate::analyzer::rust_native_result_obligation(analyzer, target, 0) {
+                    RustNativeObligationProof::Obligation(obligation) => {
+                        modeled_arm_count += 1;
+                        Some(Some(obligation))
+                    }
+                    RustNativeObligationProof::NoObligation => Some(None),
+                    RustNativeObligationProof::Open(open_reason) => {
+                        all_proofs_agree = false;
+                        reason = Some(open_reason);
+                        None
+                    }
+                };
+            if let Some(candidate) = candidate {
+                if common.is_none() {
+                    common = Some(candidate);
+                } else if common != Some(candidate) {
+                    all_proofs_agree = false;
+                }
+            }
+        }
+        if all_proofs_agree {
+            proof_complete = true;
+            native_obligation = common.flatten().map(|mut obligation| {
+                if answer.arms.len() > 1 {
+                    obligation.basis = NativeResultObligationBasis::DispatchAgreement;
+                }
+                obligation
+            });
+            if native_obligation.is_none() {
+                reason = None;
+            }
+        }
+    } else if answer.arms.is_empty() {
+        reason = Some("dispatch_unresolved");
+    } else if reason.is_none() {
+        reason = Some("dispatch_open");
+    }
+
+    let coverage = use_coverage.meet(if proof_complete {
+        EffectCoverage::Exhaustive
+    } else {
+        // A complete dispatch set is insufficient when one of its Rust
+        // declarations has an unresolved return type or attribute. Keep the
+        // obligation row open so filtered absence claims cannot read it as a
+        // proved ordinary value.
+        EffectCoverage::Open
+    });
+    let row = CallResultObligationValue {
+        file: outcome.file.clone(),
+        range: outcome.range,
+        id: result_use_row_id(&outcome.site_id, 0),
+        site_id: outcome.site_id.clone(),
+        site_ast_id: outcome.site_ast_id.clone(),
+        result_ordinal: Some(0),
+        obligation_kind: native_obligation.map(|obligation| obligation.kind.label()),
+        failure_predicate: None,
+        provenance: native_obligation.map(|_| "native"),
+        obligation_basis: native_obligation.map(|obligation| obligation.basis.label()),
+        result_use,
+        result_use_detail,
+        coverage,
+        reason,
+        pack_id: None,
+        model_id: None,
+        summary_id: None,
+        arm_count: answer.arms.len(),
+        modeled_arm_count,
+        terminal: native_obligation.is_none(),
+    };
+    record_result_obligation_coverage(cache, diagnostics, &outcome.file, coverage);
+    vec![pipeline_expansion(PipelineValue::CallResultObligation(
+        Box::new(row),
+    ))]
+}
+
+const REVIEWED_LIBC_RESULT_USE_PACK_ID: &str = "bifrost.c.libc.result-use-obligations";
+
+/// The reviewed libc pack is closed over this member vocabulary. The call
+/// shape's name is the AST-selected callee token, so this is a value filter,
+/// not a source-text resolution fallback. Calls whose member is not in this
+/// set cannot match a reviewed libc summary and do not need semantic dispatch
+/// after the native per-file lookup found no workspace target.
+fn could_be_reviewed_cpp_libc_call(shape: &CallShapeValue) -> bool {
+    matches!(
+        shape.report.outcome.callee_name.as_deref(),
+        Some(
+            "close"
+                | "fclose"
+                | "fflush"
+                | "fputc"
+                | "fputs"
+                | "putc"
+                | "read"
+                | "remove"
+                | "rename"
+                | "setvbuf"
+                | "unlink"
+                | "write"
+        )
+    )
+}
+
+fn exact_cpp_header_target_is_reviewed_libc(target: &ExactExternalProcedureTarget) -> bool {
+    target.artifact().language().semantic_pack_label() == "cpp"
+        && target.artifact().adapter().name() == "bifrost-cpp-headers"
+        && target.procedure().language().semantic_pack_label() == "cpp"
+}
+
+fn unmaterialized_cpp_header_target_is_reviewed_libc(
+    arm: &super::dispatch::DispatchArm,
+    target: &UnmaterializedExternalTarget,
+) -> bool {
+    let Some(identity) = arm.external_callee_identity.as_ref() else {
+        return false;
+    };
+    identity.language() == crate::analyzer::Language::Cpp
+        && target.language().language() == crate::analyzer::Language::Cpp
+        && target.has_resolver_owned_call_shape()
+        && identity.owner_fqn() == target.owner_fqn()
+        && identity.member() == target.member()
+}
+
+/// Join a reviewed libc status summary to the exact external declaration
+/// proved by the C/C++ resolver. This runs before the native nodiscard adapter:
+/// a workspace declaration with the same name is intentionally left to that
+/// native path, while only a configured generated header or resolver-owned
+/// header identity can enter the reviewed model.
+struct ReviewedCppLibcCallContext<'a> {
+    analyzer: &'a dyn IAnalyzer,
+    cache: &'a mut EffectTraversalCache,
+    diagnostics: &'a mut Vec<CodeQueryDiagnostic>,
+    shape: &'a CallShapeValue,
+    result_use: CallResultUse,
+    result_use_detail: Option<&'static str>,
+    use_coverage: EffectCoverage,
+    use_reason: Option<&'static str>,
+    answer: &'a super::dispatch::DispatchSiteAnswer,
+}
+
+fn reviewed_cpp_libc_call_result_obligation_expansions(
+    context: ReviewedCppLibcCallContext<'_>,
+) -> Option<Vec<PipelineExpansion>> {
+    let ReviewedCppLibcCallContext {
+        analyzer,
+        cache,
+        diagnostics,
+        shape,
+        result_use,
+        result_use_detail,
+        use_coverage,
+        use_reason,
+        answer,
+    } = context;
+    if !matches!(result_use, CallResultUse::Discarded) {
+        return None;
+    }
+    let outcome = &shape.report.outcome;
+    let has_external_arm = answer.arms.iter().any(|arm| {
+        arm.target_unit.is_none()
+            && (arm.exact_external_target.is_some()
+                || arm.unmaterialized_target.is_some()
+                || arm.external_callee_identity.is_some())
+    });
+    if !has_external_arm {
+        return None;
+    }
+
+    let mut row = CallResultObligationValue {
+        file: outcome.file.clone(),
+        range: outcome.range,
+        id: result_obligation_row_id(&outcome.site_id, None),
+        site_id: outcome.site_id.clone(),
+        site_ast_id: outcome.site_ast_id.clone(),
+        result_ordinal: None,
+        obligation_kind: None,
+        failure_predicate: None,
+        provenance: None,
+        obligation_basis: None,
+        result_use: result_use.label(),
+        result_use_detail,
+        coverage: use_coverage.meet(coverage_for(answer.coverage)),
+        reason: use_reason,
+        pack_id: None,
+        model_id: None,
+        summary_id: None,
+        arm_count: answer.arms.len(),
+        modeled_arm_count: 0,
+        terminal: true,
+    };
+    let mut common: Option<Vec<CompiledResultUseObligation>> = None;
+    let mut closes_residual = !answer.arms.is_empty();
+    if answer.arms.is_empty() {
+        row.reason = Some("dispatch_unresolved");
+    } else if matches!(answer.outcome, "cancelled" | "exceeded_budget") {
+        row.reason = Some("dispatch_interrupted");
+    } else if let Some(models) = cache.models(analyzer) {
+        for arm in &answer.arms {
+            if arm.target_unit.is_some() {
+                row.reason = Some("target_not_external");
+                break;
+            }
+            let (summary, binding) = if let Some(target) = arm.unmaterialized_target.as_ref() {
+                if !unmaterialized_cpp_header_target_is_reviewed_libc(arm, target) {
+                    row.reason = Some("artifact_unselected");
+                    break;
+                }
+                let matched = models.procedure_summaries_for_external_target(target);
+                let summary = match matched.disposition {
+                    SemanticModelMatchDisposition::Unique => {
+                        let mut records = matched.records;
+                        assert_eq!(records.len(), 1, "unique libc summary has one record");
+                        records
+                            .pop()
+                            .expect("unique libc summary record is retained")
+                    }
+                    SemanticModelMatchDisposition::Conflict => {
+                        row.reason = Some("model_conflict");
+                        break;
+                    }
+                    SemanticModelMatchDisposition::Empty => {
+                        row.reason = Some("model_unavailable");
+                        break;
+                    }
+                };
+                if summary.shard.manifest.pack_id != REVIEWED_LIBC_RESULT_USE_PACK_ID
+                    || summary.shard.manifest.language != "cpp"
+                    || summary.shard.manifest.ecosystem != "cpp-headers"
+                {
+                    row.reason = Some("model_unavailable");
+                    break;
+                }
+                let binding = match summary.bind_reviewed_result_use_obligations(
+                    ReviewedObligationTarget::new(
+                        target,
+                        &summary.shard.matched_evidence,
+                        ReviewedObligationBasis::LibcStandardDeclaration,
+                    ),
+                ) {
+                    Ok(binding) => binding,
+                    Err(_) => {
+                        row.reason = Some("obligation_unavailable");
+                        break;
+                    }
+                };
+                (summary, binding)
+            } else if let Some(target) = arm.exact_external_target.as_ref() {
+                if !exact_cpp_header_target_is_reviewed_libc(target) {
+                    row.reason = Some("artifact_unselected");
+                    break;
+                }
+                let Some(member) = target
+                    .procedure()
+                    .declaration()
+                    .segments()
+                    .last()
+                    .and_then(|segment| segment.name())
+                else {
+                    row.reason = Some("target_unresolved");
+                    break;
+                };
+                let declaration = ProcedureSummaryDeclarationKey::new(
+                    "cpp",
+                    target.artifact().path().as_str(),
+                    member,
+                    target.has_receiver(),
+                    target.parameter_count(),
+                );
+                let matched = models.procedure_summaries_for_declaration(declaration);
+                let summary = match matched.disposition {
+                    SemanticModelMatchDisposition::Unique => {
+                        let mut records = matched.records;
+                        assert_eq!(records.len(), 1, "unique libc summary has one record");
+                        records
+                            .pop()
+                            .expect("unique libc summary record is retained")
+                    }
+                    SemanticModelMatchDisposition::Conflict => {
+                        row.reason = Some("model_conflict");
+                        break;
+                    }
+                    SemanticModelMatchDisposition::Empty => {
+                        row.reason = Some("model_unavailable");
+                        break;
+                    }
+                };
+                if summary.shard.manifest.pack_id != REVIEWED_LIBC_RESULT_USE_PACK_ID
+                    || summary.shard.manifest.language != "cpp"
+                    || summary.shard.manifest.ecosystem != "cpp-headers"
+                {
+                    row.reason = Some("model_unavailable");
+                    break;
+                }
+                let binding = match summary.bind_reviewed_result_use_obligations_for_declaration(
+                    declaration,
+                    &summary.shard.matched_evidence,
+                    ReviewedObligationBasis::LibcStandardDeclaration,
+                ) {
+                    Ok(binding) => binding,
+                    Err(_) => {
+                        row.reason = Some("obligation_unavailable");
+                        break;
+                    }
+                };
+                (summary, binding)
+            } else {
+                row.reason = Some("target_unresolved");
+                break;
+            };
+            if summary.record.completeness != Completeness::Complete
+                || (summary.record.target.has_receiver && !binding.covers_overrides())
+            {
+                row.reason = Some("obligation_unavailable");
+                break;
+            }
+            if let Some(existing) = &common {
+                if existing.as_slice() != binding.obligations() {
+                    row.reason = Some("obligation_conflict");
+                    break;
+                }
+            } else {
+                common = Some(binding.obligations().to_vec());
+                row.pack_id = Some(summary.shard.manifest.pack_id.clone());
+                row.model_id = Some(summary.record.model_id.clone());
+                row.summary_id = Some(summary.record.id.clone());
+            }
+            if row.pack_id.as_deref() != Some(summary.shard.manifest.pack_id.as_str())
+                || row.model_id.as_deref() != Some(summary.record.model_id.as_str())
+                || row.summary_id.as_deref() != Some(summary.record.id.as_str())
+            {
+                row.pack_id = None;
+                row.model_id = None;
+                row.summary_id = None;
+            }
+            closes_residual &= !summary.record.target.has_receiver || binding.covers_overrides();
+            row.modeled_arm_count += 1;
+        }
+    } else {
+        row.reason = Some("model_unavailable");
+    }
+
+    let contexts_with_arms = answer
+        .arms
+        .iter()
+        .map(|arm| arm.call_context)
+        .collect::<HashSet<_>>();
+    let residuals_are_closable = !answer.unnamed_boundaries.is_empty()
+        && !answer.call_contexts.is_empty()
+        && answer
+            .call_contexts
+            .iter()
+            .enumerate()
+            .all(|(index, context)| {
+                contexts_with_arms.contains(&index)
+                    && matches!(context.unnamed_boundaries.as_slice(), [] | ["unresolved"])
+            });
+    if row.reason.is_none()
+        && row.coverage == EffectCoverage::Open
+        && residuals_are_closable
+        && closes_residual
+    {
+        row.coverage = EffectCoverage::Exhaustive;
+    }
+    if row.reason.is_none() && row.coverage != EffectCoverage::Exhaustive {
+        row.reason = Some(if row.coverage == EffectCoverage::Truncated {
+            "dispatch_truncated"
+        } else {
+            "dispatch_open"
+        });
+    }
+    if row.reason.is_none()
+        && let Some(obligations) = common
+    {
+        let mut expansions = Vec::with_capacity(obligations.len());
+        for obligation in obligations {
+            let mut positive = row.clone();
+            positive.id = result_obligation_row_id(&outcome.site_id, Some(&obligation));
+            positive.result_ordinal = Some(obligation.result_ordinal);
+            positive.obligation_kind = Some(match obligation.kind {
+                ResultUseObligationKind::PureTransformationValue => "pure_transformation_value",
+                ResultUseObligationKind::FallibleStatus => "fallible_status",
+            });
+            positive.failure_predicate = obligation.failure_predicate.map(result_predicate_label);
+            positive.provenance = Some("reviewed");
+            positive.obligation_basis = Some("libc_standard_declaration");
+            positive.terminal = false;
+            expansions.push(pipeline_expansion(PipelineValue::CallResultObligation(
+                Box::new(positive),
+            )));
+        }
+        if !expansions.is_empty() {
+            record_result_obligation_coverage(cache, diagnostics, &outcome.file, row.coverage);
+            return Some(expansions);
+        }
+        row.reason = Some("obligation_unavailable");
+    } else if row.reason.is_none() {
+        row.coverage = row.coverage.meet(EffectCoverage::Open);
+        row.reason = Some("obligation_unavailable");
+    }
+    record_result_obligation_coverage(cache, diagnostics, &outcome.file, row.coverage);
+    Some(vec![pipeline_expansion(
+        PipelineValue::CallResultObligation(Box::new(row)),
+    )])
+}
+
+/// Join C and C++ native declaration attributes to the exact result-use
+/// relation. A discarded call is positive only when every materialized
+/// overload or dispatch arm proves the same `[[nodiscard]]`/`warn_unused_result`
+/// obligation. The declaration proof remains query-scoped and therefore does
+/// not retain a workspace-sized target map.
+fn native_cpp_call_result_obligation_expansions(
+    analyzer: &dyn IAnalyzer,
+    semantic: &mut SemanticQueryContext<'_>,
+    cache: &mut EffectTraversalCache,
+    diagnostics: &mut Vec<CodeQueryDiagnostic>,
+    shape: &CallShapeValue,
+) -> Vec<PipelineExpansion> {
+    let outcome = &shape.report.outcome;
+    let classification = match cache.native_result_use_for_shape(shape) {
+        // The shared C++ call-result index intentionally omits the
+        // `static_cast` wrapper and classifies its inner call. The normalized
+        // call-shape lowering can still expose that wrapper as a call-shaped
+        // row, so close the wrapper as a consumed outer expression instead of
+        // letting its missing index entry make an explicit discard open.
+        Err(CallResultUseOpenReason::MissingCall)
+            if outcome.call_kind == CallKind::Function
+                && outcome.callee_name.as_deref() == Some("static_cast") =>
+        {
+            Ok(CallResultUseSite::new(
+                outcome.range.start_byte,
+                outcome.range.end_byte,
+                CallResultUse::Consumed,
+            ))
+        }
+        classification => classification,
+    };
+    let missing_semantic_ports = !is_c_translation_unit(&outcome.file)
+        && classification.as_ref().is_ok_and(|site| {
+            site.overrides().is_empty()
+                && matches!(site.for_port(0), CallResultUse::Discarded)
+                && semantic
+                    .call_results_at_source(
+                        &outcome.file,
+                        outcome.range,
+                        &outcome.site_id,
+                        &outcome.site_ast_id,
+                    )
+                    .is_empty()
+        });
+    let (result_use, result_use_detail, use_coverage, use_reason) = match &classification {
+        Ok(site) => {
+            let result_use = if missing_semantic_ports && site.overrides().is_empty() {
+                CallResultUse::Open(CallResultUseOpenReason::MissingResultPort)
+            } else {
+                site.for_port(0)
+            };
+            let detail = result_use.detail();
+            let coverage = if matches!(result_use, CallResultUse::Open(_)) {
+                EffectCoverage::Open
+            } else {
+                EffectCoverage::Exhaustive
+            };
+            let reason = matches!(result_use, CallResultUse::Open(_))
+                .then_some(detail)
+                .flatten();
+            (result_use, detail, coverage, reason)
+        }
+        Err(open_reason) => (
+            CallResultUse::Open(*open_reason),
+            Some(open_reason.label()),
+            EffectCoverage::Open,
+            Some(open_reason.label()),
+        ),
+    };
+
+    // The native declaration proof is relevant only to an unadorned discard.
+    // Consumed values, explicit void casts, and syntax gaps still receive the
+    // same result-use row but do not need dispatch or declaration work.
+    if !matches!(result_use, CallResultUse::Discarded) {
+        let row = CallResultObligationValue {
+            file: outcome.file.clone(),
+            range: outcome.range,
+            id: result_use_row_id(&outcome.site_id, 0),
+            site_id: outcome.site_id.clone(),
+            site_ast_id: outcome.site_ast_id.clone(),
+            result_ordinal: Some(0),
+            obligation_kind: None,
+            failure_predicate: None,
+            provenance: None,
+            obligation_basis: None,
+            result_use: result_use.label(),
+            result_use_detail,
+            coverage: use_coverage,
+            reason: use_reason,
+            pack_id: None,
+            model_id: None,
+            summary_id: None,
+            arm_count: 0,
+            modeled_arm_count: 0,
+            terminal: true,
+        };
+        record_result_obligation_coverage(cache, diagnostics, &outcome.file, use_coverage);
+        return vec![pipeline_expansion(PipelineValue::CallResultObligation(
+            Box::new(row),
+        ))];
+    }
+
+    let reviewed_cpp_libc_model_active = cache.reviewed_cpp_libc_model_active(analyzer);
+    let native_dispatch = cache.native_cpp_dispatch_for_shape(shape).filter(|lookup| {
+        is_c_translation_unit(&outcome.file)
+            || lookup.exhaustive
+            || (lookup.targets.is_empty()
+                && (!could_be_reviewed_cpp_libc_call(shape) && reviewed_cpp_libc_model_active))
+    });
+    // The reviewed libc check needs an external dispatch arm. The native
+    // prefetch only returns workspace targets, so a call it resolved to
+    // workspace declarations cannot be a reviewed libc call. A targetless
+    // call can reach that check only when its AST-selected member is in the
+    // closed reviewed-libc vocabulary. Once that reviewed pack is active,
+    // targetless non-member calls stay on the native open result even when
+    // the resolver reports an external boundary; they cannot match the
+    // reviewed pack and do not need semantic dispatch.
+    let full_answer = native_dispatch
+        .as_ref()
+        .is_none_or(|lookup| lookup.targets.is_empty() && could_be_reviewed_cpp_libc_call(shape))
+        .then(|| cache.dispatch_at_source(semantic, &outcome.file, outcome.range));
+    if let Some(answer) = full_answer.as_ref()
+        && let Some(expansions) =
+            reviewed_cpp_libc_call_result_obligation_expansions(ReviewedCppLibcCallContext {
+                analyzer,
+                cache,
+                diagnostics,
+                shape,
+                result_use,
+                result_use_detail,
+                use_coverage,
+                use_reason,
+                answer,
+            })
+    {
+        return expansions;
+    }
+    let (arm_count, dispatch_can_close, arm_targets, fallback_target) =
+        if let Some(native_dispatch) = native_dispatch {
+            (
+                native_dispatch.targets.len(),
+                native_dispatch.exhaustive,
+                native_dispatch
+                    .targets
+                    .iter()
+                    .cloned()
+                    .map(Some)
+                    .collect::<Vec<_>>(),
+                None,
+            )
+        } else {
+            let answer =
+                full_answer.expect("the full dispatch answer exists without a native lookup");
+            (
+                answer.arms.len(),
+                coverage_for(answer.coverage) == EffectCoverage::Exhaustive
+                    && answer.unnamed_boundaries.is_empty()
+                    && !answer.arms.is_empty(),
+                answer
+                    .arms
+                    .iter()
+                    .map(|arm| arm.target_unit.clone())
+                    .collect::<Vec<_>>(),
+                (answer.arms.len() == 1)
+                    .then(|| answer.arms[0].target_unit.clone())
+                    .flatten(),
+            )
+        };
+    let mut native_obligation = None;
+    let mut modeled_arm_count = 0;
+    let mut reason = use_reason;
+    let mut proof_complete = false;
+    let mut base_contract = false;
+    if dispatch_can_close {
+        let mut common: Option<Option<NativeResultObligation>> = None;
+        let mut all_proofs_agree = true;
+        for target in &arm_targets {
+            let Some(target) = target.as_ref() else {
+                all_proofs_agree = false;
+                reason = Some("native_target_unknown");
+                continue;
+            };
+            let candidate = match crate::analyzer::cpp_native_result_obligation(analyzer, target, 0)
+            {
+                crate::analyzer::CppNativeObligationProof::Obligation(obligation) => {
+                    modeled_arm_count += 1;
+                    Some(Some(obligation))
+                }
+                crate::analyzer::CppNativeObligationProof::BaseContract(obligation) => {
+                    modeled_arm_count += 1;
+                    base_contract = true;
+                    Some(Some(obligation))
+                }
+                crate::analyzer::CppNativeObligationProof::NoObligation => Some(None),
+                crate::analyzer::CppNativeObligationProof::Open(open_reason) => {
+                    all_proofs_agree = false;
+                    reason = Some(open_reason);
+                    None
+                }
+            };
+            if let Some(candidate) = candidate {
+                if common.is_none() {
+                    common = Some(candidate);
+                } else if common != Some(candidate) {
+                    all_proofs_agree = false;
+                }
+            }
+        }
+        if all_proofs_agree {
+            proof_complete = true;
+            native_obligation = common.flatten().map(|mut obligation| {
+                if arm_count > 1 {
+                    obligation.basis = NativeResultObligationBasis::DispatchAgreement;
+                }
+                obligation
+            });
+            if native_obligation.is_none() {
+                reason = None;
+            }
+        }
+    } else if arm_count == 1 {
+        // A virtual call with a nodiscard base declaration has a static
+        // contract even when the general dispatcher retains an unnamed
+        // override boundary. Ambiguous overloads retain multiple arms and do
+        // not enter this fallback; they remain open as required by B4.
+        if let Some(target) = fallback_target.as_ref()
+            && let crate::analyzer::CppNativeObligationProof::BaseContract(obligation) =
+                crate::analyzer::cpp_native_result_obligation(analyzer, target, 0)
+        {
+            native_obligation = Some(obligation);
+            modeled_arm_count = 1;
+            base_contract = true;
+            proof_complete = true;
+            reason = None;
+        }
+        if !proof_complete && reason.is_none() {
+            reason = Some("dispatch_open");
+        }
+    } else if arm_count == 0 {
+        reason = Some("dispatch_unresolved");
+    } else if reason.is_none() {
+        reason = Some("dispatch_open");
+    }
+
+    let coverage = use_coverage.meet(if proof_complete && (dispatch_can_close || base_contract) {
+        EffectCoverage::Exhaustive
+    } else {
+        EffectCoverage::Open
+    });
+    let row = CallResultObligationValue {
+        file: outcome.file.clone(),
+        range: outcome.range,
+        id: result_use_row_id(&outcome.site_id, 0),
+        site_id: outcome.site_id.clone(),
+        site_ast_id: outcome.site_ast_id.clone(),
+        result_ordinal: Some(0),
+        obligation_kind: native_obligation.map(|obligation| obligation.kind.label()),
+        failure_predicate: None,
+        provenance: native_obligation.map(|_| "native"),
+        obligation_basis: native_obligation.map(|obligation| obligation.basis.label()),
+        result_use: result_use.label(),
+        result_use_detail,
+        coverage,
+        reason,
+        pack_id: None,
+        model_id: None,
+        summary_id: None,
+        arm_count,
+        modeled_arm_count,
+        terminal: native_obligation.is_none(),
+    };
+    record_result_obligation_coverage(cache, diagnostics, &outcome.file, coverage);
+    vec![pipeline_expansion(PipelineValue::CallResultObligation(
+        Box::new(row),
+    ))]
+}
+
+/// Join Go's native `error` result-type proof to the shared result-use
+/// relation. A native obligation is eligible only when every retained dispatch
+/// arm proves the same result port; a static function with one arm is the
+/// signature-only case. The standard-library exclusions are checked from the
+/// resolver-owned exact identity before requiring a materialized declaration.
+fn native_go_call_result_obligation_expansions(
+    analyzer: &dyn IAnalyzer,
+    semantic: &mut SemanticQueryContext<'_>,
+    cache: &mut EffectTraversalCache,
+    diagnostics: &mut Vec<CodeQueryDiagnostic>,
+    shape: &CallShapeValue,
+) -> Vec<PipelineExpansion> {
+    let outcome = &shape.report.outcome;
+    let classification = cache.native_result_use_for_shape(shape);
+    let answer = cache.dispatch_at_source(semantic, &outcome.file, outcome.range);
+    let dispatch_coverage = coverage_for(answer.coverage);
+    let mut arm_targets = Vec::with_capacity(answer.arms.len());
+    let mut arm_result_counts = Vec::with_capacity(answer.arms.len());
+    let mut all_arm_signatures_known = !answer.arms.is_empty();
+    let mut excluded_reason = None;
+    for arm in &answer.arms {
+        let exclusion = arm
+            .external_callee_identity
+            .as_ref()
+            .and_then(|identity| {
+                crate::analyzer::go_native_obligation_exclusion(
+                    identity.owner_fqn(),
+                    identity.member(),
+                )
+            })
+            .or_else(|| {
+                arm.unmaterialized_target.as_ref().and_then(|target| {
+                    crate::analyzer::go_native_obligation_exclusion(
+                        target.owner_fqn(),
+                        target.member(),
+                    )
+                })
+            });
+        if let Some(reason) = exclusion {
+            excluded_reason = Some(reason);
+        }
+        let Some(target) = arm.target_unit.as_ref() else {
+            all_arm_signatures_known = false;
+            arm_targets.push(None);
+            arm_result_counts.push(None);
+            continue;
+        };
+        let metadata = analyzer.signature_metadata(target);
+        let result_count = match metadata.as_slice() {
+            [metadata] if !metadata.result_type_identities().is_empty() => {
+                Some(metadata.result_type_identities().len())
+            }
+            [metadata] if metadata.return_type_identity().is_some() => Some(1),
+            _ => None,
+        };
+        all_arm_signatures_known &= result_count.is_some();
+        arm_targets.push(Some(target.clone()));
+        arm_result_counts.push(result_count);
+    }
+
+    // An interface method's declaration signature is a Go language contract:
+    // every implementation must use the same result list. The resolver may
+    // still publish an open residual for the implementation set, but the
+    // interface method target keeps the native result obligation closed.
+    let interface_signature = arm_targets.iter().flatten().any(|target| {
+        analyzer
+            .signature_metadata(target)
+            .first()
+            .and_then(|metadata| metadata.dispatch_extensibility())
+            == Some(crate::analyzer::DispatchExtensibility::Open)
+    });
+
+    // An expression statement has no semantic consumer port for results after
+    // the first one. The declaration's structured result arity supplies those
+    // ports without making the language adapter guess syntax or type shape.
+    let mut ordinals = semantic
+        .call_results_at_source(
+            &outcome.file,
+            outcome.range,
+            &outcome.site_id,
+            &outcome.site_ast_id,
+        )
+        .into_iter()
+        .map(|result| u32::try_from(result.ordinal).expect("result ordinal fits u32"))
+        .collect::<Vec<_>>();
+    let missing_semantic_ports = ordinals.is_empty();
+    if let Ok(site) = &classification {
+        ordinals.extend(site.overrides().iter().map(|fact| fact.result_ordinal));
+    }
+    for result_count in arm_result_counts.iter().flatten() {
+        ordinals.extend(
+            (0..*result_count)
+                .map(|ordinal| u32::try_from(ordinal).expect("Go result ordinal fits u32")),
+        );
+    }
+    if ordinals.is_empty() {
+        ordinals.push(0);
+    }
+    ordinals.sort_unstable();
+    ordinals.dedup();
+    let dispatch_can_close = dispatch_coverage == EffectCoverage::Exhaustive
+        && answer.unnamed_boundaries.is_empty()
+        && !answer.arms.is_empty()
+        && excluded_reason.is_none();
+    let native_dispatch_can_close = dispatch_can_close
+        || (interface_signature
+            && all_arm_signatures_known
+            && !answer.arms.is_empty()
+            && excluded_reason.is_none());
+    let native_dispatch_coverage = if interface_signature {
+        EffectCoverage::Exhaustive
+    } else {
+        dispatch_coverage
+    };
+
+    let mut expansions = Vec::with_capacity(ordinals.len());
+    for result_ordinal in ordinals {
+        let (result_use, result_use_detail, use_coverage, use_reason) = match &classification {
+            Ok(site) => {
+                let result_use = if missing_semantic_ports && site.overrides().is_empty() {
+                    CallResultUse::Open(CallResultUseOpenReason::MissingResultPort)
+                } else {
+                    site.for_port(result_ordinal)
+                };
+                let detail = result_use.detail();
+                let coverage = if matches!(result_use, CallResultUse::Open(_)) {
+                    EffectCoverage::Open
+                } else {
+                    EffectCoverage::Exhaustive
+                };
+                let reason = matches!(result_use, CallResultUse::Open(_))
+                    .then_some(detail)
+                    .flatten();
+                (result_use.label(), detail, coverage, reason)
+            }
+            Err(open_reason) => (
+                CallResultUse::Open(*open_reason).label(),
+                Some(open_reason.label()),
+                EffectCoverage::Open,
+                Some(open_reason.label()),
+            ),
+        };
+
+        let mut native_obligation = None;
+        let mut modeled_arm_count = 0;
+        let mut reason = use_reason;
+        if let Some(excluded) = excluded_reason {
+            reason = Some(excluded);
+        } else if native_dispatch_can_close {
+            let mut common = None;
+            let mut all_obligations_agree = true;
+            for (target, result_count) in arm_targets.iter().zip(&arm_result_counts) {
+                let Some(target) = target else {
+                    all_obligations_agree = false;
+                    continue;
+                };
+                let Some(result_count) = result_count else {
+                    all_obligations_agree = false;
+                    continue;
+                };
+                if usize::try_from(result_ordinal)
+                    .ok()
+                    .is_none_or(|ordinal| ordinal >= *result_count)
+                {
+                    all_obligations_agree = false;
+                    continue;
+                }
+                let obligation = crate::analyzer::go_native_error_result_obligation(
+                    analyzer,
+                    target,
+                    result_ordinal,
+                );
+                if obligation.is_some() {
+                    modeled_arm_count += 1;
+                } else {
+                    all_obligations_agree = false;
+                }
+                if let Some(obligation) = obligation {
+                    if common.is_some_and(|existing| existing != obligation) {
+                        all_obligations_agree = false;
+                    } else {
+                        common = Some(obligation);
+                    }
+                }
+            }
+            if all_obligations_agree {
+                native_obligation = common.map(|mut obligation| {
+                    if answer.arms.len() > 1 && !interface_signature {
+                        obligation.basis = NativeResultObligationBasis::DispatchAgreement;
+                    }
+                    obligation
+                });
+            } else if !all_arm_signatures_known {
+                reason = Some("native_signature_unknown");
+            }
+        } else if answer.arms.is_empty() {
+            if let Some(obligation) = crate::analyzer::go_native_error_function_value_obligation(
+                analyzer,
+                &outcome.file,
+                outcome.range,
+                result_ordinal,
+            ) {
+                native_obligation = Some(obligation);
+            } else {
+                reason = Some("dispatch_unresolved");
+            }
+        } else if !all_arm_signatures_known {
+            reason = Some("native_signature_unknown");
+        } else if reason.is_none() {
+            reason = Some("dispatch_open");
+        }
+
+        let coverage =
+            use_coverage.meet(if native_obligation.is_some() && answer.arms.is_empty() {
+                EffectCoverage::Exhaustive
+            } else {
+                native_dispatch_coverage
+            });
+        let row = CallResultObligationValue {
+            file: outcome.file.clone(),
+            range: outcome.range,
+            id: result_use_row_id(&outcome.site_id, result_ordinal),
+            site_id: outcome.site_id.clone(),
+            site_ast_id: outcome.site_ast_id.clone(),
+            result_ordinal: Some(result_ordinal),
+            obligation_kind: native_obligation.map(|obligation| obligation.kind.label()),
+            failure_predicate: None,
+            provenance: native_obligation.map(|_| "native"),
+            obligation_basis: native_obligation.map(|obligation| obligation.basis.label()),
+            result_use,
+            result_use_detail,
+            coverage,
+            reason,
+            pack_id: None,
+            model_id: None,
+            summary_id: None,
+            arm_count: answer.arms.len(),
+            modeled_arm_count,
+            terminal: native_obligation.is_none(),
+        };
+        record_result_obligation_coverage(cache, diagnostics, &outcome.file, coverage);
+        expansions.push(pipeline_expansion(PipelineValue::CallResultObligation(
+            Box::new(row),
+        )));
+    }
+    expansions
+}
+
+const REVIEWED_PYTHON_STATUS_RESULT_USE_PACK_ID: &str =
+    "bifrost.python.status-result-use-obligations";
+
+fn python_status_result_target(target: &UnmaterializedExternalTarget) -> bool {
+    target.language() == SemanticLanguage::Standard(crate::analyzer::Language::Python)
+        && target.has_resolver_owned_call_shape()
+        && target.selected_python_artifact().is_none()
+        && !target.has_receiver()
+        && matches!(
+            (target.owner_fqn(), target.member()),
+            ("subprocess", "call") | ("os", "system")
+        )
+}
+
+fn python_status_call_result_obligation_expansions(
+    analyzer: &dyn IAnalyzer,
+    semantic: &mut SemanticQueryContext<'_>,
+    cache: &mut EffectTraversalCache,
+    diagnostics: &mut Vec<CodeQueryDiagnostic>,
+    shape: &CallShapeValue,
+) -> Option<Vec<PipelineExpansion>> {
+    let outcome = &shape.report.outcome;
+    let answer = cache.dispatch_at_source(semantic, &outcome.file, outcome.range);
+    let status_arm_count = answer
+        .arms
+        .iter()
+        .filter(|arm| {
+            arm.target_unit.is_none()
+                && arm
+                    .unmaterialized_target
+                    .as_ref()
+                    .is_some_and(python_status_result_target)
+        })
+        .count();
+    if status_arm_count == 0 {
+        return None;
+    }
+    let dispatch_is_exact = status_arm_count == answer.arms.len()
+        && answer.unnamed_boundaries.is_empty()
+        && !matches!(
+            answer.outcome,
+            "cancelled" | "exceeded_budget" | "unsupported" | "ambiguous" | "unproven"
+        )
+        && coverage_for(answer.coverage) != EffectCoverage::Truncated;
+    let mut row = CallResultObligationValue {
+        file: outcome.file.clone(),
+        range: outcome.range,
+        id: result_obligation_row_id(&outcome.site_id, None),
+        site_id: outcome.site_id.clone(),
+        site_ast_id: outcome.site_ast_id.clone(),
+        result_ordinal: None,
+        obligation_kind: None,
+        failure_predicate: None,
+        provenance: None,
+        obligation_basis: None,
+        result_use: "discarded",
+        result_use_detail: None,
+        coverage: coverage_for(answer.coverage),
+        reason: (!dispatch_is_exact).then_some("dispatch_open"),
+        pack_id: None,
+        model_id: None,
+        summary_id: None,
+        arm_count: answer.arms.len(),
+        modeled_arm_count: 0,
+        terminal: true,
+    };
+    let mut common: Option<Vec<CompiledResultUseObligation>> = None;
+    if dispatch_is_exact {
+        if let Some(models) = cache.models(analyzer) {
+            for arm in &answer.arms {
+                let Some(target) = arm.unmaterialized_target.as_ref() else {
+                    row.reason = Some("target_unresolved");
+                    break;
+                };
+                if !python_status_result_target(target) {
+                    row.reason = Some("obligation_unavailable");
+                    break;
+                }
+                let matched = models.procedure_summaries_for_external_target(target);
+                let records = matched
+                    .records
+                    .into_iter()
+                    .filter(|summary| {
+                        summary.shard.manifest.pack_id == REVIEWED_PYTHON_STATUS_RESULT_USE_PACK_ID
+                    })
+                    .collect::<Vec<_>>();
+                let summary = match records.as_slice() {
+                    [summary] => summary,
+                    [] => {
+                        row.reason = Some("model_unavailable");
+                        break;
+                    }
+                    _ => {
+                        row.reason = Some("model_conflict");
+                        break;
+                    }
+                };
+                if summary.shard.manifest.language != "python"
+                    || summary.shard.manifest.ecosystem != "python"
+                {
+                    row.reason = Some("model_unavailable");
+                    break;
+                }
+                let evidence = &summary.shard.matched_evidence;
+                if evidence.language != "python"
+                    || evidence.ecosystem != "python"
+                    || evidence
+                        .toolchain
+                        .as_ref()
+                        .map(|toolchain| toolchain.name.as_str())
+                        != Some("cpython")
+                {
+                    row.reason = Some("artifact_unselected");
+                    break;
+                }
+                let binding = match summary.bind_reviewed_result_use_obligations(
+                    ReviewedObligationTarget::new(
+                        target,
+                        evidence,
+                        ReviewedObligationBasis::PythonStandardLibraryFunction,
+                    ),
+                ) {
+                    Ok(binding) => binding,
+                    Err(_) => {
+                        row.reason = Some("obligation_unavailable");
+                        break;
+                    }
+                };
+                if summary.record.completeness != Completeness::Complete {
+                    row.reason = Some("obligation_unavailable");
+                    break;
+                }
+                if let Some(existing) = &common {
+                    if existing.as_slice() != binding.obligations()
+                        || binding.basis() != ReviewedObligationBasis::PythonStandardLibraryFunction
+                    {
+                        row.reason = Some("obligation_conflict");
+                        break;
+                    }
+                } else {
+                    common = Some(binding.obligations().to_vec());
+                    row.pack_id = Some(summary.shard.manifest.pack_id.clone());
+                    row.model_id = Some(summary.record.model_id.clone());
+                    row.summary_id = Some(summary.record.id.clone());
+                }
+                if row.pack_id.as_deref() != Some(summary.shard.manifest.pack_id.as_str())
+                    || row.model_id.as_deref() != Some(summary.record.model_id.as_str())
+                    || row.summary_id.as_deref() != Some(summary.record.id.as_str())
+                {
+                    row.pack_id = None;
+                    row.model_id = None;
+                    row.summary_id = None;
+                }
+                row.modeled_arm_count += 1;
+            }
+        } else {
+            row.reason = Some("model_unavailable");
+        }
+    }
+
+    if row.reason.is_none() {
+        if let Some(obligations) = common {
+            row.coverage = EffectCoverage::Exhaustive;
+            let mut expansions = Vec::with_capacity(obligations.len());
+            for obligation in obligations {
+                let mut positive = row.clone();
+                positive.id = result_obligation_row_id(&outcome.site_id, Some(&obligation));
+                positive.result_ordinal = Some(obligation.result_ordinal);
+                positive.obligation_kind = Some(match obligation.kind {
+                    ResultUseObligationKind::PureTransformationValue => "pure_transformation_value",
+                    ResultUseObligationKind::FallibleStatus => "fallible_status",
+                });
+                positive.failure_predicate =
+                    obligation.failure_predicate.map(result_predicate_label);
+                positive.provenance = Some("reviewed");
+                positive.obligation_basis =
+                    Some(ReviewedObligationBasis::PythonStandardLibraryFunction.label());
+                positive.terminal = false;
+                expansions.push(pipeline_expansion(PipelineValue::CallResultObligation(
+                    Box::new(positive),
+                )));
+            }
+            if !expansions.is_empty() {
+                record_result_obligation_coverage(cache, diagnostics, &outcome.file, row.coverage);
+                return Some(expansions);
+            }
+            row.reason = Some("obligation_unavailable");
+        } else if row.reason.is_none() {
+            row.coverage = row.coverage.meet(EffectCoverage::Open);
+            row.reason = Some("obligation_unavailable");
+        }
+    } else {
+        row.coverage = row.coverage.meet(EffectCoverage::Open);
+    }
+    record_result_obligation_coverage(cache, diagnostics, &outcome.file, row.coverage);
+    Some(vec![pipeline_expansion(
+        PipelineValue::CallResultObligation(Box::new(row)),
+    )])
+}
+
+fn python_call_result_obligation_expansions(
     analyzer: &dyn IAnalyzer,
     semantic: &mut SemanticQueryContext<'_>,
     cache: &mut EffectTraversalCache,
@@ -3076,7 +4602,10 @@ pub(super) fn call_result_obligation_expansions(
         result_ordinal: None,
         obligation_kind: None,
         failure_predicate: None,
+        provenance: None,
+        obligation_basis: None,
         result_use: "unknown",
+        result_use_detail: None,
         coverage: EffectCoverage::Open,
         reason: None,
         pack_id: None,
@@ -3086,18 +4615,1714 @@ pub(super) fn call_result_obligation_expansions(
         modeled_arm_count: 0,
         terminal: true,
     };
-    if crate::analyzer::common::language_for_file(&outcome.file) != crate::analyzer::Language::Java
+    let result_use = match super::python_rule_facts::python_result_use_for_call_shape(shape) {
+        Ok(result_use) => result_use,
+        Err(reason) => {
+            row.result_use = "open";
+            row.result_use_detail = Some(reason);
+            row.coverage = if reason == "unsupported_syntax" {
+                EffectCoverage::Unsupported
+            } else {
+                EffectCoverage::Open
+            };
+            row.reason = Some("result_use_unclassified");
+            record_result_obligation_coverage(cache, diagnostics, &outcome.file, row.coverage);
+            return vec![pipeline_expansion(PipelineValue::CallResultObligation(
+                Box::new(row),
+            ))];
+        }
+    };
+    if result_use == "consumed" {
+        row.result_use = "other_context";
+        row.coverage = EffectCoverage::Exhaustive;
+        record_result_obligation_coverage(cache, diagnostics, &outcome.file, row.coverage);
+        return vec![pipeline_expansion(PipelineValue::CallResultObligation(
+            Box::new(row),
+        ))];
+    }
+
+    row.result_use = "discarded";
+    if let Some(expansions) = python_status_call_result_obligation_expansions(
+        analyzer,
+        semantic,
+        cache,
+        diagnostics,
+        shape,
+    ) {
+        return expansions;
+    }
+    let exact_builtin_str_receiver = semantic.python_exact_builtin_str_receiver(shape);
+    let answer = cache.dispatch_at_source(semantic, &outcome.file, outcome.range);
+    let synthetic_target = if answer.arms.is_empty()
+        && exact_builtin_str_receiver
+        && answer.semantic_unsupported.is_none()
+        && answer.exceeded_limit.is_none()
+        && !matches!(
+            answer.outcome,
+            "cancelled" | "exceeded_budget" | "unsupported" | "ambiguous" | "unproven"
+        ) {
+        outcome.callee_name.as_deref().and_then(|member| {
+            u32::try_from(shape.report.arguments.len())
+                .ok()
+                .and_then(|arity| {
+                    UnmaterializedExternalTarget::new_modeled(
+                        "builtins.str",
+                        member,
+                        SemanticLanguage::Standard(crate::analyzer::Language::Python),
+                        arity,
+                        true,
+                    )
+                })
+        })
+    } else {
+        None
+    };
+    let synthetic_dispatch = synthetic_target.is_some();
+    let arm_targets = if synthetic_dispatch {
+        vec![synthetic_target]
+    } else {
+        answer
+            .arms
+            .iter()
+            .map(|arm| arm.unmaterialized_target.clone())
+            .collect::<Vec<_>>()
+    };
+    row.arm_count = arm_targets.len();
+    row.coverage = if synthetic_dispatch {
+        EffectCoverage::Exhaustive
+    } else {
+        coverage_for(answer.coverage)
+    };
+    let mut common: Option<Vec<CompiledResultUseObligation>> = None;
+    let mut common_basis = None;
+    let mut closes_residual = !arm_targets.is_empty();
+    if arm_targets.is_empty() {
+        row.reason = Some("dispatch_unresolved");
+    } else if matches!(answer.outcome, "cancelled" | "exceeded_budget") {
+        row.reason = Some("dispatch_interrupted");
+    } else if let Some(models) = cache.models(analyzer) {
+        for maybe_target in &arm_targets {
+            let Some(target) = maybe_target.as_ref() else {
+                row.reason = Some("target_unresolved");
+                break;
+            };
+            if target.language().semantic_pack_label() != "python"
+                || target.owner_fqn() != "builtins.str"
+                || !target.has_receiver()
+            {
+                row.reason = Some("obligation_unavailable");
+                break;
+            }
+            let matched = models.procedure_summaries_for_external_target(target);
+            let summary = match (matched.disposition, matched.records.as_slice()) {
+                (SemanticModelMatchDisposition::Unique, [summary]) => summary,
+                (SemanticModelMatchDisposition::Conflict, _) => {
+                    row.reason = Some("model_conflict");
+                    break;
+                }
+                _ => {
+                    row.reason = Some("model_unavailable");
+                    break;
+                }
+            };
+            let evidence = &summary.shard.matched_evidence;
+            if evidence.language != "python"
+                || evidence.ecosystem != "python"
+                || evidence
+                    .toolchain
+                    .as_ref()
+                    .map(|toolchain| toolchain.name.as_str())
+                    != Some("cpython")
+            {
+                row.reason = Some("artifact_unselected");
+                break;
+            }
+            let basis = ReviewedObligationBasis::BuiltinReceiverAssumption(
+                ReviewedBuiltinReceiverAssumption::PythonStr,
+            );
+            let binding = match summary.bind_reviewed_result_use_obligations(
+                ReviewedObligationTarget::new(target, evidence, basis),
+            ) {
+                Ok(binding) => binding,
+                Err(_) => {
+                    row.reason = Some("obligation_unavailable");
+                    break;
+                }
+            };
+            if summary.record.completeness != Completeness::Complete
+                || binding.obligations().iter().any(|obligation| {
+                    obligation.kind == ResultUseObligationKind::PureTransformationValue
+                        && !binding.ordinary_heap_unchanged()
+                })
+                || !binding.covers_overrides()
+            {
+                row.reason = Some("obligation_unavailable");
+                break;
+            }
+            if let Some(existing) = &common {
+                if existing.as_slice() != binding.obligations()
+                    || common_basis != Some(binding.basis())
+                {
+                    row.reason = Some("obligation_conflict");
+                    break;
+                }
+            } else {
+                common = Some(binding.obligations().to_vec());
+                common_basis = Some(binding.basis());
+                row.pack_id = Some(summary.shard.manifest.pack_id.clone());
+                row.model_id = Some(summary.record.model_id.clone());
+                row.summary_id = Some(summary.record.id.clone());
+            }
+            if row.pack_id.as_deref() != Some(summary.shard.manifest.pack_id.as_str())
+                || row.model_id.as_deref() != Some(summary.record.model_id.as_str())
+                || row.summary_id.as_deref() != Some(summary.record.id.as_str())
+            {
+                row.pack_id = None;
+                row.model_id = None;
+                row.summary_id = None;
+            }
+            closes_residual &= binding.covers_overrides();
+            row.modeled_arm_count += 1;
+        }
+    } else {
+        row.reason = Some("model_unavailable");
+    }
+
+    // An external member may publish one unresolved residual beside its
+    // modeled arm. A complete reviewed summary may discharge that residual,
+    // but no other residual kind is nameable by the binder.
+    let residuals_are_closable = if synthetic_dispatch {
+        true
+    } else {
+        let contexts_with_arms = answer
+            .arms
+            .iter()
+            .map(|arm| arm.call_context)
+            .collect::<HashSet<_>>();
+        !answer.unnamed_boundaries.is_empty()
+            && !answer.call_contexts.is_empty()
+            && answer
+                .call_contexts
+                .iter()
+                .enumerate()
+                .all(|(index, context)| {
+                    contexts_with_arms.contains(&index)
+                        && matches!(context.unnamed_boundaries.as_slice(), [] | ["unresolved"])
+                })
+    };
+    if row.reason.is_none()
+        && row.coverage == EffectCoverage::Open
+        && residuals_are_closable
+        && closes_residual
     {
+        row.coverage = EffectCoverage::Exhaustive;
+    }
+    if row.reason.is_none() && row.coverage != EffectCoverage::Exhaustive {
+        row.reason = Some(if row.coverage == EffectCoverage::Truncated {
+            "dispatch_truncated"
+        } else {
+            "dispatch_open"
+        });
+    }
+    if row.reason.is_none() {
+        if let Some(obligations) = common {
+            let basis = common_basis.expect("an obligation set carries its typed basis");
+            let mut expansions = Vec::with_capacity(obligations.len());
+            for obligation in obligations {
+                let mut positive = row.clone();
+                positive.id = result_obligation_row_id(&outcome.site_id, Some(&obligation));
+                positive.result_ordinal = Some(obligation.result_ordinal);
+                positive.obligation_kind = Some(match obligation.kind {
+                    ResultUseObligationKind::PureTransformationValue => "pure_transformation_value",
+                    ResultUseObligationKind::FallibleStatus => "fallible_status",
+                });
+                positive.failure_predicate =
+                    obligation.failure_predicate.map(result_predicate_label);
+                positive.provenance = Some("reviewed");
+                positive.obligation_basis = Some(basis.label());
+                positive.terminal = false;
+                expansions.push(pipeline_expansion(PipelineValue::CallResultObligation(
+                    Box::new(positive),
+                )));
+            }
+            if !expansions.is_empty() {
+                record_result_obligation_coverage(cache, diagnostics, &outcome.file, row.coverage);
+                return expansions;
+            }
+            row.reason = Some("obligation_unavailable");
+        } else {
+            row.coverage = row.coverage.meet(EffectCoverage::Open);
+            row.reason = Some("obligation_unavailable");
+        }
+    } else {
+        row.coverage = row.coverage.meet(EffectCoverage::Open);
+    }
+    record_result_obligation_coverage(cache, diagnostics, &outcome.file, row.coverage);
+    vec![pipeline_expansion(PipelineValue::CallResultObligation(
+        Box::new(row),
+    ))]
+}
+
+fn csharp_call_result_obligation_expansions(
+    analyzer: &dyn IAnalyzer,
+    semantic: &mut SemanticQueryContext<'_>,
+    cache: &mut EffectTraversalCache,
+    diagnostics: &mut Vec<CodeQueryDiagnostic>,
+    shape: &CallShapeValue,
+) -> Vec<PipelineExpansion> {
+    let outcome = &shape.report.outcome;
+    // The policy relation is name-selected just like the Java adapter. An
+    // unrelated call (for example HashSet<T>.Add, which is deliberately not a
+    // reviewed B5 API) must not become an open obligation row merely because
+    // the query requested call-result obligations for a broad call set.
+    if !outcome
+        .callee_name
+        .as_deref()
+        .is_some_and(csharp_reviewed_member)
+    {
+        return Vec::new();
+    }
+    let mut row = CallResultObligationValue {
+        file: outcome.file.clone(),
+        range: outcome.range,
+        id: result_obligation_row_id(&outcome.site_id, None),
+        site_id: outcome.site_id.clone(),
+        site_ast_id: outcome.site_ast_id.clone(),
+        result_ordinal: None,
+        obligation_kind: None,
+        failure_predicate: None,
+        provenance: None,
+        obligation_basis: None,
+        result_use: "unknown",
+        result_use_detail: None,
+        coverage: EffectCoverage::Open,
+        reason: None,
+        pack_id: None,
+        model_id: None,
+        summary_id: None,
+        arm_count: 0,
+        modeled_arm_count: 0,
+        terminal: true,
+    };
+    let classification = match cache.native_result_use_for_shape(shape) {
+        Ok(site) => site.for_port(0),
+        Err(reason) => {
+            row.result_use = "open";
+            row.result_use_detail = Some(reason.label());
+            row.coverage = if reason == CallResultUseOpenReason::UnsupportedSyntax {
+                EffectCoverage::Unsupported
+            } else {
+                EffectCoverage::Open
+            };
+            row.reason = Some("result_use_unclassified");
+            record_result_obligation_coverage(cache, diagnostics, &outcome.file, row.coverage);
+            return vec![pipeline_expansion(PipelineValue::CallResultObligation(
+                Box::new(row),
+            ))];
+        }
+    };
+    match classification {
+        CallResultUse::Consumed => {
+            row.result_use = "other_context";
+            row.coverage = EffectCoverage::Exhaustive;
+            record_result_obligation_coverage(cache, diagnostics, &outcome.file, row.coverage);
+            return vec![pipeline_expansion(PipelineValue::CallResultObligation(
+                Box::new(row),
+            ))];
+        }
+        CallResultUse::IntentionalDiscard(kind) => {
+            row.result_use = "intentional_discard";
+            row.result_use_detail = Some(kind.label());
+            row.coverage = EffectCoverage::Exhaustive;
+            record_result_obligation_coverage(cache, diagnostics, &outcome.file, row.coverage);
+            return vec![pipeline_expansion(PipelineValue::CallResultObligation(
+                Box::new(row),
+            ))];
+        }
+        CallResultUse::Open(reason) => {
+            row.result_use = "open";
+            row.result_use_detail = Some(reason.label());
+            row.coverage = EffectCoverage::Open;
+            row.reason = Some("result_use_unclassified");
+            record_result_obligation_coverage(cache, diagnostics, &outcome.file, row.coverage);
+            return vec![pipeline_expansion(PipelineValue::CallResultObligation(
+                Box::new(row),
+            ))];
+        }
+        CallResultUse::Discarded => {}
+    }
+
+    row.result_use = "discarded";
+    let answer = cache.dispatch_at_source(semantic, &outcome.file, outcome.range);
+    let arm_targets = answer
+        .arms
+        .iter()
+        .map(|arm| arm.unmaterialized_target.clone())
+        .collect::<Vec<_>>();
+    row.arm_count = answer.arms.len();
+    row.coverage = coverage_for(answer.coverage);
+    // A same-named workspace method is a complete near miss, not an open
+    // reviewed BCL obligation. The dispatch oracle has already proved the
+    // distinction structurally: every arm is materialized in the workspace,
+    // no unmaterialized external identity is present, and dispatch is
+    // exhaustive and resolved. Keep a terminal no-obligation row so callers
+    // can distinguish this complete negative from an absent relation.
+    let workspace_only = answer.outcome == "resolved"
+        && answer.coverage.is_exhaustive()
+        && answer.unnamed_boundaries.is_empty()
+        && !answer.arms.is_empty()
+        && answer
+            .arms
+            .iter()
+            .all(|arm| arm.target_unit.is_some() && arm.unmaterialized_target.is_none());
+    if workspace_only {
+        row.coverage = EffectCoverage::Exhaustive;
+        row.terminal = true;
+        record_result_obligation_coverage(cache, diagnostics, &outcome.file, row.coverage);
+        return vec![pipeline_expansion(PipelineValue::CallResultObligation(
+            Box::new(row),
+        ))];
+    }
+    let mut common: Option<Vec<CompiledResultUseObligation>> = None;
+    let mut closes_residual = !arm_targets.is_empty();
+    if arm_targets.is_empty() {
+        row.reason = Some("dispatch_unresolved");
+    } else if matches!(answer.outcome, "cancelled" | "exceeded_budget") {
+        row.reason = Some("dispatch_interrupted");
+    } else if let Some(models) = cache.models(analyzer) {
+        for maybe_target in &arm_targets {
+            let Some(target) = maybe_target.as_ref() else {
+                row.reason = Some("target_unresolved");
+                break;
+            };
+            if target.language().semantic_pack_label() != "csharp"
+                || !csharp_reviewed_owner(target.owner_fqn(), target.member())
+            {
+                row.reason = Some("obligation_unavailable");
+                break;
+            }
+            let matched = models.procedure_summaries_for_external_target(target);
+            let summary = match (matched.disposition, matched.records.as_slice()) {
+                (SemanticModelMatchDisposition::Unique, [summary]) => summary,
+                (SemanticModelMatchDisposition::Conflict, _) => {
+                    row.reason = Some("model_conflict");
+                    break;
+                }
+                _ => {
+                    row.reason = Some("model_unavailable");
+                    break;
+                }
+            };
+            let evidence = &summary.shard.matched_evidence;
+            if !csharp_bcl_evidence(evidence) {
+                row.reason = Some("artifact_unselected");
+                break;
+            }
+            let binding =
+                match summary.bind_reviewed_result_use_obligations(ReviewedObligationTarget::new(
+                    target,
+                    evidence,
+                    ReviewedObligationBasis::DispatchAgreement,
+                )) {
+                    Ok(binding) => binding,
+                    Err(_) => {
+                        row.reason = Some("obligation_unavailable");
+                        break;
+                    }
+                };
+            if summary.record.completeness != Completeness::Complete
+                || (target.has_receiver() && !binding.covers_overrides())
+                || binding.obligations().iter().any(|obligation| {
+                    obligation.kind == ResultUseObligationKind::PureTransformationValue
+                        && !binding.ordinary_heap_unchanged()
+                })
+            {
+                row.reason = Some("obligation_unavailable");
+                break;
+            }
+            if let Some(existing) = &common {
+                if existing.as_slice() != binding.obligations() {
+                    row.reason = Some("obligation_conflict");
+                    break;
+                }
+            } else {
+                common = Some(binding.obligations().to_vec());
+                row.pack_id = Some(summary.shard.manifest.pack_id.clone());
+                row.model_id = Some(summary.record.model_id.clone());
+                row.summary_id = Some(summary.record.id.clone());
+            }
+            if row.pack_id.as_deref() != Some(summary.shard.manifest.pack_id.as_str())
+                || row.model_id.as_deref() != Some(summary.record.model_id.as_str())
+                || row.summary_id.as_deref() != Some(summary.record.id.as_str())
+            {
+                row.pack_id = None;
+                row.model_id = None;
+                row.summary_id = None;
+            }
+            closes_residual &= !target.has_receiver() || binding.covers_overrides();
+            row.modeled_arm_count += 1;
+        }
+    } else {
+        row.reason = Some("model_unavailable");
+    }
+
+    let contexts_with_arms = answer
+        .arms
+        .iter()
+        .map(|arm| arm.call_context)
+        .collect::<HashSet<_>>();
+    let residuals_are_closable = !answer.unnamed_boundaries.is_empty()
+        && !answer.call_contexts.is_empty()
+        && answer
+            .call_contexts
+            .iter()
+            .enumerate()
+            .all(|(index, context)| {
+                contexts_with_arms.contains(&index)
+                    && matches!(context.unnamed_boundaries.as_slice(), [] | ["unresolved"])
+            });
+    if row.reason.is_none()
+        && row.coverage == EffectCoverage::Open
+        && residuals_are_closable
+        && closes_residual
+    {
+        row.coverage = EffectCoverage::Exhaustive;
+    }
+    if row.reason.is_none() && row.coverage != EffectCoverage::Exhaustive {
+        row.reason = Some(if row.coverage == EffectCoverage::Truncated {
+            "dispatch_truncated"
+        } else {
+            "dispatch_open"
+        });
+    }
+    if row.reason.is_none()
+        && let Some(obligations) = common
+    {
+        let mut expansions = Vec::with_capacity(obligations.len());
+        for obligation in obligations {
+            let mut projected = row.clone();
+            projected.id = result_obligation_row_id(&outcome.site_id, Some(&obligation));
+            projected.result_ordinal = Some(obligation.result_ordinal);
+            projected.obligation_kind = Some(match obligation.kind {
+                ResultUseObligationKind::PureTransformationValue => "pure_transformation_value",
+                ResultUseObligationKind::FallibleStatus => "fallible_status",
+            });
+            projected.failure_predicate = obligation.failure_predicate.map(result_predicate_label);
+            projected.provenance = Some("reviewed");
+            projected.obligation_basis = Some("dispatch_agreement");
+            projected.terminal = false;
+            expansions.push(pipeline_expansion(PipelineValue::CallResultObligation(
+                Box::new(projected),
+            )));
+        }
+        if !expansions.is_empty() {
+            record_result_obligation_coverage(cache, diagnostics, &outcome.file, row.coverage);
+            return expansions;
+        }
+        row.reason = Some("obligation_unavailable");
+    } else if row.reason.is_none() {
+        row.coverage = row.coverage.meet(EffectCoverage::Open);
+        row.reason = Some("obligation_unavailable");
+    } else {
+        row.coverage = row.coverage.meet(EffectCoverage::Open);
+    }
+    record_result_obligation_coverage(cache, diagnostics, &outcome.file, row.coverage);
+    vec![pipeline_expansion(PipelineValue::CallResultObligation(
+        Box::new(row),
+    ))]
+}
+
+fn csharp_reviewed_member(member: &str) -> bool {
+    matches!(
+        member,
+        "Trim"
+            | "TrimStart"
+            | "TrimEnd"
+            | "ToLower"
+            | "ToUpper"
+            | "ToLowerInvariant"
+            | "ToUpperInvariant"
+            | "Replace"
+            | "Substring"
+            | "TryParse"
+            | "TryAdd"
+            | "TryRemove"
+            | "TryUpdate"
+    )
+}
+
+fn csharp_reviewed_owner(owner: &str, member: &str) -> bool {
+    matches!(
+        (owner, member),
+        (
+            "System.String",
+            "Trim"
+                | "TrimStart"
+                | "TrimEnd"
+                | "ToLower"
+                | "ToUpper"
+                | "ToLowerInvariant"
+                | "ToUpperInvariant"
+                | "Replace"
+                | "Substring"
+        ) | (
+            "System.Int32"
+                | "System.Int64"
+                | "System.Double"
+                | "System.Decimal"
+                | "System.Guid"
+                | "System.DateTime",
+            "TryParse"
+        ) | ("System.Collections.Generic.Dictionary`2", "TryAdd")
+            | (
+                "System.Collections.Concurrent.ConcurrentDictionary`2",
+                "TryAdd" | "TryRemove" | "TryUpdate"
+            )
+    )
+}
+
+fn csharp_bcl_evidence(evidence: &SemanticModelActivationEvidence) -> bool {
+    evidence.language == "csharp"
+        && evidence.ecosystem == "nuget"
+        && evidence
+            .package
+            .as_ref()
+            .is_some_and(|package| package.name == "Microsoft.NETCore.App.Ref")
+        && evidence.target.as_deref() == Some("net8.0")
+        && evidence.artifact_sha256.is_some()
+        && evidence.module.as_ref().is_some_and(|module| {
+            matches!(
+                module.name.as_str(),
+                "System.Runtime" | "System.Collections" | "System.Collections.Concurrent"
+            )
+        })
+}
+fn javascript_typescript_call_result_obligation_expansions(
+    analyzer: &dyn IAnalyzer,
+    semantic: &mut SemanticQueryContext<'_>,
+    cache: &mut EffectTraversalCache,
+    diagnostics: &mut Vec<CodeQueryDiagnostic>,
+    shape: &CallShapeValue,
+) -> Vec<PipelineExpansion> {
+    let outcome = &shape.report.outcome;
+    let language = crate::analyzer::common::language_for_file(&outcome.file);
+    let mut row = CallResultObligationValue {
+        file: outcome.file.clone(),
+        range: outcome.range,
+        id: result_obligation_row_id(&outcome.site_id, None),
+        site_id: outcome.site_id.clone(),
+        site_ast_id: outcome.site_ast_id.clone(),
+        result_ordinal: None,
+        obligation_kind: None,
+        failure_predicate: None,
+        provenance: None,
+        obligation_basis: None,
+        result_use: "unknown",
+        result_use_detail: None,
+        coverage: EffectCoverage::Open,
+        reason: None,
+        pack_id: None,
+        model_id: None,
+        summary_id: None,
+        arm_count: 0,
+        modeled_arm_count: 0,
+        terminal: true,
+    };
+    let result_use = match cache.native_result_use_for_shape(shape) {
+        Ok(site) => site.for_port(0),
+        Err(reason) => {
+            row.result_use = "open";
+            row.result_use_detail = Some(reason.label());
+            row.coverage = if reason == CallResultUseOpenReason::UnsupportedSyntax {
+                EffectCoverage::Unsupported
+            } else {
+                EffectCoverage::Open
+            };
+            row.reason = Some("result_use_unclassified");
+            record_result_obligation_coverage(cache, diagnostics, &outcome.file, row.coverage);
+            return vec![pipeline_expansion(PipelineValue::CallResultObligation(
+                Box::new(row),
+            ))];
+        }
+    };
+    match result_use {
+        CallResultUse::Consumed => {
+            row.result_use = "other_context";
+            row.coverage = EffectCoverage::Exhaustive;
+            record_result_obligation_coverage(cache, diagnostics, &outcome.file, row.coverage);
+            return vec![pipeline_expansion(PipelineValue::CallResultObligation(
+                Box::new(row),
+            ))];
+        }
+        CallResultUse::IntentionalDiscard(kind) => {
+            row.result_use = "intentional_discard";
+            row.result_use_detail = Some(kind.label());
+            row.coverage = EffectCoverage::Exhaustive;
+            record_result_obligation_coverage(cache, diagnostics, &outcome.file, row.coverage);
+            return vec![pipeline_expansion(PipelineValue::CallResultObligation(
+                Box::new(row),
+            ))];
+        }
+        CallResultUse::Discarded => {}
+        CallResultUse::Open(reason) => {
+            row.result_use = "open";
+            row.result_use_detail = Some(reason.label());
+            row.coverage = if reason == CallResultUseOpenReason::UnsupportedSyntax {
+                EffectCoverage::Unsupported
+            } else {
+                EffectCoverage::Open
+            };
+            row.reason = Some("result_use_unclassified");
+            record_result_obligation_coverage(cache, diagnostics, &outcome.file, row.coverage);
+            return vec![pipeline_expansion(PipelineValue::CallResultObligation(
+                Box::new(row),
+            ))];
+        }
+    }
+
+    row.result_use = "discarded";
+    let (exact_receiver, receiver_owner, basis) = match language {
+        crate::analyzer::Language::TypeScript => (
+            semantic.typescript_exact_builtin_string_receiver(shape),
+            "String",
+            ReviewedObligationBasis::BuiltinReceiverAssumption(
+                ReviewedBuiltinReceiverAssumption::TypeScriptString,
+            ),
+        ),
+        crate::analyzer::Language::JavaScript => (
+            semantic.javascript_exact_string_receiver(shape),
+            "String",
+            ReviewedObligationBasis::ExactLiteralReceiver,
+        ),
+        _ => unreachable!("the JS/TS result-use adapter receives only JS or TS"),
+    };
+    let answer = cache.dispatch_at_source(semantic, &outcome.file, outcome.range);
+    let synthetic_target = if answer.arms.is_empty()
+        && exact_receiver
+        && answer.semantic_unsupported.is_none()
+        && answer.exceeded_limit.is_none()
+        && !matches!(
+            answer.outcome,
+            "cancelled" | "exceeded_budget" | "unsupported" | "ambiguous" | "unproven"
+        ) {
+        outcome.callee_name.as_deref().and_then(|member| {
+            u32::try_from(shape.report.arguments.len())
+                .ok()
+                .and_then(|arity| {
+                    UnmaterializedExternalTarget::new_modeled(
+                        receiver_owner,
+                        member,
+                        SemanticLanguage::Standard(language),
+                        arity,
+                        true,
+                    )
+                })
+        })
+    } else {
+        None
+    };
+    let synthetic_dispatch = synthetic_target.is_some();
+    let arm_targets = if synthetic_dispatch {
+        vec![synthetic_target]
+    } else {
+        answer
+            .arms
+            .iter()
+            .map(|arm| arm.unmaterialized_target.clone())
+            .collect::<Vec<_>>()
+    };
+    row.arm_count = arm_targets.len();
+    row.coverage = if synthetic_dispatch {
+        EffectCoverage::Exhaustive
+    } else {
+        coverage_for(answer.coverage)
+    };
+    let mut common: Option<Vec<CompiledResultUseObligation>> = None;
+    let mut common_basis = None;
+    let mut closes_residual = !arm_targets.is_empty();
+    if arm_targets.is_empty() {
+        row.reason = Some("dispatch_unresolved");
+    } else if matches!(answer.outcome, "cancelled" | "exceeded_budget") {
+        row.reason = Some("dispatch_interrupted");
+    } else if let Some(models) = cache.models(analyzer) {
+        for maybe_target in &arm_targets {
+            let Some(target) = maybe_target.as_ref() else {
+                row.reason = Some("target_unresolved");
+                break;
+            };
+            if target.language() != SemanticLanguage::Standard(language)
+                || target.owner_fqn() != receiver_owner
+                || !target.has_receiver()
+            {
+                row.reason = Some("obligation_unavailable");
+                break;
+            }
+            let matched = models.procedure_summaries_for_external_target(target);
+            let summary = match (matched.disposition, matched.records.as_slice()) {
+                (SemanticModelMatchDisposition::Unique, [summary]) => summary,
+                (SemanticModelMatchDisposition::Conflict, _) => {
+                    row.reason = Some("model_conflict");
+                    break;
+                }
+                _ => {
+                    row.reason = Some("model_unavailable");
+                    break;
+                }
+            };
+            if !reviewed_js_ts_evidence_selected(language, &summary.shard.matched_evidence) {
+                row.reason = Some("artifact_unselected");
+                break;
+            }
+            let binding = match summary.bind_reviewed_result_use_obligations(
+                ReviewedObligationTarget::new(target, &summary.shard.matched_evidence, basis),
+            ) {
+                Ok(binding) => binding,
+                Err(_) => {
+                    row.reason = Some("obligation_unavailable");
+                    break;
+                }
+            };
+            if summary.record.completeness != Completeness::Complete
+                || binding.obligations().iter().any(|obligation| {
+                    obligation.kind == ResultUseObligationKind::PureTransformationValue
+                        && !binding.ordinary_heap_unchanged()
+                })
+                || !binding.covers_overrides()
+            {
+                row.reason = Some("obligation_unavailable");
+                break;
+            }
+            if let Some(existing) = &common {
+                if existing.as_slice() != binding.obligations()
+                    || common_basis != Some(binding.basis())
+                {
+                    row.reason = Some("obligation_conflict");
+                    break;
+                }
+            } else {
+                common = Some(binding.obligations().to_vec());
+                common_basis = Some(binding.basis());
+                row.pack_id = Some(summary.shard.manifest.pack_id.clone());
+                row.model_id = Some(summary.record.model_id.clone());
+                row.summary_id = Some(summary.record.id.clone());
+            }
+            if row.pack_id.as_deref() != Some(summary.shard.manifest.pack_id.as_str())
+                || row.model_id.as_deref() != Some(summary.record.model_id.as_str())
+                || row.summary_id.as_deref() != Some(summary.record.id.as_str())
+            {
+                row.pack_id = None;
+                row.model_id = None;
+                row.summary_id = None;
+            }
+            closes_residual &= binding.covers_overrides();
+            row.modeled_arm_count += 1;
+        }
+    } else {
+        row.reason = Some("model_unavailable");
+    }
+
+    let residuals_are_closable = if synthetic_dispatch {
+        true
+    } else {
+        let contexts_with_arms = answer
+            .arms
+            .iter()
+            .map(|arm| arm.call_context)
+            .collect::<HashSet<_>>();
+        !answer.unnamed_boundaries.is_empty()
+            && !answer.call_contexts.is_empty()
+            && answer
+                .call_contexts
+                .iter()
+                .enumerate()
+                .all(|(index, context)| {
+                    contexts_with_arms.contains(&index)
+                        && matches!(context.unnamed_boundaries.as_slice(), [] | ["unresolved"])
+                })
+    };
+    if row.reason.is_none()
+        && row.coverage == EffectCoverage::Open
+        && residuals_are_closable
+        && closes_residual
+    {
+        row.coverage = EffectCoverage::Exhaustive;
+    }
+    if row.reason.is_none() && row.coverage != EffectCoverage::Exhaustive {
+        row.reason = Some(if row.coverage == EffectCoverage::Truncated {
+            "dispatch_truncated"
+        } else {
+            "dispatch_open"
+        });
+    }
+    if row.reason.is_none() {
+        if let Some(obligations) = common {
+            let basis = common_basis.expect("an obligation set carries its typed basis");
+            let mut expansions = Vec::with_capacity(obligations.len());
+            for obligation in obligations {
+                let mut positive = row.clone();
+                positive.id = result_obligation_row_id(&outcome.site_id, Some(&obligation));
+                positive.result_ordinal = Some(obligation.result_ordinal);
+                positive.obligation_kind = Some(match obligation.kind {
+                    ResultUseObligationKind::PureTransformationValue => "pure_transformation_value",
+                    ResultUseObligationKind::FallibleStatus => "fallible_status",
+                });
+                positive.failure_predicate =
+                    obligation.failure_predicate.map(result_predicate_label);
+                positive.provenance = Some("reviewed");
+                positive.obligation_basis = Some(basis.label());
+                positive.terminal = false;
+                expansions.push(pipeline_expansion(PipelineValue::CallResultObligation(
+                    Box::new(positive),
+                )));
+            }
+            if !expansions.is_empty() {
+                record_result_obligation_coverage(cache, diagnostics, &outcome.file, row.coverage);
+                return expansions;
+            }
+            row.reason = Some("obligation_unavailable");
+        } else {
+            row.coverage = row.coverage.meet(EffectCoverage::Open);
+            row.reason = Some("obligation_unavailable");
+        }
+    } else {
+        row.coverage = row.coverage.meet(EffectCoverage::Open);
+    }
+    record_result_obligation_coverage(cache, diagnostics, &outcome.file, row.coverage);
+    vec![pipeline_expansion(PipelineValue::CallResultObligation(
+        Box::new(row),
+    ))]
+}
+
+const REVIEWED_RUBY_CORE_RESULT_USE_PACK_ID: &str = "bifrost.ruby.core-result-use-obligations";
+
+fn ruby_reviewed_pure_member(member: &str) -> bool {
+    matches!(
+        member,
+        "strip" | "lstrip" | "rstrip" | "downcase" | "upcase" | "sub" | "gsub"
+    )
+}
+
+fn ruby_reviewed_member(member: &str) -> bool {
+    ruby_reviewed_pure_member(member) || member == "system"
+}
+
+fn ruby_core_evidence_selected(evidence: &SemanticModelActivationEvidence) -> bool {
+    evidence.language == "ruby" && evidence.ecosystem == "rubygems"
+}
+
+fn reviewed_js_ts_evidence_selected(
+    language: crate::analyzer::Language,
+    evidence: &crate::analyzer::semantic_model::SemanticModelActivationEvidence,
+) -> bool {
+    let package_matches = |name: &str, version: Option<&str>| {
+        evidence.package.as_ref().is_some_and(|package| {
+            package.name == name
+                && version.is_none_or(|version| {
+                    package
+                        .version
+                        .as_ref()
+                        .is_some_and(|actual| actual.to_string() == version)
+                })
+        })
+    };
+    match language {
+        crate::analyzer::Language::TypeScript => {
+            evidence.language == "typescript"
+                && evidence.ecosystem == "npm"
+                && package_matches("typescript", Some("7.0.2"))
+                && evidence.configuration.as_deref() == Some("typescript-lib:es5")
+                && evidence.artifact_sha256.is_none()
+        }
+        crate::analyzer::Language::JavaScript => {
+            evidence.language == "javascript"
+                && evidence.ecosystem == "npm"
+                && package_matches("pkg:generic/nodejs.org/node@22.11.0", None)
+                && evidence.configuration.as_deref()
+                    == Some("70db7f8c799decb554bc25e8bf410079c8b377f2852ee2a982d56db40f054056")
+                && evidence.artifact_sha256.as_deref()
+                    == Some("24e5130fa7bc1eaab218a0c9cb05e03168fa381bb9e3babddc6a11f655799222")
+        }
+        _ => false,
+    }
+}
+fn ruby_call_result_obligation_expansions(
+    analyzer: &dyn IAnalyzer,
+    semantic: &mut SemanticQueryContext<'_>,
+    cache: &mut EffectTraversalCache,
+    diagnostics: &mut Vec<CodeQueryDiagnostic>,
+    shape: &CallShapeValue,
+) -> Vec<PipelineExpansion> {
+    let outcome = &shape.report.outcome;
+    let mut row = CallResultObligationValue {
+        file: outcome.file.clone(),
+        range: outcome.range,
+        id: result_obligation_row_id(&outcome.site_id, None),
+        site_id: outcome.site_id.clone(),
+        site_ast_id: outcome.site_ast_id.clone(),
+        result_ordinal: None,
+        obligation_kind: None,
+        failure_predicate: None,
+        provenance: None,
+        obligation_basis: None,
+        result_use: "unknown",
+        result_use_detail: None,
+        coverage: EffectCoverage::Open,
+        reason: None,
+        pack_id: None,
+        model_id: None,
+        summary_id: None,
+        arm_count: 0,
+        modeled_arm_count: 0,
+        terminal: true,
+    };
+    let classification = match cache.native_result_use_for_shape(shape) {
+        Ok(site) => site.for_port(0),
+        Err(reason) => {
+            row.result_use = "open";
+            row.result_use_detail = Some(reason.label());
+            row.coverage = if reason == CallResultUseOpenReason::UnsupportedSyntax {
+                EffectCoverage::Unsupported
+            } else {
+                EffectCoverage::Open
+            };
+            row.reason = Some("result_use_unclassified");
+            record_result_obligation_coverage(cache, diagnostics, &outcome.file, row.coverage);
+            return vec![pipeline_expansion(PipelineValue::CallResultObligation(
+                Box::new(row),
+            ))];
+        }
+    };
+    match classification {
+        CallResultUse::Consumed => {
+            row.result_use = "other_context";
+            row.coverage = EffectCoverage::Exhaustive;
+            record_result_obligation_coverage(cache, diagnostics, &outcome.file, row.coverage);
+            return vec![pipeline_expansion(PipelineValue::CallResultObligation(
+                Box::new(row),
+            ))];
+        }
+        CallResultUse::IntentionalDiscard(kind) => {
+            row.result_use = "intentional_discard";
+            row.result_use_detail = Some(kind.label());
+            row.coverage = EffectCoverage::Exhaustive;
+            record_result_obligation_coverage(cache, diagnostics, &outcome.file, row.coverage);
+            return vec![pipeline_expansion(PipelineValue::CallResultObligation(
+                Box::new(row),
+            ))];
+        }
+        CallResultUse::Open(reason) => {
+            row.result_use = "open";
+            row.result_use_detail = Some(reason.label());
+            row.coverage = if reason == CallResultUseOpenReason::UnsupportedSyntax {
+                EffectCoverage::Unsupported
+            } else {
+                EffectCoverage::Open
+            };
+            row.reason = Some("result_use_unclassified");
+            record_result_obligation_coverage(cache, diagnostics, &outcome.file, row.coverage);
+            return vec![pipeline_expansion(PipelineValue::CallResultObligation(
+                Box::new(row),
+            ))];
+        }
+        CallResultUse::Discarded => {}
+    }
+
+    row.result_use = "discarded";
+    let answer = cache.dispatch_at_source(semantic, &outcome.file, outcome.range);
+    let arm_targets = answer
+        .arms
+        .iter()
+        .map(|arm| arm.unmaterialized_target.clone())
+        .collect::<Vec<_>>();
+    row.arm_count = answer.arms.len();
+    row.coverage = coverage_for(answer.coverage);
+
+    // Ruby permits reopening String, so the general dispatch oracle retains a
+    // dynamic-dispatch residual even when its exact resolver proved a literal
+    // (or another structured String fact). The reviewed builtin-receiver basis
+    // is the explicit policy contract that closes that one residual; it does
+    // not apply to subclasses, unknown values, or non-resolver-owned targets.
+    let ruby_builtin_receiver_assumption =
+        ruby_reviewed_pure_member(outcome.callee_name.as_deref().unwrap_or_default())
+            && matches!(answer.outcome, "resolved" | "unproven")
+            && answer.exceeded_limit.is_none()
+            && answer.arms.len() == 1
+            && !answer.unnamed_boundaries.is_empty()
+            && answer
+                .unnamed_boundaries
+                .iter()
+                .all(|boundary| matches!(*boundary, "unresolved" | "truncated"))
+            && answer.arms[0].target_unit.is_none()
+            && answer.arms[0]
+                .unmaterialized_target
+                .as_ref()
+                .is_some_and(|target| {
+                    target.language().semantic_pack_label() == "ruby"
+                        && target.owner_fqn() == "String"
+                        && target.has_receiver()
+                        && target.has_resolver_owned_call_shape()
+                });
+    if ruby_builtin_receiver_assumption {
+        row.coverage = EffectCoverage::Exhaustive;
+    }
+
+    // A same-named workspace implementation is a complete negative. It must
+    // not inherit a core-library obligation merely because its member name is
+    // also one of the reviewed Ruby spellings.
+    let workspace_only = answer.outcome == "resolved"
+        && answer.coverage.is_exhaustive()
+        && answer.unnamed_boundaries.is_empty()
+        && !answer.arms.is_empty()
+        && answer
+            .arms
+            .iter()
+            .all(|arm| arm.target_unit.is_some() && arm.unmaterialized_target.is_none());
+    if workspace_only {
+        row.coverage = EffectCoverage::Exhaustive;
+        record_result_obligation_coverage(cache, diagnostics, &outcome.file, row.coverage);
+        return vec![pipeline_expansion(PipelineValue::CallResultObligation(
+            Box::new(row),
+        ))];
+    }
+
+    let mut common: Option<Vec<CompiledResultUseObligation>> = None;
+    let mut common_basis = None;
+    let mut closes_residual = !arm_targets.is_empty();
+    if arm_targets.is_empty() {
+        row.reason = Some("dispatch_unresolved");
+    } else if matches!(answer.outcome, "cancelled" | "exceeded_budget") {
+        row.reason = Some("dispatch_interrupted");
+    } else if let Some(models) = cache.models(analyzer) {
+        for maybe_target in &arm_targets {
+            let Some(target) = maybe_target.as_ref() else {
+                row.reason = Some("target_unresolved");
+                break;
+            };
+            let member = target.member();
+            if !ruby_reviewed_member(member) {
+                row.reason = Some("obligation_unavailable");
+                break;
+            }
+            let is_pure = ruby_reviewed_pure_member(member);
+            let target_matches = if is_pure {
+                target.owner_fqn() == "String" && target.has_receiver()
+            } else if member == "system" {
+                target.owner_fqn() == "Kernel"
+            } else {
+                false
+            };
+            if !target_matches || target.language().semantic_pack_label() != "ruby" {
+                row.reason = Some("obligation_unavailable");
+                break;
+            }
+            let matched = models.procedure_summaries_for_external_target(target);
+            let records = matched
+                .records
+                .into_iter()
+                .filter(|summary| {
+                    summary.shard.manifest.pack_id == REVIEWED_RUBY_CORE_RESULT_USE_PACK_ID
+                })
+                .collect::<Vec<_>>();
+            let summary = match records.as_slice() {
+                [summary] => summary,
+                [] => {
+                    row.reason = Some("model_unavailable");
+                    break;
+                }
+                _ => {
+                    row.reason = Some("model_conflict");
+                    break;
+                }
+            };
+            let evidence = &summary.shard.matched_evidence;
+            if !ruby_core_evidence_selected(evidence)
+                || summary.shard.manifest.language != "ruby"
+                || summary.shard.manifest.ecosystem != "rubygems"
+            {
+                row.reason = Some("artifact_unselected");
+                break;
+            }
+            let basis = if is_pure {
+                ReviewedObligationBasis::BuiltinReceiverAssumption(
+                    ReviewedBuiltinReceiverAssumption::RubyString,
+                )
+            } else {
+                ReviewedObligationBasis::DispatchAgreement
+            };
+            let binding = match summary.bind_reviewed_result_use_obligations(
+                ReviewedObligationTarget::new(target, evidence, basis),
+            ) {
+                Ok(binding) => binding,
+                Err(_) => {
+                    row.reason = Some("obligation_unavailable");
+                    break;
+                }
+            };
+            if summary.record.completeness != Completeness::Complete
+                || !binding.covers_overrides()
+                || binding.obligations().iter().any(|obligation| {
+                    obligation.kind == ResultUseObligationKind::PureTransformationValue
+                        && !binding.ordinary_heap_unchanged()
+                })
+            {
+                row.reason = Some("obligation_unavailable");
+                break;
+            }
+            if let Some(existing) = &common {
+                if existing.as_slice() != binding.obligations()
+                    || common_basis != Some(binding.basis())
+                {
+                    row.reason = Some("obligation_conflict");
+                    break;
+                }
+            } else {
+                common = Some(binding.obligations().to_vec());
+                common_basis = Some(binding.basis());
+                row.pack_id = Some(summary.shard.manifest.pack_id.clone());
+                row.model_id = Some(summary.record.model_id.clone());
+                row.summary_id = Some(summary.record.id.clone());
+            }
+            if row.pack_id.as_deref() != Some(summary.shard.manifest.pack_id.as_str())
+                || row.model_id.as_deref() != Some(summary.record.model_id.as_str())
+                || row.summary_id.as_deref() != Some(summary.record.id.as_str())
+            {
+                row.pack_id = None;
+                row.model_id = None;
+                row.summary_id = None;
+            }
+            closes_residual &= binding.covers_overrides();
+            row.modeled_arm_count += 1;
+        }
+    } else {
+        row.reason = Some("model_unavailable");
+    }
+
+    let contexts_with_arms = answer
+        .arms
+        .iter()
+        .map(|arm| arm.call_context)
+        .collect::<HashSet<_>>();
+    let residuals_are_closable = !answer.unnamed_boundaries.is_empty()
+        && !answer.call_contexts.is_empty()
+        && answer
+            .call_contexts
+            .iter()
+            .enumerate()
+            .all(|(index, context)| {
+                contexts_with_arms.contains(&index)
+                    && matches!(context.unnamed_boundaries.as_slice(), [] | ["unresolved"])
+            });
+    if row.reason.is_none()
+        && row.coverage == EffectCoverage::Open
+        && residuals_are_closable
+        && closes_residual
+    {
+        row.coverage = EffectCoverage::Exhaustive;
+    }
+    if row.reason.is_none() && row.coverage != EffectCoverage::Exhaustive {
+        row.reason = Some(if row.coverage == EffectCoverage::Truncated {
+            "dispatch_truncated"
+        } else {
+            "dispatch_open"
+        });
+    }
+    if row.reason.is_none() {
+        if let Some(obligations) = common {
+            let basis = common_basis.expect("an obligation set carries its typed basis");
+            let mut expansions = Vec::with_capacity(obligations.len());
+            for obligation in obligations {
+                let mut positive = row.clone();
+                positive.id = result_obligation_row_id(&outcome.site_id, Some(&obligation));
+                positive.result_ordinal = Some(obligation.result_ordinal);
+                positive.obligation_kind = Some(match obligation.kind {
+                    ResultUseObligationKind::PureTransformationValue => "pure_transformation_value",
+                    ResultUseObligationKind::FallibleStatus => "fallible_status",
+                });
+                positive.failure_predicate =
+                    obligation.failure_predicate.map(result_predicate_label);
+                positive.provenance = Some("reviewed");
+                positive.obligation_basis = Some(basis.label());
+                positive.terminal = false;
+                expansions.push(pipeline_expansion(PipelineValue::CallResultObligation(
+                    Box::new(positive),
+                )));
+            }
+            if !expansions.is_empty() {
+                record_result_obligation_coverage(cache, diagnostics, &outcome.file, row.coverage);
+                return expansions;
+            }
+            row.reason = Some("obligation_unavailable");
+        } else {
+            row.coverage = row.coverage.meet(EffectCoverage::Open);
+            row.reason = Some("obligation_unavailable");
+        }
+    } else {
+        row.coverage = row.coverage.meet(EffectCoverage::Open);
+    }
+    record_result_obligation_coverage(cache, diagnostics, &outcome.file, row.coverage);
+    vec![pipeline_expansion(PipelineValue::CallResultObligation(
+        Box::new(row),
+    ))]
+}
+
+/// A result-use obligation is a positive only when the exact Java call is an
+/// discarded expression or adapts to a void functional method, and every
+/// feasible dispatch arm binds the same
+/// reviewed obligation from that arm's selected JDK artifact. Native adapter
+/// rows use the same relation for syntax-only per-port classification.
+fn php_call_result_obligation_expansions(
+    analyzer: &dyn IAnalyzer,
+    semantic: &mut SemanticQueryContext<'_>,
+    cache: &mut EffectTraversalCache,
+    diagnostics: &mut Vec<CodeQueryDiagnostic>,
+    shape: &CallShapeValue,
+) -> Vec<PipelineExpansion> {
+    let outcome = &shape.report.outcome;
+    // PHP functions are selected by their resolved callable name. The
+    // dispatch answer below is still required to prove the synthetic global
+    // owner, so a workspace function with the same name is a complete
+    // near-miss rather than an open reviewed obligation.
+    if !php_call_selected(outcome.callee_name.as_deref()) {
+        return Vec::new();
+    }
+    let mut row = CallResultObligationValue {
+        file: outcome.file.clone(),
+        range: outcome.range,
+        id: result_obligation_row_id(&outcome.site_id, None),
+        site_id: outcome.site_id.clone(),
+        site_ast_id: outcome.site_ast_id.clone(),
+        result_ordinal: None,
+        obligation_kind: None,
+        failure_predicate: None,
+        provenance: None,
+        obligation_basis: None,
+        result_use: "unknown",
+        result_use_detail: None,
+        coverage: EffectCoverage::Open,
+        reason: None,
+        pack_id: None,
+        model_id: None,
+        summary_id: None,
+        arm_count: 0,
+        modeled_arm_count: 0,
+        terminal: true,
+    };
+    let classification = match cache.native_result_use_for_shape(shape) {
+        Ok(site) => site.for_port(0),
+        Err(reason) => {
+            row.result_use = "open";
+            row.result_use_detail = Some(reason.label());
+            row.coverage = if reason == CallResultUseOpenReason::UnsupportedSyntax {
+                EffectCoverage::Unsupported
+            } else {
+                EffectCoverage::Open
+            };
+            row.reason = Some("result_use_unclassified");
+            record_result_obligation_coverage(cache, diagnostics, &outcome.file, row.coverage);
+            return vec![pipeline_expansion(PipelineValue::CallResultObligation(
+                Box::new(row),
+            ))];
+        }
+    };
+    match classification {
+        CallResultUse::Consumed => {
+            row.result_use = "other_context";
+            row.coverage = EffectCoverage::Exhaustive;
+            record_result_obligation_coverage(cache, diagnostics, &outcome.file, row.coverage);
+            return vec![pipeline_expansion(PipelineValue::CallResultObligation(
+                Box::new(row),
+            ))];
+        }
+        CallResultUse::IntentionalDiscard(kind) => {
+            row.result_use = "intentional_discard";
+            row.result_use_detail = Some(kind.label());
+            row.coverage = EffectCoverage::Exhaustive;
+            record_result_obligation_coverage(cache, diagnostics, &outcome.file, row.coverage);
+            return vec![pipeline_expansion(PipelineValue::CallResultObligation(
+                Box::new(row),
+            ))];
+        }
+        CallResultUse::Open(reason) => {
+            row.result_use = "open";
+            row.result_use_detail = Some(reason.label());
+            row.reason = Some("result_use_unclassified");
+            record_result_obligation_coverage(cache, diagnostics, &outcome.file, row.coverage);
+            return vec![pipeline_expansion(PipelineValue::CallResultObligation(
+                Box::new(row),
+            ))];
+        }
+        CallResultUse::Discarded => {}
+    }
+    row.result_use = "discarded";
+
+    let answer = cache.dispatch_at_source(semantic, &outcome.file, outcome.range);
+    let arm_targets = answer
+        .arms
+        .iter()
+        .map(|arm| arm.unmaterialized_target.clone())
+        .collect::<Vec<_>>();
+    // The PHP resolver's global-function identity is a resolver-owned
+    // synthetic target: it has no workspace declaration, but the ordered
+    // namespace lookup has proved the global fallback. Treat that modeled
+    // external arm like Python's synthetic builtin arm when deciding whether
+    // the external residual is discharged. Unresolved or ambiguous calls do
+    // not satisfy this shape and retain their open coverage.
+    let synthetic_dispatch = !arm_targets.is_empty()
+        && answer.unnamed_boundaries.is_empty()
+        && answer
+            .call_contexts
+            .iter()
+            .all(|context| context.unnamed_boundaries.is_empty())
+        && answer.arms.iter().all(|arm| {
+            arm.target_unit.is_none()
+                && arm.unmaterialized_target.as_ref().is_some_and(|target| {
+                    target.language().semantic_pack_label() == "php"
+                        && php_reviewed_owner(target.owner_fqn(), target.member())
+                        && !target.has_receiver()
+                })
+        });
+    row.arm_count = answer.arms.len();
+    row.coverage = if synthetic_dispatch {
+        EffectCoverage::Exhaustive
+    } else {
+        coverage_for(answer.coverage)
+    };
+    let workspace_only = answer.outcome == "resolved"
+        && answer.coverage.is_exhaustive()
+        && answer.unnamed_boundaries.is_empty()
+        && !answer.arms.is_empty()
+        && answer
+            .arms
+            .iter()
+            .all(|arm| arm.target_unit.is_some() && arm.unmaterialized_target.is_none());
+    if workspace_only {
+        row.coverage = EffectCoverage::Exhaustive;
+        record_result_obligation_coverage(cache, diagnostics, &outcome.file, row.coverage);
+        return vec![pipeline_expansion(PipelineValue::CallResultObligation(
+            Box::new(row),
+        ))];
+    }
+
+    let mut common: Option<Vec<CompiledResultUseObligation>> = None;
+    let closes_residual = !arm_targets.is_empty();
+    if arm_targets.is_empty() {
+        row.reason = Some("dispatch_unresolved");
+    } else if matches!(answer.outcome, "cancelled" | "exceeded_budget") {
+        row.reason = Some("dispatch_interrupted");
+    } else if let Some(models) = cache.models(analyzer) {
+        for maybe_target in &arm_targets {
+            let Some(target) = maybe_target.as_ref() else {
+                row.reason = Some("target_unresolved");
+                break;
+            };
+            if target.language().semantic_pack_label() != "php"
+                || !php_reviewed_owner(target.owner_fqn(), target.member())
+                || target.has_receiver()
+            {
+                row.reason = Some("obligation_unavailable");
+                break;
+            }
+            let matched = models.procedure_summaries_for_external_target(target);
+            let summary = match (matched.disposition, matched.records.as_slice()) {
+                (SemanticModelMatchDisposition::Unique, [summary]) => summary,
+                (SemanticModelMatchDisposition::Conflict, _) => {
+                    row.reason = Some("model_conflict");
+                    break;
+                }
+                _ => {
+                    row.reason = Some("model_unavailable");
+                    break;
+                }
+            };
+            let evidence = &summary.shard.matched_evidence;
+            if !php_builtin_evidence(evidence) {
+                row.reason = Some("artifact_unselected");
+                break;
+            }
+            let binding =
+                match summary.bind_reviewed_result_use_obligations(ReviewedObligationTarget::new(
+                    target,
+                    evidence,
+                    ReviewedObligationBasis::DispatchAgreement,
+                )) {
+                    Ok(binding) => binding,
+                    Err(_) => {
+                        row.reason = Some("obligation_unavailable");
+                        break;
+                    }
+                };
+            if summary.record.completeness != Completeness::Complete
+                || binding.obligations().iter().any(|obligation| {
+                    obligation.kind == ResultUseObligationKind::PureTransformationValue
+                        && !binding.ordinary_heap_unchanged()
+                })
+            {
+                row.reason = Some("obligation_unavailable");
+                break;
+            }
+            if let Some(existing) = &common {
+                if existing.as_slice() != binding.obligations() {
+                    row.reason = Some("obligation_conflict");
+                    break;
+                }
+            } else {
+                common = Some(binding.obligations().to_vec());
+                row.pack_id = Some(summary.shard.manifest.pack_id.clone());
+                row.model_id = Some(summary.record.model_id.clone());
+                row.summary_id = Some(summary.record.id.clone());
+            }
+            if row.pack_id.as_deref() != Some(summary.shard.manifest.pack_id.as_str())
+                || row.model_id.as_deref() != Some(summary.record.model_id.as_str())
+                || row.summary_id.as_deref() != Some(summary.record.id.as_str())
+            {
+                row.pack_id = None;
+                row.model_id = None;
+                row.summary_id = None;
+            }
+            row.modeled_arm_count += 1;
+        }
+    } else {
+        row.reason = Some("model_unavailable");
+    }
+
+    let contexts_with_arms = answer
+        .arms
+        .iter()
+        .map(|arm| arm.call_context)
+        .collect::<HashSet<_>>();
+    let residuals_are_closable = if synthetic_dispatch {
+        true
+    } else {
+        !answer.unnamed_boundaries.is_empty()
+            && !answer.call_contexts.is_empty()
+            && answer
+                .call_contexts
+                .iter()
+                .enumerate()
+                .all(|(index, context)| {
+                    contexts_with_arms.contains(&index)
+                        && matches!(context.unnamed_boundaries.as_slice(), [] | ["unresolved"])
+                })
+    };
+    if row.reason.is_none()
+        && row.coverage == EffectCoverage::Open
+        && residuals_are_closable
+        && closes_residual
+    {
+        row.coverage = EffectCoverage::Exhaustive;
+    }
+    if row.reason.is_none() && row.coverage != EffectCoverage::Exhaustive {
+        row.reason = Some(if row.coverage == EffectCoverage::Truncated {
+            "dispatch_truncated"
+        } else {
+            "dispatch_open"
+        });
+    }
+    if row.reason.is_none()
+        && let Some(obligations) = common
+    {
+        let mut expansions = Vec::with_capacity(obligations.len());
+        for obligation in obligations {
+            let mut projected = row.clone();
+            projected.id = result_obligation_row_id(&outcome.site_id, Some(&obligation));
+            projected.result_ordinal = Some(obligation.result_ordinal);
+            projected.obligation_kind = Some(match obligation.kind {
+                ResultUseObligationKind::PureTransformationValue => "pure_transformation_value",
+                ResultUseObligationKind::FallibleStatus => "fallible_status",
+            });
+            projected.failure_predicate = obligation.failure_predicate.map(result_predicate_label);
+            projected.provenance = Some("reviewed");
+            projected.obligation_basis = Some(ReviewedObligationBasis::DispatchAgreement.label());
+            projected.terminal = false;
+            expansions.push(pipeline_expansion(PipelineValue::CallResultObligation(
+                Box::new(projected),
+            )));
+        }
+        if !expansions.is_empty() {
+            record_result_obligation_coverage(cache, diagnostics, &outcome.file, row.coverage);
+            return expansions;
+        }
+        row.reason = Some("obligation_unavailable");
+    } else if row.reason.is_none() {
+        row.coverage = row.coverage.meet(EffectCoverage::Open);
+        row.reason = Some("obligation_unavailable");
+    } else {
+        row.coverage = row.coverage.meet(EffectCoverage::Open);
+    }
+    record_result_obligation_coverage(cache, diagnostics, &outcome.file, row.coverage);
+    vec![pipeline_expansion(PipelineValue::CallResultObligation(
+        Box::new(row),
+    ))]
+}
+
+fn php_reviewed_member(member: &str) -> bool {
+    matches!(
+        member,
+        "trim"
+            | "ltrim"
+            | "rtrim"
+            | "strtolower"
+            | "strtoupper"
+            | "str_replace"
+            | "substr"
+            | "file_put_contents"
+            | "mkdir"
+            | "unlink"
+            | "rename"
+            | "fclose"
+            | "fwrite"
+    )
+}
+
+fn php_call_selected(callee_name: Option<&str>) -> bool {
+    match callee_name {
+        Some(name) if php_reviewed_member(name) || name == "call_user_func" => true,
+        // A dynamic callable has no resolved member name. Keep it as an open
+        // row because it may invoke one of the reviewed global functions;
+        // unrelated resolved names (sprintf, json_encode, and user APIs) do
+        // not enter this relation.
+        Some(name) => name.starts_with('$'),
+        None => true,
+    }
+}
+
+fn php_reviewed_owner(owner: &str, member: &str) -> bool {
+    owner == "_php_global_" && php_reviewed_member(member)
+}
+
+fn php_builtin_evidence(evidence: &SemanticModelActivationEvidence) -> bool {
+    evidence.language == "php"
+        && evidence.ecosystem == "php"
+        && evidence.package.is_none()
+        && evidence.module.is_none()
+        && evidence.target.is_none()
+        && evidence.configuration.is_none()
+        && evidence.artifact_sha256.is_none()
+        && evidence
+            .toolchain
+            .as_ref()
+            .is_some_and(|toolchain| toolchain.name == "php" && toolchain.version.is_some())
+}
+
+pub(super) fn call_result_obligation_expansions(
+    analyzer: &dyn IAnalyzer,
+    semantic: &mut SemanticQueryContext<'_>,
+    cache: &mut EffectTraversalCache,
+    diagnostics: &mut Vec<CodeQueryDiagnostic>,
+    shape: &CallShapeValue,
+) -> Vec<PipelineExpansion> {
+    let outcome = &shape.report.outcome;
+    let language = crate::analyzer::common::language_for_file(&outcome.file);
+    if language == crate::analyzer::Language::Go {
+        return native_go_call_result_obligation_expansions(
+            analyzer,
+            semantic,
+            cache,
+            diagnostics,
+            shape,
+        );
+    }
+    if language == crate::analyzer::Language::Rust {
+        return native_rust_call_result_obligation_expansions(
+            analyzer,
+            semantic,
+            cache,
+            diagnostics,
+            shape,
+        );
+    }
+    if language == crate::analyzer::Language::Cpp {
+        return native_cpp_call_result_obligation_expansions(
+            analyzer,
+            semantic,
+            cache,
+            diagnostics,
+            shape,
+        );
+    }
+    if language == crate::analyzer::Language::Python {
+        return python_call_result_obligation_expansions(
+            analyzer,
+            semantic,
+            cache,
+            diagnostics,
+            shape,
+        );
+    }
+    if matches!(
+        language,
+        crate::analyzer::Language::JavaScript | crate::analyzer::Language::TypeScript
+    ) {
+        return javascript_typescript_call_result_obligation_expansions(
+            analyzer,
+            semantic,
+            cache,
+            diagnostics,
+            shape,
+        );
+    }
+    if language == crate::analyzer::Language::CSharp {
+        return csharp_call_result_obligation_expansions(
+            analyzer,
+            semantic,
+            cache,
+            diagnostics,
+            shape,
+        );
+    }
+    if language == crate::analyzer::Language::Php {
+        return php_call_result_obligation_expansions(
+            analyzer,
+            semantic,
+            cache,
+            diagnostics,
+            shape,
+        );
+    }
+    if language == crate::analyzer::Language::Ruby {
+        return ruby_call_result_obligation_expansions(
+            analyzer,
+            semantic,
+            cache,
+            diagnostics,
+            shape,
+        );
+    }
+    let mut row = CallResultObligationValue {
+        file: outcome.file.clone(),
+        range: outcome.range,
+        id: result_obligation_row_id(&outcome.site_id, None),
+        site_id: outcome.site_id.clone(),
+        site_ast_id: outcome.site_ast_id.clone(),
+        result_ordinal: None,
+        obligation_kind: None,
+        failure_predicate: None,
+        provenance: None,
+        obligation_basis: None,
+        result_use: "unknown",
+        result_use_detail: None,
+        coverage: EffectCoverage::Open,
+        reason: None,
+        pack_id: None,
+        model_id: None,
+        summary_id: None,
+        arm_count: 0,
+        modeled_arm_count: 0,
+        terminal: true,
+    };
+    if language != crate::analyzer::Language::Java {
+        row.result_use = "open";
+        row.result_use_detail = Some(CallResultUseOpenReason::UnsupportedSyntax.label());
         row.coverage = EffectCoverage::Unsupported;
         row.reason = Some("unsupported_language");
     } else {
-        match cache.java_result_use_for_shape(analyzer, semantic, shape) {
-            Ok(JavaCallResultUse::OtherContext) => {
+        match cache.java_result_use_site_for_shape(analyzer, semantic, shape) {
+            Ok(site) if matches!(site.for_port(0), CallResultUse::Consumed) => {
                 row.result_use = "other_context";
                 row.coverage = EffectCoverage::Exhaustive;
             }
             Err(_) => row.reason = Some("result_use_unclassified"),
-            Ok(JavaCallResultUse::Discarded) => {
+            Ok(site) if matches!(site.for_port(0), CallResultUse::Discarded) => {
                 row.result_use = "discarded";
                 let answer = cache.dispatch_at_source(semantic, &outcome.file, outcome.range);
                 row.arm_count = answer.arms.len();
@@ -3213,11 +6438,14 @@ pub(super) fn call_result_obligation_expansions(
                     });
                     row.failure_predicate =
                         obligation.failure_predicate.map(result_predicate_label);
+                    row.provenance = Some("reviewed");
+                    row.obligation_basis = Some("dispatch_agreement");
                     row.terminal = false;
                 } else {
                     row.coverage = row.coverage.meet(EffectCoverage::Open);
                 }
             }
+            Ok(_) => row.reason = Some("result_use_unclassified"),
         }
     }
     record_result_obligation_coverage(cache, diagnostics, &outcome.file, row.coverage);
@@ -3245,6 +6473,50 @@ fn result_obligation_row_id(
     digest.finish().to_string()
 }
 
+fn result_use_row_id(site_id: &str, result_ordinal: u32) -> String {
+    let mut digest = LengthDelimitedDigest::new(CALL_RESULT_OBLIGATION_ID_DOMAIN);
+    digest.push(site_id.as_bytes());
+    digest.push(b"result_use");
+    digest.push(&result_ordinal.to_le_bytes());
+    digest.finish().to_string()
+}
+
+#[allow(clippy::too_many_arguments)]
+fn validate_result_contract_value_uses(
+    analyzer: &dyn IAnalyzer,
+    workspace: &WorkspaceAnalyzer,
+    semantic: &mut SemanticQueryContext<'_>,
+    cache: &mut EffectTraversalCache,
+    flow_state_cache: &mut FlowStateTraversalCache,
+    limits: CodeQueryExecutionLimits,
+    cancellation: Option<&CancellationToken>,
+    diagnostics: &mut Vec<CodeQueryDiagnostic>,
+    value: &CallResultContractValue,
+    contract: &CompiledResultContract,
+) -> ResultContractUseValidation {
+    let validation = validate_result_contract_uses(
+        analyzer,
+        workspace,
+        semantic,
+        cache,
+        flow_state_cache,
+        limits,
+        cancellation,
+        &value.file,
+        value.range,
+        &value.site_id,
+        &value.site_ast_id,
+        value.modeled_target.as_ref(),
+        contract,
+        value.coverage,
+        &value.success_guard_edges,
+    );
+    if validation.coverage != EffectCoverage::Exhaustive {
+        record_result_contract_use_coverage(cache, diagnostics, &value.file, validation.coverage);
+    }
+    validation
+}
+
 /// Add resource-use validation to one already projected result contract. The
 /// contract row and its source identity are preserved; only the optional use
 /// fields are populated. Model projection and lifecycle composition therefore
@@ -3266,7 +6538,7 @@ pub(super) fn result_contract_use_expansions(
             Box::new(value.clone()),
         ))];
     };
-    let validation = validate_result_contract_uses(
+    let validation = validate_result_contract_value_uses(
         analyzer,
         workspace,
         semantic,
@@ -3274,18 +6546,10 @@ pub(super) fn result_contract_use_expansions(
         flow_state_cache,
         limits,
         cancellation,
-        &value.file,
-        value.range,
-        &value.site_id,
-        &value.site_ast_id,
-        value.modeled_target.as_ref(),
+        diagnostics,
+        value,
         &contract,
-        value.coverage,
-        &value.success_guard_edges,
     );
-    if validation.coverage != EffectCoverage::Exhaustive {
-        record_result_contract_use_coverage(cache, diagnostics, &value.file, validation.coverage);
-    }
     let mut enriched = value.clone();
     enriched.result_use_count = Some(validation.use_count);
     enriched.unguarded_result_use_count = validation.unguarded_use_count;
@@ -3315,7 +6579,7 @@ pub(super) fn result_contract_operation_use_expansions(
     let Some(contract) = projected_result_contract(value) else {
         return Vec::new();
     };
-    let validation = validate_result_contract_uses(
+    let validation = validate_result_contract_value_uses(
         analyzer,
         workspace,
         semantic,
@@ -3323,18 +6587,10 @@ pub(super) fn result_contract_operation_use_expansions(
         flow_state_cache,
         limits,
         cancellation,
-        &value.file,
-        value.range,
-        &value.site_id,
-        &value.site_ast_id,
-        value.modeled_target.as_ref(),
+        diagnostics,
+        value,
         &contract,
-        value.coverage,
-        &value.success_guard_edges,
     );
-    if validation.coverage != EffectCoverage::Exhaustive {
-        record_result_contract_use_coverage(cache, diagnostics, &value.file, validation.coverage);
-    }
     validation
         .uses
         .into_iter()
@@ -3402,10 +6658,7 @@ fn complete_modeled_call_facts(
         .lookups
         .get(&shape.outcome.site_id)?
         .clone();
-    if answer.coverage != ModeledCallTargetCoverage::Exhaustive
-        || !answer.adjudicable_workspace_names.is_empty()
-        || answer.arms.is_empty()
-    {
+    if answer.coverage != ModeledCallTargetCoverage::Exhaustive || answer.arms.is_empty() {
         return None;
     }
     let mut common_writes = None::<Vec<CompiledConditionalIndirectWrite>>;
@@ -3472,10 +6725,7 @@ fn modeled_call_proves_normal_continuation_absent(
     else {
         return false;
     };
-    if lookup.coverage != ModeledCallTargetCoverage::Exhaustive
-        || !lookup.adjudicable_workspace_names.is_empty()
-        || lookup.arms.is_empty()
-    {
+    if lookup.coverage != ModeledCallTargetCoverage::Exhaustive || lookup.arms.is_empty() {
         return false;
     }
     let Some(models) = cache.models(analyzer) else {
@@ -3492,6 +6742,13 @@ fn modeled_call_proves_normal_continuation_absent(
             ),
         )
     })
+}
+
+/// Whether a dialect has a nilness producer. Only Go does. The query preflight
+/// reports every other language as unsupported coverage (#3803) so an empty
+/// producer result is never mistaken for a complete answer.
+pub(super) fn nilness_supports_dialect(dialect: crate::analyzer::LanguageDialect) -> bool {
+    dialect == crate::analyzer::LanguageDialect::Standard(crate::analyzer::Language::Go)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3513,9 +6770,7 @@ pub(super) fn nilness_operation_expansions(
     };
 
     let semantics = procedure.handle.semantics();
-    if semantics.locator().language()
-        != crate::analyzer::LanguageDialect::Standard(crate::analyzer::Language::Go)
-    {
+    if !nilness_supports_dialect(semantics.locator().language()) {
         return Vec::new();
     }
     let file = procedure.file();
@@ -3586,7 +6841,7 @@ pub(super) fn nilness_operation_expansions(
             continue;
         };
         if !receiver_requires_non_null(preconditions.as_deref())
-            || shape.outcome.coverage != CallShapeCoverage::Exact
+            || !shape.outcome.coverage.is_exact()
             || shape.outcome.call_kind != CallKind::Method
         {
             continue;
@@ -3690,10 +6945,13 @@ pub(super) fn nilness_operation_expansions(
         .call_sites()
         .iter()
         .filter_map(shape_for_call)
-        .filter(|shape| shape.outcome.coverage == CallShapeCoverage::Exact)
+        .filter(|shape| shape.outcome.coverage.is_exact())
         .map(|shape| CallShapeValue {
             report: Arc::new(shape.clone()),
+            seed: None,
             source: None,
+            facts: None,
+            resolved_external_callee: None,
         })
         .collect::<Vec<_>>();
     for shape in contract_shapes {
@@ -3756,6 +7014,11 @@ pub(super) fn nilness_operation_expansions(
             let fact = candidate
                 .fact
                 .unwrap_or_else(|| scalar.fact_at(candidate.point, candidate.subject));
+            let fact = if fact == ScalarFact::Unconstrained {
+                ScalarFact::Unknown
+            } else {
+                fact
+            };
             (candidate, fact)
         })
         .collect::<Vec<_>>();
@@ -3919,7 +7182,32 @@ pub(super) fn detached_task_transfer_expansions(
 ) -> Vec<PipelineExpansion> {
     let semantics = procedure.handle.semantics();
     let procedure_id = procedure.wire_id();
-    brokk_bifrost_flow::detached_task::detached_task_transfers(semantics)
+    let mut transfers = brokk_bifrost_flow::detached_task::detached_task_transfers(semantics);
+    for spawn in semantic.modeled_task_spawns(procedure) {
+        let call = semantics
+            .call_site(spawn.call.id())
+            .expect("validated modeled task spawn call resolves");
+        for capture in semantics.captures().iter().filter(|capture| {
+            capture.callable == spawn.callable
+                && matches!(capture.mode, CaptureMode::Value | CaptureMode::Move)
+        }) {
+            let CaptureSource::Value(value) = capture.captured else {
+                continue;
+            };
+            let transfer = brokk_bifrost_flow::detached_task::DetachedTaskTransfer {
+                call_site: call.id,
+                point: call.point,
+                observation_point: capture.point,
+                value,
+                role: brokk_bifrost_flow::detached_task::DetachedTransferRole::Capture,
+                ordinal: Some(capture.destination.get()),
+            };
+            if !transfers.contains(&transfer) {
+                transfers.push(transfer);
+            }
+        }
+    }
+    transfers
         .into_iter()
         .map(|transfer| {
             let call = procedure
@@ -4029,6 +7317,94 @@ struct FailureUseOrigin {
     closed: bool,
 }
 
+fn failure_use_consumer_point_id(
+    procedure: &crate::analyzer::semantic::ProcedureHandle,
+    candidate: &FailureUseCandidate,
+    expectation: &'static str,
+) -> String {
+    super::semantic::program_point_wire_id(
+        &procedure.point_handle(candidate.point).expect(expectation),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn result_contract_failure_use_expansion(
+    value: &CallResultContractValue,
+    procedure_id: &str,
+    candidate: &FailureUseCandidate,
+    consumer_point_id: String,
+    condition_result_ordinal: u32,
+    condition_value: Option<crate::analyzer::semantic::ValueId>,
+    failure_edge_id: Option<String>,
+    origin: Option<FailureUseOrigin>,
+    provenance: crate::query::FailureUseProvenance,
+    closed: bool,
+    fallback_range: Range,
+) -> PipelineExpansion {
+    let id = result_contract_failure_use_row_id(
+        &value.id,
+        failure_edge_id.as_deref(),
+        &consumer_point_id,
+        candidate.consumer_call_id.as_deref(),
+        candidate.consumer_site_id.as_deref(),
+        candidate.operand,
+        candidate.consumer,
+        candidate.argument_ordinal,
+    );
+    let (range, ast_id, binding_value_id, establishment_point_id, establishment_value_id) =
+        match origin {
+            Some(origin) => (
+                origin.range,
+                origin.ast_id,
+                origin.binding.map(|value| u64::from(value.get())),
+                origin.establishment_point_id,
+                origin
+                    .establishment_value
+                    .map(|value| u64::from(value.get())),
+            ),
+            None => (fallback_range, None, None, None, None),
+        };
+    pipeline_expansion(PipelineValue::ResultContractFailureUse(Box::new(
+        ResultContractFailureUseValue {
+            file: value.file.clone(),
+            range,
+            ast_id,
+            id,
+            acquisition_id: value.id.clone(),
+            acquisition_site_id: value.site_id.clone(),
+            acquisition_site_ast_id: value.site_ast_id.clone(),
+            procedure_id: procedure_id.to_owned(),
+            condition_result_ordinal,
+            condition_value_id: condition_value.map(|value| u64::from(value.get())),
+            failure_edge_id,
+            consumer_point_id,
+            consumer_call_id: candidate.consumer_call_id.clone(),
+            consumer_site_id: candidate.consumer_site_id.clone(),
+            consumer_site_ast_id: candidate.consumer_site_ast_id.clone(),
+            operand_value_id: u64::from(candidate.operand.get()),
+            binding_value_id,
+            establishment_point_id,
+            establishment_value_id,
+            provenance,
+            consumer: candidate.consumer,
+            argument_ordinal: candidate.argument_ordinal,
+            proof: if closed {
+                EffectProof::Proven
+            } else {
+                EffectProof::Unproven
+            },
+            coverage: if closed {
+                EffectCoverage::Exhaustive
+            } else {
+                EffectCoverage::Open
+            },
+            pack_id: value.pack_id.clone(),
+            model_id: value.model_id.clone(),
+            summary_id: value.summary_id.clone(),
+        },
+    )))
+}
+
 fn semantic_value_range(
     semantics: &crate::analyzer::semantic::ProcedureSemantics,
     value: crate::analyzer::semantic::ValueId,
@@ -4036,13 +7412,17 @@ fn semantic_value_range(
     let mapping = semantics
         .value(value)
         .and_then(|value| semantics.source_mapping(value.source))?;
+    Some(semantic_source_range(mapping))
+}
+
+fn semantic_source_range(mapping: &crate::analyzer::semantic::SourceMapping) -> Range {
     let span = mapping.locator.anchor().span();
-    Some(Range {
+    Range {
         start_byte: span.start_byte() as usize,
         end_byte: span.end_byte() as usize,
         start_line: span.start().line() as usize + 1,
         end_line: span.end().line() as usize + 1,
-    })
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -4288,7 +7668,7 @@ fn failure_use_candidates(
         let consumer_site_id = shape.map(|shape| shape.outcome.site_id.clone());
         let consumer_site_ast_id = shape.map(|shape| shape.outcome.site_ast_id.clone());
         let structural_identity_closed =
-            shape.is_some_and(|shape| shape.outcome.coverage == CallShapeCoverage::Exact);
+            shape.is_some_and(|shape| shape.outcome.coverage.is_exact());
         for (argument_ordinal, argument) in call.arguments.iter().enumerate() {
             let argument_identity_closed = matches!(
                 argument.expansion,
@@ -4698,53 +8078,24 @@ fn open_result_contract_failure_use_expansions(
             )
         })
         .map(|candidate| {
-            let consumer_point_id = super::semantic::program_point_wire_id(
-                &procedure
-                    .point_handle(candidate.point)
-                    .expect("a retained failure consumer belongs to its procedure"),
+            let consumer_point_id = failure_use_consumer_point_id(
+                procedure,
+                &candidate,
+                "a retained failure consumer belongs to its procedure",
             );
-            let id = result_contract_failure_use_row_id(
-                &value.id,
+            result_contract_failure_use_expansion(
+                value,
+                &procedure_id,
+                &candidate,
+                consumer_point_id,
+                condition_result_ordinal,
+                condition_value,
                 None,
-                &consumer_point_id,
-                candidate.consumer_call_id.as_deref(),
-                candidate.consumer_site_id.as_deref(),
-                candidate.operand,
-                candidate.consumer,
-                candidate.argument_ordinal,
-            );
-            pipeline_expansion(PipelineValue::ResultContractFailureUse(Box::new(
-                ResultContractFailureUseValue {
-                    file: value.file.clone(),
-                    range: semantic_value_range(semantics, candidate.operand)
-                        .unwrap_or(value.range),
-                    ast_id: None,
-                    id,
-                    acquisition_id: value.id.clone(),
-                    acquisition_site_id: value.site_id.clone(),
-                    acquisition_site_ast_id: value.site_ast_id.clone(),
-                    procedure_id: procedure_id.clone(),
-                    condition_result_ordinal,
-                    condition_value_id: condition_value.map(|value| u64::from(value.get())),
-                    failure_edge_id: None,
-                    consumer_point_id,
-                    consumer_call_id: candidate.consumer_call_id,
-                    consumer_site_id: candidate.consumer_site_id,
-                    consumer_site_ast_id: candidate.consumer_site_ast_id,
-                    operand_value_id: u64::from(candidate.operand.get()),
-                    binding_value_id: None,
-                    establishment_point_id: None,
-                    establishment_value_id: None,
-                    provenance: crate::query::FailureUseProvenance::Unknown,
-                    consumer: candidate.consumer,
-                    argument_ordinal: candidate.argument_ordinal,
-                    proof: EffectProof::Unproven,
-                    coverage: EffectCoverage::Open,
-                    pack_id: value.pack_id.clone(),
-                    model_id: value.model_id.clone(),
-                    summary_id: value.summary_id.clone(),
-                },
-            )))
+                None,
+                crate::query::FailureUseProvenance::Unknown,
+                false,
+                semantic_value_range(semantics, candidate.operand).unwrap_or(value.range),
+            )
         })
         .collect()
 }
@@ -5037,62 +8388,24 @@ pub(super) fn result_contract_failure_use_expansions(
             if !filter.accepts(provenance, candidate.consumer) {
                 continue;
             }
-            let consumer_point_id = super::semantic::program_point_wire_id(
-                &procedure
-                    .point_handle(candidate.point)
-                    .expect("a derived failure consumer belongs to its procedure"),
+            let consumer_point_id = failure_use_consumer_point_id(
+                procedure,
+                candidate,
+                "a derived failure consumer belongs to its procedure",
             );
-            let id = result_contract_failure_use_row_id(
-                &value.id,
-                Some(&failure_edge_id),
-                &consumer_point_id,
-                candidate.consumer_call_id.as_deref(),
-                candidate.consumer_site_id.as_deref(),
-                candidate.operand,
-                candidate.consumer,
-                candidate.argument_ordinal,
-            );
-            expansions.push(pipeline_expansion(PipelineValue::ResultContractFailureUse(
-                Box::new(ResultContractFailureUseValue {
-                    file: value.file.clone(),
-                    range: origin.range,
-                    ast_id: origin.ast_id,
-                    id,
-                    acquisition_id: value.id.clone(),
-                    acquisition_site_id: value.site_id.clone(),
-                    acquisition_site_ast_id: value.site_ast_id.clone(),
-                    procedure_id: procedure_id.clone(),
-                    condition_result_ordinal,
-                    condition_value_id: Some(u64::from(condition.value.get())),
-                    failure_edge_id: Some(failure_edge_id.clone()),
-                    consumer_point_id,
-                    consumer_call_id: candidate.consumer_call_id.clone(),
-                    consumer_site_id: candidate.consumer_site_id.clone(),
-                    consumer_site_ast_id: candidate.consumer_site_ast_id.clone(),
-                    operand_value_id: u64::from(candidate.operand.get()),
-                    binding_value_id: origin.binding.map(|value| u64::from(value.get())),
-                    establishment_point_id: origin.establishment_point_id,
-                    establishment_value_id: origin
-                        .establishment_value
-                        .map(|value| u64::from(value.get())),
-                    provenance,
-                    consumer: candidate.consumer,
-                    argument_ordinal: candidate.argument_ordinal,
-                    proof: if closed {
-                        EffectProof::Proven
-                    } else {
-                        EffectProof::Unproven
-                    },
-                    coverage: if closed {
-                        EffectCoverage::Exhaustive
-                    } else {
-                        EffectCoverage::Open
-                    },
-                    pack_id: value.pack_id.clone(),
-                    model_id: value.model_id.clone(),
-                    summary_id: value.summary_id.clone(),
-                }),
-            )));
+            expansions.push(result_contract_failure_use_expansion(
+                value,
+                &procedure_id,
+                candidate,
+                consumer_point_id,
+                condition_result_ordinal,
+                Some(condition.value),
+                Some(failure_edge_id.clone()),
+                Some(origin),
+                provenance,
+                closed,
+                value.range,
+            ));
         }
     }
     if saw_open_candidate {
@@ -5904,7 +9217,7 @@ fn classify_result_member_operation(
     if !receiver_binding_is_exact {
         return unknown;
     }
-    if shape.outcome.coverage != CallShapeCoverage::Exact
+    if !shape.outcome.coverage.is_exact()
         || shape.outcome.call_kind != CallKind::Method
         || shape.outcome.receiver_range.is_none()
         || shape
@@ -5983,7 +9296,7 @@ fn exact_positional_call_argument<'a>(
     if indexed.call != call.id
         || !indexed.range_exact
         || !indexed.expansion_exact
-        || shape.outcome.coverage != CallShapeCoverage::Exact
+        || !shape.outcome.coverage.is_exact()
         || exact_semantic_call_range(semantics, call) != Some(shape.outcome.range)
         || shape
             .arguments
@@ -6049,14 +9362,10 @@ impl CallArgumentOperationClassification {
     }
 
     const fn unknown_at(parameter_count: u32, parameter_ordinal: u32) -> Self {
-        Self {
-            operation: OperationUseClassification {
-                applicability: OperationApplicability::Unknown,
-                required_predicate: None,
-            },
-            parameter_count: Some(parameter_count),
-            parameter_ordinal: Some(parameter_ordinal),
-        }
+        let mut unknown = Self::unknown();
+        unknown.parameter_count = Some(parameter_count);
+        unknown.parameter_ordinal = Some(parameter_ordinal);
+        unknown
     }
 }
 
@@ -6137,10 +9446,7 @@ fn classify_call_argument_operation(
     };
     let unknown =
         CallArgumentOperationClassification::unknown_at(parameter_count, parameter_ordinal);
-    if answer.coverage != ModeledCallTargetCoverage::Exhaustive
-        || !answer.adjudicable_workspace_names.is_empty()
-        || answer.arms.is_empty()
-    {
+    if answer.coverage != ModeledCallTargetCoverage::Exhaustive || answer.arms.is_empty() {
         return unknown;
     }
 
@@ -6248,15 +9554,20 @@ fn unique_exact_intrinsic_subject_read<'a>(
     reads: &[(&'a crate::structural::flow_state::StateEventRow, bool)],
     non_excludable_events: &HashSet<usize>,
 ) -> Option<&'a crate::structural::flow_state::StateEventRow> {
-    let mut matching = reads
-        .iter()
-        .filter(|(read, _)| read.value == value)
-        .map(|(read, _)| *read);
-    let read = matching.next()?;
-    if matching.next().is_some() || non_excludable_events.contains(&read.event) {
-        return None;
-    }
-    Some(read)
+    let read = unique_state_event_read(
+        reads
+            .iter()
+            .filter(|(read, _)| read.value == value)
+            .map(|(read, _)| *read),
+    )?;
+    (!non_excludable_events.contains(&read.event)).then_some(read)
+}
+
+fn unique_state_event_read<'a>(
+    mut candidates: impl Iterator<Item = &'a crate::structural::flow_state::StateEventRow>,
+) -> Option<&'a crate::structural::flow_state::StateEventRow> {
+    let read = candidates.next()?;
+    candidates.next().is_none().then_some(read)
 }
 
 #[derive(Clone, Copy)]
@@ -6399,11 +9710,9 @@ fn unique_exact_receiver_read<'a>(
     receiver_range: Range,
     reads: &[&'a crate::structural::flow_state::StateEventRow],
 ) -> Option<&'a crate::structural::flow_state::StateEventRow> {
-    let mut matching = reads.iter().copied().filter(|read| {
+    unique_state_event_read(reads.iter().copied().filter(|read| {
         read.value == receiver && &read.site.file == file && read.site.range == receiver_range
-    });
-    let read = matching.next()?;
-    matching.next().is_none().then_some(read)
+    }))
 }
 
 fn exact_result_member_receiver_read<'a>(
@@ -6412,7 +9721,7 @@ fn exact_result_member_receiver_read<'a>(
     reads: &[&'a crate::structural::flow_state::StateEventRow],
 ) -> Option<&'a crate::structural::flow_state::StateEventRow> {
     let shape = shape?;
-    if shape.outcome.coverage != CallShapeCoverage::Exact
+    if !shape.outcome.coverage.is_exact()
         || shape.outcome.call_kind != CallKind::Method
         || call.receiver.is_none()
     {
@@ -6714,17 +10023,33 @@ fn normalized_success_guard_edges(
                 // complex expressions name their own temporary value and do
                 // not join the reviewed result identity above.
                 (CompiledResultPredicate::True, GuardPredicate::Truthy { value })
-                    if guard.subject == Some(value) =>
+                    if direct_boolean_guard_matches(
+                        guard.subject,
+                        &guard.predicate,
+                        Some(value),
+                    ) =>
                 {
                     true
                 }
                 (CompiledResultPredicate::False, GuardPredicate::Truthy { value })
-                    if guard.subject == Some(value) =>
+                    if direct_boolean_guard_matches(
+                        guard.subject,
+                        &guard.predicate,
+                        Some(value),
+                    ) =>
                 {
                     false
                 }
-                (CompiledResultPredicate::True, GuardPredicate::Opaque { .. }) => true,
-                (CompiledResultPredicate::False, GuardPredicate::Opaque { .. }) => false,
+                (CompiledResultPredicate::True, GuardPredicate::Opaque { .. })
+                    if direct_boolean_guard_matches(guard.subject, &guard.predicate, None) =>
+                {
+                    true
+                }
+                (CompiledResultPredicate::False, GuardPredicate::Opaque { .. })
+                    if direct_boolean_guard_matches(guard.subject, &guard.predicate, None) =>
+                {
+                    false
+                }
                 (
                     CompiledResultPredicate::Null
                     | CompiledResultPredicate::NonNull
@@ -6742,6 +10067,12 @@ fn normalized_success_guard_edges(
                     | GuardPredicate::NullComparison { .. }
                     | GuardPredicate::Opaque { .. },
                 ) => return None,
+                (
+                    CompiledResultPredicate::Eof
+                    | CompiledResultPredicate::NonZero
+                    | CompiledResultPredicate::MinusOne,
+                    _,
+                ) => return None,
             };
             let edge = if take_true {
                 guard.true_edge
@@ -6756,12 +10087,17 @@ fn normalized_success_guard_edges(
     edges
 }
 
-const fn opposite_result_predicate(predicate: CompiledResultPredicate) -> CompiledResultPredicate {
+fn opposite_result_predicate(predicate: CompiledResultPredicate) -> CompiledResultPredicate {
     match predicate {
         CompiledResultPredicate::Null => CompiledResultPredicate::NonNull,
         CompiledResultPredicate::NonNull => CompiledResultPredicate::Null,
         CompiledResultPredicate::True => CompiledResultPredicate::False,
         CompiledResultPredicate::False => CompiledResultPredicate::True,
+        CompiledResultPredicate::Eof
+        | CompiledResultPredicate::NonZero
+        | CompiledResultPredicate::MinusOne => {
+            unreachable!("sentinel result predicates have no Boolean opposite")
+        }
     }
 }
 
@@ -6819,13 +10155,7 @@ fn semantic_call_range(
     call: &crate::analyzer::semantic::SemanticCallSite,
 ) -> Option<Range> {
     let mapping = semantics.source_mapping(call.source)?;
-    let span = mapping.locator.anchor().span();
-    Some(Range {
-        start_byte: span.start_byte() as usize,
-        end_byte: span.end_byte() as usize,
-        start_line: span.start().line() as usize + 1,
-        end_line: span.end().line() as usize + 1,
-    })
+    Some(semantic_source_range(mapping))
 }
 
 fn exact_semantic_call_range(
@@ -7342,12 +10672,7 @@ fn direct_boolean_guard_edges(
         .semantics()
         .guard_facts()
         .iter()
-        .filter(|guard| guard.subject == Some(result))
-        .filter(|guard| match guard.predicate {
-            GuardPredicate::Truthy { value } => value == result,
-            GuardPredicate::Opaque { .. } => true,
-            _ => false,
-        })
+        .filter(|guard| direct_boolean_guard_matches(guard.subject, &guard.predicate, Some(result)))
         .collect::<Vec<_>>();
     let [guard] = guards.as_slice() else {
         return None;
@@ -7355,6 +10680,23 @@ fn direct_boolean_guard_edges(
     let true_edge = procedure.control_edge_handle(guard.true_edge?)?;
     let false_edge = procedure.control_edge_handle(guard.false_edge?)?;
     Some((true_edge, false_edge))
+}
+
+fn direct_boolean_guard_matches(
+    subject: Option<crate::analyzer::semantic::ValueId>,
+    predicate: &GuardPredicate,
+    expected_subject: Option<crate::analyzer::semantic::ValueId>,
+) -> bool {
+    if expected_subject.is_some_and(|expected| subject != Some(expected)) {
+        return false;
+    }
+    match predicate {
+        GuardPredicate::Truthy { value } => {
+            subject == Some(*value) && expected_subject.is_none_or(|expected| expected == *value)
+        }
+        GuardPredicate::Opaque { .. } => subject.is_some(),
+        _ => false,
+    }
 }
 
 fn conditional_result_consumption(
@@ -9519,6 +12861,9 @@ pub(super) const fn result_predicate_label(predicate: CompiledResultPredicate) -
         CompiledResultPredicate::NonNull => "non_null",
         CompiledResultPredicate::True => "true",
         CompiledResultPredicate::False => "false",
+        CompiledResultPredicate::Eof => "eof",
+        CompiledResultPredicate::NonZero => "nonzero",
+        CompiledResultPredicate::MinusOne => "minus_one",
     }
 }
 
@@ -9543,26 +12888,14 @@ fn record_result_obligation_coverage(
     file: &ProjectFile,
     coverage: EffectCoverage,
 ) {
-    if coverage == EffectCoverage::Exhaustive {
-        return;
-    }
-    cache.incomplete = true;
-    cache.truncated |= coverage == EffectCoverage::Truncated;
-    let message = "reviewed result-use obligation or exact discard proof is incomplete";
-    if !cache
-        .result_contract_incomplete_diagnostics
-        .insert((file.clone(), message))
-    {
-        return;
-    }
-    diagnostics.push(CodeQueryDiagnostic {
-        code: CodeQueryDiagnosticCode::ResultObligationDerivationIncomplete,
-        impact: CodeQueryDiagnosticImpact::Incomplete,
-        branch: Vec::new(),
-        language: crate::analyzer::common::language_for_file(file).config_label(),
-        message: format!("{message} in `{}`", rel_path_string(file)),
-        exhausted_roots: Vec::new(),
-    });
+    record_effect_coverage_incomplete(
+        cache,
+        diagnostics,
+        file,
+        coverage,
+        CodeQueryDiagnosticCode::ResultObligationDerivationIncomplete,
+        "reviewed result-use obligation or exact discard proof is incomplete",
+    );
 }
 
 fn record_result_contract_guard_coverage(
@@ -9602,6 +12935,24 @@ fn record_result_contract_incomplete(
     coverage: EffectCoverage,
     message: &'static str,
 ) {
+    record_effect_coverage_incomplete(
+        cache,
+        diagnostics,
+        file,
+        coverage,
+        CodeQueryDiagnosticCode::ResultContractDerivationIncomplete,
+        message,
+    );
+}
+
+fn record_effect_coverage_incomplete(
+    cache: &mut EffectTraversalCache,
+    diagnostics: &mut Vec<CodeQueryDiagnostic>,
+    file: &ProjectFile,
+    coverage: EffectCoverage,
+    code: CodeQueryDiagnosticCode,
+    message: &'static str,
+) {
     if coverage == EffectCoverage::Exhaustive {
         return;
     }
@@ -9614,7 +12965,7 @@ fn record_result_contract_incomplete(
         return;
     }
     diagnostics.push(CodeQueryDiagnostic {
-        code: CodeQueryDiagnosticCode::ResultContractDerivationIncomplete,
+        code,
         impact: CodeQueryDiagnosticImpact::Incomplete,
         branch: Vec::new(),
         language: crate::analyzer::common::language_for_file(file).config_label(),
@@ -9725,6 +13076,7 @@ struct ExternalEffectCallee {
 fn external_arm_lookup(
     answer: ModelAnswer,
     key: &ModeledProcedureKey,
+    rust_receiver_dispatch_closed: bool,
 ) -> (ArmLookup, Option<ExternalEffectCallee>) {
     let (complete, covers_overrides, effects) = match answer {
         ModelAnswer::Modeled {
@@ -9736,7 +13088,8 @@ fn external_arm_lookup(
         ModelAnswer::Conflict => return (ArmLookup::Conflict, None),
         ModelAnswer::Empty => return (ArmLookup::Unmodeled { analyzable: false }, None),
     };
-    let closes = complete && (covers_overrides || !key.has_receiver);
+    let closes =
+        complete && (covers_overrides || !key.has_receiver || rust_receiver_dispatch_closed);
     if !closes && effects.is_empty() {
         return (ArmLookup::Unmodeled { analyzable: false }, None);
     }
@@ -9809,8 +13162,14 @@ fn dispatch_arms(
             // at all and stays unmodeled, which is the #2579 family.
             None => match arm.unmaterialized_target.as_ref().map(external_modeled_key) {
                 Some(key) => {
-                    let (lookup, leaf) =
-                        external_arm_lookup(cache.answer_for(analyzer, &key), &key);
+                    let rust_receiver_dispatch_closed = complete
+                        && key.language == Language::Rust.config_label()
+                        && key.has_receiver;
+                    let (lookup, leaf) = external_arm_lookup(
+                        cache.answer_for(analyzer, &key),
+                        &key,
+                        rust_receiver_dispatch_closed,
+                    );
                     external_callee = leaf;
                     (Some(key), lookup, None)
                 }
@@ -9940,7 +13299,75 @@ pub(super) fn procedure_effect_expansions(
     cache_profile: &mut Option<QueryCacheProfile>,
     declaration: &DeclarationValue,
 ) -> Vec<PipelineExpansion> {
-    let identity = declaration_identity(&declaration.unit);
+    procedure_effect_expansions_for_root(
+        analyzer,
+        semantic,
+        cache,
+        budget,
+        limits,
+        cancellation,
+        diagnostics,
+        cache_profile,
+        declaration,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) fn procedure_effect_expansions_for_procedure(
+    analyzer: &dyn IAnalyzer,
+    semantic: &mut SemanticQueryContext<'_>,
+    cache: &mut EffectTraversalCache,
+    budget: &mut CodeQueryExecutionBudget,
+    limits: CodeQueryExecutionLimits,
+    cancellation: Option<&CancellationToken>,
+    diagnostics: &mut Vec<CodeQueryDiagnostic>,
+    cache_profile: &mut Option<QueryCacheProfile>,
+    procedure: &SemanticProcedureValue,
+) -> Vec<PipelineExpansion> {
+    let locator = procedure.handle.semantics().locator();
+    let file = procedure.file();
+    let unit = super::dispatch::declaration_at_locator(analyzer, locator, file)
+        .expect("a published procedure row has an enclosing indexed declaration");
+    let span = procedure.byte_span();
+    let range = analyzer
+        .ranges_of(&unit)
+        .into_iter()
+        .filter(|range| range.start_byte <= span.start && span.end <= range.end_byte)
+        .min_by_key(|range| range.end_byte - range.start_byte)
+        .expect("the enclosing indexed declaration contains the procedure row");
+    let declaration = DeclarationValue::new(unit, range);
+    procedure_effect_expansions_for_root(
+        analyzer,
+        semantic,
+        cache,
+        budget,
+        limits,
+        cancellation,
+        diagnostics,
+        cache_profile,
+        &declaration,
+        Some(procedure),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn procedure_effect_expansions_for_root(
+    analyzer: &dyn IAnalyzer,
+    semantic: &mut SemanticQueryContext<'_>,
+    cache: &mut EffectTraversalCache,
+    budget: &mut CodeQueryExecutionBudget,
+    limits: CodeQueryExecutionLimits,
+    cancellation: Option<&CancellationToken>,
+    diagnostics: &mut Vec<CodeQueryDiagnostic>,
+    cache_profile: &mut Option<QueryCacheProfile>,
+    declaration: &DeclarationValue,
+    root_procedure: Option<&SemanticProcedureValue>,
+) -> Vec<PipelineExpansion> {
+    let identity = root_procedure.map_or_else(
+        || declaration_identity(&declaration.unit),
+        SemanticProcedureValue::wire_id,
+    );
     let report = match cache.reports.get(&identity) {
         Some(report) => Arc::clone(report),
         None => {
@@ -9954,6 +13381,7 @@ pub(super) fn procedure_effect_expansions(
                 diagnostics,
                 cache_profile,
                 declaration,
+                root_procedure,
                 ProcedureEffectBudget::default(),
             );
             let reports = summarize_procedure_effects(&graph, ProcedureEffectBudget::default());
@@ -9979,8 +13407,28 @@ pub(super) fn procedure_effect_expansions(
         declaration.unit.source(),
         report.coverage,
     );
+    let (range, site_id) = root_procedure.map_or_else(
+        || (declaration.range, declaration.site_id()),
+        |procedure| {
+            let span = procedure.byte_span();
+            let public_range = procedure.public().range;
+            let range = Range {
+                start_byte: span.start,
+                end_byte: span.end,
+                start_line: public_range.start_line,
+                end_line: public_range.end_line,
+            };
+            let site_id = declaration
+                .unit
+                .declaration_site_id(range.start_byte, range.end_byte)
+                .to_string();
+            (range, site_id)
+        },
+    );
     let subject = ProcedureEffectSubject {
         declaration: declaration.clone(),
+        range,
+        site_id,
         report,
     };
     (0..subject.report.rows.len())
@@ -10021,29 +13469,33 @@ fn discover_effect_graph(
     diagnostics: &mut Vec<CodeQueryDiagnostic>,
     cache_profile: &mut Option<QueryCacheProfile>,
     root: &DeclarationValue,
+    root_procedure: Option<&SemanticProcedureValue>,
     bounds: ProcedureEffectBudget,
 ) -> EffectGraph {
     let mut graph = EffectGraph::default();
-    let mut index_by_unit: HashMap<CodeUnit, usize> = HashMap::default();
+    let mut index_by_unit: HashMap<(CodeUnit, Option<String>), usize> = HashMap::default();
     // External leaves are keyed by their canonical member identity rather than
     // by a workspace unit, so two call sites naming the same external member
     // share one node and one edge target.
     let mut index_by_external: HashMap<ModeledProcedureKey, usize> = HashMap::default();
-    let mut queue: Vec<(CodeUnit, usize)> = Vec::new();
+    let mut queue: Vec<((CodeUnit, Option<String>), usize)> = Vec::new();
 
     let push_node = |graph: &mut EffectGraph,
-                     index_by_unit: &mut HashMap<CodeUnit, usize>,
+                     index_by_unit: &mut HashMap<(CodeUnit, Option<String>), usize>,
                      cache: &mut EffectTraversalCache,
-                     unit: &CodeUnit|
+                     unit: &CodeUnit,
+                     procedure_id: Option<&str>,
+                     display_name: Option<String>|
      -> Option<usize> {
-        if let Some(index) = index_by_unit.get(unit) {
+        let key = (unit.clone(), procedure_id.map(str::to_owned));
+        if let Some(index) = index_by_unit.get(&key) {
             return Some(*index);
         }
         if graph.procedures.len() >= bounds.max_procedures {
             graph.truncated = true;
             return None;
         }
-        let identity = declaration_identity(unit);
+        let identity = procedure_id.map_or_else(|| declaration_identity(unit), str::to_owned);
         let declaration_only =
             SignatureMetadata::unit_is_declaration_only(&analyzer.signature_metadata(unit));
         let (declared, basis) = match cache.key_for(analyzer, unit) {
@@ -10079,13 +13531,13 @@ fn discover_effect_graph(
         let index = graph.procedures.len();
         graph.procedures.push(EffectGraphProcedure {
             declaration_id: identity,
-            display_name: unit.fq_name(),
+            display_name: display_name.unwrap_or_else(|| unit.fq_name()),
             declared,
             basis,
             declaration_only,
             local_gaps: Vec::new(),
         });
-        index_by_unit.insert(unit.clone(), index);
+        index_by_unit.insert(key, index);
         Some(index)
     };
 
@@ -10115,20 +13567,46 @@ fn discover_effect_graph(
         Some(index)
     };
 
-    if push_node(&mut graph, &mut index_by_unit, cache, &root.unit).is_none() {
+    let root_procedure_id = root_procedure.map(SemanticProcedureValue::wire_id);
+    let root_procedure_span = root_procedure.map(SemanticProcedureValue::byte_span);
+    let root_procedure_is_declaration = root_procedure_span
+        .as_ref()
+        .is_some_and(|span| span.start == root.range.start_byte && span.end == root.range.end_byte);
+    let root_key = (root.unit.clone(), root_procedure_id.clone());
+    let root_display_name = root_procedure.map(|procedure| {
+        format!(
+            "{} ({})",
+            root.unit.fq_name(),
+            procedure.public().procedure_kind
+        )
+    });
+    if push_node(
+        &mut graph,
+        &mut index_by_unit,
+        cache,
+        &root.unit,
+        root_procedure_id.as_deref(),
+        root_display_name,
+    )
+    .is_none()
+    {
         return graph;
     }
-    queue.push((root.unit.clone(), 0));
+    queue.push((root_key, 0));
 
     let mut cursor = 0usize;
     while cursor < queue.len() {
-        let (unit, depth) = queue[cursor].clone();
+        let (unit_key, depth) = queue[cursor].clone();
         cursor += 1;
+        let (unit, procedure_scope) = unit_key;
         if cancellation.is_some_and(CancellationToken::is_cancelled) {
             graph.truncated = true;
             break;
         }
-        let Some(node) = index_by_unit.get(&unit).copied() else {
+        let Some(node) = index_by_unit
+            .get(&(unit.clone(), procedure_scope.clone()))
+            .copied()
+        else {
             continue;
         };
         if depth > bounds.max_depth {
@@ -10160,6 +13638,8 @@ fn discover_effect_graph(
         let Some(facts) = facts else {
             continue;
         };
+        let static_const_initializer_calls =
+            cache.rust_static_const_initializer_calls(&file, facts.source());
         let ranges = analyzer.ranges_of(&unit);
         // A declaration with no runnable entry has no body to enumerate: its
         // sites are declaration sites, and reading one as a body would claim an
@@ -10173,16 +13653,34 @@ fn discover_effect_graph(
         // out-of-line definition inside one translation unit (#1650) -- and the
         // body is the union of the calls they contain.
         let body_spans = ranges.as_slice();
+        let procedure_body_span = if root_procedure_id == procedure_scope {
+            root_procedure_span.as_ref()
+        } else {
+            None
+        };
 
         let mut call_nodes = facts
             .nodes()
             .iter()
             .enumerate()
+            // Spawn expressions remain selectable through call-shape queries,
+            // but their callees do not complete in the caller. Procedure
+            // effects here model caller-observable call completion.
             .filter(|(_, fact)| fact.kind == NormalizedKind::Call)
             .filter(|(_, fact)| {
-                body_spans.iter().any(|span| {
-                    fact.range.start_byte >= span.start_byte && fact.range.end_byte <= span.end_byte
-                })
+                !static_const_initializer_calls
+                    .contains(&(fact.range.start_byte, fact.range.end_byte))
+            })
+            .filter(|(_, fact)| {
+                procedure_body_span.map_or_else(
+                    || {
+                        body_spans.iter().any(|span| {
+                            fact.range.start_byte >= span.start_byte
+                                && fact.range.end_byte <= span.end_byte
+                        })
+                    },
+                    |span| fact.range.start_byte >= span.start && fact.range.end_byte <= span.end,
+                )
             })
             .map(|(id, fact)| (fact.range.start_byte, fact.range.end_byte, id))
             .collect::<Vec<_>>();
@@ -10221,15 +13719,20 @@ fn discover_effect_graph(
                 &shape.outcome.file,
                 shape.outcome.range,
             );
+            let in_scope = |context: &super::dispatch::DispatchCallContext| {
+                procedure_scope.as_ref().map_or_else(
+                    || context.caller_is_exact && context.caller.as_ref() == Some(&unit),
+                    |procedure_id| context.procedure_id == *procedure_id,
+                )
+            };
             let matching_contexts = call_contexts
                 .iter()
                 .enumerate()
-                .filter_map(|(index, context)| {
-                    (context.caller_is_exact && context.caller.as_ref() == Some(&unit))
-                        .then_some(index)
-                })
+                .filter_map(|(index, context)| in_scope(context).then_some(index))
                 .collect::<HashSet<_>>();
-            let unknown_caller = call_contexts.iter().any(|context| context.caller.is_none());
+            let unknown_caller = call_contexts
+                .iter()
+                .any(|context| in_scope(context) && context.caller.is_none());
             if matching_contexts.is_empty() {
                 if call_contexts.is_empty() || unknown_caller {
                     graph.procedures[node]
@@ -10292,9 +13795,19 @@ fn discover_effect_graph(
                     EffectCertainty::Possible
                 };
                 if let Some(callee_unit) = arm.callee {
-                    let Some(callee) =
-                        push_node(&mut graph, &mut index_by_unit, cache, &callee_unit)
-                    else {
+                    let callee_procedure_id = (root_procedure_is_declaration
+                        && callee_unit == root.unit)
+                        .then_some(root_procedure_id.as_deref())
+                        .flatten();
+                    let callee_key = (callee_unit.clone(), callee_procedure_id.map(str::to_owned));
+                    let Some(callee) = push_node(
+                        &mut graph,
+                        &mut index_by_unit,
+                        cache,
+                        &callee_unit,
+                        callee_procedure_id,
+                        None,
+                    ) else {
                         graph.procedures[node]
                             .local_gaps
                             .push(EffectReason::ProcedureBudgetExhausted);
@@ -10310,8 +13823,8 @@ fn discover_effect_graph(
                     // A callee already queued is already going to be walked at
                     // a depth no greater than this one. The fixpoint below,
                     // rather than this walk, resolves cycles.
-                    if queue.iter().all(|(queued, _)| queued != &callee_unit) {
-                        queue.push((callee_unit, depth.saturating_add(1)));
+                    if queue.iter().all(|(queued, _)| queued != &callee_key) {
+                        queue.push((callee_key, depth.saturating_add(1)));
                     }
                 }
                 // An external modeled member is a graph leaf: there is no
@@ -10727,6 +14240,7 @@ func inspect(input *item) (result int) {
             event,
             procedure: crate::analyzer::semantic::ProcedureId::new(0),
             event_class: StateEventClass::Read,
+            read_cause: None,
             subject: crate::structural::flow_state::FlowSubject::Binding { value },
             point: crate::analyzer::semantic::ProgramPointId::new(0),
             point_id: "point".into(),
@@ -10882,7 +14396,6 @@ func inspect(input *item) (result int) {
     fn lookup() -> ModeledCallTargetLookup {
         ModeledCallTargetLookup {
             arms: Vec::new(),
-            adjudicable_workspace_names: Vec::new(),
             call_application: ModeledCallApplication::Unknown,
             coverage: ModeledCallTargetCoverage::Unmodeled,
         }

@@ -1,6 +1,7 @@
 use crate::analyzer::Language;
 use crate::git_file::parse_rev_path;
 use crate::git_file::{git_history_path_is_file, read_git_file, resolve_git_file_path};
+use crate::mcp_common::contains_glob_syntax;
 use crate::workspace_document::has_portable_windows_path_prefix;
 use serde_json::Value;
 use std::collections::HashMap;
@@ -12,38 +13,48 @@ pub struct GitHistoryOverlay {
     pub content: String,
 }
 
-pub fn normalize_tool_arguments(
-    tool_name: &str,
-    mut arguments: Value,
-    workspace_root: &Path,
-) -> Result<Value, String> {
+#[derive(Clone, Copy)]
+enum ToolPathArgument {
+    StringArray(&'static str),
+    ObjectArrayString(&'static str, &'static str),
+    OptionalString(&'static str),
+    GetFileContents,
+    QueryCodeScopes,
+    WorkspaceFile(&'static str),
+}
+
+fn tool_path_arguments(tool_name: &str) -> &'static [ToolPathArgument] {
+    use ToolPathArgument::{
+        GetFileContents, ObjectArrayString, OptionalString, QueryCodeScopes, StringArray,
+        WorkspaceFile,
+    };
+
+    const GET_SUMMARIES: &[ToolPathArgument] = &[StringArray("targets")];
+    const LIST_SYMBOLS: &[ToolPathArgument] = &[StringArray("file_patterns")];
+    const SCAN_USAGES_BY_REFERENCE: &[ToolPathArgument] = &[StringArray("paths")];
+    const SCAN_USAGES_BY_LOCATION: &[ToolPathArgument] =
+        &[StringArray("paths"), ObjectArrayString("targets", "path")];
+    const USAGE_GRAPH: &[ToolPathArgument] = &[StringArray("paths")];
+    const MOST_RELEVANT_FILES: &[ToolPathArgument] = &[StringArray("seed_file_paths")];
+    const RENAME_SYMBOL: &[ToolPathArgument] = &[OptionalString("path")];
+    const GET_FILE_CONTENTS: &[ToolPathArgument] = &[GetFileContents];
+    const QUERY_CODE: &[ToolPathArgument] = &[QueryCodeScopes, WorkspaceFile("query_file")];
+    const SEARCH_FILE_CONTENTS: &[ToolPathArgument] = &[OptionalString("file_path")];
+    const COMPLEXITY_FILES: &[ToolPathArgument] = &[StringArray("file_paths")];
+
     match tool_name {
-        "get_summaries" => normalize_string_array_field(&mut arguments, "targets", workspace_root)?,
-        "list_symbols" => {
-            normalize_string_array_field(&mut arguments, "file_patterns", workspace_root)?
-        }
-        "scan_usages_by_reference" => {
-            normalize_string_array_field(&mut arguments, "paths", workspace_root)?;
-        }
-        "scan_usages_by_location" => {
-            normalize_string_array_field(&mut arguments, "paths", workspace_root)?;
-            normalize_object_array_string_field(&mut arguments, "targets", "path", workspace_root)?;
-        }
+        "get_summaries" => GET_SUMMARIES,
+        "list_symbols" => LIST_SYMBOLS,
+        "scan_usages_by_reference" => SCAN_USAGES_BY_REFERENCE,
+        "scan_usages_by_location" => SCAN_USAGES_BY_LOCATION,
         // `usage_graph` takes the same `paths` selector as the scan tools, so
         // it accepts the same absolute spellings inside the workspace (#3092).
-        "usage_graph" => normalize_string_array_field(&mut arguments, "paths", workspace_root)?,
-        "most_relevant_files" => {
-            normalize_string_array_field(&mut arguments, "seed_file_paths", workspace_root)?
-        }
-        "rename_symbol" => normalize_optional_string_field(&mut arguments, "path", workspace_root)?,
-        "get_file_contents" => normalize_get_file_contents_paths(&mut arguments, workspace_root)?,
-        "query_code" => {
-            normalize_query_path_scopes(&mut arguments, workspace_root)?;
-            normalize_workspace_file_field(&mut arguments, "query_file", workspace_root)?;
-        }
-        "search_file_contents" => {
-            normalize_optional_string_field(&mut arguments, "file_path", workspace_root)?
-        }
+        "usage_graph" => USAGE_GRAPH,
+        "most_relevant_files" => MOST_RELEVANT_FILES,
+        "rename_symbol" => RENAME_SYMBOL,
+        "get_file_contents" => GET_FILE_CONTENTS,
+        "query_code" => QUERY_CODE,
+        "search_file_contents" => SEARCH_FILE_CONTENTS,
         "compute_cyclomatic_complexity"
         | "compute_cognitive_complexity"
         | "report_comment_density_for_files"
@@ -51,10 +62,42 @@ pub fn normalize_tool_arguments(
         | "report_test_assertion_smells"
         | "report_structural_clone_smells"
         | "report_long_method_and_god_object_smells"
-        | "report_dead_code_and_unused_abstraction_smells" => {
-            normalize_string_array_field(&mut arguments, "file_paths", workspace_root)?
+        | "report_dead_code_and_unused_abstraction_smells" => COMPLEXITY_FILES,
+        _ => &[],
+    }
+}
+
+pub fn normalize_tool_arguments(
+    tool_name: &str,
+    mut arguments: Value,
+    workspace_root: &Path,
+) -> Result<Value, String> {
+    for path_argument in tool_path_arguments(tool_name) {
+        match *path_argument {
+            ToolPathArgument::StringArray(field) => {
+                normalize_string_array_field(&mut arguments, field, workspace_root)?
+            }
+            ToolPathArgument::ObjectArrayString(array_field, string_field) => {
+                normalize_object_array_string_field(
+                    &mut arguments,
+                    array_field,
+                    string_field,
+                    workspace_root,
+                )?
+            }
+            ToolPathArgument::OptionalString(field) => {
+                normalize_optional_string_field(&mut arguments, field, workspace_root)?
+            }
+            ToolPathArgument::GetFileContents => {
+                normalize_get_file_contents_paths(&mut arguments, workspace_root)?
+            }
+            ToolPathArgument::QueryCodeScopes => {
+                normalize_query_path_scopes(&mut arguments, workspace_root)?
+            }
+            ToolPathArgument::WorkspaceFile(field) => {
+                normalize_workspace_file_field(&mut arguments, field, workspace_root)?
+            }
         }
-        _ => {}
     }
     Ok(arguments)
 }
@@ -92,63 +135,42 @@ pub fn normalize_tool_arguments_for_cli(
     workspace_root: &Path,
 ) -> Result<(Value, Vec<GitHistoryOverlay>), String> {
     let mut overlays = GitHistoryOverlays::default();
+    for path_argument in tool_path_arguments(tool_name) {
+        match *path_argument {
+            ToolPathArgument::StringArray(field) => normalize_cli_string_array_field(
+                &mut arguments,
+                field,
+                workspace_root,
+                &mut overlays,
+            )?,
+            ToolPathArgument::ObjectArrayString(array_field, string_field) => {
+                normalize_cli_object_array_string_field(
+                    &mut arguments,
+                    array_field,
+                    string_field,
+                    workspace_root,
+                    &mut overlays,
+                )?
+            }
+            ToolPathArgument::OptionalString(field) => normalize_cli_optional_string_field(
+                &mut arguments,
+                field,
+                workspace_root,
+                &mut overlays,
+            )?,
+            ToolPathArgument::QueryCodeScopes => normalize_cli_string_array_field(
+                &mut arguments,
+                "where",
+                workspace_root,
+                &mut overlays,
+            )?,
+            ToolPathArgument::GetFileContents | ToolPathArgument::WorkspaceFile(_) => {}
+        }
+    }
     match tool_name {
-        "get_summaries" => normalize_cli_string_array_field(
-            &mut arguments,
-            "targets",
-            workspace_root,
-            &mut overlays,
-        )?,
         "get_symbol_sources" => normalize_cli_symbol_source_field(
             &mut arguments,
             "symbols",
-            workspace_root,
-            &mut overlays,
-        )?,
-        "list_symbols" => normalize_cli_string_array_field(
-            &mut arguments,
-            "file_patterns",
-            workspace_root,
-            &mut overlays,
-        )?,
-        "scan_usages_by_reference" => {
-            normalize_cli_string_array_field(
-                &mut arguments,
-                "paths",
-                workspace_root,
-                &mut overlays,
-            )?;
-        }
-        "scan_usages_by_location" => {
-            normalize_cli_string_array_field(
-                &mut arguments,
-                "paths",
-                workspace_root,
-                &mut overlays,
-            )?;
-            normalize_cli_object_array_string_field(
-                &mut arguments,
-                "targets",
-                "path",
-                workspace_root,
-                &mut overlays,
-            )?;
-        }
-        "usage_graph" => normalize_cli_string_array_field(
-            &mut arguments,
-            "paths",
-            workspace_root,
-            &mut overlays,
-        )?,
-        "most_relevant_files" => normalize_cli_string_array_field(
-            &mut arguments,
-            "seed_file_paths",
-            workspace_root,
-            &mut overlays,
-        )?,
-        "rename_symbol" => normalize_cli_optional_string_field(
-            &mut arguments,
-            "path",
             workspace_root,
             &mut overlays,
         )?,
@@ -161,31 +183,6 @@ pub fn normalize_tool_arguments_for_cli(
                 &mut overlays,
             )?
         }
-        "query_code" => normalize_cli_string_array_field(
-            &mut arguments,
-            "where",
-            workspace_root,
-            &mut overlays,
-        )?,
-        "search_file_contents" => normalize_cli_optional_string_field(
-            &mut arguments,
-            "file_path",
-            workspace_root,
-            &mut overlays,
-        )?,
-        "compute_cyclomatic_complexity"
-        | "compute_cognitive_complexity"
-        | "report_comment_density_for_files"
-        | "report_exception_handling_smells"
-        | "report_test_assertion_smells"
-        | "report_structural_clone_smells"
-        | "report_long_method_and_god_object_smells"
-        | "report_dead_code_and_unused_abstraction_smells" => normalize_cli_string_array_field(
-            &mut arguments,
-            "file_paths",
-            workspace_root,
-            &mut overlays,
-        )?,
         _ => {}
     }
 
@@ -401,10 +398,7 @@ fn git_history_anchor_is_file(rev: &str, anchor: &str, workspace_root: &Path) ->
 }
 
 fn is_analyzable_source_path(path: &str) -> bool {
-    Path::new(path)
-        .extension()
-        .and_then(|extension| extension.to_str())
-        .is_some_and(|extension| Language::from_extension(extension) != Language::None)
+    Language::from_path(Path::new(path)) != Language::None
 }
 
 fn normalize_cli_optional_string_field(
@@ -413,13 +407,23 @@ fn normalize_cli_optional_string_field(
     workspace_root: &Path,
     overlays: &mut GitHistoryOverlays,
 ) -> Result<(), String> {
+    normalize_optional_string_field_with(arguments, field, |raw| {
+        normalize_cli_path_argument(raw, workspace_root, overlays)
+    })
+}
+
+fn normalize_optional_string_field_with(
+    arguments: &mut Value,
+    field: &str,
+    mut normalize: impl FnMut(&str) -> Result<Option<String>, String>,
+) -> Result<(), String> {
     let Some(value) = arguments.get_mut(field) else {
         return Ok(());
     };
     let Some(raw) = value.as_str() else {
         return Ok(());
     };
-    if let Some(normalized) = normalize_cli_path_argument(raw, workspace_root, overlays)? {
+    if let Some(normalized) = normalize(raw)? {
         *value = Value::String(normalized);
     }
     Ok(())
@@ -432,14 +436,9 @@ fn normalize_cli_object_array_string_field(
     workspace_root: &Path,
     overlays: &mut GitHistoryOverlays,
 ) -> Result<(), String> {
-    let Some(array) = arguments.get_mut(array_field).and_then(Value::as_array_mut) else {
-        return Ok(());
-    };
-
-    for item in array {
-        normalize_cli_optional_string_field(item, string_field, workspace_root, overlays)?;
-    }
-    Ok(())
+    normalize_object_array_string_field_with(arguments, array_field, string_field, |item, field| {
+        normalize_cli_optional_string_field(item, field, workspace_root, overlays)
+    })
 }
 
 fn normalize_cli_path_argument(
@@ -552,16 +551,9 @@ fn normalize_optional_string_field(
     field: &str,
     workspace_root: &Path,
 ) -> Result<(), String> {
-    let Some(value) = arguments.get_mut(field) else {
-        return Ok(());
-    };
-    let Some(raw) = value.as_str() else {
-        return Ok(());
-    };
-    if let Some(normalized) = normalize_mcp_path_argument(raw, workspace_root)? {
-        *value = Value::String(normalized);
-    }
-    Ok(())
+    normalize_optional_string_field_with(arguments, field, |raw| {
+        normalize_mcp_path_argument(raw, workspace_root)
+    })
 }
 
 fn normalize_workspace_file_field(
@@ -599,12 +591,23 @@ fn normalize_object_array_string_field(
     string_field: &str,
     workspace_root: &Path,
 ) -> Result<(), String> {
+    normalize_object_array_string_field_with(arguments, array_field, string_field, |item, field| {
+        normalize_optional_string_field(item, field, workspace_root)
+    })
+}
+
+fn normalize_object_array_string_field_with(
+    arguments: &mut Value,
+    array_field: &str,
+    string_field: &str,
+    mut normalize: impl FnMut(&mut Value, &str) -> Result<(), String>,
+) -> Result<(), String> {
     let Some(array) = arguments.get_mut(array_field).and_then(Value::as_array_mut) else {
         return Ok(());
     };
 
     for item in array {
-        normalize_optional_string_field(item, string_field, workspace_root)?;
+        normalize(item, string_field)?;
     }
     Ok(())
 }
@@ -616,7 +619,7 @@ fn normalize_mcp_path_argument(raw: &str, workspace_root: &Path) -> Result<Optio
     }
 
     if contains_glob_syntax(trimmed) {
-        return normalize_absolute_glob(trimmed, workspace_root).map(Some);
+        return normalize_absolute_path_lexically(trimmed, workspace_root).map(Some);
     }
 
     normalize_absolute_literal_path(trimmed, workspace_root).map(Some)
@@ -631,31 +634,24 @@ fn normalize_absolute_literal_path(raw: &str, workspace_root: &Path) -> Result<S
         return canonical_path
             .strip_prefix(&canonical_root)
             .map(path_to_slash_string)
-            .map_err(|_| outside_workspace_error(raw, workspace_root));
+            .map_err(|_| {
+                crate::mcp_common::absolute_path_outside_workspace_error(raw, workspace_root)
+            });
     }
 
-    normalize_absolute_path_lexically(raw, workspace_root)
-}
-
-fn normalize_absolute_glob(raw: &str, workspace_root: &Path) -> Result<String, String> {
     normalize_absolute_path_lexically(raw, workspace_root)
 }
 
 fn normalize_absolute_path_lexically(raw: &str, workspace_root: &Path) -> Result<String, String> {
     let raw_norm = slash_string(raw);
     let root_norm = slash_string(&workspace_root.display().to_string());
-    let root_trimmed = root_norm.trim_end_matches('/');
-
-    let relative = if raw_norm == root_trimmed {
-        ""
-    } else if let Some(rest) = raw_norm.strip_prefix(&format!("{root_trimmed}/")) {
-        rest
-    } else {
-        return Err(outside_workspace_error(raw, workspace_root));
-    };
+    let relative =
+        crate::mcp_common::strip_workspace_root(&raw_norm, &root_norm).ok_or_else(|| {
+            crate::mcp_common::absolute_path_outside_workspace_error(raw, workspace_root)
+        })?;
 
     normalize_relative_slash_path(relative)
-        .map_err(|_| outside_workspace_error(raw, workspace_root))
+        .map_err(|_| crate::mcp_common::absolute_path_outside_workspace_error(raw, workspace_root))
 }
 
 fn normalize_relative_slash_path(relative: &str) -> Result<String, String> {
@@ -702,12 +698,8 @@ fn looks_like_absolute_path(raw: &str) -> bool {
     Path::new(raw).is_absolute() || has_portable_windows_path_prefix(raw)
 }
 
-fn contains_glob_syntax(raw: &str) -> bool {
-    raw.contains(['*', '?', '['])
-}
-
 fn path_to_slash_string(path: &Path) -> String {
-    path.to_string_lossy().replace('\\', "/")
+    slash_separators(&path.to_string_lossy())
 }
 
 fn slash_string(path: &str) -> String {
@@ -718,20 +710,17 @@ fn slash_string(path: &str) -> String {
     } else {
         path.to_string()
     };
-    path.replace('\\', "/")
+    slash_separators(&path)
 }
 
-fn outside_workspace_error(raw: &str, workspace_root: &Path) -> String {
-    format!(
-        "absolute path is outside active workspace: {} (workspace: {})",
-        raw,
-        workspace_root.display()
-    )
+fn slash_separators(path: &str) -> String {
+    path.replace('\\', "/")
 }
 
 #[cfg(test)]
 mod tests {
     use super::{normalize_tool_arguments, normalize_tool_arguments_for_cli};
+    use brokk_bifrost_test_macros::hardwon;
     use git2::{Repository, Signature};
     use serde_json::json;
     use std::fs;
@@ -743,50 +732,20 @@ mod tests {
     /// tests here can build small real git histories without process-spawning
     /// the CLI binary.
     fn commit_paths(repo: &Repository, paths: &[&str], message: &str) {
-        let mut index = repo.index().expect("repo index");
-        for path in paths {
-            index.add_path(Path::new(path)).expect("stage path");
-        }
-        index.write().expect("write index");
-        let tree_id = index.write_tree().expect("write tree");
-        let tree = repo.find_tree(tree_id).expect("find tree");
         let signature = Signature::now("Bifrost Test", "bifrost@example.com").expect("signature");
-        let parents = if let Ok(head) = repo.head() {
-            vec![head.peel_to_commit().expect("parent commit")]
-        } else {
-            Vec::new()
-        };
-        let parent_refs: Vec<_> = parents.iter().collect();
-        repo.commit(
-            Some("HEAD"),
-            &signature,
-            &signature,
-            message,
-            &tree,
-            &parent_refs,
-        )
-        .expect("commit");
+        crate::test_git_support::commit_paths(repo, paths, message, &signature);
+    }
+
+    fn rejected_outside_workspace_path(root: &Path, raw: &str) -> String {
+        let error =
+            normalize_tool_arguments("get_file_contents", json!({ "file_paths": [raw] }), root)
+                .expect_err("outside path should fail");
+        assert!(error.contains("outside active workspace"), "{error}");
+        error
     }
 
     #[test]
-    fn normalizes_absolute_literal_paths_for_tool_fields() {
-        let root = TempDir::new().expect("temp dir");
-        let src = root.path().join("src");
-        fs::create_dir(&src).expect("src dir");
-        let file = src.join("A.java");
-        fs::write(&file, "class A {}\n").expect("write file");
-
-        let normalized = normalize_tool_arguments(
-            "get_file_contents",
-            json!({ "file_paths": [file.display().to_string()] }),
-            root.path(),
-        )
-        .expect("normalize");
-
-        assert_eq!(normalized["file_paths"][0], "src/A.java");
-    }
-
-    #[test]
+    #[hardwon("8b0bd1e947cd: Windows absolute tool paths regressed during normalization")]
     fn normalizes_windows_absolute_literal_paths_for_tool_fields() {
         let root = Path::new("C:/work/root");
 
@@ -801,24 +760,7 @@ mod tests {
     }
 
     #[test]
-    fn normalizes_get_file_contents_rev_path_part() {
-        let root = TempDir::new().expect("temp dir");
-        let src = root.path().join("src");
-        fs::create_dir(&src).expect("src dir");
-        let file = src.join("relative.py");
-        fs::write(&file, "print('ok')\n").expect("write file");
-
-        let normalized = normalize_tool_arguments(
-            "get_file_contents",
-            json!({ "file_paths": [format!("HEAD:{}", file.display())] }),
-            root.path(),
-        )
-        .expect("normalize");
-
-        assert_eq!(normalized["file_paths"][0], "HEAD:src/relative.py");
-    }
-
-    #[test]
+    #[hardwon("8b0bd1e947cd: Windows REV:path selectors were split at the drive colon")]
     fn normalizes_get_file_contents_windows_rev_path_part() {
         let root = Path::new("C:/work/root");
 
@@ -830,53 +772,6 @@ mod tests {
         .expect("normalize");
 
         assert_eq!(normalized["file_paths"][0], "HEAD:src/relative.py");
-    }
-
-    #[test]
-    fn leaves_plain_get_file_contents_relative_paths_unchanged() {
-        let root = TempDir::new().expect("temp dir");
-
-        let normalized = normalize_tool_arguments(
-            "get_file_contents",
-            json!({ "file_paths": ["src/../relative.py"] }),
-            root.path(),
-        )
-        .expect("normalize");
-
-        assert_eq!(normalized["file_paths"][0], "src/../relative.py");
-    }
-
-    #[test]
-    fn normalizes_absolute_globs_lexically() {
-        let root = TempDir::new().expect("temp dir");
-        let raw = format!("{}/src/**/*.rs", root.path().display());
-
-        let normalized = normalize_tool_arguments(
-            "list_symbols",
-            json!({ "file_patterns": [raw] }),
-            root.path(),
-        )
-        .expect("normalize");
-
-        assert_eq!(normalized["file_patterns"][0], "src/**/*.rs");
-    }
-
-    #[test]
-    fn normalizes_query_code_absolute_where_globs() {
-        let root = TempDir::new().expect("temp dir");
-        let raw = format!("{}/src/**/*.py", root.path().display());
-
-        let normalized = normalize_tool_arguments(
-            "query_code",
-            json!({
-                "where": [raw],
-                "match": { "kind": "call" }
-            }),
-            root.path(),
-        )
-        .expect("normalize");
-
-        assert_eq!(normalized["where"][0], "src/**/*.py");
     }
 
     #[test]
@@ -901,25 +796,7 @@ mod tests {
     }
 
     #[test]
-    fn normalizes_query_code_absolute_where_globs_for_cli() {
-        let root = TempDir::new().expect("temp dir");
-        let raw = format!("{}/src/**/*.py", root.path().display());
-
-        let (normalized, overlays) = normalize_tool_arguments_for_cli(
-            "query_code",
-            json!({
-                "where": [raw],
-                "match": { "kind": "call" }
-            }),
-            root.path(),
-        )
-        .expect("normalize");
-
-        assert!(overlays.is_empty());
-        assert_eq!(normalized["where"][0], "src/**/*.py");
-    }
-
-    #[test]
+    #[hardwon("1b28944cef98: CLI path normalization left source selectors outside tool recovery")]
     fn get_symbol_sources_cli_leaves_colon_selectors_for_tool_recovery() {
         let root = TempDir::new().expect("temp dir");
         let symbols = json!([
@@ -941,6 +818,7 @@ mod tests {
     }
 
     #[test]
+    #[hardwon("1b28944cef98: CLI normalization mishandled in-workspace source selectors")]
     fn get_symbol_sources_cli_normalizes_only_in_workspace_absolute_paths() {
         let root = TempDir::new().expect("root dir");
         let source = root.path().join("src").join("A.java");
@@ -984,54 +862,15 @@ mod tests {
     }
 
     #[test]
-    fn rejects_existing_absolute_paths_outside_workspace() {
-        let root = TempDir::new().expect("root dir");
-        let outside = TempDir::new().expect("outside dir");
-        let file = outside.path().join("secret.txt");
-        fs::write(&file, "secret").expect("write outside");
-
-        let err = normalize_tool_arguments(
-            "get_file_contents",
-            json!({ "file_paths": [file.display().to_string()] }),
-            root.path(),
-        )
-        .expect_err("outside path should fail");
-
-        assert!(err.contains("outside active workspace"), "{err}");
-        assert!(err.contains(&file.display().to_string()), "{err}");
-    }
-
-    #[test]
+    #[hardwon("8b0bd1e947cd: Windows absolute paths escaped the workspace boundary")]
     fn rejects_windows_absolute_paths_outside_workspace() {
         let root = Path::new("C:/work/root");
-
-        let err = normalize_tool_arguments(
-            "get_file_contents",
-            json!({ "file_paths": ["C:/work/outside/secret.txt"] }),
-            root,
-        )
-        .expect_err("outside path should fail");
-
-        assert!(err.contains("outside active workspace"), "{err}");
+        let err = rejected_outside_workspace_path(root, "C:/work/outside/secret.txt");
         assert!(err.contains("C:/work/outside/secret.txt"), "{err}");
     }
 
     #[test]
-    fn normalizes_nonexistent_absolute_paths_inside_workspace() {
-        let root = TempDir::new().expect("temp dir");
-        let missing = root.path().join("src").join("Missing.java");
-
-        let normalized = normalize_tool_arguments(
-            "get_file_contents",
-            json!({ "file_paths": [missing.display().to_string()] }),
-            root.path(),
-        )
-        .expect("normalize");
-
-        assert_eq!(normalized["file_paths"][0], "src/Missing.java");
-    }
-
-    #[test]
+    #[hardwon("8b0bd1e947cd: nonexistent Windows paths were not normalized beneath the workspace")]
     fn normalizes_nonexistent_windows_absolute_paths_inside_workspace() {
         let root = Path::new("C:/work/root");
 
@@ -1050,28 +889,241 @@ mod tests {
         let root = TempDir::new().expect("temp dir");
         let raw = format!("{}/../outside/Missing.java", root.path().display());
 
-        let err = normalize_tool_arguments(
-            "get_file_contents",
-            json!({ "file_paths": [raw] }),
-            root.path(),
-        )
-        .expect_err("escaping path should fail");
-
-        assert!(err.contains("outside active workspace"), "{err}");
+        rejected_outside_workspace_path(root.path(), &raw);
     }
 
     #[test]
+    #[hardwon("8b0bd1e947cd: Windows parent-directory paths escaped the workspace boundary")]
     fn rejects_windows_absolute_parent_dir_escapes() {
         let root = Path::new("C:/work/root");
 
-        let err = normalize_tool_arguments(
-            "get_file_contents",
-            json!({ "file_paths": ["C:/work/root/../outside/Missing.java"] }),
-            root,
-        )
-        .expect_err("escaping path should fail");
+        rejected_outside_workspace_path(root, "C:/work/root/../outside/Missing.java");
+    }
 
-        assert!(err.contains("outside active workspace"), "{err}");
+    // #1216 regression pin: an ordinary (no `#` in the filename) historical
+    // `REV:path#symbol` selector must still split at its one `#` exactly as
+    // before, with a single overlay for the historical path.
+    #[test]
+    #[hardwon(
+        "eac69a1547ef: historical source selector parsing changed the ordinary REV:path#symbol form"
+    )]
+    fn git_history_symbol_source_ordinary_selector_splits_unchanged() {
+        let root = TempDir::new().expect("temp dir");
+        fs::write(root.path().join("Demo.java"), "class OldDemo {}\n").expect("write v1");
+        let repo = Repository::init(root.path()).expect("init repo");
+        commit_paths(&repo, &["Demo.java"], "v1");
+        fs::write(root.path().join("Demo.java"), "class NewDemo {}\n").expect("write v2");
+        commit_paths(&repo, &["Demo.java"], "v2");
+
+        let (normalized, overlays) = normalize_tool_arguments_for_cli(
+            "get_symbol_sources",
+            json!({ "symbols": ["HEAD~1:Demo.java#OldDemo"] }),
+            root.path(),
+        )
+        .expect("normalize");
+
+        assert_eq!(normalized["symbols"][0], "Demo.java#OldDemo");
+        assert_eq!(overlays.len(), 1, "{overlays:?}");
+        assert_eq!(overlays[0].rel_path, PathBuf::from("Demo.java"));
+        assert_eq!(overlays[0].content, "class OldDemo {}\n");
+    }
+
+    // #1216: a committed filename containing `#` with NO trailing symbol
+    // selector (the bug's original repro shape, e.g.
+    // `dir/Foo.VerifyGeneratedCode#01.verified.cs`) must keep the whole
+    // filename as the historical path rather than truncating it at the `#`.
+    // Before the fix, `split_once('#')` split this into path `Foo` (no
+    // extension, so `is_analyzable_source_path` rejected it) and a bogus
+    // selector `bar.py`, which made `normalize_cli_symbol_source_argument`
+    // bail out with `Ok(None)` and leave the raw `HEAD:...` string
+    // unnormalized with zero overlays.
+    #[test]
+    #[hardwon("eac69a1547ef: historical filenames containing # were split as symbol selectors")]
+    fn git_history_symbol_source_hash_named_file_without_selector_keeps_full_path() {
+        let root = TempDir::new().expect("temp dir");
+        fs::write(
+            root.path().join("Foo#bar.py"),
+            "class Foo:\n    def value(self):\n        return 1\n",
+        )
+        .expect("write file");
+        let repo = Repository::init(root.path()).expect("init repo");
+        commit_paths(&repo, &["Foo#bar.py"], "v1");
+
+        let (normalized, overlays) = normalize_tool_arguments_for_cli(
+            "get_symbol_sources",
+            json!({ "symbols": ["HEAD:Foo#bar.py"] }),
+            root.path(),
+        )
+        .expect("normalize");
+
+        assert_eq!(
+            normalized["symbols"][0], "Foo#bar.py",
+            "the full `#`-bearing filename must survive normalization unsplit"
+        );
+        assert_eq!(overlays.len(), 1, "{overlays:?}");
+        assert_eq!(overlays[0].rel_path, PathBuf::from("Foo#bar.py"));
+        assert_eq!(
+            overlays[0].content,
+            "class Foo:\n    def value(self):\n        return 1\n"
+        );
+    }
+
+    // #1216 acceptance criterion: when both a short path and a longer
+    // `#`-bearing path exist at the same revision (`Demo.py` and
+    // `Demo.py#extra.py`), the longest resolvable historical path must win.
+    // Before the fix, `split_once('#')` always took the *first* `#`, so the
+    // overlay materialized for `Demo.py#extra.py#Bar` was the short, wrong
+    // file (`Demo.py`) with a bogus `extra.py#Bar` selector tail.
+    #[test]
+    #[hardwon("eac69a1547ef: historical selector parsing chose a shorter colliding path")]
+    fn git_history_symbol_source_prefix_collision_selects_longest_committed_path() {
+        let root = TempDir::new().expect("temp dir");
+        fs::write(
+            root.path().join("Demo.py"),
+            "class Foo:\n    def value(self):\n        return 1\n",
+        )
+        .expect("write short file");
+        let repo = Repository::init(root.path()).expect("init repo");
+        commit_paths(&repo, &["Demo.py"], "v1");
+        fs::write(
+            root.path().join("Demo.py#extra.py"),
+            "class Bar:\n    def value(self):\n        return 2\n",
+        )
+        .expect("write long file");
+        commit_paths(&repo, &["Demo.py#extra.py"], "v2");
+
+        let (normalized, overlays) = normalize_tool_arguments_for_cli(
+            "get_symbol_sources",
+            json!({ "symbols": ["HEAD:Demo.py#extra.py#Bar"] }),
+            root.path(),
+        )
+        .expect("normalize");
+
+        assert_eq!(normalized["symbols"][0], "Demo.py#extra.py#Bar");
+        assert_eq!(overlays.len(), 1, "{overlays:?}");
+        assert_eq!(
+            overlays[0].rel_path,
+            PathBuf::from("Demo.py#extra.py"),
+            "the longer, resolvable historical path must win the collision"
+        );
+        assert_eq!(
+            overlays[0].content,
+            "class Bar:\n    def value(self):\n        return 2\n"
+        );
+    }
+
+    // #1216 regression pin: a historical selector whose symbol is itself a
+    // Rust raw identifier (`r#type`) must keep splitting at the first `#`
+    // (`lib.rs` / `r#type`), the same byte-for-byte behavior as before this
+    // fix and as the working-tree case fixed by #1128/#1131.
+    #[test]
+    #[hardwon("eac69a1547ef: historical raw-identifier selectors must keep their delimiter")]
+    fn git_history_symbol_source_raw_identifier_selector_unaffected() {
+        let root = TempDir::new().expect("temp dir");
+        fs::write(
+            root.path().join("lib.rs"),
+            "pub struct DbColumn {\n    pub r#type: String,\n}\n",
+        )
+        .expect("write file");
+        let repo = Repository::init(root.path()).expect("init repo");
+        commit_paths(&repo, &["lib.rs"], "v1");
+
+        let (normalized, overlays) = normalize_tool_arguments_for_cli(
+            "get_symbol_sources",
+            json!({ "symbols": ["HEAD:lib.rs#r#type"] }),
+            root.path(),
+        )
+        .expect("normalize");
+
+        assert_eq!(normalized["symbols"][0], "lib.rs#r#type");
+        assert_eq!(overlays.len(), 1, "{overlays:?}");
+        assert_eq!(overlays[0].rel_path, PathBuf::from("lib.rs"));
+        assert_eq!(
+            overlays[0].content,
+            "pub struct DbColumn {\n    pub r#type: String,\n}\n"
+        );
+    }
+
+    #[test]
+    fn normalizes_absolute_literal_paths_for_tool_fields() {
+        let root = TempDir::new().expect("temp dir");
+        let src = root.path().join("src");
+        fs::create_dir(&src).expect("src dir");
+        let file = src.join("A.java");
+        fs::write(&file, "class A {}\n").expect("write file");
+
+        let normalized = normalize_tool_arguments(
+            "get_file_contents",
+            json!({ "file_paths": [file.display().to_string()] }),
+            root.path(),
+        )
+        .expect("normalize");
+
+        assert_eq!(normalized["file_paths"][0], "src/A.java");
+    }
+
+    #[test]
+    fn normalizes_get_file_contents_rev_path_part() {
+        let root = TempDir::new().expect("temp dir");
+        let src = root.path().join("src");
+        fs::create_dir(&src).expect("src dir");
+        let file = src.join("relative.py");
+        fs::write(&file, "print('ok')\n").expect("write file");
+
+        let normalized = normalize_tool_arguments(
+            "get_file_contents",
+            json!({ "file_paths": [format!("HEAD:{}", file.display())] }),
+            root.path(),
+        )
+        .expect("normalize");
+
+        assert_eq!(normalized["file_paths"][0], "HEAD:src/relative.py");
+    }
+
+    #[test]
+    fn normalizes_absolute_globs_lexically() {
+        let root = TempDir::new().expect("temp dir");
+        let raw = format!("{}/src/**/*.rs", root.path().display());
+
+        let normalized = normalize_tool_arguments(
+            "list_symbols",
+            json!({ "file_patterns": [raw] }),
+            root.path(),
+        )
+        .expect("normalize");
+
+        assert_eq!(normalized["file_patterns"][0], "src/**/*.rs");
+    }
+
+    #[test]
+    fn normalizes_query_code_absolute_where_globs_for_cli() {
+        let root = TempDir::new().expect("temp dir");
+        let raw = format!("{}/src/**/*.py", root.path().display());
+
+        let (normalized, overlays) = normalize_tool_arguments_for_cli(
+            "query_code",
+            json!({
+                "where": [raw],
+                "match": { "kind": "call" }
+            }),
+            root.path(),
+        )
+        .expect("normalize");
+
+        assert!(overlays.is_empty());
+        assert_eq!(normalized["where"][0], "src/**/*.py");
+    }
+
+    #[test]
+    fn rejects_existing_absolute_paths_outside_workspace() {
+        let root = TempDir::new().expect("root dir");
+        let outside = TempDir::new().expect("outside dir");
+        let file = outside.path().join("secret.txt");
+        fs::write(&file, "secret").expect("write outside");
+
+        let raw = file.display().to_string();
+        let err = rejected_outside_workspace_path(root.path(), &raw);
+        assert!(err.contains(&file.display().to_string()), "{err}");
     }
 
     #[test]
@@ -1157,143 +1209,5 @@ mod tests {
 
         assert_eq!(normalized["file_paths"][0], "src/lib.rs");
         assert_eq!(normalized["fq_names"][0], fq_name);
-    }
-
-    // #1216 regression pin: an ordinary (no `#` in the filename) historical
-    // `REV:path#symbol` selector must still split at its one `#` exactly as
-    // before, with a single overlay for the historical path.
-    #[test]
-    fn git_history_symbol_source_ordinary_selector_splits_unchanged() {
-        let root = TempDir::new().expect("temp dir");
-        fs::write(root.path().join("Demo.java"), "class OldDemo {}\n").expect("write v1");
-        let repo = Repository::init(root.path()).expect("init repo");
-        commit_paths(&repo, &["Demo.java"], "v1");
-        fs::write(root.path().join("Demo.java"), "class NewDemo {}\n").expect("write v2");
-        commit_paths(&repo, &["Demo.java"], "v2");
-
-        let (normalized, overlays) = normalize_tool_arguments_for_cli(
-            "get_symbol_sources",
-            json!({ "symbols": ["HEAD~1:Demo.java#OldDemo"] }),
-            root.path(),
-        )
-        .expect("normalize");
-
-        assert_eq!(normalized["symbols"][0], "Demo.java#OldDemo");
-        assert_eq!(overlays.len(), 1, "{overlays:?}");
-        assert_eq!(overlays[0].rel_path, PathBuf::from("Demo.java"));
-        assert_eq!(overlays[0].content, "class OldDemo {}\n");
-    }
-
-    // #1216: a committed filename containing `#` with NO trailing symbol
-    // selector (the bug's original repro shape, e.g.
-    // `dir/Foo.VerifyGeneratedCode#01.verified.cs`) must keep the whole
-    // filename as the historical path rather than truncating it at the `#`.
-    // Before the fix, `split_once('#')` split this into path `Foo` (no
-    // extension, so `is_analyzable_source_path` rejected it) and a bogus
-    // selector `bar.py`, which made `normalize_cli_symbol_source_argument`
-    // bail out with `Ok(None)` and leave the raw `HEAD:...` string
-    // unnormalized with zero overlays.
-    #[test]
-    fn git_history_symbol_source_hash_named_file_without_selector_keeps_full_path() {
-        let root = TempDir::new().expect("temp dir");
-        fs::write(
-            root.path().join("Foo#bar.py"),
-            "class Foo:\n    def value(self):\n        return 1\n",
-        )
-        .expect("write file");
-        let repo = Repository::init(root.path()).expect("init repo");
-        commit_paths(&repo, &["Foo#bar.py"], "v1");
-
-        let (normalized, overlays) = normalize_tool_arguments_for_cli(
-            "get_symbol_sources",
-            json!({ "symbols": ["HEAD:Foo#bar.py"] }),
-            root.path(),
-        )
-        .expect("normalize");
-
-        assert_eq!(
-            normalized["symbols"][0], "Foo#bar.py",
-            "the full `#`-bearing filename must survive normalization unsplit"
-        );
-        assert_eq!(overlays.len(), 1, "{overlays:?}");
-        assert_eq!(overlays[0].rel_path, PathBuf::from("Foo#bar.py"));
-        assert_eq!(
-            overlays[0].content,
-            "class Foo:\n    def value(self):\n        return 1\n"
-        );
-    }
-
-    // #1216 acceptance criterion: when both a short path and a longer
-    // `#`-bearing path exist at the same revision (`Demo.py` and
-    // `Demo.py#extra.py`), the longest resolvable historical path must win.
-    // Before the fix, `split_once('#')` always took the *first* `#`, so the
-    // overlay materialized for `Demo.py#extra.py#Bar` was the short, wrong
-    // file (`Demo.py`) with a bogus `extra.py#Bar` selector tail.
-    #[test]
-    fn git_history_symbol_source_prefix_collision_selects_longest_committed_path() {
-        let root = TempDir::new().expect("temp dir");
-        fs::write(
-            root.path().join("Demo.py"),
-            "class Foo:\n    def value(self):\n        return 1\n",
-        )
-        .expect("write short file");
-        let repo = Repository::init(root.path()).expect("init repo");
-        commit_paths(&repo, &["Demo.py"], "v1");
-        fs::write(
-            root.path().join("Demo.py#extra.py"),
-            "class Bar:\n    def value(self):\n        return 2\n",
-        )
-        .expect("write long file");
-        commit_paths(&repo, &["Demo.py#extra.py"], "v2");
-
-        let (normalized, overlays) = normalize_tool_arguments_for_cli(
-            "get_symbol_sources",
-            json!({ "symbols": ["HEAD:Demo.py#extra.py#Bar"] }),
-            root.path(),
-        )
-        .expect("normalize");
-
-        assert_eq!(normalized["symbols"][0], "Demo.py#extra.py#Bar");
-        assert_eq!(overlays.len(), 1, "{overlays:?}");
-        assert_eq!(
-            overlays[0].rel_path,
-            PathBuf::from("Demo.py#extra.py"),
-            "the longer, resolvable historical path must win the collision"
-        );
-        assert_eq!(
-            overlays[0].content,
-            "class Bar:\n    def value(self):\n        return 2\n"
-        );
-    }
-
-    // #1216 regression pin: a historical selector whose symbol is itself a
-    // Rust raw identifier (`r#type`) must keep splitting at the first `#`
-    // (`lib.rs` / `r#type`), the same byte-for-byte behavior as before this
-    // fix and as the working-tree case fixed by #1128/#1131.
-    #[test]
-    fn git_history_symbol_source_raw_identifier_selector_unaffected() {
-        let root = TempDir::new().expect("temp dir");
-        fs::write(
-            root.path().join("lib.rs"),
-            "pub struct DbColumn {\n    pub r#type: String,\n}\n",
-        )
-        .expect("write file");
-        let repo = Repository::init(root.path()).expect("init repo");
-        commit_paths(&repo, &["lib.rs"], "v1");
-
-        let (normalized, overlays) = normalize_tool_arguments_for_cli(
-            "get_symbol_sources",
-            json!({ "symbols": ["HEAD:lib.rs#r#type"] }),
-            root.path(),
-        )
-        .expect("normalize");
-
-        assert_eq!(normalized["symbols"][0], "lib.rs#r#type");
-        assert_eq!(overlays.len(), 1, "{overlays:?}");
-        assert_eq!(overlays[0].rel_path, PathBuf::from("lib.rs"));
-        assert_eq!(
-            overlays[0].content,
-            "pub struct DbColumn {\n    pub r#type: String,\n}\n"
-        );
     }
 }

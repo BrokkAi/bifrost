@@ -36,7 +36,7 @@ pub struct ExtensionLimits(ExtensionLimitValues);
 pub struct InvalidExtensionLimits(&'static str);
 impl fmt::Display for InvalidExtensionLimits {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(self.0)
+        super::fmt_text(self.0, f)
     }
 }
 impl std::error::Error for InvalidExtensionLimits {}

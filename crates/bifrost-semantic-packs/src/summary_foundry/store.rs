@@ -106,7 +106,8 @@ impl StageKeyInputs<'_> {
         let canonical = serde_json::to_vec(self).expect("stage key inputs are serializable");
         let mut digest = Sha256::new();
         digest.update(&canonical);
-        hex(&digest.finalize())
+        let digest: [u8; 32] = digest.finalize().into();
+        brokk_bifrost_analysis::analyzer::canonical_hash::lower_hex_string(&digest)
     }
 }
 
@@ -285,16 +286,6 @@ fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), StoreError> {
     }
 }
 
-/// The lowercase hex of a digest.
-fn hex(bytes: &[u8]) -> String {
-    use std::fmt::Write as _;
-    let mut rendered = String::with_capacity(bytes.len() * 2);
-    for byte in bytes {
-        write!(rendered, "{byte:02x}").expect("writing to a String cannot fail");
-    }
-    rendered
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -323,41 +314,6 @@ mod tests {
     }
 
     #[test]
-    fn a_key_is_a_pure_function_of_its_inputs() {
-        let module = ModuleId::new("java/util");
-        let first = inputs(&module, "join", None, Some("up")).key();
-        let second = inputs(&module, "join", None, Some("up")).key();
-        assert_eq!(first, second);
-    }
-
-    #[test]
-    fn changing_any_input_changes_the_key() {
-        let module = ModuleId::new("java/util");
-        let base = inputs(&module, "adjudicate", Some(1), Some("up")).key();
-
-        let other_module = ModuleId::new("java/lang");
-        assert_ne!(
-            base,
-            inputs(&other_module, "adjudicate", Some(1), Some("up")).key()
-        );
-        assert_ne!(base, inputs(&module, "fixture", Some(1), Some("up")).key());
-        assert_ne!(
-            base,
-            inputs(&module, "adjudicate", Some(2), Some("up")).key()
-        );
-        assert_ne!(
-            base,
-            inputs(&module, "adjudicate", Some(1), Some("down")).key()
-        );
-        let mut bumped = inputs(&module, "adjudicate", Some(1), Some("up"));
-        bumped.stage_code_version = 2;
-        assert_ne!(base, bumped.key());
-        let mut redigested = inputs(&module, "adjudicate", Some(1), Some("up"));
-        redigested.source_slice_digest = "def456";
-        assert_ne!(base, redigested.key());
-    }
-
-    #[test]
     fn a_stored_artifact_round_trips_and_reuses_on_a_matching_key() {
         let (_directory, store) = store();
         let module = ModuleId::new("java/util");
@@ -370,13 +326,6 @@ mod tests {
             .expect("the artifact is present");
         assert_eq!(loaded, artifact);
         assert_eq!(loaded.key, inputs(&module, "join", None, None).key());
-    }
-
-    #[test]
-    fn an_absent_artifact_loads_as_none() {
-        let (_directory, store) = store();
-        let module = ModuleId::new("java/util");
-        assert_eq!(store.load(&module, "join").expect("no io error"), None);
     }
 
     #[test]

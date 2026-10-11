@@ -11,7 +11,6 @@ impl CodeQueryResult {
                 | CodeQueryResultValue::ProgramPoint { .. }
                 | CodeQueryResultValue::ControlEdge { .. }
                 | CodeQueryResultValue::TypestateFinding { .. }
-                | CodeQueryResultValue::ConcurrentAccessConflict { .. }
                 | CodeQueryResultValue::ClassSetRow { .. }
                 | CodeQueryResultValue::AbsentMemberFinding { .. }
                 | CodeQueryResultValue::AbsentMemberWitness { .. }
@@ -19,6 +18,7 @@ impl CodeQueryResult {
                 | CodeQueryResultValue::FlowEndpoint { .. }
                 | CodeQueryResultValue::FlowWitness { .. }
                 | CodeQueryResultValue::TaintFinding { .. }
+                | CodeQueryResultValue::RustPointerFinding { .. }
                 | CodeQueryResultValue::File { .. }
                 | CodeQueryResultValue::ReferenceSite { .. }
                 | CodeQueryResultValue::CallSite { .. }
@@ -28,6 +28,7 @@ impl CodeQueryResult {
                 | CodeQueryResultValue::MemberTargetAnalysis { .. }
                 | CodeQueryResultValue::ReceiverOutcome { .. }
                 | CodeQueryResultValue::ReceiverEvidence { .. }
+                | CodeQueryResultValue::PointsToCandidate { .. }
                 | CodeQueryResultValue::FieldWriteValue { .. }
                 | CodeQueryResultValue::RuntimeKeyedReadValue { .. }
                 | CodeQueryResultValue::CallShape { .. }
@@ -47,6 +48,8 @@ impl CodeQueryResult {
                 | CodeQueryResultValue::DetachedTaskTransfer { .. }
                 | CodeQueryResultValue::ProcedureEffect { .. }
                 | CodeQueryResultValue::CallableSignature { .. }
+                | CodeQueryResultValue::LiteralOccurrence { .. }
+                | CodeQueryResultValue::CallableMetrics { .. }
                 | CodeQueryResultValue::SignatureParameter { .. }
                 | CodeQueryResultValue::DecoratedParameter { .. }
                 | CodeQueryResultValue::CallableApplicability { .. }
@@ -56,6 +59,7 @@ impl CodeQueryResult {
                 | CodeQueryResultValue::DispatchTarget { .. }
                 | CodeQueryResultValue::MemberFamily { .. }
                 | CodeQueryResultValue::MemberFamilyEdge { .. }
+                | CodeQueryResultValue::PythonHierarchyFact { .. }
                 | CodeQueryResultValue::Occurrence { .. }
                 | CodeQueryResultValue::LexicalScope { .. }
                 | CodeQueryResultValue::Binding { .. }
@@ -68,18 +72,24 @@ impl CodeQueryResult {
                 CodeQueryResultValue::QualifiedPath { .. }
                 | CodeQueryResultValue::PathSegment { .. }
                 | CodeQueryResultValue::StateEvent { .. }
+                | CodeQueryResultValue::BindingInitializerCall { .. }
                 | CodeQueryResultValue::FlowRelation { .. }
                 | CodeQueryResultValue::ControlRelation { .. }
                 | CodeQueryResultValue::BranchRelation { .. }
+                | CodeQueryResultValue::CppExpression { .. }
                 | CodeQueryResultValue::LoopRelation { .. }
                 | CodeQueryResultValue::FailureHandlerState { .. }
                 | CodeQueryResultValue::StatementReachability { .. }
+                | CodeQueryResultValue::PendingCleanupFlow { .. }
+                | CodeQueryResultValue::PythonRuleFact { .. }
                 | CodeQueryResultValue::Guard { .. }
                 | CodeQueryResultValue::SourceSet { .. }
                 | CodeQueryResultValue::BuildTarget { .. }
                 | CodeQueryResultValue::TopologyEdge { .. }
                 | CodeQueryResultValue::RewritePath { .. }
-                | CodeQueryResultValue::ConfigurationFact { .. } => None,
+                | CodeQueryResultValue::DependencyEvidence { .. }
+                | CodeQueryResultValue::ConfigurationFact { .. }
+                | CodeQueryResultValue::CrossDomain { .. } => None,
             })
             .collect()
     }
@@ -250,6 +260,19 @@ impl CodeQueryResult {
                             value.id,
                         ));
                     }
+                    CodeQueryResultValue::RustPointerFinding { value } => {
+                        out.push_str(&format!(
+                            "{}:{}:{} [rust pointer {}; {}; {}; {}] {}\n",
+                            value.path,
+                            value.range.start_line,
+                            value.range.start_column,
+                            value.relation,
+                            value.origin_kind,
+                            value.strength,
+                            value.completeness,
+                            value.id,
+                        ));
+                    }
                     CodeQueryResultValue::File { value } => {
                         out.push_str(&format!("{} [file; {}]\n", value.path, value.language));
                     }
@@ -345,6 +368,20 @@ impl CodeQueryResult {
                             value.completeness,
                             value.site_id,
                             value.id
+                        ));
+                    }
+                    CodeQueryResultValue::PointsToCandidate { value } => {
+                        out.push_str(&format!(
+                            "{}:{}:{} [points-to candidate; {}; {}; {}] site={} point={:?} candidate={}\n",
+                            value.path,
+                            value.range.start_line,
+                            value.range.start_column,
+                            value.proof,
+                            value.completeness,
+                            value.coverage,
+                            value.site_id,
+                            value.program_point_id,
+                            value.candidate_index,
                         ));
                     }
                     CodeQueryResultValue::FieldWriteValue { value } => {
@@ -450,6 +487,16 @@ impl CodeQueryResult {
                                 .as_ref()
                                 .map_or(value.target_id.as_str(), |unit| unit.fq_name.as_str()),
                             value.hierarchy_depth,
+                        ));
+                    }
+                    CodeQueryResultValue::PythonHierarchyFact { value } => {
+                        out.push_str(&format!(
+                            "[python {} {}; {}; {}] {}\n",
+                            value.fact_kind,
+                            value.outcome,
+                            value.coverage,
+                            value.reason.unwrap_or("no_reason"),
+                            value.path,
                         ));
                     }
                     CodeQueryResultValue::CallShape { value } => {
@@ -697,19 +744,6 @@ impl CodeQueryResult {
                             value.reason.unwrap_or(value.coverage),
                         ));
                     }
-                    CodeQueryResultValue::ConcurrentAccessConflict { value } => {
-                        out.push_str(&format!(
-                            "{}:{}:{} [concurrent access conflict; {}; {}; {}; {}] {}\n",
-                            value.path,
-                            value.range.start_line,
-                            value.range.start_column,
-                            value.task_relation,
-                            value.ordering,
-                            value.protection,
-                            value.proof,
-                            value.location_kind,
-                        ));
-                    }
                     CodeQueryResultValue::ClassSetRow { value } => {
                         out.push_str(&format!(
                             "{}:{}:{} [class set; {}{}] {} <- {}\n",
@@ -801,6 +835,41 @@ impl CodeQueryResult {
                                 .as_deref()
                                 .map(|return_type| format!("; returns={return_type}"))
                                 .unwrap_or_default(),
+                        ));
+                    }
+                    CodeQueryResultValue::LiteralOccurrence { value } => {
+                        out.push_str(&format!(
+                            "{}:{}:{} [literal occurrence; {}; {}; {}={}; scope={}]\n",
+                            value.path,
+                            value.range.start_line,
+                            value.range.start_column,
+                            value.language,
+                            value.coverage,
+                            value.kind,
+                            value.identity.as_deref().unwrap_or("unknown"),
+                            value.scope_id,
+                        ));
+                    }
+                    CodeQueryResultValue::CallableMetrics { value } => {
+                        out.push_str(&format!(
+                            "{}:{}:{} [callable metrics; {}; {}] {} nesting={} complexity={} span={}\n",
+                            value.path,
+                            value.range.start_line,
+                            value.range.start_column,
+                            value.language,
+                            value.coverage,
+                            value.declaration.fq_name,
+                            value
+                                .max_nesting
+                                .map_or_else(|| "unknown".to_owned(), |metric| metric.to_string()),
+                            value.cognitive_complexity.map_or_else(
+                                || "unknown".to_owned(),
+                                |metric| metric.to_string()
+                            ),
+                            value.owned_body_span_lines.map_or_else(
+                                || "unknown".to_owned(),
+                                |metric| metric.to_string()
+                            ),
                         ));
                     }
                     CodeQueryResultValue::SignatureParameter { value } => {
@@ -1100,6 +1169,17 @@ impl CodeQueryResult {
                             ));
                         }
                     }
+                    CodeQueryResultValue::BindingInitializerCall { value } => {
+                        out.push_str(&format!(
+                            "{}:{}:{} [binding initializer call; {}; establishment={}] site_ast_id={}\n",
+                            value.path,
+                            value.range.start_line,
+                            value.range.start_column,
+                            value.initializer_role,
+                            value.establishment_event_id,
+                            value.site_ast_id,
+                        ));
+                    }
                     CodeQueryResultValue::FlowRelation { value } => {
                         out.push_str(&format!(
                             "{}:{}:{} [flow_relation; {}; {}] {} -> {}\n",
@@ -1185,6 +1265,16 @@ impl CodeQueryResult {
                             out.push_str(&format!("  reason: {reason:?}\n"));
                         }
                     }
+                    CodeQueryResultValue::CppExpression { value } => {
+                        out.push_str(&format!(
+                            "{}:{}:{} [cpp_expression; {}; {}]\n",
+                            value.path,
+                            value.range.start_line,
+                            value.range.start_column,
+                            value.kind,
+                            value.completeness,
+                        ));
+                    }
                     CodeQueryResultValue::FailureHandlerState { value } => {
                         out.push_str(&format!(
                             "{}:{}:{} [failure_handler_state; {}; {}]\n",
@@ -1206,6 +1296,36 @@ impl CodeQueryResult {
                             value.range.start_column,
                             value.statement_kind,
                             value.verdict,
+                        ));
+                        if let Some(reason) = &value.reason {
+                            out.push_str(&format!("  reason: {reason}\n"));
+                        }
+                    }
+                    CodeQueryResultValue::PendingCleanupFlow { value } => {
+                        out.push_str(&format!(
+                            "{}:{}:{} [pending_cleanup_flow; {}; {}; {}; {}; {}]\n",
+                            value.path,
+                            value.range.start_line,
+                            value.range.start_column,
+                            value.cleanup_kind,
+                            value.pending_kind,
+                            value.verdict,
+                            value.proof,
+                            value.coverage,
+                        ));
+                        if let Some(reason) = &value.reason {
+                            out.push_str(&format!("  reason: {reason}\n"));
+                        }
+                    }
+                    CodeQueryResultValue::PythonRuleFact { value } => {
+                        out.push_str(&format!(
+                            "{}:{}:{} [python_rule_fact; {}; {}; {}]\n",
+                            value.path,
+                            value.range.start_line,
+                            value.range.start_column,
+                            value.relation,
+                            value.outcome,
+                            value.completeness,
                         ));
                         if let Some(reason) = &value.reason {
                             out.push_str(&format!("  reason: {reason}\n"));
@@ -1343,6 +1463,22 @@ impl CodeQueryResult {
                             ));
                         }
                     }
+                    CodeQueryResultValue::DependencyEvidence { value } => {
+                        out.push_str(&format!(
+                            "{}:{}..{} [{} {} {}] {}\n",
+                            value.path,
+                            value.start_byte,
+                            value.end_byte,
+                            value.ecosystem,
+                            value.evidence_kind,
+                            value.package,
+                            value
+                                .exact_version
+                                .as_deref()
+                                .or(value.version_requirement.as_deref())
+                                .unwrap_or("unresolved")
+                        ));
+                    }
                     CodeQueryResultValue::ConfigurationFact { value } => {
                         out.push_str(&format!(
                             "{}:{}:{} [configuration; {} {}.{}] {}\n",
@@ -1354,6 +1490,36 @@ impl CodeQueryResult {
                             value.key.as_deref().unwrap_or("<document>"),
                             value.route,
                         ));
+                    }
+                    CodeQueryResultValue::CrossDomain { value } => {
+                        out.push_str(&value.path);
+                        if let Some(range) = value.range {
+                            out.push_str(&format!(":{}:{}", range.start_line, range.start_column));
+                        }
+                        out.push_str(&format!(
+                            " [cross_domain; {} {}",
+                            value.operator, value.domain,
+                        ));
+                        if let Some(relation) = value.relation {
+                            out.push_str(&format!(" {relation}"));
+                        }
+                        if let Some(binding) = value.binding {
+                            out.push_str(&format!(" {binding}"));
+                        }
+                        out.push(']');
+                        if let Some(key) = &value.key {
+                            out.push_str(&format!(" key {key:?}"));
+                        }
+                        if let Some(configuration) = &value.configuration {
+                            out.push_str(&format!(
+                                " -> {}:{}:{} {}",
+                                configuration.path,
+                                configuration.range.start_line,
+                                configuration.range.start_column,
+                                configuration.route,
+                            ));
+                        }
+                        out.push('\n');
                     }
                 }
                 if let Some(summary) = result.provenance_summary() {

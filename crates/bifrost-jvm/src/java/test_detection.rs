@@ -1,7 +1,9 @@
 use crate::java::declarations::{node_text, parse_tree};
 use crate::java::exceptions::named_child_by_kind;
 use brokk_bifrost_core::analyzer::model::{TestAssertionSmell, TestAssertionWeights};
-use brokk_bifrost_core::analyzer::test_assertions::compact_assertion_excerpt;
+use brokk_bifrost_core::analyzer::test_assertions::{
+    TestAssertionSignal, append_test_assertion_findings, compact_assertion_excerpt,
+};
 use brokk_bifrost_core::analyzer::tree_walk::{WalkControl, walk_named_tree_preorder};
 use brokk_bifrost_core::analyzer::{CodeUnitIndex, ProjectFile};
 use brokk_bifrost_core::hash::HashMap;
@@ -82,14 +84,9 @@ const TEST_ASSERTION_KIND_CONSTANT_TRUTH: &str = "constant-truth";
 const TEST_ASSERTION_KIND_CONSTANT_EQUALITY: &str = "constant-equality";
 const TEST_ASSERTION_KIND_SELF_COMPARISON: &str = "self-comparison";
 const TEST_ASSERTION_KIND_NULLNESS_ONLY: &str = "nullness-only";
-const TEST_ASSERTION_KIND_SHALLOW_ONLY: &str = "shallow-assertions-only";
 const TEST_ASSERTION_KIND_OVERSPECIFIED_LITERAL: &str = "overspecified-literal";
 const TEST_ASSERTION_KIND_ANONYMOUS_TEST_DOUBLE: &str = "anonymous-test-double";
 const TEST_ASSERTION_REASON_REUSABLE_TEST_DOUBLE: &str = "reusable-test-double-candidate";
-
-fn compact_test_assertion_excerpt(text: &str) -> String {
-    compact_assertion_excerpt(text, TEST_ASSERTION_EXCERPT_MAX_LEN)
-}
 
 pub fn java_source_contains_tests(root: Node<'_>, source: &str) -> bool {
     let mut found = false;
@@ -145,18 +142,19 @@ fn java_extends_testcase(node: Node<'_>, source: &str) -> bool {
 }
 
 fn first_named_descendant<'tree>(node: Node<'tree>, kinds: &[&str]) -> Option<Node<'tree>> {
-    let mut stack = vec![node];
-    while let Some(current) = stack.pop() {
-        if kinds.contains(&current.kind()) {
-            return Some(current);
-        }
-        for index in (0..current.named_child_count()).rev() {
-            if let Some(child) = current.named_child(index) {
-                stack.push(child);
-            }
-        }
+    if kinds.contains(&node.kind()) {
+        return Some(node);
     }
-    None
+    let mut found = None;
+    brokk_bifrost_core::analyzer::tree_walk::walk_named_tree_preorder(node, false, |candidate| {
+        if kinds.contains(&candidate.kind()) {
+            found = Some(candidate);
+            brokk_bifrost_core::analyzer::tree_walk::WalkControl::Break
+        } else {
+            brokk_bifrost_core::analyzer::tree_walk::WalkControl::Continue
+        }
+    });
+    found
 }
 
 fn final_identifier_text<'a>(node: Node<'_>, source: &'a str) -> Option<&'a str> {
@@ -213,14 +211,7 @@ pub fn detect_test_assertion_smells_java(
 }
 
 pub fn collect_nodes_by_kind<'tree>(node: Node<'tree>, kind: &str, out: &mut Vec<Node<'tree>>) {
-    if node.kind() == kind {
-        out.push(node);
-    }
-    for i in 0..node.child_count() {
-        if let Some(child) = node.child(i) {
-            collect_nodes_by_kind(child, kind, out);
-        }
-    }
+    out.extend(brokk_bifrost_core::analyzer::exception_handling::collect_nodes_by_kind(node, kind));
 }
 
 fn is_test_method(method: Node<'_>, source: &str) -> bool {
@@ -271,9 +262,11 @@ fn analyze_test_method_assertions(
         .enclosing_code_unit_for_lines(file, method.start_position().row, method.end_position().row)
         .map(|cu| cu.fq_name())
         .unwrap_or_else(|| rel_path_string(file));
-    let assertion_count = assertions.len() as i32;
+    let body_excerpt = source
+        .get(method.start_byte()..method.end_byte())
+        .unwrap_or("");
 
-    if assertion_count == 0 {
+    if assertions.is_empty() {
         add_test_smell(
             file,
             &enclosing,
@@ -282,9 +275,7 @@ fn analyze_test_method_assertions(
                 score: weights.no_assertion_weight,
                 assertion_count: 0,
                 reasons: vec![TEST_ASSERTION_KIND_NO_ASSERTIONS.to_string()],
-                excerpt_source: source
-                    .get(method.start_byte()..method.end_byte())
-                    .unwrap_or(""),
+                excerpt_source: body_excerpt,
                 start_byte: method.start_byte(),
             },
             out,
@@ -292,41 +283,27 @@ fn analyze_test_method_assertions(
         return;
     }
 
-    for assertion in &assertions {
-        add_test_smell(
-            file,
-            &enclosing,
-            PendingTestSmell {
-                assertion_kind: &assertion.kind,
-                score: assertion.base_score,
-                assertion_count,
-                reasons: assertion.reasons.clone(),
-                excerpt_source: &assertion.excerpt,
-                start_byte: assertion.start_byte,
-            },
-            out,
-        );
-    }
-
-    if assertions.iter().all(|a| a.shallow) {
-        let score = weights.shallow_assertion_only_weight
-            - meaningful_assertion_credit(assertions.iter(), weights, |a| a.meaningful);
-        add_test_smell(
-            file,
-            &enclosing,
-            PendingTestSmell {
-                assertion_kind: TEST_ASSERTION_KIND_SHALLOW_ONLY,
-                score,
-                assertion_count,
-                reasons: vec![TEST_ASSERTION_KIND_SHALLOW_ONLY.to_string()],
-                excerpt_source: source
-                    .get(method.start_byte()..method.end_byte())
-                    .unwrap_or(""),
-                start_byte: method.start_byte(),
-            },
-            out,
-        );
-    }
+    let assertions: Vec<_> = assertions
+        .into_iter()
+        .map(|assertion| TestAssertionSignal {
+            kind: assertion.kind,
+            score: assertion.base_score,
+            shallow: assertion.shallow,
+            meaningful: assertion.meaningful,
+            reasons: assertion.reasons,
+            excerpt: compact_assertion_excerpt(&assertion.excerpt, TEST_ASSERTION_EXCERPT_MAX_LEN),
+            start_byte: assertion.start_byte,
+        })
+        .collect();
+    append_test_assertion_findings(
+        file,
+        enclosing,
+        compact_assertion_excerpt(body_excerpt, TEST_ASSERTION_EXCERPT_MAX_LEN),
+        method.start_byte(),
+        &assertions,
+        weights,
+        out,
+    );
 }
 
 fn analyze_anonymous_test_doubles(
@@ -585,7 +562,7 @@ fn add_test_smell(
         score: smell.score,
         assertion_count: smell.assertion_count,
         reasons: smell.reasons,
-        excerpt: compact_test_assertion_excerpt(smell.excerpt_source),
+        excerpt: compact_assertion_excerpt(smell.excerpt_source, TEST_ASSERTION_EXCERPT_MAX_LEN),
         start_byte: smell.start_byte,
     });
 }
@@ -609,8 +586,7 @@ fn argument_nodes(invocation: Node<'_>) -> Vec<Node<'_>> {
     if arguments.kind() != "argument_list" {
         return Vec::new();
     }
-    let mut cursor = arguments.walk();
-    arguments.named_children(&mut cursor).collect()
+    brokk_bifrost_core::analyzer::tree_walk::named_children(arguments)
 }
 
 fn comparable_assertion_args<'tree>(args: &'tree [Node<'tree>]) -> &'tree [Node<'tree>] {
@@ -662,15 +638,7 @@ fn is_self_comparison(node: Node<'_>, source: &str) -> bool {
 }
 
 fn same_expression(left: Node<'_>, right: Node<'_>, source: &str) -> bool {
-    let left_text = source
-        .get(left.start_byte()..left.end_byte())
-        .unwrap_or("")
-        .trim();
-    let right_text = source
-        .get(right.start_byte()..right.end_byte())
-        .unwrap_or("")
-        .trim();
-    left_text == right_text
+    crate::same_expression_text(left, right, source)
 }
 
 fn is_constant_expression(node: Node<'_>) -> bool {
@@ -687,22 +655,8 @@ fn contains_overspecified_literal(
     weights: &TestAssertionWeights,
 ) -> bool {
     let threshold = weights.large_literal_length_threshold.max(0) as usize;
-    args.iter().any(|arg| {
-        is_string_literal(*arg)
-            && source
-                .get(arg.start_byte()..arg.end_byte())
-                .is_some_and(|text| text.len() >= threshold)
-    })
-}
-
-fn meaningful_assertion_credit<'a>(
-    assertions: impl Iterator<Item = &'a AssertionSignal>,
-    weights: &TestAssertionWeights,
-    predicate: impl Fn(&AssertionSignal) -> bool,
-) -> i32 {
-    let count = assertions.filter(|assertion| predicate(assertion)).count() as i32;
-    let creditable = count.min(weights.meaningful_assertion_credit_cap.max(0));
-    weights.meaningful_assertion_credit.max(0) * creditable
+    args.iter()
+        .any(|arg| crate::is_overspecified_string_literal(*arg, source, threshold))
 }
 
 fn anonymous_test_double_shape_counts(
@@ -770,27 +724,4 @@ struct PendingTestSmell<'a> {
     reasons: Vec<String>,
     excerpt_source: &'a str,
     start_byte: usize,
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn contains_tests(source: &str) -> bool {
-        let tree = parse_tree(source).expect("parse Java fixture");
-        java_source_contains_tests(tree.root_node(), source)
-    }
-
-    #[test]
-    fn recognizes_framework_specific_testcase_subclasses_structurally() {
-        assert!(contains_tests(
-            "class SSLServiceTests extends ESTestCase { void testReload() {} }"
-        ));
-        assert!(contains_tests(
-            "class LegacyTests extends framework.IntegrationTestCase {}"
-        ));
-        assert!(!contains_tests(
-            "class ProductionService extends UseCase {}"
-        ));
-    }
 }

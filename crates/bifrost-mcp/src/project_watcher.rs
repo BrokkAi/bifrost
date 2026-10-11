@@ -42,18 +42,11 @@ impl ProjectChangeWatcher {
         project: Arc<dyn Project>,
         claimed_files: &[ProjectFile],
     ) -> Result<Self, String> {
-        let pending = Arc::new(Mutex::new(PendingChanges::default()));
-        let mut watcher = recommended_watcher(event_handler(&project, &pending))
-            .map_err(|err| format!("Failed to create project watcher: {err}"))?;
-
-        watcher
-            .configure(Config::default())
-            .map_err(|err| format!("Failed to configure project watcher: {err}"))?;
-        watch_project_paths(&mut watcher, project.as_ref(), claimed_files)?;
-
-        Ok(Self {
-            _watcher: WatcherBackend::Recommended { _watcher: watcher },
-            pending,
+        let handler_project = Arc::clone(&project);
+        Self::start_with_backend(project, claimed_files, move |pending| {
+            recommended_watcher(event_handler(&handler_project, pending))
+                .map(|watcher| WatcherBackend::Recommended { _watcher: watcher })
+                .map_err(|err| format!("Failed to create project watcher: {err}"))
         })
     }
 
@@ -67,17 +60,37 @@ impl ProjectChangeWatcher {
         project: Arc<dyn Project>,
         claimed_files: &[ProjectFile],
     ) -> Result<Self, String> {
+        let handler_project = Arc::clone(&project);
+        Self::start_with_backend(project, claimed_files, move |pending| {
+            let config = Config::default()
+                .with_poll_interval(Duration::from_millis(20))
+                .with_compare_contents(true);
+            PollWatcher::new(event_handler(&handler_project, pending), config)
+                .map(|watcher| WatcherBackend::Poll { _watcher: watcher })
+                .map_err(|err| format!("Failed to create polling project watcher: {err}"))
+        })
+    }
+
+    fn start_with_backend(
+        project: Arc<dyn Project>,
+        claimed_files: &[ProjectFile],
+        create_backend: impl FnOnce(&Arc<Mutex<PendingChanges>>) -> Result<WatcherBackend, String>,
+    ) -> Result<Self, String> {
         let pending = Arc::new(Mutex::new(PendingChanges::default()));
-        let config = Config::default()
-            .with_poll_interval(Duration::from_millis(20))
-            .with_compare_contents(true);
-        let mut watcher = PollWatcher::new(event_handler(&project, &pending), config)
-            .map_err(|err| format!("Failed to create polling project watcher: {err}"))?;
-
-        watch_project_paths(&mut watcher, project.as_ref(), claimed_files)?;
-
+        let mut watcher = create_backend(&pending)?;
+        match &mut watcher {
+            WatcherBackend::Recommended { _watcher } => {
+                _watcher
+                    .configure(Config::default())
+                    .map_err(|err| format!("Failed to configure project watcher: {err}"))?;
+                watch_project_paths(_watcher, project.as_ref(), claimed_files)?;
+            }
+            WatcherBackend::Poll { _watcher } => {
+                watch_project_paths(_watcher, project.as_ref(), claimed_files)?;
+            }
+        }
         Ok(Self {
-            _watcher: WatcherBackend::Poll { _watcher: watcher },
+            _watcher: watcher,
             pending,
         })
     }
@@ -276,9 +289,8 @@ enum GitInternalPath {
     Churn,
 }
 
-/// The `.git` entries whose changes reach the full-refresh decision. Census in
-/// `.agents/docs/fenced-followups-investigation-2026-08.md` (Part B): nothing
-/// in the workspace reads any other `.git` path in response to an event.
+/// The `.git` entries whose changes reach the full-refresh decision. Other
+/// `.git` internals are bookkeeping and are not read as workspace source.
 const GIT_REF_STATE_FILE_NAMES: [&str; 4] = ["HEAD", "packed-refs", "MERGE_HEAD", "ORIG_HEAD"];
 const GIT_REFS_DIR_NAME: &str = "refs";
 const GIT_DIR_NAME: &str = ".git";
@@ -507,6 +519,7 @@ mod tests {
     use crate::ProjectFile;
     use crate::path_normalization::NormalizePath;
     use crate::{FilesystemProject, Project};
+    use brokk_bifrost_test_macros::hardwon;
     use notify::event::{CreateKind, ModifyKind, RemoveKind};
     use notify::{Event, EventKind};
     use std::fs;
@@ -517,13 +530,11 @@ mod tests {
     pub(super) fn project_with_files(paths: &[&str]) -> (TempDir, Arc<dyn Project>) {
         let temp = TempDir::new().unwrap();
         let root = temp.path().canonicalize().unwrap();
-        for path in paths {
-            let abs = root.join(path);
-            if let Some(parent) = abs.parent() {
-                fs::create_dir_all(parent).unwrap();
-            }
-            fs::write(abs, "fn item() {}\n").unwrap();
-        }
+        let files = paths
+            .iter()
+            .map(|path| (*path, "fn item() {}\n"))
+            .collect::<Vec<_>>();
+        brokk_bifrost_analysis::test_support::write_fixture_files(&root, &files);
         let project = Arc::new(FilesystemProject::new(root).unwrap()) as Arc<dyn Project>;
         (temp, project)
     }
@@ -575,6 +586,7 @@ mod tests {
     }
 
     #[test]
+    #[hardwon("18a38bca1916: per-path FSEvents startup could deadlock the watcher worker")]
     fn watcher_startup_installs_initial_paths_in_one_batch() {
         let (_temp, project) = project_with_files(&["src/main.rs", "tests/a.rs"]);
         let mut watcher = BatchOnlyWatcher::default();
@@ -593,75 +605,13 @@ mod tests {
         }
     }
 
-    #[test]
-    fn watch_roots_collapse_to_top_level_analyzed_dirs() {
-        let (_temp, project) =
-            project_with_files(&["src/main.rs", "src/nested/lib.rs", "tests/a.rs"]);
-        let roots = watch_roots(project.as_ref(), &[]).unwrap();
-        let rels: Vec<_> = roots
-            .iter()
-            .map(|path| {
-                path.strip_prefix(project.root())
-                    .unwrap()
-                    .to_string_lossy()
-                    .replace('\\', "/")
-            })
-            .collect();
-        assert_eq!(rels, vec!["src", "tests"]);
-    }
-
-    #[test]
-    fn watch_roots_include_existing_bifrost_project_configuration() {
-        let (_temp, project) = project_with_files(&[
-            "src/main.rs",
-            ".bifrost/policies/example.rqlp",
-            ".bifrost/suppressions.json",
-        ]);
-        let roots = watch_roots(project.as_ref(), &[]).unwrap();
-        let rels: Vec<_> = roots
-            .iter()
-            .map(|path| {
-                path.strip_prefix(project.root())
-                    .unwrap()
-                    .to_string_lossy()
-                    .replace('\\', "/")
-            })
-            .collect();
-
-        assert_eq!(rels, vec![".bifrost", "src"]);
-    }
-
-    #[test]
-    fn polling_watcher_delivers_bifrost_configuration_edits() {
-        let (_temp, project) = project_with_files(&["src/main.rs", ".bifrost/suppressions.json"]);
-        let suppression_path = project.root().join(".bifrost/suppressions.json");
-        let watcher = ProjectChangeWatcher::start_polling_for_tests(Arc::clone(&project)).unwrap();
-
-        fs::write(&suppression_path, "updated configuration").unwrap();
-        for _ in 0..100 {
-            if watcher.has_pending() {
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(20));
-        }
-
-        let delta = watcher.take_changed_files();
-        assert!(!delta.requires_full_refresh);
-        assert!(
-            delta
-                .files
-                .iter()
-                .any(|file| file.abs_path() == suppression_path),
-            "the live watcher must deliver tracked suppression edits"
-        );
-    }
-
     /// A language's configuration input often sits one directory above every
     /// source file it governs (`crates/x/Cargo.toml` over `crates/x/src`), so
     /// no recursive source root covers it. An edit to it must still reach
     /// the pending delta, or the analyzer keeps the old crate, module or
     /// path-alias layout until a restart (#3755).
     #[test]
+    #[hardwon("#3755: watcher missed edits to nested language manifests")]
     fn polling_watcher_delivers_nested_configuration_edits() {
         for (manifest, files) in [
             (
@@ -699,101 +649,6 @@ mod tests {
     }
 
     #[test]
-    fn watch_roots_fall_back_to_project_root_when_no_analyzable_files_exist() {
-        let temp = TempDir::new().unwrap();
-        let root = temp.path().canonicalize().unwrap();
-        fs::write(root.join(".gitignore"), "").unwrap();
-        fs::create_dir_all(root.join("src")).unwrap();
-        let project = FilesystemProject::new(root.clone()).unwrap();
-        let roots = watch_roots(&project, &[]).unwrap();
-        assert_eq!(roots, vec![root.normalize()]);
-    }
-
-    #[test]
-    fn internal_cache_events_do_not_trigger_project_updates() {
-        let (_temp, project) = project_with_files(&["src/main.rs"]);
-        let cache_dir = project
-            .root()
-            .join(crate::gitblob::PROJECT_DIR_NAME)
-            .join(crate::gitblob::CACHE_SUBDIR_NAME);
-        fs::create_dir_all(&cache_dir).unwrap();
-        let cache_db = cache_dir.join(crate::cache_db::cache_db_file_name());
-        fs::write(&cache_db, "cache state").unwrap();
-
-        for kind in [
-            EventKind::Modify(ModifyKind::Any),
-            EventKind::Remove(RemoveKind::Any),
-        ] {
-            let pending = Arc::new(Mutex::new(PendingChanges::default()));
-            handle_event(
-                &project,
-                &pending,
-                Event::new(kind).add_path(cache_db.clone()),
-            );
-
-            let state = pending.lock().unwrap();
-            assert!(state.files.is_empty());
-            assert!(!state.requires_full_refresh);
-        }
-    }
-
-    #[test]
-    fn legacy_root_cache_events_do_not_trigger_project_updates() {
-        let (_temp, project) = project_with_files(&["src/main.rs"]);
-        let project_dir = project.root().join(crate::gitblob::PROJECT_DIR_NAME);
-        fs::create_dir_all(&project_dir).unwrap();
-
-        for name in [
-            crate::cache_db::LEGACY_CACHE_DB_FILE_NAME,
-            "bifrost_cache.db-wal",
-            "bifrost_cache.db-shm",
-            "bifrost_cache.db-journal",
-        ] {
-            let path = project_dir.join(name);
-            fs::write(&path, "legacy cache state").unwrap();
-            let pending = Arc::new(Mutex::new(PendingChanges::default()));
-            handle_event(
-                &project,
-                &pending,
-                Event::new(EventKind::Modify(ModifyKind::Any)).add_path(path),
-            );
-
-            let state = pending.lock().unwrap();
-            assert!(state.files.is_empty(), "{name} must remain internal");
-            assert!(!state.requires_full_refresh);
-        }
-    }
-
-    #[test]
-    fn tracked_bifrost_configuration_events_are_project_updates() {
-        let (_temp, project) = project_with_files(&["src/main.rs"]);
-        for relative in [
-            ".bifrost/policies/example.rqlp",
-            ".bifrost/suppressions.json",
-        ] {
-            let path = project.root().join(relative);
-            fs::create_dir_all(path.parent().unwrap()).unwrap();
-            fs::write(&path, "configuration").unwrap();
-            let pending = Arc::new(Mutex::new(PendingChanges::default()));
-
-            handle_event(
-                &project,
-                &pending,
-                Event::new(EventKind::Modify(ModifyKind::Any)).add_path(path.clone()),
-            );
-
-            let state = pending.lock().unwrap();
-            assert_eq!(state.files.len(), 1, "{relative} must remain watched");
-            assert!(
-                state
-                    .files
-                    .contains(&ProjectFile::new(project.root().to_path_buf(), relative))
-            );
-            assert!(!state.requires_full_refresh);
-        }
-    }
-
-    #[test]
     fn bifrostignore_events_require_a_full_refresh() {
         let (_temp, project) = project_with_files(&["src/main.rs"]);
         let path = project.root().join(BIFROST_IGNORE_FILE_NAME);
@@ -811,63 +666,14 @@ mod tests {
         }
     }
 
-    #[test]
-    fn events_invalidate_the_projects_cached_file_listing() {
-        use crate::WorkspaceFileListingCache;
-
-        let temp = TempDir::new().unwrap();
-        let root = temp.path().canonicalize().unwrap().normalize();
-        fs::create_dir_all(root.join("src")).unwrap();
-        fs::write(root.join("src/main.rs"), "fn main() {}\n").unwrap();
-        let cache = Arc::new(WorkspaceFileListingCache::new(root.clone()));
-        let project: Arc<dyn crate::Project> = Arc::new(
-            FilesystemProject::with_cached_listing(root.clone(), Arc::clone(&cache)).unwrap(),
-        );
-
-        cache.files().unwrap();
-        let extra = ProjectFile::new(root.clone(), "src/extra.rs");
-        fs::write(extra.abs_path(), "fn extra() {}\n").unwrap();
-        assert!(
-            !cache.files().unwrap().contains(&extra),
-            "listing must be cached until an event invalidates it"
-        );
-
-        // Analyzer-owned SQLite state writes must not drop the listing: they
-        // follow every analyzed change and would defeat the cache.
-        let cache_db = root
-            .join(crate::gitblob::PROJECT_DIR_NAME)
-            .join(crate::gitblob::CACHE_SUBDIR_NAME)
-            .join(crate::cache_db::cache_db_file_name());
-        fs::create_dir_all(cache_db.parent().unwrap()).unwrap();
-        fs::write(&cache_db, "cache state").unwrap();
-        let pending = Arc::new(Mutex::new(PendingChanges::default()));
-        handle_event(
-            &project,
-            &pending,
-            Event::new(EventKind::Modify(ModifyKind::Any)).add_path(cache_db),
-        );
-        assert!(
-            !cache.files().unwrap().contains(&extra),
-            "internal cache-state events must not drop the cached listing"
-        );
-
-        handle_event(
-            &project,
-            &pending,
-            Event::new(EventKind::Modify(ModifyKind::Any)).add_path(extra.abs_path()),
-        );
-
-        assert!(
-            cache.files().unwrap().contains(&extra),
-            "a watcher event must drop the cached listing"
-        );
-    }
-
     /// Gate 13 defect 3: a content write to a listed file changes the file,
     /// not the listing, so the watcher keeps the listing (no worktree walk)
     /// and still hands the file to the next snapshot. A write to a
     /// `.gitignore` can change membership, so it still drops the listing.
     #[test]
+    #[hardwon(
+        "fe0249334d3c: watcher scans could outrun a content edit and leave the request stale"
+    )]
     fn content_writes_keep_the_cached_listing_and_still_report_the_file() {
         use crate::WorkspaceFileListingCache;
         use notify::event::DataChange;
@@ -931,6 +737,7 @@ mod tests {
     /// listed while it exists and gone after the rename. A new ignored file is
     /// decided the same way and stays out of the listing.
     #[test]
+    #[hardwon("4520464a4dde: editor rename saves caused repeated worktree scans")]
     fn a_rename_save_walks_nothing_and_still_reports_the_file() {
         use crate::WorkspaceFileListingCache;
         use notify::event::{DataChange, RenameMode};
@@ -1022,6 +829,7 @@ mod tests {
     }
 
     #[test]
+    #[hardwon("#1848: Git index-lock churn drove an unbounded watcher feedback loop")]
     fn git_churn_events_neither_walk_the_workspace_nor_update_the_project() {
         let (_temp, project) = project_with_files(&["src/main.rs"]);
         let baseline = project.workspace_file_listing_count();
@@ -1057,6 +865,7 @@ mod tests {
     }
 
     #[test]
+    #[hardwon("#1848: Git ref changes need refresh without classifying refs as project files")]
     fn git_ref_state_events_refresh_the_workspace_without_walking_it() {
         let (_temp, project) = project_with_files(&["src/main.rs"]);
         let baseline = project.workspace_file_listing_count();
@@ -1092,6 +901,7 @@ mod tests {
     }
 
     #[test]
+    #[hardwon("#1848: nested repository internals and .github paths crossed the watcher boundary")]
     fn nested_repository_internals_follow_the_same_boundary_as_the_workspace_walk() {
         let (_temp, project) = project_with_files(&["src/main.rs", ".github/workflows/ci.yml"]);
         let baseline = project.workspace_file_listing_count();
@@ -1147,6 +957,7 @@ mod tests {
     }
 
     #[test]
+    #[hardwon("#1848: the Git internal-path exemption must preserve ordinary source events")]
     fn source_events_still_invalidate_the_listing_and_classify() {
         use crate::WorkspaceFileListingCache;
 
@@ -1189,6 +1000,7 @@ mod tests {
     /// second, indefinitely (issue #1848). No walk is legitimate here: nothing
     /// under the working tree changes.
     #[test]
+    #[hardwon("#1848: Git bookkeeping events caused a self-sustaining workspace scan loop")]
     fn git_bookkeeping_in_a_watched_repository_never_walks_the_workspace() {
         let temp = TempDir::new().unwrap();
         let root = temp.path().canonicalize().unwrap().normalize();
@@ -1244,6 +1056,7 @@ mod tests {
     }
 
     #[test]
+    #[hardwon("#692: cache writes must not trigger full workspace refreshes")]
     fn source_events_are_incremental_but_git_events_trigger_full_refresh() {
         let (_temp, project) = project_with_files(&["src/main.rs"]);
         let source = ProjectFile::new(project.root().to_path_buf(), "src/main.rs");
@@ -1274,6 +1087,190 @@ mod tests {
     }
 
     #[test]
+    #[hardwon("86e7440a87d3: watcher scope stays limited to top-level analyzed directories")]
+    fn watch_roots_collapse_to_top_level_analyzed_dirs() {
+        let (_temp, project) =
+            project_with_files(&["src/main.rs", "src/nested/lib.rs", "tests/a.rs"]);
+        let roots = watch_roots(project.as_ref(), &[]).unwrap();
+        let rels: Vec<_> = roots
+            .iter()
+            .map(|path| {
+                path.strip_prefix(project.root())
+                    .unwrap()
+                    .to_string_lossy()
+                    .replace('\\', "/")
+            })
+            .collect();
+        assert_eq!(rels, vec!["src", "tests"]);
+    }
+
+    #[test]
+    #[hardwon("#3755: tracked Bifrost configuration files must be watched")]
+    fn watch_roots_include_existing_bifrost_project_configuration() {
+        let (_temp, project) = project_with_files(&[
+            "src/main.rs",
+            ".bifrost/policies/example.rqlp",
+            ".bifrost/suppressions.json",
+        ]);
+        let roots = watch_roots(project.as_ref(), &[]).unwrap();
+        let rels: Vec<_> = roots
+            .iter()
+            .map(|path| {
+                path.strip_prefix(project.root())
+                    .unwrap()
+                    .to_string_lossy()
+                    .replace('\\', "/")
+            })
+            .collect();
+
+        assert_eq!(rels, vec![".bifrost", "src"]);
+    }
+
+    #[test]
+    #[hardwon("#3755: a Bifrost configuration edit reaches the live watcher delta")]
+    fn polling_watcher_delivers_bifrost_configuration_edits() {
+        let (_temp, project) = project_with_files(&["src/main.rs", ".bifrost/suppressions.json"]);
+        let suppression_path = project.root().join(".bifrost/suppressions.json");
+        let watcher = ProjectChangeWatcher::start_polling_for_tests(Arc::clone(&project)).unwrap();
+
+        fs::write(&suppression_path, "updated configuration").unwrap();
+        for _ in 0..100 {
+            if watcher.has_pending() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+
+        let delta = watcher.take_changed_files();
+        assert!(!delta.requires_full_refresh);
+        assert!(
+            delta
+                .files
+                .iter()
+                .any(|file| file.abs_path() == suppression_path),
+            "the live watcher must deliver tracked suppression edits"
+        );
+    }
+
+    #[test]
+    #[hardwon("86e7440a87d3: empty source workspaces still watch the project root")]
+    fn watch_roots_fall_back_to_project_root_when_no_analyzable_files_exist() {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        fs::write(root.join(".gitignore"), "").unwrap();
+        fs::create_dir_all(root.join("src")).unwrap();
+        let project = FilesystemProject::new(root.clone()).unwrap();
+        let roots = watch_roots(&project, &[]).unwrap();
+        assert_eq!(roots, vec![root.normalize()]);
+    }
+
+    #[test]
+    fn tracked_bifrost_configuration_events_are_project_updates() {
+        let (_temp, project) = project_with_files(&["src/main.rs"]);
+        for relative in [
+            ".bifrost/policies/example.rqlp",
+            ".bifrost/suppressions.json",
+        ] {
+            let path = project.root().join(relative);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(&path, "configuration").unwrap();
+            let pending = Arc::new(Mutex::new(PendingChanges::default()));
+
+            handle_event(
+                &project,
+                &pending,
+                Event::new(EventKind::Modify(ModifyKind::Any)).add_path(path.clone()),
+            );
+
+            let state = pending.lock().unwrap();
+            assert_eq!(state.files.len(), 1, "{relative} must remain watched");
+            assert!(
+                state
+                    .files
+                    .contains(&ProjectFile::new(project.root().to_path_buf(), relative))
+            );
+            assert!(!state.requires_full_refresh);
+        }
+    }
+
+    #[test]
+    #[hardwon(
+        "#692+#1401: analyzer cache events triggered project updates or invalidated the cached listing"
+    )]
+    fn events_invalidate_the_projects_cached_file_listing() {
+        use crate::WorkspaceFileListingCache;
+
+        let temp = TempDir::new().unwrap();
+        let root = temp.path().canonicalize().unwrap().normalize();
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(root.join("src/main.rs"), "fn main() {}\n").unwrap();
+        let cache = Arc::new(WorkspaceFileListingCache::new(root.clone()));
+        let project: Arc<dyn crate::Project> = Arc::new(
+            FilesystemProject::with_cached_listing(root.clone(), Arc::clone(&cache)).unwrap(),
+        );
+
+        cache.files().unwrap();
+        let extra = ProjectFile::new(root.clone(), "src/extra.rs");
+        fs::write(extra.abs_path(), "fn extra() {}\n").unwrap();
+        assert!(
+            !cache.files().unwrap().contains(&extra),
+            "listing must be cached until an event invalidates it"
+        );
+
+        // Analyzer-owned SQLite state writes must not drop the listing: they
+        // follow every analyzed change and would defeat the cache.
+        let cache_db = root
+            .join(crate::gitblob::PROJECT_DIR_NAME)
+            .join(crate::gitblob::CACHE_SUBDIR_NAME)
+            .join(crate::cache_db::cache_db_file_name());
+        let legacy_cache_dir = root.join(crate::gitblob::PROJECT_DIR_NAME);
+        let cache_paths = std::iter::once(cache_db)
+            .chain(
+                [
+                    crate::cache_db::LEGACY_CACHE_DB_FILE_NAME,
+                    "bifrost_cache.db-wal",
+                    "bifrost_cache.db-shm",
+                    "bifrost_cache.db-journal",
+                ]
+                .map(|name| legacy_cache_dir.join(name)),
+            )
+            .collect::<Vec<_>>();
+        for path in &cache_paths {
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, "cache state").unwrap();
+        }
+        for path in cache_paths {
+            for kind in [
+                EventKind::Modify(ModifyKind::Any),
+                EventKind::Remove(RemoveKind::Any),
+            ] {
+                let pending = Arc::new(Mutex::new(PendingChanges::default()));
+                handle_event(&project, &pending, Event::new(kind).add_path(path.clone()));
+                let state = pending.lock().unwrap();
+                assert!(state.files.is_empty(), "{path:?} must remain internal");
+                assert!(!state.requires_full_refresh);
+                assert!(
+                    !cache.files().unwrap().contains(&extra),
+                    "internal cache-state events must not drop the cached listing: {path:?}"
+                );
+            }
+        }
+
+        let pending = Arc::new(Mutex::new(PendingChanges::default()));
+        handle_event(
+            &project,
+            &pending,
+            Event::new(EventKind::Modify(ModifyKind::Any)).add_path(extra.abs_path()),
+        );
+
+        assert!(
+            cache.files().unwrap().contains(&extra),
+            "a watcher event must drop the cached listing"
+        );
+    }
+
+    #[test]
+    #[hardwon("#1848: a coalesced Git event must force refresh alongside source changes")]
     fn mixed_source_and_git_events_trigger_full_refresh() {
         let (_temp, project) = project_with_files(&["src/main.rs"]);
         let source = ProjectFile::new(project.root().to_path_buf(), "src/main.rs");
@@ -1835,58 +1832,6 @@ mod pending_changes_properties {
         );
     }
 
-    /// Property 3. The full-refresh flag is a sticky OR over the sequence:
-    /// it is set exactly when some single event would set it on its own, it
-    /// never clears once set, and nothing delivered afterwards can take it
-    /// back. Stated against the implementation alone -- each event is also
-    /// applied by itself, so this holds without reference to the model.
-    #[cfg_attr(not(scheduled_tests), ignore = "scheduled-only")]
-    #[test]
-    fn full_refresh_is_the_sticky_or_of_the_sequence() {
-        let (_temp, project) = project_with_files(&fixture_relative_paths());
-        let watcher = accumulator();
-
-        proptest!(config(), |(script in event_script())| {
-            let events = script_events(&script);
-
-            let mut any_alone = false;
-            for event in &events {
-                apply(&project, &watcher, std::slice::from_ref(event));
-                any_alone |= watcher.take_changed_files().requires_full_refresh;
-            }
-
-            let mut previously_set = false;
-            for event in &events {
-                apply(&project, &watcher, std::slice::from_ref(event));
-                let now_set = watcher
-                    .pending
-                    .lock()
-                    .expect("project watcher pending state poisoned")
-                    .requires_full_refresh;
-                prop_assert!(
-                    now_set || !previously_set,
-                    "a later event cleared the full-refresh flag in {:?}",
-                    script
-                );
-                previously_set = now_set;
-            }
-
-            let delta = watcher.take_changed_files();
-            prop_assert_eq!(
-                delta.requires_full_refresh,
-                previously_set,
-                "the drain disagreed with the accumulated flag for {:?}",
-                script
-            );
-            prop_assert_eq!(
-                delta.requires_full_refresh,
-                any_alone,
-                "the sequence flag is not the OR of the individual events for {:?}",
-                script
-            );
-        });
-    }
-
     /// Property 4. The drained delta equals an independent fold of the same
     /// sequence: union of the project files each event names, OR of the
     /// refresh decisions.
@@ -1961,5 +1906,52 @@ mod pending_changes_properties {
                 );
             }
         );
+    }
+
+    #[cfg_attr(not(scheduled_tests), ignore = "scheduled-only")]
+    #[test]
+    fn full_refresh_is_the_sticky_or_of_the_sequence() {
+        let (_temp, project) = project_with_files(&fixture_relative_paths());
+        let watcher = accumulator();
+
+        proptest!(config(), |(script in event_script())| {
+            let events = script_events(&script);
+
+            let mut any_alone = false;
+            for event in &events {
+                apply(&project, &watcher, std::slice::from_ref(event));
+                any_alone |= watcher.take_changed_files().requires_full_refresh;
+            }
+
+            let mut previously_set = false;
+            for event in &events {
+                apply(&project, &watcher, std::slice::from_ref(event));
+                let now_set = watcher
+                    .pending
+                    .lock()
+                    .expect("project watcher pending state poisoned")
+                    .requires_full_refresh;
+                prop_assert!(
+                    now_set || !previously_set,
+                    "a later event cleared the full-refresh flag in {:?}",
+                    script
+                );
+                previously_set = now_set;
+            }
+
+            let delta = watcher.take_changed_files();
+            prop_assert_eq!(
+                delta.requires_full_refresh,
+                previously_set,
+                "the drain disagreed with the accumulated flag for {:?}",
+                script
+            );
+            prop_assert_eq!(
+                delta.requires_full_refresh,
+                any_alone,
+                "the sequence flag is not the OR of the individual events for {:?}",
+                script
+            );
+        });
     }
 }

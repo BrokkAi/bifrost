@@ -4,30 +4,30 @@ use std::fmt;
 use std::io::{self, Write};
 
 use crate::display_path::TaintDisplayPath;
-use crate::{PolicyDiffReview, PolicyIncrementalReview};
+use crate::{PolicyDiffReview, PolicyIncrementalReview, PolicyRunScope, PolicyRunScopeKind};
 
 use super::super::{
     BoundedWitness, CategoryPredicate, CertaintyReason, ClassificationProvenance, CvssAssessment,
-    CvssAssessmentProvenance, CvssAssessmentVariant, CvssComponentResult, CvssEvidenceBasis,
-    CvssEvidenceScope, CvssMetricEvidence, CvssNomenclature, CvssSeverity, CvssSystemScope,
-    CvssUnscoredReason, CvssVersion, DirectoryScope, EndpointDefinitionSchemaResolution,
-    EndpointObservationPhase, EndpointOrigin, EndpointRole, EndpointTaintSemantics, EvidenceRef,
-    FindingCertainty, FindingClassification, FindingCompleteness, FindingDiffDisposition,
-    FindingIdentityStability, FindingSeverity, MatchFindingAnchor, MatchResultDomain,
-    OrganizationalRiskAssessment, PolicyAnalysisType, PolicyCapability,
-    PolicyDependencyPackActivationMode, PolicyDiagnosticImpact, PolicyDiagnosticSeverity,
-    PolicyEndpointBinding, PolicyFailureReason, PolicyFinding, PolicyFindingEvidence,
-    PolicyIncompleteReason, PolicyLevel, PolicyLocationRelationship, PolicyMessageSpec,
+    CvssAssessmentProvenance, CvssAssessmentVariant, CvssComponentResult, CvssMetricEvidence,
+    CvssNomenclature, CvssSeverity, CvssUnscoredReason, CvssVersion,
+    EndpointDefinitionSchemaResolution, EndpointObservationPhase, EndpointOrigin, EndpointRole,
+    EndpointTaintSemantics, EvidenceRef, FindingCertainty, FindingClassification,
+    FindingCompleteness, FindingDiffDisposition, FindingIdentityStability, FindingSeverity,
+    MatchFindingAnchor, MatchResultDomain, OrganizationalRiskAssessment, PolicyAnalysisType,
+    PolicyCapability, PolicyDependencyPackActivationMode, PolicyDiagnosticImpact,
+    PolicyDiagnosticSeverity, PolicyEndpointBinding, PolicyFailureReason, PolicyFinding,
+    PolicyFindingEvidence, PolicyIncompleteReason, PolicyLocationRelationship, PolicyMessageSpec,
     PolicyObligation, PolicyOverlayScope, PolicyPackActivationReview, PolicyPackDecisionStatus,
     PolicyQueryProof, PolicyQueryProvenance, PolicyQueryResultRef, PolicyReportDocument,
-    PolicyRuleDescriptor, PolicyRun, PolicyRunCompletion, PolicySeveritySpec, PolicySourceLocation,
-    PolicySuppressionDecision, PolicySuppressionMatchState, PolicySuppressionOrphanState,
-    PolicySuppressionPolicyHashState, PolicySuppressionReview, PolicySuppressionTemporalState,
-    ProofMetadata, ProofReason, ResolvedEndpointDependency, ResolvedEndpointIdentity,
-    ResolvedEndpointManifestEntry, ResolvedEndpointSelectorSchemas, ResolvedEndpointSetDependency,
-    ResolvedMatchDirectoryManifest, ResolvedPrecedenceEdge, ResolvedTypestateTerminal,
-    SchemaVersionOrigin, SchemaVersionResolution, StableSemanticIdentity, TaintSourceEvidence,
-    TaintSystemEntry, TaintTrustBoundary, TypestateViolationEvidence,
+    PolicyRuleDescriptor, PolicyRun, PolicyRunCompletion, PolicySelectionProvenance,
+    PolicySeveritySpec, PolicySourceLocation, PolicySuppressionDecision,
+    PolicySuppressionMatchState, PolicySuppressionOrphanState, PolicySuppressionPolicyHashState,
+    PolicySuppressionReview, PolicySuppressionTemporalState, ProofMetadata, ProofReason,
+    ResolvedEndpointDependency, ResolvedEndpointIdentity, ResolvedEndpointManifestEntry,
+    ResolvedEndpointSelectorSchemas, ResolvedEndpointSetDependency, ResolvedMatchDirectoryManifest,
+    ResolvedPrecedenceEdge, ResolvedTypestateTerminal, SchemaVersionOrigin,
+    SchemaVersionResolution, StableSemanticIdentity, TaintSourceEvidence,
+    TypestateViolationEvidence,
 };
 
 use super::{
@@ -113,6 +113,7 @@ pub fn write_policy_human<W: Write>(
         }
     }
 
+    write_not_run_policies(&mut output, report)?;
     writeln!(output, "\nAnalysis warnings").map_err(map_io_error)?;
     write_schema_inference_notes(&mut output, report)?;
     for diagnostic in report.diagnostics() {
@@ -156,6 +157,9 @@ pub fn write_policy_human<W: Write>(
     }
 
     for run in report.runs() {
+        if matches!(run.completion(), PolicyRunCompletion::NotRun { .. }) {
+            continue;
+        }
         write_run_diagnostics(&mut output, run)?;
         write_run_obligations(&mut output, run, options.detail())?;
         if !run.completion().is_exhaustive() || run.diagnostics_truncated() {
@@ -254,7 +258,8 @@ fn report_has_analysis_warnings(report: &PolicyReportDocument) -> bool {
         || report.runs().iter().any(|run| {
             !run.diagnostics().is_empty()
                 || run.diagnostics_truncated()
-                || !run.completion().is_exhaustive()
+                || (!matches!(run.completion(), PolicyRunCompletion::NotRun { .. })
+                    && !run.completion().is_exhaustive())
                 || !run.obligations().is_empty()
                 || run.obligations_truncated()
         })
@@ -274,27 +279,9 @@ fn write_verbose_dependency_models<W: Write>(
         escape_terminal_text(review.document_path())
     )
     .map_err(map_io_error)?;
-    writeln!(
-        output,
-        "  Coverage: {}",
-        if review.complete() {
-            "complete"
-        } else {
-            "incomplete"
-        }
-    )
-    .map_err(map_io_error)?;
-    writeln!(
-        output,
-        "  Mode: {}; ecosystems: {}",
-        dependency_pack_activation_mode(review.dependency_mode()),
-        if review.ecosystems().is_empty() {
-            "none".to_owned()
-        } else {
-            review.ecosystems().join(",")
-        },
-    )
-    .map_err(map_io_error)?;
+    let (mode, coverage, ecosystems) = dependency_pack_labels(review);
+    writeln!(output, "  Coverage: {}", coverage).map_err(map_io_error)?;
+    writeln!(output, "  Mode: {}; ecosystems: {}", mode, ecosystems,).map_err(map_io_error)?;
     for decision in review.decisions() {
         write!(
             output,
@@ -337,17 +324,7 @@ fn write_concise_report<W: Write>(
         .runs()
         .iter()
         .flat_map(PolicyRun::findings)
-        .filter(|finding| {
-            finding.suppression().is_none()
-                && finding.scope().is_none()
-                && finding.baseline().is_none()
-                && !(report.diff().is_some_and(|review| {
-                    review.policy_is_qualified(finding.policy_id())
-                        && finding.diff().is_some_and(|diff| {
-                            diff.disposition() == FindingDiffDisposition::Persisting
-                        })
-                }))
-        })
+        .filter(|finding| is_active_finding(report, finding))
         .collect::<Vec<_>>();
     let analysis_complete = report_analysis_complete(report);
 
@@ -447,6 +424,7 @@ fn write_concise_report<W: Write>(
         write_diff_unqualified_policies(output, diff)?;
     }
 
+    write_not_run_policies(output, report)?;
     writeln!(output, "\nAnalysis warnings").map_err(map_io_error)?;
     let mut warning_count = 0_usize;
     if report.rules().iter().any(rule_has_schema_inference) {
@@ -500,6 +478,9 @@ fn write_concise_report<W: Write>(
         .map_err(map_io_error)?;
     }
     for run in report.runs() {
+        if matches!(run.completion(), PolicyRunCompletion::NotRun { .. }) {
+            continue;
+        }
         for diagnostic in run.diagnostics() {
             warning_count = warning_count.saturating_add(1);
             write!(
@@ -622,6 +603,18 @@ fn write_concise_report<W: Write>(
     Ok(())
 }
 
+fn is_active_finding(report: &PolicyReportDocument, finding: &PolicyFinding) -> bool {
+    finding.suppression().is_none()
+        && finding.scope().is_none()
+        && finding.baseline().is_none()
+        && !report.diff().is_some_and(|review| {
+            review.policy_is_qualified(finding.policy_id())
+                && finding
+                    .diff()
+                    .is_some_and(|diff| diff.disposition() == FindingDiffDisposition::Persisting)
+        })
+}
+
 fn rule_has_schema_inference(rule: &PolicyRuleDescriptor) -> bool {
     rule.policy_schema().origin == SchemaVersionOrigin::ImplicitCompatible
         || rule
@@ -698,16 +691,35 @@ fn write_concise_finding<W: Write>(
     writeln!(output).map_err(map_io_error)
 }
 
+fn write_concise_table_row<W: Write>(
+    output: &mut BoundedWriter<W>,
+    index: usize,
+    kind: &str,
+    location: Option<&PolicySourceLocation>,
+    label: &str,
+) -> Result<(), PolicyRenderError> {
+    write!(output, "    {index:<3} {kind:<12} ").map_err(map_io_error)?;
+    if let Some(location) = location {
+        write_location(output, location).map_err(map_io_error)?;
+    } else {
+        write!(output, "-").map_err(map_io_error)?;
+    }
+    writeln!(output, "  {}", escape_terminal_text(label)).map_err(map_io_error)
+}
+
 fn write_concise_display_path<W: Write>(
     output: &mut BoundedWriter<W>,
     path: &TaintDisplayPath,
 ) -> Result<(), PolicyRenderError> {
     writeln!(output, "    #   Kind         Location  Code / symbol").map_err(map_io_error)?;
     for (index, step) in path.steps().iter().enumerate() {
-        write!(output, "    {:<3} {:<12} ", index + 1, step.kind().label(),)
-            .map_err(map_io_error)?;
-        write_location(output, step.location()).map_err(map_io_error)?;
-        writeln!(output, "  {}", escape_terminal_text(step.label())).map_err(map_io_error)?;
+        write_concise_table_row(
+            output,
+            index + 1,
+            step.kind().label(),
+            Some(step.location()),
+            step.label(),
+        )?;
     }
     if path.omitted_meaningful_steps() > 0 {
         writeln!(
@@ -812,25 +824,22 @@ fn write_concise_witness_rows<W: Write>(
     writeln!(output, "    #   Kind         Location  Code / symbol").map_err(map_io_error)?;
     let retained_step_limit = MAX_CONCISE_WITNESS_STEPS - usize::from(taint_sink.is_some());
     for (index, step) in witness.steps().iter().take(retained_step_limit).enumerate() {
-        write!(output, "    {:<3} {:<12} ", index + 1, step.kind().label(),)
-            .map_err(map_io_error)?;
-        if let Some(location) = step.location() {
-            write_location(output, location).map_err(map_io_error)?;
-        } else {
-            write!(output, "-").map_err(map_io_error)?;
-        }
-        writeln!(output, "  {}", escape_terminal_text(step.label())).map_err(map_io_error)?;
+        write_concise_table_row(
+            output,
+            index + 1,
+            step.kind().label(),
+            step.location(),
+            step.label(),
+        )?;
     }
     if let Some((location, label)) = taint_sink {
-        write!(
+        write_concise_table_row(
             output,
-            "    {:<3} {:<12} ",
             witness.steps().len() + 1,
-            "sink"
-        )
-        .map_err(map_io_error)?;
-        write_location(output, location).map_err(map_io_error)?;
-        writeln!(output, "  {}", escape_terminal_text(label)).map_err(map_io_error)?;
+            "sink",
+            Some(location),
+            label,
+        )?;
     }
 
     let renderer_omissions = witness.steps().len().saturating_sub(retained_step_limit);
@@ -855,15 +864,15 @@ fn write_severity_marker<W: Write>(
     color: HumanRenderColor,
 ) -> Result<(), PolicyRenderError> {
     if color == HumanRenderColor::Plain {
-        return write!(output, "[{}]", finding_severity(severity)).map_err(map_io_error);
+        return write!(output, "[{}]", severity.label()).map_err(map_io_error);
     }
-    let (ansi, symbol) = match severity {
-        FindingSeverity::Unrated => ("\u{001B}[37m", "?"),
-        FindingSeverity::Note => ("\u{001B}[36m", "ℹ"),
-        FindingSeverity::Warning => ("\u{001B}[33m", "⚠"),
-        FindingSeverity::Error => ("\u{001B}[31m", "✖"),
+    let symbol = match severity {
+        FindingSeverity::Unrated => "?",
+        FindingSeverity::Note => "ℹ",
+        FindingSeverity::Warning => "⚠",
+        FindingSeverity::Error => "✖",
     };
-    write!(output, "{ansi}{symbol}\u{001B}[0m").map_err(map_io_error)
+    write!(output, "{}{symbol}\u{001B}[0m", severity_ansi(severity)).map_err(map_io_error)
 }
 
 fn concise_terminal_symbol(finding: &PolicyFinding) -> Option<&str> {
@@ -960,7 +969,7 @@ fn write_finding<W: Write>(
     writeln!(
         output,
         "  analysis: {} ({}, {})",
-        analysis_type(finding.analysis_type()),
+        finding.analysis_type().label(),
         finding.certainty().label(),
         finding.completeness().label(),
     )
@@ -1302,17 +1311,20 @@ fn write_verbose_severity<W: Write>(
     severity: FindingSeverity,
     color: HumanRenderColor,
 ) -> Result<(), PolicyRenderError> {
-    let label = finding_severity(severity);
+    let label = severity.label();
     if color == HumanRenderColor::Plain {
         return write!(output, "[{label}]").map_err(map_io_error);
     }
-    let ansi = match severity {
+    write!(output, "{}[{label}]\u{001B}[0m", severity_ansi(severity)).map_err(map_io_error)
+}
+
+fn severity_ansi(severity: FindingSeverity) -> &'static str {
+    match severity {
         FindingSeverity::Unrated => "\u{001B}[37m",
         FindingSeverity::Note => "\u{001B}[36m",
         FindingSeverity::Warning => "\u{001B}[33m",
         FindingSeverity::Error => "\u{001B}[31m",
-    };
-    write!(output, "{ansi}[{label}]\u{001B}[0m").map_err(map_io_error)
+    }
 }
 
 fn write_schema_inference_notes<W: Write>(
@@ -1424,12 +1436,7 @@ fn write_rule_detail<W: Write>(
     )
     .map_err(map_io_error)?;
     writeln!(output, "  policy hash: {}", rule.policy_hash()).map_err(map_io_error)?;
-    writeln!(
-        output,
-        "  analysis type: {}",
-        analysis_type(rule.analysis_type())
-    )
-    .map_err(map_io_error)?;
+    writeln!(output, "  analysis type: {}", rule.analysis_type().label()).map_err(map_io_error)?;
     write_schema_resolution(output, "  policy schema", rule.policy_schema())?;
     for selector in rule.selector_schemas() {
         write!(
@@ -1481,18 +1488,14 @@ fn write_rule_detail<W: Write>(
     write!(output, "  severity: ").map_err(map_io_error)?;
     match rule.severity() {
         PolicySeveritySpec::Fixed { level } => {
-            writeln!(output, "fixed {}", policy_level(*level)).map_err(map_io_error)?;
+            writeln!(output, "fixed {}", level.label()).map_err(map_io_error)?;
         }
         PolicySeveritySpec::Unrated => {
             writeln!(output, "unrated").map_err(map_io_error)?;
         }
         PolicySeveritySpec::Cvss { when_unscored } => {
-            writeln!(
-                output,
-                "cvss (when unscored: {})",
-                finding_severity(*when_unscored),
-            )
-            .map_err(map_io_error)?;
+            writeln!(output, "cvss (when unscored: {})", when_unscored.label(),)
+                .map_err(map_io_error)?;
         }
     }
     if let Some(description) = rule.description() {
@@ -1542,7 +1545,7 @@ fn write_endpoint_dependency<W: Write>(
     writeln!(
         output,
         "    model: {} - {}",
-        endpoint_role(model.role),
+        model.role.label(),
         escape_terminal_text(&model.display_name),
     )
     .map_err(map_io_error)?;
@@ -1605,7 +1608,9 @@ fn write_endpoint_taint<W: Write>(
     taint: &EndpointTaintSemantics,
 ) -> Result<(), PolicyRenderError> {
     match taint {
-        EndpointTaintSemantics::Source { labels, evidence } => {
+        EndpointTaintSemantics::Source {
+            labels, evidence, ..
+        } => {
             writeln!(output, "      taint: source").map_err(map_io_error)?;
             write_text_items(
                 output,
@@ -1649,11 +1654,10 @@ fn write_taint_source_evidence<W: Write>(
 ) -> Result<(), PolicyRenderError> {
     write!(output, "{label}:").map_err(map_io_error)?;
     if let Some(boundary) = evidence.trust_boundary {
-        write!(output, " trust boundary {}", taint_trust_boundary(boundary))
-            .map_err(map_io_error)?;
+        write!(output, " trust boundary {}", boundary.label()).map_err(map_io_error)?;
     }
     if let Some(entry) = evidence.system_entry {
-        write!(output, " system entry {}", taint_system_entry(entry)).map_err(map_io_error)?;
+        write!(output, " system entry {}", entry.label()).map_err(map_io_error)?;
     }
     writeln!(output).map_err(map_io_error)
 }
@@ -1712,8 +1716,8 @@ fn write_match_directory_manifest<W: Write>(
         "  match directory {}: {} ({}, role {}, hash {})",
         escape_terminal_text(manifest.path().as_str()),
         escape_terminal_text(manifest.directory().as_str()),
-        directory_scope(manifest.scope()),
-        manifest.role().map_or("any", endpoint_role),
+        manifest.scope().label(),
+        manifest.role().map_or("any", EndpointRole::label),
         manifest.semantic_hash(),
     )
     .map_err(map_io_error)?;
@@ -1991,8 +1995,8 @@ fn write_cvss_metric_evidence<W: Write>(
         "{label}: {}={} ({}, {}; hash {})",
         evidence.metric().first_label(),
         evidence.value().first_label(),
-        cvss_evidence_basis(evidence.basis()),
-        cvss_evidence_scope(evidence.system_scope()),
+        evidence.basis().label(),
+        evidence.system_scope().label(),
         evidence.content_hash(),
     )
     .map_err(map_io_error)?;
@@ -2871,6 +2875,23 @@ fn write_query_result_detail<W: Write>(
     result: &PolicyQueryResultRef,
 ) -> Result<(), PolicyRenderError> {
     match result {
+        PolicyQueryResultRef::DependencyEvidence {
+            package,
+            exact_version,
+            source,
+            id,
+            ..
+        } => {
+            write!(
+                output,
+                " dependency {} version {} source {} identity {}",
+                escape_terminal_text(package),
+                escape_terminal_text(exact_version.as_deref().unwrap_or("unresolved")),
+                escape_terminal_text(source.as_deref().unwrap_or("unspecified")),
+                escape_terminal_text(id)
+            )
+            .map_err(map_io_error)?;
+        }
         PolicyQueryResultRef::ConfigurationFact { id, fact_id, .. } => {
             write!(
                 output,
@@ -2880,8 +2901,118 @@ fn write_query_result_detail<W: Write>(
             )
             .map_err(map_io_error)?;
         }
+        PolicyQueryResultRef::GenerationSite {
+            id, ast_id, kind, ..
+        } => {
+            write!(
+                output,
+                " {} identity {}; ast_id {}",
+                escape_terminal_text(kind),
+                escape_terminal_text(id),
+                escape_terminal_text(ast_id.as_deref().unwrap_or("unspecified")),
+            )
+            .map_err(map_io_error)?;
+        }
+        PolicyQueryResultRef::Export {
+            id,
+            form,
+            exported_name,
+            target_fq_name,
+            local_definition,
+            ..
+        } => {
+            write!(
+                output,
+                " export {} name {} target {} identity {}",
+                escape_terminal_text(form),
+                escape_terminal_text(exported_name),
+                escape_terminal_text(target_fq_name.as_deref().unwrap_or("unresolved")),
+                escape_terminal_text(id),
+            )
+            .map_err(map_io_error)?;
+            match local_definition {
+                Some(super::super::finding::PolicyExportLocalDefinition::Defined {
+                    binding_name,
+                    binding_kind,
+                    binding_location,
+                }) => {
+                    let region = binding_location
+                        .region()
+                        .expect("validated export binding location has a source region");
+                    write!(
+                        output,
+                        " local definition {} {} at {}:{}:{}",
+                        escape_terminal_text(binding_kind),
+                        escape_terminal_text(binding_name),
+                        escape_terminal_text(binding_location.path()),
+                        region.start_line(),
+                        region.start_column(),
+                    )
+                    .map_err(map_io_error)?;
+                }
+                Some(super::super::finding::PolicyExportLocalDefinition::Undefined) => {
+                    write!(output, " local definition undefined").map_err(map_io_error)?;
+                }
+                Some(super::super::finding::PolicyExportLocalDefinition::Unknown) => {
+                    write!(output, " local definition unknown").map_err(map_io_error)?;
+                }
+                None => {}
+            }
+        }
+        PolicyQueryResultRef::CrossDomain {
+            operator,
+            domain,
+            configuration_location,
+            ..
+        } => {
+            write!(
+                output,
+                " {} {}",
+                escape_terminal_text(operator),
+                escape_terminal_text(domain),
+            )
+            .map_err(map_io_error)?;
+            if let Some(location) = configuration_location {
+                write!(
+                    output,
+                    " configuration {}",
+                    escape_terminal_text(location.path())
+                )
+                .map_err(map_io_error)?;
+            }
+        }
         PolicyQueryResultRef::StructuralMatch { kind, .. } => {
             write!(output, " {}", escape_terminal_text(kind)).map_err(map_io_error)?;
+        }
+        PolicyQueryResultRef::Binding { id, name, .. } => {
+            write!(
+                output,
+                " binding {} identity {}",
+                escape_terminal_text(name),
+                escape_terminal_text(id),
+            )
+            .map_err(map_io_error)?;
+        }
+        PolicyQueryResultRef::LexicalScope { id, index, .. } => {
+            write!(
+                output,
+                " lexical scope {} identity {}",
+                index,
+                escape_terminal_text(id),
+            )
+            .map_err(map_io_error)?;
+        }
+        PolicyQueryResultRef::Occurrence {
+            id, class, role, ..
+        } => {
+            write!(
+                output,
+                " occurrence {} {} identity {}",
+                escape_terminal_text(class),
+                escape_terminal_text(role),
+                escape_terminal_text(id),
+            )
+            .map_err(map_io_error)?;
         }
         PolicyQueryResultRef::Declaration {
             kind,
@@ -3336,14 +3467,50 @@ fn write_run_completion<W: Write>(
     )
     .map_err(map_io_error)?;
     write_completion_state(output, run)?;
+    if let Some(engine) = run.engine() {
+        write!(
+            output,
+            "; engine: {}",
+            escape_terminal_text(&engine.render())
+        )
+        .map_err(map_io_error)?;
+    }
+    if let Some(scope) = run.scope() {
+        write_run_scope(output, scope)?;
+    }
     if run.diagnostics_truncated() {
         write!(output, "; diagnostics truncated").map_err(map_io_error)?;
+    }
+    if matches!(run.completion(), PolicyRunCompletion::NotRun { .. }) {
+        return writeln!(output).map_err(map_io_error);
     }
     if run.completion().is_reliable() {
         writeln!(output, "; non-exhaustive").map_err(map_io_error)
     } else {
         writeln!(output, "; non-clean").map_err(map_io_error)
     }
+}
+
+/// The scope a run states beside its completion (spec M4.0): a range-scoped
+/// run says how many files it examined, so an empty result is not read as
+/// absence elsewhere, and every reason the run stayed wider than requested.
+fn write_run_scope<W: Write>(
+    output: &mut BoundedWriter<W>,
+    scope: &PolicyRunScope,
+) -> Result<(), PolicyRenderError> {
+    match scope.kind() {
+        PolicyRunScopeKind::ChangedRange => write!(
+            output,
+            "; range-scoped: {} files examined",
+            scope.examined_files().len()
+        ),
+        PolicyRunScopeKind::Workspace => write!(output, "; scope: workspace"),
+    }
+    .map_err(map_io_error)?;
+    for reason in scope.widened() {
+        write!(output, "; widened: {}", escape_terminal_text(reason)).map_err(map_io_error)?;
+    }
+    Ok(())
 }
 
 fn write_completion_state<W: Write>(
@@ -3389,6 +3556,31 @@ fn write_completion_state<W: Write>(
             }
             write!(output, ")").map_err(map_io_error)?;
         }
+        PolicyRunCompletion::NotRun {
+            unavailable_capabilities,
+            selected_by,
+        } => {
+            let selection = match selected_by {
+                PolicySelectionProvenance::ExplicitPolicyId => "explicit policy ID",
+                PolicySelectionProvenance::PackCategoryOrDefault => {
+                    "pack, category, or default selection"
+                }
+            };
+            write!(output, "not run (selected by {selection}; ").map_err(map_io_error)?;
+            for (index, capability) in unavailable_capabilities.iter().enumerate() {
+                if index > 0 {
+                    write!(output, "; ").map_err(map_io_error)?;
+                }
+                write!(
+                    output,
+                    "{}: {}",
+                    escape_terminal_text(&capability.label),
+                    escape_terminal_text(&capability.reason),
+                )
+                .map_err(map_io_error)?;
+            }
+            write!(output, ")").map_err(map_io_error)?;
+        }
         PolicyRunCompletion::Unsupported { capability } => {
             write!(output, "unsupported: ").map_err(map_io_error)?;
             write_capability(output, capability)?;
@@ -3403,6 +3595,36 @@ fn write_completion_state<W: Write>(
             }
             write!(output, ")").map_err(map_io_error)?;
         }
+    }
+    Ok(())
+}
+
+fn write_not_run_policies<W: Write>(
+    output: &mut BoundedWriter<W>,
+    report: &PolicyReportDocument,
+) -> Result<(), PolicyRenderError> {
+    let not_run = report
+        .runs()
+        .iter()
+        .filter(|run| matches!(run.completion(), PolicyRunCompletion::NotRun { .. }))
+        .collect::<Vec<_>>();
+    if not_run.is_empty() {
+        return Ok(());
+    }
+    writeln!(output, "\nPolicies not run").map_err(map_io_error)?;
+    for run in not_run {
+        let rule = report
+            .rules()
+            .iter()
+            .find(|rule| {
+                rule.policy_id() == run.policy_id()
+                    && rule.policy_hash() == run.policy_hash()
+                    && rule.analysis_type() == run.analysis_type()
+            })
+            .ok_or(PolicyRenderError::InvalidCanonicalReport {
+                detail: "policy run has no matching rule descriptor",
+            })?;
+        write_run_completion(output, run, rule.name())?;
     }
     Ok(())
 }
@@ -3474,49 +3696,18 @@ fn write_summary<W: Write>(
     output: &mut BoundedWriter<W>,
     report: &PolicyReportDocument,
 ) -> Result<(), PolicyRenderError> {
-    let retained_suppressed_count = report
-        .runs()
-        .iter()
-        .flat_map(PolicyRun::findings)
-        .filter(|finding| finding.suppression().is_some())
-        .count();
     let retained_scoped_count = report
         .runs()
         .iter()
         .flat_map(PolicyRun::findings)
         .filter(|finding| finding.scope().is_some())
         .count();
-    let retained_baselined_count = report
+    let active_finding_count = report
         .runs()
         .iter()
         .flat_map(PolicyRun::findings)
-        .filter(|finding| finding.baseline().is_some())
+        .filter(|finding| is_active_finding(report, finding))
         .count();
-    let retained_finding_count = report.runs().iter().fold(0_usize, |total, run| {
-        total.saturating_add(run.findings().len())
-    });
-    let persisting_finding_count = report
-        .diff()
-        .into_iter()
-        .flat_map(|review| {
-            report.runs().iter().flat_map(move |run| {
-                run.findings().iter().filter(move |finding| {
-                    review.policy_is_qualified(finding.policy_id())
-                        && finding.suppression().is_none()
-                        && finding.scope().is_none()
-                        && finding.baseline().is_none()
-                        && finding.diff().is_some_and(|diff| {
-                            diff.disposition() == FindingDiffDisposition::Persisting
-                        })
-                })
-            })
-        })
-        .count();
-    let active_finding_count = retained_finding_count
-        .saturating_sub(retained_suppressed_count)
-        .saturating_sub(retained_scoped_count)
-        .saturating_sub(retained_baselined_count)
-        .saturating_sub(persisting_finding_count);
     let suppressed_finding_count = report
         .suppressions()
         .iter()
@@ -3563,6 +3754,7 @@ fn write_summary<W: Write>(
     let mut proven_subset = 0_usize;
     let mut proven_by_summary = 0_usize;
     let mut inconclusive = 0_usize;
+    let mut not_run = 0_usize;
     let mut unsupported = 0_usize;
     let mut failed = 0_usize;
     for run in report.runs() {
@@ -3577,6 +3769,7 @@ fn write_summary<W: Write>(
             PolicyRunCompletion::Inconclusive { .. } => {
                 inconclusive = inconclusive.saturating_add(1);
             }
+            PolicyRunCompletion::NotRun { .. } => not_run = not_run.saturating_add(1),
             PolicyRunCompletion::Unsupported { .. } => {
                 unsupported = unsupported.saturating_add(1);
             }
@@ -3678,6 +3871,7 @@ fn write_summary<W: Write>(
             "proven-by-summary (authored models)",
         )?;
         write_run_count(output, inconclusive, "inconclusive")?;
+        write_run_count(output, not_run, "not-run")?;
         write_run_count(output, unsupported, "unsupported")?;
         write_run_count(output, failed, "failed")?;
     }
@@ -3697,22 +3891,17 @@ fn write_dependency_pack_summary<W: Write>(
     output: &mut BoundedWriter<W>,
     review: &PolicyPackActivationReview,
 ) -> Result<(), PolicyRenderError> {
+    let (mode, coverage, ecosystems) = dependency_pack_labels(review);
     write!(
         output,
         "; dependency packs: mode {}; {}; ecosystems {}",
-        dependency_pack_activation_mode(review.dependency_mode()),
-        if review.complete() {
-            "complete"
-        } else {
-            "incomplete"
-        },
-        if review.ecosystems().is_empty() {
-            "none".to_owned()
-        } else {
-            review.ecosystems().join(",")
-        },
+        mode, coverage, ecosystems,
     )
     .map_err(map_io_error)?;
+    // The summary names each decision; its reason is on the decision's own
+    // `Decision:` line. Every language with a standard-library pack now has a
+    // decision (#3464), so repeating reasons here would make this one line
+    // grow with the workspace's languages.
     if !review.decisions().is_empty() {
         write!(output, "; decisions ").map_err(map_io_error)?;
         for (index, decision) in review.decisions().iter().enumerate() {
@@ -3726,9 +3915,6 @@ fn write_dependency_pack_summary<W: Write>(
                 policy_pack_decision_status(decision.status()),
             )
             .map_err(map_io_error)?;
-            if let Some(reason) = decision.reason() {
-                write!(output, " ({})", escape_terminal_text(reason)).map_err(map_io_error)?;
-            }
         }
         if review.decisions_truncated() {
             write!(output, ", ... (decisions truncated)").map_err(map_io_error)?;
@@ -3762,6 +3948,24 @@ fn write_diff_unqualified_policies<W: Write>(
     Ok(())
 }
 
+fn dependency_pack_labels(
+    review: &PolicyPackActivationReview,
+) -> (&'static str, &'static str, String) {
+    (
+        dependency_pack_activation_mode(review.dependency_mode()),
+        if review.complete() {
+            "complete"
+        } else {
+            "incomplete"
+        },
+        if review.ecosystems().is_empty() {
+            "none".to_owned()
+        } else {
+            review.ecosystems().join(",")
+        },
+    )
+}
+
 const fn dependency_pack_activation_mode(mode: PolicyDependencyPackActivationMode) -> &'static str {
     match mode {
         PolicyDependencyPackActivationMode::Default => "default",
@@ -3785,10 +3989,7 @@ fn write_summary_count<W: Write>(
     count: usize,
     label: &str,
 ) -> Result<(), PolicyRenderError> {
-    if count > 0 {
-        write!(output, "; {count} {label}{}", plural_suffix(count)).map_err(map_io_error)?;
-    }
-    Ok(())
+    write_count(output, count, label, "")
 }
 
 fn write_run_count<W: Write>(
@@ -3796,13 +3997,18 @@ fn write_run_count<W: Write>(
     count: usize,
     state: &str,
 ) -> Result<(), PolicyRenderError> {
+    write_count(output, count, state, " policy run")
+}
+
+fn write_count<W: Write>(
+    output: &mut BoundedWriter<W>,
+    count: usize,
+    label: &str,
+    suffix: &str,
+) -> Result<(), PolicyRenderError> {
     if count > 0 {
-        write!(
-            output,
-            "; {count} {state} policy run{}",
-            plural_suffix(count)
-        )
-        .map_err(map_io_error)?;
+        write!(output, "; {count} {label}{suffix}{}", plural_suffix(count))
+            .map_err(map_io_error)?;
     }
     Ok(())
 }
@@ -3848,46 +4054,6 @@ const fn identity_stability(value: FindingIdentityStability) -> &'static str {
     }
 }
 
-const fn policy_level(value: PolicyLevel) -> &'static str {
-    match value {
-        PolicyLevel::Note => "note",
-        PolicyLevel::Warning => "warning",
-        PolicyLevel::Error => "error",
-    }
-}
-
-const fn endpoint_role(value: EndpointRole) -> &'static str {
-    match value {
-        EndpointRole::Source => "source",
-        EndpointRole::Sink => "sink",
-    }
-}
-
-const fn directory_scope(value: DirectoryScope) -> &'static str {
-    match value {
-        DirectoryScope::Direct => "direct",
-        DirectoryScope::Recursive => "recursive",
-    }
-}
-
-const fn taint_trust_boundary(value: TaintTrustBoundary) -> &'static str {
-    match value {
-        TaintTrustBoundary::External => "external",
-        TaintTrustBoundary::Internal => "internal",
-        TaintTrustBoundary::SameTrustZone => "same_trust_zone",
-    }
-}
-
-const fn taint_system_entry(value: TaintSystemEntry) -> &'static str {
-    match value {
-        TaintSystemEntry::VulnerableSystemNetworkStack => "vulnerable_system_network_stack",
-        TaintSystemEntry::DownloadedArtifact => "downloaded_artifact",
-        TaintSystemEntry::LocalInput => "local_input",
-        TaintSystemEntry::AdjacentNetwork => "adjacent_network",
-        TaintSystemEntry::Physical => "physical",
-    }
-}
-
 const fn schema_version_origin(value: SchemaVersionOrigin) -> &'static str {
     match value {
         SchemaVersionOrigin::Explicit => "explicit",
@@ -3902,32 +4068,17 @@ const fn cvss_version(value: CvssVersion) -> &'static str {
     }
 }
 
-const fn cvss_evidence_basis(value: CvssEvidenceBasis) -> &'static str {
-    match value {
-        CvssEvidenceBasis::StaticWitness => "static_witness",
-        CvssEvidenceBasis::PolicyAssertion => "policy_assertion",
-        CvssEvidenceBasis::EnvironmentProfile => "environment_profile",
-        CvssEvidenceBasis::ThreatFeed => "threat_feed",
-        CvssEvidenceBasis::AnalystOverride => "analyst_override",
-    }
-}
-
-const fn cvss_evidence_scope(value: CvssEvidenceScope) -> &'static str {
-    match value {
-        CvssEvidenceScope::Global => "global",
-        CvssEvidenceScope::System {
-            system: CvssSystemScope::VulnerableSystem,
-        } => "vulnerable_system",
-        CvssEvidenceScope::System {
-            system: CvssSystemScope::SubsequentSystem,
-        } => "subsequent_system",
-    }
-}
-
 const fn query_result_kind(value: &PolicyQueryResultRef) -> &'static str {
     match value {
+        PolicyQueryResultRef::DependencyEvidence { .. } => "dependency_evidence",
         PolicyQueryResultRef::ConfigurationFact { .. } => "configuration_fact",
+        PolicyQueryResultRef::GenerationSite { .. } => "generation_site",
+        PolicyQueryResultRef::Export { .. } => "export",
+        PolicyQueryResultRef::CrossDomain { .. } => "cross_domain",
         PolicyQueryResultRef::StructuralMatch { .. } => "structural_match",
+        PolicyQueryResultRef::Binding { .. } => "binding",
+        PolicyQueryResultRef::LexicalScope { .. } => "lexical_scope",
+        PolicyQueryResultRef::Occurrence { .. } => "occurrence",
         PolicyQueryResultRef::Declaration { .. } => "declaration",
         PolicyQueryResultRef::File { .. } => "file",
         PolicyQueryResultRef::ReferenceSite { .. } => "reference_site",
@@ -3945,16 +4096,6 @@ const fn endpoint_phase(value: EndpointObservationPhase) -> &'static str {
     value.label()
 }
 
-const fn analysis_type(value: PolicyAnalysisType) -> &'static str {
-    match value {
-        PolicyAnalysisType::Match => "match",
-        PolicyAnalysisType::Taint => "taint",
-        PolicyAnalysisType::Typestate => "typestate",
-        PolicyAnalysisType::Assertion => "assertion",
-        PolicyAnalysisType::Flow => "flow",
-    }
-}
-
 const fn query_proof(value: PolicyQueryProof) -> &'static str {
     match value {
         PolicyQueryProof::Exact => "exact",
@@ -3962,15 +4103,6 @@ const fn query_proof(value: PolicyQueryProof) -> &'static str {
         PolicyQueryProof::NameBased => "name_based",
         PolicyQueryProof::Ambiguous => "ambiguous",
         PolicyQueryProof::Unknown => "unknown",
-    }
-}
-
-const fn finding_severity(value: FindingSeverity) -> &'static str {
-    match value {
-        FindingSeverity::Unrated => "unrated",
-        FindingSeverity::Note => "note",
-        FindingSeverity::Warning => "warning",
-        FindingSeverity::Error => "error",
     }
 }
 
@@ -4013,7 +4145,9 @@ const fn match_result_domain(value: MatchResultDomain) -> &'static str {
         MatchResultDomain::ReferenceEdge => "reference edge",
         MatchResultDomain::QualifiedPath => "qualified_path",
         MatchResultDomain::PathSegment => "path_segment",
+        MatchResultDomain::DependencyEvidence => "dependency_evidence",
         MatchResultDomain::ConfigurationFact => "configuration_fact",
+        MatchResultDomain::CrossDomain => "cross_domain",
     }
 }
 
@@ -4105,21 +4239,13 @@ fn report_diagnostic_code(value: super::super::PolicyReportDiagnosticCode) -> &'
         Code::PolicyLoadFailed => "policy-load-failed",
         Code::PolicyParseFailed => "policy-parse-failed",
         Code::PolicyValidationFailed => "policy-validation-failed",
-        Code::EndpointParseFailed => "endpoint-parse-failed",
-        Code::EndpointValidationFailed => "endpoint-validation-failed",
         Code::NotExecutableEndpoint => "not-executable-endpoint",
         Code::DuplicatePolicyId => "duplicate-policy-id",
         Code::DuplicateEndpointId => "duplicate-endpoint-id",
         Code::PolicyCountLimit => "policy-count-limit",
         Code::EndpointCountLimit => "endpoint-count-limit",
         Code::MatchDirectoryLimit => "match-directory-limit",
-        Code::MatchDirectoryChangedDuringLoad => "match-directory-changed-during-load",
         Code::MatchDirectoryManifestMismatch => "match-directory-manifest-mismatch",
-        Code::NonEndpointInMatchDirectory => "non-endpoint-in-match-directory",
-        Code::EndpointMissingOrMismatchedTaintSemantics => {
-            "endpoint-missing-or-mismatched-taint-semantics"
-        }
-        Code::AmbiguousCombinationPrecedence => "ambiguous-combination-precedence",
         Code::UnsupportedPolicySchemaVersion => "unsupported-policy-schema-version",
         Code::UnsupportedRqlSchemaVersion => "unsupported-rql-schema-version",
         Code::ConflictingRqlSchemaVersion => "conflicting-rql-schema-version",
@@ -4174,26 +4300,28 @@ const fn yes_no(value: bool) -> &'static str {
 }
 
 const fn plural_suffix(count: usize) -> &'static str {
-    if count == 1 { "" } else { "s" }
+    plural_suffix_from_singularity(count == 1)
 }
 
 const fn plural_suffix_u64(count: u64) -> &'static str {
-    if count == 1 { "" } else { "s" }
+    plural_suffix_from_singularity(count == 1)
+}
+
+const fn plural_suffix_from_singularity(singular: bool) -> &'static str {
+    if singular { "" } else { "s" }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::display_path::{TaintDisplayPath, TaintDisplayStep, TaintDisplayStepKind};
+    use crate::test_support::cvss_assessment_provenance as cvss_provenance;
     use crate::{
-        CvssAssessmentProvenance, CvssAssessmentVariant, CvssBaseMetric, CvssEvidenceBasis,
-        CvssEvidenceContentHash, CvssEvidenceSetHash, CvssMetric, CvssMetricEvidence,
-        CvssMetricValue, CvssMetricValueToken, CvssUnscoredReason, CvssVersion, EvidenceRef,
-        OpaqueFindingKey, PolicyDiagnosticCode, PolicyOverlayScope, SourceScenarioSetHash,
-        SourceSliceHash, VulnerabilityIdentity, WitnessId, WitnessStep, WitnessStepKind,
+        CvssAssessmentVariant, CvssBaseMetric, CvssEvidenceSetHash, CvssMetric, CvssUnscoredReason,
+        CvssVersion, EvidenceRef, SourceScenarioSetHash, VulnerabilityIdentity, WitnessId,
+        WitnessStep, WitnessStepKind,
     };
     use brokk_bifrost_analysis::analyzer::semantic::WorkspaceRelativePath;
-    use brokk_bifrost_rql::structural::CodeQueryDiagnosticCode;
 
     #[test]
     fn terminal_escape_is_visible_and_cannot_create_lines_or_ansi_sequences() {
@@ -4358,89 +4486,6 @@ mod tests {
     }
 
     #[test]
-    fn call_and_reference_summaries_retain_relational_identities_and_proof() {
-        let path = WorkspaceRelativePath::new("src/app.rs").unwrap();
-        let callee_identity =
-            StableSemanticIdentity::catalog_entry("rust", path, "crate::callee").unwrap();
-        let call = PolicyQueryResultRef::CallSite {
-            location: PolicySourceLocation::span(
-                WorkspaceRelativePath::new("src/app.rs").unwrap(),
-                super::super::super::PolicyByteSpan::new(2, 8).unwrap(),
-                super::super::super::PolicyDisplayRegion::new(1, 3, 1, 9).unwrap(),
-            ),
-            caller_fq_name: "crate::caller".to_string(),
-            caller_identity: None,
-            callee_fq_name: "crate::callee".to_string(),
-            callee_identity: Some(callee_identity),
-            proof: PolicyQueryProof::Resolved,
-        };
-        let mut rendered = BoundedWriter::new(Vec::new(), usize::MAX);
-        write_query_result_detail(&mut rendered, &call).unwrap();
-        let rendered = String::from_utf8(rendered.inner).unwrap();
-        assert_eq!(
-            rendered,
-            " call crate::caller [identity unavailable] -> crate::callee [identity rust:src/app.rs:catalog_entry:crate::callee]; proof resolved"
-        );
-
-        let reference = PolicyQueryResultRef::ReferenceSite {
-            location: PolicySourceLocation::span(
-                WorkspaceRelativePath::new("src/app.rs").unwrap(),
-                super::super::super::PolicyByteSpan::new(2, 8).unwrap(),
-                super::super::super::PolicyDisplayRegion::new(1, 3, 1, 9).unwrap(),
-            ),
-            target_fq_name: "crate::target".to_string(),
-            target_identity: None,
-            usage_kind: Some("read".to_string()),
-            proof: PolicyQueryProof::Ambiguous,
-        };
-        let mut rendered = BoundedWriter::new(Vec::new(), usize::MAX);
-        write_query_result_detail(&mut rendered, &reference).unwrap();
-        assert_eq!(
-            String::from_utf8(rendered.inner).unwrap(),
-            " target crate::target; target identity unavailable; usage read; proof ambiguous"
-        );
-    }
-
-    fn cvss_metric_evidence(metric: CvssBaseMetric, byte: u8) -> CvssMetricEvidence {
-        let token = match metric {
-            CvssBaseMetric::Ac => CvssMetricValueToken::L,
-            CvssBaseMetric::At | CvssBaseMetric::Av | CvssBaseMetric::Pr | CvssBaseMetric::Ui => {
-                CvssMetricValueToken::N
-            }
-            CvssBaseMetric::Vc
-            | CvssBaseMetric::Vi
-            | CvssBaseMetric::Va
-            | CvssBaseMetric::Sc
-            | CvssBaseMetric::Si
-            | CvssBaseMetric::Sa => CvssMetricValueToken::H,
-        };
-        let typed_metric = CvssMetric::Base { metric };
-        CvssMetricEvidence::try_new(
-            typed_metric,
-            CvssMetricValue::try_new(typed_metric, token).unwrap(),
-            CvssEvidenceBasis::PolicyAssertion,
-            vec![EvidenceRef::try_new("human", metric.first_label()).unwrap()],
-            "Verified policy assertion".to_string(),
-            vec!["Deployment matches the policy model".to_string()],
-            "bifrost-policy".to_string(),
-            None,
-            metric.required_scope(),
-            CvssEvidenceContentHash::from_bytes([byte; 32]),
-        )
-        .unwrap()
-    }
-
-    fn cvss_provenance() -> CvssAssessmentProvenance {
-        CvssAssessmentProvenance::try_new(
-            "bifrost.cvss-v4".to_string(),
-            Vec::new(),
-            vec![PolicyOverlayScope::AllFindings],
-            Vec::new(),
-        )
-        .unwrap()
-    }
-
-    #[test]
     fn structured_cvss_details_preserve_scored_and_unscored_evidence() {
         let metrics = [
             CvssBaseMetric::Av,
@@ -4457,7 +4502,13 @@ mod tests {
         ]
         .into_iter()
         .enumerate()
-        .map(|(index, metric)| cvss_metric_evidence(metric, u8::try_from(index + 1).unwrap()))
+        .map(|(index, metric)| {
+            crate::test_support::cvss_test_metric_evidence(
+                metric,
+                u8::try_from(index + 1).unwrap(),
+                "human",
+            )
+        })
         .collect();
         let vector = "CVSS:4.0/AV:N/AC:L/AT:N/PR:N/UI:N/VC:H/VI:H/VA:H/SC:H/SI:H/SA:H";
         let component = CvssComponentResult::try_new(
@@ -4546,116 +4597,10 @@ mod tests {
     }
 
     #[test]
-    fn analyzer_prose_and_paths_use_the_terminal_escape_convention() {
-        let result = PolicyQueryResultRef::CallSite {
-            location: PolicySourceLocation::artifact(
-                WorkspaceRelativePath::new("src/\u{0085}\u{202E}.rs").unwrap(),
-            ),
-            caller_fq_name: "caller\n\u{001B}\u{2066}".to_string(),
-            caller_identity: None,
-            callee_fq_name: "callee\u{202E}".to_string(),
-            callee_identity: None,
-            proof: PolicyQueryProof::Ambiguous,
-        };
-        let mut rendered = BoundedWriter::new(Vec::new(), usize::MAX);
-        write_query_result_line(&mut rendered, "  analyzer result", &result).unwrap();
-        let rendered = String::from_utf8(rendered.inner).unwrap();
-        assert_eq!(rendered.lines().count(), 1);
-        assert!(rendered.contains(r"caller\u{A}\u{1B}\u{2066}"));
-        assert!(rendered.contains(r"callee\u{202E}"));
-        assert!(rendered.contains(r"src/\u{85}\u{202E}.rs"));
-        assert!(!rendered.contains('\u{001B}'));
-        assert!(!rendered.contains('\u{0085}'));
-        assert!(!rendered.contains('\u{202E}'));
-        assert!(!rendered.contains('\u{2066}'));
-    }
-
-    #[test]
-    fn match_anchor_details_distinguish_strong_and_weak_inputs() {
-        let strong = MatchFindingAnchor::strong(
-            MatchResultDomain::StructuralMatch,
-            WorkspaceRelativePath::new("src/app.rs").unwrap(),
-            None,
-            Some(SourceSliceHash::from_bytes([7; 32])),
-            2,
-        )
-        .unwrap();
-        let mut rendered = BoundedWriter::new(Vec::new(), usize::MAX);
-        write_match_anchor(&mut rendered, &strong).unwrap();
-        let rendered = String::from_utf8(rendered.inner).unwrap();
-        assert!(rendered.starts_with("  match anchor: strong structural_match src/app.rs\n"));
-        assert!(rendered.contains("    semantic owner: unavailable\n"));
-        assert!(rendered.contains(&format!(
-            "    selected source: {}\n",
-            SourceSliceHash::from_bytes([7; 32])
-        )));
-        assert!(rendered.ends_with("    occurrence ordinal: 2\n"));
-
-        let weak = MatchFindingAnchor::weak(
-            MatchResultDomain::CallSite,
-            WorkspaceRelativePath::new("src/app.rs").unwrap(),
-            OpaqueFindingKey::try_new("adapter", "snapshot-key").unwrap(),
-        );
-        let mut rendered = BoundedWriter::new(Vec::new(), usize::MAX);
-        write_match_anchor(&mut rendered, &weak).unwrap();
-        assert_eq!(
-            String::from_utf8(rendered.inner).unwrap(),
-            "  match anchor: weak call_site src/app.rs\n    typed key: adapter:snapshot-key\n"
-        );
-    }
-
-    #[test]
-    fn witness_evidence_and_nested_query_diagnostic_codes_are_explicit() {
-        let mut rendered = BoundedWriter::new(Vec::new(), usize::MAX);
-        write_evidence_refs_suffix(
-            &mut rendered,
-            &[EvidenceRef::try_new("witness", "step-1").unwrap()],
-        )
-        .unwrap();
-        assert_eq!(
-            String::from_utf8(rendered.inner).unwrap(),
-            " [evidence witness:step-1]"
-        );
-
-        let mut rendered = BoundedWriter::new(Vec::new(), usize::MAX);
-        write_policy_diagnostic_code(
-            &mut rendered,
-            &PolicyDiagnosticCode::CodeQuery {
-                code: CodeQueryDiagnosticCode::ResultLimitReached,
-            },
-        )
-        .unwrap();
-        assert_eq!(
-            String::from_utf8(rendered.inner).unwrap(),
-            "code_query/result_limit_reached"
-        );
-    }
-
-    #[test]
     fn missing_named_cvss_component_is_a_render_error_not_a_panic() {
         assert!(matches!(
             named_cvss_component(&[], CvssNomenclature::B),
             Err(PolicyRenderError::InvalidCanonicalReport { .. })
         ));
-    }
-
-    #[test]
-    fn unsupported_analysis_capability_phrases_are_stable() {
-        let cases = [
-            (
-                PolicyCapability::TaintEvaluation,
-                "taint policy compilation",
-            ),
-            (
-                PolicyCapability::TypestateEvaluation,
-                "typestate policy compilation",
-            ),
-        ];
-
-        for (capability, expected) in cases {
-            let mut rendered = BoundedWriter::new(Vec::new(), usize::MAX);
-            write_capability(&mut rendered, &capability).unwrap();
-            assert_eq!(String::from_utf8(rendered.inner).unwrap(), expected);
-        }
     }
 }

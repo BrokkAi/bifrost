@@ -18,7 +18,10 @@
 use super::{
     ExtensionCompatibility, ExtensionLimitValues, SemanticProof, SemanticRelationCompleteness,
     SemanticRelationScope, SemanticRelationStatus, SourceSpan, StableDigest, WorkspaceGeneration,
-    relation::{canonical_bytes, decode_json},
+    relation::{
+        BoundaryStatusError, canonical_bytes, decode_json, decode_snapshot_json,
+        validate_completion_boundaries,
+    },
 };
 use brokk_bifrost_flow::typestate::{
     MAX_TYPESTATE_FINDING_CANDIDATES, MAX_TYPESTATE_FINDING_REACHED_ROWS,
@@ -27,7 +30,6 @@ use brokk_bifrost_flow::typestate::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use sha2::{Digest, Sha256};
 use std::{cmp::Ordering, fmt};
 
 const SCHEMA: &str = "1.0";
@@ -44,7 +46,7 @@ impl TypestateCodecError {
 }
 impl fmt::Display for TypestateCodecError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&self.0)
+        super::fmt_text(&self.0, f)
     }
 }
 impl std::error::Error for TypestateCodecError {}
@@ -639,31 +641,25 @@ impl TypestateSnapshot {
                 "typestate findings must be in canonical order",
             ));
         }
-        let budget_boundaries = self
-            .boundaries
-            .iter()
-            .filter(|boundary| boundary.kind.is_budget())
-            .count();
-        match self.status {
-            SemanticRelationStatus::Complete if !self.boundaries.is_empty() => {
-                return Err(TypestateCodecError::new(
-                    "a complete typestate snapshot cannot carry boundaries",
-                ));
-            }
-            SemanticRelationStatus::BudgetBounded if budget_boundaries == 0 => {
-                return Err(TypestateCodecError::new(
-                    "a budget-bounded typestate snapshot must name the exhausted dimension",
-                ));
-            }
-            SemanticRelationStatus::FrontierBounded
-                if budget_boundaries > 0 || self.boundaries.is_empty() =>
-            {
-                return Err(TypestateCodecError::new(
-                    "a frontier-bounded typestate snapshot must carry only analysis boundaries",
-                ));
-            }
-            _ => {}
-        }
+        validate_completion_boundaries(
+            self.status,
+            self.boundaries
+                .iter()
+                .map(|boundary| boundary.kind.is_budget()),
+        )
+        .map_err(|error| {
+            TypestateCodecError::new(match error {
+                BoundaryStatusError::CompleteWithBoundaries => {
+                    "a complete typestate snapshot cannot carry boundaries"
+                }
+                BoundaryStatusError::BudgetWithoutBudgetBoundary => {
+                    "a budget-bounded typestate snapshot must name the exhausted dimension"
+                }
+                BoundaryStatusError::FrontierWithoutAnalysisOnlyBoundaries => {
+                    "a frontier-bounded typestate snapshot must carry only analysis boundaries"
+                }
+            })
+        })?;
         match self.verdict {
             TypestateVerdict::Conforms
                 if self.status != SemanticRelationStatus::Complete
@@ -738,8 +734,7 @@ fn finding_kind_key(kind: &TypestateFindingKind) -> String {
 pub fn encode_typestate_request_json(
     value: &TypestateRequest,
 ) -> Result<Vec<u8>, TypestateCodecError> {
-    value.validate()?;
-    canonical_bytes(value).map_err(|error| TypestateCodecError::new(error.to_string()))
+    encode_validated_json(value, value.validate())
 }
 pub fn decode_typestate_request_json(
     bytes: &[u8],
@@ -752,21 +747,26 @@ pub fn decode_typestate_request_json(
 pub fn encode_typestate_snapshot_json(
     value: &TypestateSnapshot,
 ) -> Result<Vec<u8>, TypestateCodecError> {
-    value.validate()?;
+    encode_validated_json(value, value.validate())
+}
+fn encode_validated_json(
+    value: &impl Serialize,
+    validation: Result<(), TypestateCodecError>,
+) -> Result<Vec<u8>, TypestateCodecError> {
+    validation?;
     canonical_bytes(value).map_err(|error| TypestateCodecError::new(error.to_string()))
 }
 pub fn decode_typestate_snapshot_json(
     bytes: &[u8],
 ) -> Result<TypestateSnapshot, TypestateCodecError> {
-    let value: TypestateSnapshot =
-        decode_json(bytes).map_err(|error| TypestateCodecError::new(error.to_string()))?;
-    value.validate()?;
-    if snapshot_digest(&value)? != value.snapshot_digest {
-        return Err(TypestateCodecError::new(
-            "typestate snapshot digest mismatch",
-        ));
-    }
-    Ok(value)
+    decode_snapshot_json(
+        bytes,
+        |value: &TypestateSnapshot| value.validate().map_err(|error| error.to_string()),
+        |value| snapshot_digest(value).map_err(|error| error.to_string()),
+        |value, digest| value.snapshot_digest == *digest,
+        "typestate snapshot digest mismatch",
+    )
+    .map_err(|error| TypestateCodecError::new(error.to_string()))
 }
 
 fn snapshot_digest(value: &TypestateSnapshot) -> Result<StableDigest, TypestateCodecError> {
@@ -777,15 +777,11 @@ fn snapshot_digest(value: &TypestateSnapshot) -> Result<StableDigest, TypestateC
         .remove("snapshot_digest");
     let bytes =
         canonical_bytes(&json).map_err(|error| TypestateCodecError::new(error.to_string()))?;
-    StableDigest::parse(format!("{:x}", Sha256::digest(bytes))).map_err(TypestateCodecError::new)
+    Ok(StableDigest::sha256(&bytes))
 }
 
 pub(crate) fn typestate_request_digest(
     value: &TypestateRequest,
 ) -> Result<StableDigest, TypestateCodecError> {
-    StableDigest::parse(format!(
-        "{:x}",
-        Sha256::digest(encode_typestate_request_json(value)?)
-    ))
-    .map_err(TypestateCodecError::new)
+    Ok(StableDigest::sha256(&encode_typestate_request_json(value)?))
 }

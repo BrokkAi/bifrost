@@ -95,7 +95,7 @@ fn validate_lowered_limit(
     value: usize,
     hard_maximum: usize,
 ) -> Result<(), CompositionError> {
-    if value == 0 || value > hard_maximum {
+    if !crate::within_policy_limit(value, hard_maximum) {
         return Err(CompositionError::InvalidLimit {
             field,
             value,
@@ -586,10 +586,10 @@ impl EndpointUniverse {
                                 identity: entry.identity.clone(),
                             });
                         }
-                        if !category_predicate_matches(
-                            &reference.categories,
-                            &dependency.model.categories,
-                        ) {
+                        if !reference
+                            .categories
+                            .matches_categories(&dependency.model.categories)
+                        {
                             return Err(CompositionError::ManifestEndpointMismatch {
                                 path: manifest.path.clone(),
                                 identity: entry.identity.clone(),
@@ -720,12 +720,8 @@ pub(crate) fn resolved_catalog_identity(
     reference: &CatalogRef,
 ) -> Result<ResolvedCatalogIdentity, CompositionError> {
     let catalog = catalogs.resolve(reference)?;
-    ResolvedCatalogIdentity::try_new(
-        catalog.identity().name.clone(),
-        catalog.identity().version,
-        catalog.semantic_hash(),
-    )
-    .map_err(|error| CompositionError::LoadedModel(error.to_string()))
+    ResolvedCatalogIdentity::from_catalog(catalog)
+        .map_err(|error| CompositionError::LoadedModel(error.to_string()))
 }
 
 pub(crate) fn resolve_endpoint_predicate(
@@ -743,7 +739,7 @@ pub(crate) fn resolve_endpoint_predicate(
                 .iter()
                 .filter(|identity| {
                     universe.get(identity).is_some_and(|dependency| {
-                        category_predicate_matches(predicate, &dependency.model.categories)
+                        predicate.matches_categories(&dependency.model.categories)
                     })
                 })
                 .cloned()
@@ -905,20 +901,6 @@ pub(crate) fn validate_category_predicate(
     Ok(())
 }
 
-pub(crate) fn category_predicate_matches(
-    predicate: &CategoryPredicate,
-    endpoint_categories: &[PolicyCategoryId],
-) -> bool {
-    match predicate {
-        CategoryPredicate::Any { categories } => categories
-            .iter()
-            .any(|category| endpoint_categories.contains(category)),
-        CategoryPredicate::All { categories } => categories
-            .iter()
-            .all(|category| endpoint_categories.contains(category)),
-    }
-}
-
 fn equivalent_category_predicates(left: &CategoryPredicate, right: &CategoryPredicate) -> bool {
     match (left, right) {
         (
@@ -1009,7 +991,6 @@ pub(crate) fn policy_port_to_endpoint_binding(port: &PolicyPort) -> PolicyEndpoi
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{EndpointAnalysisProjectionHash, EndpointSemanticHash};
     use brokk_bifrost_analysis::schema_version::{SchemaVersionOrigin, SchemaVersionResolution};
 
     fn category(value: &str) -> PolicyCategoryId {
@@ -1023,24 +1004,22 @@ mod tests {
         selector_origin: SchemaVersionOrigin,
         origin_path: &str,
     ) -> ResolvedEndpointDependency {
-        ResolvedEndpointDependency::new(
+        crate::test_support::resolved_endpoint_dependency(
             ResolvedEndpointIdentity::MatchEndpoint {
                 endpoint_id: EndpointId::new(endpoint_id).unwrap(),
             },
-            EndpointDefinitionSchemaResolution::PolicyDocument {
-                resolution: SchemaVersionResolution {
-                    version: 1,
-                    origin: definition_origin,
-                },
+            SchemaVersionResolution {
+                version: 1,
+                origin: definition_origin,
             },
             PolicySelectorPath::new(format!(
                 "/dependencies/match-endpoints/{endpoint_id}/selector"
             ))
             .unwrap(),
-            ResolvedEndpointSelectorSchemas::Query(SchemaVersionResolution {
+            SchemaVersionResolution {
                 version: 2,
                 origin: selector_origin,
-            }),
+            },
             ResolvedEndpointModel::new(
                 EndpointRole::Source,
                 endpoint_id.to_string(),
@@ -1049,11 +1028,9 @@ mod tests {
                 None,
                 vec![],
             ),
-            EndpointSemanticHash::from_bytes([1; 32]),
-            EndpointAnalysisProjectionHash::from_bytes([2; 32]),
-            vec![EndpointOrigin::PolicyLocal {
-                path: PolicyDependencyPath::new(origin_path).unwrap(),
-            }],
+            PolicyDependencyPath::new(origin_path).unwrap(),
+            1,
+            2,
         )
     }
 
@@ -1097,54 +1074,25 @@ mod tests {
     }
 
     #[test]
-    fn category_any_and_all_select_exact_finite_sets() {
-        let both = dependency(
-            "both",
-            &["input.user", "pii"],
-            SchemaVersionOrigin::Explicit,
-            SchemaVersionOrigin::Explicit,
-            "/origins/both",
-        );
-        let input = dependency(
-            "input",
+    fn scanned_collection_rejects_duplicate_ids_before_filtering() {
+        let endpoint = dependency(
+            "duplicate",
             &["input.user"],
             SchemaVersionOrigin::Explicit,
             SchemaVersionOrigin::Explicit,
-            "/origins/input",
+            "/origins/one",
         );
-        let allowed = vec![both.identity.clone(), input.identity.clone()];
-        let universe =
-            EndpointUniverse::try_new(&[both, input], CompositionLimits::default()).unwrap();
-        let catalogs = TaintCatalogRegistry::new_without_workspace(Default::default());
-        let policy_id = PolicyId::new("test.policy").unwrap();
-
-        let any = resolve_endpoint_predicate(
-            &EndpointPredicate::Categories {
-                predicate: CategoryPredicate::Any {
-                    categories: vec![category("pii")],
-                },
-            },
-            &policy_id,
-            &allowed,
-            &universe,
-            &catalogs,
-        )
-        .unwrap();
-        assert_eq!(any.len(), 1);
-
-        let all = resolve_endpoint_predicate(
-            &EndpointPredicate::Categories {
-                predicate: CategoryPredicate::All {
-                    categories: vec![category("input.user"), category("pii")],
-                },
-            },
-            &policy_id,
-            &allowed,
-            &universe,
-            &catalogs,
-        )
-        .unwrap();
-        assert_eq!(all, any);
+        let mut repeated = endpoint.clone();
+        repeated.origins = vec![EndpointOrigin::PolicyLocal {
+            path: PolicyDependencyPath::new("/origins/two").unwrap(),
+        }];
+        assert!(matches!(
+            validate_scanned_endpoint_collection(
+                &[endpoint, repeated],
+                CompositionLimits::default(),
+            ),
+            Err(CompositionError::DuplicateExactEndpointId { .. })
+        ));
     }
 
     #[test]
@@ -1175,28 +1123,6 @@ mod tests {
                 actual: EndpointRole::Sink,
                 ..
             })
-        ));
-    }
-
-    #[test]
-    fn scanned_collection_rejects_duplicate_ids_before_filtering() {
-        let endpoint = dependency(
-            "duplicate",
-            &["input.user"],
-            SchemaVersionOrigin::Explicit,
-            SchemaVersionOrigin::Explicit,
-            "/origins/one",
-        );
-        let mut repeated = endpoint.clone();
-        repeated.origins = vec![EndpointOrigin::PolicyLocal {
-            path: PolicyDependencyPath::new("/origins/two").unwrap(),
-        }];
-        assert!(matches!(
-            validate_scanned_endpoint_collection(
-                &[endpoint, repeated],
-                CompositionLimits::default(),
-            ),
-            Err(CompositionError::DuplicateExactEndpointId { .. })
         ));
     }
 }

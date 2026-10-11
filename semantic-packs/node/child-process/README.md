@@ -1,5 +1,10 @@
 # Node child_process packs
 
+> Legacy transition copy: product pack authoring belongs in `bifrost-packs`
+> or the private premium pack repository. Follow [the placement policy](../../../CONTRIBUTING.md#release-process).
+> Sources here are frozen pending verified v0.13.0 release and dependency migration.
+> The technical notes below describe retained contracts and test tooling.
+
 The declaration packs name the exact reviewed `execSync(command)` member
 for JavaScript and TypeScript CommonJS namespace calls. The summaries
 packs carry one complete reviewed procedure summary for that member so

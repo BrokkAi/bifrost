@@ -19,7 +19,7 @@ use crate::definition::RowLiteral;
 
 use super::ir::{
     IrAggregate, IrColumn, IrLimits, IrOperand, IrPredicate, IrRelation, IrRelationOp, IrSchema,
-    MAX_IR_SET_MEMBERS, RelationalPlanIr,
+    MAX_IR_SET_MEMBERS, RelationalPlanIr, row_literal_type,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -184,6 +184,14 @@ pub enum RelationalAssertionPlanError {
     RepeatedJoinBinding {
         binding: String,
     },
+    /// A join would pair programming-code rows with configuration rows by
+    /// equal field values. Equal spellings, paths, or co-occurrence are not a
+    /// structural relation; code and configuration correlate only through a
+    /// registered cross-domain operator inside one query (#3274, #3284).
+    CrossDomainJoin {
+        left: String,
+        right: String,
+    },
     /// An operator reads a relation that is not defined before it. Only a
     /// hand-built IR can state this; lowering cannot produce it.
     RelationCycle {
@@ -235,6 +243,10 @@ impl fmt::Display for RelationalAssertionPlanError {
                     "join `{left}` to `{right}` has no equality fields"
                 )
             }
+            Self::CrossDomainJoin { left, right } => write!(
+                formatter,
+                "join `{left}` to `{right}` would pair programming-code rows with configuration rows by equal field values, which proves no relation; correlate them inside one query with `correlate`, or require both with `require-both`"
+            ),
             Self::EmptyGroupKey { group } => {
                 write!(formatter, "group `{group}` has no grouping fields")
             }
@@ -591,12 +603,12 @@ fn validate_enum_literal(
     let Some(domain) = field.value_domain else {
         return Ok(());
     };
-    let Some(legal) = domain.labels() else {
-        return Ok(());
-    };
-    if legal.contains(&label.as_str()) {
+    if domain.admits(label) {
         return Ok(());
     }
+    let legal = domain
+        .labels()
+        .expect("a domain that rejects a label enumerates its labels");
     Err(RelationalAssertionPlanError::UnknownEnumLabel {
         field: column.to_string(),
         label: label.clone(),
@@ -831,40 +843,20 @@ pub(super) fn literal_matches_type(
     literal: &RowLiteral,
     scalar_type: CodeQueryRowScalarType,
 ) -> bool {
-    matches!(
-        (literal, scalar_type),
-        (RowLiteral::Integer(_), CodeQueryRowScalarType::Integer)
-            | (
-                RowLiteral::StringList(_),
-                CodeQueryRowScalarType::StringList
-            )
-            | (RowLiteral::Boolean(_), CodeQueryRowScalarType::Boolean)
-            | (
-                RowLiteral::ConstrainedEnum(_),
-                CodeQueryRowScalarType::ConstrainedEnum
-            )
-            | (
-                RowLiteral::String(_),
-                CodeQueryRowScalarType::String
-                    | CodeQueryRowScalarType::StableId
-                    | CodeQueryRowScalarType::DeclarationIdentity
-            )
-    )
+    scalar_type.accepts_literal_type(row_literal_type(literal))
 }
 
 pub(super) fn row_literal_kind(literal: &RowLiteral) -> &'static str {
     match literal {
         RowLiteral::String(_) => "string",
         RowLiteral::StringList(_) => "string_list",
+        RowLiteral::IntegerList(_) => "integer_list",
         RowLiteral::Integer(_) => "integer",
         RowLiteral::Boolean(_) => "boolean",
         RowLiteral::ConstrainedEnum(_) => "constrained-enum",
     }
 }
 
-/// The comparison operators are exhaustive over the IR's operator set; this
-/// assertion exists so a new operator cannot be added without deciding whether
-/// it is ordered.
 #[cfg(test)]
 mod tests {
     use super::super::ir::IrCompareOp;

@@ -6,7 +6,8 @@
 
 use crate::declarations::{extract_name_segments, parse_ruby_tree, ruby_node_text};
 use crate::syntax::{
-    ruby_call_arguments, ruby_first_call_argument, single_static_string_content_node,
+    call_method_node, ruby_call_arguments, ruby_first_call_argument,
+    ruby_static_string_content_node,
 };
 use brokk_bifrost_core::analyzer::ProjectFile;
 use brokk_bifrost_core::analyzer::model::{
@@ -195,7 +196,7 @@ fn ruby_test_case<'tree>(node: Node<'tree>, source: &'tree str) -> Option<RubyTe
     }
     let block = node.child_by_field_name("block")?;
     let description = ruby_first_call_argument(node)
-        .and_then(static_string_content)
+        .and_then(ruby_static_string_content_node)
         .map(|content| ruby_node_text(content, source))
         .filter(|description| !description.is_empty())
         .unwrap_or(method);
@@ -218,7 +219,10 @@ fn analyze_ruby_test_case(
     append_test_assertion_findings(
         file,
         symbol,
-        compact_ruby_excerpt(ruby_node_text(test_case.body, source)),
+        compact_assertion_excerpt(
+            ruby_node_text(test_case.body, source),
+            TEST_ASSERTION_EXCERPT_MAX_LEN,
+        ),
         test_case.start_byte,
         &assertions,
         weights,
@@ -325,14 +329,14 @@ fn minitest_assertion_signal(
     weights: &TestAssertionWeights,
 ) -> TestAssertionSignal {
     let arguments = ruby_call_arguments(call);
-    let classification = match method {
-        "assert_equal" | "refute_equal" | "assert_same" | "refute_same" => arguments
-            .first()
-            .zip(arguments.get(1))
-            .map(|(&left, &right)| classify_ruby_equality(left, right, source, weights)),
-        "assert_nil" | "refute_nil" => {
-            Some(("nullness-only", weights.nullness_only_weight, true, false))
-        }
+    let classification = minitest_classification(
+        method,
+        arguments.first().copied(),
+        arguments.get(1).copied(),
+        source,
+        weights,
+    )
+    .or_else(|| match method {
         "assert" if arguments.first().is_some_and(|node| node.kind() == "true") => {
             Some(("constant-truth", weights.constant_truth_weight, true, false))
         }
@@ -340,7 +344,7 @@ fn minitest_assertion_signal(
             Some(("constant-truth", weights.constant_truth_weight, true, false))
         }
         _ => None,
-    };
+    });
     assertion_signal(call, source, classification, weights, arguments.into_iter())
 }
 
@@ -352,15 +356,13 @@ fn minitest_expectation_signal(
 ) -> TestAssertionSignal {
     let receiver = call_receiver(call).expect("expectation method has receiver");
     let arguments = ruby_call_arguments(call);
-    let classification = match method {
-        "must_equal" | "wont_equal" | "must_same" | "wont_same" => arguments
-            .first()
-            .map(|&argument| classify_ruby_equality(receiver, argument, source, weights)),
-        "must_be_nil" | "wont_be_nil" => {
-            Some(("nullness-only", weights.nullness_only_weight, true, false))
-        }
-        _ => None,
-    };
+    let classification = minitest_classification(
+        method,
+        Some(receiver),
+        arguments.first().copied(),
+        source,
+        weights,
+    );
     assertion_signal(
         call,
         source,
@@ -368,6 +370,25 @@ fn minitest_expectation_signal(
         weights,
         std::iter::once(receiver).chain(arguments),
     )
+}
+
+fn minitest_classification(
+    method: &str,
+    left: Option<Node<'_>>,
+    right: Option<Node<'_>>,
+    source: &str,
+    weights: &TestAssertionWeights,
+) -> Option<(&'static str, i32, bool, bool)> {
+    match method {
+        "assert_equal" | "refute_equal" | "assert_same" | "refute_same" | "must_equal"
+        | "wont_equal" | "must_same" | "wont_same" => left
+            .zip(right)
+            .map(|(left, right)| classify_ruby_equality(left, right, source, weights)),
+        "assert_nil" | "refute_nil" | "must_be_nil" | "wont_be_nil" => {
+            Some(("nullness-only", weights.nullness_only_weight, true, false))
+        }
+        _ => None,
+    }
 }
 
 fn rspec_assertion_signal(
@@ -485,7 +506,10 @@ fn assertion_signal<'tree>(
         shallow,
         meaningful,
         reasons,
-        excerpt: compact_ruby_excerpt(ruby_node_text(call, source)),
+        excerpt: compact_assertion_excerpt(
+            ruby_node_text(call, source),
+            TEST_ASSERTION_EXCERPT_MAX_LEN,
+        ),
         start_byte: call.start_byte(),
     }
 }
@@ -507,7 +531,7 @@ fn ruby_test_marker_call(node: Node<'_>, source: &str) -> bool {
         return false;
     }
     ruby_first_call_argument(node)
-        .and_then(static_string_content)
+        .and_then(ruby_static_string_content_node)
         .map(|content| ruby_node_text(content, source))
         .is_some_and(|required| {
             matches!(required, "spec_helper" | "test_helper" | "test/unit")
@@ -540,36 +564,25 @@ fn ruby_method_name<'a>(node: Node<'_>, source: &'a str) -> Option<&'a str> {
 }
 
 fn call_method_name<'a>(node: Node<'_>, source: &'a str) -> Option<&'a str> {
-    node.child_by_field_name("method")
-        .map(|method| ruby_node_text(method, source))
+    call_method_node(node).map(|method| ruby_node_text(method, source))
 }
 
 fn call_receiver(node: Node<'_>) -> Option<Node<'_>> {
     node.child_by_field_name("receiver")
 }
 
-fn static_string_content(node: Node<'_>) -> Option<Node<'_>> {
-    (node.kind() == "string")
-        .then(|| single_static_string_content_node(node))
-        .flatten()
-}
-
 fn ruby_scalar_literal(node: Node<'_>) -> bool {
     matches!(
         node.kind(),
         "integer" | "float" | "complex" | "rational" | "true" | "false" | "nil" | "simple_symbol"
-    ) || static_string_content(node).is_some()
+    ) || ruby_static_string_content_node(node).is_some()
 }
 
 fn oversized_ruby_string(node: Node<'_>, weights: &TestAssertionWeights) -> bool {
-    static_string_content(node).is_some_and(|content| {
+    ruby_static_string_content_node(node).is_some_and(|content| {
         content.end_byte().saturating_sub(content.start_byte())
             > weights.large_literal_length_threshold.max(0) as usize
     })
-}
-
-fn compact_ruby_excerpt(text: &str) -> String {
-    compact_assertion_excerpt(text, TEST_ASSERTION_EXCERPT_MAX_LEN)
 }
 
 fn bounded_test_case_name(description: &str) -> String {

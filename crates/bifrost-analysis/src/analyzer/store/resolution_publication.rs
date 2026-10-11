@@ -609,7 +609,20 @@ pub(crate) fn prepare_resolution_capsule(
         ));
         let previous = match site.role() {
             LoweredSemanticRole::Definition => definition_keys.insert(site.site(), key),
-            LoweredSemanticRole::Reference => reference_keys.insert(site.site(), key),
+            LoweredSemanticRole::Reference if site.published_site_metadata().is_some() => {
+                reference_keys.insert(site.site(), key)
+            }
+            LoweredSemanticRole::Reference => {
+                assert_eq!(
+                    site.site_metadata()
+                        .map(|metadata| metadata.site_kind()),
+                    Some(
+                        brokk_bifrost_core::analyzer::resolution_facts::ResolutionSiteKind::SyntheticReference
+                    ),
+                    "only synthetic capsule references lack published source metadata"
+                );
+                None
+            }
         };
         assert!(
             previous.is_none(),
@@ -665,7 +678,7 @@ pub(crate) fn prepare_resolution_capsule(
     }
     assert!(
         reference_keys.is_empty(),
-        "capsule reference contexts omit dense references: {reference_keys:?}"
+        "capsule reference contexts omit published dense references: {reference_keys:?}"
     );
     let input = ResolutionContentInput::Capsule {
         key,
@@ -1156,8 +1169,12 @@ impl AnalyzerStore {
 #[cfg(test)]
 mod capsule_authentication_tests {
     use super::*;
+    use brokk_bifrost_test_macros::hardwon;
 
     #[test]
+    #[hardwon(
+        "3da13ca2218b: reordered or altered capsule presentation bypassed immutable publication identity"
+    )]
     fn capsule_verification_authenticates_fresh_cached_and_reordered_artifacts() {
         use CapsuleArtifactVerification::{Cancelled, Mismatch, Verified};
         super::super::resolution_operation::with_dense_selected_macro_fixture(

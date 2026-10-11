@@ -27,6 +27,7 @@ use brokk_bifrost_core::analyzer::model::{CallableLinkage, Range, SignatureMetad
 use brokk_bifrost_core::analyzer::query_token::QueryToken;
 use brokk_bifrost_core::analyzer::symbol_path::parse_symbol_path_fq;
 use brokk_bifrost_core::analyzer::tree_walk::{node_for_exact_range, subtree_contains};
+pub use brokk_bifrost_core::analyzer::usages::common::same_node as cpp_same_node;
 use brokk_bifrost_core::analyzer::{CodeUnit, CodeUnitIndex, Language, ProjectFile};
 use brokk_bifrost_core::hash::HashMap;
 use brokk_bifrost_core::path_utils::rel_path_string;
@@ -117,8 +118,14 @@ pub fn cpp_indexed_callable_linkage(
     index: &dyn CodeUnitIndex,
     callable: &CodeUnit,
 ) -> Option<CallableLinkage> {
+    cpp_callable_linkage_from_metadata(index.signature_metadata(callable))
+}
+
+pub fn cpp_callable_linkage_from_metadata(
+    metadata: impl IntoIterator<Item = SignatureMetadata>,
+) -> Option<CallableLinkage> {
     let mut external = false;
-    for metadata in index.signature_metadata(callable) {
+    for metadata in metadata {
         match metadata.callable_linkage() {
             Some(CallableLinkage::Internal) => return Some(CallableLinkage::Internal),
             Some(CallableLinkage::External) => external = true,
@@ -177,10 +184,10 @@ pub fn cpp_callable_definitions_share_identity_evidence_with_visibility(
         && visibility.same_logical_callable(analyzer, left, right)
         && (left.source() == right.source()
             || (matches!(
-                cpp_indexed_callable_linkage(analyzer.index, left),
+                visibility.callable_linkage(left),
                 Some(CallableLinkage::External)
             ) && matches!(
-                cpp_indexed_callable_linkage(analyzer.index, right),
+                visibility.callable_linkage(right),
                 Some(CallableLinkage::External)
             ) && header_body_related(left.source(), right.source())))
 }
@@ -460,12 +467,6 @@ fn cpp_range_for_inner_declarator(node: Node<'_>) -> Option<Node<'_>> {
     })
 }
 
-fn cpp_same_node(left: Node<'_>, right: Node<'_>) -> bool {
-    left.id() == right.id()
-        && left.start_byte() == right.start_byte()
-        && left.end_byte() == right.end_byte()
-}
-
 /// Include evidence relates one header declaration to one implementation file
 /// without pretending that every external name in a workspace belongs to one
 /// linker unit.
@@ -562,33 +563,37 @@ pub fn cpp_occurrence_role_for_range(
     let Some(node) = cpp_declaration_node_for_range(root, range) else {
         return CppOccurrenceRole::Unknown;
     };
-    if candidate.is_callable() {
-        if subtree_contains(node, |descendant| {
+    if candidate.is_callable()
+        && subtree_contains(node, |descendant| {
             descendant.kind() == "function_definition"
                 && descendant.child_by_field_name("body").is_some()
-        }) {
-            return CppOccurrenceRole::Definition;
-        }
-        // A callable recovered from a mangled region owns no node of its own,
-        // so the climb above landed on the container the parser left -- an
-        // access label, an `ERROR`, a statement -- and the scan answered for
-        // whatever else that container holds. Ask the recovery about this exact
-        // range instead, the same way a recovered class is asked below. An
-        // ordinary declaration lands on a declaration node and never gets here.
-        if !matches!(
+        })
+    {
+        return CppOccurrenceRole::Definition;
+    }
+    // A callable recovered from a mangled region owns no node of its own,
+    // so the climb above landed on the container the parser left -- an
+    // access label, an `ERROR`, a statement -- and the scan answered for
+    // whatever else that container holds. Ask the recovery about this exact
+    // range instead, the same way a recovered class is asked below. An
+    // ordinary declaration lands on a declaration node and never gets here.
+    if candidate.is_callable()
+        && !matches!(
             node.kind(),
             "declaration" | "field_declaration" | "function_definition"
-        ) && let Some(has_body) = recovered_callable_body_at(source, range)
-        {
-            return if has_body {
-                CppOccurrenceRole::Definition
-            } else {
-                CppOccurrenceRole::DeclarationOnly
-            };
-        }
-        return CppOccurrenceRole::DeclarationOnly;
+        )
+        && let Some(has_body) = recovered_callable_body_at(source, range)
+    {
+        return if has_body {
+            CppOccurrenceRole::Definition
+        } else {
+            CppOccurrenceRole::DeclarationOnly
+        };
     }
-    if node.kind() == "function_definition" && node.child_by_field_name("body").is_some() {
+    if candidate.is_class()
+        && node.kind() == "function_definition"
+        && node.child_by_field_name("body").is_some()
+    {
         return CppOccurrenceRole::Definition;
     }
     // A recovered export-macro class owns no node of its own, so the fallback
@@ -598,37 +603,22 @@ pub fn cpp_occurrence_role_for_range(
     // calls every class a forward declaration. Ask the recovery shapes about
     // this exact range first; they are the same answer the resolver's
     // declaration strength uses.
-    if let Some(has_body) = recovered_class_body_at(
-        recovered_export_classes,
-        root,
-        source,
-        candidate.identifier(),
-        range,
-    ) {
+    if candidate.is_class()
+        && let Some(has_body) = recovered_class_body_at(
+            recovered_export_classes,
+            root,
+            source,
+            candidate.identifier(),
+            range,
+        )
+    {
         return if has_body {
             CppOccurrenceRole::Definition
         } else {
             CppOccurrenceRole::DeclarationOnly
         };
     }
-    if !subtree_contains(node, |descendant| {
-        matches!(
-            descendant.kind(),
-            "class_specifier" | "struct_specifier" | "union_specifier" | "enum_specifier"
-        )
-    }) {
-        return CppOccurrenceRole::Both;
-    }
-    if subtree_contains(node, |descendant| {
-        matches!(
-            descendant.kind(),
-            "class_specifier" | "struct_specifier" | "union_specifier" | "enum_specifier"
-        ) && descendant.child_by_field_name("body").is_some()
-    }) {
-        CppOccurrenceRole::Definition
-    } else {
-        CppOccurrenceRole::DeclarationOnly
-    }
+    cpp_occurrence_role_for_node(node, candidate)
 }
 
 /// Whether the occurrence at `range` is a pure-virtual member declaration
@@ -700,6 +690,36 @@ pub struct CppReconciledDefinitionIndex {
     pub rekeyed: Vec<CodeUnit>,
     /// Re-keyed unit -> the stored provisional unit its indexed data lives under.
     pub provisional_of: HashMap<CodeUnit, CodeUnit>,
+}
+
+/// One bounded reconciliation cohort, with both identity directions. Physical
+/// units remain the keys of immutable extraction facts; canonical units retain
+/// their source, signature and synthetic provenance.
+#[derive(Default)]
+pub struct CppReconciledGroup {
+    pub by_name: HashMap<String, Arc<CppReconciledDefinitionIndex>>,
+    pub canonical_of: HashMap<CodeUnit, CodeUnit>,
+}
+
+/// Derive a cohort from recorded segment boundaries. Physical declarations
+/// must use this path instead of re-parsing their rendered protocol name.
+pub fn cpp_reconcile_group_key_for_fq(
+    fq: &brokk_bifrost_core::analyzer::fq_name::FqName,
+) -> Option<CppReconcileGroupKey> {
+    let interner = segment_interner();
+    let (member_identifier, _) = interner.resolve(fq.last()?);
+    if member_identifier.is_empty() {
+        return None;
+    }
+    let owner_terminal = fq
+        .segments()
+        .len()
+        .checked_sub(2)
+        .map(|index| interner.resolve(fq.segments()[index]).0.to_string());
+    Some(CppReconcileGroupKey {
+        member_identifier: member_identifier.to_string(),
+        owner_terminal,
+    })
 }
 
 /// Which candidates one reconcile group covers: a member identifier, and the
@@ -854,6 +874,11 @@ pub fn cpp_reconcile_candidates_from_units(
         }
         all.push(unit);
     }
+    // The final batch can be shorter than the polling stride, or empty.
+    // Refuse publication when its deadline expires after the last loop poll.
+    if !keep_going() {
+        return None;
+    }
     Some(CppReconcileCandidates {
         by_owner_terminal,
         all,
@@ -886,7 +911,7 @@ pub fn cpp_reconcile_group(
     candidates: &CppReconcileCandidates,
     keep_going: &dyn Fn() -> bool,
     on_candidate: &dyn Fn(),
-) -> Option<HashMap<String, Arc<CppReconciledDefinitionIndex>>> {
+) -> Option<CppReconciledGroup> {
     let _scope = profiling::scope_with(|| {
         format!(
             "cpp.reconciled.build[{}#{}]",
@@ -957,12 +982,25 @@ pub fn cpp_reconcile_group(
         index.rekeyed.push(rekeyed.clone());
         index.provisional_of.insert(rekeyed, unit.clone());
     }
-    Some(
-        groups
+    let canonical_of = groups
+        .values()
+        .flat_map(|index| {
+            index
+                .provisional_of
+                .iter()
+                .map(|(canonical, physical)| (physical.clone(), canonical.clone()))
+        })
+        .collect();
+    let group = CppReconciledGroup {
+        canonical_of,
+        by_name: groups
             .into_iter()
             .map(|(canonical_fq, index)| (canonical_fq, Arc::new(index)))
             .collect(),
-    )
+    };
+    // A deadline can expire in the last candidate or provenance assembly.
+    // The cache must receive only a fully completed, uncancelled cohort.
+    keep_going().then_some(group)
 }
 
 /// Reconcile one out-of-line member definition's provisional identity against
@@ -1090,13 +1128,76 @@ fn cpp_structured_out_of_line_owner_segments(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use brokk_bifrost_test_macros::hardwon;
+
+    #[test]
+    fn physical_identity_cohorts_keep_recorded_owner_and_member_boundaries() {
+        use brokk_bifrost_core::analyzer::fq_name::FqName;
+        let mut fq = FqName::new();
+        for (text, kind) in [
+            ("ns", SegmentKind::Package),
+            ("Owner$Literal", SegmentKind::Type),
+            ("operator std::string", SegmentKind::Member),
+        ] {
+            fq.push(segment_interner().intern(text, kind));
+        }
+        let key = cpp_reconcile_group_key_for_fq(&fq).unwrap();
+        assert_eq!(key.owner_terminal.as_deref(), Some("Owner$Literal"));
+        assert_eq!(key.member_identifier, "operator std::string");
+    }
+
+    #[test]
+    #[hardwon("#2488: terminal cancellation must not publish identity cohorts")]
+    fn candidate_cohorts_recheck_terminal_cancellation_before_publish() {
+        use std::cell::Cell;
+
+        let unit = CodeUnit::new(
+            ProjectFile::new(std::env::temp_dir(), "identity-cancellation.cpp"),
+            brokk_bifrost_core::analyzer::model::CodeUnitType::Function,
+            "",
+            "Owner.run",
+        );
+        let cancel_after_last_candidate = {
+            let active = Cell::new(true);
+            move || active.replace(false)
+        };
+        assert!(
+            cpp_reconcile_candidates_from_units(
+                std::iter::once(unit.clone()),
+                &cancel_after_last_candidate,
+            )
+            .is_none(),
+            "a cancellation observed after the last sub-256 candidate must prevent publication"
+        );
+
+        let candidates = (0..=CANDIDATE_BUCKETING_POLL_STRIDE)
+            .map(|index| {
+                CodeUnit::new(
+                    ProjectFile::new(std::env::temp_dir(), "identity-cancellation.cpp"),
+                    brokk_bifrost_core::analyzer::model::CodeUnitType::Function,
+                    "",
+                    format!("Owner{index}.run"),
+                )
+            })
+            .collect::<Vec<_>>();
+        let cancel_at_bucket_boundary = {
+            let active = Cell::new(true);
+            move || active.replace(false)
+        };
+        assert!(
+            cpp_reconcile_candidates_from_units(candidates, &cancel_at_bucket_boundary).is_none(),
+            "a cancellation at the bucket boundary must prevent a partial cohort from publishing"
+        );
+
+        let cancelled = || false;
+        assert!(
+            cpp_reconcile_candidates_from_units(Vec::<CodeUnit>::new(), &cancelled).is_none(),
+            "an empty cancelled cohort must not publish"
+        );
+    }
 
     fn parse_cpp(source: &str) -> Tree {
-        let mut parser = Parser::new();
-        parser
-            .set_language(&tree_sitter_cpp::LANGUAGE.into())
-            .expect("cpp language");
-        parser.parse(source, None).expect("cpp tree")
+        crate::diagnostics::parse_cpp_tree(source)
     }
 
     fn is_declarator_name(tree: &Tree, source: &str, start: usize, text: &str) -> bool {
@@ -1147,6 +1248,9 @@ mod tests {
     }
 
     #[test]
+    #[hardwon(
+        "b114d87215ca: C++ FIRD census assigned a declaration token the wrong reference/definition role"
+    )]
     fn recovered_macro_character_tokens_are_not_type_references() {
         let source = concat!(
             "struct I {};\n",
@@ -1194,6 +1298,9 @@ mod tests {
     }
 
     #[test]
+    #[hardwon(
+        "0733cadab142: C++ FIRD census assigned a declaration token the wrong reference/definition role"
+    )]
     fn conversion_operator_target_components_are_identity_syntax_only() {
         let source = concat!(
             "namespace other { struct Target {}; template<class T> struct Box {}; }\n",
@@ -1281,6 +1388,9 @@ mod tests {
     /// definition, a parameter type that happens to be the class, and the class
     /// name itself.
     #[test]
+    #[hardwon(
+        "246fc91b2fb6: C++ FIRD census assigned a declaration token the wrong reference/definition role"
+    )]
     fn declared_constructor_and_destructor_declarator_names_are_not_references() {
         let source = concat!(
             "class Foo {\n",
@@ -1372,6 +1482,9 @@ mod tests {
     /// initialization `D x(...)`, a member initializer and a bare temporary
     /// statement all name the type, and none of them is a declarator.
     #[test]
+    #[hardwon(
+        "246fc91b2fb6: C++ FIRD census assigned a declaration token the wrong reference/definition role"
+    )]
     fn constructor_call_sites_stay_references() {
         let source = concat!(
             "struct B { B(int); };\n",
@@ -1438,6 +1551,9 @@ mod tests {
     /// every constructor declaration in it as a call of the class's own name.
     /// The bodies the recovery left intact keep their references.
     #[test]
+    #[hardwon(
+        "246fc91b2fb6: C++ FIRD census assigned a declaration token the wrong reference/definition role"
+    )]
     fn a_constructor_declarator_the_parse_read_as_a_call_is_not_a_reference() {
         let source = concat!(
             "class SAMPLE_EXPORT Properties {\n",
@@ -1518,6 +1634,9 @@ mod tests {
     /// body-bearing `class_specifier` at all and every class in it read as a
     /// forward declaration, which dropped it from navigation.
     #[test]
+    #[hardwon(
+        "ec6b972248cc: C++ FIRD census assigned a declaration token the wrong reference/definition role"
+    )]
     fn recovered_export_macro_classes_are_definitions_without_an_ordinary_class() {
         let source = concat!(
             "namespace api {\n",
@@ -1541,6 +1660,9 @@ mod tests {
     }
 
     #[test]
+    #[hardwon(
+        "ec6b972248cc: C++ FIRD census assigned a declaration token the wrong reference/definition role"
+    )]
     fn ordinary_class_roles_keep_their_plain_specifier_reading() {
         assert_eq!(
             class_roles("class Plain;\n", "Plain"),

@@ -58,7 +58,8 @@ test("documentation-only changes select the docs baseline", () => {
   const decision = classifyChangeSet({
     eventName: "pull_request",
     changedPaths: [
-      ".agents/plans/1387-antigravity-dynamic-workspace-plugin.md",
+      ".agents/plans/example-plan.md",
+      ".agents/records/example-topic/investigation.md",
       "docs/src/content/docs/antigravity.md",
       "plugins/bifrost-agent/README.md",
     ],
@@ -166,6 +167,7 @@ test("ordinary analyzer and test changes select the Rust matrix only", () => {
     eventName: "pull_request",
     changedPaths: [
       "crates/bifrost-analysis/src/analyzer/javascript/semantic.rs",
+      "crates/bifrost-test-macros/src/lib.rs",
       "tests/fixtures/testcode-js/FeaturesTest.jsx",
       "tests/suite_analyzers/language_behavior.rs",
     ],
@@ -188,6 +190,7 @@ test("CSMI paths retain their existing components and select focused validation"
       ],
     ],
     ["schemas/csmi/0.1/schema.json", ["csmi"]],
+    ["schemas/csmi/0.2/schema.json", ["csmi"]],
     [
       "crates/bifrost-semantic-packs/src/bin/bifrost-semantic-pack.rs",
       [
@@ -337,7 +340,7 @@ test("broad analyzer PRs avoid unrelated packaging and plugin lanes", () => {
   const decision = classifyChangeSet({
     eventName: "pull_request",
     changedPaths: [
-      ".agents/plans/issue-1364-standalone-taint-codequery.md",
+      ".agents/plans/example-analysis-plan.md",
       "bifrost_searchtools/client.py",
       "crates/bifrost-flow/src/taint/client.rs",
       "crates/bifrost-policy/src/taint_policy.rs",

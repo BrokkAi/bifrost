@@ -1,6 +1,7 @@
 //! Resolution schema, migration, sealing, and indexed-query laws.
 
 use super::*;
+use brokk_bifrost_test_macros::hardwon;
 use rusqlite::params;
 
 #[path = "native_fk_probes.rs"]
@@ -268,15 +269,7 @@ fn assert_resolution_canonical_schema_names(conn: &Connection) {
 }
 
 fn insert_empty_resolution_interior(conn: &Connection, label: &str) -> i64 {
-    let blob_id = insert_resolution_test_blob(conn, label, "rust");
-    conn.execute(
-        "INSERT INTO resolution_fragment_interiors(
-               blob_id, lang, semantic_language, producer_epoch, interior_digest, expected_semantic_site_count, logical_rows, payload_bytes, publication_state
-             ) VALUES(?1, 'rust', 'rust', 'resolution-v1', zeroblob(32), 0, 1, 0, 'building')",
-        [blob_id],
-    )
-    .unwrap();
-    blob_id
+    insert_reference_enumeration_impact_interior(conn, label, "rust", "rust", 0)
 }
 
 #[test]
@@ -400,6 +393,26 @@ fn query_plan(conn: &Connection, sql: &str) -> Vec<String> {
         .unwrap()
 }
 
+fn assert_same_version_resolution_schema_drift_rebuilds(
+    conn: &mut Connection,
+    stale_rows_message: &str,
+) {
+    migrate(conn).unwrap();
+
+    assert!(current_schema_is_valid(conn).unwrap());
+    assert_eq!(
+        conn.query_row(
+            "SELECT COUNT(*) FROM resolution_producer_epochs",
+            [],
+            |row| { row.get::<_, i64>(0) }
+        )
+        .unwrap(),
+        0,
+        "{stale_rows_message}"
+    );
+    assert_resolution_canonical_schema_names(conn);
+}
+
 #[test]
 fn current_resolution_schema_ddl_drift_rebuilds_at_the_same_user_version() {
     let mut conn = open_in_memory_cache();
@@ -425,20 +438,10 @@ fn current_resolution_schema_ddl_drift_rebuilds_at_the_same_user_version() {
     );
     assert!(!current_schema_is_valid(&conn).unwrap());
 
-    migrate(&mut conn).unwrap();
-
-    assert!(current_schema_is_valid(&conn).unwrap());
-    assert_eq!(
-        conn.query_row(
-            "SELECT COUNT(*) FROM resolution_producer_epochs",
-            [],
-            |row| { row.get::<_, i64>(0) }
-        )
-        .unwrap(),
-        0,
-        "same-version DDL drift must rebuild rather than retain stale resolution rows"
+    assert_same_version_resolution_schema_drift_rebuilds(
+        &mut conn,
+        "same-version DDL drift must rebuild rather than retain stale resolution rows",
     );
-    assert_resolution_canonical_schema_names(&conn);
 }
 
 #[test]
@@ -458,20 +461,10 @@ fn current_resolution_schema_missing_root_index_rebuilds_at_the_same_version() {
     );
     assert!(!current_schema_is_valid(&conn).unwrap());
 
-    migrate(&mut conn).unwrap();
-
-    assert!(current_schema_is_valid(&conn).unwrap());
-    assert_eq!(
-        conn.query_row(
-            "SELECT COUNT(*) FROM resolution_producer_epochs",
-            [],
-            |row| { row.get::<_, i64>(0) }
-        )
-        .unwrap(),
-        0,
-        "index-only same-version drift must rebuild rather than retain stale resolution rows"
+    assert_same_version_resolution_schema_drift_rebuilds(
+        &mut conn,
+        "index-only same-version drift must rebuild rather than retain stale resolution rows",
     );
-    assert_resolution_canonical_schema_names(&conn);
 }
 
 #[test]
@@ -927,6 +920,7 @@ fn insert_shared_import_fixture(
 }
 
 #[test]
+#[hardwon("#3737: canonical shared import headers must reject inconsistent projections")]
 fn canonical_shared_import_properties_reject_bad_headers() {
     let conn = open_in_memory_cache();
     for (label, module_path, exported_name, expected) in [
@@ -1590,6 +1584,7 @@ fn rust_declaration_properties_cover_units_and_require_dense_constructor_fields(
 }
 
 #[test]
+#[hardwon("#3737: sealed Rust declaration properties must remain immutable and cascade")]
 fn rust_declaration_properties_are_immutable_after_seal_and_cascade() {
     let conn = open_in_memory_cache();
     let blob_id = insert_rust_declaration_property_fixture(
@@ -1723,54 +1718,8 @@ fn insert_rust_import_context_fixture(
 #[test]
 fn rust_import_contexts_publish_owner_ranges_and_seal() {
     let conn = open_in_memory_cache();
-    let blob_id = insert_resolution_test_blob(&conn, "rust-context-publish", "rust");
-    conn.execute(
-        "INSERT INTO source_fact_manifests(
-               blob_id, facts_version, source_bytes,
-               occurrence_count, declaration_count, declaration_unit_count,
-               node_count, role_count, occurrence_role_count,
-               import_count, import_segment_count, import_scope_count,
-               import_prefix_count, rust_import_context_count,
-               logical_rows, payload_bytes, publication_state
-         ) VALUES(?1, 12, 40, 4, 0, 0, 0, 0, 0, 1, 2, 0, 0, 1, 9, 58, 'building')",
-        [blob_id],
-    )
-    .unwrap();
-    conn.execute(
-        "INSERT INTO source_occurrence_arenas(blob_id, spans)\n             VALUES(?1, jsonb('[[10,20,1,1,0],[15,18,1,1,0],[0,30,1,1,0],[0,40,1,1,0]]'))",
-        [blob_id],
-    )
-    .unwrap();
-    conn.execute(
-        "INSERT INTO source_imports(
-               blob_id, import_id, statement, is_wildcard, is_global,
-               identifier, alias, path_kind, declaration_occurrence_id,
-               target_occurrence_id, alias_occurrence_id,
-               declaration_start_byte, declaration_end_byte,
-               target_start_byte, target_end_byte,
-               alias_start_byte, alias_end_byte)
-             SELECT ?1, 0, 'use crate::Thing;', 0, 0, 'Thing', NULL, 'namespace', 0, 1, NULL, json_extract(arena.spans, '$[0][0]'), json_extract(arena.spans, '$[0][1]'), json_extract(arena.spans, '$[1][0]'), json_extract(arena.spans, '$[1][1]'), NULL, NULL FROM source_occurrence_arenas AS arena WHERE arena.blob_id = ?1",
-        [blob_id],
-    )
-    .unwrap();
-    conn.execute(
-        "INSERT INTO source_import_segments(
-               blob_id, import_id, ordinal, segment
-         ) VALUES(?1, 0, 0, 'crate'), (?1, 0, 1, 'Thing')",
-        [blob_id],
-    )
-    .unwrap();
-    conn.execute(
-        "INSERT INTO source_rust_import_contexts(
-               blob_id, declaration_occurrence_id, owner_module,
-               owner_scope_occurrence_id, local_scope_occurrence_id,
-               visibility, cfg_condition,
-               owner_scope_start_byte, owner_scope_end_byte,
-               local_scope_start_byte, local_scope_end_byte, declaration_start_byte, declaration_end_byte)
-             SELECT ?1, 0, 'crate::m', 2, 3, 'pub', 'always', json_extract(arena.spans, '$[2][0]'), json_extract(arena.spans, '$[2][1]'), json_extract(arena.spans, '$[3][0]'), json_extract(arena.spans, '$[3][1]'), json_extract(arena.spans, '$[0][0]'), json_extract(arena.spans, '$[0][1]') FROM source_occurrence_arenas AS arena WHERE arena.blob_id = ?1",
-        [blob_id],
-    )
-    .unwrap();
+    let blob_id =
+        insert_rust_import_context_fixture(&conn, "rust-context-publish", (0, 30), (0, 40));
     let declaration_join_plan = query_plan(
         &conn,
         &format!(
@@ -1788,11 +1737,6 @@ fn rust_import_contexts_publish_owner_ranges_and_seal() {
             .any(|detail| detail.contains("idx_source_imports_declaration")),
         "context declaration joins must use the declaration index: {declaration_join_plan:?}"
     );
-    conn.execute(
-        "INSERT INTO rust_import_targets(blob_id, lang, ordinal, source_import_id, source_context_occurrence_id, module_path, bound_name, imported_name, is_glob, visibility, owner_module, owner_start, owner_end, local_start, local_end, cfg_condition, is_extern_crate, leading_absolute, is_macro_use)  VALUES(?1, 'rust', 0, 0, 0, 'crate', 'Thing', NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL)",
-        [blob_id],
-    )
-    .unwrap();
     conn.execute(
         "UPDATE source_fact_manifests SET publication_state = 'complete'
          WHERE blob_id = ?1",
@@ -1935,53 +1879,8 @@ fn rust_import_contexts_reject_target_link_to_different_declaration() {
 #[test]
 fn rust_import_contexts_reject_crossing_scopes_at_seal() {
     let conn = open_in_memory_cache();
-    let blob_id = insert_resolution_test_blob(&conn, "rust-context-crossing", "rust");
-    conn.execute(
-        "INSERT INTO source_fact_manifests(
-               blob_id, facts_version, source_bytes,
-               occurrence_count, declaration_count, declaration_unit_count,
-               node_count, role_count, occurrence_role_count,
-               import_count, import_segment_count, import_scope_count,
-               import_prefix_count, rust_import_context_count,
-               logical_rows, payload_bytes, publication_state
-         ) VALUES(?1, 12, 40, 4, 0, 0, 0, 0, 0, 1, 2, 0, 0, 1, 9, 58, 'building')",
-        [blob_id],
-    )
-    .unwrap();
-    conn.execute(
-        "INSERT INTO source_occurrence_arenas(blob_id, spans)\n             VALUES(?1, jsonb('[[10,20,1,1,0],[15,18,1,1,0],[0,25,1,1,0],[5,40,1,1,0]]'))",
-        [blob_id],
-    )
-    .unwrap();
-    conn.execute(
-        "INSERT INTO source_imports(
-               blob_id, import_id, statement, is_wildcard, is_global,
-               identifier, alias, path_kind, declaration_occurrence_id,
-               target_occurrence_id, alias_occurrence_id,
-               declaration_start_byte, declaration_end_byte,
-               target_start_byte, target_end_byte,
-               alias_start_byte, alias_end_byte)
-             SELECT ?1, 0, 'use crate::Thing;', 0, 0, 'Thing', NULL, 'namespace', 0, 1, NULL, json_extract(arena.spans, '$[0][0]'), json_extract(arena.spans, '$[0][1]'), json_extract(arena.spans, '$[1][0]'), json_extract(arena.spans, '$[1][1]'), NULL, NULL FROM source_occurrence_arenas AS arena WHERE arena.blob_id = ?1",
-        [blob_id],
-    )
-    .unwrap();
-    conn.execute(
-        "INSERT INTO source_import_segments(blob_id, import_id, ordinal, segment)
-         VALUES(?1, 0, 0, 'crate'), (?1, 0, 1, 'Thing')",
-        [blob_id],
-    )
-    .unwrap();
-    conn.execute(
-        "INSERT INTO source_rust_import_contexts(
-               blob_id, declaration_occurrence_id, owner_module,
-               owner_scope_occurrence_id, local_scope_occurrence_id,
-               visibility, cfg_condition,
-               owner_scope_start_byte, owner_scope_end_byte,
-               local_scope_start_byte, local_scope_end_byte, declaration_start_byte, declaration_end_byte)
-             SELECT ?1, 0, 'crate::m', 2, 3, 'pub', 'always', json_extract(arena.spans, '$[2][0]'), json_extract(arena.spans, '$[2][1]'), json_extract(arena.spans, '$[3][0]'), json_extract(arena.spans, '$[3][1]'), json_extract(arena.spans, '$[0][0]'), json_extract(arena.spans, '$[0][1]') FROM source_occurrence_arenas AS arena WHERE arena.blob_id = ?1",
-        [blob_id],
-    )
-    .unwrap();
+    let blob_id =
+        insert_rust_import_context_fixture(&conn, "rust-context-crossing", (0, 25), (5, 40));
     let error = conn
         .execute(
             "UPDATE source_fact_manifests SET publication_state = 'complete'
@@ -2223,6 +2122,7 @@ fn root_prefix_columns_enforce_root_shape_tail_and_identity_spaces() {
 /// Lane ST stage B folded `source_occurrences` from 1.24 million rows into one
 /// JSONB arena row a blob and left a view of the same shape in its place.
 #[test]
+#[hardwon("#3737: populated schema views and the occurrence arena must agree")]
 fn every_view_answers_and_the_occurrence_view_reads_the_arena() {
     let conn = open_in_memory_cache();
 
@@ -2288,6 +2188,7 @@ fn every_view_answers_and_the_occurrence_view_reads_the_arena() {
 }
 
 #[test]
+#[hardwon("#3737: occurrence arena storage must remain a SQL-readable JSON array")]
 fn occurrence_arena_column_holds_only_a_json_array() {
     let conn = open_in_memory_cache();
     let blob_id = insert_resolution_test_blob(&conn, "arena-shape", "rust");

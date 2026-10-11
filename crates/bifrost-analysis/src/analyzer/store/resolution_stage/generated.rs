@@ -13,6 +13,15 @@ use crate::analyzer::store::resolution_selection::SelectedResolutionMountRecord;
 use brokk_bifrost_core::analyzer::canonical_hash::CanonicalHasher;
 use rusqlite::{Connection, OptionalExtension, params};
 
+pub(crate) struct SelectedIncludeBindingPair<'a> {
+    pub(crate) destination_host: &'a SelectedResolutionMountRecord,
+    pub(crate) destination: BindingNodeId,
+    pub(crate) origin_host: &'a SelectedResolutionMountRecord,
+    pub(crate) original_identity: CandidatePathIdentity,
+    pub(crate) original: &'a PartialPath,
+    pub(crate) end_kind: BindingNodeKind,
+}
+
 impl SelectedResolutionStage<'_, '_> {
     pub(crate) fn admit_include_glob(
         &self,
@@ -168,6 +177,7 @@ impl SelectedResolutionStage<'_, '_> {
         })
     }
 
+    #[cfg(test)]
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn admit_include_binding_pair(
         &self,
@@ -179,6 +189,62 @@ impl SelectedResolutionStage<'_, '_> {
         end_kind: BindingNodeKind,
         cancellation: &CancellationToken,
     ) -> Result<Option<()>> {
+        self.admit_include_binding_pairs(
+            &[SelectedIncludeBindingPair {
+                destination_host,
+                destination,
+                origin_host,
+                original_identity,
+                original,
+                end_kind,
+            }],
+            cancellation,
+        )
+    }
+
+    /// Admit a whole include component's binding pairs under one temporary
+    /// transaction. Include overlays can contain hundreds of thousands of
+    /// pairs; committing each generated bridge separately made transaction
+    /// setup dominate the projection work.
+    pub(crate) fn admit_include_binding_pairs(
+        &self,
+        pairs: &[SelectedIncludeBindingPair<'_>],
+        cancellation: &CancellationToken,
+    ) -> Result<Option<()>> {
+        if pairs.is_empty() {
+            return Ok(Some(()));
+        }
+        self.with_generated_admission(cancellation, |connection| {
+            let mut changed = false;
+            for pair in pairs {
+                if cancellation.is_cancelled() {
+                    return Ok(None);
+                }
+                let Some(pair_changed) =
+                    self.admit_include_binding_pair_in_transaction(connection, pair, cancellation)?
+                else {
+                    return Ok(None);
+                };
+                changed |= pair_changed;
+            }
+            Ok(Some(((), changed)))
+        })
+    }
+
+    fn admit_include_binding_pair_in_transaction(
+        &self,
+        connection: &Connection,
+        pair: &SelectedIncludeBindingPair<'_>,
+        cancellation: &CancellationToken,
+    ) -> Result<Option<bool>> {
+        let SelectedIncludeBindingPair {
+            destination_host,
+            destination,
+            origin_host,
+            original_identity,
+            original,
+            end_kind,
+        } = pair;
         assert_eq!(original_identity.fragment(), origin_host.fragment_id());
         let mut hash = CanonicalHasher::new(b"bifrost-selected-include-binding:v1");
         hash.field("path", &original_identity.path().as_bytes());
@@ -188,92 +254,90 @@ impl SelectedResolutionStage<'_, '_> {
         let mut hash = CanonicalHasher::new(b"bifrost-selected-include-continuation:v1");
         hash.field("binding", &source_identity.digest());
         let target_identity = ResolutionPathIdentity::new(hash.finish());
-        self.with_generated_admission(cancellation, |connection| {
-            // Include splices historically allocate the boundary before paths.
-            let Some(boundary) = allocation::assign_node(
-                self.selection,
-                connection,
-                destination_host.ordinal(),
-                boundary_identity,
-                cancellation,
-            )?
-            else {
-                return Ok(None);
-            };
-            let Some(source_path) = allocation::assign_path(
-                self.selection,
-                connection,
-                destination_host.ordinal(),
-                source_identity,
-                cancellation,
-            )?
-            else {
-                return Ok(None);
-            };
-            let source_catalog = self.generated_catalog(
-                connection,
-                destination_host,
-                &[(boundary, boundary_identity)],
-                &[(source_path, source_identity)],
-            );
-            let source = LoweredResolutionFragment::selected_include_binding(
-                destination_host.fragment_id(),
-                destination,
-                boundary,
-                source_path,
-                original,
-            );
-            let Some(source_changed) = self.project_generated_bridge(
-                connection,
-                destination_host,
-                source_identity.digest(),
-                &source,
-                Some(&source_catalog),
-                &[],
-                &[],
-                cancellation,
-            )?
-            else {
-                return Ok(None);
-            };
-            let Some(target_path) = allocation::assign_path(
-                self.selection,
-                connection,
-                origin_host.ordinal(),
-                target_identity,
-                cancellation,
-            )?
-            else {
-                return Ok(None);
-            };
-            let target_catalog = self.generated_catalog(
-                connection,
-                origin_host,
-                &[],
-                &[(target_path, target_identity)],
-            );
-            let target = LoweredResolutionFragment::selected_include_continuation(
-                origin_host.fragment_id(),
-                boundary,
-                target_path,
-                end_kind,
-                original,
-            );
-            let Some(target_changed) = self.project_generated_bridge(
-                connection,
-                origin_host,
-                target_identity.digest(),
-                &target,
-                Some(&target_catalog),
-                &[],
-                &[],
-                cancellation,
-            )?
-            else {
-                return Ok(None);
-            };
-            Ok(Some(((), source_changed || target_changed)))
-        })
+        // Include splices historically allocate the boundary before paths.
+        let Some(boundary) = allocation::assign_node(
+            self.selection,
+            connection,
+            destination_host.ordinal(),
+            boundary_identity,
+            cancellation,
+        )?
+        else {
+            return Ok(None);
+        };
+        let Some(source_path) = allocation::assign_path(
+            self.selection,
+            connection,
+            destination_host.ordinal(),
+            source_identity,
+            cancellation,
+        )?
+        else {
+            return Ok(None);
+        };
+        let source_catalog = self.generated_catalog(
+            connection,
+            destination_host,
+            &[(boundary, boundary_identity)],
+            &[(source_path, source_identity)],
+        );
+        let source = LoweredResolutionFragment::selected_include_binding(
+            destination_host.fragment_id(),
+            *destination,
+            boundary,
+            source_path,
+            original,
+        );
+        let Some(source_changed) = self.project_generated_bridge(
+            connection,
+            destination_host,
+            source_identity.digest(),
+            &source,
+            Some(&source_catalog),
+            &[],
+            &[],
+            cancellation,
+        )?
+        else {
+            return Ok(None);
+        };
+        let Some(target_path) = allocation::assign_path(
+            self.selection,
+            connection,
+            origin_host.ordinal(),
+            target_identity,
+            cancellation,
+        )?
+        else {
+            return Ok(None);
+        };
+        let target_catalog = self.generated_catalog(
+            connection,
+            origin_host,
+            &[],
+            &[(target_path, target_identity)],
+        );
+        let target = LoweredResolutionFragment::selected_include_continuation(
+            origin_host.fragment_id(),
+            boundary,
+            target_path,
+            *end_kind,
+            original,
+        );
+        let Some(target_changed) = self.project_generated_bridge(
+            connection,
+            origin_host,
+            target_identity.digest(),
+            &target,
+            Some(&target_catalog),
+            &[],
+            &[],
+            cancellation,
+        )?
+        else {
+            return Ok(None);
+        };
+        Ok(Some(source_changed || target_changed))
     }
 
     /// Only descriptors of coordinates actually invented by this bridge belong

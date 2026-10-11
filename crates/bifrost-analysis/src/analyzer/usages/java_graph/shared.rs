@@ -357,12 +357,10 @@ pub(crate) struct JavaEdgeResolver<'a> {
 impl<'a> JavaEdgeResolver<'a> {
     pub(crate) fn try_new(analyzer: &'a dyn IAnalyzer) -> Option<Self> {
         let java = resolve_analyzer::<JavaAnalyzer>(analyzer)?;
-        let files: Vec<ProjectFile> = analyzer
-            .project()
-            .analyzable_files(Language::Java)
-            .ok()?
-            .into_iter()
-            .collect();
+        let files = crate::analyzer::usages::common::analyzable_usage_graph_files(
+            analyzer,
+            Language::Java,
+        )?;
         Some(Self { java, files })
     }
 
@@ -375,12 +373,8 @@ impl<'a> JavaEdgeResolver<'a> {
     where
         F: Fn(&ProjectFile) -> bool + Sync,
     {
-        let selected_files: Vec<_> = self
-            .files
-            .iter()
-            .filter(|file| keep_file(file))
-            .cloned()
-            .collect();
+        let selected_files =
+            crate::analyzer::usages::common::select_usage_graph_files(&self.files, &keep_file);
         let file_states = self
             .java
             .bulk_file_states(selected_files, BulkFileStateSource::Omit);
@@ -403,12 +397,8 @@ impl<'a> JavaEdgeResolver<'a> {
     where
         F: Fn(&ProjectFile) -> bool + Sync,
     {
-        let selected_files: Vec<_> = self
-            .files
-            .iter()
-            .filter(|file| keep_file(file))
-            .cloned()
-            .collect();
+        let selected_files =
+            crate::analyzer::usages::common::select_usage_graph_files(&self.files, &keep_file);
         let file_states = self
             .java
             .bulk_file_states(selected_files, BulkFileStateSource::Omit);
@@ -431,12 +421,8 @@ impl<'a> JavaEdgeResolver<'a> {
     where
         F: Fn(&ProjectFile) -> bool + Sync,
     {
-        let selected_files: Vec<_> = self
-            .files
-            .iter()
-            .filter(|file| keep_file(file))
-            .cloned()
-            .collect();
+        let selected_files =
+            crate::analyzer::usages::common::select_usage_graph_files(&self.files, &keep_file);
         let file_states = self
             .java
             .bulk_file_states(selected_files, BulkFileStateSource::Omit);

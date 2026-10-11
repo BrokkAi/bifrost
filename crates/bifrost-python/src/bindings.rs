@@ -1,3 +1,5 @@
+use brokk_bifrost_core::analyzer::common::node_source_text_trimmed as node_text;
+use brokk_bifrost_core::analyzer::tree_walk::{named_children_iter, push_bounded_nodes};
 use tree_sitter::Node;
 
 use brokk_bifrost_core::hash::{HashMap, HashSet};
@@ -94,11 +96,7 @@ pub fn python_type_parameter_binds_name_at(name: &str, reference: Node<'_>, sour
         {
             let mut cursor = parameters.walk();
             for parameter in parameters.named_children(&mut cursor) {
-                let binder = if parameter.kind() == "identifier" {
-                    Some(parameter)
-                } else {
-                    first_identifier_bounded(parameter, &mut || true).flatten()
-                };
+                let binder = python_type_parameter_binder_node(parameter);
                 if binder.is_some_and(|binder| node_text(binder, source) == name) {
                     // Only a name that actually matched an enclosing type
                     // parameter needs the function-wide directive scans. This
@@ -184,25 +182,7 @@ fn python_name_resolution_at_in_functions(
     PythonLexicalNameResolution::Unbound
 }
 
-fn python_parameter_name(node: Node<'_>, source: &str) -> Option<String> {
-    match node.kind() {
-        "identifier" => Some(node_text(node, source).trim().to_string()),
-        "typed_parameter"
-        | "typed_default_parameter"
-        | "default_parameter"
-        | "list_splat_pattern"
-        | "dictionary_splat_pattern" => node
-            .child_by_field_name("name")
-            .or_else(|| {
-                let mut cursor = node.walk();
-                node.named_children(&mut cursor)
-                    .find(|child| child.kind() == "identifier")
-            })
-            .and_then(|name| python_parameter_name(name, source)),
-        _ => None,
-    }
-    .filter(|name| !name.is_empty())
-}
+use crate::syntax::python_parameter_name;
 
 /// Whether this identifier is the binder (rather than a bound/constraint use)
 /// of one structured PEP 695 type parameter.
@@ -221,11 +201,7 @@ pub fn python_is_type_parameter_binder(node: Node<'_>) -> bool {
         {
             let mut cursor = parameters.walk();
             return parameters.named_children(&mut cursor).any(|parameter| {
-                let binder = if parameter.kind() == "identifier" {
-                    Some(parameter)
-                } else {
-                    first_identifier_bounded(parameter, &mut || true).flatten()
-                };
+                let binder = python_type_parameter_binder_node(parameter);
                 binder.is_some_and(|binder| binder.id() == node.id())
             });
         }
@@ -238,6 +214,14 @@ pub fn python_is_type_parameter_binder(node: Node<'_>) -> bool {
         current = parent;
     }
     false
+}
+
+fn python_type_parameter_binder_node(parameter: Node<'_>) -> Option<Node<'_>> {
+    if parameter.kind() == "identifier" {
+        Some(parameter)
+    } else {
+        first_identifier_bounded(parameter, &mut || true).flatten()
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -702,9 +686,7 @@ impl<'tree> PythonLexicalScopeInventory<'tree> {
 fn is_function_declaration_name(node: Node<'_>) -> bool {
     node.parent().is_some_and(|parent| {
         parent.kind() == "function_definition"
-            && parent
-                .child_by_field_name("name")
-                .is_some_and(|name| name.id() == node.id())
+            && brokk_bifrost_core::analyzer::tree_walk::is_field_child(parent, node, "name")
     })
 }
 
@@ -759,7 +741,7 @@ pub fn python_direct_scope_bindings_bounded<'tree>(
                 });
             })?;
         }
-        "assignment" | "augmented_assignment" => {
+        "assignment" | "annotated_assignment" | "augmented_assignment" => {
             if let Some(target) = node.child_by_field_name("left") {
                 collect_binding_targets(target, source, &mut scope_step, |_, declaration| {
                     bindings.push(PythonDirectScopeBinding {
@@ -789,7 +771,7 @@ pub fn python_direct_scope_bindings_bounded<'tree>(
                 })?;
             }
         }
-        "for_statement" => {
+        "for_statement" | "async_for_statement" => {
             if let Some(target) = node.child_by_field_name("left") {
                 collect_binding_targets(target, source, &mut scope_step, |_, declaration| {
                     bindings.push(PythonDirectScopeBinding {
@@ -797,6 +779,22 @@ pub fn python_direct_scope_bindings_bounded<'tree>(
                         kind: PythonDirectScopeBindingKind::Other,
                     });
                 })?;
+            }
+        }
+        "with_statement" => {
+            let mut cursor = node.walk();
+            for item in node
+                .named_children(&mut cursor)
+                .filter(|item| item.kind() == "with_item")
+            {
+                if let Some(alias) = item.child_by_field_name("alias") {
+                    collect_binding_targets(alias, source, &mut scope_step, |_, declaration| {
+                        bindings.push(PythonDirectScopeBinding {
+                            declaration,
+                            kind: PythonDirectScopeBindingKind::Other,
+                        });
+                    })?;
+                }
             }
         }
         "delete_statement" => {
@@ -877,19 +875,22 @@ pub fn python_module_or_class_scope_binds_name_bounded(
         {
             return Some(true);
         }
-        let excluded_body = matches!(
-            node.kind(),
-            "class_definition" | "function_definition" | "lambda"
-        )
-        .then(|| node.child_by_field_name("body").map(|body| body.id()))
-        .flatten();
-        let mut cursor = node.walk();
-        stack.extend(
-            node.named_children(&mut cursor)
-                .filter(|child| Some(child.id()) != excluded_body),
-        );
+        stack.extend(python_executable_scope_children(node));
     }
     Some(false)
+}
+
+/// Iterate executable-scope children, skipping nested callable and class bodies.
+pub fn python_executable_scope_children<'tree>(
+    node: Node<'tree>,
+) -> impl Iterator<Item = Node<'tree>> {
+    let excluded_body = matches!(
+        node.kind(),
+        "class_definition" | "function_definition" | "lambda"
+    )
+    .then(|| node.child_by_field_name("body").map(|body| body.id()))
+    .flatten();
+    named_children_iter(node).filter(move |child| Some(child.id()) != excluded_body)
 }
 
 pub fn python_unambiguous_module_class_binding_bounded(
@@ -1224,12 +1225,8 @@ fn push_named_children<'tree>(
     in_comprehension: bool,
     scope_step: &mut impl FnMut() -> bool,
 ) -> Option<()> {
-    for child in named_children_bounded(node, scope_step)?.into_iter().rev() {
-        stack.push(ScanFrame {
-            node: child,
-            in_comprehension,
-        });
-    }
+    let children = named_children_bounded(node, scope_step)?;
+    push_bounded_children(stack, children.into_iter(), in_comprehension);
     Some(())
 }
 
@@ -1240,16 +1237,14 @@ fn push_named_children_except<'tree>(
     in_comprehension: bool,
     scope_step: &mut impl FnMut() -> bool,
 ) -> Option<()> {
-    for child in named_children_bounded(node, scope_step)?
-        .into_iter()
-        .filter(|child| child.id() != excluded.id())
-        .rev()
-    {
-        stack.push(ScanFrame {
-            node: child,
-            in_comprehension,
-        });
-    }
+    let children = named_children_bounded(node, scope_step)?;
+    push_bounded_children(
+        stack,
+        children
+            .into_iter()
+            .filter(|child| child.id() != excluded.id()),
+        in_comprehension,
+    );
     Some(())
 }
 
@@ -1261,17 +1256,28 @@ fn push_nested_scope_header_children<'tree>(
 ) -> Option<()> {
     let body = node.child_by_field_name("body").map(|child| child.id());
     let name = node.child_by_field_name("name").map(|child| child.id());
-    for child in named_children_bounded(node, scope_step)?
-        .into_iter()
-        .filter(|child| Some(child.id()) != body && Some(child.id()) != name)
-        .rev()
-    {
+    let children = named_children_bounded(node, scope_step)?;
+    push_bounded_children(
+        stack,
+        children
+            .into_iter()
+            .filter(|child| Some(child.id()) != body && Some(child.id()) != name),
+        in_comprehension,
+    );
+    Some(())
+}
+
+fn push_bounded_children<'tree>(
+    stack: &mut Vec<ScanFrame<'tree>>,
+    children: impl DoubleEndedIterator<Item = Node<'tree>>,
+    in_comprehension: bool,
+) {
+    for child in children.rev() {
         stack.push(ScanFrame {
             node: child,
             in_comprehension,
         });
     }
-    Some(())
 }
 
 fn named_children_bounded<'tree>(
@@ -1280,13 +1286,8 @@ fn named_children_bounded<'tree>(
 ) -> Option<Vec<Node<'tree>>> {
     let mut cursor = node.walk();
     let mut children = Vec::new();
-    for child in node.named_children(&mut cursor) {
-        if !scope_step() {
-            return None;
-        }
-        children.push(child);
-    }
-    Some(children)
+    push_bounded_nodes(node.named_children(&mut cursor), &mut children, scope_step)
+        .then_some(children)
 }
 
 fn children_by_field_name_bounded<'tree>(
@@ -1296,13 +1297,12 @@ fn children_by_field_name_bounded<'tree>(
 ) -> Option<Vec<Node<'tree>>> {
     let mut cursor = node.walk();
     let mut children = Vec::new();
-    for child in node.children_by_field_name(field, &mut cursor) {
-        if !scope_step() {
-            return None;
-        }
-        children.push(child);
-    }
-    Some(children)
+    push_bounded_nodes(
+        node.children_by_field_name(field, &mut cursor),
+        &mut children,
+        scope_step,
+    )
+    .then_some(children)
 }
 
 fn is_comprehension(kind: &str) -> bool {
@@ -1327,10 +1327,6 @@ fn is_pattern_literal(kind: &str) -> bool {
             | "false"
             | "none"
     )
-}
-
-fn node_text<'a>(node: Node<'_>, source: &'a str) -> &'a str {
-    brokk_bifrost_core::analyzer::common::node_source_text_trimmed(node, source)
 }
 
 #[cfg(test)]

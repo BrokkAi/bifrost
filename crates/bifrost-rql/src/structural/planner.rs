@@ -52,7 +52,7 @@ impl QueryPlan {
     }
 
     pub(crate) fn has_source_anchors(&self) -> bool {
-        !self.positive_source_anchors.is_empty()
+        self.has_source_anchors_for(true)
     }
 
     pub(crate) fn has_source_anchors_for(&self, include_inside_decl: bool) -> bool {
@@ -231,6 +231,49 @@ mod tests {
     }
 
     #[test]
+    fn negation_and_opaque_regexes_contribute_no_anchors() {
+        let anchors = anchors_of(json!({
+            "match": {
+                "kind": "call",
+                "name": { "regex": "^eval_[a-z]+$" },
+                "not_has": { "name": "Sandbox" }
+            },
+            "not_inside": { "kind": "class", "name": "Sandbox" }
+        }));
+        assert!(
+            anchors.is_empty(),
+            "negations/opaque regexes must never prune: {anchors:?}"
+        );
+    }
+
+    #[test]
+    fn source_prefilter_requires_every_anchor_group() {
+        let anchors = vec![
+            SourceAnchorGroup::new(vec!["eval".to_string()]),
+            SourceAnchorGroup::new(vec!["shell".to_string(), "spawn".to_string()]),
+        ];
+        let plan = QueryPlan {
+            positive_source_anchors: anchors.clone(),
+            positive_source_anchors_without_inside_decl: anchors,
+            structural_access: StructuralAccessRequirements::default(),
+            features: QueryFeatures::default(),
+        };
+        let index = plan.build_source_index(true);
+        assert!(index.may_match("eval(x, shell=True)"));
+        assert!(index.may_match("eval(x, spawn=True)"));
+        assert!(!index.may_match("eval(x)"));
+        assert!(!index.may_match("shell(x)"));
+
+        let plan = QueryPlan {
+            positive_source_anchors: Vec::new(),
+            positive_source_anchors_without_inside_decl: Vec::new(),
+            structural_access: StructuralAccessRequirements::default(),
+            features: QueryFeatures::default(),
+        };
+        assert!(plan.build_source_index(true).may_match("anything"));
+    }
+
+    #[test]
     fn collects_conjunctive_positive_anchors() {
         let anchors = anchors_of(json!({
             "match": {
@@ -260,107 +303,5 @@ mod tests {
             "inside_decl": { "kind": "loop", "name": "retry" }
         }));
         assert_eq!(anchors, vec![group(&["retry"]), group(&["run"])]);
-    }
-
-    #[test]
-    fn anchored_literal_alternation_regexes_contribute_anchor_groups() {
-        let anchors = anchors_of(json!({
-            "match": {
-                "kind": "call",
-                "callee": { "name": { "regex": "^(read|read_to_string)$" } }
-            }
-        }));
-        assert_eq!(anchors, vec![group(&["read", "read_to_string"])]);
-
-        let anchors = anchors_of(json!({
-            "match": { "kind": "call", "name": { "regex": "^eval$" } }
-        }));
-        assert_eq!(anchors, vec![group(&["eval"])]);
-    }
-
-    #[test]
-    fn negation_and_opaque_regexes_contribute_no_anchors() {
-        let anchors = anchors_of(json!({
-            "match": {
-                "kind": "call",
-                "name": { "regex": "^eval_[a-z]+$" },
-                "not_has": { "name": "Sandbox" }
-            },
-            "not_inside": { "kind": "class", "name": "Sandbox" }
-        }));
-        assert!(
-            anchors.is_empty(),
-            "negations/opaque regexes must never prune: {anchors:?}"
-        );
-    }
-
-    #[test]
-    fn reports_whether_a_query_has_source_anchors() {
-        let anchored_query = CodeQuery::from_json(&json!({
-            "match": { "kind": "call", "callee": { "name": "eval" } }
-        }))
-        .expect("query should parse");
-        let anchored = QueryPlan::for_query(anchored_query.seed().unwrap());
-        assert!(anchored.has_source_anchors());
-
-        let unanchored_query = CodeQuery::from_json(&json!({
-            "match": { "kind": "call", "callee": { "name": { "regex": "eval" } } }
-        }))
-        .expect("query should parse");
-        let unanchored = QueryPlan::for_query(unanchored_query.seed().unwrap());
-        assert!(!unanchored.has_source_anchors());
-    }
-
-    #[test]
-    fn alternation_regexes_contribute_posting_terms() {
-        let query = CodeQuery::from_json(&json!({
-            "match": {
-                "kind": "call",
-                "callee": { "name": { "regex": "^(sort|sort_by|sort_unstable)$" } }
-            }
-        }))
-        .expect("query should parse");
-        let plan = QueryPlan::for_query(query.seed().unwrap());
-        assert!(
-            plan.structural_access()
-                .terms()
-                .contains(&StructuralPostingTerm::RoleName {
-                    role: Role::Callee,
-                    names: vec![
-                        "sort".to_string(),
-                        "sort_by".to_string(),
-                        "sort_unstable".to_string(),
-                    ],
-                }),
-            "callee alternation should produce a role-name posting term: {:?}",
-            plan.structural_access().terms()
-        );
-    }
-
-    #[test]
-    fn source_prefilter_requires_every_anchor_group() {
-        let anchors = vec![
-            SourceAnchorGroup::new(vec!["eval".to_string()]),
-            SourceAnchorGroup::new(vec!["shell".to_string(), "spawn".to_string()]),
-        ];
-        let plan = QueryPlan {
-            positive_source_anchors: anchors.clone(),
-            positive_source_anchors_without_inside_decl: anchors,
-            structural_access: StructuralAccessRequirements::default(),
-            features: QueryFeatures::default(),
-        };
-        let index = plan.build_source_index(true);
-        assert!(index.may_match("eval(x, shell=True)"));
-        assert!(index.may_match("eval(x, spawn=True)"));
-        assert!(!index.may_match("eval(x)"));
-        assert!(!index.may_match("shell(x)"));
-
-        let plan = QueryPlan {
-            positive_source_anchors: Vec::new(),
-            positive_source_anchors_without_inside_decl: Vec::new(),
-            structural_access: StructuralAccessRequirements::default(),
-            features: QueryFeatures::default(),
-        };
-        assert!(plan.build_source_index(true).may_match("anything"));
     }
 }

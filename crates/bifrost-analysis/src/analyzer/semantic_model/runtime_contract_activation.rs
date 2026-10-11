@@ -431,7 +431,7 @@ fn runtime_coordinate(selector: &CsmiArtifactSelector) -> Option<(&str, &str, Op
     None
 }
 
-fn stable_release(value: &str) -> Option<semver::Version> {
+pub(super) fn stable_release(value: &str) -> Option<semver::Version> {
     // Both registered schemes have the same ordering on this deliberately
     // bounded subset of canonical stable triples. PEP 440 epochs, shortened
     // releases and prereleases, and SemVer prereleases/builds are unsupported.

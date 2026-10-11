@@ -1,6 +1,8 @@
 use crate::structural::{CSHARP_KIND_TABLE, CSHARP_STRUCTURAL_SPEC};
-use brokk_bifrost_core::analyzer::common::IdentifierSigil;
-use brokk_bifrost_core::analyzer::fq_name::{FqName, SegmentId, SegmentKind, segment_interner};
+use brokk_bifrost_core::analyzer::common::{IdentifierSigil, node_source_text as cs_node_text};
+use brokk_bifrost_core::analyzer::fq_name::{
+    FqName, SegmentKind, joined_segments, segment_interner,
+};
 use brokk_bifrost_core::analyzer::model::StructuredTypeIdentityBuilder;
 use brokk_bifrost_core::analyzer::model::{
     CallableArity, CallableOverrideModifier, ClassLikeKind, CodeUnitType, DispatchExtensibility,
@@ -8,13 +10,16 @@ use brokk_bifrost_core::analyzer::model::{
 };
 use brokk_bifrost_core::analyzer::parsed_file::{
     CSharpSemanticDeclaration, CSharpSemanticDeclarationKind, ParsedFile, ParsedSourceFacts,
-    SourceDeclarationMetadataLink, SourceImportFact,
+    SourceImportFact,
 };
 use brokk_bifrost_core::analyzer::source_facts::{PrimarySourceFactCollector, SourceImportId};
+use brokk_bifrost_core::analyzer::structural::adapter_helpers::child_by_field_or_first_named_child;
 use brokk_bifrost_core::analyzer::structural::collector::StructuralFactCollector;
 use brokk_bifrost_core::analyzer::structural::resolution::DeclaredVisibility;
 use brokk_bifrost_core::analyzer::structural::spec::{CompiledKinds, StructuralSpec};
-use brokk_bifrost_core::analyzer::tree_walk::{ParentIndex, node_range};
+use brokk_bifrost_core::analyzer::tree_walk::{
+    ParentIndex, child_by_field_or_named_child_of_kinds, first_named_child_of_kind, node_range,
+};
 use brokk_bifrost_core::analyzer::{CodeUnit, ProjectFile};
 use brokk_bifrost_core::hash::{HashMap, HashSet};
 use tree_sitter::{Node, Tree};
@@ -22,8 +27,8 @@ use tree_sitter::{Node, Tree};
 use crate::imports::csharp_import_info_from_using_directive;
 use crate::syntax::{
     csharp_attribute_type_names, csharp_constant_pattern_type_candidate,
-    csharp_default_member_visibility, csharp_has_modifier, csharp_member_access_type_receiver,
-    csharp_type_node_identity, csharp_type_reference_root,
+    csharp_default_member_visibility, csharp_has_modifier, csharp_identifier_text as cs_ident_text,
+    csharp_member_access_type_receiver, csharp_type_node_identity, csharp_type_reference_root,
 };
 use crate::test_detection::csharp_method_has_runnable_test_attribute;
 
@@ -47,11 +52,6 @@ pub const CSHARP_IDENTIFIER_SIGIL: IdentifierSigil = IdentifierSigil {
     prefix: "@",
 };
 
-/// Intern one qualified-name segment in the process-global interner.
-fn cs_segment(text: &str, kind: SegmentKind) -> SegmentId {
-    segment_interner().intern(text, kind)
-}
-
 /// Build the structured namespace-path prefix for a C# declaration.
 ///
 /// `scope.package_name` (built by `csharp_join_namespace`) is already the
@@ -61,8 +61,8 @@ fn cs_segment(text: &str, kind: SegmentKind) -> SegmentId {
 /// (not `Path`-tagged) namespace/module prefixes.
 fn csharp_package_fq(package_name: &str) -> FqName {
     let mut fq = FqName::new();
-    for component in package_name.split('.').filter(|c| !c.is_empty()) {
-        fq.push(cs_segment(component, SegmentKind::Package));
+    for component in joined_segments(package_name, ".") {
+        fq.push(segment_interner().intern(component, SegmentKind::Package));
     }
     fq
 }
@@ -204,7 +204,9 @@ pub fn parse_csharp_file(file: &ProjectFile, source: &str, tree: &Tree) -> Parse
         python: None,
         source_bytes: source.len(),
         occurrences,
-        structural: structural.finish().expect("complete C# structural facts"),
+        structural: structural
+            .finish(root)
+            .expect("complete C# structural facts"),
         native_site_occurrences: Vec::new(),
         native_declaration_sources: Vec::new(),
         declaration_visibilities: None,
@@ -265,6 +267,7 @@ struct CSharpDeclarationProperties {
     semantic_type_spelling: Option<String>,
     is_static: bool,
     is_const: bool,
+    is_readonly: bool,
 }
 
 impl CSharpDeclarationProperties {
@@ -307,6 +310,7 @@ impl CSharpDeclarationProperties {
             semantic_type_spelling,
             is_static: csharp_has_modifier(source, node, "static"),
             is_const: csharp_has_modifier(source, node, "const"),
+            is_readonly: csharp_has_modifier(source, node, "readonly"),
         }
     }
 }
@@ -328,6 +332,7 @@ impl CSharpVisitor<'_, '_> {
             "method_declaration" if self.current_properties.is_static => {
                 CSharpSemanticDeclarationKind::StaticMethodReturn
             }
+            "method_declaration" => CSharpSemanticDeclarationKind::InstanceMethodReturn,
             "field_declaration"
             | "event_field_declaration"
             | "property_declaration"
@@ -395,9 +400,7 @@ impl CSharpVisitor<'_, '_> {
             if cs_node_text(name, self.source).is_empty() {
                 continue;
             }
-            let occurrence = self.source_facts.intern_node(declaration);
-            let name = self.source_facts.intern_node(name);
-            let declaration = self.source_facts.declare(occurrence, Some(name));
+            let declaration = self.source_facts.declare_node(declaration, Some(name));
             self.parsed
                 .csharp_semantic_declarations
                 .push(CSharpSemanticDeclaration {
@@ -418,24 +421,14 @@ impl CSharpVisitor<'_, '_> {
         unit: CodeUnit,
         metadata: SignatureMetadata,
     ) {
-        let occurrence = self.source_facts.intern_node(node);
-        let name = node
-            .child_by_field_name("name")
-            .map(|name| self.source_facts.intern_node(name));
-        let declaration = self.source_facts.declare(occurrence, name);
+        let declaration = self
+            .source_facts
+            .declare_node(node, node.child_by_field_name("name"));
         self.parsed
             .source_declaration_units
             .push((declaration, unit.clone()));
-        let metadata_ordinal = self
-            .parsed
-            .add_signature_with_metadata(unit.clone(), metadata);
         self.parsed
-            .source_declaration_metadata
-            .push(SourceDeclarationMetadataLink {
-                declaration,
-                unit,
-                metadata_ordinal,
-            });
+            .add_signature_with_source_declaration_metadata(declaration, unit, metadata);
     }
 
     fn push_children<'tree>(
@@ -727,7 +720,7 @@ impl CSharpVisitor<'_, '_> {
         let fq = parent
             .fq()
             .clone()
-            .with_pushed(cs_segment(name, SegmentKind::Member));
+            .with_pushed(segment_interner().intern(name, SegmentKind::Member));
         let code_unit = CodeUnit::with_signature_and_fq(
             self.file.clone(),
             CodeUnitType::Function,
@@ -804,7 +797,7 @@ impl CSharpVisitor<'_, '_> {
         let fq = parent
             .fq()
             .clone()
-            .with_pushed(cs_segment(declared_name, SegmentKind::Member));
+            .with_pushed(segment_interner().intern(declared_name, SegmentKind::Member));
         let code_unit = CodeUnit::with_signature_and_fq(
             self.file.clone(),
             CodeUnitType::Function,
@@ -872,7 +865,7 @@ impl CSharpVisitor<'_, '_> {
         let fq = parent
             .fq()
             .clone()
-            .with_pushed(cs_segment(name, SegmentKind::Member));
+            .with_pushed(segment_interner().intern(name, SegmentKind::Member));
         let code_unit = CodeUnit::with_signature_and_fq(
             self.file.clone(),
             CodeUnitType::Function,
@@ -928,7 +921,7 @@ impl CSharpVisitor<'_, '_> {
         let fq = parent
             .fq()
             .clone()
-            .with_pushed(cs_segment(name, SegmentKind::Member));
+            .with_pushed(segment_interner().intern(name, SegmentKind::Member));
         let code_unit = CodeUnit::new_fq(
             self.file.clone(),
             CodeUnitType::Field,
@@ -992,7 +985,7 @@ impl CSharpVisitor<'_, '_> {
             let fq = parent
                 .fq()
                 .clone()
-                .with_pushed(cs_segment(name, SegmentKind::Member));
+                .with_pushed(segment_interner().intern(name, SegmentKind::Member));
             let code_unit = CodeUnit::new_fq(
                 self.file.clone(),
                 CodeUnitType::Field,
@@ -1016,8 +1009,16 @@ impl CSharpVisitor<'_, '_> {
                     .with_return_type_identity(return_type_identity.clone())
                     .with_field_modifiers(
                         self.current_properties.is_static || self.current_properties.is_const,
-                        self.current_properties.is_const,
+                        self.current_properties.is_const || self.current_properties.is_readonly,
                     )
+                    .with_field_initializer(
+                        crate::syntax::variable_declarator_initializer(child).is_some(),
+                    )
+                    .with_source_declared_visibility(csharp_declared_visibility(
+                        node,
+                        self.source,
+                        csharp_default_member_visibility(node, &self.ancestry),
+                    ))
                     .with_dispatch_extensibility(DispatchExtensibility::Closed),
             );
         }
@@ -1038,7 +1039,7 @@ impl CSharpVisitor<'_, '_> {
         let fq = parent
             .fq()
             .clone()
-            .with_pushed(cs_segment(name, SegmentKind::Member));
+            .with_pushed(segment_interner().intern(name, SegmentKind::Member));
         let code_unit = CodeUnit::new_fq(
             self.file.clone(),
             CodeUnitType::Field,
@@ -1120,9 +1121,9 @@ fn csharp_type_code_unit(
             .unit
             .fq()
             .clone()
-            .with_pushed(cs_segment(&identity_name, SegmentKind::Nested)),
+            .with_pushed(segment_interner().intern(&identity_name, SegmentKind::Nested)),
         None => csharp_package_fq(&scope.package_name)
-            .with_pushed(cs_segment(&identity_name, SegmentKind::Type)),
+            .with_pushed(segment_interner().intern(&identity_name, SegmentKind::Type)),
     };
     Some((
         CodeUnit::new_fq(
@@ -1170,10 +1171,6 @@ fn collect_csharp_type_identifier(node: Node<'_>, source: &str, identifiers: &mu
     }
 }
 
-fn cs_node_text<'a>(node: Node<'_>, source: &'a str) -> &'a str {
-    brokk_bifrost_core::analyzer::common::node_source_text(node, source)
-}
-
 /// A declaration's own name, with the verbatim-identifier `@` escape normalized
 /// off (`class @Wrapper` -> `Wrapper`).
 ///
@@ -1184,15 +1181,6 @@ fn cs_node_text<'a>(node: Node<'_>, source: &'a str) -> &'a str {
 /// built from the raw spelling could never be matched by a reference (#2064).
 /// Use this for anything that becomes a short name, an fq segment, or a
 /// type-parameter identity; rendered signature text keeps the source spelling.
-fn cs_ident_text<'a>(node: Node<'_>, source: &'a str) -> &'a str {
-    brokk_bifrost_core::analyzer::common::node_ident_text(
-        node,
-        source,
-        true,
-        &CSHARP_IDENTIFIER_SIGIL,
-    )
-}
-
 fn normalize_cs_whitespace(value: &str) -> String {
     let mut result = String::new();
     let mut prev_space = false;
@@ -1216,8 +1204,7 @@ fn cs_namespace_body(node: Node<'_>) -> Option<Node<'_>> {
 }
 
 fn cs_type_body(node: Node<'_>) -> Option<Node<'_>> {
-    node.child_by_field_name("body")
-        .or_else(|| first_named_child_of_kind(node, "declaration_list"))
+    child_by_field_or_named_child_of_kinds(node, "body", &["declaration_list"])
 }
 
 fn csharp_type_signature(node: Node<'_>, source: &str) -> String {
@@ -1280,7 +1267,7 @@ fn csharp_dispatch_signature_metadata<'tree>(
         .with_return_type_identity(properties.return_type_identity.clone())
         .with_field_modifiers(
             properties.is_static || properties.is_const,
-            properties.is_const,
+            properties.is_const || properties.is_readonly,
         )
         .with_dispatch_extensibility(crate::syntax::csharp_callable_dispatch_extensibility(
             source,
@@ -1542,35 +1529,35 @@ fn csharp_structured_type_identity(
         match frame {
             CSharpStructuredTypeFrame::Visit(node) => match node.kind() {
                 "type" | "simple_base_type" | "primary_constructor_base_type" => {
-                    frames.push(CSharpStructuredTypeFrame::Visit(csharp_type_wrapper_child(
-                        node,
-                    )?));
+                    frames.push(CSharpStructuredTypeFrame::Visit(
+                        child_by_field_or_first_named_child(node, "type")?,
+                    ));
                 }
                 // Nullable reference types retain the same nominal declaration.
                 // Value-type nullable members are library-supplied and therefore
                 // do not publish a workspace member target through this path.
                 "nullable_type" => {
-                    frames.push(CSharpStructuredTypeFrame::Visit(csharp_type_wrapper_child(
-                        node,
-                    )?));
+                    frames.push(CSharpStructuredTypeFrame::Visit(
+                        child_by_field_or_first_named_child(node, "type")?,
+                    ));
                 }
                 "ref_type" => {
                     frames.push(CSharpStructuredTypeFrame::WrapReference);
-                    frames.push(CSharpStructuredTypeFrame::Visit(csharp_type_wrapper_child(
-                        node,
-                    )?));
+                    frames.push(CSharpStructuredTypeFrame::Visit(
+                        child_by_field_or_first_named_child(node, "type")?,
+                    ));
                 }
                 "pointer_type" => {
                     frames.push(CSharpStructuredTypeFrame::WrapPointer);
-                    frames.push(CSharpStructuredTypeFrame::Visit(csharp_type_wrapper_child(
-                        node,
-                    )?));
+                    frames.push(CSharpStructuredTypeFrame::Visit(
+                        child_by_field_or_first_named_child(node, "type")?,
+                    ));
                 }
                 "array_type" => {
                     frames.push(CSharpStructuredTypeFrame::WrapArray);
-                    frames.push(CSharpStructuredTypeFrame::Visit(csharp_type_wrapper_child(
-                        node,
-                    )?));
+                    frames.push(CSharpStructuredTypeFrame::Visit(
+                        child_by_field_or_first_named_child(node, "type")?,
+                    ));
                 }
                 "identifier"
                 | "predefined_type"
@@ -1681,13 +1668,6 @@ fn csharp_structured_named_type<'tree>(
     }
     let name = StructuredTypeName::new(path, lexical_scope.to_vec(), absolute)?;
     Some((name, arguments))
-}
-
-fn csharp_type_wrapper_child(node: Node<'_>) -> Option<Node<'_>> {
-    node.child_by_field_name("type").or_else(|| {
-        let mut cursor = node.walk();
-        node.named_children(&mut cursor).next()
-    })
 }
 
 fn csharp_identifier_text(node: Node<'_>, source: &str) -> Option<String> {
@@ -1973,75 +1953,66 @@ fn csharp_literal_initializer(node: Node<'_>, source: &str) -> Option<String> {
     None
 }
 
-fn first_named_child_of_kind<'a>(node: Node<'a>, kind: &str) -> Option<Node<'a>> {
-    let mut cursor = node.walk();
-    node.named_children(&mut cursor)
-        .find(|child| child.kind() == kind)
-}
-
-fn last_named_child(node: Node<'_>) -> Option<Node<'_>> {
-    let count = node.named_child_count();
-    if count == 0 {
-        None
-    } else {
-        node.named_child(count - 1)
-    }
-}
-
-#[cfg(test)]
-mod structured_supertype_tests {
-    use super::*;
-    use tree_sitter::Parser;
-
-    /// The structured hierarchy facts the coarse file graph follows from a
-    /// declaration to the files declaring its bases: a qualified generic base
-    /// keeps its arity suffix, and a fully qualified interface keeps its
-    /// namespace.
-    #[test]
-    fn qualified_generic_supertypes_are_recorded_with_their_arity() {
-        let source = r#"
-namespace Example.Feature;
-
-public class Outer<T> : Example.Base<Example.Model.Value>, System.IDisposable {
-    public void Dispose() {}
-}
-"#;
-        let file = ProjectFile::new(
-            std::env::current_dir().expect("test working directory must be available"),
-            "src/Feature.cs",
-        );
-        let mut parser = Parser::new();
-        parser
-            .set_language(&tree_sitter_c_sharp::LANGUAGE.into())
-            .expect("C# grammar");
-        let tree = parser.parse(source, None).expect("C# tree");
-
-        let parsed = parse_csharp_file(&file, source, &tree);
-        let outer = parsed
-            .declarations()
-            .iter()
-            .find(|unit| unit.short_name() == "Outer`1")
-            .expect("outer declaration");
-
-        assert_eq!(
-            parsed.raw_supertypes.get(outer),
-            Some(&vec![
-                "Example.Base`1".to_string(),
-                "System.IDisposable".to_string(),
-            ])
-        );
-    }
-}
+use brokk_bifrost_core::analyzer::tree_walk::last_named_child;
 
 #[cfg(test)]
 mod primary_source_tests {
     use super::*;
     use brokk_bifrost_core::analyzer::structural::kinds::NormalizedKind;
+    use brokk_bifrost_test_macros::hardwon;
 
     fn parse(source: &str) -> ParsedFile {
         let tree = crate::preprocessor::parse_csharp(source).expect("C# primary tree");
         let file = ProjectFile::new(std::env::temp_dir(), "Primary.cs");
         parse_csharp_file(&file, source, &tree)
+    }
+
+    #[test]
+    #[hardwon(
+        "62b03791910c: a comment between global and using was selected as the namespace target"
+    )]
+    fn primary_using_imports_ignore_comment_extras() {
+        use brokk_bifrost_core::analyzer::model::StructuredImportPathKind;
+
+        for (source, kind, alias, is_global) in [
+            (
+                "global /* before using */ using /* before target */ Shared.Tools;",
+                StructuredImportPathKind::Namespace,
+                None,
+                true,
+            ),
+            (
+                "global /* before using */ using static /* before target */ Shared.Tools;",
+                StructuredImportPathKind::StaticMember,
+                None,
+                true,
+            ),
+            (
+                "global using /* before alias */ Alias /* before equals */ = /* before target */ Shared.Tools;",
+                StructuredImportPathKind::ImportFrom,
+                Some("Alias"),
+                true,
+            ),
+            (
+                "using /* before target */ Shared.Tools;",
+                StructuredImportPathKind::Namespace,
+                None,
+                false,
+            ),
+        ] {
+            let parsed = parse(source);
+            assert_eq!(parsed.imports.len(), 1, "{source}");
+            let import = &parsed.imports[0];
+            assert_eq!(import.raw_snippet, source);
+            assert_eq!(import.is_global, is_global, "{source}");
+            assert_eq!(import.alias.as_deref(), alias, "{source}");
+            let path = import.path.as_ref().expect("structured import path");
+            assert_eq!(path.kind, Some(kind), "{source}");
+            assert_eq!(path.segments, ["Shared", "Tools"], "{source}");
+            let facts = parsed.source_facts.as_ref().expect("canonical C# facts");
+            assert_eq!(facts.imports.len(), 1, "{source}");
+            assert_eq!(facts.imports[0].import_info(&facts.occurrences), *import);
+        }
     }
 
     #[test]
@@ -2138,52 +2109,6 @@ mod primary_source_tests {
         let range = facts.occurrences.occurrence(alias).range;
         assert_eq!(&source[range.start_byte..range.end_byte], "Alias");
     }
-
-    #[test]
-    fn primary_using_imports_ignore_comment_extras() {
-        use brokk_bifrost_core::analyzer::model::StructuredImportPathKind;
-
-        for (source, kind, alias, is_global) in [
-            (
-                "global /* before using */ using /* before target */ Shared.Tools;",
-                StructuredImportPathKind::Namespace,
-                None,
-                true,
-            ),
-            (
-                "global /* before using */ using static /* before target */ Shared.Tools;",
-                StructuredImportPathKind::StaticMember,
-                None,
-                true,
-            ),
-            (
-                "global using /* before alias */ Alias /* before equals */ = /* before target */ Shared.Tools;",
-                StructuredImportPathKind::ImportFrom,
-                Some("Alias"),
-                true,
-            ),
-            (
-                "using /* before target */ Shared.Tools;",
-                StructuredImportPathKind::Namespace,
-                None,
-                false,
-            ),
-        ] {
-            let parsed = parse(source);
-            assert_eq!(parsed.imports.len(), 1, "{source}");
-            let import = &parsed.imports[0];
-            assert_eq!(import.raw_snippet, source);
-            assert_eq!(import.is_global, is_global, "{source}");
-            assert_eq!(import.alias.as_deref(), alias, "{source}");
-            let path = import.path.as_ref().expect("structured import path");
-            assert_eq!(path.kind, Some(kind), "{source}");
-            assert_eq!(path.segments, ["Shared", "Tools"], "{source}");
-            let facts = parsed.source_facts.as_ref().expect("canonical C# facts");
-            assert_eq!(facts.imports.len(), 1, "{source}");
-            assert_eq!(facts.imports[0].import_info(&facts.occurrences), *import);
-        }
-    }
-
     #[test]
     fn field_literals_and_modifiers_come_from_declarator_nodes() {
         let parsed = parse(
@@ -2207,10 +2132,9 @@ mod primary_source_tests {
             assert_eq!(parsed.signatures[unit], [expected]);
         }
     }
-
     #[test]
     fn semantic_source_only_events_share_primary_properties_without_display_units() {
-        let source = "namespace N { class C { static int[] Make() { return null; } const int Value = 1; event System.Action Changed; } }";
+        let source = "namespace N { class C { static int[] Make() { return null; } string Read() => \"value\"; const int Value = 1; event System.Action Changed; } }";
         let parsed = parse(source);
         let facts = parsed.source_facts.as_ref().unwrap();
         let projections = parsed
@@ -2231,6 +2155,10 @@ mod primary_source_tests {
             projections["Make"].kind,
             CSharpSemanticDeclarationKind::StaticMethodReturn
         );
+        assert_eq!(
+            projections["Read"].kind,
+            CSharpSemanticDeclarationKind::InstanceMethodReturn
+        );
         assert_eq!(projections["Value"].type_spelling.as_deref(), Some("int"));
         assert!(projections["Value"].is_static);
         assert_eq!(
@@ -2245,98 +2173,18 @@ mod primary_source_tests {
                 .any(|unit| unit.identifier() == "Changed")
         );
     }
-
-    #[test]
-    fn primary_facts_preserve_preprocessor_admission_and_empty_files() {
-        let source = "#if false\nclass Hidden { void Missing() { Lost(); } }\n#endif\nclass Visible { void Run() { Found(); } }";
-        let parsed = parse(source);
-        let facts = parsed
-            .source_facts
-            .as_ref()
-            .expect("canonical preprocessed facts");
-        assert!(
-            !parsed
-                .declarations()
-                .iter()
-                .any(|unit| unit.identifier() == "Hidden")
-        );
-        assert_eq!(
-            facts
-                .structural
-                .nodes()
-                .iter()
-                .filter(|node| node.kind == NormalizedKind::Call)
-                .count(),
-            1
-        );
-        let empty = parse("");
-        let empty_facts = empty.source_facts.expect("empty C# is a ready publication");
-        assert!(empty_facts.occurrences.declarations().is_empty());
-        assert!(empty_facts.structural.nodes().is_empty());
-        assert!(empty_facts.imports.is_empty());
-    }
-}
-
-#[cfg(test)]
-mod type_parameter_metadata_tests {
-    use super::*;
-    use tree_sitter::Parser;
-
-    /// A C# type declaration records its own type-parameter list, so a
-    /// nongeneric type is a proven zero rather than the unread list an empty
-    /// `type_parameters` used to mean (#1651).
-    #[test]
-    fn csharp_type_declarations_record_their_type_parameters() {
-        let source = r#"
-namespace Example;
-
-public class Foo {}
-public class Foo<T> {}
-public interface IFoo<K, V> {}
-public struct Point {}
-public enum Colour { Red }
-"#;
-        let file = ProjectFile::new(
-            std::env::current_dir().expect("test working directory must be available"),
-            "src/Feature.cs",
-        );
-        let mut parser = Parser::new();
-        parser
-            .set_language(&tree_sitter_c_sharp::LANGUAGE.into())
-            .expect("C# grammar");
-        let tree = parser.parse(source, None).expect("C# tree");
-        let parsed = parse_csharp_file(&file, source, &tree);
-
-        let mut recorded = parsed
-            .signature_metadata
-            .iter()
-            .flat_map(|(unit, metadata)| {
-                metadata
-                    .iter()
-                    .filter(|entry| entry.type_parameters_recorded())
-                    .map(|entry| (unit.short_name().to_string(), entry.type_parameters().len()))
-            })
-            .collect::<Vec<_>>();
-        recorded.sort();
-        assert_eq!(
-            recorded,
-            vec![
-                ("Colour".to_string(), 0),
-                ("Foo".to_string(), 0),
-                ("Foo`1".to_string(), 1),
-                ("IFoo`2".to_string(), 2),
-                ("Point".to_string(), 0),
-            ]
-        );
-    }
 }
 
 #[cfg(test)]
 mod grammar_regression_tests {
     use super::*;
+    use brokk_bifrost_test_macros::hardwon;
     use tree_sitter::Parser;
 
     #[test]
+    #[hardwon(
+        "#3197: The published C# grammar regression dropped local functions from the parse tree"
+    )]
     fn static_local_function_preserves_declaration_and_following_call() {
         let source = "class Example { void Run() { static void Local(int value) {} Local(1); } }";
         let mut parser = Parser::new();
@@ -2368,6 +2216,9 @@ mod grammar_regression_tests {
     /// C# permits `async` as an identifier outside modifier positions. A parser
     /// recovery at the invocation used to swallow the following member (#3073).
     #[test]
+    #[hardwon(
+        "#3073: The async identifier was misparsed as an expression and caused later declarations to disappear"
+    )]
     fn contextual_async_argument_preserves_following_members() {
         let source = r#"readonly struct ArrayConverterCore {
     int F(params object[] xs) => 0;
@@ -2453,8 +2304,10 @@ mod grammar_regression_tests {
 #[cfg(test)]
 mod recovered_dispatch_tests {
     use super::*;
+    use brokk_bifrost_test_macros::hardwon;
 
     #[test]
+    #[hardwon("a75f29823115: recovered virtual members lost open dispatch metadata")]
     fn recovered_virtual_member_retains_open_dispatch() {
         let source = "class Box { void Broken() { var required = Make(); required = required.Clone(); } public virtual void Recovered() {} }";
         let tree = crate::preprocessor::parse_csharp(source).unwrap();

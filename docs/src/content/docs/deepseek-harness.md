@@ -59,7 +59,9 @@ Recognized keys: `root`, `toolsets` (a Bifrost toolset expression), `serverName`
 (default `bifrost`; changes the `mcp__<serverName>__` tool prefix),
 `toolCallTimeoutMs` (default 240000, sized for first-call binary download and
 analyzer warm-up), `env` (extra environment variables for the server
-subprocess), and `failOnStartupError`.
+subprocess), and `failOnStartupError` (default `false`; passed unchanged to
+dsh's MCP client, which uses it to decide whether a server startup failure
+fails the plugin).
 
 dsh scrubs secrets-like variables (`*KEY*`, `*PASSWORD*`, `*SECRET*`,
 `*TOKEN*`) and all `DSH_*` variables from server subprocess environments. Any

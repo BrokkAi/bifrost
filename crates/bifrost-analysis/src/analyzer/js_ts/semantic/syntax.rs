@@ -1,4 +1,7 @@
 use super::*;
+use crate::analyzer::semantic::lowering::field_matches;
+pub(super) use brokk_bifrost_core::analyzer::structural::adapter_helpers::first_named_child;
+use brokk_bifrost_core::analyzer::tree_walk::parent_if_field;
 
 pub(super) fn declaration_container_kind(node: Node<'_>) -> Option<DeclarationSegmentKind> {
     match node.kind() {
@@ -14,9 +17,7 @@ pub(super) fn declaration_container_kind(node: Node<'_>) -> Option<DeclarationSe
 }
 
 pub(super) fn declaration_container_name(source: &str, node: Node<'_>) -> Option<Box<str>> {
-    node.child_by_field_name("name")
-        .and_then(|name| nonempty_node_text(source, name))
-        .map(Box::<str>::from)
+    crate::analyzer::common::declaration_container_name(source, node)
         .or_else(|| enclosing_binding(source, node).map(|binding| binding.name))
 }
 
@@ -26,7 +27,7 @@ struct EnclosingBinding {
 
 pub(super) fn callable_name(source: &str, node: Node<'_>) -> Option<Box<str>> {
     if node.kind() == "program" {
-        return Some("<file>".into());
+        return Some(crate::analyzer::semantic::FILE_INITIALIZER_SEGMENT_NAME.into());
     }
 
     if matches!(node.kind(), "field_definition" | "public_field_definition") {
@@ -113,12 +114,6 @@ fn assignment_binding(source: &str, left: Node<'_>) -> Option<EnclosingBinding> 
         return simple_binding_name(source, property).map(|name| EnclosingBinding { name });
     }
     None
-}
-
-fn field_matches(parent: Node<'_>, field: &str, child: Node<'_>) -> bool {
-    parent
-        .child_by_field_name(field)
-        .is_some_and(|candidate| candidate.id() == child.id())
 }
 
 fn has_children_in_field(parent: Node<'_>, field: &str) -> bool {
@@ -546,26 +541,11 @@ pub(super) fn abrupt_dependencies(node: Node<'_>) -> Vec<Node<'_>> {
     }
 }
 
-pub(super) fn first_named_child(node: Node<'_>) -> Option<Node<'_>> {
-    let mut cursor = node.walk();
-    node.named_children(&mut cursor).next()
-}
-
 pub(super) fn required_field<'tree>(
     node: Node<'tree>,
     field: &str,
 ) -> Result<Node<'tree>, TsLoweringError> {
-    node.child_by_field_name(field)
-        .ok_or_else(|| missing_field(node, field))
-}
-
-pub(super) fn missing_field(node: Node<'_>, field: &str) -> TsLoweringError {
-    TsLoweringError::Invalid(format!(
-        "{} node at bytes {}..{} is missing structured field {field}",
-        node.kind(),
-        node.start_byte(),
-        node.end_byte()
-    ))
+    crate::analyzer::semantic::lowering::required_field_or_else(node, field, missing_field)
 }
 
 pub(super) fn js_ts_local_scope(node: Node<'_>) -> Option<(usize, usize)> {
@@ -610,21 +590,12 @@ pub(super) fn body_contains_free_this(
     body: Node<'_>,
     cancellation: &CancellationToken,
 ) -> Result<bool, LoweringCancelled> {
-    let mut found = false;
-    try_walk_named_tree_preorder(body, true, |node| {
-        if cancellation.is_cancelled() {
-            return Err(LoweringCancelled);
-        }
-        if is_js_ts_nested_execution_boundary(node, body) {
-            return Ok(WalkControl::SkipChildren);
-        }
-        if node.kind() == "this" {
-            found = true;
-            return Ok(WalkControl::Break);
-        }
-        Ok(WalkControl::Continue)
-    })?;
-    Ok(found)
+    crate::analyzer::semantic::lowering::body_contains_matching_node(
+        body,
+        cancellation,
+        |node| is_js_ts_nested_execution_boundary(node, body),
+        |node| node.kind() == "this",
+    )
 }
 
 /// The value kind one expression node mints. A value is minted once per node,
@@ -689,21 +660,19 @@ pub(super) fn integer_offset_operand<'tree>(
     }
     let left = node.child_by_field_name("left")?;
     let right = node.child_by_field_name("right")?;
-    let subtract = match node.child_by_field_name("operator")?.kind() {
-        "+" => false,
-        "-" => true,
-        _ => return None,
-    };
-    let (operand, literal) = match (left.kind() == "identifier", right.kind() == "identifier") {
-        (true, false) => (left, right),
-        (false, true) if !subtract => (right, left),
-        _ => return None,
-    };
-    let constant = integer_literal_value(source, literal)?;
-    Some((
-        operand,
-        integer_offset(if subtract { -constant } else { constant }),
-    ))
+    let operator = node.child_by_field_name("operator")?.kind();
+    crate::analyzer::semantic::type_flow::integer_offset_from_binary_operands(
+        operator,
+        left,
+        right,
+        |literal| {
+            let constant = integer_literal_value(source, literal)?;
+            Some(SignedIntegerMagnitude::new(
+                constant < 0,
+                constant.unsigned_abs(),
+            ))
+        },
+    )
 }
 
 /// The exact safe integer a numeric literal (optionally directly negated)
@@ -716,10 +685,6 @@ pub(super) fn integer_literal_value(source: &str, node: Node<'_>) -> Option<i128
         SemanticValueKind::SignedInteger(value) => Some(value),
         _ => None,
     }
-}
-
-pub(super) fn integer_offset(offset: i128) -> SignedIntegerMagnitude {
-    SignedIntegerMagnitude::new(offset < 0, offset.unsigned_abs())
 }
 
 /// Whether `node` is a literal of a primitive value. Converting a primitive
@@ -777,15 +742,7 @@ pub(super) fn numeric_literal_value(source: &str, node: Node<'_>) -> Option<f64>
 }
 
 pub(super) fn is_callable_kind(kind: &str) -> bool {
-    matches!(
-        kind,
-        "function_declaration"
-            | "function_expression"
-            | "generator_function_declaration"
-            | "generator_function"
-            | "arrow_function"
-            | "method_definition"
-    )
+    brokk_bifrost_js_ts::syntax::is_function_like(kind)
 }
 
 pub(super) fn is_js_ts_nested_execution_boundary(node: Node<'_>, traversal_root: Node<'_>) -> bool {
@@ -836,10 +793,7 @@ pub(super) fn is_runtime_leaf(kind: &str) -> bool {
     )
 }
 
-pub(super) fn has_child_kind(node: Node<'_>, kind: &str) -> bool {
-    let mut cursor = node.walk();
-    node.children(&mut cursor).any(|child| child.kind() == kind)
-}
+pub(super) use brokk_bifrost_core::analyzer::tree_walk::has_child_of_kind as has_child_kind;
 
 pub(super) fn simple_for_of_binding(statement: Node<'_>) -> Option<Node<'_>> {
     if statement.kind() != "for_in_statement"
@@ -917,11 +871,8 @@ pub(super) fn continuous_optional_chain(mut node: Node<'_>) -> bool {
 /// preloading it as a local. Transparent wrappers have their own expression
 /// value and are therefore deliberately not climbed here.
 pub(super) fn is_call_callee(node: Node<'_>) -> bool {
-    node.parent().is_some_and(|parent| {
-        (parent.kind() == "call_expression" && parent.child_by_field_name("function") == Some(node))
-            || (parent.kind() == "new_expression"
-                && parent.child_by_field_name("constructor") == Some(node))
-    })
+    parent_if_field(node, "call_expression", "function").is_some()
+        || parent_if_field(node, "new_expression", "constructor").is_some()
 }
 
 pub(super) fn logical_assignment_operator(node: Node<'_>) -> Option<&'static str> {
@@ -992,17 +943,6 @@ pub(super) fn operation_can_throw_implicitly(node: Node<'_>) -> bool {
     }
 }
 
-pub(super) const fn completion_label(kind: CompletionKind) -> &'static str {
-    match kind {
-        CompletionKind::Normal => "normal",
-        CompletionKind::Return => "return",
-        CompletionKind::Throw => "throw",
-        CompletionKind::Break => "break",
-        CompletionKind::Continue => "continue",
-        CompletionKind::Yield => "yield",
-    }
-}
-
 /// Procedure syntax roles for the shared JavaScript/TypeScript lowering.
 /// Procedures are exactly the nodes [`callable_shape`] lowers, so the
 /// assessment and the producer agree on ownership.
@@ -1010,6 +950,7 @@ pub(crate) const PROCEDURE_SYNTAX_ROLES: crate::analyzer::languages::ProcedureSy
     crate::analyzer::languages::ProcedureSyntaxRoles {
         statement_kind: js_ts_statement_kind,
         loop_site: js_ts_loop_site,
+        loop_site_with_source: None,
         procedure_matches: |_, node| callable_shape(node).is_some(),
         nested_procedure: |node| node.kind() == "class_body" || callable_shape(node).is_some(),
     };

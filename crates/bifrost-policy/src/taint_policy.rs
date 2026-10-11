@@ -11,12 +11,14 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fmt;
 use std::hash::Hasher;
 use std::ops::Range as ByteRange;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use crate::budget::PolicyBudget;
+use brokk_bifrost_analysis::analyzer::semantic::partial_flow::rules::guard_edge_kills;
+
+use crate::budget::{PolicyBudget, PolicyBudgetField};
 use crate::definition::{
-    PolicyId, PolicyPort, PolicySelectorPath, TaintLabel, TaintTransferEffect,
+    PolicyId, PolicyPort, PolicySelectorPath, TaintLabel, TaintThreatModel, TaintTransferEffect,
 };
 use crate::evaluator::{PolicyEvaluationContext, TaintPolicyEvaluator};
 use crate::finding::{
@@ -27,7 +29,7 @@ use crate::finding::{
     ProofMetadata, ProofReason, ProofState, RelatedPolicyLocation, ReportValueError,
     StoreDimensionEvidence, WitnessStep, WitnessStepKind, WitnessStepProvenance,
 };
-use crate::finding::{PolicyWorkMetric, PolicyWorkReport, PolicyWorkUnit};
+use crate::finding::{PolicyRunScope, PolicyWorkMetric, PolicyWorkReport, PolicyWorkUnit};
 use crate::finding_identity::{
     AnalysisEventRef, AnalysisFindingId, EvidenceRef, SourceScenarioId, StableSemanticIdentity,
     WitnessId,
@@ -36,36 +38,41 @@ use crate::future_evidence::{
     TaintFindingAnchor, TaintPolicyProjectionFacts, TaintSourceProjectionFact,
 };
 use crate::projection::{
-    ProjectedFindingReport, TaintOriginProjection, TaintPairProjection, TaintProjectedFinding,
-    TaintProjectionAuthority, TaintProjectionPayload,
+    ProjectedFindingReport, TaintEnvelopeIdentity, TaintOriginProjection, TaintPairProjection,
+    TaintProjectedFinding, TaintProjectionAuthority, TaintProjectionPayload,
+    taint_envelope_identity,
 };
 use crate::resolved::{
     LoadedPolicy, ResolvedEndpointIdentity, ResolvedPolicySelector, ResolvedTaintAuxiliary,
     ResolvedTaintEndpoint, ResolvedTaintExternalModelDefinition, ResolvedTaintPolicySpec,
-    ResolvedTaintSourceDefinition,
+    ResolvedTaintSanitizerDefinition, ResolvedTaintSourceDefinition,
+    ResolvedTaintTransformDefinition,
 };
 use crate::selector_compiler::{
     ReceiverBindingApplicability, parameter_name_matches, parameter_names_match,
 };
+use crate::taint_compose_provider::{CompositionMemo, PolicyCompositionProvider};
 use crate::{ProductionTaintAnalysisResult, ProductionTaintPhaseMetrics};
 use brokk_bifrost_analysis::CancellationToken;
-use brokk_bifrost_analysis::analyzer::invalidation::DerivedArtifactId;
 use brokk_bifrost_analysis::analyzer::read_ledger::ReadKey;
 use brokk_bifrost_analysis::analyzer::semantic::workspace_oracle::{
-    ProcedureRangeLookupStatus, procedures_in_artifact,
+    PreparedWorkspaceDispatchSession, ProcedureRangeLookupStatus, RustStdBuiltinCall,
+    RustStdBuiltinTransfer, procedures_in_artifact, rust_std_builtin_call,
 };
 use brokk_bifrost_analysis::analyzer::semantic::{
     CallArgumentMapping, CallArgumentMember, CallBinding, CallBindings, CallSiteHandle,
-    CandidateCoverage, DispatchBoundaryKind, DispatchCandidate, DispatchHints,
-    DispatchReadAttribution, DispatchResult, DurablePortIdentity, EvidenceCompleteness,
+    CallableReferenceKind, CandidateCoverage, DispatchBoundary, DispatchBoundaryKind,
+    DispatchCandidate, DispatchHints, DispatchResult, DurablePortIdentity, EvidenceCompleteness,
     ExactExternalProcedureTarget, IcfgEdgeKind, LengthDelimitedDigest, ObservationPhase,
-    OracleCallContext, OracleRelationHandle, ProcedureHandle, ProcedurePortHandle,
-    ProcedurePortKind, ProgramPointHandle, ProofStatus, ReturnedCallableProvenance,
-    RuntimeReadSourceOrigin, SemanticArtifactKey, SemanticBudget, SemanticExecutionBudget,
-    SemanticLocator, SemanticOutcome, SemanticRequest, SemanticValueKind, SemanticWork,
-    SourceMappingKind, UnmaterializedExternalTarget, ValueFlowSnapshot, ValueHandle,
+    OracleCallContext, OracleRelationHandle, OracleRelationOwner, PreparedWorkspaceDispatchPool,
+    ProcedureHandle, ProcedurePortHandle, ProcedurePortKind, ProgramPointHandle, ProofStatus,
+    ResolverOwnedExternalCalleeIdentity, ReturnedCallableProvenance, RuntimeReadSourceOrigin,
+    SemanticArtifactKey, SemanticBudget, SemanticCapability, SemanticEffect,
+    SemanticExecutionBudget, SemanticGapSubject, SemanticLanguage, SemanticLocator,
+    SemanticOutcome, SemanticRequest, SemanticValueKind, SemanticWork, SourceMappingKind,
+    UnmaterializedExternalTarget, ValueAtPoint, ValueFlowSnapshot, ValueHandle,
     WorkspaceIcfgProvider, WorkspaceRelativePath, WorkspaceSemanticOracle,
-    authored_procedure_target_identity, dispatch_read_attribution,
+    authored_procedure_target_identity, record_dispatch_read,
 };
 use brokk_bifrost_analysis::analyzer::semantic::{DispatchOracle, ValueFlowOracle};
 use brokk_bifrost_analysis::analyzer::semantic_model::{
@@ -74,10 +81,12 @@ use brokk_bifrost_analysis::analyzer::semantic_model::{
     ResolvedActiveSemanticModels, SemanticModelMatchDisposition,
     UnmaterializedExternalSummaryCallShapeBinding,
 };
+use brokk_bifrost_analysis::analyzer::usages::call_shape::call_shapes_in_file;
 use brokk_bifrost_analysis::analyzer::usages::get_definition::{
     DefinitionLookupRequest, DefinitionLookupStatus, resolve_definition_batch_with_source,
 };
-use brokk_bifrost_analysis::analyzer::{ProjectFile, WorkspaceAnalyzer};
+use brokk_bifrost_analysis::analyzer::{Language, ProjectFile, WorkspaceAnalyzer};
+use brokk_bifrost_analysis::path_utils::rel_path_string;
 use brokk_bifrost_flow::dataflow::{
     CuratedCallModel, DataflowRequest, ExternalSemanticSummarySet, ExternalSummaryCompatibilityKey,
     ExternalSummaryContentHash, ExternalSummaryModelId, ExternalSummaryTarget, SemanticInputStatus,
@@ -86,28 +95,41 @@ use brokk_bifrost_flow::dataflow::{
     SummaryExitKind, SummaryPort, SummarySchemaVersion, SummarySemanticsVersion, SummaryTransfer,
     SummaryWitness, SummaryWitnessStepKind, WitnessReconstructionLimits, WitnessRetentionLimits,
 };
+use brokk_bifrost_flow::taint::compose::{
+    self, BoundSource, BudgetLane, CompositionBudget, Incompleteness, ProcedureEndpoints,
+    compose_taint_batch,
+};
 use brokk_bifrost_flow::taint::{
     SourceClassId, SourceEventKey, TaintAnalysisPlan, TaintBatch, TaintBatchCompatibilityKey,
     TaintBatchPlanner, TaintClassSet, TaintEdgeFunction, TaintFindingCollectionLimits,
-    TaintFindingReport, TaintLocalTransformBinding, TaintOriginFindingEvidence, TaintPolicyPlan,
-    TaintPropagationSemanticsId, TaintSanitizerBinding, TaintSinkBinding, TaintSourceBinding,
-    TaintStoreChannel, TaintStoreDimension, TaintStoreReadBinding, TaintStoreWriteBinding,
-    TaintUniverse, collect_taint_findings_with_limits,
+    TaintFindingReport, TaintLocalTransformBinding, TaintOriginFindingEvidence, TaintPlanError,
+    TaintPolicyPlan, TaintPropagationSemanticsId, TaintSanitizerBinding, TaintSinkBinding,
+    TaintSourceBinding, TaintStoreChannel, TaintStoreDimension, TaintStoreReadBinding,
+    TaintStoreWriteBinding, TaintUniverse, collect_taint_findings_with_limits,
 };
 use brokk_bifrost_flow::value_flow::{
-    ClosureLimits, ValueFlowCarrier, ValueFlowCarrierId, ValueFlowCuratedCallModel,
-    ValueFlowEventKey, ValueFlowEventKind, ValueFlowIncompleteCause, ValueFlowInput,
-    ValueFlowLocalRuleSpec, ValueFlowObservationPhase, ValueFlowPlan, ValueFlowProvider,
-    ValueFlowReturnedCallable, ValueFlowSinkId, ValueFlowSinkSpec, ValueFlowSourceId,
-    ValueFlowSourceSpec, ValueFlowSummaryLocationBinding, discover_closure_with,
+    CallSiteCoverage, ClosureLimits, DispatchStatus, ValueFlowCarrier, ValueFlowCuratedCallModel,
+    ValueFlowEdgeKillSpec, ValueFlowEventKey, ValueFlowEventKind, ValueFlowIncompleteCause,
+    ValueFlowInput, ValueFlowLocalRuleSpec, ValueFlowObservationPhase, ValueFlowPlan,
+    ValueFlowPlanLimits, ValueFlowProvider, ValueFlowReturnedCallable, ValueFlowSinkId,
+    ValueFlowSinkSpec, ValueFlowSourceId, ValueFlowSourceSpec, ValueFlowSummaryLocationBinding,
+    discover_closure_with,
 };
 use brokk_bifrost_flow::{
     ExactProcedureSummaryBoundary, ExactProcedureSummaryParameter, ExactProcedureSummaryReceiver,
     ExactProcedureSummaryTargetBinding, bind_compiled_procedure_summaries,
 };
+use brokk_bifrost_rql::structural::CodeQueryTaintFindingKey;
 use brokk_bifrost_rql::structural::search::CodeQueryExecutionScope;
 use brokk_bifrost_rql::structural::{
     CodeQueryCompletion, CodeQueryDiagnosticCode, CodeQueryExecutionLimits,
+};
+
+mod candidate;
+
+pub(crate) use candidate::{
+    CandidateBinding, CandidateBoundary, CandidatePass, CandidateSite, CandidateSolve,
+    project_candidate_witness, solve_flow_candidate,
 };
 
 #[derive(Debug, Clone)]
@@ -216,13 +238,83 @@ struct CompiledStoreEnd {
     channel: TaintStoreChannel,
 }
 
+/// The engine that answers one compiled taint policy (spec M3.0). The rule
+/// `select_taint_engine` applies runs once per compile, before any solve. It
+/// is not a fallback: a composition that cannot complete reports incomplete
+/// and never restarts on the ICFG engine.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum TaintEngine {
+    Composition,
+    Icfg { reason: Box<str> },
+}
+
+impl TaintEngine {
+    /// The engine name the timing note prints.
+    fn name(&self) -> &'static str {
+        match self {
+            Self::Composition => "composition",
+            Self::Icfg { .. } => "icfg",
+        }
+    }
+
+    /// Why the ICFG engine answers, or `None` for the composition.
+    fn reason(&self) -> Option<&str> {
+        match self {
+            Self::Composition => None,
+            Self::Icfg { reason } => Some(reason.as_ref()),
+        }
+    }
+
+    /// The run output form: `composition`, or `icfg (<reason>)`.
+    pub(crate) fn render(&self) -> String {
+        match self.reason() {
+            None => self.name().to_owned(),
+            Some(reason) => format!("{} ({reason})", self.name()),
+        }
+    }
+}
+
 pub(crate) struct CompiledTaintPolicyPlan {
     pub(crate) internal_policy_id: String,
     pub(crate) plan: TaintPolicyPlan,
+    pub(crate) engine: TaintEngine,
+    /// How this policy's endpoints were scoped against a changed range (spec
+    /// M4.0). `None` when the compile had no range.
+    pub(crate) scope: Option<PolicyRunScope>,
     pub(crate) sources: Box<[CompiledTaintEndpoint]>,
     pub(crate) sinks: Box<[CompiledTaintEndpoint]>,
     store_writes: Box<[CompiledStoreEnd]>,
     store_reads: Box<[CompiledStoreEnd]>,
+    call_resolution_evidence: Option<TaintCallResolutionEvidence>,
+    /// The kills bound in this region. Ordinary evaluation drops them unread;
+    /// a flow candidate (#3686) names the ones a counterfactual path passes.
+    kills: Box<[CompiledTaintKill]>,
+    /// The policy's bound external models, which a composed plan's provider
+    /// reads at each call it crosses. Empty for an ICFG plan, whose value-flow
+    /// plan installs them.
+    external_models: Arc<[BoundExternalModel]>,
+}
+
+#[derive(Debug, Clone)]
+struct TaintCallResolutionEvidence {
+    call: DurableCallSiteKey,
+    path: String,
+    location: PolicySourceLocation,
+    callee: Option<String>,
+    range: ByteRange<usize>,
+    status: SemanticInputStatus,
+    boundary_status: String,
+    resolver_complete: bool,
+    reason: Option<String>,
+}
+
+/// One bound kill (a flow policy's `kill`, a taint policy's `sanitizer`): the
+/// entry that declared it and the program point whose input carrier it clears.
+#[derive(Debug, Clone)]
+struct CompiledTaintKill {
+    endpoint: ResolvedEndpointIdentity,
+    point: ProgramPointHandle,
 }
 
 enum TaintPolicyCompilation {
@@ -235,6 +327,7 @@ enum TaintPolicyCompilation {
         refusals: Vec<String>,
         incomplete_selectors: Vec<String>,
         authored_selector_summary: bool,
+        skipped_region_roots: usize,
     },
     /// A compile whose endpoint selection was empty, so there is nothing to
     /// solve. `empty_endpoints` names the sets that matched nothing; an
@@ -244,15 +337,34 @@ enum TaintPolicyCompilation {
         refusals: Vec<String>,
         incomplete_selectors: Vec<String>,
         empty_endpoints: EmptyEndpointSets,
+        /// Set only for a changed-range answer with no sink in the range
+        /// (spec M4.1); an empty selection leaves both absent.
+        engine: Option<TaintEngine>,
+        scope: Option<PolicyRunScope>,
     },
 }
 
+/// What compiling one policy's endpoints produced. A changed-range compile
+/// whose sinks all lie outside the range has no region to analyze: its answer
+/// is the empty result, and it still records the engine that gave it.
+enum CompiledPolicy {
+    Plans(Vec<CompiledTaintPolicyPlan>),
+    NoSinkInRange {
+        engine: TaintEngine,
+        scope: PolicyRunScope,
+    },
+}
+
+#[derive(Clone)]
 struct PreparedTaintPlan {
     policy_id: PolicyId,
+    engine: TaintEngine,
     sources: Box<[CompiledTaintEndpoint]>,
     sinks: Box<[CompiledTaintEndpoint]>,
     store_writes: Box<[CompiledStoreEnd]>,
     store_reads: Box<[CompiledStoreEnd]>,
+    call_resolution_evidence: Option<TaintCallResolutionEvidence>,
+    external_models: Arc<[BoundExternalModel]>,
     compilation_elapsed: Duration,
 }
 
@@ -281,8 +393,12 @@ fn compiled_payload(
     let mut diagnostics = empty_endpoints
         .map(|empty| empty_selection_diagnostics(policy_id, empty))
         .unwrap_or_default();
-    if refusals.is_empty() && incomplete_selectors.is_empty() {
+    let source_filtered_by_threat_model =
+        empty_endpoints.is_some_and(|empty| empty.source_filtered_by_threat_model);
+    if refusals.is_empty() && incomplete_selectors.is_empty() && !source_filtered_by_threat_model {
         return TaintProjectionPayload {
+            engine: None,
+            scope: None,
             projections: Vec::new(),
             completion: if authored_selector_summary {
                 PolicyRunCompletion::ProvenBySummary
@@ -302,6 +418,9 @@ fn compiled_payload(
     if !incomplete_selectors.is_empty() {
         reasons.push(PolicyIncompleteReason::PartialDiscovery);
     }
+    if source_filtered_by_threat_model {
+        reasons.push(PolicyIncompleteReason::CapabilityIncomplete);
+    }
     let completion = PolicyRunCompletion::inconclusive(reasons)
         .expect("nonempty selector gaps have canonical reasons");
     diagnostics.extend(
@@ -318,6 +437,8 @@ fn compiled_payload(
             }),
     );
     TaintProjectionPayload {
+        engine: None,
+        scope: None,
         projections: Vec::new(),
         completion,
         diagnostics,
@@ -345,19 +466,35 @@ fn empty_selection_diagnostics(
     policy_id: &PolicyId,
     empty: EmptyEndpointSets,
 ) -> Vec<PolicyDiagnostic> {
-    empty
-        .named()
-        .into_iter()
-        .filter_map(|set| {
-            PolicyDiagnostic::empty_selection(format!(
-                "taint policy `{}` bound no {set} endpoint: its {set} selectors matched no \
+    let mut diagnostics = if empty.source_filtered_by_threat_model {
+        vec![PolicyDiagnostic::new_bounded(
+            PolicyDiagnosticCode::EvaluationFailure,
+            PolicyDiagnosticSeverity::Warning,
+            PolicyDiagnosticImpact::RunIncomplete,
+            format!(
+                "taint policy `{}` selected no active source after threat-model filtering",
+                policy_id.as_str()
+            ),
+        )]
+    } else {
+        Vec::new()
+    };
+    diagnostics.extend(
+        empty
+            .named()
+            .into_iter()
+            .filter_map(|set| {
+                PolicyDiagnostic::empty_selection(format!(
+                    "taint policy `{}` bound no {set} endpoint: its {set} selectors matched no \
                  location in the scanned workspace, so this run reports zero findings \
                  vacuously rather than proving that no flow exists",
-                policy_id.as_str()
-            ))
-            .ok()
-        })
-        .collect()
+                    policy_id.as_str()
+                ))
+                .ok()
+            })
+            .collect::<Vec<_>>(),
+    );
+    diagnostics
 }
 
 /// Render one diagnostic per refused selector row, naming the file, the row's
@@ -383,6 +520,10 @@ fn refusal_messages(refused: &[RefusedCallSite]) -> Vec<String> {
                     "taint semantic binding refused one site: the port `(argument :name \
                      \"{name}\")` at {site} does not identify one actual there: {detail}"
                 ),
+                RefusalReason::MissingOperand { port, arguments } => format!(
+                    "taint semantic binding refused one site: the port `{port}` at {site} \
+                     names no operand of the selected call, which has {arguments} argument(s)"
+                ),
             }
         })
         .collect()
@@ -395,9 +536,9 @@ fn refusal_messages(refused: &[RefusedCallSite]) -> Vec<String> {
 /// retained finding report is projected into every participating policy.
 #[derive(Default)]
 pub(crate) struct ProductionTaintPolicyEvaluator {
-    prepared: RefCell<HashMap<PolicyId, TaintProjectionPayload>>,
-    public_findings: RefCell<Vec<brokk_bifrost_rql::structural::CodeQueryTaintFinding>>,
-    retained_analyses: RefCell<Vec<Arc<ProductionTaintAnalysisResult>>>,
+    prepared: Mutex<HashMap<PolicyId, TaintProjectionPayload>>,
+    public_findings: Mutex<Vec<brokk_bifrost_rql::structural::CodeQueryTaintFinding>>,
+    retained_analyses: Mutex<Vec<Arc<ProductionTaintAnalysisResult>>>,
 }
 
 struct TaintExecutionBudget {
@@ -545,7 +686,13 @@ impl TaintExecutionBudget {
     /// abstention into a decision; it can never turn an abstain into a false
     /// clean.
     fn reset_per_batch_solve_budget(&mut self, budget: &PolicyBudget) {
-        self.semantic = Self::fresh_semantic(budget);
+        // Scalar limits reset per batch; the artifact censuses already paid
+        // carry over, so a shared artifact is charged once per compile.
+        let census = self.semantic.scope_snapshot();
+        self.semantic = SemanticBudget::new_child(
+            super::selector_compiler::semantic_work_limits(budget.query_limits().semantic),
+            &census,
+        );
         self.solver = Self::fresh_solver(budget);
     }
 }
@@ -558,6 +705,26 @@ impl ProductionTaintPolicyEvaluator {
         cancellation: Option<&CancellationToken>,
         budget: &PolicyBudget,
     ) -> Self {
+        Self::prepare_in_range(
+            policies,
+            workspace,
+            active_semantic_model_snapshot,
+            cancellation,
+            budget,
+            None,
+        )
+    }
+
+    /// [`Self::prepare`] for a run that names a changed range: sinks bind only
+    /// in `changed` (spec M4.1), and `None` binds every sink as `prepare` does.
+    pub(crate) fn prepare_in_range<'policy>(
+        policies: impl IntoIterator<Item = &'policy LoadedPolicy>,
+        workspace: &WorkspaceAnalyzer,
+        active_semantic_model_snapshot: Result<Option<Arc<ActiveSemanticModelSnapshot>>, String>,
+        cancellation: Option<&CancellationToken>,
+        budget: &PolicyBudget,
+        changed: Option<&[ProjectFile]>,
+    ) -> Self {
         let uncancelled = CancellationToken::default();
         let cancellation = cancellation.unwrap_or(&uncancelled);
         let policies = policies
@@ -566,7 +733,7 @@ impl ProductionTaintPolicyEvaluator {
             .collect::<Vec<_>>();
         let mut payloads = HashMap::with_capacity(policies.len());
         let mut metadata = HashMap::new();
-        let mut plans = Vec::new();
+        let mut plans: Vec<(TaintEngine, TaintPolicyPlan)> = Vec::new();
         let mut public_findings = Vec::new();
         let mut retained_analyses = Vec::new();
         let mut execution_budget = TaintExecutionBudget::new(budget);
@@ -577,6 +744,13 @@ impl ProductionTaintPolicyEvaluator {
             .as_ref()
             .ok()
             .and_then(|snapshot| snapshot.as_ref().map(Arc::clone));
+        // One ICFG provider serves every batch solve of this policy. Its
+        // query-local cache keeps each file's exact dispatch session, so a
+        // file is parsed once per policy compile rather than once per solve.
+        let icfg_provider = WorkspaceIcfgProvider::with_active_semantic_model_snapshot(
+            workspace,
+            icfg_active_semantic_model_snapshot.clone(),
+        );
 
         for policy in &policies {
             let policy_id = policy.definition().metadata.id.clone();
@@ -595,6 +769,7 @@ impl ProductionTaintPolicyEvaluator {
                     cancellation,
                 )
                 .with_active_semantic_model_snapshot(snapshot.clone())
+                .with_changed_files(changed)
                 .compile(policy, spec),
                 Err(message) => Err(Box::new(TaintPolicyCompileFailure {
                     error: TaintPolicyCompileError::Model(message.clone()),
@@ -609,31 +784,50 @@ impl ProductionTaintPolicyEvaluator {
                     refusals,
                     incomplete_selectors,
                     authored_selector_summary,
+                    skipped_region_roots: _,
                 }) => {
-                    payloads.insert(
-                        policy_id.clone(),
-                        compiled_payload(
-                            &policy_id,
-                            work,
-                            refusals,
-                            None,
-                            authored_selector_summary,
-                            incomplete_selectors,
-                        ),
+                    // Every root of one policy shares its engine: the rule
+                    // reads the policy's bound endpoints, not one root's region.
+                    let engine = roots
+                        .first()
+                        .map(|compiled| compiled.engine.clone())
+                        .expect("a compiled taint policy has at least one root");
+                    let scope = roots.first().and_then(|compiled| compiled.scope.clone());
+                    brokk_bifrost_analysis::profiling::note_with(|| {
+                        format!(
+                            "taint.engine policy={} engine={} reason={}",
+                            policy_id.as_str(),
+                            engine.name(),
+                            engine.reason().unwrap_or("-"),
+                        )
+                    });
+                    let mut payload = compiled_payload(
+                        &policy_id,
+                        work,
+                        refusals,
+                        None,
+                        authored_selector_summary,
+                        incomplete_selectors,
                     );
+                    payload.engine = Some(engine.clone());
+                    payload.scope = scope;
+                    payloads.insert(policy_id.clone(), payload);
                     for compiled in roots {
                         metadata.insert(
                             compiled.internal_policy_id.clone(),
                             PreparedTaintPlan {
                                 policy_id: policy_id.clone(),
+                                engine: compiled.engine.clone(),
                                 sources: compiled.sources,
                                 sinks: compiled.sinks,
                                 store_writes: compiled.store_writes,
                                 store_reads: compiled.store_reads,
+                                call_resolution_evidence: compiled.call_resolution_evidence,
+                                external_models: compiled.external_models,
                                 compilation_elapsed,
                             },
                         );
-                        plans.push(compiled.plan);
+                        plans.push((compiled.engine, compiled.plan));
                     }
                 }
                 Ok(TaintPolicyCompilation::Clean {
@@ -641,8 +835,10 @@ impl ProductionTaintPolicyEvaluator {
                     refusals,
                     incomplete_selectors,
                     empty_endpoints,
+                    engine,
+                    scope,
                 }) => {
-                    let payload = compiled_payload(
+                    let mut payload = compiled_payload(
                         &policy_id,
                         work,
                         refusals,
@@ -650,6 +846,8 @@ impl ProductionTaintPolicyEvaluator {
                         false,
                         incomplete_selectors,
                     );
+                    payload.engine = engine;
+                    payload.scope = scope;
                     payloads.insert(policy_id, payload);
                 }
                 Err(failure) => {
@@ -659,7 +857,7 @@ impl ProductionTaintPolicyEvaluator {
         }
 
         let batch_planning_started = Instant::now();
-        let batches = TaintBatchPlanner::partition(plans);
+        let batches = partition_taint_batches(plans);
         let batch_planning_elapsed = batch_planning_started.elapsed();
         match batches {
             Ok(batches) => {
@@ -676,7 +874,7 @@ impl ProductionTaintPolicyEvaluator {
                     cancellation,
                     budget,
                     &mut execution_budget,
-                    icfg_active_semantic_model_snapshot.clone(),
+                    &icfg_provider,
                 ) {
                     Ok(seeding) => seeding,
                     Err(error) => {
@@ -687,9 +885,9 @@ impl ProductionTaintPolicyEvaluator {
                             );
                         }
                         return Self {
-                            prepared: RefCell::new(payloads),
-                            public_findings: RefCell::new(public_findings),
-                            retained_analyses: RefCell::new(retained_analyses),
+                            prepared: Mutex::new(payloads),
+                            public_findings: Mutex::new(public_findings),
+                            retained_analyses: Mutex::new(retained_analyses),
                         };
                     }
                 };
@@ -736,6 +934,8 @@ impl ProductionTaintPolicyEvaluator {
                     }
                 }
                 let store_write_evidence = seeding.write_evidence_by_read(&batches);
+                let composition_memo = CompositionMemo::default();
+                let mut merge = BatchMerge::default();
                 for (batch_index, batch) in batches.into_iter().enumerate() {
                     let seeds = seeding.seeds[batch_index]
                         .iter()
@@ -749,6 +949,7 @@ impl ProductionTaintPolicyEvaluator {
                             Err(error) => {
                                 for internal_id in batch.policy_ids() {
                                     if let Some(plan) = metadata.get(internal_id) {
+                                        merge.envelopes.remove(&plan.policy_id);
                                         payloads.insert(
                                             plan.policy_id.clone(),
                                             prepared_failure_payload(
@@ -774,6 +975,7 @@ impl ProductionTaintPolicyEvaluator {
                         &metadata,
                         &policies,
                         &mut payloads,
+                        &mut merge,
                         workspace,
                         cancellation,
                         budget,
@@ -782,7 +984,9 @@ impl ProductionTaintPolicyEvaluator {
                         &mut retained_analyses,
                         batch_planning_elapsed,
                         icfg_active_semantic_model_snapshot.clone(),
+                        &icfg_provider,
                         &store_write_evidence,
+                        &composition_memo,
                     ) else {
                         if store_fed_uncertain {
                             for internal_id in batch.policy_ids() {
@@ -811,6 +1015,7 @@ impl ProductionTaintPolicyEvaluator {
                                 }
                             }
                             TaintBatchError::Internal(message) => {
+                                merge.envelopes.remove(&plan.policy_id);
                                 payloads.insert(
                                     plan.policy_id.clone(),
                                     prepared_failure_payload(message, PolicyWorkReport::default()),
@@ -831,20 +1036,30 @@ impl ProductionTaintPolicyEvaluator {
         }
 
         Self {
-            prepared: RefCell::new(payloads),
-            public_findings: RefCell::new(public_findings),
-            retained_analyses: RefCell::new(retained_analyses),
+            prepared: Mutex::new(payloads),
+            public_findings: Mutex::new(public_findings),
+            retained_analyses: Mutex::new(retained_analyses),
         }
     }
 
     pub(crate) fn take_public_findings(
         &self,
     ) -> Vec<brokk_bifrost_rql::structural::CodeQueryTaintFinding> {
-        std::mem::take(&mut *self.public_findings.borrow_mut())
+        std::mem::take(
+            &mut *self
+                .public_findings
+                .lock()
+                .expect("taint public findings mutex poisoned"),
+        )
     }
 
     pub(crate) fn take_retained_analyses(&self) -> Vec<Arc<ProductionTaintAnalysisResult>> {
-        std::mem::take(&mut *self.retained_analyses.borrow_mut())
+        std::mem::take(
+            &mut *self
+                .retained_analyses
+                .lock()
+                .expect("taint retained analyses mutex poisoned"),
+        )
     }
 }
 
@@ -860,7 +1075,8 @@ impl TaintPolicyEvaluator for ProductionTaintPolicyEvaluator {
         _budget: &PolicyBudget,
     ) -> TaintProjectionPayload {
         self.prepared
-            .borrow_mut()
+            .lock()
+            .expect("taint prepared payloads mutex poisoned")
             .remove(&policy.definition().metadata.id)
             .unwrap_or_else(|| {
                 prepared_failure_payload(
@@ -897,7 +1113,32 @@ pub(crate) struct TaintPolicyCompiler<'a> {
     /// Whether an endpoint was selected through an authored override contract.
     /// This caps a clean result; it never upgrades an incomplete solve.
     authored_selector_summary: bool,
+    /// Analysis roots whose discovery outgrew its per-region budget and were
+    /// skipped (#1936). An ordinary run reports the endpoints they held as
+    /// unanalyzed files; a flow candidate (#3686) reads the count so that "no
+    /// region connects these sites" is never claimed over a skipped region.
+    skipped_region_roots: usize,
+    /// The two positions a flow candidate asks about (#3686). Only a
+    /// candidate pass sets it. Endpoint sites are recorded before regions are
+    /// formed, because a site no region pairs with a partner is still bound.
+    candidate_probe: Option<&'a mut candidate::CandidateProbe>,
+    /// The files a changed-range run binds sinks in (spec M4.1). `None` for a
+    /// whole-workspace run, which binds every sink.
+    changed_files: Option<&'a [ProjectFile]>,
+    /// One note per sink selector that could not be sliced to the changed
+    /// files and bound the whole workspace instead (spec M4.1).
+    range_widened: Vec<String>,
+    /// How a matched-value port resolves to endpoints: from points-to
+    /// observations for the up-front compile, from file-local observations
+    /// for the composition's frontier (see `FrontierEndpointBinder::new`).
+    matched_values: MatchedValueResolver<'a>,
 }
+
+/// A resolver of one selected row's matched value to taint values.
+type MatchedValueResolver<'a> = fn(
+    &mut TaintPolicyCompiler<'a>,
+    SelectedSite,
+) -> Result<Vec<ResolvedTaintValue>, TaintPolicyCompileError>;
 
 /// The number of endpoint locations one taint compile bound, per endpoint set.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -929,6 +1170,7 @@ struct StoreKeyMetrics {
 pub(crate) struct EmptyEndpointSets {
     sources: bool,
     sinks: bool,
+    source_filtered_by_threat_model: bool,
 }
 
 impl EmptyEndpointSets {
@@ -951,7 +1193,17 @@ impl EmptyEndpointSets {
     }
 }
 
-type SelectedSite = super::selector_compiler::PolicySelectedSite;
+pub(crate) type SelectedSite = super::selector_compiler::PolicySelectedSite;
+
+fn threat_model_source_is_active(
+    source: &ResolvedTaintEndpoint<ResolvedTaintSourceDefinition>,
+    active_models: &[TaintThreatModel],
+) -> bool {
+    source
+        .definition
+        .threat_model
+        .is_none_or(|model| active_models.contains(&model))
+}
 
 /// One callee's formal parameter names, in declaration order. A slot holds
 /// every spelling its declaration gives one parameter.
@@ -999,11 +1251,18 @@ enum RefusalReason {
     /// argument binding is open, or because two dispatch candidates map the
     /// formal to different actuals (#2496).
     UnidentifiedFormal { name: String, detail: String },
+    /// The selected call has no operand at the declared port: an argument
+    /// index past its argument count, or a receiver port on a call without a
+    /// receiver. The selector matched a site the port cannot name, so the
+    /// site is refused instead of failing the whole compile. Carries the port
+    /// as written and the call's argument count.
+    MissingOperand { port: String, arguments: usize },
 }
 
 #[derive(Clone)]
-struct BoundEndpoint {
+pub(crate) struct BoundEndpoint {
     endpoint: ResolvedEndpointIdentity,
+    kind: TaintEndpointKind,
     point: ProgramPointHandle,
     /// The phase of `point` at which the bound carrier holds the observed
     /// value. A value the point itself defines holds only after that point's
@@ -1015,13 +1274,18 @@ struct BoundEndpoint {
     proof: ProofStatus,
     completeness: EvidenceCompleteness,
     labels: Box<[TaintLabel]>,
+    dispatch_obligations: Box<[CallSiteHandle]>,
+    /// The selected row whose evidence the composition's frontier left
+    /// unjudged (see [`ResolvedTaintValue::unjudged`]); `None` for every
+    /// endpoint the ICFG engine binds.
+    unjudged: Option<Arc<SelectedSite>>,
 }
 
 /// One sanitizer endpoint pair bound to the same selected call site. The
 /// input and output are retained separately so a sanitizer cannot accidentally
 /// clear a value from a different operand merely because it produces a result.
 #[derive(Clone)]
-struct BoundSanitizer {
+pub(crate) struct BoundSanitizer {
     input: BoundEndpoint,
     output: BoundEndpoint,
 }
@@ -1030,7 +1294,7 @@ struct BoundSanitizer {
 /// relation and its evidence live in value flow; the label sets are retained
 /// here until the taint function can be built against the region's universe.
 #[derive(Clone)]
-struct BoundTransform {
+pub(crate) struct BoundTransform {
     input: BoundEndpoint,
     output: BoundEndpoint,
     removes: Box<[TaintLabel]>,
@@ -1063,11 +1327,11 @@ struct BoundStoreEnd {
 /// per-port resolution quality is retained so an unproven or partial
 /// declaration degrades the run instead of overstating itself.
 #[derive(Clone)]
-struct BoundExternalModel {
+pub(crate) struct BoundExternalModel {
     /// The declaring entry's stable identity, used for the curated model id
     /// and for deterministic merging when several entries select one call.
     entry: ResolvedEndpointIdentity,
-    call: CallSiteHandle,
+    pub(crate) call: CallSiteHandle,
     transfers: Vec<LoweredModelTransfer>,
     proof: ProofStatus,
     completeness: EvidenceCompleteness,
@@ -1103,13 +1367,55 @@ struct LoweredModelTransfer {
     field: Option<ModelFieldDestination>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum TaintEndpointKind {
+    Argument,
+    Receiver,
+    ReturnValue,
+    ConstructorResult,
+    LiteralValue,
+    MatchedValue,
+    Parameter,
+}
+
 struct ResolvedTaintValue {
     call: Option<CallSiteHandle>,
+    kind: TaintEndpointKind,
     point: ProgramPointHandle,
     phase: ValueFlowObservationPhase,
     carrier: ValueFlowCarrier,
     proof: ProofStatus,
     completeness: EvidenceCompleteness,
+    dispatch_obligations: Box<[CallSiteHandle]>,
+    /// Set by the frontier's matched-value resolver for every value it resolves: the
+    /// row whose points-to evidence it did not ask for. A source bound from
+    /// it carries unknown evidence, judged later from this row (see
+    /// [`FrontierEndpointBinder::source_evidence`]). A sanitizer or transform
+    /// drops it.
+    unjudged: Option<Arc<SelectedSite>>,
+}
+
+fn resolved_entry_parameter_value(
+    procedure: &ProcedureHandle,
+    port: ProcedurePortHandle,
+    proof: ProofStatus,
+    completeness: EvidenceCompleteness,
+) -> ResolvedTaintValue {
+    let point = procedure
+        .point_handle(procedure.semantics().entry_point())
+        .expect("validated semantic procedure has its entry point");
+    ResolvedTaintValue {
+        call: None,
+        kind: TaintEndpointKind::Parameter,
+        dispatch_obligations: Box::new([]),
+        point,
+        // Formal parameters are available at entry before local effects.
+        phase: ValueFlowObservationPhase::BeforeEffects,
+        carrier: ValueFlowCarrier::Port(port),
+        proof,
+        completeness,
+        unjudged: None,
+    }
 }
 
 struct ResolvedTransferValues {
@@ -1153,6 +1459,10 @@ struct DiscoveredValueFlow {
     /// closure's captured environment connected across the call that
     /// returned it (#3470).
     returned_callables: Vec<ValueFlowReturnedCallable>,
+    /// Query-local Rust formatting macro calls whose exact standard identity
+    /// was proved by ordinary dispatch. They receive the language intrinsic
+    /// result-transfer model below, independent of active semantic packs.
+    rust_format_result_calls: Vec<(CallSiteHandle, ResolverOwnedExternalCalleeIdentity)>,
     /// Region membership, by durable procedure identity rather than by handle.
     /// A selected source or sink is tested against this set, and its handle can
     /// come from a different materialization than the walk's, so handle
@@ -1164,6 +1474,632 @@ struct DiscoveredValueFlow {
     /// materialize to an artifact, kept separate from `external_targets` so the
     /// materialized-external binding path is unchanged (#1978).
     unmaterialized_external_targets: Vec<UnmaterializedExternalTarget>,
+    call_coverage: HashMap<DurableCallSiteKey, CallSiteCoverage>,
+    dispatch_boundaries: Vec<DispatchBoundary>,
+}
+
+pub(crate) struct CallResolutionDiscoveryEvidence {
+    pub(crate) coverage: HashMap<DurableCallSiteKey, CallSiteCoverage>,
+    pub(crate) boundaries: Vec<DispatchBoundary>,
+}
+
+/// The reason `select_taint_engine` gives when no sink was bound.
+const NO_SINKS_REASON: &str = "no-sinks";
+
+/// The scope of a changed-range run over `files`.
+fn changed_range_scope(files: &[ProjectFile], widened: Vec<String>) -> PolicyRunScope {
+    PolicyRunScope::changed_range(files.iter().map(rel_path_string).collect(), widened)
+}
+
+/// Choose the engine of one compiled taint policy (spec M3.0, M4.2). The rule
+/// reads the specification and the bound sinks, and the first failing
+/// condition in this order is the reason. The order is fixed: store ends,
+/// entry points, activation-triggered sources, a flow-candidate pass, the
+/// language of every sink, the rows of every sink's blob, then the sink
+/// requirement.
+///
+/// Sources, sanitizers and transforms are not bound before the rule runs:
+/// the composition matches them on the frontier, and a match in a blob
+/// without rows makes that hop incomplete as any procedure without rows
+/// does. A flow-candidate pass needs every source site bound before its
+/// regions are chosen, so it keeps the ICFG engine.
+fn select_taint_engine(
+    workspace: &WorkspaceAnalyzer,
+    spec: &ResolvedTaintPolicySpec,
+    sinks: &[BoundEndpoint],
+    flow_candidate: bool,
+) -> Result<TaintEngine, TaintPolicyCompileError> {
+    let icfg = |reason: &str| TaintEngine::Icfg {
+        reason: reason.into(),
+    };
+    if !spec.store_writes.is_empty() || !spec.store_reads.is_empty() {
+        return Ok(icfg("store-ends"));
+    }
+    if !spec.entry_points.is_empty() {
+        return Ok(icfg("entry-points"));
+    }
+    // The taint specification has no syntax for an activation trigger, so no
+    // source is activation-triggered here. The reason stays in the closed set
+    // for a trigger form that the specification may gain.
+    if flow_candidate {
+        return Ok(icfg("flow-candidate"));
+    }
+    let mut artifacts = Vec::new();
+    let mut seen = HashSet::new();
+    for sink in sinks {
+        let key = sink.point.procedure().artifact().key();
+        if seen.insert(key) {
+            artifacts.push(key);
+        }
+    }
+    for key in &artifacts {
+        if key.language() != SemanticLanguage::Standard(Language::Rust) {
+            return Ok(icfg(&format!("language:{}", key.language().stable_label())));
+        }
+    }
+    for key in &artifacts {
+        let rows = workspace
+            .has_complete_semantic_ir_rows(key)
+            .map_err(|error| TaintPolicyCompileError::SemanticProvider(error.to_string()))?;
+        if !rows {
+            return Ok(icfg(&format!("no-rows:{}", key.path())));
+        }
+    }
+    if sinks.is_empty() {
+        return Ok(icfg(NO_SINKS_REASON));
+    }
+    Ok(TaintEngine::Composition)
+}
+
+/// Group compiled plans into batches, one engine per batch (spec M3.0). The
+/// planner keys batches on propagation semantics, which do not name the
+/// engine, so the split happens before it.
+fn partition_taint_batches(
+    plans: Vec<(TaintEngine, TaintPolicyPlan)>,
+) -> Result<Vec<TaintBatch>, TaintPlanError> {
+    let (composed, icfg): (Vec<_>, Vec<_>) = plans
+        .into_iter()
+        .partition(|(engine, _)| *engine == TaintEngine::Composition);
+    let mut batches =
+        TaintBatchPlanner::partition(icfg.into_iter().map(|(_, plan)| plan).collect())?;
+    batches.extend(TaintBatchPlanner::partition(
+        composed.into_iter().map(|(_, plan)| plan).collect(),
+    )?);
+    Ok(batches)
+}
+
+/// The status a value-flow cause prints. An unsupported input names the
+/// missing capability, so a corpus abstention report says which value-flow
+/// capability the procedure lacked rather than a bare "unsupported".
+fn cause_status_label(cause: &ValueFlowIncompleteCause) -> String {
+    match cause.status() {
+        Some(status @ SemanticInputStatus::Unsupported { capability }) => {
+            format!("{} ({})", status.label(), capability.label())
+        }
+        Some(status) => status.label().to_owned(),
+        None => "incomplete coverage".to_owned(),
+    }
+}
+
+/// The dotted declaration name of a cause's procedure.
+fn cause_procedure_name(cause: &ValueFlowIncompleteCause) -> String {
+    cause
+        .procedure()
+        .semantics()
+        .locator()
+        .declaration()
+        .segments()
+        .iter()
+        .filter_map(|segment| segment.name())
+        .collect::<Vec<_>>()
+        .join(".")
+}
+
+/// The family and message of a value-flow cause that names no call site: its
+/// procedure's semantics are incomplete. The ICFG engine's first cause and the
+/// composition's blocked gap both print this text, so both engines name the
+/// same family and message.
+fn procedure_cause_text(cause: &ValueFlowIncompleteCause, status: &str) -> (String, String) {
+    let family = format!(
+        "taint discovery is incomplete: {} is {status}",
+        cause.label()
+    );
+    let message = format!(
+        "taint discovery is incomplete: {} for {}:{} is {status}",
+        cause.label(),
+        cause.procedure().semantics().locator().path().as_str(),
+        cause_procedure_name(cause),
+    );
+    (family, message)
+}
+
+/// The diagnostic a composed batch gives each of its policy roots: its first
+/// incompleteness, reported as the ICFG engine reports its first cause (spec
+/// M3.4). A reason keyed by a call that the composition dispatched gets the
+/// same call-site evidence the ICFG engine builds for that call, so both
+/// engines name the same family and the same message.
+///
+/// The first reason follows the ICFG engine's order. Its plan names the first
+/// incomplete procedure snapshot in its procedure order (artifact key,
+/// locator, procedure id), before any call binding or endpoint
+/// (`first_incomplete_cause`); within one procedure a blocked gap outranks a
+/// residual call. So an open procedure is named before any dispatch, caller
+/// or interior reason, and the open procedure that sorts first is named. A
+/// budget lane or cancellation ends the composition itself, so it is named
+/// before everything else.
+///
+/// The snapshot input status of the first reason is returned beside the
+/// diagnostic, when the reason has one: the completion reason reads it as the
+/// ICFG engine reads its first cause's status.
+fn composition_first_cause(
+    workspace: &WorkspaceAnalyzer,
+    provider: &PolicyCompositionProvider<'_>,
+    reasons: &[Incompleteness],
+) -> Result<(Vec<PolicyDiagnostic>, Option<SemanticInputStatus>), TaintBatchError> {
+    let stopped = reasons.iter().find(|reason| {
+        matches!(
+            reason,
+            Incompleteness::Budget(_) | Incompleteness::Cancelled
+        )
+    });
+    let open = reasons
+        .iter()
+        .filter_map(|reason| match reason {
+            Incompleteness::Open { procedure, .. } => {
+                let handle = provider.served_procedure(procedure);
+                Some((
+                    (
+                        handle.artifact().key().clone(),
+                        handle.semantics().locator().clone(),
+                        handle.id(),
+                    ),
+                    reason,
+                ))
+            }
+            _ => None,
+        })
+        .min_by(|left, right| left.0.cmp(&right.0))
+        .map(|(_, reason)| reason);
+    // The ICFG engine's plan names an endpoint's selector evidence only after
+    // every procedure, call and binding cause, sources before sinks.
+    let endpoint_rank = |reason: &Incompleteness| match reason {
+        Incompleteness::SourceEvidence { .. } => 1,
+        Incompleteness::SinkEvidence { .. } => 2,
+        _ => 0,
+    };
+    let Some(first) = stopped
+        .or(open)
+        .or_else(|| reasons.iter().min_by_key(|reason| endpoint_rank(reason)))
+    else {
+        return Ok((Vec::new(), None));
+    };
+    let first_status = match first {
+        Incompleteness::Open { status, .. } => Some(*status),
+        Incompleteness::Dispatch { call, .. } => {
+            provider.dispatched_call(call).map(|(_, status, _)| status)
+        }
+        _ => None,
+    };
+    // A blocked gap outranks residual calls, as the ICFG engine's plan does.
+    // A residual call prints its procedure's snapshot status, as the ICFG
+    // engine's `CallResolution` cause does; a dispatch outside an open
+    // procedure has no snapshot cause there, so it prints its own status.
+    let residual_call = match first {
+        Incompleteness::Dispatch { call, .. } => {
+            let (_, status, _) = provider
+                .dispatched_call(call)
+                .expect("the composition records every call a reason names");
+            Some((call, status))
+        }
+        Incompleteness::Open {
+            residual,
+            blocked: None,
+            status,
+            ..
+        } => residual.first().map(|call| (call, *status)),
+        _ => None,
+    };
+    let call_site = match residual_call {
+        Some((call, status)) => call_site_cause(workspace, provider, call, status)?,
+        None => None,
+    };
+    let (family, message, primary) = match (call_site, first) {
+        (Some((message, primary)), _) => (CALL_SITE_EVIDENCE_FAMILY.to_owned(), message, primary),
+        (
+            None,
+            Incompleteness::Open {
+                blocked: Some(blocked),
+                status,
+                ..
+            },
+        ) => {
+            let cause = ValueFlowIncompleteCause::SemanticGap {
+                gap: blocked.gap.clone(),
+                capability: blocked.capability,
+                status: *status,
+            };
+            let (family, message) = procedure_cause_text(&cause, &cause_status_label(&cause));
+            (family, message, None)
+        }
+        // An open procedure with no residual call and no blocked gap is one
+        // the ICFG engine blocks without a scoped gap (an unproven relation or
+        // an open value-flow capability): its snapshot cause.
+        (
+            None,
+            Incompleteness::Open {
+                procedure,
+                residual,
+                blocked: None,
+                status,
+                ..
+            },
+        ) if residual.is_empty() => {
+            let procedure = provider.served_procedure(procedure);
+            let cause = if status.is_complete() {
+                ValueFlowIncompleteCause::SnapshotCoverage { procedure }
+            } else {
+                ValueFlowIncompleteCause::Snapshot {
+                    procedure,
+                    status: *status,
+                }
+            };
+            let (family, message) = procedure_cause_text(&cause, &cause_status_label(&cause));
+            (family, message, None)
+        }
+        (None, Incompleteness::SourceEvidence { point }) => {
+            let (family, message) = source_evidence_text(point);
+            (family, message, None)
+        }
+        (None, Incompleteness::SinkEvidence { point }) => {
+            let cause = ValueFlowIncompleteCause::SinkEvidence {
+                point: point.clone(),
+            };
+            let (family, message) = procedure_cause_text(&cause, &cause_status_label(&cause));
+            (family, message, None)
+        }
+        (None, Incompleteness::Budget(lane)) => (
+            "taint_analysis/composition_budget".to_owned(),
+            format!(
+                "taint composition exhausted its {} lane",
+                composition_lane_name(*lane)
+            ),
+            None,
+        ),
+        (None, Incompleteness::Cancelled) => (
+            "taint_analysis/cancelled".to_owned(),
+            "taint composition was cancelled before reaching a fixed point".to_owned(),
+            None,
+        ),
+        (None, other) => (
+            format!(
+                "taint_analysis/{}",
+                PolicyIncompleteReason::PartialDiscovery.label()
+            ),
+            composition_reason_message(other),
+            None,
+        ),
+    };
+    let diagnostic = PolicyDiagnostic::try_new_in_family(
+        PolicyDiagnosticCode::EvaluationFailure,
+        PolicyDiagnosticSeverity::Warning,
+        PolicyDiagnosticImpact::RunIncomplete,
+        family,
+        message,
+        primary,
+        Vec::new(),
+    )
+    .ok();
+    let mut diagnostics: Vec<PolicyDiagnostic> = diagnostic.into_iter().collect();
+    // The ICFG engine gives each analysis root its own first cause, so a run
+    // whose roots fail for different reasons names both families. The
+    // composition has one root; a source whose evidence is incomplete is
+    // named beside a higher-ranked cause of another family.
+    if !matches!(first, Incompleteness::SourceEvidence { .. })
+        && let Some(Incompleteness::SourceEvidence { point }) = reasons
+            .iter()
+            .find(|reason| matches!(reason, Incompleteness::SourceEvidence { .. }))
+    {
+        let (family, message) = source_evidence_text(point);
+        diagnostics.extend(
+            PolicyDiagnostic::try_new_in_family(
+                PolicyDiagnosticCode::EvaluationFailure,
+                PolicyDiagnosticSeverity::Warning,
+                PolicyDiagnosticImpact::RunIncomplete,
+                family,
+                message,
+                None,
+                Vec::new(),
+            )
+            .ok(),
+        );
+    }
+    Ok((diagnostics, first_status))
+}
+
+/// The family and message the ICFG engine gives a source whose selector
+/// evidence is incomplete.
+fn source_evidence_text(point: &ProgramPointHandle) -> (String, String) {
+    let cause = ValueFlowIncompleteCause::SourceEvidence {
+        point: point.clone(),
+    };
+    procedure_cause_text(&cause, &cause_status_label(&cause))
+}
+
+/// The call-site message and location of one call the composition dispatched,
+/// printed with the snapshot input `status`, or `None` for a call outside
+/// Rust, which keeps the composition's own text.
+fn call_site_cause(
+    workspace: &WorkspaceAnalyzer,
+    provider: &PolicyCompositionProvider<'_>,
+    call: &DurableCallSiteKey,
+    status: SemanticInputStatus,
+) -> Result<Option<(String, Option<PolicySourceLocation>)>, TaintBatchError> {
+    let (handle, _, _) = provider
+        .dispatched_call(call)
+        .expect("the composition records every call a reason names");
+    if !is_rust_taint_call(&handle) {
+        return Ok(None);
+    }
+    let evidence = taint_call_resolution_evidence(
+        workspace,
+        &handle,
+        status,
+        &provider.call_resolution_discovery(),
+    )
+    .map_err(|error| TaintBatchError::Internal(error.to_string()))?;
+    Ok(Some((
+        call_resolution_detail(&evidence),
+        Some(evidence.location.clone()),
+    )))
+}
+
+fn composition_lane_name(lane: BudgetLane) -> &'static str {
+    match lane {
+        BudgetLane::Procedures => PolicyBudgetField::CompositionProcedures.as_str(),
+        BudgetLane::Hops => PolicyBudgetField::CompositionHops.as_str(),
+        BudgetLane::CallersPerProcedure => {
+            PolicyBudgetField::CompositionCallersPerProcedure.as_str()
+        }
+    }
+}
+
+fn composition_reason_message(reason: &Incompleteness) -> String {
+    match reason {
+        Incompleteness::Dispatch { call, reason } => format!(
+            "taint composition could not resolve the dispatch of call {:?} in {}: {reason}",
+            call.1,
+            call.0.0.path(),
+        ),
+        Incompleteness::Callers { procedure, reason } => format!(
+            "taint composition could not enumerate the callers of {}: {reason}",
+            procedure.0.path(),
+        ),
+        Incompleteness::Model { call, reason } => format!(
+            "taint composition model of call {:?} in {} is incomplete: {reason}",
+            call.1,
+            call.0.0.path(),
+        ),
+        Incompleteness::Interior { procedure, reason } => format!(
+            "taint composition interior flows of {} are incomplete: {reason}",
+            procedure.0.path(),
+        ),
+        Incompleteness::PartialFlows { procedure, outcome } => format!(
+            "taint composition partial flows of {} are {outcome:?}",
+            procedure.0.path(),
+        ),
+        Incompleteness::Open {
+            procedure, reason, ..
+        } => format!(
+            "taint composition found {} open: {reason}",
+            procedure.0.path(),
+        ),
+        Incompleteness::MissingCaptureBinding { procedure, slot } => format!(
+            "taint composition found no capture binding for {slot:?} in {}",
+            procedure.0.path(),
+        ),
+        Incompleteness::UnplacedTransfer { procedure, carrier } => format!(
+            "taint composition could not place sanitizer or transform carrier {carrier:?} in {}",
+            procedure.0.path(),
+        ),
+        Incompleteness::Endpoints { procedure, reason } => format!(
+            "taint composition matched the policy endpoints of {} incompletely: {reason}",
+            procedure.0.path(),
+        ),
+        Incompleteness::Budget(_)
+        | Incompleteness::Cancelled
+        | Incompleteness::SourceEvidence { .. }
+        | Incompleteness::SinkEvidence { .. } => {
+            unreachable!("budget, cancellation and endpoint evidence have their own families")
+        }
+    }
+}
+
+fn is_rust_taint_call(call: &CallSiteHandle) -> bool {
+    call.procedure().artifact().key().language() == SemanticLanguage::Standard(Language::Rust)
+}
+
+/// The family of a Rust call whose dispatch keeps the run incomplete. Both
+/// engines name a call-site cause with it, so one message family joins both.
+const CALL_SITE_EVIDENCE_FAMILY: &str = "taint discovery is incomplete: call-site evidence";
+
+/// The call-site message of an incomplete Rust call, shared by the ICFG
+/// engine's first cause and the composition's first cause.
+fn call_resolution_detail(evidence: &TaintCallResolutionEvidence) -> String {
+    let callee = evidence
+        .callee
+        .as_deref()
+        .map_or("<unavailable from call shape>", |callee| callee);
+    let resolver_result = if evidence.resolver_complete {
+        "the resolver edge is complete"
+    } else {
+        "the resolver left the call incomplete"
+    };
+    let reason = evidence
+        .reason
+        .as_deref()
+        .unwrap_or("no call-site semantic-gap row");
+    format!(
+        "taint discovery is incomplete: call `{callee}` at {} bytes {}..{} has snapshot input status {}; {resolver_result}; resolver boundary status: {}; call semantic gap: {reason}",
+        evidence.path,
+        evidence.range.start,
+        evidence.range.end,
+        evidence.status.label(),
+        evidence.boundary_status,
+    )
+}
+
+fn taint_call_resolution_evidence(
+    workspace: &WorkspaceAnalyzer,
+    call: &CallSiteHandle,
+    status: SemanticInputStatus,
+    discovery: &CallResolutionDiscoveryEvidence,
+) -> Result<TaintCallResolutionEvidence, TaintPolicyCompileError> {
+    let locator = super::semantic_identity::call_site_locator(call);
+    let span = locator.anchor().span();
+    let file = ProjectFile::new(
+        workspace.analyzer().project().root().to_path_buf(),
+        locator.path().as_path(),
+    );
+    let shape = workspace
+        .analyzer()
+        .structural_fact_providers()
+        .into_iter()
+        .find_map(|provider| {
+            let facts = provider.structural_facts(&file)?;
+            call_shapes_in_file(&facts, &file, usize::MAX)
+                .into_iter()
+                .find(|shape| {
+                    shape.outcome.range.start_byte == span.start_byte() as usize
+                        && shape.outcome.range.end_byte == span.end_byte() as usize
+                })
+        });
+    let range = shape.as_ref().map_or_else(
+        || span.start_byte() as usize..span.end_byte() as usize,
+        |shape| shape.outcome.range.start_byte..shape.outcome.range.end_byte,
+    );
+    let callee = shape.and_then(|shape| shape.outcome.callee_name);
+    let coverage = discovery.coverage.get(&call.durable_key());
+    let boundaries = discovery
+        .boundaries
+        .iter()
+        .filter(|boundary| {
+            boundary.provenance.iter().any(|provenance| {
+                matches!(provenance.owner(), OracleRelationOwner::Dispatch(owner) if owner.durable_key() == call.durable_key())
+            })
+        })
+        .map(|boundary| {
+            format!(
+                "{:?} proof={:?} completeness={:?}",
+                boundary.kind, boundary.proof, boundary.completeness
+            )
+        })
+        .collect::<Vec<_>>();
+    let entered_targets = coverage.map_or_else(Vec::new, |coverage| {
+        coverage
+            .entered
+            .iter()
+            .map(|target| target.semantics().locator().declaration().clone())
+            .collect::<Vec<_>>()
+    });
+    let binding_coverage = coverage.map(|coverage| &coverage.bindings);
+    let (boundary_status, resolver_complete) = match coverage {
+        Some(CallSiteCoverage {
+            dispatch: DispatchStatus::Resolved { status, coverage },
+            has_uncovered_boundary,
+            truncated,
+            ..
+        }) => (
+            format!(
+                "dispatch_status={} candidate_coverage={coverage:?} uncovered_boundary={has_uncovered_boundary} truncated={truncated} arms={boundaries:?}",
+                status.label()
+            ),
+            status.is_complete()
+                && *coverage == CandidateCoverage::Exhaustive
+                && !has_uncovered_boundary
+                && !truncated,
+        ),
+        Some(CallSiteCoverage {
+            dispatch: DispatchStatus::Unavailable { status },
+            ..
+        }) => (
+            format!(
+                "dispatch_unavailable={} arms={boundaries:?}",
+                status.label()
+            ),
+            false,
+        ),
+        Some(CallSiteCoverage {
+            dispatch: DispatchStatus::ProviderError { detail },
+            ..
+        }) => (
+            format!("dispatch_provider_error={detail:?} arms={boundaries:?}"),
+            false,
+        ),
+        None => (
+            format!("dispatch_coverage_not_retained arms={boundaries:?}"),
+            false,
+        ),
+    };
+    let boundary_status = format!(
+        "{boundary_status} entered_targets={entered_targets:?} binding_coverage={binding_coverage:?}"
+    );
+    let reason = call
+        .procedure()
+        .semantics()
+        .gaps()
+        .iter()
+        .find(|gap| {
+            gap.subject == SemanticGapSubject::CallSite(call.id())
+                && gap.capability == SemanticCapability::Calls
+        })
+        .map(|gap| format!("{}: {}", gap.kind.label(), gap.detail));
+    let location = super::semantic_identity::policy_location(workspace, locator)
+        .map_err(TaintPolicyCompileError::SemanticProvider)?;
+    Ok(TaintCallResolutionEvidence {
+        call: call.durable_key(),
+        path: locator.path().as_str().to_owned(),
+        location,
+        callee,
+        range,
+        status,
+        boundary_status,
+        resolver_complete,
+        reason,
+    })
+}
+
+/// Build source-selective kills for the automatic comparison barriers Rust
+/// publishes in its guard facts. The predicate establishes the barrier only
+/// on one arm; the other arm retains the source exactly as ordinary value flow
+/// would. Policy-authored predicates remain outside this automatic contract.
+/// The guard rule itself lives in `partial_flow::rules::guard_edge_kills`.
+fn automatic_comparison_guard_edge_kills(
+    snapshots: &[ValueFlowInput<ValueFlowSnapshot>],
+    source_specs: &[ValueFlowSourceSpec],
+) -> Vec<ValueFlowEdgeKillSpec> {
+    if source_specs.is_empty() {
+        return Vec::new();
+    }
+    let source_keys = source_specs
+        .iter()
+        .map(|source| source.key().clone())
+        .collect::<Vec<_>>();
+    let mut kills = Vec::new();
+    for snapshot in snapshots {
+        let procedure = snapshot.value().procedure();
+        for kill in guard_edge_kills(procedure) {
+            kills.push(ValueFlowEdgeKillSpec {
+                point: procedure
+                    .point_handle(kill.point)
+                    .expect("a guard point names a live semantic point"),
+                target: kill.target_point,
+                kind: kill.kind,
+                carrier: ValueFlowCarrier::from(kill.carrier),
+                sources: source_keys.clone(),
+            });
+        }
+    }
+    kills
 }
 
 /// Compile-scoped materialization cache for require-model taint discovery
@@ -1229,9 +2165,9 @@ struct DiscoveredValueFlow {
 /// oracle and is only ever given bindings and a snapshot from one oracle call,
 /// never from this cache.
 #[derive(Default)]
-struct DiscoveryMaterializationCache {
+pub(crate) struct DiscoveryMaterializationCache<'a> {
     /// One canonical artifact instance per artifact key, for the whole compile.
-    artifacts: RefCell<
+    pub(crate) artifacts: RefCell<
         HashMap<
             SemanticArtifactKey,
             Arc<brokk_bifrost_analysis::analyzer::semantic::SemanticArtifact>,
@@ -1260,6 +2196,23 @@ struct DiscoveryMaterializationCache {
     /// hits, so `procedure_misses` counts only genuinely new procedures and the
     /// handle-identity component of it is zero.
     handle_identity_reuses: Cell<u64>,
+    /// Exact dispatch sessions, least recently used first, one per artifact key.
+    ///
+    /// A session parses its file once and then serves every call site in it.
+    /// Call sites are visited grouped by file, so a small recency-ordered set
+    /// keeps that parse. An uncapped map would hold a parsed tree for every file
+    /// a whole-workspace compile touches, for the whole compile, so the set is
+    /// capped at `DISPATCH_SESSION_CAP`. It is dropped with the compile. Only
+    /// region discovery uses it; the composition's provider has a dispatch pool.
+    dispatch_sessions: RefCell<Vec<DispatchSessionEntry<'a>>>,
+}
+
+/// Most files whose parsed dispatch syntax one compile retains at once.
+const DISPATCH_SESSION_CAP: usize = 16;
+
+struct DispatchSessionEntry<'a> {
+    key: SemanticArtifactKey,
+    session: PreparedWorkspaceDispatchSession<'a>,
 }
 
 #[derive(Clone)]
@@ -1345,10 +2298,7 @@ fn record_taint_artifact_key(workspace: &WorkspaceAnalyzer, key: &SemanticArtifa
     if !analyzer.read_ledger_attached() {
         return;
     }
-    analyzer.record_read(ReadKey::artifact(
-        DerivedArtifactId::semantic_artifact(key.public_fingerprint()),
-        Some(key.path().as_str()),
-    ));
+    analyzer.record_read(ReadKey::semantic_artifact(key));
 }
 
 fn record_taint_plan_artifacts(workspace: &WorkspaceAnalyzer, plan: &TaintAnalysisPlan) {
@@ -1359,35 +2309,70 @@ fn record_taint_plan_artifacts(workspace: &WorkspaceAnalyzer, plan: &TaintAnalys
         .for_each_retained_artifact_key(|key| record_taint_artifact_key(workspace, key));
 }
 
-/// Record the exact dispatch question and answer, retaining the typed
-/// unattributed result when the call has no replayable source range.
-fn record_taint_dispatch_read(
-    workspace: &WorkspaceAnalyzer,
-    call: &CallSiteHandle,
-    outcome: &SemanticOutcome<DispatchResult>,
-) {
-    let analyzer = workspace.analyzer();
-    if !analyzer.read_ledger_attached() {
-        return;
-    }
-    match dispatch_read_attribution(call, outcome) {
-        DispatchReadAttribution::Attributed(key) => analyzer.record_read(key),
-        DispatchReadAttribution::Unattributed(_) => analyzer.record_unattributed_read(),
-    }
-}
-
-struct PolicyDiscoveryProvider<'a, 'cache> {
+pub(crate) struct PolicyDiscoveryProvider<'a, 'cache> {
     oracle: WorkspaceSemanticOracle<'a>,
+    /// The composition's prepared dispatch sessions, one per artifact for the
+    /// provider's life, so calls of one file share one source read, one parse
+    /// and the batches announced through [`Self::expect_calls`]. `None` for
+    /// region discovery, which resolves each call in a session of its own.
+    dispatch_pool: Option<PreparedWorkspaceDispatchPool<'a>>,
     execution_budget: SemanticExecutionBudget,
-    cache: &'cache DiscoveryMaterializationCache,
+    cache: &'cache DiscoveryMaterializationCache<'a>,
     poison: RefCell<Option<TaintPolicyCompileError>>,
     /// Returned-callable provenance every dispatch answer in this walk
     /// published, in the order the walk saw it. The walk drains this once at
     /// the end, so the vector is scoped to one root's discovery.
     returned_callables: RefCell<Vec<ReturnedCallableProvenance>>,
+    rust_format_result_calls: RefCell<Vec<(CallSiteHandle, ResolverOwnedExternalCalleeIdentity)>>,
 }
 
-impl PolicyDiscoveryProvider<'_, '_> {
+impl<'a, 'cache> PolicyDiscoveryProvider<'a, 'cache> {
+    /// A provider over one workspace for one compile. Every answer it caches
+    /// lives in `cache`, which the compile owns.
+    pub(crate) fn new(
+        workspace: &'a WorkspaceAnalyzer,
+        execution_budget: SemanticExecutionBudget,
+        cache: &'cache DiscoveryMaterializationCache<'a>,
+    ) -> Self {
+        Self {
+            oracle: workspace.semantic_oracle_provider(),
+            dispatch_pool: None,
+            execution_budget,
+            cache,
+            poison: RefCell::new(None),
+            returned_callables: RefCell::new(Vec::new()),
+            rust_format_result_calls: RefCell::new(Vec::new()),
+        }
+    }
+
+    /// A provider like [`Self::new`] whose dispatches go through one prepared
+    /// session per artifact, for the composition engine.
+    pub(crate) fn with_dispatch_pool(
+        workspace: &'a WorkspaceAnalyzer,
+        execution_budget: SemanticExecutionBudget,
+        cache: &'cache DiscoveryMaterializationCache<'a>,
+    ) -> Self {
+        let mut provider = Self::new(workspace, execution_budget, cache);
+        provider.dispatch_pool = Some(provider.oracle.prepare_workspace_dispatch_pool());
+        provider
+    }
+
+    /// Announce calls whose dispatch this provider will be asked for, so the
+    /// first of them that its file resolves takes the others into its batch.
+    /// A call whose answer the compile already holds is not announced.
+    pub(crate) fn expect_calls(&self, calls: &[CallSiteHandle]) {
+        let pool = self
+            .dispatch_pool
+            .as_ref()
+            .expect("only a provider with a dispatch pool takes call announcements");
+        let cached = self.cache.dispatch.borrow();
+        pool.expect_calls(
+            calls
+                .iter()
+                .filter(|call| !cached.contains_key(&call.durable_key())),
+        );
+    }
+
     /// Take the returned-callable provenance of this walk, deduplicated by
     /// durable identity.
     ///
@@ -1414,6 +2399,21 @@ impl PolicyDiscoveryProvider<'_, '_> {
         rows
     }
 
+    /// Take standard `format!`/`format_args!` identities observed during this
+    /// query's dispatch walk, deduplicated by the call's durable identity.
+    fn take_rust_format_result_calls(
+        &self,
+    ) -> Vec<(CallSiteHandle, ResolverOwnedExternalCalleeIdentity)> {
+        let mut seen = HashSet::new();
+        let mut rows = Vec::new();
+        for row in self.rust_format_result_calls.take() {
+            if seen.insert((row.0.durable_key(), row.1.clone())) {
+                rows.push(row);
+            }
+        }
+        rows
+    }
+
     fn poison(&self, error: TaintPolicyCompileError) -> TaintPolicyCompileError {
         let mut poison = self.poison.borrow_mut();
         if poison.is_none() {
@@ -1425,7 +2425,7 @@ impl PolicyDiscoveryProvider<'_, '_> {
             .clone()
     }
 
-    fn poisoned(&self) -> Option<TaintPolicyCompileError> {
+    pub(crate) fn poisoned(&self) -> Option<TaintPolicyCompileError> {
         self.poison.borrow().clone()
     }
 
@@ -1454,7 +2454,21 @@ impl PolicyDiscoveryProvider<'_, '_> {
             .push(provenance.clone());
     }
 
-    fn require_outcome<T>(
+    /// Record the call's standard format identity when its dispatch proves
+    /// one ([`rust_format_result_identity`]).
+    fn record_rust_format_result_call(
+        &self,
+        call: &CallSiteHandle,
+        outcome: &SemanticOutcome<DispatchResult>,
+    ) {
+        if let Some(identity) = rust_format_result_identity(outcome) {
+            self.rust_format_result_calls
+                .borrow_mut()
+                .push((call.clone(), identity.clone()));
+        }
+    }
+
+    pub(crate) fn require_outcome<T>(
         &self,
         outcome: &SemanticOutcome<T>,
         operation: &str,
@@ -1462,6 +2476,71 @@ impl PolicyDiscoveryProvider<'_, '_> {
         require_uninterrupted_outcome(outcome, operation)
             .and_then(|()| require_discovery_execution_budget(&self.execution_budget, operation))
             .map_err(|error| self.poison(error))
+    }
+}
+
+/// The standard `format!`/`format_args!` identity one call's dispatch proves,
+/// if any. Only a complete, exact query-time macro dispatch answer proves it:
+/// the spelling-derived lowerer candidate and a user macro that shadows the
+/// prelude cannot satisfy this identity test.
+pub(crate) fn rust_format_result_identity(
+    outcome: &SemanticOutcome<DispatchResult>,
+) -> Option<&ResolverOwnedExternalCalleeIdentity> {
+    let dispatch = outcome.available_value()?;
+    if dispatch.coverage() != CandidateCoverage::Exhaustive
+        || !dispatch.candidates().is_empty()
+        || dispatch.boundaries().len() != 1
+    {
+        return None;
+    }
+    let boundary = &dispatch.boundaries()[0];
+    if boundary.proof != ProofStatus::Proven
+        || boundary.completeness != EvidenceCompleteness::Complete
+    {
+        return None;
+    }
+    let identity = boundary.external_callee_identity()?;
+    (identity.language() == brokk_bifrost_analysis::analyzer::Language::Rust
+        && matches!(identity.owner_fqn(), "std" | "core" | "alloc")
+        && matches!(identity.member(), "format" | "format_args"))
+    .then_some(identity)
+}
+
+impl PolicyDiscoveryProvider<'_, '_> {
+    /// Resolve one call through the compile's retained session for its file.
+    ///
+    /// A new session is opened only when the file has none retained, so the
+    /// file is parsed, and its source charged, once per retained session. A
+    /// session that lost its entry to the cap is parsed again, and charged again.
+    fn resolve_call_in_session(
+        &self,
+        call: &CallSiteHandle,
+        request: &mut SemanticRequest<'_>,
+    ) -> Result<
+        SemanticOutcome<DispatchResult>,
+        brokk_bifrost_analysis::analyzer::semantic::SemanticProviderError,
+    > {
+        let artifact = call.procedure().artifact();
+        let key = artifact.key().clone();
+        let mut entry = {
+            let mut sessions = self.cache.dispatch_sessions.borrow_mut();
+            match sessions.iter().position(|entry| entry.key == key) {
+                Some(position) => sessions.remove(position),
+                None => DispatchSessionEntry {
+                    key,
+                    session: self
+                        .oracle
+                        .prepare_call_dispatch_session(Arc::clone(artifact)),
+                },
+            }
+        };
+        let outcome = entry.session.resolve_call(call, request);
+        let mut sessions = self.cache.dispatch_sessions.borrow_mut();
+        sessions.push(entry);
+        if sessions.len() > DISPATCH_SESSION_CAP {
+            sessions.remove(0);
+        }
+        outcome
     }
 }
 
@@ -1541,22 +2620,23 @@ impl ValueFlowProvider for PolicyDiscoveryProvider<'_, '_> {
         let key = call.durable_key();
         if let Some(cached) = self.cache.dispatch.borrow().get(&key).cloned() {
             let outcome = cached.replay();
-            record_taint_dispatch_read(self.oracle.workspace(), call, &outcome);
+            record_dispatch_read(self.oracle.workspace(), call, &outcome);
             self.record_returned_callables(&outcome);
+            self.record_rust_format_result_call(call, &outcome);
             return Ok(outcome);
         }
-        let outcome = self
-            .oracle
-            .resolve_call(
-                call,
-                &mut request.staged_with_execution_budget(&self.execution_budget),
-            )
-            .map_err(|error| {
-                self.poison(TaintPolicyCompileError::SemanticProvider(error.to_string()))
-            })?;
-        record_taint_dispatch_read(self.oracle.workspace(), call, &outcome);
+        let mut staged = request.staged_with_execution_budget(&self.execution_budget);
+        let outcome = match &self.dispatch_pool {
+            Some(pool) => pool.resolve_call(call, &mut staged),
+            None => self.resolve_call_in_session(call, &mut staged),
+        }
+        .map_err(|error| {
+            self.poison(TaintPolicyCompileError::SemanticProvider(error.to_string()))
+        })?;
+        record_dispatch_read(self.oracle.workspace(), call, &outcome);
         self.require_outcome(&outcome, "taint call dispatch")?;
         self.record_returned_callables(&outcome);
+        self.record_rust_format_result_call(call, &outcome);
         self.cache
             .dispatch
             .borrow_mut()
@@ -1633,7 +2713,25 @@ impl<'a> TaintPolicyCompiler<'a> {
             bound_endpoints: BoundEndpointCounts::default(),
             store_key_metrics: StoreKeyMetrics::default(),
             authored_selector_summary: false,
+            skipped_region_roots: 0,
+            candidate_probe: None,
+            changed_files: None,
+            range_widened: Vec::new(),
+            matched_values: Self::resolve_matched_value,
         }
+    }
+
+    /// Resolve matched values from file-local observations, as the
+    /// composition's frontier does (spec M4.2).
+    fn with_file_local_matched_values(mut self) -> Self {
+        self.matched_values = Self::resolve_frontier_matched_value;
+        self
+    }
+
+    /// Bind sinks only in `files` (spec M4.1), or every sink when `None`.
+    pub(crate) fn with_changed_files(mut self, files: Option<&'a [ProjectFile]>) -> Self {
+        self.changed_files = files;
+        self
     }
 
     pub(crate) fn with_active_semantic_model_snapshot(
@@ -1679,30 +2777,107 @@ impl<'a> TaintPolicyCompiler<'a> {
                 .expect("bounded store-key metrics fit the taint work report");
         }
         match compiled {
-            Ok(compiled) => Ok(TaintPolicyCompilation::Plans {
+            Ok(CompiledPolicy::Plans(compiled)) => Ok(TaintPolicyCompilation::Plans {
                 roots: compiled,
                 work,
                 refusals: refusal_messages(&self.refused_sites),
                 authored_selector_summary: self.authored_selector_summary,
                 incomplete_selectors: self.selectors.take_incomplete_taint_selectors(),
+                skipped_region_roots: self.skipped_region_roots,
             }),
+            Ok(CompiledPolicy::NoSinkInRange { engine, scope }) => {
+                Ok(TaintPolicyCompilation::Clean {
+                    work,
+                    refusals: refusal_messages(&self.refused_sites),
+                    // No endpoint set is empty: the sources bound, and the
+                    // sinks bound nothing in the range, which claims nothing.
+                    empty_endpoints: EmptyEndpointSets {
+                        sources: false,
+                        sinks: false,
+                        source_filtered_by_threat_model: false,
+                    },
+                    incomplete_selectors: self.selectors.take_incomplete_taint_selectors(),
+                    engine: Some(engine),
+                    scope: Some(scope),
+                })
+            }
             Err(TaintPolicyCompileError::EmptyCompiledEndpoints(empty_endpoints)) => {
                 Ok(TaintPolicyCompilation::Clean {
                     work,
                     refusals: refusal_messages(&self.refused_sites),
                     empty_endpoints,
                     incomplete_selectors: self.selectors.take_incomplete_taint_selectors(),
+                    engine: None,
+                    scope: None,
                 })
             }
             Err(error) => Err(Box::new(TaintPolicyCompileFailure { error, work })),
         }
     }
 
+    /// Bind every sink selector of `spec`, in the changed files `range` when it
+    /// is given, or in the whole workspace when it is `None` (spec M4.1). A
+    /// selector whose query cannot be sliced to the files binds the whole
+    /// workspace, and its sinks are then kept only where they lie in the files,
+    /// so the range holds either way; the reason is recorded for the run.
+    fn bind_sinks(
+        &mut self,
+        spec: &ResolvedTaintPolicySpec,
+        selectors: &HashMap<&PolicySelectorPath, &ResolvedPolicySelector>,
+        range: Option<&[ProjectFile]>,
+    ) -> Result<Vec<BoundEndpoint>, TaintPolicyCompileError> {
+        let mut sinks = Vec::new();
+        for sink in &spec.sinks {
+            let selector = required_selector(selectors, &sink.definition.selector_path)?;
+            let port = &sink.definition.dangerous_operand;
+            let selected = match range {
+                None => self.select(selector, port)?,
+                Some(files) => {
+                    let (selected, widened) = self
+                        .selectors
+                        .select_taint_sliced(selector, files)
+                        .map_err(taint_selector_error)?;
+                    if let Some(reason) = widened {
+                        self.range_widened.push(format!(
+                            "sink selector `{}` bound the whole workspace: {}",
+                            selector.path,
+                            reason.stable_label()
+                        ));
+                    }
+                    selected
+                }
+            };
+            for selected in selected {
+                for resolved in self.resolve_selected_values(selected, selector, port)? {
+                    sinks.push(BoundEndpoint {
+                        endpoint: sink.identity.clone(),
+                        kind: resolved.kind,
+                        dispatch_obligations: resolved.dispatch_obligations,
+                        point: resolved.point,
+                        phase: resolved.phase,
+                        carrier: resolved.carrier,
+                        proof: resolved.proof,
+                        completeness: resolved.completeness,
+                        labels: sink.definition.accepts.clone().into_boxed_slice(),
+                        unjudged: None,
+                    });
+                }
+            }
+        }
+        if let Some(files) = range {
+            let changed = files.iter().map(rel_path_string).collect::<HashSet<_>>();
+            sinks.retain(|sink| {
+                changed.contains(sink.point.procedure().artifact().key().path().as_str())
+            });
+        }
+        Ok(sinks)
+    }
+
     fn compile_inner(
         &mut self,
         policy: &LoadedPolicy,
         spec: &ResolvedTaintPolicySpec,
-    ) -> Result<Vec<CompiledTaintPolicyPlan>, TaintPolicyCompileError> {
+    ) -> Result<CompiledPolicy, TaintPolicyCompileError> {
         validate_external_model_entries(&spec.external_models)?;
 
         let selectors = policy
@@ -1711,43 +2886,59 @@ impl<'a> TaintPolicyCompiler<'a> {
             .map(|selector| (&selector.path, selector))
             .collect::<HashMap<_, _>>();
         let mut all_sources = Vec::new();
-        let mut all_sinks = Vec::new();
-
-        for source in &spec.sources {
-            let selector = required_selector(&selectors, &source.definition.selector_path)?;
-            for selected in self.select(selector, &source.definition.bind)? {
-                for resolved in
-                    self.resolve_selected_values(selected, selector, &source.definition.bind)?
-                {
-                    all_sources.push(BoundEndpoint {
-                        endpoint: source.identity.clone(),
-                        point: resolved.point,
-                        phase: resolved.phase,
-                        carrier: resolved.carrier,
-                        proof: resolved.proof,
-                        completeness: resolved.completeness,
-                        labels: source.definition.labels.clone().into_boxed_slice(),
+        // A changed-range run binds sinks in the changed files only (spec M4.1).
+        let mut all_sinks = self.bind_sinks(spec, &selectors, self.changed_files)?;
+        // Spec M3.0 and M4.2: the engine is one rule over the specification
+        // and the bound sinks, decided before discovery and any solve, and
+        // before any source, sanitizer or transform is bound. The composition
+        // engine matches those on the frontier (`FrontierEndpointBinder`); the
+        // ICFG engine binds them here.
+        let engine = {
+            let _timing = brokk_bifrost_analysis::profiling::scope("taint.compose.select");
+            select_taint_engine(
+                self.selectors.workspace(),
+                spec,
+                &all_sinks,
+                self.candidate_probe.is_some(),
+            )?
+        };
+        // Spec M4.1: a changed-range run is answered by the composition over
+        // the sinks in its files. The ICFG engine binds every endpoint, so an
+        // ICFG answer rebinds the sinks whole and reports that the range did
+        // not narrow it. The rule gives `no-sinks` only after the store, entry
+        // point, language and row checks passed, so an empty range with that
+        // reason is a composition answer with no region to search. Both are
+        // decided before any source is bound, so an empty range binds none.
+        let mut scope = None;
+        if let Some(files) = self.changed_files {
+            let no_sinks_in_range = all_sinks.is_empty()
+                && match &engine {
+                    TaintEngine::Composition => true,
+                    TaintEngine::Icfg { reason } => reason.as_ref() == NO_SINKS_REASON,
+                };
+            match &engine {
+                _ if no_sinks_in_range => {
+                    return Ok(CompiledPolicy::NoSinkInRange {
+                        engine: TaintEngine::Composition,
+                        scope: changed_range_scope(files, std::mem::take(&mut self.range_widened)),
                     });
                 }
-            }
-        }
-        for sink in &spec.sinks {
-            let selector = required_selector(&selectors, &sink.definition.selector_path)?;
-            for selected in self.select(selector, &sink.definition.dangerous_operand)? {
-                for resolved in self.resolve_selected_values(
-                    selected,
-                    selector,
-                    &sink.definition.dangerous_operand,
-                )? {
-                    all_sinks.push(BoundEndpoint {
-                        endpoint: sink.identity.clone(),
-                        point: resolved.point,
-                        phase: resolved.phase,
-                        carrier: resolved.carrier,
-                        proof: resolved.proof,
-                        completeness: resolved.completeness,
-                        labels: sink.definition.accepts.clone().into_boxed_slice(),
-                    });
+                TaintEngine::Composition => {
+                    scope = Some(changed_range_scope(
+                        files,
+                        std::mem::take(&mut self.range_widened),
+                    ));
+                }
+                TaintEngine::Icfg { reason } => {
+                    scope = Some(PolicyRunScope::workspace(vec![format!(
+                        "engine icfg ({reason}) binds every endpoint; the changed range did not narrow it"
+                    )]));
+                    // The sinks are the first endpoints bound, so the sliced
+                    // pass's refusals and notes are all there are.
+                    self.refused_sites.clear();
+                    self.selectors.truncate_incomplete_taint_selectors(0);
+                    self.range_widened.clear();
+                    all_sinks = self.bind_sinks(spec, &selectors, None)?;
                 }
             }
         }
@@ -1759,71 +2950,36 @@ impl<'a> TaintPolicyCompiler<'a> {
         // the input prevents a sanitizer from becoming an unconditional kill
         // of a same-named call's result.
         let mut all_kills = Vec::new();
-        for sanitizer in &spec.sanitizers {
-            let selector = required_selector(&selectors, &sanitizer.selector_path)?;
-            for selected in self.select(selector, &sanitizer.definition.output)? {
-                for resolved in self.resolve_selected_transfer_values(
-                    selected,
-                    selector,
-                    &sanitizer.definition.input,
-                    &sanitizer.definition.output,
-                )? {
-                    let labels = sanitizer.definition.removes.clone().into_boxed_slice();
-                    all_kills.push(BoundSanitizer {
-                        input: BoundEndpoint {
-                            endpoint: sanitizer.identity.clone(),
-                            point: resolved.input.point,
-                            phase: resolved.input.phase,
-                            carrier: resolved.input.carrier,
-                            proof: resolved.input.proof,
-                            completeness: resolved.input.completeness,
-                            labels: labels.clone(),
-                        },
-                        output: BoundEndpoint {
-                            endpoint: sanitizer.identity.clone(),
-                            point: resolved.output.point,
-                            phase: resolved.output.phase,
-                            carrier: resolved.output.carrier,
-                            proof: resolved.output.proof,
-                            completeness: resolved.output.completeness,
-                            labels,
-                        },
-                    });
+        let mut all_transforms = Vec::new();
+        if engine != TaintEngine::Composition {
+            // Sinks were bound first to decide the engine. Their refusals and
+            // incomplete selectors are reported after the sources', in the
+            // order binding has always reported them.
+            let sink_refusals = std::mem::take(&mut self.refused_sites);
+            let sink_incomplete = self.selectors.take_incomplete_taint_selectors();
+            for source in spec
+                .sources
+                .iter()
+                .filter(|source| threat_model_source_is_active(source, &spec.threat_models))
+            {
+                let selector = required_selector(&selectors, &source.definition.selector_path)?;
+                for selected in self.select(selector, &source.definition.bind)? {
+                    all_sources.extend(self.bind_source(source, selector, selected)?);
                 }
             }
-        }
-        let mut all_transforms = Vec::new();
-        for transform in &spec.transforms {
-            let selector = required_selector(&selectors, &transform.selector_path)?;
-            for selected in self.select(selector, &transform.definition.output)? {
-                for resolved in self.resolve_selected_transfer_values(
-                    selected,
-                    selector,
-                    &transform.definition.input,
-                    &transform.definition.output,
-                )? {
-                    all_transforms.push(BoundTransform {
-                        input: BoundEndpoint {
-                            endpoint: transform.identity.clone(),
-                            point: resolved.input.point,
-                            phase: resolved.input.phase,
-                            carrier: resolved.input.carrier,
-                            proof: resolved.input.proof,
-                            completeness: resolved.input.completeness,
-                            labels: Box::default(),
-                        },
-                        output: BoundEndpoint {
-                            endpoint: transform.identity.clone(),
-                            point: resolved.output.point,
-                            phase: resolved.output.phase,
-                            carrier: resolved.output.carrier,
-                            proof: resolved.output.proof,
-                            completeness: resolved.output.completeness,
-                            labels: Box::default(),
-                        },
-                        removes: transform.definition.removes.clone().into_boxed_slice(),
-                        adds: transform.definition.adds.clone().into_boxed_slice(),
-                    });
+            self.refused_sites.extend(sink_refusals);
+            self.selectors
+                .extend_incomplete_taint_selectors(sink_incomplete);
+            for sanitizer in &spec.sanitizers {
+                let selector = required_selector(&selectors, &sanitizer.selector_path)?;
+                for selected in self.select(selector, &sanitizer.definition.output)? {
+                    all_kills.extend(self.bind_sanitizer(sanitizer, selector, selected)?);
+                }
+            }
+            for transform in &spec.transforms {
+                let selector = required_selector(&selectors, &transform.selector_path)?;
+                for selected in self.select(selector, &transform.definition.output)? {
+                    all_transforms.extend(self.bind_transform(transform, selector, selected)?);
                 }
             }
         }
@@ -1873,12 +3029,15 @@ impl<'a> TaintPolicyCompiler<'a> {
                     }
                     all_sources.push(BoundEndpoint {
                         endpoint: entry_point.identity.clone(),
+                        kind: resolved.kind,
+                        dispatch_obligations: resolved.dispatch_obligations,
                         point: resolved.point,
                         phase: resolved.phase,
                         carrier: resolved.carrier,
                         proof: resolved.proof,
                         completeness: resolved.completeness,
                         labels: entry_point.definition.labels.clone().into_boxed_slice(),
+                        unjudged: None,
                     });
                 }
             }
@@ -1921,12 +3080,15 @@ impl<'a> TaintPolicyCompiler<'a> {
                     all_store_writes.push(BoundStoreEnd {
                         endpoint: BoundEndpoint {
                             endpoint: write.identity.clone(),
+                            kind: resolved.kind,
+                            dispatch_obligations: resolved.dispatch_obligations,
                             point: resolved.point,
                             phase: resolved.phase,
                             carrier: resolved.carrier,
                             proof: resolved.proof,
                             completeness: resolved.completeness,
                             labels: Box::default(),
+                            unjudged: None,
                         },
                         channel,
                         call,
@@ -1960,12 +3122,15 @@ impl<'a> TaintPolicyCompiler<'a> {
                     all_store_reads.push(BoundStoreEnd {
                         endpoint: BoundEndpoint {
                             endpoint: read.identity.clone(),
+                            kind: resolved.kind,
+                            dispatch_obligations: resolved.dispatch_obligations,
                             point: resolved.point,
                             phase: resolved.phase,
                             carrier: resolved.carrier,
                             proof: resolved.proof,
                             completeness: resolved.completeness,
                             labels: Box::default(),
+                            unjudged: None,
                         },
                         channel,
                         call,
@@ -1981,12 +3146,33 @@ impl<'a> TaintPolicyCompiler<'a> {
             sources: all_sources.len(),
             sinks: all_sinks.len(),
         };
+        if let Some(probe) = self.candidate_probe.as_deref_mut() {
+            probe.record(&all_sources, &all_sinks)?;
+        }
         // Both sets are tested before returning, so a policy whose source and
         // sink selectors both match nothing reports both rather than only the
         // first one the compiler happened to reach (#2659).
+        // The composition matches sources on the frontier, so only a policy
+        // with no active source definition is known to bind none.
         let empty = EmptyEndpointSets {
-            sources: all_sources.is_empty(),
-            sinks: all_sinks.is_empty(),
+            sources: match engine {
+                TaintEngine::Composition => !spec
+                    .sources
+                    .iter()
+                    .any(|source| threat_model_source_is_active(source, &spec.threat_models)),
+                TaintEngine::Icfg { .. } => all_sources.is_empty(),
+            },
+            // A composed changed-range run's sinks are the ones in its files,
+            // so an empty set there is an answer about that range, not an
+            // empty selection. An ICFG answer rebound its sinks whole.
+            sinks: all_sinks.is_empty()
+                && (self.changed_files.is_none() || engine != TaintEngine::Composition),
+            source_filtered_by_threat_model: !spec.threat_models.is_empty()
+                && !spec.sources.is_empty()
+                && spec
+                    .sources
+                    .iter()
+                    .all(|source| !threat_model_source_is_active(source, &spec.threat_models)),
         };
         if empty.any() {
             return Err(TaintPolicyCompileError::EmptyCompiledEndpoints(empty));
@@ -1995,6 +3181,7 @@ impl<'a> TaintPolicyCompiler<'a> {
         let mut stable_classes = spec
             .sources
             .iter()
+            .filter(|source| threat_model_source_is_active(source, &spec.threat_models))
             .flat_map(|source| source.definition.labels.iter())
             .chain(
                 spec.sinks
@@ -2042,6 +3229,11 @@ impl<'a> TaintPolicyCompiler<'a> {
         stable_classes.dedup();
         let universe = TaintUniverse::new(stable_classes)
             .map_err(|error| TaintPolicyCompileError::Model(error.to_string()))?;
+        // A composed policy discovers no region (spec M3.1): its search
+        // starts at the bound sinks and reaches everything else on demand.
+        if engine == TaintEngine::Composition {
+            return self.composed_plans(policy, spec, all_sinks, all_models, &universe, scope);
+        }
 
         let mut roots = all_sources
             .iter()
@@ -2123,6 +3315,7 @@ impl<'a> TaintPolicyCompiler<'a> {
                     // one oversized root -- typically a high call-graph entry
                     // whose closure spans the workspace -- no longer aborts the
                     // whole compile and drops every later region (#1936).
+                    self.skipped_region_roots = self.skipped_region_roots.saturating_add(1);
                 }
                 Err(error) => return Err(error),
             }
@@ -2212,15 +3405,10 @@ impl<'a> TaintPolicyCompiler<'a> {
                 establishes && consumes
             });
         if covering_discoveries.is_empty()
+            && let Some(first_source) = source_procedures.first()
             && let Some(mut discovery) = disconnected_discoveries
                 .iter()
-                .position(|discovery| {
-                    discovery.procedures.contains(
-                        source_procedures
-                            .first()
-                            .expect("the source set is non-empty"),
-                    )
-                })
+                .position(|discovery| discovery.procedures.contains(first_source))
                 .map(|index| disconnected_discoveries.swap_remove(index))
         {
             // The selectors bound real endpoints, but no discovered call region
@@ -2325,7 +3513,7 @@ impl<'a> TaintPolicyCompiler<'a> {
             // carrier. Their event ordinals continue after the policy
             // endpoints' so every key stays unique, and every later binding
             // is matched by event key rather than by list position.
-            let mut source_specs = keyed_source_event_specs(&sources, 0)?;
+            let policy_source_specs = keyed_source_event_specs(&sources, 0)?;
             let read_specs = keyed_source_event_specs(
                 &store_reads
                     .iter()
@@ -2333,7 +3521,25 @@ impl<'a> TaintPolicyCompiler<'a> {
                     .collect::<Vec<_>>(),
                 sources.len(),
             )?;
+            // The value-flow carrier universe is assembled from snapshots,
+            // call bindings, and endpoint observations. A sanitizer can name
+            // an external call's receiver even when its binding payload only
+            // publishes the ordinary argument and return carriers. Register
+            // both sanitizer ports as auxiliary source observations so their
+            // carriers are available to the sanitizer binding; they are kept
+            // out of `bind_taint_sources` and therefore never become taint
+            // origins.
+            let sanitizer_carriers = kills
+                .iter()
+                .flat_map(|sanitizer| [sanitizer.input.clone(), sanitizer.output.clone()])
+                .collect::<Vec<_>>();
+            let sanitizer_specs = keyed_source_event_specs(
+                &sanitizer_carriers,
+                sources.len().saturating_add(store_reads.len()),
+            )?;
+            let mut source_specs = policy_source_specs.clone();
             source_specs.extend(read_specs.iter().cloned());
+            source_specs.extend(sanitizer_specs.iter().cloned());
             let mut sink_specs = keyed_sink_event_specs(&sinks, 0)?;
             let write_specs = keyed_sink_event_specs(
                 &store_writes
@@ -2343,13 +3549,19 @@ impl<'a> TaintPolicyCompiler<'a> {
                 sinks.len(),
             )?;
             sink_specs.extend(write_specs.iter().cloned());
-            let value_flow = self.build_value_flow_plan(
+            let rust_format_result_calls = discovery.rust_format_result_calls.clone();
+            let (value_flow, call_resolution_discovery) = self.build_value_flow_plan(
                 discovery,
                 source_specs.iter().map(|(_, spec)| spec.clone()).collect(),
                 sink_specs.iter().map(|(_, spec)| spec.clone()).collect(),
                 spec.call_modeling.unmodeled,
             )?;
-            let value_flow = self.install_bound_external_models(value_flow, &models, &universe)?;
+            let value_flow = self.install_bound_external_models(
+                value_flow,
+                &models,
+                &universe,
+                &rust_format_result_calls,
+            )?;
             // A store declaration models its selected call outright: nothing
             // flows through the call directly, taint crosses only via the
             // declared boundary. The empty-transfer curated model is what
@@ -2378,6 +3590,7 @@ impl<'a> TaintPolicyCompiler<'a> {
                     )
                     .map_err(|error| TaintPolicyCompileError::Plan(error.to_string()))?
             };
+            let value_flow = self.install_rust_std_builtin_models(value_flow)?;
             let local_rules = transforms
                 .iter()
                 .map(|transform| {
@@ -2396,12 +3609,8 @@ impl<'a> TaintPolicyCompiler<'a> {
             let value_flow = value_flow
                 .with_local_rules(local_rules)
                 .map_err(|error| TaintPolicyCompileError::Plan(error.to_string()))?;
-            let taint_sources = bind_taint_sources(
-                &value_flow,
-                &universe,
-                &sources,
-                &source_specs[..sources.len()],
-            )?;
+            let taint_sources =
+                bind_taint_sources(&value_flow, &universe, &sources, &policy_source_specs)?;
             let taint_sinks =
                 bind_taint_sinks(&value_flow, &universe, &sinks, &sink_specs[..sinks.len()])?;
             let taint_sanitizers = bind_taint_sanitizers(&value_flow, &universe, &kills)?;
@@ -2428,6 +3637,21 @@ impl<'a> TaintPolicyCompiler<'a> {
             .and_then(|analysis| analysis.with_local_transforms(taint_local_transforms))
             .and_then(|analysis| analysis.with_stores(store_write_bindings, store_read_bindings))
             .map_err(|error| TaintPolicyCompileError::Plan(error.to_string()))?;
+            let call_resolution_evidence = match analysis.value_flow().first_incomplete_cause() {
+                Some(ValueFlowIncompleteCause::CallResolution { call, status }) => {
+                    if is_rust_taint_call(call) {
+                        Some(taint_call_resolution_evidence(
+                            self.selectors.workspace(),
+                            call,
+                            *status,
+                            &call_resolution_discovery,
+                        )?)
+                    } else {
+                        None
+                    }
+                }
+                _ => None,
+            };
             let internal_policy_id = format!(
                 "{}#root-{root_index}",
                 policy.definition().metadata.id.as_str()
@@ -2490,10 +3714,21 @@ impl<'a> TaintPolicyCompiler<'a> {
             compiled.push(CompiledTaintPolicyPlan {
                 internal_policy_id,
                 plan,
+                engine: engine.clone(),
+                scope: scope.clone(),
                 sources: source_metadata.into_boxed_slice(),
                 sinks: sink_metadata.into_boxed_slice(),
                 store_writes: store_write_metadata.into_boxed_slice(),
                 store_reads: store_read_metadata.into_boxed_slice(),
+                call_resolution_evidence,
+                kills: kills
+                    .into_iter()
+                    .map(|kill| CompiledTaintKill {
+                        endpoint: kill.input.endpoint,
+                        point: kill.input.point,
+                    })
+                    .collect(),
+                external_models: Arc::default(),
             });
         }
         if compiled.is_empty() {
@@ -2501,7 +3736,111 @@ impl<'a> TaintPolicyCompiler<'a> {
                 "no analysis root contains both a selected source and sink".to_owned(),
             ));
         }
-        Ok(compiled)
+        Ok(CompiledPolicy::Plans(compiled))
+    }
+
+    /// The plans of a composed policy (spec M3.1, M4.0), built from the
+    /// specification and the bound sinks with no region discovered. Sources,
+    /// sanitizers and transforms are matched on the frontier, and every
+    /// call's models are answered at the call by the composition's provider,
+    /// so a plan holds the sinks, the label universe and the unmodeled-call
+    /// behavior, and carries the policy's bound external models beside it.
+    ///
+    /// A refused selector row bound no endpoint, so it costs only its own
+    /// site: the refusal leaves the run incomplete, and every other sink, in
+    /// the refused row's procedure or not, is composed. The ICFG engine drops
+    /// the whole region instead (#2308), because a region's solve would read
+    /// as clean over the site it never saw.
+    ///
+    /// One plan observes every sink up to the value-flow plan's sink limit, so
+    /// one batch and one provider serve them all; a plan has one root, which
+    /// is the first sink's procedure and names the batch.
+    fn composed_plans(
+        &self,
+        policy: &LoadedPolicy,
+        spec: &ResolvedTaintPolicySpec,
+        mut sinks: Vec<BoundEndpoint>,
+        models: Vec<BoundExternalModel>,
+        universe: &TaintUniverse,
+        scope: Option<PolicyRunScope>,
+    ) -> Result<CompiledPolicy, TaintPolicyCompileError> {
+        assert!(
+            !sinks.is_empty(),
+            "the engine rule composes only a policy with bound sinks"
+        );
+        sort_bound_endpoints(&mut sinks);
+        let models: Arc<[BoundExternalModel]> = models.into();
+        let behavior = spec.call_modeling.unmodeled;
+        let plan_error =
+            |error: &dyn fmt::Display| TaintPolicyCompileError::Plan(error.to_string());
+        // A composed plan matches its own policy's sources, sanitizers and
+        // transforms on the frontier (spec M4.2), so its batch must hold that
+        // policy alone.
+        let auxiliary_hash = {
+            let mut hasher = DefaultHasher::new();
+            hasher.write(b"bifrost-composed-policy-compatibility-v1");
+            hasher.write(policy.definition().metadata.id.as_str().as_bytes());
+            hasher.finish()
+        };
+        let mut compiled = Vec::new();
+        for (root_index, sinks) in sinks
+            .chunks(ValueFlowPlanLimits::default().max_sinks())
+            .enumerate()
+        {
+            let root = sinks[0].point.procedure().clone();
+            let sink_specs = keyed_sink_event_specs(sinks, 0)?;
+            let value_flow = ValueFlowPlan::with_call_behavior(
+                root.clone(),
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                sink_specs.iter().map(|(_, spec)| spec.clone()).collect(),
+                behavior,
+            )
+            .map_err(|error| plan_error(&error))?;
+            let taint_sinks = bind_taint_sinks(&value_flow, universe, sinks, &sink_specs)?;
+            let store_hash = store_compatibility_hash(&value_flow, &[], &[]);
+            let analysis = TaintAnalysisPlan::new(
+                value_flow,
+                universe.clone(),
+                Vec::new(),
+                taint_sinks,
+                Vec::new(),
+                Vec::new(),
+            )
+            .map_err(|error| plan_error(&error))?;
+            let internal_policy_id = format!(
+                "{}#root-{root_index}",
+                policy.definition().metadata.id.as_str()
+            );
+            let compatibility = TaintBatchCompatibilityKey::with_call_behavior(
+                TaintPropagationSemanticsId::new(
+                    &root.artifact().key().fingerprint(),
+                    root.semantics().locator(),
+                    value_flow_compatibility_hash(analysis.value_flow()),
+                    auxiliary_hash,
+                    store_hash,
+                ),
+                behavior,
+                universe.hash(),
+            );
+            let plan = TaintPolicyPlan::new(internal_policy_id.clone(), compatibility, analysis)
+                .map_err(|error| plan_error(&error))?;
+            compiled.push(CompiledTaintPolicyPlan {
+                internal_policy_id,
+                plan,
+                engine: TaintEngine::Composition,
+                scope: scope.clone(),
+                sources: Box::default(),
+                sinks: endpoint_metadata(sinks, &sink_specs).into_boxed_slice(),
+                store_writes: Box::default(),
+                store_reads: Box::default(),
+                call_resolution_evidence: None,
+                kills: Box::default(),
+                external_models: Arc::clone(&models),
+            });
+        }
+        Ok(CompiledPolicy::Plans(compiled))
     }
 
     fn select(
@@ -2512,6 +3851,122 @@ impl<'a> TaintPolicyCompiler<'a> {
         self.selectors
             .select_taint(selector)
             .map_err(taint_selector_error)
+    }
+
+    /// The source endpoints one selected row of `source` binds.
+    fn bind_source(
+        &mut self,
+        source: &ResolvedTaintEndpoint<ResolvedTaintSourceDefinition>,
+        selector: &ResolvedPolicySelector,
+        selected: SelectedSite,
+    ) -> Result<Vec<BoundEndpoint>, TaintPolicyCompileError> {
+        Ok(self
+            .resolve_selected_values(selected, selector, &source.definition.bind)?
+            .into_iter()
+            .map(|resolved| BoundEndpoint {
+                endpoint: source.identity.clone(),
+                kind: resolved.kind,
+                dispatch_obligations: resolved.dispatch_obligations,
+                point: resolved.point,
+                phase: resolved.phase,
+                carrier: resolved.carrier,
+                proof: resolved.proof,
+                completeness: resolved.completeness,
+                labels: source.definition.labels.clone().into_boxed_slice(),
+                unjudged: resolved.unjudged,
+            })
+            .collect())
+    }
+
+    /// The sanitizers one selected row of `sanitizer` binds.
+    fn bind_sanitizer(
+        &mut self,
+        sanitizer: &ResolvedTaintAuxiliary<ResolvedTaintSanitizerDefinition>,
+        selector: &ResolvedPolicySelector,
+        selected: SelectedSite,
+    ) -> Result<Vec<BoundSanitizer>, TaintPolicyCompileError> {
+        let labels = sanitizer.definition.removes.clone().into_boxed_slice();
+        Ok(self
+            .resolve_selected_sanitizer_values(
+                selected,
+                selector,
+                &sanitizer.definition.input,
+                &sanitizer.definition.output,
+            )?
+            .into_iter()
+            .map(|resolved| BoundSanitizer {
+                input: BoundEndpoint {
+                    endpoint: sanitizer.identity.clone(),
+                    kind: resolved.input.kind,
+                    dispatch_obligations: resolved.input.dispatch_obligations,
+                    point: resolved.input.point,
+                    phase: resolved.input.phase,
+                    carrier: resolved.input.carrier,
+                    proof: resolved.input.proof,
+                    completeness: resolved.input.completeness,
+                    labels: labels.clone(),
+                    unjudged: None,
+                },
+                output: BoundEndpoint {
+                    endpoint: sanitizer.identity.clone(),
+                    kind: resolved.output.kind,
+                    dispatch_obligations: resolved.output.dispatch_obligations,
+                    point: resolved.output.point,
+                    phase: resolved.output.phase,
+                    carrier: resolved.output.carrier,
+                    proof: resolved.output.proof,
+                    completeness: resolved.output.completeness,
+                    labels: labels.clone(),
+                    unjudged: None,
+                },
+            })
+            .collect())
+    }
+
+    /// The transforms one selected row of `transform` binds.
+    fn bind_transform(
+        &mut self,
+        transform: &ResolvedTaintAuxiliary<ResolvedTaintTransformDefinition>,
+        selector: &ResolvedPolicySelector,
+        selected: SelectedSite,
+    ) -> Result<Vec<BoundTransform>, TaintPolicyCompileError> {
+        Ok(self
+            .resolve_selected_transfer_values(
+                selected,
+                selector,
+                &transform.definition.input,
+                &transform.definition.output,
+            )?
+            .into_iter()
+            .map(|resolved| BoundTransform {
+                input: BoundEndpoint {
+                    endpoint: transform.identity.clone(),
+                    kind: resolved.input.kind,
+                    dispatch_obligations: resolved.input.dispatch_obligations,
+                    point: resolved.input.point,
+                    phase: resolved.input.phase,
+                    carrier: resolved.input.carrier,
+                    proof: resolved.input.proof,
+                    completeness: resolved.input.completeness,
+                    labels: Box::default(),
+                    unjudged: None,
+                },
+                output: BoundEndpoint {
+                    endpoint: transform.identity.clone(),
+                    kind: resolved.output.kind,
+                    dispatch_obligations: resolved.output.dispatch_obligations,
+                    point: resolved.output.point,
+                    phase: resolved.output.phase,
+                    carrier: resolved.output.carrier,
+                    proof: resolved.output.proof,
+                    completeness: resolved.output.completeness,
+                    labels: Box::default(),
+                    unjudged: None,
+                },
+                removes: transform.definition.removes.clone().into_boxed_slice(),
+                adds: transform.definition.adds.clone().into_boxed_slice(),
+            })
+            .collect())
     }
 
     /// Materialize the selected row's file and bind it to the semantic call
@@ -2532,7 +3987,7 @@ impl<'a> TaintPolicyCompiler<'a> {
         if selection
             .call_binding
             .as_ref()
-            .is_some_and(|row| row.selector_proof == "authored_summary")
+            .is_some_and(|row| row.selector_provenance == "authored_summary")
         {
             selection
                 .call_binding
@@ -2611,7 +4066,7 @@ impl<'a> TaintPolicyCompiler<'a> {
             if selection
                 .call_binding
                 .as_ref()
-                .is_some_and(|row| row.selector_proof == "authored_summary")
+                .is_some_and(|row| row.selector_provenance == "authored_summary")
             {
                 selection
                     .call_binding
@@ -2620,15 +4075,60 @@ impl<'a> TaintPolicyCompiler<'a> {
                     .assert_valid_identity();
                 self.authored_selector_summary = true;
             }
-            return self.resolve_matched_value(selection);
+            return (self.matched_values)(self, selection);
         }
-        let Some(sites) = self.selected_semantic_calls(&selection)? else {
-            return Ok(Vec::new());
+        let sites = match self.selected_semantic_calls(&selection) {
+            Ok(Some(sites)) => sites,
+            Ok(None) => return Ok(Vec::new()),
+            Err(TaintPolicyCompileError::SemanticUnavailable(message))
+                if message == "selected row does not identify a semantic call site"
+                    && matches!(binding, PolicyPort::ReturnValue) =>
+            {
+                let call_site_error = TaintPolicyCompileError::SemanticUnavailable(message);
+                // A return-value binding on a non-call row is also the
+                // literal-source spelling. Promote it only when the semantic
+                // observation proves that every selected carrier is a literal;
+                // a non-literal row must retain its typed call-site gap rather
+                // than guessing which value or call it names.
+                let resolved = match (self.matched_values)(self, selection) {
+                    Ok(resolved) => resolved,
+                    Err(TaintPolicyCompileError::SemanticUnavailable(_)) => {
+                        return Err(call_site_error);
+                    }
+                    Err(error) => return Err(error),
+                };
+                if resolved.is_empty()
+                    || resolved
+                        .iter()
+                        .any(|value| value.kind != TaintEndpointKind::LiteralValue)
+                {
+                    return Err(call_site_error);
+                }
+                return Ok(resolved);
+            }
+            Err(error) => return Err(error),
         };
-        if matches!(binding, PolicyPort::Receiver) {
+        let receiver_sites = if matches!(binding, PolicyPort::Receiver) {
+            sites.clone()
+        } else if matches!(binding, PolicyPort::ArgumentIndex { index: 0 }) {
+            sites
+                .iter()
+                .filter(|(procedure, call)| {
+                    let call = procedure
+                        .semantics()
+                        .call_site(call.id())
+                        .expect("validated semantic call handle resolves");
+                    call.arguments.is_empty() && call.receiver.is_some()
+                })
+                .cloned()
+                .collect()
+        } else {
+            Vec::new()
+        };
+        if !receiver_sites.is_empty() {
             match self
                 .selectors
-                .receiver_binding_applicability(&sites)
+                .receiver_binding_applicability(&receiver_sites)
                 .map_err(taint_selector_error)?
             {
                 ReceiverBindingApplicability::Applicable => {}
@@ -2665,6 +4165,7 @@ impl<'a> TaintPolicyCompiler<'a> {
             // actual first, then bind exactly as an index port does, so every
             // port shares one carrier resolver (#2496).
             let named;
+            let receiver_port = PolicyPort::Receiver;
             let effective = match binding {
                 PolicyPort::ArgumentName { name } => {
                     if let Some(row) = selection.call_binding.as_ref() {
@@ -2708,6 +4209,29 @@ impl<'a> TaintPolicyCompiler<'a> {
                     }
                 }
                 PolicyPort::ArgumentIndex { index }
+                    if *index == 0
+                        && call
+                            .procedure()
+                            .semantics()
+                            .call_site(call.id())
+                            .expect("validated semantic call handle resolves")
+                            .arguments
+                            .is_empty()
+                        && call
+                            .procedure()
+                            .semantics()
+                            .call_site(call.id())
+                            .expect("validated semantic call handle resolves")
+                            .receiver
+                            .is_some() =>
+                {
+                    Some((
+                        &receiver_port,
+                        selection.proof.clone(),
+                        selection.completeness.clone(),
+                    ))
+                }
+                PolicyPort::ArgumentIndex { index }
                     if selection.call_binding.as_ref().is_some_and(|row| {
                         usize::try_from(*index).ok() != Some(row.formal_index)
                     }) =>
@@ -2744,9 +4268,36 @@ impl<'a> TaintPolicyCompiler<'a> {
             let Some((port, proof, completeness)) = effective else {
                 continue;
             };
-            let (value, point) = select_value(procedure, call, &selection.span, port)?;
+            let Some((value, point)) = select_value(procedure, call, &selection.span, port)? else {
+                // The selector matched a call that has no operand at this
+                // port. Refuse the site rather than guess its operand, as an
+                // ambiguous row is refused (#2308).
+                self.refused_sites.push(RefusedCallSite {
+                    file: selection.file.clone(),
+                    span: selection.span.clone(),
+                    reason: RefusalReason::MissingOperand {
+                        port: operand_port_label(port),
+                        arguments: procedure
+                            .semantics()
+                            .call_site(call.id())
+                            .expect("validated call handle resolves")
+                            .arguments
+                            .len(),
+                    },
+                    procedures: vec![procedure.durable_key()],
+                });
+                continue;
+            };
             resolved.push(ResolvedTaintValue {
                 call: Some(call.clone()),
+                dispatch_obligations: selection
+                    .call_binding
+                    .as_ref()
+                    .filter(|row| row.requires_dispatch())
+                    .map(|_| call.clone())
+                    .into_iter()
+                    .collect(),
+                kind: taint_endpoint_kind(procedure, call, port),
                 point,
                 // A call port is a carrier the selected point reads or
                 // receives, never one that point's own local effects
@@ -2754,19 +4305,20 @@ impl<'a> TaintPolicyCompiler<'a> {
                 // the operand's own point, and a return value is bound at
                 // the call's normal continuation.
                 phase: ValueFlowObservationPhase::BeforeEffects,
-                carrier: ValueFlowCarrier::Value(value),
+                carrier: ValueFlowCarrier::for_value(value),
                 proof: conjoin_proof(&selection.proof, &proof),
                 completeness: conjoin_completeness(&selection.completeness, &completeness),
+                unjudged: None,
             });
         }
         Ok(resolved)
     }
 
-    /// Resolve both ports from one selector row. The underlying call-site
-    /// selection is deterministic for a row, so equal cardinality is required
-    /// before pairing; a missing side is a refusal rather than a one-sided
-    /// sanitizer effect. Matched-value ports are point observations rather than
-    /// call ports and cannot establish this input/output relationship.
+    /// Resolve both ports from one selector row. The selector gives both
+    /// ports the same sites, so equal cardinality is required before pairing;
+    /// a missing side is a refusal rather than a one-sided sanitizer effect.
+    /// Matched-value ports are supported only as an in-place sanitizer on one
+    /// point-sensitive value observation.
     fn resolve_selected_transfer_values(
         &mut self,
         selection: SelectedSite,
@@ -2776,12 +4328,43 @@ impl<'a> TaintPolicyCompiler<'a> {
     ) -> Result<Vec<ResolvedTransferValues>, TaintPolicyCompileError> {
         if matches!(input, PolicyPort::MatchedValue) || matches!(output, PolicyPort::MatchedValue) {
             return Err(TaintPolicyCompileError::UnsupportedBinding(
-                "transform or sanitizer input and output must be call ports".to_owned(),
+                "transform input and output must be call ports".to_owned(),
             ));
         }
+        self.resolve_selected_sanitizer_values(selection, selector, input, output)
+    }
+
+    fn resolve_selected_sanitizer_values(
+        &mut self,
+        selection: SelectedSite,
+        selector: &ResolvedPolicySelector,
+        input: &PolicyPort,
+        output: &PolicyPort,
+    ) -> Result<Vec<ResolvedTransferValues>, TaintPolicyCompileError> {
+        let matched_value_transfer =
+            matches!(input, PolicyPort::MatchedValue) || matches!(output, PolicyPort::MatchedValue);
+        if matched_value_transfer
+            && !(matches!(input, PolicyPort::MatchedValue)
+                && matches!(output, PolicyPort::MatchedValue))
+        {
+            return Err(TaintPolicyCompileError::UnsupportedBinding(
+                "transform or sanitizer must use matched-value for both ports or call ports for both ports"
+                    .to_owned(),
+            ));
+        }
+        let refusals_before = self.refused_sites.len();
         let inputs = self.resolve_selected_values(selection.clone(), selector, input)?;
         let outputs = self.resolve_selected_values(selection, selector, output)?;
+        let operand_refused = self.refused_sites[refusals_before..]
+            .iter()
+            .any(|refusal| matches!(refusal.reason, RefusalReason::MissingOperand { .. }));
         if inputs.is_empty() || inputs.len() != outputs.len() {
+            // A port whose operand the call lacks was refused, and its
+            // partner port has nothing to pair with. The row is refused
+            // whole; without such a refusal, the mismatch is a binding fault.
+            if operand_refused {
+                return Ok(Vec::new());
+            }
             return Err(TaintPolicyCompileError::AmbiguousSemanticSite(
                 "transform or sanitizer input and output do not resolve to the same call sites"
                     .to_owned(),
@@ -2789,12 +4372,25 @@ impl<'a> TaintPolicyCompiler<'a> {
         }
         let mut resolved = Vec::with_capacity(inputs.len());
         for (input, output) in inputs.into_iter().zip(outputs) {
-            if input.call.as_ref().map(CallSiteHandle::durable_key)
-                != output.call.as_ref().map(CallSiteHandle::durable_key)
-            {
+            let same_site = if matched_value_transfer {
+                input.call.is_none()
+                    && output.call.is_none()
+                    && input.point == output.point
+                    && input.phase == output.phase
+                    && input.carrier == output.carrier
+            } else {
+                input.call.as_ref().map(CallSiteHandle::durable_key)
+                    == output.call.as_ref().map(CallSiteHandle::durable_key)
+            };
+            if !same_site {
                 return Err(TaintPolicyCompileError::AmbiguousSemanticSite(
-                    "transform or sanitizer input and output resolved different call sites"
-                        .to_owned(),
+                    if matched_value_transfer {
+                        "matched-value sanitizer input and output do not identify the same value observation"
+                            .to_owned()
+                    } else {
+                        "transform or sanitizer input and output resolved different call sites"
+                            .to_owned()
+                    },
                 ));
             }
             resolved.push(ResolvedTransferValues { input, output });
@@ -2847,10 +4443,10 @@ impl<'a> TaintPolicyCompiler<'a> {
         // The span parameter feeds only matched-value ports, which the port
         // check above excludes.
         match select_value(procedure, call, &(0..0), port) {
-            Ok((value, _point)) => Ok(Some(value)),
+            Ok(Some((value, _point))) => Ok(Some(value)),
             // A call without the named operand (fewer arguments, or no
             // receiver) leaves the dimension unproven; the join is sound.
-            Err(_) => Ok(None),
+            Ok(None) | Err(_) => Ok(None),
         }
     }
 
@@ -3361,7 +4957,7 @@ impl<'a> TaintPolicyCompiler<'a> {
                 .resolve_call(call, &mut request)
                 .map_err(|error| TaintPolicyCompileError::SemanticProvider(error.to_string()))?
         };
-        record_taint_dispatch_read(self.selectors.workspace(), call, &dispatch);
+        record_dispatch_read(self.selectors.workspace(), call, &dispatch);
         require_uninterrupted_outcome(&dispatch, "formal-name dispatch")?;
         self.selectors
             .require_execution_budget("formal-name dispatch")
@@ -3727,6 +5323,18 @@ impl<'a> TaintPolicyCompiler<'a> {
         if let Some(parameter) = selection.decorated_parameter.clone() {
             return self.resolve_decorated_parameter_value(selection, parameter);
         }
+        let dispatch_calls = if selection
+            .call_binding
+            .as_ref()
+            .is_some_and(|row| row.requires_dispatch())
+        {
+            let Some(sites) = self.selected_semantic_calls(&selection)? else {
+                return Ok(Vec::new());
+            };
+            sites.into_iter().map(|(_, call)| call).collect::<Vec<_>>()
+        } else {
+            Vec::new()
+        };
         let workspace = self.selectors.workspace();
         let oracle = WorkspaceSemanticOracle::with_dispatch_hints(
             workspace,
@@ -3762,11 +5370,17 @@ impl<'a> TaintPolicyCompiler<'a> {
         self.selectors
             .require_execution_budget("taint matched source binding")
             .map_err(taint_selector_error)?;
-        let result = outcome.available_value().ok_or_else(|| {
-            TaintPolicyCompileError::SemanticUnavailable(
+        let Some(result) = outcome.available_value() else {
+            if selection.occurrence_role
+                == Some(brokk_bifrost_analysis::analyzer::structural::OccurrenceRole::Binder)
+                && matches!(outcome, SemanticOutcome::Unknown { .. })
+            {
+                return Ok(Vec::new());
+            }
+            return Err(TaintPolicyCompileError::SemanticUnavailable(
                 "matched source row produced no point-sensitive value observation".to_owned(),
-            )
-        })?;
+            ));
+        };
         if let Some(observation) = result.observations().first() {
             self.selectors.remember_artifact(
                 selection.file.clone(),
@@ -3786,7 +5400,21 @@ impl<'a> TaintPolicyCompiler<'a> {
             }
             (endpoint.proof.clone(), endpoint.completeness.clone())
         });
-        let proof = if matches!(outcome, SemanticOutcome::Complete { .. }) {
+        // Python can expose complete source rows while keeping its whole
+        // points-to capability surface open. Rust has a narrower exception:
+        // exact dispatch can prove that a selected expression inside a built-in
+        // value macro is a runtime value despite an unrelated open snapshot.
+        let source_observation_complete = (matches!(outcome, SemanticOutcome::Complete { .. })
+            && result.coverage() == CandidateCoverage::Exhaustive)
+            || (brokk_bifrost_analysis::analyzer::common::language_for_file(&selection.file)
+                == brokk_bifrost_analysis::Language::Python
+                && matches!(outcome, SemanticOutcome::Unknown { .. })
+                && result.source_observations_complete())
+            || (brokk_bifrost_analysis::analyzer::common::language_for_file(&selection.file)
+                == brokk_bifrost_analysis::Language::Rust
+                && matches!(outcome, SemanticOutcome::Unknown { .. })
+                && result.runtime_value_macro_observation_complete());
+        let proof = if source_observation_complete {
             endpoint_quality.as_ref().map_or_else(
                 || selection.proof.clone(),
                 |(proof, _)| conjoin_proof(&selection.proof, proof),
@@ -3802,7 +5430,7 @@ impl<'a> TaintPolicyCompiler<'a> {
                     conjoin_proof(&proof, endpoint_proof)
                 })
         };
-        let completeness = if result.coverage() == CandidateCoverage::Exhaustive {
+        let completeness = if source_observation_complete {
             endpoint_quality.as_ref().map_or_else(
                 || selection.completeness.clone(),
                 |(_, endpoint_completeness)| {
@@ -3825,18 +5453,127 @@ impl<'a> TaintPolicyCompiler<'a> {
         Ok(result
             .observations()
             .iter()
-            .map(|observation| ResolvedTaintValue {
-                call: None,
-                point: observation.query().point().clone(),
-                // Keep the phase the oracle attached to the observation. A
-                // matched value is usually the one the point defines, so the
-                // observation holds after that point's effects; binding it
-                // before them lets the defining assignment's strong update
-                // kill the endpoint at its own site.
-                phase: value_flow_phase(observation.query().phase()),
-                carrier: ValueFlowCarrier::Value(observation.query().value().clone()),
-                proof: proof.clone(),
-                completeness: completeness.clone(),
+            .map(|observation| {
+                matched_value_endpoint(
+                    observation.query(),
+                    &dispatch_calls,
+                    proof.clone(),
+                    completeness.clone(),
+                )
+            })
+            .collect())
+    }
+
+    /// Resolve a matched value on the composition's frontier from the
+    /// file-local value observations at the selected range (spec M4.2).
+    ///
+    /// The up-front path, [`Self::resolve_matched_value`], asks for the
+    /// points-to set of every observation and keeps only the observations
+    /// that have one; for a value traced to a formal that means every caller
+    /// of the procedure, then theirs. The composition never reads that set:
+    /// a frontier endpoint is the value or parameter port at its point, and
+    /// its quality comes from the path the search composes through it. So
+    /// this resolver asks no heap question and keeps every observation. Its
+    /// proof and completeness are those of the selected row and of the
+    /// projection itself (a truncated or incompletely materialized
+    /// projection is unproven and partial).
+    ///
+    /// Every value it resolves, a literal included, records its row in
+    /// `unjudged`. A source bound from it carries unknown evidence, and the
+    /// composition judges that evidence with the ICFG engine's own
+    /// resolution, [`Self::resolve_matched_value`], only for a source on a
+    /// reported path ([`FrontierEndpointBinder::source_evidence`]). A
+    /// matched-value sanitizer or transform keeps the proof and completeness
+    /// computed here: the search needs a sanitizer's proof to evaluate labels
+    /// along a path, so it cannot defer it.
+    fn resolve_frontier_matched_value(
+        &mut self,
+        selection: SelectedSite,
+    ) -> Result<Vec<ResolvedTaintValue>, TaintPolicyCompileError> {
+        if let Some(parameter) = selection.decorated_parameter.clone() {
+            return self.resolve_decorated_parameter_value(selection, parameter);
+        }
+        assert!(
+            selection.runtime_keyed_read.is_none() && !selection.runtime_keyed_read_row,
+            "a runtime keyed read is a JavaScript, TypeScript or Python row; the composition's frontier visits Rust procedures only"
+        );
+        let dispatch_calls = if selection
+            .call_binding
+            .as_ref()
+            .is_some_and(|row| row.requires_dispatch())
+        {
+            let Some(sites) = self.selected_semantic_calls(&selection)? else {
+                return Ok(Vec::new());
+            };
+            sites.into_iter().map(|(_, call)| call).collect::<Vec<_>>()
+        } else {
+            Vec::new()
+        };
+        let workspace = self.selectors.workspace();
+        let oracle = WorkspaceSemanticOracle::with_dispatch_hints(
+            workspace,
+            self.active_semantic_model_snapshot.clone(),
+            DispatchHints::empty(),
+        );
+        let outcome = {
+            let mut request = self.selectors.semantic_request();
+            oracle
+                .value_observations_at_source(
+                    &selection.file,
+                    super::selector_compiler::source_range(&selection.span),
+                    &mut request,
+                )
+                .map_err(|error| TaintPolicyCompileError::SemanticProvider(error.to_string()))?
+        };
+        require_uninterrupted_outcome(&outcome, "taint matched source binding")?;
+        self.selectors
+            .require_execution_budget("taint matched source binding")
+            .map_err(taint_selector_error)?;
+        let Some(observations) = outcome.available_value() else {
+            if selection.occurrence_role
+                == Some(brokk_bifrost_analysis::analyzer::structural::OccurrenceRole::Binder)
+                && matches!(outcome, SemanticOutcome::Unknown { .. })
+            {
+                return Ok(Vec::new());
+            }
+            return Err(TaintPolicyCompileError::SemanticUnavailable(
+                "matched source row produced no point-sensitive value observation".to_owned(),
+            ));
+        };
+        if let Some(observation) = observations.first() {
+            self.selectors.remember_artifact(
+                selection.file.clone(),
+                Arc::clone(observation.point().procedure().artifact()),
+            );
+        }
+        let (proof, completeness) = if matches!(outcome, SemanticOutcome::Complete { .. }) {
+            (selection.proof.clone(), selection.completeness.clone())
+        } else {
+            (
+                conjoin_proof(
+                    &selection.proof,
+                    &ProofStatus::Unproven("matched value observations are not proven".into()),
+                ),
+                conjoin_completeness(
+                    &selection.completeness,
+                    &EvidenceCompleteness::Partial(
+                        "matched value observations are incomplete".into(),
+                    ),
+                ),
+            )
+        };
+        let unjudged = Arc::new(selection);
+        Ok(observations
+            .iter()
+            .map(|observation| {
+                let mut value = matched_value_endpoint(
+                    observation,
+                    &dispatch_calls,
+                    proof.clone(),
+                    completeness.clone(),
+                );
+                value.unjudged = Some(Arc::clone(&unjudged));
+                value
             })
             .collect())
     }
@@ -3901,21 +5638,12 @@ impl<'a> TaintPolicyCompiler<'a> {
                 "decorated parameter value and retained procedure port disagree".to_owned(),
             ));
         }
-        let point = procedure
-            .point_handle(procedure.semantics().entry_point())
-            .expect("validated semantic procedure has its entry point");
-        Ok(vec![ResolvedTaintValue {
-            call: None,
-            point,
-            // A formal parameter is already available on entry, before the
-            // first local effects execute. Binding at this boundary phase
-            // lets the ordinary local value-flow rules carry it into the
-            // procedure body.
-            phase: ValueFlowObservationPhase::BeforeEffects,
-            carrier: ValueFlowCarrier::Port(port),
-            proof: selection.proof,
-            completeness: selection.completeness,
-        }])
+        Ok(vec![resolved_entry_parameter_value(
+            &procedure,
+            port,
+            selection.proof,
+            selection.completeness,
+        )])
     }
 
     /// Resolve one selected entry-point declaration row to its own procedure's
@@ -4055,34 +5783,27 @@ impl<'a> TaintPolicyCompiler<'a> {
                 "entry-point parameter {ordinal} has no matching procedure port on the selected declaration: {error}"
             ))
         })?;
-        let point = procedure
-            .point_handle(procedure.semantics().entry_point())
-            .expect("validated semantic procedure has its entry point");
-        Ok(vec![ResolvedTaintValue {
-            call: None,
-            point,
-            phase: ValueFlowObservationPhase::BeforeEffects,
-            carrier: ValueFlowCarrier::Port(port),
-            proof: selection.proof,
-            completeness: selection.completeness,
-        }])
+        Ok(vec![resolved_entry_parameter_value(
+            procedure,
+            port,
+            selection.proof,
+            selection.completeness,
+        )])
     }
 
     fn discover_value_flow(
         &mut self,
         root: &ProcedureHandle,
         modeled_calls: &HashSet<DurableCallSiteKey>,
-        cache: &DiscoveryMaterializationCache,
+        cache: &DiscoveryMaterializationCache<'a>,
     ) -> Result<DiscoveredValueFlow, TaintPolicyCompileError> {
         let workspace = self.selectors.workspace();
         let cancellation = self.selectors.cancellation();
-        let provider = PolicyDiscoveryProvider {
-            oracle: workspace.semantic_oracle_provider(),
-            execution_budget: self.selectors.execution_budget().clone(),
+        let provider = PolicyDiscoveryProvider::new(
+            workspace,
+            self.selectors.execution_budget().clone(),
             cache,
-            poison: RefCell::new(None),
-            returned_callables: RefCell::new(Vec::new()),
-        };
+        );
         // Anchor the returned root to the same compile-wide artifact instance
         // the provider uses for every procedure the shared walk touches.
         let root = provider.canonical_procedure(root);
@@ -4116,6 +5837,7 @@ impl<'a> TaintPolicyCompiler<'a> {
                 )
             })
             .collect();
+        let rust_format_result_calls = provider.take_rust_format_result_calls();
 
         let mut seen_external_targets = HashSet::new();
         let mut seen_unmaterialized_targets = HashSet::new();
@@ -4148,9 +5870,12 @@ impl<'a> TaintPolicyCompiler<'a> {
             snapshots: discovered.snapshots,
             bindings,
             returned_callables,
+            rust_format_result_calls,
             procedures,
             external_targets,
             unmaterialized_external_targets,
+            call_coverage: discovered.coverage.into_iter().collect(),
+            dispatch_boundaries: discovered.boundaries,
         })
     }
 
@@ -4160,31 +5885,61 @@ impl<'a> TaintPolicyCompiler<'a> {
         source_specs: Vec<ValueFlowSourceSpec>,
         sink_specs: Vec<ValueFlowSinkSpec>,
         call_behavior: brokk_bifrost_flow::dataflow::UnmodeledCallBehavior,
-    ) -> Result<ValueFlowPlan, TaintPolicyCompileError> {
+    ) -> Result<(ValueFlowPlan, CallResolutionDiscoveryEvidence), TaintPolicyCompileError> {
+        let DiscoveredValueFlow {
+            root,
+            snapshots,
+            bindings,
+            returned_callables,
+            external_targets,
+            unmaterialized_external_targets,
+            call_coverage,
+            dispatch_boundaries,
+            ..
+        } = discovery;
         let external_summaries = self.bind_external_summaries(
-            &discovery.external_targets,
-            &discovery.unmaterialized_external_targets,
-            discovery.root.artifact().key(),
+            &external_targets,
+            &unmaterialized_external_targets,
+            root.artifact().key(),
             call_behavior,
         )?;
-        let plan = ValueFlowPlan::with_call_behavior(
-            discovery.root,
-            discovery.snapshots,
-            discovery.bindings,
+        let edge_kills = automatic_comparison_guard_edge_kills(&snapshots, &source_specs);
+        let mut resolved_external_calls = exact_python_external_resolution_calls(
+            &call_coverage,
+            &dispatch_boundaries,
+            external_summaries.as_ref(),
+        );
+        resolved_external_calls.extend(exact_rust_builtin_macro_resolution_calls(
+            &call_coverage,
+            &dispatch_boundaries,
+        ));
+        let plan = ValueFlowPlan::with_call_behavior_and_edge_kills_and_resolved_external_calls(
+            root,
+            snapshots,
+            bindings,
             source_specs,
             sink_specs,
+            edge_kills,
             call_behavior,
+            resolved_external_calls,
         )
         .map_err(|error| TaintPolicyCompileError::Plan(error.to_string()))?;
         let plan = plan
-            .with_returned_callable_captures(discovery.returned_callables)
+            .with_returned_callable_captures(returned_callables)
             .map_err(|error| TaintPolicyCompileError::Plan(error.to_string()))?;
-        match external_summaries {
+        let plan = match external_summaries {
             Some(summaries) => plan
                 .with_external_summaries(summaries)
                 .map_err(|error| TaintPolicyCompileError::Plan(error.to_string())),
             None => Ok(plan),
-        }
+        }?;
+        Ok((
+            plan,
+            CallResolutionDiscoveryEvidence {
+                coverage: call_coverage,
+                boundaries: dispatch_boundaries,
+            },
+        ))
     }
 
     fn bind_external_summaries(
@@ -4333,13 +6088,28 @@ impl<'a> TaintPolicyCompiler<'a> {
                 let parameters = (0..summary.target.parameter_count)
                     .map(ExactProcedureSummaryParameter::new)
                     .collect();
-                bindings.push(ExactProcedureSummaryTargetBinding::new(
-                    summary.id.clone(),
-                    summary.target.clone(),
-                    target.artifact().clone(),
-                    target.procedure().clone(),
-                    ExactProcedureSummaryBoundary::new(receiver, parameters),
+                let matched = active.procedure_summaries_for(ProcedureSummaryTargetKey::new(
+                    &family.language,
+                    &summary.target.path,
+                    &summary.target.symbol,
+                    summary.target.has_receiver,
+                    summary.target.parameter_count,
                 ));
+                let [selected] = matched.records.as_slice() else {
+                    return Err(TaintPolicyCompileError::Model(
+                        "review provenance requires one exact activated summary".to_owned(),
+                    ));
+                };
+                bindings.push(
+                    ExactProcedureSummaryTargetBinding::new(
+                        summary.id.clone(),
+                        summary.target.clone(),
+                        target.artifact().clone(),
+                        target.procedure().clone(),
+                        ExactProcedureSummaryBoundary::new(receiver, parameters),
+                    )
+                    .with_activation_review(selected),
+                );
             }
             let set = bind_compiled_procedure_summaries(&summaries, bindings, compatibility)
                 .map_err(|error| TaintPolicyCompileError::Model(error.to_string()))?;
@@ -4447,7 +6217,6 @@ impl<'a> TaintPolicyCompiler<'a> {
                 let candidates = unmaterialized.iter().filter(|target| {
                     target.language().semantic_pack_label() == family.language
                         && target.has_receiver() == summary.target.has_receiver
-                        && summary.target.accepts_parameter_count(target.arity())
                         && owner == target.owner_fqn()
                         && member == target.member()
                 });
@@ -4467,8 +6236,13 @@ impl<'a> TaintPolicyCompiler<'a> {
                         applicable.push((target, binding));
                     }
                 }
-                applicable.sort_unstable_by(|left, right| left.0.cmp(right.0));
-                applicable.dedup_by(|left, right| left.0 == right.0);
+                // Calls with the same resolver-owned target locator share one
+                // semantic alias even when their argument value IDs differ.
+                applicable.sort_unstable_by(|left, right| {
+                    left.1.actual_locator().cmp(right.1.actual_locator())
+                });
+                applicable
+                    .dedup_by(|left, right| left.1.actual_locator() == right.1.actual_locator());
                 let Some((target, first_binding)) = applicable.first() else {
                     return Err(binding_error());
                 };
@@ -4487,13 +6261,16 @@ impl<'a> TaintPolicyCompiler<'a> {
                 .expect("validated external model id yields one internal procedure locator");
                 let summary_target = ExternalSummaryTarget::from_locator(&summary_locator)
                     .expect("internal external-summary identity is a procedure locator");
-                bindings.push(ExactProcedureSummaryTargetBinding::new(
-                    summary.id.clone(),
-                    summary.target.clone(),
-                    target.provenance_artifact_key(root_artifact),
-                    summary_locator,
-                    ExactProcedureSummaryBoundary::new(receiver, parameters),
-                ));
+                bindings.push(
+                    ExactProcedureSummaryTargetBinding::new(
+                        summary.id.clone(),
+                        summary.target.clone(),
+                        target.provenance_artifact_key(root_artifact),
+                        summary_locator,
+                        ExactProcedureSummaryBoundary::new(receiver, parameters),
+                    )
+                    .with_unmaterialized_activation_review(first_binding),
+                );
                 let retained = bindings_by_summary_target
                     .entry(summary_target)
                     .or_default();
@@ -4534,6 +6311,205 @@ impl<'a> TaintPolicyCompiler<'a> {
         .map(Some)
         .map_err(|error| TaintPolicyCompileError::Model(error.to_string()))
     }
+}
+
+pub(crate) fn exact_python_external_resolution_calls(
+    coverage: &HashMap<DurableCallSiteKey, CallSiteCoverage>,
+    boundaries: &[DispatchBoundary],
+    summaries: Option<&ExternalSemanticSummarySet>,
+) -> Vec<CallSiteHandle> {
+    let mut calls = HashMap::<DurableCallSiteKey, CallSiteHandle>::new();
+    for boundary in boundaries {
+        if !is_exact_python_constructor_boundary(boundary)
+            && !is_exact_python_modeled_receiver_method_boundary(boundary, summaries)
+        {
+            continue;
+        }
+        for call in boundary
+            .provenance
+            .iter()
+            .filter_map(|provenance| match provenance.owner() {
+                OracleRelationOwner::Dispatch(call) => Some(call),
+                _ => None,
+            })
+        {
+            calls.insert(call.durable_key(), call.clone());
+        }
+    }
+
+    calls
+        .into_values()
+        .filter(|call| {
+            let call_boundaries = boundaries
+                .iter()
+                .filter(|boundary| {
+                    boundary.provenance.iter().any(|provenance| {
+                        matches!(provenance.owner(), OracleRelationOwner::Dispatch(owner) if owner == call)
+                    })
+                })
+                .collect::<Vec<_>>();
+            let exact_constructor = call_boundaries
+                .iter()
+                .all(|boundary| is_exact_python_constructor_boundary(boundary));
+            let exact_modeled_method = call_boundaries.iter().all(|boundary| {
+                is_exact_python_modeled_receiver_method_boundary(boundary, summaries)
+            });
+            if call_boundaries.is_empty() || !(exact_constructor || exact_modeled_method) {
+                return false;
+            }
+            let Some(CallSiteCoverage {
+                dispatch: DispatchStatus::Resolved {
+                    status,
+                    coverage: candidate_coverage,
+                },
+                has_uncovered_boundary,
+                truncated: false,
+                bindings,
+                ..
+            }) = coverage.get(&call.durable_key())
+            else {
+                return false;
+            };
+            if !status.is_complete()
+                || *candidate_coverage != CandidateCoverage::Exhaustive
+                || !bindings.is_empty()
+                || (*has_uncovered_boundary && !exact_modeled_method)
+            {
+                return false;
+            }
+            true
+        })
+        .collect()
+}
+
+pub(crate) fn exact_rust_builtin_macro_resolution_calls(
+    coverage: &HashMap<DurableCallSiteKey, CallSiteCoverage>,
+    boundaries: &[DispatchBoundary],
+) -> Vec<CallSiteHandle> {
+    let is_complete_builtin_target = |boundary: &DispatchBoundary| {
+        let Some(identity) = boundary.external_callee_identity() else {
+            return false;
+        };
+        let Some(target) = boundary.unmaterialized_external_target() else {
+            return false;
+        };
+        let known_identity = identity.language() == Language::Rust
+            && matches!(
+                (identity.owner_fqn(), identity.member()),
+                (
+                    "std" | "core" | "alloc",
+                    "format"
+                        | "format_args"
+                        | "print"
+                        | "println"
+                        | "eprint"
+                        | "eprintln"
+                        | "write"
+                        | "writeln"
+                        | "panic"
+                ) | ("core.panicking", "panic_fmt" | "assert_failed")
+                    | ("std.io.stdio", "_print" | "_eprint")
+                    | ("core", "matches")
+                    | ("alloc", "vec")
+            );
+        known_identity
+            && target.language() == SemanticLanguage::Standard(Language::Rust)
+            && target.owner_fqn() == identity.owner_fqn()
+            && target.member() == identity.member()
+            && matches!(&boundary.kind, DispatchBoundaryKind::External(Some(locator)) if locator == target.locator())
+            && matches!(&boundary.proof, ProofStatus::Proven)
+            && matches!(&boundary.completeness, EvidenceCompleteness::Complete)
+    };
+    let mut calls = HashMap::<DurableCallSiteKey, CallSiteHandle>::new();
+    for boundary in boundaries
+        .iter()
+        .filter(|boundary| is_complete_builtin_target(boundary))
+    {
+        for call in boundary
+            .provenance
+            .iter()
+            .filter_map(|provenance| match provenance.owner() {
+                OracleRelationOwner::Dispatch(call) => Some(call),
+                _ => None,
+            })
+        {
+            calls.insert(call.durable_key(), call.clone());
+        }
+    }
+    calls
+        .into_values()
+        .filter(|call| {
+            let call_boundaries = boundaries
+                .iter()
+                .filter(|boundary| {
+                    boundary.provenance.iter().any(|provenance| {
+                        matches!(provenance.owner(), OracleRelationOwner::Dispatch(owner) if owner == call)
+                    })
+                })
+                .collect::<Vec<_>>();
+            if call_boundaries.is_empty()
+                || !call_boundaries
+                    .iter()
+                    .all(|boundary| is_complete_builtin_target(boundary))
+            {
+                return false;
+            }
+            matches!(
+                coverage.get(&call.durable_key()),
+                Some(CallSiteCoverage {
+                    dispatch: DispatchStatus::Resolved {
+                        status,
+                        coverage: CandidateCoverage::Exhaustive,
+                    },
+                    has_uncovered_boundary: false,
+                    truncated: false,
+                    bindings,
+                    ..
+                }) if status.is_complete() && bindings.is_empty()
+            )
+        })
+        .collect()
+}
+
+fn is_exact_python_modeled_receiver_method_boundary(
+    boundary: &DispatchBoundary,
+    summaries: Option<&ExternalSemanticSummarySet>,
+) -> bool {
+    let Some(identity) = boundary.external_callee_identity() else {
+        return false;
+    };
+    let Some(target) = boundary.unmaterialized_external_target() else {
+        return false;
+    };
+    identity.language() == Language::Python
+        && target.language() == SemanticLanguage::Standard(Language::Python)
+        && target.has_resolver_owned_call_shape()
+        && target.has_receiver()
+        && target.owner_fqn() == identity.owner_fqn()
+        && target.member() == identity.member()
+        && matches!(&boundary.kind, DispatchBoundaryKind::External(Some(locator)) if locator == target.locator())
+        && matches!(&boundary.proof, ProofStatus::Proven)
+        && summaries
+            .and_then(|summaries| summaries.summary_for(target.locator()))
+            .is_some_and(|summary| summary.completeness().is_complete())
+}
+
+fn is_exact_python_constructor_boundary(boundary: &DispatchBoundary) -> bool {
+    let Some(identity) = boundary.external_callee_identity() else {
+        return false;
+    };
+    let Some(target) = boundary.unmaterialized_external_target() else {
+        return false;
+    };
+    identity.language() == Language::Python
+        && target.language() == SemanticLanguage::Standard(Language::Python)
+        && target.has_resolver_owned_call_shape()
+        && target.has_receiver()
+        && target.member() == "__init__"
+        && target.owner_fqn() == format!("{}.{}", identity.owner_fqn(), identity.member())
+        && matches!(&boundary.kind, DispatchBoundaryKind::External(Some(locator)) if locator == target.locator())
+        && matches!(&boundary.proof, ProofStatus::Proven)
+        && matches!(&boundary.completeness, EvidenceCompleteness::Complete)
 }
 
 fn select_unmaterialized_flow_summary<'matched, 'model>(
@@ -4737,7 +6713,7 @@ fn seed_store_channels(
     cancellation: &CancellationToken,
     budget: &PolicyBudget,
     execution_budget: &mut TaintExecutionBudget,
-    active_semantic_model_snapshot: Option<Arc<ActiveSemanticModelSnapshot>>,
+    icfg_provider: &WorkspaceIcfgProvider<'_>,
 ) -> Result<StoreSeeding, String> {
     let mut seeding = StoreSeeding::empty(batches.len());
     let has_writes = batches
@@ -4849,13 +6825,9 @@ fn seed_store_channels(
             execution_budget.reset_per_batch_solve_budget(budget);
             let mut request = DataflowRequest::new(&mut execution_budget.solver, cancellation);
             record_taint_plan_artifacts(workspace, &observation);
-            let provider = WorkspaceIcfgProvider::with_active_semantic_model_snapshot(
-                workspace,
-                active_semantic_model_snapshot.clone(),
-            );
             let result = brokk_bifrost_flow::taint::solve_taint_batch_with_witnesses(
                 observation.value_flow().root(),
-                &provider,
+                icfg_provider,
                 &observation,
                 witness_retention,
                 &mut execution_budget.semantic,
@@ -5048,64 +7020,44 @@ fn seed_store_channels(
     Ok(seeding)
 }
 
-#[allow(clippy::too_many_arguments)]
-fn solve_and_project_batch(
+/// One batch's report, its timing, and what its composition found incomplete.
+struct BatchReport {
+    report: TaintFindingReport,
+    propagation_elapsed: Duration,
+    reconstruction_elapsed: Duration,
+    /// Present for a composed batch that is incomplete: the diagnostic its
+    /// first incompleteness renders. Each policy root of the batch receives it.
+    composition_diagnostics: Vec<PolicyDiagnostic>,
+    /// The snapshot input status of a composed batch's first incompleteness,
+    /// when it has one. The completion reason reads it.
+    composition_status: Option<SemanticInputStatus>,
+    /// The origin metadata of the sources a composed batch matched on the
+    /// frontier. The compile bound none of them, so the projection reads
+    /// these beside the compiled ones.
+    frontier_sources: Vec<CompiledTaintEndpoint>,
+}
+
+/// The engine of a batch. Every policy of one batch shares its engine, because
+/// the batch planner partitions by engine first.
+fn batch_engine<'m>(
     batch: &TaintBatch,
-    store_seeds: &[StoreReadSeed],
-    metadata: &HashMap<String, PreparedTaintPlan>,
-    policies: &[&LoadedPolicy],
-    payloads: &mut HashMap<PolicyId, TaintProjectionPayload>,
-    workspace: &WorkspaceAnalyzer,
-    cancellation: &CancellationToken,
-    budget: &PolicyBudget,
-    execution_budget: &mut TaintExecutionBudget,
-    public_findings: &mut Vec<brokk_bifrost_rql::structural::CodeQueryTaintFinding>,
-    retained_analyses: &mut Vec<Arc<ProductionTaintAnalysisResult>>,
-    batch_planning_elapsed: Duration,
-    active_semantic_model_snapshot: Option<Arc<ActiveSemanticModelSnapshot>>,
-    store_write_evidence: &StoreWriteEvidenceByRead,
-) -> Result<(), TaintBatchError> {
-    // Each batch solves its own regions and reconstructs evidence only for its
-    // own findings, so give it a fresh solve and witness budget instead of the
-    // request-wide remainder a corpus would have already drained (#1935 for the
-    // witness lanes, #2208 for the semantic and solver lanes).
-    // `remaining_findings` is deliberately not reset: it stays the request-wide
-    // cap on total output.
-    execution_budget.reset_per_batch_witness_budget(budget);
-    execution_budget.reset_per_batch_solve_budget(budget);
-    let limits = budget.query_limits();
-    let value_flow_limits = limits.value_flow;
-    let witness_retention = WitnessRetentionLimits::best_effort(
-        1,
-        value_flow_limits.max_retained_relations,
-        value_flow_limits.max_retained_bytes,
-    )
-    .map_err(|error| error.to_string())?;
-    let mut request = DataflowRequest::new(&mut execution_budget.solver, cancellation);
-    record_taint_plan_artifacts(workspace, batch.analysis());
-    let provider = WorkspaceIcfgProvider::with_active_semantic_model_snapshot(
-        workspace,
-        active_semantic_model_snapshot,
-    );
-    let propagation_started = Instant::now();
-    let result = brokk_bifrost_flow::taint::solve_taint_batch_with_witnesses(
-        batch.analysis().value_flow().root(),
-        &provider,
-        batch.analysis(),
-        witness_retention,
-        &mut execution_budget.semantic,
-        &mut request,
-    )
-    .map_err(|error| error.to_string())?;
-    let propagation_elapsed = propagation_started.elapsed();
-    let witness_limits = WitnessReconstructionLimits::new(
-        value_flow_limits
-            .max_witness_steps
-            .min(budget.max_witness_steps()),
-        value_flow_limits.max_witness_expansions,
-    )
-    .map_err(|error| error.to_string())?;
-    if let Some(lane) = [
+    metadata: &'m HashMap<String, PreparedTaintPlan>,
+) -> &'m TaintEngine {
+    let internal = batch
+        .policy_ids()
+        .next()
+        .expect("a taint batch holds at least one policy");
+    &metadata
+        .get(internal)
+        .expect("a batch policy has compiled metadata")
+        .engine
+}
+
+/// The first request-wide output or evidence lane that is spent, if any.
+fn first_exhausted_taint_lane(
+    execution_budget: &TaintExecutionBudget,
+) -> Option<ExhaustedTaintLane> {
+    [
         (
             ExhaustedTaintLane::Findings,
             execution_budget.remaining_findings,
@@ -5129,7 +7081,46 @@ fn solve_and_project_batch(
     ]
     .into_iter()
     .find_map(|(lane, remaining)| (remaining == 0).then_some(lane))
-    {
+}
+
+/// Solve one batch on the ICFG engine and collect its findings.
+fn solve_icfg_batch(
+    batch: &TaintBatch,
+    workspace: &WorkspaceAnalyzer,
+    cancellation: &CancellationToken,
+    budget: &PolicyBudget,
+    execution_budget: &mut TaintExecutionBudget,
+    icfg_provider: &WorkspaceIcfgProvider<'_>,
+) -> Result<BatchReport, TaintBatchError> {
+    let limits = budget.query_limits();
+    let value_flow_limits = limits.value_flow;
+    let witness_retention = WitnessRetentionLimits::best_effort(
+        1,
+        value_flow_limits.max_retained_relations,
+        value_flow_limits.max_retained_bytes,
+    )
+    .map_err(|error| error.to_string())?;
+    let mut request = DataflowRequest::new(&mut execution_budget.solver, cancellation);
+    record_taint_plan_artifacts(workspace, batch.analysis());
+    let propagation_started = Instant::now();
+    let result = brokk_bifrost_flow::taint::solve_taint_batch_with_witnesses(
+        batch.analysis().value_flow().root(),
+        icfg_provider,
+        batch.analysis(),
+        witness_retention,
+        &mut execution_budget.semantic,
+        &mut request,
+    )
+    .map_err(|error| error.to_string())?;
+    let propagation_elapsed = propagation_started.elapsed();
+    let witness_limits = WitnessReconstructionLimits::new(
+        value_flow_limits
+            .max_witness_steps
+            .min(budget.max_witness_steps()),
+        value_flow_limits.max_witness_expansions,
+    )
+    .map_err(|error| error.to_string())?;
+    if let Some(lane) = first_exhausted_taint_lane(execution_budget) {
         return Err(TaintBatchError::BudgetExhausted(lane));
     }
     let reconstruction_started = Instant::now();
@@ -5149,6 +7140,532 @@ fn solve_and_project_batch(
     )
     .map_err(|error| error.to_string())?;
     let reconstruction_elapsed = reconstruction_started.elapsed();
+    Ok(BatchReport {
+        report,
+        propagation_elapsed,
+        reconstruction_elapsed,
+        composition_diagnostics: Vec::new(),
+        composition_status: None,
+        frontier_sources: Vec::new(),
+    })
+}
+
+/// A source, sanitizer or transform selector of one policy, by its index in
+/// the policy's specification.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) enum FrontierSelector {
+    Source(usize),
+    Sanitizer(usize),
+    Transform(usize),
+}
+
+/// One endpoint a frontier selector bound.
+#[derive(Clone)]
+pub(crate) enum FrontierEndpoint {
+    Source(BoundEndpoint),
+    Sanitizer(BoundSanitizer),
+    Transform(BoundTransform),
+}
+
+impl FrontierEndpoint {
+    /// The procedure the endpoint lies in. A sanitizer's or transform's two
+    /// ports are bound at one call, so they lie in one procedure.
+    pub(crate) fn procedure(&self) -> DurableProcedureKey {
+        let (input, output) = match self {
+            Self::Source(endpoint) => (endpoint, endpoint),
+            Self::Sanitizer(sanitizer) => (&sanitizer.input, &sanitizer.output),
+            Self::Transform(transform) => (&transform.input, &transform.output),
+        };
+        let procedure = input.point.procedure().durable_key();
+        debug_assert_eq!(procedure, output.point.procedure().durable_key());
+        procedure
+    }
+}
+
+/// What the composition needs to match one policy's sources, sanitizers and
+/// transforms on the frontier (spec M4.2): the policy's selectors and
+/// definitions, and a compiler whose binding code turns a selected row into
+/// endpoints exactly as the up-front binding of the ICFG engine does. The
+/// provider decides which blob to evaluate a selector on and memoizes; this
+/// value selects and binds.
+pub(crate) struct FrontierEndpointBinder<'a> {
+    compiler: TaintPolicyCompiler<'a>,
+    policy: &'a LoadedPolicy,
+    spec: &'a ResolvedTaintPolicySpec,
+    universe: TaintUniverse,
+    /// The analyzed files, which a sliced selector's callers, dispatch and
+    /// references still answer over.
+    workspace_files: Vec<ProjectFile>,
+}
+
+impl<'a> FrontierEndpointBinder<'a> {
+    /// `compiler` is a fresh compiler over the workspace the policy runs on;
+    /// its selector session and binding state serve the frontier alone.
+    pub(crate) fn new(
+        compiler: TaintPolicyCompiler<'a>,
+        policy: &'a LoadedPolicy,
+        spec: &'a ResolvedTaintPolicySpec,
+        universe: TaintUniverse,
+    ) -> Self {
+        let workspace = compiler.selectors.workspace();
+        Self {
+            compiler: compiler.with_file_local_matched_values(),
+            policy,
+            spec,
+            universe,
+            workspace_files: workspace.analyzer().analyzed_files(),
+        }
+    }
+
+    /// The policy whose endpoints this binder matches.
+    pub(crate) fn policy_id(&self) -> &PolicyId {
+        &self.policy.definition().metadata.id
+    }
+
+    /// Every selector the frontier matches: the active sources, then the
+    /// sanitizers, then the transforms.
+    pub(crate) fn selectors(&self) -> Vec<FrontierSelector> {
+        let spec = self.spec;
+        spec.sources
+            .iter()
+            .enumerate()
+            .filter(|(_, source)| threat_model_source_is_active(source, &spec.threat_models))
+            .map(|(index, _)| FrontierSelector::Source(index))
+            .chain((0..spec.sanitizers.len()).map(FrontierSelector::Sanitizer))
+            .chain((0..spec.transforms.len()).map(FrontierSelector::Transform))
+            .collect()
+    }
+
+    fn selector(
+        &self,
+        selector: FrontierSelector,
+    ) -> Result<&'a ResolvedPolicySelector, TaintPolicyCompileError> {
+        let spec = self.spec;
+        let path = match selector {
+            FrontierSelector::Source(index) => &spec.sources[index].definition.selector_path,
+            FrontierSelector::Sanitizer(index) => &spec.sanitizers[index].selector_path,
+            FrontierSelector::Transform(index) => &spec.transforms[index].selector_path,
+        };
+        self.policy
+            .resolved_selectors()
+            .iter()
+            .find(|selector| &selector.path == path)
+            .ok_or_else(|| TaintPolicyCompileError::MissingSelector(path.as_str().to_owned()))
+    }
+
+    /// Why the selector's query cannot be evaluated on one blob, or `None`
+    /// when it can. A relational selector has no query to slice.
+    pub(crate) fn widen_reason(
+        &self,
+        selector: FrontierSelector,
+    ) -> Result<Option<crate::units::WidenReason>, TaintPolicyCompileError> {
+        Ok(match self.selector(selector)?.as_query() {
+            Some((_, query)) => crate::unit_execution::frontier_slicing_widen_reason(query),
+            None => Some(crate::units::WidenReason::PlanCrossesSeeds),
+        })
+    }
+
+    /// The rows the selector selects with its seed enumeration narrowed to
+    /// `file`.
+    pub(crate) fn select_in_file(
+        &mut self,
+        selector: FrontierSelector,
+        file: &ProjectFile,
+    ) -> Result<Vec<SelectedSite>, TaintPolicyCompileError> {
+        let resolved = self.selector(selector)?;
+        self.compiler
+            .selectors
+            .select_taint_in_file(resolved, file, &self.workspace_files)
+            .map_err(taint_selector_error)
+    }
+
+    /// The rows the selector selects over the whole workspace.
+    pub(crate) fn select_workspace(
+        &mut self,
+        selector: FrontierSelector,
+    ) -> Result<Vec<SelectedSite>, TaintPolicyCompileError> {
+        let resolved = self.selector(selector)?;
+        self.compiler
+            .selectors
+            .select_taint(resolved)
+            .map_err(taint_selector_error)
+    }
+
+    /// The authored summaries the active semantic models hold for the
+    /// external targets one call's dispatch boundaries name, bound as the
+    /// compile binds a region's (`bind_external_summaries`) with the call's
+    /// artifact as the root. `None` when no summary applies.
+    pub(crate) fn external_summaries(
+        &self,
+        targets: &[ExactExternalProcedureTarget],
+        unmaterialized: &[UnmaterializedExternalTarget],
+        artifact: &SemanticArtifactKey,
+        call_behavior: brokk_bifrost_flow::dataflow::UnmodeledCallBehavior,
+    ) -> Result<Option<ExternalSemanticSummarySet>, TaintPolicyCompileError> {
+        self.compiler
+            .bind_external_summaries(targets, unmaterialized, artifact, call_behavior)
+    }
+
+    /// Bind selected rows of one selector with the compile's binding code.
+    /// Returns the endpoints and every reason the selection or the binding
+    /// may have missed one: refused rows and selector evaluations that did
+    /// not finish.
+    pub(crate) fn bind(
+        &mut self,
+        selector: FrontierSelector,
+        sites: Vec<SelectedSite>,
+    ) -> Result<(Vec<FrontierEndpoint>, Vec<String>), TaintPolicyCompileError> {
+        let resolved = self.selector(selector)?;
+        let spec = self.spec;
+        let mut endpoints = Vec::new();
+        for site in sites {
+            match selector {
+                FrontierSelector::Source(index) => endpoints.extend(
+                    self.compiler
+                        .bind_source(&spec.sources[index], resolved, site)?
+                        .into_iter()
+                        .map(FrontierEndpoint::Source),
+                ),
+                FrontierSelector::Sanitizer(index) => endpoints.extend(
+                    self.compiler
+                        .bind_sanitizer(&spec.sanitizers[index], resolved, site)?
+                        .into_iter()
+                        .map(FrontierEndpoint::Sanitizer),
+                ),
+                FrontierSelector::Transform(index) => endpoints.extend(
+                    self.compiler
+                        .bind_transform(&spec.transforms[index], resolved, site)?
+                        .into_iter()
+                        .map(FrontierEndpoint::Transform),
+                ),
+            }
+        }
+        let mut gaps = refusal_messages(&std::mem::take(&mut self.compiler.refused_sites));
+        gaps.extend(self.compiler.selectors.take_incomplete_taint_selectors());
+        Ok((endpoints, gaps))
+    }
+
+    /// The evidence the ICFG engine would give a frontier matched-value
+    /// source bound from `selection`: its own matched-value resolution, which
+    /// asks points-to for the coverage of the matched value (spec M4.2,
+    /// stage 3). The frontier binds the source without that question, so the
+    /// composition asks it here, once per source that reaches a sink.
+    ///
+    /// A row that points-to resolves to no observation binds no source in the
+    /// ICFG engine; the composition has already found a flow from it, so the
+    /// evidence is neither proven nor complete.
+    pub(crate) fn source_evidence(
+        &mut self,
+        selection: &SelectedSite,
+    ) -> Result<compose::HopQuality, TaintPolicyCompileError> {
+        let refusals = self.compiler.refused_sites.len();
+        let resolved = self.compiler.resolve_matched_value(selection.clone());
+        // The frontier's own resolution of the same row already reported its
+        // refusals.
+        self.compiler.refused_sites.truncate(refusals);
+        let resolved = resolved?;
+        let Some(first) = resolved.first() else {
+            return Ok(compose::HopQuality::UNCERTAIN);
+        };
+        debug_assert!(
+            resolved
+                .iter()
+                .all(|value| value.proof == first.proof && value.completeness == first.completeness),
+            "the observations of one selected row share its evidence"
+        );
+        Ok(compose::HopQuality {
+            proven: matches!(first.proof, ProofStatus::Proven),
+            complete: matches!(first.completeness, EvidenceCompleteness::Complete),
+        })
+    }
+
+    /// The endpoints of one procedure in the composition's terms, the origin
+    /// metadata of its sources, and the sources whose evidence is unknown.
+    /// Sources are ordered and their events minted as the compile orders and
+    /// mints them, with ordinals counted within the procedure; sanitizers
+    /// acting at one point and carrier pair are merged as the compile merges
+    /// them.
+    pub(crate) fn procedure_endpoints(
+        &self,
+        endpoints: Vec<FrontierEndpoint>,
+    ) -> Result<
+        (
+            ProcedureEndpoints,
+            Vec<CompiledTaintEndpoint>,
+            Vec<UnjudgedSource>,
+        ),
+        TaintPolicyCompileError,
+    > {
+        let mut sources = Vec::new();
+        let mut sanitizers = Vec::new();
+        let mut transforms = Vec::new();
+        for endpoint in endpoints {
+            match endpoint {
+                FrontierEndpoint::Source(source) => sources.push(source),
+                FrontierEndpoint::Sanitizer(sanitizer) => sanitizers.push(sanitizer),
+                FrontierEndpoint::Transform(transform) => transforms.push(transform),
+            }
+        }
+        sort_bound_endpoints(&mut sources);
+        sort_bound_sanitizers(&mut sanitizers);
+        sort_bound_transforms(&mut transforms);
+        let specs = keyed_source_event_specs(&sources, 0)?;
+        let metadata = endpoint_metadata(&sources, &specs);
+        let mut answer = ProcedureEndpoints::none();
+        let mut unjudged = Vec::new();
+        for (source, (key, _)) in sources.iter().zip(specs) {
+            let origin = SourceEventKey::new(key);
+            let evidence = match &source.unjudged {
+                Some(selection) => {
+                    unjudged.push(UnjudgedSource {
+                        origin: origin.clone(),
+                        identity: source.endpoint.clone(),
+                        selection: Arc::clone(selection),
+                    });
+                    compose::EndpointEvidence::Unknown
+                }
+                None => compose::EndpointEvidence::Known(compose::HopQuality {
+                    proven: matches!(source.proof, ProofStatus::Proven),
+                    complete: matches!(source.completeness, EvidenceCompleteness::Complete),
+                }),
+            };
+            answer.sources.push(BoundSource {
+                point: source.point.clone(),
+                phase: source.phase,
+                carrier: source.carrier.clone(),
+                classes: class_set(&self.universe, &source.labels)?,
+                origin,
+                evidence,
+            });
+        }
+        for slot in sanitizer_slots(&self.universe, &sanitizers)? {
+            answer.sanitizers.push(compose::BoundSanitizer {
+                point: slot.point,
+                input: slot.input,
+                output: slot.output,
+                removed: slot.removed,
+                proven: slot.proven,
+                resolved: slot.complete,
+            });
+        }
+        for transform in transforms {
+            let removed = class_set(&self.universe, &transform.removes)?;
+            let added = class_set(&self.universe, &transform.adds)?;
+            let certain = matches!(
+                conjoin_proof(&transform.input.proof, &transform.output.proof),
+                ProofStatus::Proven
+            ) && matches!(
+                conjoin_completeness(
+                    &transform.input.completeness,
+                    &transform.output.completeness,
+                ),
+                EvidenceCompleteness::Complete
+            );
+            answer.transforms.push(compose::BoundTransform {
+                point: transform.output.point.clone(),
+                input: transform.input.carrier,
+                output: transform.output.carrier,
+                function: TaintEdgeFunction::kill(&removed)
+                    .compose(&TaintEdgeFunction::generate(&added)),
+                uncertain: !certain,
+            });
+        }
+        Ok((answer, metadata, unjudged))
+    }
+}
+
+/// A frontier source bound without its points-to evidence: the selected row
+/// to judge it from, and the identity that keys the judgment. The memo of one
+/// policy run is keyed by the endpoint and the row's site.
+pub(crate) struct UnjudgedSource {
+    pub(crate) origin: SourceEventKey,
+    pub(crate) identity: ResolvedEndpointIdentity,
+    pub(crate) selection: Arc<SelectedSite>,
+}
+
+/// Answer one batch by composition over the partial flows (spec M3.1). An
+/// incomplete composition stays incomplete: nothing here reruns the batch on
+/// the ICFG engine.
+#[allow(clippy::too_many_arguments)]
+fn compose_batch(
+    batch: &TaintBatch,
+    metadata: &HashMap<String, PreparedTaintPlan>,
+    policies: &[&LoadedPolicy],
+    workspace: &WorkspaceAnalyzer,
+    cancellation: &CancellationToken,
+    budget: &PolicyBudget,
+    execution_budget: &mut TaintExecutionBudget,
+    active_semantic_model_snapshot: Option<Arc<ActiveSemanticModelSnapshot>>,
+    composition_memo: &CompositionMemo,
+) -> Result<BatchReport, TaintBatchError> {
+    // A composed plan's compatibility names its policy, so its batch holds
+    // that one policy, whose sources, sanitizers and transforms the frontier
+    // matches.
+    let [internal] = batch.policy_ids().collect::<Vec<_>>()[..] else {
+        unreachable!("a composed batch holds one policy");
+    };
+    let prepared = metadata
+        .get(internal)
+        .expect("a batch policy has compiled metadata");
+    let policy_id = &prepared.policy_id;
+    let policy = policies
+        .iter()
+        .copied()
+        .find(|policy| &policy.definition().metadata.id == policy_id)
+        .expect("a composed policy is a member of its coordinator batch");
+    let spec = policy
+        .resolved_taint()
+        .expect("a composed policy is a taint policy");
+    let composition_budget = CompositionBudget {
+        max_procedures: budget.max_composition_procedures(),
+        max_hops: budget.max_composition_hops(),
+        max_callers_per_procedure: budget.max_composition_callers_per_procedure(),
+    };
+    let semantic = budget.query_limits().semantic;
+    let cache = DiscoveryMaterializationCache::default();
+    let provider = {
+        let _timing = brokk_bifrost_analysis::profiling::scope("taint.compose.bind");
+        PolicyCompositionProvider::new(
+            workspace,
+            SemanticExecutionBudget::new(
+                semantic.max_materialized_files,
+                semantic.max_traversal_steps,
+            ),
+            &cache,
+            batch.analysis(),
+            &prepared.external_models,
+            composition_budget.max_callers_per_procedure,
+            FrontierEndpointBinder::new(
+                TaintPolicyCompiler::new(
+                    workspace,
+                    active_semantic_model_snapshot
+                        .as_ref()
+                        .map(|snapshot| Arc::clone(snapshot.active_models())),
+                    budget.query_limits(),
+                    budget.max_selector_results(),
+                    cancellation,
+                )
+                .with_active_semantic_model_snapshot(active_semantic_model_snapshot),
+                policy,
+                spec,
+                batch.analysis().universe().clone(),
+            ),
+            composition_memo,
+        )
+    };
+    let propagation_started = Instant::now();
+    let outcome = {
+        let mut request = SemanticRequest::new(&mut execution_budget.semantic, cancellation);
+        compose_taint_batch(
+            batch.analysis(),
+            &provider,
+            composition_budget,
+            &mut request,
+        )
+    };
+    let propagation_elapsed = propagation_started.elapsed();
+    if let Some(failure) = provider.failure() {
+        return Err(TaintBatchError::Internal(failure.to_string()));
+    }
+    let outcome = outcome.map_err(|error| error.to_string())?;
+    let (partial_flows_read, partial_flows_computed) = provider.partial_flow_counts();
+    // The provider dispatches each distinct call once per run, whether the
+    // search or the openness refinement asked first.
+    let dispatches = provider.dispatches_made();
+    let endpoint_widened = provider.endpoint_widened();
+    brokk_bifrost_analysis::profiling::note_with(|| {
+        format!(
+            "taint.compose.counts policies={:?} procedures={} hops={} dispatches={} callers={} partial_flows_read={partial_flows_read} partial_flows_computed={partial_flows_computed} endpoint_evaluations={} source_evidence_resolved={} endpoint_widened={} widened_selectors={:?} incomplete={:?} abstained={:?}",
+            batch.policy_ids().collect::<Vec<_>>(),
+            outcome.stats.procedures,
+            outcome.stats.hops,
+            dispatches,
+            outcome.stats.callers,
+            provider.endpoint_evaluations(),
+            provider.source_evidence_resolved(),
+            endpoint_widened.len(),
+            endpoint_widened,
+            outcome.incompleteness,
+            outcome.abstained,
+        )
+    });
+    let (composition_diagnostics, composition_status) =
+        composition_first_cause(workspace, &provider, &outcome.incompleteness)?;
+    if let Some(lane) = first_exhausted_taint_lane(execution_budget) {
+        return Err(TaintBatchError::BudgetExhausted(lane));
+    }
+    if outcome.report.findings().len() > execution_budget.remaining_findings {
+        return Err(TaintBatchError::BudgetExhausted(
+            ExhaustedTaintLane::Findings,
+        ));
+    }
+    Ok(BatchReport {
+        report: outcome.report,
+        propagation_elapsed,
+        reconstruction_elapsed: Duration::ZERO,
+        composition_diagnostics,
+        composition_status,
+        frontier_sources: provider.frontier_sources(),
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn solve_and_project_batch(
+    batch: &TaintBatch,
+    store_seeds: &[StoreReadSeed],
+    metadata: &HashMap<String, PreparedTaintPlan>,
+    policies: &[&LoadedPolicy],
+    payloads: &mut HashMap<PolicyId, TaintProjectionPayload>,
+    merge: &mut BatchMerge,
+    workspace: &WorkspaceAnalyzer,
+    cancellation: &CancellationToken,
+    budget: &PolicyBudget,
+    execution_budget: &mut TaintExecutionBudget,
+    public_findings: &mut Vec<brokk_bifrost_rql::structural::CodeQueryTaintFinding>,
+    retained_analyses: &mut Vec<Arc<ProductionTaintAnalysisResult>>,
+    batch_planning_elapsed: Duration,
+    active_semantic_model_snapshot: Option<Arc<ActiveSemanticModelSnapshot>>,
+    icfg_provider: &WorkspaceIcfgProvider<'_>,
+    store_write_evidence: &StoreWriteEvidenceByRead,
+    composition_memo: &CompositionMemo,
+) -> Result<(), TaintBatchError> {
+    // Each batch solves its own regions and reconstructs evidence only for its
+    // own findings, so give it a fresh solve and witness budget instead of the
+    // request-wide remainder a corpus would have already drained (#1935 for the
+    // witness lanes, #2208 for the semantic and solver lanes).
+    // `remaining_findings` is deliberately not reset: it stays the request-wide
+    // cap on total output.
+    execution_budget.reset_per_batch_witness_budget(budget);
+    execution_budget.reset_per_batch_solve_budget(budget);
+    let engine = batch_engine(batch, metadata);
+    let BatchReport {
+        report,
+        propagation_elapsed,
+        reconstruction_elapsed,
+        composition_diagnostics,
+        composition_status,
+        frontier_sources,
+    } = match engine {
+        TaintEngine::Icfg { .. } => solve_icfg_batch(
+            batch,
+            workspace,
+            cancellation,
+            budget,
+            execution_budget,
+            icfg_provider,
+        )?,
+        TaintEngine::Composition => compose_batch(
+            batch,
+            metadata,
+            policies,
+            workspace,
+            cancellation,
+            budget,
+            execution_budget,
+            active_semantic_model_snapshot,
+            composition_memo,
+        )?,
+    };
     execution_budget.remaining_findings = execution_budget
         .remaining_findings
         .saturating_sub(report.findings().len());
@@ -5182,6 +7699,7 @@ fn solve_and_project_batch(
         ),
     );
     debug_assert!(retained.plan_report_match());
+    retained.set_frontier_sources(frontier_sources.iter().map(|source| source.event.clone()));
     let standalone_projection_started = Instant::now();
     let projected_findings = brokk_bifrost_rql::structural::project_taint_finding_report(
         workspace,
@@ -5197,9 +7715,23 @@ fn solve_and_project_batch(
         .map_err(|error| error.to_string())?;
     let policy_projection_started = Instant::now();
     for projection in batch.projections() {
-        let plan = metadata
+        let compiled = metadata
             .get(projection.policy_id())
             .ok_or_else(|| "taint batch projection has no compiled policy metadata".to_owned())?;
+        // The sources a composition matched on the frontier attribute its
+        // findings' origins exactly as compiled sources do.
+        let extended;
+        let plan = if frontier_sources.is_empty() {
+            compiled
+        } else {
+            let mut sources = compiled.sources.to_vec();
+            sources.extend(frontier_sources.iter().cloned());
+            extended = PreparedTaintPlan {
+                sources: sources.into_boxed_slice(),
+                ..compiled.clone()
+            };
+            &extended
+        };
         let policy = policies
             .iter()
             .copied()
@@ -5226,7 +7758,28 @@ fn solve_and_project_batch(
         let payload = payloads
             .get_mut(&plan.policy_id)
             .ok_or_else(|| "compiled taint policy has no prepared payload".to_owned())?;
-        payload.projections.extend(projected);
+        // One batch solves each root's closure, so a sink reachable from two
+        // roots yields the same envelope from two batches; keep the first copy.
+        // Not at plan time: one sink in two plans with different source sets
+        // has two identities, and both must survive. Duplicates within one
+        // batch still reach validate_taint_batch.
+        let identities = merge.envelopes.entry(plan.policy_id.clone()).or_default();
+        let mut fresh = Vec::with_capacity(projected.len());
+        for projection in projected {
+            let identity = taint_envelope_identity(&plan.policy_id, &projection);
+            if !identities.contains(&identity) {
+                fresh.push((identity, projection));
+            }
+        }
+        for (identity, projection) in fresh {
+            identities.insert(identity);
+            payload.projections.push(projection);
+        }
+        // A composed batch's first incompleteness is the run's diagnostic for
+        // this root (spec M3.4). The completion below already downgrades the run.
+        payload
+            .diagnostics
+            .extend(composition_diagnostics.iter().cloned());
         // Both counters were already published at zero by
         // `record_compile_metrics`, so this raises existing metrics and never
         // adds a name. See that function for why the name set has to be fixed.
@@ -5286,11 +7839,20 @@ fn solve_and_project_batch(
                 // an unavailable capability stays a typed capability reason and
                 // the diagnostic names the input that opened the run instead of
                 // collapsing everything into a bare partial-discovery verdict.
-                let cause = batch.analysis().value_flow().first_incomplete_cause();
+                // A composed plan holds only its sinks, so its cause is the
+                // composition's own first incompleteness, whose diagnostic was
+                // pushed above.
+                let (cause, status) = match engine {
+                    TaintEngine::Composition => (None, composition_status),
+                    TaintEngine::Icfg { .. } => {
+                        let cause = batch.analysis().value_flow().first_incomplete_cause();
+                        (cause, cause.and_then(ValueFlowIncompleteCause::status))
+                    }
+                };
                 let reason = match retained.report().result().termination() {
                     SolverTermination::Cancelled => PolicyIncompleteReason::Cancelled,
                     SolverTermination::FixedPoint | SolverTermination::ExceededBudget(_) => {
-                        match cause.and_then(ValueFlowIncompleteCause::status) {
+                        match status {
                             Some(SemanticInputStatus::Unsupported { .. }) => {
                                 PolicyIncompleteReason::CapabilityIncomplete
                             }
@@ -5307,42 +7869,106 @@ fn solve_and_project_batch(
                     .map_err(|error| error.to_string())?;
                 payload.authored_arm_closures.clear();
                 if let Some(cause) = cause {
-                    let locator = cause.procedure().semantics().locator();
-                    let name = locator
-                        .declaration()
-                        .segments()
-                        .iter()
-                        .filter_map(|segment| segment.name())
-                        .collect::<Vec<_>>()
-                        .join(".");
-                    // Name the missing capability when the input is unsupported,
-                    // so a corpus abstention report says which value-flow
-                    // capability the procedure lacked rather than a bare
-                    // "unsupported".
-                    let status = match cause.status() {
-                        Some(status @ SemanticInputStatus::Unsupported { capability }) => {
-                            format!("{} ({})", status.label(), capability.label())
+                    let name = cause_procedure_name(cause);
+                    let status = cause_status_label(cause);
+                    let (generic_family, generic_detail) = procedure_cause_text(cause, &status);
+                    let call_resolution_evidence = match cause {
+                        ValueFlowIncompleteCause::CallResolution { call, .. } => {
+                            if is_rust_taint_call(call) {
+                                let key = call.durable_key();
+                                plan.call_resolution_evidence
+                                    .as_ref()
+                                    .filter(|evidence| evidence.call == key)
+                                    .or_else(|| {
+                                        metadata.values().find_map(|candidate| {
+                                            candidate
+                                                .call_resolution_evidence
+                                                .as_ref()
+                                                .filter(|evidence| evidence.call == key)
+                                        })
+                                    })
+                            } else {
+                                None
+                            }
                         }
-                        Some(status) => status.label().to_owned(),
-                        None => "incomplete coverage".to_owned(),
+                        _ => None,
                     };
-                    let (primary, obligation) = match cause {
-                        ValueFlowIncompleteCause::CallResolution { call, .. } => (
-                            Some(super::semantic_identity::policy_location(
-                                workspace,
-                                super::semantic_identity::call_site_locator(call),
-                            )?),
-                            "; this exact call has neither a completely resolved executable target nor an applicable complete external model",
-                        ),
+                    let rust_call_site = match cause {
+                        ValueFlowIncompleteCause::CallResolution { call, .. }
+                        | ValueFlowIncompleteCause::CallBinding { call, .. }
+                        | ValueFlowIncompleteCause::CallBindingCoverage { call, .. } => {
+                            is_rust_taint_call(call)
+                        }
+                        _ => false,
+                    };
+                    let family = if rust_call_site
+                        && matches!(cause, ValueFlowIncompleteCause::CallResolution { .. })
+                    {
+                        CALL_SITE_EVIDENCE_FAMILY.to_owned()
+                    } else {
+                        generic_family
+                    };
+                    let (primary, detail) = match cause {
+                        ValueFlowIncompleteCause::CallResolution { call, .. } => {
+                            if let Some(evidence) = call_resolution_evidence {
+                                (
+                                    Some(evidence.location.clone()),
+                                    call_resolution_detail(evidence),
+                                )
+                            } else if is_rust_taint_call(call) {
+                                let locator = super::semantic_identity::call_site_locator(call);
+                                (
+                                    Some(super::semantic_identity::policy_location(
+                                        workspace, locator,
+                                    )?),
+                                    format!(
+                                        "taint discovery is incomplete at call site {} bytes {}..{}; snapshot input status is {status}; resolver boundary status is unavailable",
+                                        locator.path().as_str(),
+                                        locator.anchor().span().start_byte(),
+                                        locator.anchor().span().end_byte(),
+                                    ),
+                                )
+                            } else {
+                                let locator = super::semantic_identity::call_site_locator(call);
+                                (
+                                    Some(super::semantic_identity::policy_location(
+                                        workspace, locator,
+                                    )?),
+                                    format!(
+                                        "taint discovery is incomplete: {} for {}:{name} is {status}; this exact call has neither a completely resolved executable target nor an applicable complete external model",
+                                        cause.label(),
+                                        locator.path().as_str(),
+                                    ),
+                                )
+                            }
+                        }
                         ValueFlowIncompleteCause::CallBinding { call, .. }
-                        | ValueFlowIncompleteCause::CallBindingCoverage { call, .. } => (
-                            Some(super::semantic_identity::policy_location(
-                                workspace,
-                                super::semantic_identity::call_site_locator(call),
-                            )?),
-                            "; this exact call binding is not completely covered by executable code or an applicable complete external model",
-                        ),
-                        _ => (None, ""),
+                        | ValueFlowIncompleteCause::CallBindingCoverage { call, .. } => {
+                            let locator = super::semantic_identity::call_site_locator(call);
+                            if rust_call_site {
+                                (
+                                    Some(super::semantic_identity::policy_location(
+                                        workspace, locator,
+                                    )?),
+                                    format!(
+                                        "taint discovery is incomplete: call binding for {} is {status}; it is not completely covered by executable code or an applicable complete external model",
+                                        locator.path().as_str(),
+                                    ),
+                                )
+                            } else {
+                                (
+                                    Some(super::semantic_identity::policy_location(
+                                        workspace, locator,
+                                    )?),
+                                    format!(
+                                        "taint discovery is incomplete: {} for {}:{name} is {status}; this exact call binding is not completely covered by executable code or an applicable complete external model",
+                                        cause.label(),
+                                        locator.path().as_str(),
+                                    ),
+                                )
+                            }
+                        }
+                        _ => (None, generic_detail),
                     };
                     // The family names only the repeating cause. A corpus
                     // produces one of these per procedure, so without a family
@@ -5352,15 +7978,8 @@ fn solve_and_project_batch(
                         PolicyDiagnosticCode::EvaluationFailure,
                         PolicyDiagnosticSeverity::Warning,
                         PolicyDiagnosticImpact::RunIncomplete,
-                        format!(
-                            "taint discovery is incomplete: {} is {status}",
-                            cause.label(),
-                        ),
-                        format!(
-                            "taint discovery is incomplete: {} for {}:{name} is {status}{obligation}",
-                            cause.label(),
-                            locator.path().as_str(),
-                        ),
+                        family,
+                        detail,
                         primary,
                         Vec::new(),
                     ) {
@@ -5393,7 +8012,20 @@ fn solve_and_project_batch(
         1,
     ));
     let retained = Arc::new(retained);
-    public_findings.extend(projected_findings);
+    // The public findings come from this batch's own report, so a leak that two
+    // roots reach is reported once per root here as well. Compare against
+    // earlier batches only, as the envelope merge does.
+    let mut fresh_public = Vec::with_capacity(projected_findings.len());
+    for finding in projected_findings {
+        let key = finding.content_key();
+        if !merge.public.contains(&key) {
+            fresh_public.push((key, finding));
+        }
+    }
+    for (key, finding) in fresh_public {
+        merge.public.insert(key);
+        public_findings.push(finding);
+    }
     retained_analyses.push(retained);
     Ok(())
 }
@@ -5799,15 +8431,29 @@ fn bound_coverage_row(mut text: String) -> String {
 /// policy's selectors bound nothing here rather than that the analysis found
 /// nothing (#2659).
 ///
+/// State that the batches of one solve share when they merge into the run.
+///
+/// Each batch solves one root's closure, so a sink reachable from two roots is
+/// projected by two batches, each with the same leak. The merge keeps the first
+/// copy of each leak in every output it feeds.
+#[derive(Default)]
+struct BatchMerge {
+    /// Envelope identities per policy. Kept equal to the identities of that
+    /// policy's `payload.projections`: every path that replaces a payload
+    /// inside the batch loop clears its entry.
+    envelopes: HashMap<PolicyId, HashSet<TaintEnvelopeIdentity>>,
+    /// Content keys of public findings that an earlier batch emitted.
+    public: HashSet<CodeQueryTaintFindingKey>,
+}
+
 /// Seeding the propagation counters here, rather than letting the solve
 /// introduce their names, keeps the metric *name* set a function of the policy
 /// family alone. Retention accounting sums metric name capacities
 /// (`PolicyWorkReport::retained_size` feeds `PolicyRun`'s), and the evaluator's
 /// retention search decides how many findings a run keeps from that size, so a
 /// name set that depended on whether a batch was solved would make the retained
-/// finding set depend on it too. The incremental diff-base work
-/// (`.agents/plans/impact-sliced-diff-base.md`) cannot tolerate that: it has to
-/// prove a reused-result report is byte-identical to a full one.
+/// finding set depend on it too. Incremental and full evaluations must produce
+/// byte-identical reports.
 fn record_compile_metrics(work: &mut PolicyWorkReport, counts: BoundEndpointCounts) {
     for (name, value) in [
         (
@@ -6138,11 +8784,12 @@ fn project_policy_findings(
                     .map_err(|error| error.to_string())?;
             for label in &group.labels {
                 source_facts.push(
-                    TaintSourceProjectionFact::try_new(
+                    TaintSourceProjectionFact::try_new_with_threat_model(
                         group.source.identity.clone(),
                         group.source.semantic_hash,
                         group.source.analysis_projection_hash,
                         group.source.definition.display_name.clone(),
+                        group.source.definition.threat_model,
                         group.source.definition.categories.clone(),
                         label.clone(),
                         group.source.definition.evidence.clone(),
@@ -6180,7 +8827,17 @@ fn project_policy_findings(
                 .iter()
                 .any(|finding| finding.origins().origin_truncated())
                 || origins_omitted > 0;
-            let pair_proven = group.findings.iter().all(|finding| finding.is_proven());
+            let pair_proven = group.findings.iter().all(|finding| finding.is_proven())
+                && (report.result().is_complete()
+                    || group
+                        .origins
+                        .iter()
+                        .all(|origin| origin.has_accepted_path()));
+            let pair_closures = group
+                .origins
+                .iter()
+                .flat_map(|origin| origin.authored_arm_closures().iter().cloned())
+                .collect::<Vec<_>>();
             let pair_finding_incomplete =
                 group.findings.iter().any(|finding| !finding.is_complete());
             let pair_witness_incomplete = group.findings.iter().any(|finding| {
@@ -6201,7 +8858,7 @@ fn project_policy_findings(
                     .min(budget.max_witnesses_per_finding()),
                 witness_limits,
                 budget,
-                report.authored_arm_closures(),
+                &pair_closures,
                 store_write_evidence,
             )?;
             let witness_refs_truncated = projected_report.witnesses_truncated;
@@ -6333,6 +8990,7 @@ fn project_taint_origins(
             origins.push(TaintOriginProjection {
                 source_endpoint: group.source.identity.clone(),
                 source_label: label.clone(),
+                source_threat_model: group.source.definition.threat_model,
                 source_evidence: group.source.definition.evidence.clone(),
                 primary: super::semantic_identity::policy_location(
                     workspace,
@@ -6467,25 +9125,14 @@ fn project_taint_report(
             workspace,
             origin.origin().value_flow_key().site(),
         )?;
-        if &location == primary
-            || related
-                .iter()
-                .any(|item: &RelatedPolicyLocation| item.location() == &location)
-        {
-            continue;
-        }
-        if related.len() >= related_limit {
-            omitted_related = omitted_related.saturating_add(1);
-            continue;
-        }
-        related.push(
-            RelatedPolicyLocation::try_new(
-                PolicyLocationRelationship::Source,
-                location,
-                Vec::new(),
-            )
-            .map_err(|error| error.to_string())?,
-        );
+        super::projection::retain_related_location(
+            &mut related,
+            primary,
+            PolicyLocationRelationship::Source,
+            location,
+            related_limit,
+            &mut omitted_related,
+        )?;
     }
     // A store-fed origin carries the write-to-read edge it crossed: the write
     // call sites that fed its channel, and the origin sites whose values those
@@ -6502,21 +9149,14 @@ fn project_taint_report(
         ] {
             for site in sites {
                 let location = super::semantic_identity::policy_location(workspace, site)?;
-                if &location == primary
-                    || related
-                        .iter()
-                        .any(|item: &RelatedPolicyLocation| item.location() == &location)
-                {
-                    continue;
-                }
-                if related.len() >= related_limit {
-                    omitted_related = omitted_related.saturating_add(1);
-                    continue;
-                }
-                related.push(
-                    RelatedPolicyLocation::try_new(relationship, location, Vec::new())
-                        .map_err(|error| error.to_string())?,
-                );
+                super::projection::retain_related_location(
+                    &mut related,
+                    primary,
+                    relationship,
+                    location,
+                    related_limit,
+                    &mut omitted_related,
+                )?;
             }
         }
     }
@@ -6538,6 +9178,17 @@ fn project_taint_report(
         },
         witness_refs,
     ))
+}
+
+/// The policy witness vocabulary for one step of a taint solver witness.
+fn taint_witness_step_kind(kind: &SummaryWitnessStepKind) -> (WitnessStepKind, &'static str) {
+    match kind {
+        SummaryWitnessStepKind::Seed => (WitnessStepKind::Source, "taint source"),
+        SummaryWitnessStepKind::Edge(_) => (WitnessStepKind::Propagation, "taint propagation"),
+        SummaryWitnessStepKind::EndSummaryGap(_) => {
+            (WitnessStepKind::Return, "taint summary boundary")
+        }
+    }
 }
 
 struct ProjectedTaintWitnesses {
@@ -6599,15 +9250,7 @@ fn project_taint_witnesses(
             id.clone(),
             witness_limits.steps,
             witness_limits.bytes,
-            |kind| match kind {
-                SummaryWitnessStepKind::Seed => (WitnessStepKind::Source, "taint source"),
-                SummaryWitnessStepKind::Edge(_) => {
-                    (WitnessStepKind::Propagation, "taint propagation")
-                }
-                SummaryWitnessStepKind::EndSummaryGap(_) => {
-                    (WitnessStepKind::Return, "taint summary boundary")
-                }
-            },
+            taint_witness_step_kind,
         )?;
         let Some(mut projected) = projected else {
             omitted = omitted.saturating_add(1);
@@ -6690,15 +9333,7 @@ fn project_store_crossing_witness(
             downstream.id(),
             limits.steps,
             limits.bytes,
-            |kind| match kind {
-                SummaryWitnessStepKind::Seed => (WitnessStepKind::Source, "taint source"),
-                SummaryWitnessStepKind::Edge(_) => {
-                    (WitnessStepKind::Propagation, "taint propagation")
-                }
-                SummaryWitnessStepKind::EndSummaryGap(_) => {
-                    (WitnessStepKind::Return, "taint summary boundary")
-                }
-            },
+            taint_witness_step_kind,
         )?;
         omitted = omitted
             .saturating_add(u64::try_from(upstream.omitted_steps_lower_bound()).unwrap_or(u64::MAX))
@@ -6830,7 +9465,9 @@ fn record_exhausted_lane(payload: &mut TaintProjectionPayload, lane: ExhaustedTa
         // A run that already failed or is unsupported cannot be made more
         // reliable by a budget note, and its completion forbids an incomplete
         // diagnostic impact.
-        PolicyRunCompletion::Unsupported { .. } | PolicyRunCompletion::Failed { .. } => return,
+        PolicyRunCompletion::NotRun { .. }
+        | PolicyRunCompletion::Unsupported { .. }
+        | PolicyRunCompletion::Failed { .. } => return,
     }
     let Ok(diagnostic) = PolicyDiagnostic::try_new_in_family(
         lane.diagnostic_code(),
@@ -6851,18 +9488,12 @@ fn record_exhausted_lane(payload: &mut TaintProjectionPayload, lane: ExhaustedTa
 fn prepared_failure_payload(message: &str, work: PolicyWorkReport) -> TaintProjectionPayload {
     let completion = PolicyRunCompletion::failed(vec![PolicyFailureReason::InternalInvariant])
         .expect("one failure reason is canonical");
-    // Bounded, not validated: a compile-failure explanation can embed every
-    // underlying query diagnostic and must survive being oversized (#2779).
-    let diagnostic = Some(PolicyDiagnostic::new_bounded(
-        PolicyDiagnosticCode::EvaluationFailure,
-        PolicyDiagnosticSeverity::Error,
-        PolicyDiagnosticImpact::RunFailed,
-        message,
-    ));
     TaintProjectionPayload {
+        engine: None,
+        scope: None,
         projections: Vec::new(),
         completion,
-        diagnostics: diagnostic.into_iter().collect(),
+        diagnostics: vec![super::projection::failed_projection_diagnostic(message)],
         diagnostics_truncated: false,
         work,
         authored_arm_closures: Vec::new(),
@@ -6912,6 +9543,8 @@ fn prepared_compile_failure_payload(failure: TaintPolicyCompileFailure) -> Taint
         message,
     ));
     TaintProjectionPayload {
+        engine: None,
+        scope: None,
         projections: Vec::new(),
         completion,
         diagnostics: diagnostic.into_iter().collect(),
@@ -6925,9 +9558,7 @@ fn required_selector<'a>(
     selectors: &HashMap<&PolicySelectorPath, &'a ResolvedPolicySelector>,
     path: &PolicySelectorPath,
 ) -> Result<&'a ResolvedPolicySelector, TaintPolicyCompileError> {
-    selectors
-        .get(path)
-        .copied()
+    super::selector_compiler::find_resolved_selector(selectors, path)
         .ok_or_else(|| TaintPolicyCompileError::MissingSelector(path.as_str().to_owned()))
 }
 
@@ -6939,6 +9570,55 @@ struct CallCandidate {
     range: ByteRange<usize>,
     procedure: ProcedureHandle,
     handle: brokk_bifrost_analysis::analyzer::semantic::CallSiteHandle,
+}
+
+fn semantic_call_is_constructor(
+    procedure: &ProcedureHandle,
+    call_handle: &brokk_bifrost_analysis::analyzer::semantic::CallSiteHandle,
+) -> bool {
+    let call = procedure
+        .semantics()
+        .call_site(call_handle.id())
+        .expect("validated semantic call handle resolves");
+    procedure
+        .semantics()
+        .point(call.point)
+        .expect("validated semantic call point resolves")
+        .events
+        .iter()
+        .any(|event| {
+            matches!(
+                &event.effect,
+                SemanticEffect::CallableReference { result, callable }
+                    | SemanticEffect::CallableCreation { result, callable }
+                    if *result == call.callee
+                        && callable.kind == CallableReferenceKind::Constructor
+            )
+        })
+}
+
+fn taint_endpoint_kind(
+    procedure: &ProcedureHandle,
+    call: &brokk_bifrost_analysis::analyzer::semantic::CallSiteHandle,
+    binding: &PolicyPort,
+) -> TaintEndpointKind {
+    match binding {
+        PolicyPort::Receiver => TaintEndpointKind::Receiver,
+        PolicyPort::ReturnValue | PolicyPort::ResultIndex { .. }
+            if semantic_call_is_constructor(procedure, call) =>
+        {
+            TaintEndpointKind::ConstructorResult
+        }
+        PolicyPort::ReturnValue | PolicyPort::ResultIndex { .. } => TaintEndpointKind::ReturnValue,
+        PolicyPort::ArgumentIndex { .. } => TaintEndpointKind::Argument,
+        PolicyPort::ArgumentName { .. } => {
+            unreachable!("formal-name ports resolve to an ordinal before endpoint classification")
+        }
+        PolicyPort::MatchedValue => TaintEndpointKind::MatchedValue,
+        PolicyPort::FieldOf { .. } => {
+            unreachable!("field ports are not executable taint endpoint bindings")
+        }
+    }
 }
 
 /// What one selector row names in the semantic model.
@@ -7069,12 +9749,15 @@ fn select_call(
     ))
 }
 
+/// The value and observation point a port names at one selected call. `None`
+/// means the call has no operand for a receiver or argument port, so the port
+/// names nothing there; the caller refuses that site.
 fn select_value(
     procedure: &ProcedureHandle,
     call_handle: &brokk_bifrost_analysis::analyzer::semantic::CallSiteHandle,
     selected_span: &ByteRange<usize>,
     binding: &PolicyPort,
-) -> Result<(ValueHandle, ProgramPointHandle), TaintPolicyCompileError> {
+) -> Result<Option<(ValueHandle, ProgramPointHandle)>, TaintPolicyCompileError> {
     let call = procedure
         .semantics()
         .call_site(call_handle.id())
@@ -7102,11 +9785,10 @@ fn select_value(
             }
             matching[0].id
         }
-        PolicyPort::Receiver => call.receiver.ok_or_else(|| {
-            TaintPolicyCompileError::SemanticUnavailable(
-                "receiver binding selected a call without a receiver".to_owned(),
-            )
-        })?,
+        PolicyPort::Receiver => match call.receiver {
+            Some(receiver) => receiver,
+            None => return Ok(None),
+        },
         PolicyPort::ReturnValue => call.result.ok_or_else(|| {
             TaintPolicyCompileError::SemanticUnavailable(
                 "return-value binding selected a call without a normal result".to_owned(),
@@ -7124,18 +9806,15 @@ fn select_value(
                 ))
             })?,
         PolicyPort::ArgumentIndex { index } => {
-            call.arguments
-                .get(usize::try_from(*index).map_err(|_| {
-                    TaintPolicyCompileError::UnsupportedBinding(
-                        "argument index does not fit this platform".to_owned(),
-                    )
-                })?)
-                .ok_or_else(|| {
-                    TaintPolicyCompileError::SemanticUnavailable(format!(
-                        "selected call has no argument at index {index}"
-                    ))
-                })?
-                .value
+            let position = usize::try_from(*index).map_err(|_| {
+                TaintPolicyCompileError::UnsupportedBinding(
+                    "argument index does not fit this platform".to_owned(),
+                )
+            })?;
+            match call.arguments.get(position) {
+                Some(argument) => argument.value,
+                None => return Ok(None),
+            }
         }
         PolicyPort::ArgumentName { .. } => {
             unreachable!("formal-name ports resolve to an ordinal before carrier selection")
@@ -7150,7 +9829,18 @@ fn select_value(
         binding,
         PolicyPort::ReturnValue | PolicyPort::ResultIndex { .. }
     ) {
-        call.normal_continuation.target()
+        // A zero-argument return source can be the receiver of an enclosing
+        // call, whose invocation point precedes the nested expression's
+        // normal continuation in the Rust lowering. Observe the returned
+        // value at its call point so that the enclosing receiver boundary can
+        // carry it through the reviewed summary. Calls with arguments keep
+        // the ordinary post-call observation, which prevents their own input
+        // effects from seeing a value before the invocation completes.
+        if call.arguments.is_empty() {
+            Some(call.point)
+        } else {
+            call.normal_continuation.target()
+        }
     } else {
         Some(call.point)
     }
@@ -7165,7 +9855,17 @@ fn select_value(
     let point = procedure
         .point_handle(point_id)
         .expect("validated call point has a scoped handle");
-    Ok((value, point))
+    Ok(Some((value, point)))
+}
+
+/// The port as the policy writes it, for a refusal that names a missing
+/// operand. Only receiver and argument ports can name a missing operand.
+fn operand_port_label(port: &PolicyPort) -> String {
+    match port {
+        PolicyPort::Receiver => "receiver".to_owned(),
+        PolicyPort::ArgumentIndex { index } => format!("(argument :index {index})"),
+        _ => unreachable!("only receiver and argument ports can name a missing operand"),
+    }
 }
 
 fn conjoin_proof(left: &ProofStatus, right: &ProofStatus) -> ProofStatus {
@@ -7202,41 +9902,35 @@ const fn value_flow_phase(phase: ObservationPhase) -> ValueFlowObservationPhase 
     }
 }
 
+fn cmp_bound_endpoint_site(left: &BoundEndpoint, right: &BoundEndpoint) -> std::cmp::Ordering {
+    left.point
+        .procedure()
+        .semantics()
+        .locator()
+        .cmp(right.point.procedure().semantics().locator())
+        .then_with(|| left.point.id().cmp(&right.point.id()))
+}
+
+fn cmp_bound_endpoint(left: &BoundEndpoint, right: &BoundEndpoint) -> std::cmp::Ordering {
+    cmp_bound_endpoint_site(left, right)
+        .then_with(|| left.endpoint.cmp(&right.endpoint))
+        .then_with(|| left.kind.cmp(&right.kind))
+}
+
 fn sort_bound_endpoints(endpoints: &mut [BoundEndpoint]) {
-    endpoints.sort_by(|left, right| {
-        left.point
-            .procedure()
-            .semantics()
-            .locator()
-            .cmp(right.point.procedure().semantics().locator())
-            .then_with(|| left.point.id().cmp(&right.point.id()))
-            .then_with(|| left.endpoint.cmp(&right.endpoint))
-    });
+    endpoints.sort_by(cmp_bound_endpoint);
 }
 
 fn sort_bound_sanitizers(sanitizers: &mut [BoundSanitizer]) {
     sanitizers.sort_by(|left, right| {
-        left.input
-            .point
-            .procedure()
-            .semantics()
-            .locator()
-            .cmp(right.input.point.procedure().semantics().locator())
-            .then_with(|| left.input.point.id().cmp(&right.input.point.id()))
-            .then_with(|| left.input.endpoint.cmp(&right.input.endpoint))
+        cmp_bound_endpoint(&left.input, &right.input)
             .then_with(|| left.output.point.id().cmp(&right.output.point.id()))
     });
 }
 
 fn sort_bound_transforms(transforms: &mut [BoundTransform]) {
     transforms.sort_by(|left, right| {
-        left.output
-            .point
-            .procedure()
-            .semantics()
-            .locator()
-            .cmp(right.output.point.procedure().semantics().locator())
-            .then_with(|| left.output.point.id().cmp(&right.output.point.id()))
+        cmp_bound_endpoint_site(&left.output, &right.output)
             .then_with(|| left.input.endpoint.cmp(&right.input.endpoint))
             .then_with(|| left.input.point.id().cmp(&right.input.point.id()))
     });
@@ -7342,74 +10036,105 @@ enum FieldDestinationResolution {
 }
 
 impl<'a> TaintPolicyCompiler<'a> {
-    /// Install one curated call model per modeled call site (#2691).
-    ///
-    /// Several entries selecting one call merge into one model: per port pair
-    /// the moved label set is the union of every declaration that moves the
-    /// label and does not remove it, and the model removes everything else in
-    /// the universe at that seam, so a transfer only ever carries its declared
-    /// labels and an explicit `(sanitize :removes ...)` no-flow declaration
-    /// carries none. The whole group's selection quality conjoins into every
-    /// transfer's evidence, so an unproven or partial selection keeps the run
-    /// from completing while the declared semantics still apply.
+    /// Install the in-code Rust std operations as curated call models
+    /// (#3757): `str::to_owned` and `str::len` carry the receiver to the
+    /// result, `Ok`, `Err`, and `Some` carry their argument, and
+    /// `String::new()` returns a fresh value. They are Bifrost-authored
+    /// language-library facts applied only where the resolver, or the
+    /// literal receiver's structure, proves the std identity, so they model
+    /// the call at the derived tier. A call another model already owns keeps
+    /// that model.
+    fn install_rust_std_builtin_models(
+        &mut self,
+        plan: ValueFlowPlan,
+    ) -> Result<ValueFlowPlan, TaintPolicyCompileError> {
+        let workspace = self.selectors.workspace();
+        let mut models = Vec::new();
+        let mut modeled = HashSet::new();
+        for procedure in plan.mounted_procedures() {
+            for row in procedure.semantics().call_sites() {
+                let Some(call) = procedure.call_site_handle(row.id) else {
+                    continue;
+                };
+                if plan.has_curated_call_model(&call) || !modeled.insert(call.clone()) {
+                    continue;
+                }
+                let Some(builtin) = rust_std_builtin_call(workspace, &call)
+                    .map_err(|error| TaintPolicyCompileError::Plan(error.to_string()))?
+                else {
+                    continue;
+                };
+                models.push(ValueFlowCuratedCallModel::new(
+                    call,
+                    rust_std_builtin_model(&builtin)?,
+                ));
+            }
+        }
+        if models.is_empty() {
+            return Ok(plan);
+        }
+        plan.with_curated_call_models(models)
+            .map_err(|error| TaintPolicyCompileError::Plan(error.to_string()))
+    }
+
+    /// Install one curated call model per modeled call site (#2691), merged
+    /// as [`ExternalCallSeams`] describes.
     fn install_bound_external_models(
         &mut self,
         plan: ValueFlowPlan,
         models: &[BoundExternalModel],
         universe: &TaintUniverse,
+        rust_format_result_calls: &[(CallSiteHandle, ResolverOwnedExternalCalleeIdentity)],
     ) -> Result<ValueFlowPlan, TaintPolicyCompileError> {
-        if models.is_empty() {
+        if models.is_empty() && rust_format_result_calls.is_empty() {
             return Ok(plan);
         }
-        let plan_error =
-            |error: &dyn fmt::Display| TaintPolicyCompileError::Plan(error.to_string());
         // `models` is sorted by call identity, so equal calls are adjacent.
-        let mut grouped: Vec<(CallSiteHandle, Vec<&BoundExternalModel>)> = Vec::new();
+        let mut grouped: Vec<(
+            CallSiteHandle,
+            Vec<&BoundExternalModel>,
+            Option<ResolverOwnedExternalCalleeIdentity>,
+        )> = Vec::new();
         for model in models {
             match grouped.last_mut() {
-                Some((call, group)) if call.durable_key() == model.call.durable_key() => {
+                Some((call, group, _)) if call.durable_key() == model.call.durable_key() => {
                     group.push(model);
                 }
-                _ => grouped.push((model.call.clone(), vec![model])),
+                _ => grouped.push((model.call.clone(), vec![model], None)),
             }
         }
+        for (call, identity) in rust_format_result_calls {
+            if let Some((_, _, recorded_identity)) = grouped
+                .iter_mut()
+                .find(|(candidate, _, _)| candidate.durable_key() == call.durable_key())
+            {
+                if let Some(recorded_identity) = recorded_identity {
+                    assert_eq!(recorded_identity, identity);
+                } else {
+                    *recorded_identity = Some(identity.clone());
+                }
+            } else {
+                grouped.push((call.clone(), Vec::new(), Some(identity.clone())));
+            }
+        }
+        grouped.sort_by(|left, right| {
+            left.0
+                .procedure()
+                .semantics()
+                .locator()
+                .cmp(right.0.procedure().semantics().locator())
+                .then_with(|| left.0.id().cmp(&right.0.id()))
+        });
         let mut curated = Vec::with_capacity(grouped.len());
         let mut location_bindings = Vec::new();
-        for (call, group) in grouped {
-            let mut proof = ProofStatus::Proven;
-            let mut completeness = EvidenceCompleteness::Complete;
-            let mut names = Vec::with_capacity(group.len());
-            // Per port pair: the union of moved labels across the group's
-            // declarations plus the field destination identity. A label moves
-            // when at least one declaration lists it and does not remove it at
-            // this seam.
-            type Seam<'model> = (BTreeSet<&'model str>, Option<&'model ModelFieldDestination>);
-            let mut moved: BTreeMap<(SummaryPort, SummaryPort), Seam<'_>> = BTreeMap::new();
-            for model in &group {
-                proof = conjoin_proof(&proof, &model.proof);
-                completeness = conjoin_completeness(&completeness, &model.completeness);
-                names.push(external_model_entry_name(&model.entry));
-                for transfer in &model.transfers {
-                    let seam = moved
-                        .entry((transfer.from.clone(), transfer.to.clone()))
-                        .or_default();
-                    for label in &transfer.labels {
-                        if !transfer.removes.contains(label) {
-                            seam.0.insert(label.as_str());
-                        }
-                    }
-                    if seam.1.is_none() {
-                        seam.1 = transfer.field.as_ref();
-                    }
-                }
-            }
-            names.sort_unstable();
-            names.dedup();
+        for (call, group, rust_format_identity) in grouped {
+            let mut seams =
+                ExternalCallSeams::new(&call, &group, rust_format_identity.as_ref(), universe);
             // Decide every field destination against the plan's closed
             // carrier set before the model is built, so an unobservable write
             // drops out of the model entirely and the rest stays complete.
             let mut dropped_ports = Vec::new();
-            for ((_, to), (_, field)) in &moved {
+            for ((_, to), (_, field)) in &seams.moved {
                 let Some(field) = field else { continue };
                 match self.resolve_field_destination(&plan, &call, field)? {
                     FieldDestinationResolution::Bind(carrier) => {
@@ -7423,70 +10148,8 @@ impl<'a> TaintPolicyCompiler<'a> {
                     FieldDestinationResolution::Ambiguous => {}
                 }
             }
-            moved.retain(|(_, to), _| !dropped_ports.contains(to));
-            let evidence = SummaryEvidence::from_semantic(&proof, &completeness)
-                .map_err(|e| plan_error(&e))?;
-            let mut content = Vec::new();
-            content.extend_from_slice(b"bifrost-policy-external-model/v1\0");
-            for name in &names {
-                content.extend_from_slice(name.as_bytes());
-                content.push(0);
-            }
-            let mut transfers = Vec::with_capacity(moved.len());
-            let mut effects = Vec::with_capacity(moved.len());
-            for ((from, to), (seam, _)) in &moved {
-                content.extend_from_slice(format!("{from:?}->{to:?}:").as_bytes());
-                for label in seam.iter() {
-                    content.extend_from_slice(label.as_bytes());
-                    content.push(0);
-                }
-                content.push(b'\n');
-                transfers.push(
-                    SummaryTransfer::try_new(
-                        from.clone(),
-                        SummaryExit::try_new(SummaryExitKind::Normal, to.clone())
-                            .map_err(|e| plan_error(&e))?,
-                        evidence.clone(),
-                    )
-                    .map_err(|e| plan_error(&e))?,
-                );
-                let removed = universe
-                    .classes()
-                    .iter()
-                    .map(|class| class.as_str())
-                    .filter(|class| !seam.contains(class))
-                    .collect::<Vec<_>>();
-                if !removed.is_empty() {
-                    effects.push(SummaryEffect::new(
-                        SummaryEffectKey::sanitize(from.clone(), to.clone(), removed),
-                        evidence.clone(),
-                    ));
-                }
-            }
-            match &proof {
-                ProofStatus::Proven => content.extend_from_slice(b"proven\0"),
-                ProofStatus::Unproven(reason) => {
-                    content.extend_from_slice(b"unproven:");
-                    content.extend_from_slice(reason.as_bytes());
-                    content.push(0);
-                }
-            }
-            match &completeness {
-                EvidenceCompleteness::Complete => content.extend_from_slice(b"complete\0"),
-                EvidenceCompleteness::Partial(reason) => {
-                    content.extend_from_slice(b"partial:");
-                    content.extend_from_slice(reason.as_bytes());
-                    content.push(0);
-                }
-            }
-            let model = CuratedCallModel::try_new_with_effects(
-                ExternalSummaryModelId::new(names.join("+")).map_err(|e| plan_error(&e))?,
-                ExternalSummaryContentHash::hash_bytes(&content),
-                transfers,
-                effects,
-            )
-            .map_err(|e| plan_error(&e))?;
-            curated.push(ValueFlowCuratedCallModel::new(call, model));
+            seams.moved.retain(|(_, to), _| !dropped_ports.contains(to));
+            curated.push(ValueFlowCuratedCallModel::new(call, seams.model(universe)?));
         }
         let plan = plan
             .with_curated_call_models(curated)
@@ -7545,6 +10208,208 @@ impl<'a> TaintPolicyCompiler<'a> {
     }
 }
 
+/// The curated model of one reviewed Rust std operation (#3757).
+pub(crate) fn rust_std_builtin_model(
+    builtin: &RustStdBuiltinCall,
+) -> Result<CuratedCallModel, TaintPolicyCompileError> {
+    let plan_error = |error: &dyn fmt::Display| TaintPolicyCompileError::Plan(error.to_string());
+    let evidence =
+        SummaryEvidence::from_semantic(&ProofStatus::Proven, &EvidenceCompleteness::Complete)
+            .map_err(|e| plan_error(&e))?;
+    let input = match builtin.transfer {
+        RustStdBuiltinTransfer::ReceiverToResult => Some(SummaryPort::Receiver),
+        RustStdBuiltinTransfer::ArgumentToResult => Some(SummaryPort::Parameter(0)),
+        RustStdBuiltinTransfer::FreshResult => None,
+    };
+    let transfers = input
+        .map(|input| {
+            SummaryTransfer::try_new(
+                input,
+                SummaryExit::try_new(SummaryExitKind::Normal, SummaryPort::NormalReturn)
+                    .map_err(|e| plan_error(&e))?,
+                evidence.clone(),
+            )
+            .map_err(|e| plan_error(&e))
+        })
+        .transpose()?
+        .into_iter()
+        .collect();
+    let mut content = b"bifrost-rust-std-builtin/v1\0".to_vec();
+    content.extend_from_slice(builtin.operation.as_bytes());
+    content.extend_from_slice(format!("\0{:?}", builtin.transfer).as_bytes());
+    CuratedCallModel::try_new(
+        ExternalSummaryModelId::new(format!("bifrost.rust-std#{}", builtin.operation))
+            .map_err(|e| plan_error(&e))?,
+        ExternalSummaryContentHash::hash_bytes(&content),
+        transfers,
+    )
+    .map_err(|e| plan_error(&e))
+}
+
+/// One label set a modeled call moves across one port pair, and the field
+/// destination of the pair's output when it writes a field.
+type ExternalSeam<'model> = (BTreeSet<&'model str>, Option<&'model ModelFieldDestination>);
+
+/// The merged declarations of the external models bound to one call (#2691),
+/// with the call's standard format identity when its dispatch proves one.
+///
+/// Several entries selecting one call merge into one model: per port pair
+/// the moved label set is the union of every declaration that moves the
+/// label and does not remove it, and the model removes everything else in
+/// the universe at that seam, so a transfer only ever carries its declared
+/// labels and an explicit `(sanitize :removes ...)` no-flow declaration
+/// carries none. The whole group's selection quality conjoins into every
+/// transfer's evidence, so an unproven or partial selection keeps the run
+/// from completing while the declared semantics still apply.
+pub(crate) struct ExternalCallSeams<'model> {
+    names: Vec<String>,
+    proof: ProofStatus,
+    completeness: EvidenceCompleteness,
+    moved: BTreeMap<(SummaryPort, SummaryPort), ExternalSeam<'model>>,
+}
+
+impl<'model> ExternalCallSeams<'model> {
+    pub(crate) fn new(
+        call: &CallSiteHandle,
+        group: &[&'model BoundExternalModel],
+        rust_format_identity: Option<&ResolverOwnedExternalCalleeIdentity>,
+        universe: &'model TaintUniverse,
+    ) -> Self {
+        let mut proof = ProofStatus::Proven;
+        let mut completeness = EvidenceCompleteness::Complete;
+        let mut names =
+            Vec::with_capacity(group.len() + usize::from(rust_format_identity.is_some()));
+        let mut moved: BTreeMap<(SummaryPort, SummaryPort), ExternalSeam<'model>> = BTreeMap::new();
+        for model in group {
+            proof = conjoin_proof(&proof, &model.proof);
+            completeness = conjoin_completeness(&completeness, &model.completeness);
+            names.push(external_model_entry_name(&model.entry));
+            for transfer in &model.transfers {
+                let seam = moved
+                    .entry((transfer.from.clone(), transfer.to.clone()))
+                    .or_default();
+                for label in &transfer.labels {
+                    if !transfer.removes.contains(label) {
+                        seam.0.insert(label.as_str());
+                    }
+                }
+                if seam.1.is_none() {
+                    seam.1 = transfer.field.as_ref();
+                }
+            }
+        }
+        if let Some(identity) = rust_format_identity {
+            assert_eq!(
+                identity.language(),
+                brokk_bifrost_analysis::analyzer::Language::Rust
+            );
+            assert!(matches!(identity.owner_fqn(), "std" | "core" | "alloc"));
+            assert!(matches!(identity.member(), "format" | "format_args"));
+            names.push(format!(
+                "bifrost.intrinsic.rust-format.{}.{}",
+                identity.owner_fqn(),
+                identity.member()
+            ));
+            let semantic_call = call
+                .procedure()
+                .semantics()
+                .call_site(call.id())
+                .expect("the dispatched call belongs to its retained procedure");
+            for index in 0..semantic_call.arguments.len() {
+                let seam = moved
+                    .entry((
+                        SummaryPort::Parameter(
+                            u32::try_from(index).expect("semantic call argument index fits u32"),
+                        ),
+                        SummaryPort::NormalReturn,
+                    ))
+                    .or_default();
+                seam.0
+                    .extend(universe.classes().iter().map(|class| class.as_str()));
+            }
+        }
+        names.sort_unstable();
+        names.dedup();
+        Self {
+            names,
+            proof,
+            completeness,
+            moved,
+        }
+    }
+
+    /// The curated model of these seams.
+    pub(crate) fn model(
+        &self,
+        universe: &TaintUniverse,
+    ) -> Result<CuratedCallModel, TaintPolicyCompileError> {
+        let plan_error =
+            |error: &dyn fmt::Display| TaintPolicyCompileError::Plan(error.to_string());
+        let evidence = SummaryEvidence::from_semantic(&self.proof, &self.completeness)
+            .map_err(|e| plan_error(&e))?;
+        let mut content = Vec::new();
+        content.extend_from_slice(b"bifrost-policy-external-model/v1\0");
+        for name in &self.names {
+            content.extend_from_slice(name.as_bytes());
+            content.push(0);
+        }
+        let mut transfers = Vec::with_capacity(self.moved.len());
+        let mut effects = Vec::with_capacity(self.moved.len());
+        for ((from, to), (seam, _)) in &self.moved {
+            content.extend_from_slice(format!("{from:?}->{to:?}:").as_bytes());
+            for label in seam.iter() {
+                content.extend_from_slice(label.as_bytes());
+                content.push(0);
+            }
+            content.push(b'\n');
+            transfers.push(
+                SummaryTransfer::try_new(
+                    from.clone(),
+                    SummaryExit::try_new(SummaryExitKind::Normal, to.clone())
+                        .map_err(|e| plan_error(&e))?,
+                    evidence.clone(),
+                )
+                .map_err(|e| plan_error(&e))?,
+            );
+            let removed = universe
+                .classes()
+                .iter()
+                .map(|class| class.as_str())
+                .filter(|class| !seam.contains(class))
+                .collect::<Vec<_>>();
+            if !removed.is_empty() {
+                effects.push(SummaryEffect::new(
+                    SummaryEffectKey::sanitize(from.clone(), to.clone(), removed),
+                    evidence.clone(),
+                ));
+            }
+        }
+        match &self.proof {
+            ProofStatus::Proven => content.extend_from_slice(b"proven\0"),
+            ProofStatus::Unproven(reason) => {
+                content.extend_from_slice(b"unproven:");
+                content.extend_from_slice(reason.as_bytes());
+                content.push(0);
+            }
+        }
+        match &self.completeness {
+            EvidenceCompleteness::Complete => content.extend_from_slice(b"complete\0"),
+            EvidenceCompleteness::Partial(reason) => {
+                content.extend_from_slice(b"partial:");
+                content.extend_from_slice(reason.as_bytes());
+                content.push(0);
+            }
+        }
+        CuratedCallModel::try_new_with_effects(
+            ExternalSummaryModelId::new(self.names.join("+")).map_err(|e| plan_error(&e))?,
+            ExternalSummaryContentHash::hash_bytes(&content),
+            transfers,
+            effects,
+        )
+        .map_err(|e| plan_error(&e))
+    }
+}
+
 /// The one curated call model every store-selected call receives: no direct
 /// transfers, so the call's whole value behavior is the declared boundary.
 fn store_boundary_call_model()
@@ -7588,14 +10453,7 @@ fn string_literal_key_identity(token: &str) -> TaintStoreDimension {
 
 fn sort_bound_store_ends(ends: &mut [BoundStoreEnd]) {
     ends.sort_by(|left, right| {
-        left.endpoint
-            .point
-            .procedure()
-            .semantics()
-            .locator()
-            .cmp(right.endpoint.point.procedure().semantics().locator())
-            .then_with(|| left.endpoint.point.id().cmp(&right.endpoint.point.id()))
-            .then_with(|| left.endpoint.endpoint.cmp(&right.endpoint.endpoint))
+        cmp_bound_endpoint(&left.endpoint, &right.endpoint)
             .then_with(|| left.channel.cmp(&right.channel))
     });
 }
@@ -7637,56 +10495,66 @@ fn keyed_source_event_specs(
     endpoints: &[BoundEndpoint],
     offset: usize,
 ) -> Result<Vec<(ValueFlowEventKey, ValueFlowSourceSpec)>, TaintPolicyCompileError> {
-    endpoints
-        .iter()
-        .enumerate()
-        .map(|(index, endpoint)| {
-            let ordinal = u32::try_from(offset + index).map_err(|_| {
-                TaintPolicyCompileError::Plan("taint source ordinal overflow".to_owned())
-            })?;
-            let key =
-                ValueFlowEventKey::at_point(&endpoint.point, ordinal, ValueFlowEventKind::Source)
-                    .map_err(|error| TaintPolicyCompileError::Plan(error.to_string()))?;
-            Ok((
-                key.clone(),
-                ValueFlowSourceSpec::new(
-                    key,
-                    endpoint.point.clone(),
-                    endpoint.phase,
-                    endpoint.carrier.clone(),
-                    endpoint.proof.clone(),
-                    endpoint.completeness.clone(),
-                ),
-            ))
-        })
-        .collect()
+    keyed_event_specs(
+        endpoints,
+        offset,
+        "source",
+        ValueFlowEventKind::Source,
+        |endpoint, key| {
+            let spec = ValueFlowSourceSpec::new(
+                key,
+                endpoint.point.clone(),
+                endpoint.phase,
+                endpoint.carrier.clone(),
+                endpoint.proof.clone(),
+                endpoint.completeness.clone(),
+            );
+            spec.requiring_dispatches(endpoint.dispatch_obligations.clone())
+        },
+    )
 }
 
 fn keyed_sink_event_specs(
     endpoints: &[BoundEndpoint],
     offset: usize,
 ) -> Result<Vec<(ValueFlowEventKey, ValueFlowSinkSpec)>, TaintPolicyCompileError> {
+    keyed_event_specs(
+        endpoints,
+        offset,
+        "sink",
+        ValueFlowEventKind::Sink,
+        |endpoint, key| {
+            let spec = ValueFlowSinkSpec::new(
+                key,
+                endpoint.point.clone(),
+                endpoint.phase,
+                endpoint.carrier.clone(),
+                endpoint.proof.clone(),
+                endpoint.completeness.clone(),
+            );
+            spec.requiring_dispatches(endpoint.dispatch_obligations.clone())
+        },
+    )
+}
+
+fn keyed_event_specs<T>(
+    endpoints: &[BoundEndpoint],
+    offset: usize,
+    kind_name: &str,
+    kind: ValueFlowEventKind,
+    mut make_spec: impl FnMut(&BoundEndpoint, ValueFlowEventKey) -> T,
+) -> Result<Vec<(ValueFlowEventKey, T)>, TaintPolicyCompileError> {
     endpoints
         .iter()
         .enumerate()
         .map(|(index, endpoint)| {
             let ordinal = u32::try_from(offset + index).map_err(|_| {
-                TaintPolicyCompileError::Plan("taint sink ordinal overflow".to_owned())
+                TaintPolicyCompileError::Plan(format!("taint {kind_name} ordinal overflow"))
             })?;
-            let key =
-                ValueFlowEventKey::at_point(&endpoint.point, ordinal, ValueFlowEventKind::Sink)
-                    .map_err(|error| TaintPolicyCompileError::Plan(error.to_string()))?;
-            Ok((
-                key.clone(),
-                ValueFlowSinkSpec::new(
-                    key,
-                    endpoint.point.clone(),
-                    endpoint.phase,
-                    endpoint.carrier.clone(),
-                    endpoint.proof.clone(),
-                    endpoint.completeness.clone(),
-                ),
-            ))
+            let key = ValueFlowEventKey::at_point(&endpoint.point, ordinal, kind)
+                .map_err(|error| TaintPolicyCompileError::Plan(error.to_string()))?;
+            let spec = make_spec(endpoint, key.clone());
+            Ok((key, spec))
         })
         .collect()
 }
@@ -7695,27 +10563,39 @@ fn source_id_for_event(
     value_flow: &ValueFlowPlan,
     key: &ValueFlowEventKey,
 ) -> Result<ValueFlowSourceId, TaintPolicyCompileError> {
-    value_flow
-        .sources()
-        .find_map(|(id, spec)| (spec.key() == key).then_some(id))
-        .ok_or_else(|| {
-            TaintPolicyCompileError::Plan(
-                "compiled taint source event is absent from the value-flow plan".to_owned(),
-            )
-        })
+    event_id_for_key(
+        value_flow.sources().map(|(id, spec)| (id, spec.key())),
+        key,
+        "source",
+    )
 }
 
 fn sink_id_for_event(
     value_flow: &ValueFlowPlan,
     key: &ValueFlowEventKey,
 ) -> Result<ValueFlowSinkId, TaintPolicyCompileError> {
-    value_flow
-        .sinks()
-        .find_map(|(id, spec)| (spec.key() == key).then_some(id))
+    event_id_for_key(
+        value_flow.sinks().map(|(id, spec)| (id, spec.key())),
+        key,
+        "sink",
+    )
+}
+
+fn event_id_for_key<'a, I, Id>(
+    events: I,
+    key: &ValueFlowEventKey,
+    kind: &str,
+) -> Result<Id, TaintPolicyCompileError>
+where
+    I: IntoIterator<Item = (Id, &'a ValueFlowEventKey)>,
+{
+    events
+        .into_iter()
+        .find_map(|(id, event_key)| (event_key == key).then_some(id))
         .ok_or_else(|| {
-            TaintPolicyCompileError::Plan(
-                "compiled taint sink event is absent from the value-flow plan".to_owned(),
-            )
+            TaintPolicyCompileError::Plan(format!(
+                "compiled taint {kind} event is absent from the value-flow plan"
+            ))
         })
 }
 
@@ -7741,22 +10621,13 @@ fn bind_taint_sources(
     endpoints: &[BoundEndpoint],
     specs: &[(ValueFlowEventKey, ValueFlowSourceSpec)],
 ) -> Result<Vec<TaintSourceBinding>, TaintPolicyCompileError> {
-    assert_eq!(
-        endpoints.len(),
-        specs.len(),
-        "every bound source endpoint minted exactly one event spec"
-    );
-    endpoints
-        .iter()
-        .zip(specs)
-        .map(|(endpoint, (key, _))| {
-            Ok(TaintSourceBinding::new(
-                source_id_for_event(value_flow, key)?,
-                class_set(universe, &endpoint.labels)?,
-                SourceEventKey::new(key.clone()),
-            ))
-        })
-        .collect()
+    bind_taint_endpoints(endpoints, specs, "source", |endpoint, key| {
+        Ok(TaintSourceBinding::new(
+            source_id_for_event(value_flow, key)?,
+            class_set(universe, &endpoint.labels)?,
+            SourceEventKey::new(key.clone()),
+        ))
+    })
 }
 
 fn bind_taint_sinks(
@@ -7765,20 +10636,29 @@ fn bind_taint_sinks(
     endpoints: &[BoundEndpoint],
     specs: &[(ValueFlowEventKey, ValueFlowSinkSpec)],
 ) -> Result<Vec<TaintSinkBinding>, TaintPolicyCompileError> {
+    bind_taint_endpoints(endpoints, specs, "sink", |endpoint, key| {
+        Ok(TaintSinkBinding::new(
+            sink_id_for_event(value_flow, key)?,
+            class_set(universe, &endpoint.labels)?,
+        ))
+    })
+}
+
+fn bind_taint_endpoints<T, Spec>(
+    endpoints: &[BoundEndpoint],
+    specs: &[(ValueFlowEventKey, Spec)],
+    kind: &str,
+    mut bind: impl FnMut(&BoundEndpoint, &ValueFlowEventKey) -> Result<T, TaintPolicyCompileError>,
+) -> Result<Vec<T>, TaintPolicyCompileError> {
     assert_eq!(
         endpoints.len(),
         specs.len(),
-        "every bound sink endpoint minted exactly one event spec"
+        "every bound {kind} endpoint minted exactly one event spec"
     );
     endpoints
         .iter()
         .zip(specs)
-        .map(|(endpoint, (key, _))| {
-            Ok(TaintSinkBinding::new(
-                sink_id_for_event(value_flow, key)?,
-                class_set(universe, &endpoint.labels)?,
-            ))
-        })
+        .map(|(endpoint, (key, _))| bind(endpoint, key))
         .collect()
 }
 
@@ -7791,23 +10671,13 @@ fn bind_store_writes(
     ends: &[BoundStoreEnd],
     specs: &[(ValueFlowEventKey, ValueFlowSinkSpec)],
 ) -> Result<Vec<TaintStoreWriteBinding>, TaintPolicyCompileError> {
-    assert_eq!(
-        ends.len(),
-        specs.len(),
-        "every bound store write minted exactly one event spec"
-    );
-    ends.iter()
-        .zip(specs)
-        .map(|(end, (key, _))| {
-            let complete = matches!(end.endpoint.proof, ProofStatus::Proven)
-                && matches!(end.endpoint.completeness, EvidenceCompleteness::Complete);
-            Ok(TaintStoreWriteBinding::new(
-                sink_id_for_event(value_flow, key)?,
-                end.channel.clone(),
-                complete,
-            ))
-        })
-        .collect()
+    bind_store_ends(ends, specs, "write", |end, key, complete| {
+        Ok(TaintStoreWriteBinding::new(
+            sink_id_for_event(value_flow, key)?,
+            end.channel.clone(),
+            complete,
+        ))
+    })
 }
 
 fn bind_store_reads(
@@ -7815,21 +10685,32 @@ fn bind_store_reads(
     ends: &[BoundStoreEnd],
     specs: &[(ValueFlowEventKey, ValueFlowSourceSpec)],
 ) -> Result<Vec<TaintStoreReadBinding>, TaintPolicyCompileError> {
+    bind_store_ends(ends, specs, "read", |end, key, complete| {
+        Ok(TaintStoreReadBinding::new(
+            source_id_for_event(value_flow, key)?,
+            end.channel.clone(),
+            complete,
+        ))
+    })
+}
+
+fn bind_store_ends<T, Spec>(
+    ends: &[BoundStoreEnd],
+    specs: &[(ValueFlowEventKey, Spec)],
+    kind: &str,
+    mut bind: impl FnMut(&BoundStoreEnd, &ValueFlowEventKey, bool) -> Result<T, TaintPolicyCompileError>,
+) -> Result<Vec<T>, TaintPolicyCompileError> {
     assert_eq!(
         ends.len(),
         specs.len(),
-        "every bound store read minted exactly one event spec"
+        "every bound store {kind} minted exactly one event spec"
     );
     ends.iter()
         .zip(specs)
         .map(|(end, (key, _))| {
             let complete = matches!(end.endpoint.proof, ProofStatus::Proven)
                 && matches!(end.endpoint.completeness, EvidenceCompleteness::Complete);
-            Ok(TaintStoreReadBinding::new(
-                source_id_for_event(value_flow, key)?,
-                end.channel.clone(),
-                complete,
-            ))
+            bind(end, key, complete)
         })
         .collect()
 }
@@ -7839,35 +10720,26 @@ fn bind_store_reads(
 /// at most one binding. The output carrier is retained and validated as part
 /// of the exact input/output contract, while applying the kill to the input is
 /// what keeps a wrong tainted operand from being cleared by the sanitizer call.
-fn bind_taint_sanitizers(
-    value_flow: &ValueFlowPlan,
+/// One sanitizer effect at one point and phase on one input and output
+/// carrier: the union of the classes every sanitizer bound there removes, and
+/// whether all of them are proven and complete.
+struct SanitizerSlot {
+    point: ProgramPointHandle,
+    phase: ValueFlowObservationPhase,
+    input: ValueFlowCarrier,
+    output: ValueFlowCarrier,
+    removed: TaintClassSet,
+    proven: bool,
+    complete: bool,
+}
+
+/// Merge bound sanitizers that act at one point, phase and carrier pair.
+fn sanitizer_slots(
     universe: &TaintUniverse,
     sanitizers: &[BoundSanitizer],
-) -> Result<Vec<TaintSanitizerBinding>, TaintPolicyCompileError> {
-    let mut slots: Vec<(
-        ProgramPointHandle,
-        ValueFlowObservationPhase,
-        ValueFlowCarrierId,
-        ValueFlowCarrierId,
-        TaintClassSet,
-        bool,
-        bool,
-    )> = Vec::new();
+) -> Result<Vec<SanitizerSlot>, TaintPolicyCompileError> {
+    let mut slots: Vec<SanitizerSlot> = Vec::new();
     for sanitizer in sanitizers {
-        let input = value_flow
-            .carrier_id(&sanitizer.input.carrier)
-            .ok_or_else(|| {
-                TaintPolicyCompileError::Plan(
-                    "sanitizer input carrier is absent from the value-flow plan".to_owned(),
-                )
-            })?;
-        let output = value_flow
-            .carrier_id(&sanitizer.output.carrier)
-            .ok_or_else(|| {
-                TaintPolicyCompileError::Plan(
-                    "sanitizer output carrier is absent from the value-flow plan".to_owned(),
-                )
-            })?;
         let removed = class_set(universe, &sanitizer.input.labels)?;
         let proven = matches!(sanitizer.input.proof, ProofStatus::Proven)
             && matches!(sanitizer.output.proof, ProofStatus::Proven);
@@ -7878,31 +10750,57 @@ fn bind_taint_sanitizers(
                 EvidenceCompleteness::Complete
             );
         match slots.iter_mut().find(|slot| {
-            slot.0 == sanitizer.input.point
-                && slot.1 == sanitizer.input.phase
-                && slot.2 == input
-                && slot.3 == output
+            slot.point == sanitizer.input.point
+                && slot.phase == sanitizer.input.phase
+                && slot.input == sanitizer.input.carrier
+                && slot.output == sanitizer.output.carrier
         }) {
             Some(slot) => {
-                slot.4 = slot.4.union(&removed);
-                slot.5 &= proven;
-                slot.6 &= complete;
+                slot.removed = slot.removed.union(&removed);
+                slot.proven &= proven;
+                slot.complete &= complete;
             }
-            None => slots.push((
-                sanitizer.input.point.clone(),
-                sanitizer.input.phase,
-                input,
-                output,
+            None => slots.push(SanitizerSlot {
+                point: sanitizer.input.point.clone(),
+                phase: sanitizer.input.phase,
+                input: sanitizer.input.carrier.clone(),
+                output: sanitizer.output.carrier.clone(),
                 removed,
                 proven,
                 complete,
-            )),
+            }),
         }
     }
-    Ok(slots
+    Ok(slots)
+}
+
+fn bind_taint_sanitizers(
+    value_flow: &ValueFlowPlan,
+    universe: &TaintUniverse,
+    sanitizers: &[BoundSanitizer],
+) -> Result<Vec<TaintSanitizerBinding>, TaintPolicyCompileError> {
+    sanitizer_slots(universe, sanitizers)?
         .into_iter()
-        .map(|(point, phase, input, output, removed, proven, complete)| {
-            if complete {
+        .map(|slot| {
+            let input = value_flow.carrier_id(&slot.input).ok_or_else(|| {
+                TaintPolicyCompileError::Plan(
+                    "sanitizer input carrier is absent from the value-flow plan".to_owned(),
+                )
+            })?;
+            let output = value_flow.carrier_id(&slot.output).ok_or_else(|| {
+                TaintPolicyCompileError::Plan(
+                    "sanitizer output carrier is absent from the value-flow plan".to_owned(),
+                )
+            })?;
+            let SanitizerSlot {
+                point,
+                phase,
+                removed,
+                proven,
+                complete,
+                ..
+            } = slot;
+            Ok(if complete {
                 TaintSanitizerBinding::resolved_with_output(point, phase, 0, input, output, removed)
             } else if proven {
                 TaintSanitizerBinding::proven_incomplete_with_output(
@@ -7912,9 +10810,9 @@ fn bind_taint_sanitizers(
                 TaintSanitizerBinding::unresolved_with_output(
                     point, phase, 0, input, output, removed,
                 )
-            }
+            })
         })
-        .collect())
+        .collect()
 }
 
 fn bind_taint_local_transforms(
@@ -8007,6 +10905,79 @@ fn local_transform_compatibility_hash(
     hasher.finish()
 }
 
+/// The taint value one matched-value observation binds: a parameter's
+/// observation binds its procedure port at the entry point, any other value
+/// binds itself at its point, a constant as a literal.
+fn matched_value_endpoint(
+    observation: &ValueAtPoint,
+    dispatch_calls: &[CallSiteHandle],
+    proof: ProofStatus,
+    completeness: EvidenceCompleteness,
+) -> ResolvedTaintValue {
+    let value = observation.value();
+    let procedure = value.procedure().clone();
+    let parameter_ordinal =
+        procedure
+            .semantics()
+            .value(value.id())
+            .and_then(|row| match &row.kind {
+                SemanticValueKind::Parameter { ordinal, .. } => Some(*ordinal),
+                _ => None,
+            });
+    let (point, phase, carrier) = match parameter_ordinal {
+        Some(ordinal) => {
+            let port = ProcedurePortHandle::parameter(procedure.clone(), ordinal)
+                .expect("semantic parameter value has a matching procedure port");
+            let point = procedure
+                .point_handle(procedure.semantics().entry_point())
+                .expect("semantic procedure has an entry point handle");
+            (
+                point,
+                ValueFlowObservationPhase::BeforeEffects,
+                ValueFlowCarrier::Port(port),
+            )
+        }
+        None => (
+            observation.point().clone(),
+            // Keep the phase the oracle attached to the observation. A
+            // matched value is usually the one the point defines, so the
+            // observation holds after that point's effects; binding it
+            // before them lets the defining assignment's strong update
+            // kill the endpoint at its own site.
+            value_flow_phase(observation.phase()),
+            ValueFlowCarrier::for_value(value.clone()),
+        ),
+    };
+    let kind = match &carrier {
+        ValueFlowCarrier::Value(value)
+            if procedure.semantics().value(value.id()).is_some_and(|row| {
+                matches!(
+                    row.kind,
+                    SemanticValueKind::Constant | SemanticValueKind::ConstantString(_)
+                )
+            }) =>
+        {
+            TaintEndpointKind::LiteralValue
+        }
+        _ => TaintEndpointKind::MatchedValue,
+    };
+    ResolvedTaintValue {
+        call: None,
+        dispatch_obligations: dispatch_calls
+            .iter()
+            .filter(|call| call.procedure() == &procedure)
+            .cloned()
+            .collect(),
+        kind,
+        point,
+        phase,
+        carrier,
+        proof,
+        completeness,
+        unjudged: None,
+    }
+}
+
 fn endpoint_metadata<Spec>(
     endpoints: &[BoundEndpoint],
     specs: &[(ValueFlowEventKey, Spec)],
@@ -8030,35 +11001,25 @@ fn require_uninterrupted_outcome<T>(
     outcome: &brokk_bifrost_analysis::analyzer::semantic::SemanticOutcome<T>,
     operation: &str,
 ) -> Result<(), TaintPolicyCompileError> {
-    match outcome {
-        SemanticOutcome::Cancelled { .. } => Err(TaintPolicyCompileError::QueryIncomplete {
-            completion: CodeQueryCompletion::Cancelled,
-            detail: format!("{operation} was cancelled"),
-        }),
-        SemanticOutcome::ExceededBudget { exceeded, .. } => Err(query_budget_error(
-            CodeQueryDiagnosticCode::SemanticBudgetExhausted,
-            format!("{operation} exceeded the shared semantic budget: {exceeded}"),
-        )),
-        SemanticOutcome::Complete { .. }
-        | SemanticOutcome::Ambiguous { .. }
-        | SemanticOutcome::Unknown { .. }
-        | SemanticOutcome::Unsupported { .. }
-        | SemanticOutcome::Unproven { .. } => Ok(()),
-    }
+    super::selector_compiler::semantic_outcome_failure(outcome, operation)
+        .map_or(Ok(()), |(completion, detail)| {
+            Err(TaintPolicyCompileError::QueryIncomplete { completion, detail })
+        })
 }
 
 fn require_discovery_execution_budget(
     budget: &SemanticExecutionBudget,
     operation: &str,
 ) -> Result<(), TaintPolicyCompileError> {
-    if budget.work().exhausted {
-        Err(query_budget_error(
-            CodeQueryDiagnosticCode::SemanticBudgetExhausted,
-            format!("{operation} exhausted the shared semantic file or traversal budget"),
-        ))
-    } else {
-        Ok(())
-    }
+    super::selector_compiler::semantic_execution_budget_failure(budget, operation).map_or(
+        Ok(()),
+        |detail| {
+            Err(query_budget_error(
+                CodeQueryDiagnosticCode::SemanticBudgetExhausted,
+                detail,
+            ))
+        },
+    )
 }
 
 fn query_budget_error(
@@ -8066,7 +11027,7 @@ fn query_budget_error(
     detail: impl Into<String>,
 ) -> TaintPolicyCompileError {
     TaintPolicyCompileError::QueryIncomplete {
-        completion: CodeQueryCompletion::Incomplete { codes: vec![code] },
+        completion: super::selector_compiler::incomplete_code_query_completion(code),
         detail: detail.into(),
     }
 }
@@ -8110,21 +11071,25 @@ fn taint_selector_error(
 mod tests {
     use std::sync::Arc;
 
+    use brokk_bifrost_test_macros::hardwon;
+
     use super::{
-        DiscoveryMaterializationCache, ProductionTaintPolicyEvaluator, TaintExecutionBudget,
-        TaintPolicyCompiler, compiled_payload,
+        DiscoveryMaterializationCache, ProductionTaintPolicyEvaluator, TaintEngine,
+        TaintExecutionBudget, TaintPolicyCompilation, TaintPolicyCompiler, compiled_payload,
     };
     use crate::budget::PolicyBudget;
-    use crate::catalog::{CatalogRegistryLimits, TaintCatalogRegistry};
-    use crate::coordinator::{PolicyEvaluationOptions, evaluate_policy_source};
+    use crate::coordinator::{
+        PolicyEvaluationInput, PolicyEvaluationOptions, PolicySemanticModelContext,
+        evaluate_policy_inputs_with_analyzer_and_semantic_models, evaluate_policy_source,
+    };
     use crate::definition::PolicyId;
     use crate::evaluator::{DefaultPolicyEvaluator, PolicyEvaluationContext, PolicyEvaluator};
     use crate::finding::{
         PolicyDiagnostic, PolicyIncompleteReason, PolicyRunCompletion, PolicyWorkMetric,
         PolicyWorkReport,
     };
-    use crate::inline_project::InlineTestProject;
-    use crate::registry::{PolicyRegistry, PolicyRegistryLimits};
+    use crate::inline_project::{BuiltInlineTestProject, InlineTestProject};
+    use crate::registry::PolicyRegistry;
     use crate::source::PolicySourceIdentity;
     use crate::suppression::PolicyEvaluationDate;
     use brokk_bifrost_analysis::CancellationToken;
@@ -8133,6 +11098,11 @@ mod tests {
         DispatchBoundaryKind, EvidenceCompleteness, IcfgEdgeKind, IcfgLimitKind, ProcedureHandle,
         ProofStatus, SemanticArtifact, SemanticBudget, SemanticRequest, SemanticWork,
     };
+    use brokk_bifrost_analysis::analyzer::semantic_model::{
+        CatalogOptions, CompilerOptions, SemanticModelActivationEvidence,
+        SemanticModelActivationRequest, SemanticPackCatalog, SessionPackSource,
+        SessionPackSourceKind, SourceFormat, compile_source,
+    };
     use brokk_bifrost_analysis::analyzer::{
         AnalyzerConfig, AnalyzerQueryScope, FilesystemProject, Language, Project, WorkspaceAnalyzer,
     };
@@ -8140,6 +11110,7 @@ mod tests {
     use brokk_bifrost_rql::structural::{CodeQueryExecutionLimits, CodeQuerySemanticLimits};
 
     #[test]
+    #[hardwon("#2838: recursive-carry runs were inconclusive without a diagnostic family")]
     fn solver_incompleteness_diagnostics_have_stable_typed_families() {
         let proof = ProofStatus::Unproven("unproven".into());
         let gap = EvidenceCompleteness::Partial("partial".into());
@@ -8228,6 +11199,7 @@ mod tests {
     /// warning. The retained reasons and kinds now tell them apart, at the
     /// same locations, and `primary` and `related` name the selected rows.
     #[test]
+    #[hardwon("#3644: coverage diagnostics lost distinct retained reasons at equal counts")]
     fn fixed_point_incompleteness_names_distinct_reasons_at_equal_counts() {
         fn fixed_point(proof: &ProofStatus, boundary: &SummaryBoundaryKind) -> PolicyDiagnostic {
             let gap = EvidenceCompleteness::Partial(
@@ -8340,6 +11312,7 @@ mod tests {
     /// oversized path, construct under the report prose bound with three rows
     /// per category in coverage order and each category's exact omitted count.
     #[test]
+    #[hardwon("#3644: fixed-point diagnostics dropped proof reasons under report bounds")]
     fn fixed_point_incompleteness_is_bounded_per_category() {
         const ROWS: usize = 40;
         // Two-byte characters after a five-byte label, so the 108-byte reason
@@ -8467,14 +11440,12 @@ mod tests {
             proof: &'a ProofStatus,
             completeness: &'a EvidenceCompleteness,
         ) -> CoverageRow<'a> {
-            CoverageRow {
+            row(
+                CoverageRowKind::Edge(kind),
                 location,
-                kind: CoverageRowKind::Edge(kind),
-                origin: None,
-                proof: Some(proof),
-                completeness: Some(completeness),
-                provenance: &[],
-            }
+                Some(proof),
+                Some(completeness),
+            )
         }
 
         pub(super) fn boundary<'a>(
@@ -8483,9 +11454,23 @@ mod tests {
             proof: Option<&'a ProofStatus>,
             completeness: Option<&'a EvidenceCompleteness>,
         ) -> CoverageRow<'a> {
+            row(
+                CoverageRowKind::Boundary { kind, target: None },
+                location,
+                proof,
+                completeness,
+            )
+        }
+
+        fn row<'a>(
+            kind: CoverageRowKind<'a>,
+            location: PolicySourceLocation,
+            proof: Option<&'a ProofStatus>,
+            completeness: Option<&'a EvidenceCompleteness>,
+        ) -> CoverageRow<'a> {
             CoverageRow {
                 location,
-                kind: CoverageRowKind::Boundary { kind, target: None },
+                kind,
                 origin: None,
                 proof,
                 completeness,
@@ -8495,6 +11480,7 @@ mod tests {
     }
 
     #[test]
+    #[hardwon("#2779: overlong failure detail erased the refusal explanation")]
     fn an_oversized_compile_failure_detail_still_names_the_refusal() {
         // #2779: the xss category refused all 455 cases with an empty
         // diagnostics list because the QueryIncomplete detail (which joins
@@ -8529,6 +11515,7 @@ mod tests {
     }
 
     #[test]
+    #[hardwon("#2738: authored selector summaries could overstate clean coverage")]
     fn authored_selector_summary_caps_only_a_clean_compile() {
         let policy_id = PolicyId::new("test.issue-2714-cap").expect("valid policy id");
         let clean = compiled_payload(
@@ -8556,6 +11543,7 @@ mod tests {
     }
 
     #[test]
+    #[hardwon("b1b77f63a031: incomplete selector discovery dropped supported taint results")]
     fn incomplete_selector_preserves_partial_discovery_without_refusal() {
         let policy_id = PolicyId::new("test.issue-3712").expect("valid policy id");
         let payload = compiled_payload(
@@ -8651,57 +11639,62 @@ def run_fanout():
         )
     }
 
-    fn two_flow_workspace() -> (tempfile::TempDir, WorkspaceAnalyzer) {
-        let workspace = tempfile::tempdir().expect("temporary workspace");
-        std::fs::write(workspace.path().join("first.py"), FIRST_FLOW_SOURCE)
-            .expect("first fixture source");
-        std::fs::write(workspace.path().join("second.py"), SECOND_FLOW_SOURCE)
-            .expect("second fixture source");
-        let project: Arc<dyn Project> =
-            Arc::new(FilesystemProject::new(workspace.path()).expect("fixture project"));
-        let analyzer = WorkspaceAnalyzer::build_ephemeral_footgun(
-            project,
-            AnalyzerConfig {
-                parallelism: Some(1),
-                ..AnalyzerConfig::default()
-            },
-        )
-        .expect("an analyzer over the fixture");
-        (workspace, analyzer)
+    fn two_flow_workspace() -> (BuiltInlineTestProject, WorkspaceAnalyzer) {
+        workspace_with_sources(&[
+            ("first.py", FIRST_FLOW_SOURCE),
+            ("second.py", SECOND_FLOW_SOURCE),
+        ])
     }
 
-    fn three_fanout_workspace() -> (tempfile::TempDir, WorkspaceAnalyzer) {
-        let workspace = tempfile::tempdir().expect("temporary workspace");
-        for name in ["first.py", "second.py", "third.py"] {
-            std::fs::write(workspace.path().join(name), FANOUT_FLOW_SOURCE)
-                .expect("fanout fixture source");
-        }
-        let project: Arc<dyn Project> =
-            Arc::new(FilesystemProject::new(workspace.path()).expect("fixture project"));
-        let analyzer = WorkspaceAnalyzer::build_ephemeral_footgun(
-            project,
-            AnalyzerConfig {
-                parallelism: Some(1),
-                ..AnalyzerConfig::default()
-            },
-        )
-        .expect("an analyzer over the fanout fixture");
-        (workspace, analyzer)
+    fn three_fanout_workspace() -> (BuiltInlineTestProject, WorkspaceAnalyzer) {
+        workspace_with_sources(&[
+            ("first.py", FANOUT_FLOW_SOURCE),
+            ("second.py", FANOUT_FLOW_SOURCE),
+            ("third.py", FANOUT_FLOW_SOURCE),
+        ])
+    }
+
+    fn workspace_with_sources(
+        files: &[(&str, &str)],
+    ) -> (BuiltInlineTestProject, WorkspaceAnalyzer) {
+        let project = files
+            .iter()
+            .fold(InlineTestProject::new(), |project, (path, source)| {
+                project.file(*path, *source)
+            })
+            .build();
+        let analyzer = project.workspace_analyzer(AnalyzerConfig {
+            parallelism: Some(1),
+            ..AnalyzerConfig::default()
+        });
+        (project, analyzer)
+    }
+
+    fn assert_findings_lane_exhausted(
+        completion: &PolicyRunCompletion,
+        diagnostics: &[PolicyDiagnostic],
+    ) {
+        assert!(
+            matches!(
+                completion,
+                PolicyRunCompletion::Inconclusive { reasons }
+                    if reasons.contains(&PolicyIncompleteReason::BatchFindingLimit)
+            ),
+            "a spent findings lane is typed rather than an invariant: completion={completion:?} diagnostics={diagnostics:?}"
+        );
+        assert!(
+            diagnostics.iter().any(|diagnostic| diagnostic.message()
+                == "taint request-wide budget is exhausted: findings"),
+            "a diagnostic must name the exhausted lane: {diagnostics:?}"
+        );
     }
 
     fn registry_for(source: &str) -> PolicyRegistry {
-        let catalogs = Arc::new(TaintCatalogRegistry::new_without_workspace(
-            CatalogRegistryLimits::default(),
-        ));
-        let mut registry =
-            PolicyRegistry::new_without_workspace(catalogs, PolicyRegistryLimits::default());
-        registry
-            .register_policy_bytes(
-                PolicySourceIdentity::new("test:issue-2356.rqlp"),
-                source.as_bytes(),
-            )
-            .expect("the fixture policy loads");
-        registry
+        crate::test_support::registry_with_policy(
+            "test:issue-2356.rqlp",
+            source,
+            "the fixture policy loads",
+        )
     }
 
     /// #2356: a request-wide lane that runs out is a budget outcome, not a
@@ -8715,6 +11708,9 @@ def run_fanout():
     /// already projected. The run must instead stay inconclusive, name the
     /// exhausted lane, and keep those findings.
     #[test]
+    #[hardwon(
+        "#2356: the budget fix turns request-wide lane exhaustion into typed incompleteness instead of InternalInvariant failure."
+    )]
     fn an_exhausted_request_wide_lane_degrades_the_run_instead_of_failing_it() {
         let (_workspace, analyzer) = two_flow_workspace();
         let registry = registry_for(&two_flow_policy(""));
@@ -8731,35 +11727,15 @@ def run_fanout():
             None,
             &budget,
         );
-        let payloads = evaluator.prepared.borrow();
+        let payloads = evaluator
+            .prepared
+            .lock()
+            .expect("taint prepared payloads mutex poisoned");
         let [(_, payload)] = payloads.iter().collect::<Vec<_>>()[..] else {
             panic!("one taint policy produces one payload");
         };
 
-        assert!(
-            !matches!(payload.completion, PolicyRunCompletion::Failed { .. }),
-            "a spent budget must not surface as a run failure: {:#?}",
-            payload.completion
-        );
-        let PolicyRunCompletion::Inconclusive { reasons } = &payload.completion else {
-            panic!(
-                "expected an inconclusive run, got {:#?}",
-                payload.completion
-            );
-        };
-        assert!(
-            reasons.contains(&PolicyIncompleteReason::BatchFindingLimit),
-            "the exhausted findings lane must be named: {reasons:#?}"
-        );
-        assert!(
-            payload
-                .diagnostics
-                .iter()
-                .any(|diagnostic| diagnostic.message()
-                    == "taint request-wide budget is exhausted: findings"),
-            "a diagnostic must name the exhausted lane: {:#?}",
-            payload.diagnostics
-        );
+        assert_findings_lane_exhausted(&payload.completion, &payload.diagnostics);
         assert!(
             !payload.projections.is_empty(),
             "the findings the earlier batch already projected must survive"
@@ -8774,6 +11750,9 @@ def run_fanout():
     /// request-wide cap, the next region must still take #2356's typed budget
     /// path and preserve the already assembled findings.
     #[test]
+    #[hardwon(
+        "#2544: the fanout regression preserves distinct sink findings when one source reaches two sinks in one procedure."
+    )]
     fn xss_style_fanout_assembles_before_the_findings_lane_exhausts() {
         let (_workspace, analyzer) = three_fanout_workspace();
         let registry = registry_for(&two_flow_policy(""));
@@ -8806,16 +11785,7 @@ def run_fanout():
             .evaluate(policy, &context, &mut evaluation_budget)
             .expect("the prepared fanout payload assembles");
 
-        assert!(
-            matches!(
-                run.completion(),
-                PolicyRunCompletion::Inconclusive { reasons }
-                    if reasons.contains(&PolicyIncompleteReason::BatchFindingLimit)
-            ),
-            "a spent findings lane is typed rather than an invariant: completion={:?} diagnostics={:?}",
-            run.completion(),
-            run.diagnostics()
-        );
+        assert_findings_lane_exhausted(run.completion(), run.diagnostics());
         assert_eq!(
             run.findings().len(),
             2,
@@ -8848,6 +11818,9 @@ def run_fanout():
     /// below the host cap produced an over-long witness, the authority
     /// rejected the whole envelope, and the finding was lost.
     #[test]
+    #[hardwon(
+        "#2356: the report fix retains an over-limit witness as a truncated finding instead of failing or dropping it."
+    )]
     fn a_witness_over_the_effective_report_limit_truncates_instead_of_dropping_the_finding() {
         let (workspace, analyzer) = two_flow_workspace();
         let source = two_flow_policy(":report (report :witness (witness :max-steps 2))");
@@ -8855,7 +11828,7 @@ def run_fanout():
             PolicyEvaluationDate::from_ymd(2026, 8, 18).expect("fixed evaluation date"),
         );
         let outcome = evaluate_policy_source(
-            workspace.path(),
+            workspace.root(),
             PolicySourceIdentity::new("test:issue-2356.rqlp"),
             &source,
             &analyzer,
@@ -8903,6 +11876,7 @@ def run_fanout():
     /// succeed again, while `remaining_findings` -- the cap on total output, not
     /// on per-batch work -- keeps its running value.
     #[test]
+    #[hardwon("#2208: earlier roots drained later per-batch solver budgets")]
     fn per_batch_reset_restores_solve_lanes_without_restoring_the_finding_cap() {
         let budget = PolicyBudget::default();
         let mut execution = TaintExecutionBudget::new(&budget);
@@ -8976,6 +11950,9 @@ def tail(value):
     /// the pair deterministically: the fixture's recursion back to the root
     /// resolves through the first analyzer's cache.
     #[test]
+    #[hardwon(
+        "#2289: durable procedure identity must deduplicate discovery across artifact materializations"
+    )]
     fn a_procedure_reached_through_two_materializations_is_discovered_once() {
         let workspace = tempfile::tempdir().expect("temporary workspace");
         std::fs::write(
@@ -9130,6 +12107,9 @@ def tail(value):
     /// the cold acquisition so a missing cache-hit funnel cannot be hidden by
     /// set deduplication in one request.
     #[test]
+    #[hardwon(
+        "#2970: the read-ledger fix attributes cached discovery reads to the same cold inputs as the initial materialization."
+    )]
     fn discovery_cache_hits_retain_cold_read_attribution() {
         let project = InlineTestProject::with_language(Language::Python)
             .file("relay.py", TWO_MATERIALIZATION_SOURCE)
@@ -9301,6 +12281,9 @@ def entry_0():
     /// pins that this really is a tight budget -- half of one census cannot even
     /// materialize the file once -- so the first half cannot pass on slack.
     #[test]
+    #[hardwon(
+        "#2295: one artifact census must fund every root that reaches the same materialized file"
+    )]
     fn a_budget_sized_for_one_materialization_admits_every_root() {
         /// One census for the material, plus headroom for the compile's own
         /// value-flow walk over it, which #2289 measured as linear in the
@@ -9440,6 +12423,283 @@ def direct():
     put(read())
 ";
 
+    const RECEIVER_SANITIZER_SOURCE: &str = r#"
+use std::string::String;
+
+fn source(value: String) -> String {
+    value
+}
+
+fn sink(_: String) {}
+
+fn run(input: String) {
+    let value: String = source(input);
+    let cleaned: String = value.replace("\r", "");
+    sink(cleaned);
+}
+"#;
+
+    fn named_rust_type(name: &str) -> serde_json::Value {
+        serde_json::json!({
+            "kind": "named",
+            "name": name,
+            "arguments": [],
+            "nullable": false
+        })
+    }
+
+    fn compile_receiver_sanitizer_pack(
+        pack_id: &str,
+        shard_id: &str,
+        payload: serde_json::Value,
+    ) -> brokk_bifrost_analysis::analyzer::semantic_model::CompiledSemanticModelPack {
+        let source = serde_json::to_vec(&serde_json::json!({
+            "schema_version": 2,
+            "pack_id": pack_id,
+            "version": "1.0.0",
+            "producer": { "name": "bifrost-test", "version": "1.0.0" },
+            "language": "rust",
+            "ecosystem": "cargo",
+            "compatibility": {
+                "bifrost": ">=0.12.0, <1.0.0",
+                "toolchains": []
+            },
+            "provenance": { "source": "test:inline", "revision": "receiver-sanitizer" },
+            "license": "Apache-2.0",
+            "completeness": "complete",
+            "safety": { "generated_code_only": false, "review_required": false },
+            "shards": [{
+                "id": shard_id,
+                "activation": [{
+                    "targets": [],
+                    "configurations": []
+                }],
+                "payload": payload
+            }]
+        }))
+        .expect("receiver sanitizer semantic pack serializes");
+        compile_source(SourceFormat::Json, &source, &CompilerOptions::default()).unwrap_or_else(
+            |diagnostics| panic!("receiver sanitizer semantic pack compiles: {diagnostics:#?}"),
+        )
+    }
+
+    fn receiver_sanitizer_declaration_pack()
+    -> brokk_bifrost_analysis::analyzer::semantic_model::CompiledSemanticModelPack {
+        compile_receiver_sanitizer_pack(
+            "test.receiver-sanitizer-declarations",
+            "declarations.string",
+            serde_json::json!({
+                "kind": "declaration_facts",
+                "types": [
+                    {
+                        "id": "type.rust-codeql.std",
+                        "name": "std",
+                        "type_kind": "module",
+                        "visibility": "public",
+                        "locator": {
+                            "kind": "artifact",
+                            "path": "library/std/src/lib.rs",
+                            "symbol": "std"
+                        }
+                    },
+                    {
+                        "id": "type.rust-codeql.std-string",
+                        "name": "std.string",
+                        "type_kind": "module",
+                        "visibility": "public",
+                        "locator": {
+                            "kind": "artifact",
+                            "path": "library/alloc/src/lib.rs",
+                            "symbol": "std.string"
+                        }
+                    },
+                    {
+                        "id": "type.rust-codeql.std-string-string",
+                        "name": "std.string.String",
+                        "type_kind": "struct",
+                        "visibility": "public",
+                        "locator": {
+                            "kind": "artifact",
+                            "path": "library/alloc/src/string.rs",
+                            "symbol": "std.string.String"
+                        }
+                    }
+                ],
+                "members": [{
+                    "id": "member.rust-codeql.std-string-string-replace",
+                    "owner": "type.rust-codeql.std-string-string",
+                    "name": "replace",
+                    "member_kind": "method",
+                    "visibility": "public",
+                    "is_static": false,
+                    "callable_family_complete": true,
+                    "signature": {
+                        "parameters": [
+                            { "name": "pattern", "type": named_rust_type("untyped") },
+                            { "name": "replacement", "type": named_rust_type("untyped") }
+                        ],
+                        "returns": named_rust_type("std.string.String")
+                    },
+                    "aliases": [],
+                    "locator": {
+                        "kind": "artifact",
+                        "path": "library/alloc/src/string.rs",
+                        "symbol": "std.string.String.replace"
+                    }
+                }],
+                "relations": []
+            }),
+        )
+    }
+
+    fn receiver_sanitizer_summary_pack()
+    -> brokk_bifrost_analysis::analyzer::semantic_model::CompiledSemanticModelPack {
+        compile_receiver_sanitizer_pack(
+            "test.receiver-sanitizer-summaries",
+            "summaries.string",
+            serde_json::json!({
+                "kind": "procedure_summaries",
+                "summaries": [{
+                    "id": "summary.rust-codeql.std-string-string-replace",
+                    "target": {
+                        "path": "library/alloc/src/string.rs",
+                        "symbol": "std.string.String.replace",
+                        "has_receiver": true,
+                        "parameter_count": 2
+                    },
+                    "completeness": "complete",
+                    "covers_overrides": true,
+                    "locations": [],
+                    "transfers": [{
+                        "input": { "kind": "receiver" },
+                        "exit_kind": "normal",
+                        "output": { "kind": "normal_return" }
+                    }],
+                    "effects": []
+                }]
+            }),
+        )
+    }
+
+    const RECEIVER_SANITIZER_POLICY: &str = r#"(policy
+      :schema-version 1
+      :id "test.receiver-sanitizer"
+      :name "Receiver sanitizer"
+      :message "tainted data reached sink"
+      :severity warning
+      :analysis (analysis
+        :type taint
+        :mode may
+        :call-modeling (call-modeling :unmodeled optimistic)
+        :sources (endpoint-set :entries [
+          (source :id raw-input :display-name "raw input" :categories [input.user]
+            :selector (rql :schema-version 1
+              (language rust (call :callee (name "source"))))
+            :bind return-value :labels [attacker-controlled])])
+        :sinks (endpoint-set :entries [
+          (sink :id sink :display-name "sink" :categories [data.sensitive]
+            :selector (rql :schema-version 1
+              (language rust (call :callee (name "sink"))))
+            :dangerous-operand (argument :index 0)
+            :accepts [attacker-controlled])])
+        :sanitizers (endpoint-set :entries [
+          (sanitizer :id clean
+            :selector (rql :schema-version 1
+              (language rust
+                (call-argument :formal-index 0
+                  (resolved-call :resolves-to "std.string.String.replace" :proof declared
+                    (call-bindings
+                      (call-shape
+                        (call :callee (name "replace") :args [
+                          (string_literal (text/regex "^\\\"\\\\r\\\"$"))
+                          (string_literal (text/regex "^\\\"\\\"$"))])))))))
+            :input receiver
+            :output return-value
+            :removes [attacker-controlled])])))"#;
+
+    #[test]
+    fn receiver_input_sanitizer_compiles_against_a_small_fixture() {
+        let project = InlineTestProject::with_language(Language::Rust)
+            .file("src/lib.rs", RECEIVER_SANITIZER_SOURCE)
+            .build();
+        let analyzer = project.workspace_analyzer(AnalyzerConfig {
+            parallelism: Some(1),
+            ..AnalyzerConfig::default()
+        });
+        let catalog = SemanticPackCatalog::open_ephemeral(CatalogOptions::default())
+            .expect("open an ephemeral semantic-pack catalog");
+        for (pack, source_id) in [
+            (
+                receiver_sanitizer_declaration_pack(),
+                "test:receiver-sanitizer-declarations",
+            ),
+            (
+                receiver_sanitizer_summary_pack(),
+                "test:receiver-sanitizer-summaries",
+            ),
+        ] {
+            catalog
+                .register_session_pack(
+                    &pack,
+                    &SessionPackSource {
+                        kind: SessionPackSourceKind::Embedded,
+                        source_id: source_id.to_owned(),
+                    },
+                )
+                .expect("register receiver sanitizer pack");
+        }
+        let request = SemanticModelActivationRequest {
+            bifrost_version: env!("CARGO_PKG_VERSION")
+                .parse()
+                .expect("test Bifrost version parses"),
+            evidence: vec![SemanticModelActivationEvidence {
+                language: "rust".to_owned(),
+                ecosystem: "cargo".to_owned(),
+                package: None,
+                module: None,
+                toolchain: None,
+                target: None,
+                configuration: None,
+                artifact_sha256: None,
+            }],
+            controls: Vec::new(),
+            limits: Default::default(),
+        };
+        let outcome = evaluate_policy_inputs_with_analyzer_and_semantic_models(
+            project.root(),
+            &[PolicyEvaluationInput::embedded(
+                PolicySourceIdentity::new("test:receiver-sanitizer.rqlp"),
+                RECEIVER_SANITIZER_POLICY,
+            )],
+            &analyzer,
+            &brokk_bifrost_flow::FlowWorkspaceState::default(),
+            &PolicyEvaluationOptions::new(
+                PolicyEvaluationDate::from_ymd(2026, 10, 2).expect("fixed evaluation date"),
+            ),
+            PolicySemanticModelContext {
+                catalog: &catalog,
+                request: &request,
+                persistence: None,
+            },
+            None,
+        )
+        .expect("receiver sanitizer policy evaluates");
+        assert!(
+            !outcome.report().runs().is_empty(),
+            "the policy produces runs: rules={}, diagnostics={:?}",
+            outcome.report().rules().len(),
+            outcome.report().diagnostics()
+        );
+        for run in outcome.report().runs() {
+            assert!(
+                !matches!(run.completion(), PolicyRunCompletion::Failed { .. }),
+                "receiver sanitizer binding must compile: completion={:?}, diagnostics={:?}",
+                run.completion(),
+                run.diagnostics()
+            );
+        }
+    }
+
     /// A flow policy over the fixture above. `kill_callee` names the procedure
     /// whose returned value no longer carries the tracked provenance, so two
     /// policies that differ only in it have different propagation semantics.
@@ -9474,38 +12734,16 @@ def direct():
         )
     }
 
-    fn flow_workspace() -> (tempfile::TempDir, WorkspaceAnalyzer) {
+    fn flow_workspace() -> (BuiltInlineTestProject, WorkspaceAnalyzer) {
         python_workspace(FLOW_FIXTURE_SOURCE)
     }
 
-    fn python_workspace(source: &str) -> (tempfile::TempDir, WorkspaceAnalyzer) {
-        let workspace = tempfile::tempdir().expect("temporary workspace");
-        std::fs::write(workspace.path().join("flow.py"), source).expect("fixture source");
-        let project: Arc<dyn Project> =
-            Arc::new(FilesystemProject::new(workspace.path()).expect("fixture project"));
-        let analyzer = WorkspaceAnalyzer::build_ephemeral_footgun(
-            project,
-            AnalyzerConfig {
-                parallelism: Some(1),
-                ..AnalyzerConfig::default()
-            },
-        )
-        .expect("an analyzer over the fixture");
-        (workspace, analyzer)
+    fn python_workspace(source: &str) -> (BuiltInlineTestProject, WorkspaceAnalyzer) {
+        workspace_with_sources(&[("flow.py", source)])
     }
 
     fn registry_for_sources(sources: &[(&str, &str)]) -> PolicyRegistry {
-        let catalogs = Arc::new(TaintCatalogRegistry::new_without_workspace(
-            CatalogRegistryLimits::default(),
-        ));
-        let mut registry =
-            PolicyRegistry::new_without_workspace(catalogs, PolicyRegistryLimits::default());
-        for (identity, source) in sources {
-            registry
-                .register_policy_bytes(PolicySourceIdentity::new(*identity), source.as_bytes())
-                .expect("the fixture policy loads");
-        }
-        registry
+        crate::test_support::registry_with_policies(sources, "the fixture policy loads")
     }
 
     fn shared_memberships(work: &PolicyWorkReport) -> u64 {
@@ -9522,10 +12760,12 @@ def direct():
     /// `PolicyRun`'s, and the evaluator's retention search picks how many
     /// findings a run keeps from that size. A name that appeared only once its
     /// counter moved would therefore let the input data decide which findings
-    /// a run at the retention boundary keeps, which the incremental diff-base
-    /// work (`.agents/plans/impact-sliced-diff-base.md`) cannot tolerate: it
-    /// has to prove a reused-result report is byte-identical to a full one.
+    /// a run at the retention boundary keeps, which would violate the contract
+    /// that incremental and full evaluations produce byte-identical reports.
     #[test]
+    #[hardwon(
+        "#2659: the metric-schema fix publishes the same fields for solved and unbound runs, eliminating slice-dependent output shape."
+    )]
     fn one_flow_policy_publishes_the_same_metric_names_over_every_workspace() {
         let work_for = |source: &str| {
             let (_workspace, analyzer) = python_workspace(source);
@@ -9538,7 +12778,10 @@ def direct():
                 None,
                 &PolicyBudget::default(),
             );
-            let payloads = evaluator.prepared.borrow();
+            let payloads = evaluator
+                .prepared
+                .lock()
+                .expect("taint prepared payloads mutex poisoned");
             let [(_, payload)] = payloads.iter().collect::<Vec<_>>()[..] else {
                 panic!(
                     "one flow policy produces one payload, got {}",
@@ -9589,34 +12832,6 @@ def direct():
         }
     }
 
-    /// #2436: two flow policies whose propagation semantics agree must share
-    /// one solve. The shared-membership metric counts the other members of the
-    /// batch each policy landed in, so a shared batch reports at least one.
-    #[test]
-    fn two_compatible_flow_policies_share_one_propagation_solve() {
-        let (_workspace, analyzer) = flow_workspace();
-        let registry = registry_for_sources(&[
-            ("test:flow-a.rqlp", &flow_policy("test.flow-a", "validate")),
-            ("test:flow-b.rqlp", &flow_policy("test.flow-b", "validate")),
-        ]);
-        let evaluator = ProductionTaintPolicyEvaluator::prepare(
-            registry.policies(),
-            &analyzer,
-            Ok(None),
-            None,
-            &PolicyBudget::default(),
-        );
-        let payloads = evaluator.prepared.borrow();
-        assert_eq!(payloads.len(), 2, "two flow policies produce two payloads");
-        for (policy_id, payload) in payloads.iter() {
-            assert!(
-                shared_memberships(&payload.work) >= 1,
-                "{policy_id} must share its solve with the compatible policy: {:#?}",
-                payload.work
-            );
-        }
-    }
-
     /// The other half of the same claim: kills change propagation, so two
     /// policies that disagree about them must not share a solve. Without the
     /// kill semantics in the batch compatibility key these two would collide
@@ -9635,7 +12850,10 @@ def direct():
             None,
             &PolicyBudget::default(),
         );
-        let payloads = evaluator.prepared.borrow();
+        let payloads = evaluator
+            .prepared
+            .lock()
+            .expect("taint prepared payloads mutex poisoned");
         assert_eq!(payloads.len(), 2);
         for (policy_id, payload) in payloads.iter() {
             assert!(
@@ -9652,9 +12870,167 @@ def direct():
         }
     }
 
-    /// #2436 no-false-green: a spent request-wide findings lane must leave the
-    /// flow run inconclusive. A truncated run that reported `Complete` with
-    /// fewer findings would be a clean verdict the analysis never proved.
+    /// #3686: only a flow candidate question runs a candidate pass. An
+    /// ordinary run runs none, so normal scans pay no candidate cost. A reached
+    /// candidate runs one pass; a killed negative runs the authored pass and
+    /// the kill-free pass; and an execution limit of one stops after the
+    /// authored pass. The route's acceptance tests over the P0 reference
+    /// trees live in the root suite (`policy_flow_candidate.rs`).
+    #[test]
+    fn flow_candidate_passes_run_only_for_a_candidate_question() {
+        use crate::explain::{
+            ExplanationCandidate, ExplanationLimits, ExplanationOutcome, FlowExplanationCandidate,
+            explain_flow_candidate,
+        };
+
+        let (workspace, analyzer) = python_workspace(FLOW_CANDIDATE_SOURCE);
+        let source = flow_policy("test.flow-candidate", "validate");
+        let flow_state = brokk_bifrost_flow::FlowWorkspaceState::default();
+
+        let before = super::candidate::candidate_passes_for_test();
+        let outcome = evaluate_policy_source(
+            workspace.root(),
+            PolicySourceIdentity::new("test:flow-candidate.rqlp"),
+            &source,
+            &analyzer,
+            &flow_state,
+            &PolicyEvaluationOptions::new(
+                PolicyEvaluationDate::from_ymd(2026, 10, 2).expect("fixed evaluation date"),
+            ),
+            None,
+        )
+        .expect("the ordinary run evaluates");
+        assert_eq!(
+            super::candidate::candidate_passes_for_test(),
+            before,
+            "an ordinary policy run must not run a candidate pass"
+        );
+        let [run] = outcome.report().runs() else {
+            panic!("one policy produces one run");
+        };
+        assert_eq!(
+            run.findings().len(),
+            1,
+            "only `direct` reaches put: {:#?}",
+            run.findings()
+        );
+
+        let registry = registry_for_sources(&[("test:flow-candidate.rqlp", &source)]);
+        let policy = registry.policies().next().expect("one loaded policy");
+        let context = PolicyEvaluationContext {
+            analyzer: analyzer.analyzer(),
+            workspace: Some(&analyzer),
+            flow_state: &flow_state,
+            cancellation: None,
+            cvss_overlays: &[],
+            organizational_risk: &[],
+            incremental: None,
+        };
+        // The origin is the `read()` call inside each observed `put(...)`.
+        let candidate = |observation: &str, origin_offset: usize| {
+            let start = FLOW_CANDIDATE_SOURCE
+                .find(observation)
+                .expect("the fixture holds the observation");
+            let origin = start + origin_offset;
+            FlowExplanationCandidate::new(
+                ExplanationCandidate::in_range(
+                    "flow.py",
+                    origin as u64,
+                    (origin + "read()".len()) as u64,
+                )
+                .expect("a workspace-relative origin"),
+                ExplanationCandidate::in_range(
+                    "flow.py",
+                    start as u64,
+                    (start + observation.len()) as u64,
+                )
+                .expect("a workspace-relative observation"),
+            )
+        };
+        let reached = candidate("put(read())", "put(".len());
+        let killed = candidate("put(validate(read()))", "put(validate(".len());
+        let explain = |candidate: &FlowExplanationCandidate, limits: &ExplanationLimits| {
+            let before = super::candidate::candidate_passes_for_test();
+            let explanation = explain_flow_candidate(
+                policy,
+                &context,
+                candidate,
+                &PolicyBudget::default(),
+                limits,
+            )
+            .expect("the candidate explains");
+            (
+                explanation,
+                super::candidate::candidate_passes_for_test() - before,
+            )
+        };
+        let attribution = |explanation: &crate::explain::PolicyExplanation| {
+            explanation
+                .root()
+                .children()
+                .iter()
+                .find(|node| node.label() == "kill_attribution")
+                .map(|node| node.outcome())
+        };
+
+        let limits = ExplanationLimits::default();
+        let (explanation, passes) = explain(&reached, &limits);
+        assert_eq!(
+            explanation.outcome(),
+            ExplanationOutcome::Satisfied,
+            "{explanation:#?}"
+        );
+        assert_eq!(passes, 1, "a reached candidate needs one production pass");
+
+        let (explanation, passes) = explain(&killed, &limits);
+        assert_eq!(
+            explanation.outcome(),
+            ExplanationOutcome::Failed,
+            "{explanation:#?}"
+        );
+        assert_eq!(
+            attribution(&explanation),
+            Some(ExplanationOutcome::Satisfied),
+            "{explanation:#?}"
+        );
+        assert_eq!(passes, 2, "the authored pass and the kill-free pass");
+
+        let (explanation, passes) = explain(&killed, &limits.with_max_prefix_executions(1));
+        assert_eq!(
+            explanation.outcome(),
+            ExplanationOutcome::Failed,
+            "{explanation:#?}"
+        );
+        assert_eq!(
+            attribution(&explanation),
+            Some(ExplanationOutcome::Unknown),
+            "{explanation:#?}"
+        );
+        assert_eq!(
+            passes, 1,
+            "an execution limit of one runs the authored pass only"
+        );
+    }
+
+    /// One origin that reaches `put` directly and one that `validate` kills on
+    /// its way there, for the flow candidate pass counts (#3686).
+    const FLOW_CANDIDATE_SOURCE: &str = "\
+def read():
+    return \"raw\"
+
+def validate(value):
+    return value
+
+def put(value):
+    pass
+
+def direct():
+    put(read())
+
+def validated():
+    put(validate(read()))
+";
+
     #[test]
     fn a_spent_findings_lane_keeps_a_flow_run_inconclusive() {
         let (_workspace, analyzer) = flow_workspace();
@@ -9674,7 +13050,10 @@ def direct():
             None,
             &budget,
         );
-        let payloads = evaluator.prepared.borrow();
+        let payloads = evaluator
+            .prepared
+            .lock()
+            .expect("taint prepared payloads mutex poisoned");
         let [(_, payload)] = payloads.iter().collect::<Vec<_>>()[..] else {
             panic!("one flow policy produces one payload");
         };
@@ -9682,6 +13061,1308 @@ def direct():
             !matches!(payload.completion, PolicyRunCompletion::Complete),
             "an exhausted findings lane must not report a conclusive clean run: {:#?}",
             payload.completion
+        );
+    }
+
+    const COMPOSED_SOURCE: &str = r#"fn source() -> String {
+    String::new()
+}
+
+fn pass_through(value: String) -> String {
+    value
+}
+
+fn sink(text: String) -> usize {
+    text.len()
+}
+
+pub fn run() {
+    let raw = source();
+    let moved = pass_through(raw);
+    sink(moved);
+}
+"#;
+
+    const COMPOSED_POLICY: &str = r#"(policy
+      :schema-version 1
+      :id "test.composed"
+      :name "Composed"
+      :message "tainted data reached sink"
+      :severity warning
+      :analysis (analysis
+        :type taint
+        :mode may
+        :call-modeling (call-modeling :unmodeled optimistic)
+        :sources (endpoint-set :entries [
+          (source :id raw-input :display-name "raw input" :categories [input.user]
+            :selector (rql :schema-version 1
+              (language rust (call :callee (name "source"))))
+            :bind return-value :labels [attacker-controlled])])
+        :sinks (endpoint-set :entries [
+          (sink :id sink :display-name "sink" :categories [data.sensitive]
+            :selector (rql :schema-version 1
+              (language rust (call :callee (name "sink"))))
+            :dangerous-operand (argument :index 0)
+            :accepts [attacker-controlled])])))"#;
+
+    /// The composed policy's engine names of its compiled roots, compiled once
+    /// under `identity` on `project`.
+    fn compiled_engines(
+        project: &BuiltInlineTestProject,
+        workspace: &WorkspaceAnalyzer,
+        identity: &str,
+        source: &str,
+    ) -> Vec<TaintEngine> {
+        let mut registry = crate::registry::test_registry_for_workspace(project.root());
+        let policy = registry
+            .register_policy_bytes(PolicySourceIdentity::new(identity), source.as_bytes())
+            .expect("the policy registers");
+        let spec = policy
+            .resolved_taint()
+            .expect("the policy is a taint policy");
+        let cancellation = CancellationToken::default();
+        let compilation = TaintPolicyCompiler::new(
+            workspace,
+            None,
+            CodeQueryExecutionLimits::default(),
+            64,
+            &cancellation,
+        )
+        .compile(policy, spec)
+        .unwrap_or_else(|failure| panic!("the policy compiles: {:?}", failure.error));
+        let TaintPolicyCompilation::Plans { roots, .. } = compilation else {
+            panic!("the policy compiles to analysis plans");
+        };
+        roots.into_iter().map(|root| root.engine).collect()
+    }
+
+    /// The engine rule is a pure function of the policy and the workspace: the
+    /// same policy on the same fixture selects the same engine on every
+    /// compile, and adding a store end selects the ICFG engine (spec M3.0).
+    #[test]
+    fn the_engine_rule_is_stable_and_a_store_end_selects_icfg() {
+        let project = InlineTestProject::with_language(Language::Rust)
+            .file("src/lib.rs", COMPOSED_SOURCE)
+            .build();
+        let workspace = project.workspace_analyzer(AnalyzerConfig {
+            parallelism: Some(1),
+            ..AnalyzerConfig::default()
+        });
+        let first = compiled_engines(
+            &project,
+            &workspace,
+            "test:engine-first.rqlp",
+            COMPOSED_POLICY,
+        );
+        let second = compiled_engines(
+            &project,
+            &workspace,
+            "test:engine-second.rqlp",
+            COMPOSED_POLICY,
+        );
+        assert!(
+            !first.is_empty()
+                && first
+                    .iter()
+                    .all(|engine| *engine == TaintEngine::Composition),
+            "the composed policy selects the composition engine: {first:?}"
+        );
+        assert_eq!(first, second, "the same policy selects the same engine");
+
+        let with_store = COMPOSED_POLICY.replacen(
+            ":sinks",
+            ":stores (endpoint-set :entries [(store-write :id put \
+               :selector (rql :schema-version 1 (language rust (call :callee (name \"pass_through\")))) \
+               :store primary :input (argument :index 0))]) :sinks",
+            1,
+        );
+        let stored = compiled_engines(&project, &workspace, "test:engine-store.rqlp", &with_store);
+        assert!(
+            !stored.is_empty()
+                && stored.iter().all(|engine| {
+                    *engine
+                        == TaintEngine::Icfg {
+                            reason: "store-ends".into(),
+                        }
+                }),
+            "a store end selects the ICFG engine: {stored:?}"
+        );
+    }
+
+    /// A source reaches a sink across one call. The composition engine finds
+    /// the finding from the sink backwards through the callee's stored or
+    /// computed partial flows, not from a whole-workspace solve. The same
+    /// fixture also runs through the policy evaluator, and its run records the
+    /// composition engine.
+    #[test]
+    fn composition_finds_a_source_that_reaches_a_sink_across_a_call() {
+        use super::TaintPolicyCompilation;
+        use crate::registry::test_registry_for_workspace;
+        use crate::taint_compose_provider::{CompositionMemo, PolicyCompositionProvider};
+        use brokk_bifrost_analysis::analyzer::semantic::SemanticExecutionBudget;
+        use brokk_bifrost_analysis::analyzer::semantic::{SemanticBudget, SemanticRequest};
+        use brokk_bifrost_flow::taint::compose::{CompositionBudget, compose_taint_batch};
+
+        let project = InlineTestProject::with_language(Language::Rust)
+            .file("src/lib.rs", COMPOSED_SOURCE)
+            .build();
+        let workspace = project.workspace_analyzer(AnalyzerConfig {
+            parallelism: Some(1),
+            ..AnalyzerConfig::default()
+        });
+        let mut registry = test_registry_for_workspace(project.root());
+        let policy = registry
+            .register_policy_bytes(
+                PolicySourceIdentity::new("test:composed.rqlp"),
+                COMPOSED_POLICY.as_bytes(),
+            )
+            .expect("the composed policy registers");
+        let spec = policy
+            .resolved_taint()
+            .expect("the composed policy is a taint policy");
+        let cancellation = CancellationToken::default();
+        let compilation = TaintPolicyCompiler::new(
+            &workspace,
+            None,
+            CodeQueryExecutionLimits::default(),
+            64,
+            &cancellation,
+        )
+        .compile(policy, spec)
+        .unwrap_or_else(|failure| panic!("the composed policy compiles: {:?}", failure.error));
+        let TaintPolicyCompilation::Plans { roots, .. } = compilation else {
+            panic!("the composed policy compiles to analysis plans");
+        };
+        let [root] = roots.as_slice() else {
+            panic!("the composed policy has one root, found {}", roots.len());
+        };
+        assert_eq!(root.engine, TaintEngine::Composition);
+        let plan = root.plan.analysis();
+
+        let cache = DiscoveryMaterializationCache::default();
+        let memo = CompositionMemo::default();
+        let provider = PolicyCompositionProvider::new(
+            &workspace,
+            SemanticExecutionBudget::new(usize::MAX, usize::MAX),
+            &cache,
+            plan,
+            &root.external_models,
+            64,
+            super::FrontierEndpointBinder::new(
+                TaintPolicyCompiler::new(
+                    &workspace,
+                    None,
+                    CodeQueryExecutionLimits::default(),
+                    64,
+                    &cancellation,
+                ),
+                policy,
+                spec,
+                plan.universe().clone(),
+            ),
+            &memo,
+        );
+        let mut budget = SemanticBudget::default();
+        let outcome = compose_taint_batch(
+            plan,
+            &provider,
+            CompositionBudget {
+                max_procedures: 64,
+                max_hops: 4096,
+                max_callers_per_procedure: 64,
+            },
+            &mut SemanticRequest::new(&mut budget, &cancellation),
+        )
+        .expect("the composition runs");
+        assert!(
+            provider.failure().is_none(),
+            "the provider failed: {:?}",
+            provider.failure()
+        );
+        let findings = outcome.report.findings();
+        assert_eq!(findings.len(), 1, "one finding is expected: {findings:#?}");
+        let sink = plan
+            .value_flow()
+            .sink(findings[0].sink())
+            .expect("the finding names a sink of its plan");
+        assert_eq!(
+            sink.point()
+                .procedure()
+                .semantics()
+                .locator()
+                .declaration()
+                .segments()
+                .last()
+                .and_then(|segment| segment.name()),
+            Some("run"),
+            "the sink is the call in run"
+        );
+
+        let options = PolicyEvaluationOptions::new(
+            PolicyEvaluationDate::from_ymd(2026, 10, 9).expect("fixed evaluation date"),
+        );
+        let outcome = evaluate_policy_source(
+            project.root(),
+            PolicySourceIdentity::new("test:composed-surface.rqlp"),
+            COMPOSED_POLICY,
+            &workspace,
+            &brokk_bifrost_flow::FlowWorkspaceState::new(),
+            &options,
+            None,
+        )
+        .expect("production taint evaluation");
+        let [run] = outcome.report().runs() else {
+            panic!("one policy produces one run");
+        };
+        assert_eq!(run.findings().len(), 1, "{:#?}", run.diagnostics());
+        assert_eq!(
+            run.engine().map(TaintEngine::render).as_deref(),
+            Some("composition"),
+        );
+    }
+
+    /// `run` passes its source to `std::convert::identity`, which has no body
+    /// in the workspace, and logs the result. Only the policy's
+    /// unmodeled-call behavior can carry the source across the call.
+    const UNMODELED_CALL_SOURCE: &str = r#"fn source() -> String {
+    String::new()
+}
+
+fn sink(text: String) -> usize {
+    text.len()
+}
+
+pub fn run() {
+    let raw = source();
+    let moved = std::convert::identity(raw);
+    sink(moved);
+}
+"#;
+
+    /// `run` puts its source in a `vec!` and logs the vector.
+    const VEC_MACRO_SOURCE: &str = r#"fn source() -> String {
+    String::new()
+}
+
+fn sink(text: String) -> usize {
+    text.len()
+}
+
+pub fn run() {
+    let raw = source();
+    let moved = vec![raw];
+    sink(moved);
+}
+"#;
+
+    /// One run as the engine comparison reads it: the engine, the completion,
+    /// each finding's location, certainty and completeness, the distinct
+    /// diagnostic families, and every diagnostic message, sorted.
+    type EngineRun = (
+        Option<String>,
+        PolicyRunCompletion,
+        Vec<(
+            crate::finding::PolicySourceLocation,
+            crate::finding::FindingCertainty,
+            crate::finding::FindingCompleteness,
+        )>,
+        Vec<String>,
+        Vec<String>,
+    );
+
+    /// `COMPOSED_POLICY` with `:unmodeled behavior` over `source`, evaluated
+    /// once on each engine: as written, which selects the composition, and
+    /// with an inert store end, which selects the ICFG engine.
+    fn engine_runs(source: &str, behavior: &str) -> [EngineRun; 2] {
+        engine_runs_of(COMPOSED_POLICY, source, behavior)
+    }
+
+    /// `base` with `:unmodeled behavior` over `source`, evaluated once on each
+    /// engine as `engine_runs` does.
+    fn engine_runs_of(base: &str, source: &str, behavior: &str) -> [EngineRun; 2] {
+        let project = InlineTestProject::with_language(Language::Rust)
+            .file("src/lib.rs", source)
+            .build();
+        let workspace = project.workspace_analyzer(AnalyzerConfig {
+            parallelism: Some(1),
+            ..AnalyzerConfig::default()
+        });
+        let composed = base.replacen(
+            ":unmodeled optimistic",
+            &format!(":unmodeled {behavior}"),
+            1,
+        );
+        let icfg = composed.replacen(
+            ":sinks",
+            ":stores (endpoint-set :entries [(store-write :id put \
+               :selector (rql :schema-version 1 (language rust (call :callee (name \"nothing_here\")))) \
+               :store primary :input (argument :index 0))]) :sinks",
+            1,
+        );
+        let options = PolicyEvaluationOptions::new(
+            PolicyEvaluationDate::from_ymd(2026, 10, 9).expect("fixed evaluation date"),
+        );
+        [("composed", composed), ("icfg", icfg)].map(|(name, policy)| {
+            let outcome = evaluate_policy_source(
+                project.root(),
+                PolicySourceIdentity::new(format!("test:{name}-{behavior}.rqlp")),
+                &policy,
+                &workspace,
+                &brokk_bifrost_flow::FlowWorkspaceState::new(),
+                &options,
+                None,
+            )
+            .expect("production taint evaluation");
+            let [run] = outcome.report().runs() else {
+                panic!("one policy produces one run");
+            };
+            let mut families = run
+                .diagnostics()
+                .iter()
+                .map(|diagnostic| diagnostic.family().to_owned())
+                .collect::<Vec<_>>();
+            families.sort();
+            families.dedup();
+            let mut messages = run
+                .diagnostics()
+                .iter()
+                .map(|diagnostic| diagnostic.message().to_owned())
+                .collect::<Vec<_>>();
+            messages.sort();
+            (
+                run.engine().map(TaintEngine::render),
+                run.completion().clone(),
+                run.findings()
+                    .iter()
+                    .map(|finding| {
+                        (
+                            finding.primary().clone(),
+                            finding.certainty().clone(),
+                            finding.completeness().clone(),
+                        )
+                    })
+                    .collect(),
+                families,
+                messages,
+            )
+        })
+    }
+
+    /// Assert that both engines select as intended and agree on the
+    /// completion and the findings of `source` under every unmodeled-call
+    /// behavior. Returns the number of findings under each behavior.
+    fn assert_engines_agree_on_every_behavior(source: &str) -> [usize; 3] {
+        ["paranoid", "optimistic", "require-model"].map(|behavior| {
+            let [composed, icfg] = engine_runs(source, behavior);
+            assert_eq!(composed.0.as_deref(), Some("composition"), "{behavior}");
+            assert_eq!(icfg.0.as_deref(), Some("icfg (store-ends)"), "{behavior}");
+            assert_eq!(
+                (&composed.1, &composed.2),
+                (&icfg.1, &icfg.2),
+                "the engines disagree under {behavior}"
+            );
+            composed.2.len()
+        })
+    }
+
+    /// `run` passes its source as the second argument of a two-argument
+    /// `sink`. `other` calls a one-argument `sink`, which the same name selector
+    /// matches; the policy binds the sink on argument index 1, which that call
+    /// lacks. The site is refused and `other`'s region is dropped, so `run`
+    /// keeps its finding. The refusal makes the run incomplete, and both
+    /// engines answer the same. Before the refusal, binding aborted the whole
+    /// compile with `selected call has no argument at index 1`.
+    #[test]
+    #[hardwon(
+        "9ce1a3aecb5a: a selected call without the declared argument aborted the compile instead of being refused"
+    )]
+    fn both_engines_refuse_a_selected_call_without_the_declared_operand() {
+        const OPERAND_SOURCE: &str = r#"fn source() -> String {
+    String::new()
+}
+
+fn sink(label: usize, text: String) -> usize {
+    label + text.len()
+}
+
+fn other(text: String) -> usize {
+    fn sink(text: String) -> usize {
+        text.len()
+    }
+    sink(text)
+}
+
+pub fn run() {
+    let raw = source();
+    sink(0, raw);
+}
+"#;
+        let policy = COMPOSED_POLICY.replacen(
+            ":dangerous-operand (argument :index 0)",
+            ":dangerous-operand (argument :index 1)",
+            1,
+        );
+        let [composed, icfg] = engine_runs_of(&policy, OPERAND_SOURCE, "optimistic");
+        assert_eq!(composed.0.as_deref(), Some("composition"));
+        assert_eq!(icfg.0.as_deref(), Some("icfg (store-ends)"));
+        assert_eq!(
+            (&composed.1, &composed.2, &composed.3, &composed.4),
+            (&icfg.1, &icfg.2, &icfg.3, &icfg.4),
+            "the engines disagree on the refused-operand run"
+        );
+        assert_eq!(
+            icfg.1,
+            PolicyRunCompletion::inconclusive(vec![PolicyIncompleteReason::CapabilityIncomplete])
+                .expect("a canonical capability reason"),
+            "the refusal leaves the run incomplete"
+        );
+        assert_eq!(
+            icfg.2.len(),
+            1,
+            "the two-argument call's flow is reported: {:?}",
+            icfg.2
+        );
+        assert_eq!(
+            icfg.4
+                .iter()
+                .filter(
+                    |message| message.contains("the port `(argument :index 1)` at")
+                        && message.contains("which has 1 argument(s)")
+                )
+                .count(),
+            1,
+            "the one-argument call is refused with its diagnostic: {:?}",
+            icfg.4
+        );
+    }
+
+    /// `run` holds both sinks the name selector matches: the two-argument
+    /// `sink`, which receives the source as argument 1, and the one-argument
+    /// `sink1`, which has no argument 1 and is refused. A composed run builds
+    /// no region, so the refusal costs only its own site: the flow into `sink`
+    /// is reported and the run is incomplete for the refusal. Before, the
+    /// composed compile discovered regions and dropped every region holding
+    /// `run` (#2308), so the run compiled to no root and failed with "no
+    /// analysis root contains both a selected source and sink". The ICFG
+    /// engine keeps that region rule, so it reports nothing here.
+    #[test]
+    #[hardwon(
+        "c3dd2cb6be7f: a refused sink site dropped every sink of its procedure from a composed run"
+    )]
+    fn a_composed_refusal_drops_its_site_and_keeps_the_procedures_other_sinks() {
+        const SAME_PROCEDURE_SOURCE: &str = r#"fn source() -> String {
+    String::new()
+}
+
+fn sink(label: usize, text: String) -> usize {
+    label + text.len()
+}
+
+fn sink1(text: String) -> usize {
+    text.len()
+}
+
+pub fn run() -> usize {
+    let raw = source();
+    sink(0, raw) + sink1(String::new())
+}
+"#;
+        let policy = COMPOSED_POLICY
+            .replacen(
+                ":dangerous-operand (argument :index 0)",
+                ":dangerous-operand (argument :index 1)",
+                1,
+            )
+            .replacen("(name \"sink\")", "(name/regex \"^sink1?$\")", 1);
+        let [composed, icfg] = engine_runs_of(&policy, SAME_PROCEDURE_SOURCE, "optimistic");
+        assert_eq!(composed.0.as_deref(), Some("composition"));
+        assert_eq!(
+            composed.1,
+            PolicyRunCompletion::inconclusive(vec![PolicyIncompleteReason::CapabilityIncomplete])
+                .expect("a canonical capability reason"),
+            "the refusal leaves the composed run incomplete"
+        );
+        assert_eq!(
+            composed.2.len(),
+            1,
+            "the flow into the two-argument sink is reported: {:?}",
+            composed.2
+        );
+        assert_eq!(
+            composed
+                .4
+                .iter()
+                .filter(
+                    |message| message.contains("the port `(argument :index 1)` at")
+                        && message.contains("which has 1 argument(s)")
+                )
+                .count(),
+            1,
+            "the one-argument call is refused with its diagnostic: {:?}",
+            composed.4
+        );
+        assert!(
+            icfg.2.is_empty(),
+            "the ICFG engine drops the region that holds the refused site: {:?}",
+            icfg.2
+        );
+    }
+
+    /// `std::format!` leaves `run` open with blocked gaps that no call dispatch
+    /// answers (M3-k fixture v7). The composition's diagnostic must name the
+    /// family the ICFG engine names for the same procedure.
+    #[test]
+    #[hardwon(
+        "a2f46bafa030: a composed run named a blocked-gap open procedure with a family the ICFG engine does not name"
+    )]
+    fn composition_names_a_blocked_gap_with_the_icfg_family() {
+        const BLOCKED_GAP_SOURCE: &str = r#"fn source() -> String {
+    String::new()
+}
+
+fn sink(text: String) -> usize {
+    text.len()
+}
+
+pub fn run() {
+    let raw = source();
+    let moved = std::format!("{}", raw);
+    sink(moved);
+}
+"#;
+        let [composed, icfg] = engine_runs(BLOCKED_GAP_SOURCE, "paranoid");
+        assert_eq!(composed.0.as_deref(), Some("composition"));
+        assert_eq!(icfg.0.as_deref(), Some("icfg (store-ends)"));
+        assert_eq!(
+            icfg.3,
+            ["taint discovery is incomplete: procedure semantics is unknown"],
+            "the ICFG engine names one family for this procedure"
+        );
+        assert!(
+            composed.3.iter().all(|family| icfg.3.contains(family)),
+            "composed families {:?} are not a subset of the ICFG's {:?}",
+            composed.3,
+            icfg.3
+        );
+        assert_eq!((&composed.1, &composed.2), (&icfg.1, &icfg.2));
+    }
+
+    /// The composition crosses a call no model covers and no candidate body
+    /// answers exactly as the ICFG engine does: paranoid carries the argument
+    /// to the result, uncertain; optimistic and require-model carry nothing.
+    #[test]
+    fn both_engines_cross_an_unmodeled_call_by_the_policy_behavior() {
+        assert_eq!(
+            assert_engines_agree_on_every_behavior(UNMODELED_CALL_SOURCE),
+            [1, 0, 0]
+        );
+    }
+
+    /// The Rust lowering of `vec!` writes the elements into the call's result
+    /// value before the call. Both engines keep that fact across the unmodeled
+    /// call, so under optimistic and require-model the composition finds the
+    /// flow as the ICFG does.
+    #[hardwon(
+        "1b531c29a629: the fixpoint erased a result value written before its call, so vec! elements never reached the sink"
+    )]
+    #[test]
+    fn both_engines_carry_a_vec_macro_element_under_every_behavior() {
+        assert_eq!(
+            assert_engines_agree_on_every_behavior(VEC_MACRO_SOURCE),
+            [1, 1, 1]
+        );
+    }
+
+    /// The ICFG engine reaches a call's continuation only over the call's
+    /// continuation edges, which carry its dispatch's proof and completeness,
+    /// and it applies them to every fact leaving the call's point, whether or
+    /// not the fact enters the callee. Each fixture leaves the source's path
+    /// across an unresolved call without passing through it: a `println!`
+    /// between the source and the sink that prints the source (lane M3-k's
+    /// fixture v6) or another value (v9), a source bound to an unresolved
+    /// trait-object call's result, and a sink at an unresolved trait-object
+    /// call. Both engines report each flow as possible and partial. When a
+    /// `println!` sits on one branch only, the other path crosses no call, so
+    /// the flow is definite and complete on both engines; the same holds when
+    /// the other branch calls a resolved function instead, whose
+    /// continuation is proven and complete, which only a separate crossed-call
+    /// set per path keeps apart from the `println!` branch.
+    #[test]
+    #[hardwon(
+        "4187b3b0a032: a flow live across an unresolved call kept a proven, complete quality that the ICFG degrades"
+    )]
+    fn both_engines_degrade_a_flow_live_across_an_unresolved_call() {
+        let prints_the_source = r#"fn source() -> String {
+    String::new()
+}
+
+fn sink(text: String) -> usize {
+    text.len()
+}
+
+pub fn run() {
+    let raw = source();
+    println!("{}", raw);
+    let moved = raw;
+    sink(moved);
+}
+"#;
+        let prints_another_value = r#"fn source() -> String {
+    String::new()
+}
+
+fn sink(text: String) -> usize {
+    text.len()
+}
+
+pub fn run() {
+    let raw = source();
+    let other = String::new();
+    println!("{}", other);
+    let moved = raw;
+    sink(moved);
+}
+"#;
+        let prints_on_one_branch = r#"fn source() -> String {
+    String::new()
+}
+
+fn sink(text: String) -> usize {
+    text.len()
+}
+
+pub fn run(flag: bool) {
+    let raw = source();
+    if flag {
+        println!("{}", "branch");
+    }
+    let moved = raw;
+    sink(moved);
+}
+"#;
+        let resolved_call_on_the_other_branch = r#"fn source() -> String {
+    String::new()
+}
+
+fn sink(text: String) -> usize {
+    text.len()
+}
+
+fn note() {}
+
+pub fn run(flag: bool) {
+    let raw = source();
+    if flag {
+        note();
+    } else {
+        println!("{}", "branch");
+    }
+    let moved = raw;
+    sink(moved);
+}
+"#;
+        let unresolved_source = r#"pub trait Feed {
+    fn source(&self) -> String;
+}
+
+fn sink(text: String) -> usize {
+    text.len()
+}
+
+pub fn run(feed: &dyn Feed) {
+    let raw = feed.source();
+    sink(raw);
+}
+"#;
+        let unresolved_sink = r#"pub trait Out {
+    fn sink(&self, text: String) -> usize;
+}
+
+fn source() -> String {
+    String::new()
+}
+
+pub fn run(out: &dyn Out) {
+    let raw = source();
+    out.sink(raw);
+}
+"#;
+        for (source, expected) in [
+            (prints_the_source, ("possible", "partial")),
+            (prints_another_value, ("possible", "partial")),
+            (unresolved_source, ("possible", "partial")),
+            (unresolved_sink, ("possible", "partial")),
+            (prints_on_one_branch, ("definite", "complete")),
+            (resolved_call_on_the_other_branch, ("definite", "complete")),
+        ] {
+            let [composed, icfg] = engine_runs(source, "paranoid");
+            assert_eq!(composed.0.as_deref(), Some("composition"));
+            assert_eq!(icfg.0.as_deref(), Some("icfg (store-ends)"));
+            assert_eq!(
+                (&composed.1, &composed.2),
+                (&icfg.1, &icfg.2),
+                "the engines disagree on {source}"
+            );
+            let [(_, certainty, completeness)] = composed.2.as_slice() else {
+                panic!("one finding on {source}: {:#?}", composed.2);
+            };
+            assert_eq!(
+                (certainty.label(), completeness.label()),
+                expected,
+                "{source}"
+            );
+        }
+    }
+
+    /// `run` logs its source through an unresolved trait-object call, so the
+    /// open `run` keeps that call as a residual call. Both engines name it
+    /// with the same call-site message, which prints the procedure's
+    /// snapshot input status rather than the call's dispatch status, so the
+    /// run carries one diagnostic on each engine.
+    #[test]
+    fn both_engines_name_a_residual_call_with_the_same_message() {
+        const UNRESOLVED_SINK: &str = r#"pub trait Out {
+    fn sink(&self, text: String) -> usize;
+}
+
+fn source() -> String {
+    String::new()
+}
+
+pub fn run(out: &dyn Out) {
+    let raw = source();
+    out.sink(raw);
+}
+"#;
+        let [composed, icfg] = engine_runs(UNRESOLVED_SINK, "paranoid");
+        assert_eq!(composed.0.as_deref(), Some("composition"));
+        assert_eq!(icfg.0.as_deref(), Some("icfg (store-ends)"));
+        assert_eq!((&composed.1, &composed.2), (&icfg.1, &icfg.2));
+        assert_eq!(icfg.4.len(), 1, "{:#?}", icfg.4);
+        assert_eq!(composed.4, icfg.4);
+    }
+
+    /// The fixture of the authored-summary composition test. `replace` is a
+    /// std method with no body in the workspace, so its boundary is closed by
+    /// the summary alone: `receiver.replace(raw, "")` returns its first
+    /// argument's value.
+    const SUMMARY_CALL_SOURCE: &str = r#"use std::string::String;
+
+fn source() -> String {
+    String::new()
+}
+
+fn sink(text: String) -> usize {
+    text.len()
+}
+
+pub fn run(receiver: String) {
+    let raw = source();
+    let moved = receiver.replace(raw, "");
+    sink(moved);
+}
+"#;
+
+    /// A summary whose one transfer runs from parameter 0 to the normal
+    /// return. The declaration pack and the target match the receiver
+    /// sanitizer fixture above.
+    fn parameter_summary_pack()
+    -> brokk_bifrost_analysis::analyzer::semantic_model::CompiledSemanticModelPack {
+        compile_receiver_sanitizer_pack(
+            "test.parameter-summaries",
+            "summaries.string",
+            serde_json::json!({
+                "kind": "procedure_summaries",
+                "summaries": [{
+                    "id": "summary.rust-codeql.std-string-string-replace",
+                    "target": {
+                        "path": "library/alloc/src/string.rs",
+                        "symbol": "std.string.String.replace",
+                        "has_receiver": true,
+                        "parameter_count": 2
+                    },
+                    "completeness": "complete",
+                    "covers_overrides": true,
+                    "locations": [],
+                    "transfers": [{
+                        "input": { "kind": "parameter", "ordinal": 0 },
+                        "exit_kind": "normal",
+                        "output": { "kind": "normal_return" }
+                    }],
+                    "effects": []
+                }]
+            }),
+        )
+    }
+
+    /// A source reaches a sink through a call whose boundary the resolver
+    /// proves and completes from the authored summary. The summary's transfer
+    /// is the only way the flow crosses the call, so the composition finds the
+    /// finding only if it applies the summary on that complete boundary.
+    #[hardwon(
+        "a2f46bafa034: covering_model skipped a proven and complete boundary before it looked up the summary that closed it"
+    )]
+    #[test]
+    fn composition_applies_an_authored_summary_on_a_complete_external_boundary() {
+        use super::TaintPolicyCompilation;
+        use crate::registry::test_registry_for_workspace;
+        use crate::taint_compose_provider::{CompositionMemo, PolicyCompositionProvider};
+        use brokk_bifrost_analysis::analyzer::semantic::SemanticExecutionBudget;
+        use brokk_bifrost_analysis::analyzer::semantic::{SemanticBudget, SemanticRequest};
+        use brokk_bifrost_analysis::analyzer::semantic_model::{
+            SemanticModelRuntimeOutcome, acquire_active_semantic_models,
+        };
+        use brokk_bifrost_flow::taint::compose::{CompositionBudget, compose_taint_batch};
+
+        let project = InlineTestProject::with_language(Language::Rust)
+            .file("src/lib.rs", SUMMARY_CALL_SOURCE)
+            .build();
+        let workspace = project.workspace_analyzer(AnalyzerConfig {
+            parallelism: Some(1),
+            ..AnalyzerConfig::default()
+        });
+        let catalog = SemanticPackCatalog::open_ephemeral(CatalogOptions::default())
+            .expect("open an ephemeral semantic-pack catalog");
+        for (pack, source_id) in [
+            (
+                receiver_sanitizer_declaration_pack(),
+                "test:summary-call-declarations",
+            ),
+            (parameter_summary_pack(), "test:summary-call-summaries"),
+        ] {
+            catalog
+                .register_session_pack(
+                    &pack,
+                    &SessionPackSource {
+                        kind: SessionPackSourceKind::Embedded,
+                        source_id: source_id.to_owned(),
+                    },
+                )
+                .expect("register the summary fixture");
+        }
+        let cancellation = CancellationToken::default();
+        let SemanticModelRuntimeOutcome::Ready {
+            active, snapshot, ..
+        } = acquire_active_semantic_models(
+            workspace.analyzer(),
+            &catalog,
+            None,
+            &SemanticModelActivationRequest {
+                bifrost_version: env!("CARGO_PKG_VERSION")
+                    .parse()
+                    .expect("test Bifrost version parses"),
+                evidence: vec![SemanticModelActivationEvidence {
+                    language: "rust".to_owned(),
+                    ecosystem: "cargo".to_owned(),
+                    package: None,
+                    module: None,
+                    toolchain: None,
+                    target: None,
+                    configuration: None,
+                    artifact_sha256: None,
+                }],
+                controls: Vec::new(),
+                limits: Default::default(),
+            },
+            &cancellation,
+        )
+        else {
+            panic!("the summary fixture activates");
+        };
+        let mut registry = test_registry_for_workspace(project.root());
+        let policy = registry
+            .register_policy_bytes(
+                PolicySourceIdentity::new("test:summary-call.rqlp"),
+                COMPOSED_POLICY.as_bytes(),
+            )
+            .expect("the composed policy registers");
+        let spec = policy
+            .resolved_taint()
+            .expect("the composed policy is a taint policy");
+        let compilation = TaintPolicyCompiler::new(
+            &workspace,
+            Some(active),
+            CodeQueryExecutionLimits::default(),
+            64,
+            &cancellation,
+        )
+        .with_active_semantic_model_snapshot(Some(Arc::clone(&snapshot)))
+        .compile(policy, spec)
+        .unwrap_or_else(|failure| panic!("the composed policy compiles: {:?}", failure.error));
+        let TaintPolicyCompilation::Plans { roots, .. } = compilation else {
+            panic!("the composed policy compiles to analysis plans");
+        };
+        let [root] = roots.as_slice() else {
+            panic!("the composed policy has one root, found {}", roots.len());
+        };
+        assert_eq!(root.engine, TaintEngine::Composition);
+        let plan = root.plan.analysis();
+
+        let cache = DiscoveryMaterializationCache::default();
+        let memo = CompositionMemo::default();
+        let provider = PolicyCompositionProvider::new(
+            &workspace,
+            SemanticExecutionBudget::new(usize::MAX, usize::MAX),
+            &cache,
+            plan,
+            &root.external_models,
+            64,
+            // The composition binds a call's summaries at the call, from the
+            // active models its binder's compiler holds.
+            super::FrontierEndpointBinder::new(
+                TaintPolicyCompiler::new(
+                    &workspace,
+                    None,
+                    CodeQueryExecutionLimits::default(),
+                    64,
+                    &cancellation,
+                )
+                .with_active_semantic_model_snapshot(Some(snapshot)),
+                policy,
+                spec,
+                plan.universe().clone(),
+            ),
+            &memo,
+        );
+        let mut budget = SemanticBudget::default();
+        let outcome = compose_taint_batch(
+            plan,
+            &provider,
+            CompositionBudget {
+                max_procedures: 64,
+                max_hops: 4096,
+                max_callers_per_procedure: 64,
+            },
+            &mut SemanticRequest::new(&mut budget, &cancellation),
+        )
+        .expect("the composition runs");
+        assert!(
+            provider.failure().is_none(),
+            "the provider failed: {:?}",
+            provider.failure()
+        );
+        let findings = outcome.report.findings();
+        assert_eq!(findings.len(), 1, "one finding is expected: {findings:#?}");
+    }
+
+    const COMPOSED_FIELD_SOURCE: &str = r#"pub struct Config {
+    pub key: String,
+}
+
+fn source() -> String {
+    String::new()
+}
+
+fn sink(text: &String) -> usize {
+    text.len()
+}
+
+fn callee(c: &Config) {
+    sink(&c.key);
+}
+
+pub fn caller() {
+    let mut c = Config {
+        key: String::new(),
+    };
+    c.key = source();
+    callee(&c);
+}
+"#;
+
+    /// Compose `COMPOSED_POLICY` over one Rust file and hand the plan and the
+    /// outcome to `check` while the workspace that owns them is alive.
+    fn compose_rust(
+        source: &str,
+        check: impl FnOnce(
+            &brokk_bifrost_flow::taint::TaintAnalysisPlan,
+            &brokk_bifrost_flow::taint::compose::ComposeOutcome,
+        ),
+    ) {
+        use super::TaintPolicyCompilation;
+        use crate::registry::test_registry_for_workspace;
+        use crate::taint_compose_provider::{CompositionMemo, PolicyCompositionProvider};
+        use brokk_bifrost_analysis::analyzer::semantic::SemanticExecutionBudget;
+        use brokk_bifrost_analysis::analyzer::semantic::{SemanticBudget, SemanticRequest};
+        use brokk_bifrost_flow::taint::compose::{CompositionBudget, compose_taint_batch};
+
+        let project = InlineTestProject::with_language(Language::Rust)
+            .file("src/lib.rs", source)
+            .build();
+        let workspace = project.workspace_analyzer(AnalyzerConfig {
+            parallelism: Some(1),
+            ..AnalyzerConfig::default()
+        });
+        let mut registry = test_registry_for_workspace(project.root());
+        let policy = registry
+            .register_policy_bytes(
+                PolicySourceIdentity::new("test:composed.rqlp"),
+                COMPOSED_POLICY.as_bytes(),
+            )
+            .expect("the composed policy registers");
+        let spec = policy
+            .resolved_taint()
+            .expect("the composed policy is a taint policy");
+        let cancellation = CancellationToken::default();
+        let compilation = TaintPolicyCompiler::new(
+            &workspace,
+            None,
+            CodeQueryExecutionLimits::default(),
+            64,
+            &cancellation,
+        )
+        .compile(policy, spec)
+        .unwrap_or_else(|failure| panic!("the composed policy compiles: {:?}", failure.error));
+        let TaintPolicyCompilation::Plans { roots, .. } = compilation else {
+            panic!("the composed policy compiles to analysis plans");
+        };
+        let [root] = roots.as_slice() else {
+            panic!("the composed policy has one root, found {}", roots.len());
+        };
+        let plan = root.plan.analysis();
+
+        let cache = DiscoveryMaterializationCache::default();
+        let memo = CompositionMemo::default();
+        let provider = PolicyCompositionProvider::new(
+            &workspace,
+            SemanticExecutionBudget::new(usize::MAX, usize::MAX),
+            &cache,
+            plan,
+            &root.external_models,
+            64,
+            super::FrontierEndpointBinder::new(
+                TaintPolicyCompiler::new(
+                    &workspace,
+                    None,
+                    CodeQueryExecutionLimits::default(),
+                    64,
+                    &cancellation,
+                ),
+                policy,
+                spec,
+                plan.universe().clone(),
+            ),
+            &memo,
+        );
+        let mut budget = SemanticBudget::default();
+        let outcome = compose_taint_batch(
+            plan,
+            &provider,
+            CompositionBudget {
+                max_procedures: 64,
+                max_hops: 4096,
+                max_callers_per_procedure: 64,
+            },
+            &mut SemanticRequest::new(&mut budget, &cancellation),
+        )
+        .expect("the composition runs");
+        assert!(
+            provider.failure().is_none(),
+            "the provider failed: {:?}",
+            provider.failure()
+        );
+        check(plan, &outcome);
+    }
+
+    /// A source the caller stores in a field reaches a sink the callee
+    /// applies to that field of its parameter. The demand at the callee's
+    /// heap input port climbs to the caller, where it is the location rooted
+    /// at the bound argument, observed before the call's effects.
+    ///
+    /// The run is not complete: without a standard library the workspace
+    /// leaves `String::new` undispatched and the procedures open, as it does
+    /// for the ICFG engine. No interior run may be incomplete, which is how
+    /// an unobserved caller-side location shows.
+    #[test]
+    fn composition_finds_a_source_in_a_field_the_callee_reads() {
+        use brokk_bifrost_flow::taint::compose::Incompleteness;
+
+        compose_rust(COMPOSED_FIELD_SOURCE, |plan, outcome| {
+            assert!(
+                !outcome
+                    .incompleteness
+                    .iter()
+                    .any(|reason| matches!(reason, Incompleteness::Interior { .. })),
+                "every interior run is complete: {:#?}",
+                outcome.incompleteness
+            );
+            let findings = outcome.report.findings();
+            assert_eq!(findings.len(), 1, "one finding is expected: {findings:#?}");
+            let finding = &findings[0];
+            let name = |point: &brokk_bifrost_analysis::analyzer::semantic::ProgramPointHandle| {
+                point
+                    .procedure()
+                    .semantics()
+                    .locator()
+                    .declaration()
+                    .segments()
+                    .last()
+                    .and_then(|segment| segment.name())
+                    .map(str::to_owned)
+            };
+            let sink = plan
+                .value_flow()
+                .sink(finding.sink())
+                .expect("the finding names a sink of its plan");
+            assert_eq!(
+                name(sink.point()).as_deref(),
+                Some("callee"),
+                "the sink is the call in callee"
+            );
+            let [evidence] = finding.origins().evidence() else {
+                panic!("one origin is expected: {:#?}", finding.origins());
+            };
+            let [witness] = evidence.witnesses() else {
+                panic!("one witness is expected: {evidence:#?}");
+            };
+            let procedures = witness
+                .steps()
+                .iter()
+                .filter_map(|step| name(step.source()))
+                .fold(Vec::<String>::new(), |mut names, name| {
+                    if names.last() != Some(&name) {
+                        names.push(name);
+                    }
+                    names
+                });
+            assert_eq!(
+                procedures,
+                ["caller", "callee"],
+                "the witness runs from the caller into the callee: {witness:#?}"
+            );
+        });
+    }
+
+    /// A parameter source read where the formal is named by its value rather
+    /// than by its port.
+    ///
+    /// `printed` passes the formal to `println!` by an inline capture, which
+    /// the Rust lowering publishes as a `LanguageDefined` relation from the
+    /// formal's value into the macro's argument. `formatted` passes it to
+    /// `format!` by an inline capture, which the lowering passes to the macro
+    /// call as a direct argument. Each `_control` variant is the same macro
+    /// over a local copy, and `control` passes the formal straight to a call.
+    /// `returned` passes the formal to `pass`, which returns its own formal;
+    /// the lowering reads that formal through a `Parameter` relation into a
+    /// temporary, so its `NormalReturn` relation names the temporary. Without
+    /// the Cargo manifest, `formatted_control` is missed too, so the fixture
+    /// keeps one.
+    const FORMAL_CARRIER_SOURCE: &str = r#"
+fn sink(_: &str) {}
+
+fn sink_owned(_: String) {}
+
+fn pass(x: &str) -> &str {
+    x
+}
+
+pub fn control(secret: &str) {
+    sink(secret);
+}
+
+pub fn returned(secret: &str) {
+    sink(pass(secret));
+}
+
+pub fn printed(secret: &str) {
+    std::println!("{secret}");
+}
+
+pub fn printed_control(secret: &str) {
+    let copy = secret;
+    std::println!("{copy}");
+}
+
+pub fn formatted(secret: &str) {
+    let s = format!("{secret}");
+    sink_owned(s);
+}
+
+pub fn formatted_control(secret: &str) {
+    let copy = secret;
+    let s = format!("{copy}");
+    sink_owned(s);
+}
+"#;
+
+    const FORMAL_CARRIER_POLICY: &str = r#"(policy
+      :schema-version 1
+      :id "test.formal-carrier"
+      :name "Formal carrier"
+      :message "a secret parameter reached a sink"
+      :severity warning
+      :analysis (analysis
+        :type taint
+        :mode may
+        :call-modeling (call-modeling :unmodeled optimistic)
+        :sources (endpoint-set :entries [
+          (source :id secret-parameter :display-name "secret parameter" :categories [data.sensitive]
+            :selector (rql :schema-version 1
+              (language rust (parameter :name "secret")))
+            :bind matched-value :labels [sensitive])])
+        :sinks (endpoint-set :entries [
+          (sink :id sink :display-name "sink" :categories [logging.cleartext]
+            :selector (rql :schema-version 1
+              (language rust (call :callee (name/regex "^sink(_owned)?$"))))
+            :dangerous-operand (argument :index 0)
+            :accepts [sensitive])
+          (sink :id print :display-name "print" :categories [logging.cleartext]
+            :selector (rql :schema-version 1
+              (language rust (call :receiver (name "std") :callee (name "println"))))
+            :dangerous-operand (argument :index 0)
+            :accepts [sensitive])])))"#;
+
+    #[test]
+    #[hardwon(
+        "bcdf0afc67d0+f3aec911b1c7: a formal read by value (println! LanguageDefined relation, format! direct call argument) had a second carrier identity, so a parameter source never reached the sink"
+    )]
+    fn a_parameter_source_reaches_the_sink_through_a_relation_that_names_the_formal_by_value() {
+        let project = InlineTestProject::with_language(Language::Rust)
+            .file(
+                "Cargo.toml",
+                "[package]\nname = \"formal_carrier\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+            )
+            .file("src/lib.rs", FORMAL_CARRIER_SOURCE)
+            .build();
+        let analyzer = project.workspace_analyzer(AnalyzerConfig {
+            parallelism: Some(1),
+            ..AnalyzerConfig::default()
+        });
+        let outcome = evaluate_policy_source(
+            project.root(),
+            PolicySourceIdentity::new("test:formal-carrier.rqlp"),
+            FORMAL_CARRIER_POLICY,
+            &analyzer,
+            &brokk_bifrost_flow::FlowWorkspaceState::new(),
+            &PolicyEvaluationOptions::new(
+                PolicyEvaluationDate::from_ymd(2026, 10, 9).expect("fixed evaluation date"),
+            ),
+            None,
+        )
+        .expect("formal carrier policy evaluates");
+        let [run] = outcome.report().runs() else {
+            panic!("one policy produces one run: {:?}", outcome.report());
+        };
+        let mut sink_lines = run
+            .findings()
+            .iter()
+            .map(|finding| {
+                finding
+                    .primary()
+                    .region()
+                    .expect("a taint finding has a source region")
+                    .start_line()
+            })
+            .collect::<Vec<_>>();
+        sink_lines.sort_unstable();
+        // control (11), returned (15), printed (19), printed_control (24),
+        // formatted (29) and formatted_control (35).
+        assert_eq!(
+            sink_lines,
+            vec![11, 15, 19, 24, 29, 35],
+            "completion={:?} diagnostics={:#?}",
+            run.completion(),
+            run.diagnostics()
         );
     }
 }

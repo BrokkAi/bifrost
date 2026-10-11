@@ -1,31 +1,24 @@
 use super::{RustTypeSourceCollector, RustTypeSourceShape};
+use crate::test_helpers::parse_rust as parse_tree;
 use brokk_bifrost_core::analyzer::rust_facts::RustTypeCompoundSourceKind;
-use brokk_bifrost_core::analyzer::source_facts::{
-    PrimarySourceFactCollector, SourceFactRows, SourceOccurrenceId,
-};
-use tree_sitter::{Node, Parser, Tree};
+use brokk_bifrost_core::analyzer::source_facts::{PrimarySourceFactCollector, SourceFactRows};
+use tree_sitter::{Node, Tree};
 
-fn parse_tree(source: &str) -> Tree {
-    let mut parser = Parser::new();
-    parser
-        .set_language(&tree_sitter_rust::LANGUAGE.into())
-        .expect("Rust grammar");
-    parser.parse(source, None).expect("parse Rust source")
+fn occurrence_text<'source>(
+    source: &'source str,
+    rows: &SourceFactRows,
+    occurrence: brokk_bifrost_core::analyzer::source_facts::SourceOccurrenceId,
+) -> &'source str {
+    let range = rows.occurrence(occurrence).range;
+    &source[range.start_byte..range.end_byte]
 }
 
 fn first_named_kind<'tree>(tree: &'tree Tree, kind: &str) -> Node<'tree> {
-    let mut pending = vec![tree.root_node()];
-    while let Some(node) = pending.pop() {
-        if node.kind() == kind {
-            return node;
-        }
-        for index in (0..node.named_child_count()).rev() {
-            if let Some(child) = node.named_child(index) {
-                pending.push(child);
-            }
-        }
-    }
-    panic!("missing Rust node kind {kind}");
+    brokk_bifrost_core::analyzer::tree_walk::first_named_descendant_of_kind_inclusive(
+        tree.root_node(),
+        kind,
+    )
+    .unwrap_or_else(|| panic!("missing Rust node kind {kind}"))
 }
 
 fn record_kind(
@@ -45,13 +38,103 @@ fn record_kind(
     (fact, types.into_facts(), occurrences.finish(), tree)
 }
 
-fn occurrence_text<'source>(
-    source: &'source str,
-    rows: &SourceFactRows,
-    occurrence: SourceOccurrenceId,
-) -> &'source str {
-    let range = rows.occurrence(occurrence).range;
-    &source[range.start_byte..range.end_byte]
+#[test]
+#[brokk_bifrost_test_macros::hardwon(
+    "7d6cc2fc20f8: valid Vector Rust syntax was emitted as ERROR nodes by the grammar"
+)]
+fn valid_vector_turbofish_and_tuple_higher_ranked_bound_keep_structured_nodes() {
+    let turbofish_source = "fn parse(input: &str) { let _ = char::<_, NomErrorType>('#')(input); }";
+    let turbofish_tree = parse_tree(turbofish_source);
+    assert!(
+        !turbofish_tree.root_node().has_error(),
+        "valid inferred turbofish syntax must not recover as ERROR nodes"
+    );
+    let generic_function = first_named_kind(&turbofish_tree, "generic_function");
+    let function = generic_function
+        .child_by_field_name("function")
+        .expect("generic function name");
+    assert_eq!(&turbofish_source[function.byte_range()], "char");
+    let arguments = generic_function
+        .child_by_field_name("type_arguments")
+        .expect("generic function type arguments");
+    assert_eq!(arguments.child_count(), 5);
+    assert_eq!(arguments.child(1).unwrap().kind(), "_");
+    assert_eq!(
+        &turbofish_source[arguments.child(1).unwrap().byte_range()],
+        "_"
+    );
+    assert_eq!(arguments.child(3).unwrap().kind(), "type_identifier");
+    assert_eq!(
+        &turbofish_source[arguments.child(3).unwrap().byte_range()],
+        "NomErrorType"
+    );
+
+    let tuple_source = "fn setup() -> (impl Subscriber + for<'a> LookupSpan<'a>, ()) { todo!() }";
+    let tuple_tree = parse_tree(tuple_source);
+    assert!(
+        !tuple_tree.root_node().has_error(),
+        "valid tuple impl Trait HRTB syntax must not recover as ERROR nodes"
+    );
+    let bounded = first_named_kind(&tuple_tree, "bounded_type");
+    assert_eq!(bounded.child_count(), 3);
+    assert_eq!(bounded.child(0).unwrap().kind(), "abstract_type");
+    let higher_ranked = bounded.child(2).unwrap();
+    assert_eq!(higher_ranked.kind(), "higher_ranked_trait_bound");
+    let parameters = higher_ranked
+        .child_by_field_name("type_parameters")
+        .expect("higher-ranked type parameters");
+    assert_eq!(&tuple_source[parameters.byte_range()], "<'a>");
+    let bound_type = higher_ranked
+        .child_by_field_name("type")
+        .expect("higher-ranked trait type");
+    assert_eq!(bound_type.kind(), "generic_type");
+    assert_eq!(&tuple_source[bound_type.byte_range()], "LookupSpan<'a>");
+}
+
+#[test]
+fn parser_recovery_without_required_compound_fields_retains_missing_shape() {
+    for (source, node_kind) in [
+        ("fn make() -> impl {}", "abstract_type"),
+        ("fn make() -> dyn {}", "dynamic_type"),
+    ] {
+        let tree = parse_tree(source);
+        assert!(tree.root_node().has_error());
+        let node = first_named_kind(&tree, node_kind);
+        let missing_child = node
+            .child_by_field_name("trait")
+            .expect("tree-sitter recovery child");
+        assert!(missing_child.is_missing());
+        let mut occurrences = PrimarySourceFactCollector::new(source);
+        let mut types = RustTypeSourceCollector::new();
+        let fact = types.record_type(node, source, &mut occurrences).clone();
+        let RustTypeSourceShape::Compound {
+            kind,
+            children,
+            type_parameters,
+            ..
+        } = fact.shape
+        else {
+            panic!("missing parser field must retain compound recovery shape");
+        };
+        assert_eq!(
+            kind,
+            if node_kind == "abstract_type" {
+                RustTypeCompoundSourceKind::Abstract
+            } else {
+                RustTypeCompoundSourceKind::Dynamic
+            }
+        );
+        assert_eq!(children.len(), 1);
+        assert!(type_parameters.is_none());
+    }
+}
+
+#[test]
+fn deeply_nested_wrappers_are_collected_iteratively() {
+    let source = format!("fn make() -> {}Type {{}}", "&".repeat(2048));
+    let (fact, _, _, _) = record_kind(&source, "reference_type");
+    assert_eq!(fact.wrappers.len(), 2048);
+    assert!(matches!(fact.shape, RustTypeSourceShape::Path { .. }));
 }
 
 #[test]
@@ -160,7 +243,6 @@ fn captures_compound_forms_and_preserves_structured_child_order() {
         );
     }
 }
-
 #[test]
 fn captures_higher_ranked_target_and_parameter_list_without_generic_duplication() {
     let source = "fn higher_ranked_factory() -> dyn for<'a> Trait<'a> { todo!() }";
@@ -184,7 +266,6 @@ fn captures_higher_ranked_target_and_parameter_list_without_generic_duplication(
     assert!(!facts.iter().any(|child| child.occurrence == parameters));
     assert_eq!(occurrence_text(source, &rows, parameters), "<'a>");
 }
-
 #[test]
 fn nested_generic_and_wrapper_occurrences_remain_exact_and_deduplicated() {
     let source = "fn make() -> Option<Box<&Trait>> {}";
@@ -232,50 +313,4 @@ fn nested_generic_and_wrapper_occurrences_remain_exact_and_deduplicated() {
         "&Trait"
     );
     assert_eq!(facts.len(), 3);
-}
-
-#[test]
-fn parser_recovery_without_required_compound_fields_retains_missing_shape() {
-    for (source, node_kind) in [
-        ("fn make() -> impl {}", "abstract_type"),
-        ("fn make() -> dyn {}", "dynamic_type"),
-    ] {
-        let tree = parse_tree(source);
-        assert!(tree.root_node().has_error());
-        let node = first_named_kind(&tree, node_kind);
-        let missing_child = node
-            .child_by_field_name("trait")
-            .expect("tree-sitter recovery child");
-        assert!(missing_child.is_missing());
-        let mut occurrences = PrimarySourceFactCollector::new(source);
-        let mut types = RustTypeSourceCollector::new();
-        let fact = types.record_type(node, source, &mut occurrences).clone();
-        let RustTypeSourceShape::Compound {
-            kind,
-            children,
-            type_parameters,
-            ..
-        } = fact.shape
-        else {
-            panic!("missing parser field must retain compound recovery shape");
-        };
-        assert_eq!(
-            kind,
-            if node_kind == "abstract_type" {
-                RustTypeCompoundSourceKind::Abstract
-            } else {
-                RustTypeCompoundSourceKind::Dynamic
-            }
-        );
-        assert_eq!(children.len(), 1);
-        assert!(type_parameters.is_none());
-    }
-}
-
-#[test]
-fn deeply_nested_wrappers_are_collected_iteratively() {
-    let source = format!("fn make() -> {}Type {{}}", "&".repeat(2048));
-    let (fact, _, _, _) = record_kind(&source, "reference_type");
-    assert_eq!(fact.wrappers.len(), 2048);
-    assert!(matches!(fact.shape, RustTypeSourceShape::Path { .. }));
 }

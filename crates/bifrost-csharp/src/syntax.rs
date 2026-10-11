@@ -11,10 +11,21 @@ use brokk_bifrost_core::analyzer::fq_name::{FqName, SegmentKind, segment_interne
 use brokk_bifrost_core::analyzer::model::{
     CallableArity, DispatchExtensibility, SignatureMetadata,
 };
+use brokk_bifrost_core::analyzer::semantic_diagnostics::same_node;
+use brokk_bifrost_core::analyzer::structural::adapter_helpers::declarator_initializer;
+use brokk_bifrost_core::analyzer::structural::adapter_helpers::nearest_ancestor_with;
 use brokk_bifrost_core::analyzer::structural::resolution::DeclaredVisibility;
-use brokk_bifrost_core::analyzer::tree_walk::ParentIndex;
+use brokk_bifrost_core::analyzer::tree_walk::{ParentIndex, named_children_iter};
 use brokk_bifrost_core::analyzer::{CodeUnit, CodeUnitIndex};
 use tree_sitter::Node;
+
+pub fn csharp_is_member_variable_owner_kind(kind: &str) -> bool {
+    matches!(kind, "field_declaration" | "event_field_declaration")
+}
+
+pub fn variable_declarator_initializer(declarator: Node<'_>) -> Option<Node<'_>> {
+    declarator_initializer(declarator)
+}
 
 pub fn csharp_callable_dispatch_extensibility<'tree>(
     source: &str,
@@ -91,10 +102,17 @@ fn csharp_enclosing_accessor_owner<'tree>(
     ancestry: &ParentIndex<'tree>,
 ) -> Option<Node<'tree>> {
     (node.kind() == "accessor_declaration")
-        .then(|| ancestry.parent(node))
+        .then(|| csharp_accessor_owner(node, |node| ancestry.parent(node)))
         .flatten()
-        .and_then(|parent| ancestry.parent(parent))
         .filter(|owner| matches!(owner.kind(), "property_declaration" | "indexer_declaration"))
+}
+
+/// The declaration that owns a C# accessor list.
+pub fn csharp_accessor_owner<'tree>(
+    node: Node<'tree>,
+    mut parent_of: impl FnMut(Node<'tree>) -> Option<Node<'tree>>,
+) -> Option<Node<'tree>> {
+    parent_of(node).and_then(parent_of)
 }
 
 /// The default accessibility of a member of `node`'s enclosing type.
@@ -122,21 +140,20 @@ fn csharp_enclosing_callable_type<'tree>(
     node: Node<'tree>,
     ancestry: &ParentIndex<'tree>,
 ) -> Option<Node<'tree>> {
-    let mut current = ancestry.parent(node);
-    while let Some(parent) = current {
-        if matches!(
-            parent.kind(),
-            "class_declaration"
-                | "struct_declaration"
-                | "record_declaration"
-                | "record_struct_declaration"
-                | "interface_declaration"
-        ) {
-            return Some(parent);
-        }
-        current = ancestry.parent(parent);
-    }
-    None
+    nearest_ancestor_with(
+        node,
+        |node| ancestry.parent(node),
+        |kind| {
+            matches!(
+                kind,
+                "class_declaration"
+                    | "struct_declaration"
+                    | "record_declaration"
+                    | "record_struct_declaration"
+                    | "interface_declaration"
+            )
+        },
+    )
 }
 
 pub fn csharp_using_directive_is_static(node: Node<'_>) -> bool {
@@ -163,14 +180,38 @@ pub fn csharp_using_directive_target(node: Node<'_>, source: &str) -> Option<Str
 }
 
 pub fn csharp_using_directive_target_node(node: Node<'_>) -> Option<Node<'_>> {
+    csharp_using_directive_target_node_matching(node, |_| true)
+}
+
+pub fn csharp_using_directive_target_node_matching<'tree>(
+    node: Node<'tree>,
+    mut accepts: impl FnMut(Node<'tree>) -> bool,
+) -> Option<Node<'tree>> {
     if node.kind() != "using_directive" {
         return None;
     }
     let alias = node.child_by_field_name("name");
-    let mut cursor = node.walk();
     // Comments are named extras too; only the non-alias syntax child is the target.
-    node.named_children(&mut cursor)
-        .find(|child| !child.is_extra() && alias.is_none_or(|alias| child != &alias))
+    named_children_iter(node).find(|child| {
+        !child.is_extra() && alias.is_none_or(|alias| *child != alias) && accepts(*child)
+    })
+}
+
+/// Whether `parent` transparently wraps `current` in a C# expression.
+pub fn csharp_transparent_expression_parent(current: Node<'_>, parent: Node<'_>) -> bool {
+    matches!(
+        parent.kind(),
+        "parenthesized_expression" | "checked_expression"
+    ) || (parent.kind() == "cast_expression"
+        && parent.child_by_field_name("value") == Some(current))
+}
+
+/// Resolve each direct argument node of a C# generic-name type argument list.
+pub fn map_csharp_type_arguments<T>(
+    arguments: Option<Node<'_>>,
+    resolve: impl FnMut(Node<'_>) -> Option<T>,
+) -> Option<Vec<T>> {
+    named_children_iter(arguments?).map(resolve).collect()
 }
 
 pub fn csharp_using_directive_namespace(node: Node<'_>, source: &str) -> Option<String> {
@@ -373,7 +414,8 @@ pub fn csharp_type_node_segments(node: Node<'_>, source: &str) -> Vec<String> {
 /// declaration, and the declaration side records the canonical spelling, so a
 /// name segment built here has to agree (#2064). The shared sigil gates the
 /// strip on the `identifier` leaf kind, so a `predefined_type` is untouched.
-fn csharp_type_segment_text<'a>(node: Node<'_>, source: &'a str) -> &'a str {
+/// Read a C# identifier while removing the verbatim-identifier sigil.
+pub fn csharp_identifier_text<'a>(node: Node<'_>, source: &'a str) -> &'a str {
     brokk_bifrost_core::analyzer::common::node_ident_text(
         node,
         source,
@@ -461,7 +503,7 @@ fn csharp_type_node_segments_with_terminal_suffix(
                     .filter_map(|index| current.named_child(index))
                     .find(|child| child.kind() == "type_argument_list");
                 if let Some(name) = name {
-                    let source_name = csharp_type_segment_text(name, source);
+                    let source_name = csharp_identifier_text(name, source);
                     let arity = type_arguments.map_or(0, csharp_type_argument_arity);
                     if !source_name.is_empty() {
                         segments.push(CSharpNameSegment {
@@ -497,7 +539,7 @@ fn csharp_type_node_segments_with_terminal_suffix(
             // its type from its initializer, so it is a segment like any other
             // keyword type rather than a walk failure.
             "identifier" | "predefined_type" | "implicit_type" => {
-                let segment = csharp_type_segment_text(current, source);
+                let segment = csharp_identifier_text(current, source);
                 if !segment.is_empty() {
                     segments.push(CSharpNameSegment {
                         identifier: segment.to_string(),
@@ -577,7 +619,7 @@ pub fn csharp_type_reference_root(mut node: Node<'_>) -> Option<Node<'_>> {
             && (parent.child_by_field_name("name").is_some()
                 || csharp_using_directive_is_static(parent))
             && csharp_using_directive_target_node(parent)
-                .is_some_and(|target| same_csharp_node(target, node))
+                .is_some_and(|target| same_node(target, node))
         {
             return Some(node);
         }
@@ -591,7 +633,7 @@ pub fn csharp_type_reference_root(mut node: Node<'_>) -> Option<Node<'_>> {
                 | "record_struct_declaration"
         ) && !parent
             .child_by_field_name("name")
-            .is_some_and(|name| same_csharp_node(name, node))
+            .is_some_and(|name| same_node(name, node))
         {
             return Some(node);
         }
@@ -638,11 +680,11 @@ fn csharp_pattern_type_wrapper<'tree>(
     match parent.kind() {
         "type_pattern" | "declaration_pattern" | "recursive_pattern" => parent
             .child_by_field_name("type")
-            .filter(|candidate| same_csharp_node(*candidate, node))
+            .filter(|candidate| same_node(*candidate, node))
             .map(|_| parent),
         "parenthesized_pattern" | "negated_pattern" => parent
             .named_child(0)
-            .filter(|candidate| same_csharp_node(*candidate, node))
+            .filter(|candidate| same_node(*candidate, node))
             .map(|_| parent),
         _ => None,
     }
@@ -660,7 +702,7 @@ fn csharp_is_structured_type_role(parent: Node<'_>, node: Node<'_>) -> bool {
     fields.iter().any(|field| {
         parent
             .child_by_field_name(field)
-            .is_some_and(|candidate| same_csharp_node(candidate, node))
+            .is_some_and(|candidate| same_node(candidate, node))
     })
 }
 
@@ -750,9 +792,7 @@ pub fn csharp_member_access_type_receiver(node: Node<'_>) -> Option<Node<'_>> {
     if node.kind() != "member_access_expression" {
         return None;
     }
-    let receiver = node
-        .child_by_field_name("expression")
-        .or_else(|| node.named_child(0))?;
+    let receiver = csharp_member_access_receiver(node)?;
     matches!(
         receiver.kind(),
         "identifier"
@@ -762,6 +802,18 @@ pub fn csharp_member_access_type_receiver(node: Node<'_>) -> Option<Node<'_>> {
             | "member_access_expression"
     )
     .then_some(receiver)
+}
+
+pub fn csharp_member_access_receiver(node: Node<'_>) -> Option<Node<'_>> {
+    node.child_by_field_name("expression")
+        .or_else(|| node.named_child(0))
+}
+
+pub fn csharp_parameter_name_and_type(node: Node<'_>) -> Option<(Node<'_>, Node<'_>)> {
+    Some((
+        node.child_by_field_name("name")?,
+        node.child_by_field_name("type")?,
+    ))
 }
 
 pub fn csharp_type_terminal_identifier(mut node: Node<'_>) -> Option<Node<'_>> {
@@ -832,10 +884,6 @@ pub fn csharp_type_leftmost_identifier(mut node: Node<'_>) -> Option<Node<'_>> {
     }
 }
 
-fn same_csharp_node(left: Node<'_>, right: Node<'_>) -> bool {
-    left.start_byte() == right.start_byte() && left.end_byte() == right.end_byte()
-}
-
 /// Whether `node` is a bare occurrence of `value`, the parameter C# introduces
 /// implicitly inside a `set`, `init`, `add` or `remove` accessor.
 ///
@@ -869,7 +917,7 @@ pub fn csharp_implicit_accessor_value(node: Node<'_>, source: &str) -> bool {
                 | "alias_qualified_name"
         ) && parent
             .child_by_field_name("name")
-            .is_some_and(|name| same_csharp_node(name, node))
+            .is_some_and(|name| same_node(name, node))
     }) {
         return false;
     }
@@ -905,7 +953,7 @@ pub fn csharp_local_binder_name(node: Node<'_>) -> bool {
     if parent.kind() == "foreach_statement" {
         return parent
             .child_by_field_name("left")
-            .is_some_and(|left| same_csharp_node(left, node));
+            .is_some_and(|left| same_node(left, node));
     }
     // `Math.Abs(Width * Height)` parses as a declaration expression whose type is
     // the `pointer_type` `Width *`, which makes `Height` look like an `out var`
@@ -926,7 +974,7 @@ pub fn csharp_local_binder_name(node: Node<'_>) -> bool {
             | "from_clause"
     ) && parent
         .child_by_field_name("name")
-        .is_some_and(|name| same_csharp_node(name, node))
+        .is_some_and(|name| same_node(name, node))
 }
 
 /// Whether `node` occupies a C# TYPE position: a structured type role, or an
@@ -1029,22 +1077,32 @@ pub fn csharp_attribute_type_names(name: Node<'_>, source: &str) -> Vec<String> 
 }
 
 pub fn csharp_attribute_terminal_name<'a>(name: Node<'_>, source: &'a str) -> Option<&'a str> {
-    let mut terminal = name;
-    while let Some(next) = match terminal.kind() {
-        "qualified_name" | "alias_qualified_name" => terminal
-            .child_by_field_name("name")
-            .or_else(|| terminal.named_child(terminal.named_child_count().saturating_sub(1))),
-        "generic_name" => terminal
-            .child_by_field_name("name")
-            .or_else(|| terminal.named_child(0)),
-        _ => None,
-    } {
-        terminal = next;
-    }
+    let terminal = csharp_attribute_terminal_name_node(name)?;
     source
         .get(terminal.start_byte()..terminal.end_byte())
         .map(str::trim)
         .filter(|terminal| !terminal.is_empty())
+}
+
+/// Return the terminal type-name node of a structured C# attribute name.
+///
+/// Attribute aliases and qualified names must be resolved from their complete
+/// name, but a definition request focused on the terminal keeps the resolver's
+/// ordinary reference-site selection on the attribute type rather than on a
+/// qualified-name wrapper.
+pub fn csharp_attribute_terminal_name_node(mut name: Node<'_>) -> Option<Node<'_>> {
+    loop {
+        let next = match name.kind() {
+            "qualified_name" | "alias_qualified_name" => name
+                .child_by_field_name("name")
+                .or_else(|| name.named_child(name.named_child_count().saturating_sub(1))),
+            "generic_name" => name
+                .child_by_field_name("name")
+                .or_else(|| name.named_child(0)),
+            _ => return Some(name),
+        }?;
+        name = next;
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -1168,13 +1226,7 @@ pub fn csharp_relational_generic_call(
         return None;
     }
     let argument_container = greater_than.child_by_field_name("right")?;
-    let argument = match argument_container.kind() {
-        "cast_expression" => argument_container.child_by_field_name("type")?,
-        "parenthesized_expression" if argument_container.named_child_count() == 1 => {
-            argument_container.named_child(0)?
-        }
-        _ => return None,
-    };
+    let argument = csharp_relational_generic_call_argument(argument_container)?;
     Some(CSharpRelationalGenericCall {
         member_access,
         type_argument,
@@ -1184,22 +1236,24 @@ pub fn csharp_relational_generic_call(
     })
 }
 
+fn csharp_relational_generic_call_argument(container: Node<'_>) -> Option<Node<'_>> {
+    match container.kind() {
+        "cast_expression" => container.child_by_field_name("type"),
+        "parenthesized_expression" if container.named_child_count() == 1 => {
+            container.named_child(0)
+        }
+        _ => None,
+    }
+}
+
 pub fn csharp_relational_generic_call_for_argument(
     argument: Node<'_>,
 ) -> Option<CSharpRelationalGenericCall<'_>> {
     let argument_container = argument.parent()?;
-    let greater_than = match argument_container.kind() {
-        "cast_expression" if argument_container.child_by_field_name("type") == Some(argument) => {
-            argument_container.parent()?
-        }
-        "parenthesized_expression"
-            if argument_container.named_child_count() == 1
-                && argument_container.named_child(0) == Some(argument) =>
-        {
-            argument_container.parent()?
-        }
-        _ => return None,
-    };
+    if csharp_relational_generic_call_argument(argument_container) != Some(argument) {
+        return None;
+    }
+    let greater_than = argument_container.parent()?;
     let less_than = greater_than.child_by_field_name("left")?;
     let mut member_access = less_than.child_by_field_name("left")?;
     while member_access.kind() != "member_access_expression" {
@@ -1247,10 +1301,10 @@ pub fn csharp_cast_relational_generic_call_for_name(
         return None;
     }
     let argument_container = greater_than.child_by_field_name("right")?;
-    let argument = (argument_container.kind() == "parenthesized_expression"
-        && argument_container.named_child_count() == 1)
-        .then(|| argument_container.named_child(0))
-        .flatten()?;
+    if argument_container.kind() != "parenthesized_expression" {
+        return None;
+    }
+    let argument = csharp_relational_generic_call_argument(argument_container)?;
     Some(CSharpCastRelationalGenericCall {
         function: identifier,
         type_argument,
@@ -1307,9 +1361,12 @@ pub fn normalize_csharp_type_fragment(reference: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{csharp_normalize_fq_name, csharp_normalize_full_name, csharp_type_node_identity};
-    use brokk_bifrost_core::analyzer::Language;
-    use brokk_bifrost_core::analyzer::fq_name::{FqName, SegmentKind, segment_interner};
+    use super::{
+        csharp_normalize_fq_name, csharp_normalize_full_name, csharp_type_node_identity,
+        segment_interner,
+    };
+    use brokk_bifrost_core::analyzer::fq_name::{FqName, SegmentKind};
+    use brokk_bifrost_core::analyzer::model::Language;
     use tree_sitter::Parser;
 
     fn generic_identity(source: &str, spelling: &str) -> String {

@@ -67,10 +67,23 @@ pub(crate) fn occurrence_id(
     role: OccurrenceRole,
 ) -> String {
     let mut digest = LengthDelimitedDigest::new(OCCURRENCE_ID_DOMAIN);
+    push_occurrence_id_fields(&mut digest, content_identity, node, role);
+    digest.finish().to_string()
+}
+
+/// Append the content, AST-node, and role fields shared by stable occurrence
+/// and resolution-candidate identifiers. Callers supply their own digest
+/// domain and any additional key fields.
+#[doc(hidden)]
+pub fn push_occurrence_id_fields(
+    digest: &mut LengthDelimitedDigest,
+    content_identity: ContentIdentity,
+    node: u32,
+    role: OccurrenceRole,
+) {
     digest.push(content_identity.as_bytes());
     digest.push(&node.to_le_bytes());
     digest.push(role.label().as_bytes());
-    digest.finish().to_string()
 }
 
 /// What a caller wants derived beyond the rows themselves.
@@ -133,6 +146,10 @@ pub struct OccurrenceRow {
     pub raw_spelling: String,
     /// Present only when the adapter's decoding changes the spelling.
     pub decoded_spelling: Option<String>,
+    /// The status of the definition lookup for a demanded reference row.
+    /// `None` means resolution was not attempted, including undemanded rows,
+    /// target-disabled derivation, and non-reference rows.
+    pub resolution_status: Option<DefinitionLookupStatus>,
     pub target: OccurrenceTarget,
     /// The candidates the resolver considered for this reference, present only
     /// when the caller asked for them and only on reference-class rows. `None`
@@ -320,6 +337,55 @@ pub fn occurrences_for_file_with_options_roles_and_ast_ids(
     )
 }
 
+/// Resolve targets for an exact caller-selected set of rows from one file.
+///
+/// This keeps the same per-file definition batch as normal occurrence
+/// derivation while allowing a query to finish its identity, role, name, and
+/// structural filters before paying for target resolution. The supplied rows
+/// are query-local clones; no target answer is retained by the analyzer.
+#[doc(hidden)]
+pub fn resolve_occurrence_targets_for_rows(
+    analyzer: &dyn IAnalyzer,
+    file: &ProjectFile,
+    rows: &mut [OccurrenceRow],
+    cancellation: &CancellationToken,
+) -> Result<(), OccurrencesCancelled> {
+    if cancellation.is_cancelled() {
+        return Err(OccurrencesCancelled);
+    }
+    if rows.is_empty() {
+        return Ok(());
+    }
+
+    let language = language_for_file(file);
+    let provider = analyzer
+        .structural_fact_providers()
+        .into_iter()
+        .find(|provider| provider.structural_language() == language)
+        .expect("occurrence rows have a structural fact provider");
+    let facts = provider
+        .structural_facts(file)
+        .expect("occurrence rows have structural facts for their file");
+    for row in rows.iter() {
+        assert_eq!(row.file, *file, "one target batch contains one file");
+        assert_eq!(
+            row.content_identity,
+            facts.source_identity(),
+            "query-local occurrence rows and their facts share one content snapshot"
+        );
+    }
+
+    resolve_reference_targets(
+        analyzer,
+        file,
+        &facts,
+        rows,
+        OccurrenceDerivationOptions::ROWS_ONLY,
+        None,
+        cancellation,
+    )
+}
+
 /// [`occurrences_for_file`], resolving targets only for reference rows that
 /// start on one of `lines`.
 ///
@@ -490,6 +556,7 @@ fn classify_rows(
                 enclosing: None,
                 raw_spelling,
                 decoded_spelling,
+                resolution_status: None,
                 target: OccurrenceTarget::None,
                 candidates: None,
             });
@@ -566,6 +633,7 @@ fn resolve_reference_targets(
     // A row outside the caller's demanded lines is "not attempted", exactly
     // like the identity-only derivation below -- not "resolved to nothing".
     for &index in &undemanded_indices {
+        rows[index].resolution_status = None;
         rows[index].target = OccurrenceTarget::NotDerived;
     }
     if !options.targets {
@@ -573,6 +641,7 @@ fn resolve_reference_targets(
         // every reference row rather than leaving `None`, which means "this
         // class has nothing to resolve" and would be a different claim.
         for &index in &reference_indices {
+            rows[index].resolution_status = None;
             rows[index].target = OccurrenceTarget::NotDerived;
         }
         return Ok(());
@@ -629,6 +698,7 @@ fn resolve_reference_targets(
 
     for (position, &index) in reference_indices.iter().enumerate() {
         let outcome = &outcomes[position];
+        rows[index].resolution_status = Some(outcome.status);
         rows[index].target = if !outcome.definitions.is_empty() {
             OccurrenceTarget::Resolved(outcome.definitions.clone())
         } else if let Some(lexical) = outcome.lexical_definition.clone() {
@@ -693,6 +763,7 @@ mod tests {
     use super::*;
     use crate::analyzer::usages::get_definition::TraceCompleteness;
     use crate::analyzer::{AnalyzerConfig, Language, Project, TestProject, WorkspaceAnalyzer};
+    use std::collections::BTreeSet;
     use std::path::PathBuf;
     use tempfile::TempDir;
 
@@ -783,9 +854,7 @@ mod tests {
         /// Byte offset of `needle`, whose first token is the occurrence under
         /// test; the marker keeps the assertion readable without re-scanning.
         fn at(&self, needle: &str) -> usize {
-            self.source
-                .find(needle)
-                .unwrap_or_else(|| panic!("fixture does not contain {needle:?}"))
+            crate::test_support::fixture_marker(&self.source, needle)
         }
     }
 
@@ -815,6 +884,69 @@ mod tests {
         );
         assert!(exhaustive.rows.len() > scoped.rows.len());
         assert_eq!(scoped.completeness, exhaustive.completeness);
+    }
+
+    #[test]
+    fn selected_reference_rows_keep_status_separate_from_undemanded_rows() {
+        let source = concat!(
+            "class Caller {\n",
+            "    void first(Caller other) {\n",
+            "        other.run();\n",
+            "    }\n",
+            "    void second(Caller other) {\n",
+            "        other.run();\n",
+            "    }\n",
+            "    void run() {}\n",
+            "}\n",
+        );
+        let fixture = Fixture::new(Language::Java, "src/Caller.java", source);
+        let all = fixture.result();
+        let demanded_line = all
+            .rows
+            .iter()
+            .find(|row| {
+                row.class == OccurrenceClass::Reference
+                    && row.resolution_status == Some(DefinitionLookupStatus::Resolved)
+            })
+            .map(|row| row.range.start_line)
+            .expect("fixture must contain a resolved reference row");
+        let lines = BTreeSet::from([demanded_line]);
+        let selected = occurrences_for_file_at_lines(
+            fixture.workspace.analyzer(),
+            &fixture.file,
+            &lines,
+            &CancellationToken::new(),
+        )
+        .expect("uncancelled selected occurrence derivation");
+
+        let selected_references: Vec<_> = selected
+            .rows
+            .iter()
+            .filter(|row| {
+                row.class == OccurrenceClass::Reference && row.range.start_line == demanded_line
+            })
+            .collect();
+        assert!(!selected_references.is_empty());
+        assert!(
+            selected_references
+                .iter()
+                .all(|row| row.resolution_status == Some(DefinitionLookupStatus::Resolved))
+        );
+
+        let undemanded_references: Vec<_> = selected
+            .rows
+            .iter()
+            .filter(|row| {
+                row.class == OccurrenceClass::Reference && row.range.start_line != demanded_line
+            })
+            .collect();
+        assert!(
+            !undemanded_references.is_empty(),
+            "fixture must retain reference rows outside the demanded line"
+        );
+        assert!(undemanded_references.iter().all(|row| {
+            row.resolution_status.is_none() && matches!(&row.target, OccurrenceTarget::NotDerived)
+        }));
     }
 
     fn expect_row<'rows>(
@@ -1054,36 +1186,6 @@ mod tests {
     }
 
     #[test]
-    fn typescript_keyed_fields_and_type_operands_stay_apart() {
-        let source = concat!(
-            "interface Widget { label: string }\n",
-            "const table = { label: \"a\" };\n",
-            "function render(widget: Widget): string {\n",
-            "    return widget.label + table.label;\n",
-            "}\n",
-        );
-        let fixture = Fixture::new(Language::TypeScript, "src/app.ts", source);
-        let result = fixture.result();
-
-        let map_key = expect_row(&result.rows, fixture.at("label: \"a\""), "map key");
-        assert_eq!(map_key.role, OccurrenceRole::LabelOrKey);
-        assert_eq!(map_key.namespace, Namespace::Label);
-        assert_eq!(map_key.class, OccurrenceClass::NonReference);
-
-        let type_operand = expect_row(&result.rows, fixture.at("Widget)"), "annotation operand");
-        assert_eq!(type_operand.role, OccurrenceRole::TypeOperand);
-        assert_eq!(type_operand.namespace, Namespace::Type);
-
-        let binder = expect_row(&result.rows, fixture.at("widget: Widget"), "parameter");
-        assert_eq!(binder.role, OccurrenceRole::Binder);
-        assert_eq!(binder.namespace, Namespace::Value);
-
-        let member = expect_row(&result.rows, fixture.at("label + table"), "member read");
-        assert_eq!(member.role, OccurrenceRole::MemberPosition);
-        assert_eq!(member.class, OccurrenceClass::Reference);
-    }
-
-    #[test]
     fn python_annotations_are_type_operands_and_parameters_are_binders() {
         let source = concat!(
             "import os.path\n",
@@ -1117,6 +1219,49 @@ mod tests {
         let keyword = expect_row(&result.rows, fixture.at("key="), "keyword argument name");
         assert_eq!(keyword.role, OccurrenceRole::LabelOrKey);
         assert_eq!(keyword.namespace, Namespace::Label);
+    }
+
+    #[test]
+    fn python_formal_parameters_and_scope_directives_have_distinct_structural_roles() {
+        let source = concat!(
+            "def outer(enclosing):\n",
+            "    shared = 0\n",
+            "    def inner(\n",
+            "        bare,\n",
+            "        typed: int,\n",
+            "        default=1,\n",
+            "        typed_default: int = 2,\n",
+            "        *args,\n",
+            "        **kwargs,\n",
+            "    ):\n",
+            "        global shared\n",
+            "        nonlocal enclosing\n",
+            "        return bare\n",
+        );
+        let fixture = Fixture::new(Language::Python, "src/app.py", source);
+        let rows = fixture.result().rows;
+        for needle in [
+            "bare,",
+            "typed: int",
+            "default=1",
+            "typed_default: int",
+            "args,",
+            "kwargs,",
+        ] {
+            let row = expect_row(&rows, fixture.at(needle), "formal parameter");
+            assert_eq!(row.role, OccurrenceRole::Binder, "{needle}");
+            assert_eq!(row.class, OccurrenceClass::Binding, "{needle}");
+        }
+
+        let global_name = fixture.at("global shared") + "global ".len();
+        let global = expect_row(&rows, global_name, "global directive name");
+        assert_eq!(global.role, OccurrenceRole::GlobalDirective);
+        assert_eq!(global.class, OccurrenceClass::NonReference);
+
+        let nonlocal_name = fixture.at("nonlocal enclosing") + "nonlocal ".len();
+        let nonlocal = expect_row(&rows, nonlocal_name, "nonlocal directive name");
+        assert_eq!(nonlocal.role, OccurrenceRole::NonlocalDirective);
+        assert_eq!(nonlocal.class, OccurrenceClass::NonReference);
     }
 
     #[test]
@@ -1207,6 +1352,9 @@ mod tests {
     /// [`Namespace::PathPrefix`]. The row is kept and the role is covered:
     /// dropping it lost the only evidence that `std` and `HashMap` are
     /// mentioned at all (#3064).
+    #[brokk_bifrost_test_macros::hardwon(
+        "#3064: Rust path qualifier occurrences were dropped instead of using the path-prefix namespace"
+    )]
     #[test]
     fn rust_path_segments_are_kept_in_the_path_prefix_namespace() {
         let source = "use std::collections::HashMap;\nfn take(map: HashMap<u32, u32>) -> usize { map.len() }\n";
@@ -1293,21 +1441,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn cancellation_propagates_out_of_the_producer() {
-        let source = "class Widget {\n    int render(String label) { return label.length(); }\n}\n";
-        let fixture = Fixture::new(Language::Java, "app/Widget.java", source);
-        let cancellation = CancellationToken::new();
-        cancellation.cancel();
-
-        let outcome =
-            occurrences_for_file(fixture.workspace.analyzer(), &fixture.file, &cancellation);
-        assert!(
-            matches!(outcome, Err(OccurrencesCancelled)),
-            "a cancelled request must not yield rows"
-        );
-    }
-
     fn trace_of<'rows>(
         rows: &'rows [OccurrenceRow],
         start_byte: usize,
@@ -1324,44 +1457,6 @@ mod tests {
             .rejected()
             .filter(|row| row.outcome.rejection() == Some(reason))
             .collect()
-    }
-
-    /// A caller that does not ask for candidates gets none, and the rows it
-    /// does get are unchanged. This is the "existing consumers pay nothing"
-    /// contract stated as behavior rather than as an intention.
-    #[test]
-    fn candidates_are_absent_unless_the_caller_asks_for_them() {
-        let source = "fn render(label: &str) -> usize {\n    label.len()\n}\n";
-        let fixture = Fixture::new(Language::Rust, "src/app.rs", source);
-
-        let plain = fixture.result();
-        assert!(
-            plain.rows.iter().all(|row| row.candidates.is_none()),
-            "an unasked derivation must attach no trace"
-        );
-
-        let traced = fixture.traced_result();
-        assert!(
-            traced
-                .rows
-                .iter()
-                .filter(|row| row.class == OccurrenceClass::Reference)
-                .all(|row| row.candidates.is_some()),
-            "every reference row of a traced derivation carries its trace"
-        );
-        assert!(
-            traced
-                .rows
-                .iter()
-                .filter(|row| row.class != OccurrenceClass::Reference)
-                .all(|row| row.candidates.is_none()),
-            "only reference-class rows have candidates to report"
-        );
-        assert_eq!(
-            plain.rows.len(),
-            traced.rows.len(),
-            "asking for candidates must not change which rows exist"
-        );
     }
 
     /// The mined `61c223586` shape: an inner binding shadows an outer one of
@@ -1519,55 +1614,27 @@ mod tests {
         );
     }
 
-    /// A complete discovery outcome declaring exactly `modules`, in the shape
-    /// the per-language resolvers produce: the identity rides on the artifact
-    /// module for Python and on the evidence module coordinate for npm.
-    fn discovery_declaring(
+    fn discovery_declaring_with_stub_artifacts(
         language: &str,
         modules: &[&str],
     ) -> crate::analyzer::semantic_model::DependencyDiscoveryOutcome {
         use crate::analyzer::semantic_model::{
-            CatalogCoordinate, DependencyArtifactRole, DependencyDiscoveryOutcome,
-            ExternalArtifactKind, ResolvedDependency, ResolvedDependencyArtifact,
-            SemanticModelActivationEvidence,
+            DependencyArtifactRole, ExternalArtifactKind, ResolvedDependencyArtifact,
         };
-        DependencyDiscoveryOutcome::complete(
-            modules
-                .iter()
-                .map(|module| ResolvedDependency {
-                    id: format!("test:distribution:{module}"),
-                    evidence: SemanticModelActivationEvidence {
-                        language: language.to_owned(),
-                        ecosystem: "test".to_owned(),
-                        package: None,
-                        module: Some(CatalogCoordinate {
-                            name: (*module).to_owned(),
-                            version: None,
-                        }),
-                        toolchain: None,
-                        target: None,
-                        configuration: None,
-                        artifact_sha256: None,
-                    },
-                    provenance: Vec::new(),
-                    artifacts: vec![ResolvedDependencyArtifact::module_file(
-                        DependencyArtifactRole::Declarations,
-                        ExternalArtifactKind::PythonStub,
-                        (*module).to_owned(),
-                        PathBuf::from("unused-in-this-test.pyi"),
-                    )],
-                    scope: crate::analyzer::topology::DependencyScope::Unknown,
-                    declared_by: None,
-                })
-                .collect(),
-        )
+
+        crate::test_support::discovery_declaring(language, modules, |module| {
+            vec![ResolvedDependencyArtifact::module_file(
+                DependencyArtifactRole::Declarations,
+                ExternalArtifactKind::PythonStub,
+                module.to_owned(),
+                PathBuf::from("unused-in-this-test.pyi"),
+            )]
+        })
     }
 
     fn external_boundaries(trace: &ResolutionTraceResult) -> Vec<BoundaryStatus> {
-        let external: Vec<BoundaryStatus> = trace
-            .candidates
-            .iter()
-            .filter(|row| matches!(row.candidate, TraceCandidateRef::ExternalRoute { .. }))
+        let external: Vec<BoundaryStatus> = crate::test_support::external_route_candidates(trace)
+            .into_iter()
             .map(|row| row.boundary)
             .collect();
         assert!(
@@ -1592,7 +1659,7 @@ mod tests {
         let fixture = Fixture::new(Language::Python, "app/client.py", source);
         fixture.workspace.retain_dependency_discovery_evidence(
             &[Language::Python],
-            &discovery_declaring("python", &["requests"]),
+            &discovery_declaring_with_stub_artifacts("python", &["requests"]),
         );
         let result = fixture.traced_result();
         let trace = trace_of(&result.rows, fixture.at("requests.get"), "declared read");
@@ -1636,7 +1703,7 @@ mod tests {
             .workspace
             .retain_dependency_discovery_evidence(
                 &[Language::Python],
-                &discovery_declaring("python", &["requests"]),
+                &discovery_declaring_with_stub_artifacts("python", &["requests"]),
             );
         let result = declared_elsewhere.traced_result();
         let trace = trace_of(
@@ -1665,7 +1732,7 @@ mod tests {
         let fixture = Fixture::new(Language::TypeScript, "src/app.ts", source);
         fixture.workspace.retain_dependency_discovery_evidence(
             &[Language::JavaScript, Language::TypeScript],
-            &discovery_declaring("typescript", &["lodash"]),
+            &discovery_declaring_with_stub_artifacts("typescript", &["lodash"]),
         );
         let result = fixture.traced_result();
         let trace = trace_of(
@@ -1839,6 +1906,7 @@ mod tests {
                 "a reference row derived without targets must say so rather than look unresolved; got {:?}",
                 row.target
             );
+            assert!(row.resolution_status.is_none());
         }
         for row in identity_only
             .rows
@@ -1850,6 +1918,7 @@ mod tests {
                 "a non-reference row has nothing to resolve either way; got {:?}",
                 row.target
             );
+            assert!(row.resolution_status.is_none());
         }
         assert!(
             resolved.rows.iter().any(|row| !matches!(

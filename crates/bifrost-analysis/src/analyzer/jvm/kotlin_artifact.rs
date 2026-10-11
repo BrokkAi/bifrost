@@ -2,17 +2,20 @@ use super::java_artifact::{
     MAX_ARCHIVE_ENTRIES, MAX_SOURCE_ENTRY_BYTES, MAX_TOTAL_ARCHIVE_BYTES, ZipDirectoryStatus,
     zip_directory_status,
 };
+use super::parent_index;
+use super::{restrict_effective_visibility, take_artifact_record as take_record};
 use crate::CancellationToken;
 use crate::analyzer::common::node_source_text_trimmed;
 use crate::analyzer::kotlin::language;
+#[cfg(test)]
+use crate::analyzer::semantic_model::ExternalArtifactPackProducer;
 use crate::analyzer::semantic_model::{
-    ActivationSelector, ArtifactProducerLimits, ArtifactProduction, ArtifactProductionRequest,
-    AuthoredPayload, AuthoredSemanticModelPack, AuthoredShard, BoundedProducerDiagnostics,
-    Completeness, ExactArtifact, ExternalArtifactKind, ExternalArtifactPackProducer, HierarchyFact,
-    HierarchyKind, Locator, MemberFact, MemberIdentity, MemberKind, Parameter, Producer,
-    ProducerDiagnostic, ProducerDiagnosticSeverity, Signature, StructuredTypeExpression, TypeFact,
-    TypeIdentity, TypeKind, TypeRef, Visibility, carried_source_paths, is_canonical_relative_path,
-    member_declaration_id, read_exact_artifact_while, type_declaration_id,
+    ArtifactProducerLimits, ArtifactProduction, ArtifactProductionRequest, AuthoredPayload,
+    AuthoredShard, BoundedProducerDiagnostics, Completeness, ExactArtifact, ExternalArtifactKind,
+    HierarchyFact, HierarchyKind, Locator, MemberFact, MemberIdentity, MemberKind, Parameter,
+    ParameterPassingMode, Signature, StructuredTypeExpression, TypeFact, TypeIdentity, TypeKind,
+    TypeRef, Visibility, is_canonical_relative_path, member_declaration_id,
+    read_exact_artifact_while, type_declaration_id,
 };
 use crate::analyzer::tree_sitter_analyzer::ParsedFile;
 use crate::analyzer::tree_walk::{first_named_child_of_kind, named_children};
@@ -20,12 +23,14 @@ use crate::analyzer::{CodeUnit, ProjectFile, SignatureMetadata};
 use crate::hash::HashMap;
 use brokk_bifrost_jvm::kotlin::declarations::{
     KotlinClassLikeKind, KotlinDeclaredVisibility, kotlin_class_like_kind,
-    kotlin_declared_visibility, parse_kotlin_file,
+    kotlin_declared_visibility, kotlin_has_modifier, parse_kotlin_file,
 };
 use brokk_bifrost_jvm::kotlin::imports::KOTLIN_DEFAULT_IMPORT_PACKAGES;
-use brokk_bifrost_jvm::kotlin::syntax::{kotlin_type_spelling, kotlin_user_type_segments};
+use brokk_bifrost_jvm::kotlin::syntax::{
+    kotlin_declared_type_parameter_names, kotlin_type_spelling, kotlin_user_type_segments,
+};
 use std::io::{Cursor, Read};
-use tree_sitter::{Node, Parser, Tree};
+use tree_sitter::{Node, Tree};
 use zip::ZipArchive;
 
 const KOTLIN_PACKAGE_MARKER: &str = "bifrost:kotlin-package";
@@ -67,24 +72,10 @@ impl KnownTypes {
 #[derive(Debug, Clone, Copy, Default)]
 pub struct KotlinSourceJarPackProducer;
 
-impl ExternalArtifactPackProducer for KotlinSourceJarPackProducer {
-    fn produce_exact_artifact(
-        &self,
-        request: &ArtifactProductionRequest,
-        limits: &ArtifactProducerLimits,
-    ) -> ArtifactProduction {
-        self.produce(request, limits, None)
-    }
-
-    fn produce_exact_artifact_with_cancellation(
-        &self,
-        request: &ArtifactProductionRequest,
-        limits: &ArtifactProducerLimits,
-        cancellation: Option<&CancellationToken>,
-    ) -> ArtifactProduction {
-        self.produce(request, limits, cancellation)
-    }
-}
+crate::analyzer::semantic_model::implement_external_artifact_pack_producer!(
+    KotlinSourceJarPackProducer,
+    produce
+);
 
 impl KotlinSourceJarPackProducer {
     fn produce(
@@ -94,7 +85,7 @@ impl KotlinSourceJarPackProducer {
         cancellation: Option<&CancellationToken>,
     ) -> ArtifactProduction {
         if request.artifact_kind != ExternalArtifactKind::KotlinSourceJar {
-            return failure(
+            return crate::analyzer::semantic_model::failed_artifact_production(
                 "artifact.kind",
                 "Kotlin producer requires a Kotlin source JAR artifact",
                 limits,
@@ -119,14 +110,14 @@ impl KotlinSourceJarPackProducer {
         match zip_directory_status(artifact.bytes()) {
             ZipDirectoryStatus::Valid => {}
             ZipDirectoryStatus::Exceeded => {
-                return failure(
+                return crate::analyzer::semantic_model::failed_artifact_production(
                     "limit.archive_directory",
                     "Kotlin JAR central directory exceeds bounded entry or byte limits",
                     limits,
                 );
             }
             ZipDirectoryStatus::Invalid => {
-                return failure(
+                return crate::analyzer::semantic_model::failed_artifact_production(
                     "kotlin.archive.invalid",
                     "artifact has an invalid ZIP/JAR central directory",
                     limits,
@@ -136,7 +127,7 @@ impl KotlinSourceJarPackProducer {
         let mut archive = match ZipArchive::new(Cursor::new(artifact.bytes())) {
             Ok(archive) => archive,
             Err(_) => {
-                return failure(
+                return crate::analyzer::semantic_model::failed_artifact_production(
                     "kotlin.archive.invalid",
                     "artifact is not a readable ZIP/JAR archive",
                     limits,
@@ -156,7 +147,11 @@ impl KotlinSourceJarPackProducer {
         }
         for index in 0..entry_limit {
             if cancellation.is_some_and(CancellationToken::is_cancelled) {
-                return cancelled(limits);
+                return crate::analyzer::semantic_model::failed_artifact_production(
+                    "artifact.cancelled",
+                    "Kotlin archive production was cancelled",
+                    limits,
+                );
             }
             let Ok(mut entry) = archive.by_index(index) else {
                 diagnostics.warning(
@@ -235,7 +230,11 @@ impl KotlinSourceJarPackProducer {
         let mut inventory_diagnostics = BoundedProducerDiagnostics::new(limits);
         for (name, source) in &entries {
             if cancellation.is_some_and(CancellationToken::is_cancelled) {
-                return cancelled(limits);
+                return crate::analyzer::semantic_model::failed_artifact_production(
+                    "artifact.cancelled",
+                    "Kotlin archive production was cancelled",
+                    limits,
+                );
             }
             inventoried_entries += 1;
             let Some((_, parsed)) = parse_entry(name, source, &mut inventory_diagnostics) else {
@@ -279,7 +278,11 @@ impl KotlinSourceJarPackProducer {
                 break;
             }
             if cancellation.is_some_and(CancellationToken::is_cancelled) {
-                return cancelled(limits);
+                return crate::analyzer::semantic_model::failed_artifact_production(
+                    "artifact.cancelled",
+                    "Kotlin archive production was cancelled",
+                    limits,
+                );
             }
             let Some((tree, parsed)) = parse_entry(&name, &source, &mut diagnostics) else {
                 continue;
@@ -333,11 +336,7 @@ fn parse_entry(
     source: &str,
     diagnostics: &mut BoundedProducerDiagnostics,
 ) -> Option<(Tree, ParsedFile)> {
-    let mut parser = Parser::new();
-    parser
-        .set_language(&language::LANGUAGE.into())
-        .expect("Kotlin language");
-    let tree = parser.parse(source, None)?;
+    let tree = super::parse_source_tree(language::LANGUAGE.into(), source, "Kotlin language")?;
     if tree.root_node().has_error() {
         diagnostics.warning_for_source_entry(
             "kotlin.source.parse",
@@ -498,8 +497,8 @@ fn entry_facts(
             name: name.clone(),
             type_kind: kind,
             visibility,
-            is_abstract: kind == TypeKind::Interface || modifier_present(node, source, "abstract"),
-            is_sealed: modifier_present(node, source, "sealed"),
+            is_abstract: kind == TypeKind::Interface || modifier_present(node, "abstract"),
+            is_sealed: modifier_present(node, "sealed"),
             callable_surface_complete: false,
             has_explicit_type_terms: false,
             type_parameters: type_parameters(node, source),
@@ -531,7 +530,7 @@ fn entry_facts(
                 })
                 .map(|name| HierarchyFact {
                     hierarchy_kind: HierarchyKind::Extends,
-                    target: named_type(name),
+                    target: TypeRef::named(name),
                     declaration_ordinal: None,
                 })
                 .collect(),
@@ -672,13 +671,13 @@ fn entry_facts(
                     .map(|parameter| parameter.r#type.clone())
             }));
             let has_body = first_named_child_of_kind(node, "function_body").is_some();
-            let explicitly_final = modifier_present(node, source, "final");
+            let explicitly_final = modifier_present(node, "final");
             let explicitly_virtual = !explicitly_final
                 && (owner_kind == TypeKind::Interface
-                    || modifier_present(node, source, "open")
-                    || modifier_present(node, source, "override")
-                    || modifier_present(node, source, "abstract"));
-            let is_abstract = modifier_present(node, source, "abstract")
+                    || modifier_present(node, "open")
+                    || modifier_present(node, "override")
+                    || modifier_present(node, "abstract"));
+            let is_abstract = modifier_present(node, "abstract")
                 || (owner_kind == TypeKind::Interface && !has_body);
             let id = member_declaration_id(MemberIdentity {
                 owner_id: &owner_id,
@@ -696,6 +695,8 @@ fn entry_facts(
             members.push(MemberFact {
                 non_overridable: None,
                 ambient_use: None,
+                value_type: None,
+                proxied_type: None,
                 id,
                 owner: owner_id.clone(),
                 name: name.clone(),
@@ -707,6 +708,7 @@ fn entry_facts(
                 implicit_operation: None,
                 explicit_operation: None,
                 callable_family_complete: false,
+                exact_return_classes: Vec::new(),
                 signature,
                 receiver: None,
                 extension_receiver,
@@ -754,16 +756,6 @@ fn package_fact(entry: &str, name: &str) -> TypeFact {
     }
 }
 
-fn parent_index(parsed: &ParsedFile) -> HashMap<CodeUnit, CodeUnit> {
-    let mut parents = HashMap::default();
-    for (parent, children) in &parsed.children {
-        for child in children {
-            parents.insert(child.clone(), parent.clone());
-        }
-    }
-    parents
-}
-
 fn declaration_node<'tree>(
     tree: &'tree Tree,
     parsed: &ParsedFile,
@@ -786,17 +778,16 @@ fn effective_visibility(
     declaration: &CodeUnit,
     parents: &HashMap<CodeUnit, CodeUnit>,
 ) -> Option<Visibility> {
-    let mut visibility = Visibility::Public;
-    let mut current = Some(declaration);
-    while let Some(candidate) = current {
-        match kotlin_declared_visibility(declaration_node(tree, parsed, candidate)?, source) {
-            KotlinDeclaredVisibility::Public => {}
-            KotlinDeclaredVisibility::Protected => visibility = Visibility::Protected,
-            KotlinDeclaredVisibility::Internal | KotlinDeclaredVisibility::Private => return None,
-        }
-        current = parents.get(candidate);
-    }
-    Some(visibility)
+    let enclosing = std::iter::successors(Some(declaration), |candidate| parents.get(*candidate))
+        .map(|candidate| {
+            let node = declaration_node(tree, parsed, candidate)?;
+            match kotlin_declared_visibility(node, source) {
+                KotlinDeclaredVisibility::Public => Some(Visibility::Public),
+                KotlinDeclaredVisibility::Protected => Some(Visibility::Protected),
+                KotlinDeclaredVisibility::Internal | KotlinDeclaredVisibility::Private => None,
+            }
+        });
+    restrict_effective_visibility(Visibility::Public, enclosing)
 }
 
 fn effective_member_visibility(
@@ -807,21 +798,21 @@ fn effective_member_visibility(
     node: Node<'_>,
     parents: &HashMap<CodeUnit, CodeUnit>,
 ) -> Option<Visibility> {
-    let mut visibility = match kotlin_declared_visibility(node, source) {
+    let visibility = match kotlin_declared_visibility(node, source) {
         KotlinDeclaredVisibility::Public => Visibility::Public,
         KotlinDeclaredVisibility::Protected => Visibility::Protected,
         KotlinDeclaredVisibility::Internal | KotlinDeclaredVisibility::Private => return None,
     };
-    let mut current = parents.get(declaration);
-    while let Some(owner) = current {
-        match kotlin_declared_visibility(declaration_node(tree, parsed, owner)?, source) {
-            KotlinDeclaredVisibility::Public => {}
-            KotlinDeclaredVisibility::Protected => visibility = Visibility::Protected,
-            KotlinDeclaredVisibility::Internal | KotlinDeclaredVisibility::Private => return None,
-        }
-        current = parents.get(owner);
-    }
-    Some(visibility)
+    let enclosing = std::iter::successors(parents.get(declaration), |owner| parents.get(*owner))
+        .map(|owner| {
+            let node = declaration_node(tree, parsed, owner)?;
+            match kotlin_declared_visibility(node, source) {
+                KotlinDeclaredVisibility::Public => Some(Visibility::Public),
+                KotlinDeclaredVisibility::Protected => Some(Visibility::Protected),
+                KotlinDeclaredVisibility::Internal | KotlinDeclaredVisibility::Private => None,
+            }
+        });
+    restrict_effective_visibility(visibility, enclosing)
 }
 
 fn type_kind(node: Node<'_>, alias: bool) -> TypeKind {
@@ -849,6 +840,7 @@ fn signature(
     depth_limit_hit: &mut bool,
 ) -> Option<Signature> {
     let type_parameters = type_parameters(node, source);
+    let mut vararg_seen = false;
     let parameters = metadata
         .into_iter()
         .flat_map(|value| value.parameters())
@@ -858,6 +850,15 @@ fn signature(
                 .map(|value| node_source_text_trimmed(value, source))
                 .filter(|value| value.len() <= MAX_QUALIFIED_NAME_BYTES)
                 .map(str::to_owned);
+            let variadic = parameter_is_variadic(parameter_node, source);
+            let passing_mode = if variadic {
+                vararg_seen = true;
+                ParameterPassingMode::PositionalOrNamed
+            } else if vararg_seen {
+                ParameterPassingMode::NamedOnly
+            } else {
+                ParameterPassingMode::PositionalOrNamed
+            };
             Some(Parameter {
                 name,
                 r#type: first_type_descendant(parameter_node).map_or_else(any_type, |value| {
@@ -873,8 +874,9 @@ fn signature(
                     )
                 }),
                 optional: parameter_is_optional(parameter_node),
-                variadic: parameter_is_variadic(parameter_node, source),
-                passing_mode: Default::default(),
+                variadic,
+                role: None,
+                passing_mode,
             })
         })
         .collect();
@@ -926,7 +928,7 @@ fn parameter_is_optional(parameter: Node<'_>) -> bool {
 }
 
 fn parameter_is_variadic(parameter: Node<'_>, source: &str) -> bool {
-    if modifier_present(parameter, source, "vararg") {
+    if modifier_present(parameter, "vararg") {
         return true;
     }
     let Some(list) = parameter.parent() else {
@@ -938,10 +940,9 @@ fn parameter_is_variadic(parameter: Node<'_>, source: &str) -> bool {
             return pending_vararg;
         }
         if child.is_named() && child.kind() == "parameter_modifiers" {
-            pending_vararg = node_source_text_trimmed(child, source) == "vararg"
-                || named_children(child)
-                    .into_iter()
-                    .any(|modifier| node_source_text_trimmed(modifier, source) == "vararg");
+            pending_vararg = brokk_bifrost_jvm::kotlin::declarations::kotlin_modifiers_mark_vararg(
+                child, source,
+            );
         } else if child.is_named() && child.kind() == "parameter" {
             pending_vararg = false;
         }
@@ -1081,7 +1082,7 @@ fn type_ref_with_parameters(
                 nullable: false,
             }
         }
-        _ => kotlin_type_spelling(node, source).map_or_else(any_type, named_type),
+        _ => kotlin_type_spelling(node, source).map_or_else(any_type, TypeRef::named),
     };
     if contains_nullable_wrapper(node) {
         nullable(value)
@@ -1481,15 +1482,8 @@ fn kotlin_stable_default_type(name: &str) -> Option<&'static str> {
     }
 }
 
-fn named_type(name: String) -> TypeRef {
-    TypeRef::Named {
-        name,
-        arguments: Vec::new(),
-        nullable: false,
-    }
-}
 fn any_type() -> TypeRef {
-    named_type("kotlin.Any".to_owned())
+    TypeRef::named("kotlin.Any".to_owned())
 }
 fn nullable(value: TypeRef) -> TypeRef {
     match value {
@@ -1510,16 +1504,9 @@ fn nullable(value: TypeRef) -> TypeRef {
 }
 
 fn type_parameters(node: Node<'_>, source: &str) -> Vec<String> {
-    let Some(parameters) = first_named_descendant_of_kind(node, "type_parameters") else {
-        return Vec::new();
-    };
-    named_children(parameters)
+    kotlin_declared_type_parameter_names(node, source)
         .into_iter()
-        .filter(|parameter| parameter.kind() == "type_parameter")
-        .filter_map(|parameter| first_named_child_of_kind(parameter, "type_identifier"))
-        .map(|name| node_source_text_trimmed(name, source))
         .filter(|name| name.len() <= MAX_QUALIFIED_NAME_BYTES)
-        .map(str::to_owned)
         .collect()
 }
 
@@ -1545,18 +1532,8 @@ fn bounded_text(value: &str) -> String {
     value[..end].to_owned()
 }
 
-fn modifier_present(node: Node<'_>, source: &str, expected: &str) -> bool {
-    let Some(modifiers) = first_named_child_of_kind(node, "modifiers") else {
-        return false;
-    };
-    let mut stack = vec![modifiers];
-    while let Some(found) = stack.pop() {
-        if node_source_text_trimmed(found, source) == expected {
-            return true;
-        }
-        stack.extend(named_children(found));
-    }
-    false
+fn modifier_present(node: Node<'_>, expected: &str) -> bool {
+    kotlin_has_modifier(node, expected)
 }
 
 fn apply_extension_surfaces(
@@ -1638,38 +1615,6 @@ fn merge_types(types: &mut Vec<TypeFact>) {
     *types = merged;
 }
 
-fn take_record(remaining: &mut usize, hit: &mut bool) -> bool {
-    if *remaining == 0 {
-        *hit = true;
-        false
-    } else {
-        *remaining -= 1;
-        true
-    }
-}
-
-fn failure(code: &str, message: &str, limits: &ArtifactProducerLimits) -> ArtifactProduction {
-    ArtifactProduction::failed(
-        ProducerDiagnostic {
-            severity: ProducerDiagnosticSeverity::Error,
-            source_entry: None,
-            code: code.to_owned(),
-            location: None,
-            declaration: None,
-            message: message.to_owned(),
-        },
-        limits,
-    )
-}
-
-fn cancelled(limits: &ArtifactProducerLimits) -> ArtifactProduction {
-    failure(
-        "artifact.cancelled",
-        "Kotlin archive production was cancelled",
-        limits,
-    )
-}
-
 fn finish(
     request: &ArtifactProductionRequest,
     digest: &str,
@@ -1692,21 +1637,10 @@ fn finish(
             suppressed_diagnostics,
         };
     }
-    let mut activation: Vec<ActivationSelector> = request.activation.clone();
-    for selector in &mut activation {
-        selector.artifact_sha256 = Some(digest.to_owned());
-    }
     let (diagnostics, suppressed_diagnostics) = bounded.finish();
-    let completeness = if diagnostics.is_empty() && suppressed_diagnostics.total() == 0 {
-        Completeness::Complete
-    } else {
-        Completeness::Partial
-    };
-    // Every Source locator in these shards names an archive entry this
-    // producer parsed, so the pack carries them all.
-    let shards = vec![AuthoredShard {
+    let shard = AuthoredShard {
         id: "declarations.kotlin.external".to_owned(),
-        activation,
+        activation: request.activation.clone(),
         payload: AuthoredPayload::DeclarationFacts {
             types,
             members,
@@ -1717,45 +1651,26 @@ fn finish(
         collection_flows: None,
         deferred_yields: None,
         conditional_type_refinements: None,
-    }];
-    ArtifactProduction {
-        artifact_sha256: Some(digest.to_owned()),
-        pack: Some(AuthoredSemanticModelPack {
-            schema_version: crate::analyzer::semantic_model::SEMANTIC_MODEL_SCHEMA_VERSION,
-            pack_id: request.pack_id.clone(),
-            version: request.pack_version.clone(),
-            producer: Producer {
-                name: "bifrost-kotlin-source-jar".to_owned(),
-                version: env!("CARGO_PKG_VERSION").to_owned(),
-            },
-            language: "kotlin".to_owned(),
-            ecosystem: request.ecosystem.clone(),
-            compatibility: request.compatibility.clone(),
-            provenance: request.provenance.clone(),
-            license: request.license.clone(),
-            completeness,
-            safety: request.safety.clone(),
-            carried_sources: carried_source_paths(&shards),
-            cpp_portability: None,
-            python_correspondence: None,
-            shards,
-        }),
-        completeness,
+        callable_values: None,
+    };
+    crate::analyzer::semantic_model::finish_authored_pack_production(
+        request,
+        digest,
+        "bifrost-kotlin-source-jar",
+        "kotlin",
         diagnostics,
         suppressed_diagnostics,
-    }
+        vec![shard],
+    )
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::analyzer::semantic_model::{
-        Compatibility, CompilerOptions, NameSelector, Provenance, Safety, SuppressedDiagnostics,
-        compile_pack,
+        CompilerOptions, Provenance, SuppressedDiagnostics, compile_pack,
     };
-    use std::fs::File;
-    use std::io::Write;
-    use zip::write::SimpleFileOptions;
+    use crate::test_support::write_zip;
 
     const SOURCE: &str = r#"package kotlin.example
 interface Contract
@@ -1772,6 +1687,7 @@ object Registry {
 }
 fun topLevelHelper(value: String): String = value
 fun topLevelHelper(value: Int): String = value.toString()
+fun collect(prefix: String, vararg values: String, tail: Int = 0): String = prefix + values.joinToString() + tail
 fun String.relay(times: Int): String = repeat(times)
 fun Int.relay(times: Int): String = toString().repeat(times)
 fun <T> T.applyLike(): T = this
@@ -1846,6 +1762,39 @@ private fun hidden(): Unit = Unit
             2
         );
         assert!(members.iter().any(|fact| fact.name == "relay"));
+        let collect = members
+            .iter()
+            .find(|fact| fact.name == "collect")
+            .and_then(|fact| fact.signature.as_ref())
+            .expect("collect signature");
+        assert_eq!(
+            collect
+                .parameters
+                .iter()
+                .map(|parameter| parameter.passing_mode)
+                .collect::<Vec<_>>(),
+            vec![
+                ParameterPassingMode::PositionalOrNamed,
+                ParameterPassingMode::PositionalOrNamed,
+                ParameterPassingMode::NamedOnly,
+            ]
+        );
+        assert_eq!(
+            collect
+                .parameters
+                .iter()
+                .map(|parameter| parameter.optional)
+                .collect::<Vec<_>>(),
+            vec![false, false, true]
+        );
+        assert_eq!(
+            collect
+                .parameters
+                .iter()
+                .map(|parameter| parameter.variadic)
+                .collect::<Vec<_>>(),
+            vec![false, true, false]
+        );
         let dependency = types
             .iter()
             .find(|fact| fact.name == "kotlin.example.Dependency")
@@ -1854,13 +1803,13 @@ private fun hidden(): Unit = Unit
             dependency
                 .hierarchy
                 .iter()
-                .any(|fact| fact.target == named_type("kotlin.example.Contract".to_owned()))
+                .any(|fact| fact.target == TypeRef::named("kotlin.example.Contract".to_owned()))
         );
         assert!(
             dependency
                 .hierarchy
                 .iter()
-                .any(|fact| fact.target == named_type("kotlin.example.Sequence".to_owned()))
+                .any(|fact| fact.target == TypeRef::named("kotlin.example.Sequence".to_owned()))
         );
         let extensions = members
             .iter()
@@ -1869,7 +1818,7 @@ private fun hidden(): Unit = Unit
         assert_eq!(extensions.len(), 2);
         assert_ne!(extensions[0].id, extensions[1].id);
         assert!(extensions.iter().any(|fact| {
-            fact.extension_receiver == Some(named_type("kotlin.String".to_owned()))
+            fact.extension_receiver == Some(TypeRef::named("kotlin.String".to_owned()))
         }));
         let generic = members
             .iter()
@@ -1893,7 +1842,7 @@ private fun hidden(): Unit = Unit
         );
         assert_eq!(
             constrained.extension_receiver_constraints,
-            vec![named_type("kotlin.example.Contract".to_owned())]
+            vec![TypeRef::named("kotlin.example.Contract".to_owned())]
         );
         let where_constrained = members
             .iter()
@@ -1909,7 +1858,7 @@ private fun hidden(): Unit = Unit
             .and_then(|signature| signature.returns.as_ref());
         assert_eq!(
             nested_return,
-            Some(&named_type("kotlin.example.Outer.Token".to_owned()))
+            Some(&TypeRef::named("kotlin.example.Outer.Token".to_owned()))
         );
         let child = types
             .iter()
@@ -1917,7 +1866,7 @@ private fun hidden(): Unit = Unit
             .unwrap();
         assert_eq!(
             child.hierarchy[0].target,
-            named_type("kotlin.example.Outer.Base".to_owned())
+            TypeRef::named("kotlin.example.Outer.Base".to_owned())
         );
         let uses_sequence = types
             .iter()
@@ -1925,11 +1874,48 @@ private fun hidden(): Unit = Unit
             .unwrap();
         assert_eq!(
             uses_sequence.hierarchy[0].target,
-            named_type("kotlin.sequences.Sequence".to_owned())
+            TypeRef::named("kotlin.sequences.Sequence".to_owned())
         );
         assert!(!members.iter().any(|fact| fact.name == "hidden"));
         assert!(!types.iter().any(|fact| fact.name.contains("Kt")));
         compile_pack(pack, &CompilerOptions::default()).unwrap();
+    }
+
+    #[test]
+    fn annotation_argument_keyword_does_not_make_extension_member_virtual() {
+        let root = tempfile::tempdir().unwrap();
+        let archive = root.path().join("annotation-modifier.jar");
+        write_zip(
+            &archive,
+            &[
+                (
+                    "example/Host.kt",
+                    "package example\nannotation class Marker(val open: Boolean)\nclass Host { @Marker(open = true) fun String.decorate() {} }",
+                ),
+                ("kotlin/String.kt", "package kotlin\nclass String"),
+            ],
+        );
+        let production = KotlinSourceJarPackProducer
+            .produce_exact_artifact(&request(archive), &ArtifactProducerLimits::default());
+        assert!(
+            production.diagnostics.is_empty(),
+            "{:#?}",
+            production.diagnostics
+        );
+        let AuthoredPayload::DeclarationFacts { members, .. } =
+            &production.pack.as_ref().unwrap().shards[0].payload
+        else {
+            panic!("declarations")
+        };
+        let decorate = members
+            .iter()
+            .find(|member| member.name == "decorate")
+            .expect("extension member");
+        assert!(decorate.extension_receiver.is_some());
+        assert!(
+            !decorate.is_virtual,
+            "annotation argument `open` was mistaken for a modifier: {decorate:#?}"
+        );
     }
 
     #[test]
@@ -2041,7 +2027,11 @@ private fun hidden(): Unit = Unit
         );
     }
 
+    use brokk_bifrost_test_macros::hardwon;
     #[test]
+    #[hardwon(
+        "#2761: A malformed real Kotlin entry must retain its entry path through parser rejection diagnostics"
+    )]
     fn parse_reject_carries_its_exact_artifact_source_entry() {
         let mut diagnostics = BoundedProducerDiagnostics::new(&ArtifactProducerLimits::default());
         assert!(
@@ -2069,53 +2059,18 @@ private fun hidden(): Unit = Unit
     }
 
     fn request(path: std::path::PathBuf) -> ArtifactProductionRequest {
-        ArtifactProductionRequest {
+        crate::test_support::jvm_source_jar_request(
             path,
-            artifact_kind: ExternalArtifactKind::KotlinSourceJar,
-            pack_id: "kotlin-fixture".to_owned(),
-            pack_version: "2.2.0".to_owned(),
-            ecosystem: "maven".to_owned(),
-            compatibility: Compatibility {
-                bifrost: None,
-                toolchains: vec![crate::analyzer::semantic_model::VersionConstraint {
-                    name: "kotlin".to_owned(),
-                    requirement: "=2.2.0".to_owned(),
-                }],
-            },
-            activation: vec![ActivationSelector {
-                package: Some(NameSelector {
-                    name: "example:kotlin-library".to_owned(),
-                    version: Some("=2.2.0".to_owned()),
-                }),
-                module: None,
-                toolchain: Some(NameSelector {
-                    name: "kotlin".to_owned(),
-                    version: Some("=2.2.0".to_owned()),
-                }),
-                targets: vec!["jvm".to_owned()],
-                configurations: Vec::new(),
-                artifact_sha256: None,
-            }],
-            provenance: Provenance {
+            ExternalArtifactKind::KotlinSourceJar,
+            "kotlin-fixture",
+            "kotlin",
+            "example:kotlin-library",
+            "2.2.0",
+            vec!["jvm".to_owned()],
+            Provenance {
                 source: "test".to_owned(),
                 revision: Some("2.2.0".to_owned()),
             },
-            license: "Apache-2.0".to_owned(),
-            safety: Safety {
-                generated_code_only: false,
-                review_required: false,
-            },
-        }
-    }
-
-    fn write_zip(path: &std::path::Path, entries: &[(&str, &str)]) {
-        let mut writer = zip::ZipWriter::new(File::create(path).unwrap());
-        for (name, source) in entries {
-            writer
-                .start_file(*name, SimpleFileOptions::default())
-                .unwrap();
-            writer.write_all(source.as_bytes()).unwrap();
-        }
-        writer.finish().unwrap();
+        )
     }
 }

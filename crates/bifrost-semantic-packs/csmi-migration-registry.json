@@ -1233,7 +1233,7 @@
       "classification": "blocked_missing_adapter_or_identity_evidence",
       "generation_strategy": "retain_until_profile_support",
       "native_source_kind": "compiled_semantic_model",
-      "path": "crates/bifrost-semantic-packs/embedded/python-os-command-declarations/shards/declarations.python-os-system.json",
+      "path": "crates/bifrost-semantic-packs/embedded/python-os-command-declarations/shards/declarations.python-os-commands.deflate",
       "profiles": [
         "python"
       ],
@@ -1303,6 +1303,166 @@
       ],
       "reason": "First-wave migration candidate; exportability remains pending lossless field and applicability audit.",
       "source_model": "semantic-packs/python/process-inputs/bifrost.python-process-inputs.json"
+    },
+    {
+      "asset_role": "compiled_manifest",
+      "audit_status": "pending",
+      "blockers": [
+        "missing_profile_adapter"
+      ],
+      "classification": "blocked_missing_adapter_or_identity_evidence",
+      "generation_strategy": "retain_until_profile_support",
+      "native_source_kind": "compiled_semantic_model",
+      "path": "crates/bifrost-semantic-packs/embedded/python-security-sink-declarations/manifest.json",
+      "profiles": [
+        "python"
+      ],
+      "reason": "First-wave migration candidate; exportability remains pending lossless field and applicability audit.",
+      "source_model": "semantic-packs/python/security-sinks/bifrost.python-security-sink-declarations.json"
+    },
+    {
+      "asset_role": "compiled_shard",
+      "audit_status": "pending",
+      "blockers": [
+        "missing_profile_adapter"
+      ],
+      "classification": "blocked_missing_adapter_or_identity_evidence",
+      "generation_strategy": "retain_until_profile_support",
+      "native_source_kind": "compiled_semantic_model",
+      "path": "crates/bifrost-semantic-packs/embedded/python-security-sink-declarations/shards/declarations.python-security-sink-apis.deflate",
+      "profiles": [
+        "python"
+      ],
+      "reason": "First-wave migration candidate; exportability remains pending lossless field and applicability audit.",
+      "source_model": "semantic-packs/python/security-sinks/bifrost.python-security-sink-declarations.json"
+    },
+    {
+      "asset_role": "compiled_manifest",
+      "audit_status": "pending",
+      "blockers": [
+        "missing_profile_adapter"
+      ],
+      "classification": "blocked_missing_adapter_or_identity_evidence",
+      "generation_strategy": "retain_until_profile_support",
+      "native_source_kind": "compiled_semantic_model",
+      "path": "crates/bifrost-semantic-packs/embedded/python-security-sink-summaries/manifest.json",
+      "profiles": [
+        "python"
+      ],
+      "reason": "First-wave migration candidate; exportability remains pending lossless field and applicability audit.",
+      "source_model": "semantic-packs/python/security-sinks/bifrost.python-security-sink-summaries.json"
+    },
+    {
+      "asset_role": "compiled_shard",
+      "audit_status": "pending",
+      "blockers": [
+        "missing_profile_adapter"
+      ],
+      "classification": "blocked_missing_adapter_or_identity_evidence",
+      "generation_strategy": "retain_until_profile_support",
+      "native_source_kind": "compiled_semantic_model",
+      "path": "crates/bifrost-semantic-packs/embedded/python-security-sink-summaries/shards/summaries.python-security-sinks.deflate",
+      "profiles": [
+        "python"
+      ],
+      "reason": "First-wave migration candidate; exportability remains pending lossless field and applicability audit.",
+      "source_model": "semantic-packs/python/security-sinks/bifrost.python-security-sink-summaries.json"
+    },
+    {
+      "asset_role": "compiled_manifest",
+      "audit_status": "pending",
+      "blockers": [
+        "missing_profile_adapter"
+      ],
+      "classification": "blocked_missing_adapter_or_identity_evidence",
+      "generation_strategy": "retain_until_profile_support",
+      "native_source_kind": "compiled_semantic_model",
+      "path": "crates/bifrost-semantic-packs/embedded/python-stdlib-api-declarations/manifest.json",
+      "profiles": [
+        "python"
+      ],
+      "reason": "First-wave migration candidate; exportability remains pending lossless field and applicability audit.",
+      "source_model": "semantic-packs/python/stdlib-apis/bifrost.python-stdlib-api-declarations.json"
+    },
+    {
+      "asset_role": "compiled_shard",
+      "audit_status": "pending",
+      "blockers": [
+        "missing_profile_adapter"
+      ],
+      "classification": "blocked_missing_adapter_or_identity_evidence",
+      "generation_strategy": "retain_until_profile_support",
+      "native_source_kind": "compiled_semantic_model",
+      "path": "crates/bifrost-semantic-packs/embedded/python-stdlib-api-declarations/shards/declarations.python-ssl-legacy-api.deflate",
+      "profiles": [
+        "python"
+      ],
+      "reason": "First-wave migration candidate; exportability remains pending lossless field and applicability audit.",
+      "source_model": "semantic-packs/python/stdlib-apis/bifrost.python-stdlib-api-declarations.json"
+    },
+    {
+      "asset_role": "compiled_shard",
+      "audit_status": "pending",
+      "blockers": [
+        "missing_profile_adapter"
+      ],
+      "classification": "blocked_missing_adapter_or_identity_evidence",
+      "generation_strategy": "retain_until_profile_support",
+      "native_source_kind": "compiled_semantic_model",
+      "path": "crates/bifrost-semantic-packs/embedded/python-stdlib-api-declarations/shards/declarations.python-stdlib-security-apis.deflate",
+      "profiles": [
+        "python"
+      ],
+      "reason": "First-wave migration candidate; exportability remains pending lossless field and applicability audit.",
+      "source_model": "semantic-packs/python/stdlib-apis/bifrost.python-stdlib-api-declarations.json"
+    },
+    {
+      "asset_role": "compiled_manifest",
+      "audit_status": "pending",
+      "blockers": [
+        "missing_effect_vocabulary"
+      ],
+      "classification": "blocked_missing_vocabulary",
+      "generation_strategy": "retain_until_vocabulary_support",
+      "native_source_kind": "compiled_semantic_model",
+      "path": "crates/bifrost-semantic-packs/embedded/python-str-result-use-obligations/manifest.json",
+      "profiles": [
+        "python"
+      ],
+      "reason": "Reviewed pure-transformation result-use obligations have no lossless mapping in the pinned CSMI vocabulary.",
+      "source_model": "crates/bifrost-semantic-packs/models/python-str-result-use-obligations.json"
+    },
+    {
+      "asset_role": "compiled_shard",
+      "audit_status": "pending",
+      "blockers": [
+        "missing_effect_vocabulary"
+      ],
+      "classification": "blocked_missing_vocabulary",
+      "generation_strategy": "retain_until_vocabulary_support",
+      "native_source_kind": "compiled_semantic_model",
+      "path": "crates/bifrost-semantic-packs/embedded/python-str-result-use-obligations/shards/python.str.reviewed-declarations.deflate",
+      "profiles": [
+        "python"
+      ],
+      "reason": "Reviewed pure-transformation result-use obligations have no lossless mapping in the pinned CSMI vocabulary.",
+      "source_model": "crates/bifrost-semantic-packs/models/python-str-result-use-obligations.json"
+    },
+    {
+      "asset_role": "compiled_shard",
+      "audit_status": "pending",
+      "blockers": [
+        "missing_effect_vocabulary"
+      ],
+      "classification": "blocked_missing_vocabulary",
+      "generation_strategy": "retain_until_vocabulary_support",
+      "native_source_kind": "compiled_semantic_model",
+      "path": "crates/bifrost-semantic-packs/embedded/python-str-result-use-obligations/shards/python.str.reviewed-result-use.deflate",
+      "profiles": [
+        "python"
+      ],
+      "reason": "Reviewed pure-transformation result-use obligations have no lossless mapping in the pinned CSMI vocabulary.",
+      "source_model": "crates/bifrost-semantic-packs/models/python-str-result-use-obligations.json"
     },
     {
       "asset_role": "compiled_manifest",
@@ -1855,6 +2015,26 @@
       "reason": "The generator-rule model is not representable by pinned CSMI 0.1 generator vocabulary."
     },
     {
+      "asset_role": "authored_semantic_model",
+      "audit_status": "pending",
+      "blockers": [
+        "missing_effect_vocabulary"
+      ],
+      "classification": "blocked_missing_vocabulary",
+      "embedded_paths": [
+        "crates/bifrost-semantic-packs/embedded/python-str-result-use-obligations/manifest.json",
+        "crates/bifrost-semantic-packs/embedded/python-str-result-use-obligations/shards/python.str.reviewed-declarations.deflate",
+        "crates/bifrost-semantic-packs/embedded/python-str-result-use-obligations/shards/python.str.reviewed-result-use.deflate"
+      ],
+      "generation_strategy": "retain_until_vocabulary_support",
+      "native_source_kind": "authored_semantic_model",
+      "path": "crates/bifrost-semantic-packs/models/python-str-result-use-obligations.json",
+      "profiles": [
+        "python"
+      ],
+      "reason": "Reviewed pure-transformation result-use obligations have no lossless mapping in the pinned CSMI vocabulary."
+    },
+    {
       "asset_role": "generated_semantic_model",
       "audit_status": "pending",
       "blockers": [
@@ -1903,6 +2083,84 @@
       "path": "semantic-packs/benchmarks/owasp-benchmark-java.json",
       "profiles": [],
       "reason": "Benchmark result data records evaluation evidence, not semantic model facts."
+    },
+    {
+      "asset_role": "authored_semantic_model",
+      "audit_status": "pending",
+      "blockers": [
+        "missing_profile_adapter"
+      ],
+      "classification": "blocked_missing_adapter_or_identity_evidence",
+      "generation_strategy": "retain_until_profile_support",
+      "native_source_kind": "authored_semantic_model",
+      "path": "semantic-packs/cpp-codeql-parity/bifrost.c-cpp-api-taint.json",
+      "profiles": [],
+      "reason": "Reviewed C/C++ CodeQL parity model; no supported C/C++ profile adapter is registered for lossless CSMI export."
+    },
+    {
+      "asset_role": "authored_semantic_model",
+      "audit_status": "pending",
+      "blockers": [
+        "missing_profile_adapter"
+      ],
+      "classification": "blocked_missing_adapter_or_identity_evidence",
+      "generation_strategy": "retain_until_profile_support",
+      "native_source_kind": "authored_semantic_model",
+      "path": "semantic-packs/cpp-codeql-parity/bifrost.c-posix-sources.json",
+      "profiles": [],
+      "reason": "Reviewed C/C++ CodeQL parity model; no supported C/C++ profile adapter is registered for lossless CSMI export."
+    },
+    {
+      "asset_role": "authored_semantic_model",
+      "audit_status": "pending",
+      "blockers": [
+        "missing_profile_adapter"
+      ],
+      "classification": "blocked_missing_adapter_or_identity_evidence",
+      "generation_strategy": "retain_until_profile_support",
+      "native_source_kind": "authored_semantic_model",
+      "path": "semantic-packs/cpp-codeql-parity/bifrost.c-range-provenance.json",
+      "profiles": [],
+      "reason": "Reviewed C/C++ CodeQL parity model; no supported C/C++ profile adapter is registered for lossless CSMI export."
+    },
+    {
+      "asset_role": "authored_semantic_model",
+      "audit_status": "pending",
+      "blockers": [
+        "missing_profile_adapter"
+      ],
+      "classification": "blocked_missing_adapter_or_identity_evidence",
+      "generation_strategy": "retain_until_profile_support",
+      "native_source_kind": "authored_semantic_model",
+      "path": "semantic-packs/cpp-codeql-parity/bifrost.c-stdlib-probe.json",
+      "profiles": [],
+      "reason": "Reviewed C/C++ CodeQL parity model; no supported C/C++ profile adapter is registered for lossless CSMI export."
+    },
+    {
+      "asset_role": "authored_semantic_model",
+      "audit_status": "pending",
+      "blockers": [
+        "missing_profile_adapter"
+      ],
+      "classification": "blocked_missing_adapter_or_identity_evidence",
+      "generation_strategy": "retain_until_profile_support",
+      "native_source_kind": "authored_semantic_model",
+      "path": "semantic-packs/cpp-codeql-parity/bifrost.cpp-stdio-format.json",
+      "profiles": [],
+      "reason": "Reviewed C/C++ CodeQL parity model; no supported C/C++ profile adapter is registered for lossless CSMI export."
+    },
+    {
+      "asset_role": "authored_semantic_model",
+      "audit_status": "pending",
+      "blockers": [
+        "missing_profile_adapter"
+      ],
+      "classification": "blocked_missing_adapter_or_identity_evidence",
+      "generation_strategy": "retain_until_profile_support",
+      "native_source_kind": "authored_semantic_model",
+      "path": "semantic-packs/cpp-codeql-parity/bifrost.cpp13-crypto-tls-url-security.json",
+      "profiles": [],
+      "reason": "Reviewed C/C++ CodeQL parity model; no supported C/C++ profile adapter is registered for lossless CSMI export."
     },
     {
       "asset_role": "authored_semantic_model",
@@ -2417,7 +2675,209 @@
       "classification": "not_a_semantic_model",
       "generation_strategy": "retain_native_artifact",
       "native_source_kind": "documentation",
+      "path": "semantic-packs/python-codeql-parity/README.md",
+      "profiles": [],
+      "reason": "README documents the private Python CodeQL parity fixtures; it is documentation, not semantic data."
+    },
+    {
+      "asset_role": "authored_semantic_model",
+      "audit_status": "pending",
+      "blockers": [
+        "missing_profile_adapter"
+      ],
+      "classification": "blocked_missing_adapter_or_identity_evidence",
+      "generation_strategy": "retain_until_profile_support",
+      "native_source_kind": "authored_semantic_model",
+      "path": "semantic-packs/python-codeql-parity/bifrost.python-defusedxml.csmi.json",
+      "profiles": [
+        "python"
+      ],
+      "reason": "Private Python CodeQL parity semantic document; exportability remains pending a lossless profile-adapter and exact source-artifact audit."
+    },
+    {
+      "asset_role": "authored_semantic_model",
+      "audit_status": "pending",
+      "blockers": [
+        "missing_profile_adapter"
+      ],
+      "classification": "blocked_missing_adapter_or_identity_evidence",
+      "generation_strategy": "retain_until_profile_support",
+      "native_source_kind": "authored_semantic_model",
+      "path": "semantic-packs/python-codeql-parity/bifrost.python-django.json",
+      "profiles": [
+        "python"
+      ],
+      "reason": "Private Python CodeQL parity semantic document; exportability remains pending a lossless profile-adapter and exact source-artifact audit."
+    },
+    {
+      "asset_role": "authored_semantic_model",
+      "audit_status": "pending",
+      "blockers": [
+        "missing_profile_adapter"
+      ],
+      "classification": "blocked_missing_adapter_or_identity_evidence",
+      "generation_strategy": "retain_until_profile_support",
+      "native_source_kind": "authored_semantic_model",
+      "path": "semantic-packs/python-codeql-parity/bifrost.python-flask.json",
+      "profiles": [
+        "python"
+      ],
+      "reason": "Private Python CodeQL parity semantic document; exportability remains pending a lossless profile-adapter and exact source-artifact audit."
+    },
+    {
+      "asset_role": "authored_semantic_model",
+      "audit_status": "pending",
+      "blockers": [
+        "missing_profile_adapter"
+      ],
+      "classification": "blocked_missing_adapter_or_identity_evidence",
+      "generation_strategy": "retain_until_profile_support",
+      "native_source_kind": "authored_semantic_model",
+      "path": "semantic-packs/python-codeql-parity/bifrost.python-jinja2.json",
+      "profiles": [
+        "python"
+      ],
+      "reason": "Private Python CodeQL parity semantic document; exportability remains pending a lossless profile-adapter and exact source-artifact audit."
+    },
+    {
+      "asset_role": "authored_semantic_model",
+      "audit_status": "pending",
+      "blockers": [
+        "missing_profile_adapter"
+      ],
+      "classification": "blocked_missing_adapter_or_identity_evidence",
+      "generation_strategy": "retain_until_profile_support",
+      "native_source_kind": "authored_semantic_model",
+      "path": "semantic-packs/python-codeql-parity/bifrost.python-ldap.csmi.json",
+      "profiles": [
+        "python"
+      ],
+      "reason": "Private Python CodeQL parity semantic document; exportability remains pending a lossless profile-adapter and exact source-artifact audit."
+    },
+    {
+      "asset_role": "authored_semantic_model",
+      "audit_status": "pending",
+      "blockers": [
+        "missing_profile_adapter"
+      ],
+      "classification": "blocked_missing_adapter_or_identity_evidence",
+      "generation_strategy": "retain_until_profile_support",
+      "native_source_kind": "authored_semantic_model",
+      "path": "semantic-packs/python-codeql-parity/bifrost.python-ldap3.csmi.json",
+      "profiles": [
+        "python"
+      ],
+      "reason": "Private Python CodeQL parity semantic document; exportability remains pending a lossless profile-adapter and exact source-artifact audit."
+    },
+    {
+      "asset_role": "authored_semantic_model",
+      "audit_status": "pending",
+      "blockers": [
+        "missing_profile_adapter"
+      ],
+      "classification": "blocked_missing_adapter_or_identity_evidence",
+      "generation_strategy": "retain_until_profile_support",
+      "native_source_kind": "authored_semantic_model",
+      "path": "semantic-packs/python-codeql-parity/bifrost.python-lxml.csmi.json",
+      "profiles": [
+        "python"
+      ],
+      "reason": "Private Python CodeQL parity semantic document; exportability remains pending a lossless profile-adapter and exact source-artifact audit."
+    },
+    {
+      "asset_role": "authored_semantic_model",
+      "audit_status": "pending",
+      "blockers": [
+        "missing_profile_adapter"
+      ],
+      "classification": "blocked_missing_adapter_or_identity_evidence",
+      "generation_strategy": "retain_until_profile_support",
+      "native_source_kind": "authored_semantic_model",
+      "path": "semantic-packs/python-codeql-parity/bifrost.python-mongosanitizer.csmi.json",
+      "profiles": [
+        "python"
+      ],
+      "reason": "Private Python CodeQL parity semantic document; exportability remains pending a lossless profile-adapter and exact source-artifact audit."
+    },
+    {
+      "asset_role": "authored_semantic_model",
+      "audit_status": "pending",
+      "blockers": [
+        "missing_profile_adapter"
+      ],
+      "classification": "blocked_missing_adapter_or_identity_evidence",
+      "generation_strategy": "retain_until_profile_support",
+      "native_source_kind": "authored_semantic_model",
+      "path": "semantic-packs/python-codeql-parity/bifrost.python-paramiko.json",
+      "profiles": [
+        "python"
+      ],
+      "reason": "Private Python CodeQL parity semantic document; exportability remains pending a lossless profile-adapter and exact source-artifact audit."
+    },
+    {
+      "asset_role": "authored_semantic_model",
+      "audit_status": "pending",
+      "blockers": [
+        "missing_profile_adapter"
+      ],
+      "classification": "blocked_missing_adapter_or_identity_evidence",
+      "generation_strategy": "retain_until_profile_support",
+      "native_source_kind": "authored_semantic_model",
+      "path": "semantic-packs/python-codeql-parity/bifrost.python-pymongo.csmi.json",
+      "profiles": [
+        "python"
+      ],
+      "reason": "Private Python CodeQL parity semantic document; exportability remains pending a lossless profile-adapter and exact source-artifact audit."
+    },
+    {
+      "asset_role": "authored_semantic_model",
+      "audit_status": "pending",
+      "blockers": [
+        "missing_profile_adapter"
+      ],
+      "classification": "blocked_missing_adapter_or_identity_evidence",
+      "generation_strategy": "retain_until_profile_support",
+      "native_source_kind": "authored_semantic_model",
+      "path": "semantic-packs/python-codeql-parity/bifrost.python-requests.json",
+      "profiles": [
+        "python"
+      ],
+      "reason": "Private Python CodeQL parity semantic document; exportability remains pending a lossless profile-adapter and exact source-artifact audit."
+    },
+    {
+      "asset_role": "authored_semantic_model",
+      "audit_status": "pending",
+      "blockers": [
+        "missing_profile_adapter"
+      ],
+      "classification": "blocked_missing_adapter_or_identity_evidence",
+      "generation_strategy": "retain_until_profile_support",
+      "native_source_kind": "authored_semantic_model",
+      "path": "semantic-packs/python-codeql-parity/bifrost.python-werkzeug.json",
+      "profiles": [
+        "python"
+      ],
+      "reason": "Private Python CodeQL parity semantic document; exportability remains pending a lossless profile-adapter and exact source-artifact audit."
+    },
+    {
+      "asset_role": "documentation",
+      "audit_status": "not_applicable",
+      "blockers": [],
+      "classification": "not_a_semantic_model",
+      "generation_strategy": "retain_native_artifact",
+      "native_source_kind": "documentation",
       "path": "semantic-packs/python/README-process-inputs.md",
+      "profiles": [],
+      "reason": "Documentation describes or governs native pack authoring; it is not a semantic model."
+    },
+    {
+      "asset_role": "documentation",
+      "audit_status": "not_applicable",
+      "blockers": [],
+      "classification": "not_a_semantic_model",
+      "generation_strategy": "retain_native_artifact",
+      "native_source_kind": "documentation",
+      "path": "semantic-packs/python/README-security-sinks.md",
       "profiles": [],
       "reason": "Documentation describes or governs native pack authoring; it is not a semantic model."
     },
@@ -2470,7 +2930,7 @@
       "reason": "First-wave migration candidate; exportability remains pending lossless field and applicability audit.",
       "embedded_paths": [
         "crates/bifrost-semantic-packs/embedded/python-os-command-declarations/manifest.json",
-        "crates/bifrost-semantic-packs/embedded/python-os-command-declarations/shards/declarations.python-os-system.json"
+        "crates/bifrost-semantic-packs/embedded/python-os-command-declarations/shards/declarations.python-os-commands.deflate"
       ]
     },
     {
@@ -2512,6 +2972,64 @@
       ]
     },
     {
+      "asset_role": "authored_semantic_model",
+      "audit_status": "pending",
+      "blockers": [
+        "missing_profile_adapter"
+      ],
+      "classification": "blocked_missing_adapter_or_identity_evidence",
+      "generation_strategy": "retain_until_profile_support",
+      "native_source_kind": "authored_semantic_model",
+      "path": "semantic-packs/python/security-sinks/bifrost.python-security-sink-declarations.json",
+      "profiles": [
+        "python"
+      ],
+      "reason": "First-wave migration candidate; exportability remains pending lossless field and applicability audit.",
+      "embedded_paths": [
+        "crates/bifrost-semantic-packs/embedded/python-security-sink-declarations/manifest.json",
+        "crates/bifrost-semantic-packs/embedded/python-security-sink-declarations/shards/declarations.python-security-sink-apis.deflate"
+      ]
+    },
+    {
+      "asset_role": "authored_semantic_model",
+      "audit_status": "pending",
+      "blockers": [
+        "missing_profile_adapter"
+      ],
+      "classification": "blocked_missing_adapter_or_identity_evidence",
+      "generation_strategy": "retain_until_profile_support",
+      "native_source_kind": "authored_semantic_model",
+      "path": "semantic-packs/python/security-sinks/bifrost.python-security-sink-summaries.json",
+      "profiles": [
+        "python"
+      ],
+      "reason": "First-wave migration candidate; exportability remains pending lossless field and applicability audit.",
+      "embedded_paths": [
+        "crates/bifrost-semantic-packs/embedded/python-security-sink-summaries/manifest.json",
+        "crates/bifrost-semantic-packs/embedded/python-security-sink-summaries/shards/summaries.python-security-sinks.deflate"
+      ]
+    },
+    {
+      "asset_role": "authored_semantic_model",
+      "audit_status": "pending",
+      "blockers": [
+        "missing_profile_adapter"
+      ],
+      "classification": "blocked_missing_adapter_or_identity_evidence",
+      "generation_strategy": "retain_until_profile_support",
+      "native_source_kind": "authored_semantic_model",
+      "path": "semantic-packs/python/stdlib-apis/bifrost.python-stdlib-api-declarations.json",
+      "profiles": [
+        "python"
+      ],
+      "reason": "First-wave migration candidate; exportability remains pending lossless field and applicability audit.",
+      "embedded_paths": [
+        "crates/bifrost-semantic-packs/embedded/python-stdlib-api-declarations/manifest.json",
+        "crates/bifrost-semantic-packs/embedded/python-stdlib-api-declarations/shards/declarations.python-ssl-legacy-api.deflate",
+        "crates/bifrost-semantic-packs/embedded/python-stdlib-api-declarations/shards/declarations.python-stdlib-security-apis.deflate"
+      ]
+    },
+    {
       "asset_role": "artifact_descriptor",
       "audit_status": "not_applicable",
       "blockers": [],
@@ -2547,6 +3065,306 @@
       "path": "semantic-packs/python/unittest-assertions-2026.9.7.spec.json",
       "profiles": [],
       "reason": "Artifact acquisition and extraction instructions are inputs to model generation, not semantic model facts."
+    },
+    {
+      "asset_role": "authored_semantic_model",
+      "audit_status": "pending",
+      "blockers": [
+        "missing_profile_adapter"
+      ],
+      "classification": "blocked_missing_adapter_or_identity_evidence",
+      "generation_strategy": "retain_until_profile_support",
+      "native_source_kind": "authored_semantic_model",
+      "path": "semantic-packs/rust-codeql-parity/bifrost.rust-cookie.json",
+      "profiles": [
+        "rust"
+      ],
+      "reason": "Reviewed Rust CodeQL parity model; exportability remains pending lossless field and applicability audit."
+    },
+    {
+      "asset_role": "authored_semantic_model",
+      "audit_status": "pending",
+      "blockers": [
+        "missing_profile_adapter"
+      ],
+      "classification": "blocked_missing_adapter_or_identity_evidence",
+      "generation_strategy": "retain_until_profile_support",
+      "native_source_kind": "authored_semantic_model",
+      "path": "semantic-packs/rust-codeql-parity/bifrost.rust-db-row-sources.json",
+      "profiles": [
+        "rust"
+      ],
+      "reason": "Reviewed Rust CodeQL parity model; exportability remains pending lossless field and applicability audit."
+    },
+    {
+      "asset_role": "authored_semantic_model",
+      "audit_status": "pending",
+      "blockers": [
+        "missing_profile_adapter"
+      ],
+      "classification": "blocked_missing_adapter_or_identity_evidence",
+      "generation_strategy": "retain_until_profile_support",
+      "native_source_kind": "authored_semantic_model",
+      "path": "semantic-packs/rust-codeql-parity/bifrost.rust-html-escape.json",
+      "profiles": [
+        "rust"
+      ],
+      "reason": "Reviewed Rust CodeQL parity model; exportability remains pending lossless field and applicability audit."
+    },
+    {
+      "asset_role": "authored_semantic_model",
+      "audit_status": "pending",
+      "blockers": [
+        "missing_profile_adapter"
+      ],
+      "classification": "blocked_missing_adapter_or_identity_evidence",
+      "generation_strategy": "retain_until_profile_support",
+      "native_source_kind": "authored_semantic_model",
+      "path": "semantic-packs/rust-codeql-parity/bifrost.rust-libc-alloc.json",
+      "profiles": [
+        "rust"
+      ],
+      "reason": "Reviewed Rust CodeQL parity model; exportability remains pending lossless field and applicability audit."
+    },
+    {
+      "asset_role": "authored_semantic_model",
+      "audit_status": "pending",
+      "blockers": [
+        "missing_profile_adapter"
+      ],
+      "classification": "blocked_missing_adapter_or_identity_evidence",
+      "generation_strategy": "retain_until_profile_support",
+      "native_source_kind": "authored_semantic_model",
+      "path": "semantic-packs/rust-codeql-parity/bifrost.rust-regex.json",
+      "profiles": [
+        "rust"
+      ],
+      "reason": "Reviewed Rust CodeQL parity model; exportability remains pending lossless field and applicability audit."
+    },
+    {
+      "asset_role": "authored_semantic_model",
+      "audit_status": "pending",
+      "blockers": [
+        "missing_profile_adapter"
+      ],
+      "classification": "blocked_missing_adapter_or_identity_evidence",
+      "generation_strategy": "retain_until_profile_support",
+      "native_source_kind": "authored_semantic_model",
+      "path": "semantic-packs/rust-codeql-parity/bifrost.rust-reqwest-tls.json",
+      "profiles": [
+        "rust"
+      ],
+      "reason": "Reviewed Rust CodeQL parity model; exportability remains pending lossless field and applicability audit."
+    },
+    {
+      "asset_role": "authored_semantic_model",
+      "audit_status": "pending",
+      "blockers": [
+        "missing_profile_adapter"
+      ],
+      "classification": "blocked_missing_adapter_or_identity_evidence",
+      "generation_strategy": "retain_until_profile_support",
+      "native_source_kind": "authored_semantic_model",
+      "path": "semantic-packs/rust-codeql-parity/bifrost.rust-reqwest.json",
+      "profiles": [
+        "rust"
+      ],
+      "reason": "Reviewed Rust CodeQL parity model; exportability remains pending lossless field and applicability audit."
+    },
+    {
+      "asset_role": "authored_semantic_model",
+      "audit_status": "pending",
+      "blockers": [
+        "missing_profile_adapter"
+      ],
+      "classification": "blocked_missing_adapter_or_identity_evidence",
+      "generation_strategy": "retain_until_profile_support",
+      "native_source_kind": "authored_semantic_model",
+      "path": "semantic-packs/rust-codeql-parity/bifrost.rust-rustcrypto.json",
+      "profiles": [
+        "rust"
+      ],
+      "reason": "Reviewed Rust CodeQL parity model; exportability remains pending lossless field and applicability audit."
+    },
+    {
+      "asset_role": "authored_semantic_model",
+      "audit_status": "pending",
+      "blockers": [
+        "missing_profile_adapter"
+      ],
+      "classification": "blocked_missing_adapter_or_identity_evidence",
+      "generation_strategy": "retain_until_profile_support",
+      "native_source_kind": "authored_semantic_model",
+      "path": "semantic-packs/rust-codeql-parity/bifrost.rust-std-alloc.json",
+      "profiles": [
+        "rust"
+      ],
+      "reason": "Reviewed Rust CodeQL parity model; exportability remains pending lossless field and applicability audit."
+    },
+    {
+      "asset_role": "authored_semantic_model",
+      "audit_status": "pending",
+      "blockers": [
+        "missing_profile_adapter"
+      ],
+      "classification": "blocked_missing_adapter_or_identity_evidence",
+      "generation_strategy": "retain_until_profile_support",
+      "native_source_kind": "authored_semantic_model",
+      "path": "semantic-packs/rust-codeql-parity/bifrost.rust-std-fs.json",
+      "profiles": [
+        "rust"
+      ],
+      "reason": "Reviewed Rust CodeQL parity model; exportability remains pending lossless field and applicability audit."
+    },
+    {
+      "asset_role": "authored_semantic_model",
+      "audit_status": "pending",
+      "blockers": [
+        "missing_profile_adapter"
+      ],
+      "classification": "blocked_missing_adapter_or_identity_evidence",
+      "generation_strategy": "retain_until_profile_support",
+      "native_source_kind": "authored_semantic_model",
+      "path": "semantic-packs/rust-codeql-parity/bifrost.rust-std-io-write.json",
+      "profiles": [
+        "rust"
+      ],
+      "reason": "Reviewed Rust CodeQL parity model; exportability remains pending lossless field and applicability audit."
+    },
+    {
+      "asset_role": "authored_semantic_model",
+      "audit_status": "pending",
+      "blockers": [
+        "missing_profile_adapter"
+      ],
+      "classification": "blocked_missing_adapter_or_identity_evidence",
+      "generation_strategy": "retain_until_profile_support",
+      "native_source_kind": "authored_semantic_model",
+      "path": "semantic-packs/rust-codeql-parity/bifrost.rust-std-process.json",
+      "profiles": [
+        "rust"
+      ],
+      "reason": "Reviewed Rust CodeQL parity model; exportability remains pending lossless field and applicability audit."
+    },
+    {
+      "asset_role": "authored_semantic_model",
+      "audit_status": "pending",
+      "blockers": [
+        "missing_profile_adapter"
+      ],
+      "classification": "blocked_missing_adapter_or_identity_evidence",
+      "generation_strategy": "retain_until_profile_support",
+      "native_source_kind": "authored_semantic_model",
+      "path": "semantic-packs/rust-codeql-parity/bifrost.rust-std-threat-sources.json",
+      "profiles": [
+        "rust"
+      ],
+      "reason": "Reviewed Rust CodeQL parity model; exportability remains pending lossless field and applicability audit."
+    },
+    {
+      "asset_role": "authored_semantic_model",
+      "audit_status": "pending",
+      "blockers": [
+        "missing_profile_adapter"
+      ],
+      "classification": "blocked_missing_adapter_or_identity_evidence",
+      "generation_strategy": "retain_until_profile_support",
+      "native_source_kind": "authored_semantic_model",
+      "path": "semantic-packs/rust-codeql-parity/bifrost.rust-tokio-fs.json",
+      "profiles": [
+        "rust"
+      ],
+      "reason": "Reviewed Rust CodeQL parity model; exportability remains pending lossless field and applicability audit."
+    },
+    {
+      "asset_role": "authored_semantic_model",
+      "audit_status": "pending",
+      "blockers": [
+        "missing_profile_adapter"
+      ],
+      "classification": "blocked_missing_adapter_or_identity_evidence",
+      "generation_strategy": "retain_until_profile_support",
+      "native_source_kind": "authored_semantic_model",
+      "path": "semantic-packs/rust-codeql-parity/bifrost.rust-tokio-process.json",
+      "profiles": [
+        "rust"
+      ],
+      "reason": "Reviewed Rust CodeQL parity model; exportability remains pending lossless field and applicability audit."
+    },
+    {
+      "asset_role": "authored_semantic_model",
+      "audit_status": "pending",
+      "blockers": [
+        "missing_profile_adapter"
+      ],
+      "classification": "blocked_missing_adapter_or_identity_evidence",
+      "generation_strategy": "retain_until_profile_support",
+      "native_source_kind": "authored_semantic_model",
+      "path": "semantic-packs/rust-codeql-parity/bifrost.rust-url.json",
+      "profiles": [
+        "rust"
+      ],
+      "reason": "Reviewed Rust CodeQL parity model; exportability remains pending lossless field and applicability audit."
+    },
+    {
+      "asset_role": "authored_semantic_model",
+      "audit_status": "pending",
+      "blockers": [
+        "missing_profile_adapter"
+      ],
+      "classification": "blocked_missing_adapter_or_identity_evidence",
+      "generation_strategy": "retain_until_profile_support",
+      "native_source_kind": "authored_semantic_model",
+      "path": "semantic-packs/rust-codeql-parity/bifrost.rust-web-response.json",
+      "profiles": [
+        "rust"
+      ],
+      "reason": "Reviewed Rust CodeQL parity model; exportability remains pending lossless field and applicability audit."
+    },
+    {
+      "asset_role": "authored_semantic_model",
+      "audit_status": "pending",
+      "blockers": [
+        "missing_profile_adapter"
+      ],
+      "classification": "blocked_missing_adapter_or_identity_evidence",
+      "generation_strategy": "retain_until_profile_support",
+      "native_source_kind": "authored_semantic_model",
+      "path": "semantic-packs/rust-sql-injection/bifrost.rust-postgres-sql.json",
+      "profiles": [
+        "rust"
+      ],
+      "reason": "Reviewed postgres SQL-sink model for the #3757 Rust SQL-injection support; exportability remains pending lossless field and applicability audit."
+    },
+    {
+      "asset_role": "authored_semantic_model",
+      "audit_status": "pending",
+      "blockers": [
+        "missing_profile_adapter"
+      ],
+      "classification": "blocked_missing_adapter_or_identity_evidence",
+      "generation_strategy": "retain_until_profile_support",
+      "native_source_kind": "authored_semantic_model",
+      "path": "semantic-packs/rust-sql-injection/bifrost.rust-rusqlite-sql.json",
+      "profiles": [
+        "rust"
+      ],
+      "reason": "Reviewed rusqlite SQL-sink model for the #3757 Rust SQL-injection support; exportability remains pending lossless field and applicability audit."
+    },
+    {
+      "asset_role": "authored_semantic_model",
+      "audit_status": "pending",
+      "blockers": [
+        "missing_profile_adapter"
+      ],
+      "classification": "blocked_missing_adapter_or_identity_evidence",
+      "generation_strategy": "retain_until_profile_support",
+      "native_source_kind": "authored_semantic_model",
+      "path": "semantic-packs/rust-sql-injection/bifrost.rust-std-sql-taint.json",
+      "profiles": [
+        "rust"
+      ],
+      "reason": "Reviewed Rust std input and value-carrier model for the #3757 Rust SQL-injection support; exportability remains pending lossless field and applicability audit."
     },
     {
       "asset_role": "documentation",

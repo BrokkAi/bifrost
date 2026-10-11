@@ -57,16 +57,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn should_log_throttles_by_key() {
-        let log: ThrottledLog<String> = ThrottledLog::new(Duration::from_secs(10), 8);
-        let now = Instant::now();
-
-        assert!(log.should_log("a", now));
-        assert!(!log.should_log("a", now + Duration::from_secs(9)));
-        assert!(log.should_log("a", now + Duration::from_secs(10)));
-    }
-
-    #[test]
     fn should_log_prunes_stale_entries_and_bounds_recent_entries() {
         let log: ThrottledLog<String> = ThrottledLog::new(Duration::from_secs(10), 2);
         let now = Instant::now();
@@ -89,5 +79,15 @@ mod tests {
             entries_after_clear, 1,
             "recent entries should be cleared wholesale when the log stays full"
         );
+    }
+
+    #[test]
+    fn should_log_throttles_by_key() {
+        let log: ThrottledLog<String> = ThrottledLog::new(Duration::from_secs(10), 8);
+        let now = Instant::now();
+
+        assert!(log.should_log("a", now));
+        assert!(!log.should_log("a", now + Duration::from_secs(9)));
+        assert!(log.should_log("a", now + Duration::from_secs(10)));
     }
 }

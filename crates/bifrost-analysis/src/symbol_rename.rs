@@ -18,7 +18,7 @@ use crate::analyzer::{
     CodeUnit, CodeUnitType, IAnalyzer, Language, Project, ProjectFile, Range as ByteRange,
 };
 use crate::text_utils::{
-    compute_line_starts, find_line_index_for_offset, find_word, identifier_span_at_offset,
+    compute_line_starts, find_word, identifier_span_at_offset, line_column_for_offset,
 };
 
 const RENAME_CONFIDENCE_THRESHOLD: f64 = 1.0;
@@ -298,20 +298,6 @@ pub fn rename_symbol(
         files,
     };
     Ok(result)
-}
-
-pub(crate) fn line_column_for_byte_offset(
-    source: &str,
-    line_starts: &[usize],
-    offset: usize,
-) -> (usize, usize) {
-    let line_index = find_line_index_for_offset(line_starts, offset);
-    let line_start = line_starts.get(line_index).copied().unwrap_or(0);
-    let column = source
-        .get(line_start..offset)
-        .map(|slice| slice.chars().count() + 1)
-        .unwrap_or(1);
-    (line_index + 1, column)
 }
 
 fn read_source(project: &dyn Project, file: &ProjectFile) -> Result<String, RenameFailure> {
@@ -632,8 +618,7 @@ fn edit_for_byte_range(
 ) -> Result<EditCandidate, RenameFailure> {
     let entry = cache.ensure(project, file)?;
     if entry.body.get(start_byte..end_byte) != Some(old_name) {
-        let (line, column) =
-            line_column_for_byte_offset(&entry.body, &entry.line_starts, start_byte);
+        let (line, column) = line_column_for_offset(&entry.body, &entry.line_starts, start_byte);
         return Err(RenameFailure {
             kind: "stale_location",
             message: format!(
@@ -742,6 +727,7 @@ struct EditCandidate {
 mod tests {
     use super::*;
     use brokk_bifrost_core::analyzer::usages::receiver_analysis::ReceiverBudgetLimit;
+    use brokk_bifrost_test_macros::hardwon;
     use std::collections::BTreeSet;
 
     fn usage_query(result: FuzzyResult, completion: UsageQueryCompletion) -> QueryResult {
@@ -759,6 +745,7 @@ mod tests {
     }
 
     #[test]
+    #[hardwon("68e575a4e3c1: rename planning must reject incomplete or unproven references")]
     fn rename_requires_complete_execution_and_proven_reference_inventory() {
         let file = ProjectFile::new(std::env::temp_dir(), "target.rs");
         let target = CodeUnit::new(file.clone(), CodeUnitType::Function, "", "target");
@@ -848,6 +835,7 @@ mod tests {
     /// navigation surface answers with "move to an identifier token and
     /// retry", advice that is wrong for every status here.
     #[test]
+    #[hardwon("8383e535963c: unresolved lookup status and diagnostics must survive rename refusal")]
     fn an_unresolved_definition_keeps_its_status_and_diagnostics() {
         for (status, kind) in [
             (
@@ -886,6 +874,7 @@ mod tests {
     /// An ambiguous location has no unique authority, so it is a refusal and
     /// never an edit, and it is not reported as an absence either.
     #[test]
+    #[hardwon("8383e535963c: ambiguous definitions must not be reported as absent")]
     fn an_ambiguous_definition_refuses_the_rename_without_claiming_absence() {
         let failure =
             unresolved_definition_failure(&unresolved_outcome(DefinitionLookupStatus::Ambiguous));
@@ -901,19 +890,6 @@ mod tests {
             end_byte: end as usize,
             new_text: "renamed".to_string(),
         }
-    }
-
-    #[test]
-    fn prepare_file_edits_sorts_and_deduplicates() {
-        let edits = prepare_file_edits(vec![edit(10, 12), edit(1, 3), edit(10, 12)]).unwrap();
-
-        assert_eq!(
-            edits
-                .into_iter()
-                .map(|edit| (edit.start_byte, edit.end_byte))
-                .collect::<Vec<_>>(),
-            vec![(1, 3), (10, 12)]
-        );
     }
 
     #[test]

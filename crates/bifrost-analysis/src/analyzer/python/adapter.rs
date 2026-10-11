@@ -5,8 +5,7 @@
 //! with `pub(crate)` fields that cannot leave this crate.
 
 use crate::analyzer::cognitive_complexity;
-use crate::analyzer::{CodeUnit, Language, LanguageAdapter, ProjectFile, Range};
-use crate::text_utils::compute_line_starts;
+use crate::analyzer::{CodeUnit, Language, LanguageAdapter, ProjectFile};
 use brokk_bifrost_python::adapter::{
     PYTHON_COGNITIVE_CONFIG, PYTHON_FILE_EXTENSION, python_extract_call_receiver,
 };
@@ -78,7 +77,7 @@ impl LanguageAdapter for PythonAdapter {
     }
 
     fn should_persist_code_unit(&self, code_unit: &CodeUnit) -> bool {
-        !code_unit.is_file_scope() && !code_unit.is_module()
+        crate::analyzer::common::should_persist_code_unit(code_unit)
     }
 
     fn synthesize_hydrated_units(
@@ -93,12 +92,9 @@ impl LanguageAdapter for PythonAdapter {
         };
         state.top_level_declarations.insert(0, module.clone());
         state.declarations.insert(module.clone());
-        state.ranges.entry(module.clone()).or_default().push(Range {
-            start_byte: 0,
-            end_byte: source.len(),
-            start_line: 1,
-            end_line: compute_line_starts(source).len(),
-        });
+        state.ranges.entry(module.clone()).or_default().push(
+            crate::analyzer::tree_sitter_analyzer::full_source_range(source),
+        );
         let module_children: Vec<_> = state
             .top_level_declarations
             .iter()

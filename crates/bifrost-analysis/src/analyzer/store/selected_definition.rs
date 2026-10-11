@@ -442,6 +442,21 @@ impl SelectedResolutionMountInventory<'_> {
         )
     }
 
+    /// All parser units linked from each source declaration. A declaration can
+    /// have multiple parser-unit projections; the language analyzer selects
+    /// the one whose structured identity matches the persisted semantic row.
+    pub(crate) fn selected_declaration_unit_candidates(
+        &self,
+        definitions: &[(SelectedResolutionMountOrdinal, ResolutionLocalKey)],
+        cancellation: &CancellationToken,
+    ) -> Result<SelectedDefinitionUnitReadOutcome> {
+        self.selected_unit_candidates_by_coordinate(
+            SELECTED_DECLARATION_UNITS_SQL.as_str(),
+            definitions,
+            cancellation,
+        )
+    }
+
     /// See [`SELECTED_MACRO_ITEM_UNIT_SQL`]. `None` when cancelled; an empty
     /// row when the staged definition is not a crate-declared item.
     pub(crate) fn selected_macro_item_unit(
@@ -480,6 +495,32 @@ impl SelectedResolutionMountInventory<'_> {
     }
 
     fn selected_units_by_coordinate(
+        &self,
+        sql: &str,
+        definitions: &[(SelectedResolutionMountOrdinal, ResolutionLocalKey)],
+        cancellation: &CancellationToken,
+    ) -> Result<SelectedDefinitionUnitReadOutcome> {
+        let outcome = self.read_selected_units_by_coordinate(sql, definitions, cancellation)?;
+        if let SelectedDefinitionUnitReadOutcome::Ready(rows) = &outcome
+            && rows.len() > definitions.len()
+        {
+            return Err(StoreError::new(
+                "selected definition projection returned duplicate parser units",
+            ));
+        }
+        Ok(outcome)
+    }
+
+    fn selected_unit_candidates_by_coordinate(
+        &self,
+        sql: &str,
+        definitions: &[(SelectedResolutionMountOrdinal, ResolutionLocalKey)],
+        cancellation: &CancellationToken,
+    ) -> Result<SelectedDefinitionUnitReadOutcome> {
+        self.read_selected_units_by_coordinate(sql, definitions, cancellation)
+    }
+
+    fn read_selected_units_by_coordinate(
         &self,
         sql: &str,
         definitions: &[(SelectedResolutionMountOrdinal, ResolutionLocalKey)],
@@ -539,11 +580,6 @@ impl SelectedResolutionMountInventory<'_> {
             if cancellation.is_cancelled() {
                 return Ok(SelectedDefinitionUnitReadOutcome::Cancelled);
             }
-        }
-        if all_rows.len() > requests.len() {
-            return Err(StoreError::new(
-                "selected definition projection returned duplicate parser units",
-            ));
         }
         Ok(SelectedDefinitionUnitReadOutcome::Ready(
             all_rows

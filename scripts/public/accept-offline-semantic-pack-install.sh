@@ -2,7 +2,7 @@
 set -euo pipefail
 
 if [[ $# -ne 8 ]]; then
-  echo "usage: $0 BIFROST INSTALLER BUNDLE POLICY_ROOT PACK_CACHE_ROOT RECEIPT JAVA_HOME SCRATCH_ROOT" >&2
+  echo "usage: $0 BIFROST INSTALLER BUNDLE POLICY_ROOT CACHE OUTCOME_RECEIPT JAVA_HOME SCRATCH_ROOT" >&2
   exit 2
 fi
 
@@ -10,30 +10,190 @@ bifrost=$(realpath "$1")
 installer=$(realpath "$2")
 bundle=$(realpath "$3")
 policy_root=$(realpath "$4")
-pack_cache=$(realpath -m "$5")
-receipt=$(realpath "$6")
+pack_cache=$(realpath "$5")
+outcome_receipt=$(realpath "$6")
 java_home=$(realpath "$7")
-scratch=$(realpath -m "$8")
+scratch_parent=$(realpath "$(dirname "$8")")
+scratch="$scratch_parent/$(basename "$8")"
 
 for executable in "$bifrost" "$installer"; do
   [[ -x "$executable" ]] || { echo "not executable: $executable" >&2; exit 2; }
 done
-[[ -f "$bundle/index.json" ]] || { echo "bundle has no index.json: $bundle" >&2; exit 2; }
-[[ -d "$policy_root" ]] || { echo "policy pack root is not a directory: $policy_root" >&2; exit 2; }
-mkdir -p -- "$pack_cache"
-[[ -d "$pack_cache" ]] || { echo "pack cache root is not a directory: $pack_cache" >&2; exit 2; }
-cache_write_probe=$(mktemp "$pack_cache/.bifrost-write-test.XXXXXX")
-rm -f -- "$cache_write_probe"
-[[ -s "$receipt" ]] || { echo "pack selection receipt is missing: $receipt" >&2; exit 2; }
-node -e 'JSON.parse(require("node:fs").readFileSync(process.argv[1], "utf8"))' "$receipt"
+for directory in "$bundle" "$policy_root" "$pack_cache"; do
+  [[ -d "$directory" ]] || { echo "not a directory: $directory" >&2; exit 2; }
+done
+[[ -s "$outcome_receipt" ]] || { echo "missing acquisition outcome: $outcome_receipt" >&2; exit 2; }
 [[ -x "$java_home/bin/java" && -d "$java_home/jmods" ]] || {
   echo "JAVA_HOME is not a complete JDK: $java_home" >&2
   exit 2
 }
 
+# The acquisition job owns selection. Consume its exact outcome and receipt;
+# this acceptance must never select another release or refresh the cache.
+live_profile=$("$bifrost" pack-engine-profile)
+selection_id=$(LIVE_PROFILE_JSON="$live_profile" node - "$outcome_receipt" "$bifrost" "$bundle" "$policy_root" "$pack_cache" <<'NODE'
+const crypto = require("node:crypto");
+const fs = require("node:fs");
+const path = require("node:path");
+const { isDeepStrictEqual } = require("node:util");
+
+const [outcomePath, executablePath, bundleRoot, policyRoot, cacheRoot] = process.argv.slice(2);
+const profile = JSON.parse(process.env.LIVE_PROFILE_JSON);
+const outcome = JSON.parse(fs.readFileSync(outcomePath, "utf8"));
+
+const fail = (message) => {
+  throw new Error(message);
+};
+const exactKeys = (value, keys, label) => {
+  if (!value || typeof value !== "object" || Array.isArray(value)) fail(`${label} is not an object`);
+  const actual = Object.keys(value).sort();
+  const expected = [...keys].sort();
+  if (!isDeepStrictEqual(actual, expected)) {
+    fail(`${label} keys differ: expected ${expected.join(",")}, got ${actual.join(",")}`);
+  }
+};
+const nonempty = (value, label) => {
+  if (typeof value !== "string" || value.length === 0) fail(`${label} is missing`);
+};
+const sha256 = (file) => crypto.createHash("sha256").update(fs.readFileSync(file)).digest("hex");
+const real = (file) => fs.realpathSync(file);
+const requireDirectory = (directory, label) => {
+  if (!fs.statSync(directory).isDirectory()) fail(`${label} is not a directory: ${directory}`);
+};
+const requireSamePath = (actual, expected, label) => {
+  if (real(actual) !== real(expected)) fail(`${label} disagrees: ${actual} vs ${expected}`);
+};
+
+exactKeys(outcome, [
+  "outcome_schema_version",
+  "status",
+  "engine",
+  "request",
+  "failure",
+  "rejections",
+  "inventory",
+  "selection",
+  "created_at",
+], "acquisition outcome");
+if (outcome.outcome_schema_version !== 1 || outcome.status !== "selected") {
+  fail("acquisition outcome is not a selected schema-1 result");
+}
+if (outcome.failure !== null || !Array.isArray(outcome.rejections) || !outcome.selection) {
+  fail("selected acquisition outcome has an invalid failure or selection");
+}
+exactKeys(outcome.engine, ["version", "build_identity", "executable_sha256"], "outcome engine");
+exactKeys(profile, [
+  "build_identity",
+  "capabilities",
+  "capability_contract_version",
+  "engine_version",
+  "model_set_sha256",
+  "schemas",
+], "live pack-engine-profile");
+nonempty(profile.engine_version, "live engine version");
+nonempty(profile.build_identity, "live engine build identity");
+if (outcome.engine.version !== profile.engine_version || outcome.engine.build_identity !== profile.build_identity) {
+  fail("acquisition outcome engine identity disagrees with live pack-engine-profile");
+}
+const executableDigest = sha256(executablePath);
+if (outcome.engine.executable_sha256 !== executableDigest) {
+  fail(`acquisition outcome executable digest differs: ${outcome.engine.executable_sha256} vs ${executableDigest}`);
+}
+
+const selection = outcome.selection;
+exactKeys(selection, [
+  "selection_id",
+  "selection_reason",
+  "cache_reused",
+  "receipt_path",
+  "policy_pack_root",
+  "semantic_bundle_root",
+  "receipt",
+], "outcome selection");
+if (!/^[a-f0-9]{64}$/u.test(selection.selection_id)) fail("selection id is not a lowercase SHA-256 identity");
+nonempty(selection.receipt_path, "selection receipt path");
+nonempty(selection.policy_pack_root, "selected policy root");
+nonempty(selection.semantic_bundle_root, "selected semantic bundle root");
+const selectionReceiptPath = real(selection.receipt_path);
+const selectionRoot = path.dirname(selectionReceiptPath);
+if (path.basename(selectionRoot) !== selection.selection_id) fail("selection receipt directory does not match selection_id");
+const receipt = JSON.parse(fs.readFileSync(selectionReceiptPath, "utf8"));
+exactKeys(receipt, [
+  "receipt_schema_version",
+  "status",
+  "selection_id",
+  "selection_reason",
+  "request",
+  "engine",
+  "source",
+  "releases",
+  "rejections",
+  "extracted_files",
+  "artifacts",
+  "replay",
+  "created_at",
+], "selection receipt");
+if (receipt.receipt_schema_version !== 3 || !["qualified", "compatible"].includes(receipt.status)) {
+  fail("selected receipt is not a schema-3 compatible selection");
+}
+if (receipt.selection_id !== selection.selection_id || receipt.selection_reason !== selection.selection_reason) {
+  fail("selection_id or selection_reason disagrees with the selected receipt");
+}
+if (!isDeepStrictEqual(selection.receipt, receipt)) fail("outcome embedded receipt differs from the selected receipt file");
+exactKeys(receipt.engine, ["version", "build_identity", "profile"], "selection receipt engine");
+if (receipt.engine.version !== profile.engine_version || receipt.engine.build_identity !== profile.build_identity ||
+    !isDeepStrictEqual(receipt.engine.profile, profile)) {
+  fail("selected receipt profile disagrees with live pack-engine-profile");
+}
+
+requireDirectory(bundleRoot, "selected semantic bundle root");
+requireDirectory(policyRoot, "selected policy root");
+requireDirectory(cacheRoot, "selected semantic cache root");
+requireSamePath(selection.policy_pack_root, policyRoot, "policy root");
+requireSamePath(selection.semantic_bundle_root, bundleRoot, "semantic bundle root");
+const expectedCacheRoot = path.join(path.dirname(path.dirname(path.dirname(selectionReceiptPath))), "semantic-pack-catalog-v1");
+requireSamePath(cacheRoot, expectedCacheRoot, "semantic cache root");
+requireSamePath(path.join(selectionRoot, "root", "rules"), policyRoot, "receipt policy root");
+
+if (!Array.isArray(receipt.releases)) fail("selected receipt releases are missing");
+const rootRelease = receipt.releases.find((release) => release.role === "root");
+if (!rootRelease || rootRelease.pack_id !== "bifrost.public.rules") fail("selected receipt root is not bifrost.public.rules");
+const nativeDependency = receipt.releases.find((release) =>
+  release.role === "dependency" && Array.isArray(release.artifacts) && release.artifacts.some((artifact) => artifact.role === "native"),
+);
+if (!nativeDependency) fail("selected receipt has no native semantic-pack dependency");
+requireSamePath(
+  path.join(selectionRoot, `dependency-${nativeDependency.pack_id}`, "bifrost-semantic-packs"),
+  bundleRoot,
+  "receipt semantic bundle root",
+);
+if (!fs.existsSync(path.join(bundleRoot, "index.json"))) fail("selected semantic bundle has no index.json");
+
+// The selected policy source is the authoritative semantic-hash source. Its
+// bytes must be covered by both producer receipt records before it is used.
+const manifestRelativePath = "rules/bifrost.security/manifest.json";
+const sourceManifest = path.join(policyRoot, "bifrost.security", "manifest.json");
+const manifestContent = rootRelease.contents?.find((content) => content.path === manifestRelativePath);
+const extractedManifest = receipt.extracted_files?.root?.find((file) => file.path === manifestRelativePath);
+if (!manifestContent || !extractedManifest) fail("selected receipt does not cover bifrost.security/manifest.json");
+const sourceManifestDigest = sha256(sourceManifest);
+if (sourceManifestDigest !== manifestContent.sha256 || sourceManifestDigest !== extractedManifest.sha256) {
+  fail("selected policy manifest digest disagrees with the producer receipt");
+}
+if (fs.statSync(sourceManifest).size !== extractedManifest.size_bytes) {
+  fail("selected policy manifest size disagrees with the producer receipt");
+}
+
+process.stdout.write(`${selection.selection_id}\n`);
+NODE
+)
+
+selection_receipt=$(node -e 'const fs = require("node:fs"); const outcome = JSON.parse(fs.readFileSync(process.argv[1], "utf8")); process.stdout.write(outcome.selection.receipt_path)' "$outcome_receipt")
+selection_receipt=$(realpath "$selection_receipt")
+policy_manifest="$policy_root/bifrost.security/manifest.json"
+
 rm -rf "$scratch"
 mkdir -p "$scratch/workspace/src/main/java/fixture" "$scratch/empty-home"
-cp "$receipt" "$scratch/open-packs-receipt.json"
 workspace="$scratch/workspace"
 catalog="$workspace/.bifrost/semantic-pack-catalog"
 mkdir -p "$workspace/.bifrost"
@@ -74,6 +234,15 @@ public final class App {
     }
 }
 JAVA
+
+[[ -f "$bundle/index.json" ]] || { echo "selected bundle has no index.json: $bundle" >&2; exit 2; }
+mkdir -p -- "$pack_cache"
+cache_write_probe=$(mktemp "$pack_cache/.bifrost-write-test.XXXXXX")
+rm -f -- "$cache_write_probe"
+cp "$selection_receipt" "$scratch/open-packs-receipt.json"
+if [[ -n "${GITHUB_OUTPUT:-}" ]]; then
+  printf 'selection_id=%s\n' "$selection_id" >> "$GITHUB_OUTPUT"
+fi
 
 run_scan() {
   local label=$1
@@ -167,7 +336,6 @@ connection.close()
 PY
 run_scan incompatible
 
-policy_manifest="$(dirname "$0")/../../crates/bifrost-policy/policy-packs/bifrost.security/manifest.json"
 node - "$scratch" "$policy_manifest" <<'NODE'
 const fs = require("node:fs");
 const path = require("node:path");

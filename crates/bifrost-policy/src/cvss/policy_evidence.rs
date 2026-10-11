@@ -7,8 +7,7 @@ use super::reduction::{CvssFindingProjection, CvssReductionError};
 use super::{CvssEvidenceBasis, CvssEvidenceContentHash, CvssMetricEvidence, PolicyOverlayScope};
 use crate::definition::{
     AnyOrAll, CvssEvidencePredicate, CvssEvidenceScope, CvssMetric, CvssMetricRule, EndpointRef,
-    PolicyAnalysisType, PolicyEvidenceRef, TaintSourceEvidence, TaintSystemEntry,
-    TaintTrustBoundary,
+    PolicyEvidenceRef, TaintSourceEvidence, TaintSystemEntry, TaintTrustBoundary,
 };
 use crate::evaluator::{
     CvssAnalystOverlayEvidence, CvssEnvironmentOverlayEvidence, CvssEvaluationOverlay,
@@ -206,38 +205,11 @@ fn overlay_record(
     metadata: &crate::evaluator::CvssOverlayEvidenceMetadata,
     content_hash: CvssEvidenceContentHash,
 ) -> Result<CvssMetricEvidence, CvssReductionError> {
-    Ok(CvssMetricEvidence::try_new(
-        metric,
-        value,
-        basis,
-        metadata.evidence_refs().to_vec(),
-        metadata.rationale().to_string(),
-        metadata.assumptions().to_vec(),
-        metadata.assessor_or_tool().to_string(),
-        Some(metadata.assessed_at().to_string()),
-        metadata.system_scope(),
-        content_hash,
-    )?)
+    Ok(metadata.try_new_metric_evidence(metric, value, basis, content_hash)?)
 }
 
 fn sort_scoped_evidence(records: &mut [ScopedMetricEvidence]) {
-    records.sort_by(|left, right| {
-        super::metric_rank(left.evidence.metric())
-            .cmp(&super::metric_rank(right.evidence.metric()))
-            .then_with(|| left.target_scope.cmp(&right.target_scope))
-            .then_with(|| left.evidence.basis().cmp(&right.evidence.basis()))
-            .then_with(|| {
-                left.evidence
-                    .value()
-                    .first_label()
-                    .cmp(right.evidence.value().first_label())
-            })
-            .then_with(|| {
-                left.evidence
-                    .content_hash()
-                    .cmp(&right.evidence.content_hash())
-            })
-    });
+    records.sort_by(super::reduction::compare_scoped_evidence);
 }
 
 fn evaluate_predicate<'a>(
@@ -343,10 +315,7 @@ fn source_labels_match(
 }
 
 fn quantified_contains<T: Eq>(haystack: &[T], needles: &[T], quantifier: AnyOrAll) -> bool {
-    match quantifier {
-        AnyOrAll::Any => needles.iter().any(|needle| haystack.contains(needle)),
-        AnyOrAll::All => needles.iter().all(|needle| haystack.contains(needle)),
-    }
+    crate::classification::quantified_membership(quantifier, needles, haystack)
 }
 
 fn source_evidence_matches(actual: &TaintSourceEvidence, expected: &TaintSourceEvidence) -> bool {
@@ -550,7 +519,7 @@ fn predicate_hash(predicate: &CvssEvidencePredicate) -> [u8; 32] {
         }
         CvssEvidencePredicate::AnalysisType { analysis_type } => {
             update_field(&mut hasher, b"analysis-type");
-            update_field(&mut hasher, analysis_type_label(*analysis_type));
+            update_field(&mut hasher, analysis_type.label().as_bytes());
         }
         CvssEvidencePredicate::SourceEvidence { evidence } => {
             update_field(&mut hasher, b"source-evidence");
@@ -640,16 +609,6 @@ fn hash_system_scope(hasher: &mut Sha256, scope: CvssEvidenceScope) {
     }
 }
 
-const fn analysis_type_label(value: PolicyAnalysisType) -> &'static [u8] {
-    match value {
-        PolicyAnalysisType::Match => b"match",
-        PolicyAnalysisType::Taint => b"taint",
-        PolicyAnalysisType::Typestate => b"typestate",
-        PolicyAnalysisType::Assertion => b"assertion",
-        PolicyAnalysisType::Flow => b"flow",
-    }
-}
-
 const fn trust_boundary_label(value: TaintTrustBoundary) -> &'static [u8] {
     match value {
         TaintTrustBoundary::External => b"external",
@@ -675,8 +634,8 @@ mod tests {
     use super::*;
     use crate::catalog::{CatalogRegistryLimits, TaintCatalogRegistry};
     use crate::definition::{
-        CvssBaseMetric, CvssMetricValue, CvssMetricValueToken, CvssSystemScope, PolicyCvssBasis,
-        TaintLabel,
+        CvssBaseMetric, CvssMetricValue, CvssMetricValueToken, CvssSystemScope, PolicyAnalysisType,
+        PolicyCvssBasis, TaintLabel,
     };
     use crate::finding_identity::{OpaqueFindingKey, SourceScenarioId};
     use crate::future_evidence::{
@@ -764,7 +723,7 @@ mod tests {
         label: &str,
         scenario: &str,
     ) -> TaintSourceProjectionFact {
-        TaintSourceProjectionFact::try_new(
+        crate::test_support::taint_source_projection_fact(
             source.identity.clone(),
             source.semantic_hash,
             source.analysis_projection_hash,
@@ -786,7 +745,6 @@ mod tests {
             vec![SourceScenarioId::try_new("test", scenario).unwrap()],
             EvidenceRef::try_new("test-source", scenario).unwrap(),
         )
-        .unwrap()
     }
 
     #[test]

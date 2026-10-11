@@ -25,6 +25,7 @@ use super::ir::{
     query_schema,
 };
 use super::validate::RelationalAssertionPlanError;
+use brokk_bifrost_rql::DomainKind;
 
 /// One name the plan can still address, and the relation it currently stands
 /// for.
@@ -32,6 +33,9 @@ use super::validate::RelationalAssertionPlanError;
 struct RelationSlot {
     name: String,
     id: IrRelationId,
+    /// The input domain of the binding's rows; `None` for heterogeneous
+    /// cross-domain rows, which carry their own discriminated identities.
+    domain: Option<DomainKind>,
 }
 
 fn lower_bindings(
@@ -46,9 +50,9 @@ fn lower_bindings(
             return Err(RelationalAssertionPlanError::DuplicateBinding { name });
         }
         let id = IrRelationId(relations.len());
-        let (op, schema) = match &binding.source {
+        let (op, schema, domain) = match &binding.source {
             RowBindingSource::Query(PolicySelector::Inline { query, .. }) => {
-                let (_, fields) = query.validate_row_fields().map_err(|error| {
+                let (kind, fields) = query.validate_row_fields().map_err(|error| {
                     RelationalAssertionPlanError::InvalidQuery {
                         binding: name.clone(),
                         message: error.to_string(),
@@ -61,6 +65,7 @@ fn lower_bindings(
                         schema: schema.clone(),
                     },
                     schema,
+                    kind.domain_kind(),
                 )
             }
             RowBindingSource::Query(PolicySelector::File { .. }) => {
@@ -73,7 +78,7 @@ fn lower_bindings(
             op,
             schema,
         });
-        slots.push(RelationSlot { name, id });
+        slots.push(RelationSlot { name, id, domain });
     }
 
     if bindings.is_empty() {
@@ -90,6 +95,8 @@ fn lower_joins(
 ) -> Result<(IrRelationId, IrSchema), RelationalAssertionPlanError> {
     let mut chain = slots[0].id;
     let mut chain_schema = relations[chain.index()].schema.clone();
+    // The single-input domains already joined into the chain.
+    let mut chain_domains = slots[0].domain.into_iter().collect::<Vec<_>>();
 
     for join in joins {
         let left = join.left.as_str();
@@ -104,15 +111,26 @@ fn lower_joins(
                 binding: right.to_string(),
             });
         }
-        let Some(right_id) = slots
+        let Some((right_id, right_domain)) = slots
             .iter()
             .find(|slot| slot.name == right)
-            .map(|slot| slot.id)
+            .map(|slot| (slot.id, slot.domain))
         else {
             return Err(RelationalAssertionPlanError::UnknownBinding {
                 name: right.to_string(),
             });
         };
+        if let Some(right_domain) = right_domain {
+            if chain_domains.iter().any(|domain| *domain != right_domain) {
+                return Err(RelationalAssertionPlanError::CrossDomainJoin {
+                    left: left.to_string(),
+                    right: right.to_string(),
+                });
+            }
+            if !chain_domains.contains(&right_domain) {
+                chain_domains.push(right_domain);
+            }
+        }
         let kind = match join.kind {
             RowJoinKind::Inner => IrJoinKind::Inner,
             RowJoinKind::Semi => IrJoinKind::Semi,

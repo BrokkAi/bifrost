@@ -16,10 +16,11 @@ use brokk_bifrost_core::analyzer::usages::local_inference::LocalBindingsSnapshot
 use brokk_bifrost_core::analyzer::usages::model::{
     ExportEntry, ExportIndex, ImportBinder, ImportBinding, ImportKind,
 };
+use brokk_bifrost_core::analyzer::usages::reexport_seeds;
 use brokk_bifrost_core::analyzer::usages::{ImportEdge, ImportEdgeKind};
 use brokk_bifrost_core::analyzer::{CodeUnit, Language, ProjectFile};
 use brokk_bifrost_core::hash::{HashMap, HashSet};
-use std::collections::{BTreeSet, VecDeque};
+use std::collections::BTreeSet;
 use std::sync::{Arc, Mutex};
 
 use crate::declarations::python_module_name;
@@ -29,7 +30,7 @@ use crate::graph_support::{
     retain_modules_for_importer,
 };
 use crate::imports::{
-    literal_importlib_modules, module_replacement_of, resolve_python_relative_module,
+    literal_importlib_modules, module_replacement_of, resolve_python_module_specifier,
 };
 
 /// Re-export and reverse-import indices over the Python workspace.
@@ -69,6 +70,22 @@ pub enum ModuleBindingEventKind {
     Other,
 }
 
+/// Keep events from the last unconditional binding through `cutoff`.
+pub fn visible_module_binding_suffix(
+    events: &[ModuleBindingEvent],
+    cutoff: usize,
+) -> impl Iterator<Item = &ModuleBindingEvent> {
+    let visible: Vec<_> = events
+        .iter()
+        .filter(|event| event.visible_from <= cutoff)
+        .collect();
+    let start = visible
+        .iter()
+        .rposition(|event| !event.conditional)
+        .unwrap_or(0);
+    visible.into_iter().skip(start)
+}
+
 /// Resolve a module specifier to the files defining it: a leading-dot specifier
 /// is made absolute against the importing file's package, then looked up in the
 /// module index.
@@ -78,11 +95,7 @@ fn resolve_module(
     importing_file: &ProjectFile,
     module_specifier: &str,
 ) -> Vec<ProjectFile> {
-    let resolved_module = if module_specifier.starts_with('.') {
-        resolve_python_relative_module(importing_file, module_specifier)
-    } else {
-        Some(module_specifier.to_string())
-    };
+    let resolved_module = resolve_python_module_specifier(importing_file, module_specifier);
     let Some(resolved_module) = resolved_module else {
         return Vec::new();
     };
@@ -106,21 +119,20 @@ fn resolve_module(
 }
 
 fn is_sys_namespace_binding(binding: &ImportBinding) -> bool {
-    binding.kind == ImportKind::Namespace
-        && binding
-            .namespace_imported_module
-            .as_deref()
-            .unwrap_or(&binding.module_specifier)
-            == "sys"
+    is_namespace_binding_for_module(binding, "sys")
 }
 
 fn is_importlib_namespace_binding(binding: &ImportBinding) -> bool {
+    is_namespace_binding_for_module(binding, "importlib")
+}
+
+fn is_namespace_binding_for_module(binding: &ImportBinding, module: &str) -> bool {
     binding.kind == ImportKind::Namespace
         && binding
             .namespace_imported_module
             .as_deref()
             .unwrap_or(&binding.module_specifier)
-            == "importlib"
+            == module
 }
 
 impl PythonUsageIndex {
@@ -369,28 +381,12 @@ impl PythonUsageIndex {
             }
         }
 
-        let mut frontier: VecDeque<(ProjectFile, String)> = seeds.iter().cloned().collect();
-        while let Some(seed) = frontier.pop_front() {
-            if let Some(reexports) = self.reexport_edges.get(&seed) {
-                for next in reexports {
-                    if seeds.insert(next.clone()) {
-                        frontier.push_back(next.clone());
-                    }
-                }
-            }
-            if !seed.1.starts_with('_')
-                && let Some(star_files) = self.star_reexports.get(&seed.0)
-            {
-                for star_file in star_files {
-                    let next = (star_file.clone(), seed.1.clone());
-                    if seeds.insert(next.clone()) {
-                        frontier.push_back(next);
-                    }
-                }
-            }
-        }
-
-        seeds
+        reexport_seeds::expand_reexport_seeds(
+            seeds,
+            &self.reexport_edges,
+            &self.star_reexports,
+            |name| !name.starts_with('_'),
+        )
     }
 
     pub fn matching_edges_for_importer(
@@ -398,19 +394,7 @@ impl PythonUsageIndex {
         importer: &ProjectFile,
         seeds: &BTreeSet<(ProjectFile, String)>,
     ) -> Vec<ImportEdge> {
-        let mut matches = Vec::new();
-        for (target_file, _) in seeds {
-            let Some(edges) = self.importer_reverse.get(target_file) else {
-                continue;
-            };
-            matches.extend(
-                edges
-                    .iter()
-                    .filter(|edge| &edge.importer == importer && edge_matches_seed(edge, seeds))
-                    .cloned(),
-            );
-        }
-        matches
+        reexport_seeds::matching_edges_for_importer(&self.importer_reverse, importer, seeds)
     }
 
     pub fn importer_files_for_seeds(
@@ -423,7 +407,7 @@ impl PythonUsageIndex {
                 importers.extend(
                     edges
                         .iter()
-                        .filter(|edge| edge_matches_seed(edge, seeds))
+                        .filter(|edge| reexport_seeds::edge_matches_seed(edge, seeds))
                         .map(|edge| edge.importer.clone()),
                 );
             }
@@ -495,19 +479,6 @@ impl PythonUsageIndex {
                 .or_insert_with(|| facts.clone())
                 .clone(),
         )
-    }
-}
-
-fn edge_matches_seed(edge: &ImportEdge, seeds: &BTreeSet<(ProjectFile, String)>) -> bool {
-    match &edge.kind {
-        ImportEdgeKind::Named(name) => seeds.contains(&(edge.target_file.clone(), name.clone())),
-        ImportEdgeKind::Default => {
-            seeds.contains(&(edge.target_file.clone(), "default".to_string()))
-        }
-        ImportEdgeKind::Namespace => seeds.iter().any(|(file, _)| file == &edge.target_file),
-        ImportEdgeKind::CommonJsRequire(export_name) => {
-            seeds.contains(&(edge.target_file.clone(), export_name.clone()))
-        }
     }
 }
 
@@ -648,8 +619,10 @@ pub fn usage_scope_facts(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use brokk_bifrost_test_macros::hardwon;
 
     #[test]
+    #[hardwon("59dfb80c3bb8: module replacement chains failed to canonicalize or reject cycles")]
     fn module_replacement_chains_canonicalize_and_cycles_are_rejected() {
         let root = tempfile::tempdir().expect("temporary project root");
         let first = ProjectFile::new(root.path(), "first.py");
@@ -670,6 +643,9 @@ mod tests {
     }
 
     #[test]
+    #[hardwon(
+        "ddf65ec23b34: repeated graph queries rebuilt generation-stable Python binding facts"
+    )]
     fn module_binding_timeline_is_reused_within_index_generation() {
         let root = tempfile::tempdir().expect("temporary project root");
         let file = ProjectFile::new(root.path(), "consumer.py");

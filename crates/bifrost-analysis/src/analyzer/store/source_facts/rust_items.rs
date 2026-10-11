@@ -172,6 +172,12 @@ pub(in crate::analyzer) fn rust_item_source_cost(
             for role in &arm.ident_roles {
                 payload = payload.saturating_add(role.name.len());
             }
+            payload =
+                payload.saturating_add(arm.transcriber_identifiers.as_ref().map_or(0, |names| {
+                    serde_json::to_string(names)
+                        .expect("Rust macro transcriber identifiers serialize as JSON")
+                        .len()
+                }));
         }
     }
     for group in &items.generics {
@@ -625,8 +631,9 @@ pub(in crate::analyzer) fn insert_rust_item_source_facts_tx(
     )?;
     let mut macro_arms = tx.prepare_cached(
         "INSERT INTO source_rust_macro_arms(
-           blob_id, declaration_id, ordinal, occurrence_id, pattern_occurrence_id, start_byte, end_byte, provenance
-         ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+           blob_id, declaration_id, ordinal, occurrence_id, pattern_occurrence_id,
+           start_byte, end_byte, provenance, transcriber_identifiers
+         ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
     )?;
     let mut macro_pattern_nodes = tx.prepare_cached(
         "INSERT INTO source_rust_macro_pattern_nodes(
@@ -659,6 +666,10 @@ pub(in crate::analyzer) fn insert_rust_item_source_facts_tx(
                 usize_to_i64(inline_occurrence.range.start_byte)?,
                 usize_to_i64(inline_occurrence.range.end_byte)?,
                 crate::analyzer::store::source_facts::provenance_code(inline_occurrence.provenance),
+                arm.transcriber_identifiers.as_ref().map(|names| {
+                    serde_json::to_string(names)
+                        .expect("Rust macro transcriber identifiers serialize as JSON")
+                }),
             ])?;
             for (pattern_ordinal, pattern) in arm.patterns.iter().enumerate() {
                 check_cancelled(cancellation)?;

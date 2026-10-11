@@ -9,13 +9,19 @@ import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import fs from "node:fs";
-import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
 
 import { fakeGhEnv } from "../fixtures/workflow-shell/fake-gh.mjs";
 import { run, scriptForDirectory } from "./release-script-test-helpers.mjs";
+import {
+  createBareGitPair,
+  gitWithTestIdentity,
+  withTempDir as withSharedTempDir,
+  writeExecutable,
+} from "./test-fixtures.mjs";
+import { writeFixtureFile as writeFile } from "../test-support/write-file.mjs";
 
 const scriptsDir = fileURLToPath(new URL(".", import.meta.url));
 const repoRoot = path.resolve(scriptsDir, "..", "..");
@@ -42,38 +48,451 @@ const BASH = (() => {
   return "bash";
 })();
 
+const offlineAcceptance = script("accept-offline-semantic-pack-install.sh");
+const OFFLINE_PROFILE = {
+  build_identity: "a".repeat(40),
+  capabilities: ["taint"],
+  capability_contract_version: 1,
+  engine_version: "0.13.0",
+  model_set_sha256: "b".repeat(64),
+  schemas: {
+    policy_document: [1],
+    rql: [1],
+    builtin_catalog: [2],
+    policy_bundle: [1],
+    semantic_model_read: [2],
+    semantic_model_write: [8],
+    semantic_spec: [1],
+    release_index: [3],
+    runtime: [1],
+  },
+};
+const OFFLINE_POLICY_ID = "bifrost.security.java.system-getenv-to-runtime-exec";
+const OFFLINE_PACK_IDS = [
+  "bifrost.jdk",
+  "bifrost.kotlin-stdlib",
+  "bifrost.python-stdlib",
+  "bifrost.python-stdlib-assertions",
+  "bifrost.rust-stdlib",
+  "bifrost.scala-library",
+  "bifrost.typescript-stdlib",
+];
+
+function digestBytes(bytes) {
+  return createHash("sha256").update(bytes).digest("hex");
+}
+
+function offlineAcceptanceFixture(dir) {
+  const fakeBin = path.join(dir, "fake-bin");
+  const openPackRoot = path.join(dir, "open-pack-releases");
+  const cacheRoot = path.join(openPackRoot, "semantic-pack-catalog-v1");
+  const selectionId = "c".repeat(64);
+  const selectionRoot = path.join(openPackRoot, "selections", selectionId);
+  const policyRoot = path.join(selectionRoot, "root", "rules");
+  const bundleRoot = path.join(
+    selectionRoot,
+    "dependency-bifrost.public.packs",
+    "bifrost-semantic-packs",
+  );
+  const receiptPath = path.join(selectionRoot, "receipt.json");
+  const outcomePath = path.join(dir, "open-packs-outcome.json");
+  const scratchRoot = path.join(dir, "scratch");
+  const javaHome = path.join(dir, "jdk");
+  const dockerLog = path.join(dir, "docker.log");
+  const installerLog = path.join(dir, "installer.log");
+  const bifrost = path.join(fakeBin, "bifrost");
+  const installer = path.join(fakeBin, "bifrost-semantic-pack");
+  const docker = path.join(fakeBin, "docker");
+
+  fs.mkdirSync(path.join(policyRoot, "bifrost.security"), { recursive: true });
+  fs.mkdirSync(path.join(bundleRoot), { recursive: true });
+  fs.mkdirSync(cacheRoot, { recursive: true });
+  writeExecutable(path.join(javaHome, "bin", "java"), "#!/usr/bin/env bash\nexit 0\n");
+  fs.mkdirSync(path.join(javaHome, "jmods"), { recursive: true });
+
+  const policyManifest = `${JSON.stringify({
+    schema_version: 2,
+    id: "bifrost.security",
+    version: "1.3.0",
+    policies: [{
+      path: "policies/jvm/system-getenv-to-runtime-exec.rqlp",
+      id: OFFLINE_POLICY_ID,
+      resolved_semantic_hash: "d".repeat(64),
+    }],
+  }, null, 2)}\n`;
+  const policyManifestBytes = Buffer.from(policyManifest);
+  fs.writeFileSync(path.join(policyRoot, "bifrost.security", "manifest.json"), policyManifestBytes);
+  fs.writeFileSync(
+    path.join(bundleRoot, "index.json"),
+    JSON.stringify({ packs: OFFLINE_PACK_IDS.map((pack_id) => ({ pack_id })) }),
+  );
+  const manifestDigest = digestBytes(policyManifestBytes);
+  const manifestRelativePath = "rules/bifrost.security/manifest.json";
+  const request = {
+    request_schema_version: 1,
+    pack_id: "bifrost.public.rules",
+    repository: "https://github.com/BrokkAi/bifrost-packs",
+    selection: { mode: "preferred", allowed_versions: "*", channel: "stable" },
+    dependencies: [{
+      pack_id: "bifrost.public.packs",
+      repository: "https://github.com/BrokkAi/bifrost-packs",
+      manifest_sha256: "e".repeat(64),
+    }],
+  };
+  const createdAt = "2026-10-09T00:00:00.000Z";
+  const receipt = {
+    receipt_schema_version: 3,
+    status: "qualified",
+    selection_id: selectionId,
+    selection_reason: "highest-eligible",
+    request,
+    engine: {
+      version: OFFLINE_PROFILE.engine_version,
+      build_identity: OFFLINE_PROFILE.build_identity,
+      profile: OFFLINE_PROFILE,
+    },
+    source: {
+      repository: request.repository,
+      inventory_url: null,
+      inventory_sha256_pin: null,
+      index_sha256: "f".repeat(64),
+      fetched_at: createdAt,
+      fetched_online: false,
+    },
+    releases: [
+      {
+        role: "root",
+        pack_id: "bifrost.public.rules",
+        release_version: "1.3.0",
+        visibility: "public",
+        tag: "rules/v1.3.0",
+        tag_commit: "1".repeat(40),
+        source_commit: "1".repeat(40),
+        manifest_schema_version: 2,
+        manifest_sha256: "2".repeat(64),
+        qualification: {
+          integrity: { status: "verified", evidence: [] },
+          behavior: { status: "qualified", evidence: [] },
+        },
+        provenance: null,
+        artifacts: [{
+          name: "rules.tar.gz",
+          role: "policy",
+          size_bytes: 1,
+          sha256: "3".repeat(64),
+        }],
+        contents: [{ path: manifestRelativePath, sha256: manifestDigest }],
+      },
+      {
+        role: "dependency",
+        pack_id: "bifrost.public.packs",
+        release_version: "1.3.0",
+        visibility: "public",
+        tag: "packs/v1.3.0",
+        tag_commit: "4".repeat(40),
+        source_commit: "4".repeat(40),
+        manifest_schema_version: 2,
+        manifest_sha256: "5".repeat(64),
+        qualification: {
+          integrity: { status: "verified", evidence: [] },
+          behavior: { status: "qualified", evidence: [] },
+        },
+        provenance: null,
+        artifacts: [{
+          name: "packs.tar.gz",
+          role: "native",
+          size_bytes: 1,
+          sha256: "6".repeat(64),
+        }],
+        contents: [],
+      },
+    ],
+    rejections: [],
+    extracted_files: {
+      root: [{ path: manifestRelativePath, size_bytes: policyManifestBytes.length, sha256: manifestDigest }],
+      "dependency-bifrost.public.packs": [],
+    },
+    artifacts: [],
+    replay: request,
+    created_at: createdAt,
+  };
+  fs.mkdirSync(selectionRoot, { recursive: true });
+  fs.writeFileSync(receiptPath, `${JSON.stringify(receipt, null, 2)}\n`);
+  const outcome = {
+    outcome_schema_version: 1,
+    status: "selected",
+    engine: {
+      version: OFFLINE_PROFILE.engine_version,
+      build_identity: OFFLINE_PROFILE.build_identity,
+      executable_sha256: "",
+    },
+    request,
+    failure: null,
+    rejections: [],
+    inventory: {
+      index_sha256: "f".repeat(64),
+      fetched_at: createdAt,
+      fetched_online: false,
+    },
+    selection: {
+      selection_id: selectionId,
+      selection_reason: "highest-eligible",
+      cache_reused: true,
+      receipt_path: receiptPath,
+      policy_pack_root: policyRoot,
+      semantic_bundle_root: bundleRoot,
+      receipt,
+    },
+    created_at: createdAt,
+  };
+
+  writeExecutable(
+    bifrost,
+    `#!/usr/bin/env bash
+set -euo pipefail
+if [[ "\${1:-}" == pack-engine-profile ]]; then
+  printf '%s\\n' "$FAKE_PROFILE"
+else
+  exit 91
+fi
+`,
+  );
+  outcome.engine.executable_sha256 = digestBytes(fs.readFileSync(bifrost));
+  fs.writeFileSync(outcomePath, `${JSON.stringify(outcome, null, 2)}\n`);
+
+  writeExecutable(
+    installer,
+    `#!/usr/bin/env bash
+set -euo pipefail
+printf '%s\\n' "$*" >> "$FAKE_INSTALLER_LOG"
+case "\${1:-}" in
+  verify) printf 'verified\\n' ;;
+  install)
+    mkdir -p "$3"
+    python3 - "$3/catalog.db" <<'PY'
+import sqlite3
+import sys
+connection = sqlite3.connect(sys.argv[1])
+connection.execute("create table if not exists marker (value text)")
+connection.commit()
+connection.close()
+PY
+    ;;
+  list)
+    printf '%s\\n' '${JSON.stringify({ installed: OFFLINE_PACK_IDS.map((pack_id) => ({ pack_id })) })}'
+    ;;
+  *) exit 92 ;;
+esac
+`,
+  );
+  const missingReport = {
+    runs: [{
+      policy_id: OFFLINE_POLICY_ID,
+      findings: [],
+      completion: { type: "inconclusive", reasons: ["partial_discovery"] },
+      diagnostics: [{
+        code: { type: "evaluation_failure" },
+        severity: "warning",
+        impact: "run_incomplete",
+        family: "evaluation_failure",
+        message: "/analysis/sinks/entries/runtime-exec-command/selector call_binding_dispatch_partial UnsupportedExpression",
+      }],
+    }],
+    packs: { decisions: [] },
+  };
+  const positiveReport = {
+    runs: [{
+      policy_id: OFFLINE_POLICY_ID,
+      policy_hash: "d".repeat(64),
+      findings: [{ evidence: { evidence: {
+        source_endpoint: { entry_id: "environment-variable" },
+        sink_endpoint: { entry_id: "runtime-exec-command" },
+      } } }],
+      completion: { type: "complete" },
+      diagnostics: [],
+    }],
+    packs: { decisions: [{ pack: "bifrost.jdk@21.0.8", status: "selected" }] },
+  };
+  const negativeReport = {
+    runs: [{ policy_id: OFFLINE_POLICY_ID, findings: [], completion: { type: "inconclusive" } }],
+    packs: { decisions: [] },
+  };
+  const cleanReport = {
+    runs: [{ policy_id: OFFLINE_POLICY_ID, findings: [], completion: { type: "complete" }, diagnostics: [] }],
+    packs: { decisions: [] },
+  };
+  writeExecutable(
+    docker,
+    `#!/usr/bin/env bash
+set -euo pipefail
+printf '%s\\n' "$*" >> "$FAKE_DOCKER_LOG"
+case "$(wc -l < "$FAKE_DOCKER_LOG" | tr -d ' ')" in
+  1) printf '%s\\n' "$FAKE_MISSING_REPORT"; exit 2 ;;
+  2) printf '%s\\n' "$FAKE_POSITIVE_REPORT"; exit 0 ;;
+  *) printf '%s\\n' "$FAKE_NEGATIVE_REPORT"; exit 1 ;;
+esac
+`,
+  );
+
+  return {
+    bifrost,
+    installer,
+    bundleRoot,
+    policyRoot,
+    cacheRoot,
+    outcomePath,
+    javaHome,
+    scratchRoot,
+    dockerLog,
+    installerLog,
+    receipt,
+    outcome,
+    fakeBin,
+    profile: JSON.stringify(OFFLINE_PROFILE),
+    reports: {
+      missing: JSON.stringify(missingReport),
+      positive: JSON.stringify(positiveReport),
+      negative: JSON.stringify(negativeReport),
+      clean: JSON.stringify(cleanReport),
+    },
+  };
+}
+
+function runOfflineAcceptance(dir, mutate = () => {}) {
+  const fixture = offlineAcceptanceFixture(dir);
+  mutate(fixture);
+  fs.writeFileSync(fixture.outcomePath, `${JSON.stringify(fixture.outcome, null, 2)}\n`);
+  const result = run(BASH, [
+    offlineAcceptance,
+    fixture.bifrost,
+    fixture.installer,
+    fixture.bundleRoot,
+    fixture.policyRoot,
+    fixture.cacheRoot,
+    fixture.outcomePath,
+    fixture.javaHome,
+    fixture.scratchRoot,
+  ], {
+    env: {
+      PATH: `${fixture.fakeBin}:${process.env.PATH}`,
+      FAKE_PROFILE: fixture.profile,
+      FAKE_INSTALLER_LOG: fixture.installerLog,
+      FAKE_DOCKER_LOG: fixture.dockerLog,
+      FAKE_MISSING_REPORT: fixture.reports.missing,
+      FAKE_POSITIVE_REPORT: fixture.reports.positive,
+      FAKE_NEGATIVE_REPORT: fixture.reports.negative,
+    },
+  });
+  return { ...fixture, result };
+}
+
+test("offline semantic-pack acceptance requires the producer's eight exact inputs", () => {
+  withTempDir((dir) => {
+    const result = run(BASH, [offlineAcceptance, ...Array.from({ length: 7 }, () => dir)]);
+    assert.equal(result.status, 2);
+    assert.match(result.stderr, /usage: .*BUNDLE POLICY_ROOT CACHE OUTCOME_RECEIPT JAVA_HOME SCRATCH_ROOT/u);
+  });
+});
+
+test("offline semantic-pack acceptance passes provenance validation before its four scans", () => {
+  withTempDir((dir) => {
+    const fixture = runOfflineAcceptance(dir);
+    assert.equal(fixture.result.status, 0, fixture.result.stderr);
+    assert.equal(fs.readFileSync(fixture.dockerLog, "utf8").trim().split("\n").length, 4);
+    assert.match(fs.readFileSync(fixture.installerLog, "utf8"), /^verify /mu);
+    assert.match(fs.readFileSync(fixture.installerLog, "utf8"), /^install /mu);
+    const retained = JSON.parse(fs.readFileSync(path.join(fixture.scratchRoot, "open-packs-receipt.json"), "utf8"));
+    assert.equal(retained.receipt_schema_version, 3);
+    assert.equal(retained.selection_id, fixture.receipt.selection_id);
+    assert.equal(retained.outcome_schema_version, undefined);
+  });
+});
+
+for (const [label, mutate] of [
+  ["wrong executable digest", (fixture) => {
+    fixture.outcome.engine.executable_sha256 = "b".repeat(64);
+  }],
+  ["wrong selected profile", (fixture) => {
+    fixture.receipt.engine.profile = { ...fixture.receipt.engine.profile, build_identity: "b".repeat(40) };
+    fixture.outcome.selection.receipt = fixture.receipt;
+    fs.writeFileSync(
+      path.join(path.dirname(fixture.outcome.selection.receipt_path), "receipt.json"),
+      `${JSON.stringify(fixture.receipt, null, 2)}\n`,
+    );
+  }],
+  ["wrong selected roots", (fixture) => {
+    const wrongRoot = path.join(path.dirname(fixture.policyRoot), "wrong-rules");
+    fs.mkdirSync(wrongRoot, { recursive: true });
+    fixture.outcome.selection.policy_pack_root = wrongRoot;
+  }],
+]) {
+  test(`offline semantic-pack acceptance rejects ${label} before Docker or install`, () => {
+    withTempDir((dir) => {
+      const fixture = runOfflineAcceptance(dir, mutate);
+      assert.notEqual(fixture.result.status, 0);
+      assert.equal(fs.existsSync(fixture.dockerLog), false);
+      assert.equal(fs.existsSync(fixture.installerLog), false);
+    });
+  });
+}
+
+test("offline semantic-pack acceptance rejects a tampered selected manifest before Docker or install", () => {
+  withTempDir((dir) => {
+    const fixture = runOfflineAcceptance(dir, (value) => {
+      fs.writeFileSync(path.join(value.policyRoot, "bifrost.security", "manifest.json"), "tampered\n");
+    });
+    assert.notEqual(fixture.result.status, 0);
+    assert.match(fixture.result.stderr, /selected policy manifest digest disagrees/u);
+    assert.equal(fs.existsSync(fixture.dockerLog), false);
+    assert.equal(fs.existsSync(fixture.installerLog), false);
+  });
+});
+
+test("offline semantic-pack acceptance rejects an embedded receipt that disagrees with disk before Docker or install", () => {
+  withTempDir((dir) => {
+    const fixture = runOfflineAcceptance(dir, (value) => {
+      const onDiskReceipt = {
+        ...value.receipt,
+        source: { ...value.receipt.source, index_sha256: "e".repeat(64) },
+      };
+      fs.writeFileSync(
+        value.outcome.selection.receipt_path,
+        `${JSON.stringify(onDiskReceipt, null, 2)}\n`,
+      );
+    });
+    assert.notEqual(fixture.result.status, 0);
+    assert.match(fixture.result.stderr, /embedded receipt differs/u);
+    assert.equal(fs.existsSync(fixture.dockerLog), false);
+    assert.equal(fs.existsSync(fixture.installerLog), false);
+  });
+});
+
+test("offline semantic-pack acceptance rejects a complete clean missing-JAVA_HOME report", () => {
+  withTempDir((dir) => {
+    const fixture = runOfflineAcceptance(dir, (value) => {
+      value.reports.missing = value.reports.clean;
+    });
+    assert.notEqual(fixture.result.status, 0);
+    assert.match(fixture.result.stderr, /missing catalog produced a complete clean policy run/u);
+  });
+});
+
+test("offline semantic-pack acceptance rejects a complete clean corrupt-catalog report", () => {
+  withTempDir((dir) => {
+    const fixture = runOfflineAcceptance(dir, (value) => {
+      value.reports.negative = value.reports.clean;
+    });
+    assert.notEqual(fixture.result.status, 0);
+    assert.match(fixture.result.stderr, /corrupt catalog produced a complete clean policy run/u);
+  });
+});
+
 function withTempDir(body) {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bifrost-readiness-scripts."));
-  try {
-    return body(dir);
-  } finally {
-    fs.rmSync(dir, { recursive: true, force: true });
-  }
+  return withSharedTempDir(body, "bifrost-readiness-scripts.");
 }
 
 function git(cwd, ...args) {
-  return execFileSync("git", args, {
-    cwd,
-    encoding: "utf8",
-    env: {
-      ...process.env,
-      GIT_AUTHOR_NAME: "Test",
-      GIT_AUTHOR_EMAIL: "test@example.com",
-      GIT_COMMITTER_NAME: "Test",
-      GIT_COMMITTER_EMAIL: "test@example.com",
-    },
-  }).trim();
-}
-
-function writeFile(root, relativePath, contents) {
-  const target = path.join(root, relativePath);
-  fs.mkdirSync(path.dirname(target), { recursive: true });
-  fs.writeFileSync(target, contents, "utf8");
-}
-
-function writeExecutable(file, contents) {
-  fs.mkdirSync(path.dirname(file), { recursive: true });
-  fs.writeFileSync(file, contents, { mode: 0o755 });
+  return gitWithTestIdentity(cwd, args).trim();
 }
 
 function commit(root, message, files) {
@@ -94,10 +513,7 @@ function releaseMetadata(version, digest) {
 // A repository shaped like the public one: a compiled-input commit, then a
 // checksum-only correction on top of it.
 function releaseLikeRepository(dir) {
-  const origin = path.join(dir, "origin.git");
-  const work = path.join(dir, "work");
-  execFileSync("git", ["init", "-q", "--bare", "-b", "master", origin]);
-  execFileSync("git", ["init", "-q", "-b", "master", work]);
+  const { origin, work } = createBareGitPair(dir);
   git(work, "config", "commit.gpgsign", "false");
   git(work, "remote", "add", "origin", origin);
 
@@ -125,8 +541,16 @@ test("the release crate inventory matches the workspace members plus the facade"
   const manifest = fs.readFileSync(path.join(repoRoot, "Cargo.toml"), "utf8");
   const members = [...manifest.matchAll(/^\s*"crates\/([\w-]+)",\s*$/gmu)].map((match) => match[1]);
   assert.ok(members.length > 0, "expected workspace members");
+  // A member that opts out of publication (such as a test-only proc-macro
+  // crate) is not part of the release.
+  const published = members.filter(
+    (member) =>
+      !/^publish\s*=\s*false\s*$/mu.test(
+        fs.readFileSync(path.join(repoRoot, "crates", member, "Cargo.toml"), "utf8"),
+      ),
+  );
 
-  const expected = [...members.map((member) => `brokk-${member}`), "brokk-bifrost"];
+  const expected = [...published.map((member) => `brokk-${member}`), "brokk-bifrost"];
   assert.deepEqual([...crates].sort(), expected.sort());
   assert.equal(crates.at(-1), "brokk-bifrost", "the facade must be packaged last");
 });

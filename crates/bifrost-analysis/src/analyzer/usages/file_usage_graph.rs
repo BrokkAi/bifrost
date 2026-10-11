@@ -230,12 +230,11 @@ fn file_graph(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::{ProjectFile, file_graph};
+
     fn file(path: &str) -> ProjectFile {
-        ProjectFile::new(
-            std::env::current_dir().expect("test working directory must be available"),
-            path,
-        )
+        let root = std::env::current_dir().expect("test working directory must be available");
+        crate::analyzer::common::project_file_for_test(&root, path)
     }
 
     #[test]

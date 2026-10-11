@@ -35,6 +35,60 @@ pub struct HandlerBodyShape {
     pub try_body: Option<Range>,
 }
 
+/// Whether a C# handler rethrows the exception selected by its catch clause.
+///
+/// `throw new ...` and other throws are deliberately represented by `None`:
+/// they do not propagate the caught exception and therefore do not suppress a
+/// catch-all finding. `Unknown` is reserved for a recovered handler body.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HandlerRethrowKind {
+    None,
+    Bare,
+    CaughtVariable,
+    Both,
+    Unknown,
+}
+
+impl HandlerRethrowKind {
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Bare => "bare",
+            Self::CaughtVariable => "caught_variable",
+            Self::Both => "both",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
+/// The C#-specific facts that extend the shared handler body shape.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CSharpCatchBodyFacts {
+    pub shape: HandlerBodyShape,
+    pub rethrow: HandlerRethrowKind,
+}
+
+/// One failure branch selected by a language-native failure-handler hook.
+///
+/// Native failure syntax does not necessarily have a normalized `Catch` node
+/// (Rust `match` arms are one example). The structural query engine keeps the
+/// shared result vocabulary while the language adapter supplies the exact
+/// branch range and its body shape.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NativeFailureBranch {
+    pub handler: Range,
+    pub shape: HandlerBodyShape,
+}
+
+/// Scala's native catch syntax contains one or more case clauses. The
+/// structural fact selects the enclosing `catch_clause`, while policy needs
+/// one state row for each case so a mixed catch reports only its empty cases.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ScalaCatchBodyShape {
+    pub handler: Range,
+    pub shape: HandlerBodyShape,
+}
+
 /// How a grammar attaches the handler body to the handler node.
 #[derive(Clone, Copy)]
 enum HandlerBody {
@@ -182,7 +236,78 @@ pub fn python_except_body_shape(syntax: &PreparedSyntaxTree, catch: Range) -> Ha
 /// Classify an exact C# `catch` clause, including one with a `when` filter:
 /// a filter selects the exception but does not handle it.
 pub fn csharp_catch_body_shape(syntax: &PreparedSyntaxTree, catch: Range) -> HandlerBodyShape {
-    handler_body_shape(syntax, catch, &CSHARP)
+    csharp_catch_body_facts(syntax, catch).shape
+}
+
+/// Classify the exact C# catch body and whether it propagates its caught
+/// exception. Nested catch clauses and nested callable bodies are separate
+/// handlers/scopes, so their throw statements do not count for this handler.
+pub fn csharp_catch_body_facts(syntax: &PreparedSyntaxTree, catch: Range) -> CSharpCatchBodyFacts {
+    let shape = handler_body_shape(syntax, catch, &CSHARP);
+    let rethrow = match shape.state {
+        HandlerBodyState::Open(_) => HandlerRethrowKind::Unknown,
+        HandlerBodyState::Empty => HandlerRethrowKind::None,
+        HandlerBodyState::Nonempty => csharp_catch_rethrow_kind(syntax, catch),
+    };
+    CSharpCatchBodyFacts { shape, rethrow }
+}
+
+fn csharp_catch_rethrow_kind(syntax: &PreparedSyntaxTree, catch: Range) -> HandlerRethrowKind {
+    let Some(catch_node) = exact_handler_node(syntax, catch, &CSHARP) else {
+        return HandlerRethrowKind::Unknown;
+    };
+    let Some(body) = catch_node.child_by_field_name("body") else {
+        return HandlerRethrowKind::Unknown;
+    };
+    let caught_name = named_child_kind(catch_node, "catch_declaration")
+        .and_then(|declaration| declaration.child_by_field_name("name"))
+        .map(|name| {
+            name.utf8_text(syntax.source().as_bytes())
+                .unwrap_or_default()
+        });
+    let mut has_bare = false;
+    let mut has_caught_variable = false;
+    let mut stack = vec![body];
+    while let Some(node) = stack.pop() {
+        let mut cursor = node.walk();
+        for child in node.named_children(&mut cursor) {
+            if matches!(
+                child.kind(),
+                "catch_clause"
+                    | "method_declaration"
+                    | "constructor_declaration"
+                    | "local_function_statement"
+                    | "lambda_expression"
+                    | "anonymous_method_expression"
+            ) {
+                continue;
+            }
+            if child.kind() == "throw_statement" {
+                let mut expression_cursor = child.walk();
+                match child.named_children(&mut expression_cursor).next() {
+                    None => has_bare = true,
+                    Some(expression)
+                        if expression.kind() == "identifier"
+                            && caught_name.is_some_and(|name| {
+                                expression
+                                    .utf8_text(syntax.source().as_bytes())
+                                    .is_ok_and(|value| value == name)
+                            }) =>
+                    {
+                        has_caught_variable = true;
+                    }
+                    Some(_) => {}
+                }
+            }
+            stack.push(child);
+        }
+    }
+    match (has_bare, has_caught_variable) {
+        (true, true) => HandlerRethrowKind::Both,
+        (true, false) => HandlerRethrowKind::Bare,
+        (false, true) => HandlerRethrowKind::CaughtVariable,
+        (false, false) => HandlerRethrowKind::None,
+    }
 }
 
 /// Classify an exact PHP `catch` clause.
@@ -208,11 +333,16 @@ pub fn ruby_rescue_body_shape(syntax: &PreparedSyntaxTree, catch: Range) -> Hand
     handler_body_shape(syntax, catch, &RUBY)
 }
 
-fn handler_body_shape(
+/// Classify the case clauses in one exact Scala `catch_clause`.
+///
+/// A braced or indented catch is a pattern match whose cases are independent
+/// failure handlers. A catch whose body is an expression has no case clause
+/// and remains open because the expression form is outside this structural
+/// no-op rule. A unit literal is the one Scala expression that is a no-op.
+pub fn scala_catch_body_shapes(
     syntax: &PreparedSyntaxTree,
     catch: Range,
-    grammar: &HandlerSyntax,
-) -> HandlerBodyShape {
+) -> Vec<ScalaCatchBodyShape> {
     let open = |gap, body, try_body| HandlerBodyShape {
         state: HandlerBodyState::Open(gap),
         body,
@@ -223,11 +353,142 @@ fn handler_body_shape(
         .root_node()
         .named_descendant_for_byte_range(catch.start_byte, catch.end_byte)
         .filter(|node| {
-            grammar.handler_kinds.contains(&node.kind())
+            node.kind() == "catch_clause"
                 && node.start_byte() == catch.start_byte
                 && node.end_byte() == catch.end_byte
         })
     else {
+        return vec![ScalaCatchBodyShape {
+            handler: catch,
+            shape: open(HandlerBodyGap::SyntaxRecovery, None, None),
+        }];
+    };
+
+    let try_node = node
+        .parent()
+        .filter(|parent| parent.kind() == "try_expression");
+    let try_body = try_node
+        .and_then(|parent| parent.child_by_field_name("body"))
+        .map(brokk_bifrost_core::analyzer::tree_walk::node_range);
+    let syntax_recovered = node.has_error()
+        || try_node.is_some_and(|parent| parent.has_error())
+        || has_error_ancestor(node);
+
+    let cases = brokk_bifrost_core::analyzer::exception_handling::collect_nodes_by_kind(
+        node,
+        "case_clause",
+    )
+    .into_iter()
+    .filter(|case| scala_direct_case_matches(*case, node))
+    .collect::<Vec<_>>();
+
+    if cases.is_empty() {
+        let body = node
+            .child_by_field_name("body")
+            .map(brokk_bifrost_core::analyzer::tree_walk::node_range);
+        return vec![ScalaCatchBodyShape {
+            handler: catch,
+            shape: open(
+                if syntax_recovered {
+                    HandlerBodyGap::SyntaxRecovery
+                } else if try_body.is_none() {
+                    HandlerBodyGap::MissingTryBody
+                } else {
+                    HandlerBodyGap::MissingBody
+                },
+                body,
+                try_body,
+            ),
+        }];
+    }
+
+    cases
+        .into_iter()
+        .map(|case| {
+            let body_children = scala_case_body_children(case);
+            let body = span_of_nodes(&body_children);
+            let state = if syntax_recovered || case.has_error() || has_error_ancestor(case) {
+                HandlerBodyState::Open(HandlerBodyGap::SyntaxRecovery)
+            } else if try_body.is_none() {
+                HandlerBodyState::Open(HandlerBodyGap::MissingTryBody)
+            } else if body_children
+                .iter()
+                .any(|child| child.kind() != "unit" && !child.is_extra())
+            {
+                HandlerBodyState::Nonempty
+            } else {
+                HandlerBodyState::Empty
+            };
+            ScalaCatchBodyShape {
+                handler: brokk_bifrost_core::analyzer::tree_walk::node_range(case),
+                shape: HandlerBodyShape {
+                    state,
+                    body,
+                    try_body,
+                },
+            }
+        })
+        .collect()
+}
+
+fn scala_case_body_children<'tree>(case: Node<'tree>) -> Vec<Node<'tree>> {
+    let mut cursor = case.walk();
+    case.children_by_field_name("body", &mut cursor)
+        .filter(Node::is_named)
+        .collect()
+}
+
+fn span_of_nodes(nodes: &[Node<'_>]) -> Option<Range> {
+    let first = nodes.first()?;
+    let last = nodes.last()?;
+    Some(Range {
+        start_byte: first.start_byte(),
+        end_byte: last.end_byte(),
+        start_line: first.start_position().row + 1,
+        end_line: last.end_position().row + 1,
+    })
+}
+
+fn scala_direct_case_matches(case: Node<'_>, catch: Node<'_>) -> bool {
+    let mut ancestor = case.parent();
+    while let Some(parent) = ancestor {
+        if matches!(parent.kind(), "case_block" | "indented_cases") {
+            return parent.parent().is_some_and(|owner| {
+                owner.kind() == "catch_clause"
+                    && owner.start_byte() == catch.start_byte()
+                    && owner.end_byte() == catch.end_byte()
+            });
+        }
+        if parent.kind() == "catch_clause" {
+            return false;
+        }
+        ancestor = parent.parent();
+    }
+    false
+}
+
+fn has_error_ancestor(node: Node<'_>) -> bool {
+    let mut ancestor = node.parent();
+    while let Some(parent) = ancestor {
+        if parent.is_error() {
+            return true;
+        }
+        ancestor = parent.parent();
+    }
+    false
+}
+
+fn handler_body_shape(
+    syntax: &PreparedSyntaxTree,
+    catch: Range,
+    grammar: &HandlerSyntax,
+) -> HandlerBodyShape {
+    let open = |gap, body, try_body| HandlerBodyShape {
+        state: HandlerBodyState::Open(gap),
+        body,
+        try_body,
+    };
+    let Some(node) = exact_handler_node(syntax, catch, grammar) else {
         return open(HandlerBodyGap::SyntaxRecovery, None, None);
     };
     // A second body child is recovery, not a choice between bodies.
@@ -315,6 +576,28 @@ fn handler_body_shape(
     }
 }
 
+fn exact_handler_node<'tree>(
+    syntax: &'tree PreparedSyntaxTree,
+    catch: Range,
+    grammar: &HandlerSyntax,
+) -> Option<Node<'tree>> {
+    syntax
+        .tree()
+        .root_node()
+        .named_descendant_for_byte_range(catch.start_byte, catch.end_byte)
+        .filter(|node| {
+            grammar.handler_kinds.contains(&node.kind())
+                && node.start_byte() == catch.start_byte
+                && node.end_byte() == catch.end_byte
+        })
+}
+
+fn named_child_kind<'tree>(node: Node<'tree>, kind: &str) -> Option<Node<'tree>> {
+    let mut cursor = node.walk();
+    node.named_children(&mut cursor)
+        .find(|child| child.kind() == kind)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -365,25 +648,6 @@ mod tests {
             assert!(shape.body.is_some(), "{source}");
             assert!(shape.try_body.is_some(), "{source}");
         }
-    }
-
-    #[test]
-    fn java_catch_with_any_immediate_statement_is_nonempty() {
-        for source in [
-            "class A { void f(Exception problem) { try { throw problem; } catch (Exception e) { throw e; } } }",
-            "class A { void f(Exception problem) { try { throw problem; } catch (Exception e) { int x = 1; } } }",
-            "class A { void f(Exception problem) { try { throw problem; } catch (Exception e) { class Inner {} } } }",
-        ] {
-            let shapes = catch_shapes(source);
-            let [shape] = shapes.as_slice() else {
-                panic!("one native catch clause: {source}");
-            };
-            assert_eq!(shape.state, HandlerBodyState::Nonempty, "{source}");
-        }
-        assert!(
-            catch_shapes("class A { void f() { try {} finally {} } }").is_empty(),
-            "finally is not a catch handler"
-        );
     }
 
     fn shapes_with(
@@ -441,6 +705,112 @@ mod tests {
         .into_iter()
         .map(|shape| shape.state)
         .collect()
+    }
+
+    fn scala_shapes(source: &str) -> Vec<ScalaCatchBodyShape> {
+        let mut parser = tree_sitter::Parser::new();
+        parser
+            .set_language(&brokk_bifrost_jvm::scala::language::LANGUAGE.into())
+            .expect("Scala grammar loads");
+        let tree = parser.parse(source, None).expect("Scala source parses");
+        let catches = brokk_bifrost_core::analyzer::exception_handling::collect_nodes_by_kind(
+            tree.root_node(),
+            "catch_clause",
+        )
+        .into_iter()
+        .map(node_range)
+        .collect::<Vec<_>>();
+        let prepared = PreparedSyntaxTree::new(
+            PreparedSyntaxSource::Exact(Arc::from(source)),
+            tree,
+            vec![0],
+            LanguageDialect::Standard(Language::Scala),
+            PreparedSourceOrigin::Disk,
+            None,
+        );
+        catches
+            .into_iter()
+            .flat_map(|catch| scala_catch_body_shapes(&prepared, catch))
+            .collect()
+    }
+
+    #[test]
+    fn scala_catch_cases_classify_each_native_handler_shape() {
+        use HandlerBodyState::{Empty, Nonempty, Open};
+
+        let empty = scala_shapes(
+            "object A { def f(): Unit = { try { work() } catch { case e: Exception => } } }",
+        );
+        assert_eq!(empty.len(), 1);
+        assert_eq!(empty[0].shape.state, Empty);
+        assert!(empty[0].shape.try_body.is_some());
+
+        let unit = scala_shapes(
+            "object A { def f(): Unit = { try { work() } catch { case e: Exception => () } } }",
+        );
+        assert_eq!(unit.len(), 1);
+        assert_eq!(unit[0].shape.state, Empty);
+
+        let guarded = scala_shapes(
+            "object A { def f(): Unit = { try { work() } catch { case e: IOException if ignore => } } }",
+        );
+        assert_eq!(guarded.len(), 1);
+        assert_eq!(guarded[0].shape.state, Empty);
+
+        let mixed = scala_shapes(
+            "object A { def f(): Unit = { try { work() } catch { case ignored: Exception =>; case handled: RuntimeException => report(handled) } } }",
+        );
+        assert_eq!(
+            mixed
+                .iter()
+                .map(|item| item.shape.state)
+                .collect::<Vec<_>>(),
+            vec![Empty, Nonempty]
+        );
+
+        for source in [
+            "object A { def f(): Unit = { try { work() } catch { case e: Exception => throw e } } }",
+            "object A { def f(): Unit = { try { work() } catch { case e: Exception => report(e) } } }",
+            "object A { def f(): Unit = { try { work() } catch { case e: Exception => None } } }",
+        ] {
+            let shapes = scala_shapes(source);
+            assert_eq!(shapes.len(), 1, "{source}");
+            assert_eq!(shapes[0].shape.state, Nonempty, "{source}");
+        }
+
+        let expression =
+            scala_shapes("object A { def f(): Unit = { try { work() } catch handler } }");
+        assert_eq!(expression.len(), 1);
+        assert_eq!(expression[0].shape.state, Open(HandlerBodyGap::MissingBody));
+
+        let match_expression = scala_shapes(
+            "object A { def f(): Unit = { try { work() } catch fallback() match { case e: Exception => () } } }",
+        );
+        assert_eq!(match_expression.len(), 1);
+        assert_eq!(
+            match_expression[0].shape.state,
+            Open(HandlerBodyGap::MissingBody)
+        );
+
+        assert!(
+            scala_shapes("object A { def f(): Unit = { try { work() } finally cleanup() } }")
+                .is_empty()
+        );
+        assert!(
+            scala_shapes(
+                "object A { def f(): Unit = { Try(work()).recover { case e: Exception => } } }"
+            )
+            .is_empty()
+        );
+
+        let recovered = scala_shapes(
+            "object A { def f(): Unit = { try { work() } catch { case e: Exception => if ( } } }",
+        );
+        assert_eq!(recovered.len(), 1);
+        assert_eq!(
+            recovered[0].shape.state,
+            Open(HandlerBodyGap::SyntaxRecovery)
+        );
     }
 
     #[test]
@@ -508,6 +878,25 @@ mod tests {
         assert_eq!(
             shape.state,
             HandlerBodyState::Open(HandlerBodyGap::SyntaxRecovery)
+        );
+    }
+
+    #[test]
+    fn java_catch_with_any_immediate_statement_is_nonempty() {
+        for source in [
+            "class A { void f(Exception problem) { try { throw problem; } catch (Exception e) { throw e; } } }",
+            "class A { void f(Exception problem) { try { throw problem; } catch (Exception e) { int x = 1; } } }",
+            "class A { void f(Exception problem) { try { throw problem; } catch (Exception e) { class Inner {} } } }",
+        ] {
+            let shapes = catch_shapes(source);
+            let [shape] = shapes.as_slice() else {
+                panic!("one native catch clause: {source}");
+            };
+            assert_eq!(shape.state, HandlerBodyState::Nonempty, "{source}");
+        }
+        assert!(
+            catch_shapes("class A { void f() { try {} finally {} } }").is_empty(),
+            "finally is not a catch handler"
         );
     }
 }

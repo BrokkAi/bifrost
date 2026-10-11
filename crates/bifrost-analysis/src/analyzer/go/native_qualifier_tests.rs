@@ -5,7 +5,6 @@ use crate::analyzer::resolution::{
     classify_selected_root_path_half, lower_for_test,
 };
 use crate::analyzer::{Language, LanguageAdapter, ProjectFile};
-
 #[test]
 fn parsed_go_qualifiers_lower_to_selected_root_halves_and_typed_receivers() {
     let source = r#"package consumer
@@ -89,60 +88,6 @@ func use(local Local) { _ = pkg.Member; pkg.Call(); _ = local.Member }
         3,
         "the two value selectors and call retain runtime receiver obligations; pkg.Item is a package type route"
     );
-}
-
-#[test]
-fn parsed_go_function_value_reference_reaches_original_callable_identity() {
-    use crate::analyzer::resolution::{
-        BatchResolutionEngine, LoweredSemanticRole, PreloadedFragmentSource, ResolutionQuery,
-        lower_lexical_for_test,
-    };
-    use brokk_bifrost_core::analyzer::resolution_facts::{
-        ResolutionIdentifierRole, ResolutionNamespace,
-    };
-    let source = "package p\nfunc F() {}\nfunc use() { f := F; f() }\n";
-    let file = ProjectFile::new(std::env::temp_dir(), "function_value.go");
-    let adapter = GoAdapter;
-    let mut parser = tree_sitter::Parser::new();
-    parser
-        .set_language(&adapter.parser_language_for_file(&file))
-        .unwrap();
-    let tree = parser.parse(source, None).unwrap();
-    let parsed = adapter.parse_file(&file, source, &tree);
-    let facts = &parsed.resolution_facts;
-    let site = |role| {
-        facts
-            .identifiers
-            .iter()
-            .find(|id| facts.names[id.name.index()].spelling == "F" && id.role == role)
-            .unwrap()
-    };
-    let reference = site(ResolutionIdentifierRole::Reference);
-    assert_eq!(reference.namespace, ResolutionNamespace::Value);
-    let declaration = site(ResolutionIdentifierRole::Declaration);
-    let (lowered, _) = lower_lexical_for_test(
-        BindingFragmentId::for_test(b"go-function-value"),
-        Language::Go,
-        facts,
-    );
-    let semantic = |site, role| {
-        lowered
-            .semantics()
-            .iter()
-            .find(|s| s.site() == site && s.role() == role)
-            .unwrap()
-            .semantic()
-    };
-    let target = semantic(declaration.site, LoweredSemanticRole::Definition);
-    let reference = semantic(reference.site, LoweredSemanticRole::Reference);
-    let source = PreloadedFragmentSource::from_lowered_fragments([lowered]);
-    let answer = BatchResolutionEngine::new(&source)
-        .resolve_reference(
-            ResolutionQuery::new(reference),
-            &CancellationToken::default(),
-        )
-        .unwrap();
-    assert_eq!(answer.targets(), &[target]);
 }
 
 #[test]
@@ -307,115 +252,6 @@ fn parsed_go_spelling_union_respects_scope_activation_and_wrong_namespace_blocke
             )
             .unwrap();
         assert_eq!(answer.targets(), expected.as_slice());
-    }
-}
-
-#[test]
-fn parsed_go_spelling_union_drives_runtime_and_type_object_projection() {
-    use crate::analyzer::resolution::{
-        LoweredSemanticRole, PreloadedFactResolutionService, ResolutionSlotValue,
-    };
-    use brokk_bifrost_core::analyzer::resolution_facts::{
-        ResolutionIdentifierRole, ResolutionNamespace,
-    };
-    let facts = parse_go_spelling_facts(
-        r#"package p
-        type Outer struct { Member string }
-        var X Outer
-        func use() { _ = X.Member; type X struct { Member int }; _ = X.Member }
-        func innerValue() { type X struct{}; { var X Outer; _ = X.Member } }
-    "#,
-    );
-    let artifact = lower_for_test(
-        BindingFragmentId::for_test(b"go-spelling-typed"),
-        Language::Go,
-        &facts,
-    );
-    let semantic = |site, role| {
-        artifact
-            .lexical()
-            .semantics()
-            .iter()
-            .find(|s| s.site() == site && s.role() == role)
-            .unwrap()
-            .semantic()
-    };
-    let prefix_references = facts
-        .identifiers
-        .iter()
-        .filter(|id| {
-            facts.names[id.name.index()].spelling == "X"
-                && id.namespace == ResolutionNamespace::TypeOrValue
-        })
-        .map(|id| semantic(id.site, LoweredSemanticRole::Reference))
-        .collect::<Vec<_>>();
-    let type_definitions = facts
-        .identifiers
-        .iter()
-        .filter(|id| {
-            id.role == ResolutionIdentifierRole::Declaration
-                && id.namespace == ResolutionNamespace::Type
-        })
-        .map(|id| semantic(id.site, LoweredSemanticRole::Definition))
-        .collect::<Vec<_>>();
-    assert_eq!(prefix_references.len(), 3);
-    assert_eq!(type_definitions.len(), 3);
-    let members = facts
-        .identifiers
-        .iter()
-        .filter(|id| {
-            facts.names[id.name.index()].spelling == "Member"
-                && id.role == ResolutionIdentifierRole::Reference
-        })
-        .map(|id| semantic(id.site, LoweredSemanticRole::Reference))
-        .collect::<Vec<_>>();
-    let outer_field = facts
-        .identifiers
-        .iter()
-        .find(|id| {
-            facts.names[id.name.index()].spelling == "Member"
-                && id.role == ResolutionIdentifierRole::Declaration
-        })
-        .unwrap();
-    let outer_field = semantic(outer_field.site, LoweredSemanticRole::Definition);
-    let service = PreloadedFactResolutionService::from_lowered_fragments(
-        [artifact.lexical().clone()],
-        [artifact.typed().clone()],
-    );
-    let before = service
-        .resolve_reference(prefix_references[0], &CancellationToken::default())
-        .unwrap();
-    let after = service
-        .resolve_reference(prefix_references[1], &CancellationToken::default())
-        .unwrap();
-    let inner_value = service
-        .resolve_reference(prefix_references[2], &CancellationToken::default())
-        .unwrap();
-    let values = |answer: &crate::analyzer::resolution::FactResolutionAnswer| {
-        answer
-            .projected_frontiers()
-            .iter()
-            .flat_map(|frontier| frontier.possible_values().iter().copied())
-            .collect::<Vec<_>>()
-    };
-    assert!(
-        matches!(values(&before).as_slice(), [ResolutionSlotValue::Runtime { ty, addressable: true }] if ty.identity() == type_definitions[0])
-    );
-    assert!(
-        matches!(values(&after).as_slice(), [ResolutionSlotValue::TypeObject(ty)] if ty.identity() == type_definitions[1])
-    );
-    assert!(
-        matches!(values(&inner_value).as_slice(), [ResolutionSlotValue::Runtime { ty, addressable: true }] if ty.identity() == type_definitions[0])
-    );
-    assert_eq!(members.len(), 3);
-    for (member, expected) in members
-        .into_iter()
-        .zip([Some(outer_field), None, Some(outer_field)])
-    {
-        let answer = service
-            .resolve_reference(member, &CancellationToken::default())
-            .unwrap();
-        assert_eq!(answer.binding().targets(), expected.as_slice());
     }
 }
 

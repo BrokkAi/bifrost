@@ -26,19 +26,17 @@ use crate::analyzer::usages::call_shape::call_shape_for_call;
 use crate::analyzer::usages::get_definition::CallSyntaxKind;
 use crate::analyzer::{CodeUnit, CodeUnitIndex, IAnalyzer, Language};
 use crate::path_utils::rel_path_string;
-use brokk_bifrost_core::analyzer::structural::callable::CallShapeCoverage;
 use brokk_bifrost_core::analyzer::usages::receiver_analysis::ReceiverAnalysisBudget;
 use brokk_bifrost_core::analyzer::usages::resolution_session::{
     BoundedResolution, ResolutionSession,
 };
 
 fn diagnostic(kind: &str, message: impl Into<String>, caller: &CodeUnit) -> CallRelationDiagnostic {
-    CallRelationDiagnostic {
-        code: CallRelationDiagnosticCode::AnalysisFailed,
-        message: message.into(),
-        context: caller.fq_name().to_string(),
-        reason_kind: Some(kind.to_owned()),
-    }
+    CallRelationDiagnostic::analysis_failed(
+        message.into(),
+        caller.fq_name().to_string(),
+        kind.to_owned(),
+    )
 }
 
 fn failed(kind: &str, message: impl Into<String>, caller: &CodeUnit) -> CallRelationResult {
@@ -79,6 +77,7 @@ pub(super) fn outgoing(
         );
         result.truncated = true;
         result.diagnostics[0].code = CallRelationDiagnosticCode::BudgetExhausted;
+        result.diagnostics[0].reason_kind = None;
         return result;
     }
     let Some(source) = rust.indexed_source(caller.source()) else {
@@ -96,6 +95,7 @@ pub(super) fn outgoing(
         );
         result.truncated = true;
         result.diagnostics[0].code = CallRelationDiagnosticCode::BudgetExhausted;
+        result.diagnostics[0].reason_kind = None;
         return result;
     }
     let Some(caller_range) = rust
@@ -221,13 +221,13 @@ pub(super) fn outgoing(
                     if !session.scope_step() || cancellation.is_cancelled() {
                         break;
                     }
-                    if node.kind != NormalizedKind::Call || node.range.start_byte < caller_range.start_byte
+                    if !node.kind.satisfies(NormalizedKind::Call) || node.range.start_byte < caller_range.start_byte
                         || node.range.end_byte > caller_range.end_byte {
                         continue;
                     }
                     let shape = call_shape_for_call(&facts, caller.source(), u32::try_from(node_id).expect("source node ID fits u32"))
                         .expect("a structured Call node has a call shape");
-                    if shape.outcome.coverage != CallShapeCoverage::Exact {
+                    if !shape.outcome.coverage.is_exact() {
                         result.diagnostics.push(diagnostic("native_call_shape_incomplete", format!("call shape is {:?} at {:?}", shape.outcome.coverage, shape.outcome.range), caller));
                         continue;
                     }
@@ -271,7 +271,7 @@ pub(super) fn outgoing(
                             code: CallRelationDiagnosticCode::TargetsAmbiguous,
                             message: format!("native call at {callee_range:?} has ambiguous canonical targets: {:?}", answer.resolution.binding().targets()),
                             context: caller.fq_name(),
-                            reason_kind: Some("native_call_targets_ambiguous".to_owned()),
+                            reason_kind: None,
                         });
                     }
                     if !answer.lexical_definitions.is_empty() || answer.definitions.is_empty() {
@@ -283,6 +283,7 @@ pub(super) fn outgoing(
                         result.truncated = true;
                         let mut omitted = diagnostic("native_call_candidates_omitted", format!("call at {callee_range:?} exceeds its candidate bound"), caller);
                         omitted.code = CallRelationDiagnosticCode::CandidateLimit;
+                        omitted.reason_kind = None;
                         result.diagnostics.push(omitted);
                     }
                     for callee in definitions.into_iter().take(limits.max_candidates) {
@@ -327,6 +328,7 @@ pub(super) fn outgoing(
             );
             result.truncated = true;
             result.diagnostics[0].code = CallRelationDiagnosticCode::BudgetExhausted;
+            result.diagnostics[0].reason_kind = None;
             result
         }
         BoundedResolution::Complete {

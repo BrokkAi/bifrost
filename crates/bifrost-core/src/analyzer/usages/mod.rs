@@ -26,3 +26,11 @@ pub mod same_owner;
 pub mod scan_scope;
 
 pub use graph_core::{ImportEdge, ImportEdgeKind};
+
+/// Remove one nested scope while keeping the root scope in place.
+pub fn exit_nested_scope<T>(scopes: &mut Vec<T>) {
+    if scopes.len() > 1 {
+        let nested_len = scopes.len() - 1;
+        scopes.truncate(nested_len);
+    }
+}

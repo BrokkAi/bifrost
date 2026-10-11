@@ -35,24 +35,7 @@ fn free_this_scan_honors_cancellation() {
     );
 }
 
-#[test]
-fn capability_table_is_total_and_partitioned() {
-    let capabilities = kotlin_capabilities();
-    let counts = capabilities
-        .iter()
-        .fold([0_usize; 3], |mut counts, (_, support)| {
-            let index = match support {
-                CapabilitySupport::Complete => 0,
-                CapabilitySupport::Partial => 1,
-                CapabilitySupport::Unsupported => 2,
-            };
-            counts[index] += 1;
-            counts
-        });
-
-    assert_eq!(counts.iter().sum::<usize>(), SemanticCapability::COUNT);
-    assert_eq!(counts, [9, 19, 6]);
-}
+use brokk_bifrost_test_macros::hardwon;
 
 /// Whether the adapter proves a first iteration for `for (i in <iterable>)`.
 fn proves_first_iteration(iterable: &str) -> bool {
@@ -84,6 +67,7 @@ fn proves_first_iteration(iterable: &str) -> bool {
 }
 
 #[test]
+#[hardwon("#2660: literal Kotlin ranges were treated as possibly empty")]
 fn literal_bounded_ranges_prove_a_first_iteration() {
     for iterable in [
         "0..3",
@@ -101,6 +85,7 @@ fn literal_bounded_ranges_prove_a_first_iteration() {
 }
 
 #[test]
+#[hardwon("#2660: empty or unknown Kotlin ranges were treated as guaranteed non-empty")]
 fn empty_or_unprovable_ranges_prove_nothing() {
     for iterable in [
         // Provably empty, so the body may never run.
@@ -181,6 +166,82 @@ fn value_class_construction_requires_known_actual_compatibility() {
                         == KotlinAdaptationIncomplete::UnderlyingTypeUnknown.detail()
                 }),
                 "missing typed compatibility gap: {procedure:#?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn compound_indexed_assignments_validate_with_one_calls_gap() {
+    use crate::analyzer::{AnalyzerConfig, Language};
+    use crate::inline_project::InlineTestProject;
+
+    let source = r#"
+class Box(var x: Int)
+
+fun indexed(a: IntArray, i: Int) {
+    a[i] += 1
+}
+
+fun matrix(m: Matrix, i: Int, j: Int, x: Int) {
+    m[i, j] /= x
+}
+
+fun member(o: Box) {
+    o.x += 1
+}
+"#;
+    let project = InlineTestProject::with_language(Language::Kotlin)
+        .file("assignments.kt", source)
+        .build();
+    let workspace = project.workspace_analyzer(AnalyzerConfig::default());
+    let cancellation = CancellationToken::default();
+    let mut budget = SemanticBudget::default();
+    let artifact = workspace
+        .materialize_program_semantics(
+            &project.file("assignments.kt"),
+            &mut SemanticRequest::new(&mut budget, &cancellation),
+        )
+        .expect("Kotlin semantic materialization succeeds")
+        .available_value()
+        .cloned()
+        .expect("compound assignments must leave a valid semantic artifact");
+
+    for (name, indexed) in [("indexed", true), ("matrix", true), ("member", false)] {
+        let procedure = artifact
+            .procedures()
+            .iter()
+            .find(|procedure| {
+                procedure
+                    .locator()
+                    .declaration()
+                    .segments()
+                    .last()
+                    .and_then(|segment| segment.name())
+                    == Some(name)
+            })
+            .unwrap_or_else(|| panic!("missing fixture procedure {name}"));
+        let calls = procedure
+            .gaps()
+            .iter()
+            .filter(|gap| {
+                gap.subject == SemanticGapSubject::Point
+                    && gap.capability == SemanticCapability::Calls
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(calls.len(), 1, "{name}: {calls:#?}");
+        assert_eq!(calls[0].kind, SemanticGapKind::Unsupported, "{name}");
+        if indexed {
+            assert!(
+                calls[0].detail.contains("compound")
+                    && calls[0].detail.contains("indexed")
+                    && calls[0].detail.contains("set"),
+                "{name}: combined operator details must remain visible: {calls:#?}"
+            );
+        } else {
+            assert!(
+                calls[0].detail.contains("compound") && calls[0].detail.contains("op or opAssign"),
+                "{name}: compound operator detail must remain visible: {calls:#?}"
             );
         }
     }

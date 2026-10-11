@@ -1,5 +1,4 @@
 mod adapter;
-mod cache;
 mod call_conversion;
 mod cargo_routes;
 mod clones;
@@ -8,6 +7,8 @@ mod dependency_discovery;
 pub(crate) mod diagnostics;
 mod external;
 mod fact_catch_up;
+mod file_dependency_evidence;
+mod format_macro_dispatch;
 pub(crate) mod generated_model;
 mod graph_support;
 mod hierarchy;
@@ -19,6 +20,7 @@ pub(crate) use native_graph::{
     RustNativeWorkspaceGraphOutcome, build_rust_native_workspace_graph_for_files,
 };
 pub(crate) mod external_calls;
+pub mod failure_handlers;
 mod native_outgoing;
 pub(crate) mod native_points;
 mod native_rename;
@@ -29,9 +31,23 @@ pub(crate) mod selected_projection;
 pub(crate) mod selected_reverse;
 pub(crate) mod selected_shadow;
 mod semantic;
+mod site_activation;
+pub(crate) use semantic::RustReceiverTypeFacts;
+#[cfg(test)]
+pub(crate) use semantic::RustSemanticLowerer;
+#[cfg(test)]
+mod enum_variant_tests;
 pub(in crate::analyzer) mod source_publication;
 pub(crate) mod source_storage;
+pub(crate) mod std_types;
+pub use std_types::{
+    RustNativeObligationProof, rust_call_is_standard_drop, rust_native_result_obligation,
+};
+#[cfg(test)]
+mod module_export_resolution_tests;
 mod structural;
+#[cfg(test)]
+mod test_support;
 #[cfg(test)]
 mod usage_queries_tests;
 #[cfg(test)]
@@ -49,26 +65,29 @@ use crate::analyzer::languages::{
 use crate::analyzer::semantic::ResolverOwnedExternalCalleeIdentity;
 use crate::analyzer::store::LimitedQueryRows;
 use crate::analyzer::usages::get_definition::{
-    BoundedResolution, DefinitionLookupOutcome, ExactExternalCallProof,
+    BoundedResolution, DefinitionLookupOutcome, ExactExternalCallProof, ResolvedReferenceSite,
 };
 use crate::analyzer::usages::get_type::TypeLookupOutcome;
 use crate::analyzer::usages::workspace_graph::UsageEcosystem;
 use crate::analyzer::{
     AnalyzerConfig, AnalyzerStoreContext, BuildProgress, CloneSmell, CloneSmellWeights, CodeUnit,
-    ForwardQueryProvider, IAnalyzer, ImportAnalysisProvider, Language, PoolSafeMemo, Project,
-    ProjectFile, Range, SignatureMetadata, StructuredImportPath, TestAssertionSmell,
+    CodeUnitType, ForwardQueryProvider, IAnalyzer, ImportAnalysisProvider, Language, PoolSafeMemo,
+    Project, ProjectFile, Range, SignatureMetadata, StructuredImportPath, TestAssertionSmell,
     TestAssertionWeights, TestDetectionProvider, TreeSitterAnalyzer, TypeAliasProvider,
     TypeHierarchyProvider, resolve_analyzer,
 };
 use crate::analyzer::{AnalyzerQueryScope, QueryScope};
 use crate::hash::{HashMap, HashSet};
-use external_calls::{rust_call_written_arity, rust_import_binder_external_callee};
+use external_calls::rust_import_binder_external_callee;
 use moka::sync::Cache;
 use std::collections::BTreeSet;
+use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
 
-use super::weighted_cache::{build_weighted_cache, weight_code_unit_set, weight_project_file_set};
+use super::weighted_cache::{
+    build_weighted_cache, weight_code_unit_set, weight_export_index, weight_project_file_set,
+};
 pub(crate) use adapter::RustAdapter;
 use brokk_bifrost_core::analyzer::rust_facts::{RustModuleRouteFacts, RustUsageFacts};
 use brokk_bifrost_rust::cache::{
@@ -79,6 +98,7 @@ use brokk_bifrost_rust::graph_support::{
     RustPlacedDeclaration, RustTraitImplRow, RustUnresolvedImpl,
 };
 use brokk_bifrost_rust::hierarchy::RustHierarchySourceFacts;
+pub use brokk_bifrost_rust::structural::{RustCallResultUseIndex, rust_call_result_use};
 use brokk_bifrost_rust::usage_queries::RustDeclarationFacts;
 use brokk_bifrost_rust::usage_walks::RustWalkCaches;
 
@@ -88,6 +108,15 @@ type RustFactCacheKey = (Option<crate::analyzer::store::GenerationId>, git2::Oid
 type RustHierarchySourceFactsCacheKey =
     (crate::analyzer::store::GenerationId, git2::Oid, ProjectFile);
 
+// Generated binding files can produce single hierarchy-fact entries above
+// 16 MiB. Give each source-fact cache a larger share while keeping both byte
+// caps tied to the analyzer's explicit memo budget.
+const RUST_SOURCE_FACT_CACHE_BUDGET_DIVISOR: u64 = 4;
+
+fn rust_source_fact_cache_budget(memo_budget: u64) -> u64 {
+    memo_budget / RUST_SOURCE_FACT_CACHE_BUDGET_DIVISOR
+}
+
 /// Query occurrences and their immutable fact product share one selected blob.
 #[cfg(test)]
 pub(crate) struct RustPrimarySourceAt {
@@ -96,7 +125,8 @@ pub(crate) struct RustPrimarySourceAt {
 }
 
 fn weight_rust_hierarchy_source_facts<K>(_key: &K, value: &Arc<RustHierarchySourceFacts>) -> u32 {
-    value.estimated_retained_bytes().clamp(1, u32::MAX as usize) as u32
+    let bytes = value.estimated_retained_bytes();
+    bytes.clamp(1, u32::MAX as usize) as u32
 }
 use brokk_bifrost_rust::cargo_routes::RustCargoRouteIndex;
 use brokk_bifrost_rust::crate_naming;
@@ -107,10 +137,12 @@ pub use brokk_bifrost_rust::field_roles::rust_is_field_declaration_name;
 pub use brokk_bifrost_rust::graph_support::rust_reference_namespace;
 pub(crate) use brokk_bifrost_rust::imports::rust_import_binding_name;
 use brokk_bifrost_rust::test_detection::detect_rust_test_assertion_smells;
-use cache::weight_export_index;
 use clones::build_rust_clone_candidate_data;
 pub use dependency_discovery::resolve_rust_semantic_pack_dependencies;
 pub use external::RustDependencyPackAdapter;
+pub use file_dependency_evidence::{
+    acquire_rust_file_dependency_evidence, rust_file_dependency_evidence,
+};
 pub use rustdoc_artifact::RustdocJsonPackProducer;
 
 pub use brokk_bifrost_rust::graph_support::RustReferenceContext;
@@ -140,6 +172,11 @@ pub fn rust_declaration_is_enum_variant(
     rust: &RustAnalyzer,
     declaration: &CodeUnit,
 ) -> Result<bool, RustCargoRouteError> {
+    if declaration.kind() != CodeUnitType::Field {
+        return Ok(false);
+    }
+    // Enum variants are distinguished on their own canonical source property;
+    // their class owner need not be present in that property's unit map.
     is_rust_enum_variant_declaration(rust, declaration)
 }
 
@@ -147,6 +184,9 @@ pub fn rust_declaration_is_enum_variant(
 pub struct RustAnalyzer {
     inner: TreeSitterAnalyzer<RustAdapter>,
     memo_budget: u64,
+    dependency_evidence_overlay: crate::analyzer::store::Result<
+        Option<Arc<crate::analyzer::store::dependency_file_evidence::ScopedDependencyEvidence>>,
+    >,
     imported_code_units: Cache<ProjectFile, Arc<HashSet<CodeUnit>>>,
     referencing_files: Cache<ProjectFile, Arc<HashSet<ProjectFile>>>,
     export_indexes: Cache<ProjectFile, Arc<crate::analyzer::usages::ExportIndex>>,
@@ -196,6 +236,68 @@ pub struct RustAnalyzer {
 crate::analyzer::impl_forward_query_provider!(RustAnalyzer);
 
 impl RustAnalyzer {
+    pub(crate) fn update_all_with_progress(
+        &self,
+        progress: Option<crate::analyzer::BuildProgress>,
+    ) -> Self {
+        crate_naming::invalidate();
+        let inner = self.inner.update_all_with_progress(progress);
+        Self::from_inner(inner, self.memo_budget)
+    }
+
+    fn capture_dependency_overlay(
+        inner: &TreeSitterAnalyzer<RustAdapter>,
+    ) -> crate::analyzer::store::Result<
+        Option<Arc<crate::analyzer::store::dependency_file_evidence::ScopedDependencyEvidence>>,
+    > {
+        crate::analyzer::store::dependency_file_evidence::publish_overlay(
+            inner.analyzer_store(),
+            &inner.selected_workspace_snapshots(),
+            inner.project(),
+            Language::Rust,
+        )
+    }
+
+    fn from_inner(inner: TreeSitterAnalyzer<RustAdapter>, memo_budget: u64) -> Self {
+        Self {
+            dependency_evidence_overlay: Self::capture_dependency_overlay(&inner),
+            inner,
+            memo_budget,
+            imported_code_units: build_weighted_cache(memo_budget / 4, weight_code_unit_set),
+            referencing_files: build_weighted_cache(memo_budget / 8, weight_project_file_set),
+            export_indexes: build_weighted_cache(memo_budget / 8, weight_export_index),
+            reverse_import_index: Arc::new(PoolSafeMemo::new()),
+            cargo_routes: Arc::new(PoolSafeMemo::new()),
+            package_file_index: Arc::new(OnceLock::new()),
+            module_file_resolution_count: Arc::new(AtomicUsize::new(0)),
+            export_name_canonicalization_count: Arc::new(AtomicUsize::new(0)),
+            module_route_fact_fallback_count: Arc::new(AtomicUsize::new(0)),
+            rust_usage_facts: build_weighted_cache(memo_budget / 8, weight_rust_usage_facts),
+            declaration_facts: build_weighted_cache(memo_budget / 16, weight_declaration_facts),
+            declaration_source_properties: build_weighted_cache(
+                rust_source_fact_cache_budget(memo_budget),
+                weight_declaration_source_properties,
+            ),
+            rust_hierarchy_source_facts: build_weighted_cache(
+                rust_source_fact_cache_budget(memo_budget),
+                weight_rust_hierarchy_source_facts,
+            ),
+            fact_catch_up: Arc::new(fact_catch_up::RustFactCatchUp::new()),
+            walk_caches: Arc::new(RustWalkCaches::new(memo_budget)),
+        }
+    }
+
+    fn store_result_or_unavailable<T>(
+        &self,
+        result: crate::analyzer::store::Result<T>,
+        context: impl FnOnce() -> String,
+    ) -> Result<T, RustCargoRouteError> {
+        result.map_err(|error| {
+            self.inner.record_store_error(error.context(context()));
+            RustCargoRouteError::Unavailable
+        })
+    }
+
     pub(crate) fn structural_parent_of(&self, code_unit: &CodeUnit) -> Option<CodeUnit> {
         self.inner.structural_parent_of(code_unit)
     }
@@ -301,29 +403,55 @@ impl RustAnalyzer {
         Ok((generation, oid))
     }
 
+    fn selected_rust_source_while(
+        &self,
+        file: &ProjectFile,
+        keep_going: &dyn Fn() -> bool,
+    ) -> Result<(crate::analyzer::store::GenerationId, git2::Oid), RustCargoRouteError> {
+        if !keep_going() {
+            return Err(RustCargoRouteError::Cancelled);
+        }
+        self.selected_rust_source(file)
+    }
+
     fn declaration_source_properties(
         &self,
         file: &ProjectFile,
         keep_going: &dyn Fn() -> bool,
     ) -> Result<Arc<RustDeclarationSourceProperties>, RustCargoRouteError> {
-        if !keep_going() {
-            return Err(RustCargoRouteError::Cancelled);
-        }
-        let (generation, oid) = self.selected_rust_source(file)?;
+        let (generation, oid) = self.selected_rust_source_while(file, keep_going)?;
         let key = (generation, oid, file.clone());
         if let Some(cached) = self.declaration_source_properties.get(&key) {
             return Ok(cached);
         }
-        let rows = self
-            .analyzer_store()
-            .rust_declaration_properties(oid, generation, &RustAdapter, file, keep_going)
-            .map_err(|error| {
+        let load = || {
+            self.analyzer_store().rust_declaration_properties(
+                oid,
+                generation,
+                &RustAdapter,
+                file,
+                keep_going,
+            )
+        };
+        let rows = match load() {
+            Ok(rows) => rows,
+            Err(error) if error.is_missing_required_source_facts() => {
+                self.ensure_rust_declaration_facts_published(file, generation, oid)?;
+                load().map_err(|error| {
+                    self.inner.record_store_error(error.context(format!(
+                        "reading canonical Rust declaration properties after catch-up for {file:?} ({oid})"
+                    )));
+                    RustCargoRouteError::Unavailable
+                })?
+            }
+            Err(error) => {
                 self.inner.record_store_error(error.context(format!(
                     "reading canonical Rust declaration properties for {file:?} ({oid})"
                 )));
-                RustCargoRouteError::Unavailable
-            })?
-            .ok_or(RustCargoRouteError::Cancelled)?;
+                return Err(RustCargoRouteError::Unavailable);
+            }
+        }
+        .ok_or(RustCargoRouteError::Cancelled)?;
         let mut properties = RustDeclarationSourceProperties::default();
         for (unit, property) in rows {
             if !keep_going() {
@@ -348,10 +476,7 @@ impl RustAnalyzer {
         file: &ProjectFile,
         keep_going: &dyn Fn() -> bool,
     ) -> Result<Arc<RustHierarchySourceFacts>, RustCargoRouteError> {
-        if !keep_going() {
-            return Err(RustCargoRouteError::Cancelled);
-        }
-        let (generation, oid) = self.selected_rust_source(file)?;
+        let (generation, oid) = self.selected_rust_source_while(file, keep_going)?;
         self.rust_hierarchy_source_facts_for_key((generation, oid, file.clone()), keep_going)
     }
 
@@ -393,10 +518,7 @@ impl RustAnalyzer {
         range: std::ops::Range<usize>,
         keep_going: &dyn Fn() -> bool,
     ) -> Result<RustPrimarySourceAt, RustCargoRouteError> {
-        if !keep_going() {
-            return Err(RustCargoRouteError::Cancelled);
-        }
-        let (generation, oid) = self.selected_rust_source(file)?;
+        let (generation, oid) = self.selected_rust_source_while(file, keep_going)?;
         let occurrences = self
             .analyzer_store()
             .rust_primary_occurrences_at(oid, generation, range, keep_going)
@@ -414,50 +536,41 @@ impl RustAnalyzer {
         Ok(RustPrimarySourceAt { occurrences, facts })
     }
 
+    #[track_caller]
     pub(crate) fn declaration_candidates_by_fqn_limited(
         &self,
         fqn: &str,
         limit: usize,
         continue_query: impl FnMut() -> bool,
     ) -> LimitedQueryRows<CodeUnit> {
-        let Some(identifier) = fqn.rsplit('.').next().filter(|name| !name.is_empty()) else {
-            return LimitedQueryRows::complete(Vec::new(), 0);
-        };
-        let mut candidates =
-            self.inner
-                .lookup_declarations_by_identifier_limited(identifier, limit, continue_query);
-        if candidates.complete {
-            candidates
-                .rows
-                .retain(|candidate| candidate.fq_name() == fqn);
-        }
-        candidates
+        self.inner
+            .lookup_declarations_by_fqn_limited(fqn, limit, continue_query)
     }
 
-    pub(crate) fn signature_metadata_limited(
+    crate::analyzer::tree_sitter_analyzer::delegate_inner_methods! {
+        pub(crate) fn signature_metadata_limited(
         &self,
         code_unit: &CodeUnit,
         limit: usize,
-    ) -> LimitedQueryRows<SignatureMetadata> {
-        self.inner.signature_metadata_limited(code_unit, limit)
+    ) -> LimitedQueryRows<SignatureMetadata>;
     }
 
-    pub(crate) fn signatures_limited(
+    crate::analyzer::tree_sitter_analyzer::delegate_inner_methods! {
+        pub(crate) fn signatures_limited(
         &self,
         code_unit: &CodeUnit,
         limit: usize,
-    ) -> LimitedQueryRows<String> {
-        self.inner.signatures_limited(code_unit, limit)
+    ) -> LimitedQueryRows<String>;
     }
 
-    #[doc(hidden)]
-    pub fn reset_full_hydration_count_for_test(&self) {
-        self.inner.reset_full_hydration_count_for_test();
+    crate::analyzer::tree_sitter_analyzer::delegate_inner_methods! {
+        #[doc(hidden)]
+        pub fn reset_full_hydration_count_for_test(&self);
     }
 
-    #[doc(hidden)]
-    pub fn full_hydration_count_for_test(&self) -> usize {
-        self.inner.full_hydration_count_for_test()
+    crate::analyzer::tree_sitter_analyzer::delegate_inner_methods! {
+        #[doc(hidden)]
+        pub fn full_hydration_count_for_test(&self) -> usize;
     }
 
     pub(crate) fn ranges_limited(
@@ -518,6 +631,7 @@ impl RustAnalyzer {
     pub(crate) fn clone_with_project(&self, project: Arc<dyn Project>) -> Self {
         let mut clone = self.clone();
         clone.inner = clone.inner.clone_with_project(project);
+        clone.dependency_evidence_overlay = Self::capture_dependency_overlay(&clone.inner);
         clone.imported_code_units =
             build_weighted_cache(self.memo_budget / 4, weight_code_unit_set);
         clone.referencing_files =
@@ -528,8 +642,10 @@ impl RustAnalyzer {
         clone.package_file_index = Arc::new(OnceLock::new());
         clone.declaration_facts =
             build_weighted_cache(self.memo_budget / 8, weight_declaration_facts);
-        clone.rust_hierarchy_source_facts =
-            build_weighted_cache(self.memo_budget / 16, weight_rust_hierarchy_source_facts);
+        clone.rust_hierarchy_source_facts = build_weighted_cache(
+            rust_source_fact_cache_budget(self.memo_budget),
+            weight_rust_hierarchy_source_facts,
+        );
         clone.fact_catch_up = Arc::new(fact_catch_up::RustFactCatchUp::new());
         clone.walk_caches = Arc::new(RustWalkCaches::new(self.memo_budget));
         clone
@@ -538,6 +654,7 @@ impl RustAnalyzer {
     pub(crate) fn clone_for_index_warm(&self, project: Arc<dyn Project>) -> Self {
         let mut clone = self.clone();
         clone.inner = clone.inner.clone_with_project(project);
+        clone.dependency_evidence_overlay = Self::capture_dependency_overlay(&clone.inner);
         clone
     }
 
@@ -588,7 +705,12 @@ impl RustAnalyzer {
             .ok_or(RustCargoRouteError::Cancelled)?;
         mounts.sort_unstable_by(|(left, _), (right, _)| left.cmp(right));
         let facts = self.rust_module_route_facts(&mounts, keep_going)?;
-        let files: Vec<_> = mounts.into_iter().map(|(file, _)| file).collect();
+        // Unsafe sources were marked incomplete during the fact read; only
+        // files with canonical published facts belong in this index input.
+        let files: Vec<_> = mounts
+            .into_iter()
+            .filter_map(|(file, _)| facts.contains_key(&file).then_some(file))
+            .collect();
         RustCargoRouteIndex::build_while(&files, &facts, &|| keep_going())
             .ok_or(RustCargoRouteError::Cancelled)
     }
@@ -637,7 +759,11 @@ impl RustAnalyzer {
                 Some(facts) if facts.file_extent().is_some() => {
                     by_file.insert(file.clone(), facts.clone());
                 }
-                _ => missing.push(file.clone()),
+                Some(_) => missing.push(file.clone()),
+                None if self
+                    .inner
+                    .record_structure_unavailable_if_unparseable(file, *oid) => {}
+                None => missing.push(file.clone()),
             }
         }
         if !missing.is_empty() {
@@ -677,31 +803,8 @@ impl RustAnalyzer {
     pub fn new_with_config(project: Arc<dyn Project>, config: AnalyzerConfig) -> Self {
         crate_naming::invalidate();
         let memo_budget = config.memo_cache_budget_bytes();
-        Self {
-            inner: TreeSitterAnalyzer::new_with_config(project, RustAdapter, config),
-            memo_budget,
-            imported_code_units: build_weighted_cache(memo_budget / 4, weight_code_unit_set),
-            referencing_files: build_weighted_cache(memo_budget / 8, weight_project_file_set),
-            export_indexes: build_weighted_cache(memo_budget / 8, weight_export_index),
-            reverse_import_index: Arc::new(PoolSafeMemo::new()),
-            cargo_routes: Arc::new(PoolSafeMemo::new()),
-            package_file_index: Arc::new(OnceLock::new()),
-            module_file_resolution_count: Arc::new(AtomicUsize::new(0)),
-            export_name_canonicalization_count: Arc::new(AtomicUsize::new(0)),
-            module_route_fact_fallback_count: Arc::new(AtomicUsize::new(0)),
-            rust_usage_facts: build_weighted_cache(memo_budget / 8, weight_rust_usage_facts),
-            declaration_facts: build_weighted_cache(memo_budget / 16, weight_declaration_facts),
-            declaration_source_properties: build_weighted_cache(
-                memo_budget / 16,
-                weight_declaration_source_properties,
-            ),
-            rust_hierarchy_source_facts: build_weighted_cache(
-                memo_budget / 16,
-                weight_rust_hierarchy_source_facts,
-            ),
-            fact_catch_up: Arc::new(fact_catch_up::RustFactCatchUp::new()),
-            walk_caches: Arc::new(RustWalkCaches::new(memo_budget)),
-        }
+        let inner = TreeSitterAnalyzer::new_with_config(project, RustAdapter, config);
+        Self::from_inner(inner, memo_budget)
     }
 
     pub(crate) fn new_with_config_store_context(
@@ -719,31 +822,7 @@ impl RustAnalyzer {
             store_context,
             progress,
         )?;
-        Ok(Self {
-            inner,
-            memo_budget,
-            imported_code_units: build_weighted_cache(memo_budget / 4, weight_code_unit_set),
-            referencing_files: build_weighted_cache(memo_budget / 8, weight_project_file_set),
-            export_indexes: build_weighted_cache(memo_budget / 8, weight_export_index),
-            reverse_import_index: Arc::new(PoolSafeMemo::new()),
-            cargo_routes: Arc::new(PoolSafeMemo::new()),
-            package_file_index: Arc::new(OnceLock::new()),
-            module_file_resolution_count: Arc::new(AtomicUsize::new(0)),
-            export_name_canonicalization_count: Arc::new(AtomicUsize::new(0)),
-            module_route_fact_fallback_count: Arc::new(AtomicUsize::new(0)),
-            rust_usage_facts: build_weighted_cache(memo_budget / 8, weight_rust_usage_facts),
-            declaration_facts: build_weighted_cache(memo_budget / 16, weight_declaration_facts),
-            declaration_source_properties: build_weighted_cache(
-                memo_budget / 16,
-                weight_declaration_source_properties,
-            ),
-            rust_hierarchy_source_facts: build_weighted_cache(
-                memo_budget / 16,
-                weight_rust_hierarchy_source_facts,
-            ),
-            fact_catch_up: Arc::new(fact_catch_up::RustFactCatchUp::new()),
-            walk_caches: Arc::new(RustWalkCaches::new(memo_budget)),
-        })
+        Ok(Self::from_inner(inner, memo_budget))
     }
 
     pub fn from_project<P>(project: P) -> Self
@@ -762,39 +841,47 @@ impl RustAnalyzer {
     }
 }
 
-/// Whether `file` is a Cargo manifest, the non-source input that names crates
-/// and their path dependencies. `Cargo.toml` maps to no language, so the
-/// workspace analyzer must route it to the Rust delegate by name.
+/// Whether `file` is a Cargo input the workspace analyzer routes to the Rust
+/// delegate by name, because none maps to a language: a manifest, a lockfile
+/// or a configuration file (`RustSupport::is_configuration_input_path`). Cargo
+/// file changes refresh static file evidence independently of packs; crate
+/// rows read the subset `is_cargo_topology_input` names.
+pub(crate) fn is_cargo_evidence_input(file: &ProjectFile) -> bool {
+    RustSupport.is_configuration_input_path(file.rel_path())
+}
+
+/// Whether `file` is a Cargo input that crate rows read, and so a workspace
+/// package identity input with a topology digest
+/// (`RustAdapter::workspace_package_identity_digest`):
+/// - a manifest, `Cargo.toml`, which names crates, their targets and their
+///   dependency routes;
+/// - a Cargo configuration file, `.cargo/config.toml` or the legacy
+///   `.cargo/config`, whose `[patch]`, `build.target` and `--cfg` rustflags
+///   change crate cfg sets and routes (#3768,
+///   `brokk_bifrost_rust::cargo_config`).
 ///
-/// It is the only Rust configuration file routed here (decided in #3756):
-/// - `Cargo.lock` and `rust-toolchain.toml` are read only by dependency
-///   discovery (`dependency_discovery.rs`), to choose the dependency and
-///   standard-library packs. They are Cargo pack inputs
-///   (`CargoDependencyResolver::dependency_inputs`), and the host refreshes
-///   pack activation when one changes. Crate rows, cfg and feature activation,
-///   and Cargo routes do not read them, and pack-derived semantic artifacts
-///   are keyed by the active packs, so routing them here would rebuild for no
-///   change in results.
-/// - `.cargo/config.toml` is read by nothing: its `[patch]`, `build.target`
-///   and `--cfg` rustflags are not honored (#3768). Route it when they are.
-pub(crate) fn is_cargo_manifest(file: &ProjectFile) -> bool {
+/// `Cargo.lock` is routed but crate rows do not read it, so it has no digest
+/// and an edit to it rebuilds.
+pub(crate) fn is_cargo_topology_input(file: &ProjectFile) -> bool {
     file.rel_path()
         .file_name()
         .is_some_and(|name| name == "Cargo.toml")
+        || brokk_bifrost_rust::cargo_config::is_cargo_configuration_path(file.rel_path())
 }
 
 /// Whether every changed file the Rust analyzer would reindex still hashes to
 /// what the store holds, so `update` can hand back a clone instead of
 /// rebuilding.
 ///
-/// A changed manifest is never "unchanged": it moves crate membership and
-/// dependency routes without touching a Rust source, and only the underlying
-/// analyzer's update re-derives the crate rows for it.
+/// A changed Cargo input is never "unchanged": a manifest or configuration
+/// file moves crate membership, cfg sets and dependency routes, and any of
+/// them moves dependency evidence, without touching a Rust source. Only the
+/// underlying analyzer's update re-derives those rows.
 fn rust_indexed_sources_unchanged(
     index: &dyn CodeUnitIndex,
     changed_files: &BTreeSet<ProjectFile>,
 ) -> bool {
-    if changed_files.iter().any(is_cargo_manifest) {
+    if changed_files.iter().any(is_cargo_evidence_input) {
         return false;
     }
     changed_files
@@ -807,6 +894,13 @@ fn rust_indexed_sources_unchanged(
                 .ok()
                 .is_some_and(|source| index.indexed_source_matches(file, &source))
         })
+}
+
+fn reference_context_with_progress<'a>(
+    progress: &'a dyn Fn() -> bool,
+    build: impl FnOnce() -> brokk_bifrost_rust::graph_support::RustReferenceContext<'a>,
+) -> Option<brokk_bifrost_rust::graph_support::RustReferenceContext<'a>> {
+    progress().then(build)
 }
 
 impl TypeAliasProvider for RustAnalyzer {
@@ -829,6 +923,7 @@ impl brokk_bifrost_rust::graph_support::RustSource for RustAnalyzer {
         self.structural_parent_of(code_unit)
     }
 
+    #[track_caller]
     fn declaration_candidates_by_fqn_while(
         &self,
         fq_name: &str,
@@ -891,9 +986,7 @@ impl brokk_bifrost_rust::graph_support::RustSource for RustAnalyzer {
     }
 
     fn import_binder_of(&self, file: &ProjectFile) -> crate::analyzer::usages::ImportBinder {
-        let scope = AnalyzerQueryScope::new(self);
-        let token = scope.token();
-        self.import_binder_of(token, file)
+        crate::analyzer::with_query_scope(self, |token| self.import_binder_of(token, file))
     }
 
     fn export_index_of(
@@ -964,80 +1057,67 @@ impl RustFactSource for RustAnalyzer {
         &self,
         module_path: &str,
     ) -> Result<Vec<git2::Oid>, RustCargoRouteError> {
-        self.analyzer_store()
-            .rust_import_target_blobs("rust", module_path)
-            .map_err(|error| {
-                self.inner.record_store_error(
-                    error.context(format!("reading Rust import targets for {module_path:?}")),
-                );
-                RustCargoRouteError::Unavailable
-            })
+        self.store_result_or_unavailable(
+            self.analyzer_store()
+                .rust_import_target_blobs("rust", module_path),
+            || format!("reading Rust import targets for {module_path:?}"),
+        )
     }
 
     fn rust_module_import_candidate_blobs(
         &self,
         component: &str,
     ) -> Result<Vec<git2::Oid>, RustCargoRouteError> {
-        self.analyzer_store()
-            .rust_module_import_candidate_blobs("rust", component)
-            .map_err(|error| {
-                self.inner.record_store_error(error.context(format!(
-                    "reading Rust module import candidates for {component:?}"
-                )));
-                RustCargoRouteError::Unavailable
-            })
+        self.store_result_or_unavailable(
+            self.analyzer_store()
+                .rust_module_import_candidate_blobs("rust", component),
+            || format!("reading Rust module import candidates for {component:?}"),
+        )
     }
 
     fn rust_export_blobs(
         &self,
         exported_name: &str,
     ) -> Result<Vec<git2::Oid>, RustCargoRouteError> {
-        self.analyzer_store()
-            .rust_export_blobs("rust", exported_name)
-            .map_err(|error| {
-                self.inner.record_store_error(
-                    error.context(format!("reading Rust exports for {exported_name:?}")),
-                );
-                RustCargoRouteError::Unavailable
-            })
+        self.store_result_or_unavailable(
+            self.analyzer_store()
+                .rust_export_blobs("rust", exported_name),
+            || format!("reading Rust exports for {exported_name:?}"),
+        )
     }
 
     fn rust_traits_implemented_by(
         &self,
         declaration: &RustPlacedDeclaration,
     ) -> Result<Vec<RustPlacedDeclaration>, RustCargoRouteError> {
-        self.analyzer_store()
+        let result = self
+            .analyzer_store()
             .rust_traits_implemented_by(
                 declaration.blob,
                 declaration.declaration,
                 &declaration.rel_path,
             )
-            .map(placed_declarations)
-            .map_err(|error| {
-                self.inner.record_store_error(error.context(format!(
-                    "reading Rust traits implemented by {declaration:?}"
-                )));
-                RustCargoRouteError::Unavailable
-            })
+            .map(placed_declarations);
+        self.store_result_or_unavailable(result, || {
+            format!("reading Rust traits implemented by {declaration:?}")
+        })
     }
 
     fn rust_types_implementing(
         &self,
         declaration: &RustPlacedDeclaration,
     ) -> Result<Vec<RustPlacedDeclaration>, RustCargoRouteError> {
-        self.analyzer_store()
+        let result = self
+            .analyzer_store()
             .rust_types_implementing(
                 declaration.blob,
                 declaration.declaration,
                 &declaration.rel_path,
             )
-            .map(placed_declarations)
-            .map_err(|error| {
-                self.inner.record_store_error(
-                    error.context(format!("reading Rust types implementing {declaration:?}")),
-                );
-                RustCargoRouteError::Unavailable
-            })
+            .map(placed_declarations);
+        self.store_result_or_unavailable(result, || {
+            format!("reading Rust types implementing {declaration:?}")
+        })
     }
 
     fn rust_trait_impl_rows(
@@ -1078,15 +1158,13 @@ impl RustFactSource for RustAnalyzer {
         &self,
         impl_item: &RustPlacedDeclaration,
     ) -> Result<Vec<RustPlacedDeclaration>, RustCargoRouteError> {
-        self.analyzer_store()
+        let result = self
+            .analyzer_store()
             .rust_traits_of_impl(impl_item.blob, impl_item.declaration, &impl_item.rel_path)
-            .map(placed_declarations)
-            .map_err(|error| {
-                self.inner.record_store_error(error.context(format!(
-                    "reading the Rust traits stated by impl {impl_item:?}"
-                )));
-                RustCargoRouteError::Unavailable
-            })
+            .map(placed_declarations);
+        self.store_result_or_unavailable(result, || {
+            format!("reading the Rust traits stated by impl {impl_item:?}")
+        })
     }
 
     fn rust_item_macro_decisions(
@@ -1152,18 +1230,14 @@ impl RustFactSource for RustAnalyzer {
         &self,
         declaration: &RustPlacedDeclaration,
     ) -> Result<Vec<String>, RustCargoRouteError> {
-        self.analyzer_store()
-            .rust_trait_impl_spellings(
-                declaration.blob,
-                declaration.declaration,
-                &declaration.rel_path,
-            )
-            .map_err(|error| {
-                self.inner.record_store_error(error.context(format!(
-                    "reading Rust trait impl spellings for {declaration:?}"
-                )));
-                RustCargoRouteError::Unavailable
-            })
+        let result = self.analyzer_store().rust_trait_impl_spellings(
+            declaration.blob,
+            declaration.declaration,
+            &declaration.rel_path,
+        );
+        self.store_result_or_unavailable(result, || {
+            format!("reading Rust trait impl spellings for {declaration:?}")
+        })
     }
 
     fn rust_alias_blobs_mentioning(
@@ -1220,24 +1294,17 @@ impl RustFactSource for RustAnalyzer {
     }
 
     fn rust_include_blobs(&self, file_name: &str) -> Result<Vec<git2::Oid>, RustCargoRouteError> {
-        self.analyzer_store()
-            .rust_include_blobs("rust", file_name)
-            .map_err(|error| {
-                self.inner.record_store_error(
-                    error.context(format!("reading Rust include candidates for {file_name:?}")),
-                );
-                RustCargoRouteError::Unavailable
-            })
+        self.store_result_or_unavailable(
+            self.analyzer_store().rust_include_blobs("rust", file_name),
+            || format!("reading Rust include candidates for {file_name:?}"),
+        )
     }
 
     fn rust_include_host_blobs(&self) -> Result<Vec<git2::Oid>, RustCargoRouteError> {
-        self.analyzer_store()
-            .rust_include_host_blobs("rust")
-            .map_err(|error| {
-                self.inner
-                    .record_store_error(error.context("reading Rust include hosts"));
-                RustCargoRouteError::Unavailable
-            })
+        self.store_result_or_unavailable(
+            self.analyzer_store().rust_include_host_blobs("rust"),
+            || "reading Rust include hosts".to_owned(),
+        )
     }
 
     fn rust_declaration_facts_of(
@@ -1277,7 +1344,9 @@ impl RustFactSource for RustAnalyzer {
         file: &ProjectFile,
         progress: &'a dyn Fn() -> bool,
     ) -> Option<RustReferenceContext<'a>> {
-        progress().then(|| self.reference_context_of_while(token, file, progress))
+        reference_context_with_progress(progress, || {
+            self.reference_context_of_while(token, file, progress)
+        })
     }
 
     fn forward_reference_context_of<'a>(
@@ -1294,7 +1363,9 @@ impl RustFactSource for RustAnalyzer {
         file: &ProjectFile,
         progress: &'a dyn Fn() -> bool,
     ) -> Option<RustReferenceContext<'a>> {
-        progress().then(|| self.forward_reference_context_of_while(token, file, progress))
+        reference_context_with_progress(progress, || {
+            self.forward_reference_context_of_while(token, file, progress)
+        })
     }
 }
 
@@ -1303,82 +1374,81 @@ impl TestDetectionProvider for RustAnalyzer {}
 use crate::analyzer::CodeUnitIndex;
 
 impl CodeUnitIndex for RustAnalyzer {
-    /// Forwarded so the request-scoped memo on the inner analyzer answers
-    /// (#2679); the trait default would rebuild uncached per call.
-    fn class_range_index(
+    crate::analyzer::tree_sitter_analyzer::delegate_inner_methods! {
+        /// Forwarded so the request-scoped memo on the inner analyzer answers
+        /// (#2679); the trait default would rebuild uncached per call.
+        fn class_range_index(
         &self,
         file: &ProjectFile,
-    ) -> std::sync::Arc<brokk_bifrost_core::analyzer::usages::inverted_edges::ClassRangeIndex> {
-        self.inner.class_range_index(file)
+    ) -> std::sync::Arc<brokk_bifrost_core::analyzer::usages::inverted_edges::ClassRangeIndex>;
     }
 
-    fn enclosing_code_unit(
+    crate::analyzer::tree_sitter_analyzer::delegate_inner_methods! {
+        fn enclosing_code_unit(
         &self,
         file: &ProjectFile,
         range: &crate::analyzer::Range,
-    ) -> Option<CodeUnit> {
-        self.inner.enclosing_code_unit(file, range)
+    ) -> Option<CodeUnit>;
     }
 
-    fn enclosing_code_unit_for_lines(
+    crate::analyzer::tree_sitter_analyzer::delegate_inner_methods! {
+        fn enclosing_code_unit_for_lines(
+            &self,
+            file: &ProjectFile,
+            start_line: usize,
+            end_line: usize,
+        ) -> Option<CodeUnit>;
+    }
+
+    crate::analyzer::tree_sitter_analyzer::delegate_inner_methods! {
+        fn top_level_declarations(&self, file: &ProjectFile) -> Vec<CodeUnit>;
+    }
+
+    crate::analyzer::tree_sitter_analyzer::delegate_inner_methods! {
+        fn summary_file_projection(
         &self,
         file: &ProjectFile,
-        start_line: usize,
-        end_line: usize,
-    ) -> Option<CodeUnit> {
-        self.inner
-            .enclosing_code_unit_for_lines(file, start_line, end_line)
+    ) -> Option<Arc<crate::analyzer::SummaryFileProjection>>;
     }
 
-    fn top_level_declarations(&self, file: &ProjectFile) -> Vec<CodeUnit> {
-        self.inner.top_level_declarations(file)
+    crate::analyzer::tree_sitter_analyzer::delegate_inner_methods! {
+        fn analyzed_files(&self) -> Vec<ProjectFile>;
     }
 
-    fn summary_file_projection(
-        &self,
-        file: &ProjectFile,
-    ) -> Option<Arc<crate::analyzer::SummaryFileProjection>> {
-        self.inner.summary_file_projection(file)
+    crate::analyzer::tree_sitter_analyzer::delegate_inner_methods! {
+        fn indexed_source(&self, file: &ProjectFile) -> Option<String>;
     }
 
-    fn analyzed_files(&self) -> Vec<ProjectFile> {
-        self.inner.analyzed_files()
+    crate::analyzer::tree_sitter_analyzer::delegate_inner_methods! {
+        fn location_declarations(&self, file: &ProjectFile) -> BTreeSet<CodeUnit>;
     }
 
-    fn indexed_source(&self, file: &ProjectFile) -> Option<String> {
-        self.inner.indexed_source(file)
+    crate::analyzer::tree_sitter_analyzer::delegate_inner_methods! {
+        fn location_ranges(&self, code_unit: &CodeUnit) -> Vec<crate::analyzer::Range>;
     }
 
-    fn location_declarations(&self, file: &ProjectFile) -> BTreeSet<CodeUnit> {
-        self.inner.location_declarations(file)
+    crate::analyzer::tree_sitter_analyzer::delegate_inner_methods! {
+        fn indexed_source_matches(&self, file: &ProjectFile, source: &str) -> bool;
     }
 
-    fn location_ranges(&self, code_unit: &CodeUnit) -> Vec<crate::analyzer::Range> {
-        self.inner.location_ranges(code_unit)
+    crate::analyzer::tree_sitter_analyzer::delegate_inner_methods! {
+        fn is_analyzed(&self, file: &ProjectFile) -> bool;
     }
 
-    fn indexed_source_matches(&self, file: &ProjectFile, source: &str) -> bool {
-        self.inner.indexed_source_matches(file, source)
-    }
-
-    fn is_analyzed(&self, file: &ProjectFile) -> bool {
-        self.inner.is_analyzed(file)
-    }
-
-    fn retain_analyzed(&self, candidates: &[ProjectFile]) -> Vec<ProjectFile> {
-        self.inner.retain_analyzed(candidates)
+    crate::analyzer::tree_sitter_analyzer::delegate_inner_methods! {
+        fn retain_analyzed(&self, candidates: &[ProjectFile]) -> Vec<ProjectFile>;
     }
 
     fn all_declarations(&self) -> Box<dyn Iterator<Item = CodeUnit> + '_> {
         self.inner.all_declarations()
     }
 
-    fn declarations_sharing_name(&self, unit: &CodeUnit) -> Vec<CodeUnit> {
-        self.inner.declarations_sharing_name(unit)
+    crate::analyzer::tree_sitter_analyzer::delegate_inner_methods! {
+        fn declarations_sharing_name(&self, unit: &CodeUnit) -> Vec<CodeUnit>;
     }
 
-    fn declarations(&self, file: &ProjectFile) -> BTreeSet<CodeUnit> {
-        self.inner.declarations(file)
+    crate::analyzer::tree_sitter_analyzer::delegate_inner_methods! {
+        fn declarations(&self, file: &ProjectFile) -> BTreeSet<CodeUnit>;
     }
 
     fn declares(&self, file: &ProjectFile, unit: &CodeUnit) -> bool {
@@ -1393,8 +1463,8 @@ impl CodeUnitIndex for RustAnalyzer {
         self.inner.definitions(fq_name)
     }
 
-    fn direct_children(&self, code_unit: &CodeUnit) -> Vec<CodeUnit> {
-        self.inner.direct_children(code_unit)
+    crate::analyzer::tree_sitter_analyzer::delegate_inner_methods! {
+        fn direct_children(&self, code_unit: &CodeUnit) -> Vec<CodeUnit>;
     }
 
     /// The same owner lookup as the [`CodeUnitIndex::parent_of`] default plus Rust's
@@ -1407,8 +1477,8 @@ impl CodeUnitIndex for RustAnalyzer {
             .or_else(|| self.inner.structural_parent_of(code_unit))
     }
 
-    fn ranges(&self, code_unit: &CodeUnit) -> Vec<crate::analyzer::Range> {
-        self.inner.ranges(code_unit)
+    crate::analyzer::tree_sitter_analyzer::delegate_inner_methods! {
+        fn ranges(&self, code_unit: &CodeUnit) -> Vec<crate::analyzer::Range>;
     }
 
     fn ranges_with_limit(
@@ -1425,66 +1495,57 @@ impl CodeUnitIndex for RustAnalyzer {
         self.inner.signatures(code_unit)
     }
 
-    fn signature_metadata(&self, code_unit: &CodeUnit) -> Vec<SignatureMetadata> {
-        self.inner.signature_metadata(code_unit)
+    crate::analyzer::tree_sitter_analyzer::delegate_inner_methods! {
+        fn signature_metadata(&self, code_unit: &CodeUnit) -> Vec<SignatureMetadata>;
     }
 
-    fn get_analyzed_files(&self) -> BTreeSet<ProjectFile> {
-        self.inner.get_analyzed_files()
+    crate::analyzer::tree_sitter_analyzer::delegate_inner_methods! {
+        fn languages(&self) -> BTreeSet<Language>;
     }
 
-    fn languages(&self) -> BTreeSet<Language> {
-        self.inner.languages()
+    crate::analyzer::tree_sitter_analyzer::delegate_inner_methods! {
+        fn project(&self) -> &dyn Project;
     }
 
-    fn project(&self) -> &dyn Project {
-        self.inner.project()
-    }
-
-    fn get_all_declarations(&self) -> Vec<CodeUnit> {
-        self.inner.get_all_declarations()
-    }
-
-    fn get_definitions(&self, fq_name: &str) -> Vec<CodeUnit> {
-        self.inner.get_definitions(fq_name)
+    crate::analyzer::tree_sitter_analyzer::delegate_inner_methods! {
+        fn get_all_declarations(&self) -> Vec<CodeUnit>;
     }
 
     fn get_skeleton(&self, code_unit: &CodeUnit) -> Option<String> {
         self.inner.get_skeleton(code_unit)
     }
 
-    fn get_skeleton_header(&self, code_unit: &CodeUnit) -> Option<String> {
-        self.inner.get_skeleton_header(code_unit)
+    crate::analyzer::tree_sitter_analyzer::delegate_inner_methods! {
+        fn get_skeleton_header(&self, code_unit: &CodeUnit) -> Option<String>;
     }
 
-    fn get_source(&self, code_unit: &CodeUnit, include_comments: bool) -> Option<String> {
-        self.inner.get_source(code_unit, include_comments)
+    crate::analyzer::tree_sitter_analyzer::delegate_inner_methods! {
+        fn get_source(&self, code_unit: &CodeUnit, include_comments: bool) -> Option<String>;
     }
 
-    fn get_sources(&self, code_unit: &CodeUnit, include_comments: bool) -> BTreeSet<String> {
-        self.inner.get_sources(code_unit, include_comments)
+    crate::analyzer::tree_sitter_analyzer::delegate_inner_methods! {
+        fn get_sources(&self, code_unit: &CodeUnit, include_comments: bool) -> BTreeSet<String>;
     }
 
-    fn search_definitions(&self, pattern: &str, auto_quote: bool) -> BTreeSet<CodeUnit> {
-        self.inner.search_definitions(pattern, auto_quote)
+    crate::analyzer::tree_sitter_analyzer::delegate_inner_methods! {
+        fn search_definitions(&self, pattern: &str, auto_quote: bool) -> BTreeSet<CodeUnit>;
     }
 
-    fn search_definitions_by_suffix_pattern(
+    crate::analyzer::tree_sitter_analyzer::delegate_inner_methods! {
+        fn search_definitions_by_suffix_pattern(
         &self,
         pattern: &str,
         terminal_identifiers: &[String],
         language: Language,
-    ) -> BTreeSet<CodeUnit> {
-        self.inner
-            .search_definitions_by_suffix_pattern(pattern, terminal_identifiers, language)
+    ) -> BTreeSet<CodeUnit>;
     }
 
-    fn lookup_candidates_by_short_name(&self, symbol: &str) -> BTreeSet<CodeUnit> {
-        self.inner.lookup_candidates_by_short_name(symbol)
+    crate::analyzer::tree_sitter_analyzer::delegate_inner_methods! {
+        fn lookup_candidates_by_short_name(&self, symbol: &str) -> BTreeSet<CodeUnit>;
     }
 
-    fn has_complete_symbol_lookup_index(&self) -> bool {
-        self.inner.has_complete_symbol_lookup_index()
+    crate::analyzer::tree_sitter_analyzer::delegate_inner_methods! {
+        fn has_complete_symbol_lookup_index(&self) -> bool;
     }
 
     fn lookup_candidates_by_identifier(&self, identifier: &str) -> BTreeSet<CodeUnit> {
@@ -1493,6 +1554,34 @@ impl CodeUnitIndex for RustAnalyzer {
 }
 
 impl IAnalyzer for RustAnalyzer {
+    crate::analyzer::tree_sitter_analyzer::delegate_inner_procedure_fact_methods!();
+
+    fn dependency_file_locations(
+        &self,
+    ) -> crate::analyzer::store::Result<
+        Vec<(
+            String,
+            crate::analyzer::semantic_model::DependencyEvidenceLocation,
+        )>,
+    > {
+        match &self.dependency_evidence_overlay {
+            Ok(Some(publication)) => publication.locations(),
+            Ok(None) => self.inner.dependency_file_locations(),
+            Err(error) => Err(error.clone()),
+        }
+    }
+
+    fn dependency_file_evidence(
+        &self,
+    ) -> crate::analyzer::store::Result<crate::analyzer::semantic_model::DependencyFileEvidence>
+    {
+        match &self.dependency_evidence_overlay {
+            Ok(Some(publication)) => publication.read(),
+            Ok(None) => self.inner.dependency_file_evidence(),
+            Err(error) => Err(error.clone()),
+        }
+    }
+
     crate::analyzer::i_analyzer::forward_relational_definition_batch!();
 
     #[cfg(any(test, feature = "test-support"))]
@@ -1524,30 +1613,30 @@ impl IAnalyzer for RustAnalyzer {
         self.inner.end_query(context);
     }
 
-    fn prefetch_definitions(&self, fq_names: &[String]) {
-        self.inner.prefetch_definitions(fq_names);
+    crate::analyzer::tree_sitter_analyzer::delegate_inner_methods! {
+        fn prefetch_definitions(&self, fq_names: &[String]);
     }
 
-    fn record_query_failure(&self, error: crate::analyzer::store::StoreError) {
-        self.inner.record_query_failure(error);
+    crate::analyzer::tree_sitter_analyzer::delegate_inner_methods! {
+        fn record_query_failure(&self, error: crate::analyzer::store::StoreError);
     }
 
-    fn workspace_file_index_cell(&self) -> Option<crate::analyzer::WorkspaceFileIndexCell> {
-        self.inner.workspace_file_index_cell()
+    crate::analyzer::tree_sitter_analyzer::delegate_inner_methods! {
+        fn workspace_file_index_cell(&self) -> Option<crate::analyzer::WorkspaceFileIndexCell>;
     }
 
-    fn definition_lookup_memo(
+    crate::analyzer::tree_sitter_analyzer::delegate_inner_methods! {
+        fn definition_lookup_memo(
         &self,
-    ) -> Option<std::sync::Arc<crate::analyzer::DefinitionLookupMemo>> {
-        self.inner.definition_lookup_memo()
+    ) -> Option<std::sync::Arc<crate::analyzer::DefinitionLookupMemo>>;
     }
 
-    fn import_statements(&self, file: &ProjectFile) -> Vec<String> {
-        self.inner.import_statements(file)
+    crate::analyzer::tree_sitter_analyzer::delegate_inner_methods! {
+        fn import_statements(&self, file: &ProjectFile) -> Vec<String>;
     }
 
-    fn compute_cognitive_complexities(&self, file: &ProjectFile) -> Vec<(CodeUnit, u32)> {
-        self.inner.compute_cognitive_complexities(file)
+    crate::analyzer::tree_sitter_analyzer::delegate_inner_methods! {
+        fn compute_cognitive_complexities(&self, file: &ProjectFile) -> Vec<(CodeUnit, u32)>;
     }
 
     /// The hierarchy index still takes double-digit seconds to build on a large
@@ -1579,66 +1668,12 @@ impl IAnalyzer for RustAnalyzer {
             return self.clone();
         }
 
-        Self {
-            inner: self.inner.update(changed_files),
-            memo_budget: self.memo_budget,
-            imported_code_units: build_weighted_cache(self.memo_budget / 4, weight_code_unit_set),
-            referencing_files: build_weighted_cache(self.memo_budget / 8, weight_project_file_set),
-            export_indexes: build_weighted_cache(self.memo_budget / 8, weight_export_index),
-            reverse_import_index: Arc::new(PoolSafeMemo::new()),
-            cargo_routes: Arc::new(PoolSafeMemo::new()),
-            package_file_index: Arc::new(OnceLock::new()),
-            module_file_resolution_count: Arc::new(AtomicUsize::new(0)),
-            export_name_canonicalization_count: Arc::new(AtomicUsize::new(0)),
-            module_route_fact_fallback_count: Arc::new(AtomicUsize::new(0)),
-            rust_usage_facts: build_weighted_cache(self.memo_budget / 8, weight_rust_usage_facts),
-            declaration_facts: build_weighted_cache(
-                self.memo_budget / 16,
-                weight_declaration_facts,
-            ),
-            declaration_source_properties: build_weighted_cache(
-                self.memo_budget / 16,
-                weight_declaration_source_properties,
-            ),
-            rust_hierarchy_source_facts: build_weighted_cache(
-                self.memo_budget / 16,
-                weight_rust_hierarchy_source_facts,
-            ),
-            fact_catch_up: Arc::new(fact_catch_up::RustFactCatchUp::new()),
-            walk_caches: Arc::new(RustWalkCaches::new(self.memo_budget)),
-        }
+        let inner = self.inner.update(changed_files);
+        Self::from_inner(inner, self.memo_budget)
     }
 
     fn update_all(&self) -> Self {
-        crate_naming::invalidate();
-        Self {
-            inner: self.inner.update_all(),
-            memo_budget: self.memo_budget,
-            imported_code_units: build_weighted_cache(self.memo_budget / 4, weight_code_unit_set),
-            referencing_files: build_weighted_cache(self.memo_budget / 8, weight_project_file_set),
-            export_indexes: build_weighted_cache(self.memo_budget / 8, weight_export_index),
-            reverse_import_index: Arc::new(PoolSafeMemo::new()),
-            cargo_routes: Arc::new(PoolSafeMemo::new()),
-            package_file_index: Arc::new(OnceLock::new()),
-            module_file_resolution_count: Arc::new(AtomicUsize::new(0)),
-            export_name_canonicalization_count: Arc::new(AtomicUsize::new(0)),
-            module_route_fact_fallback_count: Arc::new(AtomicUsize::new(0)),
-            rust_usage_facts: build_weighted_cache(self.memo_budget / 8, weight_rust_usage_facts),
-            declaration_facts: build_weighted_cache(
-                self.memo_budget / 16,
-                weight_declaration_facts,
-            ),
-            declaration_source_properties: build_weighted_cache(
-                self.memo_budget / 16,
-                weight_declaration_source_properties,
-            ),
-            rust_hierarchy_source_facts: build_weighted_cache(
-                self.memo_budget / 16,
-                weight_rust_hierarchy_source_facts,
-            ),
-            fact_catch_up: Arc::new(fact_catch_up::RustFactCatchUp::new()),
-            walk_caches: Arc::new(RustWalkCaches::new(self.memo_budget)),
-        }
+        self.update_all_with_progress(None)
     }
 
     fn parse_errors(&self, file: &ProjectFile) -> Option<Vec<crate::analyzer::ParseError>> {
@@ -1653,23 +1688,22 @@ impl IAnalyzer for RustAnalyzer {
         diagnostics::collect_rust_semantic_diagnostics(self, file, source)
     }
 
-    fn extract_call_receiver(&self, reference: &str) -> Option<String> {
-        self.inner.extract_call_receiver(reference)
+    crate::analyzer::tree_sitter_analyzer::delegate_inner_methods! {
+        fn extract_call_receiver(&self, reference: &str) -> Option<String>;
     }
 
-    fn is_access_expression(&self, file: &ProjectFile, start_byte: usize, end_byte: usize) -> bool {
-        self.inner.is_access_expression(file, start_byte, end_byte)
+    crate::analyzer::tree_sitter_analyzer::delegate_inner_methods! {
+        fn is_access_expression(&self, file: &ProjectFile, start_byte: usize, end_byte: usize) -> bool;
     }
 
-    fn find_nearest_declaration(
-        &self,
-        file: &ProjectFile,
-        start_byte: usize,
-        end_byte: usize,
-        ident: &str,
-    ) -> Option<crate::analyzer::DeclarationInfo> {
-        self.inner
-            .find_nearest_declaration(file, start_byte, end_byte, ident)
+    crate::analyzer::tree_sitter_analyzer::delegate_inner_methods! {
+        fn find_nearest_declaration(
+            &self,
+            file: &ProjectFile,
+            start_byte: usize,
+            end_byte: usize,
+            ident: &str,
+        ) -> Option<crate::analyzer::DeclarationInfo>;
     }
 
     fn search_symbol_candidates(
@@ -1696,34 +1730,34 @@ impl IAnalyzer for RustAnalyzer {
         Some(self)
     }
 
-    fn structural_fact_providers(
+    crate::analyzer::tree_sitter_analyzer::delegate_inner_methods! {
+        fn structural_fact_providers(
         &self,
-    ) -> Vec<&dyn crate::analyzer::structural::StructuralFactProvider> {
-        self.inner.structural_fact_providers()
+    ) -> Vec<&dyn crate::analyzer::structural::StructuralFactProvider>;
     }
 
     fn snapshot_caches(&self) -> Option<&crate::analyzer::AnalyzerSnapshotCaches> {
         Some(self.inner.snapshot_caches())
     }
 
-    fn workspace_content_identities(
+    crate::analyzer::tree_sitter_analyzer::delegate_inner_methods! {
+        fn workspace_content_identities(
         &self,
-    ) -> Option<crate::analyzer::content_identity::WorkspaceContentIdentities> {
-        self.inner.workspace_content_identities()
+    ) -> Option<crate::analyzer::content_identity::WorkspaceContentIdentities>;
     }
 
-    fn workspace_fact_indexes(
+    crate::analyzer::tree_sitter_analyzer::delegate_inner_methods! {
+        fn workspace_fact_indexes(
         &self,
-    ) -> Vec<&dyn crate::analyzer::read_verification::WorkspaceFactIndex> {
-        self.inner.workspace_fact_indexes()
+    ) -> Vec<&dyn crate::analyzer::read_verification::WorkspaceFactIndex>;
     }
 
     fn test_detection_provider(&self) -> Option<&dyn TestDetectionProvider> {
         Some(self)
     }
 
-    fn contains_tests(&self, file: &ProjectFile) -> bool {
-        self.inner.contains_tests(file)
+    crate::analyzer::tree_sitter_analyzer::delegate_inner_methods! {
+        fn contains_tests(&self, file: &ProjectFile) -> bool;
     }
 
     /// Per-declaration taint, widened by the file-level verdict: every
@@ -1769,28 +1803,20 @@ impl IAnalyzer for RustAnalyzer {
         file: &ProjectFile,
         weights: TestAssertionWeights,
     ) -> Vec<TestAssertionSmell> {
-        if !self.contains_tests(file) || file_language(file) != Language::Rust {
-            return Vec::new();
-        }
-        let Ok(source) = self.inner.project().read_source(file) else {
-            return Vec::new();
-        };
-        detect_rust_test_assertion_smells(file, &source, &weights)
+        crate::analyzer::test_assertion_smells_for_file(self, file, Language::Rust, |source| {
+            detect_rust_test_assertion_smells(file, source, &weights)
+        })
     }
 }
 
 #[cfg(any(test, feature = "test-support"))]
 impl crate::analyzer::AnalyzerTestHooks for RustAnalyzer {
-    fn reset_definition_prefetch_batch_count_for_test(&self) {
-        self.inner
-            .test_hooks()
-            .reset_definition_prefetch_batch_count_for_test();
+    crate::analyzer::tree_sitter_analyzer::delegate_inner_test_hook_methods! {
+        fn reset_definition_prefetch_batch_count_for_test(&self);
     }
 
-    fn definition_prefetch_batch_count_for_test(&self) -> usize {
-        self.inner
-            .test_hooks()
-            .definition_prefetch_batch_count_for_test()
+    crate::analyzer::tree_sitter_analyzer::delegate_inner_test_hook_methods! {
+        fn definition_prefetch_batch_count_for_test(&self) -> usize;
     }
 
     fn reset_definition_candidate_row_read_count_for_test(&self) {
@@ -1805,40 +1831,28 @@ impl crate::analyzer::AnalyzerTestHooks for RustAnalyzer {
             .definition_candidate_row_read_count_for_test()
     }
 
-    fn reset_definition_candidates_query_count_for_test(&self) {
-        self.inner
-            .test_hooks()
-            .reset_definition_candidates_query_count_for_test();
+    crate::analyzer::tree_sitter_analyzer::delegate_inner_test_hook_methods! {
+        fn reset_definition_candidates_query_count_for_test(&self);
     }
 
-    fn definition_candidates_query_count_for_test(&self) -> usize {
-        self.inner
-            .test_hooks()
-            .definition_candidates_query_count_for_test()
+    crate::analyzer::tree_sitter_analyzer::delegate_inner_test_hook_methods! {
+        fn definition_candidates_query_count_for_test(&self) -> usize;
     }
 
-    fn reset_relational_definition_batch_call_count_for_test(&self) {
-        self.inner
-            .test_hooks()
-            .reset_relational_definition_batch_call_count_for_test();
+    crate::analyzer::tree_sitter_analyzer::delegate_inner_test_hook_methods! {
+        fn reset_relational_definition_batch_call_count_for_test(&self);
     }
 
-    fn relational_definition_batch_call_count_for_test(&self) -> usize {
-        self.inner
-            .test_hooks()
-            .relational_definition_batch_call_count_for_test()
+    crate::analyzer::tree_sitter_analyzer::delegate_inner_test_hook_methods! {
+        fn relational_definition_batch_call_count_for_test(&self) -> usize;
     }
 
-    fn reset_full_declaration_scan_count_for_test(&self) {
-        self.inner
-            .test_hooks()
-            .reset_full_declaration_scan_count_for_test();
+    crate::analyzer::tree_sitter_analyzer::delegate_inner_test_hook_methods! {
+        fn reset_full_declaration_scan_count_for_test(&self);
     }
 
-    fn full_declaration_scan_count_for_test(&self) -> usize {
-        self.inner
-            .test_hooks()
-            .full_declaration_scan_count_for_test()
+    crate::analyzer::tree_sitter_analyzer::delegate_inner_test_hook_methods! {
+        fn full_declaration_scan_count_for_test(&self) -> usize;
     }
 
     fn reset_search_candidate_hydration_count_for_test(&self) {
@@ -1855,10 +1869,6 @@ impl crate::analyzer::AnalyzerTestHooks for RustAnalyzer {
 
     fn reset_candidate_hydration_count_for_test(&self) {
         self.inner.reset_full_hydration_count_for_test();
-    }
-
-    fn candidate_hydration_count_for_test(&self) -> usize {
-        self.inner.full_hydration_count_for_test() + self.inner.bulk_hydration_count_for_test()
     }
 
     fn full_candidate_hydration_count_for_test(&self) -> usize {
@@ -1892,9 +1902,12 @@ pub(crate) struct RustSupport;
 /// exact source snapshot the call site was classified against; without them no
 /// binder expands.
 ///
-/// A callee whose owner is already multi-segment carries its own qualification
-/// and is left alone. A single-segment import (`use foo;`, `extern crate foo;`)
-/// adds no qualification and is skipped. Every other binder of that local name
+/// A multi-segment callee binds through its leading segment. In
+/// `net::TcpStream::connect` with `use std::net as net;`, the binder `net` names
+/// the target path `std::net`, and the middle written segments (`TcpStream`)
+/// append after it, so the owner is `std::net::TcpStream` (#3491). A
+/// single-segment import (`use foo;`, `extern crate foo;`) adds no qualification
+/// and is skipped. Every other binder of that local name
 /// has to prove this one identity: a binder that proves a different owner
 /// answers nothing rather than picking one, and so does a binder that proves
 /// nothing at all, whether because a workspace declaration or boundary owns the
@@ -1911,65 +1924,158 @@ fn expand_rust_imported_external_callee(
     _callee_text: &str,
     site: Option<&ExternalCalleeSite<'_>>,
 ) -> Option<ImportedExternalCallee> {
+    expand_rust_imported_external_callee_with_operation_factory(
+        analyzer,
+        file,
+        _callee_text,
+        site,
+        None,
+    )
+}
+
+fn expand_rust_imported_external_callee_with_operation_factory(
+    analyzer: &dyn IAnalyzer,
+    file: &ProjectFile,
+    _callee_text: &str,
+    site: Option<&ExternalCalleeSite<'_>>,
+    operation_factory: Option<&native_points::RustDefinitionOperationFactory<'_>>,
+) -> Option<ImportedExternalCallee> {
+    expand_rust_imported_external_callee_with_operation(
+        analyzer,
+        file,
+        _callee_text,
+        site,
+        operation_factory,
+        None,
+    )
+}
+
+pub(crate) fn expand_rust_imported_external_callee_with_operation<'analyzer, 'factory>(
+    analyzer: &'analyzer dyn IAnalyzer,
+    file: &ProjectFile,
+    _callee_text: &str,
+    site: Option<&ExternalCalleeSite<'_>>,
+    operation_factory: Option<&'factory native_points::RustDefinitionOperationFactory<'analyzer>>,
+    mut operation: Option<
+        &mut crate::analyzer::store::resolution_operation::SelectedResolutionOperation<
+            'analyzer,
+            'factory,
+        >,
+    >,
+) -> Option<ImportedExternalCallee> {
     let site = site?;
     let callee = external_calls::call_path(site.tree, site.callee_start_byte)?;
-    let segments = brokk_bifrost_rust::graph_support::rust_path_segments(callee)?;
-    let [owner, member] = segments.as_slice() else {
-        return None;
-    };
-    let owner = brokk_bifrost_rust::declarations::rust_node_text(*owner, site.source);
-    let member = brokk_bifrost_rust::declarations::rust_node_text(*member, site.source);
-    // The declared callable this binder proves has to accept the written call,
-    // so the expansion reads the call's written argument count from the same
-    // parsed tree the callee reference came from. A callee whose call does not
-    // parse is not proof of anything.
-    let parameter_count = rust_call_written_arity(site.tree, site.callee_start_byte)?;
-    let provider = analyzer.import_analysis_provider_for_file(file)?;
-    let scope = AnalyzerQueryScope::new(analyzer);
     let mut expanded: Option<(ExactExternalCallProof, ResolverOwnedExternalCalleeIdentity)> = None;
-    for import in provider.import_info_of(scope.token(), file) {
-        let binding_name = rust_import_binding_name(&import);
-        if binding_name.is_glob() || binding_name.named() != Some(owner) {
-            continue;
-        }
-        // Only an owner path can carry the qualification; a `use foo;`
-        // binder has nothing to expand, exactly as before.
-        let path = match import.path.as_ref() {
-            Some(path) if path.segments.len() >= 2 => path,
-            _ => continue,
-        };
-        // The binder is evidence only where the `use` declaration is in
-        // scope. A module-owned `use` binds its name inside that module's
-        // lexical extent -- which is exactly what `lexical_scopes` records --
-        // so a binder written in a sibling module names nothing at this call,
-        // and letting it answer would either veto a real identity or, when it
-        // binds the same path, prove an identity the call never wrote.
-        if !rust_import_binder_visible_at_byte(path, site.callee_start_byte) {
-            continue;
-        }
-        // A binder that names the local owner but proves no external identity
-        // is evidence against the expansion, so it ends the whole answer
-        // rather than extending the loop.
-        let proof = rust_import_binder_external_callee(
-            analyzer,
-            scope.token(),
-            file,
-            site,
-            &import,
-            member,
-            parameter_count,
-        )?;
-        match &expanded {
-            Some(existing) if *existing == proof => {}
-            Some(_) => return None,
-            None => expanded = Some(proof),
+    if let Some(segments) = brokk_bifrost_rust::graph_support::rust_path_segments(callee) {
+        // The leading written segment names the binder. A single-segment callee
+        // is its own binder (`use foo::bar; bar()`).
+        let (written_member, written_owner) = segments.split_last()?;
+        let binding_node = written_owner.first().unwrap_or(written_member);
+        let binding = brokk_bifrost_rust::declarations::rust_node_text(*binding_node, site.source);
+        let written_member =
+            brokk_bifrost_rust::declarations::rust_node_text(*written_member, site.source);
+        if let Some(provider) = analyzer.import_analysis_provider_for_file(file) {
+            let scope = AnalyzerQueryScope::new(analyzer);
+            for import in provider.import_info_of(scope.token(), file) {
+                let binding_name = rust_import_binding_name(&import);
+                if binding_name.is_glob() || binding_name.named() != Some(binding) {
+                    continue;
+                }
+                // Only an owner path can carry the qualification; a `use foo;`
+                // binder has nothing to expand, exactly as before.
+                let path = match import.path.as_ref() {
+                    Some(path) if path.segments.len() >= 2 => path,
+                    _ => continue,
+                };
+                // The binder is evidence only where the `use` declaration is in
+                // scope. A module-owned `use` binds its name inside that module's
+                // lexical extent -- which is exactly what `lexical_scopes` records --
+                // so a binder written in a sibling module names nothing at this call,
+                // and letting it answer would either veto a real identity or, when it
+                // binds the same path, prove an identity the call never wrote.
+                if !rust_import_binder_visible_at_byte(path, site.callee_start_byte) {
+                    continue;
+                }
+                // A single-segment callee takes the member from the binder's own
+                // path. A longer callee appends its middle segments after the
+                // binder's target: `net::TcpStream::connect` with `net` bound to
+                // `std::net` owns `std::net::TcpStream`.
+                let (owner_components, member): (Vec<String>, &str) = if written_owner.is_empty() {
+                    let (member, owner_components) = path.segments.split_last()?;
+                    (owner_components.to_vec(), member.as_str())
+                } else {
+                    let appended = written_owner.iter().skip(1).map(|node| {
+                        brokk_bifrost_rust::declarations::rust_node_text(*node, site.source)
+                            .to_owned()
+                    });
+                    (
+                        path.segments.iter().cloned().chain(appended).collect(),
+                        written_member,
+                    )
+                };
+                // A binder that names the local owner but proves no external identity
+                // is evidence against the expansion, so it ends the whole answer
+                // rather than extending the loop.
+                let proof = rust_import_binder_external_callee(
+                    analyzer,
+                    scope.token(),
+                    file,
+                    site,
+                    &import,
+                    member,
+                    &owner_components,
+                    operation_factory,
+                    operation.as_deref_mut(),
+                )?;
+                match &expanded {
+                    Some(existing) if *existing == proof => {}
+                    Some(_) => return None,
+                    None => expanded = Some(proof),
+                }
+            }
         }
     }
     // The binder selected one callable in the activated model, so the call
     // carries that callable's exact proof and owner/member identity into the
     // common dispatch path rather than a spelling a later stage has to
     // re-interpret (#3484).
-    expanded.map(|(proof, identity)| ImportedExternalCallee::proven(proof, identity))
+    if let Some((proof, identity)) = expanded {
+        return Some(ImportedExternalCallee::proven(proof, identity));
+    }
+    // A field call's receiver may be a parameter or local initialized from an
+    // imported associated constructor. It has no import binder named after the
+    // receiver expression, so the static-import route above cannot prove it.
+    // Reuse the same structured receiver proof used by exact definition lookup;
+    // this keeps call dispatch, modeled return-owner inference, and navigation
+    // on one external owner identity.
+    let function = callee;
+    if function.kind() != "field_expression" {
+        return None;
+    }
+    let field = function.child_by_field_name("field")?;
+    let member = brokk_bifrost_rust::declarations::rust_node_text(field, site.source);
+    let method_site = ResolvedReferenceSite {
+        path: member.to_owned(),
+        text: member.to_owned(),
+        range: Range {
+            start_byte: field.start_byte(),
+            end_byte: field.end_byte(),
+            start_line: field.start_position().row + 1,
+            end_line: field.end_position().row + 1,
+        },
+        focus_start_byte: field.start_byte(),
+        focus_end_byte: field.end_byte(),
+    };
+    let (proof, identity) = external_calls::exact_rust_external_method_call_with_operation(
+        analyzer,
+        file,
+        site.source,
+        &method_site,
+        None,
+        operation_factory,
+        operation,
+    )?;
+    Some(ImportedExternalCallee::proven(proof, identity))
 }
 
 /// Whether the parser-derived `use` declaration behind `path` binds a name
@@ -1993,6 +2099,20 @@ fn rust_import_binder_visible_at_byte(path: &StructuredImportPath, call_start_by
 }
 
 impl LanguageSupport for RustSupport {
+    fn is_configuration_input_path(&self, path: &Path) -> bool {
+        matches!(
+            path.file_name().and_then(|n| n.to_str()),
+            Some("Cargo.toml" | "Cargo.lock")
+        ) || (path
+            .parent()
+            .and_then(Path::file_name)
+            .is_some_and(|n| n == ".cargo")
+            && matches!(
+                path.file_name().and_then(|n| n.to_str()),
+                Some("config" | "config.toml")
+            ))
+    }
+
     fn language(&self) -> Language {
         Language::Rust
     }
@@ -2047,7 +2167,9 @@ impl LanguageSupport for RustSupport {
         unit: &CodeUnit,
         limit: usize,
     ) -> Option<LimitedQueryRows<String>> {
-        resolve_analyzer::<RustAnalyzer>(analyzer).map(|rust| rust.signatures_limited(unit, limit))
+        crate::analyzer::languages::with_resolved_analyzer::<RustAnalyzer, _>(analyzer, |rust| {
+            rust.signatures_limited(unit, limit)
+        })
     }
 
     fn declaration_ranges_limited(
@@ -2059,20 +2181,33 @@ impl LanguageSupport for RustSupport {
         resolve_analyzer::<RustAnalyzer>(analyzer).map(|rust| rust.ranges_limited(unit, limit))
     }
 
+    fn procedure_drops_run_no_user_code(
+        &self,
+        analyzer: &dyn IAnalyzer,
+        file: &ProjectFile,
+        source: &Arc<str>,
+        callable: std::ops::Range<usize>,
+    ) -> bool {
+        std_types::procedure_drops_run_no_user_code(analyzer, file, source, callable)
+    }
+
     fn forward_query_provider<'a>(
         &self,
         analyzer: &'a dyn IAnalyzer,
     ) -> Option<&'a dyn ForwardQueryProvider> {
-        resolve_analyzer::<RustAnalyzer>(analyzer).map(|value| value as _)
+        crate::analyzer::forward_query_provider::<RustAnalyzer>(analyzer)
     }
 
     fn ecosystem(&self) -> UsageEcosystem {
         UsageEcosystem::Rust
     }
 
-    fn reference_plugin(&self) -> crate::analyzer::languages::ReferenceLanguagePlugin {
-        crate::analyzer::languages::ReferenceLanguagePlugin::native(
-            &RUST_USAGE_STRATEGY,
+    fn reference_usage_strategy(&self) -> &'static dyn crate::analyzer::usages::GraphUsageAnalyzer {
+        &RUST_USAGE_STRATEGY
+    }
+
+    fn reference_graph_backend(&self) -> crate::analyzer::languages::LanguageGraphBackend {
+        crate::analyzer::languages::LanguageGraphBackend::Native(
             &native_graph::RustNativeWorkspaceGraphProvider,
         )
     }
@@ -2165,18 +2300,71 @@ impl StructuralReceiverResolver for RustSupport {
 /// crate would keep its old name until the process exited.
 #[cfg(test)]
 mod tests {
-    use crate::analyzer::{IAnalyzer, Language, ProjectFile, TestProject};
+    use crate::analyzer::{AnalyzerQueryScope, IAnalyzer, Language, ProjectFile, TestProject};
     use brokk_bifrost_rust::declarations::rust_package_name;
+    use brokk_bifrost_rust::hierarchy::RustHierarchySourceFacts;
+    use brokk_bifrost_rust::test_helpers::write_fixture_file as write;
     use std::collections::BTreeSet;
+    use std::sync::Arc;
 
-    fn write(root: &std::path::Path, relative: &str, contents: &str) {
-        let path = root.join(relative);
-        std::fs::create_dir_all(path.parent().expect("parent")).expect("create dirs");
-        std::fs::write(&path, contents).expect("write fixture");
-    }
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#4502: a generated Rust hierarchy result above 16 MiB was hydrated for each inverse target"
+    )]
+    fn generated_hierarchy_facts_over_sixteen_mib_stay_cached() {
+        const GENERATED_UNITS: usize = 15_059;
+        let memo_budget = 256 * 1024 * 1024;
+        let cache_budget = super::rust_source_fact_cache_budget(memo_budget);
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = temp.path().canonicalize().expect("canonical root");
+        let file = ProjectFile::new(root, "generated.rs");
+        let long_name = "x".repeat(1_500);
+        let unit = crate::analyzer::CodeUnit::new(
+            file.clone(),
+            crate::analyzer::CodeUnitType::Class,
+            "generated",
+            long_name,
+        );
+        let declaration_units = (0..GENERATED_UNITS)
+            .map(|index| {
+                (
+                    brokk_bifrost_core::analyzer::source_facts::SourceDeclarationId::new(
+                        index as u32,
+                    ),
+                    unit.clone(),
+                )
+            })
+            .collect();
+        let facts = Arc::new(RustHierarchySourceFacts {
+            items: Default::default(),
+            types: Vec::new(),
+            declarations: Vec::new(),
+            declaration_units,
+            module_names: Default::default(),
+            imports: Vec::new(),
+        });
+        let retained_bytes = facts.estimated_retained_bytes();
+        assert!(retained_bytes > (16 * 1024 * 1024));
+        assert!(retained_bytes <= cache_budget as usize);
 
-    fn rust_analyzer(root: &std::path::Path) -> super::RustAnalyzer {
-        super::RustAnalyzer::from_project(TestProject::new(root.to_path_buf(), Language::Rust))
+        let cache =
+            super::build_weighted_cache(cache_budget, super::weight_rust_hierarchy_source_facts);
+        let key = (
+            crate::analyzer::store::GenerationId::BOOTSTRAP,
+            git2::Oid::zero(),
+            file,
+        );
+        let mut hydrated_unit_rows = 0usize;
+        for _target in 0..2 {
+            let cached = cache.get(&key).unwrap_or_else(|| {
+                hydrated_unit_rows += facts.declaration_units.len();
+                cache.insert(key.clone(), Arc::clone(&facts));
+                Arc::clone(&facts)
+            });
+            assert_eq!(cached.declaration_units.len(), GENERATED_UNITS);
+            cache.run_pending_tasks();
+        }
+        assert_eq!(hydrated_unit_rows, GENERATED_UNITS);
     }
 
     #[test]
@@ -2191,7 +2379,7 @@ mod tests {
         write(&root, "src/lib.rs", "pub struct Marker;\n");
         let library = ProjectFile::new(root.clone(), "src/lib.rs");
 
-        let analyzer = rust_analyzer(&root);
+        let analyzer = crate::test_support::rust_analyzer(&root);
         assert_eq!(rust_package_name(&library), "before");
 
         write(
@@ -2217,7 +2405,7 @@ mod tests {
             "Cargo.toml",
             "[package]\nname = \"renamed-again\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
         );
-        let rebuilt = rust_analyzer(&root);
+        let rebuilt = crate::test_support::rust_analyzer(&root);
         assert_eq!(
             rust_package_name(&library),
             "renamed_again",
@@ -2225,21 +2413,11 @@ mod tests {
         );
         drop(rebuilt);
     }
-}
 
-#[cfg(test)]
-mod foreign_file_tests {
-    use crate::analyzer::{AnalyzerQueryScope, Language, ProjectFile, TestProject};
-
-    /// Asking the Rust analyzer for a file it does not own is not a store
-    /// failure.
-    ///
-    /// A recorded store error fails the whole MCP request
-    /// (`searchtools_service.rs`, "Analyzer store failure while running ..."),
-    /// so a mixed-language `usage_graph` that named only Rust paths exited 1
-    /// on a C++ header that some other read had reached. The Rust adapter
-    /// reports "not mine" for a foreign file and leaves the request intact.
     #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "a6d14cf6a78a: a foreign-language file poisoned an otherwise valid Rust request"
+    )]
     fn a_foreign_file_is_unavailable_to_rust_without_failing_the_request() {
         let temp = tempfile::tempdir().expect("tempdir");
         let root = temp.path().canonicalize().expect("canonical root");

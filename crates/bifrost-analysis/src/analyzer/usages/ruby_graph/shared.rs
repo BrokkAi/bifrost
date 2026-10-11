@@ -1,6 +1,6 @@
 use super::{build_ruby_edges, with_ruby_graph_source};
 use crate::analyzer::usages::common::analyzed_files_for_language;
-use crate::analyzer::usages::inverted_edges::{EdgeNodeDomain, UsageEdgeWeights, UsageEdges};
+use crate::analyzer::usages::inverted_edges::{EdgeNodeDomain, UsageEdges};
 use crate::analyzer::{IAnalyzer, Language, ProjectFile, RubyAnalyzer, resolve_analyzer};
 use crate::hash::HashSet;
 
@@ -23,13 +23,14 @@ impl<'a> RubyEdgeResolver<'a> {
         Some(Self { ruby, files })
     }
 
-    pub(crate) fn build_edges<F>(
+    pub(crate) fn build_edges<Output, F>(
         &self,
         analyzer: &dyn IAnalyzer,
         nodes: &HashSet<String>,
         keep_file: F,
-    ) -> Option<UsageEdges>
+    ) -> Option<Output>
     where
+        Output: crate::analyzer::usages::inverted_edges::UsageEdgeBuildOutput<String>,
         F: Fn(&ProjectFile) -> bool + Sync,
     {
         with_ruby_graph_source(analyzer, |graph| {
@@ -60,27 +61,6 @@ impl<'a> RubyEdgeResolver<'a> {
                 self.ruby,
                 &self.files,
                 EdgeNodeDomain::Rooted(callers),
-                keep_file,
-            )
-        })
-    }
-
-    pub(crate) fn build_edge_weights<F>(
-        &self,
-        analyzer: &dyn IAnalyzer,
-        nodes: &HashSet<String>,
-        keep_file: F,
-    ) -> Option<UsageEdgeWeights>
-    where
-        F: Fn(&ProjectFile) -> bool + Sync,
-    {
-        with_ruby_graph_source(analyzer, |graph| {
-            build_ruby_edges(
-                graph,
-                analyzer,
-                self.ruby,
-                &self.files,
-                EdgeNodeDomain::Closed(nodes),
                 keep_file,
             )
         })

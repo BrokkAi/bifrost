@@ -1,9 +1,7 @@
 use crate::graph::extractor::ScanCtx;
-use brokk_bifrost_core::analyzer::Range;
 use brokk_bifrost_core::analyzer::usages::common::{
-    SNIPPET_CONTEXT_LINES, reclassify_self_receiver_hit_at, usage_hit,
+    insert_import_hit, insert_unproven_hit, reclassify_self_receiver_hit_at, usage_hit_for_node,
 };
-use brokk_bifrost_core::text_utils::{find_line_index_for_offset, trimmed_snippet_around_line};
 use tree_sitter::Node;
 
 pub fn record_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
@@ -13,9 +11,8 @@ pub fn record_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
 }
 
 pub fn record_unproven_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
-    if let Some(hit) = build_hit(node, ctx) {
-        ctx.unproven_hits.insert(hit.into_unproven());
-    }
+    let hit = build_hit(node, ctx);
+    insert_unproven_hit(ctx.unproven_hits, hit);
 }
 
 /// Record `node` as a same-owner self/cls receiver hit (#1014 facet B): a
@@ -32,34 +29,15 @@ pub fn record_self_receiver_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
 /// into this file), which the IDE find-references surface includes but the
 /// call-graph surfaces ignore.
 pub fn record_import_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
-    if let Some(hit) = build_hit(node, ctx) {
-        ctx.hits.insert(hit.into_import());
-    }
+    let hit = build_hit(node, ctx);
+    insert_import_hit(ctx.hits, hit);
 }
 
 fn build_hit(
     node: Node<'_>,
     ctx: &mut ScanCtx<'_>,
 ) -> Option<brokk_bifrost_core::analyzer::usages::model::UsageHit> {
-    let start_byte = node.start_byte();
-    let end_byte = node.end_byte();
-    if start_byte >= end_byte {
-        return None;
-    }
-
-    let line_idx = find_line_index_for_offset(ctx.line_starts, start_byte);
-    let snippet =
-        trimmed_snippet_around_line(ctx.source, ctx.line_starts, line_idx, SNIPPET_CONTEXT_LINES);
-    let range = Range {
-        start_byte,
-        end_byte,
-        start_line: line_idx,
-        end_line: line_idx,
-    };
-
-    let enclosing = ctx.graph.index.enclosing_code_unit(ctx.file, &range)?;
-
-    Some(usage_hit(
-        ctx.file, line_idx, start_byte, end_byte, enclosing, snippet,
-    ))
+    usage_hit_for_node(node, ctx.file, ctx.source, ctx.line_starts, |range| {
+        ctx.graph.index.enclosing_code_unit(ctx.file, range)
+    })
 }

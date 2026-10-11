@@ -1,5 +1,10 @@
 # Node runtime-values packs
 
+> Legacy transition copy: product pack authoring belongs in `bifrost-packs`
+> or the private premium pack repository. Follow [the placement policy](../../../CONTRIBUTING.md#release-process).
+> Sources here are frozen pending verified v0.13.0 release and dependency migration.
+> The technical notes below describe retained contracts and test tooling.
+
 `typescript/bifrost.node-runtime-values.json` and
 `javascript/bifrost.node-runtime-values.json` carry the reviewed Node
 runtime-values contract for the `keyed_read_value` capability. Each pack
@@ -103,5 +108,5 @@ Compile the packs with:
 cargo run -p brokk-bifrost-semantic-packs --features release-tooling \
   --bin bifrost-semantic-pack -- compile \
   semantic-packs/node/runtime-values/typescript/bifrost.node-runtime-values.json \
-  crates/bifrost-semantic-packs/embedded/node-runtime-values-typescript
+  /path/to/test-output/node-runtime-values-typescript
 ```

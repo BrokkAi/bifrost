@@ -1,16 +1,28 @@
 //! Selected Go reverse references. Candidate names come from the sealed
-//! reference-lookup identity index and Go package rows; every candidate is
-//! resolved again through the selected file-scoped Go forward context.
+//! reference-lookup identity index and Go package rows; summary rows confirm
+//! name candidates, keyed receiver anchors confirm member accesses, the native
+//! point path handles unknown receiver types, and the selected Go forward
+//! context handles only the remaining fallback causes.
 
 use super::GoAnalyzer;
 use crate::CancellationToken;
-use crate::analyzer::resolution::ResolutionCompletion;
+use crate::analyzer::go::native_points::{
+    GoNativePointRequest, GoNativePointRequestOpen, GoPointBindingInitializer,
+};
+use crate::analyzer::languages::BoundedReceiverQuery;
+use crate::analyzer::resolution::seam_profile::{GoRenamePhase, go_rename_phase};
+use crate::analyzer::resolution::{FactReferenceSiteMetadata, ResolutionCompletion};
+use crate::analyzer::store::resolution_operation::go_receiver_anchor::{
+    GoReceiverAnchorMember, GoReceiverTypeAnchor,
+};
 use crate::analyzer::store::resolution_operation::go_reverse_rows::{
-    GoReverseBindingTarget, GoReverseCandidateOutcome, GoReverseConfirmed,
+    GoReverseBindingTarget, GoReverseCandidate, GoReverseCandidateOutcome, GoReverseConfirmed,
+    GoReverseMemberConfirmation,
 };
 use crate::analyzer::store::resolution_operation::{
-    SelectedResolutionContextMetrics, SelectedResolutionOperationInput,
-    SelectedResolutionOperationOpenOutcome, SelectedResolutionOperationOutcome,
+    SelectedResolutionContextMetrics, SelectedResolutionOperation,
+    SelectedResolutionOperationInput, SelectedResolutionOperationOpenOutcome,
+    SelectedResolutionOperationOutcome,
 };
 use crate::analyzer::store::resolution_publication::SelectedResolutionOverlayInputsOutcome;
 use crate::analyzer::store::resolution_selection::SelectedResolutionLanguage;
@@ -48,16 +60,52 @@ pub fn go_selected_inverse_for(
     target: &CodeUnit,
     cancellation: &CancellationToken,
 ) -> GoSelectedReverseOutcome<EdgeDerivationResult> {
-    match go_selected_inverse_for_inner(go, target, cancellation) {
+    go_selected_inverse_for_with_test_inclusion(go, target, true, cancellation)
+}
+
+pub(crate) fn go_selected_inverse_for_with_test_inclusion(
+    go: &GoAnalyzer,
+    target: &CodeUnit,
+    include_tests: bool,
+    cancellation: &CancellationToken,
+) -> GoSelectedReverseOutcome<EdgeDerivationResult> {
+    match go_selected_inverse_for_inner(go, target, include_tests, cancellation, false, None) {
         Ok(outcome) => outcome,
         Err(error) => GoSelectedReverseOutcome::StoreError(error.to_string()),
     }
 }
 
+pub(crate) fn go_selected_inverse_for_rename_original(
+    go: &GoAnalyzer,
+    target: &CodeUnit,
+    new_name: &str,
+    cancellation: &CancellationToken,
+) -> (
+    GoSelectedReverseOutcome<EdgeDerivationResult>,
+    Option<String>,
+) {
+    let mut conflict = None;
+    let outcome = match go_selected_inverse_for_inner(
+        go,
+        target,
+        true,
+        cancellation,
+        true,
+        Some((new_name, &mut conflict)),
+    ) {
+        Ok(outcome) => outcome,
+        Err(error) => GoSelectedReverseOutcome::StoreError(error.to_string()),
+    };
+    (outcome, conflict)
+}
+
 fn go_selected_inverse_for_inner(
     go: &GoAnalyzer,
     target: &CodeUnit,
+    include_tests: bool,
     cancellation: &CancellationToken,
+    record_initial_rename_phases: bool,
+    rename_check: Option<(&str, &mut Option<String>)>,
 ) -> Result<GoSelectedReverseOutcome<EdgeDerivationResult>> {
     if cancellation.is_cancelled() {
         return Ok(GoSelectedReverseOutcome::Cancelled);
@@ -109,7 +157,7 @@ fn go_selected_inverse_for_inner(
         &masks,
     )
     .with_content_mounts(content_mounts);
-    let operation = match go
+    let mut operation = match go
         .inner
         .analyzer_store()
         .open_selected_resolution_operation(input, cancellation)?
@@ -126,22 +174,45 @@ fn go_selected_inverse_for_inner(
         }
     };
     let generation = go.inner.project().analysis_generation();
-    let candidates =
-        match operation.go_reverse_candidate_sites(target, context.context_id, cancellation)? {
-            GoReverseCandidateOutcome::Ready(candidates) => candidates,
-            GoReverseCandidateOutcome::Unavailable(reason) => {
-                return Ok(GoSelectedReverseOutcome::Unavailable(reason));
-            }
-            GoReverseCandidateOutcome::Cancelled => {
-                return Ok(GoSelectedReverseOutcome::Cancelled);
-            }
-        };
+    let candidate_phase =
+        record_initial_rename_phases.then(|| go_rename_phase(GoRenamePhase::CandidateEnumeration));
+    let candidates = match operation.go_reverse_candidate_sites(
+        target,
+        context.context_id,
+        include_tests,
+        &profile,
+        cancellation,
+    )? {
+        GoReverseCandidateOutcome::Ready(candidates) => candidates,
+        GoReverseCandidateOutcome::Unavailable(reason) => {
+            return Ok(GoSelectedReverseOutcome::Unavailable(reason));
+        }
+        GoReverseCandidateOutcome::Cancelled => {
+            return Ok(GoSelectedReverseOutcome::Cancelled);
+        }
+    };
+    let rename_context = candidates.rename_context();
+    drop(candidate_phase);
     let mut context_metrics = SelectedResolutionContextMetrics;
+    let confirmation_phase =
+        record_initial_rename_phases.then(|| go_rename_phase(GoRenamePhase::Confirmation));
+    let mut point_request = None;
     let confirmed = match operation.confirm_go_reverse_candidates(
         context.context_id,
         candidates,
         cancellation,
         &mut context_metrics,
+        |operation, candidate, metadata| {
+            confirm_go_reverse_member_access(
+                go,
+                operation,
+                context.context_id,
+                &mut point_request,
+                candidate,
+                metadata,
+                cancellation,
+            )
+        },
     )? {
         SelectedResolutionOperationOutcome::Native(confirmed) => confirmed,
         SelectedResolutionOperationOutcome::Unavailable(reason) => {
@@ -154,6 +225,47 @@ fn go_selected_inverse_for_inner(
             return Ok(GoSelectedReverseOutcome::Cancelled);
         }
     };
+    drop(confirmation_phase);
+    if let Some((new_name, conflict)) = rename_check {
+        let references = confirmed
+            .references
+            .iter()
+            .filter_map(|reference| {
+                let metadata = reference.answer.site_metadata()?;
+                if !metadata.unqualified() {
+                    return None;
+                }
+                let site = reference.locator.source_site()?;
+                let source = go.indexed_source(&ProjectFile::new(
+                    go.inner.project().root(),
+                    reference.locator.relative_path(),
+                ))?;
+                (source.get(metadata.start_byte()..metadata.end_byte())
+                    == Some(target.identifier()))
+                .then_some((reference.locator.relative_path(), site))
+            })
+            .map(|(relative_path, site)| {
+                let mount = operation
+                    .mount_table()
+                    .mount_for_path("go", relative_path)?
+                    .ok_or_else(|| {
+                        StoreError::new(format!(
+                            "selected Go rename reference has no mount: {relative_path}"
+                        ))
+                    })?;
+                Ok((mount.ordinal().get(), site.get()))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let capture_phase = go_rename_phase(GoRenamePhase::CaptureCheck);
+        *conflict = operation.go_rename_conflict(
+            &rename_context,
+            target,
+            &references,
+            new_name,
+            cancellation,
+        )?;
+        drop(capture_phase);
+    }
     if go.inner.project().analysis_generation() != generation {
         return Ok(GoSelectedReverseOutcome::Stale(
             "Go selected reverse query crossed an analyzer generation".into(),
@@ -166,6 +278,375 @@ fn go_selected_inverse_for_inner(
         ));
     }
     Ok(GoSelectedReverseOutcome::Ready(answer))
+}
+
+fn confirm_go_reverse_member_access<'a>(
+    go: &'a GoAnalyzer,
+    operation: &SelectedResolutionOperation<'_, '_>,
+    context_id: i64,
+    point_request: &mut Option<Box<GoNativePointRequest<'a>>>,
+    candidate: &GoReverseCandidate,
+    metadata: FactReferenceSiteMetadata,
+    cancellation: &CancellationToken,
+) -> Result<crate::analyzer::usages::get_definition::BoundedResolution<GoReverseMemberConfirmation>>
+{
+    use crate::analyzer::usages::get_definition::BoundedResolution;
+    use crate::analyzer::usages::receiver_analysis::ReceiverAnalysisWork;
+
+    if cancellation.is_cancelled() {
+        return Ok(BoundedResolution::Cancelled {
+            work: ReceiverAnalysisWork::default(),
+        });
+    }
+
+    let file = ProjectFile::new(go.inner.project().root(), candidate.locator.relative_path());
+    let source = go.indexed_source(&file).ok_or_else(|| {
+        StoreError::new(format!(
+            "selected Go member reference has no indexed source: {file}"
+        ))
+    })?;
+    if !go
+        .inner
+        .source_matches_selected_native_content(&file, &source)
+    {
+        return Err(StoreError::new(format!(
+            "selected Go member reference source changed before point confirmation: {file}"
+        )));
+    }
+    let start_byte = metadata.start_byte();
+    let end_byte = metadata.end_byte();
+    let text = source.get(start_byte..end_byte).ok_or_else(|| {
+        StoreError::new(format!(
+            "selected Go member reference range is outside indexed source: {file} {start_byte}..{end_byte}"
+        ))
+    })?;
+    let line_starts = compute_line_starts(&source);
+    let site = crate::analyzer::usages::get_definition::ResolvedReferenceSite {
+        path: candidate.locator.relative_path().to_owned(),
+        text: text.to_owned(),
+        range: Range {
+            start_byte,
+            end_byte,
+            start_line: find_line_index_for_offset(&line_starts, start_byte) + 1,
+            end_line: find_line_index_for_offset(&line_starts, end_byte.saturating_sub(1)) + 1,
+        },
+        focus_start_byte: start_byte,
+        focus_end_byte: end_byte,
+    };
+    let tree = crate::analyzer::usages::get_definition::parse_go_tree(&source);
+    let receiver_member = match tree.as_ref() {
+        Some(tree) => resolve_go_reverse_receiver_anchor_member(
+            operation,
+            context_id,
+            candidate,
+            &site,
+            tree,
+            &source,
+            cancellation,
+        )?,
+        None => GoReceiverAnchorMember::Unknown,
+    };
+    if cancellation.is_cancelled() {
+        return Ok(BoundedResolution::Cancelled {
+            work: ReceiverAnalysisWork::default(),
+        });
+    }
+    match receiver_member {
+        GoReceiverAnchorMember::Known { member, .. } => {
+            return Ok(BoundedResolution::Complete {
+                value: GoReverseMemberConfirmation::ReceiverAnchor(member),
+                work: ReceiverAnalysisWork::default(),
+            });
+        }
+        GoReceiverAnchorMember::Unknown => {
+            crate::analyzer::resolution::seam_profile::record_go_reverse_member_access_unknown();
+        }
+    }
+    if point_request.is_none() {
+        match GoNativePointRequest::open(go, go.semantic_model_overlay(), cancellation)? {
+            GoNativePointRequestOpen::Ready(request) => *point_request = Some(request),
+            GoNativePointRequestOpen::Unavailable { .. } => {
+                return Ok(BoundedResolution::Complete {
+                    value: GoReverseMemberConfirmation::Point(None),
+                    work: ReceiverAnalysisWork::default(),
+                });
+            }
+            GoNativePointRequestOpen::Cancelled => {
+                return Ok(BoundedResolution::Cancelled {
+                    work: ReceiverAnalysisWork::default(),
+                });
+            }
+        }
+    }
+    let query = BoundedReceiverQuery {
+        analyzer: go,
+        file: &file,
+        source: &source,
+        tree: tree.as_ref(),
+        site: &site,
+        budget: crate::analyzer::usages::receiver_analysis::INTERACTIVE_TYPE_LOOKUP_BUDGET,
+        cancellation: Some(cancellation),
+    };
+    Ok(
+        match point_request
+            .as_mut()
+            .expect("member point request was opened")
+            .resolve_definition_answer(query)
+        {
+            BoundedResolution::Complete { value, work } => BoundedResolution::Complete {
+                value: GoReverseMemberConfirmation::Point(value.map(Box::new)),
+                work,
+            },
+            BoundedResolution::Exceeded { limit, work } => {
+                BoundedResolution::Exceeded { limit, work }
+            }
+            BoundedResolution::Cancelled { work } => BoundedResolution::Cancelled { work },
+        },
+    )
+}
+
+fn resolve_go_reverse_receiver_anchor_member(
+    operation: &SelectedResolutionOperation<'_, '_>,
+    context_id: i64,
+    candidate: &GoReverseCandidate,
+    site: &crate::analyzer::usages::get_definition::ResolvedReferenceSite,
+    tree: &tree_sitter::Tree,
+    source: &str,
+    cancellation: &CancellationToken,
+) -> Result<GoReceiverAnchorMember> {
+    if cancellation.is_cancelled() {
+        return Ok(GoReceiverAnchorMember::Unknown);
+    }
+    let Some(anchor) =
+        crate::analyzer::go::native_points::go_point_receiver_anchor(site, tree, source)
+    else {
+        return Ok(GoReceiverAnchorMember::Unknown);
+    };
+    let path = candidate.locator.relative_path();
+    if let Some(binding) = anchor.binding.as_ref() {
+        if let Some(initializer) = binding.initializer.as_ref() {
+            return resolve_go_reverse_binding_initializer_member(
+                operation,
+                context_id,
+                candidate,
+                path,
+                initializer,
+                &binding.member_name,
+                cancellation,
+            );
+        }
+        let Some((package_id, source_role, binding_anchor)) = operation
+            .go_point_binding_type_anchor(
+                context_id,
+                path,
+                binding.declaration_start_byte,
+                binding.declaration_end_byte,
+                &binding.member_name,
+                cancellation,
+            )?
+        else {
+            return Ok(GoReceiverAnchorMember::Unknown);
+        };
+        if package_id != candidate.package_id || source_role != candidate.source_role {
+            return Ok(GoReceiverAnchorMember::Unknown);
+        }
+        let first_member = operation.resolve_go_receiver_anchor_member(
+            context_id,
+            package_id,
+            &source_role,
+            &binding_anchor,
+            cancellation,
+        )?;
+        let Some(followup_member_name) = binding.followup_member_name.as_ref() else {
+            return Ok(first_member);
+        };
+        debug_assert_eq!(followup_member_name, &anchor.member_name);
+        let GoReceiverAnchorMember::Known { member, .. } = first_member else {
+            return Ok(GoReceiverAnchorMember::Unknown);
+        };
+        let field_anchor = GoReceiverTypeAnchor::field_type(member, anchor.member_name.clone());
+        return operation.resolve_go_receiver_anchor_member(
+            context_id,
+            package_id,
+            &source_role,
+            &field_anchor,
+            cancellation,
+        );
+    }
+    let (package_id, source_role, selected_anchor): (i64, String, GoReceiverTypeAnchor) =
+        if let Some(owner_type_name) = anchor.owner_type_name.as_deref() {
+            let Some((package_id, source_role, selected_anchor)) = operation
+                .go_point_receiver_type_anchor(
+                    context_id,
+                    path,
+                    anchor.kind,
+                    owner_type_name,
+                    &anchor.name,
+                    &anchor.member_name,
+                    cancellation,
+                )?
+            else {
+                return Ok(GoReceiverAnchorMember::Unknown);
+            };
+            (package_id, source_role, selected_anchor)
+        } else {
+            let Some((call_start, call_end)) = anchor.owner_call_reference else {
+                return Ok(GoReceiverAnchorMember::Unknown);
+            };
+            let Some(call_reference) =
+                operation.go_point_call_reference_at(path, call_start, call_end, cancellation)?
+            else {
+                return Ok(GoReceiverAnchorMember::Unknown);
+            };
+            let Some((package_id, source_role, call_anchor)) = operation
+                .go_point_callable_result_anchor(context_id, path, call_reference, cancellation)?
+            else {
+                return Ok(GoReceiverAnchorMember::Unknown);
+            };
+            let Some(call_types) = operation.go_receiver_anchor_types(
+                context_id,
+                package_id,
+                &source_role,
+                &call_anchor,
+                cancellation,
+            )?
+            else {
+                return Ok(GoReceiverAnchorMember::Unknown);
+            };
+            let Some(owner_type_name) =
+                operation.go_point_type_name(call_types.receiver_type.identity(), cancellation)?
+            else {
+                return Ok(GoReceiverAnchorMember::Unknown);
+            };
+            let Some((member_package_id, member_source_role, selected_anchor)) = operation
+                .go_point_receiver_type_anchor(
+                    context_id,
+                    path,
+                    anchor.kind,
+                    &owner_type_name,
+                    &anchor.name,
+                    &anchor.member_name,
+                    cancellation,
+                )?
+            else {
+                return Ok(GoReceiverAnchorMember::Unknown);
+            };
+            if package_id != member_package_id || source_role != member_source_role {
+                return Ok(GoReceiverAnchorMember::Unknown);
+            }
+            (member_package_id, member_source_role, selected_anchor)
+        };
+    if package_id != candidate.package_id || source_role != candidate.source_role {
+        return Ok(GoReceiverAnchorMember::Unknown);
+    }
+    operation.resolve_go_receiver_anchor_member(
+        context_id,
+        package_id,
+        &source_role,
+        &selected_anchor,
+        cancellation,
+    )
+}
+
+fn resolve_go_reverse_binding_initializer_member(
+    operation: &SelectedResolutionOperation<'_, '_>,
+    context_id: i64,
+    candidate: &GoReverseCandidate,
+    path: &str,
+    initializer: &GoPointBindingInitializer,
+    target_member: &str,
+    cancellation: &CancellationToken,
+) -> Result<GoReceiverAnchorMember> {
+    match initializer {
+        GoPointBindingInitializer::CallResult {
+            function_start_byte,
+            function_end_byte,
+        } => {
+            let Some(call_reference) = operation.go_point_call_reference_at(
+                path,
+                *function_start_byte,
+                *function_end_byte,
+                cancellation,
+            )?
+            else {
+                return Ok(GoReceiverAnchorMember::Unknown);
+            };
+            let Some((package_id, source_role, call_anchor)) = operation
+                .go_point_callable_result_anchor(context_id, path, call_reference, cancellation)?
+            else {
+                return Ok(GoReceiverAnchorMember::Unknown);
+            };
+            if package_id != candidate.package_id || source_role != candidate.source_role {
+                return Ok(GoReceiverAnchorMember::Unknown);
+            }
+            let selected_anchor = GoReceiverTypeAnchor {
+                member_name: target_member.to_owned(),
+                ..call_anchor
+            };
+            operation.resolve_go_receiver_anchor_member(
+                context_id,
+                package_id,
+                &source_role,
+                &selected_anchor,
+                cancellation,
+            )
+        }
+        GoPointBindingInitializer::FieldChain {
+            root_declaration_start_byte,
+            root_declaration_end_byte,
+            member_names,
+        } => {
+            let Some(first_member) = member_names.first() else {
+                return Ok(GoReceiverAnchorMember::Unknown);
+            };
+            let Some((package_id, source_role, root_anchor)) = operation
+                .go_point_binding_type_anchor(
+                    context_id,
+                    path,
+                    *root_declaration_start_byte,
+                    *root_declaration_end_byte,
+                    first_member,
+                    cancellation,
+                )?
+            else {
+                return Ok(GoReceiverAnchorMember::Unknown);
+            };
+            if package_id != candidate.package_id || source_role != candidate.source_role {
+                return Ok(GoReceiverAnchorMember::Unknown);
+            }
+            let mut resolved = operation.resolve_go_receiver_anchor_member(
+                context_id,
+                package_id,
+                &source_role,
+                &root_anchor,
+                cancellation,
+            )?;
+            for member_name in member_names.iter().skip(1) {
+                let GoReceiverAnchorMember::Known { member, .. } = resolved else {
+                    return Ok(GoReceiverAnchorMember::Unknown);
+                };
+                let field_anchor = GoReceiverTypeAnchor::field_type(member, member_name.clone());
+                resolved = operation.resolve_go_receiver_anchor_member(
+                    context_id,
+                    package_id,
+                    &source_role,
+                    &field_anchor,
+                    cancellation,
+                )?;
+            }
+            let GoReceiverAnchorMember::Known { member, .. } = resolved else {
+                return Ok(GoReceiverAnchorMember::Unknown);
+            };
+            let field_anchor = GoReceiverTypeAnchor::field_type(member, target_member.to_owned());
+            operation.resolve_go_receiver_anchor_member(
+                context_id,
+                package_id,
+                &source_role,
+                &field_anchor,
+                cancellation,
+            )
+        }
+    }
 }
 
 fn project_confirmed_references(
@@ -295,7 +776,14 @@ fn project_confirmed_references(
             } else {
                 UsageProof::Unproven
             },
-            usage_kind: go_selected_usage_kind(metadata, owner_relation, target),
+            ambiguous_candidate: false,
+            usage_kind: go_selected_usage_kind(
+                metadata,
+                owner_relation,
+                target,
+                projected_file
+                    .is_receiver_type_reference(metadata.start_byte(), metadata.end_byte()),
+            ),
             site_class: SiteClass::UseSite,
             owner_relation,
             provenance: EdgeProvenance::Inverse,
@@ -389,6 +877,7 @@ fn push_reason(reasons: &mut Vec<EdgeIncompleteReason>, reason: EdgeIncompleteRe
 struct GoSelectedReferenceFile<'analyzer> {
     source_len: usize,
     line_starts: Box<[usize]>,
+    receiver_type_references: Box<[(usize, usize)]>,
     classifier: Option<ReferenceSiteClassifier<'analyzer>>,
 }
 
@@ -397,8 +886,15 @@ impl<'analyzer> GoSelectedReferenceFile<'analyzer> {
         Self {
             source_len: source.len(),
             line_starts: compute_line_starts(source).into_boxed_slice(),
+            receiver_type_references: go_receiver_type_reference_ranges(source),
             classifier: ReferenceSiteClassifier::new(go, file),
         }
+    }
+
+    fn is_receiver_type_reference(&self, start_byte: usize, end_byte: usize) -> bool {
+        self.receiver_type_references
+            .binary_search(&(start_byte, end_byte))
+            .is_ok()
     }
 
     fn range(&self, start_byte: usize, end_byte: usize) -> Range {
@@ -416,15 +912,55 @@ impl<'analyzer> GoSelectedReferenceFile<'analyzer> {
     }
 }
 
+pub(super) fn go_receiver_type_reference_ranges(source: &str) -> Box<[(usize, usize)]> {
+    let Some(tree) = crate::analyzer::usages::get_definition::parse_go_tree(source) else {
+        return Box::new([]);
+    };
+    let mut pending = vec![tree.root_node()];
+    let mut ranges = Vec::new();
+    while let Some(node) = pending.pop() {
+        if node.kind() == "method_declaration"
+            && let Some(receiver) = node.child_by_field_name("receiver")
+        {
+            let mut receiver_cursor = receiver.walk();
+            for parameter in receiver.named_children(&mut receiver_cursor) {
+                if parameter.kind() != "parameter_declaration" {
+                    continue;
+                }
+                let Some(type_node) = parameter.child_by_field_name("type") else {
+                    continue;
+                };
+                let mut type_nodes = vec![type_node];
+                while let Some(type_node) = type_nodes.pop() {
+                    if matches!(type_node.kind(), "identifier" | "type_identifier") {
+                        ranges.push((type_node.start_byte(), type_node.end_byte()));
+                    }
+                    let mut type_cursor = type_node.walk();
+                    type_nodes.extend(type_node.named_children(&mut type_cursor));
+                }
+            }
+        }
+        let mut cursor = node.walk();
+        pending.extend(node.named_children(&mut cursor));
+    }
+    ranges.sort_unstable();
+    ranges.dedup();
+    ranges.into_boxed_slice()
+}
+
 fn go_selected_usage_kind(
     metadata: crate::analyzer::resolution::FactReferenceSiteMetadata,
     owner_relation: crate::analyzer::structural::OwnerRelation,
     target: &CodeUnit,
+    receiver_type_reference: bool,
 ) -> UsageHitKind {
     if metadata.site_kind() == ResolutionSiteKind::ImportDeclaration {
         UsageHitKind::Import
-    } else if metadata.callable_receiver_origin()
-        == Some(ResolutionCallableReceiverOrigin::CurrentInstance)
+    } else if (receiver_type_reference
+        && metadata.site_kind() == ResolutionSiteKind::TypeReference
+        && metadata.namespace() == ResolutionNamespace::Type)
+        || metadata.callable_receiver_origin()
+            == Some(ResolutionCallableReceiverOrigin::CurrentInstance)
         || (owner_relation == crate::analyzer::structural::OwnerRelation::SelfReference
             && target.is_function())
         || (metadata.namespace() == ResolutionNamespace::Value
@@ -558,8 +1094,8 @@ fn selected_go_context_id(go: &GoAnalyzer) -> Result<Option<i64>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::analyzer::CodeUnitIndex;
     use crate::analyzer::go::native_usages::GoNativeUsageStrategy;
-    use crate::analyzer::{CodeUnitIndex, Project};
     use crate::hash::HashSet;
     use crate::inline_project::{BuiltInlineTestProject, InlineTestProject};
     use crate::path_utils::rel_path_string;
@@ -662,6 +1198,39 @@ func externalTest() {
                 "persist Go resolution facts for {file}"
             );
         }
+        analyzer
+            .refresh_source_inventory()
+            .expect("publish and reconcile the Go fixture's final source-inventory generation");
+        let context_id = selected_go_context_id(analyzer)
+            .expect("read selected Go package context")
+            .expect("selected Go package context");
+        reconcile_go_summaries(analyzer, context_id);
+    }
+
+    fn reconcile_go_summaries(analyzer: &GoAnalyzer, context_id: i64) {
+        let snapshot = analyzer
+            .selected_snapshot_for_test()
+            .expect("selected Go snapshot");
+        let profile = analyzer
+            .native_context_profile()
+            .expect("selected Go native context profile");
+        let report = analyzer
+            .inner
+            .analyzer_store()
+            .reconcile_unit_summaries(
+                &snapshot,
+                crate::analyzer::store::go_unit_summaries::GoUnitSummaries {
+                    context_id,
+                    profile,
+                },
+                &crate::CancellationToken::new(),
+            )
+            .expect("reconcile summaries for the selected Go native context");
+        assert!(
+            report.failed.is_empty(),
+            "selected Go native summary derivation must succeed: {:?}",
+            report.failed
+        );
     }
 
     fn target(analyzer: &GoAnalyzer, fixture: &BuiltInlineTestProject, name: &str) -> CodeUnit {
@@ -736,8 +1305,9 @@ func externalTest() {
         )
     }
 
-    fn assert_transitive_candidate_stays_incomplete(
+    fn assert_transitive_member_is_point_confirmed(
         answer: &EdgeDerivationResult,
+        target: &CodeUnit,
         expected_path: &str,
         scenario: &str,
     ) {
@@ -747,18 +1317,22 @@ func externalTest() {
             candidates.iter().any(|path| path == expected_path),
             "{scenario} must reach the recursive candidate set for {expected_path}: {candidates:?}"
         );
+        let qualified_imports = crate::analyzer::store::resolution_operation::go_reverse_rows::
+            last_go_reverse_qualified_imports_for_test();
         assert!(
-            !edge_paths(answer).contains(expected_path),
-            "forward resolution cannot yet type this {scenario}; do not publish a guessed edge: {answer:#?}"
+            qualified_imports.is_empty(),
+            "{scenario} is a receiver member path, not a package import route: {qualified_imports:?}"
         );
+        let edge = answer
+            .edges
+            .iter()
+            .find(|edge| edge.site.file.rel_path() == expected_path)
+            .unwrap_or_else(|| panic!("point resolution must confirm {scenario}: {answer:#?}"));
         assert!(
-            matches!(
-                &answer.completeness,
-                EdgeCompleteness::Incomplete { reasons }
-                    if reasons.contains(&EdgeIncompleteReason::InverseIndexResolutionIncomplete)
-            ),
-            "an unconfirmed {scenario} candidate must remain explicitly incomplete: {answer:#?}"
+            edge.target == *target && edge.proof == UsageProof::Proven,
+            "point resolution must prove the requested declaration for {scenario}: {edge:#?}"
         );
+        assert_eq!(answer.completeness, EdgeCompleteness::Complete);
     }
 
     #[test]
@@ -847,16 +1421,145 @@ func TestNew(t *testing.T) { _ = New() }
                 .any(|edge| edge.site.file == fixture.file("pkg/pkg_test.go")),
             "internal test call must resolve to its package declaration: {answer:#?}"
         );
-        assert!(
-            matches!(
-                &answer.completeness,
-                EdgeCompleteness::Incomplete { reasons }
-                    if reasons.contains(&EdgeIncompleteReason::InverseIndexReferenceEnumerationIncomplete)
-            ),
-            "the source-inventory test-role fallback must remain explicitly incomplete: {answer:#?}"
+        assert_eq!(
+            answer.completeness,
+            EdgeCompleteness::Complete,
+            "the named testing import cannot hide another workspace reference: {answer:#?}"
         );
     }
 
+    #[brokk_bifrost_test_macros::hardwon(
+        "46bd3b03ff7f: reverse summary skipped a cross-file name ending at package scope"
+    )]
+    #[test]
+    fn selected_go_inverse_confirms_cross_file_package_scope_names() {
+        const PROVIDER: &str = "package pkg\n\nfunc Target() {}\n";
+        const CALLER: &str = "package pkg\n\nfunc use() { Target() }\n";
+        let (fixture, analyzer) =
+            transitive_fixture(&[("pkg/provider.go", PROVIDER), ("pkg/caller.go", CALLER)]);
+        let target = target_at(&analyzer, &fixture, "pkg/provider.go", "Target");
+
+        let answer = inverse(&analyzer, &target);
+
+        assert!(
+            answer.edges.iter().any(
+                |edge| edge.site.file == fixture.file("pkg/caller.go") && edge.target == target
+            ),
+            "a same-package name reaches the caller file's package Scope: {answer:#?}"
+        );
+    }
+
+    #[brokk_bifrost_test_macros::hardwon(
+        "22f2f70ef463: unresolved default imports hid their selected file-scope binder"
+    )]
+    #[test]
+    fn selected_go_inverse_uses_default_import_binder_without_provider() {
+        const APP: &str = r#"package app
+
+import "example.test/transitive/missing"
+
+type Widget struct { Widget int }
+
+func use() {
+	_ = Widget{Widget: 1}
+	_ = missing.Widget{}
+}
+"#;
+
+        let (fixture, analyzer) = transitive_fixture(&[("app/app.go", APP)]);
+        let target = target_at(&analyzer, &fixture, "app/app.go", "Widget");
+        crate::analyzer::store::resolution_operation::go_reverse_rows::
+            reset_go_reverse_qualified_imports_for_test();
+
+        let answer = inverse(&analyzer, &target);
+        let imports = crate::analyzer::store::resolution_operation::go_reverse_rows::
+            last_go_reverse_qualified_imports_for_test();
+
+        assert!(
+            imports
+                .iter()
+                .any(|(_, _, import_id)| *import_id == Some(0)),
+            "the unresolved default import still has a selected binder row: {imports:?}"
+        );
+        let type_start = APP.find("Widget{").expect("composite literal type");
+        assert!(
+            answer.edges.iter().any(|edge| {
+                edge.site.file == fixture.file("app/app.go")
+                    && edge.site.range.start_byte == type_start
+            }),
+            "the composite-literal type remains a reference to Widget: {answer:#?}"
+        );
+        let key_start = APP.find("Widget:").expect("composite key");
+        assert!(
+            !answer.edges.iter().any(|edge| {
+                edge.site.file == fixture.file("app/app.go")
+                    && edge.site.range.start_byte == key_start
+            }),
+            "a composite-literal key is not a name reference to the package type: {answer:#?}"
+        );
+        let imported_start =
+            APP.find("missing.Widget").expect("qualified missing name") + "missing.".len();
+        assert!(
+            !answer.edges.iter().any(|edge| {
+                edge.site.file == fixture.file("app/app.go")
+                    && edge.site.range.start_byte == imported_start
+            }),
+            "an unresolved external package does not bind to the local Widget: {answer:#?}"
+        );
+    }
+
+    #[test]
+    fn selected_go_inverse_confirms_generic_imported_function_calls() {
+        use crate::analyzer::usages::get_definition::{
+            CallSyntaxKind, call_site_syntax_for_reference,
+        };
+
+        const LIB: &str = "package lib\n\nfunc New[T any]() *T { return new(T) }\n";
+        const APP: &str = "package app\n\nimport \"example.test/transitive/lib\"\n\nfunc use() { _ = lib.New[int]() }\n";
+        let (fixture, analyzer) = transitive_fixture(&[("lib/lib.go", LIB), ("app/app.go", APP)]);
+        let target = target_at(&analyzer, &fixture, "lib/lib.go", "New");
+
+        let answer = inverse(&analyzer, &target);
+        let candidate_paths =
+            crate::analyzer::store::resolution_operation::go_reverse_rows::
+                last_go_reverse_candidate_paths_for_test();
+        assert!(
+            candidate_paths.iter().any(|path| path == "app/app.go"),
+            "the structured imported call must enter forward confirmation: {candidate_paths:?}"
+        );
+
+        let edge = answer
+            .edges
+            .iter()
+            .find(|edge| edge.site.file == fixture.file("app/app.go") && edge.target == target)
+            .expect("the generic imported call must be forward-confirmed");
+        assert_eq!(
+            edge.reference_kind,
+            Some(brokk_bifrost_core::analyzer::usages::model::ReferenceKind::MethodCall),
+            "generic selector calls retain their call classification: {edge:#?}"
+        );
+        let facts = analyzer
+            .structural_fact_providers()
+            .into_iter()
+            .find_map(|provider| provider.structural_facts(&edge.site.file))
+            .expect("imported generic call has structural facts");
+        let syntax = call_site_syntax_for_reference(
+            &facts,
+            edge.site.range.start_byte,
+            edge.site.range.end_byte,
+        )
+        .expect("imported generic reference maps to its call syntax");
+        assert_eq!(syntax.kind, CallSyntaxKind::Method);
+        assert_eq!(
+            answer.completeness,
+            EdgeCompleteness::Complete,
+            "the fixture has a complete package inventory with no build constraints, and the generic imported function binding is exact: {answer:#?}"
+        );
+    }
+
+    #[brokk_bifrost_test_macros::hardwon(
+        "c9cfd997855a: member point confirmation proves methods reached through imported results"
+    )]
     #[test]
     fn selected_go_inverse_follows_intermediate_package_for_methods() {
         const A: &str = r#"package a
@@ -884,14 +1587,20 @@ func use() {
         let (fixture, analyzer) =
             transitive_fixture(&[("a/a.go", A), ("b/b.go", B), ("c/c.go", C)]);
         let target = target_at(&analyzer, &fixture, "a/a.go", "Method");
+        crate::analyzer::store::resolution_operation::go_reverse_rows::
+            reset_go_reverse_qualified_imports_for_test();
         let answer = inverse(&analyzer, &target);
-        assert_transitive_candidate_stays_incomplete(
+        assert_transitive_member_is_point_confirmed(
             &answer,
+            &target,
             "c/c.go",
             "a method reached through b.Get",
         );
     }
 
+    #[brokk_bifrost_test_macros::hardwon(
+        "c9cfd997855a: member point confirmation proves methods reached through imported types"
+    )]
     #[test]
     fn selected_go_inverse_follows_intermediate_package_for_promoted_members() {
         const A: &str = r#"package a
@@ -918,14 +1627,20 @@ func use(s b.S) {
         let (fixture, analyzer) =
             transitive_fixture(&[("a/a.go", A), ("b/b.go", B), ("c/c.go", C)]);
         let target = target_at(&analyzer, &fixture, "a/a.go", "Method");
+        crate::analyzer::store::resolution_operation::go_reverse_rows::
+            reset_go_reverse_qualified_imports_for_test();
         let answer = inverse(&analyzer, &target);
-        assert_transitive_candidate_stays_incomplete(
+        assert_transitive_member_is_point_confirmed(
             &answer,
+            &target,
             "c/c.go",
             "a promoted method reached through b.S",
         );
     }
 
+    #[brokk_bifrost_test_macros::hardwon(
+        "800772caaffe: a qualified Go type alias needs summary evidence for its target"
+    )]
     #[test]
     fn selected_go_inverse_follows_intermediate_package_for_type_aliases() {
         const A: &str = r#"package a
@@ -948,6 +1663,8 @@ var value b.T
         let (fixture, analyzer) =
             transitive_fixture(&[("a/a.go", A), ("b/b.go", B), ("c/c.go", C)]);
         let target = target_at(&analyzer, &fixture, "a/a.go", "T");
+        crate::analyzer::store::resolution_operation::go_reverse_rows::
+            reset_go_reverse_alias_fallbacks_for_test();
         let answer = inverse(&analyzer, &target);
         let definition_plan = crate::analyzer::store::resolution_operation::go_reverse_rows::
             last_go_reverse_definition_plan_for_test();
@@ -986,6 +1703,12 @@ var value b.T
                 .iter()
                 .any(|edge| edge.site.file == fixture.file("c/c.go") && edge.target == target)
         );
+        assert_eq!(
+            crate::analyzer::store::resolution_operation::go_reverse_rows::
+                last_go_reverse_alias_fallbacks_for_test(),
+            0,
+            "the live alias summaries must resolve this chain without forward fallback"
+        );
         assert!(
             answer.edges.iter().all(|edge| edge.target == target),
             "publish only the selected a.T declaration: {answer:#?}"
@@ -1018,6 +1741,84 @@ var value b.T
         assert!(
             matches!(answer.completeness, EdgeCompleteness::Incomplete { .. }),
             "an incomplete Go package publication cannot authorize an empty result: {answer:#?}"
+        );
+    }
+
+    #[test]
+    fn selected_go_reverse_inventory_ignores_unrelated_incomplete_imports() {
+        const MODEL_SOURCE: &str = "package model\ntype Widget struct{}\nfunc NeverUsed() {}\n";
+        const CLIENT_SOURCE: &str = r#"package client
+
+import (
+	. "fmt"
+	. "example.test/transitive/model"
+)
+
+func use() {
+	_ = Widget{}
+	_ = Sprintf(1)
+}
+"#;
+        let (fixture, analyzer) = transitive_fixture(&[
+            ("model/model.go", MODEL_SOURCE),
+            ("client/client.go", CLIENT_SOURCE),
+        ]);
+        let unused = target_at(&analyzer, &fixture, "model/model.go", "NeverUsed");
+        let answer = inverse(&analyzer, &unused);
+        assert!(
+            answer.edges.iter().all(|edge| edge.target == unused),
+            "reverse results remain target-specific: {answer:#?}"
+        );
+        assert_eq!(
+            answer.completeness,
+            EdgeCompleteness::Complete,
+            "an unavailable fmt provider cannot hide references to the selected workspace package: {answer:#?}"
+        );
+
+        let context_id = selected_go_context_id(&analyzer)
+            .unwrap()
+            .expect("selected Go package context");
+        let updated = crate::analyzer::store::resolution_operation::go_reverse_rows::mark_go_import_incomplete_for_test(
+            analyzer.inner.analyzer_store(),
+            context_id,
+            "fmt",
+        )
+        .unwrap();
+        assert_eq!(
+            updated, 1,
+            "the external dot import is present in inventory"
+        );
+        reconcile_go_summaries(&analyzer, context_id);
+        let answer = inverse(&analyzer, &unused);
+        assert_eq!(
+            answer.completeness,
+            EdgeCompleteness::Complete,
+            "an unavailable external dot provider cannot hide references to the selected workspace package: {answer:#?}"
+        );
+
+        let updated = crate::analyzer::store::resolution_operation::go_reverse_rows::mark_go_import_incomplete_for_test(
+            analyzer.inner.analyzer_store(),
+            context_id,
+            "example.test/transitive/model",
+        )
+        .unwrap();
+        assert_eq!(updated, 1, "the target dot import is present in inventory");
+        reconcile_go_summaries(&analyzer, context_id);
+        let removed = crate::analyzer::store::resolution_operation::go_reverse_rows::mark_go_unit_summary_unavailable_for_test(
+            analyzer.inner.analyzer_store(),
+            context_id,
+            crate::analyzer::store::go_unit_summaries::go_unit_key(
+                "example.test/transitive/model",
+                "",
+                "go",
+            ),
+        )
+        .unwrap();
+        assert_eq!(removed, 1, "the selected target summary was withdrawn");
+        let answer = inverse(&analyzer, &unused);
+        assert!(
+            matches!(answer.completeness, EdgeCompleteness::Incomplete { .. }),
+            "a missing selected provider summary keeps reverse absence open: {answer:#?}"
         );
     }
 
@@ -1250,6 +2051,14 @@ var value b.T
                 .any(|detail| detail.contains("resolution_paths_root_terminal")),
             "prefixed root names must seek the selected root-terminal index: {plan:#?}"
         );
+        assert!(
+            plan.iter().all(|detail| !detail.contains("SCAN versions")),
+            "candidate discovery must avoid workspace-wide version scans: {plan:#?}"
+        );
+        assert!(
+            plan.iter().all(|detail| !detail.contains("SCAN members")),
+            "candidate discovery must seek package files from visible packages: {plan:#?}"
+        );
     }
 
     #[test]
@@ -1368,20 +2177,114 @@ var value b.T
             "unexpected native-only calls: {native_only:?}"
         );
         assert!(
-            !selected_complete
-                && matches!(
-                    &selected.completeness,
-                    EdgeCompleteness::Incomplete { reasons }
-                        if reasons.contains(&EdgeIncompleteReason::InverseIndexResolutionIncomplete)
-                ),
-            "external test package context is unavailable, so the native result remains explicitly incomplete: {selected:#?}"
+            selected_complete,
+            "the live unit summaries include the external test package and confirm the same complete call-site set as the incumbent: {selected:#?}"
         );
     }
 
     #[test]
-    fn selected_go_native_rename_refuses_incomplete_qualified_multifile_inventory() {
-        use crate::symbol_rename::{RenameSelection, rename_symbol};
+    #[brokk_bifrost_test_macros::hardwon(
+        "#2771: qualified Go type-prefix candidates skipped the file import binder lookup"
+    )]
+    fn selected_go_inverse_reads_import_binders_for_type_prefix_candidates() {
+        const LIB: &str = "package lib\ntype Widget struct{}\n";
+        const APP: &str =
+            "package app\nimport library \"example.test/transitive/lib\"\nvar _ library.Widget\n";
+        let (fixture, analyzer) = transitive_fixture(&[("lib/lib.go", LIB), ("app/app.go", APP)]);
+        let target = target_at(&analyzer, &fixture, "lib/lib.go", "Widget");
+        crate::analyzer::store::resolution_operation::go_reverse_rows::
+            reset_go_reverse_qualified_imports_for_test();
 
+        let answer = inverse(&analyzer, &target);
+        let imports = crate::analyzer::store::resolution_operation::go_reverse_rows::
+            last_go_reverse_qualified_imports_for_test();
+
+        assert_eq!(
+            answer.completeness,
+            EdgeCompleteness::Complete,
+            "{answer:#?}"
+        );
+        assert!(
+            answer
+                .edges
+                .iter()
+                .any(|edge| edge.site.file == fixture.file("app/app.go")),
+            "the imported type reference is confirmed: {answer:#?}"
+        );
+        assert_eq!(
+            imports.len(),
+            1,
+            "the type-prefix candidate uses one import binder: {imports:?}"
+        );
+        assert!(
+            imports[0].2.is_some(),
+            "the type-prefix path reaches its source import row: {imports:?}"
+        );
+    }
+
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "f389fce9693d: qualified reverse binding must select the binder named at the file Scope endpoint"
+    )]
+    fn selected_go_inverse_selects_the_qualified_import_by_spelling() {
+        const LIB: &str = "package lib\ntype Widget struct{}\n";
+        const AUX: &str = "package auxiliary\nvar Marker int\n";
+        const APP: &str = "package app\nimport (\n library \"example.test/transitive/lib\"\n support \"example.test/transitive/auxiliary\"\n)\ntype Container struct { library *library.Widget }\ntype localLibrary struct { Widget int }\nvar _ = support.Marker\nfunc use() { var item *library.Widget; var library localLibrary; _ = item; _ = library.Widget }\n";
+        let (fixture, analyzer) = transitive_fixture(&[
+            ("lib/lib.go", LIB),
+            ("auxiliary/auxiliary.go", AUX),
+            ("app/app.go", APP),
+        ]);
+        let target = target_at(&analyzer, &fixture, "lib/lib.go", "Widget");
+        crate::analyzer::store::resolution_operation::go_reverse_rows::
+            reset_go_reverse_qualified_imports_for_test();
+
+        let answer = inverse(&analyzer, &target);
+        let imports = crate::analyzer::store::resolution_operation::go_reverse_rows::
+            last_go_reverse_qualified_imports_for_test();
+
+        assert_eq!(
+            answer.completeness,
+            EdgeCompleteness::Complete,
+            "{answer:#?}"
+        );
+        let qualified_widget_starts = APP
+            .match_indices("library.Widget")
+            .map(|(start, _)| start + "library.".len())
+            .collect::<Vec<_>>();
+        assert_eq!(qualified_widget_starts.len(), 3);
+        for &imported_type_start in &qualified_widget_starts[..2] {
+            assert!(
+                answer.edges.iter().any(|edge| {
+                    edge.site.file == fixture.file("app/app.go")
+                        && edge.site.range.start_byte == imported_type_start
+                }),
+                "the import remains visible before a later local declaration: {answer:#?}"
+            );
+        }
+        assert!(
+            !answer.edges.iter().any(|edge| {
+                edge.site.file == fixture.file("app/app.go")
+                    && edge.site.range.start_byte == qualified_widget_starts[2]
+            }),
+            "a local value shadow keeps its member out of package import confirmation: {answer:#?}"
+        );
+        assert_eq!(
+            imports.len(),
+            2,
+            "only qualified package type sites may select the named import: {imports:?}"
+        );
+        assert!(
+            imports.iter().all(|import| import.2 == Some(0)),
+            "the qualifier spelling selects the first source import row: {imports:?}"
+        );
+    }
+
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "22f2f70ef463: complete conditional-file summaries must not make Go rename incomplete"
+    )]
+    fn selected_go_native_rename_confirms_qualified_multifile_inventory() {
         let fixture = InlineTestProject::with_language(Language::Go)
             .file("go.mod", "module example.test/rename\n\ngo 1.22\n")
             .file("provider/api.go", "package provider\nfunc Helper() {}\n")
@@ -1394,113 +2297,65 @@ var value b.T
                 "client/two.go",
                 "package client\nimport pkg \"example.test/rename/provider\"\nfunc Two() { pkg.Helper() }\n",
             )
+            .file(
+                "client/build_constrained.go",
+                "//go:build bifrost_unselected\n\npackage client\n\nimport pkg \"example.test/rename/provider\"\n\nfunc Unselected() { pkg.Helper() }\n",
+            )
             .build();
         let analyzer = GoAnalyzer::new(fixture.project_dyn());
         persist_selected_go_sources(&analyzer);
+        crate::analyzer::store::resolution_operation::go_reverse_rows::
+            reset_go_reverse_qualified_imports_for_test();
         let target = target_at(&analyzer, &fixture, "provider/api.go", "Helper");
-        let native_error = super::super::native_rename::go_native_rename(
+        let renamed = super::super::native_rename::go_native_rename(
             &analyzer,
             fixture.project(),
             &target,
             "Assist",
             &CancellationToken::new(),
         )
-        .expect_err("rename must refuse unresolved selected inverse evidence");
-        assert_eq!(native_error.kind, "incomplete_analysis", "{native_error:?}");
+        .expect("complete qualified summary rows confirm every candidate site");
+        let qualified_imports = crate::analyzer::store::resolution_operation::go_reverse_rows::
+            last_go_reverse_qualified_imports_for_test();
+        assert_eq!(
+            qualified_imports.len(),
+            3,
+            "each qualified fixture site reaches its source import binder: {qualified_imports:?}"
+        );
         assert!(
-            native_error
-                .message
-                .contains("InverseIndexReferenceEnumerationIncomplete")
-                && native_error
-                    .message
-                    .contains("InverseIndexResolutionIncomplete"),
-            "the refusal names both incomplete inventory sources: {native_error:?}"
-        );
-
-        let source = fixture
-            .project()
-            .read_source(&fixture.file("provider/api.go"))
-            .expect("provider source");
-        let declaration = source.find("Helper").expect("declaration name");
-        let incumbent = rename_symbol(
-            &analyzer,
-            fixture.project(),
-            fixture.file("provider/api.go"),
-            RenameSelection::ByteOffset(declaration),
-            "Assist",
-        )
-        .unwrap_or_else(|error| panic!("incumbent Go rename refused fixture: {error:?}"));
-        let edits = |result: &crate::symbol_rename::RenameResult| {
-            result
-                .files
+            qualified_imports
                 .iter()
-                .flat_map(|file| {
-                    file.edits.iter().map(|edit| {
-                        (
-                            file.file.rel_path().to_path_buf(),
-                            edit.start_byte,
-                            edit.end_byte,
-                            edit.new_text.clone(),
-                        )
-                    })
-                })
-                .collect::<BTreeSet<_>>()
-        };
-        assert_eq!(
-            incumbent
-                .files
-                .iter()
-                .map(|file| file.file.rel_path().to_path_buf())
-                .collect::<BTreeSet<_>>(),
-            BTreeSet::from([
-                std::path::PathBuf::from("provider/api.go"),
-                std::path::PathBuf::from("provider/other.go"),
-                std::path::PathBuf::from("client/one.go"),
-                std::path::PathBuf::from("client/two.go"),
-            ]),
-            "the incumbent finds the declaration, same-package, and aliased cross-package references"
+                .all(|(_, _, import_id)| import_id.is_some()),
+            "the stored qualifier path selects exact source import IDs: {qualified_imports:?}"
         );
-        assert_eq!(
-            edits(&incumbent).len(),
-            4,
-            "the incumbent's multi-file source edits are the adjudication baseline"
+        assert_eq!(renamed.files.len(), 5, "{renamed:#?}");
+        assert!(
+            renamed.files.iter().all(|file| !file.edits.is_empty()),
+            "every selected declaration and confirmed use has an edit: {renamed:#?}"
         );
-        for file in incumbent
-            .files
-            .iter()
-            .filter(|file| file.file.rel_path().starts_with("client"))
-        {
-            let source = fixture
-                .project()
-                .read_source(&file.file)
-                .expect("aliased client source");
-            for edit in &file.edits {
-                assert_eq!(
-                    source.get(edit.start_byte..edit.end_byte),
-                    Some("Helper"),
-                    "incumbent leaves import alias `pkg` untouched"
-                );
-            }
-        }
     }
 
     #[test]
-    fn selected_go_native_rename_refuses_incomplete_inventory_before_capture_check() {
+    #[brokk_bifrost_test_macros::hardwon(
+        "9df40beaa3e1: counterfactual Go rename publication missed a local capture"
+    )]
+    fn selected_go_native_rename_checks_capture_after_build_selection_gaps() {
         let fixture = InlineTestProject::with_language(Language::Go)
             .file("go.mod", "module example.test/capture\n\ngo 1.22\n")
             .file(
                 "main.go",
                 "package capture\nfunc Original() {}\nfunc caller() { taken := 1; Original(); _ = taken }\n",
             )
+            .file(
+                "build_constrained.go",
+                "//go:build bifrost_unselected\n\npackage capture\n\nfunc unselectedCaller() { Original() }\n",
+            )
             .build();
         let analyzer = GoAnalyzer::new(fixture.project_dyn());
         persist_selected_go_sources(&analyzer);
         let target = target_at(&analyzer, &fixture, "main.go", "Original");
         let selected = inverse(&analyzer, &target);
-        assert!(matches!(
-            selected.completeness,
-            EdgeCompleteness::Incomplete { .. }
-        ));
+        assert!(matches!(selected.completeness, EdgeCompleteness::Complete));
         let error = super::super::native_rename::go_native_rename(
             &analyzer,
             fixture.project(),
@@ -1509,13 +2364,41 @@ var value b.T
             &CancellationToken::new(),
         )
         .expect_err("the local variable would capture the renamed call");
-        assert_eq!(error.kind, "incomplete_analysis", "{error:?}");
+        assert_eq!(error.kind, "capture_or_rebinding", "{error:?}");
         assert!(
-            error
-                .message
-                .contains("InverseIndexReferenceEnumerationIncomplete")
-                && error.message.contains("InverseIndexResolutionIncomplete"),
-            "the incomplete source inventory blocks counterfactual capture analysis: {error:?}"
+            error.message.contains("captured") && error.message.contains("taken"),
+            "the saved scope rows identify the capturing local declaration: {error:?}"
+        );
+    }
+
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "9df40beaa3e1: counterfactual Go rename publication missed a root-name rebinding"
+    )]
+    fn selected_go_native_rename_detects_rebinding_of_an_existing_builtin_reference() {
+        let fixture = InlineTestProject::with_language(Language::Go)
+            .file("go.mod", "module example.test/rename\n\ngo 1.22\n")
+            .file(
+                "main.go",
+                "package rename\nfunc Original() {}\nfunc useOriginal() { Original() }\nfunc useBuiltin() { _ = len([]int{1}) }\n",
+            )
+            .build();
+        let analyzer = GoAnalyzer::new(fixture.project_dyn());
+        persist_selected_go_sources(&analyzer);
+        let target = target_at(&analyzer, &fixture, "main.go", "Original");
+
+        let error = super::super::native_rename::go_native_rename(
+            &analyzer,
+            fixture.project(),
+            &target,
+            "len",
+            &CancellationToken::new(),
+        )
+        .expect_err("renaming to len would rebind the existing builtin call");
+        assert_eq!(error.kind, "capture_or_rebinding", "{error:?}");
+        assert!(
+            error.message.contains("rebinds") && error.message.contains("len"),
+            "the saved root-terminal path names the rebound builtin use: {error:?}"
         );
     }
 }

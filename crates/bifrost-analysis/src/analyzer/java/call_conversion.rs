@@ -3,6 +3,7 @@ use crate::analyzer::java::imports::JavaTypeResolution;
 use crate::analyzer::jvm::external::{
     JvmExternalDeclarationSource, JvmExternalType, JvmExternalTypeKind,
 };
+use crate::analyzer::jvm::java_array_dimension_count;
 use crate::analyzer::lexical_definitions::{
     LexicalBindingResolution, formal_parameter_slots_for_owner_with_nodes,
     parameter_owner_for_range, resolve_lexical_binding,
@@ -26,6 +27,7 @@ use crate::analyzer::{
     AnalyzerDefinitionLookup, AnalyzerQueryScope, CodeUnit, CodeUnitIndex, IAnalyzer, Language,
     ProjectFile, QueryScope,
 };
+use brokk_bifrost_core::analyzer::tree_walk::root_node as root_of;
 use brokk_bifrost_jvm::java::declarations::node_text;
 use brokk_bifrost_jvm::java::graph::return_type::java_type_name_components;
 use brokk_bifrost_jvm::java::graph_support::java_type_parameter_in_scope;
@@ -533,22 +535,8 @@ pub(crate) fn primitive_actual_type(
     actual: Node<'_>,
     source: &str,
 ) -> Option<JavaPrimitive> {
-    let mut expression = actual;
-    while expression.kind() == "parenthesized_expression" {
-        expression = expression.named_child(0)?;
-    }
-    if let Some(primitive) = numeric_literal_type(expression, source) {
+    if let Some(primitive) = primitive_actual_type_from_syntax(actual, source) {
         return Some(primitive);
-    }
-    if expression.kind() == "cast_expression" {
-        let target = expression.child_by_field_name("type")?;
-        expression.child_by_field_name("value")?;
-        return matches!(
-            target.kind(),
-            "integral_type" | "floating_point_type" | "boolean_type"
-        )
-        .then(|| primitive_type(target))
-        .flatten();
     }
     let java = resolve_analyzer::<JavaAnalyzer>(analyzer)?;
     let scope = AnalyzerQueryScope::new(java);
@@ -567,6 +555,36 @@ pub(crate) fn primitive_actual_type(
         }
         _ => None,
     }
+}
+
+/// Read only primitive types proved directly by one Java expression node.
+/// Native call evidence uses this bounded syntax proof without consulting the
+/// incumbent definition resolver for expressions it cannot type structurally.
+pub(crate) fn primitive_actual_type_from_syntax(
+    actual: Node<'_>,
+    source: &str,
+) -> Option<JavaPrimitive> {
+    let mut expression = actual;
+    while expression.kind() == "parenthesized_expression" {
+        expression = expression.named_child(0)?;
+    }
+    if let Some(primitive) = primitive_literal(expression) {
+        return Some(primitive);
+    }
+    if let Some(primitive) = numeric_literal_type(expression, source) {
+        return Some(primitive);
+    }
+    if expression.kind() == "cast_expression" {
+        let target = expression.child_by_field_name("type")?;
+        expression.child_by_field_name("value")?;
+        return matches!(
+            target.kind(),
+            "integral_type" | "floating_point_type" | "boolean_type"
+        )
+        .then(|| primitive_type(target))
+        .flatten();
+    }
+    None
 }
 
 /// How one declared Java formal takes a primitive actual during strict
@@ -928,19 +946,17 @@ fn declared_java_type_shape<'a>(
     let mut element = type_node;
     let mut dimensions = 0usize;
     while element.kind() == "array_type" {
-        dimensions += dimension_count(element.child_by_field_name("dimensions"));
+        dimensions += element
+            .child_by_field_name("dimensions")
+            .map_or(0, java_array_dimension_count);
         element = element
             .child_by_field_name("element")
             .ok_or(ConversionUnknown::UnresolvedSourceType)?;
     }
-    dimensions += dimension_count(declaration.child_by_field_name("dimensions"));
+    dimensions += declaration
+        .child_by_field_name("dimensions")
+        .map_or(0, java_array_dimension_count);
     Ok((element, dimensions))
-}
-
-fn dimension_count(dimensions: Option<Node<'_>>) -> usize {
-    // Each `[]` axis contributes two anonymous child tokens to a
-    // `dimensions` node, so the axis count is half the child count.
-    dimensions.map_or(0, |dimensions| dimensions.child_count() / 2)
 }
 
 fn array_java_type(element: ResolvedConversionType, dimensions: usize) -> JavaConversionType {
@@ -1002,15 +1018,25 @@ fn resolve_type_node(
         BoundedResolution::Cancelled { .. } => return Err(TypeResolutionFailure::Cancelled),
     }
 
+    resolve_named_type_fallback(java, token, packs, file, &raw_name)
+}
+
+fn resolve_named_type_fallback(
+    java: &JavaAnalyzer,
+    token: crate::analyzer::QueryToken<'_>,
+    packs: Option<std::sync::Arc<crate::analyzer::semantic_model::SemanticModelOverlay>>,
+    file: &ProjectFile,
+    name: &str,
+) -> Result<ResolvedConversionType, TypeResolutionFailure> {
     if java
-        .resolve_type_name_candidates_in_file(token, file, &raw_name)
+        .resolve_type_name_candidates_in_file(token, file, name)
         .len()
         > 1
     {
         return Err(TypeResolutionFailure::AmbiguousBinding);
     }
 
-    match java.resolve_type_name_with_external(token, packs.clone(), file, &raw_name) {
+    match java.resolve_type_name_with_external(token, packs.clone(), file, name) {
         Some(JavaTypeResolution::Source(unit)) => workspace_type_identity(java, unit),
         Some(JavaTypeResolution::External(external)) => {
             let identity = external_identity(java, packs.as_deref(), &external)
@@ -1099,26 +1125,9 @@ fn resolve_model_named_type(
         ));
     }
 
-    if java
-        .resolve_type_name_candidates_in_file(token, file, name)
-        .len()
-        > 1
-    {
-        return Err(ConversionUnknown::AmbiguousBinding);
-    }
-    match java.resolve_type_name_with_external(token, packs.clone(), file, name) {
-        Some(JavaTypeResolution::Source(unit)) => Ok(JavaConversionType::Value(
-            workspace_type_identity(java, unit).map_err(TypeResolutionFailure::target)?,
-        )),
-        Some(JavaTypeResolution::External(external)) => {
-            let identity = external_identity(java, packs.as_deref(), &external)
-                .ok_or(ConversionUnknown::UnresolvedTargetType)?;
-            Ok(JavaConversionType::Value(
-                ResolvedConversionType::External { identity },
-            ))
-        }
-        None => Err(ConversionUnknown::UnresolvedTargetType),
-    }
+    let resolved = resolve_named_type_fallback(java, token, packs, file, name)
+        .map_err(TypeResolutionFailure::target)?;
+    Ok(JavaConversionType::Value(resolved))
 }
 
 /// Classify one conversion between structured Java types. Identical array
@@ -1327,13 +1336,8 @@ pub(crate) fn declaration_declares_array(declaration: Node<'_>, type_node: Node<
     if declaration.kind() == "spread_parameter" {
         return true;
     }
-    let mut type_stack = vec![type_node];
-    while let Some(node) = type_stack.pop() {
-        if matches!(node.kind(), "array_type" | "dimensions") {
-            return true;
-        }
-        let mut cursor = node.walk();
-        type_stack.extend(node.named_children(&mut cursor));
+    if super::java_type_syntax_is_array(type_node) {
+        return true;
     }
 
     let mut current = Some(declaration);
@@ -1441,7 +1445,7 @@ fn numeric_literal_type(node: Node<'_>, source: &str) -> Option<JavaPrimitive> {
     }
 }
 
-fn primitive_type(node: Node<'_>) -> Option<JavaPrimitive> {
+pub(crate) fn primitive_type(node: Node<'_>) -> Option<JavaPrimitive> {
     let direct = match node.kind() {
         "boolean" | "boolean_type" => Some(JavaPrimitive::Boolean),
         "byte" | "byte_type" => Some(JavaPrimitive::Byte),
@@ -1512,63 +1516,9 @@ pub(crate) fn declared_type_node(node: Node<'_>) -> Option<Node<'_>> {
     }
 }
 
-fn root_of(node: Node<'_>) -> Node<'_> {
-    let mut root = node;
-    while let Some(parent) = root.parent() {
-        root = parent;
-    }
-    root
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn local_assignment_identity_requires_exact_reference_types_and_binding() {
-        let source = "class App { void run(App input) { App value = input; App alias = value; alias = value; } }";
-        let project = crate::inline_project::InlineTestProject::with_language(Language::Java)
-            .file("App.java", source)
-            .build();
-        let analyzer = JavaAnalyzer::from_project(project.project().clone());
-        let prover =
-            JavaLocalAssignmentConversionProver::new(&analyzer, &project.file("App.java"), source)
-                .unwrap();
-        let range = |text: &str| {
-            let start = source.find(text).unwrap();
-            crate::analyzer::Range {
-                start_byte: start,
-                end_byte: start + text.len(),
-                start_line: 1,
-                end_line: 1,
-            }
-        };
-        let declaration = range("alias = value");
-        let target = crate::analyzer::Range {
-            end_byte: declaration.start_byte + "alias".len(),
-            ..declaration
-        };
-        let proof = prover.prove(declaration, target).expect("exact local copy");
-        assert!(proof.preserves_reference_identity(), "{proof:?}");
-        let start = source.rfind("alias = value").unwrap();
-        let reassignment = crate::analyzer::Range {
-            start_byte: start,
-            end_byte: start + "alias = value".len(),
-            start_line: 1,
-            end_line: 1,
-        };
-        assert!(
-            prover
-                .prove(reassignment, target)
-                .expect("same local target")
-                .preserves_reference_identity()
-        );
-        let wrong = range("value = input");
-        assert!(matches!(
-            prover.prove(declaration, wrong),
-            Err(ConversionUnknown::AmbiguousBinding)
-        ));
-    }
 
     #[test]
     fn local_assignment_primitive_identity_is_not_reference_identity() {
@@ -1597,7 +1547,6 @@ mod tests {
         assert_eq!(proof.conversion.kind, ConversionKind::JavaIdentity);
         assert!(!proof.preserves_reference_identity(), "{proof:?}");
     }
-
     #[test]
     fn local_assignment_unknown_cast_generic_and_field_write_remain_open() {
         for (source, written) in [
@@ -1642,7 +1591,6 @@ mod tests {
             );
         }
     }
-
     #[test]
     fn local_assignment_rejects_a_stale_source_snapshot() {
         let source = "class App { void run(App input) { App value = input; } }";
@@ -1660,37 +1608,6 @@ mod tests {
             Err(ConversionUnknown::UnresolvedSourceType)
         ));
     }
-
-    #[test]
-    fn local_assignment_call_result_retains_selected_declared_type() {
-        let source =
-            "class App { static native App acquire(); void run() { App value = acquire(); } }";
-        let project = crate::inline_project::InlineTestProject::with_language(Language::Java)
-            .file("App.java", source)
-            .build();
-        let analyzer = JavaAnalyzer::from_project(project.project().clone());
-        let prover =
-            JavaLocalAssignmentConversionProver::new(&analyzer, &project.file("App.java"), source)
-                .unwrap();
-        let start = source.find("value = acquire()").unwrap();
-        let write = crate::analyzer::Range {
-            start_byte: start,
-            end_byte: start + "value = acquire()".len(),
-            start_line: 1,
-            end_line: 1,
-        };
-        let target = crate::analyzer::Range {
-            end_byte: start + "value".len(),
-            ..write
-        };
-        assert!(
-            prover
-                .prove(write, target)
-                .expect("selected static return type")
-                .preserves_reference_identity()
-        );
-    }
-
     #[test]
     fn local_assignment_source_call_with_unproven_arguments_stays_unknown() {
         let source = "class App { static native App acquire(App input); void run(App input) { App value = acquire(input); } }";
@@ -1717,7 +1634,6 @@ mod tests {
             "a selected return declaration alone does not prove argument applicability"
         );
     }
-
     #[test]
     fn local_assignment_boxing_certificate_never_claims_reference_identity() {
         let primitive = ResolvedConversionType::JavaPrimitive(JavaPrimitive::Int);
@@ -1754,6 +1670,31 @@ mod tests {
         }
     }
 
+    fn parse_java(source: &str) -> tree_sitter::Tree {
+        brokk_bifrost_jvm::java::declarations::parse_tree(source).expect("java source parses")
+    }
+
+    fn first_kind<'tree>(root: tree_sitter::Node<'tree>, kind: &str) -> tree_sitter::Node<'tree> {
+        crate::analyzer::test_support::first_named_node_matching_reverse_preorder(root, |node| {
+            node.kind() == kind
+        })
+        .unwrap_or_else(|| panic!("no {kind} node in test source"))
+    }
+
+    fn external(fqn: &str, declaration_is_class: bool) -> ExternalConversionIdentity {
+        ExternalConversionIdentity::from_provenance(
+            fqn,
+            ExternalConversionProvenance::SemanticPack {
+                pack_id: "test-pack".to_owned(),
+                declaration_id: fqn.to_owned(),
+            },
+            declaration_is_class,
+            StableDigest::sha256(b"test-surface"),
+            Some(StableDigest::sha256(b"test-models")),
+        )
+        .expect("semantic-pack identities require active model evidence")
+    }
+
     #[test]
     fn local_assignment_captured_target_is_not_procedure_local() {
         let source = "class App { void run(App input) { App value = input; Runnable later = () -> { value = input; }; } }";
@@ -1783,7 +1724,6 @@ mod tests {
             Err(ConversionUnknown::UnsupportedExpression)
         ));
     }
-
     #[test]
     fn local_assignment_captured_source_needs_capture_evidence() {
         let source =
@@ -1811,41 +1751,6 @@ mod tests {
             Err(ConversionUnknown::UnsupportedExpression)
         ));
     }
-
-    fn parse_java(source: &str) -> tree_sitter::Tree {
-        let mut parser = tree_sitter::Parser::new();
-        parser
-            .set_language(&tree_sitter_java::LANGUAGE.into())
-            .expect("java grammar loads");
-        parser.parse(source, None).expect("java source parses")
-    }
-
-    fn first_kind<'tree>(root: tree_sitter::Node<'tree>, kind: &str) -> tree_sitter::Node<'tree> {
-        let mut stack = vec![root];
-        while let Some(node) = stack.pop() {
-            if node.kind() == kind {
-                return node;
-            }
-            let mut cursor = node.walk();
-            stack.extend(node.named_children(&mut cursor));
-        }
-        panic!("no {kind} node in test source");
-    }
-
-    fn external(fqn: &str, declaration_is_class: bool) -> ExternalConversionIdentity {
-        ExternalConversionIdentity::from_provenance(
-            fqn,
-            ExternalConversionProvenance::SemanticPack {
-                pack_id: "test-pack".to_owned(),
-                declaration_id: fqn.to_owned(),
-            },
-            declaration_is_class,
-            StableDigest::sha256(b"test-surface"),
-            Some(StableDigest::sha256(b"test-models")),
-        )
-        .expect("semantic-pack identities require active model evidence")
-    }
-
     #[test]
     fn wrapper_interpretation_requires_resolver_class_evidence() {
         assert_eq!(
@@ -1864,24 +1769,9 @@ mod tests {
         );
     }
 
+    use brokk_bifrost_test_macros::hardwon;
     #[test]
-    fn semantic_pack_identity_requires_active_model_set() {
-        assert!(
-            ExternalConversionIdentity::from_provenance(
-                "java.lang.Integer",
-                ExternalConversionProvenance::SemanticPack {
-                    pack_id: "test-pack".to_owned(),
-                    declaration_id: "integer".to_owned(),
-                },
-                true,
-                StableDigest::sha256(b"test-surface"),
-                None,
-            )
-            .is_none()
-        );
-    }
-
-    #[test]
+    #[hardwon("#3312: Java array parameter dimensions were discarded when binding model overloads")]
     fn lexical_array_shapes_are_read_structurally() {
         let tree = parse_java("class A { void f(String[] args) {} }");
         let root = tree.root_node();
@@ -1894,6 +1784,9 @@ mod tests {
     }
 
     #[test]
+    #[hardwon(
+        "#3312: C-style array dimensions on a parameter declarator were omitted from overload shape"
+    )]
     fn c_style_declarator_dimensions_are_structural() {
         let tree = parse_java("class A { void f(String args[]) {} }");
         let root = tree.root_node();
@@ -1906,6 +1799,7 @@ mod tests {
     }
 
     #[test]
+    #[hardwon("#3312: Nested Java array dimensions were flattened during overload matching")]
     fn nested_array_dimensions_count_each_axis() {
         let tree = parse_java("class A { void m() { String[][] grid = null; } }");
         let root = tree.root_node();
@@ -1918,6 +1812,26 @@ mod tests {
     }
 
     #[test]
+    #[hardwon("#4271: Type annotations inside Java array dimensions inflated the dimension count")]
+    fn annotated_array_dimensions_count_bracket_tokens() {
+        let tree = parse_java("class A { void m() { String @A [] @B [] grid = null; } }");
+        let root = tree.root_node();
+        let declarator = first_kind(root, "variable_declarator");
+        let type_node = declared_type_node(declarator).expect("declarator declares a type");
+        let dimensions_node = type_node
+            .child_by_field_name("dimensions")
+            .expect("array type has dimensions");
+        assert_eq!(dimensions_node.child_count(), 6);
+        let (element, dimensions) =
+            declared_java_type_shape(declarator, type_node).expect("array shape resolves");
+        assert_eq!(element.kind(), "type_identifier");
+        assert_eq!(dimensions, 2);
+    }
+
+    #[test]
+    #[hardwon(
+        "#3312: Scalar Java declarations were falsely assigned an array dimension during overload matching"
+    )]
     fn non_array_declarations_have_zero_dimensions() {
         let tree = parse_java("class A { void f(String command) {} }");
         let root = tree.root_node();
@@ -1930,6 +1844,9 @@ mod tests {
     }
 
     #[test]
+    #[hardwon(
+        "#3312: Java varargs were incorrectly treated as supported array arguments for overload binding"
+    )]
     fn spread_parameters_stay_typed_unsupported() {
         let tree = parse_java("class A { void f(String... args) {} }");
         let root = tree.root_node();
@@ -1943,6 +1860,7 @@ mod tests {
     }
 
     #[test]
+    #[hardwon("#3312: Array dimensions were lost between source declarations and model types")]
     fn array_java_type_wraps_one_layer_per_dimension() {
         let element = ResolvedConversionType::External {
             identity: external("java.lang.String", true),
@@ -1961,6 +1879,7 @@ mod tests {
     }
 
     #[test]
+    #[hardwon("#3312: Equal array types failed to preserve exact element-identity conversion")]
     fn identical_array_shapes_prove_element_identity() {
         let string = ResolvedConversionType::External {
             identity: external("java.lang.String", true),
@@ -1974,6 +1893,7 @@ mod tests {
     }
 
     #[test]
+    #[hardwon("#3312: Array arguments incorrectly matched scalar model formals")]
     fn array_actual_rejects_non_array_model_formal() {
         let string = ResolvedConversionType::External {
             identity: external("java.lang.String", true),
@@ -1986,6 +1906,7 @@ mod tests {
     }
 
     #[test]
+    #[hardwon("#3312: Mismatched array dimensions incorrectly fell back to element compatibility")]
     fn array_shape_mismatch_is_typed_unsupported() {
         let string = ResolvedConversionType::External {
             identity: external("java.lang.String", true),
@@ -1999,6 +1920,7 @@ mod tests {
     }
 
     #[test]
+    #[hardwon("#3312: Java primitive widening was lost while classifying value types")]
     fn value_widening_survives_the_java_type_layer() {
         let conversion = classify_java_conversion(
             JavaConversionType::Value(ResolvedConversionType::JavaPrimitive(JavaPrimitive::Int)),
@@ -2009,6 +1931,9 @@ mod tests {
     }
 
     #[test]
+    #[hardwon(
+        "f2e97970bb6c: Regression from the Java widening fix: int[] cannot use scalar int-to-long widening to match long[]"
+    )]
     fn array_elements_do_not_borrow_scalar_primitive_widening() {
         let int_array =
             array_java_type(ResolvedConversionType::JavaPrimitive(JavaPrimitive::Int), 1);

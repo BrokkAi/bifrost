@@ -28,9 +28,7 @@
 //! - the identity of the mounts the request may currently bind into.
 //!
 //! The first three are what `candidate_coverage_fingerprint` already combines.
-//! The fourth is not in that fingerprint, and
-//! `.agents/docs/stack-graph-reader-statement-lifetime-2026-09-21.md` records
-//! why it has to be in this one: `persisted_reference_seeds` combines ordinary
+//! The fourth is not in that fingerprint: `persisted_reference_seeds` combines ordinary
 //! metadata, stage metadata, fragment and local gaps and effective closed
 //! reasons, every membership read joins
 //! `temp.selected_resolution_scope_mounts`, and a forward Rust request narrows
@@ -60,7 +58,6 @@
 //! workload is killed by `timeout` and never closes its request, so a profile
 //! that only wrote at the request boundary would write nothing at all for it.
 
-use std::io::Write;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Mutex, OnceLock};
@@ -220,13 +217,12 @@ impl Profile {
     }
 
     fn write_line(&self, line: &str) {
-        let mut output = self
-            .output
-            .lock()
-            .expect("seed key profile output poisoned");
-        if let Err(error) = writeln!(output, "{line}").and_then(|()| output.flush()) {
-            eprintln!("Bifrost seed key profile could not write a line: {error}");
-        }
+        super::write_profile_line(
+            &self.output,
+            line,
+            "seed key profile output poisoned",
+            "seed key profile",
+        );
     }
 }
 
@@ -376,7 +372,9 @@ fn call_object(kind: &str, call: &Call) -> serde_json::Value {
                 "reference": key.reference,
                 "request": key.request,
                 "content_epoch": key.content_epoch,
-                "scope": hex(&call.scopes[key.scope as usize]),
+                "scope": crate::analyzer::canonical_hash::lower_hex_string(
+                    &call.scopes[key.scope as usize],
+                ),
                 "reads": reads,
             })
         })
@@ -408,7 +406,11 @@ fn call_object(kind: &str, call: &Call) -> serde_json::Value {
             "9_16": histogram[4],
             "17_plus": histogram[5],
         },
-        "scopes": call.scopes.iter().map(hex).collect::<Vec<_>>(),
+        "scopes": call
+            .scopes
+            .iter()
+            .map(crate::analyzer::canonical_hash::lower_hex_string)
+            .collect::<Vec<_>>(),
         "top_keys": top,
     })
 }
@@ -424,15 +426,6 @@ const fn bucket(reads: u64) -> usize {
         9..=16 => 4,
         _ => 5,
     }
-}
-
-fn hex(bytes: &[u8; 32]) -> String {
-    use std::fmt::Write as _;
-    let mut text = String::with_capacity(bytes.len() * 2);
-    for byte in bytes {
-        write!(text, "{byte:02x}").expect("writing to a String cannot fail");
-    }
-    text
 }
 
 /// The bytes one seed result occupies, near enough for a cache-size decision.
@@ -572,25 +565,5 @@ impl Drop for CallScope {
         profile.calls.fetch_add(1, Ordering::Relaxed);
         profile.write_line(&line);
         write_totals();
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    // Whether the instrument is off without its variable is not asserted here.
-    // [`TEST_PROFILE`] is process-global and
-    // `resolution_stage::lexical_reader_tests` turns it on, so a test in this
-    // binary that asserted the off state would depend on which test ran first.
-    // That test owns both halves instead.
-
-    #[test]
-    fn reads_per_key_buckets_cover_every_count() {
-        assert_eq!(
-            (1..=20).map(bucket).collect::<Vec<_>>(),
-            vec![0, 1, 2, 2, 3, 3, 3, 3, 4, 4, 4, 4, 4, 4, 4, 4, 5, 5, 5, 5]
-        );
-        assert_eq!(bucket(u64::MAX), 5);
     }
 }

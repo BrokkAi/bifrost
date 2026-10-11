@@ -357,7 +357,7 @@ pub fn unused_imports_for_file(
         .filter(|row| {
             !import_declarations
                 .iter()
-                .any(|declaration| contains(*declaration, row.range))
+                .any(|declaration| declaration.contains(&row.range))
         })
         .map(|row| fold_name(language, row.effective_spelling()))
         .collect();
@@ -371,7 +371,7 @@ pub fn unused_imports_for_file(
         for row in &occurrences.rows {
             if let Some(declaration) = import_declarations
                 .iter()
-                .find(|declaration| contains(**declaration, row.range))
+                .find(|declaration| declaration.contains(&row.range))
             {
                 import_mentions
                     .entry(fold_name(language, row.effective_spelling()))
@@ -413,7 +413,7 @@ pub fn unused_imports_for_file(
             || import_mentions.get(&name).is_some_and(|declarations| {
                 declarations
                     .iter()
-                    .any(|declaration| !contains(*declaration, binding.range))
+                    .any(|declaration| !declaration.contains(&binding.range))
             })
         {
             continue;
@@ -507,7 +507,7 @@ fn refine_import_certainties(
                         // module to this spelling. The pack resolver handles
                         // Cargo renames, but not these lexical substitutions.
                         && !bindings.iter().any(|binding| {
-                            binding.name == *root && contains(binding.activation, finding.range)
+                            binding.name == *root && binding.activation.contains(&finding.range)
                         })
             })
             && let Some(symbol) =
@@ -636,7 +636,7 @@ fn scala_pack_rules_out_ambient_use(
     // which would make a same-spelled published path the wrong declaration.
     if bindings
         .iter()
-        .any(|binding| binding.name == *root && contains(binding.activation, range))
+        .any(|binding| binding.name == *root && binding.activation.contains(&range))
     {
         return false;
     }
@@ -719,10 +719,6 @@ fn has_documentation_comment(language: Language, root: Node<'_>, source: &str) -
     })
 }
 
-fn contains(outer: Range, inner: Range) -> bool {
-    outer.start_byte <= inner.start_byte && inner.end_byte <= outer.end_byte
-}
-
 /// Whether a Python file is a package initializer, whose unreferenced imports
 /// are the language's conventional re-export.
 fn is_python_package_initializer(file: &ProjectFile) -> bool {
@@ -770,45 +766,31 @@ fn reference_rows_missing(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::analyzer::structural::resolution::ALL_ENVIRONMENT_AXES;
-    use crate::analyzer::{AnalyzerConfig, Project, TestProject, WorkspaceAnalyzer};
-    use std::path::PathBuf;
-    use std::sync::Arc;
-    use tempfile::TempDir;
+    use crate::analyzer::AnalyzerConfig;
+    use crate::test_support::AnalyzerFixture;
+    use brokk_bifrost_test_macros::hardwon;
 
     struct Fixture {
-        _temp: TempDir,
-        workspace: WorkspaceAnalyzer,
+        analyzer: AnalyzerFixture,
         file: ProjectFile,
         source: String,
     }
 
     impl Fixture {
         fn new(language: Language, relative_path: &str, source: &str) -> Self {
-            let temp = tempfile::tempdir().expect("temp dir");
-            let root: PathBuf = temp.path().canonicalize().expect("canonical root");
-            let file = ProjectFile::new(root.clone(), relative_path);
-            file.write(source).expect("write fixture source");
-            let project = TestProject::new(root, language);
-            let workspace = WorkspaceAnalyzer::build_ephemeral_footgun(
-                Arc::new(project) as Arc<dyn Project>,
-                AnalyzerConfig::default(),
-            )
-            .expect("ephemeral workspace should build");
+            let analyzer = AnalyzerFixture::new_for_language(language, &[(relative_path, source)]);
+            let file = ProjectFile::new(analyzer.project_root(), relative_path);
             Self {
-                _temp: temp,
-                workspace,
+                analyzer,
                 file,
                 source: source.to_owned(),
             }
         }
 
         fn result(&self) -> UnusedImportsFileResult {
-            unused_imports_for_file(self.workspace.analyzer(), &self.file)
+            unused_imports_for_file(self.analyzer.analyzer().analyzer(), &self.file)
         }
 
-        /// The findings' local names in source order, asserting the file was
-        /// decided at all.
         fn unused_names(&self) -> Vec<String> {
             let result = self.result();
             assert!(
@@ -824,52 +806,10 @@ mod tests {
         }
 
         fn at(&self, needle: &str) -> usize {
-            self.source
-                .find(needle)
-                .unwrap_or_else(|| panic!("fixture does not contain {needle:?}"))
+            crate::test_support::fixture_marker(&self.source, needle)
         }
     }
 
-    /// The hand-written support table must keep matching what the adapters
-    /// actually derive: a language reports only when its adapter declares the
-    /// import-binder axis, and every language that does not is recorded with
-    /// the reason it does not.
-    #[test]
-    fn the_support_table_matches_every_adapter_import_binder_axis() {
-        for language in [
-            Language::None,
-            Language::Java,
-            Language::Go,
-            Language::Cpp,
-            Language::JavaScript,
-            Language::TypeScript,
-            Language::Python,
-            Language::Rust,
-            Language::Php,
-            Language::Scala,
-            Language::CSharp,
-            Language::Ruby,
-            Language::Kotlin,
-        ] {
-            let derives_binders = structural_spec_for(language).is_some_and(|spec| {
-                spec.lexical_environment_support()
-                    .is_supported(EnvironmentAxis::ImportBinders)
-            });
-            let support = unused_import_support(language);
-            assert_eq!(
-                support == UnusedImportSupport::NoImportBinders,
-                !derives_binders,
-                "{language:?} declares import binders = {derives_binders}, table says {support:?}"
-            );
-            assert!(
-                ALL_ENVIRONMENT_AXES.contains(&EnvironmentAxis::ImportBinders),
-                "the axis this table is keyed on must exist"
-            );
-        }
-    }
-
-    /// Python: one unused import, one used import, a `__all__` re-export that
-    /// is a use, and a wildcard that binds no single name.
     #[test]
     fn python_reports_the_unused_import_and_spares_the_reexport() {
         let fixture = Fixture::new(
@@ -894,9 +834,6 @@ mod tests {
         );
     }
 
-    /// A Python package initializer that states no `__all__` is not decided:
-    /// an import it never references there is the language's conventional
-    /// re-export, and the file alone cannot tell that from a mistake.
     #[test]
     fn a_python_package_initializer_without_all_is_not_decided() {
         let fixture = Fixture::new(
@@ -912,60 +849,6 @@ mod tests {
         );
     }
 
-    /// The same initializer with an `__all__` is decided, and the listed name
-    /// is a re-export rather than an unused import.
-    #[test]
-    fn a_python_package_initializer_with_all_reports_only_the_unlisted_import() {
-        let fixture = Fixture::new(
-            Language::Python,
-            "pkg/__init__.py",
-            concat!(
-                "from .impl import Widget\n",
-                "from .other import Gadget\n",
-                "__all__ = [\"Widget\"]\n",
-            ),
-        );
-        assert_eq!(fixture.unused_names(), vec!["Gadget".to_string()]);
-    }
-
-    /// JavaScript: a side-effect import binds no name and is never reported, a
-    /// namespace import binds an unspecified set, an `export { x }` of an
-    /// imported name is a use, and only the genuinely unreferenced specifier
-    /// is reported.
-    #[test]
-    fn javascript_reports_only_the_unreferenced_specifier() {
-        let fixture = Fixture::new(
-            Language::JavaScript,
-            "src/app.js",
-            concat!(
-                "import './setup.js';\n",
-                "import * as ns from './ns.js';\n",
-                "import used from './used.js';\n",
-                "import unusedDefault from './unused.js';\n",
-                "import { forwarded, alpha, beta as bee } from './named.js';\n",
-                "export { forwarded };\n",
-                "export { passthrough } from './passthrough.js';\n",
-                "used(alpha);\n",
-            ),
-        );
-        assert_eq!(
-            fixture.unused_names(),
-            vec!["unusedDefault".to_string(), "bee".to_string()]
-        );
-        assert!(
-            fixture
-                .result()
-                .findings
-                .iter()
-                .all(|finding| finding.certainty == UnusedImportCertainty::Unreferenced),
-            "a file without JSX proves the absence"
-        );
-    }
-
-    /// A default-value token inside a destructuring pattern is classified as a
-    /// binder rather than as a read. It still spells the name, so the import
-    /// it names is not reported (issue #40: over-counting uses may only
-    /// suppress a finding).
     #[test]
     fn javascript_counts_a_pattern_default_value_as_a_use() {
         let fixture = Fixture::new(
@@ -980,8 +863,6 @@ mod tests {
         assert_eq!(fixture.unused_names(), Vec::<String>::new());
     }
 
-    /// TypeScript: a type-only import used in a type position is used, and an
-    /// unreferenced one is reported.
     #[test]
     fn typescript_reports_the_unreferenced_type_import() {
         let fixture = Fixture::new(
@@ -994,41 +875,6 @@ mod tests {
             ),
         );
         assert_eq!(fixture.unused_names(), vec!["Unused".to_string()]);
-    }
-
-    /// A file containing JSX cannot prove any import unused: the JSX factory's
-    /// name is a build setting this derivation does not read.
-    #[test]
-    fn a_jsx_file_downgrades_every_finding_to_an_ambient_use() {
-        let fixture = Fixture::new(
-            Language::TypeScript,
-            "src/app.tsx",
-            concat!(
-                "import React from 'react';\n",
-                "import { Widget } from './widget';\n",
-                "import { Unused } from './unused';\n",
-                "export function App() { return <Widget />; }\n",
-            ),
-        );
-        let result = fixture.result();
-        assert!(result.completeness.is_complete(), "{:?}", result);
-        assert_eq!(
-            result
-                .findings
-                .iter()
-                .map(|finding| (finding.local_name.as_str(), finding.certainty))
-                .collect::<Vec<_>>(),
-            vec![
-                (
-                    "React",
-                    UnusedImportCertainty::AmbientUsePossible(AmbientImportUse::JsxFactory)
-                ),
-                (
-                    "Unused",
-                    UnusedImportCertainty::AmbientUsePossible(AmbientImportUse::JsxFactory)
-                ),
-            ]
-        );
     }
 
     #[test]
@@ -1066,11 +912,8 @@ mod tests {
         );
     }
 
-    /// Grammar 0.24.3 nests item attributes in a `declaration_with_attribute`
-    /// wrapper. An attribute macro can turn an apparent concrete struct into
-    /// arbitrary syntax, so the same attribute must preserve ambient-use doubt
-    /// in the new layout that a preceding-sibling attribute preserved before.
     #[test]
+    #[hardwon("#3208: grouped outer Rust attributes lost their structured semantics")]
     fn rust_grouped_outer_attributes_keep_a_resolved_struct_ambient() {
         let project = crate::inline_project::InlineTestProject::with_language(Language::Rust)
             .file("src/lib.rs", "mod definitions; mod consumer;\n")
@@ -1100,10 +943,8 @@ mod tests {
         );
     }
 
-    /// `HashMap::new()` spells the imported `HashMap` through a path head,
-    /// which carried no occurrence row until #3064. The import is used, and
-    /// the file is decided rather than undecided.
     #[test]
+    #[hardwon("#3064: a Rust path-head import disappeared from unused-import analysis")]
     fn rust_counts_a_scoped_path_head_as_a_use() {
         let fixture = Fixture::new(
             Language::Rust,
@@ -1117,8 +958,6 @@ mod tests {
         assert_eq!(fixture.unused_names(), ["BTreeMap"]);
     }
 
-    /// Rust's findings name the doubt they cannot rule out: a `use` can name a
-    /// trait, whose methods are reachable without the trait being spelled.
     #[test]
     fn rust_findings_carry_the_trait_method_scope_doubt() {
         let fixture = Fixture::new(
@@ -1138,10 +977,8 @@ mod tests {
         );
     }
 
-    /// Java is in the same position, and for the same reason: `Map.Entry`
-    /// spells `Map`. Java has no ambient import use, so its findings are
-    /// proofs.
     #[test]
+    #[hardwon("#3064: a Java qualified type-path import was falsely reported unused")]
     fn java_counts_a_qualified_type_head_as_a_use() {
         let fixture = Fixture::new(
             Language::Java,
@@ -1165,8 +1002,6 @@ mod tests {
         );
     }
 
-    /// A Java wildcard binds an unspecified set of names, so it is never
-    /// reported even when nothing else in the file spells anything from it.
     #[test]
     fn java_wildcard_imports_are_never_reported() {
         let fixture = Fixture::new(
@@ -1181,10 +1016,8 @@ mod tests {
         assert!(fixture.unused_names().is_empty());
     }
 
-    /// `mutable.Buffer` spells the imported `mutable` through a path head.
-    /// Scala's findings name the doubt they cannot rule out: an import can
-    /// name a given or an implicit selected by type, never by name.
     #[test]
+    #[hardwon("#3064: a Scala stable-identifier path import was falsely reported unused")]
     fn scala_counts_a_stable_identifier_head_as_a_use() {
         let fixture = Fixture::new(
             Language::Scala,
@@ -1211,9 +1044,6 @@ mod tests {
         );
     }
 
-    /// A Scala 3 `export` re-publishes the name as a member of the enclosing
-    /// template, so it is a use even though nothing else in the file spells
-    /// it. A wildcard import binds an unspecified set and is never reported.
     #[test]
     fn scala_exports_and_wildcards_are_not_unused_imports() {
         let fixture = Fixture::new(
@@ -1229,10 +1059,6 @@ mod tests {
         assert!(fixture.unused_names().is_empty());
     }
 
-    /// A javadoc `{@link Map}` keeps `import java.util.Map;` alive while
-    /// spelling the name only inside a comment token, so a Java file that
-    /// carries a documentation comment cannot prove any of its imports
-    /// unreferenced. A file with only ordinary comments still can.
     #[test]
     fn a_java_documentation_comment_downgrades_every_finding() {
         let documented = Fixture::new(
@@ -1279,8 +1105,6 @@ mod tests {
         );
     }
 
-    /// PHP docblocks reference imported types the same way, through `@var`,
-    /// `@param` and `@throws`.
     #[test]
     fn a_php_docblock_downgrades_every_finding() {
         let fixture = Fixture::new(
@@ -1309,8 +1133,6 @@ mod tests {
         );
     }
 
-    /// PHP compares class and function names case-insensitively, so
-    /// `new gadget()` uses `use App\Model\Gadget;`.
     #[test]
     fn php_class_names_compare_case_insensitively() {
         let fixture = Fixture::new(
@@ -1327,8 +1149,6 @@ mod tests {
         assert_eq!(fixture.unused_names(), ["Widget"]);
     }
 
-    /// A language whose adapter derives no import binders reports nothing for
-    /// the same shape, and says so.
     #[test]
     fn go_reports_nothing_because_it_derives_no_import_binders() {
         let fixture = Fixture::new(

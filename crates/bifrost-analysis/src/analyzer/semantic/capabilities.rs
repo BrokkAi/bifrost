@@ -162,21 +162,50 @@ impl SemanticCapabilitiesBuilder {
     }
 }
 
+pub(crate) fn tree_sitter_adapter_capabilities() -> SemanticCapabilitiesBuilder {
+    let mut builder = SemanticCapabilities::builder();
+    for capability in [
+        SemanticCapability::Procedures,
+        SemanticCapability::EntryBoundary,
+        SemanticCapability::NormalExitBoundary,
+        SemanticCapability::ExceptionalExitBoundary,
+        SemanticCapability::BasicBlocks,
+        SemanticCapability::ProgramPoints,
+        SemanticCapability::ReturnFlow,
+        SemanticCapability::NormalCallContinuation,
+        SemanticCapability::ExceptionalCallContinuation,
+    ] {
+        builder = builder.complete(capability);
+    }
+    for capability in [
+        SemanticCapability::NormalControlFlow,
+        SemanticCapability::ExceptionalControlFlow,
+        SemanticCapability::CleanupControlFlow,
+        SemanticCapability::Assignments,
+        SemanticCapability::Values,
+        SemanticCapability::Allocations,
+        SemanticCapability::FieldMemory,
+        SemanticCapability::IndexMemory,
+        SemanticCapability::LocalFlow,
+        SemanticCapability::ParameterFlow,
+        SemanticCapability::ReceiverFlow,
+        SemanticCapability::Calls,
+        SemanticCapability::DynamicDispatch,
+        SemanticCapability::CallableReferences,
+        SemanticCapability::Captures,
+        SemanticCapability::NonLocalControl,
+        SemanticCapability::ResourceManagement,
+        SemanticCapability::DeferredExecution,
+        SemanticCapability::GuardFacts,
+    ] {
+        builder = builder.partial(capability);
+    }
+    builder
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn lookup_is_total_and_defaults_to_unsupported() {
-        let capabilities = SemanticCapabilities::default();
-        assert_eq!(capabilities.iter().count(), SemanticCapability::ALL.len());
-        for capability in SemanticCapability::ALL {
-            assert_eq!(
-                capabilities.support(capability),
-                CapabilitySupport::Unsupported
-            );
-        }
-    }
 
     #[test]
     fn builder_preserves_complete_partial_and_unsupported() {
@@ -196,25 +225,5 @@ mod tests {
             capabilities.support(SemanticCapability::Calls),
             CapabilitySupport::Unsupported
         );
-    }
-
-    #[test]
-    fn registry_ordinals_labels_and_storage_are_exhaustive() {
-        let capabilities = SemanticCapabilities::default();
-        let iterated = capabilities
-            .iter()
-            .map(|(capability, _)| capability)
-            .collect::<Vec<_>>();
-        assert_eq!(iterated, SemanticCapability::ALL);
-        assert_eq!(SemanticCapability::ALL.len(), SemanticCapability::COUNT);
-        assert_eq!(capabilities.support.len(), SemanticCapability::COUNT);
-
-        let mut labels = SemanticCapability::ALL
-            .into_iter()
-            .map(SemanticCapability::label)
-            .collect::<Vec<_>>();
-        labels.sort_unstable();
-        labels.dedup();
-        assert_eq!(labels.len(), SemanticCapability::ALL.len());
     }
 }

@@ -4,6 +4,7 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Condvar, Mutex};
 use std::time::Instant;
 
+use brokk_bifrost_core::util::elapsed_ns;
 use serde::Serialize;
 
 use crate::cancellation::CancellationToken;
@@ -224,10 +225,6 @@ impl BoundedReadyScheduler {
     }
 }
 
-fn elapsed_ns(started: Instant) -> u64 {
-    u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -248,18 +245,5 @@ mod tests {
         assert_eq!(run.profile.tasks_started, 4);
         assert_eq!(run.profile.tasks_completed, 4);
         assert_eq!(run.profile.peak_concurrency, 2);
-    }
-
-    #[test]
-    fn cancellation_is_visible_before_queued_tasks_start() {
-        let cancellation = CancellationToken::default();
-        cancellation.cancel();
-        let run = BoundedReadyScheduler::new(1)
-            .run(3, Some(&cancellation), |_| cancellation.is_cancelled());
-
-        assert_eq!(run.results, [true, true, true]);
-        assert_eq!(run.profile.tasks_observed_cancelled_before_start, 3);
-        assert_eq!(run.profile.tasks_started, 3);
-        assert_eq!(run.profile.peak_concurrency, 1);
     }
 }

@@ -4,8 +4,18 @@
 //! abrupt-completion routing, cleanup specialization, and immutable adjacency
 //! storage remain owned by the shared semantic substrate.
 
+use crate::analyzer::semantic::lowering::{
+    ShortCircuitKind, field_matches, resolve_binding_value, schedule_loop_flow,
+    schedule_sequential_work, schedule_short_circuit_condition,
+};
+use brokk_bifrost_core::analyzer::structural::adapter_helpers::first_named_child;
+use brokk_bifrost_core::analyzer::tree_walk::{
+    child_by_field_or_named_child_of_kinds, first_named_child_of_kind,
+    named_children_vec as named_children,
+};
 use tree_sitter::Node;
 
+use crate::analyzer::declared_scalar::{DeclaredScalarType, binding_nodes};
 use crate::analyzer::lexical_definitions::formal_parameter_slots_for_owner;
 use crate::analyzer::semantic::cfg::{
     CleanupRegionId, CompletionKind, CompletionRequest, CompletionRoute, ProcedureCfgBuilder,
@@ -18,8 +28,9 @@ use crate::analyzer::tree_sitter_analyzer::{
 };
 use crate::analyzer::{DispatchExtensibility, Language, PhpAnalyzer, ProjectFile};
 use crate::hash::HashMap;
+use brokk_bifrost_php::graph::syntax::{clone_object_operand, object_creation_type};
 
-const ADAPTER_VERSION: &[u8] = b"php-value-semantics-v4";
+const ADAPTER_VERSION: &[u8] = b"php-value-semantics-v8";
 
 impl_program_semantics_provider!(PhpAnalyzer, PhpSemanticLowerer);
 
@@ -27,14 +38,12 @@ struct PhpSemanticLowerer;
 
 impl ProgramSemanticsLowerer for PhpSemanticLowerer {
     fn identity(&self) -> SemanticAdapterIdentity {
-        SemanticAdapterIdentity {
-            adapter: AdapterSemanticsVersion::hash_bytes("php", ADAPTER_VERSION)
-                .expect("adapter name is non-empty"),
-            configuration: ConfigurationFingerprint::hash_bytes(
-                b"php-intrafile-execution-defaults-v1",
-            ),
-            dependencies: DependencyFingerprint::hash_bytes(b"no-intrafile-dependencies"),
-        }
+        SemanticAdapterIdentity::for_adapter(
+            "php",
+            ADAPTER_VERSION,
+            b"php-intrafile-execution-defaults-v1",
+            DependencyFingerprint::hash_bytes(b"no-intrafile-dependencies"),
+        )
     }
 
     fn capabilities(&self) -> SemanticCapabilities {
@@ -49,25 +58,13 @@ impl ProgramSemanticsLowerer for PhpSemanticLowerer {
         cancellation: &CancellationToken,
     ) -> Result<SemanticOutcome<Vec<ProcedureSemanticsParts>>, SemanticProviderError> {
         let (specs, initial_work) =
-            match enumerate_procedures(file, prepared, budget, cancellation)? {
-                ProcedureEnumeration::Complete {
+            match enumerate_procedures(file, prepared, budget, cancellation)?.into_lowering_input()
+            {
+                ProcedureLoweringInput::Complete {
                     value,
                     initial_work,
-                    ..
                 } => (value, initial_work),
-                ProcedureEnumeration::ExceededBudget { exceeded, work } => {
-                    return Ok(SemanticOutcome::ExceededBudget {
-                        partial: None,
-                        exceeded,
-                        work,
-                    });
-                }
-                ProcedureEnumeration::Cancelled { work } => {
-                    return Ok(SemanticOutcome::Cancelled {
-                        partial: None,
-                        work,
-                    });
-                }
+                ProcedureLoweringInput::Stopped(outcome) => return Ok(outcome),
             };
 
         let classes = php_class_inventory(prepared);
@@ -85,58 +82,19 @@ impl ProgramSemanticsLowerer for PhpSemanticLowerer {
 }
 
 fn php_capabilities() -> SemanticCapabilities {
-    let mut builder = SemanticCapabilities::builder();
-    for capability in [
-        SemanticCapability::Procedures,
-        SemanticCapability::EntryBoundary,
-        SemanticCapability::NormalExitBoundary,
-        SemanticCapability::ExceptionalExitBoundary,
-        SemanticCapability::BasicBlocks,
-        SemanticCapability::ProgramPoints,
-        SemanticCapability::ReturnFlow,
-        SemanticCapability::NormalCallContinuation,
-        SemanticCapability::ExceptionalCallContinuation,
-    ] {
-        builder = builder.complete(capability);
-    }
-    for capability in [
-        SemanticCapability::NormalControlFlow,
-        SemanticCapability::ExceptionalControlFlow,
-        SemanticCapability::CleanupControlFlow,
-        SemanticCapability::Calls,
-        SemanticCapability::DynamicDispatch,
-        SemanticCapability::CallableReferences,
-        SemanticCapability::Values,
-        SemanticCapability::Assignments,
-        SemanticCapability::Allocations,
-        SemanticCapability::LocalFlow,
-        SemanticCapability::ParameterFlow,
-        SemanticCapability::ReceiverFlow,
-        SemanticCapability::Captures,
-        SemanticCapability::GeneratorSuspension,
-        SemanticCapability::DeferredExecution,
-        SemanticCapability::NonLocalControl,
-        SemanticCapability::ResourceManagement,
-        // `Partial` states the exact limit: every decision the condition
-        // lowering reaches publishes a row, but only a constant `true` or
-        // `false` -- through any number of `!` and parenthesis wrappers -- is
-        // normalized, and everything else is recorded `Opaque`. Conditional
-        // edges this adapter synthesizes outside condition lowering, such as
-        // the `??` null gate, the `foreach` header's exhaustion test, and
-        // `switch`/`match` arm dispatch, publish no guard row at all (#2443).
-        SemanticCapability::GuardFacts,
-        // Partial: a property write and read spelled `$o->name`, and an element
-        // write and read spelled `$a[k]`, lower into real memory rows whenever
-        // the target is a single such place (#2663). A dynamic property name,
-        // a static property, a destructuring target, a reference assignment,
-        // and a variable-variable still publish their own gaps instead, and a
-        // non-constant element key publishes an index-memory gap on the
-        // location it could not identify.
-        SemanticCapability::FieldMemory,
-        SemanticCapability::IndexMemory,
-    ] {
-        builder = builder.partial(capability);
-    }
+    let mut builder = crate::analyzer::semantic::capabilities::tree_sitter_adapter_capabilities();
+    // GuardFacts stays partial: every decision the condition lowering reaches
+    // publishes a row, but only a constant `true` or `false` -- through any
+    // number of `!` and parenthesis wrappers -- is normalized, and everything
+    // else is recorded `Opaque`. Conditional edges this adapter synthesizes
+    // outside condition lowering, such as the `??` null gate, the `foreach`
+    // header's exhaustion test, and `switch`/`match` arm dispatch, publish no
+    // guard row at all (#2443).
+    builder = builder.partial(SemanticCapability::GeneratorSuspension);
+    // FieldMemory and IndexMemory stay partial: single property and element
+    // reads and writes lower into structured memory rows (#2663). Unsupported
+    // dynamic, static, destructuring, reference, and variable-variable targets
+    // keep their own gaps.
     builder.build()
 }
 
@@ -154,12 +112,6 @@ struct ProcedureSpec<'tree> {
 
 type ProcedureEnumeration<'tree> = ProcedureInventoryOutcome<Vec<ProcedureSpec<'tree>>>;
 
-struct ProcedureEnumerationFrame<'tree> {
-    node: Node<'tree>,
-    lexical_parent: Option<ProcedureId>,
-    declaration_path: usize,
-}
-
 fn enumerate_procedures<'tree>(
     file: &ProjectFile,
     prepared: &'tree PreparedSyntaxTree,
@@ -169,84 +121,73 @@ fn enumerate_procedures<'tree>(
     let root = prepared.tree().root_node();
     let mut inventory =
         ProcedureInventoryBuilder::new(file, prepared.dialect(), root, "php-source", budget)?;
-    let mut specs = Vec::new();
-    let mut stack = vec![ProcedureEnumerationFrame {
-        node: root,
-        lexical_parent: None,
-        declaration_path: inventory.root_path(),
-    }];
-
-    while let Some(frame) = stack.pop() {
-        if cancellation.is_cancelled() {
-            return Ok(inventory.cancelled());
-        }
-        if let Err(stop) = inventory.charge_traversal_entry() {
-            return Ok(stop.into_outcome());
-        }
-        let child_path = frame.declaration_path;
-        let mut container_body_scope = None;
-        if let Some(segment_kind) = declaration_container_kind(frame.node) {
-            let name = declaration_container_name(prepared.source(), frame.node);
-            let anchor =
-                source_anchor(frame.node, 0).map_err(SemanticProviderError::invalid_identity)?;
-            let container_path = inventory.push_container(
-                frame.declaration_path,
-                segment_kind,
-                name.as_deref(),
-                anchor,
-            )?;
-            if let Some(body) = frame.node.child_by_field_name("body") {
-                container_body_scope = Some((body.id(), container_path));
+    let root_path = inventory.root_path();
+    let specs = match walk_procedure_tree(
+        root,
+        root_path,
+        &mut inventory,
+        cancellation,
+        named_children,
+        |frame, inventory| {
+            let mut container_body = None;
+            if let Some(segment_kind) = declaration_container_kind(frame.node) {
+                let name = declaration_container_name(prepared.source(), frame.node);
+                let anchor = source_anchor(frame.node, 0)
+                    .map_err(SemanticProviderError::invalid_identity)?;
+                let container_path = inventory.push_container(
+                    frame.declaration_path,
+                    segment_kind,
+                    name.as_deref(),
+                    anchor,
+                )?;
+                if let Some(body) = frame.node.child_by_field_name("body") {
+                    container_body = Some((body.id(), container_path));
+                }
             }
-        }
 
-        let mut callable_body_scope = None;
-        if let Some((kind, segment_kind, body, properties, returns_value)) =
-            callable_shape(prepared.source(), frame.node, frame.lexical_parent)
-        {
-            let name = callable_name(prepared.source(), frame.node);
-            let anchor =
-                source_anchor(frame.node, 0).map_err(SemanticProviderError::invalid_identity)?;
-            let identity = match inventory.allocate_procedure(
-                child_path,
-                segment_kind,
-                name.as_deref(),
-                anchor,
-            )? {
-                Ok(identity) => identity,
-                Err(stop) => return Ok(stop.into_outcome()),
+            let mut callable_body = None;
+            let value = if let Some((kind, segment_kind, body, properties, returns_value)) =
+                callable_shape(prepared.source(), frame.node, frame.lexical_parent)
+            {
+                let name = callable_name(prepared.source(), frame.node);
+                let anchor = source_anchor(frame.node, 0)
+                    .map_err(SemanticProviderError::invalid_identity)?;
+                let identity = match inventory.allocate_procedure(
+                    frame.declaration_path,
+                    segment_kind,
+                    name.as_deref(),
+                    anchor,
+                )? {
+                    Ok(identity) => identity,
+                    Err(stop) => return Ok(ProcedureWalkStep::ExceededBudget(stop)),
+                };
+                callable_body = Some((body.id(), identity.id, identity.declaration_path));
+                Some(ProcedureSpec {
+                    id: identity.id,
+                    callable: frame.node,
+                    body,
+                    locator: identity.locator,
+                    lexical_parent: frame.lexical_parent,
+                    kind,
+                    properties,
+                    returns_value,
+                })
+            } else {
+                None
             };
-            specs.push(ProcedureSpec {
-                id: identity.id,
-                callable: frame.node,
-                body,
-                locator: identity.locator,
-                lexical_parent: frame.lexical_parent,
-                kind,
-                properties,
-                returns_value,
-            });
-            callable_body_scope = Some((body.id(), identity.id, identity.declaration_path));
-        }
-
-        let mut cursor = frame.node.walk();
-        let children = frame.node.named_children(&mut cursor).collect::<Vec<_>>();
-        for child in children.into_iter().rev() {
-            let child_path = container_body_scope
-                .filter(|(body_id, _)| *body_id == child.id())
-                .map(|(_, path)| path)
-                .unwrap_or(child_path);
-            let (lexical_parent, declaration_path) = callable_body_scope
-                .filter(|(body_id, _, _)| *body_id == child.id())
-                .map(|(_, procedure, path)| (Some(procedure), path))
-                .unwrap_or((frame.lexical_parent, child_path));
-            stack.push(ProcedureEnumerationFrame {
-                node: child,
-                lexical_parent,
-                declaration_path,
-            });
-        }
-    }
+            Ok(ProcedureWalkStep::Continue {
+                value,
+                scopes: ProcedureWalkScopes {
+                    container_body,
+                    callable_body,
+                },
+            })
+        },
+    )? {
+        ProcedureTreeWalkOutcome::Complete(specs) => specs,
+        ProcedureTreeWalkOutcome::ExceededBudget(stop) => return Ok(stop.into_outcome()),
+        ProcedureTreeWalkOutcome::Cancelled => return Ok(inventory.cancelled()),
+    };
 
     Ok(inventory.complete(specs))
 }
@@ -263,11 +204,7 @@ fn declaration_container_kind(node: Node<'_>) -> Option<DeclarationSegmentKind> 
     }
 }
 
-fn declaration_container_name(source: &str, node: Node<'_>) -> Option<Box<str>> {
-    node.child_by_field_name("name")
-        .and_then(|name| nonempty_node_text(source, name))
-        .map(Box::<str>::from)
-}
+use crate::analyzer::common::declaration_container_name;
 
 fn callable_name(source: &str, node: Node<'_>) -> Option<Box<str>> {
     if node.kind() == "property_hook" {
@@ -276,10 +213,9 @@ fn callable_name(source: &str, node: Node<'_>) -> Option<Box<str>> {
             enclosing_property_name(source, node).unwrap_or_else(|| Box::<str>::from("<property>"));
         return Some(format!("{property}.{hook}").into_boxed_str());
     }
-    node.child_by_field_name("name")
-        .and_then(|name| nonempty_node_text(source, name))
-        .map(Box::<str>::from)
-        .or_else(|| enclosing_binding_name(source, node))
+    crate::analyzer::semantic::lowering::callable_name_with_binding(source, node, || {
+        enclosing_binding_name(source, node)
+    })
 }
 
 fn enclosing_property_name(source: &str, node: Node<'_>) -> Option<Box<str>> {
@@ -487,24 +423,11 @@ fn property_hook_name(node: Node<'_>) -> Option<Node<'_>> {
 }
 
 fn body_contains_yield(body: Node<'_>) -> bool {
-    let mut stack = vec![body];
-    while let Some(node) = stack.pop() {
-        if node != body && is_callable_kind(node.kind()) {
-            continue;
-        }
-        if node.kind() == "yield_expression" {
-            return true;
-        }
-        let mut cursor = node.walk();
-        stack.extend(node.named_children(&mut cursor));
-    }
-    false
-}
-
-fn field_matches(parent: Node<'_>, field: &str, child: Node<'_>) -> bool {
-    parent
-        .child_by_field_name(field)
-        .is_some_and(|candidate| candidate.id() == child.id())
+    crate::analyzer::tree_walk::body_contains_kind_outside_nested_callables(
+        body,
+        "yield_expression",
+        is_callable_kind,
+    )
 }
 
 type PhpLoweringError = ProcedureLoweringError;
@@ -514,6 +437,12 @@ type EdgeTarget = ControlTarget;
 #[derive(Debug, Clone, Copy)]
 enum Work<'tree> {
     Statement {
+        node: Node<'tree>,
+        entry: ProgramPointId,
+        next: EdgeTarget,
+        scope: ScopeFrameId,
+    },
+    StatementList {
         node: Node<'tree>,
         entry: ProgramPointId,
         next: EdgeTarget,
@@ -649,7 +578,7 @@ fn lower_procedure<'tree>(
     context.emit_local_bindings(&mut builder, spec.body)?;
 
     if spec.properties.is_generator {
-        context.add_gap(
+        context.session.record_gap(
             &mut builder,
             entry,
             SemanticGapSubject::Procedure,
@@ -659,7 +588,7 @@ fn lower_procedure<'tree>(
         )?;
     }
     if spec.lexical_parent.is_some() {
-        context.add_gap(
+        context.session.record_gap(
             &mut builder,
             entry,
             SemanticGapSubject::Procedure,
@@ -669,7 +598,7 @@ fn lower_procedure<'tree>(
         )?;
     }
     if enclosing_trait(spec.callable) {
-        context.add_gap(
+        context.session.record_gap(
             &mut builder,
             entry,
             SemanticGapSubject::Procedure,
@@ -689,8 +618,11 @@ fn lower_procedure<'tree>(
         }
     } else if spec.returns_value {
         let implicit_return = context.point(&mut builder, spec.body, Vec::new())?;
-        let source =
-            context.expression_value(&mut builder, spec.body, expression_value_kind(spec.body))?;
+        let source = context.expression_value(
+            &mut builder,
+            spec.body,
+            expression_value_kind(prepared.source(), spec.body),
+        )?;
         let value = context.value(&mut builder, implicit_return, SemanticValueKind::Return)?;
         context.append_effect(
             &mut builder,
@@ -706,7 +638,7 @@ fn lower_procedure<'tree>(
             implicit_return,
             SemanticEffect::ProcedureReturn { value: Some(value) },
         )?;
-        context.edge(
+        context.session.add_target_edge(
             &mut builder,
             implicit_return,
             EdgeTarget::normal(normal_exit),
@@ -727,7 +659,9 @@ fn lower_procedure<'tree>(
             chain_short_circuit: None,
         }
     };
-    context.edge(&mut builder, entry, EdgeTarget::normal(body_entry))?;
+    context
+        .session
+        .add_target_edge(&mut builder, entry, EdgeTarget::normal(body_entry))?;
 
     drive_and_finish_procedure(
         builder,
@@ -775,7 +709,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                     })
                 })
                 .unwrap_or(declaration);
-            let metadata = self.value_mapping(builder, mapping_node)?;
+            let metadata = self.session.add_value_mapping(builder, mapping_node)?;
             let parameter_name = slot
                 .unique_name()
                 .map(normalize_php_name)
@@ -803,7 +737,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             }
             if slot.variadic.is_some() || has_direct_named_child(declaration, "reference_modifier")
             {
-                self.add_gap(
+                self.session.record_gap(
                     builder,
                     entry,
                     SemanticGapSubject::Value(value),
@@ -820,7 +754,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 ProcedureKind::Method | ProcedureKind::Constructor | ProcedureKind::Accessor
             )
         {
-            let metadata = self.value_mapping(builder, callable)?;
+            let metadata = self.session.add_value_mapping(builder, callable)?;
             let receiver = self.session.add_value_with_metadata(
                 builder,
                 metadata,
@@ -868,7 +802,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 {
                     continue;
                 }
-                let metadata = self.value_mapping(builder, left)?;
+                let metadata = self.session.add_value_mapping(builder, left)?;
                 let value = self.session.add_value_with_metadata(
                     builder,
                     metadata,
@@ -887,27 +821,21 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
     }
 
     fn binding_value(&self, name: &str) -> Option<(ValueId, ValueFlowKind)> {
-        if let Some(binding) = self.locals.get(name) {
-            Some((binding.value, ValueFlowKind::Local))
-        } else {
-            self.parameters.get(name).map(|value| {
-                (
-                    *value,
-                    if Some(*value) == self.receiver {
-                        ValueFlowKind::Receiver
-                    } else {
-                        ValueFlowKind::Parameter
-                    },
-                )
-            })
-        }
+        resolve_binding_value(
+            self.locals.get(name).map(|binding| binding.value),
+            self.parameters.get(name).copied(),
+            self.receiver,
+        )
     }
 
     fn local_declaration_value(&self, name: &str, start_byte: usize) -> Option<ValueId> {
-        self.locals
-            .get(name)
-            .filter(|binding| binding.declaration_start == start_byte)
-            .map(|binding| binding.value)
+        crate::analyzer::common::local_value_for_declaration(
+            self.locals
+                .get(name)
+                .iter()
+                .map(|binding| (binding.declaration_start, binding.value)),
+            start_byte,
+        )
     }
 
     fn expression_value(
@@ -916,29 +844,13 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         node: Node<'tree>,
         kind: SemanticValueKind,
     ) -> Result<ValueId, PhpLoweringError> {
-        if let Some(value) = self.expression_values.get(&node.id()) {
-            return Ok(*value);
-        }
-        let metadata = self.value_mapping(builder, node)?;
-        let value = self.session.insert_cached_value_with_metadata(
+        self.session.cached_node_value(
             builder,
             &mut self.expression_values,
-            node.id(),
-            metadata,
+            node,
             kind,
-        )?;
-        Ok(value)
-    }
-
-    fn source_value(
-        &mut self,
-        builder: &mut ProcedureCfgBuilder,
-        node: Node<'tree>,
-        kind: SemanticValueKind,
-    ) -> Result<ValueId, PhpLoweringError> {
-        let metadata = self.value_mapping(builder, node)?;
-        self.session
-            .add_value_with_metadata(builder, metadata, kind)
+            |session, builder, node| session.add_value_mapping(builder, node),
+        )
     }
 
     fn emit_lexical_input_flow(
@@ -955,17 +867,8 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         let Some((source, kind)) = self.binding_value(name) else {
             return Ok(());
         };
-        if source != target {
-            self.append_effect(
-                builder,
-                point,
-                SemanticEffect::ValueFlow {
-                    kind,
-                    source,
-                    target,
-                },
-            )?;
-        }
+        self.session
+            .append_value_flow_if_distinct(builder, point, kind, source, target)?;
         Ok(())
     }
 
@@ -976,9 +879,25 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         entry: ProgramPointId,
         next: EdgeTarget,
     ) -> Result<(), PhpLoweringError> {
-        let value = self.expression_value(builder, node, expression_value_kind(node))?;
+        if node.kind() == "variable_name"
+            && php_variable_name(self.prepared.source(), node).eq_ignore_ascii_case("GLOBALS")
+        {
+            self.session.record_gap(
+                builder,
+                entry,
+                SemanticGapSubject::Point,
+                SemanticCapability::Assignments,
+                SemanticGapKind::Unknown,
+                "$GLOBALS exposes procedure state through the global symbol table",
+            )?;
+        }
+        let value = self.expression_value(
+            builder,
+            node,
+            expression_value_kind(self.prepared.source(), node),
+        )?;
         self.emit_lexical_input_flow(builder, node, entry, value)?;
-        self.edge(builder, entry, next)
+        self.session.add_target_edge(builder, entry, next)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1000,7 +919,11 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 .local_declaration_value(name, left.start_byte())
                 .or_else(|| self.binding_value(name).map(|(value, _)| value));
             if let Some(target) = target {
-                let value = self.expression_value(builder, right, expression_value_kind(right))?;
+                let value = self.expression_value(
+                    builder,
+                    right,
+                    expression_value_kind(self.prepared.source(), right),
+                )?;
                 self.append_effect(
                     builder,
                     terminal,
@@ -1017,7 +940,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                         terminal,
                         "branching expression assignment",
                     )?;
-                    self.add_gap(
+                    self.session.record_gap(
                         builder,
                         terminal,
                         SemanticGapSubject::Value(target),
@@ -1027,7 +950,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                     )?;
                 }
             } else {
-                self.add_gap(
+                self.session.record_gap(
                     builder,
                     terminal,
                     SemanticGapSubject::Point,
@@ -1036,7 +959,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                     "dynamic or unbound PHP assignment target is not represented as a stable local",
                 )?;
             }
-            self.edge(builder, terminal, next)?;
+            self.session.add_target_edge(builder, terminal, next)?;
             return self.schedule_expressions(
                 builder,
                 entry,
@@ -1048,9 +971,13 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         }
 
         if let Some(place) = php_place(left) {
-            let value = self.expression_value(builder, right, expression_value_kind(right))?;
+            let value = self.expression_value(
+                builder,
+                right,
+                expression_value_kind(self.prepared.source(), right),
+            )?;
             let evaluations = self.emit_memory_store(builder, terminal, &place, value, right)?;
-            self.edge(builder, terminal, next)?;
+            self.session.add_target_edge(builder, terminal, next)?;
             return self.schedule_expressions(
                 builder,
                 entry,
@@ -1062,7 +989,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         }
 
         self.add_magic_dispatch_gaps(builder, terminal, "property or indexed assignment")?;
-        self.add_gap(
+        self.session.record_gap(
             builder,
             terminal,
             SemanticGapSubject::Point,
@@ -1070,7 +997,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             SemanticGapKind::Unsupported,
             php_declined_assignment_detail(left),
         )?;
-        self.edge(builder, terminal, next)?;
+        self.session.add_target_edge(builder, terminal, next)?;
         let children = runtime_expression_children(node);
         self.schedule_expressions(
             builder,
@@ -1100,6 +1027,15 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             } => {
                 self.session.record_statement_entry(builder, node, entry)?;
                 self.statement(builder, node, entry, next, scope, stack)
+            }
+            Work::StatementList {
+                node,
+                entry,
+                next,
+                scope,
+            } => {
+                let bodies = children_by_field_name(node, "body");
+                self.schedule_statements(builder, entry, &bodies, next, scope, stack)
             }
             Work::Expression {
                 node,
@@ -1143,7 +1079,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         // constant (#2443).
         if let Some(value) = php_folded_boolean_constant(self.prepared.source(), node) {
             let taken = if value { when_true } else { when_false };
-            self.edge(builder, entry, taken)?;
+            self.session.add_target_edge(builder, entry, taken)?;
             return self.record_guard(
                 builder,
                 entry,
@@ -1167,50 +1103,31 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             return Ok(());
         }
         match (node.kind(), php_short_circuit_operator(node)) {
-            ("binary_expression", Some("&&" | "and")) => {
+            ("binary_expression", Some(operator @ ("&&" | "and" | "||" | "or"))) => {
                 let left = required_field(node, "left")?;
                 let right = required_field(node, "right")?;
                 let right_entry = self.point(builder, right, Vec::new())?;
-                stack.push(Work::Condition {
-                    node: right,
-                    entry: right_entry,
+                let kind = match operator {
+                    "&&" | "and" => ShortCircuitKind::And,
+                    "||" | "or" => ShortCircuitKind::Or,
+                    _ => unreachable!("the match arm selects PHP boolean operators"),
+                };
+                schedule_short_circuit_condition(
+                    stack,
+                    kind,
+                    (left, entry),
+                    (right, right_entry),
                     when_true,
                     when_false,
                     scope,
-                });
-                stack.push(Work::Condition {
-                    node: left,
-                    entry,
-                    when_true: EdgeTarget {
-                        point: right_entry,
-                        kind: ControlEdgeKind::ConditionalTrue,
+                    |node, entry, when_true, when_false, scope| Work::Condition {
+                        node,
+                        entry,
+                        when_true,
+                        when_false,
+                        scope,
                     },
-                    when_false,
-                    scope,
-                });
-                Ok(())
-            }
-            ("binary_expression", Some("||" | "or")) => {
-                let left = required_field(node, "left")?;
-                let right = required_field(node, "right")?;
-                let right_entry = self.point(builder, right, Vec::new())?;
-                stack.push(Work::Condition {
-                    node: right,
-                    entry: right_entry,
-                    when_true,
-                    when_false,
-                    scope,
-                });
-                stack.push(Work::Condition {
-                    node: left,
-                    entry,
-                    when_true,
-                    when_false: EdgeTarget {
-                        point: right_entry,
-                        kind: ControlEdgeKind::ConditionalFalse,
-                    },
-                    scope,
-                });
+                );
                 Ok(())
             }
             ("binary_expression", Some("??")) => {
@@ -1219,7 +1136,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 let right_entry = self.point(builder, right, Vec::new())?;
                 let nullish_decision = self.point(builder, left, Vec::new())?;
                 let nonnull_truthiness = self.point(builder, left, Vec::new())?;
-                self.edge(
+                self.session.add_target_edge(
                     builder,
                     nullish_decision,
                     EdgeTarget {
@@ -1227,7 +1144,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                         kind: ControlEdgeKind::ConditionalTrue,
                     },
                 )?;
-                self.edge(
+                self.session.add_target_edge(
                     builder,
                     nullish_decision,
                     EdgeTarget {
@@ -1235,8 +1152,10 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                         kind: ControlEdgeKind::ConditionalFalse,
                     },
                 )?;
-                self.edge(builder, nonnull_truthiness, when_true)?;
-                self.edge(builder, nonnull_truthiness, when_false)?;
+                self.session
+                    .add_target_edge(builder, nonnull_truthiness, when_true)?;
+                self.session
+                    .add_target_edge(builder, nonnull_truthiness, when_false)?;
                 stack.push(Work::Condition {
                     node: right,
                     entry: right_entry,
@@ -1306,18 +1225,30 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             }
             _ => {
                 let decision = self.point(builder, node, Vec::new())?;
-                self.edge(builder, decision, when_true)?;
-                self.edge(builder, decision, when_false)?;
-                // The condition's own value is the one thing an opaque guard
-                // can honestly name: the decision tested it, whatever it means.
-                let subject = self.expression_value(builder, node, expression_value_kind(node))?;
+                self.session.add_target_edge(builder, decision, when_true)?;
+                self.session
+                    .add_target_edge(builder, decision, when_false)?;
+                let (predicate, subject) = match self.normalize_condition(builder, node)? {
+                    Some(normalized) => normalized,
+                    None => (
+                        GuardPredicate::Opaque {
+                            digest: GuardConditionDigest::from_syntax_kind(node.kind()),
+                        },
+                        // The condition's own value is the one thing an opaque
+                        // guard can honestly name: the decision tested it,
+                        // whatever it means.
+                        Some(self.expression_value(
+                            builder,
+                            node,
+                            expression_value_kind(self.prepared.source(), node),
+                        )?),
+                    ),
+                };
                 self.record_guard(
                     builder,
                     decision,
-                    GuardPredicate::Opaque {
-                        digest: GuardConditionDigest::from_syntax_kind(node.kind()),
-                    },
-                    Some(subject),
+                    predicate,
+                    subject,
                     Some(when_true),
                     Some(when_false),
                 )?;
@@ -1333,14 +1264,149 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         }
     }
 
+    /// Normalize the PHP conditions whose built-in scalar behavior is exact.
+    /// A dynamic variable is admitted only through its exact local or
+    /// parameter binding; the scalar state then keeps the guard open unless
+    /// every reaching write is a supported integer or Boolean fact.
+    fn normalize_condition(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        node: Node<'tree>,
+    ) -> Result<Option<(GuardPredicate, Option<ValueId>)>, PhpLoweringError> {
+        let source = self.prepared.source();
+        let mut cursor = node;
+        let mut negated = false;
+        loop {
+            match cursor.kind() {
+                "parenthesized_expression" => {
+                    let Some(inner) = first_runtime_named_child(cursor) else {
+                        return Ok(None);
+                    };
+                    cursor = inner;
+                }
+                "unary_op_expression" if php_logical_not_operand(cursor).is_some() => {
+                    negated = !negated;
+                    cursor = php_logical_not_operand(cursor)
+                        .expect("logical-not operand was checked above");
+                }
+                _ => break,
+            }
+        }
+        if let Some(value) = php_boolean_literal_value(source, cursor) {
+            return Ok(Some((
+                GuardPredicate::ConstantBoolean {
+                    value: value != negated,
+                },
+                None,
+            )));
+        }
+        if self.php_condition_binding(cursor).is_some() {
+            let value =
+                self.expression_value(builder, cursor, expression_value_kind(source, cursor))?;
+            return Ok(Some((GuardPredicate::Truthy { value }, Some(value))));
+        }
+        if cursor.kind() != "binary_expression" {
+            return Ok(None);
+        }
+        let (Some(operator), Some(left), Some(right)) = (
+            cursor.child_by_field_name("operator"),
+            cursor.child_by_field_name("left"),
+            cursor.child_by_field_name("right"),
+        ) else {
+            return Ok(None);
+        };
+        let left = peel_php_condition_parentheses(left);
+        let right = peel_php_condition_parentheses(right);
+        let left_binding = self.php_condition_binding(left);
+        let right_binding = self.php_condition_binding(right);
+        let left_null = php_scalar_literal_value_kind(source, left)
+            .is_some_and(|kind| matches!(kind, SemanticValueKind::Null));
+        let right_null = php_scalar_literal_value_kind(source, right)
+            .is_some_and(|kind| matches!(kind, SemanticValueKind::Null));
+        let left_integer = php_scalar_literal_value_kind(source, left)
+            .is_some_and(|kind| matches!(kind, SemanticValueKind::SignedInteger(_)));
+        let right_integer = php_scalar_literal_value_kind(source, right)
+            .is_some_and(|kind| matches!(kind, SemanticValueKind::SignedInteger(_)));
+        let (subject_node, constant, reversed, null_comparison) =
+            match (left_binding, right_binding) {
+                (Some(_), None) if right_null => (left, right, false, true),
+                (None, Some(_)) if left_null => (right, left, true, true),
+                (Some(_), None) if right_integer => (left, right, false, false),
+                (None, Some(_)) if left_integer => (right, left, true, false),
+                _ => return Ok(None),
+            };
+        let Some(subject_value) = self.php_condition_binding(subject_node) else {
+            return Ok(None);
+        };
+        let subject = self.expression_value(
+            builder,
+            subject_node,
+            expression_value_kind(source, subject_node),
+        )?;
+        let constant =
+            self.expression_value(builder, constant, expression_value_kind(source, constant))?;
+        let operator = operator.kind();
+        if null_comparison {
+            let null_on_true = match operator {
+                "===" => true,
+                "!==" => false,
+                _ => return Ok(None),
+            };
+            let normalized = Some((
+                GuardPredicate::NullComparison {
+                    null_on_true: if negated { !null_on_true } else { null_on_true },
+                },
+                Some(subject),
+            ));
+            return Ok(normalized);
+        }
+        let predicate = match operator {
+            "<" | "<=" | ">" | ">=" => {
+                let relation = match operator {
+                    "<" => IntegerComparison::LessThan,
+                    "<=" => IntegerComparison::LessThanOrEqual,
+                    ">" => IntegerComparison::GreaterThan,
+                    ">=" => IntegerComparison::GreaterThanOrEqual,
+                    _ => unreachable!("ordered operator was matched"),
+                };
+                let relation = if reversed {
+                    relation.reverse()
+                } else {
+                    relation
+                };
+                GuardPredicate::OrderedIntegerComparison {
+                    relation: if negated { relation.negate() } else { relation },
+                    constant,
+                }
+            }
+            "==" | "!=" | "===" | "!==" => GuardPredicate::ConstantEquality {
+                negated: (matches!(operator, "!=" | "!==")) != negated,
+                constant,
+            },
+            _ => return Ok(None),
+        };
+        debug_assert_eq!(
+            self.php_condition_binding(subject_node),
+            Some(subject_value)
+        );
+        Ok(Some((predicate, Some(subject))))
+    }
+
+    fn php_condition_binding(&self, node: Node<'tree>) -> Option<ValueId> {
+        if node.kind() != "variable_name" {
+            return None;
+        }
+        let name = php_variable_name(self.prepared.source(), node);
+        let (value, flow) = self.binding_value(name)?;
+        matches!(flow, ValueFlowKind::Local | ValueFlowKind::Parameter).then_some(value)
+    }
+
     /// Publish one guard fact for a decision this lowerer just made.
     ///
-    /// Only a constant boolean is normalized today. Everything else this
-    /// lowerer decides is recorded `Opaque` rather than guessed, so an absent
-    /// guard row means the condition lowering made no decision at that point
-    /// at all -- which is what makes the [`SemanticCapability::GuardFacts`]
-    /// entry readable. Arms must already have been added as edges; the IR
-    /// validator enforces that.
+    /// Literal booleans, exact local and parameter truth tests, and integer
+    /// comparisons are normalized. Everything else this lowerer decides is
+    /// recorded `Opaque` rather than guessed. Arms must already have been
+    /// added as edges; the IR validator enforces that.
     #[allow(clippy::too_many_arguments)]
     fn record_guard(
         &mut self,
@@ -1351,21 +1417,9 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         when_true: Option<EdgeTarget>,
         when_false: Option<EdgeTarget>,
     ) -> Result<(), PhpLoweringError> {
-        let arm = |target: Option<EdgeTarget>| {
-            target.map(|target| GuardArm {
-                target_point: target.point,
-                kind: target.kind,
-            })
-        };
-        self.session.add_guard_fact(
-            builder,
-            point,
-            predicate,
-            subject,
-            arm(when_true),
-            arm(when_false),
-        )?;
-        Ok(())
+        self.session
+            .add_guard_for_targets(builder, point, predicate, subject, when_true, when_false)
+            .map(|_| ())
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1402,7 +1456,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             "switch_statement" => self.switch_statement(builder, node, entry, next, scope, stack),
             "try_statement" => self.try_statement(builder, node, entry, next, scope, stack),
             "exit_statement" => self.exit_boundary(builder, node, entry, scope, stack),
-            "goto_statement" => self.add_gap(
+            "goto_statement" => self.session.record_gap(
                 builder,
                 entry,
                 SemanticGapSubject::Point,
@@ -1411,7 +1465,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 "goto label resolution and non-local transfer are not lowered",
             ),
             "named_label_statement" => {
-                self.add_gap(
+                self.session.record_gap(
                     builder,
                     entry,
                     SemanticGapSubject::Point,
@@ -1419,7 +1473,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                     SemanticGapKind::Unsupported,
                     "label reachability from goto is not lowered",
                 )?;
-                self.edge(builder, entry, next)
+                self.session.add_target_edge(builder, entry, next)
             }
             "echo_statement" | "unset_statement" => {
                 let boundary = self.point(builder, node, Vec::new())?;
@@ -1438,7 +1492,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                             "magic __unset and operand failures are not lowered",
                         ),
                     ] {
-                        self.add_gap(
+                        self.session.record_gap(
                             builder,
                             boundary,
                             SemanticGapSubject::Point,
@@ -1448,7 +1502,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                         )?;
                     }
                 }
-                self.edge(builder, boundary, next)?;
+                self.session.add_target_edge(builder, boundary, next)?;
                 let expressions = runtime_expression_children(node);
                 self.schedule_expressions(
                     builder,
@@ -1459,10 +1513,23 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                     stack,
                 )
             }
-            "global_declaration"
-            | "static_variable_declaration"
-            | "const_declaration"
-            | "property_declaration" => {
+            "global_declaration" | "static_variable_declaration" => {
+                self.session.record_gap(
+                    builder,
+                    entry,
+                    SemanticGapSubject::Point,
+                    SemanticCapability::Assignments,
+                    SemanticGapKind::Unsupported,
+                    if node.kind() == "global_declaration" {
+                        "PHP global declarations alias procedure bindings to global storage"
+                    } else {
+                        "PHP static locals retain storage across procedure activations"
+                    },
+                )?;
+                let initializers = declaration_initializers(node);
+                self.schedule_expressions(builder, entry, &initializers, next, scope, stack)
+            }
+            "const_declaration" | "property_declaration" => {
                 let initializers = declaration_initializers(node);
                 self.schedule_expressions(builder, entry, &initializers, next, scope, stack)
             }
@@ -1485,10 +1552,12 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                     });
                     Ok(())
                 } else {
-                    self.edge(builder, entry, next)
+                    self.session.add_target_edge(builder, entry, next)
                 }
             }
-            "empty_statement" | "namespace_use_declaration" => self.edge(builder, entry, next),
+            "empty_statement" | "namespace_use_declaration" => {
+                self.session.add_target_edge(builder, entry, next)
+            }
             _ => self.unhandled_control_syntax(builder, node, entry),
         }
     }
@@ -1508,8 +1577,11 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             self.point(builder, node, Vec::new())?
         };
         let value = if let [returned] = values.as_slice() {
-            let source =
-                self.expression_value(builder, *returned, expression_value_kind(*returned))?;
+            let source = self.expression_value(
+                builder,
+                *returned,
+                expression_value_kind(self.prepared.source(), *returned),
+            )?;
             let target = self.value(builder, terminal, SemanticValueKind::Return)?;
             self.append_effect(
                 builder,
@@ -1525,7 +1597,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             None
         };
         if values.len() > 1 {
-            self.add_gap(
+            self.session.record_gap(
                 builder,
                 terminal,
                 SemanticGapSubject::Point,
@@ -1607,7 +1679,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             let Some(level) = node_text(self.prepared.source(), level_node)
                 .and_then(|text| text.parse::<usize>().ok())
             else {
-                return self.add_gap(
+                return self.session.record_gap(
                     builder,
                     entry,
                     SemanticGapSubject::Point,
@@ -1621,7 +1693,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             1
         };
         if level == 0 {
-            return self.add_gap(
+            return self.session.record_gap(
                 builder,
                 entry,
                 SemanticGapSubject::Point,
@@ -1636,7 +1708,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             .and_then(|frames| frames.iter().rev().nth(level - 1))
             .cloned()
         else {
-            return self.add_gap(
+            return self.session.record_gap(
                 builder,
                 entry,
                 SemanticGapSubject::Point,
@@ -1658,23 +1730,40 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         entry: ProgramPointId,
         next: EdgeTarget,
     ) -> Result<(), PhpLoweringError> {
-        self.add_gap(
+        self.record_declaration_boundary(
+            builder,
+            entry,
+            next,
+            "conditional function declaration timing and redeclaration behavior require runtime context",
+            "conditional function redeclaration failures are not lowered",
+        )
+    }
+
+    fn record_declaration_boundary(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        entry: ProgramPointId,
+        next: EdgeTarget,
+        deferred_detail: &'static str,
+        exceptional_detail: &'static str,
+    ) -> Result<(), PhpLoweringError> {
+        self.session.record_gap(
             builder,
             entry,
             SemanticGapSubject::Point,
             SemanticCapability::DeferredExecution,
             SemanticGapKind::Unknown,
-            "conditional function declaration timing and redeclaration behavior require runtime context",
+            deferred_detail,
         )?;
-        self.add_gap(
+        self.session.record_gap(
             builder,
             entry,
             SemanticGapSubject::Point,
             SemanticCapability::ExceptionalControlFlow,
             SemanticGapKind::Unsupported,
-            "conditional function redeclaration failures are not lowered",
+            exceptional_detail,
         )?;
-        self.edge(builder, entry, next)
+        self.session.add_target_edge(builder, entry, next)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1689,9 +1778,9 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
     ) -> Result<(), PhpLoweringError> {
         let initializers = declaration_initializers(node);
         if initializers.is_empty() {
-            return self.edge(builder, entry, next);
+            return self.session.add_target_edge(builder, entry, next);
         }
-        self.add_gap(
+        self.session.record_gap(
             builder,
             entry,
             SemanticGapSubject::Point,
@@ -1700,7 +1789,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             "function-static initializers execute only on first initialization; both initialized and uninitialized states are represented",
         )?;
         let first = self.point(builder, initializers[0], Vec::new())?;
-        self.edge(
+        self.session.add_target_edge(
             builder,
             entry,
             EdgeTarget {
@@ -1708,7 +1797,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 kind: ControlEdgeKind::ConditionalTrue,
             },
         )?;
-        self.edge(
+        self.session.add_target_edge(
             builder,
             entry,
             EdgeTarget {
@@ -1743,7 +1832,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 "tick callback failures and directive-specific runtime errors are not lowered",
             ),
         ] {
-            self.add_gap(
+            self.session.record_gap(
                 builder,
                 entry,
                 SemanticGapSubject::Point,
@@ -1765,23 +1854,13 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         entry: ProgramPointId,
         next: EdgeTarget,
     ) -> Result<(), PhpLoweringError> {
-        self.add_gap(
+        self.record_declaration_boundary(
             builder,
             entry,
-            SemanticGapSubject::Point,
-            SemanticCapability::DeferredExecution,
-            SemanticGapKind::Unknown,
+            next,
             "conditional type declaration and registration timing require runtime context",
-        )?;
-        self.add_gap(
-            builder,
-            entry,
-            SemanticGapSubject::Point,
-            SemanticCapability::ExceptionalControlFlow,
-            SemanticGapKind::Unsupported,
             "type declaration, trait composition, and redeclaration failures are not lowered",
-        )?;
-        self.edge(builder, entry, next)
+        )
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1834,22 +1913,11 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         for (index, ((condition, body, condition_entry), body_entry)) in
             conditional_arms.iter().zip(&body_entries).enumerate().rev()
         {
-            let false_target = conditional_arms
-                .get(index + 1)
-                .map(|(_, _, entry)| EdgeTarget {
-                    point: *entry,
-                    kind: ControlEdgeKind::ConditionalFalse,
-                })
-                .or_else(|| {
-                    alternative_entry.map(|point| EdgeTarget {
-                        point,
-                        kind: ControlEdgeKind::ConditionalFalse,
-                    })
-                })
-                .unwrap_or(EdgeTarget {
-                    point: next.point,
-                    kind: ControlEdgeKind::ConditionalFalse,
-                });
+            let false_target = crate::analyzer::semantic::lowering::conditional_false_target(
+                conditional_arms.get(index + 1).map(|(_, _, entry)| *entry),
+                alternative_entry,
+                next,
+            );
             stack.push(Work::Statement {
                 node: *body,
                 entry: *body_entry,
@@ -1886,36 +1954,57 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         let body_entry = self.point(builder, body, Vec::new())?;
         self.session
             .record_loop_site(builder, node, condition_entry, body_entry)?;
-        let loop_scope = self.push_loop_scope(
+        let label = self.next_control_label();
+        let loop_scope = schedule_loop_flow(
             builder,
-            scope,
+            &self.session,
+            entry,
             next,
+            scope,
+            Some(label.clone()),
+            &[],
+            Some((condition, condition_entry)),
             condition_entry,
-            ControlEdgeKind::LoopBack,
+            EdgeTarget::normal(condition_entry),
+            (body, body_entry),
+            &[],
+            stack,
+            |node, entry, next, scope| Work::Expression {
+                node,
+                entry,
+                next,
+                scope,
+                chain_short_circuit: None,
+            },
+            |node, entry, next, scope| Work::Expression {
+                node,
+                entry,
+                next,
+                scope,
+                chain_short_circuit: None,
+            },
+            |node, entry, next, scope| Work::Statement {
+                node,
+                entry,
+                next,
+                scope,
+            },
+            |node, entry, when_true, when_false, scope| Work::Condition {
+                node,
+                entry,
+                when_true,
+                when_false,
+                scope,
+            },
+        )?;
+        self.extend_controls(
+            scope,
+            loop_scope,
+            PhpControlFrame {
+                label,
+                kind: PhpControlKind::Loop,
+            },
         );
-        stack.push(Work::Statement {
-            node: body,
-            entry: body_entry,
-            next: EdgeTarget {
-                point: condition_entry,
-                kind: ControlEdgeKind::LoopBack,
-            },
-            scope: loop_scope,
-        });
-        stack.push(Work::Condition {
-            node: condition,
-            entry: condition_entry,
-            when_true: EdgeTarget {
-                point: body_entry,
-                kind: ControlEdgeKind::ConditionalTrue,
-            },
-            when_false: EdgeTarget {
-                point: next.point,
-                kind: ControlEdgeKind::ConditionalFalse,
-            },
-            scope: loop_scope,
-        });
-        self.edge(builder, entry, EdgeTarget::normal(condition_entry))?;
         Ok(())
     }
 
@@ -1961,7 +2050,8 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             next: EdgeTarget::normal(condition_entry),
             scope: loop_scope,
         });
-        self.edge(builder, entry, EdgeTarget::normal(body_entry))?;
+        self.session
+            .add_target_edge(builder, entry, EdgeTarget::normal(body_entry))?;
         Ok(())
     }
 
@@ -1991,80 +2081,77 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         let body_entry = self.point(builder, body_anchor, Vec::new())?;
         self.session
             .record_loop_site(builder, node, condition_entry, body_entry)?;
-        let update_entry = update
-            .map(|update| self.point(builder, update, Vec::new()))
-            .transpose()?;
-        let continue_target = update_entry.unwrap_or(condition_entry);
-        let loop_scope = self.push_loop_scope(
+        let updates = update
+            .map(|update| {
+                self.point(builder, update, Vec::new())
+                    .map(|update_entry| vec![(update, update_entry)])
+            })
+            .transpose()?
+            .unwrap_or_default();
+        let initializers =
+            initializer.map_or_else(Vec::new, |initializer| vec![(initializer, entry)]);
+        let label = self.next_control_label();
+        let loop_scope = schedule_loop_flow(
             builder,
-            scope,
+            &self.session,
+            entry,
             next,
-            continue_target,
-            if update.is_some() {
-                ControlEdgeKind::Normal
-            } else {
-                ControlEdgeKind::LoopBack
+            scope,
+            Some(label.clone()),
+            &initializers,
+            condition.map(|condition| (condition, condition_entry)),
+            condition_entry,
+            EdgeTarget::normal(condition_entry),
+            (body_anchor, body_entry),
+            &updates,
+            stack,
+            |node, entry, next, scope| Work::Expression {
+                node,
+                entry,
+                next,
+                scope,
+                chain_short_circuit: None,
+            },
+            |node, entry, next, scope| Work::Expression {
+                node,
+                entry,
+                next,
+                scope,
+                chain_short_circuit: None,
+            },
+            |node, entry, next, scope| {
+                if bodies.len() == 1 {
+                    Work::Statement {
+                        node,
+                        entry,
+                        next,
+                        scope,
+                    }
+                } else {
+                    Work::StatementList {
+                        node,
+                        entry,
+                        next,
+                        scope,
+                    }
+                }
+            },
+            |node, entry, when_true, when_false, scope| Work::Condition {
+                node,
+                entry,
+                when_true,
+                when_false,
+                scope,
+            },
+        )?;
+        self.extend_controls(
+            scope,
+            loop_scope,
+            PhpControlFrame {
+                label,
+                kind: PhpControlKind::Loop,
             },
         );
-
-        if let Some(update) = update {
-            stack.push(Work::Expression {
-                node: update,
-                entry: update_entry.expect("update entry exists"),
-                next: EdgeTarget {
-                    point: condition_entry,
-                    kind: ControlEdgeKind::LoopBack,
-                },
-                scope: loop_scope,
-                chain_short_circuit: None,
-            });
-        }
-        let body_next = EdgeTarget {
-            point: continue_target,
-            kind: if update.is_some() {
-                ControlEdgeKind::Normal
-            } else {
-                ControlEdgeKind::LoopBack
-            },
-        };
-        if let [body] = bodies.as_slice() {
-            stack.push(Work::Statement {
-                node: *body,
-                entry: body_entry,
-                next: body_next,
-                scope: loop_scope,
-            });
-        } else {
-            self.schedule_statements(builder, body_entry, &bodies, body_next, loop_scope, stack)?;
-        }
-        if let Some(condition) = condition {
-            stack.push(Work::Condition {
-                node: condition,
-                entry: condition_entry,
-                when_true: EdgeTarget {
-                    point: body_entry,
-                    kind: ControlEdgeKind::ConditionalTrue,
-                },
-                when_false: EdgeTarget {
-                    point: next.point,
-                    kind: ControlEdgeKind::ConditionalFalse,
-                },
-                scope: loop_scope,
-            });
-        } else {
-            self.edge(builder, condition_entry, EdgeTarget::normal(body_entry))?;
-        }
-        if let Some(initializer) = initializer {
-            stack.push(Work::Expression {
-                node: initializer,
-                entry,
-                next: EdgeTarget::normal(condition_entry),
-                scope: loop_scope,
-                chain_short_circuit: None,
-            });
-        } else if entry != condition_entry {
-            self.edge(builder, entry, EdgeTarget::normal(condition_entry))?;
-        }
         Ok(())
     }
 
@@ -2126,7 +2213,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                     "foreach iterator and destructuring failures are not lowered",
                 ),
             ] {
-                self.add_gap(
+                self.session.record_gap(
                     builder,
                     test,
                     SemanticGapSubject::Point,
@@ -2136,7 +2223,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 )?;
             }
         }
-        self.edge(
+        self.session.add_target_edge(
             builder,
             test,
             EdgeTarget {
@@ -2144,7 +2231,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 kind: ControlEdgeKind::ConditionalTrue,
             },
         )?;
-        self.edge(
+        self.session.add_target_edge(
             builder,
             test,
             EdgeTarget {
@@ -2164,7 +2251,8 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 scope: loop_scope,
             });
         } else {
-            self.edge(builder, body_entry, body_next)?;
+            self.session
+                .add_target_edge(builder, body_entry, body_next)?;
         }
         self.schedule_expressions(
             builder,
@@ -2203,7 +2291,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             .filter(|child| matches!(child.kind(), "case_statement" | "default_statement"))
             .collect::<Vec<_>>();
         if cases.is_empty() {
-            self.edge(builder, dispatch, next)?;
+            self.session.add_target_edge(builder, dispatch, next)?;
         } else {
             let entries = cases
                 .iter()
@@ -2246,7 +2334,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                     comparison,
                     "switch loose comparison and conversion",
                 )?;
-                self.edge(
+                self.session.add_target_edge(
                     builder,
                     comparison,
                     EdgeTarget {
@@ -2254,7 +2342,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                         kind: ControlEdgeKind::SwitchCase,
                     },
                 )?;
-                self.edge(
+                self.session.add_target_edge(
                     builder,
                     comparison,
                     EdgeTarget {
@@ -2271,7 +2359,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 });
                 no_match = EdgeTarget::normal(predicate_entry);
             }
-            self.edge(builder, dispatch, no_match)?;
+            self.session.add_target_edge(builder, dispatch, no_match)?;
         }
         stack.push(Work::Expression {
             node: value,
@@ -2326,7 +2414,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         let normal_destination = if cleanup_region.is_some() && next.kind != ControlEdgeKind::Normal
         {
             let relay = self.point(builder, node, Vec::new())?;
-            self.edge(builder, relay, next)?;
+            self.session.add_target_edge(builder, relay, next)?;
             relay
         } else {
             next.point
@@ -2346,7 +2434,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             cleanup_scope
         } else {
             let dispatcher = self.point(builder, node, Vec::new())?;
-            self.add_gap(
+            self.session.record_gap(
                 builder,
                 dispatcher,
                 SemanticGapSubject::Point,
@@ -2355,7 +2443,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 "catch type matching, union selection, and throwable binding require runtime refinement",
             )?;
             for catch_entry in &catch_entries {
-                self.edge(
+                self.session.add_target_edge(
                     builder,
                     dispatcher,
                     EdgeTarget {
@@ -2365,7 +2453,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 )?;
             }
             let unmatched = self.point(builder, node, Vec::new())?;
-            self.edge(
+            self.session.add_target_edge(
                 builder,
                 dispatcher,
                 EdgeTarget {
@@ -2427,6 +2515,56 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             });
         }
         Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn operator_assignment_expression(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        node: Node<'tree>,
+        entry: ProgramPointId,
+        next: EdgeTarget,
+        scope: ScopeFrameId,
+        stack: &mut Vec<Work<'tree>>,
+    ) -> Result<(), PhpLoweringError> {
+        let boundary = self.point(builder, node, Vec::new())?;
+        if let Some(target) = self.operator_write_target(node) {
+            let value = self.expression_value(
+                builder,
+                node,
+                expression_value_kind(self.prepared.source(), node),
+            )?;
+            self.append_effect(
+                builder,
+                boundary,
+                SemanticEffect::Assignment { target, value },
+            )?;
+        }
+        let children = runtime_expression_children(node);
+        self.note_unspecified_evaluation_order(builder, boundary, node, &children)?;
+        self.add_magic_dispatch_gaps(builder, boundary, "operator or assignment dispatch")?;
+        self.session.add_target_edge(builder, boundary, next)?;
+        self.schedule_expressions(
+            builder,
+            entry,
+            &children,
+            EdgeTarget::normal(boundary),
+            scope,
+            stack,
+        )
+    }
+
+    fn operator_write_target(&self, node: Node<'tree>) -> Option<ValueId> {
+        let target = node
+            .child_by_field_name("left")
+            .or_else(|| node.child_by_field_name("argument"))
+            .or_else(|| node.child_by_field_name("operand"))?;
+        if target.kind() != "variable_name" {
+            return None;
+        }
+        let name = php_variable_name(self.prepared.source(), target);
+        let (value, flow) = self.binding_value(name)?;
+        matches!(flow, ValueFlowKind::Local | ValueFlowKind::Parameter).then_some(value)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -2507,7 +2645,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                     boundary,
                     "clone and magic __clone dispatch",
                 )?;
-                self.add_gap(
+                self.session.record_gap(
                     builder,
                     boundary,
                     SemanticGapSubject::Point,
@@ -2515,7 +2653,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                     SemanticGapKind::Unknown,
                     "cloned object lifetime and destructor/resource effects are not lowered",
                 )?;
-                self.edge(builder, boundary, next)?;
+                self.session.add_target_edge(builder, boundary, next)?;
                 let children = runtime_expression_children(node);
                 self.schedule_expressions(
                     builder,
@@ -2529,17 +2667,24 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             "assignment_expression" => {
                 self.assignment_expression(builder, node, entry, next, scope, stack)
             }
-            "augmented_assignment_expression"
-            | "reference_assignment_expression"
+            "augmented_assignment_expression" | "update_expression" => {
+                self.operator_assignment_expression(builder, node, entry, next, scope, stack)
+            }
+            "reference_assignment_expression"
             | "binary_expression"
             | "unary_op_expression"
-            | "update_expression"
             | "cast_expression" => {
                 let boundary = self.point(builder, node, Vec::new())?;
                 let children = runtime_expression_children(node);
-                self.note_unspecified_evaluation_order(builder, boundary, node, &children)?;
-                self.add_magic_dispatch_gaps(builder, boundary, "operator or assignment dispatch")?;
-                self.edge(builder, boundary, next)?;
+                if !self.is_scalar_operator_syntax(node) {
+                    self.note_unspecified_evaluation_order(builder, boundary, node, &children)?;
+                    self.add_magic_dispatch_gaps(
+                        builder,
+                        boundary,
+                        "operator or assignment dispatch",
+                    )?;
+                }
+                self.session.add_target_edge(builder, boundary, next)?;
                 self.schedule_expressions(
                     builder,
                     entry,
@@ -2585,6 +2730,58 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         }
     }
 
+    /// A comparison over a binding or literal has no PHP operator dispatch or
+    /// evaluation-order uncertainty once the scalar solver proves the binding
+    /// type. If the binding is dynamic, the solver leaves the guard open; the
+    /// producer must still avoid turning this exact syntax into a procedure
+    /// gap that blocks the proof for unrelated scalar facts.
+    fn is_scalar_operator_syntax(&self, node: Node<'tree>) -> bool {
+        let source = self.prepared.source();
+        match node.kind() {
+            "binary_expression" => {
+                let Some(operator) = node.child_by_field_name("operator") else {
+                    return false;
+                };
+                if !matches!(
+                    operator.kind(),
+                    "<" | "<=" | ">" | ">=" | "==" | "!=" | "===" | "!=="
+                ) {
+                    return false;
+                }
+                let Some(left) = node.child_by_field_name("left") else {
+                    return false;
+                };
+                let Some(right) = node.child_by_field_name("right") else {
+                    return false;
+                };
+                self.is_scalar_operator_operand(source, left)
+                    && self.is_scalar_operator_operand(source, right)
+            }
+            "unary_op_expression" => {
+                node.child_by_field_name("operator")
+                    .is_some_and(|operator| operator.kind() == "!")
+                    && node
+                        .child_by_field_name("argument")
+                        .is_some_and(|argument| self.is_scalar_operator_operand(source, argument))
+            }
+            _ => false,
+        }
+    }
+
+    fn is_scalar_operator_operand(&self, source: &str, node: Node<'tree>) -> bool {
+        let node = peel_php_condition_parentheses(node);
+        self.php_condition_binding(node).is_some()
+            || php_scalar_literal_value_kind(source, node).is_some_and(|kind| {
+                matches!(
+                    kind,
+                    SemanticValueKind::SignedInteger(_)
+                        | SemanticValueKind::UnsignedInteger(_)
+                        | SemanticValueKind::Boolean(_)
+                        | SemanticValueKind::Null
+                )
+            })
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn short_circuit_expression(
         &mut self,
@@ -2596,7 +2793,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         stack: &mut Vec<Work<'tree>>,
     ) -> Result<(), PhpLoweringError> {
         let merge = self.point(builder, node, Vec::new())?;
-        self.edge(builder, merge, next)?;
+        self.session.add_target_edge(builder, merge, next)?;
         stack.push(Work::Condition {
             node,
             entry,
@@ -2644,7 +2841,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 self.add_magic_dispatch_gaps(builder, boundary, detail)?;
             }
         }
-        self.edge(builder, boundary, next)?;
+        self.session.add_target_edge(builder, boundary, next)?;
 
         let chain_destination = chain_short_circuit.unwrap_or(next.point);
         if node.kind() == "nullsafe_member_access_expression" {
@@ -2655,7 +2852,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 .into_iter()
                 .filter(|child| child.id() != object.id())
                 .collect::<Vec<_>>();
-            self.edge(
+            self.session.add_target_edge(
                 builder,
                 decision,
                 EdgeTarget {
@@ -2664,7 +2861,8 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 },
             )?;
             self.schedule_nullable_tail(builder, decision, &remaining, boundary, scope, stack)?;
-            self.edge(builder, entry, EdgeTarget::normal(object_entry))?;
+            self.session
+                .add_target_edge(builder, entry, EdgeTarget::normal(object_entry))?;
             stack.push(Work::Expression {
                 node: object,
                 entry: object_entry,
@@ -2697,7 +2895,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         stack: &mut Vec<Work<'tree>>,
     ) -> Result<(), PhpLoweringError> {
         if remaining.is_empty() {
-            return self.edge(
+            return self.session.add_target_edge(
                 builder,
                 decision,
                 EdgeTarget {
@@ -2707,7 +2905,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             );
         }
         let first = self.point(builder, remaining[0], Vec::new())?;
-        self.edge(
+        self.session.add_target_edge(
             builder,
             decision,
             EdgeTarget {
@@ -2740,7 +2938,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         let alternative = required_field(node, "alternative")?;
         let merge = self.point(builder, node, Vec::new())?;
         let alternative_entry = self.point(builder, alternative, Vec::new())?;
-        self.edge(builder, merge, next)?;
+        self.session.add_target_edge(builder, merge, next)?;
         stack.push(Work::Expression {
             node: alternative,
             entry: alternative_entry,
@@ -2791,7 +2989,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         let body = required_field(node, "body")?;
         let arms = named_children_without_comments(body);
         let merge = self.point(builder, node, Vec::new())?;
-        self.edge(builder, merge, next)?;
+        self.session.add_target_edge(builder, merge, next)?;
 
         let mut conditional_candidates = Vec::new();
         let mut default_entry = None;
@@ -2829,7 +3027,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                     value: Some(exception),
                 },
             )?;
-            self.add_gap(
+            self.session.record_gap(
                 builder,
                 unmatched,
                 SemanticGapSubject::Point,
@@ -2855,7 +3053,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         for (predicate, result_entry) in conditional_candidates.into_iter().rev() {
             let predicate_entry = self.point(builder, predicate, Vec::new())?;
             let comparison = self.point(builder, predicate, Vec::new())?;
-            self.edge(
+            self.session.add_target_edge(
                 builder,
                 comparison,
                 EdgeTarget {
@@ -2863,7 +3061,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                     kind: ControlEdgeKind::SwitchCase,
                 },
             )?;
-            self.edge(
+            self.session.add_target_edge(
                 builder,
                 comparison,
                 EdgeTarget {
@@ -2904,7 +3102,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         } else {
             self.point(builder, node, Vec::new())?
         };
-        self.add_gap(
+        self.session.record_gap(
             builder,
             boundary,
             SemanticGapSubject::Point,
@@ -2913,7 +3111,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             "yield suspension, sent values, thrown exceptions, and resumption are not lowered",
         )?;
         if has_direct_token(node, "from") {
-            self.add_gap(
+            self.session.record_gap(
                 builder,
                 boundary,
                 SemanticGapSubject::Point,
@@ -2964,7 +3162,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 "included code may define declarations, return a value, or terminate execution",
             ),
         ] {
-            self.add_gap(
+            self.session.record_gap(
                 builder,
                 boundary,
                 SemanticGapSubject::Point,
@@ -2973,7 +3171,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 detail,
             )?;
         }
-        self.edge(builder, boundary, next)?;
+        self.session.add_target_edge(builder, boundary, next)?;
         let values = runtime_expression_children(node);
         self.schedule_expressions(
             builder,
@@ -3013,7 +3211,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 "process-exit resource and destructor cleanup is not lowered",
             ),
         ] {
-            self.add_gap(
+            self.session.record_gap(
                 builder,
                 boundary,
                 SemanticGapSubject::Point,
@@ -3051,9 +3249,13 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         let normal = self.point(builder, node, Vec::new())?;
         let exceptional = self.point(builder, node, Vec::new())?;
         let callable_anchor = php_callable_anchor(node).unwrap_or(node);
-        let callee = self.source_value(builder, callable_anchor, SemanticValueKind::Callable)?;
+        let callee =
+            self.session
+                .add_node_value(builder, callable_anchor, SemanticValueKind::Callable)?;
         let result = self.expression_value(builder, node, SemanticValueKind::Temporary)?;
-        let thrown = self.source_value(builder, callable_anchor, SemanticValueKind::Exception)?;
+        let thrown =
+            self.session
+                .add_node_value(builder, callable_anchor, SemanticValueKind::Exception)?;
         let receiver_node = matches!(
             node.kind(),
             "member_call_expression" | "nullsafe_member_call_expression"
@@ -3062,7 +3264,11 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         .flatten();
         let receiver = receiver_node
             .map(|receiver| {
-                self.expression_value(builder, receiver, expression_value_kind(receiver))
+                self.expression_value(
+                    builder,
+                    receiver,
+                    expression_value_kind(self.prepared.source(), receiver),
+                )
             })
             .transpose()?;
         let callable_kind = match node.kind() {
@@ -3074,20 +3280,13 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             _ => CallableReferenceKind::Function,
         };
         let resolution = CallableTargetResolution::Unknown;
-        let metadata = self.metadata(invoke)?;
-        self.append_effect(
+        self.callable_reference(
             builder,
             invoke,
-            SemanticEffect::CallableReference {
-                result: callee,
-                callable: CallableValue {
-                    kind: callable_kind,
-                    targets: resolution.clone(),
-                    target_evidence: metadata.evidence,
-                    bound_receiver: receiver,
-                    environment: None,
-                },
-            },
+            callee,
+            callable_kind,
+            resolution.clone(),
+            receiver,
         )?;
 
         let mut arguments = Vec::new();
@@ -3097,8 +3296,11 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 incomplete_argument_mapping = true;
                 continue;
             };
-            let value =
-                self.expression_value(builder, value_node, expression_value_kind(value_node))?;
+            let value = self.expression_value(
+                builder,
+                value_node,
+                expression_value_kind(self.prepared.source(), value_node),
+            )?;
             let semantic = match php_call_argument_shape(argument) {
                 PhpCallArgumentShape::Positional => {
                     SemanticCallArgument::direct(value, ArgumentDomain::Positional)
@@ -3146,7 +3348,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 .add_allocation(builder, normal, result, AllocationKind::Object)?;
         }
         if incomplete_argument_mapping {
-            self.add_gap(
+            self.session.record_gap(
                 builder,
                 invoke,
                 SemanticGapSubject::CallSite(call_site),
@@ -3155,8 +3357,9 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 "PHP unpacked and by-reference arguments require resolved parameter binding",
             )?;
         }
-        self.edge(builder, invoke, EdgeTarget::normal(normal))?;
-        self.edge(
+        self.session
+            .add_target_edge(builder, invoke, EdgeTarget::normal(normal))?;
+        self.session.add_target_edge(
             builder,
             invoke,
             EdgeTarget {
@@ -3164,7 +3367,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 kind: ControlEdgeKind::Exceptional,
             },
         )?;
-        self.edge(builder, normal, next)?;
+        self.session.add_target_edge(builder, normal, next)?;
         self.abrupt(
             builder,
             exceptional,
@@ -3174,10 +3377,20 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             stack,
         )?;
         self.resolution_gaps(builder, invoke, callee, call_site, &resolution)?;
+        if php_symbol_table_function(self.prepared.source(), node) {
+            self.session.record_gap(
+                builder,
+                invoke,
+                SemanticGapSubject::Point,
+                SemanticCapability::Assignments,
+                SemanticGapKind::Unknown,
+                "extract and compact inspect or synthesize local bindings through the PHP symbol table",
+            )?;
+        }
         let uses_runtime_class_dispatch =
             runtime_class_dispatch_scope(self.prepared.source(), node);
         if receiver.is_some() || uses_runtime_class_dispatch {
-            self.add_gap(
+            self.session.record_gap(
                 builder,
                 invoke,
                 SemanticGapSubject::CallSite(call_site),
@@ -3192,7 +3405,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         // and nothing for the gap to refine, so publishing one would hold
         // every allocation's snapshot open on a question the source answers.
         if node.kind() == "object_creation_expression" && !self.creation_lifetime_is_closed(node) {
-            self.add_gap(
+            self.session.record_gap(
                 builder,
                 invoke,
                 SemanticGapSubject::Point,
@@ -3208,7 +3421,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             let decision = self.point(builder, node, Vec::new())?;
             let remaining = nullsafe_call_tail(node);
             let chain_destination = chain_short_circuit.unwrap_or(next.point);
-            self.edge(
+            self.session.add_target_edge(
                 builder,
                 decision,
                 EdgeTarget {
@@ -3217,7 +3430,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 },
             )?;
             if remaining.is_empty() {
-                self.edge(
+                self.session.add_target_edge(
                     builder,
                     decision,
                     EdgeTarget {
@@ -3227,7 +3440,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 )?;
             } else {
                 let first = self.point(builder, remaining[0], Vec::new())?;
-                self.edge(
+                self.session.add_target_edge(
                     builder,
                     decision,
                     EdgeTarget {
@@ -3244,7 +3457,8 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                     stack,
                 )?;
             }
-            self.edge(builder, entry, EdgeTarget::normal(object_entry))?;
+            self.session
+                .add_target_edge(builder, entry, EdgeTarget::normal(object_entry))?;
             stack.push(Work::Expression {
                 node: object,
                 entry: object_entry,
@@ -3304,22 +3518,15 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             "scoped_call_expression" => CallableReferenceKind::StaticMethod,
             _ => CallableReferenceKind::Function,
         };
-        let metadata = self.metadata(boundary)?;
-        self.append_effect(
+        self.callable_reference(
             builder,
             boundary,
-            SemanticEffect::CallableReference {
-                result,
-                callable: CallableValue {
-                    kind,
-                    targets: CallableTargetResolution::Unknown,
-                    target_evidence: metadata.evidence,
-                    bound_receiver: receiver,
-                    environment: None,
-                },
-            },
+            result,
+            kind,
+            CallableTargetResolution::Unknown,
+            receiver,
         )?;
-        self.add_gap(
+        self.session.record_gap(
             builder,
             boundary,
             SemanticGapSubject::Value(result),
@@ -3327,14 +3534,14 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             SemanticGapKind::Unknown,
             "first-class callable target requires location-first dispatch refinement",
         )?;
-        self.edge(builder, boundary, next)?;
+        self.session.add_target_edge(builder, boundary, next)?;
         if node.kind() == "nullsafe_member_call_expression" {
             let object = required_field(node, "object")?;
             let object_entry = self.point(builder, object, Vec::new())?;
             let decision = self.point(builder, node, Vec::new())?;
             let remaining = nullsafe_callable_reference_tail(node);
             let chain_destination = chain_short_circuit.unwrap_or(next.point);
-            self.edge(
+            self.session.add_target_edge(
                 builder,
                 decision,
                 EdgeTarget {
@@ -3343,7 +3550,8 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 },
             )?;
             self.schedule_nullable_tail(builder, decision, &remaining, boundary, scope, stack)?;
-            self.edge(builder, entry, EdgeTarget::normal(object_entry))?;
+            self.session
+                .add_target_edge(builder, entry, EdgeTarget::normal(object_entry))?;
             stack.push(Work::Expression {
                 node: object,
                 entry: object_entry,
@@ -3385,20 +3593,17 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             entry,
             SemanticEffect::CallableCreation {
                 result,
-                callable: CallableValue {
-                    kind: if node.kind() == "arrow_function" {
+                callable: CallableValue::unknown_target(
+                    if node.kind() == "arrow_function" {
                         CallableReferenceKind::Lambda
                     } else {
                         CallableReferenceKind::Function
                     },
-                    targets: CallableTargetResolution::Unknown,
-                    target_evidence: metadata.evidence,
-                    bound_receiver: None,
-                    environment: None,
-                },
+                    metadata.evidence,
+                ),
             },
         )?;
-        self.add_gap(
+        self.session.record_gap(
             builder,
             entry,
             SemanticGapSubject::Value(result),
@@ -3406,7 +3611,17 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             SemanticGapKind::Unknown,
             "closure body target and capture environment require location-first refinement",
         )?;
-        self.edge(builder, entry, next)
+        if php_closure_captures_by_reference(node) {
+            self.session.record_gap(
+                builder,
+                entry,
+                SemanticGapSubject::Point,
+                SemanticCapability::Captures,
+                SemanticGapKind::Unsupported,
+                "PHP closure by-reference captures can rebind the enclosing local",
+            )?;
+        }
+        self.session.add_target_edge(builder, entry, next)
     }
 
     fn unhandled_control_syntax(
@@ -3415,18 +3630,9 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         node: Node<'tree>,
         entry: ProgramPointId,
     ) -> Result<(), PhpLoweringError> {
-        let detail = format!(
-            "{} runtime/control syntax is not yet lowered structurally",
-            node.kind()
-        );
-        self.add_gap(
-            builder,
-            entry,
-            SemanticGapSubject::Point,
-            SemanticCapability::NormalControlFlow,
-            SemanticGapKind::Unsupported,
-            &detail,
-        )
+        self.session
+            .add_unhandled_control_syntax_gap(builder, entry, node.kind())
+            .map(|_| ())
     }
 
     /// What one local name or expression holds at this occurrence.
@@ -3525,14 +3731,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             None => source_anchor(name, 0).map_err(PhpLoweringError::Invalid)?,
         };
         let procedure = self.session.locator();
-        let locator = SemanticLocator::new(
-            procedure.mount(),
-            procedure.path().clone(),
-            procedure.language(),
-            procedure.declaration().clone(),
-            SemanticRole::MemoryLocation,
-            anchor,
-        );
+        let locator = procedure.memory_location_at(anchor);
         if !resolved && let Some(property) = property {
             self.field_locators.insert(property.into(), locator.clone());
         }
@@ -3569,18 +3768,12 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         point: ProgramPointId,
         location: MemoryLocationId,
     ) -> Result<(), PhpLoweringError> {
-        self.session.add_gap_with_impacts(
+        self.session.add_unknown_field_identity_gap(
             builder,
             point,
-            SemanticGapSubject::MemoryLocation(location),
-            SemanticCapability::FieldMemory,
-            SemanticGapImpacts::single(SemanticGapImpact::HeapRead)
-                .with(SemanticGapImpact::HeapWrite)
-                .with(SemanticGapImpact::Aliasing),
-            SemanticGapKind::Unknown,
+            location,
             "PHP property occurrence is structured, but the class that declares it is not resolved",
-        )?;
-        Ok(())
+        )
     }
 
     fn add_dynamic_index_gap(
@@ -3590,18 +3783,8 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         location: MemoryLocationId,
         detail: &str,
     ) -> Result<(), PhpLoweringError> {
-        self.session.add_gap_with_impacts(
-            builder,
-            point,
-            SemanticGapSubject::MemoryLocation(location),
-            SemanticCapability::IndexMemory,
-            SemanticGapImpacts::single(SemanticGapImpact::HeapRead)
-                .with(SemanticGapImpact::HeapWrite)
-                .with(SemanticGapImpact::Aliasing),
-            SemanticGapKind::Unsupported,
-            detail,
-        )?;
-        Ok(())
+        self.session
+            .add_unprojected_index_gap(builder, point, location, detail)
     }
 
     /// The memory location a place names, plus its own identity gaps.
@@ -3613,8 +3796,11 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
     ) -> Result<(MemoryLocationId, MemoryAccessKind), PhpLoweringError> {
         match place {
             PhpPlace::Field { object, name } => {
-                let base =
-                    self.expression_value(builder, *object, expression_value_kind(*object))?;
+                let base = self.expression_value(
+                    builder,
+                    *object,
+                    expression_value_kind(self.prepared.source(), *object),
+                )?;
                 let (member, resolved) = self.memory_member_locator(*object, *name)?;
                 let location = self.session.add_memory_location(
                     builder,
@@ -3627,8 +3813,11 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 Ok((location, MemoryAccessKind::Field))
             }
             PhpPlace::Element { object, key } => {
-                let base =
-                    self.expression_value(builder, *object, expression_value_kind(*object))?;
+                let base = self.expression_value(
+                    builder,
+                    *object,
+                    expression_value_kind(self.prepared.source(), *object),
+                )?;
                 let index = match key {
                     Some(key) => self.index_value(builder, *key)?,
                     None => None,
@@ -3681,7 +3870,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             // remains.
             return Ok(());
         }
-        self.add_gap(
+        self.session.record_gap(
             builder,
             point,
             SemanticGapSubject::Point,
@@ -3734,7 +3923,11 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         place: &PhpPlace<'tree>,
         node: Node<'tree>,
     ) -> Result<(), PhpLoweringError> {
-        let result = self.expression_value(builder, node, expression_value_kind(node))?;
+        let result = self.expression_value(
+            builder,
+            node,
+            expression_value_kind(self.prepared.source(), node),
+        )?;
         let (location, kind) = self.memory_location(builder, point, place)?;
         self.emit_access_dispatch_gaps(builder, point, place)?;
         self.append_effect(
@@ -3766,7 +3959,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
     ) -> Result<(), PhpLoweringError> {
         let (targets, unlowered) = php_foreach_targets(node);
         if unlowered {
-            self.add_gap(
+            self.session.record_gap(
                 builder,
                 point,
                 SemanticGapSubject::Point,
@@ -3786,7 +3979,11 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         if slots.is_empty() {
             return Ok(());
         }
-        let base = self.expression_value(builder, iterable, expression_value_kind(iterable))?;
+        let base = self.expression_value(
+            builder,
+            iterable,
+            expression_value_kind(self.prepared.source(), iterable),
+        )?;
         let location = self.session.add_memory_location(
             builder,
             point,
@@ -3817,7 +4014,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         point: ProgramPointId,
         operation: &str,
     ) -> Result<(), PhpLoweringError> {
-        self.add_gap(
+        self.session.record_gap(
             builder,
             point,
             SemanticGapSubject::Point,
@@ -3825,7 +4022,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             SemanticGapKind::Unknown,
             &format!("{operation} may invoke magic methods or runtime protocols"),
         )?;
-        self.add_gap(
+        self.session.record_gap(
             builder,
             point,
             SemanticGapSubject::Point,
@@ -3853,7 +4050,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         {
             return Ok(());
         }
-        self.add_gap(
+        self.session.record_gap(
             builder,
             point,
             SemanticGapSubject::Point,
@@ -3873,13 +4070,14 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         stack: &mut Vec<Work<'tree>>,
     ) -> Result<(), PhpLoweringError> {
         if children.is_empty() {
-            return self.edge(builder, entry, next);
+            return self.session.add_target_edge(builder, entry, next);
         }
         let entries = children
             .iter()
             .map(|child| self.point(builder, *child, Vec::new()))
             .collect::<Result<Vec<_>, _>>()?;
-        self.edge(builder, entry, EdgeTarget::normal(entries[0]))?;
+        self.session
+            .add_target_edge(builder, entry, EdgeTarget::normal(entries[0]))?;
         let dead_start = children
             .iter()
             .position(|child| statement_is_directly_abrupt(*child))
@@ -3955,27 +4153,28 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         stack: &mut Vec<Work<'tree>>,
     ) -> Result<(), PhpLoweringError> {
         if children.is_empty() {
-            return self.edge(builder, entry, next);
+            return self.session.add_target_edge(builder, entry, next);
         }
         let entries = children
             .iter()
             .map(|child| self.point(builder, *child, Vec::new()))
             .collect::<Result<Vec<_>, _>>()?;
-        self.edge(builder, entry, EdgeTarget::normal(entries[0]))?;
-        for index in (0..children.len()).rev() {
-            let child_next = entries
-                .get(index + 1)
-                .copied()
-                .map(EdgeTarget::normal)
-                .unwrap_or(next);
-            stack.push(Work::Expression {
-                node: children[index],
-                entry: entries[index],
-                next: child_next,
+        self.session
+            .add_target_edge(builder, entry, EdgeTarget::normal(entries[0]))?;
+        schedule_sequential_work(
+            stack,
+            children,
+            &entries,
+            next,
+            scope,
+            |index, node, entry, next, scope| Work::Expression {
+                node,
+                entry,
+                next,
                 scope,
                 chain_short_circuit: (index == 0).then_some(first_chain_short_circuit).flatten(),
-            });
-        }
+            },
+        );
         Ok(())
     }
 
@@ -3989,27 +4188,27 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         stack: &mut Vec<Work<'tree>>,
     ) -> Result<(), PhpLoweringError> {
         if children.is_empty() {
-            return self.edge(builder, first, next);
+            return self.session.add_target_edge(builder, first, next);
         }
         let mut entries = Vec::with_capacity(children.len());
         entries.push(first);
         for child in &children[1..] {
             entries.push(self.point(builder, *child, Vec::new())?);
         }
-        for index in (0..children.len()).rev() {
-            let child_next = entries
-                .get(index + 1)
-                .copied()
-                .map(EdgeTarget::normal)
-                .unwrap_or(next);
-            stack.push(Work::Expression {
-                node: children[index],
-                entry: entries[index],
-                next: child_next,
+        schedule_sequential_work(
+            stack,
+            children,
+            &entries,
+            next,
+            scope,
+            |_, node, entry, next, scope| Work::Expression {
+                node,
+                entry,
+                next,
                 scope,
                 chain_short_circuit: None,
-            });
-        }
+            },
+        );
         Ok(())
     }
 
@@ -4077,8 +4276,10 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
     }
 
     fn copy_controls(&mut self, parent: ScopeFrameId, child: ScopeFrameId) {
-        let controls = self.controls.get(&parent).cloned().unwrap_or_default();
-        self.controls.insert(child, controls);
+        self.controls.insert(
+            child,
+            crate::analyzer::semantic::lowering::copy_scope_frames(&self.controls, parent),
+        );
     }
 
     fn extend_controls(
@@ -4087,13 +4288,10 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         child: ScopeFrameId,
         frame: PhpControlFrame,
     ) {
-        let mut controls = self
-            .controls
-            .get(&parent)
-            .map(|controls| controls.to_vec())
-            .unwrap_or_default();
-        controls.push(frame);
-        self.controls.insert(child, controls.into_boxed_slice());
+        self.controls.insert(
+            child,
+            crate::analyzer::semantic::lowering::extend_scope_frames(&self.controls, parent, frame),
+        );
     }
 
     fn abrupt(
@@ -4108,26 +4306,20 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         let Some(route) = builder.resolve_completion(scope, &CompletionRequest::new(kind, label))
         else {
             if matches!(kind, CompletionKind::Break | CompletionKind::Continue) {
-                let detail = format!(
-                    "{} completion has no matching represented target",
-                    completion_label(kind)
-                );
-                return self.add_gap(
+                return self.session.add_unmatched_completion_gap(
                     builder,
                     from,
-                    SemanticGapSubject::Point,
+                    kind,
                     if label.is_some() {
                         SemanticCapability::NonLocalControl
                     } else {
                         SemanticCapability::NormalControlFlow
                     },
-                    SemanticGapKind::Unsupported,
-                    &detail,
                 );
             }
             return Err(PhpLoweringError::Invalid(format!(
                 "{} completion has no matching structured continuation",
-                completion_label(kind)
+                kind.label()
             )));
         };
         self.route(builder, from, &route, stack)
@@ -4148,13 +4340,9 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             |region| region.id,
             |region| region.body,
         )? {
-            let statement_next = if step.next.kind == ControlEdgeKind::Normal {
-                step.next
-            } else {
-                let relay = self.point(builder, step.region.body, Vec::new())?;
-                self.edge(builder, relay, step.next)?;
-                EdgeTarget::normal(relay)
-            };
+            let statement_next =
+                self.session
+                    .cleanup_next_target(builder, step.region.body, step.next)?;
             stack.push(Work::Statement {
                 node: step.region.body,
                 entry: step.entry,
@@ -4162,7 +4350,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 scope: step.region.outer_scope,
             });
         }
-        self.edge(builder, from, plan.target())
+        self.session.add_target_edge(builder, from, plan.target())
     }
 
     fn resolution_gaps(
@@ -4184,32 +4372,39 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         )
     }
 
+    fn callable_reference(
+        &self,
+        builder: &mut ProcedureCfgBuilder,
+        point: ProgramPointId,
+        result: ValueId,
+        kind: CallableReferenceKind,
+        targets: CallableTargetResolution,
+        bound_receiver: Option<ValueId>,
+    ) -> Result<(), PhpLoweringError> {
+        let metadata = self.metadata(point)?;
+        self.append_effect(
+            builder,
+            point,
+            SemanticEffect::CallableReference {
+                result,
+                callable: CallableValue {
+                    kind,
+                    targets,
+                    target_evidence: metadata.evidence,
+                    bound_receiver,
+                    environment: None,
+                },
+            },
+        )
+    }
+
     fn point(
         &mut self,
         builder: &mut ProcedureCfgBuilder,
         node: Node<'tree>,
         effects: Vec<SemanticEffect>,
     ) -> Result<ProgramPointId, PhpLoweringError> {
-        let metadata = self.mapping(builder, node)?;
-        self.session.add_point(builder, metadata, effects)
-    }
-
-    fn mapping(
-        &mut self,
-        builder: &mut ProcedureCfgBuilder,
-        node: Node<'tree>,
-    ) -> Result<PointMetadata, PhpLoweringError> {
-        self.session.add_node_mapping(builder, node)
-    }
-
-    fn value_mapping(
-        &mut self,
-        builder: &mut ProcedureCfgBuilder,
-        node: Node<'tree>,
-    ) -> Result<PointMetadata, PhpLoweringError> {
-        let anchor = source_anchor(node, 0).map_err(PhpLoweringError::Invalid)?;
-        self.session
-            .add_mapping(builder, anchor, SourceMappingKind::Exact)
+        self.session.add_node_point(builder, node, effects)
     }
 
     fn metadata(&self, point: ProgramPointId) -> Result<PointMetadata, PhpLoweringError> {
@@ -4232,30 +4427,6 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         effect: SemanticEffect,
     ) -> Result<(), PhpLoweringError> {
         self.session.append_effect(builder, point, effect)
-    }
-
-    fn add_gap(
-        &mut self,
-        builder: &mut ProcedureCfgBuilder,
-        point: ProgramPointId,
-        subject: SemanticGapSubject,
-        capability: SemanticCapability,
-        kind: SemanticGapKind,
-        detail: &str,
-    ) -> Result<(), PhpLoweringError> {
-        self.session
-            .add_gap(builder, point, subject, capability, kind, detail)?;
-        Ok(())
-    }
-
-    fn edge(
-        &self,
-        builder: &mut ProcedureCfgBuilder,
-        source_point: ProgramPointId,
-        target: EdgeTarget,
-    ) -> Result<(), PhpLoweringError> {
-        self.session
-            .add_edge(builder, source_point, target.point, target.kind)
     }
 }
 
@@ -4302,6 +4473,56 @@ fn php_boolean_literal_value(source: &str, node: Node<'_>) -> Option<bool> {
     }
 }
 
+fn peel_php_condition_parentheses(mut node: Node<'_>) -> Node<'_> {
+    while node.kind() == "parenthesized_expression" {
+        let Some(inner) = first_runtime_named_child(node) else {
+            break;
+        };
+        node = inner;
+    }
+    node
+}
+
+/// The exact scalar value kind of a PHP integer, Boolean, or null literal.
+/// PHP integer literals use the platform signed integer range; a spelling
+/// outside that range is left as a generic constant because PHP promotes it
+/// to a floating value at runtime. Parentheses and unary minus are structural
+/// wrappers, so they are peeled without inspecting source delimiters.
+fn php_scalar_literal_value_kind(source: &str, mut node: Node<'_>) -> Option<SemanticValueKind> {
+    let mut negative = false;
+    loop {
+        match node.kind() {
+            "parenthesized_expression" => node = first_runtime_named_child(node)?,
+            "unary_op_expression"
+                if node
+                    .child_by_field_name("operator")
+                    .is_some_and(|operator| operator.kind() == "-") =>
+            {
+                negative = !negative;
+                node = node.child_by_field_name("argument")?;
+            }
+            _ => break,
+        }
+    }
+    match node.kind() {
+        "integer" => {
+            let value = php_integer_literal(nonempty_node_text(source, node)?)?;
+            let value = if negative {
+                value.checked_neg()?
+            } else {
+                value
+            };
+            Some(SemanticValueKind::SignedInteger(i128::from(value)))
+        }
+        "boolean" => (!negative)
+            .then(|| php_boolean_literal_value(source, node))
+            .flatten()
+            .map(SemanticValueKind::Boolean),
+        "null" if !negative => Some(SemanticValueKind::Null),
+        _ => None,
+    }
+}
+
 /// The constant value of a condition, when its parenthesis and `!` wrappers
 /// bottom out in a boolean literal.
 ///
@@ -4333,17 +4554,6 @@ fn statement_is_directly_abrupt(node: Node<'_>) -> bool {
             matches!(expression.kind(), "throw_expression" | "exit_statement")
         }),
         _ => false,
-    }
-}
-
-fn completion_label(kind: CompletionKind) -> &'static str {
-    match kind {
-        CompletionKind::Normal => "normal",
-        CompletionKind::Return => "return",
-        CompletionKind::Throw => "throw",
-        CompletionKind::Break => "break",
-        CompletionKind::Continue => "continue",
-        CompletionKind::Yield => "yield",
     }
 }
 
@@ -4394,11 +4604,7 @@ fn call_arguments(node: Node<'_>) -> Vec<Node<'_>> {
 }
 
 fn call_arguments_node(node: Node<'_>) -> Option<Node<'_>> {
-    node.child_by_field_name("arguments").or_else(|| {
-        named_children(node)
-            .into_iter()
-            .find(|child| child.kind() == "arguments")
-    })
+    child_by_field_or_named_child_of_kinds(node, "arguments", &["arguments"])
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -4445,12 +4651,37 @@ fn php_callable_anchor(node: Node<'_>) -> Option<Node<'_>> {
     }
 }
 
-fn php_object_creation_type(node: Node<'_>) -> Option<Node<'_>> {
-    node.child_by_field_name("class").or_else(|| {
-        named_children(node)
+fn php_symbol_table_function(source: &str, node: Node<'_>) -> bool {
+    if node.kind() != "function_call_expression" {
+        return false;
+    }
+    let Some(anchor) = php_callable_anchor(node) else {
+        return false;
+    };
+    let Some(name) = node_text(source, anchor) else {
+        return false;
+    };
+    matches!(
+        name.rsplit('\\').next(),
+        Some(name) if name.eq_ignore_ascii_case("extract") || name.eq_ignore_ascii_case("compact")
+    )
+}
+
+fn php_closure_captures_by_reference(node: Node<'_>) -> bool {
+    node.kind() == "anonymous_function"
+        && named_children(node)
             .into_iter()
-            .find(|child| matches!(child.kind(), "name" | "qualified_name" | "relative_scope"))
-    })
+            .find(|child| child.kind() == "anonymous_function_use_clause")
+            .is_some_and(|use_clause| {
+                has_direct_named_child(use_clause, "by_ref")
+                    || has_direct_named_child(use_clause, "reference_modifier")
+                    || has_direct_token(use_clause, "&")
+            })
+}
+
+fn php_object_creation_type(node: Node<'_>) -> Option<Node<'_>> {
+    node.child_by_field_name("class")
+        .or_else(|| object_creation_type(node))
 }
 
 fn call_operand_evaluations(node: Node<'_>) -> Vec<Node<'_>> {
@@ -4687,6 +4918,7 @@ pub(crate) const PROCEDURE_SYNTAX_ROLES: crate::analyzer::languages::ProcedureSy
                 condition: node.child_by_field_name("condition"),
             })
         },
+        loop_site_with_source: None,
         procedure_matches: |_, node| is_php_procedure_node(node),
         nested_procedure: |node| {
             is_php_procedure_node(node)
@@ -4735,14 +4967,9 @@ fn php_statement_kind(node: Node<'_>) -> Option<&'static str> {
 }
 
 fn first_runtime_named_child(node: Node<'_>) -> Option<Node<'_>> {
-    named_children(node)
-        .into_iter()
-        .find(|child| child_is_runtime(node, *child))
-}
-
-fn named_children(node: Node<'_>) -> Vec<Node<'_>> {
-    let mut cursor = node.walk();
-    node.named_children(&mut cursor).collect()
+    brokk_bifrost_core::analyzer::tree_walk::first_named_child_matching(node, |child| {
+        child_is_runtime(node, child)
+    })
 }
 
 /// The named children that are program text rather than commentary.
@@ -4763,44 +4990,22 @@ fn named_children_without_comments(node: Node<'_>) -> Vec<Node<'_>> {
         .collect()
 }
 
-fn first_named_child(node: Node<'_>) -> Option<Node<'_>> {
-    let mut cursor = node.walk();
-    node.named_children(&mut cursor).next()
-}
-
 fn has_direct_named_child(node: Node<'_>, kind: &str) -> bool {
-    named_children(node)
-        .into_iter()
-        .any(|child| child.kind() == kind)
+    first_named_child_of_kind(node, kind).is_some()
 }
 
-fn has_direct_token(node: Node<'_>, kind: &str) -> bool {
-    let mut cursor = node.walk();
-    node.children(&mut cursor).any(|child| child.kind() == kind)
-}
+use brokk_bifrost_core::analyzer::tree_walk::has_child_of_kind as has_direct_token;
 
 fn is_comment_kind(kind: &str) -> bool {
     matches!(kind, "comment" | "php_tag" | "text")
 }
 
 fn required_field<'tree>(node: Node<'tree>, field: &str) -> Result<Node<'tree>, PhpLoweringError> {
-    node.child_by_field_name(field)
-        .ok_or_else(|| missing_field(node, field))
-}
-
-fn missing_field(node: Node<'_>, field: &str) -> PhpLoweringError {
-    PhpLoweringError::Invalid(format!(
-        "{} node at bytes {}..{} is missing structured field {field}",
-        node.kind(),
-        node.start_byte(),
-        node.end_byte()
-    ))
+    crate::analyzer::semantic::lowering::required_field_or_else(node, field, missing_field)
 }
 
 fn php_variable_name<'source>(source: &'source str, node: Node<'_>) -> &'source str {
-    node_text(source, node)
-        .unwrap_or_default()
-        .trim_start_matches('$')
+    brokk_bifrost_php::graph::syntax::variable_identifier(node, source)
 }
 
 fn normalize_php_name(name: &str) -> &str {
@@ -5410,17 +5615,16 @@ enum PhpLocalType {
 
 /// The class name of the type-like declaration this callable is written in.
 fn enclosing_class_name(source: &str, node: Node<'_>) -> Option<Box<str>> {
-    let mut parent = node.parent();
-    while let Some(candidate) = parent {
-        if matches!(
-            candidate.kind(),
-            "class_declaration" | "trait_declaration" | "enum_declaration"
-        ) {
-            return declaration_container_name(source, candidate);
-        }
-        parent = candidate.parent();
-    }
-    None
+    let candidate = brokk_bifrost_core::analyzer::structural::adapter_helpers::nearest_ancestor(
+        node,
+        |kind| {
+            matches!(
+                kind,
+                "class_declaration" | "trait_declaration" | "enum_declaration"
+            )
+        },
+    )?;
+    declaration_container_name(source, candidate)
 }
 
 /// What each local name of one procedure holds.
@@ -5580,7 +5784,11 @@ fn php_expression_local_type(
             .and_then(|child| php_unqualified_class_name(source, child))
             .map(|name| PhpLocalType::Class(name.into())),
         "parenthesized_expression" | "clone_expression" => {
-            let inner = first_runtime_named_child(node)?;
+            let inner = if node.kind() == "clone_expression" {
+                clone_object_operand(node, source)
+            } else {
+                first_runtime_named_child(node)
+            }?;
             php_expression_local_type(source, inventory, types, enclosing_class, inner, depth + 1)
         }
         "variable_name" => {
@@ -5619,12 +5827,121 @@ fn php_expression_local_type(
     }
 }
 
-fn expression_value_kind(node: Node<'_>) -> SemanticValueKind {
+fn expression_value_kind(source: &str, node: Node<'_>) -> SemanticValueKind {
+    if let Some(kind) = php_scalar_literal_value_kind(source, node) {
+        return kind;
+    }
     match node.kind() {
         "anonymous_function" | "arrow_function" => SemanticValueKind::Callable,
         "integer" | "float" | "boolean" | "null" | "string" | "string_content"
         | "magic_constant" => SemanticValueKind::Constant,
         _ => SemanticValueKind::Temporary,
+    }
+}
+
+/// The PHP bindings whose scalar representation is established by exact
+/// syntax. A local enters this list only when its literal initializers agree;
+/// later non-literal writes are stored as unknown by the scalar solver. A
+/// successful `int` or `bool` parameter call has already performed weak-mode
+/// coercion before the body executes, so `strict_types` does not change this
+/// entry fact. By-reference, variadic, promoted-property, nullable, union and
+/// unresolved parameters remain open.
+pub fn php_declared_scalar_types(
+    procedure: &ProcedureHandle,
+    prepared: &PreparedSyntaxTree,
+) -> Vec<(ValueId, DeclaredScalarType)> {
+    let bindings = binding_nodes(procedure, prepared);
+    let Some((_, _, first_binding)) = bindings.first().copied() else {
+        return Vec::new();
+    };
+    let mut callable = first_binding;
+    while let Some(parent) = callable.parent() {
+        callable = parent;
+        if is_callable_kind(callable.kind()) {
+            break;
+        }
+    }
+    let source = prepared.source();
+    let mut literal_types = HashMap::<Box<str>, Option<DeclaredScalarType>>::default();
+    let mut stack = vec![callable];
+    while let Some(node) = stack.pop() {
+        if node.id() != callable.id() && is_callable_kind(node.kind()) {
+            continue;
+        }
+        if node.kind() == "assignment_expression"
+            && let (Some(left), Some(right)) = (
+                node.child_by_field_name("left"),
+                node.child_by_field_name("right"),
+            )
+            && left.kind() == "variable_name"
+        {
+            let name = php_variable_name(source, left);
+            if let Some(kind) = php_scalar_literal_declared_type(source, right) {
+                match literal_types.get(name).copied() {
+                    None => {
+                        literal_types.insert(name.into(), Some(kind));
+                    }
+                    Some(Some(previous)) if previous == kind => {}
+                    Some(_) => {
+                        literal_types.insert(name.into(), None);
+                    }
+                }
+            }
+        }
+        stack.extend(named_children(node));
+    }
+
+    bindings
+        .into_iter()
+        .filter_map(|(value, parameter, name)| {
+            if parameter {
+                let declaration = name.parent()?;
+                if declaration.kind() != "simple_parameter"
+                    || has_direct_named_child(declaration, "reference_modifier")
+                    || has_direct_named_child(declaration, "by_ref")
+                {
+                    return None;
+                }
+                let scalar_type = declaration
+                    .child_by_field_name("type")
+                    .and_then(|type_node| php_scalar_declared_type(source, type_node))?;
+                return Some((value, scalar_type));
+            }
+            let name = php_variable_name(source, name);
+            literal_types
+                .get(name)
+                .copied()
+                .flatten()
+                .map(|scalar_type| (value, scalar_type))
+        })
+        .collect()
+}
+
+fn php_scalar_literal_declared_type(source: &str, node: Node<'_>) -> Option<DeclaredScalarType> {
+    match php_scalar_literal_value_kind(source, node)? {
+        SemanticValueKind::SignedInteger(_) => Some(DeclaredScalarType::Signed(64)),
+        SemanticValueKind::Boolean(_) => Some(DeclaredScalarType::Boolean),
+        SemanticValueKind::UnsignedInteger(_) => Some(DeclaredScalarType::Signed(64)),
+        _ => None,
+    }
+}
+
+fn php_scalar_declared_type(source: &str, mut type_node: Node<'_>) -> Option<DeclaredScalarType> {
+    loop {
+        match type_node.kind() {
+            "type" | "named_type" => type_node = first_named_child(type_node)?,
+            "primitive_type" | "name" => {
+                return match nonempty_node_text(source, type_node)?
+                    .to_ascii_lowercase()
+                    .as_str()
+                {
+                    "int" => Some(DeclaredScalarType::Signed(64)),
+                    "bool" => Some(DeclaredScalarType::Boolean),
+                    _ => None,
+                };
+            }
+            _ => return None,
+        }
     }
 }
 
@@ -5650,6 +5967,7 @@ fn is_runtime_leaf(kind: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use brokk_bifrost_test_macros::hardwon;
     use std::sync::Arc;
 
     use super::*;
@@ -5705,16 +6023,12 @@ mod tests {
         (parts.points.len(), parts.control_edges.len())
     }
 
-    /// `comment` is a tree-sitter extra, so the grammar admits one anywhere in
-    /// a `match_block` and makes it a named child there. Asking a comment for
-    /// the `return_expression` every arm has failed the lowering, and because a
-    /// provider failure is per file rather than per procedure, one `//` in one
-    /// match body cost that whole file its semantics. Every position the
-    /// grammar allows a comment in must lower to the same procedure as the
-    /// comment-free spelling.
+    /// Comments are tree-sitter extras. They must not change the lowered
+    /// control-flow shape for either PHP match arms or switch cases.
     #[test]
-    fn commented_match_bodies_lower_like_their_comment_free_spelling() {
-        let baseline = lowered_shape(
+    #[hardwon("25ff2ab51418: comments in PHP match bodies aborted semantic lowering")]
+    fn commented_control_bodies_lower_like_their_comment_free_spelling() {
+        let match_baseline = lowered_shape(
             "<?php\nfunction pick(string $t): int {\n    return match ($t) {\n        'a', 'b' => 1,\n        default => 0,\n    };\n}\n",
         );
 
@@ -5738,24 +6052,18 @@ mod tests {
         ] {
             assert_eq!(
                 lowered_shape(source),
-                baseline,
+                match_baseline,
                 "a {position} must not change what the match body lowers to"
             );
         }
-    }
 
-    /// The near miss the defect report contrasted against: a `switch` body
-    /// screens its children by case kind, so a comment there was always
-    /// harmless. It must stay harmless.
-    #[test]
-    fn commented_switch_bodies_lower_like_their_comment_free_spelling() {
-        let baseline = lowered_shape(
+        let switch_baseline = lowered_shape(
             "<?php\nfunction pick(string $t): int {\n    switch ($t) {\n        case 'a':\n            return 1;\n    }\n    return 0;\n}\n",
         );
-        let commented = lowered_shape(
+        let commented_switch = lowered_shape(
             "<?php\nfunction pick(string $t): int {\n    switch ($t) {\n        // leading\n        case 'a':\n            return 1; // trailing\n    }\n    return 0;\n}\n",
         );
-        assert_eq!(commented, baseline);
+        assert_eq!(commented_switch, switch_baseline);
     }
 
     /// The constant the condition lowering folds `if (<condition>)` to, or
@@ -5792,6 +6100,7 @@ mod tests {
     }
 
     #[test]
+    #[hardwon("#2663: wrapped and case-varied PHP booleans left impossible branches reachable")]
     fn constant_boolean_conditions_fold_through_their_wrappers() {
         for (condition, value) in [
             ("false", false),
@@ -5817,6 +6126,7 @@ mod tests {
     }
 
     #[test]
+    #[hardwon("#2663: opaque PHP conditions were incorrectly folded as constants")]
     fn non_constant_conditions_keep_their_decision() {
         for condition in [
             "$flag",
@@ -5839,21 +6149,15 @@ mod tests {
         }
     }
 
-    #[test]
-    fn guard_facts_are_partially_supported() {
-        assert_eq!(
-            php_capabilities().support(SemanticCapability::GuardFacts),
-            CapabilitySupport::Partial,
-            "PHP folds constant boolean conditions and records every other decision opaque"
-        );
-    }
-
     /// PHP casts an array key string to an integer only when the string is the
     /// canonical decimal representation of one. The pairs that must meet and
     /// the near misses that must not are both part of the contract: an
     /// over-eager cast merges cells PHP keeps apart, and a missing one splits
     /// a cell PHP keeps together.
     #[test]
+    #[hardwon(
+        "#2663: PHP array key canonicalization must preserve the correct integer and string identities"
+    )]
     fn php_array_key_strings_cast_exactly_when_php_casts_them() {
         for (text, expected) in [
             ("0", Some(0)),
@@ -5892,6 +6196,7 @@ mod tests {
     /// Two spellings of one integer name one cell, so a literal is read for
     /// its value and not its text.
     #[test]
+    #[hardwon("#2663: PHP integer literal values must drive constant-branch evaluation correctly")]
     fn php_integer_literals_are_read_by_value() {
         for (text, expected) in [
             ("0", Some(0)),
@@ -5916,27 +6221,6 @@ mod tests {
                 php_integer_literal(text),
                 expected,
                 "PHP integer literal {text:?} read wrongly"
-            );
-        }
-    }
-
-    /// The scalar list is a whitelist because every name absent from it can
-    /// hold an object whose release runs a destructor this file never sees.
-    #[test]
-    fn only_whitelisted_scalar_type_names_hold_no_object() {
-        for name in ["int", "float", "string", "bool", "INT", "Never", "void"] {
-            assert!(
-                php_scalar_type_name(name),
-                "{name} states a scalar and holds no object"
-            );
-        }
-        for name in [
-            "array", "object", "mixed", "iterable", "callable", "self", "static", "parent",
-            "Closing",
-        ] {
-            assert!(
-                !php_scalar_type_name(name),
-                "{name} can hold an object and must not be treated as a scalar"
             );
         }
     }

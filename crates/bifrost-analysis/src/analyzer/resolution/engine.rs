@@ -25,6 +25,7 @@ use super::fact_lowering::{
     LoweredCandidateDirection, LoweredCoverageGap, LoweredResolutionFragment,
     LoweringCoverageFrontier,
 };
+use super::fact_source::DeclarationAccessDecision;
 use super::model::{
     BindingCandidateAdmission, BindingFragmentId, BindingNodeId, BindingNodeKind,
     EndpointSignature, LookupAlternative, PartialPath, PartialPathId, PartialScopedSymbol,
@@ -121,6 +122,10 @@ pub struct ReferenceSearchAnswer {
 }
 
 impl ReferenceSearchAnswer {
+    pub(crate) fn empty(completion: ResolutionCompletion) -> Self {
+        Self::new(Vec::new(), Vec::new(), completion)
+    }
+
     pub(crate) fn new(
         references: impl Into<Box<[SemanticId]>>,
         witnesses: impl Into<Box<[ResolutionWitness]>>,
@@ -313,13 +318,12 @@ impl CandidateNodeIndex {
 
 /// What one direction's whole candidate index retains, buckets included.
 fn candidate_index_retained_bytes(index: &HashMap<BindingNodeId, CandidateNodeIndex>) -> usize {
-    index
-        .values()
-        .map(CandidateNodeIndex::estimated_retained_bytes)
-        .fold(
-            brokk_bifrost_core::hash::map_slot_bytes(index),
-            usize::saturating_add,
-        )
+    super::add_estimated_map_values(
+        brokk_bifrost_core::hash::map_slot_bytes(index),
+        index
+            .values()
+            .map(CandidateNodeIndex::estimated_retained_bytes),
+    )
 }
 
 /// Take the next path index across sorted buckets in candidate-identity
@@ -347,6 +351,25 @@ fn take_next_candidate_in_identity_order(
         buckets.swap_remove(best);
     }
     Some(taken)
+}
+
+fn visit_candidates_in_identity_order(
+    paths: &[StoredPartialPath],
+    node_index: Option<&CandidateNodeIndex>,
+    visitor: &mut dyn FnMut(PartialPathId, &PartialPath) -> StoreResult<bool>,
+) -> StoreResult<()> {
+    let Some(node_index) = node_index else {
+        return Ok(());
+    };
+    let mut buckets = Vec::new();
+    node_index.extend_all_buckets(&mut buckets);
+    while let Some(index) = take_next_candidate_in_identity_order(paths, &mut buckets) {
+        let candidate = &paths[index];
+        if !visitor(candidate.identity.path(), &candidate.path)? {
+            break;
+        }
+    }
+    Ok(())
 }
 
 /// One immutable, file-local fragment supplied to preload mode.
@@ -390,7 +413,7 @@ impl PreloadedFragment {
         mut self,
         definitions: Vec<(SemanticId, GoDefinitionNamespaces)>,
     ) -> Self {
-        self.go_definition_namespaces = definitions;
+        self.go_definition_namespaces.extend(definitions);
         self
     }
 
@@ -830,10 +853,7 @@ impl PreloadedCoverage {
 }
 
 fn poll_reverse_gap_completion(cancellation: &CancellationToken, work: &mut usize) -> bool {
-    *work = work
-        .checked_add(1)
-        .expect("preloaded reverse gap completion work must fit usize");
-    work.is_multiple_of(CANCELLATION_QUANTUM) && cancellation.is_cancelled()
+    super::poll_resolution_work(cancellation, work)
 }
 
 fn include_preloaded_candidate_cancellation(
@@ -841,13 +861,8 @@ fn include_preloaded_candidate_cancellation(
     cancellation: &CancellationToken,
     work: &mut usize,
 ) -> BatchCandidateCompletionOutcome {
-    let request_count = completion.branch_completions().len();
-    let (unconditional, branches) = completion.into_parts();
-    let mut evidence = CancellationEvidenceLedger::default();
-    let _ = evidence.include(&unconditional, cancellation, work);
-    let (unconditional, _) = evidence.finish(true, cancellation, work);
-    BatchCandidateCompletionOutcome::new_observing(request_count, unconditional, branches, || {
-        let _ = poll_reverse_gap_completion(cancellation, work);
+    super::batch::include_candidate_cancellation_with_poll(completion, cancellation, work, |work| {
+        poll_reverse_gap_completion(cancellation, work)
     })
 }
 
@@ -873,17 +888,182 @@ impl PreloadedFragmentSource {
             .get(&fragment)
             .cloned()
             .unwrap_or(ResolutionCompletion::Complete);
-        if let ResolutionCompletion::Incomplete(reasons) = &completion {
-            for _ in reasons.iter() {
-                if !session.scope_step() || cancellation.is_cancelled() {
-                    return Ok(completion.combine(&cancelled_completion()));
+        Ok(super::reference_inventory_completion_with_session(
+            completion,
+            cancellation,
+            session,
+        ))
+    }
+
+    fn reference_seed_for_node(
+        &self,
+        query: ResolutionQuery,
+        node: BindingNodeId,
+        cancellation: &CancellationToken,
+        work: &mut usize,
+    ) -> ReferenceSeed {
+        let fragment = self
+            .node_fragments
+            .get(&node)
+            .copied()
+            .expect("every preloaded reference node has an owning fragment");
+        ReferenceSeed::new_with_site_metadata(
+            fragment,
+            query,
+            node,
+            self.reference_metadata.get(&query.reference()).copied(),
+            self.coverage
+                .reference_completion_with_poll(query.reference(), cancellation, work),
+        )
+    }
+
+    fn definition_node_for(&self, definition: SemanticId) -> Option<BindingNodeId> {
+        self.definitions.get(&definition).copied()
+    }
+
+    fn match_candidates(
+        &self,
+        requests: &[BatchCandidateRequest],
+        direction: LoweredCandidateDirection,
+        cancellation: &CancellationToken,
+    ) -> StoreResult<super::batch::BatchCandidateOutcome> {
+        let index = match direction {
+            LoweredCandidateDirection::Forward => &self.forward,
+            LoweredCandidateDirection::Reverse => &self.reverse,
+        };
+        let mut matches = BTreeSet::new();
+        let mut visited = 0_usize;
+        let mut buckets = Vec::new();
+        'requests: for request in requests {
+            visited += 1;
+            if visited.is_multiple_of(CANCELLATION_QUANTUM) && cancellation.is_cancelled() {
+                break 'requests;
+            }
+            let Some(node_index) = index.get(&request.endpoint().node()) else {
+                continue;
+            };
+            buckets.clear();
+            node_index.extend_buckets_for(request.endpoint(), &mut buckets);
+            while let Some(index) = take_next_candidate_in_identity_order(&self.paths, &mut buckets)
+            {
+                visited += 1;
+                if visited.is_multiple_of(CANCELLATION_QUANTUM) && cancellation.is_cancelled() {
+                    break 'requests;
                 }
+                let stored = &self.paths[index];
+                let admitted = match direction {
+                    LoweredCandidateDirection::Forward => {
+                        endpoint_admits_candidate(request.endpoint(), stored.path.start())
+                    }
+                    LoweredCandidateDirection::Reverse => {
+                        endpoint_admits_candidate(request.endpoint(), stored.path.end())
+                    }
+                };
+                if !admitted {
+                    continue;
+                }
+                matches.insert(BatchCandidateMatch::new(
+                    stored.identity,
+                    request.request_ordinal(),
+                ));
             }
         }
-        if cancellation.is_cancelled() || !session.observe_cancellation() {
-            return Ok(completion.combine(&cancelled_completion()));
+        let mut canonical_matches = Vec::with_capacity(matches.len());
+        while let Some(matched) = matches.pop_first() {
+            visited += 1;
+            if visited.is_multiple_of(CANCELLATION_QUANTUM) {
+                let _ = cancellation.is_cancelled();
+            }
+            canonical_matches.push(matched);
         }
-        Ok(completion)
+        let unconditional_completion = self.coverage.candidate_unconditional_completion_with_poll(
+            direction,
+            cancellation,
+            &mut visited,
+        );
+        let mut branch_completions = Vec::with_capacity(requests.len());
+        for request in requests {
+            visited += 1;
+            if visited.is_multiple_of(CANCELLATION_QUANTUM) {
+                let _ = cancellation.is_cancelled();
+            }
+            branch_completions.push(self.coverage.candidate_branch_completion_with_poll(
+                direction,
+                request.endpoint(),
+                cancellation,
+                &mut visited,
+            ));
+        }
+        Ok(super::batch::BatchCandidateOutcome::new_observing(
+            requests.len(),
+            canonical_matches,
+            unconditional_completion,
+            branch_completions,
+            || {
+                visited += 1;
+                if visited.is_multiple_of(CANCELLATION_QUANTUM) {
+                    let _ = cancellation.is_cancelled();
+                }
+            },
+        ))
+    }
+
+    fn candidate_completion_outcome(
+        &self,
+        requests: &[BatchCandidateRequest],
+        direction: LoweredCandidateDirection,
+        session: Option<&ResolutionSession>,
+        cancellation: &CancellationToken,
+        work: &mut usize,
+    ) -> BatchCandidateCompletionOutcome {
+        let unconditional_completion = self.coverage.candidate_unconditional_completion_with_poll(
+            direction,
+            cancellation,
+            work,
+        );
+        let branch_work_context = match direction {
+            LoweredCandidateDirection::Forward => "forward candidate coverage work must fit usize",
+            LoweredCandidateDirection::Reverse => "reverse candidate coverage work must fit usize",
+        };
+        let observation_work_context = match direction {
+            LoweredCandidateDirection::Forward => {
+                "forward candidate completion work must fit usize"
+            }
+            LoweredCandidateDirection::Reverse => {
+                "reverse candidate completion work must fit usize"
+            }
+        };
+        let mut branch_completions = Vec::with_capacity(requests.len());
+        for request in requests {
+            if session.is_some_and(|session| !session.scope_step()) {
+                return BatchCandidateCompletionOutcome::new(
+                    requests.len(),
+                    cancelled_completion(),
+                    std::iter::repeat_n(ResolutionCompletion::Complete, requests.len()),
+                );
+            }
+            *work = work.checked_add(1).expect(branch_work_context);
+            if work.is_multiple_of(CANCELLATION_QUANTUM) {
+                let _ = cancellation.is_cancelled();
+            }
+            branch_completions.push(self.coverage.candidate_branch_completion_with_poll(
+                direction,
+                request.endpoint(),
+                cancellation,
+                work,
+            ));
+        }
+        BatchCandidateCompletionOutcome::new_observing(
+            requests.len(),
+            unconditional_completion,
+            branch_completions,
+            || {
+                *work = work.checked_add(1).expect(observation_work_context);
+                if work.is_multiple_of(CANCELLATION_QUANTUM) {
+                    let _ = cancellation.is_cancelled();
+                }
+            },
+        )
     }
 
     fn assert_local_or_boundary_node(
@@ -1488,7 +1668,7 @@ impl ResolutionFragmentSource for PreloadedFragmentSource {
 
     fn definition_node(&self, definition: SemanticId) -> StoreResult<Option<BindingNodeId>> {
         self.require_legacy_closed_world()?;
-        Ok(self.definitions.get(&definition).copied())
+        Ok(self.definition_node_for(definition))
     }
 
     fn definition_semantic(&self, node: BindingNodeId) -> StoreResult<Option<SemanticId>> {
@@ -1524,18 +1704,7 @@ impl ResolutionFragmentSource for PreloadedFragmentSource {
         visitor: &mut dyn FnMut(PartialPathId, &PartialPath) -> StoreResult<bool>,
     ) -> StoreResult<()> {
         self.require_legacy_closed_world()?;
-        let Some(node_index) = self.forward.get(&endpoint.node()) else {
-            return Ok(());
-        };
-        let mut buckets = Vec::new();
-        node_index.extend_all_buckets(&mut buckets);
-        while let Some(index) = take_next_candidate_in_identity_order(&self.paths, &mut buckets) {
-            let candidate = &self.paths[index];
-            if !visitor(candidate.identity.path(), &candidate.path)? {
-                break;
-            }
-        }
-        Ok(())
+        visit_candidates_in_identity_order(&self.paths, self.forward.get(&endpoint.node()), visitor)
     }
 
     fn visit_reverse_candidates(
@@ -1544,18 +1713,7 @@ impl ResolutionFragmentSource for PreloadedFragmentSource {
         visitor: &mut dyn FnMut(PartialPathId, &PartialPath) -> StoreResult<bool>,
     ) -> StoreResult<()> {
         self.require_legacy_closed_world()?;
-        let Some(node_index) = self.reverse.get(&endpoint.node()) else {
-            return Ok(());
-        };
-        let mut buckets = Vec::new();
-        node_index.extend_all_buckets(&mut buckets);
-        while let Some(index) = take_next_candidate_in_identity_order(&self.paths, &mut buckets) {
-            let candidate = &self.paths[index];
-            if !visitor(candidate.identity.path(), &candidate.path)? {
-                break;
-            }
-        }
-        Ok(())
+        visit_candidates_in_identity_order(&self.paths, self.reverse.get(&endpoint.node()), visitor)
     }
 
     fn visit_type_transfer_rules(
@@ -1604,22 +1762,12 @@ impl BatchResolutionFragmentSource for PreloadedFragmentSource {
         let Some(&node) = self.references.get(&query.reference()) else {
             return Ok(None);
         };
-        let fragment = self
-            .node_fragments
-            .get(&node)
-            .copied()
-            .expect("every preloaded reference node has an owning fragment");
         let mut work = 0_usize;
-        Ok(Some(ReferenceSeed::new_with_site_metadata(
-            fragment,
+        Ok(Some(self.reference_seed_for_node(
             query,
             node,
-            self.reference_metadata.get(&query.reference()).copied(),
-            self.coverage.reference_completion_with_poll(
-                query.reference(),
-                cancellation,
-                &mut work,
-            ),
+            cancellation,
+            &mut work,
         )))
     }
 
@@ -1646,24 +1794,10 @@ impl BatchResolutionFragmentSource for PreloadedFragmentSource {
         for (ordinal, &query) in queries.iter().enumerate() {
             let mut cancellation_observed =
                 ordinal.is_multiple_of(CANCELLATION_QUANTUM) && cancellation.is_cancelled();
-            let seed = self.references.get(&query.reference()).map(|&node| {
-                let fragment = self
-                    .node_fragments
-                    .get(&node)
-                    .copied()
-                    .expect("every preloaded reference node has an owning fragment");
-                ReferenceSeed::new_with_site_metadata(
-                    fragment,
-                    query,
-                    node,
-                    self.reference_metadata.get(&query.reference()).copied(),
-                    self.coverage.reference_completion_with_poll(
-                        query.reference(),
-                        cancellation,
-                        &mut work,
-                    ),
-                )
-            });
+            let seed = self
+                .references
+                .get(&query.reference())
+                .map(|&node| self.reference_seed_for_node(query, node, cancellation, &mut work));
             if let Some(seed) = &seed {
                 cancellation_observed |=
                     evidence.include(seed.completion(), cancellation, &mut work);
@@ -1690,7 +1824,7 @@ impl BatchResolutionFragmentSource for PreloadedFragmentSource {
         if cancellation.is_cancelled() {
             return Ok(None);
         }
-        Ok(self.definitions.get(&definition).copied())
+        Ok(self.definition_node_for(definition))
     }
 
     fn lookup_definition_nodes(
@@ -1740,21 +1874,11 @@ impl BatchResolutionFragmentSource for PreloadedFragmentSource {
             if node != request.expected_node() {
                 continue;
             }
-            let fragment = self
-                .node_fragments
-                .get(&node)
-                .copied()
-                .expect("every preloaded reference node has an owning fragment");
-            seeds.push(ReferenceSeed::new_with_site_metadata(
-                fragment,
+            seeds.push(self.reference_seed_for_node(
                 ResolutionQuery::new(request.reference()),
                 node,
-                self.reference_metadata.get(&request.reference()).copied(),
-                self.coverage.reference_completion_with_poll(
-                    request.reference(),
-                    cancellation,
-                    &mut work,
-                ),
+                cancellation,
+                &mut work,
             ));
         }
         Ok(seeds)
@@ -1961,73 +2085,7 @@ impl BatchResolutionFragmentSource for PreloadedFragmentSource {
         requests: &[BatchCandidateRequest],
         cancellation: &CancellationToken,
     ) -> StoreResult<super::batch::BatchCandidateOutcome> {
-        let mut matches = BTreeSet::new();
-        let mut visited = 0_usize;
-        let mut buckets = Vec::new();
-        'requests: for request in requests {
-            visited += 1;
-            if visited.is_multiple_of(CANCELLATION_QUANTUM) && cancellation.is_cancelled() {
-                break 'requests;
-            }
-            let Some(node_index) = self.forward.get(&request.endpoint().node()) else {
-                continue;
-            };
-            buckets.clear();
-            node_index.extend_buckets_for(request.endpoint(), &mut buckets);
-            while let Some(index) = take_next_candidate_in_identity_order(&self.paths, &mut buckets)
-            {
-                visited += 1;
-                if visited.is_multiple_of(CANCELLATION_QUANTUM) && cancellation.is_cancelled() {
-                    break 'requests;
-                }
-                let stored = &self.paths[index];
-                if !endpoint_admits_candidate(request.endpoint(), stored.path.start()) {
-                    continue;
-                }
-                matches.insert(BatchCandidateMatch::new(
-                    stored.identity,
-                    request.request_ordinal(),
-                ));
-            }
-        }
-        let mut canonical_matches = Vec::with_capacity(matches.len());
-        while let Some(matched) = matches.pop_first() {
-            visited += 1;
-            if visited.is_multiple_of(CANCELLATION_QUANTUM) {
-                let _ = cancellation.is_cancelled();
-            }
-            canonical_matches.push(matched);
-        }
-        let unconditional_completion = self.coverage.candidate_unconditional_completion_with_poll(
-            LoweredCandidateDirection::Forward,
-            cancellation,
-            &mut visited,
-        );
-        let mut branch_completions = Vec::with_capacity(requests.len());
-        for request in requests {
-            visited += 1;
-            if visited.is_multiple_of(CANCELLATION_QUANTUM) {
-                let _ = cancellation.is_cancelled();
-            }
-            branch_completions.push(self.coverage.candidate_branch_completion_with_poll(
-                LoweredCandidateDirection::Forward,
-                request.endpoint(),
-                cancellation,
-                &mut visited,
-            ));
-        }
-        Ok(super::batch::BatchCandidateOutcome::new_observing(
-            requests.len(),
-            canonical_matches,
-            unconditional_completion,
-            branch_completions,
-            || {
-                visited += 1;
-                if visited.is_multiple_of(CANCELLATION_QUANTUM) {
-                    let _ = cancellation.is_cancelled();
-                }
-            },
-        ))
+        self.match_candidates(requests, LoweredCandidateDirection::Forward, cancellation)
     }
 
     fn match_reverse_candidates(
@@ -2035,73 +2093,7 @@ impl BatchResolutionFragmentSource for PreloadedFragmentSource {
         requests: &[BatchCandidateRequest],
         cancellation: &CancellationToken,
     ) -> StoreResult<super::batch::BatchCandidateOutcome> {
-        let mut matches = BTreeSet::new();
-        let mut visited = 0_usize;
-        let mut buckets = Vec::new();
-        'requests: for request in requests {
-            visited += 1;
-            if visited.is_multiple_of(CANCELLATION_QUANTUM) && cancellation.is_cancelled() {
-                break 'requests;
-            }
-            let Some(node_index) = self.reverse.get(&request.endpoint().node()) else {
-                continue;
-            };
-            buckets.clear();
-            node_index.extend_buckets_for(request.endpoint(), &mut buckets);
-            while let Some(index) = take_next_candidate_in_identity_order(&self.paths, &mut buckets)
-            {
-                visited += 1;
-                if visited.is_multiple_of(CANCELLATION_QUANTUM) && cancellation.is_cancelled() {
-                    break 'requests;
-                }
-                let stored = &self.paths[index];
-                if !endpoint_admits_candidate(request.endpoint(), stored.path.end()) {
-                    continue;
-                }
-                matches.insert(BatchCandidateMatch::new(
-                    stored.identity,
-                    request.request_ordinal(),
-                ));
-            }
-        }
-        let mut canonical_matches = Vec::with_capacity(matches.len());
-        while let Some(matched) = matches.pop_first() {
-            visited += 1;
-            if visited.is_multiple_of(CANCELLATION_QUANTUM) {
-                let _ = cancellation.is_cancelled();
-            }
-            canonical_matches.push(matched);
-        }
-        let unconditional_completion = self.coverage.candidate_unconditional_completion_with_poll(
-            LoweredCandidateDirection::Reverse,
-            cancellation,
-            &mut visited,
-        );
-        let mut branch_completions = Vec::with_capacity(requests.len());
-        for request in requests {
-            visited += 1;
-            if visited.is_multiple_of(CANCELLATION_QUANTUM) {
-                let _ = cancellation.is_cancelled();
-            }
-            branch_completions.push(self.coverage.candidate_branch_completion_with_poll(
-                LoweredCandidateDirection::Reverse,
-                request.endpoint(),
-                cancellation,
-                &mut visited,
-            ));
-        }
-        Ok(super::batch::BatchCandidateOutcome::new_observing(
-            requests.len(),
-            canonical_matches,
-            unconditional_completion,
-            branch_completions,
-            || {
-                visited += 1;
-                if visited.is_multiple_of(CANCELLATION_QUANTUM) {
-                    let _ = cancellation.is_cancelled();
-                }
-            },
-        ))
+        self.match_candidates(requests, LoweredCandidateDirection::Reverse, cancellation)
     }
 
     fn visit_forward_candidate_match_pages(
@@ -2145,45 +2137,12 @@ impl BatchResolutionFragmentSource for PreloadedFragmentSource {
                 std::iter::repeat_n(ResolutionCompletion::Complete, requests.len()),
             ));
         }
-        let unconditional_completion = self.coverage.candidate_unconditional_completion_with_poll(
+        Ok(self.candidate_completion_outcome(
+            requests,
             LoweredCandidateDirection::Forward,
+            resolution_session,
             cancellation,
             &mut work,
-        );
-        let mut branch_completions = Vec::with_capacity(requests.len());
-        for request in requests {
-            if resolution_session.is_some_and(|session| !session.scope_step()) {
-                return Ok(BatchCandidateCompletionOutcome::new(
-                    requests.len(),
-                    cancelled_completion(),
-                    std::iter::repeat_n(ResolutionCompletion::Complete, requests.len()),
-                ));
-            }
-            work = work
-                .checked_add(1)
-                .expect("forward candidate coverage work must fit usize");
-            if work.is_multiple_of(CANCELLATION_QUANTUM) {
-                let _ = cancellation.is_cancelled();
-            }
-            branch_completions.push(self.coverage.candidate_branch_completion_with_poll(
-                LoweredCandidateDirection::Forward,
-                request.endpoint(),
-                cancellation,
-                &mut work,
-            ));
-        }
-        Ok(BatchCandidateCompletionOutcome::new_observing(
-            requests.len(),
-            unconditional_completion,
-            branch_completions,
-            || {
-                work = work
-                    .checked_add(1)
-                    .expect("forward candidate completion work must fit usize");
-                if work.is_multiple_of(CANCELLATION_QUANTUM) {
-                    let _ = cancellation.is_cancelled();
-                }
-            },
         ))
     }
 
@@ -2202,38 +2161,12 @@ impl BatchResolutionFragmentSource for PreloadedFragmentSource {
             &mut work,
             visitor,
         )?;
-        let unconditional_completion = self.coverage.candidate_unconditional_completion_with_poll(
+        Ok(self.candidate_completion_outcome(
+            requests,
             LoweredCandidateDirection::Reverse,
+            None,
             cancellation,
             &mut work,
-        );
-        let mut branch_completions = Vec::with_capacity(requests.len());
-        for request in requests {
-            work = work
-                .checked_add(1)
-                .expect("reverse candidate coverage work must fit usize");
-            if work.is_multiple_of(CANCELLATION_QUANTUM) {
-                let _ = cancellation.is_cancelled();
-            }
-            branch_completions.push(self.coverage.candidate_branch_completion_with_poll(
-                LoweredCandidateDirection::Reverse,
-                request.endpoint(),
-                cancellation,
-                &mut work,
-            ));
-        }
-        Ok(BatchCandidateCompletionOutcome::new_observing(
-            requests.len(),
-            unconditional_completion,
-            branch_completions,
-            || {
-                work = work
-                    .checked_add(1)
-                    .expect("reverse candidate completion work must fit usize");
-                if work.is_multiple_of(CANCELLATION_QUANTUM) {
-                    let _ = cancellation.is_cancelled();
-                }
-            },
         ))
     }
 
@@ -2425,25 +2358,9 @@ impl<'a, S: ResolutionFragmentSource + ?Sized> ResolutionEngine<'a, S> {
         state: &TypedFrontierState,
         cancellation: &CancellationToken,
     ) -> StoreResult<(Vec<TypedFrontierState>, ResolutionCompletion)> {
-        if cancellation.is_cancelled() {
-            return Ok((
-                Vec::new(),
-                state.completion().combine(&cancelled_completion()),
-            ));
-        }
-        let mut rules = Vec::new();
-        let mut visited = 0_usize;
-        let source_completion =
-            self.source
-                .visit_type_transfer_rules(state.slot(), &mut |rule| {
-                    visited += 1;
-                    if visited.is_multiple_of(CANCELLATION_QUANTUM) && cancellation.is_cancelled() {
-                        return Ok(false);
-                    }
-                    rules.push(rule.clone());
-                    Ok(true)
-                })?;
-        apply_type_transfer_rules(state, rules, source_completion, cancellation)
+        transfer_types_with_source(state, cancellation, |visitor| {
+            self.source.visit_type_transfer_rules(state.slot(), visitor)
+        })
     }
 
     /// Reverse stitching only generates candidates. Each candidate is then
@@ -2564,7 +2481,7 @@ impl<'a, S: ResolutionFragmentSource + ?Sized> ResolutionEngine<'a, S> {
         let mut clock = WorkClock::default();
         let mut cancelled = false;
 
-        while let Some(state) = queue.pop_front() {
+        while let Some(mut state) = queue.pop_front() {
             if let Some(target) = self.complete_definition(&state.path)? {
                 let namespaces = self.source.go_definition_namespaces(target)?;
                 match classify_completed_binding(
@@ -2574,10 +2491,16 @@ impl<'a, S: ResolutionFragmentSource + ?Sized> ResolutionEngine<'a, S> {
                     target,
                     state.path,
                 ) {
-                    CompletedBinding::Complete(candidate) => completed.push(candidate),
-                    CompletedBinding::Incomplete(terminal) => terminals.push(terminal),
+                    CompletedBinding::Complete(candidate) => {
+                        completed.push(candidate);
+                        continue;
+                    }
+                    CompletedBinding::Incomplete(terminal) => {
+                        terminals.push(terminal);
+                        continue;
+                    }
+                    CompletedBinding::Ignored(path) => state.path = path,
                 }
-                continue;
             }
 
             let mut has_successor = false;
@@ -2727,14 +2650,16 @@ pub(super) struct CompletedPath {
     pub(super) path: PartialPath,
 }
 
-/// Binding classification has two domain outcomes, each retaining its path.
+/// Binding classification retains the path for every domain outcome.
 #[derive(Debug)]
 pub(super) enum CompletedBinding {
     Complete(CompletedPath),
     Incomplete(IncompleteTerminalPath),
+    Ignored(PartialPath),
 }
 
 /// Missing Go namespace authority is uncertainty, never an affirmative blocker.
+/// Its path must already carry the evidence for that uncertainty.
 pub(super) fn classify_completed_binding(
     requested: Option<ResolutionNamespace>,
     package_qualifier: bool,
@@ -2743,6 +2668,15 @@ pub(super) fn classify_completed_binding(
     path: PartialPath,
 ) -> CompletedBinding {
     assert!(!package_qualifier || requested == Some(ResolutionNamespace::TypeOrValue));
+    if namespaces.is_some_and(GoDefinitionNamespaces::is_go_field)
+        && !matches!(
+            requested,
+            None | Some(ResolutionNamespace::Value)
+                | Some(ResolutionNamespace::TypeOrValue) if !package_qualifier
+        )
+    {
+        return CompletedBinding::Ignored(path);
+    }
     let admission = match requested {
         None => BindingCandidateAdmission::Target,
         Some(requested) => match namespaces {
@@ -2751,11 +2685,11 @@ pub(super) fn classify_completed_binding(
             }
             Some(_) => BindingCandidateAdmission::WrongNamespaceBlocker,
             None => {
-                return CompletedBinding::Incomplete(IncompleteTerminalPath::new(
-                    path.with_additional_completion(&ResolutionCompletion::incomplete([
-                        ResolutionIncompleteReason::UnsupportedSemantic(target),
-                    ])),
-                ));
+                assert!(
+                    matches!(path.completion(), ResolutionCompletion::Incomplete(_)),
+                    "missing Go namespace authority must carry attributable incomplete evidence: {target}"
+                );
+                return CompletedBinding::Incomplete(IncompleteTerminalPath::new(path));
             }
         },
     };
@@ -2808,8 +2742,7 @@ pub(super) fn identity_path(node: BindingNodeId) -> PartialPath {
 pub(super) fn endpoint_is_balanced(endpoint: &EndpointSignature) -> bool {
     endpoint.symbols().fixed().is_empty()
         && endpoint.symbols().tail().is_none()
-        && endpoint.scopes().fixed().is_empty()
-        && endpoint.scopes().tail().is_none()
+        && super::endpoint_has_empty_scopes(endpoint)
 }
 
 pub(super) fn apply_type_transfer_rules(
@@ -2891,7 +2824,32 @@ pub(super) fn apply_type_transfer_rules(
     Ok((alternatives, completion))
 }
 
-pub(super) fn cancelled_completion() -> ResolutionCompletion {
+pub(super) fn transfer_types_with_source(
+    state: &TypedFrontierState,
+    cancellation: &CancellationToken,
+    visit_rules: impl FnOnce(
+        &mut dyn FnMut(&TypeTransferRule) -> StoreResult<bool>,
+    ) -> StoreResult<ResolutionCompletion>,
+) -> StoreResult<(Vec<TypedFrontierState>, ResolutionCompletion)> {
+    if cancellation.is_cancelled() {
+        return Ok((
+            Vec::new(),
+            state.completion().combine(&cancelled_completion()),
+        ));
+    }
+    let mut rules = Vec::new();
+    let mut visited = 0_usize;
+    let source_completion = visit_rules(&mut |rule| {
+        if super::poll_resolution_work(cancellation, &mut visited) {
+            return Ok(false);
+        }
+        rules.push(rule.clone());
+        Ok(true)
+    })?;
+    apply_type_transfer_rules(state, rules, source_completion, cancellation)
+}
+
+pub(crate) fn cancelled_completion() -> ResolutionCompletion {
     ResolutionCompletion::incomplete([ResolutionIncompleteReason::Cancelled])
 }
 
@@ -2904,13 +2862,16 @@ pub(super) fn select_paths(
 ) -> ResolutionAnswer {
     select_paths_with_cancellation_evidence(
         reference,
-        completed,
-        terminals,
+        &completed,
+        &terminals,
         unconditional_completion,
         ResolutionCompletion::Complete,
         cancellation,
     )
 }
+
+pub(super) type SelectionAccessLookup<'a> = dyn FnMut(SemanticId, &[SemanticId]) -> StoreResult<Option<Vec<DeclarationAccessDecision>>>
+    + 'a;
 
 struct CompletedPathDominance {
     dominance: Vec<Vec<usize>>,
@@ -2987,6 +2948,131 @@ fn completed_path_dominance_with_poll(
     })
 }
 
+/// One graph vertex per completed path and per distinct terminal precedence list.
+// Equal-precedence terminals have identical shadow relations and no internal edges,
+// so quotienting preserves cycles, maxima, and per-terminal discharge.
+struct AugmentedPathRelation {
+    dominance: Vec<Vec<usize>>,
+    // Quotient indegrees preserve zero/nonzero; singleton classes retain exact ranks.
+    indegree: Vec<usize>,
+    terminal_nodes: Vec<usize>,
+    terminal_classes_are_singletons: bool,
+}
+
+fn augmented_path_relation_with_poll(
+    completed: &[CompletedPath],
+    terminals: &[IncompleteTerminalPath],
+    cancellation: &CancellationToken,
+    work: &mut usize,
+) -> Option<AugmentedPathRelation> {
+    let affirmative_count = completed.len();
+    let mut class_by_precedence: HashMap<&[PrecedenceStep], usize> =
+        crate::hash::map_with_capacity(terminals.len());
+    let mut representatives = Vec::with_capacity(terminals.len());
+    let mut terminal_nodes = Vec::with_capacity(terminals.len());
+    let mut has_duplicate_terminal_class = false;
+
+    for (terminal_index, terminal) in terminals.iter().enumerate() {
+        if selection_cancelled(work, cancellation) {
+            return None;
+        }
+        let precedence = terminal.path().precedence();
+        let class = if let Some(&class) = class_by_precedence.get(precedence) {
+            has_duplicate_terminal_class = true;
+            class
+        } else {
+            let class = representatives.len();
+            class_by_precedence.insert(precedence, class);
+            representatives.push(terminal_index);
+            class
+        };
+        terminal_nodes.push(affirmative_count + class);
+    }
+
+    let total = affirmative_count
+        .checked_add(representatives.len())
+        .expect("selected path count must fit usize");
+    let mut dominance = empty_adjacency_with_poll(total, cancellation, work)?;
+    let mut indegree = zero_usize_with_poll(total, cancellation, work)?;
+    let path = |index: usize| {
+        if index < affirmative_count {
+            &completed[index].path
+        } else {
+            terminals[representatives[index - affirmative_count]].path()
+        }
+    };
+
+    for left in 0..total {
+        for right in (left + 1)..total {
+            if selection_cancelled(work, cancellation) {
+                return None;
+            }
+            if path_shadows_with_poll(path(left), path(right), cancellation, work)? {
+                dominance[left].push(right);
+                indegree[right] += 1;
+            }
+            if path_shadows_with_poll(path(right), path(left), cancellation, work)? {
+                dominance[right].push(left);
+                indegree[left] += 1;
+            }
+        }
+    }
+
+    Some(AugmentedPathRelation {
+        dominance,
+        indegree,
+        terminal_nodes,
+        terminal_classes_are_singletons: !has_duplicate_terminal_class,
+    })
+}
+
+#[cfg(test)]
+fn augmented_path_relation_reference_with_poll(
+    completed: &[CompletedPath],
+    terminals: &[IncompleteTerminalPath],
+    cancellation: &CancellationToken,
+    work: &mut usize,
+) -> Option<AugmentedPathRelation> {
+    let affirmative_count = completed.len();
+    let total = affirmative_count
+        .checked_add(terminals.len())
+        .expect("selected path count must fit usize");
+    let mut dominance = empty_adjacency_with_poll(total, cancellation, work)?;
+    let mut indegree = zero_usize_with_poll(total, cancellation, work)?;
+    let path = |index: usize| {
+        if index < affirmative_count {
+            &completed[index].path
+        } else {
+            terminals[index - affirmative_count].path()
+        }
+    };
+
+    for left in 0..total {
+        for right in (left + 1)..total {
+            if selection_cancelled(work, cancellation) {
+                return None;
+            }
+            if path_shadows_with_poll(path(left), path(right), cancellation, work)? {
+                dominance[left].push(right);
+                indegree[right] += 1;
+            }
+            if path_shadows_with_poll(path(right), path(left), cancellation, work)? {
+                dominance[right].push(left);
+                indegree[left] += 1;
+            }
+        }
+    }
+
+    Some(AugmentedPathRelation {
+        dominance,
+        indegree,
+        terminal_nodes: (0..terminals.len())
+            .map(|index| affirmative_count + index)
+            .collect(),
+        terminal_classes_are_singletons: true,
+    })
+}
+
 /// Select one exact answer while retaining traversal-only evidence solely for
 /// the cancellation fallback.
 ///
@@ -2996,8 +3082,8 @@ fn completed_path_dominance_with_poll(
 /// `cancellation_evidence`.
 pub(super) fn select_paths_with_cancellation_evidence(
     reference: SemanticId,
-    completed: Vec<CompletedPath>,
-    terminals: Vec<IncompleteTerminalPath>,
+    completed: &[CompletedPath],
+    terminals: &[IncompleteTerminalPath],
     unconditional_completion: ResolutionCompletion,
     cancellation_evidence: ResolutionCompletion,
     cancellation: &CancellationToken,
@@ -3008,8 +3094,8 @@ pub(super) fn select_paths_with_cancellation_evidence(
         selection_completion.include(&unconditional_completion, cancellation, &mut work);
     let (conservative, cancelled_during_publication) = build_conservative_answer(
         reference,
-        &completed,
-        &terminals,
+        completed,
+        terminals,
         &unconditional_completion,
         cancellation,
         &mut work,
@@ -3034,7 +3120,7 @@ pub(super) fn select_paths_with_cancellation_evidence(
         dominance,
         indegree,
         visited,
-    }) = completed_path_dominance_with_poll(&completed, cancellation, &mut work)
+    }) = completed_path_dominance_with_poll(completed, cancellation, &mut work)
     else {
         return cancelled_selection_from_ledger(
             conservative,
@@ -3151,229 +3237,184 @@ pub(super) fn select_paths_with_cancellation_evidence(
     };
     let mut lookup_decision = None;
     if precedence_consistent && !terminals.is_empty() {
-        let affirmative_count = completed.len();
-        let total = affirmative_count
-            .checked_add(terminals.len())
-            .expect("selected path count must fit usize");
-        let path = |index: usize| {
-            if index < affirmative_count {
-                &completed[index].path
-            } else {
-                terminals[index - affirmative_count].path()
-            }
-        };
-        let Some(mut augmented_dominance) =
-            empty_adjacency_with_poll(total, cancellation, &mut work)
-        else {
-            return cancelled_selection_from_ledger(
-                conservative,
-                selection_completion,
-                &cancellation_evidence,
-                cancellation,
-                &mut work,
-            );
-        };
-        let Some(mut augmented_indegree) = zero_usize_with_poll(total, cancellation, &mut work)
-        else {
-            return cancelled_selection_from_ledger(
-                conservative,
-                selection_completion,
-                &cancellation_evidence,
-                cancellation,
-                &mut work,
-            );
-        };
-        'augmented_pairs: for left in 0..total {
-            for right in (left + 1)..total {
-                if selection_cancelled(&mut work, cancellation) {
-                    cancelled = true;
-                    break 'augmented_pairs;
-                }
-                let Some(left_shadows) =
-                    path_shadows_with_poll(path(left), path(right), cancellation, &mut work)
-                else {
-                    cancelled = true;
-                    break 'augmented_pairs;
-                };
-                if left_shadows {
-                    augmented_dominance[left].push(right);
-                    augmented_indegree[right] += 1;
-                }
-                let Some(right_shadows) =
-                    path_shadows_with_poll(path(right), path(left), cancellation, &mut work)
-                else {
-                    cancelled = true;
-                    break 'augmented_pairs;
-                };
-                if right_shadows {
-                    augmented_dominance[right].push(left);
-                    augmented_indegree[left] += 1;
-                }
-            }
-        }
-
-        let mut augmented_visited = 0_usize;
-        if !cancelled {
-            let Some(mut remaining_indegree) =
-                clone_usize_with_poll(&augmented_indegree, cancellation, &mut work)
-            else {
-                return cancelled_selection_from_ledger(
-                    conservative,
-                    selection_completion,
-                    &cancellation_evidence,
-                    cancellation,
-                    &mut work,
-                );
-            };
-            let mut ready = VecDeque::new();
-            for (index, &degree) in remaining_indegree.iter().enumerate() {
-                if selection_cancelled(&mut work, cancellation) {
-                    cancelled = true;
-                    break;
-                }
-                if degree == 0 {
-                    ready.push_back(index);
-                }
-            }
-            'augmented_topology: while let Some(left) = ready.pop_front() {
-                if selection_cancelled(&mut work, cancellation) {
-                    cancelled = true;
-                    break;
-                }
-                augmented_visited += 1;
-                for &right in &augmented_dominance[left] {
-                    if selection_cancelled(&mut work, cancellation) {
-                        cancelled = true;
-                        break 'augmented_topology;
-                    }
-                    remaining_indegree[right] -= 1;
-                    if remaining_indegree[right] == 0 {
-                        ready.push_back(right);
-                    }
-                }
-            }
-        }
-
-        if !cancelled && augmented_visited == total {
-            let Some(augmented_maxima) =
-                zero_indegree_indices_with_poll(&augmented_indegree, cancellation, &mut work)
-            else {
-                return cancelled_selection_from_ledger(
-                    conservative,
-                    selection_completion,
-                    &cancellation_evidence,
-                    cancellation,
-                    &mut work,
-                );
-            };
-            let Some(directly_shadowed) = directly_shadowed_with_poll(
-                total,
-                &augmented_maxima,
-                &augmented_dominance,
-                cancellation,
-                &mut work,
-            ) else {
-                return cancelled_selection_from_ledger(
-                    conservative,
-                    selection_completion,
-                    &cancellation_evidence,
-                    cancellation,
-                    &mut work,
-                );
-            };
-            let Some(nontransitive) = has_nontransitive_edge_with_poll(
-                &augmented_indegree,
-                &directly_shadowed,
-                cancellation,
-                &mut work,
-            ) else {
-                return cancelled_selection_from_ledger(
-                    conservative,
-                    selection_completion,
-                    &cancellation_evidence,
-                    cancellation,
-                    &mut work,
-                );
-            };
-            if nontransitive {
-                let Some(reset) = false_vector_with_poll(completed.len(), cancellation, &mut work)
-                else {
-                    return cancelled_selection_from_ledger(
-                        conservative,
-                        selection_completion,
-                        &cancellation_evidence,
-                        cancellation,
-                        &mut work,
-                    );
-                };
-                shadowed = reset;
-                selection_completion.include_reason(
-                    ResolutionIncompleteReason::InconsistentPrecedence(reference),
-                );
-            } else {
-                for (terminal_index, is_discharged) in terminal_discharged.iter_mut().enumerate() {
-                    if selection_cancelled(&mut work, cancellation) {
-                        cancelled = true;
-                        break;
-                    }
-                    let index = affirmative_count + terminal_index;
-                    for &maximum in &augmented_maxima {
+        match augmented_path_relation_with_poll(completed, terminals, cancellation, &mut work) {
+            None => cancelled = true,
+            Some(relation) => {
+                let total = relation.dominance.len();
+                let mut augmented_visited = 0_usize;
+                if !cancelled {
+                    let Some(mut remaining_indegree) =
+                        clone_usize_with_poll(&relation.indegree, cancellation, &mut work)
+                    else {
+                        return cancelled_selection_from_ledger(
+                            conservative,
+                            selection_completion,
+                            &cancellation_evidence,
+                            cancellation,
+                            &mut work,
+                        );
+                    };
+                    let mut ready = VecDeque::new();
+                    for (index, &degree) in remaining_indegree.iter().enumerate() {
                         if selection_cancelled(&mut work, cancellation) {
                             cancelled = true;
                             break;
                         }
-                        if maximum < affirmative_count {
-                            let Some(contains) = contains_index_with_poll(
-                                &augmented_dominance[maximum],
-                                index,
-                                cancellation,
-                                &mut work,
-                            ) else {
+                        if degree == 0 {
+                            ready.push_back(index);
+                        }
+                    }
+                    'augmented_topology: while let Some(left) = ready.pop_front() {
+                        if selection_cancelled(&mut work, cancellation) {
+                            cancelled = true;
+                            break;
+                        }
+                        augmented_visited += 1;
+                        for &right in &relation.dominance[left] {
+                            if selection_cancelled(&mut work, cancellation) {
                                 cancelled = true;
-                                break;
-                            };
-                            if contains {
-                                *is_discharged = true;
-                                break;
+                                break 'augmented_topology;
+                            }
+                            remaining_indegree[right] -= 1;
+                            if remaining_indegree[right] == 0 {
+                                ready.push_back(right);
                             }
                         }
                     }
-                    if cancelled {
-                        break;
-                    }
                 }
-                if !cancelled
-                    && unconditional_completion == ResolutionCompletion::Complete
-                    && completed.iter().all(|candidate| {
-                        candidate.admission == BindingCandidateAdmission::Target
-                            && candidate.path.completion() == &ResolutionCompletion::Complete
-                    })
-                    && terminal_discharged.iter().any(|discharged| !discharged)
-                {
-                    lookup_decision = ordered_lookup_alternatives(
-                        &completed,
-                        &terminals,
-                        &augmented_indegree,
+
+                if !cancelled && augmented_visited == total {
+                    let Some(augmented_maxima) = zero_indegree_indices_with_poll(
+                        &relation.indegree,
                         cancellation,
                         &mut work,
+                    ) else {
+                        return cancelled_selection_from_ledger(
+                            conservative,
+                            selection_completion,
+                            &cancellation_evidence,
+                            cancellation,
+                            &mut work,
+                        );
+                    };
+                    let Some(directly_shadowed) = directly_shadowed_with_poll(
+                        total,
+                        &augmented_maxima,
+                        &relation.dominance,
+                        cancellation,
+                        &mut work,
+                    ) else {
+                        return cancelled_selection_from_ledger(
+                            conservative,
+                            selection_completion,
+                            &cancellation_evidence,
+                            cancellation,
+                            &mut work,
+                        );
+                    };
+                    let Some(nontransitive) = has_nontransitive_edge_with_poll(
+                        &relation.indegree,
+                        &directly_shadowed,
+                        cancellation,
+                        &mut work,
+                    ) else {
+                        return cancelled_selection_from_ledger(
+                            conservative,
+                            selection_completion,
+                            &cancellation_evidence,
+                            cancellation,
+                            &mut work,
+                        );
+                    };
+                    if nontransitive {
+                        let Some(reset) =
+                            false_vector_with_poll(completed.len(), cancellation, &mut work)
+                        else {
+                            return cancelled_selection_from_ledger(
+                                conservative,
+                                selection_completion,
+                                &cancellation_evidence,
+                                cancellation,
+                                &mut work,
+                            );
+                        };
+                        shadowed = reset;
+                        selection_completion.include_reason(
+                            ResolutionIncompleteReason::InconsistentPrecedence(reference),
+                        );
+                    } else {
+                        for (terminal_index, is_discharged) in
+                            terminal_discharged.iter_mut().enumerate()
+                        {
+                            if selection_cancelled(&mut work, cancellation) {
+                                cancelled = true;
+                                break;
+                            }
+                            let node = relation.terminal_nodes[terminal_index];
+                            for &maximum in &augmented_maxima {
+                                if selection_cancelled(&mut work, cancellation) {
+                                    cancelled = true;
+                                    break;
+                                }
+                                if maximum < completed.len() {
+                                    let Some(contains) = contains_index_with_poll(
+                                        &relation.dominance[maximum],
+                                        node,
+                                        cancellation,
+                                        &mut work,
+                                    ) else {
+                                        cancelled = true;
+                                        break;
+                                    };
+                                    if contains {
+                                        *is_discharged = true;
+                                        break;
+                                    }
+                                }
+                            }
+                            if cancelled {
+                                break;
+                            }
+                        }
+                        if !cancelled
+                            && unconditional_completion == ResolutionCompletion::Complete
+                            && completed.iter().all(|candidate| {
+                                candidate.admission == BindingCandidateAdmission::Target
+                                    && candidate.path.completion()
+                                        == &ResolutionCompletion::Complete
+                            })
+                            && terminal_discharged.iter().any(|discharged| !discharged)
+                            && relation.terminal_classes_are_singletons
+                        {
+                            // With singleton classes the quotient is the original graph, so
+                            // its indegrees retain the exact ranks ordered lookup requires.
+                            lookup_decision = ordered_lookup_alternatives(
+                                completed,
+                                terminals,
+                                &relation.indegree,
+                                cancellation,
+                                &mut work,
+                            );
+                        }
+                    }
+                } else if !cancelled {
+                    let Some(reset) =
+                        false_vector_with_poll(completed.len(), cancellation, &mut work)
+                    else {
+                        return cancelled_selection_from_ledger(
+                            conservative,
+                            selection_completion,
+                            &cancellation_evidence,
+                            cancellation,
+                            &mut work,
+                        );
+                    };
+                    shadowed = reset;
+                    selection_completion.include_reason(
+                        ResolutionIncompleteReason::InconsistentPrecedence(reference),
                     );
                 }
             }
-        } else if !cancelled {
-            let Some(reset) = false_vector_with_poll(completed.len(), cancellation, &mut work)
-            else {
-                return cancelled_selection_from_ledger(
-                    conservative,
-                    selection_completion,
-                    &cancellation_evidence,
-                    cancellation,
-                    &mut work,
-                );
-            };
-            shadowed = reset;
-            selection_completion.include_reason(
-                ResolutionIncompleteReason::InconsistentPrecedence(reference),
-            );
         }
     }
     cancelled |= cancellation.is_cancelled();
@@ -3400,8 +3441,8 @@ pub(super) fn select_paths_with_cancellation_evidence(
     }
     let Some(answer) = try_build_resolution_answer(
         reference,
-        &completed,
-        &terminals,
+        completed,
+        terminals,
         &shadowed,
         &terminal_discharged,
         &completion,
@@ -3428,6 +3469,91 @@ pub(super) fn select_paths_with_cancellation_evidence(
     match lookup_decision {
         Some(decision) => answer.with_lookup_decision(decision),
         None => answer,
+    }
+}
+
+/// Re-select after lazily removing selected declarations known to be inactive.
+/// Unknown activation remains selected for contextual access to mark incomplete.
+pub(super) fn select_paths_with_lazy_access(
+    reference: SemanticId,
+    mut completed: Vec<CompletedPath>,
+    terminals: Vec<IncompleteTerminalPath>,
+    unconditional_completion: ResolutionCompletion,
+    cancellation_evidence: ResolutionCompletion,
+    cancellation: &CancellationToken,
+    access_lookup: &mut SelectionAccessLookup<'_>,
+) -> StoreResult<ResolutionAnswer> {
+    let mut work = 0_usize;
+    loop {
+        let answer = select_paths_with_cancellation_evidence(
+            reference,
+            &completed,
+            &terminals,
+            unconditional_completion.clone(),
+            cancellation_evidence.clone(),
+            cancellation,
+        );
+        if answer
+            .completion()
+            .contains_reason(ResolutionIncompleteReason::Cancelled)
+            || answer.targets().is_empty()
+        {
+            return Ok(answer);
+        }
+
+        let Some(decisions) = access_lookup(reference, answer.targets())? else {
+            let cancelled =
+                ResolutionCompletion::incomplete([ResolutionIncompleteReason::Cancelled]);
+            return Ok(cancelled_selection_answer(
+                answer,
+                &cancelled,
+                &cancellation_evidence,
+                cancellation,
+                &mut work,
+            ));
+        };
+        assert_eq!(
+            decisions.len(),
+            answer.targets().len(),
+            "selected declaration access must answer every requested endpoint"
+        );
+
+        let inactive = answer
+            .targets()
+            .iter()
+            .zip(decisions)
+            .filter_map(|(&target, decision)| {
+                (decision == DeclarationAccessDecision::InactiveActivation).then_some(target)
+            })
+            .collect::<HashSet<_>>();
+        if inactive.is_empty() {
+            return Ok(answer);
+        }
+
+        let mut filtering_cancelled = false;
+        let mut retained = Vec::with_capacity(completed.len());
+        for candidate in completed.drain(..) {
+            if selection_cancelled(&mut work, cancellation) {
+                filtering_cancelled = true;
+                break;
+            }
+            if inactive.contains(&candidate.target) {
+                continue;
+            }
+            retained.push(candidate);
+        }
+        completed = retained;
+        if filtering_cancelled || cancellation.is_cancelled() {
+            let cancelled =
+                ResolutionCompletion::incomplete([ResolutionIncompleteReason::Cancelled]);
+            return Ok(cancelled_selection_answer(
+                answer,
+                &cancelled,
+                &cancellation_evidence,
+                cancellation,
+                &mut work,
+            ));
+        }
     }
 }
 
@@ -3712,8 +3838,7 @@ fn try_build_resolution_answer(
 }
 
 fn selection_cancelled(work: &mut usize, cancellation: &CancellationToken) -> bool {
-    *work += 1;
-    work.is_multiple_of(CANCELLATION_QUANTUM) && cancellation.is_cancelled()
+    super::poll_resolution_work(cancellation, work)
 }
 
 fn observe_selection_cancellation(
@@ -3789,14 +3914,7 @@ fn empty_adjacency_with_poll(
     cancellation: &CancellationToken,
     work: &mut usize,
 ) -> Option<Vec<Vec<usize>>> {
-    let mut values = Vec::with_capacity(len);
-    for _ in 0..len {
-        if selection_cancelled(work, cancellation) {
-            return None;
-        }
-        values.push(Vec::new());
-    }
-    Some(values)
+    fill_vec_with_poll(len, cancellation, work, Vec::new)
 }
 
 fn zero_usize_with_poll(
@@ -3804,14 +3922,7 @@ fn zero_usize_with_poll(
     cancellation: &CancellationToken,
     work: &mut usize,
 ) -> Option<Vec<usize>> {
-    let mut values = Vec::with_capacity(len);
-    for _ in 0..len {
-        if selection_cancelled(work, cancellation) {
-            return None;
-        }
-        values.push(0);
-    }
-    Some(values)
+    fill_vec_with_poll(len, cancellation, work, || 0)
 }
 
 fn clone_usize_with_poll(
@@ -3819,14 +3930,12 @@ fn clone_usize_with_poll(
     cancellation: &CancellationToken,
     work: &mut usize,
 ) -> Option<Vec<usize>> {
-    let mut cloned = Vec::with_capacity(values.len());
-    for &value in values {
-        if selection_cancelled(work, cancellation) {
-            return None;
-        }
-        cloned.push(value);
-    }
-    Some(cloned)
+    let mut cancelled = || selection_cancelled(work, cancellation);
+    super::model::clone_cells_with_poll(
+        values,
+        &mut super::model::copy_cell_with_poll::<usize, _>,
+        &mut cancelled,
+    )
 }
 
 fn false_vector_with_poll(
@@ -3834,12 +3943,24 @@ fn false_vector_with_poll(
     cancellation: &CancellationToken,
     work: &mut usize,
 ) -> Option<Vec<bool>> {
+    fill_vec_with_poll(len, cancellation, work, || false)
+}
+
+fn fill_vec_with_poll<T, F>(
+    len: usize,
+    cancellation: &CancellationToken,
+    work: &mut usize,
+    mut value: F,
+) -> Option<Vec<T>>
+where
+    F: FnMut() -> T,
+{
     let mut values = Vec::with_capacity(len);
     for _ in 0..len {
         if selection_cancelled(work, cancellation) {
             return None;
         }
-        values.push(false);
+        values.push(value());
     }
     Some(values)
 }
@@ -4105,7 +4226,10 @@ mod tests {
         PartialScopedSymbol, PrecedenceStep, ResolutionSlotValue, ResolutionTypeRef,
         StackVariableId, TypeTransferValueTransform,
     };
+    use super::super::partial_path_id_for_test as path_id;
+    use super::super::runtime_type_for_test as runtime_type;
     use super::*;
+    use crate::analyzer::resolution::test_support::{fragment, node, semantic};
     use crate::analyzer::resolution::{
         PreloadedFactResolutionService, lower_resolution_facts_with_identity_catalog,
     };
@@ -4121,91 +4245,10 @@ mod tests {
     use brokk_bifrost_core::analyzer::usages::resolution_session::{
         BoundedResolution, ResolutionSession,
     };
-
-    fn semantic(value: &str) -> SemanticId {
-        SemanticId::for_test(value)
-    }
-
-    #[test]
-    fn selection_completion_shares_cancelled_evidence_and_equal_comparison_work() {
-        let raw = ResolutionCompletion::incomplete((0..4_096_usize).map(|index| {
-            ResolutionIncompleteReason::UnsupportedSemantic(SemanticId::for_test(
-                index.to_le_bytes(),
-            ))
-        }));
-        let ResolutionCompletion::Incomplete(reasons) = &raw else {
-            unreachable!()
-        };
-        let shared =
-            ResolutionCompletion::Incomplete(reasons.to_shared_with_poll(&mut || false).unwrap());
-        let mut comparison_work = 0;
-        assert_eq!(
-            compare_completions_with_poll(&shared, &shared, &mut || {
-                comparison_work += 1;
-                false
-            }),
-            Some(std::cmp::Ordering::Equal)
-        );
-        assert_eq!(comparison_work, 1);
-
-        let cancellation = CancellationToken::new();
-        cancellation.cancel();
-        let mut work = 0;
-        let empty = ResolutionCompletion::Incomplete(Vec::new().into());
-        let answer = cancelled_selection_answer(
-            ResolutionAnswer::new(Vec::new(), Vec::new(), shared),
-            &empty,
-            &empty,
-            &cancellation,
-            &mut work,
-        );
-        assert_eq!(
-            answer.completion(),
-            &raw.combine(&ResolutionCompletion::incomplete([
-                ResolutionIncompleteReason::Cancelled,
-            ]))
-        );
-        assert!(
-            matches!(answer.completion(), ResolutionCompletion::Incomplete(reasons) if reasons.is_shared())
-        );
-        assert!(
-            work < 100,
-            "selection cancellation must retain the base without scanning it: {work}"
-        );
-    }
-
-    fn runtime_type(value: &str) -> ResolutionSlotValue {
-        ResolutionSlotValue::runtime(ResolutionTypeRef::new(semantic(value), 0), false)
-    }
-
-    fn fragment(value: &str) -> BindingFragmentId {
-        BindingFragmentId::for_test(value)
-    }
+    use brokk_bifrost_test_macros::hardwon;
 
     fn type_only_inventory_facts() -> FileResolutionFacts {
-        FileResolutionFacts {
-            scopes: vec![ResolutionScopeFact {
-                id: ResolutionScopeId::new(0),
-                parent: None,
-                owner: None,
-                kind: ResolutionScopeKind::CompilationUnit,
-                inheritance: ResolutionScopeInheritance::Lexical,
-                start_byte: 0,
-                end_byte: 100,
-            }],
-            sites: vec![ResolutionSiteFact {
-                id: ResolutionSiteId::new(0),
-                scope: ResolutionScopeId::new(0),
-                kind: ResolutionSiteKind::UnsupportedExpression,
-                start_byte: 20,
-                end_byte: 21,
-            }],
-            gaps: vec![ResolutionGapFact {
-                site: ResolutionSiteId::new(0),
-                kind: ResolutionGapKind::UnsupportedExpression,
-            }],
-            ..FileResolutionFacts::default()
-        }
+        crate::analyzer::resolution::test_support::unsupported_expression_gap_facts()
     }
 
     fn empty_inventory_fragment(fragment: BindingFragmentId) -> LoweredResolutionFragment {
@@ -4251,52 +4294,6 @@ mod tests {
             &type_only_inventory_facts(),
         )
         .0
-    }
-
-    #[test]
-    fn scoped_reference_seed_enumeration_certifies_empty_fragment_inventory() {
-        let clean = fragment("scoped-seeds-clean");
-        let gap = fragment("scoped-seeds-gap");
-        let source = PreloadedFragmentSource::from_lowered_fragments([
-            empty_inventory_fragment(clean),
-            enumeration_inventory_fragment(gap),
-        ]);
-        let cancellation = CancellationToken::new();
-        for (fragments, complete) in [
-            (HashSet::default(), true),
-            (HashSet::from_iter([clean]), true),
-            (HashSet::from_iter([gap]), false),
-        ] {
-            let completion = source
-                .visit_reference_seed_batches_in_fragments(
-                    &fragments,
-                    1,
-                    &cancellation,
-                    &mut |_| panic!("empty fragment cannot emit a seed batch"),
-                )
-                .unwrap();
-            assert_eq!(completion == ResolutionCompletion::Complete, complete);
-        }
-        assert!(
-            source
-                .visit_reference_seed_batches_in_fragments(
-                    &HashSet::from_iter([fragment("unselected-scoped-seeds")]),
-                    1,
-                    &cancellation,
-                    &mut |_| Ok(true)
-                )
-                .is_err()
-        );
-        cancellation.cancel();
-        let cancelled = source
-            .visit_reference_seed_batches_in_fragments(
-                &HashSet::default(),
-                1,
-                &cancellation,
-                &mut |_| Ok(true),
-            )
-            .unwrap();
-        assert!(cancelled.contains_reason(ResolutionIncompleteReason::Cancelled));
     }
 
     #[test]
@@ -4397,103 +4394,8 @@ mod tests {
         );
     }
 
-    fn node(value: &str) -> BindingNodeId {
-        BindingNodeId::for_test(value)
-    }
-
-    fn path_id(value: &str) -> PartialPathId {
-        PartialPathId::for_test(value)
-    }
-
     fn endpoint(node: BindingNodeId, symbols: Vec<SemanticId>) -> EndpointSignature {
-        EndpointSignature::new(
-            node,
-            StackPattern::closed(symbols),
-            StackPattern::closed(Vec::new()),
-        )
-    }
-
-    #[test]
-    fn preloaded_endpoint_classification_carries_exact_member_scope_owner_and_cancels_atomically() {
-        let fragment = fragment("member-scope-classification-fragment");
-        let scope_head = node("member-scope-classification-head");
-        let owner = semantic("member-scope-classification-owner");
-        let mut source = PreloadedFragmentSource::from_fragments([PreloadedFragment::new(
-            fragment,
-            [(scope_head, BindingNodeKind::Scope)],
-            [],
-        )]);
-        source.install_member_scope_owners([(scope_head, owner)]);
-
-        let classified = source
-            .classify_endpoint_nodes(&[scope_head], &CancellationToken::new())
-            .expect("preloaded endpoint classification is infallible");
-
-        assert_eq!(classified.len(), 1);
-        assert_eq!(classified[0].node(), scope_head);
-        assert_eq!(classified[0].member_scope_owner(), Some(owner));
-        assert_eq!(classified[0].reference(), None);
-        assert_eq!(classified[0].definition(), None);
-
-        let cancellation = CancellationToken::new();
-        cancellation.cancel();
-        assert!(
-            source
-                .classify_endpoint_nodes(&[scope_head], &cancellation)
-                .expect("preloaded cancellation is operational")
-                .is_empty(),
-            "a cancelled endpoint batch must not expose a classified prefix"
-        );
-    }
-
-    #[test]
-    #[should_panic(expected = "must name a Scope endpoint")]
-    fn preloaded_member_scope_owner_rejects_a_reference_node() {
-        let fragment = fragment("malformed-member-scope-classification-fragment");
-        let reference = semantic("malformed-member-scope-reference");
-        let reference_node = node("malformed-member-scope-reference-node");
-        let mut source = PreloadedFragmentSource::from_fragments([PreloadedFragment::new(
-            fragment,
-            [(reference_node, BindingNodeKind::Reference(reference))],
-            [],
-        )]);
-
-        source.install_member_scope_owners([(
-            reference_node,
-            semantic("malformed-member-scope-owner"),
-        )]);
-    }
-
-    #[test]
-    #[should_panic(expected = "duplicate or conflicting member-scope owner classification")]
-    fn preloaded_endpoint_classification_rejects_duplicate_owner_installation() {
-        let fragment = fragment("duplicate-member-scope-classification-fragment");
-        let scope_head = node("duplicate-member-scope-classification-head");
-        let owner = semantic("duplicate-member-scope-classification-owner");
-        let mut source = PreloadedFragmentSource::from_fragments([PreloadedFragment::new(
-            fragment,
-            [(scope_head, BindingNodeKind::Scope)],
-            [],
-        )]);
-
-        source.install_member_scope_owners([(scope_head, owner), (scope_head, owner)]);
-    }
-
-    #[test]
-    #[should_panic(expected = "duplicate or conflicting member-scope owner classification")]
-    fn preloaded_endpoint_classification_rejects_conflicting_owner_installation() {
-        let fragment = fragment("conflicting-member-scope-classification-fragment");
-        let scope_head = node("conflicting-member-scope-classification-head");
-        let mut source = PreloadedFragmentSource::from_fragments([PreloadedFragment::new(
-            fragment,
-            [(scope_head, BindingNodeKind::Scope)],
-            [],
-        )]);
-
-        source.install_member_scope_owners([
-            (scope_head, semantic("first-member-scope-owner")),
-            (scope_head, semantic("second-member-scope-owner")),
-        ]);
+        crate::analyzer::resolution::test_support::endpoint(node, symbols, Vec::new())
     }
 
     fn path(
@@ -4521,12 +4423,8 @@ mod tests {
         precedence: Vec<PrecedenceStep>,
         completion: ResolutionCompletion,
     ) -> PartialPath {
-        PartialPath::new(
-            endpoint(start, before),
-            endpoint(end, after),
-            precedence,
-            [WitnessStep::Node(end)],
-            completion,
+        crate::analyzer::resolution::test_support::partial_path(
+            start, end, before, after, precedence, completion,
         )
     }
 
@@ -4610,28 +4508,6 @@ mod tests {
     }
 
     #[test]
-    fn empty_reverse_gap_exclusion_plan_is_exact_raw_parity() {
-        let fragment = fragment("empty-reverse-gap-plan-fragment");
-        let reason = semantic("empty-reverse-gap-plan-reason");
-        let (source, request) = source_with_reverse_inventory_gaps(
-            "empty-reverse-gap-plan",
-            &[(fragment, semantic("empty-reverse-gap-plan-gap"), reason)],
-        );
-        let raw = visit_reverse_pages(&source, &request, None, &CancellationToken::new())
-            .expect("raw preload reverse visit succeeds");
-        let mut exclusions = ReverseCandidateGapExclusionPlan::default();
-        let filtered = visit_reverse_pages(
-            &source,
-            &request,
-            Some(&mut exclusions),
-            &CancellationToken::new(),
-        )
-        .expect("empty reverse exclusion delegates to raw preload visit");
-
-        assert_eq!(filtered, raw);
-    }
-
-    #[test]
     fn exact_reverse_gap_exclusions_preserve_same_reason_siblings_and_raw_source() {
         let fragment = fragment("same-reason-reverse-gap-fragment");
         let reason = semantic("same-reason-reverse-gap-reason");
@@ -4675,187 +4551,6 @@ mod tests {
         let raw_after = visit_reverse_pages(&source, &request, None, &CancellationToken::new())
             .expect("filtered preload calls do not mutate raw coverage");
         assert_eq!(raw_after, raw_before);
-    }
-
-    #[test]
-    fn prepared_reverse_gap_exclusion_replays_filtered_semantics_before_cancellation() {
-        let fragment = fragment("prepared-reverse-gap-cancellation-fragment");
-        let removed_gap = semantic("prepared-reverse-gap-cancellation-removed-gap");
-        let removed_reason = semantic("prepared-reverse-gap-cancellation-removed-reason");
-        let retained_reason = semantic("prepared-reverse-gap-cancellation-retained-reason");
-        let (source, request) = source_with_reverse_inventory_gaps(
-            "prepared-reverse-gap-cancellation",
-            &[
-                (fragment, removed_gap, removed_reason),
-                (
-                    fragment,
-                    semantic("prepared-reverse-gap-cancellation-retained-gap"),
-                    retained_reason,
-                ),
-            ],
-        );
-        let mut plan = ReverseCandidateGapExclusionPlan::new([ReverseCandidateGapIdentity::new(
-            fragment,
-            removed_gap,
-        )]);
-        let warm = visit_reverse_pages(
-            &source,
-            &request,
-            Some(&mut plan),
-            &CancellationToken::new(),
-        )
-        .expect("the live preload visit prepares one exact filtered completion");
-        assert_eq!(warm.0.len(), 1);
-        assert_eq!(
-            warm.1.unconditional_completion(),
-            &ResolutionCompletion::incomplete([ResolutionIncompleteReason::UnsupportedSemantic(
-                retained_reason
-            ),])
-        );
-
-        let cancellation = CancellationToken::new();
-        cancellation.cancel();
-        let cancelled = visit_reverse_pages(&source, &request, Some(&mut plan), &cancellation)
-            .expect("a prepared preload plan replays immutable semantics under cancellation");
-        assert!(cancelled.0.is_empty());
-        assert_eq!(
-            cancelled.1.unconditional_completion(),
-            &warm
-                .1
-                .unconditional_completion()
-                .combine(&cancelled_completion())
-        );
-
-        let retried = visit_reverse_pages(
-            &source,
-            &request,
-            Some(&mut plan),
-            &CancellationToken::new(),
-        )
-        .expect("a fresh preload retry remains exact after entry cancellation");
-        assert_eq!(retried, warm);
-    }
-
-    #[test]
-    fn exact_reverse_gap_exclusions_reject_wrong_fragment_unknown_and_stale_fingerprint() {
-        let owner_fragment = fragment("exact-reverse-gap-owner");
-        let other_fragment = fragment("exact-reverse-gap-other-owner");
-        let gap_id = semantic("exact-reverse-gap-id");
-        let reason = semantic("exact-reverse-gap-reason");
-        let (mut source, request) = source_with_reverse_inventory_gaps(
-            "exact-reverse-gap-owner",
-            &[(owner_fragment, gap_id, reason)],
-        );
-        for identity in [
-            ReverseCandidateGapIdentity::new(other_fragment, gap_id),
-            ReverseCandidateGapIdentity::new(owner_fragment, semantic("unknown-reverse-gap-id")),
-        ] {
-            let mut plan = ReverseCandidateGapExclusionPlan::new([identity]);
-            let mut callback_count = 0_usize;
-            let error = source
-                .visit_reverse_candidate_match_pages_with_gap_exclusions(
-                    std::slice::from_ref(&request),
-                    &mut plan,
-                    &CancellationToken::new(),
-                    &mut |_| {
-                        callback_count += 1;
-                        Ok(true)
-                    },
-                )
-                .expect_err("an absent exact reverse gap must fail closed");
-            assert!(error.to_string().contains("no exact gap"));
-            assert_eq!(callback_count, 0);
-        }
-
-        let exact = ReverseCandidateGapIdentity::new(owner_fragment, gap_id);
-        let mut plan = ReverseCandidateGapExclusionPlan::new([exact]);
-        visit_reverse_pages(
-            &source,
-            &request,
-            Some(&mut plan),
-            &CancellationToken::new(),
-        )
-        .expect("the plan prepares against its first exact source");
-        let (mut different_source, different_request) = source_with_reverse_inventory_gaps(
-            "different-reverse-gap-source",
-            &[(
-                owner_fragment,
-                gap_id,
-                semantic("different-reverse-gap-reason"),
-            )],
-        );
-        let mut callback_count = 0_usize;
-        let error = different_source
-            .visit_reverse_candidate_match_pages_with_gap_exclusions(
-                std::slice::from_ref(&different_request),
-                &mut plan,
-                &CancellationToken::new(),
-                &mut |_| {
-                    callback_count += 1;
-                    Ok(true)
-                },
-            )
-            .expect_err("a prepared plan cannot cross a different raw fingerprint");
-        assert!(error.to_string().contains("different raw coverage"));
-        assert_eq!(callback_count, 0);
-    }
-
-    #[test]
-    fn cancellation_during_reverse_gap_preparation_retains_raw_evidence_and_retries_exactly() {
-        let fragment = fragment("cancelled-reverse-gap-preparation-fragment");
-        let reason = semantic("cancelled-reverse-gap-preparation-reason");
-        let identities = (0..64)
-            .map(|ordinal| {
-                ReverseCandidateGapIdentity::new(
-                    fragment,
-                    semantic(&format!("cancelled-reverse-gap-{ordinal}")),
-                )
-            })
-            .collect::<Vec<_>>();
-        let rows = identities
-            .iter()
-            .map(|identity| (fragment, identity.gap_id(), reason))
-            .collect::<Vec<_>>();
-        let (mut source, request) =
-            source_with_reverse_inventory_gaps("cancelled-reverse-gap-preparation", &rows);
-        let mut plan = ReverseCandidateGapExclusionPlan::new(identities);
-        let cancellation = CancellationToken::cancel_after_checks_for_test(5);
-        let mut callback_count = 0_usize;
-        let cancelled = source
-            .visit_reverse_candidate_match_pages_with_gap_exclusions(
-                std::slice::from_ref(&request),
-                &mut plan,
-                &cancellation,
-                &mut |_| {
-                    callback_count += 1;
-                    Ok(true)
-                },
-            )
-            .expect("preload preparation cancellation is semantic");
-        assert_eq!(callback_count, 0);
-        assert!(
-            cancelled
-                .unconditional_completion()
-                .contains_reason(ResolutionIncompleteReason::UnsupportedSemantic(reason))
-        );
-        assert!(
-            cancelled
-                .unconditional_completion()
-                .contains_reason(ResolutionIncompleteReason::Cancelled)
-        );
-
-        let (matches, retried) = visit_reverse_pages(
-            &source,
-            &request,
-            Some(&mut plan),
-            &CancellationToken::new(),
-        )
-        .expect("a fresh operation token retries an unpublished preparation");
-        assert_eq!(matches.len(), 1);
-        assert_eq!(
-            retried.unconditional_completion(),
-            &ResolutionCompletion::Complete
-        );
     }
 
     fn selection_completed(
@@ -4918,432 +4613,6 @@ mod tests {
         );
         nodes.extend(junctions.iter().map(|node| (*node, BindingNodeKind::Scope)));
         PreloadedFragmentSource::new(nodes, paths)
-    }
-
-    #[test]
-    #[should_panic(expected = "names non-local, non-boundary binding node")]
-    fn preloaded_fragment_rejects_a_foreign_fixed_endpoint_scope() {
-        let foreign_fragment = fragment("foreign-scope-owner");
-        let path_fragment = fragment("foreign-scope-user");
-        let foreign_scope = node("foreign-fixed-scope");
-        let start = node("foreign-fixed-scope-start");
-        let end = node("foreign-fixed-scope-end");
-        let invalid = PartialPath::new(
-            EndpointSignature::new(
-                start,
-                StackPattern::closed(Vec::new()),
-                StackPattern::closed([foreign_scope]),
-            ),
-            endpoint(end, Vec::new()),
-            Vec::new(),
-            [WitnessStep::Node(end)],
-            ResolutionCompletion::Complete,
-        );
-
-        PreloadedFragmentSource::from_fragments([
-            PreloadedFragment::new(
-                foreign_fragment,
-                [(foreign_scope, BindingNodeKind::Scope)],
-                [],
-            ),
-            PreloadedFragment::new(
-                path_fragment,
-                [
-                    (start, BindingNodeKind::Scope),
-                    (end, BindingNodeKind::Scope),
-                ],
-                [(path_id("foreign-fixed-scope-path"), invalid)],
-            ),
-        ]);
-    }
-
-    #[test]
-    #[should_panic(expected = "attached scope stack")]
-    fn preloaded_fragment_rejects_an_unknown_attached_symbol_scope() {
-        let owner = fragment("unknown-attached-scope-owner");
-        let start = node("unknown-attached-scope-start");
-        let end = node("unknown-attached-scope-end");
-        let unknown_scope = node("unknown-attached-scope");
-        let invalid = PartialPath::new(
-            EndpointSignature::new_scoped(
-                start,
-                StackPattern::closed([PartialScopedSymbol::scoped(
-                    semantic("unknown-attached-name"),
-                    StackPattern::closed([unknown_scope]),
-                )]),
-                StackPattern::closed(Vec::new()),
-            ),
-            endpoint(end, Vec::new()),
-            Vec::new(),
-            [WitnessStep::Node(end)],
-            ResolutionCompletion::Complete,
-        );
-
-        PreloadedFragmentSource::from_fragments([PreloadedFragment::new(
-            owner,
-            [
-                (start, BindingNodeKind::Scope),
-                (end, BindingNodeKind::Scope),
-            ],
-            [(path_id("unknown-attached-scope-path"), invalid)],
-        )]);
-    }
-
-    #[test]
-    #[should_panic(expected = "jump node")]
-    fn preloaded_fragment_rejects_a_jump_to_a_foreign_interior() {
-        let foreign_fragment = fragment("foreign-jump-owner");
-        let jump_fragment = fragment("foreign-jump-user");
-        let foreign_scope = node("foreign-jump-scope");
-        let jump = node("foreign-jump-node");
-
-        PreloadedFragmentSource::from_fragments([
-            PreloadedFragment::new(
-                foreign_fragment,
-                [(foreign_scope, BindingNodeKind::Scope)],
-                [],
-            ),
-            PreloadedFragment::new(
-                jump_fragment,
-                [(jump, BindingNodeKind::JumpToScope(foreign_scope))],
-                [],
-            ),
-        ]);
-    }
-
-    #[test]
-    #[should_panic(expected = "witness position")]
-    fn preloaded_fragment_rejects_an_unknown_witness_node() {
-        let owner = fragment("unknown-witness-owner");
-        let start = node("unknown-witness-start");
-        let end = node("unknown-witness-end");
-        let unknown = node("unknown-witness-node");
-        let invalid = PartialPath::new(
-            endpoint(start, Vec::new()),
-            endpoint(end, Vec::new()),
-            Vec::new(),
-            [WitnessStep::Node(unknown)],
-            ResolutionCompletion::Complete,
-        );
-
-        PreloadedFragmentSource::from_fragments([PreloadedFragment::new(
-            owner,
-            [
-                (start, BindingNodeKind::Scope),
-                (end, BindingNodeKind::Scope),
-            ],
-            [(path_id("unknown-witness-path"), invalid)],
-        )]);
-    }
-
-    #[test]
-    fn preloaded_fragment_accepts_explicit_boundaries_in_all_node_positions() {
-        let owner = fragment("explicit-boundary-owner");
-        let boundary = node("explicit-shared-boundary");
-        let jump = node("explicit-boundary-jump");
-        let end = node("explicit-boundary-end");
-        let valid = PartialPath::new(
-            EndpointSignature::new_scoped(
-                jump,
-                StackPattern::closed([PartialScopedSymbol::scoped(
-                    semantic("explicit-boundary-name"),
-                    StackPattern::closed([boundary]),
-                )]),
-                StackPattern::closed([boundary]),
-            ),
-            endpoint(end, Vec::new()),
-            Vec::new(),
-            [WitnessStep::Node(boundary), WitnessStep::Node(end)],
-            ResolutionCompletion::Complete,
-        );
-
-        let source = PreloadedFragmentSource::from_fragments_with_boundaries(
-            [boundary],
-            [PreloadedFragment::new(
-                owner,
-                [
-                    (jump, BindingNodeKind::JumpToScope(boundary)),
-                    (end, BindingNodeKind::Scope),
-                ],
-                [(path_id("explicit-boundary-path"), valid)],
-            )],
-        );
-
-        assert_eq!(source.nodes.get(&boundary), Some(&BindingNodeKind::Root));
-    }
-
-    #[test]
-    fn fragmented_and_monolithic_paths_resolve_identically() {
-        let reference = semantic("reference");
-        let target = semantic("target");
-        let target_node = node("target-node");
-        let seam = node("seam");
-        let name = semantic("name");
-        let monolithic = source_with_paths(
-            reference,
-            &[(target, target_node)],
-            &[],
-            vec![(
-                path_id("whole"),
-                path(
-                    node("reference-node"),
-                    target_node,
-                    Vec::new(),
-                    Vec::new(),
-                    Vec::new(),
-                ),
-            )],
-        );
-        let fragmented = source_with_paths(
-            reference,
-            &[(target, target_node)],
-            &[seam],
-            vec![
-                (
-                    path_id("push"),
-                    path(
-                        node("reference-node"),
-                        seam,
-                        Vec::new(),
-                        vec![name],
-                        Vec::new(),
-                    ),
-                ),
-                (
-                    path_id("pop"),
-                    path(seam, target_node, vec![name], Vec::new(), Vec::new()),
-                ),
-            ],
-        );
-        let cancellation = CancellationToken::new();
-
-        let whole = ResolutionEngine::new(&monolithic)
-            .resolve_reference(ResolutionQuery::new(reference), &cancellation)
-            .expect("preloaded source is infallible");
-        let pieces = ResolutionEngine::new(&fragmented)
-            .resolve_reference(ResolutionQuery::new(reference), &cancellation)
-            .expect("preloaded source is infallible");
-
-        assert_eq!(whole.targets(), &[target]);
-        assert_eq!(pieces.targets(), whole.targets());
-        assert_eq!(pieces.completion(), &ResolutionCompletion::Complete);
-    }
-
-    #[test]
-    fn imported_package_blocks_plain_names_and_binds_only_structured_qualifiers() {
-        let reference = semantic("go-package-reference");
-        let package = semantic("go-import-binding");
-        let outer = semantic("go-outer-definition");
-        let choice = semantic("go-file-spelling-choice");
-        for (requested, qualifier) in [
-            (ResolutionNamespace::Type, false),
-            (ResolutionNamespace::Value, false),
-            (ResolutionNamespace::Callable, false),
-            (ResolutionNamespace::TypeOrValue, false),
-            (ResolutionNamespace::TypeOrValue, true),
-        ] {
-            let near = selection_completed(
-                "package",
-                package,
-                vec![precedence(choice, 0)],
-                ResolutionCompletion::Complete,
-            );
-            let CompletedBinding::Complete(near) = classify_completed_binding(
-                Some(requested),
-                qualifier,
-                Some(GoDefinitionNamespaces::from_bits(8)),
-                package,
-                near.path,
-            ) else {
-                panic!("known package category has complete admission")
-            };
-            let far = selection_completed(
-                "outer",
-                outer,
-                vec![precedence(choice, 1)],
-                ResolutionCompletion::Complete,
-            );
-            let answer = select_paths(
-                reference,
-                vec![near, far],
-                Vec::new(),
-                ResolutionCompletion::Complete,
-                &CancellationToken::new(),
-            );
-            assert_eq!(
-                answer.targets(),
-                if qualifier {
-                    std::slice::from_ref(&package)
-                } else {
-                    &[]
-                }
-            );
-            assert!(!answer.targets().contains(&outer));
-            assert!(
-                answer
-                    .witnesses()
-                    .iter()
-                    .any(|witness| witness.target() == package)
-            );
-        }
-    }
-
-    #[test]
-    fn missing_go_definition_authority_is_incomplete_and_cannot_block_or_bind() {
-        let reference = semantic("go-missing-authority-reference");
-        let unknown = semantic("go-unknown-namespace");
-        let outer = semantic("go-outer-value");
-        let choice = semantic("go-spelling-choice");
-        let near = selection_completed(
-            "unknown",
-            unknown,
-            vec![precedence(choice, 0)],
-            ResolutionCompletion::Complete,
-        );
-        let CompletedBinding::Incomplete(terminal) = classify_completed_binding(
-            Some(ResolutionNamespace::Value),
-            false,
-            None,
-            unknown,
-            near.path,
-        ) else {
-            panic!("missing namespace authority must remain incomplete");
-        };
-        let far = selection_completed(
-            "far",
-            outer,
-            vec![precedence(choice, 1)],
-            ResolutionCompletion::Complete,
-        );
-        let answer = select_paths(
-            reference,
-            vec![far],
-            vec![terminal],
-            ResolutionCompletion::Complete,
-            &CancellationToken::new(),
-        );
-        assert_eq!(answer.targets(), &[outer]);
-        assert!(
-            matches!(answer.completion(), ResolutionCompletion::Incomplete(reasons) if reasons.contains(&ResolutionIncompleteReason::UnsupportedSemantic(unknown)))
-        );
-        assert!(
-            answer
-                .witnesses()
-                .iter()
-                .all(|witness| witness.target() != unknown)
-        );
-    }
-
-    #[test]
-    fn completed_namespace_blocker_dominates_outer_target_without_becoming_a_target() {
-        let reference = semantic("go-blocked-reference");
-        let blocker = semantic("go-local-type");
-        let outer = semantic("go-outer-value");
-        let choice = semantic("go-spelling-choice");
-        let mut near = selection_completed(
-            "near",
-            blocker,
-            vec![precedence(choice, 0)],
-            ResolutionCompletion::Complete,
-        );
-        near.admission = BindingCandidateAdmission::WrongNamespaceBlocker;
-        let far = selection_completed(
-            "far",
-            outer,
-            vec![precedence(choice, 1)],
-            ResolutionCompletion::Complete,
-        );
-        let answer = select_paths(
-            reference,
-            vec![near, far],
-            Vec::new(),
-            ResolutionCompletion::Complete,
-            &CancellationToken::new(),
-        );
-        assert!(answer.targets().is_empty());
-        assert_eq!(answer.completion(), &ResolutionCompletion::Complete);
-        for (target, reason) in [
-            (blocker, RejectionReason::WrongNamespace),
-            (outer, RejectionReason::ShadowedByNearer),
-        ] {
-            assert!(answer.witnesses().iter().any(|witness| {
-                witness.target() == target
-                    && witness.steps().iter().any(|step| {
-                        matches!(step,
-                    WitnessStep::Candidate { semantic, outcome: CandidateOutcome::Rejected(actual) }
-                    if *semantic == target && *actual == reason)
-                    })
-            }));
-        }
-    }
-
-    #[test]
-    fn nearer_target_dominates_outer_namespace_blocker() {
-        let reference = semantic("go-near-reference");
-        let local = semantic("go-local-value");
-        let blocker = semantic("go-outer-type");
-        let choice = semantic("go-spelling-choice");
-        let near = selection_completed(
-            "near",
-            local,
-            vec![precedence(choice, 0)],
-            ResolutionCompletion::Complete,
-        );
-        let mut far = selection_completed(
-            "far",
-            blocker,
-            vec![precedence(choice, 1)],
-            ResolutionCompletion::Complete,
-        );
-        far.admission = BindingCandidateAdmission::WrongNamespaceBlocker;
-        let answer = select_paths(
-            reference,
-            vec![near, far],
-            Vec::new(),
-            ResolutionCompletion::Complete,
-            &CancellationToken::new(),
-        );
-        assert_eq!(answer.targets(), &[local]);
-        assert_eq!(answer.completion(), &ResolutionCompletion::Complete);
-    }
-
-    #[test]
-    fn cancelled_namespace_blocker_keeps_rejected_identity_without_affirmative_target() {
-        let reference = semantic("go-cancelled-reference");
-        let blocker = semantic("go-local-type");
-        let outer = semantic("go-outer-value");
-        let choice = semantic("go-spelling-choice");
-        let mut near = selection_completed(
-            "near",
-            blocker,
-            vec![precedence(choice, 0)],
-            ResolutionCompletion::Complete,
-        );
-        near.admission = BindingCandidateAdmission::WrongNamespaceBlocker;
-        let far = selection_completed(
-            "far",
-            outer,
-            vec![precedence(choice, 1)],
-            ResolutionCompletion::Complete,
-        );
-        let cancellation = CancellationToken::new();
-        cancellation.cancel();
-        let answer = select_paths(
-            reference,
-            vec![near, far],
-            Vec::new(),
-            ResolutionCompletion::Complete,
-            &cancellation,
-        );
-        assert_eq!(answer.targets(), &[outer]);
-        assert!(
-            matches!(answer.completion(), ResolutionCompletion::Incomplete(reasons) if reasons.contains(&ResolutionIncompleteReason::Cancelled))
-        );
-        assert!(answer.witnesses().iter().any(|witness| {
-            witness.target() == blocker && witness.steps().iter().any(|step| matches!(step,
-                WitnessStep::Candidate { semantic, outcome: CandidateOutcome::Rejected(RejectionReason::WrongNamespace) }
-                if *semantic == blocker))
-        }));
     }
 
     #[test]
@@ -5563,6 +4832,858 @@ mod tests {
     }
 
     #[test]
+    fn terminal_crossing_affirmative_maxima_cannot_be_discharged() {
+        let reference = semantic("terminal-cross-max-reference");
+        let first = semantic("terminal-cross-max-first");
+        let second = semantic("terminal-cross-max-second");
+        let first_choice = semantic("terminal-cross-max-first-choice");
+        let second_choice = semantic("terminal-cross-max-second-choice");
+        let gap = semantic("terminal-cross-max-gap");
+
+        let answer = select_paths(
+            reference,
+            vec![
+                selection_completed(
+                    "terminal-cross-max-first",
+                    first,
+                    vec![precedence(first_choice, 1)],
+                    ResolutionCompletion::Complete,
+                ),
+                selection_completed(
+                    "terminal-cross-max-second",
+                    second,
+                    vec![precedence(second_choice, 0)],
+                    ResolutionCompletion::Complete,
+                ),
+            ],
+            vec![selection_terminal(
+                "terminal-cross-max",
+                vec![precedence(second_choice, 1), precedence(first_choice, 0)],
+                gap,
+            )],
+            ResolutionCompletion::Complete,
+            &CancellationToken::new(),
+        );
+
+        let mut expected = vec![first, second];
+        expected.sort_unstable();
+        assert_eq!(answer.targets(), expected);
+        assert!(matches!(
+            answer.completion(),
+            ResolutionCompletion::Incomplete(reasons)
+                if reasons.contains(&ResolutionIncompleteReason::UnsupportedSemantic(gap))
+                    && reasons.contains(&ResolutionIncompleteReason::InconsistentPrecedence(reference))
+        ));
+    }
+
+    #[test]
+    fn reverse_generation_is_forward_validated_for_cross_target_shadowing() {
+        let reference = semantic("shadowed-reference");
+        let local = semantic("local");
+        let imported = semantic("imported");
+        let choice = semantic("choice");
+        let local_node = node("local-node");
+        let imported_node = node("imported-node");
+        let source = source_with_paths(
+            reference,
+            &[(local, local_node), (imported, imported_node)],
+            &[],
+            vec![
+                (
+                    path_id("local"),
+                    path(
+                        node("reference-node"),
+                        local_node,
+                        Vec::new(),
+                        Vec::new(),
+                        vec![PrecedenceStep {
+                            tier: PrecedenceTier::LexicalBinding,
+                            ordinal: 0,
+                            semantic: choice,
+                        }],
+                    ),
+                ),
+                (
+                    path_id("imported"),
+                    path(
+                        node("reference-node"),
+                        imported_node,
+                        Vec::new(),
+                        Vec::new(),
+                        vec![PrecedenceStep {
+                            tier: PrecedenceTier::ExplicitImport,
+                            ordinal: 0,
+                            semantic: choice,
+                        }],
+                    ),
+                ),
+            ],
+        );
+
+        let references = ResolutionEngine::new(&source)
+            .references_to(imported, &CancellationToken::new())
+            .expect("preloaded source is infallible");
+
+        assert!(references.references().is_empty());
+        assert!(references.witnesses().is_empty());
+        assert_eq!(references.completion(), &ResolutionCompletion::Complete);
+    }
+
+    #[test]
+    fn stack_neutral_cycles_are_certified_complete() {
+        let reference = semantic("reference");
+        let target = semantic("target");
+        let target_node = node("target-node");
+        let loop_node = node("loop-node");
+        let source = source_with_paths(
+            reference,
+            &[(target, target_node)],
+            &[loop_node],
+            vec![
+                (
+                    path_id("enter"),
+                    path(
+                        node("reference-node"),
+                        loop_node,
+                        Vec::new(),
+                        Vec::new(),
+                        Vec::new(),
+                    ),
+                ),
+                (
+                    path_id("cycle"),
+                    path(loop_node, loop_node, Vec::new(), Vec::new(), Vec::new()),
+                ),
+                (
+                    path_id("exit"),
+                    path(loop_node, target_node, Vec::new(), Vec::new(), Vec::new()),
+                ),
+            ],
+        );
+
+        let answer = ResolutionEngine::new(&source)
+            .resolve_reference(ResolutionQuery::new(reference), &CancellationToken::new())
+            .expect("preloaded source is infallible");
+
+        assert_eq!(answer.targets(), &[target]);
+        assert_eq!(answer.completion(), &ResolutionCompletion::Complete);
+    }
+
+    #[test]
+    fn productive_cycles_terminate_without_proving_a_negative() {
+        let reference = semantic("productive-reference");
+        let target = semantic("productive-target");
+        let target_node = node("productive-target-node");
+        let loop_node = node("productive-loop-node");
+        let tail = StackVariableId::for_test("productive-tail");
+        let push = PartialPath::new(
+            EndpointSignature::new_scoped(
+                loop_node,
+                StackPattern::open(Vec::new(), tail),
+                StackPattern::closed(Vec::new()),
+            ),
+            EndpointSignature::new_scoped(
+                loop_node,
+                StackPattern::open(
+                    [PartialScopedSymbol::unscoped(semantic("pushed-name"))],
+                    tail,
+                ),
+                StackPattern::closed(Vec::new()),
+            ),
+            Vec::new(),
+            Vec::new(),
+            ResolutionCompletion::Complete,
+        );
+        let source = source_with_paths(
+            reference,
+            &[(target, target_node)],
+            &[loop_node],
+            vec![
+                (
+                    path_id("productive-enter"),
+                    path(
+                        node("reference-node"),
+                        loop_node,
+                        Vec::new(),
+                        Vec::new(),
+                        Vec::new(),
+                    ),
+                ),
+                (path_id("productive-cycle"), push),
+                (
+                    path_id("productive-exit"),
+                    path(loop_node, target_node, Vec::new(), Vec::new(), Vec::new()),
+                ),
+            ],
+        );
+
+        let answer = ResolutionEngine::new(&source)
+            .resolve_reference(ResolutionQuery::new(reference), &CancellationToken::new())
+            .expect("preloaded source is infallible");
+
+        assert_eq!(answer.targets(), &[target]);
+        assert!(matches!(
+            answer.completion(),
+            ResolutionCompletion::Incomplete(reasons)
+                if reasons.contains(&ResolutionIncompleteReason::CyclicExpansion(
+                    path_id("productive-cycle")
+                ))
+        ));
+    }
+
+    #[test]
+    fn preload_row_order_does_not_change_results() {
+        let reference = semantic("reference");
+        let first = semantic("first");
+        let second = semantic("second");
+        let first_node = node("first-node");
+        let second_node = node("second-node");
+        let rows = vec![
+            (
+                path_id("first"),
+                path(
+                    node("reference-node"),
+                    first_node,
+                    Vec::new(),
+                    Vec::new(),
+                    Vec::new(),
+                ),
+            ),
+            (
+                path_id("second"),
+                path(
+                    node("reference-node"),
+                    second_node,
+                    Vec::new(),
+                    Vec::new(),
+                    Vec::new(),
+                ),
+            ),
+        ];
+        let forward = source_with_paths(
+            reference,
+            &[(first, first_node), (second, second_node)],
+            &[],
+            rows.clone(),
+        );
+        let reverse = source_with_paths(
+            reference,
+            &[(first, first_node), (second, second_node)],
+            &[],
+            rows.into_iter().rev().collect(),
+        );
+        let cancellation = CancellationToken::new();
+
+        let forward_answer = ResolutionEngine::new(&forward)
+            .resolve_reference(ResolutionQuery::new(reference), &cancellation)
+            .expect("preloaded source is infallible");
+        let reverse_answer = ResolutionEngine::new(&reverse)
+            .resolve_reference(ResolutionQuery::new(reference), &cancellation)
+            .expect("preloaded source is infallible");
+
+        assert_eq!(forward_answer, reverse_answer);
+    }
+
+    #[test]
+    fn selection_completion_shares_cancelled_evidence_and_equal_comparison_work() {
+        let raw = ResolutionCompletion::incomplete((0..4_096_usize).map(|index| {
+            ResolutionIncompleteReason::UnsupportedSemantic(SemanticId::for_test(
+                index.to_le_bytes(),
+            ))
+        }));
+        let ResolutionCompletion::Incomplete(reasons) = &raw else {
+            unreachable!()
+        };
+        let shared =
+            ResolutionCompletion::Incomplete(reasons.to_shared_with_poll(&mut || false).unwrap());
+        let mut comparison_work = 0;
+        assert_eq!(
+            compare_completions_with_poll(&shared, &shared, &mut || {
+                comparison_work += 1;
+                false
+            }),
+            Some(std::cmp::Ordering::Equal)
+        );
+        assert_eq!(comparison_work, 1);
+
+        let cancellation = CancellationToken::new();
+        cancellation.cancel();
+        let mut work = 0;
+        let empty = ResolutionCompletion::Incomplete(Vec::new().into());
+        let answer = cancelled_selection_answer(
+            ResolutionAnswer::new(Vec::new(), Vec::new(), shared),
+            &empty,
+            &empty,
+            &cancellation,
+            &mut work,
+        );
+        assert_eq!(
+            answer.completion(),
+            &raw.combine(&ResolutionCompletion::incomplete([
+                ResolutionIncompleteReason::Cancelled,
+            ]))
+        );
+        assert!(
+            matches!(answer.completion(), ResolutionCompletion::Incomplete(reasons) if reasons.is_shared())
+        );
+        assert!(
+            work < 100,
+            "selection cancellation must retain the base without scanning it: {work}"
+        );
+    }
+
+    #[test]
+    fn scoped_reference_seed_enumeration_certifies_empty_fragment_inventory() {
+        let clean = fragment("scoped-seeds-clean");
+        let gap = fragment("scoped-seeds-gap");
+        let source = PreloadedFragmentSource::from_lowered_fragments([
+            empty_inventory_fragment(clean),
+            enumeration_inventory_fragment(gap),
+        ]);
+        let cancellation = CancellationToken::new();
+        for (fragments, complete) in [
+            (HashSet::default(), true),
+            (HashSet::from_iter([clean]), true),
+            (HashSet::from_iter([gap]), false),
+        ] {
+            let completion = source
+                .visit_reference_seed_batches_in_fragments(
+                    &fragments,
+                    1,
+                    &cancellation,
+                    &mut |_| panic!("empty fragment cannot emit a seed batch"),
+                )
+                .unwrap();
+            assert_eq!(completion == ResolutionCompletion::Complete, complete);
+        }
+        assert!(
+            source
+                .visit_reference_seed_batches_in_fragments(
+                    &HashSet::from_iter([fragment("unselected-scoped-seeds")]),
+                    1,
+                    &cancellation,
+                    &mut |_| Ok(true)
+                )
+                .is_err()
+        );
+        cancellation.cancel();
+        let cancelled = source
+            .visit_reference_seed_batches_in_fragments(
+                &HashSet::default(),
+                1,
+                &cancellation,
+                &mut |_| Ok(true),
+            )
+            .unwrap();
+        assert!(cancelled.contains_reason(ResolutionIncompleteReason::Cancelled));
+    }
+
+    #[test]
+    fn preloaded_endpoint_classification_carries_exact_member_scope_owner_and_cancels_atomically() {
+        let fragment = fragment("member-scope-classification-fragment");
+        let scope_head = node("member-scope-classification-head");
+        let owner = semantic("member-scope-classification-owner");
+        let mut source = PreloadedFragmentSource::from_fragments([PreloadedFragment::new(
+            fragment,
+            [(scope_head, BindingNodeKind::Scope)],
+            [],
+        )]);
+        source.install_member_scope_owners([(scope_head, owner)]);
+
+        let classified = source
+            .classify_endpoint_nodes(&[scope_head], &CancellationToken::new())
+            .expect("preloaded endpoint classification is infallible");
+
+        assert_eq!(classified.len(), 1);
+        assert_eq!(classified[0].node(), scope_head);
+        assert_eq!(classified[0].member_scope_owner(), Some(owner));
+        assert_eq!(classified[0].reference(), None);
+        assert_eq!(classified[0].definition(), None);
+
+        let cancellation = CancellationToken::new();
+        cancellation.cancel();
+        assert!(
+            source
+                .classify_endpoint_nodes(&[scope_head], &cancellation)
+                .expect("preloaded cancellation is operational")
+                .is_empty(),
+            "a cancelled endpoint batch must not expose a classified prefix"
+        );
+    }
+
+    #[test]
+    fn empty_reverse_gap_exclusion_plan_is_exact_raw_parity() {
+        let fragment = fragment("empty-reverse-gap-plan-fragment");
+        let reason = semantic("empty-reverse-gap-plan-reason");
+        let (source, request) = source_with_reverse_inventory_gaps(
+            "empty-reverse-gap-plan",
+            &[(fragment, semantic("empty-reverse-gap-plan-gap"), reason)],
+        );
+        let raw = visit_reverse_pages(&source, &request, None, &CancellationToken::new())
+            .expect("raw preload reverse visit succeeds");
+        let mut exclusions = ReverseCandidateGapExclusionPlan::default();
+        let filtered = visit_reverse_pages(
+            &source,
+            &request,
+            Some(&mut exclusions),
+            &CancellationToken::new(),
+        )
+        .expect("empty reverse exclusion delegates to raw preload visit");
+
+        assert_eq!(filtered, raw);
+    }
+
+    #[test]
+    fn prepared_reverse_gap_exclusion_replays_filtered_semantics_before_cancellation() {
+        let fragment = fragment("prepared-reverse-gap-cancellation-fragment");
+        let removed_gap = semantic("prepared-reverse-gap-cancellation-removed-gap");
+        let removed_reason = semantic("prepared-reverse-gap-cancellation-removed-reason");
+        let retained_reason = semantic("prepared-reverse-gap-cancellation-retained-reason");
+        let (source, request) = source_with_reverse_inventory_gaps(
+            "prepared-reverse-gap-cancellation",
+            &[
+                (fragment, removed_gap, removed_reason),
+                (
+                    fragment,
+                    semantic("prepared-reverse-gap-cancellation-retained-gap"),
+                    retained_reason,
+                ),
+            ],
+        );
+        let mut plan = ReverseCandidateGapExclusionPlan::new([ReverseCandidateGapIdentity::new(
+            fragment,
+            removed_gap,
+        )]);
+        let warm = visit_reverse_pages(
+            &source,
+            &request,
+            Some(&mut plan),
+            &CancellationToken::new(),
+        )
+        .expect("the live preload visit prepares one exact filtered completion");
+        assert_eq!(warm.0.len(), 1);
+        assert_eq!(
+            warm.1.unconditional_completion(),
+            &ResolutionCompletion::incomplete([ResolutionIncompleteReason::UnsupportedSemantic(
+                retained_reason
+            ),])
+        );
+
+        let cancellation = CancellationToken::new();
+        cancellation.cancel();
+        let cancelled = visit_reverse_pages(&source, &request, Some(&mut plan), &cancellation)
+            .expect("a prepared preload plan replays immutable semantics under cancellation");
+        assert!(cancelled.0.is_empty());
+        assert_eq!(
+            cancelled.1.unconditional_completion(),
+            &warm
+                .1
+                .unconditional_completion()
+                .combine(&cancelled_completion())
+        );
+
+        let retried = visit_reverse_pages(
+            &source,
+            &request,
+            Some(&mut plan),
+            &CancellationToken::new(),
+        )
+        .expect("a fresh preload retry remains exact after entry cancellation");
+        assert_eq!(retried, warm);
+    }
+
+    #[test]
+    fn exact_reverse_gap_exclusions_reject_wrong_fragment_unknown_and_stale_fingerprint() {
+        let owner_fragment = fragment("exact-reverse-gap-owner");
+        let other_fragment = fragment("exact-reverse-gap-other-owner");
+        let gap_id = semantic("exact-reverse-gap-id");
+        let reason = semantic("exact-reverse-gap-reason");
+        let (mut source, request) = source_with_reverse_inventory_gaps(
+            "exact-reverse-gap-owner",
+            &[(owner_fragment, gap_id, reason)],
+        );
+        for identity in [
+            ReverseCandidateGapIdentity::new(other_fragment, gap_id),
+            ReverseCandidateGapIdentity::new(owner_fragment, semantic("unknown-reverse-gap-id")),
+        ] {
+            let mut plan = ReverseCandidateGapExclusionPlan::new([identity]);
+            let mut callback_count = 0_usize;
+            let error = source
+                .visit_reverse_candidate_match_pages_with_gap_exclusions(
+                    std::slice::from_ref(&request),
+                    &mut plan,
+                    &CancellationToken::new(),
+                    &mut |_| {
+                        callback_count += 1;
+                        Ok(true)
+                    },
+                )
+                .expect_err("an absent exact reverse gap must fail closed");
+            assert!(error.to_string().contains("no exact gap"));
+            assert_eq!(callback_count, 0);
+        }
+
+        let exact = ReverseCandidateGapIdentity::new(owner_fragment, gap_id);
+        let mut plan = ReverseCandidateGapExclusionPlan::new([exact]);
+        visit_reverse_pages(
+            &source,
+            &request,
+            Some(&mut plan),
+            &CancellationToken::new(),
+        )
+        .expect("the plan prepares against its first exact source");
+        let (mut different_source, different_request) = source_with_reverse_inventory_gaps(
+            "different-reverse-gap-source",
+            &[(
+                owner_fragment,
+                gap_id,
+                semantic("different-reverse-gap-reason"),
+            )],
+        );
+        let mut callback_count = 0_usize;
+        let error = different_source
+            .visit_reverse_candidate_match_pages_with_gap_exclusions(
+                std::slice::from_ref(&different_request),
+                &mut plan,
+                &CancellationToken::new(),
+                &mut |_| {
+                    callback_count += 1;
+                    Ok(true)
+                },
+            )
+            .expect_err("a prepared plan cannot cross a different raw fingerprint");
+        assert!(error.to_string().contains("different raw coverage"));
+        assert_eq!(callback_count, 0);
+    }
+
+    #[test]
+    fn cancellation_during_reverse_gap_preparation_retains_raw_evidence_and_retries_exactly() {
+        let fragment = fragment("cancelled-reverse-gap-preparation-fragment");
+        let reason = semantic("cancelled-reverse-gap-preparation-reason");
+        let identities = (0..64)
+            .map(|ordinal| {
+                ReverseCandidateGapIdentity::new(
+                    fragment,
+                    semantic(&format!("cancelled-reverse-gap-{ordinal}")),
+                )
+            })
+            .collect::<Vec<_>>();
+        let rows = identities
+            .iter()
+            .map(|identity| (fragment, identity.gap_id(), reason))
+            .collect::<Vec<_>>();
+        let (mut source, request) =
+            source_with_reverse_inventory_gaps("cancelled-reverse-gap-preparation", &rows);
+        let mut plan = ReverseCandidateGapExclusionPlan::new(identities);
+        let cancellation = CancellationToken::cancel_after_checks_for_test(5);
+        let mut callback_count = 0_usize;
+        let cancelled = source
+            .visit_reverse_candidate_match_pages_with_gap_exclusions(
+                std::slice::from_ref(&request),
+                &mut plan,
+                &cancellation,
+                &mut |_| {
+                    callback_count += 1;
+                    Ok(true)
+                },
+            )
+            .expect("preload preparation cancellation is semantic");
+        assert_eq!(callback_count, 0);
+        assert!(
+            cancelled
+                .unconditional_completion()
+                .contains_reason(ResolutionIncompleteReason::UnsupportedSemantic(reason))
+        );
+        assert!(
+            cancelled
+                .unconditional_completion()
+                .contains_reason(ResolutionIncompleteReason::Cancelled)
+        );
+
+        let (matches, retried) = visit_reverse_pages(
+            &source,
+            &request,
+            Some(&mut plan),
+            &CancellationToken::new(),
+        )
+        .expect("a fresh operation token retries an unpublished preparation");
+        assert_eq!(matches.len(), 1);
+        assert_eq!(
+            retried.unconditional_completion(),
+            &ResolutionCompletion::Complete
+        );
+    }
+
+    #[test]
+    fn preloaded_fragment_accepts_explicit_boundaries_in_all_node_positions() {
+        let owner = fragment("explicit-boundary-owner");
+        let boundary = node("explicit-shared-boundary");
+        let jump = node("explicit-boundary-jump");
+        let end = node("explicit-boundary-end");
+        let valid = PartialPath::new(
+            EndpointSignature::new_scoped(
+                jump,
+                StackPattern::closed([PartialScopedSymbol::scoped(
+                    semantic("explicit-boundary-name"),
+                    StackPattern::closed([boundary]),
+                )]),
+                StackPattern::closed([boundary]),
+            ),
+            endpoint(end, Vec::new()),
+            Vec::new(),
+            [WitnessStep::Node(boundary), WitnessStep::Node(end)],
+            ResolutionCompletion::Complete,
+        );
+
+        let source = PreloadedFragmentSource::from_fragments_with_boundaries(
+            [boundary],
+            [PreloadedFragment::new(
+                owner,
+                [
+                    (jump, BindingNodeKind::JumpToScope(boundary)),
+                    (end, BindingNodeKind::Scope),
+                ],
+                [(path_id("explicit-boundary-path"), valid)],
+            )],
+        );
+
+        assert_eq!(source.nodes.get(&boundary), Some(&BindingNodeKind::Root));
+    }
+
+    #[test]
+    fn fragmented_and_monolithic_paths_resolve_identically() {
+        let reference = semantic("reference");
+        let target = semantic("target");
+        let target_node = node("target-node");
+        let seam = node("seam");
+        let name = semantic("name");
+        let monolithic = source_with_paths(
+            reference,
+            &[(target, target_node)],
+            &[],
+            vec![(
+                path_id("whole"),
+                path(
+                    node("reference-node"),
+                    target_node,
+                    Vec::new(),
+                    Vec::new(),
+                    Vec::new(),
+                ),
+            )],
+        );
+        let fragmented = source_with_paths(
+            reference,
+            &[(target, target_node)],
+            &[seam],
+            vec![
+                (
+                    path_id("push"),
+                    path(
+                        node("reference-node"),
+                        seam,
+                        Vec::new(),
+                        vec![name],
+                        Vec::new(),
+                    ),
+                ),
+                (
+                    path_id("pop"),
+                    path(seam, target_node, vec![name], Vec::new(), Vec::new()),
+                ),
+            ],
+        );
+        let cancellation = CancellationToken::new();
+
+        let whole = ResolutionEngine::new(&monolithic)
+            .resolve_reference(ResolutionQuery::new(reference), &cancellation)
+            .expect("preloaded source is infallible");
+        let pieces = ResolutionEngine::new(&fragmented)
+            .resolve_reference(ResolutionQuery::new(reference), &cancellation)
+            .expect("preloaded source is infallible");
+
+        assert_eq!(whole.targets(), &[target]);
+        assert_eq!(pieces.targets(), whole.targets());
+        assert_eq!(pieces.completion(), &ResolutionCompletion::Complete);
+    }
+
+    #[test]
+    fn imported_package_blocks_plain_names_and_binds_only_structured_qualifiers() {
+        let reference = semantic("go-package-reference");
+        let package = semantic("go-import-binding");
+        let outer = semantic("go-outer-definition");
+        let choice = semantic("go-file-spelling-choice");
+        for (requested, qualifier) in [
+            (ResolutionNamespace::Type, false),
+            (ResolutionNamespace::Value, false),
+            (ResolutionNamespace::Callable, false),
+            (ResolutionNamespace::TypeOrValue, false),
+            (ResolutionNamespace::TypeOrValue, true),
+        ] {
+            let near = selection_completed(
+                "package",
+                package,
+                vec![precedence(choice, 0)],
+                ResolutionCompletion::Complete,
+            );
+            let CompletedBinding::Complete(near) = classify_completed_binding(
+                Some(requested),
+                qualifier,
+                Some(GoDefinitionNamespaces::from_bits(8)),
+                package,
+                near.path,
+            ) else {
+                panic!("known package category has complete admission")
+            };
+            let far = selection_completed(
+                "outer",
+                outer,
+                vec![precedence(choice, 1)],
+                ResolutionCompletion::Complete,
+            );
+            let answer = select_paths(
+                reference,
+                vec![near, far],
+                Vec::new(),
+                ResolutionCompletion::Complete,
+                &CancellationToken::new(),
+            );
+            assert_eq!(
+                answer.targets(),
+                if qualifier {
+                    std::slice::from_ref(&package)
+                } else {
+                    &[]
+                }
+            );
+            assert!(!answer.targets().contains(&outer));
+            assert!(
+                answer
+                    .witnesses()
+                    .iter()
+                    .any(|witness| witness.target() == package)
+            );
+        }
+    }
+
+    #[test]
+    #[hardwon("0214401b5a9f: a completed namespace blocker failed to suppress an outer target")]
+    fn completed_namespace_blocker_dominates_outer_target_without_becoming_a_target() {
+        let reference = semantic("go-blocked-reference");
+        let blocker = semantic("go-local-type");
+        let outer = semantic("go-outer-value");
+        let choice = semantic("go-spelling-choice");
+        let mut near = selection_completed(
+            "near",
+            blocker,
+            vec![precedence(choice, 0)],
+            ResolutionCompletion::Complete,
+        );
+        near.admission = BindingCandidateAdmission::WrongNamespaceBlocker;
+        let far = selection_completed(
+            "far",
+            outer,
+            vec![precedence(choice, 1)],
+            ResolutionCompletion::Complete,
+        );
+        let answer = select_paths(
+            reference,
+            vec![near, far],
+            Vec::new(),
+            ResolutionCompletion::Complete,
+            &CancellationToken::new(),
+        );
+        assert!(answer.targets().is_empty());
+        assert_eq!(answer.completion(), &ResolutionCompletion::Complete);
+        for (target, reason) in [
+            (blocker, RejectionReason::WrongNamespace),
+            (outer, RejectionReason::ShadowedByNearer),
+        ] {
+            assert!(answer.witnesses().iter().any(|witness| {
+                witness.target() == target
+                    && witness.steps().iter().any(|step| {
+                        matches!(step,
+                    WitnessStep::Candidate { semantic, outcome: CandidateOutcome::Rejected(actual) }
+                    if *semantic == target && *actual == reason)
+                    })
+            }));
+        }
+    }
+
+    #[test]
+    #[hardwon("0214401b5a9f: namespace blocker ordering did not honor the nearer lexical target")]
+    fn nearer_target_dominates_outer_namespace_blocker() {
+        let reference = semantic("go-near-reference");
+        let local = semantic("go-local-value");
+        let blocker = semantic("go-outer-type");
+        let choice = semantic("go-spelling-choice");
+        let near = selection_completed(
+            "near",
+            local,
+            vec![precedence(choice, 0)],
+            ResolutionCompletion::Complete,
+        );
+        let mut far = selection_completed(
+            "far",
+            blocker,
+            vec![precedence(choice, 1)],
+            ResolutionCompletion::Complete,
+        );
+        far.admission = BindingCandidateAdmission::WrongNamespaceBlocker;
+        let answer = select_paths(
+            reference,
+            vec![near, far],
+            Vec::new(),
+            ResolutionCompletion::Complete,
+            &CancellationToken::new(),
+        );
+        assert_eq!(answer.targets(), &[local]);
+        assert_eq!(answer.completion(), &ResolutionCompletion::Complete);
+    }
+
+    #[test]
+    #[hardwon(
+        "0214401b5a9f: cancellation erased the rejected namespace identity and made the result unsound"
+    )]
+    fn cancelled_namespace_blocker_keeps_rejected_identity_without_affirmative_target() {
+        let reference = semantic("go-cancelled-reference");
+        let blocker = semantic("go-local-type");
+        let outer = semantic("go-outer-value");
+        let choice = semantic("go-spelling-choice");
+        let mut near = selection_completed(
+            "near",
+            blocker,
+            vec![precedence(choice, 0)],
+            ResolutionCompletion::Complete,
+        );
+        near.admission = BindingCandidateAdmission::WrongNamespaceBlocker;
+        let far = selection_completed(
+            "far",
+            outer,
+            vec![precedence(choice, 1)],
+            ResolutionCompletion::Complete,
+        );
+        let cancellation = CancellationToken::new();
+        cancellation.cancel();
+        let answer = select_paths(
+            reference,
+            vec![near, far],
+            Vec::new(),
+            ResolutionCompletion::Complete,
+            &cancellation,
+        );
+        assert_eq!(answer.targets(), &[outer]);
+        assert!(
+            matches!(answer.completion(), ResolutionCompletion::Incomplete(reasons) if reasons.contains(&ResolutionIncompleteReason::Cancelled))
+        );
+        assert!(answer.witnesses().iter().any(|witness| {
+            witness.target() == blocker && witness.steps().iter().any(|step| matches!(step,
+                WitnessStep::Candidate { semantic, outcome: CandidateOutcome::Rejected(RejectionReason::WrongNamespace) }
+                if *semantic == blocker))
+        }));
+    }
+
+    #[test]
     fn ordered_lookup_evidence_preserves_endpoints_and_relative_precedence() {
         let reference = semantic("ordered-lookup-reference");
         let target = semantic("ordered-lookup-target");
@@ -5717,51 +5838,6 @@ mod tests {
                     if reasons.contains(&ResolutionIncompleteReason::UnsupportedSemantic(gap))
             ));
         }
-    }
-
-    #[test]
-    fn terminal_crossing_affirmative_maxima_cannot_be_discharged() {
-        let reference = semantic("terminal-cross-max-reference");
-        let first = semantic("terminal-cross-max-first");
-        let second = semantic("terminal-cross-max-second");
-        let first_choice = semantic("terminal-cross-max-first-choice");
-        let second_choice = semantic("terminal-cross-max-second-choice");
-        let gap = semantic("terminal-cross-max-gap");
-
-        let answer = select_paths(
-            reference,
-            vec![
-                selection_completed(
-                    "terminal-cross-max-first",
-                    first,
-                    vec![precedence(first_choice, 1)],
-                    ResolutionCompletion::Complete,
-                ),
-                selection_completed(
-                    "terminal-cross-max-second",
-                    second,
-                    vec![precedence(second_choice, 0)],
-                    ResolutionCompletion::Complete,
-                ),
-            ],
-            vec![selection_terminal(
-                "terminal-cross-max",
-                vec![precedence(second_choice, 1), precedence(first_choice, 0)],
-                gap,
-            )],
-            ResolutionCompletion::Complete,
-            &CancellationToken::new(),
-        );
-
-        let mut expected = vec![first, second];
-        expected.sort_unstable();
-        assert_eq!(answer.targets(), expected);
-        assert!(matches!(
-            answer.completion(),
-            ResolutionCompletion::Incomplete(reasons)
-                if reasons.contains(&ResolutionIncompleteReason::UnsupportedSemantic(gap))
-                    && reasons.contains(&ResolutionIncompleteReason::InconsistentPrecedence(reference))
-        ));
     }
 
     #[test]
@@ -6045,161 +6121,6 @@ mod tests {
     }
 
     #[test]
-    fn reverse_generation_is_forward_validated_for_cross_target_shadowing() {
-        let reference = semantic("shadowed-reference");
-        let local = semantic("local");
-        let imported = semantic("imported");
-        let choice = semantic("choice");
-        let local_node = node("local-node");
-        let imported_node = node("imported-node");
-        let source = source_with_paths(
-            reference,
-            &[(local, local_node), (imported, imported_node)],
-            &[],
-            vec![
-                (
-                    path_id("local"),
-                    path(
-                        node("reference-node"),
-                        local_node,
-                        Vec::new(),
-                        Vec::new(),
-                        vec![PrecedenceStep {
-                            tier: PrecedenceTier::LexicalBinding,
-                            ordinal: 0,
-                            semantic: choice,
-                        }],
-                    ),
-                ),
-                (
-                    path_id("imported"),
-                    path(
-                        node("reference-node"),
-                        imported_node,
-                        Vec::new(),
-                        Vec::new(),
-                        vec![PrecedenceStep {
-                            tier: PrecedenceTier::ExplicitImport,
-                            ordinal: 0,
-                            semantic: choice,
-                        }],
-                    ),
-                ),
-            ],
-        );
-
-        let references = ResolutionEngine::new(&source)
-            .references_to(imported, &CancellationToken::new())
-            .expect("preloaded source is infallible");
-
-        assert!(references.references().is_empty());
-        assert!(references.witnesses().is_empty());
-        assert_eq!(references.completion(), &ResolutionCompletion::Complete);
-    }
-
-    #[test]
-    fn stack_neutral_cycles_are_certified_complete() {
-        let reference = semantic("reference");
-        let target = semantic("target");
-        let target_node = node("target-node");
-        let loop_node = node("loop-node");
-        let source = source_with_paths(
-            reference,
-            &[(target, target_node)],
-            &[loop_node],
-            vec![
-                (
-                    path_id("enter"),
-                    path(
-                        node("reference-node"),
-                        loop_node,
-                        Vec::new(),
-                        Vec::new(),
-                        Vec::new(),
-                    ),
-                ),
-                (
-                    path_id("cycle"),
-                    path(loop_node, loop_node, Vec::new(), Vec::new(), Vec::new()),
-                ),
-                (
-                    path_id("exit"),
-                    path(loop_node, target_node, Vec::new(), Vec::new(), Vec::new()),
-                ),
-            ],
-        );
-
-        let answer = ResolutionEngine::new(&source)
-            .resolve_reference(ResolutionQuery::new(reference), &CancellationToken::new())
-            .expect("preloaded source is infallible");
-
-        assert_eq!(answer.targets(), &[target]);
-        assert_eq!(answer.completion(), &ResolutionCompletion::Complete);
-    }
-
-    #[test]
-    fn productive_cycles_terminate_without_proving_a_negative() {
-        let reference = semantic("productive-reference");
-        let target = semantic("productive-target");
-        let target_node = node("productive-target-node");
-        let loop_node = node("productive-loop-node");
-        let tail = StackVariableId::for_test("productive-tail");
-        let push = PartialPath::new(
-            EndpointSignature::new_scoped(
-                loop_node,
-                StackPattern::open(Vec::new(), tail),
-                StackPattern::closed(Vec::new()),
-            ),
-            EndpointSignature::new_scoped(
-                loop_node,
-                StackPattern::open(
-                    [PartialScopedSymbol::unscoped(semantic("pushed-name"))],
-                    tail,
-                ),
-                StackPattern::closed(Vec::new()),
-            ),
-            Vec::new(),
-            Vec::new(),
-            ResolutionCompletion::Complete,
-        );
-        let source = source_with_paths(
-            reference,
-            &[(target, target_node)],
-            &[loop_node],
-            vec![
-                (
-                    path_id("productive-enter"),
-                    path(
-                        node("reference-node"),
-                        loop_node,
-                        Vec::new(),
-                        Vec::new(),
-                        Vec::new(),
-                    ),
-                ),
-                (path_id("productive-cycle"), push),
-                (
-                    path_id("productive-exit"),
-                    path(loop_node, target_node, Vec::new(), Vec::new(), Vec::new()),
-                ),
-            ],
-        );
-
-        let answer = ResolutionEngine::new(&source)
-            .resolve_reference(ResolutionQuery::new(reference), &CancellationToken::new())
-            .expect("preloaded source is infallible");
-
-        assert_eq!(answer.targets(), &[target]);
-        assert!(matches!(
-            answer.completion(),
-            ResolutionCompletion::Incomplete(reasons)
-                if reasons.contains(&ResolutionIncompleteReason::CyclicExpansion(
-                    path_id("productive-cycle")
-                ))
-        ));
-    }
-
-    #[test]
     fn cancellation_is_polled_by_work_not_time_and_returns_incomplete() {
         let reference = semantic("reference");
         let target = semantic("target");
@@ -6407,13 +6328,13 @@ mod tests {
 
         let answer = select_paths_with_cancellation_evidence(
             reference,
-            vec![selection_completed(
+            &[selection_completed(
                 "selector-transient-evidence-path",
                 target,
                 Vec::new(),
                 ResolutionCompletion::Complete,
             )],
-            Vec::new(),
+            &[],
             ResolutionCompletion::Complete,
             ResolutionCompletion::incomplete([evidence]),
             &CancellationToken::new(),
@@ -6421,59 +6342,6 @@ mod tests {
 
         assert_eq!(answer.targets(), &[target]);
         assert_eq!(answer.completion(), &ResolutionCompletion::Complete);
-    }
-
-    #[test]
-    fn preload_row_order_does_not_change_results() {
-        let reference = semantic("reference");
-        let first = semantic("first");
-        let second = semantic("second");
-        let first_node = node("first-node");
-        let second_node = node("second-node");
-        let rows = vec![
-            (
-                path_id("first"),
-                path(
-                    node("reference-node"),
-                    first_node,
-                    Vec::new(),
-                    Vec::new(),
-                    Vec::new(),
-                ),
-            ),
-            (
-                path_id("second"),
-                path(
-                    node("reference-node"),
-                    second_node,
-                    Vec::new(),
-                    Vec::new(),
-                    Vec::new(),
-                ),
-            ),
-        ];
-        let forward = source_with_paths(
-            reference,
-            &[(first, first_node), (second, second_node)],
-            &[],
-            rows.clone(),
-        );
-        let reverse = source_with_paths(
-            reference,
-            &[(first, first_node), (second, second_node)],
-            &[],
-            rows.into_iter().rev().collect(),
-        );
-        let cancellation = CancellationToken::new();
-
-        let forward_answer = ResolutionEngine::new(&forward)
-            .resolve_reference(ResolutionQuery::new(reference), &cancellation)
-            .expect("preloaded source is infallible");
-        let reverse_answer = ResolutionEngine::new(&reverse)
-            .resolve_reference(ResolutionQuery::new(reference), &cancellation)
-            .expect("preloaded source is infallible");
-
-        assert_eq!(forward_answer, reverse_answer);
     }
 
     #[test]
@@ -6659,77 +6527,6 @@ mod tests {
     }
 
     #[test]
-    fn typed_copy_rule_empty_input_produces_an_honest_empty_target_state() {
-        let source_slot = semantic("empty-source-slot");
-        let target_slot = semantic("empty-target-slot");
-        let source = PreloadedFragmentSource::new([], []).with_type_transfer_rules([(
-            source_slot,
-            TypeTransferRule::new(
-                semantic("empty-copy-rule"),
-                target_slot,
-                0,
-                TypeTransferValueTransform::Preserve,
-                ResolutionCompletion::Complete,
-            ),
-        )]);
-        let input =
-            TypedFrontierState::new(source_slot, Vec::new(), ResolutionCompletion::Complete);
-
-        let (alternatives, completion) = ResolutionEngine::new(&source)
-            .transfer_types(&input, &CancellationToken::new())
-            .expect("preloaded source is infallible");
-
-        assert_eq!(completion, ResolutionCompletion::Complete);
-        assert_eq!(alternatives.len(), 1);
-        assert_eq!(alternatives[0].slot(), target_slot);
-        assert!(alternatives[0].possible_values().is_empty());
-        assert_eq!(
-            alternatives[0].completion(),
-            &ResolutionCompletion::Complete
-        );
-    }
-
-    #[test]
-    fn typed_no_value_rule_discards_inputs_without_claiming_an_adjustment_gap() {
-        let source_slot = semantic("void-type-slot");
-        let target_slot = semantic("void-call-result-slot");
-        let source = PreloadedFragmentSource::new([], []).with_type_transfer_rules([(
-            source_slot,
-            TypeTransferRule::new(
-                semantic("void-copy-rule"),
-                target_slot,
-                0,
-                TypeTransferValueTransform::ToNoValue,
-                ResolutionCompletion::Complete,
-            ),
-        )]);
-        let input = TypedFrontierState::new(
-            source_slot,
-            [
-                ResolutionSlotValue::type_object(ResolutionTypeRef::new(semantic("void"), 0)),
-                ResolutionSlotValue::runtime(
-                    ResolutionTypeRef::new(semantic("adversarial-void-runtime"), u32::MAX),
-                    true,
-                ),
-            ],
-            ResolutionCompletion::Complete,
-        );
-
-        let (alternatives, completion) = ResolutionEngine::new(&source)
-            .transfer_types(&input, &CancellationToken::new())
-            .expect("preloaded source is infallible");
-
-        assert_eq!(completion, ResolutionCompletion::Complete);
-        assert_eq!(alternatives.len(), 1);
-        assert_eq!(alternatives[0].slot(), target_slot);
-        assert!(alternatives[0].possible_values().is_empty());
-        assert_eq!(
-            alternatives[0].completion(),
-            &ResolutionCompletion::Complete
-        );
-    }
-
-    #[test]
     fn cancellation_at_an_empty_transfer_boundary_is_propagated() {
         let input = TypedFrontierState::new(
             semantic("empty-transfer-slot"),
@@ -6843,5 +6640,194 @@ mod tests {
             ResolutionQuery::new(first_reference).reference(),
             first_reference
         );
+    }
+
+    mod selection_properties {
+        use super::*;
+        use proptest::prelude::*;
+
+        fn precedence_steps() -> impl Strategy<Value = Vec<PrecedenceStep>> {
+            prop::collection::vec((0_u8..4, 0_u8..4, 0_u8..4), 0..5).prop_map(|steps| {
+                steps
+                    .into_iter()
+                    .map(|(semantic_index, tier_index, ordinal)| {
+                        let tier = match tier_index {
+                            0 => PrecedenceTier::LexicalBinding,
+                            1 => PrecedenceTier::OwnMember,
+                            2 => PrecedenceTier::InheritedMember,
+                            _ => PrecedenceTier::ExplicitImport,
+                        };
+                        PrecedenceStep {
+                            semantic: semantic(&format!(
+                                "selector-property-choice-{semantic_index}"
+                            )),
+                            tier,
+                            ordinal: u32::from(ordinal),
+                        }
+                    })
+                    .collect()
+            })
+        }
+
+        fn paths(
+            completed_precedences: &[Vec<PrecedenceStep>],
+            terminal_precedences: &[Vec<PrecedenceStep>],
+        ) -> (Vec<CompletedPath>, Vec<IncompleteTerminalPath>) {
+            let completed = completed_precedences
+                .iter()
+                .enumerate()
+                .map(|(index, precedence)| {
+                    selection_completed(
+                        &format!("selector-property-completed-{index}"),
+                        semantic(&format!("selector-property-target-{index}")),
+                        precedence.clone(),
+                        ResolutionCompletion::Complete,
+                    )
+                })
+                .collect();
+            let terminals = terminal_precedences
+                .iter()
+                .enumerate()
+                .map(|(index, precedence)| {
+                    selection_terminal(
+                        &format!("selector-property-terminal-{index}"),
+                        precedence.clone(),
+                        semantic(&format!("selector-property-terminal-gap-{index}")),
+                    )
+                })
+                .collect();
+            (completed, terminals)
+        }
+
+        fn original_node(
+            relation: &AugmentedPathRelation,
+            completed_count: usize,
+            original_index: usize,
+        ) -> usize {
+            if original_index < completed_count {
+                original_index
+            } else {
+                relation.terminal_nodes[original_index - completed_count]
+            }
+        }
+
+        fn expanded_edge(
+            relation: &AugmentedPathRelation,
+            completed_count: usize,
+            from: usize,
+            to: usize,
+        ) -> bool {
+            let from_node = original_node(relation, completed_count, from);
+            let to_node = original_node(relation, completed_count, to);
+            from_node != to_node && relation.dominance[from_node].contains(&to_node)
+        }
+
+        fn is_acyclic(relation: &AugmentedPathRelation) -> bool {
+            let mut remaining_indegree = relation.indegree.clone();
+            let mut ready = remaining_indegree
+                .iter()
+                .enumerate()
+                .filter_map(|(index, degree)| (*degree == 0).then_some(index))
+                .collect::<VecDeque<_>>();
+            let mut visited = 0;
+            while let Some(left) = ready.pop_front() {
+                visited += 1;
+                for &right in &relation.dominance[left] {
+                    remaining_indegree[right] -= 1;
+                    if remaining_indegree[right] == 0 {
+                        ready.push_back(right);
+                    }
+                }
+            }
+            visited == relation.dominance.len()
+        }
+
+        proptest! {
+            #![proptest_config(ProptestConfig {
+                cases: 96,
+                .. ProptestConfig::default()
+            })]
+
+            #[test]
+            fn quotient_relation_matches_full_terminal_relation(
+                mut completed_precedences in prop::collection::vec(precedence_steps(), 0..5),
+                mut terminal_precedences in prop::collection::vec(precedence_steps(), 0..8),
+                scenario in 0_u8..4,
+            ) {
+                let forced_cycle = scenario == 3;
+                match scenario {
+                    1 => {
+                        completed_precedences.clear();
+                        terminal_precedences = vec![Vec::new(), Vec::new()];
+                    }
+                    2 => {
+                        let choice = semantic("selector-property-ordered-choice");
+                        completed_precedences = vec![vec![precedence(choice, 1)]];
+                        terminal_precedences = vec![vec![precedence(choice, 0)]];
+                    }
+                    3 => {
+                        let a = semantic("selector-property-cycle-a");
+                        let b = semantic("selector-property-cycle-b");
+                        let c = semantic("selector-property-cycle-c");
+                        completed_precedences = vec![
+                            vec![precedence(a, 0), precedence(c, 1)],
+                            vec![precedence(a, 1), precedence(b, 0)],
+                        ];
+                        terminal_precedences = vec![vec![precedence(b, 1), precedence(c, 0)]];
+                    }
+                    _ => {}
+                }
+
+                let (completed, terminals) =
+                    paths(&completed_precedences, &terminal_precedences);
+                let cancellation = CancellationToken::new();
+                let mut quotient_work = 0;
+                let quotient = augmented_path_relation_with_poll(
+                    &completed,
+                    &terminals,
+                    &cancellation,
+                    &mut quotient_work,
+                );
+                prop_assert!(quotient.is_some());
+                let quotient = quotient.unwrap();
+
+                let mut reference_work = 0;
+                let reference = augmented_path_relation_reference_with_poll(
+                    &completed,
+                    &terminals,
+                    &cancellation,
+                    &mut reference_work,
+                );
+                prop_assert!(reference.is_some());
+                let reference = reference.unwrap();
+
+                let original_count = completed.len() + terminals.len();
+                for from in 0..original_count {
+                    let quotient_from = original_node(&quotient, completed.len(), from);
+                    let reference_from = original_node(&reference, completed.len(), from);
+                    prop_assert_eq!(
+                        quotient.indegree[quotient_from] != 0,
+                        reference.indegree[reference_from] != 0,
+                    );
+                    if quotient.terminal_classes_are_singletons {
+                        prop_assert_eq!(
+                            quotient.indegree[quotient_from],
+                            reference.indegree[reference_from],
+                        );
+                    }
+                    for to in 0..original_count {
+                        prop_assert_eq!(
+                            expanded_edge(&quotient, completed.len(), from, to),
+                            expanded_edge(&reference, completed.len(), from, to),
+                        );
+                    }
+                }
+
+                prop_assert_eq!(is_acyclic(&quotient), is_acyclic(&reference));
+                if forced_cycle {
+                    prop_assert!(!is_acyclic(&reference));
+                }
+            }
+        }
     }
 }

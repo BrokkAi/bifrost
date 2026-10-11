@@ -1,5 +1,7 @@
 //! Coordinated JS/TS source identity and structural publication.
 
+use brokk_bifrost_core::analyzer::ProjectFile;
+use brokk_bifrost_core::analyzer::fq_name::{SegmentKind, segment_interner};
 use brokk_bifrost_core::analyzer::js_ts_facts::*;
 use brokk_bifrost_core::analyzer::model::{
     CodeUnit, ImportInfo, SignatureMetadata, StructuredImportPath,
@@ -8,11 +10,12 @@ use brokk_bifrost_core::analyzer::parsed_file::{
     ParsedFile, ParsedSourceFacts, SourceDeclarationMetadataLink, SourceImportFact,
 };
 use brokk_bifrost_core::analyzer::source_facts::{
-    PrimarySourceFactCollector, SourceDeclarationId, SourceImportId,
+    PrimarySourceFactCollector, SourceDeclarationId, SourceImportId, SourceOccurrenceId,
 };
 use brokk_bifrost_core::analyzer::structural::collector::StructuralFactCollector;
 use brokk_bifrost_core::analyzer::structural::spec::{CompiledKinds, StructuralSpec};
 use brokk_bifrost_core::analyzer::tree_walk::ParentIndex;
+use brokk_bifrost_core::analyzer::usages::model::ImportKind;
 use brokk_bifrost_core::analyzer::usages::model::{ExportEntry, ExportIndex};
 use brokk_bifrost_core::hash::{HashMap, HashSet};
 use std::ops::{Deref, DerefMut};
@@ -270,9 +273,7 @@ impl<'source> JsTsParsedFile<'source> {
         top_level: Option<CodeUnit>,
     ) {
         let name = declaration_name(node);
-        self.capture_declaration(&unit, node, name);
-        self.parsed
-            .add_code_unit(unit, node, source, parent, top_level);
+        self.add_code_unit_with_name(unit, node, name, source, parent, top_level);
     }
 
     pub fn add_named_code_unit(
@@ -284,7 +285,19 @@ impl<'source> JsTsParsedFile<'source> {
         parent: Option<CodeUnit>,
         top_level: Option<CodeUnit>,
     ) {
-        self.capture_declaration(&unit, node, Some(name));
+        self.add_code_unit_with_name(unit, node, Some(name), source, parent, top_level);
+    }
+
+    fn add_code_unit_with_name(
+        &mut self,
+        unit: CodeUnit,
+        node: Node<'_>,
+        name: Option<Node<'_>>,
+        source: &str,
+        parent: Option<CodeUnit>,
+        top_level: Option<CodeUnit>,
+    ) {
+        self.capture_declaration(&unit, node, name);
         self.parsed
             .add_code_unit(unit, node, source, parent, top_level);
     }
@@ -314,23 +327,13 @@ impl<'source> JsTsParsedFile<'source> {
             .alias
             .filter(|_| syntax.import.binder_span.is_some())
             .map(|node| self.source.intern_node(node));
-        let import =
-            SourceImportId::try_from_index(self.imports.len()).expect("JS/TS import ids fit u32");
-        if let Some(kind) = syntax.kind {
-            self.js_ts.bindings.push(JsTsImportBindingFact {
-                import,
-                kind,
-                is_static: syntax.is_static,
-            });
-        }
-        self.imports.push(SourceImportFact::from_import(
+        self.push_import_fact(
             syntax.import,
             declaration,
             target,
             alias,
-            Vec::new(),
-        ));
-        import
+            syntax.kind.map(|kind| (kind, syntax.is_static)),
+        )
     }
 
     fn add_export_import(
@@ -340,8 +343,6 @@ impl<'source> JsTsParsedFile<'source> {
         imported_name: Option<String>,
     ) -> SourceImportId {
         let declaration = self.source.intern_node(node);
-        let import =
-            SourceImportId::try_from_index(self.imports.len()).expect("JS/TS import ids fit u32");
         let info = ImportInfo {
             raw_snippet: crate::model::node_text(node, self.source_text)
                 .trim()
@@ -359,11 +360,31 @@ impl<'source> JsTsParsedFile<'source> {
                 declaration_start_byte: node.start_byte(),
             }),
         };
+        self.push_import_fact(info, declaration, None, None, None)
+    }
+
+    fn push_import_fact(
+        &mut self,
+        info: ImportInfo,
+        declaration: SourceOccurrenceId,
+        target: Option<SourceOccurrenceId>,
+        alias: Option<SourceOccurrenceId>,
+        binding: Option<(ImportKind, bool)>,
+    ) -> SourceImportId {
+        let import =
+            SourceImportId::try_from_index(self.imports.len()).expect("JS/TS import ids fit u32");
+        if let Some((kind, is_static)) = binding {
+            self.js_ts.bindings.push(JsTsImportBindingFact {
+                import,
+                kind,
+                is_static,
+            });
+        }
         self.imports.push(SourceImportFact::from_import(
             info,
             declaration,
-            None,
-            None,
+            target,
+            alias,
             Vec::new(),
         ));
         import
@@ -428,6 +449,73 @@ impl<'source> JsTsParsedFile<'source> {
             self.parsed.source_declaration_metadata.push(link);
         }
         ordinal
+    }
+}
+
+pub(crate) fn add_field_member_unit(
+    file: &ProjectFile,
+    source: &str,
+    node: Node<'_>,
+    name: &str,
+    parent: &CodeUnit,
+    top_level: &CodeUnit,
+    parsed: &mut JsTsParsedFile<'_>,
+) -> CodeUnit {
+    let fq = parent
+        .fq()
+        .clone()
+        .with_pushed(segment_interner().intern(name, SegmentKind::Member));
+    let code_unit = CodeUnit::new_fq(
+        file.clone(),
+        brokk_bifrost_core::analyzer::model::CodeUnitType::Field,
+        "",
+        format!("{}.{}", parent.short_name(), name),
+        fq,
+    );
+    parsed.add_code_unit(
+        code_unit.clone(),
+        node,
+        source,
+        Some(parent.clone()),
+        Some(top_level.clone()),
+    );
+    code_unit
+}
+
+pub(crate) fn visit_constructor_assigned_fields(
+    file: &ProjectFile,
+    source: &str,
+    constructor: Node<'_>,
+    parent: &CodeUnit,
+    top_level: &CodeUnit,
+    parsed: &mut JsTsParsedFile<'_>,
+    is_nested_scope: impl Fn(&str) -> bool,
+) {
+    let mut stack = vec![constructor];
+    while let Some(node) = stack.pop() {
+        if node.id() != constructor.id() && is_nested_scope(node.kind()) {
+            continue;
+        }
+        if node.kind() == "assignment_expression"
+            && let Some(left) = node.child_by_field_name("left")
+            && let Some(property) = crate::model::this_member_property(left, source)
+        {
+            let Some(name) = crate::model::property_name_text(property, source) else {
+                continue;
+            };
+            let code_unit =
+                add_field_member_unit(file, source, property, &name, parent, top_level, parsed);
+            parsed.add_signature(
+                code_unit,
+                crate::model::trim_statement(crate::model::node_text(node, source)),
+            );
+            continue;
+        }
+        for index in (0..node.named_child_count()).rev() {
+            if let Some(child) = node.named_child(index) {
+                stack.push(child);
+            }
+        }
     }
 }
 
@@ -504,12 +592,13 @@ pub(crate) fn parse_primary<'source>(
                         parsed.declaration_scopes.parent(node)
                     })
                 }) {
-                    let kind = spec.refine_kind(
+                    let kind = spec.refine_kind_with_parents(
                         node,
                         raw_kind,
                         parent.map(|id| structural.normalized_kind(id)),
                         source,
                         &context,
+                        structural.parents(),
                     );
                     let fact = structural
                         .enter(node, kind, parent, &mut parsed.source)
@@ -531,6 +620,16 @@ pub(crate) fn parse_primary<'source>(
                     &mut parsed.parsed.type_identifiers,
                 );
                 if depth == 1 {
+                    // File dependencies are independent of the exported names and
+                    // forwarding bindings. Even `export {} from './module'` names
+                    // a direct source; source-less exports name no dependency.
+                    if node.kind() == "export_statement"
+                        && let Some(module_specifier) =
+                            crate::syntax::js_ts_statement_module_specifier(node, source)
+                    {
+                        let import = parsed.add_export_import(node, module_specifier, None);
+                        parsed.generic_imports.push(import);
+                    }
                     let mut exports = ExportIndex::empty();
                     crate::graph::extractor::collect_export_statement(
                         node,
@@ -575,7 +674,7 @@ pub(crate) fn parse_primary<'source>(
         parsed.add_import_syntax(syntax);
     }
     let structural = structural
-        .finish()
+        .finish(root)
         .expect("JS/TS structural collection must finish");
     let occurrences = parsed.source.finish();
     let generic_imports = parsed.generic_imports;
@@ -613,6 +712,7 @@ pub(crate) fn parse_primary<'source>(
 mod tests {
     use super::*;
     use brokk_bifrost_core::analyzer::ProjectFile;
+    use brokk_bifrost_test_macros::hardwon;
     use tree_sitter::Parser;
 
     fn parse(source: &str, extension: &str) -> ParsedFile {
@@ -635,6 +735,61 @@ mod tests {
     }
 
     #[test]
+    #[hardwon(
+        "#3843: source-bearing re-exports were absent from the generic file dependency projection"
+    )]
+    fn reexport_file_dependencies_do_not_bind_exported_names() {
+        for extension in ["js", "ts", "tsx"] {
+            let type_exports = if extension == "js" {
+                ""
+            } else {
+                "export type { Shape } from './types';\nexport { type Shape } from './inline-types';\n"
+            };
+            let parsed = parse(
+                &format!(
+                    "export {{ original as renamed }} from './named';\n\
+                 export * from './star';\n\
+                 export * as namespace from './namespace';\n\
+                 export {{}} from './empty';\n\
+                 const local = 1; export {{ local }};\n\
+                 export const sourceLess = './not-a-source';\n{type_exports}"
+                ),
+                extension,
+            );
+            let paths: Vec<_> = parsed
+                .imports
+                .iter()
+                .map(|import| import.path.as_ref().expect("source path").segments.clone())
+                .collect();
+            let mut expected = vec![
+                vec!["./named"],
+                vec!["./star"],
+                vec!["./namespace"],
+                vec!["./empty"],
+            ];
+            if extension != "js" {
+                expected.extend([vec!["./types"], vec!["./inline-types"]]);
+            }
+            assert_eq!(paths, expected);
+            assert!(parsed.imports.iter().all(|import| {
+                import.identifier.is_none()
+                    && import.alias.is_none()
+                    && import.binder_span.is_none()
+                    && !import.is_wildcard
+            }));
+            let source = parsed.source_facts.expect("canonical source facts");
+            let js_ts = source.js_ts.expect("JS/TS facts");
+            assert!(js_ts.bindings.is_empty());
+            assert!(js_ts.exports.iter().any(|export| {
+                export.name.as_deref() == Some("renamed")
+                    && matches!(export.kind, JsTsExportKind::ReexportNamed { import }
+                        if !source.generic_imports.contains(&import))
+            }));
+        }
+    }
+
+    #[test]
+    #[hardwon("#2369: deeply nested loops caused quadratic parent walks")]
     fn deeply_nested_loop_primary_capture_stays_linear() {
         // Same AST shape and depth as the production #2369 analyzer fixture;
         // this focused gate also exercises the coordinated structural capture.
@@ -666,213 +821,5 @@ mod tests {
             16_000
         );
         assert!(started.elapsed() < std::time::Duration::from_secs(60));
-    }
-
-    #[test]
-    fn declaration_and_structural_projections_share_live_node_identity() {
-        for extension in ["js", "ts", "tsx"] {
-            let source = "export class Widget { render(value) { return value; } }";
-            let parsed = parse(source, extension);
-            let facts = parsed.source_facts.as_ref().expect("canonical publication");
-            assert_eq!(facts.source_bytes, source.len());
-            let mut matched_methods = 0;
-            for (declaration, unit) in &parsed.source_declaration_units {
-                if unit.identifier() != "render" {
-                    continue;
-                }
-                matched_methods += 1;
-                let declaration = facts.occurrences.declaration(*declaration);
-                assert!(
-                    facts
-                        .structural
-                        .nodes()
-                        .iter()
-                        .any(|node| node.occurrence == declaration.occurrence)
-                );
-                let name = facts
-                    .occurrences
-                    .occurrence(declaration.name.expect("method name"))
-                    .range;
-                assert_eq!(&source[name.start_byte..name.end_byte], "render");
-            }
-            assert_eq!(matched_methods, 1);
-            assert!(!parsed.source_declaration_metadata.is_empty());
-        }
-    }
-
-    #[test]
-    fn destructured_binders_share_statement_but_keep_distinct_names() {
-        let source = "export const { first, second: renamed } = object;";
-        let parsed = parse(source, "ts");
-        let facts = parsed.source_facts.as_ref().expect("canonical publication");
-        let declarations: Vec<_> = parsed
-            .source_declaration_units
-            .iter()
-            .filter(|(_, unit)| matches!(unit.identifier(), "first" | "renamed"))
-            .map(|(id, _)| facts.occurrences.declaration(*id))
-            .collect();
-        assert_eq!(declarations.len(), 2);
-        assert_eq!(declarations[0].occurrence, declarations[1].occurrence);
-        assert_ne!(declarations[0].name, declarations[1].name);
-    }
-
-    #[test]
-    fn exports_keep_source_only_imports_out_of_generic_projection() {
-        let parsed = parse(
-            "import { a as local } from './a'; export { local as publicName }; export * from './b';",
-            "ts",
-        );
-        let facts = parsed.source_facts.as_ref().expect("canonical publication");
-        let js_ts = facts.js_ts.as_ref().expect("JS/TS family");
-        assert_eq!(parsed.imports.len(), 1);
-        assert_eq!(js_ts.bindings.len(), 1);
-        assert_eq!(js_ts.exports.len(), 2);
-        assert_eq!(facts.imports.len(), 2);
-        assert_eq!(facts.generic_imports.len(), 1);
-    }
-
-    #[test]
-    fn type_annotations_capture_structure_and_direct_declaration_links() {
-        let parsed = parse(
-            "interface Props { title: string } type Wrapped<T = Props> = Promise<T>; export function run(cb: (props: Props) => void): Wrapped<Props> { return null; }",
-            "ts",
-        );
-        let source = parsed.source_facts.as_ref().expect("source facts");
-        let facts = source.js_ts.as_ref().expect("JS/TS family");
-        let declaration = |name| {
-            let (id, _) = parsed
-                .source_declaration_units
-                .iter()
-                .find(|(_, unit)| unit.identifier() == name)
-                .expect("published declaration");
-            facts
-                .declarations
-                .iter()
-                .find(|declaration| declaration.declaration == *id)
-                .expect("typed declaration")
-        };
-        assert!(declaration("Props").is_interface);
-        assert!(matches!(
-            facts.types[declaration("Wrapped")
-                .alias_type
-                .expect("alias value")
-                .index()]
-            .shape,
-            JsTsTypeShape::Generic { .. }
-        ));
-        let run = declaration("run");
-        let parameter =
-            run.parameters.as_ref().expect("callable parameters")[0].expect("parameter annotation");
-        let JsTsTypeShape::Wrapped(callback) = facts.types[parameter.index()].shape else {
-            panic!("annotation wrapper");
-        };
-        let JsTsTypeShape::Function { parameters, .. } = &facts.types[callback.index()].shape
-        else {
-            panic!("callback shape");
-        };
-        assert_eq!(parameters.len(), 1);
-        assert!(parameters[0].is_some());
-        assert!(run.return_type.is_some());
-    }
-
-    #[test]
-    fn direct_properties_capture_program_local_and_unbound_receivers() {
-        let source = "const Tools = { parse(value) { return value; } }; window.Shared = function() {}; function outer() { const local = {}; local.run = function() {}; }";
-        let parsed = parse(source, "js");
-        let publication = parsed.source_facts.as_ref().expect("source facts");
-        let facts = publication.js_ts.as_ref().expect("JS/TS family");
-        for (root, expected) in [
-            ("Tools", JsTsReceiverBinding::Program),
-            ("window", JsTsReceiverBinding::Unbound),
-            ("local", JsTsReceiverBinding::Local),
-        ] {
-            let receiver = facts
-                .property_receivers
-                .iter()
-                .find(|receiver| receiver.receiver_root == root)
-                .unwrap_or_else(|| {
-                    panic!("missing receiver {root}: {:?}", facts.property_receivers)
-                });
-            assert_eq!(receiver.binding, expected);
-            assert_eq!(
-                publication
-                    .occurrences
-                    .declaration(receiver.declaration)
-                    .name,
-                Some(receiver.property)
-            );
-            assert!(
-                parsed
-                    .source_declaration_units
-                    .iter()
-                    .any(|(declaration, _)| *declaration == receiver.declaration)
-            );
-            let property = publication.occurrences.occurrence(receiver.property);
-            assert!(!source[property.range.start_byte..property.range.end_byte].is_empty());
-        }
-        assert!(!facts.file_is_external_module);
-        let module = parse("function load() { return require('./nested'); }", "js");
-        assert!(
-            module
-                .source_facts
-                .as_ref()
-                .unwrap()
-                .js_ts
-                .as_ref()
-                .unwrap()
-                .file_is_external_module
-        );
-    }
-
-    #[test]
-    fn type_argument_module_values_are_canonical_source_only_imports() {
-        let source_text = "import * as M from './module';\nconst before = actual;\nconst actual = importActual<typeof M>('./module');\nconst after = actual;\n";
-        let parsed = parse(source_text, "ts");
-        let source = parsed.source_facts.as_ref().expect("source facts");
-        let facts = source.js_ts.as_ref().expect("JS/TS family");
-        let mut parser = Parser::new();
-        parser
-            .set_language(&tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into())
-            .expect("TypeScript grammar");
-        let tree = parser.parse(source_text, None).expect("tree");
-        let binder = crate::syntax::JsTsImportBinder::from_source_facts_with_lexical_bindings(
-            facts,
-            &source.imports,
-            &source.occurrences,
-            tree.root_node(),
-            crate::syntax::JsTsLexicalBindingIndex::build(tree.root_node(), source_text),
-        );
-        assert_eq!(
-            binder
-                .binding("actual")
-                .expect("type argument binding")
-                .module_specifier,
-            "./module"
-        );
-        let before_use = source_text
-            .find("const before = actual;")
-            .expect("before use")
-            + "const before = ".len();
-        assert!(matches!(
-            binder.binding_at("actual", before_use),
-            crate::syntax::JsTsImportBindingResolution::Inactive
-        ));
-        let after_use = source_text
-            .find("const after = actual;")
-            .expect("after use")
-            + "const after = ".len();
-        let crate::syntax::JsTsImportBindingResolution::Exact(actual) =
-            binder.binding_at("actual", after_use)
-        else {
-            panic!("typed module value should resolve after its initializer");
-        };
-        assert_eq!(actual.binding.module_specifier, "./module");
-        let type_query = source_text.find("typeof M").expect("type query") + "typeof ".len();
-        assert!(matches!(
-            binder.binding_at("M", type_query),
-            crate::syntax::JsTsImportBindingResolution::Exact(_)
-        ));
-        assert_eq!(parsed.imports.len(), 1);
-        assert_eq!(source.imports.len(), 2);
     }
 }

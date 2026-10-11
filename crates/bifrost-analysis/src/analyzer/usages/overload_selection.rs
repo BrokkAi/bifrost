@@ -21,11 +21,11 @@
 //!   from verdict *counts*: zero applicable candidates stay `unresolved`, and
 //!   several equally applicable candidates stay `ambiguous` with every row
 //!   retained. Reordering the candidate vector cannot change the summary.
-//! - An undecidable site says so. A language whose resolver does not report the
-//!   callable axis, a site with no trace at all, or a site where any considered
-//!   candidate's verdict is `unknown` yields `unknown_shape` -- never a
-//!   confident `unresolved` that a policy would read as a proven-empty overload
-//!   set.
+//! - An undecidable site says so. A language whose resolver does not report
+//!   the callable axis, a site with no trace at all, a trace that records only
+//!   selected candidates, or a site where any considered candidate's verdict
+//!   is `unknown` yields `unknown_shape` -- never a confident result that a
+//!   policy would read as an exhaustive overload set.
 //!
 //! The site's *shape* coverage is deliberately not duplicated here. It is the
 //! `call_shape` row's field, joined on the same `site_ast_id`; deriving it a
@@ -167,6 +167,7 @@ pub fn overload_selection_report(
             resolution: resolution_of(
                 supported,
                 trace.is_some(),
+                trace.is_some_and(|trace| trace.completeness.covers_rejections()),
                 applicability.len(),
                 applicable,
                 unknown,
@@ -192,6 +193,7 @@ fn count_of(rows: &[ApplicabilityRow], verdict: ApplicabilityVerdict) -> usize {
 fn resolution_of(
     supported: bool,
     traced: bool,
+    trace_covers_rejections: bool,
     considered: usize,
     applicable: usize,
     unknown: usize,
@@ -201,7 +203,7 @@ fn resolution_of(
     // seam that recorded no candidate -- has proved nothing about an overload
     // set, and calling that `unresolved` would let a policy read "the resolver
     // rejected every overload" out of "the resolver never looked".
-    if !supported || !traced || considered == 0 || unknown > 0 {
+    if !supported || !traced || !trace_covers_rejections || considered == 0 || unknown > 0 {
         return SelectionResolution::UnknownShape;
     }
     match applicable {
@@ -231,17 +233,7 @@ mod tests {
     use crate::analyzer::usages::get_definition::trace::{
         CallableApplicabilityRecord, TraceCandidate, TraceCompleteness,
     };
-    use brokk_bifrost_core::analyzer::model::{CodeUnitType, ProjectFile};
-
-    fn unit(name: &str) -> CodeUnit {
-        let file = ProjectFile::new(std::env::temp_dir(), "Main.java");
-        CodeUnit::new(
-            file,
-            CodeUnitType::Function,
-            "app",
-            format!("Widget.{name}"),
-        )
-    }
+    use crate::analyzer::usages::test_unit as unit;
 
     fn record(
         verdict: ApplicabilityVerdict,
@@ -274,34 +266,6 @@ mod tests {
         }
     }
 
-    /// The selected overload is applicable and every refused overload stays
-    /// visible with the exact reason it lost.
-    #[test]
-    fn one_winner_beside_refused_overloads_resolves_uniquely() {
-        let traced = trace(vec![
-            selected("render", ApplicabilityVerdict::Applicable),
-            rejected("render", CallableRejectionReason::ArityBelowRequired),
-            rejected("render", CallableRejectionReason::ArityAboveTotal),
-        ]);
-        let report = overload_selection_report("site", true, Some(&traced));
-        assert_eq!(
-            report.selection.resolution,
-            SelectionResolution::ResolvedUnique
-        );
-        assert_eq!(report.selection.considered, 3);
-        assert_eq!(report.selection.applicable, 1);
-        assert_eq!(report.selection.inapplicable, 2);
-        assert!(report.applicability[0].selected);
-        assert_eq!(
-            report.applicability[1].reason,
-            Some(CallableRejectionReason::ArityBelowRequired)
-        );
-        assert_eq!(
-            report.applicability[2].reason,
-            Some(CallableRejectionReason::ArityAboveTotal)
-        );
-    }
-
     /// Two equally applicable winners stay ambiguous with both rows retained,
     /// and no permutation of the candidate vector changes that.
     #[test]
@@ -332,7 +296,6 @@ mod tests {
         assert_eq!(report.selection.resolution, SelectionResolution::Unresolved);
         assert_eq!(report.applicability.len(), 2);
     }
-
     /// One undecidable candidate makes the whole site undecidable: an
     /// exact-cardinality assertion over it must never come out clean.
     #[test]
@@ -347,6 +310,24 @@ mod tests {
             SelectionResolution::UnknownShape
         );
         assert_eq!(report.selection.unknown, 1);
+    }
+
+    /// A selection-only trace records native winners but cannot prove that
+    /// they exhaust the overload set. Keep the candidate rows while withholding
+    /// a complete site-level result.
+    #[test]
+    fn selection_only_trace_keeps_rows_without_proving_site_selection() {
+        let traced = ResolutionTraceResult {
+            candidates: vec![selected("render", ApplicabilityVerdict::Applicable)],
+            completeness: TraceCompleteness::SelectionOnly,
+        };
+        let report = overload_selection_report("site", true, Some(&traced));
+        assert_eq!(report.applicability.len(), 1);
+        assert_eq!(report.selection.applicable, 1);
+        assert_eq!(
+            report.selection.resolution,
+            SelectionResolution::UnknownShape
+        );
     }
 
     /// A language that does not report the axis, and a site with no trace at
@@ -375,7 +356,6 @@ mod tests {
         assert_eq!(untraced.selection.considered, 0);
         assert!(untraced.applicability.is_empty());
     }
-
     /// A trace that enumerated no candidate at all proves nothing about an
     /// overload set. "The resolver rejected every overload" and "the resolver
     /// never looked" are different answers, and only the first is
@@ -410,7 +390,6 @@ mod tests {
             ApplicabilityVerdict::Unknown
         );
     }
-
     /// Row identities are deterministic and distinct per candidate, which is
     /// what keeps two rows of one site from deduplicating into one.
     #[test]

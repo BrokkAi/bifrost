@@ -1,17 +1,13 @@
 use brokk_bifrost_core::analyzer::fq_name::{
-    FqName, SegmentId, SegmentKind, joined_segments, normalize_joined, segment_interner,
+    FqName, SegmentKind, joined_segments, normalize_joined, segment_interner,
 };
 use brokk_bifrost_core::analyzer::model::{
-    CodeUnitType, ImportInfo, ParameterMetadata, Range, SignatureMetadata, StructuredImportPath,
-    StructuredImportPathKind, StructuredTypeIdentity, StructuredTypeIdentityBuilder,
-    StructuredTypeName,
+    CodeUnitType, ParameterMetadata, Range, SignatureMetadata, StructuredTypeIdentity,
+    StructuredTypeIdentityBuilder, StructuredTypeName,
 };
-use brokk_bifrost_core::analyzer::parsed_file::{
-    ParsedFile, ParsedSourceFacts, SourceDeclarationMetadataLink,
-};
+use brokk_bifrost_core::analyzer::parsed_file::{ParsedFile, ParsedSourceFacts};
 use brokk_bifrost_core::analyzer::source_facts::{PrimarySourceFactCollector, SourceImportId};
 use brokk_bifrost_core::analyzer::structural::collector::StructuralFactCollector;
-use brokk_bifrost_core::analyzer::structural::facts::Span;
 use brokk_bifrost_core::analyzer::structural::resolution::DeclaredVisibility;
 use brokk_bifrost_core::analyzer::structural::spec::{CompiledKinds, StructuralSpec};
 use brokk_bifrost_core::analyzer::tree_walk::ParentIndex;
@@ -22,17 +18,12 @@ use brokk_bifrost_core::analyzer::{CodeUnit, ProjectFile};
 use tree_sitter::{Node, Point, Tree};
 
 use crate::aliases::{
-    PhpFileContext, PhpFileContextIndex, PhpUseAliases, module_constant_fq,
-    php_use_aliases_from_node, resolve_php_type_node,
+    PhpFileContext, PhpUseAliases, module_constant_fq, php_use_aliases_from_node,
+    resolve_php_type_node,
 };
 use crate::graph::syntax::{instanceof_type_node, object_creation_type, static_member_parts};
 use crate::source_properties::PhpSourcePropertyCollector;
 use brokk_bifrost_core::analyzer::php_facts::PhpDeclaredSourceType;
-
-/// Intern one qualified-name segment in the process-global interner.
-fn php_segment(text: &str, kind: SegmentKind) -> SegmentId {
-    segment_interner().intern(text, kind)
-}
 
 /// PHP's `\`-separated namespace path is stored `.`-joined in `package_name`.
 const PHP_PACKAGE_SEPARATOR: &str = ".";
@@ -54,7 +45,7 @@ const PHP_PACKAGE_SEPARATOR: &str = ".";
 fn php_package_fq(package_name: &str) -> FqName {
     let mut fq = FqName::new();
     for component in joined_segments(package_name, PHP_PACKAGE_SEPARATOR) {
-        fq.push(php_segment(component, SegmentKind::Package));
+        fq.push(segment_interner().intern(component, SegmentKind::Package));
     }
     fq
 }
@@ -75,56 +66,7 @@ pub fn parse_php_file(file: &ProjectFile, source: &str, tree: &Tree) -> ParsedFi
     // file-level qualifier above.
     visitor.visit_children(tree.root_node(), &PhpScope::new(String::new(), None));
     collect_php_imported_type_names(tree.root_node(), source, &mut parsed.type_identifiers);
-    parsed.imports = collect_php_import_infos(tree.root_node(), source);
     parsed
-}
-
-/// The local names this file's `use` declarations introduce, one row per bound
-/// name.
-///
-/// One row per binding is the shape the store holds (migration 0019) and the
-/// shape the lexical-environment layer joins its import binders from: the
-/// binder span points at the exact token that spells the local name, so an
-/// aliased import and a same-named local stay distinguishable without reading
-/// the snippet. The clauses come from [`PhpFileContextIndex`], which already
-/// visits every `use` declaration with the namespace it is written in, so
-/// nothing here re-walks `namespace_use_declaration`.
-///
-/// PHP has no wildcard import. `use Foo\{A, B}` is a group, which the index
-/// expands into one binding per clause, and `use Foo\Bar` binds exactly the
-/// tail name, so `is_wildcard` is always false.
-fn collect_php_import_infos(root: Node<'_>, source: &str) -> Vec<ImportInfo> {
-    let Some(index) = PhpFileContextIndex::from_tree(root, source, || true) else {
-        return Vec::new();
-    };
-    let mut imports = Vec::new();
-    for declaration in index.use_declarations() {
-        let raw_snippet = source[declaration.start_byte..declaration.end_byte].to_owned();
-        for binding in &declaration.bindings {
-            let imported = binding.segments.last().cloned();
-            let alias = (imported.as_deref() != Some(binding.local.as_str()))
-                .then(|| binding.local.clone());
-            imports.push(ImportInfo {
-                raw_snippet: raw_snippet.clone(),
-                is_wildcard: false,
-                is_global: false,
-                identifier: imported,
-                alias,
-                path: Some(StructuredImportPath {
-                    segments: binding.segments.clone(),
-                    kind: Some(StructuredImportPathKind::Namespace),
-                    lexical_prefixes: Vec::new(),
-                    lexical_scopes: Vec::new(),
-                    declaration_start_byte: declaration.start_byte,
-                }),
-                binder_span: Some(Span {
-                    start_byte: binding.binder_start,
-                    end_byte: binding.binder_end,
-                }),
-            });
-        }
-    }
-    imports
 }
 
 /// The workspace-visible FQ names one PHP file imports.
@@ -414,6 +356,25 @@ impl<'a> PhpVisitor<'a> {
                     ));
                 self.properties.add_aliases(aliases);
             }
+            if matches!(
+                node.kind(),
+                "include_expression"
+                    | "include_once_expression"
+                    | "require_expression"
+                    | "require_once_expression"
+            ) {
+                let expression = (node.named_child_count() == 1)
+                    .then(|| node.named_child(0))
+                    .flatten();
+                self.properties
+                    .imports
+                    .push(crate::imports::project_include_source_fact(
+                        node,
+                        expression,
+                        self.source,
+                        &mut self.source_facts,
+                    ));
+            }
             self.properties
                 .capture(node, self.source, &mut self.source_facts);
             self.properties
@@ -466,9 +427,19 @@ impl<'a> PhpVisitor<'a> {
             .iter()
             .map(|import| import.import_info(&source_facts))
             .collect();
-        let generic_imports = (0..imports.len())
+        let generic_imports: Vec<SourceImportId> = (0..imports.len())
             .map(|index| SourceImportId::try_from_index(index).expect("PHP import ids fit in u32"))
             .collect();
+        // The store zips `parsed.imports` with the generic projection
+        // positionally, so the 1:1 shape is a producer contract, not a
+        // coincidence (#4288: the last filtered reinterpretation of
+        // `parsed.imports` panicked the store on a trailing-comma group
+        // `use`).
+        assert_eq!(
+            self.parsed.imports.len(),
+            generic_imports.len(),
+            "PHP parsed imports project the canonical source imports one to one"
+        );
         let php = std::mem::take(&mut self.properties.facts);
         assert!(
             php.valid_links(&source_facts, &imports),
@@ -486,7 +457,7 @@ impl<'a> PhpVisitor<'a> {
             source_bytes: self.source.len(),
             occurrences: source_facts,
             structural: structural
-                .finish()
+                .finish(root)
                 .expect("complete PHP preparation has no structural admission limit"),
             native_site_occurrences: Vec::new(),
             native_declaration_sources: Vec::new(),
@@ -543,16 +514,8 @@ impl<'a> PhpVisitor<'a> {
         metadata: SignatureMetadata,
     ) {
         let declaration = self.properties.declaration(node).declaration;
-        let metadata_ordinal = self
-            .parsed
-            .add_signature_with_metadata(unit.clone(), metadata);
         self.parsed
-            .source_declaration_metadata
-            .push(SourceDeclarationMetadataLink {
-                declaration,
-                unit,
-                metadata_ordinal,
-            });
+            .add_signature_with_source_declaration_metadata(declaration, unit, metadata);
     }
 
     fn visit_node<'tree>(
@@ -626,9 +589,9 @@ impl<'a> PhpVisitor<'a> {
             Some(parent) => parent
                 .fq()
                 .clone()
-                .with_pushed(php_segment(&name, SegmentKind::Nested)),
+                .with_pushed(segment_interner().intern(&name, SegmentKind::Nested)),
             None => php_package_fq(&scope.package_name)
-                .with_pushed(php_segment(&name, SegmentKind::Type)),
+                .with_pushed(segment_interner().intern(&name, SegmentKind::Type)),
         };
         let code_unit = CodeUnit::new_fq(
             self.file.clone(),
@@ -674,9 +637,9 @@ impl<'a> PhpVisitor<'a> {
             Some(parent) => parent
                 .fq()
                 .clone()
-                .with_pushed(php_segment(&name, SegmentKind::Member)),
+                .with_pushed(segment_interner().intern(&name, SegmentKind::Member)),
             None => php_package_fq(&scope.package_name)
-                .with_pushed(php_segment(&name, SegmentKind::Member)),
+                .with_pushed(segment_interner().intern(&name, SegmentKind::Member)),
         };
         let code_unit = CodeUnit::new_fq(
             self.file.clone(),
@@ -737,7 +700,7 @@ impl<'a> PhpVisitor<'a> {
                 parent
                     .fq()
                     .clone()
-                    .with_pushed(php_segment(stripped_name, SegmentKind::Member)),
+                    .with_pushed(segment_interner().intern(stripped_name, SegmentKind::Member)),
             );
             self.link_declaration(&code_unit, child, name_node);
             self.parsed.add_code_unit_with_range(
@@ -798,10 +761,10 @@ impl<'a> PhpVisitor<'a> {
                 Some(parent) => parent
                     .fq()
                     .clone()
-                    .with_pushed(php_segment(&name, SegmentKind::Member)),
+                    .with_pushed(segment_interner().intern(&name, SegmentKind::Member)),
                 None => php_package_fq(&scope.package_name)
-                    .with_pushed(php_segment("_module_", SegmentKind::Package))
-                    .with_pushed(php_segment(&name, SegmentKind::Member)),
+                    .with_pushed(segment_interner().intern("_module_", SegmentKind::Package))
+                    .with_pushed(segment_interner().intern(&name, SegmentKind::Member)),
             };
             let code_unit = CodeUnit::new_fq(
                 self.file.clone(),
@@ -841,16 +804,8 @@ impl<'a> PhpVisitor<'a> {
         if name.is_empty() {
             return;
         }
-        let code_unit = CodeUnit::new_fq(
-            self.file.clone(),
-            CodeUnitType::Field,
-            scope.package_name.clone(),
-            format!("{}.{}", parent.short_name(), name),
-            parent
-                .fq()
-                .clone()
-                .with_pushed(php_segment(&name, SegmentKind::Member)),
-        );
+        let code_unit =
+            CodeUnit::new_member_field(self.file.clone(), scope.package_name.clone(), parent, name);
         self.link_declaration(&code_unit, node, name_node);
         self.parsed.add_code_unit_with_range(
             code_unit.clone(),
@@ -892,7 +847,7 @@ impl<'a> PhpVisitor<'a> {
                 parent
                     .fq()
                     .clone()
-                    .with_pushed(php_segment(stripped_name, SegmentKind::Member)),
+                    .with_pushed(segment_interner().intern(stripped_name, SegmentKind::Member)),
             );
             self.link_declaration(&code_unit, parameter, name_node);
             self.parsed.add_code_unit_with_range(
@@ -1165,18 +1120,7 @@ fn php_parameter_label_nodes(parameters_node: Node<'_>) -> Vec<Node<'_>> {
 }
 
 fn php_property_prefix(node: Node<'_>, source: &str) -> String {
-    let mut parts = php_attribute_lines(node, source);
-    let mut cursor = node.walk();
-    for child in node.named_children(&mut cursor) {
-        match child.kind() {
-            "visibility_modifier"
-            | "static_modifier"
-            | "readonly_modifier"
-            | "abstract_modifier"
-            | "final_modifier" => parts.push(php_node_text(child, source).trim().to_string()),
-            _ => {}
-        }
-    }
+    let parts = php_attribute_modifier_parts(node, source);
     if parts.is_empty() {
         String::new()
     } else {
@@ -1185,6 +1129,12 @@ fn php_property_prefix(node: Node<'_>, source: &str) -> String {
 }
 
 fn php_const_prefix(node: Node<'_>, source: &str) -> String {
+    let mut parts = php_attribute_modifier_parts(node, source);
+    parts.push("const".to_string());
+    format!("{} ", parts.join(" "))
+}
+
+fn php_attribute_modifier_parts(node: Node<'_>, source: &str) -> Vec<String> {
     let mut parts = php_attribute_lines(node, source);
     let mut cursor = node.walk();
     for child in node.named_children(&mut cursor) {
@@ -1197,8 +1147,7 @@ fn php_const_prefix(node: Node<'_>, source: &str) -> String {
             _ => {}
         }
     }
-    parts.push("const".to_string());
-    format!("{} ", parts.join(" "))
+    parts
 }
 
 fn php_attribute_lines(node: Node<'_>, source: &str) -> Vec<String> {
@@ -1348,18 +1297,15 @@ fn php_type_declaration_kind(kind: &str) -> bool {
 }
 
 fn php_declaration_kind(kind: &str) -> bool {
-    matches!(
-        kind,
-        "class_declaration"
-            | "interface_declaration"
-            | "trait_declaration"
-            | "enum_declaration"
-            | "function_definition"
-            | "method_declaration"
-            | "property_declaration"
-            | "const_declaration"
-            | "enum_case"
-    )
+    php_type_declaration_kind(kind)
+        || matches!(
+            kind,
+            "function_definition"
+                | "method_declaration"
+                | "property_declaration"
+                | "const_declaration"
+                | "enum_case"
+        )
 }
 
 fn php_is_literal(node: Node<'_>) -> bool {
@@ -1378,7 +1324,9 @@ fn php_is_literal(node: Node<'_>) -> bool {
 }
 
 fn php_node_text(node: Node<'_>, source: &str) -> String {
-    source[node.start_byte()..node.end_byte()].to_string()
+    brokk_bifrost_core::analyzer::common::try_node_source_text(node, source)
+        .expect("PHP declaration nodes must point into UTF-8 source")
+        .to_owned()
 }
 
 fn php_const_value(node: Node<'_>) -> Option<Node<'_>> {
@@ -1391,16 +1339,7 @@ fn php_const_value(node: Node<'_>) -> Option<Node<'_>> {
 }
 
 fn php_find_named_descendant<'a>(node: Node<'a>, kind: &str) -> Option<Node<'a>> {
-    let mut stack = vec![node];
-    while let Some(node) = stack.pop() {
-        if node.kind() == kind {
-            return Some(node);
-        }
-        let mut cursor = node.walk();
-        let children = node.named_children(&mut cursor).collect::<Vec<_>>();
-        stack.extend(children.into_iter().rev());
-    }
-    None
+    brokk_bifrost_core::analyzer::tree_walk::first_named_descendant_of_kind_inclusive(node, kind)
 }
 
 fn normalize_php_snippet(snippet: &str) -> String {
@@ -1422,6 +1361,206 @@ fn php_range(start_byte: usize, start: Point, end_byte: usize, end: Point) -> Ra
 }
 
 #[cfg(test)]
+mod callable_modifier_tests {
+    use super::*;
+    use brokk_bifrost_test_macros::hardwon;
+    use tree_sitter::Parser;
+
+    /// The PHP half of #2912. A `function_definition` at namespace scope binds
+    /// no receiver, a `method_declaration` binds one unless it declares
+    /// `static`, and every callable states that the walk read its modifiers.
+    /// An abstract method and an interface method are included because both
+    /// are body-less `method_declaration` nodes that the same walk must key.
+    #[test]
+    #[hardwon("#2912: PHP callable receiver metadata was missing, preventing procedure keys")]
+    fn callable_metadata_records_php_static_structurally() {
+        let source = "<?php\nnamespace App;\n\nfunction free(string $value): string { return $value; }\n\nabstract class Widget {\n    public function __construct(string $spec) {}\n    public static function build(string $spec): Widget { return new Widget($spec); }\n    public function render(string $target): string { return $target; }\n    abstract protected function measure(string $target): int;\n    private static function reset(): void {}\n}\n\ninterface Renders {\n    public function paint(string $target): string;\n}\n";
+        let file = ProjectFile::new(std::env::temp_dir(), "widget.php");
+        let mut parser = Parser::new();
+        parser
+            .set_language(&tree_sitter_php::LANGUAGE_PHP.into())
+            .expect("PHP parser language");
+        let tree = parser.parse(source, None).expect("parse PHP fixture");
+        let parsed = parse_php_file(&file, source, &tree);
+
+        let modifiers = |fq_name: &str| {
+            let metadata = parsed
+                .signature_metadata
+                .iter()
+                .find(|(unit, _)| unit.fq_name() == fq_name)
+                .and_then(|(_, metadata)| metadata.first())
+                .unwrap_or_else(|| {
+                    panic!(
+                        "missing PHP callable {fq_name}; recorded {:?}",
+                        parsed
+                            .signature_metadata
+                            .keys()
+                            .map(CodeUnit::fq_name)
+                            .collect::<Vec<_>>()
+                    )
+                });
+            assert!(
+                metadata.callable_modifiers_recorded(),
+                "{fq_name} must record that the walk read its modifiers"
+            );
+            (
+                metadata.callable_is_static(),
+                metadata.callable_is_constructor(),
+                metadata.parameters().len(),
+            )
+        };
+
+        assert_eq!(modifiers("App.free"), (true, false, 1));
+        assert_eq!(modifiers("App.Widget.__construct"), (false, false, 1));
+        assert_eq!(modifiers("App.Widget.build"), (true, false, 1));
+        assert_eq!(modifiers("App.Widget.render"), (false, false, 1));
+        assert_eq!(modifiers("App.Widget.measure"), (false, false, 1));
+        assert_eq!(modifiers("App.Widget.reset"), (true, false, 0));
+        assert_eq!(modifiers("App.Renders.paint"), (false, false, 1));
+    }
+}
+
+#[cfg(test)]
+mod imported_type_name_tests {
+    use super::*;
+    use brokk_bifrost_test_macros::hardwon;
+    use tree_sitter::Parser;
+
+    fn imported_names(source: &str) -> Vec<String> {
+        let file = ProjectFile::new(std::env::temp_dir(), "collector.php");
+        let mut parser = Parser::new();
+        parser
+            .set_language(&tree_sitter_php::LANGUAGE_PHP.into())
+            .expect("PHP parser language");
+        let tree = parser.parse(source, None).expect("parse PHP fixture");
+        let parsed = parse_php_file(&file, source, &tree);
+        let mut names: Vec<String> = parsed.type_identifiers.into_iter().collect();
+        names.sort();
+        names
+    }
+
+    /// #1713: an unqualified name inside `namespace N;` binds to `N\Name` with
+    /// no `use` declaration, so every reference position resolves against the
+    /// file's own namespace. A `use` alias overrides that, an absolute `\Name`
+    /// escapes it, and the file's own declaration is not an import.
+    #[test]
+    #[hardwon("#1713: same-namespace PHP references produced no import edges")]
+    fn same_namespace_references_resolve_without_a_use_declaration() {
+        let names = imported_names(
+            "<?php\nnamespace FastRoute;\n\nuse Other\\Helper as Aid;\n\nclass Collector extends Base implements Marker {\n    use Mixin;\n\n    private DataGenerator $generator;\n\n    public function build(RouteParser $parser): Result {\n        $made = new Handler();\n        Aid::make();\n        Settings::LIMIT;\n        if ($made instanceof Guard) {\n            return $made;\n        }\n        try {\n            return $parser;\n        } catch (\\RuntimeException $error) {\n            throw $error;\n        }\n    }\n}\n",
+        );
+
+        assert_eq!(
+            names,
+            vec![
+                "FastRoute.Base".to_string(),
+                "FastRoute.DataGenerator".to_string(),
+                "FastRoute.Guard".to_string(),
+                "FastRoute.Handler".to_string(),
+                "FastRoute.Marker".to_string(),
+                "FastRoute.Mixin".to_string(),
+                "FastRoute.Result".to_string(),
+                "FastRoute.RouteParser".to_string(),
+                "FastRoute.Settings".to_string(),
+                "Other.Helper".to_string(),
+                "RuntimeException".to_string(),
+            ]
+        );
+    }
+
+    /// A `use` alias wins over the namespace rule, which is PHP's own
+    /// precedence: the file names `RouteParser`, and the name it binds is the
+    /// aliased one, not the same-namespace one.
+    #[test]
+    #[hardwon("#1713: a use alias failed to override the current namespace")]
+    fn a_use_alias_shadows_the_same_namespace_name() {
+        let names = imported_names(
+            "<?php\nnamespace FastRoute;\n\nuse Other\\RouteParser;\n\nclass Collector {\n    public function build(RouteParser $parser): void {}\n}\n",
+        );
+
+        assert_eq!(names, vec!["Other.RouteParser".to_string()]);
+    }
+
+    /// A `use function` / `use const` clause names a declaration made in
+    /// another file exactly as a class `use` does. A constant is stored under
+    /// the module-constant identity its declaration carries.
+    #[test]
+    #[hardwon("#1713: function and constant use clauses were absent from import facts")]
+    fn function_and_constant_use_clauses_are_imports() {
+        let names = imported_names(
+            "<?php\nnamespace FastRoute;\n\nuse function Other\\render;\nuse const Other\\LIMIT;\n\nclass Collector {}\n",
+        );
+
+        assert_eq!(
+            names,
+            vec![
+                "Other._module_.LIMIT".to_string(),
+                "Other.render".to_string()
+            ]
+        );
+    }
+
+    /// Each `namespace N { ... }` block carries its own namespace and its own
+    /// aliases, so a bare name resolves against the block it is written in.
+    #[test]
+    #[hardwon("#1713: references leaked across braced namespace blocks")]
+    fn scoped_namespace_blocks_resolve_against_their_own_namespace() {
+        let names = imported_names(
+            "<?php\nnamespace First {\n    class One {\n        public function run(Shared $value): void {}\n    }\n}\nnamespace Second {\n    class Two {\n        public function run(Shared $value): void {}\n    }\n}\n",
+        );
+
+        assert_eq!(
+            names,
+            vec!["First.Shared".to_string(), "Second.Shared".to_string()]
+        );
+    }
+}
+
+#[cfg(test)]
+mod include_import_grammar_tests {
+    use tree_sitter::Parser;
+
+    #[test]
+    fn each_php_include_form_has_one_named_expression_child() {
+        let source =
+            "<?php include 'a.php'; include_once 'b.php'; require 'c.php'; require_once 'd.php';";
+        let mut parser = Parser::new();
+        parser
+            .set_language(&tree_sitter_php::LANGUAGE_PHP.into())
+            .expect("PHP parser language");
+        let tree = parser.parse(source, None).expect("parse PHP fixture");
+        let expected = [
+            "include_expression",
+            "include_once_expression",
+            "require_expression",
+            "require_once_expression",
+        ];
+        let mut found = Vec::new();
+        let mut stack = vec![tree.root_node()];
+        while let Some(node) = stack.pop() {
+            if expected.contains(&node.kind()) {
+                found.push(node.kind());
+                assert_eq!(
+                    node.named_child_count(),
+                    1,
+                    "{} has one expression",
+                    node.kind()
+                );
+            }
+            for index in 0..node.child_count() {
+                if let Some(child) = node.child(index) {
+                    stack.push(child);
+                }
+            }
+        }
+        found.sort_unstable();
+        let mut expected = expected.to_vec();
+        expected.sort_unstable();
+        assert_eq!(found, expected);
+    }
+}
+
+#[cfg(test)]
 mod source_fact_tests {
     use super::*;
     use brokk_bifrost_core::analyzer::php_facts::{PhpDeclarationKind, PhpFieldWriteKind};
@@ -1429,11 +1568,7 @@ mod source_fact_tests {
     use std::path::PathBuf;
 
     fn parsed(source: &str) -> ParsedFile {
-        let mut parser = tree_sitter::Parser::new();
-        parser
-            .set_language(&tree_sitter_php::LANGUAGE_PHP.into())
-            .unwrap();
-        let tree = parser.parse(source, None).unwrap();
+        let tree = crate::aliases::parse_php_tree(source).expect("PHP source parses");
         let file = ProjectFile::new(std::env::temp_dir(), PathBuf::from("m4-php.php"));
         parse_php_file(&file, source, &tree)
     }
@@ -1578,6 +1713,7 @@ class Holder {
         for source in [
             "<?php use ; class C {}",
             "<?php use Vendor\\Thing as ;",
+            "<?php use Vendor\\{A, B,};",
             "<?php class { function broken( {}",
             "<html>Hi</html><?php use Vendor\\Thing; ?>tail",
         ] {
@@ -1590,155 +1726,12 @@ class Holder {
                     .unwrap()
                     .valid_links(&source_facts.occurrences, &source_facts.imports)
             );
+            // #4288: the store zips the generic import list with the canonical
+            // source imports by ordinal, so recovery shapes (a trailing-comma
+            // group inserts a phantom clause with an empty name) must not
+            // desync the two projections.
+            assert_eq!(parsed.imports.len(), source_facts.imports.len());
+            assert_eq!(parsed.imports.len(), source_facts.generic_imports.len());
         }
-    }
-}
-
-#[cfg(test)]
-mod callable_modifier_tests {
-    use super::*;
-    use tree_sitter::Parser;
-
-    /// The PHP half of #2912. A `function_definition` at namespace scope binds
-    /// no receiver, a `method_declaration` binds one unless it declares
-    /// `static`, and every callable states that the walk read its modifiers.
-    /// An abstract method and an interface method are included because both
-    /// are body-less `method_declaration` nodes that the same walk must key.
-    #[test]
-    fn callable_metadata_records_php_static_structurally() {
-        let source = "<?php\nnamespace App;\n\nfunction free(string $value): string { return $value; }\n\nabstract class Widget {\n    public function __construct(string $spec) {}\n    public static function build(string $spec): Widget { return new Widget($spec); }\n    public function render(string $target): string { return $target; }\n    abstract protected function measure(string $target): int;\n    private static function reset(): void {}\n}\n\ninterface Renders {\n    public function paint(string $target): string;\n}\n";
-        let file = ProjectFile::new(std::env::temp_dir(), "widget.php");
-        let mut parser = Parser::new();
-        parser
-            .set_language(&tree_sitter_php::LANGUAGE_PHP.into())
-            .expect("PHP parser language");
-        let tree = parser.parse(source, None).expect("parse PHP fixture");
-        let parsed = parse_php_file(&file, source, &tree);
-
-        let modifiers = |fq_name: &str| {
-            let metadata = parsed
-                .signature_metadata
-                .iter()
-                .find(|(unit, _)| unit.fq_name() == fq_name)
-                .and_then(|(_, metadata)| metadata.first())
-                .unwrap_or_else(|| {
-                    panic!(
-                        "missing PHP callable {fq_name}; recorded {:?}",
-                        parsed
-                            .signature_metadata
-                            .keys()
-                            .map(CodeUnit::fq_name)
-                            .collect::<Vec<_>>()
-                    )
-                });
-            assert!(
-                metadata.callable_modifiers_recorded(),
-                "{fq_name} must record that the walk read its modifiers"
-            );
-            (
-                metadata.callable_is_static(),
-                metadata.callable_is_constructor(),
-                metadata.parameters().len(),
-            )
-        };
-
-        assert_eq!(modifiers("App.free"), (true, false, 1));
-        assert_eq!(modifiers("App.Widget.__construct"), (false, false, 1));
-        assert_eq!(modifiers("App.Widget.build"), (true, false, 1));
-        assert_eq!(modifiers("App.Widget.render"), (false, false, 1));
-        assert_eq!(modifiers("App.Widget.measure"), (false, false, 1));
-        assert_eq!(modifiers("App.Widget.reset"), (true, false, 0));
-        assert_eq!(modifiers("App.Renders.paint"), (false, false, 1));
-    }
-}
-
-#[cfg(test)]
-mod imported_type_name_tests {
-    use super::*;
-    use tree_sitter::Parser;
-
-    fn imported_names(source: &str) -> Vec<String> {
-        let file = ProjectFile::new(std::env::temp_dir(), "collector.php");
-        let mut parser = Parser::new();
-        parser
-            .set_language(&tree_sitter_php::LANGUAGE_PHP.into())
-            .expect("PHP parser language");
-        let tree = parser.parse(source, None).expect("parse PHP fixture");
-        let parsed = parse_php_file(&file, source, &tree);
-        let mut names: Vec<String> = parsed.type_identifiers.into_iter().collect();
-        names.sort();
-        names
-    }
-
-    /// #1713: an unqualified name inside `namespace N;` binds to `N\Name` with
-    /// no `use` declaration, so every reference position resolves against the
-    /// file's own namespace. A `use` alias overrides that, an absolute `\Name`
-    /// escapes it, and the file's own declaration is not an import.
-    #[test]
-    fn same_namespace_references_resolve_without_a_use_declaration() {
-        let names = imported_names(
-            "<?php\nnamespace FastRoute;\n\nuse Other\\Helper as Aid;\n\nclass Collector extends Base implements Marker {\n    use Mixin;\n\n    private DataGenerator $generator;\n\n    public function build(RouteParser $parser): Result {\n        $made = new Handler();\n        Aid::make();\n        Settings::LIMIT;\n        if ($made instanceof Guard) {\n            return $made;\n        }\n        try {\n            return $parser;\n        } catch (\\RuntimeException $error) {\n            throw $error;\n        }\n    }\n}\n",
-        );
-
-        assert_eq!(
-            names,
-            vec![
-                "FastRoute.Base".to_string(),
-                "FastRoute.DataGenerator".to_string(),
-                "FastRoute.Guard".to_string(),
-                "FastRoute.Handler".to_string(),
-                "FastRoute.Marker".to_string(),
-                "FastRoute.Mixin".to_string(),
-                "FastRoute.Result".to_string(),
-                "FastRoute.RouteParser".to_string(),
-                "FastRoute.Settings".to_string(),
-                "Other.Helper".to_string(),
-                "RuntimeException".to_string(),
-            ]
-        );
-    }
-
-    /// A `use` alias wins over the namespace rule, which is PHP's own
-    /// precedence: the file names `RouteParser`, and the name it binds is the
-    /// aliased one, not the same-namespace one.
-    #[test]
-    fn a_use_alias_shadows_the_same_namespace_name() {
-        let names = imported_names(
-            "<?php\nnamespace FastRoute;\n\nuse Other\\RouteParser;\n\nclass Collector {\n    public function build(RouteParser $parser): void {}\n}\n",
-        );
-
-        assert_eq!(names, vec!["Other.RouteParser".to_string()]);
-    }
-
-    /// A `use function` / `use const` clause names a declaration made in
-    /// another file exactly as a class `use` does. A constant is stored under
-    /// the module-constant identity its declaration carries.
-    #[test]
-    fn function_and_constant_use_clauses_are_imports() {
-        let names = imported_names(
-            "<?php\nnamespace FastRoute;\n\nuse function Other\\render;\nuse const Other\\LIMIT;\n\nclass Collector {}\n",
-        );
-
-        assert_eq!(
-            names,
-            vec![
-                "Other._module_.LIMIT".to_string(),
-                "Other.render".to_string()
-            ]
-        );
-    }
-
-    /// Each `namespace N { ... }` block carries its own namespace and its own
-    /// aliases, so a bare name resolves against the block it is written in.
-    #[test]
-    fn scoped_namespace_blocks_resolve_against_their_own_namespace() {
-        let names = imported_names(
-            "<?php\nnamespace First {\n    class One {\n        public function run(Shared $value): void {}\n    }\n}\nnamespace Second {\n    class Two {\n        public function run(Shared $value): void {}\n    }\n}\n",
-        );
-
-        assert_eq!(
-            names,
-            vec!["First.Shared".to_string(), "Second.Shared".to_string()]
-        );
     }
 }

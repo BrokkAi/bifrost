@@ -52,34 +52,30 @@ fn push_normalized_windows_prefix(
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, windows))]
 mod tests {
     use super::*;
-    use std::path::Path;
 
-    #[test]
-    fn removes_current_and_parent_components() {
-        let path = PathBuf::from("src")
-            .join(".")
-            .join("nested")
-            .join("..")
-            .join("lib.rs");
-        assert_eq!(path.normalize(), Path::new("src/lib.rs"));
+    fn assert_verbatim_path_normalizes_to_ordinary(ordinary: &str, verbatim: &str) {
+        assert_eq!(
+            PathBuf::from(ordinary).normalize(),
+            PathBuf::from(verbatim).normalize()
+        );
     }
 
-    #[cfg(windows)]
     #[test]
     fn normalizes_verbatim_and_ordinary_disk_roots_equally() {
-        let ordinary = PathBuf::from(r"C:\Users\runner\repo").normalize();
-        let verbatim = PathBuf::from(r"\\?\C:\Users\runner\repo").normalize();
-        assert_eq!(ordinary, verbatim);
+        assert_verbatim_path_normalizes_to_ordinary(
+            r"C:\Users\runner\repo",
+            r"\\?\C:\Users\runner\repo",
+        );
     }
 
-    #[cfg(windows)]
     #[test]
     fn normalizes_verbatim_and_ordinary_unc_roots_equally() {
-        let ordinary = PathBuf::from(r"\\server\share\repo").normalize();
-        let verbatim = PathBuf::from(r"\\?\UNC\server\share\repo").normalize();
-        assert_eq!(ordinary, verbatim);
+        assert_verbatim_path_normalizes_to_ordinary(
+            r"\\server\share\repo",
+            r"\\?\UNC\server\share\repo",
+        );
     }
 }

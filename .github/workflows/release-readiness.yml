@@ -988,18 +988,19 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          "$STAGED_BIFROST" pack-engine-profile > "${RUNNER_TEMP}/pack-engine-profile.json"
-          profile_sha256="$(sha256sum "${RUNNER_TEMP}/pack-engine-profile.json" | awk '{print $1}')"
-          [[ "$profile_sha256" =~ ^[0-9a-f]{64}$ ]]
-          echo "sha256=$profile_sha256" >> "$GITHUB_OUTPUT"
+          "$STAGED_BIFROST" prepare-open-packs \
+            --cache-dir "${RUNNER_TEMP}/open-packs-cache" --identity-only \
+            > "${RUNNER_TEMP}/open-packs-identity.json"
+          identity="$(jq -er '.identity | select(test("^[0-9a-f]{64}$"))' "${RUNNER_TEMP}/open-packs-identity.json")"
+          echo "identity=$identity" >> "$GITHUB_OUTPUT"
       - name: Restore verified open-pack cache for this engine profile
         if: ${{ inputs.qualify_open_content || needs.preflight.outputs.version != '0.13.0' }}
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ${{ runner.temp }}/open-packs-cache
-          key: bifrost-open-packs-v1-${{ steps.pack-profile.outputs.sha256 }}-receipt-pending
+          key: bifrost-open-packs-v1-${{ steps.pack-profile.outputs.identity }}-receipt-pending
           restore-keys: |
-            bifrost-open-packs-v1-${{ steps.pack-profile.outputs.sha256 }}-
+            bifrost-open-packs-v1-${{ steps.pack-profile.outputs.identity }}-
       - name: Acquire eligible integrity-verified Bifrost-packs release
         if: ${{ inputs.qualify_open_content || needs.preflight.outputs.version != '0.13.0' }}
         id: open-packs
@@ -1009,8 +1010,7 @@ jobs:
           receipt="${RUNNER_TEMP}/open-packs-receipt.json"
           env_file="${RUNNER_TEMP}/open-packs.env.json"
           rm -f "$receipt" "$env_file"
-          node scripts/public/prepare-open-packs.mjs \
-            --binary "$STAGED_BIFROST" \
+          "$STAGED_BIFROST" prepare-open-packs \
             --cache-dir "${RUNNER_TEMP}/open-packs-cache" \
             --receipt-path "$receipt" \
             --env-path "$env_file"
@@ -1071,7 +1071,7 @@ jobs:
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ${{ runner.temp }}/open-packs-cache
-          key: bifrost-open-packs-v1-${{ steps.pack-profile.outputs.sha256 }}-${{ steps.open-packs.outputs.receipt_sha256 }}
+          key: bifrost-open-packs-v1-${{ steps.pack-profile.outputs.identity }}-${{ steps.open-packs.outputs.receipt_sha256 }}
       - name: Record typed policy smoke status
         if: ${{ inputs.qualify_open_content || needs.preflight.outputs.version != '0.13.0' }}
         shell: bash

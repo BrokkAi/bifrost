@@ -18,8 +18,7 @@ define_work_dimensions! {
     ///
     /// Serializable because a reused policy evaluation unit replays the exact
     /// solver charge its own solve made, and that charge outlives the process
-    /// that measured it (`.agents/plans/impact-sliced-diff-base.md`, Decision
-    /// Log (5c)).
+    /// that measured it.
     #[derive(
         Debug, Default, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize,
     )]
@@ -61,6 +60,18 @@ pub struct SolverBudgetExceeded {
 }
 
 impl SolverBudgetExceeded {
+    pub(crate) const fn new(
+        dimension: SolverBudgetDimension,
+        limit: usize,
+        attempted: usize,
+    ) -> Self {
+        Self {
+            dimension,
+            limit,
+            attempted,
+        }
+    }
+
     pub const fn dimension(self) -> SolverBudgetDimension {
         self.dimension
     }
@@ -122,7 +133,7 @@ pub struct SolverBudget {
 impl SolverBudget {
     pub const fn new(limits: SolverWork) -> Self {
         Self {
-            ledger: BudgetLedger::new(limits, SolverWork::uniform(0)),
+            ledger: BudgetLedger::with_zero_usage(limits),
         }
     }
 

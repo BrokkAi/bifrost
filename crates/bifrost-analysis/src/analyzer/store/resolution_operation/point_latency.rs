@@ -33,12 +33,10 @@ use crate::searchtools::{
 /// One adjudicated #2767 candidate, addressed by the exact reference that
 /// reaches it.
 ///
-/// The ledger (`.agents/docs/stack-graph-2767-ledger.md`) names each changed
-/// callable and the caller path that reaches it. A latency site is that
-/// caller's reference token, because a point query is issued at a reference,
-/// not at a declaration. `token` is checked against the corpus source before
-/// any measurement runs, so a site that drifted fails loudly instead of
-/// silently measuring a different call.
+/// A latency site is the caller's reference token, because a point query is
+/// issued at a reference, not at a declaration. `token` is checked against
+/// the corpus source before any measurement runs, so a site that drifted fails
+/// loudly instead of silently measuring a different call.
 #[derive(Debug, Clone, Copy)]
 struct PointLatencySite {
     /// Ledger row number, 1 to 10.
@@ -891,7 +889,7 @@ fn rust_whole_workspace_point_rebaser_identities_are_independent_of_the_selectio
             range.end_byte,
         );
         let cancellation = CancellationToken::default();
-        let operation = fixture.open_ready(&cancellation);
+        let mut operation = fixture.open_ready(&cancellation);
         let mounts = operation.mount_table().mount_count();
         let _ = super::take_rebaser_identities_at_handback_for_test();
         operation
@@ -1098,7 +1096,7 @@ fn rust_point_request_sql_work_does_not_grow_with_the_workspace() {
         );
         let cancellation = CancellationToken::default();
         begin_production_selected_sql_trace(&fixture.store);
-        let operation = fixture.open_ready(&cancellation);
+        let mut operation = fixture.open_ready(&cancellation);
         let _open = checkpoint_production_selected_sql_trace();
         let answer = operation
             .resolve_rust_reference_for_caller_bounded(
@@ -1114,6 +1112,7 @@ fn rust_point_request_sql_work_does_not_grow_with_the_workspace() {
             matches!(answer, BoundedResolution::Complete { .. }),
             "the point fixture must answer inside its budget at {files} files"
         );
+        drop(operation);
         let work = finish_production_selected_sql_trace(&fixture.store);
         (files, work.statement_count(), work.decoded_rows)
     });
@@ -1166,7 +1165,7 @@ fn deferred_member_lookup_sql_work_does_not_grow_with_the_workspace() {
         );
         let cancellation = CancellationToken::default();
         begin_production_selected_sql_trace(&fixture.store);
-        let operation = fixture.open_ready(&cancellation);
+        let mut operation = fixture.open_ready(&cancellation);
         let _open = checkpoint_production_selected_sql_trace();
         let mount_callers = SelectedMountCallerTrace::begin();
         operation
@@ -1179,6 +1178,7 @@ fn deferred_member_lookup_sql_work_does_not_grow_with_the_workspace() {
                 &mut ResolutionBatchMetrics::default(),
             )
             .expect("the member point request answers");
+        drop(operation);
         let work = finish_production_selected_sql_trace(&fixture.store);
         drop(mount_callers);
         eprintln!(
@@ -1257,7 +1257,7 @@ fn an_intrinsic_owner_opens_only_the_blobs_that_seed_it() {
             range.end_byte,
         );
         let cancellation = CancellationToken::default();
-        let operation = fixture.open_ready(&cancellation);
+        let mut operation = fixture.open_ready(&cancellation);
         shared_request_probe::reset();
         operation
             .resolve_rust_reference_for_caller_bounded(

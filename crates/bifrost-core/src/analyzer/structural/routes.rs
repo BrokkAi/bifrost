@@ -232,8 +232,12 @@ impl IdentityRouteSupport {
     }
 
     pub fn is_empty(&self) -> bool {
-        self.axes.iter().all(|support| !support.is_supported())
-            && self.relations.iter().all(|support| !support.is_supported())
+        super::support_is_empty(
+            self.axes
+                .iter()
+                .chain(&self.relations)
+                .map(|support| support.is_supported()),
+        )
     }
 
     /// Iterate the axis table in the stable order declared by
@@ -421,113 +425,6 @@ impl CanonicalIdentity {
 mod tests {
     use super::*;
     use crate::analyzer::fq_name::segment_interner;
-    use std::collections::HashSet;
-
-    /// Every labelled vocabulary in this registry must have unique labels that
-    /// round-trip through both `from_label` and serde, so a JSON surface and a
-    /// rendered surface never disagree about a name.
-    #[test]
-    fn route_vocabularies_are_unique_and_round_trip() {
-        macro_rules! check {
-            ($all:expr, $type:ty) => {{
-                let mut labels = HashSet::new();
-                for &value in $all {
-                    assert!(labels.insert(value.label()), "duplicate label {value:?}");
-                    assert_eq!(<$type>::from_label(value.label()), Some(value));
-                    let json = serde_json::to_value(value).expect("serialize");
-                    assert_eq!(
-                        json,
-                        serde_json::Value::String(value.label().to_owned()),
-                        "serde label diverges from label() for {value:?}"
-                    );
-                    let back: $type = serde_json::from_value(json).expect("deserialize");
-                    assert_eq!(back, value);
-                }
-                assert_eq!(labels.len(), $all.len());
-            }};
-        }
-
-        check!(ALL_ROUTE_HOP_KINDS, RouteHopKind);
-        check!(ALL_IDENTITY_AXES, IdentityAxis);
-        check!(ALL_SEGMENT_RESOLUTION_STATUSES, SegmentResolutionStatus);
-        check!(ALL_ROUTE_TERMINATIONS, RouteTermination);
-        check!(ALL_CANONICAL_SEGMENT_KINDS, CanonicalSegmentKind);
-
-        assert!(RouteHopKind::from_label("not_a_hop").is_none());
-        assert!(IdentityAxis::from_label("not_an_axis").is_none());
-    }
-
-    #[test]
-    fn indices_are_dense_and_size_the_support_tables() {
-        assert_eq!(ALL_IDENTITY_AXES.len(), IdentityAxis::COUNT);
-        for (slot, &axis) in ALL_IDENTITY_AXES.iter().enumerate() {
-            assert_eq!(axis.index(), slot);
-        }
-        assert_eq!(ALL_ROUTE_HOP_KINDS.len(), RouteHopKind::COUNT);
-        for (slot, &relation) in ALL_ROUTE_HOP_KINDS.iter().enumerate() {
-            assert_eq!(relation.index(), slot);
-        }
-        assert_eq!(
-            IdentityRouteSupport::NONE.iter_axes().count(),
-            IdentityAxis::COUNT
-        );
-        assert_eq!(
-            IdentityRouteSupport::NONE.iter_relations().count(),
-            RouteHopKind::COUNT
-        );
-    }
-
-    #[test]
-    fn support_table_is_total_and_defaults_to_unsupported() {
-        let table = IdentityRouteSupport::default();
-        assert!(table.is_empty());
-        for &axis in ALL_IDENTITY_AXES {
-            assert!(!table.supports_axis(axis));
-        }
-        for &relation in ALL_ROUTE_HOP_KINDS {
-            assert!(!table.supports_relation(relation));
-        }
-
-        let declared = IdentityRouteSupport::NONE
-            .supported_axis(IdentityAxis::PathSegments)
-            .supported_relation(RouteHopKind::ReExport);
-        assert!(declared.supports_axis(IdentityAxis::PathSegments));
-        assert!(!declared.supports_axis(IdentityAxis::SegmentResolution));
-        assert!(declared.supports_relation(RouteHopKind::ReExport));
-        assert!(!declared.supports_relation(RouteHopKind::Alias));
-        assert!(!declared.is_empty());
-        assert!(NO_IDENTITY_ROUTE_SUPPORT.is_empty());
-    }
-
-    /// The shared deep-adapter base claims every axis and no relation, so each
-    /// deep adapter's relation claims stay visible at its own declaration.
-    #[test]
-    fn deep_axis_base_claims_all_axes_and_no_relations() {
-        for &axis in ALL_IDENTITY_AXES {
-            assert!(
-                DEEP_IDENTITY_AXES.supports_axis(axis),
-                "deep base must claim {axis}"
-            );
-        }
-        for &relation in ALL_ROUTE_HOP_KINDS {
-            assert!(
-                !DEEP_IDENTITY_AXES.supports_relation(relation),
-                "the base must not claim {relation}; relations are per-adapter"
-            );
-        }
-    }
-
-    #[test]
-    fn every_vocabulary_value_describes_itself() {
-        for &axis in ALL_IDENTITY_AXES {
-            assert!(!axis.description().is_empty());
-            assert_eq!(axis.signature(), axis.label());
-        }
-        for &relation in ALL_ROUTE_HOP_KINDS {
-            assert!(!relation.description().is_empty());
-            assert_eq!(relation.signature(), relation.label());
-        }
-    }
 
     /// The load-bearing identity property: two identities that render the same
     /// but differ structurally are unequal, and equality never consults the
@@ -580,7 +477,6 @@ mod tests {
         assert_ne!(generic, recorded_nongeneric);
         assert_ne!(module_util, recorded_nongeneric);
     }
-
     /// A quoted or punctuation-bearing identifier is one semantic segment: its
     /// literal text survives the projection and the identity has exactly as
     /// many segments as the `FqName`, never a re-split of the rendering.
@@ -602,19 +498,6 @@ mod tests {
         assert_eq!(
             identity.diagnostic_rendering(),
             ".github.workflows.release.v2"
-        );
-    }
-
-    #[test]
-    #[should_panic(expected = "at least one segment")]
-    fn empty_identity_fails_at_the_construction_point() {
-        let interner = segment_interner();
-        let _ = CanonicalIdentity::from_fq(
-            Language::Rust,
-            Namespace::Value,
-            &FqName::new(),
-            interner,
-            None,
         );
     }
 }

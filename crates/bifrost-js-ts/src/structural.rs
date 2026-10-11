@@ -1,32 +1,43 @@
 //! Shared JavaScript/TypeScript structural specs for `query_code`.
 
+use brokk_bifrost_core::analyzer::common::try_node_source_text as node_text;
 use brokk_bifrost_core::analyzer::structural::adapter_helpers::{
     attach_positional_argument_roles, attach_role_with_derived_name, attach_terminal_callee,
     field_name_in_parent, first_named_child, nearest_ancestor, node_range,
+    unquoted_string_content_span,
 };
 use brokk_bifrost_core::analyzer::structural::adapter_helpers::{
     linear_chain_tokens, qualified_chain_root, spelled_generic_arity,
 };
-use brokk_bifrost_core::analyzer::structural::callable::CallSiteContext;
+use brokk_bifrost_core::analyzer::structural::callable::{
+    CallKind, CallSiteContext, CallSiteFacts,
+};
 use brokk_bifrost_core::analyzer::structural::edges::{
     DEEP_REFERENCE_EDGE_SUPPORT, ReferenceEdgeSupport,
 };
-use brokk_bifrost_core::analyzer::structural::facts::Span;
+use brokk_bifrost_core::analyzer::structural::facts::{
+    IntegerLiteralValue, Span, decode_integer_literal_digits,
+};
 use brokk_bifrost_core::analyzer::structural::kinds::{NormalizedKind, Role};
 use brokk_bifrost_core::analyzer::structural::materialization::{
     DeclarationMaterializationSupport, JS_TS_MATERIALIZATION_SUPPORT,
 };
 use brokk_bifrost_core::analyzer::structural::occurrences::{
-    Namespace, OccurrenceRole, OccurrenceRoleSupport, default_occurrence_namespace,
+    Namespace, OccurrenceRole, OccurrenceRoleSupport, module_path_occurrence_namespace,
 };
 use brokk_bifrost_core::analyzer::structural::resolution::{
     BindingActivation, BindingKind, DEEP_LEXICAL_ENVIRONMENT_SUPPORT, HoistingClass,
     LexicalEnvironmentSupport,
 };
+use brokk_bifrost_core::analyzer::structural::result_use::{
+    CallResultUse, CallResultUseIndex, CallResultUseOpenReason, CallResultUseSite,
+    IntentionalDiscardKind,
+};
 use brokk_bifrost_core::analyzer::structural::routes::{
     CuratedExportSurface, DEEP_IDENTITY_AXES, IdentityRouteSupport, RouteHopKind,
 };
-use brokk_bifrost_core::analyzer::structural::spec::{RoleSink, StructuralSpec};
+use brokk_bifrost_core::analyzer::structural::spec::{EmbeddedLeafFact, RoleSink, StructuralSpec};
+use brokk_bifrost_core::analyzer::tree_walk::ParentIndex;
 use brokk_bifrost_core::analyzer::{Language, Range};
 use tree_sitter::Node;
 
@@ -51,6 +62,122 @@ pub static JAVASCRIPT_STRUCTURAL_SPEC: JsTsStructuralSpec = JsTsStructuralSpec {
 pub static TYPESCRIPT_STRUCTURAL_SPEC: JsTsStructuralSpec = JsTsStructuralSpec {
     language: Language::TypeScript,
 };
+
+/// Classify one exact JavaScript or TypeScript call expression without
+/// resolving its callee. The result-use rule is shared by both grammars:
+/// expression statements drop a result, while every other ordinary expression
+/// context consumes it. `void` is the one explicit discard spelling accepted
+/// by the JS/TS adapter.
+pub fn js_ts_call_result_use(call: Node<'_>, _source: &str) -> CallResultUseSite {
+    let default = if call.kind() != "call_expression"
+        || call.has_error()
+        || has_recovery_ancestor(call)
+        || has_recovery_descendant(call)
+    {
+        CallResultUse::Open(CallResultUseOpenReason::RecoveredSyntax)
+    } else {
+        let mut expression = call;
+        loop {
+            let Some(parent) = expression.parent() else {
+                break CallResultUse::Open(CallResultUseOpenReason::UnclassifiedSyntax);
+            };
+            if parent.is_error() || parent.is_missing() {
+                break CallResultUse::Open(CallResultUseOpenReason::RecoveredSyntax);
+            }
+            match parent.kind() {
+                "parenthesized_expression"
+                    if parent.named_child_count() == 1
+                        && parent
+                            .named_child(0)
+                            .is_some_and(|child| child.id() == expression.id()) =>
+                {
+                    expression = parent;
+                }
+                "unary_expression"
+                    if parent
+                        .child_by_field_name("argument")
+                        .is_some_and(|argument| argument.id() == expression.id())
+                        && parent
+                            .children(&mut parent.walk())
+                            .any(|child| child.kind() == "void") =>
+                {
+                    break CallResultUse::IntentionalDiscard(
+                        IntentionalDiscardKind::JavaScriptVoid,
+                    );
+                }
+                "expression_statement"
+                    if parent.named_child_count() == 1
+                        && parent
+                            .named_child(0)
+                            .is_some_and(|child| child.id() == expression.id()) =>
+                {
+                    break CallResultUse::Discarded;
+                }
+                _ => break CallResultUse::Consumed,
+            }
+        }
+    };
+    CallResultUseSite::new(call.start_byte(), call.end_byte(), default)
+}
+
+fn has_recovery_ancestor(mut node: Node<'_>) -> bool {
+    while let Some(parent) = node.parent() {
+        if parent.is_error() || parent.is_missing() {
+            return true;
+        }
+        node = parent;
+    }
+    false
+}
+
+fn has_recovery_descendant(root: Node<'_>) -> bool {
+    let mut stack = vec![root];
+    while let Some(node) = stack.pop() {
+        if node.id() != root.id() && (node.is_error() || node.is_missing()) {
+            return true;
+        }
+        for index in (0..node.named_child_count()).rev() {
+            stack.push(node.named_child(index).expect("named child exists"));
+        }
+    }
+    false
+}
+
+/// One source-snapshot index of exact JavaScript/TypeScript call spans.
+#[derive(Debug, Clone)]
+pub struct JsTsCallResultUseIndex {
+    inner: CallResultUseIndex,
+}
+
+impl JsTsCallResultUseIndex {
+    pub fn new(root: Node<'_>, source: &str) -> Self {
+        let mut sites = Vec::new();
+        let mut stack = vec![root];
+        while let Some(node) = stack.pop() {
+            if node.kind() == "call_expression" {
+                sites.push(js_ts_call_result_use(node, source));
+            }
+            for index in (0..node.named_child_count()).rev() {
+                stack.push(node.named_child(index).expect("named child exists"));
+            }
+        }
+        Self {
+            inner: CallResultUseIndex::new(sites),
+        }
+    }
+
+    pub fn at_span(
+        &self,
+        start_byte: usize,
+        end_byte: usize,
+    ) -> Result<&CallResultUseSite, CallResultUseOpenReason> {
+        self.inner.at_span(start_byte, end_byte)
+    }
+
+    pub fn sites(&self) -> &[CallResultUseSite] {
+        self.inner.sites()
+    }
+}
 
 macro_rules! js_ts_kind_table {
     ($($ts_only:expr,)*) => {
@@ -95,6 +222,7 @@ macro_rules! js_ts_kind_table {
             ("spread_element", NormalizedKind::SpreadElement),
             ("string", NormalizedKind::StringLiteral),
             ("template_string", NormalizedKind::StringLiteral),
+            ("unary_expression", NormalizedKind::NumericLiteral),
             ("number", NormalizedKind::NumericLiteral),
             ("true", NormalizedKind::BooleanLiteral),
             ("false", NormalizedKind::BooleanLiteral),
@@ -112,6 +240,7 @@ macro_rules! js_ts_kind_table {
             ("statement_block", NormalizedKind::Block),
             ("switch_body", NormalizedKind::Block),
             ("decorator", NormalizedKind::Decorator),
+            ("comment", NormalizedKind::Comment),
             $($ts_only,)*
         ]
     };
@@ -122,12 +251,20 @@ macro_rules! js_ts_kind_table {
 /// and wraps every parameter in `required_parameter`/`optional_parameter`;
 /// without those entries a `.jsx` class name would stop being an Identifier
 /// fact the moment the dialect changed. `CompiledKinds` drops the entries a
-/// concrete grammar does not have, so tree-sitter-javascript keeps exactly the
-/// table it had before.
+/// concrete grammar does not have, so tree-sitter-javascript gets the entries
+/// it has, which include the plain-JavaScript parameter patterns (#3841).
 pub const JS_KIND_TABLE: &[(&str, NormalizedKind)] = js_ts_kind_table!(
     ("type_identifier", NormalizedKind::Identifier),
     ("required_parameter", NormalizedKind::Parameter),
     ("optional_parameter", NormalizedKind::Parameter),
+    // Plain JavaScript has no parameter wrapper: a parameter is a bare
+    // identifier, a default value, or a destructuring pattern that is a direct
+    // child of `formal_parameters` (#3841). `refine_kind` lifts identifiers in
+    // that position to Parameter, and `should_extract_with_parent` admits these
+    // pattern nodes only in that position.
+    ("assignment_pattern", NormalizedKind::Parameter),
+    ("object_pattern", NormalizedKind::Parameter),
+    ("array_pattern", NormalizedKind::Parameter),
 );
 
 /// The entries [`JS_KIND_TABLE`] carries only for the `.jsx` dialect's TSX
@@ -166,19 +303,172 @@ pub const TS_KIND_TABLE: &[(&str, NormalizedKind)] = js_ts_kind_table!(
     ("optional_parameter", NormalizedKind::Parameter),
 );
 
-fn node_text<'source>(node: Node<'_>, source: &'source str) -> Option<&'source str> {
-    node.utf8_text(source.as_bytes()).ok()
-}
-
 fn unquoted_string_span(node: Node<'_>) -> Option<Span> {
     if node.kind() != "string" {
         return None;
     }
-    let start = node.start_byte().checked_add(1)?;
-    let end = node.end_byte().checked_sub(1)?;
-    (start <= end).then_some(Span {
-        start_byte: start,
-        end_byte: end,
+    unquoted_string_content_span(node)
+}
+
+fn js_ts_string_literal_value(node: Node<'_>, source: &str) -> Option<String> {
+    if node.kind() == "template_string" {
+        let mut cursor = node.walk();
+        if node
+            .named_children(&mut cursor)
+            .any(|child| child.kind() == "template_substitution")
+        {
+            return None;
+        }
+    }
+    let raw = node_text(node, source)?;
+    let delimiter = match node.kind() {
+        "string" => raw.chars().next(),
+        "template_string" => Some('`'),
+        _ => None,
+    }?;
+    if !raw.starts_with(delimiter) || !raw.ends_with(delimiter) {
+        return None;
+    }
+
+    let content = &raw[delimiter.len_utf8()..raw.len() - delimiter.len_utf8()];
+    let mut value = String::with_capacity(content.len());
+    let mut chars = content.chars().peekable();
+    while let Some(character) = chars.next() {
+        if character != '\\' {
+            value.push(character);
+            continue;
+        }
+        let escape = chars.next()?;
+        match escape {
+            '\\' | '\'' | '"' | '`' => value.push(escape),
+            'b' => value.push('\u{0008}'),
+            'f' => value.push('\u{000c}'),
+            'n' => value.push('\n'),
+            'r' => value.push('\r'),
+            't' => value.push('\t'),
+            'v' => value.push('\u{000b}'),
+            '0' => value.push('\0'),
+            '\n' => {}
+            '\r' => {
+                chars.next_if_eq(&'\n');
+            }
+            'x' => {
+                let high = chars.next()?.to_digit(16)?;
+                let low = chars.next()?.to_digit(16)?;
+                value.push(char::from_u32(high * 16 + low)?);
+            }
+            'u' => {
+                let code_point = if chars.next_if_eq(&'{').is_some() {
+                    let mut digits = String::new();
+                    for digit in chars.by_ref() {
+                        if digit == '}' {
+                            break;
+                        }
+                        digits.push(digit);
+                    }
+                    if digits.is_empty() || digits.len() > 6 {
+                        return None;
+                    }
+                    u32::from_str_radix(&digits, 16).ok()?
+                } else {
+                    let mut digits = String::new();
+                    for _ in 0..4 {
+                        digits.push(chars.next()?);
+                    }
+                    u32::from_str_radix(&digits, 16).ok()?
+                };
+                value.push(char::from_u32(code_point)?);
+            }
+            other => value.push(other),
+        }
+    }
+    Some(value)
+}
+
+fn js_ts_integer_literal_value(node: Node<'_>, source: &str) -> Option<IntegerLiteralValue> {
+    let (literal, negative) = if node.kind() == "unary_expression" {
+        let operator = node.child_by_field_name("operator")?;
+        let negative = match operator.kind() {
+            "+" => false,
+            "-" => true,
+            _ => return None,
+        };
+        (
+            js_ts_numeric_target(node.child_by_field_name("argument")?)?,
+            negative,
+        )
+    } else {
+        (node, false)
+    };
+    if literal.kind() != "number" {
+        return None;
+    }
+    let text = node_text(literal, source)?;
+    let text = text.strip_suffix('n').unwrap_or(text);
+    if text.is_empty() || text.contains('.') || text.contains('e') || text.contains('E') {
+        return None;
+    }
+    let compact = text.replace('_', "");
+    let (radix, digits) = if let Some(digits) = compact
+        .strip_prefix("0x")
+        .or_else(|| compact.strip_prefix("0X"))
+    {
+        (16, digits)
+    } else if let Some(digits) = compact
+        .strip_prefix("0b")
+        .or_else(|| compact.strip_prefix("0B"))
+    {
+        (2, digits)
+    } else if let Some(digits) = compact
+        .strip_prefix("0o")
+        .or_else(|| compact.strip_prefix("0O"))
+    {
+        (8, digits)
+    } else {
+        if compact.len() > 1
+            && compact.starts_with('0')
+            && compact.as_bytes().iter().skip(1).any(|byte| *byte != b'0')
+        {
+            return None;
+        }
+        (10, compact.as_str())
+    };
+    let value = decode_integer_literal_digits(radix, digits.as_bytes())?;
+    Some(if negative { value.negated() } else { value })
+}
+
+fn js_ts_numeric_target(mut node: Node<'_>) -> Option<Node<'_>> {
+    while node.kind() == "parenthesized_expression" {
+        node = first_named_child(node)?;
+    }
+    Some(node)
+}
+
+fn js_ts_signed_numeric_unary(node: Node<'_>) -> bool {
+    node.kind() == "unary_expression"
+        && node
+            .child_by_field_name("operator")
+            .is_some_and(|operator| matches!(operator.kind(), "+" | "-"))
+        && node
+            .child_by_field_name("argument")
+            .and_then(js_ts_numeric_target)
+            .is_some_and(|argument| argument.kind() == "number")
+}
+
+fn js_ts_is_inside_signed_numeric_wrapper<'tree>(
+    node: Node<'tree>,
+    parent_of: impl Fn(Node<'tree>) -> Option<Node<'tree>>,
+) -> bool {
+    let mut parent = parent_of(node);
+    while parent.is_some_and(|parent| parent.kind() == "parenthesized_expression") {
+        parent = parent.and_then(&parent_of);
+    }
+    parent.is_some_and(|parent| {
+        js_ts_signed_numeric_unary(parent)
+            && parent
+                .child_by_field_name("argument")
+                .and_then(js_ts_numeric_target)
+                .is_some_and(|argument| argument.id() == node.id())
     })
 }
 
@@ -230,8 +520,13 @@ fn jsx_expression_operand<'tree>(value: Node<'tree>) -> Option<Node<'tree>> {
 }
 
 fn jsx_spread_operand<'tree>(attribute: Node<'tree>) -> Option<Node<'tree>> {
-    let spread = first_named_child(attribute).filter(|child| child.kind() == "spread_element")?;
-    first_named_child(spread)
+    jsx_spread_expression(first_named_child(attribute)?)
+}
+
+fn jsx_spread_expression<'tree>(spread: Node<'tree>) -> Option<Node<'tree>> {
+    (spread.kind() == "spread_element")
+        .then(|| first_named_child(spread))
+        .flatten()
 }
 
 fn jsx_attribute_value<'tree>(attribute: Node<'tree>) -> Option<Node<'tree>> {
@@ -240,7 +535,7 @@ fn jsx_attribute_value<'tree>(attribute: Node<'tree>) -> Option<Node<'tree>> {
         .and_then(jsx_expression_operand)
         .and_then(|value| {
             if value.kind() == "spread_element" {
-                first_named_child(value)
+                jsx_spread_expression(value)
             } else {
                 Some(value)
             }
@@ -320,7 +615,44 @@ fn parameter_name_node<'tree>(parameter: Node<'tree>) -> Option<Node<'tree>> {
         "required_parameter" | "optional_parameter" | "rest_pattern" => parameter
             .child_by_field_name("pattern")
             .or_else(|| parameter.child_by_field_name("name")),
+        // A plain JavaScript default value is an assignment_pattern whose
+        // `left` is the bound pattern, which is TSX's `pattern` field.
+        "assignment_pattern" => parameter.child_by_field_name("left"),
+        // A destructuring parameter names its pattern, as TSX does.
+        "object_pattern" | "array_pattern" => Some(parameter),
         _ => expression_name_node(parameter),
+    }
+}
+
+/// Whether a node sits directly in a formal parameter list. Plain JavaScript
+/// has no parameter wrapper node, so this position is what makes a bare
+/// identifier or pattern a parameter (#3841).
+fn is_formal_parameter_position(parent: Option<Node<'_>>) -> bool {
+    parent.is_some_and(|parent| parent.kind() == "formal_parameters")
+}
+
+/// Whether an identifier is one of JavaScript's ordinary formal parameters.
+///
+/// The JavaScript grammar keeps simple parameters as bare `identifier` nodes,
+/// unlike the TypeScript grammar's `required_parameter` wrapper.  The
+/// normalized vocabulary must not make callers know that grammar distinction,
+/// so refine bare identifiers by their immediate structured parent. TypeScript
+/// parameter wrappers already produce the parameter fact, so their identifier
+/// children must not be promoted as a second fact.
+fn js_ts_parameter_identifier<'tree>(node: Node<'tree>, parents: &ParentIndex<'tree>) -> bool {
+    if node.kind() != "identifier" {
+        return false;
+    }
+
+    let Some(parent) = parents.parent(node) else {
+        return false;
+    };
+    match parent.kind() {
+        "formal_parameters" => true,
+        "arrow_function" => parent
+            .child_by_field_name("parameter")
+            .is_some_and(|parameter| parameter.id() == node.id()),
+        _ => false,
     }
 }
 
@@ -539,6 +871,8 @@ fn js_ts_binding_activation(binder: Node<'_>, scope: Range) -> Option<BindingAct
                 | "optional_parameter"
                 | "formal_parameters"
                 | "arrow_function"
+                | "function_declaration"
+                | "generator_function_declaration"
         )
     })?;
     match form.kind() {
@@ -561,6 +895,11 @@ fn js_ts_binding_activation(binder: Node<'_>, scope: Range) -> Option<BindingAct
             kind: BindingKind::LoopVariable,
             hoisting: HoistingClass::DeclaredHead,
             activation: node_range(form),
+        }),
+        "function_declaration" | "generator_function_declaration" => Some(BindingActivation {
+            kind: BindingKind::Local,
+            hoisting: HoistingClass::ScopeWide,
+            activation: scope,
         }),
         _ => {
             let declaration = form.parent()?;
@@ -599,6 +938,24 @@ impl JsTsStructuralSpec {
         kind: NormalizedKind,
         parent_of: impl Fn(Node<'tree>) -> Option<Node<'tree>>,
     ) -> bool {
+        if kind == NormalizedKind::Parameter
+            && matches!(
+                node.kind(),
+                "assignment_pattern" | "object_pattern" | "array_pattern"
+            )
+            && !is_formal_parameter_position(parent_of(node))
+        {
+            return false;
+        }
+        if kind == NormalizedKind::NumericLiteral && node.kind() == "unary_expression" {
+            return js_ts_signed_numeric_unary(node);
+        }
+        if kind == NormalizedKind::NumericLiteral
+            && node.kind() == "number"
+            && js_ts_is_inside_signed_numeric_wrapper(node, &parent_of)
+        {
+            return false;
+        }
         if kind == NormalizedKind::JsxSpreadAttribute
             && !(node.kind() == "jsx_expression"
                 && parent_of(node).is_some_and(|parent| {
@@ -623,7 +980,7 @@ impl JsTsStructuralSpec {
         sink: &mut RoleSink<'_>,
         parent_of: impl Fn(Node<'tree>) -> Option<Node<'tree>>,
     ) {
-        if let Some(role) = js_ts_occurrence_role(node, parent_of) {
+        if let Some(role) = js_ts_occurrence_role(node, &parent_of) {
             sink.occurrence_role(node, role);
         }
         match kind {
@@ -792,6 +1149,27 @@ impl StructuralSpec for JsTsStructuralSpec {
         true
     }
 
+    fn supports_string_literal_value(&self) -> bool {
+        true
+    }
+
+    fn string_literal_value_may_be_absent(&self, node: Node<'_>, source: &str) -> bool {
+        matches!(node.kind(), "string" | "template_string")
+            && js_ts_string_literal_value(node, source).is_none()
+    }
+
+    fn string_literal_value(&self, node: Node<'_>, source: &str) -> Option<String> {
+        js_ts_string_literal_value(node, source)
+    }
+
+    fn supports_integer_literal_value(&self) -> bool {
+        true
+    }
+
+    fn integer_literal_value(&self, node: Node<'_>, source: &str) -> Option<IntegerLiteralValue> {
+        js_ts_integer_literal_value(node, source)
+    }
+
     fn kind_table(&self) -> &'static [(&'static str, NormalizedKind)] {
         match self.language {
             Language::JavaScript => JS_KIND_TABLE,
@@ -800,15 +1178,18 @@ impl StructuralSpec for JsTsStructuralSpec {
         }
     }
 
-    fn refine_kind(
+    fn refine_kind_with_parents<'tree>(
         &self,
-        node: Node<'_>,
+        node: Node<'tree>,
         kind: NormalizedKind,
         _enclosing: Option<NormalizedKind>,
         source: &str,
         _context: &CallSiteContext,
+        parents: &ParentIndex<'tree>,
     ) -> NormalizedKind {
-        if kind == NormalizedKind::Method
+        if kind == NormalizedKind::Identifier && js_ts_parameter_identifier(node, parents) {
+            NormalizedKind::Parameter
+        } else if kind == NormalizedKind::Method
             && node.kind() == "method_definition"
             && node
                 .child_by_field_name("name")
@@ -821,20 +1202,57 @@ impl StructuralSpec for JsTsStructuralSpec {
         }
     }
 
+    fn embedded_leaf_facts(
+        &self,
+        node: Node<'_>,
+        kind: NormalizedKind,
+        _source: &str,
+        _cancellation: Option<&brokk_bifrost_core::cancellation::CancellationToken>,
+    ) -> Vec<EmbeddedLeafFact> {
+        if kind == NormalizedKind::Method
+            && node.kind() == "method_definition"
+            && node
+                .parent()
+                .is_some_and(|parent| parent.kind() == "object")
+        {
+            vec![EmbeddedLeafFact {
+                kind: NormalizedKind::ObjectProperty,
+                range: node_range(node),
+                parent: None,
+                construct: None,
+                occurrence_role: None,
+            }]
+        } else {
+            Vec::new()
+        }
+    }
+
     fn should_extract(&self, node: Node<'_>, kind: NormalizedKind) -> bool {
         self.should_extract_with_parent(node, kind, |node| node.parent())
     }
 
+    fn call_site_facts(
+        &self,
+        node: Node<'_>,
+        _source: &str,
+        _context: &CallSiteContext,
+    ) -> Option<CallSiteFacts> {
+        // Both grammars distinguish construction from an ordinary call.
+        (node.kind() == "new_expression").then(|| CallSiteFacts::of_kind(CallKind::Constructor))
+    }
+
     fn supports_role(&self, role: Role) -> bool {
-        role != Role::Kwarg
+        brokk_bifrost_core::analyzer::structural::spec::supports_role_without_kwarg(role)
     }
 
     fn supports_kind(&self, kind: NormalizedKind) -> bool {
-        kind == NormalizedKind::Constructor
-            || self
-                .kind_table()
-                .iter()
-                .any(|(_, fact_kind)| fact_kind.satisfies(kind))
+        matches!(
+            kind,
+            NormalizedKind::Constructor | NormalizedKind::Parameter | NormalizedKind::SyntaxError
+        ) || self
+            .kind_table()
+            .iter()
+            .any(|(_, fact_kind)| fact_kind.satisfies(kind))
     }
 
     fn occurrence_role_support(&self) -> &OccurrenceRoleSupport {
@@ -870,6 +1288,20 @@ impl StructuralSpec for JsTsStructuralSpec {
         js_ts_binding_activation(binder, scope)
     }
 
+    fn declaration_binding_activation(
+        &self,
+        declaration_name: Node<'_>,
+        scope: Range,
+    ) -> Option<BindingActivation> {
+        let parent = declaration_name.parent()?;
+        matches!(
+            parent.kind(),
+            "function_declaration" | "generator_function_declaration"
+        )
+        .then(|| js_ts_binding_activation(declaration_name, scope))
+        .flatten()
+    }
+
     fn qualified_path_root<'tree>(&self, token: Node<'tree>) -> Option<Node<'tree>> {
         if !matches!(
             token.kind(),
@@ -886,6 +1318,22 @@ impl StructuralSpec for JsTsStructuralSpec {
 
     fn segment_generic_arity(&self, token: Node<'_>) -> Option<u32> {
         spelled_generic_arity(token, JS_TS_PATH_CHAIN, &["generic_type"])
+    }
+
+    fn generator_construct(
+        &self,
+        node: Node<'_>,
+        kind: NormalizedKind,
+        _source: &str,
+    ) -> Option<&'static str> {
+        if kind != NormalizedKind::CollectionLiteral {
+            return None;
+        }
+        match node.kind() {
+            "array" => Some("array"),
+            "object" => Some("object"),
+            _ => None,
+        }
     }
 
     fn indirection_relation(
@@ -911,10 +1359,7 @@ impl StructuralSpec for JsTsStructuralSpec {
         role: OccurrenceRole,
         declares: Option<NormalizedKind>,
     ) -> Option<Namespace> {
-        match role {
-            OccurrenceRole::PathSegment => Some(Namespace::Module),
-            _ => default_occurrence_namespace(role, declares),
-        }
+        module_path_occurrence_namespace(role, declares)
     }
 
     fn extract(&self, node: Node<'_>, kind: NormalizedKind, sink: &mut RoleSink<'_>) {
@@ -963,96 +1408,118 @@ fn attach_collection_elements(sink: &mut RoleSink<'_>, literal: Node<'_>) {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use brokk_bifrost_core::analyzer::source_facts::PrimarySourceFactCollector;
-    use brokk_bifrost_core::analyzer::structural::spec::RoleSink;
+mod result_use_tests {
+    use super::{JsTsCallResultUseIndex, js_ts_call_result_use};
+    use brokk_bifrost_core::analyzer::structural::result_use::{
+        CallResultUse, IntentionalDiscardKind,
+    };
+    use tree_sitter::Parser;
 
-    #[test]
-    fn typescript_parameter_extracts_name_and_decorator_role() {
-        let source = "class Controller { handle(@Query value: string) {} }";
-        let mut parser = tree_sitter::Parser::new();
-        parser
-            .set_language(&tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into())
-            .expect("TypeScript grammar");
-        let tree = parser.parse(source, None).expect("TypeScript tree");
+    fn tree(source: &str, typescript: bool) -> tree_sitter::Tree {
+        let mut parser = Parser::new();
+        let language = if typescript {
+            tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into()
+        } else {
+            tree_sitter_javascript::LANGUAGE.into()
+        };
+        parser.set_language(&language).expect("JS/TS grammar");
+        parser.parse(source, None).expect("JS/TS tree")
+    }
 
-        let mut parameter = None;
+    fn call_nodes(tree: &tree_sitter::Tree) -> Vec<tree_sitter::Node<'_>> {
+        let mut calls = Vec::new();
         let mut stack = vec![tree.root_node()];
         while let Some(node) = stack.pop() {
-            if node.kind() == "required_parameter" {
-                parameter = Some(node);
+            if node.kind() == "call_expression" {
+                calls.push(node);
             }
-            let mut cursor = node.walk();
-            stack.extend(node.named_children(&mut cursor));
+            for index in (0..node.named_child_count()).rev() {
+                stack.push(node.named_child(index).expect("named child"));
+            }
         }
-        let parameter = parameter.expect("decorated required parameter");
-
-        let mut source_facts = PrimarySourceFactCollector::new(source);
-        let parents = brokk_bifrost_core::analyzer::tree_walk::ParentIndex::new(tree.root_node());
-        let mut sink = RoleSink::new(&mut source_facts, 32, None, &parents);
-        TYPESCRIPT_STRUCTURAL_SPEC.extract(parameter, NormalizedKind::Parameter, &mut sink);
-        let (name, roles, _occurrence_roles, stop) = sink.into_parts();
-
-        assert_eq!(stop, None);
-        let name_range = source_facts.occurrence(name.expect("parameter name")).range;
-        assert_eq!((name_range.start_byte, name_range.end_byte), (33, 38));
-        let decorator = roles
-            .iter()
-            .find(|target| target.role == Role::Decorator)
-            .expect("parameter decorator role");
-        let decorator_range = source_facts.occurrence(decorator.occurrence).range;
-        assert_eq!(
-            &source[decorator_range.start_byte..decorator_range.end_byte],
-            "@Query"
-        );
-        let name_range = source_facts
-            .occurrence(decorator.name.expect("decorator name"))
-            .range;
-        assert_eq!(&source[name_range.start_byte..name_range.end_byte], "Query");
+        calls.sort_by_key(|node| node.start_byte());
+        calls
     }
 
     #[test]
-    fn tsx_parameter_extracts_name_and_decorator_role() {
-        let source = "class Controller { handle(@Query value: string) {} }";
-        let mut parser = tree_sitter::Parser::new();
-        parser
-            .set_language(&tree_sitter_typescript::LANGUAGE_TSX.into())
-            .expect("TSX grammar");
-        let tree = parser.parse(source, None).expect("TSX tree");
-
-        let mut parameter = None;
-        let mut stack = vec![tree.root_node()];
-        while let Some(node) = stack.pop() {
-            if node.kind() == "required_parameter" {
-                parameter = Some(node);
-            }
-            let mut cursor = node.walk();
-            stack.extend(node.named_children(&mut cursor));
+    fn statements_void_and_consumed_contexts_are_distinct_in_both_grammars() {
+        for typescript in [false, true] {
+            let source = if typescript {
+                concat!(
+                    "declare const s: string;\n",
+                    "declare function sink(value: string): void;\n",
+                    "s.trim();\n",
+                    "void s.trim();\n",
+                    "const value = s.trim();\n",
+                    "sink(s.trim());\n",
+                )
+            } else {
+                concat!(
+                    "const s = 'value';\n",
+                    "function sink(value) {}\n",
+                    "s.trim();\n",
+                    "void s.trim();\n",
+                    "const value = s.trim();\n",
+                    "sink(s.trim());\n",
+                )
+            };
+            let tree = tree(source, typescript);
+            assert!(
+                !tree.root_node().has_error(),
+                "{}",
+                tree.root_node().to_sexp()
+            );
+            let calls = call_nodes(&tree);
+            assert_eq!(calls.len(), 5, "{}", tree.root_node().to_sexp());
+            assert_eq!(
+                js_ts_call_result_use(calls[0], source).default_use(),
+                CallResultUse::Discarded
+            );
+            assert_eq!(
+                js_ts_call_result_use(calls[1], source).default_use(),
+                CallResultUse::IntentionalDiscard(IntentionalDiscardKind::JavaScriptVoid)
+            );
+            assert_eq!(
+                js_ts_call_result_use(calls[2], source).default_use(),
+                CallResultUse::Consumed
+            );
+            assert_eq!(
+                js_ts_call_result_use(calls[3], source).default_use(),
+                CallResultUse::Discarded
+            );
+            assert_eq!(
+                js_ts_call_result_use(calls[4], source).default_use(),
+                CallResultUse::Consumed
+            );
         }
-        let parameter = parameter.expect("decorated required parameter");
+    }
 
-        let mut source_facts = PrimarySourceFactCollector::new(source);
-        let parents = brokk_bifrost_core::analyzer::tree_walk::ParentIndex::new(tree.root_node());
-        let mut sink = RoleSink::new(&mut source_facts, 32, None, &parents);
-        TYPESCRIPT_STRUCTURAL_SPEC.extract(parameter, NormalizedKind::Parameter, &mut sink);
-        let (name, roles, _occurrence_roles, stop) = sink.into_parts();
-
-        assert_eq!(stop, None);
-        let name_range = source_facts.occurrence(name.expect("parameter name")).range;
-        assert_eq!((name_range.start_byte, name_range.end_byte), (33, 38));
-        let decorator = roles
-            .iter()
-            .find(|target| target.role == Role::Decorator)
-            .expect("parameter decorator role");
-        let decorator_range = source_facts.occurrence(decorator.occurrence).range;
+    #[test]
+    fn exact_index_uses_the_call_span_and_recovery_stays_open() {
+        let source = "declare const s: string; s.trim();";
+        let parsed = tree(source, false);
+        let calls = call_nodes(&parsed);
+        let index = JsTsCallResultUseIndex::new(parsed.root_node(), source);
         assert_eq!(
-            &source[decorator_range.start_byte..decorator_range.end_byte],
-            "@Query"
+            index
+                .at_span(calls[0].start_byte(), calls[0].end_byte())
+                .expect("indexed call")
+                .default_use(),
+            CallResultUse::Discarded
         );
-        let name_range = source_facts
-            .occurrence(decorator.name.expect("decorator name"))
-            .range;
-        assert_eq!(&source[name_range.start_byte..name_range.end_byte], "Query");
+        assert!(index.at_span(source.len(), source.len()).is_err());
+
+        let recovered_source = "const s = 'value'; s.trim(1 2);";
+        let recovered_tree = tree(recovered_source, false);
+        let recovered_calls = call_nodes(&recovered_tree);
+        assert!(recovered_tree.root_node().has_error());
+        assert!(
+            matches!(
+                js_ts_call_result_use(recovered_calls[0], recovered_source).default_use(),
+                CallResultUse::Open(_)
+            ),
+            "{}",
+            recovered_tree.root_node().to_sexp()
+        );
     }
 }

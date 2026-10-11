@@ -21,10 +21,12 @@
 //!   and reporting the first stage at which the candidate stopped being
 //!   covered. It serves `match` and `assertion` policies;
 //!   [`explain_match_candidate`] is its `match` adapter.
-//!
-//! `why-not` for a flow or taint policy is deliberately not answered here. It
-//! is not a projection of anything retained: it needs candidate-specific
-//! solver queries, and it is designed separately.
+//! - [`explain_flow_candidate`] answers **why not** for one explicit `flow` or
+//!   `taint` candidate: a source position and an observation position. It is
+//!   not a projection of anything retained, so it runs the production compiler
+//!   and solver over only the analysis regions that bind both sites, and, for
+//!   a negative, once more over the policy with its kills removed to name the
+//!   kill that blocked the path (issue 3686).
 //!
 //! Both return a [`PolicyExplanation`]: a versioned root
 //! (`bifrost_policy_explanation/v2`) over a bounded tree of nodes, each with a
@@ -50,7 +52,8 @@
 //!
 //! # Zero cost when unused
 //!
-//! This module is additive. Ordinary policy evaluation calls nothing here. A
+//! This module is additive. Ordinary policy evaluation calls nothing here,
+//! and nothing a candidate question builds outlives its answer. A
 //! host-facing explanation activates semantic sources only when it owns the
 //! disposable analyzer snapshot; a caller-owned analyzer is read under one
 //! pinned active-model publication and is not re-activated.
@@ -62,8 +65,21 @@ mod why;
 mod why_assertion;
 mod why_flow;
 mod why_not;
+mod why_not_flow;
 mod why_not_relational;
 mod why_typestate;
+
+fn add_omitted_amount(truncated: &mut bool, lower_bound: &mut u64, amount: u64) {
+    if amount == 0 {
+        return;
+    }
+    *truncated = true;
+    *lower_bound = (*lower_bound).saturating_add(amount);
+}
+
+fn serialize_json<T: serde::Serialize>(value: &T, message: &'static str) -> String {
+    serde_json::to_string(value).expect(message)
+}
 
 #[cfg(test)]
 mod tests;
@@ -74,7 +90,7 @@ pub use host::{
 pub use model::{
     ExplainError, ExplanationBudgetLimit, ExplanationGeneration, ExplanationGenerationParseError,
     ExplanationLimits, ExplanationNode, ExplanationNodeId, ExplanationNodeKind, ExplanationOutcome,
-    ExplanationQuestion, ExplanationSubject, ExplanationTruncation,
+    ExplanationPosition, ExplanationQuestion, ExplanationSubject, ExplanationTruncation,
     NEAR_MISS_ADAPTER_ANALYSIS_TYPES, POLICY_EXPLANATION_FORMAT, PolicyExplanation,
     WHY_ADAPTER_ANALYSIS_TYPES, WHY_NOT_ADAPTER_ANALYSIS_TYPES,
 };
@@ -84,3 +100,5 @@ pub use near_miss::{
 };
 pub use why::{explain_finding, explain_match_finding};
 pub use why_not::{ExplanationCandidate, explain_candidate, explain_match_candidate};
+pub(crate) use why_not::{absence_reasons, row_covers_candidate};
+pub use why_not_flow::{FlowExplanationCandidate, explain_flow_candidate};

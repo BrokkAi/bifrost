@@ -1,6 +1,10 @@
 use brokk_bifrost_core::analyzer::ProjectFile;
+use brokk_bifrost_core::analyzer::common::{collapse_whitespace, node_source_text as node_text};
 use brokk_bifrost_core::analyzer::model::{TestAssertionSmell, TestAssertionWeights};
-use brokk_bifrost_core::analyzer::tree_walk::{WalkControl, walk_named_tree_preorder};
+use brokk_bifrost_core::analyzer::test_assertions::{
+    TestAssertionSignal, append_test_assertion_findings, is_common_assertion_literal,
+    normalize_assertion_expression, oversized_quoted_literal,
+};
 use regex::Regex;
 use std::sync::LazyLock;
 use tree_sitter::Node;
@@ -97,52 +101,28 @@ fn analyze_scala_test_case(
     weights: &TestAssertionWeights,
     out: &mut Vec<TestAssertionSmell>,
 ) {
-    let assertions = collect_scala_assertions(body, weights);
-    let assertion_count = assertions.len() as i32;
     let symbol = format!("{}::{}", file, name);
-
-    if assertion_count == 0 {
-        out.push(TestAssertionSmell {
-            file: file.clone(),
-            enclosing_fq_name: symbol,
-            assertion_kind: "no-assertions".to_string(),
-            score: weights.no_assertion_weight,
-            assertion_count: 0,
-            reasons: vec!["no-assertions".to_string()],
-            excerpt: compact_scala_excerpt(body),
-            start_byte,
-        });
-        return;
-    }
-
-    for assertion in &assertions {
-        if assertion.score <= 0 {
-            continue;
-        }
-        out.push(TestAssertionSmell {
-            file: file.clone(),
-            enclosing_fq_name: symbol.clone(),
-            assertion_kind: assertion.kind.clone(),
+    let assertions: Vec<_> = collect_scala_assertions(body, weights)
+        .into_iter()
+        .map(|assertion| TestAssertionSignal {
+            kind: assertion.kind,
             score: assertion.score,
-            assertion_count,
-            reasons: vec![assertion.reason.clone()],
-            excerpt: assertion.excerpt.clone(),
+            shallow: assertion.shallow,
+            meaningful: false,
+            reasons: vec![assertion.reason],
+            excerpt: assertion.excerpt,
             start_byte: start_byte + assertion.start_byte,
-        });
-    }
-
-    if assertions.iter().all(|assertion| assertion.shallow) {
-        out.push(TestAssertionSmell {
-            file: file.clone(),
-            enclosing_fq_name: symbol,
-            assertion_kind: "shallow-assertions-only".to_string(),
-            score: weights.shallow_assertion_only_weight,
-            assertion_count,
-            reasons: vec!["shallow-assertions-only".to_string()],
-            excerpt: compact_scala_excerpt(body),
-            start_byte,
-        });
-    }
+        })
+        .collect();
+    append_test_assertion_findings(
+        file,
+        symbol,
+        collapse_whitespace(body),
+        start_byte,
+        &assertions,
+        weights,
+        out,
+    );
 }
 
 fn collect_scala_assertions(
@@ -174,7 +154,7 @@ fn collect_scala_assertions(
                 score,
                 shallow: false,
                 reason: reason.to_string(),
-                excerpt: compact_scala_excerpt(whole.as_str()),
+                excerpt: collapse_whitespace(whole.as_str()),
                 start_byte: whole.start(),
             }
         } else {
@@ -183,7 +163,7 @@ fn collect_scala_assertions(
                 score: 0,
                 shallow: false,
                 reason: "meaningful-assertion".to_string(),
-                excerpt: compact_scala_excerpt(whole.as_str()),
+                excerpt: collapse_whitespace(whole.as_str()),
                 start_byte: whole.start(),
             }
         };
@@ -213,7 +193,7 @@ fn collect_scala_assertions(
                 score,
                 shallow: false,
                 reason: reason.to_string(),
-                excerpt: compact_scala_excerpt(whole.as_str()),
+                excerpt: collapse_whitespace(whole.as_str()),
                 start_byte: whole.start(),
             }
         } else if let Some(literal) = oversized_scala_literal(&left, &right, weights) {
@@ -222,7 +202,7 @@ fn collect_scala_assertions(
                 score: weights.overspecified_literal_weight,
                 shallow: false,
                 reason: format!("overspecified-literal:{literal}"),
-                excerpt: compact_scala_excerpt(whole.as_str()),
+                excerpt: collapse_whitespace(whole.as_str()),
                 start_byte: whole.start(),
             }
         } else {
@@ -231,7 +211,7 @@ fn collect_scala_assertions(
                 score: 0,
                 shallow: false,
                 reason: "meaningful-assertion".to_string(),
-                excerpt: compact_scala_excerpt(whole.as_str()),
+                excerpt: collapse_whitespace(whole.as_str()),
                 start_byte: whole.start(),
             }
         };
@@ -245,7 +225,7 @@ fn collect_scala_assertions(
             score: weights.nullness_only_weight,
             shallow: true,
             reason: "nullness-only".to_string(),
-            excerpt: compact_scala_excerpt(whole.as_str()),
+            excerpt: collapse_whitespace(whole.as_str()),
             start_byte: whole.start(),
         });
     }
@@ -274,7 +254,7 @@ fn collect_scala_assertions(
                 score,
                 shallow: false,
                 reason: reason.to_string(),
-                excerpt: compact_scala_excerpt(whole.as_str()),
+                excerpt: collapse_whitespace(whole.as_str()),
                 start_byte: whole.start(),
             }
         } else if operator == "==" {
@@ -284,7 +264,7 @@ fn collect_scala_assertions(
                     score: weights.overspecified_literal_weight,
                     shallow: false,
                     reason: format!("overspecified-literal:{literal}"),
-                    excerpt: compact_scala_excerpt(whole.as_str()),
+                    excerpt: collapse_whitespace(whole.as_str()),
                     start_byte: whole.start(),
                 }
             } else if is_scala_null_literal(&left) || is_scala_null_literal(&right) {
@@ -293,7 +273,7 @@ fn collect_scala_assertions(
                     score: weights.nullness_only_weight,
                     shallow: true,
                     reason: "nullness-only".to_string(),
-                    excerpt: compact_scala_excerpt(whole.as_str()),
+                    excerpt: collapse_whitespace(whole.as_str()),
                     start_byte: whole.start(),
                 }
             } else {
@@ -302,7 +282,7 @@ fn collect_scala_assertions(
                     score: 0,
                     shallow: false,
                     reason: "meaningful-assertion".to_string(),
-                    excerpt: compact_scala_excerpt(whole.as_str()),
+                    excerpt: collapse_whitespace(whole.as_str()),
                     start_byte: whole.start(),
                 }
             }
@@ -312,7 +292,7 @@ fn collect_scala_assertions(
                 score: 0,
                 shallow: false,
                 reason: "meaningful-assertion".to_string(),
-                excerpt: compact_scala_excerpt(whole.as_str()),
+                excerpt: collapse_whitespace(whole.as_str()),
                 start_byte: whole.start(),
             }
         };
@@ -331,7 +311,7 @@ fn collect_scala_assertions(
                 score: weights.constant_truth_weight,
                 shallow: true,
                 reason: "constant-truth".to_string(),
-                excerpt: compact_scala_excerpt(whole.as_str()),
+                excerpt: collapse_whitespace(whole.as_str()),
                 start_byte: whole.start(),
             }
         } else {
@@ -340,7 +320,7 @@ fn collect_scala_assertions(
                 score: 0,
                 shallow: false,
                 reason: "meaningful-assertion".to_string(),
-                excerpt: compact_scala_excerpt(whole.as_str()),
+                excerpt: collapse_whitespace(whole.as_str()),
                 start_byte: whole.start(),
             }
         };
@@ -355,7 +335,7 @@ fn collect_scala_assertions(
                 score: 0,
                 shallow: false,
                 reason: "meaningful-assertion".to_string(),
-                excerpt: compact_scala_excerpt(whole.as_str()),
+                excerpt: collapse_whitespace(whole.as_str()),
                 start_byte: whole.start(),
             });
         }
@@ -365,27 +345,16 @@ fn collect_scala_assertions(
 }
 
 fn normalize_scala_expr(expr: &str) -> String {
-    expr.trim()
-        .trim_matches(|ch| matches!(ch, '(' | ')' | ' '))
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ")
+    normalize_assertion_expression(expr)
 }
 
 fn is_scala_literal(expr: &str) -> bool {
     let trimmed = expr.trim();
-    (trimmed.starts_with('"') && trimmed.ends_with('"'))
-        || matches!(trimmed, "true" | "false" | "null")
-        || trimmed.parse::<i64>().is_ok()
-        || trimmed.parse::<f64>().is_ok()
+    is_common_assertion_literal(trimmed) || matches!(trimmed, "true" | "false" | "null")
 }
 
 fn is_scala_null_literal(expr: &str) -> bool {
     expr.trim() == "null"
-}
-
-fn compact_scala_excerpt(text: &str) -> String {
-    text.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 fn oversized_scala_literal(
@@ -393,32 +362,16 @@ fn oversized_scala_literal(
     right: &str,
     weights: &TestAssertionWeights,
 ) -> Option<String> {
-    [left, right].into_iter().find_map(|expr| {
-        let trimmed = expr.trim();
-        let unquoted = trimmed
-            .strip_prefix('"')
-            .and_then(|s| s.strip_suffix('"'))?;
-        (unquoted.len() >= weights.large_literal_length_threshold.max(0) as usize)
-            .then(|| trimmed.to_string())
-    })
+    oversized_quoted_literal(left, right, weights, &['"'])
 }
 
 pub fn scala_contains_tests(root: Node<'_>, source: &str) -> bool {
-    let mut found = false;
-    walk_named_tree_preorder(root, true, |node| {
-        found |= match node.kind() {
-            "annotation" => scala_test_annotation(node, source),
-            "call_expression" | "generic_function" => scala_test_call(node, source),
-            "infix_expression" => scala_test_infix(node, source),
-            _ => false,
-        };
-        if found {
-            WalkControl::SkipChildren
-        } else {
-            WalkControl::Continue
-        }
-    });
-    found
+    crate::test_detection::contains_test_node(root, |node| match node.kind() {
+        "annotation" => scala_test_annotation(node, source),
+        "call_expression" | "generic_function" => scala_test_call(node, source),
+        "infix_expression" => scala_test_infix(node, source),
+        _ => false,
+    })
 }
 
 fn scala_test_annotation(node: Node<'_>, source: &str) -> bool {
@@ -462,10 +415,4 @@ fn final_identifier_text<'a>(node: Node<'_>, source: &'a str) -> Option<&'a str>
         }
     }
     last
-}
-
-fn node_text<'a>(node: Node<'_>, source: &'a str) -> &'a str {
-    source
-        .get(node.start_byte()..node.end_byte())
-        .unwrap_or_default()
 }

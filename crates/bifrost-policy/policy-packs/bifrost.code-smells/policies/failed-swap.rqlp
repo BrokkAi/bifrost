@@ -6,7 +6,7 @@
   :name "Failed local swap"
   :message "the second assignment copies back the first assignment's value"
   :severity warning
-  :description "Two adjacent ordinary local assignments have crossed exact binding identities: a = b followed by b = a. Exact reaching evidence proves the second read receives the first write, which can indicate a failed swap. Intent is not inferred and no automatic fix is offered."
+  :description "Two adjacent ordinary local or parameter assignments have crossed exact binding identities: a = b followed by b = a. Exact reaching evidence proves the second read receives the first write, which can indicate a failed swap. C and C++ report distinct fundamental and pointer objects; volatile, const, reference, aggregate, overloadable, aliased, macro-uncertain, and incomplete-flow cases remain open. Intent is not inferred and no automatic fix is offered."
   :help-uri "https://bifrost.brokk.ai/static-analysis-policies/#built-in-code-smell-pack"
   :tags ["correctness" "assignment"]
   :analysis (analysis
@@ -18,7 +18,7 @@
                         (verdict eq failed_swap)
                         (proof eq exact)
                         (coverage eq exhaustive))
-          (language java javascript typescript python csharp kotlin go rust
+          (language java javascript typescript python csharp kotlin go rust scala php ruby cpp
             (assignment-relations :relation [failed-swap]
               (procedure-of
                 (callable)))))))

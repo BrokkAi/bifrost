@@ -11,20 +11,17 @@ pub(in crate::analyzer::usages) use brokk_bifrost_php::aliases::{
     PhpCallableCandidates, PhpFileContext as FileContext, php_dynamic_type_keyword,
     resolve_php_constant, resolve_php_function, resolve_php_type, resolve_php_type_arms,
 };
-pub(in crate::analyzer::usages) use brokk_bifrost_php::graph::resolver::{
-    node_text as php_node_text, qualified_candidate_text as php_qualified_candidate_text,
-};
+pub(in crate::analyzer::usages) use brokk_bifrost_php::graph::resolver::node_text as php_node_text;
 pub(in crate::analyzer::usages) use brokk_bifrost_php::graph::syntax;
 
 use crate::analyzer::fq_name::{SegmentKind, segment_interner};
 use crate::analyzer::store::StoreError;
 use crate::analyzer::usages::common::language_for_target;
 use crate::analyzer::usages::inverted_edges::{UsageEdgeWeights, UsageEdges};
-use crate::analyzer::usages::model::FuzzyResult;
-use crate::analyzer::usages::outcome::{GraphFailureReason, GraphUsageOutcome};
+use crate::analyzer::usages::outcome::GraphUsageOutcome;
 use crate::analyzer::usages::php_graph::shared::{PhpEdgeResolver, PhpQueryResolver};
 use crate::analyzer::usages::traits::GraphUsageAnalyzer;
-use crate::analyzer::usages::traits::{UsageQueryResolver, UsageScanScope};
+use crate::analyzer::usages::traits::{GraphUsageDispatchSpec, UsageScanScope};
 use crate::analyzer::{
     AnalyzerDefinitionLookup, CodeUnit, DefinitionLanguageScope, FqName, IAnalyzer, Language,
     PhpAnalyzer, ProjectFile, RelationalBatchOutcome, RelationalCallableFact,
@@ -268,7 +265,7 @@ where
     F: Fn(&ProjectFile) -> bool + Sync,
 {
     let resolver = PhpEdgeResolver::try_new(analyzer)?;
-    Some(resolver.build_edge_weights(analyzer, nodes, keep_file))
+    Some(resolver.build_edges(analyzer, nodes, keep_file))
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -320,29 +317,17 @@ impl GraphUsageAnalyzer for PhpUsageGraphStrategy {
         scan_scope: &UsageScanScope<'_>,
         max_usages: usize,
     ) -> GraphUsageOutcome {
-        if overloads.is_empty() {
-            return GraphUsageOutcome::Resolved(FuzzyResult::empty_success());
-        }
-
-        let target = &overloads[0];
-        if language_for_target(target) != Language::Php {
-            return GraphUsageOutcome::fallback_safe(
-                target.fq_name(),
-                GraphFailureReason::UnsupportedTargetLanguage("target is not PHP"),
-                "PhpUsageGraphStrategy",
-            );
-        }
-
-        let Some(resolver) = PhpQueryResolver::try_new(analyzer) else {
-            return GraphUsageOutcome::fallback_safe(
-                target.fq_name(),
-                GraphFailureReason::MissingAnalyzerCapability(
-                    "analyzer does not expose PhpAnalyzer",
-                ),
-                "PhpUsageGraphStrategy",
-            );
-        };
-
-        resolver.find_usages(analyzer, overloads, scan_scope, max_usages)
+        crate::analyzer::usages::traits::dispatch_graph_usage_query::<PhpQueryResolver<'_>>(
+            analyzer,
+            overloads,
+            scan_scope,
+            max_usages,
+            GraphUsageDispatchSpec {
+                target_language: Language::Php,
+                unsupported_target: "target is not PHP",
+                missing_analyzer: "analyzer does not expose PhpAnalyzer",
+                strategy: "PhpUsageGraphStrategy",
+            },
+        )
     }
 }

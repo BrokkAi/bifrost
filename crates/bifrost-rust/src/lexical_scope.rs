@@ -1,9 +1,10 @@
 use brokk_bifrost_core::analyzer::common::{
-    node_ident_text, parse_source_range_with_cancellation, parse_source_region,
+    parse_source_range_with_cancellation, parse_source_region,
 };
 use brokk_bifrost_core::analyzer::model::{ImportInfo, StructuredImportPathKind};
 use brokk_bifrost_core::analyzer::parsed_file::SourceImportFact;
 use brokk_bifrost_core::analyzer::usages::model::{ImportBinder, ImportBinding, ImportKind};
+use brokk_bifrost_core::analyzer::weighted_cache::{build_weighted_cache, weight_source_text};
 use brokk_bifrost_core::hash::{HashMap, HashSet};
 use moka::sync::Cache;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -13,7 +14,7 @@ use tree_sitter::{Node, Parser, Tree};
 use crate::imports::{
     RustImportBindingName, rust_import_binding_name, rust_imports_from_use_declaration,
 };
-use crate::syntax::{outer_attributes, unwrap_attributes};
+use crate::syntax::{outer_attributes, outer_attributes_with_parent, unwrap_attributes};
 
 /// Re-exported from core, where the persisted `rust_import_targets` row shape
 /// that carries it lives. Kept spelled here because every reader of a cfg
@@ -21,29 +22,39 @@ use crate::syntax::{outer_attributes, unwrap_attributes};
 pub use brokk_bifrost_core::analyzer::rust_facts::RustCfgCondition;
 
 pub fn rust_cfg_condition(node: Node<'_>, source: &str) -> RustCfgCondition {
-    let mut condition = RustCfgCondition::Always;
-    for attribute_item in outer_attributes(node) {
-        if attribute_item.kind() != "attribute_item" {
-            break;
-        }
-        match cfg_attribute_condition(attribute_item, source) {
-            Err(()) => return RustCfgCondition::Unknown,
-            Ok(None) => {}
-            Ok(Some(candidate)) => {
-                condition = RustCfgCondition::conjunction([condition, candidate]);
-            }
-        }
-    }
-    condition
+    rust_cfg_condition_from_attributes(
+        outer_attributes(node).take_while(|attribute| attribute.kind() == "attribute_item"),
+        source,
+    )
+}
+
+pub(crate) fn rust_cfg_condition_with_parent(
+    node: Node<'_>,
+    parent: Option<Node<'_>>,
+    source: &str,
+) -> RustCfgCondition {
+    rust_cfg_condition_from_attributes(
+        outer_attributes_with_parent(node, parent)
+            .take_while(|attribute| attribute.kind() == "attribute_item"),
+        source,
+    )
 }
 
 pub fn rust_crate_cfg_condition(root: Node<'_>, source: &str) -> RustCfgCondition {
-    let mut condition = RustCfgCondition::Always;
     let mut cursor = root.walk();
-    for attribute_item in root
-        .named_children(&mut cursor)
-        .filter(|child| child.kind() == "inner_attribute_item")
-    {
+    rust_cfg_condition_from_attributes(
+        root.named_children(&mut cursor)
+            .filter(|child| child.kind() == "inner_attribute_item"),
+        source,
+    )
+}
+
+fn rust_cfg_condition_from_attributes<'tree>(
+    attributes: impl Iterator<Item = Node<'tree>>,
+    source: &str,
+) -> RustCfgCondition {
+    let mut condition = RustCfgCondition::Always;
+    for attribute_item in attributes {
         match cfg_attribute_condition(attribute_item, source) {
             Err(()) => return RustCfgCondition::Unknown,
             Ok(None) => {}
@@ -61,7 +72,7 @@ fn cfg_attribute_condition(
 ) -> Result<Option<RustCfgCondition>, ()> {
     let attribute = attribute_item.named_child(0).ok_or(())?;
     let path = attribute.named_child(0).ok_or(())?;
-    if node_text(path, source).trim() != "cfg" {
+    if crate::declarations::rust_node_text(path, source).trim() != "cfg" {
         return Ok(None);
     }
     Ok(Some(
@@ -126,7 +137,7 @@ pub(crate) fn rust_cfg_argument_condition(
         if first.kind() != "identifier" {
             return None;
         }
-        let name = node_text(first, source);
+        let name = crate::declarations::rust_node_text(first, source);
         match nodes.as_slice() {
             [_] => output.push(RustCfgInstruction::Atom(name.to_string())),
             [_, equals, literal] if equals.kind() == "=" => {
@@ -213,64 +224,9 @@ static RUST_TREE_PARSED_BYTES: AtomicUsize = AtomicUsize::new(0);
 static RUST_SCOPE_INDEXES: OnceLock<Cache<Arc<str>, Arc<RustLexicalScopeIndex>>> = OnceLock::new();
 static RUST_SCOPE_INDEX_BUILDS: AtomicUsize = AtomicUsize::new(0);
 
-#[cfg(test)]
-std::thread_local! {
-    static FIXTURE_TREE_PARSE_COUNTS: std::cell::Cell<Option<(usize, usize)>> =
-        const { std::cell::Cell::new(None) };
-}
-
-/// Count actual parses and requests made synchronously by one fixture. The
-/// existing aggregate counters still cover workers in integration tests.
-#[cfg(test)]
-pub(crate) fn with_rust_tree_parse_counts_for_test<T>(
-    fixture: impl FnOnce() -> T,
-) -> (T, (usize, usize)) {
-    struct Reset<'a>(&'a std::cell::Cell<Option<(usize, usize)>>);
-    impl Drop for Reset<'_> {
-        fn drop(&mut self) {
-            self.0.set(None);
-        }
-    }
-    FIXTURE_TREE_PARSE_COUNTS.with(|counts| {
-        assert!(
-            counts.get().is_none(),
-            "one parse observer per fixture thread"
-        );
-        counts.set(Some((0, 0)));
-        let reset = Reset(counts);
-        let result = fixture();
-        let observed = counts.get().expect("fixture parse observer is active");
-        drop(reset);
-        (result, observed)
-    })
-}
-
-#[cfg(test)]
-fn record_fixture_tree_parse() {
-    FIXTURE_TREE_PARSE_COUNTS.with(|counts| {
-        if let Some((parses, requests)) = counts.get() {
-            counts.set(Some((parses + 1, requests)));
-        }
-    });
-}
-
-#[cfg(test)]
-fn record_fixture_tree_parse_request() {
-    FIXTURE_TREE_PARSE_COUNTS.with(|counts| {
-        if let Some((parses, requests)) = counts.get() {
-            counts.set(Some((parses, requests + 1)));
-        }
-    });
-}
-
 fn rust_scope_index_cache() -> &'static Cache<Arc<str>, Arc<RustLexicalScopeIndex>> {
     RUST_SCOPE_INDEXES.get_or_init(|| {
-        Cache::builder()
-            .max_capacity(RUST_TREE_CACHE_SOURCE_BUDGET_BYTES)
-            .weigher(|key: &Arc<str>, _value: &Arc<RustLexicalScopeIndex>| {
-                key.len().min(u32::MAX as usize) as u32
-            })
-            .build()
+        build_weighted_cache(RUST_TREE_CACHE_SOURCE_BUDGET_BYTES, weight_source_text)
     })
 }
 
@@ -320,19 +276,12 @@ pub fn rust_scope_index_build_count_for_test() -> usize {
 
 fn rust_tree_cache() -> &'static Cache<Arc<str>, Option<Tree>> {
     RUST_TREES.get_or_init(|| {
-        Cache::builder()
-            .max_capacity(RUST_TREE_CACHE_SOURCE_BUDGET_BYTES)
-            .weigher(|key: &Arc<str>, _value: &Option<Tree>| {
-                key.len().min(u32::MAX as usize) as u32
-            })
-            .build()
+        build_weighted_cache(RUST_TREE_CACHE_SOURCE_BUDGET_BYTES, weight_source_text)
     })
 }
 
 pub(crate) fn parse_rust_tree_uncached(source: &str) -> Option<Tree> {
     RUST_TREE_PARSES.fetch_add(1, Ordering::Relaxed);
-    #[cfg(test)]
-    record_fixture_tree_parse();
     RUST_TREE_PARSED_BYTES.fetch_add(source.len(), Ordering::Relaxed);
     let mut parser = Parser::new();
     parser
@@ -361,8 +310,6 @@ pub(crate) fn parse_rust_tree_uncached(source: &str) -> Option<Tree> {
 /// parse to several threads.
 pub fn parse_rust_tree(source: &str) -> Option<Tree> {
     RUST_TREE_PARSE_REQUESTS.fetch_add(1, Ordering::Relaxed);
-    #[cfg(test)]
-    record_fixture_tree_parse_request();
     let cache = rust_tree_cache();
     if let Some(cached) = cache.get(source) {
         return cached;
@@ -381,32 +328,32 @@ pub fn parse_rust_tree(source: &str) -> Option<Tree> {
 /// while a region parse is additionally keyed by position, and macro-interior
 /// reparses happen once per invocation site during a file's analysis pass.
 pub fn parse_rust_region_tree(source: &str, start: usize, end: usize) -> Option<Tree> {
-    RUST_TREE_PARSE_REQUESTS.fetch_add(1, Ordering::Relaxed);
-    RUST_TREE_PARSES.fetch_add(1, Ordering::Relaxed);
-    #[cfg(test)]
-    {
-        record_fixture_tree_parse_request();
-        record_fixture_tree_parse();
-    }
-    RUST_TREE_PARSED_BYTES.fetch_add(end.saturating_sub(start), Ordering::Relaxed);
-    parse_source_region(&tree_sitter_rust::LANGUAGE.into(), source, start, end)
+    parse_rust_fragment_tree(end.saturating_sub(start), || {
+        parse_source_region(&tree_sitter_rust::LANGUAGE.into(), source, start, end)
+    })
 }
 
 /// Parse an AST-provided range without scanning the source prefix to recover
 /// line/column positions for each embedded invocation.
 pub(crate) fn parse_rust_range_tree(source: &str, range: tree_sitter::Range) -> Option<Tree> {
+    parse_rust_fragment_tree(range.end_byte.saturating_sub(range.start_byte), || {
+        parse_source_range_with_cancellation(
+            &tree_sitter_rust::LANGUAGE.into(),
+            source,
+            range,
+            None,
+        )
+    })
+}
+
+fn parse_rust_fragment_tree(
+    parse_bytes: usize,
+    parse: impl FnOnce() -> Option<Tree>,
+) -> Option<Tree> {
     RUST_TREE_PARSE_REQUESTS.fetch_add(1, Ordering::Relaxed);
     RUST_TREE_PARSES.fetch_add(1, Ordering::Relaxed);
-    #[cfg(test)]
-    {
-        record_fixture_tree_parse_request();
-        record_fixture_tree_parse();
-    }
-    RUST_TREE_PARSED_BYTES.fetch_add(
-        range.end_byte.saturating_sub(range.start_byte),
-        Ordering::Relaxed,
-    );
-    parse_source_range_with_cancellation(&tree_sitter_rust::LANGUAGE.into(), source, range, None)
+    RUST_TREE_PARSED_BYTES.fetch_add(parse_bytes, Ordering::Relaxed);
+    parse()
 }
 
 /// Number of Rust source texts actually handed to tree-sitter since the last
@@ -603,12 +550,7 @@ static RUST_USE_STATEMENTS: OnceLock<Cache<Arc<str>, Arc<Vec<RustUseStatement>>>
 
 fn rust_use_statement_cache() -> &'static Cache<Arc<str>, Arc<Vec<RustUseStatement>>> {
     RUST_USE_STATEMENTS.get_or_init(|| {
-        Cache::builder()
-            .max_capacity(RUST_TREE_CACHE_SOURCE_BUDGET_BYTES)
-            .weigher(|key: &Arc<str>, _value: &Arc<Vec<RustUseStatement>>| {
-                key.len().min(u32::MAX as usize) as u32
-            })
-            .build()
+        build_weighted_cache(RUST_TREE_CACHE_SOURCE_BUDGET_BYTES, weight_source_text)
     })
 }
 
@@ -811,7 +753,7 @@ pub fn visible_import_binder_in_tree(
     binder
 }
 
-fn use_statement_visible_at(
+pub(crate) fn use_statement_visible_at(
     reference_byte: usize,
     reference_mod_range: Option<(usize, usize)>,
     mod_range: Option<(usize, usize)>,
@@ -848,7 +790,7 @@ pub fn enclosing_mod_item_range_at(node: Node<'_>, byte: usize) -> Option<(usize
     }
 }
 
-fn lexical_scope_kind(kind: &str) -> bool {
+pub(crate) fn lexical_scope_kind(kind: &str) -> bool {
     matches!(
         kind,
         "block" | "function_item" | "impl_item" | "trait_item" | "mod_item"
@@ -1130,7 +1072,7 @@ impl RustLexicalScopeIndex {
         let Some(name) = item.child_by_field_name("name") else {
             return;
         };
-        let name = node_text(name, source).trim();
+        let name = crate::declarations::rust_node_text(name, source).trim();
         if name.is_empty() {
             return;
         }
@@ -1168,6 +1110,22 @@ pub fn local_item_name_shadowed_in_tree(
     name: &str,
     reference_byte: usize,
 ) -> bool {
+    local_name_shadowed_in_tree_with_collector(
+        root,
+        source,
+        name,
+        reference_byte,
+        collect_visible_local_items,
+    )
+}
+
+fn local_name_shadowed_in_tree_with_collector<'tree>(
+    root: Node<'tree>,
+    source: &str,
+    name: &str,
+    reference_byte: usize,
+    collect_items: fn(Node<'tree>, &str, usize, &mut HashSet<String>),
+) -> bool {
     let Some(scope) = enclosing_function_or_closure(root, reference_byte) else {
         return false;
     };
@@ -1175,7 +1133,7 @@ pub fn local_item_name_shadowed_in_tree(
         return false;
     };
     let mut items = HashSet::default();
-    collect_visible_local_items(body, source, reference_byte, &mut items);
+    collect_items(body, source, reference_byte, &mut items);
     items.contains(name)
 }
 
@@ -1189,15 +1147,13 @@ pub fn local_type_item_name_shadowed_in_tree(
     name: &str,
     reference_byte: usize,
 ) -> bool {
-    let Some(scope) = enclosing_function_or_closure(root, reference_byte) else {
-        return false;
-    };
-    let Some(body) = scope.child_by_field_name("body") else {
-        return false;
-    };
-    let mut items = HashSet::default();
-    collect_visible_local_type_items(body, source, reference_byte, &mut items);
-    items.contains(name)
+    local_name_shadowed_in_tree_with_collector(
+        root,
+        source,
+        name,
+        reference_byte,
+        collect_visible_local_type_items,
+    )
 }
 
 fn collect_visible_local_items(
@@ -1365,7 +1321,11 @@ fn enclosing_function_or_closure(root: Node<'_>, reference_byte: usize) -> Optio
 }
 
 fn contains_byte(node: Node<'_>, byte: usize) -> bool {
-    node.start_byte() <= byte && byte < node.end_byte()
+    brokk_bifrost_core::analyzer::model::byte_range_contains(
+        node.start_byte(),
+        node.end_byte(),
+        byte,
+    )
 }
 
 fn child_lexical_scope_containing_reference(
@@ -1390,7 +1350,7 @@ fn child_lexical_scope_containing_reference(
 
 fn collect_local_item_name(node: Node<'_>, source: &str, out: &mut HashSet<String>) {
     if let Some(name) = node.child_by_field_name("name") {
-        let text = node_text(name, source).trim();
+        let text = crate::declarations::rust_node_text(name, source).trim();
         if !text.is_empty() {
             out.insert(text.to_string());
         }
@@ -1403,7 +1363,7 @@ fn collect_pattern_bindings(node: Node<'_>, source: &str, out: &mut HashSet<Stri
         match node.kind() {
             "scoped_identifier" | "scoped_type_identifier" => {}
             "identifier" => {
-                let text = node_text(node, source).trim();
+                let text = crate::declarations::rust_node_text(node, source).trim();
                 if !text.is_empty() {
                     out.insert(text.to_string());
                 }
@@ -1412,7 +1372,7 @@ fn collect_pattern_bindings(node: Node<'_>, source: &str, out: &mut HashSet<Stri
                 if let Some(pattern) = node.child_by_field_name("pattern") {
                     stack.push(pattern);
                 } else if let Some(name) = node.child_by_field_name("name") {
-                    let text = node_text(name, source).trim();
+                    let text = crate::declarations::rust_node_text(name, source).trim();
                     if !text.is_empty() {
                         out.insert(text.to_string());
                     }
@@ -1456,55 +1416,136 @@ fn collect_pattern_bindings(node: Node<'_>, source: &str, out: &mut HashSet<Stri
     }
 }
 
-/// Same identifier-kind-gated `r#` stripping as `declarations::rust_node_text`
-/// (#1128): local bindings/imports here must match the normalized names
-/// declarations and usage sites agree on.
-fn node_text<'a>(node: Node<'_>, source: &'a str) -> &'a str {
-    node_ident_text(
-        node,
-        source,
-        false,
-        &crate::declarations::RUST_IDENTIFIER_SIGIL,
-    )
-}
-
 #[cfg(test)]
 mod tests {
     use std::fmt::Write as _;
 
     use super::*;
+    use brokk_bifrost_test_macros::hardwon;
 
     #[test]
-    fn parse_observers_exclude_concurrent_fixture_work() {
-        let ready = std::sync::Barrier::new(2);
-        std::thread::scope(|scope| {
-            let workers = [1, 3].map(|expected| {
-                let ready = &ready;
-                scope.spawn(move || {
-                    let (_, counts) = with_rust_tree_parse_counts_for_test(|| {
-                        let source = "fn observed() {}";
-                        for _ in 0..expected {
-                            assert!(parse_rust_region_tree(source, 0, source.len()).is_some());
-                        }
-                        // Both fixtures have parsed while both observers are
-                        // active, so an aggregate counter cannot pin either.
-                        ready.wait();
-                    });
-                    assert_eq!(counts, (expected, expected));
-                })
-            });
-            for worker in workers {
-                worker
-                    .join()
-                    .expect("fixture parse observer is independent");
-            }
-        });
-        let (_, counts) = with_rust_tree_parse_counts_for_test(|| {});
+    #[hardwon(
+        "46e7bf58c956: The cfg adapter distinguishes a direct feature predicate from its negation on separate declarations."
+    )]
+    fn cfg_condition_reads_direct_feature_and_not_feature_attributes() {
+        let source = r#"
+#[cfg(feature = "query_apply")]
+use crate::apply::apply_from_stdin;
+
+#[cfg(not(feature = "query_apply"))]
+fn apply_from_stdin() -> u8 { 1 }
+"#;
+        let tree = parse_rust_tree_uncached(source).expect("parse Rust fixture");
+        let root = tree.root_node();
+        let mut cursor = root.walk();
+        let declarations = root.named_children(&mut cursor).collect::<Vec<_>>();
+        let use_declaration = declarations
+            .iter()
+            .copied()
+            .find(|node| unwrap_attributes(*node).kind() == "use_declaration")
+            .expect("use declaration");
+        let function = declarations
+            .iter()
+            .copied()
+            .find(|node| unwrap_attributes(*node).kind() == "function_item")
+            .expect("function declaration");
+
         assert_eq!(
-            counts,
-            (0, 0),
-            "a finished fixture leaves no active observer"
+            rust_cfg_condition(use_declaration, source),
+            RustCfgCondition::Atom("feature = \"query_apply\"".to_string())
         );
+        assert_eq!(
+            rust_cfg_condition(function, source),
+            RustCfgCondition::NotAtom("feature = \"query_apply\"".to_string())
+        );
+    }
+
+    #[test]
+    #[hardwon(
+        "4c73366ac22d: The parsed alias keeps the lowercase source item as its named target instead of treating it as a namespace import."
+    )]
+    fn aliased_lowercase_import_preserves_the_named_target() {
+        let source = "use crate::models::with_tracing::{linear_no_bias as linear};\n";
+        let binder = visible_import_binder_at(source, source.len());
+        let binding = binder
+            .bindings
+            .get("linear")
+            .expect("the alias must be visible");
+
+        assert_eq!(binding.kind, ImportKind::Named);
+        assert_eq!(binding.imported_name.as_deref(), Some("linear_no_bias"));
+    }
+
+    #[test]
+    fn extern_crate_is_structured_and_does_not_enter_use_binder() {
+        let source = "extern crate dependency as dep;\n";
+        let tree = parse_rust_tree_uncached(source).expect("parse Rust fixture");
+        let imports = crate::imports::rust_import_projection(tree.root_node(), source, "");
+        assert_eq!(imports.len(), 1);
+        let import = &imports[0].import;
+        assert!(import.is_extern_crate());
+        assert_eq!(import.path(), ["dependency"]);
+
+        let mut binder = ImportBinder::empty();
+        insert_rust_import_binding(&mut binder, &import.info);
+        assert!(binder.bindings.is_empty());
+    }
+
+    #[test]
+    #[hardwon(
+        "75d44cf79d6d: A parsed as _ import remains absent from the ordinary name map while a neighboring named import binds normally."
+    )]
+    fn unnamed_import_does_not_enter_the_ordinary_name_map() {
+        let source = "use crate::Trait as _;\nuse crate::Named;\n";
+        let binder = visible_import_binder_at(source, source.len());
+
+        assert!(!binder.bindings.contains_key("_"));
+        assert!(binder.bindings.contains_key("Named"));
+    }
+
+    #[test]
+    fn local_type_item_shadow_ignores_value_items() {
+        let source = r#"
+fn function_value() {
+    fn extjson() {}
+    let _: extjson::models::DateTimeBody = todo(); // FUNCTION_VALUE
+}
+
+fn const_value() {
+    const extjson: usize = 0;
+    let _: extjson::models::DateTimeBody = todo(); // CONST_VALUE
+}
+
+fn static_value() {
+    static extjson: usize = 0;
+    let _: extjson::models::DateTimeBody = todo(); // STATIC_VALUE
+}
+
+fn type_item() {
+    struct extjson;
+    let _: extjson::models::DateTimeBody = todo(); // TYPE_ITEM
+}
+"#;
+        let tree = parse_rust_tree_uncached(source).expect("parse Rust fixture");
+        for marker in ["FUNCTION_VALUE", "CONST_VALUE", "STATIC_VALUE"] {
+            let reference_byte = source.find(marker).expect("reference marker");
+            assert!(
+                !local_type_item_name_shadowed_in_tree(
+                    tree.root_node(),
+                    source,
+                    "extjson",
+                    reference_byte,
+                ),
+                "value item must not shadow a type/module path ({marker})"
+            );
+        }
+        let reference_byte = source.find("TYPE_ITEM").expect("reference marker");
+        assert!(local_type_item_name_shadowed_in_tree(
+            tree.root_node(),
+            source,
+            "extjson",
+            reference_byte,
+        ));
     }
 
     #[test]
@@ -1576,53 +1617,6 @@ mod selected {
     }
 
     #[test]
-    fn cfg_condition_reads_direct_feature_and_not_feature_attributes() {
-        let source = r#"
-#[cfg(feature = "query_apply")]
-use crate::apply::apply_from_stdin;
-
-#[cfg(not(feature = "query_apply"))]
-fn apply_from_stdin() -> u8 { 1 }
-"#;
-        let tree = parse_rust_tree_uncached(source).expect("parse Rust fixture");
-        let root = tree.root_node();
-        let mut cursor = root.walk();
-        let declarations = root.named_children(&mut cursor).collect::<Vec<_>>();
-        let use_declaration = declarations
-            .iter()
-            .copied()
-            .find(|node| unwrap_attributes(*node).kind() == "use_declaration")
-            .expect("use declaration");
-        let function = declarations
-            .iter()
-            .copied()
-            .find(|node| unwrap_attributes(*node).kind() == "function_item")
-            .expect("function declaration");
-
-        assert_eq!(
-            rust_cfg_condition(use_declaration, source),
-            RustCfgCondition::Atom("feature = \"query_apply\"".to_string())
-        );
-        assert_eq!(
-            rust_cfg_condition(function, source),
-            RustCfgCondition::NotAtom("feature = \"query_apply\"".to_string())
-        );
-    }
-
-    #[test]
-    fn aliased_lowercase_import_preserves_the_named_target() {
-        let source = "use crate::models::with_tracing::{linear_no_bias as linear};\n";
-        let binder = visible_import_binder_at(source, source.len());
-        let binding = binder
-            .bindings
-            .get("linear")
-            .expect("the alias must be visible");
-
-        assert_eq!(binding.kind, ImportKind::Named);
-        assert_eq!(binding.imported_name.as_deref(), Some("linear_no_bias"));
-    }
-
-    #[test]
     fn import_binding_uses_structured_path_instead_of_display_text() {
         let source = "use crate::models::{Thing as Local, lower};\n";
         let tree = parse_rust_tree_uncached(source).expect("parse Rust fixture");
@@ -1647,21 +1641,6 @@ fn apply_from_stdin() -> u8 { 1 }
         assert_eq!(lower.kind, ImportKind::Namespace);
         assert_eq!(lower.module_specifier, "crate::models::lower");
         assert_eq!(lower.imported_name, None);
-    }
-
-    #[test]
-    fn extern_crate_is_structured_and_does_not_enter_use_binder() {
-        let source = "extern crate dependency as dep;\n";
-        let tree = parse_rust_tree_uncached(source).expect("parse Rust fixture");
-        let imports = crate::imports::rust_import_projection(tree.root_node(), source, "");
-        assert_eq!(imports.len(), 1);
-        let import = &imports[0].import;
-        assert!(import.is_extern_crate());
-        assert_eq!(import.path(), ["dependency"]);
-
-        let mut binder = ImportBinder::empty();
-        insert_rust_import_binding(&mut binder, &import.info);
-        assert!(binder.bindings.is_empty());
     }
 
     #[test]
@@ -1695,59 +1674,5 @@ fn apply_from_stdin() -> u8 { 1 }
         assert_eq!(absolute_alias.kind, ImportKind::Named);
         assert_eq!(absolute_alias.module_specifier, "");
         assert_eq!(absolute_alias.imported_name.as_deref(), Some("crate"));
-    }
-
-    #[test]
-    fn unnamed_import_does_not_enter_the_ordinary_name_map() {
-        let source = "use crate::Trait as _;\nuse crate::Named;\n";
-        let binder = visible_import_binder_at(source, source.len());
-
-        assert!(!binder.bindings.contains_key("_"));
-        assert!(binder.bindings.contains_key("Named"));
-    }
-
-    #[test]
-    fn local_type_item_shadow_ignores_value_items() {
-        let source = r#"
-fn function_value() {
-    fn extjson() {}
-    let _: extjson::models::DateTimeBody = todo(); // FUNCTION_VALUE
-}
-
-fn const_value() {
-    const extjson: usize = 0;
-    let _: extjson::models::DateTimeBody = todo(); // CONST_VALUE
-}
-
-fn static_value() {
-    static extjson: usize = 0;
-    let _: extjson::models::DateTimeBody = todo(); // STATIC_VALUE
-}
-
-fn type_item() {
-    struct extjson;
-    let _: extjson::models::DateTimeBody = todo(); // TYPE_ITEM
-}
-"#;
-        let tree = parse_rust_tree_uncached(source).expect("parse Rust fixture");
-        for marker in ["FUNCTION_VALUE", "CONST_VALUE", "STATIC_VALUE"] {
-            let reference_byte = source.find(marker).expect("reference marker");
-            assert!(
-                !local_type_item_name_shadowed_in_tree(
-                    tree.root_node(),
-                    source,
-                    "extjson",
-                    reference_byte,
-                ),
-                "value item must not shadow a type/module path ({marker})"
-            );
-        }
-        let reference_byte = source.find("TYPE_ITEM").expect("reference marker");
-        assert!(local_type_item_name_shadowed_in_tree(
-            tree.root_node(),
-            source,
-            "extjson",
-            reference_byte,
-        ));
     }
 }

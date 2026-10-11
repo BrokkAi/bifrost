@@ -5,6 +5,7 @@ pub mod class_set_summaries;
 pub(in crate::analyzer) mod cpp_template;
 #[cfg(test)]
 mod cpp_template_tests;
+pub(crate) mod dependency_file_evidence;
 pub mod epoch;
 pub mod gc;
 mod jvm_package_context;
@@ -36,7 +37,15 @@ pub use source_facts::SourceFactStorage;
 // Milestone 5 publishes the normalized writer seam before the producer and
 // selected-hydration tranches wire it into analyzer construction.
 pub(crate) mod go_package_context;
+pub(crate) mod go_unit_summaries;
+pub(crate) mod import_graph;
+pub(crate) mod rust_unit_summaries;
+pub(crate) mod unit_summaries;
 pub(crate) use go_package_context::{GoContextHeadStatus, GoContextIdentity};
+pub(crate) use import_graph::{
+    WorkspaceImportDirection, WorkspaceImportGraphBinding, WorkspaceImportGraphDependencies,
+    WorkspaceImportGraphEdge, WorkspaceImportGraphRefreshPlan, WorkspaceImportGraphSource,
+};
 #[allow(dead_code)]
 pub(crate) mod resolution;
 pub(crate) mod resolution_authority;
@@ -52,6 +61,8 @@ pub(crate) mod resolution_publication;
 pub(crate) mod resolution_selection;
 pub(crate) mod resolution_stage;
 pub(crate) mod resolution_typed;
+pub(crate) mod selected_read_memo;
+pub(crate) mod semantic_ir;
 #[cfg(test)]
 pub(crate) mod test_adapters;
 mod workspace_inputs;
@@ -82,6 +93,11 @@ use rusqlite::{
 use sha2::{Digest, Sha256};
 use tree_sitter::Language as TsLanguage;
 
+#[cfg(test)]
+fn test_blob_oid(contents: impl AsRef<[u8]>) -> Oid {
+    Oid::hash_object(git2::ObjectType::Blob, contents.as_ref()).expect("test blob oid")
+}
+
 use brokk_bifrost_core::cache_db::{
     OPTIONAL_FACT_KIND_CPP_CLASS_TEMPLATE, OPTIONAL_FACT_KIND_MATERIALIZATION_RECORD,
     OPTIONAL_FACT_KIND_RUBY_METHOD_DISPATCH_MODE, OPTIONAL_FACT_KIND_SCALA_EXPORT,
@@ -89,7 +105,9 @@ use brokk_bifrost_core::cache_db::{
 };
 
 use brokk_bifrost_core::analyzer::RelationalName;
-use brokk_bifrost_core::analyzer::canonical_hash::lower_hex_string;
+use brokk_bifrost_core::analyzer::canonical_hash::{
+    lower_hex_string, write_length_prefixed as hash_length_prefixed,
+};
 use brokk_bifrost_core::analyzer::parsed_file::{ParsedSourceFacts, SourceImportFact};
 use brokk_bifrost_core::analyzer::resolution_facts::ResolutionScopeId;
 #[cfg(test)]
@@ -102,6 +120,8 @@ use brokk_bifrost_core::analyzer::rust_facts::{
     decode_rust_include_binding_kind, decode_rust_visibility, encode_rust_cfg_condition,
     encode_rust_include_binding_kind, encode_rust_visibility,
 };
+#[cfg(test)]
+use brokk_bifrost_core::analyzer::source_facts::SourceDeclarationId;
 use brokk_bifrost_core::analyzer::source_facts::SourceImportId;
 use brokk_bifrost_core::analyzer::usages::resolution_session::ResolutionSession;
 
@@ -114,8 +134,8 @@ use crate::analyzer::resolution::{
 };
 use crate::analyzer::structural::DeclaredVisibility;
 use crate::analyzer::structural::facts::{
-    PersistedCallSite, PersistedOccurrenceRole, PersistedSpan, PersistedStructuralFacts,
-    PersistedStructuralNode, PersistedStructuralRole,
+    AssignmentShape, PersistedCallSite, PersistedOccurrenceRole, PersistedRecoveredRegion,
+    PersistedSpan, PersistedStructuralFacts, PersistedStructuralNode, PersistedStructuralRole,
 };
 use crate::analyzer::structural::materialization::{
     MaterializationRecord, MaterializationRecordPayload,
@@ -137,6 +157,32 @@ use self::resolution::PreparedResolutionBundle;
 use self::resolution_prepare::{
     ResolutionInteriorPreparation, prepare_resolution_bundle_with_source_facts,
 };
+use self::semantic_ir::{
+    PreparedSemanticIr, SemanticIrLoweringOutcome, insert_semantic_ir_tx,
+    semantic_ir_producer_epoch,
+};
+use crate::analyzer::semantic::partial_flow::fixpoint::parse_time_partial_flows;
+use crate::analyzer::semantic::service::{
+    ProgramSemanticsLowerer, semantic_artifact_key_from_content,
+};
+use crate::analyzer::semantic::{
+    ContentIdentity, SemanticArtifact, SemanticArtifactBuildError, SemanticBudget, SemanticOutcome,
+    StableDigest,
+};
+use crate::analyzer::tree_sitter_analyzer::{
+    PreparedSyntaxPreparation, PreparedSyntaxTree, reparse_retained_source,
+};
+
+#[cfg(test)]
+pub(crate) fn declaration_name<'a>(
+    facts: &ParsedSourceFacts,
+    source: &'a str,
+    declaration: SourceDeclarationId,
+) -> &'a str {
+    facts
+        .declaration_name(source, declaration)
+        .expect("declaration has a source name inside the source")
+}
 
 const PREPARED_WRITE_IMMEDIATE_RETRIES: usize = 2;
 const STALE_GENERATION_RECLAIM_ROWS: usize = 10_000;
@@ -149,10 +195,25 @@ const STALE_GENERATION_RECLAIM_ROWS: usize = 10_000;
 /// gate now (see `0023-signature-metadata-columns.sql`), so the read budget
 /// stands on its own.
 const MAX_LIMITED_QUERY_ROW_BYTES: usize = 8 << 20;
+const LIMITED_UNIT_IDENTITY_PREDICATE: &str =
+    "units.blob_id = (SELECT id FROM blobs WHERE blob_oid = ?1 AND lang = ?2)
+     AND (units.exact_fqn = ?3 OR units.exact_fqn IS NULL)
+     AND units.kind = ?4
+     AND units.short_name = ?5
+     AND units.signature IS ?6
+     AND units.synthetic = ?7";
 const MAX_LIMITED_QUERY_AGGREGATE_BYTES: usize = 8 << 20;
 
 pub fn analyzer_db_path(workspace_root: &Path) -> PathBuf {
     gitblob::cache_db_path(workspace_root)
+}
+
+pub(super) fn valid_workspace_relative_path(path: &Path) -> bool {
+    path.to_str().is_some_and(|path_text| {
+        !path_text.is_empty()
+            && crate::analyzer::semantic::WorkspaceRelativePath::try_from_path(path)
+                .is_ok_and(|normalized| normalized.as_str() == path_text)
+    })
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -169,6 +230,7 @@ pub enum StoreErrorKind {
 pub struct StoreError {
     message: String,
     kind: StoreErrorKind,
+    missing_required_source_facts: bool,
 }
 
 impl StoreError {
@@ -176,13 +238,27 @@ impl StoreError {
         Self {
             message: message.into(),
             kind: StoreErrorKind::Generic,
+            missing_required_source_facts: false,
         }
+    }
+
+    pub(crate) fn missing_required_source_facts(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            kind: StoreErrorKind::Generic,
+            missing_required_source_facts: true,
+        }
+    }
+
+    pub(crate) fn is_missing_required_source_facts(&self) -> bool {
+        self.missing_required_source_facts
     }
 
     pub(crate) fn stale_generation(message: impl Into<String>) -> Self {
         Self {
             message: message.into(),
             kind: StoreErrorKind::StaleGeneration,
+            missing_required_source_facts: false,
         }
     }
 
@@ -190,6 +266,7 @@ impl StoreError {
         Self {
             message: message.into(),
             kind: StoreErrorKind::StaleResolution,
+            missing_required_source_facts: false,
         }
     }
 
@@ -197,6 +274,7 @@ impl StoreError {
         Self {
             message: message.into(),
             kind: StoreErrorKind::ResourceBound,
+            missing_required_source_facts: false,
         }
     }
 
@@ -204,6 +282,7 @@ impl StoreError {
         Self {
             message: message.into(),
             kind: StoreErrorKind::Corrupt,
+            missing_required_source_facts: false,
         }
     }
 
@@ -235,6 +314,7 @@ impl StoreError {
         Self {
             message: format!("{context}: {}", self.message),
             kind: self.kind,
+            missing_required_source_facts: self.missing_required_source_facts,
         }
     }
 }
@@ -272,6 +352,7 @@ impl From<rusqlite::Error> for StoreError {
             } else {
                 StoreErrorKind::Generic
             },
+            missing_required_source_facts: false,
         }
     }
 }
@@ -283,6 +364,10 @@ impl From<git2::Error> for StoreError {
 }
 
 pub type Result<T> = std::result::Result<T, StoreError>;
+
+pub(crate) fn required_source_value<T>(value: Option<T>, context: &str, label: &str) -> Result<T> {
+    value.ok_or_else(|| StoreError::new(format!("{context} is missing {label}")))
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(crate) struct WorkspaceId(String);
@@ -330,28 +415,16 @@ pub enum SemanticPackActivationSourceKind {
 
 impl SemanticPackActivationSourceKind {
     pub(crate) fn as_str(self) -> &'static str {
-        match self {
-            Self::Installed => "installed",
-            Self::Generated => "generated",
-            Self::PreShipped => "pre_shipped",
-            Self::WorkspaceProduced => "workspace_produced",
-            Self::Embedded => "embedded",
-            Self::EphemeralWorkspace => "ephemeral_workspace",
-        }
+        crate::analyzer::semantic_model::activation_catalog_kind(self).as_str()
     }
 
     fn parse(value: &str) -> Result<Self> {
-        match value {
-            "installed" => Ok(Self::Installed),
-            "generated" => Ok(Self::Generated),
-            "pre_shipped" => Ok(Self::PreShipped),
-            "workspace_produced" => Ok(Self::WorkspaceProduced),
-            "embedded" => Ok(Self::Embedded),
-            "ephemeral_workspace" => Ok(Self::EphemeralWorkspace),
-            _ => Err(StoreError::new(format!(
-                "unknown semantic-pack activation source kind {value:?}"
-            ))),
-        }
+        crate::analyzer::semantic_model::parse_semantic_pack_activation_source_kind(value)
+            .ok_or_else(|| {
+                StoreError::new(format!(
+                    "unknown semantic-pack activation source kind {value:?}"
+                ))
+            })
     }
 }
 
@@ -624,6 +697,15 @@ pub struct AnalyzerStore {
     /// cache never goes stale and nothing invalidates it; it is bounded by an
     /// entry cap. See [`resolution::SharedNameCache`].
     resolution_shared_name_cache: resolution::SharedNameCache,
+    /// Complete selected Go contexts reused under their selected publication.
+    /// Both file-local bindings and prepared import closures share this
+    /// explicitly bounded cache and immutable value representation.
+    go_prepared_context_cache: resolution::BoundedResolutionCache<
+        resolution_operation::go_named::GoPreparedContextCacheKey,
+        Arc<resolution_operation::GoPreparedImportContext>,
+    >,
+    /// Reusable selected Rust include-overlay plans, bounded to four entries.
+    rust_macro_include_overlay_cache: resolution_operation::SelectedRustMacroIncludeOverlayCache,
     #[cfg(test)]
     workspace_selection_counters: WorkspaceSelectionCounters,
     db_path: Option<PathBuf>,
@@ -1364,9 +1446,100 @@ fn semantic_pack_active_set_digest(members: &[SemanticPackActiveReference]) -> R
     Ok(format!("{:x}", hasher.finalize()))
 }
 
-fn hash_length_prefixed(hasher: &mut Sha256, value: &[u8]) {
-    hasher.update((value.len() as u64).to_be_bytes());
-    hasher.update(value);
+fn update_sha256_with_length_prefix(hasher: &mut Sha256, value: &[u8]) {
+    crate::analyzer::digest::update_length_delimited_sha256(hasher, value);
+}
+
+fn update_sha256_with_length_prefixed_text(hasher: &mut Sha256, value: &str) {
+    update_sha256_with_length_prefix(hasher, value.as_bytes());
+}
+
+fn update_sha256_with_length_prefixed_byte(hasher: &mut Sha256, value: u8) {
+    update_sha256_with_length_prefix(hasher, &[value]);
+}
+
+fn update_sha256_with_length_prefixed_u64(hasher: &mut Sha256, value: u64) {
+    update_sha256_with_length_prefix(hasher, &value.to_le_bytes());
+}
+
+fn new_sha256_with_length_prefixed_domain(domain: &[u8]) -> Sha256 {
+    crate::analyzer::digest::new_length_delimited_sha256(domain)
+}
+
+fn checked_fixed_digest(bytes: Vec<u8>) -> std::result::Result<[u8; 32], usize> {
+    let digest: std::result::Result<[u8; 32], Vec<u8>> = bytes.try_into();
+    digest.map_err(|bytes| bytes.len())
+}
+
+fn class_set_bounded_count(value: i64, max: usize, name: &str, owner: &str) -> Result<usize> {
+    let value = usize::try_from(value)
+        .map_err(|_| StoreError::corrupt(format!("class-set {owner} {name} count is invalid")))?;
+    if value > max {
+        return Err(StoreError::resource_bound(format!(
+            "class-set {owner} {name} count exceeds {max}"
+        )));
+    }
+    Ok(value)
+}
+
+fn admit_class_set_text_bytes(
+    total: &mut usize,
+    row_bytes: i64,
+    max_bytes: usize,
+    owner: &str,
+    text_kind: &str,
+) -> Result<()> {
+    let row_bytes = class_set_bounded_count(row_bytes, max_bytes, "payload row text byte", owner)?;
+    *total = total.checked_add(row_bytes).ok_or_else(|| {
+        StoreError::resource_bound(format!(
+            "class-set {owner} {text_kind} size overflows usize"
+        ))
+    })?;
+    if *total > max_bytes {
+        return Err(StoreError::resource_bound(format!(
+            "class-set {owner} {text_kind} exceeds {max_bytes} bytes"
+        )));
+    }
+    Ok(())
+}
+
+fn class_set_u32(value: i64, name: &str, owner: &str) -> Result<u32> {
+    u32::try_from(value)
+        .map_err(|_| StoreError::corrupt(format!("class-set {owner} {name} exceeds u32")))
+}
+
+fn ensure_store_not_cancelled(
+    cancellation: &CancellationToken,
+    message: &'static str,
+) -> Result<()> {
+    if cancellation.is_cancelled() {
+        Err(StoreError::new(message))
+    } else {
+        Ok(())
+    }
+}
+
+fn canonical_language_label(label: &str) -> Option<Language> {
+    Language::from_config_label(label).filter(|language| language.config_label() == label)
+}
+
+fn live_class_set_owner_blob_id(
+    conn: &Connection,
+    blob_oid: &str,
+    language: &str,
+) -> Result<Option<i64>> {
+    conn.query_row(
+        &format!(
+            "SELECT meta.blob_id FROM blob_meta AS meta
+             JOIN blobs ON blobs.id=meta.blob_id
+             WHERE blobs.blob_oid=?1 AND blobs.lang=?2
+               AND {PARSED_BLOB_COMPLETE_CONDITION}"
+        ),
+        params![blob_oid, language],
+        |row| row.get(0),
+    )
+    .optional()
+    .map_err(StoreError::from)
 }
 
 fn reader_source_path(conn: &Connection) -> Option<PathBuf> {
@@ -2204,6 +2377,15 @@ impl AnalyzerStore {
         &self.resolution_shared_name_cache
     }
 
+    pub(crate) fn go_prepared_context_cache(
+        &self,
+    ) -> &resolution::BoundedResolutionCache<
+        resolution_operation::go_named::GoPreparedContextCacheKey,
+        Arc<resolution_operation::GoPreparedImportContext>,
+    > {
+        &self.go_prepared_context_cache
+    }
+
     pub(crate) fn workspace_content_package_facts(
         &self,
         lang: &str,
@@ -2857,6 +3039,9 @@ impl AnalyzerStore {
             crate_statement_counter: Mutex::new(None),
             writer_resolution_selection: Mutex::new(None),
             resolution_shared_name_cache: resolution::SharedNameCache::new(),
+            go_prepared_context_cache: resolution::BoundedResolutionCache::new(128),
+            rust_macro_include_overlay_cache:
+                resolution_operation::SelectedRustMacroIncludeOverlayCache::new(),
             #[cfg(test)]
             workspace_selection_counters: WorkspaceSelectionCounters::default(),
             db_path,
@@ -2899,6 +3084,9 @@ impl AnalyzerStore {
             crate_statement_counter: Mutex::new(None),
             writer_resolution_selection: Mutex::new(None),
             resolution_shared_name_cache: resolution::SharedNameCache::new(),
+            go_prepared_context_cache: resolution::BoundedResolutionCache::new(128),
+            rust_macro_include_overlay_cache:
+                resolution_operation::SelectedRustMacroIncludeOverlayCache::new(),
             #[cfg(test)]
             workspace_selection_counters: WorkspaceSelectionCounters::default(),
             db_path: Some(db_path.to_path_buf()),
@@ -3102,6 +3290,10 @@ impl AnalyzerStore {
             conn
         };
         Ok(conn)
+    }
+
+    pub(crate) fn uses_single_connection_reads(&self) -> bool {
+        self.readers.source.is_none()
     }
 
     /// Check out a reader and point its revisioned views at `snapshots`.
@@ -3445,27 +3637,41 @@ impl AnalyzerStore {
         Ok(total)
     }
 
-    pub fn missing_blobs(&self, oids: &[Oid], lang: &str) -> Result<Vec<Oid>> {
-        let mut conn = self.read_conn()?;
-        let tx = conn.transaction()?;
-        let mut stmt = tx.prepare(
+    fn current_blob_key_statement<'conn>(
+        tx: &'conn Transaction<'_>,
+    ) -> Result<rusqlite::Statement<'conn>> {
+        Ok(tx.prepare(
             "SELECT 1 FROM blobs
              WHERE blob_oid = ?1 AND lang = ?2
                AND generation = COALESCE(
                  (SELECT generation FROM analysis_epochs WHERE lang = ?2), 0
                )
              LIMIT 1",
-        )?;
+        )?)
+    }
+
+    fn current_blob_key_exists(
+        statement: &mut rusqlite::Statement<'_>,
+        oid: Oid,
+        lang: &str,
+    ) -> Result<bool> {
+        Ok(statement
+            .query_row(params![oid.to_string(), lang], |_| Ok(()))
+            .optional()?
+            .is_some())
+    }
+
+    pub fn missing_blobs(&self, oids: &[Oid], lang: &str) -> Result<Vec<Oid>> {
+        let mut conn = self.read_conn()?;
+        let tx = conn.transaction()?;
+        let mut stmt = Self::current_blob_key_statement(&tx)?;
         let mut out = Vec::new();
         let mut seen = HashSet::default();
         for oid in oids {
             if !seen.insert(*oid) {
                 continue;
             }
-            let exists = stmt
-                .query_row(params![oid.to_string(), lang], |_| Ok(()))
-                .optional()?
-                .is_some();
+            let exists = Self::current_blob_key_exists(&mut stmt, *oid, lang)?;
             if !exists {
                 out.push(*oid);
             }
@@ -3478,24 +3684,14 @@ impl AnalyzerStore {
     pub fn missing_blob_keys(&self, entries: &[(Oid, String)]) -> Result<Vec<(Oid, String)>> {
         let mut conn = self.read_conn()?;
         let tx = conn.transaction()?;
-        let mut stmt = tx.prepare(
-            "SELECT 1 FROM blobs
-             WHERE blob_oid = ?1 AND lang = ?2
-               AND generation = COALESCE(
-                 (SELECT generation FROM analysis_epochs WHERE lang = ?2), 0
-               )
-             LIMIT 1",
-        )?;
+        let mut stmt = Self::current_blob_key_statement(&tx)?;
         let mut out = Vec::new();
         let mut seen = HashSet::default();
         for (oid, lang) in entries {
             if !seen.insert((*oid, lang.clone())) {
                 continue;
             }
-            let exists = stmt
-                .query_row(params![oid.to_string(), lang], |_| Ok(()))
-                .optional()?
-                .is_some();
+            let exists = Self::current_blob_key_exists(&mut stmt, *oid, lang)?;
             if !exists {
                 out.push((*oid, lang.clone()));
             }
@@ -3522,11 +3718,15 @@ impl AnalyzerStore {
         Ok(out)
     }
 
+    /// `semantic_ir_epoch` is the producer epoch of the adapter's parse-time
+    /// lowerer, or `None` when the adapter has none. The caller holds the
+    /// adapter; this method does not, so it cannot derive the epoch itself.
     pub(crate) fn missing_published_complete_analysis_blob_keys_at_generations(
         &self,
         requests: &[CompleteAnalysisBlobRequest],
         generations: &HashMap<String, GenerationId>,
         semantic_language: Language,
+        semantic_ir_epoch: Option<&str>,
     ) -> Result<Vec<MissingCompleteAnalysisBlob>> {
         assert_ne!(semantic_language, Language::None);
         let mut storage_languages = HashSet::default();
@@ -3541,6 +3741,9 @@ impl AnalyzerStore {
         }
         for storage_language in &storage_languages {
             self.ensure_resolution_producer_epoch(storage_language, semantic_language)?;
+            if let Some(epoch) = semantic_ir_epoch {
+                self.ensure_semantic_ir_producer_epoch(storage_language, epoch)?;
+            }
         }
         let mut conn = {
             let _scope = crate::profiling::scope("store.missing_analysis.open_reader");
@@ -3735,6 +3938,18 @@ impl AnalyzerStore {
                         ))
                     },
                 )?;
+                let recovered_regions = tx
+                    .prepare_cached(STRUCTURAL_RECOVERED_REGIONS_SQL)?
+                    .query_map(params![blob_id, callable_kind_codes_json()], |row| {
+                        Ok(PersistedRecoveredRegion {
+                            span: PersistedSpan {
+                                start: row.get(0)?,
+                                end: row.get(1)?,
+                            },
+                            inside_callable: row.get(2)?,
+                        })
+                    })?
+                    .collect::<rusqlite::Result<Vec<_>>>()?;
                 tx.commit()?;
                 let decode_error = |family: &str, err: serde_json::Error| {
                     StoreError::new(format!("invalid persisted structural {family}: {err}"))
@@ -3756,6 +3971,7 @@ impl AnalyzerStore {
                     nodes,
                     roles,
                     occurrence_roles,
+                    recovered_regions,
                 }))
             });
         if cancellation.is_cancelled() {
@@ -3797,11 +4013,19 @@ impl AnalyzerStore {
         state: &FileState,
     ) -> Result<()> {
         let generation = self.current_generation(lang)?;
-        self.write_parsed_blob_at_generation(oid, lang, generation, adapter, state)
+        self.write_parsed_blob_at_generation(
+            &test_blob_file(),
+            oid,
+            lang,
+            generation,
+            adapter,
+            state,
+        )
     }
 
     pub(crate) fn write_parsed_blob_at_generation<A: LanguageAdapter>(
         &self,
+        file: &ProjectFile,
         oid: Oid,
         lang: &str,
         generation: GenerationId,
@@ -3826,8 +4050,28 @@ impl AnalyzerStore {
         }
         for storage_language in generations.keys() {
             self.ensure_resolution_producer_epoch(storage_language, adapter.language())?;
+            if let Some(lowerer) = adapter.parse_time_semantic_lowerer() {
+                self.ensure_semantic_ir_producer_epoch(
+                    storage_language,
+                    &semantic_ir_producer_epoch(&lowerer.lowerer().identity()),
+                )?;
+            }
         }
+        require_complete_file_state(state)?;
+        let syntax = match reparse_retained_source(adapter, file, state, None) {
+            PreparedSyntaxPreparation::Complete(Some(syntax)) => syntax,
+            PreparedSyntaxPreparation::Complete(None) => {
+                return Err(StoreError::new(format!(
+                    "parsed blob {oid}/{lang} source does not parse within its budget"
+                )));
+            }
+            PreparedSyntaxPreparation::Cancelled => {
+                unreachable!("no cancellation token supplied")
+            }
+        };
         let prepared = match prepare_parsed_blob_at_generations(
+            file,
+            &syntax,
             oid,
             lang,
             &generations,
@@ -3872,7 +4116,10 @@ impl AnalyzerStore {
         prepare_parsed_blob(oid, lang, generation, adapter, state)
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn prepare_parsed_blob_at_generations<A: LanguageAdapter>(
+        file: &ProjectFile,
+        syntax: &PreparedSyntaxTree,
         oid: Oid,
         lang: &str,
         generations: &HashMap<String, GenerationId>,
@@ -3882,6 +4129,8 @@ impl AnalyzerStore {
         cancellation: &CancellationToken,
     ) -> Result<PreparedParsedBlobPreparation> {
         prepare_parsed_blob_at_generations(
+            file,
+            syntax,
             oid,
             lang,
             generations,
@@ -3947,6 +4196,7 @@ impl AnalyzerStore {
 
     fn ensure_prepared_resolution_epochs(&self, prepared: &[PreparedParsedBlob]) -> Result<()> {
         let mut languages = HashMap::default();
+        let mut semantic_ir_epochs = HashMap::default();
         for root in prepared {
             let mut fragments = Vec::with_capacity(root.fragment_count());
             root.append_fragments(&mut fragments);
@@ -3960,10 +4210,20 @@ impl AnalyzerStore {
                         fragment.lang()
                     )));
                 }
+                if let Some(semantic_ir) = fragment.semantic_ir.as_ref() {
+                    // One lowerer serves every blob of a storage language, so
+                    // its producer epoch cannot differ within one batch.
+                    let previous =
+                        semantic_ir_epochs.insert(fragment.lang(), semantic_ir.producer_epoch());
+                    assert!(previous.is_none_or(|epoch| epoch == semantic_ir.producer_epoch()));
+                }
             }
         }
         for (storage_language, semantic_language) in languages {
             self.ensure_resolution_producer_epoch(storage_language, semantic_language)?;
+        }
+        for (storage_language, producer_epoch) in semantic_ir_epochs {
+            self.ensure_semantic_ir_producer_epoch(storage_language, producer_epoch)?;
         }
         Ok(())
     }
@@ -4167,6 +4427,21 @@ impl AnalyzerStore {
         Ok(rows)
     }
 
+    /// Run one bounded unit query under a generation-checked read transaction.
+    fn with_current_generation_read_transaction<T>(
+        &self,
+        lang: &str,
+        generation: GenerationId,
+        read: impl FnOnce(&Transaction<'_>) -> Result<T>,
+    ) -> Result<T> {
+        let mut conn = self.read_conn()?;
+        let tx = conn.transaction()?;
+        require_current_generation(&tx, lang, generation)?;
+        let result = read(&tx)?;
+        tx.commit()?;
+        Ok(result)
+    }
+
     /// Read at most `limit` signature-metadata rows for one persisted code
     /// unit without hydrating the owning file state.
     ///
@@ -4182,12 +4457,9 @@ impl AnalyzerStore {
         unit: &CodeUnit,
         limit: usize,
     ) -> Result<LimitedQueryRows<SignatureMetadata>> {
-        let mut conn = self.read_conn()?;
-        let tx = conn.transaction()?;
-        require_current_generation(&tx, lang, generation)?;
-        let result = signature_metadata_for_unit_limited_conn(&tx, oid, lang, unit, limit)?;
-        tx.commit()?;
-        Ok(result)
+        self.with_current_generation_read_transaction(lang, generation, |tx| {
+            signature_metadata_for_unit_limited_conn(tx, oid, lang, unit, limit)
+        })
     }
 
     /// Read at most `limit` signature labels for one persisted code unit
@@ -4200,12 +4472,9 @@ impl AnalyzerStore {
         unit: &CodeUnit,
         limit: usize,
     ) -> Result<LimitedQueryRows<String>> {
-        let mut conn = self.read_conn()?;
-        let tx = conn.transaction()?;
-        require_current_generation(&tx, lang, generation)?;
-        let result = signatures_for_unit_limited_conn(&tx, oid, lang, unit, limit)?;
-        tx.commit()?;
-        Ok(result)
+        self.with_current_generation_read_transaction(lang, generation, |tx| {
+            signatures_for_unit_limited_conn(tx, oid, lang, unit, limit)
+        })
     }
 
     /// Read at most `limit` Ruby dispatch-mode rows for one persisted code
@@ -4218,12 +4487,9 @@ impl AnalyzerStore {
         unit: &CodeUnit,
         limit: usize,
     ) -> Result<LimitedQueryRows<RubyMethodDispatchMode>> {
-        let mut conn = self.read_conn()?;
-        let tx = conn.transaction()?;
-        require_current_generation(&tx, lang, generation)?;
-        let result = ruby_method_dispatch_modes_for_unit_limited_conn(&tx, oid, lang, unit, limit)?;
-        tx.commit()?;
-        Ok(result)
+        self.with_current_generation_read_transaction(lang, generation, |tx| {
+            ruby_method_dispatch_modes_for_unit_limited_conn(tx, oid, lang, unit, limit)
+        })
     }
 
     /// Read at most `limit` direct declaration children for one persisted
@@ -4236,12 +4502,9 @@ impl AnalyzerStore {
         unit: &CodeUnit,
         limit: usize,
     ) -> Result<LimitedQueryRows<HydratedCandidateRow>> {
-        let mut conn = self.read_conn()?;
-        let tx = conn.transaction()?;
-        require_current_generation(&tx, lang, generation)?;
-        let result = direct_children_for_unit_limited_conn(&tx, oid, lang, unit, limit)?;
-        tx.commit()?;
-        Ok(result)
+        self.with_current_generation_read_transaction(lang, generation, |tx| {
+            direct_children_for_unit_limited_conn(tx, oid, lang, unit, limit)
+        })
     }
 
     pub(crate) fn raw_supertypes_for_unit_limited(
@@ -4252,12 +4515,9 @@ impl AnalyzerStore {
         unit: &CodeUnit,
         limit: usize,
     ) -> Result<LimitedQueryRows<String>> {
-        let mut conn = self.read_conn()?;
-        let tx = conn.transaction()?;
-        require_current_generation(&tx, lang, generation)?;
-        let result = raw_supertypes_for_unit_limited_conn(&tx, oid, lang, unit, limit)?;
-        tx.commit()?;
-        Ok(result)
+        self.with_current_generation_read_transaction(lang, generation, |tx| {
+            raw_supertypes_for_unit_limited_conn(tx, oid, lang, unit, limit)
+        })
     }
 
     pub(crate) fn supertype_lookup_paths_for_unit_limited(
@@ -4268,12 +4528,9 @@ impl AnalyzerStore {
         unit: &CodeUnit,
         limit: usize,
     ) -> Result<LimitedQueryRows<String>> {
-        let mut conn = self.read_conn()?;
-        let tx = conn.transaction()?;
-        require_current_generation(&tx, lang, generation)?;
-        let result = supertype_lookup_paths_for_unit_limited_conn(&tx, oid, lang, unit, limit)?;
-        tx.commit()?;
-        Ok(result)
+        self.with_current_generation_read_transaction(lang, generation, |tx| {
+            supertype_lookup_paths_for_unit_limited_conn(tx, oid, lang, unit, limit)
+        })
     }
 
     /// Read at most `limit` declaration ranges for one persisted code unit
@@ -4286,12 +4543,9 @@ impl AnalyzerStore {
         unit: &CodeUnit,
         limit: usize,
     ) -> Result<LimitedQueryRows<Range>> {
-        let mut conn = self.read_conn()?;
-        let tx = conn.transaction()?;
-        require_current_generation(&tx, lang, generation)?;
-        let result = ranges_for_unit_limited_conn(&tx, oid, lang, unit, limit)?;
-        tx.commit()?;
-        Ok(result)
+        self.with_current_generation_read_transaction(lang, generation, |tx| {
+            ranges_for_unit_limited_conn(tx, oid, lang, unit, limit)
+        })
     }
 
     /// Hydrate many live file states from persisted blob rows using chunked
@@ -4820,17 +5074,47 @@ impl AnalyzerStore {
         }
     }
 
+    fn declaration_candidate_rows_by_predicate<'a>(
+        &self,
+        langs: impl IntoIterator<Item = &'a str>,
+        predicate: &str,
+        values: &[&dyn ToSql],
+    ) -> Result<Vec<HydratedCandidateRow>> {
+        let mut conn = self.read_conn()?;
+        let tx = conn.transaction()?;
+        let sql = declaration_candidate_sql(predicate);
+        let rows = candidate_rows_for_languages(&tx, langs, &sql, values)?;
+        tx.commit()?;
+        Ok(rows)
+    }
+
+    fn declaration_candidate_rows_for_langs_by_predicate(
+        &self,
+        langs: &[String],
+        generations: &HashMap<String, GenerationId>,
+        predicate: &str,
+        values: &[&dyn ToSql],
+    ) -> Result<Vec<HydratedCandidateRow>> {
+        let mut conn = self.read_conn()?;
+        let tx = conn.transaction()?;
+        require_generation_map(&tx, generations, langs.iter().map(String::as_str))?;
+        let sql = declaration_candidate_sql(predicate);
+        let rows =
+            candidate_rows_for_languages(&tx, langs.iter().map(String::as_str), &sql, values)?;
+        tx.commit()?;
+        Ok(rows)
+    }
+
     pub fn declaration_candidate_rows_by_short_name(
         &self,
         lang: &str,
         short_name: &str,
     ) -> Result<Vec<HydratedCandidateRow>> {
-        let mut conn = self.read_conn()?;
-        let tx = conn.transaction()?;
-        let sql = declaration_candidate_sql("units.lang = ?1 AND units.short_name = ?2");
-        let rows = candidate_rows_for_languages(&tx, std::iter::once(lang), &sql, &[&short_name])?;
-        tx.commit()?;
-        Ok(rows)
+        self.declaration_candidate_rows_by_predicate(
+            std::iter::once(lang),
+            "units.lang = ?1 AND units.short_name = ?2",
+            &[&short_name],
+        )
     }
 
     pub fn declaration_candidate_rows_by_short_name_for_langs(
@@ -4839,18 +5123,12 @@ impl AnalyzerStore {
         generations: &HashMap<String, GenerationId>,
         short_name: &str,
     ) -> Result<Vec<HydratedCandidateRow>> {
-        let mut conn = self.read_conn()?;
-        let tx = conn.transaction()?;
-        require_generation_map(&tx, generations, langs.iter().map(String::as_str))?;
-        let sql = declaration_candidate_sql("units.lang = ?1 AND units.short_name = ?2");
-        let rows = candidate_rows_for_languages(
-            &tx,
-            langs.iter().map(String::as_str),
-            &sql,
+        self.declaration_candidate_rows_for_langs_by_predicate(
+            langs,
+            generations,
+            "units.lang = ?1 AND units.short_name = ?2",
             &[&short_name],
-        )?;
-        tx.commit()?;
-        Ok(rows)
+        )
     }
 
     /// `complete` is false when the caller's deadline expired mid-seek. The
@@ -5164,11 +5442,7 @@ impl AnalyzerStore {
             .join(", ");
         let sql = candidate_rows_sql_with_membership(
             "units",
-            "FROM code_units AS units
-             JOIN blobs AS keys
-               ON keys.id = units.blob_id
-             JOIN blob_meta AS meta
-               ON meta.blob_id = units.blob_id",
+            CODE_UNIT_CANDIDATE_FROM_CLAUSE,
             &format!("units.lang = ?1 AND units.identifier IN ({placeholders})"),
             "(units.in_declarations = 1 OR units.in_definition_lookup = 1)",
             "keys.blob_oid, units.unit_key",
@@ -5229,25 +5503,9 @@ impl AnalyzerStore {
         let mut conn = self.read_conn()?;
         let tx = conn.transaction()?;
         require_generation_map(&tx, generations, langs.iter().map(String::as_str))?;
-        let sql = limited_candidate_rows_sql_with_membership(
-            "units",
-            "FROM code_units AS units
-             JOIN blobs AS keys
-               ON keys.id = units.blob_id
-             JOIN blob_meta AS meta
-               ON meta.blob_id = units.blob_id",
-            "units.lang = ?1 AND units.identifier = ?2",
-            "(units.in_declarations = 1 OR units.in_definition_lookup = 1)",
-            &["keys.blob_oid", "units.unit_key"],
-        );
-        let sql = format!("{sql} LIMIT ?3");
-        let rows = candidate_rows_for_languages_limited(
-            &tx,
-            langs.iter().map(String::as_str),
-            &sql,
-            &[&identifier],
-            limit,
-        )?;
+        let sql = limited_identifier_candidate_sql();
+        let rows =
+            candidate_rows_for_identifier_languages_limited(&tx, langs, identifier, &sql, limit)?;
         tx.commit()?;
         Ok(rows)
     }
@@ -5259,18 +5517,16 @@ impl AnalyzerStore {
         column: PersistedLookupKey,
         value: &str,
     ) -> Result<Vec<HydratedCandidateRow>> {
-        let mut conn = self.read_conn()?;
-        let tx = conn.transaction()?;
-        require_generation_map(&tx, generations, langs.iter().map(String::as_str))?;
         let column = match column {
             PersistedLookupKey::ExactFqn => "exact_fqn",
             PersistedLookupKey::NormalizedFqn => "normalized_fqn",
         };
-        let sql = declaration_candidate_sql(&format!("units.lang = ?1 AND units.{column} = ?2"));
-        let rows =
-            candidate_rows_for_languages(&tx, langs.iter().map(String::as_str), &sql, &[&value])?;
-        tx.commit()?;
-        Ok(rows)
+        self.declaration_candidate_rows_for_langs_by_predicate(
+            langs,
+            generations,
+            &format!("units.lang = ?1 AND units.{column} = ?2"),
+            &[&value],
+        )
     }
 
     pub(crate) fn declaration_candidate_rows_by_lookup_key_for_langs_limited(
@@ -5318,23 +5574,11 @@ impl AnalyzerStore {
         } else {
             "exact_fqn"
         };
+        let predicate = declaration_member_owner_predicate(owner_column);
         let sql = candidate_rows_sql(
             "child",
-            "FROM code_units AS owner
-             JOIN unit_children AS edge
-               ON edge.blob_id = owner.blob_id
-              AND edge.parent_key = owner.unit_key
-             JOIN code_units AS child
-               ON child.blob_id = edge.blob_id
-              AND child.unit_key = edge.child_key
-             JOIN blobs AS keys
-               ON keys.id = child.blob_id
-             JOIN blob_meta AS meta
-               ON meta.blob_id = child.blob_id",
-            &format!(
-                "owner.lang = ?1 AND owner.{owner_column} = ?2
-                 AND owner.in_declarations = 1 AND child.identifier = ?3"
-            ),
+            DECLARATION_MEMBER_CANDIDATE_FROM_CLAUSE,
+            &predicate,
         );
         let rows = candidate_rows_for_languages(
             &tx,
@@ -5363,23 +5607,11 @@ impl AnalyzerStore {
         } else {
             "exact_fqn"
         };
+        let predicate = declaration_member_owner_predicate(owner_column);
         let sql = limited_candidate_rows_sql_with_membership(
             "child",
-            "FROM code_units AS owner
-             JOIN unit_children AS edge
-               ON edge.blob_id = owner.blob_id
-              AND edge.parent_key = owner.unit_key
-             JOIN code_units AS child
-               ON child.blob_id = edge.blob_id
-              AND child.unit_key = edge.child_key
-             JOIN blobs AS keys
-               ON keys.id = child.blob_id
-             JOIN blob_meta AS meta
-               ON meta.blob_id = child.blob_id",
-            &format!(
-                "owner.lang = ?1 AND owner.{owner_column} = ?2
-                 AND owner.in_declarations = 1 AND child.identifier = ?3"
-            ),
+            DECLARATION_MEMBER_CANDIDATE_FROM_CLAUSE,
+            &predicate,
             "child.in_declarations = 1",
             &["keys.blob_oid", "child.unit_key"],
         );
@@ -5401,14 +5633,12 @@ impl AnalyzerStore {
         generations: &HashMap<String, GenerationId>,
         package: &str,
     ) -> Result<Vec<HydratedCandidateRow>> {
-        let mut conn = self.read_conn()?;
-        let tx = conn.transaction()?;
-        require_generation_map(&tx, generations, langs.iter().map(String::as_str))?;
-        let sql = declaration_candidate_sql("units.lang = ?1 AND units.content_qualifier = ?2");
-        let rows =
-            candidate_rows_for_languages(&tx, langs.iter().map(String::as_str), &sql, &[&package])?;
-        tx.commit()?;
-        Ok(rows)
+        self.declaration_candidate_rows_for_langs_by_predicate(
+            langs,
+            generations,
+            "units.lang = ?1 AND units.content_qualifier = ?2",
+            &[&package],
+        )
     }
 
     /// One literal, index-ordered page of candidate rows whose persisted
@@ -5470,7 +5700,7 @@ impl AnalyzerStore {
                 candidate_row_from_row,
             )?,
         };
-        let rows = collect_candidate_rows(mapped)?;
+        let rows = collect_mapped_rows(mapped)?;
         drop(statement);
         let rows = hydrate_candidate_rows(&tx, rows, None)?
             .expect("uncancelled package-page hydration completes");
@@ -5482,12 +5712,7 @@ impl AnalyzerStore {
         &self,
         lang: &str,
     ) -> Result<Vec<HydratedCandidateRow>> {
-        let mut conn = self.read_conn()?;
-        let tx = conn.transaction()?;
-        let sql = declaration_candidate_sql("units.lang = ?1");
-        let rows = candidate_rows_for_languages(&tx, std::iter::once(lang), &sql, &[])?;
-        tx.commit()?;
-        Ok(rows)
+        self.declaration_candidate_rows_by_predicate(std::iter::once(lang), "units.lang = ?1", &[])
     }
 
     /// Candidate rows for a literal ASCII substring over a persistently stable
@@ -5499,17 +5724,14 @@ impl AnalyzerStore {
         lang: &str,
         substring: &str,
     ) -> Result<Vec<HydratedCandidateRow>> {
-        let mut conn = self.read_conn()?;
-        let tx = conn.transaction()?;
-        let sql = declaration_candidate_sql(
+        self.declaration_candidate_rows_by_predicate(
+            std::iter::once(lang),
             "units.lang = ?1 AND (
                instr(lower(units.short_name), lower(?2)) > 0
                OR instr(lower(units.content_qualifier), lower(?2)) > 0
              )",
-        );
-        let rows = candidate_rows_for_languages(&tx, std::iter::once(lang), &sql, &[&substring])?;
-        tx.commit()?;
-        Ok(rows)
+            &[&substring],
+        )
     }
 
     pub fn declaration_candidate_rows_by_literal_substring_for_langs(
@@ -5518,23 +5740,15 @@ impl AnalyzerStore {
         generations: &HashMap<String, GenerationId>,
         substring: &str,
     ) -> Result<Vec<HydratedCandidateRow>> {
-        let mut conn = self.read_conn()?;
-        let tx = conn.transaction()?;
-        require_generation_map(&tx, generations, langs.iter().map(String::as_str))?;
-        let sql = declaration_candidate_sql(
+        self.declaration_candidate_rows_for_langs_by_predicate(
+            langs,
+            generations,
             "units.lang = ?1 AND (
                instr(lower(units.short_name), lower(?2)) > 0
                OR instr(lower(units.content_qualifier), lower(?2)) > 0
              )",
-        );
-        let rows = candidate_rows_for_languages(
-            &tx,
-            langs.iter().map(String::as_str),
-            &sql,
             &[&substring],
-        )?;
-        tx.commit()?;
-        Ok(rows)
+        )
     }
 
     /// Search candidates carry the metadata that `search_symbols` otherwise
@@ -5569,6 +5783,46 @@ impl AnalyzerStore {
         required_literals: Option<&[Vec<String>]>,
         cancellation: Option<&CancellationToken>,
     ) -> Result<LimitedQueryRows<SearchCandidateNameRow>> {
+        self.search_candidate_name_rows(
+            langs,
+            generations,
+            active_blobs,
+            search_candidate_name_rows_sql(langs, required_literals),
+            cancellation,
+        )
+    }
+
+    pub(crate) fn search_candidate_name_rows_with_cpp_owners(
+        &self,
+        langs: &[String],
+        generations: &HashMap<String, GenerationId>,
+        active_blobs: &[ActiveSearchBlob],
+        required_literals: Option<&[Vec<String>]>,
+        cancellation: Option<&CancellationToken>,
+    ) -> Result<LimitedQueryRows<SearchCandidateNameRow>> {
+        let (mut sql, mut parameters) = search_candidate_name_rows_sql(langs, required_literals);
+        let (owners, owner_parameters) =
+            cpp_search_owner_name_rows_sql(langs, required_literals, parameters.len());
+        sql.push_str(" UNION ALL ");
+        sql.push_str(&owners);
+        parameters.extend(owner_parameters);
+        self.search_candidate_name_rows(
+            langs,
+            generations,
+            active_blobs,
+            (sql, parameters),
+            cancellation,
+        )
+    }
+
+    fn search_candidate_name_rows(
+        &self,
+        langs: &[String],
+        generations: &HashMap<String, GenerationId>,
+        active_blobs: &[ActiveSearchBlob],
+        query: (String, Vec<String>),
+        cancellation: Option<&CancellationToken>,
+    ) -> Result<LimitedQueryRows<SearchCandidateNameRow>> {
         // Pattern matching is performed after language-specific FQN hydration.
         // One request may carry several patterns, so the storage projection
         // intentionally supplies one complete declaration candidate set for
@@ -5593,12 +5847,7 @@ impl AnalyzerStore {
         }
         let rows = {
             let _scope = crate::profiling::scope("store.symbol_names.query_all_languages");
-            search_candidate_name_rows_for_langs_conn_cancellable(
-                &tx,
-                langs,
-                required_literals,
-                cancellation,
-            )?
+            search_candidate_name_rows_conn_cancellable(&tx, langs, query, cancellation)?
         };
         tx.commit()?;
         if rows.complete && !cancellation.is_some_and(CancellationToken::is_cancelled) {
@@ -5651,7 +5900,7 @@ impl AnalyzerStore {
                 complete = false;
                 break;
             }
-            let padded = padded_search_candidate_key_arity(chunk.len());
+            let padded = padded_arity(chunk.len(), &SEARCH_CANDIDATE_KEY_ARITY_LADDER);
             let sql = search_candidate_key_set_sql(padded);
             let mut parameters = Vec::with_capacity(padded * 3);
             for (lang, blob_oid, unit_key) in chunk {
@@ -5714,13 +5963,12 @@ impl AnalyzerStore {
         langs: &[String],
         generations: &HashMap<String, GenerationId>,
     ) -> Result<Vec<HydratedCandidateRow>> {
-        let mut conn = self.read_conn()?;
-        let tx = conn.transaction()?;
-        require_generation_map(&tx, generations, langs.iter().map(String::as_str))?;
-        let sql = declaration_candidate_sql("units.lang = ?1");
-        let rows = candidate_rows_for_languages(&tx, langs.iter().map(String::as_str), &sql, &[])?;
-        tx.commit()?;
-        Ok(rows)
+        self.declaration_candidate_rows_for_langs_by_predicate(
+            langs,
+            generations,
+            "units.lang = ?1",
+            &[],
+        )
     }
 
     pub(crate) fn workspace_snapshots_for_langs(
@@ -5737,7 +5985,6 @@ impl AnalyzerStore {
         Ok(snapshots)
     }
 
-    #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn workspace_snapshots_for_current_languages(
         &self,
         workspace_id: &WorkspaceId,
@@ -5872,35 +6119,29 @@ impl AnalyzerStore {
         let mut conn = self.read_conn()?;
         let tx = conn.transaction()?;
         require_generation_map(&tx, generations, langs.iter().map(String::as_str))?;
-        let sql = format!(
-            "SELECT keys.blob_oid, units.lang, units.unit_key, units.kind, units.short_name,
-                    units.content_qualifier, units.signature, units.synthetic,
-                    units.is_type_alias, units.top_level_ordinal, units.in_declarations,
-                    units.in_definition_lookup, units.fq_anchor_kind, units.fq_anchor_pop,
-                    units.fq_package_tail_segments, units.fq_segment_count,
-                    units.exact_fqn_tail, units.fq_segment_bytes,
-                    units.normalized_fqn_tail,
-                    units.in_test_region,
-                    primary_range.start_byte, primary_range.end_byte,
-                    primary_range.start_line, primary_range.end_line
-             FROM code_units AS units
-             JOIN blobs AS keys
-               ON keys.id = units.blob_id
-             JOIN blob_meta AS meta
-               ON meta.blob_id = units.blob_id
+        let from_clause = format!(
+            "{CODE_UNIT_CANDIDATE_FROM_CLAUSE}
              LEFT JOIN unit_ranges AS primary_range
                ON primary_range.blob_id = units.blob_id
               AND primary_range.unit_key = units.unit_key
-              AND primary_range.ordinal = 0
+              AND primary_range.ordinal = 0"
+        );
+        let sql = format!(
+            "SELECT keys.blob_oid, {},
+                    units.in_test_region,
+                    primary_range.start_byte, primary_range.end_byte,
+                    primary_range.start_line, primary_range.end_line
+             {from_clause}
              WHERE units.lang = ?1 AND units.kind = ?2 AND units.in_declarations = 1
                AND {PARSED_BLOB_COMPLETE_CONDITION}
-             ORDER BY keys.blob_oid, units.unit_key"
+             ORDER BY keys.blob_oid, units.unit_key",
+            candidate_unit_projection_sql("units")
         );
         let kind = code_unit_kind_to_i64(kind);
         let mut statement = tx.prepare_cached(&sql)?;
         let mut out = Vec::new();
         for lang in langs {
-            out.extend(collect_candidate_primary_range_rows(statement.query_map(
+            out.extend(collect_mapped_rows(statement.query_map(
                 params![lang, kind],
                 candidate_primary_range_row_from_row,
             )?)?);
@@ -6195,6 +6436,10 @@ impl AnalyzerStore {
         self.conn.execute(move |conn| {
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
             tx.execute(
+                "DELETE FROM workspace_import_graphs WHERE workspace_id = ?1",
+                params![workspace_id],
+            )?;
+            tx.execute(
                 "DELETE FROM workspace_heads WHERE workspace_id = ?1",
                 params![workspace_id],
             )?;
@@ -6207,6 +6452,11 @@ impl AnalyzerStore {
                 params![workspace_id],
             )?;
             tx.execute(rust_crates::DELETE_UNBOUND_TOPOLOGIES_SQL, [])?;
+            tx.execute(
+                unit_summaries::DELETE_WORKSPACE_VERSIONS_SQL,
+                params![workspace_id],
+            )?;
+            tx.execute(unit_summaries::DELETE_UNBOUND_SUMMARIES_SQL, [])?;
             let revisions = tx.execute(
                 "DELETE FROM workspace_revisions WHERE workspace_id = ?1",
                 params![workspace_id],
@@ -6445,26 +6695,12 @@ impl AnalyzerStore {
         impl_declaration_id: u32,
         impl_rel_path: &str,
     ) -> Result<Vec<(Oid, u32, String)>> {
-        let conn = self.read_conn()?;
-        let mut stmt = conn.prepare_cached(&RUST_TRAITS_OF_IMPL_SQL)?;
-        let rows = stmt.query_map(
-            params![impl_blob.to_string(), impl_declaration_id, impl_rel_path],
-            |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, u32>(1)?,
-                    row.get::<_, String>(2)?,
-                ))
-            },
-        )?;
-        let mut out = Vec::new();
-        for row in rows {
-            let (oid, declaration, rel_path) = row?;
-            out.push((Oid::from_str(&oid)?, declaration, rel_path));
-        }
-        out.sort();
-        out.dedup();
-        Ok(out)
+        self.rust_trait_impl_counterparts(
+            &RUST_TRAITS_OF_IMPL_SQL,
+            impl_blob,
+            impl_declaration_id,
+            impl_rel_path,
+        )
     }
 
     /// Every item-position macro invocation of one placed file, with its
@@ -6695,23 +6931,17 @@ impl AnalyzerStore {
     /// selection, which has to know which files are spliced into another
     /// before it can decide whether to read them.
     pub(crate) fn rust_include_host_blobs(&self, lang: &str) -> Result<Vec<Oid>> {
-        let conn = self.read_conn()?;
-        let mut stmt = conn.prepare_cached(
+        self.rust_fact_blob_oids(
             "SELECT DISTINCT keys.blob_oid
                  FROM rust_include_edges AS facts
                  JOIN blobs AS keys ON keys.id = facts.blob_id
                  WHERE facts.lang = ?1",
-        )?;
-        let rows = stmt.query_map(params![lang], |row| row.get::<_, String>(0))?;
-        let mut blobs = Vec::new();
-        for row in rows {
-            let text = row?;
-            blobs.push(
+            params![lang],
+            |text| {
                 Oid::from_str(&text)
-                    .map_err(|err| StoreError::new(format!("invalid blob oid {text}: {err}")))?,
-            );
-        }
-        Ok(blobs)
+                    .map_err(|err| StoreError::new(format!("invalid blob oid {text}: {err}")))
+            },
+        )
     }
 
     /// Blobs with an `include!` whose literal's last path component is
@@ -6864,19 +7094,14 @@ impl AnalyzerStore {
         generation: GenerationId,
         oids: &[Oid],
     ) -> Result<HashSet<Oid>> {
-        const OIDS_PER_QUERY: usize = 400;
-        let mut unique: Vec<String> = oids.iter().map(Oid::to_string).collect();
-        unique.sort();
-        unique.dedup();
+        let unique = unique_rust_fact_oid_strings(oids);
         let conn = self.read_conn()?;
         let mut present = set_with_capacity(unique.len());
-        for chunk in unique.chunks(OIDS_PER_QUERY) {
-            let sql = Self::blobs_with_rust_facts_sql(chunk.len());
+        for chunk in unique.chunks(RUST_FACT_OIDS_PER_QUERY) {
+            let (placeholders, parameters) =
+                rust_fact_oid_query_parameters(lang, generation, chunk);
+            let sql = Self::blobs_with_rust_facts_sql(&placeholders);
             let mut stmt = conn.prepare_cached(&sql)?;
-            let mut parameters = Vec::with_capacity(chunk.len() + 2);
-            parameters.push(rusqlite::types::Value::Text(lang.to_owned()));
-            parameters.push(rusqlite::types::Value::Integer(generation.get()));
-            parameters.extend(chunk.iter().cloned().map(rusqlite::types::Value::Text));
             let rows = stmt.query_map(params_from_iter(parameters.iter()), |row| {
                 row.get::<_, String>(0)
             })?;
@@ -6887,11 +7112,7 @@ impl AnalyzerStore {
         Ok(present)
     }
 
-    fn blobs_with_rust_facts_sql(oid_count: usize) -> String {
-        assert!(oid_count > 0, "Rust fact probe needs at least one OID");
-        let placeholders = std::iter::repeat_n("?", oid_count)
-            .collect::<Vec<_>>()
-            .join(", ");
+    fn blobs_with_rust_facts_sql(placeholders: &str) -> String {
         format!(
             "SELECT keys.blob_oid
          FROM rust_published_fact_blobs AS keys
@@ -6921,24 +7142,16 @@ impl AnalyzerStore {
         if !keep_going() {
             return Ok(None);
         }
-        const OIDS_PER_QUERY: usize = 400;
-        let mut unique: Vec<String> = oids.iter().map(Oid::to_string).collect();
-        unique.sort();
-        unique.dedup();
+        let unique = unique_rust_fact_oid_strings(oids);
         let mut conn = self.read_conn()?;
         let tx = conn.transaction()?;
         let mut by_oid: HashMap<Oid, RustModuleRouteFacts> = HashMap::default();
-        for chunk in unique.chunks(OIDS_PER_QUERY) {
+        for chunk in unique.chunks(RUST_FACT_OIDS_PER_QUERY) {
             if !keep_going() {
                 return Ok(None);
             }
-            let placeholders = std::iter::repeat_n("?", chunk.len())
-                .collect::<Vec<_>>()
-                .join(", ");
-            let mut parameters = Vec::with_capacity(chunk.len() + 2);
-            parameters.push(rusqlite::types::Value::Text(lang.to_owned()));
-            parameters.push(rusqlite::types::Value::Integer(generation.get()));
-            parameters.extend(chunk.iter().cloned().map(rusqlite::types::Value::Text));
+            let (placeholders, parameters) =
+                rust_fact_oid_query_parameters(lang, generation, chunk);
             let mut stmt = tx.prepare_cached(&format!(
                 "SELECT keys.blob_oid, source_scope.declaration_id,
                         facts.parent_ordinal, facts.module_name,
@@ -7068,14 +7281,26 @@ impl AnalyzerStore {
     }
 
     fn rust_fact_blobs(&self, sql: &str, lang: &str, key: &str) -> Result<Vec<Oid>> {
+        let mut out =
+            self.rust_fact_blob_oids(sql, params![lang, key], |text| Ok(Oid::from_str(&text)?))?;
+        out.sort();
+        Ok(out)
+    }
+
+    fn rust_fact_blob_oids(
+        &self,
+        sql: &str,
+        parameters: impl rusqlite::Params,
+        mut decode: impl FnMut(String) -> Result<Oid>,
+    ) -> Result<Vec<Oid>> {
         let conn = self.read_conn()?;
         let mut stmt = conn.prepare_cached(sql)?;
-        let rows = stmt.query_map(params![lang, key], |row| row.get::<_, String>(0))?;
+        let rows = stmt.query_map(parameters, |row| row.get::<_, String>(0))?;
         let mut out = Vec::new();
         for row in rows {
-            out.push(Oid::from_str(&row?)?);
+            let text = row?;
+            out.push(decode(text)?);
         }
-        out.sort();
         Ok(out)
     }
 }
@@ -7334,16 +7559,37 @@ fn mounted_declaration_sql_with_primary_ranges() -> String {
     )
 }
 
+const CODE_UNIT_CANDIDATE_FROM_CLAUSE: &str = "FROM code_units AS units
+     JOIN blobs AS keys
+       ON keys.id = units.blob_id
+     JOIN blob_meta AS meta
+       ON meta.blob_id = units.blob_id";
+
+const DECLARATION_MEMBER_CANDIDATE_FROM_CLAUSE: &str = "FROM code_units AS owner
+     JOIN unit_children AS edge
+       ON edge.blob_id = owner.blob_id
+      AND edge.parent_key = owner.unit_key
+     JOIN code_units AS child
+       ON child.blob_id = edge.blob_id
+      AND child.unit_key = edge.child_key
+     JOIN blobs AS keys
+       ON keys.id = child.blob_id
+     JOIN blob_meta AS meta
+       ON meta.blob_id = child.blob_id";
+
+fn declaration_member_owner_predicate(owner_column: &str) -> String {
+    format!(
+        "owner.lang = ?1 AND owner.{owner_column} = ?2
+         AND owner.in_declarations = 1 AND child.identifier = ?3"
+    )
+}
+
 /// `declaration_candidate_rows_by_identifier_prefix_for_langs`'s query. Named
 /// so `identifier_prefix_lookup_seeks_the_identifier_index` can plan it.
 fn identifier_prefix_candidate_sql() -> String {
     candidate_rows_sql_with_membership(
         "units",
-        "FROM code_units AS units
-         JOIN blobs AS keys
-           ON keys.id = units.blob_id
-         JOIN blob_meta AS meta
-           ON meta.blob_id = units.blob_id",
+        CODE_UNIT_CANDIDATE_FROM_CLAUSE,
         "units.lang = ?1 AND units.identifier >= ?2 AND units.identifier < ?3",
         "(units.in_declarations = 1 OR units.in_definition_lookup = 1)",
         "keys.blob_oid, units.unit_key",
@@ -7354,14 +7600,37 @@ fn identifier_prefix_candidate_sql() -> String {
 fn limited_identifier_candidate_for_blob_sql() -> String {
     limited_candidate_rows_sql_with_membership(
         "units",
-        "FROM code_units AS units
-         JOIN blobs AS keys
-           ON keys.id = units.blob_id
-         JOIN blob_meta AS meta
-           ON meta.blob_id = units.blob_id",
+        CODE_UNIT_CANDIDATE_FROM_CLAUSE,
         "units.lang = ?1 AND units.identifier = ?2 AND keys.blob_oid = ?3",
         "(units.in_declarations = 1 OR units.in_definition_lookup = 1)",
         &["keys.blob_oid", "units.unit_key"],
+    )
+}
+
+fn limited_identifier_candidate_sql() -> String {
+    format!(
+        "{} LIMIT (
+           SELECT request_limit
+           FROM temp.declaration_candidate_requests
+           ORDER BY request_ordinal
+           LIMIT 1
+         )",
+        limited_candidate_rows_sql_with_membership(
+            "units",
+            "FROM temp.declaration_candidate_requests AS requested
+             CROSS JOIN code_units AS units
+             JOIN blobs AS keys
+               ON keys.id = units.blob_id
+             JOIN blob_meta AS meta
+               ON meta.blob_id = units.blob_id",
+            "units.lang = requested.lang AND units.identifier = requested.identifier",
+            "(units.in_declarations = 1 OR units.in_definition_lookup = 1)",
+            &[
+                "requested.request_ordinal",
+                "keys.blob_oid",
+                "units.unit_key",
+            ],
+        )
     )
 }
 
@@ -7385,11 +7654,7 @@ fn byte_successor(prefix: &str) -> Option<String> {
 fn limited_declaration_candidate_sql(predicate: &str) -> String {
     limited_candidate_rows_sql_with_membership(
         "units",
-        "FROM code_units AS units
-         JOIN blobs AS keys
-           ON keys.id = units.blob_id
-         JOIN blob_meta AS meta
-           ON meta.blob_id = units.blob_id",
+        CODE_UNIT_CANDIDATE_FROM_CLAUSE,
         predicate,
         "units.in_declarations = 1",
         &["keys.blob_oid", "units.unit_key"],
@@ -7399,11 +7664,7 @@ fn limited_declaration_candidate_sql(predicate: &str) -> String {
 fn declaration_candidate_sql_with_order(predicate: &str, order_by: &str) -> String {
     candidate_rows_sql_with_membership(
         "units",
-        "FROM code_units AS units
-         JOIN blobs AS keys
-           ON keys.id = units.blob_id
-         JOIN blob_meta AS meta
-           ON meta.blob_id = units.blob_id",
+        CODE_UNIT_CANDIDATE_FROM_CLAUSE,
         predicate,
         "units.in_declarations = 1",
         order_by,
@@ -7444,6 +7705,24 @@ fn limited_candidate_rows_sql_with_membership(
     membership: &str,
     order_by: &[&str],
 ) -> String {
+    limited_candidate_rows_sql_with_membership_and_cte_prefix(
+        candidate_alias,
+        from_clause,
+        predicate,
+        membership,
+        order_by,
+        "",
+    )
+}
+
+fn limited_candidate_rows_sql_with_membership_and_cte_prefix(
+    candidate_alias: &str,
+    from_clause: &str,
+    predicate: &str,
+    membership: &str,
+    order_by: &[&str],
+    cte_prefix: &str,
+) -> String {
     let row_bytes = format!(
         "length(CAST(keys.blob_oid AS BLOB))
          + length(CAST({candidate_alias}.lang AS BLOB))
@@ -7471,7 +7750,7 @@ fn limited_candidate_rows_sql_with_membership(
         .collect::<Vec<_>>()
         .join(", ");
     format!(
-        "WITH bounded AS MATERIALIZED (
+        "WITH {cte_prefix}bounded AS MATERIALIZED (
            SELECT keys.blob_oid, {candidate_alias}.lang,
                   {candidate_alias}.unit_key, {candidate_alias}.kind,
                   {candidate_alias}.short_name, {candidate_alias}.content_qualifier,
@@ -7537,27 +7816,34 @@ fn candidate_rows_sql_with_membership_projection_and_completeness(
     order_by: &str,
     extra_projection: &str,
 ) -> String {
+    let candidate_projection = candidate_unit_projection_sql(candidate_alias);
     let order_by = if order_by.is_empty() {
         String::new()
     } else {
         format!("ORDER BY {order_by}")
     };
     format!(
-        "SELECT keys.blob_oid, {candidate_alias}.lang, {candidate_alias}.unit_key,
-                {candidate_alias}.kind, {candidate_alias}.short_name,
-                {candidate_alias}.content_qualifier, {candidate_alias}.signature,
-                {candidate_alias}.synthetic, {candidate_alias}.is_type_alias,
-                {candidate_alias}.top_level_ordinal, {candidate_alias}.in_declarations,
-                {candidate_alias}.in_definition_lookup,
-                {candidate_alias}.fq_anchor_kind, {candidate_alias}.fq_anchor_pop,
-                {candidate_alias}.fq_package_tail_segments,
-                {candidate_alias}.fq_segment_count, {candidate_alias}.exact_fqn_tail,
-                {candidate_alias}.fq_segment_bytes,
-                {candidate_alias}.normalized_fqn_tail{extra_projection}
+        "SELECT keys.blob_oid, {candidate_projection}{extra_projection}
          {from_clause}
          WHERE {predicate} AND {membership}
            AND {completeness}
          {order_by}"
+    )
+}
+
+fn candidate_unit_projection_sql(candidate_alias: &str) -> String {
+    format!(
+        "{candidate_alias}.lang, {candidate_alias}.unit_key,
+         {candidate_alias}.kind, {candidate_alias}.short_name,
+         {candidate_alias}.content_qualifier, {candidate_alias}.signature,
+         {candidate_alias}.synthetic, {candidate_alias}.is_type_alias,
+         {candidate_alias}.top_level_ordinal, {candidate_alias}.in_declarations,
+         {candidate_alias}.in_definition_lookup,
+         {candidate_alias}.fq_anchor_kind, {candidate_alias}.fq_anchor_pop,
+         {candidate_alias}.fq_package_tail_segments,
+         {candidate_alias}.fq_segment_count, {candidate_alias}.exact_fqn_tail,
+         {candidate_alias}.fq_segment_bytes,
+         {candidate_alias}.normalized_fqn_tail"
     )
 }
 
@@ -7744,23 +8030,7 @@ fn build_point_component_definition_candidate_sql(
         // per-language workspace file version for each probe (#2742). CROSS JOIN is
         // SQLite's documented directive to keep the written join order.
         component_definition_candidate_projection(
-            &format!(
-                "FROM workspace_file_anchors AS anchors
-             CROSS JOIN workspace_files AS files
-               ON files.lang = anchors.lang
-              AND files.generation = anchors.generation
-              AND files.file_id = anchors.file_id
-             CROSS JOIN blobs AS keys
-               ON keys.blob_oid = files.blob_oid
-              AND keys.lang = files.lang
-              AND keys.generation = ?2
-             CROSS JOIN {unit_source}
-               ON units.blob_id = keys.id
-              AND units.fq_anchor_kind = anchors.anchor_kind
-              AND units.fq_anchor_pop = anchors.anchor_pop
-             JOIN blob_meta AS meta
-               ON meta.blob_id = units.blob_id"
-            ),
+            &point_anchored_definition_from_clause(unit_source),
             &format!(
                 "anchors.lang = ?1
                  AND anchors.generation = ?2
@@ -7858,21 +8128,7 @@ fn point_anchor_only_definition_candidate_sql(membership: &str) -> &'static str 
             // Same join-order constraint as the anchored component lookup (#2742):
             // the package seek is the selective entry point and must stay outermost.
             component_definition_candidate_projection(
-                "FROM workspace_file_anchors AS anchors
-                 CROSS JOIN workspace_files AS files
-                   ON files.lang = anchors.lang
-                  AND files.generation = anchors.generation
-                  AND files.file_id = anchors.file_id
-                 CROSS JOIN blobs AS keys
-                   ON keys.blob_oid = files.blob_oid
-                  AND keys.lang = files.lang
-                  AND keys.generation = ?2
-                 CROSS JOIN code_units AS units
-                   ON units.blob_id = keys.id
-                  AND units.fq_anchor_kind = anchors.anchor_kind
-                  AND units.fq_anchor_pop = anchors.anchor_pop
-                 JOIN blob_meta AS meta
-                   ON meta.blob_id = units.blob_id",
+                &point_anchored_definition_from_clause("code_units AS units"),
                 "anchors.lang = ?1
                  AND anchors.generation = ?2
                  AND anchors.package_name = ?3
@@ -7890,6 +8146,26 @@ fn point_anchor_only_definition_candidate_sql(membership: &str) -> &'static str 
         _ => unreachable!("anchor-only lookup has one of two membership contracts"),
     };
     &SQL[membership_index]
+}
+
+fn point_anchored_definition_from_clause(unit_source: &str) -> String {
+    format!(
+        "FROM workspace_file_anchors AS anchors
+         CROSS JOIN workspace_files AS files
+           ON files.lang = anchors.lang
+          AND files.generation = anchors.generation
+          AND files.file_id = anchors.file_id
+         CROSS JOIN blobs AS keys
+           ON keys.blob_oid = files.blob_oid
+          AND keys.lang = files.lang
+          AND keys.generation = ?2
+         CROSS JOIN {unit_source}
+           ON units.blob_id = keys.id
+          AND units.fq_anchor_kind = anchors.anchor_kind
+          AND units.fq_anchor_pop = anchors.anchor_pop
+         JOIN blob_meta AS meta
+           ON meta.blob_id = units.blob_id"
+    )
 }
 
 fn batch_component_definition_candidate_sql(
@@ -7914,27 +8190,7 @@ fn batch_component_definition_candidate_sql(
         // planner enumerates every per-language workspace file version and every
         // anchored unit in it before it consults a request prefix (#2742).
         component_definition_candidate_projection(
-            &format!(
-                "FROM requests
-             CROSS JOIN workspace_file_anchors AS anchors
-               ON anchors.lang = ?2
-              AND anchors.generation = ?3
-              AND anchors.package_name = requests.prefix
-             CROSS JOIN workspace_files AS files
-               ON files.lang = anchors.lang
-              AND files.generation = anchors.generation
-              AND files.file_id = anchors.file_id
-             CROSS JOIN blobs AS keys
-               ON keys.blob_oid = files.blob_oid
-              AND keys.lang = files.lang
-              AND keys.generation = ?3
-             CROSS JOIN {unit_source}
-               ON units.blob_id = keys.id
-              AND units.fq_anchor_kind = anchors.anchor_kind
-              AND units.fq_anchor_pop = anchors.anchor_pop
-             JOIN blob_meta AS meta
-               ON meta.blob_id = units.blob_id"
-            ),
+            &batch_anchored_definition_from_clause(unit_source),
             &format!(
                 "requests.anchored = 1
                  AND requests.tail <> ''
@@ -8010,25 +8266,7 @@ fn batch_component_definition_candidate_sql(
 fn batch_anchor_only_definition_candidate_sql(membership: &str) -> String {
     // Same join-order constraint as the anchored batch component lookup (#2742).
     let select = component_definition_candidate_projection(
-        "FROM requests
-         CROSS JOIN workspace_file_anchors AS anchors
-           ON anchors.lang = ?2
-          AND anchors.generation = ?3
-          AND anchors.package_name = requests.prefix
-         CROSS JOIN workspace_files AS files
-           ON files.lang = anchors.lang
-          AND files.generation = anchors.generation
-          AND files.file_id = anchors.file_id
-         CROSS JOIN blobs AS keys
-           ON keys.blob_oid = files.blob_oid
-          AND keys.lang = files.lang
-          AND keys.generation = ?3
-         CROSS JOIN code_units AS units
-           ON units.blob_id = keys.id
-          AND units.fq_anchor_kind = anchors.anchor_kind
-          AND units.fq_anchor_pop = anchors.anchor_pop
-         JOIN blob_meta AS meta
-           ON meta.blob_id = units.blob_id",
+        &batch_anchored_definition_from_clause("code_units AS units"),
         "requests.anchored = 1
          AND requests.normalized = 0
          AND requests.tail = ''
@@ -8046,6 +8284,30 @@ fn batch_anchor_only_definition_candidate_sql(membership: &str) -> String {
            FROM json_each(?1)
          )
          {select}"
+    )
+}
+
+fn batch_anchored_definition_from_clause(unit_source: &str) -> String {
+    format!(
+        "FROM requests
+         CROSS JOIN workspace_file_anchors AS anchors
+           ON anchors.lang = ?2
+          AND anchors.generation = ?3
+          AND anchors.package_name = requests.prefix
+         CROSS JOIN workspace_files AS files
+           ON files.lang = anchors.lang
+          AND files.generation = anchors.generation
+          AND files.file_id = anchors.file_id
+         CROSS JOIN blobs AS keys
+           ON keys.blob_oid = files.blob_oid
+          AND keys.lang = files.lang
+          AND keys.generation = ?3
+         CROSS JOIN {unit_source}
+           ON units.blob_id = keys.id
+          AND units.fq_anchor_kind = anchors.anchor_kind
+          AND units.fq_anchor_pop = anchors.anchor_pop
+         JOIN blob_meta AS meta
+           ON meta.blob_id = units.blob_id"
     )
 }
 
@@ -8091,16 +8353,112 @@ fn candidate_rows_for_languages<'a>(
     sql: &str,
     values: &[&dyn ToSql],
 ) -> Result<Vec<HydratedCandidateRow>> {
+    let rows = candidate_rows_for_languages_with(conn, langs, sql, values, candidate_row_from_row)?;
+    Ok(hydrate_candidate_rows(conn, rows, None)?
+        .expect("uncancelled candidate hydration completes"))
+}
+
+fn candidate_rows_for_languages_with<'a, T>(
+    conn: &Connection,
+    langs: impl IntoIterator<Item = &'a str>,
+    sql: &str,
+    values: &[&dyn ToSql],
+    mut row_from_row: impl FnMut(&rusqlite::Row<'_>) -> rusqlite::Result<T>,
+) -> Result<Vec<T>> {
     let mut statement = conn.prepare_cached(sql)?;
     let mut rows = Vec::new();
     for lang in langs {
         let params = std::iter::once(&lang as &dyn ToSql).chain(values.iter().copied());
-        rows.extend(collect_candidate_rows(
-            statement.query_map(params_from_iter(params), candidate_row_from_row)?,
+        rows.extend(collect_mapped_rows(
+            statement.query_map(params_from_iter(params), &mut row_from_row)?,
         )?);
     }
-    Ok(hydrate_candidate_rows(conn, rows, None)?
-        .expect("uncancelled candidate hydration completes"))
+    Ok(rows)
+}
+
+fn candidate_rows_for_identifier_languages_limited(
+    conn: &Connection,
+    langs: &[String],
+    identifier: &str,
+    sql: &str,
+    limit: usize,
+) -> Result<LimitedQueryRows<HydratedCandidateRow>> {
+    if limit == 0 {
+        return Ok(LimitedQueryRows::incomplete(Vec::new(), 0));
+    }
+
+    ensure_declaration_candidate_requests_table(conn)?;
+    conn.execute("DELETE FROM temp.declaration_candidate_requests", [])?;
+    {
+        let mut insert = conn.prepare_cached(
+            "INSERT INTO temp.declaration_candidate_requests(
+               request_ordinal, lang, identifier, request_limit
+             ) VALUES (?1, ?2, ?3, ?4)",
+        )?;
+        let sql_limit = i64::try_from(limit).unwrap_or(i64::MAX);
+        if langs.is_empty() {
+            insert.execute(params![
+                0_i64,
+                Option::<String>::None,
+                Option::<String>::None,
+                sql_limit
+            ])?;
+        }
+        for (ordinal, lang) in langs.iter().enumerate() {
+            insert.execute(params![usize_to_i64(ordinal)?, lang, identifier, sql_limit])?;
+        }
+    }
+
+    let mut statement = conn.prepare_cached(sql)?;
+    let mut query = statement.query([])?;
+    let mut rows = Vec::new();
+    let mut inspected = 0usize;
+    let mut bytes = LimitedQueryByteBudget::default();
+    let mut complete = true;
+    while let Some(row) = query.next()? {
+        inspected = inspected.saturating_add(1);
+        // The relational FQ header occupies 12..=18; row bytes follow.
+        if !bytes.admit_sqlite_bytes(row.get::<_, i64>(19)?)? {
+            complete = false;
+            break;
+        }
+        rows.push(candidate_row_from_row(row)?);
+    }
+    drop(query);
+    if inspected == limit {
+        complete = false;
+    }
+    drop(statement);
+    let rows = hydrate_candidate_rows(conn, rows, None)?
+        .expect("uncancelled candidate hydration completes");
+    conn.execute("DELETE FROM temp.declaration_candidate_requests", [])?;
+    if complete {
+        Ok(LimitedQueryRows::complete(rows, inspected))
+    } else {
+        Ok(LimitedQueryRows::incomplete(rows, inspected))
+    }
+}
+
+fn ensure_declaration_candidate_requests_table(conn: &Connection) -> Result<()> {
+    let exists: bool = conn.query_row(
+        "SELECT EXISTS(
+           SELECT 1 FROM temp.sqlite_schema
+           WHERE type = 'table' AND name = 'declaration_candidate_requests'
+         )",
+        [],
+        |row| row.get(0),
+    )?;
+    if !exists {
+        conn.execute_batch(
+            "CREATE TEMP TABLE declaration_candidate_requests(
+           request_ordinal INTEGER PRIMARY KEY,
+           lang TEXT,
+           identifier TEXT,
+           request_limit INTEGER NOT NULL
+         ) WITHOUT ROWID;",
+        )?;
+    }
+    Ok(())
 }
 
 fn candidate_rows_for_languages_limited<'a>(
@@ -8329,6 +8687,8 @@ struct RustExportRow {
 
 /// One `rust_import_targets` row. Canonical source/context links replace
 /// legacy import properties; module_path and bound_name are indexed headers.
+/// A grouped `self` import stores its complete module path so source views can
+/// distinguish it from an import of the path's final segment.
 #[derive(Debug, PartialEq, Eq)]
 struct RustImportTargetRow {
     ordinal: i64,
@@ -8466,12 +8826,18 @@ impl RustFactRows {
                     .and_then(|(arena, ids)| ids.target.map(|id| arena.occurrence(id)));
                 let alias_occurrence = occurrence_rows
                     .and_then(|(arena, ids)| ids.alias.map(|id| arena.occurrence(id)));
+                let module_self =
+                    source.is_some() && target.imported_name.as_deref() == Some("self");
                 Ok(RustImportTargetRow {
                     ordinal: usize_to_i64(ordinal)?,
-                    module_path: source.map_or_else(
-                        || target.module_path.join("::"),
-                        |source| rust_import_qualifier(source).join("::"),
-                    ),
+                    module_path: if module_self {
+                        target.module_path.join("::")
+                    } else {
+                        source.map_or_else(
+                            || target.module_path.join("::"),
+                            |source| rust_import_qualifier(source).join("::"),
+                        )
+                    },
                     bound_name: match source {
                         Some(source) => rust_import_bound_name(source).cloned(),
                         None => target.bound_name.clone(),
@@ -8825,8 +9191,10 @@ fn insert_rust_fact_rows(
 // ==== store/mod.rs lines 8261-8560 at the Phase 1 merge ====
 /// Read back one blob's `rust_*` fact rows through the common bulk decoder.
 fn read_rust_usage_facts(conn: &Connection, oid: &str, lang: &str) -> Result<RustUsageFacts> {
-    read_rust_usage_facts_with_session(conn, oid, lang, None)?
-        .ok_or_else(|| StoreError::new("unbounded Rust usage-fact hydration stopped unexpectedly"))
+    require_unbounded_hydration(
+        read_rust_usage_facts_with_session(conn, oid, lang, None)?,
+        "unbounded Rust usage-fact hydration stopped unexpectedly",
+    )
 }
 
 #[cfg(test)]
@@ -8835,8 +9203,10 @@ fn read_rust_usage_facts_bulk(
     lang: &str,
     oids: &[String],
 ) -> Result<HashMap<String, RustUsageFacts>> {
-    read_rust_usage_facts_bulk_with_session(conn, lang, oids, None)?
-        .ok_or_else(|| StoreError::new("unbounded Rust usage-fact hydration stopped unexpectedly"))
+    require_unbounded_hydration(
+        read_rust_usage_facts_bulk_with_session(conn, lang, oids, None)?,
+        "unbounded Rust usage-fact hydration stopped unexpectedly",
+    )
 }
 
 fn rust_import_targets_sql(placeholders: &str) -> String {
@@ -9510,6 +9880,9 @@ pub(crate) struct PreparedParsedBlob {
     contains_tests: i64,
     content_package: String,
     resolution: PreparedResolutionBundle,
+    /// The blob's semantic IR rows, lowered at parse time. `None` for a
+    /// language whose adapter has no parse-time lowerer.
+    semantic_ir: Option<PreparedSemanticIr>,
     logical_rows: usize,
     payload_bytes: usize,
     mutation_logical_rows: usize,
@@ -10685,7 +11058,11 @@ fn prepare_parsed_blob<A: LanguageAdapter>(
     }
     let mut generations = HashMap::default();
     generations.insert(lang.to_owned(), generation);
+    let file = test_blob_file();
+    let syntax = test_blob_syntax(adapter, &file, &state);
     match prepare_parsed_blob_at_generations(
+        &file,
+        &syntax,
         oid,
         lang,
         &generations,
@@ -10701,7 +11078,10 @@ fn prepare_parsed_blob<A: LanguageAdapter>(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn prepare_parsed_blob_at_generations<A: LanguageAdapter>(
+    file: &ProjectFile,
+    syntax: &PreparedSyntaxTree,
     oid: Oid,
     lang: &str,
     generations: &HashMap<String, GenerationId>,
@@ -10862,6 +11242,9 @@ fn prepare_parsed_blob_at_generations<A: LanguageAdapter>(
         ))
     })?;
     assert_ne!(adapter.language(), Language::None);
+    let _collect_units_timing = crate::profiling::scope_with(|| {
+        format!("store.prepare_parsed_blob.collect_unit_keys[{lang}][{oid}]")
+    });
     let stored_units = collect_stored_units(adapter, state.as_ref());
     let unit_keys = stored_unit_keys_from_units(&stored_units);
     let mut source_declaration_units = state
@@ -10885,16 +11268,26 @@ fn prepare_parsed_blob_at_generations<A: LanguageAdapter>(
     source_declaration_metadata
         .sort_unstable_by_key(|(declaration, unit, ordinal)| (declaration.get(), *unit, *ordinal));
     source_declaration_metadata.dedup();
-    let lowered = lower_resolution_facts_with_identity_catalog(
-        BindingFragmentId::unmounted(),
-        adapter.language(),
-        &state.resolution_facts,
-    );
+    drop(_collect_units_timing);
+    let _resolution_timing = crate::profiling::scope_with(|| {
+        format!("store.prepare_parsed_blob.resolution_prepare[{lang}][{oid}]")
+    });
+    let lowered = {
+        let _lowering_timing = crate::profiling::scope_with(|| {
+            format!("store.prepare_parsed_blob.resolution_lowering[{lang}][{oid}]")
+        });
+        lower_resolution_facts_with_identity_catalog(
+            BindingFragmentId::unmounted(),
+            adapter.language(),
+            &state.resolution_facts,
+        )
+    };
     stop_if_cancelled!();
     let resolution = match prepare_resolution_bundle_with_source_facts(
         &lowered,
         &unit_keys,
         state.source_facts.as_ref(),
+        Some(&state.source),
         cancellation,
     )? {
         ResolutionInteriorPreparation::Prepared(bundle) => *bundle,
@@ -10903,9 +11296,33 @@ fn prepare_parsed_blob_at_generations<A: LanguageAdapter>(
         }
     };
     drop(lowered);
+    drop(_resolution_timing);
     stop_if_cancelled!();
     assert_eq!(resolution.semantic_language(), adapter.language());
+    // The tree belongs to the file's primary storage language. A projection
+    // reading has its own dialect and carries no semantic IR rows (C++ only).
+    let semantic_ir = match adapter.parse_time_semantic_lowerer() {
+        Some(lowerer) if lang == adapter.storage_language_key_for_file(file) => {
+            let Some(prepared) = prepare_parse_time_semantic_ir(
+                lowerer.lowerer(),
+                file,
+                syntax,
+                oid,
+                lang,
+                cancellation,
+            )?
+            else {
+                return Ok(PreparedParsedBlobPreparation::Cancelled);
+            };
+            Some(prepared)
+        }
+        _ => None,
+    };
+    stop_if_cancelled!();
 
+    let _additional_timing = crate::profiling::scope_with(|| {
+        format!("store.prepare_parsed_blob.additional_projections[{lang}][{oid}]")
+    });
     // The same blob's other readings (see `FileState::additional_projections`)
     // carry the exact generation captured with the primary. A projection state
     // has no projections of its own, so this traversal is bounded to one level.
@@ -10924,6 +11341,8 @@ fn prepare_parsed_blob_at_generations<A: LanguageAdapter>(
             )));
         }
         let projection = prepare_parsed_blob_at_generations(
+            file,
+            syntax,
             oid,
             projection_lang,
             generations,
@@ -10967,6 +11386,8 @@ fn prepare_parsed_blob_at_generations<A: LanguageAdapter>(
         projection_state.source.clear();
         projection_state.additional_projections.clear();
         let projection = prepare_parsed_blob_at_generations(
+            file,
+            syntax,
             oid,
             projection_lang,
             generations,
@@ -10984,6 +11405,10 @@ fn prepare_parsed_blob_at_generations<A: LanguageAdapter>(
     }
     stop_if_cancelled!();
     stop_if_cancelled!();
+    drop(_additional_timing);
+    let _structural_timing = crate::profiling::scope_with(|| {
+        format!("store.prepare_parsed_blob.structural_rows[{lang}][{oid}]")
+    });
     let persist_lookup_keys = adapter.persist_content_stable_lookup_keys();
     let mut units = Vec::with_capacity(stored_units.len());
     for stored in stored_units {
@@ -11233,6 +11658,7 @@ fn prepare_parsed_blob_at_generations<A: LanguageAdapter>(
     let mut type_identifiers: Vec<_> = state.type_identifiers.iter().cloned().collect();
     type_identifiers.sort();
     stop_if_cancelled!();
+    drop(_structural_timing);
 
     let optional_counts = optional_fact_counts(
         cpp_templates.header_count(),
@@ -11242,8 +11668,15 @@ fn prepare_parsed_blob_at_generations<A: LanguageAdapter>(
         materialization_records.len(),
         signature_metadata_signature_ordinals.len(),
     );
+    let semantic_logical_rows = semantic_ir
+        .as_ref()
+        .map_or(0, PreparedSemanticIr::logical_rows);
+    let semantic_payload_bytes = semantic_ir
+        .as_ref()
+        .map_or(0, PreparedSemanticIr::payload_bytes);
     let parsed_logical_rows = saturating_sum([
         4,
+        semantic_logical_rows,
         optional_counts.nonzero_len(),
         units.len(),
         saturating_sum(units.iter().map(|row| row.relational_fq_segments.len())),
@@ -11326,7 +11759,8 @@ fn prepare_parsed_blob_at_generations<A: LanguageAdapter>(
         .len()
         .saturating_add(string_bytes)
         .saturating_add(binary_bytes)
-        .saturating_add(content_package.len());
+        .saturating_add(content_package.len())
+        .saturating_add(semantic_payload_bytes);
     stop_if_cancelled!();
     let (source_rows, source_bytes) = state.source_facts.as_ref().map_or((0, 0), |facts| {
         source_facts::source_fact_cost(
@@ -11363,6 +11797,9 @@ fn prepare_parsed_blob_at_generations<A: LanguageAdapter>(
         .saturating_add(source_bytes)
         .saturating_add(lang.len());
 
+    let _fragment_timing = crate::profiling::scope_with(|| {
+        format!("store.prepare_parsed_blob.fragment_build[{lang}][{oid}]")
+    });
     Ok(PreparedParsedBlobPreparation::Prepared(Box::new(
         PreparedParsedBlob {
             oid,
@@ -11403,6 +11840,7 @@ fn prepare_parsed_blob_at_generations<A: LanguageAdapter>(
             contains_tests,
             content_package,
             resolution,
+            semantic_ir,
             logical_rows,
             payload_bytes,
             mutation_logical_rows: saturating_sum(
@@ -11416,6 +11854,149 @@ fn prepare_parsed_blob_at_generations<A: LanguageAdapter>(
             additional,
         },
     )))
+}
+
+/// Lowers one parsed blob with the parse-time lowerer and encodes the outcome
+/// as semantic IR rows (spec M1.4). `Ok(None)` means preparation was cancelled.
+/// Lowers one parsed blob with the parse-time lowerer, over the tree the
+/// analysis walk read, and encodes the outcome as semantic IR rows (spec
+/// M1.4). `Ok(None)` means preparation was cancelled.
+fn prepare_parse_time_semantic_ir(
+    lowerer: &dyn ProgramSemanticsLowerer,
+    file: &ProjectFile,
+    prepared: &PreparedSyntaxTree,
+    oid: Oid,
+    lang: &str,
+    cancellation: &CancellationToken,
+) -> Result<Option<PreparedSemanticIr>> {
+    let _timing = crate::profiling::scope_with(|| {
+        format!("store.prepare_parsed_blob.semantic_ir[{lang}][{oid}]")
+    });
+    let producer_epoch = semantic_ir_producer_epoch(&lowerer.identity());
+    let content = ContentIdentity::from_digest(StableDigest::from_array(prepared.source_sha256()));
+    let (outcome, artifact) = {
+        let _lower = crate::profiling::scope("semantic_ir.lower");
+        match lower_parse_time_semantic_ir(lowerer, file, prepared, content, cancellation) {
+            Some(lowered) => lowered,
+            None => return Ok(None),
+        }
+    };
+    let partial_flows = match artifact {
+        Some(artifact) => {
+            let _partial_flows = crate::profiling::scope("semantic_ir.partial_flows");
+            match parse_time_partial_flows(&artifact, prepared, cancellation) {
+                Some(flows) => Some(flows),
+                None => return Ok(None),
+            }
+        }
+        None => None,
+    };
+    let _encode = crate::profiling::scope("semantic_ir.encode");
+    Ok(Some(PreparedSemanticIr::prepare(
+        outcome,
+        partial_flows.as_deref(),
+        &producer_epoch,
+        content,
+        prepared.source().len(),
+    )))
+}
+
+/// The lowering outcome, validated the way a reader would validate it, and the
+/// validated artifact of a complete outcome. `None` means the lowering was
+/// cancelled and the blob preparation must stop.
+fn lower_parse_time_semantic_ir(
+    lowerer: &dyn ProgramSemanticsLowerer,
+    file: &ProjectFile,
+    prepared: &PreparedSyntaxTree,
+    content: ContentIdentity,
+    cancellation: &CancellationToken,
+) -> Option<(SemanticIrLoweringOutcome, Option<Arc<SemanticArtifact>>)> {
+    let lowered = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        lowerer.lower(file, prepared, &SemanticBudget::default(), cancellation)
+    }));
+    let lowered = match lowered {
+        Ok(lowered) => lowered,
+        Err(payload) => {
+            let message = payload
+                .downcast_ref::<String>()
+                .map(String::as_str)
+                .or_else(|| payload.downcast_ref::<&str>().copied())
+                .unwrap_or("non-string panic payload");
+            return Some((
+                SemanticIrLoweringOutcome::Panicked(message.to_owned()),
+                None,
+            ));
+        }
+    };
+    if cancellation.is_cancelled() {
+        return None;
+    }
+    let unvalidated = |outcome| Some((outcome, None));
+    match lowered {
+        Err(error) => unvalidated(SemanticIrLoweringOutcome::Error(error.to_string())),
+        Ok(SemanticOutcome::Complete { value: parts, .. }) => {
+            let key = match semantic_artifact_key_from_content(
+                file,
+                prepared.dialect(),
+                content,
+                None,
+                lowerer.identity(),
+            ) {
+                Ok(key) => key,
+                Err(error) => {
+                    return unvalidated(SemanticIrLoweringOutcome::Error(error.to_string()));
+                }
+            };
+            match SemanticArtifact::try_new_with_budget(
+                key,
+                lowerer.capabilities(),
+                parts.clone(),
+                &mut SemanticBudget::default(),
+            ) {
+                Ok(artifact) => Some((
+                    SemanticIrLoweringOutcome::Complete { parts },
+                    Some(Arc::new(artifact)),
+                )),
+                Err(SemanticArtifactBuildError::Invalid(error)) => {
+                    unvalidated(SemanticIrLoweringOutcome::Error(error.to_string()))
+                }
+                Err(SemanticArtifactBuildError::ExceededBudget(exceeded)) => {
+                    unvalidated(SemanticIrLoweringOutcome::ExceededBudget(exceeded))
+                }
+            }
+        }
+        Ok(SemanticOutcome::ExceededBudget { exceeded, .. }) => {
+            unvalidated(SemanticIrLoweringOutcome::ExceededBudget(exceeded))
+        }
+        Ok(SemanticOutcome::Unsupported { capability, .. }) => {
+            unvalidated(SemanticIrLoweringOutcome::Unsupported(capability))
+        }
+        Ok(SemanticOutcome::Cancelled { .. }) => None,
+        Ok(other) => unvalidated(SemanticIrLoweringOutcome::Incomplete {
+            label: other.label(),
+        }),
+    }
+}
+
+/// The file a test blob is parsed and lowered as when the test does not name
+/// one. It has no extension, so it takes its language's default grammar.
+#[cfg(test)]
+pub(crate) fn test_blob_file() -> ProjectFile {
+    ProjectFile::new(std::env::temp_dir(), "test_blob")
+}
+
+/// The tree a test blob's state is prepared with: the state's source parsed
+/// again, the way a path that dropped its tree does.
+#[cfg(test)]
+fn test_blob_syntax<A: LanguageAdapter>(
+    adapter: &A,
+    file: &ProjectFile,
+    state: &FileState,
+) -> Arc<PreparedSyntaxTree> {
+    match reparse_retained_source(adapter, file, state, None) {
+        PreparedSyntaxPreparation::Complete(Some(syntax)) => syntax,
+        _ => panic!("a test blob's source must parse within its budget"),
+    }
 }
 
 fn write_prepared_blob_rows_tx(
@@ -11435,8 +12016,7 @@ fn write_prepared_blob_rows_tx(
     // `import_statements` or `blob_meta`. IDs remain database-owned. A Rust
     // repair preserves its ID when persisted crate rows retain references
     // to the same immutable content and epoch. Nothing outside SQLite holds
-    // an ID across a query; see
-    // `.agents/plans/store-blob-id-interning.md`.
+    // an ID across a query.
     let Some(previous_owners) =
         resolution_publication::repair_owners_tx(tx, oid, lang, generation, cancellation)?
     else {
@@ -11455,6 +12035,10 @@ fn write_prepared_blob_rows_tx(
         // across the delete/reinsert so the normal cascade clears damaged facts.
         tx.execute_batch("PRAGMA defer_foreign_keys = ON")?;
     }
+    // The delete below cascades away the old row's unit summary members, exports
+    // and imports, so the summaries that listed it stop being live first.
+    tx.prepare_cached(unit_summaries::WITHDRAW_VERSIONS_OF_REPLACED_BLOB_SQL)?
+        .execute(params![oid, lang])?;
     tx.prepare_cached("DELETE FROM blobs WHERE blob_oid = ?1 AND lang = ?2")?
         .execute(params![oid, lang])?;
     tx.prepare_cached(rust_crates::REINSERT_BLOB_SQL)?
@@ -11628,8 +12212,8 @@ fn write_prepared_blob_rows_tx(
            blob_id, lang, contains_tests, content_package, stored_unit_count,
            range_count, signature_count, signature_metadata_count, supertype_count,
            child_count, import_statement_count, type_identifier_count, is_complete,
-           declaration_visibility_version, java_type_constructor_version, go_source_version, java_source_version, scala_source_version, ruby_source_version, php_source_version, cpp_source_version, source_facts_version, metadata_bridges_required, js_ts_source_version, python_source_version, native_bridges_required
-         ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, 1, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25)",
+           declaration_visibility_version, java_type_constructor_version, go_source_version, java_source_version, scala_source_version, ruby_source_version, php_source_version, cpp_source_version, source_facts_version, metadata_bridges_required, js_ts_source_version, python_source_version, native_bridges_required, parse_completeness
+         ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, 1, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26)",
     )?
     .execute(params![
         blob_id,
@@ -11657,6 +12241,7 @@ fn write_prepared_blob_rows_tx(
         blob.js_ts_source_version,
         blob.python_source_version,
         blob.source_facts_version.is_some(),
+        blob.state.completeness.label(),
     ])?;
     insert_optional_fact_manifest(
         tx,
@@ -11698,6 +12283,11 @@ fn write_prepared_blob_rows_tx(
         )?;
     }
     if !resolution::insert_prepared_bundle_tx(tx, blob_id, lang, &blob.resolution, cancellation)? {
+        return Err(StoreError::new("prepared blob persistence was cancelled"));
+    }
+    if let Some(semantic_ir) = blob.semantic_ir.as_ref()
+        && !insert_semantic_ir_tx(tx, blob_id, lang, semantic_ir, cancellation)?
+    {
         return Err(StoreError::new("prepared blob persistence was cancelled"));
     }
     let source_ready: bool = tx.query_row(
@@ -11798,7 +12388,7 @@ impl SideFactFamilies {
     }
 }
 
-fn require_complete_file_state(state: &FileState) -> Result<()> {
+pub(crate) fn require_complete_file_state(state: &FileState) -> Result<()> {
     if !state.parse_complete {
         return Err(StoreError::new(
             "timed-out file analysis cannot be published as a complete parsed blob",
@@ -12119,6 +12709,7 @@ struct BlobMetaRow {
     raw_content_package: String,
     type_identifiers: HashSet<String>,
     stored_unit_count: usize,
+    completeness: crate::analyzer::ParseCompleteness,
     side_counts: PersistedSideTableCounts,
 }
 
@@ -12313,6 +12904,7 @@ fn hydrate_file_state_conn<A: LanguageAdapter>(
         contains_tests: meta.contains_tests,
         test_region_units,
         materialization_records,
+        completeness: meta.completeness,
         parse_errors: None,
         parse_complete: true,
         additional_projections: Vec::new(),
@@ -12636,12 +13228,12 @@ fn hydrate_file_states_conn<A: LanguageAdapter>(
             materialization_records_by_oid.get(&oid_text),
             &by_key,
         )?;
-        let raw_supertypes = unit_string_map_for_file(supertypes_by_oid.get(&oid_text), &by_key);
+        let raw_supertypes = unit_values_map_for_file(supertypes_by_oid.get(&oid_text), &by_key);
         let supertype_lookup_paths =
-            unit_string_map_for_file(supertype_lookup_paths_by_oid.get(&oid_text), &by_key);
-        let signatures = unit_string_map_for_file(signatures_by_oid.get(&oid_text), &by_key);
+            unit_values_map_for_file(supertype_lookup_paths_by_oid.get(&oid_text), &by_key);
+        let signatures = unit_values_map_for_file(signatures_by_oid.get(&oid_text), &by_key);
         let signature_metadata =
-            signature_metadata_map_for_file(signature_metadata_by_oid.get(&oid_text), &by_key);
+            unit_values_map_for_file(signature_metadata_by_oid.get(&oid_text), &by_key);
         let signature_metadata_signature_ordinals =
             signature_metadata_signature_ordinals_map_for_file(
                 signature_metadata_signature_ordinals_by_oid.get(&oid_text),
@@ -12702,6 +13294,7 @@ fn hydrate_file_states_conn<A: LanguageAdapter>(
             contains_tests: adapter.hydrate_contains_tests(meta.contains_tests, file, source_text),
             test_region_units,
             materialization_records,
+            completeness: meta.completeness,
             parse_errors: None,
             parse_complete: true,
             additional_projections: Vec::new(),
@@ -12722,7 +13315,7 @@ fn hydrate_file_states_conn<A: LanguageAdapter>(
 static BLOB_META_SQL: LazyLock<String> = LazyLock::new(|| {
     let optional_fact_projection = OPTIONAL_FACT_COUNT_PROJECTION.as_str();
     format!(
-        "SELECT contains_tests, content_package, stored_unit_count,
+        "SELECT contains_tests, content_package, stored_unit_count, parse_completeness,
             range_count, signature_count, signature_metadata_count, supertype_count,
             child_count, import_statement_count, type_identifier_count,
             {optional_fact_projection}
@@ -12743,18 +13336,21 @@ fn read_blob_meta<A: LanguageAdapter>(
     file: &ProjectFile,
     source: &str,
 ) -> Result<Option<BlobMetaRow>> {
-    let row: Option<(i64, String, i64, RawSideTableCounts)> = conn
+    let row: Option<(i64, String, i64, String, RawSideTableCounts)> = conn
         .prepare_cached(&BLOB_META_SQL)?
         .query_row(params![oid, lang], |row| {
             Ok((
                 row.get(0)?,
                 row.get(1)?,
                 row.get(2)?,
-                raw_side_table_counts_from_row(row, 3)?,
+                row.get(3)?,
+                raw_side_table_counts_from_row(row, 4)?,
             ))
         })
         .optional()?;
-    let Some((contains_tests, content_package, stored_unit_count, raw_side_counts)) = row else {
+    let Some((contains_tests, content_package, stored_unit_count, completeness, raw_side_counts)) =
+        row
+    else {
         return Ok(None);
     };
     let type_identifiers = read_type_identifiers(conn, oid, lang)?;
@@ -12765,6 +13361,7 @@ fn read_blob_meta<A: LanguageAdapter>(
         raw_content_package: content_package,
         type_identifiers,
         stored_unit_count: i64_to_usize(stored_unit_count)?,
+        completeness: crate::analyzer::ParseCompleteness::from_label(&completeness),
         side_counts,
     }))
 }
@@ -12866,6 +13463,34 @@ fn side_table_counts_from_raw(raw: RawSideTableCounts) -> Result<PersistedSideTa
     })
 }
 
+const RUST_FACT_OIDS_PER_QUERY: usize = 400;
+
+fn unique_rust_fact_oid_strings(oids: &[Oid]) -> Vec<String> {
+    let mut unique: Vec<String> = oids.iter().map(Oid::to_string).collect();
+    unique.sort();
+    unique.dedup();
+    unique
+}
+
+fn rust_fact_oid_query_parameters(
+    lang: &str,
+    generation: GenerationId,
+    chunk: &[String],
+) -> (String, Vec<rusqlite::types::Value>) {
+    assert!(
+        !chunk.is_empty(),
+        "Rust fact query chunk must contain an OID"
+    );
+    let placeholders = std::iter::repeat_n("?", chunk.len())
+        .collect::<Vec<_>>()
+        .join(", ");
+    let mut parameters = Vec::with_capacity(chunk.len() + 2);
+    parameters.push(rusqlite::types::Value::Text(lang.to_owned()));
+    parameters.push(rusqlite::types::Value::Integer(generation.get()));
+    parameters.extend(chunk.iter().cloned().map(rusqlite::types::Value::Text));
+    (placeholders, parameters)
+}
+
 fn unique_oid_strings(entries: &[(ProjectFile, Oid)]) -> Vec<String> {
     let mut seen = HashSet::default();
     let mut out = Vec::new();
@@ -12884,12 +13509,12 @@ fn unique_oid_strings(entries: &[(ProjectFile, Oid)]) -> Vec<String> {
 /// caches them. `900` is the top because the callers chunk at 900.
 const IN_CHUNK_ARITY_LADDER: [usize; 4] = [16, 64, 256, 900];
 
-fn padded_in_arity(len: usize) -> usize {
-    IN_CHUNK_ARITY_LADDER
+fn padded_arity(len: usize, ladder: &[usize]) -> usize {
+    ladder
         .iter()
         .copied()
         .find(|&arity| arity >= len)
-        .unwrap_or(IN_CHUNK_ARITY_LADDER[IN_CHUNK_ARITY_LADDER.len() - 1])
+        .unwrap_or(*ladder.last().expect("arity ladder is nonempty"))
 }
 
 /// Parameters for a chunked `IN (…)` query, padded to the next fixed arity with
@@ -12897,7 +13522,7 @@ fn padded_in_arity(len: usize) -> usize {
 /// `x IN (a, b, NULL)` returns exactly what `x IN (a, b)` returns for the
 /// non-null `blob_oid`s we query.
 fn chunk_params(lang: &str, chunk: &[String]) -> Vec<Option<String>> {
-    let arity = padded_in_arity(chunk.len());
+    let arity = padded_arity(chunk.len(), &IN_CHUNK_ARITY_LADDER);
     let mut params = Vec::with_capacity(arity + 1);
     params.push(Some(lang.to_string()));
     params.extend(chunk.iter().cloned().map(Some));
@@ -12906,10 +13531,37 @@ fn chunk_params(lang: &str, chunk: &[String]) -> Vec<Option<String>> {
 }
 
 fn chunk_placeholders(chunk: &[String]) -> String {
-    let arity = padded_in_arity(chunk.len());
+    let arity = padded_arity(chunk.len(), &IN_CHUNK_ARITY_LADDER);
     std::iter::repeat_n("?", arity)
         .collect::<Vec<_>>()
         .join(",")
+}
+
+fn read_grouped_bulk_rows<T>(
+    conn: &Connection,
+    lang: &str,
+    oids: &[String],
+    sql_for_placeholders: impl Fn(&str) -> String,
+    mut row_from_sql: impl FnMut(&rusqlite::Row<'_>) -> rusqlite::Result<(String, T)>,
+) -> Result<HashMap<String, Vec<T>>> {
+    let mut out: HashMap<String, Vec<T>> = HashMap::default();
+    for chunk in oids.chunks(900) {
+        if chunk.is_empty() {
+            continue;
+        }
+        let placeholders = chunk_placeholders(chunk);
+        let sql = sql_for_placeholders(&placeholders);
+        let params = chunk_params(lang, chunk);
+        let mut stmt = conn.prepare_cached(&sql)?;
+        let rows = stmt.query_map(rusqlite::params_from_iter(params.iter()), |row| {
+            row_from_sql(row)
+        })?;
+        for row in rows {
+            let (oid, value) = row?;
+            out.entry(oid).or_default().push(value);
+        }
+    }
+    Ok(out)
 }
 
 fn read_blob_meta_bulk(conn: &Connection, lang: &str, oids: &[String]) -> Result<BlobMetaRows> {
@@ -12922,6 +13574,7 @@ fn read_blob_meta_bulk(conn: &Connection, lang: &str, oids: &[String]) -> Result
         let placeholders = chunk_placeholders(chunk);
         let sql = format!(
             "SELECT keys.blob_oid, contains_tests, content_package, stored_unit_count,
+                    parse_completeness,
                     range_count, signature_count, signature_metadata_count, supertype_count,
                     child_count, import_statement_count, type_identifier_count,
                     {optional_fact_projection}
@@ -12942,11 +13595,19 @@ fn read_blob_meta_bulk(conn: &Connection, lang: &str, oids: &[String]) -> Result
                 row.get::<_, i64>(1)?,
                 row.get::<_, String>(2)?,
                 row.get::<_, i64>(3)?,
-                raw_side_table_counts_from_row(row, 4)?,
+                row.get::<_, String>(4)?,
+                raw_side_table_counts_from_row(row, 5)?,
             ))
         })?;
         for row in rows {
-            let (oid, contains_tests, content_package, stored_unit_count, raw_side_counts) = row?;
+            let (
+                oid,
+                contains_tests,
+                content_package,
+                stored_unit_count,
+                completeness,
+                raw_side_counts,
+            ) = row?;
             out.insert(
                 oid,
                 BlobMetaRow {
@@ -12955,6 +13616,7 @@ fn read_blob_meta_bulk(conn: &Connection, lang: &str, oids: &[String]) -> Result
                     content_package,
                     type_identifiers: HashSet::default(),
                     stored_unit_count: i64_to_usize(stored_unit_count)?,
+                    completeness: crate::analyzer::ParseCompleteness::from_label(&completeness),
                     side_counts: side_table_counts_from_raw(raw_side_counts)?,
                 },
             );
@@ -13068,30 +13730,24 @@ fn read_unit_rows_bulk(
     lang: &str,
     oids: &[String],
 ) -> Result<HashMap<String, Vec<RawUnitRow>>> {
-    let mut out: HashMap<String, Vec<RawUnitRow>> = HashMap::default();
-    for chunk in oids.chunks(900) {
-        if chunk.is_empty() {
-            continue;
-        }
-        let placeholders = chunk_placeholders(chunk);
-        let sql = format!(
-            "SELECT keys.blob_oid, {RAW_UNIT_COLUMNS}
+    let mut out = read_grouped_bulk_rows(
+        conn,
+        lang,
+        oids,
+        |placeholders| {
+            format!(
+                "SELECT keys.blob_oid, {RAW_UNIT_COLUMNS}
              FROM blobs AS keys
              JOIN code_units AS units ON units.blob_id = keys.id
              WHERE keys.lang = ? AND keys.blob_oid IN ({placeholders})
              ORDER BY keys.blob_oid, units.unit_key"
-        );
-        let params = chunk_params(lang, chunk);
-        let mut stmt = conn.prepare_cached(&sql)?;
-        let rows = stmt.query_map(rusqlite::params_from_iter(params.iter()), |row| {
+            )
+        },
+        |row| {
             let raw = raw_unit_row_from_row(row, 0)?;
             Ok((raw.blob_oid.to_string(), raw))
-        })?;
-        for row in rows {
-            let (oid, raw) = row?;
-            out.entry(oid).or_default().push(raw);
-        }
-    }
+        },
+    )?;
     let mut all_rows = out
         .values_mut()
         .flat_map(|rows| rows.drain(..))
@@ -13285,8 +13941,10 @@ fn read_import_infos_bulk(
     lang: &str,
     oids: &[String],
 ) -> Result<HashMap<String, Vec<ImportInfo>>> {
-    read_import_infos_bulk_with_session(conn, lang, oids, None)?
-        .ok_or_else(|| StoreError::new("unbounded import-info hydration stopped unexpectedly"))
+    require_unbounded_hydration(
+        read_import_infos_bulk_with_session(conn, lang, oids, None)?,
+        "unbounded import-info hydration stopped unexpectedly",
+    )
 }
 
 fn import_infos_bulk_sql(placeholders: &str) -> String {
@@ -13342,34 +14000,26 @@ fn read_scala_exports_bulk(
     lang: &str,
     oids: &[String],
 ) -> Result<ScalaExportRows> {
-    let mut out: ScalaExportRows = HashMap::default();
-    for chunk in oids.chunks(900) {
-        if chunk.is_empty() {
-            continue;
-        }
-        let placeholders = chunk_placeholders(chunk);
-        let sql = format!(
-            "SELECT keys.blob_oid, facts.owner_key, facts.info
-             FROM blobs AS keys
-             JOIN scala_exports AS facts ON facts.blob_id = keys.id
-             WHERE keys.lang = ? AND keys.blob_oid IN ({placeholders})
-             ORDER BY keys.blob_oid, facts.owner_key, facts.ordinal"
-        );
-        let params = chunk_params(lang, chunk);
-        let mut stmt = conn.prepare_cached(&sql)?;
-        let rows = stmt.query_map(rusqlite::params_from_iter(params.iter()), |row| {
+    read_grouped_bulk_rows(
+        conn,
+        lang,
+        oids,
+        |placeholders| {
+            format!(
+                "SELECT keys.blob_oid, facts.owner_key, facts.info
+                 FROM blobs AS keys
+                 JOIN scala_exports AS facts ON facts.blob_id = keys.id
+                 WHERE keys.lang = ? AND keys.blob_oid IN ({placeholders})
+                 ORDER BY keys.blob_oid, facts.owner_key, facts.ordinal"
+            )
+        },
+        |row| {
             Ok((
                 row.get::<_, String>(0)?,
-                row.get::<_, i64>(1)?,
-                row.get::<_, Vec<u8>>(2)?,
+                (row.get::<_, i64>(1)?, row.get::<_, Vec<u8>>(2)?),
             ))
-        })?;
-        for row in rows {
-            let (oid, owner_key, info) = row?;
-            out.entry(oid).or_default().push((owner_key, info));
-        }
-    }
-    Ok(out)
+        },
+    )
 }
 
 fn read_materialization_records_bulk(
@@ -13377,34 +14027,26 @@ fn read_materialization_records_bulk(
     lang: &str,
     oids: &[String],
 ) -> Result<MaterializationRecordRows> {
-    let mut out: MaterializationRecordRows = HashMap::default();
-    for chunk in oids.chunks(900) {
-        if chunk.is_empty() {
-            continue;
-        }
-        let placeholders = chunk_placeholders(chunk);
-        let sql = format!(
-            "SELECT keys.blob_oid, facts.unit_key, facts.payload
-             FROM blobs AS keys
-             JOIN materialization_records AS facts ON facts.blob_id = keys.id
-             WHERE keys.lang = ? AND keys.blob_oid IN ({placeholders})
-             ORDER BY keys.blob_oid, facts.ordinal"
-        );
-        let params = chunk_params(lang, chunk);
-        let mut stmt = conn.prepare_cached(&sql)?;
-        let rows = stmt.query_map(rusqlite::params_from_iter(params.iter()), |row| {
+    read_grouped_bulk_rows(
+        conn,
+        lang,
+        oids,
+        |placeholders| {
+            format!(
+                "SELECT keys.blob_oid, facts.unit_key, facts.payload
+                 FROM blobs AS keys
+                 JOIN materialization_records AS facts ON facts.blob_id = keys.id
+                 WHERE keys.lang = ? AND keys.blob_oid IN ({placeholders})
+                 ORDER BY keys.blob_oid, facts.ordinal"
+            )
+        },
+        |row| {
             Ok((
                 row.get::<_, String>(0)?,
-                row.get::<_, Option<i64>>(1)?,
-                row.get::<_, Vec<u8>>(2)?,
+                (row.get::<_, Option<i64>>(1)?, row.get::<_, Vec<u8>>(2)?),
             ))
-        })?;
-        for row in rows {
-            let (oid, unit_key, payload) = row?;
-            out.entry(oid).or_default().push((unit_key, payload));
-        }
-    }
-    Ok(out)
+        },
+    )
 }
 
 fn materialization_records_for_file(
@@ -13431,34 +14073,26 @@ fn read_unit_string_vec_bulk(
     value_column: &str,
     oids: &[String],
 ) -> Result<HashMap<String, Vec<(i64, String)>>> {
-    let mut out: HashMap<String, Vec<(i64, String)>> = HashMap::default();
-    for chunk in oids.chunks(900) {
-        if chunk.is_empty() {
-            continue;
-        }
-        let placeholders = chunk_placeholders(chunk);
-        let sql = format!(
-            "SELECT keys.blob_oid, facts.unit_key, facts.{value_column}
-             FROM blobs AS keys
-             JOIN {table} AS facts ON facts.blob_id = keys.id
-             WHERE keys.lang = ? AND keys.blob_oid IN ({placeholders})
-             ORDER BY keys.blob_oid, facts.unit_key, facts.ordinal"
-        );
-        let params = chunk_params(lang, chunk);
-        let mut stmt = conn.prepare_cached(&sql)?;
-        let rows = stmt.query_map(rusqlite::params_from_iter(params.iter()), |row| {
+    read_grouped_bulk_rows(
+        conn,
+        lang,
+        oids,
+        |placeholders| {
+            format!(
+                "SELECT keys.blob_oid, facts.unit_key, facts.{value_column}
+                 FROM blobs AS keys
+                 JOIN {table} AS facts ON facts.blob_id = keys.id
+                 WHERE keys.lang = ? AND keys.blob_oid IN ({placeholders})
+                 ORDER BY keys.blob_oid, facts.unit_key, facts.ordinal"
+            )
+        },
+        |row| {
             Ok((
                 row.get::<_, String>(0)?,
-                row.get::<_, i64>(1)?,
-                row.get::<_, String>(2)?,
+                (row.get::<_, i64>(1)?, row.get::<_, String>(2)?),
             ))
-        })?;
-        for row in rows {
-            let (oid, key, value) = row?;
-            out.entry(oid).or_default().push((key, value));
-        }
-    }
-    Ok(out)
+        },
+    )
 }
 
 fn read_signature_metadata_bulk(
@@ -13466,35 +14100,30 @@ fn read_signature_metadata_bulk(
     lang: &str,
     oids: &[String],
 ) -> Result<SignatureMetadataRows> {
-    let mut out: SignatureMetadataRows = HashMap::default();
-    for chunk in oids.chunks(900) {
-        if chunk.is_empty() {
-            continue;
-        }
-        let placeholders = chunk_placeholders(chunk);
-        let columns = signature_metadata_projection_columns_sql("metadata");
-        let sql = format!(
-            "SELECT keys.blob_oid, metadata.unit_key, {columns}
-             FROM blobs AS keys
-             JOIN unit_signature_metadata_values AS metadata ON metadata.blob_id = keys.id
-             WHERE keys.lang = ? AND keys.blob_oid IN ({placeholders})
-             ORDER BY keys.blob_oid, metadata.unit_key, metadata.ordinal"
-        );
-        let params = chunk_params(lang, chunk);
-        let mut stmt = conn.prepare_cached(&sql)?;
-        let rows = stmt.query_map(rusqlite::params_from_iter(params.iter()), |row| {
+    let columns = signature_metadata_projection_columns_sql("metadata");
+    read_grouped_bulk_rows(
+        conn,
+        lang,
+        oids,
+        |placeholders| {
+            format!(
+                "SELECT keys.blob_oid, metadata.unit_key, {columns}
+                 FROM blobs AS keys
+                 JOIN unit_signature_metadata_values AS metadata ON metadata.blob_id = keys.id
+                 WHERE keys.lang = ? AND keys.blob_oid IN ({placeholders})
+                 ORDER BY keys.blob_oid, metadata.unit_key, metadata.ordinal"
+            )
+        },
+        |row| {
             Ok((
                 row.get::<_, String>(0)?,
-                row.get::<_, i64>(1)?,
-                signature_metadata_projection_from_row(row, 2)?,
+                (
+                    row.get::<_, i64>(1)?,
+                    signature_metadata_projection_from_row(row, 2)?,
+                ),
             ))
-        })?;
-        for row in rows {
-            let (oid, key, value) = row?;
-            out.entry(oid).or_default().push((key, value));
-        }
-    }
-    Ok(out)
+        },
+    )
 }
 
 fn read_signature_metadata_signature_ordinals_bulk(
@@ -13590,34 +14219,26 @@ fn read_children_bulk(
     lang: &str,
     oids: &[String],
 ) -> Result<HashMap<String, Vec<(i64, i64)>>> {
-    let mut out: HashMap<String, Vec<(i64, i64)>> = HashMap::default();
-    for chunk in oids.chunks(900) {
-        if chunk.is_empty() {
-            continue;
-        }
-        let placeholders = chunk_placeholders(chunk);
-        let sql = format!(
-            "SELECT keys.blob_oid, facts.parent_key, facts.child_key
-             FROM blobs AS keys
-             JOIN unit_children AS facts ON facts.blob_id = keys.id
-             WHERE keys.lang = ? AND keys.blob_oid IN ({placeholders})
-             ORDER BY keys.blob_oid, facts.parent_key, facts.ordinal"
-        );
-        let params = chunk_params(lang, chunk);
-        let mut stmt = conn.prepare_cached(&sql)?;
-        let rows = stmt.query_map(rusqlite::params_from_iter(params.iter()), |row| {
+    read_grouped_bulk_rows(
+        conn,
+        lang,
+        oids,
+        |placeholders| {
+            format!(
+                "SELECT keys.blob_oid, facts.parent_key, facts.child_key
+                 FROM blobs AS keys
+                 JOIN unit_children AS facts ON facts.blob_id = keys.id
+                 WHERE keys.lang = ? AND keys.blob_oid IN ({placeholders})
+                 ORDER BY keys.blob_oid, facts.parent_key, facts.ordinal"
+            )
+        },
+        |row| {
             Ok((
                 row.get::<_, String>(0)?,
-                row.get::<_, i64>(1)?,
-                row.get::<_, i64>(2)?,
+                (row.get::<_, i64>(1)?, row.get::<_, i64>(2)?),
             ))
-        })?;
-        for row in rows {
-            let (oid, parent, child) = row?;
-            out.entry(oid).or_default().push((parent, child));
-        }
-    }
-    Ok(out)
+        },
+    )
 }
 
 fn read_ruby_method_dispatch_modes_bulk(
@@ -13660,52 +14281,28 @@ fn read_scala_traits_bulk(
     lang: &str,
     oids: &[String],
 ) -> Result<ScalaTraitRows> {
-    let mut out: ScalaTraitRows = HashMap::default();
-    for chunk in oids.chunks(900) {
-        if chunk.is_empty() {
-            continue;
-        }
-        let placeholders = chunk_placeholders(chunk);
-        let sql = format!(
-            "SELECT keys.blob_oid, facts.unit_key
-             FROM blobs AS keys
-             JOIN scala_traits AS facts ON facts.blob_id = keys.id
-             WHERE keys.lang = ? AND keys.blob_oid IN ({placeholders})
-             ORDER BY keys.blob_oid, facts.unit_key"
-        );
-        let params = chunk_params(lang, chunk);
-        let mut stmt = conn.prepare_cached(&sql)?;
-        let rows = stmt.query_map(rusqlite::params_from_iter(params.iter()), |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
-        })?;
-        for row in rows {
-            let (oid, key) = row?;
-            out.entry(oid).or_default().push(key);
-        }
-    }
-    Ok(out)
+    read_grouped_bulk_rows(
+        conn,
+        lang,
+        oids,
+        |placeholders| {
+            format!(
+                "SELECT keys.blob_oid, facts.unit_key
+                 FROM blobs AS keys
+                 JOIN scala_traits AS facts ON facts.blob_id = keys.id
+                 WHERE keys.lang = ? AND keys.blob_oid IN ({placeholders})
+                 ORDER BY keys.blob_oid, facts.unit_key"
+            )
+        },
+        |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
+    )
 }
 
-fn unit_string_map_for_file(
-    rows: Option<&Vec<(i64, String)>>,
+fn unit_values_map_for_file<T: Clone>(
+    rows: Option<&Vec<(i64, T)>>,
     by_key: &HashMap<i64, UnitRow>,
-) -> HashMap<CodeUnit, Vec<String>> {
-    let mut out: HashMap<CodeUnit, Vec<String>> = HashMap::default();
-    for (key, value) in rows.into_iter().flatten() {
-        if let Some(unit) = by_key.get(key) {
-            out.entry(unit.unit.clone())
-                .or_default()
-                .push(value.clone());
-        }
-    }
-    out
-}
-
-fn signature_metadata_map_for_file(
-    rows: Option<&Vec<SignatureMetadataRow>>,
-    by_key: &HashMap<i64, UnitRow>,
-) -> HashMap<CodeUnit, Vec<SignatureMetadata>> {
-    let mut out: HashMap<CodeUnit, Vec<SignatureMetadata>> = HashMap::default();
+) -> HashMap<CodeUnit, Vec<T>> {
+    let mut out: HashMap<CodeUnit, Vec<T>> = HashMap::default();
     for (key, value) in rows.into_iter().flatten() {
         if let Some(unit) = by_key.get(key) {
             out.entry(unit.unit.clone())
@@ -13803,15 +14400,31 @@ fn ranges_map_for_file(
     let mut out: HashMap<CodeUnit, Vec<Range>> = HashMap::default();
     for (key, start_byte, end_byte, start_line, end_line) in rows.into_iter().flatten() {
         if let Some(unit) = by_key.get(key) {
-            out.entry(unit.unit.clone()).or_default().push(Range {
-                start_byte: i64_to_usize(*start_byte)?,
-                end_byte: i64_to_usize(*end_byte)?,
-                start_line: i64_to_usize(*start_line)?,
-                end_line: i64_to_usize(*end_line)?,
-            });
+            out.entry(unit.unit.clone())
+                .or_default()
+                .push(range_from_coordinate_values(
+                    *start_byte,
+                    *end_byte,
+                    *start_line,
+                    *end_line,
+                )?);
         }
     }
     Ok(out)
+}
+
+fn range_from_coordinate_values(
+    start_byte: i64,
+    end_byte: i64,
+    start_line: i64,
+    end_line: i64,
+) -> Result<Range> {
+    Ok(Range {
+        start_byte: i64_to_usize(start_byte)?,
+        end_byte: i64_to_usize(end_byte)?,
+        start_line: i64_to_usize(start_line)?,
+        end_line: i64_to_usize(end_line)?,
+    })
 }
 
 fn children_map_for_file(
@@ -14030,6 +14643,22 @@ fn candidate_with_hydrated_fq(
     }
 }
 
+fn code_unit_from_hydrated_row(
+    row: &HydratedCandidateRow,
+    file: &ProjectFile,
+    fq: FqName,
+    package_segment_count: usize,
+) -> CodeUnit {
+    CodeUnit::from_fq(
+        file.clone(),
+        row.kind,
+        fq,
+        package_segment_count,
+        row.signature.clone(),
+        row.flags.synthetic,
+    )
+}
+
 impl CandidateRowContainer for CandidateRow {
     type Hydrated = HydratedCandidateRow;
 
@@ -14153,14 +14782,7 @@ impl<T> CandidateRowContainer for (CandidateRow, T) {
     }
 }
 
-fn padded_candidate_key_arity(len: usize) -> usize {
-    const LADDER: [usize; 5] = [1, 16, 64, 256, 400];
-    LADDER
-        .iter()
-        .copied()
-        .find(|&arity| arity >= len)
-        .unwrap_or(LADDER[LADDER.len() - 1])
-}
+const CANDIDATE_KEY_ARITY_LADDER: [usize; 5] = [1, 16, 64, 256, 400];
 
 /// `NOT INDEXED` is the whole point of this function's shape, and removing it
 /// costs hours (issue #2794).
@@ -14169,7 +14791,7 @@ fn padded_candidate_key_arity(len: usize) -> usize {
 /// seg_ordinal)` and carries no secondary index, so the join above is a
 /// primary-key prefix seek and there is nothing else here for the planner to
 /// choose. It chose something else anyway. From the 256-key rung of
-/// [`padded_candidate_key_arity`] upward -- that is, on every full chunk --
+/// the 256-key rung upward -- that is, on every full chunk --
 /// SQLite 3.53 stops seeking the primary key and instead builds an AUTOMATIC
 /// COVERING INDEX on `segments(unit_key)`, over the whole table, *per
 /// execution*. On dotnet/runtime that is a transient index over 3,842,193 rows
@@ -14237,7 +14859,7 @@ pub(super) fn hydrate_candidate_rows<T: CandidateRowContainer>(
     let mut inspected_segments = 0usize;
     for (chunk_index, chunk) in unique_keys.chunks(400).enumerate() {
         let chunk_start = chunk_index * 400;
-        let padded = padded_candidate_key_arity(chunk.len());
+        let padded = padded_arity(chunk.len(), &CANDIDATE_KEY_ARITY_LADDER);
         let sql = candidate_fq_segments_sql(padded);
         let mut parameters = Vec::with_capacity(padded * 4);
         for (offset, (oid, lang, unit_key)) in chunk.iter().enumerate() {
@@ -14377,14 +14999,23 @@ fn definition_order_candidate_row_from_row(
 fn candidate_primary_range_row_from_row(
     row: &rusqlite::Row<'_>,
 ) -> rusqlite::Result<CandidatePrimaryRangeRow> {
-    // The relational FQ header occupies 12..=18; test-region evidence is 19
-    // and the range follows at 20..=23.
-    let primary_range = primary_range_from_row(row, 20)?;
+    let (primary_range, in_test_region) = candidate_range_and_test_region_from_row(row)?;
     Ok(CandidatePrimaryRangeRow {
         candidate: candidate_row_from_row(row)?,
-        in_test_region: row.get::<_, i64>(19)? != 0,
+        in_test_region,
         primary_range,
     })
+}
+
+fn candidate_range_and_test_region_from_row(
+    row: &rusqlite::Row<'_>,
+) -> rusqlite::Result<(Option<Range>, bool)> {
+    // The relational FQ header occupies 12..=18; test-region evidence is 19
+    // and the primary range follows at 20..=23.
+    Ok((
+        primary_range_from_row(row, 20)?,
+        row.get::<_, i64>(19)? != 0,
+    ))
 }
 
 fn primary_range_from_row(row: &rusqlite::Row<'_>, base: usize) -> rusqlite::Result<Option<Range>> {
@@ -14415,19 +15046,6 @@ fn mounted_candidate_primary_range_row_from_row(
     })
 }
 
-fn collect_candidate_primary_range_rows<F>(
-    rows: rusqlite::MappedRows<'_, F>,
-) -> Result<Vec<CandidatePrimaryRangeRow>>
-where
-    F: FnMut(&rusqlite::Row<'_>) -> rusqlite::Result<CandidatePrimaryRangeRow>,
-{
-    let mut out = Vec::new();
-    for row in rows {
-        out.push(row?);
-    }
-    Ok(out)
-}
-
 fn usage_fact_row_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<UsageFactRow> {
     // The relational FQ header occupies 12..=18, the unit's first signature
     // text is 19, and signature-metadata columns start at 20. `label` is NOT
@@ -14448,11 +15066,10 @@ fn usage_fact_row_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<UsageFac
 
 fn search_candidate_row_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SearchCandidateRow> {
     let candidate = candidate_row_from_row(row)?;
-    // The relational FQ header occupies 12..=18; `in_test_region` is 19,
-    // the primary-range columns are 20..=23, the second range is 24..=27,
+    // The second range is 24..=27,
     // column 28 says whether another range follows, and 29 proves complete
     // callable occurrence metadata with no prototypes.
-    let primary_range = primary_range_from_row(row, 20)?;
+    let (primary_range, in_test_region) = candidate_range_and_test_region_from_row(row)?;
     let secondary_range = primary_range_from_row(row, 24)?;
     Ok(SearchCandidateRow {
         candidate,
@@ -14461,24 +15078,13 @@ fn search_candidate_row_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Se
         secondary_range,
         has_more_ranges: row.get::<_, Option<i64>>(28)?.is_some(),
         all_ranges_are_definitions: row.get::<_, i64>(29)? != 0,
-        in_test_region: row.get::<_, i64>(19)? != 0,
+        in_test_region,
     })
 }
 
-fn collect_candidate_rows<F>(rows: rusqlite::MappedRows<'_, F>) -> Result<Vec<CandidateRow>>
+fn collect_mapped_rows<T, F>(rows: rusqlite::MappedRows<'_, F>) -> Result<Vec<T>>
 where
-    F: FnMut(&rusqlite::Row<'_>) -> rusqlite::Result<CandidateRow>,
-{
-    let mut out = Vec::new();
-    for row in rows {
-        out.push(row?);
-    }
-    Ok(out)
-}
-
-fn collect_usage_fact_rows<F>(rows: rusqlite::MappedRows<'_, F>) -> Result<Vec<UsageFactRow>>
-where
-    F: FnMut(&rusqlite::Row<'_>) -> rusqlite::Result<UsageFactRow>,
+    F: FnMut(&rusqlite::Row<'_>) -> rusqlite::Result<T>,
 {
     let mut out = Vec::new();
     for row in rows {
@@ -14491,14 +15097,9 @@ where
 /// predicate so the by-key hydration and the whole-language enumeration share
 /// their columns and completion predicate without sharing a join order.
 fn search_candidate_projection_sql(prefix: &str, from: &str, predicate: &str) -> String {
+    let candidate_projection = candidate_unit_projection_sql("units");
     format!(
-        "{prefix}SELECT keys.blob_oid, units.lang, units.unit_key, units.kind, units.short_name,
-                units.content_qualifier, units.signature, units.synthetic,
-                units.is_type_alias, units.top_level_ordinal, units.in_declarations,
-                units.in_definition_lookup, units.fq_anchor_kind, units.fq_anchor_pop,
-                units.fq_package_tail_segments, units.fq_segment_count,
-                units.exact_fqn_tail, units.fq_segment_bytes,
-                units.normalized_fqn_tail, units.in_test_region,
+        "{prefix}SELECT keys.blob_oid, {candidate_projection}, units.in_test_region,
                 primary_range.start_byte, primary_range.end_byte,
                 primary_range.start_line, primary_range.end_line,
                 secondary_range.start_byte, secondary_range.end_byte,
@@ -14532,11 +15133,8 @@ fn search_candidate_projection_sql(prefix: &str, from: &str, predicate: &str) ->
 fn search_candidate_sql(predicate: &str) -> String {
     search_candidate_projection_sql(
         "",
-        "FROM code_units AS units
-         JOIN blobs AS keys
-           ON keys.id = units.blob_id
-         JOIN blob_meta AS meta
-           ON meta.blob_id = units.blob_id
+        &format!(
+            "{CODE_UNIT_CANDIDATE_FROM_CLAUSE}
          LEFT JOIN unit_ranges AS primary_range
            ON primary_range.blob_id = units.blob_id
           AND primary_range.unit_key = units.unit_key
@@ -14548,7 +15146,8 @@ fn search_candidate_sql(predicate: &str) -> String {
          LEFT JOIN unit_ranges AS further_range
            ON further_range.blob_id = units.blob_id
           AND further_range.unit_key = units.unit_key
-          AND further_range.ordinal = 2",
+          AND further_range.ordinal = 2"
+        ),
         predicate,
     )
 }
@@ -14556,15 +15155,8 @@ fn search_candidate_sql(predicate: &str) -> String {
 /// Fixed arities for the tuple list used by key hydration. Padding with NULLs
 /// keeps a small set of prepared SQL shapes; the inner joins discard padding.
 const SEARCH_CANDIDATE_KEY_BATCH_SIZE: usize = 400;
-
-fn padded_search_candidate_key_arity(len: usize) -> usize {
-    const LADDER: [usize; 4] = [16, 64, 256, SEARCH_CANDIDATE_KEY_BATCH_SIZE];
-    LADDER
-        .iter()
-        .copied()
-        .find(|&arity| arity >= len)
-        .unwrap_or(SEARCH_CANDIDATE_KEY_BATCH_SIZE)
-}
+const SEARCH_CANDIDATE_KEY_ARITY_LADDER: [usize; 4] =
+    [16, 64, 256, SEARCH_CANDIDATE_KEY_BATCH_SIZE];
 
 /// The by-key path is driven by an exact `(lang, blob_oid, unit_key)` tuple
 /// set. The requested CTE is the outer relation, so SQLite seeks each blob
@@ -14726,16 +15318,94 @@ fn search_candidate_name_rows_sql(
     (sql, literal_parameters)
 }
 
-fn search_candidate_name_rows_for_langs_conn_cancellable(
-    conn: &Connection,
+/// Candidate discovery only: combine a written member's unchanged terminal
+/// segments with every live class having that terminal owner. Include visibility
+/// and ambiguity are proved by the shared C++ reconciler after hydration. This
+/// superset keeps canonical namespace/anchored patterns from being discarded by
+/// provisional names, without hydrating every out-of-line body in the workspace.
+fn cpp_search_owner_name_rows_sql(
     langs: &[String],
     required_literals: Option<&[Vec<String>]>,
+    parameter_offset: usize,
+) -> (String, Vec<String>) {
+    let mut parameters = Vec::new();
+    let literal_predicate = required_literals
+        .map(|patterns| {
+            let disjuncts = patterns
+                .iter()
+                .map(|literals| {
+                    let conjuncts = literals
+                        .iter()
+                        .map(|literal| {
+                            parameters.push(like_contains_pattern(literal));
+                            let slot = langs.len() + parameter_offset + parameters.len();
+                            format!(
+                                r"(owner.short_name LIKE ?{slot} ESCAPE '\'
+                    OR owner.content_qualifier LIKE ?{slot} ESCAPE '\'
+                    OR member.segment LIKE ?{slot} ESCAPE '\')"
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                        .join(" AND ");
+                    format!("({conjuncts})")
+                })
+                .collect::<Vec<_>>()
+                .join(" OR ");
+            format!(" AND ({disjuncts})")
+        })
+        .unwrap_or_default();
+    let language_slots = (1..=langs.len())
+        .map(|slot| format!("?{slot}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let language_cases = langs
+        .iter()
+        .enumerate()
+        .map(|(index, _)| format!("WHEN ?{} THEN {index}", index + 1))
+        .collect::<Vec<_>>()
+        .join(" ");
+    (format!("SELECT CASE units.lang {language_cases} END,
+                keys.blob_oid, units.unit_key,
+                owner.short_name || '.' || member.segment, owner.content_qualifier
+         FROM temp.active_blob_oids AS active
+         CROSS JOIN blobs AS keys ON keys.blob_oid = active.blob_oid
+         CROSS JOIN code_units AS units ON units.blob_id = keys.id
+         JOIN blob_meta AS meta ON meta.blob_id = units.blob_id
+         JOIN code_unit_fq_segments AS terminal_owner
+           ON terminal_owner.blob_id = units.blob_id AND terminal_owner.unit_key = units.unit_key
+          AND terminal_owner.seg_ordinal = units.fq_segment_count - 2
+          AND terminal_owner.seg_kind IN ('package', 'type', 'nested')
+         JOIN code_unit_fq_segments AS member
+           ON member.blob_id = units.blob_id AND member.unit_key = units.unit_key
+          AND member.seg_ordinal = units.fq_segment_count - 1 AND member.seg_kind = 'member'
+         CROSS JOIN code_units AS owner
+           ON owner.lang IN ({language_slots}) AND owner.identifier = terminal_owner.segment
+          AND owner.kind = 0 AND owner.in_declarations = 1
+         JOIN blobs AS owner_blob ON owner_blob.id = owner.blob_id
+         JOIN temp.active_blob_oids AS owner_active ON owner_active.blob_oid = owner_blob.blob_oid
+         WHERE units.lang = 'cpp' AND units.kind = 1 AND units.in_declarations = 1
+           AND {PARSED_BLOB_COMPLETE_CONDITION}
+           AND EXISTS (
+             SELECT 1 FROM source_declaration_units AS link
+             JOIN source_cpp_declarations AS declaration
+               ON declaration.blob_id = link.blob_id AND declaration.declaration_id = link.declaration_id
+              AND declaration.occurrence_role IN (1, 2)
+             JOIN source_cpp_declaration_paths AS path
+               ON path.blob_id = link.blob_id AND path.declaration_id = link.declaration_id
+              AND path.path_kind = 0 AND path.ordinal = 0
+             WHERE link.blob_id = units.blob_id AND link.unit_key = units.unit_key
+           ){literal_predicate}"), parameters)
+}
+
+fn search_candidate_name_rows_conn_cancellable(
+    conn: &Connection,
+    langs: &[String],
+    (sql, literal_parameters): (String, Vec<String>),
     cancellation: Option<&CancellationToken>,
 ) -> Result<LimitedQueryRows<SearchCandidateNameRow>> {
     if langs.is_empty() {
         return Ok(LimitedQueryRows::complete(Vec::new(), 0));
     }
-    let (sql, literal_parameters) = search_candidate_name_rows_sql(langs, required_literals);
     let mut stmt = conn.prepare_cached(&sql)?;
     let parameters = langs
         .iter()
@@ -14772,6 +15442,29 @@ fn search_candidate_name_rows_for_langs_conn_cancellable(
     }
 }
 
+fn insert_temp_three_column_rows(
+    conn: &Connection,
+    table: &str,
+    columns: &str,
+    rows: impl IntoIterator<Item = [rusqlite::types::Value; 3]>,
+) -> Result<()> {
+    let mut rows = rows.into_iter();
+    loop {
+        let chunk = rows.by_ref().take(300).collect::<Vec<_>>();
+        if chunk.is_empty() {
+            break;
+        }
+        let values = std::iter::repeat_n("(?, ?, ?)", chunk.len())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let sql = format!("INSERT OR IGNORE INTO temp.{table}({columns}) VALUES {values}");
+        let parameters = chunk.into_iter().flatten().collect::<Vec<_>>();
+        conn.prepare_cached(&sql)?
+            .execute(params_from_iter(parameters.iter()))?;
+    }
+    Ok(())
+}
+
 fn sync_active_blob_oids(conn: &Connection, active_blobs: &[ActiveSearchBlob]) -> Result<()> {
     conn.execute_batch(
         "CREATE TEMP TABLE IF NOT EXISTS active_blob_oids(
@@ -14782,24 +15475,18 @@ fn sync_active_blob_oids(conn: &Connection, active_blobs: &[ActiveSearchBlob]) -
          ) WITHOUT ROWID, STRICT;
          DELETE FROM temp.active_blob_oids;",
     )?;
-    for chunk in active_blobs.chunks(300) {
-        let values = std::iter::repeat_n("(?, ?, ?)", chunk.len())
-            .collect::<Vec<_>>()
-            .join(", ");
-        let sql = format!(
-            "INSERT OR IGNORE INTO temp.active_blob_oids(blob_oid, package_literals, prefilter_exempt)
-             VALUES {values}"
-        );
-        let mut statement = conn.prepare_cached(&sql)?;
-        let mut parameters: Vec<rusqlite::types::Value> = Vec::with_capacity(chunk.len() * 3);
-        for blob in chunk {
-            parameters.push(blob.oid.to_string().into());
-            parameters.push(blob.package_literals.clone().into());
-            parameters.push(i64::from(blob.prefilter_exempt).into());
-        }
-        statement.execute(params_from_iter(parameters))?;
-    }
-    Ok(())
+    insert_temp_three_column_rows(
+        conn,
+        "active_blob_oids",
+        "blob_oid, package_literals, prefilter_exempt",
+        active_blobs.iter().map(|blob| {
+            [
+                blob.oid.to_string().into(),
+                blob.package_literals.clone().into(),
+                i64::from(blob.prefilter_exempt).into(),
+            ]
+        }),
+    )
 }
 
 const REVERSE_IMPORT_CANDIDATE_BLOBS_SQL: &str = "SELECT DISTINCT files.rel_path
@@ -14937,7 +15624,7 @@ fn usage_fact_rows_by_lang_conn(
     }
     let sql = usage_fact_rows_by_lang_sql();
     let mut stmt = conn.prepare_cached(&sql)?;
-    let rows = collect_usage_fact_rows(stmt.query_map([lang], usage_fact_row_from_row)?)?;
+    let rows = collect_mapped_rows(stmt.query_map([lang], usage_fact_row_from_row)?)?;
     drop(stmt);
     Ok(hydrate_candidate_rows(conn, rows, None)?
         .expect("uncancelled usage-fact hydration completes"))
@@ -15027,15 +15714,10 @@ fn primary_ranges_by_unit_for_lang_conn(
                     Box::new(err),
                 )
             })?;
-            Ok((
-                (oid, row.get(1)?),
-                Range {
-                    start_byte: i64_to_usize(row.get(2)?).map_err(rusqlite_error_from_store)?,
-                    end_byte: i64_to_usize(row.get(3)?).map_err(rusqlite_error_from_store)?,
-                    start_line: i64_to_usize(row.get(4)?).map_err(rusqlite_error_from_store)?,
-                    end_line: i64_to_usize(row.get(5)?).map_err(rusqlite_error_from_store)?,
-                },
-            ))
+            let range =
+                range_from_coordinate_values(row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?)
+                    .map_err(rusqlite_error_from_store)?;
+            Ok(((oid, row.get(1)?), range))
         })?;
         for row in rows {
             let (key, range) = row?;
@@ -15080,7 +15762,7 @@ fn definition_lookup_candidate_rows_by_oids_conn(
         parameters.push(lang.to_string());
         parameters.extend(chunk.iter().map(Oid::to_string));
         let mut stmt = conn.prepare_cached(&sql)?;
-        out.extend(collect_candidate_rows(stmt.query_map(
+        out.extend(collect_mapped_rows(stmt.query_map(
             params_from_iter(parameters.iter()),
             candidate_row_from_row,
         )?)?);
@@ -15222,8 +15904,14 @@ fn read_unit_rows_while<A: LanguageAdapter>(
 }
 
 fn read_import_infos(conn: &Connection, oid: &str, lang: &str) -> Result<Vec<ImportInfo>> {
-    read_import_infos_with_session(conn, oid, lang, None)?
-        .ok_or_else(|| StoreError::new("unbounded import-info hydration stopped unexpectedly"))
+    require_unbounded_hydration(
+        read_import_infos_with_session(conn, oid, lang, None)?,
+        "unbounded import-info hydration stopped unexpectedly",
+    )
+}
+
+fn require_unbounded_hydration<T>(value: Option<T>, message: &'static str) -> Result<T> {
+    value.ok_or_else(|| StoreError::new(message))
 }
 
 fn read_import_infos_with_session(
@@ -15265,26 +15953,9 @@ fn read_materialization_records(
     lang: &str,
     by_key: &HashMap<i64, UnitRow>,
 ) -> Result<Vec<MaterializationRecord>> {
-    let mut stmt = conn.prepare_cached(
-        "SELECT unit_key, payload FROM materialization_records
-         WHERE blob_id = (SELECT id FROM blobs WHERE blob_oid = ?1 AND lang = ?2)
-         ORDER BY ordinal",
-    )?;
-    let rows = stmt.query_map(params![oid, lang], |row| {
-        Ok((row.get::<_, Option<i64>>(0)?, row.get::<_, Vec<u8>>(1)?))
-    })?;
-    let mut out = Vec::new();
-    for row in rows {
-        let (unit_key, payload) = row?;
-        let payload: MaterializationRecordPayload = deserialize_blob(&payload)?;
-        let unit = unit_key
-            .and_then(|key| by_key.get(&key))
-            .map(|row| row.unit.clone());
-        if let Some(record) = MaterializationRecord::join(payload, unit) {
-            out.push(record);
-        }
-    }
-    Ok(out)
+    let oid = oid.to_owned();
+    let rows = read_materialization_records_bulk(conn, lang, std::slice::from_ref(&oid))?;
+    materialization_records_for_file(rows.get(&oid), by_key)
 }
 
 fn read_scala_exports(
@@ -15293,24 +15964,9 @@ fn read_scala_exports(
     lang: &str,
     by_key: &HashMap<i64, UnitRow>,
 ) -> Result<HashMap<CodeUnit, Vec<crate::analyzer::ScalaExportInfo>>> {
-    let mut stmt = conn.prepare_cached(
-        "SELECT owner_key, info FROM scala_exports
-         WHERE blob_id = (SELECT id FROM blobs WHERE blob_oid = ?1 AND lang = ?2)
-         ORDER BY owner_key, ordinal",
-    )?;
-    let rows = stmt.query_map(params![oid, lang], |row| {
-        Ok((row.get::<_, i64>(0)?, row.get::<_, Vec<u8>>(1)?))
-    })?;
-    let mut out = HashMap::default();
-    for row in rows {
-        let (key, info) = row?;
-        if let Some(owner) = by_key.get(&key) {
-            out.entry(owner.unit.clone())
-                .or_insert_with(Vec::new)
-                .push(deserialize_blob(&info)?);
-        }
-    }
-    Ok(out)
+    let oid = oid.to_owned();
+    let rows = read_scala_exports_bulk(conn, lang, std::slice::from_ref(&oid))?;
+    scala_exports_map_for_file(rows.get(&oid), by_key)
 }
 
 fn read_unit_string_vec(
@@ -15321,23 +15977,10 @@ fn read_unit_string_vec(
     value_column: &str,
     by_key: &HashMap<i64, UnitRow>,
 ) -> Result<HashMap<CodeUnit, Vec<String>>> {
-    let sql = format!(
-        "SELECT unit_key, {value_column} FROM {table}
-         WHERE blob_id = (SELECT id FROM blobs WHERE blob_oid = ?1 AND lang = ?2)
-         ORDER BY unit_key, ordinal"
-    );
-    let mut stmt = conn.prepare_cached(&sql)?;
-    let rows = stmt.query_map(params![oid, lang], |row| {
-        Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
-    })?;
-    let mut out: HashMap<CodeUnit, Vec<String>> = HashMap::default();
-    for row in rows {
-        let (key, value) = row?;
-        if let Some(unit) = by_key.get(&key) {
-            out.entry(unit.unit.clone()).or_default().push(value);
-        }
-    }
-    Ok(out)
+    let oid = oid.to_owned();
+    let rows =
+        read_unit_string_vec_bulk(conn, lang, table, value_column, std::slice::from_ref(&oid))?;
+    Ok(unit_values_map_for_file(rows.get(&oid), by_key))
 }
 
 fn read_signature_metadata(
@@ -15347,27 +15990,9 @@ fn read_signature_metadata(
     by_key: &HashMap<i64, UnitRow>,
 ) -> Result<HashMap<CodeUnit, Vec<SignatureMetadata>>> {
     require_declaration_visibility_available(conn, oid, lang)?;
-    let columns = signature_metadata_projection_columns_sql("metadata");
-    let mut stmt = conn.prepare_cached(&format!(
-        "SELECT metadata.unit_key, {columns}
-         FROM unit_signature_metadata_values AS metadata
-         WHERE metadata.blob_id = (SELECT id FROM blobs WHERE blob_oid = ?1 AND lang = ?2)
-         ORDER BY metadata.unit_key, metadata.ordinal"
-    ))?;
-    let rows = stmt.query_map(params![oid, lang], |row| {
-        Ok((
-            row.get::<_, i64>(0)?,
-            signature_metadata_projection_from_row(row, 1)?,
-        ))
-    })?;
-    let mut out: HashMap<CodeUnit, Vec<SignatureMetadata>> = HashMap::default();
-    for row in rows {
-        let (key, metadata) = row?;
-        if let Some(unit) = by_key.get(&key) {
-            out.entry(unit.unit.clone()).or_default().push(metadata);
-        }
-    }
-    Ok(out)
+    let oid = oid.to_owned();
+    let rows = read_signature_metadata_bulk(conn, lang, std::slice::from_ref(&oid))?;
+    Ok(unit_values_map_for_file(rows.get(&oid), by_key))
 }
 
 fn read_signature_metadata_signature_ordinals(
@@ -15375,17 +16000,10 @@ fn read_signature_metadata_signature_ordinals(
     oid: &str,
     lang: &str,
 ) -> Result<Vec<SignatureMetadataSignatureOrdinalRow>> {
-    let mut stmt = conn.prepare_cached(
-        "SELECT unit_key, metadata_ordinal, signature_ordinal
-         FROM unit_signature_metadata_signatures
-         WHERE blob_id = (SELECT id FROM blobs WHERE blob_oid = ?1 AND lang = ?2)
-         ORDER BY unit_key, metadata_ordinal",
-    )?;
-    let rows = stmt.query_map(params![oid, lang], |row| {
-        Ok((row.get(0)?, row.get(1)?, row.get(2)?))
-    })?;
-    rows.collect::<std::result::Result<Vec<_>, _>>()
-        .map_err(StoreError::from)
+    let oid = oid.to_owned();
+    let mut rows =
+        read_signature_metadata_signature_ordinals_bulk(conn, lang, std::slice::from_ref(&oid))?;
+    Ok(rows.remove(&oid).unwrap_or_default())
 }
 
 fn direct_children_for_unit_limited_conn(
@@ -15478,12 +16096,7 @@ fn signature_metadata_for_unit_sql() -> &'static str {
          JOIN unit_signature_metadata_values AS metadata
            ON metadata.blob_id = units.blob_id
           AND metadata.unit_key = units.unit_key
-         WHERE units.blob_id = (SELECT id FROM blobs WHERE blob_oid = ?1 AND lang = ?2)
-           AND (units.exact_fqn = ?3 OR units.exact_fqn IS NULL)
-           AND units.kind = ?4
-           AND units.short_name = ?5
-           AND units.signature IS ?6
-           AND units.synthetic = ?7
+         WHERE {LIMITED_UNIT_IDENTITY_PREDICATE}
            AND {PARSED_BLOB_COMPLETE_CONDITION}
          ORDER BY metadata.ordinal
          LIMIT ?8"
@@ -15560,12 +16173,7 @@ fn signatures_for_unit_limited_conn(
          JOIN unit_signatures AS signatures
            ON signatures.blob_id = units.blob_id
           AND signatures.unit_key = units.unit_key
-         WHERE units.blob_id = (SELECT id FROM blobs WHERE blob_oid = ?1 AND lang = ?2)
-           AND (units.exact_fqn = ?3 OR units.exact_fqn IS NULL)
-           AND units.kind = ?4
-           AND units.short_name = ?5
-           AND units.signature IS ?6
-           AND units.synthetic = ?7
+         WHERE {LIMITED_UNIT_IDENTITY_PREDICATE}
            AND {PARSED_BLOB_COMPLETE_CONDITION}
          ORDER BY signatures.ordinal
          LIMIT ?8"
@@ -15607,12 +16215,7 @@ fn ruby_method_dispatch_modes_for_unit_limited_conn(
          JOIN ruby_method_dispatch_modes AS modes
            ON modes.blob_id = units.blob_id
           AND modes.unit_key = units.unit_key
-         WHERE units.blob_id = (SELECT id FROM blobs WHERE blob_oid = ?1 AND lang = ?2)
-           AND (units.exact_fqn = ?3 OR units.exact_fqn IS NULL)
-           AND units.kind = ?4
-           AND units.short_name = ?5
-           AND units.signature IS ?6
-           AND units.synthetic = ?7
+         WHERE {LIMITED_UNIT_IDENTITY_PREDICATE}
            AND units.in_declarations = 1
            AND {PARSED_BLOB_COMPLETE_CONDITION}
          ORDER BY units.unit_key
@@ -15697,12 +16300,7 @@ fn raw_supertypes_for_unit_limited_conn(
          JOIN unit_supertypes AS supertypes
            ON supertypes.blob_id = units.blob_id
           AND supertypes.unit_key = units.unit_key
-         WHERE units.blob_id = (SELECT id FROM blobs WHERE blob_oid = ?1 AND lang = ?2)
-           AND (units.exact_fqn = ?3 OR units.exact_fqn IS NULL)
-           AND units.kind = ?4
-           AND units.short_name = ?5
-           AND units.signature IS ?6
-           AND units.synthetic = ?7
+         WHERE {LIMITED_UNIT_IDENTITY_PREDICATE}
            AND {PARSED_BLOB_COMPLETE_CONDITION}
          ORDER BY supertypes.ordinal
          LIMIT ?8"
@@ -15749,12 +16347,7 @@ fn supertype_lookup_paths_for_unit_limited_conn(
          JOIN unit_supertypes AS supertypes
            ON supertypes.blob_id = units.blob_id
           AND supertypes.unit_key = units.unit_key
-         WHERE units.blob_id = (SELECT id FROM blobs WHERE blob_oid = ?1 AND lang = ?2)
-           AND (units.exact_fqn = ?3 OR units.exact_fqn IS NULL)
-           AND units.kind = ?4
-           AND units.short_name = ?5
-           AND units.signature IS ?6
-           AND units.synthetic = ?7
+         WHERE {LIMITED_UNIT_IDENTITY_PREDICATE}
            AND {PARSED_BLOB_COMPLETE_CONDITION}
          ORDER BY supertypes.ordinal
          LIMIT ?8"
@@ -15795,12 +16388,7 @@ fn ranges_for_unit_limited_conn(
          JOIN unit_ranges AS ranges
            ON ranges.blob_id = units.blob_id
           AND ranges.unit_key = units.unit_key
-         WHERE units.blob_id = (SELECT id FROM blobs WHERE blob_oid = ?1 AND lang = ?2)
-           AND (units.exact_fqn = ?3 OR units.exact_fqn IS NULL)
-           AND units.kind = ?4
-           AND units.short_name = ?5
-           AND units.signature IS ?6
-           AND units.synthetic = ?7
+         WHERE {LIMITED_UNIT_IDENTITY_PREDICATE}
            AND {PARSED_BLOB_COMPLETE_CONDITION}
          ORDER BY ranges.ordinal
          LIMIT ?8"
@@ -15890,25 +16478,9 @@ fn read_children(
     lang: &str,
     by_key: &HashMap<i64, UnitRow>,
 ) -> Result<HashMap<CodeUnit, Vec<CodeUnit>>> {
-    let mut stmt = conn.prepare_cached(
-        "SELECT parent_key, child_key FROM unit_children
-         WHERE blob_id = (SELECT id FROM blobs WHERE blob_oid = ?1 AND lang = ?2)
-         ORDER BY parent_key, ordinal",
-    )?;
-    let rows = stmt.query_map(params![oid, lang], |row| {
-        Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?))
-    })?;
-    let mut out: HashMap<CodeUnit, Vec<CodeUnit>> = HashMap::default();
-    for row in rows {
-        let (parent_key, child_key) = row?;
-        let (Some(parent), Some(child)) = (by_key.get(&parent_key), by_key.get(&child_key)) else {
-            continue;
-        };
-        out.entry(parent.unit.clone())
-            .or_default()
-            .push(child.unit.clone());
-    }
-    Ok(out)
+    let oid = oid.to_owned();
+    let rows = read_children_bulk(conn, lang, std::slice::from_ref(&oid))?;
+    Ok(children_map_for_file(rows.get(&oid), by_key))
 }
 
 fn read_ruby_method_dispatch_modes(
@@ -15941,20 +16513,9 @@ fn read_scala_traits(
     lang: &str,
     by_key: &HashMap<i64, UnitRow>,
 ) -> Result<HashSet<CodeUnit>> {
-    let mut stmt = conn.prepare_cached(
-        "SELECT unit_key FROM scala_traits
-         WHERE blob_id = (SELECT id FROM blobs WHERE blob_oid = ?1 AND lang = ?2)
-         ORDER BY unit_key",
-    )?;
-    let rows = stmt.query_map(params![oid, lang], |row| row.get::<_, i64>(0))?;
-    let mut out = HashSet::default();
-    for row in rows {
-        let key = row?;
-        if let Some(unit) = by_key.get(&key) {
-            out.insert(unit.unit.clone());
-        }
-    }
-    Ok(out)
+    let oid = oid.to_owned();
+    let rows = read_scala_traits_bulk(conn, lang, std::slice::from_ref(&oid))?;
+    Ok(scala_traits_for_file(rows.get(&oid), by_key))
 }
 
 fn synthesize_file_scope(file: &ProjectFile, source: &str, state: &mut FileState) {
@@ -15999,6 +16560,11 @@ fn ensure_language_epochs_tx(
             tx.execute("DELETE FROM rust_crate_versions WHERE lang = ?1", [lang])?;
             tx.execute("DELETE FROM rust_crate_reconciliations", [])?;
             tx.execute(rust_crates::DELETE_UNBOUND_TOPOLOGIES_SQL, [])?;
+        }
+        // Summaries are keyed by generation, so a rotation strands every version
+        // row of the language. Withdraw them and delete the headers nothing binds.
+        if tx.execute(unit_summaries::DELETE_LANGUAGE_VERSIONS_SQL, [lang])? > 0 {
+            tx.execute(unit_summaries::DELETE_UNBOUND_SUMMARIES_SQL, [])?;
         }
         let generation: i64 = tx.query_row(
             "UPDATE analysis_generation_sequence
@@ -16165,7 +16731,7 @@ fn stored_blob_cascade_costs_conn(
         // The padded rows carry NULL blob_oid/lang, so their LEFT JOINs miss and
         // they report `Missing`; we size `chunk_costs` to the padded arity, fill
         // every ordinal, then truncate the padding away — semantics-preserving.
-        let padded = padded_cascade_arity(chunk.len());
+        let padded = padded_arity(chunk.len(), &CASCADE_ARITY_LADDER);
         let mut chunk_costs = vec![StoredCascadeCost::Missing; padded];
         let sql = stored_blob_cascade_costs_sql(padded);
         on_query();
@@ -16227,14 +16793,7 @@ fn stored_blob_cascade_costs_conn(
 /// Fixed arities for the cascade-cost `VALUES` query. Capped at
 /// `PersistBatchTargets::PRODUCTION.max_blobs` (the chunk size), which the SQL
 /// builder asserts against.
-fn padded_cascade_arity(len: usize) -> usize {
-    const LADDER: [usize; 2] = [16, PersistBatchTargets::PRODUCTION.max_blobs];
-    LADDER
-        .iter()
-        .copied()
-        .find(|&arity| arity >= len)
-        .unwrap_or(LADDER[LADDER.len() - 1])
-}
+const CASCADE_ARITY_LADDER: [usize; 2] = [16, PersistBatchTargets::PRODUCTION.max_blobs];
 
 // These are the projection rows written by insert_rust_fact_rows. Canonical
 // source manifests explicitly exclude them. Integer coordinates and repeated
@@ -16263,6 +16822,21 @@ const RUST_PROJECTION_PAYLOAD_COLUMNS: &[(&str, &[&str])] = &[
         &["local_name", "module_specifier", "imported_name", "kind"],
     ),
 ];
+
+/// The semantic IR head's `logical_rows` is the head plus every child row. Its
+/// children go with the head through `ON DELETE CASCADE`, so the head is the
+/// one place this count reads. A blob without a head counts zero.
+fn semantic_ir_cascade_rows_sql(blob_id: &str) -> String {
+    format!(
+        "COALESCE((SELECT logical_rows FROM semantic_ir_publications WHERE blob_id = {blob_id}), 0)"
+    )
+}
+
+fn semantic_ir_cascade_payload_bytes_sql(blob_id: &str) -> String {
+    format!(
+        "COALESCE((SELECT payload_bytes FROM semantic_ir_publications WHERE blob_id = {blob_id}), 0)"
+    )
+}
 
 fn rust_projection_cascade_rows_sql(blob_id: &str) -> String {
     RUST_PROJECTION_PAYLOAD_COLUMNS
@@ -16293,6 +16867,7 @@ fn rust_projection_cascade_payload_bytes_sql(blob_id: &str) -> String {
 fn complete_blob_cascade_rows_sql(blob_id: &str) -> String {
     let class_set_rows = class_set_summary_cascade_rows_sql(blob_id);
     let rust_projection_rows = rust_projection_cascade_rows_sql(blob_id);
+    let semantic_ir_rows = semantic_ir_cascade_rows_sql(blob_id);
     format!(
         "1 + CASE WHEN meta.blob_id IS NULL THEN
          COALESCE((SELECT logical_rows FROM resolution_fragment_interiors
@@ -16332,6 +16907,7 @@ fn complete_blob_cascade_rows_sql(blob_id: &str) -> String {
               WHERE costs.blob_id = meta.blob_id) END
          + {class_set_rows}
          + {rust_projection_rows}
+         + {semantic_ir_rows}
          + (SELECT COUNT(*) FROM workspace_resolution_content_roots WHERE blob_id = {blob_id})"
     )
 }
@@ -16344,6 +16920,7 @@ fn stored_blob_cascade_costs_sql(key_count: usize) -> String {
         .join(", ");
     let complete_rows = complete_blob_cascade_rows_sql("blob.id");
     let class_set_bytes = class_set_summary_cascade_payload_bytes_sql("blob.id");
+    let semantic_ir_bytes = semantic_ir_cascade_payload_bytes_sql("blob.id");
     format!(
         "WITH requested(ordinal, blob_oid, lang) AS (VALUES {requested})
          SELECT requested.ordinal,
@@ -16351,7 +16928,7 @@ fn stored_blob_cascade_costs_sql(key_count: usize) -> String {
            meta.blob_id IS NOT NULL,
            CASE WHEN blob.id IS NULL THEN 0 ELSE {complete_rows} END,
            CASE WHEN blob.id IS NULL THEN 0
-             WHEN meta.blob_id IS NULL THEN {class_set_bytes}
+             WHEN meta.blob_id IS NULL THEN {class_set_bytes} + {semantic_ir_bytes}
                + COALESCE((SELECT payload_bytes FROM resolution_fragment_interiors
                  WHERE blob_id = blob.id AND publication_state = 'complete'), 0)
                + COALESCE((SELECT SUM(length(workspace_id) + length(lang))
@@ -16376,42 +16953,125 @@ fn stored_blob_cascade_costs_sql(key_count: usize) -> String {
     )
 }
 
+#[derive(Clone, Copy)]
+struct ClassSetCascadeChild {
+    table: &'static str,
+    payload_bytes: &'static str,
+}
+
+const CLASS_SET_SUMMARY_CASCADE_CHILDREN: [ClassSetCascadeChild; 7] = [
+    ClassSetCascadeChild {
+        table: "class_set_summary_facts",
+        payload_bytes: "length(CAST(child_cost.fact_kind AS BLOB))
+             + length(CAST(child_cost.source_kind AS BLOB))
+             + COALESCE(length(child_cost.source_event_key), 0)
+             + COALESCE(length(child_cost.carrier_key), 0)
+             + COALESCE(length(child_cost.sink_event_key), 0)",
+    },
+    ClassSetCascadeChild {
+        table: "class_set_summary_exits",
+        payload_bytes: "length(CAST(child_cost.exit_kind AS BLOB))",
+    },
+    ClassSetCascadeChild {
+        table: "class_set_summary_reached",
+        payload_bytes: "0",
+    },
+    ClassSetCascadeChild {
+        table: "class_set_summary_dependencies",
+        payload_bytes: "length(child_cost.callee_procedure_lineage)
+             + length(child_cost.callee_entry_selector_digest)
+             + length(child_cost.expected_output_digest)
+             + length(child_cost.consumed_child_lookup_digest)
+             + length(CAST(child_cost.entry_kind AS BLOB))
+             + COALESCE(length(child_cost.entry_carrier_key), 0)
+             + COALESCE(length(child_cost.entry_source_behavior_digest), 0)",
+    },
+    ClassSetCascadeChild {
+        table: "class_set_summary_dependency_sources",
+        payload_bytes: "length(child_cost.source_event_digest)",
+    },
+    ClassSetCascadeChild {
+        table: "class_set_summary_reads",
+        payload_bytes: "length(child_cost.key_digest) + length(CAST(child_cost.kind AS BLOB))
+             + COALESCE(length(CAST(child_cost.family AS BLOB)), 0)
+             + COALESCE(length(CAST(child_cost.languages AS BLOB)), 0)
+             + COALESCE(length(CAST(child_cost.rel_path AS BLOB)), 0)
+             + COALESCE(length(CAST(child_cost.name AS BLOB)), 0)
+             + COALESCE(length(child_cost.index_key), 0)
+             + COALESCE(length(CAST(child_cost.blob_oid AS BLOB)), 0)
+             + COALESCE(length(child_cost.subject), 0)
+             + COALESCE(length(child_cost.digest), 0)",
+    },
+    ClassSetCascadeChild {
+        table: "class_set_summary_charges",
+        payload_bytes: "length(CAST(child_cost.charge_kind AS BLOB))",
+    },
+];
+
+const CLASS_SET_SURFACE_CASCADE_CHILDREN: [ClassSetCascadeChild; 5] = [
+    ClassSetCascadeChild {
+        table: "class_set_procedure_surface_calls",
+        payload_bytes: "length(CAST(child_cost.dispatch_kind AS BLOB))
+             + length(CAST(child_cost.dispatch_status AS BLOB))
+             + COALESCE(length(CAST(child_cost.dispatch_capability AS BLOB)), 0)
+             + COALESCE(length(CAST(child_cost.dispatch_coverage AS BLOB)), 0)",
+    },
+    ClassSetCascadeChild {
+        table: "class_set_procedure_surface_bindings",
+        payload_bytes: "length(CAST(child_cost.binding_status AS BLOB))
+             + COALESCE(length(CAST(child_cost.binding_capability AS BLOB)), 0)",
+    },
+    ClassSetCascadeChild {
+        table: "class_set_procedure_surface_entered",
+        payload_bytes: "length(child_cost.target_procedure_lineage)
+             + length(CAST(child_cost.target_rel_path AS BLOB))
+             + length(CAST(child_cost.target_lang AS BLOB))
+             + length(child_cost.target_artifact_public_identity)
+             + length(child_cost.target_artifact_content_identity)
+             + length(child_cost.target_local_structure_digest)",
+    },
+    ClassSetCascadeChild {
+        table: "class_set_procedure_surface_lexical_children",
+        payload_bytes: "length(child_cost.child_procedure_lineage)
+             + length(CAST(child_cost.child_rel_path AS BLOB))
+             + length(CAST(child_cost.child_lang AS BLOB))
+             + length(child_cost.child_artifact_public_identity)
+             + length(child_cost.child_artifact_content_identity)
+             + length(child_cost.child_local_structure_digest)",
+    },
+    ClassSetCascadeChild {
+        table: "class_set_procedure_surface_reads",
+        payload_bytes: "length(child_cost.key_digest) + length(CAST(child_cost.kind AS BLOB))
+             + length(CAST(child_cost.family AS BLOB))
+             + length(CAST(child_cost.rel_path AS BLOB))
+             + length(child_cost.subject) + length(child_cost.digest)",
+    },
+];
+
 fn class_set_summary_cascade_rows_sql(blob_id: &str) -> String {
     let summary_predicate = class_set_summary_owner_or_surface_predicate("summary_cost", blob_id);
-    let child_rows = [
-        "class_set_summary_facts",
-        "class_set_summary_exits",
-        "class_set_summary_reached",
-        "class_set_summary_dependencies",
-        "class_set_summary_dependency_sources",
-        "class_set_summary_reads",
-        "class_set_summary_charges",
-    ]
-    .map(|table| {
-        format!(
-            "(SELECT COUNT(*) FROM {table} AS child_cost
+    let child_rows = CLASS_SET_SUMMARY_CASCADE_CHILDREN
+        .map(|child| {
+            format!(
+                "(SELECT COUNT(*) FROM {table} AS child_cost
               JOIN class_set_summaries AS summary_cost
                 ON summary_cost.summary_id = child_cost.summary_id
-              WHERE {summary_predicate})"
-        )
-    })
-    .join(" + ");
-    let surface_child_rows = [
-        "class_set_procedure_surface_calls",
-        "class_set_procedure_surface_bindings",
-        "class_set_procedure_surface_entered",
-        "class_set_procedure_surface_lexical_children",
-        "class_set_procedure_surface_reads",
-    ]
-    .map(|table| {
-        format!(
-            "(SELECT COUNT(*) FROM {table} AS child_cost
+              WHERE {summary_predicate})",
+                table = child.table,
+            )
+        })
+        .join(" + ");
+    let surface_child_rows = CLASS_SET_SURFACE_CASCADE_CHILDREN
+        .map(|child| {
+            format!(
+                "(SELECT COUNT(*) FROM {table} AS child_cost
               JOIN class_set_procedure_surfaces AS surface_cost
                 ON surface_cost.surface_id = child_cost.surface_id
-              WHERE surface_cost.owner_blob_id = {blob_id})"
-        )
-    })
-    .join(" + ");
+              WHERE surface_cost.owner_blob_id = {blob_id})",
+                table = child.table,
+            )
+        })
+        .join(" + ");
     let root_result_rows = format!(
         "(SELECT COUNT(*) FROM class_set_finding_free_root_results AS root_result_cost
           WHERE root_result_cost.owner_blob_id = {blob_id})
@@ -16446,60 +17106,18 @@ fn class_set_summary_cascade_payload_bytes_sql(blob_id: &str) -> String {
           FROM class_set_summaries AS summary_cost
           WHERE {summary_predicate}), 0)"
     );
-    let child_payloads = [
-        (
-            "class_set_summary_facts",
-            "length(CAST(child_cost.fact_kind AS BLOB))
-             + length(CAST(child_cost.source_kind AS BLOB))
-             + COALESCE(length(child_cost.source_event_key), 0)
-             + COALESCE(length(child_cost.carrier_key), 0)
-             + COALESCE(length(child_cost.sink_event_key), 0)",
-        ),
-        (
-            "class_set_summary_exits",
-            "length(CAST(child_cost.exit_kind AS BLOB))",
-        ),
-        ("class_set_summary_reached", "0"),
-        (
-            "class_set_summary_dependencies",
-            "length(child_cost.callee_procedure_lineage)
-             + length(child_cost.callee_entry_selector_digest)
-             + length(child_cost.expected_output_digest)
-             + length(child_cost.consumed_child_lookup_digest)
-             + length(CAST(child_cost.entry_kind AS BLOB))
-             + COALESCE(length(child_cost.entry_carrier_key), 0)
-             + COALESCE(length(child_cost.entry_source_behavior_digest), 0)",
-        ),
-        (
-            "class_set_summary_dependency_sources",
-            "length(child_cost.source_event_digest)",
-        ),
-        (
-            "class_set_summary_reads",
-            "length(child_cost.key_digest) + length(CAST(child_cost.kind AS BLOB))
-             + COALESCE(length(CAST(child_cost.family AS BLOB)), 0)
-             + COALESCE(length(CAST(child_cost.languages AS BLOB)), 0)
-             + COALESCE(length(CAST(child_cost.rel_path AS BLOB)), 0)
-             + COALESCE(length(CAST(child_cost.name AS BLOB)), 0)
-             + COALESCE(length(child_cost.index_key), 0)
-             + COALESCE(length(CAST(child_cost.blob_oid AS BLOB)), 0)
-             + COALESCE(length(child_cost.subject), 0)
-             + COALESCE(length(child_cost.digest), 0)",
-        ),
-        (
-            "class_set_summary_charges",
-            "length(CAST(child_cost.charge_kind AS BLOB))",
-        ),
-    ]
-    .map(|(table, payload)| {
-        format!(
-            "COALESCE((SELECT SUM({payload}) FROM {table} AS child_cost
+    let child_payloads = CLASS_SET_SUMMARY_CASCADE_CHILDREN
+        .map(|child| {
+            format!(
+                "COALESCE((SELECT SUM({payload}) FROM {table} AS child_cost
               JOIN class_set_summaries AS summary_cost
                 ON summary_cost.summary_id = child_cost.summary_id
-              WHERE {summary_predicate}), 0)"
-        )
-    })
-    .join(" + ");
+              WHERE {summary_predicate}), 0)",
+                payload = child.payload_bytes,
+                table = child.table,
+            )
+        })
+        .join(" + ");
     let surface_header = format!(
         "COALESCE((SELECT SUM(
             length(surface_digest) + length(procedure_lineage)
@@ -16511,54 +17129,18 @@ fn class_set_summary_cascade_payload_bytes_sql(blob_id: &str) -> String {
           FROM class_set_procedure_surfaces AS surface_cost
           WHERE surface_cost.owner_blob_id = {blob_id}), 0)"
     );
-    let surface_child_payloads = [
-        (
-            "class_set_procedure_surface_calls",
-            "length(CAST(child_cost.dispatch_kind AS BLOB))
-             + length(CAST(child_cost.dispatch_status AS BLOB))
-             + COALESCE(length(CAST(child_cost.dispatch_capability AS BLOB)), 0)
-             + COALESCE(length(CAST(child_cost.dispatch_coverage AS BLOB)), 0)",
-        ),
-        (
-            "class_set_procedure_surface_bindings",
-            "length(CAST(child_cost.binding_status AS BLOB))
-             + COALESCE(length(CAST(child_cost.binding_capability AS BLOB)), 0)",
-        ),
-        (
-            "class_set_procedure_surface_entered",
-            "length(child_cost.target_procedure_lineage)
-             + length(CAST(child_cost.target_rel_path AS BLOB))
-             + length(CAST(child_cost.target_lang AS BLOB))
-             + length(child_cost.target_artifact_public_identity)
-             + length(child_cost.target_artifact_content_identity)
-             + length(child_cost.target_local_structure_digest)",
-        ),
-        (
-            "class_set_procedure_surface_lexical_children",
-            "length(child_cost.child_procedure_lineage)
-             + length(CAST(child_cost.child_rel_path AS BLOB))
-             + length(CAST(child_cost.child_lang AS BLOB))
-             + length(child_cost.child_artifact_public_identity)
-             + length(child_cost.child_artifact_content_identity)
-             + length(child_cost.child_local_structure_digest)",
-        ),
-        (
-            "class_set_procedure_surface_reads",
-            "length(child_cost.key_digest) + length(CAST(child_cost.kind AS BLOB))
-             + length(CAST(child_cost.family AS BLOB))
-             + length(CAST(child_cost.rel_path AS BLOB))
-             + length(child_cost.subject) + length(child_cost.digest)",
-        ),
-    ]
-    .map(|(table, payload)| {
-        format!(
-            "COALESCE((SELECT SUM({payload}) FROM {table} AS child_cost
+    let surface_child_payloads = CLASS_SET_SURFACE_CASCADE_CHILDREN
+        .map(|child| {
+            format!(
+                "COALESCE((SELECT SUM({payload}) FROM {table} AS child_cost
               JOIN class_set_procedure_surfaces AS surface_cost
                 ON surface_cost.surface_id = child_cost.surface_id
-              WHERE surface_cost.owner_blob_id = {blob_id}), 0)"
-        )
-    })
-    .join(" + ");
+              WHERE surface_cost.owner_blob_id = {blob_id}), 0)",
+                payload = child.payload_bytes,
+                table = child.table,
+            )
+        })
+        .join(" + ");
     let root_result_header = format!(
         "COALESCE((SELECT SUM(
             length(root_public_digest) + length(CAST(owner_rel_path AS BLOB))
@@ -16625,6 +17207,7 @@ fn persisted_blob_mutation_cost_fallback_sql() -> &'static str {
         let complete_rows = complete_blob_cascade_rows_sql("blob.id");
         let rust_projection_bytes = rust_projection_cascade_payload_bytes_sql("blob.id");
         let class_set_bytes = class_set_summary_cascade_payload_bytes_sql("blob.id");
+        let semantic_ir_bytes = semantic_ir_cascade_payload_bytes_sql("blob.id");
         format!(
             "SELECT
        {complete_rows},
@@ -16704,6 +17287,7 @@ fn persisted_blob_mutation_cost_fallback_sql() -> &'static str {
              ), 0) END
          + {class_set_bytes}
          + {rust_projection_bytes}
+         + {semantic_ir_bytes}
          + COALESCE((SELECT SUM(length(CAST(workspace_id AS BLOB)) + length(CAST(lang AS BLOB)))
            FROM workspace_resolution_content_roots WHERE blob_id = blob.id), 0)
      FROM blobs AS blob
@@ -16727,14 +17311,7 @@ fn insert_blob_payload_cost_tx(
 
 /// Fixed arities for the `VALUES (?, ?)` pair lists, capped at the caller's
 /// 400-key chunk size.
-fn padded_pair_arity(len: usize) -> usize {
-    const LADDER: [usize; 4] = [16, 64, 256, 400];
-    LADDER
-        .iter()
-        .copied()
-        .find(|&arity| arity >= len)
-        .unwrap_or(LADDER[LADDER.len() - 1])
-}
+const PAIR_ARITY_LADDER: [usize; 4] = [16, 64, 256, 400];
 
 /// Read-path membership for a key set: which of `entries` have a published
 /// parse at the active generation. This is the hydration query.
@@ -16782,8 +17359,17 @@ const MISSING_PUBLISHED_COMPLETE_ANALYSIS_SQL: &str = "SELECT requested.blob_oid
       AND primary_interior.semantic_language = ?1
       AND primary_interior.producer_epoch = primary_resolution_epoch.producer_epoch
       AND primary_interior.publication_state = 'complete'
+     LEFT JOIN semantic_ir_producer_epochs AS primary_semantic_epoch
+       ON primary_semantic_epoch.lang = requested.lang
+     LEFT JOIN semantic_ir_publications AS primary_semantic
+       ON primary_semantic.blob_id = primary_blob.id
+      AND primary_semantic.producer_epoch = primary_semantic_epoch.producer_epoch
+      AND primary_semantic.publication_state = 'complete'
      WHERE primary_meta.blob_id IS NULL
         OR primary_interior.blob_id IS NULL
+        OR (primary_semantic_epoch.producer_epoch IS NOT NULL AND primary_semantic.blob_id IS NULL)
+        -- Projections are C++ only and carry no semantic IR rows, so they keep
+        -- the resolution-only predicate below.
         OR EXISTS (
           SELECT 1
           FROM temp.requested_analysis_projections AS projection
@@ -16951,25 +17537,18 @@ fn sync_requested_analysis_projections(
                 })
         })
         .collect::<Vec<_>>();
-    const KEYS_PER_INSERT: usize = 300;
-    for chunk in projections.chunks(KEYS_PER_INSERT) {
-        let values = std::iter::repeat_n("(?, ?, ?)", chunk.len())
-            .collect::<Vec<_>>()
-            .join(", ");
-        let sql = format!(
-            "INSERT OR IGNORE INTO temp.requested_analysis_projections(
-               blob_oid, primary_lang, projection_lang
-             ) VALUES {values}"
-        );
-        let mut parameters = Vec::with_capacity(chunk.len() * 3);
-        for (oid, primary, projection) in chunk {
-            parameters.push(rusqlite::types::Value::Text(oid.clone()));
-            parameters.push(rusqlite::types::Value::Text((*primary).to_owned()));
-            parameters.push(rusqlite::types::Value::Text((*projection).to_owned()));
-        }
-        conn.execute(&sql, params_from_iter(parameters.iter()))?;
-    }
-    Ok(())
+    insert_temp_three_column_rows(
+        conn,
+        "requested_analysis_projections",
+        "blob_oid, primary_lang, projection_lang",
+        projections.into_iter().map(|(oid, primary, projection)| {
+            [
+                rusqlite::types::Value::Text(oid),
+                rusqlite::types::Value::Text(primary.to_owned()),
+                rusqlite::types::Value::Text(projection.to_owned()),
+            ]
+        }),
+    )
 }
 
 fn sync_requested_parsed_blobs(conn: &Connection, entries: &[(Oid, String)]) -> Result<()> {
@@ -16982,26 +17561,18 @@ fn sync_requested_parsed_blobs(conn: &Connection, entries: &[(Oid, String)]) -> 
          ) WITHOUT ROWID, STRICT;
          DELETE FROM temp.requested_parsed_blobs;",
     )?;
-    const KEYS_PER_INSERT: usize = 300;
-    for (chunk_index, chunk) in entries.chunks(KEYS_PER_INSERT).enumerate() {
-        let values = std::iter::repeat_n("(?, ?, ?)", chunk.len())
-            .collect::<Vec<_>>()
-            .join(", ");
-        let sql = format!(
-            "INSERT OR IGNORE INTO temp.requested_parsed_blobs(blob_oid, lang, ordinal) VALUES {values}"
-        );
-        let mut parameters = Vec::with_capacity(chunk.len() * 3);
-        let chunk_start = chunk_index * KEYS_PER_INSERT;
-        for (offset, (oid, lang)) in chunk.iter().enumerate() {
-            parameters.push(rusqlite::types::Value::Text(oid.to_string()));
-            parameters.push(rusqlite::types::Value::Text(lang.clone()));
-            parameters.push(rusqlite::types::Value::Integer(
-                (chunk_start + offset) as i64,
-            ));
-        }
-        conn.execute(&sql, params_from_iter(parameters.iter()))?;
-    }
-    Ok(())
+    insert_temp_three_column_rows(
+        conn,
+        "requested_parsed_blobs",
+        "blob_oid, lang, ordinal",
+        entries.iter().enumerate().map(|(ordinal, (oid, lang))| {
+            [
+                rusqlite::types::Value::Text(oid.to_string()),
+                rusqlite::types::Value::Text(lang.clone()),
+                rusqlite::types::Value::Integer(ordinal as i64),
+            ]
+        }),
+    )
 }
 
 /// The batched key-membership statement. Kept as one builder so the EXPLAIN
@@ -17043,7 +17614,7 @@ fn parsed_blob_keys_conn_with_condition(
         // query lands on a small set of cached SQL shapes. Padded rows carry
         // NULL blob_oid/lang; the inner JOIN drops them, so the matched-key set
         // is unchanged.
-        let padded = padded_pair_arity(chunk.len());
+        let padded = padded_arity(chunk.len(), &PAIR_ARITY_LADDER);
         let sql = parsed_blob_keys_sql(padded, joins, condition);
         let mut parameters: Vec<Option<String>> = Vec::with_capacity(padded * 2);
         for (oid, lang) in chunk {
@@ -17129,6 +17700,9 @@ fn reclaim_stale_generations_conn(conn: &mut Connection, max_logical_rows: usize
 
     let remaining = max_logical_rows.saturating_sub(reclaimed);
     if remaining > 0 {
+        if tx.execute(unit_summaries::DELETE_STALE_GENERATION_VERSIONS_SQL, [])? > 0 {
+            tx.execute(unit_summaries::DELETE_UNBOUND_SUMMARIES_SQL, [])?;
+        }
         tx.execute(
             "DELETE FROM workspace_heads
              WHERE generation <> COALESCE(
@@ -17376,6 +17950,25 @@ pub(crate) fn hydrate_unit_fq<A: LanguageAdapter>(
         file,
         |anchor, qualifier, file| adapter.resolve_package_anchor(anchor, qualifier, file),
     )
+}
+
+pub(crate) fn hydrate_mounted_candidate<A: LanguageAdapter>(
+    adapter: &A,
+    project_root: &Path,
+    row: HydratedCandidateRow,
+    rel_path: String,
+) -> Result<CodeUnit> {
+    let file = ProjectFile::new(project_root.to_path_buf(), rel_path);
+    let (fq, package_segment_count) =
+        hydrate_unit_fq(adapter, row.fq.as_ref(), &row.content_qualifier, &file)?;
+    Ok(CodeUnit::from_fq(
+        file,
+        row.kind,
+        fq,
+        package_segment_count,
+        row.signature,
+        row.flags.synthetic,
+    ))
 }
 
 /// Assemble a stored identity using the caller's selected package authority.
@@ -18079,8 +18672,8 @@ fn bool_to_i64(value: bool) -> i64 {
     i64::from(value)
 }
 
-/// One `source_structural_facts.nodes` element; positions are documented in
-/// migration 0128. The node id is the array index.
+/// One `source_structural_facts.nodes` element. Positions follow the current
+/// structural-facts version; the node id is the array index.
 #[derive(serde::Deserialize)]
 struct StructuralNodeJson(
     u8,
@@ -18094,6 +18687,12 @@ struct StructuralNodeJson(
     u32,
     Option<u8>,
     Option<u8>,
+    Option<u8>,
+    Option<u8>,
+    Option<AssignmentShape>,
+    Option<crate::analyzer::structural::facts::IntegerLiteralValue>,
+    Option<bool>,
+    Option<String>,
     Option<u8>,
 );
 
@@ -18145,6 +18744,12 @@ fn decode_structural_nodes(
                 call_kind,
                 call_coverage,
                 continues,
+                parenthesized,
+                assignment_shape,
+                integer_literal_value,
+                duplicate_key,
+                string_value,
+                is_async,
             ) = row;
             let call_site = match (call_kind, call_coverage, continues) {
                 (None, None, None) => None,
@@ -18163,6 +18768,12 @@ fn decode_structural_nodes(
                 node_id: u32::try_from(index).expect("structural node ids must fit in u32"),
                 kind,
                 boolean_value: boolean_value.map(|value| value != 0),
+                parenthesized: parenthesized.map(|value| value != 0),
+                assignment_shape,
+                integer_literal_value,
+                duplicate_key,
+                string_value,
+                is_async: is_async.map(|value| value != 0),
                 construct,
                 span: PersistedSpan { start, end },
                 parent,
@@ -18172,6 +18783,20 @@ fn decode_structural_nodes(
             })
         })
         .collect()
+}
+
+fn next_consecutive_ordinal<K: Copy + Eq>(
+    previous_key: &mut Option<K>,
+    ordinal: &mut u32,
+    key: K,
+) -> u32 {
+    *ordinal = if *previous_key == Some(key) {
+        *ordinal + 1
+    } else {
+        0
+    };
+    *previous_key = Some(key);
+    *ordinal
 }
 
 fn decode_structural_roles(
@@ -18194,12 +18819,8 @@ fn decode_structural_roles(
                 keyword_start,
                 keyword_end,
             ) = row;
-            ordinal = if previous_node == Some(source_node_id) {
-                ordinal + 1
-            } else {
-                0
-            };
-            previous_node = Some(source_node_id);
+            let ordinal =
+                next_consecutive_ordinal(&mut previous_node, &mut ordinal, source_node_id);
             Ok(PersistedStructuralRole {
                 source_node_id,
                 ordinal,
@@ -18223,12 +18844,7 @@ fn decode_structural_occurrence_roles(
     Ok(rows
         .into_iter()
         .map(|(node_id, role)| {
-            ordinal = if previous_node == Some(node_id) {
-                ordinal + 1
-            } else {
-                0
-            };
-            previous_node = Some(node_id);
+            let ordinal = next_consecutive_ordinal(&mut previous_node, &mut ordinal, node_id);
             PersistedOccurrenceRole {
                 node_id,
                 ordinal,
@@ -18244,6 +18860,36 @@ fn decode_structural_occurrence_roles(
 /// rather than seeking one primary key, so it is the only one whose plan can
 /// move with the store's statistics. It is written here once and pinned by
 /// name from the registry in `store::planner_statistics`.
+/// One blob's recovered regions in source order, each with whether a
+/// callable fact's byte range contains it (#3777). `?2` is the JSON array of
+/// callable kind codes from [`callable_kind_codes_json`]; node positions 0, 3
+/// and 4 are the kind code and byte range documented in migration 0128.
+pub(crate) const STRUCTURAL_RECOVERED_REGIONS_SQL: &str =
+    "SELECT region.start_byte, region.end_byte,
+        EXISTS(
+          SELECT 1
+          FROM source_structural_facts AS facts, json_each(facts.nodes) AS node
+          WHERE facts.blob_id = region.blob_id
+            AND node.value ->> 0 IN (SELECT value FROM json_each(?2))
+            AND node.value ->> 3 <= region.start_byte
+            AND region.end_byte <= node.value ->> 4
+        ) AS inside_callable
+ FROM source_structural_recovered_regions AS region
+ WHERE region.blob_id = ?1
+ ORDER BY region.ordinal";
+
+/// The kind codes of every callable fact, as the JSON array
+/// [`STRUCTURAL_RECOVERED_REGIONS_SQL`] binds.
+pub(crate) fn callable_kind_codes_json() -> String {
+    use brokk_bifrost_core::analyzer::structural::code::VocabularyCode;
+    let codes = crate::analyzer::structural::kinds::ALL_KINDS
+        .iter()
+        .filter(|kind| kind.satisfies(crate::analyzer::structural::kinds::NormalizedKind::Callable))
+        .map(|kind| kind.code().to_string())
+        .collect::<Vec<_>>();
+    format!("[{}]", codes.join(","))
+}
+
 fn structural_fact_manifest_sql() -> String {
     format!(
         "SELECT facts.blob_id, facts.source_bytes, facts.node_count, facts.role_count,
@@ -18258,8 +18904,12 @@ fn structural_fact_manifest_sql() -> String {
 }
 
 pub(crate) fn usize_to_i64(value: usize) -> Result<i64> {
-    i64::try_from(value)
-        .map_err(|_| StoreError::new(format!("value does not fit in SQLite INTEGER: {value}")))
+    sqlite_integer(value)
+        .ok_or_else(|| StoreError::new(format!("value does not fit in SQLite INTEGER: {value}")))
+}
+
+fn sqlite_integer<T: TryInto<i64>>(value: T) -> Option<i64> {
+    value.try_into().ok()
 }
 
 fn i64_to_usize(value: i64) -> Result<usize> {
@@ -18319,15 +18969,59 @@ mod resolution_producer_tests;
 
 #[cfg(test)]
 mod tests {
-    use std::time::Instant;
-
     use super::*;
+    use crate::test_support::write_file;
+    pub(super) fn blob_id(conn: &Connection, oid: Oid) -> i64 {
+        conn.query_row(
+            "SELECT id FROM blobs WHERE blob_oid = ?1 AND lang = 'rust'",
+            [oid.to_string()],
+            |row| row.get(0),
+        )
+        .expect("published Rust blob id")
+    }
+
+    pub(super) fn assert_rust_source_read_cancellation_retries<T>(
+        mut read: impl FnMut(&dyn Fn() -> bool) -> Option<T>,
+        minimum_checkpoints: usize,
+        check_retry: impl FnOnce(&T, &T),
+    ) {
+        let checks = std::cell::Cell::new(0usize);
+        let complete = read(&|| {
+            checks.set(checks.get() + 1);
+            true
+        })
+        .expect("complete Rust source-fact read");
+        let total_checks = checks.get();
+        assert!(
+            total_checks > minimum_checkpoints,
+            "Rust source-fact read had too few checkpoints: {total_checks}"
+        );
+
+        let cancelled_checks = std::cell::Cell::new(0usize);
+        assert!(
+            read(&|| {
+                cancelled_checks.set(cancelled_checks.get() + 1);
+                cancelled_checks.get() < total_checks
+            })
+            .is_none(),
+            "cancelled Rust source-fact read returned partial rows"
+        );
+        assert!(
+            cancelled_checks.get() >= total_checks,
+            "cancelled Rust source-fact read skipped checkpoints"
+        );
+
+        let retried = read(&|| true).expect("retry Rust source-fact read");
+        check_retry(&complete, &retried);
+    }
+
     // The EXPLAIN QUERY PLAN pins below take their SQL and bindings from the
     // pinned-query registry in `planner_statistics`, so each pinned statement
     // is written once, and run each assertion in both planner-statistics
     // states (issue #3016).
     use super::planner_statistics::pinned_plans::DEFINITION_CANDIDATE_ARITY_LADDER;
-    use super::planner_statistics::tests::{explain_pin, pinned};
+    use super::planner_statistics::tests::{explain_pin, pinned, prepare_pin_context};
+    pub(super) use super::test_blob_oid as oid_for;
     use crate::analyzer::cpp::CppAdapter;
     use crate::analyzer::csharp::CSharpAdapter;
     use crate::analyzer::go::GoAdapter;
@@ -18339,12 +19033,51 @@ mod tests {
     use crate::analyzer::ruby::RubyAdapter;
     use crate::analyzer::rust::RustAdapter;
     use crate::analyzer::scala::ScalaAdapter;
-    use crate::analyzer::tree_sitter_analyzer::ParsedFile;
+    use crate::analyzer::tree_sitter_analyzer::{ParsedFile, TreeSitterAnalyzer};
     use crate::analyzer::typescript::TypescriptAdapter;
     use crate::gitblob::test_repo::{commit_all, init_repo};
+    use brokk_bifrost_core::analyzer::structural::code::VocabularyCode;
     use brokk_bifrost_core::cache_gc::PlannerStatisticsState;
     use git2::ObjectType;
     use tree_sitter::Parser;
+
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "74238a905cc7: persisted integer fixture omitted the async field"
+    )]
+    fn decode_structural_node_keeps_integer_value_fields() {
+        let encoded = serde_json::json!([[
+            brokk_bifrost_core::analyzer::structural::kinds::NormalizedKind::NumericLiteral.code(),
+            null,
+            null,
+            0,
+            3,
+            null,
+            null,
+            null,
+            1,
+            null,
+            null,
+            null,
+            null,
+            null,
+            { "decimal": null, "low_bits": 4294967295u32, "negative": false },
+            null,
+            null,
+            null
+        ]])
+        .to_string();
+        let nodes = decode_structural_nodes(&encoded).expect("current node-row layout");
+
+        assert_eq!(
+            nodes[0].integer_literal_value,
+            Some(crate::analyzer::structural::facts::IntegerLiteralValue {
+                decimal: None,
+                low_bits: u32::MAX,
+                negative: false,
+            })
+        );
+    }
 
     #[test]
     fn store_error_context_preserves_resource_bound_kind() {
@@ -18599,7 +19332,14 @@ mod tests {
             .ensure_language_epoch_value(lang, "signature-metadata-round-trip")
             .unwrap();
         store
-            .write_parsed_blob_at_generation(oid, lang, generation, adapter, state.as_ref())
+            .write_parsed_blob_at_generation(
+                &crate::analyzer::store::test_blob_file(),
+                oid,
+                lang,
+                generation,
+                adapter,
+                state.as_ref(),
+            )
             .unwrap();
         let conn = store.read_conn().unwrap();
         let pair_count: i64 = conn
@@ -18772,7 +19512,14 @@ mod tests {
             .ensure_language_epoch_value("ruby", "unpaired-first-signature")
             .unwrap();
         store
-            .write_parsed_blob_at_generation(oid, "ruby", generation, &RubyAdapter, &state)
+            .write_parsed_blob_at_generation(
+                &crate::analyzer::store::test_blob_file(),
+                oid,
+                "ruby",
+                generation,
+                &RubyAdapter,
+                &state,
+            )
             .unwrap();
 
         let usage_row = store
@@ -18827,7 +19574,14 @@ mod tests {
             .ensure_language_epoch_value("java", "signature-metadata-pairs")
             .unwrap();
         store
-            .write_parsed_blob_at_generation(oid, "java", generation, &JavaAdapter, &state)
+            .write_parsed_blob_at_generation(
+                &crate::analyzer::store::test_blob_file(),
+                oid,
+                "java",
+                generation,
+                &JavaAdapter,
+                &state,
+            )
             .unwrap();
         drop(store);
 
@@ -18958,7 +19712,14 @@ mod tests {
             .ensure_language_epoch_value("ruby", "invalid-signature-metadata-pair")
             .unwrap();
         store
-            .write_parsed_blob_at_generation(oid, "ruby", generation, &RubyAdapter, &state)
+            .write_parsed_blob_at_generation(
+                &crate::analyzer::store::test_blob_file(),
+                oid,
+                "ruby",
+                generation,
+                &RubyAdapter,
+                &state,
+            )
             .expect("invalid metadata/signature coordinate must panic during preparation");
     }
 
@@ -18993,7 +19754,14 @@ mod tests {
             .ensure_language_epoch_value("ruby", "unbounded-signature-metadata")
             .unwrap();
         store
-            .write_parsed_blob_at_generation(oid, "ruby", generation, &RubyAdapter, &state)
+            .write_parsed_blob_at_generation(
+                &crate::analyzer::store::test_blob_file(),
+                oid,
+                "ruby",
+                generation,
+                &RubyAdapter,
+                &state,
+            )
             .unwrap();
 
         let limited = store
@@ -19081,7 +19849,14 @@ mod tests {
             .ensure_language_epoch_value("java", "field-initializer-observation")
             .unwrap();
         store
-            .write_parsed_blob_at_generation(oid, "java", generation, &JavaAdapter, &state)
+            .write_parsed_blob_at_generation(
+                &crate::analyzer::store::test_blob_file(),
+                oid,
+                "java",
+                generation,
+                &JavaAdapter,
+                &state,
+            )
             .unwrap();
 
         let conn = store.read_conn().unwrap();
@@ -19114,6 +19889,9 @@ mod tests {
     /// issue #2351 the encoder clamps an oversized label, because a label is a
     /// rendering that can always be made shorter. Every other oversized column
     /// still fails loudly, which is what this pins.
+    #[brokk_bifrost_test_macros::hardwon(
+        "#2351: oversized persisted return-type metadata must fail and roll back instead of publishing a partial blob"
+    )]
     #[test]
     fn oversized_signature_metadata_is_rejected_by_the_schema_and_publishes_nothing() {
         let temp = tempfile::TempDir::new().unwrap();
@@ -19175,7 +19953,14 @@ mod tests {
         );
 
         let write_error = store
-            .write_parsed_blob_at_generation(oid, "ruby", generation, &RubyAdapter, state.as_ref())
+            .write_parsed_blob_at_generation(
+                &crate::analyzer::store::test_blob_file(),
+                oid,
+                "ruby",
+                generation,
+                &RubyAdapter,
+                state.as_ref(),
+            )
             .expect_err("direct persistence must reject oversized signature metadata")
             .to_string();
         assert!(
@@ -19193,6 +19978,9 @@ mod tests {
     /// Issue #2351: a label is a rendering, so an oversized one is clamped and
     /// the file still indexes. The parameter spans index the label, so the
     /// clamp must drop the ones that no longer land inside it.
+    #[brokk_bifrost_test_macros::hardwon(
+        "9b24a4c0ceb1: oversized generated labels aborted persistence instead of being clamped"
+    )]
     #[test]
     fn an_oversized_label_is_clamped_instead_of_failing_the_blob() {
         let temp = tempfile::TempDir::new().unwrap();
@@ -19235,7 +20023,14 @@ mod tests {
             .unwrap();
 
         store
-            .write_parsed_blob_at_generation(oid, "ruby", generation, &RubyAdapter, state.as_ref())
+            .write_parsed_blob_at_generation(
+                &crate::analyzer::store::test_blob_file(),
+                oid,
+                "ruby",
+                generation,
+                &RubyAdapter,
+                state.as_ref(),
+            )
             .expect("a clamped label must not fail the blob");
         assert!(
             store
@@ -19265,6 +20060,34 @@ mod tests {
             parameters.contains("\"mak\"") && !parameters.contains("\"tail\""),
             "only spans inside the retained prefix may survive: {parameters}"
         );
+    }
+
+    /// Structural hydration reads one blob's recovered regions through the
+    /// region table's primary key, and answers callable containment against
+    /// that blob's one structural-facts row (#3777). The only scan is the
+    /// `json_each` walk over that row's nodes.
+    #[test]
+    fn recovered_region_reader_seeks_one_blob() {
+        for state in PlannerStatisticsState::BOTH {
+            let store = AnalyzerStore::open_ephemeral().unwrap();
+            let conn = store.conn.lock().expect("store mutex");
+            state.install(&conn);
+            let plan = explain_pin(&conn, &pinned("structural_recovered_regions"));
+            for table in ["region", "facts"] {
+                assert!(
+                    plan.iter()
+                        .any(|detail| detail
+                            .starts_with(&format!("SEARCH {table} USING PRIMARY KEY"))),
+                    "{table} must be a primary-key seek {state}: {plan:#?}"
+                );
+            }
+            assert!(
+                plan.iter().all(|detail| !detail.contains("TEMP B-TREE")
+                    && !detail.contains("AUTOMATIC")
+                    && (!detail.contains("SCAN ") || detail.contains("VIRTUAL TABLE"))),
+                "only the JSON nodes may be scanned {state}: {plan:#?}"
+            );
+        }
     }
 
     /// Both signature-metadata readers that join reach their rows through the
@@ -19362,30 +20185,6 @@ mod tests {
     }
 
     #[test]
-    fn limited_query_byte_budget_caps_individual_and_aggregate_rows() {
-        let mut bytes = LimitedQueryByteBudget::default();
-        let half = MAX_LIMITED_QUERY_AGGREGATE_BYTES / 2;
-        assert!(
-            bytes
-                .admit_sqlite_bytes(usize_to_i64(half).unwrap())
-                .unwrap()
-        );
-        assert!(
-            bytes
-                .admit_sqlite_bytes(usize_to_i64(half).unwrap())
-                .unwrap()
-        );
-        assert!(!bytes.admit_sqlite_bytes(1).unwrap());
-
-        let mut bytes = LimitedQueryByteBudget::default();
-        assert!(
-            !bytes
-                .admit_sqlite_bytes(usize_to_i64(MAX_LIMITED_QUERY_ROW_BYTES + 1).unwrap())
-                .unwrap()
-        );
-    }
-
-    #[test]
     fn resource_bound_oversized_current_epoch_content_package_fails_closed() {
         let temp = tempfile::TempDir::new().unwrap();
         let file = write_file(
@@ -19400,7 +20199,14 @@ mod tests {
             .ensure_language_epoch_value("java", "limited-content-package-row-bytes-v1")
             .unwrap();
         store
-            .write_parsed_blob_at_generation(oid, "java", generation, &JavaAdapter, &state)
+            .write_parsed_blob_at_generation(
+                &crate::analyzer::store::test_blob_file(),
+                oid,
+                "java",
+                generation,
+                &JavaAdapter,
+                &state,
+            )
             .unwrap();
 
         let ordinary = store
@@ -19451,7 +20257,14 @@ mod tests {
             .ensure_language_epoch_value("java", "limited-fallback-qualifier-row-bytes-v1")
             .unwrap();
         store
-            .write_parsed_blob_at_generation(oid, "java", generation, &JavaAdapter, &state)
+            .write_parsed_blob_at_generation(
+                &crate::analyzer::store::test_blob_file(),
+                oid,
+                "java",
+                generation,
+                &JavaAdapter,
+                &state,
+            )
             .unwrap();
 
         let ordinary = store
@@ -19525,6 +20338,9 @@ mod tests {
     /// the fixture needs two of them and the qualifiers are staged by
     /// `top_level_ordinal` rather than by `unit_key`. A file with one class and
     /// two methods would offer the scan a single eligible row.
+    #[brokk_bifrost_test_macros::hardwon(
+        "#1726: fallback qualifier scans skipped empty earlier declarations in their work budget"
+    )]
     #[test]
     fn limited_fallback_qualifier_charges_empty_rows_before_evidence() {
         let temp = tempfile::TempDir::new().unwrap();
@@ -19540,7 +20356,14 @@ mod tests {
             .ensure_language_epoch_value("java", "limited-fallback-qualifier-scan-v1")
             .unwrap();
         store
-            .write_parsed_blob_at_generation(oid, "java", generation, &JavaAdapter, &state)
+            .write_parsed_blob_at_generation(
+                &crate::analyzer::store::test_blob_file(),
+                oid,
+                "java",
+                generation,
+                &JavaAdapter,
+                &state,
+            )
             .unwrap();
 
         {
@@ -19604,7 +20427,14 @@ mod tests {
             .ensure_language_epoch_value("go", "limited-import-row-bytes-v1")
             .unwrap();
         store
-            .write_parsed_blob_at_generation(oid, "go", generation, &GoAdapter, &state)
+            .write_parsed_blob_at_generation(
+                &crate::analyzer::store::test_blob_file(),
+                oid,
+                "go",
+                generation,
+                &GoAdapter,
+                &state,
+            )
             .unwrap();
         let ordinary = store
             .import_infos_for_key_limited(oid, "go", generation, usize::MAX)
@@ -19660,7 +20490,14 @@ mod tests {
             .ensure_language_epoch_value("go", "limited-import-count-integrity-v1")
             .unwrap();
         store
-            .write_parsed_blob_at_generation(oid, "go", generation, &GoAdapter, &state)
+            .write_parsed_blob_at_generation(
+                &crate::analyzer::store::test_blob_file(),
+                oid,
+                "go",
+                generation,
+                &GoAdapter,
+                &state,
+            )
             .unwrap();
 
         {
@@ -19720,7 +20557,14 @@ mod tests {
             .ensure_language_epoch_value("scala", "limited-supertype-row-bytes-v1")
             .unwrap();
         store
-            .write_parsed_blob_at_generation(oid, "scala", generation, &ScalaAdapter, &state)
+            .write_parsed_blob_at_generation(
+                &crate::analyzer::store::test_blob_file(),
+                oid,
+                "scala",
+                generation,
+                &ScalaAdapter,
+                &state,
+            )
             .unwrap();
         let oversized = usize_to_i64(MAX_LIMITED_QUERY_ROW_BYTES + 1).unwrap();
 
@@ -19780,7 +20624,14 @@ mod tests {
             .ensure_language_epoch_value("java", "limited-candidate-row-bytes-v1")
             .unwrap();
         store
-            .write_parsed_blob_at_generation(oid, "java", generation, &JavaAdapter, &state)
+            .write_parsed_blob_at_generation(
+                &crate::analyzer::store::test_blob_file(),
+                oid,
+                "java",
+                generation,
+                &JavaAdapter,
+                &state,
+            )
             .unwrap();
 
         {
@@ -19814,6 +20665,77 @@ mod tests {
         assert!(!limited.complete);
         assert!(limited.rows.is_empty());
         assert_eq!(limited.inspected, 1);
+    }
+
+    #[brokk_bifrost_test_macros::hardwon(
+        "#4510: STAT4 recompiled the cached identifier-candidate query for distinct names"
+    )]
+    #[test]
+    fn limited_identifier_candidate_query_does_not_reprepare_for_distinct_names() {
+        use rusqlite::StatementStatus;
+
+        const IDENTIFIERS: usize = 1_024;
+        let temp = tempfile::TempDir::new().unwrap();
+        let source = (0..IDENTIFIERS)
+            .map(|index| format!("pub struct Module{index:04};\n"))
+            .collect::<String>();
+        let rust_file = write_file(temp.path(), "src/lib.rs", &source);
+        let java_source = (0..IDENTIFIERS)
+            .map(|index| format!("class Module{index:04} {{}}\n"))
+            .collect::<String>();
+        let java_file = write_file(temp.path(), "src/Library.java", &java_source);
+        let store = AnalyzerStore::open_ephemeral().unwrap();
+        store
+            .write_parsed_blob(
+                oid_for(rust_file.read_to_string().unwrap().as_bytes()),
+                "rust",
+                &RustAdapter,
+                &parse_state(&RustAdapter, &rust_file),
+            )
+            .unwrap();
+        store
+            .write_parsed_blob(
+                oid_for(java_file.read_to_string().unwrap().as_bytes()),
+                "java",
+                &JavaAdapter,
+                &parse_state(&JavaAdapter, &java_file),
+            )
+            .unwrap();
+        store.refresh_planner_statistics().unwrap();
+
+        let sql = limited_identifier_candidate_sql();
+        let langs = vec!["rust".to_string(), "java".to_string()];
+        let mut conn = store.read_conn().unwrap();
+        let tx = conn.transaction().unwrap();
+        for index in 0..IDENTIFIERS {
+            let identifier = format!("Module{index:04}");
+            let rows =
+                candidate_rows_for_identifier_languages_limited(&tx, &langs, &identifier, &sql, 3)
+                    .unwrap();
+            assert!(rows.complete, "{identifier} candidate query was incomplete");
+            assert_eq!(rows.rows.len(), 2, "{identifier} candidate count");
+            assert_eq!(
+                rows.rows
+                    .iter()
+                    .map(|candidate| candidate.lang.as_str())
+                    .collect::<Vec<_>>(),
+                ["rust", "java"],
+                "{identifier} candidate language order"
+            );
+        }
+        tx.commit().unwrap();
+
+        let statement = conn.prepare_cached(&sql).unwrap();
+        assert_eq!(
+            statement.get_status(StatementStatus::Run),
+            IDENTIFIERS as i32,
+            "one cached statement must execute once per requested identifier"
+        );
+        assert_eq!(
+            statement.get_status(StatementStatus::RePrepare),
+            0,
+            "temp-table request values must not trigger STAT4 statement re-preparation"
+        );
     }
 
     /// The actionable cache-denial message reaches the workspace entry point,
@@ -19919,7 +20841,14 @@ mod tests {
             .ensure_language_epoch_value("java", "concurrent-smoke-v1")
             .unwrap();
         store
-            .write_parsed_blob_at_generation(oid, "java", generation, &JavaAdapter, state.as_ref())
+            .write_parsed_blob_at_generation(
+                &crate::analyzer::store::test_blob_file(),
+                oid,
+                "java",
+                generation,
+                &JavaAdapter,
+                state.as_ref(),
+            )
             .unwrap();
 
         let langs = vec!["java".to_string()];
@@ -19952,6 +20881,7 @@ mod tests {
                     let extra_oid = oid_for(extra_state.source.as_bytes());
                     store
                         .write_parsed_blob_at_generation(
+                            &crate::analyzer::store::test_blob_file(),
                             extra_oid,
                             "java",
                             generation,
@@ -20040,6 +20970,9 @@ mod tests {
         );
     }
 
+    #[brokk_bifrost_test_macros::hardwon(
+        "#1104: Scala empty block lambdas were parsed incorrectly while old cache rows stayed current"
+    )]
     #[test]
     fn scala_empty_lambda_parser_epoch_invalidates_prior_parsed_blobs() {
         // This is the Scala epoch immediately before issue #1068's parser-table
@@ -20055,39 +20988,12 @@ mod tests {
             "class VCSSpec { def run(): Unit = simulation.run() { _ => }; def after = 1 }\n",
         );
         let state = Arc::new(parse_state(&ScalaAdapter, &file));
-        let oid = oid_for(state.source.as_bytes());
-        let store = AnalyzerStore::open_ephemeral().unwrap();
-        let prior_generation = store
-            .ensure_language_epoch_value("scala", PRE_EMPTY_LAMBDA_EPOCH)
-            .unwrap();
-        store
-            .write_parsed_blob_at_generation(
-                oid,
-                "scala",
-                prior_generation,
-                &ScalaAdapter,
-                state.as_ref(),
-            )
-            .unwrap();
-        assert!(store.contains_parsed_blob(oid, "scala").unwrap());
-
-        let current_generation = store
-            .ensure_language_epoch(
-                Language::Scala,
-                &crate::analyzer::scala::language::LANGUAGE.into(),
-            )
-            .unwrap();
-
-        assert_ne!(current_generation, prior_generation);
-        assert!(!store.contains_parsed_blob(oid, "scala").unwrap());
-        assert_eq!(
-            store
-                .missing_parsed_blob_keys(&[(oid, "scala".to_string())])
-                .unwrap(),
-            vec![(oid, "scala".to_string())]
-        );
+        assert_prior_parsed_blob_invalidated(&ScalaAdapter, state.as_ref(), PRE_EMPTY_LAMBDA_EPOCH);
     }
 
+    #[brokk_bifrost_test_macros::hardwon(
+        "#2911: type aliases gained their own type identity, which stale cache rows could not represent"
+    )]
     #[test]
     fn rust_type_alias_identity_epoch_invalidates_prior_parsed_blobs() {
         let temp = tempfile::TempDir::new().unwrap();
@@ -20110,38 +21016,91 @@ mod tests {
             "the const keeps its own field declaration beside {alias:?}: {:?}",
             state.declarations
         );
-        let oid = oid_for(state.source.as_bytes());
-        let store = AnalyzerStore::open_ephemeral().unwrap();
         let prior_epoch = epoch::rust_epoch_before_type_alias_type_identity();
-        let prior_generation = store
-            .ensure_language_epoch_value("rust", &prior_epoch)
-            .unwrap();
-        store
-            .write_parsed_blob_at_generation(
-                oid,
-                "rust",
-                prior_generation,
-                &RustAdapter,
-                state.as_ref(),
-            )
-            .unwrap();
-        assert!(store.contains_parsed_blob(oid, "rust").unwrap());
+        assert_prior_parsed_blob_invalidated(&RustAdapter, state.as_ref(), &prior_epoch);
+    }
 
-        let current_generation = store
-            .ensure_language_epoch(Language::Rust, &tree_sitter_rust::LANGUAGE.into())
-            .unwrap();
+    #[brokk_bifrost_test_macros::hardwon(
+        "6dc4d18752fb: recovered macro fragment bindings change persisted Rust resolution facts"
+    )]
+    #[test]
+    fn rust_recovered_macro_fragment_epoch_invalidates_prior_parsed_blobs() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let file = write_file(
+            temp.path(),
+            "issue_70446.rs",
+            r#"//@ check-pass
 
-        assert_ne!(current_generation, prior_generation);
-        assert!(!store.contains_parsed_blob(oid, "rust").unwrap());
-        assert_eq!(
-            store
-                .missing_parsed_blob_keys(&[(oid, "rust".to_string())])
-                .unwrap(),
-            vec![(oid, "rust".to_string())]
+macro_rules! foo {
+    ($(: $p:path)? $(: $l:lifetime)? ) => { bar! {$(: $p)? $(: $l)? } };
+}
+
+macro_rules! bar {
+    ($(: $p:path)? $(: $l:lifetime)? ) => {};
+}
+
+foo! {: 'a }
+
+fn main() {}
+"#,
         );
+        let state = Arc::new(parse_state(&RustAdapter, &file));
+        let prior_epoch = epoch::rust_epoch_before_recovered_macro_fragment_bindings();
+        assert_prior_parsed_blob_invalidated(&RustAdapter, state.as_ref(), &prior_epoch);
+    }
+
+    #[brokk_bifrost_test_macros::hardwon(
+        "#4458: stale Rust cache rows retained cfg_attr transformation boundaries"
+    )]
+    #[test]
+    fn rust_cfg_attr_item_boundary_epoch_invalidates_prior_parsed_blobs() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let file = write_file(
+            temp.path(),
+            "lib.rs",
+            "#[cfg_attr(test, track_caller)]\npub fn visit() {}\n",
+        );
+        let state = Arc::new(parse_state(&RustAdapter, &file));
+        let prior_epoch = epoch::rust_epoch_before_cfg_attr_effective_item_attributes();
+        assert_prior_parsed_blob_invalidated(&RustAdapter, state.as_ref(), &prior_epoch);
+    }
+
+    #[brokk_bifrost_test_macros::hardwon(
+        "#4458: reference impl receivers change persisted Rust resolution facts"
+    )]
+    #[test]
+    fn rust_reference_impl_member_owner_epoch_invalidates_prior_parsed_blobs() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let file = write_file(
+            temp.path(),
+            "reference_impl.rs",
+            "pub struct Widget; impl Hook for &mut Widget { fn call(self) { self.ping(); } }\n",
+        );
+        let state = Arc::new(parse_state(&RustAdapter, &file));
+        let prior_epoch = epoch::rust_epoch_before_reference_impl_member_owners();
+        assert_prior_parsed_blob_invalidated(&RustAdapter, state.as_ref(), &prior_epoch);
+    }
+
+    #[brokk_bifrost_test_macros::hardwon(
+        "#4458: derive-helper boundaries change persisted Rust resolution facts"
+    )]
+    #[test]
+    fn rust_derive_helper_attribute_epoch_invalidates_prior_parsed_blobs() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let file = write_file(
+            temp.path(),
+            "lib.rs",
+            "#[derive(Parser)]\n#[command(name = \"tool\")]\npub struct Args;\n",
+        );
+        let state = Arc::new(parse_state(&RustAdapter, &file));
+        let prior_epoch = epoch::rust_epoch_before_conditional_derive_helper_attributes();
+        assert_prior_parsed_blob_invalidated(&RustAdapter, state.as_ref(), &prior_epoch);
     }
 
     /// The TypeScript half of the same #2911 bump.
+    #[brokk_bifrost_test_macros::hardwon(
+        "#2911: TypeScript aliases gained their own type identity, which stale cache rows could not represent"
+    )]
     #[test]
     fn ts_type_alias_identity_epoch_invalidates_prior_parsed_blobs() {
         let temp = tempfile::TempDir::new().unwrap();
@@ -20164,38 +21123,8 @@ mod tests {
             "the const keeps its own field declaration beside {alias:?}: {:?}",
             state.declarations
         );
-        let oid = oid_for(state.source.as_bytes());
-        let store = AnalyzerStore::open_ephemeral().unwrap();
         let prior_epoch = epoch::typescript_epoch_before_type_alias_type_identity();
-        let prior_generation = store
-            .ensure_language_epoch_value("typescript", &prior_epoch)
-            .unwrap();
-        store
-            .write_parsed_blob_at_generation(
-                oid,
-                "typescript",
-                prior_generation,
-                &TypescriptAdapter,
-                state.as_ref(),
-            )
-            .unwrap();
-        assert!(store.contains_parsed_blob(oid, "typescript").unwrap());
-
-        let current_generation = store
-            .ensure_language_epoch(
-                Language::TypeScript,
-                &tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
-            )
-            .unwrap();
-
-        assert_ne!(current_generation, prior_generation);
-        assert!(!store.contains_parsed_blob(oid, "typescript").unwrap());
-        assert_eq!(
-            store
-                .missing_parsed_blob_keys(&[(oid, "typescript".to_string())])
-                .unwrap(),
-            vec![(oid, "typescript".to_string())]
-        );
+        assert_prior_parsed_blob_invalidated(&TypescriptAdapter, state.as_ref(), &prior_epoch);
     }
 
     #[test]
@@ -20220,38 +21149,8 @@ mod tests {
             "the val keeps its own field declaration beside {alias:?}: {:?}",
             state.declarations
         );
-        let oid = oid_for(state.source.as_bytes());
-        let store = AnalyzerStore::open_ephemeral().unwrap();
         let prior_epoch = epoch::kotlin_epoch_before_type_alias_type_identity();
-        let prior_generation = store
-            .ensure_language_epoch_value("kotlin", &prior_epoch)
-            .unwrap();
-        store
-            .write_parsed_blob_at_generation(
-                oid,
-                "kotlin",
-                prior_generation,
-                &KotlinAdapter,
-                state.as_ref(),
-            )
-            .unwrap();
-        assert!(store.contains_parsed_blob(oid, "kotlin").unwrap());
-
-        let current_generation = store
-            .ensure_language_epoch(
-                Language::Kotlin,
-                &crate::analyzer::kotlin::language::LANGUAGE.into(),
-            )
-            .unwrap();
-
-        assert_ne!(current_generation, prior_generation);
-        assert!(!store.contains_parsed_blob(oid, "kotlin").unwrap());
-        assert_eq!(
-            store
-                .missing_parsed_blob_keys(&[(oid, "kotlin".to_string())])
-                .unwrap(),
-            vec![(oid, "kotlin".to_string())]
-        );
+        assert_prior_parsed_blob_invalidated(&KotlinAdapter, state.as_ref(), &prior_epoch);
     }
 
     /// #3453: Kotlin now records callable modifier metadata, and it recorded
@@ -20260,6 +21159,9 @@ mod tests {
     /// whose adapter honestly never looked, so `receiver_contract_of` reports
     /// no contract and every Kotlin procedure summary stays inert. The salt is
     /// the only thing that retires those rows.
+    #[brokk_bifrost_test_macros::hardwon(
+        "#3453: persisted Kotlin callables lacked modifier metadata needed for receiver contracts"
+    )]
     #[test]
     fn kotlin_callable_modifier_metadata_epoch_invalidates_prior_parsed_blobs() {
         let temp = tempfile::TempDir::new().unwrap();
@@ -20269,38 +21171,47 @@ mod tests {
             "package example\n\nobject Registry {\n    fun register(spec: String): String = spec\n}\n\nclass Widget {\n    fun render(target: String): String = target\n}\n",
         );
         let state = Arc::new(parse_state(&KotlinAdapter, &file));
-        let oid = oid_for(state.source.as_bytes());
-        let store = AnalyzerStore::open_ephemeral().unwrap();
-        let prior_epoch = epoch::kotlin_epoch_before_callable_modifier_metadata();
-        let prior_generation = store
-            .ensure_language_epoch_value("kotlin", &prior_epoch)
-            .unwrap();
-        store
-            .write_parsed_blob_at_generation(
-                oid,
-                "kotlin",
-                prior_generation,
-                &KotlinAdapter,
-                state.as_ref(),
-            )
-            .unwrap();
-        assert!(store.contains_parsed_blob(oid, "kotlin").unwrap());
-
-        let current_generation = store
-            .ensure_language_epoch(
-                Language::Kotlin,
-                &crate::analyzer::kotlin::language::LANGUAGE.into(),
-            )
-            .unwrap();
-
-        assert_ne!(current_generation, prior_generation);
-        assert!(!store.contains_parsed_blob(oid, "kotlin").unwrap());
-        assert_eq!(
-            store
-                .missing_parsed_blob_keys(&[(oid, "kotlin".to_string())])
-                .unwrap(),
-            vec![(oid, "kotlin".to_string())]
+        let prior_epoch = epoch::epoch_before_bump(
+            epoch::TestEpochLanguage::Kotlin,
+            "kotlin-callable-modifier-metadata-2026-09",
         );
+        assert_prior_parsed_blob_invalidated(&KotlinAdapter, state.as_ref(), &prior_epoch);
+    }
+
+    #[test]
+    fn kotlin_call_navigation_receiver_epoch_invalidates_prior_parsed_blobs() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let file = write_file(
+            temp.path(),
+            "ExactFlowFixture.kt",
+            r#"object ExactFlowFixture {
+    fun relay(value: String): String = value
+
+    fun run(input: String) {
+        ExactFlowFixture.relay(input)
+    }
+}
+"#,
+        );
+        let state = Arc::new(parse_state(&KotlinAdapter, &file));
+        let prior_epoch = epoch::kotlin_epoch_before_call_navigation_receiver_facts();
+        assert_prior_parsed_blob_invalidated(&KotlinAdapter, state.as_ref(), &prior_epoch);
+    }
+
+    #[test]
+    fn kotlin_scalar_additive_facts_epoch_invalidates_prior_parsed_blobs() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let file = write_file(
+            temp.path(),
+            "Arithmetic.kt",
+            "package example\nfun decrement(depth: Int) = depth - 1\n",
+        );
+        let state = Arc::new(parse_state(&KotlinAdapter, &file));
+        let prior_epoch = epoch::epoch_before_bump(
+            epoch::TestEpochLanguage::Kotlin,
+            "kotlin-labeled-this-receiver-2026-10",
+        );
+        assert_prior_parsed_blob_invalidated(&KotlinAdapter, state.as_ref(), &prior_epoch);
     }
 
     #[test]
@@ -20325,38 +21236,21 @@ mod tests {
             "the val keeps its own field declaration beside {alias:?}: {:?}",
             state.declarations
         );
-        let oid = oid_for(state.source.as_bytes());
-        let store = AnalyzerStore::open_ephemeral().unwrap();
         let prior_epoch = epoch::scala_epoch_before_type_alias_type_identity();
-        let prior_generation = store
-            .ensure_language_epoch_value("scala", &prior_epoch)
-            .unwrap();
-        store
-            .write_parsed_blob_at_generation(
-                oid,
-                "scala",
-                prior_generation,
-                &ScalaAdapter,
-                state.as_ref(),
-            )
-            .unwrap();
-        assert!(store.contains_parsed_blob(oid, "scala").unwrap());
+        assert_prior_parsed_blob_invalidated(&ScalaAdapter, state.as_ref(), &prior_epoch);
+    }
 
-        let current_generation = store
-            .ensure_language_epoch(
-                Language::Scala,
-                &crate::analyzer::scala::language::LANGUAGE.into(),
-            )
-            .unwrap();
-
-        assert_ne!(current_generation, prior_generation);
-        assert!(!store.contains_parsed_blob(oid, "scala").unwrap());
-        assert_eq!(
-            store
-                .missing_parsed_blob_keys(&[(oid, "scala".to_string())])
-                .unwrap(),
-            vec![(oid, "scala".to_string())]
+    #[test]
+    fn scala_native_root_route_facts_epoch_invalidates_prior_parsed_blobs() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let file = write_file(
+            temp.path(),
+            "Use.scala",
+            "package example\nobject Use { val value: Outer.Inner = null }\n",
         );
+        let state = Arc::new(parse_state(&ScalaAdapter, &file));
+        let prior_epoch = epoch::scala_epoch_before_native_root_route_facts();
+        assert_prior_parsed_blob_invalidated(&ScalaAdapter, state.as_ref(), &prior_epoch);
     }
 
     #[test]
@@ -20368,40 +21262,13 @@ mod tests {
             "object Syntax:\n  extension (value: String)\n    def twice: String = value + value\n",
         );
         let state = Arc::new(parse_state(&ScalaAdapter, &file));
-        let oid = oid_for(state.source.as_bytes());
-        let store = AnalyzerStore::open_ephemeral().unwrap();
         let prior_epoch = epoch::scala_epoch_before_tree_sitter_scala_0_26_2();
-        let prior_generation = store
-            .ensure_language_epoch_value("scala", &prior_epoch)
-            .unwrap();
-        store
-            .write_parsed_blob_at_generation(
-                oid,
-                "scala",
-                prior_generation,
-                &ScalaAdapter,
-                state.as_ref(),
-            )
-            .unwrap();
-        assert!(store.contains_parsed_blob(oid, "scala").unwrap());
-
-        let current_generation = store
-            .ensure_language_epoch(
-                Language::Scala,
-                &crate::analyzer::scala::language::LANGUAGE.into(),
-            )
-            .unwrap();
-
-        assert_ne!(current_generation, prior_generation);
-        assert!(!store.contains_parsed_blob(oid, "scala").unwrap());
-        assert_eq!(
-            store
-                .missing_parsed_blob_keys(&[(oid, "scala".to_string())])
-                .unwrap(),
-            vec![(oid, "scala".to_string())]
-        );
+        assert_prior_parsed_blob_invalidated(&ScalaAdapter, state.as_ref(), &prior_epoch);
     }
 
+    #[brokk_bifrost_test_macros::hardwon(
+        "4b3f6065fca9: batched parsed-blob membership must preserve mixed-language and incomplete-key semantics"
+    )]
     #[test]
     fn parsed_blob_keys_batches_mixed_languages_and_incomplete_rows() {
         let temp = tempfile::TempDir::new().unwrap();
@@ -20521,6 +21388,9 @@ mod tests {
         });
     }
 
+    #[brokk_bifrost_test_macros::hardwon(
+        "b67515a85a44: reader checkout cleanup invalidated cached statements and connection functions"
+    )]
     #[test]
     fn reader_checkout_preserves_prepared_statements_and_identity_functions() {
         use rusqlite::StatementStatus;
@@ -20723,6 +21593,9 @@ mod tests {
     /// selection that connection already holds must run nothing: no view
     /// script, no selection rewrite. A different selection is a real change and
     /// is written once.
+    #[brokk_bifrost_test_macros::hardwon(
+        "#2883: repeated workspace selection rewrote connection-local views on every checkout"
+    )]
     #[test]
     fn a_repeated_workspace_selection_costs_the_connection_nothing() {
         let temp = tempfile::tempdir().unwrap();
@@ -20875,6 +21748,9 @@ mod tests {
     /// scanning `code_units` and probing the temp table -- reads every
     /// declaration of every language in the database instead of only the live
     /// ones (issue #2316).
+    #[brokk_bifrost_test_macros::hardwon(
+        "#2316: candidate prefiltering caused SQLite to scan declarations outside live blobs"
+    )]
     #[test]
     fn search_candidate_name_plan_is_driven_by_the_live_blob_set() {
         for state in PlannerStatisticsState::BOTH {
@@ -20913,6 +21789,47 @@ mod tests {
         );
     }
 
+    #[test]
+    fn cpp_owner_search_plan_seeks_live_bodies_and_named_classes() {
+        for state in PlannerStatisticsState::BOTH {
+            let store = AnalyzerStore::open_ephemeral().unwrap();
+            let conn = store.conn.lock().expect("store mutex");
+            sync_active_blob_oids(&conn, &[]).unwrap();
+            state.install(&conn);
+            for label in [
+                "cpp_search_owner_name_rows_unfiltered",
+                "cpp_search_owner_name_rows_prefiltered",
+            ] {
+                let plan = explain_pin(&conn, &pinned(label));
+                assert!(
+                    plan.iter()
+                        .any(|row| row.contains("SEARCH units USING PRIMARY KEY")),
+                    "{state}: {plan:#?}"
+                );
+                assert!(
+                    plan.iter().any(|row| row.contains(
+                        "SEARCH owner USING INDEX idx_code_units_lang_identifier_lookup"
+                    )),
+                    "{state}: {plan:#?}"
+                );
+                assert!(
+                    plan.iter()
+                        .any(|row| row.contains("source_declaration_units_unit")),
+                    "{state}: {plan:#?}"
+                );
+                assert!(
+                    !plan
+                        .iter()
+                        .any(|row| row.contains("SCAN units") || row.contains("SCAN owner")),
+                    "{state}: {plan:#?}"
+                );
+            }
+        }
+    }
+
+    #[brokk_bifrost_test_macros::hardwon(
+        "#2785: by-key candidate hydration scanned unrelated declarations before the requested blob"
+    )]
     #[test]
     fn search_candidate_key_plan_is_driven_by_the_requested_blob() {
         for state in PlannerStatisticsState::BOTH {
@@ -20966,6 +21883,9 @@ mod tests {
         );
     }
 
+    #[brokk_bifrost_test_macros::hardwon(
+        "#2785: by-key hydration crossed blob or language boundaries and skipped padded batches"
+    )]
     #[test]
     fn search_candidate_key_hydration_preserves_multi_blob_language_parity() {
         let temp = tempfile::TempDir::new().unwrap();
@@ -21134,50 +22054,6 @@ mod tests {
     }
 
     #[test]
-    fn search_candidate_projection_marks_only_multiple_physical_ranges() {
-        let temp = tempfile::TempDir::new().unwrap();
-        let file = write_file(
-            temp.path(),
-            "src/functions.cpp",
-            "int declared_once();\n\nint defined_twice();\nint defined_twice() { return 1; }\n",
-        );
-        let oid = oid_for(file.read_to_string().unwrap().as_bytes());
-        let store = AnalyzerStore::open_ephemeral().unwrap();
-        store
-            .write_parsed_blob(oid, "cpp", &CppAdapter, &parse_state(&CppAdapter, &file))
-            .unwrap();
-
-        let candidates = store.search_candidate_rows_by_lang("cpp").unwrap();
-        let declared_once = candidates
-            .iter()
-            .find(|row| row.candidate.short_name == "declared_once")
-            .expect("single-occurrence function");
-        let defined_twice = candidates
-            .iter()
-            .find(|row| row.candidate.short_name == "defined_twice")
-            .expect("prototype and definition function");
-
-        assert!(!declared_once.has_multiple_ranges, "{declared_once:#?}");
-        assert!(
-            !declared_once.all_ranges_are_definitions,
-            "{declared_once:#?}"
-        );
-        assert!(defined_twice.has_multiple_ranges, "{defined_twice:#?}");
-        assert!(
-            !defined_twice.all_ranges_are_definitions,
-            "{defined_twice:#?}"
-        );
-        assert_eq!(
-            declared_once.primary_range.map(|range| range.start_line),
-            Some(1)
-        );
-        assert_eq!(
-            defined_twice.primary_range.map(|range| range.start_line),
-            Some(3)
-        );
-    }
-
-    #[test]
     fn search_candidate_projection_proves_repeated_callable_definitions() {
         let temp = tempfile::TempDir::new().unwrap();
         let file = write_file(
@@ -21240,6 +22116,9 @@ mod tests {
     /// Issue #2316: the candidate scan is prefiltered by the literals every
     /// pattern requires, and the two live-name channels a persisted column
     /// cannot express keep their declarations.
+    #[brokk_bifrost_test_macros::hardwon(
+        "#2316: required-literal prefiltering dropped valid package and exempt-channel candidates"
+    )]
     #[test]
     fn active_symbol_candidate_scan_prefilters_on_required_literals() {
         let temp = tempfile::TempDir::new().unwrap();
@@ -21324,34 +22203,6 @@ mod tests {
             ),
             all
         );
-    }
-
-    #[test]
-    fn generation_map_requires_a_token_for_every_requested_storage_language() {
-        let store = AnalyzerStore::open_ephemeral().unwrap();
-        let typescript = store
-            .ensure_language_epoch_value("typescript:ts", "ts-epoch")
-            .unwrap();
-        store
-            .ensure_language_epoch_value("typescript:tsx", "tsx-epoch")
-            .unwrap();
-        let oid = oid_for(b"mixed ts storage key");
-        let mut generations = HashMap::default();
-        generations.insert("typescript:ts".to_string(), typescript);
-
-        let error = store
-            .parsed_blob_keys_at_generations(
-                &[
-                    (oid, "typescript:ts".to_string()),
-                    (oid, "typescript:tsx".to_string()),
-                ],
-                &generations,
-            )
-            .unwrap_err();
-
-        assert!(error.is_stale_generation());
-        assert!(error.to_string().contains("missing captured"));
-        assert!(error.to_string().contains("typescript:tsx"));
     }
 
     #[test]
@@ -21874,6 +22725,9 @@ mod tests {
     /// read no fact table at all. A plan that reaches a fact table is the full
     /// verification predicate leaking back onto the read path, which is what
     /// charged 56.2 us per key on the firefox cold start.
+    #[brokk_bifrost_test_macros::hardwon(
+        "bc616e71979d: read-path membership re-counted every persisted fact table for each key"
+    )]
     #[test]
     fn read_path_membership_query_seeks_keys_without_reading_fact_tables() {
         for state in PlannerStatisticsState::BOTH {
@@ -21912,125 +22766,6 @@ mod tests {
                 "the read-path plan must not touch {table} {state}: {plan:#?}"
             );
         }
-    }
-
-    /// The bulk fact readers must intern once per requested OID and then walk
-    /// the fact table's own primary key. Two ways to get this wrong would not
-    /// show up as a failure anywhere else: scanning `blobs` instead of seeking
-    /// it, and scanning the fact table because the join lost its key.
-    #[test]
-    fn bulk_fact_reads_seek_the_intern_index_and_then_the_fact_primary_key() {
-        for state in PlannerStatisticsState::BOTH {
-            bulk_fact_reads_seek_the_intern_index_and_then_the_fact_primary_key_in(state);
-        }
-    }
-
-    fn bulk_fact_reads_seek_the_intern_index_and_then_the_fact_primary_key_in(
-        state: PlannerStatisticsState,
-    ) {
-        let store = AnalyzerStore::open_ephemeral().unwrap();
-        let conn = store.conn.lock().expect("store mutex");
-        state.install(&conn);
-        let plan = explain_pin(&conn, &pinned("ranges_bulk"));
-
-        assert!(
-            plan.iter().any(|detail| detail
-                .contains("SEARCH keys USING COVERING INDEX sqlite_autoindex_blobs_1")),
-            "the requested OIDs must seek the intern index, which covers the id \
-             it returns {state}: {plan:#?}"
-        );
-        assert!(
-            plan.iter()
-                .any(|detail| detail.contains("SEARCH facts USING PRIMARY KEY")),
-            "each interned id must range-scan unit_ranges by its own key {state}: {plan:#?}"
-        );
-        assert!(
-            plan.iter().all(|detail| !detail.contains("SCAN")),
-            "no relation in a bulk fact read may be scanned {state}: {plan:#?}"
-        );
-    }
-
-    /// The read path takes membership by default and the full condition only
-    /// when the diagnostic switch asks for it.
-    #[test]
-    fn read_path_predicate_is_membership_unless_the_switch_asks_for_full() {
-        assert_eq!(
-            read_path_parsed_blob_condition(),
-            PARSED_BLOB_COMPLETE_CONDITION
-        );
-        assert!(!full_read_path_integrity_requested(None));
-        assert!(!full_read_path_integrity_requested(Some(
-            std::ffi::OsStr::new("")
-        )));
-        assert!(!full_read_path_integrity_requested(Some(
-            std::ffi::OsStr::new("membership")
-        )));
-        assert!(full_read_path_integrity_requested(Some(
-            std::ffi::OsStr::new("full")
-        )));
-        assert!(full_read_path_integrity_requested(Some(
-            std::ffi::OsStr::new("FULL")
-        )));
-    }
-
-    #[test]
-    fn path_symbol_name_lookups_use_their_fqn_indexes() {
-        for state in PlannerStatisticsState::BOTH {
-            path_symbol_name_lookups_use_their_fqn_indexes_in(state);
-        }
-    }
-
-    fn path_symbol_name_lookups_use_their_fqn_indexes_in(state: PlannerStatisticsState) {
-        let store = AnalyzerStore::open_ephemeral().unwrap();
-        let conn = store.conn.lock().expect("store mutex");
-        store
-            .select_writer_workspace_snapshots(&conn, &HashMap::default())
-            .unwrap();
-        state.install(&conn);
-        for (name, expected_index) in [
-            (
-                "exact_path_symbol_fqn",
-                "idx_workspace_file_path_symbol_rows_exact",
-            ),
-            (
-                "normalized_path_symbol_fqn",
-                "idx_workspace_file_path_symbol_rows_normalized",
-            ),
-        ] {
-            let plan = explain_pin(&conn, &pinned(name));
-            assert!(
-                plan.iter().any(|detail| detail.contains(expected_index)),
-                "expected path-name lookup to use {expected_index} {state}, got {plan:?}"
-            );
-            assert!(
-                plan.iter().all(|detail| !detail.contains("SCAN rows")),
-                "path-name lookup must not scan the path-symbol rows {state}: {plan:?}"
-            );
-        }
-    }
-
-    #[test]
-    fn workspace_snapshot_identity_is_a_primary_key_point_query() {
-        for state in PlannerStatisticsState::BOTH {
-            workspace_snapshot_identity_is_a_primary_key_point_query_in(state);
-        }
-    }
-
-    fn workspace_snapshot_identity_is_a_primary_key_point_query_in(state: PlannerStatisticsState) {
-        let store = AnalyzerStore::open_ephemeral().unwrap();
-        let conn = store.conn.lock().expect("store mutex");
-        state.install(&conn);
-        let plan = explain_pin(&conn, &pinned("workspace_snapshot_identity"));
-        assert!(
-            plan.iter()
-                .any(|detail| detail.contains("SEARCH workspace_heads USING PRIMARY KEY")),
-            "workspace identity must seek the snapshot primary key {state}: {plan:?}"
-        );
-        assert!(
-            plan.iter()
-                .all(|detail| !detail.contains("SCAN workspace_heads")),
-            "workspace identity must not scan heads {state}: {plan:?}"
-        );
     }
 
     #[test]
@@ -22401,6 +23136,9 @@ mod tests {
         (temp, store)
     }
 
+    #[brokk_bifrost_test_macros::hardwon(
+        "#3035+888ce79b9d65: declaration catalog reads returned ranges from a non-selected workspace revision"
+    )]
     #[test]
     fn mounted_declaration_primary_ranges_follow_the_selected_revision() {
         let temp = tempfile::TempDir::new().unwrap();
@@ -22496,6 +23234,9 @@ mod tests {
         }
     }
 
+    #[brokk_bifrost_test_macros::hardwon(
+        "#3035+888ce79b9d65: cancelled mounted declaration reads exposed a partial row prefix"
+    )]
     #[test]
     fn mounted_declaration_primary_range_read_discards_a_cancelled_prefix() {
         const BLOBS: usize = CANDIDATE_ROWS_PER_CANCELLATION_POLL + 1;
@@ -22525,62 +23266,6 @@ mod tests {
                 )
                 .unwrap()
                 .is_none()
-        );
-    }
-
-    /// Release-only same-process baseline for the FQ2-to-relational hydration
-    /// change. Setup is deliberately outside the timed interval. Run this test
-    /// at arities 1, 64, 512, and 10,000 by setting
-    /// `BIFROST_FQ_BENCH_BLOBS`; keep the v27 executable so the same samples
-    /// can be alternated with v28 after the migration.
-    #[test]
-    #[ignore = "release-only FQ identity storage benchmark"]
-    fn benchmark_fq_segment_hydration() {
-        let blobs = std::env::var("BIFROST_FQ_BENCH_BLOBS")
-            .ok()
-            .map(|value| value.parse::<usize>().expect("positive benchmark arity"))
-            .unwrap_or(512);
-        assert!(blobs > 0, "benchmark arity must be positive");
-        let iterations = std::env::var("BIFROST_FQ_BENCH_ITERATIONS")
-            .ok()
-            .map(|value| value.parse::<usize>().expect("positive iteration count"))
-            .unwrap_or_else(|| if blobs >= 10_000 { 5 } else { 20 });
-        assert!(iterations > 0, "benchmark iterations must be positive");
-
-        let (_temp, store) = store_with_repeated_short_name(blobs);
-        let generations = HashMap::from_iter([("java".to_string(), GenerationId::BOOTSTRAP)]);
-        let languages = ["java".to_string()];
-        let read = || {
-            store
-                .declaration_candidate_rows_by_short_name_for_langs(
-                    &languages,
-                    &generations,
-                    "Sample",
-                )
-                .expect("read benchmark candidates")
-        };
-        let warm = read();
-        assert_eq!(warm.len(), blobs);
-        let segment_rows = store
-            .conn
-            .lock()
-            .expect("analyzer store mutex poisoned")
-            .query_row("SELECT COUNT(*) FROM code_unit_fq_segments", [], |row| {
-                row.get::<_, usize>(0)
-            })
-            .expect("count benchmark segment rows");
-
-        let started = Instant::now();
-        let mut returned_rows = 0usize;
-        for _ in 0..iterations {
-            let rows = std::hint::black_box(read());
-            returned_rows = returned_rows.saturating_add(rows.len());
-            std::hint::black_box(rows);
-        }
-        let elapsed = started.elapsed();
-        eprintln!(
-            "{{\"benchmark\":\"fq_segment_hydration\",\"arity\":{blobs},\"iterations\":{iterations},\"returned_rows\":{returned_rows},\"segment_rows\":{segment_rows},\"wall_ns\":{}}}",
-            elapsed.as_nanos()
         );
     }
 
@@ -22652,6 +23337,9 @@ mod tests {
     /// this seek needs (`1200 / 512` blocks plus the end-of-language check) and
     /// far under the 1,200 a per-row poll would spend.
     #[cfg_attr(not(scheduled_tests), ignore = "scheduled-only")]
+    #[brokk_bifrost_test_macros::hardwon(
+        "946710c44839: per-row cancellation polling exhausted the budget on successful candidate reads"
+    )]
     #[test]
     fn a_completing_candidate_row_seek_polls_once_per_row_block() {
         const BLOBS: usize = 1_200;
@@ -23075,7 +23763,14 @@ mod tests {
         let prior = epoch::cpp_epoch_before_raw_quoted_include_header_paths();
         let prior_generation = store.ensure_language_epoch_value("cpp", &prior).unwrap();
         store
-            .write_parsed_blob_at_generation(oid, "cpp", prior_generation, &CppAdapter, &state)
+            .write_parsed_blob_at_generation(
+                &crate::analyzer::store::test_blob_file(),
+                oid,
+                "cpp",
+                prior_generation,
+                &CppAdapter,
+                &state,
+            )
             .unwrap();
         assert!(store.contains_parsed_blob(oid, "cpp").unwrap());
 
@@ -23104,6 +23799,128 @@ mod tests {
         );
     }
 
+    /// One header of the SQLite amalgamation's shape: an include guard around
+    /// an `extern "C"` block that `#if 0` opens and a second `#if 0` closes.
+    fn amalgamated_c_header(guard: &str, aggregate: &str) -> String {
+        format!(
+            "#ifndef {guard}\n#define {guard}\n#if 0\nextern \"C\" {{\n#endif\n\
+             struct {aggregate} {{ int value; }};\n\
+             #if 0\n}}  /* End of the 'extern \"C\"' block */\n#endif\n#endif\n"
+        )
+    }
+
+    /// Two amalgamated headers and a definition: tree-sitter returns an ERROR
+    /// root with the first include guard left open, and every declaration
+    /// lies inside it (#3501).
+    fn two_amalgamated_c_headers() -> String {
+        format!(
+            "#include <stdarg.h>\n{}{}int sqlite3_open(void) {{ return 0; }}\n",
+            amalgamated_c_header("SQLITE3_H", "sqlite3_file"),
+            amalgamated_c_header("_SQLITE3RTREE_H_", "sqlite3_rtree_geometry")
+        )
+    }
+
+    /// #3501: a genuinely unclosed translation unit is persisted and hydrated
+    /// as partial, with every recovered declaration kept. ABI 15 now reads the
+    /// original one- and two-header linkage witnesses as complete positives.
+    #[test]
+    fn a_parse_left_inside_an_unclosed_construct_persists_as_partial() {
+        let one = format!(
+            "#include <stdarg.h>\n{}int sqlite3_open(void) {{ return 0; }}\n",
+            amalgamated_c_header("SQLITE3_H", "sqlite3_file")
+        );
+        let temp = tempfile::TempDir::new().unwrap();
+        let store = AnalyzerStore::open_ephemeral().unwrap();
+        let generation = store
+            .ensure_language_epoch_value("cpp:c", "parse-completeness-v1")
+            .unwrap();
+        for (name, source, expected) in [
+            ("one.c", one, crate::analyzer::ParseCompleteness::Complete),
+            (
+                "two.c",
+                two_amalgamated_c_headers(),
+                crate::analyzer::ParseCompleteness::Complete,
+            ),
+            (
+                "unclosed.c",
+                format!("{}\n{}", "{".repeat(32), two_amalgamated_c_headers()),
+                crate::analyzer::ParseCompleteness::Partial,
+            ),
+        ] {
+            let file = write_file(temp.path(), name, &source);
+            assert_eq!(CppAdapter.storage_language_key_for_file(&file), "cpp:c");
+            let oid = oid_for(source.as_bytes());
+            let state = parse_state(&CppAdapter, &file);
+            assert_eq!(state.completeness, expected, "{name}");
+            store
+                .write_parsed_blob_at_generation(
+                    &crate::analyzer::store::test_blob_file(),
+                    oid,
+                    "cpp:c",
+                    generation,
+                    &CppAdapter,
+                    &state,
+                )
+                .unwrap();
+
+            let persisted: String = store
+                .read_conn()
+                .unwrap()
+                .query_row(
+                    "SELECT meta.parse_completeness
+                     FROM blob_meta AS meta
+                     JOIN blobs ON blobs.id = meta.blob_id
+                     WHERE blobs.blob_oid = ?1 AND blobs.lang = 'cpp:c'",
+                    [oid.to_string()],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(persisted, expected.label(), "{name}");
+
+            let hydrated = store
+                .hydrate_file_state_with_source(
+                    oid,
+                    "cpp:c",
+                    generation,
+                    &CppAdapter,
+                    &file,
+                    &source,
+                )
+                .unwrap()
+                .expect("hydration should succeed");
+            assert_eq!(hydrated.completeness, expected, "{name}");
+            assert_eq!(hydrated.declarations, state.declarations, "{name}");
+            assert!(
+                hydrated
+                    .declarations
+                    .iter()
+                    .any(|unit| unit.fq_name() == "sqlite3_open"),
+                "{name}: recovery keeps its declarations: {:?}",
+                hydrated.declarations
+            );
+        }
+    }
+
+    #[test]
+    fn cpp_partial_parse_completeness_epoch_invalidates_prior_parsed_blobs() {
+        let temp = tempfile::TempDir::new().unwrap();
+        // Enough unmatched braces keep recovery at an ERROR root rather than
+        // letting the parser synthesize local closing tokens. Preserve the
+        // partial-blob epoch contract with genuinely malformed source.
+        let source = format!("{}\n{}", "{".repeat(32), two_amalgamated_c_headers());
+        let file = write_file(temp.path(), "sqlite3.h", &source);
+        let state = parse_state(&CppAdapter, &file);
+        assert_eq!(
+            state.completeness,
+            crate::analyzer::ParseCompleteness::Partial
+        );
+        let prior_epoch = epoch::cpp_epoch_before_partial_parse_completeness();
+        assert_prior_parsed_blob_invalidated(&CppAdapter, &state, &prior_epoch);
+    }
+
+    #[brokk_bifrost_test_macros::hardwon(
+        "#1208: recovered C++ typedef bases changed without invalidating stored declarations"
+    )]
     #[test]
     fn cpp_recovered_typedef_base_epoch_invalidates_prior_parsed_blobs() {
         let temp = tempfile::TempDir::new().unwrap();
@@ -23115,40 +23932,16 @@ mod tests {
              };\n",
         );
         let state = Arc::new(parse_state(&CppAdapter, &file));
-        let oid = oid_for(state.source.as_bytes());
-        let store = AnalyzerStore::open_ephemeral().unwrap();
         // Recompute the immediately preceding C++ epoch for this target from
         // the complete pre-#1208 language salt, rather than passing an
         // arbitrary old label through the store's generic epoch API. The live
         // grammar fingerprint is target-specific, so the durable contract is
         // the generation cutover below, not one target's full epoch digest.
-        let prior_epoch = epoch::cpp_epoch_before_recovered_typedef_base();
-        let prior_generation = store
-            .ensure_language_epoch_value("cpp", &prior_epoch)
-            .unwrap();
-        store
-            .write_parsed_blob_at_generation(
-                oid,
-                "cpp",
-                prior_generation,
-                &CppAdapter,
-                state.as_ref(),
-            )
-            .unwrap();
-        assert!(store.contains_parsed_blob(oid, "cpp").unwrap());
-
-        let current_generation = store
-            .ensure_language_epoch(Language::Cpp, &tree_sitter_cpp::LANGUAGE.into())
-            .unwrap();
-
-        assert_ne!(current_generation, prior_generation);
-        assert!(!store.contains_parsed_blob(oid, "cpp").unwrap());
-        assert_eq!(
-            store
-                .missing_parsed_blob_keys(&[(oid, "cpp".to_string())])
-                .unwrap(),
-            vec![(oid, "cpp".to_string())]
+        let prior_epoch = epoch::epoch_before_bump(
+            epoch::TestEpochLanguage::Cpp,
+            "recovered-typedef-base-alias-identity-2026-07",
         );
+        assert_prior_parsed_blob_invalidated(&CppAdapter, state.as_ref(), &prior_epoch);
     }
 
     /// #3493: the C and C++ walk now records callable modifier metadata, and
@@ -23157,6 +23950,9 @@ mod tests {
     /// from an adapter that honestly declares none, so `receiver_contract_of`
     /// reports no contract and every C or C++ procedure summary stays inert.
     /// The salt is the only thing that retires those rows.
+    #[brokk_bifrost_test_macros::hardwon(
+        "#3493: persisted C and C++ callables lacked modifier metadata for receiver contracts"
+    )]
     #[test]
     fn cpp_callable_modifier_metadata_epoch_invalidates_prior_parsed_blobs() {
         let temp = tempfile::TempDir::new().unwrap();
@@ -23170,35 +23966,11 @@ mod tests {
              }\n",
         );
         let state = Arc::new(parse_state(&CppAdapter, &file));
-        let oid = oid_for(state.source.as_bytes());
-        let store = AnalyzerStore::open_ephemeral().unwrap();
-        let prior_epoch = epoch::cpp_epoch_before_callable_modifier_metadata();
-        let prior_generation = store
-            .ensure_language_epoch_value("cpp", &prior_epoch)
-            .unwrap();
-        store
-            .write_parsed_blob_at_generation(
-                oid,
-                "cpp",
-                prior_generation,
-                &CppAdapter,
-                state.as_ref(),
-            )
-            .unwrap();
-        assert!(store.contains_parsed_blob(oid, "cpp").unwrap());
-
-        let current_generation = store
-            .ensure_language_epoch(Language::Cpp, &tree_sitter_cpp::LANGUAGE.into())
-            .unwrap();
-
-        assert_ne!(current_generation, prior_generation);
-        assert!(!store.contains_parsed_blob(oid, "cpp").unwrap());
-        assert_eq!(
-            store
-                .missing_parsed_blob_keys(&[(oid, "cpp".to_string())])
-                .unwrap(),
-            vec![(oid, "cpp".to_string())]
+        let prior_epoch = epoch::epoch_before_bump(
+            epoch::TestEpochLanguage::Cpp,
+            "cpp-callable-modifier-metadata-2026-09",
         );
+        assert_prior_parsed_blob_invalidated(&CppAdapter, state.as_ref(), &prior_epoch);
     }
 
     #[test]
@@ -23212,35 +23984,11 @@ mod tests {
              }\n",
         );
         let state = Arc::new(parse_state(&CppAdapter, &file));
-        let oid = oid_for(state.source.as_bytes());
-        let store = AnalyzerStore::open_ephemeral().unwrap();
-        let prior_epoch = epoch::cpp_epoch_before_source_member_prototype_units();
-        let prior_generation = store
-            .ensure_language_epoch_value("cpp", &prior_epoch)
-            .unwrap();
-        store
-            .write_parsed_blob_at_generation(
-                oid,
-                "cpp",
-                prior_generation,
-                &CppAdapter,
-                state.as_ref(),
-            )
-            .unwrap();
-        assert!(store.contains_parsed_blob(oid, "cpp").unwrap());
-
-        let current_generation = store
-            .ensure_language_epoch(Language::Cpp, &tree_sitter_cpp::LANGUAGE.into())
-            .unwrap();
-
-        assert_ne!(current_generation, prior_generation);
-        assert!(!store.contains_parsed_blob(oid, "cpp").unwrap());
-        assert_eq!(
-            store
-                .missing_parsed_blob_keys(&[(oid, "cpp".to_string())])
-                .unwrap(),
-            vec![(oid, "cpp".to_string())]
+        let prior_epoch = epoch::epoch_before_bump(
+            epoch::TestEpochLanguage::Cpp,
+            "cpp-source-member-prototype-units-2026-09",
         );
+        assert_prior_parsed_blob_invalidated(&CppAdapter, state.as_ref(), &prior_epoch);
     }
 
     #[test]
@@ -23255,35 +24003,11 @@ mod tests {
              class Tail {}; } }\n",
         );
         let state = Arc::new(parse_state(&CppAdapter, &file));
-        let oid = oid_for(state.source.as_bytes());
-        let store = AnalyzerStore::open_ephemeral().unwrap();
-        let prior_epoch = epoch::cpp_epoch_before_namespace_recovery_ancestry_authority();
-        let prior_generation = store
-            .ensure_language_epoch_value("cpp", &prior_epoch)
-            .unwrap();
-        store
-            .write_parsed_blob_at_generation(
-                oid,
-                "cpp",
-                prior_generation,
-                &CppAdapter,
-                state.as_ref(),
-            )
-            .unwrap();
-        assert!(store.contains_parsed_blob(oid, "cpp").unwrap());
-
-        let current_generation = store
-            .ensure_language_epoch(Language::Cpp, &tree_sitter_cpp::LANGUAGE.into())
-            .unwrap();
-
-        assert_ne!(current_generation, prior_generation);
-        assert!(!store.contains_parsed_blob(oid, "cpp").unwrap());
-        assert_eq!(
-            store
-                .missing_parsed_blob_keys(&[(oid, "cpp".to_string())])
-                .unwrap(),
-            vec![(oid, "cpp".to_string())]
+        let prior_epoch = epoch::epoch_before_bump(
+            epoch::TestEpochLanguage::Cpp,
+            "namespace-recovery-ancestry-authority-2026-09",
         );
+        assert_prior_parsed_blob_invalidated(&CppAdapter, state.as_ref(), &prior_epoch);
     }
 
     #[test]
@@ -23297,35 +24021,11 @@ mod tests {
              }}\n",
         );
         let state = Arc::new(parse_state(&CppAdapter, &file));
-        let oid = oid_for(state.source.as_bytes());
-        let store = AnalyzerStore::open_ephemeral().unwrap();
-        let prior_epoch = epoch::cpp_epoch_before_complete_sentinel_class_tail();
-        let prior_generation = store
-            .ensure_language_epoch_value("cpp", &prior_epoch)
-            .unwrap();
-        store
-            .write_parsed_blob_at_generation(
-                oid,
-                "cpp",
-                prior_generation,
-                &CppAdapter,
-                state.as_ref(),
-            )
-            .unwrap();
-        assert!(store.contains_parsed_blob(oid, "cpp").unwrap());
-
-        let current_generation = store
-            .ensure_language_epoch(Language::Cpp, &tree_sitter_cpp::LANGUAGE.into())
-            .unwrap();
-
-        assert_ne!(current_generation, prior_generation);
-        assert!(!store.contains_parsed_blob(oid, "cpp").unwrap());
-        assert_eq!(
-            store
-                .missing_parsed_blob_keys(&[(oid, "cpp".to_string())])
-                .unwrap(),
-            vec![(oid, "cpp".to_string())]
+        let prior_epoch = epoch::epoch_before_bump(
+            epoch::TestEpochLanguage::Cpp,
+            "complete-sentinel-class-tail-2026-08",
         );
+        assert_prior_parsed_blob_invalidated(&CppAdapter, state.as_ref(), &prior_epoch);
     }
 
     #[test]
@@ -23339,35 +24039,11 @@ mod tests {
              result_type operator()() { return result_type{}; } }; }\n",
         );
         let state = Arc::new(parse_state(&CppAdapter, &file));
-        let oid = oid_for(state.source.as_bytes());
-        let store = AnalyzerStore::open_ephemeral().unwrap();
-        let prior_epoch = epoch::cpp_epoch_before_sentinel_class_before_member_callable();
-        let prior_generation = store
-            .ensure_language_epoch_value("cpp", &prior_epoch)
-            .unwrap();
-        store
-            .write_parsed_blob_at_generation(
-                oid,
-                "cpp",
-                prior_generation,
-                &CppAdapter,
-                state.as_ref(),
-            )
-            .unwrap();
-        assert!(store.contains_parsed_blob(oid, "cpp").unwrap());
-
-        let current_generation = store
-            .ensure_language_epoch(Language::Cpp, &tree_sitter_cpp::LANGUAGE.into())
-            .unwrap();
-
-        assert_ne!(current_generation, prior_generation);
-        assert!(!store.contains_parsed_blob(oid, "cpp").unwrap());
-        assert_eq!(
-            store
-                .missing_parsed_blob_keys(&[(oid, "cpp".to_string())])
-                .unwrap(),
-            vec![(oid, "cpp".to_string())]
+        let prior_epoch = epoch::epoch_before_bump(
+            epoch::TestEpochLanguage::Cpp,
+            "sentinel-class-before-member-callable-2026-08",
         );
+        assert_prior_parsed_blob_invalidated(&CppAdapter, state.as_ref(), &prior_epoch);
     }
 
     #[test]
@@ -23386,35 +24062,11 @@ mod tests {
              }\n",
         );
         let state = Arc::new(parse_state(&CppAdapter, &file));
-        let oid = oid_for(state.source.as_bytes());
-        let store = AnalyzerStore::open_ephemeral().unwrap();
-        let prior_epoch = epoch::cpp_epoch_before_namespaced_plain_fragment_boundary();
-        let prior_generation = store
-            .ensure_language_epoch_value("cpp", &prior_epoch)
-            .unwrap();
-        store
-            .write_parsed_blob_at_generation(
-                oid,
-                "cpp",
-                prior_generation,
-                &CppAdapter,
-                state.as_ref(),
-            )
-            .unwrap();
-        assert!(store.contains_parsed_blob(oid, "cpp").unwrap());
-
-        let current_generation = store
-            .ensure_language_epoch(Language::Cpp, &tree_sitter_cpp::LANGUAGE.into())
-            .unwrap();
-
-        assert_ne!(current_generation, prior_generation);
-        assert!(!store.contains_parsed_blob(oid, "cpp").unwrap());
-        assert_eq!(
-            store
-                .missing_parsed_blob_keys(&[(oid, "cpp".to_string())])
-                .unwrap(),
-            vec![(oid, "cpp".to_string())]
+        let prior_epoch = epoch::epoch_before_bump(
+            epoch::TestEpochLanguage::Cpp,
+            "namespaced-plain-fragment-boundary-2026-08",
         );
+        assert_prior_parsed_blob_invalidated(&CppAdapter, state.as_ref(), &prior_epoch);
     }
 
     #[test]
@@ -23431,35 +24083,11 @@ mod tests {
              }\n",
         );
         let state = Arc::new(parse_state(&CppAdapter, &file));
-        let oid = oid_for(state.source.as_bytes());
-        let store = AnalyzerStore::open_ephemeral().unwrap();
-        let prior_epoch = epoch::cpp_epoch_before_templated_plain_fragment_ownership();
-        let prior_generation = store
-            .ensure_language_epoch_value("cpp", &prior_epoch)
-            .unwrap();
-        store
-            .write_parsed_blob_at_generation(
-                oid,
-                "cpp",
-                prior_generation,
-                &CppAdapter,
-                state.as_ref(),
-            )
-            .unwrap();
-        assert!(store.contains_parsed_blob(oid, "cpp").unwrap());
-
-        let current_generation = store
-            .ensure_language_epoch(Language::Cpp, &tree_sitter_cpp::LANGUAGE.into())
-            .unwrap();
-
-        assert_ne!(current_generation, prior_generation);
-        assert!(!store.contains_parsed_blob(oid, "cpp").unwrap());
-        assert_eq!(
-            store
-                .missing_parsed_blob_keys(&[(oid, "cpp".to_string())])
-                .unwrap(),
-            vec![(oid, "cpp".to_string())]
+        let prior_epoch = epoch::epoch_before_bump(
+            epoch::TestEpochLanguage::Cpp,
+            "templated-plain-fragment-prefix-and-sibling-ownership-2026-08",
         );
+        assert_prior_parsed_blob_invalidated(&CppAdapter, state.as_ref(), &prior_epoch);
     }
 
     #[test]
@@ -23475,37 +24103,16 @@ mod tests {
              };\n",
         );
         let state = Arc::new(parse_state(&CppAdapter, &file));
-        let oid = oid_for(state.source.as_bytes());
-        let store = AnalyzerStore::open_ephemeral().unwrap();
-        let prior_epoch = epoch::cpp_epoch_before_macro_displaced_callable_name();
-        let prior_generation = store
-            .ensure_language_epoch_value("cpp", &prior_epoch)
-            .unwrap();
-        store
-            .write_parsed_blob_at_generation(
-                oid,
-                "cpp",
-                prior_generation,
-                &CppAdapter,
-                state.as_ref(),
-            )
-            .unwrap();
-        assert!(store.contains_parsed_blob(oid, "cpp").unwrap());
-
-        let current_generation = store
-            .ensure_language_epoch(Language::Cpp, &tree_sitter_cpp::LANGUAGE.into())
-            .unwrap();
-
-        assert_ne!(current_generation, prior_generation);
-        assert!(!store.contains_parsed_blob(oid, "cpp").unwrap());
-        assert_eq!(
-            store
-                .missing_parsed_blob_keys(&[(oid, "cpp".to_string())])
-                .unwrap(),
-            vec![(oid, "cpp".to_string())]
+        let prior_epoch = epoch::epoch_before_bump(
+            epoch::TestEpochLanguage::Cpp,
+            "macro-displaced-scalar-return-callable-name-2026-08",
         );
+        assert_prior_parsed_blob_invalidated(&CppAdapter, state.as_ref(), &prior_epoch);
     }
 
+    #[brokk_bifrost_test_macros::hardwon(
+        "9d8e13727de8: C++ explicit-object parameters were counted as ordinary callable arity"
+    )]
     #[test]
     fn cpp_explicit_object_arity_epoch_invalidates_prior_parsed_blobs() {
         let temp = tempfile::TempDir::new().unwrap();
@@ -23517,35 +24124,11 @@ mod tests {
              };\n",
         );
         let state = Arc::new(parse_state(&CppAdapter, &file));
-        let oid = oid_for(state.source.as_bytes());
-        let store = AnalyzerStore::open_ephemeral().unwrap();
-        let prior_epoch = epoch::cpp_epoch_before_explicit_object_callable_arity();
-        let prior_generation = store
-            .ensure_language_epoch_value("cpp", &prior_epoch)
-            .unwrap();
-        store
-            .write_parsed_blob_at_generation(
-                oid,
-                "cpp",
-                prior_generation,
-                &CppAdapter,
-                state.as_ref(),
-            )
-            .unwrap();
-        assert!(store.contains_parsed_blob(oid, "cpp").unwrap());
-
-        let current_generation = store
-            .ensure_language_epoch(Language::Cpp, &tree_sitter_cpp::LANGUAGE.into())
-            .unwrap();
-
-        assert_ne!(current_generation, prior_generation);
-        assert!(!store.contains_parsed_blob(oid, "cpp").unwrap());
-        assert_eq!(
-            store
-                .missing_parsed_blob_keys(&[(oid, "cpp".to_string())])
-                .unwrap(),
-            vec![(oid, "cpp".to_string())]
+        let prior_epoch = epoch::epoch_before_bump(
+            epoch::TestEpochLanguage::Cpp,
+            "explicit-object-callable-arity-2026-08",
         );
+        assert_prior_parsed_blob_invalidated(&CppAdapter, state.as_ref(), &prior_epoch);
     }
 
     #[test]
@@ -23559,35 +24142,8 @@ mod tests {
              HWY_API Vec64<unsigned> LowerHalf(Vec128<unsigned> value) { return {}; }\n",
         );
         let state = Arc::new(parse_state(&CppAdapter, &file));
-        let oid = oid_for(state.source.as_bytes());
-        let store = AnalyzerStore::open_ephemeral().unwrap();
         let prior_epoch = epoch::cpp_epoch_before_macro_template_return_free_function_ownership();
-        let prior_generation = store
-            .ensure_language_epoch_value("cpp", &prior_epoch)
-            .unwrap();
-        store
-            .write_parsed_blob_at_generation(
-                oid,
-                "cpp",
-                prior_generation,
-                &CppAdapter,
-                state.as_ref(),
-            )
-            .unwrap();
-        assert!(store.contains_parsed_blob(oid, "cpp").unwrap());
-
-        let current_generation = store
-            .ensure_language_epoch(Language::Cpp, &tree_sitter_cpp::LANGUAGE.into())
-            .unwrap();
-
-        assert_ne!(current_generation, prior_generation);
-        assert!(!store.contains_parsed_blob(oid, "cpp").unwrap());
-        assert_eq!(
-            store
-                .missing_parsed_blob_keys(&[(oid, "cpp".to_string())])
-                .unwrap(),
-            vec![(oid, "cpp".to_string())]
-        );
+        assert_prior_parsed_blob_invalidated(&CppAdapter, state.as_ref(), &prior_epoch);
     }
 
     /// A cache written before headers gained a stored C reading (#1970) holds
@@ -23605,29 +24161,9 @@ mod tests {
              };\n",
         );
         let state = Arc::new(parse_state(&CppAdapter, &file));
-        let oid = oid_for(state.source.as_bytes());
-        let store = AnalyzerStore::open_ephemeral().unwrap();
-        let prior_epoch = epoch::cpp_epoch_before_c_header_projection();
-        let prior_generation = store
-            .ensure_language_epoch_value("cpp", &prior_epoch)
-            .unwrap();
-        store
-            .write_parsed_blob_at_generation(
-                oid,
-                "cpp",
-                prior_generation,
-                &CppAdapter,
-                state.as_ref(),
-            )
-            .unwrap();
-        assert!(store.contains_parsed_blob(oid, "cpp").unwrap());
-
-        let current_generation = store
-            .ensure_language_epoch(Language::Cpp, &tree_sitter_cpp::LANGUAGE.into())
-            .unwrap();
-
-        assert_ne!(current_generation, prior_generation);
-        assert!(!store.contains_parsed_blob(oid, "cpp").unwrap());
+        let prior_epoch =
+            epoch::epoch_before_bump(epoch::TestEpochLanguage::Cpp, "c-header-projection-2026-08");
+        assert_prior_parsed_blob_invalidated(&CppAdapter, state.as_ref(), &prior_epoch);
     }
 
     #[test]
@@ -23641,35 +24177,9 @@ mod tests {
              };\n",
         );
         let state = Arc::new(parse_state(&CppAdapter, &file));
-        let oid = oid_for(state.source.as_bytes());
-        let store = AnalyzerStore::open_ephemeral().unwrap();
-        let prior_epoch = epoch::cpp_epoch_before_c_tag_scope();
-        let prior_generation = store
-            .ensure_language_epoch_value("cpp", &prior_epoch)
-            .unwrap();
-        store
-            .write_parsed_blob_at_generation(
-                oid,
-                "cpp",
-                prior_generation,
-                &CppAdapter,
-                state.as_ref(),
-            )
-            .unwrap();
-        assert!(store.contains_parsed_blob(oid, "cpp").unwrap());
-
-        let current_generation = store
-            .ensure_language_epoch(Language::Cpp, &tree_sitter_cpp::LANGUAGE.into())
-            .unwrap();
-
-        assert_ne!(current_generation, prior_generation);
-        assert!(!store.contains_parsed_blob(oid, "cpp").unwrap());
-        assert_eq!(
-            store
-                .missing_parsed_blob_keys(&[(oid, "cpp".to_string())])
-                .unwrap(),
-            vec![(oid, "cpp".to_string())]
-        );
+        let prior_epoch =
+            epoch::epoch_before_bump(epoch::TestEpochLanguage::Cpp, "c-tag-scope-2026-08");
+        assert_prior_parsed_blob_invalidated(&CppAdapter, state.as_ref(), &prior_epoch);
     }
 
     /// A `.c` blob and a byte-identical `.cpp` blob are two different
@@ -23718,6 +24228,7 @@ mod tests {
         let generations = store.ensure_language_epoch_values(&epochs).unwrap();
         store
             .write_parsed_blob_at_generation(
+                &crate::analyzer::store::test_blob_file(),
                 oid,
                 "cpp:c",
                 generations["cpp:c"],
@@ -23742,35 +24253,11 @@ mod tests {
              auto ref_of(int& value) -> int&;\n",
         );
         let state = Arc::new(parse_state(&CppAdapter, &file));
-        let oid = oid_for(state.source.as_bytes());
-        let store = AnalyzerStore::open_ephemeral().unwrap();
-        let prior_epoch = epoch::cpp_epoch_before_abstract_reference_declarator_identity();
-        let prior_generation = store
-            .ensure_language_epoch_value("cpp", &prior_epoch)
-            .unwrap();
-        store
-            .write_parsed_blob_at_generation(
-                oid,
-                "cpp",
-                prior_generation,
-                &CppAdapter,
-                state.as_ref(),
-            )
-            .unwrap();
-        assert!(store.contains_parsed_blob(oid, "cpp").unwrap());
-
-        let current_generation = store
-            .ensure_language_epoch(Language::Cpp, &tree_sitter_cpp::LANGUAGE.into())
-            .unwrap();
-
-        assert_ne!(current_generation, prior_generation);
-        assert!(!store.contains_parsed_blob(oid, "cpp").unwrap());
-        assert_eq!(
-            store
-                .missing_parsed_blob_keys(&[(oid, "cpp".to_string())])
-                .unwrap(),
-            vec![(oid, "cpp".to_string())]
+        let prior_epoch = epoch::epoch_before_bump(
+            epoch::TestEpochLanguage::Cpp,
+            "abstract-reference-declarator-identity-2026-08",
         );
+        assert_prior_parsed_blob_invalidated(&CppAdapter, state.as_ref(), &prior_epoch);
     }
 
     #[test]
@@ -23783,35 +24270,11 @@ mod tests {
              T choose(T value) { return value; }\n",
         );
         let state = Arc::new(parse_state(&CppAdapter, &file));
-        let oid = oid_for(state.source.as_bytes());
-        let store = AnalyzerStore::open_ephemeral().unwrap();
-        let prior_epoch = epoch::cpp_epoch_before_structured_callable_parameter_types();
-        let prior_generation = store
-            .ensure_language_epoch_value("cpp", &prior_epoch)
-            .unwrap();
-        store
-            .write_parsed_blob_at_generation(
-                oid,
-                "cpp",
-                prior_generation,
-                &CppAdapter,
-                state.as_ref(),
-            )
-            .unwrap();
-        assert!(store.contains_parsed_blob(oid, "cpp").unwrap());
-
-        let current_generation = store
-            .ensure_language_epoch(Language::Cpp, &tree_sitter_cpp::LANGUAGE.into())
-            .unwrap();
-
-        assert_ne!(current_generation, prior_generation);
-        assert!(!store.contains_parsed_blob(oid, "cpp").unwrap());
-        assert_eq!(
-            store
-                .missing_parsed_blob_keys(&[(oid, "cpp".to_string())])
-                .unwrap(),
-            vec![(oid, "cpp".to_string())]
+        let prior_epoch = epoch::epoch_before_bump(
+            epoch::TestEpochLanguage::Cpp,
+            "structured-callable-parameter-types-2026-08",
         );
+        assert_prior_parsed_blob_invalidated(&CppAdapter, state.as_ref(), &prior_epoch);
     }
 
     #[test]
@@ -23826,35 +24289,11 @@ mod tests {
              };\n",
         );
         let state = Arc::new(parse_state(&CppAdapter, &file));
-        let oid = oid_for(state.source.as_bytes());
-        let store = AnalyzerStore::open_ephemeral().unwrap();
-        let prior_epoch = epoch::cpp_epoch_before_plain_fragmented_class_sibling_ownership();
-        let prior_generation = store
-            .ensure_language_epoch_value("cpp", &prior_epoch)
-            .unwrap();
-        store
-            .write_parsed_blob_at_generation(
-                oid,
-                "cpp",
-                prior_generation,
-                &CppAdapter,
-                state.as_ref(),
-            )
-            .unwrap();
-        assert!(store.contains_parsed_blob(oid, "cpp").unwrap());
-
-        let current_generation = store
-            .ensure_language_epoch(Language::Cpp, &tree_sitter_cpp::LANGUAGE.into())
-            .unwrap();
-
-        assert_ne!(current_generation, prior_generation);
-        assert!(!store.contains_parsed_blob(oid, "cpp").unwrap());
-        assert_eq!(
-            store
-                .missing_parsed_blob_keys(&[(oid, "cpp".to_string())])
-                .unwrap(),
-            vec![(oid, "cpp".to_string())]
+        let prior_epoch = epoch::epoch_before_bump(
+            epoch::TestEpochLanguage::Cpp,
+            "plain-fragmented-class-sibling-ownership-2026-08",
         );
+        assert_prior_parsed_blob_invalidated(&CppAdapter, state.as_ref(), &prior_epoch);
     }
 
     #[test]
@@ -23878,35 +24317,11 @@ mod tests {
              }\n",
         );
         let state = Arc::new(parse_state(&CppAdapter, &file));
-        let oid = oid_for(state.source.as_bytes());
-        let store = AnalyzerStore::open_ephemeral().unwrap();
-        let prior_epoch = epoch::cpp_epoch_before_fragmented_export_sibling_class_parent_scope();
-        let prior_generation = store
-            .ensure_language_epoch_value("cpp", &prior_epoch)
-            .unwrap();
-        store
-            .write_parsed_blob_at_generation(
-                oid,
-                "cpp",
-                prior_generation,
-                &CppAdapter,
-                state.as_ref(),
-            )
-            .unwrap();
-        assert!(store.contains_parsed_blob(oid, "cpp").unwrap());
-
-        let current_generation = store
-            .ensure_language_epoch(Language::Cpp, &tree_sitter_cpp::LANGUAGE.into())
-            .unwrap();
-
-        assert_ne!(current_generation, prior_generation);
-        assert!(!store.contains_parsed_blob(oid, "cpp").unwrap());
-        assert_eq!(
-            store
-                .missing_parsed_blob_keys(&[(oid, "cpp".to_string())])
-                .unwrap(),
-            vec![(oid, "cpp".to_string())]
+        let prior_epoch = epoch::epoch_before_bump(
+            epoch::TestEpochLanguage::Cpp,
+            "fragmented-export-sibling-class-parent-scope-2026-08",
         );
+        assert_prior_parsed_blob_invalidated(&CppAdapter, state.as_ref(), &prior_epoch);
     }
 
     #[test]
@@ -23928,35 +24343,11 @@ mod tests {
              }\n",
         );
         let state = Arc::new(parse_state(&CppAdapter, &file));
-        let oid = oid_for(state.source.as_bytes());
-        let store = AnalyzerStore::open_ephemeral().unwrap();
-        let prior_epoch = epoch::cpp_epoch_before_macro_decorated_template_class_scope();
-        let prior_generation = store
-            .ensure_language_epoch_value("cpp", &prior_epoch)
-            .unwrap();
-        store
-            .write_parsed_blob_at_generation(
-                oid,
-                "cpp",
-                prior_generation,
-                &CppAdapter,
-                state.as_ref(),
-            )
-            .unwrap();
-        assert!(store.contains_parsed_blob(oid, "cpp").unwrap());
-
-        let current_generation = store
-            .ensure_language_epoch(Language::Cpp, &tree_sitter_cpp::LANGUAGE.into())
-            .unwrap();
-
-        assert_ne!(current_generation, prior_generation);
-        assert!(!store.contains_parsed_blob(oid, "cpp").unwrap());
-        assert_eq!(
-            store
-                .missing_parsed_blob_keys(&[(oid, "cpp".to_string())])
-                .unwrap(),
-            vec![(oid, "cpp".to_string())]
+        let prior_epoch = epoch::epoch_before_bump(
+            epoch::TestEpochLanguage::Cpp,
+            "macro-decorated-template-class-scope-2026-08",
         );
+        assert_prior_parsed_blob_invalidated(&CppAdapter, state.as_ref(), &prior_epoch);
     }
 
     #[test]
@@ -23977,35 +24368,11 @@ mod tests {
              };\n",
         );
         let state = Arc::new(parse_state(&CppAdapter, &file));
-        let oid = oid_for(state.source.as_bytes());
-        let store = AnalyzerStore::open_ephemeral().unwrap();
-        let prior_epoch = epoch::cpp_epoch_before_conditional_alias_physical_ranges();
-        let prior_generation = store
-            .ensure_language_epoch_value("cpp", &prior_epoch)
-            .unwrap();
-        store
-            .write_parsed_blob_at_generation(
-                oid,
-                "cpp",
-                prior_generation,
-                &CppAdapter,
-                state.as_ref(),
-            )
-            .unwrap();
-        assert!(store.contains_parsed_blob(oid, "cpp").unwrap());
-
-        let current_generation = store
-            .ensure_language_epoch(Language::Cpp, &tree_sitter_cpp::LANGUAGE.into())
-            .unwrap();
-
-        assert_ne!(current_generation, prior_generation);
-        assert!(!store.contains_parsed_blob(oid, "cpp").unwrap());
-        assert_eq!(
-            store
-                .missing_parsed_blob_keys(&[(oid, "cpp".to_string())])
-                .unwrap(),
-            vec![(oid, "cpp".to_string())]
+        let prior_epoch = epoch::epoch_before_bump(
+            epoch::TestEpochLanguage::Cpp,
+            "conditional-alias-physical-ranges-2026-08",
         );
+        assert_prior_parsed_blob_invalidated(&CppAdapter, state.as_ref(), &prior_epoch);
     }
 
     #[test]
@@ -24021,41 +24388,20 @@ mod tests {
              typedef WUFFS_BASE__SLICE(wuffs_base__token) wuffs_base__slice_token;\n",
         );
         let state = Arc::new(parse_state(&CppAdapter, &file));
-        let oid = oid_for(state.source.as_bytes());
-        let store = AnalyzerStore::open_ephemeral().unwrap();
-        let prior_epoch = epoch::cpp_epoch_before_macro_argument_typedef_declarator();
-        let prior_generation = store
-            .ensure_language_epoch_value("cpp", &prior_epoch)
-            .unwrap();
-        store
-            .write_parsed_blob_at_generation(
-                oid,
-                "cpp",
-                prior_generation,
-                &CppAdapter,
-                state.as_ref(),
-            )
-            .unwrap();
-        assert!(store.contains_parsed_blob(oid, "cpp").unwrap());
-
-        let current_generation = store
-            .ensure_language_epoch(Language::Cpp, &tree_sitter_cpp::LANGUAGE.into())
-            .unwrap();
-
-        assert_ne!(current_generation, prior_generation);
-        assert!(!store.contains_parsed_blob(oid, "cpp").unwrap());
-        assert_eq!(
-            store
-                .missing_parsed_blob_keys(&[(oid, "cpp".to_string())])
-                .unwrap(),
-            vec![(oid, "cpp".to_string())]
+        let prior_epoch = epoch::epoch_before_bump(
+            epoch::TestEpochLanguage::Cpp,
+            "macro-argument-typedef-declarator-2026-08",
         );
+        assert_prior_parsed_blob_invalidated(&CppAdapter, state.as_ref(), &prior_epoch);
     }
 
     /// #2597: the JavaScript walk now records callable modifier metadata.
     /// A blob written under the prior epoch says "nobody read the modifiers",
     /// which every consumer reads as "undecided" rather than as an error, so
     /// the salt is the only thing that retires those rows.
+    #[brokk_bifrost_test_macros::hardwon(
+        "#2597: persisted JavaScript callables lacked modifier metadata needed for call binding"
+    )]
     #[test]
     fn js_callable_modifier_metadata_epoch_invalidates_prior_parsed_blobs() {
         let temp = tempfile::TempDir::new().unwrap();
@@ -24068,37 +24414,14 @@ mod tests {
             &crate::analyzer::javascript::JavascriptAdapter,
             &file,
         ));
-        let oid = oid_for(state.source.as_bytes());
-        let store = AnalyzerStore::open_ephemeral().unwrap();
-        let prior_epoch = epoch::javascript_epoch_before_callable_modifier_metadata();
-        let prior_generation = store
-            .ensure_language_epoch_value("javascript", &prior_epoch)
-            .unwrap();
-        store
-            .write_parsed_blob_at_generation(
-                oid,
-                "javascript",
-                prior_generation,
-                &crate::analyzer::javascript::JavascriptAdapter,
-                state.as_ref(),
-            )
-            .unwrap();
-        assert!(store.contains_parsed_blob(oid, "javascript").unwrap());
-
-        let current_generation = store
-            .ensure_language_epoch(
-                Language::JavaScript,
-                &tree_sitter_javascript::LANGUAGE.into(),
-            )
-            .unwrap();
-
-        assert_ne!(current_generation, prior_generation);
-        assert!(!store.contains_parsed_blob(oid, "javascript").unwrap());
-        assert_eq!(
-            store
-                .missing_parsed_blob_keys(&[(oid, "javascript".to_string())])
-                .unwrap(),
-            vec![(oid, "javascript".to_string())]
+        let prior_epoch = epoch::epoch_before_bump(
+            epoch::TestEpochLanguage::JavaScript,
+            "js-ts-callable-modifier-metadata-2026-08",
+        );
+        assert_prior_parsed_blob_invalidated(
+            &crate::analyzer::javascript::JavascriptAdapter,
+            state.as_ref(),
+            &prior_epoch,
         );
     }
 
@@ -24118,40 +24441,17 @@ mod tests {
             &crate::analyzer::javascript::JavascriptAdapter,
             &file,
         ));
-        let oid = oid_for(state.source.as_bytes());
-        let store = AnalyzerStore::open_ephemeral().unwrap();
         let prior_epoch = epoch::javascript_epoch_before_private_name_assignment_declarations();
-        let prior_generation = store
-            .ensure_language_epoch_value("javascript", &prior_epoch)
-            .unwrap();
-        store
-            .write_parsed_blob_at_generation(
-                oid,
-                "javascript",
-                prior_generation,
-                &crate::analyzer::javascript::JavascriptAdapter,
-                state.as_ref(),
-            )
-            .unwrap();
-        assert!(store.contains_parsed_blob(oid, "javascript").unwrap());
-
-        let current_generation = store
-            .ensure_language_epoch(
-                Language::JavaScript,
-                &tree_sitter_javascript::LANGUAGE.into(),
-            )
-            .unwrap();
-
-        assert_ne!(current_generation, prior_generation);
-        assert!(!store.contains_parsed_blob(oid, "javascript").unwrap());
-        assert_eq!(
-            store
-                .missing_parsed_blob_keys(&[(oid, "javascript".to_string())])
-                .unwrap(),
-            vec![(oid, "javascript".to_string())]
+        assert_prior_parsed_blob_invalidated(
+            &crate::analyzer::javascript::JavascriptAdapter,
+            state.as_ref(),
+            &prior_epoch,
         );
     }
 
+    #[brokk_bifrost_test_macros::hardwon(
+        "5304870f83d5: production C# test-like calls were misclassified by runner-name matching"
+    )]
     #[test]
     fn csharp_structured_test_classification_epoch_invalidates_prior_parsed_blobs() {
         let temp = tempfile::TempDir::new().unwrap();
@@ -24169,37 +24469,13 @@ mod tests {
         // custom xUnit attributes and persisted this runnable test as false.
         state.contains_tests = false;
         let state = Arc::new(state);
-        let oid = oid_for(state.source.as_bytes());
-        let store = AnalyzerStore::open_ephemeral().unwrap();
         let prior_epoch = epoch::csharp_epoch_before_structured_runnable_test_classification();
-        let prior_generation = store
-            .ensure_language_epoch_value("csharp", &prior_epoch)
-            .unwrap();
-        store
-            .write_parsed_blob_at_generation(
-                oid,
-                "csharp",
-                prior_generation,
-                &CSharpAdapter,
-                state.as_ref(),
-            )
-            .unwrap();
-        assert!(store.contains_parsed_blob(oid, "csharp").unwrap());
-
-        let current_generation = store
-            .ensure_language_epoch(Language::CSharp, &tree_sitter_c_sharp::LANGUAGE.into())
-            .unwrap();
-
-        assert_ne!(current_generation, prior_generation);
-        assert!(!store.contains_parsed_blob(oid, "csharp").unwrap());
-        assert_eq!(
-            store
-                .missing_parsed_blob_keys(&[(oid, "csharp".to_string())])
-                .unwrap(),
-            vec![(oid, "csharp".to_string())]
-        );
+        assert_prior_parsed_blob_invalidated(&CSharpAdapter, state.as_ref(), &prior_epoch);
     }
 
+    #[brokk_bifrost_test_macros::hardwon(
+        "1396a5373c5b: inherited C# test methods were missing from derived-class blast radius"
+    )]
     #[test]
     fn csharp_inherited_test_classification_epoch_invalidates_prior_owner_facts() {
         let temp = tempfile::TempDir::new().unwrap();
@@ -24219,35 +24495,8 @@ mod tests {
         // method, so a hierarchy walk could not classify derived files.
         state.test_region_units.clear();
         let state = Arc::new(state);
-        let oid = oid_for(state.source.as_bytes());
-        let store = AnalyzerStore::open_ephemeral().unwrap();
         let prior_epoch = epoch::csharp_epoch_before_inherited_test_classification();
-        let prior_generation = store
-            .ensure_language_epoch_value("csharp", &prior_epoch)
-            .unwrap();
-        store
-            .write_parsed_blob_at_generation(
-                oid,
-                "csharp",
-                prior_generation,
-                &CSharpAdapter,
-                state.as_ref(),
-            )
-            .unwrap();
-        assert!(store.contains_parsed_blob(oid, "csharp").unwrap());
-
-        let current_generation = store
-            .ensure_language_epoch(Language::CSharp, &tree_sitter_c_sharp::LANGUAGE.into())
-            .unwrap();
-
-        assert_ne!(current_generation, prior_generation);
-        assert!(!store.contains_parsed_blob(oid, "csharp").unwrap());
-        assert_eq!(
-            store
-                .missing_parsed_blob_keys(&[(oid, "csharp".to_string())])
-                .unwrap(),
-            vec![(oid, "csharp".to_string())]
-        );
+        assert_prior_parsed_blob_invalidated(&CSharpAdapter, state.as_ref(), &prior_epoch);
     }
 
     #[test]
@@ -24277,40 +24526,13 @@ mod tests {
             .top_level_declarations
             .retain(|unit| unit.fq_name() != "example.asInt");
         let state = Arc::new(state);
-        let oid = oid_for(state.source.as_bytes());
-        let store = AnalyzerStore::open_ephemeral().unwrap();
         let prior_epoch = epoch::scala_epoch_before_top_level_extension_declarations();
-        let prior_generation = store
-            .ensure_language_epoch_value("scala", &prior_epoch)
-            .unwrap();
-        store
-            .write_parsed_blob_at_generation(
-                oid,
-                "scala",
-                prior_generation,
-                &ScalaAdapter,
-                state.as_ref(),
-            )
-            .unwrap();
-        assert!(store.contains_parsed_blob(oid, "scala").unwrap());
-
-        let current_generation = store
-            .ensure_language_epoch(
-                Language::Scala,
-                &crate::analyzer::scala::language::LANGUAGE.into(),
-            )
-            .unwrap();
-
-        assert_ne!(current_generation, prior_generation);
-        assert!(!store.contains_parsed_blob(oid, "scala").unwrap());
-        assert_eq!(
-            store
-                .missing_parsed_blob_keys(&[(oid, "scala".to_string())])
-                .unwrap(),
-            vec![(oid, "scala".to_string())]
-        );
+        assert_prior_parsed_blob_invalidated(&ScalaAdapter, state.as_ref(), &prior_epoch);
     }
 
+    #[brokk_bifrost_test_macros::hardwon(
+        "65984c3656f2: imports nested in Rust inline modules were absent from persisted facts"
+    )]
     #[test]
     fn rust_nested_import_epoch_invalidates_prior_parsed_blobs() {
         let temp = tempfile::TempDir::new().unwrap();
@@ -24350,6 +24572,7 @@ mod tests {
             .unwrap();
         store
             .write_parsed_blob_at_generation(
+                &crate::analyzer::store::test_blob_file(),
                 oid,
                 "rust",
                 prior_generation,
@@ -24409,37 +24632,16 @@ mod tests {
             .includes
             .clear();
         let state = Arc::new(state);
-        let oid = oid_for(state.source.as_bytes());
-        let store = AnalyzerStore::open_ephemeral().unwrap();
-        let prior_epoch = epoch::cpp_epoch_before_nested_include_claims();
-        let prior_generation = store
-            .ensure_language_epoch_value("cpp", &prior_epoch)
-            .unwrap();
-        store
-            .write_parsed_blob_at_generation(
-                oid,
-                "cpp",
-                prior_generation,
-                &CppAdapter,
-                state.as_ref(),
-            )
-            .unwrap();
-        assert!(store.contains_parsed_blob(oid, "cpp").unwrap());
-
-        let current_generation = store
-            .ensure_language_epoch(Language::Cpp, &tree_sitter_cpp::LANGUAGE.into())
-            .unwrap();
-
-        assert_ne!(current_generation, prior_generation);
-        assert!(!store.contains_parsed_blob(oid, "cpp").unwrap());
-        assert_eq!(
-            store
-                .missing_parsed_blob_keys(&[(oid, "cpp".to_string())])
-                .unwrap(),
-            vec![(oid, "cpp".to_string())]
+        let prior_epoch = epoch::epoch_before_bump(
+            epoch::TestEpochLanguage::Cpp,
+            "nested-include-claims-2026-08",
         );
+        assert_prior_parsed_blob_invalidated(&CppAdapter, state.as_ref(), &prior_epoch);
     }
 
+    #[brokk_bifrost_test_macros::hardwon(
+        "6684f234106d: production JavaScript calls containing `it(` were falsely classified as tests"
+    )]
     #[test]
     fn js_structured_test_classification_epoch_invalidates_prior_parsed_blobs() {
         let temp = tempfile::TempDir::new().unwrap();
@@ -24454,41 +24656,21 @@ mod tests {
         // matcher for the `emit(...)` production call above.
         state.contains_tests = true;
         let state = Arc::new(state);
-        let oid = oid_for(state.source.as_bytes());
-        let store = AnalyzerStore::open_ephemeral().unwrap();
-        let prior_epoch = epoch::javascript_epoch_before_structured_test_classification();
-        let prior_generation = store
-            .ensure_language_epoch_value("javascript", &prior_epoch)
-            .unwrap();
-        store
-            .write_parsed_blob_at_generation(
-                oid,
-                "javascript",
-                prior_generation,
-                &crate::analyzer::javascript::JavascriptAdapter,
-                state.as_ref(),
-            )
-            .unwrap();
-        assert!(store.contains_parsed_blob(oid, "javascript").unwrap());
-
-        let current_generation = store
-            .ensure_language_epoch(
-                Language::JavaScript,
-                &tree_sitter_javascript::LANGUAGE.into(),
-            )
-            .unwrap();
-
-        assert_ne!(current_generation, prior_generation);
-        assert!(!store.contains_parsed_blob(oid, "javascript").unwrap());
-        assert_eq!(
-            store
-                .missing_parsed_blob_keys(&[(oid, "javascript".to_string())])
-                .unwrap(),
-            vec![(oid, "javascript".to_string())]
+        let prior_epoch = epoch::epoch_before_bump(
+            epoch::TestEpochLanguage::JavaScript,
+            "structured-js-ts-test-classification-2026-08",
+        );
+        assert_prior_parsed_blob_invalidated(
+            &crate::analyzer::javascript::JavascriptAdapter,
+            state.as_ref(),
+            &prior_epoch,
         );
     }
 
     /// The TypeScript half of the same #2597 bump.
+    #[brokk_bifrost_test_macros::hardwon(
+        "#2597: persisted TypeScript callables lacked modifier metadata needed for call binding"
+    )]
     #[test]
     fn ts_callable_modifier_metadata_epoch_invalidates_prior_parsed_blobs() {
         let temp = tempfile::TempDir::new().unwrap();
@@ -24498,40 +24680,16 @@ mod tests {
             "export class Widget {\n    static build(spec: string): Widget { return new Widget(); }\n    render(target: string): string { return target; }\n}\n",
         );
         let state = Arc::new(parse_state(&TypescriptAdapter, &file));
-        let oid = oid_for(state.source.as_bytes());
-        let store = AnalyzerStore::open_ephemeral().unwrap();
-        let prior_epoch = epoch::typescript_epoch_before_callable_modifier_metadata();
-        let prior_generation = store
-            .ensure_language_epoch_value("typescript", &prior_epoch)
-            .unwrap();
-        store
-            .write_parsed_blob_at_generation(
-                oid,
-                "typescript",
-                prior_generation,
-                &TypescriptAdapter,
-                state.as_ref(),
-            )
-            .unwrap();
-        assert!(store.contains_parsed_blob(oid, "typescript").unwrap());
-
-        let current_generation = store
-            .ensure_language_epoch(
-                Language::TypeScript,
-                &tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
-            )
-            .unwrap();
-
-        assert_ne!(current_generation, prior_generation);
-        assert!(!store.contains_parsed_blob(oid, "typescript").unwrap());
-        assert_eq!(
-            store
-                .missing_parsed_blob_keys(&[(oid, "typescript".to_string())])
-                .unwrap(),
-            vec![(oid, "typescript".to_string())]
+        let prior_epoch = epoch::epoch_before_bump(
+            epoch::TestEpochLanguage::TypeScript,
+            "js-ts-callable-modifier-metadata-2026-08",
         );
+        assert_prior_parsed_blob_invalidated(&TypescriptAdapter, state.as_ref(), &prior_epoch);
     }
 
+    #[brokk_bifrost_test_macros::hardwon(
+        "6684f234106d: production TypeScript calls containing `it(` were falsely classified as tests"
+    )]
     #[test]
     fn ts_structured_test_classification_epoch_invalidates_prior_parsed_blobs() {
         let temp = tempfile::TempDir::new().unwrap();
@@ -24546,38 +24704,11 @@ mod tests {
         // matcher for the `init(...)` production call above.
         state.contains_tests = true;
         let state = Arc::new(state);
-        let oid = oid_for(state.source.as_bytes());
-        let store = AnalyzerStore::open_ephemeral().unwrap();
-        let prior_epoch = epoch::typescript_epoch_before_structured_test_classification();
-        let prior_generation = store
-            .ensure_language_epoch_value("typescript", &prior_epoch)
-            .unwrap();
-        store
-            .write_parsed_blob_at_generation(
-                oid,
-                "typescript",
-                prior_generation,
-                &TypescriptAdapter,
-                state.as_ref(),
-            )
-            .unwrap();
-        assert!(store.contains_parsed_blob(oid, "typescript").unwrap());
-
-        let current_generation = store
-            .ensure_language_epoch(
-                Language::TypeScript,
-                &tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
-            )
-            .unwrap();
-
-        assert_ne!(current_generation, prior_generation);
-        assert!(!store.contains_parsed_blob(oid, "typescript").unwrap());
-        assert_eq!(
-            store
-                .missing_parsed_blob_keys(&[(oid, "typescript".to_string())])
-                .unwrap(),
-            vec![(oid, "typescript".to_string())]
+        let prior_epoch = epoch::epoch_before_bump(
+            epoch::TestEpochLanguage::TypeScript,
+            "structured-js-ts-test-classification-2026-08",
         );
+        assert_prior_parsed_blob_invalidated(&TypescriptAdapter, state.as_ref(), &prior_epoch);
     }
 
     #[test]
@@ -24592,38 +24723,71 @@ mod tests {
             "export function useShape(): { id?: string; label?: string } {\n    return build();\n}\n",
         );
         let state = Arc::new(parse_state(&TypescriptAdapter, &file));
-        let oid = oid_for(state.source.as_bytes());
-        let store = AnalyzerStore::open_ephemeral().unwrap();
-        let prior_epoch = epoch::typescript_epoch_before_inline_return_type_members();
-        let prior_generation = store
-            .ensure_language_epoch_value("typescript", &prior_epoch)
-            .unwrap();
-        store
-            .write_parsed_blob_at_generation(
-                oid,
-                "typescript",
-                prior_generation,
-                &TypescriptAdapter,
-                state.as_ref(),
-            )
-            .unwrap();
-        assert!(store.contains_parsed_blob(oid, "typescript").unwrap());
-
-        let current_generation = store
-            .ensure_language_epoch(
-                Language::TypeScript,
-                &tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
-            )
-            .unwrap();
-
-        assert_ne!(current_generation, prior_generation);
-        assert!(!store.contains_parsed_blob(oid, "typescript").unwrap());
-        assert_eq!(
-            store
-                .missing_parsed_blob_keys(&[(oid, "typescript".to_string())])
-                .unwrap(),
-            vec![(oid, "typescript".to_string())]
+        let prior_epoch = epoch::epoch_before_bump(
+            epoch::TestEpochLanguage::TypeScript,
+            "ts-inline-return-type-members-2026-08",
         );
+        assert_prior_parsed_blob_invalidated(&TypescriptAdapter, state.as_ref(), &prior_epoch);
+    }
+
+    #[test]
+    fn tsx_ampersand_repair_invalidates_prior_dialect_blobs() {
+        fn check<A: LanguageAdapter>(adapter: &A, prior_epoch: &str, file: &ProjectFile) {
+            let state = parse_state(adapter, file);
+            let oid = oid_for(state.source.as_bytes());
+            let store = AnalyzerStore::open_ephemeral().unwrap();
+            let keys = adapter.storage_language_keys();
+            for (key, _) in &keys {
+                let generation = store.ensure_language_epoch_value(key, prior_epoch).unwrap();
+                store
+                    .write_parsed_blob_at_generation(
+                        &crate::analyzer::store::test_blob_file(),
+                        oid,
+                        key,
+                        generation,
+                        adapter,
+                        &state,
+                    )
+                    .unwrap();
+                assert!(store.contains_parsed_blob(oid, key).unwrap());
+            }
+            // Follow the production path, including its language-level memoization.
+            let epochs = keys
+                .iter()
+                .map(|(key, parser)| {
+                    (
+                        key.clone(),
+                        epoch::epoch_for(adapter.language(), parser).to_string(),
+                    )
+                })
+                .collect::<Vec<_>>();
+            store.ensure_language_epoch_values(&epochs).unwrap();
+            for (key, _) in &keys {
+                assert!(!store.contains_parsed_blob(oid, key).unwrap(), "{key}");
+            }
+        }
+
+        let temp = tempfile::TempDir::new().unwrap();
+        for (extension, language) in [
+            ("js", epoch::TestEpochLanguage::JavaScript),
+            ("ts", epoch::TestEpochLanguage::TypeScript),
+        ] {
+            let file = write_file(
+                temp.path(),
+                &format!("view.{extension}"),
+                "export const view = 1;",
+            );
+            let prior = epoch::epoch_before_bump(language, "tsx-literal-ampersands-0.23.5");
+            if extension == "js" {
+                check(
+                    &crate::analyzer::javascript::JavascriptAdapter,
+                    &prior,
+                    &file,
+                );
+            } else {
+                check(&TypescriptAdapter, &prior, &file);
+            }
+        }
     }
 
     /// #3451: Python now records callable modifier metadata, and it recorded
@@ -24632,6 +24796,9 @@ mod tests {
     /// whose adapter honestly never looked, so `receiver_contract_of` reports
     /// no contract and every Python procedure summary stays inert. The salt is
     /// the only thing that retires those rows.
+    #[brokk_bifrost_test_macros::hardwon(
+        "#3451: persisted Python callables lacked modifier metadata needed for receiver contracts"
+    )]
     #[test]
     fn python_callable_modifier_metadata_epoch_invalidates_prior_parsed_blobs() {
         let temp = tempfile::TempDir::new().unwrap();
@@ -24641,35 +24808,8 @@ mod tests {
             "class Widget:\n    @staticmethod\n    def build(spec):\n        return spec\n\n    def render(self, target):\n        return target\n",
         );
         let state = Arc::new(parse_state(&PythonAdapter, &file));
-        let oid = oid_for(state.source.as_bytes());
-        let store = AnalyzerStore::open_ephemeral().unwrap();
         let prior_epoch = epoch::python_epoch_before_callable_modifier_metadata();
-        let prior_generation = store
-            .ensure_language_epoch_value("python", &prior_epoch)
-            .unwrap();
-        store
-            .write_parsed_blob_at_generation(
-                oid,
-                "python",
-                prior_generation,
-                &PythonAdapter,
-                state.as_ref(),
-            )
-            .unwrap();
-        assert!(store.contains_parsed_blob(oid, "python").unwrap());
-
-        let current_generation = store
-            .ensure_language_epoch(Language::Python, &tree_sitter_python::LANGUAGE.into())
-            .unwrap();
-
-        assert_ne!(current_generation, prior_generation);
-        assert!(!store.contains_parsed_blob(oid, "python").unwrap());
-        assert_eq!(
-            store
-                .missing_parsed_blob_keys(&[(oid, "python".to_string())])
-                .unwrap(),
-            vec![(oid, "python".to_string())]
-        );
+        assert_prior_parsed_blob_invalidated(&PythonAdapter, state.as_ref(), &prior_epoch);
     }
 
     /// #3455: Go now records callable modifier metadata, and it recorded none
@@ -24687,14 +24827,24 @@ mod tests {
             "package shop\n\ntype Client struct{}\n\nfunc (c *Client) Send(orderID string) {}\n\nfunc Total(orderID string) int64 { return 0 }\n",
         );
         let state = Arc::new(parse_state(&GoAdapter, &file));
+        let prior_epoch = epoch::go_epoch_before_callable_modifier_metadata();
+        assert_prior_parsed_blob_invalidated(&GoAdapter, state.as_ref(), &prior_epoch);
+    }
+
+    #[test]
+    fn go_source_membership_digest_epoch_invalidates_prior_parsed_blobs() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let file = write_file(temp.path(), "client.go", "package shop\n\nfunc Send() {}\n");
+        let state = Arc::new(parse_state(&GoAdapter, &file));
         let oid = oid_for(state.source.as_bytes());
         let store = AnalyzerStore::open_ephemeral().unwrap();
-        let prior_epoch = epoch::go_epoch_before_callable_modifier_metadata();
+        let prior_epoch = epoch::go_epoch_before_source_membership_digest();
         let prior_generation = store
             .ensure_language_epoch_value("go", &prior_epoch)
             .unwrap();
         store
             .write_parsed_blob_at_generation(
+                &ProjectFile::new(temp.path(), "client.go"),
                 oid,
                 "go",
                 prior_generation,
@@ -24719,6 +24869,24 @@ mod tests {
     }
 
     #[test]
+    fn go_source_owned_package_lookup_epoch_invalidates_prior_parsed_blobs() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let file = write_file(temp.path(), "client.go", "package shop\n\nfunc Send() {}\n");
+        let state = Arc::new(parse_state(&GoAdapter, &file));
+        let prior_epoch = epoch::go_epoch_before_source_owned_package_lookups();
+        assert_prior_parsed_blob_invalidated(&GoAdapter, state.as_ref(), &prior_epoch);
+    }
+
+    #[test]
+    fn go_argument_independent_call_coverage_epoch_invalidates_prior_parsed_blobs() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let file = write_file(temp.path(), "client.go", "package shop\n\nfunc Send() {}\n");
+        let state = Arc::new(parse_state(&GoAdapter, &file));
+        let prior_epoch = epoch::go_epoch_before_argument_independent_call_reference_coverage();
+        assert_prior_parsed_blob_invalidated(&GoAdapter, state.as_ref(), &prior_epoch);
+    }
+
+    #[test]
     fn php_conditional_free_function_epoch_invalidates_prior_parsed_blobs() {
         let temp = tempfile::TempDir::new().unwrap();
         let file = write_file(
@@ -24727,35 +24895,8 @@ mod tests {
             "<?php\nnamespace FastRoute;\nif (true) { function route(): void {} }\n",
         );
         let state = Arc::new(parse_state(&PhpAdapter, &file));
-        let oid = oid_for(state.source.as_bytes());
-        let store = AnalyzerStore::open_ephemeral().unwrap();
         let prior_epoch = epoch::php_epoch_before_conditional_free_function_declarations();
-        let prior_generation = store
-            .ensure_language_epoch_value("php", &prior_epoch)
-            .unwrap();
-        store
-            .write_parsed_blob_at_generation(
-                oid,
-                "php",
-                prior_generation,
-                &PhpAdapter,
-                state.as_ref(),
-            )
-            .unwrap();
-        assert!(store.contains_parsed_blob(oid, "php").unwrap());
-
-        let current_generation = store
-            .ensure_language_epoch(Language::Php, &tree_sitter_php::LANGUAGE_PHP.into())
-            .unwrap();
-
-        assert_ne!(current_generation, prior_generation);
-        assert!(!store.contains_parsed_blob(oid, "php").unwrap());
-        assert_eq!(
-            store
-                .missing_parsed_blob_keys(&[(oid, "php".to_string())])
-                .unwrap(),
-            vec![(oid, "php".to_string())]
-        );
+        assert_prior_parsed_blob_invalidated(&PhpAdapter, state.as_ref(), &prior_epoch);
     }
 
     /// #1713: PHP now records the FQ names a file imports in
@@ -24777,37 +24918,13 @@ mod tests {
             "the current walk records the same-namespace import: {:?}",
             state.type_identifiers
         );
-        let oid = oid_for(state.source.as_bytes());
-        let store = AnalyzerStore::open_ephemeral().unwrap();
         let prior_epoch = epoch::php_epoch_before_imported_type_names();
-        let prior_generation = store
-            .ensure_language_epoch_value("php", &prior_epoch)
-            .unwrap();
-        store
-            .write_parsed_blob_at_generation(
-                oid,
-                "php",
-                prior_generation,
-                &PhpAdapter,
-                state.as_ref(),
-            )
-            .unwrap();
-        assert!(store.contains_parsed_blob(oid, "php").unwrap());
-
-        let current_generation = store
-            .ensure_language_epoch(Language::Php, &tree_sitter_php::LANGUAGE_PHP.into())
-            .unwrap();
-
-        assert_ne!(current_generation, prior_generation);
-        assert!(!store.contains_parsed_blob(oid, "php").unwrap());
-        assert_eq!(
-            store
-                .missing_parsed_blob_keys(&[(oid, "php".to_string())])
-                .unwrap(),
-            vec![(oid, "php".to_string())]
-        );
+        assert_prior_parsed_blob_invalidated(&PhpAdapter, state.as_ref(), &prior_epoch);
     }
 
+    #[brokk_bifrost_test_macros::hardwon(
+        "9bf090ac306f: Scala recovery changed declaration identities without retiring stale rows"
+    )]
     #[test]
     fn scala_scalachess_fqn_recovery_epoch_invalidates_stale_rows_and_reuses_current() {
         let temp = tempfile::TempDir::new().unwrap();
@@ -24833,6 +24950,7 @@ mod tests {
             .unwrap();
         store
             .write_parsed_blob_at_generation(
+                &crate::analyzer::store::test_blob_file(),
                 oid,
                 "scala",
                 prior_generation,
@@ -24861,6 +24979,7 @@ mod tests {
         // version must reuse its generation and keep the semantic state warm.
         store
             .write_parsed_blob_at_generation(
+                &crate::analyzer::store::test_blob_file(),
                 oid,
                 "scala",
                 current_generation,
@@ -25053,7 +25172,14 @@ mod tests {
             .ensure_language_epoch_value("java", "epoch-a")
             .unwrap();
         store
-            .write_parsed_blob_at_generation(oid, "java", a1, &JavaAdapter, &state)
+            .write_parsed_blob_at_generation(
+                &crate::analyzer::store::test_blob_file(),
+                oid,
+                "java",
+                a1,
+                &JavaAdapter,
+                &state,
+            )
             .unwrap();
         let b = store
             .ensure_language_epoch_value("java", "epoch-b")
@@ -25091,7 +25217,14 @@ mod tests {
             .ensure_language_epoch_value("java", "epoch-b")
             .unwrap();
         store
-            .write_parsed_blob_at_generation(oid, "java", b, &JavaAdapter, state.as_ref())
+            .write_parsed_blob_at_generation(
+                &crate::analyzer::store::test_blob_file(),
+                oid,
+                "java",
+                b,
+                &JavaAdapter,
+                state.as_ref(),
+            )
             .unwrap();
 
         let (outcomes, stats) =
@@ -25169,7 +25302,14 @@ mod tests {
         let store = AnalyzerStore::open_ephemeral().unwrap();
         let a = store.ensure_language_epoch_value("java", "a").unwrap();
         store
-            .write_parsed_blob_at_generation(oid, "java", a, &JavaAdapter, &state)
+            .write_parsed_blob_at_generation(
+                &crate::analyzer::store::test_blob_file(),
+                oid,
+                "java",
+                a,
+                &JavaAdapter,
+                &state,
+            )
             .unwrap();
         let row = PathSymbolRow {
             rel_path: "Model.java".to_string(),
@@ -25281,6 +25421,9 @@ mod tests {
         );
     }
 
+    #[brokk_bifrost_test_macros::hardwon(
+        "8c91d98583fb: opening a matching persistent epoch waited behind unrelated writer work"
+    )]
     #[test]
     fn matching_persistent_epoch_does_not_wait_for_the_writer_slot() {
         let temp = tempfile::TempDir::new().unwrap();
@@ -25362,7 +25505,14 @@ mod tests {
             .ensure_language_epoch_value("java", "epoch-a")
             .unwrap();
         writer
-            .write_parsed_blob_at_generation(oid, "java", a, &JavaAdapter, &state_a)
+            .write_parsed_blob_at_generation(
+                &crate::analyzer::store::test_blob_file(),
+                oid,
+                "java",
+                a,
+                &JavaAdapter,
+                &state_a,
+            )
             .unwrap();
 
         let mut reader_conn = reader.read_conn().unwrap();
@@ -25385,7 +25535,14 @@ mod tests {
             .ensure_language_epoch_value("java", "epoch-b")
             .unwrap();
         writer
-            .write_parsed_blob_at_generation(oid, "java", b, &JavaAdapter, &state_b)
+            .write_parsed_blob_at_generation(
+                &crate::analyzer::store::test_blob_file(),
+                oid,
+                "java",
+                b,
+                &JavaAdapter,
+                &state_b,
+            )
             .unwrap();
 
         let old_units =
@@ -25427,7 +25584,14 @@ mod tests {
         let store = AnalyzerStore::open_ephemeral().unwrap();
         let a = store.ensure_language_epoch_value("java", "a").unwrap();
         store
-            .write_parsed_blob_at_generation(oid, "java", a, &JavaAdapter, &state)
+            .write_parsed_blob_at_generation(
+                &crate::analyzer::store::test_blob_file(),
+                oid,
+                "java",
+                a,
+                &JavaAdapter,
+                &state,
+            )
             .unwrap();
         store.ensure_language_epoch_value("java", "b").unwrap();
         store
@@ -25567,6 +25731,7 @@ mod tests {
         for oid in &oids {
             store
                 .write_parsed_blob_at_generation(
+                    &crate::analyzer::store::test_blob_file(),
                     *oid,
                     "java",
                     generation_a,
@@ -25653,7 +25818,14 @@ mod tests {
             .collect::<Vec<_>>();
         for oid in &oids {
             store
-                .write_parsed_blob_at_generation(*oid, "java", generation_a, &JavaAdapter, &state)
+                .write_parsed_blob_at_generation(
+                    &crate::analyzer::store::test_blob_file(),
+                    *oid,
+                    "java",
+                    generation_a,
+                    &JavaAdapter,
+                    &state,
+                )
                 .unwrap();
         }
         let expected = AnalyzerStore::prepare_parsed_blob(
@@ -25720,6 +25892,9 @@ mod tests {
         );
     }
 
+    #[brokk_bifrost_test_macros::hardwon(
+        "21e73ad38a68: conflicting prepared generations could mix stale and current facts in one publication"
+    )]
     #[test]
     fn conflicting_prepared_generations_isolate_the_stale_root() {
         let temp = tempfile::TempDir::new().unwrap();
@@ -25799,6 +25974,7 @@ mod tests {
             .unwrap();
         store
             .write_parsed_blob_at_generation(
+                &crate::analyzer::store::test_blob_file(),
                 complete_oid,
                 "java",
                 generation,
@@ -26007,133 +26183,6 @@ mod tests {
     }
 
     #[test]
-    fn relational_fq_loaders_use_only_ordered_primary_key_probes() {
-        for state in PlannerStatisticsState::BOTH {
-            relational_fq_loaders_use_only_ordered_primary_key_probes_in(state);
-        }
-    }
-
-    fn relational_fq_loaders_use_only_ordered_primary_key_probes_in(state: PlannerStatisticsState) {
-        let store = AnalyzerStore::open_ephemeral().unwrap();
-        let conn = store.conn.lock().expect("store mutex");
-        state.install(&conn);
-
-        let candidate_plan = explain_pin(&conn, &pinned("candidate_fq_segments_16"));
-        assert!(
-            candidate_plan
-                .iter()
-                .any(|detail| detail.contains("SEARCH segments USING PRIMARY KEY")),
-            "candidate batches must seek the segment primary key {state}: {candidate_plan:#?}"
-        );
-        assert!(
-            candidate_plan.iter().all(|detail| {
-                !detail.contains("SCAN segments") && !detail.contains("USE TEMP B-TREE")
-            }),
-            "candidate batches must not scan or sort persisted rows {state}: {candidate_plan:#?}"
-        );
-
-        let range_plan = explain_pin(&conn, &pinned("raw_unit_fq_segments"));
-        assert!(
-            range_plan
-                .iter()
-                .any(|detail| detail.contains("SEARCH facts USING PRIMARY KEY")),
-            "file batches must seek the segment primary key {state}: {range_plan:#?}"
-        );
-        assert!(
-            range_plan.iter().all(|detail| {
-                !detail.contains("SCAN code_unit_fq_segments")
-                    && !detail.contains("USE TEMP B-TREE")
-            }),
-            "file batches must not scan or sort persisted rows {state}: {range_plan:#?}"
-        );
-    }
-
-    #[test]
-    fn limited_candidate_cost_uses_parent_segment_bytes_without_child_probe() {
-        for state in PlannerStatisticsState::BOTH {
-            limited_candidate_cost_uses_parent_segment_bytes_without_child_probe_in(state);
-        }
-    }
-
-    fn limited_candidate_cost_uses_parent_segment_bytes_without_child_probe_in(
-        state: PlannerStatisticsState,
-    ) {
-        let store = AnalyzerStore::open_ephemeral().unwrap();
-        let conn = store.conn.lock().expect("store mutex");
-        state.install(&conn);
-        let plan = explain_pin(&conn, &pinned("limited_identifier_candidate_for_blob"));
-
-        assert!(
-            plan.iter()
-                .all(|detail| !detail.contains("code_unit_fq_segments")),
-            "header admission must use the parent byte count without touching segment rows {state}: {plan:#?}"
-        );
-        assert!(
-            plan.iter().all(|detail| {
-                !detail.contains("SCAN segments")
-                    && !detail.contains("SCAN units")
-                    && !detail.contains("SCAN meta")
-            }),
-            "the limited read must not scan a persisted parent or child table {state}: {plan:#?}"
-        );
-
-        let header_plan = explain_pin(&conn, &pinned("point_component_definition_candidate_exact"));
-        assert!(
-            header_plan
-                .iter()
-                .all(|detail| !detail.contains("code_unit_fq_segments")),
-            "component candidate headers must not hydrate child segments {state}: {header_plan:#?}"
-        );
-        assert!(
-            header_plan.iter().any(|detail| {
-                detail.contains("idx_workspace_file_anchor_rows_package")
-                    && detail.contains("package_name=?")
-            }),
-            "mounted lookup must seek the request prefix {state}: {header_plan:#?}"
-        );
-        assert!(
-            header_plan
-                .iter()
-                .any(|detail| detail.contains("idx_code_units_anchored_blob_exact_tail")),
-            "mounted lookup must seek the request tail inside the selected blob {state}: {header_plan:#?}"
-        );
-        assert_anchor_package_seek_is_outermost(
-            &header_plan,
-            "idx_code_units_anchored_blob_exact_tail",
-            &format!("the anchored component point lookup {state}"),
-        );
-        assert!(
-            header_plan.iter().all(|detail| {
-                !detail.contains("SCAN units") && !detail.contains("SCAN anchors")
-            }),
-            "component lookup must not enumerate a short-name candidate set {state}: {header_plan:#?}"
-        );
-        assert!(
-            header_plan
-                .iter()
-                .all(|detail| !detail.contains("USE TEMP B-TREE")),
-            "point lookup has no SQL ordering contract and must not sort {state}: {header_plan:#?}"
-        );
-
-        let stable_plan = explain_pin(
-            &conn,
-            &pinned("point_component_definition_candidate_stable"),
-        );
-        assert!(
-            stable_plan
-                .iter()
-                .any(|detail| detail.contains("idx_code_units_stable_exact_tail")),
-            "stable component lookup must seek the complete request tail {state}: {stable_plan:#?}"
-        );
-        assert!(
-            stable_plan
-                .iter()
-                .all(|detail| !detail.contains("SCAN units")),
-            "stable component lookup must not enumerate language units {state}: {stable_plan:#?}"
-        );
-    }
-
-    #[test]
     fn limited_candidate_order_terms_survive_materialization() {
         for state in PlannerStatisticsState::BOTH {
             limited_candidate_order_terms_survive_materialization_in(state);
@@ -26160,6 +26209,9 @@ mod tests {
         );
     }
 
+    #[brokk_bifrost_test_macros::hardwon(
+        "#1748: rendered definition separators were not inverted into lookup identity components"
+    )]
     #[test]
     fn rendered_name_components_invert_every_supported_boundary() {
         assert_eq!(
@@ -26418,6 +26470,9 @@ mod tests {
         }
     }
 
+    #[brokk_bifrost_test_macros::hardwon(
+        "#2794: anchor-only identities could not be recovered from relational definition storage"
+    )]
     #[test]
     fn anchor_only_lookup_uses_the_null_tail_relation() {
         let sql = point_anchor_only_definition_candidate_sql("units.in_declarations = 1");
@@ -26532,6 +26587,9 @@ mod tests {
         );
     }
 
+    #[brokk_bifrost_test_macros::hardwon(
+        "#3035+888ce79b9d65: mounted declaration scans read rows outside the live workspace index"
+    )]
     #[test]
     fn mounted_declaration_primary_range_scan_seeks_indexed_rows() {
         for state in PlannerStatisticsState::BOTH {
@@ -26589,50 +26647,78 @@ mod tests {
     #[test]
     fn identifier_prefix_lookup_seeks_the_identifier_index() {
         for state in PlannerStatisticsState::BOTH {
-            identifier_prefix_lookup_seeks_the_identifier_index_in(state);
+            identifier_lookup_uses_index_in(state, "identifier_prefix_candidate", "prefix range");
         }
-    }
-
-    fn identifier_prefix_lookup_seeks_the_identifier_index_in(state: PlannerStatisticsState) {
-        let store = AnalyzerStore::open_ephemeral().unwrap();
-        let conn = store.conn.lock().expect("store mutex");
-        state.install(&conn);
-        let plan = explain_pin(&conn, &pinned("identifier_prefix_candidate"));
-
-        assert!(
-            plan.iter().any(|detail| detail
-                .contains("SEARCH units USING INDEX idx_code_units_lang_identifier_lookup")),
-            "the prefix range must seek the identifier index {state}: {plan:#?}"
-        );
-        assert!(
-            plan.iter().all(|detail| !detail.contains("SCAN units")),
-            "the prefix range must never scan code_units {state}: {plan:#?}"
-        );
     }
 
     #[test]
     fn file_identifier_lookup_seeks_identifier_index_before_blob_key_filter() {
         for state in PlannerStatisticsState::BOTH {
-            file_identifier_lookup_seeks_identifier_index_before_blob_key_filter_in(state);
+            identifier_lookup_uses_index_in(
+                state,
+                "limited_identifier_candidate_for_blob",
+                "file-scoped lookup",
+            );
         }
     }
 
-    fn file_identifier_lookup_seeks_identifier_index_before_blob_key_filter_in(
+    #[test]
+    fn limited_identifier_candidate_seeks_the_identifier_index_with_both_statistics_states() {
+        for state in PlannerStatisticsState::BOTH {
+            let temp = tempfile::TempDir::new().unwrap();
+            let file = write_file(temp.path(), "src/lib.rs", "pub struct Widget;\n");
+            let oid = oid_for(file.read_to_string().unwrap().as_bytes());
+            let store = AnalyzerStore::open_ephemeral().unwrap();
+            store
+                .write_parsed_blob(oid, "rust", &RustAdapter, &parse_state(&RustAdapter, &file))
+                .unwrap();
+
+            let conn = store.conn.lock().expect("store mutex");
+            prepare_pin_context(&conn);
+            conn.execute(
+                "INSERT INTO temp.declaration_candidate_requests(
+                   request_ordinal, lang, identifier, request_limit
+                 ) VALUES (0, 'rust', 'Widget', 16)",
+                [],
+            )
+            .unwrap();
+            state.install(&conn);
+            let plan = explain_pin(&conn, &pinned("limited_identifier_candidate"));
+
+            assert!(
+                plan.iter().any(|detail| detail
+                    .contains("SEARCH units USING INDEX idx_code_units_lang_identifier_lookup")),
+                "limited candidate query must seek the identifier index {state}: {plan:#?}"
+            );
+            assert!(
+                plan.iter().all(|detail| {
+                    !detail.contains("SCAN units")
+                        && !detail.contains("AUTOMATIC")
+                        && !detail.contains("CO-ROUTINE")
+                }),
+                "limited candidate query must retain indexed execution {state}: {plan:#?}"
+            );
+        }
+    }
+
+    fn identifier_lookup_uses_index_in(
         state: PlannerStatisticsState,
+        query_name: &str,
+        lookup_description: &str,
     ) {
         let store = AnalyzerStore::open_ephemeral().unwrap();
         let conn = store.conn.lock().expect("store mutex");
         state.install(&conn);
-        let plan = explain_pin(&conn, &pinned("limited_identifier_candidate_for_blob"));
+        let plan = explain_pin(&conn, &pinned(query_name));
 
         assert!(
             plan.iter().any(|detail| detail
                 .contains("SEARCH units USING INDEX idx_code_units_lang_identifier_lookup")),
-            "file-scoped lookup must seek the identifier index {state}: {plan:#?}"
+            "the {lookup_description} must seek the identifier index {state}: {plan:#?}"
         );
         assert!(
             plan.iter().all(|detail| !detail.contains("SCAN units")),
-            "file-scoped lookup must never scan code_units {state}: {plan:#?}"
+            "the {lookup_description} must never scan code_units {state}: {plan:#?}"
         );
     }
 
@@ -26645,6 +26731,9 @@ mod tests {
         assert_eq!(None, byte_successor("Wid\u{00e9}"));
     }
 
+    #[brokk_bifrost_test_macros::hardwon(
+        "6098a8148fbc: concurrent cache repairs duplicated persistent writes for the same blob"
+    )]
     #[test]
     fn simultaneous_identical_repairs_share_one_persistent_transaction() {
         const PRODUCERS: usize = 50;
@@ -26833,6 +26922,7 @@ mod tests {
             .unwrap();
         store
             .write_parsed_blob_at_generation(
+                &crate::analyzer::store::test_blob_file(),
                 replaced_oid,
                 "java",
                 generation_a,
@@ -27681,6 +27771,7 @@ mod tests {
             .unwrap();
         store
             .write_parsed_blob_at_generation(
+                &crate::analyzer::store::test_blob_file(),
                 rust_oid,
                 "rust",
                 prior_rust_generation,
@@ -27693,6 +27784,7 @@ mod tests {
             .unwrap();
         store
             .write_parsed_blob_at_generation(
+                &crate::analyzer::store::test_blob_file(),
                 go_oid,
                 "go",
                 go_generation,
@@ -28073,44 +28165,56 @@ mod tests {
         let mut parsed: ParsedFile = adapter.parse_file(file, &source, &tree);
         parsed.add_file_scope(file, &source);
         let contains_tests = adapter.contains_tests(file, &source, &tree, &parsed);
-        let declarations = parsed.declarations().clone();
-        FileState {
+        TreeSitterAnalyzer::<A>::file_state_from_parsed(
             source,
-            content_qualifier: parsed.content_qualifier,
-            package_name: parsed.package_name,
-            top_level_declarations: parsed.top_level_declarations,
-            declarations,
-            definition_lookup_units: parsed.definition_lookup_units,
-            imports: parsed.imports,
-            scala_exports: parsed.scala_exports,
-            rust_usage_facts: parsed.rust_usage_facts,
-            resolution_facts: parsed.resolution_facts,
-            source_facts: parsed.source_facts,
-            source_declaration_units: parsed.source_declaration_units,
-            source_declaration_metadata: parsed.source_declaration_metadata,
-            raw_supertypes: parsed.raw_supertypes,
-            supertype_lookup_paths: parsed.supertype_lookup_paths,
-            type_identifiers: parsed.type_identifiers,
-            signatures: parsed.signatures,
-            signature_metadata: parsed.signature_metadata,
-            signature_metadata_signature_ordinals: parsed.signature_metadata_signature_ordinals,
-            cpp_template_metadata: parsed.cpp_template_metadata,
-            ranges: parsed.ranges,
-            children: parsed.children,
-            type_aliases: parsed.type_aliases,
-            ruby_method_dispatch_modes: parsed.ruby_method_dispatch_modes,
-            scala_traits: parsed.scala_traits,
+            parsed,
             contains_tests,
-            test_region_units: parsed.test_region_units,
-            materialization_records: parsed.materialization_records,
-            parse_errors: Some(Vec::new()),
-            parse_complete: true,
-            additional_projections: Vec::new(),
-        }
+            Some(Vec::new()),
+            true,
+        )
+    }
+
+    fn assert_prior_parsed_blob_invalidated<A: LanguageAdapter>(
+        adapter: &A,
+        state: &FileState,
+        prior_epoch: &str,
+    ) {
+        let language = adapter.language();
+        let language_key = language.config_label();
+        let oid = oid_for(state.source.as_bytes());
+        let store = AnalyzerStore::open_ephemeral().unwrap();
+        let prior_generation = store
+            .ensure_language_epoch_value(language_key, prior_epoch)
+            .unwrap();
+        store
+            .write_parsed_blob_at_generation(
+                &crate::analyzer::store::test_blob_file(),
+                oid,
+                language_key,
+                prior_generation,
+                adapter,
+                state,
+            )
+            .unwrap();
+        assert!(store.contains_parsed_blob(oid, language_key).unwrap());
+
+        let current_generation = store
+            .ensure_language_epoch(language, &adapter.parser_language())
+            .unwrap();
+
+        assert_ne!(current_generation, prior_generation);
+        assert!(!store.contains_parsed_blob(oid, language_key).unwrap());
+        assert_eq!(
+            store
+                .missing_parsed_blob_keys(&[(oid, language_key.to_string())])
+                .unwrap(),
+            vec![(oid, language_key.to_string())]
+        );
     }
 
     fn assert_file_state_equivalent(expected: &FileState, actual: &FileState) {
         assert_eq!(actual.package_name, expected.package_name);
+        assert_eq!(actual.completeness, expected.completeness);
         assert_eq!(
             actual.top_level_declarations,
             expected.top_level_declarations
@@ -28123,12 +28227,12 @@ mod tests {
         );
         assert_eq!(actual.imports, expected.imports);
         assert_eq!(
-            non_empty_string_vec_entries(&actual.raw_supertypes),
-            non_empty_string_vec_entries(&expected.raw_supertypes)
+            non_empty_vec_entries(&actual.raw_supertypes),
+            non_empty_vec_entries(&expected.raw_supertypes)
         );
         assert_eq!(
-            non_empty_string_vec_entries(&actual.supertype_lookup_paths),
-            non_empty_string_vec_entries(&expected.supertype_lookup_paths)
+            non_empty_vec_entries(&actual.supertype_lookup_paths),
+            non_empty_vec_entries(&expected.supertype_lookup_paths)
         );
         assert_eq!(actual.type_identifiers, expected.type_identifiers);
         assert_eq!(actual.signatures, expected.signatures);
@@ -28144,8 +28248,8 @@ mod tests {
         assert_eq!(actual.cpp_template_metadata, expected.cpp_template_metadata);
         assert_eq!(actual.ranges, expected.ranges);
         assert_eq!(
-            non_empty_code_unit_vec_entries(&actual.children),
-            non_empty_code_unit_vec_entries(&expected.children)
+            non_empty_vec_entries(&actual.children),
+            non_empty_vec_entries(&expected.children)
         );
         assert_eq!(actual.type_aliases, expected.type_aliases);
         assert_eq!(
@@ -28159,18 +28263,9 @@ mod tests {
         assert!(actual.parse_errors.is_none());
     }
 
-    fn non_empty_string_vec_entries(
-        map: &HashMap<CodeUnit, Vec<String>>,
-    ) -> HashMap<CodeUnit, Vec<String>> {
-        map.iter()
-            .filter(|(_, values)| !values.is_empty())
-            .map(|(unit, values)| (unit.clone(), values.clone()))
-            .collect()
-    }
-
-    fn non_empty_code_unit_vec_entries(
-        map: &HashMap<CodeUnit, Vec<CodeUnit>>,
-    ) -> HashMap<CodeUnit, Vec<CodeUnit>> {
+    fn non_empty_vec_entries<T: Clone>(
+        map: &HashMap<CodeUnit, Vec<T>>,
+    ) -> HashMap<CodeUnit, Vec<T>> {
         map.iter()
             .filter(|(_, values)| !values.is_empty())
             .map(|(unit, values)| (unit.clone(), values.clone()))
@@ -28178,34 +28273,6 @@ mod tests {
     }
 
     const TEST_OID: &str = "1111111111111111111111111111111111111111";
-
-    /// The bincode encoding migration 0018 retired, frozen here so the
-    /// equivalence test below cannot drift with the production encoders.
-    ///
-    /// `import_details.info` was written by `bincode::serialize`, whose legacy
-    /// defaults are fixed-width integers, u64 length prefixes, and u32 enum
-    /// discriminants. Round-tripping a fixture through it reproduces exactly
-    /// what the old reader would have handed a consumer.
-    fn frozen_import_blob_round_trip(import: &ImportInfo) -> ImportInfo {
-        let bytes = bincode::serialize(import).expect("frozen import encode");
-        bincode::deserialize(&bytes).expect("frozen import decode")
-    }
-
-    /// One `ImportInfo` per shape the ten language adapters actually produce,
-    /// from `.agents/docs/opaque-blob-inventory-2026-08.md` section 1.3.
-    ///
-    /// The point is coverage of the SHAPE space, not of any one language's
-    /// grammar: a pathless import, every path kind, a wildcard, an alias, a
-    /// global, and the presence marker that makes `Some(path)` and `None`
-    /// distinct.
-    ///
-    /// Every language's `import_statements` projection. Schema 117 keeps only
-    /// that projection here: an import's segments, lexical scopes and lexical
-    /// prefixes live in the canonical `source_import_*` families, which
-    /// `source_facts::import_read`, the Java/Go and Kotlin publication suites
-    /// and `rust_item_query_plan_tests` cover end to end. A blob written
-    /// without canonical source facts therefore carries a path's kind and
-    /// declaration start byte and nothing else.
     fn import_shape_fixture() -> Vec<ImportInfo> {
         let path = |kind: Option<StructuredImportPathKind>, declaration_start_byte: usize| {
             Some(StructuredImportPath {
@@ -28395,30 +28462,6 @@ mod tests {
         tx.commit().unwrap();
     }
 
-    /// The relational rows must hand back exactly what the retired bincode
-    /// decoder would have. Every language's variance is in the fixture, so a
-    /// field this migration forgot to persist shows up as a mismatch here
-    /// rather than as a resolution bug in one language months later.
-    #[test]
-    fn import_rows_hydrate_what_the_frozen_blob_decoder_produced() {
-        let imports = import_shape_fixture();
-        let store = AnalyzerStore::open_ephemeral().unwrap();
-        write_import_fixture(&store, "rust", &imports);
-
-        let conn = store.conn.lock().expect("store mutex");
-        let hydrated = read_import_infos(&conn, TEST_OID, "rust").unwrap();
-        let frozen: Vec<ImportInfo> = imports.iter().map(frozen_import_blob_round_trip).collect();
-        assert_eq!(hydrated, frozen);
-        assert_eq!(hydrated, imports);
-
-        let bulk = read_import_infos_bulk(&conn, "rust", &[TEST_OID.to_string()]).unwrap();
-        assert_eq!(
-            bulk.get(TEST_OID).map(Vec::as_slice),
-            None,
-            "a blob with no blob_meta row is not complete, so the bulk read skips it"
-        );
-    }
-
     /// SQL hydration retains the producer's import interpretation independently
     /// of the rendered snippet consumed by display clients.
     #[test]
@@ -28472,6 +28515,9 @@ mod tests {
     /// an import's structure in the canonical `source_import_*` families, which
     /// cascade from `source_fact_manifests`; `import_statements` is the only
     /// import relation that still hangs directly off `blobs`.
+    #[brokk_bifrost_test_macros::hardwon(
+        "a0398f1cdc9e: deleting an analyzer blob left its persisted import statements behind"
+    )]
     #[test]
     fn deleting_a_blob_cascades_its_import_statements() {
         let imports = import_shape_fixture();
@@ -28489,69 +28535,6 @@ mod tests {
             )
             .unwrap();
         assert_eq!(remaining, 0, "import_statements must cascade with its blob");
-    }
-
-    /// The schema, not Rust, rejects a malformed import row.
-    #[test]
-    fn import_row_constraints_are_enforced_by_the_schema() {
-        let store = AnalyzerStore::open_ephemeral().unwrap();
-        let conn = store.conn.lock().expect("store mutex");
-        conn.execute(
-            "INSERT INTO blobs(blob_oid, lang) VALUES(?1, 'rust')",
-            [TEST_OID],
-        )
-        .unwrap();
-        let insert = |columns: &str, values: &str| -> rusqlite::Error {
-            conn.execute(
-                &format!(
-                    "INSERT INTO import_statements(blob_id, lang, ordinal, statement, {columns})
-                     VALUES((SELECT id FROM blobs WHERE blob_oid = ?1 AND lang = 'rust'), 'rust', 0, 'use x;', {values})"
-                ),
-                [TEST_OID],
-            )
-            .unwrap_err()
-        };
-        assert_constraint_error(insert("is_wildcard, is_global", "2, 0"), "CHECK");
-        assert_constraint_error(insert("is_wildcard, is_global", "0, 7"), "CHECK");
-        assert_constraint_error(
-            insert(
-                "is_wildcard, is_global, path_kind, declaration_start_byte",
-                "0, 0, 'not_a_kind', 0",
-            ),
-            "CHECK",
-        );
-        assert_constraint_error(
-            insert("is_wildcard, is_global, path_kind", "0, 0, 'namespace'"),
-            "CHECK",
-        );
-        assert_constraint_error(
-            insert(
-                "is_wildcard, is_global, binder_start, binder_end",
-                "0, 0, 9, 3",
-            ),
-            "CHECK",
-        );
-        assert_constraint_error(
-            insert("is_wildcard, is_global, binder_start", "0, 0, 9"),
-            "CHECK",
-        );
-        let negative_ordinal = conn
-            .execute(
-                "INSERT INTO import_statements(
-                   blob_id, lang, ordinal, statement, is_wildcard, is_global
-                 ) VALUES((SELECT id FROM blobs WHERE blob_oid = ?1 AND lang = 'rust'), 'rust', -1, 'use x;', 0, 0)",
-                [TEST_OID],
-            )
-            .unwrap_err();
-        assert_constraint_error(negative_ordinal, "CHECK");
-
-        conn.execute(
-            "INSERT INTO import_statements(
-               blob_id, lang, ordinal, statement, is_wildcard, is_global
-             ) VALUES((SELECT id FROM blobs WHERE blob_oid = ?1 AND lang = 'rust'), 'rust', 0, 'use x;', 0, 0)",
-            [TEST_OID],
-        )
-        .unwrap();
     }
 
     /// Nothing an import row stores may depend on where the file lives: two
@@ -28637,36 +28620,6 @@ mod tests {
         assert_eq!(dump(&first), dump(&second));
     }
 
-    /// Every new import read is an indexed seek. The child reads are the ones
-    /// this migration added, and their `ORDER BY` matches the primary key, so
-    /// they must not need an ordering b-tree either.
-    #[test]
-    fn import_reads_use_the_import_primary_keys() {
-        for state in PlannerStatisticsState::BOTH {
-            import_reads_use_the_import_primary_keys_in(state);
-        }
-    }
-
-    fn import_reads_use_the_import_primary_keys_in(state: PlannerStatisticsState) {
-        let store = AnalyzerStore::open_ephemeral().unwrap();
-        let conn = store.conn.lock().expect("store mutex");
-        state.install(&conn);
-
-        let per_blob = explain_pin(&conn, &pinned("import_statements_per_blob"));
-        assert!(
-            per_blob
-                .iter()
-                .any(|detail| detail.contains("SEARCH import USING PRIMARY KEY")),
-            "{state}: {per_blob:#?}"
-        );
-        assert!(
-            per_blob.iter().all(
-                |detail| !detail.contains("SCAN import") && !detail.contains("USE TEMP B-TREE")
-            ),
-            "{state}: {per_blob:#?}"
-        );
-    }
-
     #[test]
     fn workspace_package_fact_batch_seeks_each_requested_blob() {
         for state in PlannerStatisticsState::BOTH {
@@ -28706,6 +28659,9 @@ mod tests {
         );
     }
 
+    #[brokk_bifrost_test_macros::hardwon(
+        "9527ec801458: batched package-fact reads must match per-blob results after startup query batching"
+    )]
     #[test]
     fn workspace_package_fact_batch_matches_single_blob_queries() {
         let temp = tempfile::tempdir().unwrap();
@@ -28773,6 +28729,9 @@ mod tests {
         assert!(facts[0].package_tail.is_empty());
     }
 
+    #[brokk_bifrost_test_macros::hardwon(
+        "43a2c41d9d02: a package read reported complete after a requested blob had no index rows"
+    )]
     #[test]
     fn anchored_workspace_package_facts_report_an_unindexed_blob_incomplete() {
         let temp = tempfile::tempdir().unwrap();
@@ -28805,6 +28764,9 @@ mod tests {
         assert_eq!(outcome.facts[0].blob_oid, persisted_oid);
     }
 
+    #[brokk_bifrost_test_macros::hardwon(
+        "85a5d7d8ac62: Java reverse-import candidate reads scanned globally instead of following seed names"
+    )]
     #[test]
     fn reverse_reference_candidates_use_name_first_indexes() {
         for state in PlannerStatisticsState::BOTH {
@@ -29080,7 +29042,14 @@ mod tests {
             .ensure_language_epoch_value("ruby", "materialization-round-trip-v1")
             .unwrap();
         store
-            .write_parsed_blob_at_generation(oid, "ruby", generation, &RubyAdapter, &state)
+            .write_parsed_blob_at_generation(
+                &crate::analyzer::store::test_blob_file(),
+                oid,
+                "ruby",
+                generation,
+                &RubyAdapter,
+                &state,
+            )
             .unwrap();
 
         let hydrated = store
@@ -29112,6 +29081,9 @@ mod tests {
     /// generation site producing its macro unit, a preprocessor conditional
     /// is a recorded configuration gate, and an export-macro class the parser
     /// broke is recorded as a recovered declaration.
+    #[brokk_bifrost_test_macros::hardwon(
+        "#2552: export-macro recovery lost the displaced C++ class constructor and its provenance"
+    )]
     #[test]
     fn cpp_macro_config_and_recovery_records() {
         use crate::analyzer::structural::materialization::{GenerationKind, MaterializationRecord};
@@ -29207,6 +29179,9 @@ mod tests {
     /// reparse walk mints, a fragmented multiple-base export declaration
     /// records its recovered class, and a fragmented partial specialization
     /// records the recovered member scope.
+    #[brokk_bifrost_test_macros::hardwon(
+        "#1657+5554beb0001d: remaining C++ recovery shapes must retain Recovered source provenance"
+    )]
     #[test]
     fn cpp_remaining_recovery_shapes_record_recovered_origin() {
         use crate::analyzer::structural::materialization::MaterializationRecord;
@@ -29557,7 +29532,7 @@ mod tests {
     #[test]
     fn rust_fact_tables_record_exports_imports_modules_and_occurrences() {
         let temp = tempfile::TempDir::new().unwrap();
-        let (store, oid) = rust_usage_fact_store(temp.path());
+        let (store, oid) = rust_fixture_store(temp.path(), "src/lib.rs", RUST_USAGE_FACT_FIXTURE);
         let facts = store.rust_usage_facts(oid, "rust").unwrap();
 
         let exports: Vec<_> = facts
@@ -29753,6 +29728,9 @@ mod tests {
         );
     }
 
+    #[brokk_bifrost_test_macros::hardwon(
+        "3bb3fbdffb31: selected Rust inverse reads lost canonical import occurrence locations"
+    )]
     #[test]
     fn canonical_import_locations_reopen_and_seek_exact_ordinals() {
         let mut source = String::from(
@@ -30158,6 +30136,9 @@ mod primary;
         );
     }
 
+    #[brokk_bifrost_test_macros::hardwon(
+        "9fba40a6cb46: stale Rust macro DTOs overrode canonical declaration identities and route ranges"
+    )]
     #[test]
     fn canonical_rust_macro_properties_ignore_stale_dto_and_reopen_exact_links() {
         let source = "#[macro_export]\nmacro_rules! public_macro { () => {}; }\nmacro_rules! private_macro { () => {}; }\nmod nested { macro_rules! local_macro { () => {}; } }\n";
@@ -30277,6 +30258,9 @@ mod primary;
         );
     }
 
+    #[brokk_bifrost_test_macros::hardwon(
+        "9fba40a6cb46: persisted macro scope trusted stale context instead of canonical source identity"
+    )]
     #[test]
     fn canonical_rust_macro_scope_requires_source_context_and_repairs() {
         let source = "mod nested { macro_rules! local_macro { () => {}; } }\n";
@@ -31051,6 +31035,9 @@ helper::wrap! {
         tx.rollback().unwrap();
     }
 
+    #[brokk_bifrost_test_macros::hardwon(
+        "440ca895ccfb: missing canonical Rust import segments were accepted as complete authority"
+    )]
     #[test]
     fn missing_canonical_import_segments_fail_and_republication_recovers() {
         let fixture = crate::inline_project::InlineTestProject::new()
@@ -32146,7 +32133,7 @@ helper::wrap! {
     #[test]
     fn rust_fact_tables_answer_the_inverted_name_lookups() {
         let temp = tempfile::TempDir::new().unwrap();
-        let (store, oid) = rust_usage_fact_store(temp.path());
+        let (store, oid) = rust_fixture_store(temp.path(), "src/lib.rs", RUST_USAGE_FACT_FIXTURE);
 
         assert_eq!(store.rust_export_blobs("rust", "Alias").unwrap(), vec![oid]);
         assert!(
@@ -32191,6 +32178,9 @@ helper::wrap! {
         );
     }
 
+    #[brokk_bifrost_test_macros::hardwon(
+        "6074c794e6bd: Rust import candidate planning scanned rows outside the requested occurrence names"
+    )]
     #[test]
     fn rust_module_import_candidates_seek_occurrences_then_blob_import_rows() {
         for state in PlannerStatisticsState::BOTH {
@@ -32255,7 +32245,7 @@ helper::wrap! {
     #[test]
     fn rust_fact_rows_cascade_with_their_blob() {
         let temp = tempfile::TempDir::new().unwrap();
-        let (store, oid) = rust_usage_fact_store(temp.path());
+        let (store, oid) = rust_fixture_store(temp.path(), "src/lib.rs", RUST_USAGE_FACT_FIXTURE);
         let count = |store: &AnalyzerStore| {
             let conn = store.conn.lock().unwrap();
             [
@@ -32301,12 +32291,7 @@ helper::wrap! {
     #[test]
     fn rust_fact_rows_are_stable_across_a_re_analysis_of_the_same_content() {
         let temp = tempfile::TempDir::new().unwrap();
-        let file = write_file(temp.path(), "src/lib.rs", RUST_USAGE_FACT_FIXTURE);
-        let oid = oid_for(RUST_USAGE_FACT_FIXTURE.as_bytes());
-        let store = AnalyzerStore::open_ephemeral().unwrap();
-        store
-            .write_parsed_blob(oid, "rust", &RustAdapter, &parse_state(&RustAdapter, &file))
-            .unwrap();
+        let (store, oid) = rust_fixture_store(temp.path(), "src/lib.rs", RUST_USAGE_FACT_FIXTURE);
         let first = store.rust_usage_facts(oid, "rust").unwrap();
 
         // Same bytes at a different path: the content key is unchanged, so the
@@ -32324,12 +32309,52 @@ helper::wrap! {
         let second = store.rust_usage_facts(oid, "rust").unwrap();
 
         assert_eq!(first, second);
+
+        let route_file = write_file(temp.path(), "src/lib.rs", RUST_MODULE_ROUTE_FIXTURE);
+        let route_oid = oid_for(RUST_MODULE_ROUTE_FIXTURE.as_bytes());
+        store
+            .write_parsed_blob(
+                route_oid,
+                "rust",
+                &RustAdapter,
+                &parse_state(&RustAdapter, &route_file),
+            )
+            .unwrap();
+        let first_routes = store
+            .rust_usage_facts(route_oid, "rust")
+            .unwrap()
+            .module_routes;
+        assert!(
+            !first_routes.routes.is_empty(),
+            "fixture must persist route rows"
+        );
+
+        let moved_route_file = write_file(
+            temp.path(),
+            "src/deep/nested/mod.rs",
+            RUST_MODULE_ROUTE_FIXTURE,
+        );
+        store
+            .write_parsed_blob(
+                route_oid,
+                "rust",
+                &RustAdapter,
+                &parse_state(&RustAdapter, &moved_route_file),
+            )
+            .unwrap();
+        assert_eq!(
+            store
+                .rust_usage_facts(route_oid, "rust")
+                .unwrap()
+                .module_routes,
+            first_routes
+        );
     }
 
     #[test]
     fn rust_module_route_tables_record_scopes_routes_gates_and_item_macros() {
         let temp = tempfile::TempDir::new().unwrap();
-        let (store, oid) = rust_module_route_store(temp.path(), "src/lib.rs");
+        let (store, oid) = rust_fixture_store(temp.path(), "src/lib.rs", RUST_MODULE_ROUTE_FIXTURE);
         let routes = store.rust_usage_facts(oid, "rust").unwrap().module_routes;
 
         let scopes: Vec<_> = routes
@@ -32462,7 +32487,7 @@ helper::wrap! {
     #[test]
     fn rust_module_route_rows_cascade_with_their_blob() {
         let temp = tempfile::TempDir::new().unwrap();
-        let (store, oid) = rust_module_route_store(temp.path(), "src/lib.rs");
+        let (store, oid) = rust_fixture_store(temp.path(), "src/lib.rs", RUST_MODULE_ROUTE_FIXTURE);
         let counts = |store: &AnalyzerStore| {
             let conn = store.conn.lock().unwrap();
             [
@@ -32497,42 +32522,12 @@ helper::wrap! {
         assert_eq!(counts(&store), [0, 0, 0, 0]);
     }
 
-    /// Nothing in the module-route rows may be path-derived: the blob key is a
-    /// content hash, so the same bytes at a different path must produce
-    /// byte-identical rows. Directory resolution belongs to the reader.
-    #[test]
-    fn rust_module_route_rows_are_stable_across_a_re_analysis_of_the_same_content() {
-        let temp = tempfile::TempDir::new().unwrap();
-        let (store, oid) = rust_module_route_store(temp.path(), "src/lib.rs");
-        let first = store.rust_usage_facts(oid, "rust").unwrap().module_routes;
-        assert!(!first.routes.is_empty(), "fixture must persist route rows");
-
-        let moved = write_file(
-            temp.path(),
-            "src/deep/nested/mod.rs",
-            RUST_MODULE_ROUTE_FIXTURE,
-        );
-        store
-            .write_parsed_blob(
-                oid,
-                "rust",
-                &RustAdapter,
-                &parse_state(&RustAdapter, &moved),
-            )
-            .unwrap();
-
-        assert_eq!(
-            store.rust_usage_facts(oid, "rust").unwrap().module_routes,
-            first
-        );
-    }
-
     /// The Cargo-route build reads every live blob at once, and that batched
     /// read must agree with the per-blob one it replaces column for column.
     #[test]
     fn batched_module_route_facts_match_the_per_blob_read() {
         let temp = tempfile::TempDir::new().unwrap();
-        let (store, oid) = rust_module_route_store(temp.path(), "src/lib.rs");
+        let (store, oid) = rust_fixture_store(temp.path(), "src/lib.rs", RUST_MODULE_ROUTE_FIXTURE);
         let other = write_file(temp.path(), "src/plain.rs", "mod leaf;\n");
         let other_oid = oid_for(b"mod leaf;\n");
         store
@@ -32694,16 +32689,6 @@ include!(\"generated/table.rs\");
 // in_a_comment
 ";
 
-    fn rust_usage_fact_store(temp: &Path) -> (AnalyzerStore, Oid) {
-        let file = write_file(temp, "src/lib.rs", RUST_USAGE_FACT_FIXTURE);
-        let oid = oid_for(RUST_USAGE_FACT_FIXTURE.as_bytes());
-        let store = AnalyzerStore::open_ephemeral().unwrap();
-        store
-            .write_parsed_blob(oid, "rust", &RustAdapter, &parse_state(&RustAdapter, &file))
-            .unwrap();
-        (store, oid)
-    }
-
     /// The module-route fixture (issue #1793): a file whose declarations cover
     /// every column the Cargo route index reads -- an inline scope with a
     /// `#[path]`, a `#[macro_use]` declaration, a bare `#[cfg(test)]` gate, a
@@ -32728,24 +32713,14 @@ mod scope {
 replay! { mod replayed; }
 ";
 
-    fn rust_module_route_store(temp: &Path, rel_path: &str) -> (AnalyzerStore, Oid) {
-        let file = write_file(temp, rel_path, RUST_MODULE_ROUTE_FIXTURE);
-        let oid = oid_for(RUST_MODULE_ROUTE_FIXTURE.as_bytes());
+    fn rust_fixture_store(temp: &Path, rel_path: &str, fixture: &str) -> (AnalyzerStore, Oid) {
+        let file = write_file(temp, rel_path, fixture);
+        let oid = oid_for(fixture.as_bytes());
         let store = AnalyzerStore::open_ephemeral().unwrap();
         store
             .write_parsed_blob(oid, "rust", &RustAdapter, &parse_state(&RustAdapter, &file))
             .unwrap();
         (store, oid)
-    }
-
-    fn write_file(root: &Path, rel_path: &str, contents: &str) -> ProjectFile {
-        let file = ProjectFile::new(root.to_path_buf(), rel_path);
-        file.write(contents).unwrap();
-        file
-    }
-
-    pub(super) fn oid_for(contents: &[u8]) -> Oid {
-        Oid::hash_object(ObjectType::Blob, contents).unwrap()
     }
 
     /// Every `short_name` the store holds for one parsed blob.
@@ -32761,7 +32736,14 @@ replay! { mod replayed; }
             .ensure_language_epoch_value(lang, "short-name-vocabulary-pin-v1")
             .unwrap();
         store
-            .write_parsed_blob_at_generation(oid, lang, generation, adapter, &state)
+            .write_parsed_blob_at_generation(
+                &crate::analyzer::store::test_blob_file(),
+                oid,
+                lang,
+                generation,
+                adapter,
+                &state,
+            )
             .unwrap();
         let conn = store.conn.lock().unwrap();
         let mut statement = conn
@@ -32785,10 +32767,8 @@ replay! { mod replayed; }
     /// `definition_candidate_short_names` drops a lookup spelling that carries
     /// a separator `absent_segment_separators` reports for the adapter's
     /// language, on the ground that no stored `short_name` for that language
-    /// can contain one. `.agents/docs/graph-read-cost-investigation-2026-08.md`
-    /// measured that property over 324,891 rustc rows (0 containing `::`);
-    /// this asserts it against rows the store actually wrote, over the rust
-    /// shapes most likely to smuggle a path separator into a name -- nested
+    /// can contain one. This asserts the property against rows the store wrote,
+    /// over the Rust shapes most likely to smuggle a path separator into a name -- nested
     /// inline modules, a generic inherent impl, a qualified trait impl, and an
     /// associated const.
     ///

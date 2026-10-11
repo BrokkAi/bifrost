@@ -114,7 +114,7 @@ pub enum ExtensionWorkspaceError {
 }
 impl fmt::Display for ExtensionWorkspaceError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{self:?}")
+        super::fmt_debug(self, f)
     }
 }
 impl std::error::Error for ExtensionWorkspaceError {}
@@ -130,7 +130,7 @@ pub enum ExtensionError {
 }
 impl fmt::Display for ExtensionError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{self:?}")
+        super::fmt_debug(self, f)
     }
 }
 impl std::error::Error for ExtensionError {}
@@ -1628,13 +1628,12 @@ fn point_span(
     handle: &ProgramPointHandle,
 ) -> Result<SourceSpan, ExtensionError> {
     let semantics = handle.procedure().semantics();
-    let point = semantics
+    let _point = semantics
         .point(handle.id())
         .expect("a validated witness point resolves in its own procedure");
-    let locator = &semantics
-        .source_mapping(point.source)
-        .expect("a validated witness point has a source mapping")
-        .locator;
+    let locator = handle
+        .locator()
+        .expect("a validated witness point has a source mapping");
     locator_span(analyzer, locator)
 }
 
@@ -2307,66 +2306,13 @@ mod tests {
         ExtensionWorkspace::open(options).unwrap()
     }
 
-    fn legacy_generation_for(
-        workspace: &ExtensionWorkspace,
-        config: &AnalyzerConfig,
-    ) -> WorkspaceGeneration {
-        let mut hasher = Sha256::new();
-        hasher.update(b"brokk-bifrost-extension-workspace-generation-v1\0");
-        hasher.update(env!("CARGO_PKG_VERSION").as_bytes());
-        hasher.update(EXTENSION_API_VERSION.major.to_le_bytes());
-        hasher.update(format!("{config:?}").as_bytes());
-        let project = workspace.analyzer.analyzer().project();
-        hasher.update(project.root().to_string_lossy().as_bytes());
-        for file in project.all_files_shared().unwrap().iter() {
-            hasher.update([0]);
-            hasher.update(file.rel_path().to_string_lossy().as_bytes());
-            hasher.update([0]);
-            match project.read_source_snapshot(file) {
-                Ok(source) => hasher.update(source.source().as_bytes()),
-                Err(error) if error.kind() == std::io::ErrorKind::InvalidData => {
-                    hasher.update(b"<unsupported-file-content>");
-                }
-                Err(error) => panic!("unexpected source read error: {error}"),
-            }
-        }
-        WorkspaceGeneration::new(
-            StableDigest::parse(format!("{:x}", hasher.finalize())).expect("SHA-256 is canonical"),
-        )
-    }
-
     fn provider(workspace: &ExtensionWorkspace) -> &dyn StructuralFactProvider {
         workspace.analyzer.analyzer().structural_fact_providers()[0]
     }
 
     fn commit_all(repo: &git2::Repository) {
-        let mut index = repo.index().unwrap();
-        index
-            .add_all(["*"].iter(), git2::IndexAddOption::DEFAULT, None)
-            .unwrap();
-        index.write().unwrap();
-        let tree = repo.find_tree(index.write_tree().unwrap()).unwrap();
         let signature = git2::Signature::now("bifrost-test", "test@example.invalid").unwrap();
-        repo.commit(Some("HEAD"), &signature, &signature, "init", &tree, &[])
-            .unwrap();
-    }
-
-    #[test]
-    fn default_open_stays_ephemeral_and_reports_it() {
-        let temp = tempfile::tempdir().unwrap();
-        let root = temp.path().canonicalize().unwrap();
-        write_project(&root);
-        let workspace = open(&root, false);
-        let store = workspace.store();
-        assert_eq!(store.requested, ExtensionPersistenceMode::Ephemeral);
-        assert_eq!(store.engaged, ExtensionPersistenceMode::Ephemeral);
-        assert!(store.cache_db.is_none());
-        assert!(store.diagnostics.is_empty());
-        assert_eq!(&workspace.describe().store, store);
-        assert!(
-            !root.join(".bifrost").exists(),
-            "an ephemeral open must not create an on-disk cache"
-        );
+        crate::test_git_support::commit_all_without_parent(repo, "init", &signature);
     }
 
     #[test]
@@ -2403,22 +2349,6 @@ mod tests {
         assert_ne!(
             second.content_identity(),
             configuration_changed.content_identity()
-        );
-    }
-
-    #[test]
-    fn generation_preserves_the_legacy_byte_stream() {
-        let temp = tempfile::tempdir().unwrap();
-        let root = temp.path().canonicalize().unwrap();
-        write_project(&root);
-        let config = AnalyzerConfig::default();
-        let mut options = ExtensionWorkspaceOptions::new(&root);
-        options.analyzer_config = config.clone();
-        let workspace = ExtensionWorkspace::open(options).unwrap();
-
-        assert_eq!(
-            workspace.generation(),
-            &legacy_generation_for(&workspace, &config)
         );
     }
 

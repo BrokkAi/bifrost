@@ -40,32 +40,37 @@
 //! called only from its own class is never a proven inbound edge, and never
 //! confidently dead either.
 
-use super::KotlinGraphSource;
 use super::resolver::{
-    KotlinNameResolver, KotlinResolutionCtx, bare_callable_unit, kotlin_callable_arities,
-    member_unit, receiver_is_same_owner, receiver_type_fq_name, type_unit, visible_extension_unit,
+    KotlinNameResolver, KotlinResolutionCtx, bare_callable_unit, binding_type_fq_name,
+    kotlin_callable_arities, member_unit, nearest_enclosing_member_unit, receiver_is_same_owner,
+    receiver_type_fq_name, type_unit, visible_extension_unit,
+};
+use super::{
+    KotlinGraphSource, kotlin_constructed_type_components, kotlin_navigation_receiver_identifier,
+    kotlin_outer_user_type_segments, visit_resolved_type_name_prefixes,
 };
 use crate::kotlin::syntax::{
-    kotlin_binding_type_components, kotlin_call_arity, kotlin_call_with_callee, kotlin_callee,
-    kotlin_class_literal_type, kotlin_dotted_navigation_segments, kotlin_import_header_segments,
-    kotlin_is_declaration_name, kotlin_is_expression_kind, kotlin_is_navigation_kind,
-    kotlin_named_argument_label, kotlin_navigation_member, kotlin_navigation_receiver,
-    kotlin_user_type_segments,
+    kotlin_call_arity, kotlin_call_with_callee, kotlin_callee, kotlin_class_literal_type,
+    kotlin_class_literal_type_segments, kotlin_constructed_type_name_nodes,
+    kotlin_dotted_navigation_components, kotlin_import_header_segments, kotlin_is_declaration_name,
+    kotlin_is_navigation_kind, kotlin_named_argument_label, kotlin_navigation_member,
+    kotlin_navigation_receiver, kotlin_value_declaration_name,
 };
 use brokk_bifrost_core::analyzer::ProjectFile;
 use brokk_bifrost_core::analyzer::query_token::QueryToken;
 use brokk_bifrost_core::analyzer::tree_walk::{
-    TreeWalkAction, first_named_child_of_kind, named_children, walk_tree_iterative,
+    TreeWalkAction, first_named_child_of_kind, walk_tree_iterative,
 };
 use brokk_bifrost_core::analyzer::usages::common::node_text;
 use brokk_bifrost_core::analyzer::usages::inverted_edges::{
-    ClassRangeIndex, FileEdgeScanInput, PerFileEdges, classify_reference_node,
+    ClassRangeIndex, FileEdgeScanInput, PerFileEdges,
 };
 use brokk_bifrost_core::analyzer::usages::local_inference::{
     LocalInferenceConfig, LocalInferenceEngine,
 };
 use brokk_bifrost_core::analyzer::usages::same_owner::route_same_owner;
 use brokk_bifrost_core::hash::HashMap;
+use std::ops::ControlFlow;
 use tree_sitter::Node;
 
 /// Node kinds that open a Kotlin binding scope.
@@ -233,18 +238,12 @@ impl KotlinEdgeScan<'_> {
     }
 
     fn record(&mut self, callee: String, node: Node<'_>) {
-        self.edges.record_kind(
-            self.input,
-            callee,
-            classify_reference_node(node),
-            node.start_byte(),
-            node.end_byte(),
-        );
+        self.edges.record_reference(self.input, callee, node);
     }
 
     fn record_unproven(&mut self, name: &str, node: Node<'_>) {
         self.edges
-            .record_unproven_name(self.input, name, node.start_byte(), node.end_byte());
+            .record_unproven_name_at_node(self.input, name, node);
     }
 }
 
@@ -273,49 +272,11 @@ fn walk(root: Node<'_>, token: QueryToken<'_>, scan: &mut KotlinEdgeScan<'_>) {
 /// establish one, otherwise a *shadow* — a binding of unknown type that keeps a
 /// local from being misread as the class it hides.
 fn seed_value_declarations(node: Node<'_>, token: QueryToken<'_>, scan: &mut KotlinEdgeScan<'_>) {
-    if !matches!(
-        node.kind(),
-        "variable_declaration" | "parameter" | "class_parameter" | "parameter_with_optional_type"
-    ) {
-        return;
-    }
-    let Some(name_node) = first_named_child_of_kind(node, "simple_identifier") else {
+    let Some(name) = kotlin_value_declaration_name(node, scan.source) else {
         return;
     };
-    let name = node_text(name_node, scan.source).to_string();
-    if name.is_empty() {
-        return;
-    }
-    match binding_type_fq_name(node, token, scan) {
-        Some(fqn) => scan.bindings.seed_symbol(name, fqn),
-        None => scan.bindings.declare_shadow(name),
-    }
-}
-
-fn binding_type_fq_name(
-    binding: Node<'_>,
-    token: QueryToken<'_>,
-    scan: &mut KotlinEdgeScan<'_>,
-) -> Option<String> {
-    if let Some(components) = kotlin_binding_type_components(binding, scan.source)
-        && let Some(fqn) = scan
-            .names
-            .resolve_type_components(&components, binding.start_byte())
-    {
-        return Some(fqn);
-    }
-    // A `variable_declaration` holds only the name and the written type; the
-    // initializer is its sibling under the enclosing `property_declaration`.
-    let owner = if binding.kind() == "variable_declaration" {
-        binding.parent()?
-    } else {
-        binding
-    };
-    let initializer = named_children(owner)
-        .into_iter()
-        .rev()
-        .find(|child| kotlin_is_expression_kind(child.kind()))?;
-    receiver_type_fq_name(initializer, token, scan, 0)
+    let target = binding_type_fq_name(node, token, scan);
+    scan.bindings.seed_or_shadow(name, target);
 }
 
 fn record_reference(node: Node<'_>, token: QueryToken<'_>, scan: &mut KotlinEdgeScan<'_>) {
@@ -355,18 +316,8 @@ fn record_reference(node: Node<'_>, token: QueryToken<'_>, scan: &mut KotlinEdge
 /// value namespace: a binding of the leading name proves the receiver is a value,
 /// and a value's runtime class names no declaration this pass could edge to.
 fn record_class_literal(literal: Node<'_>, scan: &mut KotlinEdgeScan<'_>) {
-    let segments = match literal.kind() {
-        // A bare name, aliased to `type_identifier` by the callable-reference
-        // form and left a `simple_identifier` by the navigation one.
-        "type_identifier" | "simple_identifier" => vec![literal],
-        kind if kotlin_is_navigation_kind(kind) => {
-            let Some(segments) = kotlin_dotted_navigation_segments(literal) else {
-                return;
-            };
-            segments
-        }
-        // `f()::class` names the runtime class of a call's result.
-        _ => return,
+    let Some(segments) = kotlin_class_literal_type_segments(literal) else {
+        return;
     };
     let Some(leading) = segments.first() else {
         return;
@@ -415,13 +366,10 @@ fn record_user_type(user_type: Node<'_>, scan: &mut KotlinEdgeScan<'_>) {
     // A nested `user_type` is reached through its parent's segment walk. Generic
     // arguments sit inside `type_arguments`, not directly under their owner, so
     // they are still visited in their own right.
-    if user_type
-        .parent()
-        .is_some_and(|parent| parent.kind() == "user_type")
-    {
+    let Some(segments) = kotlin_outer_user_type_segments(user_type) else {
         return;
-    }
-    record_type_name_segments(&kotlin_user_type_segments(user_type), scan);
+    };
+    record_type_name_segments(&segments, scan);
 }
 
 /// Record one edge per resolving prefix of a dotted type name, so an outer type's
@@ -430,20 +378,10 @@ fn record_type_name_segments(segments: &[Node<'_>], scan: &mut KotlinEdgeScan<'_
     if !scan.may_match_type_segments(segments) {
         return;
     }
-    let mut components = Vec::new();
-    for segment in segments {
-        let name = node_text(*segment, scan.source);
-        if name.is_empty() {
-            return;
-        }
-        components.push(name.to_string());
-        if let Some(resolved) = scan
-            .names
-            .resolve_type_components(&components, segment.start_byte())
-        {
-            scan.record(resolved, *segment);
-        }
-    }
+    visit_resolved_type_name_prefixes(segments, scan.source, scan.names, |segment, resolved| {
+        scan.record(resolved, segment);
+        ControlFlow::Continue(())
+    });
 }
 
 /// Record `class D : Base(1)` — a reference to the superclass and, when the
@@ -462,38 +400,27 @@ fn record_constructor_invocation(node: Node<'_>, scan: &mut KotlinEdgeScan<'_>) 
 /// takes: a bare name, a `user_type` in a supertype list, or a dotted
 /// navigation.
 fn resolve_constructed_type(callee: Node<'_>, scan: &mut KotlinEdgeScan<'_>) -> Option<String> {
+    let (_terminal, segments) = kotlin_constructed_type_name_nodes(callee)?;
+    if callee.kind() == "user_type" && !scan.may_match_type_segments(&segments) {
+        return None;
+    }
+    let components = kotlin_constructed_type_components(callee.kind(), &segments, scan.source)?;
     match callee.kind() {
         "simple_identifier" => {
-            let name = node_text(callee, scan.source).to_string();
+            let name = components.first()?;
             if name.is_empty()
-                || !scan.may_match_spelled_name(&name)
-                || scan.bindings.is_shadowed(&name)
+                || !scan.may_match_spelled_name(name)
+                || scan.bindings.is_shadowed(name)
             {
                 return None;
             }
             scan.names
-                .resolve_type_components(std::slice::from_ref(&name), callee.start_byte())
+                .resolve_type_components(&components, callee.start_byte())
         }
-        "user_type" => {
-            let segments = kotlin_user_type_segments(callee);
-            if !scan.may_match_type_segments(&segments) {
-                return None;
-            }
-            let components = segments
-                .iter()
-                .map(|segment| node_text(*segment, scan.source))
-                .filter(|component| !component.is_empty())
-                .map(str::to_string)
-                .collect::<Vec<_>>();
-            (!components.is_empty())
-                .then(|| {
-                    scan.names
-                        .resolve_type_components(&components, callee.start_byte())
-                })
-                .flatten()
-        }
+        "user_type" => scan
+            .names
+            .resolve_type_components(&components, callee.start_byte()),
         kind if kotlin_is_navigation_kind(kind) => {
-            let components = dotted_navigation_components(callee, scan)?;
             if !components
                 .iter()
                 .any(|component| scan.may_match_spelled_name(component))
@@ -531,10 +458,11 @@ fn record_constructor_of(
         .structural_members(owner.fq(), owner.identifier())
         .into_iter()
         .find(|candidate| {
-            candidate.is_function()
-                && kotlin_callable_arities(scan.graph, candidate)
-                    .iter()
-                    .any(|recorded| recorded.accepts(arity))
+            if !candidate.is_function() {
+                return false;
+            }
+            let arities = kotlin_callable_arities(scan.graph, candidate);
+            arities.is_empty() || arities.iter().any(|recorded| recorded.accepts(arity))
         });
     if let Some(constructor) = constructor {
         scan.record(constructor.fq_name(), reference);
@@ -542,19 +470,6 @@ fn record_constructor_of(
 }
 
 /// The dotted name a navigation spells, when every link of it is a plain name.
-fn dotted_navigation_components(
-    navigation: Node<'_>,
-    scan: &KotlinEdgeScan<'_>,
-) -> Option<Vec<String>> {
-    let segments = kotlin_dotted_navigation_segments(navigation)?;
-    let names: Vec<&str> = segments
-        .iter()
-        .map(|segment| node_text(*segment, scan.source))
-        .collect();
-    (!names.iter().any(|name| name.is_empty()))
-        .then(|| names.into_iter().map(str::to_string).collect())
-}
-
 /// Record a bare `simple_identifier` that names a *type* used as a qualifier:
 /// the receiver of a member access, as in `Base.helper()` or `Color.RED`.
 ///
@@ -563,25 +478,15 @@ fn dotted_navigation_components(
 /// declaration's own name, and it must not be shadowed by a local — `val Base =
 /// 1; Base.length` is a property access on a string, not a reference to a class.
 fn record_bare_identifier(node: Node<'_>, scan: &mut KotlinEdgeScan<'_>) {
-    if kotlin_is_declaration_name(node) {
-        return;
-    }
-    let name = node_text(node, scan.source).to_string();
-    if name.is_empty() || !scan.may_match_spelled_name(&name) || scan.bindings.is_shadowed(&name) {
-        return;
-    }
-    let Some(navigation) = node
-        .parent()
-        .filter(|parent| kotlin_is_navigation_kind(parent.kind()))
-    else {
+    let Some((_, name)) = kotlin_navigation_receiver_identifier(node, scan.source) else {
         return;
     };
-    if kotlin_navigation_receiver(navigation).is_none_or(|receiver| receiver.id() != node.id()) {
+    if !scan.may_match_spelled_name(name) || scan.bindings.is_shadowed(name) {
         return;
     }
     if let Some(resolved) = scan
         .names
-        .resolve_type_components(std::slice::from_ref(&name), node.start_byte())
+        .resolve_type_components(&[name.to_string()], node.start_byte())
     {
         scan.record(resolved, node);
     }
@@ -605,7 +510,7 @@ fn record_call(call: Node<'_>, token: QueryToken<'_>, scan: &mut KotlinEdgeScan<
             if !scan.may_match_terminal(node_text(member, scan.source)) {
                 return;
             }
-            if let Some(owner_fqn) = dotted_navigation_components(callee, scan)
+            if let Some(owner_fqn) = kotlin_dotted_navigation_components(callee, scan.source)
                 .and_then(|components| {
                     scan.names
                         .resolve_type_components(&components, callee.start_byte())
@@ -646,10 +551,7 @@ fn record_call(call: Node<'_>, token: QueryToken<'_>, scan: &mut KotlinEdgeScan<
 /// Record `::name`, a callable reference. No arity is applied, so the reference
 /// is judged on the name alone.
 fn record_callable_reference(reference: Node<'_>, scan: &mut KotlinEdgeScan<'_>) {
-    let Some(name_node) = named_children(reference)
-        .into_iter()
-        .find(|child| child.kind() == "simple_identifier")
-    else {
+    let Some(name_node) = first_named_child_of_kind(reference, "simple_identifier") else {
         return;
     };
     let name = node_text(name_node, scan.source).to_string();
@@ -672,24 +574,18 @@ fn record_bare_callable(
     // owner that declares the name is the one the reference binds to; a
     // further-out one cannot also answer it.
     let owners = scan.enclosing_owner_fq_names(token);
-    for owner in &owners {
-        if let Some(found) = member_unit(owner, name, arity, scan) {
-            let fqn = found.fq_name();
-            route_same_owner(
-                scan,
-                true,
-                |scan| {
-                    scan.edges.record_unproven(
-                        scan.input,
-                        fqn,
-                        token.start_byte(),
-                        token.end_byte(),
-                    )
-                },
-                |scan| scan.record_unproven(name, token),
-            );
-            return;
-        }
+    if let Some(found) = nearest_enclosing_member_unit(&owners, name, arity, scan) {
+        let fqn = found.fq_name();
+        route_same_owner(
+            scan,
+            true,
+            |scan| {
+                scan.edges
+                    .record_unproven(scan.input, fqn, token.start_byte(), token.end_byte())
+            },
+            |scan| scan.record_unproven(name, token),
+        );
+        return;
     }
     let unit = match arity {
         Some(arity) => bare_callable_unit(name, arity, token, scan),

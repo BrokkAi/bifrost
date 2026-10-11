@@ -4,6 +4,7 @@ use crate::analyzer::source_facts::{
     SourceFactRows, SourceOccurrence, SourceOccurrenceId, SourceOccurrenceProvenance,
 };
 use crate::analyzer::structural::facts::Span;
+use brokk_bifrost_test_macros::hardwon;
 
 fn source_rows() -> SourceFactRows {
     SourceFactRows::new(
@@ -40,6 +41,7 @@ fn source_rows() -> SourceFactRows {
     )
 }
 
+#[hardwon("abff47417358: an unavailable import path lost its canonical source identity")]
 #[test]
 fn unavailable_path_round_trip_retains_source_identity() {
     let rows = source_rows();
@@ -81,6 +83,7 @@ fn unavailable_path_round_trip_retains_source_identity() {
     );
 }
 
+#[hardwon("abff47417358: an empty structured import path lost canonical spans")]
 #[test]
 fn empty_structured_path_round_trip_uses_canonical_spans() {
     let rows = source_rows();

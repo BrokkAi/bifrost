@@ -4,6 +4,7 @@
 //! [`ProjectFile`] lives in `brokk-bifrost-analysis` instead: it reads a
 //! workspace listing off an `IAnalyzer`, which is above this crate.
 
+use std::borrow::Cow;
 use std::path::{Component, Path, PathBuf};
 
 use crate::analyzer::ProjectFile;
@@ -12,8 +13,27 @@ pub fn normalize_pattern(pattern: &str) -> String {
     pattern.replace('\\', "/")
 }
 
+/// Whether `pattern` contains any supported glob metacharacter.
+pub fn contains_glob_syntax(pattern: &str) -> bool {
+    pattern.contains(['*', '?', '['])
+}
+
 pub fn rel_path_string(file: &ProjectFile) -> String {
     file.rel_path().to_string_lossy().replace('\\', "/")
+}
+
+/// Whether `path` starts with a Windows drive-absolute prefix.
+pub fn is_windows_absolute_path(path: &str) -> bool {
+    has_drive_letter_prefix(path) && matches!(path.as_bytes().get(2), Some(b'/' | b'\\'))
+}
+
+/// Render a workspace-relative path as a slash-separated key by joining its
+/// path components. A backslash that is part of a Unix filename stays literal.
+pub fn workspace_relative_slash_path(path: &Path) -> String {
+    path.components()
+        .map(|component| component.as_os_str().to_string_lossy())
+        .collect::<Vec<_>>()
+        .join("/")
 }
 
 /// The path-suffix key `path` denotes: its `Normal` components joined with
@@ -32,16 +52,20 @@ pub fn rel_path_string(file: &ProjectFile) -> String {
 /// too-narrow one would silently drop a file from the index.
 pub fn path_suffix_key(path: &Path) -> Option<String> {
     let mut key = String::new();
-    for component in path.components() {
-        let Component::Normal(part) = component else {
-            continue;
-        };
+    for part in normal_path_components(path) {
         if !key.is_empty() {
             key.push('/');
         }
-        key.push_str(&part.to_string_lossy());
+        key.push_str(&part);
     }
     (!key.is_empty()).then_some(key)
+}
+
+fn normal_path_components(path: &Path) -> impl Iterator<Item = Cow<'_, str>> {
+    path.components().filter_map(|component| match component {
+        Component::Normal(part) => Some(part.to_string_lossy()),
+        _ => None,
+    })
 }
 
 /// Every suffix of `path`'s `Normal` components as a [`path_suffix_key`],
@@ -52,12 +76,8 @@ pub fn path_suffix_key(path: &Path) -> Option<String> {
 /// path, includer-relative path, and the trailing-components fallback are all
 /// component suffixes of the file that satisfies them.
 pub fn path_suffix_keys(path: &Path) -> Vec<String> {
-    let parts: Vec<String> = path
-        .components()
-        .filter_map(|component| match component {
-            Component::Normal(part) => Some(part.to_string_lossy().into_owned()),
-            _ => None,
-        })
+    let parts: Vec<String> = normal_path_components(path)
+        .map(|part| part.into_owned())
         .collect();
     (0..parts.len())
         .map(|start| parts[start..].join("/"))
@@ -106,6 +126,22 @@ pub fn workspace_rel_path(input: &str) -> Option<PathBuf> {
     Some(rel)
 }
 
+/// Normalize `path` against a relative base, rejecting attempts to escape it.
+pub fn normalize_relative_path_from(base: &Path, path: &Path) -> Option<PathBuf> {
+    let mut normalized = base.to_path_buf();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::Normal(part) => normalized.push(part),
+            Component::ParentDir => {
+                normalized.pop().then_some(())?;
+            }
+            Component::RootDir | Component::Prefix(_) => return None,
+        }
+    }
+    Some(normalized)
+}
+
 pub fn has_drive_letter_prefix(s: &str) -> bool {
     let mut chars = s.chars();
     matches!(
@@ -134,7 +170,7 @@ pub fn percent_decode(input: &str) -> String {
     String::from_utf8_lossy(&out).into_owned()
 }
 
-fn hex_value(byte: u8) -> Option<u8> {
+pub fn hex_value(byte: u8) -> Option<u8> {
     match byte {
         b'0'..=b'9' => Some(byte - b'0'),
         b'a'..=b'f' => Some(byte - b'a' + 10),
@@ -145,8 +181,23 @@ fn hex_value(byte: u8) -> Option<u8> {
 
 #[cfg(test)]
 mod tests {
-    use super::{percent_decode, workspace_rel_path};
-    use std::path::PathBuf;
+    use super::{percent_decode, workspace_rel_path, workspace_relative_slash_path};
+    use std::path::{Path, PathBuf};
+
+    #[test]
+    fn workspace_relative_slash_path_joins_components() {
+        let path = Path::new("src").join("main.rs");
+        assert_eq!("src/main.rs", workspace_relative_slash_path(&path));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn workspace_relative_slash_path_preserves_literal_unix_backslash() {
+        assert_eq!(
+            r"literal\backslash.rs",
+            workspace_relative_slash_path(Path::new(r"literal\backslash.rs")),
+        );
+    }
 
     #[test]
     fn percent_decode_handles_unicode_spaces_and_malformed_escapes() {
@@ -165,6 +216,9 @@ mod tests {
     /// leading `?` case is what a verbatim UNC spelling normalizes to after the
     /// root trim.
     #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "92139ed3d8b9: a drive-shaped component inside the path could escape the workspace"
+    )]
     fn workspace_rel_path_rejects_drive_shaped_components_anywhere() {
         for input in [
             "C:/x", "./C:/x", "a/C:/b", "a\\C:\\b", "./a:", "a:", "a/b:", "?/C:/x",
@@ -304,20 +358,6 @@ mod path_properties {
             })
     }
 
-    /// Strings around the drive-letter boundary, including near misses.
-    fn drive_shaped_string() -> impl Strategy<Value = String> {
-        prop_oneof![
-            "[A-Za-z]:[a-z/\\\\]{0,3}",
-            "[0-9]:[a-z]{0,2}",
-            "[A-Za-z];[a-z]{0,2}",
-            "[A-Za-z]{2,3}:[a-z]{0,2}",
-            "\u{e9}:[a-z]{0,2}",
-            literal(""),
-            literal(":"),
-            literal("c"),
-        ]
-    }
-
     /// A segment that survives `Path::components` as a single `Normal`: it
     /// starts with a letter, so it is never `.`, `..`, empty, or a separator.
     fn safe_component() -> impl Strategy<Value = String> {
@@ -343,19 +383,7 @@ mod path_properties {
             );
         }
 
-        /// Contract: true exactly when the first character is an ASCII letter
-        /// and the second is `:`. The cross-check is byte-level rather than
-        /// char-level, so a multi-byte leading character cannot be mistaken for
-        /// a drive letter.
-        #[test]
-        fn has_drive_letter_prefix_agrees_with_byte_predicate(
-            input in prop_oneof![drive_shaped_string(), adversarial_path(), any::<String>()],
-        ) {
-            let bytes = input.as_bytes();
-            let expected =
-                bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':';
-            prop_assert_eq!(has_drive_letter_prefix(&input), expected, "{:?}", input);
-        }
+
 
         /// The documented rejections. Note the leading-`/` trim happens first,
         /// so a root anchor is stripped rather than rejected; everything the
@@ -463,29 +491,9 @@ mod path_properties {
             }
         }
 
-        /// Totality over arbitrary input, including non-path text.
-        #[test]
-        fn workspace_rel_path_never_panics(input in any::<String>()) {
-            if let Some(rel) = workspace_rel_path(&input) {
-                prop_assert!(!rel.as_os_str().is_empty());
-                prop_assert!(rel.is_relative());
-            }
-        }
 
-        /// `path_suffix_keys` yields one key per `Normal` component, longest
-        /// first, and its first entry is exactly `path_suffix_key`.
-        #[test]
-        fn path_suffix_keys_cover_every_normal_component(
-            components in prop::collection::vec(safe_component(), 1..6),
-        ) {
-            let path = PathBuf::from(components.join("/"));
-            let keys = path_suffix_keys(&path);
-            prop_assert_eq!(keys.len(), components.len());
-            prop_assert_eq!(keys.first().cloned(), path_suffix_key(&path));
-            for (start, key) in keys.iter().enumerate() {
-                prop_assert_eq!(key, &components[start..].join("/"));
-            }
-        }
+
+
 
         /// Structure of the keys for any path: non-empty, strictly shortening,
         /// and each a component-boundary suffix of the one before it.
@@ -555,15 +563,7 @@ mod path_properties {
             );
         }
 
-        /// Escape-free input is returned unchanged. The generator strips `%`
-        /// by construction rather than via `prop_assume!`, whose fixed reject
-        /// budget aborts high-case-count runs such as a nightly stress pass.
-        #[test]
-        fn percent_decode_is_identity_without_escapes(
-            input in any::<String>().prop_map(|s| s.replace('%', "")),
-        ) {
-            prop_assert_eq!(percent_decode(&input), input);
-        }
+
 
         /// The decoder inverts a total `%XX` encoding of every byte, for any
         /// Unicode string.

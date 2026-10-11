@@ -9,7 +9,8 @@ use brokk_bifrost_core::analyzer::resolution_facts::ResolutionNamespace;
 pub(in crate::analyzer::store) const DECLARATIONS: &str = r#"
 SELECT request.mount_ordinal, request.key0, owner_type.kind,
        callable.is_method, receiver.kind, field.declaration_id,
-       field_semantic.semantic_key, value.slot, field.name, field.embedded
+       field_semantic.semantic_key, value.slot, field.name, field.embedded,
+       interface_method.name, interface_method_semantic.semantic_key
 FROM temp.selected_resolution_typed_requests_1 AS request
 CROSS JOIN temp.selected_resolution_mounts AS mount
   ON mount.mount_ordinal=request.mount_ordinal AND mount.semantic_language='go'
@@ -44,6 +45,16 @@ LEFT JOIN main.source_go_callables AS callable
   ON callable.blob_id=bridge.blob_id AND callable.declaration_id=bridge.declaration_id
 LEFT JOIN main.source_go_types AS receiver
   ON receiver.blob_id=callable.blob_id AND receiver.type_id=callable.receiver_type_id
+LEFT JOIN main.source_go_callables AS interface_method
+  ON interface_method.blob_id=owner_type.blob_id
+ AND interface_method.owner_type_id=owner_type.type_id AND interface_method.is_method=1
+LEFT JOIN main.source_native_declaration_bridges AS interface_method_bridge
+  ON interface_method_bridge.blob_id=interface_method.blob_id
+ AND interface_method_bridge.declaration_id=interface_method.declaration_id
+LEFT JOIN main.resolution_semantic_sites AS interface_method_semantic
+  ON interface_method_semantic.blob_id=interface_method_bridge.blob_id
+ AND interface_method_semantic.source_site=interface_method_bridge.source_site
+ AND interface_method_semantic.semantic_role='definition'
 "#;
 
 pub(super) fn read(
@@ -131,7 +142,22 @@ pub(super) fn read(
                     }
                     GoMemberDeclarationKind::Struct { fields }
                 } else if owner_kind == Some(13) {
-                    GoMemberDeclarationKind::Interface
+                    let mut methods = Vec::new();
+                    if let Some(name) = row.get::<_, Option<String>>(10)? {
+                        let recipe =
+                            crate::analyzer::resolution::ResolutionLookupSemanticRecipe::new(
+                                Language::Go,
+                                ResolutionNamespace::Callable,
+                                &name,
+                            );
+                        methods.push(crate::analyzer::resolution::GoInterfaceMethod {
+                            callable_lookup: recipe.semantic(&names),
+                            definition: row
+                                .get::<_, Option<u32>>(11)?
+                                .map(|key| SemanticId::local(ordinal.get(), key)),
+                        });
+                    }
+                    GoMemberDeclarationKind::Interface { methods }
                 } else if method == Some(true) {
                     let receiver_kind: Option<i64> = row.get(4)?;
                     GoMemberDeclarationKind::Method {
@@ -164,6 +190,16 @@ pub(super) fn read(
                         GoMemberDeclarationKind::Struct { fields: more },
                     ) => {
                         fields.extend(more);
+                    }
+                    (
+                        GoMemberDeclarationKind::Interface { methods },
+                        GoMemberDeclarationKind::Interface { methods: more },
+                    ) => {
+                        methods.extend(more);
+                        methods.sort_unstable_by_key(|method| {
+                            (method.callable_lookup, method.definition)
+                        });
+                        methods.dedup();
                     }
                     (previous, kind) if *previous == kind => {}
                     _ => {

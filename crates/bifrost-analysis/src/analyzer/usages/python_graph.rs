@@ -12,16 +12,17 @@ use crate::analyzer::usages::traits::GraphUsageAnalyzer;
 use crate::analyzer::{AnalyzerQueryScope, QueryScope};
 
 use crate::analyzer::store::StoreError;
-use crate::analyzer::usages::common::{classify_recursive_hits, language_for_target};
+use crate::analyzer::usages::common::{
+    classify_recursive_hits, language_for_target, with_relational_frontier,
+};
 use crate::analyzer::usages::inverted_edges::{
     EdgeNodeDomain, UsageEdgeBuildOutput, UsageEdgeBuildResult, UsageEdgeWeights, UsageEdges,
     build_edge_output_with_completeness, parse_and_collect_with_domain,
 };
-use crate::analyzer::usages::model::FuzzyResult;
 use crate::analyzer::usages::outcome::{
     CandidateUsageHits, GraphFailureReason, GraphUsageOutcome, union_candidate_usages,
 };
-use crate::analyzer::usages::traits::{UsageQueryResolver, UsageScanScope};
+use crate::analyzer::usages::traits::{GraphUsageDispatchSpec, UsageQueryResolver, UsageScanScope};
 use crate::analyzer::{
     CodeUnit, IAnalyzer, Language, ProjectFile, PythonAnalyzer, resolve_analyzer,
 };
@@ -49,28 +50,15 @@ pub(in crate::analyzer::usages) fn with_python_graph_source<R>(
     mut visit: impl FnMut(PythonGraphSource<'_>) -> R,
 ) -> R {
     let scope = AnalyzerQueryScope::new(analyzer);
-    let cancellation = crate::CancellationToken::new();
-    match crate::analyzer::relational_frontier::resolve_relational_frontier(
-        analyzer,
-        &cancellation,
-        |frontier| {
-            visit(PythonGraphSource {
-                token: scope.token(),
-                index: analyzer,
-                hierarchy: analyzer.type_hierarchy_provider(),
-                imports: analyzer.import_analysis_provider(),
-                definitions: frontier,
-            })
-        },
-    ) {
-        crate::analyzer::RelationalFrontierOutcome::Complete(result) => result,
-        crate::analyzer::RelationalFrontierOutcome::Cancelled => {
-            unreachable!("an uncancelled Python helper frontier cannot cancel")
-        }
-        crate::analyzer::RelationalFrontierOutcome::Failed(error) => {
-            panic!("Python relational helper frontier failed: {error:?}")
-        }
-    }
+    with_relational_frontier(analyzer, "Python", |frontier| {
+        visit(PythonGraphSource {
+            token: scope.token(),
+            index: analyzer,
+            hierarchy: analyzer.type_hierarchy_provider(),
+            imports: analyzer.import_analysis_provider(),
+            definitions: frontier,
+        })
+    })
 }
 
 /// The whole-workspace inverted pass: the shared driver's parallel fan-out plus
@@ -424,100 +412,36 @@ impl GraphUsageAnalyzer for PythonExportUsageGraphStrategy {
         scan_scope: &UsageScanScope<'_>,
         max_usages: usize,
     ) -> GraphUsageOutcome {
-        if overloads.is_empty() {
-            return GraphUsageOutcome::Resolved(FuzzyResult::empty_success());
-        }
-
-        let target = &overloads[0];
-        if language_for_target(target) != Language::Python {
-            return GraphUsageOutcome::fallback_safe(
-                target.fq_name(),
-                GraphFailureReason::UnsupportedTargetLanguage("target is not Python"),
-                PYTHON_STRATEGY,
-            );
-        }
-
-        let Some(resolver) = PythonQueryResolver::try_new(analyzer) else {
-            return GraphUsageOutcome::fallback_safe(
-                target.fq_name(),
-                GraphFailureReason::MissingAnalyzerCapability(
-                    "analyzer does not expose PythonAnalyzer",
-                ),
-                PYTHON_STRATEGY,
-            );
-        };
-
-        resolver.find_usages(analyzer, overloads, scan_scope, max_usages)
+        crate::analyzer::usages::traits::dispatch_graph_usage_query::<PythonQueryResolver<'_>>(
+            analyzer,
+            overloads,
+            scan_scope,
+            max_usages,
+            GraphUsageDispatchSpec {
+                target_language: Language::Python,
+                unsupported_target: "target is not Python",
+                missing_analyzer: "analyzer does not expose PythonAnalyzer",
+                strategy: PYTHON_STRATEGY,
+            },
+        )
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{build_cached_python_usage_edges_for_targets, build_rooted_python_usage_edges};
-    use crate::analyzer::usages::python_graph::with_python_graph_source;
+    use super::{
+        build_cached_python_usage_edges_for_targets, build_rooted_python_usage_edges,
+        collect_scope_facts_from_parsed_source, with_python_graph_source,
+    };
+
     use crate::analyzer::{AnalyzerQueryScope, AnalyzerTestHooks, QueryScope};
     use crate::analyzer::{CodeUnitIndex, ImportAnalysisProvider, Language, PythonAnalyzer};
     use crate::inline_project::InlineTestProject;
-    use brokk_bifrost_python::graph::extractor::{
-        collect_scope_facts_from_parsed_source, with_callable_return_type_lookup_counter_for_test,
-    };
+
+    use brokk_bifrost_python::graph::extractor::with_callable_return_type_lookup_counter_for_test;
     use brokk_bifrost_python::graph_support::PythonSource;
+    use brokk_bifrost_test_macros::hardwon;
 
-    /// Imported annotations remain available from captured declaration metadata
-    /// when the declaration's source file is no longer readable.
-    #[test]
-    fn imported_factory_return_walk_uses_canonical_declarations() {
-        let consumer_source = "from models import User\n\n\ndef run():\n    user = User.guest()\n    return user.normalized_name\n";
-        let fixture = InlineTestProject::with_language(Language::Python)
-            .file("models.py", "class User:\n    @property\n    def normalized_name(self) -> str:\n        return \"n\"\n\n    @classmethod\n    def guest(cls) -> \"User\":\n        return cls()\n")
-            .file("consumer.py", consumer_source)
-            .build();
-        let analyzer = PythonAnalyzer::new(fixture.project_dyn());
-        assert!(
-            !analyzer
-                .get_definitions("models.User.normalized_name")
-                .is_empty(),
-            "fixture should index the property under its module-qualified name"
-        );
-        let consumer = analyzer
-            .get_analyzed_files()
-            .into_iter()
-            .find(|file| file.to_string().ends_with("consumer.py"))
-            .expect("consumer file");
-        let scope = AnalyzerQueryScope::new(&analyzer);
-        let prepared = analyzer
-            .prepared_syntax(scope.token(), &consumer)
-            .expect("consumer prepared syntax");
-
-        let (facts, counts) = with_callable_return_type_lookup_counter_for_test(|| {
-            with_python_graph_source(&analyzer, |graph| {
-                let models = fixture.file("models.py");
-                let captured = analyzer
-                    .prepared_syntax(graph.token, &models)
-                    .expect("capture foreign declaration snapshot");
-                assert!(captured.source().contains("def guest"));
-                std::fs::remove_file(models.abs_path()).expect("remove declaration source");
-                collect_scope_facts_from_parsed_source(
-                    &graph,
-                    &analyzer,
-                    &consumer,
-                    prepared.source(),
-                    prepared.tree().root_node(),
-                )
-                .expect("captured Python scope facts")
-            })
-        });
-
-        assert!(!facts.is_empty());
-        assert!(
-            counts.canonical > 0,
-            "fixture must exercise the return-type walk: {counts:?}"
-        );
-        assert_eq!(
-            counts.body, 0,
-            "annotated returns must use captured metadata without body inference: {counts:?}"
-        );
-    }
     #[test]
     fn export_index_uses_captured_scope_and_order_after_source_removal() {
         use brokk_bifrost_core::analyzer::usages::model::ExportEntry;
@@ -706,6 +630,9 @@ mod tests {
     /// fallback -- plus a negative case, proving the deferral changed only
     /// when each check runs, not what it decides.
     #[test]
+    #[hardwon(
+        "#2999: The rooted Python scan resolves direct namespace and inherited calls while restricting work to roots"
+    )]
     fn rooted_scan_resolves_direct_namespace_and_inherited_callees() {
         let project = InlineTestProject::with_language(Language::Python)
             .file(
@@ -786,6 +713,9 @@ mod tests {
     /// `canonical_namespace_candidates` into `real.helper` -- which must only be
     /// recorded as an edge when the caller actually asked for it.
     #[test]
+    #[hardwon(
+        "#2999: Bounded Python namespace fallback candidates are filtered against the requested target set"
+    )]
     fn bounded_scan_namespace_fallback_candidates_are_filtered_by_targets() {
         let project = InlineTestProject::with_language(Language::Python)
             .file("real.py", "def helper():\n    return 1\n")
@@ -823,17 +753,64 @@ mod tests {
         );
     }
 
-    /// An empty `pkg/__init__.py` is ordinary Python: it declares the package and
-    /// contributes no edges. The whole-workspace inverted pass fails closed on any
-    /// file whose scan produced no per-file result, so an empty file that the
-    /// on-demand parse refuses to parse takes the entire graph down with it -- the
-    /// build returns `None` and every caller of `usage_graph` on a package with an
-    /// empty `__init__.py` gets "Python usage edge build omitted files".
-    ///
-    /// `build_rooted_python_usage_edges` returns `Some` only when the driver saw a
-    /// result for every kept file: the other `None` is a workspace with no Python
-    /// files at all, which the assertion below rules out.
     #[test]
+    fn imported_factory_return_walk_uses_canonical_declarations() {
+        let consumer_source = "from models import User\n\n\ndef run():\n    user = User.guest()\n    return user.normalized_name\n";
+        let fixture = InlineTestProject::with_language(Language::Python)
+            .file("models.py", "class User:\n    @property\n    def normalized_name(self) -> str:\n        return \"n\"\n\n    @classmethod\n    def guest(cls) -> \"User\":\n        return cls()\n")
+            .file("consumer.py", consumer_source)
+            .build();
+        let analyzer = PythonAnalyzer::new(fixture.project_dyn());
+        assert!(
+            !analyzer
+                .get_definitions("models.User.normalized_name")
+                .is_empty(),
+            "fixture should index the property under its module-qualified name"
+        );
+        let consumer = analyzer
+            .get_analyzed_files()
+            .into_iter()
+            .find(|file| file.to_string().ends_with("consumer.py"))
+            .expect("consumer file");
+        let scope = AnalyzerQueryScope::new(&analyzer);
+        let prepared = analyzer
+            .prepared_syntax(scope.token(), &consumer)
+            .expect("consumer prepared syntax");
+
+        let (facts, counts) = with_callable_return_type_lookup_counter_for_test(|| {
+            with_python_graph_source(&analyzer, |graph| {
+                let models = fixture.file("models.py");
+                let captured = analyzer
+                    .prepared_syntax(graph.token, &models)
+                    .expect("capture foreign declaration snapshot");
+                assert!(captured.source().contains("def guest"));
+                std::fs::remove_file(models.abs_path()).expect("remove declaration source");
+                collect_scope_facts_from_parsed_source(
+                    &graph,
+                    &analyzer,
+                    &consumer,
+                    prepared.source(),
+                    prepared.tree().root_node(),
+                )
+                .expect("captured Python scope facts")
+            })
+        });
+
+        assert!(!facts.is_empty());
+        assert!(
+            counts.canonical > 0,
+            "fixture must exercise the return-type walk: {counts:?}"
+        );
+        assert_eq!(
+            counts.body, 0,
+            "annotated returns must use captured metadata without body inference: {counts:?}"
+        );
+    }
+
+    #[test]
+    #[hardwon(
+        "12a397623142: an empty package initializer was treated as absent and omitted from Python usage scans"
+    )]
     fn empty_package_init_is_scanned_rather_than_omitted() {
         let project = InlineTestProject::with_language(Language::Python)
             .file("pkg/__init__.py", "")

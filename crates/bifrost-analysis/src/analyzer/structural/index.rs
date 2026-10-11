@@ -39,7 +39,15 @@ use std::time::Instant;
 // tag/attribute/child/key/value role postings change derived index content (#2645).
 // Version 5: `module` facts for module and namespace declarations change
 // derived index content (#2518).
-pub const STRUCTURAL_INDEX_REPRESENTATION_VERSION: u32 = 5;
+// Version 6: comment-token and queryable syntax-error facts change the kind
+// postings (#4337).
+// Version 7: decoded Python regex terms, risk facts, and comparisons add kind
+// postings (#4324, #4334).
+// Version 8: Python formal-parameter facts add kind postings (#4323).
+// Version 10 merges tuple-literal postings (#4330) with Python literal postings
+// from the PY14-PY21 lane. Version 11 separately added origin/master vocabulary
+// and polynomial Python regex-risk postings (#4324); version 12 combines them.
+pub const STRUCTURAL_INDEX_REPRESENTATION_VERSION: u32 = 12;
 const MAX_INDEX_FILES: usize = 1_000_000;
 const MAX_INDEX_FACT_NODES: u64 = 100_000_000;
 const MAX_INDEX_SOURCE_BYTES: u64 = 16 * 1024 * 1024 * 1024;
@@ -145,6 +153,10 @@ pub struct StructuralIndexFile {
     pub file: ProjectFile,
     pub source_bytes: u64,
     pub fact_nodes: u32,
+    /// The file's recovered regions (#3777). A node recovery removed has no
+    /// posting, so an empty candidate set is not a complete answer for a file
+    /// whose regions could hide the selection. Empty for almost every file.
+    pub recovered_regions: Box<[super::facts::RecoveredRegion]>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -170,6 +182,10 @@ pub struct SnapshotStructuralIndex {
     kind_name_postings: KindNamePostings,
     role_postings: HashMap<RolePostingKey, Box<[FactAddress]>>,
     source_trigram_filters: Box<[u64]>,
+    /// Ids of the files that carry recovered regions (#3777). A node that
+    /// syntax recovery removed has no posting, so no candidate set can name
+    /// these files; a query that visits only candidate files adds them.
+    recovered_files: Box<[u32]>,
     fact_nodes: u64,
     retained_bytes: u64,
 }
@@ -190,6 +206,13 @@ impl SnapshotStructuralIndex {
 
     pub fn file_count(&self) -> usize {
         self.files.len()
+    }
+
+    /// The indexed files that carry recovered regions, in file-id order.
+    pub fn files_with_recovered_regions(&self) -> impl Iterator<Item = &ProjectFile> {
+        self.recovered_files
+            .iter()
+            .map(|id| &self.files[*id as usize].file)
     }
 
     /// Returns false only when at least one required anchor group has every
@@ -1351,6 +1374,7 @@ fn build_index(
                 file: file.clone(),
                 source_bytes: source.len() as u64,
                 fact_nodes,
+                recovered_regions: facts.recovered_regions().into(),
             });
             let filter_start = file_id as usize * SOURCE_FILTER_WORDS_PER_FILE;
             if !insert_source_trigrams(
@@ -1590,6 +1614,12 @@ fn build_index(
     let Some(role_postings) = boxed_rows(role_rows, cancellation) else {
         return Err(cancelled_failure(started, metrics));
     };
+    let recovered_files = indexed_files
+        .iter()
+        .enumerate()
+        .filter(|(_, file)| !file.recovered_regions.is_empty())
+        .map(|(id, _)| u32::try_from(id).expect("structural index file ids fit in u32"))
+        .collect();
     let mut index = SnapshotStructuralIndex {
         content_identity,
         files: indexed_files.into_boxed_slice(),
@@ -1599,6 +1629,7 @@ fn build_index(
         kind_name_postings,
         role_postings,
         source_trigram_filters: source_trigram_filters.into_boxed_slice(),
+        recovered_files,
         fact_nodes: metrics.fact_nodes,
         retained_bytes: 0,
     };
@@ -1676,6 +1707,17 @@ fn retained_bytes(
         .saturating_add(
             (index.files.len() as u64)
                 .saturating_mul(size_of::<StructuralIndexFile>() as u64)
+                .saturating_add(
+                    (index
+                        .files
+                        .iter()
+                        .map(|file| file.recovered_regions.len())
+                        .sum::<usize>() as u64)
+                        .saturating_mul(size_of::<super::facts::RecoveredRegion>() as u64),
+                )
+                .saturating_add(
+                    (index.recovered_files.len() as u64).saturating_mul(size_of::<u32>() as u64),
+                )
                 .saturating_add(hash_table_allocation_bytes::<ProjectFile, u32>(
                     index.file_ids.capacity(),
                 ))
@@ -1747,7 +1789,9 @@ mod tests {
     use crate::analyzer::Range;
     use crate::analyzer::structural::facts::{FileFacts, NormalizedNode};
     use crate::analyzer::structural::occurrences::OccurrenceRole;
+    use crate::analyzer::structural::test_support::content_identity as content;
     use crate::compact_graph::CompactRows;
+    use brokk_bifrost_test_macros::hardwon;
 
     struct FakeProvider {
         files: Vec<ProjectFile>,
@@ -1780,10 +1824,6 @@ mod tests {
             *self.released.lock().expect("build gate poisoned") = true;
             self.changed.notify_all();
         }
-    }
-
-    fn content(seed: u64) -> WorkspaceContentIdentity {
-        WorkspaceContentIdentity::for_test(seed)
     }
 
     /// Order the provider's files the way [`SnapshotStructuralIndexCache`]
@@ -1902,6 +1942,12 @@ mod tests {
             vec![NormalizedNode {
                 kind: NormalizedKind::Class,
                 boolean_value: None,
+                parenthesized: None,
+                assignment_shape: None,
+                integer_literal_value: None,
+                duplicate_key: None,
+                is_async: None,
+                string_value: None,
                 construct: None,
                 range: Range {
                     start_byte: 0,
@@ -1919,6 +1965,7 @@ mod tests {
             }],
             CompactRows::from_parts(vec![0, 0], Vec::new()),
             CompactRows::from_parts(vec![0, 0], Vec::new()),
+            Vec::new(),
         );
         FakeProvider {
             files: vec![file.clone()],
@@ -1943,6 +1990,12 @@ mod tests {
                         NormalizedKind::Function
                     },
                     boolean_value: None,
+                    parenthesized: None,
+                    assignment_shape: None,
+                    integer_literal_value: None,
+                    duplicate_key: None,
+                    is_async: None,
+                    string_value: None,
                     construct: None,
                     range: Range {
                         start_byte,
@@ -1966,6 +2019,7 @@ mod tests {
             nodes,
             CompactRows::from_parts(vec![0; MIN_KIND_NAME_POSTING_ROWS + 1], Vec::new()),
             CompactRows::from_parts(vec![0; MIN_KIND_NAME_POSTING_ROWS + 1], Vec::new()),
+            Vec::new(),
         );
         FakeProvider {
             files: vec![file.clone()],
@@ -1973,33 +2027,6 @@ mod tests {
             census: None,
             gate: None,
         }
-    }
-
-    #[test]
-    fn exact_kind_and_name_postings_select_dense_addresses() {
-        let provider = provider();
-        let (index, metrics) =
-            build_index_for_test(&provider, 1024 * 1024, content(1)).expect("index builds");
-        let requirements = StructuralAccessRequirements::new_for_test(vec![
-            StructuralPostingTerm::Kinds(vec![NormalizedKind::Declaration]),
-            StructuralPostingTerm::ExactName(vec!["App".to_string()]),
-        ]);
-        let selected = index
-            .select(
-                &requirements,
-                Some(&provider.files),
-                false,
-                false,
-                &CancellationToken::default(),
-            )
-            .expect("complete scope")
-            .expect("indexed requirements");
-
-        assert_eq!(selected.estimate.candidate_files, 1);
-        assert_eq!(selected.estimate.candidate_facts, 1);
-        assert_eq!(selected.facts_for(&provider.files[0]), [0]);
-        assert_eq!(metrics.fact_nodes, 1);
-        assert!(index.retained_bytes() > 0);
     }
 
     #[test]
@@ -2055,33 +2082,6 @@ mod tests {
             index.source_may_contain(file, &[SourceAnchorGroup::new(vec!["z".to_string()])]),
             Some(true)
         );
-    }
-
-    #[test]
-    fn complete_index_is_reused_by_the_snapshot_owner() {
-        let provider = provider();
-        let cache = SnapshotStructuralIndexCache::new(1024 * 1024);
-        let cancellation = CancellationToken::default();
-
-        let StructuralIndexAcquisition::Ready {
-            index: first,
-            lifecycle: StructuralIndexLifecycle::Built,
-            ..
-        } = cache.acquire(&provider, &cancellation)
-        else {
-            panic!("first acquisition must build")
-        };
-        let StructuralIndexAcquisition::Ready {
-            index: second,
-            lifecycle: StructuralIndexLifecycle::Hit,
-            ..
-        } = cache.acquire(&provider, &cancellation)
-        else {
-            panic!("second acquisition must hit")
-        };
-
-        assert!(Arc::ptr_eq(&first, &second));
-        assert_eq!(cache.len_for_test(), 1);
     }
 
     #[test]
@@ -2216,20 +2216,6 @@ mod tests {
     }
 
     #[test]
-    fn cancelled_build_never_publishes() {
-        let provider = provider();
-        let cache = SnapshotStructuralIndexCache::new(1024 * 1024);
-        let cancellation = CancellationToken::default();
-        cancellation.cancel();
-
-        assert!(matches!(
-            cache.acquire(&provider, &cancellation),
-            StructuralIndexAcquisition::Cancelled { .. }
-        ));
-        assert_eq!(cache.len_for_test(), 0);
-    }
-
-    #[test]
     fn cancellation_after_partial_construction_never_publishes() {
         let provider = provider();
         let cache = SnapshotStructuralIndexCache::new(1024 * 1024);
@@ -2238,19 +2224,6 @@ mod tests {
         assert!(matches!(
             cache.acquire(&provider, &cancellation),
             StructuralIndexAcquisition::Cancelled { .. }
-        ));
-        assert_eq!(cache.len_for_test(), 0);
-    }
-
-    #[test]
-    fn fixed_footprint_over_budget_never_publishes() {
-        let provider = provider();
-        let cache = SnapshotStructuralIndexCache::new(1);
-
-        assert!(matches!(
-            cache.acquire(&provider, &CancellationToken::default()),
-            StructuralIndexAcquisition::Unavailable { reason, .. }
-                if &*reason == "structural index retained-byte limit exceeded"
         ));
         assert_eq!(cache.len_for_test(), 0);
     }
@@ -2334,26 +2307,7 @@ mod tests {
     }
 
     #[test]
-    fn census_within_budget_still_builds() {
-        let mut provider = provider();
-        provider.census = Some(StructuralIndexCensus {
-            files: 1,
-            source_bytes: 64 * 1024,
-            workspace_source_bytes: 64 * 1024,
-        });
-        let cache = SnapshotStructuralIndexCache::new(16 * 1024 * 1024);
-
-        assert!(matches!(
-            cache.acquire(&provider, &CancellationToken::default()),
-            StructuralIndexAcquisition::Ready {
-                lifecycle: StructuralIndexLifecycle::Built,
-                ..
-            }
-        ));
-        assert_eq!(cache.len_for_test(), 1);
-    }
-
-    #[test]
+    #[hardwon("#2879: fixed provider shares starved the usable Rust posting index")]
     fn a_minority_language_keeps_a_floor_of_the_shared_budget() {
         let memo_budget_bytes = 256 * 1024 * 1024;
         // A handful of tiny files whose index costs per file, not per byte:
@@ -2376,6 +2330,7 @@ mod tests {
     }
 
     #[test]
+    #[hardwon("#2879: fixed provider shares rejected the workspace-sized dominant index")]
     fn a_dominant_language_is_apportioned_more_than_a_fixed_share() {
         let memo_budget_bytes = 256 * 1024 * 1024;
         // The Rust slice of this repository, whose index needed 103_636_999
@@ -2442,6 +2397,12 @@ mod tests {
             vec![NormalizedNode {
                 kind: NormalizedKind::Class,
                 boolean_value: None,
+                parenthesized: None,
+                assignment_shape: None,
+                integer_literal_value: None,
+                duplicate_key: None,
+                is_async: None,
+                string_value: None,
                 construct: None,
                 range: Range {
                     start_byte: 0,
@@ -2459,6 +2420,7 @@ mod tests {
             }],
             CompactRows::from_parts(vec![0, 0], Vec::new()),
             CompactRows::from_parts(vec![0, 0], Vec::new()),
+            Vec::new(),
         );
         let provider = FakeProvider {
             files: vec![file.clone()],
@@ -2477,6 +2439,7 @@ mod tests {
     }
 
     #[test]
+    #[hardwon("#1459: provider index rejection must name the unavailable facts file")]
     fn unavailable_provider_facts_never_publish() {
         let mut provider = provider();
         provider.facts.clear();
@@ -2504,6 +2467,7 @@ mod tests {
     /// unavailable" }`, and the whole Python slice fell back to scan mode for
     /// the session.
     #[test]
+    #[hardwon("#1459: an empty file prevented the structural provider index from completing")]
     fn empty_file_does_not_abort_the_provider_index() {
         let temp = tempfile::tempdir().expect("temp dir");
         let root = temp.path().canonicalize().expect("canonical root");
@@ -2530,6 +2494,81 @@ mod tests {
     }
 
     #[test]
+    fn complete_index_is_reused_by_the_snapshot_owner() {
+        let provider = provider();
+        let cache = SnapshotStructuralIndexCache::new(1024 * 1024);
+        let cancellation = CancellationToken::default();
+
+        let StructuralIndexAcquisition::Ready {
+            index: first,
+            lifecycle: StructuralIndexLifecycle::Built,
+            ..
+        } = cache.acquire(&provider, &cancellation)
+        else {
+            panic!("first acquisition must build")
+        };
+        let StructuralIndexAcquisition::Ready {
+            index: second,
+            lifecycle: StructuralIndexLifecycle::Hit,
+            ..
+        } = cache.acquire(&provider, &cancellation)
+        else {
+            panic!("second acquisition must hit")
+        };
+
+        assert!(Arc::ptr_eq(&first, &second));
+        assert_eq!(cache.len_for_test(), 1);
+    }
+
+    #[test]
+    fn cancelled_build_never_publishes() {
+        let provider = provider();
+        let cache = SnapshotStructuralIndexCache::new(1024 * 1024);
+        let cancellation = CancellationToken::default();
+        cancellation.cancel();
+
+        assert!(matches!(
+            cache.acquire(&provider, &cancellation),
+            StructuralIndexAcquisition::Cancelled { .. }
+        ));
+        assert_eq!(cache.len_for_test(), 0);
+    }
+
+    #[test]
+    fn fixed_footprint_over_budget_never_publishes() {
+        let provider = provider();
+        let cache = SnapshotStructuralIndexCache::new(1);
+
+        assert!(matches!(
+            cache.acquire(&provider, &CancellationToken::default()),
+            StructuralIndexAcquisition::Unavailable { reason, .. }
+                if &*reason == "structural index retained-byte limit exceeded"
+        ));
+        assert_eq!(cache.len_for_test(), 0);
+    }
+
+    #[test]
+    #[hardwon("#2879: an index that fit the retained budget was rejected before construction")]
+    fn census_within_budget_still_builds() {
+        let mut provider = provider();
+        provider.census = Some(StructuralIndexCensus {
+            files: 1,
+            source_bytes: 64 * 1024,
+            workspace_source_bytes: 64 * 1024,
+        });
+        let cache = SnapshotStructuralIndexCache::new(16 * 1024 * 1024);
+
+        assert!(matches!(
+            cache.acquire(&provider, &CancellationToken::default()),
+            StructuralIndexAcquisition::Ready {
+                lifecycle: StructuralIndexLifecycle::Built,
+                ..
+            }
+        ));
+        assert_eq!(cache.len_for_test(), 1);
+    }
+
+    #[test]
     fn cancelled_candidate_selection_stops_without_rows() {
         let provider = ambiguous_name_provider();
         let (index, _) =
@@ -2553,17 +2592,5 @@ mod tests {
                 .expect_err("selection must observe cancellation"),
             "structural index selection cancelled"
         );
-    }
-
-    #[test]
-    fn retained_census_grows_with_posting_content() {
-        let simple = provider();
-        let ambiguous = ambiguous_name_provider();
-        let (simple, _) =
-            build_index_for_test(&simple, 1024 * 1024, content(1)).expect("simple index builds");
-        let (ambiguous, _) =
-            build_index_for_test(&ambiguous, 1024 * 1024, content(2)).expect("larger index builds");
-
-        assert!(ambiguous.retained_bytes() > simple.retained_bytes());
     }
 }

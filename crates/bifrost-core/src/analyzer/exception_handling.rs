@@ -12,8 +12,11 @@
 //! the project through an `IAnalyzer`, resolves a grammar by language, and
 //! dispatches to the per-language detectors.
 
+use crate::analyzer::common::try_node_source_text;
 use crate::analyzer::model::{ExceptionHandlingSmell, ExceptionSmellWeights};
-use crate::analyzer::tree_walk::{children_iter, push_children_reversed};
+use crate::analyzer::tree_walk::children_iter;
+use crate::analyzer::{CodeUnitIndex, ProjectFile};
+use crate::path_utils::rel_path_string;
 use tree_sitter::Node;
 
 const EXCEPTION_EXCERPT_MAX_LEN: usize = 180;
@@ -74,6 +77,41 @@ pub fn score_handler(
     (score > 0).then_some(HandlerScore { score, reasons })
 }
 
+pub fn build_handler_smell(
+    analyzer: &(impl CodeUnitIndex + ?Sized),
+    file: &ProjectFile,
+    source: &str,
+    handler: Node<'_>,
+    catch_type: String,
+    weights: &ExceptionSmellWeights,
+    input: HandlerScoreInput,
+) -> Option<ExceptionHandlingSmell> {
+    let body_statement_count = input.body_statement_count;
+    let scored = score_handler(weights, input)?;
+    let enclosing_fq_name = analyzer
+        .enclosing_code_unit_for_lines(
+            file,
+            handler.start_position().row,
+            handler.end_position().row,
+        )
+        .map(|unit| unit.fq_name())
+        .unwrap_or_else(|| rel_path_string(file));
+    let excerpt = try_node_source_text(handler, source)
+        .map(compact_excerpt)
+        .unwrap_or_default();
+
+    Some(ExceptionHandlingSmell {
+        file: file.clone(),
+        enclosing_fq_name,
+        catch_type,
+        score: scored.score,
+        body_statement_count,
+        reasons: scored.reasons,
+        excerpt,
+        start_byte: handler.start_byte(),
+    })
+}
+
 pub fn sort_findings(findings: &mut [ExceptionHandlingSmell]) {
     findings.sort_by(|left, right| {
         right
@@ -87,13 +125,12 @@ pub fn sort_findings(findings: &mut [ExceptionHandlingSmell]) {
 
 pub fn collect_nodes_by_kind<'tree>(root: Node<'tree>, kind: &str) -> Vec<Node<'tree>> {
     let mut matches = Vec::new();
-    let mut pending = vec![root];
-    while let Some(node) = pending.pop() {
+    crate::analyzer::tree_walk::walk_tree_preorder(root, true, |node| {
         if node.kind() == kind {
             matches.push(node);
         }
-        push_children_reversed(node, &mut pending);
-    }
+        crate::analyzer::tree_walk::WalkControl::Continue
+    });
     matches
 }
 
@@ -122,43 +159,18 @@ pub fn has_descendant_of_kind(root: Node<'_>, kind: &str) -> bool {
 }
 
 pub fn find_first_named_descendant<'tree>(root: Node<'tree>, kind: &str) -> Option<Node<'tree>> {
-    let mut pending = Vec::new();
-    let mut cursor = root.walk();
-    let children: Vec<_> = root.named_children(&mut cursor).collect();
-    pending.extend(children.into_iter().rev());
-    while let Some(node) = pending.pop() {
+    let mut found = None;
+    crate::analyzer::tree_walk::walk_named_tree_preorder(root, false, |node| {
         if node.kind() == kind {
-            return Some(node);
+            found = Some(node);
+            crate::analyzer::tree_walk::WalkControl::Break
+        } else {
+            crate::analyzer::tree_walk::WalkControl::Continue
         }
-        let mut cursor = node.walk();
-        let children: Vec<_> = node.named_children(&mut cursor).collect();
-        pending.extend(children.into_iter().rev());
-    }
-    None
+    });
+    found
 }
 
 pub fn compact_excerpt(text: &str) -> String {
-    let mut compact = String::with_capacity(text.len());
-    let mut seen_non_whitespace = false;
-    let mut pending_space = false;
-    for character in text.chars() {
-        if character.is_whitespace() {
-            if seen_non_whitespace {
-                pending_space = true;
-            }
-            continue;
-        }
-        if pending_space && !compact.is_empty() {
-            compact.push(' ');
-        }
-        compact.push(character);
-        pending_space = false;
-        seen_non_whitespace = true;
-    }
-    if compact.chars().count() <= EXCEPTION_EXCERPT_MAX_LEN {
-        return compact;
-    }
-    let mut truncated: String = compact.chars().take(EXCEPTION_EXCERPT_MAX_LEN).collect();
-    truncated.push_str("...");
-    truncated
+    crate::analyzer::test_assertions::compact_assertion_excerpt(text, EXCEPTION_EXCERPT_MAX_LEN)
 }

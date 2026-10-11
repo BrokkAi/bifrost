@@ -180,6 +180,10 @@ pub(crate) fn weight_usage_edges(key: &Arc<[String]>, edges: &Arc<UsageEdges>) -
             .iter()
             .map(|target| size_of::<String>() + target.len())
             .sum::<usize>();
+    weight_usage_edge_contents(key_bytes, edges)
+}
+
+pub(crate) fn weight_usage_edge_contents(key_bytes: usize, edges: &UsageEdges) -> u32 {
     let edge_bytes = edges
         .edges
         .iter()
@@ -324,27 +328,39 @@ pub(crate) fn build_file_declarations_with_file_scope<K: NodeKey>(
         .into_iter()
         .filter(|unit| include_file_scope || !unit.is_file_scope())
     {
-        let key = K::from_unit(&unit);
-        for unit_range in analyzer.ranges(&unit) {
-            let span = (unit_range.start_byte, unit_range.end_byte);
-            enclosers.push((span.0, span.1, key.clone()));
-            definitions.entry(key.clone()).or_default().push(span);
-        }
+        let ranges = analyzer.ranges(&unit);
+        append_file_declaration_ranges(&unit, &ranges, &mut enclosers, &mut definitions);
     }
     if include_file_scope {
         let file_scope = CodeUnit::file_scope(file.clone());
-        for unit_range in analyzer.ranges(&file_scope) {
-            let span = (unit_range.start_byte, unit_range.end_byte);
-            enclosers.push((span.0, span.1, K::from_unit(&file_scope)));
-            definitions
-                .entry(K::from_unit(&file_scope))
-                .or_default()
-                .push(span);
-        }
+        let ranges = analyzer.ranges(&file_scope);
+        append_file_declaration_ranges(&file_scope, &ranges, &mut enclosers, &mut definitions);
     }
     FileDeclarations {
         enclosers,
         definitions,
+    }
+}
+
+fn append_file_declaration_ranges<K: NodeKey>(
+    unit: &CodeUnit,
+    ranges: &[crate::analyzer::Range],
+    enclosers: &mut Vec<(usize, usize, K)>,
+    definitions: &mut HashMap<K, Vec<(usize, usize)>>,
+) {
+    let key = K::from_unit(unit);
+    for range in ranges {
+        let span = (range.start_byte, range.end_byte);
+        // Scala primary constructors share the class's full source span.
+        // Retain their definitions while the source class owns references;
+        // equal-span caller selection must not depend on iteration order.
+        let synthetic_scala_constructor = unit.is_synthetic()
+            && unit.is_function()
+            && declaration_language_for_file(unit.source()) == crate::analyzer::Language::Scala;
+        if !synthetic_scala_constructor {
+            enclosers.push((span.0, span.1, key.clone()));
+        }
+        definitions.entry(key.clone()).or_default().push(span);
     }
 }
 
@@ -406,12 +422,8 @@ fn build_file_declarations_from_declaration_ranges_with_filter<K: NodeKey>(
         .filter(|unit| include_file_scope || !unit.is_file_scope())
         .filter(|unit| include(unit))
     {
-        let key = K::from_unit(unit);
-        for unit_range in ranges.get(unit).into_iter().flatten() {
-            let span = (unit_range.start_byte, unit_range.end_byte);
-            enclosers.push((span.0, span.1, key.clone()));
-            definitions.entry(key.clone()).or_default().push(span);
-        }
+        let unit_ranges = ranges.get(unit).map(Vec::as_slice).unwrap_or(&[]);
+        append_file_declaration_ranges(unit, unit_ranges, &mut enclosers, &mut definitions);
     }
     FileDeclarations {
         enclosers,
@@ -734,12 +746,10 @@ impl<K: NodeKey> EdgeSitesPartial<K> {
                 }
             }));
         }
-        for (callee, sites) in file.callsites {
-            *self.callsites.entry(callee).or_insert(0) += sites.len();
-        }
-        for (callee, sites) in file.unproven_inbound {
-            *self.unproven_inbound.entry(callee).or_insert(0) += sites.len();
-        }
+        accumulate_site_counts(&mut self.callsites, file.callsites, |sites| sites.len());
+        accumulate_site_counts(&mut self.unproven_inbound, file.unproven_inbound, |sites| {
+            sites.len()
+        });
     }
 
     fn combine(&mut self, other: Self) {
@@ -772,10 +782,7 @@ fn cap_edge_sites<K: NodeKey>(
     callsites: BTreeMap<K, usize>,
     unproven_inbound: BTreeMap<K, usize>,
 ) -> UsageEdges<K> {
-    let truncated: BTreeMap<K, usize> = callsites
-        .into_iter()
-        .filter(|(_, total)| *total > MAX_CALLSITES)
-        .collect();
+    let truncated = truncated_call_sites(callsites);
     let edges: BTreeMap<(K, K), Vec<CallSite>> = edge_sites
         .into_iter()
         .filter(|((_, callee), _)| !truncated.contains_key(callee))
@@ -818,12 +825,10 @@ impl<K: NodeKey> EdgeWeightsPartial<K> {
                 counts.record(evidence.kind);
             }
         }
-        for (callee, sites) in file.callsites {
-            *self.callsites.entry(callee).or_insert(0) += sites.len();
-        }
-        for (callee, sites) in file.unproven_inbound {
-            *self.unproven_inbound.entry(callee).or_insert(0) += sites.len();
-        }
+        accumulate_site_counts(&mut self.callsites, file.callsites, |sites| sites.len());
+        accumulate_site_counts(&mut self.unproven_inbound, file.unproven_inbound, |sites| {
+            sites.len()
+        });
     }
 
     fn combine(&mut self, other: Self) {
@@ -866,10 +871,7 @@ fn cap_edge_weights<K: NodeKey>(
     callsites: BTreeMap<K, usize>,
     unproven_inbound: BTreeMap<K, usize>,
 ) -> UsageEdgeWeights<K> {
-    let truncated: BTreeMap<K, usize> = callsites
-        .into_iter()
-        .filter(|(_, total)| *total > MAX_CALLSITES)
-        .collect();
+    let truncated = truncated_call_sites(callsites);
     let edges: BTreeMap<(K, K), UsageReferenceCounts> = edge_weights
         .into_iter()
         .filter(|((_, callee), _)| !truncated.contains_key(callee))
@@ -882,6 +884,23 @@ fn cap_edge_weights<K: NodeKey>(
     }
 }
 
+fn accumulate_site_counts<K: NodeKey, Sites>(
+    totals: &mut BTreeMap<K, usize>,
+    sites_by_callee: impl IntoIterator<Item = (K, Sites)>,
+    site_count: impl Fn(&Sites) -> usize,
+) {
+    for (callee, sites) in sites_by_callee {
+        *totals.entry(callee).or_insert(0) += site_count(&sites);
+    }
+}
+
+fn truncated_call_sites<K: NodeKey>(callsites: BTreeMap<K, usize>) -> BTreeMap<K, usize> {
+    callsites
+        .into_iter()
+        .filter(|(_, total)| *total > MAX_CALLSITES)
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -889,117 +908,89 @@ mod tests {
     use crate::text_utils::find_line_index_for_offset;
     use brokk_bifrost_core::analyzer::usages::inverted_edges::UsageReferenceKind;
     use brokk_bifrost_core::analyzer::usages::inverted_edges::classify_reference_node;
+    use brokk_bifrost_test_macros::hardwon;
     use tree_sitter::Node;
 
     fn find_node<'tree>(root: Node<'tree>, source: &str, kind: &str, text: &str) -> Node<'tree> {
-        let mut stack = vec![root];
-        while let Some(node) = stack.pop() {
+        let mut found = None;
+        brokk_bifrost_core::analyzer::tree_walk::walk_named_tree_preorder(root, true, |node| {
             if node.kind() == kind
                 && source
                     .get(node.start_byte()..node.end_byte())
                     .is_some_and(|candidate| candidate == text)
             {
-                return node;
+                found = Some(node);
+                brokk_bifrost_core::analyzer::tree_walk::WalkControl::Break
+            } else {
+                brokk_bifrost_core::analyzer::tree_walk::WalkControl::Continue
             }
-            for index in (0..node.named_child_count()).rev() {
-                if let Some(child) = node.named_child(index) {
-                    stack.push(child);
-                }
-            }
+        });
+        found.unwrap_or_else(|| panic!("missing {kind} node {text:?}"))
+    }
+
+    fn assert_reference_classifier(
+        language: &str,
+        grammar: tree_sitter::Language,
+        source: &str,
+        expected: &[(&str, &str, UsageReferenceKind)],
+    ) {
+        let mut parser = tree_sitter::Parser::new();
+        parser.set_language(&grammar).unwrap();
+        let tree = parser
+            .parse(source, None)
+            .unwrap_or_else(|| panic!("{language} source"));
+        let root = tree.root_node();
+        for (kind, text, expected) in expected {
+            assert_eq!(
+                classify_reference_node(find_node(root, source, kind, text)),
+                *expected,
+                "{language} {kind} {text}"
+            );
         }
-        panic!("missing {kind} node {text:?}");
     }
 
     #[test]
-    fn structured_reference_classifier_distinguishes_rust_kinds() {
-        let source = "fn caller(value: Model) { helper(); value.member; value.run(); OTHER; }";
-        let mut parser = tree_sitter::Parser::new();
-        parser
-            .set_language(&tree_sitter_rust::LANGUAGE.into())
-            .unwrap();
-        let tree = parser.parse(source, None).unwrap();
-        let root = tree.root_node();
+    fn structured_reference_classifier_distinguishes_language_kinds() {
+        let rust = "fn caller(value: Model) { helper(); value.member; value.run(); OTHER; }";
+        assert_reference_classifier(
+            "Rust",
+            tree_sitter_rust::LANGUAGE.into(),
+            rust,
+            &[
+                ("type_identifier", "Model", UsageReferenceKind::Type),
+                ("identifier", "helper", UsageReferenceKind::Call),
+                ("field_identifier", "member", UsageReferenceKind::Member),
+                ("field_identifier", "run", UsageReferenceKind::Call),
+                ("identifier", "OTHER", UsageReferenceKind::Other),
+            ],
+        );
 
-        assert_eq!(
-            classify_reference_node(find_node(root, source, "type_identifier", "Model")),
-            UsageReferenceKind::Type
-        );
-        assert_eq!(
-            classify_reference_node(find_node(root, source, "identifier", "helper")),
-            UsageReferenceKind::Call
-        );
-        assert_eq!(
-            classify_reference_node(find_node(root, source, "field_identifier", "member")),
-            UsageReferenceKind::Member
-        );
-        assert_eq!(
-            classify_reference_node(find_node(root, source, "field_identifier", "run")),
-            UsageReferenceKind::Call
-        );
-        assert_eq!(
-            classify_reference_node(find_node(root, source, "identifier", "OTHER")),
-            UsageReferenceKind::Other
-        );
-    }
-
-    #[test]
-    fn structured_reference_classifier_distinguishes_python_calls_and_members() {
         let source = "def caller(value: Model):\n    helper()\n    value.member\n    value.run()\n";
-        let mut parser = tree_sitter::Parser::new();
-        parser
-            .set_language(&tree_sitter_python::LANGUAGE.into())
-            .unwrap();
-        let tree = parser.parse(source, None).unwrap();
-        let root = tree.root_node();
+        assert_reference_classifier(
+            "Python",
+            tree_sitter_python::LANGUAGE.into(),
+            source,
+            &[
+                ("identifier", "Model", UsageReferenceKind::Type),
+                ("identifier", "helper", UsageReferenceKind::Call),
+                ("identifier", "member", UsageReferenceKind::Member),
+                ("identifier", "run", UsageReferenceKind::Call),
+            ],
+        );
 
-        assert_eq!(
-            classify_reference_node(find_node(root, source, "identifier", "Model")),
-            UsageReferenceKind::Type
-        );
-        assert_eq!(
-            classify_reference_node(find_node(root, source, "identifier", "helper")),
-            UsageReferenceKind::Call
-        );
-        assert_eq!(
-            classify_reference_node(find_node(root, source, "identifier", "member")),
-            UsageReferenceKind::Member
-        );
-        assert_eq!(
-            classify_reference_node(find_node(root, source, "identifier", "run")),
-            UsageReferenceKind::Call
-        );
-    }
-
-    #[test]
-    fn structured_reference_classifier_distinguishes_typescript_kinds() {
-        let source =
+        let typescript =
             "function caller(value: Model) { helper(); value.member; value.run(); OTHER; }";
-        let mut parser = tree_sitter::Parser::new();
-        parser
-            .set_language(&tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into())
-            .unwrap();
-        let tree = parser.parse(source, None).unwrap();
-        let root = tree.root_node();
-
-        assert_eq!(
-            classify_reference_node(find_node(root, source, "type_identifier", "Model")),
-            UsageReferenceKind::Type
-        );
-        assert_eq!(
-            classify_reference_node(find_node(root, source, "identifier", "helper")),
-            UsageReferenceKind::Call
-        );
-        assert_eq!(
-            classify_reference_node(find_node(root, source, "property_identifier", "member")),
-            UsageReferenceKind::Member
-        );
-        assert_eq!(
-            classify_reference_node(find_node(root, source, "property_identifier", "run")),
-            UsageReferenceKind::Call
-        );
-        assert_eq!(
-            classify_reference_node(find_node(root, source, "identifier", "OTHER")),
-            UsageReferenceKind::Other
+        assert_reference_classifier(
+            "TypeScript",
+            tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
+            typescript,
+            &[
+                ("type_identifier", "Model", UsageReferenceKind::Type),
+                ("identifier", "helper", UsageReferenceKind::Call),
+                ("property_identifier", "member", UsageReferenceKind::Member),
+                ("property_identifier", "run", UsageReferenceKind::Call),
+                ("identifier", "OTHER", UsageReferenceKind::Other),
+            ],
         );
     }
 
@@ -1024,13 +1015,16 @@ mod tests {
     }
 
     #[test]
-    fn edge_weight_sums_distinct_file_line_sites_across_files() {
+    fn edge_weight_merges_count_distinct_file_line_sites() {
         // The same (caller, callee) edge from two files, both on line 5. Distinct
         // (file, line) sites = 2; unioning line sets would collapse to 1.
-        let merged = merge_and_cap(vec![
-            per_file_with_edge("a.rs", "caller", "callee", 5),
-            per_file_with_edge("b.rs", "caller", "callee", 5),
-        ]);
+        let input = || {
+            vec![
+                per_file_with_edge("a.rs", "caller", "callee", 5),
+                per_file_with_edge("b.rs", "caller", "callee", 5),
+            ]
+        };
+        let merged = merge_and_cap(input());
         let sites = merged
             .edges
             .get(&("caller".to_string(), "callee".to_string()))
@@ -1055,14 +1049,7 @@ mod tests {
                 },
             ],
         );
-    }
-
-    #[test]
-    fn edge_weight_only_merge_sums_distinct_file_line_sites() {
-        let merged = merge_weights_and_cap(vec![
-            per_file_with_edge("a.rs", "caller", "callee", 5),
-            per_file_with_edge("b.rs", "caller", "callee", 5),
-        ]);
+        let merged = merge_weights_and_cap(input());
 
         assert_eq!(
             merged
@@ -1256,6 +1243,9 @@ mod tests {
     }
 
     #[test]
+    #[hardwon(
+        "#2603: Runs the callee prefilter over a real tree-sitter TypeScript AST and checks bounded inbound evidence against the AST-selected call nodes"
+    )]
     fn inbound_domain_bounds_callees_but_keeps_all_indexed_callers() {
         let source = "function caller() { target(); unknown(); }";
         let mut parser = tree_sitter::Parser::new();
@@ -1314,6 +1304,9 @@ mod tests {
     /// from the callee set alone -- so this reuses the TypeScript grammar the
     /// module already links.
     #[test]
+    #[hardwon(
+        "#3033: Keeps Scala quoted dotted identifiers and symbolic operators as whole terminal segments"
+    )]
     fn callee_terminals_follow_the_language_segment_rules() {
         let source = "function caller() {}";
         let mut parser = tree_sitter::Parser::new();

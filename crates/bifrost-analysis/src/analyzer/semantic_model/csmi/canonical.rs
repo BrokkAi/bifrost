@@ -7,9 +7,9 @@
 //! their vocabulary-specific schemas still belong to the vocabulary owner.
 
 use super::model::{CsmiPackManifest, CsmiSemanticDocument};
+use crate::analyzer::canonical_hash::{lower_hex_string, sha256_bytes};
 use serde::Serialize;
 use serde_json::Value;
-use sha2::{Digest, Sha256};
 use std::fmt;
 
 #[derive(Debug)]
@@ -91,13 +91,7 @@ pub fn canonical_pack_manifest(manifest: &CsmiPackManifest) -> Result<Vec<u8>, C
 }
 
 pub fn sha256_hex(bytes: &[u8]) -> String {
-    let digest = Sha256::digest(bytes);
-    let mut output = String::with_capacity(64);
-    for byte in digest {
-        use fmt::Write as _;
-        write!(output, "{byte:02x}").expect("writing to String cannot fail");
-    }
-    output
+    lower_hex_string(&sha256_bytes(bytes))
 }
 
 pub fn canonical_digest<T: Serialize>(value: &T) -> Result<String, CsmiCanonicalError> {

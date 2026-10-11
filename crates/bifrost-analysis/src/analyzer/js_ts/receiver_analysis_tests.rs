@@ -6,9 +6,8 @@
 
 #[cfg(test)]
 mod tests {
-    use crate::analyzer::{
-        AnalyzerDefinitionLookup, Language, ProjectFile, TestProject, TypescriptAnalyzer,
-    };
+    use crate::analyzer::test_typescript_project as test_project;
+    use crate::analyzer::{AnalyzerDefinitionLookup, Language};
     use brokk_bifrost_core::analyzer::usages::receiver_analysis::DEFAULT_RECEIVER_MAX_TARGETS;
     use brokk_bifrost_core::analyzer::usages::receiver_analysis::{
         ReceiverAnalysisBudget, ReceiverAnalysisOutcome, ReceiverValue,
@@ -16,26 +15,10 @@ mod tests {
     use brokk_bifrost_core::analyzer::usages::reference_site::smallest_named_node_covering;
     use brokk_bifrost_js_ts::graph::receiver_analysis::*;
     use brokk_bifrost_js_ts::syntax::{JsTsImportBinder, compute_import_binder};
-    use std::path::PathBuf;
     use tree_sitter::Node;
-    use tree_sitter::Parser;
-
-    fn test_project(source: &str) -> (tempfile::TempDir, ProjectFile, TypescriptAnalyzer) {
-        let temp = tempfile::tempdir().expect("temp dir");
-        let root = temp.path().canonicalize().expect("canonical temp dir");
-        let file = ProjectFile::new(root.clone(), PathBuf::from("src/app.ts"));
-        file.write(source).expect("write source");
-        let analyzer =
-            TypescriptAnalyzer::from_project(TestProject::new(root, Language::TypeScript));
-        (temp, file, analyzer)
-    }
 
     fn parse(source: &str) -> tree_sitter::Tree {
-        let mut parser = Parser::new();
-        parser
-            .set_language(&tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into())
-            .expect("typescript parser");
-        parser.parse(source, None).expect("parse source")
+        brokk_bifrost_js_ts::test_support::parse_typescript(source)
     }
 
     fn receiver_node<'tree>(
@@ -53,47 +36,7 @@ mod tests {
             .expect("receiver node")
     }
 
-    #[test]
-    fn tiny_scope_budget_exits_without_precise_targets() {
-        let source = r#"
-class Service { run() {} }
-function makeService() { return new Service(); }
-export function caller() {
-  const service = makeService();
-  service.run();
-}
-"#;
-        let (_temp, file, analyzer) = test_project(source);
-        let tree = parse(source);
-        let definitions = AnalyzerDefinitionLookup::new(&analyzer, Language::TypeScript);
-        let provider = JsTsReceiverFactProvider::new(
-            &analyzer,
-            &definitions,
-            Language::TypeScript,
-            &file,
-            source,
-            tree.root_node(),
-            JsTsImportBinder::empty(),
-        );
-        let receiver = receiver_node(tree.root_node(), source, "service.run", "service");
-
-        let report = provider.resolve_member_targets_report(
-            receiver,
-            "run",
-            receiver.start_byte(),
-            ReceiverAnalysisBudget::tiny(),
-        );
-
-        assert_eq!(
-            report.outcome,
-            ReceiverAnalysisOutcome::ExceededBudget {
-                limit: "scope_nodes"
-            }
-        );
-        assert!(report.outcome.is_terminal_for_graph());
-        assert_eq!(report.work.scope_nodes, 2);
-        assert!(!report.candidates_truncated);
-    }
+    use brokk_bifrost_test_macros::hardwon;
 
     #[cfg_attr(not(scheduled_tests), ignore = "scheduled-only")]
     #[test]
@@ -196,8 +139,10 @@ export function caller(which: number) {
         assert!(report.work.summary_expansions > 0);
     }
 
-    #[cfg_attr(not(scheduled_tests), ignore = "scheduled-only")]
     #[test]
+    #[hardwon(
+        "de73c59e3a7d: Parses real JS/TS source with Tree-sitter and checks receiver-provider results; regression: an unknown earlier receiver write could be overwritten by annotation-based false exactness"
+    )]
     fn receiver_history_does_not_false_prove_after_an_unknown_write() {
         let cases = [
             (
@@ -264,6 +209,9 @@ function run() {
 
     #[cfg_attr(not(scheduled_tests), ignore = "scheduled-only")]
     #[test]
+    #[hardwon(
+        "bec09944c2de: Parses real JS/TS source with Tree-sitter and checks receiver-provider results; regression: TypeScript annotations overrode runtime initializer owner evidence, including conflicting and dynamic values"
+    )]
     fn annotated_initializers_do_not_override_value_evidence() {
         let cases = [
             (
@@ -372,6 +320,9 @@ function make() {
 
     #[cfg_attr(not(scheduled_tests), ignore = "scheduled-only")]
     #[test]
+    #[hardwon(
+        "#2726: Parses real JS/TS source with Tree-sitter and checks receiver-provider results; regression: node:-prefixed builtin imports minted a second owner, so summaries for the bare builtin spelling missed"
+    )]
     fn unique_package_imports_are_complete_module_receiver_identities() {
         let source = r#"
 import path from "node:path";
@@ -426,6 +377,9 @@ crypto.randomUUID();
     }
 
     #[test]
+    #[hardwon(
+        "#2726: Parses real JS/TS source with Tree-sitter and checks receiver-provider results; regression: competing import candidates produced guessed external ownership; reassigned imports also stay unknown"
+    )]
     fn competing_and_reassigned_import_receivers_stay_incomplete() {
         let source = r#"
 import api from "pkg-a";

@@ -4,7 +4,7 @@ use std::ops::Range as ByteRange;
 use std::sync::Arc;
 
 use crate::resolved::LoadedPolicy;
-use crate::unit_execution::{UnitAttempt, UnitReuse, recompute_unit};
+use crate::unit_execution::{UnitAttempt, UnitReuse, query_slicing_widen_reason, recompute_unit};
 use crate::units::{
     PolicyIncrementalContext, PolicyUnitKey, PolicyUnitProduct, SelectorProduct,
     SelectorProductSite, UnitPartition, WidenReason,
@@ -22,13 +22,17 @@ use brokk_bifrost_analysis::analyzer::semantic::{
     SemanticOutcome, SemanticProviderError, SemanticRequest, SemanticWork, ValueFlowOracle,
     ValueId,
 };
+use brokk_bifrost_analysis::analyzer::structural::OccurrenceRole;
+use brokk_bifrost_analysis::analyzer::usages::call_relations::CallTargetOutcomeCache;
 use brokk_bifrost_analysis::analyzer::usages::effects::EffectCoverage;
 use brokk_bifrost_analysis::analyzer::{ProjectFile, Range, ReadKey, WorkspaceAnalyzer};
 use brokk_bifrost_analysis::path_utils::rel_path_string;
 use brokk_bifrost_rql::structural::search::{
-    CodeQueryExecutionScope, CodeQuerySemanticReceipt, DetailedCodeQueryDecoratedParameterEvidence,
-    DetailedCodeQueryDomain, DetailedCodeQueryEvidence, UnitExecutionResult,
+    CodeQueryCallBinding, CodeQueryExecutionScope, CodeQueryRowFamilySession,
+    CodeQuerySemanticReceipt, DetailedCodeQueryDecoratedParameterEvidence, DetailedCodeQueryDomain,
+    DetailedCodeQueryEvidence, DetailedCodeQueryResult, UnitExecutionResult,
     execute_code_query_detailed_eager_index_workspace_with_semantic_receipt,
+    execute_code_query_detailed_eager_index_workspace_with_semantic_receipt_and_row_family_session,
     execute_code_query_selector_unit, merge_unit_rows, plan_seed_files,
 };
 use brokk_bifrost_rql::structural::{
@@ -54,8 +58,7 @@ pub(super) enum PolicySelectorSessionError {
     /// The sliced compile cannot claim to have produced what a whole compile
     /// would have produced, and the caller must compile the policy again with
     /// no units. Not a failure: the reason says which step refused, and the
-    /// answer is the compile this session was avoiding
-    /// (`.agents/plans/impact-sliced-diff-base.md`, "The head algorithm").
+    /// answer is the compile this session was avoiding.
     Widen(WidenReason),
 }
 
@@ -83,6 +86,12 @@ pub(super) struct PolicySelectedSite {
     pub(super) result_contract: Option<PolicyResultContractSelection>,
     pub(super) call_shape: Option<PolicyCallShapeSelection>,
     pub(super) call_binding: Option<PolicySelectedCallBinding>,
+    /// Model identity retained even for a receiver-only row. Those rows have
+    /// no written actual to populate `call_binding`, but their declaration
+    /// identity is still needed by consumers that validate an external
+    /// procedure summary.
+    pub(super) modeled_member_id: Option<String>,
+    pub(super) modeled_target_origin: Option<&'static str>,
     /// Exact semantic value/parameter-port identity retained by a complete
     /// decorated-parameter query row. The corresponding artifact dependency
     /// is admitted into this selector session before the row escapes.
@@ -95,6 +104,9 @@ pub(super) struct PolicySelectedSite {
     /// no endpoint exists. Preserve that distinction for matched-value.
     pub(super) runtime_keyed_read_row: bool,
     pub(super) runtime_keyed_read_conclusive_exclusion: bool,
+    /// Exact syntactic role for a taint selector's occurrence row. A binder
+    /// can be name-classified without denoting an executable value point.
+    pub(super) occurrence_role: Option<OccurrenceRole>,
     /// This exact row came from the narrowly retained positive subset of an
     /// otherwise incomplete result-contract query.
     pub(super) retained_incomplete_result_contract_query: bool,
@@ -118,9 +130,7 @@ fn query_plan_contains_decorator_bindings(plan: &CodeQueryPlan) -> bool {
         {
             return true;
         }
-        if let CodeQueryPlanSource::Set { branches, .. } = &plan.source {
-            pending.extend(branches);
-        }
+        pending.extend(plan.source.child_plans());
     }
     false
 }
@@ -172,6 +182,21 @@ fn query_guarantees_workspace_exact_call_proof(plan: &CodeQueryPlan) -> bool {
         }
     }
     true
+}
+
+// A receiver constraint adds a dispatch obligation even to a declared selector.
+// Visit set branches structurally; an obligation on any branch is conservative.
+fn query_requires_receiver_dispatch(plan: &CodeQueryPlan) -> bool {
+    let mut pending = vec![plan];
+    while let Some(plan) = pending.pop() {
+        if plan.steps.iter().any(|step| {
+            matches!(step, QueryStep::ResolvedCall(filter) if filter.receiver_type.is_some())
+        }) {
+            return true;
+        }
+        pending.extend(plan.source.child_plans());
+    }
+    false
 }
 
 fn admits_existing_incomplete_call_bindings(
@@ -319,21 +344,39 @@ fn retains_independently_proven_result_contracts(
 
 /// A taint endpoint row is useful only when the query retained a located
 /// structural or semantic site. An open dispatch may still have a concrete
-/// call-binding row; a terminal or identity-less row cannot name an operand.
+/// call-binding row. A terminal binding row is also a usable call site when it
+/// proves an exhaustively empty actual-to-formal partition: a zero-argument
+/// source still binds the call's normal return value, even though it has no
+/// argument row to emit.
 fn usable_taint_row(item: &CodeQueryResultItem, evidence: &DetailedCodeQueryEvidence) -> bool {
     if evidence.byte_span.is_none() || matches!(evidence.domain, DetailedCodeQueryDomain::File) {
         return false;
     }
     match &item.value {
         CodeQueryResultValue::CallBinding { value } => {
-            !value.terminal
-                && value.argument_id.is_some()
-                && value.actual_index.is_some()
-                && value.formal_index.is_some()
-                && value.formal_name.is_some()
-                && value.formal_layout_id.is_some()
+            let located_source_binding = incomplete_source_call_binding(value);
+            let exact_site = value.formal_layout_id.is_some()
                 && value.selector_proof.is_some()
-                && (value.semantic_target_id.is_some() || value.model_callable_id.is_some())
+                && (value.semantic_target_id.is_some()
+                    || value.model_callable_id.is_some()
+                    // A resolver-owned external call can have no materialized
+                    // dispatch target or callable id. Its declared selector
+                    // proof is the exact target identity for a terminal
+                    // zero-argument partition.
+                    || (value.selector_exact && value.terminal));
+            if value.terminal {
+                value.mapping == "exact"
+                    && value.coverage == "exhaustive"
+                    && value.actual_count == 0
+                    && exact_site
+            } else {
+                value.argument_id.is_some()
+                    && value.actual_index.is_some()
+                    && value.formal_index.is_some()
+                    && value.formal_name.is_some()
+                    && value.formal_layout_id.is_some()
+                    && (exact_site || located_source_binding)
+            }
         }
         CodeQueryResultValue::DecoratedParameter { value } => {
             value.completion == "complete"
@@ -351,6 +394,19 @@ fn usable_taint_row(item: &CodeQueryResultItem, evidence: &DetailedCodeQueryEvid
         // semantic endpoint when the query as a whole is incomplete.
         _ => false,
     }
+}
+
+fn incomplete_source_call_binding(value: &CodeQueryCallBinding) -> bool {
+    value.target.is_some()
+        && value.declared_target_id.is_some()
+        && value.target_origin == Some("source")
+        && value.coverage == "incomplete"
+        && value.dispatch_outcome == "resolved"
+        && value.dispatch_coverage == "exhaustive"
+        && value.dispatch_target_count == 1
+        && !value.dispatch_targets_truncated
+        && value.mapping == "exact"
+        && value.actual_count == value.bound_count
 }
 
 fn retains_usable_taint_rows(
@@ -525,6 +581,10 @@ pub(super) struct PolicySelectedCallBinding {
     pub(super) model_id: Option<String>,
     pub(super) pack_id: Option<String>,
     pub(super) selector_proof: &'static str,
+    pub(super) requires_receiver_dispatch: bool,
+    /// Whether the row has an exact selector proof or only a retained source
+    /// candidate under incomplete selected-native resolution.
+    pub(super) selector_provenance: &'static str,
     pub(super) selector_summary_id: Option<String>,
     pub(super) selector_summary_model_id: Option<String>,
     pub(super) selector_summary_pack_id: Option<String>,
@@ -532,6 +592,14 @@ pub(super) struct PolicySelectedCallBinding {
 }
 
 impl PolicySelectedCallBinding {
+    pub(super) fn requires_dispatch(&self) -> bool {
+        self.requires_receiver_dispatch
+            || matches!(
+                self.selector_proof,
+                "resolved_workspace" | "authored_summary"
+            )
+    }
+
     pub(super) fn assert_valid_identity(&self) {
         debug_assert!(!self.row_id.is_empty());
         debug_assert!(!self.site_id.is_empty());
@@ -552,20 +620,28 @@ impl PolicySelectedCallBinding {
         debug_assert!(self.model_id.as_ref().is_none_or(|id| !id.is_empty()));
         debug_assert!(self.pack_id.as_ref().is_none_or(|pack| !pack.is_empty()));
         debug_assert!(matches!(
-            self.selector_proof,
-            "declared" | "derived" | "authored_summary" | "resolved_workspace"
+            self.selector_provenance,
+            "declared"
+                | "derived"
+                | "authored_summary"
+                | "resolved_workspace"
+                | "incomplete_source_candidate"
         ));
         debug_assert!(
-            self.selector_proof != "declared"
+            self.selector_provenance != "declared"
                 || (self.signature_id.is_some() && self.model_id.is_some())
         );
         debug_assert_eq!(
-            self.selector_proof == "authored_summary",
+            self.selector_provenance == "authored_summary",
             self.selector_summary_id.is_some()
                 && self.selector_summary_model_id.is_some()
                 && self.selector_summary_pack_id.is_some()
                 && self.selector_summary_pack_digest.is_some()
         );
+        debug_assert!(matches!(
+            self.selector_proof,
+            "declared" | "derived" | "authored_summary" | "resolved_workspace"
+        ));
     }
 }
 
@@ -584,6 +660,10 @@ pub(super) struct PolicySelectorSession<'a> {
     /// answer over the whole workspace, because those answers are what make a
     /// finding in an unedited file change.
     execution_scope: CodeQueryExecutionScope<'a>,
+    /// Exact Rust call-target outcomes shared by selector scans in this
+    /// compilation. The cache is bounded by the files and call sites the
+    /// compilation actually queries and is dropped with the session.
+    call_target_outcomes: Option<CallTargetOutcomeCache>,
     /// The per-seed selector units this compile may reuse, when it holds an
     /// incremental context. Absent for a compile that has nothing to reuse and
     /// for every family that does not unitize its selectors, which then run
@@ -644,6 +724,11 @@ pub(super) struct PolicySelectorSession<'a> {
     // level fact into its final completion even when no row can seed a subject.
     retained_incomplete_result_contract_selectors: usize,
     incomplete_taint_selectors: Vec<String>,
+    /// Complete identity-only occurrence and environment rows shared across
+    /// selectors in this policy compilation. The session is dropped with the
+    /// compiler and keys every product by the workspace snapshot, role set
+    /// and derivation options.
+    row_family_session: CodeQueryRowFamilySession,
 }
 
 impl<'a> PolicySelectorSession<'a> {
@@ -675,6 +760,8 @@ impl<'a> PolicySelectorSession<'a> {
             .semantic
             .max_materialized_files
             .max(workspace.project_file_count());
+        let call_target_outcomes =
+            CallTargetOutcomeCache::for_policy_compilation(workspace.analyzer());
         Self {
             workspace,
             analysis,
@@ -682,6 +769,7 @@ impl<'a> PolicySelectorSession<'a> {
             max_selector_results,
             cancellation,
             execution_scope,
+            call_target_outcomes,
             units: None,
             semantic_budget: SemanticBudget::new(semantic_work_limits(query_limits.semantic))
                 .expect("validated CodeQuery semantic limits are positive"),
@@ -709,6 +797,7 @@ impl<'a> PolicySelectorSession<'a> {
             result_contract_artifact_leases: 0,
             retained_incomplete_result_contract_selectors: 0,
             incomplete_taint_selectors: Vec::new(),
+            row_family_session: CodeQueryRowFamilySession::default(),
         }
     }
 
@@ -760,9 +849,12 @@ impl<'a> PolicySelectorSession<'a> {
         self.peak_retained_bytes = self.peak_retained_bytes.max(retained_peak);
         self.peak_traversal_steps = self.peak_traversal_steps.max(traversal_peak);
 
+        // The region's scalar limits reset, but the artifact censuses this
+        // compile already paid stay paid: a shared artifact is charged once per
+        // compile, and a later region pays only the repeat lookup.
+        let census = self.semantic_budget.scope_snapshot();
         self.semantic_budget =
-            SemanticBudget::new(semantic_work_limits(self.query_limits.semantic))
-                .expect("validated CodeQuery semantic limits are positive");
+            SemanticBudget::new_child(semantic_work_limits(self.query_limits.semantic), &census);
         self.semantic_execution_budget = SemanticExecutionBudget::new(
             self.materialized_files_limit,
             self.query_limits.semantic.max_traversal_steps,
@@ -823,7 +915,9 @@ impl<'a> PolicySelectorSession<'a> {
             &self.semantic_budget,
             &self.semantic_execution_budget,
             artifact_leases,
-            self.execution_scope,
+            self.execution_scope
+                .clone()
+                .with_optional_shared_call_target_outcomes(self.call_target_outcomes.as_ref()),
         );
         let semantic_receipt = detailed.take_semantic_receipt();
         self.query_work = self.query_work.saturating_add(detailed.work);
@@ -867,7 +961,55 @@ impl<'a> PolicySelectorSession<'a> {
         selector: &ResolvedPolicySelector,
     ) -> Result<Vec<PolicySelectedSite>, PolicySelectorSessionError> {
         let query = self.selector_query(selector)?;
-        let mut detailed = self.execute_taint_selector_query(&query)?;
+        let scope = self.execution_scope.clone();
+        self.select_taint_in(selector, &query, scope)
+    }
+
+    /// Run a taint selector sliced to the seed files `files` (spec M4.1), or
+    /// over the whole workspace when its query cannot be sliced. The second
+    /// value is the reason the whole workspace answered, which the caller
+    /// records; a sliced run widens nothing.
+    pub(super) fn select_taint_sliced(
+        &mut self,
+        selector: &ResolvedPolicySelector,
+        files: &[ProjectFile],
+    ) -> Result<(Vec<PolicySelectedSite>, Option<WidenReason>), PolicySelectorSessionError> {
+        let query = self.selector_query(selector)?;
+        if let Some(reason) = query_slicing_widen_reason(&query) {
+            return Ok((self.select_taint(selector)?, Some(reason)));
+        }
+        // The whole-workspace enumeration is what seed diagnostics still walk;
+        // the slice narrows only which files seed.
+        let workspace_files = self.workspace.analyzer().analyzed_files();
+        let scope = CodeQueryExecutionScope::for_seed_files(files, &workspace_files);
+        Ok((self.select_taint_in(selector, &query, scope)?, None))
+    }
+
+    /// Select one taint endpoint selector with its seed enumeration narrowed
+    /// to `file`, as a per-seed unit does: callers, dispatch and references
+    /// still answer over the whole workspace. The caller has checked that the
+    /// query can be sliced (`query_slicing_widen_reason`).
+    pub(super) fn select_taint_in_file(
+        &mut self,
+        selector: &ResolvedPolicySelector,
+        file: &ProjectFile,
+        workspace_files: &[ProjectFile],
+    ) -> Result<Vec<PolicySelectedSite>, PolicySelectorSessionError> {
+        let query = self.selector_query(selector)?;
+        self.select_taint_in(
+            selector,
+            &query,
+            CodeQueryExecutionScope::for_seed_files(std::slice::from_ref(file), workspace_files),
+        )
+    }
+
+    fn select_taint_in(
+        &mut self,
+        selector: &ResolvedPolicySelector,
+        query: &CodeQuery,
+        scope: CodeQueryExecutionScope<'_>,
+    ) -> Result<Vec<PolicySelectedSite>, PolicySelectorSessionError> {
+        let mut detailed = self.execute_taint_selector_query(query, scope)?;
         let completion = detailed.result.completion();
         if matches!(
             completion,
@@ -915,6 +1057,18 @@ impl<'a> PolicySelectorSession<'a> {
 
     pub(super) fn take_incomplete_taint_selectors(&mut self) -> Vec<String> {
         std::mem::take(&mut self.incomplete_taint_selectors)
+    }
+
+    /// Keep the first `len` incomplete-selector notes, so a caller that binds
+    /// a selector twice can drop the first pass's notes.
+    pub(super) fn truncate_incomplete_taint_selectors(&mut self, len: usize) {
+        self.incomplete_taint_selectors.truncate(len);
+    }
+
+    /// Put back messages taken with `take_incomplete_taint_selectors`, after
+    /// the ones recorded since.
+    pub(super) fn extend_incomplete_taint_selectors(&mut self, messages: Vec<String>) {
+        self.incomplete_taint_selectors.extend(messages);
     }
 
     /// Compile this session's selectors one seed file at a time, reusing what
@@ -1033,7 +1187,8 @@ impl<'a> PolicySelectorSession<'a> {
                     executed.rows
                 }
             };
-            check_exhaustive_selector_rows(&rows)?;
+            super::unit_execution::check_exhaustive_rows(&rows)
+                .map_err(PolicySelectorSessionError::Widen)?;
             products.push(rows);
         }
         let merged = merge_unit_rows(query, products);
@@ -1075,7 +1230,8 @@ impl<'a> PolicySelectorSession<'a> {
                 CodeQueryExecutionScope::for_seed_files(
                     std::slice::from_ref(file),
                     &units.workspace_files,
-                ),
+                )
+                .with_optional_shared_call_target_outcomes(self.call_target_outcomes.as_ref()),
             )
         });
         let mut detailed = executed.detailed;
@@ -1199,15 +1355,18 @@ impl<'a> PolicySelectorSession<'a> {
         Ok(query)
     }
 
-    #[cfg(test)]
-    fn execute_selector_query(
+    fn execute_selector_query_core(
         &mut self,
         query: &brokk_bifrost_rql::CodeQuery,
-    ) -> Result<PolicySelectorQueryResult, PolicySelectorSessionError> {
+        scope: CodeQueryExecutionScope<'_>,
+    ) -> Result<
+        (DetailedCodeQueryResult, Option<CodeQuerySemanticReceipt>),
+        PolicySelectorSessionError,
+    > {
         self.selector_scans = self.selector_scans.saturating_add(1);
         let query_limits = self.remaining_query_limits()?;
         let artifact_leases = self.artifact_leases.snapshot();
-        let mut detailed = execute_code_query_detailed_eager_index_workspace_with_semantic_receipt(
+        let mut detailed = execute_code_query_detailed_eager_index_workspace_with_semantic_receipt_and_row_family_session(
             self.workspace,
             query,
             query_limits,
@@ -1215,10 +1374,21 @@ impl<'a> PolicySelectorSession<'a> {
             &self.semantic_budget,
             &self.semantic_execution_budget,
             artifact_leases,
-            self.execution_scope,
+            scope.with_optional_shared_call_target_outcomes(self.call_target_outcomes.as_ref()),
+            &mut self.row_family_session,
         );
         let semantic_receipt = detailed.take_semantic_receipt();
         self.query_work = self.query_work.saturating_add(detailed.work);
+        Ok((detailed, semantic_receipt))
+    }
+
+    #[cfg(test)]
+    fn execute_selector_query(
+        &mut self,
+        query: &brokk_bifrost_rql::CodeQuery,
+    ) -> Result<PolicySelectorQueryResult, PolicySelectorSessionError> {
+        let scope = self.execution_scope.clone();
+        let (detailed, semantic_receipt) = self.execute_selector_query_core(query, scope)?;
         self.charge_query_semantic_work(detailed.work.semantic, semantic_receipt)?;
         Ok(PolicySelectorQueryResult {
             result: detailed.result,
@@ -1233,21 +1403,8 @@ impl<'a> PolicySelectorSession<'a> {
         &mut self,
         query: &brokk_bifrost_rql::CodeQuery,
     ) -> Result<PolicySelectorQueryResult, PolicySelectorSessionError> {
-        self.selector_scans = self.selector_scans.saturating_add(1);
-        let query_limits = self.remaining_query_limits()?;
-        let artifact_leases = self.artifact_leases.snapshot();
-        let mut detailed = execute_code_query_detailed_eager_index_workspace_with_semantic_receipt(
-            self.workspace,
-            query,
-            query_limits,
-            Some(self.cancellation),
-            &self.semantic_budget,
-            &self.semantic_execution_budget,
-            artifact_leases,
-            self.execution_scope,
-        );
-        let semantic_receipt = detailed.take_semantic_receipt();
-        self.query_work = self.query_work.saturating_add(detailed.work);
+        let scope = self.execution_scope.clone();
+        let (detailed, semantic_receipt) = self.execute_selector_query_core(query, scope)?;
         let retain_result_contract_subset =
             retains_independently_proven_result_contracts(&detailed.result, &detailed.evidence);
         let artifact_charge = self.charge_query_semantic_work_with_artifact_continuation(
@@ -1268,22 +1425,9 @@ impl<'a> PolicySelectorSession<'a> {
     fn execute_taint_selector_query(
         &mut self,
         query: &brokk_bifrost_rql::CodeQuery,
+        scope: CodeQueryExecutionScope<'_>,
     ) -> Result<PolicySelectorQueryResult, PolicySelectorSessionError> {
-        self.selector_scans = self.selector_scans.saturating_add(1);
-        let query_limits = self.remaining_query_limits()?;
-        let artifact_leases = self.artifact_leases.snapshot();
-        let mut detailed = execute_code_query_detailed_eager_index_workspace_with_semantic_receipt(
-            self.workspace,
-            query,
-            query_limits,
-            Some(self.cancellation),
-            &self.semantic_budget,
-            &self.semantic_execution_budget,
-            artifact_leases,
-            self.execution_scope,
-        );
-        let semantic_receipt = detailed.take_semantic_receipt();
-        self.query_work = self.query_work.saturating_add(detailed.work);
+        let (detailed, semantic_receipt) = self.execute_selector_query_core(query, scope)?;
         let retain_rows = retains_usable_taint_rows(&detailed.result, &detailed.evidence);
         let artifact_charge = self.charge_query_semantic_work_with_artifact_continuation(
             detailed.work.semantic,
@@ -1409,12 +1553,27 @@ impl<'a> PolicySelectorSession<'a> {
                     }
                     (_, None) => None,
                 };
-                let span = evidence.byte_span.ok_or_else(|| {
+                let evidence_span = evidence.byte_span.ok_or_else(|| {
                     PolicySelectorSessionError::Unavailable(format!(
                         "selector `{}` produced a row without a source span",
                         selector.path
                     ))
                 })?;
+                let receiver_only_call = match &item.value {
+                    CodeQueryResultValue::CallBinding { value } => {
+                        value.argument_id.is_none() && value.binding_kind == Some("receiver")
+                    }
+                    _ => false,
+                };
+                let span = if receiver_only_call {
+                    match &item.value {
+                        CodeQueryResultValue::CallBinding { value } =>
+                            self.call_span_for_ast_id(&evidence.file, &value.site_ast_id)?,
+                        _ => unreachable!("receiver-only marker belongs to a call binding"),
+                    }
+                } else {
+                    evidence_span
+                };
                 let (proof, completeness) = if !taint_subset
                     && (declared_call || workspace_exact_call)
                     && matches!(item.value, CodeQueryResultValue::CallBinding { .. })
@@ -1486,6 +1645,8 @@ impl<'a> PolicySelectorSession<'a> {
                     (_, None) => (None, false, false),
                 };
                 let call_binding = match &item.value {
+                    CodeQueryResultValue::CallBinding { value } if value.terminal => None,
+                    CodeQueryResultValue::CallBinding { .. } if receiver_only_call => None,
                     CodeQueryResultValue::CallBinding { value } => {
                         let call_span = self.call_span_for_ast_id(
                             &evidence.file,
@@ -1531,10 +1692,27 @@ impl<'a> PolicySelectorSession<'a> {
                             signature_id: value.signature_id.clone(),
                             model_id: value.model_id.clone(),
                             pack_id: value.pack_id.clone(),
+                            requires_receiver_dispatch: selector.as_query().is_some_and(|(_, query)| {
+                                query_requires_receiver_dispatch(&query.plan)
+                            }),
                             selector_proof: if declared_call && !taint_subset {
                                 "declared"
                             } else if workspace_exact_call && !taint_subset {
                                 "resolved_workspace"
+                            } else {
+                                value.selector_proof.ok_or_else(|| {
+                                    PolicySelectorSessionError::Unavailable(format!(
+                                        "selector `{}` selected a binding without selector proof",
+                                        selector.path
+                                    ))
+                                })?
+                            },
+                            selector_provenance: if declared_call && !taint_subset {
+                                "declared"
+                            } else if workspace_exact_call && !taint_subset {
+                                "resolved_workspace"
+                            } else if taint_subset && incomplete_source_call_binding(value) {
+                                "incomplete_source_candidate"
                             } else {
                                 value.selector_proof.ok_or_else(|| {
                                     PolicySelectorSessionError::Unavailable(format!(
@@ -1575,6 +1753,23 @@ impl<'a> PolicySelectorSession<'a> {
                     }
                     _ => None,
                 };
+                let (modeled_member_id, modeled_target_origin) = match &item.value {
+                    CodeQueryResultValue::CallBinding { value } => {
+                        (value.model_id.clone(), value.target_origin)
+                    }
+                    _ => (None, None),
+                };
+                let occurrence_role = if self.analysis == "taint" {
+                    match &item.value {
+                        CodeQueryResultValue::Occurrence { value } => Some(
+                            OccurrenceRole::from_label(value.role)
+                                .expect("occurrence rows use the registered role vocabulary"),
+                        ),
+                        _ => None,
+                    }
+                } else {
+                    None
+                };
                 Ok(Some(PolicySelectedSite {
                     file: evidence.file,
                     span,
@@ -1583,10 +1778,13 @@ impl<'a> PolicySelectorSession<'a> {
                     result_contract,
                     call_shape,
                     call_binding,
+                    modeled_member_id,
+                    modeled_target_origin,
                     decorated_parameter,
                     runtime_keyed_read,
                     runtime_keyed_read_row,
                     runtime_keyed_read_conclusive_exclusion,
+                    occurrence_role,
                     retained_incomplete_result_contract_query,
                 }))
             })
@@ -1951,12 +2149,7 @@ impl<'a> PolicySelectorSession<'a> {
             .outcome()
             .available_value()
             .cloned()
-            .ok_or_else(|| {
-                PolicySelectorSessionError::Unavailable(format!(
-                    "program semantics are unavailable for {}",
-                    file.abs_path().display()
-                ))
-            })?;
+            .ok_or_else(|| unavailable_semantic_artifact(file))?;
         let outcome = continuation.commit(self, "program semantics materialization")?;
         drop(outcome);
         assert!(
@@ -2000,12 +2193,10 @@ impl<'a> PolicySelectorSession<'a> {
         };
         self.require_uninterrupted(&outcome, "program semantics materialization")?;
         self.require_execution_budget("program semantics materialization")?;
-        let artifact = outcome.available_value().cloned().ok_or_else(|| {
-            PolicySelectorSessionError::Unavailable(format!(
-                "program semantics are unavailable for {}",
-                file.abs_path().display()
-            ))
-        })?;
+        let artifact = outcome
+            .available_value()
+            .cloned()
+            .ok_or_else(|| unavailable_semantic_artifact(file))?;
         self.artifacts.insert(file.clone(), Arc::clone(&artifact));
         Ok(artifact)
     }
@@ -2028,13 +2219,8 @@ impl<'a> PolicySelectorSession<'a> {
         &self,
         operation: &str,
     ) -> Result<(), PolicySelectorSessionError> {
-        if self.semantic_execution_budget.work().exhausted {
-            Err(semantic_budget_error(format!(
-                "{operation} exhausted the shared semantic file or traversal budget"
-            )))
-        } else {
-            Ok(())
-        }
+        semantic_execution_budget_failure(&self.semantic_execution_budget, operation)
+            .map_or(Ok(()), |detail| Err(semantic_budget_error(detail)))
     }
 
     pub(super) fn require_uninterrupted<T>(
@@ -2042,17 +2228,9 @@ impl<'a> PolicySelectorSession<'a> {
         outcome: &brokk_bifrost_analysis::analyzer::semantic::SemanticOutcome<T>,
         operation: &str,
     ) -> Result<(), PolicySelectorSessionError> {
-        use brokk_bifrost_analysis::analyzer::semantic::SemanticOutcome;
-        match outcome {
-            SemanticOutcome::Cancelled { .. } => Err(PolicySelectorSessionError::Incomplete {
-                completion: CodeQueryCompletion::Cancelled,
-                detail: format!("{operation} was cancelled"),
-            }),
-            SemanticOutcome::ExceededBudget { exceeded, .. } => Err(semantic_budget_error(
-                format!("{operation} exceeded the shared semantic budget: {exceeded}"),
-            )),
-            _ => Ok(()),
-        }
+        semantic_outcome_failure(outcome, operation).map_or(Ok(()), |(completion, detail)| {
+            Err(PolicySelectorSessionError::Incomplete { completion, detail })
+        })
     }
 
     pub(super) fn work_report(&self, analysis: &str) -> PolicyWorkReport {
@@ -2124,12 +2302,10 @@ impl<'a> PolicySelectorSession<'a> {
             // (`PolicyWorkReport::retained_size` feeds `PolicyRun`'s), and the
             // evaluator's retention search decides how many findings a run
             // keeps from that size. A name set that depends on the run's data
-            // therefore makes the *retained finding set* depend on it, which
-            // the incremental diff-base work
-            // (`.agents/plans/impact-sliced-diff-base.md`) cannot tolerate: it
-            // has to prove a reused-result report is byte-identical to a full
-            // one. Emitting them always makes the name set a function of the
-            // policy family and the `analysis` label alone, and #2659 already
+            // therefore makes the *retained finding set* depend on it. The
+            // incremental/full equivalence contract requires byte-identical
+            // reports, so the name set must be a function of the policy family
+            // and the `analysis` label alone. #2659 already
             // settled that a permanent zero is the honest signal -- it says
             // the compile did none of this work, not that nothing was measured.
             (
@@ -2287,24 +2463,7 @@ impl<'a> PolicySelectorSession<'a> {
         work: CodeQuerySemanticWork,
         receipt: Option<CodeQuerySemanticReceipt>,
     ) -> Result<(), PolicySelectorSessionError> {
-        let semantic_work = self.selector_semantic_work(work);
-        let Some(receipt) = receipt else {
-            assert_eq!(
-                work,
-                CodeQuerySemanticWork::default(),
-                "a selector that performs semantic work must return its one-shot charge",
-            );
-            return Ok(());
-        };
-        let (semantic_charge, execution_before, execution_charge, artifact_charge) =
-            receipt.into_parts();
-        self.apply_query_charge(
-            semantic_work,
-            semantic_charge,
-            execution_before,
-            execution_charge,
-        )?;
-        drop(artifact_charge);
+        self.charge_query_semantic_work_with_artifact_continuation(work, receipt, false)?;
         Ok(())
     }
 
@@ -2426,6 +2585,7 @@ fn selector_site_is_projectable(site: &PolicySelectedSite) -> bool {
         && !site.runtime_keyed_read_row
         && site.runtime_keyed_read.is_none()
         && !site.runtime_keyed_read_conclusive_exclusion
+        && site.occurrence_role != Some(OccurrenceRole::Binder)
         && !site.retained_incomplete_result_contract_query
 }
 
@@ -2448,22 +2608,6 @@ fn project_selector_site(site: &PolicySelectedSite) -> SelectorProductSite {
 /// Exhaustiveness is checked on the product rather than on how it was
 /// obtained: a unit that truncated or raised a diagnostic is not a partition
 /// of a whole execution, whichever run computed it.
-fn check_exhaustive_selector_rows(
-    rows: &UnitExecutionResult,
-) -> Result<(), PolicySelectorSessionError> {
-    if rows.truncated {
-        return Err(PolicySelectorSessionError::Widen(
-            WidenReason::UnitNotExhaustive,
-        ));
-    }
-    if !rows.diagnostics.is_empty() {
-        return Err(PolicySelectorSessionError::Widen(
-            WidenReason::UnitDiagnostics,
-        ));
-    }
-    Ok(())
-}
-
 fn lane(value: usize) -> u64 {
     u64::try_from(value).unwrap_or(u64::MAX)
 }
@@ -2631,10 +2775,13 @@ impl<'a> SelectorUnits<'a> {
                     result_contract: None,
                     call_shape: None,
                     call_binding: None,
+                    modeled_member_id: None,
+                    modeled_target_origin: None,
                     decorated_parameter: None,
                     runtime_keyed_read: None,
                     runtime_keyed_read_row: false,
                     runtime_keyed_read_conclusive_exclusion: false,
+                    occurrence_role: None,
                     retained_incomplete_result_contract_query: false,
                 })
             })
@@ -2692,10 +2839,61 @@ pub(super) struct SelectorUnitOutcome {
 
 fn semantic_budget_error(detail: impl Into<String>) -> PolicySelectorSessionError {
     PolicySelectorSessionError::Incomplete {
-        completion: CodeQueryCompletion::Incomplete {
-            codes: vec![CodeQueryDiagnosticCode::SemanticBudgetExhausted],
-        },
+        completion: incomplete_code_query_completion(
+            CodeQueryDiagnosticCode::SemanticBudgetExhausted,
+        ),
         detail: detail.into(),
+    }
+}
+
+pub(super) fn find_resolved_selector<'a>(
+    selectors: &HashMap<&crate::definition::PolicySelectorPath, &'a ResolvedPolicySelector>,
+    path: &crate::definition::PolicySelectorPath,
+) -> Option<&'a ResolvedPolicySelector> {
+    selectors.get(path).copied()
+}
+
+fn unavailable_semantic_artifact(file: &ProjectFile) -> PolicySelectorSessionError {
+    PolicySelectorSessionError::Unavailable(format!(
+        "program semantics are unavailable for {}",
+        file.abs_path().display()
+    ))
+}
+
+pub(super) fn incomplete_code_query_completion(
+    code: CodeQueryDiagnosticCode,
+) -> CodeQueryCompletion {
+    CodeQueryCompletion::Incomplete { codes: vec![code] }
+}
+
+pub(super) fn semantic_execution_budget_failure(
+    budget: &SemanticExecutionBudget,
+    operation: &str,
+) -> Option<String> {
+    budget
+        .work()
+        .exhausted
+        .then(|| format!("{operation} exhausted the shared semantic file or traversal budget"))
+}
+
+pub(super) fn semantic_outcome_failure<T>(
+    outcome: &SemanticOutcome<T>,
+    operation: &str,
+) -> Option<(CodeQueryCompletion, String)> {
+    match outcome {
+        SemanticOutcome::Cancelled { .. } => Some((
+            CodeQueryCompletion::Cancelled,
+            format!("{operation} was cancelled"),
+        )),
+        SemanticOutcome::ExceededBudget { exceeded, .. } => Some((
+            incomplete_code_query_completion(CodeQueryDiagnosticCode::SemanticBudgetExhausted),
+            format!("{operation} exceeded the shared semantic budget: {exceeded}"),
+        )),
+        SemanticOutcome::Complete { .. }
+        | SemanticOutcome::Ambiguous { .. }
+        | SemanticOutcome::Unknown { .. }
+        | SemanticOutcome::Unsupported { .. }
+        | SemanticOutcome::Unproven { .. } => None,
     }
 }
 
@@ -2746,6 +2944,42 @@ pub(super) fn selected_site_quality(
         semantic_binding_quality(semantic)
     } else {
         match &item.value {
+            CodeQueryResultValue::DependencyEvidence { value } => (
+                ProofStatus::Proven,
+                if value.complete {
+                    EvidenceCompleteness::Complete
+                } else {
+                    EvidenceCompleteness::Partial("dependency file record was only partially interpreted".into())
+                },
+            ),
+            CodeQueryResultValue::PythonRuleFact { value } => (
+                proof_from_label(value.proof),
+                if value.completeness == "complete" {
+                    EvidenceCompleteness::Complete
+                } else {
+                    EvidenceCompleteness::Partial(
+                        value
+                            .reason
+                            .clone()
+                            .unwrap_or_else(|| "Python rule fact evidence is incomplete".into())
+                            .into(),
+                    )
+                },
+            ),
+            CodeQueryResultValue::RustPointerFinding { value } => (
+                proof_from_label(value.proof),
+                if value.completeness == "complete" {
+                    EvidenceCompleteness::Complete
+                } else {
+                    EvidenceCompleteness::Partial(
+                        value
+                            .reason
+                            .clone()
+                            .unwrap_or_else(|| "Rust pointer finding evidence is incomplete".into())
+                            .into(),
+                    )
+                },
+            ),
             CodeQueryResultValue::TypestateFinding { value } => (
                 if value.path_proven {
                     ProofStatus::Proven
@@ -2765,6 +2999,16 @@ pub(super) fn selected_site_quality(
             CodeQueryResultValue::CallSite { value } => (
                 proof_from_label(value.proof),
                 EvidenceCompleteness::Complete,
+            ),
+            CodeQueryResultValue::PointsToCandidate { value } => (
+                proof_from_label(value.proof),
+                if value.completeness == "complete" && value.coverage == "exhaustive" {
+                    EvidenceCompleteness::Complete
+                } else {
+                    EvidenceCompleteness::Partial(
+                        "points-to candidate set is not exhaustive".into(),
+                    )
+                },
             ),
             CodeQueryResultValue::JsxAttributeValue { value } => (
                 ProofStatus::Proven,
@@ -2852,6 +3096,11 @@ pub(super) fn selected_site_quality(
                 ProofStatus::Proven,
                 flow_state_completeness(value.completeness, &value.uncovered_axes),
             ),
+            // Each relation row is an exact binding-to-call AST link; overall
+            // derivation completeness is carried by query diagnostics.
+            CodeQueryResultValue::BindingInitializerCall { .. } => {
+                (ProofStatus::Proven, EvidenceCompleteness::Complete)
+            }
             CodeQueryResultValue::FlowRelation { value } => (
                 ProofStatus::Proven,
                 flow_state_completeness(value.completeness, &value.uncovered_axes),
@@ -2893,6 +3142,22 @@ pub(super) fn selected_site_quality(
                     )
                 } else {
                     EvidenceCompleteness::Complete
+                },
+            ),
+            CodeQueryResultValue::PendingCleanupFlow { value } => (
+                if value.proof == "exact" {
+                    ProofStatus::Proven
+                } else {
+                    ProofStatus::Unproven(
+                        format!("pending cleanup proof is {}", value.proof).into(),
+                    )
+                },
+                if value.coverage == "exhaustive" {
+                    EvidenceCompleteness::Complete
+                } else {
+                    EvidenceCompleteness::Partial(
+                        format!("pending cleanup flow is incomplete: {:?}", value.reason).into(),
+                    )
                 },
             ),
             CodeQueryResultValue::FailureHandlerState { value } => (
@@ -2998,6 +3263,38 @@ pub(super) fn selected_site_quality(
                     )
                 },
             ),
+            CodeQueryResultValue::LiteralOccurrence { value } => (
+                if value.coverage == "exact" {
+                    ProofStatus::Proven
+                } else {
+                    ProofStatus::Unproven("literal decoder coverage is open".into())
+                },
+                if value.coverage == "exact" {
+                    EvidenceCompleteness::Complete
+                } else {
+                    EvidenceCompleteness::Partial(
+                        format!("literal occurrence coverage is {}", value.coverage).into(),
+                    )
+                },
+            ),
+            // Callable-metrics rows are exact only when the shared AST walk
+            // and ownership evidence are exact. Incomplete and unrecorded
+            // rows keep selector policies open, so a stale overlay cannot
+            // become a clean negative by omission.
+            CodeQueryResultValue::CallableMetrics { value } => {
+                if value.coverage == "exact" {
+                    (ProofStatus::Proven, EvidenceCompleteness::Complete)
+                } else {
+                    (
+                        ProofStatus::Unproven(
+                            format!("callable metrics coverage is {}", value.coverage).into(),
+                        ),
+                        EvidenceCompleteness::Partial(
+                            format!("callable metrics coverage is {}", value.coverage).into(),
+                        ),
+                    )
+                }
+            }
             // A parameter row whose optionality the language never recorded
             // cannot support a required-versus-optional claim.
             CodeQueryResultValue::SignatureParameter { value } => (
@@ -3155,10 +3452,11 @@ pub(super) fn selected_site_quality(
                 },
                 if value.mapping == "exact"
                     && value.coverage == "exhaustive"
-                    && !value.terminal
-                    && value.argument_id.is_some()
                     && value.selector_exact
                     && value.selector_proof.is_some()
+                    && ((!value.terminal
+                        && value.argument_id.is_some())
+                        || (value.terminal && value.actual_count == 0))
                 {
                     EvidenceCompleteness::Complete
                 } else {
@@ -3264,32 +3562,6 @@ pub(super) fn selected_site_quality(
                     )
                 },
             ),
-            CodeQueryResultValue::ConcurrentAccessConflict { value } => (
-                if value.proof == "proven" {
-                    ProofStatus::Proven
-                } else {
-                    ProofStatus::Unproven(
-                        value
-                            .reasons
-                            .first()
-                            .map(String::as_str)
-                            .unwrap_or("concurrent access proof is open")
-                            .into(),
-                    )
-                },
-                if value.coverage == "exhaustive" {
-                    EvidenceCompleteness::Complete
-                } else {
-                    EvidenceCompleteness::Partial(
-                        value
-                            .reasons
-                            .first()
-                            .map(String::as_str)
-                            .unwrap_or("concurrent access coverage is open")
-                            .into(),
-                    )
-                },
-            ),
             // A class-set row's own status is its proof story: only a `known`
             // row is a proven claim, every other status carries no proof.
             CodeQueryResultValue::ClassSetRow { value } => (
@@ -3349,7 +3621,22 @@ pub(super) fn selected_site_quality(
                     )
                 },
             ),
+            CodeQueryResultValue::PythonHierarchyFact { value } => (
+                ProofStatus::Proven,
+                if value.coverage == "complete" {
+                    EvidenceCompleteness::Complete
+                } else {
+                    EvidenceCompleteness::Partial(
+                        format!(
+                            "Python hierarchy fact is open: outcome={}, reason={:?}",
+                            value.outcome, value.reason
+                        )
+                        .into(),
+                    )
+                },
+            ),
             CodeQueryResultValue::StructuralMatch { .. }
+            | CodeQueryResultValue::CppExpression { .. }
             | CodeQueryResultValue::Declaration { .. }
             | CodeQueryResultValue::File { .. }
             | CodeQueryResultValue::CandidateHop { .. }
@@ -3380,6 +3667,11 @@ pub(super) fn selected_site_quality(
             // set is whole arrives through the query's diagnostics, never
             // through this per-row judgement.
             | CodeQueryResultValue::ConfigurationFact { .. }
+            // A cross-domain row records one structurally proven pair or one
+            // contributing row of a satisfied requirement (#3284); a key that
+            // names several facts is the row's own `binding` column, and
+            // input completeness arrives through the query's diagnostics.
+            | CodeQueryResultValue::CrossDomain { .. }
             // The identity-route rows are parser facts with the same per-axis
             // completeness story (#1475).
             | CodeQueryResultValue::QualifiedPath { .. }
@@ -3429,17 +3721,7 @@ fn flow_state_completeness(
     completeness: &str,
     uncovered_axes: &[&'static str],
 ) -> EvidenceCompleteness {
-    if completeness == "complete" {
-        EvidenceCompleteness::Complete
-    } else {
-        EvidenceCompleteness::Partial(
-            format!(
-                "flow-state derivation does not cover [{}]",
-                uncovered_axes.join(", ")
-            )
-            .into(),
-        )
-    }
+    derivation_completeness(completeness, "flow-state", uncovered_axes)
 }
 
 /// The evidence completeness one rewrite-path row carries (#1480).
@@ -3447,13 +3729,21 @@ fn rewrite_path_completeness(
     completeness: &str,
     uncovered_domains: &[&'static str],
 ) -> EvidenceCompleteness {
+    derivation_completeness(completeness, "rewrite-path", uncovered_domains)
+}
+
+fn derivation_completeness(
+    completeness: &str,
+    derivation: &str,
+    uncovered: &[&'static str],
+) -> EvidenceCompleteness {
     if completeness == "complete" {
         EvidenceCompleteness::Complete
     } else {
         EvidenceCompleteness::Partial(
             format!(
-                "rewrite-path derivation does not cover [{}]",
-                uncovered_domains.join(", ")
+                "{derivation} derivation does not cover [{}]",
+                uncovered.join(", ")
             )
             .into(),
         )
@@ -3532,6 +3822,7 @@ mod tests {
     };
     use brokk_bifrost_analysis::analyzer::{AnalyzerConfig, Language, WorkspaceAnalyzer};
     use brokk_bifrost_rql::structural::CodeQuery;
+    use brokk_bifrost_test_macros::hardwon;
 
     const EXACT_EXTERNAL_RECEIVER_MODEL: &str = r#"{
   "schema_version": 2,
@@ -3703,6 +3994,9 @@ mod tests {
     }
 
     #[test]
+    #[hardwon(
+        "#3732: keep located taint findings from partial selector discovery without claiming completion"
+    )]
     fn taint_selection_retains_located_rows_under_a_result_limit() {
         let project = InlineTestProject::with_language(Language::Go)
             .file(
@@ -3744,6 +4038,44 @@ mod tests {
         );
         assert_eq!(complete.select_taint(&selector).unwrap().len(), 2);
         assert!(complete.take_incomplete_taint_selectors().is_empty());
+    }
+
+    #[test]
+    fn zero_argument_call_binding_retains_the_call_site() {
+        let project = InlineTestProject::with_language(Language::Go)
+            .file(
+                "subject.go",
+                "package subject\n\nfunc source() {}\nfunc caller() { source() }\n",
+            )
+            .build();
+        let workspace = project.workspace_analyzer(AnalyzerConfig {
+            parallelism: Some(1),
+            ..AnalyzerConfig::default()
+        });
+        let selector = resolved_selector(
+            "(language go (call-bindings (call-shape (call :callee (name \"source\") (arity 0)))))",
+            "/analysis/sources/zero-argument",
+        );
+        let cancellation = CancellationToken::default();
+        let mut session = PolicySelectorSession::new(
+            &workspace,
+            "taint",
+            PolicyBudget::default().query_limits(),
+            16,
+            &cancellation,
+            CodeQueryExecutionScope::whole_workspace(),
+        );
+
+        let selected = session
+            .select_taint(&selector)
+            .expect("an exact zero-argument call binding is a usable source site");
+
+        assert_eq!(selected.len(), 1);
+        assert!(
+            selected[0].call_binding.is_none(),
+            "a terminal row has no operand binding but retains its call-site span"
+        );
+        assert!(selected[0].span.start < selected[0].span.end);
     }
 
     fn cfg_entry_selector(name: &str, path: &str) -> ResolvedPolicySelector {
@@ -3807,46 +4139,9 @@ mod tests {
     }
 
     #[test]
-    fn terminal_result_contract_rows_do_not_become_policy_sites() {
-        let project = InlineTestProject::with_language(Language::Go)
-            .file(
-                "subject.go",
-                r#"package subject
-
-func target() {}
-func caller() { target() }
-"#,
-            )
-            .build();
-        let workspace = project.workspace_analyzer(AnalyzerConfig {
-            parallelism: Some(1),
-            ..AnalyzerConfig::default()
-        });
-        let cancellation = CancellationToken::default();
-        let selector = resolved_selector(
-            r#"(call-result-contracts (call-shape (call :callee (name "target"))))"#,
-            "/analysis/terminal-result-contract",
-        );
-        let mut session = PolicySelectorSession::new(
-            &workspace,
-            "test",
-            PolicyBudget::default().query_limits(),
-            64,
-            &cancellation,
-            CodeQueryExecutionScope::whole_workspace(),
-        );
-
-        let selected = session
-            .select_with_artifact_continuation(&selector)
-            .expect("an exact unmodeled call produces a complete terminal contract row");
-
-        assert!(
-            selected.is_empty(),
-            "a terminal result-contract row is a proven non-applicability result"
-        );
-    }
-
-    #[test]
+    #[hardwon(
+        "57a6c0b0faa6: successful typestate evaluation must preserve compile peaks without recounting cumulative work"
+    )]
     fn child_evaluation_extends_peaks_without_recounting_cumulative_ledgers() {
         let compile_peaks = PolicySemanticPeaks {
             row_dimension: 12,
@@ -3872,6 +4167,9 @@ func caller() { target() }
     }
 
     #[test]
+    #[hardwon(
+        "3ac44dca99bb: Go receiver binding must keep function, method, field, and unknown outcomes distinct"
+    )]
     fn receiver_binding_distinguishes_go_function_method_field_and_unknown() {
         let project = InlineTestProject::new()
             .file("go.mod", "module example.com/receiver-binding\n\ngo 1.22\n")
@@ -4060,6 +4358,7 @@ func inspect(item resource, callback callbacks, unknown unknownpkg.Resource) {
     /// `nested_entries` must not cap every other dimension of every later
     /// query at what is left of that one lane.
     #[test]
+    #[hardwon("#2523: draining nested-entry work must not cap independent semantic row dimensions")]
     fn a_drained_lane_caps_itself_and_no_other_dimension() {
         let (_directory, workspace) = one_file_workspace();
         let cancellation = CancellationToken::default();
@@ -4104,143 +4403,13 @@ func inspect(item resource, callback callbacks, unknown unknownpkg.Resource) {
         }
     }
 
-    /// A zero delta allowance is representable because a continuation may
-    /// revisit a paid artifact without spending that row lane. Actual new work
-    /// is refused by the child ledger, as the behavior tests below pin.
-    #[test]
-    fn a_fully_spent_ledger_publishes_zero_delta_row_limits() {
-        let (_directory, workspace) = one_file_workspace();
-        let cancellation = CancellationToken::default();
-        let budget = PolicyBudget::default();
-        let rows = budget.query_limits().semantic.max_rows_per_dimension;
-        let mut session = PolicySelectorSession::new(
-            &workspace,
-            "test",
-            budget.query_limits(),
-            64,
-            &cancellation,
-            CodeQueryExecutionScope::whole_workspace(),
-        );
-
-        session
-            .semantic_budget
-            .charge(SemanticWork {
-                procedures: rows,
-                blocks: rows,
-                program_points: rows,
-                values: rows,
-                allocations: rows,
-                call_sites: rows,
-                memory_locations: rows,
-                captures: rows,
-                source_mappings: rows,
-                evidence: rows,
-                gaps: rows,
-                events: rows,
-                control_edges: rows,
-                nested_entries: rows,
-                ..SemanticWork::default()
-            })
-            .expect("the charge exactly fills every row lane");
-
-        let semantic = session
-            .remaining_query_limits()
-            .expect("zero delta limits are valid for a paid-artifact revisit")
-            .semantic;
-        for dimension in CodeQuerySemanticRowLimits::ROW_DIMENSIONS {
-            assert_eq!(semantic.rows(dimension), 0, "{dimension:?}");
-        }
-        assert!(semantic.max_retained_bytes > 0);
-    }
-
-    #[test]
-    #[should_panic(
-        expected = "a selector that performs semantic work must return its one-shot charge"
-    )]
-    fn semantic_query_work_without_a_charge_fails_closed() {
-        let (_directory, workspace) = one_file_workspace();
-        let cancellation = CancellationToken::default();
-        let budget = PolicyBudget::default();
-        let mut session = PolicySelectorSession::new(
-            &workspace,
-            "test",
-            budget.query_limits(),
-            64,
-            &cancellation,
-            CodeQueryExecutionScope::whole_workspace(),
-        );
-
-        let _ = session.charge_query_semantic_work(
-            CodeQuerySemanticWork {
-                procedures: 1,
-                ..CodeQuerySemanticWork::default()
-            },
-            None,
-        );
-    }
-
-    /// A session narrowed to one seed file selects only that file's sites;
-    /// the same selector over the whole workspace selects every file's.
-    ///
-    /// This is the seam a per-seed selector unit runs through. Only the seed
-    /// enumeration narrows, and the whole-workspace default is what every
-    /// caller that does not narrow keeps.
-    #[test]
-    fn a_narrowed_selector_session_enumerates_only_its_seed_files() {
-        let project = InlineTestProject::with_language(Language::Go)
-            .file("a.go", "package p\n\nfunc target() {}\n")
-            .file("b.go", "package p\n\nfunc target() {}\n")
-            .build();
-        let workspace = project.workspace_analyzer(AnalyzerConfig::default());
-        let cancellation = CancellationToken::default();
-        let limits = PolicyBudget::default().query_limits();
-        let selector = resolved_selector(r#"(function :name "target")"#, "/analysis/subject");
-
-        let mut whole = PolicySelectorSession::new(
-            &workspace,
-            "test",
-            limits,
-            64,
-            &cancellation,
-            CodeQueryExecutionScope::whole_workspace(),
-        );
-        let every_site = whole
-            .select_with_artifact_continuation(&selector)
-            .expect("the whole-workspace selector completes");
-        assert_eq!(
-            every_site.len(),
-            2,
-            "the default scope enumerates both files, not {}",
-            every_site.len()
-        );
-
-        let mut files = workspace.analyzer().analyzed_files();
-        files.sort();
-        let seed = project.file("a.go");
-        let mut narrowed = PolicySelectorSession::new(
-            &workspace,
-            "test",
-            limits,
-            64,
-            &cancellation,
-            CodeQueryExecutionScope::for_seed_files(std::slice::from_ref(&seed), &files),
-        );
-        let one_site = narrowed
-            .select_with_artifact_continuation(&selector)
-            .expect("the narrowed selector completes");
-        assert_eq!(
-            one_site.len(),
-            1,
-            "the narrowed scope enumerates one file, not {}",
-            one_site.len()
-        );
-        assert_eq!(one_site[0].file, seed);
-    }
-
     /// A selector and the policy compiler continuation are one accounting
     /// scope. The selector pays the artifact census; immediate materialization
     /// may pay only the one repeat lookup, even though RQL released its Arc.
     #[test]
+    #[hardwon(
+        "9b6029ba83b9: immediate materialization must reuse the selector's paid semantic census"
+    )]
     fn selector_charge_allows_immediate_post_selection_materialization() {
         let (_directory, workspace) = one_file_workspace();
         let cancellation = CancellationToken::default();
@@ -4305,6 +4474,9 @@ func inspect(item resource, callback callbacks, unknown unknownpkg.Resource) {
     /// can therefore be revisited with zero new-file and zero owned-text
     /// allowance, but the next real repeat still exhausts its exact row lane.
     #[test]
+    #[hardwon(
+        "9b6029ba83b9: overlapping selectors must share paid identity and a truthful retention high-water mark"
+    )]
     fn overlapping_selectors_share_identity_and_retained_high_water() {
         let (_directory, workspace) = one_file_workspace();
         let cancellation = CancellationToken::default();
@@ -4413,5 +4585,167 @@ func inspect(item resource, callback callbacks, unknown unknownpkg.Resource) {
             ),
             "{error:?}"
         );
+    }
+
+    #[test]
+    fn terminal_result_contract_rows_do_not_become_policy_sites() {
+        let project = InlineTestProject::with_language(Language::Go)
+            .file(
+                "subject.go",
+                r#"package subject
+
+func target() {}
+func caller() { target() }
+"#,
+            )
+            .build();
+        let workspace = project.workspace_analyzer(AnalyzerConfig {
+            parallelism: Some(1),
+            ..AnalyzerConfig::default()
+        });
+        let cancellation = CancellationToken::default();
+        let selector = resolved_selector(
+            r#"(call-result-contracts (call-shape (call :callee (name "target"))))"#,
+            "/analysis/terminal-result-contract",
+        );
+        let mut session = PolicySelectorSession::new(
+            &workspace,
+            "test",
+            PolicyBudget::default().query_limits(),
+            64,
+            &cancellation,
+            CodeQueryExecutionScope::whole_workspace(),
+        );
+
+        let selected = session
+            .select_with_artifact_continuation(&selector)
+            .expect("an exact unmodeled call produces a complete terminal contract row");
+
+        assert!(
+            selected.is_empty(),
+            "a terminal result-contract row is a proven non-applicability result"
+        );
+    }
+    #[test]
+    fn a_fully_spent_ledger_publishes_zero_delta_row_limits() {
+        let (_directory, workspace) = one_file_workspace();
+        let cancellation = CancellationToken::default();
+        let budget = PolicyBudget::default();
+        let rows = budget.query_limits().semantic.max_rows_per_dimension;
+        let mut session = PolicySelectorSession::new(
+            &workspace,
+            "test",
+            budget.query_limits(),
+            64,
+            &cancellation,
+            CodeQueryExecutionScope::whole_workspace(),
+        );
+
+        session
+            .semantic_budget
+            .charge(SemanticWork {
+                procedures: rows,
+                blocks: rows,
+                program_points: rows,
+                values: rows,
+                allocations: rows,
+                call_sites: rows,
+                memory_locations: rows,
+                captures: rows,
+                source_mappings: rows,
+                evidence: rows,
+                gaps: rows,
+                events: rows,
+                control_edges: rows,
+                nested_entries: rows,
+                ..SemanticWork::default()
+            })
+            .expect("the charge exactly fills every row lane");
+
+        let semantic = session
+            .remaining_query_limits()
+            .expect("zero delta limits are valid for a paid-artifact revisit")
+            .semantic;
+        for dimension in CodeQuerySemanticRowLimits::ROW_DIMENSIONS {
+            assert_eq!(semantic.rows(dimension), 0, "{dimension:?}");
+        }
+        assert!(semantic.max_retained_bytes > 0);
+    }
+
+    #[test]
+    #[should_panic(
+        expected = "a selector that performs semantic work must return its one-shot charge"
+    )]
+    fn semantic_query_work_without_a_charge_fails_closed() {
+        let (_directory, workspace) = one_file_workspace();
+        let cancellation = CancellationToken::default();
+        let budget = PolicyBudget::default();
+        let mut session = PolicySelectorSession::new(
+            &workspace,
+            "test",
+            budget.query_limits(),
+            64,
+            &cancellation,
+            CodeQueryExecutionScope::whole_workspace(),
+        );
+
+        let _ = session.charge_query_semantic_work(
+            CodeQuerySemanticWork {
+                procedures: 1,
+                ..CodeQuerySemanticWork::default()
+            },
+            None,
+        );
+    }
+    #[test]
+    fn a_narrowed_selector_session_enumerates_only_its_seed_files() {
+        let project = InlineTestProject::with_language(Language::Go)
+            .file("a.go", "package p\n\nfunc target() {}\n")
+            .file("b.go", "package p\n\nfunc target() {}\n")
+            .build();
+        let workspace = project.workspace_analyzer(AnalyzerConfig::default());
+        let cancellation = CancellationToken::default();
+        let limits = PolicyBudget::default().query_limits();
+        let selector = resolved_selector(r#"(function :name "target")"#, "/analysis/subject");
+
+        let mut whole = PolicySelectorSession::new(
+            &workspace,
+            "test",
+            limits,
+            64,
+            &cancellation,
+            CodeQueryExecutionScope::whole_workspace(),
+        );
+        let every_site = whole
+            .select_with_artifact_continuation(&selector)
+            .expect("the whole-workspace selector completes");
+        assert_eq!(
+            every_site.len(),
+            2,
+            "the default scope enumerates both files, not {}",
+            every_site.len()
+        );
+
+        let mut files = workspace.analyzer().analyzed_files();
+        files.sort();
+        let seed = project.file("a.go");
+        let mut narrowed = PolicySelectorSession::new(
+            &workspace,
+            "test",
+            limits,
+            64,
+            &cancellation,
+            CodeQueryExecutionScope::for_seed_files(std::slice::from_ref(&seed), &files),
+        );
+        let one_site = narrowed
+            .select_with_artifact_continuation(&selector)
+            .expect("the narrowed selector completes");
+        assert_eq!(
+            one_site.len(),
+            1,
+            "the narrowed scope enumerates one file, not {}",
+            one_site.len()
+        );
+        assert_eq!(one_site[0].file, seed);
     }
 }

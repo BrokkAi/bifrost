@@ -332,7 +332,8 @@ fn verdict(
     None
 }
 
-fn materialize(case: &FixtureCase, root: &Path) -> Result<(), FixtureRunError> {
+/// Materialize one generated fixture case beneath `root`.
+pub fn materialize(case: &FixtureCase, root: &Path) -> Result<(), FixtureRunError> {
     fs::create_dir_all(root).map_err(|error| FixtureRunError::Io {
         path: root.to_path_buf(),
         error,

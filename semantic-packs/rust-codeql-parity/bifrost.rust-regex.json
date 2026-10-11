@@ -1,0 +1,685 @@
+{
+  "schema_version": 2,
+  "pack_id": "bifrost.rust-regex",
+  "version": "0.1.0",
+  "producer": {
+    "name": "bifrost-reviewed-rust-codeql-models",
+    "version": "0.1.0"
+  },
+  "language": "rust",
+  "ecosystem": "cargo",
+  "compatibility": {
+    "bifrost": ">=0.12.0, <1.0.0",
+    "toolchains": []
+  },
+  "provenance": {
+    "source": "CodeQL rust/regex-injection regex construction and escape model, adapted to Bifrost's structured Rust external-call identities.",
+    "revision": "codeql-rust-regex-injection-2026-10-02"
+  },
+  "license": "Apache-2.0",
+  "completeness": "complete",
+  "safety": {
+    "generated_code_only": false,
+    "review_required": false
+  },
+  "shards": [
+    {
+      "id": "declarations.rust-codeql.regex",
+      "activation": [
+        {
+          "targets": [],
+          "configurations": []
+        }
+      ],
+      "payload": {
+        "kind": "declaration_facts",
+        "types": [
+          {
+            "id": "type.rust-codeql.regex",
+            "name": "regex",
+            "type_kind": "module",
+            "visibility": "public",
+            "locator": {
+              "kind": "artifact",
+              "path": "src/api.rs",
+              "symbol": "regex"
+            }
+          },
+          {
+            "id": "type.rust-codeql.regex-regex",
+            "name": "regex.Regex",
+            "type_kind": "struct",
+            "visibility": "public",
+            "locator": {
+              "kind": "artifact",
+              "path": "src/api.rs",
+              "symbol": "regex.Regex"
+            }
+          },
+          {
+            "id": "type.rust-codeql.regex-regex-builder",
+            "name": "regex.RegexBuilder",
+            "type_kind": "struct",
+            "visibility": "public",
+            "locator": {
+              "kind": "artifact",
+              "path": "src/api.rs",
+              "symbol": "regex.RegexBuilder"
+            }
+          },
+          {
+            "id": "type.rust-codeql.regex-regex-set",
+            "name": "regex.RegexSet",
+            "type_kind": "struct",
+            "visibility": "public",
+            "locator": {
+              "kind": "artifact",
+              "path": "src/api.rs",
+              "symbol": "regex.RegexSet"
+            }
+          },
+          {
+            "id": "type.rust-codeql.regex-bytes",
+            "name": "regex.bytes",
+            "type_kind": "module",
+            "visibility": "public",
+            "locator": {
+              "kind": "artifact",
+              "path": "src/api.rs",
+              "symbol": "regex.bytes"
+            }
+          },
+          {
+            "id": "type.rust-codeql.regex-bytes-regex",
+            "name": "regex.bytes.Regex",
+            "type_kind": "struct",
+            "visibility": "public",
+            "locator": {
+              "kind": "artifact",
+              "path": "src/api.rs",
+              "symbol": "regex.bytes.Regex"
+            }
+          },
+          {
+            "id": "type.rust-codeql.regex-bytes-regex-builder",
+            "name": "regex.bytes.RegexBuilder",
+            "type_kind": "struct",
+            "visibility": "public",
+            "locator": {
+              "kind": "artifact",
+              "path": "src/api.rs",
+              "symbol": "regex.bytes.RegexBuilder"
+            }
+          },
+          {
+            "id": "type.rust-codeql.regex-bytes-regex-set",
+            "name": "regex.bytes.RegexSet",
+            "type_kind": "struct",
+            "visibility": "public",
+            "locator": {
+              "kind": "artifact",
+              "path": "src/api.rs",
+              "symbol": "regex.bytes.RegexSet"
+            }
+          },
+          {
+            "id": "type.rust-codeql.regex-lite",
+            "name": "regex_lite",
+            "type_kind": "module",
+            "visibility": "public",
+            "locator": {
+              "kind": "artifact",
+              "path": "src/api.rs",
+              "symbol": "regex_lite"
+            }
+          },
+          {
+            "id": "type.rust-codeql.regex-lite-regex",
+            "name": "regex_lite.Regex",
+            "type_kind": "struct",
+            "visibility": "public",
+            "locator": {
+              "kind": "artifact",
+              "path": "src/api.rs",
+              "symbol": "regex_lite.Regex"
+            }
+          },
+          {
+            "id": "type.rust-codeql.regex-lite-regex-builder",
+            "name": "regex_lite.RegexBuilder",
+            "type_kind": "struct",
+            "visibility": "public",
+            "locator": {
+              "kind": "artifact",
+              "path": "src/api.rs",
+              "symbol": "regex_lite.RegexBuilder"
+            }
+          },
+          {
+            "id": "type.rust-codeql.fancy-regex",
+            "name": "fancy_regex",
+            "type_kind": "module",
+            "visibility": "public",
+            "locator": {
+              "kind": "artifact",
+              "path": "src/api.rs",
+              "symbol": "fancy_regex"
+            }
+          },
+          {
+            "id": "type.rust-codeql.fancy-regex-regex",
+            "name": "fancy_regex.Regex",
+            "type_kind": "struct",
+            "visibility": "public",
+            "locator": {
+              "kind": "artifact",
+              "path": "src/api.rs",
+              "symbol": "fancy_regex.Regex"
+            }
+          },
+          {
+            "id": "type.rust-codeql.fancy-regex-regex-builder",
+            "name": "fancy_regex.RegexBuilder",
+            "type_kind": "struct",
+            "visibility": "public",
+            "locator": {
+              "kind": "artifact",
+              "path": "src/api.rs",
+              "symbol": "fancy_regex.RegexBuilder"
+            }
+          }
+        ],
+        "members": [
+          {
+            "id": "member.rust-codeql.regex-regex.new",
+            "owner": "type.rust-codeql.regex-regex",
+            "name": "new",
+            "member_kind": "method",
+            "visibility": "public",
+            "is_static": true,
+            "callable_family_complete": true,
+            "signature": {
+              "parameters": [
+                {
+                  "name": "pattern",
+                  "type": {
+                    "kind": "named",
+                    "name": "untyped"
+                  }
+                }
+              ],
+              "returns": {
+                "kind": "named",
+                "name": "untyped"
+              }
+            },
+            "locator": {
+              "kind": "artifact",
+              "path": "src/api.rs",
+              "symbol": "regex.Regex.new"
+            }
+          },
+          {
+            "id": "member.rust-codeql.regex-regex-builder.new",
+            "owner": "type.rust-codeql.regex-regex-builder",
+            "name": "new",
+            "member_kind": "method",
+            "visibility": "public",
+            "is_static": true,
+            "callable_family_complete": true,
+            "signature": {
+              "parameters": [
+                {
+                  "name": "pattern",
+                  "type": {
+                    "kind": "named",
+                    "name": "untyped"
+                  }
+                }
+              ],
+              "returns": {
+                "kind": "named",
+                "name": "untyped"
+              }
+            },
+            "locator": {
+              "kind": "artifact",
+              "path": "src/api.rs",
+              "symbol": "regex.RegexBuilder.new"
+            }
+          },
+          {
+            "id": "member.rust-codeql.regex-regex-set.new",
+            "owner": "type.rust-codeql.regex-regex-set",
+            "name": "new",
+            "member_kind": "method",
+            "visibility": "public",
+            "is_static": true,
+            "callable_family_complete": true,
+            "signature": {
+              "parameters": [
+                {
+                  "name": "patterns",
+                  "type": {
+                    "kind": "named",
+                    "name": "untyped"
+                  }
+                }
+              ],
+              "returns": {
+                "kind": "named",
+                "name": "untyped"
+              }
+            },
+            "locator": {
+              "kind": "artifact",
+              "path": "src/api.rs",
+              "symbol": "regex.RegexSet.new"
+            }
+          },
+          {
+            "id": "member.rust-codeql.regex-bytes-regex.new",
+            "owner": "type.rust-codeql.regex-bytes-regex",
+            "name": "new",
+            "member_kind": "method",
+            "visibility": "public",
+            "is_static": true,
+            "callable_family_complete": true,
+            "signature": {
+              "parameters": [
+                {
+                  "name": "pattern",
+                  "type": {
+                    "kind": "named",
+                    "name": "untyped"
+                  }
+                }
+              ],
+              "returns": {
+                "kind": "named",
+                "name": "untyped"
+              }
+            },
+            "locator": {
+              "kind": "artifact",
+              "path": "src/api.rs",
+              "symbol": "regex.bytes.Regex.new"
+            }
+          },
+          {
+            "id": "member.rust-codeql.regex-bytes-regex-builder.new",
+            "owner": "type.rust-codeql.regex-bytes-regex-builder",
+            "name": "new",
+            "member_kind": "method",
+            "visibility": "public",
+            "is_static": true,
+            "callable_family_complete": true,
+            "signature": {
+              "parameters": [
+                {
+                  "name": "pattern",
+                  "type": {
+                    "kind": "named",
+                    "name": "untyped"
+                  }
+                }
+              ],
+              "returns": {
+                "kind": "named",
+                "name": "untyped"
+              }
+            },
+            "locator": {
+              "kind": "artifact",
+              "path": "src/api.rs",
+              "symbol": "regex.bytes.RegexBuilder.new"
+            }
+          },
+          {
+            "id": "member.rust-codeql.regex-bytes-regex-set.new",
+            "owner": "type.rust-codeql.regex-bytes-regex-set",
+            "name": "new",
+            "member_kind": "method",
+            "visibility": "public",
+            "is_static": true,
+            "callable_family_complete": true,
+            "signature": {
+              "parameters": [
+                {
+                  "name": "patterns",
+                  "type": {
+                    "kind": "named",
+                    "name": "untyped"
+                  }
+                }
+              ],
+              "returns": {
+                "kind": "named",
+                "name": "untyped"
+              }
+            },
+            "locator": {
+              "kind": "artifact",
+              "path": "src/api.rs",
+              "symbol": "regex.bytes.RegexSet.new"
+            }
+          },
+          {
+            "id": "member.rust-codeql.regex.escape",
+            "owner": "type.rust-codeql.regex",
+            "name": "escape",
+            "member_kind": "method",
+            "visibility": "public",
+            "is_static": true,
+            "callable_family_complete": true,
+            "signature": {
+              "parameters": [
+                {
+                  "name": "text",
+                  "type": {
+                    "kind": "named",
+                    "name": "untyped"
+                  }
+                }
+              ],
+              "returns": {
+                "kind": "named",
+                "name": "untyped"
+              }
+            },
+            "locator": {
+              "kind": "artifact",
+              "path": "src/api.rs",
+              "symbol": "regex.escape"
+            }
+          },
+          {
+            "id": "member.rust-codeql.regex-lite-regex.new",
+            "owner": "type.rust-codeql.regex-lite-regex",
+            "name": "new",
+            "member_kind": "method",
+            "visibility": "public",
+            "is_static": true,
+            "callable_family_complete": true,
+            "signature": {
+              "parameters": [
+                {
+                  "name": "pattern",
+                  "type": {
+                    "kind": "named",
+                    "name": "untyped"
+                  }
+                }
+              ],
+              "returns": {
+                "kind": "named",
+                "name": "untyped"
+              }
+            },
+            "locator": {
+              "kind": "artifact",
+              "path": "src/api.rs",
+              "symbol": "regex_lite.Regex.new"
+            }
+          },
+          {
+            "id": "member.rust-codeql.regex-lite-regex-builder.new",
+            "owner": "type.rust-codeql.regex-lite-regex-builder",
+            "name": "new",
+            "member_kind": "method",
+            "visibility": "public",
+            "is_static": true,
+            "callable_family_complete": true,
+            "signature": {
+              "parameters": [
+                {
+                  "name": "pattern",
+                  "type": {
+                    "kind": "named",
+                    "name": "untyped"
+                  }
+                }
+              ],
+              "returns": {
+                "kind": "named",
+                "name": "untyped"
+              }
+            },
+            "locator": {
+              "kind": "artifact",
+              "path": "src/api.rs",
+              "symbol": "regex_lite.RegexBuilder.new"
+            }
+          },
+          {
+            "id": "member.rust-codeql.fancy-regex-regex.new",
+            "owner": "type.rust-codeql.fancy-regex-regex",
+            "name": "new",
+            "member_kind": "method",
+            "visibility": "public",
+            "is_static": true,
+            "callable_family_complete": true,
+            "signature": {
+              "parameters": [
+                {
+                  "name": "pattern",
+                  "type": {
+                    "kind": "named",
+                    "name": "untyped"
+                  }
+                }
+              ],
+              "returns": {
+                "kind": "named",
+                "name": "untyped"
+              }
+            },
+            "locator": {
+              "kind": "artifact",
+              "path": "src/api.rs",
+              "symbol": "fancy_regex.Regex.new"
+            }
+          },
+          {
+            "id": "member.rust-codeql.fancy-regex-regex-builder.new",
+            "owner": "type.rust-codeql.fancy-regex-regex-builder",
+            "name": "new",
+            "member_kind": "method",
+            "visibility": "public",
+            "is_static": true,
+            "callable_family_complete": true,
+            "signature": {
+              "parameters": [
+                {
+                  "name": "pattern",
+                  "type": {
+                    "kind": "named",
+                    "name": "untyped"
+                  }
+                }
+              ],
+              "returns": {
+                "kind": "named",
+                "name": "untyped"
+              }
+            },
+            "locator": {
+              "kind": "artifact",
+              "path": "src/api.rs",
+              "symbol": "fancy_regex.RegexBuilder.new"
+            }
+          }
+        ],
+        "relations": []
+      }
+    },
+    {
+      "id": "summaries.rust-codeql.regex",
+      "activation": [
+        {
+          "targets": [],
+          "configurations": []
+        }
+      ],
+      "payload": {
+        "kind": "procedure_summaries",
+        "summaries": [
+          {
+            "id": "summary.rust-codeql.regex-regex.new",
+            "target": {
+              "path": "src/api.rs",
+              "symbol": "regex.Regex.new",
+              "has_receiver": false,
+              "parameter_count": 1
+            },
+            "completeness": "complete",
+            "locations": [],
+            "transfers": [],
+            "effects": []
+          },
+          {
+            "id": "summary.rust-codeql.regex-regex-builder.new",
+            "target": {
+              "path": "src/api.rs",
+              "symbol": "regex.RegexBuilder.new",
+              "has_receiver": false,
+              "parameter_count": 1
+            },
+            "completeness": "complete",
+            "locations": [],
+            "transfers": [],
+            "effects": []
+          },
+          {
+            "id": "summary.rust-codeql.regex-regex-set.new",
+            "target": {
+              "path": "src/api.rs",
+              "symbol": "regex.RegexSet.new",
+              "has_receiver": false,
+              "parameter_count": 1
+            },
+            "completeness": "complete",
+            "locations": [],
+            "transfers": [],
+            "effects": []
+          },
+          {
+            "id": "summary.rust-codeql.regex-bytes-regex.new",
+            "target": {
+              "path": "src/api.rs",
+              "symbol": "regex.bytes.Regex.new",
+              "has_receiver": false,
+              "parameter_count": 1
+            },
+            "completeness": "complete",
+            "locations": [],
+            "transfers": [],
+            "effects": []
+          },
+          {
+            "id": "summary.rust-codeql.regex-bytes-regex-builder.new",
+            "target": {
+              "path": "src/api.rs",
+              "symbol": "regex.bytes.RegexBuilder.new",
+              "has_receiver": false,
+              "parameter_count": 1
+            },
+            "completeness": "complete",
+            "locations": [],
+            "transfers": [],
+            "effects": []
+          },
+          {
+            "id": "summary.rust-codeql.regex-bytes-regex-set.new",
+            "target": {
+              "path": "src/api.rs",
+              "symbol": "regex.bytes.RegexSet.new",
+              "has_receiver": false,
+              "parameter_count": 1
+            },
+            "completeness": "complete",
+            "locations": [],
+            "transfers": [],
+            "effects": []
+          },
+          {
+            "id": "summary.rust-codeql.regex.escape",
+            "target": {
+              "path": "src/api.rs",
+              "symbol": "regex.escape",
+              "has_receiver": false,
+              "parameter_count": 1
+            },
+            "completeness": "complete",
+            "locations": [],
+            "transfers": [
+              {
+                "input": {
+                  "kind": "parameter",
+                  "ordinal": 0
+                },
+                "exit_kind": "normal",
+                "output": {
+                  "kind": "normal_return"
+                }
+              }
+            ],
+            "effects": []
+          },
+          {
+            "id": "summary.rust-codeql.regex-lite-regex.new",
+            "target": {
+              "path": "src/api.rs",
+              "symbol": "regex_lite.Regex.new",
+              "has_receiver": false,
+              "parameter_count": 1
+            },
+            "completeness": "complete",
+            "locations": [],
+            "transfers": [],
+            "effects": []
+          },
+          {
+            "id": "summary.rust-codeql.regex-lite-regex-builder.new",
+            "target": {
+              "path": "src/api.rs",
+              "symbol": "regex_lite.RegexBuilder.new",
+              "has_receiver": false,
+              "parameter_count": 1
+            },
+            "completeness": "complete",
+            "locations": [],
+            "transfers": [],
+            "effects": []
+          },
+          {
+            "id": "summary.rust-codeql.fancy-regex-regex.new",
+            "target": {
+              "path": "src/api.rs",
+              "symbol": "fancy_regex.Regex.new",
+              "has_receiver": false,
+              "parameter_count": 1
+            },
+            "completeness": "complete",
+            "locations": [],
+            "transfers": [],
+            "effects": []
+          },
+          {
+            "id": "summary.rust-codeql.fancy-regex-regex-builder.new",
+            "target": {
+              "path": "src/api.rs",
+              "symbol": "fancy_regex.RegexBuilder.new",
+              "has_receiver": false,
+              "parameter_count": 1
+            },
+            "completeness": "complete",
+            "locations": [],
+            "transfers": [],
+            "effects": []
+          }
+        ]
+      }
+    }
+  ]
+}

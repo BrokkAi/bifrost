@@ -6,6 +6,7 @@
 //! `ImportAnalysisProvider` impl -- stays in `brokk-bifrost-analysis`.
 
 use crate::scala::graph_support::ScalaSource;
+use crate::scala::syntax::node_text as scala_node_text;
 use brokk_bifrost_core::analyzer::model::{
     ImportInfo, ScalaExportInfo, ScalaExportSelector, StructuredImportPath, StructuredImportScope,
 };
@@ -43,12 +44,26 @@ pub fn scala_enclosing_template_owner_fq_names(
     file: &ProjectFile,
     byte: usize,
 ) -> Vec<String> {
+    scala_enclosing_template_owner_units(
+        index.class_range_index(file).enclosing_unit(byte).cloned(),
+        |owner| scala.structural_parent_of(owner),
+    )
+    .into_iter()
+    .map(|owner| owner.fq_name())
+    .collect()
+}
+
+/// Walk a Scala structural-parent chain and retain its class-like owners in
+/// innermost-first order.
+pub fn scala_enclosing_template_owner_units(
+    mut current: Option<CodeUnit>,
+    mut structural_parent: impl FnMut(&CodeUnit) -> Option<CodeUnit>,
+) -> Vec<CodeUnit> {
     let mut owners = Vec::new();
-    let mut current = index.class_range_index(file).enclosing_unit(byte).cloned();
     while let Some(owner) = current {
-        current = scala.structural_parent_of(&owner);
+        current = structural_parent(&owner);
         if owner.is_class() {
-            owners.push(owner.fq_name());
+            owners.push(owner);
         }
     }
     owners
@@ -353,19 +368,8 @@ fn scala_import_selector_info<'tree>(
 }
 
 pub fn scala_lexical_scope_path(node: Node<'_>) -> Vec<StructuredImportScope> {
-    let mut scopes = Vec::new();
-    let mut current = node.parent();
-    while let Some(parent) = current {
-        if is_scala_lexical_scope(parent.kind()) {
-            scopes.push(StructuredImportScope {
-                start_byte: parent.start_byte(),
-                end_byte: parent.end_byte(),
-            });
-        }
-        current = parent.parent();
-    }
-    scopes.reverse();
-    scopes
+    scala_lexical_scope_path_checked(node, |_| true)
+        .expect("unrestricted Scala lexical-scope traversal cannot stop")
 }
 
 pub fn scala_lexical_scope_path_checked(
@@ -425,10 +429,6 @@ fn render_scala_import(path: &[String], wildcard: bool, alias: Option<&str>) -> 
     rendered
 }
 
-fn scala_node_text<'a>(node: Node<'_>, source: &'a str) -> &'a str {
-    &source[node.byte_range()]
-}
-
 pub fn is_scala_importable_top_level(unit: &CodeUnit) -> bool {
     // "Top level" is a statement about segment count, not about the rendered
     // spelling: a Scala backtick-quoted name may itself contain a `.`
@@ -448,6 +448,7 @@ pub fn is_scala_importable_direct_member(unit: &CodeUnit) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use brokk_bifrost_test_macros::hardwon;
     use tree_sitter::Parser;
 
     fn parsed_export(source: &str) -> ScalaExportInfo {
@@ -468,6 +469,7 @@ mod tests {
     }
 
     #[test]
+    #[hardwon("#933: Scala inverse usage missed callables imported through export chains")]
     fn scala_export_parser_preserves_selector_semantics() {
         let export = parsed_export(
             "object Facade { export Core.{dropped as _, original as renamed, kept, *} }",
@@ -494,6 +496,7 @@ mod tests {
     }
 
     #[test]
+    #[hardwon("#933: Scala inverse usage missed callables imported through export chains")]
     fn scala_export_parser_distinguishes_given_from_ordinary_wildcard() {
         let given = parsed_export("object Facade { export Core.given }");
         assert_eq!(given.selectors, [ScalaExportSelector::GivenWildcard]);

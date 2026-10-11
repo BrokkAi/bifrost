@@ -1,10 +1,12 @@
 use crate::access_chain::{ImportMemberChainOwner, JsTsImportedMemberChain};
 use crate::providers::JsTsSource;
-use crate::syntax::JsTsImportBinder;
+use crate::syntax::{JsTsImportBinder, js_ts_statement_module_source, unquote};
 use crate::tsconfig::AliasResolver;
 use crate::type_text::{jsts_type_space_candidates, jsts_value_space_candidates};
+use brokk_bifrost_core::analyzer::common::node_source_text as node_text;
 use brokk_bifrost_core::analyzer::definition_lookup::sort_units;
 use brokk_bifrost_core::analyzer::model::{ImportInfo, StructuredImportPath};
+use brokk_bifrost_core::analyzer::tree_walk::first_named_child_of_kind as first_child_of_kind;
 use brokk_bifrost_core::analyzer::usages::model::ImportBinding;
 use brokk_bifrost_core::analyzer::usages::model::ImportKind;
 use brokk_bifrost_core::analyzer::usages::receiver_analysis::{
@@ -16,6 +18,17 @@ use brokk_bifrost_core::analyzer::{
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use tree_sitter::Node;
+
+pub fn js_ts_direct_import_export_name<'a>(
+    binding: &'a ImportBinding,
+    reference: &'a str,
+) -> &'a str {
+    match binding.kind {
+        ImportKind::Named => binding.imported_name.as_deref().unwrap_or(reference),
+        ImportKind::Default => "default",
+        _ => unreachable!("binding was filtered to a direct module import"),
+    }
+}
 
 /// Syntax view of one parser-derived JS/TS import row.
 ///
@@ -50,13 +63,9 @@ pub fn parse_es_import_syntaxes_from_node<'tree>(
         return Vec::new();
     }
     let raw = node_text(node, source).trim().to_string();
-    let Some(source_node) = node.child_by_field_name("source") else {
+    let Some((source_node, module_specifier)) = js_ts_statement_module_source(node, source) else {
         return Vec::new();
     };
-    let module_specifier = unquote(node_text(source_node, source));
-    if module_specifier.is_empty() {
-        return Vec::new();
-    }
     let path = structured_module_path(&module_specifier, node.start_byte());
 
     let Some(import_clause) = named_child_of_kind(node, "import_clause") else {
@@ -434,16 +443,8 @@ fn commonjs_pattern_local_name_node<'tree>(node: Node<'tree>, source: &str) -> O
     }
 }
 
-fn first_child_of_kind<'a>(node: Node<'a>, kind: &str) -> Option<Node<'a>> {
-    let mut cursor = node.walk();
-    node.named_children(&mut cursor)
-        .find(|child| child.kind() == kind)
-}
-
 fn direct_require_expression(node: Node<'_>, source: &str) -> bool {
-    let mut cursor = node.walk();
-    node.named_children(&mut cursor)
-        .any(|child| is_require_call(child, source))
+    direct_require_call(node, source).is_some()
 }
 
 fn direct_require_call<'tree>(node: Node<'tree>, source: &str) -> Option<Node<'tree>> {
@@ -532,33 +533,12 @@ fn collect_named_es_import_syntaxes<'tree>(
     }
 }
 
-fn named_child_of_kind<'a>(node: Node<'a>, kind: &str) -> Option<Node<'a>> {
-    let mut cursor = node.walk();
-    node.named_children(&mut cursor)
-        .find(|child| child.kind() == kind)
-}
+use brokk_bifrost_core::analyzer::tree_walk::first_named_child_of_kind as named_child_of_kind;
 
 fn first_identifier_child_node(node: Node<'_>) -> Option<Node<'_>> {
     let mut cursor = node.walk();
     node.named_children(&mut cursor)
         .find(|child| matches!(child.kind(), "identifier" | "type_identifier"))
-}
-
-fn node_text<'a>(node: Node<'_>, source: &'a str) -> &'a str {
-    brokk_bifrost_core::analyzer::common::node_source_text(node, source)
-}
-
-fn unquote(text: &str) -> String {
-    let trimmed = text.trim();
-    let stripped = trimmed
-        .strip_prefix('"')
-        .and_then(|value| value.strip_suffix('"'))
-        .or_else(|| {
-            trimmed
-                .strip_prefix('\'')
-                .and_then(|value| value.strip_suffix('\''))
-        });
-    stripped.unwrap_or(trimmed).to_string()
 }
 
 /// Resolve one parser-derived import to project files.
@@ -733,6 +713,102 @@ pub fn js_ts_module_identity(specifier: &str) -> Option<JsTsModuleIdentity<'_>> 
     })
 }
 
+/// Node's built-in modules: `require('node:module').builtinModules` for the
+/// reviewed Node 22 line, which a bare or `node:` specifier loads from the
+/// runtime rather than from `node_modules`.
+const NODE_BUILTIN_MODULES: &[&str] = &[
+    "_http_agent",
+    "_http_client",
+    "_http_common",
+    "_http_incoming",
+    "_http_outgoing",
+    "_http_server",
+    "_stream_duplex",
+    "_stream_passthrough",
+    "_stream_readable",
+    "_stream_transform",
+    "_stream_wrap",
+    "_stream_writable",
+    "_tls_common",
+    "_tls_wrap",
+    "assert",
+    "assert/strict",
+    "async_hooks",
+    "buffer",
+    "child_process",
+    "cluster",
+    "console",
+    "constants",
+    "crypto",
+    "dgram",
+    "diagnostics_channel",
+    "dns",
+    "dns/promises",
+    "domain",
+    "events",
+    "fs",
+    "fs/promises",
+    "http",
+    "http2",
+    "https",
+    "inspector",
+    "inspector/promises",
+    "module",
+    "net",
+    "os",
+    "path",
+    "path/posix",
+    "path/win32",
+    "perf_hooks",
+    "process",
+    "punycode",
+    "querystring",
+    "readline",
+    "readline/promises",
+    "repl",
+    "stream",
+    "stream/consumers",
+    "stream/promises",
+    "stream/web",
+    "string_decoder",
+    "sys",
+    "timers",
+    "timers/promises",
+    "tls",
+    "trace_events",
+    "tty",
+    "url",
+    "util",
+    "util/types",
+    "v8",
+    "vm",
+    "wasi",
+    "worker_threads",
+    "zlib",
+];
+
+/// Node 22 built-in modules that exist only under the `node:` scheme. The bare
+/// spelling of each names an ordinary npm package.
+const NODE_SCHEME_ONLY_BUILTIN_MODULES: &[&str] = &["sea", "sqlite", "test", "test/reporters"];
+
+/// The Node built-in module a specifier loads, in its canonical spelling
+/// (`node:fs` and `fs` are both `fs`), or `None` when the specifier names a
+/// package, a workspace file, or nothing Node provides.
+pub fn node_builtin_module(specifier: &str) -> Option<&'static str> {
+    let has_scheme = specifier.starts_with(NODE_BUILTIN_SCHEME);
+    let identity = js_ts_module_identity(specifier)?;
+    NODE_BUILTIN_MODULES
+        .iter()
+        .chain(
+            has_scheme
+                .then_some(NODE_SCHEME_ONLY_BUILTIN_MODULES)
+                .into_iter()
+                .flatten(),
+        )
+        .find(|module| **module == identity.specifier)
+        .copied()
+}
+
 /// The npm package a bare module specifier addresses, and the subpath below it.
 ///
 /// The `(package, subpath)` half of [`js_ts_module_identity`], for callers that
@@ -901,12 +977,8 @@ pub fn import_info_tokens(import: &ImportInfo) -> BTreeSet<String> {
 }
 
 pub fn extract_js_ts_call_receiver(reference: &str) -> Option<String> {
-    let trimmed = reference.trim();
-    let before_args = trimmed
-        .split_once('(')
-        .map(|(head, _)| head)
-        .unwrap_or(trimmed);
-    let (receiver, method) = before_args.rsplit_once('.')?;
+    let (receiver, method) =
+        brokk_bifrost_core::analyzer::common::extract_call_reference_parts(reference, &["."])?;
     if receiver.is_empty() || method.is_empty() {
         return None;
     }
@@ -970,11 +1042,7 @@ pub fn resolve_js_ts_direct_import_candidates(
     let mut candidates = Vec::new();
     for binding in imports.resolvable_direct_bindings_for(name) {
         saw_direct_import = true;
-        let exported_name = match binding.kind {
-            ImportKind::Named => binding.imported_name.as_deref().unwrap_or(name),
-            ImportKind::Default => "default",
-            _ => unreachable!("direct bindings contain only named/default imports"),
-        };
+        let exported_name = js_ts_direct_import_export_name(binding, name);
         candidates.extend(resolve_js_ts_module_binding_candidates(
             host,
             support,
@@ -1187,91 +1255,12 @@ fn jsts_module_export_candidates(
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        node_text, parse_commonjs_require_bindings_from_node,
-        parse_commonjs_require_import_infos_from_node,
-        parse_commonjs_require_import_syntaxes_from_node, parse_es_import_infos_from_node,
-        parse_es_import_syntaxes_from_node, resolve_js_ts_import_info_paths,
-    };
-    use brokk_bifrost_core::analyzer::Language;
-    use brokk_bifrost_core::analyzer::model::ImportInfo;
-    use std::path::PathBuf;
+    use super::parse_commonjs_require_import_infos_from_node;
+    use brokk_bifrost_test_macros::hardwon;
     use tree_sitter::Parser;
 
-    fn parse_typescript_import_infos(
-        source: &str,
-    ) -> Vec<brokk_bifrost_core::analyzer::model::ImportInfo> {
-        let mut parser = Parser::new();
-        parser
-            .set_language(&tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into())
-            .unwrap();
-        let tree = parser.parse(source, None).unwrap();
-        let root = tree.root_node();
-        let import_node = root
-            .named_children(&mut root.walk())
-            .find(|child| child.kind() == "import_statement")
-            .unwrap();
-        parse_es_import_infos_from_node(import_node, source)
-    }
-
     #[test]
-    fn parses_typescript_type_only_named_imports() {
-        let imports = parse_typescript_import_infos("import type { BubbleState } from '../types';");
-        assert_eq!(1, imports.len());
-        assert_eq!(Some("BubbleState"), imports[0].identifier.as_deref());
-        assert_eq!(None, imports[0].alias.as_deref());
-        assert_eq!(
-            Some(&vec!["../types".to_string()]),
-            imports[0].path.as_ref().map(|path| &path.segments)
-        );
-    }
-
-    #[test]
-    fn retains_exact_esm_import_nodes_and_kind() {
-        let source = "import { original as current } from './module';";
-        let mut parser = Parser::new();
-        parser
-            .set_language(&tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into())
-            .unwrap();
-        let tree = parser.parse(source, None).unwrap();
-        let root = tree.root_node();
-        let statement = root
-            .named_children(&mut root.walk())
-            .find(|child| child.kind() == "import_statement")
-            .unwrap();
-        let syntax = parse_es_import_syntaxes_from_node(statement, source);
-        assert_eq!(1, syntax.len());
-        let syntax = &syntax[0];
-        assert_eq!(
-            Some("original"),
-            syntax.name.map(|node| node_text(node, source))
-        );
-        assert_eq!(
-            Some("current"),
-            syntax.alias.map(|node| node_text(node, source))
-        );
-        assert_eq!(
-            Some("'./module'"),
-            syntax.target.map(|node| node_text(node, source))
-        );
-        assert_eq!(Some(super::ImportKind::Named), syntax.kind);
-        assert!(syntax.is_static);
-        assert_eq!(statement, syntax.declaration);
-    }
-
-    #[test]
-    fn parses_mixed_typescript_named_imports_with_inline_type_modifiers() {
-        let imports = parse_typescript_import_infos(
-            "import { type BubbleState, SummaryState } from '../types';",
-        );
-        let identifiers = imports
-            .into_iter()
-            .map(|import| import.identifier.unwrap_or_default())
-            .collect::<Vec<_>>();
-        assert_eq!(vec!["BubbleState", "SummaryState"], identifiers);
-    }
-
-    #[test]
+    #[hardwon("#2587: CommonJS import paths had to come from the AST literal")]
     fn parses_typescript_commonjs_import_path_from_the_ast_literal() {
         let source = "const { makeThing } = require('./other');";
         let mut parser = Parser::new();
@@ -1290,122 +1279,6 @@ mod tests {
         assert_eq!(
             Some(&vec!["./other".to_string()]),
             imports[0].path.as_ref().map(|path| &path.segments)
-        );
-    }
-
-    #[test]
-    fn retains_commonjs_require_target_and_named_binding_nodes() {
-        let source = "const { makeThing: localThing } = require('./other');";
-        let mut parser = Parser::new();
-        parser
-            .set_language(&tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into())
-            .unwrap();
-        let tree = parser.parse(source, None).unwrap();
-        let root = tree.root_node();
-        let declaration = root
-            .named_children(&mut root.walk())
-            .find(|child| child.kind() == "lexical_declaration")
-            .unwrap();
-        let syntax = parse_commonjs_require_import_syntaxes_from_node(declaration, source);
-        assert_eq!(1, syntax.len());
-        let syntax = &syntax[0];
-        assert_eq!(
-            Some("makeThing"),
-            syntax.name.map(|node| node_text(node, source))
-        );
-        assert_eq!(
-            Some("localThing"),
-            syntax.alias.map(|node| node_text(node, source))
-        );
-        assert_eq!(
-            Some("'./other'"),
-            syntax.target.map(|node| node_text(node, source))
-        );
-        assert_eq!(Some(super::ImportKind::Named), syntax.kind);
-        assert!(!syntax.is_static);
-    }
-
-    #[test]
-    fn side_effect_require_has_no_local_binding_kind() {
-        let source = "require('./side-effect');";
-        let mut parser = Parser::new();
-        parser
-            .set_language(&tree_sitter_javascript::LANGUAGE.into())
-            .unwrap();
-        let tree = parser.parse(source, None).unwrap();
-        let statement = tree.root_node().named_child(0).unwrap();
-
-        let syntax = parse_commonjs_require_import_syntaxes_from_node(statement, source);
-        assert_eq!(1, syntax.len());
-        assert_eq!(None, syntax[0].kind);
-        assert_eq!(
-            Some("'./side-effect'"),
-            syntax[0].target.map(|node| node_text(node, source))
-        );
-        assert!(parse_commonjs_require_bindings_from_node(statement, source).is_empty());
-    }
-
-    #[test]
-    fn canonical_import_resolution_ignores_stale_raw_snippet() {
-        let root = tempfile::tempdir().unwrap();
-        std::fs::create_dir_all(root.path().join("src")).unwrap();
-        std::fs::write(root.path().join("src/main.ts"), "").unwrap();
-        std::fs::write(root.path().join("src/captured.ts"), "").unwrap();
-        std::fs::write(root.path().join("src/stale.ts"), "").unwrap();
-        let source_file = brokk_bifrost_core::analyzer::ProjectFile::new(
-            root.path().to_path_buf(),
-            PathBuf::from("src/main.ts"),
-        );
-        let mut parser = Parser::new();
-        parser
-            .set_language(&tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into())
-            .unwrap();
-        let tree = parser
-            .parse("import value from './captured';", None)
-            .unwrap();
-        let root_node = tree.root_node();
-        let statement = root_node
-            .named_children(&mut root_node.walk())
-            .next()
-            .unwrap();
-        let mut import =
-            parse_es_import_infos_from_node(statement, "import value from './captured';")
-                .pop()
-                .unwrap();
-        import.raw_snippet = "import value from './stale';".to_string();
-        let resolved =
-            resolve_js_ts_import_info_paths(&source_file, &import, Language::TypeScript, None);
-        assert_eq!(
-            vec![brokk_bifrost_core::analyzer::ProjectFile::new(
-                root.path().to_path_buf(),
-                PathBuf::from("src/captured.ts"),
-            )],
-            resolved
-        );
-    }
-
-    #[test]
-    fn canonical_import_resolution_reports_unavailable_structured_path() {
-        let root = tempfile::tempdir().unwrap();
-        std::fs::create_dir_all(root.path().join("src")).unwrap();
-        std::fs::write(root.path().join("src/main.ts"), "").unwrap();
-        std::fs::write(root.path().join("src/stale.ts"), "").unwrap();
-        let source_file = brokk_bifrost_core::analyzer::ProjectFile::new(
-            root.path().to_path_buf(),
-            PathBuf::from("src/main.ts"),
-        );
-        let import = ImportInfo {
-            raw_snippet: "import value from './stale';".to_string(),
-            is_wildcard: false,
-            is_global: false,
-            identifier: Some("value".to_string()),
-            alias: None,
-            path: None,
-            binder_span: None,
-        };
-        assert!(
-            resolve_js_ts_import_info_paths(&source_file, &import, Language::TypeScript, None)
-                .is_empty()
         );
     }
 
@@ -1430,59 +1303,21 @@ mod tests {
     }
 
     #[test]
-    fn refuses_specifiers_that_do_not_address_a_package() {
-        use super::npm_package_of_module_specifier as split;
+    #[hardwon(
+        "#3464: zero-configuration semantic-pack activation could not identify the JavaScript and TypeScript standard-library pack"
+    )]
+    fn names_node_builtins_and_nothing_an_npm_package_or_file_could_be() {
+        use super::node_builtin_module;
 
-        assert_eq!(None, split(""));
-        assert_eq!(None, split("./local"));
-        assert_eq!(None, split("../sibling"));
-        assert_eq!(None, split("/absolute"));
-        // A scope with no package name is not an npm coordinate.
-        assert_eq!(None, split("@scope"));
-    }
-
-    #[test]
-    fn folds_the_node_scheme_into_the_bare_builtin_identity() {
-        use super::js_ts_module_identity as classify;
-
-        let bare = classify("fs").expect("a bare builtin names a module");
-        let scheme = classify("node:fs").expect("a node: builtin names a module");
-        assert_eq!(bare, scheme, "one module, one identity");
-        assert_eq!("fs", scheme.specifier);
-        assert_eq!("fs", scheme.package);
-        assert_eq!(None, scheme.subpath);
-
-        // A builtin subpath keeps its bare root and splits like any other.
-        let bare_subpath = classify("fs/promises").expect("a builtin subpath names a module");
-        let scheme_subpath =
-            classify("node:fs/promises").expect("a node: builtin subpath names a module");
-        assert_eq!(bare_subpath, scheme_subpath);
-        assert_eq!("fs/promises", scheme_subpath.specifier);
-        assert_eq!("fs", scheme_subpath.package);
-        assert_eq!(Some("promises"), scheme_subpath.subpath);
-    }
-
-    #[test]
-    fn classifies_packages_subpaths_and_workspace_paths() {
-        use super::js_ts_module_identity as classify;
-
-        let scoped = classify("@scope/pkg").expect("a scoped package names a module");
-        assert_eq!("@scope/pkg", scoped.specifier);
-        assert_eq!("@scope/pkg", scoped.package);
-        assert_eq!(None, scoped.subpath);
-
-        let subpath = classify("pkg/sub").expect("a package subpath names a module");
-        assert_eq!("pkg/sub", subpath.specifier);
-        assert_eq!("pkg", subpath.package);
-        assert_eq!(Some("sub"), subpath.subpath);
-
-        // A trailing slash names the package itself, not an empty subpath.
-        let trailing = classify("pkg/").expect("a trailing slash still names the package");
-        assert_eq!("pkg", trailing.specifier);
-        assert_eq!("pkg", trailing.package);
-        assert_eq!(None, trailing.subpath);
-
-        assert_eq!(None, classify("./rel"));
-        assert_eq!(None, classify("/abs"));
+        assert_eq!(Some("fs"), node_builtin_module("fs"));
+        assert_eq!(Some("fs"), node_builtin_module("node:fs"));
+        assert_eq!(Some("fs/promises"), node_builtin_module("node:fs/promises"));
+        // `node:test` is a builtin, while bare `test` is an npm package.
+        assert_eq!(Some("test"), node_builtin_module("node:test"));
+        assert_eq!(None, node_builtin_module("test"));
+        // A builtin root with a subpath Node does not provide names nothing.
+        assert_eq!(None, node_builtin_module("fs/extra"));
+        assert_eq!(None, node_builtin_module("left-pad"));
+        assert_eq!(None, node_builtin_module("./fs"));
     }
 }

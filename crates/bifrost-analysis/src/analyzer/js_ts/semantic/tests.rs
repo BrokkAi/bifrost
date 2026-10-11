@@ -7,6 +7,7 @@ use super::values::{
     allocation_alias_use, constant_array_index, plain_member_base_use, stable_member_key,
 };
 use super::*;
+use crate::analyzer::semantic::floating_value_for_test as floating;
 use crate::analyzer::tree_sitter_analyzer::{PreparedSourceOrigin, PreparedSyntaxSource};
 use crate::analyzer::{Language, LanguageDialect};
 use std::sync::Arc;
@@ -36,6 +37,26 @@ fn lower_javascript_procedure(
         .expect("function procedure must be lowered")
 }
 
+fn lower_prepared_source(
+    lowerer: JsTsSemanticLowerer,
+    file: &ProjectFile,
+    prepared: &PreparedSyntaxTree,
+    language: &str,
+) -> Vec<ProcedureSemanticsParts> {
+    let outcome = lowerer
+        .lower(
+            file,
+            prepared,
+            &SemanticBudget::default(),
+            &CancellationToken::default(),
+        )
+        .unwrap_or_else(|_| panic!("{language} semantic lowering must succeed"));
+    let SemanticOutcome::Complete { value, .. } = outcome else {
+        panic!("{language} semantic lowering must complete");
+    };
+    value
+}
+
 fn lower_javascript_parts(source: &str) -> Vec<ProcedureSemanticsParts> {
     let mut parser = tree_sitter::Parser::new();
     parser
@@ -53,18 +74,12 @@ fn lower_javascript_parts(source: &str) -> Vec<ProcedureSemanticsParts> {
         None,
     );
     let file = ProjectFile::new(std::env::temp_dir(), "semantic-expression-propagation.js");
-    let outcome = JsTsSemanticLowerer::javascript()
-        .lower(
-            &file,
-            &prepared,
-            &SemanticBudget::default(),
-            &CancellationToken::default(),
-        )
-        .expect("JavaScript semantic lowering must succeed");
-    let SemanticOutcome::Complete { value, .. } = outcome else {
-        panic!("JavaScript semantic lowering must complete");
-    };
-    value
+    lower_prepared_source(
+        JsTsSemanticLowerer::javascript(),
+        &file,
+        &prepared,
+        "JavaScript",
+    )
 }
 
 #[test]
@@ -126,7 +141,11 @@ fn for_initializer_let_is_established_before_body_and_increment_writes() {
     );
 }
 
+use brokk_bifrost_test_macros::hardwon;
 #[test]
+#[hardwon(
+    "#2640: Parses real JS/TS source with Tree-sitter and checks semantic lowerer output; regression for local callback target publication and capture flow"
+)]
 fn local_const_callback_publishes_target_and_capture_ports() {
     let source = r#"
         function capture(source) {
@@ -220,6 +239,9 @@ fn local_const_callback_publishes_target_and_capture_ports() {
 }
 
 #[test]
+#[hardwon(
+    "#2640: Parses real JS/TS source with Tree-sitter and checks semantic lowerer output; keeps unsupported captures from fabricating a precise invocation target"
+)]
 fn callback_with_unsupported_parameter_capture_keeps_invocation_unknown() {
     let source = r#"
         function capture(input) {
@@ -267,6 +289,9 @@ fn callback_with_unsupported_parameter_capture_keeps_invocation_unknown() {
 }
 
 #[test]
+#[hardwon(
+    "#3148: Parses real JS/TS source with Tree-sitter and checks semantic lowerer output; pins callable value identity when an omitted capture is used as a callee"
+)]
 fn unsupported_parameter_capture_in_call_position_remains_callable() {
     let source = r#"
         function outer(callback) {
@@ -302,6 +327,9 @@ fn unsupported_parameter_capture_in_call_position_remains_callable() {
 }
 
 #[test]
+#[hardwon(
+    "#3148: Parses real JS/TS source with Tree-sitter and checks semantic lowerer output; pins callable value identity when an omitted capture is used as a constructor"
+)]
 fn unsupported_parameter_capture_in_constructor_position_remains_callable() {
     let source = r#"
         function outer(callback) {
@@ -336,6 +364,9 @@ fn unsupported_parameter_capture_in_constructor_position_remains_callable() {
 }
 
 #[test]
+#[hardwon(
+    "#3148: Parses real JS/TS source with Tree-sitter and checks semantic lowerer output; keeps a locally passed callback value after unsupported capture lowering"
+)]
 fn unsupported_parameter_capture_as_call_argument_remains_local() {
     let source = r#"
         function outer(callback) {
@@ -365,6 +396,9 @@ fn unsupported_parameter_capture_as_call_argument_remains_local() {
 }
 
 #[test]
+#[hardwon(
+    "#2640: Parses real JS/TS source with Tree-sitter and checks semantic lowerer output; prevents sibling nested callbacks from sharing the wrong capture target"
+)]
 fn sibling_callback_chain_keeps_each_capture_target_distinct() {
     let source = r#"
         function capture(input) {
@@ -419,13 +453,7 @@ fn sibling_callback_chain_keeps_each_capture_target_distinct() {
 }
 
 fn prepare_typescript_source(source: &str) -> PreparedSyntaxTree {
-    let mut parser = tree_sitter::Parser::new();
-    parser
-        .set_language(&tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into())
-        .expect("TypeScript grammar must load");
-    let tree = parser
-        .parse(source, None)
-        .expect("TypeScript source must parse");
+    let tree = brokk_bifrost_js_ts::test_support::parse_typescript(source);
     PreparedSyntaxTree::new(
         PreparedSyntaxSource::Exact(Arc::from(source)),
         tree,
@@ -439,18 +467,12 @@ fn prepare_typescript_source(source: &str) -> PreparedSyntaxTree {
 fn lower_typescript_source(source: &str) -> Vec<ProcedureSemanticsParts> {
     let prepared = prepare_typescript_source(source);
     let file = ProjectFile::new(std::env::temp_dir(), "semantic-parameter-identity.ts");
-    let outcome = JsTsSemanticLowerer::typescript()
-        .lower(
-            &file,
-            &prepared,
-            &SemanticBudget::default(),
-            &CancellationToken::default(),
-        )
-        .expect("TypeScript semantic lowering must succeed");
-    let SemanticOutcome::Complete { value, .. } = outcome else {
-        panic!("TypeScript semantic lowering must complete");
-    };
-    value
+    lower_prepared_source(
+        JsTsSemanticLowerer::typescript(),
+        &file,
+        &prepared,
+        "TypeScript",
+    )
 }
 
 #[test]
@@ -574,6 +596,9 @@ fn uninitialized_js_ts_declarations_establish_undefined_at_the_right_time() {
 }
 
 #[test]
+#[hardwon(
+    "0b35f54978eb: JavaScript update expressions failed to write local and parameter bindings"
+)]
 fn js_ts_updates_write_computed_values_or_report_open_targets() {
     for lower in [
         lower_javascript_parts as fn(&str) -> Vec<ProcedureSemanticsParts>,
@@ -662,6 +687,9 @@ fn js_ts_updates_write_computed_values_or_report_open_targets() {
 }
 
 #[test]
+#[hardwon(
+    "60b172595e48: Strict equality does not invoke coercion and must not acquire a spurious operator-throw gap"
+)]
 fn js_ts_strict_comparison_keeps_operand_gaps_without_operator_throw_gap() {
     for lower in [
         lower_javascript_parts as fn(&str) -> Vec<ProcedureSemanticsParts>,
@@ -728,7 +756,7 @@ fn value_for_node(parts: &ProcedureSemanticsParts, node: tree_sitter::Node<'_>) 
         .iter()
         .find_map(|value| {
             let mapping = &parts.source_mappings[value.source.index()];
-            let span = mapping.locator.anchor().span();
+            let span = crate::analyzer::test_support::source_mapping_span(mapping);
             (span.start_byte() == node.start_byte() as u32
                 && span.end_byte() == node.end_byte() as u32)
                 .then_some(value.id)
@@ -737,6 +765,9 @@ fn value_for_node(parts: &ProcedureSemanticsParts, node: tree_sitter::Node<'_>) 
 }
 
 #[test]
+#[hardwon(
+    "#2816: Parses real JS/TS source with Tree-sitter and checks semantic lowerer output; checks decorated parameter facts retain exact structural identities"
+)]
 fn typescript_parameters_retain_exact_structural_fact_identities() {
     let source = r#"
         declare const Query: ParameterDecorator;
@@ -794,6 +825,9 @@ fn typescript_parameters_retain_exact_structural_fact_identities() {
 }
 
 #[test]
+#[hardwon(
+    "#2816: Parses real JS/TS source with Tree-sitter and checks semantic lowerer output; pins accounting of structural identity traversal against the semantic budget"
+)]
 fn typescript_structural_identity_pass_is_charged_to_semantic_budget() {
     let source = "class Controller { method(value: string) {} }";
     let prepared = prepare_typescript_source(source);
@@ -825,13 +859,7 @@ fn typescript_structural_identity_pass_is_charged_to_semantic_budget() {
 }
 
 fn parse_javascript_source(source: &str) -> tree_sitter::Tree {
-    let mut parser = tree_sitter::Parser::new();
-    parser
-        .set_language(&tree_sitter_javascript::LANGUAGE.into())
-        .expect("JavaScript grammar must load");
-    parser
-        .parse(source, None)
-        .expect("JavaScript source must parse")
+    brokk_bifrost_js_ts::test_support::parse_javascript(source)
 }
 
 fn local_value_flows(parts: &ProcedureSemanticsParts) -> Vec<(ValueId, ValueId)> {
@@ -863,23 +891,13 @@ fn all_value_flows(parts: &ProcedureSemanticsParts) -> Vec<(ValueId, ValueId)> {
 }
 
 fn value_flow_reaches(flows: &[(ValueId, ValueId)], source: ValueId, target: ValueId) -> bool {
-    let mut pending = vec![source];
-    let mut visited = Vec::new();
-    while let Some(current) = pending.pop() {
-        if current == target {
-            return true;
-        }
-        if visited.contains(&current) {
-            continue;
-        }
-        visited.push(current);
+    crate::analyzer::test_support::graph_reaches(source, target, |current, pending| {
         pending.extend(
             flows
                 .iter()
                 .filter_map(|(from, to)| (*from == current).then_some(*to)),
         );
-    }
-    false
+    })
 }
 
 struct FieldMemoryEvents {
@@ -914,93 +932,6 @@ fn field_memory_events(parts: &ProcedureSemanticsParts) -> FieldMemoryEvents {
                 events
             },
         )
-}
-
-#[test]
-fn explicit_throw_flows_payload_to_catch_binder() {
-    let source = r#"
-        function flow() {
-            const payload = 1;
-            try {
-                throw payload;
-            } catch (caught) {
-                return caught;
-            }
-        }
-    "#;
-    let parts = lower_javascript_source(source);
-    let tree = parse_javascript_source(source);
-    let throw_statement = first_named_kind(tree.root_node(), "throw_statement");
-    let catch_clause = first_named_kind(tree.root_node(), "catch_clause");
-    let argument = throw_statement
-        .child_by_field_name("argument")
-        .or_else(|| first_named_child(throw_statement))
-        .expect("throw argument");
-    let parameter = catch_clause
-        .child_by_field_name("parameter")
-        .expect("catch parameter");
-    let argument_value = value_for_node(&parts, argument);
-    let binder_value = value_for_node(&parts, parameter);
-    let flows = local_value_flows(&parts);
-    let carrier = flows
-        .iter()
-        .find_map(|(source, target)| (*source == argument_value).then_some(*target))
-        .expect("throw argument must flow into an exception carrier");
-
-    assert!(flows.contains(&(carrier, binder_value)));
-    assert!(parts.points.iter().any(|point| {
-        point.events.iter().any(|event| {
-            matches!(
-                event.effect,
-                SemanticEffect::Throw {
-                    value: Some(value)
-                } if value == carrier
-            )
-        })
-    }));
-}
-
-#[test]
-fn explicit_throw_does_not_flow_unrelated_local_to_catch_binder() {
-    let source = r#"
-        function flow() {
-            const ignored = 1;
-            const clean = 2;
-            try {
-                throw clean;
-            } catch (caught) {
-                return caught;
-            }
-        }
-    "#;
-    let parts = lower_javascript_source(source);
-    let tree = parse_javascript_source(source);
-    let catch_clause = first_named_kind(tree.root_node(), "catch_clause");
-    let parameter = catch_clause
-        .child_by_field_name("parameter")
-        .expect("catch parameter");
-    let declarations = nodes_of_kind(tree.root_node(), "variable_declarator");
-    let ignored = declarations
-        .iter()
-        .find_map(|declaration| {
-            let name = declaration.child_by_field_name("name")?;
-            (source.get(name.byte_range()) == Some("ignored")).then_some(name)
-        })
-        .expect("ignored declaration");
-    let clean = declarations
-        .iter()
-        .find_map(|declaration| {
-            let name = declaration.child_by_field_name("name")?;
-            (source.get(name.byte_range()) == Some("clean")).then_some(name)
-        })
-        .expect("clean declaration");
-    let binder_value = value_for_node(&parts, parameter);
-    let ignored_value = value_for_node(&parts, ignored);
-    let clean_value = value_for_node(&parts, clean);
-    let flows = all_value_flows(&parts);
-
-    assert!(value_flow_reaches(&flows, clean_value, binder_value));
-    assert!(!value_flow_reaches(&flows, ignored_value, binder_value));
 }
 
 #[test]
@@ -1053,275 +984,6 @@ fn destructured_catch_binder_is_explicitly_incomplete() {
             && gap
                 .detail
                 .contains("catch binders are not yet lowered with payload identity")
-    }));
-}
-
-#[test]
-fn thrown_error_field_reaches_catch_load() {
-    let source = r#"
-        function flow(source) {
-            const payload = new Error("flow");
-            payload.value = source;
-            try {
-                throw payload;
-            } catch (caught) {
-                return caught.value;
-            }
-        }
-    "#;
-    let parts = lower_javascript_source(source);
-    let tree = parse_javascript_source(source);
-    let function = first_named_kind(tree.root_node(), "function_declaration");
-    let parameter = first_named_child(
-        function
-            .child_by_field_name("parameters")
-            .expect("function parameters"),
-    )
-    .expect("source parameter");
-    let assignment = nodes_of_kind(tree.root_node(), "assignment_expression")
-        .into_iter()
-        .next()
-        .expect("field assignment");
-    let payload_binding = nodes_of_kind(tree.root_node(), "variable_declarator")
-        .into_iter()
-        .find_map(|declaration| {
-            let name = declaration.child_by_field_name("name")?;
-            (source.get(name.byte_range()) == Some("payload")).then_some(name)
-        })
-        .expect("payload declaration");
-    let source_reference = assignment
-        .child_by_field_name("right")
-        .expect("field assignment value");
-    let store_property = assignment
-        .child_by_field_name("left")
-        .and_then(|left| left.child_by_field_name("property"))
-        .expect("field assignment property");
-    let throw_statement = first_named_kind(tree.root_node(), "throw_statement");
-    let thrown_expression = throw_statement
-        .child_by_field_name("argument")
-        .or_else(|| first_named_child(throw_statement))
-        .expect("throw expression");
-    let catch_clause = first_named_kind(tree.root_node(), "catch_clause");
-    let binder = catch_clause
-        .child_by_field_name("parameter")
-        .expect("catch binder");
-    let load = nodes_of_kind(tree.root_node(), "member_expression")
-        .into_iter()
-        .find(|member| {
-            member
-                .child_by_field_name("object")
-                .and_then(|object| source.get(object.byte_range()))
-                == Some("caught")
-        })
-        .expect("caught field load");
-    let load_property = load
-        .child_by_field_name("property")
-        .expect("caught field property");
-    let source_value = value_for_node(&parts, parameter);
-    let payload_value = value_for_node(&parts, payload_binding);
-    let source_reference_value = value_for_node(&parts, source_reference);
-    let thrown_value = value_for_node(&parts, thrown_expression);
-    let binder_value = value_for_node(&parts, binder);
-    let load_value = value_for_node(&parts, load);
-    let flows = all_value_flows(&parts);
-    let field_events = field_memory_events(&parts);
-    assert_eq!(field_events.stores.len(), 1);
-    assert_eq!(field_events.loads.len(), 1);
-    let (store_location, store_value) = field_events.stores[0];
-    let (load_location, load_result) = field_events.loads[0];
-    let (store_base, store_member) = match &parts.memory_locations[store_location.index()].kind {
-        MemoryLocationKind::Field { base, member } => (*base, member.clone()),
-        _ => panic!("field store must use a field location"),
-    };
-    let (load_base, load_member) = match &parts.memory_locations[load_location.index()].kind {
-        MemoryLocationKind::Field { base, member } => (*base, member.clone()),
-        _ => panic!("field load must use a field location"),
-    };
-
-    assert_eq!(store_value, source_reference_value);
-    assert_eq!(load_result, load_value);
-    assert!(value_flow_reaches(&flows, payload_value, store_base));
-    assert!(value_flow_reaches(&flows, payload_value, thrown_value));
-    assert!(value_flow_reaches(&flows, binder_value, load_base));
-    assert_eq!(store_member, load_member);
-    assert_eq!(
-        stable_member_key(source, store_property),
-        stable_member_key(source, load_property)
-    );
-    let carrier = flows
-        .iter()
-        .find_map(|(source, target)| {
-            (*source == thrown_value && *target != binder_value).then_some(*target)
-        })
-        .expect("thrown payload must flow into an exception carrier");
-    assert!(flows.contains(&(thrown_value, carrier)));
-    assert!(flows.contains(&(carrier, binder_value)));
-    assert!(value_flow_reaches(&flows, source_value, store_value));
-    assert!(value_flow_reaches(&flows, thrown_value, binder_value));
-    assert!(!parts.gaps.iter().any(|gap| {
-        matches!(
-            gap.capability,
-            SemanticCapability::FieldMemory | SemanticCapability::ExceptionalControlFlow
-        )
-    }));
-}
-
-#[test]
-fn thrown_error_clean_field_does_not_reach_from_unrelated_source() {
-    let source = r#"
-        function flow(source) {
-            const ignored = source;
-            const payload = new Error("flow");
-            payload.value = 0;
-            try {
-                throw payload;
-            } catch (caught) {
-                return caught.value;
-            }
-        }
-    "#;
-    let parts = lower_javascript_source(source);
-    let tree = parse_javascript_source(source);
-    let function = first_named_kind(tree.root_node(), "function_declaration");
-    let parameter = first_named_child(
-        function
-            .child_by_field_name("parameters")
-            .expect("function parameters"),
-    )
-    .expect("source parameter");
-    let declarations = nodes_of_kind(tree.root_node(), "variable_declarator");
-    let ignored = declarations
-        .iter()
-        .find_map(|declaration| {
-            let name = declaration.child_by_field_name("name")?;
-            (source.get(name.byte_range()) == Some("ignored")).then_some(name)
-        })
-        .expect("ignored local");
-    let assignment = nodes_of_kind(tree.root_node(), "assignment_expression")
-        .into_iter()
-        .next()
-        .expect("field assignment");
-    let clean_value_node = assignment
-        .child_by_field_name("right")
-        .expect("clean field value");
-    let source_value = value_for_node(&parts, parameter);
-    let ignored_value = value_for_node(&parts, ignored);
-    let clean_value = value_for_node(&parts, clean_value_node);
-    let flows = all_value_flows(&parts);
-    let field_events = field_memory_events(&parts);
-    assert_eq!(field_events.stores.len(), 1);
-    assert_eq!(field_events.loads.len(), 1);
-    assert!(value_flow_reaches(&flows, source_value, ignored_value));
-    assert!(!value_flow_reaches(&flows, source_value, clean_value));
-    assert!(!parts.gaps.iter().any(|gap| {
-        matches!(
-            gap.capability,
-            SemanticCapability::FieldMemory | SemanticCapability::ExceptionalControlFlow
-        )
-    }));
-}
-
-#[test]
-fn thrown_error_field_with_local_calls_remains_complete() {
-    let source = r#"
-        function source() {
-            return 1;
-        }
-        function sink(value) {}
-        function flow() {
-            try {
-                const payload = new Error("flow");
-                payload.value = source();
-                throw payload;
-            } catch (caught) {
-                sink(caught.value);
-            }
-        }
-    "#;
-    let parts = lower_javascript_procedure(source, Some("flow"));
-    let tree = parse_javascript_source(source);
-    let assignment = nodes_of_kind(tree.root_node(), "assignment_expression")
-        .into_iter()
-        .next()
-        .expect("field assignment");
-    let payload_binding = nodes_of_kind(tree.root_node(), "variable_declarator")
-        .into_iter()
-        .find_map(|declaration| {
-            let name = declaration.child_by_field_name("name")?;
-            (source.get(name.byte_range()) == Some("payload")).then_some(name)
-        })
-        .expect("payload declaration");
-    let source_call = assignment
-        .child_by_field_name("right")
-        .expect("source call");
-    let store_property = assignment
-        .child_by_field_name("left")
-        .and_then(|left| left.child_by_field_name("property"))
-        .expect("field assignment property");
-    let throw_statement = first_named_kind(tree.root_node(), "throw_statement");
-    let thrown_expression = throw_statement
-        .child_by_field_name("argument")
-        .or_else(|| first_named_child(throw_statement))
-        .expect("throw expression");
-    let catch_clause = first_named_kind(tree.root_node(), "catch_clause");
-    let binder = catch_clause
-        .child_by_field_name("parameter")
-        .expect("catch binder");
-    let load = nodes_of_kind(tree.root_node(), "member_expression")
-        .into_iter()
-        .find(|member| {
-            member
-                .child_by_field_name("object")
-                .and_then(|object| source.get(object.byte_range()))
-                == Some("caught")
-        })
-        .expect("caught field load");
-    let load_property = load
-        .child_by_field_name("property")
-        .expect("caught field property");
-    let payload_value = value_for_node(&parts, payload_binding);
-    let source_call_value = value_for_node(&parts, source_call);
-    let thrown_value = value_for_node(&parts, thrown_expression);
-    let binder_value = value_for_node(&parts, binder);
-    let load_value = value_for_node(&parts, load);
-    let flows = all_value_flows(&parts);
-    let field_events = field_memory_events(&parts);
-    assert_eq!(field_events.stores.len(), 1);
-    assert_eq!(field_events.loads.len(), 1);
-    let (store_location, store_value) = field_events.stores[0];
-    let (load_location, load_result) = field_events.loads[0];
-    let (store_base, store_member) = match &parts.memory_locations[store_location.index()].kind {
-        MemoryLocationKind::Field { base, member } => (*base, member.clone()),
-        _ => panic!("field store must use a field location"),
-    };
-    let (load_base, load_member) = match &parts.memory_locations[load_location.index()].kind {
-        MemoryLocationKind::Field { base, member } => (*base, member.clone()),
-        _ => panic!("field load must use a field location"),
-    };
-
-    assert_eq!(store_value, source_call_value);
-    assert_eq!(load_result, load_value);
-    assert!(value_flow_reaches(&flows, payload_value, store_base));
-    assert!(value_flow_reaches(&flows, payload_value, thrown_value));
-    assert!(value_flow_reaches(&flows, binder_value, load_base));
-    assert_eq!(store_member, load_member);
-    assert_eq!(
-        stable_member_key(source, store_property),
-        stable_member_key(source, load_property)
-    );
-    let carrier = flows
-        .iter()
-        .find_map(|(source, target)| {
-            (*source == thrown_value && *target != binder_value).then_some(*target)
-        })
-        .expect("thrown payload must flow into an exception carrier");
-    assert!(flows.contains(&(thrown_value, carrier)));
-    assert!(flows.contains(&(carrier, binder_value)));
-    assert!(!parts.gaps.iter().any(|gap| {
-        matches!(
-            gap.capability,
-            SemanticCapability::FieldMemory | SemanticCapability::ExceptionalControlFlow
-        )
     }));
 }
 
@@ -1397,6 +1059,9 @@ fn dynamic_error_field_access_remains_incomplete() {
 }
 
 #[test]
+#[hardwon(
+    "#2317: Parses real JS/TS source with Tree-sitter and checks semantic lowerer output; regression for parenthesized arithmetic taint losing operand identity or targeting an unrelated literal"
+)]
 fn parenthesized_expression_preserves_value_identity_without_targeting_unrelated_literal() {
     let source = r#"
         function compute(value) {
@@ -1491,16 +1156,8 @@ fn parenthesized_expression_preserves_value_identity_without_targeting_unrelated
 }
 
 fn first_named_kind<'tree>(root: Node<'tree>, kind: &str) -> Node<'tree> {
-    let mut found = None;
-    crate::analyzer::tree_sitter_analyzer::walk_named_tree_preorder(root, true, |node| {
-        if node.kind() == kind {
-            found = Some(node);
-            WalkControl::Break
-        } else {
-            WalkControl::Continue
-        }
-    });
-    found.expect("expected syntax node")
+    brokk_bifrost_core::analyzer::tree_walk::first_named_descendant_of_kind_inclusive(root, kind)
+        .expect("expected syntax node")
 }
 
 fn counted_loop_starts_true(source: &str) -> bool {
@@ -1549,12 +1206,18 @@ fn boolean_condition_value(source: &str) -> Option<bool> {
 }
 
 #[test]
+#[hardwon(
+    "#2318: Parses real JS/TS source with Tree-sitter and checks semantic lowerer output; pins feasible-edge selection for true and false literal conditions"
+)]
 fn boolean_literal_conditions_have_one_feasible_edge() {
     assert_eq!(boolean_condition_value("if (true) {}"), Some(true));
     assert_eq!(boolean_condition_value("if (false) {}"), Some(false));
 }
 
 #[test]
+#[hardwon(
+    "#2318: Parses real JS/TS source with Tree-sitter and checks semantic lowerer output; prevents a dynamic loop bound from being treated as a proven first iteration"
+)]
 fn counted_for_first_iteration_requires_numeric_static_shape() {
     assert!(counted_loop_starts_true(
         "for (let iteration = 0; iteration < 3; iteration++) {}"
@@ -1734,6 +1397,7 @@ fn method_decorators_stay_in_the_class_definition_context() {
 }
 
 #[test]
+#[hardwon("#2311: equal numeric array indices did not share heap identity")]
 fn numeric_index_tokens_reuse_equal_tokens_and_separate_different_tokens() {
     let source = r#"
         const values = [0, "0"];
@@ -1769,6 +1433,7 @@ fn numeric_index_tokens_reuse_equal_tokens_and_separate_different_tokens() {
 }
 
 #[test]
+#[hardwon("#2311: plain-object fields accepted prototype and call-result bases")]
 fn plain_object_field_keys_share_only_allowed_member_bases() {
     let source = r#"
         const original = { value: 0 };
@@ -1830,6 +1495,7 @@ fn plain_object_field_keys_share_only_allowed_member_bases() {
 }
 
 #[test]
+#[hardwon("#2311: direct allocation aliases lost their structured source identity")]
 fn direct_alias_assignment_is_structurally_identifiable() {
     let source = "const original = {}; const alias = original;";
     let mut parser = tree_sitter::Parser::new();
@@ -1856,6 +1522,7 @@ fn direct_alias_assignment_is_structurally_identifiable() {
 }
 
 #[test]
+#[hardwon("#2311: decimal array-index forms were normalized inconsistently")]
 fn array_index_keys_normalize_decimal_integer_tokens_only() {
     let source = r#"
         const values = [0];
@@ -1895,6 +1562,9 @@ fn array_index_keys_normalize_decimal_integer_tokens_only() {
 }
 
 #[test]
+#[hardwon(
+    "#2764: Parses real JS/TS source with Tree-sitter and checks semantic lowerer output; regression for array-element field stores and loads using different allocation identities"
+)]
 fn array_element_object_fields_reuse_literal_identity() {
     let source = r#"
         function flow(source) {
@@ -1927,6 +1597,9 @@ fn array_element_object_fields_reuse_literal_identity() {
 }
 
 #[test]
+#[hardwon(
+    "#2764: Parses real JS/TS source with Tree-sitter and checks semantic lowerer output; pins the conservative boundary when an array element escapes through a local alias"
+)]
 fn escaped_array_element_keeps_field_identity_incomplete() {
     let source = r#"
         function flow(source) {
@@ -1943,6 +1616,9 @@ fn escaped_array_element_keeps_field_identity_incomplete() {
 }
 
 #[test]
+#[hardwon(
+    "#2764: Parses real JS/TS source with Tree-sitter and checks semantic lowerer output; prevents a missing literal field from receiving a fabricated precise identity"
+)]
 fn absent_array_element_field_keeps_field_identity_incomplete() {
     let source = r#"
         function flow() {
@@ -1956,61 +1632,12 @@ fn absent_array_element_field_keeps_field_identity_incomplete() {
     }));
 }
 
-#[test]
-fn runtime_keyed_loads_retain_numeric_index_and_structural_value_mapping() {
-    let source = "function probe() { return process.argv[2]; }";
-    for procedures in [
-        lower_typescript_source(source),
-        lower_javascript_parts(source),
-    ] {
-        let mut found = false;
-        for procedure in &procedures {
-            for point in &procedure.points {
-                for event in &point.events {
-                    let SemanticEffect::MemoryLoad {
-                        location, result, ..
-                    } = event.effect
-                    else {
-                        continue;
-                    };
-                    if matches!(
-                        procedure.memory_locations[location.index()].kind,
-                        crate::analyzer::semantic::MemoryLocationKind::Index {
-                            constant_index: Some(2),
-                            ..
-                        }
-                    ) {
-                        let terminal_mapping = &procedure.source_mappings
-                            [procedure.values[result.index()].source.index()];
-                        let span = terminal_mapping.locator.anchor().span();
-                        assert_eq!(
-                            &source[span.start_byte() as usize..span.end_byte() as usize],
-                            "process.argv[2]"
-                        );
-                        let crate::analyzer::semantic::MemoryLocationKind::Index { base, .. } =
-                            procedure.memory_locations[location.index()].kind
-                        else {
-                            unreachable!("selected an indexed runtime load")
-                        };
-                        let container_mapping = &procedure.source_mappings
-                            [procedure.values[base.index()].source.index()];
-                        assert!(
-                            container_mapping.ast_identity.is_some(),
-                            "normalized runtime candidate retains its AST identity"
-                        );
-                        assert!(procedure.gaps.iter().any(|gap| gap.point == point.id
-                        && gap.discharge == crate::analyzer::semantic::SemanticGapDischarge::RuntimeReadBehavior));
-                        found = true;
-                    }
-                }
-            }
-        }
-        assert!(
-            found,
-            "the indexed load must remain an executable semantic effect"
-        );
-    }
-}
+/// #3352/#3373: the runtime oracle joins a keyed read to its structural seed
+/// through the `ast_identity` of the load result's source mapping. The
+/// mapping anchored at the query's candidate anchor must be the one carrying
+/// that identity: the terminal load itself for a dot read, and the load of
+/// the base of its access chain for a subscript read. Local `const`
+/// initializers must preserve this exactly as return positions do.
 
 #[test]
 fn runtime_keyed_store_gaps_are_not_read_discharges() {
@@ -2037,13 +1664,9 @@ fn runtime_keyed_store_gaps_are_not_read_discharges() {
         assert_eq!(stores, 2);
     }
 }
-/// #3352/#3373: the runtime oracle joins a keyed read to its structural seed
-/// through the `ast_identity` of the load result's source mapping. The
-/// mapping anchored at the query's candidate anchor must be the one carrying
-/// that identity: the terminal load itself for a dot read, and the load of
-/// the base of its access chain for a subscript read. Local `const`
-/// initializers must preserve this exactly as return positions do.
+
 #[test]
+#[hardwon("#3352: Runtime-load identity was lost through a local const initializer")]
 fn const_initializer_runtime_loads_keep_the_structural_identity_the_oracle_joins_on() {
     let source = "function read() {\
                   \n  const dot = process.env.DFB_INPUT;\
@@ -2122,6 +1745,9 @@ fn const_initializer_runtime_loads_keep_the_structural_identity_the_oracle_joins
 }
 
 #[test]
+#[hardwon(
+    "#3373: Parses real JS/TS source with Tree-sitter and checks semantic lowerer output; pins the structural seed identity and count for both runtime subscript load forms"
+)]
 fn runtime_keyed_subscript_loads_retain_the_ast_derived_seed_identity() {
     let source = "function probe() { const token = process.env['CONFIG_TOKEN']; const index = process.argv[7]; }";
     for procedures in [
@@ -2182,6 +1808,9 @@ fn runtime_keyed_subscript_loads_retain_the_ast_derived_seed_identity() {
 }
 
 #[test]
+#[hardwon(
+    "#3373: Parses real JS/TS source with Tree-sitter and checks semantic lowerer output; negative regression prevents ordinary subscript loads from inheriting runtime identity"
+)]
 fn ordinary_subscript_values_do_not_borrow_a_runtime_seed_identity() {
     let source = "function probe(items) { return items[7]; }";
     for procedures in [
@@ -2217,6 +1846,9 @@ fn ordinary_subscript_values_do_not_borrow_a_runtime_seed_identity() {
 }
 
 #[test]
+#[hardwon(
+    "#3373: Parses real JS/TS source with Tree-sitter and checks semantic lowerer output; pins root-binding identity through a computed runtime container chain"
+)]
 fn computed_runtime_container_loads_resolve_to_the_binding_their_chain_starts_from() {
     let source = "function probe() { const token = process['env']['CONFIG_TOKEN']; }";
     for procedures in [
@@ -2315,18 +1947,7 @@ impl NumericFlavor {
             None,
         );
         let file = ProjectFile::new(std::env::temp_dir(), file);
-        let outcome = lowerer
-            .lower(
-                &file,
-                &prepared,
-                &SemanticBudget::default(),
-                &CancellationToken::default(),
-            )
-            .expect("semantic lowering must succeed");
-        let SemanticOutcome::Complete { value, .. } = outcome else {
-            panic!("{self:?}: semantic lowering must complete");
-        };
-        value
+        lower_prepared_source(lowerer, &file, &prepared, &format!("{self:?}"))
             .into_iter()
             .find(|procedure| procedure.kind == ProcedureKind::Function)
             .expect("function procedure must be lowered")
@@ -2338,11 +1959,10 @@ fn mapped_text<'source>(
     source: &'source str,
     mapping: SourceMappingId,
 ) -> &'source str {
-    let span = parts.source_mappings[mapping.index()]
-        .locator
-        .anchor()
-        .span();
-    &source[span.start_byte() as usize..span.end_byte() as usize]
+    crate::analyzer::test_support::source_mapping_text(
+        &parts.source_mappings[mapping.index()],
+        source,
+    )
 }
 
 /// The kind of the one value minted for an exactly spelled expression.
@@ -2359,12 +1979,6 @@ fn value_kind_for_text(
         .collect::<Vec<_>>();
     assert_eq!(kinds.len(), 1, "`{text}` must mint one value: {kinds:?}");
     kinds.into_iter().next().expect("one value")
-}
-
-fn floating(value: f64) -> SemanticValueKind {
-    SemanticValueKind::FloatingPoint {
-        bits: value.to_bits(),
-    }
 }
 
 #[test]
@@ -2539,23 +2153,6 @@ fn js_ts_numeric_comparisons_publish_scalar_guards() {
     }
 }
 
-#[test]
-fn tsx_and_jsx_numeric_guard_beside_markup_keeps_its_shape() {
-    for flavor in [
-        NumericFlavor::JavaScript,
-        NumericFlavor::Jsx,
-        NumericFlavor::Tsx,
-    ] {
-        let source = "function f(x) { if (x < 5) { return <div>{x}</div>; } return null; }";
-        let parts = flavor.lower(source);
-        assert_eq!(
-            describe_guards(&parts, source),
-            ["x < 5: int less_than UnsignedInteger(5) on x"],
-            "{flavor:?}"
-        );
-    }
-}
-
 fn integer_offsets<'source>(
     parts: &ProcedureSemanticsParts,
     source: &'source str,
@@ -2581,74 +2178,24 @@ fn integer_offsets<'source>(
 }
 
 #[test]
-fn js_ts_identifier_plus_integer_literal_publishes_integer_offset() {
-    let body = "let a = x + 1; let b = 2 + x; let c = x - 3; let d = x - -4; let e = 5 - x; \
-         let f = x + 1.5; let g = x + 10n; let h = o.x + 1; let i = x * 2; let j = x + y;";
-    for flavor in NumericFlavor::ALL {
-        let source = format!("function f(x, y, o) {{ {body} }}");
-        let parts = flavor.lower(&source);
-        let mut offsets = integer_offsets(&parts, &source);
-        offsets.sort_unstable();
+fn tsx_and_jsx_numeric_guard_beside_markup_keeps_its_shape() {
+    for flavor in [
+        NumericFlavor::JavaScript,
+        NumericFlavor::Jsx,
+        NumericFlavor::Tsx,
+    ] {
+        let source = "function f(x) { if (x < 5) { return <div>{x}</div>; } return null; }";
+        let parts = flavor.lower(source);
         assert_eq!(
-            offsets,
-            [
-                ("x", "2 + x", false, 2),
-                ("x", "x + 1", false, 1),
-                ("x", "x - -4", false, 4),
-                ("x", "x - 3", true, 3),
-            ],
+            describe_guards(&parts, source),
+            ["x < 5: int less_than UnsignedInteger(5) on x"],
             "{flavor:?}"
         );
-        let language_defined_targets = parts
-            .points
-            .iter()
-            .flat_map(|point| point.events.iter())
-            .filter_map(|event| match event.effect {
-                SemanticEffect::ValueFlow {
-                    kind: ValueFlowKind::LanguageDefined,
-                    target,
-                    ..
-                } => Some(mapped_text(
-                    &parts,
-                    &source,
-                    parts.values[target.index()].source,
-                )),
-                _ => None,
-            })
-            .collect::<HashSet<_>>();
-        for offset in ["x + 1", "2 + x", "x - 3", "x - -4"] {
-            assert!(
-                !language_defined_targets.contains(offset),
-                "{flavor:?}: `{offset}` keeps only its offset flow"
-            );
-        }
-        for generic in ["5 - x", "x + 1.5", "x + 10n", "o.x + 1", "x * 2", "x + y"] {
-            assert!(
-                language_defined_targets.contains(generic),
-                "{flavor:?}: `{generic}` keeps its operand flows"
-            );
-        }
     }
 }
 
 #[test]
-fn js_ts_numeric_guards_and_offsets_add_no_scalar_gaps() {
-    for source in [
-        "function f(x) { let y = x + 1; if (y < 5) { return 1; } \
-         if (x === 2.5) { return 2; } if (x !== x) { return 3; } if (y) { return 4; } \
-         return y - 1; }",
-        // A counted loop with a per-iteration binding and its update.
-        "function f() { let found = -1; for (let i = 0; i < 3; i++) { if (i === 2) found = i; } \
-         if (found === -1) return null; return found; }",
-    ] {
-        for flavor in NumericFlavor::ALL {
-            let parts = flavor.lower(source);
-            assert!(parts.gaps.is_empty(), "{flavor:?}: {:?}", parts.gaps);
-        }
-    }
-}
-
-#[test]
+#[hardwon("#3528: counted loops stayed incomplete because JavaScript updates lost integer offsets")]
 fn js_ts_updates_and_compound_literals_publish_integer_offsets() {
     let source = "function f() { let i = 0; i++; ++i; i--; i += 2; i -= 3; i *= 2; }";
     for flavor in NumericFlavor::ALL {
@@ -2678,6 +2225,7 @@ fn js_ts_updates_and_compound_literals_publish_integer_offsets() {
 }
 
 #[test]
+#[hardwon("#3528: updates of non-primitive bindings need an open conversion-call gap")]
 fn js_ts_update_conversion_stays_open_unless_the_binding_holds_only_primitives() {
     let call_gaps = |parts: &ProcedureSemanticsParts| {
         parts

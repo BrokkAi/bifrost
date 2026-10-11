@@ -122,18 +122,6 @@
       "expires_at": null
     },
     {
-      "policy_id": "bifrost.performance.sleep-in-loop",
-      "finding_id": "f403bdcec718dab18ed1d1a20edb863dd8b49367067c90a81476312a5c2fd4b5",
-      "path": "crates/bifrost-analysis/src/process.rs",
-      "identity_stability": "strong",
-      "status": "accepted",
-      "reason": "Deliberate retry/backoff or poll-until-deadline loop; the sleep is the mechanism, not a defect.",
-      "policy_hash_at_acceptance": "b0319247b09cacb3e1b43e0b3809f7b2ba6858a5522ba6de7bf3a7b8212901ad",
-      "accepted_by": "dbakereffendi",
-      "accepted_at": "2026-08-04",
-      "expires_at": null
-    },
-    {
       "policy_id": "bifrost.performance.file-read-in-loop",
       "finding_id": "dc30842b42793b975f0e3339c0a04879fcabd4491d330102e611c44489d2f498",
       "path": "crates/bifrost-semantic-packs/src/summary_foundry/framework_pack.rs",

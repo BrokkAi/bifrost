@@ -65,10 +65,7 @@ impl TaintUniverseHash {
 
 impl fmt::Display for TaintUniverseHash {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        for byte in self.0 {
-            write!(formatter, "{byte:02x}")?;
-        }
-        Ok(())
+        brokk_bifrost_core::analyzer::canonical_hash::write_lower_hex(&self.0, formatter)
     }
 }
 
@@ -227,7 +224,7 @@ impl TaintClassSet {
     }
 
     pub fn is_empty(&self) -> bool {
-        self.words.iter().all(|word| *word == 0)
+        brokk_bifrost_core::analyzer::common::packed_bits_is_empty(&self.words)
     }
 
     pub(crate) fn contains_dense(&self, class: TaintClassId) -> bool {
@@ -280,10 +277,7 @@ impl TaintClassSet {
     }
 
     pub fn len(&self) -> usize {
-        self.words
-            .iter()
-            .map(|word| word.count_ones() as usize)
-            .sum()
+        brokk_bifrost_core::analyzer::common::packed_bits_len(&self.words)
     }
 
     pub(crate) fn union_with(&mut self, other: &Self) {
@@ -316,12 +310,20 @@ impl TaintClassSet {
     }
 
     fn assert_compatible(&self, other: &Self) {
-        assert_eq!(
-            (self.universe, self.class_count),
-            (other.universe, other.class_count),
-            "taint class sets require one universe"
-        );
+        assert_class_sets_compatible(self, other, "taint class sets require one universe");
     }
+}
+
+pub(super) fn assert_class_sets_compatible(
+    left: &TaintClassSet,
+    right: &TaintClassSet,
+    message: &'static str,
+) {
+    assert_eq!(
+        (left.universe(), left.class_count()),
+        (right.universe(), right.class_count()),
+        "{message}"
+    );
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

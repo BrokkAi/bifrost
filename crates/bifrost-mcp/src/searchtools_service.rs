@@ -11,8 +11,8 @@ use crate::{
     ProjectFile, SubsetCoverage, WorkspaceAnalyzer, WorkspaceFileListingCache,
     analyzer::IndexWarmer,
     analyzer::packs_document::{
-        WORKSPACE_PACKS_DOCUMENT_PATH, WorkspaceActivationSources, WorkspacePacksActivation,
-        WorkspacePacksConfig, activate_installed_workspace_semantic_sources_in_catalog,
+        WORKSPACE_PACKS_DOCUMENT_PATH, WorkspaceActivationSources, WorkspacePacksConfig,
+        activate_installed_workspace_semantic_sources_in_catalog,
         activate_workspace_semantic_sources_in_catalog, bootstrap_semantic_model_catalog,
         install_semantic_model_catalog_bootstrap as install_shared_semantic_model_catalog_bootstrap,
         intrinsic_language_evidence, load_workspace_packs_config_at, node_runtime_evidence,
@@ -45,14 +45,14 @@ use crate::{
     path_normalization::NormalizePath,
     policy::{
         BuiltInPolicySelection, ExplainError, ExplanationCandidate, ExplanationGeneration,
-        ExplanationLimits, ExplanationTarget, NearMissCandidates, POLICY_EXIT_CLEAN,
-        POLICY_EXIT_FINDING, POLICY_EXIT_UNRELIABLE, PolicyBaselineOptions, PolicyBaselineSource,
-        PolicyBatchOutcome, PolicyEvaluationDate, PolicyEvaluationInput, PolicyEvaluationOptions,
-        PolicyExplanation, PolicyFailOn, PolicyFindingId, PolicyHostActivationContext, PolicyId,
-        PolicyNearMissRanking, PolicyReportDocument, PolicyRun, PolicyScopeOptions,
-        PolicyScopeSource, PolicyStageTiming, PolicySuppressionOptions, PolicySuppressionSource,
-        built_in_policy_catalog, explain_policy_inputs, rank_policy_near_misses,
-        workspace_snapshot_deadline_outcome_with_preflight,
+        ExplanationLimits, ExplanationTarget, FlowExplanationCandidate, NearMissCandidates,
+        POLICY_EXIT_CLEAN, POLICY_EXIT_FINDING, POLICY_EXIT_UNRELIABLE, PolicyBaselineOptions,
+        PolicyBaselineSource, PolicyBatchOutcome, PolicyEvaluationDate, PolicyEvaluationInput,
+        PolicyEvaluationOptions, PolicyExplanation, PolicyFailOn, PolicyFindingId, PolicyId,
+        PolicyNearMissRanking, PolicyRangeRequest, PolicyReportDocument, PolicyRun,
+        PolicyScopeOptions, PolicyScopeSource, PolicyStageTiming, PolicySuppressionOptions,
+        PolicySuppressionSource, built_in_policy_catalog, explain_policy_inputs,
+        rank_policy_near_misses, workspace_snapshot_deadline_outcome_with_preflight,
     },
     profiling,
     searchtools::{
@@ -96,6 +96,15 @@ pub(crate) struct TransportTimings {
     pub(crate) transport_queue_wait: Duration,
     pub(crate) workspace_readiness_wait: Duration,
     pub(crate) analyzer_admission_wait: Duration,
+}
+
+impl TransportTimings {
+    fn with_queue_wait(transport_queue_wait: Duration) -> Self {
+        Self {
+            transport_queue_wait,
+            ..Self::default()
+        }
+    }
 }
 
 /// Configure the downstream shipped-pack provider once for this process.
@@ -233,7 +242,6 @@ fn parse_workspace_semantic_models_setting(
 #[derive(Debug)]
 struct WorkspacePackActivationState {
     config: Option<Arc<WorkspacePacksConfig>>,
-    activation: Option<Arc<WorkspacePacksActivation>>,
     ecosystems: Vec<crate::analyzer::DependencyPackEcosystem>,
     failure: Option<String>,
     /// Dependencies whose exact acquisition the expensive stage of the warm
@@ -280,7 +288,10 @@ fn activate_configured_semantic_models(
         Ok(prelude) => prelude,
         Err(failure_state) => return Ok(failure_state),
     };
-    let activation = match activate_workspace_semantic_sources_in_catalog(
+    // The activation publishes its models onto the session analyzer, which is
+    // what the session's tools read. Policy evaluation activates its own
+    // workspace (#3735), so nothing reads the transaction's own record.
+    let failure = activate_workspace_semantic_sources_in_catalog(
         workspace,
         &AnalyzerConfig::default(),
         &catalog,
@@ -292,25 +303,13 @@ fn activate_configured_semantic_models(
         },
         &additional_evidence,
         &CancellationToken::default(),
-    ) {
-        Ok(activation) => activation.map(Arc::new),
-        Err(error) => {
-            return Ok(WorkspacePackActivationState {
-                config: packs_config,
-                activation: None,
-                ecosystems,
-                failure: Some(format!(
-                    "workspace semantic-pack activation failed: {error}"
-                )),
-                pending_acquisitions: Vec::new(),
-            });
-        }
-    };
+    )
+    .err()
+    .map(|error| format!("workspace semantic-pack activation failed: {error}"));
     Ok(WorkspacePackActivationState {
         config: packs_config,
-        activation,
         ecosystems,
-        failure: None,
+        failure,
         pending_acquisitions: Vec::new(),
     })
 }
@@ -367,7 +366,6 @@ fn activate_configured_semantic_models_installed_stage(
         Ok(Some(installed)) => {
             let state = WorkspacePackActivationState {
                 config: packs_config,
-                activation: Some(Arc::new(installed.activation)),
                 ecosystems,
                 failure: None,
                 pending_acquisitions: installed.pending,
@@ -381,7 +379,6 @@ fn activate_configured_semantic_models_installed_stage(
         Ok(None) => Ok(InstalledPackStageOutcome::Settled(
             WorkspacePackActivationState {
                 config: packs_config,
-                activation: None,
                 ecosystems,
                 failure: None,
                 pending_acquisitions: Vec::new(),
@@ -390,7 +387,6 @@ fn activate_configured_semantic_models_installed_stage(
         Err(error) => Ok(InstalledPackStageOutcome::Settled(
             WorkspacePackActivationState {
                 config: packs_config,
-                activation: None,
                 ecosystems,
                 failure: Some(format!(
                     "workspace semantic-pack activation failed: {error}"
@@ -418,6 +414,15 @@ struct SessionPackCatalogPrelude {
     additional_evidence: Vec<SemanticModelActivationEvidence>,
 }
 
+fn append_intrinsic_semantic_evidence(
+    workspace: &WorkspaceAnalyzer,
+    evidence: &mut Vec<SemanticModelActivationEvidence>,
+) {
+    evidence.extend(intrinsic_language_evidence(workspace));
+    evidence.extend(node_runtime_evidence(workspace));
+    evidence.extend(python_process_input_evidence(workspace));
+}
+
 fn open_session_pack_catalog(
     workspace_root: &Path,
     workspace: &WorkspaceAnalyzer,
@@ -443,7 +448,6 @@ fn open_session_pack_catalog(
                 Err(error) => {
                     return Err(WorkspacePackActivationState {
                         config: packs_config.clone(),
-                        activation: None,
                         ecosystems,
                         failure: Some(format!(
                             "failed to open workspace semantic-pack catalog: {error}"
@@ -461,7 +465,6 @@ fn open_session_pack_catalog(
                 Err(error) => {
                     return Err(WorkspacePackActivationState {
                         config: packs_config.clone(),
-                        activation: None,
                         ecosystems,
                         failure: Some(format!(
                             "failed to open generated semantic-pack catalog: {error}"
@@ -475,15 +478,12 @@ fn open_session_pack_catalog(
     let mut additional_evidence = Vec::new();
     match bootstrap_semantic_model_catalog(&catalog) {
         Ok(true) => {
-            additional_evidence.extend(intrinsic_language_evidence(workspace));
-            additional_evidence.extend(node_runtime_evidence(workspace));
-            additional_evidence.extend(python_process_input_evidence(workspace));
+            append_intrinsic_semantic_evidence(workspace, &mut additional_evidence);
         }
         Ok(false) => {}
         Err(error) => {
             return Err(WorkspacePackActivationState {
                 config: packs_config.clone(),
-                activation: None,
                 ecosystems,
                 failure: Some(format!(
                     "failed to register the MCP semantic-pack catalog bootstrap: {error}"
@@ -510,8 +510,7 @@ fn activate_legacy_configured_semantic_models(
         let ecosystems = workspace_pack_ecosystems(workspace, packs_config.as_deref());
         return Ok(WorkspacePackActivationState {
             config: packs_config,
-            activation: None,
-            ecosystems,
+                ecosystems,
             failure: Some(
                 "workspace packs document cannot be combined with legacy semantic-pack environment configuration"
                     .to_owned(),
@@ -554,9 +553,7 @@ fn activate_legacy_configured_semantic_models(
     if bootstrap_semantic_model_catalog(&catalog)? {
         {
             let _scope = profiling::scope("semantic_pack.intrinsic_evidence");
-            evidence.extend(intrinsic_language_evidence(workspace));
-            evidence.extend(node_runtime_evidence(workspace));
-            evidence.extend(python_process_input_evidence(workspace));
+            append_intrinsic_semantic_evidence(workspace, &mut evidence);
         }
     }
     // The reviewed workspace-local route is the shared analysis helper, the
@@ -624,7 +621,6 @@ fn activate_legacy_configured_semantic_models(
             }
             Ok(WorkspacePackActivationState {
                 config: None,
-                activation: None,
                 ecosystems: Vec::new(),
                 failure: None,
                 pending_acquisitions: Vec::new(),
@@ -749,7 +745,7 @@ mod workspace_semantic_model_configuration_tests {
         // and the CLI would (#1868).
         let activation = activate_configured_semantic_models(&root, &analyzer, None).unwrap();
         assert!(activation.config.is_some());
-        assert!(activation.activation.is_some());
+        assert!(activation.failure.is_none());
 
         assert!(
             analyzer
@@ -762,6 +758,9 @@ mod workspace_semantic_model_configuration_tests {
 
     #[cfg_attr(not(scheduled_tests), ignore = "scheduled-only")]
     #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "3f170fdac386: Commit 3f170fdac386 fixed absent pack configuration failing to use bound workspace defaults"
+    )]
     fn absent_packs_document_uses_bound_workspace_defaults() {
         let temp = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(temp.path().join("src")).unwrap();
@@ -778,21 +777,7 @@ mod workspace_semantic_model_configuration_tests {
             state.ecosystems,
             [crate::analyzer::DependencyPackEcosystem::Cargo]
         );
-        assert!(state.activation.is_some());
         assert!(state.failure.is_none());
-    }
-
-    #[test]
-    fn workspace_setting_requires_an_explicit_supported_value() {
-        assert!(!parse_workspace_semantic_models_setting(None).unwrap());
-        assert!(parse_workspace_semantic_models_setting(Some(std::ffi::OsStr::new("on"))).unwrap());
-        assert!(
-            !parse_workspace_semantic_models_setting(Some(std::ffi::OsStr::new("off"))).unwrap()
-        );
-        let error =
-            parse_workspace_semantic_models_setting(Some(std::ffi::OsStr::new("automatic")))
-                .unwrap_err();
-        assert!(error.contains(WORKSPACE_SEMANTIC_MODELS_ENV));
     }
 
     #[test]
@@ -860,7 +845,6 @@ mod workspace_semantic_model_configuration_tests {
         )
         .unwrap();
         let error = state.failure.expect("the failed activation is retained");
-        assert!(state.activation.is_none());
         assert!(error.contains("workspace semantic-model discovery failed"));
         assert!(error.contains(".bifrost/semantic-models/job-maker.json"));
     }
@@ -887,6 +871,9 @@ mod issue_1228_response_budget_tests {
     };
 
     #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#1255: large symbol-source responses regressed MCP code-intelligence latency"
+    )]
     fn oversized_symbol_source_response_is_rejected_before_rendering() {
         let result = SymbolSourcesResult {
             sources: vec![SourceBlock {
@@ -900,6 +887,7 @@ mod issue_1228_response_budget_tests {
                 presentation: None,
                 note: None,
                 semantic_model: None,
+                inside_unclosed_construct: None,
             }],
             not_found: Vec::new(),
             ambiguous: Vec::new(),
@@ -921,6 +909,9 @@ mod issue_1228_response_budget_tests {
     }
 
     #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "83d39edefb3d: cancelled symbol-source batches discarded completed sibling results"
+    )]
     fn partial_symbol_source_response_keeps_completed_sources_and_typed_cancellation() {
         let result = SymbolSourcesResult {
             sources: vec![SourceBlock {
@@ -934,6 +925,7 @@ mod issue_1228_response_budget_tests {
                 presentation: None,
                 note: None,
                 semantic_model: None,
+                inside_unclosed_construct: None,
             }],
             not_found: Vec::new(),
             ambiguous: Vec::new(),
@@ -984,6 +976,10 @@ struct RunPolicyParams {
     #[serde(default)]
     fail_on: RunPolicyFailOn,
     diff_base: Option<String>,
+    /// Scope the taint composition to the files `diff_base` changed. Requires
+    /// `diff_base` and incremental reuse.
+    #[serde(default)]
+    diff_scoped: bool,
     /// Whether this run may publish complete units and reuse verified ones.
     /// Absent means yes. `false` forces full evaluation without policy-unit
     /// cache access when diagnosing a difference.
@@ -1073,6 +1069,9 @@ struct ExplainPolicyParams {
     policy_ids: Vec<String>,
     finding_id: Option<String>,
     candidate: Option<ExplainPolicyCandidate>,
+    /// For a flow or taint policy, the origin (source) position; `candidate`
+    /// is then the observation (sink) position (issue 3686).
+    candidate_source: Option<ExplainPolicyCandidate>,
     near_misses: Option<ExplainPolicyNearMisses>,
     workspace_generation: Option<String>,
 }
@@ -1264,6 +1263,7 @@ pub struct SearchToolsService {
     /// on first access. `None` once the session is ready (or for
     /// synchronously-built services).
     pending_build: Mutex<Option<PendingWorkspaceBuild>>,
+    build_progress: Arc<crate::workspace_progress::WorkspaceBuildProgress>,
     /// Records a deferred-build failure (e.g. the workspace walk hit an IO
     /// error) so every access after the first surfaces it instead of hanging.
     build_error: Mutex<Option<String>>,
@@ -1284,6 +1284,17 @@ pub struct SearchToolsService {
     /// for a trusted whole-workspace caller, never a tool argument: a query
     /// document must not be able to raise its own limits.
     workspace_scaled_query_limits: bool,
+}
+
+/// Calls `get_symbol_sources` and decodes its JSON response for tests that
+/// exercise the service through its public tool surface.
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub fn symbol_sources_json(service: &SearchToolsService, arguments_json: &str) -> Value {
+    let payload = service
+        .call_tool_json("get_symbol_sources", arguments_json)
+        .unwrap();
+    serde_json::from_str(&payload).unwrap()
 }
 
 /// When a session pays for the expensive per-generation index builds.
@@ -1353,10 +1364,9 @@ enum PackWarmState {
 /// with the pending-acquisition diagnostic.
 #[derive(Clone)]
 enum SessionPackActivation {
-    /// The warm finished: this is the session's exact final activation, or
-    /// its stated failure (`Some` carrying `failure`), or the
-    /// reported-unavailable case (`None`).
-    Settled(Option<Arc<WorkspacePackActivationState>>),
+    /// The warm finished, successfully or with a stated failure: nothing an
+    /// answer could still gain is outstanding.
+    Settled,
     /// The installed stage settled and the snapshot awaited it; the expensive
     /// stage is still running, so the active set can still gain the pending
     /// acquisitions this state names.
@@ -1369,20 +1379,16 @@ enum SessionPackActivation {
 
 impl SemanticPackWarm {
     fn settled(state: Option<Arc<WorkspacePackActivationState>>) -> Self {
-        Self {
-            state: Mutex::new(PackWarmState::Settled(state)),
-            settled: Condvar::new(),
-            worker: Mutex::new(None),
-            started_at: Instant::now(),
-            settled_ns: AtomicU64::new(0),
-            #[cfg(test)]
-            hold: None,
-        }
+        Self::new(PackWarmState::Settled(state))
     }
 
     fn pending() -> Self {
+        Self::new(PackWarmState::Pending)
+    }
+
+    fn new(state: PackWarmState) -> Self {
         Self {
-            state: Mutex::new(PackWarmState::Pending),
+            state: Mutex::new(state),
             settled: Condvar::new(),
             worker: Mutex::new(None),
             started_at: Instant::now(),
@@ -1395,7 +1401,14 @@ impl SemanticPackWarm {
     /// Start the staged activation on its own thread and publish what it
     /// returns.
     fn spawn(project_root: PathBuf, analyzer: WorkspaceAnalyzer) -> Result<Arc<Self>, String> {
-        let warm = Arc::new(Self::pending());
+        Self::start_worker(Arc::new(Self::pending()), project_root, analyzer)
+    }
+
+    fn start_worker(
+        warm: Arc<Self>,
+        project_root: PathBuf,
+        analyzer: WorkspaceAnalyzer,
+    ) -> Result<Arc<Self>, String> {
         let worker = start_pack_warm_worker(Arc::clone(&warm), project_root, analyzer)?;
         *warm
             .worker
@@ -1417,12 +1430,7 @@ impl SemanticPackWarm {
             hold: Some(hold),
             ..Self::pending()
         });
-        let worker = start_pack_warm_worker(Arc::clone(&warm), project_root, analyzer)?;
-        *warm
-            .worker
-            .lock()
-            .expect("semantic-pack warm mutex poisoned") = Some(worker);
-        Ok(warm)
+        Self::start_worker(warm, project_root, analyzer)
     }
 
     /// Join activation before the session releases its analyzer snapshot.
@@ -1456,7 +1464,7 @@ impl SemanticPackWarm {
             PackWarmState::AcquisitionPending(state) => {
                 SessionPackActivation::AcquisitionPending(Arc::clone(state))
             }
-            PackWarmState::Settled(state) => SessionPackActivation::Settled(state.clone()),
+            PackWarmState::Settled(_) => SessionPackActivation::Settled,
         }
     }
 
@@ -1632,42 +1640,55 @@ struct ExpensiveStageHold {
 }
 
 #[cfg(test)]
+fn new_release_latch() -> (Mutex<bool>, Condvar) {
+    (Mutex::new(false), Condvar::new())
+}
+
+#[cfg(test)]
+fn park_on_release(released: &Mutex<bool>, progress: &Condvar, poison_message: &str) {
+    let mut released = released.lock().expect(poison_message);
+    while !*released {
+        released = progress.wait(released).expect(poison_message);
+    }
+}
+
+#[cfg(test)]
+fn release_latch(released: &Mutex<bool>, progress: &Condvar, poison_message: &str) {
+    *released.lock().expect(poison_message) = true;
+    progress.notify_all();
+}
+
+#[cfg(test)]
 impl ExpensiveStageHold {
     fn new() -> Self {
-        Self {
-            released: Mutex::new(false),
-            progress: Condvar::new(),
-        }
+        let (released, progress) = new_release_latch();
+        Self { released, progress }
     }
 
     fn park_until_released(&self) {
-        let mut released = self
-            .released
-            .lock()
-            .expect("expensive-stage hold mutex poisoned");
-        while !*released {
-            released = self
-                .progress
-                .wait(released)
-                .expect("expensive-stage hold mutex poisoned");
-        }
+        park_on_release(
+            &self.released,
+            &self.progress,
+            "expensive-stage hold mutex poisoned",
+        );
     }
 
     fn release(&self) {
-        *self
-            .released
-            .lock()
-            .expect("expensive-stage hold mutex poisoned") = true;
-        self.progress.notify_all();
+        release_latch(
+            &self.released,
+            &self.progress,
+            "expensive-stage hold mutex poisoned",
+        );
     }
 }
 
 #[cfg(test)]
 impl PackWarmHold {
     fn new() -> Self {
+        let (released, progress) = new_release_latch();
         Self {
-            released: Mutex::new(false),
-            progress: Condvar::new(),
+            released,
+            progress,
             worker_parked: Mutex::new(false),
             worker_parked_changed: Condvar::new(),
             teardown_waiting: Mutex::new(false),
@@ -1699,13 +1720,11 @@ impl PackWarmHold {
             .lock()
             .expect("pack warm parked mutex poisoned") = true;
         self.worker_parked_changed.notify_all();
-        let mut released = self.released.lock().expect("pack warm hold mutex poisoned");
-        while !*released {
-            released = self
-                .progress
-                .wait(released)
-                .expect("pack warm hold mutex poisoned");
-        }
+        park_on_release(
+            &self.released,
+            &self.progress,
+            "pack warm hold mutex poisoned",
+        );
     }
 
     fn park_expensive_stage_until_released(&self) {
@@ -1715,8 +1734,11 @@ impl PackWarmHold {
     }
 
     fn release(&self) {
-        *self.released.lock().expect("pack warm hold mutex poisoned") = true;
-        self.progress.notify_all();
+        release_latch(
+            &self.released,
+            &self.progress,
+            "pack warm hold mutex poisoned",
+        );
     }
 
     fn release_all(&self) {
@@ -1886,6 +1908,13 @@ fn explain_policy_question(
                 .to_string(),
         ));
     }
+    if params.candidate_source.is_some() && params.candidate.is_none() {
+        return Err(SearchToolsServiceError::invalid_params(
+            "explain_policy candidate_source is the source half of a flow or taint candidate \
+             and requires candidate"
+                .to_string(),
+        ));
+    }
     if let Some(finding_id) = &params.finding_id {
         let parsed = finding_id.parse::<PolicyFindingId>().map_err(|error| {
             SearchToolsServiceError::invalid_params(format!(
@@ -1897,8 +1926,15 @@ fn explain_policy_question(
         ));
     }
     if let Some(candidate) = &params.candidate {
+        let observation = explain_policy_candidate(candidate)?;
         return Ok(ExplainPolicyQuestion::Explanation(
-            ExplanationTarget::Candidate(explain_policy_candidate(candidate)?),
+            match &params.candidate_source {
+                Some(source) => ExplanationTarget::FlowCandidate(FlowExplanationCandidate::new(
+                    explain_policy_candidate(source)?,
+                    observation,
+                )),
+                None => ExplanationTarget::Candidate(observation),
+            },
         ));
     }
     let Some(near_misses) = &params.near_misses else {
@@ -2024,6 +2060,7 @@ fn explain_policy_inputs_from(
         packs: params.policy_packs.clone(),
         categories: params.policy_categories.clone(),
         policy_ids: params.policy_ids.clone(),
+        excluded_policy_ids: Vec::new(),
     };
     let selected = built_in_policy_catalog()
         .map_err(|error| {
@@ -2035,7 +2072,7 @@ fn explain_policy_inputs_from(
         .map_err(|error| SearchToolsServiceError::invalid_params(error.to_string()))?;
     let mut built_in = selected
         .into_iter()
-        .map(|policy| PolicyEvaluationInput::embedded(policy.source_identity(), policy.source()))
+        .map(PolicyEvaluationInput::selected_builtin)
         .collect::<Vec<_>>();
     built_in.append(&mut inputs);
     if built_in.len() != 1 {
@@ -2139,205 +2176,6 @@ mod explain_policy_tests {
         u64::try_from(SOURCE.find(needle).expect("the fixture holds the needle")).unwrap()
     }
 
-    #[test]
-    fn explain_policy_answers_why_not_with_a_structured_explanation() {
-        let (_temp, service) = service();
-        let value = service
-            .call_tool_value(
-                "explain_policy",
-                json!({
-                    "policy_files": ["policies/match.rqlp"],
-                    "candidate": { "path": "Widget.java", "byte_start": byte_offset("Widget") }
-                }),
-            )
-            .expect("explain_policy should answer");
-        let explanation = &value["explanation"];
-        assert_eq!(
-            explanation["format"],
-            brokk_bifrost_policy::POLICY_EXPLANATION_FORMAT,
-            "{value:#}"
-        );
-        assert_eq!(explanation["question"], "why_not", "{value:#}");
-        assert_eq!(explanation["policy_id"], "test.explain.mcp.match");
-        assert_eq!(explanation["analysis_type"], "match");
-        assert_eq!(explanation["subject"]["type"], "candidate");
-        assert_eq!(explanation["subject"]["path"], "Widget.java");
-        // The result carries no gate: an explanation is a query.
-        assert!(value.get("status").is_none(), "{value:#}");
-        assert!(value.get("exit_status").is_none(), "{value:#}");
-        // The tree is a tree, and its root states an outcome.
-        assert!(explanation["node_count"].as_u64().is_some_and(|n| n >= 1));
-        assert!(
-            ["satisfied", "failed", "unknown"]
-                .contains(&explanation["outcome"].as_str().expect("an outcome")),
-            "{value:#}"
-        );
-        assert!(
-            explanation["root"]["id"]
-                .as_str()
-                .is_some_and(|id| id.len() == 32)
-        );
-    }
-
-    /// The relational adapter reaches the wire: an assertion policy answers
-    /// per row binding, and the node vocabulary the slice added is published.
-    #[test]
-    fn explain_policy_answers_why_not_for_a_relational_policy() {
-        let (_temp, service) = service();
-        let value = service
-            .call_tool_value(
-                "explain_policy",
-                json!({
-                    "policy_files": ["policies/relational.rqlp"],
-                    "candidate": {
-                        "path": "Widget.java",
-                        "byte_start": byte_offset("return 1"),
-                        "byte_end": byte_offset("return 1") + 8
-                    }
-                }),
-            )
-            .expect("explain_policy should answer for a relational policy");
-        let explanation = &value["explanation"];
-        assert_eq!(explanation["analysis_type"], "assertion", "{value:#}");
-        assert_eq!(explanation["root"]["label"], "relational_candidate");
-        let bindings = explanation["root"]["children"]
-            .as_array()
-            .expect("the root has children")
-            .iter()
-            .filter(|node| node["kind"] == "relation_binding")
-            .count();
-        assert_eq!(bindings, 1, "{value:#}");
-    }
-
-    #[test]
-    fn explain_policy_requires_exactly_one_question() {
-        let (_temp, service) = service();
-        let neither = service
-            .call_tool_value(
-                "explain_policy",
-                json!({ "policy_files": ["policies/match.rqlp"] }),
-            )
-            .expect_err("a request with no question has no answer");
-        assert_eq!(neither.code, SearchToolsServiceErrorCode::InvalidParams);
-        assert!(
-            neither
-                .message
-                .contains("requires finding_id (why), candidate (why-not), or near_misses"),
-            "{}",
-            neither.message
-        );
-
-        for extra in [
-            json!({ "candidate": { "path": "Widget.java", "byte_start": 0 } }),
-            json!({ "near_misses": { "enumerate_from_policy_seed": true } }),
-        ] {
-            let mut arguments = json!({
-                "policy_files": ["policies/match.rqlp"],
-                "finding_id": "0".repeat(64),
-            });
-            for (key, value) in extra.as_object().expect("an object") {
-                arguments[key] = value.clone();
-            }
-            let both = service
-                .call_tool_value("explain_policy", arguments)
-                .expect_err("a request with two questions has two answers");
-            assert!(both.message.contains("exactly one of"), "{}", both.message);
-        }
-    }
-
-    #[test]
-    fn explain_policy_explains_exactly_one_policy() {
-        let (_temp, service) = service();
-        let error = service
-            .call_tool_value(
-                "explain_policy",
-                json!({
-                    "policy_files": ["policies/match.rqlp", "policies/relational.rqlp"],
-                    "candidate": { "path": "Widget.java", "byte_start": 0 }
-                }),
-            )
-            .expect_err("an explanation is about one policy");
-        assert_eq!(error.code, SearchToolsServiceErrorCode::InvalidParams);
-        assert!(error.message.contains("resolved to 2"), "{}", error.message);
-    }
-
-    /// Issue 2500 on the wire: the seed-scoped search returns the sibling
-    /// ranking document, ordered by declared-predicate distance.
-    #[test]
-    fn explain_policy_ranks_near_misses_from_the_policys_own_seed_scope() {
-        let (_temp, service) = service();
-        let value = service
-            .call_tool_value(
-                "explain_policy",
-                json!({
-                    "policy_files": ["policies/match.rqlp"],
-                    "near_misses": { "enumerate_from_policy_seed": true }
-                }),
-            )
-            .expect("explain_policy should rank near misses");
-        let ranking = &value["near_miss_ranking"];
-        assert_eq!(
-            ranking["format"],
-            brokk_bifrost_policy::POLICY_NEAR_MISS_FORMAT,
-            "{value:#}"
-        );
-        assert_eq!(ranking["question"], "near_miss", "{value:#}");
-        assert_eq!(ranking["policy_id"], "test.explain.mcp.match");
-        assert_eq!(ranking["analysis_type"], "match");
-        assert_eq!(ranking["conjuncts"], json!(["scope", "root.name"]));
-        assert_eq!(ranking["enumeration"]["type"], "policy_seed", "{value:#}");
-        // An explanation tree is not what a ranking answers with.
-        assert!(value.get("explanation").is_none(), "{value:#}");
-        assert!(value.get("status").is_none(), "{value:#}");
-
-        let entries = ranking["entries"].as_array().expect("ranked entries");
-        assert_eq!(entries.len(), 2, "{value:#}");
-        assert_eq!(entries[0]["rank"], 1);
-        assert_eq!(entries[0]["outcome"], "satisfied");
-        assert_eq!(entries[0]["unsatisfied_conjuncts"], 0);
-        assert_eq!(entries[1]["rank"], 2);
-        assert_eq!(entries[1]["outcome"], "failed", "{value:#}");
-        assert_eq!(entries[1]["unsatisfied_conjuncts"], 1);
-        assert_eq!(entries[1]["failing_conjunct"], "root.name", "{value:#}");
-        assert_eq!(entries[1]["subject"]["type"], "candidate");
-        assert_eq!(entries[1]["subject"]["path"], "Widget.java");
-    }
-
-    /// A supplied list is ranked without any search, and the retention bound
-    /// reports what it removed.
-    #[test]
-    fn explain_policy_ranks_a_supplied_candidate_list_under_its_bounds() {
-        let (_temp, service) = service();
-        let value = service
-            .call_tool_value(
-                "explain_policy",
-                json!({
-                    "policy_files": ["policies/match.rqlp"],
-                    "near_misses": {
-                        "candidates": [
-                            { "path": "Widget.java", "byte_start": byte_offset("class Gadget"),
-                              "byte_end": byte_offset("class Gadget") + 12 },
-                            { "path": "Widget.java", "byte_start": byte_offset("class Widget"),
-                              "byte_end": byte_offset("class Widget") + 12 }
-                        ],
-                        "max_candidates": 1
-                    }
-                }),
-            )
-            .expect("explain_policy should rank a supplied list");
-        let ranking = &value["near_miss_ranking"];
-        assert_eq!(
-            ranking["enumeration"],
-            json!({ "type": "supplied", "supplied": 2 })
-        );
-        assert_eq!(ranking["candidates_considered"], 2, "{value:#}");
-        let entries = ranking["entries"].as_array().expect("ranked entries");
-        assert_eq!(entries.len(), 1, "{value:#}");
-        assert_eq!(entries[0]["unsatisfied_conjuncts"], 0, "{value:#}");
-        assert_eq!(ranking["truncation"]["candidates_truncated"], true);
-        assert_eq!(ranking["truncation"]["omitted_candidates_lower_bound"], 1);
-    }
-
     /// The near-miss form never means "search the repository": one of the two
     /// enumeration routes must be chosen explicitly.
     #[test]
@@ -2386,73 +2224,61 @@ mod explain_policy_tests {
         }
     }
 
-    /// A family with no adapter is a stated condition on the wire, and the
-    /// message names the families that do have one.
+    /// A taint candidate is a source position and a sink position (issue
+    /// 3686), so each half of a mismatched candidate shape is a stated
+    /// condition on the wire. A family with no adapter for a question is one
+    /// too, and the message names the families that do have one.
     #[test]
-    fn explain_policy_reports_an_unavailable_adapter_with_the_supported_families() {
+    fn explain_policy_states_the_candidate_shape_and_the_supported_families() {
         let (_temp, service) = service();
-        let error = service
-            .call_tool_value(
-                "explain_policy",
+        let position = json!({ "path": "Widget.java", "byte_start": 0 });
+        for (arguments, expected) in [
+            (
+                json!({ "policy_files": ["policies/taint.rqlp"], "candidate": position }),
+                "supply candidate_source",
+            ),
+            (
+                json!({ "policy_files": ["policies/match.rqlp"], "candidate_source": position }),
+                "requires candidate",
+            ),
+            (
+                json!({
+                    "policy_files": ["policies/match.rqlp"],
+                    "finding_id": "0".repeat(64),
+                    "candidate_source": position
+                }),
+                "requires candidate",
+            ),
+            (
+                json!({
+                    "policy_files": ["policies/match.rqlp"],
+                    "candidate": position,
+                    "candidate_source": position
+                }),
+                "applies only to flow and taint policies",
+            ),
+            (
                 json!({
                     "policy_files": ["policies/taint.rqlp"],
-                    "candidate": { "path": "Widget.java", "byte_start": 0 }
+                    "near_misses": { "enumerate_from_policy_seed": true }
                 }),
-            )
-            .expect_err("taint has no why-not adapter yet");
-        assert_eq!(error.code, SearchToolsServiceErrorCode::InvalidParams);
-        assert!(
-            error
-                .message
-                .contains("supported analysis types: match, assertion"),
-            "{}",
-            error.message
-        );
-    }
-
-    #[test]
-    fn explain_policy_rejects_a_malformed_finding_identity_and_a_bad_path() {
-        let (_temp, service) = service();
-        let bad_id = service
-            .call_tool_value(
-                "explain_policy",
-                json!({
-                    "policy_files": ["policies/match.rqlp"],
-                    "finding_id": "not-a-digest"
-                }),
-            )
-            .expect_err("a finding identity is a lowercase sha-256");
-        assert_eq!(bad_id.code, SearchToolsServiceErrorCode::InvalidParams);
-
-        let escaping = service
-            .call_tool_value(
-                "explain_policy",
-                json!({
-                    "policy_files": ["policies/match.rqlp"],
-                    "candidate": { "path": "../outside.java", "byte_start": 0 }
-                }),
-            )
-            .expect_err("a candidate stays inside the workspace");
-        assert!(
-            escaping.message.contains("not inside the workspace"),
-            "{}",
-            escaping.message
-        );
-
-        let reversed = service
-            .call_tool_value(
-                "explain_policy",
-                json!({
-                    "policy_files": ["policies/match.rqlp"],
-                    "candidate": { "path": "Widget.java", "byte_start": 9, "byte_end": 4 }
-                }),
-            )
-            .expect_err("a candidate range does not end before it starts");
-        assert!(
-            reversed.message.contains("exceeds end"),
-            "{}",
-            reversed.message
-        );
+                "supported analysis types: match, assertion",
+            ),
+        ] {
+            let error = service
+                .call_tool_value("explain_policy", arguments.clone())
+                .expect_err("a mismatched question is refused");
+            assert_eq!(
+                error.code,
+                SearchToolsServiceErrorCode::InvalidParams,
+                "{arguments}"
+            );
+            assert!(
+                error.message.contains(expected),
+                "{arguments}: {}",
+                error.message
+            );
+        }
     }
 
     /// Issue 3207 item 1. An agent that read a finding id under one workspace
@@ -2682,7 +2508,7 @@ fn mark_pack_acquisition_pending(
         return;
     }
     let message = match pack_activation {
-        SessionPackActivation::Settled(_) => return,
+        SessionPackActivation::Settled => return,
         SessionPackActivation::AcquisitionPending(state) => {
             let selected: Vec<Language> = match query_languages {
                 Some(Value::Array(labels)) => labels
@@ -2771,7 +2597,6 @@ mod pack_acquisition_pending_tests {
     fn pending_state(entries: &[(&str, &str)]) -> Arc<WorkspacePackActivationState> {
         Arc::new(WorkspacePackActivationState {
             config: None,
-            activation: None,
             ecosystems: Vec::new(),
             failure: None,
             pending_acquisitions: entries
@@ -2824,89 +2649,51 @@ mod pack_acquisition_pending_tests {
         crate::rql::CodeQuery::from_json(&query).expect("a valid pending-marker query")
     }
 
-    fn pure_structural_query() -> crate::rql::CodeQuery {
-        parsed_query(json!({
+    fn gson_class_selector() -> Value {
+        json!({
             "languages": ["java"],
             "where": ["Gson.java"],
             "match": { "kind": "class", "name": "Gson" }
-        }))
+        })
+    }
+
+    fn gson_class_query(steps: Value) -> Value {
+        let mut query = gson_class_selector();
+        query["steps"] = steps;
+        query
+    }
+
+    fn pure_structural_query() -> crate::rql::CodeQuery {
+        parsed_query(gson_class_selector())
     }
 
     fn semantic_query() -> crate::rql::CodeQuery {
-        parsed_query(json!({
-            "languages": ["java"],
-            "where": ["Gson.java"],
-            "match": { "kind": "class", "name": "Gson" },
-            "steps": [{ "op": "procedure_of" }]
-        }))
+        parsed_query(gson_class_query(json!([{ "op": "procedure_of" }])))
     }
 
     fn nested_pure_query() -> crate::rql::CodeQuery {
-        parsed_query(json!({
-            "union": [
-                {
-                    "languages": ["java"],
-                    "where": ["Gson.java"],
-                    "match": { "kind": "class", "name": "Gson" },
-                    "steps": [{ "op": "file_of" }]
-                },
-                {
-                    "languages": ["java"],
-                    "where": ["Gson.java"],
-                    "match": { "kind": "class", "name": "Gson" },
-                    "steps": [{ "op": "file_of" }]
-                }
-            ]
-        }))
+        let query = gson_class_query(json!([{ "op": "file_of" }]));
+        parsed_query(json!({ "union": [query.clone(), query] }))
     }
 
     fn nested_semantic_query() -> crate::rql::CodeQuery {
-        parsed_query(json!({
-            "union": [
-                {
-                    "languages": ["java"],
-                    "where": ["Gson.java"],
-                    "match": { "kind": "class", "name": "Gson" },
-                    "steps": [{ "op": "procedure_of" }]
-                },
-                {
-                    "languages": ["java"],
-                    "where": ["Gson.java"],
-                    "match": { "kind": "class", "name": "Gson" },
-                    "steps": [{ "op": "procedure_of" }]
-                }
-            ]
-        }))
-    }
-
-    fn unscoped_enclosing_decl_query() -> crate::rql::CodeQuery {
-        parsed_query(json!({
-            "languages": ["java"],
-            "match": { "kind": "class", "name": "Gson" },
-            "steps": [{ "op": "enclosing_decl" }]
-        }))
+        let query = gson_class_query(json!([{ "op": "procedure_of" }]));
+        parsed_query(json!({ "union": [query.clone(), query] }))
     }
 
     fn nested_mixed_query() -> crate::rql::CodeQuery {
         parsed_query(json!({
             "union": [
-                {
-                    "languages": ["java"],
-                    "where": ["Gson.java"],
-                    "match": { "kind": "class", "name": "Gson" },
-                    "steps": [{ "op": "file_of" }]
-                },
-                {
-                    "languages": ["java"],
-                    "where": ["Gson.java"],
-                    "match": { "kind": "class", "name": "Gson" },
-                    "steps": [{ "op": "enclosing_decl" }, { "op": "file_of" }]
-                }
+                gson_class_query(json!([{ "op": "file_of" }])),
+                gson_class_query(json!([{ "op": "enclosing_decl" }, { "op": "file_of" }]))
             ]
         }))
     }
 
     #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#3433: Issue #3433 fixed a semantic query over a pending language losing its typed pending state"
+    )]
     fn a_semantic_query_over_a_pending_language_carries_the_typed_pending_state() {
         let phase = SessionPackActivation::AcquisitionPending(pending_state(&[
             ("jvm", "jdk:25.0.4.1"),
@@ -2950,10 +2737,15 @@ mod pack_acquisition_pending_tests {
     }
 
     #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#3433: model-dependent near misses including unscoped enclosing_decl lost pending coverage"
+    )]
     fn model_dependent_near_misses_keep_pending_coverage() {
         let queries = [
             json!({"languages": ["java"], "match": {"kind": "class", "name": "External"}}),
             json!({"languages": ["java"], "match": {"kind": "class", "name": "External"},
+                "steps": [{"op": "enclosing_decl"}]}),
+            json!({"languages": ["java"], "match": {"kind": "class", "name": "Gson"},
                 "steps": [{"op": "enclosing_decl"}]}),
             json!({"languages": ["java"], "where": ["App.java"],
                 "match": {"kind": "call", "callee": {"name": "trim"}}}),
@@ -2981,18 +2773,9 @@ mod pack_acquisition_pending_tests {
     }
 
     #[test]
-    fn a_pure_structural_query_over_a_pending_language_is_unmarked() {
-        let phase = SessionPackActivation::AcquisitionPending(pending_state(&[("jvm", "jdk")]));
-        let response = mark(
-            &phase,
-            Some(&json!(["java"])),
-            &[Language::Java],
-            &pure_structural_query(),
-        );
-        assert!(marked_codes(&response).is_empty());
-    }
-
-    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#3433: Issue #3433 fixed file-scoped callee and receiver constraints being treated as a workspace-wide semantic query"
+    )]
     fn file_scoped_callee_and_receiver_constraints_remain_conservative() {
         let phase = SessionPackActivation::AcquisitionPending(pending_state(&[("jvm", "jdk")]));
         for query in [
@@ -3017,21 +2800,9 @@ mod pack_acquisition_pending_tests {
     }
 
     #[test]
-    fn an_unscoped_enclosing_decl_query_remains_pending() {
-        let phase = SessionPackActivation::AcquisitionPending(pending_state(&[("jvm", "jdk")]));
-        let response = mark(
-            &phase,
-            Some(&json!(["java"])),
-            &[Language::Java],
-            &unscoped_enclosing_decl_query(),
-        );
-        assert!(
-            marked_codes(&response)
-                .contains(&crate::rql::CodeQueryDiagnosticCode::SemanticPackAcquisitionPending)
-        );
-    }
-
-    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#3433: Issue #3433 fixed file and import-graph steps losing scoped pending state"
+    )]
     fn file_and_import_graph_steps_are_safe_for_scoped_declarations() {
         let phase = SessionPackActivation::AcquisitionPending(pending_state(&[("jvm", "jdk")]));
         let query = parsed_query(json!({
@@ -3049,6 +2820,9 @@ mod pack_acquisition_pending_tests {
     }
 
     #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#3433: Issue #3433 fixed an unsupported step falsely discharging pending semantic coverage"
+    )]
     fn disallowed_steps_remain_pending() {
         let phase = SessionPackActivation::AcquisitionPending(pending_state(&[("jvm", "jdk")]));
         for step in [
@@ -3071,6 +2845,9 @@ mod pack_acquisition_pending_tests {
     }
 
     #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#3433: Issue #3433 fixed one disallowed nested semantic branch failing to mark the combined query pending"
+    )]
     fn a_mixed_nested_query_marks_when_one_branch_is_disallowed() {
         let phase = SessionPackActivation::AcquisitionPending(pending_state(&[("jvm", "jdk")]));
         let response = mark(
@@ -3086,6 +2863,9 @@ mod pack_acquisition_pending_tests {
     }
 
     #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#3433: Issue #3433 fixed a semantic query in a language outside the pending set being marked pending"
+    )]
     fn a_semantic_query_outside_the_pending_languages_is_unmarked() {
         let phase = SessionPackActivation::AcquisitionPending(pending_state(&[("jvm", "jdk:25")]));
         let response = mark(
@@ -3107,6 +2887,9 @@ mod pack_acquisition_pending_tests {
     }
 
     #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#3433: Issue #3433 fixed an unfiltered semantic query ignoring a pending language present in the workspace"
+    )]
     fn an_unfiltered_semantic_query_marks_when_the_workspace_uses_a_pending_language() {
         let phase = SessionPackActivation::AcquisitionPending(pending_state(&[("npm", "lodash")]));
         let response = mark(
@@ -3122,6 +2905,9 @@ mod pack_acquisition_pending_tests {
     }
 
     #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#3433: Issue #3433 fixed nested pure structural branches inheriting unrelated pending model state"
+    )]
     fn nested_pure_structural_branches_do_not_mark() {
         let phase = SessionPackActivation::AcquisitionPending(pending_state(&[("jvm", "jdk")]));
         let response = mark(
@@ -3134,6 +2920,9 @@ mod pack_acquisition_pending_tests {
     }
 
     #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#3433: Issue #3433 fixed nested semantic branches losing the typed pending state"
+    )]
     fn a_nested_semantic_branch_carries_the_typed_pending_state() {
         let phase = SessionPackActivation::AcquisitionPending(pending_state(&[("jvm", "jdk")]));
         let response = mark(
@@ -3149,7 +2938,10 @@ mod pack_acquisition_pending_tests {
     }
 
     #[test]
-    fn a_warm_the_request_could_not_wait_for_marks_a_semantic_query() {
+    #[brokk_bifrost_test_macros::hardwon(
+        "#3433: pending semantic queries were unmarked or pure structural queries were marked"
+    )]
+    fn pending_semantic_queries_are_marked_while_pure_queries_are_unmarked() {
         let response = mark(
             &SessionPackActivation::WarmPending,
             Some(&json!(["rust"])),
@@ -3169,26 +2961,28 @@ mod pack_acquisition_pending_tests {
             &pure_structural_query(),
         );
         assert!(marked_codes(&pure).is_empty());
+
+        let acquisition_pure = mark(
+            &SessionPackActivation::AcquisitionPending(pending_state(&[("jvm", "jdk")])),
+            Some(&json!(["java"])),
+            &[Language::Java],
+            &pure_structural_query(),
+        );
+        assert!(marked_codes(&acquisition_pure).is_empty());
     }
 
     #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#3372: settled semantic-pack activation still marked query results incomplete"
+    )]
     fn a_settled_session_never_marks() {
-        let settled_none = mark(
-            &SessionPackActivation::Settled(None),
+        let settled = mark(
+            &SessionPackActivation::Settled,
             Some(&json!(["java"])),
             &[Language::Java],
             &semantic_query(),
         );
-        assert!(marked_codes(&settled_none).is_empty());
-
-        let settled = SessionPackActivation::Settled(Some(pending_state(&[])));
-        let response = mark(
-            &settled,
-            Some(&json!(["java"])),
-            &[Language::Java],
-            &semantic_query(),
-        );
-        assert!(marked_codes(&response).is_empty());
+        assert!(marked_codes(&settled).is_empty());
     }
 }
 
@@ -3315,7 +3109,8 @@ mod pack_input_change_tests {
     /// `Cargo.lock` and `rust-toolchain.toml` reach Rust analysis only through
     /// dependency and standard-library packs, so this refresh is what keeps
     /// them current: the Rust delegate is not routed either file (#3756).
-    /// `.cargo/config.toml` is read by nothing (#3768).
+    /// `.cargo/config.toml` is the reverse: the Rust delegate reads it for crate
+    /// cfg sets and routes, and pack discovery does not (#3768).
     #[test]
     fn rust_pack_inputs_refresh_pack_activation_and_cargo_config_does_not() {
         let root = std::env::temp_dir();
@@ -3342,12 +3137,14 @@ impl Drop for WorkspaceSession {
         // exits, so joining state publication alone would still let its SQLite
         // handles outlive the session.
         self.semantic_packs.wait_for_worker();
-        if let Some(handle) = self.usage_index_warm.take()
-            && let Err(panic) = handle.join()
-        {
+        let Some(handle) = self.usage_index_warm.take() else {
+            return;
+        };
+        if let Err(panic) = handle.join() {
             // The payload's own `Debug` is `Any { .. }`. A warm that failed
-            // leaves its index unpublished and the next query rebuilds it,
-            // so this is a diagnostic rather than a request failure.
+            // leaves its index unpublished and the next query rebuilds it, so
+            // this is a diagnostic rather than a request failure -- but it is
+            // only a diagnostic if it says what happened.
             eprintln!("{}", reported_panic("usage-index warm thread", panic));
         }
     }
@@ -3438,6 +3235,7 @@ fn decode_run_policy_arguments(
         packs: params.policy_packs,
         categories: params.policy_categories,
         policy_ids: params.policy_ids,
+        excluded_policy_ids: Vec::new(),
     };
     let selected = built_in_policy_catalog()
         .map_err(|error| {
@@ -3455,7 +3253,7 @@ fn decode_run_policy_arguments(
         .collect::<Vec<_>>();
     let mut built_in_inputs = selected
         .into_iter()
-        .map(|policy| PolicyEvaluationInput::embedded(policy.source_identity(), policy.source()))
+        .map(PolicyEvaluationInput::selected_builtin)
         .collect::<Vec<_>>();
     built_in_inputs.append(&mut policy_inputs);
     let policy_inputs = built_in_inputs;
@@ -3517,6 +3315,19 @@ fn decode_run_policy_arguments(
             )));
         }
         options = options.with_diff_base(revision);
+    }
+    if params.diff_scoped {
+        if options.diff_base().is_none() {
+            return Err(SearchToolsServiceError::invalid_params(
+                "run_policy diff_scoped requires diff_base",
+            ));
+        }
+        if !params.incremental.unwrap_or(true) {
+            return Err(SearchToolsServiceError::invalid_params(
+                "run_policy diff_scoped cannot be combined with incremental: false",
+            ));
+        }
+        options = options.with_range(PolicyRangeRequest::DiffBase);
     }
     Ok(DecodedRunPolicy {
         policy_inputs,
@@ -3652,8 +3463,7 @@ impl SearchToolsService {
         root: PathBuf,
         watcher_starter: WatcherStarter,
     ) -> Result<Self, String> {
-        let canonical = canonical_service_root(root)?;
-        let file_listing = Some(Arc::new(WorkspaceFileListingCache::new(canonical.clone())));
+        let (canonical, file_listing) = canonical_one_shot_root_and_listing_cache(root)?;
         Ok(Self::lazy(
             canonical,
             file_listing,
@@ -3710,10 +3520,10 @@ impl SearchToolsService {
         project: Arc<dyn Project>,
         config: AnalyzerConfig,
     ) -> Result<Self, String> {
-        let workspace =
-            WorkspaceAnalyzer::build_persisted_without_automatic_gc(Arc::clone(&project), config)
-                .map_err(|error| format!("Failed to build persisted workspace: {error}"))?;
-        Self::new_manual_from_workspace(project, workspace)
+        Self::new_manual_from_persisted_build_result(
+            Arc::clone(&project),
+            WorkspaceAnalyzer::build_persisted_without_automatic_gc(Arc::clone(&project), config),
+        )
     }
 
     /// Progress-reporting sibling of [`Self::new_manual_persisted_for_project`].
@@ -3725,12 +3535,22 @@ impl SearchToolsService {
     where
         F: Fn(crate::analyzer::BuildProgressEvent) + Send + Sync + 'static,
     {
-        let workspace = WorkspaceAnalyzer::build_persisted_without_automatic_gc_with_progress(
+        Self::new_manual_from_persisted_build_result(
             Arc::clone(&project),
-            config,
-            progress,
+            WorkspaceAnalyzer::build_persisted_without_automatic_gc_with_progress(
+                Arc::clone(&project),
+                config,
+                progress,
+            ),
         )
-        .map_err(|error| format!("Failed to build persisted workspace: {error}"))?;
+    }
+
+    fn new_manual_from_persisted_build_result<E: std::fmt::Display>(
+        project: Arc<dyn Project>,
+        result: Result<WorkspaceAnalyzer, E>,
+    ) -> Result<Self, String> {
+        let workspace =
+            result.map_err(|error| format!("Failed to build persisted workspace: {error}"))?;
         Self::new_manual_from_workspace(project, workspace)
     }
 
@@ -3747,24 +3567,13 @@ impl SearchToolsService {
             StartupIndexWarm::OnDemand,
             &watcher_starter,
         )?;
-        Ok(Self {
-            root: RwLock::new(Some(root)),
-            session: RwLock::new(Some(session)),
-            workspace_generation: AtomicU64::new(1),
-            flow_state: crate::flow::FlowWorkspaceState::new(),
-            query_protocols: RwLock::new(Default::default()),
-            query_value_flows: RwLock::new(Default::default()),
-            query_taint_results: RwLock::new(Default::default()),
-            pending_build: Mutex::new(None),
-            build_error: Mutex::new(None),
-            file_listing: RwLock::new(None),
-            update_strategy: UpdateStrategy::Manual,
-            startup_index_warm: StartupIndexWarm::OnDemand,
+        Ok(Self::with_session_state(
+            root,
+            Some(session),
+            None,
+            UpdateStrategy::Manual,
             watcher_starter,
-            diff_snapshot_object_dir: None,
-            diff_scoring: DiffScoringSession::default(),
-            workspace_scaled_query_limits: false,
-        })
+        ))
     }
 
     /// Clone the active session's workspace analyzer for read-only use.
@@ -3791,8 +3600,6 @@ impl SearchToolsService {
         policy_inputs: &[PolicyEvaluationInput],
         options: &PolicyEvaluationOptions,
     ) -> Result<PolicyBatchOutcome, String> {
-        self.settle_pack_activation(None)
-            .map_err(|error| error.to_string())?;
         loop {
             let generation = self.workspace_generation();
             let snapshot = self
@@ -3802,19 +3609,10 @@ impl SearchToolsService {
                 continue;
             }
             let result = {
+                // The coordinator analyzes this session's project under the
+                // policy configuration and activates the policy's semantic
+                // sources itself, as every entry point does (#3735).
                 let runtime = CodeIntelligenceRuntime::new(&snapshot, &self.flow_state, None);
-                // Policy settled the full warm before snapshotting, so the
-                // exact final activation is the state this scope carries.
-                let runtime = match &snapshot.pack_activation {
-                    SessionPackActivation::Settled(Some(state)) => runtime
-                        .with_host_activation_context(PolicyHostActivationContext::new(
-                            state.config.as_deref(),
-                            state.activation.as_deref(),
-                            &state.ecosystems,
-                            state.failure.as_deref(),
-                        )),
-                    _ => runtime,
-                };
                 runtime
                     .evaluate_policy_inputs(root, policy_inputs, options)
                     .map_err(|error| SearchToolsServiceError::internal(error.to_string()))
@@ -3980,9 +3778,7 @@ impl SearchToolsService {
         let arguments = serde_json::from_str::<Value>(arguments_json).map_err(|err| {
             SearchToolsServiceError::invalid_params(format!("Invalid JSON arguments: {err}"))
         })?;
-        let result = self
-            .call_tool_output(name, arguments, RenderOptions::default())?
-            .into_value();
+        let result = self.call_tool_value(name, arguments)?;
         serde_json::to_string(&result).map_err(|err| {
             SearchToolsServiceError::internal(format!("Failed to serialize tool result: {err}"))
         })
@@ -4060,10 +3856,7 @@ impl SearchToolsService {
             arguments,
             render_options,
             cancellation,
-            TransportTimings {
-                transport_queue_wait,
-                ..TransportTimings::default()
-            },
+            TransportTimings::with_queue_wait(transport_queue_wait),
         )
     }
 
@@ -4738,10 +4531,7 @@ impl SearchToolsService {
         self.execute_prepared_query_code_with_transport_timings(
             prepared,
             cancellation,
-            TransportTimings {
-                transport_queue_wait,
-                ..TransportTimings::default()
-            },
+            TransportTimings::with_queue_wait(transport_queue_wait),
         )
     }
 
@@ -5062,12 +4852,9 @@ impl SearchToolsService {
     /// A one-shot `--tool` process: build the workspace, answer one call, exit.
     ///
     /// No file watcher. Nothing in the process consumes a watch event before it
-    /// exits, and installing one is not free: `start_watcher` cost 0.37-0.40 s
-    /// of wall clock on the rustc tree, and its deliberate
-    /// `invalidate_cached_file_listing` then forced a **second** whole-workspace
-    /// walk (0.45 s) inside the tool call's own budget, because the listing the
-    /// build had just filled was dropped
-    /// (`.agents/docs/gate-cell-overhead-2026-08.md`).
+    /// exits. Starting a watcher also invalidates the listing the build just
+    /// filled, forcing a second whole-workspace walk with no benefit to a
+    /// process that exits after one call.
     ///
     /// The listing cache stays, which is the part that is not about watching: a
     /// process that exits cannot observe a change it would need to invalidate
@@ -5082,8 +4869,7 @@ impl SearchToolsService {
         root: PathBuf,
         watcher_starter: WatcherStarter,
     ) -> Result<Self, String> {
-        let canonical = canonical_service_root(root)?;
-        let file_listing = Some(Arc::new(WorkspaceFileListingCache::new(canonical.clone())));
+        let (canonical, file_listing) = canonical_one_shot_root_and_listing_cache(root)?;
         Self::new_synchronous(
             canonical,
             file_listing,
@@ -5097,8 +4883,7 @@ impl SearchToolsService {
         update_strategy: UpdateStrategy,
         watcher_starter: WatcherStarter,
     ) -> Result<Self, String> {
-        let canonical = canonical_service_root(root)?;
-        let file_listing = listing_cache_for(update_strategy, &canonical);
+        let (canonical, file_listing) = canonical_root_and_listing_cache(root, update_strategy)?;
         Self::new_synchronous(canonical, file_listing, update_strategy, watcher_starter)
     }
 
@@ -5122,24 +4907,13 @@ impl SearchToolsService {
             StartupIndexWarm::OnDemand,
             &watcher_starter,
         )?;
-        Ok(Self {
-            root: RwLock::new(Some(root)),
-            session: RwLock::new(Some(session)),
-            workspace_generation: AtomicU64::new(1),
-            flow_state: crate::flow::FlowWorkspaceState::new(),
-            query_protocols: RwLock::new(Default::default()),
-            query_value_flows: RwLock::new(Default::default()),
-            query_taint_results: RwLock::new(Default::default()),
-            pending_build: Mutex::new(None),
-            build_error: Mutex::new(None),
-            file_listing: RwLock::new(file_listing),
+        Ok(Self::with_session_state(
+            root,
+            Some(session),
+            file_listing,
             update_strategy,
-            startup_index_warm: StartupIndexWarm::OnDemand,
             watcher_starter,
-            diff_snapshot_object_dir: None,
-            diff_scoring: DiffScoringSession::default(),
-            workspace_scaled_query_limits: false,
-        })
+        ))
     }
 
     #[cfg(any(test, feature = "test-support"))]
@@ -5171,24 +4945,13 @@ impl SearchToolsService {
             StartupIndexWarm::OnDemand,
             &watcher_starter,
         )?;
-        Ok(Self {
-            root: RwLock::new(Some(root)),
-            session: RwLock::new(Some(session)),
-            workspace_generation: AtomicU64::new(1),
-            flow_state: crate::flow::FlowWorkspaceState::new(),
-            query_protocols: RwLock::new(Default::default()),
-            query_value_flows: RwLock::new(Default::default()),
-            query_taint_results: RwLock::new(Default::default()),
-            pending_build: Mutex::new(None),
-            build_error: Mutex::new(None),
-            file_listing: RwLock::new(file_listing),
+        Ok(Self::with_session_state(
+            root,
+            Some(session),
+            file_listing,
             update_strategy,
-            startup_index_warm: StartupIndexWarm::OnDemand,
             watcher_starter,
-            diff_snapshot_object_dir: None,
-            diff_scoring: DiffScoringSession::default(),
-            workspace_scaled_query_limits: false,
-        })
+        ))
     }
 
     fn new_lazy_with_strategy(
@@ -5207,8 +4970,7 @@ impl SearchToolsService {
         update_strategy: UpdateStrategy,
         watcher_starter: WatcherStarter,
     ) -> Result<Self, String> {
-        let canonical = canonical_service_root(root)?;
-        let file_listing = listing_cache_for(update_strategy, &canonical);
+        let (canonical, file_listing) = canonical_root_and_listing_cache(root, update_strategy)?;
         Ok(Self::lazy(
             canonical,
             file_listing,
@@ -5228,15 +4990,32 @@ impl SearchToolsService {
         update_strategy: UpdateStrategy,
         watcher_starter: WatcherStarter,
     ) -> Self {
+        Self::with_session_state(
+            canonical,
+            None,
+            file_listing,
+            update_strategy,
+            watcher_starter,
+        )
+    }
+
+    fn with_session_state(
+        root: PathBuf,
+        session: Option<WorkspaceSession>,
+        file_listing: Option<Arc<WorkspaceFileListingCache>>,
+        update_strategy: UpdateStrategy,
+        watcher_starter: WatcherStarter,
+    ) -> Self {
         Self {
-            root: RwLock::new(Some(canonical)),
-            session: RwLock::new(None),
+            root: RwLock::new(Some(root)),
+            session: RwLock::new(session),
             workspace_generation: AtomicU64::new(1),
             flow_state: crate::flow::FlowWorkspaceState::new(),
             query_protocols: RwLock::new(Default::default()),
             query_value_flows: RwLock::new(Default::default()),
             query_taint_results: RwLock::new(Default::default()),
             pending_build: Mutex::new(None),
+            build_progress: Arc::new(Default::default()),
             build_error: Mutex::new(None),
             file_listing: RwLock::new(file_listing),
             update_strategy,
@@ -5301,6 +5080,7 @@ impl SearchToolsService {
             query_value_flows: RwLock::new(Default::default()),
             query_taint_results: RwLock::new(Default::default()),
             pending_build: Mutex::new(None),
+            build_progress: Arc::new(Default::default()),
             build_error: Mutex::new(None),
             file_listing: RwLock::new(None),
             update_strategy,
@@ -5353,6 +5133,7 @@ impl SearchToolsService {
         // fill it while indexing is pending; installed below alongside `root`.
         let file_listing = listing_cache_for(update_strategy, &canonical);
         let build_file_listing = file_listing.clone();
+        let observation = self.build_progress.begin(generation);
         let handle = std::thread::Builder::new()
             .name("bifrost-index-build".to_string())
             .spawn(
@@ -5361,10 +5142,11 @@ impl SearchToolsService {
                     // uses (`gitblob::cache_db_path`): a linked worktree shares
                     // the primary checkout's oid-keyed database, so a client
                     // bind neither copies nor forks it (issue #1544).
-                    let (project, workspace) = build_persisted_workspace(
+                    let (project, workspace) = build_persisted_workspace_reporting(
                         build_root.clone(),
                         build_file_listing,
                         update_strategy,
+                        Some(&observation),
                     )?;
                     let session = assemble_session_deferred(
                         project,
@@ -5373,6 +5155,7 @@ impl SearchToolsService {
                         startup_index_warm,
                         &watcher_starter,
                     )?;
+                    observation.complete();
                     Ok((generation, build_root, session))
                 },
             )
@@ -5486,6 +5269,8 @@ impl SearchToolsService {
                 eprintln!("Failed to spawn commit-history warm thread: {error}");
             }
         }
+        let build_progress = Arc::new(crate::workspace_progress::WorkspaceBuildProgress::default());
+        let observation = build_progress.begin(1);
         let handle = std::thread::Builder::new()
             .name("bifrost-index-build".to_string())
             .spawn({
@@ -5499,6 +5284,7 @@ impl SearchToolsService {
                         Arc::clone(&project),
                         AnalyzerConfig::default(),
                         update_strategy,
+                        Some(&observation),
                     )
                     .map_err(|error| format!("Failed to build persisted workspace: {error}"))?;
                     let session = assemble_session_deferred(
@@ -5508,6 +5294,7 @@ impl SearchToolsService {
                         StartupIndexWarm::AtStartup,
                         &watcher_starter,
                     )?;
+                    observation.complete();
                     Ok((1, canonical, session))
                 }
             })
@@ -5521,6 +5308,7 @@ impl SearchToolsService {
             query_value_flows: RwLock::new(Default::default()),
             query_taint_results: RwLock::new(Default::default()),
             pending_build: Mutex::new(Some(handle)),
+            build_progress,
             build_error: Mutex::new(None),
             file_listing: RwLock::new(file_listing),
             update_strategy,
@@ -5658,6 +5446,21 @@ impl SearchToolsService {
         cancelled: &dyn Fn() -> bool,
     ) -> Result<(), SearchToolsServiceError> {
         self.wait_workspace_ready_until(cancelled, None)
+    }
+
+    pub(crate) fn initial_workspace_build_uninstalled(&self) -> bool {
+        match self.pending_build.try_lock() {
+            Ok(pending) => pending.is_some(),
+            Err(std::sync::TryLockError::WouldBlock) => true,
+            Err(std::sync::TryLockError::Poisoned(_)) => true,
+        }
+    }
+
+    pub(crate) fn workspace_build_progress(
+        &self,
+        generation: u64,
+    ) -> Option<crate::workspace_progress::BuildSnapshot> {
+        self.build_progress.snapshot(generation)
     }
 
     pub fn workspace_build_pending(&self) -> bool {
@@ -5839,8 +5642,12 @@ impl SearchToolsService {
             .analyzer()
             .project()
             .invalidate_cached_file_listing();
-        let next = session.snapshot.update_all();
+        let observation = self.build_progress.begin(self.workspace_generation());
+        let next = session
+            .snapshot
+            .update_all_with_progress(observation.sink());
         session.snapshot = Arc::new(next);
+        observation.complete();
         session.refresh_pack_activation();
         session.schedule_index_warm();
         Self::structured_only(refresh_result(session.snapshot.analyzer()))
@@ -5916,15 +5723,7 @@ impl SearchToolsService {
         let session = guard.as_mut().ok_or_else(Self::closed_error)?;
 
         if resolved == session.snapshot.analyzer().project().root() {
-            let usage_index_ready = session.usage_index_ready();
-            let semantic_packs_ready = session.semantic_packs.is_ready();
-            let session_subset = session_subset(session.snapshot.analyzer());
-            return active_workspace_result(
-                &resolved,
-                usage_index_ready,
-                semantic_packs_ready,
-                session_subset,
-            );
+            return active_workspace_result_for_session(&resolved, session);
         }
 
         // Fully assemble the replacement before mutating either active field so
@@ -5961,15 +5760,13 @@ impl SearchToolsService {
         self.advance_workspace_generation();
         let old_session = std::mem::replace(session, new_session);
         session.schedule_index_warm();
-        let usage_index_ready = session.usage_index_ready();
-        let semantic_packs_ready = session.semantic_packs.is_ready();
-        let session_subset = session_subset(session.snapshot.analyzer());
         *root = Some(resolved.clone());
         *self
             .file_listing
             .write()
             .map_err(|_| SearchToolsServiceError::internal("SearchToolsService lock poisoned"))? =
             new_file_listing;
+        let result = active_workspace_result_for_session(&resolved, session);
         drop(guard);
         drop(root);
         drop(old_session);
@@ -5977,12 +5774,7 @@ impl SearchToolsService {
         // The replacement session's background index warm has only just
         // started, so this reports the newly activated workspace's readiness,
         // not the closed one's.
-        active_workspace_result(
-            &resolved,
-            usage_index_ready,
-            semantic_packs_ready,
-            session_subset,
-        )
+        result
     }
 
     fn handle_get_active_workspace(
@@ -5995,12 +5787,7 @@ impl SearchToolsService {
             })?;
         let guard = self.read_session()?;
         let session = guard.as_ref().ok_or_else(Self::closed_error)?;
-        active_workspace_result(
-            session.snapshot.analyzer().project().root(),
-            session.usage_index_ready(),
-            session.semantic_packs.is_ready(),
-            session_subset(session.snapshot.analyzer()),
-        )
+        active_workspace_result_for_session(session.snapshot.analyzer().project().root(), session)
     }
 
     /// Read-first snapshot acquisition: the exclusive session lock is only
@@ -6053,40 +5840,6 @@ impl SearchToolsService {
         ))
     }
 
-    /// Wait for a deferred semantic-pack warm to settle fully, then report.
-    ///
-    /// Policy evaluation hands the settled activation to the runtime, so it
-    /// waits here rather than reading whatever the session happened to have
-    /// when its snapshot was taken. Nothing else waits for the full settle:
-    /// the query path awaits only the warm's cheap installed stage
-    /// ([`Self::settle_installed_pack_stage`], issue #3401), and the readiness
-    /// barrier that publishes the session deliberately excludes the warm
-    /// entirely (issue #3372).
-    ///
-    /// Two callers do not wait. One whose budget is already gone reports its
-    /// deadline through the snapshot path, and one whose workspace is still
-    /// being built has no warm to wait for yet; both must reach the same
-    /// canonical answer they reached before this warm existed. The session lock
-    /// is released before waiting, because the warm can take seconds and every
-    /// other caller has to keep working.
-    fn settle_pack_activation(
-        &self,
-        cancellation: Option<&CancellationToken>,
-    ) -> Result<(), SearchToolsServiceError> {
-        if cancellation.is_some_and(|token| token.is_cancelled() || token.is_timed_out()) {
-            return Ok(());
-        }
-        let semantic_packs = {
-            let guard = self.read_session()?;
-            match guard.as_ref() {
-                Some(session) => Arc::clone(&session.semantic_packs),
-                None => return Ok(()),
-            }
-        };
-        semantic_packs.wait();
-        Ok(())
-    }
-
     /// Wait for the warm's installed stage, then report.
     ///
     /// Every query tool reaches its snapshot through
@@ -6107,8 +5860,8 @@ impl SearchToolsService {
     /// on every request path would move where existing cancellation budgets
     /// fire. A cancelled-but-not-yet-timed-out request simply waits for this
     /// bounded stage and reports through its own later checkpoints. The
-    /// session lock is released before waiting, exactly as in
-    /// [`Self::settle_pack_activation`].
+    /// session lock is released before waiting, because the stage can take a
+    /// moment and every other caller has to keep working.
     fn settle_installed_pack_stage(
         &self,
         cancellation: Option<&CancellationToken>,
@@ -6372,9 +6125,7 @@ impl SearchToolsService {
         P: serde::de::DeserializeOwned,
         R: Serialize,
     {
-        let params = serde_json::from_value::<P>(arguments).map_err(|err| {
-            SearchToolsServiceError::invalid_params(format!("Invalid tool arguments: {err}"))
-        })?;
+        let params = Self::decode_tool_params(arguments)?;
         let result = handler(workspace, params);
         match serde_json::to_value(result).map_err(|err| {
             SearchToolsServiceError::internal(format!("Failed to serialize tool result: {err}"))
@@ -6498,18 +6249,12 @@ impl SearchToolsService {
         P: serde::de::DeserializeOwned,
         R: Serialize + RenderText,
     {
-        let params = serde_json::from_value::<P>(arguments).map_err(|err| {
-            SearchToolsServiceError::invalid_params(format!("Invalid tool arguments: {err}"))
-        })?;
-        let result = handler(workspace, params);
-        let rendered_text = result.render_text(render_options);
-        let structured = serde_json::to_value(result).map_err(|err| {
-            SearchToolsServiceError::internal(format!("Failed to serialize tool result: {err}"))
-        })?;
-        Ok(ToolOutput::Structured {
-            structured,
-            rendered_text: Some(rendered_text),
-        })
+        Self::decode_render_and_try_run(
+            workspace,
+            arguments,
+            render_options,
+            |workspace, params| Ok(handler(workspace, params)),
+        )
     }
 
     fn decode_render_and_try_run<P, R>(
@@ -6522,9 +6267,7 @@ impl SearchToolsService {
         P: serde::de::DeserializeOwned,
         R: Serialize + RenderText,
     {
-        let params = serde_json::from_value::<P>(arguments).map_err(|err| {
-            SearchToolsServiceError::invalid_params(format!("Invalid tool arguments: {err}"))
-        })?;
+        let params = Self::decode_tool_params(arguments)?;
         let result = handler(workspace, params).map_err(SearchToolsServiceError::invalid_params)?;
         let rendered_text = result.render_text(render_options);
         let structured = serde_json::to_value(result).map_err(|err| {
@@ -6536,6 +6279,26 @@ impl SearchToolsService {
         })
     }
 
+    fn decode_tool_params<P: serde::de::DeserializeOwned>(
+        arguments: Value,
+    ) -> Result<P, SearchToolsServiceError> {
+        serde_json::from_value::<P>(arguments).map_err(|err| {
+            SearchToolsServiceError::invalid_params(format!("Invalid tool arguments: {err}"))
+        })
+    }
+
+    fn policy_suppression_preflight(
+        &self,
+        options: &PolicyEvaluationOptions,
+    ) -> Result<crate::policy::PolicySuppressionPreflight, SearchToolsServiceError> {
+        let root = self.service_root()?;
+        crate::policy::preflight_policy_suppressions(&root, options).map_err(|error| {
+            SearchToolsServiceError::internal(format!(
+                "run_policy suppression preflight failed: {error}"
+            ))
+        })
+    }
+
     pub(crate) fn preflight_run_policy(
         &self,
         arguments: &Value,
@@ -6544,13 +6307,7 @@ impl SearchToolsService {
         let decoded = decode_run_policy_arguments(arguments.clone())?;
         let selection_elapsed = selection_started.elapsed();
         let preflight_started = Instant::now();
-        let root = self.service_root()?;
-        let preflight = crate::policy::preflight_policy_suppressions(&root, &decoded.options)
-            .map_err(|error| {
-                SearchToolsServiceError::internal(format!(
-                    "run_policy suppression preflight failed: {error}"
-                ))
-            })?;
+        let preflight = self.policy_suppression_preflight(&decoded.options)?;
         let preflight_elapsed = preflight_started.elapsed();
         if preflight.is_valid() {
             return Ok(RunPolicyPreflight::Valid(PreparedRunPolicyPreflight {
@@ -6617,13 +6374,7 @@ impl SearchToolsService {
                 ),
                 None => {
                     let preflight_started = Instant::now();
-                    let root = self.service_root()?;
-                    let preflight = crate::policy::preflight_policy_suppressions(&root, &options)
-                        .map_err(|error| {
-                        SearchToolsServiceError::internal(format!(
-                            "run_policy suppression preflight failed: {error}"
-                        ))
-                    })?;
+                    let preflight = self.policy_suppression_preflight(&options)?;
                     (
                         preflight,
                         decode_selection_elapsed,
@@ -6680,7 +6431,6 @@ impl SearchToolsService {
             snapshot_started,
             include_stage_timings,
         } = preparation;
-        self.settle_pack_activation(cancellation)?;
         loop {
             let workspace_generation = self.workspace_generation();
             let snapshot_result = {
@@ -6827,19 +6577,10 @@ impl SearchToolsService {
         } = prepared;
         let result = (|| {
             let _scope = profiling::scope("run_policy.evaluate_policy_inputs");
+            // The coordinator analyzes this session's project under the policy
+            // configuration and activates the policy's semantic sources itself,
+            // as every entry point does (#3735).
             let runtime = CodeIntelligenceRuntime::new(&snapshot, &self.flow_state, cancellation);
-            // Policy settled the full warm before snapshotting, so the exact
-            // final activation is the state this scope carries.
-            let runtime = match &snapshot.pack_activation {
-                SessionPackActivation::Settled(Some(state)) => runtime
-                    .with_host_activation_context(PolicyHostActivationContext::new(
-                        state.config.as_deref(),
-                        state.activation.as_deref(),
-                        &state.ecosystems,
-                        state.failure.as_deref(),
-                    )),
-                _ => runtime,
-            };
             // The head evaluation is the other long stretch of a policy
             // request: name it so a budgeted host reports the phase that spent
             // the budget rather than the tool (issue #3170).
@@ -6892,12 +6633,19 @@ impl SearchToolsService {
     }
 
     fn structured_only<R: Serialize>(result: R) -> Result<ToolOutput, SearchToolsServiceError> {
+        Self::structured_output(result, None)
+    }
+
+    fn structured_output<R: Serialize>(
+        result: R,
+        rendered_text: Option<String>,
+    ) -> Result<ToolOutput, SearchToolsServiceError> {
         let structured = serde_json::to_value(result).map_err(|err| {
             SearchToolsServiceError::internal(format!("Failed to serialize tool result: {err}"))
         })?;
         Ok(ToolOutput::Structured {
             structured,
-            rendered_text: None,
+            rendered_text,
         })
     }
 
@@ -6906,13 +6654,7 @@ impl SearchToolsService {
         render_options: RenderOptions,
     ) -> Result<ToolOutput, SearchToolsServiceError> {
         let rendered_text = result.render_text(render_options);
-        let structured = serde_json::to_value(result).map_err(|err| {
-            SearchToolsServiceError::internal(format!("Failed to serialize tool result: {err}"))
-        })?;
-        Ok(ToolOutput::Structured {
-            structured,
-            rendered_text: Some(rendered_text),
-        })
+        Self::structured_output(result, Some(rendered_text))
     }
 
     fn read_session(
@@ -6990,7 +6732,7 @@ impl SearchToolsService {
 
     fn unbound_error() -> SearchToolsServiceError {
         SearchToolsServiceError::internal(
-            "Bifrost is not bound to a workspace. The MCP client must provide an approved filesystem root via roots/list, or configure Bifrost with --root or BIFROST_WORKSPACE_ROOT.",
+            "Bifrost is not bound to a workspace. The MCP client must provide an approved filesystem root via roots/list, or the server must be started with --root <path>. activate_workspace cannot bind an unbound server.",
         )
     }
 }
@@ -7055,6 +6797,23 @@ fn canonical_service_root(root: PathBuf) -> Result<PathBuf, String> {
     Ok(canonical)
 }
 
+fn canonical_root_and_listing_cache(
+    root: PathBuf,
+    update_strategy: UpdateStrategy,
+) -> Result<(PathBuf, Option<Arc<WorkspaceFileListingCache>>), String> {
+    let canonical = canonical_service_root(root)?;
+    let file_listing = listing_cache_for(update_strategy, &canonical);
+    Ok((canonical, file_listing))
+}
+
+fn canonical_one_shot_root_and_listing_cache(
+    root: PathBuf,
+) -> Result<(PathBuf, Option<Arc<WorkspaceFileListingCache>>), String> {
+    let canonical = canonical_service_root(root)?;
+    let file_listing = Arc::new(WorkspaceFileListingCache::new(canonical.clone()));
+    Ok((canonical, Some(file_listing)))
+}
+
 fn build_project(
     root: PathBuf,
     listing: Option<Arc<WorkspaceFileListingCache>>,
@@ -7072,6 +6831,15 @@ fn build_persisted_workspace(
     listing: Option<Arc<WorkspaceFileListingCache>>,
     update_strategy: UpdateStrategy,
 ) -> Result<(Arc<dyn Project>, WorkspaceAnalyzer), String> {
+    build_persisted_workspace_reporting(root, listing, update_strategy, None)
+}
+
+fn build_persisted_workspace_reporting(
+    root: PathBuf,
+    listing: Option<Arc<WorkspaceFileListingCache>>,
+    update_strategy: UpdateStrategy,
+    observation: Option<&crate::workspace_progress::BuildObservation>,
+) -> Result<(Arc<dyn Project>, WorkspaceAnalyzer), String> {
     let _scope = profiling::scope("mcp_cold.analyzer_construction");
     let cache_path = crate::gitblob::cache_db_path(&root);
     crate::cache_db::validate_writable_cache_filesystem(&cache_path)
@@ -7081,6 +6849,7 @@ fn build_persisted_workspace(
         Arc::clone(&project),
         AnalyzerConfig::default(),
         update_strategy,
+        observation,
     )
     .map_err(|error| format!("Failed to build persisted workspace: {error}"))?;
     Ok((project, workspace))
@@ -7090,7 +6859,24 @@ fn build_persisted_analyzer(
     project: Arc<dyn Project>,
     config: AnalyzerConfig,
     update_strategy: UpdateStrategy,
+    observation: Option<&crate::workspace_progress::BuildObservation>,
 ) -> Result<WorkspaceAnalyzer, crate::analyzer::store::StoreError> {
+    if let Some(observation) = observation {
+        return match update_strategy {
+            UpdateStrategy::WatchFiles => WorkspaceAnalyzer::build_persisted_with_progress(
+                project,
+                config,
+                observation.sink(),
+            ),
+            UpdateStrategy::Manual => {
+                WorkspaceAnalyzer::build_persisted_without_automatic_gc_with_progress(
+                    project,
+                    config,
+                    observation.sink(),
+                )
+            }
+        };
+    }
     match update_strategy {
         UpdateStrategy::WatchFiles => WorkspaceAnalyzer::build_persisted(project, config),
         UpdateStrategy::Manual => {
@@ -7113,6 +6899,27 @@ fn build_ephemeral_workspace(
     Ok((project, workspace))
 }
 
+/// Share environment loading and failure reporting across the activation stages.
+fn activate_session_pack_stage<T>(
+    project_root: &Path,
+    workspace: &WorkspaceAnalyzer,
+    activate: impl FnOnce(
+        &Path,
+        &WorkspaceAnalyzer,
+        Option<ConfiguredSemanticModels>,
+    ) -> Result<T, String>,
+) -> Option<T> {
+    match configured_semantic_models()
+        .and_then(|configured| activate(project_root, workspace, configured))
+    {
+        Ok(state) => Some(state),
+        Err(error) => {
+            eprintln!("bifrost: workspace semantic-pack activation unavailable: {error}");
+            None
+        }
+    }
+}
+
 /// Resolve and activate this workspace's semantic packs, reporting an
 /// unavailable activation the way every other caller does: as a stated failure
 /// on stderr with no active set, never as a silent one.
@@ -7120,15 +6927,8 @@ fn activate_session_semantic_packs(
     project_root: &Path,
     workspace: &WorkspaceAnalyzer,
 ) -> Option<Arc<WorkspacePackActivationState>> {
-    match configured_semantic_models().and_then(|configured| {
-        activate_configured_semantic_models(project_root, workspace, configured)
-    }) {
-        Ok(state) => Some(Arc::new(state)),
-        Err(error) => {
-            eprintln!("bifrost: workspace semantic-pack activation unavailable: {error}");
-            None
-        }
-    }
+    activate_session_pack_stage(project_root, workspace, activate_configured_semantic_models)
+        .map(Arc::new)
 }
 
 /// The installed-pack stage of [`activate_session_semantic_packs`]: the cheap
@@ -7139,15 +6939,11 @@ fn activate_session_installed_semantic_packs(
     project_root: &Path,
     workspace: &WorkspaceAnalyzer,
 ) -> Option<InstalledPackStageOutcome> {
-    match configured_semantic_models().and_then(|configured| {
-        activate_configured_semantic_models_installed_stage(project_root, workspace, configured)
-    }) {
-        Ok(outcome) => Some(outcome),
-        Err(error) => {
-            eprintln!("bifrost: workspace semantic-pack activation unavailable: {error}");
-            None
-        }
-    }
+    activate_session_pack_stage(
+        project_root,
+        workspace,
+        activate_configured_semantic_models_installed_stage,
+    )
 }
 
 /// Assemble a `WorkspaceSession` from a built project + analyzer: wrap the
@@ -7362,6 +7158,52 @@ fn active_workspace_result(
     })
 }
 
+fn active_workspace_result_for_session(
+    root: &Path,
+    session: &WorkspaceSession,
+) -> Result<ToolOutput, SearchToolsServiceError> {
+    active_workspace_result(
+        root,
+        session.usage_index_ready(),
+        session.semantic_packs.is_ready(),
+        session_subset(session.snapshot.analyzer()),
+    )
+}
+
+#[cfg(test)]
+fn test_workspace(file: &str, source: &str) -> (tempfile::TempDir, PathBuf) {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().canonicalize().unwrap();
+    std::fs::write(root.join(file), source).unwrap();
+    (temp, root)
+}
+
+#[cfg(test)]
+fn unbound_test_service(
+    update_strategy: UpdateStrategy,
+    watcher_starter: WatcherStarter,
+) -> SearchToolsService {
+    SearchToolsService {
+        root: RwLock::new(None),
+        session: RwLock::new(None),
+        workspace_generation: AtomicU64::new(0),
+        flow_state: crate::flow::FlowWorkspaceState::new(),
+        query_protocols: RwLock::new(Default::default()),
+        query_value_flows: RwLock::new(Default::default()),
+        query_taint_results: RwLock::new(Default::default()),
+        pending_build: Mutex::new(None),
+        build_progress: Arc::new(Default::default()),
+        build_error: Mutex::new(None),
+        file_listing: RwLock::new(None),
+        update_strategy,
+        startup_index_warm: StartupIndexWarm::AtStartup,
+        watcher_starter,
+        diff_snapshot_object_dir: None,
+        diff_scoring: DiffScoringSession::default(),
+        workspace_scaled_query_limits: false,
+    }
+}
+
 #[cfg(test)]
 mod watcher_startup_tests {
     use super::*;
@@ -7375,10 +7217,8 @@ mod watcher_startup_tests {
     const WATCHER_FAILURE: &str = "injected watcher startup failure";
 
     fn workspace(file: &str, source: &str) -> (tempfile::TempDir, PathBuf) {
-        let temp = tempfile::tempdir().unwrap();
-        std::fs::write(temp.path().join(file), source).unwrap();
-        let root = temp.path().canonicalize().unwrap().normalize();
-        (temp, root)
+        let (temp, root) = super::test_workspace(file, source);
+        (temp, root.normalize())
     }
 
     fn failing_starter(calls: Arc<AtomicUsize>) -> WatcherStarter {
@@ -7389,24 +7229,7 @@ mod watcher_startup_tests {
     }
 
     fn unbound_watching_service(starter: WatcherStarter) -> SearchToolsService {
-        SearchToolsService {
-            root: RwLock::new(None),
-            session: RwLock::new(None),
-            workspace_generation: AtomicU64::new(0),
-            flow_state: crate::flow::FlowWorkspaceState::new(),
-            query_protocols: RwLock::new(Default::default()),
-            query_value_flows: RwLock::new(Default::default()),
-            query_taint_results: RwLock::new(Default::default()),
-            pending_build: Mutex::new(None),
-            build_error: Mutex::new(None),
-            file_listing: RwLock::new(None),
-            update_strategy: UpdateStrategy::WatchFiles,
-            startup_index_warm: StartupIndexWarm::AtStartup,
-            watcher_starter: starter,
-            diff_snapshot_object_dir: None,
-            diff_scoring: DiffScoringSession::default(),
-            workspace_scaled_query_limits: false,
-        }
+        super::unbound_test_service(UpdateStrategy::WatchFiles, starter)
     }
 
     fn assert_watcher_error(error: &SearchToolsServiceError) {
@@ -7415,18 +7238,52 @@ mod watcher_startup_tests {
         assert!(error.message.contains(WATCHER_FAILURE));
     }
 
+    fn assert_one_shot_cache_is_shared_and_watcher_free(
+        service: &SearchToolsService,
+        watcher_starts: &AtomicUsize,
+    ) {
+        assert_eq!(
+            0,
+            watcher_starts.load(Ordering::SeqCst),
+            "a one-shot process must not install a file watcher"
+        );
+        let listing = service
+            .file_listing
+            .read()
+            .unwrap()
+            .clone()
+            .expect("a one-shot service shares one listing cache");
+        assert_eq!(
+            1,
+            listing.walk_count(),
+            "the workspace must be walked once for the whole process"
+        );
+    }
+
+    fn assert_watcher_startup_failure_is_retained(
+        service: &SearchToolsService,
+        watcher_starts: &AtomicUsize,
+    ) {
+        for _ in 0..2 {
+            let error = service
+                .call_tool_value("get_active_workspace", json!({}))
+                .unwrap_err();
+            assert_watcher_error(&error);
+        }
+        assert_eq!(watcher_starts.load(Ordering::SeqCst), 1);
+    }
+
     /// A one-shot `--tool` process installs no watcher and walks the workspace
     /// exactly once.
     ///
-    /// Both halves were measured on the rustc tree
-    /// (`.agents/docs/gate-cell-overhead-2026-08.md`): `start_watcher` cost
-    /// 0.37-0.40 s of wall clock outside the tool's budget, and the
-    /// `invalidate_cached_file_listing` it performs to close its own event-
-    /// coverage gap threw away the listing the build had just filled, so the
-    /// next consumer re-walked the whole tree (0.45 s) *inside* the budget.
-    /// Neither buys a process that exits anything: nothing consumes a watch
-    /// event before exit.
+    /// Nothing consumes a watch event before exit. Starting a watcher would
+    /// invalidate the listing built during startup and force the next consumer
+    /// to walk the workspace again, without helping a process that exits after
+    /// one call.
     #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "ee7c68aa9a94: Commit ee7c68aa9a94 removed the watcher startup and duplicate workspace walk from one-shot tool calls"
+    )]
     fn a_one_shot_service_starts_no_watcher_and_walks_the_workspace_once() {
         let (_temp, root) = workspace("OneShot.java", "class OneShot {}\n");
         let calls = Arc::new(AtomicUsize::new(0));
@@ -7443,11 +7300,6 @@ mod watcher_startup_tests {
 
         let service = SearchToolsService::new_one_shot_with_watcher_starter(root, starter).unwrap();
 
-        assert_eq!(
-            0,
-            calls.load(Ordering::SeqCst),
-            "a one-shot process must not install a file watcher"
-        );
         {
             let guard = service.session.read().unwrap();
             let session = guard.as_ref().expect("a one-shot service is built eagerly");
@@ -7465,17 +7317,7 @@ mod watcher_startup_tests {
                 .expect("workspace listing");
         }
 
-        let listing = service
-            .file_listing
-            .read()
-            .unwrap()
-            .clone()
-            .expect("a one-shot service shares one listing cache");
-        assert_eq!(
-            1,
-            listing.walk_count(),
-            "the workspace must be walked once for the whole process"
-        );
+        assert_one_shot_cache_is_shared_and_watcher_free(&service, &calls);
     }
 
     /// A workspace-independent one-shot tool is lazy, but "lazy" is not "never
@@ -7485,6 +7327,9 @@ mod watcher_startup_tests {
     /// seconds in 129 walks. The walk count is the observable form of that
     /// defect, so it is what this pins.
     #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "a456913fc052: Commit a456913fc052 fixed workspace-independent one-shot requests re-walking the entire tree for every ignore probe"
+    )]
     fn a_workspace_independent_one_shot_service_walks_the_workspace_once() {
         let (_temp, root) = workspace("Independent.java", "class Independent {}\n");
         let calls = Arc::new(AtomicUsize::new(0));
@@ -7517,22 +7362,7 @@ mod watcher_startup_tests {
             }
         }
 
-        assert_eq!(
-            0,
-            calls.load(Ordering::SeqCst),
-            "a one-shot process must not install a file watcher"
-        );
-        let listing = service
-            .file_listing
-            .read()
-            .unwrap()
-            .clone()
-            .expect("a one-shot workspace-independent service shares one listing cache");
-        assert_eq!(
-            1,
-            listing.walk_count(),
-            "the workspace must be walked once for the whole process"
-        );
+        assert_one_shot_cache_is_shared_and_watcher_free(&service, &calls);
     }
 
     /// The other side of the distinction above: a long-lived `Manual` service
@@ -7541,6 +7371,9 @@ mod watcher_startup_tests {
     /// listing there is user-visible across requests.
     #[cfg_attr(not(scheduled_tests), ignore = "scheduled-only")]
     #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "a456913fc052: Commit a456913fc052 kept long-lived manual sessions from retaining an uninvalidatable stale listing cache"
+    )]
     fn a_long_lived_manual_service_carries_no_listing_cache() {
         let (_temp, root) = workspace("Manual.java", "class Manual {}\n");
         let service = SearchToolsService::new_deferred_manual(root).unwrap();
@@ -7551,6 +7384,9 @@ mod watcher_startup_tests {
     }
 
     #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#847: a watcher startup error must be reported instead of opening a watch-mode service"
+    )]
     fn eager_watching_service_reports_watcher_startup_failure() {
         let (_temp, root) = workspace("Eager.java", "class Eager {}\n");
         let calls = Arc::new(AtomicUsize::new(0));
@@ -7570,6 +7406,9 @@ mod watcher_startup_tests {
     }
 
     #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#847: lazy startup must retain its watcher failure instead of publishing a partial session"
+    )]
     fn lazy_watching_service_retains_watcher_startup_failure() {
         let (_temp, root) = workspace("Lazy.java", "class Lazy {}\n");
         let calls = Arc::new(AtomicUsize::new(0));
@@ -7580,16 +7419,13 @@ mod watcher_startup_tests {
         )
         .unwrap();
 
-        for _ in 0..2 {
-            let error = service
-                .call_tool_value("get_active_workspace", json!({}))
-                .unwrap_err();
-            assert_watcher_error(&error);
-        }
-        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_watcher_startup_failure_is_retained(&service, &calls);
     }
 
     #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#847: concurrent first use must publish one watcher/session outcome"
+    )]
     fn concurrent_lazy_first_use_publishes_one_session_outcome() {
         const CALLERS: usize = 8;
         // Under the full library suite, persisted workspace construction can
@@ -7657,6 +7493,9 @@ mod watcher_startup_tests {
     }
 
     #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#847: deferred startup must surface and retain watcher failure"
+    )]
     fn deferred_watching_service_retains_watcher_startup_failure() {
         let (_temp, root) = workspace("Deferred.java", "class Deferred {}\n");
         let calls = Arc::new(AtomicUsize::new(0));
@@ -7666,13 +7505,7 @@ mod watcher_startup_tests {
         )
         .unwrap();
 
-        for _ in 0..2 {
-            let error = service
-                .call_tool_value("get_active_workspace", json!({}))
-                .unwrap_err();
-            assert_watcher_error(&error);
-        }
-        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_watcher_startup_failure_is_retained(&service, &calls);
     }
 
     #[test]
@@ -7804,6 +7637,9 @@ mod watcher_startup_tests {
     }
 
     #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#2542: Kotlin cold startup work must remain attributed to MCP transport phases"
+    )]
     fn profiled_query_reports_transport_wait_components() {
         let (_temp, root) = workspace("SplitQueued.java", "class SplitQueued {}\n");
         let service =
@@ -7844,6 +7680,9 @@ mod watcher_startup_tests {
     }
 
     #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#2923: Issue #2923 added and fixed forwarding analyzer build progress through the persisted manual service"
+    )]
     fn persisted_manual_service_forwards_analyzer_build_progress() {
         let (_temp, root) = workspace("Progress.js", "export const answer = 42;\n");
         let project: Arc<dyn Project> =
@@ -7864,6 +7703,9 @@ mod watcher_startup_tests {
     }
 
     #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#2923: Issue #2923 fixed the observer not receiving the final canonical policy runs"
+    )]
     fn policy_observer_receives_the_final_canonical_runs() {
         let (_temp, root) = workspace("Observed.js", "eval(userInput);\n");
         let service =
@@ -7877,9 +7719,7 @@ mod watcher_startup_tests {
             .expect("select policy");
         let inputs = selected
             .into_iter()
-            .map(|policy| {
-                PolicyEvaluationInput::embedded(policy.source_identity(), policy.source())
-            })
+            .map(PolicyEvaluationInput::selected_builtin)
             .collect::<Vec<_>>();
         let options = PolicyEvaluationOptions::new(
             PolicyEvaluationDate::from_ymd(2026, 9, 3).expect("fixed date"),
@@ -7900,6 +7740,9 @@ mod watcher_startup_tests {
     /// The selectors intersect, so the report carries a single run instead of
     /// the whole pack's runs filtered afterwards.
     #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#2923: pack and policy-id selectors must intersect instead of running the whole pack"
+    )]
     fn issue_2923_a_pack_and_an_id_evaluate_only_that_policy() {
         let (_temp, root) = workspace("Observed.js", "eval(userInput);\n");
         let service = SearchToolsService::new_manual_ephemeral(root).expect("manual service");
@@ -7964,6 +7807,9 @@ mod watcher_startup_tests {
     }
 
     #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#1296: a run_policy deadline must return the canonical unreliable report"
+    )]
     fn issue_1296_run_policy_snapshot_deadline_returns_canonical_report() {
         let (_temp, root) = workspace("DeferredPolicy.java", "class DeferredPolicy {}\n");
         let (startup_started_tx, startup_started_rx) = mpsc::channel();
@@ -8009,7 +7855,7 @@ mod watcher_startup_tests {
 
         assert_eq!(result.status, "unreliable");
         assert_eq!(result.exit_status, POLICY_EXIT_UNRELIABLE);
-        assert_eq!(result.report.schema_version(), 5);
+        assert_eq!(result.report.schema_version(), 6);
         assert!(result.report.rules().is_empty());
         assert!(result.report.runs().is_empty());
         assert_eq!(
@@ -8060,6 +7906,9 @@ mod watcher_startup_tests {
     }
 
     #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "65092f1ba920: malformed suppressions must fail before deferred readiness work"
+    )]
     fn malformed_suppressions_fail_before_deferred_snapshot_readiness() {
         let (_temp, root) = workspace("MalformedPolicy.java", "class MalformedPolicy {}\n");
         let suppression_path = root.join(".bifrost/suppressions.json");
@@ -8103,7 +7952,7 @@ mod watcher_startup_tests {
         };
         assert_eq!(result.status, "unreliable");
         assert_eq!(result.exit_status, POLICY_EXIT_UNRELIABLE);
-        assert_eq!(result.report.schema_version(), 5);
+        assert_eq!(result.report.schema_version(), 6);
         assert!(result.report.rules().is_empty());
         assert!(result.report.runs().is_empty());
         assert_eq!(result.report.diagnostics().len(), 1);
@@ -8141,6 +7990,9 @@ mod watcher_startup_tests {
     }
 
     #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "65092f1ba920: valid parsed suppressions must be carried into policy execution"
+    )]
     fn valid_suppression_preflight_is_carried_into_policy_execution() {
         let (_temp, root) = workspace("Policy.java", "class Policy {}");
         let service = SearchToolsService::new_manual_ephemeral(root.clone())
@@ -8191,6 +8043,9 @@ mod watcher_startup_tests {
     /// not block through the build and then emit a zero-result
     /// "cancelled/partial" payload that reads as "no such symbols".
     #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#1199: broad search must return the bounded not-ready error during cold startup"
+    )]
     fn issue_1199_search_symbols_snapshot_deadline_returns_not_ready_error() {
         let (_temp, root) = workspace("Deferred.java", "class Deferred {}\n");
         let (startup_started_tx, startup_started_rx) = mpsc::channel();
@@ -8254,6 +8109,9 @@ mod watcher_startup_tests {
     }
 
     #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#1503: concurrent expired cold requests must not duplicate the shared workspace build"
+    )]
     fn issue_1503_concurrent_cold_waiters_time_out_without_duplicate_builds() {
         let (_temp, root) = workspace("Cold.java", "class Cold {}\n");
         let starts = Arc::new(AtomicUsize::new(0));
@@ -8325,6 +8183,9 @@ mod watcher_startup_tests {
     }
 
     #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#1296: registration deadlines must include policy preparation timings"
+    )]
     fn issue_1296_registration_deadline_includes_preparation_timings() {
         let (_temp, root) = workspace("Policy.java", "class Policy {}\n");
         let service = SearchToolsService::new_manual_ephemeral(root).expect("manual service");
@@ -8347,7 +8208,7 @@ mod watcher_startup_tests {
         };
 
         assert_eq!(structured["status"], "unreliable");
-        assert_eq!(structured["report"]["schema_version"], 5);
+        assert_eq!(structured["report"]["schema_version"], 6);
         assert_eq!(
             structured["report"]["execution"]["termination"],
             "deadline_exceeded"
@@ -8381,6 +8242,9 @@ mod watcher_startup_tests {
     }
 
     #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#1322: a superseded client build must not publish after workspace rebinding"
+    )]
     fn superseded_client_workspace_build_cannot_publish_after_rebinding() {
         let (_first_temp, first_root) = workspace("First.java", "class First {}\n");
         let (_second_temp, second_root) = workspace("Second.java", "class Second {}\n");
@@ -8452,6 +8316,9 @@ mod watcher_startup_tests {
     }
 
     #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#1322: a failed client build must be retryable after unbinding"
+    )]
     fn failed_client_workspace_build_can_be_retried_after_unbinding() {
         let (_temp, root) = workspace("Retry.java", "class Retry {}\n");
         let calls = Arc::new(AtomicUsize::new(0));
@@ -8493,6 +8360,9 @@ mod watcher_startup_tests {
     }
 
     #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#1519: a deferred snapshot must resolve before optional query-index warming"
+    )]
     fn deferred_build_resolves_before_optional_query_indexes_are_warm() {
         let (_temp, root) = workspace(
             "lib.rs",
@@ -8602,6 +8472,9 @@ mod watcher_startup_tests {
     /// state rather than a constant, in both states (#1757; re-pointed from
     /// the whole-workspace index build).
     #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#1758: Audit marked this BONE-tricky high: the readiness result can straddle warm completion and must reflect the session state (#1758)"
+    )]
     fn workspace_startup_runs_the_usage_index_warm_and_reports_its_readiness() {
         let (_temp, root) = workspace("lib.rs", "pub fn root() {}\npub fn run() { root(); }\n");
         let service = SearchToolsService::new_deferred_manual(root).unwrap();
@@ -8659,6 +8532,9 @@ mod watcher_startup_tests {
     /// after it, the snapshot installs while the warm is still running, the
     /// session says so, and the settled state arrives once the warm finishes.
     #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#3372: semantic-pack activation must not delay publishing the ready workspace snapshot"
+    )]
     fn workspace_readiness_publishes_before_semantic_pack_activation_settles() {
         let (_temp, root) = workspace("Warm.java", "class Warm {}\n");
         let hold = Arc::new(PackWarmHold::new());
@@ -8695,6 +8571,9 @@ mod watcher_startup_tests {
     }
 
     #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "501b6d4e2c67: semantic-pack workers must finish before a closing workspace releases its store"
+    )]
     fn closing_workspace_joins_semantic_pack_worker_before_releasing_store() {
         let (_temp, root) = workspace("Warm.java", "class Warm {}\n");
         let hold = Arc::new(PackWarmHold::new());
@@ -8718,7 +8597,8 @@ mod watcher_startup_tests {
             let (closed_tx, closed_rx) = mpsc::channel();
             let closing_service = Arc::clone(&service);
             let closer = scope.spawn(move || {
-                closed_tx.send(closing_service.close()).unwrap();
+                let close_result = closing_service.close();
+                (close_result, closed_tx.send(()))
             });
             hold.wait_for_teardown_waiting();
             assert!(
@@ -8732,9 +8612,10 @@ mod watcher_startup_tests {
             hold.release_all();
             closed_rx
                 .recv_timeout(Duration::from_secs(30))
-                .unwrap()
-                .unwrap();
-            closer.join().unwrap();
+                .expect("close completion signal did not arrive");
+            let (close_result, signal_result) = closer.join().expect("close thread panicked");
+            close_result.expect("close workspace");
+            signal_result.expect("close completion receiver remained connected");
         });
         assert!(
             store.upgrade().is_none(),
@@ -8743,6 +8624,9 @@ mod watcher_startup_tests {
     }
 
     #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#3401: a panicked semantic-pack worker must be joined without hiding its panic"
+    )]
     fn closing_workspace_joins_panicked_semantic_pack_worker() {
         let (_temp, root) = workspace("Warm.java", "class Warm {}\n");
         let hold = Arc::new(PackWarmHold::new_panicking());
@@ -8788,6 +8672,9 @@ mod watcher_startup_tests {
     /// acquisition pending. The hold parks the expensive stage there: the
     /// query returning at all proves it did not wait for production.
     #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#3372: query_code must mark potentially model-dependent answers while acquisition is pending"
+    )]
     fn query_code_marks_pending_pack_acquisition_until_the_warm_settles() {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().join("workspace");
@@ -8964,24 +8851,15 @@ mod watcher_startup_tests {
         root: PathBuf,
         handle: std::thread::JoinHandle<Result<(u64, PathBuf, WorkspaceSession), String>>,
     ) -> SearchToolsService {
-        SearchToolsService {
-            root: RwLock::new(Some(root)),
-            session: RwLock::new(None),
-            workspace_generation: AtomicU64::new(1),
-            flow_state: crate::flow::FlowWorkspaceState::new(),
-            query_protocols: RwLock::new(Default::default()),
-            query_value_flows: RwLock::new(Default::default()),
-            query_taint_results: RwLock::new(Default::default()),
-            pending_build: Mutex::new(Some(handle)),
-            build_error: Mutex::new(None),
-            file_listing: RwLock::new(None),
-            update_strategy: UpdateStrategy::Manual,
-            startup_index_warm: StartupIndexWarm::OnDemand,
-            watcher_starter: production_watcher_starter(),
-            diff_snapshot_object_dir: None,
-            diff_scoring: DiffScoringSession::default(),
-            workspace_scaled_query_limits: false,
-        }
+        let mut service = SearchToolsService::with_session_state(
+            root,
+            None,
+            None,
+            UpdateStrategy::Manual,
+            production_watcher_starter(),
+        );
+        service.pending_build = Mutex::new(Some(handle));
+        service
     }
 
     fn pack_warm_ready(service: &SearchToolsService) -> bool {
@@ -8997,6 +8875,9 @@ mod watcher_startup_tests {
     /// outstanding there is nothing for a caller to wait for.
     #[cfg_attr(not(scheduled_tests), ignore = "scheduled-only")]
     #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#1758: Issue #1758 fixed one-shot and embedded services paying startup cost for a usage-index warm they may never query"
+    )]
     fn a_one_shot_service_does_not_start_the_usage_index_warm_at_startup() {
         let (_temp, root) = workspace("lib.rs", "pub fn root() {}\npub fn run() { root(); }\n");
         let service = SearchToolsService::new_manual_ephemeral(root).unwrap();
@@ -9018,6 +8899,9 @@ mod watcher_startup_tests {
     /// waits on the same memo rather than failing or answering from a partial
     /// index.
     #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#1758: Issue #1758 fixed requests racing startup warm so they wait on the same memo and return the settled answer"
+    )]
     fn a_request_racing_the_startup_usage_index_warm_returns_the_warm_answer() {
         let (_temp, root) = workspace(
             "lib.rs",
@@ -9049,23 +8933,7 @@ mod watcher_startup_tests {
     }
 
     #[test]
-    fn deferred_manual_service_does_not_invoke_watcher_starter() {
-        let (_temp, root) = workspace("DeferredManual.java", "class DeferredManual {}\n");
-        let calls = Arc::new(AtomicUsize::new(0));
-        let service = SearchToolsService::new_deferred_with_strategy_and_watcher_starter(
-            root,
-            UpdateStrategy::Manual,
-            failing_starter(Arc::clone(&calls)),
-        )
-        .unwrap();
-
-        service
-            .call_tool_value("get_active_workspace", json!({}))
-            .unwrap();
-        assert_eq!(calls.load(Ordering::SeqCst), 0);
-    }
-
-    #[test]
+    #[brokk_bifrost_test_macros::hardwon("#847: a manual service must not start a file watcher")]
     fn manual_service_does_not_invoke_watcher_starter() {
         let (_temp, root) = workspace("Manual.java", "class Manual {}\n");
         let calls = Arc::new(AtomicUsize::new(0));
@@ -9084,6 +8952,9 @@ mod watcher_startup_tests {
     }
 
     #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#847: watcher failure during activation must preserve the prior usable workspace"
+    )]
     fn watcher_failure_during_activation_preserves_old_workspace() {
         let (_old_temp, old_root) = workspace("Old.java", "class Old {}\n");
         let (_new_temp, new_root) = workspace("New.java", "class New {}\n");
@@ -9127,6 +8998,9 @@ mod watcher_startup_tests {
     /// Git bookkeeping is outside the analyzed source set and must not replace
     /// the session snapshot used by subsequent queries.
     #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#3755: Issue #3755 fixed Git bookkeeping replacing the source snapshot used by later queries"
+    )]
     fn git_bookkeeping_in_a_watched_session_keeps_the_source_snapshot() {
         let (_temp, root) = workspace("Model.java", "class Model { void run() {} }\n");
         let repository = git2::Repository::init(&root).unwrap();
@@ -9173,6 +9047,9 @@ mod watcher_startup_tests {
     /// recursive source root. Adding a path dependency there must still reach
     /// the next query through the watcher (#3755).
     #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#3755: nested member manifest edits must invalidate dependency analysis on the next query"
+    )]
     fn a_member_manifest_edit_reaches_the_next_query() {
         const APP_MANIFEST: &str =
             "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2021\"\n";
@@ -9284,6 +9161,9 @@ mod analyzer_failure_boundary_tests {
     }
 
     #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "fecfeafc7647: stale analyzer generations must reload the service snapshot before retry"
+    )]
     fn stale_generation_reloads_the_service_snapshot_before_retrying() {
         let (_temp, root, service) = multi_language_service();
 
@@ -9309,6 +9189,9 @@ mod analyzer_failure_boundary_tests {
     }
 
     #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "fecfeafc7647: Rust symbol search must recover after an external generation cutover"
+    )]
     fn rust_search_symbols_recovers_after_an_external_generation_cutover() {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().canonicalize().unwrap();
@@ -9372,6 +9255,9 @@ mod analyzer_failure_boundary_tests {
     }
 
     #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#847: concurrent query scopes must not share SQLite failure state"
+    )]
     fn overlapping_query_scopes_do_not_share_store_failures() {
         let (_temp, root, service) = multi_language_service();
 
@@ -9429,7 +9315,7 @@ mod analyzer_failure_boundary_tests {
         let scope = WorkspaceQueryScope::new(
             Arc::new(workspace),
             document_root,
-            SessionPackActivation::Settled(None),
+            SessionPackActivation::Settled,
         );
 
         let service = SearchToolsService::new_manual_ephemeral(root).unwrap();
@@ -9479,6 +9365,9 @@ mod analyzer_failure_boundary_tests {
     }
 
     #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#847: a handler error must retain precedence over a recorded store failure"
+    )]
     fn query_finish_preserves_handler_error_over_recorded_store_failure() {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().canonicalize().unwrap();
@@ -9489,7 +9378,7 @@ mod analyzer_failure_boundary_tests {
         let scope = WorkspaceQueryScope::new(
             Arc::new(workspace),
             document_root,
-            SessionPackActivation::Settled(None),
+            SessionPackActivation::Settled,
         );
         scope
             .context
@@ -9581,6 +9470,7 @@ public partial class MudDialogContainer
             query_value_flows: RwLock::new(Default::default()),
             query_taint_results: RwLock::new(Default::default()),
             pending_build: Mutex::new(None),
+            build_progress: Arc::new(Default::default()),
             build_error: Mutex::new(None),
             file_listing: RwLock::new(None),
             update_strategy: UpdateStrategy::WatchFiles,
@@ -9594,10 +9484,7 @@ public partial class MudDialogContainer
 
     fn call_sources(service: &SearchToolsService, symbols: &[&str]) -> Value {
         let arguments = serde_json::json!({ "symbols": symbols });
-        let payload = service
-            .call_tool_json("get_symbol_sources", &arguments.to_string())
-            .unwrap();
-        serde_json::from_str(&payload).unwrap()
+        symbol_sources_json(service, &arguments.to_string())
     }
 
     fn source_texts(value: &Value) -> Vec<&str> {
@@ -9614,6 +9501,9 @@ public partial class MudDialogContainer
     /// `watching_service_without_watcher` is a watching session whose watcher
     /// never delivers, which makes the race deterministic (gate 13 defect 3).
     #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "fe0249334d3c: a location request must refresh its requested file before watcher delivery"
+    )]
     fn a_location_request_observes_its_own_file_before_the_watcher_delivers() {
         let temp = tempfile::TempDir::new().unwrap();
         let root = temp.path().canonicalize().unwrap();
@@ -9635,6 +9525,9 @@ public partial class MudDialogContainer
     }
 
     #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#588: source results must not combine post-edit bytes with a pre-edit symbol index"
+    )]
     fn get_symbol_sources_refreshes_combined_stale_member_request() {
         let (_temp, root) = write_project();
         let service = watching_service_without_watcher(root.clone());
@@ -9665,6 +9558,9 @@ public partial class MudDialogContainer
     }
 
     #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "95655a5e9778: symbol and usage proofs must recheck source bytes after candidate discovery"
+    )]
     fn candidate_files_are_rechecked_after_the_source_changes() {
         let (_temp, root) = write_project();
         let (_project, workspace) = build_ephemeral_workspace(root.clone(), None).unwrap();
@@ -9690,6 +9586,9 @@ public partial class MudDialogContainer
 
     #[cfg_attr(not(scheduled_tests), ignore = "scheduled-only")]
     #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#588: a new member source must be resolved from the indexed owner after edits"
+    )]
     fn get_symbol_sources_refreshes_new_member_from_indexed_owner() {
         let (_temp, root) = write_project();
         let service = watching_service_without_watcher(root.clone());
@@ -9710,6 +9609,9 @@ public partial class MudDialogContainer
     }
 
     #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#588: manual and watched source reads must retain one analyzer generation"
+    )]
     fn stale_analyzer_and_manual_service_keep_generation_consistent_source() {
         let (_temp, root) = write_project();
         let (project, workspace) = build_ephemeral_workspace(root.clone(), None).unwrap();
@@ -9748,6 +9650,9 @@ public partial class MudDialogContainer
     }
 
     #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#588: transient source read failures must not be converted into deleted-file results"
+    )]
     fn transient_source_read_errors_are_not_classified_as_deletion() {
         let (_temp, root) = write_project();
         let file = ProjectFile::new(root, PathBuf::from("MudDialogContainer.cs"));
@@ -9761,6 +9666,9 @@ public partial class MudDialogContainer
     }
 
     #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#588: a deleted target must refresh to not-found instead of stale source"
+    )]
     fn get_symbol_sources_refreshes_deleted_target_to_not_found() {
         let (_temp, root) = write_project();
         let service = watching_service_without_watcher(root.clone());
@@ -9776,6 +9684,9 @@ public partial class MudDialogContainer
     }
 
     #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#588: deleting one ambiguous candidate must refresh the remaining target"
+    )]
     fn get_symbol_sources_refreshes_stale_ambiguity_after_deletion() {
         let (_temp, root) = write_ambiguous_project();
         let service = watching_service_without_watcher(root.clone());
@@ -9816,41 +9727,16 @@ public partial class MudDialogContainer
 #[cfg(test)]
 mod client_roots_tests {
     use super::*;
-    use git2::{IndexAddOption, Repository, Signature};
+    use git2::{Repository, Signature};
     use serde_json::json;
 
     fn commit_all(repo: &Repository) {
-        let mut index = repo.index().unwrap();
-        index
-            .add_all(["*"].iter(), IndexAddOption::DEFAULT, None)
-            .unwrap();
-        index.write().unwrap();
-        let tree_id = index.write_tree().unwrap();
-        let tree = repo.find_tree(tree_id).unwrap();
         let signature = Signature::now("Bifrost Test", "test@example.com").unwrap();
-        repo.commit(Some("HEAD"), &signature, &signature, "initial", &tree, &[])
-            .unwrap();
+        crate::test_git_support::commit_all_without_parent(repo, "initial", &signature);
     }
 
     fn unbound_manual_service() -> SearchToolsService {
-        SearchToolsService {
-            root: RwLock::new(None),
-            session: RwLock::new(None),
-            workspace_generation: AtomicU64::new(0),
-            flow_state: crate::flow::FlowWorkspaceState::new(),
-            query_protocols: RwLock::new(Default::default()),
-            query_value_flows: RwLock::new(Default::default()),
-            query_taint_results: RwLock::new(Default::default()),
-            pending_build: Mutex::new(None),
-            build_error: Mutex::new(None),
-            file_listing: RwLock::new(None),
-            update_strategy: UpdateStrategy::Manual,
-            startup_index_warm: StartupIndexWarm::AtStartup,
-            watcher_starter: production_watcher_starter(),
-            diff_snapshot_object_dir: None,
-            diff_scoring: DiffScoringSession::default(),
-            workspace_scaled_query_limits: false,
-        }
+        super::unbound_test_service(UpdateStrategy::Manual, production_watcher_starter())
     }
 
     fn cache_db_for(root: &Path) -> PathBuf {
@@ -9860,10 +9746,8 @@ mod client_roots_tests {
     }
 
     fn committed_workspace(file: &str, source: &str) -> (tempfile::TempDir, PathBuf) {
-        let temp = tempfile::tempdir().unwrap();
-        let root = temp.path().canonicalize().unwrap();
+        let (temp, root) = super::test_workspace(file, source);
         let repo = Repository::init(&root).unwrap();
-        std::fs::write(root.join(file), source).unwrap();
         commit_all(&repo);
         (temp, root)
     }
@@ -9876,24 +9760,16 @@ mod client_roots_tests {
         db_path
     }
 
-    fn gc_accounting(db_path: &Path) -> (i64, i64) {
-        let connection = rusqlite::Connection::open(db_path).unwrap();
-        connection
-            .query_row(
-                "SELECT last_gc_at, blobs_at_last_gc FROM cache_state WHERE id = 1",
-                [],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )
-            .unwrap()
-    }
-
     #[cfg_attr(not(scheduled_tests), ignore = "scheduled-only")]
     #[test]
     fn manual_persisted_sessions_leave_gc_for_explicit_maintenance() {
         let (_source_temp, source_root) = committed_workspace("Source.java", "class Source {}\n");
         let source_db = make_cache_gc_due(&source_root);
         let service = SearchToolsService::new_manual_persisted(source_root.clone()).unwrap();
-        assert_eq!(gc_accounting(&source_db), (0, 0));
+        assert_eq!(
+            crate::cache_gc::gc_accounting_for_test(&source_db).unwrap(),
+            (0, 0)
+        );
 
         std::fs::write(
             source_root.join("Source.java"),
@@ -9901,7 +9777,10 @@ mod client_roots_tests {
         )
         .unwrap();
         service.call_tool_value("refresh", json!({})).unwrap();
-        assert_eq!(gc_accounting(&source_db), (0, 0));
+        assert_eq!(
+            crate::cache_gc::gc_accounting_for_test(&source_db).unwrap(),
+            (0, 0)
+        );
 
         let (_target_temp, target_root) = committed_workspace("Target.java", "class Target {}\n");
         let target_db = make_cache_gc_due(&target_root);
@@ -9913,8 +9792,14 @@ mod client_roots_tests {
             .unwrap();
         service.close().unwrap();
 
-        assert_eq!(gc_accounting(&source_db), (0, 0));
-        assert_eq!(gc_accounting(&target_db), (0, 0));
+        assert_eq!(
+            crate::cache_gc::gc_accounting_for_test(&source_db).unwrap(),
+            (0, 0)
+        );
+        assert_eq!(
+            crate::cache_gc::gc_accounting_for_test(&target_db).unwrap(),
+            (0, 0)
+        );
     }
 
     #[cfg_attr(not(scheduled_tests), ignore = "scheduled-only")]
@@ -9926,7 +9811,8 @@ mod client_roots_tests {
         let service = SearchToolsService::new(root).unwrap();
         service.close().unwrap();
 
-        let (last_gc_at, blobs_at_last_gc) = gc_accounting(&db_path);
+        let (last_gc_at, blobs_at_last_gc) =
+            crate::cache_gc::gc_accounting_for_test(&db_path).unwrap();
         assert!(last_gc_at > 0);
         assert!(blobs_at_last_gc > 0);
     }
@@ -9940,7 +9826,8 @@ mod client_roots_tests {
         service.request_cache_gc().unwrap();
         service.close().unwrap();
 
-        let (last_gc_at, blobs_at_last_gc) = gc_accounting(&db_path);
+        let (last_gc_at, blobs_at_last_gc) =
+            crate::cache_gc::gc_accounting_for_test(&db_path).unwrap();
         assert!(last_gc_at > 0);
         assert!(blobs_at_last_gc > 0);
     }
@@ -9985,6 +9872,9 @@ mod client_roots_tests {
     /// entry point does: to the primary checkout's database, co-located with
     /// the git object database the analyzer must already read (issue #1544).
     #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#1544: client-bound linked worktrees must share the primary repository cache"
+    )]
     fn client_bound_linked_worktree_uses_the_primary_cache() {
         let temp = tempfile::tempdir().unwrap();
         let primary_root = temp.path().join("primary");
@@ -10022,6 +9912,9 @@ mod client_roots_tests {
     /// fallback `gitblob::cache_db_path` already provides: resolution never
     /// escapes such a root.
     #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#1544: a non-Git client root must retain its own local cache path"
+    )]
     fn client_bound_non_git_root_keeps_a_local_cache_path() {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().join("loose");
@@ -10061,6 +9954,9 @@ mod client_roots_tests {
     /// repository's primary cache. The bound root still bounds what the
     /// workspace sees; it does not bound where derived data lives.
     #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#1544: nested client roots must map to the repository primary cache"
+    )]
     fn nested_client_root_uses_the_repository_primary_cache() {
         let temp = tempfile::tempdir().unwrap();
         let primary_root = temp.path().join("primary");
@@ -10094,6 +9990,9 @@ mod client_roots_tests {
     /// content into a linked worktree's results: reconciliation resolves every
     /// answer against the bound worktree's current blob oids.
     #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#1544: a shared primary cache must not leak symbols from another workspace"
+    )]
     fn shared_primary_cache_does_not_leak_primary_only_symbols() {
         let temp = tempfile::tempdir().unwrap();
         let primary_root = temp.path().join("primary");
@@ -10163,6 +10062,9 @@ mod search_symbols_cancellation_tests {
     use serde_json::json;
 
     #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#1199: cancellation must reach the cold search_symbols request"
+    )]
     fn issue_1199_service_forwards_cancellation_to_search_symbols() {
         let temp = tempfile::tempdir().unwrap();
         std::fs::write(
@@ -10200,6 +10102,9 @@ mod search_symbols_cancellation_tests {
     }
 
     #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#1304: cancellation must reach usage-ranked most_relevant_files work"
+    )]
     fn issue_1304_service_forwards_cancellation_to_most_relevant_files() {
         let temp = tempfile::tempdir().unwrap();
         std::fs::write(temp.path().join("lib.rs"), "pub fn target() {}\n").unwrap();
@@ -10225,6 +10130,9 @@ mod search_symbols_cancellation_tests {
     }
 
     #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#1304: cancelled shared ranking must publish no incomplete ranked prefix"
+    )]
     fn issue_1304_shared_request_cancellation_publishes_no_ranked_prefix() {
         let temp = tempfile::tempdir().unwrap();
         std::fs::write(
@@ -10291,54 +10199,53 @@ mod search_symbols_cancellation_tests {
     }
 
     #[test]
-    fn issue_1228_service_forwards_cancellation_to_scan_usages_by_reference() {
+    #[brokk_bifrost_test_macros::hardwon(
+        "#1228: pre-cancelled requests must reach reference and location usage scans"
+    )]
+    fn issue_1228_service_forwards_cancellation_to_usage_scans() {
         let temp = tempfile::tempdir().unwrap();
         std::fs::write(temp.path().join("lib.rs"), "pub fn target() {}\n").unwrap();
         let service = SearchToolsService::new_manual_ephemeral(temp.path().to_path_buf()).unwrap();
         let cancellation = CancellationToken::new();
         cancellation.cancel();
 
-        let result = service
-            .call_tool_output_with_cancellation(
+        for (tool, arguments, input_kind, count) in [
+            (
                 "scan_usages_by_reference",
                 json!({
                     "symbols": ["target", "other"],
                     "include_tests": true
                 }),
-                RenderOptions::default(),
-                Some(&cancellation),
-            )
-            .unwrap()
-            .into_value();
-
-        assert_cancelled_scan_result(&result, "symbol", 2);
-    }
-
-    #[test]
-    fn issue_1228_service_forwards_cancellation_to_scan_usages_by_location() {
-        let temp = tempfile::tempdir().unwrap();
-        std::fs::write(temp.path().join("lib.rs"), "pub fn target() {}\n").unwrap();
-        let service = SearchToolsService::new_manual_ephemeral(temp.path().to_path_buf()).unwrap();
-        let cancellation = CancellationToken::new();
-        cancellation.cancel();
-
-        let result = service
-            .call_tool_output_with_cancellation(
+                "symbol",
+                2,
+            ),
+            (
                 "scan_usages_by_location",
                 json!({
                     "targets": [{"path": "lib.rs", "line": 1}],
                     "include_tests": true
                 }),
-                RenderOptions::default(),
-                Some(&cancellation),
-            )
-            .unwrap()
-            .into_value();
-
-        assert_cancelled_scan_result(&result, "target", 1);
+                "target",
+                1,
+            ),
+        ] {
+            let result = service
+                .call_tool_output_with_cancellation(
+                    tool,
+                    arguments,
+                    RenderOptions::default(),
+                    Some(&cancellation),
+                )
+                .unwrap()
+                .into_value();
+            assert_cancelled_scan_result(&result, input_kind, count);
+        }
     }
 
     #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#1199: unbounded search pattern batches must be rejected before cold work"
+    )]
     fn issue_1199_search_symbols_rejects_unbounded_pattern_batches() {
         let temp = tempfile::tempdir().unwrap();
         std::fs::write(temp.path().join("lib.rs"), "pub fn target() {}\n").unwrap();

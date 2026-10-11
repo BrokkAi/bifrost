@@ -7,9 +7,9 @@
 //! `language_for_target` -- names `IAnalyzer` or `Language` and stays in
 //! `brokk-bifrost-analysis`, which re-exports these at their original paths.
 
-use crate::analyzer::common::node_source_text_trimmed;
 use crate::analyzer::usages::model::{UsageHit, UsageHitSurface};
-use crate::analyzer::{CodeUnit, ProjectFile};
+use crate::analyzer::{CodeUnit, ProjectFile, Range};
+use crate::text_utils::{find_line_index_for_offset, trimmed_snippet_around_line};
 use std::collections::BTreeSet;
 use tree_sitter::Node;
 
@@ -25,6 +25,18 @@ pub fn external_usage_hit_count(hits: &BTreeSet<UsageHit>) -> usize {
     hits.iter()
         .filter(|hit| hit.kind.included_in(UsageHitSurface::ExternalUsages))
         .count()
+}
+
+pub fn insert_import_hit(hits: &mut BTreeSet<UsageHit>, hit: Option<UsageHit>) {
+    if let Some(hit) = hit {
+        hits.insert(hit.into_import());
+    }
+}
+
+pub fn insert_unproven_hit(hits: &mut BTreeSet<UsageHit>, hit: Option<UsageHit>) {
+    if let Some(hit) = hit {
+        hits.insert(hit.into_unproven());
+    }
 }
 
 pub fn reclassify_import_hit_at(
@@ -116,6 +128,34 @@ pub fn usage_hit(
     )
 }
 
+/// Build a usage hit for a syntax node with the caller's enclosing-unit policy.
+pub fn usage_hit_for_node(
+    node: Node<'_>,
+    file: &ProjectFile,
+    source: &str,
+    line_starts: &[usize],
+    enclosing_code_unit: impl FnOnce(&Range) -> Option<CodeUnit>,
+) -> Option<UsageHit> {
+    let start_byte = node.start_byte();
+    let end_byte = node.end_byte();
+    if start_byte >= end_byte {
+        return None;
+    }
+
+    let line_idx = find_line_index_for_offset(line_starts, start_byte);
+    let snippet = trimmed_snippet_around_line(source, line_starts, line_idx, SNIPPET_CONTEXT_LINES);
+    let range = Range {
+        start_byte,
+        end_byte,
+        start_line: line_idx,
+        end_line: line_idx,
+    };
+    let enclosing = enclosing_code_unit(&range)?;
+    Some(usage_hit(
+        file, line_idx, start_byte, end_byte, enclosing, snippet,
+    ))
+}
+
 /// Yields `fqn`, then each progressively shorter dot-truncated prefix down to
 /// (and including) the last single segment -- `"a.b.c"` -> `"a.b.c"`, `"a.b"`,
 /// `"a"` -- never descending to the bare empty string unless `fqn` itself is
@@ -140,9 +180,7 @@ pub fn same_node(left: Node<'_>, right: Node<'_>) -> bool {
 /// The trimmed source text spanned by `node`, or `""` if the byte range is not a
 /// valid `str` boundary. Shared by the per-language usage resolvers that key on a
 /// node's identifier/type text.
-pub fn node_text<'a>(node: Node<'_>, source: &'a str) -> &'a str {
-    node_source_text_trimmed(node, source)
-}
+pub use crate::analyzer::common::node_source_text_trimmed as node_text;
 
 /// Lazily walks a [`CodeUnit`]'s enclosing-owner chain outward, starting at
 /// `start` itself and stepping via caller-supplied `step` on every
@@ -178,6 +216,17 @@ where
         step,
         started: false,
     }
+}
+
+/// The starting owner followed by its contiguous enclosing class owners.
+pub fn enclosing_class_chain<S>(innermost: CodeUnit, step: S) -> impl Iterator<Item = CodeUnit>
+where
+    S: FnMut(&CodeUnit) -> Option<CodeUnit>,
+{
+    let parents = enclosing_owner_chain(innermost.clone(), step)
+        .skip(1)
+        .take_while(CodeUnit::is_class);
+    std::iter::once(innermost).chain(parents)
 }
 
 pub struct EnclosingOwnerChain<S> {

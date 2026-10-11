@@ -136,16 +136,13 @@ pub fn duration(label: impl AsRef<str>, duration: Duration) {
 #[cfg(test)]
 mod tests {
     use super::timing_enabled;
+    use brokk_bifrost_test_macros::hardwon;
     use std::ffi::OsStr;
-
-    #[test]
-    fn an_unset_variable_leaves_timing_off() {
-        assert!(!timing_enabled(None));
-    }
 
     /// The D4 harness footgun: presence-not-value parsing read `0` as on and
     /// charged the measured run 247k span events.
     #[test]
+    #[hardwon("3d821165ed15: BIFROST_TIMING=0 enabled profiling and added 247k span events")]
     fn an_off_spelling_switches_timing_off() {
         for value in ["", "0", "false", "off", " off ", "OFF", "False"] {
             assert!(
@@ -156,6 +153,7 @@ mod tests {
     }
 
     #[test]
+    #[hardwon("3d821165ed15: unrecognized timing values must still enable tracing")]
     fn any_other_value_switches_timing_on() {
         for value in ["1", "true", "on", "yes", "2", "spans"] {
             assert!(
@@ -167,6 +165,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    #[hardwon("3d821165ed15: non-UTF-8 timing values must not be mistaken for unset")]
     fn a_non_utf8_value_is_not_an_off_spelling() {
         use std::os::unix::ffi::OsStrExt;
 

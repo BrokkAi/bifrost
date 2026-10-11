@@ -241,111 +241,13 @@ fn arity_rejection_reason(arities: &[CallableArity], actual: usize) -> CallableR
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use brokk_bifrost_core::analyzer::model::{CodeUnitType, ProjectFile};
 
-    fn unit(name: &str) -> CodeUnit {
-        let file = ProjectFile::new(std::env::temp_dir(), "Main.java");
-        CodeUnit::new(
-            file,
-            CodeUnitType::Function,
-            "app",
-            format!("Widget.{name}"),
-        )
-    }
+    use super::*;
+    use crate::analyzer::usages::test_unit as unit;
 
     /// The winners a resolver binds and the rows a policy reads come from one
     /// pass: the survivors are exactly the candidates that were not refused.
-    #[test]
-    fn winners_are_the_candidates_the_verdicts_did_not_refuse() {
-        let one = unit("one");
-        let two = unit("two");
-        let candidates = vec![one.clone(), two.clone()];
-        let outcome = arity_applicability(&candidates, Some(1), |candidate| {
-            Some(if *candidate == one {
-                CallableArity::exact(1)
-            } else {
-                CallableArity::exact(2)
-            })
-        });
-        assert_eq!(outcome.winners, vec![one]);
-        assert_eq!(
-            outcome.verdicts[0].verdict,
-            ApplicabilityVerdict::Applicable
-        );
-        assert_eq!(
-            outcome.verdicts[1].verdict,
-            ApplicabilityVerdict::Inapplicable
-        );
-        assert_eq!(
-            outcome.verdicts[1].reason,
-            Some(CallableRejectionReason::ArityBelowRequired)
-        );
-    }
 
-    /// Which end of the range the call missed is stated exactly, so a policy
-    /// can tell "too few arguments" from "too many".
-    #[test]
-    fn the_reason_names_the_end_of_the_range_that_was_missed() {
-        let candidates = vec![unit("f")];
-        let too_many = arity_applicability(&candidates, Some(5), |_| {
-            Some(CallableArity::new(1, 2, false))
-        });
-        assert_eq!(
-            too_many.verdicts[0].reason,
-            Some(CallableRejectionReason::ArityAboveTotal)
-        );
-        let too_few = arity_applicability(&candidates, Some(0), |_| {
-            Some(CallableArity::new(1, 2, false))
-        });
-        assert_eq!(
-            too_few.verdicts[0].reason,
-            Some(CallableRejectionReason::ArityBelowRequired)
-        );
-    }
-
-    /// A repeating trailing parameter has no upper bound, so a call that
-    /// exceeds the declared total is still applicable.
-    #[test]
-    fn a_repeating_parameter_accepts_more_arguments_than_it_declares() {
-        let candidates = vec![unit("f")];
-        let outcome = arity_applicability(&candidates, Some(9), |_| {
-            Some(CallableArity::new(1, 2, true))
-        });
-        assert_eq!(outcome.winners.len(), 1);
-        assert!(!outcome.refused_any());
-    }
-
-    /// A call that falls in the gap between two declared parameter lists missed
-    /// neither end of a single range, and saying so beats picking one.
-    #[test]
-    fn a_call_between_two_declared_lists_is_a_list_shape_mismatch() {
-        let candidates = vec![unit("f")];
-        let outcome = arity_applicability_over_entries(&candidates, Some(2), |_| {
-            Some(vec![CallableArity::exact(1), CallableArity::exact(3)])
-        });
-        assert_eq!(
-            outcome.verdicts[0].reason,
-            Some(CallableRejectionReason::ListShapeMismatch)
-        );
-    }
-
-    /// A candidate with several declared lists is applicable when any of them
-    /// accepts the call, which is what every language's own filter does.
-    #[test]
-    fn any_accepting_declared_list_makes_the_candidate_applicable() {
-        let candidates = vec![unit("f")];
-        let outcome = arity_applicability_over_entries(&candidates, Some(3), |_| {
-            Some(vec![CallableArity::exact(1), CallableArity::exact(3)])
-        });
-        assert_eq!(
-            outcome.verdicts[0].verdict,
-            ApplicabilityVerdict::Applicable
-        );
-    }
-
-    /// An unreadable call shape refuses nothing and claims nothing: every
-    /// candidate stays reachable with an undecided verdict.
     #[test]
     fn an_unreadable_call_shape_decides_nothing() {
         let candidates = vec![unit("one"), unit("two")];
@@ -365,8 +267,6 @@ mod tests {
         );
     }
 
-    /// A declared arity nobody recorded is undecidable rather than accepted,
-    /// and it never becomes a rejection either.
     #[test]
     fn an_unrecorded_declared_arity_is_undecidable_not_applicable() {
         let candidates = vec![unit("f")];

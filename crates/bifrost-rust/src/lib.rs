@@ -22,6 +22,7 @@
 
 pub mod adapter;
 pub mod cache;
+pub mod cargo_config;
 pub mod cargo_manifest;
 pub mod cargo_routes;
 pub mod crate_naming;
@@ -31,6 +32,7 @@ pub mod declarations;
 pub mod diagnostics;
 pub mod facts;
 pub mod field_roles;
+pub mod format_args;
 pub mod graph_support;
 pub mod hierarchy;
 pub mod hierarchy_source_context;
@@ -60,3 +62,6 @@ pub mod cfg;
 
 #[cfg(test)]
 mod producer_smoke_tests;
+
+#[cfg(any(test, feature = "test-support"))]
+pub mod test_helpers;

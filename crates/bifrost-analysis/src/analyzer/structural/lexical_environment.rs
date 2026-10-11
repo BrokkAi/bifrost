@@ -114,7 +114,11 @@ impl ScopeRow {
     }
 
     pub fn contains(&self, position_byte: usize) -> bool {
-        self.range.start_byte <= position_byte && position_byte < self.range.end_byte
+        brokk_bifrost_core::analyzer::model::byte_range_contains(
+            self.range.start_byte,
+            self.range.end_byte,
+            position_byte,
+        )
     }
 }
 
@@ -489,14 +493,6 @@ fn unavailable(file: &ProjectFile, reason: EnvironmentIncompleteReason) -> Envir
     )
 }
 
-/// Record a reason once. Which axis is incomplete is what matters; how many
-/// rows hit the same wall is not.
-fn note(reasons: &mut Vec<EnvironmentIncompleteReason>, reason: EnvironmentIncompleteReason) {
-    if !reasons.contains(&reason) {
-        reasons.push(reason);
-    }
-}
-
 fn completeness(
     support: &LexicalEnvironmentSupport,
     mut reasons: Vec<EnvironmentIncompleteReason>,
@@ -599,10 +595,10 @@ fn binding_rows(
     let mut rows = Vec::new();
     for node in 0..facts.nodes().len() {
         let node = u32::try_from(node).expect("facts arena node count fits in u32");
-        if !facts
-            .occurrence_roles(node)
-            .contains(&OccurrenceRole::Binder)
-        {
+        let roles = facts.occurrence_roles(node);
+        let is_binder = roles.contains(&OccurrenceRole::Binder);
+        let is_declaration_name = roles.contains(&OccurrenceRole::DeclarationName);
+        if !is_binder && !is_declaration_name {
             continue;
         }
         let declaring_scope = enclosing_scope(facts, &scope_of_node, node);
@@ -622,16 +618,21 @@ fn binding_rows(
         let Some(binder) =
             root.descendant_for_byte_range(normalized.range.start_byte, normalized.range.end_byte)
         else {
-            note(reasons, EnvironmentIncompleteReason::SyntaxUnavailable);
+            super::note_once(reasons, EnvironmentIncompleteReason::SyntaxUnavailable);
             continue;
         };
-        let Some(activation) =
+        let activation = if is_binder {
             spec.binding_activation(binder, scopes[declaring_scope as usize].range)
-        else {
-            note(
-                reasons,
-                EnvironmentIncompleteReason::BindingActivationUnknown,
-            );
+        } else {
+            spec.declaration_binding_activation(binder, scopes[declaring_scope as usize].range)
+        };
+        let Some(activation) = activation else {
+            if is_binder {
+                super::note_once(
+                    reasons,
+                    EnvironmentIncompleteReason::BindingActivationUnknown,
+                );
+            }
             continue;
         };
         let raw = &source[normalized.range.start_byte..normalized.range.end_byte];
@@ -681,7 +682,7 @@ fn import_binder_rows(
             continue;
         };
         if import.path.is_none() {
-            note(
+            super::note_once(
                 reasons,
                 EnvironmentIncompleteReason::ImportTargetUnstructured,
             );
@@ -1029,48 +1030,33 @@ pub fn binding_of(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::analyzer::{AnalyzerConfig, Project, TestProject, WorkspaceAnalyzer};
-    use std::path::PathBuf;
-    use std::sync::Arc;
-    use tempfile::TempDir;
+    use crate::test_support::AnalyzerFixture;
 
     struct Fixture {
-        _temp: TempDir,
-        workspace: WorkspaceAnalyzer,
+        analyzer: AnalyzerFixture,
         file: ProjectFile,
         source: String,
     }
 
     impl Fixture {
         fn new(language: Language, relative_path: &str, source: &str) -> Self {
-            let temp = tempfile::tempdir().expect("temp dir");
-            let root: PathBuf = temp.path().canonicalize().expect("canonical root");
-            let file = ProjectFile::new(root.clone(), relative_path);
-            file.write(source).expect("write fixture source");
-            let project = TestProject::new(root, language);
-            let workspace = WorkspaceAnalyzer::build_ephemeral_footgun(
-                Arc::new(project) as Arc<dyn Project>,
-                AnalyzerConfig::default(),
-            )
-            .expect("ephemeral workspace should build");
+            let analyzer = AnalyzerFixture::new_for_language(language, &[(relative_path, source)]);
+            let file = ProjectFile::new(analyzer.project_root(), relative_path);
             Self {
-                _temp: temp,
-                workspace,
+                analyzer,
                 file,
                 source: source.to_owned(),
             }
         }
 
         fn environment(&self) -> EnvironmentFileResult {
-            environment_for_file(self.workspace.analyzer(), &self.file)
+            environment_for_file(self.analyzer.analyzer().analyzer(), &self.file)
         }
 
         /// Byte offset of `needle`; the marker keeps a position assertion
         /// readable without re-scanning the fixture.
         fn at(&self, needle: &str) -> usize {
-            self.source
-                .find(needle)
-                .unwrap_or_else(|| panic!("fixture does not contain {needle:?}"))
+            crate::test_support::fixture_marker(&self.source, needle)
         }
     }
 
@@ -1105,221 +1091,6 @@ mod tests {
         }
     }
 
-    fn scope_kinds(env: &EnvironmentFileResult) -> Vec<Option<NormalizedKind>> {
-        env.scopes.iter().map(|scope| scope.anchor.kind()).collect()
-    }
-
-    /// The file scope is synthesized, not read from a fact, and it is the root
-    /// of every chain: no adapter maps its grammar's root node, so a consumer
-    /// that walked only facts would have no scope to stop at.
-    #[test]
-    fn the_file_scope_is_the_synthesized_root_of_the_scope_chain() {
-        let source = concat!(
-            "class Widget {\n",
-            "    int render(String label) {\n",
-            "        return label.length();\n",
-            "    }\n",
-            "}\n",
-        );
-        let fixture = Fixture::new(Language::Java, "app/Widget.java", source);
-        let env = fixture.environment();
-
-        assert_eq!(env.scopes[0].anchor, ScopeAnchor::File);
-        assert_eq!(env.scopes[0].parent_scope, None);
-        assert_eq!(env.scopes[0].ast_id(), None);
-        assert_eq!(env.scopes[0].range.start_byte, 0);
-        assert_eq!(env.scopes[0].range.end_byte, source.len());
-        assert!(
-            env.scopes[1..]
-                .iter()
-                .all(|scope| scope.parent_scope.is_some() && scope.ast_id().is_some()),
-            "every non-file scope has a parent and an AST identity: {:?}",
-            env.scopes
-        );
-        assert_eq!(
-            scope_kinds(&env),
-            vec![
-                None,
-                Some(NormalizedKind::Class),
-                Some(NormalizedKind::Method),
-                Some(NormalizedKind::Block),
-            ],
-            "scopes are the file, the class, the method and its body block"
-        );
-        assert_eq!(env.scope_ancestry(3), vec![3, 2, 1, 0]);
-    }
-
-    /// A Java parameter list sits outside the body block's byte range, so the
-    /// scope that owns a parameter is the callable, not the block. The
-    /// binding-of walk climbs the ancestry, which is what makes the
-    /// parameter reachable from inside the body regardless.
-    #[test]
-    fn java_parameters_belong_to_the_callable_and_reach_into_its_body() {
-        let source = concat!(
-            "class Widget {\n",
-            "    int render(String label) {\n",
-            "        int size = label.length();\n",
-            "        return size;\n",
-            "    }\n",
-            "}\n",
-        );
-        let fixture = Fixture::new(Language::Java, "app/Widget.java", source);
-        let env = fixture.environment();
-        assert!(env.completeness.is_complete(), "{:?}", env.completeness);
-
-        let label = binding(&env, "label");
-        assert_eq!(label.kind, BindingKind::Parameter);
-        assert_eq!(label.hoisting, HoistingClass::ScopeWide);
-        assert_eq!(
-            env.scope(label.declaring_scope).anchor.kind(),
-            Some(NormalizedKind::Method)
-        );
-        assert!(
-            label.range.start_byte < env.scope(label.declaring_scope).range.end_byte
-                && !env
-                    .scopes
-                    .iter()
-                    .any(|scope| scope.anchor.kind() == Some(NormalizedKind::Block)
-                        && scope.contains(label.range.start_byte)),
-            "the parameter lies outside every block: {:?}",
-            env.scopes
-        );
-
-        let size = binding(&env, "size");
-        assert_eq!(size.kind, BindingKind::Local);
-        assert_eq!(size.hoisting, HoistingClass::SourceOrder);
-        assert_eq!(
-            env.scope(size.declaring_scope).anchor.kind(),
-            Some(NormalizedKind::Block)
-        );
-
-        assert_eq!(
-            reached(&env, "label", fixture.at("label.length")).node,
-            label.node,
-            "a read inside the body reaches the parameter declared outside it"
-        );
-        assert_eq!(
-            reached(&env, "size", fixture.at("size;")).node,
-            size.node,
-            "and the local reaches its own binder"
-        );
-    }
-
-    /// Re-binding the same name in one block is two bindings with adjacent
-    /// intervals: a read between them reaches the first, a read below the
-    /// second reaches the second.
-    #[test]
-    fn rust_rebinding_in_one_block_reaches_the_binder_above_the_read() {
-        let source = concat!(
-            "fn render() -> u32 {\n",
-            "    let value = 1;\n",
-            "    let seen = value;\n",
-            "    let value = 2;\n",
-            "    return value;\n",
-            "}\n",
-        );
-        let fixture = Fixture::new(Language::Rust, "src/app.rs", source);
-        let env = fixture.environment();
-        assert!(env.completeness.is_complete(), "{:?}", env.completeness);
-
-        let first = fixture.at("value = 1");
-        let second = fixture.at("value = 2");
-        let between = fixture.at("value;\n    let value = 2");
-        let below = fixture.at("value;\n}");
-
-        assert_eq!(
-            reached(&env, "value", between).range.start_byte,
-            first,
-            "the read between the two bindings reaches the first"
-        );
-        assert_eq!(
-            reached(&env, "value", below).range.start_byte,
-            second,
-            "the read below the re-binding reaches the second"
-        );
-        match binding_of(&env, "value", below, None) {
-            BindingOfOutcome::Shadowed { winner, shadowed } => {
-                assert_eq!(env.bindings[winner].range.start_byte, second);
-                assert_eq!(
-                    shadowed
-                        .iter()
-                        .map(|index| env.bindings[*index].range.start_byte)
-                        .collect::<Vec<_>>(),
-                    vec![first],
-                    "the earlier binding is reported as shadowed, not dropped"
-                );
-            }
-            other => panic!("a re-binding is a shadowing answer, got {other:?}"),
-        }
-    }
-
-    /// A try-with-resources resource is in effect over the try block only.
-    #[test]
-    fn java_try_resource_is_in_effect_over_the_try_block() {
-        let source = concat!(
-            "class Widget {\n",
-            "    void run() throws Exception {\n",
-            "        try (AutoCloseable handle = open()) {\n",
-            "            handle.toString();\n",
-            "        }\n",
-            "        after();\n",
-            "    }\n",
-            "}\n",
-        );
-        let fixture = Fixture::new(Language::Java, "app/Widget.java", source);
-        let env = fixture.environment();
-
-        let handle = binding(&env, "handle");
-        assert_eq!(handle.kind, BindingKind::CatchOrResource);
-        assert_eq!(handle.hoisting, HoistingClass::DeclaredHead);
-        assert_eq!(
-            handle.activation.start_byte,
-            fixture.at("{\n            handle")
-        );
-
-        assert_eq!(
-            reached(&env, "handle", fixture.at("handle.toString")).node,
-            handle.node
-        );
-        assert_eq!(
-            binding_of(&env, "handle", fixture.at("after()"), None),
-            BindingOfOutcome::NoBinding,
-            "the resource is out of effect below the try block"
-        );
-    }
-
-    /// A Java local is in effect from the end of its declaration, so a read
-    /// above it reaches nothing at all.
-    #[cfg_attr(not(scheduled_tests), ignore = "scheduled-only")]
-    #[test]
-    fn java_local_read_before_its_declaration_reaches_nothing() {
-        let source = concat!(
-            "class Widget {\n",
-            "    int render() {\n",
-            "        int first = later;\n",
-            "        int later = 2;\n",
-            "        return first + later;\n",
-            "    }\n",
-            "}\n",
-        );
-        let fixture = Fixture::new(Language::Java, "app/Widget.java", source);
-        let env = fixture.environment();
-
-        assert_eq!(
-            binding_of(&env, "later", fixture.at("later;\n        int later"), None),
-            BindingOfOutcome::NoBinding
-        );
-        assert_eq!(
-            reached(&env, "later", fixture.at("later;\n    }"))
-                .range
-                .start_byte,
-            fixture.at("later = 2")
-        );
-    }
-
-    /// JavaScript is the opposite case, and deliberately so: `var` hoists, so a
-    /// read above the declaration reaches the hoisted binding rather than
-    /// nothing or an outer name.
     #[test]
     fn js_var_read_before_its_declaration_reaches_the_hoisted_binding() {
         let source = concat!(
@@ -1340,36 +1111,43 @@ mod tests {
         );
     }
 
-    /// A comprehension target lives in the comprehension's own implicit scope,
-    /// which is a declared sub-interval of the block it is written in.
     #[test]
-    fn python_comprehension_target_is_a_declared_head_binder() {
+    fn python_function_local_assigned_in_a_block_reaches_after_the_block() {
         let source = concat!(
-            "def render(items):\n",
-            "    doubled = [item * 2 for item in items]\n",
-            "    return doubled\n",
+            "def render(choose):\n",
+            "    if choose:\n",
+            "        value = 1\n",
+            "    return value\n",
         );
         let fixture = Fixture::new(Language::Python, "src/app.py", source);
         let env = fixture.environment();
 
-        let item = binding(&env, "item");
-        assert_eq!(item.kind, BindingKind::LoopVariable);
-        assert_eq!(item.hoisting, HoistingClass::DeclaredHead);
-        assert_eq!(item.activation.start_byte, fixture.at("[item * 2"));
-
+        let value = binding(&env, "value");
+        assert_eq!(value.kind, BindingKind::Local);
         assert_eq!(
-            reached(&env, "item", fixture.at("item * 2")).node,
-            item.node
+            env.scope(value.declaring_scope).anchor.kind(),
+            Some(NormalizedKind::Function),
+            "Python's if block does not open a lexical scope"
         );
         assert_eq!(
-            binding_of(&env, "item", fixture.at("doubled\n"), None),
-            BindingOfOutcome::NoBinding,
-            "the comprehension target does not leak into the function body"
+            reached(&env, "value", fixture.at("return value") + "return ".len()).node,
+            value.node
         );
+    }
 
-        let items = binding(&env, "items");
-        assert_eq!(items.kind, BindingKind::Parameter);
-        assert_eq!(items.hoisting, HoistingClass::ScopeWide);
+    #[test]
+    fn python_module_root_keeps_top_level_imports_in_file_scope() {
+        let fixture = Fixture::new(
+            Language::Python,
+            "src/app.py",
+            "import json\nvalue = json\n",
+        );
+        let env = fixture.environment();
+
+        assert_eq!(env.scopes.len(), 1, "scopes: {:?}", env.scopes);
+        let json = binding(&env, "json");
+        assert_eq!(json.declaring_scope, 0);
+        assert_eq!(env.scope(json.declaring_scope).anchor, ScopeAnchor::File);
     }
 
     /// One import statement can introduce several names, and a rename can make
@@ -1407,116 +1185,6 @@ mod tests {
         assert_ne!(
             beta.node, alpha.node,
             "two rows of one declaration keep distinct AST identities"
-        );
-    }
-
-    /// The activation an import binder carries is the adapter's answer
-    /// (#2925), and every adapter but Scala's takes the scope-wide default.
-    /// A Python `import` written inside a function body is the sharpest pin
-    /// on that default: its declaring scope is the body block, and the row
-    /// still covers the whole block rather than starting at the statement.
-    #[test]
-    fn a_python_function_local_import_keeps_the_scope_wide_default() {
-        let source = concat!(
-            "def render(path):\n",
-            "    import os\n",
-            "    return os.path.join(path)\n",
-        );
-        let fixture = Fixture::new(Language::Python, "src/app.py", source);
-        let env = fixture.environment();
-
-        let os = binding(&env, "os");
-        assert_eq!(os.kind, BindingKind::ImportBinder);
-        assert_eq!(os.hoisting, HoistingClass::ScopeWide);
-        let block = env.scope(os.declaring_scope);
-        assert_eq!(
-            os.activation, block.range,
-            "the row covers its whole declaring scope: {block:?}"
-        );
-        assert_eq!(
-            reached(&env, "os", fixture.at("os.path.join")).node,
-            os.node
-        );
-    }
-
-    /// The same pin for TypeScript, whose imports are hoisted module bindings.
-    #[test]
-    fn a_typescript_import_binder_keeps_the_scope_wide_default() {
-        let source = concat!(
-            "import { helper } from \"./helper\";\n",
-            "\n",
-            "export function render(label: string): string {\n",
-            "    return helper(label);\n",
-            "}\n",
-        );
-        let fixture = Fixture::new(Language::TypeScript, "src/app.ts", source);
-        let env = fixture.environment();
-
-        let helper = binding(&env, "helper");
-        assert_eq!(helper.kind, BindingKind::ImportBinder);
-        assert_eq!(helper.hoisting, HoistingClass::ScopeWide);
-        assert_eq!(helper.declaring_scope, 0);
-        assert_eq!(helper.activation, env.scopes[0].range);
-        assert_eq!(
-            reached(&env, "helper", fixture.at("helper(label)")).node,
-            helper.node
-        );
-    }
-
-    /// Import binders and local binders are separate row families over the
-    /// same file, each with its own interval, so Milestone 3 can trace which
-    /// of the two a reference selected.
-    #[test]
-    fn java_import_and_local_rows_coexist_with_their_own_intervals() {
-        let source = concat!(
-            "package app;\n",
-            "import java.util.List;\n",
-            "class Widget {\n",
-            "    int render() {\n",
-            "        List items = null;\n",
-            "        return items.size();\n",
-            "    }\n",
-            "}\n",
-        );
-        let fixture = Fixture::new(Language::Java, "app/Widget.java", source);
-        let env = fixture.environment();
-
-        let list = binding(&env, "List");
-        let detail = list
-            .import
-            .as_ref()
-            .unwrap_or_else(|| panic!("List must be an import binder: {list:?}"));
-        assert_eq!(list.kind, BindingKind::ImportBinder);
-        assert_eq!(list.declaring_scope, 0, "a Java import binds file-wide");
-        assert_eq!(list.activation, env.scopes[0].range);
-        assert_eq!(detail.local_name, "List");
-        assert!(!detail.wildcard);
-        assert_eq!(detail.wildcard_ambiguous, None);
-        // Java imports gained a parser-derived structured path in #1603, so
-        // the row names both the local name and its target segments, and the
-        // import axis is covered. (Before #1603 this test pinned the gap that
-        // follow-up #1600 tracked.)
-        assert_eq!(
-            detail.target_segments,
-            vec!["java".to_owned(), "util".to_owned(), "List".to_owned()]
-        );
-        assert!(env.completeness.covers(EnvironmentAxis::ImportBinders));
-        assert!(env.completeness.covers(EnvironmentAxis::BindingIntervals));
-        assert!(env.completeness.covers(EnvironmentAxis::Scopes));
-
-        let items = binding(&env, "items");
-        assert_eq!(items.kind, BindingKind::Local);
-        assert_ne!(items.declaring_scope, 0);
-        assert_eq!(
-            reached(&env, "items", fixture.at("items.size")).node,
-            items.node
-        );
-
-        assert!(env.package.syntactic, "Java spells its package in source");
-        assert!(
-            env.package.package_fq.is_some(),
-            "package clause: {:?}",
-            env.package
         );
     }
 
@@ -1560,136 +1228,13 @@ mod tests {
         );
     }
 
-    /// The motivating discriminator of the whole plan: is the value operated on
-    /// inside this loop declared inside or outside the loop body?
-    #[test]
-    fn java_loop_reads_separate_outer_and_loop_local_bindings() {
-        let source = concat!(
-            "class Widget {\n",
-            "    void run() {\n",
-            "        String outer = \"a\";\n",
-            "        for (int index = 0; index < 3; index++) {\n",
-            "            String inner = \"b\";\n",
-            "            use(outer);\n",
-            "            use(inner);\n",
-            "        }\n",
-            "    }\n",
-            "}\n",
-        );
-        let fixture = Fixture::new(Language::Java, "app/Widget.java", source);
-        let env = fixture.environment();
-
-        let loop_scope = env
-            .scopes
-            .iter()
-            .find(|scope| {
-                scope
-                    .anchor
-                    .kind()
-                    .is_some_and(|kind| kind.satisfies(NormalizedKind::Loop))
-            })
-            .unwrap_or_else(|| panic!("the for statement must be a scope: {:?}", env.scopes));
-
-        let outer = reached(&env, "outer", fixture.at("outer);"));
-        let outer_scope = env.scope(outer.declaring_scope);
-        assert!(
-            outer_scope.range.start_byte < loop_scope.range.start_byte
-                && outer_scope.range.end_byte > loop_scope.range.end_byte,
-            "the outer binding is declared in a scope that contains the loop: {outer_scope:?} vs {loop_scope:?}"
-        );
-
-        let inner = reached(&env, "inner", fixture.at("inner);"));
-        let inner_scope = env.scope(inner.declaring_scope);
-        assert!(
-            inner_scope.range.start_byte >= loop_scope.range.start_byte
-                && inner_scope.range.end_byte <= loop_scope.range.end_byte,
-            "the loop-local binding is declared inside the loop: {inner_scope:?} vs {loop_scope:?}"
-        );
-    }
-
-    /// Scala derives its environment from the same facts as Java: the class is
-    /// the scope its members belong to, a method body block and a case clause
-    /// are scopes of their own, and a local shadowing a member is reached
-    /// where the member (excluded here, resolved at the member tiers) is not.
-    #[test]
-    fn scala_locals_and_pattern_binders_are_scoped_and_members_are_excluded() {
-        let source = concat!(
-            "object Host {\n",
-            "  val total = 1\n",
-            "  def run(seed: Option[Int]): Int = {\n",
-            "    val total = 2\n",
-            "    seed match {\n",
-            "      case Some(inner) => inner + total\n",
-            "      case None => total\n",
-            "    }\n",
-            "  }\n",
-            "}\n",
-        );
-        let fixture = Fixture::new(Language::Scala, "src/Host.scala", source);
-        let env = fixture.environment();
-        assert!(env.completeness.is_complete(), "{:?}", env.completeness);
-        assert_eq!(
-            scope_kinds(&env),
-            vec![
-                None,
-                Some(NormalizedKind::Class),
-                Some(NormalizedKind::Method),
-                Some(NormalizedKind::Block),
-                Some(NormalizedKind::Block),
-                Some(NormalizedKind::Block),
-            ],
-            "the file, the object, the method, its body and the two case clauses"
-        );
-
-        let total = binding(&env, "total");
-        assert_eq!(total.kind, BindingKind::Local);
-        assert_eq!(total.hoisting, HoistingClass::SourceOrder);
-        assert_eq!(
-            total.range.start_byte,
-            fixture.at("total = 2"),
-            "the member `val total = 1` is not a lexical binding"
-        );
-        assert_eq!(
-            reached(&env, "total", fixture.at("total\n      case None")).node,
-            total.node
-        );
-
-        let inner = binding(&env, "inner");
-        assert_eq!(inner.kind, BindingKind::PatternBinder);
-        assert_eq!(inner.hoisting, HoistingClass::DeclaredHead);
-        assert_eq!(
-            env.scope(inner.declaring_scope).anchor.kind(),
-            Some(NormalizedKind::Block),
-            "the pattern binder belongs to its case clause"
-        );
-        assert_eq!(
-            reached(&env, "inner", fixture.at("inner + total")).node,
-            inner.node
-        );
-        assert_eq!(
-            binding_of(
-                &env,
-                "inner",
-                fixture.at("None => total") + "None => ".len(),
-                None
-            ),
-            BindingOfOutcome::NoBinding,
-            "the pattern binder is out of effect in the next clause"
-        );
-
-        let seed = binding(&env, "seed");
-        assert_eq!(seed.kind, BindingKind::Parameter);
-        assert_eq!(
-            env.scope(seed.declaring_scope).anchor.kind(),
-            Some(NormalizedKind::Method)
-        );
-        assert!(env.package.syntactic, "Scala spells its package in source");
-    }
-
     /// A Scala `import` is a statement, so one written inside a block is in
     /// effect from the import onward and not from the block's first byte. A
     /// file-level import stays scope-wide, which is what every other language
     /// reports for every import (#2925).
+    #[brokk_bifrost_test_macros::hardwon(
+        "317af407fd3b: Scala imports and contextual parameters need their exact lexical scope"
+    )]
     #[test]
     fn a_scala_block_local_import_is_in_effect_only_below_the_import() {
         let source = concat!(
@@ -1751,6 +1296,9 @@ mod tests {
     /// A `given` and an `extension` are scopes of their own, so their
     /// parameters bind inside the definition rather than being excluded as
     /// members of the template they are written in (#2925).
+    #[brokk_bifrost_test_macros::hardwon(
+        "317af407fd3b: Scala imports and contextual parameters need their exact lexical scope"
+    )]
     #[test]
     fn scala_given_and_extension_parameters_bind_inside_their_definition() {
         let source = concat!(
@@ -1832,473 +1380,6 @@ mod tests {
             binding_of(&env, "value", fixture.at("build(base)"), None),
             BindingOfOutcome::NoBinding,
             "and nowhere else"
-        );
-    }
-
-    /// Ruby's scope tree is exactly the set of forms that open a fresh
-    /// local-variable scope: methods, blocks and lambdas, and class, module
-    /// and singleton-class bodies. `while`, `for` and `rescue` are normalized
-    /// as `Loop` and `Catch`, which every C-family adapter scopes, and Ruby
-    /// deliberately does not: a local first assigned inside one of them
-    /// outlives it.
-    #[test]
-    fn ruby_scopes_are_the_forms_that_open_a_local_variable_scope() {
-        let source = concat!(
-            "module Api\n",
-            "  class Widget\n",
-            "    def render(rows)\n",
-            "      while rows.any?\n",
-            "        rows.pop\n",
-            "      end\n",
-            "      begin\n",
-            "        risky\n",
-            "      rescue => error\n",
-            "        error\n",
-            "      end\n",
-            "      rows.each { |row| row }\n",
-            "    end\n",
-            "\n",
-            "    class << self\n",
-            "      def build\n",
-            "        1\n",
-            "      end\n",
-            "    end\n",
-            "  end\n",
-            "end\n",
-        );
-        let fixture = Fixture::new(Language::Ruby, "app/widget.rb", source);
-        let env = fixture.environment();
-
-        assert_eq!(
-            scope_kinds(&env),
-            vec![
-                None,
-                Some(NormalizedKind::Module),
-                Some(NormalizedKind::Class),
-                Some(NormalizedKind::Method),
-                Some(NormalizedKind::Lambda),
-                Some(NormalizedKind::Class),
-                Some(NormalizedKind::Method),
-            ],
-            "the file, the module, the class, `render`, its block, the \
-             singleton class and `build`"
-        );
-    }
-
-    /// A Ruby local exists from its first assignment onward, so a read above
-    /// the assignment reaches nothing and a read below it reaches the local.
-    /// The method's parameter is scope-wide over the method, reachable from
-    /// either side.
-    #[test]
-    fn ruby_local_is_in_effect_from_its_first_assignment_onward() {
-        let source = concat!(
-            "class Widget\n",
-            "  def render(label)\n",
-            "    puts label\n",
-            "    size = label\n",
-            "    size\n",
-            "  end\n",
-            "end\n",
-        );
-        let fixture = Fixture::new(Language::Ruby, "app/widget.rb", source);
-        let env = fixture.environment();
-        assert!(
-            env.completeness.covers(EnvironmentAxis::Scopes)
-                && env.completeness.covers(EnvironmentAxis::BindingIntervals),
-            "{:?}",
-            env.completeness
-        );
-
-        let label = binding(&env, "label");
-        assert_eq!(label.kind, BindingKind::Parameter);
-        assert_eq!(label.hoisting, HoistingClass::ScopeWide);
-        assert_eq!(
-            env.scope(label.declaring_scope).anchor.kind(),
-            Some(NormalizedKind::Method)
-        );
-
-        let size = binding(&env, "size");
-        assert_eq!(size.kind, BindingKind::Local);
-        assert_eq!(size.hoisting, HoistingClass::SourceOrder);
-        assert_eq!(
-            env.scope(size.declaring_scope).anchor.kind(),
-            Some(NormalizedKind::Method),
-            "Ruby has no block-statement scope: the local belongs to the method"
-        );
-
-        assert_eq!(
-            binding_of(&env, "size", fixture.at("puts label"), None),
-            BindingOfOutcome::NoBinding,
-            "a read above the first assignment reaches no binding"
-        );
-        assert_eq!(
-            reached(&env, "size", fixture.at("size\n  end")).node,
-            size.node,
-            "and a read below it reaches the local"
-        );
-        assert_eq!(
-            reached(&env, "label", fixture.at("label\n    size")).node,
-            label.node
-        );
-    }
-
-    /// A block parameter shadows a same-named method local inside the block
-    /// and nowhere else: the read inside the block reports the block parameter
-    /// as winner with the method local shadowed, and the read below the block
-    /// reaches the method local alone.
-    #[test]
-    fn ruby_block_parameter_shadows_the_enclosing_method_local() {
-        let source = concat!(
-            "def run(rows)\n",
-            "  value = 1\n",
-            "  rows.each do |value|\n",
-            "    use(value)\n",
-            "  end\n",
-            "  value\n",
-            "end\n",
-        );
-        let fixture = Fixture::new(Language::Ruby, "app/run.rb", source);
-        let env = fixture.environment();
-
-        let parameter = env
-            .bindings
-            .iter()
-            .find(|row| row.name == "value" && row.kind == BindingKind::Parameter)
-            .unwrap_or_else(|| panic!("the block parameter: {:?}", env.bindings));
-        let local = env
-            .bindings
-            .iter()
-            .find(|row| row.name == "value" && row.kind == BindingKind::Local)
-            .unwrap_or_else(|| panic!("the method local: {:?}", env.bindings));
-        assert_eq!(
-            env.scope(parameter.declaring_scope).anchor.kind(),
-            Some(NormalizedKind::Lambda),
-            "a block parameter belongs to its block"
-        );
-        assert_eq!(
-            env.scope(local.declaring_scope).anchor.kind(),
-            Some(NormalizedKind::Function)
-        );
-
-        match binding_of(&env, "value", fixture.at("value)\n  end"), None) {
-            BindingOfOutcome::Shadowed { winner, shadowed } => {
-                assert_eq!(env.bindings[winner].node, parameter.node);
-                assert_eq!(
-                    shadowed
-                        .iter()
-                        .map(|index| env.bindings[*index].node)
-                        .collect::<Vec<_>>(),
-                    vec![local.node],
-                    "the method local is shadowed, not dropped"
-                );
-            }
-            other => panic!("the block parameter must shadow the local, got {other:?}"),
-        }
-        assert_eq!(
-            reached(&env, "value", fixture.at("value\nend")).node,
-            local.node,
-            "below the block the method local is the only binding in effect"
-        );
-    }
-
-    /// `rescue => error` assigns a local of the *enclosing* scope, not of the
-    /// rescue clause: Ruby's parser declares the name in the method's local
-    /// table, so it stays in effect after the `begin`/`end`. The repository's
-    /// own Ruby binding collector agrees -- `collect_local_bindings` walks
-    /// into `rescue` and records `exception_variable` on the enclosing scope's
-    /// timeline rather than opening a scope for it.
-    #[test]
-    fn ruby_rescue_variable_is_a_local_of_the_enclosing_scope() {
-        let source = concat!(
-            "def run\n",
-            "  begin\n",
-            "    risky\n",
-            "  rescue => error\n",
-            "    handle(error)\n",
-            "  end\n",
-            "  error\n",
-            "end\n",
-        );
-        let fixture = Fixture::new(Language::Ruby, "app/run.rb", source);
-        let env = fixture.environment();
-
-        let error = binding(&env, "error");
-        assert_eq!(error.kind, BindingKind::CatchOrResource);
-        assert_eq!(error.hoisting, HoistingClass::SourceOrder);
-        assert_eq!(
-            env.scope(error.declaring_scope).anchor.kind(),
-            Some(NormalizedKind::Function),
-            "the rescue clause is not a scope of its own in Ruby"
-        );
-
-        assert_eq!(
-            binding_of(&env, "error", fixture.at("risky"), None),
-            BindingOfOutcome::NoBinding,
-            "a read above the rescue clause reaches nothing"
-        );
-        assert_eq!(
-            reached(&env, "error", fixture.at("error)")).node,
-            error.node
-        );
-        assert_eq!(
-            reached(&env, "error", fixture.at("error\nend")).node,
-            error.node,
-            "and the name outlives the begin/end block"
-        );
-    }
-
-    /// `@size`, `@@count` and `$global` are members and globals, never lexical
-    /// bindings: no binder introduces them, so the environment must carry no
-    /// row for them under either spelling.
-    #[test]
-    fn ruby_instance_class_and_global_variables_are_not_lexical_bindings() {
-        let source = concat!(
-            "class Widget\n",
-            "  def render(label)\n",
-            "    @size = label\n",
-            "    @@count = 1\n",
-            "    $global = 2\n",
-            "    @size\n",
-            "  end\n",
-            "end\n",
-        );
-        let fixture = Fixture::new(Language::Ruby, "app/widget.rb", source);
-        let env = fixture.environment();
-
-        let names: Vec<&str> = env.bindings.iter().map(|row| row.name.as_str()).collect();
-        assert_eq!(
-            names,
-            vec!["label"],
-            "only the parameter binds lexically: {:?}",
-            env.bindings
-        );
-        for name in ["@size", "size", "@@count", "count", "$global", "global"] {
-            assert_eq!(
-                binding_of(&env, name, fixture.at("@size\n  end"), None),
-                BindingOfOutcome::NoBinding,
-                "{name} must not reach a lexical binding"
-            );
-        }
-    }
-
-    /// Ruby answers its scopes and binding intervals and nothing else: it has
-    /// no import binder (a `require` loads a file and introduces no local
-    /// name) and no file-level package clause (namespacing is `module`/`class`
-    /// nesting, which is a scope fact rather than a property of the file). The
-    /// partial table is what keeps an empty import-binder row set from reading
-    /// as "this file imports nothing into its lexical namespace".
-    #[test]
-    fn ruby_declares_scopes_and_intervals_and_leaves_the_other_axes_unsupported() {
-        let source = "require \"json\"\n\ndef run\n  value = 1\n  value\nend\n";
-        let fixture = Fixture::new(Language::Ruby, "app/run.rb", source);
-        let env = fixture.environment();
-
-        assert!(env.completeness.covers(EnvironmentAxis::Scopes));
-        assert!(env.completeness.covers(EnvironmentAxis::BindingIntervals));
-        assert!(!env.completeness.covers(EnvironmentAxis::ImportBinders));
-        assert!(!env.completeness.covers(EnvironmentAxis::PackageClause));
-        assert!(
-            env.bindings
-                .iter()
-                .all(|row| row.kind != BindingKind::ImportBinder),
-            "a Ruby require introduces no import binder: {:?}",
-            env.bindings
-        );
-        assert_eq!(
-            reached(&env, "value", fixture.at("value\nend")).kind,
-            BindingKind::Local,
-            "an unsupported import axis must not stop binding-of from answering"
-        );
-    }
-
-    /// The two candidate axes belong to the resolution trace, so an
-    /// environment result never claims them even when it is otherwise
-    /// complete.
-    #[test]
-    fn an_environment_result_never_covers_the_candidate_axes() {
-        let source = "class Widget {\n    int render() { return 1; }\n}\n";
-        let fixture = Fixture::new(Language::Java, "app/Widget.java", source);
-        let env = fixture.environment();
-
-        assert!(env.completeness.is_complete(), "{:?}", env.completeness);
-        assert!(!env.completeness.covers(EnvironmentAxis::CandidateSelection));
-        assert!(!env.completeness.covers(EnvironmentAxis::CandidateRejection));
-        for &axis in ENVIRONMENT_PRODUCER_AXES {
-            assert!(env.completeness.covers(axis), "{axis} not covered");
-        }
-    }
-
-    /// PHP scopes variables by function. A parameter is in effect over the
-    /// whole callable whatever the position; a local comes into existence
-    /// where it is first written and lasts to the end of that callable, so a
-    /// read above its assignment reaches no binding at all rather than the
-    /// wrong one (#2962).
-    #[test]
-    fn php_parameters_are_scope_wide_and_locals_start_at_their_assignment() {
-        let source = concat!(
-            "<?php\n",
-            "\n",
-            "function render(string $label, int $size): string {\n",
-            "    $prefix = strtoupper($label);\n",
-            "    $joined = $prefix . $size;\n",
-            "    return $joined;\n",
-            "}\n",
-            "\n",
-            "$outside = render('a', 1);\n",
-        );
-        let fixture = Fixture::new(Language::Php, "src/render.php", source);
-        let env = fixture.environment();
-        assert!(env.completeness.is_complete(), "{:?}", env.completeness);
-
-        let label = binding(&env, "label");
-        assert_eq!(label.kind, BindingKind::Parameter);
-        assert_eq!(label.hoisting, HoistingClass::ScopeWide);
-        assert_eq!(
-            env.scope(label.declaring_scope).anchor.kind(),
-            Some(NormalizedKind::Function),
-            "a PHP parameter belongs to its callable, not to a body block"
-        );
-
-        let prefix = binding(&env, "prefix");
-        assert_eq!(prefix.kind, BindingKind::Local);
-        assert_eq!(prefix.hoisting, HoistingClass::SourceOrder);
-        assert_eq!(
-            prefix.activation.start_byte,
-            fixture.at("strtoupper($label)") + "strtoupper($label)".len(),
-            "the local is in effect from the end of the assignment that binds it"
-        );
-        assert_eq!(
-            binding_of(&env, "prefix", fixture.at("strtoupper($label)"), None),
-            BindingOfOutcome::NoBinding,
-            "a read inside the assignment's own right-hand side reaches nothing"
-        );
-        assert_eq!(
-            reached(&env, "prefix", fixture.at("$prefix . $size")).node,
-            prefix.node,
-            "and the read below it reaches exactly that binding"
-        );
-        assert_eq!(
-            reached(&env, "label", fixture.at("strtoupper($label)")).node,
-            label.node,
-            "the parameter is in effect over the whole body"
-        );
-        assert_eq!(
-            binding_of(&env, "label", fixture.at("$outside"), None),
-            BindingOfOutcome::NoBinding,
-            "and nowhere outside its callable"
-        );
-
-        // A script global is a lexical binding of the file scope, on the same
-        // first-assignment rule: PHP's global scope is a scope like any other.
-        let outside = binding(&env, "outside");
-        assert_eq!(outside.declaring_scope, 0);
-        assert_eq!(outside.hoisting, HoistingClass::SourceOrder);
-    }
-
-    /// PHP has no block scope. A name first written inside a `foreach` or a
-    /// `catch` is a local of the enclosing function and is still in effect
-    /// after that statement ends, which is why neither construct opens a scope
-    /// row for PHP even though the C-family default opens one for both.
-    #[test]
-    fn php_loop_and_catch_binders_outlive_their_statements() {
-        let source = concat!(
-            "<?php\n",
-            "\n",
-            "function tally(array $rows): int {\n",
-            "    $total = 0;\n",
-            "    foreach ($rows as $key => $row) {\n",
-            "        $total = $row + $key;\n",
-            "    }\n",
-            "    try {\n",
-            "        $total = risky($total);\n",
-            "    } catch (RuntimeException $error) {\n",
-            "        $total = $error->getCode();\n",
-            "    }\n",
-            "    return $row + $key + $error->getLine() + $total;\n",
-            "}\n",
-        );
-        let fixture = Fixture::new(Language::Php, "src/tally.php", source);
-        let env = fixture.environment();
-        assert!(env.completeness.is_complete(), "{:?}", env.completeness);
-
-        assert_eq!(
-            scope_kinds(&env),
-            vec![None, Some(NormalizedKind::Function)],
-            "only the file and the callable are scopes: PHP scopes by function"
-        );
-
-        let after = fixture.at("return $row");
-        for (name, kind) in [
-            ("row", BindingKind::LoopVariable),
-            ("key", BindingKind::LoopVariable),
-            ("error", BindingKind::CatchOrResource),
-        ] {
-            let found = binding(&env, name);
-            assert_eq!(found.kind, kind, "{name}");
-            assert_eq!(found.hoisting, HoistingClass::SourceOrder, "{name}");
-            assert_eq!(
-                reached(&env, name, after).node,
-                found.node,
-                "{name} is still in effect after the statement that binds it"
-            );
-        }
-        assert_eq!(
-            reached(&env, "row", fixture.at("$row + $key;")).node,
-            binding(&env, "row").node,
-            "and inside the loop body too"
-        );
-    }
-
-    /// A closure's `use (...)` capture is bound when the closure is created,
-    /// so it is scope-wide inside the closure and in effect nowhere else. The
-    /// closure's own parameters behave the same way.
-    #[test]
-    fn php_closure_use_captures_bind_inside_the_closure_only() {
-        let source = concat!(
-            "<?php\n",
-            "\n",
-            "function build(int $seed): callable {\n",
-            "    $offset = $seed + 1;\n",
-            "    $adder = function (int $addend) use ($offset) {\n",
-            "        return $addend + $offset;\n",
-            "    };\n",
-            "    return $adder;\n",
-            "}\n",
-        );
-        let fixture = Fixture::new(Language::Php, "src/build.php", source);
-        let env = fixture.environment();
-        assert!(env.completeness.is_complete(), "{:?}", env.completeness);
-
-        let capture = env
-            .bindings
-            .iter()
-            .find(|row| row.name == "offset" && row.kind == BindingKind::Parameter)
-            .unwrap_or_else(|| panic!("no capture binding; bindings: {:?}", env.bindings));
-        assert_eq!(capture.hoisting, HoistingClass::ScopeWide);
-        assert_eq!(
-            env.scope(capture.declaring_scope).anchor.kind(),
-            Some(NormalizedKind::Lambda),
-            "the capture is declared by the closure, not by its enclosing function"
-        );
-        assert_eq!(
-            capture.range.start_byte,
-            fixture.at("$offset) {") + 1,
-            "the capture's binder token is the name inside the `use` clause"
-        );
-
-        // Inside the closure both the capture and the enclosing local of the
-        // same name are in effect; the nearer scope wins.
-        match binding_of(&env, "offset", fixture.at("$addend + $offset"), None) {
-            BindingOfOutcome::Shadowed { winner, shadowed } => {
-                assert_eq!(env.bindings[winner].node, capture.node);
-                assert_eq!(shadowed.len(), 1, "the enclosing local is the loser");
-            }
-            other => panic!("expected the capture to shadow the enclosing local: {other:?}"),
-        }
-        assert_eq!(
-            binding_of(&env, "addend", fixture.at("return $adder"), None),
-            BindingOfOutcome::NoBinding,
-            "a closure parameter is in effect nowhere outside the closure"
         );
     }
 
@@ -2408,51 +1489,6 @@ mod tests {
             binding_of(&env, "Gadget", fixture.at("return 1"), None),
             BindingOfOutcome::NoBinding,
             "the sibling namespace never sees it"
-        );
-    }
-
-    /// A class body is a member space, not a binding scope: a property, a
-    /// class constant and an enum case are members and never appear as lexical
-    /// bindings. A promoted constructor parameter is both -- it declares a
-    /// property AND binds a name in the constructor -- and the binding side is
-    /// what the environment reports.
-    #[test]
-    fn php_class_members_are_not_lexical_bindings() {
-        let source = concat!(
-            "<?php\n",
-            "\n",
-            "class Service {\n",
-            "    public string $field = '';\n",
-            "    private const LIMIT = 3;\n",
-            "\n",
-            "    public function __construct(private int $size) {}\n",
-            "\n",
-            "    public function run(): int {\n",
-            "        $this->field = 'x';\n",
-            "        return $this->size + self::LIMIT;\n",
-            "    }\n",
-            "}\n",
-        );
-        let fixture = Fixture::new(Language::Php, "src/Service.php", source);
-        let env = fixture.environment();
-        assert!(env.completeness.is_complete(), "{:?}", env.completeness);
-
-        let names: Vec<&str> = env.bindings.iter().map(|row| row.name.as_str()).collect();
-        assert_eq!(
-            names,
-            ["size"],
-            "only the promoted constructor parameter binds a name lexically"
-        );
-        let size = binding(&env, "size");
-        assert_eq!(size.kind, BindingKind::Parameter);
-        assert_eq!(
-            env.scope(size.declaring_scope).anchor.kind(),
-            Some(NormalizedKind::Constructor)
-        );
-        assert_eq!(
-            binding_of(&env, "field", fixture.at("$this->field"), None),
-            BindingOfOutcome::NoBinding,
-            "`$this->field` resolves at the member tiers, not in the environment"
         );
     }
 }

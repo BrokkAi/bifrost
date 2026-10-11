@@ -12,6 +12,7 @@ import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
+import { gitWithTestIdentity } from "./test-fixtures.mjs";
 
 const SCRIPT = fileURLToPath(new URL("sync-policy-scan-action.sh", import.meta.url));
 
@@ -51,26 +52,17 @@ Pin an exact tag when a gate has to stay reproducible:
 `;
 
 function git(args, cwd) {
-  return execFileSync("git", args, {
-    cwd,
-    encoding: "utf8",
-    env: {
-      ...process.env,
-      GIT_AUTHOR_NAME: "Test",
-      GIT_AUTHOR_EMAIL: "test@example.com",
-      GIT_COMMITTER_NAME: "Test",
-      GIT_COMMITTER_EMAIL: "test@example.com",
+  return gitWithTestIdentity(cwd, args, {
       GIT_CONFIG_COUNT: "1",
       GIT_CONFIG_KEY_0: "commit.gpgsign",
       GIT_CONFIG_VALUE_0: "false",
-    },
   });
 }
 
 function withFixture(body, { action = ACTION, readme = README } = {}) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bifrost-policy-scan-sync."));
   try {
-    // A release checkout: only the three files the script reads.
+    // A release checkout with the complete action runtime closure.
     const checkout = path.join(dir, "checkout");
     fs.mkdirSync(path.join(checkout, ".github/actions/policy-scan"), { recursive: true });
     fs.mkdirSync(path.join(checkout, "packaging/policy-scan-action"), { recursive: true });
@@ -80,9 +72,11 @@ function withFixture(body, { action = ACTION, readme = README } = {}) {
 
     // The alias repository, as a bare repo the script can clone and push to.
     const bare = path.join(dir, "alias.git");
-    git(["init", "-q", "--bare", "-b", "main", bare]);
+    git(["init", "-q", "--bare", bare]);
+    git(["symbolic-ref", "HEAD", "refs/heads/main"], bare);
     const seed = path.join(dir, "seed");
-    git(["init", "-q", "-b", "main", seed]);
+    git(["init", "-q", seed]);
+    git(["symbolic-ref", "HEAD", "refs/heads/main"], seed);
     fs.writeFileSync(path.join(seed, "README.md"), "seed\n");
     git(["add", "-A"], seed);
     git(["-c", "commit.gpgsign=false", "commit", "-q", "-m", "seed"], seed);
@@ -336,7 +330,7 @@ function runGate({ code, diffBase = "", report, rawReport, failOn = "warning" })
 }
 
 function sarifReport({ results = [], diffBaseline, suppressionReviews = [], executionSuccessful = true, notifications = [] } = {}) {
-  const properties = {};
+  const properties = { "bifrost.policyRuns": [{ policyId: "fixture.rule", completion: { type: "complete" } }] };
   if (diffBaseline !== undefined) {
     properties["bifrost.diffBaseline"] = diffBaseline;
   }
@@ -477,7 +471,7 @@ test("unexpected statuses and missing or invalid SARIF fail closed", () => {
 
   const unsuccessful = runGate({ code: 0, report: sarifReport({ executionSuccessful: false }) });
   assert.equal(unsuccessful.status, 1);
-  assert.match(unsuccessful.stdout, /unsuccessful invocation/u);
+  assert.match(unsuccessful.stdout, /successful completed policy execution/u);
 
   const invalid = runGate({ code: 0, rawReport: "not json" });
   assert.equal(invalid.status, 1);
@@ -566,7 +560,7 @@ exit 2
 
     const scanEnv = {
       ...env, SARIF_FILE: 'report.sarif', FAIL_ON: 'warning', POLICY_PACKS: '',
-      POLICY_IDS: 'rule.one', POLICY_CATEGORIES: '', POLICY_FILES: '', DIFF_BASE: 'abc123',
+      POLICY_IDS: 'rule.one', EXCLUDE_POLICY_IDS: '', POLICY_CATEGORIES: '', POLICY_FILES: '', DIFF_BASE: 'abc123',
       POLICY_TIMINGS: 'true', FULL_EVALUATION: 'false', MANAGED_CACHE: 'true', MANAGED_CACHE_ROOT: outputs['cache-root'],
     };
     runActionScript('Run policies', scanEnv, dir);
@@ -721,7 +715,7 @@ exit "\${ANALYZER_STATUS:-0}"
     env: {
       ...process.env,
       WORKDIR: dir, BIFROST_BIN: binary, GITHUB_OUTPUT: path.join(dir, 'outputs'),
-      SARIF_FILE: 'report.sarif', FAIL_ON: 'warning', POLICY_PACKS: '', POLICY_IDS: '',
+      SARIF_FILE: 'report.sarif', FAIL_ON: 'warning', POLICY_PACKS: '', POLICY_IDS: '', EXCLUDE_POLICY_IDS: '',
       POLICY_CATEGORIES: '', POLICY_FILES: '', DIFF_BASE: '', MANAGED_CACHE: 'false',
       MANAGED_CACHE_ROOT: '', POLICY_TIMINGS: 'true',
     },
@@ -858,10 +852,49 @@ test('partial policy diagnostics remain uploadable when SARIF and step outputs a
   const end = action.indexOf('    - name: Summarize policy execution', start);
   const retention = action.slice(start, end);
   assert.match(retention, /if: always\(\) && inputs.artifact-name != ''/);
+  assert.match(retention, /steps\.scan-output\.outcome == 'success'/);
   assert.doesNotMatch(retention, /steps.run.outputs/);
   assert.match(retention, /inputs.working-directory.*inputs.sarif-file.*\.stderr.log/);
   assert.match(retention, /if-no-files-found: error/);
   const gate = runGate({ code: 0 });
   assert.equal(gate.status, 1);
   assert.match(gate.stdout, /did not emit a SARIF report/);
+});
+
+test('binary acquisition runs after stale scan output is cleared', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'bifrost-policy-stale-output.'));
+  try {
+    const report = path.join(dir, 'report.sarif');
+    const log = `${report}.stderr.log`;
+    fs.writeFileSync(report, JSON.stringify(sarifReport()));
+    fs.writeFileSync(log, 'preceding invocation diagnostics\n');
+    const cleared = runActionScript('Clear previous scan output', { WORKDIR: dir, SARIF_FILE: 'report.sarif' }, dir);
+    assert.equal(cleared.status, 0, cleared.stderr + cleared.stdout);
+    const action = fs.readFileSync('.github/actions/policy-scan/action.yml', 'utf8');
+    assert.match(action, /prepare-open-packs --cache-dir/);
+    assert.match(action, /prepare-open-packs --cache-dir.*--receipt-path/su);
+    assert.equal(fs.existsSync(report), false);
+    assert.equal(fs.existsSync(log), false);
+    assert.ok(action.indexOf('name: Clear previous scan output') < action.indexOf('name: Resolve pack acquisition identity'));
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("standalone alias carries only the composite action contract", () => {
+  withFixture(({ checkout, bare, dir }) => {
+    assert.equal(sync(checkout, bare, "v0.11.0").status, 0);
+    const aliasFiles = execFileSync('git', ['--git-dir', bare, 'ls-tree', '-r', '--name-only', 'v0.11.0'], { encoding: 'utf8' }).trim().split('\n').sort();
+    assert.deepEqual(aliasFiles, ['LICENSE.md', 'README.md', 'action.yml']);
+  });
+});
+
+test("exit zero cannot label absent or incomplete policy execution clean", () => {
+  for (const completion of [undefined, [], [{ completion: { type: "inconclusive" } }], [{ completion: { type: "proven_subset" } }]]) {
+    const report = sarifReport();
+    report.runs[0].properties['bifrost.policyRuns'] = completion;
+    const result = runGate({ code: 0, report });
+    assert.equal(result.status, 1);
+    assert.doesNotMatch(result.stdout, /scan is clean/);
+  }
 });

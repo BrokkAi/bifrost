@@ -1,14 +1,16 @@
 use super::*;
+use crate::test_helpers::occurrence_text;
+use crate::test_helpers::parse_rust as parse;
 
+use crate::declarations::RustEmbeddedSourceMap;
 use crate::item_sources::RustItemSourceSink;
 use brokk_bifrost_core::analyzer::rust_facts::{RustMacroDelimiter, RustMacroRepetitionOperator};
 use brokk_bifrost_core::analyzer::source_facts::SourceOccurrenceSink;
 use brokk_bifrost_core::analyzer::source_facts::{
-    PrimarySourceFactCollector, SourceDeclarationId, SourceFactRows, SourceOccurrenceId,
-    SourceOccurrenceProvenance,
+    PrimarySourceFactCollector, SourceDeclarationId, SourceOccurrenceId, SourceOccurrenceProvenance,
 };
 use std::collections::HashMap;
-use tree_sitter::{Node, Parser, Tree};
+use tree_sitter::{Node, Tree};
 
 struct PrimarySink<'source> {
     collector: PrimarySourceFactCollector<'source>,
@@ -16,11 +18,7 @@ struct PrimarySink<'source> {
 
 impl RustItemSourceSink for PrimarySink<'_> {
     fn declare_node(&mut self, node: Node<'_>) -> SourceDeclarationId {
-        let occurrence = self.collector.intern_node(node);
-        let name = node
-            .child_by_field_name("name")
-            .map(|name| self.collector.intern_node(name));
-        self.collector.declare(occurrence, name)
+        crate::item_sources::declare_primary_node(&mut self.collector, node)
     }
 }
 
@@ -42,21 +40,12 @@ impl SourceOccurrenceSink for PrimarySink<'_> {
 
 struct EmbeddedSink<'source> {
     collector: PrimarySourceFactCollector<'source>,
-    occurrences: HashMap<usize, SourceOccurrenceId>,
+    source_map: RustEmbeddedSourceMap,
 }
 
 impl SourceOccurrenceSink for EmbeddedSink<'_> {
     fn intern_node(&mut self, node: Node<'_>) -> SourceOccurrenceId {
-        if let Some(occurrence) = self.occurrences.get(&node.id()).copied() {
-            return occurrence;
-        }
-        let occurrence = self.collector.intern_subspan_bytes(
-            node.start_byte(),
-            node.end_byte(),
-            SourceOccurrenceProvenance::Embedded,
-        );
-        assert!(self.occurrences.insert(node.id(), occurrence).is_none());
-        occurrence
+        self.source_map.intern_node(node, &mut self.collector)
     }
 
     fn intern_subspan_bytes(
@@ -80,14 +69,6 @@ impl RustItemSourceSink for EmbeddedSink<'_> {
     }
 }
 
-fn parse(source: &str) -> Tree {
-    let mut parser = Parser::new();
-    parser
-        .set_language(&tree_sitter_rust::LANGUAGE.into())
-        .expect("Rust grammar");
-    parser.parse(source, None).expect("Rust tree")
-}
-
 fn macro_definition(tree: &Tree) -> Node<'_> {
     let mut stack = vec![tree.root_node()];
     while let Some(node) = stack.pop() {
@@ -98,15 +79,6 @@ fn macro_definition(tree: &Tree) -> Node<'_> {
         stack.extend(node.named_children(&mut cursor));
     }
     panic!("macro definition")
-}
-
-fn occurrence_text<'source>(
-    source: &'source str,
-    rows: &SourceFactRows,
-    occurrence: SourceOccurrenceId,
-) -> &'source str {
-    let range = rows.occurrence(occurrence).range;
-    &source[range.start_byte..range.end_byte]
 }
 
 #[test]
@@ -225,7 +197,7 @@ fn embedded_capture_retains_embedded_occurrence_provenance() {
     let definition = macro_definition(&tree);
     let mut sink = EmbeddedSink {
         collector: PrimarySourceFactCollector::new(source),
-        occurrences: HashMap::new(),
+        source_map: RustEmbeddedSourceMap::default(),
     };
     let context = sink.intern_node(tree.root_node());
     let fact = capture_macro_definition(definition, source, &mut sink, context);

@@ -1,72 +1,26 @@
 ---
 title: Zed LSP
-description: Configure Zed to use Bifrost as an editor language server.
+description: Status of Bifrost language-server support in Zed.
 ---
 
-Zed can use Bifrost as an editor language server for navigation and references.
-This is separate from Zed Agent/MCP support: configure the LSP adapter when you
-want editor features, and configure MCP when you want the agent to call Bifrost
-tools.
+:::caution[No released Zed LSP setup yet]
+The language server is the separate `bifrost-lsp` program, and `bifrost-lsp`
+has no release yet. Bifrost built after release 0.12.0 does not serve LSP:
+`bifrost --lsp` exits with an error. See [LSP Server](/lsp/).
+:::
 
-The Bifrost Zed extension lives in `editors/zed`. It starts Bifrost with:
-
-```bash
-bifrost --root <worktree-root> --lsp
-```
-
-## Install the Development Extension
-
-For local development, build Bifrost from the repository root:
+Bifrost has no published Zed extension. The Bifrost source repository contains
+an unpublished development scaffold for one. It starts the language server with:
 
 ```bash
-cargo build --bin bifrost
+bifrost-lsp --root <worktree-root>
 ```
 
-Then open Zed, run `zed: install dev extension`, and select `editors/zed`.
+It uses the `binary.path` setting of the language server's own entry, then of
+`lsp.bifrost`, and otherwise looks for `bifrost-lsp` on `PATH`. Values in
+`lsp.bifrost.binary.arguments` are appended after `--root`.
+Until `bifrost-lsp` is released, the scaffold has no release binary to start.
+It is not a supported integration.
 
-For the first smoke test, put the Bifrost binary on `PATH` and configure the
-language to use the Bifrost adapter:
-
-```json
-{
-  "languages": {
-    "Rust": {
-      "language_servers": ["bifrost-rust", "!rust-analyzer"]
-    }
-  }
-}
-```
-
-If you want Bifrost to run alongside Zed's default language server, keep both
-servers in the list:
-
-```json
-{
-  "languages": {
-    "Rust": {
-      "language_servers": ["bifrost-rust", "rust-analyzer"]
-    }
-  }
-}
-```
-
-Use the concrete Zed adapter ID for the language you are configuring, such as
-`bifrost-rust`, `bifrost-python`, `bifrost-go`, `bifrost-javascript`,
-`bifrost-typescript`, `bifrost-ruby`, `bifrost-php`, `bifrost-csharp`,
-`bifrost-scala`, `bifrost-kotlin`, or `bifrost-java`.
-
-Avoid `lsp.bifrost-rust.binary.path` for local testing. Zed treats that setting
-as a direct language-server binary override and starts the executable without
-the extension's `--root <worktree-root> --lsp` arguments. Prefer PATH-based
-resolution or the dev extension path so the extension can add the workspace
-root arguments.
-
-## Validate the Setup
-
-Open a supported source file and use Zed's normal go-to-definition or references
-actions. Bifrost should be the language server handling the request for the
-configured adapter.
-
-If Zed rejects the settings block with a message like `Property bifrost is not
-allowed`, check that the setting uses the adapter ID, such as `bifrost-rust`,
-not a generic `bifrost` language-server key.
+To use Bifrost tools from Zed's agent, configure MCP instead. MCP does not need
+the language server. See [Zed MCP](/zed-mcp/).

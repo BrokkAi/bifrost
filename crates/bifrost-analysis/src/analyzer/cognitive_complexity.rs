@@ -14,9 +14,11 @@
 // re-exported here at its historical path. Only the scorer stays.
 use brokk_bifrost_core::analyzer::cognitive_complexity::slice_contains;
 pub use brokk_bifrost_core::analyzer::cognitive_complexity::{
-    CaseIncrementPredicate, Config, DefaultCasePredicate, JumpPredicate,
-    NamedFunctionBoundaryPredicate, is_wildcard_case,
+    CallableMetrics, CallableMetricsCoverage, CaseIncrementPredicate, Config, DefaultCasePredicate,
+    JumpPredicate, NamedFunctionBoundaryPredicate, is_wildcard_case,
 };
+use brokk_bifrost_core::analyzer::semantic_diagnostics::same_node;
+use brokk_bifrost_core::analyzer::tree_walk::{is_comment_kind, node_range};
 
 use crate::analyzer::tree_walk::named_children;
 use tree_sitter::Node;
@@ -28,6 +30,24 @@ struct Frame<'tree> {
     root: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WalkMode {
+    /// Preserve the historical MCP scorer semantics, including descending into
+    /// configured anonymous functions with one extra nesting level.
+    Legacy,
+    /// Treat every nested callable as a separate owner and retain only the
+    /// executable leaves owned by the root callable.
+    CallableMetrics,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct WalkResult {
+    complexity: u32,
+    max_nesting: u32,
+    owned_start_line: Option<usize>,
+    owned_end_line: Option<usize>,
+}
+
 /// Compute the cognitive complexity of `root` according to `config`.
 ///
 /// `root` should be the tree-sitter node representing the function/method
@@ -36,7 +56,48 @@ struct Frame<'tree> {
 /// default/wildcard switch cases and to read the bytes of anonymous
 /// logical-operator tokens.
 pub fn compute(root: Node<'_>, source: &str, config: &Config) -> u32 {
+    walk(root, source, config, WalkMode::Legacy).complexity
+}
+
+/// Compute the structured metrics used by the query-local `callable_metrics`
+/// relation. Nested named and anonymous callables are ownership boundaries;
+/// their bodies are not included in the enclosing callable's complexity,
+/// nesting, or owned executable span.
+pub fn compute_metrics(root: Node<'_>, source: &str, config: &Config) -> CallableMetrics {
+    let body = root.child_by_field_name("body");
+    let result = walk(root, source, config, WalkMode::CallableMetrics);
+    let Some(body) = body else {
+        return CallableMetrics {
+            coverage: CallableMetricsCoverage::Incomplete,
+            max_nesting: Some(result.max_nesting),
+            cognitive_complexity: Some(result.complexity),
+            owned_body_span_lines: None,
+        };
+    };
+    let coverage = if root.has_error() || root.is_missing() || body.has_error() || body.is_missing()
+    {
+        CallableMetricsCoverage::Incomplete
+    } else {
+        CallableMetricsCoverage::Exact
+    };
+    let owned_body_span_lines = result
+        .owned_start_line
+        .zip(result.owned_end_line)
+        .map(|(start, end)| end.saturating_sub(start).saturating_add(1) as u32);
+    CallableMetrics {
+        coverage,
+        max_nesting: Some(result.max_nesting),
+        cognitive_complexity: Some(result.complexity),
+        owned_body_span_lines,
+    }
+}
+
+fn walk(root: Node<'_>, source: &str, config: &Config, mode: WalkMode) -> WalkResult {
     let mut complexity: u32 = 0;
+    let mut max_nesting: u32 = 0;
+    let mut owned_start_line: Option<usize> = None;
+    let mut owned_end_line: Option<usize> = None;
+    let owned_body = root.child_by_field_name("body");
     let mut work: Vec<Frame<'_>> = Vec::new();
     work.push(Frame {
         node: root,
@@ -50,6 +111,9 @@ pub fn compute(root: Node<'_>, source: &str, config: &Config) -> u32 {
         let kind = node.kind();
 
         if config.is_any_if(kind) {
+            if mode == WalkMode::CallableMetrics {
+                max_nesting = max_nesting.max(frame.nesting.saturating_add(1));
+            }
             complexity = complexity.saturating_add(if frame.else_if_continuation {
                 1
             } else {
@@ -60,9 +124,15 @@ pub fn compute(root: Node<'_>, source: &str, config: &Config) -> u32 {
             || slice_contains(config.catch_types, kind)
             || slice_contains(config.conditional_types, kind)
         {
+            if mode == WalkMode::CallableMetrics {
+                max_nesting = max_nesting.max(frame.nesting.saturating_add(1));
+            }
             complexity = complexity.saturating_add(control_flow_increment(frame.nesting));
             push_named_children(&mut work, node, frame.nesting + 1, false);
         } else if slice_contains(config.case_types, kind) {
+            if mode == WalkMode::CallableMetrics {
+                max_nesting = max_nesting.max(frame.nesting.saturating_add(1));
+            }
             let case_count = config.case_increment_predicate.map_or_else(
                 || {
                     u32::from(
@@ -99,10 +169,32 @@ pub fn compute(root: Node<'_>, source: &str, config: &Config) -> u32 {
                     .named_function_boundary_predicate
                     .map(|pred| pred(node))
                     .unwrap_or(false);
-            if !frame.root && named_boundary {
+            let anonymous_boundary = slice_contains(config.anonymous_function_types, kind);
+            if !frame.root
+                && (named_boundary || (mode == WalkMode::CallableMetrics && anonymous_boundary))
+            {
                 continue;
             }
-            let child_nesting = if slice_contains(config.anonymous_function_types, kind) {
+            if mode == WalkMode::CallableMetrics
+                && !frame.root
+                && owned_body.is_some_and(|body| {
+                    !same_node(node, body)
+                        && node.start_byte() >= body.start_byte()
+                        && node.end_byte() <= body.end_byte()
+                })
+                && node.named_child_count() == 0
+                && !is_comment_kind(node.kind())
+            {
+                let range = node_range(node);
+                owned_start_line = Some(
+                    owned_start_line.map_or(range.start_line, |start| start.min(range.start_line)),
+                );
+                owned_end_line =
+                    Some(owned_end_line.map_or(range.end_line, |end| end.max(range.end_line)));
+            }
+            let child_nesting = if mode == WalkMode::Legacy
+                && slice_contains(config.anonymous_function_types, kind)
+            {
                 frame.nesting + 1
             } else {
                 frame.nesting
@@ -116,7 +208,13 @@ pub fn compute(root: Node<'_>, source: &str, config: &Config) -> u32 {
         }
     }
 
-    complexity
+    debug_assert_eq!(owned_start_line.is_some(), owned_end_line.is_some());
+    WalkResult {
+        complexity,
+        max_nesting,
+        owned_start_line,
+        owned_end_line,
+    }
 }
 
 fn push_if_children<'tree>(
@@ -177,15 +275,14 @@ fn push_named_children<'tree>(
     nesting: u32,
     root: bool,
 ) {
-    let children = named_children(node);
-    for child in children.into_iter().rev() {
-        work.push(Frame {
+    brokk_bifrost_core::analyzer::tree_walk::push_named_children_reversed_as(node, work, |child| {
+        Frame {
             node: child,
             nesting,
             else_if_continuation: false,
             root,
-        });
-    }
+        }
+    });
 }
 
 fn push_named_children_except<'tree>(
@@ -194,20 +291,17 @@ fn push_named_children_except<'tree>(
     except: Option<Node<'tree>>,
     nesting: u32,
 ) {
-    let children = named_children(node);
-    for child in children.into_iter().rev() {
-        if let Some(skip) = except
-            && same_range(child, skip)
-        {
-            continue;
-        }
-        work.push(Frame {
+    brokk_bifrost_core::analyzer::tree_walk::push_named_children_reversed_where_as(
+        node,
+        work,
+        |child| except.is_none_or(|skip| !same_node(child, skip)),
+        |child| Frame {
             node: child,
             nesting,
             else_if_continuation: false,
             root: false,
-        });
-    }
+        },
+    );
 }
 
 fn control_flow_increment(nesting: u32) -> u32 {
@@ -287,113 +381,7 @@ fn direct_named_child_matching<'tree, F>(node: Node<'tree>, pred: F) -> Option<N
 where
     F: Fn(&str) -> bool,
 {
-    let mut cursor = node.walk();
-    node.named_children(&mut cursor)
-        .find(|child| pred(child.kind()))
-}
-
-fn same_range(a: Node<'_>, b: Node<'_>) -> bool {
-    a.start_byte() == b.start_byte() && a.end_byte() == b.end_byte()
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use tree_sitter::Parser;
-
-    fn rust_config() -> Config {
-        // Minimal Rust-flavoured config sufficient for in-module tests; the
-        // real config lives next to `RustAdapter`.
-        Config {
-            if_types: &["if_expression"],
-            loop_types: &["for_expression", "while_expression", "loop_expression"],
-            case_types: &["match_arm"],
-            binary_types: &["binary_expression"],
-            logical_operators: &["&&", "||"],
-            jump_types: &["break_expression", "continue_expression"],
-            named_function_boundary_types: &["function_item"],
-            anonymous_function_types: &["closure_expression"],
-            else_clause_types: &["else_clause"],
-            default_case_predicate: Some(is_wildcard_case),
-            ..Config::empty()
-        }
-    }
-
-    fn parse_rust(source: &str) -> tree_sitter::Tree {
-        let mut parser = Parser::new();
-        parser
-            .set_language(&tree_sitter_rust::LANGUAGE.into())
-            .unwrap();
-        parser.parse(source, None).expect("parse")
-    }
-
-    fn find_function<'tree>(root: Node<'tree>, name: &str, source: &str) -> Option<Node<'tree>> {
-        if root.kind() == "function_item" {
-            let mut cursor = root.walk();
-            for child in root.named_children(&mut cursor) {
-                if child.kind() == "identifier"
-                    && source
-                        .get(child.start_byte()..child.end_byte())
-                        .map(|t| t == name)
-                        .unwrap_or(false)
-                {
-                    return Some(root);
-                }
-            }
-        }
-        let mut cursor = root.walk();
-        for child in root.named_children(&mut cursor) {
-            if let Some(found) = find_function(child, name, source) {
-                return Some(found);
-            }
-        }
-        None
-    }
-
-    fn score(source: &str, fn_name: &str) -> u32 {
-        let tree = parse_rust(source);
-        let node = find_function(tree.root_node(), fn_name, source).expect("function not found");
-        compute(node, source, &rust_config())
-    }
-
-    #[test]
-    fn simple_function_is_zero() {
-        assert_eq!(score("fn method() -> i32 { 0 }", "method"), 0);
-    }
-
-    #[test]
-    fn if_nested_if_and_else_if() {
-        let source = "fn method(a: i32, b: i32) -> i32 {\n\
-            if a > 0 {\n\
-                if b > 0 { return 1; }\n\
-            } else if a < 0 {\n\
-                return -1;\n\
-            }\n\
-            0\n\
-        }\n";
-        assert_eq!(score(source, "method"), 4);
-    }
-
-    #[test]
-    fn loops_match_logical_and_closure() {
-        let source = "fn method(x: i32) -> i32 {\n\
-            let f = || { if x > 0 { 1 } else { 0 } };\n\
-            'outer: for i in 0..x {\n\
-                if x > 0 && i > 0 || i < 10 { break 'outer; }\n\
-            }\n\
-            while x > 0 { continue; }\n\
-            match x { 1 => f(), _ => 0 }\n\
-        }\n";
-        assert_eq!(score(source, "method"), 10);
-    }
-
-    #[test]
-    fn deep_nesting_does_not_overflow() {
-        let mut source = String::from("fn method(x: i32) -> i32 {\n");
-        source.push_str(&"if x > 0 {\n".repeat(120));
-        source.push_str("return 1;\n");
-        source.push_str(&"}\n".repeat(120));
-        source.push_str("0\n}\n");
-        assert_eq!(score(&source, "method"), 7_260);
-    }
+    brokk_bifrost_core::analyzer::tree_walk::first_named_child_matching(node, |child| {
+        pred(child.kind())
+    })
 }

@@ -202,19 +202,22 @@ fn resolve_events(
     let mut used_manifests = Vec::new();
     for event in events {
         let trigger = match &event.trigger {
-            TypestateEventTrigger::Calls { subject, phase, .. } => {
+            TypestateEventTrigger::Calls {
+                subject,
+                phase,
+                argument_condition,
+                ..
+            } => {
                 validate_call_phase(*phase, subject)?;
                 ResolvedTypestateEventTrigger::Calls {
                     selector_path: event_selector_path(&event.id)?,
                     subject: subject.clone(),
                     phase: *phase,
+                    argument_condition: *argument_condition,
                 }
             }
             TypestateEventTrigger::MatchEndpoints { set, role, phase } => {
-                let selected = universe.select_match_set(set, *role, false, manifests)?;
-                for identity in &selected.identities {
-                    universe.validate_observation(identity, *phase)?;
-                }
+                let selected = resolve_observed_match_set(set, *role, *phase, universe, manifests)?;
                 endpoint_identities.extend(selected.identities.iter().cloned());
                 used_manifests.extend(selected.manifests);
                 ResolvedTypestateEventTrigger::MatchEndpoints {
@@ -303,10 +306,7 @@ fn resolve_expectations(
     for expectation in expectations {
         let trigger = match &expectation.trigger {
             TypestateTerminalTrigger::MatchEndpoints { set, role, phase } => {
-                let selected = universe.select_match_set(set, *role, false, manifests)?;
-                for identity in &selected.identities {
-                    universe.validate_observation(identity, *phase)?;
-                }
+                let selected = resolve_observed_match_set(set, *role, *phase, universe, manifests)?;
                 endpoint_identities.extend(selected.identities.iter().cloned());
                 used_manifests.extend(selected.manifests);
                 ResolvedTypestateTerminalTrigger::MatchEndpoints {
@@ -369,29 +369,12 @@ fn validate_event_ambiguity(
     events: &[ResolvedTypestateEventSpec],
     graph: &PrecedenceGraph<TypestateEventId>,
 ) -> Result<(), CompositionError> {
-    for left_index in 0..events.len() {
-        for right_index in (left_index + 1)..events.len() {
-            let left = &events[left_index];
-            let right = &events[right_index];
-            if graph.dominates(&left.id, &right.id) || graph.dominates(&right.id, &left.id) {
-                continue;
-            }
-            let subject_overlap =
-                identity_set_intersection(&left.applies_to_subjects, &right.applies_to_subjects);
-            if subject_overlap.is_empty() {
-                continue;
-            }
-
-            let joint_dominators = events
-                .iter()
-                .enumerate()
-                .filter(|(_, candidate)| {
-                    graph.dominates(&candidate.id, &left.id)
-                        && graph.dominates(&candidate.id, &right.id)
-                })
-                .map(|(index, _)| index)
-                .collect::<Vec<_>>();
-
+    validate_ambiguity(
+        events,
+        graph,
+        |event| &event.id,
+        |event| &event.applies_to_subjects,
+        |events, left, right, joint_dominators, subject_overlap| {
             let covered = match (&left.trigger, &right.trigger) {
                 (
                     ResolvedTypestateEventTrigger::MatchEndpoints {
@@ -406,74 +389,56 @@ fn validate_event_ambiguity(
                     let endpoint_overlap =
                         identity_set_intersection(left_endpoints, right_endpoints);
                     if endpoint_overlap.is_empty() {
-                        continue;
+                        return Ok(None);
                     }
-                    event_match_overlap_is_covered(
+                    Some(event_match_overlap_is_covered(
                         events,
                         graph,
                         left,
                         right,
-                        &joint_dominators,
-                        &subject_overlap,
+                        joint_dominators,
+                        subject_overlap,
                         &endpoint_overlap,
                         *left_phase,
-                    )?
+                    )?)
                 }
                 (
                     ResolvedTypestateEventTrigger::SemanticEvent { event: left_event },
                     ResolvedTypestateEventTrigger::SemanticEvent { event: right_event },
-                ) if left_event == right_event => event_semantic_overlap_is_covered(
+                ) if left_event == right_event => Some(event_semantic_overlap_is_covered(
                     events,
                     graph,
                     left,
                     right,
-                    &joint_dominators,
-                    &subject_overlap,
+                    joint_dominators,
+                    subject_overlap,
                     *left_event,
-                )?,
+                )?),
                 // Semantic equivalence of arbitrary call selectors, and of a
                 // call selector with another trigger form, belongs to #824's
                 // same-site dominance pass.
-                _ => continue,
+                _ => return Ok(None),
             };
-            if !covered {
-                return Err(CompositionError::TypestateEventPrecedence(format!(
-                    "typestate events {:?} and {:?} overlap without a unique superseding winner",
-                    left.id, right.id
-                )));
-            }
-        }
-    }
-    Ok(())
+            Ok(covered)
+        },
+        |left, right| {
+            CompositionError::TypestateEventPrecedence(format!(
+                "typestate events {left:?} and {right:?} overlap without a unique superseding winner"
+            ))
+        },
+    )
 }
 
 fn validate_expectation_ambiguity(
     expectations: &[ResolvedTypestateTerminalExpectationSpec],
     graph: &PrecedenceGraph<TypestateExpectationId>,
 ) -> Result<(), CompositionError> {
-    for left_index in 0..expectations.len() {
-        for right_index in (left_index + 1)..expectations.len() {
-            let left = &expectations[left_index];
-            let right = &expectations[right_index];
-            if graph.dominates(&left.id, &right.id) || graph.dominates(&right.id, &left.id) {
-                continue;
-            }
-            let subject_overlap =
-                identity_set_intersection(&left.applies_to_subjects, &right.applies_to_subjects);
-            if subject_overlap.is_empty() {
-                continue;
-            }
-
-            let joint_dominators = expectations
-                .iter()
-                .enumerate()
-                .filter(|(_, candidate)| {
-                    graph.dominates(&candidate.id, &left.id)
-                        && graph.dominates(&candidate.id, &right.id)
-                })
-                .map(|(index, _)| index)
-                .collect::<Vec<_>>();
-
+    validate_ambiguity(
+        expectations,
+        graph,
+        |expectation| &expectation.id,
+        |expectation| &expectation.applies_to_subjects,
+        |expectations, left, right, joint_dominators, subject_overlap| {
             let covered = match (&left.trigger, &right.trigger) {
                 (
                     ResolvedTypestateTerminalTrigger::MatchEndpoints {
@@ -488,42 +453,111 @@ fn validate_expectation_ambiguity(
                     let endpoint_overlap =
                         identity_set_intersection(left_endpoints, right_endpoints);
                     if endpoint_overlap.is_empty() {
-                        continue;
+                        return Ok(None);
                     }
-                    expectation_match_overlap_is_covered(
+                    Some(expectation_match_overlap_is_covered(
                         expectations,
                         graph,
                         left,
                         right,
-                        &joint_dominators,
-                        &subject_overlap,
+                        joint_dominators,
+                        subject_overlap,
                         &endpoint_overlap,
                         *left_phase,
-                    )?
+                    )?)
                 }
                 (
                     ResolvedTypestateTerminalTrigger::SemanticEvent { event: left_event },
                     ResolvedTypestateTerminalTrigger::SemanticEvent { event: right_event },
-                ) if left_event == right_event => expectation_semantic_overlap_is_covered(
+                ) if left_event == right_event => Some(expectation_semantic_overlap_is_covered(
                     expectations,
                     graph,
                     left,
                     right,
-                    &joint_dominators,
-                    &subject_overlap,
+                    joint_dominators,
+                    subject_overlap,
                     *left_event,
-                )?,
-                _ => continue,
+                )?),
+                _ => return Ok(None),
+            };
+            Ok(covered)
+        },
+        |left, right| {
+            CompositionError::TypestateExpectationPrecedence(format!(
+                "typestate expectations {left:?} and {right:?} overlap without a unique superseding winner"
+            ))
+        },
+    )
+}
+
+fn validate_ambiguity<T, K>(
+    candidates: &[T],
+    graph: &PrecedenceGraph<K>,
+    candidate_id: impl for<'a> Fn(&'a T) -> &'a K,
+    applicable_subjects: impl for<'a> Fn(&'a T) -> &'a [ResolvedEndpointIdentity],
+    mut pair_coverage: impl FnMut(
+        &[T],
+        &T,
+        &T,
+        &[usize],
+        &[&ResolvedEndpointIdentity],
+    ) -> Result<Option<bool>, CompositionError>,
+    conflict: impl Fn(&K, &K) -> CompositionError,
+) -> Result<(), CompositionError>
+where
+    K: Clone + Eq + std::hash::Hash + Ord + std::fmt::Debug,
+{
+    for left_index in 0..candidates.len() {
+        for right_index in (left_index + 1)..candidates.len() {
+            let left = &candidates[left_index];
+            let right = &candidates[right_index];
+            let left_id = candidate_id(left);
+            let right_id = candidate_id(right);
+            if graph.dominates(left_id, right_id) || graph.dominates(right_id, left_id) {
+                continue;
+            }
+            let subject_overlap =
+                identity_set_intersection(applicable_subjects(left), applicable_subjects(right));
+            if subject_overlap.is_empty() {
+                continue;
+            }
+            let joint_dominators = joint_dominator_indices(
+                candidates
+                    .iter()
+                    .enumerate()
+                    .map(|(index, candidate)| (index, candidate_id(candidate))),
+                graph,
+                left_id,
+                right_id,
+            );
+            let Some(covered) =
+                pair_coverage(candidates, left, right, &joint_dominators, &subject_overlap)?
+            else {
+                continue;
             };
             if !covered {
-                return Err(CompositionError::TypestateExpectationPrecedence(format!(
-                    "typestate expectations {:?} and {:?} overlap without a unique superseding winner",
-                    left.id, right.id
-                )));
+                return Err(conflict(left_id, right_id));
             }
         }
     }
     Ok(())
+}
+
+fn joint_dominator_indices<'a, K>(
+    candidate_ids: impl Iterator<Item = (usize, &'a K)>,
+    graph: &PrecedenceGraph<K>,
+    left: &K,
+    right: &K,
+) -> Vec<usize>
+where
+    K: Clone + Eq + std::hash::Hash + Ord + 'a,
+{
+    candidate_ids
+        .filter(|(_, candidate)| {
+            graph.dominates(candidate, left) && graph.dominates(candidate, right)
+        })
+        .map(|(index, _)| index)
+        .collect()
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -541,26 +575,22 @@ fn event_match_overlap_is_covered(
         .iter()
         .copied()
         .filter(|index| event_covers_match_region(&events[*index], subjects, endpoints, phase))
-        .collect::<Vec<_>>();
-    if !fully_applicable.is_empty() {
-        graph
-            .unique_winner(
-                [left.id.clone(), right.id.clone()].into_iter().chain(
-                    fully_applicable
-                        .iter()
-                        .map(|index| events[*index].id.clone()),
-                ),
-            )
-            .map_err(|error| CompositionError::TypestateEventPrecedence(error.to_string()))?;
-        return Ok(true);
-    }
-    Ok(subjects.iter().all(|subject| {
-        endpoints.iter().all(|endpoint| {
-            joint_dominators.iter().any(|index| {
-                event_applies_to_match_point(&events[*index], subject, endpoint, phase)
+        .map(|index| events[index].id.clone());
+    overlap_is_covered(
+        graph,
+        &left.id,
+        &right.id,
+        fully_applicable,
+        subjects,
+        |subject| {
+            endpoints.iter().all(|endpoint| {
+                joint_dominators.iter().any(|index| {
+                    event_applies_to_match_point(&events[*index], subject, endpoint, phase)
+                })
             })
-        })
-    }))
+        },
+    )
+    .map_err(|error| CompositionError::TypestateEventPrecedence(error.to_string()))
 }
 
 fn event_semantic_overlap_is_covered(
@@ -576,24 +606,20 @@ fn event_semantic_overlap_is_covered(
         .iter()
         .copied()
         .filter(|index| event_covers_semantic_region(&events[*index], subjects, event))
-        .collect::<Vec<_>>();
-    if !fully_applicable.is_empty() {
-        graph
-            .unique_winner(
-                [left.id.clone(), right.id.clone()].into_iter().chain(
-                    fully_applicable
-                        .iter()
-                        .map(|index| events[*index].id.clone()),
-                ),
-            )
-            .map_err(|error| CompositionError::TypestateEventPrecedence(error.to_string()))?;
-        return Ok(true);
-    }
-    Ok(subjects.iter().all(|subject| {
-        joint_dominators
-            .iter()
-            .any(|index| event_applies_to_semantic_point(&events[*index], subject, event))
-    }))
+        .map(|index| events[index].id.clone());
+    overlap_is_covered(
+        graph,
+        &left.id,
+        &right.id,
+        fully_applicable,
+        subjects,
+        |subject| {
+            joint_dominators
+                .iter()
+                .any(|index| event_applies_to_semantic_point(&events[*index], subject, event))
+        },
+    )
+    .map_err(|error| CompositionError::TypestateEventPrecedence(error.to_string()))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -613,26 +639,27 @@ fn expectation_match_overlap_is_covered(
         .filter(|index| {
             expectation_covers_match_region(&expectations[*index], subjects, endpoints, phase)
         })
-        .collect::<Vec<_>>();
-    if !fully_applicable.is_empty() {
-        graph
-            .unique_winner(
-                [left.id.clone(), right.id.clone()].into_iter().chain(
-                    fully_applicable
-                        .iter()
-                        .map(|index| expectations[*index].id.clone()),
-                ),
-            )
-            .map_err(|error| CompositionError::TypestateExpectationPrecedence(error.to_string()))?;
-        return Ok(true);
-    }
-    Ok(subjects.iter().all(|subject| {
-        endpoints.iter().all(|endpoint| {
-            joint_dominators.iter().any(|index| {
-                expectation_applies_to_match_point(&expectations[*index], subject, endpoint, phase)
+        .map(|index| expectations[index].id.clone());
+    overlap_is_covered(
+        graph,
+        &left.id,
+        &right.id,
+        fully_applicable,
+        subjects,
+        |subject| {
+            endpoints.iter().all(|endpoint| {
+                joint_dominators.iter().any(|index| {
+                    expectation_applies_to_match_point(
+                        &expectations[*index],
+                        subject,
+                        endpoint,
+                        phase,
+                    )
+                })
             })
-        })
-    }))
+        },
+    )
+    .map_err(|error| CompositionError::TypestateExpectationPrecedence(error.to_string()))
 }
 
 fn expectation_semantic_overlap_is_covered(
@@ -648,24 +675,72 @@ fn expectation_semantic_overlap_is_covered(
         .iter()
         .copied()
         .filter(|index| expectation_covers_semantic_region(&expectations[*index], subjects, event))
-        .collect::<Vec<_>>();
+        .map(|index| expectations[index].id.clone());
+    overlap_is_covered(
+        graph,
+        &left.id,
+        &right.id,
+        fully_applicable,
+        subjects,
+        |subject| {
+            joint_dominators.iter().any(|index| {
+                expectation_applies_to_semantic_point(&expectations[*index], subject, event)
+            })
+        },
+    )
+    .map_err(|error| CompositionError::TypestateExpectationPrecedence(error.to_string()))
+}
+
+fn overlap_is_covered<K>(
+    graph: &PrecedenceGraph<K>,
+    left: &K,
+    right: &K,
+    fully_applicable: impl IntoIterator<Item = K>,
+    subjects: &[&ResolvedEndpointIdentity],
+    point_is_covered: impl Fn(&ResolvedEndpointIdentity) -> bool,
+) -> Result<bool, PrecedenceError<K>>
+where
+    K: Clone + Eq + std::hash::Hash + Ord,
+{
+    let fully_applicable = fully_applicable.into_iter().collect::<Vec<_>>();
     if !fully_applicable.is_empty() {
-        graph
-            .unique_winner(
-                [left.id.clone(), right.id.clone()].into_iter().chain(
-                    fully_applicable
-                        .iter()
-                        .map(|index| expectations[*index].id.clone()),
-                ),
-            )
-            .map_err(|error| CompositionError::TypestateExpectationPrecedence(error.to_string()))?;
+        graph.unique_winner(
+            [left.clone(), right.clone()]
+                .into_iter()
+                .chain(fully_applicable),
+        )?;
         return Ok(true);
     }
-    Ok(subjects.iter().all(|subject| {
-        joint_dominators.iter().any(|index| {
-            expectation_applies_to_semantic_point(&expectations[*index], subject, event)
-        })
-    }))
+    Ok(subjects.iter().all(|subject| point_is_covered(subject)))
+}
+
+fn match_region_is_covered(
+    candidate_subjects: &[ResolvedEndpointIdentity],
+    candidate_endpoints: &[ResolvedEndpointIdentity],
+    candidate_phase: EndpointObservationPhase,
+    subjects: &[&ResolvedEndpointIdentity],
+    endpoints: &[&ResolvedEndpointIdentity],
+    phase: EndpointObservationPhase,
+) -> bool {
+    subjects
+        .iter()
+        .all(|subject| candidate_subjects.contains(subject))
+        && candidate_phase == phase
+        && endpoints
+            .iter()
+            .all(|endpoint| candidate_endpoints.contains(endpoint))
+}
+
+fn semantic_region_is_covered(
+    candidate_subjects: &[ResolvedEndpointIdentity],
+    candidate_event: PolicySemanticEvent,
+    subjects: &[&ResolvedEndpointIdentity],
+    event: PolicySemanticEvent,
+) -> bool {
+    candidate_event == event
+        && subjects
+            .iter()
+            .all(|subject| candidate_subjects.contains(subject))
 }
 
 fn event_covers_match_region(
@@ -674,19 +749,21 @@ fn event_covers_match_region(
     endpoints: &[&ResolvedEndpointIdentity],
     phase: EndpointObservationPhase,
 ) -> bool {
-    subjects
-        .iter()
-        .all(|subject| candidate.applies_to_subjects.contains(subject))
-        && matches!(
-            &candidate.trigger,
-            ResolvedTypestateEventTrigger::MatchEndpoints {
-                endpoints: candidate_endpoints,
-                phase: candidate_phase,
-            } if *candidate_phase == phase
-                && endpoints
-                    .iter()
-                    .all(|endpoint| candidate_endpoints.contains(endpoint))
-        )
+    let ResolvedTypestateEventTrigger::MatchEndpoints {
+        endpoints: candidate_endpoints,
+        phase: candidate_phase,
+    } = &candidate.trigger
+    else {
+        return false;
+    };
+    match_region_is_covered(
+        &candidate.applies_to_subjects,
+        candidate_endpoints,
+        *candidate_phase,
+        subjects,
+        endpoints,
+        phase,
+    )
 }
 
 fn event_applies_to_match_point(
@@ -695,14 +772,21 @@ fn event_applies_to_match_point(
     endpoint: &ResolvedEndpointIdentity,
     phase: EndpointObservationPhase,
 ) -> bool {
-    candidate.applies_to_subjects.contains(subject)
-        && matches!(
-            &candidate.trigger,
-            ResolvedTypestateEventTrigger::MatchEndpoints {
-                endpoints,
-                phase: candidate_phase,
-            } if *candidate_phase == phase && endpoints.contains(endpoint)
-        )
+    let ResolvedTypestateEventTrigger::MatchEndpoints {
+        endpoints: candidate_endpoints,
+        phase: candidate_phase,
+    } = &candidate.trigger
+    else {
+        return false;
+    };
+    match_region_is_covered(
+        &candidate.applies_to_subjects,
+        candidate_endpoints,
+        *candidate_phase,
+        std::slice::from_ref(&subject),
+        std::slice::from_ref(&endpoint),
+        phase,
+    )
 }
 
 fn event_covers_semantic_region(
@@ -710,15 +794,18 @@ fn event_covers_semantic_region(
     subjects: &[&ResolvedEndpointIdentity],
     event: PolicySemanticEvent,
 ) -> bool {
-    subjects
-        .iter()
-        .all(|subject| candidate.applies_to_subjects.contains(subject))
-        && matches!(
-            candidate.trigger,
-            ResolvedTypestateEventTrigger::SemanticEvent {
-                event: candidate_event,
-            } if candidate_event == event
-        )
+    let ResolvedTypestateEventTrigger::SemanticEvent {
+        event: candidate_event,
+    } = &candidate.trigger
+    else {
+        return false;
+    };
+    semantic_region_is_covered(
+        &candidate.applies_to_subjects,
+        *candidate_event,
+        subjects,
+        event,
+    )
 }
 
 fn event_applies_to_semantic_point(
@@ -726,13 +813,18 @@ fn event_applies_to_semantic_point(
     subject: &ResolvedEndpointIdentity,
     event: PolicySemanticEvent,
 ) -> bool {
-    candidate.applies_to_subjects.contains(subject)
-        && matches!(
-            candidate.trigger,
-            ResolvedTypestateEventTrigger::SemanticEvent {
-                event: candidate_event,
-            } if candidate_event == event
-        )
+    let ResolvedTypestateEventTrigger::SemanticEvent {
+        event: candidate_event,
+    } = &candidate.trigger
+    else {
+        return false;
+    };
+    semantic_region_is_covered(
+        &candidate.applies_to_subjects,
+        *candidate_event,
+        std::slice::from_ref(&subject),
+        event,
+    )
 }
 
 fn expectation_covers_match_region(
@@ -741,19 +833,21 @@ fn expectation_covers_match_region(
     endpoints: &[&ResolvedEndpointIdentity],
     phase: EndpointObservationPhase,
 ) -> bool {
-    subjects
-        .iter()
-        .all(|subject| candidate.applies_to_subjects.contains(subject))
-        && matches!(
-            &candidate.trigger,
-            ResolvedTypestateTerminalTrigger::MatchEndpoints {
-                endpoints: candidate_endpoints,
-                phase: candidate_phase,
-            } if *candidate_phase == phase
-                && endpoints
-                    .iter()
-                    .all(|endpoint| candidate_endpoints.contains(endpoint))
-        )
+    let ResolvedTypestateTerminalTrigger::MatchEndpoints {
+        endpoints: candidate_endpoints,
+        phase: candidate_phase,
+    } = &candidate.trigger
+    else {
+        return false;
+    };
+    match_region_is_covered(
+        &candidate.applies_to_subjects,
+        candidate_endpoints,
+        *candidate_phase,
+        subjects,
+        endpoints,
+        phase,
+    )
 }
 
 fn expectation_applies_to_match_point(
@@ -762,14 +856,21 @@ fn expectation_applies_to_match_point(
     endpoint: &ResolvedEndpointIdentity,
     phase: EndpointObservationPhase,
 ) -> bool {
-    candidate.applies_to_subjects.contains(subject)
-        && matches!(
-            &candidate.trigger,
-            ResolvedTypestateTerminalTrigger::MatchEndpoints {
-                endpoints,
-                phase: candidate_phase,
-            } if *candidate_phase == phase && endpoints.contains(endpoint)
-        )
+    let ResolvedTypestateTerminalTrigger::MatchEndpoints {
+        endpoints: candidate_endpoints,
+        phase: candidate_phase,
+    } = &candidate.trigger
+    else {
+        return false;
+    };
+    match_region_is_covered(
+        &candidate.applies_to_subjects,
+        candidate_endpoints,
+        *candidate_phase,
+        std::slice::from_ref(&subject),
+        std::slice::from_ref(&endpoint),
+        phase,
+    )
 }
 
 fn expectation_covers_semantic_region(
@@ -777,15 +878,18 @@ fn expectation_covers_semantic_region(
     subjects: &[&ResolvedEndpointIdentity],
     event: PolicySemanticEvent,
 ) -> bool {
-    subjects
-        .iter()
-        .all(|subject| candidate.applies_to_subjects.contains(subject))
-        && matches!(
-            candidate.trigger,
-            ResolvedTypestateTerminalTrigger::SemanticEvent {
-                event: candidate_event,
-            } if candidate_event == event
-        )
+    let ResolvedTypestateTerminalTrigger::SemanticEvent {
+        event: candidate_event,
+    } = &candidate.trigger
+    else {
+        return false;
+    };
+    semantic_region_is_covered(
+        &candidate.applies_to_subjects,
+        *candidate_event,
+        subjects,
+        event,
+    )
 }
 
 fn expectation_applies_to_semantic_point(
@@ -793,13 +897,18 @@ fn expectation_applies_to_semantic_point(
     subject: &ResolvedEndpointIdentity,
     event: PolicySemanticEvent,
 ) -> bool {
-    candidate.applies_to_subjects.contains(subject)
-        && matches!(
-            candidate.trigger,
-            ResolvedTypestateTerminalTrigger::SemanticEvent {
-                event: candidate_event,
-            } if candidate_event == event
-        )
+    let ResolvedTypestateTerminalTrigger::SemanticEvent {
+        event: candidate_event,
+    } = &candidate.trigger
+    else {
+        return false;
+    };
+    semantic_region_is_covered(
+        &candidate.applies_to_subjects,
+        *candidate_event,
+        std::slice::from_ref(&subject),
+        event,
+    )
 }
 
 fn identity_set_intersection<'a>(
@@ -903,6 +1012,20 @@ fn event_selector_path(id: &TypestateEventId) -> Result<PolicySelectorPath, Comp
     .map_err(|error| CompositionError::LoadedModel(error.to_string()))
 }
 
+fn resolve_observed_match_set(
+    set: &MatchEndpointSetRef,
+    role: EndpointRole,
+    phase: EndpointObservationPhase,
+    universe: &EndpointUniverse,
+    manifests: &[ResolvedMatchDirectoryManifest],
+) -> Result<MatchSelection, CompositionError> {
+    let selected = universe.select_match_set(set, role, false, manifests)?;
+    for identity in &selected.identities {
+        universe.validate_observation(identity, phase)?;
+    }
+    Ok(selected)
+}
+
 fn merge_typestate_manifests(
     manifests: impl IntoIterator<Item = ResolvedMatchDirectoryManifest>,
 ) -> Result<Vec<ResolvedMatchDirectoryManifest>, CompositionError> {
@@ -929,7 +1052,6 @@ fn merge_typestate_manifests(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{EndpointAnalysisProjectionHash, EndpointSemanticHash};
     use brokk_bifrost_analysis::schema_version::{SchemaVersionOrigin, SchemaVersionResolution};
 
     fn endpoint(
@@ -938,22 +1060,20 @@ mod tests {
         binding: PolicyEndpointBinding,
         seed: u8,
     ) -> ResolvedEndpointDependency {
-        ResolvedEndpointDependency::new(
+        crate::test_support::resolved_endpoint_dependency(
             ResolvedEndpointIdentity::MatchEndpoint {
                 endpoint_id: EndpointId::new(id).unwrap(),
             },
-            EndpointDefinitionSchemaResolution::PolicyDocument {
-                resolution: SchemaVersionResolution {
-                    version: 1,
-                    origin: SchemaVersionOrigin::Explicit,
-                },
+            SchemaVersionResolution {
+                version: 1,
+                origin: SchemaVersionOrigin::Explicit,
             },
             PolicySelectorPath::new(format!("/dependencies/match-endpoints/{id}/selector"))
                 .unwrap(),
-            ResolvedEndpointSelectorSchemas::Query(SchemaVersionResolution {
+            SchemaVersionResolution {
                 version: 2,
                 origin: SchemaVersionOrigin::Explicit,
-            }),
+            },
             ResolvedEndpointModel::new(
                 role,
                 id.to_string(),
@@ -968,11 +1088,9 @@ mod tests {
                 None,
                 vec![],
             ),
-            EndpointSemanticHash::from_bytes([seed; 32]),
-            EndpointAnalysisProjectionHash::from_bytes([seed.wrapping_add(64); 32]),
-            vec![EndpointOrigin::PolicyLocal {
-                path: PolicyDependencyPath::new(format!("/endpoints/{id}")).unwrap(),
-            }],
+            PolicyDependencyPath::new(format!("/endpoints/{id}")).unwrap(),
+            seed,
+            seed.wrapping_add(64),
         )
     }
 

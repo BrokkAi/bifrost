@@ -92,12 +92,9 @@ impl<'a> RubyOverlayConstants<'a> {
     /// overlay marks it `Conflict` and this returns `None`, so neither
     /// navigation nor a diagnostic picks an arbitrary winner.
     pub(crate) fn unique_type(&self, constant_path: &str) -> Option<&'a SemanticModelSymbol> {
-        let matched = self
-            .overlay?
-            .symbols_with_id(&Self::declaration_id(constant_path));
-        (matched.disposition == SemanticModelOverlayDisposition::Unique)
-            .then(|| matched.records.first().copied())
-            .flatten()
+        self.overlay?
+            .symbols_with_id(&Self::declaration_id(constant_path))
+            .unique()
     }
 
     /// Select a callable from the activated declaration surface, retaining

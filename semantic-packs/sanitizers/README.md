@@ -1,5 +1,10 @@
 # Sanitizer semantic packs
 
+> Legacy transition copy: product pack authoring belongs in `bifrost-packs`
+> or the private premium pack repository. Follow [the placement policy](../../CONTRIBUTING.md#release-process).
+> Sources here are frozen pending verified v0.13.0 release and dependency migration.
+> The technical notes below describe retained contracts and test tooling.
+
 These packs carry Bifrost's audited sanitizer content (#1871 Stage 4, #1923).
 Each pack is a `procedure_summaries` pack. Each summary states that one method
 neutralizes taint for a set of injection contexts. The pack removes the matching

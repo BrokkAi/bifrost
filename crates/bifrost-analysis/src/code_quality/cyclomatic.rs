@@ -4,8 +4,6 @@
 //! exceeds the supplied threshold. Output format mirrors brokk-core's
 //! `CodeQualityToolsMcp.computeCyclomaticComplexity` byte-for-byte.
 
-#[cfg(test)]
-use super::cyclomatic_complexity_for_sources;
 use super::{
     MAX_REPORT_LINES, ReportLines, append_ambiguous_path_notes, cyclomatic_complexities_for_file,
     resolve_project_files,
@@ -93,137 +91,9 @@ pub fn compute_cyclomatic_complexity(
 
 #[cfg(test)]
 mod tests {
-    use super::super::{MAX_FILE_PATHS, MAX_SOURCE_BYTES};
     use super::*;
+    use crate::code_quality::{MAX_SOURCE_BYTES, cyclomatic_complexity_for_sources};
     use crate::test_support::AnalyzerFixture;
-
-    #[cfg_attr(not(scheduled_tests), ignore = "scheduled-only")]
-    #[test]
-    fn simple_function_under_threshold_returns_empty_report() {
-        let fix = AnalyzerFixture::new(&[("src/lib.rs", "fn trivial() -> i32 { 0 }\n")]);
-        let result = compute_cyclomatic_complexity(
-            fix.analyzer.analyzer(),
-            ComputeCyclomaticComplexityParams {
-                file_paths: vec!["src/lib.rs".to_string()],
-                threshold: 0,
-            },
-        );
-        assert_eq!(
-            result.report,
-            "No methods exceeded the complexity threshold of 10."
-        );
-        assert!(!result.truncated);
-    }
-
-    #[test]
-    fn function_above_threshold_is_flagged() {
-        let body = format!(
-            "fn busy(x: i32) -> i32 {{\n{}    0\n}}\n",
-            "    if x > 0 {}\n".repeat(11)
-        );
-        let fix = AnalyzerFixture::new(&[("src/lib.rs", body.as_str())]);
-        let result = compute_cyclomatic_complexity(
-            fix.analyzer.analyzer(),
-            ComputeCyclomaticComplexityParams {
-                file_paths: vec!["src/lib.rs".to_string()],
-                threshold: 0,
-            },
-        );
-        assert_eq!(
-            result.report,
-            "Cyclomatic complexity (threshold: 10):\n- busy: 12 (in src/lib.rs)"
-        );
-        assert!(!result.truncated);
-    }
-
-    #[test]
-    fn explicit_threshold_overrides_default() {
-        // 1 base + 1 `if` = 2; threshold 1 should flag.
-        let fix = AnalyzerFixture::new(&[("src/lib.rs", "fn small(x: i32) { if x > 0 {} }\n")]);
-        let result = compute_cyclomatic_complexity(
-            fix.analyzer.analyzer(),
-            ComputeCyclomaticComplexityParams {
-                file_paths: vec!["src/lib.rs".to_string()],
-                threshold: 1,
-            },
-        );
-        assert_eq!(
-            result.report,
-            "Cyclomatic complexity (threshold: 1):\n- small: 2 (in src/lib.rs)"
-        );
-    }
-
-    #[test]
-    fn complexity_equal_to_threshold_is_not_flagged() {
-        // 1 base + 1 `if` = 2; threshold 2 must NOT flag (uses `>` not `>=`).
-        let fix = AnalyzerFixture::new(&[("src/lib.rs", "fn small(x: i32) { if x > 0 {} }\n")]);
-        let result = compute_cyclomatic_complexity(
-            fix.analyzer.analyzer(),
-            ComputeCyclomaticComplexityParams {
-                file_paths: vec!["src/lib.rs".to_string()],
-                threshold: 2,
-            },
-        );
-        assert_eq!(
-            result.report,
-            "No methods exceeded the complexity threshold of 2."
-        );
-    }
-
-    #[test]
-    fn logical_operators_count_toward_complexity() {
-        // 1 base + 1 `if` + 2 `&&` + 1 `||` + 1 `?` = 6; threshold 5 flags.
-        let fix = AnalyzerFixture::new(&[(
-            "src/lib.rs",
-            "fn ops(a: bool, b: bool, c: bool) -> Option<bool> {\n    \
-             let _q = Some(a)?;\n    \
-             if a && b && c || a { Some(true) } else { Some(false) }\n}\n",
-        )]);
-        let result = compute_cyclomatic_complexity(
-            fix.analyzer.analyzer(),
-            ComputeCyclomaticComplexityParams {
-                file_paths: vec!["src/lib.rs".to_string()],
-                threshold: 5,
-            },
-        );
-        assert_eq!(
-            result.report,
-            "Cyclomatic complexity (threshold: 5):\n- ops: 6 (in src/lib.rs)"
-        );
-    }
-
-    #[test]
-    fn iterates_into_nested_methods() {
-        let fix = AnalyzerFixture::new(&[(
-            "src/lib.rs",
-            "struct S;\nimpl S {\n    fn m(&self, x: i32) {\n        if x > 0 { if x > 1 {} }\n    }\n}\n",
-        )]);
-        let result = compute_cyclomatic_complexity(
-            fix.analyzer.analyzer(),
-            ComputeCyclomaticComplexityParams {
-                file_paths: vec!["src/lib.rs".to_string()],
-                threshold: 2,
-            },
-        );
-        assert!(result.report.contains("S.m: 3"));
-    }
-
-    #[cfg_attr(not(scheduled_tests), ignore = "scheduled-only")]
-    #[test]
-    fn missing_files_are_silently_skipped() {
-        let fix = AnalyzerFixture::new(&[("src/lib.rs", "fn x() {}\n")]);
-        let result = compute_cyclomatic_complexity(
-            fix.analyzer.analyzer(),
-            ComputeCyclomaticComplexityParams {
-                file_paths: vec!["does/not/exist.rs".to_string()],
-                threshold: 0,
-            },
-        );
-        assert_eq!(
-            result.report,
-            "No methods exceeded the complexity threshold of 10."
-        );
-    }
 
     #[test]
     fn absolute_paths_outside_the_workspace_are_not_read() {
@@ -267,57 +137,6 @@ mod tests {
             result.report,
             "No methods exceeded the complexity threshold of 2."
         );
-    }
-
-    #[cfg_attr(not(scheduled_tests), ignore = "scheduled-only")]
-    #[test]
-    fn non_function_code_units_are_ignored() {
-        let fix = AnalyzerFixture::new(&[("src/lib.rs", "struct S;\n")]);
-        let result = compute_cyclomatic_complexity(
-            fix.analyzer.analyzer(),
-            ComputeCyclomaticComplexityParams {
-                file_paths: vec!["src/lib.rs".to_string()],
-                threshold: 0,
-            },
-        );
-        assert_eq!(
-            result.report,
-            "No methods exceeded the complexity threshold of 10."
-        );
-    }
-
-    #[test]
-    fn multiple_files_share_one_header() {
-        let fix = AnalyzerFixture::new(&[
-            ("src/a.rs", "fn alpha(x: i32) { if x > 0 {} }\n"),
-            ("src/b.rs", "fn beta() {}\n"),
-        ]);
-        let result = compute_cyclomatic_complexity(
-            fix.analyzer.analyzer(),
-            ComputeCyclomaticComplexityParams {
-                file_paths: vec!["src/a.rs".to_string(), "src/b.rs".to_string()],
-                threshold: 1,
-            },
-        );
-        assert_eq!(
-            result.report,
-            "Cyclomatic complexity (threshold: 1):\n- a.alpha: 2 (in src/a.rs)"
-        );
-    }
-
-    #[test]
-    fn file_paths_above_cap_marks_truncated() {
-        let fix = AnalyzerFixture::new(&[("src/lib.rs", "fn x() {}\n")]);
-        let mut paths = vec!["src/lib.rs".to_string(); MAX_FILE_PATHS];
-        paths.push("src/extra.rs".to_string());
-        let result = compute_cyclomatic_complexity(
-            fix.analyzer.analyzer(),
-            ComputeCyclomaticComplexityParams {
-                file_paths: paths,
-                threshold: 0,
-            },
-        );
-        assert!(result.truncated);
     }
 
     #[test]

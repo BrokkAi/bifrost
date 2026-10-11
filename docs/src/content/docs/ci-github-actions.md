@@ -29,7 +29,9 @@ jobs:
       - uses: BrokkAi/bifrost-policy-scan@v0
 ```
 
-The default configuration installs the pinned Bifrost release, runs the `bifrost.code-smells` pack on the checkout, writes `bifrost-policy.sarif`, uploads it, and gates on the exit code.
+The default configuration installs the pinned Bifrost release, selects `bifrost.code-smells` from the host catalog, writes `bifrost-policy.sarif`, uploads it, and gates on the exit code. The [v0.13 external-content follow-up](#versioned-external-content-v013-follow-up) replaces the earlier embedded-pack assumption; acquisition failure is a failed gate, not a clean scan.
+
+On most real code, this default gate exits `2` today, because some policies in the pack cannot complete. For example, the Python absent-member policies need the Python standard-library pack, and `contradictory-condition` ends inconclusive when it cannot decide a condition. Read the report diagnostics before you choose a selection. [Scan a Codebase](/scan-a-codebase/) explains these cases and shows how to gate on selected policies.
 
 ## Versioning
 
@@ -42,8 +44,10 @@ The `security-events: write` permission is required for the SARIF upload. Code s
 The gate distinguishes three results:
 
 - `0` - clean. The job passes.
-- `1` - findings at or above the `fail-on` threshold. The job fails and the findings appear as code-scanning alerts.
-- `2` - unreliable. The run could not prove its own completeness, for example after a budget or capability limit. The job fails with a distinct message. Do not treat an unreliable run as clean, and do not lower `fail-on` to hide it. Read the report diagnostics instead.
+- `1` - findings at or above the `fail-on` threshold, or an orphaned suppression record: an accepted suppression whose file the run analyzed but whose finding no longer exists. An orphaned record gives `1` even with `fail-on: never`. The job fails and the findings appear as code-scanning alerts.
+- `2` - unreliable. The run could not prove its own completeness, for example after a budget or capability limit, or a `proven_subset` run found nothing to gate. The job fails with a distinct message. Do not treat an unreliable run as clean, and do not lower `fail-on` to hide it. Read the report diagnostics instead.
+
+The [policy reference](/reference/policies/#exit-status) gives the complete exit-status rules.
 
 ## Scan error diagnostics
 
@@ -55,20 +59,30 @@ explicit policy setting changes how an unknown verdict gates CI.
 
 Detailed diagnostic identifiers live in
 `runs[].invocations[].toolExecutionNotifications[].descriptor.id`. Use these
-stable identifiers for automation; message wording can change. Report-level
-identifiers match the canonical JSON diagnostic `code`:
+stable identifiers for automation; message wording can change. There are two
+kinds:
 
-| Identifier | Meaning and next step |
-| --- | --- |
-| `policy-load-failed` | A policy could not be read. Check the path and permissions in the diagnostic. |
-| `policy-parse-failed` / `policy-validation-failed` | Fix the policy syntax or invalid declaration at the reported source range. |
-| `diff-base-unreliable` | The base revision could not establish a reliable comparison. Inspect its policy completion reasons; full gating applies. |
-| `pack-activation-failed` | Inspect the named pack and its activation diagnostic. |
-| `workspace-snapshot-deadline-exceeded` | Workspace preparation exceeded its deadline. Inspect the workspace and preparation budget. |
-| `BIFROST_POLICY_INCONCLUSIVE` | Inspect `bifrost.completion` for the typed reasons the evaluation could not finish reliably. |
-| `BIFROST_POLICY_UNSUPPORTED` | The policy requires unavailable analysis support. Inspect the completion reason. |
-| `BIFROST_POLICY_FAILED` | Evaluation failed. Inspect the retained completion diagnostic. |
-| `BIFROST_REPORT_DIAGNOSTICS_TRUNCATED` | Some diagnostics did not fit in the report. Inspect the omission count and reporting limits. |
+- A report diagnostic uses its canonical JSON diagnostic `code` as the
+  identifier, for example `policy-load-failed`, `suppression-load-failed`, or
+  `diff-base-unreliable`. The
+  [report diagnostic codes](/reference/policies/#report-diagnostic-codes) table in the policy
+  reference gives the meaning and next step for every code.
+- A policy run whose completion is not `complete` adds one notification.
+  `BIFROST_REPORT_DIAGNOSTICS_TRUNCATED` means some report diagnostics did not
+  fit in the report.
+
+| Completion | Notification ID | Meaning |
+| --- | --- | --- |
+| `proven_subset` | `BIFROST_POLICY_PROVEN_SUBSET` | Every retained finding is proven, but the run searched only part of the program. Reliable, not exhaustive. With no gated finding, the run exits `2`. |
+| `proven_by_summary` | `BIFROST_POLICY_PROVEN_BY_SUMMARY` | The result rests on authored external procedure summaries. Reliable, not exhaustive. Exits `0` or `1`. |
+| `inconclusive` | `BIFROST_POLICY_INCONCLUSIVE` | The run could not finish its analysis. Exits `2` unless the policy's `on-unknown` verdict says otherwise. |
+| `not_run` | `BIFROST_POLICY_NOT_RUN` | A required capability was unavailable. Implicit pack/category/default selections do not affect the exit status; an explicit policy ID exits `2`. |
+| `unsupported` | `BIFROST_POLICY_UNSUPPORTED` | The policy needs a capability that this analyzer lacks. Exits `2`. |
+| `failed` | `BIFROST_POLICY_FAILED` | Evaluation failed. Exits `2`. |
+
+The [completion states](/reference/policies/#completion-states) table in the
+policy reference lists the reasons for each state.
+
 
 Notifications also retain policy identity, completion reasons, and diagnostic
 source details in `properties`. A notification can be advisory: its identifier
@@ -89,9 +103,14 @@ does not contain the CLI threshold decision. Library callers with a
 
 | Input | Default | Meaning |
 | --- | --- | --- |
-| `version` | pinned release tag | Bifrost release to install. Pin an exact tag for reproducible gates. |
-| `policy-packs` | `bifrost.code-smells` | Space-separated built-in pack IDs. |
+| `version` | pinned release tag | Bifrost release to install. Pin an exact tag for reproducible gates. The value `local` installs nothing: the action uses `target/release/bifrost`, then `target/debug/bifrost` from the checkout, then a `bifrost` on `PATH`. |
+| `packs-source` | pinned public source | JSON repository/version and rules/semantic descriptor pins; optional digest-bound HTTPS inventory. See [versioned external content](#versioned-external-content-v013-follow-up). |
+| `packs-token` | empty | Existing private repository read secret, restricted to trusted push or workflow-dispatch acquisition. |
+| `packs-cache` | `true` | Restore and save verified external content for this source and actual engine profile. Disabled for authenticated acquisition. |
+| `packs-offline` | `false` | Require verified cached external content without network access; a cache miss fails. |
+| `policy-packs` | `bifrost.code-smells` | Space-separated pack IDs from the selected host catalog. When unset, the default applies only if you set no `policy-ids` or `policy-categories`. |
 | `policy-ids` | empty | Space-separated policy IDs. |
+| `exclude-policy-ids` | empty | Space-separated built-in policy IDs to skip after the selection inputs resolve. Each must be selected by them, and at least one policy must remain. |
 | `policy-categories` | empty | Space-separated categories. |
 | `policy-files` | empty | Space-separated workspace-relative `.rqlp` files. |
 | `fail-on` | `warning` | Severity gate: `never`, `finding`, `note`, `warning`, or `error`. |
@@ -105,14 +124,47 @@ does not contain the CLI threshold decision. Library callers with a
 | `cache` | `true` | Restore and save the analyzer cache between runs. |
 | `working-directory` | `.` | Workspace root to analyze, relative to the checkout. |
 
+The four selection inputs become `--policy-pack`, `--policy-id`,
+`--policy-category`, and `--policy-file` flags. When you leave `policy-packs`
+unset, the action passes `bifrost.code-smells` only if you set no `policy-ids`
+or `policy-categories`. This has these effects:
+
+- Values within one input form a union. Different catalog selectors
+  intersect. An explicit `policy-packs` value intersects with `policy-ids` and
+  `policy-categories`: a `policy-ids` value outside those packs selects nothing,
+  and the action fails. Its log names the `policy-packs`, `policy-categories`,
+  and `policy-ids` values that matched nothing.
+- To run a policy from another pack, set `policy-ids` or `policy-categories`
+  and leave `policy-packs` unset.
+- When the default pack applies, `policy-files` runs beside it. Set
+  `policy-packs: ''` to run only your files.
+- If `policy-packs` is `''` and every other selection input is empty, the run
+  evaluates every pack in the selected catalog.
+- Opt-in policies, such as the declared-storage family, run only when
+  `policy-ids` names them.
+- `exclude-policy-ids` removes policies after the selection inputs intersect,
+  and it keeps every other member of the selected packs, including members
+  added in later releases. For example, with the default pack,
+  `exclude-policy-ids: bifrost.correctness.python-absent-member` runs the other
+  code-smells policies. An excluded ID that the selection does not select, an
+  unknown ID, and an exclusion that removes every policy each fail the run with
+  exit status 2. This is a selection control, not a suppression: use
+  `.bifrost/suppressions.json` for individual findings.
+
+See [Policy selection](/reference/policies/#policy-selection) in the policy
+reference.
+
 The action exposes these outputs for later steps:
 
 | Output | Meaning |
 | --- | --- |
 | `analyzer-cache-hit` | Whether an exact analyzer cache entry was restored; empty when caching is disabled. |
 | `exit-code` | Raw bifrost policy exit code (0, 1, or 2). |
+| `stderr-capture-code` | Status of the stderr log capture. `0` means the log was created and retained. |
 | `sarif-file` | Path of the SARIF report, relative to the checkout. |
 | `bifrost-bin` | Absolute path of the bifrost executable the run used. |
+| `pack-selection-id` | Digest-bound external content selection identity, when acquisition ran. |
+| `pack-cache-reused` | Whether an existing verified content selection was reused. This is not policy execution evidence. |
 
 ## Analyzer cache
 
@@ -142,7 +194,11 @@ publish a snapshot.
 Incremental evidence reuse is on by default, including for `diff-base` scans.
 Set `full-evaluation: true` to pass `--no-incremental` and request a full
 evaluation for comparison. The action forwards this existing CLI control; it
-does not implement a separate slicing algorithm.
+does not implement a separate slicing algorithm. A scan of the base branch
+publishes policy units for that revision, so a later pull-request scan whose
+`diff-base` is the same commit reuses them for its base evaluation when the
+restored cache snapshot holds them; the SARIF run property `bifrost.incremental`
+reports those counts as `base_units_reused` and `base_units_recomputed`.
 
 The action logs execution, policy work, completeness, and incremental evidence
 from its single SARIF scan. `policy-timings: true` adds per-policy timing details
@@ -179,11 +235,11 @@ jobs:
           diff-base: ${{ github.event.pull_request.base.sha }}
 ```
 
-The checkout must contain the base revision: `fetch-depth: 0` is the simple form, or fetch the base SHA explicitly. If the base revision does not resolve, the run exits `2` (unreliable) rather than silently gating on everything. If the base revision resolves but its evaluation cannot prove its own completeness, the run degrades to full gating and reports a `diff-base-unreliable` diagnostic, so a broken base can never hide new findings.
+The checkout must contain the base revision: `fetch-depth: 0` is the simple form, or fetch the base SHA explicitly. If the base revision does not resolve, the run exits `2` (unreliable) rather than silently gating on everything. If the base revision resolves but its evaluation cannot prove its own completeness, the run degrades to full gating, reports a `diff-base-unreliable` diagnostic, and exits `2`, so a broken base can never hide new findings.
 
 With `cache` on, which is the default, the run stores what each policy concluded over the base revision and what every part of that evaluation read. A later run against the same base restores that cache, skips the base export and build, and recomputes only the parts of the pull request's tree whose inputs changed, so a pull-request run pays for its own change rather than for the whole base. `cache: 'false'` keeps nothing between runs, so every run evaluates both revisions in full. The report is the same either way: findings, identities, `baselineState` values, diagnostics, and the exit code do not depend on what the cache holds. Only the report's `incremental` section, which records what the run reused, and the run's own work counters differ.
 
-Three identity limitations are accepted: a pure file rename re-keys every finding in the file (one `fixed` plus one `new`), inserting an identical duplicate of an existing source slice above it under the same owner can shift the ordinal that distinguishes the duplicates and misclassify one pair, and an edit that changes which declarations a typestate policy binds re-keys every finding that policy reports.
+Two identity limitations are accepted: a pure file rename re-keys every finding in the file (one `fixed` plus one `new`), and inserting an identical duplicate of an existing source slice above it under the same owner can shift the ordinal that distinguishes the duplicates and misclassify one pair. An edit also re-keys a finding when it changes the violating site's own source slice. For a typestate finding, an edit re-keys it when it changes the text of the declaration a locator sits in above that locator, the declaration path a locator names, or the policy's automaton. Adding a tracked object in another file does not. See [Gate Only On What The Change Introduced](/static-analysis-policies/#gate-only-on-what-the-change-introduced).
 
 ## Onboard a legacy repository with a committed baseline
 
@@ -201,4 +257,107 @@ A recommended split for a legacy repository: pull requests gate with `diff-base`
 
 ## Suppressions, scope, and baseline
 
-The run honors `.bifrost/suppressions.json`, `.bifrost/policy-scope.json`, and `.bifrost/baseline.json` from the workspace, exactly as the CLI does. Accepted suppressions and baselined findings appear in the SARIF report as suppressed results. See [Static-Analysis Policies](/static-analysis-policies/) for the document formats.
+The run honors the workspace's review files exactly as the CLI does: the suppression files `.bifrost/suppressions.json`, `.bifrost/suppressions.private.json`, and `.bifrost/suppressions.local.json`, read in that order; the scope file `.bifrost/policy-scope.json`; and the baseline `.bifrost/baseline.json`. The action has no input that overrides these paths. Accepted suppressions and baselined findings appear in the SARIF report as suppressed results. See [Static-Analysis Policies](/static-analysis-policies/) for how to use them and the [policy reference](/reference/policies/) for their formats and limits.
+
+## Versioned external content (v0.13 follow-up)
+
+The core engine has no default product rules. The updated action acquires rules
+from a host-selected source and their exact semantic release dependency before
+resolving `policy-packs`, `policy-ids` or `policy-categories` against that catalog.
+A successful download or verified cache hit is not a clean scan or proof of
+behavioral coverage. Incomplete policy results retain the engine's exit `2`
+contract and SARIF diagnostics.
+Each invocation clears its SARIF and diagnostic output paths before binary or
+content acquisition, so a failed acquisition cannot retain an earlier report.
+
+The initial public pin is rules `0.1.1`, descriptor SHA-256
+`6f188826fe5b4918967100d8c0816c8b230a13d4a47300497d2294390a112388`, with semantic descriptor SHA-256 `f28356cb17e85d84de3432de837f2d045e554e6d3d8d1f08018015e4960446d8`.
+That historical release targets the 0.12 engine range; it is **not qualified for
+a v0.13 scan**. Until the content owner supplies a compatible qualified successor,
+the action fails explicitly before policy execution. This follow-up does not
+alter the v0.13.0 release candidate or turn its failed SARIF run into success.
+The existing published action tags keep their original behavior until a separately
+reviewed release publishes this change.
+
+Set `packs-source` to a JSON object with a trusted GitHub `repository` URL,
+exact semantic version `rules_version`, and the reviewed rules descriptor's
+`manifest_sha256` plus `semantic_manifest_sha256` for its exact dependency descriptor. The repository must publish the existing `pack-release.json`
+contract under `rules/vVERSION` and its exact semantic dependency under
+`packs/vVERSION`. The wrapper pack identities remain `bifrost.public.rules` and
+`bifrost.public.packs`; the policy catalog inside can define custom pack IDs.
+The descriptor binds its clean source commit to the Git tag, indexes content
+hashes, declares archive digests and pins its semantic dependency. The resolver
+checks all declared schemas and capabilities against `bifrost pack-engine-profile`
+from the actual scan binary, and requires qualified behavior before execution.
+Before publishing a content cache, the action also reads the selected catalog
+and rejects requirements absent from that actual profile.
+
+```yaml
+      - uses: BrokkAi/bifrost-policy-scan@v0
+        with:
+          packs-source: >-
+            {"repository":"https://github.com/example/reviewed-packs",
+             "rules_version":"1.2.3",
+             "manifest_sha256":"REPLACE_WITH_REVIEWED_64_HEX_DESCRIPTOR_DIGEST",
+             "semantic_manifest_sha256":"REPLACE_WITH_REVIEWED_64_HEX_DEPENDENCY_DIGEST"}
+          policy-packs: my-reviewed-catalog
+```
+
+For a trusted HTTPS archive mirror, add `inventory_url` and `inventory_sha256`
+to that object. The pinned inventory has `schema_version: 1` and a `releases`
+array. Each record names `tag`, `tag_commit`, `prerelease`, `manifest_sha256`,
+`manifest_url`, and `assets` mapping each declared archive filename to an object
+with `url`. It must include the selected rules descriptor and its exact semantic
+dependency. These are the existing release descriptors and tar.gz archive
+contracts, not arbitrary source checkouts or raw policy folders. All descriptor
+and archive URLs and redirects must remain on the inventory's HTTPS origin.
+Repository sources permit only their GitHub API/release URLs and redirects to
+GitHub's `release-assets.githubusercontent.com` or `objects.githubusercontent.com`
+asset hosts. Authorization is sent only to the selected repository's GitHub API,
+never to a redirect target. Credentials, query strings and fragments are rejected
+in configured URLs; transient signed GitHub asset redirects are never persisted.
+
+An explicit `packs-source` takes precedence over caller-prepared roots and the
+public pin. An invalid explicit selection fails without fallback. With no
+explicit selection, a caller may supply both `BIFROST_OPEN_POLICY_PACK_ROOT` and
+`BIFROST_OPEN_SEMANTIC_PACK_BUNDLE`; the engine validates those roots. A
+policy-file-only scan with empty `policy-packs`, `policy-ids` and
+`policy-categories` bypasses product acquisition. For example, set
+`policy-packs: ''` and `policy-files: policies/team.rqlp`.
+
+`packs-cache` defaults to `true` independently of the analyzer `cache` input.
+The key binds the source/version/descriptor pin, the mirror inventory digest
+when present, runner platform and full engine profile (build identity, model
+set, schemas and capability contract). The saved suffix is the verified selection
+ID, which also binds exact dependency descriptors and archive identities. Only
+that source/profile prefix can restore; every restored descriptor, archive,
+extracted file and selection receipt is reverified. Changes in source, version,
+digests, dependencies or engine contracts invalidate reuse. Corrupt bytes fail
+closed. Online runs refresh source descriptors; `packs-offline: true` forbids
+network requests and fails on a missing verified selection. Negative selection
+receipts never activate content and are never saved as successful content caches.
+`pack-selection-id` and `pack-cache-reused` expose acquisition evidence separately
+from policy results. Missing releases, authentication/404, network, malformed,
+incompatible and unqualified content fail the action without manufacturing SARIF.
+
+### Private repositories
+
+Use `packs-token: ${{ secrets.EXISTING_PACKS_READ_TOKEN }}` only in a trusted
+`push` or explicitly approved `workflow_dispatch` workflow, with the immutable
+reviewed action revision and source pin. The existing token needs **Contents:
+read** on the selected source repository, including its releases. The caller's
+`GITHUB_TOKEN` generally cannot read a different private repository. Repository
+or protected-environment secrets are the supported mechanism; do not put tokens
+in source URLs. This implementation creates no tokens, OAuth grants or persistent
+credentials. If access is missing, a human must grant the existing credential
+read access to that repository (and organization authorization if required), then
+make it available as a secret to the trusted workflow/environment.
+
+Private acquisition credentials are prohibited on all PR events, including
+`pull_request_target`. Never run untrusted PR code in a privileged workflow.
+The token is scoped to the acquisition step, withheld from the engine-profile
+subprocess and policy execution, and absent from URLs, identities, receipts,
+logs and SARIF. Authenticated content and its analyzer data are not saved to
+Actions caches that a fork or PR could restore. Retained SARIF may still contain
+private policy names or findings, so use the appropriate repository and artifact
+access controls for those results.

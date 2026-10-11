@@ -29,6 +29,7 @@ use crate::analyzer::QueryScope;
 use crate::analyzer::{IAnalyzer, Language, ProjectFile, Range};
 use crate::cancellation::CancellationToken;
 use crate::hash::HashSet;
+use crate::text_utils::find_line_index_for_offset;
 use brokk_bifrost_core::analyzer::query_token::QueryToken;
 use brokk_bifrost_core::analyzer::structural::rewrite_path::{
     RewriteDomainKind, RewriteOrigin, RewriteOutcome, RewritePath, RewriteTrace,
@@ -150,6 +151,16 @@ pub fn rewrite_paths_for_file(
         return FileRewritePaths::complete(Vec::new(), generation);
     }
     rust_import_alias_paths(analyzer, token, file, generation, request)
+}
+
+/// Derive one file's rewrite paths with the default request controls.
+pub fn rewrite_paths_for_file_with_cancellation(
+    analyzer: &dyn IAnalyzer,
+    file: &ProjectFile,
+    cancellation: Option<&CancellationToken>,
+) -> FileRewritePaths {
+    let token = cancellation.cloned().unwrap_or_default();
+    rewrite_paths_for_file(analyzer, file, &mut RewritePathRequest::new(&token))
 }
 
 /// The `rust_import_alias` domain over one Rust file.
@@ -280,10 +291,7 @@ impl LineIndex {
     }
 
     fn line_of(&self, offset: usize) -> usize {
-        match self.starts.binary_search(&offset) {
-            Ok(line) => line + 1,
-            Err(next) => next,
-        }
+        find_line_index_for_offset(&self.starts, offset) + 1
     }
 
     fn range(&self, start_byte: usize, end_byte: usize) -> Range {
@@ -296,33 +304,29 @@ impl LineIndex {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
+#[test]
+fn a_line_index_numbers_offsets_from_one() {
+    let index = LineIndex::build("use a::b as c;\nuse c::d as a;\n");
+    assert_eq!(index.line_of(0), 1);
+    assert_eq!(index.line_of(13), 1);
+    assert_eq!(index.line_of(15), 2);
+    let range = index.range(15, 18);
+    assert_eq!(range.start_line, 2);
+    assert_eq!(range.end_line, 2);
+    assert_eq!(range.start_byte, 15);
+}
 
-    #[test]
-    fn a_line_index_numbers_offsets_from_one() {
-        let index = LineIndex::build("use a::b as c;\nuse c::d as a;\n");
-        assert_eq!(index.line_of(0), 1);
-        assert_eq!(index.line_of(13), 1);
-        assert_eq!(index.line_of(15), 2);
-        let range = index.range(15, 18);
-        assert_eq!(range.start_line, 2);
-        assert_eq!(range.end_line, 2);
-        assert_eq!(range.start_byte, 15);
-    }
-
-    #[test]
-    fn completeness_covers_a_domain_no_reason_blocks() {
-        let complete = RewritePathCompleteness::Complete;
-        assert!(complete.covers(RewriteDomainKind::RustImportAlias));
-        assert!(complete.reasons().is_empty());
-        let blocked = RewritePathCompleteness::from_reasons(vec![
-            RewritePathIncompleteReason::NoDomainAnalyzer(RewriteDomainKind::RustImportAlias),
-        ]);
-        assert!(!blocked.covers(RewriteDomainKind::RustImportAlias));
-        let cancelled =
-            RewritePathCompleteness::from_reasons(vec![RewritePathIncompleteReason::Cancelled]);
-        assert!(!cancelled.covers(RewriteDomainKind::RustImportAlias));
-    }
+#[test]
+fn completeness_covers_a_domain_no_reason_blocks() {
+    let complete = RewritePathCompleteness::Complete;
+    assert!(complete.covers(RewriteDomainKind::RustImportAlias));
+    assert!(complete.reasons().is_empty());
+    let blocked =
+        RewritePathCompleteness::from_reasons(vec![RewritePathIncompleteReason::NoDomainAnalyzer(
+            RewriteDomainKind::RustImportAlias,
+        )]);
+    assert!(!blocked.covers(RewriteDomainKind::RustImportAlias));
+    let cancelled =
+        RewritePathCompleteness::from_reasons(vec![RewritePathIncompleteReason::Cancelled]);
+    assert!(!cancelled.covers(RewriteDomainKind::RustImportAlias));
 }

@@ -27,6 +27,9 @@ use tree_sitter::Tree;
 #[derive(Debug, Clone, Default)]
 pub(crate) struct RustAdapter;
 
+static RUST_SEMANTIC_LOWERER: super::semantic::RustSemanticLowerer =
+    super::semantic::RustSemanticLowerer;
+
 impl LanguageAdapter for RustAdapter {
     fn source_fact_storage(&self) -> Option<&'static crate::analyzer::store::SourceFactStorage> {
         Some(&super::source_publication::SOURCE_STORAGE)
@@ -34,6 +37,16 @@ impl LanguageAdapter for RustAdapter {
 
     fn language(&self) -> Language {
         Language::Rust
+    }
+
+    fn parse_time_semantic_lowerer(
+        &self,
+    ) -> Option<crate::analyzer::semantic::service::ParseTimeSemanticLowerer> {
+        Some(
+            crate::analyzer::semantic::service::ParseTimeSemanticLowerer::new(
+                &RUST_SEMANTIC_LOWERER,
+            ),
+        )
     }
 
     /// `parse_rust_file` fills none of the language-specific families: Rust
@@ -92,20 +105,28 @@ impl LanguageAdapter for RustAdapter {
     }
 
     fn workspace_package_identity_input(&self, file: &ProjectFile) -> bool {
-        file.rel_path()
-            .file_name()
-            .is_some_and(|name| name == "Cargo.toml")
+        super::is_cargo_topology_input(file)
     }
 
     /// The same parse crate reconciliation reads, minus what no Rust reader
-    /// consumes. A manifest that does not parse has no meaning to compare, so
+    /// consumes. An input that does not parse has no meaning to compare, so
     /// any edit to it rebuilds.
-    fn workspace_package_identity_digest(&self, source: &[u8]) -> Option<[u8; 32]> {
-        brokk_bifrost_rust::cargo_manifest::RustCargoManifestDocument::from_source_bytes(
-            source.into(),
-        )
-        .ok()
-        .map(|document| document.topology_digest())
+    fn workspace_package_identity_digest(
+        &self,
+        file: &ProjectFile,
+        source: &[u8],
+    ) -> Option<[u8; 32]> {
+        if brokk_bifrost_rust::cargo_config::is_cargo_configuration_path(file.rel_path()) {
+            brokk_bifrost_rust::cargo_config::RustCargoConfigDocument::from_source_bytes(source)
+                .ok()
+                .map(|document| document.topology_digest())
+        } else {
+            brokk_bifrost_rust::cargo_manifest::RustCargoManifestDocument::from_source_bytes(
+                source.into(),
+            )
+            .ok()
+            .map(|document| document.topology_digest())
+        }
     }
 
     fn resolve_package_anchor(

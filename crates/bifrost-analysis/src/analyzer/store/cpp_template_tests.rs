@@ -91,23 +91,28 @@ fn assert_fixture_covers_every_shape(metadata: &HashMap<CodeUnit, CppTemplateMet
     );
 }
 
+fn persist_and_hydrate_template_metadata(
+    file: &ProjectFile,
+    parsed: &crate::analyzer::tree_sitter_analyzer::FileState,
+) -> crate::analyzer::tree_sitter_analyzer::FileState {
+    let oid = oid_for(file.read_to_string().unwrap().as_bytes());
+    let store = AnalyzerStore::open_ephemeral().unwrap();
+    store
+        .write_parsed_blob(oid, "cpp", &CppAdapter, parsed)
+        .unwrap();
+    store
+        .hydrate_file_state(oid, "cpp", &CppAdapter, file)
+        .unwrap()
+        .unwrap()
+}
+
 #[test]
 fn persisted_cpp_class_templates_preserve_every_metadata_shape() {
     let temp = tempfile::TempDir::new().unwrap();
     let file = template_fixture(temp.path());
-    let source = file.read_to_string().unwrap();
-    let oid = oid_for(source.as_bytes());
     let parsed = parse_state(&CppAdapter, &file);
     assert_fixture_covers_every_shape(&parsed.cpp_template_metadata);
-
-    let store = AnalyzerStore::open_ephemeral().unwrap();
-    store
-        .write_parsed_blob(oid, "cpp", &CppAdapter, &parsed)
-        .unwrap();
-    let hydrated = store
-        .hydrate_file_state(oid, "cpp", &CppAdapter, &file)
-        .unwrap()
-        .unwrap();
+    let hydrated = persist_and_hydrate_template_metadata(&file, &parsed);
 
     assert_eq!(
         hydrated.cpp_template_metadata, parsed.cpp_template_metadata,
@@ -116,6 +121,50 @@ fn persisted_cpp_class_templates_preserve_every_metadata_shape() {
     // The same fixture through the prepared batch path and bulk hydration,
     // over the whole FileState rather than this one map.
     assert_direct_prepared_parity(&CppAdapter, "cpp", &file);
+}
+
+/// What `CppAnalyzer::template_metadata` answers after a build is what the
+/// relational families hold. The comparison runs against the metadata read
+/// back out of a store rather than against the parse alone, so this is the
+/// warm-versus-persisted parity the opaque payload used to get from
+/// `assert_file_state_equivalent`, unit by unit and in both directions.
+#[test]
+fn warm_analyzer_class_template_metadata_matches_the_persisted_metadata() {
+    let fixture = crate::inline_project::InlineTestProject::with_language(Language::Cpp)
+        .file("include/bundle.h", TEMPLATE_SOURCE)
+        .build();
+    let file = fixture.file("include/bundle.h");
+    let parsed = parse_state(&CppAdapter, &file);
+    assert_fixture_covers_every_shape(&parsed.cpp_template_metadata);
+
+    let store = AnalyzerStore::open_ephemeral().unwrap();
+    let oid = oid_for(file.read_to_string().unwrap().as_bytes());
+    store
+        .write_parsed_blob(oid, "cpp", &CppAdapter, &parsed)
+        .unwrap();
+    let persisted = store
+        .hydrate_file_state(oid, "cpp", &CppAdapter, &file)
+        .unwrap()
+        .unwrap()
+        .cpp_template_metadata;
+    assert_eq!(persisted, parsed.cpp_template_metadata);
+
+    let analyzer = crate::analyzer::cpp::CppAnalyzer::from_project(fixture.project().clone());
+    for (unit, metadata) in &persisted {
+        assert_eq!(
+            analyzer.template_metadata(unit).as_ref(),
+            Some(metadata),
+            "warm metadata differs for {unit:?}"
+        );
+    }
+    // And no other declaration acquires metadata of its own.
+    for unit in &analyzer.get_all_declarations() {
+        assert_eq!(
+            analyzer.template_metadata(unit),
+            persisted.get(unit).cloned(),
+            "warm metadata differs for {unit:?}"
+        );
+    }
 }
 
 /// The persisted schema of a store that has done production work is the
@@ -180,52 +229,6 @@ fn a_worked_store_holds_exactly_the_baseline_schema() {
     );
 }
 
-/// What `CppAnalyzer::template_metadata` answers after a build is what the
-/// relational families hold. The comparison runs against the metadata read
-/// back out of a store rather than against the parse alone, so this is the
-/// warm-versus-persisted parity the opaque payload used to get from
-/// `assert_file_state_equivalent`, unit by unit and in both directions.
-#[test]
-fn warm_analyzer_class_template_metadata_matches_the_persisted_metadata() {
-    let fixture = crate::inline_project::InlineTestProject::with_language(Language::Cpp)
-        .file("include/bundle.h", TEMPLATE_SOURCE)
-        .build();
-    let file = fixture.file("include/bundle.h");
-    let parsed = parse_state(&CppAdapter, &file);
-    assert_fixture_covers_every_shape(&parsed.cpp_template_metadata);
-
-    let store = AnalyzerStore::open_ephemeral().unwrap();
-    let oid = oid_for(file.read_to_string().unwrap().as_bytes());
-    store
-        .write_parsed_blob(oid, "cpp", &CppAdapter, &parsed)
-        .unwrap();
-    let persisted = store
-        .hydrate_file_state(oid, "cpp", &CppAdapter, &file)
-        .unwrap()
-        .unwrap()
-        .cpp_template_metadata;
-    assert_eq!(persisted, parsed.cpp_template_metadata);
-
-    let analyzer = crate::analyzer::cpp::CppAnalyzer::from_project(fixture.project().clone());
-    for (unit, metadata) in &persisted {
-        assert_eq!(
-            analyzer.template_metadata(unit).as_ref(),
-            Some(metadata),
-            "warm metadata differs for {unit:?}"
-        );
-    }
-    // And no other declaration acquires metadata of its own.
-    for unit in &analyzer.get_all_declarations() {
-        assert_eq!(
-            analyzer.template_metadata(unit),
-            persisted.get(unit).cloned(),
-            "warm metadata differs for {unit:?}"
-        );
-    }
-}
-
-/// Every object the store file itself holds: tables, views, triggers and
-/// indexes, without SQLite's own bookkeeping objects.
 fn persisted_schema_objects(conn: &Connection) -> Vec<(String, String)> {
     conn.prepare(
         "SELECT type, name FROM main.sqlite_schema

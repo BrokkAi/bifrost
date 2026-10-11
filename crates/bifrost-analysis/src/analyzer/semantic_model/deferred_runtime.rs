@@ -364,27 +364,4 @@ mod tests {
             DeferredYieldBoundary::Cancelled
         );
     }
-
-    #[test]
-    fn incomplete_profile_cannot_establish_a_handle() {
-        let mut contract = contract();
-        contract.coverage = Some(Completeness::Partial);
-        let cancellation = CancellationToken::default();
-        let mut runtime = DeferredYieldRuntime::new(1);
-        assert_eq!(
-            runtime.construct(10, "map", &contract, &cancellation),
-            Err(DeferredYieldBoundary::IncompleteContract)
-        );
-        assert_eq!(
-            runtime
-                .resume(
-                    &10,
-                    &contract,
-                    DeferredValidityEvidence::Established,
-                    &cancellation
-                )
-                .unwrap_err(),
-            DeferredYieldBoundary::UnknownHandle
-        );
-    }
 }

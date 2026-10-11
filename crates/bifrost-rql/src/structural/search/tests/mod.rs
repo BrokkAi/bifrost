@@ -1,4 +1,4 @@
-use super::results::{ALL_DETAILED_CODE_QUERY_DOMAINS, CodeQueryRowScalarRef};
+use super::results::CodeQueryRowScalarRef;
 use super::*;
 use crate::analyzer::usages::reference_site::ResolvedReferenceSite;
 use crate::analyzer::{
@@ -32,11 +32,21 @@ fn language_analyzer(language: Language, project: TestProject) -> Box<dyn IAnaly
     }
 }
 
+mod comments;
 mod configuration;
 mod contracts;
 mod details;
 mod execution;
 mod index_access;
+mod python_call_callee;
+mod python_comparison;
+mod python_imports;
+mod python_method_receiver;
+mod python_pythagorean;
+mod python_raises;
+mod recovered_syntax;
+mod rust_imports;
+mod rust_task_and_callback;
 mod selected_edges;
 mod unit_partition_properties;
 mod units;

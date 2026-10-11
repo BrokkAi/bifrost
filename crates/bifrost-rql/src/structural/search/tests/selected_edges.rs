@@ -5,6 +5,7 @@ use crate::analyzer::structural::reference_edges::{
     inverse_edges_for_declaration,
 };
 use brokk_bifrost_analysis::native_resolution_test_support::SelectedReferenceInverseIndex;
+use brokk_bifrost_test_macros::hardwon;
 use serde_json::json;
 use std::sync::Arc;
 
@@ -52,74 +53,6 @@ fn execute_rust_native_edges(
         after_staging(&result);
         Ok(Some(result))
     })
-}
-
-#[test]
-fn native_rust_edges_of_filters_aliases_and_decoys_and_renders_public_rows() {
-    use brokk_bifrost_analysis::native_resolution_test_support::RustSelectedReverseOutcome;
-    let project = InlineTestProject::with_language(Language::Rust)
-        .file(
-            "Cargo.toml",
-            "[package]\nname = \"native_rql\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
-        )
-        .file(
-            "src/lib.rs",
-            "pub mod api;\nuse api::target as alias;\npub fn caller() { alias(); alias(); }\n",
-        )
-        .file("src/api.rs", "pub fn target() {}\npub fn decoy() {}\n")
-        .build();
-    let workspace = project.workspace_analyzer(AnalyzerConfig::default());
-    for (name, expected) in [("target", 2), ("decoy", 0)] {
-        let target = workspace
-            .analyzer()
-            .all_declarations()
-            .find(|unit| unit.identifier() == name)
-            .unwrap();
-        let query = CodeQuery::from_json(&json!({
-            "languages": ["rust"],
-            "match": { "kind": "callable", "name": name },
-            "steps": [
-                { "op": "enclosing_decl" },
-                { "op": "edges_of", "proof": "proven", "usage": ["reference"],
-                  "surface": "external_usages", "relation": ["external"],
-                  "site_class": ["use_site"] }
-            ]
-        }))
-        .unwrap();
-        let RustSelectedReverseOutcome::Ready(Some(native)) = execute_rust_native_edges(
-            &workspace,
-            &target,
-            &query,
-            &CancellationToken::new(),
-            |_| {},
-        ) else {
-            panic!("closed Rust native query must publish");
-        };
-        assert_eq!(native.completion(), CodeQueryCompletion::Complete);
-        assert_eq!(native.results.len(), expected);
-        let incumbent = execute_workspace(
-            &workspace,
-            &brokk_bifrost_flow::FlowWorkspaceState::default(),
-            &query,
-        );
-        assert_eq!(
-            serde_json::to_value(native).unwrap(),
-            serde_json::to_value(incumbent).unwrap()
-        );
-
-        if expected > 0 {
-            let cancellation = CancellationToken::new();
-            let outcome =
-                execute_rust_native_edges(&workspace, &target, &query, &cancellation, |staged| {
-                    assert_eq!(staged.results.len(), expected);
-                    cancellation.cancel();
-                });
-            assert!(
-                matches!(outcome, RustSelectedReverseOutcome::Cancelled),
-                "late cancellation must discard already rendered rows: {outcome:?}"
-            );
-        }
-    }
 }
 
 #[test]
@@ -392,39 +325,6 @@ fn selected_index_survives_a_seed_union_before_the_shared_edge_suffix() {
 
     assert_eq!(result.completion(), CodeQueryCompletion::Complete);
     assert_eq!(telemetry.snapshot().provider_lookups, 1);
-}
-
-#[test]
-fn selected_inverse_keeps_edge_target_on_the_ordinary_pipeline() {
-    let fixture = SelectedEdgeFixture::new();
-    let target = fixture.register_target();
-    let query = CodeQuery::from_json(&json!({
-        "languages": ["java"],
-        "match": { "kind": "callable", "name": "register" },
-        "steps": [
-            { "op": "enclosing_decl" },
-            { "op": "edges_of", "usage": ["reference"] },
-            { "op": "edge_target" }
-        ]
-    }))
-    .expect("edge target query");
-    let incumbent = execute_workspace(
-        &fixture.workspace,
-        &brokk_bifrost_flow::FlowWorkspaceState::default(),
-        &query,
-    );
-
-    let selected = super::super::execute_workspace_with_selected_inverse_index_for_test(
-        &fixture.workspace,
-        &query,
-        fixture.complete_selected_index(&target),
-        &SelectedEdgesOfTelemetry::default(),
-    );
-
-    assert_eq!(
-        serde_json::to_value(selected).expect("selected target projection"),
-        serde_json::to_value(incumbent).expect("incumbent target projection")
-    );
 }
 
 #[test]
@@ -814,6 +714,106 @@ fn selected_inverse_scope_rejects_retryable_branch_local_edges() {
 }
 
 #[test]
+fn native_rust_edges_of_filters_aliases_and_decoys_and_renders_public_rows() {
+    use brokk_bifrost_analysis::native_resolution_test_support::RustSelectedReverseOutcome;
+    let project = InlineTestProject::with_language(Language::Rust)
+        .file(
+            "Cargo.toml",
+            "[package]\nname = \"native_rql\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+        )
+        .file(
+            "src/lib.rs",
+            "pub mod api;\nuse api::target as alias;\npub fn caller() { alias(); alias(); }\n",
+        )
+        .file("src/api.rs", "pub fn target() {}\npub fn decoy() {}\n")
+        .build();
+    let workspace = project.workspace_analyzer(AnalyzerConfig::default());
+    for (name, expected) in [("target", 2), ("decoy", 0)] {
+        let target = workspace
+            .analyzer()
+            .all_declarations()
+            .find(|unit| unit.identifier() == name)
+            .unwrap();
+        let query = CodeQuery::from_json(&json!({
+            "languages": ["rust"],
+            "match": { "kind": "callable", "name": name },
+            "steps": [
+                { "op": "enclosing_decl" },
+                { "op": "edges_of", "proof": "proven", "usage": ["reference"],
+                  "surface": "external_usages", "relation": ["external"],
+                  "site_class": ["use_site"] }
+            ]
+        }))
+        .unwrap();
+        let RustSelectedReverseOutcome::Ready(Some(native)) = execute_rust_native_edges(
+            &workspace,
+            &target,
+            &query,
+            &CancellationToken::new(),
+            |_| {},
+        ) else {
+            panic!("closed Rust native query must publish");
+        };
+        assert_eq!(native.completion(), CodeQueryCompletion::Complete);
+        assert_eq!(native.results.len(), expected);
+        let incumbent = execute_workspace(
+            &workspace,
+            &brokk_bifrost_flow::FlowWorkspaceState::default(),
+            &query,
+        );
+        assert_eq!(
+            serde_json::to_value(native).unwrap(),
+            serde_json::to_value(incumbent).unwrap()
+        );
+
+        if expected > 0 {
+            let cancellation = CancellationToken::new();
+            let outcome =
+                execute_rust_native_edges(&workspace, &target, &query, &cancellation, |staged| {
+                    assert_eq!(staged.results.len(), expected);
+                    cancellation.cancel();
+                });
+            assert!(
+                matches!(outcome, RustSelectedReverseOutcome::Cancelled),
+                "late cancellation must discard already rendered rows: {outcome:?}"
+            );
+        }
+    }
+}
+#[test]
+fn selected_inverse_keeps_edge_target_on_the_ordinary_pipeline() {
+    let fixture = SelectedEdgeFixture::new();
+    let target = fixture.register_target();
+    let query = CodeQuery::from_json(&json!({
+        "languages": ["java"],
+        "match": { "kind": "callable", "name": "register" },
+        "steps": [
+            { "op": "enclosing_decl" },
+            { "op": "edges_of", "usage": ["reference"] },
+            { "op": "edge_target" }
+        ]
+    }))
+    .expect("edge target query");
+    let incumbent = execute_workspace(
+        &fixture.workspace,
+        &brokk_bifrost_flow::FlowWorkspaceState::default(),
+        &query,
+    );
+
+    let selected = super::super::execute_workspace_with_selected_inverse_index_for_test(
+        &fixture.workspace,
+        &query,
+        fixture.complete_selected_index(&target),
+        &SelectedEdgesOfTelemetry::default(),
+    );
+
+    assert_eq!(
+        serde_json::to_value(selected).expect("selected target projection"),
+        serde_json::to_value(incumbent).expect("incumbent target projection")
+    );
+}
+#[test]
+#[hardwon("#4488: a bound import alias made a same-named Rust decoy incomplete")]
 fn production_rust_edges_of_preserves_aliases_decoys_and_cache_reuse() {
     const LIBRARY: &str = concat!(
         "pub mod dep;\n",
@@ -884,7 +884,6 @@ fn production_rust_edges_of_preserves_aliases_decoys_and_cache_reuse() {
     let repeated = cache.inverse_for(analyzer, &target, None);
     assert!(Arc::ptr_eq(&target_edges, &repeated));
 }
-
 #[test]
 fn production_rust_edges_of_preserves_glob_import_references() {
     let project = InlineTestProject::with_language(Language::Rust)
@@ -929,10 +928,6 @@ fn production_rust_edges_of_preserves_glob_import_references() {
         0
     );
 }
-
-/// Row-driven inverse discovery covers module declarations as well as values.
-/// Preserve the exact import-token edge instead of the old eager index's
-/// target-kind refusal; module coverage must not manufacture empty absence.
 #[test]
 fn production_rust_edges_of_covers_module_rows_from_reverse_demands() {
     let project = InlineTestProject::with_language(Language::Rust)

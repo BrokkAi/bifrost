@@ -14,16 +14,16 @@
 
 use super::resolution_stage::lexical_readers as stage;
 
-use std::cell::{OnceCell, RefCell};
+use std::cell::{Cell, OnceCell, RefCell};
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 
 use brokk_bifrost_core::analyzer::resolution_facts::{
-    ResolutionCallableReceiverOrigin, ResolutionNamespace, ResolutionScopeId, ResolutionSiteId,
-    ResolutionSiteKind,
+    ResolutionCallableReceiverOrigin, ResolutionMemberKind, ResolutionNamespace, ResolutionScopeId,
+    ResolutionSiteId, ResolutionSiteKind,
 };
 use brokk_bifrost_core::analyzer::usages::resolution_session::ResolutionSession;
 use rusqlite::functions::FunctionFlags;
-use rusqlite::{Connection, Row, params};
+use rusqlite::{Connection, OptionalExtension, Row, params};
 use serde::Deserialize;
 
 use crate::CancellationToken;
@@ -33,17 +33,17 @@ use crate::analyzer::resolution::{
     BatchResolutionFragmentSource, BindingFragmentId, BindingNodeId, BindingNodeKind,
     CandidatePathIdentity, CompletionReasons, EndpointSignature, FactReferenceSiteMetadata,
     LoweredCandidateDirection, MAX_SOURCE_ROWS_PER_BATCH, PartialPath, PartialPathId,
-    PartialScopedSymbol, PrecedenceStep, ReferenceSeed, ReferenceSeedBatch,
-    ReferenceSeedReadOutcome, ResolutionCompletion, ResolutionIncompleteReason, ResolutionLocalKey,
-    ResolutionLookupSemanticRecipe, ResolutionNodeIdentity, ResolutionPathIdentity,
-    ResolutionQuery, ResolutionSemanticIdentity, ResolutionStackVariableIdentity,
-    ReverseCandidateGapCoverage, ReverseCandidateGapCoverageBuilder,
-    ReverseCandidateGapExclusionPlan, ReverseCandidateGapRow, ReverseReferenceSeedRequest,
-    SelectedNodeMount, SelectedNodeProvenance, SelectedResolutionMount,
-    SelectedResolutionMountOrdinal, SelectedSemanticLocator, SelectedSemanticMount,
-    SelectedSemanticProvenance, SemanticId, SharedNameId, SharedNameInterner, StackPattern,
-    StackVariableId, TypeTransferRule, WitnessStep, definition_node_identity,
-    reference_node_identity, scope_head_node_identity,
+    PartialScopedSymbol, PrecedenceStep, ReferenceLocalPathEvidence, ReferenceSeed,
+    ReferenceSeedBatch, ReferenceSeedReadOutcome, ResolutionCompletion, ResolutionIncompleteReason,
+    ResolutionLocalKey, ResolutionLookupSemanticRecipe, ResolutionNodeIdentity,
+    ResolutionPathIdentity, ResolutionQuery, ResolutionSemanticIdentity,
+    ResolutionStackVariableIdentity, ReverseCandidateGapCoverage,
+    ReverseCandidateGapCoverageBuilder, ReverseCandidateGapExclusionPlan, ReverseCandidateGapRow,
+    ReverseReferenceSeedRequest, SelectedNodeMount, SelectedNodeProvenance,
+    SelectedResolutionMount, SelectedResolutionMountOrdinal, SelectedSemanticLocator,
+    SelectedSemanticMount, SelectedSemanticProvenance, SemanticId, SharedNameId,
+    SharedNameInterner, StackPattern, StackVariableId, TypeTransferRule, WitnessStep,
+    definition_node_identity, reference_node_identity, scope_head_node_identity,
 };
 use crate::analyzer::structural::{
     BoundaryStatus, CandidateOutcome, CandidateOutcomeKind, PrecedenceTier, RejectionReason,
@@ -51,7 +51,10 @@ use crate::analyzer::structural::{
 };
 use crate::hash::HashMap;
 
-use super::resolution::with_resolution_read_progress_handler;
+use super::resolution::{
+    EndpointLookupShape, endpoint_lookup_shape, json_array, mount_ordinal, nonnegative_i64,
+    nonnegative_i64_value, read_resolution_statement, require_selected_mount_record,
+};
 use super::resolution_prepare::resolution_rows::{
     ParsedEndpointCells, ParsedPathBody, PathBodyContext, RESOLUTION_FORWARD_CANDIDATE_MATCH_SQL,
     RESOLUTION_IDENTITY_RECIPES_SQL, RESOLUTION_PATHS_BY_KEY_SQL,
@@ -64,7 +67,12 @@ use super::resolution_selection::{
     SelectedResolutionMountInventory, SelectedResolutionMountRecord, SelectedResolutionReadStamp,
 };
 use super::resolution_typed::SelectedResolutionTypedSource;
+use super::selected_read_memo::ExactReadMemo;
 use super::{Result as StoreResult, StoreError};
+
+fn json_array_of_arrays(elements: &[String]) -> String {
+    format!("[{}]", elements.join(","))
+}
 
 // A reference's runtime ID already carries its ordinary mount and local key.
 // Catalog membership and site payload are one indexed question for the batch.
@@ -77,6 +85,193 @@ CROSS JOIN resolution_semantic_catalog catalog
 CROSS JOIN resolution_sites site
  ON site.blob_id=catalog.blob_id AND site.site=catalog.local_key
 WHERE catalog.identity_digest IS NOT NULL AND site.role=0
+"#;
+
+pub(crate) const REFERENCE_LOCAL_PATH_EVIDENCE_SQL: &str = r#"
+WITH RECURSIVE selected_site AS (
+ SELECT site.site,site.role,site.namespace,site.site_kind,site.start_byte,
+        site.end_byte,site.unqualified,site.owner,site.receiver_origin,
+        site.go_spelling_namespace,site.go_definition_namespaces,site.go_package_qualifier
+ FROM main.resolution_sites AS site
+ WHERE site.blob_id=?1 AND site.site=?2 AND site.role=0
+), site_paths AS MATERIALIZED (
+ SELECT paths.path,paths.end_node,paths.root_terminal,paths.end_lead_local,
+        paths.end_lead_identity,nodes.semantic_local_key,nodes.source_scope,nodes.kind
+ FROM main.resolution_paths AS paths INDEXED BY resolution_paths_forward
+ LEFT JOIN main.resolution_node_catalog AS nodes
+   ON nodes.blob_id=paths.blob_id AND nodes.local_key=paths.end_node
+ WHERE paths.blob_id=?1 AND paths.start_node=?2
+), lexical_walk(lookup_local,lookup_identity,node,depth) AS (
+ SELECT end_lead_local,end_lead_identity,end_node,0
+ FROM site_paths
+ WHERE end_node>=0 AND semantic_local_key IS NULL
+   AND (end_lead_local IS NOT NULL OR end_lead_identity IS NOT NULL)
+   AND kind=1
+ UNION ALL
+ SELECT walk.lookup_local,walk.lookup_identity,path.end_node,walk.depth+1
+ FROM lexical_walk AS walk
+ CROSS JOIN main.resolution_paths AS path INDEXED BY resolution_paths_forward
+   ON path.blob_id=?1 AND path.start_node=walk.node
+ CROSS JOIN main.resolution_node_catalog AS endpoint
+   ON endpoint.blob_id=path.blob_id AND endpoint.local_key=path.end_node
+ WHERE path.start_lead_local IS NULL AND path.start_lead_identity IS NULL
+   AND path.end_node>=0 AND path.root_terminal IS NULL
+   AND endpoint.kind=1 AND endpoint.semantic_local_key IS NULL
+), matched_local_bindings AS MATERIALIZED (
+ SELECT walk.lookup_local,walk.lookup_identity,walk.depth,
+        endpoint.semantic_local_key
+ FROM lexical_walk AS walk
+ CROSS JOIN main.resolution_paths AS binding INDEXED BY resolution_paths_forward
+   ON binding.blob_id=?1 AND binding.start_node=walk.node
+  AND binding.start_lead_local IS walk.lookup_local
+  AND binding.start_lead_identity IS walk.lookup_identity
+ CROSS JOIN main.resolution_node_catalog AS endpoint
+   ON endpoint.blob_id=binding.blob_id AND endpoint.local_key=binding.end_node
+  AND endpoint.semantic_local_key IS NOT NULL
+ WHERE binding.end_node>=0 AND binding.root_terminal IS NULL
+), root_prefix_sites(candidate_site,prefix_site) AS MATERIALIZED (
+ -- The candidate path carries the qualifier semantic key even when no route
+ -- row exists. Resolve it to its reference site before reading path starts:
+ -- semantic keys and resolution site keys are separate key spaces.
+ SELECT root.start_node,semantic.source_site
+ FROM main.resolution_paths AS root INDEXED BY resolution_paths_forward
+ JOIN main.resolution_semantic_sites AS semantic
+   ON semantic.blob_id=root.blob_id AND semantic.semantic_role='reference'
+  AND semantic.semantic_key=CAST(json_extract(root.body,'$[4][1]') AS INTEGER)
+ JOIN main.resolution_sites AS qualifier
+   ON qualifier.blob_id=semantic.blob_id AND qualifier.site=semantic.source_site
+  AND qualifier.role=0 AND qualifier.go_package_qualifier=1
+ WHERE root.blob_id=?1 AND root.start_node=?2
+   AND root.end_node=-1 AND root.root_terminal IS NOT NULL
+   AND json_array_length(root.body,'$[4]')>=2
+   AND json_type(root.body,'$[4][1]')='integer'
+   AND CAST(json_extract(root.body,'$[4][1]') AS INTEGER)>=0
+ GROUP BY root.start_node
+ HAVING COUNT(DISTINCT semantic.source_site)=1
+), prefix_site_paths AS MATERIALIZED (
+ SELECT prefix.candidate_site,paths.path,paths.end_node,paths.root_terminal,
+        paths.end_lead_local,paths.end_lead_identity,nodes.semantic_local_key,
+        nodes.source_scope,nodes.kind
+ FROM root_prefix_sites AS prefix
+ CROSS JOIN main.resolution_paths AS paths INDEXED BY resolution_paths_forward
+   ON paths.blob_id=?1 AND paths.start_node=prefix.prefix_site
+ LEFT JOIN main.resolution_node_catalog AS nodes
+   ON nodes.blob_id=paths.blob_id AND nodes.local_key=paths.end_node
+), prefix_lexical_walk(candidate_site,lookup_local,lookup_identity,node,depth) AS (
+ SELECT candidate_site,end_lead_local,end_lead_identity,end_node,0
+ FROM prefix_site_paths
+ WHERE end_node>=0 AND semantic_local_key IS NULL
+   AND (end_lead_local IS NOT NULL OR end_lead_identity IS NOT NULL)
+   AND kind=1
+ UNION ALL
+ SELECT walk.candidate_site,walk.lookup_local,walk.lookup_identity,path.end_node,
+        walk.depth+1
+ FROM prefix_lexical_walk AS walk
+ CROSS JOIN main.resolution_paths AS path INDEXED BY resolution_paths_forward
+   ON path.blob_id=?1 AND path.start_node=walk.node
+ CROSS JOIN main.resolution_node_catalog AS endpoint
+   ON endpoint.blob_id=path.blob_id AND endpoint.local_key=path.end_node
+ WHERE path.start_lead_local IS NULL AND path.start_lead_identity IS NULL
+   AND path.end_node>=0 AND path.root_terminal IS NULL
+   AND endpoint.kind=1 AND endpoint.semantic_local_key IS NULL
+), prefix_scope_spellings AS MATERIALIZED (
+ SELECT DISTINCT walk.candidate_site,walk.node,identity.spelling
+ FROM prefix_lexical_walk AS walk
+ CROSS JOIN main.resolution_identities AS identity
+   ON identity.id=walk.lookup_identity
+ WHERE walk.node>=0 AND identity.spelling IS NOT NULL
+), prefix_matched_bindings AS MATERIALIZED (
+ SELECT walk.candidate_site,walk.lookup_local,walk.lookup_identity,walk.depth,
+        endpoint.semantic_local_key
+ FROM prefix_lexical_walk AS walk
+ CROSS JOIN main.resolution_paths AS binding INDEXED BY resolution_paths_forward
+   ON binding.blob_id=?1 AND binding.start_node=walk.node
+  AND binding.start_lead_local IS walk.lookup_local
+  AND binding.start_lead_identity IS walk.lookup_identity
+ CROSS JOIN main.resolution_node_catalog AS endpoint
+   ON endpoint.blob_id=binding.blob_id AND endpoint.local_key=binding.end_node
+  AND endpoint.semantic_local_key IS NOT NULL
+ WHERE binding.end_node>=0 AND binding.root_terminal IS NULL
+), prefix_binding_depths AS (
+ SELECT candidate_site,lookup_local,lookup_identity,MIN(depth) AS depth
+ FROM prefix_matched_bindings
+ GROUP BY candidate_site,lookup_local,lookup_identity
+), prefix_definitions(candidate_site,semantic_local_key) AS (
+ SELECT candidate_site,semantic_local_key
+ FROM prefix_site_paths
+ WHERE end_node>=0 AND semantic_local_key IS NOT NULL
+ UNION
+ SELECT binding.candidate_site,binding.semantic_local_key
+ FROM prefix_matched_bindings AS binding
+ JOIN prefix_binding_depths AS nearest
+   ON nearest.candidate_site=binding.candidate_site
+  AND nearest.lookup_local IS binding.lookup_local
+  AND nearest.lookup_identity IS binding.lookup_identity
+  AND nearest.depth=binding.depth
+), prefix_shadow_definitions(candidate_site,semantic_local_key) AS MATERIALIZED (
+ SELECT DISTINCT prefix_definition_row.candidate_site,
+        prefix_definition_row.semantic_local_key
+ FROM prefix_definitions AS prefix_definition_row
+ JOIN selected_site AS site ON site.site=prefix_definition_row.candidate_site
+ LEFT JOIN main.resolution_semantic_sites AS semantic
+   ON semantic.blob_id=?1
+  AND semantic.semantic_key=prefix_definition_row.semantic_local_key
+  AND semantic.semantic_role='definition'
+ LEFT JOIN main.source_native_declaration_bridges AS bridge
+   ON bridge.blob_id=semantic.blob_id AND bridge.source_site=semantic.source_site
+ LEFT JOIN main.source_declarations AS declaration
+   ON declaration.blob_id=bridge.blob_id
+  AND declaration.declaration_id=bridge.declaration_id
+ WHERE declaration.declaration_id IS NULL
+    OR declaration.end_byte<=site.start_byte
+)
+SELECT site.site,site.role,site.namespace,site.site_kind,site.start_byte,
+       site.end_byte,site.unqualified,site.owner,site.receiver_origin,
+       site.go_spelling_namespace,site.go_definition_namespaces,site.go_package_qualifier,
+       paths.end_node,paths.root_terminal,paths.semantic_local_key,paths.source_scope,
+       NULL,NULL,NULL,NULL,NULL,
+       EXISTS(
+         SELECT 1 FROM main.resolution_package_references AS package_root
+           INDEXED BY resolution_package_references_scope
+         WHERE package_root.blob_id=?1
+           AND package_root.root_scope_key=paths.end_node),
+       prefix_definition.semantic_local_key,
+       prefix_scope.node,prefix_scope.spelling
+FROM selected_site AS site
+LEFT JOIN site_paths AS paths ON TRUE
+LEFT JOIN prefix_shadow_definitions AS prefix_definition
+  ON prefix_definition.candidate_site=?2
+LEFT JOIN prefix_scope_spellings AS prefix_scope
+  ON prefix_scope.candidate_site=?2
+UNION ALL
+SELECT site.site,site.role,site.namespace,site.site_kind,site.start_byte,
+       site.end_byte,site.unqualified,site.owner,site.receiver_origin,
+       site.go_spelling_namespace,site.go_definition_namespaces,site.go_package_qualifier,
+       NULL,NULL,NULL,NULL,walk.lookup_local,walk.lookup_identity,walk.depth,
+       scope.source_scope,binding.semantic_local_key,
+       EXISTS(
+         SELECT 1 FROM main.resolution_package_references AS package_root
+           INDEXED BY resolution_package_references_scope
+         WHERE package_root.blob_id=?1
+           AND package_root.root_scope_key=walk.node),
+       prefix_definition.semantic_local_key,
+       prefix_scope.node,prefix_scope.spelling
+FROM selected_site AS site
+CROSS JOIN lexical_walk AS walk
+-- CROSS JOIN keeps the walk as the outer loop. With a plain JOIN the planner
+-- may put the node catalog outside instead, and then reads every node of the
+-- blob once per site. The walk is small, and the lookup below is a key seek.
+CROSS JOIN main.resolution_node_catalog AS scope
+  ON scope.blob_id=?1 AND scope.local_key=walk.node
+LEFT JOIN matched_local_bindings AS binding
+  ON binding.lookup_local IS walk.lookup_local
+ AND binding.lookup_identity IS walk.lookup_identity
+ AND binding.depth=walk.depth
+LEFT JOIN prefix_shadow_definitions AS prefix_definition
+  ON prefix_definition.candidate_site=?2
+LEFT JOIN prefix_scope_spellings AS prefix_scope
+  ON prefix_scope.candidate_site=?2
+WHERE scope.source_scope IS NOT NULL OR binding.semantic_local_key IS NOT NULL
 "#;
 
 // Keep the coverage arms disjoint so ORDER BY cannot make SQLite scan every
@@ -367,32 +562,68 @@ CROSS JOIN main.resolution_gaps AS h
     AND h.blob_id = m.blob_id
 "#;
 
-// One candidate direction's whole boundary-rooted branch coverage, from
-// `resolution_gaps`.
-//
-// A gap endpoint is either the universal root or a node of the gap's own blob,
-// so only a universal-root-rooted request can have its branch completion
-// qualified by another blob, and these rows are exactly the gaps that qualify
-// it: `covers = 5` or `6` with `subject = -1`, the universal root. Each row
-// carries the shared lookup the gap names, or 0 for every lookup, and the
-// gap's own blob-local reason. That is the same triple the blob's interior
-// holds in its universal-root `CandidateCoverage`: an unkeyed bucket that
-// qualifies every boundary-rooted request and one bucket per lookup symbol.
-//
-// One covering seek per in-scope mount, for the same reason the unconditional
-// read takes its own partial index: root-rooted rows are 2,019 of tract's
-// 866,258, so a primary-key seek pays a descent through the blob's other gaps
-// to find them or to find none. `resolution_gaps_root_branches` is 98 KB and
-// leads on `covers`, which makes both the hit and the miss cheap (2.02 ms to
-// 0.53 ms for the 2,019 forward rows, 0.19 ms to 0.04 ms for the empty
-// reverse direction, against the deleted header table). The planner does not
-// choose a partial index over a primary key on its own, so the statement
-// names it, as the schema's byte-range statement does.
-//
-// A gap header in a blob outside the request's scope cannot qualify this
-// answer; `narrowed_forward_scope_keeps_in_closure_gap_reasons` pins the
-// other half, that a gap inside the closure still does.
+// One candidate direction's finite boundary-rooted lookup set. Every request
+// takes lookup 0, the unkeyed bucket, and requests with a fixed shared name add
+// only that lookup. The partial index is ordered
+// `(covers, blob_id, lookup, reason)` for rows whose subject is the universal
+// root, so binding all three leading columns reads only the requested buckets
+// in each in-scope mount. Open-tail requests use the all-lookups statement
+// below because their selector deliberately admits every shared lookup.
+// `INDEXED BY` keeps the primary-key path from walking a blob's unrelated gap
+// rows to reach these roots or prove a miss. Scope mounts drive both
+// statements, so gaps outside the request closure do not qualify the answer.
 pub(super) const CANDIDATE_GAP_BOUNDARY_BRANCHES_SQL: &str = r#"
+SELECT m.mount_ordinal, h.lookup, h.reason
+FROM temp.selected_resolution_scope_mounts AS scope
+CROSS JOIN temp.selected_resolution_mounts AS m
+     ON m.mount_ordinal = scope.mount_ordinal
+CROSS JOIN json_each(?2) AS requested
+CROSS JOIN main.resolution_gaps AS h
+     INDEXED BY resolution_gaps_root_branches
+     ON h.subject = -1
+    AND h.covers = ?1
+    AND h.blob_id = m.blob_id
+    AND h.lookup = requested.value
+"#;
+
+// The same two reads for a scoped visit. A visit that names its mounts keeps
+// only those mounts' boundary rows (the caller filters by scope after the
+// read), so reading every scope mount's rows only to drop them returned
+// about 66,000 rows per execution for a one-mount Go import visit. The mount
+// list drives the join; the request-scope join keeps the closure rule.
+pub(super) const CANDIDATE_GAP_BOUNDARY_BRANCHES_IN_MOUNTS_SQL: &str = r#"
+SELECT m.mount_ordinal, h.lookup, h.reason
+FROM json_each(?3) AS wanted
+CROSS JOIN temp.selected_resolution_scope_mounts AS scope
+     ON scope.mount_ordinal = wanted.value
+CROSS JOIN temp.selected_resolution_mounts AS m
+     ON m.mount_ordinal = scope.mount_ordinal
+CROSS JOIN json_each(?2) AS requested
+CROSS JOIN main.resolution_gaps AS h
+     INDEXED BY resolution_gaps_root_branches
+     ON h.subject = -1
+    AND h.covers = ?1
+    AND h.blob_id = m.blob_id
+    AND h.lookup = requested.value
+"#;
+
+pub(super) const CANDIDATE_GAP_BOUNDARY_BRANCHES_ALL_IN_MOUNTS_SQL: &str = r#"
+SELECT m.mount_ordinal, h.lookup, h.reason
+FROM json_each(?2) AS wanted
+CROSS JOIN temp.selected_resolution_scope_mounts AS scope
+     ON scope.mount_ordinal = wanted.value
+CROSS JOIN temp.selected_resolution_mounts AS m
+     ON m.mount_ordinal = scope.mount_ordinal
+CROSS JOIN main.resolution_gaps AS h
+     INDEXED BY resolution_gaps_root_branches
+     ON h.subject = -1
+    AND h.covers = ?1
+    AND h.blob_id = m.blob_id
+"#;
+
+// An open-tail selector has no finite lookup set; its completion is the union
+// of every keyed bucket plus lookup 0, so it necessarily reads all root rows.
+pub(super) const CANDIDATE_GAP_BOUNDARY_BRANCHES_ALL_SQL: &str = r#"
 SELECT m.mount_ordinal, h.lookup, h.reason
 FROM temp.selected_resolution_scope_mounts AS scope
 CROSS JOIN temp.selected_resolution_mounts AS m
@@ -539,8 +770,8 @@ type BoundaryWildcardProbeMask = for<'selection, 'store> fn(
 /// `usage_graph` spent about half its CPU. Built as a shared base, each one is
 /// a merge of two sparse deltas over one `Arc`, and every combine site in the
 /// engine already takes that path when it sees a shared value.
-#[derive(Debug)]
-struct UnconditionalCandidateBox {
+#[derive(Clone, Debug)]
+pub(crate) struct UnconditionalCandidateBox {
     /// The whole box: a shared base with no removals and no additions. This is
     /// what a read with no scope and no restated mount returns, by cloning the
     /// handle.
@@ -551,15 +782,121 @@ struct UnconditionalCandidateBox {
     positions: Box<[usize]>,
 }
 
-/// One candidate direction's boundary-rooted branch coverage, as tier-1 rows.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub(crate) struct UnconditionalCandidateReadKey {
+    pub(crate) scope: [u8; 32],
+    pub(crate) direction: usize,
+}
+
+type ContextPathsMemo = RefCell<
+    ExactReadMemo<ContextPathReadKey, std::rc::Rc<Vec<(CandidatePathIdentity, PartialPath)>>>,
+>;
+
+/// The shared memo of reverse candidate rows read for one selected context.
+pub(crate) type ReverseCandidateRowsMemo =
+    std::rc::Rc<RefCell<ExactReadMemo<ReverseCandidateReadKey, Vec<Vec<OfferedCandidateRow>>>>>;
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub(crate) struct ReverseCandidateReadKey {
+    pub(crate) scope: [u8; 32],
+    pub(crate) fragment: BindingFragmentId,
+    pub(crate) blob_id: i64,
+    pub(crate) request_count: usize,
+    pub(crate) arrays: Vec<Vec<String>>,
+}
+
+#[derive(Hash, PartialEq, Eq)]
+struct ContextPathReadKey {
+    context_id: i64,
+    candidates: Vec<CandidatePathIdentity>,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct GraphStageReaderStats {
+    pub(crate) forward_executions: usize,
+    pub(crate) forward_decoded_rows: usize,
+    pub(crate) forward_memo_hits: usize,
+    pub(crate) forward_max_batch: usize,
+    pub(crate) context_executions: usize,
+    pub(crate) context_decoded_rows: usize,
+    pub(crate) context_memo_hits: usize,
+    pub(crate) context_max_batch: usize,
+}
+
+impl GraphStageReaderStats {
+    pub(crate) fn accumulate(&mut self, other: Self) {
+        self.forward_executions += other.forward_executions;
+        self.forward_decoded_rows += other.forward_decoded_rows;
+        self.forward_memo_hits += other.forward_memo_hits;
+        self.forward_max_batch = self.forward_max_batch.max(other.forward_max_batch);
+        self.context_executions += other.context_executions;
+        self.context_decoded_rows += other.context_decoded_rows;
+        self.context_memo_hits += other.context_memo_hits;
+        self.context_max_batch = self.context_max_batch.max(other.context_max_batch);
+    }
+}
+
+/// Exact lexical answers shared by one Go operation or one graph-stage unit.
+/// Graph-stage instances are removed by the unit guard before the next unit.
+pub(crate) struct UnconditionalCandidateCache {
+    gap_boxes: std::rc::Rc<
+        RefCell<ExactReadMemo<UnconditionalCandidateReadKey, UnconditionalCandidateBox>>,
+    >,
+    reverse_rows: ReverseCandidateRowsMemo,
+    context_paths: ContextPathsMemo,
+    graph_stage_read_batch_size: Option<usize>,
+    graph_stage_reader_stats: Cell<GraphStageReaderStats>,
+    offered_hits: Cell<usize>,
+    offered_misses: Cell<usize>,
+}
+
+impl UnconditionalCandidateCache {
+    pub(crate) fn for_go_operation() -> Self {
+        Self::new(None)
+    }
+
+    pub(crate) fn for_graph_stage(read_batch_size: usize) -> Self {
+        assert!((1..=MAX_SOURCE_ROWS_PER_BATCH).contains(&read_batch_size));
+        Self::new(Some(read_batch_size))
+    }
+
+    fn new(graph_stage_read_batch_size: Option<usize>) -> Self {
+        Self {
+            gap_boxes: std::rc::Rc::new(RefCell::new(ExactReadMemo::default())),
+            reverse_rows: std::rc::Rc::new(RefCell::new(ExactReadMemo::default())),
+            context_paths: RefCell::new(ExactReadMemo::default()),
+            graph_stage_read_batch_size,
+            graph_stage_reader_stats: Cell::new(GraphStageReaderStats::default()),
+            offered_hits: Cell::new(0),
+            offered_misses: Cell::new(0),
+        }
+    }
+
+    pub(crate) fn graph_stage_reader_stats(&self) -> GraphStageReaderStats {
+        self.graph_stage_reader_stats.get()
+    }
+
+    pub(crate) fn offered_row_stats(&self) -> (usize, usize) {
+        (self.offered_hits.get(), self.offered_misses.get())
+    }
+
+    fn update_graph_stage_reader_stats(&self, update: impl FnOnce(&mut GraphStageReaderStats)) {
+        let mut stats = self.graph_stage_reader_stats.get();
+        update(&mut stats);
+        self.graph_stage_reader_stats.set(stats);
+    }
+}
+
+/// The requested boundary-rooted buckets, as tier-1 rows.
 ///
 /// A blob's interior keeps its universal-root coverage as one bucket that
 /// every boundary-rooted request takes and one bucket per lookup symbol that
-/// only a request naming that symbol takes. These are the same buckets over
-/// the whole selection, with the selected mount each reason came from so a
-/// scoped read can drop the mounts it may not use.
-#[derive(Debug, Default)]
-struct BoundaryCandidateBranches {
+/// only a request naming that symbol takes. This carries just lookup 0 plus
+/// the requested names, or every name for an open-tail request. Each reason
+/// retains the selected mount it came from so a scoped read can drop mounts it
+/// may not use.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct BoundaryCandidateBranches {
     /// Gaps that name no lookup symbol: the interior's `all_lookups` bucket,
     /// which qualifies every boundary-rooted request of this direction.
     unkeyed: Vec<(usize, ResolutionIncompleteReason)>,
@@ -573,6 +910,19 @@ struct BoundaryCandidateBranches {
     /// keyed bucket and takes the unkeyed rows alone.
     by_shared_lookup: HashMap<SharedNameId, Vec<(usize, ResolutionIncompleteReason)>>,
 }
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub(crate) struct BoundaryCandidateReadKey {
+    pub(crate) covers: i64,
+    pub(crate) mount_set: [u8; 32],
+    pub(crate) lookup_set: Option<Vec<i64>>,
+    /// The visit's own mounts, when it names any; the rows are limited to them.
+    pub(crate) visit_mounts: Option<Vec<u32>>,
+}
+
+pub(crate) type BoundaryCandidateReadMemo = std::rc::Rc<
+    RefCell<ExactReadMemo<BoundaryCandidateReadKey, std::rc::Rc<BoundaryCandidateBranches>>>,
+>;
 
 /// What one batch's completion read needs from the selection.
 struct CandidateCompletionPlan {
@@ -643,11 +993,17 @@ pub(crate) struct SelectedResolutionLexicalSource<'selection, 'store> {
     /// repeat the exact same box, and the box is a property of the selection
     /// rather than of any request, so it is read from tier 1 once and reused.
     unconditional_candidate_reasons: [OnceCell<UnconditionalCandidateBox>; 2],
-    /// One candidate direction's boundary-rooted branch coverage, forward then
-    /// reverse. Like the unconditional box this is a property of the selection
-    /// and the direction, so it is read from tier 1 once and reused instead of
-    /// producing every blob's interior to state it.
-    boundary_candidate_branches: [OnceCell<BoundaryCandidateBranches>; 2],
+    unconditional_candidate_read_memo: Option<
+        std::rc::Rc<
+            RefCell<ExactReadMemo<UnconditionalCandidateReadKey, UnconditionalCandidateBox>>,
+        >,
+    >,
+    reverse_candidate_read_memo: Option<ReverseCandidateRowsMemo>,
+    candidate_cache: Option<std::rc::Rc<UnconditionalCandidateCache>>,
+    /// Boundary-rooted branch rows shared by identical reads for this selected
+    /// operation. The key includes coverage, the active mount-set identity,
+    /// and either the finite requested lookups or the all-lookups case.
+    boundary_candidate_read_memo: Option<BoundaryCandidateReadMemo>,
     authority: std::rc::Rc<super::resolution_authority::SelectedResolutionAuthority<'selection>>,
 }
 
@@ -673,8 +1029,17 @@ impl<'selection, 'store> SelectedResolutionLexicalSource<'selection, 'store> {
         cancellation: &CancellationToken,
     ) -> StoreResult<HashMap<SemanticId, String>> {
         assert!(references.len() <= MAX_SOURCE_ROWS_PER_BATCH);
-        let Some(mut spellings) =
-            stage::reference_lookup_spellings(self.selection, references, namespace, cancellation)?
+        let namespaces = if self.selection.has_go_semantics() {
+            super::resolution_prepare::go_reference_lookup_namespace_codes(namespace)
+        } else {
+            super::resolution_prepare::reference_lookup_namespace_codes(namespace)
+        };
+        let Some(mut spellings) = stage::reference_lookup_spellings(
+            self.selection,
+            references,
+            &namespaces,
+            cancellation,
+        )?
         else {
             return Ok(HashMap::default());
         };
@@ -700,7 +1065,7 @@ impl<'selection, 'store> SelectedResolutionLexicalSource<'selection, 'store> {
             let Some(rows) = self.authority.reference_lookup_spellings(
                 &mount,
                 &keys,
-                namespace,
+                &namespaces,
                 cancellation,
             )?
             else {
@@ -774,12 +1139,9 @@ impl<'selection, 'store> SelectedResolutionLexicalSource<'selection, 'store> {
     /// is staged, so this reads an index the operation already owns instead of
     /// a second copy of it.
     fn selected_position_of_fragment(&self, fragment: BindingFragmentId) -> Option<usize> {
-        let mount = self
-            .selection
-            .mount_rebaser()
-            .borrow()
-            .mount_for_fragment(fragment)?;
-        self.selected_position(mount.ordinal())
+        self.selection
+            .mount_ordinal_for_fragment(fragment)
+            .and_then(|mount| self.selected_position(mount))
     }
 
     /// Resolve only the requested positions before applying the stable blob order.
@@ -1044,6 +1406,22 @@ impl<'selection, 'store> SelectedResolutionLexicalSource<'selection, 'store> {
         ))
     }
 
+    fn with_blob_mount(
+        &self,
+        blob: i64,
+        cancellation: &CancellationToken,
+        query: impl FnOnce(
+            &SelectedResolutionMountRecord,
+            &CancellationToken,
+        ) -> StoreResult<Option<Vec<ResolutionSiteId>>>,
+    ) -> StoreResult<Option<Vec<ResolutionSiteId>>> {
+        match self.mount_of_blob(blob, cancellation)? {
+            None => Ok(None),
+            Some(None) => Ok(Some(Vec::new())),
+            Some(Some(mount)) => query(&mount, cancellation),
+        }
+    }
+
     /// Every reference in one blob that looks a name up, optionally narrowed
     /// to the scope chain a named import binder governs.
     pub(crate) fn lookup_reference_sites(
@@ -1053,13 +1431,10 @@ impl<'selection, 'store> SelectedResolutionLexicalSource<'selection, 'store> {
         binder_scope: Option<brokk_bifrost_core::analyzer::resolution_facts::ResolutionScopeId>,
         cancellation: &CancellationToken,
     ) -> StoreResult<Option<Vec<ResolutionSiteId>>> {
-        let mount = match self.mount_of_blob(blob, cancellation)? {
-            None => return Ok(None),
-            Some(None) => return Ok(Some(Vec::new())),
-            Some(Some(mount)) => mount,
-        };
-        self.authority
-            .lookup_reference_sites(&mount, lookup, binder_scope, cancellation)
+        self.with_blob_mount(blob, cancellation, |mount, cancellation| {
+            self.authority
+                .lookup_reference_sites(mount, lookup, binder_scope, cancellation)
+        })
     }
 
     /// Every reference in one blob whose route to the crate root ends in a
@@ -1070,13 +1445,10 @@ impl<'selection, 'store> SelectedResolutionLexicalSource<'selection, 'store> {
         terminal: SemanticId,
         cancellation: &CancellationToken,
     ) -> StoreResult<Option<Vec<ResolutionSiteId>>> {
-        let mount = match self.mount_of_blob(blob, cancellation)? {
-            None => return Ok(None),
-            Some(None) => return Ok(Some(Vec::new())),
-            Some(Some(mount)) => mount,
-        };
-        self.authority
-            .root_demand_reference_sites(&mount, terminal, cancellation)
+        self.with_blob_mount(blob, cancellation, |mount, cancellation| {
+            self.authority
+                .root_demand_reference_sites(mount, terminal, cancellation)
+        })
     }
 
     /// Root-demand references whose head is a declared named import.
@@ -1086,13 +1458,10 @@ impl<'selection, 'store> SelectedResolutionLexicalSource<'selection, 'store> {
         terminal: SemanticId,
         cancellation: &CancellationToken,
     ) -> StoreResult<Option<Vec<ResolutionSiteId>>> {
-        let mount = match self.mount_of_blob(blob, cancellation)? {
-            None => return Ok(None),
-            Some(None) => return Ok(Some(Vec::new())),
-            Some(Some(mount)) => mount,
-        };
-        self.authority
-            .imported_root_demand_reference_sites(&mount, terminal, cancellation)
+        self.with_blob_mount(blob, cancellation, |mount, cancellation| {
+            self.authority
+                .imported_root_demand_reference_sites(mount, terminal, cancellation)
+        })
     }
 
     /// The same, restricted to the routes whose first segment is a type
@@ -1103,13 +1472,10 @@ impl<'selection, 'store> SelectedResolutionLexicalSource<'selection, 'store> {
         terminal: SemanticId,
         cancellation: &CancellationToken,
     ) -> StoreResult<Option<Vec<ResolutionSiteId>>> {
-        let mount = match self.mount_of_blob(blob, cancellation)? {
-            None => return Ok(None),
-            Some(None) => return Ok(Some(Vec::new())),
-            Some(Some(mount)) => mount,
-        };
-        self.authority
-            .prefixed_root_demand_reference_sites(&mount, terminal, cancellation)
+        self.with_blob_mount(blob, cancellation, |mount, cancellation| {
+            self.authority
+                .prefixed_root_demand_reference_sites(mount, terminal, cancellation)
+        })
     }
 
     /// The type references one reference site observes through its
@@ -1120,13 +1486,10 @@ impl<'selection, 'store> SelectedResolutionLexicalSource<'selection, 'store> {
         site: ResolutionSiteId,
         cancellation: &CancellationToken,
     ) -> StoreResult<Option<Vec<ResolutionSiteId>>> {
-        let mount = match self.mount_of_blob(blob, cancellation)? {
-            None => return Ok(None),
-            Some(None) => return Ok(Some(Vec::new())),
-            Some(Some(mount)) => mount,
-        };
-        self.authority
-            .type_identity_observation_sites(&mount, site, cancellation)
+        self.with_blob_mount(blob, cancellation, |mount, cancellation| {
+            self.authority
+                .type_identity_observation_sites(mount, site, cancellation)
+        })
     }
 
     /// The trait references one member definition declares as a
@@ -1154,13 +1517,10 @@ impl<'selection, 'store> SelectedResolutionLexicalSource<'selection, 'store> {
         lookup: SemanticId,
         cancellation: &CancellationToken,
     ) -> StoreResult<Option<Vec<ResolutionSiteId>>> {
-        let mount = match self.mount_of_blob(blob, cancellation)? {
-            None => return Ok(None),
-            Some(None) => return Ok(Some(Vec::new())),
-            Some(Some(mount)) => mount,
-        };
-        self.authority
-            .qualified_route_reference_sites(&mount, lookup, cancellation)
+        self.with_blob_mount(blob, cancellation, |mount, cancellation| {
+            self.authority
+                .qualified_route_reference_sites(mount, lookup, cancellation)
+        })
     }
 
     /// The reason semantics one unsupported scope, binder or expression at a
@@ -1248,13 +1608,7 @@ impl<'selection, 'store> SelectedResolutionLexicalSource<'selection, 'store> {
         Self::with_authority(
             selection,
             std::rc::Rc::new(
-                super::resolution_authority::SelectedResolutionAuthority::new(
-                    selection.connection(),
-                    selection.shared_name_table(),
-                    selection.requested_mount_rows(),
-                    selection.persisted_mount_count(),
-                    selection.authority_validations(),
-                ),
+                super::resolution_authority::SelectedResolutionAuthority::from_selection(selection),
             ),
         )
     }
@@ -1264,6 +1618,80 @@ impl<'selection, 'store> SelectedResolutionLexicalSource<'selection, 'store> {
         authority: std::rc::Rc<
             super::resolution_authority::SelectedResolutionAuthority<'selection>,
         >,
+    ) -> Self {
+        Self::with_authority_and_read_memos(selection, authority, None, None, None)
+    }
+
+    pub(crate) fn new_on_demand_with_read_memos(
+        selection: &'selection SelectedResolutionMountInventory<'store>,
+        unconditional_candidate_read_memo: std::rc::Rc<
+            RefCell<ExactReadMemo<UnconditionalCandidateReadKey, UnconditionalCandidateBox>>,
+        >,
+        reverse_candidate_read_memo: std::rc::Rc<
+            RefCell<ExactReadMemo<ReverseCandidateReadKey, Vec<Vec<OfferedCandidateRow>>>>,
+        >,
+        boundary_candidate_read_memo: BoundaryCandidateReadMemo,
+    ) -> Self {
+        Self::with_authority_and_read_memos(
+            selection,
+            std::rc::Rc::new(
+                super::resolution_authority::SelectedResolutionAuthority::from_selection(selection),
+            ),
+            Some(unconditional_candidate_read_memo),
+            Some(reverse_candidate_read_memo),
+            Some(boundary_candidate_read_memo),
+        )
+    }
+
+    pub(crate) fn new_on_demand_with_boundary_read_memo(
+        selection: &'selection SelectedResolutionMountInventory<'store>,
+        boundary_candidate_read_memo: BoundaryCandidateReadMemo,
+    ) -> Self {
+        Self::with_authority_and_read_memos(
+            selection,
+            std::rc::Rc::new(
+                super::resolution_authority::SelectedResolutionAuthority::from_selection(selection),
+            ),
+            None,
+            None,
+            Some(boundary_candidate_read_memo),
+        )
+    }
+
+    pub(crate) fn new_on_demand_with_unconditional_cache(
+        selection: &'selection SelectedResolutionMountInventory<'store>,
+        candidate_cache: std::rc::Rc<UnconditionalCandidateCache>,
+    ) -> Self {
+        let mut source = Self::new_on_demand_with_read_memos(
+            selection,
+            std::rc::Rc::clone(&candidate_cache.gap_boxes),
+            std::rc::Rc::clone(&candidate_cache.reverse_rows),
+            std::rc::Rc::new(RefCell::new(ExactReadMemo::default())),
+        );
+        source.candidate_cache = Some(candidate_cache);
+        source
+    }
+
+    pub(crate) fn with_boundary_read_memo(
+        mut self,
+        boundary_candidate_read_memo: BoundaryCandidateReadMemo,
+    ) -> Self {
+        self.boundary_candidate_read_memo = Some(boundary_candidate_read_memo);
+        self
+    }
+
+    fn with_authority_and_read_memos(
+        selection: &'selection SelectedResolutionMountInventory<'store>,
+        authority: std::rc::Rc<
+            super::resolution_authority::SelectedResolutionAuthority<'selection>,
+        >,
+        unconditional_candidate_read_memo: Option<
+            std::rc::Rc<
+                RefCell<ExactReadMemo<UnconditionalCandidateReadKey, UnconditionalCandidateBox>>,
+            >,
+        >,
+        reverse_candidate_read_memo: Option<ReverseCandidateRowsMemo>,
+        boundary_candidate_read_memo: Option<BoundaryCandidateReadMemo>,
     ) -> Self {
         Self {
             selection,
@@ -1275,7 +1703,10 @@ impl<'selection, 'store> SelectedResolutionLexicalSource<'selection, 'store> {
             selected_interiors_validated: OnceCell::new(),
             ordinary_completion_suppression: RefCell::new(None),
             unconditional_candidate_reasons: [OnceCell::new(), OnceCell::new()],
-            boundary_candidate_branches: [OnceCell::new(), OnceCell::new()],
+            unconditional_candidate_read_memo,
+            reverse_candidate_read_memo,
+            candidate_cache: None,
+            boundary_candidate_read_memo,
             authority,
         }
     }
@@ -1314,7 +1745,7 @@ impl<'selection, 'store> SelectedResolutionLexicalSource<'selection, 'store> {
         } else {
             Vec::new()
         };
-        let rows = if staged.is_empty() {
+        let mut rows = if staged.is_empty() {
             let Some(rows) = authority.semantic_sites(&mount, locator, cancellation)? else {
                 return Ok(SelectedSemanticLookupOutcome::Cancelled);
             };
@@ -1322,6 +1753,9 @@ impl<'selection, 'store> SelectedResolutionLexicalSource<'selection, 'store> {
         } else {
             staged
         };
+        if let Some(namespace) = locator.reference_namespace() {
+            rows.retain(|(_, _, candidate_namespace)| *candidate_namespace == namespace);
+        }
         if rows.is_empty() {
             return Ok(SelectedSemanticLookupOutcome::Missing);
         }
@@ -1400,7 +1834,7 @@ impl<'selection, 'store> SelectedResolutionLexicalSource<'selection, 'store> {
             .filter_map(|name| shared_names.to_persisted(name))
             .map(|name| i64::from(name.get()))
             .collect::<Vec<_>>();
-        let id_array = json_integer_array(names.into_iter());
+        let id_array = json_array(names);
         let stage_requests = serde_json::to_string(
             &requests
                 .iter()
@@ -1471,12 +1905,7 @@ JOIN temp.selected_resolution_stage_recipes recipe
         &self,
         ordinal: SelectedResolutionMountOrdinal,
     ) -> StoreResult<std::sync::Arc<SelectedResolutionMountRecord>> {
-        self.selected_mount(ordinal)?.ok_or_else(|| {
-            invalid_fact(format!(
-                "selected lexical row names unknown mount ordinal {}",
-                ordinal.get()
-            ))
-        })
+        require_selected_mount_record(self.selected_mount(ordinal)?, ordinal, "lexical")
     }
 
     fn read_statement<T>(
@@ -1484,16 +1913,7 @@ JOIN temp.selected_resolution_stage_recipes recipe
         cancellation: &CancellationToken,
         job: impl FnOnce(&Connection) -> StoreResult<Option<T>>,
     ) -> StoreResult<Option<T>> {
-        if cancellation.is_cancelled() {
-            return Ok(None);
-        }
-        match with_resolution_read_progress_handler(self.selection.connection(), cancellation, job)
-        {
-            Err(error) if error.is_sqlite_interrupted() && cancellation.is_cancelled() => Ok(None),
-            Err(error) => Err(error),
-            Ok(_) if cancellation.is_cancelled() => Ok(None),
-            Ok(result) => Ok(result),
-        }
+        read_resolution_statement(self.selection.connection(), cancellation, job)
     }
 
     fn validate_selected_interiors_uncached(
@@ -1563,19 +1983,12 @@ JOIN temp.selected_resolution_stage_recipes recipe
         let fragments = std::iter::once(fragment).collect();
         let completion =
             stage::reference_inventory_completion(self.selection, Some(&fragments), cancellation)?;
-        if let ResolutionCompletion::Incomplete(reasons) = &completion {
-            for _ in reasons.iter() {
-                if !session.scope_step() || cancellation.is_cancelled() {
-                    return Ok(with_cancelled(completion));
-                }
-            }
-        }
         Ok(
-            if cancellation.is_cancelled() || !session.observe_cancellation() {
-                with_cancelled(completion)
-            } else {
-                completion
-            },
+            crate::analyzer::resolution::reference_inventory_completion_with_session(
+                completion,
+                cancellation,
+                session,
+            ),
         )
     }
 
@@ -1730,14 +2143,9 @@ JOIN temp.selected_resolution_stage_recipes recipe
         } else {
             None
         };
-        if let (Some(ordinary), Some(staged)) = (ordinary, staged[0])
-            && ordinary != staged
-        {
-            return Err(invalid_fact(format!(
-                "ordinary and stage identity coordinates disagree: {fragment:?}, {identity:?}, {ordinary:?}, {staged:?}"
-            )));
-        }
-        Ok(Some(ordinary.or(staged[0])))
+        Ok(Some(reconcile_stage_identity(
+            fragment, &identity, ordinary, staged[0],
+        )?))
     }
 
     pub(crate) fn local_semantics_for_identities(
@@ -1826,14 +2234,9 @@ JOIN temp.selected_resolution_stage_recipes recipe
         } else {
             None
         };
-        if let (Some(ordinary), Some(staged)) = (ordinary, staged[0])
-            && ordinary != staged
-        {
-            return Err(invalid_fact(format!(
-                "ordinary and stage identity coordinates disagree: {fragment:?}, {identity:?}, {ordinary:?}, {staged:?}"
-            )));
-        }
-        Ok(Some(ordinary.or(staged[0])))
+        Ok(Some(reconcile_stage_identity(
+            fragment, &identity, ordinary, staged[0],
+        )?))
     }
 
     /// The node one mount gives one source scope's head.
@@ -1892,6 +2295,18 @@ JOIN temp.selected_resolution_stage_recipes recipe
     ) -> StoreResult<Option<&UnconditionalCandidateBox>> {
         if let Some(published) = self.unconditional_candidate_reasons[direction.position()].get() {
             return Ok(Some(published));
+        }
+        let key = UnconditionalCandidateReadKey {
+            scope: self.selection.scope_identity(),
+            direction: direction.position(),
+        };
+        if let Some(memo) = &self.unconditional_candidate_read_memo
+            && let Some(published) = memo.borrow().get(&key).cloned()
+        {
+            return Ok(Some(
+                self.unconditional_candidate_reasons[direction.position()]
+                    .get_or_init(|| published),
+            ));
         }
         // The mounted reason is the identity mounted on the blob's own
         // fragment, which is what producing the interior would have reported.
@@ -1961,13 +2376,16 @@ JOIN temp.selected_resolution_stage_recipes recipe
                 positions,
             }
         };
+        if let Some(memo) = &self.unconditional_candidate_read_memo {
+            memo.borrow_mut().insert(key, published.clone());
+        }
         Ok(Some(
             self.unconditional_candidate_reasons[direction.position()].get_or_init(|| published),
         ))
     }
 
-    /// One candidate direction's boundary-rooted branch coverage, read from the
-    /// tier-1 candidate gap headers over the whole selection.
+    /// The requested boundary-rooted branch coverage, read from tier-1 gap
+    /// headers over the active mount set.
     ///
     /// A gap endpoint is either the universal root or a node of the gap's own
     /// blob, so a boundary-rooted request is the only kind another blob can
@@ -1976,20 +2394,77 @@ JOIN temp.selected_resolution_stage_recipes recipe
     /// running the candidate visitor with a discard callback: on tract that was
     /// 282 productions for one candidate read. The reason identity each row
     /// carries is blob-local, so it remounts on that blob's own fragment and
-    /// reproduces the mounted reason the interior would have reported.
+    /// reproduces the mounted reason the interior would have reported. Fixed
+    /// lookups issue one index seek per requested identity, including lookup
+    /// zero; an open-tail read uses the all-lookups statement. Identical reads
+    /// are retained only in the owning semantic operation's exact-read memo.
     fn boundary_candidate_branches(
         &self,
         direction: CandidateDirection,
+        selectors: &[BoundaryBranchSelector],
+        visit_mounts: Option<&[SelectedResolutionMountOrdinal]>,
         cancellation: &CancellationToken,
-    ) -> StoreResult<Option<&BoundaryCandidateBranches>> {
-        if let Some(branches) = self.boundary_candidate_branches[direction.position()].get() {
+    ) -> StoreResult<Option<std::rc::Rc<BoundaryCandidateBranches>>> {
+        let covers = covers_candidate_endpoint(direction.lowered());
+        let mut lookup_set = vec![0];
+        let mut every_lookup = false;
+        for selector in selectors {
+            match selector {
+                BoundaryBranchSelector::SharedLookup(lookup) => {
+                    lookup_set.push(i64::from(lookup.get()))
+                }
+                BoundaryBranchSelector::EveryLookup => every_lookup = true,
+                BoundaryBranchSelector::OwnMount | BoundaryBranchSelector::Unkeyed => {}
+            }
+        }
+        let lookup_set = if every_lookup {
+            None
+        } else {
+            lookup_set.sort_unstable();
+            lookup_set.dedup();
+            Some(lookup_set)
+        };
+        let visit_mounts = visit_mounts.map(|mounts| {
+            debug_assert!(
+                mounts.is_sorted(),
+                "a visit's mount scope is sorted: {mounts:?}"
+            );
+            mounts.iter().map(|mount| mount.get()).collect::<Vec<_>>()
+        });
+        let key = BoundaryCandidateReadKey {
+            covers,
+            mount_set: self.selection.scope_identity(),
+            lookup_set: lookup_set.clone(),
+            visit_mounts: visit_mounts.clone(),
+        };
+        if let Some(memo) = &self.boundary_candidate_read_memo
+            && let Some(branches) = memo.borrow().get(&key).cloned()
+        {
             return Ok(Some(branches));
         }
         let mut rows = Vec::new();
         let live = self.read_statement(cancellation, |conn| {
-            let mut statement = conn.prepare_cached(CANDIDATE_GAP_BOUNDARY_BRANCHES_SQL)?;
-            let mut decoded =
-                statement.query(params![covers_candidate_endpoint(direction.lowered())])?;
+            let sql = match (lookup_set.is_some(), visit_mounts.is_some()) {
+                (true, false) => CANDIDATE_GAP_BOUNDARY_BRANCHES_SQL,
+                (false, false) => CANDIDATE_GAP_BOUNDARY_BRANCHES_ALL_SQL,
+                (true, true) => CANDIDATE_GAP_BOUNDARY_BRANCHES_IN_MOUNTS_SQL,
+                (false, true) => CANDIDATE_GAP_BOUNDARY_BRANCHES_ALL_IN_MOUNTS_SQL,
+            };
+            let mut statement = conn.prepare_cached(sql)?;
+            let lookup_json = lookup_set
+                .as_ref()
+                .map(|lookups| json_array(lookups.iter()));
+            let mounts_json = visit_mounts
+                .as_ref()
+                .map(|mounts| json_array(mounts.iter()));
+            let mut decoded = match (lookup_json.as_deref(), mounts_json.as_deref()) {
+                (Some(lookups), None) => statement.query(params![covers, lookups])?,
+                (None, None) => statement.query(params![covers])?,
+                (Some(lookups), Some(mounts)) => {
+                    statement.query(params![covers, lookups, mounts])?
+                }
+                (None, Some(mounts)) => statement.query(params![covers, mounts])?,
+            };
             while let Some(row) = decoded.next()? {
                 if cancellation.is_cancelled() {
                     return Ok(None);
@@ -2039,9 +2514,11 @@ JOIN temp.selected_resolution_stage_recipes recipe
             bucket.sort_unstable();
             bucket.dedup();
         }
-        Ok(Some(
-            self.boundary_candidate_branches[direction.position()].get_or_init(|| branches),
-        ))
+        let branches = std::rc::Rc::new(branches);
+        if let Some(memo) = &self.boundary_candidate_read_memo {
+            memo.borrow_mut().insert(key, std::rc::Rc::clone(&branches));
+        }
+        Ok(Some(branches))
     }
 
     /// The selected mounts whose authority one completion read must open, and
@@ -2066,12 +2543,13 @@ JOIN temp.selected_resolution_stage_recipes recipe
             }
             let endpoint = request.endpoint();
             if endpoint.node() == BindingNodeId::universal_root() {
-                let selector = match endpoint.symbols().fixed().first() {
-                    None if endpoint.symbols().tail().is_some() => {
-                        BoundaryBranchSelector::EveryLookup
-                    }
-                    None => BoundaryBranchSelector::Unkeyed,
-                    Some(symbol) => symbol.symbol().shared_name_id().map_or(
+                let selector = match endpoint_lookup_shape(
+                    endpoint.symbols().fixed().first(),
+                    endpoint.symbols().tail().is_some(),
+                ) {
+                    EndpointLookupShape::Every => BoundaryBranchSelector::EveryLookup,
+                    EndpointLookupShape::Unkeyed => BoundaryBranchSelector::Unkeyed,
+                    EndpointLookupShape::Fixed(symbol) => symbol.symbol().shared_name_id().map_or(
                         BoundaryBranchSelector::Unkeyed,
                         BoundaryBranchSelector::SharedLookup,
                     ),
@@ -2147,10 +2625,13 @@ JOIN temp.selected_resolution_stage_recipes recipe
                     continue;
                 }
                 let endpoint = request.endpoint();
-                let wanted = match endpoint.symbols().fixed().first() {
-                    None if endpoint.symbols().tail().is_some() => WantedLookup::Every,
-                    None => WantedLookup::Unkeyed,
-                    Some(symbol) => symbol
+                let wanted = match endpoint_lookup_shape(
+                    endpoint.symbols().fixed().first(),
+                    endpoint.symbols().tail().is_some(),
+                ) {
+                    EndpointLookupShape::Every => WantedLookup::Every,
+                    EndpointLookupShape::Unkeyed => WantedLookup::Unkeyed,
+                    EndpointLookupShape::Fixed(symbol) => symbol
                         .symbol()
                         .shared_name_id()
                         .and_then(|shared| names.to_persisted(shared))
@@ -2191,7 +2672,7 @@ JOIN temp.selected_resolution_stage_recipes recipe
                 }
             }
             let exact = serde_json::to_string(&exact).expect("integer tuples serialize");
-            let every = json_integer_array(every.into_iter());
+            let every = json_array(every);
             let result = self.read_statement(cancellation, |conn| {
                 let mut statement = conn.prepare_cached(CANDIDATE_GAP_ENDPOINT_BRANCHES_SQL)?;
                 let mut decoded =
@@ -2279,6 +2760,24 @@ JOIN temp.selected_resolution_stage_recipes recipe
                 CandidateRequestNode::Unmounted => None,
             })
             .collect::<BTreeSet<_>>();
+        // The read below drops the reasons the stage closed. A derive-helper
+        // gap is keyed by an endpoint node of its own mount, never by the
+        // universal root.
+        if !self.selection.decide_derive_helpers_of_mounts(
+            nodes
+                .iter()
+                .filter_map(|&(host, _)| u32::try_from(host).ok()),
+            cancellation,
+        )? {
+            return Ok((
+                BatchCandidateCompletionOutcome::new(
+                    requests.len(),
+                    with_cancelled(ResolutionCompletion::Complete),
+                    vec![ResolutionCompletion::Complete; requests.len()],
+                ),
+                true,
+            ));
+        }
         let nodes =
             serde_json::to_string(&nodes).expect("ordinary reverse endpoint requests serialize");
         let excluded = serde_json::to_string(&ordinary_excluded)
@@ -2407,7 +2906,13 @@ JOIN temp.selected_resolution_stage_recipes recipe
         }
         let (ordinary, mut cancelled) =
             self.ordinary_candidate_completion(direction, requests, scope, cancellation)?;
-        if !self.refresh_ordinary_completion_suppression(cancellation)? {
+        // Only an endpoint branch carries a derive-helper reason; the
+        // unconditional box holds fragment and inventory coverage.
+        if !self
+            .selection
+            .decide_derive_helpers_of_completions(ordinary.branch_completions(), cancellation)?
+            || !self.refresh_ordinary_completion_suppression(cancellation)?
+        {
             return Ok((
                 BatchCandidateCompletionOutcome::new(
                     requests.len(),
@@ -2584,7 +3089,9 @@ JOIN temp.selected_resolution_stage_recipes recipe
             .iter()
             .any(|selector| *selector != BoundaryBranchSelector::OwnMount)
         {
-            let Some(boundary) = self.boundary_candidate_branches(direction, cancellation)? else {
+            let Some(boundary) =
+                self.boundary_candidate_branches(direction, &selectors, scope, cancellation)?
+            else {
                 return Ok(cancelled_outcome(unconditional, branches));
             };
             positions.sort_unstable();
@@ -2853,32 +3360,102 @@ JOIN temp.selected_resolution_stage_recipes recipe
         cancellation: &CancellationToken,
         visitor: &mut dyn FnMut(&[BatchCandidateMatch]) -> StoreResult<bool>,
     ) -> StoreResult<CandidatePageVisit> {
+        assert_eq!(keys.len(), requests.len());
+        let read_batch_size = self
+            .candidate_cache
+            .as_ref()
+            .and_then(|cache| cache.graph_stage_read_batch_size)
+            .unwrap_or_else(|| requests.len().max(1));
+        let mut request_ordinal_base = 0;
+        for (request_page, key_page) in requests
+            .chunks(read_batch_size)
+            .zip(keys.chunks(read_batch_size))
+        {
+            match self.visit_candidate_match_rows_page(
+                direction,
+                mount,
+                request_page,
+                key_page,
+                request_ordinal_base,
+                maximum_page_rows,
+                resolution_session,
+                cancellation,
+                visitor,
+            )? {
+                CandidatePageVisit::Exhausted => {
+                    request_ordinal_base += request_page.len();
+                }
+                other => return Ok(other),
+            }
+        }
+        Ok(CandidatePageVisit::Exhausted)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn visit_candidate_match_rows_page(
+        &self,
+        direction: CandidateDirection,
+        mount: &SelectedResolutionMountRecord,
+        requests: &[BatchCandidateRequest],
+        keys: &[CandidateRequestKey],
+        request_ordinal_base: usize,
+        maximum_page_rows: usize,
+        resolution_session: Option<&ResolutionSession>,
+        cancellation: &CancellationToken,
+        visitor: &mut dyn FnMut(&[BatchCandidateMatch]) -> StoreResult<bool>,
+    ) -> StoreResult<CandidatePageVisit> {
         assert!(
             requests.len() <= MAX_SOURCE_ROWS_PER_BATCH,
             "candidate request page has {} entries; maximum is {MAX_SOURCE_ROWS_PER_BATCH}",
             requests.len()
         );
+        assert_eq!(keys.len(), requests.len());
+        assert!(
+            direction == CandidateDirection::Reverse
+                || requests
+                    .iter()
+                    .all(|request| !request.uses_root_terminal_targets()),
+            "root-terminal target requests use the reverse candidate reader"
+        );
         let fragment = mount.fragment_id();
         let Some(()) = self.authority.ensure_authority(mount, cancellation)? else {
             return Ok(CandidatePageVisit::Cancelled);
         };
-        // Three non-root bucket arrays and one structured root-prefix array.
-        // Every reverse batch is still one statement for this blob. Each root
-        // key is bound once with cell boundaries, not once per proper prefix.
+        // Three non-root bucket arrays and two structured root arrays. Every
+        // reverse batch is still one statement for this blob. Root-prefix keys
+        // are bound once with cell boundaries; exact root-terminal targets are
+        // keyed by their shared identity.
         let mut keyed = Vec::new();
         let mut open = Vec::new();
         let mut whole_node = Vec::new();
         let mut root_prefix = Vec::new();
+        let mut root_terminals = Vec::new();
+        let names = self
+            .selection
+            .shared_name_table()
+            .interner(self.selection.connection());
         for (ordinal, key) in keys.iter().enumerate() {
             let Some(node) = key.node.local_key(mount.ordinal()) else {
                 continue;
             };
             if direction == CandidateDirection::Reverse && node == -1 {
+                if let Some(targets) = requests[ordinal].root_terminal_targets() {
+                    let mut seen = HashSet::<SharedNameId>::default();
+                    for target in targets {
+                        if let Some(persisted) = names.to_persisted(*target)
+                            && seen.insert(persisted)
+                        {
+                            root_terminals.push(format!(
+                                "[{ordinal},{},{}]",
+                                persisted.get(),
+                                i64::from(requests[ordinal].root_terminal_targets_are_imports())
+                            ));
+                        }
+                    }
+                    continue;
+                }
                 let Some(prefix) = root_candidate_request(
-                    &self
-                        .selection
-                        .shared_name_table()
-                        .interner(self.selection.connection()),
+                    &names,
                     ordinal,
                     &requests[ordinal],
                     mount.ordinal(),
@@ -2936,10 +3513,11 @@ JOIN temp.selected_resolution_stage_recipes recipe
             open.as_slice(),
             whole_node.as_slice(),
             root_prefix.as_slice(),
+            root_terminals.as_slice(),
         ];
         let arrays = &arrays[..match direction {
             CandidateDirection::Forward => 3,
-            CandidateDirection::Reverse => 4,
+            CandidateDirection::Reverse => 5,
         }];
         let empty = arrays.iter().all(|array| array.is_empty());
         let Some(mut offered) = self.read_offered_candidates(
@@ -2964,10 +3542,13 @@ JOIN temp.selected_resolution_stage_recipes recipe
         {
             assert_eq!(
                 request.request_ordinal(),
-                ordinal,
-                "candidate requests use canonical local ordinals"
+                request_ordinal_base + ordinal,
+                "candidate requests retain canonical whole-batch ordinals"
             );
-            if resolution_session.is_some_and(|session| !session.scope_step()) {
+            let charge_admitted_rows = request.uses_root_terminal_targets();
+            if !charge_admitted_rows
+                && resolution_session.is_some_and(|session| !session.scope_step())
+            {
                 break;
             }
             work += 1;
@@ -2981,7 +3562,9 @@ JOIN temp.selected_resolution_stage_recipes recipe
             // page-limited read's answer identical.
             rows.sort_unstable_by_key(|row| row.identity);
             for row in rows.iter() {
-                if resolution_session.is_some_and(|session| !session.scope_step()) {
+                if !charge_admitted_rows
+                    && resolution_session.is_some_and(|session| !session.scope_step())
+                {
                     break 'requests;
                 }
                 work += 1;
@@ -2993,6 +3576,11 @@ JOIN temp.selected_resolution_stage_recipes recipe
                 let offered_endpoint = decode_selected_endpoint(&context, row.node, &row.endpoint);
                 if !request.admits_candidate(&offered_endpoint) {
                     continue;
+                }
+                if charge_admitted_rows
+                    && resolution_session.is_some_and(|session| !session.scope_step())
+                {
+                    break 'requests;
                 }
                 page.push(BatchCandidateMatch::new(
                     row.identity,
@@ -3033,10 +3621,53 @@ JOIN temp.selected_resolution_stage_recipes recipe
         arrays: &[&[String]],
         cancellation: &CancellationToken,
     ) -> StoreResult<Option<Vec<Vec<OfferedCandidateRow>>>> {
+        if let Some(cache) = &self.candidate_cache
+            && let Some(batch_size) = cache.graph_stage_read_batch_size
+        {
+            assert!(
+                requests <= batch_size,
+                "graph-stage candidate batch exceeds its bound"
+            );
+        }
         if empty {
             return Ok(Some((0..requests).map(|_| Vec::new()).collect::<Vec<_>>()));
         }
-        self.read_statement(cancellation, |conn| {
+        let memo_key = self
+            .reverse_candidate_read_memo
+            .as_ref()
+            .filter(|_| direction == CandidateDirection::Reverse)
+            .map(|_| ReverseCandidateReadKey {
+                scope: self.selection.scope_identity(),
+                fragment,
+                blob_id,
+                request_count: requests,
+                arrays: arrays.iter().map(|array| array.to_vec()).collect(),
+            });
+        if let Some(key) = &memo_key
+            && let Some(rows) = self
+                .reverse_candidate_read_memo
+                .as_ref()
+                .expect("a reverse candidate memo key has a memo")
+                .borrow()
+                .get(key)
+                .cloned()
+        {
+            if let Some(cache) = &self.candidate_cache {
+                cache.offered_hits.set(cache.offered_hits.get() + 1);
+                if cache.graph_stage_read_batch_size.is_some()
+                    && direction == CandidateDirection::Forward
+                {
+                    cache.update_graph_stage_reader_stats(|stats| {
+                        stats.forward_memo_hits += 1;
+                    });
+                }
+            }
+            return Ok(Some(rows));
+        }
+        if let Some(cache) = &self.candidate_cache {
+            cache.offered_misses.set(cache.offered_misses.get() + 1);
+        }
+        let result = self.read_statement(cancellation, |conn| {
             let mut prepared = conn.prepare_cached(statement)?;
             let parameters = std::iter::once(rusqlite::types::Value::Integer(blob_id)).chain(
                 arrays
@@ -3064,7 +3695,23 @@ JOIN temp.selected_resolution_stage_recipes recipe
                 });
             }
             Ok(Some(offered))
-        })
+        })?;
+        if let (Some(key), Some(rows)) = (memo_key, result.as_ref())
+            && let Some(memo) = &self.reverse_candidate_read_memo
+        {
+            memo.borrow_mut().insert(key, rows.clone());
+        }
+        if let (Some(cache), Some(rows)) = (&self.candidate_cache, result.as_ref())
+            && cache.graph_stage_read_batch_size.is_some()
+            && direction == CandidateDirection::Forward
+        {
+            cache.update_graph_stage_reader_stats(|stats| {
+                stats.forward_executions += 1;
+                stats.forward_decoded_rows += rows.iter().map(Vec::len).sum::<usize>();
+                stats.forward_max_batch = stats.forward_max_batch.max(requests);
+            });
+        }
+        Ok(result)
     }
 
     fn reference_gap_completions(
@@ -3077,7 +3724,7 @@ JOIN temp.selected_resolution_stage_recipes recipe
         HashMap<i64, ResolutionCompletion>,
         bool,
     )> {
-        let keys = json_integer_array(keys.iter().copied());
+        let keys = json_array(keys.iter().copied());
         let mut fragment = ResolutionCompletion::Complete;
         let mut local = HashMap::<i64, ResolutionCompletion>::default();
         let read = self.read_statement(cancellation, |conn| {
@@ -3339,20 +3986,13 @@ JOIN temp.selected_resolution_stage_recipes recipe
         keys: &[i64],
         cancellation: &CancellationToken,
     ) -> StoreResult<Option<HashMap<i64, RawSiteRow>>> {
-        let key_array = json_integer_array(keys.iter().copied());
-        self.read_statement(cancellation, |conn| {
-            let mut statement = conn.prepare_cached(REFERENCE_SITES_BY_KEY_SQL)?;
-            let mut rows = statement.query(params![blob_id, &key_array])?;
-            let mut sites = HashMap::default();
-            while let Some(row) = rows.next()? {
-                if cancellation.is_cancelled() {
-                    return Ok(None);
-                }
-                let site = RawSiteRow::from_row(row)?;
-                sites.insert(site.site, site);
-            }
-            Ok(Some(sites))
-        })
+        let key_array = json_array(keys.iter().copied());
+        self.read_site_rows_with_sql(
+            REFERENCE_SITES_BY_KEY_SQL,
+            blob_id,
+            &key_array,
+            cancellation,
+        )
     }
 
     /// One blob's site rows, by key, in one statement for the whole call.
@@ -3365,10 +4005,62 @@ JOIN temp.selected_resolution_stage_recipes recipe
         keys: impl Iterator<Item = i64>,
         cancellation: &CancellationToken,
     ) -> StoreResult<Option<HashMap<i64, RawSiteRow>>> {
-        let key_array = json_integer_array(keys);
-        self.read_statement(cancellation, |conn| {
-            let mut statement = conn.prepare_cached(RESOLUTION_SITES_BY_KEY_SQL)?;
-            let mut rows = statement.query(params![blob_id, &key_array])?;
+        let mut keys = keys.collect::<Vec<_>>();
+        keys.sort_unstable();
+        keys.dedup();
+        let mut sites = HashMap::default();
+        let mut missing = Vec::new();
+        {
+            let memo = self.selection.site_row_memo().borrow();
+            for site in keys {
+                if cancellation.is_cancelled() {
+                    return Ok(None);
+                }
+                match memo.get(blob_id, site) {
+                    Some(Some(row)) => {
+                        sites.insert(site, row);
+                    }
+                    Some(None) => {}
+                    None => missing.push(site),
+                }
+            }
+        }
+        if missing.is_empty() {
+            return Ok(Some(sites));
+        }
+        let key_array = json_array(missing.iter().copied());
+        let Some(fetched) = self.read_site_rows_with_sql(
+            RESOLUTION_SITES_BY_KEY_SQL,
+            blob_id,
+            &key_array,
+            cancellation,
+        )?
+        else {
+            return Ok(None);
+        };
+        {
+            let mut memo = self.selection.site_row_memo().borrow_mut();
+            for site in missing {
+                if cancellation.is_cancelled() {
+                    return Ok(None);
+                }
+                memo.insert(blob_id, site, fetched.get(&site).copied());
+            }
+        }
+        sites.extend(fetched);
+        Ok(Some(sites))
+    }
+
+    fn read_site_rows_with_sql(
+        &self,
+        sql: &str,
+        blob_id: i64,
+        key_array: &str,
+        cancellation: &CancellationToken,
+    ) -> StoreResult<Option<HashMap<i64, RawSiteRow>>> {
+        let Some(sites) = self.read_statement(cancellation, |conn| {
+            let mut statement = conn.prepare_cached(sql)?;
+            let mut rows = statement.query(params![blob_id, key_array])?;
             let mut sites: HashMap<i64, RawSiteRow> = HashMap::default();
             while let Some(row) = rows.next()? {
                 if cancellation.is_cancelled() {
@@ -3378,7 +4070,11 @@ JOIN temp.selected_resolution_stage_recipes recipe
                 sites.insert(site.site, site);
             }
             Ok(Some(sites))
-        })
+        })?
+        else {
+            return Ok(None);
+        };
+        Ok(Some(sites))
     }
 
     /// One blob's member-scope owners, by scope head node key, in one
@@ -3393,7 +4089,7 @@ JOIN temp.selected_resolution_stage_recipes recipe
         keys: impl Iterator<Item = i64>,
         cancellation: &CancellationToken,
     ) -> StoreResult<Option<HashMap<i64, i64>>> {
-        let key_array = json_integer_array(keys);
+        let key_array = json_array(keys);
         self.read_statement(cancellation, |conn| {
             let mut statement = conn.prepare_cached(MEMBER_SCOPE_OWNERS_BY_NODE_SQL)?;
             let mut rows = statement.query(params![blob_id, &key_array])?;
@@ -3625,11 +4321,21 @@ JOIN temp.selected_resolution_stage_recipes recipe
             && endpoint.symbols().tail().is_some()
     }
 
-    fn requests_are_open_universal_root(requests: &[BatchCandidateRequest]) -> bool {
+    fn requests_are_universal_root(requests: &[BatchCandidateRequest]) -> bool {
         !requests.is_empty()
             && requests.iter().enumerate().all(|(ordinal, request)| {
                 request.request_ordinal() == ordinal
-                    && Self::is_open_universal_root_request(request)
+                    && request.endpoint().node() == BindingNodeId::universal_root()
+                    && request.endpoint().scopes().fixed().is_empty()
+                    && request.endpoint().scopes().tail().is_none()
+            })
+    }
+
+    fn requests_are_open_universal_root(requests: &[BatchCandidateRequest]) -> bool {
+        Self::requests_are_universal_root(requests)
+            && requests.iter().all(|request| {
+                request.endpoint().symbols().fixed().is_empty()
+                    && request.endpoint().symbols().tail().is_some()
             })
     }
 
@@ -3908,7 +4614,6 @@ impl crate::analyzer::resolution::SelectedRootImportAnchors
     ) -> StoreResult<
         Option<brokk_bifrost_core::analyzer::resolution_facts::ResolutionRootImportAnchor>,
     > {
-        use brokk_bifrost_core::analyzer::resolution_facts::ResolutionRootImportAnchor;
         let Some(provenance) = self.semantic_provenance(semantic, cancellation)? else {
             return Ok(None);
         };
@@ -3917,15 +4622,154 @@ impl crate::analyzer::resolution::SelectedRootImportAnchors
             SelectedSemanticProvenance::Stage(provenance) => provenance.identity(),
             SelectedSemanticProvenance::Shared(_) => return Ok(None),
         };
-        Ok([
-            ResolutionRootImportAnchor::Lexical,
-            ResolutionRootImportAnchor::Absolute,
-        ]
-        .into_iter()
-        .find(|anchor| {
-            crate::analyzer::resolution::root_import_anchor_semantic_identity(*anchor) == identity
-        }))
+        Ok(crate::analyzer::resolution::root_import_anchor_for_identity(&identity))
     }
+}
+
+impl SelectedResolutionLexicalSource<'_, '_> {
+    fn visit_candidate_match_pages(
+        &self,
+        direction: CandidateDirection,
+        requests: &[BatchCandidateRequest],
+        mounts: Option<&[SelectedResolutionMountOrdinal]>,
+        cancellation: &CancellationToken,
+        visitor: &mut dyn FnMut(&[BatchCandidateMatch]) -> StoreResult<bool>,
+    ) -> StoreResult<BatchCandidateCompletionOutcome> {
+        let (completion, cancelled) =
+            self.lazy_candidate_completion(direction, requests, mounts, None, cancellation)?;
+        if cancelled {
+            return Ok(completion);
+        }
+        let visit = self.lazy_candidate_matches(
+            direction,
+            requests,
+            mounts,
+            MAX_SOURCE_ROWS_PER_BATCH,
+            None,
+            None,
+            cancellation,
+            visitor,
+        )?;
+        candidate_completion_after_visit(requests.len(), completion, visit, cancellation)
+    }
+}
+
+fn read_reference_local_path_evidence(
+    statement: &mut rusqlite::Statement<'_>,
+    ordinal: SelectedResolutionMountOrdinal,
+    blob_id: i64,
+    site: i64,
+    cancellation: &CancellationToken,
+) -> StoreResult<Option<ReferenceLocalPathEvidence>> {
+    let mut rows = statement.query(params![blob_id, site])?;
+    let mut metadata = None;
+    let mut local_definitions = Vec::new();
+    let mut prefix_local_definitions = Vec::new();
+    let mut prefix_scope_spellings = Vec::new();
+    let mut scope_endpoints = Vec::new();
+    let mut binding_candidates = Vec::<(Option<i64>, Option<i64>, i64, u32)>::new();
+    let mut reaches_root = false;
+    let mut reaches_package_root_scope = false;
+    while let Some(row) = rows.next()? {
+        if cancellation.is_cancelled() {
+            return Ok(None);
+        }
+        let site = RawSiteRow::from_row(row)?;
+        let site_metadata = site.metadata(ordinal).ok_or_else(|| {
+            StoreError::corrupt(format!(
+                "selected reference site has no metadata: blob={blob_id}, site={}",
+                site.site
+            ))
+        })?;
+        if let Some(previous) = metadata {
+            if previous != site_metadata {
+                return Err(StoreError::corrupt(format!(
+                    "selected reference path rows disagree on site metadata: blob={blob_id}, site={}",
+                    site.site
+                )));
+            }
+        } else {
+            metadata = Some(site_metadata);
+        }
+        let walk_depth: Option<i64> = row.get(18)?;
+        reaches_package_root_scope |= row.get::<_, bool>(21)?;
+        if let Some(local_key) = row.get::<_, Option<i64>>(22)? {
+            prefix_local_definitions.push(SemanticId::local(
+                ordinal.get(),
+                u32::try_from(local_key).expect("prefix local binding semantic key fits u32"),
+            ));
+        }
+        if let (Some(scope_key), Some(spelling)) = (
+            row.get::<_, Option<i64>>(23)?,
+            row.get::<_, Option<String>>(24)?,
+        ) {
+            prefix_scope_spellings.push((
+                u32::try_from(scope_key).expect("prefix path scope key fits u32"),
+                spelling,
+            ));
+        }
+        if let Some(depth) = walk_depth {
+            let lookup_local: Option<i64> = row.get(16)?;
+            let lookup_identity: Option<i64> = row.get(17)?;
+            if let Some(scope) = row.get::<_, Option<i64>>(19)? {
+                scope_endpoints.push(u32::try_from(scope).expect("path scope ordinal fits u32"));
+            }
+            if let Some(local_key) = row.get::<_, Option<i64>>(20)? {
+                binding_candidates.push((
+                    lookup_local,
+                    lookup_identity,
+                    depth,
+                    u32::try_from(local_key).expect("local binding semantic key fits u32"),
+                ));
+            }
+        } else {
+            let end_node: Option<i64> = row.get(12)?;
+            reaches_root |= row.get::<_, Option<i64>>(13)?.is_some();
+            if end_node.is_some_and(|node| node >= 0)
+                && let Some(local_key) = row.get::<_, Option<i64>>(14)?
+            {
+                local_definitions.push(SemanticId::local(
+                    ordinal.get(),
+                    u32::try_from(local_key).expect("path endpoint semantic key fits u32"),
+                ));
+            }
+        }
+    }
+    let Some(metadata) = metadata else {
+        return Ok(None);
+    };
+    let mut nearest_binding_depths = HashMap::<(Option<i64>, Option<i64>), i64>::default();
+    for (lookup_local, lookup_identity, depth, _) in &binding_candidates {
+        nearest_binding_depths
+            .entry((*lookup_local, *lookup_identity))
+            .and_modify(|nearest| *nearest = (*nearest).min(*depth))
+            .or_insert(*depth);
+    }
+    local_definitions.extend(
+        binding_candidates
+            .into_iter()
+            .filter(|(lookup_local, lookup_identity, depth, _)| {
+                nearest_binding_depths.get(&(*lookup_local, *lookup_identity)) == Some(depth)
+            })
+            .map(|(_, _, _, local_key)| SemanticId::local(ordinal.get(), local_key)),
+    );
+    local_definitions.sort_unstable();
+    local_definitions.dedup();
+    prefix_local_definitions.sort_unstable();
+    prefix_local_definitions.dedup();
+    prefix_scope_spellings.sort_unstable();
+    prefix_scope_spellings.dedup();
+    scope_endpoints.sort_unstable();
+    scope_endpoints.dedup();
+    Ok(Some(ReferenceLocalPathEvidence::new(
+        metadata,
+        local_definitions,
+        prefix_local_definitions,
+        prefix_scope_spellings,
+        scope_endpoints,
+        reaches_root,
+        reaches_package_root_scope,
+    )))
 }
 
 impl BatchResolutionFragmentSource for SelectedResolutionLexicalSource<'_, '_> {
@@ -3944,15 +4788,82 @@ impl BatchResolutionFragmentSource for SelectedResolutionLexicalSource<'_, '_> {
         Ok(read.rows().first().and_then(|row| row.seed().cloned()))
     }
 
-    fn go_lookup_spelling(
+    fn reference_local_path_evidence(
+        &self,
+        reference: SemanticId,
+        cancellation: &CancellationToken,
+    ) -> StoreResult<Option<ReferenceLocalPathEvidence>> {
+        let (Some(ordinal), Some(site)) = (reference.ordinal(), reference.local_key()) else {
+            return Ok(None);
+        };
+        let ordinal = SelectedResolutionMountOrdinal::new(ordinal);
+        let Some(mount) = self.selected_mount(ordinal)? else {
+            return Ok(None);
+        };
+        let Some(evidence) = self.read_statement(cancellation, |connection| {
+            let mut statement = connection.prepare_cached(REFERENCE_LOCAL_PATH_EVIDENCE_SQL)?;
+            read_reference_local_path_evidence(
+                &mut statement,
+                ordinal,
+                mount.blob_id(),
+                i64::from(site),
+                cancellation,
+            )
+        })?
+        else {
+            return Ok(None);
+        };
+        Ok(Some(evidence))
+    }
+
+    fn universe_entry(
         &self,
         reference: SemanticId,
         namespace: ResolutionNamespace,
         cancellation: &CancellationToken,
-    ) -> StoreResult<Option<String>> {
+    ) -> StoreResult<Option<crate::analyzer::resolution::UniverseEntry>> {
+        if !self.selection.has_universe_semantics() {
+            return Ok(None);
+        }
+        let Some(ordinal) = reference.ordinal() else {
+            return Ok(None);
+        };
+        // The spelling read loads the reference's mount record, so the
+        // language read below is a memo hit for a persisted mount.
         let mut spellings =
             self.reference_lookup_spellings(&[reference], namespace, cancellation)?;
-        Ok(spellings.remove(&reference))
+        let Some(spelling) = spellings.remove(&reference) else {
+            return Ok(None);
+        };
+        let language = if (ordinal as usize) < self.selection.persisted_mount_count() {
+            self.selected_mount(SelectedResolutionMountOrdinal::new(ordinal))?
+                .map(|mount| mount.semantic_language())
+        } else {
+            // A transient replacement mount has no persisted record.
+            let Some(label) = self.read_statement(cancellation, |conn| {
+                let label = conn
+                    .query_row(
+                        "SELECT semantic_language FROM temp.selected_resolution_mounts WHERE mount_ordinal=?1",
+                        [ordinal],
+                        |row| row.get::<_, String>(0),
+                    )
+                    .optional()?;
+                Ok(Some(label))
+            })?
+            else {
+                return Ok(None);
+            };
+            label
+                .map(|label| {
+                    crate::analyzer::Language::from_config_label(&label).ok_or_else(|| {
+                        StoreError::corrupt(format!("unknown selected language {label:?}"))
+                    })
+                })
+                .transpose()?
+        };
+        Ok(language.and_then(|language| {
+            crate::analyzer::resolution::universe_lookup(language, namespace, &spelling)
+        }))
     }
 
     fn intern_shared_name_digest(
@@ -3964,8 +4875,17 @@ impl BatchResolutionFragmentSource for SelectedResolutionLexicalSource<'_, '_> {
             .intern_shared_name_digest(digest, cancellation)
     }
 
+    fn shared_name_digest_for_identity(
+        &self,
+        identity: SemanticId,
+        cancellation: &CancellationToken,
+    ) -> StoreResult<Option<[u8; 32]>> {
+        self.authority
+            .shared_name_digest_for_identity(identity, cancellation)
+    }
+
     fn supports_go_universe(&self) -> bool {
-        true
+        self.selection.has_go_semantics()
     }
 
     fn lookup_reference_seeds(
@@ -4148,13 +5068,17 @@ impl BatchResolutionFragmentSource for SelectedResolutionLexicalSource<'_, '_> {
                 }
             }
         }
+        let mut go_mounts = HashSet::<SelectedResolutionMountOrdinal>::default();
         let names = self
             .selection
             .shared_name_table()
             .interner(self.selection.connection());
         for (ordinal, members) in groups {
             let record = &*self.mount_record(ordinal)?;
-            let keys = json_integer_array(members.iter().map(|(_, key)| *key));
+            if record.semantic_language() == crate::analyzer::Language::Go {
+                go_mounts.insert(ordinal);
+            }
+            let keys = json_array(members.iter().map(|(_, key)| *key));
             let Some(ordinary) = self.read_statement(cancellation, |connection| {
                 let mut statement = connection.prepare_cached(
                     "SELECT node.local_key,node.kind,node.semantic_local_key,node.semantic_shared_identity,node.target_local_key,node.target_boundary_key FROM json_each(?2) input CROSS JOIN main.resolution_node_catalog node ON node.blob_id=?1 AND node.local_key=input.value"
@@ -4247,6 +5171,68 @@ impl BatchResolutionFragmentSource for SelectedResolutionLexicalSource<'_, '_> {
                 }
             }
         }
+        let mut go_fields = HashSet::<SemanticId>::default();
+        if self.selection.has_go_semantics() {
+            use crate::analyzer::resolution::{
+                FactPageVisitor, LoweredMemberOwnerProperty, SelectedTypedFactSource,
+                SelectedTypedRow, TypedFactRequest,
+            };
+            let mut definitions = payloads
+                .iter()
+                .filter_map(|(node, payload)| match payload {
+                    BindingNodeKind::Definition(semantic)
+                        if node.ordinal().is_some_and(|ordinal| {
+                            go_mounts.contains(&SelectedResolutionMountOrdinal::new(ordinal))
+                        }) =>
+                    {
+                        Some(*semantic)
+                    }
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            definitions.sort_unstable();
+            definitions.dedup();
+            if !definitions.is_empty() {
+                let mut collect_fields =
+                    |rows: &[SelectedTypedRow<LoweredMemberOwnerProperty>]| {
+                        for row in rows {
+                            if row.row().kind() == ResolutionMemberKind::Field {
+                                assert!(
+                                    go_fields.insert(row.row().definition()),
+                                    "one selected Go field membership per definition"
+                                );
+                            }
+                        }
+                        Ok(true)
+                    };
+                let read = self.typed.visit_member_owner_pages_for_definitions(
+                    TypedFactRequest::new(&definitions),
+                    cancellation,
+                    &mut FactPageVisitor::new(&mut collect_fields),
+                )?;
+                if cancellation.is_cancelled() || read.is_cancelled() {
+                    return Ok(Vec::new());
+                }
+                assert!(
+                    read.is_exhausted(),
+                    "member-owner classification visitor always exhausts its selected pages"
+                );
+            }
+        }
+        for (&node, payload) in &payloads {
+            if let BindingNodeKind::Definition(definition) = payload
+                && go_fields.contains(definition)
+            {
+                let namespaces =
+                    crate::analyzer::resolution::GoDefinitionNamespaces::GO_FIELD_VALUE;
+                if let Some(previous) = go_namespaces.insert(node, namespaces) {
+                    assert_eq!(
+                        previous, namespaces,
+                        "a selected Go field has value namespace authority"
+                    );
+                }
+            }
+        }
         let mut classified = Vec::with_capacity(nodes.len());
         for &node in nodes {
             if cancellation.is_cancelled() {
@@ -4295,27 +5281,13 @@ impl BatchResolutionFragmentSource for SelectedResolutionLexicalSource<'_, '_> {
         cancellation: &CancellationToken,
         visitor: &mut dyn FnMut(&[BatchCandidateMatch]) -> StoreResult<bool>,
     ) -> StoreResult<BatchCandidateCompletionOutcome> {
-        let (completion, cancelled) = self.lazy_candidate_completion(
+        self.visit_candidate_match_pages(
             CandidateDirection::Forward,
             requests,
-            None,
-            None,
-            cancellation,
-        )?;
-        if cancelled {
-            return Ok(completion);
-        }
-        let visit = self.lazy_candidate_matches(
-            CandidateDirection::Forward,
-            requests,
-            None,
-            MAX_SOURCE_ROWS_PER_BATCH,
-            None,
             None,
             cancellation,
             visitor,
-        )?;
-        candidate_completion_after_visit(requests.len(), completion, visit, cancellation)
+        )
     }
 
     fn visit_forward_root_candidate_match_pages(
@@ -4328,27 +5300,13 @@ impl BatchResolutionFragmentSource for SelectedResolutionLexicalSource<'_, '_> {
         if !Self::requests_are_open_universal_root(requests) {
             return self.visit_forward_candidate_match_pages(requests, cancellation, visitor);
         }
-        let (completion, cancelled) = self.lazy_candidate_completion(
+        self.visit_candidate_match_pages(
             CandidateDirection::Forward,
             requests,
             mounts,
-            None,
-            cancellation,
-        )?;
-        if cancelled {
-            return Ok(completion);
-        }
-        let visit = self.lazy_candidate_matches(
-            CandidateDirection::Forward,
-            requests,
-            mounts,
-            MAX_SOURCE_ROWS_PER_BATCH,
-            None,
-            None,
             cancellation,
             visitor,
-        )?;
-        candidate_completion_after_visit(requests.len(), completion, visit, cancellation)
+        )
     }
 
     fn visit_forward_candidate_match_pages_limited(
@@ -4405,27 +5363,13 @@ impl BatchResolutionFragmentSource for SelectedResolutionLexicalSource<'_, '_> {
         cancellation: &CancellationToken,
         visitor: &mut dyn FnMut(&[BatchCandidateMatch]) -> StoreResult<bool>,
     ) -> StoreResult<BatchCandidateCompletionOutcome> {
-        let (completion, cancelled) = self.lazy_candidate_completion(
+        self.visit_candidate_match_pages(
             CandidateDirection::Reverse,
             requests,
-            None,
-            None,
-            cancellation,
-        )?;
-        if cancelled {
-            return Ok(completion);
-        }
-        let visit = self.lazy_candidate_matches(
-            CandidateDirection::Reverse,
-            requests,
-            None,
-            MAX_SOURCE_ROWS_PER_BATCH,
-            None,
             None,
             cancellation,
             visitor,
-        )?;
-        candidate_completion_after_visit(requests.len(), completion, visit, cancellation)
+        )
     }
 
     fn visit_reverse_root_candidate_match_pages(
@@ -4435,30 +5379,17 @@ impl BatchResolutionFragmentSource for SelectedResolutionLexicalSource<'_, '_> {
         cancellation: &CancellationToken,
         visitor: &mut dyn FnMut(&[BatchCandidateMatch]) -> StoreResult<bool>,
     ) -> StoreResult<BatchCandidateCompletionOutcome> {
-        if !Self::requests_are_open_universal_root(requests) {
+        let scoped_root_visit = mounts.is_some() && Self::requests_are_universal_root(requests);
+        if !Self::requests_are_open_universal_root(requests) && !scoped_root_visit {
             return self.visit_reverse_candidate_match_pages(requests, cancellation, visitor);
         }
-        let (completion, cancelled) = self.lazy_candidate_completion(
+        self.visit_candidate_match_pages(
             CandidateDirection::Reverse,
             requests,
             mounts,
-            None,
-            cancellation,
-        )?;
-        if cancelled {
-            return Ok(completion);
-        }
-        let visit = self.lazy_candidate_matches(
-            CandidateDirection::Reverse,
-            requests,
-            mounts,
-            MAX_SOURCE_ROWS_PER_BATCH,
-            None,
-            None,
             cancellation,
             visitor,
-        )?;
-        candidate_completion_after_visit(requests.len(), completion, visit, cancellation)
+        )
     }
 
     fn visit_reverse_candidate_match_pages_with_gap_exclusions_shared(
@@ -4542,17 +5473,30 @@ impl BatchResolutionFragmentSource for SelectedResolutionLexicalSource<'_, '_> {
         for (fragment, keys) in &groups {
             let mount = &*self.mount_record_of_fragment(*fragment)?;
             let blob_id = mount.blob_id();
-            let key_array = json_integer_array(keys.iter().map(|(_, key)| *key));
+            let key_array = json_array(keys.iter().map(|(_, key)| *key));
             let Some(bodies) = self.read_statement(cancellation, |conn| {
                 let mut statement = conn.prepare_cached(RESOLUTION_PATHS_BY_KEY_SQL)?;
                 let mut rows = statement.query(params![blob_id, &key_array])?;
-                let mut bodies: HashMap<i64, (i64, i64, ParsedPathBody)> = HashMap::default();
+                let mut bodies: HashMap<i64, (i64, i64, ParsedPathBody, Option<u32>)> =
+                    HashMap::default();
                 while let Some(row) = rows.next()? {
                     let key: i64 = row.get(0)?;
                     let start_node: i64 = row.get(1)?;
                     let end_node: i64 = row.get(2)?;
                     let body: String = row.get(3)?;
-                    bodies.insert(key, (start_node, end_node, parse_path_body(&body)));
+                    let activation: Option<i64> = row.get(4)?;
+                    bodies.insert(
+                        key,
+                        (
+                            start_node,
+                            end_node,
+                            parse_path_body(&body),
+                            activation.map(|ordinal| {
+                                u32::try_from(ordinal)
+                                    .expect("a stored root import activation fits a source offset")
+                            }),
+                        ),
+                    );
                 }
                 Ok(Some(bodies))
             })?
@@ -4563,10 +5507,17 @@ impl BatchResolutionFragmentSource for SelectedResolutionLexicalSource<'_, '_> {
                 fragment: *fragment,
             };
             for (position, key) in keys {
-                let (start_node, end_node, body) = bodies.get(key).unwrap_or_else(|| {
-                    panic!("blob {blob_id} has no path row for candidate key {key}")
-                });
-                hydrated[*position] = Some(decode_path_row(&context, *start_node, *end_node, body));
+                let (start_node, end_node, body, activation) =
+                    bodies.get(key).unwrap_or_else(|| {
+                        panic!("blob {blob_id} has no path row for candidate key {key}")
+                    });
+                hydrated[*position] = Some(decode_path_row(
+                    &context,
+                    *start_node,
+                    *end_node,
+                    body,
+                    *activation,
+                ));
             }
         }
         // A persisted path carries the reasons of the gaps it passes; one the
@@ -4574,7 +5525,11 @@ impl BatchResolutionFragmentSource for SelectedResolutionLexicalSource<'_, '_> {
         let closed = if hydrated.iter().flatten().any(|path| {
             path.completion() != &crate::analyzer::resolution::ResolutionCompletion::Complete
         }) {
-            if !self.refresh_ordinary_completion_suppression(cancellation)? {
+            if !self.selection.decide_derive_helpers_of_completions(
+                hydrated.iter().flatten().map(|path| path.completion()),
+                cancellation,
+            )? || !self.refresh_ordinary_completion_suppression(cancellation)?
+            {
                 return Ok(Vec::new());
             }
             self.ordinary_completion_suppression
@@ -4701,13 +5656,6 @@ impl BatchResolutionFragmentSource for SelectedResolutionLexicalSource<'_, '_> {
 /// holds, it passes them as one JSON array in one statement.
 /// A batch of already-rendered JSON arrays as the one array a `json_each(?)`
 /// statement takes.
-fn json_array_of_arrays(elements: &[String]) -> String {
-    let mut out = String::from("[");
-    out.push_str(&elements.join(","));
-    out.push(']');
-    out
-}
-
 pub(in crate::analyzer::store) fn finish_reverse_evidence(
     evidence: impl IntoIterator<Item = ReverseCoverageEvidence>,
     excluded: &[crate::analyzer::resolution::ReverseCandidateGapIdentity],
@@ -4990,6 +5938,22 @@ struct CandidateRequestKey {
 /// `resolution_sites.role`: `0` a reference, `1` a definition.
 const DEFINITION_SITE_ROLE: i64 = 1;
 
+/// Rows from immutable published blobs touched by one selected operation.
+#[derive(Default)]
+pub(super) struct SiteRowMemo {
+    rows: HashMap<(i64, i64), Option<RawSiteRow>>,
+}
+
+impl SiteRowMemo {
+    fn get(&self, blob_id: i64, site: i64) -> Option<Option<RawSiteRow>> {
+        self.rows.get(&(blob_id, site)).copied()
+    }
+
+    fn insert(&mut self, blob_id: i64, site: i64, row: Option<RawSiteRow>) {
+        self.rows.insert((blob_id, site), row);
+    }
+}
+
 /// One `resolution_sites` row as it comes off the statement.
 #[derive(Clone, Copy, Debug)]
 struct RawSiteRow {
@@ -5071,7 +6035,8 @@ impl RawSiteRow {
 ///
 /// It carries the endpoint admission decides on and not the path: almost every
 /// offered row is rejected, and a rejected row must not cost a whole body.
-struct OfferedCandidateRow {
+#[derive(Clone)]
+pub(crate) struct OfferedCandidateRow {
     identity: CandidatePathIdentity,
     node: i64,
     endpoint: ParsedEndpointCells,
@@ -5209,24 +6174,7 @@ impl RawCandidateGap {
                 10,
                 "candidate gap lookup semantic digest",
             )?,
-            reason: RawCompletionReason {
-                position: gap_key,
-                kind: row.get(11)?,
-                cyclic_path_key: optional_nonnegative_i64(
-                    row,
-                    12,
-                    "candidate gap cyclic path key",
-                )?,
-                cyclic_path_digest: optional_digest(row, 13, "candidate gap cyclic path digest")?,
-                semantic_key: optional_nonnegative_i64(
-                    row,
-                    14,
-                    "candidate gap reason semantic key",
-                )?,
-                semantic_space: row.get(15)?,
-                semantic_digest: optional_digest(row, 16, "candidate gap reason semantic digest")?,
-                boundary_status: row.get(17)?,
-            },
+            reason: RawCompletionReason::from_columns(row, gap_key, 11, "candidate gap")?,
             gap_semantic_key: nonnegative_i64(row, 18, "candidate gap semantic key")?,
             gap_semantic_space: row.get(19)?,
             gap_semantic_digest: required_digest(row, 20, "candidate gap semantic digest")?,
@@ -5448,10 +6396,16 @@ struct RawCandidateMatch {
 
 impl RawCandidateMatch {
     fn from_row(row: &Row<'_>) -> StoreResult<Self> {
+        let (mount, path_key, path_digest) = candidate_match_identity_from_row(
+            row,
+            "candidate match mount",
+            "candidate path key",
+            "candidate path digest",
+        )?;
         Ok(Self {
-            mount: mount_ordinal(row, 1, "candidate match mount")?,
-            path_key: nonnegative_i64(row, 2, "candidate path key")?,
-            path_digest: required_digest(row, 3, "candidate path digest")?,
+            mount,
+            path_key,
+            path_digest,
         })
     }
 }
@@ -5465,13 +6419,32 @@ struct RawBoundaryCandidateMatch {
 
 impl RawBoundaryCandidateMatch {
     fn from_row(row: &Row<'_>) -> StoreResult<Self> {
+        let (mount, path_key, path_digest) = candidate_match_identity_from_row(
+            row,
+            "boundary candidate mount",
+            "boundary candidate path key",
+            "boundary candidate path digest",
+        )?;
         Ok(Self {
-            mount: mount_ordinal(row, 1, "boundary candidate mount")?,
-            path_key: nonnegative_i64(row, 2, "boundary candidate path key")?,
-            path_digest: required_digest(row, 3, "boundary candidate path digest")?,
+            mount,
+            path_key,
+            path_digest,
             probe_ordinal: usize_from_nonnegative(row, 4, "boundary candidate probe ordinal")?,
         })
     }
+}
+
+fn candidate_match_identity_from_row(
+    row: &Row<'_>,
+    mount_label: &str,
+    path_key_label: &str,
+    path_digest_label: &str,
+) -> StoreResult<(SelectedResolutionMountOrdinal, i64, [u8; 32])> {
+    Ok((
+        mount_ordinal(row, 1, mount_label)?,
+        nonnegative_i64(row, 2, path_key_label)?,
+        required_digest(row, 3, path_digest_label)?,
+    ))
 }
 
 #[derive(Debug)]
@@ -6072,38 +7045,45 @@ impl RawPathBodyCompletionReason {
                 self.kind
             ))
         })?;
-        match (kind, self.path, self.semantic, self.status) {
-            (ResolutionCompletionReasonKind::CyclicExpansion, Some(path), None, None) => {
-                Ok(ResolutionIncompleteReason::CyclicExpansion(
-                    catalog.mount_path(path, mount, identities)?,
-                ))
-            }
+        let (path, semantic, status) = match (kind, self.path, self.semantic, self.status) {
+            (ResolutionCompletionReasonKind::CyclicExpansion, Some(path), None, None) => (
+                Some(catalog.mount_path(path, mount, identities)?),
+                None,
+                None,
+            ),
             (
                 ResolutionCompletionReasonKind::InconsistentPrecedence,
                 None,
                 Some(semantic),
                 None,
-            ) => Ok(ResolutionIncompleteReason::InconsistentPrecedence(
-                catalog.mount_semantic(semantic, mount, identities)?,
-            )),
+            ) => (
+                None,
+                Some(catalog.mount_semantic(semantic, mount, identities)?),
+                None,
+            ),
             (ResolutionCompletionReasonKind::OpenBoundary, None, Some(semantic), Some(status)) => {
                 let status = BoundaryStatus::from_label(&status).ok_or_else(|| {
                     invalid_fact(format!("unknown resolution boundary status {status:?}"))
                 })?;
-                Ok(ResolutionIncompleteReason::OpenBoundary {
-                    semantic: catalog.mount_semantic(semantic, mount, identities)?,
-                    status,
-                })
+                (
+                    None,
+                    Some(catalog.mount_semantic(semantic, mount, identities)?),
+                    Some(status),
+                )
             }
-            (ResolutionCompletionReasonKind::UnsupportedSemantic, None, Some(semantic), None) => {
-                Ok(ResolutionIncompleteReason::UnsupportedSemantic(
-                    catalog.mount_semantic(semantic, mount, identities)?,
-                ))
+            (ResolutionCompletionReasonKind::UnsupportedSemantic, None, Some(semantic), None) => (
+                None,
+                Some(catalog.mount_semantic(semantic, mount, identities)?),
+                None,
+            ),
+            shape => {
+                return Err(invalid_fact(format!(
+                    "partial-path completion reason has inconsistent shape {shape:?}"
+                )));
             }
-            shape => Err(invalid_fact(format!(
-                "partial-path completion reason has inconsistent shape {shape:?}"
-            ))),
-        }
+        };
+        Ok(completion_reason(kind, path, semantic, status)
+            .expect("validated partial-path completion reason has a valid payload"))
     }
 }
 
@@ -6250,15 +7230,9 @@ impl RawNodeCoordinate {
         mount: &SelectedResolutionMountRecord,
         identities: &mut IdentityStage<'_>,
     ) -> StoreResult<Option<BindingNodeId>> {
-        let local = match (self.key, self.digest) {
-            (None, None) => None,
-            (Some(key), Some(digest)) => Some(identities.node(mount, key, digest)?),
-            values => {
-                return Err(invalid_fact(format!(
-                    "path node key and digest disagree: {values:?}"
-                )));
-            }
-        };
+        let local = optional_key_digest(self.key, self.digest, "path node")?
+            .map(|(key, digest)| identities.node(mount, key, digest))
+            .transpose()?;
         let boundary = self.boundary_key.map(boundary_node_from_key).transpose()?;
         match (local, boundary) {
             (None, None) => Ok(None),
@@ -6605,7 +7579,7 @@ fn reference_site_metadata(
         ));
     }
     if callable_receiver_origin
-        .is_some_and(|origin| unqualified != (origin == ResolutionCallableReceiverOrigin::Implicit))
+        .is_some_and(|origin| !origin.is_reference_qualification_valid(unqualified))
     {
         return Err(invalid_fact(
             "reference qualification disagrees with callable receiver origin",
@@ -6668,7 +7642,7 @@ fn combine_evidence(
 fn with_cancelled(completion: ResolutionCompletion) -> ResolutionCompletion {
     combine_evidence([
         completion,
-        ResolutionCompletion::incomplete([ResolutionIncompleteReason::Cancelled]),
+        crate::analyzer::resolution::cancelled_completion(),
     ])
 }
 
@@ -6791,7 +7765,7 @@ impl<'names> IdentityStage<'names> {
 
 /// One storage-local key as the catalog position it is.
 fn local_key_u32(key: ResolutionLocalKey) -> StoreResult<u32> {
-    u32::try_from(key.get()).map_err(|_| {
+    key.try_u32().ok_or_else(|| {
         invalid_fact(format!(
             "a persisted local key is a catalog position and fits u32: {key:?}"
         ))
@@ -6876,15 +7850,48 @@ struct RawCompletionReason {
 
 impl RawCompletionReason {
     fn from_gap_row(row: &Row<'_>, base: usize) -> StoreResult<Self> {
+        let position = nonnegative_i64(row, base, "gap key")?;
+        Self::from_columns(row, position, base + 1, "")
+    }
+
+    fn from_columns(
+        row: &Row<'_>,
+        position: i64,
+        kind_column: usize,
+        label_prefix: &str,
+    ) -> StoreResult<Self> {
+        let label = |field: &str| {
+            if label_prefix.is_empty() {
+                field.to_owned()
+            } else {
+                format!("{label_prefix} {field}")
+            }
+        };
         Ok(Self {
-            position: nonnegative_i64(row, base, "gap key")?,
-            kind: row.get(base + 1)?,
-            cyclic_path_key: optional_nonnegative_i64(row, base + 2, "cyclic path key")?,
-            cyclic_path_digest: optional_digest(row, base + 3, "cyclic path digest")?,
-            semantic_key: optional_nonnegative_i64(row, base + 4, "reason semantic key")?,
-            semantic_space: row.get(base + 5)?,
-            semantic_digest: optional_digest(row, base + 6, "reason semantic digest")?,
-            boundary_status: row.get(base + 7)?,
+            position,
+            kind: row.get(kind_column)?,
+            cyclic_path_key: optional_nonnegative_i64(
+                row,
+                kind_column + 1,
+                &label("cyclic path key"),
+            )?,
+            cyclic_path_digest: optional_digest(
+                row,
+                kind_column + 2,
+                &label("cyclic path digest"),
+            )?,
+            semantic_key: optional_nonnegative_i64(
+                row,
+                kind_column + 3,
+                &label("reason semantic key"),
+            )?,
+            semantic_space: row.get(kind_column + 4)?,
+            semantic_digest: optional_digest(
+                row,
+                kind_column + 5,
+                &label("reason semantic digest"),
+            )?,
+            boundary_status: row.get(kind_column + 6)?,
         })
     }
 
@@ -6976,11 +7983,21 @@ fn mount_optional_path(
     key: Option<i64>,
     digest: Option<[u8; 32]>,
 ) -> StoreResult<Option<PartialPathId>> {
+    optional_key_digest(key, digest, "partial path")?
+        .map(|(key, digest)| identities.path(mount, key, digest))
+        .transpose()
+}
+
+fn optional_key_digest(
+    key: Option<i64>,
+    digest: Option<[u8; 32]>,
+    description: &str,
+) -> StoreResult<Option<(i64, [u8; 32])>> {
     match (key, digest) {
         (None, None) => Ok(None),
-        (Some(key), Some(digest)) => identities.path(mount, key, digest).map(Some),
+        (Some(key), Some(digest)) => Ok(Some((key, digest))),
         values => Err(invalid_fact(format!(
-            "partial path key and digest disagree: {values:?}"
+            "{description} key and digest disagree: {values:?}"
         ))),
     }
 }
@@ -7020,25 +8037,52 @@ fn incomplete_reason_from_parts(
 ) -> StoreResult<ResolutionIncompleteReason> {
     let kind = ResolutionCompletionReasonKind::from_label(kind)
         .ok_or_else(|| invalid_fact(format!("unknown completion reason kind {kind:?}")))?;
-    match (kind, path, semantic, boundary_status) {
+    if !matches!(kind, ResolutionCompletionReasonKind::OpenBoundary) && boundary_status.is_some() {
+        return Err(invalid_fact(format!(
+            "completion reason {kind:?} has inconsistent local payload"
+        )));
+    }
+    let status = if matches!(kind, ResolutionCompletionReasonKind::OpenBoundary)
+        && path.is_none()
+        && semantic.is_some()
+    {
+        boundary_status
+            .map(|status| {
+                BoundaryStatus::from_label(status).ok_or_else(|| {
+                    invalid_fact(format!("unknown resolution boundary status {status:?}"))
+                })
+            })
+            .transpose()?
+    } else {
+        None
+    };
+    completion_reason(kind, path, semantic, status).ok_or_else(|| {
+        invalid_fact(format!(
+            "completion reason {kind:?} has inconsistent local payload"
+        ))
+    })
+}
+
+fn completion_reason(
+    kind: ResolutionCompletionReasonKind,
+    path: Option<PartialPathId>,
+    semantic: Option<SemanticId>,
+    status: Option<BoundaryStatus>,
+) -> Option<ResolutionIncompleteReason> {
+    match (kind, path, semantic, status) {
         (ResolutionCompletionReasonKind::CyclicExpansion, Some(path), None, None) => {
-            Ok(ResolutionIncompleteReason::CyclicExpansion(path))
+            Some(ResolutionIncompleteReason::CyclicExpansion(path))
         }
         (ResolutionCompletionReasonKind::InconsistentPrecedence, None, Some(semantic), None) => {
-            Ok(ResolutionIncompleteReason::InconsistentPrecedence(semantic))
+            Some(ResolutionIncompleteReason::InconsistentPrecedence(semantic))
         }
         (ResolutionCompletionReasonKind::OpenBoundary, None, Some(semantic), Some(status)) => {
-            let status = BoundaryStatus::from_label(status).ok_or_else(|| {
-                invalid_fact(format!("unknown resolution boundary status {status:?}"))
-            })?;
-            Ok(ResolutionIncompleteReason::OpenBoundary { semantic, status })
+            Some(ResolutionIncompleteReason::OpenBoundary { semantic, status })
         }
         (ResolutionCompletionReasonKind::UnsupportedSemantic, None, Some(semantic), None) => {
-            Ok(ResolutionIncompleteReason::UnsupportedSemantic(semantic))
+            Some(ResolutionIncompleteReason::UnsupportedSemantic(semantic))
         }
-        _ => Err(invalid_fact(format!(
-            "completion reason {kind:?} has inconsistent local payload"
-        ))),
+        _ => None,
     }
 }
 
@@ -7070,17 +8114,6 @@ fn scope_ordinal_array(scope: &[SelectedResolutionMountOrdinal]) -> String {
     }
     array.push(']');
     array
-}
-
-fn mount_ordinal(
-    row: &Row<'_>,
-    column: usize,
-    description: &str,
-) -> StoreResult<SelectedResolutionMountOrdinal> {
-    let value = nonnegative_i64(row, column, description)?;
-    let value = u32::try_from(value)
-        .map_err(|_| invalid_fact(format!("{description} is outside u32: {value}")))?;
-    Ok(SelectedResolutionMountOrdinal::new(value))
 }
 
 /// One candidate gap header identity column, as the 32-byte digest the schema
@@ -7121,20 +8154,26 @@ fn gap_identity_digest(
     })
 }
 
-fn nonnegative_i64(row: &Row<'_>, column: usize, description: &str) -> StoreResult<i64> {
-    let value = row.get::<_, i64>(column)?;
-    if value < 0 {
-        return Err(invalid_fact(format!(
-            "{description} cannot be negative: {value}"
-        )));
-    }
-    Ok(value)
-}
-
 fn usize_from_nonnegative(row: &Row<'_>, column: usize, description: &str) -> StoreResult<usize> {
     let value = nonnegative_i64(row, column, description)?;
     usize::try_from(value)
         .map_err(|_| invalid_fact(format!("{description} does not fit usize: {value}")))
+}
+
+fn reconcile_stage_identity<T: Copy + std::fmt::Debug + PartialEq, I: std::fmt::Debug>(
+    fragment: BindingFragmentId,
+    identity: &I,
+    ordinary: Option<T>,
+    staged: Option<T>,
+) -> StoreResult<Option<T>> {
+    if let (Some(ordinary), Some(staged)) = (ordinary, staged)
+        && ordinary != staged
+    {
+        return Err(invalid_fact(format!(
+            "ordinary and stage identity coordinates disagree: {fragment:?}, {identity:?}, {ordinary:?}, {staged:?}"
+        )));
+    }
+    Ok(ordinary.or(staged))
 }
 
 fn optional_nonnegative_i64(
@@ -7142,21 +8181,16 @@ fn optional_nonnegative_i64(
     column: usize,
     description: &str,
 ) -> StoreResult<Option<i64>> {
-    let value = row.get::<_, Option<i64>>(column)?;
-    if value.is_some_and(|value| value < 0) {
-        return Err(invalid_fact(format!(
-            "{description} cannot be negative: {value:?}"
-        )));
-    }
-    Ok(value)
+    row.get::<_, Option<i64>>(column)?
+        .map(|value| nonnegative_i64_value(value, description))
+        .transpose()
 }
 
 fn required_digest(row: &Row<'_>, column: usize, description: &str) -> StoreResult<[u8; 32]> {
     let value = row.get::<_, Vec<u8>>(column)?;
-    value.try_into().map_err(|value: Vec<u8>| {
+    super::checked_fixed_digest(value).map_err(|length| {
         invalid_fact(format!(
-            "{description} must contain 32 bytes, found {}",
-            value.len()
+            "{description} must contain 32 bytes, found {length}"
         ))
     })
 }
@@ -7168,10 +8202,9 @@ fn optional_digest(
 ) -> StoreResult<Option<[u8; 32]>> {
     row.get::<_, Option<Vec<u8>>>(column)?
         .map(|value| {
-            value.try_into().map_err(|value: Vec<u8>| {
+            super::checked_fixed_digest(value).map_err(|length| {
                 invalid_fact(format!(
-                    "{description} must contain 32 bytes, found {}",
-                    value.len()
+                    "{description} must contain 32 bytes, found {length}"
                 ))
             })
         })
@@ -7198,7 +8231,7 @@ fn ensure_selected_interior(row: &Row<'_>, column: usize, operation: &str) -> St
 mod root_prefix_tests {
     use super::*;
 
-    fn request(symbols: Vec<SemanticId>) -> BatchCandidateRequest {
+    pub(super) fn request(symbols: Vec<SemanticId>) -> BatchCandidateRequest {
         BatchCandidateRequest::new(
             0,
             EndpointSignature::new_scoped(
@@ -7257,49 +8290,6 @@ mod root_prefix_tests {
                 if complete == 1 { 1 } else { 2 }
             );
         }
-    }
-
-    #[test]
-    fn root_prefix_offsets_preserve_empty_foreign_and_context_boundaries() {
-        let mount = SelectedResolutionMountOrdinal::new(7);
-        let cancellation = CancellationToken::new();
-        for foreign in [SemanticId::local(8, 12), SemanticId::operation_local(12)] {
-            let req = request(vec![SemanticId::local(7, 1), foreign]);
-            let encoded = root_candidate_request(
-                crate::analyzer::resolution::test_shared_names(),
-                3,
-                &req,
-                mount,
-                &cancellation,
-            )
-            .unwrap();
-            let value: serde_json::Value = serde_json::from_str(&encoded).unwrap();
-            assert_eq!(value, serde_json::json!([3, "[[1,null,0]]", 0, 0, [1, 11]]));
-        }
-        let empty = root_candidate_request(
-            crate::analyzer::resolution::test_shared_names(),
-            0,
-            &request(vec![]),
-            mount,
-            &cancellation,
-        )
-        .unwrap();
-        assert_eq!(
-            serde_json::from_str::<serde_json::Value>(&empty).unwrap(),
-            serde_json::json!([0, "[]", 0, 1, []])
-        );
-        let complete = root_candidate_request(
-            crate::analyzer::resolution::test_shared_names(),
-            0,
-            &request(vec![SemanticId::local(7, 1)]),
-            mount,
-            &cancellation,
-        )
-        .unwrap();
-        assert_eq!(
-            serde_json::from_str::<serde_json::Value>(&complete).unwrap(),
-            serde_json::json!([0, "[[1,null,0]]", 0, 1, [1]])
-        );
     }
 
     #[test]
@@ -7488,12 +8478,12 @@ mod root_prefix_tests {
                 let mut statement = conn
                     .prepare(RESOLUTION_REVERSE_CANDIDATE_MATCH_SQL)
                     .unwrap();
-                assert_eq!(statement.parameter_count(), 5);
+                assert_eq!(statement.parameter_count(), 6);
                 let keyed = format!("[[{},0,1,null,0]]", batch.len());
                 let open = format!("[[{},0]]", batch.len());
                 let whole = format!("[[{},0]]", batch.len() + 1);
                 let mut rows = statement
-                    .query(params![1, keyed, open, whole, encoded])
+                    .query(params![1, keyed, open, whole, encoded, "[]"])
                     .unwrap();
                 let mut actual = Vec::new();
                 while let Some(row) = rows.next().unwrap() {
@@ -7590,7 +8580,7 @@ mod root_prefix_tests {
                     .prepare(RESOLUTION_REVERSE_CANDIDATE_MATCH_SQL)
                     .unwrap();
                 let rows = statement
-                    .query_map(params![1, "[]", "[]", "[]", array], |row| {
+                    .query_map(params![1, "[]", "[]", "[]", array, "[]"], |row| {
                         Ok((
                             row.get::<_, usize>(0)?,
                             row.get::<_, i64>(1)?,
@@ -7638,13 +8628,17 @@ mod root_prefix_tests {
                 .unwrap()
             );
             let stopped = CancellationToken::new();
-            let result = with_resolution_read_progress_handler(&conn, &stopped, |conn| {
-                stopped.cancel();
-                let mut statement = conn.prepare(RESOLUTION_REVERSE_CANDIDATE_MATCH_SQL)?;
-                let mut rows = statement.query(params![1, "[]", "[]", "[]", encoded])?;
-                while rows.next()?.is_some() {}
-                Ok(())
-            });
+            let result = crate::analyzer::store::resolution::with_resolution_read_progress_handler(
+                &conn,
+                &stopped,
+                |conn| {
+                    stopped.cancel();
+                    let mut statement = conn.prepare(RESOLUTION_REVERSE_CANDIDATE_MATCH_SQL)?;
+                    let mut rows = statement.query(params![1, "[]", "[]", "[]", encoded, "[]"])?;
+                    while rows.next()?.is_some() {}
+                    Ok(())
+                },
+            );
             assert!(result.unwrap_err().to_string().contains("interrupted"));
             assert_eq!(
                 conn.query_row("SELECT 1", [], |row| row.get::<_, i64>(0))
@@ -7716,7 +8710,60 @@ impl crate::analyzer::resolution::SelectedContextPathSource
         candidates: &[CandidatePathIdentity],
         cancellation: &CancellationToken,
     ) -> StoreResult<Option<Vec<(CandidatePathIdentity, PartialPath)>>> {
-        stage::hydrate_context_paths(self.selection, context, candidates, cancellation)
+        let Some(cache) = self
+            .candidate_cache
+            .as_ref()
+            .filter(|cache| cache.graph_stage_read_batch_size.is_some())
+        else {
+            return Ok(stage::hydrate_context_paths(
+                self.selection,
+                context,
+                candidates,
+                cancellation,
+            )?
+            .map(|(paths, _)| paths));
+        };
+        let batch_size = cache
+            .graph_stage_read_batch_size
+            .expect("filtered graph-stage cache has a batch size");
+        if candidates.is_empty() {
+            return Ok(Some(Vec::new()));
+        }
+        let mut hydrated = Vec::new();
+        for page in candidates.chunks(batch_size) {
+            if cancellation.is_cancelled() {
+                return Ok(None);
+            }
+            let key = ContextPathReadKey {
+                context_id: context.get(),
+                candidates: page.to_vec(),
+            };
+            if let Some(cached) = cache.context_paths.borrow().get(&key).cloned() {
+                cache.update_graph_stage_reader_stats(|stats| {
+                    stats.context_memo_hits += 1;
+                });
+                hydrated.extend(cached.iter().cloned());
+                continue;
+            }
+            let Some((rows, decoded_rows)) =
+                stage::hydrate_context_paths(self.selection, context, page, cancellation)?
+            else {
+                return Ok(None);
+            };
+            cache.update_graph_stage_reader_stats(|stats| {
+                stats.context_executions += 1;
+                stats.context_decoded_rows += decoded_rows;
+                stats.context_max_batch = stats.context_max_batch.max(page.len());
+            });
+            cache
+                .context_paths
+                .borrow_mut()
+                .insert(key, std::rc::Rc::new(rows.clone()));
+            hydrated.extend(rows);
+        }
+        let mut seen = crate::hash::HashSet::default();
+        hydrated.retain(|(identity, _)| seen.insert(*identity));
+        Ok(Some(hydrated))
     }
 }
 
@@ -7934,6 +8981,49 @@ mod stage_completion_cache_tests {
         assert!(
             cold.ordinary_completion_suppression.borrow().is_none(),
             "an interrupted suppression read cannot publish a cache entry"
+        );
+    }
+
+    #[test]
+    fn root_prefix_offsets_preserve_empty_foreign_and_context_boundaries() {
+        let mount = SelectedResolutionMountOrdinal::new(7);
+        let cancellation = CancellationToken::new();
+        for foreign in [SemanticId::local(8, 12), SemanticId::operation_local(12)] {
+            let req = super::root_prefix_tests::request(vec![SemanticId::local(7, 1), foreign]);
+            let encoded = root_candidate_request(
+                crate::analyzer::resolution::test_shared_names(),
+                3,
+                &req,
+                mount,
+                &cancellation,
+            )
+            .unwrap();
+            let value: serde_json::Value = serde_json::from_str(&encoded).unwrap();
+            assert_eq!(value, serde_json::json!([3, "[[1,null,0]]", 0, 0, [1, 11]]));
+        }
+        let empty = root_candidate_request(
+            crate::analyzer::resolution::test_shared_names(),
+            0,
+            &super::root_prefix_tests::request(vec![]),
+            mount,
+            &cancellation,
+        )
+        .unwrap();
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&empty).unwrap(),
+            serde_json::json!([0, "[]", 0, 1, []])
+        );
+        let complete = root_candidate_request(
+            crate::analyzer::resolution::test_shared_names(),
+            0,
+            &super::root_prefix_tests::request(vec![SemanticId::local(7, 1)]),
+            mount,
+            &cancellation,
+        )
+        .unwrap();
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&complete).unwrap(),
+            serde_json::json!([0, "[[1,null,0]]", 0, 1, [1]])
         );
     }
 }

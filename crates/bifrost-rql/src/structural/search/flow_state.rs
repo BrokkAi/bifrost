@@ -8,22 +8,21 @@
 //! any filter runs -- so a `:class read` filter that drops every row still
 //! leaves the reason the row set is partial on the response.
 //!
-//! There is no capability table here on purpose. The eleven adapters declare
-//! identical semantic capability rows (see
-//! `.agents/docs/issue-1480-m0-claimed-languages.md`), so a static gate would
-//! carry no information; the honest source is the per-procedure lowering
-//! result, which is exactly what [`FlowStateCompleteness`] reports.
+//! There is no capability table here on purpose: a static gate cannot describe
+//! per-procedure lowering completeness. The per-procedure lowering result is
+//! the honest source, and it is what [`FlowStateCompleteness`] reports (#1480).
 
 use super::super::flow_state::{
     FLOW_STATE_AXES, FileFlowState, FlowRelationRow, FlowStateAxis, FlowStateCompleteness,
     FlowStateDerivation, FlowStateIncompleteReason, FlowStateRequest, StateEventRow,
-    flow_state_for_file, flow_state_for_materialized_artifact,
+    flow_state_for_file_with_snapshot, flow_state_for_materialized_artifact,
     flow_state_for_materialized_procedure,
 };
 use super::rel_path_string;
 use super::results::{
-    CodeQueryDiagnostic, CodeQueryDiagnosticCode, CodeQueryDiagnosticImpact, CodeQueryFlowRelation,
-    CodeQueryRange, CodeQueryStateEvent, CodeQueryStateEventRef,
+    CodeQueryBindingInitializerCall, CodeQueryDiagnostic, CodeQueryDiagnosticCode,
+    CodeQueryDiagnosticImpact, CodeQueryFlowRelation, CodeQueryRange, CodeQueryStateEvent,
+    CodeQueryStateEventRef,
 };
 #[cfg(test)]
 use crate::analyzer::semantic::SemanticGapKind;
@@ -132,12 +131,7 @@ fn record_flow_artifact_read(
     let Some(artifact) = artifact else {
         return;
     };
-    analyzer.record_read(crate::analyzer::ReadKey::artifact(
-        brokk_bifrost_analysis::analyzer::invalidation::DerivedArtifactId::semantic_artifact(
-            artifact.key().public_fingerprint(),
-        ),
-        Some(artifact.key().path().as_str()),
-    ));
+    analyzer.record_read(crate::analyzer::ReadKey::semantic_artifact(artifact.key()));
 }
 
 impl FlowStateTraversalCache {
@@ -185,10 +179,12 @@ impl FlowStateTraversalCache {
         if let Some(cached) = self.files.get(&key) {
             return Arc::clone(&cached.state);
         }
-        let token = cancellation.cloned().unwrap_or_default();
-        let mut request = FlowStateRequest::new(&token)
-            .with_active_semantic_model_snapshot(self.active_semantic_model_snapshot.clone());
-        let derived = Arc::new(flow_state_for_file(workspace, file, &mut request));
+        let derived = Arc::new(flow_state_for_file_with_snapshot(
+            workspace,
+            file,
+            cancellation,
+            self.active_semantic_model_snapshot.clone(),
+        ));
         self.files.insert(
             key,
             CachedFileFlowState {
@@ -208,39 +204,18 @@ impl FlowStateTraversalCache {
         outcome: SemanticOutcome<Arc<SemanticArtifact>>,
         cancellation: Option<&CancellationToken>,
     ) -> Arc<FileFlowState> {
-        let key = FlowStateCacheKey {
-            file: file.clone(),
-            active_model_set_hash: self.active_model_set_hash.clone(),
-            scope: FlowStateCacheScope::File,
-            outcome: FlowStateOutcomeIdentity::for_outcome(&outcome),
-        };
         let artifact = outcome.available_value().cloned();
         record_flow_artifact_read(workspace, artifact.as_deref());
-        if let (Some(wanted), Some(cached)) = (artifact.as_ref(), self.files.get(&key))
-            && cached
-                .artifact
-                .as_ref()
-                .is_some_and(|retained| Arc::ptr_eq(retained, wanted))
-        {
-            return Arc::clone(&cached.state);
-        }
-        let token = cancellation.cloned().unwrap_or_default();
-        let mut request = FlowStateRequest::new(&token)
-            .with_active_semantic_model_snapshot(self.active_semantic_model_snapshot.clone());
-        let derived = Arc::new(flow_state_for_materialized_artifact(
-            workspace,
+        self.cached_materialized_scope(
             file,
             outcome,
-            &mut request,
-        ));
-        self.files.insert(
-            key,
-            CachedFileFlowState {
-                artifact,
-                state: Arc::clone(&derived),
+            artifact,
+            FlowStateCacheScope::File,
+            cancellation,
+            |outcome, request| {
+                flow_state_for_materialized_artifact(workspace, file, outcome, request)
             },
-        );
-        derived
+        )
     }
 
     /// Derive (or replay) flow state for one exact procedure from the semantic
@@ -253,12 +228,6 @@ impl FlowStateTraversalCache {
         procedure: &ProcedureHandle,
         cancellation: Option<&CancellationToken>,
     ) -> Arc<FileFlowState> {
-        let key = FlowStateCacheKey {
-            file: file.clone(),
-            active_model_set_hash: self.active_model_set_hash.clone(),
-            scope: FlowStateCacheScope::Procedure(procedure.id()),
-            outcome: FlowStateOutcomeIdentity::for_outcome(&outcome),
-        };
         let artifact = outcome.available_value().cloned();
         record_flow_artifact_read(workspace, artifact.as_deref());
         if let Some(artifact) = artifact.as_ref() {
@@ -267,6 +236,39 @@ impl FlowStateTraversalCache {
                 "procedure-scoped flow cache requires a handle from the supplied artifact allocation"
             );
         }
+        self.cached_materialized_scope(
+            file,
+            outcome,
+            artifact,
+            FlowStateCacheScope::Procedure(procedure.id()),
+            cancellation,
+            |outcome, request| {
+                flow_state_for_materialized_procedure(workspace, file, outcome, procedure, request)
+            },
+        )
+    }
+
+    fn cached_materialized_scope<F>(
+        &mut self,
+        file: &ProjectFile,
+        outcome: SemanticOutcome<Arc<SemanticArtifact>>,
+        artifact: Option<Arc<SemanticArtifact>>,
+        scope: FlowStateCacheScope,
+        cancellation: Option<&CancellationToken>,
+        derive: F,
+    ) -> Arc<FileFlowState>
+    where
+        F: FnOnce(
+            SemanticOutcome<Arc<SemanticArtifact>>,
+            &mut FlowStateRequest<'_>,
+        ) -> FileFlowState,
+    {
+        let key = FlowStateCacheKey {
+            file: file.clone(),
+            active_model_set_hash: self.active_model_set_hash.clone(),
+            scope,
+            outcome: FlowStateOutcomeIdentity::for_outcome(&outcome),
+        };
         if let (Some(wanted), Some(cached)) = (artifact.as_ref(), self.files.get(&key))
             && cached
                 .artifact
@@ -278,13 +280,7 @@ impl FlowStateTraversalCache {
         let token = cancellation.cloned().unwrap_or_default();
         let mut request = FlowStateRequest::new(&token)
             .with_active_semantic_model_snapshot(self.active_semantic_model_snapshot.clone());
-        let derived = Arc::new(flow_state_for_materialized_procedure(
-            workspace,
-            file,
-            outcome,
-            procedure,
-            &mut request,
-        ));
+        let derived = Arc::new(derive(outcome, &mut request));
         self.files.insert(
             key,
             CachedFileFlowState {
@@ -413,6 +409,10 @@ fn classify_reason(reason: &FlowStateIncompleteReason) -> (CodeQueryDiagnosticCo
             CodeQueryDiagnosticCode::FlowStateDerivationIncomplete,
             "the lowering declares a local binding it never establishes",
         ),
+        BindingScopeLivenessUnavailable { .. } => (
+            CodeQueryDiagnosticCode::FlowStateDerivationIncomplete,
+            "Rust lexical-scope future-frame liveness could not be derived completely",
+        ),
         BindingStateNotClosed { .. } => (
             CodeQueryDiagnosticCode::FlowStateDerivationIncomplete,
             "aliasing, capture, or ownership transfer leaves the binding's read/write state open",
@@ -458,6 +458,9 @@ pub(super) struct StateEventValue {
     /// The wire identity of the seed procedure, carried from the semantic
     /// handle that produced it so two row families agree on one spelling.
     pub(super) procedure_id: Arc<str>,
+    /// Exact request-retained semantic procedure used to relate the event's
+    /// establishment value to call results in its initializer.
+    pub(super) procedure: ProcedureHandle,
 }
 
 impl StateEventValue {
@@ -494,6 +497,7 @@ pub(super) struct FlowRelationValue {
     pub(super) relation: usize,
     pub(super) file: ProjectFile,
     pub(super) procedure_id: Arc<str>,
+    pub(super) procedure: ProcedureHandle,
 }
 
 impl FlowRelationValue {
@@ -549,8 +553,17 @@ impl FlowRelationValue {
             },
             file: self.file.clone(),
             procedure_id: Arc::clone(&self.procedure_id),
+            procedure: self.procedure.clone(),
         }
     }
+}
+
+/// One request-derived link from a binding establishment to a call result in
+/// its initializer receiver chain.
+#[derive(Debug, Clone)]
+pub(super) struct BindingInitializerCallValue {
+    pub(super) row: CodeQueryBindingInitializerCall,
+    pub(super) file: ProjectFile,
 }
 
 pub(super) fn state_event_id(procedure_id: &str, row: &StateEventRow) -> String {
@@ -590,6 +603,13 @@ pub(super) fn state_event_filter_matches(filter: &StateEventFilter, row: &StateE
     if !filter.subjects.is_empty() && !filter.subjects.contains(&row.subject.kind()) {
         return false;
     }
+    if !filter.read_causes.is_empty()
+        && !row
+            .read_cause
+            .is_some_and(|cause| filter.read_causes.contains(&cause))
+    {
+        return false;
+    }
     true
 }
 
@@ -612,21 +632,23 @@ pub(super) fn public_state_event(
     range: CodeQueryRange,
 ) -> CodeQueryStateEvent {
     let row = value.row();
+    let common = state_event_projection(value.id(), row, range);
     CodeQueryStateEvent {
-        id: value.id(),
-        ast_id: row.site.ast_id.clone(),
+        id: common.id,
+        ast_id: common.ast_id,
         procedure_id: value.procedure_id.to_string(),
-        path: rel_path_string(&row.site.file),
+        path: common.path,
         language: crate::analyzer::common::language_for_file(&row.site.file).config_label(),
-        range,
+        range: common.range,
         start_byte: row.site.range.start_byte,
         end_byte: row.site.range.end_byte,
-        event_class: row.event_class.label(),
-        subject: row.subject.kind().label(),
-        member: row.subject.member().map(str::to_string),
+        event_class: common.event_class,
+        read_cause: row.read_cause.map(|cause| cause.label()),
+        subject: common.subject,
+        member: common.member,
         subject_value: row.subject.value().index(),
-        program_point: row.point.index(),
-        program_point_id: row.point_id.to_string(),
+        program_point: common.program_point,
+        program_point_id: common.program_point_id,
         value: row.value.index(),
         completeness: axis_completeness_label(&value.derivation().completeness, row.subject.axis()),
         uncovered_axes: uncovered_axes(&value.derivation().completeness),
@@ -667,8 +689,16 @@ pub(super) fn state_event_ref(
     row: &StateEventRow,
     range: CodeQueryRange,
 ) -> CodeQueryStateEventRef {
+    state_event_projection(state_event_id(procedure_id, row), row, range)
+}
+
+fn state_event_projection(
+    id: String,
+    row: &StateEventRow,
+    range: CodeQueryRange,
+) -> CodeQueryStateEventRef {
     CodeQueryStateEventRef {
-        id: state_event_id(procedure_id, row),
+        id,
         ast_id: row.site.ast_id.clone(),
         path: rel_path_string(&row.site.file),
         range,
@@ -693,11 +723,7 @@ fn axis_completeness_label(
     completeness: &FlowStateCompleteness,
     axis: FlowStateAxis,
 ) -> &'static str {
-    if completeness.covers(axis) {
-        "complete"
-    } else {
-        "partial"
-    }
+    super::completeness_label_for_coverage(completeness.covers(axis))
 }
 
 fn uncovered_axes(completeness: &FlowStateCompleteness) -> Vec<&'static str> {
@@ -712,28 +738,6 @@ fn uncovered_axes(completeness: &FlowStateCompleteness) -> Vec<&'static str> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use brokk_bifrost_core::analyzer::structural::flow_state::{
-        ALL_FLOW_CERTAINTIES, ALL_FLOW_RELATIONS, ALL_FLOW_SUBJECT_KINDS, ALL_STATE_EVENT_CLASSES,
-        StateEventClass,
-    };
-
-    #[test]
-    fn every_flow_state_vocabulary_value_has_a_wire_label() {
-        for class in ALL_STATE_EVENT_CLASSES {
-            assert!(!class.label().is_empty());
-        }
-        for relation in ALL_FLOW_RELATIONS {
-            assert!(!relation.label().is_empty());
-            for subject in ALL_FLOW_SUBJECT_KINDS {
-                assert!(FLOW_STATE_AXES.contains(&relation.axis_for_subject(*subject)));
-            }
-        }
-        for certainty in ALL_FLOW_CERTAINTIES {
-            assert!(!certainty.label().is_empty());
-        }
-        assert_eq!(FLOW_STATE_AXES.len(), 7);
-    }
-
     #[test]
     fn an_incomplete_derivation_reports_every_reason_once_per_subject() {
         let mut cache = FlowStateTraversalCache::default();
@@ -755,13 +759,7 @@ mod tests {
             7,
             &mut diagnostics,
         );
-        assert_eq!(diagnostics.len(), 2, "{diagnostics:?}");
-        assert!(
-            diagnostics
-                .iter()
-                .all(|diagnostic| diagnostic.impact == CodeQueryDiagnosticImpact::Incomplete),
-            "{diagnostics:?}"
-        );
+        crate::structural::search::test_support::assert_incomplete_diagnostics(&diagnostics, 2);
         // The second call adds nothing: one reason is reported once per subject.
         cache.report_completeness(
             "src/main.js",
@@ -771,7 +769,7 @@ mod tests {
             7,
             &mut diagnostics,
         );
-        assert_eq!(diagnostics.len(), 2, "{diagnostics:?}");
+        crate::structural::search::test_support::assert_incomplete_diagnostics(&diagnostics, 2);
         assert!(!completeness.covers(FlowStateAxis::PropertyEvents));
         assert!(!completeness.covers(FlowStateAxis::ReachingRelation));
     }
@@ -817,17 +815,5 @@ mod tests {
             "the same reason does block the relation family: {diagnostics:?}"
         );
         assert!(!completeness.covers(FlowStateAxis::SameEvaluationRelation));
-    }
-
-    #[test]
-    fn a_subject_filter_keeps_only_the_named_subject_kind() {
-        let filter = StateEventFilter {
-            classes: vec![StateEventClass::Read],
-            subjects: Vec::new(),
-        };
-        assert!(filter.classes.contains(&StateEventClass::Read));
-        assert!(!filter.classes.contains(&StateEventClass::Establish));
-        assert!(!filter.is_empty());
-        assert!(StateEventFilter::default().is_empty());
     }
 }

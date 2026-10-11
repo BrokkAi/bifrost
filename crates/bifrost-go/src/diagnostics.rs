@@ -13,8 +13,8 @@
 //! [`SemanticDiagnosticIncompleteReason`], never a guess and never an error.
 
 use brokk_bifrost_core::analyzer::model::{
-    SemanticAbsenceProof, SemanticDiagnostic, SemanticDiagnosticDomain,
-    SemanticDiagnosticIncompleteReason, SemanticDiagnosticReport,
+    SemanticAbsenceProof, SemanticDiagnosticDomain, SemanticDiagnosticIncompleteReason,
+    SemanticDiagnosticReport, push_absent_diagnostic,
 };
 use brokk_bifrost_core::analyzer::semantic_diagnostics::{
     ScopeStack, contains_node, node_range, node_text, same_node,
@@ -25,7 +25,10 @@ use brokk_bifrost_core::analyzer::{BoundedDefinitionLookup, ProjectFile, Range};
 use brokk_bifrost_core::text_utils::compute_line_starts;
 use tree_sitter::Node;
 
-use crate::graph::ast::{range_clause_binding_names, range_clause_is_short_declaration};
+use crate::declarations::{declared_go_package_name, is_predeclared_go_type};
+use crate::graph::ast::{
+    for_each_parameter_declaration, range_clause_binding_names, range_clause_is_short_declaration,
+};
 use crate::graph::resolver::GoImportBindings;
 use crate::packages::{GO_MODULE_SCOPE_SEGMENT, canonical_go_package_name};
 
@@ -107,7 +110,7 @@ pub fn collect_go_semantic_diagnostics(
     }
 
     let line_starts = compute_line_starts(source);
-    let package_name = declared_package_name(tree.root_node(), source)
+    let package_name = declared_go_package_name(tree.root_node(), source)
         .map(|declared| canonical_go_package_name(file, &declared))
         .unwrap_or_default();
     let mut collector = GoDiagnosticCollector {
@@ -181,22 +184,40 @@ impl GoDiagnosticCollector<'_> {
         stack: &mut Vec<ScanFrame<'tree>>,
     ) {
         match node.kind() {
-            "source_file" => push_named_children(stack, node),
+            "source_file" => {
+                brokk_bifrost_core::analyzer::tree_walk::push_named_children_reversed_as(
+                    node,
+                    stack,
+                    ScanFrame::Node,
+                )
+            }
             "block" | "block_statement" => {
                 scopes.enter();
                 stack.push(ScanFrame::ExitScope);
-                push_named_children(stack, node);
+                brokk_bifrost_core::analyzer::tree_walk::push_named_children_reversed_as(
+                    node,
+                    stack,
+                    ScanFrame::Node,
+                );
             }
             "function_declaration" | "method_declaration" => {
                 scopes.enter();
                 self.seed_function_scope(node, scopes);
                 stack.push(ScanFrame::ExitScope);
-                push_named_children(stack, node);
+                brokk_bifrost_core::analyzer::tree_walk::push_named_children_reversed_as(
+                    node,
+                    stack,
+                    ScanFrame::Node,
+                );
             }
             "for_statement" => {
                 scopes.enter();
                 stack.push(ScanFrame::ExitScope);
-                push_named_children(stack, node);
+                brokk_bifrost_core::analyzer::tree_walk::push_named_children_reversed_as(
+                    node,
+                    stack,
+                    ScanFrame::Node,
+                );
             }
             "type_spec" | "type_alias" => {
                 if node.child_by_field_name("type_parameters").is_some() {
@@ -204,20 +225,36 @@ impl GoDiagnosticCollector<'_> {
                     self.seed_type_parameters_from_owner(node, scopes);
                     stack.push(ScanFrame::ExitScope);
                 }
-                push_named_children(stack, node);
+                brokk_bifrost_core::analyzer::tree_walk::push_named_children_reversed_as(
+                    node,
+                    stack,
+                    ScanFrame::Node,
+                );
             }
             "import_declaration" | "package_clause" => {}
             "parameter_declaration" | "variadic_parameter_declaration" => {
                 self.seed_parameter_declaration(node, scopes);
-                push_named_children(stack, node);
+                brokk_bifrost_core::analyzer::tree_walk::push_named_children_reversed_as(
+                    node,
+                    stack,
+                    ScanFrame::Node,
+                );
             }
             "type_parameter_declaration" => {
                 self.seed_type_parameter_declaration(node, scopes);
-                push_named_children(stack, node);
+                brokk_bifrost_core::analyzer::tree_walk::push_named_children_reversed_as(
+                    node,
+                    stack,
+                    ScanFrame::Node,
+                );
             }
             "var_declaration" | "const_declaration" => {
                 self.seed_value_declaration(node, scopes);
-                push_named_children(stack, node);
+                brokk_bifrost_core::analyzer::tree_walk::push_named_children_reversed_as(
+                    node,
+                    stack,
+                    ScanFrame::Node,
+                );
             }
             "short_var_declaration" => {
                 stack.push(ScanFrame::SeedShortVar(node));
@@ -238,12 +275,20 @@ impl GoDiagnosticCollector<'_> {
             }
             "selector_expression" | "qualified_type" => {
                 self.check_selector(node, scopes);
-                push_named_children(stack, node);
+                brokk_bifrost_core::analyzer::tree_walk::push_named_children_reversed_as(
+                    node,
+                    stack,
+                    ScanFrame::Node,
+                );
             }
             "identifier" | "type_identifier" | "field_identifier" | "package_identifier" => {
                 self.check_identifier(node, scopes);
             }
-            _ => push_named_children(stack, node),
+            _ => brokk_bifrost_core::analyzer::tree_walk::push_named_children_reversed_as(
+                node,
+                stack,
+                ScanFrame::Node,
+            ),
         }
     }
 
@@ -269,15 +314,9 @@ impl GoDiagnosticCollector<'_> {
     }
 
     fn seed_parameter_list(&mut self, node: Node<'_>, scopes: &mut ScopeStack) {
-        let mut cursor = node.walk();
-        for child in node.named_children(&mut cursor) {
-            if matches!(
-                child.kind(),
-                "parameter_declaration" | "variadic_parameter_declaration"
-            ) {
-                self.seed_parameter_declaration(child, scopes);
-            }
-        }
+        for_each_parameter_declaration(node, |parameter| {
+            self.seed_parameter_declaration(parameter, scopes)
+        });
     }
 
     fn seed_parameter_declaration(&mut self, node: Node<'_>, scopes: &mut ScopeStack) {
@@ -328,13 +367,7 @@ impl GoDiagnosticCollector<'_> {
     }
 
     fn seed_type_parameter_declaration(&mut self, node: Node<'_>, scopes: &mut ScopeStack) {
-        let mut cursor = node.walk();
-        for child in node.children_by_field_name("name", &mut cursor) {
-            let name = node_text(child, self.source);
-            if name != "_" {
-                scopes.declare(name.to_string());
-            }
-        }
+        self.seed_spec_names(node, scopes);
     }
 
     fn seed_short_var_declaration(&mut self, node: Node<'_>, scopes: &mut ScopeStack) {
@@ -500,8 +533,12 @@ impl GoDiagnosticCollector<'_> {
     }
 
     fn push_resolved(&mut self, node: Node<'_>, boundary: BoundaryStatus) {
-        let range = node_range(node, self.line_starts);
-        self.report.push_resolved(range, boundary);
+        brokk_bifrost_core::analyzer::semantic_diagnostics::push_resolved_node(
+            &mut self.report,
+            node,
+            self.line_starts,
+            boundary,
+        );
     }
 
     fn push_ambiguous(&mut self, node: Node<'_>, count: usize) {
@@ -527,20 +564,18 @@ impl GoDiagnosticCollector<'_> {
         kind: &'static str,
         message: String,
     ) {
-        self.report.push_absent(
+        push_absent_diagnostic(
+            &mut self.report,
+            &mut self.diagnostic_count,
             SemanticAbsenceProof {
                 range,
                 domain,
                 boundary,
             },
-            SemanticDiagnostic {
-                range,
-                source: GO_SEMANTIC_DIAGNOSTIC_SOURCE,
-                kind,
-                message,
-            },
+            GO_SEMANTIC_DIAGNOSTIC_SOURCE,
+            kind,
+            message,
         );
-        self.diagnostic_count += 1;
     }
 
     fn is_standalone_reference(&self, node: Node<'_>) -> bool {
@@ -604,22 +639,6 @@ fn partial_surface_reason(import_path: &str) -> SemanticDiagnosticIncompleteReas
     }
 }
 
-fn declared_package_name(root: Node<'_>, source: &str) -> Option<String> {
-    let mut cursor = root.walk();
-    for child in root.named_children(&mut cursor) {
-        if child.kind() != "package_clause" {
-            continue;
-        }
-        let mut package_cursor = child.walk();
-        for package_child in child.named_children(&mut package_cursor) {
-            if matches!(package_child.kind(), "package_identifier" | "identifier") {
-                return Some(node_text(package_child, source).trim().to_string());
-            }
-        }
-    }
-    None
-}
-
 fn selector_parts<'tree>(
     node: Node<'tree>,
     source: &str,
@@ -680,14 +699,6 @@ fn identifier_texts(node: Node<'_>, source: &str) -> Vec<String> {
         }
     }
     out
-}
-
-fn push_named_children<'tree>(stack: &mut Vec<ScanFrame<'tree>>, node: Node<'tree>) {
-    let mut cursor = node.walk();
-    let children: Vec<_> = node.named_children(&mut cursor).collect();
-    for child in children.into_iter().rev() {
-        stack.push(ScanFrame::Node(child));
-    }
 }
 
 fn push_field_if_present<'tree>(
@@ -785,51 +796,30 @@ fn is_keyed_element_key(node: Node<'_>) -> bool {
 /// Source declarations may shadow these names, so resolvers must consult this
 /// predicate only after ordinary lexical, package, and import lookup.
 pub fn is_predeclared_go_name(name: &str) -> bool {
-    matches!(
-        name,
-        "any"
-            | "bool"
-            | "byte"
-            | "comparable"
-            | "complex64"
-            | "complex128"
-            | "error"
-            | "float32"
-            | "float64"
-            | "int"
-            | "int8"
-            | "int16"
-            | "int32"
-            | "int64"
-            | "rune"
-            | "string"
-            | "uint"
-            | "uint8"
-            | "uint16"
-            | "uint32"
-            | "uint64"
-            | "uintptr"
-            | "true"
-            | "false"
-            | "iota"
-            | "nil"
-            | "append"
-            | "cap"
-            | "clear"
-            | "close"
-            | "complex"
-            | "copy"
-            | "delete"
-            | "imag"
-            | "len"
-            | "make"
-            | "max"
-            | "min"
-            | "new"
-            | "panic"
-            | "print"
-            | "println"
-            | "real"
-            | "recover"
-    )
+    is_predeclared_go_type(name)
+        || matches!(
+            name,
+            "true"
+                | "false"
+                | "iota"
+                | "nil"
+                | "append"
+                | "cap"
+                | "clear"
+                | "close"
+                | "complex"
+                | "copy"
+                | "delete"
+                | "imag"
+                | "len"
+                | "make"
+                | "max"
+                | "min"
+                | "new"
+                | "panic"
+                | "print"
+                | "println"
+                | "real"
+                | "recover"
+        )
 }

@@ -31,10 +31,22 @@ and complete the provider sign-in before validating Bifrost. Provider
 authentication belongs to Pi and is separate from the Bifrost setup.
 
 Reload Pi after installation. Run `/bifrost` in the interactive TUI to choose
-the Bifrost capabilities for the current workspace. The default selection
-enables symbol navigation, structural queries, and file discovery and ranking.
-Additional selections expose code-quality reports, Git history, raw text
-search, or JSON and XML transforms.
+the Bifrost capabilities for the current workspace. Pi saves the choice for
+each workspace under its agent directory, in `bifrost/workspaces/`.
+
+| Capability | Default | Bifrost tools | Toolsets started |
+| --- | --- | --- | --- |
+| Symbols | On | `search_symbols`, `get_symbol_sources`, `get_summaries`, `rename_symbol`, `usage_graph`, `analyze_diff`, and either the location tools (`scan_usages_by_location`, `get_definitions_by_location`, `get_type_by_location`) or the reference tools (`scan_usages_by_reference`, `get_definitions_by_reference`) | `symbol`, `diff`, `slopcop` |
+| Structural queries | On | `query_code`, `get_symbol_locations`, `get_symbol_ancestors` | `extended` |
+| File discovery | On | `most_relevant_files` | `extended` |
+| Policies | On | `list_policies`, `run_policy` | `extended` |
+| Code quality | Off | The eleven `slopcop` report tools | `slopcop` |
+| Text search | Off | `get_file_contents`, `search_file_contents`, `find_files_containing` | `text` |
+
+The extension starts one Bifrost MCP server with the union of the toolsets,
+in the order `symbol|extended|diff|slopcop|text`. With the default selection,
+that is `symbol|extended|diff|slopcop`. It exposes to Pi only the tools of the
+selected capabilities.
 
 To update an existing checkout to the package version on the current branch,
 pull the checkout, rerun `npm install` and `pi install "$(pwd)" --approve` from
@@ -44,6 +56,11 @@ The package uses the same pinned, checksum-verified Bifrost release launcher as
 the other agent plugins. It can download that binary into a user cache on first
 use. See [Data and Trust Boundaries](/data-boundaries/#plugin-launcher-downloads-and-cache)
 for the resolution order, cache locations, and controls for automatic downloads.
+
+The package also gives Pi four skills: `bifrost-code-navigation`,
+`bifrost-code-reading`, `bifrost-codebase-search`, and
+`bifrost-policy-checking`. See
+[Packaged agent plugin](/mcp/#packaged-agent-plugin) for what each one covers.
 
 ## Tool Names And Workspace Scope
 

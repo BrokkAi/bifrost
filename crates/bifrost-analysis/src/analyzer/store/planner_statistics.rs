@@ -207,8 +207,9 @@ pub mod pinned_plans {
         RenderedTailMatch, Result, StoreError, WorkspaceSnapshots,
         batch_anchor_only_definition_candidate_sql, batch_component_definition_candidate_sql,
         candidate_fq_segments_sql, chunk_params, chunk_placeholders,
-        direct_children_limited_candidate_sql, enclosing_declarations_for_file_sql,
-        identifier_prefix_candidate_sql, limited_identifier_candidate_for_blob_sql,
+        cpp_search_owner_name_rows_sql, direct_children_limited_candidate_sql,
+        enclosing_declarations_for_file_sql, identifier_prefix_candidate_sql,
+        limited_identifier_candidate_for_blob_sql, limited_identifier_candidate_sql,
         mounted_declaration_sql, mounted_declaration_sql_with_primary_ranges, parsed_blob_keys_sql,
         persisted_blob_mutation_cost_fallback_sql, point_anchor_only_definition_candidate_sql,
         point_component_definition_candidate_sql, ranges_bulk_sql, raw_unit_fq_segments_sql,
@@ -333,7 +334,22 @@ pub mod pinned_plans {
             pin(
                 "selected_boundary_candidate_gap_branches",
                 super::super::resolution_lexical::CANDIDATE_GAP_BOUNDARY_BRANCHES_SQL,
+                vec![integer(5), text("[0,7]")],
+            ),
+            pin(
+                "selected_boundary_candidate_gap_branches_all",
+                super::super::resolution_lexical::CANDIDATE_GAP_BOUNDARY_BRANCHES_ALL_SQL,
                 vec![integer(5)],
+            ),
+            pin(
+                "selected_boundary_candidate_gap_branches_in_mounts",
+                super::super::resolution_lexical::CANDIDATE_GAP_BOUNDARY_BRANCHES_IN_MOUNTS_SQL,
+                vec![integer(5), text("[0,7]"), text("[1,3]")],
+            ),
+            pin(
+                "selected_boundary_candidate_gap_branches_all_in_mounts",
+                super::super::resolution_lexical::CANDIDATE_GAP_BOUNDARY_BRANCHES_ALL_IN_MOUNTS_SQL,
+                vec![integer(5), text("[1,3]")],
             ),
             pin(
                 "selected_endpoint_candidate_gap_branches",
@@ -376,8 +392,12 @@ pub mod pinned_plans {
     /// does not even prepare, so the dump would report a preparation error
     /// instead of a plan.
     pub fn prepare_pin_context(conn: &Connection) {
+        super::super::ensure_declaration_candidate_requests_table(conn)
+            .expect("identifier candidate request table");
         crate::analyzer::store::resolution_lexical::register_resolution_identity_functions(conn)
             .expect("resolution identity SQL functions");
+        crate::analyzer::store::go_unit_summaries::register_go_summary_sql_functions(conn)
+            .expect("Go summary SQL functions");
         crate::analyzer::store::rust_crates::prepare_pin_context(conn).expect("crate SQL context");
         // The authority reader is normally planned against the selected
         // operation's connection, where this temp table is already installed.
@@ -424,6 +444,8 @@ pub mod pinned_plans {
         .expect("selected Go transient placement pin view");
         conn.execute_batch(crate::analyzer::store::resolution_operation::rust_crate_context::SELECTED_MODULE_PLACEMENTS_SCHEMA_SQL)
             .expect("selected Rust module placement pin view");
+        conn.execute_batch(crate::analyzer::store::resolution_operation::rust_reverse_rows::GAP_CANDIDATE_SITES_SCHEMA_SQL)
+            .expect("selected Rust reverse gap site pin table");
         conn.execute_batch(crate::analyzer::store::resolution_stage::schema_sql())
             .expect("selected resolution stage pin tables");
         sync_active_blob_oids(conn, &[]).expect("active blob temp table");
@@ -443,6 +465,10 @@ pub mod pinned_plans {
     /// and the plan pin below walks the same list, so a statement cannot be added
     /// to the reader and left unplanned.
     pub(super) const TYPED_FACT_PINS: &[(&str, &str)] = &[
+        (
+            "resolution_rust_reason_owners",
+            crate::analyzer::store::resolution_operation::rust_crate_access::REASON_OWNERS_SQL,
+        ),
         (
             "resolution_type_frontiers_by_slot",
             crate::analyzer::store::resolution_prepare::typed_rows::TYPE_FRONTIERS_BY_SLOT_SQL,
@@ -616,14 +642,183 @@ pub mod pinned_plans {
             ],
         )];
         queries.push(pin(
+            "php_dynamic_import_sources",
+            crate::analyzer::store::import_graph::DYNAMIC_IMPORT_SOURCES_SQL,
+            vec![text("[[\"php\",\"src/Dynamic.php\"]]")],
+        ));
+        queries.push(pin(
+            "semantic_ir_publication",
+            super::super::semantic_ir::SEMANTIC_IR_PUBLICATION_SQL,
+            vec![
+                text("5555555555555555555555555555555555555555"),
+                text("rust"),
+            ],
+        ));
+        queries.push(pin(
+            "selected_macro_occurrence_lines",
+            super::super::resolution_operation::SELECTED_MACRO_OCCURRENCE_LINES_SQL,
+            vec![integer(1)],
+        ));
+        queries.push(pin(
             "go_definition_package_anchor",
             super::super::resolution_operation::native_units::GO_DEFINITION_PACKAGE_ANCHOR,
             vec![integer(1)],
         ));
         queries.push(pin(
+            "go_reverse_inventory_complete",
+            super::super::resolution_operation::go_reverse_rows::GO_REVERSE_INVENTORY_COMPLETE_SQL,
+            vec![
+                integer(1),
+                integer(1),
+                integer(1),
+                integer(0),
+                text("[[1,\"type\"]]"),
+                text("workspace"),
+                integer(1),
+                integer(1),
+                text("go-epoch"),
+                digest(1),
+                integer(3),
+            ],
+        ));
+        queries.push(pin(
+            "reference_local_path_evidence",
+            super::super::resolution_lexical::REFERENCE_LOCAL_PATH_EVIDENCE_SQL,
+            vec![integer(1), integer(1)],
+        ));
+        queries.push(pin(
+            "go_reverse_summary_export_rows",
+            super::super::resolution_operation::go_reverse_rows::GO_REVERSE_SUMMARY_EXPORT_ROWS_SQL,
+            vec![
+                integer(1),
+                text("[[1,\"type\"]]"),
+                integer(1),
+                integer(1),
+                text("workspace"),
+                integer(1),
+                integer(1),
+                text("go-epoch"),
+                integer(3),
+                digest(1),
+                text("[[1,1]]"),
+                integer(1),
+            ],
+        ));
+        queries.push(pin(
+            "go_point_binding_receiver_anchor",
+            super::super::resolution_operation::go_receiver_anchor::GO_POINT_BINDING_RECEIVER_ANCHOR,
+            vec![integer(1), integer(12), integer(16)],
+        ));
+        queries.push(pin(
+            "go_reverse_transient_target_exports",
+            super::super::resolution_operation::go_reverse_rows::GO_REVERSE_TRANSIENT_TARGET_EXPORTS_SQL,
+            vec![
+                integer(1),
+                text("[[1,1]]"),
+                text("[[1,\"type\"]]"),
+            ],
+        ));
+        queries.push(pin(
+            "go_reverse_transient_alias_exports",
+            super::super::resolution_operation::go_reverse_rows::GO_REVERSE_TRANSIENT_ALIAS_EXPORTS_SQL,
+            vec![
+                integer(1),
+                text("[[1,\"type\"]]"),
+                integer(1),
+                text("go"),
+                integer(1),
+                text("workspace"),
+                integer(1),
+                integer(1),
+                text("go-epoch"),
+                integer(3),
+                digest(1),
+                text("[[1,1]]"),
+            ],
+        ));
+        queries.push(pin(
+            "go_reverse_qualified_import",
+            super::super::resolution_operation::go_reverse_rows::GO_REVERSE_QUALIFIED_IMPORT_SQL,
+            vec![
+                integer(1),
+                integer(1),
+                integer(1),
+                text("[[1,\"pkg\"]]"),
+                integer(1),
+                text("go"),
+                integer(1),
+            ],
+        ));
+        queries.push(pin(
+            "go_reverse_dot_export_rows",
+            super::super::resolution_operation::go_reverse_rows::GO_REVERSE_DOT_EXPORT_ROWS_SQL,
+            vec![
+                integer(1),
+                integer(1),
+                text("[[1,\"type\"]]"),
+                text("workspace"),
+                integer(1),
+                integer(1),
+                text("go-epoch"),
+                integer(3),
+                digest(1),
+                text("[[1,1]]"),
+                integer(1),
+                integer(1),
+                text("go"),
+                integer(1),
+            ],
+        ));
+        queries.push(pin(
+            "go_rename_target_units",
+            super::super::resolution_operation::go_reverse_rows::GO_RENAME_TARGET_UNITS_SQL,
+            vec![integer(1), text("src/main.go")],
+        ));
+        queries.push(pin(
+            "go_rename_local_name_conflict",
+            super::super::resolution_operation::go_reverse_rows::GO_RENAME_LOCAL_NAME_CONFLICT_SQL,
+            vec![text("[[1,1,10]]"), text("[1]")],
+        ));
+        queries.push(pin(
+            "go_rename_edit_site_scope_keys",
+            super::super::resolution_operation::go_reverse_rows::GO_RENAME_EDIT_SITE_SCOPE_KEYS_SQL,
+            vec![text("[[1,1]]")],
+        ));
+        queries.push(pin(
+            "go_rename_import_name_conflict",
+            super::super::resolution_operation::go_reverse_rows::GO_RENAME_IMPORT_NAME_CONFLICT_SQL,
+            vec![text("[[1,1]]"), text("[1]")],
+        ));
+        queries.push(pin(
+            "go_rename_package_name_conflict",
+            super::super::resolution_operation::go_reverse_rows::GO_RENAME_PACKAGE_NAME_CONFLICT_SQL,
+            vec![text("[1]"), text("[1]")],
+        ));
+        queries.push(pin(
+            "go_rename_rebound_root_references",
+            super::super::resolution_operation::go_reverse_rows::GO_RENAME_REBOUND_ROOT_REFERENCES_SQL,
+            vec![
+                text("[1]"),
+                text("[1]"),
+                text("[[1,1]]"),
+                text("[[1,1]]"),
+                text("len"),
+            ],
+        ));
+        queries.push(pin(
             "jvm_native_import_target_mounts",
             super::super::resolution_operation::jvm_context::JAVA_IMPORT_TARGET_MOUNTS,
             vec![text("dep")],
+        ));
+        queries.push(pin(
+            "jvm_native_alias_member_by_blob",
+            super::super::resolution_operation::jvm_context::SELECTED_JVM_ALIAS_BY_BLOB_AND_MEMBER,
+            vec![integer(1), text("member")],
+        ));
+        queries.push(pin(
+            "jvm_native_import_selector",
+            super::super::resolution_operation::jvm_context::SELECTED_IMPORT_SELECTOR,
+            vec![integer(1), integer(1)],
         ));
         queries.push(pin(
             "jvm_native_source_access",
@@ -649,6 +844,11 @@ pub mod pinned_plans {
                 vec![integer(1), integer(1)],
             ),
             (
+                "native_package_members_by_mount",
+                package_context::ORDINARY_MEMBERS_BY_MOUNT,
+                vec![integer(1)],
+            ),
+            (
                 "native_stage_package_references",
                 package_context::STAGED_PACKAGE_REFERENCES,
                 vec![integer(0)],
@@ -657,6 +857,11 @@ pub mod pinned_plans {
                 "native_stage_package_members",
                 package_context::STAGED_MEMBERS,
                 vec![integer(1), integer(1)],
+            ),
+            (
+                "native_stage_package_members_by_mount",
+                package_context::STAGED_MEMBERS_BY_MOUNT,
+                vec![integer(1)],
             ),
         ] {
             queries.push(pin(name, sql, params));
@@ -687,7 +892,21 @@ pub mod pinned_plans {
             ));
             queries.push(pin(format!("stage_lexical_prefix_spellings_{arity}"),
                 crate::analyzer::store::resolution_stage::lexical_readers::REFERENCE_LOOKUP_SPELLINGS_SQL,
-                vec![text(&serde_json::to_string(&requests).expect("prefix pin parameters")), Value::Integer(crate::analyzer::store::resolution_prepare::resolution_rows::namespace_code(brokk_bifrost_core::analyzer::resolution_facts::ResolutionNamespace::Type))],
+                vec![
+                    text(&serde_json::to_string(&requests).expect("prefix pin parameters")),
+                    text(&serde_json::to_string(&crate::analyzer::store::resolution_prepare::reference_lookup_namespace_codes(
+                        brokk_bifrost_core::analyzer::resolution_facts::ResolutionNamespace::Type,
+                    )).expect("prefix namespace pin parameters")),
+                ],
+            ));
+            queries.push(pin(format!("stage_go_reference_spellings_{arity}"),
+                crate::analyzer::store::resolution_stage::lexical_readers::REFERENCE_LOOKUP_SPELLINGS_SQL,
+                vec![
+                    text(&serde_json::to_string(&requests).expect("Go spelling pin parameters")),
+                    text(&serde_json::to_string(&crate::analyzer::store::resolution_prepare::go_reference_lookup_namespace_codes(
+                        brokk_bifrost_core::analyzer::resolution_facts::ResolutionNamespace::TypeOrValue,
+                    )).expect("Go namespace pin parameters")),
+                ],
             ));
         }
         queries.push(pin(
@@ -781,6 +1000,14 @@ pub mod pinned_plans {
             "frontier_source_ready",
             crate::analyzer::store::resolution_typed::FRONTIER_SOURCE_READY_SQL,
             vec![integer(1)],
+        ));
+        queries.push(pin(
+            "structural_recovered_regions",
+            crate::analyzer::store::STRUCTURAL_RECOVERED_REGIONS_SQL,
+            vec![
+                integer(1),
+                text(&crate::analyzer::store::callable_kind_codes_json()),
+            ],
         ));
         queries.push(pin("stage_lexical_ordinary_completion_suppression",
             crate::analyzer::store::resolution_stage::lexical_readers::ORDINARY_COMPLETION_SUPPRESSION_SQL,
@@ -969,7 +1196,7 @@ pub mod pinned_plans {
             ),
             pin(
                 "rust_reverse_target_activation",
-                reverse::TARGET_ACTIVATION_SQL,
+                reverse::BASE_TARGET_ACTIVATION_SQL,
                 vec![integer(0), integer(0)],
             ),
             pin(
@@ -1007,9 +1234,83 @@ pub mod pinned_plans {
                 reverse::TEXTUAL_MACRO_SOURCES_SQL,
                 vec![integer(1)],
             ),
+            pin(
+                "rust_reverse_gap_candidate_sites",
+                reverse::GAP_CANDIDATE_SITES_SQL,
+                vec![
+                    integer(1),
+                    text("[[\"target\",\"callable\"]]"),
+                    integer(1),
+                    text("[1]"),
+                    integer(super::super::resolution_prepare::resolution_rows::site_kind_code(
+                        brokk_bifrost_core::analyzer::resolution_facts::ResolutionSiteKind::MemberReference,
+                    )),
+                    integer(1),
+                    integer(super::super::resolution_prepare::resolution_rows::site_kind_code(
+                        brokk_bifrost_core::analyzer::resolution_facts::ResolutionSiteKind::CallableReference,
+                    )),
+                    integer(super::super::resolution_prepare::resolution_rows::gap_origin_code(
+                        crate::analyzer::resolution::LoweringGapOrigin::Extracted(
+                            brokk_bifrost_core::analyzer::resolution_facts::ResolutionGapKind::MacroArgument,
+                        ),
+                    )),
+                    integer(super::super::resolution_prepare::resolution_rows::gap_origin_code(
+                        crate::analyzer::resolution::LoweringGapOrigin::Extracted(
+                            brokk_bifrost_core::analyzer::resolution_facts::ResolutionGapKind::UnexpandedItemMacro,
+                        ),
+                    )),
+                    integer(super::super::resolution_prepare::resolution_rows::gap_origin_code(
+                        crate::analyzer::resolution::LoweringGapOrigin::Extracted(
+                            brokk_bifrost_core::analyzer::resolution_facts::ResolutionGapKind::UnexpandedImplMacro,
+                        ),
+                    )),
+                    integer(super::super::resolution_prepare::resolution_rows::gap_origin_code(
+                        crate::analyzer::resolution::LoweringGapOrigin::Extracted(
+                            brokk_bifrost_core::analyzer::resolution_facts::ResolutionGapKind::UnsupportedScopeOrBinder,
+                        ),
+                    )),
+                    integer(super::super::resolution_prepare::resolution_rows::gap_origin_code(
+                        crate::analyzer::resolution::LoweringGapOrigin::Extracted(
+                            brokk_bifrost_core::analyzer::resolution_facts::ResolutionGapKind::UnsupportedExpression,
+                        ),
+                    )),
+                    integer(1),
+                ],
+            ),
+            pin(
+                "rust_reverse_target_scoped_inventory_gaps",
+                reverse::target_scoped_reference_inventory_gaps_sql(),
+                vec![
+                    integer(1),
+                    text("[[\"target\",\"callable\"]]"),
+                    integer(super::super::resolution_prepare::resolution_rows::gap_origin_code(
+                        crate::analyzer::resolution::LoweringGapOrigin::QualifiedReference,
+                    )),
+                    integer(1 << 31),
+                    integer(super::super::resolution_prepare::resolution_rows::site_kind_code(
+                        brokk_bifrost_core::analyzer::resolution_facts::ResolutionSiteKind::MemberReference,
+                    )),
+                    text("[]"),
+                    integer(1),
+                    integer(super::super::resolution_prepare::resolution_rows::site_kind_code(
+                        brokk_bifrost_core::analyzer::resolution_facts::ResolutionSiteKind::CallableReference,
+                    )),
+                    text("[]"),
+                    integer(super::super::resolution_prepare::resolution_rows::gap_origin_code(
+                        crate::analyzer::resolution::LoweringGapOrigin::Extracted(
+                            brokk_bifrost_core::analyzer::resolution_facts::ResolutionGapKind::GeneratedItemSurface,
+                        ),
+                    )),
+                    integer(super::super::resolution_prepare::resolution_rows::gap_origin_code(
+                        crate::analyzer::resolution::LoweringGapOrigin::Extracted(
+                            brokk_bifrost_core::analyzer::resolution_facts::ResolutionGapKind::UnsupportedCallApplicability,
+                        ),
+                    )),
+                ],
+            ),
         ]);
         queries.extend([
-            pin("rust_reverse_exports", include_str!("rust_reverse_exports.sql"), vec![integer(1), integer(0)]),
+            pin("rust_reverse_exports", include_str!("rust_reverse_exports.sql"), vec![integer(1), integer(0), text("src/lib.rs")]),
             pin("rust_crate_imports_binder", "SELECT * FROM rust_crate_imports WHERE topology_id = ?1 AND module_path = ?2 AND blob_id = ?3 AND binder_scope = ?4 AND bound_name = ?5", vec![integer(1), text("crate"), integer(1), integer(0), text("X")]),
             pin("rust_crate_imports_target", "SELECT * FROM rust_crate_imports WHERE target_crate_key = ?1 AND target_module_path = ?2 AND target_name = ?3", vec![digest(0), text("crate"), text("X")]),
             pin("rust_crate_exports_declaration", "SELECT * FROM rust_crate_exports WHERE declaration_blob_id = ?1 AND declaration_site = ?2", vec![integer(1), integer(0)]),
@@ -1067,6 +1368,7 @@ pub mod pinned_plans {
                     text("[[0,0]]"),
                     text("[]"),
                     text("[[0,\"[[0,null,0]]\",0,1,[1]]]"),
+                    text("[]"),
                 ],
             ),
             pin(
@@ -1179,6 +1481,22 @@ pub mod pinned_plans {
                 .collect();
             queries.push(pin(label, sql, params));
         }
+        let langs = vec!["cpp".to_string(), "cpp:c".to_string()];
+        for (label, required) in [
+            ("cpp_search_owner_name_rows_unfiltered", None),
+            (
+                "cpp_search_owner_name_rows_prefiltered",
+                Some(vec![vec!["owner".to_string(), "run".to_string()]]),
+            ),
+        ] {
+            let (sql, literals) = cpp_search_owner_name_rows_sql(&langs, required.as_deref(), 0);
+            let params = langs
+                .iter()
+                .chain(literals.iter())
+                .map(|value| text(value))
+                .collect();
+            queries.push(pin(label, sql, params));
+        }
         queries.push(pin(
             "search_candidate_key_set",
             search_candidate_key_set_sql(1),
@@ -1238,17 +1556,12 @@ pub mod pinned_plans {
                 super::super::resolution_operation::go_named::STAGED_IMPORT_BINDINGS,
             ),
         ] {
-            queries.push(pin(label, sql, vec![integer(1)]));
+            queries.push(pin(label, sql, vec![text("[1]")]));
         }
         queries.push(pin(
-            "go_named_import_package_name",
-            super::super::resolution_operation::go_named::IMPORT_PACKAGE_NAME,
-            vec![
-                integer(1),
-                integer(1),
-                text("go"),
-                text("example.test/provider"),
-            ],
+            "go_file_import_rows",
+            super::super::resolution_operation::go_named::GO_FILE_IMPORT_ROWS,
+            vec![integer(1), text(r#"[[1,1,"go"]]"#)],
         ));
         queries.push(pin(
             "go_named_import_target_mounts",
@@ -1341,6 +1654,11 @@ pub mod pinned_plans {
             ],
         ));
 
+        queries.push(pin(
+            "selected_dependency_file_evidence",
+            super::super::dependency_file_evidence::READ_ROWS_SQL,
+            vec![integer(1)],
+        ));
         queries.push(pin(
             "selected_configuration_bytes",
             super::super::workspace_inputs::SELECTED_CONFIGURATION_BYTES_SQL,
@@ -1572,6 +1890,11 @@ pub mod pinned_plans {
             vec![text("rust"), text("Widget"), text(OID), integer(16)],
         ));
         queries.push(pin(
+            "limited_identifier_candidate",
+            limited_identifier_candidate_sql(),
+            vec![],
+        ));
+        queries.push(pin(
             "point_component_definition_candidate_exact",
             point_component_definition_candidate_sql(true, RenderedTailMatch::Exact, MEMBERSHIP),
             vec![text("java"), integer(0), text("pkg"), text("Widget")],
@@ -1719,6 +2042,291 @@ pub mod pinned_plans {
             super::super::selected_definition::SELECTED_LEXICAL_DEFINITIONS_SQL,
             vec![],
         ));
+
+        let pair_count = crate::analyzer::store::import_graph::IMPORT_GRAPH_PATH_BATCH;
+        let mut pair_params = Vec::with_capacity(pair_count * 2 + 1);
+        pair_params.push(text("publication-workspace"));
+        for index in 0..pair_count {
+            pair_params.push(text(&format!("src/module_{index}.rs")));
+            pair_params.push(text("src/lib.rs"));
+        }
+        queries.push(pin(
+            "import_graph_publish_select_existing_edge_pairs_256",
+            crate::analyzer::store::import_graph::existing_edge_pairs_sql(pair_count),
+            pair_params.clone(),
+        ));
+        queries.push(pin(
+            "import_graph_publish_select_edge_pairs_with_facts_256",
+            crate::analyzer::store::import_graph::edge_pairs_with_facts_sql(pair_count),
+            pair_params[1..]
+                .iter()
+                .cloned()
+                .chain(std::iter::once(text("publication-workspace")))
+                .collect(),
+        ));
+        queries.push(pin(
+            "import_graph_publish_delete_exact_edge_pairs_256",
+            crate::analyzer::store::import_graph::delete_edge_pairs_sql(pair_count),
+            pair_params.clone(),
+        ));
+        let mut insert_pair_params = Vec::with_capacity(pair_count * 3);
+        for index in 0..pair_count {
+            insert_pair_params.push(text("publication-workspace"));
+            insert_pair_params.push(text(&format!("src/module_{index}.rs")));
+            insert_pair_params.push(text("src/lib.rs"));
+        }
+        queries.push(pin(
+            "import_graph_publish_insert_new_edge_pairs_256",
+            crate::analyzer::store::import_graph::insert_edge_pairs_sql(pair_count),
+            insert_pair_params,
+        ));
+        let ordinal_count = crate::analyzer::store::import_graph::IMPORT_GRAPH_ORDINAL_BATCH;
+        let mut ordinal_params = Vec::with_capacity(ordinal_count * 2 + 1);
+        ordinal_params.push(text("publication-workspace"));
+        for index in 0..ordinal_count {
+            ordinal_params.push(text(&format!("src/module_{index}.rs")));
+            ordinal_params.push(integer(0));
+        }
+        queries.push(pin(
+            "import_graph_publish_select_edge_facts_by_ordinals_256",
+            crate::analyzer::store::import_graph::edge_fact_rows_by_ordinals_sql(ordinal_count),
+            ordinal_params.clone(),
+        ));
+        let edge_fact_key_count = crate::analyzer::store::import_graph::IMPORT_GRAPH_ROW_BATCH;
+        let mut edge_fact_key_params = Vec::with_capacity(1 + edge_fact_key_count * 3);
+        edge_fact_key_params.push(text("publication-workspace"));
+        for index in 0..edge_fact_key_count {
+            edge_fact_key_params.push(text(&format!("src/module_{index}.rs")));
+            edge_fact_key_params.push(integer(0));
+            edge_fact_key_params.push(text("src/lib.rs"));
+        }
+        queries.push(pin(
+            "import_graph_publish_delete_stale_edge_facts_64",
+            crate::analyzer::store::import_graph::delete_edge_fact_keys_sql(edge_fact_key_count),
+            edge_fact_key_params.clone(),
+        ));
+        let mut edge_fact_upsert_params = Vec::with_capacity(edge_fact_key_count * 5);
+        for index in 0..edge_fact_key_count {
+            edge_fact_upsert_params.push(text("publication-workspace"));
+            edge_fact_upsert_params.push(text(&format!("src/module_{index}.rs")));
+            edge_fact_upsert_params.push(integer(0));
+            edge_fact_upsert_params.push(text("src/lib.rs"));
+            edge_fact_upsert_params.push(text("[]"));
+        }
+        queries.push(pin(
+            "import_graph_publish_upsert_edge_facts_64",
+            crate::analyzer::store::import_graph::upsert_edge_facts_sql(edge_fact_key_count),
+            edge_fact_upsert_params,
+        ));
+        for (name, table) in [
+            (
+                "import_graph_publish_select_candidate_dependencies_by_ordinals_256",
+                "workspace_import_candidate_file_dependencies",
+            ),
+            (
+                "import_graph_publish_select_route_dependencies_by_ordinals_256",
+                "workspace_import_route_dependencies",
+            ),
+            (
+                "import_graph_publish_select_missing_dependencies_by_ordinals_256",
+                "workspace_import_missing_module_dependencies",
+            ),
+        ] {
+            queries.push(pin(
+                name,
+                crate::analyzer::store::import_graph::import_graph_dependency_rows_by_ordinals_sql(
+                    table,
+                    ordinal_count,
+                ),
+                ordinal_params.clone(),
+            ));
+        }
+        let dependency_row_count = crate::analyzer::store::import_graph::IMPORT_GRAPH_ROW_BATCH;
+        for (name, table) in [
+            (
+                "import_graph_publish_delete_candidate_dependency_rows_64",
+                "workspace_import_candidate_file_dependencies",
+            ),
+            (
+                "import_graph_publish_delete_route_dependency_rows_64",
+                "workspace_import_route_dependencies",
+            ),
+            (
+                "import_graph_publish_delete_missing_dependency_rows_64",
+                "workspace_import_missing_module_dependencies",
+            ),
+        ] {
+            let mut params = Vec::with_capacity(
+                1 + dependency_row_count
+                    * if table == "workspace_import_missing_module_dependencies" {
+                        3
+                    } else {
+                        4
+                    },
+            );
+            params.push(text("publication-workspace"));
+            for index in 0..dependency_row_count {
+                params.push(text(&format!("src/module_{index}.rs")));
+                params.push(integer(0));
+                if table == "workspace_import_missing_module_dependencies" {
+                    params.push(text(&format!("demo::missing_{index}")));
+                } else {
+                    params.push(text(&format!("src/module_{index}.rs")));
+                    params.push(text("Widget"));
+                }
+            }
+            queries.push(pin(
+                name,
+                crate::analyzer::store::import_graph::delete_import_graph_dependency_rows_sql(
+                    table,
+                    dependency_row_count,
+                ),
+                params,
+            ));
+        }
+        let importer_count = crate::analyzer::store::import_graph::IMPORT_GRAPH_PATH_BATCH;
+        let mut importer_params = Vec::with_capacity(importer_count + 1);
+        importer_params.push(text("publication-workspace"));
+        importer_params
+            .extend((0..importer_count).map(|index| text(&format!("src/module_{index}.rs"))));
+        queries.push(pin(
+            "import_graph_publish_select_edge_fact_keys_by_importers_256",
+            crate::analyzer::store::import_graph::edge_fact_rows_by_importers_sql(importer_count),
+            importer_params.clone(),
+        ));
+        for (name, table) in [
+            (
+                "import_graph_publish_delete_candidate_dependencies_by_importers_256",
+                "workspace_import_candidate_file_dependencies",
+            ),
+            (
+                "import_graph_publish_delete_route_dependencies_by_importers_256",
+                "workspace_import_route_dependencies",
+            ),
+            (
+                "import_graph_publish_delete_missing_dependencies_by_importers_256",
+                "workspace_import_missing_module_dependencies",
+            ),
+        ] {
+            queries.push(pin(
+                name,
+                crate::analyzer::store::import_graph::delete_importers_sql(table, importer_count),
+                importer_params.clone(),
+            ));
+        }
+        let mut removed_sources_params = Vec::with_capacity(importer_count + 1);
+        removed_sources_params.push(text("publication-workspace"));
+        removed_sources_params
+            .extend((0..importer_count).map(|index| text(&format!("src/module_{index}.rs"))));
+        for (name, path_column) in [
+            (
+                "import_graph_publish_select_edge_facts_by_importer_paths_256",
+                "importer_path",
+            ),
+            (
+                "import_graph_publish_select_edge_facts_by_target_paths_256",
+                "target_path",
+            ),
+        ] {
+            queries.push(pin(
+                name,
+                crate::analyzer::store::import_graph::edge_fact_pairs_by_paths_sql(
+                    path_column,
+                    importer_count,
+                ),
+                removed_sources_params.clone(),
+            ));
+        }
+        queries.push(pin(
+            "import_graph_publish_delete_edge_facts_by_removed_targets_256",
+            crate::analyzer::store::import_graph::delete_edge_facts_by_target_paths_sql(
+                importer_count,
+            ),
+            removed_sources_params.clone(),
+        ));
+        for (name, sql) in [
+            (
+                "import_graph_publish_delete_source",
+                "DELETE FROM workspace_import_sources WHERE workspace_id = ?1 AND source_path = ?2",
+            ),
+            (
+                "import_graph_publish_delete_source_modules",
+                "DELETE FROM workspace_import_source_modules WHERE workspace_id = ?1 AND source_path = ?2",
+            ),
+            (
+                "import_graph_publish_delete_source_bindings",
+                "DELETE FROM workspace_import_source_bindings WHERE workspace_id = ?1 AND source_path = ?2",
+            ),
+        ] {
+            queries.push(pin(
+                name,
+                sql,
+                vec![text("publication-workspace"), text("src/lib.rs")],
+            ));
+        }
+        // The per-unit summary readers and the writer's hooks (derivation
+        // contract kind 2). A STAT4 build plans from the bound values, so the
+        // workspace id, unit key and epoch are shaped like production's; the pin
+        // test in `resolution_operation_unit_summary_tests.rs` rebinds them to
+        // the rows of a real Go store.
+        queries.push(pin(
+            "unit_summary_live_version",
+            super::super::go_unit_summaries::GO_LIVE_SUMMARY_SQL,
+            vec![
+                text(&"7".repeat(64)),
+                text("go"),
+                integer(1),
+                digest(1),
+                integer(1),
+                text("go-resolution-epoch"),
+                integer(1),
+                digest(2),
+                digest(3),
+            ],
+        ));
+        queries.push(pin(
+            "unit_summary_export_point",
+            super::super::unit_summaries::UNIT_EXPORT_POINT_SQL,
+            vec![integer(1), text("value"), integer(1)],
+        ));
+        queries.push(pin(
+            "unit_summary_dependents",
+            super::super::unit_summaries::UNIT_DEPENDENTS_SQL,
+            vec![digest(1), text(&"7".repeat(64)), text("go"), integer(1)],
+        ));
+        queries.push(pin(
+            "rust_unit_summary_live_version",
+            super::super::unit_summaries::LIVE_SUMMARY_SQL,
+            vec![
+                text(&"7".repeat(64)),
+                text("rust"),
+                integer(1),
+                digest(1),
+                integer(1),
+                text("rust-resolution-epoch"),
+                integer(super::super::rust_unit_summaries::RUST_UNIT_SUMMARY_DERIVATION_VERSION),
+            ],
+        ));
+        queries.push(pin(
+            "rust_unit_summary_export_point",
+            super::super::unit_summaries::UNIT_EXPORT_POINT_SQL,
+            vec![integer(1), text("type"), integer(1)],
+        ));
+        queries.push(pin(
+            "rust_unit_summary_dependents",
+            super::super::unit_summaries::UNIT_DEPENDENTS_SQL,
+            vec![digest(1), text(&"7".repeat(64)), text("rust"), integer(1)],
+        ));
+        queries.push(pin(
+            "unit_summary_graph_join",
+            super::super::unit_summaries::UNIT_GRAPH_JOIN_SQL,
+            vec![integer(1)],
+        ));
+        queries.push(pin(
+            "unit_summary_withdraw_replaced_blob",
+            super::super::unit_summaries::WITHDRAW_VERSIONS_OF_REPLACED_BLOB_SQL,
+            vec![text(OID), text("go")],
+        ));
         queries
     }
 
@@ -1726,11 +2334,19 @@ pub mod pinned_plans {
         conn: &Connection,
         query: &PinnedQuery,
     ) -> std::result::Result<Vec<String>, String> {
+        plan_rows_for_sql(conn, &query.sql, &query.params)
+    }
+
+    pub(crate) fn plan_rows_for_sql(
+        conn: &Connection,
+        sql: &str,
+        params: &[Value],
+    ) -> std::result::Result<Vec<String>, String> {
         let mut statement = conn
-            .prepare(&format!("EXPLAIN QUERY PLAN {}", query.sql))
+            .prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
             .map_err(|error| format!("prepare: {error}"))?;
         statement
-            .query_map(params_from_iter(query.params.iter()), |row| {
+            .query_map(params_from_iter(params.iter()), |row| {
                 row.get::<_, String>(3)
             })
             .map_err(|error| format!("bind: {error}"))?
@@ -1781,12 +2397,13 @@ pub mod pinned_plans {
 
 #[cfg(test)]
 pub(crate) mod tests {
+    use brokk_bifrost_test_macros::hardwon;
     use std::collections::{HashMap, HashSet};
     use std::path::PathBuf;
 
     use rusqlite::Connection;
 
-    use super::super::{AnalyzerStore, WorkspaceId};
+    use super::super::AnalyzerStore;
     // The pinned SQL, its bindings, and the two helpers that plan it live in
     // `pinned_plans` so the benchmark can call them too; the pin tests in
     // `store/mod.rs` still reach them through this module's path, which is why
@@ -1800,11 +2417,35 @@ pub(crate) mod tests {
         planner_statistics_row_count, with_representative_statistics,
     };
 
+    pub(crate) fn assert_pinned_query_uses_index(
+        conn: &Connection,
+        state: PlannerStatisticsState,
+        name: &str,
+        expected_index: &str,
+        forbidden_details: &[&str],
+    ) {
+        let plan = explain_pin(conn, &pinned(name));
+        assert!(
+            plan.iter().any(|detail| detail.contains(expected_index)),
+            "{state} {name}: {plan:#?}"
+        );
+        assert!(
+            plan.iter().all(|detail| {
+                forbidden_details
+                    .iter()
+                    .all(|forbidden| !detail.contains(forbidden))
+            }),
+            "{state} {name}: {plan:#?}"
+        );
+    }
+
+    use crate::analyzer::store::test_adapters::two_revision_collection_fixture;
     use crate::analyzer::workspace::WorkspaceAnalyzer;
     use crate::analyzer::{AnalyzerConfig, Language, Project, TestProject};
     use crate::gitblob::test_repo::{commit_all, init_repo};
 
     #[test]
+    #[hardwon("#3769: Rust field-only usage scans evaluated unrelated full resolution facts")]
     fn issue_3769_field_exclusion_seeks_exact_source_and_gap_rows() {
         use rusqlite::{StatementStatus, params, params_from_iter};
 
@@ -1891,6 +2532,7 @@ pub(crate) mod tests {
     }
 
     #[test]
+    #[hardwon("4c088c8231d7: selective reference-gap reads scanned unrelated persisted gaps")]
     fn reference_gap_completion_seeks_requested_subjects_with_unrelated_blob_gaps() {
         use crate::analyzer::resolution::LoweringGapOrigin;
         use crate::analyzer::store::resolution_prepare::resolution_rows::gap_origin_code;
@@ -2395,40 +3037,6 @@ pub(crate) mod tests {
         }
     }
 
-    /// The same dump, but the plans come from an in-memory store carrying the
-    /// statistics captured from a real one.
-    ///
-    /// `sqlite_stat1` is what the planner reads; the rows themselves are not.
-    /// Loading a captured `sqlite_stat1` into an empty store therefore
-    /// reproduces the real store's planning inputs without its data, which is
-    /// what makes the pinned plans testable in CI.
-    #[test]
-    #[ignore = "operator tool: prints plans rather than asserting on them"]
-    fn dump_pinned_plans_with_captured_statistics() {
-        // An ephemeral store's own connection, not a pooled reader: readers are
-        // read-only, and installing captured statistics writes `sqlite_stat1`.
-        let store = AnalyzerStore::open_ephemeral().expect("open store");
-        let conn = store.conn.lock().expect("store mutex");
-        store
-            .select_writer_workspace_snapshots(&conn, &HashMap::default())
-            .expect("workspace selection views");
-        prepare_pin_context(&conn);
-        with_representative_statistics(&conn);
-        eprintln!(
-            "{}",
-            serde_json::json!({
-                "sqlite_stat1_rows": planner_statistics_row_count(&conn).expect("stat1 rows"),
-            })
-        );
-        for query in pinned_queries() {
-            let record = match plan_rows(&conn, &query) {
-                Ok(plan) => serde_json::json!({"pin": query.name, "plan": plan}),
-                Err(error) => serde_json::json!({"pin": query.name, "error": error}),
-            };
-            println!("{record}");
-        }
-    }
-
     /// Batch typed-fact readers and scalar ownership readers must seek
     /// stored resolution tables under both statistics states. Array readers
     /// may scan json_each or its subquery; no reader may scan a resolution
@@ -2467,6 +3075,30 @@ pub(crate) mod tests {
                      scans {scanned:?}, whole plan {plan:?}"
                 );
             }
+        }
+    }
+
+    #[test]
+    fn rust_reason_owners_seek_declaration_site_in_both_statistics_states() {
+        for state in PlannerStatisticsState::BOTH {
+            let store = AnalyzerStore::open_ephemeral().expect("open store");
+            let conn = store.conn.lock().expect("store mutex");
+            store
+                .select_writer_workspace_snapshots(&conn, &HashMap::default())
+                .expect("workspace selection views");
+            prepare_pin_context(&conn);
+            state.install(&conn);
+            assert_pinned_query_uses_index(
+                &conn,
+                state,
+                "resolution_rust_reason_owners",
+                "resolution_rust_declaration_authorities_source_site",
+                &[
+                    "SCAN resolution_rust_declaration_authorities",
+                    "AUTOMATIC",
+                    "TEMP B-TREE",
+                ],
+            );
         }
     }
 
@@ -2518,6 +3150,11 @@ pub(crate) mod tests {
                     "SCAN p",
                 ),
                 (
+                    "resolution_reverse_candidate_match",
+                    "SEARCH p USING INDEX resolution_paths_root_terminal (blob_id=? AND root_terminal=?)",
+                    "SCAN p",
+                ),
+                (
                     "resolution_root_terminal_paths",
                     "SEARCH resolution_paths USING COVERING INDEX resolution_paths_root_terminal \
                      (blob_id=? AND root_terminal=?)",
@@ -2564,6 +3201,7 @@ pub(crate) mod tests {
     /// closure excludes drops out at the second seek and is never turned into
     /// an interior.
     #[test]
+    #[hardwon("c3c6da88f35d: point requests read endpoint headers outside their selected mounts")]
     fn the_scoped_endpoint_header_read_is_driven_by_its_mount_scope() {
         for state in PlannerStatisticsState::BOTH {
             let store = AnalyzerStore::open_ephemeral().expect("open store");
@@ -2610,6 +3248,7 @@ pub(crate) mod tests {
     /// them. The wildcard probe admits every header of its direction, so only
     /// its answer is checked.
     #[test]
+    #[hardwon("75590eea5877: non-wildcard endpoint probes scanned headers of unrelated shapes")]
     fn the_unscoped_endpoint_header_read_seeks_its_probe_shape() {
         use rusqlite::StatementStatus;
         let sql = super::super::resolution_lexical::PATH_ENDPOINT_HEADER_MOUNTS_SQL;
@@ -2737,6 +3376,7 @@ pub(crate) mod tests {
     /// The unique path index binds only the language here, and a plan through
     /// it walks every mount for every membership row (#3761).
     #[test]
+    #[hardwon("#3761: shared typed lookups scanned every mount through the path index")]
     fn the_shared_typed_membership_reaches_mounts_by_blob() {
         for state in PlannerStatisticsState::BOTH {
             let store = AnalyzerStore::open_ephemeral().expect("open store");
@@ -2761,6 +3401,7 @@ pub(crate) mod tests {
     }
 
     #[test]
+    #[hardwon("4f3061857f8c: fragment gap reads scanned unrelated headers outside the mount scope")]
     fn the_candidate_gap_header_reads_are_driven_by_their_mount_scope() {
         for state in PlannerStatisticsState::BOTH {
             let store = AnalyzerStore::open_ephemeral().expect("open store");
@@ -2777,6 +3418,10 @@ pub(crate) mod tests {
                 ),
                 (
                     "selected_boundary_candidate_gap_branches",
+                    "SEARCH h USING COVERING INDEX resolution_gaps_root_branches (covers=? AND blob_id=? AND lookup=?)",
+                ),
+                (
+                    "selected_boundary_candidate_gap_branches_all",
                     "SEARCH h USING COVERING INDEX resolution_gaps_root_branches (covers=? AND blob_id=?)",
                 ),
             ] {
@@ -2792,6 +3437,36 @@ pub(crate) mod tests {
                     );
                 }
                 for forbidden in ["SCAN h", "SCAN m", "TEMP B-TREE"] {
+                    assert!(
+                        !plan.iter().any(|row| row.contains(forbidden)),
+                        "{state} {name} must not {forbidden}: {plan:?}"
+                    );
+                }
+            }
+            // A scoped visit reads only its named mounts: the mount list
+            // drives, the request-scope table is seeked, never scanned.
+            for (name, header_search) in [
+                (
+                    "selected_boundary_candidate_gap_branches_in_mounts",
+                    "SEARCH h USING COVERING INDEX resolution_gaps_root_branches (covers=? AND blob_id=? AND lookup=?)",
+                ),
+                (
+                    "selected_boundary_candidate_gap_branches_all_in_mounts",
+                    "SEARCH h USING COVERING INDEX resolution_gaps_root_branches (covers=? AND blob_id=?)",
+                ),
+            ] {
+                let plan = explain_pin(&conn, &pinned(name));
+                for required in [
+                    "SEARCH scope USING PRIMARY KEY (mount_ordinal=?)",
+                    "SEARCH m USING PRIMARY KEY (mount_ordinal=?)",
+                    header_search,
+                ] {
+                    assert!(
+                        plan.iter().any(|row| row.contains(required)),
+                        "{state} {name} must {required}: {plan:?}"
+                    );
+                }
+                for forbidden in ["SCAN scope", "SCAN h", "SCAN m", "TEMP B-TREE"] {
                     assert!(
                         !plan.iter().any(|row| row.contains(forbidden)),
                         "{state} {name} must not {forbidden}: {plan:?}"
@@ -2824,6 +3499,9 @@ pub(crate) mod tests {
     }
 
     #[test]
+    #[hardwon(
+        "ed9135b9cc0a: definition hydration scanned blob-wide units instead of requested keys"
+    )]
     fn selected_definition_units_seek_the_complete_requested_keys() {
         for state in PlannerStatisticsState::BOTH {
             let store = AnalyzerStore::open_ephemeral().expect("open store");
@@ -2846,6 +3524,38 @@ pub(crate) mod tests {
             assert!(
                 plan.first().is_some_and(|row| row.contains("SCAN request")),
                 "{state}: requested coordinates drive hydration: {plan:?}"
+            );
+        }
+    }
+
+    #[test]
+    #[hardwon("#4501: macro occurrence line reads repeated a JSONB arena lookup per input")]
+    fn selected_macro_occurrence_lines_seek_one_arena_in_both_statistics_states() {
+        let store = AnalyzerStore::open_ephemeral().expect("open store");
+        let conn = store.conn.lock().expect("store mutex");
+        conn.execute_batch("PRAGMA foreign_keys=OFF;").unwrap();
+        conn.execute(
+            "INSERT INTO source_occurrence_arenas VALUES(1,jsonb('[[0,1,1,1,0]]'))",
+            [],
+        )
+        .unwrap();
+
+        for state in PlannerStatisticsState::BOTH {
+            state.install(&conn);
+            let plan = explain_pin(&conn, &pinned("selected_macro_occurrence_lines"));
+            assert!(
+                plan.iter()
+                    .any(|row| row.contains("SEARCH arena USING PRIMARY KEY (blob_id=?)")),
+                "{state}: the arena lookup must use its blob primary key: {plan:?}"
+            );
+            assert!(
+                plan.iter()
+                    .any(|row| row.contains("SCAN entry VIRTUAL TABLE")),
+                "{state}: the selected arena is traversed once with json_each: {plan:?}"
+            );
+            assert!(
+                plan.iter().all(|row| !row.contains("SCAN arena")),
+                "{state}: the arena table must not be scanned: {plan:?}"
             );
         }
     }
@@ -2891,6 +3601,225 @@ pub(crate) mod tests {
                     );
                 }
             }
+        }
+    }
+
+    #[test]
+    fn go_reverse_qualified_import_seeks_binders_and_package_unit_keys_under_both_statistics_states()
+     {
+        for state in PlannerStatisticsState::BOTH {
+            let store = AnalyzerStore::open_ephemeral().expect("open store");
+            let conn = store.conn.lock().expect("store mutex");
+            store
+                .select_writer_workspace_snapshots(&conn, &HashMap::default())
+                .expect("workspace selection views");
+            prepare_pin_context(&conn);
+            state.install(&conn);
+            let plan = explain_pin(&conn, &pinned("go_reverse_qualified_import"));
+            assert!(
+                plan.iter().any(|detail| {
+                    detail.contains("SEARCH binder USING INDEX resolution_go_package_imports_scope")
+                        && detail.contains("blob_id=?")
+                        && detail.contains("file_scope_key=?")
+                }),
+                "{state} qualified import binding must seek by caller blob and file Scope: {plan:?}"
+            );
+            assert!(
+                plan.iter().any(|detail| {
+                    detail
+                        .contains("SEARCH target_package USING INDEX go_package_instances_unit_key")
+                        && detail.contains("context_id=? AND unit_key=?")
+                }),
+                "{state} qualified import target must seek its stored package unit key: {plan:?}"
+            );
+            assert!(
+                !plan
+                    .iter()
+                    .any(|detail| detail.starts_with("SCAN target_package")),
+                "{state} qualified import must not scan the context's packages: {plan:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn go_reverse_inventory_seeks_test_variants_and_membership_keys_under_both_statistics_states() {
+        for state in PlannerStatisticsState::BOTH {
+            let store = AnalyzerStore::open_ephemeral().expect("open store");
+            let conn = store.conn.lock().expect("store mutex");
+            store
+                .select_writer_workspace_snapshots(&conn, &HashMap::default())
+                .expect("workspace selection views");
+            prepare_pin_context(&conn);
+            state.install(&conn);
+            let plan = explain_pin(&conn, &pinned("go_reverse_inventory_complete"));
+            assert!(
+                plan.iter().any(|detail| {
+                    detail.contains("SEARCH test_package USING INDEX go_package_instances_for_test")
+                        && detail.contains("context_id=? AND for_test=?")
+                }),
+                "{state} candidate target must seek test variants by their for-test path: {plan:?}"
+            );
+            assert!(
+                !plan
+                    .iter()
+                    .any(|detail| detail.starts_with("SCAN test_package")),
+                "{state} candidate target must not scan the context's packages: {plan:?}"
+            );
+        }
+    }
+
+    #[hardwon("cfb70fbdaf89: the lexical walk read every node of the blob for each candidate site")]
+    #[test]
+    fn reference_local_path_evidence_seeks_walk_scopes_by_key_under_both_statistics_states() {
+        for state in PlannerStatisticsState::BOTH {
+            let store = AnalyzerStore::open_ephemeral().expect("open store");
+            let conn = store.conn.lock().expect("store mutex");
+            store
+                .select_writer_workspace_snapshots(&conn, &HashMap::default())
+                .expect("workspace selection views");
+            prepare_pin_context(&conn);
+            state.install(&conn);
+            let plan = explain_pin(&conn, &pinned("reference_local_path_evidence"));
+            assert!(
+                plan.iter().any(|detail| {
+                    detail == "SEARCH scope USING PRIMARY KEY (blob_id=? AND local_key=?)"
+                }),
+                "{state} lexical walk must seek each scope node by its key: {plan:?}"
+            );
+            assert!(
+                !plan
+                    .iter()
+                    .any(|detail| detail == "SEARCH scope USING PRIMARY KEY (blob_id=?)"),
+                "{state} lexical walk must not read every node of the blob per site: {plan:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn go_binding_receiver_anchor_seeks_declaration_type_under_both_statistics_states() {
+        for state in PlannerStatisticsState::BOTH {
+            let store = AnalyzerStore::open_ephemeral().expect("open store");
+            let conn = store.conn.lock().expect("store mutex");
+            store
+                .select_writer_workspace_snapshots(&conn, &HashMap::default())
+                .expect("workspace selection views");
+            prepare_pin_context(&conn);
+            state.install(&conn);
+            let plan = explain_pin(&conn, &pinned("go_point_binding_receiver_anchor"));
+            assert!(
+                plan.iter().any(|detail| {
+                    detail.contains(
+                        "SEARCH declaration USING COVERING INDEX source_declarations_name_range",
+                    ) && detail.contains("blob_id=? AND name_start_byte=? AND name_end_byte=?")
+                }),
+                "{state} Go binding anchor must seek the selected declaration range: {plan:?}"
+            );
+            assert!(
+                plan.iter().any(|detail| {
+                    detail.contains("SEARCH bridge USING COVERING INDEX source_native_declaration_bridges_declaration")
+                }),
+                "{state} Go binding anchor must seek the declaration bridge: {plan:?}"
+            );
+            assert!(
+                plan.iter().any(|detail| {
+                    detail.contains("SEARCH declared USING PRIMARY KEY")
+                        && detail.contains("blob_id=? AND definition=?")
+                }),
+                "{state} Go binding anchor must seek declared type rows: {plan:?}"
+            );
+            assert!(
+                !plan.iter().any(|detail| {
+                    detail == "SCAN declaration"
+                        || detail == "SCAN bridge"
+                        || detail == "SCAN declared"
+                }),
+                "{state} Go binding anchor must not scan persisted rows: {plan:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn go_rename_conflict_queries_use_keyed_bundle_and_summary_seeks_under_both_statistics_states()
+    {
+        for state in PlannerStatisticsState::BOTH {
+            let store = AnalyzerStore::open_ephemeral().expect("open store");
+            let conn = store.conn.lock().expect("store mutex");
+            store
+                .select_writer_workspace_snapshots(&conn, &HashMap::default())
+                .expect("workspace selection views");
+            prepare_pin_context(&conn);
+            state.install(&conn);
+
+            let local = explain_pin(&conn, &pinned("go_rename_local_name_conflict"));
+            assert!(
+                local
+                    .iter()
+                    .any(|detail| detail.contains("resolution_paths_forward")),
+                "{state} local rename collision must seek scope paths: {local:?}"
+            );
+            assert!(
+                local.iter().any(|detail| {
+                    detail.contains("SEARCH semantic USING")
+                        && detail.contains("blob_id=? AND shared_identity=?")
+                }),
+                "{state} local rename collision must seek semantic identities: {local:?}"
+            );
+            assert!(
+                !local.iter().any(|detail| {
+                    detail == "SEARCH semantic USING PRIMARY KEY (blob_id=?)"
+                        || detail == "SCAN semantic"
+                }),
+                "{state} local rename collision must not scan a blob's semantic catalog: {local:?}"
+            );
+            let scopes = explain_pin(&conn, &pinned("go_rename_edit_site_scope_keys"));
+            assert!(
+                scopes.iter().any(|detail| {
+                    detail.contains("resolution_paths_forward")
+                        && detail.contains("blob_id=?")
+                        && detail.contains("start_node=?")
+                }),
+                "{state} edited-site scope lookup must seek saved paths: {scopes:?}"
+            );
+            let import = explain_pin(&conn, &pinned("go_rename_import_name_conflict"));
+            assert!(
+                import
+                    .iter()
+                    .any(|detail| detail.contains("resolution_go_package_imports_choice")),
+                "{state} import rename collision must seek spelling-choice binders: {import:?}"
+            );
+            assert!(
+                import.iter().any(|detail| {
+                    detail.contains("SEARCH semantic USING")
+                        && detail.contains("blob_id=? AND shared_identity=?")
+                }),
+                "{state} import rename collision must seek semantic identities: {import:?}"
+            );
+            assert!(
+                import.iter().any(|detail| {
+                    detail.contains("SEARCH source_import USING")
+                        && detail.contains("source_imports_declaration_range")
+                        && detail.contains(
+                            "blob_id=? AND declaration_start_byte=? AND declaration_end_byte=?",
+                        )
+                }),
+                "{state} import rename collision must seek the import declaration range: {import:?}"
+            );
+            let package = explain_pin(&conn, &pinned("go_rename_package_name_conflict"));
+            assert!(
+                package.iter().any(|detail| {
+                    detail.contains("SEARCH export USING PRIMARY KEY")
+                        && detail.contains("summary_id=?")
+                        && detail.contains("identity_id=?")
+                }),
+                "{state} package rename collision must seek the summary export key: {package:?}"
+            );
+            let rebound = explain_pin(&conn, &pinned("go_rename_rebound_root_references"));
+            assert!(
+                rebound
+                    .iter()
+                    .any(|detail| detail.contains("resolution_paths_root_terminal")),
+                "{state} rebind check must seek root-terminal paths: {rebound:?}"
+            );
         }
     }
 
@@ -2952,17 +3881,6 @@ pub(crate) mod tests {
         assert!(
             opened_any,
             "the registry must contain at least one resolution reader for this pin to mean anything"
-        );
-    }
-
-    #[test]
-    fn a_fresh_store_has_no_planner_statistics() {
-        let store = AnalyzerStore::open_ephemeral().unwrap();
-        let conn = store.conn.lock().expect("store mutex");
-        assert_eq!(
-            planner_statistics_row_count(&conn).unwrap(),
-            0,
-            "a store that has never run ANALYZE must not have a sqlite_stat1 table"
         );
     }
 
@@ -3109,39 +4027,6 @@ pub(crate) mod tests {
     ///
     /// The environment variable is process-wide, so this test sets it around
     /// one build and restores it; it does not run beside the test above.
-    #[test]
-    fn the_off_switch_leaves_a_persisted_build_without_statistics() {
-        let _guard = statistics_env_lock()
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let temp = tempfile::tempdir().unwrap();
-        let root = temp.path().canonicalize().unwrap();
-        std::fs::write(root.join(".gitignore"), ".bifrost/cache/\n").unwrap();
-        std::fs::write(root.join("app.rs"), "pub fn widget() -> u32 { 1 }\n").unwrap();
-        let repository = init_repo(&root);
-        commit_all(&repository, "one file");
-        let project: Arc<dyn Project> = Arc::new(TestProject::new(root.clone(), Language::Rust));
-
-        // SAFETY: the lock above serializes every test that reads or writes
-        // this variable, and no other thread in this binary reads it.
-        unsafe { std::env::set_var(STORE_STATISTICS_ENV, "off") };
-        let workspace =
-            WorkspaceAnalyzer::build_persisted(Arc::clone(&project), AnalyzerConfig::default())
-                .expect("persisted analyzer should build");
-        let db_path = workspace
-            .persisted_store_path()
-            .expect("a persisted build reports its store path");
-        drop(workspace);
-        unsafe { std::env::remove_var(STORE_STATISTICS_ENV) };
-
-        let statistics = Connection::open(&db_path).unwrap();
-        assert_eq!(
-            planner_statistics_row_count(&statistics).unwrap(),
-            0,
-            "BIFROST_STORE_STATISTICS=off must leave no sqlite_stat1 rows"
-        );
-    }
-
     /// A collection that dropped rows refreshes the statistics it invalidated.
     ///
     /// The setup makes one persisted blob genuinely unreachable: two commits,
@@ -3153,54 +4038,11 @@ pub(crate) mod tests {
         let _guard = statistics_env_lock()
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let temp = tempfile::tempdir().unwrap();
-        let root = temp.path().canonicalize().unwrap();
-        let first = "pub fn widget() -> u32 { 1 }\n";
-        let second = "pub fn widget() -> u32 { 2 }\npub fn extra() -> u32 { 3 }\n";
-        std::fs::write(root.join(".gitignore"), ".bifrost/cache/\n").unwrap();
-        std::fs::write(root.join("app.rs"), first).unwrap();
-        let repository = init_repo(&root);
-        let first_commit = commit_all(&repository, "first content");
-        let project: Arc<dyn Project> = Arc::new(TestProject::new(root.clone(), Language::Rust));
-        let workspace = WorkspaceAnalyzer::build_persisted_without_automatic_gc(
-            Arc::clone(&project),
-            AnalyzerConfig::default(),
-        )
-        .expect("persisted analyzer should build");
-        let db_path = workspace
-            .persisted_store_path()
-            .expect("a persisted build reports its store path");
-        drop(workspace);
+        let fixture = two_revision_collection_fixture();
+        let db_path = &fixture.db_path;
+        drop(fixture.store);
 
-        std::fs::write(root.join("app.rs"), second).unwrap();
-        commit_all(&repository, "second content");
-        drop(
-            WorkspaceAnalyzer::build_persisted_without_automatic_gc(
-                Arc::clone(&project),
-                AnalyzerConfig::default(),
-            )
-            .expect("persisted analyzer should rebuild"),
-        );
-
-        let head = repository.head().unwrap();
-        let branch = head.name().expect("a named branch").to_string();
-        repository
-            .reference(&branch, first_commit, true, "drop the second commit")
-            .unwrap();
-        std::fs::write(root.join("app.rs"), first).unwrap();
-
-        // Both analyzers are gone. Release their retained revision history;
-        // rewinding Git alone does not make those facts collectable.
-        let store = AnalyzerStore::open_persistent(&db_path).expect("open the collected store");
-        assert!(
-            store
-                .delete_workspace_projection(&WorkspaceId::for_root(&root))
-                .expect("release the workspace projection")
-                > 0
-        );
-        drop(store);
-
-        let statistics = Connection::open(&db_path).unwrap();
+        let statistics = Connection::open(db_path).unwrap();
         statistics
             .execute(
                 "INSERT INTO sqlite_stat1(tbl, idx, stat) VALUES('zzz_3016_sentinel', NULL, '1')",
@@ -3209,13 +4051,14 @@ pub(crate) mod tests {
             .unwrap();
         drop(statistics);
 
-        let outcome = brokk_bifrost_core::cache_gc::force_gc(&db_path, &repository, &root)
-            .expect("forced collection");
+        let outcome =
+            brokk_bifrost_core::cache_gc::force_gc(db_path, &fixture.repository, &fixture.root)
+                .expect("forced collection");
         assert!(
             outcome.analyzer_dropped > 0,
             "the setup must leave the second content collectable: {outcome:?}"
         );
-        let statistics = Connection::open(&db_path).unwrap();
+        let statistics = Connection::open(db_path).unwrap();
         let sentinel: i64 = statistics
             .query_row(
                 "SELECT count(*) FROM sqlite_stat1 WHERE tbl = 'zzz_3016_sentinel'",
@@ -3253,6 +4096,7 @@ pub(crate) mod tests {
     /// `sqlite_stat1` is a schema change every connection notices, and
     /// rewriting its rows is not.
     #[test]
+    #[hardwon("d78f9a16030c: pooled readers retained statements prepared under old statistics")]
     fn a_refresh_makes_a_pooled_reader_plan_with_the_new_statistics() {
         let store = AnalyzerStore::open_ephemeral().unwrap();
         {
@@ -3308,6 +4152,7 @@ pub(crate) mod tests {
     /// reader checked out across the refresh is exactly the one a busy server
     /// has, and reusing it would keep the old plans indefinitely.
     #[test]
+    #[hardwon("d78f9a16030c: a reader checked out during refresh could re-enter the stale pool")]
     fn a_reader_checked_out_across_a_refresh_is_not_returned_to_the_pool() {
         let store = AnalyzerStore::open_ephemeral().unwrap();
         {
@@ -3346,6 +4191,7 @@ pub(crate) mod tests {
     /// The repair is counted rather than timed: `ANALYZE` on a one-blob store
     /// is too fast to distinguish from the open around it.
     #[test]
+    #[hardwon("d78f9a16030c: opening a populated store without sqlite_stat1 left a latency cliff")]
     fn opening_a_built_store_without_statistics_repairs_them_once() {
         let _guard = statistics_env_lock()
             .lock()
@@ -3391,6 +4237,7 @@ pub(crate) mod tests {
     /// it would read as stale at every open and pay for a refresh that can
     /// produce nothing. Every ephemeral workspace opens exactly such a store.
     #[test]
+    #[hardwon("d78f9a16030c: empty-store open must avoid an unnecessary statistics pass")]
     fn opening_an_empty_store_does_not_analyze_it() {
         let _guard = statistics_env_lock()
             .lock()
@@ -3410,6 +4257,9 @@ pub(crate) mod tests {
     /// off carries no statistics, and the next open of that store -- with the
     /// switch cleared -- gives it some.
     #[test]
+    #[hardwon(
+        "d78f9a16030c: disabled build-time analysis left later opens without planner statistics"
+    )]
     fn a_build_with_the_switch_off_is_repaired_at_the_next_open() {
         let _guard = statistics_env_lock()
             .lock()
@@ -3484,11 +4334,13 @@ pub(crate) mod tests {
 
 #[cfg(test)]
 mod native_tests {
+    use brokk_bifrost_test_macros::hardwon;
     use rusqlite::Connection;
 
     use super::super::ReaderPool;
 
     #[test]
+    #[hardwon("#3029: readers checked out across statistics refresh could re-enter the stale pool")]
     fn statistics_refresh_retires_idle_and_checked_out_readers() {
         use super::super::SelectedReader;
 
@@ -3524,6 +4376,7 @@ mod native_tests {
     }
 
     #[test]
+    #[hardwon("#3029: active and streaming reader pools retained plans from old statistics")]
     fn refresh_recycles_all_store_reader_classes_and_populates_statistics() {
         let store = super::AnalyzerStore::open_ephemeral().unwrap();
         store.conn.execute(|conn| {
@@ -3609,6 +4462,7 @@ mod rust_crate_row_plans {
              INSERT INTO rust_crate_topologies VALUES(1, zeroblob(32), zeroblob(32),
                  'test', 'lib', 'sample', '2021', 'std', jsonb('[\"test\"]'), 1, zeroblob(32), 'complete');
              INSERT INTO rust_crate_containers VALUES(1, 'crate', 'module', 'root');
+             INSERT INTO rust_crate_container_members SELECT 1, 'crate', id FROM blobs;
              INSERT INTO rust_crate_container_sources SELECT 1, 'crate', id, 0, 'src/lib.rs', 'declared', NULL, NULL FROM blobs;
              INSERT INTO rust_crate_exports SELECT 1, 'crate', 'type', 'X', 'declaration',
                  'public', NULL, id, 0 FROM blobs;

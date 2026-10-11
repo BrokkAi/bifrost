@@ -1,0 +1,67 @@
+{
+  "schema_version": 2,
+  "pack_id": "bifrost.rust-reqwest-tls",
+  "version": "0.1.0",
+  "producer": {
+    "name": "bifrost-codeql-rust-parity-cq09",
+    "version": "0.1.0"
+  },
+  "language": "rust",
+  "ecosystem": "cargo",
+  "compatibility": {
+    "bifrost": ">=0.12.0, <1.0.0",
+    "toolchains": []
+  },
+  "provenance": {
+    "source": "CodeQL Rust parity fixture API shape for disabled TLS certificate and hostname checks.",
+    "revision": "api-shape"
+  },
+  "license": "Apache-2.0",
+  "completeness": "complete",
+  "safety": {
+    "generated_code_only": false,
+    "review_required": false
+  },
+  "shards": [
+    {
+      "id": "declarations.rust-reqwest-tls",
+      "activation": [{"targets": [], "configurations": []}],
+      "payload": {
+        "kind": "declaration_facts",
+        "types": [
+          {"id": "type.rust-reqwest.module", "name": "reqwest", "type_kind": "module", "visibility": "public", "locator": {"kind": "artifact", "path": "src/lib.rs", "symbol": "reqwest"}},
+          {"id": "type.rust-reqwest.client", "name": "reqwest.Client", "type_kind": "struct", "visibility": "public", "locator": {"kind": "artifact", "path": "src/api.rs", "symbol": "reqwest.Client"}},
+          {"id": "type.rust-reqwest.builder", "name": "reqwest.ClientBuilder", "type_kind": "struct", "visibility": "public", "locator": {"kind": "artifact", "path": "src/api.rs", "symbol": "reqwest.ClientBuilder"}},
+          {"id": "type.rust-native-tls.module", "name": "native_tls", "type_kind": "module", "visibility": "public", "locator": {"kind": "artifact", "path": "src/lib.rs", "symbol": "native_tls"}},
+          {"id": "type.rust-native-tls.connector", "name": "native_tls.TlsConnector", "type_kind": "struct", "visibility": "public", "locator": {"kind": "artifact", "path": "src/api.rs", "symbol": "native_tls.TlsConnector"}},
+          {"id": "type.rust-native-tls.builder", "name": "native_tls.TlsConnectorBuilder", "type_kind": "struct", "visibility": "public", "locator": {"kind": "artifact", "path": "src/api.rs", "symbol": "native_tls.TlsConnectorBuilder"}}
+        ],
+        "members": [
+          {"id": "member.rust-reqwest.client.builder", "owner": "type.rust-reqwest.client", "name": "builder", "member_kind": "method", "visibility": "public", "is_static": true, "callable_family_complete": true, "signature": {"parameters": [], "returns": {"kind": "named", "name": "reqwest.ClientBuilder"}}, "locator": {"kind": "artifact", "path": "src/api.rs", "symbol": "reqwest.Client.builder"}},
+          {"id": "member.rust-reqwest.builder.invalid-certs", "owner": "type.rust-reqwest.builder", "name": "danger_accept_invalid_certs", "member_kind": "method", "visibility": "public", "is_static": false, "callable_family_complete": true, "signature": {"parameters": [{"name": "value", "type": {"kind": "named", "name": "untyped"}}], "returns": {"kind": "named", "name": "reqwest.ClientBuilder"}}, "locator": {"kind": "artifact", "path": "src/api.rs", "symbol": "reqwest.ClientBuilder.danger_accept_invalid_certs"}},
+          {"id": "member.rust-reqwest.builder.invalid-hostnames", "owner": "type.rust-reqwest.builder", "name": "danger_accept_invalid_hostnames", "member_kind": "method", "visibility": "public", "is_static": false, "callable_family_complete": true, "signature": {"parameters": [{"name": "value", "type": {"kind": "named", "name": "untyped"}}], "returns": {"kind": "named", "name": "reqwest.ClientBuilder"}}, "locator": {"kind": "artifact", "path": "src/api.rs", "symbol": "reqwest.ClientBuilder.danger_accept_invalid_hostnames"}},
+          {"id": "member.rust-reqwest.builder.build", "owner": "type.rust-reqwest.builder", "name": "build", "member_kind": "method", "visibility": "public", "is_static": false, "callable_family_complete": true, "signature": {"parameters": [], "returns": {"kind": "named", "name": "std.result.Result"}}, "locator": {"kind": "artifact", "path": "src/api.rs", "symbol": "reqwest.ClientBuilder.build"}},
+          {"id": "member.rust-native-tls.connector.builder", "owner": "type.rust-native-tls.connector", "name": "builder", "member_kind": "method", "visibility": "public", "is_static": true, "callable_family_complete": true, "signature": {"parameters": [], "returns": {"kind": "named", "name": "native_tls.TlsConnectorBuilder"}}, "locator": {"kind": "artifact", "path": "src/api.rs", "symbol": "native_tls.TlsConnector.builder"}},
+          {"id": "member.rust-native-tls.builder.invalid-certs", "owner": "type.rust-native-tls.builder", "name": "danger_accept_invalid_certs", "member_kind": "method", "visibility": "public", "is_static": false, "callable_family_complete": true, "signature": {"parameters": [{"name": "value", "type": {"kind": "named", "name": "untyped"}}], "returns": {"kind": "named", "name": "native_tls.TlsConnectorBuilder"}}, "locator": {"kind": "artifact", "path": "src/api.rs", "symbol": "native_tls.TlsConnectorBuilder.danger_accept_invalid_certs"}},
+          {"id": "member.rust-native-tls.builder.build", "owner": "type.rust-native-tls.builder", "name": "build", "member_kind": "method", "visibility": "public", "is_static": false, "callable_family_complete": true, "signature": {"parameters": [], "returns": {"kind": "named", "name": "std.result.Result"}}, "locator": {"kind": "artifact", "path": "src/api.rs", "symbol": "native_tls.TlsConnectorBuilder.build"}}
+        ]
+      }
+    },
+    {
+      "id": "summaries.rust-reqwest-tls",
+      "activation": [{"targets": [], "configurations": []}],
+      "payload": {
+        "kind": "procedure_summaries",
+        "summaries": [
+          {"id": "summary.rust-reqwest.client.builder", "target": {"path": "src/api.rs", "symbol": "reqwest.Client.builder", "has_receiver": false, "parameter_count": 0}, "completeness": "complete", "locations": [], "transfers": [], "effects": [{"kind": "allocation", "event": "event.rust-reqwest.client.builder.result", "output": {"kind": "normal_return"}}]},
+          {"id": "summary.rust-reqwest.builder.invalid-certs", "target": {"path": "src/api.rs", "symbol": "reqwest.ClientBuilder.danger_accept_invalid_certs", "has_receiver": true, "parameter_count": 1}, "completeness": "complete", "covers_overrides": true, "locations": [], "transfers": [{"input": {"kind": "receiver"}, "exit_kind": "normal", "output": {"kind": "normal_return"}}], "effects": []},
+          {"id": "summary.rust-reqwest.builder.invalid-hostnames", "target": {"path": "src/api.rs", "symbol": "reqwest.ClientBuilder.danger_accept_invalid_hostnames", "has_receiver": true, "parameter_count": 1}, "completeness": "complete", "covers_overrides": true, "locations": [], "transfers": [{"input": {"kind": "receiver"}, "exit_kind": "normal", "output": {"kind": "normal_return"}}], "effects": []},
+          {"id": "summary.rust-reqwest.builder.build", "target": {"path": "src/api.rs", "symbol": "reqwest.ClientBuilder.build", "has_receiver": true, "parameter_count": 0}, "completeness": "complete", "covers_overrides": true, "locations": [], "transfers": [], "effects": [{"kind": "allocation", "event": "event.rust-reqwest.builder.build.result", "output": {"kind": "normal_return"}}]},
+          {"id": "summary.rust-native-tls.connector.builder", "target": {"path": "src/api.rs", "symbol": "native_tls.TlsConnector.builder", "has_receiver": false, "parameter_count": 0}, "completeness": "complete", "locations": [], "transfers": [], "effects": [{"kind": "allocation", "event": "event.rust-native-tls.connector.builder.result", "output": {"kind": "normal_return"}}]},
+          {"id": "summary.rust-native-tls.builder.invalid-certs", "target": {"path": "src/api.rs", "symbol": "native_tls.TlsConnectorBuilder.danger_accept_invalid_certs", "has_receiver": true, "parameter_count": 1}, "completeness": "complete", "covers_overrides": true, "locations": [], "transfers": [{"input": {"kind": "receiver"}, "exit_kind": "normal", "output": {"kind": "normal_return"}}], "effects": []},
+          {"id": "summary.rust-native-tls.builder.build", "target": {"path": "src/api.rs", "symbol": "native_tls.TlsConnectorBuilder.build", "has_receiver": true, "parameter_count": 0}, "completeness": "complete", "covers_overrides": true, "locations": [], "transfers": [], "effects": [{"kind": "allocation", "event": "event.rust-native-tls.builder.build.result", "output": {"kind": "normal_return"}}]}
+        ]
+      }
+    }
+  ]
+}

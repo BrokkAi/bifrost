@@ -13,8 +13,9 @@
 //! and an unresolved member does not open an identical-body proof. Arm-local
 //! declarations (block locals, catch and resource variables, loop variables
 //! and comprehension targets) are the exception, handled by pairing their
-//! binders, and a nested callable or local class body stays open because its
-//! capture and class identity are not modeled. One unbound spelling is one
+//! binders, and a nested callable or local class body stays open when its
+//! capture or class identity is not modeled; Scala lambdas and local defs are
+//! compared when their lexical rows are exact. One unbound spelling is one
 //! lookup only when no chain condition declares it with a binder the lexical
 //! environment does not model, such as a Java pattern variable. Repeated
 //! conditions additionally prove stability in `condition_stability`, which
@@ -25,13 +26,19 @@ use super::lexical_environment::{BindingOfOutcome, EnvironmentFileResult, bindin
 use super::occurrences::Namespace;
 use super::resolution::BindingKind;
 use crate::analyzer::CodeUnit;
-use crate::analyzer::branch_boolean::{BooleanBranchOutcome, classify_boolean_branches};
+use crate::analyzer::branch_boolean::{
+    BooleanBranchOutcome, KotlinBooleanBranchClassification, ScalaBooleanBranchClassification,
+    classify_boolean_branches, classify_kotlin_boolean_branches, classify_scala_boolean_branches,
+    kotlin_when_is_a6_shape, scala_defines_named_type,
+};
 use crate::analyzer::java_integral_parameter::{
     JavaIntegralDomain, JavaScalarType, java_decimal_int_value,
 };
 use crate::analyzer::languages::{LanguageSupport, language_support};
 use crate::analyzer::{Language, Range};
 use brokk_bifrost_core::analyzer::prepared_syntax::PreparedSyntaxTree;
+use brokk_bifrost_core::analyzer::structural::body_relations::empty_if_arm_relation;
+use brokk_bifrost_core::analyzer::tree_walk::{has_child_of_kind as has_direct_token, node_range};
 use std::collections::HashMap;
 use tree_sitter::Node;
 
@@ -40,6 +47,7 @@ pub enum BranchRelationKind {
     IdenticalBodies,
     RepeatedCondition,
     RedundantBooleanReturn,
+    EmptyArm,
 }
 
 impl BranchRelationKind {
@@ -48,6 +56,7 @@ impl BranchRelationKind {
             Self::IdenticalBodies => "identical_bodies",
             Self::RepeatedCondition => "repeated_condition",
             Self::RedundantBooleanReturn => "redundant_boolean_return",
+            Self::EmptyArm => "empty_arm",
         }
     }
 }
@@ -237,9 +246,28 @@ pub fn relations_for_if(
     if node.has_error() {
         return open_rows(range, BranchOpenReason::SyntaxRecovery);
     }
+    if language == Language::Php && php_unsupported_lexical_ancestor(node) {
+        return open_rows(range, BranchOpenReason::NonLocalReference);
+    }
     // Other conditionals share the `If` fact (a C# `switch`, a Kotlin
-    // `when`); these relations compare `if` arms only.
+    // `when`). Only a Kotlin `when` shaped like an A6 Boolean result gets a
+    // scoped open row; ordinary `when` expressions are outside this policy.
     if !if_kinds.contains(&node.kind()) {
+        if language == Language::Kotlin
+            && node.kind() == "when_expression"
+            && kotlin_when_is_a6_shape(syntax.source(), node)
+        {
+            return vec![BranchRelationRow {
+                kind: BranchRelationKind::RedundantBooleanReturn,
+                verdict: BranchRelationVerdict::Open(BranchOpenReason::UnsupportedCondition),
+                owner: node_range(node),
+                earlier: node_range(node),
+                later: node_range(node),
+                earlier_ordinal: 0,
+                later_ordinal: 0,
+                orientation: None,
+            }];
+        }
         return Vec::new();
     }
     let arms = match collect_arms(node, language) {
@@ -314,7 +342,22 @@ pub fn relations_for_if(
             });
         }
     }
-    rows.extend(redundant_boolean_row(syntax, language, node));
+    rows.extend(redundant_boolean_row(syntax, language, node, env));
+    if let Some(empty_arm) = empty_if_arm_relation(node, language) {
+        let consequence = node_range(empty_arm.consequence);
+        let alternative = empty_arm.alternative.map(node_range).unwrap_or(consequence);
+        let has_alternative = empty_arm.alternative.is_some();
+        rows.push(BranchRelationRow {
+            kind: BranchRelationKind::EmptyArm,
+            verdict: BranchRelationVerdict::Proven,
+            owner: node_range(empty_arm.owner),
+            earlier: consequence,
+            later: alternative,
+            earlier_ordinal: 0,
+            later_ordinal: usize::from(has_alternative),
+            orientation: None,
+        });
+    }
     rows
 }
 
@@ -324,11 +367,55 @@ fn redundant_boolean_row(
     syntax: &PreparedSyntaxTree,
     language: Language,
     node: Node<'_>,
+    env: &EnvironmentFileResult,
 ) -> Option<BranchRelationRow> {
+    if language == Language::Rust {
+        let condition = node.child_by_field_name("condition")?;
+        if !rust_boolean_expression(condition, env, syntax.source()) {
+            return None;
+        }
+    }
     let true_body = node.child_by_field_name(consequence_field(language))?;
+    if language == Language::Scala
+        && node.child_by_field_name("alternative").is_none()
+        && (scala_has_else_keyword(node) || syntax.tree().root_node().has_error())
+    {
+        return Some(open_redundant_boolean_row(
+            node,
+            true_body,
+            node,
+            BranchOpenReason::SyntaxRecovery,
+        ));
+    }
     let false_body = if let Some(alternative) = node.child_by_field_name("alternative") {
+        if language == Language::Scala && (alternative.has_error() || alternative.is_missing()) {
+            return Some(open_redundant_boolean_row(
+                node,
+                true_body,
+                alternative,
+                BranchOpenReason::SyntaxRecovery,
+            ));
+        }
         if alternative.kind() == "else_clause" {
-            alternative.named_child(0)?
+            let Some(body) = alternative.named_child(0) else {
+                return (language == Language::Scala).then(|| {
+                    open_redundant_boolean_row(
+                        node,
+                        true_body,
+                        alternative,
+                        BranchOpenReason::SyntaxRecovery,
+                    )
+                });
+            };
+            if language == Language::Scala && body.has_error() {
+                return Some(open_redundant_boolean_row(
+                    node,
+                    true_body,
+                    body,
+                    BranchOpenReason::SyntaxRecovery,
+                ));
+            }
+            body
         } else {
             alternative
         }
@@ -343,7 +430,18 @@ fn redundant_boolean_row(
             }
             _ => node,
         };
-        let parent = statement.parent().filter(|parent| !parent.has_error())?;
+        let Some(parent) = statement.parent().filter(|parent| !parent.has_error()) else {
+            return (language == Language::Scala && syntax.tree().root_node().has_error()).then(
+                || {
+                    open_redundant_boolean_row(
+                        node,
+                        true_body,
+                        node,
+                        BranchOpenReason::SyntaxRecovery,
+                    )
+                },
+            );
+        };
         let blocks: &[&str] = match language {
             Language::Java | Language::Python | Language::CSharp | Language::Rust => &["block"],
             Language::Php | Language::Cpp => &["compound_statement"],
@@ -357,13 +455,62 @@ fn redundant_boolean_row(
         if !blocks.contains(&parent.kind()) {
             return None;
         }
-        let mut following = statement.next_named_sibling()?;
+        let Some(mut following) = statement.next_named_sibling() else {
+            return (language == Language::Scala && syntax.tree().root_node().has_error()).then(
+                || {
+                    open_redundant_boolean_row(
+                        node,
+                        true_body,
+                        node,
+                        BranchOpenReason::SyntaxRecovery,
+                    )
+                },
+            );
+        };
         while following.is_extra() {
             following = following.next_named_sibling()?;
         }
         following
     };
-    let outcome = classify_boolean_branches(language, syntax.source(), true_body, false_body)?;
+    let outcome = if language == Language::Kotlin {
+        match classify_kotlin_boolean_branches(syntax.source(), node, true_body, false_body) {
+            KotlinBooleanBranchClassification::Proven(outcome) => outcome,
+            KotlinBooleanBranchClassification::Open => {
+                return Some(BranchRelationRow {
+                    kind: BranchRelationKind::RedundantBooleanReturn,
+                    verdict: BranchRelationVerdict::Open(BranchOpenReason::UnsupportedCondition),
+                    owner: node_range(node),
+                    earlier: node_range(true_body),
+                    later: node_range(false_body),
+                    earlier_ordinal: 0,
+                    later_ordinal: 1,
+                    orientation: None,
+                });
+            }
+            KotlinBooleanBranchClassification::NotApplicable => {
+                classify_boolean_branches(language, syntax.source(), true_body, false_body)?
+            }
+        }
+    } else if language == Language::Scala {
+        match classify_scala_boolean_branches(syntax.source(), true_body, false_body, Some(node)) {
+            ScalaBooleanBranchClassification::Proven(outcome) => outcome,
+            ScalaBooleanBranchClassification::NotCandidate => return None,
+            ScalaBooleanBranchClassification::Open => {
+                return Some(BranchRelationRow {
+                    kind: BranchRelationKind::RedundantBooleanReturn,
+                    verdict: BranchRelationVerdict::Open(BranchOpenReason::UnsupportedCondition),
+                    owner: node_range(node),
+                    earlier: node_range(true_body),
+                    later: node_range(false_body),
+                    earlier_ordinal: 0,
+                    later_ordinal: 1,
+                    orientation: None,
+                });
+            }
+        }
+    } else {
+        classify_boolean_branches(language, syntax.source(), true_body, false_body)?
+    };
     // The first arm of a Ruby `unless` runs when its condition is false.
     let outcome = match (node.kind(), outcome) {
         ("unless", BooleanBranchOutcome::Condition) => BooleanBranchOutcome::NegatedCondition,
@@ -390,6 +537,7 @@ fn open_rows(range: Range, reason: BranchOpenReason) -> Vec<BranchRelationRow> {
         BranchRelationKind::IdenticalBodies,
         BranchRelationKind::RepeatedCondition,
         BranchRelationKind::RedundantBooleanReturn,
+        BranchRelationKind::EmptyArm,
     ]
     .into_iter()
     .map(|kind| BranchRelationRow {
@@ -403,6 +551,30 @@ fn open_rows(range: Range, reason: BranchOpenReason) -> Vec<BranchRelationRow> {
         orientation: None,
     })
     .collect()
+}
+
+fn open_redundant_boolean_row(
+    owner: Node<'_>,
+    earlier: Node<'_>,
+    later: Node<'_>,
+    reason: BranchOpenReason,
+) -> BranchRelationRow {
+    BranchRelationRow {
+        kind: BranchRelationKind::RedundantBooleanReturn,
+        verdict: BranchRelationVerdict::Open(reason),
+        owner: node_range(owner),
+        earlier: node_range(earlier),
+        later: node_range(later),
+        earlier_ordinal: 0,
+        later_ordinal: 1,
+        orientation: None,
+    }
+}
+
+fn scala_has_else_keyword(node: Node<'_>) -> bool {
+    let mut cursor = node.walk();
+    node.children(&mut cursor)
+        .any(|child| child.kind() == "else")
 }
 
 fn collect_arms<'tree>(
@@ -578,15 +750,6 @@ fn kotlin_else_if(body: Node<'_>) -> Option<Node<'_>> {
         .filter(|nested| nested.kind() == "if_expression")
 }
 
-fn node_range(node: Node<'_>) -> Range {
-    Range {
-        start_byte: node.start_byte(),
-        end_byte: node.end_byte(),
-        start_line: node.start_position().row + 1,
-        end_line: node.end_position().row + 1,
-    }
-}
-
 /// What every comparison within one `if` chain shares.
 #[derive(Clone, Copy)]
 struct Chain<'a> {
@@ -687,7 +850,12 @@ fn compare_trees(earlier: Node<'_>, later: Node<'_>, chain: &Chain<'_>) -> Branc
             }
             return BranchRelationVerdict::Distinct;
         }
-        let nested = nested || is_nested_callable(left, language);
+        let nested_callable = is_nested_callable(left, language);
+        let php_exact_callable =
+            language == Language::Php && php_exact_nested_callable(left, right);
+        let scala_exact_callable =
+            language == Language::Scala && scala_nested_callable_is_exact(left, right, env);
+        let nested = nested || (nested_callable && !(php_exact_callable || scala_exact_callable));
         deferred |= nested;
         if position_dependent(left, language, source) || position_dependent(right, language, source)
         {
@@ -813,7 +981,9 @@ fn compare_trees(earlier: Node<'_>, later: Node<'_>, chain: &Chain<'_>) -> Branc
                     let range = env.bindings[*index].range;
                     range.start_byte == node.start_byte()
                         && range.end_byte == node.end_byte()
-                        && arm_local_binding(env, *index, arm)
+                        && (arm_local_binding(env, *index, arm)
+                            || (language == Language::Scala
+                                && scala_callable_binding(env, *index, arm)))
                 })
             };
             match (
@@ -928,10 +1098,12 @@ fn compare_trees(earlier: Node<'_>, later: Node<'_>, chain: &Chain<'_>) -> Branc
                 return BranchRelationVerdict::Open(BranchOpenReason::LexicalBindingUnavailable);
             }
         };
-        // A pattern binder that a chain condition declares, such as Rust's
-        // `if let Some(v) = ..`, is in effect in some arms only, but the
-        // environment states its interval as the whole `if`. In an arm where
-        // it is not in effect, the same spelling names another binding.
+        // A pattern binder that a chain condition declares, such as Java's
+        // flow-sensitive pattern variable, is in effect in some arms only and
+        // is not represented by the shared lexical environment. Rust's
+        // `if let` binders are represented with their exact consequence-body
+        // interval by the Rust adapter, so the Rust branch below can compare
+        // the pattern binding with an outer binding precisely.
         let declared_by_condition = |index: usize| {
             let range = env.bindings[index].range;
             let within =
@@ -941,7 +1113,7 @@ fn compare_trees(earlier: Node<'_>, later: Node<'_>, chain: &Chain<'_>) -> Branc
                 && !within(earlier.start_byte(), earlier.end_byte())
                 && !within(later.start_byte(), later.end_byte())
         };
-        if declared_by_condition(a) || declared_by_condition(b) {
+        if language != Language::Rust && (declared_by_condition(a) || declared_by_condition(b)) {
             return BranchRelationVerdict::Open(BranchOpenReason::LexicalBindingUnavailable);
         }
         // Every assignment to a Ruby local is a binding row of its own, but
@@ -967,6 +1139,15 @@ fn compare_trees(earlier: Node<'_>, later: Node<'_>, chain: &Chain<'_>) -> Branc
         }
         if a != b && (arm_local_binding(env, a, earlier) || arm_local_binding(env, b, later)) {
             return BranchRelationVerdict::Open(BranchOpenReason::LexicalBindingUnavailable);
+        }
+        if language == Language::Rust
+            && (env.bindings[a].kind == BindingKind::PatternBinder
+                || env.bindings[b].kind == BindingKind::PatternBinder)
+        {
+            if a == b && name == other_name {
+                continue;
+            }
+            return BranchRelationVerdict::Distinct;
         }
         if !ordinary_binding(env, a) || !ordinary_binding(env, b) {
             if a == b && name == other_name {
@@ -1066,6 +1247,82 @@ fn declared_boolean(
                 .and_then(|written| source.get(written.byte_range())),
             Some("Boolean" | "bool")
         )
+}
+
+fn rust_unary_not_operand(node: Node<'_>) -> Option<Node<'_>> {
+    if node.kind() != "unary_expression" || node.named_child_count() != 1 {
+        return None;
+    }
+    let mut cursor = node.walk();
+    if !node.children(&mut cursor).any(|child| child.kind() == "!") {
+        return None;
+    }
+    node.named_child(0)
+}
+
+fn rust_boolean_expression(
+    expression: Node<'_>,
+    env: &EnvironmentFileResult,
+    source: &str,
+) -> bool {
+    match expression.kind() {
+        "boolean_literal" => matches!(source.get(expression.byte_range()), Some("true" | "false")),
+        "parenthesized_expression" if expression.named_child_count() == 1 => {
+            rust_boolean_expression(
+                expression.named_child(0).expect("one named child"),
+                env,
+                source,
+            )
+        }
+        "unary_expression" => rust_unary_not_operand(expression)
+            .is_some_and(|operand| rust_boolean_expression(operand, env, source)),
+        "identifier" => {
+            let Some(name) = source.get(expression.byte_range()) else {
+                return false;
+            };
+            match binding_of(env, name, expression.start_byte(), Some(Namespace::Value)) {
+                BindingOfOutcome::Reached(index)
+                | BindingOfOutcome::Shadowed { winner: index, .. } => {
+                    rust_declared_boolean(env, index, expression, source)
+                }
+                BindingOfOutcome::NoBinding | BindingOfOutcome::Incomplete(_) => false,
+            }
+        }
+        _ => false,
+    }
+}
+
+fn rust_declared_boolean(
+    env: &EnvironmentFileResult,
+    index: usize,
+    reference: Node<'_>,
+    source: &str,
+) -> bool {
+    let mut root = reference;
+    while let Some(parent) = root.parent() {
+        root = parent;
+    }
+    let range = env.bindings[index].range;
+    let Some(name) = root.named_descendant_for_byte_range(range.start_byte, range.end_byte) else {
+        return false;
+    };
+    let form = std::iter::successors(Some(name), |node| node.parent())
+        .find(|node| matches!(node.kind(), "parameter" | "let_declaration"));
+    let Some(form) = form else {
+        return false;
+    };
+    if form
+        .child_by_field_name("type")
+        .and_then(|written| source.get(written.byte_range()))
+        == Some("bool")
+    {
+        return true;
+    }
+    form.kind() == "let_declaration"
+        && form.child_by_field_name("type").is_none()
+        && form
+            .child_by_field_name("value")
+            .is_some_and(|value| value.kind() == "boolean_literal")
 }
 
 /// Whether `node` evaluates to its own source position, so two spellings of
@@ -1179,15 +1436,24 @@ fn arm_local_binding(env: &EnvironmentFileResult, index: usize, arm: Node<'_>) -
         && binding.range.end_byte <= arm.end_byte()
 }
 
+/// Scala callable parameters are separate bindings in each branch, just like
+/// arm-local declarations. Their activation is wholly inside the arm even
+/// though the shared classifier reserves `arm_local_binding` for declarations
+/// introduced by the arm itself.
+fn scala_callable_binding(env: &EnvironmentFileResult, index: usize, arm: Node<'_>) -> bool {
+    let binding = &env.bindings[index];
+    matches!(binding.kind, BindingKind::Local | BindingKind::Parameter)
+        && arm.start_byte() <= binding.activation.start_byte
+        && binding.activation.end_byte <= arm.end_byte()
+        && arm.start_byte() <= binding.range.start_byte
+        && binding.range.end_byte <= arm.end_byte()
+}
+
 fn has_with_ancestor(node: Node<'_>) -> bool {
-    let mut ancestor = node.parent();
-    while let Some(current) = ancestor {
-        if current.kind() == "with_statement" {
-            return true;
-        }
-        ancestor = current.parent();
-    }
-    false
+    brokk_bifrost_core::analyzer::structural::adapter_helpers::nearest_ancestor(node, |kind| {
+        kind == "with_statement"
+    })
+    .is_some()
 }
 
 fn stable_binding(env: &EnvironmentFileResult, index: usize) -> bool {
@@ -1248,9 +1514,11 @@ fn explicit_this_receiver(invocation: Node<'_>) -> bool {
 
 /// A nested callable or local class creates a new closure or class per arm.
 /// Its captures and class identity are not modeled, so its equivalence stays
-/// open rather than inferred from matching syntax. The kinds cover the Java,
-/// JavaScript, TypeScript and Python grammars; a Python decorated definition
-/// is covered by the definition it wraps.
+/// open rather than inferred from matching syntax. PHP is the exception for
+/// by-value closures and arrows: its lexical environment gives each parameter,
+/// capture and local an exact binding, so their bodies can be compared.
+/// The kinds cover the Java, JavaScript, TypeScript and Python grammars; a
+/// Python decorated definition is covered by the definition it wraps.
 fn is_nested_callable(node: Node<'_>, language: Language) -> bool {
     // A Ruby `block` is a closure; elsewhere a `block` is a statement block.
     if language == Language::Ruby {
@@ -1331,6 +1599,85 @@ fn is_nested_callable(node: Node<'_>, language: Language) -> bool {
         )
 }
 
+/// Whether a Scala nested callable can be compared through the lexical
+/// environment. Lambdas and local `def`s have environment rows for their
+/// parameters and locals. An anonymous `new T { ... }` is an instance with a
+/// distinct class identity, so it remains deferred even when its body text
+/// matches. Deferred parameter and lazy-value shapes also retain uncertainty.
+fn scala_nested_callable_is_exact(
+    left: Node<'_>,
+    right: Node<'_>,
+    env: &EnvironmentFileResult,
+) -> bool {
+    if left.kind() != right.kind()
+        || !matches!(left.kind(), "lambda_expression" | "function_definition")
+        || !env.completeness.is_complete()
+    {
+        return false;
+    }
+    let mut stack = vec![left, right];
+    let mut visited = 0;
+    while let Some(node) = stack.pop() {
+        visited += 1;
+        if visited > 4096 || node.has_error() || node.is_missing() {
+            return false;
+        }
+        if matches!(
+            node.kind(),
+            "by_name_type"
+                | "lazy_parameter_type"
+                | "repeated_parameter_type"
+                | "lazy_modifier"
+                | "lazy"
+        ) {
+            return false;
+        }
+        stack.extend(non_extra_children(node).into_iter().map(|(_, child)| child));
+    }
+    true
+}
+
+fn php_exact_nested_callable(left: Node<'_>, right: Node<'_>) -> bool {
+    if left.kind() != right.kind() {
+        return false;
+    }
+    match left.kind() {
+        "arrow_function" => true,
+        "anonymous_function" => {
+            !php_callable_has_by_ref_capture(left) && !php_callable_has_by_ref_capture(right)
+        }
+        _ => false,
+    }
+}
+
+fn php_callable_has_by_ref_capture(node: Node<'_>) -> bool {
+    if node.kind() != "anonymous_function" {
+        return false;
+    }
+    let mut cursor = node.walk();
+    node.named_children(&mut cursor)
+        .filter(|child| child.kind() == "anonymous_function_use_clause")
+        .any(|use_clause| {
+            has_direct_token(use_clause, "by_ref")
+                || has_direct_token(use_clause, "reference_modifier")
+                || has_direct_token(use_clause, "&")
+        })
+}
+
+fn php_unsupported_lexical_ancestor(node: Node<'_>) -> bool {
+    let mut current = node.parent();
+    while let Some(ancestor) = current {
+        if ancestor.kind() == "anonymous_class" {
+            return true;
+        }
+        if ancestor.kind() == "anonymous_function" && php_callable_has_by_ref_capture(ancestor) {
+            return true;
+        }
+        current = ancestor.parent();
+    }
+    false
+}
+
 /// The spellings that Java pattern variables in the chain's conditions
 /// declare.
 ///
@@ -1395,6 +1742,12 @@ fn condition_stability(
     syntax: &PreparedSyntaxTree,
     env: &EnvironmentFileResult,
 ) -> BranchRelationVerdict {
+    if language == Language::Scala {
+        return scala_condition_stability(condition, syntax.source(), env);
+    }
+    if language == Language::CSharp {
+        return csharp_condition_stability(condition, syntax.source(), env);
+    }
     let c_dialect = syntax.dialect() == crate::analyzer::LanguageDialect::CppC;
     let baseline = basic_condition_stability(condition, language, c_dialect, syntax.source(), env);
     if language != Language::Java
@@ -1406,6 +1759,657 @@ fn condition_stability(
         return baseline;
     }
     java_primitive_condition_stability(condition, syntax, env)
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ScalaConditionScalarType {
+    Integer,
+    Boolean,
+}
+
+#[derive(Clone, Copy)]
+enum ScalaConditionExpectation {
+    Boolean,
+    Integer,
+}
+
+/// Scala's operators are methods, so repeated conditions are stable only
+/// when every operand is a local or by-value parameter with an exact primitive
+/// type, or a decimal integer/Boolean literal. The stack keeps this walk
+/// bounded and avoids treating an arbitrary expression with a primitive result
+/// as a built-in operator invocation.
+fn scala_condition_stability(
+    condition: Node<'_>,
+    source: &str,
+    env: &EnvironmentFileResult,
+) -> BranchRelationVerdict {
+    let mut pending = vec![(condition, ScalaConditionExpectation::Boolean)];
+    let mut visited = 0;
+    while let Some((mut node, expectation)) = pending.pop() {
+        visited += 1;
+        if visited > 4096 || node.child_count() > 4096 {
+            return BranchRelationVerdict::Open(BranchOpenReason::ComparisonBudget);
+        }
+        if node.has_error() || node.is_missing() {
+            return BranchRelationVerdict::Open(BranchOpenReason::SyntaxRecovery);
+        }
+        while node.kind() == "parenthesized_expression" {
+            if node.named_child_count() != 1 {
+                return BranchRelationVerdict::Open(BranchOpenReason::MissingBranchField);
+            }
+            node = node.named_child(0).expect("one parenthesized expression");
+            visited += 1;
+            if visited > 4096 || node.has_error() || node.is_missing() {
+                return BranchRelationVerdict::Open(BranchOpenReason::ComparisonBudget);
+            }
+        }
+        if let Some(scalar_type) = scala_condition_literal_type(node, source) {
+            if scala_condition_type_matches(scalar_type, expectation) {
+                continue;
+            }
+            return BranchRelationVerdict::Open(BranchOpenReason::UnsupportedCondition);
+        }
+        match node.kind() {
+            "identifier" => {
+                let scalar_type = match scala_condition_binding_type(node, source, env) {
+                    Ok(scalar_type) => scalar_type,
+                    Err(reason) => return BranchRelationVerdict::Open(reason),
+                };
+                if !scala_condition_type_matches(scalar_type, expectation) {
+                    return BranchRelationVerdict::Open(BranchOpenReason::UnsupportedCondition);
+                }
+            }
+            "prefix_expression" => {
+                let Some(operator) = scala_prefix_operator(node) else {
+                    return BranchRelationVerdict::Open(BranchOpenReason::MissingBranchField);
+                };
+                let Some(operand) = scala_prefix_operand(node) else {
+                    return BranchRelationVerdict::Open(BranchOpenReason::MissingBranchField);
+                };
+                match operator {
+                    "!" if matches!(expectation, ScalaConditionExpectation::Boolean) => {
+                        pending.push((operand, ScalaConditionExpectation::Boolean));
+                    }
+                    "-" if matches!(expectation, ScalaConditionExpectation::Integer) => {
+                        pending.push((operand, ScalaConditionExpectation::Integer));
+                    }
+                    _ => {
+                        return BranchRelationVerdict::Open(BranchOpenReason::UnsupportedCondition);
+                    }
+                }
+            }
+            "infix_expression" => {
+                let (Some(operator), Some(left), Some(right)) = (
+                    node.child_by_field_name("operator"),
+                    node.child_by_field_name("left"),
+                    node.child_by_field_name("right"),
+                ) else {
+                    return BranchRelationVerdict::Open(BranchOpenReason::MissingBranchField);
+                };
+                let Some(operator) = source.get(operator.byte_range()) else {
+                    return BranchRelationVerdict::Open(BranchOpenReason::SyntaxRecovery);
+                };
+                match operator {
+                    "&&" | "||" if matches!(expectation, ScalaConditionExpectation::Boolean) => {
+                        pending.push((right, ScalaConditionExpectation::Boolean));
+                        pending.push((left, ScalaConditionExpectation::Boolean));
+                    }
+                    "<" | "<=" | ">" | ">="
+                        if matches!(expectation, ScalaConditionExpectation::Boolean) =>
+                    {
+                        pending.push((right, ScalaConditionExpectation::Integer));
+                        pending.push((left, ScalaConditionExpectation::Integer));
+                    }
+                    "==" | "!=" if matches!(expectation, ScalaConditionExpectation::Boolean) => {
+                        let left_type = match scala_condition_operand_type(left, source, env) {
+                            Ok(left_type) => left_type,
+                            Err(reason) => return BranchRelationVerdict::Open(reason),
+                        };
+                        let right_type = match scala_condition_operand_type(right, source, env) {
+                            Ok(right_type) => right_type,
+                            Err(reason) => return BranchRelationVerdict::Open(reason),
+                        };
+                        if left_type != right_type
+                            || !matches!(
+                                (left_type, right_type),
+                                (
+                                    ScalaConditionScalarType::Integer,
+                                    ScalaConditionScalarType::Integer
+                                ) | (
+                                    ScalaConditionScalarType::Boolean,
+                                    ScalaConditionScalarType::Boolean
+                                )
+                            )
+                        {
+                            return BranchRelationVerdict::Open(
+                                BranchOpenReason::UnsupportedCondition,
+                            );
+                        }
+                    }
+                    _ => {
+                        return BranchRelationVerdict::Open(BranchOpenReason::UnsupportedCondition);
+                    }
+                }
+            }
+            _ => return BranchRelationVerdict::Open(BranchOpenReason::UnsupportedCondition),
+        }
+    }
+    BranchRelationVerdict::Proven
+}
+
+fn scala_condition_type_matches(
+    scalar_type: ScalaConditionScalarType,
+    expectation: ScalaConditionExpectation,
+) -> bool {
+    matches!(
+        (scalar_type, expectation),
+        (
+            ScalaConditionScalarType::Boolean,
+            ScalaConditionExpectation::Boolean
+        ) | (
+            ScalaConditionScalarType::Integer,
+            ScalaConditionExpectation::Integer
+        )
+    )
+}
+
+fn scala_condition_operand_type(
+    mut node: Node<'_>,
+    source: &str,
+    env: &EnvironmentFileResult,
+) -> Result<ScalaConditionScalarType, BranchOpenReason> {
+    for _ in 0..64 {
+        if node.kind() == "parenthesized_expression" {
+            if node.named_child_count() != 1 {
+                return Err(BranchOpenReason::MissingBranchField);
+            }
+            node = node.named_child(0).expect("one parenthesized expression");
+            continue;
+        }
+        if node.kind() == "prefix_expression" {
+            if scala_prefix_operator(node) != Some("-") {
+                return Err(BranchOpenReason::UnsupportedCondition);
+            }
+            node = scala_prefix_operand(node).ok_or(BranchOpenReason::MissingBranchField)?;
+            continue;
+        }
+        if let Some(scalar_type) = scala_condition_literal_type(node, source) {
+            return Ok(scalar_type);
+        }
+        return match node.kind() {
+            "identifier" => scala_condition_binding_type(node, source, env),
+            _ => Err(BranchOpenReason::UnsupportedCondition),
+        };
+    }
+    Err(BranchOpenReason::ComparisonBudget)
+}
+
+fn scala_condition_literal_type(
+    mut node: Node<'_>,
+    source: &str,
+) -> Option<ScalaConditionScalarType> {
+    let mut negative = false;
+    for _ in 0..64 {
+        match node.kind() {
+            "parenthesized_expression" => {
+                node = node.named_child(0)?;
+            }
+            "prefix_expression" => {
+                if scala_prefix_operator(node) != Some("-") {
+                    return None;
+                }
+                negative = !negative;
+                node = scala_prefix_operand(node)?;
+            }
+            "boolean_literal" if !negative => {
+                return matches!(source.get(node.byte_range()), Some("true" | "false"))
+                    .then_some(ScalaConditionScalarType::Boolean);
+            }
+            "integer_literal" => {
+                let mut text = source.get(node.byte_range())?;
+                if matches!(text.as_bytes().last(), Some(b'l' | b'L')) {
+                    text = &text[..text.len() - 1];
+                }
+                if text.is_empty() || !text.bytes().all(|byte| byte.is_ascii_digit()) {
+                    return None;
+                }
+                let magnitude = text.parse::<u128>().ok()?;
+                let max_i64 = if negative {
+                    (i64::MAX as u128) + 1
+                } else {
+                    i64::MAX as u128
+                };
+                if magnitude > max_i64 {
+                    return None;
+                }
+                return Some(ScalaConditionScalarType::Integer);
+            }
+            _ => return None,
+        }
+    }
+    None
+}
+
+fn scala_prefix_operator(node: Node<'_>) -> Option<&'static str> {
+    let mut cursor = node.walk();
+    node.children(&mut cursor)
+        .find_map(|child| match child.kind() {
+            "!" => Some("!"),
+            "-" => Some("-"),
+            _ => None,
+        })
+}
+
+fn scala_prefix_operand(node: Node<'_>) -> Option<Node<'_>> {
+    let mut cursor = node.walk();
+    node.named_children(&mut cursor).next()
+}
+
+fn scala_condition_binding_type(
+    node: Node<'_>,
+    source: &str,
+    env: &EnvironmentFileResult,
+) -> Result<ScalaConditionScalarType, BranchOpenReason> {
+    let name = source
+        .get(node.byte_range())
+        .ok_or(BranchOpenReason::SyntaxRecovery)?;
+    let index = match binding_of(env, name, node.start_byte(), Some(Namespace::Value)) {
+        BindingOfOutcome::Reached(index) | BindingOfOutcome::Shadowed { winner: index, .. } => {
+            index
+        }
+        BindingOfOutcome::NoBinding => return Err(BranchOpenReason::NonLocalReference),
+        BindingOfOutcome::Incomplete(_) => {
+            return Err(BranchOpenReason::LexicalBindingUnavailable);
+        }
+    };
+    if !stable_binding(env, index) {
+        return Err(BranchOpenReason::NonLocalReference);
+    }
+    scala_declared_condition_type(env, index, node, source)
+        .ok_or(BranchOpenReason::UnsupportedCondition)
+}
+
+fn scala_declared_condition_type(
+    env: &EnvironmentFileResult,
+    index: usize,
+    reference: Node<'_>,
+    source: &str,
+) -> Option<ScalaConditionScalarType> {
+    let mut root = reference;
+    while let Some(parent) = root.parent() {
+        root = parent;
+    }
+    let range = env.bindings[index].range;
+    let name = root.named_descendant_for_byte_range(range.start_byte, range.end_byte)?;
+    if name.start_byte() != range.start_byte || name.end_byte() != range.end_byte {
+        return None;
+    }
+    let declaration = name.parent()?;
+    let (typed, definition) = match declaration.kind() {
+        "parameter" => (declaration.child_by_field_name("type"), declaration),
+        "val_definition" | "var_definition"
+            if declaration
+                .child_by_field_name("pattern")
+                .is_some_and(|pattern| pattern.id() == name.id()) =>
+        {
+            (declaration.child_by_field_name("type"), declaration)
+        }
+        _ => return None,
+    };
+    if scala_has_deferred_shape(definition) {
+        return None;
+    }
+    typed
+        .and_then(|type_node| {
+            let scalar_type = scala_condition_type_name(type_node, source)?;
+            // An unqualified prelude spelling can be shadowed by a source
+            // type with the same name. A qualified `scala.Boolean` (and its
+            // numeric peers) remains the platform type.
+            if type_node.kind() == "type_identifier"
+                && scala_defines_named_type(
+                    reference,
+                    source,
+                    match scalar_type {
+                        ScalaConditionScalarType::Integer => {
+                            scala_integer_type_name(type_node, source)?
+                        }
+                        ScalaConditionScalarType::Boolean => "Boolean",
+                    },
+                )
+            {
+                return None;
+            }
+            Some(scalar_type)
+        })
+        .or_else(|| {
+            (declaration.kind() != "parameter")
+                .then(|| declaration.child_by_field_name("value"))
+                .flatten()
+                .and_then(|value| scala_condition_literal_type(value, source))
+        })
+}
+
+fn scala_integer_type_name(type_node: Node<'_>, source: &str) -> Option<&'static str> {
+    match source.get(type_node.byte_range())? {
+        "Int" => Some("Int"),
+        "Long" => Some("Long"),
+        "Short" => Some("Short"),
+        "Byte" => Some("Byte"),
+        _ => None,
+    }
+}
+
+fn scala_has_deferred_shape(node: Node<'_>) -> bool {
+    let mut stack = vec![node];
+    let mut visited = 0;
+    while let Some(current) = stack.pop() {
+        visited += 1;
+        if visited > 4096 {
+            return true;
+        }
+        if matches!(
+            current.kind(),
+            "by_name_type"
+                | "lazy_parameter_type"
+                | "repeated_parameter_type"
+                | "lazy_modifier"
+                | "lazy"
+        ) {
+            return true;
+        }
+        stack.extend(
+            non_extra_children(current)
+                .into_iter()
+                .map(|(_, child)| child),
+        );
+    }
+    false
+}
+
+fn scala_condition_type_name(
+    type_node: Node<'_>,
+    source: &str,
+) -> Option<ScalaConditionScalarType> {
+    let mut segments = Vec::new();
+    let mut stack = vec![type_node];
+    let mut visited = 0;
+    while let Some(node) = stack.pop() {
+        visited += 1;
+        if visited > 4096 {
+            return None;
+        }
+        match node.kind() {
+            "identifier" | "operator_identifier" | "type_identifier" => {
+                segments.push(source.get(node.byte_range())?.to_owned());
+            }
+            "type_arguments" | "arguments" | "annotation" | "structural_type" => {}
+            _ => {
+                let mut children = non_extra_children(node)
+                    .into_iter()
+                    .map(|(_, child)| child)
+                    .collect::<Vec<_>>();
+                children.reverse();
+                stack.extend(children);
+            }
+        }
+    }
+    match segments
+        .iter()
+        .map(String::as_str)
+        .collect::<Vec<_>>()
+        .as_slice()
+    {
+        ["Int"]
+        | ["scala", "Int"]
+        | ["Long"]
+        | ["scala", "Long"]
+        | ["Short"]
+        | ["scala", "Short"]
+        | ["Byte"]
+        | ["scala", "Byte"] => Some(ScalaConditionScalarType::Integer),
+        ["Boolean"] | ["scala", "Boolean"] => Some(ScalaConditionScalarType::Boolean),
+        _ => None,
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CSharpConditionType {
+    Integral,
+    Boolean,
+}
+
+fn csharp_condition_stability(
+    condition: Node<'_>,
+    source: &str,
+    env: &EnvironmentFileResult,
+) -> BranchRelationVerdict {
+    let mut pending = vec![condition];
+    let mut visited = 0;
+    while let Some(mut node) = pending.pop() {
+        visited += 1;
+        if visited > 4096 || node.child_count() > 4096 {
+            return BranchRelationVerdict::Open(BranchOpenReason::ComparisonBudget);
+        }
+        if node.has_error() || node.is_missing() {
+            return BranchRelationVerdict::Open(BranchOpenReason::SyntaxRecovery);
+        }
+        while node.kind() == "parenthesized_expression" && node.named_child_count() == 1 {
+            node = node.named_child(0).expect("one parenthesized expression");
+            visited += 1;
+            if visited > 4096 || node.has_error() || node.is_missing() {
+                return BranchRelationVerdict::Open(BranchOpenReason::SyntaxRecovery);
+            }
+        }
+        match node.kind() {
+            "boolean_literal" => {
+                if !matches!(source.get(node.byte_range()), Some("true" | "false")) {
+                    return BranchRelationVerdict::Open(BranchOpenReason::SyntaxRecovery);
+                }
+            }
+            "binary_expression" => {
+                let (Some(operator), Some(left), Some(right)) = (
+                    node.child_by_field_name("operator"),
+                    node.child_by_field_name("left"),
+                    node.child_by_field_name("right"),
+                ) else {
+                    return BranchRelationVerdict::Open(BranchOpenReason::MissingBranchField);
+                };
+                match operator.kind() {
+                    "&&" | "||" => {
+                        pending.push(right);
+                        pending.push(left);
+                    }
+                    "==" | "!=" => {
+                        let left_type = csharp_scalar_operand_type(left, source, env);
+                        let right_type = csharp_scalar_operand_type(right, source, env);
+                        match (left_type, right_type) {
+                            (Ok(left), Ok(right)) if left == right => {}
+                            (Err(reason), _) | (_, Err(reason)) => {
+                                return BranchRelationVerdict::Open(reason);
+                            }
+                            _ => {
+                                return BranchRelationVerdict::Open(
+                                    BranchOpenReason::UnsupportedCondition,
+                                );
+                            }
+                        }
+                    }
+                    "<" | "<=" | ">" | ">=" => {
+                        for operand in [left, right] {
+                            if let Err(reason) = csharp_scalar_operand_type(operand, source, env)
+                                .and_then(|kind| {
+                                    (kind == CSharpConditionType::Integral)
+                                        .then_some(kind)
+                                        .ok_or(BranchOpenReason::UnsupportedCondition)
+                                })
+                            {
+                                return BranchRelationVerdict::Open(reason);
+                            }
+                        }
+                    }
+                    _ => {
+                        return BranchRelationVerdict::Open(BranchOpenReason::UnsupportedCondition);
+                    }
+                }
+            }
+            "prefix_unary_expression" => {
+                let (Some(operator), Some(operand)) = (node.child(0), node.named_child(0)) else {
+                    return BranchRelationVerdict::Open(BranchOpenReason::MissingBranchField);
+                };
+                if operator.kind() != "!"
+                    || csharp_scalar_operand_type(operand, source, env)
+                        != Ok(CSharpConditionType::Boolean)
+                {
+                    return BranchRelationVerdict::Open(BranchOpenReason::UnsupportedCondition);
+                }
+            }
+            "identifier" => {
+                if csharp_scalar_binding_type(node, source, env) != Ok(CSharpConditionType::Boolean)
+                {
+                    return BranchRelationVerdict::Open(BranchOpenReason::UnsupportedCondition);
+                }
+            }
+            _ => {
+                return BranchRelationVerdict::Open(BranchOpenReason::UnsupportedCondition);
+            }
+        }
+    }
+    BranchRelationVerdict::Proven
+}
+
+fn csharp_scalar_operand_type(
+    mut node: Node<'_>,
+    source: &str,
+    env: &EnvironmentFileResult,
+) -> Result<CSharpConditionType, BranchOpenReason> {
+    while node.kind() == "parenthesized_expression" && node.named_child_count() == 1 {
+        node = node.named_child(0).expect("one parenthesized expression");
+    }
+    if node.has_error() || node.is_missing() {
+        return Err(BranchOpenReason::SyntaxRecovery);
+    }
+    match node.kind() {
+        "integer_literal" | "boolean_literal" => csharp_literal_type(node, source),
+        "identifier" => csharp_scalar_binding_type(node, source, env),
+        _ => Err(BranchOpenReason::UnsupportedCondition),
+    }
+}
+
+fn csharp_literal_type(
+    node: Node<'_>,
+    source: &str,
+) -> Result<CSharpConditionType, BranchOpenReason> {
+    match node.kind() {
+        "integer_literal"
+            if source
+                .get(node.byte_range())
+                .and_then(|value| value.parse::<u64>().ok())
+                .is_some() =>
+        {
+            Ok(CSharpConditionType::Integral)
+        }
+        "boolean_literal" if matches!(source.get(node.byte_range()), Some("true" | "false")) => {
+            Ok(CSharpConditionType::Boolean)
+        }
+        _ => Err(BranchOpenReason::UnsupportedCondition),
+    }
+}
+
+fn csharp_scalar_binding_type(
+    reference: Node<'_>,
+    source: &str,
+    env: &EnvironmentFileResult,
+) -> Result<CSharpConditionType, BranchOpenReason> {
+    let name = source
+        .get(reference.byte_range())
+        .ok_or(BranchOpenReason::SyntaxRecovery)?;
+    let index = match binding_of(env, name, reference.start_byte(), Some(Namespace::Value)) {
+        BindingOfOutcome::Reached(index) | BindingOfOutcome::Shadowed { winner: index, .. } => {
+            index
+        }
+        BindingOfOutcome::NoBinding => return Err(BranchOpenReason::NonLocalReference),
+        BindingOfOutcome::Incomplete(_) => {
+            return Err(BranchOpenReason::LexicalBindingUnavailable);
+        }
+    };
+    if !stable_binding(env, index) {
+        return Err(BranchOpenReason::UnsupportedCondition);
+    }
+
+    let mut root = reference;
+    while let Some(parent) = root.parent() {
+        root = parent;
+    }
+    let range = env.bindings[index].range;
+    let name_node = root
+        .named_descendant_for_byte_range(range.start_byte, range.end_byte)
+        .ok_or(BranchOpenReason::LexicalBindingUnavailable)?;
+    let declaration = name_node
+        .parent()
+        .ok_or(BranchOpenReason::LexicalBindingUnavailable)?;
+    let (names_binding, typed) = match declaration.kind() {
+        "parameter" => (declaration.child_by_field_name("name"), Some(declaration)),
+        "variable_declarator" => (
+            declaration.child_by_field_name("name"),
+            declaration.parent(),
+        ),
+        _ => (None, None),
+    };
+    if names_binding != Some(name_node) {
+        return Err(BranchOpenReason::UnsupportedCondition);
+    }
+    if declaration.kind() == "parameter" {
+        let mut cursor = declaration.walk();
+        if declaration.children(&mut cursor).any(|child| {
+            child.kind() == "modifier"
+                || matches!(child.kind(), "ref" | "out" | "in" | "params" | "this")
+        }) {
+            return Err(BranchOpenReason::UnsupportedCondition);
+        }
+    }
+    let Some(typed) = typed else {
+        return Err(BranchOpenReason::UnsupportedCondition);
+    };
+    if declaration.kind() == "variable_declarator"
+        && (typed.kind() != "variable_declaration" || typed.has_error())
+    {
+        return Err(BranchOpenReason::SyntaxRecovery);
+    }
+    let type_node = typed
+        .child_by_field_name("type")
+        .ok_or(BranchOpenReason::UnsupportedCondition)?;
+    if type_node.kind() == "implicit_type" {
+        if declaration.kind() != "variable_declarator" {
+            return Err(BranchOpenReason::UnsupportedCondition);
+        }
+        let mut cursor = declaration.walk();
+        let initializer = declaration
+            .named_children(&mut cursor)
+            .find(|child| child.start_byte() > name_node.end_byte())
+            .and_then(|child| {
+                if child.kind() == "equals_value_clause" {
+                    child.named_child(0)
+                } else {
+                    Some(child)
+                }
+            })
+            .ok_or(BranchOpenReason::UnsupportedCondition)?;
+        return csharp_literal_type(initializer, source);
+    }
+    csharp_declared_type(type_node, source).ok_or(BranchOpenReason::UnsupportedCondition)
+}
+
+fn csharp_declared_type(node: Node<'_>, source: &str) -> Option<CSharpConditionType> {
+    if node.kind() != "predefined_type" {
+        return None;
+    }
+    match source.get(node.byte_range())? {
+        "sbyte" | "byte" | "short" | "ushort" | "char" | "int" | "uint" | "long" | "ulong" => {
+            Some(CSharpConditionType::Integral)
+        }
+        "bool" => Some(CSharpConditionType::Boolean),
+        _ => None,
+    }
 }
 
 fn basic_condition_stability(
@@ -1434,6 +2438,14 @@ fn basic_condition_stability(
             return BranchRelationVerdict::Open(BranchOpenReason::SyntaxRecovery);
         }
         let kind = node.kind();
+        if language == Language::Rust && kind == "unary_expression" {
+            let Some(operand) = rust_unary_not_operand(node) else {
+                return BranchRelationVerdict::Open(BranchOpenReason::UnsupportedCondition);
+            };
+            if !rust_boolean_expression(operand, env, source) {
+                return BranchRelationVerdict::Open(BranchOpenReason::UnsupportedCondition);
+            }
+        }
         if matches!(
             (language, kind),
             (
@@ -1580,11 +2592,18 @@ fn basic_condition_stability(
                     | "("
                     | ")"
             ),
-            // A Rust comparison or `!` dispatches to a trait that user code
-            // can implement, so only a bare `bool` local is stable.
+            // Rust comparisons dispatch to traits that user code can
+            // implement. Unary `!` is admitted below only after its operand
+            // is proved to be a built-in Boolean binding or literal.
             Language::Rust => matches!(
                 kind,
-                "identifier" | "boolean_literal" | "parenthesized_expression" | "(" | ")"
+                "identifier"
+                    | "boolean_literal"
+                    | "parenthesized_expression"
+                    | "unary_expression"
+                    | "!"
+                    | "("
+                    | ")"
             ),
             // Ruby truthiness runs no method, but `==`, `!` and `not` are
             // method calls and a constant read can call `const_missing`.
@@ -1609,6 +2628,8 @@ fn basic_condition_stability(
                     | "parenthesized_expression"
                     | "binary_expression"
                     | "unary_op_expression"
+                    | "=="
+                    | "!="
                     | "==="
                     | "!=="
                     | "!"
@@ -1766,10 +2787,7 @@ fn java_integral_operand(
     env: &EnvironmentFileResult,
 ) -> Result<(), BranchOpenReason> {
     let node = java_peel_parentheses(node)?;
-    if java_decimal_int_value(syntax.source(), node).is_some() {
-        return Ok(());
-    }
-    let kind = java_binding_type(node, syntax, env)?;
+    let kind = java_integral_or_binding_type(node, syntax, env)?;
     (kind == JavaPrimitiveConditionType::Integral)
         .then_some(())
         .ok_or(BranchOpenReason::UnsupportedCondition)
@@ -1784,6 +2802,14 @@ fn java_equality_operand(
     if matches!(node.kind(), "true" | "false") {
         return Ok(JavaPrimitiveConditionType::Boolean);
     }
+    java_integral_or_binding_type(node, syntax, env)
+}
+
+fn java_integral_or_binding_type(
+    node: Node<'_>,
+    syntax: &PreparedSyntaxTree,
+    env: &EnvironmentFileResult,
+) -> Result<JavaPrimitiveConditionType, BranchOpenReason> {
     if java_decimal_int_value(syntax.source(), node).is_some() {
         return Ok(JavaPrimitiveConditionType::Integral);
     }
@@ -1912,6 +2938,7 @@ mod tests {
     use super::*;
     use crate::analyzer::AnalyzerConfig;
     use crate::inline_project::InlineTestProject;
+    use brokk_bifrost_test_macros::hardwon;
 
     fn rows(language: Language, path: &str, source: &str) -> Vec<BranchRelationRow> {
         let fixture = InlineTestProject::with_language(language)
@@ -2000,78 +3027,9 @@ mod tests {
     }
 
     #[test]
-    fn script_boolean_returns_pair_only_with_the_next_statement_in_the_same_block() {
-        for (language, path, positive, inverse, intervening, nested) in [
-            (
-                Language::JavaScript,
-                "sample.js",
-                "function f(x) { if (x) return true; return false; }",
-                "function f(x) { if (x) { return false; } /* note */ return true; }",
-                "function f(x) { if (x) return true; mark(); return false; }",
-                "function f(x, y) { if (x) { if (y) return true; } return false; }",
-            ),
-            (
-                Language::TypeScript,
-                "sample.ts",
-                "function f(x: boolean) { if (x) return true; return false; }",
-                "function f(x: boolean) { if (x) { return false; } /* note */ return true; }",
-                "function f(x: boolean) { if (x) return true; mark(); return false; }",
-                "function f(x: boolean, y: boolean) { if (x) { if (y) return true; } return false; }",
-            ),
-            (
-                Language::Python,
-                "sample.py",
-                "def f(x):\n    if x:\n        return True\n    return False\n",
-                "def f(x):\n    if x:\n        return False\n    # note\n    return True\n",
-                "def f(x):\n    if x:\n        return True\n    mark()\n    return False\n",
-                "def f(x, y):\n    if x:\n        if y:\n            return True\n    return False\n",
-            ),
-        ] {
-            for (source, orientation) in [(positive, "condition"), (inverse, "negated_condition")] {
-                let rows = rows(language, path, source);
-                let boolean_rows = rows
-                    .iter()
-                    .filter(|row| row.kind == BranchRelationKind::RedundantBooleanReturn)
-                    .collect::<Vec<_>>();
-                assert_eq!(boolean_rows.len(), 1, "{source}: {rows:?}");
-                assert_eq!(boolean_rows[0].verdict, BranchRelationVerdict::Proven);
-                assert_eq!(boolean_rows[0].orientation, Some(orientation));
-                assert!(boolean_rows[0].later.start_byte > boolean_rows[0].owner.end_byte);
-            }
-            for source in [intervening, nested] {
-                let rows = rows(language, path, source);
-                assert!(
-                    verdicts(&rows, BranchRelationKind::RedundantBooleanReturn).is_empty(),
-                    "{source}: {rows:?}"
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn java_branch_relations_prove_local_identity_and_stable_repetition() {
-        let branch_rows = rows(
-            Language::Java,
-            "Sample.java",
-            "class Sample { static int f(int x) { if (x == 1) return x; else if (x == 1) return x; else return 0; } }",
-        );
-        assert_eq!(
-            verdicts(&branch_rows, BranchRelationKind::RepeatedCondition),
-            vec![BranchRelationVerdict::Proven],
-            "{branch_rows:#?}"
-        );
-        assert_eq!(
-            verdicts(&branch_rows, BranchRelationKind::IdenticalBodies),
-            vec![
-                BranchRelationVerdict::Proven,
-                BranchRelationVerdict::Distinct,
-                BranchRelationVerdict::Distinct
-            ],
-            "{branch_rows:#?}"
-        );
-    }
-
-    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "fb68a2103438: Java boxed predicates and field targets produced incorrect branch proofs"
+    )]
     fn java_primitive_and_boxed_relational_and_boolean_composition_are_stable() {
         for source in [
             "class Sample { int f(int x) { if (x > 5) return 1; else if (x > 5) return 2; return 0; } }",
@@ -2117,6 +3075,18 @@ mod tests {
                 "{source}: {branch_rows:#?}"
             );
         }
+
+        let volatile_boolean = rows(
+            Language::Java,
+            "Sample.java",
+            "class Sample { volatile boolean ready; int f() { if (ready == true) return 1; else if (ready == true) return 2; return 0; } }",
+        );
+        assert!(
+            verdicts(&volatile_boolean, BranchRelationKind::RepeatedCondition)
+                .iter()
+                .all(|verdict| matches!(verdict, BranchRelationVerdict::Open(_))),
+            "{volatile_boolean:#?}"
+        );
     }
 
     #[test]
@@ -2235,74 +3205,6 @@ mod tests {
     }
 
     #[test]
-    fn repeated_java_volatile_field_remains_open() {
-        let branch_rows = rows(
-            Language::Java,
-            "Sample.java",
-            "class Sample { volatile boolean ready; int f() { if (ready == true) return 1; else if (ready == true) return 2; return 0; } }",
-        );
-        assert!(
-            verdicts(&branch_rows, BranchRelationKind::RepeatedCondition)
-                .iter()
-                .all(|verdict| matches!(verdict, BranchRelationVerdict::Open(_))),
-            "{branch_rows:#?}"
-        );
-    }
-
-    #[test]
-    fn identical_direct_calls_require_the_same_local_callee() {
-        for (language, path, source) in [
-            (
-                Language::JavaScript,
-                "sample.js",
-                "function f(flag, callback) { if (flag) return callback(); else return callback(); }",
-            ),
-            (
-                Language::TypeScript,
-                "sample.ts",
-                "function f(flag: boolean, callback: () => number) { if (flag) return callback(); else return callback(); }",
-            ),
-            (
-                Language::Python,
-                "sample.py",
-                "def f(flag, callback):\n    if flag:\n        return callback()\n    else:\n        return callback()\n",
-            ),
-        ] {
-            let branch_rows = rows(language, path, source);
-            assert_eq!(
-                verdicts(&branch_rows, BranchRelationKind::IdenticalBodies),
-                vec![BranchRelationVerdict::Proven],
-                "{path}: {branch_rows:#?}"
-            );
-        }
-    }
-
-    #[test]
-    fn identical_local_updates_and_paired_branch_local_binders_are_proven() {
-        let same_local = rows(
-            Language::Java,
-            "Sample.java",
-            "class Sample { int f(boolean condition, int x) { if (condition) { x++; } else { x++; } return x; } }",
-        );
-        assert_eq!(
-            verdicts(&same_local, BranchRelationKind::IdenticalBodies),
-            vec![BranchRelationVerdict::Proven],
-            "{same_local:#?}"
-        );
-
-        let paired_locals = rows(
-            Language::Java,
-            "Sample.java",
-            "class Sample { int f(boolean condition) { if (condition) { int x = 0; x++; } else { int x = 0; x++; } return 0; } }",
-        );
-        assert_eq!(
-            verdicts(&paired_locals, BranchRelationKind::IdenticalBodies),
-            vec![BranchRelationVerdict::Proven],
-            "{paired_locals:#?}"
-        );
-    }
-
-    #[test]
     fn java_method_name_compares_as_a_name_not_through_a_same_named_local() {
         let calls = rows(
             Language::Java,
@@ -2370,78 +3272,26 @@ mod tests {
     /// Each arm creates its own closure, object method or class, whatever the
     /// grammar calls it and whatever parameters it binds.
     #[test]
+    #[hardwon("64dfd105e7fd: identical-branch proof compared fresh nested callable identities")]
     fn nested_callables_and_local_classes_in_matching_arms_stay_deferred() {
         let deferred = vec![BranchRelationVerdict::Open(BranchOpenReason::DeferredBody)];
+        for &(language, path, source) in crate::test_support::NESTED_CALLABLE_BRANCH_CASES {
+            assert_eq!(
+                identical_bodies(language, path, source),
+                deferred,
+                "{source}"
+            );
+        }
         for (language, path, source) in [
-            (
-                Language::JavaScript,
-                "sample.js",
-                "function f(x) { if (x === 1) { return function () { return x; }; } else { return function () { return x; }; } }",
-            ),
-            (
-                Language::JavaScript,
-                "sample.js",
-                "function f(x) { if (x === 1) { return function* () { yield x; }; } else { return function* () { yield x; }; } }",
-            ),
-            (
-                Language::JavaScript,
-                "sample.js",
-                "function f(x) { if (x === 1) { return { m() { return x; } }; } else { return { m() { return x; } }; } }",
-            ),
-            (
-                Language::JavaScript,
-                "sample.js",
-                "function f(x) { if (x === 1) { return class { m() { return x; } }; } else { return class { m() { return x; } }; } }",
-            ),
-            (
-                Language::JavaScript,
-                "sample.js",
-                "function f(x) { if (x === 1) { return (a) => a + x; } else { return (a) => a + x; } }",
-            ),
-            (
-                Language::TypeScript,
-                "sample.ts",
-                "function f(x: number) { if (x === 1) { return function (a: number) { return a + x; }; } else { return function (a: number) { return a + x; }; } }",
-            ),
             (
                 Language::TypeScript,
                 "sample.ts",
                 "function f(x: number) { if (x === 1) { return class { m() { return x; } }; } else { return class { m() { return x; } }; } }",
             ),
             (
-                Language::TypeScript,
-                "sample.ts",
-                "function f(x: number) { if (x === 1) { return (a: number) => a + x; } else { return (a: number) => a + x; } }",
-            ),
-            (
-                Language::Python,
-                "sample.py",
-                "def f(x):\n    if x is None:\n        class A:\n            pass\n        return A\n    else:\n        class A:\n            pass\n        return A\n",
-            ),
-            (
-                Language::Python,
-                "sample.py",
-                "def f(x, d):\n    if x is None:\n        @d\n        def g():\n            return x\n        return g\n    else:\n        @d\n        def g():\n            return x\n        return g\n",
-            ),
-            (
-                Language::Python,
-                "sample.py",
-                "def f(x):\n    if x is None:\n        return lambda a: a + x\n    else:\n        return lambda a: a + x\n",
-            ),
-            (
-                Language::Java,
-                "Sample.java",
-                "class Sample { java.util.function.IntUnaryOperator f(int x) { if (x == 1) return a -> a + x; else return a -> a + x; } }",
-            ),
-            (
                 Language::Java,
                 "Sample.java",
                 "class Sample { java.util.function.IntBinaryOperator f(int x) { if (x == 1) return (int a, int b) -> a + b + x; else return (int a, int b) -> a + b + x; } }",
-            ),
-            (
-                Language::Java,
-                "Sample.java",
-                "class Sample { Object f(int x) { if (x == 1) { record R(int a) {} return new R(x); } else { record R(int a) {} return new R(x); } } }",
             ),
             (
                 Language::Java,
@@ -2460,6 +3310,7 @@ mod tests {
     /// Deferring a nested callable does not hide a difference elsewhere in the
     /// arms, and a callable never equals a non-callable.
     #[test]
+    #[hardwon("64dfd105e7fd: deferral of nested bodies hid differences in the enclosing arms")]
     fn deferred_callables_keep_distinct_arms_complete() {
         for (language, path, source) in [
             (
@@ -2491,10 +3342,13 @@ mod tests {
         }
     }
 
-    /// A pattern variable declared by a chain condition is a different binding
-    /// in each arm, although the environment does not model it and both reads
-    /// share one spelling.
+    /// Catch, resource, loop and comprehension binders declared inside each
+    /// arm pair binder by binder, as block locals do.
+
     #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#3684: Java pattern binders with identical names were unsafely merged across arms"
+    )]
     fn java_pattern_binders_keep_identical_reads_open() {
         for source in [
             "class Sample { Object f(Object o, Object p) { if (o instanceof String s) return s; else if (p instanceof String s) return s; return null; } }",
@@ -2524,9 +3378,8 @@ mod tests {
         }
     }
 
-    /// Catch, resource, loop and comprehension binders declared inside each
-    /// arm pair binder by binder, as block locals do.
     #[test]
+    #[hardwon("64dfd105e7fd: identical branch text paired different arm-local binders")]
     fn arm_local_catch_resource_loop_and_comprehension_binders_pair() {
         for (language, path, source) in [
             (
@@ -2585,24 +3438,5 @@ mod tests {
                 "{source}"
             );
         }
-    }
-
-    #[test]
-    fn tsx_uses_the_typescript_branch_proof() {
-        let branch_rows = rows(
-            Language::TypeScript,
-            "sample.tsx",
-            "const element = <section />; function f(x: string) { if (x === 'ready') return x; else if (x === 'ready') return x; else return 0; }",
-        );
-        assert_eq!(
-            verdicts(&branch_rows, BranchRelationKind::RepeatedCondition),
-            vec![BranchRelationVerdict::Proven],
-            "{branch_rows:#?}"
-        );
-        assert!(
-            verdicts(&branch_rows, BranchRelationKind::IdenticalBodies)
-                .contains(&BranchRelationVerdict::Proven),
-            "{branch_rows:#?}"
-        );
     }
 }

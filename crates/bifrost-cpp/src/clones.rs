@@ -5,6 +5,10 @@
 //! the ~12-LOC entry point; everything that knows C++ is here.
 
 use brokk_bifrost_core::analyzer::tree_walk::push_children_reversed;
+use brokk_bifrost_core::clones::{
+    CloneNormalizationRules, normalize_clone_ast_label as normalize_cpp_clone_ast_label,
+    normalize_clone_leaf_token as normalize_cpp_clone_leaf_token,
+};
 use tree_sitter::{Node, Parser};
 
 const CPP_CLONE_AST_IDENTIFIER_TYPES: &[&str] = &[
@@ -15,6 +19,17 @@ const CPP_CLONE_AST_IDENTIFIER_TYPES: &[&str] = &[
 ];
 const CPP_CLONE_AST_STRING_TYPES: &[&str] = &["string_literal", "raw_string_literal"];
 const CPP_CLONE_AST_NUMBER_TYPES: &[&str] = &["number_literal"];
+const CPP_CLONE_NORMALIZATION_RULES: CloneNormalizationRules = CloneNormalizationRules {
+    identifier_kinds: CPP_CLONE_AST_IDENTIFIER_TYPES,
+    string_kinds: CPP_CLONE_AST_STRING_TYPES,
+    number_kinds: CPP_CLONE_AST_NUMBER_TYPES,
+    boolean_kinds: &[],
+    boolean_values: &["true", "false"],
+    null_kinds: &[],
+    null_values: &[],
+    comment_kinds: &["comment"],
+    ignored_ast_kinds: &[],
+};
 
 pub fn cpp_clone_parser() -> Parser {
     let mut parser = Parser::new();
@@ -22,33 +37,6 @@ pub fn cpp_clone_parser() -> Parser {
         .set_language(&tree_sitter_cpp::LANGUAGE.into())
         .expect("failed to load cpp parser");
     parser
-}
-
-fn normalize_cpp_clone_leaf_token(node: Node<'_>, source: &str) -> String {
-    let kind = node.kind();
-    let token = source
-        .get(node.start_byte()..node.end_byte())
-        .unwrap_or("")
-        .trim();
-    if token.is_empty() || kind == "comment" {
-        return String::new();
-    }
-    if CPP_CLONE_AST_IDENTIFIER_TYPES.contains(&kind) {
-        return "ID".to_string();
-    }
-    if CPP_CLONE_AST_STRING_TYPES.contains(&kind) {
-        return "STR".to_string();
-    }
-    if CPP_CLONE_AST_NUMBER_TYPES.contains(&kind) {
-        return "NUM".to_string();
-    }
-    if matches!(token, "true" | "false") {
-        return "BOOL".to_string();
-    }
-    if token.chars().count() == 1 && token.chars().all(|ch| !ch.is_alphanumeric()) {
-        return format!("OP:{token}");
-    }
-    format!("T:{kind}")
 }
 
 /// The normalized token stream and the joined AST-label signature for one C++
@@ -64,9 +52,13 @@ pub fn cpp_clone_profile(parser: &mut Parser, source: &str) -> (Vec<String>, Str
         if cpp_is_ignorable_clone_logging_node(node, source) {
             continue;
         }
-        ast_labels.push(normalize_cpp_clone_ast_label(node, source));
+        ast_labels.push(normalize_cpp_clone_ast_label(
+            node,
+            source,
+            CPP_CLONE_NORMALIZATION_RULES,
+        ));
         if node.named_child_count() == 0 {
-            let token = normalize_cpp_clone_leaf_token(node, source);
+            let token = normalize_cpp_clone_leaf_token(node, source, CPP_CLONE_NORMALIZATION_RULES);
             if !token.is_empty() {
                 normalized_tokens.push(token);
             }
@@ -74,27 +66,6 @@ pub fn cpp_clone_profile(parser: &mut Parser, source: &str) -> (Vec<String>, Str
         push_children_reversed(node, &mut stack);
     }
     (normalized_tokens, ast_labels.join("|"))
-}
-
-fn normalize_cpp_clone_ast_label(node: Node<'_>, source: &str) -> String {
-    let kind = node.kind();
-    let text = source
-        .get(node.start_byte()..node.end_byte())
-        .unwrap_or("")
-        .trim();
-    if CPP_CLONE_AST_IDENTIFIER_TYPES.contains(&kind) {
-        return "ID".to_string();
-    }
-    if CPP_CLONE_AST_STRING_TYPES.contains(&kind) {
-        return "STR".to_string();
-    }
-    if CPP_CLONE_AST_NUMBER_TYPES.contains(&kind) {
-        return "NUM".to_string();
-    }
-    if matches!(text, "true" | "false") {
-        return "BOOL".to_string();
-    }
-    format!("N:{kind}")
 }
 
 fn cpp_is_ignorable_clone_logging_node(node: Node<'_>, source: &str) -> bool {

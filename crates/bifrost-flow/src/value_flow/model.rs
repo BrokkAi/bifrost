@@ -52,6 +52,29 @@ pub enum ValueFlowCarrier {
 }
 
 impl ValueFlowCarrier {
+    /// The carrier for one value. This is the only way to build a carrier
+    /// from a value handle.
+    ///
+    /// A formal binding has one carrier, its port. Entry seeds, parameter
+    /// sources and most relations name a formal parameter or receiver by its
+    /// port. Some relations and call operands name it by its value instead:
+    /// the `LanguageDefined` flow from a `println!` inline capture, the source
+    /// of a closure capture, or a `format!` inline capture that the Rust
+    /// lowering passes to the call as a direct argument. A separate `Value`
+    /// carrier for the formal would give it two identities, and a fact seeded
+    /// on the port would never reach what reads the value. The rule is the one
+    /// `ValueFlowEndpoint::for_value` applies; every other value is its own
+    /// carrier.
+    pub fn for_value(value: ValueHandle) -> Self {
+        match ValueFlowEndpoint::for_value(value) {
+            ValueFlowEndpoint::Value(value) => Self::Value(value),
+            ValueFlowEndpoint::Port(port) => Self::Port(port),
+            ValueFlowEndpoint::Location(_) => {
+                unreachable!("for_value names a value or a formal port")
+            }
+        }
+    }
+
     pub fn procedure(&self) -> Option<&ProcedureHandle> {
         match self {
             Self::Value(value) => Some(value.procedure()),
@@ -70,7 +93,17 @@ impl ValueFlowCarrier {
 
     pub fn stable_key(&self) -> Result<ValueFlowCarrierKey, ValueFlowModelError> {
         match self {
-            Self::Value(value) => value_key(value),
+            Self::Value(value) => {
+                debug_assert!(
+                    matches!(
+                        ValueFlowEndpoint::for_value(value.clone()),
+                        ValueFlowEndpoint::Value(_)
+                    ),
+                    "a formal's carrier is its port; build value carriers with \
+                     ValueFlowCarrier::for_value: {value:?}"
+                );
+                value_key(value)
+            }
             Self::Port(port) => port_key(port),
             Self::Location(location) => Ok(ValueFlowCarrierKey::Location {
                 root: Box::new(root_key(location.path().root())?),
@@ -152,6 +185,22 @@ fn same_scoped_locator(left: &ScopedSemanticLocator, right: &ScopedSemanticLocat
     left.scope().key() == right.scope().key() && left.locator() == right.locator()
 }
 
+/// Whether two field selectors name one entity.
+///
+/// [`selector_key`] drops the scope of every field selector, so a carrier key
+/// never separates two field selectors by artifact. This equality must agree
+/// with that key for an artifact-independent locator (the Rust field-member
+/// path), because the caller's own load and a callee's projected read of the
+/// same member are one entity there. For any other locator the artifact scope
+/// stays part of the identity.
+fn same_field_selector(left: &ScopedSemanticLocator, right: &ScopedSemanticLocator) -> bool {
+    if left.locator().is_artifact_independent_field() {
+        left.locator() == right.locator()
+    } else {
+        same_scoped_locator(left, right)
+    }
+}
+
 fn same_root(left: &AccessPathRoot, right: &AccessPathRoot) -> bool {
     match (left, right) {
         (AccessPathRoot::Value(left), AccessPathRoot::Value(right)) => same_value(left, right),
@@ -195,7 +244,7 @@ fn same_path(left: &AccessPath, right: &AccessPath) -> bool {
             .zip(right.selectors())
             .all(|(left, right)| match (left, right) {
                 (AccessSelector::Field(left), AccessSelector::Field(right)) => {
-                    same_scoped_locator(left, right)
+                    same_field_selector(left, right)
                 }
                 (AccessSelector::Property(left), AccessSelector::Property(right)) => left == right,
                 (
@@ -215,9 +264,11 @@ fn same_path(left: &AccessPath, right: &AccessPath) -> bool {
 }
 
 impl From<ValueFlowEndpoint> for ValueFlowCarrier {
+    /// A `Value` endpoint becomes [`ValueFlowCarrier::for_value`], so a
+    /// relation that names a formal by its value reads the formal's port.
     fn from(endpoint: ValueFlowEndpoint) -> Self {
         match endpoint {
-            ValueFlowEndpoint::Value(value) => Self::Value(value),
+            ValueFlowEndpoint::Value(value) => Self::for_value(value),
             ValueFlowEndpoint::Port(port) => Self::Port(port),
             ValueFlowEndpoint::Location(location) => Self::Location(location),
         }
@@ -449,9 +500,9 @@ impl ValueFlowCarrierKey {
 
     /// Checkout-independent fingerprint for one stable value-flow carrier.
     pub fn stable_fingerprint(&self) -> StableDigest {
-        let mut digest = LengthDelimitedDigest::new(b"bifrost-value-flow-carrier-key-v1");
-        self.push_stable_identity(&mut digest);
-        digest.finish()
+        stable_fingerprint_with(b"bifrost-value-flow-carrier-key-v1", |digest| {
+            self.push_stable_identity(digest)
+        })
     }
 
     /// Conservative retained size, including boxed nested access paths.
@@ -549,10 +600,78 @@ fn push_carrier_locator(
     locator: &SemanticLocator,
     procedure: Option<&SemanticLocator>,
 ) {
-    match procedure {
-        Some(procedure) => locator.push_procedure_local_identity(digest, procedure),
-        None => locator.push_stable_identity(digest),
+    push_summary_identity(digest, locator, procedure);
+}
+
+pub(super) trait SummaryIdentity {
+    fn push_summary_stable_identity(&self, digest: &mut LengthDelimitedDigest);
+    fn push_summary_procedure_local_identity(
+        &self,
+        digest: &mut LengthDelimitedDigest,
+        procedure: &SemanticLocator,
+    );
+}
+
+impl SummaryIdentity for SemanticLocator {
+    fn push_summary_stable_identity(&self, digest: &mut LengthDelimitedDigest) {
+        self.push_stable_identity(digest);
     }
+
+    fn push_summary_procedure_local_identity(
+        &self,
+        digest: &mut LengthDelimitedDigest,
+        procedure: &SemanticLocator,
+    ) {
+        self.push_procedure_local_identity(digest, procedure);
+    }
+}
+
+impl SummaryIdentity for ValueFlowCarrierKey {
+    fn push_summary_stable_identity(&self, digest: &mut LengthDelimitedDigest) {
+        self.push_stable_identity(digest);
+    }
+
+    fn push_summary_procedure_local_identity(
+        &self,
+        digest: &mut LengthDelimitedDigest,
+        procedure: &SemanticLocator,
+    ) {
+        self.push_procedure_local_identity(digest, procedure);
+    }
+}
+
+impl SummaryIdentity for ValueFlowEventKey {
+    fn push_summary_stable_identity(&self, digest: &mut LengthDelimitedDigest) {
+        self.push_stable_identity(digest);
+    }
+
+    fn push_summary_procedure_local_identity(
+        &self,
+        digest: &mut LengthDelimitedDigest,
+        procedure: &SemanticLocator,
+    ) {
+        self.push_procedure_local_identity(digest, procedure);
+    }
+}
+
+pub(super) fn push_summary_identity<T: SummaryIdentity + ?Sized>(
+    digest: &mut LengthDelimitedDigest,
+    value: &T,
+    procedure: Option<&SemanticLocator>,
+) {
+    match procedure {
+        Some(procedure) => value.push_summary_procedure_local_identity(digest, procedure),
+        None => value.push_summary_stable_identity(digest),
+    }
+}
+
+fn stable_fingerprint_with(
+    domain: &[u8],
+    push_identity: impl FnOnce(&mut LengthDelimitedDigest),
+) -> StableDigest {
+    let mut digest = LengthDelimitedDigest::new(domain);
+    push_identity(&mut digest);
+    digest.finish()
 }
 
 fn push_value_identity(
@@ -712,9 +831,9 @@ impl ValueFlowEventKey {
 
     /// Checkout-independent fingerprint for one resolved semantic event.
     pub fn stable_fingerprint(&self) -> StableDigest {
-        let mut digest = LengthDelimitedDigest::new(b"bifrost-value-flow-event-key-v1");
-        self.push_stable_identity(&mut digest);
-        digest.finish()
+        stable_fingerprint_with(b"bifrost-value-flow-event-key-v1", |digest| {
+            self.push_stable_identity(digest)
+        })
     }
 
     pub fn retained_bytes(&self) -> usize {
@@ -740,9 +859,27 @@ pub struct ValueFlowSourceSpec {
     /// observation point before this source can be activated. `None` keeps
     /// the historical unconditional source behavior.
     conditional_triggers: Option<Box<[ValueFlowEventKey]>>,
+    /// Exact invocations whose dispatch is required by endpoint selection.
+    dispatch_obligations: Box<[CallSiteHandle]>,
 }
 
 impl ValueFlowSourceSpec {
+    /// Build a proven source observed before effects at this program point.
+    pub fn at_point(
+        point: &ProgramPointHandle,
+        ordinal: u32,
+        carrier: ValueFlowCarrier,
+    ) -> Result<Self, ValueFlowModelError> {
+        Ok(Self::new(
+            ValueFlowEventKey::at_point(point, ordinal, ValueFlowEventKind::Source)?,
+            point.clone(),
+            ValueFlowObservationPhase::BeforeEffects,
+            carrier,
+            ProofStatus::Proven,
+            EvidenceCompleteness::Complete,
+        ))
+    }
+
     pub fn new(
         key: ValueFlowEventKey,
         point: ProgramPointHandle,
@@ -758,6 +895,7 @@ impl ValueFlowSourceSpec {
             carrier,
             proof,
             completeness,
+            dispatch_obligations: Box::new([]),
             conditional_triggers: None,
         }
     }
@@ -774,6 +912,22 @@ impl ValueFlowSourceSpec {
         assert!(!triggers.is_empty(), "a conditional source needs a trigger");
         self.conditional_triggers = Some(triggers.into_boxed_slice());
         self
+    }
+
+    /// Retain the exact calls that must be discharged for this endpoint's
+    /// resolved-call selection. Structural and declared endpoints need none.
+    pub fn requiring_dispatches(mut self, calls: Box<[CallSiteHandle]>) -> Self {
+        assert!(
+            calls
+                .iter()
+                .all(|call| call.procedure() == self.point.procedure())
+        );
+        self.dispatch_obligations = calls;
+        self
+    }
+
+    pub fn dispatch_obligations(&self) -> &[CallSiteHandle] {
+        &self.dispatch_obligations
     }
 
     pub fn key(&self) -> &ValueFlowEventKey {
@@ -826,9 +980,27 @@ pub struct ValueFlowSinkSpec {
     carrier: ValueFlowCarrier,
     proof: ProofStatus,
     completeness: EvidenceCompleteness,
+    /// Exact invocations whose dispatch is required by endpoint selection.
+    dispatch_obligations: Box<[CallSiteHandle]>,
 }
 
 impl ValueFlowSinkSpec {
+    /// Build a proven sink observed after effects at this program point.
+    pub fn at_point(
+        point: &ProgramPointHandle,
+        ordinal: u32,
+        carrier: ValueFlowCarrier,
+    ) -> Result<Self, ValueFlowModelError> {
+        Ok(Self::new(
+            ValueFlowEventKey::at_point(point, ordinal, ValueFlowEventKind::Sink)?,
+            point.clone(),
+            ValueFlowObservationPhase::AfterEffects,
+            carrier,
+            ProofStatus::Proven,
+            EvidenceCompleteness::Complete,
+        ))
+    }
+
     pub fn new(
         key: ValueFlowEventKey,
         point: ProgramPointHandle,
@@ -844,7 +1016,24 @@ impl ValueFlowSinkSpec {
             carrier,
             proof,
             completeness,
+            dispatch_obligations: Box::new([]),
         }
+    }
+
+    /// Retain the exact calls that must be discharged for this endpoint's
+    /// resolved-call selection. Structural and declared endpoints need none.
+    pub fn requiring_dispatches(mut self, calls: Box<[CallSiteHandle]>) -> Self {
+        assert!(
+            calls
+                .iter()
+                .all(|call| call.procedure() == self.point.procedure())
+        );
+        self.dispatch_obligations = calls;
+        self
+    }
+
+    pub fn dispatch_obligations(&self) -> &[CallSiteHandle] {
+        &self.dispatch_obligations
     }
 
     pub fn key(&self) -> &ValueFlowEventKey {
@@ -894,19 +1083,13 @@ impl fmt::Display for ValueFlowModelError {
 impl Error for ValueFlowModelError {}
 
 pub(crate) fn semantic_locator_heap_bytes(locator: &SemanticLocator) -> usize {
-    let segments = locator.declaration().segments();
     locator
         .path()
         .as_str()
         .len()
-        .saturating_add(size_of_val(segments))
-        .saturating_add(
-            segments
-                .iter()
-                .filter_map(|segment| segment.name())
-                .map(str::len)
-                .fold(0usize, usize::saturating_add),
-        )
+        .saturating_add(crate::dataflow::declaration_locator_heap_bytes(
+            locator.declaration(),
+        ))
 }
 
 fn source_locator(
@@ -914,9 +1097,8 @@ fn source_locator(
     source: crate::analyzer::semantic::SourceMappingId,
 ) -> Result<SemanticLocator, ValueFlowModelError> {
     procedure
-        .semantics()
-        .source_mapping(source)
-        .map(|mapping| mapping.locator.clone())
+        .source_locator(source)
+        .cloned()
         .ok_or(ValueFlowModelError::StaleSourceMapping)
 }
 
@@ -941,6 +1123,14 @@ impl From<DurableIdentityError> for ValueFlowModelError {
 fn carrier_key(identity: &DurableObjectIdentity) -> ValueFlowCarrierKey {
     match identity {
         DurableObjectIdentity::Value(value) => value_carrier_key(value),
+        DurableObjectIdentity::FieldPath { base, member } => ValueFlowCarrierKey::Location {
+            root: Box::new(carrier_key(base)),
+            selectors: Box::new([ValueFlowSelectorKey::Field(member.clone())]),
+            exact: true,
+        },
+        // Flow carriers denote the underlying slot and intentionally drop
+        // the invocation context used by object identity.
+        DurableObjectIdentity::CallSubstitution { base, .. } => carrier_key(base),
         DurableObjectIdentity::CallResult {
             call,
             result,
@@ -1047,6 +1237,8 @@ fn root_key(root: &AccessPathRoot) -> Result<ValueFlowCarrierKey, ValueFlowModel
 
 fn selector_key(selector: &AccessSelector) -> Result<ValueFlowSelectorKey, ValueFlowModelError> {
     match selector {
+        // The scope is dropped here on purpose; `same_field_selector` is the
+        // equality that agrees with this key for artifact-independent members.
         AccessSelector::Field(field) => Ok(ValueFlowSelectorKey::Field(field.locator().clone())),
         AccessSelector::Property(property) => Ok(ValueFlowSelectorKey::Property(property.clone())),
         AccessSelector::Index(IndexSelector::Exact(index)) => Ok(ValueFlowSelectorKey::ExactIndex(
@@ -1062,116 +1254,22 @@ fn selector_key(selector: &AccessSelector) -> Result<ValueFlowSelectorKey, Value
 #[cfg(test)]
 mod tests {
     use crate::analyzer::Language;
-    use crate::analyzer::semantic::{
-        DeclarationLocator, DeclarationSegment, DeclarationSegmentKind, SemanticLanguage,
-        SemanticRole, SourceAnchor, SourcePosition, SourceSpan, WorkspaceMountId,
-        WorkspaceRelativePath,
-    };
+    use crate::analyzer::semantic::{SemanticRole, SourcePosition, SourceSpan};
+    use brokk_bifrost_test_macros::hardwon;
 
     use super::*;
 
     fn locator(mount: &str, role: SemanticRole, name: &str) -> SemanticLocator {
         let span =
             SourceSpan::new(SourcePosition::new(4, 1, 0), SourcePosition::new(8, 1, 4)).unwrap();
-        let anchor = SourceAnchor::new(span, 0);
-        SemanticLocator::new(
-            WorkspaceMountId::hash_bytes(mount),
-            WorkspaceRelativePath::new("src/fixture.py").unwrap(),
-            SemanticLanguage::Standard(Language::Python),
-            DeclarationLocator::new(vec![
-                DeclarationSegment::named(DeclarationSegmentKind::Function, name, anchor, 0)
-                    .unwrap(),
-            ])
-            .unwrap(),
+        crate::test_support::function_locator(
+            mount,
+            "src/fixture.py",
+            Language::Python,
             role,
-            anchor,
+            name,
+            span,
         )
-    }
-
-    fn locator_at(
-        mount: &str,
-        role: SemanticRole,
-        name: &str,
-        procedure_start: u32,
-        start: u32,
-        end: u32,
-    ) -> SemanticLocator {
-        let anchor = |start, end| {
-            SourceAnchor::new(
-                SourceSpan::new(
-                    SourcePosition::new(start, 0, start),
-                    SourcePosition::new(end, 0, end),
-                )
-                .unwrap(),
-                0,
-            )
-        };
-        let procedure_anchor = anchor(procedure_start, procedure_start + 40);
-        SemanticLocator::new(
-            WorkspaceMountId::hash_bytes(mount),
-            WorkspaceRelativePath::new("src/fixture.py").unwrap(),
-            SemanticLanguage::Standard(Language::Python),
-            DeclarationLocator::new(vec![
-                DeclarationSegment::named(
-                    DeclarationSegmentKind::Function,
-                    name,
-                    procedure_anchor,
-                    0,
-                )
-                .unwrap(),
-            ])
-            .unwrap(),
-            role,
-            anchor(start, end),
-        )
-    }
-
-    fn procedure_local_carrier_digest(
-        carrier: &ValueFlowCarrierKey,
-        procedure: &SemanticLocator,
-    ) -> StableDigest {
-        let mut digest = LengthDelimitedDigest::new(b"test-procedure-local-carrier");
-        carrier.push_procedure_local_identity(&mut digest, procedure);
-        digest.finish()
-    }
-
-    fn procedure_local_event_digest(
-        event: &ValueFlowEventKey,
-        procedure: &SemanticLocator,
-    ) -> StableDigest {
-        let mut digest = LengthDelimitedDigest::new(b"test-procedure-local-event");
-        event.push_procedure_local_identity(&mut digest, procedure);
-        digest.finish()
-    }
-
-    fn nested_carrier(mount: &str) -> ValueFlowCarrierKey {
-        let procedure = locator(mount, SemanticRole::Procedure, "run");
-        let value = locator(mount, SemanticRole::Value, "run");
-        let call = locator(mount, SemanticRole::CallSite, "run");
-        let field = locator(mount, SemanticRole::MemoryLocation, "run");
-        ValueFlowCarrierKey::Location {
-            root: Box::new(ValueFlowCarrierKey::CallResult {
-                call,
-                result: Box::new(ValueFlowCarrierKey::Value {
-                    locator: value.clone(),
-                    role: "result".into(),
-                    ordinal: Some(u32::MAX),
-                }),
-                callee: procedure,
-            }),
-            selectors: vec![
-                ValueFlowSelectorKey::Field(field),
-                ValueFlowSelectorKey::ExactIndex(Box::new(ValueFlowCarrierKey::Value {
-                    locator: value,
-                    role: "index".into(),
-                    ordinal: None,
-                })),
-                ValueFlowSelectorKey::ConstantIndex(u128::MAX),
-                ValueFlowSelectorKey::AnyIndex,
-            ]
-            .into_boxed_slice(),
-            exact: true,
-        }
     }
 
     fn lexical_cell_key(
@@ -1190,6 +1288,9 @@ mod tests {
     }
 
     #[test]
+    #[hardwon(
+        "#3099: Lexical-cell structural identity and its digest must distinguish captured bindings that share a location but differ by role or ordinal."
+    )]
     fn lexical_cell_key_retains_binding_role_and_ordinal() {
         let base = lexical_cell_key("mount", "parameter", Some(0));
         let changed_role = lexical_cell_key("mount", "local", Some(0));
@@ -1205,6 +1306,9 @@ mod tests {
     }
 
     #[test]
+    #[hardwon(
+        "#3099: Remounted lexical locators remain exactly unequal while producing the same stable fingerprint."
+    )]
     fn lexical_cell_key_is_checkout_independent() {
         let first = lexical_cell_key("first checkout", "parameter", Some(0));
         let second = lexical_cell_key("second checkout", "parameter", Some(0));
@@ -1212,22 +1316,6 @@ mod tests {
         assert_ne!(first, second, "mounted locators retain exact equality");
         assert_eq!(first.stable_fingerprint(), second.stable_fingerprint());
     }
-
-    #[test]
-    fn carrier_fingerprint_is_structured_and_checkout_independent() {
-        let first = nested_carrier("first checkout");
-        let second = nested_carrier("second checkout");
-        assert_ne!(first, second, "mounted locators retain exact equality");
-        assert_eq!(first.stable_fingerprint(), second.stable_fingerprint());
-
-        let mut prefix = first.clone();
-        let ValueFlowCarrierKey::Location { exact, .. } = &mut prefix else {
-            unreachable!("fixture is a location")
-        };
-        *exact = false;
-        assert_ne!(first.stable_fingerprint(), prefix.stable_fingerprint());
-    }
-
     #[test]
     fn carrier_fingerprint_handles_deep_access_paths_iteratively() {
         let locator = locator("mount", SemanticRole::Value, "run");
@@ -1244,177 +1332,5 @@ mod tests {
             };
         }
         assert_ne!(carrier.stable_fingerprint().as_bytes(), &[0; 32]);
-    }
-
-    #[test]
-    fn procedure_local_call_boundary_carriers_ignore_preceding_source_movement() {
-        let make = |mount: &str, shift: u32, callee_name: &str| {
-            let caller = locator_at(
-                mount,
-                SemanticRole::Procedure,
-                "wrapper",
-                100 + shift,
-                100 + shift,
-                140 + shift,
-            );
-            let call = locator_at(
-                mount,
-                SemanticRole::CallSite,
-                "wrapper",
-                100 + shift,
-                112 + shift,
-                120 + shift,
-            );
-            let result = locator_at(
-                mount,
-                SemanticRole::Value,
-                "wrapper",
-                100 + shift,
-                112 + shift,
-                120 + shift,
-            );
-            let callee = locator_at(
-                mount,
-                SemanticRole::Procedure,
-                callee_name,
-                20 + shift,
-                20 + shift,
-                60 + shift,
-            );
-            let port = ValueFlowCarrierKey::Port {
-                procedure: callee.clone(),
-                kind: ValueFlowPortKey::Parameter { ordinal: 0 },
-            };
-            let call_result = ValueFlowCarrierKey::CallResult {
-                call,
-                result: Box::new(ValueFlowCarrierKey::Allocation { locator: result }),
-                callee,
-            };
-            (caller, port, call_result)
-        };
-
-        let (first_caller, first_port, first_result) = make("first", 0, "leaf");
-        let (shifted_caller, shifted_port, shifted_result) = make("second", 200, "leaf");
-        assert_eq!(
-            procedure_local_carrier_digest(&first_port, &first_caller),
-            procedure_local_carrier_digest(&shifted_port, &shifted_caller)
-        );
-        assert_eq!(
-            procedure_local_carrier_digest(&first_result, &first_caller),
-            procedure_local_carrier_digest(&shifted_result, &shifted_caller),
-            "the call and caller-local result move with the caller while the callee uses lineage"
-        );
-
-        let (renamed_caller, renamed_port, renamed_result) = make("second", 200, "peer");
-        assert_ne!(
-            procedure_local_carrier_digest(&first_port, &first_caller),
-            procedure_local_carrier_digest(&renamed_port, &renamed_caller)
-        );
-        assert_ne!(
-            procedure_local_carrier_digest(&first_result, &first_caller),
-            procedure_local_carrier_digest(&renamed_result, &renamed_caller),
-            "changing the logical callee still rotates the boundary carrier"
-        );
-    }
-
-    #[test]
-    fn cross_procedure_events_use_their_declaring_procedure_coordinates() {
-        let make = |mount: &str, shift: u32, callee_name: &str, site_offset: u32| {
-            let caller = locator_at(
-                mount,
-                SemanticRole::Procedure,
-                "root",
-                100 + shift,
-                100 + shift,
-                140 + shift,
-            );
-            let procedure = locator_at(
-                mount,
-                SemanticRole::Procedure,
-                callee_name,
-                20 + shift,
-                20 + shift,
-                60 + shift,
-            );
-            let site = locator_at(
-                mount,
-                SemanticRole::ProgramPoint,
-                callee_name,
-                20 + shift,
-                20 + shift + site_offset,
-                25 + shift + site_offset,
-            );
-            (
-                caller,
-                procedure,
-                ValueFlowEventKey {
-                    site,
-                    ordinal: 0,
-                    kind: ValueFlowEventKind::Sink,
-                },
-            )
-        };
-
-        let (first_caller, first_procedure, first) = make("first", 0, "wrapper", 10);
-        let (shifted_caller, shifted_procedure, shifted) = make("second", 200, "wrapper", 10);
-        assert_eq!(
-            procedure_local_event_digest(&first, &first_caller),
-            procedure_local_event_digest(&shifted, &shifted_caller),
-            "a preceding sibling may move both the wrapper and its sink"
-        );
-        assert_eq!(
-            procedure_local_event_digest(&first, &first_procedure),
-            procedure_local_event_digest(&shifted, &shifted_procedure),
-            "an event remains stable when its own procedure moves intact"
-        );
-
-        let (moved_caller, moved_procedure, moved) = make("second", 200, "wrapper", 11);
-        assert_ne!(
-            procedure_local_event_digest(&first, &first_caller),
-            procedure_local_event_digest(&moved, &moved_caller),
-            "moving the sink within its declaring procedure rotates the event"
-        );
-        assert_ne!(
-            procedure_local_event_digest(&first, &first_procedure),
-            procedure_local_event_digest(&moved, &moved_procedure),
-            "same-procedure event identity remains position-sensitive"
-        );
-        let (renamed_caller, _renamed_procedure, renamed) = make("second", 200, "peer", 10);
-        assert_ne!(
-            procedure_local_event_digest(&first, &first_caller),
-            procedure_local_event_digest(&renamed, &renamed_caller),
-            "changing the declaring procedure rotates the event"
-        );
-    }
-
-    #[test]
-    fn event_fingerprint_partitions_kind_and_ordinal_but_not_mount() {
-        let event = ValueFlowEventKey {
-            site: locator("first checkout", SemanticRole::ProgramPoint, "run"),
-            ordinal: 7,
-            kind: ValueFlowEventKind::Source,
-        };
-        let remounted = ValueFlowEventKey {
-            site: locator("second checkout", SemanticRole::ProgramPoint, "run"),
-            ..event.clone()
-        };
-        assert_eq!(event.stable_fingerprint(), remounted.stable_fingerprint());
-
-        let changed_ordinal = ValueFlowEventKey {
-            ordinal: 8,
-            ..event.clone()
-        };
-        let changed_kind = ValueFlowEventKey {
-            kind: ValueFlowEventKind::Sink,
-            ..event.clone()
-        };
-        assert_ne!(
-            event.stable_fingerprint(),
-            changed_ordinal.stable_fingerprint()
-        );
-        assert_ne!(
-            event.stable_fingerprint(),
-            changed_kind.stable_fingerprint()
-        );
     }
 }

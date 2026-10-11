@@ -17,17 +17,9 @@ fn assert_context_paths_equal(
     assert_eq!(actual.len(), expected.len());
     for ((actual_id, actual), (expected_id, expected)) in actual.iter().zip(expected) {
         assert_eq!(actual_id, expected_id);
-        assert_eq!(
-            actual
-                .stack_effect_alpha_key_with_poll(&mut || false)
-                .expect("uncancelled actual alpha key"),
-            expected
-                .stack_effect_alpha_key_with_poll(&mut || false)
-                .expect("uncancelled expected alpha key"),
+        crate::analyzer::store::resolution_stage::assert_partial_path_bodies_equal(
+            actual, expected,
         );
-        assert_eq!(actual.precedence(), expected.precedence());
-        assert_eq!(actual.witness(), expected.witness());
-        assert_eq!(actual.completion(), expected.completion());
     }
 }
 

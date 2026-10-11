@@ -3,13 +3,6 @@
 use super::*;
 use rusqlite::params;
 
-fn connection_through(_version: i64) -> Connection {
-    let mut conn = Connection::open_in_memory().unwrap();
-    configure_connection(&mut conn).unwrap();
-    migrate(&mut conn).unwrap();
-    conn
-}
-
 fn insert_import_fixture(
     conn: &Connection,
     seed: &str,
@@ -96,17 +89,12 @@ fn insert_import_fixture(
 }
 
 fn seal(conn: &Connection, blob_id: i64) -> rusqlite::Result<usize> {
-    conn.execute(
-        "UPDATE source_fact_manifests
-            SET publication_state = 'complete'
-          WHERE blob_id = ?1",
-        [blob_id],
-    )
+    seal_rust_source_manifest(conn, blob_id)
 }
 
 #[test]
 fn schema62_distinguishes_unavailable_from_empty_structured_path() {
-    let conn = connection_through(CURRENT_MIGRATION_VERSION);
+    let conn = open_in_memory_cache();
     let unavailable = insert_import_fixture(&conn, "schema62-unavailable", Some(0), None, None);
     let empty = insert_import_fixture(&conn, "schema62-empty", Some(1), None, None);
     seal(&conn, unavailable).unwrap();
@@ -136,7 +124,7 @@ fn schema62_distinguishes_unavailable_from_empty_structured_path() {
 
 #[test]
 fn schema62_rejects_path_properties_and_children_for_unavailable_paths() {
-    let conn = connection_through(CURRENT_MIGRATION_VERSION);
+    let conn = open_in_memory_cache();
     let path_kind = insert_import_fixture(
         &conn,
         "schema62-path-kind",
@@ -160,7 +148,7 @@ fn schema62_rejects_path_properties_and_children_for_unavailable_paths() {
 
 #[test]
 fn schema62_sealed_path_availability_is_immutable() {
-    let conn = connection_through(CURRENT_MIGRATION_VERSION);
+    let conn = open_in_memory_cache();
     let blob_id = insert_import_fixture(&conn, "schema62-immutable", Some(0), None, None);
     seal(&conn, blob_id).unwrap();
 

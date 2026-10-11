@@ -49,10 +49,6 @@ const ALPHA: f64 = 0.85;
 const CONVERGENCE_EPSILON: f64 = 1.0e-6;
 const SCORE_BUCKET_SCALE: f64 = 1.0e9;
 const MAX_ITERS: usize = 75;
-/// The numerical baseline uses the current fixed-iteration PageRank solver.
-/// Allowing a small tolerance keeps the test portable across supported CPUs.
-#[cfg(test)]
-const PAGE_RANK_SCORE_TOLERANCE: f64 = 1.0e-6;
 const IMPORT_DEPTH: usize = 2;
 const COMMITS_TO_PROCESS: usize = 1_000;
 /// How deep the cascade reads the file-level co-edit ranking. The campaign that
@@ -127,10 +123,8 @@ struct FileRelevance {
 #[serde(rename_all = "snake_case")]
 pub enum MostRelevantFilesRankingMode {
     /// Priority tiers over mirror, stem, co-edit, directory and import
-    /// evidence. The default because it is the one that was measured: 41.0
-    /// percent recall@10 against 24.7 percent for a directory-plus-popularity
-    /// baseline and 29.1 percent for `HistoryImports` over 8,346 leave-one-out
-    /// cases in 18 repositories (`.agents/docs/coedit-retrieval-eval-2026-08-14.md`).
+    /// evidence. The default selected by the co-edit retrieval evaluation
+    /// (issue #2127).
     #[default]
     Cascade,
     HistoryImports,
@@ -176,14 +170,6 @@ pub(crate) enum Cancellable<T> {
 }
 
 impl UsageReferenceWeights {
-    #[cfg(test)]
-    const UNIFORM: Self = Self {
-        calls: 1.0,
-        members: 1.0,
-        types: 1.0,
-        other: 1.0,
-    };
-
     // Calibrated against deterministic git co-change retrieval on eight
     // repositories spanning Python, TypeScript, PHP, Java, Go, C++, and Rust.
     // The deliberately subtle bias improved the macro average without the Go
@@ -419,14 +405,9 @@ fn cascade_universe(analyzer: &dyn IAnalyzer) -> Vec<ProjectFile> {
     let _scope = profiling::scope("relevance::cascade_universe");
     let project = analyzer.project();
     let languages = project.analyzer_languages();
-    let Ok(listing) = project.all_files_shared() else {
-        return Vec::new();
-    };
-    listing
-        .iter()
-        .filter(|file| languages.contains(&file.language()))
-        .cloned()
-        .collect()
+    crate::analyzer::common::workspace_files_matching_language(project, |language| {
+        languages.contains(&language)
+    })
 }
 
 /// The depth-1 import neighbourhood of the seeds, both directions.
@@ -531,10 +512,7 @@ fn cascade_history_evidence(
 
     // The co-edit leg only scores a file that co-occurred with a seed, so a
     // seed the current tree does not hold can contribute nothing.
-    let coedit = if seed_weights
-        .keys()
-        .any(|seed| repo.is_tracked_in_tree(seed, &head_tree))
-    {
+    let coedit = if any_file_tracked_in_tree(&repo, &head_tree, seed_weights.keys()) {
         let (scored, status) = score_git_co_change(
             &commit_files,
             seed_weights,
@@ -728,20 +706,29 @@ fn related_files_by_usage(
         return Cancellable::Complete(Vec::new());
     }
 
-    let (ranking_graph, graph_incomplete) =
-        match build_usage_ranking_graph_with_kind_and_cancellation(
-            analyzer,
-            token,
-            seed_weights,
-            graph_kind,
-            cancellation,
-        ) {
-            Cancellable::Complete(graph) => (graph, false),
-            Cancellable::Incomplete(graph) => (graph, true),
-            Cancellable::Cancelled => return Cancellable::Cancelled,
-        };
+    let ranking_graph = build_usage_ranking_graph_with_kind_and_cancellation(
+        analyzer,
+        token,
+        seed_weights,
+        graph_kind,
+        cancellation,
+    );
+    rank_usage_graph_with_cancellation(ranking_graph, seed_weights, k, cancellation)
+}
+
+fn rank_usage_graph_with_cancellation<G: AsRef<UsageRankingGraph>>(
+    graph: Cancellable<G>,
+    seed_weights: &HashMap<ProjectFile, f64>,
+    k: usize,
+    cancellation: &CancellationToken,
+) -> Cancellable<Vec<FileRelevance>> {
+    let (ranking_graph, graph_incomplete) = match graph {
+        Cancellable::Complete(graph) => (graph, false),
+        Cancellable::Incomplete(graph) => (graph, true),
+        Cancellable::Cancelled => return Cancellable::Cancelled,
+    };
     match related_files_by_usage_graph_with_cancellation(
-        &ranking_graph,
+        ranking_graph.as_ref(),
         seed_weights,
         k,
         UsageReferenceWeights::CALIBRATED,
@@ -1116,18 +1103,27 @@ fn related_files_by_usage_graph(
     k: usize,
     weights: UsageReferenceWeights,
 ) -> Vec<FileRelevance> {
-    match related_files_by_usage_graph_with_cancellation(
-        ranking_graph,
-        seed_weights,
-        k,
-        weights,
-        &CancellationToken::default(),
-    ) {
+    relevance_files_without_cancellation(
+        related_files_by_usage_graph_with_cancellation(
+            ranking_graph,
+            seed_weights,
+            k,
+            weights,
+            &CancellationToken::default(),
+        ),
+        "default cancellation token cannot cancel usage ranking",
+    )
+}
+
+#[cfg(test)]
+fn relevance_files_without_cancellation(
+    result: Cancellable<Vec<FileRelevance>>,
+    cancellation_failure: &str,
+) -> Vec<FileRelevance> {
+    match result {
         Cancellable::Complete(files) => files,
         Cancellable::Incomplete(files) => files,
-        Cancellable::Cancelled => {
-            unreachable!("default cancellation token cannot cancel usage ranking")
-        }
+        Cancellable::Cancelled => unreachable!("{cancellation_failure}"),
     }
 }
 
@@ -1266,10 +1262,7 @@ pub(crate) fn most_important_project_files_with_cancellation(
     if cancellation.is_some_and(crate::CancellationToken::is_cancelled) {
         return (Vec::new(), HistoryRankingStatus::Cancelled);
     }
-    if !candidate_set
-        .iter()
-        .any(|file| repo.is_tracked_in_tree(file, &head_tree))
-    {
+    if !any_file_tracked_in_tree(&repo, &head_tree, candidate_set.iter()) {
         return (Vec::new(), HistoryRankingStatus::Complete);
     }
 
@@ -1429,18 +1422,16 @@ fn related_files_by_imports(
     k: usize,
     reversed: bool,
 ) -> Vec<FileRelevance> {
-    match related_files_by_imports_with_cancellation(
-        analyzer,
-        seed_weights,
-        k,
-        reversed,
-        &CancellationToken::default(),
-    ) {
-        Cancellable::Complete(files) | Cancellable::Incomplete(files) => files,
-        Cancellable::Cancelled => {
-            unreachable!("default cancellation token cannot cancel import ranking")
-        }
-    }
+    relevance_files_without_cancellation(
+        related_files_by_imports_with_cancellation(
+            analyzer,
+            seed_weights,
+            k,
+            reversed,
+            &CancellationToken::default(),
+        ),
+        "default cancellation token cannot cancel import ranking",
+    )
 }
 
 fn related_files_by_imports_with_cancellation(
@@ -2040,10 +2031,7 @@ fn related_files_by_git(
     let Some(head_tree) = repo.head_tree() else {
         return Ok((Vec::new(), HistoryRankingStatus::Complete));
     };
-    if !seed_weights
-        .keys()
-        .any(|seed| repo.is_tracked_in_tree(seed, &head_tree))
-    {
+    if !any_file_tracked_in_tree(&repo, &head_tree, seed_weights.keys()) {
         return Ok((Vec::new(), HistoryRankingStatus::Complete));
     }
 
@@ -2336,6 +2324,14 @@ struct GitProjectContext {
     repo_prefix: PathBuf,
 }
 
+fn any_file_tracked_in_tree<'a>(
+    repo: &GitProjectContext,
+    head_tree: &git2::Tree<'_>,
+    mut files: impl Iterator<Item = &'a ProjectFile>,
+) -> bool {
+    files.any(|file| repo.is_tracked_in_tree(file, head_tree))
+}
+
 struct RepoCommitChangeCache {
     commits: Cache<Oid, Arc<CommitChange>>,
     fill_lock: Mutex<()>,
@@ -2370,6 +2366,14 @@ struct CachedRecentOids {
     /// flag they were permanently cold on that path (issue #1333) even though a single fill had
     /// already captured all of their history.
     exhausted: bool,
+}
+
+fn cached_recent_oids(cache: &RepoCommitChangeCache, head: Oid, limit: usize) -> Option<Vec<Oid>> {
+    let guard = cache.recent_oids.lock().expect("recent oids mutex");
+    let cached = guard
+        .as_ref()
+        .filter(|cached| cached.head == head && (cached.oids.len() >= limit || cached.exhausted))?;
+    Some(cached.oids[..cached.oids.len().min(limit)].to_vec())
 }
 
 impl RepoCommitChangeCache {
@@ -2644,14 +2648,8 @@ impl GitProjectContext {
         let Some(head) = self.head_commit_oid() else {
             return Ok(Some(Vec::new()));
         };
-        let ordered_oids = {
-            let guard = cache.recent_oids.lock().expect("recent oids mutex");
-            let Some(cached) = guard.as_ref().filter(|cached| {
-                cached.head == head && (cached.oids.len() >= limit || cached.exhausted)
-            }) else {
-                return Ok(None);
-            };
-            cached.oids[..cached.oids.len().min(limit)].to_vec()
+        let Some(ordered_oids) = cached_recent_oids(&cache, head, limit) else {
+            return Ok(None);
         };
         match self.collect_cached_commit_changes(&ordered_oids, &cache) {
             Ok(changes) => Ok(Some(changes)),
@@ -2788,14 +2786,8 @@ impl GitProjectContext {
             return self.recent_commit_oids(limit, cancellation);
         };
 
-        {
-            let guard = cache.recent_oids.lock().expect("recent oids mutex");
-            if let Some(cached) = guard.as_ref()
-                && cached.head == head_oid
-                && (cached.oids.len() >= limit || cached.exhausted)
-            {
-                return Ok(Some(cached.oids[..cached.oids.len().min(limit)].to_vec()));
-            }
+        if let Some(oids) = cached_recent_oids(cache, head_oid, limit) {
+            return Ok(Some(oids));
         }
 
         cache.recent_oid_fills.fetch_add(1, Ordering::Relaxed);
@@ -3310,10 +3302,7 @@ impl RenameCanonicalizer {
 }
 
 fn normalized_rel_path(file: &ProjectFile) -> String {
-    file.rel_path()
-        .to_string_lossy()
-        .replace('\\', "/")
-        .to_ascii_lowercase()
+    brokk_bifrost_core::path_utils::rel_path_string(file).to_ascii_lowercase()
 }
 
 fn score_bucket(score: f64) -> i64 {
@@ -3329,38 +3318,28 @@ fn compare_file_relevance(left: &FileRelevance, right: &FileRelevance) -> std::c
 mod cascade;
 
 #[cfg(test)]
-mod weight_benchmark;
-
-#[cfg(test)]
 mod tests {
     use super::{
         DEFAULT_RECENCY_HALF_LIFE, FileRelevance, GitProjectContext, RepoCommitChangeCache,
         UsageReferenceWeights, clear_repo_commit_change_cache_for_root,
-        clear_repo_root_cache_for_project, commit_age_weight, most_important_project_files,
+        clear_repo_root_cache_for_project, most_important_project_files,
         most_relevant_project_files_with_half_life, related_files_by_git, related_files_by_imports,
         repo_commit_change_cache, repo_root_cache, weighted_page_rank,
     };
-    use crate::analyzer::usages::inverted_edges::UsageReferenceCounts;
     use crate::analyzer::{
-        AnalyzerDelegate, GoAnalyzer, JavaAnalyzer, Language, MultiAnalyzer, OverlayProject,
-        Project, ProjectFile, PythonAnalyzer, RustAnalyzer, TestProject,
+        AnalyzerDelegate, GoAnalyzer, Language, MultiAnalyzer, OverlayProject, Project,
+        ProjectFile, PythonAnalyzer, RustAnalyzer, TestProject,
     };
     use crate::analyzer::{AnalyzerQueryScope, QueryScope};
     use crate::hash::HashMap;
+    use crate::test_support::{java_analyzer, write_file};
     use git2::{Repository, Signature};
     use std::collections::BTreeMap;
     use std::fs;
     use std::path::Path;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Barrier};
-    use std::time::Instant;
     use tempfile::TempDir;
-
-    fn write_file(root: &Path, rel_path: &str, contents: &str) -> ProjectFile {
-        let file = ProjectFile::new(root.to_path_buf(), rel_path);
-        file.write(contents).unwrap();
-        file
-    }
 
     fn hash_map<K, V, const N: usize>(entries: [(K, V); N]) -> HashMap<K, V>
     where
@@ -3505,118 +3484,11 @@ func run() {
         assert_eq!(vec!["Alpha.java", "Beta.java", "Zed.java"], paths);
     }
 
-    fn java_analyzer(root: &Path) -> JavaAnalyzer {
-        JavaAnalyzer::from_project(TestProject::new(root.to_path_buf(), Language::Java))
-    }
-
-    fn rust_analyzer(root: &Path) -> RustAnalyzer {
-        RustAnalyzer::from_project(TestProject::new(root.to_path_buf(), Language::Rust))
-    }
-
-    /// The shallow-mirror case: one snapshot commit, which carries no
-    /// co-occurrence information at all, so the co-edit leg correctly declines
-    /// to rank. The cascade reads the same repository and still pairs the seed
-    /// with its mirror, its directory and the directory that changed with it.
-    #[test]
-    fn cascade_ranks_from_paths_where_one_snapshot_commit_leaves_co_edit_nothing() {
-        let temp = TempDir::new().unwrap();
-        let root = temp.path();
-        write_file(root, "src/parser/lexer.rs", "pub fn lex() {}\n");
-        write_file(root, "tests/parser/lexer.rs", "#[test]\nfn lexes() {}\n");
-        write_file(root, "src/parser/emitter.rs", "pub fn emit() {}\n");
-        write_file(root, "src/net/client.rs", "pub fn get() {}\n");
-        let repo = Repository::init(root).unwrap();
-        commit_paths(
-            &repo,
-            "import the whole tree",
-            &[
-                "src/parser/lexer.rs",
-                "tests/parser/lexer.rs",
-                "src/parser/emitter.rs",
-                "src/net/client.rs",
-            ],
-            &[],
-        );
-
-        let analyzer = rust_analyzer(root);
-        let seeds = [(
-            ProjectFile::new(root.to_path_buf(), "src/parser/lexer.rs"),
-            1.0,
-        )];
-        let uncancelled = crate::CancellationToken::default();
-
-        let (history_only, status) = super::most_relevant_project_files_history_only(
-            &analyzer,
-            &seeds,
-            5,
-            Some(DEFAULT_RECENCY_HALF_LIFE),
-            &uncancelled,
-        );
-        assert!(history_only.is_empty(), "{history_only:?}");
-        assert_eq!(super::HistoryRankingStatus::Complete, status);
-
-        let ranked = match super::most_relevant_project_files_cascade(
-            &analyzer,
-            &seeds,
-            5,
-            Some(DEFAULT_RECENCY_HALF_LIFE),
-            &uncancelled,
-        ) {
-            super::MostRelevantProjectFilesOutcome::Complete(files) => files,
-            super::MostRelevantProjectFilesOutcome::HistoryUnavailable(files) => {
-                panic!("history should be available here, ranked {files:?}")
-            }
-            super::MostRelevantProjectFilesOutcome::UsageGraphIncomplete(files)
-            | super::MostRelevantProjectFilesOutcome::UsageGraphIncompleteAndHistoryUnavailable(
-                files,
-            ) => {
-                panic!("the cascade does not use a usage graph, ranked {files:?}")
-            }
-            super::MostRelevantProjectFilesOutcome::Cancelled => {
-                panic!("an uncancelled token cannot cancel the cascade")
-            }
-        };
-        assert_eq!(
-            vec![
-                "tests/parser/lexer.rs",
-                "src/parser/emitter.rs",
-                "src/net/client.rs",
-            ],
-            ranked
-                .iter()
-                .map(super::normalized_rel_path)
-                .collect::<Vec<_>>()
-        );
-    }
-
     fn commit_paths(repo: &Repository, message: &str, add: &[&str], remove: &[&str]) {
-        let mut index = repo.index().unwrap();
-        for path in remove {
-            index.remove_path(Path::new(path)).unwrap();
-        }
-        for path in add {
-            index.add_path(Path::new(path)).unwrap();
-        }
-        index.write().unwrap();
-
-        let tree_id = index.write_tree().unwrap();
-        let tree = repo.find_tree(tree_id).unwrap();
         let signature = Signature::now("Test User", "test@example.com").unwrap();
-        let parent = repo
-            .head()
-            .ok()
-            .and_then(|head| head.target())
-            .and_then(|oid| repo.find_commit(oid).ok());
-        let parents = parent.iter().collect::<Vec<_>>();
-        repo.commit(
-            Some("HEAD"),
-            &signature,
-            &signature,
-            message,
-            &tree,
-            &parents,
-        )
-        .unwrap();
+        crate::test_support::shared_git::commit_paths_with_removals(
+            repo, add, remove, message, &signature,
+        );
     }
 
     fn commit_paths_at(
@@ -3626,38 +3498,15 @@ func run() {
         remove: &[&str],
         seconds: i64,
     ) {
-        let mut index = repo.index().unwrap();
-        for path in remove {
-            index.remove_path(Path::new(path)).unwrap();
-        }
-        for path in add {
-            index.add_path(Path::new(path)).unwrap();
-        }
-        index.write().unwrap();
-
-        let tree_id = index.write_tree().unwrap();
-        let tree = repo.find_tree(tree_id).unwrap();
         let signature = Signature::new(
             "Test User",
             "test@example.com",
             &git2::Time::new(seconds, 0),
         )
         .unwrap();
-        let parent = repo
-            .head()
-            .ok()
-            .and_then(|head| head.target())
-            .and_then(|oid| repo.find_commit(oid).ok());
-        let parents = parent.iter().collect::<Vec<_>>();
-        repo.commit(
-            Some("HEAD"),
-            &signature,
-            &signature,
-            message,
-            &tree,
-            &parents,
-        )
-        .unwrap();
+        crate::test_support::shared_git::commit_paths_with_removals(
+            repo, add, remove, message, &signature,
+        );
     }
 
     fn git_context(root: &Path) -> GitProjectContext {
@@ -3673,45 +3522,6 @@ func run() {
                 .and_then(|value| value.to_str())
                 == Some(file_name)
         })
-    }
-
-    #[test]
-    fn seeds_exclude_self_and_rank_imported_neighbors_higher_reversed_false() {
-        let temp = TempDir::new().unwrap();
-        let root = temp.path();
-        let a = write_file(
-            root,
-            "test/A.java",
-            "package test; import test.B; public class A { public void a() {} }",
-        );
-        let b = write_file(
-            root,
-            "test/B.java",
-            "package test; import test.C; public class B { public void b() {} }",
-        );
-        let c = write_file(
-            root,
-            "test/C.java",
-            "package test; public class C { public void c() {} }",
-        );
-        write_file(
-            root,
-            "test/D.java",
-            "package test; public class D { public void d() {} }",
-        );
-
-        let analyzer = java_analyzer(root);
-        let results = related_files_by_imports(&analyzer, &hash_map([(a.clone(), 1.0)]), 10, false);
-
-        assert!(results.iter().all(|result| result.file != a));
-        assert!(results.len() >= 2);
-        let top_two = results
-            .iter()
-            .take(2)
-            .map(|entry| entry.file.clone())
-            .collect::<Vec<_>>();
-        assert!(top_two.contains(&b));
-        assert!(top_two.contains(&c));
     }
 
     #[test]
@@ -3745,74 +3555,6 @@ func run() {
         assert!(matches!(cancelled, super::Cancellable::Cancelled));
         let retry = related_files_by_imports(&analyzer, &seed_weights, 10, false);
         assert!(retry.iter().any(|candidate| candidate.file == target));
-    }
-
-    #[test]
-    fn relative_ranking_of_hub_node() {
-        let temp = TempDir::new().unwrap();
-        let root = temp.path();
-        let hub = write_file(root, "test/Hub.java", "package test; public class Hub {}");
-        let leaf = write_file(
-            root,
-            "test/Leaf1.java",
-            "package test; import test.Hub; public class Leaf1 {}",
-        );
-        write_file(
-            root,
-            "test/Leaf2.java",
-            "package test; import test.Hub; public class Leaf2 {}",
-        );
-        write_file(
-            root,
-            "test/Leaf3.java",
-            "package test; import test.Hub; public class Leaf3 {}",
-        );
-        write_file(
-            root,
-            "test/Leaf4.java",
-            "package test; import test.Hub; public class Leaf4 {}",
-        );
-
-        let analyzer = java_analyzer(root);
-        let results = related_files_by_imports(&analyzer, &hash_map([(leaf, 1.0)]), 10, false);
-
-        assert_eq!(Some(&hub), results.first().map(|entry| &entry.file));
-    }
-
-    #[test]
-    fn rank_flows_through_chain_but_not_beyond_import_depth() {
-        let temp = TempDir::new().unwrap();
-        let root = temp.path();
-        let a = write_file(
-            root,
-            "test/A.java",
-            "package test; import test.B; public class A {}",
-        );
-        let b = write_file(
-            root,
-            "test/B.java",
-            "package test; import test.C; public class B {}",
-        );
-        let c = write_file(
-            root,
-            "test/C.java",
-            "package test; import test.D; public class C {}",
-        );
-        let d = write_file(root, "test/D.java", "package test; public class D {}");
-
-        let analyzer = java_analyzer(root);
-        let results = related_files_by_imports(&analyzer, &hash_map([(a, 1.0)]), 10, false);
-        let result_files = results
-            .iter()
-            .map(|entry| entry.file.clone())
-            .collect::<Vec<_>>();
-
-        let index_b = result_files.iter().position(|file| file == &b).unwrap();
-        let index_c = result_files.iter().position(|file| file == &c).unwrap();
-        assert!(result_files.contains(&b));
-        assert!(result_files.contains(&c));
-        assert!(!result_files.contains(&d));
-        assert!(index_b < index_c);
     }
 
     #[test]
@@ -3862,17 +3604,6 @@ func run() {
     }
 
     #[test]
-    fn weighted_page_rank_uses_edge_weights() {
-        let scores = weighted_page_rank(
-            &[vec![(1, 1.0), (2, 3.0)], Vec::new(), Vec::new()],
-            &[1.0, 0.0, 0.0],
-        );
-
-        assert!(scores[2] > scores[1], "scores: {scores:?}");
-        assert!((scores.iter().sum::<f64>() - 1.0).abs() < 1.0e-6);
-    }
-
-    #[test]
     fn issue_1304_weighted_page_rank_stops_on_cancellation() {
         let cancellation = crate::CancellationToken::cancel_after_checks_for_test(2);
 
@@ -3885,6 +3616,9 @@ func run() {
         assert!(scores.is_none());
     }
 
+    #[brokk_bifrost_test_macros::hardwon(
+        "d57e0ee72ded: Cancels a real analyzer-backed usage-graph query and verifies callers receive the typed Cancelled outcome"
+    )]
     #[test]
     fn issue_1304_cancelled_usage_graph_is_a_typed_outcome() {
         let temp = TempDir::new().unwrap();
@@ -3920,6 +3654,9 @@ func run() {
         ));
     }
 
+    #[brokk_bifrost_test_macros::hardwon(
+        "d57e0ee72ded: Compares selected Rust-ecosystem graph construction with all-language construction to prove pruning preserves exact ranking output"
+    )]
     #[test]
     fn issue_1304_seed_ecosystem_pruning_preserves_exact_ranking() {
         let temp = TempDir::new().unwrap();
@@ -4016,42 +3753,6 @@ func run() {
     }
 
     #[test]
-    fn calibrated_usage_weights_apply_a_subtle_behavioral_preference() {
-        let weights = UsageReferenceWeights::CALIBRATED;
-        let call = weights.combine(UsageReferenceCounts {
-            calls: 1,
-            ..UsageReferenceCounts::default()
-        });
-        let member = weights.combine(UsageReferenceCounts {
-            members: 1,
-            ..UsageReferenceCounts::default()
-        });
-        let type_reference = weights.combine(UsageReferenceCounts {
-            types: 1,
-            ..UsageReferenceCounts::default()
-        });
-        let other = weights.combine(UsageReferenceCounts {
-            other: 1,
-            ..UsageReferenceCounts::default()
-        });
-        assert!(call > member && member > type_reference && type_reference > other);
-
-        let scores = weighted_page_rank(
-            &[
-                vec![(1, call), (2, member), (3, type_reference), (4, other)],
-                Vec::new(),
-                Vec::new(),
-                Vec::new(),
-                Vec::new(),
-            ],
-            &[1.0, 0.0, 0.0, 0.0, 0.0],
-        );
-        assert!(scores[1] > scores[2]);
-        assert!(scores[2] > scores[3]);
-        assert!(scores[3] > scores[4]);
-    }
-
-    #[test]
     fn weighted_page_rank_returns_dangling_mass_to_personalized_seeds() {
         let scores = weighted_page_rank(&[vec![(1, 1.0)], Vec::new()], &[2.0, 0.0]);
 
@@ -4068,222 +3769,6 @@ func run() {
         assert_eq!(first, second);
         assert!((first.iter().sum::<f64>() - 1.0).abs() < 1.0e-6);
         assert!(first.iter().all(|score| score.is_finite() && *score > 0.0));
-    }
-
-    #[test]
-    fn no_project_imports_are_handled_gracefully() {
-        let temp = TempDir::new().unwrap();
-        let root = temp.path();
-        let a = write_file(
-            root,
-            "test/A.java",
-            "package test; import java.util.List; public class A { List<String> list; }",
-        );
-        write_file(
-            root,
-            "test/B.java",
-            "package test; import java.util.Map; public class B { Map<String, String> map; }",
-        );
-
-        let analyzer = java_analyzer(root);
-        let results = related_files_by_imports(&analyzer, &hash_map([(a.clone(), 1.0)]), 10, false);
-
-        assert!(results.iter().all(|entry| entry.file != a));
-        assert!(results.is_empty());
-    }
-
-    #[test]
-    fn reverse_import_traversal_finds_importers() {
-        let temp = TempDir::new().unwrap();
-        let root = temp.path();
-        let importer = write_file(
-            root,
-            "test/Importer.java",
-            "package test; import test.Imported; public class Importer {}",
-        );
-        let imported = write_file(
-            root,
-            "test/Imported.java",
-            "package test; public class Imported {}",
-        );
-
-        let analyzer = java_analyzer(root);
-        let results = related_files_by_imports(&analyzer, &hash_map([(imported, 1.0)]), 10, true);
-
-        assert!(results.iter().any(|entry| entry.file == importer));
-    }
-
-    #[test]
-    fn directionality_of_reversed_flag_matches_brokk() {
-        let temp = TempDir::new().unwrap();
-        let root = temp.path();
-        let upstream = write_file(
-            root,
-            "test/Upstream.java",
-            "package test; public class Upstream {}",
-        );
-        let middle = write_file(
-            root,
-            "test/Middle.java",
-            "package test; import test.Upstream; public class Middle {}",
-        );
-        let downstream = write_file(
-            root,
-            "test/Downstream.java",
-            "package test; import test.Middle; public class Downstream {}",
-        );
-
-        let analyzer = java_analyzer(root);
-        let forward =
-            related_files_by_imports(&analyzer, &hash_map([(middle.clone(), 1.0)]), 10, false);
-        let reverse = related_files_by_imports(&analyzer, &hash_map([(middle, 1.0)]), 10, true);
-
-        assert!(forward.iter().any(|entry| entry.file == upstream));
-        assert!(!forward.iter().any(|entry| entry.file == downstream));
-        assert!(reverse.iter().any(|entry| entry.file == downstream));
-        assert!(!reverse.iter().any(|entry| entry.file == upstream));
-    }
-
-    #[test]
-    fn multi_analyzer_with_multiple_languages_uses_correct_delegates() {
-        let temp = TempDir::new().unwrap();
-        let root = temp.path();
-        let java_source = write_file(
-            root,
-            "test/Source.java",
-            "package test; import test.Target; public class Source {}",
-        );
-        let java_target = write_file(
-            root,
-            "test/Target.java",
-            "package test; public class Target {}",
-        );
-        let py_source = write_file(
-            root,
-            "py_source.py",
-            "from other_module import other_fn\n\ndef py_source_fn():\n    other_fn()\n",
-        );
-        let py_target = write_file(root, "other_module.py", "def other_fn():\n    pass\n");
-
-        let project = TestProject::new(root.to_path_buf(), Language::Java);
-        let multi = MultiAnalyzer::new(BTreeMap::from([
-            (
-                Language::Java,
-                AnalyzerDelegate::Java(JavaAnalyzer::from_project(project.clone())),
-            ),
-            (
-                Language::Python,
-                AnalyzerDelegate::Python(PythonAnalyzer::from_project(project)),
-            ),
-        ]));
-
-        let java_results =
-            related_files_by_imports(&multi, &hash_map([(java_source, 1.0)]), 10, false);
-        assert!(java_results.iter().any(|entry| entry.file == java_target));
-        assert!(!java_results.iter().any(|entry| entry.file == py_target));
-
-        let py_results = related_files_by_imports(&multi, &hash_map([(py_source, 1.0)]), 10, false);
-        assert!(py_results.iter().any(|entry| entry.file == py_target));
-        assert!(!py_results.iter().any(|entry| entry.file == java_target));
-    }
-
-    #[test]
-    fn stable_scores_exist_for_named_results() {
-        let temp = TempDir::new().unwrap();
-        let root = temp.path();
-        let a = write_file(
-            root,
-            "test/A.java",
-            "package test; import test.B; public class A {}",
-        );
-        write_file(
-            root,
-            "test/B.java",
-            "package test; import test.C; public class B {}",
-        );
-        write_file(root, "test/C.java", "package test; public class C {}");
-
-        let analyzer = java_analyzer(root);
-        let results = related_files_by_imports(&analyzer, &hash_map([(a, 1.0)]), 10, false);
-
-        let b_score = file_by_name(&results, "B.java")
-            .expect("B should be ranked")
-            .score;
-        let c_score = file_by_name(&results, "C.java")
-            .expect("C should be ranked")
-            .score;
-
-        // Personalized PageRank over A -> B -> C, with A as the only teleport
-        // target. These values deliberately pin the existing fixed-iteration
-        // algorithm so storage-only graph changes cannot alter ranking behavior.
-        assert!(
-            (b_score - 0.330_416_201).abs() <= super::PAGE_RANK_SCORE_TOLERANCE,
-            "B score changed: {b_score}"
-        );
-        assert!(
-            (c_score - 0.280_853_771).abs() <= super::PAGE_RANK_SCORE_TOLERANCE,
-            "C score changed: {c_score}"
-        );
-    }
-
-    #[test]
-    fn recency_weighted_git_scores_downweight_old_only_targets_against_uniform_scores() {
-        let temp = TempDir::new().unwrap();
-        let root = temp.path();
-        write_file(root, "Seed.java", "public class Seed { }");
-        write_file(root, "OldTarget.java", "public class OldTarget { }");
-
-        let repo = Repository::init(root).unwrap();
-        commit_paths(&repo, "initial seed", &["Seed.java"], &[]);
-        commit_paths(&repo, "add old target", &["OldTarget.java"], &[]);
-        fs::write(
-            root.join("Seed.java"),
-            "public class Seed { int oldUse() { return 1; } }",
-        )
-        .unwrap();
-        fs::write(
-            root.join("OldTarget.java"),
-            "public class OldTarget { int value() { return 1; } }",
-        )
-        .unwrap();
-        commit_paths(&repo, "old cochange", &["Seed.java", "OldTarget.java"], &[]);
-        fs::write(
-            root.join("Seed.java"),
-            "public class Seed { int newerOnly() { return 2; } }",
-        )
-        .unwrap();
-        commit_paths(&repo, "seed only recent", &["Seed.java"], &[]);
-        for index in 0..30 {
-            fs::write(
-                root.join("Seed.java"),
-                format!("public class Seed {{ int recentOnly{index}() {{ return {index}; }} }}"),
-            )
-            .unwrap();
-            commit_paths(
-                &repo,
-                &format!("seed only recent {index}"),
-                &["Seed.java"],
-                &[],
-            );
-        }
-
-        let analyzer = java_analyzer(root);
-        let seed = ProjectFile::new(root.to_path_buf(), "Seed.java");
-        let seed_weights = hash_map([(seed, 1.0)]);
-        let uncancelled = crate::CancellationToken::default();
-        let (uniform_scores, _) =
-            related_files_by_git(&analyzer, &seed_weights, 10, None, &uncancelled).unwrap();
-        let (recency_scores, _) =
-            related_files_by_git(&analyzer, &seed_weights, 10, Some(10.0), &uncancelled).unwrap();
-
-        let uniform_old = file_by_name(&uniform_scores, "OldTarget.java")
-            .expect("uniform old target score")
-            .score;
-        let recency_old = file_by_name(&recency_scores, "OldTarget.java")
-            .expect("recency old target score")
-            .score;
-
-        assert!(recency_old < uniform_old, "{recency_old} !< {uniform_old}");
     }
 
     /// Build a repository whose `Seed.java` and `Target.java` co-change, so the
@@ -4312,6 +3797,9 @@ func run() {
     /// budget: the walk would make Git refetch absent objects from the promisor
     /// remote one round trip at a time (1.2s versus 8m18s on the corpus in
     /// issue #1373). The truthful answer is that history is unavailable.
+    #[brokk_bifrost_test_macros::hardwon(
+        "#1373: Marks a network promisor repository and verifies bounded history ranking reports unavailable without scanning or fetching commits"
+    )]
     #[test]
     fn issue_1373_partial_clone_reports_history_unavailable_without_filling() {
         let temp = TempDir::new().unwrap();
@@ -4350,6 +3838,9 @@ func run() {
     /// the #1373 guard exists for. This is exactly the clone the benchmark
     /// harness produces when it blobless-clones a local fixture repository.
     #[cfg_attr(not(scheduled_tests), ignore = "scheduled-only")]
+    #[brokk_bifrost_test_macros::hardwon(
+        "8bc6970d53cf: Verifies a local-path promisor clone may fill history and still ranks a co-changed file, unlike network remotes"
+    )]
     #[test]
     fn local_promisor_partial_clone_still_ranks_by_commit_history() {
         let temp = TempDir::new().unwrap();
@@ -4383,6 +3874,9 @@ func run() {
     /// The partial-clone rule keys off the clone, so an ordinary repository keeps
     /// filling its history and ranking at full quality.
     #[cfg_attr(not(scheduled_tests), ignore = "scheduled-only")]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#1373: Confirms the partial-clone guard leaves ordinary repositories able to fill history and return their co-change candidate"
+    )]
     #[test]
     fn issue_1373_ordinary_clone_still_ranks_by_commit_history() {
         let temp = TempDir::new().unwrap();
@@ -4411,6 +3905,9 @@ func run() {
     /// The history leg is cancellable end to end. Before issue #1373 the walk ran
     /// inside a blocking `Command::output`, so a request-wide deadline could not
     /// stop it and the tool blew its budget instead of reporting the interruption.
+    #[brokk_bifrost_test_macros::hardwon(
+        "#1373: Pre-cancels a Git ranking request and checks history traversal returns Cancelled with no candidate prefix"
+    )]
     #[test]
     fn issue_1373_cancelled_request_stops_the_history_walk() {
         let temp = TempDir::new().unwrap();
@@ -4440,6 +3937,9 @@ func run() {
     /// (issue #2327). The fake filler below stands in for that walk so the dedup is observed
     /// without any Git process, and the barrier keeps the second schedule inside the first
     /// warm's lifetime instead of racing it.
+    #[brokk_bifrost_test_macros::hardwon(
+        "#2327: Uses a barrier-controlled concurrent warm to prove a second scheduler is dropped for the same repository until the first releases its claim"
+    )]
     #[test]
     fn issue_2327_a_second_history_warm_is_dropped_while_one_is_in_flight() {
         let cache = Arc::new(RepoCommitChangeCache::new(8));
@@ -4482,6 +3982,9 @@ func run() {
     /// the request reports `HistoryUnavailable` without starting a Git subprocess, and the
     /// fill it could not afford runs on its own thread, so the next identical request ranks
     /// with the history tier (issue #2327).
+    #[brokk_bifrost_test_macros::hardwon(
+        "#2327: Verifies a cold cancellable request reports unavailable promptly, warms history asynchronously, and ranks on retry"
+    )]
     #[test]
     fn issue_2327_a_cold_cancellable_ranking_warms_history_in_the_background() {
         let temp = TempDir::new().unwrap();
@@ -4531,6 +4034,9 @@ func run() {
 
     /// The startup warm fills a cold cache from its own thread, which is what a session that
     /// only calls cancellable navigation tools depends on (issue #2327).
+    #[brokk_bifrost_test_macros::hardwon(
+        "#2327: Runs the startup warm thread against a cold Git repo and checks cached history is readable after join"
+    )]
     #[test]
     fn issue_2327_the_startup_history_warm_fills_a_cold_cache() {
         let temp = TempDir::new().unwrap();
@@ -4557,6 +4063,9 @@ func run() {
     /// The partial-clone guard of issue #1373 covers the background warm too: filling a
     /// network promisor clone's history is unbounded network work whoever waits for it, so a
     /// cold hit on such a repository must schedule nothing at all.
+    #[brokk_bifrost_test_macros::hardwon(
+        "#2327: Checks the network-promisor guard also suppresses background warm scheduling and all associated history fills"
+    )]
     #[test]
     fn issue_2327_a_network_partial_clone_never_schedules_a_background_warm() {
         let temp = TempDir::new().unwrap();
@@ -4592,200 +4101,6 @@ func run() {
         );
         assert_eq!(0, cache.recent_oid_fills.load(Ordering::Relaxed));
         assert_eq!(0, cache.fill_commits_scanned.load(Ordering::Relaxed));
-    }
-
-    #[test]
-    fn half_life_none_reproduces_legacy_uniform_scores_exactly() {
-        let temp = TempDir::new().unwrap();
-        let root = temp.path();
-        write_file(root, "Seed.java", "public class Seed { }");
-        write_file(root, "Target.java", "public class Target { }");
-
-        let repo = Repository::init(root).unwrap();
-        commit_paths(&repo, "initial seed", &["Seed.java"], &[]);
-        commit_paths(&repo, "add target", &["Target.java"], &[]);
-        fs::write(
-            root.join("Seed.java"),
-            "public class Seed { int use() { return 1; } }",
-        )
-        .unwrap();
-        fs::write(
-            root.join("Target.java"),
-            "public class Target { int value() { return 1; } }",
-        )
-        .unwrap();
-        commit_paths(&repo, "cochange", &["Seed.java", "Target.java"], &[]);
-        fs::write(
-            root.join("Seed.java"),
-            "public class Seed { int useAgain() { return 2; } }",
-        )
-        .unwrap();
-        commit_paths(&repo, "seed only", &["Seed.java"], &[]);
-
-        let analyzer = java_analyzer(root);
-        let seed = ProjectFile::new(root.to_path_buf(), "Seed.java");
-        let (uniform_scores, _) = related_files_by_git(
-            &analyzer,
-            &hash_map([(seed, 1.0)]),
-            10,
-            None,
-            &crate::CancellationToken::default(),
-        )
-        .unwrap();
-
-        let target_score = file_by_name(&uniform_scores, "Target.java")
-            .expect("uniform target score")
-            .score;
-        let expected_seed_mass = 3.0;
-        let expected_joint_mass = 0.5;
-        let expected_conditional = expected_joint_mass / expected_seed_mass;
-        let expected_idf = 3.0f64.ln();
-        let expected_score = expected_conditional * expected_idf;
-
-        assert!(
-            (target_score - expected_score).abs() < 1.0e-12,
-            "{target_score} != {expected_score}"
-        );
-    }
-
-    #[test]
-    fn huge_half_life_approximates_uniform_scores() {
-        let temp = TempDir::new().unwrap();
-        let root = temp.path();
-        write_file(root, "Seed.java", "public class Seed { }");
-        write_file(root, "Target.java", "public class Target { }");
-
-        let repo = Repository::init(root).unwrap();
-        commit_paths(&repo, "initial seed", &["Seed.java"], &[]);
-        commit_paths(&repo, "add target", &["Target.java"], &[]);
-        fs::write(
-            root.join("Seed.java"),
-            "public class Seed { int use() { return 1; } }",
-        )
-        .unwrap();
-        fs::write(
-            root.join("Target.java"),
-            "public class Target { int value() { return 1; } }",
-        )
-        .unwrap();
-        commit_paths(&repo, "cochange", &["Seed.java", "Target.java"], &[]);
-        fs::write(
-            root.join("Seed.java"),
-            "public class Seed { int useAgain() { return 2; } }",
-        )
-        .unwrap();
-        commit_paths(&repo, "seed only", &["Seed.java"], &[]);
-
-        let analyzer = java_analyzer(root);
-        let seed = ProjectFile::new(root.to_path_buf(), "Seed.java");
-        let (uniform_scores, _) = related_files_by_git(
-            &analyzer,
-            &hash_map([(seed.clone(), 1.0)]),
-            10,
-            None,
-            &crate::CancellationToken::default(),
-        )
-        .unwrap();
-        let (huge_half_life_scores, _) = related_files_by_git(
-            &analyzer,
-            &hash_map([(seed, 1.0)]),
-            10,
-            Some(1.0e9),
-            &crate::CancellationToken::default(),
-        )
-        .unwrap();
-
-        let uniform_target = file_by_name(&uniform_scores, "Target.java")
-            .expect("uniform target score")
-            .score;
-        let huge_target = file_by_name(&huge_half_life_scores, "Target.java")
-            .expect("large half-life target score")
-            .score;
-        assert!((uniform_target - huge_target).abs() < 1.0e-9);
-    }
-
-    #[test]
-    fn small_half_life_sharpens_recency_preference() {
-        let temp = TempDir::new().unwrap();
-        let root = temp.path();
-        write_file(root, "Seed.java", "public class Seed { }");
-        write_file(root, "OldTarget.java", "public class OldTarget { }");
-        write_file(root, "RecentTarget.java", "public class RecentTarget { }");
-
-        let repo = Repository::init(root).unwrap();
-        commit_paths(&repo, "initial seed", &["Seed.java"], &[]);
-        commit_paths(&repo, "add old target", &["OldTarget.java"], &[]);
-        fs::write(
-            root.join("Seed.java"),
-            "public class Seed { int oldUse() { return 1; } }",
-        )
-        .unwrap();
-        fs::write(
-            root.join("OldTarget.java"),
-            "public class OldTarget { int value() { return 1; } }",
-        )
-        .unwrap();
-        commit_paths(&repo, "old cochange", &["Seed.java", "OldTarget.java"], &[]);
-        commit_paths(&repo, "add recent target", &["RecentTarget.java"], &[]);
-        fs::write(
-            root.join("Seed.java"),
-            "public class Seed { int recentUse() { return 2; } }",
-        )
-        .unwrap();
-        fs::write(
-            root.join("RecentTarget.java"),
-            "public class RecentTarget { int value() { return 2; } }",
-        )
-        .unwrap();
-        commit_paths(
-            &repo,
-            "recent cochange",
-            &["Seed.java", "RecentTarget.java"],
-            &[],
-        );
-
-        let analyzer = java_analyzer(root);
-        let (default_ranked, _) = most_relevant_project_files_with_half_life(
-            &analyzer,
-            &[(ProjectFile::new(root.to_path_buf(), "Seed.java"), 1.0)],
-            2,
-            Some(DEFAULT_RECENCY_HALF_LIFE),
-            &crate::CancellationToken::default(),
-        );
-        let (legacy_ranked, _) = most_relevant_project_files_with_half_life(
-            &analyzer,
-            &[(ProjectFile::new(root.to_path_buf(), "Seed.java"), 1.0)],
-            2,
-            None,
-            &crate::CancellationToken::default(),
-        );
-        let (sharp_ranked, _) = most_relevant_project_files_with_half_life(
-            &analyzer,
-            &[(ProjectFile::new(root.to_path_buf(), "Seed.java"), 1.0)],
-            2,
-            Some(1.0),
-            &crate::CancellationToken::default(),
-        );
-
-        assert_eq!(
-            "RecentTarget.java",
-            default_ranked[0].rel_path().display().to_string()
-        );
-        assert_eq!(
-            "OldTarget.java",
-            legacy_ranked[0].rel_path().display().to_string()
-        );
-        assert_eq!(
-            "RecentTarget.java",
-            sharp_ranked[0].rel_path().display().to_string()
-        );
-    }
-
-    #[test]
-    fn commit_age_weight_defaults_to_uniform_when_half_life_is_none() {
-        assert_eq!(1.0, commit_age_weight(0, None));
-        assert_eq!(1.0, commit_age_weight(250, None));
-        assert_eq!(1.0, commit_age_weight(1_000, None));
     }
 
     #[test]
@@ -5033,80 +4348,6 @@ func run() {
         assert!(!Arc::ptr_eq(&left_cache, &right_cache));
     }
 
-    #[test]
-    #[ignore = "benchmark helper for repeated most_relevant_files calls"]
-    fn benchmark_repeat_calls_with_cached_git_history() {
-        let temp = TempDir::new().unwrap();
-        let root = temp.path();
-        write_file(root, "Seed.java", "public class Seed { }");
-        write_file(root, "Target.java", "public class Target { }");
-        write_file(root, "Helper.java", "public class Helper { }");
-
-        let repo = Repository::init(root).unwrap();
-        commit_paths_at(
-            &repo,
-            "initial",
-            &["Seed.java", "Target.java", "Helper.java"],
-            &[],
-            1,
-        );
-        for index in 0..120 {
-            fs::write(
-                root.join("Seed.java"),
-                format!("public class Seed {{ int value{index}() {{ return {index}; }} }}"),
-            )
-            .unwrap();
-            let changed = if index % 3 == 0 {
-                vec!["Seed.java", "Target.java"]
-            } else {
-                vec!["Seed.java", "Helper.java"]
-            };
-            commit_paths_at(
-                &repo,
-                &format!("change {index}"),
-                &changed,
-                &[],
-                index as i64 + 2,
-            );
-        }
-
-        let analyzer = java_analyzer(root);
-        let seeds = [(ProjectFile::new(root.to_path_buf(), "Seed.java"), 1.0)];
-
-        clear_repo_commit_change_cache_for_root(root);
-        let cold_started = Instant::now();
-        for _ in 0..28 {
-            clear_repo_commit_change_cache_for_root(root);
-            let _ = most_relevant_project_files_with_half_life(
-                &analyzer,
-                &seeds,
-                5,
-                Some(DEFAULT_RECENCY_HALF_LIFE),
-                &crate::CancellationToken::default(),
-            );
-        }
-        let cold_elapsed = cold_started.elapsed();
-
-        clear_repo_commit_change_cache_for_root(root);
-        let warm_started = Instant::now();
-        for _ in 0..28 {
-            let _ = most_relevant_project_files_with_half_life(
-                &analyzer,
-                &seeds,
-                5,
-                Some(DEFAULT_RECENCY_HALF_LIFE),
-                &crate::CancellationToken::default(),
-            );
-        }
-        let warm_elapsed = warm_started.elapsed();
-
-        eprintln!(
-            "benchmark_repeat_calls_with_cached_git_history cold_28={:.3}s warm_28={:.3}s",
-            cold_elapsed.as_secs_f64(),
-            warm_elapsed.as_secs_f64()
-        );
-    }
-
     /// M5 ranking-identity regression: repeating the same call against an unchanged HEAD must
     /// reuse the HEAD-keyed commit-OID cache and repo-root cache added in M5, and produce the
     /// exact same ranking. A regression here would mean the cache is returning a different (or
@@ -5285,6 +4526,9 @@ func run() {
         assert_eq!(5, cached_larger.len());
     }
 
+    #[brokk_bifrost_test_macros::hardwon(
+        "#1228: Checks a cold warm-only cache lookup does not start the Git history subprocess for a cancellable request"
+    )]
     #[test]
     fn issue_1228_cancellable_git_ranking_never_spawns_on_a_cold_cache() {
         let temp = TempDir::new().unwrap();

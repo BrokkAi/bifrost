@@ -6,6 +6,7 @@ use crate::analyzer::resolution::{
     LoweredDeferredMemberOwner, LoweredMemberScopeProperty, StackPattern, mounted_site_node,
     mounted_site_semantic,
 };
+use crate::analyzer::store::selected_read_memo::ExactReadMemo;
 use brokk_bifrost_core::analyzer::resolution_facts::ResolutionMemberKind;
 use rusqlite::{OptionalExtension, params};
 
@@ -16,10 +17,14 @@ use rusqlite::{OptionalExtension, params};
 /// outside the file's own lowering, whose body only a request-scoped capsule
 /// lowers. No persisted reference is written in such a scope, so it is no
 /// requester's module.
-pub(super) const MODULES_FOR_BLOB: &str = "SELECT source.topology_id, source.container_path,
+pub(super) const MODULES_FOR_BLOB: &str = "WITH request_roots(topology_id) AS (
+ SELECT CAST(value AS INTEGER) FROM json_each(?3)
+)
+SELECT source.topology_id, source.container_path,
  source.blob_id, source.rel_path, scopes.resolution_scope, crates.edition,
  crates.target_kind='detached' AND EXISTS(SELECT 1 FROM rust_crate_topologies AS cargo
-  WHERE cargo.target_kind<>'detached' AND +cargo.publication_state='complete')
+  WHERE cargo.target_kind<>'detached' AND +cargo.publication_state='complete'),
+ json_array_length(?3)=0 OR source.topology_id IN (SELECT topology_id FROM request_roots)
  FROM rust_crate_container_sources AS source
  CROSS JOIN selected_rust_crates AS crates ON crates.topology_id=source.topology_id
  CROSS JOIN source_rust_module_scopes AS scopes ON scopes.blob_id=source.blob_id AND scopes.ordinal=source.scope_ordinal
@@ -77,21 +82,21 @@ type ExportKey = (i64, String, String, String, i64, String);
 /// runs; the stage's own fact tables are separate and none of them reads
 /// those.
 ///
-/// Only a crate stage holds one: [`CrateStageMemos`] installs it when the
-/// graph build starts a crate and drops it when the build moves to the next
-/// crate. Outside a crate stage the lookups run the statements directly.
+/// Only a crate stage holds one: [`RustGraphStageTables`] installs it for a
+/// native graph unit, and [`CrateStageMemos`] installs it for other scoped
+/// Rust operations. Outside a crate stage the lookups run the statements
+/// directly.
 #[derive(Default)]
 pub(super) struct CrateRowMemo {
-    exports: HashMap<ExportKey, Vec<RustCrateExport>>,
-    scopes: HashMap<(i64, u32), Vec<u32>>,
-    inventories: HashMap<ExportKey, Vec<String>>,
+    exports: ExactReadMemo<ExportKey, Vec<RustCrateExport>>,
+    scopes: ExactReadMemo<(i64, u32), Vec<u32>>,
+    inventories: ExactReadMemo<ExportKey, Vec<String>>,
 }
 
-/// Holds one crate stage's memos: the request's [`CrateRowMemo`], the
-/// inventory's `CrateAccessMemo` and its `AuthorityValidations`, and the
-/// stage's read transaction on the reader. Installed when the graph build
-/// starts a crate and emptied when it drops, so no answer crosses into the
-/// next crate and the reader leaves the stage outside any transaction.
+/// Holds one scoped Rust operation's memos: the request's [`CrateRowMemo`],
+/// the inventory's `CrateAccessMemo` and its `AuthorityValidations`, and the
+/// stage's read transaction on the reader. The native graph path installs the
+/// Rust row tables separately under its shared graph-stage guard.
 pub(crate) struct CrateStageMemos<'a> {
     inventory: &'a super::super::resolution_selection::SelectedResolutionMountInventory<'a>,
     rows: &'a RefCell<Option<CrateRowMemo>>,
@@ -139,6 +144,34 @@ impl Drop for CrateStageMemos<'_> {
             std::thread::panicking() || self.inventory.connection().is_autocommit(),
             "a crate stage left its reader inside a transaction"
         );
+    }
+}
+
+/// Rust-owned export and access rows for one graph stage. The generic graph
+/// guard owns the shared authority-validation memo and reader transaction;
+/// this guard installs only the Rust-specific tables inside that boundary.
+pub(crate) struct RustGraphStageTables<'a> {
+    rows: &'a RefCell<Option<CrateRowMemo>>,
+    access: &'a RefCell<Option<super::rust_crate_access::CrateAccessMemo>>,
+}
+
+impl<'a> RustGraphStageTables<'a> {
+    pub(super) fn install(
+        rows: &'a RefCell<Option<CrateRowMemo>>,
+        access: &'a RefCell<Option<super::rust_crate_access::CrateAccessMemo>>,
+    ) -> Self {
+        assert!(rows.borrow().is_none(), "crate stages do not nest");
+        assert!(access.borrow().is_none(), "crate stages do not nest");
+        *rows.borrow_mut() = Some(CrateRowMemo::default());
+        *access.borrow_mut() = Some(Default::default());
+        Self { rows, access }
+    }
+}
+
+impl Drop for RustGraphStageTables<'_> {
+    fn drop(&mut self) {
+        self.rows.take();
+        self.access.take();
     }
 }
 
@@ -898,16 +931,19 @@ impl RustCrateRows<'_, '_, '_> {
         )
     }
 
-    /// The crate modules one selected file is placed in.
+    /// The crate modules one selected file is placed in, with whether they
+    /// belong to a directly requested root.
     ///
-    /// A file is a module of every topology whose container rows name it, so
-    /// a lookup written in it asks each placement. Both Rust forward routes
-    /// read this, which is why it lives beside the crate rows rather than in
-    /// either one.
+    /// A file is a module of every topology whose container rows name it.
+    /// Lookup asks each directly requested placement; a dependency placement
+    /// cannot supply an alternate `crate::` root for that same source. Both
+    /// Rust forward routes read this, which is why it lives beside the crate
+    /// rows rather than in either one.
     pub(super) fn modules_for_mount(
         &self,
         mounts: SelectedMountTable<'_, '_>,
         ordinal: SelectedResolutionMountOrdinal,
+        request_topologies: &[i64],
         cancellation: &CancellationToken,
     ) -> Result<Vec<Module>> {
         let mount = mounts.mount_by_ordinal(ordinal)?;
@@ -933,21 +969,27 @@ impl RustCrateRows<'_, '_, '_> {
             cancellation,
         )?;
         let fragment = mount.fragment();
+        let request_topologies = serde_json::to_string(request_topologies)
+            .expect("Cargo topology ids serialize as JSON");
         conn.prepare_cached(MODULES_FOR_BLOB)?
-            .query_map(params![blob, mount.persisted_relative_path()], |row| {
-                Ok(Module {
-                    topology: row.get(0)?,
-                    path: row.get(1)?,
-                    blob: row.get(2)?,
-                    rel_path: row.get(3)?,
-                    selected_blob: selected_blob.expect("selected module has a published blob"),
-                    fragment,
-                    scope: ResolutionScopeId::new(row.get(4)?),
-                    edition: row.get(5)?,
-                    unmounted: row.get(6)?,
-                    overlay_completion: overlay_completion.clone(),
-                })
-            })?
+            .query_map(
+                params![blob, mount.persisted_relative_path(), request_topologies],
+                |row| {
+                    Ok(Module {
+                        topology: row.get(0)?,
+                        path: row.get(1)?,
+                        blob: row.get(2)?,
+                        rel_path: row.get(3)?,
+                        selected_blob: selected_blob.expect("selected module has a published blob"),
+                        fragment,
+                        scope: ResolutionScopeId::new(row.get(4)?),
+                        edition: row.get(5)?,
+                        unmounted: row.get(6)?,
+                        requested: row.get(7)?,
+                        overlay_completion: overlay_completion.clone(),
+                    })
+                },
+            )?
             .collect::<rusqlite::Result<Vec<_>>>()
             .map_err(Into::into)
     }
@@ -1723,11 +1765,40 @@ impl RustCrateRows<'_, '_, '_> {
                 }
                 if next.len() == before {
                     if unmounted_root {
-                        *completion = completion.combine(&ResolutionCompletion::incomplete([
-                            ResolutionIncompleteReason::UnmountedFile {
-                                fragment: requester.fragment,
-                            },
-                        ]));
+                        let macro_details =
+                            super::rust_crate_context::macro_gated_unmounted_file_details(
+                                conn,
+                                &requester.rel_path,
+                            )?;
+                        if macro_details.is_empty() {
+                            let inactive_cfg_details =
+                                super::rust_crate_context::inactive_cfg_unmounted_file_details(
+                                    conn,
+                                    &requester.rel_path,
+                                )?;
+                            if inactive_cfg_details.is_empty() {
+                                *completion =
+                                    completion.combine(&ResolutionCompletion::incomplete([
+                                        ResolutionIncompleteReason::UnmountedFile {
+                                            fragment: requester.fragment,
+                                        },
+                                    ]));
+                            } else {
+                                *completion = completion.combine(
+                                    &super::rust_crate_context::inactive_cfg_route_boundary(
+                                        &self.ready.context_identities,
+                                        &inactive_cfg_details,
+                                    ),
+                                );
+                            }
+                        } else {
+                            *completion = completion.combine(
+                                &super::rust_crate_context::macro_gated_route_boundary(
+                                    &self.ready.context_identities,
+                                    &macro_details,
+                                ),
+                            );
+                        }
                     }
                     *completion = completion.combine(&self.crate_inventory_completion(
                         requester,

@@ -8,21 +8,16 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
 import fs from "node:fs";
-import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
+import { withTempDir as withSharedTempDir } from "./test-fixtures.mjs";
 
 const SCRIPT = fileURLToPath(new URL("create-policy-scan-release.sh", import.meta.url));
 const FIXTURE_BIN = fileURLToPath(new URL("../fixtures/workflow-shell/", import.meta.url));
 
 function withTempDir(body) {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bifrost-policy-scan-release."));
-  try {
-    return body(dir);
-  } finally {
-    fs.rmSync(dir, { recursive: true, force: true });
-  }
+  return withSharedTempDir(body, "bifrost-policy-scan-release.");
 }
 
 // The `gh` double in scripts/fixtures/workflow-shell only answers `gh api`. The

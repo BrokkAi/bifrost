@@ -3,17 +3,20 @@ use super::ir::{
     BindingFilter, BindingOfOptions, BindingSeed, BranchRelationFilter, BranchRelationKind,
     CallArgumentSelector, CallIdentity, CallInputSelector, CallSiteTraversalFilter,
     CallTraversalFilter, CandidateFilter, CandidateOutcomeLabel, CodeQuery, CodeQueryPlan,
-    CodeQueryPlanSource, CodeQueryResultDetail, CodeQuerySeed, ConfigurationCompletenessFilter,
-    ConfigurationFactsFilter, ConfigurationFactsSeed, ConfigurationNodeKindFilter,
+    CodeQueryPlanSource, CodeQueryResultDetail, CodeQuerySeed, ConfigurationCodeMatch,
+    ConfigurationCodeRelation, ConfigurationCompletenessFilter, ConfigurationFactsFilter,
+    ConfigurationFactsSeed, ConfigurationKeyRelation, ConfigurationNodeKindFilter,
     ConfigurationRouteFilter, ConfigurationRouteSegmentFilter, ControlRelationFilter,
-    DEFAULT_LIMIT, DeclarationStateFilter, DecoratorBindingFilter, EdgeFilter, ExportFilter,
-    ExportSeed, FailureUseConsumer, FailureUseProvenance, FieldWriteValueTraversal,
+    CppProvenanceFilter, CrossDomainCorrelation, CrossDomainRelation, CrossDomainRequirement,
+    DEFAULT_LIMIT, DeclarationModifier, DeclarationStateFilter, DecoratorBindingFilter,
+    DependencyConfigurationRelation, DependencyEvidenceFilter, DependencyEvidenceSeed, EdgeFilter,
+    ExportFilter, ExportSeed, FailureUseConsumer, FailureUseProvenance, FieldWriteValueTraversal,
     FlowRelationFilter, GenerationSiteFilter, GenerationSiteSeed, HierarchyTraversal,
-    JsxAttributeValueTraversal, KeyedReadKeySelector, KeyedReadValueTraversal, MAX_ARITY,
-    MAX_BINDING_NAME_LENGTH, MAX_CAPTURE_LENGTH, MAX_CONFIGURATION_FILTER_ENTRIES,
-    MAX_CONFIGURATION_KEY_LENGTH, MAX_CONFIGURATION_ROUTE_SEGMENTS,
-    MAX_DECORATOR_BINDING_FILTER_LENGTH, MAX_ENVIRONMENT_FILTER_ENTRIES, MAX_KIND_LIST_ENTRIES,
-    MAX_KWARG_NAME_LENGTH, MAX_KWARGS, MAX_LANGUAGE_FILTERS, MAX_LIMIT,
+    JsxAttributeValueTraversal, KeyedReadKeySelector, KeyedReadValueTraversal, LanguageRule,
+    MAX_ARITY, MAX_BINDING_NAME_LENGTH, MAX_CAPTURE_LENGTH, MAX_CONFIGURATION_FILTER_ENTRIES,
+    MAX_CONFIGURATION_KEY_LENGTH, MAX_CONFIGURATION_ROUTE_SEGMENTS, MAX_CONFIGURATION_VALUE_LENGTH,
+    MAX_CORRELATION_DOCUMENTS, MAX_DECORATOR_BINDING_FILTER_LENGTH, MAX_ENVIRONMENT_FILTER_ENTRIES,
+    MAX_KIND_LIST_ENTRIES, MAX_KWARG_NAME_LENGTH, MAX_KWARGS, MAX_LANGUAGE_FILTERS, MAX_LIMIT,
     MAX_OCCURRENCE_FILTER_ENTRIES, MAX_PATTERN_DEPTH, MAX_PATTERN_NODES, MAX_QUERY_BRANCHES,
     MAX_QUERY_PLAN_DEPTH, MAX_QUERY_PLAN_NODES, MAX_QUERY_STEPS, MAX_ROLE_LIST_ENTRIES,
     MAX_ROW_PREDICATE_SET_MEMBERS, MAX_ROW_PREDICATES, MAX_ROW_PROJECTION_COLUMNS,
@@ -21,26 +24,33 @@ use super::ir::{
     PathSeed, Pattern, QueryError, QueryPathScope, QueryRowLiteral, QueryRowPredicate,
     QueryRowPredicateOp, QueryRowPredicateOperand, QueryRowProjectionColumn, QueryStep,
     ReceiverTraversalFilter, ReferenceTraversalFilter, ResolvedCallFilter, ResolvedCallProof,
-    ResolvedCallReceiverType, ResultContractFailureUseFilter, RewritePathFilter, ScopeFilter,
-    ScopeSeed, SegmentsOfOptions, SetOperator, StateEventFilter, StringPredicate, TaintTraversal,
-    TypestateTraversal, UNATTRIBUTED_TIER_LABEL, ValueFlowTraversal, WitnessTraversal,
-    intersect_language_scopes,
+    ResolvedCallReceiverType, ResolvedValueFilter, ResultContractFailureUseFilter,
+    RewritePathFilter, ScopeFilter, ScopeSeed, SegmentsOfOptions, SetOperator, StateEventFilter,
+    StringPredicate, TaintTraversal, TypestateTraversal, UNATTRIBUTED_TIER_LABEL,
+    ValueFlowTraversal, WitnessTraversal, intersect_language_scopes,
 };
 use super::schema::{
-    ALL_QUERY_STEP_OPS, CodeQueryExecutionMode, PatternField, QueryField, QueryStepField,
-    StringPredicateField, call_traversal_completeness_from_label,
+    ALL_QUERY_PLAN_SOURCES, ALL_QUERY_STEP_OPS, CodeQueryExecutionMode, PatternField, QueryField,
+    QueryStepField, StringPredicateField, call_traversal_completeness_from_label,
     configuration_member_role_from_label, configuration_provenance_from_label,
     configuration_scalar_kind_from_label, jsx_element_identity_from_label,
     reference_kind_from_label, rql_schema_version_registry, usage_kind_from_label,
     usage_proof_from_label, usage_surface_from_label,
 };
+use super::{child_path, index_path};
 use brokk_bifrost_core::analyzer::Language;
+use brokk_bifrost_core::analyzer::cpp_class_facts::CppClassFactKind;
+use brokk_bifrost_core::analyzer::cpp_facts::CppProvenanceRule;
+use brokk_bifrost_core::analyzer::statement_facts::StatementFactKind;
+use brokk_bifrost_core::analyzer::structural::body_relations::{BodyOwner, BodyState};
 use brokk_bifrost_core::analyzer::structural::control_relation::{
     ControlExitPartition, ControlRelationKind,
 };
 use brokk_bifrost_core::analyzer::structural::edges::{OwnerRelation, SiteClass};
+use brokk_bifrost_core::analyzer::structural::facts::AssignmentSequenceKind;
 use brokk_bifrost_core::analyzer::structural::flow_state::{
     FlowCertainty, FlowRelation as FlowRelationLabel, FlowSubjectKind, StateEventClass,
+    StateEventReadCause,
 };
 use brokk_bifrost_core::analyzer::structural::kinds::{ALL_KINDS, NormalizedKind, Role};
 use brokk_bifrost_core::analyzer::structural::materialization::{
@@ -127,18 +137,6 @@ fn type_name(value: &Value) -> &'static str {
     }
 }
 
-fn child_path(path: &str, field: &str) -> String {
-    if path.is_empty() {
-        field.to_string()
-    } else {
-        format!("{path}.{field}")
-    }
-}
-
-fn index_path(path: &str, index: usize) -> String {
-    format!("{path}[{index}]")
-}
-
 #[derive(Clone, Copy, Default)]
 struct QueryFields<'a> {
     where_globs: Option<&'a Value>,
@@ -155,13 +153,39 @@ struct QueryFields<'a> {
     bindings: Option<&'a Value>,
     generation_sites: Option<&'a Value>,
     exports: Option<&'a Value>,
+    dependency_evidence: Option<&'a Value>,
     configuration_facts: Option<&'a Value>,
+    correlate: Option<&'a Value>,
+    require_both: Option<&'a Value>,
     paths: Option<&'a Value>,
     steps: Option<&'a Value>,
     limit: Option<&'a Value>,
     result_detail: Option<&'a Value>,
     execution_mode: Option<&'a Value>,
     schema_version: Option<&'a Value>,
+}
+
+impl<'a> QueryFields<'a> {
+    /// The value this query authored for one plan source, if any.
+    fn source(&self, source: QueryField) -> Option<&'a Value> {
+        match source {
+            QueryField::Match => self.root,
+            QueryField::Occurrences => self.occurrences,
+            QueryField::Scopes => self.scopes,
+            QueryField::Bindings => self.bindings,
+            QueryField::GenerationSites => self.generation_sites,
+            QueryField::Exports => self.exports,
+            QueryField::DependencyEvidence => self.dependency_evidence,
+            QueryField::ConfigurationFacts => self.configuration_facts,
+            QueryField::Correlate => self.correlate,
+            QueryField::RequireBoth => self.require_both,
+            QueryField::Paths => self.paths,
+            QueryField::Union => self.union,
+            QueryField::Intersect => self.intersect,
+            QueryField::Except => self.except,
+            other => unreachable!("{} is not a query plan source", other.label()),
+        }
+    }
 }
 
 fn collect_query_fields<'a>(
@@ -191,7 +215,10 @@ fn collect_query_fields<'a>(
             QueryField::Bindings => fields.bindings = Some(value),
             QueryField::GenerationSites => fields.generation_sites = Some(value),
             QueryField::Exports => fields.exports = Some(value),
+            QueryField::DependencyEvidence => fields.dependency_evidence = Some(value),
             QueryField::ConfigurationFacts => fields.configuration_facts = Some(value),
+            QueryField::Correlate => fields.correlate = Some(value),
+            QueryField::RequireBoth => fields.require_both = Some(value),
             QueryField::Paths => fields.paths = Some(value),
             QueryField::Steps => fields.steps = Some(value),
             QueryField::Limit => fields.limit = Some(value),
@@ -239,42 +266,36 @@ fn decode_plan(
         }
     }
 
-    let sources = [
-        ("match", fields.root),
-        ("occurrences", fields.occurrences),
-        ("scopes", fields.scopes),
-        ("bindings", fields.bindings),
-        ("generation_sites", fields.generation_sites),
-        ("exports", fields.exports),
-        ("configuration_facts", fields.configuration_facts),
-        ("paths", fields.paths),
-        ("union", fields.union),
-        ("intersect", fields.intersect),
-        ("except", fields.except),
-    ];
-    let present = sources
+    let present = ALL_QUERY_PLAN_SOURCES
         .iter()
-        .filter_map(|(label, value)| value.map(|value| (*label, value)))
+        .filter_map(|source| fields.source(*source).map(|value| (*source, value)))
         .collect::<Vec<_>>();
     if present.is_empty() {
+        let labels = ALL_QUERY_PLAN_SOURCES
+            .iter()
+            .map(|source| source.label())
+            .collect::<Vec<_>>();
+        let (last, leading) = labels
+            .split_last()
+            .expect("query plan declares its sources");
         return Err(QueryError::new(
             child_path(path, "match"),
-            "one of match, occurrences, scopes, bindings, paths, union, intersect, or except is required",
+            format!("one of {}, or {last} is required", leading.join(", ")),
         ));
     }
     if present.len() > 1 {
         return Err(QueryError::new(
-            child_path(path, present[1].0),
+            child_path(path, present[1].0.label()),
             format!(
                 "query plan source is mutually exclusive with {}",
-                present[0].0
+                present[0].0.label()
             ),
         ));
     }
 
     let source = if let Some(value) = fields.root {
         let match_path = child_path(path, "match");
-        let root_pattern = decode_pattern(value, &match_path, budget, 0)?;
+        let root_pattern = decode_pattern(value, &match_path, budget, 0, false)?;
         if root_pattern.kinds.is_empty()
             && root_pattern.name.is_none()
             && root_pattern.text.is_none()
@@ -287,7 +308,7 @@ fn decode_plan(
         let inside_path = child_path(path, "inside");
         let inside = fields
             .inside
-            .map(|value| decode_pattern(value, &inside_path, budget, 0))
+            .map(|value| decode_pattern(value, &inside_path, budget, 0, false))
             .transpose()?;
         if let Some(pattern) = &inside
             && pattern.is_empty()
@@ -297,7 +318,7 @@ fn decode_plan(
         let inside_decl_path = child_path(path, "inside_decl");
         let inside_decl = fields
             .inside_decl
-            .map(|value| decode_pattern(value, &inside_decl_path, budget, 0))
+            .map(|value| decode_pattern(value, &inside_decl_path, budget, 0, false))
             .transpose()?;
         if let Some(pattern) = &inside_decl
             && pattern.is_empty()
@@ -310,7 +331,7 @@ fn decode_plan(
         let not_inside_path = child_path(path, "not_inside");
         let not_inside = fields
             .not_inside
-            .map(|value| decode_pattern(value, &not_inside_path, budget, 0))
+            .map(|value| decode_pattern(value, &not_inside_path, budget, 0, false))
             .transpose()?;
         if let Some(pattern) = &not_inside
             && pattern.is_empty()
@@ -449,6 +470,24 @@ fn decode_plan(
                 .unwrap_or_default(),
             filter: decode_export_filter(object, &exports_path)?,
         }))
+    } else if let Some(value) = fields.dependency_evidence {
+        let evidence_path = child_path(path, "dependency_evidence");
+        reject_structural_containment(&fields, path, "dependency_evidence")?;
+        if fields.languages.is_some() {
+            return Err(QueryError::new(
+                child_path(path, "languages"),
+                "dependency evidence has an ecosystem axis, not a programming-language axis",
+            ));
+        }
+        let object = as_object(value, &evidence_path)?;
+        CodeQueryPlanSource::DependencyEvidence(Box::new(DependencyEvidenceSeed {
+            where_globs: fields
+                .where_globs
+                .map(|value| decode_path_scope(value, &child_path(path, "where")))
+                .transpose()?
+                .unwrap_or_default(),
+            filter: decode_dependency_evidence_filter(object, &evidence_path)?,
+        }))
     } else if let Some(value) = fields.configuration_facts {
         let configuration_path = child_path(path, "configuration_facts");
         reject_structural_containment(&fields, path, "configuration_facts")?;
@@ -467,6 +506,40 @@ fn decode_plan(
                 .unwrap_or_default(),
             filter: decode_configuration_facts_filter(object, &configuration_path)?,
         }))
+    } else if let Some(value) = fields.correlate {
+        let correlate_path = child_path(path, "correlate");
+        reject_structural_containment(&fields, path, "correlate")?;
+        let inputs = decode_cross_domain_inputs(value, &correlate_path, budget, depth)?;
+        let relation_path = child_path(&correlate_path, "relation");
+        let relation = inputs.relation.ok_or_else(|| {
+            QueryError::new(
+                &relation_path,
+                "correlate requires a registered relation; use require_both to require both inputs without relating their rows",
+            )
+        })?;
+        let mut source = CodeQueryPlanSource::Correlate(Box::new(CrossDomainCorrelation {
+            relation: decode_cross_domain_relation(relation, &relation_path)?,
+            code: inputs.code,
+            configuration: inputs.configuration,
+        }));
+        conjoin_shared_scope(&mut source, &fields, path)?;
+        source
+    } else if let Some(value) = fields.require_both {
+        let require_path = child_path(path, "require_both");
+        reject_structural_containment(&fields, path, "require_both")?;
+        let inputs = decode_cross_domain_inputs(value, &require_path, budget, depth)?;
+        if inputs.relation.is_some() {
+            return Err(QueryError::new(
+                child_path(&require_path, "relation"),
+                "require_both never relates rows; use correlate with a registered relation to pair them",
+            ));
+        }
+        let mut source = CodeQueryPlanSource::RequireBoth(Box::new(CrossDomainRequirement {
+            code: inputs.code,
+            configuration: inputs.configuration,
+        }));
+        conjoin_shared_scope(&mut source, &fields, path)?;
+        source
     } else {
         for (label, value) in [
             ("inside", fields.inside),
@@ -520,20 +593,7 @@ fn decode_plan(
             )?);
         }
         let mut set = CodeQueryPlanSource::Set { op, branches };
-        if let Some(shared_scope) = fields
-            .where_globs
-            .map(|value| decode_path_scope(value, &child_path(path, "where")))
-            .transpose()?
-        {
-            conjoin_source_scope(&mut set, Some(&shared_scope), None, path)?;
-        }
-        if let Some(shared_languages) = fields
-            .languages
-            .map(|value| decode_languages(value, &child_path(path, "languages")))
-            .transpose()?
-        {
-            conjoin_source_scope(&mut set, None, Some(&shared_languages), path)?;
-        }
+        conjoin_shared_scope(&mut set, &fields, path)?;
         set
     };
 
@@ -648,6 +708,302 @@ fn reject_structural_containment(
         }
     }
     Ok(())
+}
+
+/// Conjoin a composite source's own `where` and `languages` fields into every
+/// seed it reads.
+fn conjoin_shared_scope(
+    source: &mut CodeQueryPlanSource,
+    fields: &QueryFields<'_>,
+    path: &str,
+) -> Result<(), QueryError> {
+    if let Some(shared_scope) = fields
+        .where_globs
+        .map(|value| decode_path_scope(value, &child_path(path, "where")))
+        .transpose()?
+    {
+        conjoin_source_scope(source, Some(&shared_scope), None, path)?;
+    }
+    if let Some(shared_languages) = fields
+        .languages
+        .map(|value| decode_languages(value, &child_path(path, "languages")))
+        .transpose()?
+    {
+        conjoin_source_scope(source, None, Some(&shared_languages), path)?;
+    }
+    Ok(())
+}
+
+/// The authored fields of one `correlate` or `require_both` object.
+struct CrossDomainInputs<'a> {
+    relation: Option<&'a Value>,
+    code: CodeQueryPlan,
+    configuration: CodeQueryPlan,
+}
+
+fn decode_cross_domain_inputs<'a>(
+    value: &'a Value,
+    path: &str,
+    budget: &mut QueryBudget,
+    depth: usize,
+) -> Result<CrossDomainInputs<'a>, QueryError> {
+    use super::schema::CrossDomainField;
+    let object = as_object(value, path)?;
+    let mut relation = None;
+    let mut code = None;
+    let mut configuration = None;
+    for (key, value) in object {
+        match CrossDomainField::from_label(key) {
+            Some(CrossDomainField::Relation) => relation = Some(value),
+            Some(CrossDomainField::Code) => code = Some(value),
+            Some(CrossDomainField::Configuration) => configuration = Some(value),
+            None => {
+                return Err(QueryError::new(
+                    child_path(path, key),
+                    "unknown cross-domain field; expected relation, code, or configuration",
+                ));
+            }
+        }
+    }
+    let mut input = |value: Option<&Value>, label: &str| {
+        let input_path = child_path(path, label);
+        let value = value.ok_or_else(|| {
+            QueryError::new(
+                &input_path,
+                format!("a cross-domain operator requires a {label} query"),
+            )
+        })?;
+        let object = as_object(value, &input_path)?;
+        let input_fields = collect_query_fields(object, &input_path)?;
+        decode_plan(input_fields, &input_path, budget, false, depth + 1)
+    };
+    let code = input(code, "code")?;
+    let configuration = input(configuration, "configuration")?;
+    Ok(CrossDomainInputs {
+        relation,
+        code,
+        configuration,
+    })
+}
+
+fn decode_cross_domain_relation(
+    value: &Value,
+    path: &str,
+) -> Result<CrossDomainRelation, QueryError> {
+    use super::schema::{
+        ALL_CROSS_DOMAIN_RELATION_FIELDS, ConfigurationCodeRelationField,
+        ConfigurationKeyRelationField, CrossDomainRelationField,
+    };
+    let object = as_object(value, path)?;
+    let registered = ALL_CROSS_DOMAIN_RELATION_FIELDS
+        .iter()
+        .map(|relation| relation.label())
+        .collect::<Vec<_>>();
+    let mut entries = object.iter();
+    let (Some((label, body)), None) = (entries.next(), entries.next()) else {
+        return Err(QueryError::new(
+            path,
+            format!("a relation names exactly one registered relation: {registered:?}"),
+        ));
+    };
+    let relation_path = child_path(path, label);
+    match CrossDomainRelationField::from_label(label) {
+        Some(CrossDomainRelationField::ConfigurationKey) => {
+            let body = as_object(body, &relation_path)?;
+            let mut documents = None;
+            for (key, value) in body {
+                match ConfigurationKeyRelationField::from_label(key) {
+                    Some(ConfigurationKeyRelationField::Documents) => documents = Some(value),
+                    None => {
+                        return Err(QueryError::new(
+                            child_path(&relation_path, key),
+                            "unknown configuration_key field; expected documents",
+                        ));
+                    }
+                }
+            }
+            let documents_path = child_path(&relation_path, "documents");
+            let entries = documents
+                .ok_or_else(|| {
+                    QueryError::new(
+                        &documents_path,
+                        "configuration_key requires the documents the binding reads",
+                    )
+                })?
+                .as_array()
+                .ok_or_else(|| {
+                    QueryError::new(&documents_path, "expected an array of document paths")
+                })?;
+            if entries.is_empty() || entries.len() > MAX_CORRELATION_DOCUMENTS {
+                return Err(QueryError::new(
+                    &documents_path,
+                    format!(
+                        "configuration_key declares from 1 through {MAX_CORRELATION_DOCUMENTS} documents"
+                    ),
+                ));
+            }
+            let mut documents = entries
+                .iter()
+                .enumerate()
+                .map(|(index, entry)| {
+                    entry.as_str().map(str::to_owned).ok_or_else(|| {
+                        QueryError::new(
+                            index_path(&documents_path, index),
+                            "expected a workspace-relative document path string",
+                        )
+                    })
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            documents.sort();
+            documents.dedup();
+            Ok(CrossDomainRelation::ConfigurationKey(
+                ConfigurationKeyRelation { documents },
+            ))
+        }
+        Some(CrossDomainRelationField::ConfigurationCode) => {
+            let body = as_object(body, &relation_path)?;
+            let mut match_kind = None;
+            let mut absence = false;
+            for (key, value) in body {
+                match ConfigurationCodeRelationField::from_label(key) {
+                    Some(ConfigurationCodeRelationField::Match) => {
+                        let field_path = child_path(&relation_path, key);
+                        let label = value.as_str().ok_or_else(|| {
+                            QueryError::new(
+                                &field_path,
+                                "expected a configuration-code match label",
+                            )
+                        })?;
+                        match_kind = Some(ConfigurationCodeMatch::from_label(label).ok_or_else(|| {
+                            QueryError::new(
+                                &field_path,
+                                format!(
+                                    "unknown configuration-code match {label:?}; expected one of {}",
+                                    ConfigurationCodeMatch::ALL
+                                        .iter()
+                                        .map(|kind| kind.label())
+                                        .collect::<Vec<_>>()
+                                        .join(", ")
+                                ),
+                            )
+                        })?);
+                    }
+                    Some(ConfigurationCodeRelationField::Absence) => {
+                        let field_path = child_path(&relation_path, key);
+                        absence = value
+                            .as_bool()
+                            .ok_or_else(|| QueryError::new(&field_path, "expected a boolean"))?;
+                    }
+                    None => {
+                        return Err(QueryError::new(
+                            child_path(&relation_path, key),
+                            "unknown configuration_code field; expected match or absence",
+                        ));
+                    }
+                }
+            }
+            let match_kind = match_kind.ok_or_else(|| {
+                QueryError::new(
+                    child_path(&relation_path, "match"),
+                    "configuration_code requires a match kind",
+                )
+            })?;
+            Ok(CrossDomainRelation::ConfigurationCode(
+                ConfigurationCodeRelation {
+                    match_kind,
+                    absence,
+                },
+            ))
+        }
+        Some(CrossDomainRelationField::DependencyConfiguration) => {
+            use super::schema::DependencyConfigurationRelationField;
+            let body = as_object(body, &relation_path)?;
+            for key in body.keys() {
+                if DependencyConfigurationRelationField::from_label(key).is_none() {
+                    return Err(QueryError::new(
+                        child_path(&relation_path, key),
+                        "unknown dependency_configuration field",
+                    ));
+                }
+            }
+            let required_string = |field: &str| -> Result<String, QueryError> {
+                body.get(field)
+                    .and_then(Value::as_str)
+                    .map(str::to_owned)
+                    .ok_or_else(|| {
+                        QueryError::new(child_path(&relation_path, field), "required string field")
+                    })
+            };
+            let required_strings = |field: &str| -> Result<Vec<String>, QueryError> {
+                let field_path = child_path(&relation_path, field);
+                let entries = body
+                    .get(field)
+                    .and_then(Value::as_array)
+                    .ok_or_else(|| QueryError::new(&field_path, "required array of strings"))?;
+                entries
+                    .iter()
+                    .enumerate()
+                    .map(|(index, value)| {
+                        value.as_str().map(str::to_owned).ok_or_else(|| {
+                            QueryError::new(index_path(&field_path, index), "expected string")
+                        })
+                    })
+                    .collect()
+            };
+            let overrides_path = child_path(&relation_path, "overrides");
+            let overrides = match body.get("overrides") {
+                None => Vec::new(),
+                Some(value) => value
+                    .as_array()
+                    .ok_or_else(|| {
+                        QueryError::new(
+                            &overrides_path,
+                            "expected array of lower-to-higher document pairs",
+                        )
+                    })?
+                    .iter()
+                    .enumerate()
+                    .map(|(index, edge)| {
+                        let edge_path = index_path(&overrides_path, index);
+                        let edge =
+                            edge.as_array()
+                                .filter(|edge| edge.len() == 2)
+                                .ok_or_else(|| {
+                                    QueryError::new(
+                                        &edge_path,
+                                        "override edge requires exactly two document strings",
+                                    )
+                                })?;
+                        let endpoint = |index: usize| {
+                            edge[index].as_str().map(str::to_owned).ok_or_else(|| {
+                                QueryError::new(
+                                    index_path(&edge_path, index),
+                                    "expected document string",
+                                )
+                            })
+                        };
+                        Ok([endpoint(0)?, endpoint(1)?])
+                    })
+                    .collect::<Result<Vec<_>, QueryError>>()?,
+            };
+            let mut relation = DependencyConfigurationRelation {
+                owner: required_string("owner")?,
+                ecosystem: required_string("ecosystem")?,
+                version_ranges: required_strings("version_ranges")?,
+                documents: required_strings("documents")?,
+                overrides,
+                values: required_strings("values")?,
+            };
+            super::ir::validate_dependency_configuration_relation(&relation, &relation_path)?;
+            relation.documents.sort();
+            relation.documents.dedup();
+            Ok(CrossDomainRelation::DependencyConfiguration(relation))
+        }
+        None => Err(QueryError::new(
+            relation_path,
+            format!("unknown cross-domain relation; expected one of {registered:?}"),
+        )),
+    }
 }
 
 /// Decode one constrained-value axis that accepts either a single label or an
@@ -891,7 +1247,13 @@ pub(super) fn decode_state_event_filter(
 ) -> Result<StateEventFilter, QueryError> {
     let classes = QueryStepField::StateEventClasses.label();
     let subjects = QueryStepField::StateEventSubjects.label();
-    reject_unknown_filter_fields(object, path, &[classes, subjects, "op"], "state event")?;
+    let read_causes = QueryStepField::StateEventReadCauses.label();
+    reject_unknown_filter_fields(
+        object,
+        path,
+        &[classes, subjects, read_causes, "op"],
+        "state event",
+    )?;
     Ok(StateEventFilter {
         classes: decode_environment_axis(
             object,
@@ -906,6 +1268,13 @@ pub(super) fn decode_state_event_filter(
             subjects,
             "flow subject kind",
             FlowSubjectKind::from_label,
+        )?,
+        read_causes: decode_environment_axis(
+            object,
+            path,
+            read_causes,
+            "state-event read cause",
+            StateEventReadCause::from_label,
         )?,
     })
 }
@@ -983,6 +1352,23 @@ pub(super) fn decode_branch_relation_filter(
             field,
             "branch relation",
             BranchRelationKind::from_label,
+        )?,
+    })
+}
+
+fn decode_cpp_provenance_filter(
+    object: &Map<String, Value>,
+    path: &str,
+) -> Result<CppProvenanceFilter, QueryError> {
+    let field = QueryStepField::CppProvenance.label();
+    reject_unknown_filter_fields(object, path, &[field, "op"], "C/C++ provenance")?;
+    Ok(CppProvenanceFilter {
+        rules: decode_environment_axis(
+            object,
+            path,
+            field,
+            "C/C++ provenance rule",
+            CppProvenanceRule::from_label,
         )?,
     })
 }
@@ -1240,6 +1626,74 @@ fn decode_configuration_keys(
     Ok(keys)
 }
 
+fn decode_configuration_values(
+    object: &Map<String, Value>,
+    path: &str,
+    field: &str,
+) -> Result<Vec<String>, QueryError> {
+    let Some(value) = object.get(field) else {
+        return Ok(Vec::new());
+    };
+    let field_path = child_path(path, field);
+    let entries = value
+        .as_array()
+        .ok_or_else(|| QueryError::new(&field_path, "expected an array of configuration values"))?;
+    if entries.len() > MAX_CONFIGURATION_FILTER_ENTRIES {
+        return Err(QueryError::new(
+            &field_path,
+            format!("at most {MAX_CONFIGURATION_FILTER_ENTRIES} configuration values are allowed"),
+        ));
+    }
+    let mut values = Vec::with_capacity(entries.len());
+    for (index, entry) in entries.iter().enumerate() {
+        let entry_path = index_path(&field_path, index);
+        let value = entry.as_str().ok_or_else(|| {
+            QueryError::new(&entry_path, "expected a configuration scalar value string")
+        })?;
+        if value.len() > MAX_CONFIGURATION_VALUE_LENGTH {
+            return Err(QueryError::new(
+                &entry_path,
+                format!(
+                    "configuration scalar value length must be at most {MAX_CONFIGURATION_VALUE_LENGTH}"
+                ),
+            ));
+        }
+        if !values.iter().any(|candidate| candidate == value) {
+            values.push(value.to_string());
+        }
+    }
+    Ok(values)
+}
+
+fn decode_configuration_numeric_bound(
+    object: &Map<String, Value>,
+    path: &str,
+    field: &str,
+) -> Result<Option<String>, QueryError> {
+    let Some(value) = object.get(field) else {
+        return Ok(None);
+    };
+    let field_path = child_path(path, field);
+    let value = value
+        .as_str()
+        .ok_or_else(|| QueryError::new(&field_path, "expected a finite numeric bound string"))?;
+    if value.len() > MAX_CONFIGURATION_VALUE_LENGTH {
+        return Err(QueryError::new(
+            &field_path,
+            format!(
+                "configuration numeric bound length must be at most {MAX_CONFIGURATION_VALUE_LENGTH}"
+            ),
+        ));
+    }
+    if !value.parse::<f64>().is_ok_and(|number| number.is_finite()) {
+        return Err(QueryError::new(
+            &field_path,
+            "expected a finite numeric bound string",
+        ));
+    }
+    Ok(Some(value.to_string()))
+}
+
 fn decode_configuration_fact_ordinals(
     object: &Map<String, Value>,
     path: &str,
@@ -1274,6 +1728,22 @@ fn decode_configuration_fact_ordinals(
         }
     }
     Ok(ordinals)
+}
+
+fn decode_configuration_nonnegative_integer(
+    object: &Map<String, Value>,
+    path: &str,
+    field: &str,
+) -> Result<Option<u32>, QueryError> {
+    let Some(value) = object.get(field) else {
+        return Ok(None);
+    };
+    let field_path = child_path(path, field);
+    let value = value
+        .as_u64()
+        .and_then(|value| u32::try_from(value).ok())
+        .ok_or_else(|| QueryError::new(&field_path, "expected a non-negative 32-bit integer"))?;
+    Ok(Some(value))
 }
 
 fn decode_configuration_route_segment(
@@ -1394,6 +1864,25 @@ pub(super) fn decode_configuration_facts_filter(
             "roles",
             "scalar_kinds",
             "keys",
+            "values",
+            "values_ignore_case",
+            "value_lt",
+            "value_le",
+            "value_gt",
+            "value_ge",
+            "xml_parent_keys",
+            "xml_preceding_sibling_keys",
+            "xml_sibling_attribute_keys",
+            "xml_sibling_attribute_values",
+            "xml_sibling_attribute_values_ignore_case",
+            "xml_reference_source_keys",
+            "xml_reference_target_keys",
+            "xml_reference_target_element_keys",
+            "xml_reference_target_child_keys",
+            "xml_peer_element_keys",
+            "xml_peer_attribute_keys",
+            "xml_peer_child_keys",
+            "xml_peer_min_shared_children",
             "routes",
             "fact_ordinals",
             "provenances",
@@ -1431,6 +1920,65 @@ pub(super) fn decode_configuration_facts_filter(
             configuration_scalar_kind_from_label,
         )?,
         keys: decode_configuration_keys(object, path)?,
+        values: decode_configuration_values(object, path, "values")?,
+        values_ignore_case: decode_configuration_values(object, path, "values_ignore_case")?,
+        value_lt: decode_configuration_numeric_bound(object, path, "value_lt")?,
+        value_le: decode_configuration_numeric_bound(object, path, "value_le")?,
+        value_gt: decode_configuration_numeric_bound(object, path, "value_gt")?,
+        value_ge: decode_configuration_numeric_bound(object, path, "value_ge")?,
+        xml_parent_keys: decode_configuration_values(object, path, "xml_parent_keys")?,
+        xml_preceding_sibling_keys: decode_configuration_values(
+            object,
+            path,
+            "xml_preceding_sibling_keys",
+        )?,
+        xml_sibling_attribute_keys: decode_configuration_values(
+            object,
+            path,
+            "xml_sibling_attribute_keys",
+        )?,
+        xml_sibling_attribute_values: decode_configuration_values(
+            object,
+            path,
+            "xml_sibling_attribute_values",
+        )?,
+        xml_sibling_attribute_values_ignore_case: decode_configuration_values(
+            object,
+            path,
+            "xml_sibling_attribute_values_ignore_case",
+        )?,
+        xml_reference_source_keys: decode_configuration_values(
+            object,
+            path,
+            "xml_reference_source_keys",
+        )?,
+        xml_reference_target_keys: decode_configuration_values(
+            object,
+            path,
+            "xml_reference_target_keys",
+        )?,
+        xml_reference_target_element_keys: decode_configuration_values(
+            object,
+            path,
+            "xml_reference_target_element_keys",
+        )?,
+        xml_reference_target_child_keys: decode_configuration_values(
+            object,
+            path,
+            "xml_reference_target_child_keys",
+        )?,
+        xml_peer_element_keys: decode_configuration_values(object, path, "xml_peer_element_keys")?,
+        xml_peer_attribute_keys: decode_configuration_values(
+            object,
+            path,
+            "xml_peer_attribute_keys",
+        )?,
+        xml_peer_child_keys: decode_configuration_values(object, path, "xml_peer_child_keys")?,
+        xml_peer_min_shared_children: decode_configuration_nonnegative_integer(
+            object,
+            path,
+            "xml_peer_min_shared_children",
+        )?,
         routes: decode_configuration_routes(object, path)?,
         fact_ordinals: decode_configuration_fact_ordinals(object, path)?,
         provenances: decode_configuration_enum_axis(
@@ -1543,8 +2091,11 @@ fn conjoin_source_scope(
     languages: Option<&[Language]>,
     path: &str,
 ) -> Result<(), QueryError> {
-    let mut pending = vec![(source, path.to_string())];
-    while let Some((source, path)) = pending.pop() {
+    // The third element says whether the shared language scope reaches this
+    // source: a cross-domain operator applies it to its code input only,
+    // because configuration has no programming-language axis.
+    let mut pending = vec![(source, path.to_string(), languages)];
+    while let Some((source, path, languages)) = pending.pop() {
         let (local_scope, local_languages) = match source {
             CodeQueryPlanSource::Seed(seed) => (&mut seed.where_globs, &mut seed.languages),
             CodeQueryPlanSource::Occurrences(seed) => (&mut seed.where_globs, &mut seed.languages),
@@ -1555,6 +2106,21 @@ fn conjoin_source_scope(
                 (&mut seed.where_globs, &mut seed.languages)
             }
             CodeQueryPlanSource::Exports(seed) => (&mut seed.where_globs, &mut seed.languages),
+            CodeQueryPlanSource::DependencyEvidence(seed) => {
+                if let Some(shared) = scope {
+                    seed.where_globs = seed
+                        .where_globs
+                        .combine(shared)
+                        .map_err(|e| QueryError::new(child_path(&path, "where"), e.to_string()))?;
+                }
+                if languages.is_some() {
+                    return Err(QueryError::new(
+                        child_path(&path, "languages"),
+                        "dependency evidence has an ecosystem axis",
+                    ));
+                }
+                continue;
+            }
             CodeQueryPlanSource::ConfigurationFacts(seed) => {
                 if let Some(shared) = scope {
                     seed.where_globs = seed.where_globs.combine(shared).map_err(|error| {
@@ -1577,9 +2143,41 @@ fn conjoin_source_scope(
                         .enumerate()
                         .rev()
                         .map(|(index, branch)| {
-                            (&mut branch.source, index_path(&branch_path, index))
+                            (
+                                &mut branch.source,
+                                index_path(&branch_path, index),
+                                languages,
+                            )
                         }),
                 );
+                continue;
+            }
+            CodeQueryPlanSource::Correlate(correlation) => {
+                let operator_path = child_path(&path, "correlate");
+                pending.push((
+                    &mut correlation.configuration.source,
+                    child_path(&operator_path, "configuration"),
+                    None,
+                ));
+                pending.push((
+                    &mut correlation.code.source,
+                    child_path(&operator_path, "code"),
+                    languages,
+                ));
+                continue;
+            }
+            CodeQueryPlanSource::RequireBoth(requirement) => {
+                let operator_path = child_path(&path, "require_both");
+                pending.push((
+                    &mut requirement.configuration.source,
+                    child_path(&operator_path, "configuration"),
+                    None,
+                ));
+                pending.push((
+                    &mut requirement.code.source,
+                    child_path(&operator_path, "code"),
+                    languages,
+                ));
                 continue;
             }
         };
@@ -1805,7 +2403,7 @@ fn decode_row_name(value: &Value, path: &str, what: &str) -> Result<String, Quer
     let Some(name) = value.as_str() else {
         return Err(QueryError::new(path, format!("{what} must be a string")));
     };
-    if name.is_empty() || name.len() > super::ir::MAX_ROW_FIELD_NAME_LENGTH {
+    if !super::ir::is_valid_row_field_name(name) {
         return Err(QueryError::new(
             path,
             format!(
@@ -1822,7 +2420,7 @@ fn decode_row_literal(value: &Value, path: &str) -> Result<QueryRowLiteral, Quer
     if object.len() != 1 {
         return Err(QueryError::new(
             path,
-            "row literal must contain exactly one of string, string_list, integer, boolean, or enum",
+            "row literal must contain exactly one of string, string_list, integer_list, integer, boolean, or enum",
         ));
     }
     if let Some(value) = object.get("string") {
@@ -1848,6 +2446,24 @@ fn decode_row_literal(value: &Value, path: &str) -> Result<QueryRowLiteral, Quer
             })?);
         }
         return Ok(QueryRowLiteral::StringList(strings));
+    }
+    if let Some(value) = object.get("integer_list") {
+        let values = value.as_array().ok_or_else(|| {
+            QueryError::new(
+                child_path(path, "integer_list"),
+                "expected an array of non-negative integers",
+            )
+        })?;
+        let mut integers = Vec::with_capacity(values.len());
+        for (index, value) in values.iter().enumerate() {
+            integers.push(value.as_u64().ok_or_else(|| {
+                QueryError::new(
+                    format!("{}.integer_list[{index}]", path),
+                    "expected a non-negative integer",
+                )
+            })?);
+        }
+        return Ok(QueryRowLiteral::IntegerList(integers));
     }
     if let Some(value) = object.get("integer") {
         return value.as_u64().map(QueryRowLiteral::Integer).ok_or_else(|| {
@@ -1877,7 +2493,7 @@ fn decode_row_literal(value: &Value, path: &str) -> Result<QueryRowLiteral, Quer
     }
     Err(QueryError::new(
         path,
-        "unknown row literal; expected string, string_list, integer, boolean, or enum",
+        "unknown row literal; expected string, string_list, integer_list, integer, boolean, or enum",
     ))
 }
 
@@ -2086,6 +2702,13 @@ fn decode_steps(value: &Value, path: &str) -> Result<Vec<QueryStep>, QueryError>
         let mut step = match op {
             super::schema::QueryStepOp::Filter => QueryStep::Filter(Vec::new()),
             super::schema::QueryStepOp::Project => QueryStep::Project(Vec::new()),
+            super::schema::QueryStepOp::CaptureAnchor => QueryStep::CaptureAnchor(String::new()),
+            super::schema::QueryStepOp::ConfigurationAbsence => {
+                QueryStep::ConfigurationAbsence(Box::default())
+            }
+            super::schema::QueryStepOp::StatementFacts => {
+                QueryStep::StatementFacts(StatementFactKind::AllocaInLoop)
+            }
             super::schema::QueryStepOp::Typestate => {
                 let protocol_ref_path = child_path(&entry_path, "protocol_ref");
                 let protocol_ref = object
@@ -2144,6 +2767,12 @@ fn decode_steps(value: &Value, path: &str) -> Result<Vec<QueryStep>, QueryError>
                     receiver_type: None,
                 })
             }
+            super::schema::QueryStepOp::ResolvedValue => {
+                QueryStep::ResolvedValue(ResolvedValueFilter {
+                    resolves_to: CallIdentity::Stable(String::new()),
+                    proof: ResolvedCallProof::Exact,
+                })
+            }
             super::schema::QueryStepOp::CallArgument => {
                 QueryStep::CallArgument(CallArgumentSelector::FormalIndex(0))
             }
@@ -2162,9 +2791,14 @@ fn decode_steps(value: &Value, path: &str) -> Result<Vec<QueryStep>, QueryError>
         );
         let call_input = matches!(step, QueryStep::CallInput(_));
         let resolved_call = matches!(step, QueryStep::ResolvedCall(_));
+        let resolved_value = matches!(step, QueryStep::ResolvedValue(_));
         let call_argument = matches!(step, QueryStep::CallArgument(_));
         let row_filter = matches!(step, QueryStep::Filter(_));
         let row_project = matches!(step, QueryStep::Project(_));
+        let capture_anchor = matches!(step, QueryStep::CaptureAnchor(_));
+        let configuration_absence = matches!(step, QueryStep::ConfigurationAbsence(_));
+        let statement_facts = matches!(step, QueryStep::StatementFacts(_));
+        let cpp_facts = matches!(step, QueryStep::CppFacts(_));
         let jsx_attribute_value = matches!(step, QueryStep::JsxAttributeValue(_));
         let field_write_value = matches!(step, QueryStep::FieldWriteValue(_));
         let keyed_read_value = matches!(step, QueryStep::KeyedReadValue(_));
@@ -2191,12 +2825,43 @@ fn decode_steps(value: &Value, path: &str) -> Result<Vec<QueryStep>, QueryError>
         let control_relation = matches!(step, QueryStep::ControlRelations(_));
         let assignment_relation = matches!(step, QueryStep::AssignmentRelations(_));
         let branch_relation = matches!(step, QueryStep::BranchRelations(_));
+        let cpp_provenance = matches!(step, QueryStep::CppProvenance(_));
         let rewrite_path = matches!(step, QueryStep::RewritePathsOf(_));
         let failure_use = matches!(step, QueryStep::ResultContractFailureUses(_));
         let segments = matches!(step, QueryStep::SegmentsOf(_));
         let absent_member = matches!(step, QueryStep::AbsentMember(_));
         for key in object.keys() {
-            match QueryStepField::from_label(key) {
+            if configuration_absence
+                && key != "op"
+                && matches!(
+                    key.as_str(),
+                    "formats"
+                        | "node_kinds"
+                        | "roles"
+                        | "scalar_kinds"
+                        | "keys"
+                        | "values"
+                        | "values_ignore_case"
+                        | "value_lt"
+                        | "value_le"
+                        | "value_gt"
+                        | "value_ge"
+                        | "routes"
+                        | "fact_ordinals"
+                        | "provenances"
+                        | "completenesses"
+                )
+            {
+                continue;
+            }
+            let field = if cpp_facts && key == QueryStepField::CppFactKind.json_label() {
+                Some(QueryStepField::CppFactKind)
+            } else if statement_facts && key == QueryStepField::StatementFactKind.json_label() {
+                Some(QueryStepField::StatementFactKind)
+            } else {
+                QueryStepField::from_label(key)
+            };
+            match field {
                 Some(QueryStepField::Op) => {}
                 Some(QueryStepField::Depth | QueryStepField::Transitive) if hierarchy => {}
                 Some(
@@ -2213,10 +2878,20 @@ fn decode_steps(value: &Value, path: &str) -> Result<Vec<QueryStep>, QueryError>
                     | QueryStepField::CallProof
                     | QueryStepField::ReceiverType,
                 ) if resolved_call => {}
+                Some(QueryStepField::ResolvesTo | QueryStepField::CallProof) if resolved_value => {}
                 Some(QueryStepField::FormalName | QueryStepField::FormalIndex) if call_argument => {
                 }
                 Some(QueryStepField::RowWhere) if row_filter => {}
                 Some(QueryStepField::Columns) if row_project => {}
+                Some(QueryStepField::StatementFactKind) if statement_facts => {}
+                Some(QueryStepField::StatementFactKind) => {
+                    return Err(QueryError::new(
+                        child_path(&entry_path, key),
+                        "statement_fact_kind is only valid for statement_facts",
+                    ));
+                }
+                Some(QueryStepField::CppFactKind)
+                    if cpp_facts && key == QueryStepField::CppFactKind.json_label() => {}
                 Some(
                     QueryStepField::Identity
                     | QueryStepField::ElementName
@@ -2235,7 +2910,7 @@ fn decode_steps(value: &Value, path: &str) -> Result<Vec<QueryStep>, QueryError>
                     | QueryStepField::IndexMax
                     | QueryStepField::SourceOrigin,
                 ) if keyed_read_value => {}
-                Some(QueryStepField::Capture) if receiver => {}
+                Some(QueryStepField::Capture) if receiver || capture_anchor => {}
                 Some(QueryStepField::ProtocolRef) if typestate => {}
                 Some(QueryStepField::PlanRef) if value_flow => {}
                 Some(QueryStepField::TaintRef) if taint => {}
@@ -2278,8 +2953,11 @@ fn decode_steps(value: &Value, path: &str) -> Result<Vec<QueryStep>, QueryError>
                     | QueryStepField::EdgeRelations
                     | QueryStepField::EdgeSiteClasses,
                 ) if edge => {}
-                Some(QueryStepField::StateEventClasses | QueryStepField::StateEventSubjects)
-                    if state_event => {}
+                Some(
+                    QueryStepField::StateEventClasses
+                    | QueryStepField::StateEventSubjects
+                    | QueryStepField::StateEventReadCauses,
+                ) if state_event => {}
                 Some(QueryStepField::FlowRelations | QueryStepField::FlowCertainties)
                     if flow_relation => {}
                 Some(QueryStepField::RewriteDomains | QueryStepField::RewriteOutcomes)
@@ -2288,6 +2966,7 @@ fn decode_steps(value: &Value, path: &str) -> Result<Vec<QueryStep>, QueryError>
                     if control_relation => {}
                 Some(QueryStepField::AssignmentRelations) if assignment_relation => {}
                 Some(QueryStepField::BranchRelations) if branch_relation => {}
+                Some(QueryStepField::CppProvenance) if cpp_provenance => {}
                 Some(
                     QueryStepField::FailureUseProvenances | QueryStepField::FailureUseConsumers,
                 ) if failure_use => {}
@@ -2341,6 +3020,7 @@ fn decode_steps(value: &Value, path: &str) -> Result<Vec<QueryStep>, QueryError>
                     | QueryStepField::EdgeSiteClasses
                     | QueryStepField::StateEventClasses
                     | QueryStepField::StateEventSubjects
+                    | QueryStepField::StateEventReadCauses
                     | QueryStepField::FlowRelations
                     | QueryStepField::FlowCertainties
                     | QueryStepField::RewriteDomains
@@ -2348,6 +3028,7 @@ fn decode_steps(value: &Value, path: &str) -> Result<Vec<QueryStep>, QueryError>
                     | QueryStepField::ControlRelations
                     | QueryStepField::AssignmentRelations
                     | QueryStepField::BranchRelations
+                    | QueryStepField::CppProvenance
                     | QueryStepField::ControlExitPartitions
                     | QueryStepField::FailureUseProvenances
                     | QueryStepField::FailureUseConsumers
@@ -2359,7 +3040,8 @@ fn decode_steps(value: &Value, path: &str) -> Result<Vec<QueryStep>, QueryError>
                     | QueryStepField::FormalName
                     | QueryStepField::FormalIndex
                     | QueryStepField::RowWhere
-                    | QueryStepField::Columns,
+                    | QueryStepField::Columns
+                    | QueryStepField::CppFactKind,
                 )
                 | None => {
                     return Err(QueryError::new(
@@ -2389,6 +3071,56 @@ fn decode_steps(value: &Value, path: &str) -> Result<Vec<QueryStep>, QueryError>
                 })?,
                 &child_path(&entry_path, "columns"),
             )?);
+        } else if configuration_absence {
+            let mut filter_object = object.clone();
+            filter_object.remove("op");
+            step = QueryStep::ConfigurationAbsence(Box::new(decode_configuration_facts_filter(
+                &filter_object,
+                &entry_path,
+            )?));
+        } else if statement_facts {
+            let field = QueryStepField::StatementFactKind.json_label();
+            let kind_path = child_path(&entry_path, field);
+            let label = object
+                .get(field)
+                .ok_or_else(|| QueryError::new(&kind_path, "required field is missing"))?
+                .as_str()
+                .ok_or_else(|| QueryError::new(&kind_path, "expected a statement fact label"))?;
+            let kind = StatementFactKind::from_label(label).ok_or_else(|| {
+                QueryError::new(
+                    &kind_path,
+                    format!(
+                        "unknown statement fact {label:?}; expected one of: {}",
+                        StatementFactKind::ALL
+                            .iter()
+                            .map(|kind| kind.label())
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    ),
+                )
+            })?;
+            step = QueryStep::StatementFacts(kind);
+        } else if cpp_facts {
+            let field = QueryStepField::CppFactKind.json_label();
+            let path = child_path(&entry_path, field);
+            let kind = object
+                .get(field)
+                .and_then(Value::as_str)
+                .and_then(CppClassFactKind::from_label)
+                .ok_or_else(|| {
+                    QueryError::new(
+                        path,
+                        format!(
+                            "{field} must be one of {}",
+                            CppClassFactKind::ALL
+                                .iter()
+                                .map(|kind| kind.label())
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        ),
+                    )
+                })?;
+            step = QueryStep::CppFacts(kind);
         } else if resolved_call {
             let resolves_to = decode_call_identity(object, &entry_path, "resolves_to", true)?
                 .expect("required call identity decoded");
@@ -2410,6 +3142,21 @@ fn decode_steps(value: &Value, path: &str) -> Result<Vec<QueryStep>, QueryError>
                 proof,
                 receiver_type,
             });
+        } else if resolved_value {
+            let resolves_to = decode_call_identity(object, &entry_path, "resolves_to", true)?
+                .expect("required value identity decoded");
+            let proof_path = child_path(&entry_path, "call_proof");
+            let proof = match object.get("call_proof").and_then(Value::as_str) {
+                Some("exact") => ResolvedCallProof::Exact,
+                Some(_) => {
+                    return Err(QueryError::new(
+                        proof_path,
+                        "resolved_value proof must be exact",
+                    ));
+                }
+                None => return Err(QueryError::new(proof_path, "required field is missing")),
+            };
+            step = QueryStep::ResolvedValue(ResolvedValueFilter { resolves_to, proof });
         } else if call_argument {
             let selector_count = ["formal_name", "formal_index"]
                 .into_iter()
@@ -2519,6 +3266,8 @@ fn decode_steps(value: &Value, path: &str) -> Result<Vec<QueryStep>, QueryError>
             step = QueryStep::FlowRelationsOf(decode_flow_relation_filter(object, &entry_path)?);
         } else if branch_relation {
             step = QueryStep::BranchRelations(decode_branch_relation_filter(object, &entry_path)?);
+        } else if cpp_provenance {
+            step = QueryStep::CppProvenance(decode_cpp_provenance_filter(object, &entry_path)?);
         } else if control_relation {
             step =
                 QueryStep::ControlRelations(decode_control_relation_filter(object, &entry_path)?);
@@ -3025,6 +3774,25 @@ fn decode_steps(value: &Value, path: &str) -> Result<Vec<QueryStep>, QueryError>
                 key: Some(key),
                 pristine_input,
             });
+        } else if capture_anchor {
+            let path = child_path(&entry_path, "capture");
+            let shape = QueryStepField::Capture.value_shape();
+            let capture = object
+                .get("capture")
+                .ok_or_else(|| QueryError::new(&path, "required field is missing"))?
+                .as_str()
+                .filter(|name| shape.accepts_string(name))
+                .map(str::to_owned)
+                .ok_or_else(|| {
+                    let (minimum, maximum) = shape
+                        .string_length_bounds()
+                        .expect("capture-name shape has string bounds");
+                    QueryError::new(
+                        path,
+                        format!("expected a string between {minimum} and {maximum} bytes"),
+                    )
+                })?;
+            step = QueryStep::CaptureAnchor(capture);
         } else if receiver {
             let capture = object
                 .get("capture")
@@ -3116,14 +3884,39 @@ struct PatternFields<'a> {
     kind: Option<&'a Value>,
     not_kind: Option<&'a Value>,
     name: Option<&'a Value>,
+    is_async: Option<&'a Value>,
+    modifier: Option<&'a Value>,
+    string_value: Option<&'a Value>,
+    language_rule: Option<&'a Value>,
+    body_state: Option<&'a Value>,
+    body_owner: Option<&'a Value>,
     text: Option<&'a Value>,
+    comment_block_text: Option<&'a Value>,
     boolean_value: Option<&'a Value>,
+    parenthesized: Option<&'a Value>,
+    integer_value: Option<&'a Value>,
+    duplicate_key: Option<&'a Value>,
+    integer_has_any_bits: Option<&'a Value>,
+    integer_has_all_bits: Option<&'a Value>,
+    integer_has_no_bits: Option<&'a Value>,
+    assignment_target_kind: Option<&'a Value>,
+    assignment_value_kind: Option<&'a Value>,
+    assignment_target_unstarred_count: Option<&'a Value>,
+    assignment_value_unstarred_count: Option<&'a Value>,
+    assignment_target_starred: Option<&'a Value>,
+    assignment_value_starred: Option<&'a Value>,
+    assignment_unstarred_count_mismatch: Option<&'a Value>,
+    index: Option<&'a Value>,
     arity: Option<&'a Value>,
     visibility: Option<&'a Value>,
     parameter_type: Option<&'a Value>,
     capture: Option<&'a Value>,
     has: Option<&'a Value>,
+    local_value: Option<&'a Value>,
     not_has: Option<&'a Value>,
+    not: Option<&'a Value>,
+    all: Option<&'a Value>,
+    any: Option<&'a Value>,
     roles: Vec<(Role, &'a Value)>,
 }
 
@@ -3138,14 +3931,49 @@ fn collect_pattern_fields<'a>(
                 PatternField::Kind => fields.kind = Some(value),
                 PatternField::NotKind => fields.not_kind = Some(value),
                 PatternField::Name => fields.name = Some(value),
+                PatternField::Async => fields.is_async = Some(value),
+                PatternField::Modifier => fields.modifier = Some(value),
+                PatternField::StringValue => fields.string_value = Some(value),
+                PatternField::LanguageRule => fields.language_rule = Some(value),
+                PatternField::BodyState => fields.body_state = Some(value),
+                PatternField::BodyOwner => fields.body_owner = Some(value),
                 PatternField::Text => fields.text = Some(value),
+                PatternField::CommentBlockText => fields.comment_block_text = Some(value),
                 PatternField::BooleanValue => fields.boolean_value = Some(value),
+                PatternField::Parenthesized => fields.parenthesized = Some(value),
+                PatternField::IntegerValue => fields.integer_value = Some(value),
+                PatternField::DuplicateKey => fields.duplicate_key = Some(value),
+                PatternField::IntegerHasAnyBits => fields.integer_has_any_bits = Some(value),
+                PatternField::IntegerHasAllBits => fields.integer_has_all_bits = Some(value),
+                PatternField::IntegerHasNoBits => fields.integer_has_no_bits = Some(value),
+                PatternField::AssignmentTargetKind => fields.assignment_target_kind = Some(value),
+                PatternField::AssignmentValueKind => fields.assignment_value_kind = Some(value),
+                PatternField::AssignmentTargetUnstarredCount => {
+                    fields.assignment_target_unstarred_count = Some(value)
+                }
+                PatternField::AssignmentValueUnstarredCount => {
+                    fields.assignment_value_unstarred_count = Some(value)
+                }
+                PatternField::AssignmentTargetStarred => {
+                    fields.assignment_target_starred = Some(value)
+                }
+                PatternField::AssignmentValueStarred => {
+                    fields.assignment_value_starred = Some(value)
+                }
+                PatternField::AssignmentUnstarredCountMismatch => {
+                    fields.assignment_unstarred_count_mismatch = Some(value)
+                }
+                PatternField::Index => fields.index = Some(value),
                 PatternField::Arity => fields.arity = Some(value),
                 PatternField::Visibility => fields.visibility = Some(value),
                 PatternField::ParameterType => fields.parameter_type = Some(value),
                 PatternField::Capture => fields.capture = Some(value),
                 PatternField::Has => fields.has = Some(value),
+                PatternField::LocalValue => fields.local_value = Some(value),
                 PatternField::NotHas => fields.not_has = Some(value),
+                PatternField::Not => fields.not = Some(value),
+                PatternField::All => fields.all = Some(value),
+                PatternField::Any => fields.any = Some(value),
             }
         } else if let Some(role) = Role::from_label(key) {
             fields.roles.push((role, value));
@@ -3164,6 +3992,7 @@ fn decode_pattern(
     path: &str,
     budget: &mut QueryBudget,
     depth: usize,
+    list_role_child: bool,
 ) -> Result<Pattern, QueryError> {
     if depth > MAX_PATTERN_DEPTH {
         return Err(QueryError::new(
@@ -3200,6 +4029,17 @@ fn decode_pattern(
         .map(|value| decode_string_predicate(value, &child_path(path, "text"), false))
         .transpose()?;
 
+    let comment_block_text = fields
+        .comment_block_text
+        .map(|value| decode_string_predicate(value, &child_path(path, "comment_block_text"), false))
+        .transpose()?;
+    if comment_block_text.is_some() && !kinds.contains(&NormalizedKind::Comment) {
+        return Err(QueryError::new(
+            child_path(path, "comment_block_text"),
+            "comment_block_text requires the comment kind",
+        ));
+    }
+
     let boolean_value = fields
         .boolean_value
         .map(|value| {
@@ -3209,6 +4049,225 @@ fn decode_pattern(
                     "expected a boolean literal",
                 )
             })
+        })
+        .transpose()?;
+
+    let is_async = fields
+        .is_async
+        .map(|value| {
+            value.as_bool().ok_or_else(|| {
+                QueryError::new(child_path(path, "async"), "expected a boolean literal")
+            })
+        })
+        .transpose()?;
+
+    let modifier = fields
+        .modifier
+        .map(|value| {
+            let modifier_path = child_path(path, "modifier");
+            let label = value
+                .as_str()
+                .ok_or_else(|| QueryError::new(&modifier_path, "expected a modifier label"))?;
+            DeclarationModifier::from_label(label).ok_or_else(|| {
+                QueryError::new(
+                    &modifier_path,
+                    format!(
+                        "unknown modifier {label:?}; expected one of: {}",
+                        DeclarationModifier::ALL
+                            .iter()
+                            .map(|modifier| modifier.label())
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    ),
+                )
+            })
+        })
+        .transpose()?;
+
+    let string_value = fields
+        .string_value
+        .map(|value| decode_string_predicate(value, &child_path(path, "string_value"), true))
+        .transpose()?;
+
+    let language_rule = fields
+        .language_rule
+        .map(|value| {
+            let rule_path = child_path(path, "language_rule");
+            let label = value
+                .as_str()
+                .ok_or_else(|| QueryError::new(&rule_path, "expected a language rule label"))?;
+            LanguageRule::from_label(label).ok_or_else(|| {
+                QueryError::new(
+                    &rule_path,
+                    format!(
+                        "unknown language rule {label:?}; expected one of: {}",
+                        LanguageRule::all_labels().join(", ")
+                    ),
+                )
+            })
+        })
+        .transpose()?;
+
+    let body_state = fields
+        .body_state
+        .map(|value| {
+            let body_path = child_path(path, "body_state");
+            let label = value
+                .as_str()
+                .ok_or_else(|| QueryError::new(&body_path, "expected a body-state label"))?;
+            BodyState::from_label(label).ok_or_else(|| {
+                QueryError::new(
+                    &body_path,
+                    format!(
+                        "unknown body state {label:?}; expected one of: {}",
+                        BodyState::ALL
+                            .iter()
+                            .map(|state| state.label())
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    ),
+                )
+            })
+        })
+        .transpose()?;
+
+    let body_owner = fields
+        .body_owner
+        .map(|value| {
+            let owner_path = child_path(path, "body_owner");
+            let label = value
+                .as_str()
+                .ok_or_else(|| QueryError::new(&owner_path, "expected a body-owner label"))?;
+            BodyOwner::from_label(label).ok_or_else(|| {
+                QueryError::new(
+                    &owner_path,
+                    format!(
+                        "unknown body owner {label:?}; expected one of: {}",
+                        BodyOwner::ALL
+                            .iter()
+                            .map(|owner| owner.label())
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    ),
+                )
+            })
+        })
+        .transpose()?;
+    if body_owner.is_some() && body_state.is_none() {
+        return Err(QueryError::new(
+            child_path(path, "body_owner"),
+            "body_owner requires body_state",
+        ));
+    }
+
+    let parenthesized = fields
+        .parenthesized
+        .map(|value| {
+            value.as_bool().ok_or_else(|| {
+                QueryError::new(
+                    child_path(path, "parenthesized"),
+                    "expected a boolean literal",
+                )
+            })
+        })
+        .transpose()?;
+
+    let integer_value = fields
+        .integer_value
+        .map(|value| decode_canonical_integer_decimal(value, &child_path(path, "integer_value")))
+        .transpose()?;
+    let duplicate_key = fields
+        .duplicate_key
+        .map(|value| {
+            value.as_bool().ok_or_else(|| {
+                QueryError::new(
+                    child_path(path, "duplicate_key"),
+                    "expected a boolean literal",
+                )
+            })
+        })
+        .transpose()?;
+    let integer_has_any_bits = fields
+        .integer_has_any_bits
+        .map(|value| decode_permission_bit_mask(value, &child_path(path, "integer_has_any_bits")))
+        .transpose()?;
+    let integer_has_all_bits = fields
+        .integer_has_all_bits
+        .map(|value| decode_permission_bit_mask(value, &child_path(path, "integer_has_all_bits")))
+        .transpose()?;
+    let integer_has_no_bits = fields
+        .integer_has_no_bits
+        .map(|value| decode_permission_bit_mask(value, &child_path(path, "integer_has_no_bits")))
+        .transpose()?;
+
+    let assignment_target_kind = fields
+        .assignment_target_kind
+        .map(|value| {
+            decode_assignment_sequence_kind(value, &child_path(path, "assignment_target_kind"))
+        })
+        .transpose()?;
+    let assignment_value_kind = fields
+        .assignment_value_kind
+        .map(|value| {
+            decode_assignment_sequence_kind(value, &child_path(path, "assignment_value_kind"))
+        })
+        .transpose()?;
+    let assignment_target_unstarred_count = fields
+        .assignment_target_unstarred_count
+        .map(|value| {
+            decode_assignment_sequence_count(
+                value,
+                &child_path(path, "assignment_target_unstarred_count"),
+            )
+        })
+        .transpose()?;
+    let assignment_value_unstarred_count = fields
+        .assignment_value_unstarred_count
+        .map(|value| {
+            decode_assignment_sequence_count(
+                value,
+                &child_path(path, "assignment_value_unstarred_count"),
+            )
+        })
+        .transpose()?;
+    let assignment_target_starred = fields
+        .assignment_target_starred
+        .map(|value| decode_bool(value, &child_path(path, "assignment_target_starred")))
+        .transpose()?;
+    let assignment_value_starred = fields
+        .assignment_value_starred
+        .map(|value| decode_bool(value, &child_path(path, "assignment_value_starred")))
+        .transpose()?;
+    let assignment_unstarred_count_mismatch = fields
+        .assignment_unstarred_count_mismatch
+        .map(|value| {
+            decode_bool(
+                value,
+                &child_path(path, "assignment_unstarred_count_mismatch"),
+            )
+        })
+        .transpose()?;
+
+    let index = fields
+        .index
+        .map(|value| {
+            let index_path = child_path(path, "index");
+            if !list_role_child {
+                return Err(QueryError::new(
+                    &index_path,
+                    "index is valid only on a child of an ordered list role",
+                ));
+            }
+            let index = value.as_u64().ok_or_else(|| {
+                QueryError::new(&index_path, "index must be a non-negative integer")
+            })?;
+            if index > u64::from(MAX_ARITY) {
+                return Err(QueryError::new(
+                    &index_path,
+                    format!("index must be at most {MAX_ARITY}"),
+                ));
+            }
+            Ok(index as u32)
         })
         .transpose()?;
 
@@ -3229,6 +4288,7 @@ fn decode_pattern(
         &kinds,
         !visibility.is_empty(),
         parameter_type.is_some(),
+        is_async.is_some(),
         path,
     )?;
 
@@ -3251,20 +4311,50 @@ fn decode_pattern(
         .transpose()?;
 
     let has = decode_boxed_sub_pattern(fields.has, path, "has", budget, depth + 1)?;
+    let local_value =
+        decode_boxed_sub_pattern(fields.local_value, path, "local_value", budget, depth + 1)?;
     let not_has = decode_boxed_sub_pattern(fields.not_has, path, "not_has", budget, depth + 1)?;
+    let not = decode_boxed_sub_pattern(fields.not, path, "not", budget, depth + 1)?;
+    let all = decode_pattern_list(fields.all, path, "all", budget, depth + 1)?;
+    let any = decode_pattern_list(fields.any, path, "any", budget, depth + 1)?;
 
     let mut pattern = Pattern {
         kinds,
         not_kinds,
         name,
+        is_async,
+        modifier,
+        string_value,
+        language_rule,
+        body_state,
+        body_owner,
         text,
+        comment_block_text,
         boolean_value,
+        parenthesized,
+        integer_value,
+        duplicate_key,
+        integer_has_any_bits,
+        integer_has_all_bits,
+        integer_has_no_bits,
+        assignment_target_kind,
+        assignment_value_kind,
+        assignment_target_unstarred_count,
+        assignment_value_unstarred_count,
+        assignment_target_starred,
+        assignment_value_starred,
+        assignment_unstarred_count_mismatch,
+        index,
         arity,
         visibility,
         parameter_type,
         capture,
         has,
+        local_value,
         not_has,
+        not,
+        all,
+        any,
         ..Pattern::default()
     };
 
@@ -3321,6 +4411,68 @@ fn decode_arity_bound(value: &Value, path: &str) -> Result<u32, QueryError> {
         return Err(QueryError::new(
             path,
             format!("arity bound must be at most {MAX_ARITY}"),
+        ));
+    }
+    Ok(count as u32)
+}
+
+fn decode_bool(value: &Value, path: &str) -> Result<bool, QueryError> {
+    value
+        .as_bool()
+        .ok_or_else(|| QueryError::new(path, "expected a boolean literal"))
+}
+
+fn decode_canonical_integer_decimal(value: &Value, path: &str) -> Result<String, QueryError> {
+    let value = value
+        .as_str()
+        .ok_or_else(|| QueryError::new(path, "expected a quoted canonical decimal integer"))?;
+    reject_too_long(value, path, MAX_STRING_PREDICATE_LENGTH, "integer value")?;
+    let bytes = value.as_bytes();
+    if bytes.is_empty()
+        || !((bytes[0] == b'0' && bytes.len() == 1)
+            || (matches!(bytes[0], b'1'..=b'9')
+                && bytes[1..].iter().all(|byte| byte.is_ascii_digit())))
+    {
+        return Err(QueryError::new(
+            path,
+            "integer_value must be a canonical non-negative decimal string",
+        ));
+    }
+    Ok(value.to_owned())
+}
+
+fn decode_permission_bit_mask(value: &Value, path: &str) -> Result<u32, QueryError> {
+    let mask = value
+        .as_u64()
+        .ok_or_else(|| QueryError::new(path, "permission bit mask must be a positive integer"))?;
+    if mask == 0 || mask > u64::from(u32::MAX) {
+        return Err(QueryError::new(
+            path,
+            format!("permission bit mask must be between 1 and {}", u32::MAX),
+        ));
+    }
+    Ok(mask as u32)
+}
+
+fn decode_assignment_sequence_kind(
+    value: &Value,
+    path: &str,
+) -> Result<AssignmentSequenceKind, QueryError> {
+    let label = value
+        .as_str()
+        .ok_or_else(|| QueryError::new(path, "expected \"list\" or \"tuple\""))?;
+    AssignmentSequenceKind::from_label(label)
+        .ok_or_else(|| QueryError::new(path, "expected \"list\" or \"tuple\""))
+}
+
+fn decode_assignment_sequence_count(value: &Value, path: &str) -> Result<u32, QueryError> {
+    let count = value
+        .as_u64()
+        .ok_or_else(|| QueryError::new(path, "expected a non-negative integer"))?;
+    if count > u64::from(MAX_ARITY) {
+        return Err(QueryError::new(
+            path,
+            format!("assignment sequence count must be at most {MAX_ARITY}"),
         ));
     }
     Ok(count as u32)
@@ -3432,9 +4584,10 @@ fn reject_callable_signature_on_non_callable(
     kinds: &[NormalizedKind],
     constrains_visibility: bool,
     constrains_parameter_type: bool,
+    constrains_async: bool,
     path: &str,
 ) -> Result<(), QueryError> {
-    if !constrains_visibility && !constrains_parameter_type {
+    if !constrains_visibility && !constrains_parameter_type && !constrains_async {
         return Ok(());
     }
     if kinds.is_empty() {
@@ -3450,8 +4603,10 @@ fn reject_callable_signature_on_non_callable(
     }
     let field = if constrains_visibility {
         "visibility"
-    } else {
+    } else if constrains_parameter_type {
         "parameter_type"
+    } else {
+        "async"
     };
     Err(QueryError::new(
         child_path(path, field),
@@ -3514,13 +4669,47 @@ fn decode_boxed_sub_pattern(
         None => Ok(None),
         Some(value) => {
             let field_path = child_path(path, field);
-            let pattern = decode_pattern(value, &field_path, budget, depth)?;
+            let pattern = decode_pattern(value, &field_path, budget, depth, false)?;
             if pattern.is_empty() {
                 return Err(QueryError::new(&field_path, "pattern must not be empty"));
             }
             Ok(Some(Box::new(pattern)))
         }
     }
+}
+
+fn decode_pattern_list(
+    value: Option<&Value>,
+    path: &str,
+    field: &str,
+    budget: &mut QueryBudget,
+    depth: usize,
+) -> Result<Vec<Pattern>, QueryError> {
+    let Some(value) = value else {
+        return Ok(Vec::new());
+    };
+    let field_path = child_path(path, field);
+    let entries = value
+        .as_array()
+        .ok_or_else(|| QueryError::new(&field_path, "expected an array of patterns"))?;
+    if entries.is_empty() {
+        return Err(QueryError::new(
+            &field_path,
+            "pattern list must contain at least one pattern",
+        ));
+    }
+    entries
+        .iter()
+        .enumerate()
+        .map(|(index, value)| {
+            let item_path = index_path(&field_path, index);
+            let pattern = decode_pattern(value, &item_path, budget, depth, false)?;
+            if pattern.is_empty() {
+                return Err(QueryError::new(&item_path, "pattern must not be empty"));
+            }
+            Ok(pattern)
+        })
+        .collect()
 }
 
 /// Decode the role fields (`callee`, `args`, `left`, ...) into `pattern`,
@@ -3569,7 +4758,7 @@ fn decode_role_fields(
     for &role in Role::single_target_roles() {
         if let Some(value) = role_value(roles, role) {
             let role_path = child_path(path, role.label());
-            let sub_pattern = Box::new(decode_pattern(value, &role_path, budget, depth)?);
+            let sub_pattern = Box::new(decode_pattern(value, &role_path, budget, depth, false)?);
             match role {
                 Role::Callee => pattern.callee = Some(sub_pattern),
                 Role::Receiver => pattern.receiver = Some(sub_pattern),
@@ -3583,12 +4772,15 @@ fn decode_role_fields(
                 Role::Tag => pattern.tag = Some(sub_pattern),
                 Role::Value => pattern.value = Some(sub_pattern),
                 Role::Key => pattern.key = Some(sub_pattern),
+                Role::Test => pattern.test = Some(sub_pattern),
                 Role::Arg
                 | Role::Kwarg
                 | Role::Decorator
                 | Role::Element
                 | Role::Attributes
-                | Role::Children => {
+                | Role::Children
+                | Role::Part
+                | Role::TypeArguments => {
                     unreachable!("non-single role")
                 }
             }
@@ -3614,6 +4806,7 @@ fn decode_role_fields(
                     &index_path(&role_path, index),
                     budget,
                     depth,
+                    true,
                 )?);
             }
             match role {
@@ -3622,6 +4815,8 @@ fn decode_role_fields(
                 Role::Element => pattern.elements = patterns,
                 Role::Attributes => pattern.attributes = patterns,
                 Role::Children => pattern.children = patterns,
+                Role::Part => pattern.parts = patterns,
+                Role::TypeArguments => pattern.type_arguments = patterns,
                 Role::Callee
                 | Role::Receiver
                 | Role::Kwarg
@@ -3634,7 +4829,8 @@ fn decode_role_fields(
                 | Role::Iterable
                 | Role::Tag
                 | Role::Value
-                | Role::Key => unreachable!("non-list role"),
+                | Role::Key
+                | Role::Test => unreachable!("non-list role"),
             }
         }
     }
@@ -3654,7 +4850,7 @@ fn decode_role_fields(
             reject_too_long(keyword, &keyword_path, MAX_KWARG_NAME_LENGTH, "keyword")?;
             kwargs.push((
                 keyword.clone(),
-                decode_pattern(entry, &keyword_path, budget, depth)?,
+                decode_pattern(entry, &keyword_path, budget, depth, false)?,
             ));
         }
         pattern.kwargs = kwargs;
@@ -3667,4 +4863,93 @@ fn role_value<'a>(roles: &[(Role, &'a Value)], expected: Role) -> Option<&'a Val
     roles
         .iter()
         .find_map(|(role, value)| (*role == expected).then_some(*value))
+}
+
+fn decode_dependency_evidence_filter(
+    object: &Map<String, Value>,
+    path: &str,
+) -> Result<DependencyEvidenceFilter, QueryError> {
+    for key in object.keys() {
+        if super::schema::DependencyEvidenceFilterField::from_label(key).is_none() {
+            return Err(QueryError::new(
+                child_path(path, key),
+                "unknown dependency evidence filter field",
+            ));
+        }
+    }
+    let filter: DependencyEvidenceFilter = serde_json::from_value(Value::Object(object.clone()))
+        .map_err(|e| QueryError::new(path, e.to_string()))?;
+    validate_dependency_evidence_filter(&filter, path)?;
+    Ok(filter)
+}
+pub(super) fn validate_dependency_evidence_filter(
+    filter: &DependencyEvidenceFilter,
+    path: &str,
+) -> Result<(), QueryError> {
+    for (field, values) in [
+        ("ecosystems", &filter.ecosystems),
+        ("packages", &filter.packages),
+        ("kinds", &filter.kinds),
+        ("exact_versions", &filter.exact_versions),
+        ("version_ranges", &filter.version_ranges),
+        ("sources", &filter.sources),
+        ("declared_by", &filter.declared_by),
+        ("scopes", &filter.scopes),
+    ] {
+        if values.len() > 128 || values.iter().any(String::is_empty) {
+            return Err(QueryError::new(
+                child_path(path, field),
+                "expected at most 128 nonempty strings",
+            ));
+        }
+    }
+    for (index, kind) in filter.kinds.iter().enumerate() {
+        if brokk_bifrost_analysis::analyzer::semantic_model::DependencyEvidenceKind::from_label(
+            kind,
+        )
+        .is_none()
+        {
+            return Err(QueryError::new(
+                index_path(&child_path(path, "kinds"), index),
+                "unknown dependency evidence kind",
+            ));
+        }
+    }
+    for (index, scope) in filter.scopes.iter().enumerate() {
+        if !brokk_bifrost_analysis::analyzer::topology::DependencyScope::LABELS
+            .contains(&scope.as_str())
+        {
+            return Err(QueryError::new(
+                index_path(&child_path(path, "scopes"), index),
+                "unknown dependency scope",
+            ));
+        }
+    }
+    if !filter.version_ranges.is_empty()
+        && filter.ecosystems != ["cargo"]
+        && filter.ecosystems != ["npm"]
+    {
+        return Err(QueryError::new(
+            child_path(path, "version_ranges"),
+            "version_ranges requires exactly one supported ecosystem: cargo or npm",
+        ));
+    }
+    for (index, range) in filter.version_ranges.iter().enumerate() {
+        let error = if filter.ecosystems == ["npm"] {
+            brokk_bifrost_analysis::analyzer::dependency_evidence::NpmVersionRange::parse(range)
+                .err()
+                .map(|e| e.to_string())
+        } else {
+            semver::VersionReq::parse(range)
+                .err()
+                .map(|e| e.to_string())
+        };
+        if let Some(error) = error {
+            return Err(QueryError::new(
+                index_path(&child_path(path, "version_ranges"), index),
+                error,
+            ));
+        }
+    }
+    Ok(())
 }

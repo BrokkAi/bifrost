@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import argparse
+import difflib
 import json
 import keyword
 import sys
@@ -315,22 +316,20 @@ class CodeGenerator:
 
     def unique_function_name(self, class_name: str) -> str:
         preferred = f"_decode_{snake_name(class_name)}"
-        candidate = preferred
-        suffix = 2
-        while candidate in self.function_names:
-            candidate = f"{preferred}_{suffix}"
-            suffix += 1
-        self.function_names.add(candidate)
-        return candidate
+        return self.unique_name(preferred, self.function_names)
 
     def unique_decoder_name(self, pointer: str) -> str:
         preferred = f"_decode_{snake_name(pointer.replace('/', '_'))}"
+        return self.unique_name(preferred, self.decoder_names)
+
+    @staticmethod
+    def unique_name(preferred: str, names: set[str]) -> str:
         candidate = preferred
         suffix = 2
-        while candidate in self.decoder_names:
+        while candidate in names:
             candidate = f"{preferred}_{suffix}"
             suffix += 1
-        self.decoder_names.add(candidate)
+        names.add(candidate)
         return candidate
 
     def plan_for(self, schema: dict[str, Any], pointer: str, preferred_name: str) -> TypePlan:
@@ -470,13 +469,20 @@ class CodeGenerator:
             type_values = schema["type"]
             seen_types: set[str] = set()
             nullable = "null" in type_values
+            # Sibling keywords (items, format, minimum, description, ...) qualify
+            # every concrete alternative, so carry them onto each one. Dropping
+            # them makes a nullable array lose its element schema and a nullable
+            # integer lose its numeric bounds.
+            siblings = {
+                key: value for key, value in schema.items() if key != "type"
+            }
             for type_value in type_values:
                 if type_value == "null":
                     continue
                 if type_value in seen_types:
                     raise schema_error(pointer, f"duplicate type {type_value!r}")
                 seen_types.add(type_value)
-                alternatives.append({"type": type_value})
+                alternatives.append({**siblings, "type": type_value})
         return nullable, alternatives
 
     def union_plan(
@@ -879,6 +885,8 @@ def emit_enum(plan: TypePlan) -> str:
         lines.append("    return value")
         return "\n".join(lines)
     values = ", ".join(python_literal(value) for value in plan.enum_values)
+    if len(plan.enum_values) == 1:
+        values += ","
     values_repr = repr(list(plan.enum_values))
     lines = [
         f"def {plan.decoder_name}(value: Any, prefix: str = {plan.class_name!r}) -> {plan.class_name}:",
@@ -943,6 +951,8 @@ def emit_union(plan: TypePlan) -> str:
             + f"    return {plan.class_name}.from_dict(value)"
         )
     lines = [f"def {plan.decoder_name}(value: Any, prefix: str = \"union\") -> {plan.type_expression}:"]
+    if plan.nullable:
+        lines.extend(["    if value is None:", "        return None"])
     lines.append("    errors = []")
     for variant in plan.union_plans:
         lines.append("    try:")
@@ -1202,8 +1212,15 @@ def main(argv: list[str] | None = None) -> int:
         if args.check:
             if args.output == Path("-"):
                 raise ValueError("--check cannot compare stdout")
-            if not args.output.exists() or args.output.read_text(encoding="utf-8") != generated:
+            existing = args.output.read_text(encoding="utf-8") if args.output.exists() else ""
+            if existing != generated:
                 print(f"stale generated output: {args.output}", file=sys.stderr)
+                sys.stderr.writelines(difflib.unified_diff(
+                    existing.splitlines(keepends=True),
+                    generated.splitlines(keepends=True),
+                    fromfile=str(args.output),
+                    tofile=f"{args.output} (generated)",
+                ))
                 return 1
         elif args.output == Path("-"):
             sys.stdout.write(generated)

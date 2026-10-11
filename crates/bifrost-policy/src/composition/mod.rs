@@ -5,6 +5,7 @@ mod precedence;
 mod taint;
 mod typestate;
 
+pub(crate) use common::policy_port_to_endpoint_binding;
 pub(crate) use common::validate_scanned_endpoint_collection;
 pub(crate) use common::{CompositionError, CompositionLimits};
 pub(crate) use precedence::{PrecedenceError, PrecedenceGraph};

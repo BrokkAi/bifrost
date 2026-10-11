@@ -6,6 +6,7 @@ use crate::analyzer::structural::facts::{FileFacts, STRUCTURAL_FACTS_VERSION};
 use crate::analyzer::structural::kinds::NormalizedKind;
 use crate::inline_project::InlineTestProject;
 use brokk_bifrost_core::analyzer::structural::code::VocabularyCode;
+use brokk_bifrost_test_macros::hardwon;
 
 #[test]
 fn kotlin_metadata_bridges_are_required_sealed_and_repairable_without_visibility() {
@@ -197,6 +198,7 @@ fn kotlin_canonical_publication_reopens_metadata_imports_and_structural_rows() {
 /// writer checks this over the facts in memory before it inserts them.
 #[cfg(debug_assertions)]
 #[test]
+#[hardwon("83a47468335d: constructor names must come from an ancestor")]
 #[should_panic(expected = "is no ancestor's name")]
 fn kotlin_constructor_cannot_store_an_unrelated_name() {
     use brokk_bifrost_core::analyzer::structural::facts::StructuralFactRows;
@@ -208,7 +210,7 @@ fn kotlin_constructor_cannot_store_an_unrelated_name() {
     let mut facts = state.source_facts.clone().expect("canonical Kotlin source");
     // The real facts store: both constructors carry the class name.
     facts.assert_storable();
-    let (mut nodes, roles, occurrence_roles) = facts.structural.into_parts();
+    let (mut nodes, roles, occurrence_roles, recovered_regions) = facts.structural.into_parts();
     let method_name = nodes
         .iter()
         .find(|node| node.kind == NormalizedKind::Method)
@@ -219,6 +221,72 @@ fn kotlin_constructor_cannot_store_an_unrelated_name() {
         .find(|node| node.kind == NormalizedKind::Constructor)
         .expect("constructor")
         .name = Some(method_name);
-    facts.structural = StructuralFactRows::new(nodes, roles, occurrence_roles);
+    facts.structural = StructuralFactRows::new(nodes, roles, occurrence_roles, recovered_regions);
     facts.assert_storable();
+}
+
+/// Recovered regions publish as rows, and hydration answers in SQL whether a
+/// callable fact contains each one (#3777). The class-body `ERROR` is outside
+/// every callable; the `ERROR` that swallows the `if` and the zero-width
+/// `MISSING` `)` are inside one.
+#[test]
+#[hardwon("#3777: recovered syntax made structural selection falsely complete")]
+fn kotlin_recovered_regions_hydrate_with_callable_containment() {
+    let source = "class A {\n    val x: Int = 1 +\n}\n\nfun f(c: Boolean): Boolean {\n    if c return true else return false\n}\n\nfun g(): Int {\n    val x = listOf(1, 2\n    return x.size\n}\n";
+    let fixture = InlineTestProject::with_language(Language::Kotlin)
+        .file("Sample.kt", source)
+        .build();
+    let state = parse_state(&KotlinAdapter, &fixture.file("Sample.kt"));
+    let parsed = state
+        .source_facts
+        .as_ref()
+        .expect("canonical Kotlin source")
+        .structural
+        .recovered_regions()
+        .iter()
+        .map(|span| &source[span.start_byte..span.end_byte])
+        .collect::<Vec<_>>();
+    assert_eq!(parsed, ["+", "if c return true else", ""]);
+    assert!(
+        !state
+            .source_facts
+            .as_ref()
+            .unwrap()
+            .structural
+            .nodes()
+            .iter()
+            .any(|node| node.kind == NormalizedKind::If),
+        "recovery left the swallowed `if` without a fact"
+    );
+
+    let oid = oid_for(source.as_bytes());
+    let store = AnalyzerStore::open_ephemeral().expect("open store");
+    store
+        .write_parsed_blob(oid, "kotlin", &KotlinAdapter, &state)
+        .expect("publish Kotlin");
+    let generation = store.current_generation("kotlin").expect("generation");
+    let rows = store
+        .load_structural_facts_rows(oid, "kotlin", generation, STRUCTURAL_FACTS_VERSION)
+        .expect("canonical structural read")
+        .expect("published structural rows");
+    let facts = FileFacts::from_persisted_rows(source.to_owned(), rows).expect("hydrate");
+    let hydrated = facts
+        .recovered_regions()
+        .iter()
+        .map(|region| {
+            (
+                &source[region.range.start_byte..region.range.end_byte],
+                region.range.start_line,
+                region.inside_callable,
+            )
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        hydrated,
+        [
+            ("+", 2, Some(false)),
+            ("if c return true else", 6, Some(true)),
+            ("", 11, Some(true)),
+        ]
+    );
 }

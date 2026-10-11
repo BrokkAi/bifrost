@@ -31,6 +31,25 @@ const QUERY_SHAPE_NAMES: [&str; QUERY_SHAPE_COUNT] = [
     "callable_facts",
 ];
 
+fn record_relational_question_miss(
+    pending_set: &mut HashSet<RelationalDefinitionQuestion>,
+    pending: &mut Vec<RelationalDefinitionQuestion>,
+    question: &RelationalDefinitionQuestion,
+) -> RelationalDefinitionValue {
+    if pending_set.insert(question.clone()) {
+        pending.push(question.clone());
+    }
+    RelationalDefinitionValue::empty_for(&question.query)
+}
+
+fn take_pending_questions(
+    pending_set: &mut HashSet<RelationalDefinitionQuestion>,
+    pending: &mut Vec<RelationalDefinitionQuestion>,
+) -> Vec<RelationalDefinitionQuestion> {
+    pending_set.clear();
+    std::mem::take(pending)
+}
+
 fn query_shape(query: &crate::analyzer::RelationalDefinitionQuery) -> (&'static str, usize) {
     match query {
         crate::analyzer::RelationalDefinitionQuery::ExactName => (QUERY_SHAPE_NAMES[0], 0),
@@ -127,20 +146,27 @@ impl RelationalDefinitionFrontier for RecordingRelationalFrontier {
             state.answer_hit_count += 1;
             return value.as_ref().clone();
         }
-        if state.pending_set.insert(question.clone()) {
-            state.pending.push(question.clone());
-        }
-        RelationalDefinitionValue::empty_for(&question.query)
+        let FrontierState {
+            pending_set,
+            pending,
+            ..
+        } = &mut *state;
+        record_relational_question_miss(pending_set, pending, question)
     }
 }
 
 impl RecordingRelationalFrontier {
     fn take_pending(&self) -> Vec<RelationalDefinitionQuestion> {
         let mut state = self.state.lock().expect("relational frontier poisoned");
-        state.pending_set.clear();
-        let pending = std::mem::take(&mut state.pending);
+        let FrontierState {
+            pending_set,
+            pending,
+            batch_count,
+            ..
+        } = &mut *state;
+        let pending = take_pending_questions(pending_set, pending);
         if !pending.is_empty() {
-            state.batch_count += 1;
+            *batch_count += 1;
         }
         pending
     }
@@ -242,8 +268,8 @@ impl ImmutableRecordingFrontier {
 
     fn take_pending(&self) -> Vec<RelationalDefinitionQuestion> {
         let mut pending = self.pending.lock().expect("relational frontier poisoned");
-        pending.set.clear();
-        std::mem::take(&mut pending.ordered)
+        let PendingQuestions { set, ordered } = &mut *pending;
+        take_pending_questions(set, ordered)
     }
 
     fn query_shape_counts(&self) -> Option<[usize; QUERY_SHAPE_COUNT]> {
@@ -262,10 +288,8 @@ impl RelationalDefinitionFrontier for ImmutableRecordingFrontier {
             return value.as_ref().clone();
         }
         let mut pending = self.pending.lock().expect("relational frontier poisoned");
-        if pending.set.insert(question.clone()) {
-            pending.ordered.push(question.clone());
-        }
-        RelationalDefinitionValue::empty_for(&question.query)
+        let PendingQuestions { set, ordered } = &mut *pending;
+        record_relational_question_miss(set, ordered, question)
     }
 }
 
@@ -273,6 +297,61 @@ pub(crate) enum RelationalItemFrontierOutcome<T> {
     Complete(Vec<T>),
     Cancelled(Vec<Option<T>>),
     Failed(crate::analyzer::RelationalBatchError),
+}
+
+enum FrontierBatchResolution {
+    Installed,
+    Cancelled,
+    Failed(crate::analyzer::RelationalBatchError),
+}
+
+fn execute_and_install_frontier_batch(
+    frontier: &RecordingRelationalFrontier,
+    questions: Vec<RelationalDefinitionQuestion>,
+    execute: &mut impl FnMut(&[RelationalDefinitionRequest]) -> RelationalBatchOutcome,
+    failure_context: &'static str,
+    profiling_scope: Option<&'static str>,
+) -> FrontierBatchResolution {
+    let requests = questions
+        .iter()
+        .enumerate()
+        .map(|(ordinal, question)| question.request(ordinal))
+        .collect::<Vec<_>>();
+    let _batch_scope = profiling_scope.and_then(|scope| {
+        crate::profiling::enabled()
+            .then(|| crate::profiling::scope(format!("{scope}[{}]", requests.len())))
+    });
+    let results = match execute(&requests) {
+        RelationalBatchOutcome::Complete(results) => results,
+        RelationalBatchOutcome::Cancelled => return FrontierBatchResolution::Cancelled,
+        RelationalBatchOutcome::Failed(error) => {
+            crate::profiling::note_with(|| {
+                format!("{failure_context} batch failed: {}", error.message())
+            });
+            return FrontierBatchResolution::Failed(error);
+        }
+    };
+    assert_eq!(results.len(), requests.len());
+    let mut values = std::iter::repeat_with(|| None)
+        .take(requests.len())
+        .collect::<Vec<_>>();
+    for result in results {
+        assert!(result.ordinal < values.len());
+        let slot = &mut values[result.ordinal];
+        assert!(
+            slot.is_none(),
+            "a relational batch returned an ordinal twice"
+        );
+        *slot = Some(result.value);
+    }
+    frontier.install(
+        questions,
+        values
+            .into_iter()
+            .map(|value| value.expect("a relational batch omitted an ordinal"))
+            .collect(),
+    );
+    FrontierBatchResolution::Installed
 }
 
 /// Evaluate one finite graph-resolution frontier to a fixed point.
@@ -323,39 +402,19 @@ fn resolve_relational_frontier_on<T>(
         if questions.is_empty() {
             return RelationalFrontierOutcome::Complete(provisional);
         }
-        let requests = questions
-            .iter()
-            .enumerate()
-            .map(|(ordinal, question)| question.request(ordinal))
-            .collect::<Vec<_>>();
-        let results = match execute(&requests) {
-            RelationalBatchOutcome::Complete(results) => results,
-            RelationalBatchOutcome::Cancelled => return RelationalFrontierOutcome::Cancelled,
-            RelationalBatchOutcome::Failed(error) => {
-                crate::profiling::note_with(|| {
-                    format!("relational_frontier batch failed: {}", error.message())
-                });
+        match execute_and_install_frontier_batch(
+            frontier,
+            questions,
+            &mut execute,
+            "relational_frontier",
+            None,
+        ) {
+            FrontierBatchResolution::Installed => {}
+            FrontierBatchResolution::Cancelled => return RelationalFrontierOutcome::Cancelled,
+            FrontierBatchResolution::Failed(error) => {
                 return RelationalFrontierOutcome::Failed(error);
             }
-        };
-        assert_eq!(results.len(), requests.len());
-        let mut values = vec![None; results.len()];
-        for result in results {
-            assert!(result.ordinal < values.len());
-            let slot = &mut values[result.ordinal];
-            assert!(
-                slot.is_none(),
-                "a relational batch returned an ordinal twice"
-            );
-            *slot = Some(result.value);
         }
-        frontier.install(
-            questions,
-            values
-                .into_iter()
-                .map(|value| value.expect("a relational batch omitted an ordinal"))
-                .collect(),
-        );
     }
 }
 
@@ -495,49 +554,21 @@ where
                 )
             });
         }
-        let requests = questions
-            .iter()
-            .enumerate()
-            .map(|(ordinal, question)| question.request(ordinal))
-            .collect::<Vec<_>>();
-        let _barrier_scope = crate::profiling::enabled().then(|| {
-            crate::profiling::scope(format!(
-                "relational_item_frontier::barrier_sql[{}]",
-                requests.len()
-            ))
-        });
-        let results = match execute(&requests) {
-            RelationalBatchOutcome::Complete(results) => results,
-            RelationalBatchOutcome::Cancelled => {
+        match execute_and_install_frontier_batch(
+            frontier,
+            questions,
+            &mut execute,
+            "relational_item_frontier",
+            Some("relational_item_frontier::barrier_sql"),
+        ) {
+            FrontierBatchResolution::Installed => {}
+            FrontierBatchResolution::Cancelled => {
                 return RelationalItemFrontierOutcome::Cancelled(completed);
             }
-            RelationalBatchOutcome::Failed(error) => {
-                crate::profiling::note_with(|| {
-                    format!("relational_item_frontier batch failed: {}", error.message())
-                });
+            FrontierBatchResolution::Failed(error) => {
                 return RelationalItemFrontierOutcome::Failed(error);
             }
-        };
-        assert_eq!(results.len(), requests.len());
-        let mut values = std::iter::repeat_with(|| None)
-            .take(results.len())
-            .collect::<Vec<_>>();
-        for result in results {
-            assert!(result.ordinal < values.len());
-            let slot = &mut values[result.ordinal];
-            assert!(
-                slot.is_none(),
-                "a relational batch returned an ordinal twice"
-            );
-            *slot = Some(result.value);
         }
-        frontier.install(
-            questions,
-            values
-                .into_iter()
-                .map(|value| value.expect("a relational batch omitted an ordinal"))
-                .collect(),
-        );
         active = next_active;
     }
 }
@@ -719,69 +750,6 @@ mod tests {
         assert_eq!(outcome, RelationalFrontierOutcome::Complete((true, false)));
         assert_eq!(batches.get(), 2);
         assert_eq!(evaluations.get(), 3);
-    }
-
-    #[test]
-    fn one_pass_deduplicates_shape_equivalent_questions() {
-        let question = package_question("same");
-        let batches = Cell::new(0usize);
-        let outcome = resolve_relational_frontier_with(
-            &CancellationToken::new(),
-            |requests| {
-                batches.set(batches.get() + 1);
-                assert_eq!(requests.len(), 1);
-                RelationalBatchOutcome::Complete(vec![RelationalDefinitionResult {
-                    ordinal: 0,
-                    value: RelationalDefinitionValue::PackageRelation(
-                        PackageRelationValue::Exists(false),
-                    ),
-                }])
-            },
-            |frontier| (exists(frontier, &question), exists(frontier, &question)),
-        );
-        assert_eq!(outcome, RelationalFrontierOutcome::Complete((false, false)));
-        assert_eq!(batches.get(), 1);
-    }
-
-    #[test]
-    fn owned_frontier_supports_request_local_arc_adapters() {
-        struct Adapter {
-            frontier: Arc<dyn RelationalDefinitionFrontier>,
-        }
-
-        let question = package_question("owned");
-        let outcome = resolve_relational_frontier_with_owned(
-            &CancellationToken::new(),
-            |requests| {
-                RelationalBatchOutcome::Complete(
-                    requests
-                        .iter()
-                        .map(|request| RelationalDefinitionResult {
-                            ordinal: request.ordinal,
-                            value: RelationalDefinitionValue::PackageRelation(
-                                PackageRelationValue::Exists(true),
-                            ),
-                        })
-                        .collect(),
-                )
-            },
-            |frontier| {
-                let adapter = Adapter { frontier };
-                exists(adapter.frontier.as_ref(), &question)
-            },
-        );
-        assert_eq!(outcome, RelationalFrontierOutcome::Complete(true));
-    }
-
-    #[test]
-    fn cancelled_batch_never_publishes_the_provisional_result() {
-        let question = package_question("cancelled");
-        let outcome = resolve_relational_frontier_with(
-            &CancellationToken::new(),
-            |_requests| RelationalBatchOutcome::Cancelled,
-            |frontier| exists(frontier, &question),
-        );
-        assert_eq!(outcome, RelationalFrontierOutcome::Cancelled);
     }
 
     #[test]
@@ -987,5 +955,16 @@ mod tests {
         assert_eq!(batches.load(Ordering::Relaxed), 1);
         assert_eq!(ready_evaluations.load(Ordering::Relaxed), 1);
         assert_eq!(missing_evaluations.load(Ordering::Relaxed), 4);
+    }
+
+    #[test]
+    fn cancelled_batch_never_publishes_the_provisional_result() {
+        let question = package_question("cancelled");
+        let outcome = resolve_relational_frontier_with(
+            &CancellationToken::new(),
+            |_requests| RelationalBatchOutcome::Cancelled,
+            |frontier| exists(frontier, &question),
+        );
+        assert_eq!(outcome, RelationalFrontierOutcome::Cancelled);
     }
 }

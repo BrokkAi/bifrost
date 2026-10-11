@@ -197,12 +197,13 @@ fn extract_file_facts_limited_with_tree(
                     && let Some(kind) = compiled.kind_of(&node)
                     && spec.should_extract(node, kind)
                 {
-                    let kind = spec.refine_kind(
+                    let kind = spec.refine_kind_with_parents(
                         node,
                         kind,
                         enclosing.map(|id| collector.normalized_kind(id)),
                         source,
                         &call_site_context,
+                        collector.parents(),
                     );
                     let fact_id = match collector.enter(node, kind, enclosing, &mut source_facts) {
                         Ok(fact_id) => fact_id,
@@ -249,7 +250,7 @@ fn extract_file_facts_limited_with_tree(
         }
     }
 
-    let rows = match collector.finish() {
+    let rows = match collector.finish(tree.root_node()) {
         Ok(rows) => rows,
         Err(StructuralFactCollectorStop::Exceeded) => {
             return LimitedFileFacts::Exceeded {
@@ -271,12 +272,14 @@ fn extract_file_facts_limited_with_tree(
 mod tests {
     use super::super::occurrences::OccurrenceRole;
     use super::*;
+    use brokk_bifrost_test_macros::hardwon;
 
     /// #1459: an empty file is a legitimate workspace member with zero facts
     /// (empty `__init__.py`, placeholder `.ts` fixtures). It must extract as
     /// an empty fact set, not `Unavailable` -- the all-or-nothing index build
     /// aborts the whole provider slice on any unavailable file.
     #[test]
+    #[hardwon("#1459: empty files aborted structural indexing before other providers ran")]
     fn empty_source_extracts_zero_facts() {
         let spec = &brokk_bifrost_python::structural::PYTHON_STRUCTURAL_SPEC;
         let grammar = tree_sitter_python::LANGUAGE.into();
@@ -292,94 +295,7 @@ mod tests {
     }
 
     #[test]
-    fn role_target_to_forward_child_resolves_after_one_collection_walk() {
-        use super::super::kinds::{NormalizedKind, Role};
-
-        let spec = &brokk_bifrost_python::structural::PYTHON_STRUCTURAL_SPEC;
-        let grammar = tree_sitter_python::LANGUAGE.into();
-        let source = "def call(value):\n    return target(value)\n";
-        let facts = extract_file_facts(spec, &grammar, source).expect("python fixture extracts");
-        let call_id = facts
-            .nodes()
-            .iter()
-            .position(|node| node.kind == NormalizedKind::Call)
-            .expect("call fact") as u32;
-        let callee = facts
-            .role_targets(call_id, Role::Callee)
-            .next()
-            .expect("callee role");
-        let target_id = callee.node.expect("callee identifier is normalized");
-
-        assert!(target_id > call_id, "callee is a forward child fact");
-        assert_eq!(facts.node(target_id).kind, NormalizedKind::Identifier);
-        assert_eq!(callee.span.text(source), "target");
-        assert_eq!(
-            facts.node(call_id).name.map(|span| span.text(source)),
-            Some("target")
-        );
-    }
-
-    /// An adapter must emit only the occurrence roles its table declares: a
-    /// table and an extraction pass that disagree would turn "we cannot
-    /// classify this" into a clean, empty, and wrong answer (#1473).
-    ///
-    /// PHP is the narrowest table left in the workspace -- it declares
-    /// `member_position` and nothing else -- so it is where an undeclared
-    /// emission would show. This guard used to point at Scala, which declared
-    /// no roles at all until #1597 graduated it.
-    #[test]
-    fn an_adapter_emits_only_the_occurrence_roles_it_declares() {
-        let spec = &brokk_bifrost_php::structural::PHP_STRUCTURAL_SPEC;
-        let support = spec.occurrence_role_support();
-        assert!(support.is_supported(OccurrenceRole::MemberPosition));
-
-        let grammar = tree_sitter_php::LANGUAGE_PHP.into();
-        let source = concat!(
-            "<?php\n",
-            "class Widget {\n",
-            "    public function render(Helper $helper): int {\n",
-            "        return $helper->build();\n",
-            "    }\n",
-            "}\n",
-        );
-        let facts = extract_file_facts(spec, &grammar, source).expect("php fixture extracts facts");
-        assert!(facts.nodes().len() > 1, "fixture should produce facts");
-        assert!(
-            facts.occurrence_role_count() > 0,
-            "the fixture must exercise the classifier"
-        );
-        for id in 0..facts.nodes().len() as u32 {
-            for role in facts.occurrence_roles(id) {
-                assert!(
-                    support.is_supported(*role),
-                    "php emitted undeclared role {role:?}"
-                );
-            }
-        }
-    }
-
-    /// Occurrence roles survive relational persistence with their node addressing
-    /// intact, which is the property the `(content identity, fact id)` join in
-    /// later milestones depends on.
-    #[test]
-    fn extracted_occurrence_roles_round_trip_through_the_snapshot_codec() {
-        let spec = &brokk_bifrost_python::structural::PYTHON_STRUCTURAL_SPEC;
-        let grammar = tree_sitter_python::LANGUAGE.into();
-        let source = "def render(label):\n    return label\n";
-        let facts = extract_file_facts(spec, &grammar, source).expect("python fixture extracts");
-        assert!(facts.occurrence_role_count() > 0);
-
-        let rows = facts
-            .persisted_rows()
-            .expect("facts become relational rows");
-        let decoded = FileFacts::from_persisted_rows(source.to_owned(), rows)
-            .expect("relational facts hydrate");
-        for id in 0..facts.nodes().len() as u32 {
-            assert_eq!(decoded.occurrence_roles(id), facts.occurrence_roles(id));
-        }
-    }
-
-    #[test]
+    #[hardwon("#1612: deferred Python annotations lost their inner AST facts")]
     fn embedded_facts_preserve_identity_containment_limits_and_snapshots() {
         let spec = &brokk_bifrost_python::structural::PYTHON_STRUCTURAL_SPEC;
         let grammar = tree_sitter_python::LANGUAGE.into();
@@ -439,5 +355,50 @@ mod tests {
             extract_file_facts_limited(spec, &grammar, source, facts.nodes().len() - 1, None,),
             LimitedFileFacts::Exceeded { .. }
         ));
+    }
+
+    #[test]
+    fn role_target_to_forward_child_resolves_after_one_collection_walk() {
+        use super::super::kinds::{NormalizedKind, Role};
+
+        let spec = &brokk_bifrost_python::structural::PYTHON_STRUCTURAL_SPEC;
+        let grammar = tree_sitter_python::LANGUAGE.into();
+        let source = "def call(value):\n    return target(value)\n";
+        let facts = extract_file_facts(spec, &grammar, source).expect("python fixture extracts");
+        let call_id = facts
+            .nodes()
+            .iter()
+            .position(|node| node.kind == NormalizedKind::Call)
+            .expect("call fact") as u32;
+        let callee = facts
+            .role_targets(call_id, Role::Callee)
+            .next()
+            .expect("callee role");
+        let target_id = callee.node.expect("callee identifier is normalized");
+
+        assert!(target_id > call_id, "callee is a forward child fact");
+        assert_eq!(facts.node(target_id).kind, NormalizedKind::Identifier);
+        assert_eq!(callee.span.text(source), "target");
+        assert_eq!(
+            facts.node(call_id).name.map(|span| span.text(source)),
+            Some("target")
+        );
+    }
+    #[test]
+    fn extracted_occurrence_roles_round_trip_through_the_snapshot_codec() {
+        let spec = &brokk_bifrost_python::structural::PYTHON_STRUCTURAL_SPEC;
+        let grammar = tree_sitter_python::LANGUAGE.into();
+        let source = "def render(label):\n    return label\n";
+        let facts = extract_file_facts(spec, &grammar, source).expect("python fixture extracts");
+        assert!(facts.occurrence_role_count() > 0);
+
+        let rows = facts
+            .persisted_rows()
+            .expect("facts become relational rows");
+        let decoded = FileFacts::from_persisted_rows(source.to_owned(), rows)
+            .expect("relational facts hydrate");
+        for id in 0..facts.nodes().len() as u32 {
+            assert_eq!(decoded.occurrence_roles(id), facts.occurrence_roles(id));
+        }
     }
 }

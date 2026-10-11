@@ -14,18 +14,7 @@ fn java_binding_declares_array(node: Node<'_>) -> bool {
             node.parent()
                 .and_then(|declaration| declaration.child_by_field_name("type"))
         })
-        .is_some_and(java_type_syntax_is_array)
-}
-
-fn java_type_syntax_is_array(root: Node<'_>) -> bool {
-    let mut stack = vec![root];
-    while let Some(node) = stack.pop() {
-        if matches!(node.kind(), "array_type" | "dimensions") {
-            return true;
-        }
-        stack.extend(named_children(node));
-    }
-    false
+        .is_some_and(super::super::java_type_syntax_is_array)
 }
 
 /// A resolved, unambiguous field declaration: its own name's source anchor,
@@ -125,24 +114,23 @@ pub(super) fn java_declaration_inventory(
 }
 
 fn enclosing_type_name(source: &str, node: Node<'_>) -> Option<Box<str>> {
-    let mut current = node.parent();
-    while let Some(candidate) = current {
-        if matches!(
-            candidate.kind(),
-            "class_declaration"
-                | "interface_declaration"
-                | "enum_declaration"
-                | "record_declaration"
-                | "annotation_type_declaration"
-        ) {
-            return candidate
-                .child_by_field_name("name")
-                .and_then(|name| node_text(source, name))
-                .map(Into::into);
-        }
-        current = candidate.parent();
-    }
-    None
+    let candidate = brokk_bifrost_core::analyzer::structural::adapter_helpers::nearest_ancestor(
+        node,
+        |kind| {
+            matches!(
+                kind,
+                "class_declaration"
+                    | "interface_declaration"
+                    | "enum_declaration"
+                    | "record_declaration"
+                    | "annotation_type_declaration"
+            )
+        },
+    )?;
+    candidate
+        .child_by_field_name("name")
+        .and_then(|name| node_text(source, name))
+        .map(Into::into)
 }
 
 impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
@@ -1136,7 +1124,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             }
             "cast_expression" => node
                 .child_by_field_name("type")
-                .is_some_and(java_type_syntax_is_array),
+                .is_some_and(super::super::java_type_syntax_is_array),
             _ => false,
         }
     }

@@ -8,15 +8,14 @@
 //! carries the procedure's `SemanticArtifactKey` -- a digest over mount, path,
 //! language, exact source revision, adapter semantics version, IR version,
 //! configuration fingerprint, and dependency fingerprint -- closed over the
-//! exact dependency and recursive-group closure. A procedure also carries the
-//! provider behavior when projection asks for call transfers or a fresh-object
-//! publication inventory, because either answer can change without changing
-//! the procedure's own source. A call-free procedure without witnessed
-//! allocation publication uses a provider-independent behavior, so rotating a
-//! provider does not discard an exact reusable leaf summary for an unrelated
-//! edit. A protocol summary adds the protocol and binding hashes. A whole
-//! solved result adds the entry facts, the full provider execution behavior,
-//! and both remaining budgets.
+//! exact dependency and recursive-group closure. A procedure carries the
+//! provider behavior when projection asks for call transfers, because that
+//! answer can change without changing the procedure's own source. A call-free
+//! procedure uses a provider-independent behavior, so rotating a provider
+//! does not discard an exact reusable leaf summary for an unrelated edit. A
+//! protocol summary adds the protocol and binding hashes. A whole solved result
+//! adds the entry facts, the full provider execution behavior, and both
+//! remaining budgets.
 //!
 //! This remains generation-independent: a stale entry is simply an entry
 //! nothing asks for again, and the byte and entry limits retire it. The full
@@ -32,43 +31,30 @@
 //! freezing one into the cache would deny a later, better-funded request the
 //! better answer it could reach. See [`publish_exact_result`].
 
+use crate::semantic_summary::{ProcedureDependencyComponentOrder, ProcedureDependencyGraph};
 use std::fmt;
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
-use std::{cmp::Reverse, collections::BinaryHeap};
 
 use crate::analyzer::semantic::cfg_algorithms::{
-    CfgAlgorithmBudget, CfgAlgorithmError, CfgAlgorithmRequest, DenseBidirectionalGraph,
-    strongly_connected_components,
+    CfgAlgorithmBudget, CfgAlgorithmError, CfgAlgorithmRequest, strongly_connected_components,
 };
 use crate::analyzer::semantic::{
-    AbstractObject, AccessPathRoot, BindingOriginIndex, CallBoundary, CallInvocationMode,
-    CallSiteId, CallableTarget, CallableTargetResolution, CandidateCoverage, EvidenceCompleteness,
-    FreshObjectPublicationKind, FreshObjectPublicationQuery, HeapOracle, IcfgProvider,
-    IcfgProviderBehaviorIdentity, IndexedLocationIdentity, LengthDelimitedDigest, MemoryLocationId,
-    MemoryLocationKind, ObjectCardinality, OracleCallContext, ProcedureHandle, ProgramPointId,
+    BindingOriginIndex, CallBoundary, CallInvocationMode, CallSiteId, CallableTarget,
+    CallableTargetResolution, CandidateCoverage, EvidenceCompleteness, IcfgProvider,
+    IcfgProviderBehaviorIdentity, LengthDelimitedDigest, MemoryLocationKind, ProcedureHandle,
     ProofStatus, SemanticBudgetExceeded, SemanticCallSite, SemanticEffect, SemanticExecutionBudget,
     SemanticExecutionBudgetCharge, SemanticExecutionBudgetSnapshot, SemanticOutcome,
-    SemanticProviderError, SemanticRequest, SemanticValueKind, SemanticWork,
-    SynchronizationOperation, ValueFlowKind, ValueId,
-};
-use crate::concurrency::{
-    ConcurrencyAnswer, ConcurrencyAtomicOperation, ConcurrencyLockMode, ConcurrencyProvider,
-    ConcurrencySubjectIdentity, ResolvedConcurrencyEffect, ResolvedLockAcquisition,
-    ResolvedTaskSpawnCondition, ResolvedTimerStopOutcome,
+    SemanticProviderError, SemanticRequest, SemanticValueKind, SemanticWork, ValueFlowKind,
+    ValueId,
 };
 use crate::dataflow::{
     DataflowRequest, ProcedureSummaryIdentity, ProcedureSummaryKey,
     ProductionSemanticSummaryRepository, SemanticInputStatus, SemanticProcedureSummary, SolverWork,
     SummaryBehaviorKey, SummaryBoundaryKind, SummaryCallSourceWitness, SummaryCompleteness,
-    SummaryConcurrencyAccessMode, SummaryConcurrencyAccessPath, SummaryConcurrencyAccessSelector,
-    SummaryConcurrencyEffect, SummaryConcurrencyEffectKind, SummaryConcurrencyExecution,
-    SummaryConcurrencyExecutionCardinality, SummaryConcurrencyLockMode,
-    SummaryConcurrencyLockOperation, SummaryConcurrencySourceWitness,
-    SummaryConcurrencySubjectIdentity, SummaryContextKey, SummaryDependencyKey, SummaryEffect,
-    SummaryEffectKey, SummaryEventKey, SummaryEvidence, SummaryLocationKey, SummaryLockAcquisition,
-    SummaryOrigin, SummaryPort, SummaryPublicationError, SummaryPublicationOutcome,
-    SummaryReadObserver, SummaryRecursiveEdge, SummaryRecursiveGroupKey, SummaryRepositoryLimits,
-    SummarySchemaVersion, SummarySemanticsVersion, SummaryValidationError,
+    SummaryContextKey, SummaryDependencyKey, SummaryEffect, SummaryEffectKey, SummaryEventKey,
+    SummaryEvidence, SummaryOrigin, SummaryPort, SummaryPublicationError,
+    SummaryPublicationOutcome, SummaryReadObserver, SummaryRecursiveEdge, SummaryRecursiveGroupKey,
+    SummaryRepositoryLimits, SummarySchemaVersion, SummarySemanticsVersion, SummaryValidationError,
 };
 use crate::hash::{HashMap, HashSet};
 
@@ -80,12 +66,12 @@ use super::{
     solve_typestate_with_reusable_summaries, solve_typestate_with_summaries,
 };
 
-const PRODUCTION_SUMMARY_SEMANTICS: &[u8] = b"bifrost-production-semantic-summary-v24";
+const PRODUCTION_SUMMARY_SEMANTICS: &[u8] = b"bifrost-production-semantic-summary-v26";
 const EMPTY_CALL_CONTEXT: &[u8] = b"bifrost-production-empty-call-context-v1";
 const PRODUCTION_ICFG_BEHAVIOR_DOMAIN: &[u8] = b"bifrost-production-icfg-behavior-v2";
-const PRODUCTION_PUBLICATION_BEHAVIOR_DOMAIN: &[u8] = b"bifrost-production-publication-behavior-v1";
+const PRODUCTION_SUMMARY_BEHAVIOR_DOMAIN: &[u8] = b"bifrost-production-summary-behavior-v1";
 const PROVIDER_INDEPENDENT_LEAF_BEHAVIOR: &[u8] =
-    b"bifrost-production-provider-independent-leaf/v2";
+    b"bifrost-production-provider-independent-leaf/v3";
 const CALL_EFFECT_DOMAIN: &[u8] = b"bifrost-production-call-effect-v1";
 const WORKSPACE_PROVIDER_CONTEXT: &[u8] = b"bifrost-production-workspace-provider-v1";
 
@@ -283,10 +269,7 @@ impl ProductionTypestateSummaryRepository {
     }
 
     pub fn counters(&self) -> ProductionSummaryLifecycleCounters {
-        *self
-            .counters
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+        *self.lifecycle_counters()
     }
 
     pub fn retained_result_count(&self) -> usize {
@@ -714,14 +697,9 @@ where
     let solver_work_before = request.budget.used();
     let execution_before = execution_context.snapshot();
     let provider_behavior = production_icfg_behavior(provider.behavior_identity());
-    let projection_behavior =
-        production_summary_behavior(projection_provider.behavior_identity(), false);
+    let projection_behavior = production_summary_behavior(projection_provider.behavior_identity());
     let result_key = production_result_key(
-        summary_identity(
-            root,
-            projection_behavior,
-            ProductionPublicationMode::Omitted,
-        ),
+        summary_identity(root, projection_behavior),
         provider_behavior,
         entry_facts,
         protocol,
@@ -795,8 +773,6 @@ where
     let semantic_summaries = match project_production_semantic_summaries_with_behavior(
         std::slice::from_ref(root),
         projection_provider,
-        None,
-        None,
         projection_behavior,
         &mut SemanticRequest::new(semantic_budget, request.cancellation),
     ) {
@@ -1004,12 +980,6 @@ fn publish_exact_result(
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ProductionPublicationMode {
-    Omitted,
-    Witnessed,
-}
-
 /// Owned semantic identities in bottom-up publication order.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProductionSemanticSummarySet {
@@ -1017,7 +987,6 @@ pub struct ProductionSemanticSummarySet {
     components: Vec<std::ops::Range<usize>>,
     complete_call_targets: HashMap<(ProcedureHandle, CallSiteId), Box<[ProcedureHandle]>>,
     behavior: SummaryBehaviorKey,
-    publication_mode: ProductionPublicationMode,
     procedure_semantics_precharged: bool,
 }
 
@@ -1039,7 +1008,7 @@ impl ProductionSemanticSummarySet {
     }
 
     pub fn summary_for(&self, procedure: &ProcedureHandle) -> Option<&SemanticProcedureSummary> {
-        let identity = summary_identity(procedure, self.behavior, self.publication_mode);
+        let identity = summary_identity(procedure, self.behavior);
         self.summaries
             .iter()
             .find(|summary| summary.key().identity() == &identity)
@@ -1079,12 +1048,7 @@ impl ProductionSemanticSummarySet {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ProductionSummaryProjectionError {
     Provider(SemanticProviderError),
-    MismatchedConcurrencyBehavior,
     CallTransferBudgetExceeded {
-        procedure: Box<ProcedureSummaryIdentity>,
-        exceeded: SemanticBudgetExceeded,
-    },
-    PublicationBudgetExceeded {
         procedure: Box<ProcedureSummaryIdentity>,
         exceeded: SemanticBudgetExceeded,
     },
@@ -1099,22 +1063,12 @@ impl fmt::Display for ProductionSummaryProjectionError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Provider(error) => write!(formatter, "semantic provider failed: {error}"),
-            Self::MismatchedConcurrencyBehavior => formatter
-                .write_str("concurrency model provider does not match the ICFG provider behavior"),
             Self::CallTransferBudgetExceeded {
                 procedure,
                 exceeded,
             } => write!(
                 formatter,
                 "cannot cache call-transfer closure for {:?}: {exceeded}",
-                procedure.declaration(),
-            ),
-            Self::PublicationBudgetExceeded {
-                procedure,
-                exceeded,
-            } => write!(
-                formatter,
-                "cannot cache publication inventory for {:?}: {exceeded}",
                 procedure.declaration(),
             ),
             Self::RetainedClosureBudgetExceeded(exceeded) => {
@@ -1140,150 +1094,11 @@ impl std::error::Error for ProductionSummaryProjectionError {
         match self {
             Self::Provider(error) => Some(error),
             Self::Validation(error) => Some(error),
-            Self::CallTransferBudgetExceeded { exceeded, .. }
-            | Self::PublicationBudgetExceeded { exceeded, .. } => Some(exceeded),
+            Self::CallTransferBudgetExceeded { exceeded, .. } => Some(exceeded),
             Self::RetainedClosureBudgetExceeded(exceeded) => Some(exceeded),
-            Self::MismatchedConcurrencyBehavior
-            | Self::Cancelled
-            | Self::GraphBudgetExceeded
-            | Self::InvalidDependencyGraph => None,
+            Self::Cancelled | Self::GraphBudgetExceeded | Self::InvalidDependencyGraph => None,
         }
     }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ProductionSemanticSummaryAcquisitionKind {
-    Retained,
-    Projected,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ProductionSemanticSummaryAcquisition {
-    summaries: ProductionSemanticSummarySet,
-    kind: ProductionSemanticSummaryAcquisitionKind,
-}
-
-impl ProductionSemanticSummaryAcquisition {
-    pub const fn kind(&self) -> ProductionSemanticSummaryAcquisitionKind {
-        self.kind
-    }
-
-    pub fn into_summaries(self) -> ProductionSemanticSummarySet {
-        self.summaries
-    }
-}
-
-/// Acquire an exact retained closure before falling back to fresh projection.
-///
-/// Retained rows carry no generation-local call-target handles. Their set
-/// deliberately leaves that companion empty so consumers resolve current calls
-/// through their live provider.
-pub fn acquire_production_semantic_summaries<Provider>(
-    roots: &[ProcedureHandle],
-    provider: &Provider,
-    repository: &ProductionSemanticSummaryRepository,
-    observer: &dyn SummaryReadObserver,
-    request: &mut SemanticRequest<'_>,
-) -> Result<ProductionSemanticSummaryAcquisition, ProductionSummaryProjectionError>
-where
-    Provider: IcfgProvider + HeapOracle,
-{
-    acquire_production_semantic_summaries_inner(
-        roots, provider, None, repository, observer, request,
-    )
-}
-
-/// Acquire production summaries that also retain complete reviewed-model
-/// effects at their exact source call. The ICFG provider's behavior identity
-/// must describe the same active-model snapshot as `concurrency_provider`;
-/// callers construct both from one captured request snapshot.
-pub fn acquire_production_semantic_summaries_with_concurrency<Provider>(
-    roots: &[ProcedureHandle],
-    provider: &Provider,
-    concurrency_provider: &dyn ConcurrencyProvider,
-    repository: &ProductionSemanticSummaryRepository,
-    observer: &dyn SummaryReadObserver,
-    request: &mut SemanticRequest<'_>,
-) -> Result<ProductionSemanticSummaryAcquisition, ProductionSummaryProjectionError>
-where
-    Provider: IcfgProvider + HeapOracle,
-{
-    if concurrency_provider.summary_behavior_identity() != Some(provider.behavior_identity()) {
-        return Err(ProductionSummaryProjectionError::MismatchedConcurrencyBehavior);
-    }
-    acquire_production_semantic_summaries_inner(
-        roots,
-        provider,
-        Some(concurrency_provider),
-        repository,
-        observer,
-        request,
-    )
-}
-
-fn acquire_production_semantic_summaries_inner<Provider>(
-    roots: &[ProcedureHandle],
-    provider: &Provider,
-    concurrency_provider: Option<&dyn ConcurrencyProvider>,
-    repository: &ProductionSemanticSummaryRepository,
-    observer: &dyn SummaryReadObserver,
-    request: &mut SemanticRequest<'_>,
-) -> Result<ProductionSemanticSummaryAcquisition, ProductionSummaryProjectionError>
-where
-    Provider: IcfgProvider + HeapOracle,
-{
-    if request.cancellation.is_cancelled() {
-        return Err(ProductionSummaryProjectionError::Cancelled);
-    }
-    let behavior = production_summary_behavior(provider.behavior_identity(), true);
-    let mut root_identities = roots
-        .iter()
-        .map(|root| summary_identity(root, behavior, ProductionPublicationMode::Witnessed))
-        .collect::<Vec<_>>();
-    root_identities.sort_unstable();
-    root_identities.dedup();
-    if let Some(retained) = repository.complete_closure(&root_identities) {
-        let work = retained
-            .summaries()
-            .iter()
-            .map(|summary| 1usize.saturating_add(summary.dependencies().len()))
-            .fold(0usize, usize::saturating_add);
-        request
-            .budget
-            .charge(SemanticWork {
-                nested_entries: work,
-                ..SemanticWork::default()
-            })
-            .map_err(ProductionSummaryProjectionError::RetainedClosureBudgetExceeded)?;
-        if request.cancellation.is_cancelled() {
-            return Err(ProductionSummaryProjectionError::Cancelled);
-        }
-        retained.observe(observer);
-        let (summaries, components) = retained.into_parts();
-        return Ok(ProductionSemanticSummaryAcquisition {
-            summaries: ProductionSemanticSummarySet {
-                summaries,
-                components,
-                complete_call_targets: HashMap::default(),
-                behavior,
-                publication_mode: ProductionPublicationMode::Witnessed,
-                procedure_semantics_precharged: false,
-            },
-            kind: ProductionSemanticSummaryAcquisitionKind::Retained,
-        });
-    }
-
-    Ok(ProductionSemanticSummaryAcquisition {
-        summaries: project_production_semantic_summaries_with_behavior(
-            roots,
-            provider,
-            Some(provider),
-            concurrency_provider,
-            behavior,
-            request,
-        )?,
-        kind: ProductionSemanticSummaryAcquisitionKind::Projected,
-    })
 }
 
 impl From<SemanticProviderError> for ProductionSummaryProjectionError {
@@ -1333,72 +1148,31 @@ fn record_direct_call_effect(
     Ok(())
 }
 
-/// Project the exact production ICFG dependency closure and witnessed
-/// publication inventory into stable reusable summaries.
+/// Project the exact production ICFG dependency closure into stable reusable
+/// summaries.
 pub fn project_production_semantic_summaries<Provider>(
     roots: &[ProcedureHandle],
     provider: &Provider,
     request: &mut SemanticRequest<'_>,
 ) -> Result<ProductionSemanticSummarySet, ProductionSummaryProjectionError>
 where
-    Provider: IcfgProvider + HeapOracle,
+    Provider: IcfgProvider,
 {
-    let behavior = production_summary_behavior(provider.behavior_identity(), true);
-    project_production_semantic_summaries_with_behavior(
-        roots,
-        provider,
-        Some(provider),
-        None,
-        behavior,
-        request,
-    )
-}
-
-pub fn project_production_semantic_summaries_with_concurrency<Provider>(
-    roots: &[ProcedureHandle],
-    provider: &Provider,
-    concurrency_provider: &dyn ConcurrencyProvider,
-    request: &mut SemanticRequest<'_>,
-) -> Result<ProductionSemanticSummarySet, ProductionSummaryProjectionError>
-where
-    Provider: IcfgProvider + HeapOracle,
-{
-    if concurrency_provider.summary_behavior_identity() != Some(provider.behavior_identity()) {
-        return Err(ProductionSummaryProjectionError::MismatchedConcurrencyBehavior);
-    }
-    let behavior = production_summary_behavior(provider.behavior_identity(), true);
-    project_production_semantic_summaries_with_behavior(
-        roots,
-        provider,
-        Some(provider),
-        Some(concurrency_provider),
-        behavior,
-        request,
-    )
+    let behavior = production_summary_behavior(provider.behavior_identity());
+    project_production_semantic_summaries_with_behavior(roots, provider, behavior, request)
 }
 
 fn project_production_semantic_summaries_with_behavior<Provider>(
     roots: &[ProcedureHandle],
     provider: &Provider,
-    publication_provider: Option<&dyn HeapOracle>,
-    concurrency_provider: Option<&dyn ConcurrencyProvider>,
     behavior: SummaryBehaviorKey,
     request: &mut SemanticRequest<'_>,
 ) -> Result<ProductionSemanticSummarySet, ProductionSummaryProjectionError>
 where
     Provider: IcfgProvider + ?Sized,
 {
-    // One control-query ledger spans the whole projection. Recreating it for
-    // each source dominance question discards the complete graph facts.
-    let mut control_request = crate::concurrency::SolveRequest::raw(request);
-    let request = &mut control_request;
-    let publication_mode = if publication_provider.is_some() {
-        ProductionPublicationMode::Witnessed
-    } else {
-        ProductionPublicationMode::Omitted
-    };
     let mut procedures = roots.to_vec();
-    canonicalize_procedures(&mut procedures, behavior, publication_mode);
+    canonicalize_procedures(&mut procedures, behavior);
     let mut index_by_handle = procedures
         .iter()
         .cloned()
@@ -1409,36 +1183,18 @@ where
     let mut complete_call_targets =
         vec![HashMap::<CallSiteId, Box<[ProcedureHandle]>>::default(); procedures.len()];
     let mut direct_call_effects = vec![Vec::<DirectCallEffect>::new(); procedures.len()];
-    let mut direct_effects = Vec::with_capacity(procedures.len());
-    for procedure in &procedures {
-        direct_effects.push(project_direct_concurrency_effects(
-            procedure,
-            publication_provider,
-            behavior,
-            request,
-        )?);
-    }
+    let mut direct_effects = vec![Vec::<SummaryEffect>::new(); procedures.len()];
     let mut cursor = 0usize;
 
     while cursor < procedures.len() {
         let procedure = procedures[cursor].clone();
         let mut dependencies = Vec::new();
         for (call_ordinal, call) in procedure.semantics().call_sites().iter().enumerate() {
-            if let Some(concurrency_provider) = concurrency_provider {
-                project_modeled_call_effects(
-                    &procedure,
-                    call,
-                    concurrency_provider,
-                    request,
-                    &mut direct_effects[cursor],
-                )?;
-            }
             // Detached callees are source dependencies, but never synchronous
             // call transfers: their bodies do not return into this caller.
             if call.invocation_mode == CallInvocationMode::Detached {
-                // The live concurrency solver gives this IR-owned proof the
-                // same precedence, so it can also serve as an exact current
-                // target companion without consulting workspace dispatch.
+                // An IR-owned local target is already exact and needs no
+                // second dispatch query.
                 if let CallableTargetResolution::Proven(CallableTarget::Local(target)) =
                     call.declared_targets
                 {
@@ -1446,7 +1202,7 @@ where
                         .artifact()
                         .procedure_handle(target)
                         .expect("validated local target belongs to its artifact");
-                    let dependency = summary_identity(&target, behavior, publication_mode);
+                    let dependency = summary_identity(&target, behavior);
                     let evidence = SummaryEvidence::proven_complete();
                     record_direct_call_effect(
                         &mut direct_call_effects[cursor],
@@ -1472,11 +1228,7 @@ where
                     SemanticOutcome::ExceededBudget { exceeded, .. } => {
                         return Err(
                             ProductionSummaryProjectionError::CallTransferBudgetExceeded {
-                                procedure: Box::new(summary_identity(
-                                    &procedure,
-                                    behavior,
-                                    publication_mode,
-                                )),
+                                procedure: Box::new(summary_identity(&procedure, behavior)),
                                 exceeded,
                             },
                         );
@@ -1508,14 +1260,13 @@ where
                 if let Some(dispatch) = dispatch {
                     // Exact candidates are stable may-dependencies. Do not put
                     // them in `complete_call_targets`: raw dispatch does not
-                    // include the concurrency provider's callable and binding
-                    // proof, which must remain live at the spawned invocation.
+                    // establish a complete target set for this invocation.
                     for candidate in dispatch.candidates().iter().filter(|candidate| {
                         matches!(candidate.proof(), ProofStatus::Proven)
                             && matches!(candidate.completeness(), EvidenceCompleteness::Complete)
                     }) {
                         let target = candidate.target().clone();
-                        let dependency = summary_identity(&target, behavior, publication_mode);
+                        let dependency = summary_identity(&target, behavior);
                         let evidence = SummaryEvidence::from_semantic(
                             candidate.proof(),
                             candidate.completeness(),
@@ -1568,11 +1319,7 @@ where
                 SemanticOutcome::ExceededBudget { exceeded, .. } => {
                     return Err(
                         ProductionSummaryProjectionError::CallTransferBudgetExceeded {
-                            procedure: Box::new(summary_identity(
-                                &procedure,
-                                behavior,
-                                publication_mode,
-                            )),
+                            procedure: Box::new(summary_identity(&procedure, behavior)),
                             exceeded,
                         },
                     );
@@ -1596,11 +1343,11 @@ where
                     .iter()
                     .map(|transfer| transfer.callee.clone())
                     .collect::<Vec<_>>();
-                canonicalize_procedures(&mut targets, behavior, publication_mode);
+                canonicalize_procedures(&mut targets, behavior);
                 complete_call_targets[cursor].insert(call.id, targets.into_boxed_slice());
             }
             for transfer in value.transfers {
-                let dependency = summary_identity(&transfer.callee, behavior, publication_mode);
+                let dependency = summary_identity(&transfer.callee, behavior);
                 let evidence =
                     SummaryEvidence::from_semantic(&transfer.proof, &transfer.completeness)?
                         .conjoin(&outcome_evidence)?;
@@ -1614,7 +1361,7 @@ where
                 dependencies.push(transfer.callee);
             }
         }
-        canonicalize_procedures(&mut dependencies, behavior, publication_mode);
+        canonicalize_procedures(&mut dependencies, behavior);
         for dependency in &dependencies {
             if !index_by_handle.contains_key(dependency) {
                 let index = procedures.len();
@@ -1622,12 +1369,7 @@ where
                 direct_dependencies.push(Vec::new());
                 complete_call_targets.push(HashMap::default());
                 direct_call_effects.push(Vec::new());
-                direct_effects.push(project_direct_concurrency_effects(
-                    dependency,
-                    publication_provider,
-                    behavior,
-                    request,
-                )?);
+                direct_effects.push(Vec::new());
                 index_by_handle.insert(dependency.clone(), index);
             }
         }
@@ -1637,11 +1379,8 @@ where
 
     let mut canonical_order = (0..procedures.len()).collect::<Vec<_>>();
     canonical_order.sort_unstable_by(|&left, &right| {
-        summary_identity(&procedures[left], behavior, publication_mode).cmp(&summary_identity(
-            &procedures[right],
-            behavior,
-            publication_mode,
-        ))
+        summary_identity(&procedures[left], behavior)
+            .cmp(&summary_identity(&procedures[right], behavior))
     });
     let mut canonical_by_old = vec![0usize; procedures.len()];
     for (canonical, old) in canonical_order.iter().copied().enumerate() {
@@ -1699,1457 +1438,8 @@ where
         &graph,
         &sccs.components,
         behavior,
-        publication_mode,
         request.cancellation,
     )
-}
-
-fn project_modeled_call_effects(
-    procedure: &ProcedureHandle,
-    call: &SemanticCallSite,
-    provider: &dyn ConcurrencyProvider,
-    request: &mut crate::concurrency::SolveRequest<'_, '_>,
-    effects: &mut Vec<SummaryEffect>,
-) -> Result<(), ProductionSummaryProjectionError> {
-    if call.execution_timing != crate::analyzer::semantic::ExecutionTiming::SameEvaluation {
-        return Ok(());
-    }
-    let call_handle = procedure
-        .call_site_handle(call.id)
-        .expect("validated call belongs to its procedure");
-    if !provider.may_have_modeled_effects(&call_handle) {
-        return Ok(());
-    }
-    let targets = provider.resolve_call(&call_handle, request)?;
-    let ConcurrencyAnswer::Proven(modeled) =
-        provider.modeled_effects(&call_handle, &targets, request)?
-    else {
-        return Ok(());
-    };
-    let mut stable = Vec::with_capacity(modeled.len());
-    for effect in modeled {
-        if let ResolvedConcurrencyEffect::TaskSpawn {
-            callable,
-            targets,
-            receiver,
-            group,
-            condition,
-            timer,
-        } = &effect
-        {
-            // A spawn a model dispatches through a receiver names a method of
-            // a value the call already holds, not a callable value this
-            // procedure can recover a body for; the live solve binds that
-            // receiver itself, so the projection abstains rather than
-            // inventing a target (issue #3428).
-            if receiver.is_some() {
-                return Ok(());
-            }
-            let recovered = crate::concurrency::source_callable_targets(procedure, *callable);
-            if !matches!(recovered, ConcurrencyAnswer::Proven(ref recovered) if recovered == targets)
-            {
-                // A callable this procedure cannot name (a forwarded formal,
-                // for example) does not project. The condition still lives on
-                // the caller's solve, which reports its own typed boundary;
-                // composing it here would name a callable the boundary cannot
-                // describe.
-                return Ok(());
-            }
-            let ordinals = call
-                .arguments
-                .iter()
-                .enumerate()
-                .filter_map(|(ordinal, argument)| (argument.value == *callable).then_some(ordinal))
-                .collect::<Vec<_>>();
-            let [ordinal] = ordinals.as_slice() else {
-                return Ok(());
-            };
-            let group = if let Some(group) = group {
-                let DirectConcurrencyPath::Boundary(location) =
-                    direct_concurrency_modeled_subject_path(
-                        procedure,
-                        call,
-                        group.value,
-                        provider,
-                        request,
-                    )?
-                else {
-                    return Ok(());
-                };
-                Some(crate::dataflow::SummaryConcurrencyTaskGroup {
-                    location,
-                    identity: match group.identity {
-                        ConcurrencySubjectIdentity::Value => {
-                            SummaryConcurrencySubjectIdentity::Value
-                        }
-                        ConcurrencySubjectIdentity::Backing => {
-                            SummaryConcurrencySubjectIdentity::Backing
-                        }
-                    },
-                })
-            } else {
-                None
-            };
-            // The timer is the spawn call's own result, so it reaches the
-            // boundary exactly when the wrapper's normal returns identify
-            // that result. A timer that stays local cannot be named on the
-            // boundary, so the spawn does not project at all and the live
-            // model lookup keeps answering the call, exactly like a group
-            // that stays local.
-            let timer = if timer.is_some() {
-                let Some(port) = direct_timer_return_port(procedure, call) else {
-                    return Ok(());
-                };
-                Some(SummaryConcurrencyAccessPath::port(port))
-            } else {
-                None
-            };
-            let kind = SummaryConcurrencyEffectKind::TaskSpawn {
-                callable: crate::dataflow::SummaryConcurrencyCallable::SourceArgument(
-                    u32::try_from(*ordinal).expect("validated call argument ordinal fits u32"),
-                ),
-                target_coverage: crate::dataflow::SummaryConcurrencyTargetCoverage::Exhaustive,
-                condition: match condition {
-                    ResolvedTaskSpawnCondition::Unconditional => {
-                        crate::dataflow::SummaryTaskSpawnCondition::Unconditional
-                    }
-                    ResolvedTaskSpawnCondition::CallResultTrue
-                    | ResolvedTaskSpawnCondition::OnResultTrue { .. } => {
-                        crate::dataflow::SummaryTaskSpawnCondition::CallResultTrue
-                    }
-                },
-                group,
-                timer,
-            };
-            if stable.contains(&kind) {
-                return Ok(());
-            }
-            stable.push(kind);
-            continue;
-        }
-        if let ResolvedConcurrencyEffect::OnceDo {
-            once,
-            callable,
-            targets,
-        } = &effect
-        {
-            let recovered = crate::concurrency::source_callable_targets(procedure, *callable);
-            if !matches!(recovered, ConcurrencyAnswer::Proven(ref recovered) if recovered == targets)
-            {
-                return Ok(());
-            }
-            let ordinals = call
-                .arguments
-                .iter()
-                .enumerate()
-                .filter_map(|(ordinal, argument)| (argument.value == *callable).then_some(ordinal))
-                .collect::<Vec<_>>();
-            let [ordinal] = ordinals.as_slice() else {
-                return Ok(());
-            };
-            let DirectConcurrencyPath::Boundary(once_path) =
-                direct_concurrency_modeled_subject_path(
-                    procedure, call, once.value, provider, request,
-                )?
-            else {
-                return Ok(());
-            };
-            let kind = SummaryConcurrencyEffectKind::OnceDo {
-                once: once_path,
-                identity: match once.identity {
-                    ConcurrencySubjectIdentity::Value => SummaryConcurrencySubjectIdentity::Value,
-                    ConcurrencySubjectIdentity::Backing => {
-                        SummaryConcurrencySubjectIdentity::Backing
-                    }
-                },
-                callable: crate::dataflow::SummaryConcurrencyCallable::SourceArgument(
-                    u32::try_from(*ordinal).expect("validated call argument ordinal fits u32"),
-                ),
-                target_coverage: crate::dataflow::SummaryConcurrencyTargetCoverage::Exhaustive,
-            };
-            if stable.contains(&kind) {
-                return Ok(());
-            }
-            stable.push(kind);
-            continue;
-        }
-        if let ResolvedConcurrencyEffect::SubtestRun {
-            callable,
-            targets,
-            group,
-        }
-        | ResolvedConcurrencyEffect::SubtestCleanup {
-            callable,
-            targets,
-            group,
-        } = &effect
-        {
-            // A subtest spawn projects like a task spawn: the callable stays
-            // a witnessed source argument with exhaustive targets and the
-            // group stays a boundary port. The consuming solver classifies
-            // the resolved callback itself, so the classification never
-            // crosses the summary boundary as a frozen fact. The `Parallel`
-            // marker never projects: the classification pre-scan reads the
-            // available callback bodies directly.
-            let recovered = crate::concurrency::source_callable_targets(procedure, *callable);
-            if !matches!(recovered, ConcurrencyAnswer::Proven(ref recovered) if recovered == targets)
-            {
-                return Ok(());
-            }
-            let ordinals = call
-                .arguments
-                .iter()
-                .enumerate()
-                .filter_map(|(ordinal, argument)| (argument.value == *callable).then_some(ordinal))
-                .collect::<Vec<_>>();
-            let [ordinal] = ordinals.as_slice() else {
-                return Ok(());
-            };
-            let DirectConcurrencyPath::Boundary(location) =
-                direct_concurrency_modeled_subject_path(
-                    procedure,
-                    call,
-                    group.value,
-                    provider,
-                    request,
-                )?
-            else {
-                return Ok(());
-            };
-            let group = crate::dataflow::SummaryConcurrencyTaskGroup {
-                location,
-                identity: match group.identity {
-                    ConcurrencySubjectIdentity::Value => SummaryConcurrencySubjectIdentity::Value,
-                    ConcurrencySubjectIdentity::Backing => {
-                        SummaryConcurrencySubjectIdentity::Backing
-                    }
-                },
-            };
-            let kind = if matches!(effect, ResolvedConcurrencyEffect::SubtestRun { .. }) {
-                SummaryConcurrencyEffectKind::SubtestRun {
-                    callable: crate::dataflow::SummaryConcurrencyCallable::SourceArgument(
-                        u32::try_from(*ordinal).expect("validated call argument ordinal fits u32"),
-                    ),
-                    target_coverage: crate::dataflow::SummaryConcurrencyTargetCoverage::Exhaustive,
-                    group,
-                }
-            } else {
-                SummaryConcurrencyEffectKind::SubtestCleanup {
-                    callable: crate::dataflow::SummaryConcurrencyCallable::SourceArgument(
-                        u32::try_from(*ordinal).expect("validated call argument ordinal fits u32"),
-                    ),
-                    target_coverage: crate::dataflow::SummaryConcurrencyTargetCoverage::Exhaustive,
-                    group,
-                }
-            };
-            if stable.contains(&kind) {
-                return Ok(());
-            }
-            stable.push(kind);
-            continue;
-        }
-        if let ResolvedConcurrencyEffect::SyncMap {
-            map,
-            key,
-            operation,
-            ..
-        } = &effect
-        {
-            let DirectConcurrencyPath::Boundary(map_path) =
-                direct_concurrency_modeled_subject_path(
-                    procedure, call, map.value, provider, request,
-                )?
-            else {
-                return Ok(());
-            };
-            let key_path = match key {
-                Some(key) => match direct_concurrency_modeled_subject_path(
-                    procedure, call, key.value, provider, request,
-                )? {
-                    DirectConcurrencyPath::Boundary(path) => Some(path),
-                    // A key that names no boundary port stays unnamed: the
-                    // projected protocol keeps the map port and the consumer
-                    // states the key boundary rather than losing the effect.
-                    _ => None,
-                },
-                None => None,
-            };
-            let kind = SummaryConcurrencyEffectKind::SyncMap {
-                map: map_path,
-                identity: match map.identity {
-                    ConcurrencySubjectIdentity::Value => SummaryConcurrencySubjectIdentity::Value,
-                    ConcurrencySubjectIdentity::Backing => {
-                        SummaryConcurrencySubjectIdentity::Backing
-                    }
-                },
-                key: key_path,
-                operation: match operation {
-                    crate::concurrency::ConcurrencySyncMapOperation::Store => {
-                        crate::dataflow::SummaryConcurrencySyncMapOperation::Store
-                    }
-                    crate::concurrency::ConcurrencySyncMapOperation::Delete => {
-                        crate::dataflow::SummaryConcurrencySyncMapOperation::Delete
-                    }
-                    crate::concurrency::ConcurrencySyncMapOperation::Clear => {
-                        crate::dataflow::SummaryConcurrencySyncMapOperation::Clear
-                    }
-                    crate::concurrency::ConcurrencySyncMapOperation::Load => {
-                        crate::dataflow::SummaryConcurrencySyncMapOperation::Load
-                    }
-                    crate::concurrency::ConcurrencySyncMapOperation::Range => {
-                        crate::dataflow::SummaryConcurrencySyncMapOperation::Range
-                    }
-                    crate::concurrency::ConcurrencySyncMapOperation::LoadOrStore => {
-                        crate::dataflow::SummaryConcurrencySyncMapOperation::LoadOrStore
-                    }
-                    crate::concurrency::ConcurrencySyncMapOperation::LoadAndDelete => {
-                        crate::dataflow::SummaryConcurrencySyncMapOperation::LoadAndDelete
-                    }
-                    crate::concurrency::ConcurrencySyncMapOperation::Swap => {
-                        crate::dataflow::SummaryConcurrencySyncMapOperation::Swap
-                    }
-                    crate::concurrency::ConcurrencySyncMapOperation::CompareAndSwap => {
-                        crate::dataflow::SummaryConcurrencySyncMapOperation::CompareAndSwap
-                    }
-                    crate::concurrency::ConcurrencySyncMapOperation::CompareAndDelete => {
-                        crate::dataflow::SummaryConcurrencySyncMapOperation::CompareAndDelete
-                    }
-                },
-            };
-            if stable.contains(&kind) {
-                return Ok(());
-            }
-            stable.push(kind);
-            continue;
-        }
-        if let ResolvedConcurrencyEffect::TimerStop { timer, outcome } = &effect {
-            match outcome {
-                ResolvedTimerStopOutcome::CallResultTrue => {}
-                // Provider answers are raw model answers; a bound outcome
-                // never reaches projection.
-                ResolvedTimerStopOutcome::OnResultTrue { .. } => {
-                    unreachable!("provider answers carry unresolved stops")
-                }
-            }
-            // A summary boundary may carry the stop only when its own normal
-            // result is exactly the call's result. A transformed or discarded
-            // result would describe a cancellation no consumer can establish,
-            // so the stop is dropped silently and consumers keep the may-run
-            // answer instead.
-            if !summary_returns_identify_call_result(procedure, call) {
-                continue;
-            }
-            let DirectConcurrencyPath::Boundary(timer_path) =
-                direct_concurrency_modeled_subject_path(
-                    procedure,
-                    call,
-                    timer.value,
-                    provider,
-                    request,
-                )?
-            else {
-                return Ok(());
-            };
-            let kind = SummaryConcurrencyEffectKind::TimerStop {
-                timer: timer_path,
-                identity: match timer.identity {
-                    ConcurrencySubjectIdentity::Value => SummaryConcurrencySubjectIdentity::Value,
-                    ConcurrencySubjectIdentity::Backing => {
-                        SummaryConcurrencySubjectIdentity::Backing
-                    }
-                },
-            };
-            if stable.contains(&kind) {
-                return Ok(());
-            }
-            stable.push(kind);
-            continue;
-        }
-        if let ResolvedConcurrencyEffect::TimerReset { timer } = &effect {
-            let DirectConcurrencyPath::Boundary(timer_path) =
-                direct_concurrency_modeled_subject_path(
-                    procedure,
-                    call,
-                    timer.value,
-                    provider,
-                    request,
-                )?
-            else {
-                return Ok(());
-            };
-            let kind = SummaryConcurrencyEffectKind::TimerReset {
-                timer: timer_path,
-                identity: match timer.identity {
-                    ConcurrencySubjectIdentity::Value => SummaryConcurrencySubjectIdentity::Value,
-                    ConcurrencySubjectIdentity::Backing => {
-                        SummaryConcurrencySubjectIdentity::Backing
-                    }
-                },
-            };
-            if stable.contains(&kind) {
-                return Ok(());
-            }
-            stable.push(kind);
-            continue;
-        }
-        let subject = match &effect {
-            ResolvedConcurrencyEffect::LockAcquire { lock, .. }
-            | ResolvedConcurrencyEffect::LockRelease { lock, .. } => lock,
-            ResolvedConcurrencyEffect::WaitGroupAdd { group, .. }
-            | ResolvedConcurrencyEffect::WaitGroupDone { group }
-            | ResolvedConcurrencyEffect::WaitGroupWait { group } => group,
-            ResolvedConcurrencyEffect::TaskJoin { group } => group,
-            ResolvedConcurrencyEffect::Atomic { location, .. }
-                if location.identity == ConcurrencySubjectIdentity::Value =>
-            {
-                location
-            }
-            // The condition's own object identity crosses the boundary, so a
-            // wrapper that waits on a parameter keeps the protocol semantics.
-            // A `CondBind` condition is a construction result rather than an
-            // input subject and is bound live at its own call site instead.
-            ResolvedConcurrencyEffect::CondWait { condition }
-            | ResolvedConcurrencyEffect::CondNotify { condition, .. } => condition,
-            _ => return Ok(()),
-        };
-        let DirectConcurrencyPath::Boundary(path) = direct_concurrency_modeled_subject_path(
-            procedure,
-            call,
-            subject.value,
-            provider,
-            request,
-        )?
-        else {
-            return Ok(());
-        };
-        let identity = match subject.identity {
-            ConcurrencySubjectIdentity::Value => SummaryConcurrencySubjectIdentity::Value,
-            ConcurrencySubjectIdentity::Backing => SummaryConcurrencySubjectIdentity::Backing,
-        };
-        let kind = match effect {
-            ResolvedConcurrencyEffect::TaskJoin { .. } => SummaryConcurrencyEffectKind::TaskJoin {
-                group: crate::dataflow::SummaryConcurrencyTaskGroup {
-                    location: path,
-                    identity,
-                },
-            },
-            ResolvedConcurrencyEffect::WaitGroupAdd { delta, .. } => {
-                SummaryConcurrencyEffectKind::WaitGroupAdd {
-                    group: path,
-                    identity,
-                    delta: delta.map_or(
-                        crate::dataflow::SummaryConcurrencyInteger::Unknown,
-                        crate::dataflow::SummaryConcurrencyInteger::Constant,
-                    ),
-                }
-            }
-            ResolvedConcurrencyEffect::WaitGroupDone { .. } => {
-                SummaryConcurrencyEffectKind::WaitGroupDone {
-                    group: path,
-                    identity,
-                }
-            }
-            ResolvedConcurrencyEffect::WaitGroupWait { .. } => {
-                SummaryConcurrencyEffectKind::WaitGroupWait {
-                    group: path,
-                    identity,
-                }
-            }
-            ResolvedConcurrencyEffect::LockAcquire {
-                mode, acquisition, ..
-            } => {
-                let acquisition = match acquisition {
-                    ResolvedLockAcquisition::Unconditional => SummaryLockAcquisition::Unconditional,
-                    ResolvedLockAcquisition::CallResultTrue => {
-                        SummaryLockAcquisition::CallResultTrue
-                    }
-                    // Provider answers are raw model answers; a bound or
-                    // unestablished condition never reaches projection.
-                    ResolvedLockAcquisition::OnResultTrue { .. }
-                    | ResolvedLockAcquisition::Unestablished => {
-                        unreachable!("provider answers carry unresolved acquisitions")
-                    }
-                };
-                SummaryConcurrencyEffectKind::Lock {
-                    lock: path,
-                    identity,
-                    operation: SummaryConcurrencyLockOperation::Acquire,
-                    mode: match mode {
-                        ConcurrencyLockMode::Shared => SummaryConcurrencyLockMode::Shared,
-                        ConcurrencyLockMode::Exclusive => SummaryConcurrencyLockMode::Exclusive,
-                    },
-                    acquisition,
-                }
-            }
-            ResolvedConcurrencyEffect::LockRelease { mode, .. } => {
-                SummaryConcurrencyEffectKind::Lock {
-                    lock: path,
-                    identity,
-                    operation: SummaryConcurrencyLockOperation::Release,
-                    mode: match mode {
-                        ConcurrencyLockMode::Shared => SummaryConcurrencyLockMode::Shared,
-                        ConcurrencyLockMode::Exclusive => SummaryConcurrencyLockMode::Exclusive,
-                    },
-                    acquisition: SummaryLockAcquisition::Unconditional,
-                }
-            }
-            ResolvedConcurrencyEffect::CondWait { .. } => {
-                SummaryConcurrencyEffectKind::CondWait { condition: path }
-            }
-            ResolvedConcurrencyEffect::CondNotify { waiters, .. } => {
-                SummaryConcurrencyEffectKind::CondNotify {
-                    condition: path,
-                    waiters: match waiters {
-                        crate::concurrency::ConcurrencyCondWaiters::One => {
-                            crate::dataflow::SummaryConcurrencyCondWaiters::One
-                        }
-                        crate::concurrency::ConcurrencyCondWaiters::All => {
-                            crate::dataflow::SummaryConcurrencyCondWaiters::All
-                        }
-                    },
-                }
-            }
-            ResolvedConcurrencyEffect::Atomic { operation, .. } => {
-                SummaryConcurrencyEffectKind::Atomic {
-                    location: path,
-                    operation: match operation {
-                        ConcurrencyAtomicOperation::Load => {
-                            crate::dataflow::SummaryConcurrencyAtomicOperation::Load
-                        }
-                        ConcurrencyAtomicOperation::Store => {
-                            crate::dataflow::SummaryConcurrencyAtomicOperation::Store
-                        }
-                        ConcurrencyAtomicOperation::ReadModifyWrite => {
-                            crate::dataflow::SummaryConcurrencyAtomicOperation::ReadModifyWrite
-                        }
-                    },
-                }
-            }
-            _ => unreachable!("only supported modeled effects passed subject selection"),
-        };
-        if stable.contains(&kind) {
-            return Ok(());
-        }
-        stable.push(kind);
-    }
-    if stable.is_empty() {
-        return Ok(());
-    }
-    let Some(event_ordinal) = procedure
-        .semantics()
-        .points()
-        .iter()
-        .flat_map(|point| &point.events)
-        .enumerate()
-        .find_map(|(ordinal, event)| {
-            matches!(event.effect, SemanticEffect::Invoke { call_site } if call_site == call.id)
-                .then_some(ordinal)
-        })
-    else {
-        return Ok(());
-    };
-    let effect_count = u32::try_from(stable.len()).expect("modeled effect limits fit u32");
-    effects.push(direct_concurrency_effect(
-        procedure,
-        call.source,
-        event_ordinal,
-        SummaryConcurrencyEffectKind::ModeledCall { effect_count },
-    ));
-    effects.extend(
-        stable
-            .into_iter()
-            .map(|kind| direct_concurrency_effect(procedure, call.source, event_ordinal, kind)),
-    );
-    Ok(())
-}
-
-/// Whether the procedure's normal returns all carry exactly the modeled call's
-/// result, so the call's try-acquire condition can transfer to the summary's
-/// own boundary result (issue #3369).
-///
-/// The lowerer states the identification as an exact return value flow whose
-/// source is the call's result and whose target is the returned value of a
-/// `ProcedureReturn` row. Every return value must be reached by such a flow,
-/// and no return flow may carry another source: a constant, a second
-/// expression, or a value reaching the return through storage breaks the
-/// identification and keeps the summary boundary open instead of moving the
-/// condition onto a result it does not describe.
-pub(crate) fn summary_returns_identify_call_result(
-    procedure: &ProcedureHandle,
-    call: &crate::analyzer::semantic::SemanticCallSite,
-) -> bool {
-    let Some(result) = call.result else {
-        return false;
-    };
-    let semantics = procedure.semantics();
-    let mut flows = Vec::new();
-    let mut returned_values = Vec::new();
-    for point in semantics.points() {
-        for event in &point.events {
-            match event.effect {
-                SemanticEffect::ValueFlow {
-                    kind: ValueFlowKind::Return,
-                    source,
-                    target,
-                } => flows.push((source, target)),
-                SemanticEffect::ProcedureReturn { value: Some(value) } => {
-                    returned_values.push(value)
-                }
-                _ => {}
-            }
-        }
-    }
-    !flows.is_empty()
-        && flows.iter().all(|(source, _)| *source == result)
-        && returned_values
-            .iter()
-            .all(|value| flows.iter().any(|(_, target)| target == value))
-}
-
-/// The boundary port a spawn call's timer result escapes through, when the
-/// wrapper's normal returns identify that result exactly (issue #3382).
-///
-/// The port names the single return position every normal return carries the
-/// timer through. A wrapper that keeps the timer local, returns it through
-/// more than one position, or mixes it with other results names no port, and
-/// the projected spawn keeps its task but loses the cancellable identity.
-fn direct_timer_return_port(
-    procedure: &ProcedureHandle,
-    call: &SemanticCallSite,
-) -> Option<SummaryPort> {
-    if !summary_returns_identify_call_result(procedure, call) {
-        return None;
-    }
-    let result = call.result?;
-    let mut ports = procedure
-        .semantics()
-        .points()
-        .iter()
-        .flat_map(|point| &point.events)
-        .filter_map(|event| match event.effect {
-            SemanticEffect::ValueFlow {
-                kind: ValueFlowKind::Return,
-                source,
-                ..
-            } if source == result => Some(SummaryPort::NormalReturn),
-            SemanticEffect::ValueFlow {
-                kind: ValueFlowKind::IndexedReturn { ordinal },
-                source,
-                ..
-            } if source == result => Some(SummaryPort::IndexedNormalReturn(ordinal)),
-            _ => None,
-        })
-        .collect::<Vec<_>>();
-    ports.sort();
-    ports.dedup();
-    match ports.as_slice() {
-        [port] => Some(port.clone()),
-        _ => None,
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-enum DirectPathCursor {
-    Value(ValueId),
-    Location(MemoryLocationId),
-}
-
-pub(crate) enum DirectConcurrencyPath {
-    Boundary(SummaryConcurrencyAccessPath),
-    Local,
-    Open,
-}
-
-/// Lower source-backed effects that can be stated entirely at a procedure
-/// boundary. Fresh allocations retain a stable source identity even when they
-/// remain local, while local cells are omitted. Every other unrepresentable
-/// heap access emits an explicit unsupported effect, so a consumer cannot
-/// mistake a partial projection for complete coverage.
-fn project_direct_concurrency_effects(
-    procedure: &ProcedureHandle,
-    publication_provider: Option<&dyn HeapOracle>,
-    behavior: SummaryBehaviorKey,
-    request: &mut crate::concurrency::SolveRequest<'_, '_>,
-) -> Result<Vec<SummaryEffect>, ProductionSummaryProjectionError> {
-    let semantics = procedure.semantics();
-    let mut effects = Vec::new();
-    let mut ordinal = 0usize;
-    for point in semantics.points() {
-        for (event_index, event) in point.events.iter().enumerate() {
-            let kind = match &event.effect {
-                SemanticEffect::Allocation { allocation } => {
-                    Some(SummaryConcurrencyEffectKind::Allocation {
-                        location: crate::concurrency::source_allocation_summary_path(
-                            procedure,
-                            *allocation,
-                        ),
-                    })
-                }
-                SemanticEffect::MemoryLoad { location, .. } => {
-                    direct_concurrency_path(procedure, *location).map_boundary(|location| {
-                        SummaryConcurrencyEffectKind::Access {
-                            location,
-                            mode: SummaryConcurrencyAccessMode::Read,
-                            must_hold: Box::default(),
-                        }
-                    })
-                }
-                SemanticEffect::MemoryStore { location, .. } => {
-                    direct_concurrency_path(procedure, *location).map_boundary(|location| {
-                        SummaryConcurrencyEffectKind::Access {
-                            location,
-                            mode: SummaryConcurrencyAccessMode::Write,
-                            must_hold: Box::default(),
-                        }
-                    })
-                }
-                SemanticEffect::Synchronization {
-                    operation, subject, ..
-                } => direct_concurrency_synchronization_path(
-                    procedure,
-                    point.id,
-                    event_index,
-                    *subject,
-                    *operation,
-                    request,
-                )?
-                .map_boundary(|subject| {
-                    SummaryConcurrencyEffectKind::Synchronize {
-                        subject,
-                        operation: (*operation).into(),
-                    }
-                }),
-                _ => None,
-            };
-            if let Some(kind) = kind {
-                effects.push(direct_concurrency_effect(
-                    procedure,
-                    event.source,
-                    ordinal,
-                    kind,
-                ));
-            }
-            ordinal = ordinal.saturating_add(1);
-        }
-    }
-    for gap in semantics
-        .gaps()
-        .iter()
-        .filter(|gap| crate::concurrency::semantic_gap_omits_concurrency_access(gap))
-    {
-        effects.push(direct_concurrency_effect(
-            procedure,
-            gap.source,
-            ordinal,
-            SummaryConcurrencyEffectKind::Unsupported {
-                protocol: format!("semantic-gap:{}", gap.capability.label()).into_boxed_str(),
-            },
-        ));
-        ordinal = ordinal.saturating_add(1);
-    }
-    if let Some(provider) = publication_provider {
-        project_direct_publication_effects(procedure, provider, behavior, request, &mut effects)?;
-    }
-    Ok(effects)
-}
-
-fn project_direct_publication_effects(
-    procedure: &ProcedureHandle,
-    provider: &dyn HeapOracle,
-    behavior: SummaryBehaviorKey,
-    request: &mut SemanticRequest<'_>,
-    effects: &mut Vec<SummaryEffect>,
-) -> Result<(), ProductionSummaryProjectionError> {
-    let semantics = procedure.semantics();
-    for allocation in semantics.allocations() {
-        let object = AbstractObject::new(
-            AccessPathRoot::Allocation(
-                procedure
-                    .allocation_handle(allocation.id)
-                    .expect("validated allocation retains its handle"),
-            ),
-            ObjectCardinality::Unknown,
-        )
-        .map_err(|error| SemanticProviderError::internal(error.to_string()))?;
-        let ownership_start = procedure
-            .point_handle(allocation.point)
-            .expect("validated allocation retains its point");
-        let mut inventory_open = false;
-        let mut saw_publication = false;
-        for exit in [
-            semantics.normal_exit_point(),
-            semantics.exceptional_exit_point(),
-        ] {
-            let query = FreshObjectPublicationQuery::new(
-                object.clone(),
-                ownership_start.clone(),
-                procedure
-                    .point_handle(exit)
-                    .expect("validated procedure retains its exit point"),
-                OracleCallContext::empty(),
-            )
-            .map_err(|error| SemanticProviderError::internal(error.to_string()))?;
-            let outcome = provider.fresh_object_publications(&query, request)?;
-            if let Some(exceeded) = outcome.budget_exceeded() {
-                return Err(
-                    ProductionSummaryProjectionError::PublicationBudgetExceeded {
-                        procedure: Box::new(summary_identity(
-                            procedure,
-                            behavior,
-                            ProductionPublicationMode::Witnessed,
-                        )),
-                        exceeded,
-                    },
-                );
-            }
-            if matches!(outcome, SemanticOutcome::Cancelled { .. }) {
-                return Err(ProductionSummaryProjectionError::Cancelled);
-            }
-            let outcome_complete = outcome.is_complete();
-            let Some(result) = outcome.available_value() else {
-                inventory_open = true;
-                continue;
-            };
-            inventory_open |= !outcome_complete || !result.has_exhaustive_proven_inventory();
-            saw_publication |= !result.publications().candidates().is_empty();
-            for candidate in result
-                .publications()
-                .candidates()
-                .iter()
-                .filter(|candidate| candidate.is_proven_complete())
-            {
-                let publication = candidate.value();
-                if publication.kind() == FreshObjectPublicationKind::Call {
-                    // The matching stable call effect retains this boundary.
-                    // Its complete callee summary must account for whether the
-                    // object is actually published beyond the call.
-                    continue;
-                }
-                let point = publication.point().id();
-                let event_index = usize::try_from(publication.event_index())
-                    .expect("semantic publication event index fits usize");
-                let event = semantics
-                    .point(point)
-                    .and_then(|point| point.events.get(event_index))
-                    .expect("validated publication retains its exact semantic event");
-                let Some(destination) = direct_publication_destination(
-                    procedure,
-                    point,
-                    event_index,
-                    publication.kind(),
-                ) else {
-                    inventory_open = true;
-                    continue;
-                };
-                let event_ordinal = direct_event_ordinal(semantics, point, event_index);
-                effects.push(direct_concurrency_effect_with_evidence(
-                    procedure,
-                    event.source,
-                    event_ordinal,
-                    SummaryConcurrencyEffectKind::Publish {
-                        value: crate::concurrency::source_allocation_summary_path(
-                            procedure,
-                            allocation.id,
-                        ),
-                        destination,
-                    },
-                    SummaryEvidence::from_semantic(candidate.proof(), candidate.completeness())?,
-                ));
-            }
-        }
-        if inventory_open {
-            let allocation_ordinal = semantics
-                .points()
-                .iter()
-                .flat_map(|point| &point.events)
-                .position(|event| {
-                    matches!(event.effect, SemanticEffect::Allocation { allocation: candidate }
-                        if candidate == allocation.id)
-                })
-                .expect("validated allocation retains its semantic event");
-            effects.push(direct_concurrency_effect(
-                procedure,
-                allocation.source,
-                allocation_ordinal,
-                SummaryConcurrencyEffectKind::Unsupported {
-                    protocol: "publication-inventory-open".into(),
-                },
-            ));
-        } else if !saw_publication {
-            let allocation_ordinal = semantics
-                .points()
-                .iter()
-                .flat_map(|point| &point.events)
-                .position(|event| {
-                    matches!(event.effect, SemanticEffect::Allocation { allocation: candidate }
-                        if candidate == allocation.id)
-                })
-                .expect("validated allocation retains its semantic event");
-            effects.push(direct_concurrency_effect(
-                procedure,
-                allocation.source,
-                allocation_ordinal,
-                SummaryConcurrencyEffectKind::Unpublished {
-                    value: crate::concurrency::source_allocation_summary_path(
-                        procedure,
-                        allocation.id,
-                    ),
-                },
-            ));
-        }
-    }
-    Ok(())
-}
-
-pub(crate) fn direct_publication_destination(
-    procedure: &ProcedureHandle,
-    point: ProgramPointId,
-    event_index: usize,
-    kind: FreshObjectPublicationKind,
-) -> Option<SummaryConcurrencyAccessPath> {
-    let semantics = procedure.semantics();
-    let events = &semantics.point(point)?.events;
-    let event = events.get(event_index)?;
-    let return_port = |target: ValueId| {
-        let mut ports = events.iter().filter_map(|event| match event.effect {
-            SemanticEffect::ValueFlow {
-                target: candidate,
-                kind: ValueFlowKind::Return,
-                ..
-            } if candidate == target => Some(SummaryPort::NormalReturn),
-            SemanticEffect::ValueFlow {
-                target: candidate,
-                kind: ValueFlowKind::IndexedReturn { ordinal },
-                ..
-            } if candidate == target => Some(SummaryPort::IndexedNormalReturn(ordinal)),
-            _ => None,
-        });
-        let port = ports.next()?;
-        ports.next().is_none().then_some(port)
-    };
-    let destination = match (kind, &event.effect) {
-        (FreshObjectPublicationKind::MemoryStore, SemanticEffect::MemoryStore { location, .. }) => {
-            match direct_concurrency_path(procedure, *location) {
-                DirectConcurrencyPath::Boundary(path) => return Some(path),
-                DirectConcurrencyPath::Local | DirectConcurrencyPath::Open => return None,
-            }
-        }
-        (
-            FreshObjectPublicationKind::Return,
-            SemanticEffect::ValueFlow {
-                kind: ValueFlowKind::Return,
-                ..
-            },
-        ) => SummaryPort::NormalReturn,
-        (
-            FreshObjectPublicationKind::Return,
-            SemanticEffect::ValueFlow {
-                kind: ValueFlowKind::IndexedReturn { ordinal },
-                ..
-            },
-        ) => SummaryPort::IndexedNormalReturn(*ordinal),
-        (
-            FreshObjectPublicationKind::Return,
-            SemanticEffect::ProcedureReturn { value: Some(value) },
-        ) => return_port(*value)?,
-        (FreshObjectPublicationKind::Throw, SemanticEffect::Throw { value: Some(_) }) => {
-            SummaryPort::ExceptionalReturn
-        }
-        _ => return None,
-    };
-    Some(SummaryConcurrencyAccessPath::port(destination))
-}
-
-fn direct_event_ordinal(
-    semantics: &crate::analyzer::semantic::ProcedureSemantics,
-    point: ProgramPointId,
-    event_index: usize,
-) -> usize {
-    let mut ordinal = 0usize;
-    for row in semantics.points() {
-        if row.id == point {
-            assert!(event_index < row.events.len(), "publication event exists");
-            return ordinal.saturating_add(event_index);
-        }
-        ordinal = ordinal.saturating_add(row.events.len());
-    }
-    unreachable!("publication point belongs to its procedure")
-}
-
-impl DirectConcurrencyPath {
-    fn map_boundary(
-        self,
-        map: impl FnOnce(SummaryConcurrencyAccessPath) -> SummaryConcurrencyEffectKind,
-    ) -> Option<SummaryConcurrencyEffectKind> {
-        match self {
-            Self::Boundary(path) => Some(map(path)),
-            Self::Local => None,
-            Self::Open => Some(SummaryConcurrencyEffectKind::Unsupported {
-                protocol: "unrepresentable-boundary-access".into(),
-            }),
-        }
-    }
-}
-
-pub(crate) fn direct_concurrency_path(
-    procedure: &ProcedureHandle,
-    location: MemoryLocationId,
-) -> DirectConcurrencyPath {
-    direct_concurrency_path_from(procedure, DirectPathCursor::Location(location))
-}
-
-pub(crate) fn direct_concurrency_value_path(
-    procedure: &ProcedureHandle,
-    value: ValueId,
-) -> DirectConcurrencyPath {
-    direct_concurrency_path_from(procedure, DirectPathCursor::Value(value))
-}
-
-pub(crate) fn direct_concurrency_modeled_subject_path(
-    procedure: &ProcedureHandle,
-    call: &SemanticCallSite,
-    subject: ValueId,
-    provider: &dyn ConcurrencyProvider,
-    request: &mut crate::concurrency::SolveRequest<'_, '_>,
-) -> Result<DirectConcurrencyPath, ProductionSummaryProjectionError> {
-    let direct = direct_concurrency_value_path(procedure, subject);
-    if matches!(direct, DirectConcurrencyPath::Boundary(_)) {
-        return Ok(direct);
-    }
-    let semantics = procedure.semantics();
-    let mut before_point = call.point;
-    let mut before_index = semantics
-        .point(call.point)
-        .expect("validated call retains its point")
-        .events
-        .iter()
-        .position(|event| matches!(event.effect, SemanticEffect::Invoke { call_site } if call_site == call.id))
-        .expect("validated call retains its invocation event");
-    let mut cursor = DirectPathCursor::Value(subject);
-    let mut visited = crate::hash::HashSet::default();
-    while visited.insert(cursor.clone()) {
-        let mut predecessors = Vec::new();
-        let mut terminal_allocation = None;
-        for point in semantics.points() {
-            for (event_index, event) in point.events.iter().enumerate() {
-                let predecessor = match (&cursor, &event.effect) {
-                    (DirectPathCursor::Value(value), SemanticEffect::Allocation { allocation })
-                        if semantics
-                            .allocation(*allocation)
-                            .is_some_and(|row| row.result == *value) =>
-                    {
-                        if provider.allocation_binds_by_reference(procedure, *allocation)
-                            != Some(true)
-                        {
-                            return Ok(direct);
-                        }
-                        None
-                    }
-                    (
-                        DirectPathCursor::Value(value),
-                        SemanticEffect::ValueFlow {
-                            target,
-                            source,
-                            kind,
-                        },
-                    ) if target == value => {
-                        // Dependence through a copy, view, computation, or wrapper
-                        // is insufficient for this reference-object certificate.
-                        if *kind != ValueFlowKind::Local {
-                            return Ok(direct);
-                        }
-                        Some(DirectPathCursor::Value(*source))
-                    }
-                    (
-                        DirectPathCursor::Value(value),
-                        SemanticEffect::Assignment {
-                            target,
-                            value: source,
-                        },
-                    ) if target == value => Some(DirectPathCursor::Value(*source)),
-                    (
-                        DirectPathCursor::Value(value),
-                        SemanticEffect::MemoryLoad {
-                            result, location, ..
-                        },
-                    ) if result == value => Some(DirectPathCursor::Location(*location)),
-                    (
-                        DirectPathCursor::Location(location),
-                        SemanticEffect::MemoryStore {
-                            location: target,
-                            value,
-                            ..
-                        },
-                    ) if target == location => Some(DirectPathCursor::Value(*value)),
-                    _ => continue,
-                };
-                let evidence = semantics
-                    .evidence_row(event.evidence)
-                    .expect("validated modeled subject retains evidence");
-                let before = if point.id == before_point {
-                    event_index < before_index
-                } else {
-                    production_point_dominates(procedure, point.id, before_point, request)?
-                };
-                if evidence.proof != ProofStatus::Proven
-                    || evidence.completeness != EvidenceCompleteness::Complete
-                    || !before
-                {
-                    return Ok(direct);
-                }
-                if let Some(predecessor) = predecessor {
-                    predecessors.push((predecessor, point.id, event_index));
-                } else if let SemanticEffect::Allocation { allocation } = event.effect {
-                    terminal_allocation = Some(allocation);
-                }
-            }
-        }
-        if let Some(allocation) = terminal_allocation {
-            return Ok(if predecessors.is_empty() {
-                DirectConcurrencyPath::Boundary(crate::concurrency::source_allocation_summary_path(
-                    procedure, allocation,
-                ))
-            } else {
-                direct
-            });
-        }
-        if let DirectPathCursor::Location(location) = cursor {
-            let MemoryLocationKind::LexicalCell { binding } = semantics
-                .memory_location(location)
-                .expect("validated modeled load retains its location")
-                .kind
-            else {
-                return Ok(direct);
-            };
-            if predecessors.is_empty() {
-                cursor = DirectPathCursor::Value(binding);
-                continue;
-            }
-        }
-        let Some((predecessor, point, index)) = predecessors.first() else {
-            return Ok(direct);
-        };
-        // Assignment and its matching Local row describe one definition.
-        // Multiple definition points or different sources cannot certify it.
-        if predecessors.iter().any(|(candidate, candidate_point, _)| {
-            candidate != predecessor || candidate_point != point
-        }) {
-            return Ok(direct);
-        }
-        before_point = *point;
-        before_index = *index;
-        cursor = predecessor.clone();
-    }
-    Ok(direct)
-}
-
-fn direct_concurrency_synchronization_path(
-    procedure: &ProcedureHandle,
-    point: ProgramPointId,
-    event_index: usize,
-    subject: ValueId,
-    operation: SynchronizationOperation,
-    request: &mut crate::concurrency::SolveRequest<'_, '_>,
-) -> Result<DirectConcurrencyPath, ProductionSummaryProjectionError> {
-    let direct = direct_concurrency_value_path(procedure, subject);
-    // Parameter and receiver subjects already have stable boundary ports. A
-    // fresh channel needs its allocation port instead, but only after every
-    // structured descriptor-copy edge is complete, unique, and guaranteed to
-    // execute before this operation. Other synchronization objects may have
-    // value-copy semantics, so do not apply this channel-specific proof to
-    // locks, atomics, wait groups, or modeled protocols.
-    if matches!(direct, DirectConcurrencyPath::Boundary(_))
-        || !matches!(
-            operation,
-            SynchronizationOperation::ChannelSend | SynchronizationOperation::ChannelReceive
-        )
-    {
-        return Ok(direct);
-    }
-    let semantics = procedure.semantics();
-    let mut value = subject;
-    let mut visited = crate::hash::HashSet::default();
-    while visited.insert(value) {
-        if let Some(allocation) = semantics
-            .allocations()
-            .iter()
-            .find(|allocation| allocation.result == value)
-        {
-            let allocation_before = if allocation.point == point {
-                semantics
-                    .point(point)
-                    .expect("validated synchronization retains its point")
-                    .events
-                    .iter()
-                    .position(|event| {
-                        matches!(
-                            event.effect,
-                            SemanticEffect::Allocation { allocation: candidate }
-                                if candidate == allocation.id
-                        )
-                    })
-                    .is_some_and(|allocation_index| allocation_index < event_index)
-            } else {
-                production_point_dominates(procedure, allocation.point, point, request)?
-            };
-            return Ok(if allocation_before {
-                DirectConcurrencyPath::Boundary(crate::concurrency::source_allocation_summary_path(
-                    procedure,
-                    allocation.id,
-                ))
-            } else {
-                direct
-            });
-        }
-        let mut sources = Vec::new();
-        let mut source_open = false;
-        for source_point in semantics.points() {
-            for (source_event_index, source_event) in source_point.events.iter().enumerate() {
-                let source = match source_event.effect {
-                    SemanticEffect::ValueFlow {
-                        kind: ValueFlowKind::Local | ValueFlowKind::BackingStore { .. },
-                        source,
-                        target,
-                    } if target == value => Some(source),
-                    SemanticEffect::Assignment {
-                        target,
-                        value: source,
-                    } if target == value => Some(source),
-                    _ => None,
-                };
-                let Some(source) = source else {
-                    continue;
-                };
-                let evidence = semantics
-                    .evidence_row(source_event.evidence)
-                    .expect("validated synchronization flow retains its evidence");
-                let source_before = if source_point.id == point {
-                    source_event_index < event_index
-                } else {
-                    production_point_dominates(procedure, source_point.id, point, request)?
-                };
-                if evidence.proof != ProofStatus::Proven
-                    || evidence.completeness != EvidenceCompleteness::Complete
-                    || !source_before
-                {
-                    source_open = true;
-                } else if !sources.contains(&source) {
-                    sources.push(source);
-                }
-            }
-        }
-        let [source] = sources.as_slice() else {
-            return Ok(direct);
-        };
-        if source_open {
-            return Ok(direct);
-        }
-        value = *source;
-    }
-    Ok(direct)
-}
-
-fn production_point_dominates(
-    procedure: &ProcedureHandle,
-    candidate: ProgramPointId,
-    target: ProgramPointId,
-    request: &mut crate::concurrency::SolveRequest<'_, '_>,
-) -> Result<bool, ProductionSummaryProjectionError> {
-    match crate::concurrency::point_dominates(procedure, candidate, target, request) {
-        Ok(dominates) => Ok(dominates),
-        Err(_) if request.cancellation.is_cancelled() => {
-            Err(ProductionSummaryProjectionError::Cancelled)
-        }
-        Err(_) => Err(ProductionSummaryProjectionError::GraphBudgetExceeded),
-    }
-}
-
-fn direct_concurrency_path_from(
-    procedure: &ProcedureHandle,
-    mut cursor: DirectPathCursor,
-) -> DirectConcurrencyPath {
-    let semantics = procedure.semantics();
-    let binding_origins = BindingOriginIndex::from_semantics(semantics);
-    let indirect_writes = indirect_binding_write_targets(semantics, &binding_origins);
-    let mut selectors = Vec::new();
-    let mut visited = crate::hash::HashSet::default();
-    loop {
-        if !visited.insert(cursor.clone()) {
-            return DirectConcurrencyPath::Open;
-        }
-        match cursor {
-            DirectPathCursor::Location(location) => {
-                let location = semantics
-                    .memory_location(location)
-                    .expect("validated concurrency location exists");
-                match &location.kind {
-                    MemoryLocationKind::Field { base, member } => {
-                        selectors.push(SummaryConcurrencyAccessSelector::Field(
-                            concurrency_location_key(member),
-                        ));
-                        cursor = DirectPathCursor::Value(*base);
-                    }
-                    MemoryLocationKind::Property { base, key } => {
-                        selectors.push(SummaryConcurrencyAccessSelector::Property(key.clone()));
-                        cursor = DirectPathCursor::Value(*base);
-                    }
-                    MemoryLocationKind::Index {
-                        base,
-                        index,
-                        constant_index,
-                        identity,
-                    } => {
-                        selectors.push(if *identity == IndexedLocationIdentity::Aggregate {
-                            SummaryConcurrencyAccessSelector::Aggregate
-                        } else {
-                            match constant_index.and_then(|value| i128::try_from(value).ok()) {
-                                Some(value) => {
-                                    SummaryConcurrencyAccessSelector::ConstantIndex(value)
-                                }
-                                None => index
-                                    .and_then(|value| direct_scalar_summary_port(semantics, value))
-                                    .map_or(
-                                        SummaryConcurrencyAccessSelector::AnyIndex,
-                                        SummaryConcurrencyAccessSelector::Index,
-                                    ),
-                            }
-                        });
-                        cursor = DirectPathCursor::Value(*base);
-                    }
-                    MemoryLocationKind::Dereference { address } => {
-                        cursor = DirectPathCursor::Value(*address);
-                    }
-                    MemoryLocationKind::Static { member } => {
-                        selectors.reverse();
-                        return DirectConcurrencyPath::Boundary(SummaryConcurrencyAccessPath::new(
-                            SummaryPort::Heap(concurrency_location_key(member)),
-                            selectors,
-                        ));
-                    }
-                    MemoryLocationKind::Capture { .. } => {
-                        let mapping = semantics
-                            .source_mapping(location.source)
-                            .expect("validated capture location retains a source mapping");
-                        selectors.reverse();
-                        return DirectConcurrencyPath::Boundary(SummaryConcurrencyAccessPath::new(
-                            SummaryPort::Capture(concurrency_location_key(&mapping.locator)),
-                            selectors,
-                        ));
-                    }
-                    MemoryLocationKind::LexicalCell { binding } => {
-                        // The cell itself is procedure-local, but a field or
-                        // index reached through its stored value may name a
-                        // formal pointer actual. Follow projected accesses so
-                        // that a captured formal contributes a boundary
-                        // effect; keep direct cell storage local.
-                        if selectors.is_empty() {
-                            return DirectConcurrencyPath::Local;
-                        }
-                        let mut stored_values = Vec::new();
-                        for point in semantics.points() {
-                            for event in &point.events {
-                                if let SemanticEffect::MemoryStore {
-                                    location: stored_location,
-                                    value,
-                                    ..
-                                } = event.effect
-                                    && stored_location == location.id
-                                    && !stored_values.contains(&value)
-                                {
-                                    stored_values.push(value);
-                                }
-                            }
-                        }
-                        cursor = match stored_values.as_slice() {
-                            [] => DirectPathCursor::Value(*binding),
-                            [stored] => DirectPathCursor::Value(*stored),
-                            _ => return DirectConcurrencyPath::Open,
-                        };
-                    }
-                }
-            }
-            DirectPathCursor::Value(value) => {
-                if let Some(root) = direct_summary_port(semantics, value) {
-                    selectors.reverse();
-                    return DirectConcurrencyPath::Boundary(SummaryConcurrencyAccessPath::new(
-                        root, selectors,
-                    ));
-                }
-                // Taking a captured cell's address names its binding directly;
-                // it intentionally does not emit a read of the captured value.
-                // Use the producer's exact capture slot, as for a capture load.
-                let mut captures = semantics.memory_locations().iter().filter(|location| {
-                    matches!(location.kind, MemoryLocationKind::Capture { binding: Some(binding), .. } if binding == value)
-                });
-                if let Some(capture) = captures.next() {
-                    if captures.next().is_some() {
-                        return DirectConcurrencyPath::Open;
-                    }
-                    cursor = DirectPathCursor::Location(capture.id);
-                    continue;
-                }
-                if semantics
-                    .allocations()
-                    .iter()
-                    .any(|allocation| allocation.result == value)
-                {
-                    return DirectConcurrencyPath::Local;
-                }
-                let mut predecessors = Vec::new();
-                for point in semantics.points() {
-                    for event in &point.events {
-                        let predecessor = match event.effect {
-                            SemanticEffect::MemoryLoad {
-                                location, result, ..
-                            } if result == value => {
-                                let location_row = semantics
-                                    .memory_location(location)
-                                    .expect("validated load retains its location");
-                                Some(match location_row.kind {
-                                    // A load observes the binding's value, not the
-                                    // lexical cell's storage. Only an unchanged
-                                    // binding can supply one stable value path.
-                                    MemoryLocationKind::LexicalCell { binding }
-                                        if !direct_value_is_reassigned(
-                                            semantics,
-                                            binding,
-                                            &indirect_writes,
-                                        ) =>
-                                    {
-                                        DirectPathCursor::Value(binding)
-                                    }
-                                    _ => DirectPathCursor::Location(location),
-                                })
-                            }
-                            SemanticEffect::ValueFlow {
-                                source,
-                                target,
-                                kind:
-                                    ValueFlowKind::Local
-                                    | ValueFlowKind::Parameter
-                                    | ValueFlowKind::Receiver
-                                    | ValueFlowKind::BackingStore { .. },
-                            } if target == value => Some(DirectPathCursor::Value(source)),
-                            SemanticEffect::Assignment {
-                                target,
-                                value: source,
-                            } if target == value => Some(DirectPathCursor::Value(source)),
-                            _ => None,
-                        };
-                        if let Some(predecessor) = predecessor
-                            && !predecessors.contains(&predecessor)
-                        {
-                            predecessors.push(predecessor);
-                        }
-                    }
-                }
-                let [predecessor] = predecessors.as_slice() else {
-                    return DirectConcurrencyPath::Open;
-                };
-                cursor = predecessor.clone();
-            }
-        }
-    }
 }
 
 fn direct_summary_port(
@@ -3172,19 +1462,22 @@ fn direct_value_is_reassigned(
         || semantics
             .points()
             .iter()
-            .flat_map(|point| &point.events)
-            .any(|event| match event.effect {
+            .flat_map(|point| point.events.iter().map(move |event| (point.id, event)))
+            .any(|(point, event)| match event.effect {
                 SemanticEffect::Assignment { target, .. } => target == value,
-                SemanticEffect::MemoryStore { location, .. } => semantics
-                    .memory_location(location)
-                    .is_some_and(|location| match location.kind {
-                        MemoryLocationKind::LexicalCell { binding } => binding == value,
-                        MemoryLocationKind::Capture {
-                            binding: Some(binding),
-                            ..
-                        } => binding == value,
-                        _ => false,
-                    }),
+                SemanticEffect::MemoryStore { location, .. } => {
+                    !semantics.is_formal_cell_initialization(point, &event.effect)
+                        && semantics.memory_location(location).is_some_and(
+                            |location| match location.kind {
+                                MemoryLocationKind::LexicalCell { binding } => binding == value,
+                                MemoryLocationKind::Capture {
+                                    binding: Some(binding),
+                                    ..
+                                } => binding == value,
+                                _ => false,
+                            },
+                        )
+                }
                 _ => false,
             })
 }
@@ -3226,7 +1519,7 @@ fn indirect_binding_write_targets(
 
 /// The exact boundary or literal source of one immutable scalar snapshot.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum DirectScalarSource {
+pub enum DirectScalarSource {
     Port(SummaryPort),
     UnsignedInteger(u128),
     Boolean(bool),
@@ -3243,7 +1536,7 @@ pub(crate) enum DirectScalarSource {
 /// constructing the indexed memory location, so inspecting only the
 /// temporary's value kind loses the exact source. A computed expression,
 /// assignment, or competing source remains unavailable.
-pub(crate) fn direct_scalar_source(
+pub fn direct_scalar_source(
     semantics: &crate::analyzer::semantic::ProcedureSemantics,
     mut value: ValueId,
 ) -> Option<DirectScalarSource> {
@@ -3299,70 +1592,6 @@ pub(crate) fn direct_scalar_source(
         }
         value = predecessor;
     }
-}
-
-pub(crate) fn direct_scalar_summary_port(
-    semantics: &crate::analyzer::semantic::ProcedureSemantics,
-    value: ValueId,
-) -> Option<SummaryPort> {
-    match direct_scalar_source(semantics, value)? {
-        DirectScalarSource::Port(port) => Some(port),
-        DirectScalarSource::UnsignedInteger(_)
-        | DirectScalarSource::Boolean(_)
-        | DirectScalarSource::ConstantString(_)
-        | DirectScalarSource::IntegerOffset { .. } => None,
-    }
-}
-
-fn concurrency_location_key(
-    locator: &crate::analyzer::semantic::SemanticLocator,
-) -> SummaryLocationKey {
-    SummaryLocationKey::from_locator(locator)
-}
-
-fn direct_concurrency_effect(
-    procedure: &ProcedureHandle,
-    source: crate::analyzer::semantic::SourceMappingId,
-    ordinal: usize,
-    kind: SummaryConcurrencyEffectKind,
-) -> SummaryEffect {
-    direct_concurrency_effect_with_evidence(
-        procedure,
-        source,
-        ordinal,
-        kind,
-        SummaryEvidence::proven_complete(),
-    )
-}
-
-fn direct_concurrency_effect_with_evidence(
-    procedure: &ProcedureHandle,
-    source: crate::analyzer::semantic::SourceMappingId,
-    ordinal: usize,
-    kind: SummaryConcurrencyEffectKind,
-    evidence: SummaryEvidence,
-) -> SummaryEffect {
-    let mapping = procedure
-        .semantics()
-        .source_mapping(source)
-        .expect("validated concurrency effect retains a source mapping");
-    let span = mapping.locator.anchor().span();
-    SummaryEffect::new(
-        SummaryEffectKey::Concurrency(SummaryConcurrencyEffect::new(
-            SummaryEventKey::from_concurrency_source(&mapping.locator, ordinal),
-            kind,
-            SummaryConcurrencyExecution::new(
-                crate::analyzer::semantic::ExecutionTiming::SameEvaluation,
-                SummaryConcurrencyExecutionCardinality::Unknown,
-            ),
-            Some(SummaryConcurrencySourceWitness::new(
-                procedure.semantics().locator(),
-                span.start_byte(),
-                span.end_byte(),
-            )),
-        )),
-        evidence,
-    )
 }
 
 fn project_boundary_effect(
@@ -3446,7 +1675,6 @@ fn build_summary_set(
     graph: &ProcedureDependencyGraph,
     components: &[Box<[usize]>],
     behavior: SummaryBehaviorKey,
-    publication_mode: ProductionPublicationMode,
     cancellation: &crate::cancellation::CancellationToken,
 ) -> Result<ProductionSemanticSummarySet, ProductionSummaryProjectionError> {
     let DirectSummaryProjection {
@@ -3456,52 +1684,18 @@ fn build_summary_set(
     } = direct;
     let identities = procedures
         .iter()
-        .map(|procedure| summary_identity(procedure, behavior, publication_mode))
+        .map(|procedure| summary_identity(procedure, behavior))
         .collect::<Vec<_>>();
-    let mut component_by_node = vec![0usize; procedures.len()];
-    for (component, members) in components.iter().enumerate() {
-        for &member in members.iter() {
-            component_by_node[member] = component;
-        }
-    }
-    let mut dependencies_by_component = vec![Vec::<usize>::new(); components.len()];
-    for (component, members) in components.iter().enumerate() {
-        for &member in members.iter() {
-            dependencies_by_component[component].extend(
-                graph.outgoing[member]
-                    .iter()
-                    .map(|edge| component_by_node[graph.edges[*edge].1])
-                    .filter(|&target| target != component),
-            );
-        }
-        dependencies_by_component[component].sort_unstable();
-        dependencies_by_component[component].dedup();
-    }
-    let mut dependents_by_component = vec![Vec::<usize>::new(); components.len()];
-    for (dependent, dependencies) in dependencies_by_component.iter().enumerate() {
-        for &dependency in dependencies {
-            dependents_by_component[dependency].push(dependent);
-        }
-    }
-    for dependents in &mut dependents_by_component {
-        dependents.sort_unstable();
-        dependents.dedup();
-    }
-    let mut remaining_dependencies = dependencies_by_component
-        .iter()
-        .map(Vec::len)
-        .collect::<Vec<_>>();
-    let mut ready = remaining_dependencies
-        .iter()
-        .enumerate()
-        .filter_map(|(component, &remaining)| (remaining == 0).then_some(Reverse(component)))
-        .collect::<BinaryHeap<_>>();
+    let component_order =
+        ProcedureDependencyComponentOrder::new(graph, components, procedures.len())
+            .ok_or(ProductionSummaryProjectionError::InvalidDependencyGraph)?;
+    let component_by_node = &component_order.component_by_node;
 
     let mut key_by_node = vec![None::<ProcedureSummaryKey>; procedures.len()];
     let mut summaries = Vec::with_capacity(procedures.len());
     let mut summary_components = Vec::with_capacity(components.len());
 
-    while let Some(Reverse(component)) = ready.pop() {
+    for &component in &component_order.components {
         if cancellation.is_cancelled() {
             return Err(ProductionSummaryProjectionError::Cancelled);
         }
@@ -3621,14 +1815,6 @@ fn build_summary_set(
             summaries.push(summary);
         }
         summary_components.push(started..summaries.len());
-        for &dependent in &dependents_by_component[component] {
-            remaining_dependencies[dependent] = remaining_dependencies[dependent]
-                .checked_sub(1)
-                .ok_or(ProductionSummaryProjectionError::InvalidDependencyGraph)?;
-            if remaining_dependencies[dependent] == 0 {
-                ready.push(Reverse(dependent));
-            }
-        }
     }
 
     if summary_components.len() != components.len() {
@@ -3650,7 +1836,6 @@ fn build_summary_set(
         components: summary_components,
         complete_call_targets,
         behavior,
-        publication_mode,
         procedure_semantics_precharged: true,
     })
 }
@@ -3676,37 +1861,20 @@ fn production_icfg_behavior(provider: IcfgProviderBehaviorIdentity) -> SummaryBe
     SummaryBehaviorKey::from_parts(derive(provider.as_bytes()), derive(provider.read_bytes()))
 }
 
-fn production_summary_behavior(
-    provider: IcfgProviderBehaviorIdentity,
-    publication_inventory: bool,
-) -> SummaryBehaviorKey {
+fn production_summary_behavior(provider: IcfgProviderBehaviorIdentity) -> SummaryBehaviorKey {
     let behavior = production_icfg_behavior(provider);
     let derive = |identity: &[u8; 32]| {
-        let mut digest = LengthDelimitedDigest::new(PRODUCTION_PUBLICATION_BEHAVIOR_DOMAIN);
+        let mut digest = LengthDelimitedDigest::new(PRODUCTION_SUMMARY_BEHAVIOR_DOMAIN);
         digest.push(identity);
-        let mode: &[u8] = if publication_inventory {
-            b"publication-enabled"
-        } else {
-            b"publication-disabled"
-        };
-        digest.push(mode);
         digest.finish()
     };
     SummaryBehaviorKey::from_parts(derive(behavior.as_bytes()), derive(behavior.read_bytes()))
 }
 
-fn provider_independent_leaf_behavior(
-    publication_mode: ProductionPublicationMode,
-) -> SummaryBehaviorKey {
-    static OMITTED: OnceLock<SummaryBehaviorKey> = OnceLock::new();
-    static WITNESSED: OnceLock<SummaryBehaviorKey> = OnceLock::new();
-    let (cell, label): (&OnceLock<SummaryBehaviorKey>, &[u8]) = match publication_mode {
-        ProductionPublicationMode::Omitted => (&OMITTED, b"publication-omitted"),
-        ProductionPublicationMode::Witnessed => (&WITNESSED, b"publication-witnessed"),
-    };
-    *cell.get_or_init(|| {
-        let mut digest = LengthDelimitedDigest::new(PROVIDER_INDEPENDENT_LEAF_BEHAVIOR);
-        digest.push(label);
+fn provider_independent_leaf_behavior() -> SummaryBehaviorKey {
+    static BEHAVIOR: OnceLock<SummaryBehaviorKey> = OnceLock::new();
+    *BEHAVIOR.get_or_init(|| {
+        let digest = LengthDelimitedDigest::new(PROVIDER_INDEPENDENT_LEAF_BEHAVIOR);
         SummaryBehaviorKey::from_digest(digest.finish())
     })
 }
@@ -3714,19 +1882,12 @@ fn provider_independent_leaf_behavior(
 fn summary_identity(
     procedure: &ProcedureHandle,
     provider_behavior: SummaryBehaviorKey,
-    publication_mode: ProductionPublicationMode,
 ) -> ProcedureSummaryIdentity {
-    // A call-free procedure is provider-independent only when publication
-    // projection also performs no heap query. An allocation-bearing witnessed
-    // leaf must retain the provider behavior because that provider decides its
-    // publication inventory.
-    let uses_provider = !procedure.semantics().call_sites().is_empty()
-        || (publication_mode == ProductionPublicationMode::Witnessed
-            && !procedure.semantics().allocations().is_empty());
+    let uses_provider = !procedure.semantics().call_sites().is_empty();
     let behavior = if uses_provider {
         provider_behavior
     } else {
-        provider_independent_leaf_behavior(publication_mode)
+        provider_independent_leaf_behavior()
     };
     ProcedureSummaryIdentity::new(
         procedure.artifact().key().clone(),
@@ -3739,86 +1900,9 @@ fn summary_identity(
     )
 }
 
-fn canonicalize_procedures(
-    procedures: &mut Vec<ProcedureHandle>,
-    behavior: SummaryBehaviorKey,
-    publication_mode: ProductionPublicationMode,
-) {
-    procedures
-        .sort_unstable_by_key(|procedure| summary_identity(procedure, behavior, publication_mode));
+fn canonicalize_procedures(procedures: &mut Vec<ProcedureHandle>, behavior: SummaryBehaviorKey) {
+    procedures.sort_unstable_by_key(|procedure| summary_identity(procedure, behavior));
     procedures.dedup_by(|left, right| {
-        summary_identity(left, behavior, publication_mode)
-            == summary_identity(right, behavior, publication_mode)
+        summary_identity(left, behavior) == summary_identity(right, behavior)
     });
-}
-
-#[derive(Debug)]
-struct ProcedureDependencyGraph {
-    edges: Vec<(usize, usize)>,
-    outgoing: Vec<Vec<usize>>,
-    incoming: Vec<Vec<usize>>,
-}
-
-impl ProcedureDependencyGraph {
-    fn new(dependencies: Vec<Vec<usize>>) -> Self {
-        let mut edges = dependencies
-            .iter()
-            .enumerate()
-            .flat_map(|(caller, callees)| callees.iter().map(move |&callee| (caller, callee)))
-            .collect::<Vec<_>>();
-        edges.sort_unstable();
-        edges.dedup();
-        let mut outgoing = vec![Vec::new(); dependencies.len()];
-        let mut incoming = vec![Vec::new(); dependencies.len()];
-        for (edge, &(caller, callee)) in edges.iter().enumerate() {
-            outgoing[caller].push(edge);
-            incoming[callee].push(edge);
-        }
-        Self {
-            edges,
-            outgoing,
-            incoming,
-        }
-    }
-}
-
-impl DenseBidirectionalGraph for ProcedureDependencyGraph {
-    type Node = usize;
-    type Edge = usize;
-
-    fn node_count(&self) -> usize {
-        self.outgoing.len()
-    }
-
-    fn node_at(&self, index: usize) -> Option<Self::Node> {
-        (index < self.outgoing.len()).then_some(index)
-    }
-
-    fn node_index(&self, node: Self::Node) -> Option<usize> {
-        (node < self.outgoing.len()).then_some(node)
-    }
-
-    fn successors(
-        &self,
-        node: Self::Node,
-    ) -> impl DoubleEndedIterator<Item = (Self::Edge, Self::Node)> + ExactSizeIterator + '_ {
-        self.outgoing[node]
-            .iter()
-            .copied()
-            .map(|edge| (edge, self.edges[edge].1))
-    }
-
-    fn predecessors(
-        &self,
-        node: Self::Node,
-    ) -> impl DoubleEndedIterator<Item = (Self::Edge, Self::Node)> + ExactSizeIterator + '_ {
-        self.incoming[node]
-            .iter()
-            .copied()
-            .map(|edge| (edge, self.edges[edge].0))
-    }
-
-    fn edge_endpoints(&self, edge: Self::Edge) -> Option<(Self::Node, Self::Node)> {
-        self.edges.get(edge).copied()
-    }
 }

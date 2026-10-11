@@ -7,9 +7,7 @@ use brokk_bifrost_core::analyzer::js_ts_facts::{
     JsTsPropertyReceiverFact, JsTsReceiverBinding, JsTsSourceFacts, JsTsSourceTypeId, JsTsTypeFact,
     JsTsTypeShape,
 };
-use brokk_bifrost_core::analyzer::source_facts::{
-    SourceDeclarationId, SourceImportId, SourceOccurrenceId,
-};
+use brokk_bifrost_core::analyzer::source_facts::{SourceDeclarationId, SourceOccurrenceId};
 use brokk_bifrost_core::analyzer::usages::model::ImportKind;
 use brokk_bifrost_core::hash::HashMap;
 use brokk_bifrost_js_ts::source_facts::JsTsFileSourceFacts;
@@ -19,7 +17,7 @@ use rusqlite::{OptionalExtension, params};
 use crate::analyzer::LanguageAdapter;
 use crate::analyzer::store::source_facts::{
     SOURCE_DECLARATION_UNITS_SQL, SOURCE_FACTS_VERSION, read_source_identity_rows,
-    read_source_imports, strict_bool,
+    read_source_imports, source_import, strict_bool,
 };
 use crate::analyzer::store::{
     AnalyzerStore, GenerationId, Result, StoreError, read_source_unit_map,
@@ -48,13 +46,7 @@ pub(in crate::analyzer) const JS_TS_SOURCE_HEADER_SQL: &str =
         AND ready.available = 1";
 
 fn required<T>(value: Option<T>, label: &str) -> Result<T> {
-    value.ok_or_else(|| StoreError::new(format!("JS/TS source facts are missing {label}")))
-}
-
-fn source_import(value: i64, label: &str) -> Result<SourceImportId> {
-    let value = u32::try_from(value)
-        .map_err(|_| StoreError::new(format!("invalid {label} source import id {value}")))?;
-    Ok(SourceImportId::new(value))
+    crate::analyzer::store::required_source_value(value, "JS/TS source facts", label)
 }
 
 fn source_type(value: Option<i64>, label: &str) -> Result<Option<JsTsSourceTypeId>> {
@@ -177,7 +169,7 @@ impl AnalyzerStore {
                 expected_source_declarations,
                 expected_bridges,
             ) = header.ok_or_else(|| {
-                StoreError::new(format!(
+                StoreError::missing_required_source_facts(format!(
                     "canonical JS/TS source facts unavailable for {file:?} ({oid})"
                 ))
             })?;

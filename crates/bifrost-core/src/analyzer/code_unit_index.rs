@@ -22,6 +22,49 @@ use crate::analyzer::query_batch::LimitedQueryRows;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
+/// Return the candidate with the narrowest range enclosing the requested line
+/// span. When a candidate has multiple enclosing ranges, its first one is used.
+pub fn narrowest_enclosing_by_lines<T, R>(
+    candidates: impl IntoIterator<Item = (T, R)>,
+    start_line: usize,
+    end_line: usize,
+) -> Option<T>
+where
+    R: IntoIterator<Item = Range>,
+{
+    candidates
+        .into_iter()
+        .filter_map(|(candidate, ranges)| {
+            let range = ranges
+                .into_iter()
+                .find(|range| range.start_line <= start_line && range.end_line >= end_line)?;
+            Some((range.end_line - range.start_line, candidate))
+        })
+        .min_by_key(|(span, _)| *span)
+        .map(|(_, candidate)| candidate)
+}
+
+/// Keep declarations whose fully qualified name matches `fq_name` exactly.
+pub fn declarations_with_fq_name(
+    candidates: impl IntoIterator<Item = CodeUnit>,
+    fq_name: &str,
+) -> Vec<CodeUnit> {
+    candidates
+        .into_iter()
+        .filter(|candidate| candidate.fq_name() == fq_name)
+        .collect()
+}
+
+/// Return the stable, case-insensitive fields used to break definition ties.
+pub fn definition_tie_break_key(code_unit: &CodeUnit) -> (String, String, String, String) {
+    (
+        code_unit.source().to_string().to_ascii_lowercase(),
+        code_unit.fq_name().to_ascii_lowercase(),
+        code_unit.signature().unwrap_or("").to_ascii_lowercase(),
+        format!("{:?}", code_unit.kind()),
+    )
+}
+
 pub trait CodeUnitIndex: Send + Sync {
     fn project(&self) -> &dyn Project;
 
@@ -185,6 +228,13 @@ pub trait CodeUnitIndex: Send + Sync {
         self.get_declarations(file)
     }
 
+    /// Whether every declaration `file` publishes is a reading of a completed
+    /// parse (#3501). Default `Complete`: an analyzer that never records a
+    /// partial parse has none to report.
+    fn parse_completeness(&self, _file: &ProjectFile) -> crate::analyzer::model::ParseCompleteness {
+        crate::analyzer::model::ParseCompleteness::Complete
+    }
+
     /// Declaration-materialization provenance recorded for `file` by its
     /// language walk (issue #1476). Default empty: an analyzer that records
     /// nothing has no records, and the materialization support tables decide
@@ -239,9 +289,7 @@ pub trait CodeUnitIndex: Send + Sync {
     /// selector on a 360k-declaration workspace (#2880).
     fn declarations_sharing_name(&self, unit: &CodeUnit) -> Vec<CodeUnit> {
         let fq_name = unit.fq_name();
-        self.all_declarations()
-            .filter(|candidate| candidate.fq_name() == fq_name)
-            .collect()
+        declarations_with_fq_name(self.all_declarations(), &fq_name)
     }
 
     fn definitions(&self, _fq_name: &str) -> Box<dyn Iterator<Item = CodeUnit> + '_> {
@@ -440,7 +488,14 @@ pub trait CodeUnitIndex: Send + Sync {
         skeletons
     }
 
-    fn get_source(&self, code_unit: &CodeUnit, include_comments: bool) -> Option<String>;
+    fn get_source(&self, code_unit: &CodeUnit, include_comments: bool) -> Option<String> {
+        let sources = self.get_sources(code_unit, include_comments);
+        if sources.is_empty() {
+            None
+        } else {
+            Some(sources.into_iter().collect::<Vec<_>>().join("\n\n"))
+        }
+    }
 
     fn get_sources(&self, code_unit: &CodeUnit, include_comments: bool) -> BTreeSet<String>;
 
@@ -528,6 +583,9 @@ pub fn default_parent_fq_name(code_unit: &CodeUnit) -> Option<String> {
 /// whichever namespace happened to sort first; C#'s bounded and unbounded
 /// `namespace_of_file` spellings then disagreed while sharing one memo cell,
 /// which made the memoized answer depend on which spelling ran first (#1726).
+/// The hydrated vector also contains a synthetic `FileScope` carrier, which
+/// is not persisted as a declaration. Exclude it before applying the budget
+/// so fresh and persisted scans inspect the same declaration sequence (#4607).
 ///
 /// `limit` caps the declarations inspected and counts the recorded-qualifier
 /// probe as one of them. `usize::MAX` is the unbounded spelling: the cap can
@@ -548,6 +606,19 @@ where
     }
     let mut inspected = 1usize;
     for unit in top_level_declarations {
+        // Every hydrated and freshly parsed `FileState::top_level_declarations`
+        // carries a synthetic file-scope wrapper spanning the whole file
+        // (`synthesize_file_scope` / `ParsedFile::add_file_scope`), but
+        // `should_persist_code_unit` keeps it out of the store, so the
+        // persisted twin `first_declaration_content_qualifier_for_key_limited`
+        // never sees it. Counting it here charged the bounded namespace query
+        // one unit more on the in-memory branches than on the store branch,
+        // which made `work.fact_nodes` depend on whether the file's state was
+        // hydrated (#4755). The wrapper is not a source declaration, so skip
+        // it on every branch and keep the two spellings' budget identical.
+        if unit.is_file_scope() {
+            continue;
+        }
         if inspected == limit {
             return LimitedQueryRows::incomplete(Vec::new(), inspected);
         }
@@ -560,7 +631,76 @@ where
 }
 
 #[cfg(test)]
+mod file_namespace_tests {
+    use super::file_namespace_from_top_level_declarations;
+    use crate::analyzer::model::{CodeUnit, CodeUnitType, ProjectFile};
+    use brokk_bifrost_test_macros::hardwon;
+
+    fn source() -> ProjectFile {
+        ProjectFile::new(
+            std::env::current_dir().expect("test working directory"),
+            "Probe.cs",
+        )
+    }
+
+    #[test]
+    #[hardwon(
+        "#4607: a transient FileScope inflated fresh namespace work compared with persisted declarations"
+    )]
+    fn global_declaration_has_the_same_budget_with_or_without_its_file_scope() {
+        let declaration = CodeUnit::new(source(), CodeUnitType::Class, "", "Probe");
+        let scope = CodeUnit::file_scope(source());
+        for hydrated in [[&declaration, &scope], [&scope, &declaration]] {
+            for limit in [0, 1, 2, usize::MAX] {
+                let persisted =
+                    file_namespace_from_top_level_declarations("", [&declaration], limit);
+                let fresh = file_namespace_from_top_level_declarations("", hydrated, limit);
+                assert_eq!(fresh.rows, persisted.rows, "limit={limit}");
+                assert_eq!(fresh.complete, persisted.complete, "limit={limit}");
+                assert_eq!(fresh.inspected, persisted.inspected, "limit={limit}");
+            }
+        }
+        let answer = file_namespace_from_top_level_declarations("", [&declaration, &scope], 2);
+        assert!(answer.complete);
+        assert_eq!(answer.rows, [String::new()]);
+        assert_eq!(answer.inspected, 2);
+    }
+
+    #[test]
+    #[hardwon(
+        "#4607: excluding FileScope must still charge real empty declarations and retain source order"
+    )]
+    fn real_empty_declarations_still_consume_the_namespace_budget() {
+        let empty = CodeUnit::new(source(), CodeUnitType::Class, "", "Probe");
+        let zeta = CodeUnit::new(source(), CodeUnitType::Class, "Zeta", "First");
+        let alpha = CodeUnit::new(source(), CodeUnitType::Class, "Alpha", "Later");
+        let scope = CodeUnit::file_scope(source());
+        let units = [&scope, &empty, &zeta, &alpha];
+        let truncated = file_namespace_from_top_level_declarations("", units, 2);
+        assert!(!truncated.complete);
+        assert!(truncated.rows.is_empty());
+        assert_eq!(truncated.inspected, 2);
+        let answer = file_namespace_from_top_level_declarations("", units, 3);
+        assert!(answer.complete);
+        assert_eq!(answer.rows, ["Zeta"]);
+        assert_eq!(answer.inspected, 3);
+    }
+
+    #[test]
+    #[hardwon("#4607: a synthetic file scope is not an authored namespace declaration")]
+    fn file_scope_alone_does_not_consume_a_declaration_probe() {
+        let scope = CodeUnit::file_scope(source());
+        let answer = file_namespace_from_top_level_declarations("", [&scope], 1);
+        assert!(answer.complete);
+        assert_eq!(answer.rows, [String::new()]);
+        assert_eq!(answer.inspected, 1);
+    }
+}
+
+#[cfg(test)]
 mod parent_of_tests {
+    use brokk_bifrost_test_macros::hardwon;
+
     use super::default_parent_fq_name;
     use crate::analyzer::fq_name::{FqName, SegmentId, SegmentKind, segment_interner};
     use crate::analyzer::model::{CodeUnit, CodeUnitType, ProjectFile};
@@ -613,6 +753,9 @@ mod parent_of_tests {
     }
 
     #[test]
+    #[hardwon(
+        "#1555: mixed C++ namespace and member separators must follow recorded FQName segments"
+    )]
     fn cpp_namespace_head_owner_uses_structured_segments() {
         // `::` between namespaces, `.` down the owner/member tail — the mixed
         // separator the plan calls out. Both arms drop the trailing member.
@@ -633,6 +776,7 @@ mod parent_of_tests {
     }
 
     #[test]
+    #[hardwon("#1555: popping a C++ namespace component must preserve the package prefix boundary")]
     fn cpp_namespace_component_owner_uses_structured_segments() {
         // Popping into the `::`-joined namespace head: both arms agree because
         // `::` is in the parent-of separator set (unlike the shrinking-scope
@@ -653,6 +797,7 @@ mod parent_of_tests {
     }
 
     #[test]
+    #[hardwon("#1555: dotted package names must remain distinct from declaration segments")]
     fn dotted_package_owner_uses_structured_segments() {
         assert_structured_parent(
             "a.py",
@@ -671,6 +816,7 @@ mod parent_of_tests {
     }
 
     #[test]
+    #[hardwon("#1555: dollar-nested types must pop one structured owner segment at a time")]
     fn dollar_nested_owner_uses_structured_segments() {
         // A `$`-joined nested type: dropping the member, then dropping the
         // nested type, agrees between the segment pop and the `$`/`.` scan.
@@ -699,6 +845,7 @@ mod parent_of_tests {
     }
 
     #[test]
+    #[hardwon("#1555: dots inside Go import path segments must not be treated as owner boundaries")]
     fn go_import_path_member_owner_uses_structured_segments() {
         // Path components carry literal dots (`github.com`) and `/` joins; both
         // arms drop only the trailing member, so the embedded dot never splits.
@@ -720,6 +867,7 @@ mod parent_of_tests {
     }
 
     #[test]
+    #[hardwon("#1555: a top-level structured FQName must have no parent owner")]
     fn single_segment_has_no_owner() {
         assert_structured_parent(
             "a.py",

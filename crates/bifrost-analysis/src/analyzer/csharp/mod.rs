@@ -9,6 +9,8 @@
 
 mod adapter;
 mod cache;
+mod call_conversion;
+mod catch_facts;
 mod clones;
 mod compilation;
 mod dependency_discovery;
@@ -41,16 +43,14 @@ pub(crate) use brokk_bifrost_csharp::syntax::{
 };
 pub use brokk_bifrost_csharp::syntax::{csharp_source_name_segment, strip_csharp_generic_arity};
 
-use crate::analyzer::clone_detection::{
-    CloneCandidateProfile, detect_structural_clone_smells, refine_clone_similarity_with_ast,
-};
-use crate::analyzer::common::language_for_file as file_language;
+use crate::analyzer::clone_detection::detect_language_structural_clone_smells;
+use crate::analyzer::common::limited_known_rows;
 use crate::analyzer::languages::{
     BoundedReceiverQuery, DeadCodeBulkEdges, DeadCodeBulkPreflight, DeadCodeBulkProof,
     DeadCodeRouting, DeadCodeSupport, EdgePassId, EdgeSiteScanCtx, EdgeWeightScanCtx,
     LanguageEdgePass, LanguageEdgeSites, LanguageEdgeWeights, LanguageSupport,
-    StructuralReceiverResolver, analyzable_file_count, candidate_fqns,
-    fqn_has_multiple_function_definitions,
+    StructuralReceiverResolver, analyzable_file_count, fqn_has_multiple_function_definitions,
+    ready_preflight,
 };
 use crate::analyzer::store::LimitedQueryRows;
 use crate::analyzer::usages::csharp_graph::{
@@ -61,17 +61,17 @@ use crate::analyzer::usages::get_definition::{
     BoundedResolution, DefinitionLookupOutcome, resolve_csharp_bounded,
 };
 use crate::analyzer::usages::get_type::{TypeLookupOutcome, resolve_csharp_type_bounded};
-use crate::analyzer::usages::inverted_edges::cached_dead_code_usage_edges;
+use crate::analyzer::usages::receiver_sites::ReceiverSiteInputMode;
 use crate::analyzer::usages::workspace_graph::UsageEcosystem;
 use crate::analyzer::{
-    AnalyzerConfig, AnalyzerDefinitionLookup, AnalyzerStoreContext, BoundedDefinitionLookup,
-    BuildProgress, CSharpAnalyzerConfig, CodeUnit, ForwardQueryProvider, IAnalyzer,
-    ImportAnalysisProvider, Language, Project, ProjectFile, SignatureMetadata, TestAssertionSmell,
-    TestAssertionWeights, TestDetectionProvider, TreeSitterAnalyzer, TypeHierarchyProvider,
-    resolve_analyzer,
+    AnalyzerConfig, AnalyzerStoreContext, BoundedDefinitionLookup, BuildProgress,
+    CSharpAnalyzerConfig, CodeUnit, ForwardQueryProvider, IAnalyzer, ImportAnalysisProvider,
+    Language, Project, ProjectFile, SignatureMetadata, TestAssertionSmell, TestAssertionWeights,
+    TestDetectionProvider, TreeSitterAnalyzer, TypeHierarchyProvider, resolve_analyzer,
 };
 use crate::hash::{HashMap, HashSet};
 use crate::{CloneSmell, CloneSmellWeights};
+use moka::sync::Cache;
 use std::collections::BTreeSet;
 use std::sync::Arc;
 
@@ -89,26 +89,39 @@ use external::{
 };
 use graph_support::CSharpSource;
 
-fn limited_known_values<T>(
-    len: usize,
-    values: impl IntoIterator<Item = T>,
-    limit: usize,
-) -> LimitedQueryRows<T> {
-    if limit == 0 {
-        return LimitedQueryRows::incomplete(Vec::new(), 0);
-    }
-    let inspected = len.min(limit);
-    let rows = values.into_iter().take(limit).collect();
-    if len > limit {
-        LimitedQueryRows::incomplete(rows, inspected)
-    } else {
-        LimitedQueryRows::complete(rows, inspected)
-    }
-}
+pub use catch_facts::{CSharpCatchFacts, CSharpCatchTypeRelation, csharp_catch_facts};
 
 pub(crate) use dependency_discovery::{
     is_csharp_dependency_input, is_csharp_dependency_input_path,
 };
+
+fn cached_file_value<T: Clone + Send + Sync + 'static>(
+    cache: &Cache<ProjectFile, Arc<T>>,
+    file: &ProjectFile,
+    compute: impl FnOnce() -> T,
+) -> T {
+    if let Some(cached) = cache.get(file) {
+        return (*cached).clone();
+    }
+    let value = compute();
+    cache.insert(file.clone(), Arc::new(value.clone()));
+    value
+}
+
+fn cached_limited_query_rows<T>(
+    cached: impl FnOnce() -> Option<LimitedQueryRows<T>>,
+    compute: impl FnOnce() -> LimitedQueryRows<T>,
+    cache_complete: impl FnOnce(&[T]),
+) -> LimitedQueryRows<T> {
+    if let Some(rows) = cached() {
+        return rows;
+    }
+    let batch = compute();
+    if batch.complete {
+        cache_complete(&batch.rows);
+    }
+    batch
+}
 
 #[derive(Clone)]
 pub struct CSharpAnalyzer {
@@ -121,9 +134,20 @@ pub struct CSharpAnalyzer {
 crate::analyzer::impl_forward_query_provider!(CSharpAnalyzer);
 
 impl CSharpAnalyzer {
+    pub(crate) fn update_all_with_progress(
+        &self,
+        progress: Option<crate::analyzer::BuildProgress>,
+    ) -> Self {
+        Self {
+            inner: self.inner.update_all_with_progress(progress),
+            memo_caches: Arc::new(CSharpMemoCaches::new(self.memo_caches.budget_bytes())),
+            csharp_config: self.csharp_config.clone(),
+            external_index: Arc::new(std::sync::OnceLock::new()),
+        }
+    }
+
     pub(crate) fn clone_with_project(&self, project: Arc<dyn Project>) -> Self {
-        let mut clone = self.clone();
-        clone.inner = clone.inner.clone_with_project(project);
+        let mut clone = self.clone_for_index_warm(project);
         clone.memo_caches = Arc::new(CSharpMemoCaches::new(self.memo_caches.budget_bytes()));
         clone.external_index = Arc::new(std::sync::OnceLock::new());
         clone
@@ -180,14 +204,14 @@ impl CSharpAnalyzer {
         Self::new(Arc::new(project))
     }
 
-    #[doc(hidden)]
-    pub fn reset_full_hydration_count_for_test(&self) {
-        self.inner.reset_full_hydration_count_for_test();
+    crate::analyzer::tree_sitter_analyzer::delegate_inner_methods! {
+        #[doc(hidden)]
+        pub fn reset_full_hydration_count_for_test(&self);
     }
 
-    #[doc(hidden)]
-    pub fn full_hydration_count_for_test(&self) -> usize {
-        self.inner.full_hydration_count_for_test()
+    crate::analyzer::tree_sitter_analyzer::delegate_inner_methods! {
+        #[doc(hidden)]
+        pub fn full_hydration_count_for_test(&self) -> usize;
     }
 
     pub(crate) fn declaration_candidates_by_identifier(
@@ -295,14 +319,9 @@ impl CSharpAnalyzer {
     }
 
     pub fn namespace_of_file(&self, file: &ProjectFile) -> String {
-        if let Some(cached) = self.memo_caches.namespace_by_file.get(file) {
-            return (*cached).clone();
-        }
-        let namespace = graph_support::compute_namespace_of_file(self, file);
-        self.memo_caches
-            .namespace_by_file
-            .insert(file.clone(), Arc::new(namespace.clone()));
-        namespace
+        cached_file_value(&self.memo_caches.namespace_by_file, file, || {
+            graph_support::compute_namespace_of_file(self, file)
+        })
     }
 
     /// The bounded twin of [`Self::namespace_of_file`], sharing its memo cell.
@@ -314,7 +333,7 @@ impl CSharpAnalyzer {
         limit: usize,
     ) -> LimitedQueryRows<String> {
         if let Some(cached) = self.memo_caches.namespace_by_file.get(file) {
-            return limited_known_values(1, std::iter::once((*cached).clone()), limit);
+            return limited_known_rows(1, std::iter::once((*cached).clone()), limit);
         }
         let batch = graph_support::compute_namespace_of_file_limited(self, file, limit);
         if batch.complete {
@@ -458,6 +477,53 @@ impl CSharpAnalyzer {
         Some(format!("{owner}.{member}"))
     }
 
+    /// The canonical external identity of one applicable C# constructor, or
+    /// `None` when the owner ladder remains empty, ambiguous, or lacks an
+    /// exact declaration at this arity.
+    pub(crate) fn external_constructor_identity(
+        &self,
+        packs: Option<Arc<crate::analyzer::semantic_model::SemanticModelOverlay>>,
+        candidate_owners: &[String],
+        parameter_count: u32,
+    ) -> Option<(String, String)> {
+        let external = self.external_declarations(packs);
+        if external.is_empty() {
+            return None;
+        }
+        let mut targets = candidate_owners
+            .iter()
+            .filter_map(|owner| external.constructor(owner, parameter_count))
+            .collect::<Vec<_>>();
+        targets.sort();
+        targets.dedup();
+        let [target] = targets.as_slice() else {
+            return None;
+        };
+        Some(target.clone())
+    }
+
+    /// Whether the exact external C# member identity is static, using the
+    /// same activated declaration surface that published the identity.
+    pub(crate) fn external_member_is_static(
+        &self,
+        packs: Option<Arc<crate::analyzer::semantic_model::SemanticModelOverlay>>,
+        owner: &str,
+        member: &str,
+    ) -> Option<bool> {
+        self.external_declarations(packs)
+            .member_is_static(owner, member)
+    }
+
+    /// Whether the exact external C# type identity is sealed according to the
+    /// active declaration surface.
+    pub(crate) fn external_type_is_sealed(
+        &self,
+        packs: Option<Arc<crate::analyzer::semantic_model::SemanticModelOverlay>>,
+        owner: &str,
+    ) -> Option<bool> {
+        self.external_declarations(packs).type_is_sealed(owner)
+    }
+
     pub fn using_namespaces_of(&self, token: QueryToken<'_>, file: &ProjectFile) -> Vec<String> {
         if let Some(cached) = self.memo_caches.using_namespaces.get(file) {
             return (*cached).clone();
@@ -477,7 +543,7 @@ impl CSharpAnalyzer {
         mut continue_query: impl FnMut() -> bool,
     ) -> LimitedQueryRows<String> {
         if let Some(cached) = self.memo_caches.using_namespaces.get(file) {
-            return limited_known_values(cached.len(), cached.iter().cloned(), limit);
+            return limited_known_rows(cached.len(), cached.iter().cloned(), limit);
         }
         let batch = graph_support::compute_using_namespaces_of_limited(
             self,
@@ -516,29 +582,32 @@ impl CSharpAnalyzer {
         limit: usize,
         mut continue_query: impl FnMut() -> bool,
     ) -> LimitedQueryRows<(String, String)> {
-        if let Some(cached) = self.memo_caches.using_aliases.get(file) {
-            return limited_known_values(
-                cached.len(),
-                cached
-                    .iter()
-                    .map(|(alias, target)| (alias.clone(), target.clone())),
-                limit,
-            );
-        }
-        let batch = graph_support::compute_using_aliases_of_limited(
-            self,
-            token,
-            file,
-            limit,
-            &mut continue_query,
-        );
-        if batch.complete {
-            self.memo_caches.using_aliases.insert(
-                file.clone(),
-                Arc::new(batch.rows.iter().cloned().collect::<HashMap<_, _>>()),
-            );
-        }
-        batch
+        let cache = &self.memo_caches.using_aliases;
+        cached_limited_query_rows(
+            || {
+                cache.get(file).map(|cached| {
+                    limited_known_rows(
+                        cached.len(),
+                        cached
+                            .iter()
+                            .map(|(alias, target)| (alias.clone(), target.clone())),
+                        limit,
+                    )
+                })
+            },
+            || {
+                graph_support::compute_using_aliases_of_limited(
+                    self,
+                    token,
+                    file,
+                    limit,
+                    &mut continue_query,
+                )
+            },
+            |rows| {
+                cache.insert(file.clone(), Arc::new(rows.iter().cloned().collect()));
+            },
+        )
     }
 
     pub(crate) fn global_using_namespaces(&self, token: QueryToken<'_>) -> &HashSet<String> {
@@ -552,21 +621,24 @@ impl CSharpAnalyzer {
         limit: usize,
         mut continue_query: impl FnMut() -> bool,
     ) -> LimitedQueryRows<String> {
-        if let Some(cached) = self.memo_caches.global_using_namespaces.get() {
-            return limited_known_values(cached.len(), cached.iter().cloned(), limit);
-        }
-        let batch = graph_support::compute_global_using_namespaces_limited(
-            self,
-            limit,
-            &mut continue_query,
-        );
-        if batch.complete {
-            let _ = self
-                .memo_caches
-                .global_using_namespaces
-                .set(batch.rows.iter().cloned().collect());
-        }
-        batch
+        let cache = &self.memo_caches.global_using_namespaces;
+        cached_limited_query_rows(
+            || {
+                cache
+                    .get()
+                    .map(|cached| limited_known_rows(cached.len(), cached.iter().cloned(), limit))
+            },
+            || {
+                graph_support::compute_global_using_namespaces_limited(
+                    self,
+                    limit,
+                    &mut continue_query,
+                )
+            },
+            |rows| {
+                cache.get_or_init(|| rows.iter().cloned().collect());
+            },
+        )
     }
 
     fn global_using_aliases(&self, token: QueryToken<'_>) -> &HashMap<String, String> {
@@ -580,24 +652,30 @@ impl CSharpAnalyzer {
         limit: usize,
         mut continue_query: impl FnMut() -> bool,
     ) -> LimitedQueryRows<(String, String)> {
-        if let Some(cached) = self.memo_caches.global_using_aliases.get() {
-            return limited_known_values(
-                cached.len(),
-                cached
-                    .iter()
-                    .map(|(alias, target)| (alias.clone(), target.clone())),
-                limit,
-            );
-        }
-        let batch =
-            graph_support::compute_global_using_aliases_limited(self, limit, &mut continue_query);
-        if batch.complete {
-            let _ = self
-                .memo_caches
-                .global_using_aliases
-                .set(batch.rows.iter().cloned().collect());
-        }
-        batch
+        let cache = &self.memo_caches.global_using_aliases;
+        cached_limited_query_rows(
+            || {
+                cache.get().map(|cached| {
+                    limited_known_rows(
+                        cached.len(),
+                        cached
+                            .iter()
+                            .map(|(alias, target)| (alias.clone(), target.clone())),
+                        limit,
+                    )
+                })
+            },
+            || {
+                graph_support::compute_global_using_aliases_limited(
+                    self,
+                    limit,
+                    &mut continue_query,
+                )
+            },
+            |rows| {
+                cache.get_or_init(|| rows.iter().cloned().collect());
+            },
+        )
     }
 
     pub(crate) fn global_static_using_type_names(&self, token: QueryToken<'_>) -> &[String] {
@@ -612,7 +690,7 @@ impl CSharpAnalyzer {
         mut continue_query: impl FnMut() -> bool,
     ) -> LimitedQueryRows<String> {
         if let Some(cached) = self.memo_caches.global_static_using_type_names.get() {
-            return limited_known_values(cached.len(), cached.iter().cloned(), limit);
+            return limited_known_rows(cached.len(), cached.iter().cloned(), limit);
         }
         let batch = graph_support::compute_global_static_using_type_names_limited(
             self,
@@ -712,8 +790,7 @@ impl CSharpSource for CSharpAnalyzer {
         _token: QueryToken<'_>,
         read: &mut dyn FnMut(&dyn BoundedDefinitionLookup),
     ) {
-        let lookup = AnalyzerDefinitionLookup::new(self, Language::CSharp);
-        read(&lookup);
+        crate::analyzer::with_analyzer_usage_definitions(self, Language::CSharp, read);
     }
 
     fn all_files(&self) -> Vec<ProjectFile> {
@@ -752,8 +829,8 @@ impl CSharpSource for CSharpAnalyzer {
             .workspace_import_info_limited(token, limit, continue_query)
     }
 
-    fn raw_supertypes_of(&self, code_unit: &CodeUnit) -> Vec<String> {
-        self.inner.raw_supertypes_of(code_unit)
+    crate::analyzer::tree_sitter_analyzer::delegate_inner_methods! {
+        fn raw_supertypes_of(&self, code_unit: &CodeUnit) -> Vec<String>;
     }
 
     fn raw_supertypes_limited(
@@ -855,14 +932,9 @@ impl CSharpSource for CSharpAnalyzer {
     }
 
     fn file_using_namespaces_of(&self, token: QueryToken<'_>, file: &ProjectFile) -> Vec<String> {
-        if let Some(cached) = self.memo_caches.file_using_namespaces.get(file) {
-            return (*cached).clone();
-        }
-        let namespaces = graph_support::file_using_namespaces(self, token, file);
-        self.memo_caches
-            .file_using_namespaces
-            .insert(file.clone(), Arc::new(namespaces.clone()));
-        namespaces
+        cached_file_value(&self.memo_caches.file_using_namespaces, file, || {
+            graph_support::file_using_namespaces(self, token, file)
+        })
     }
 
     fn sorted_global_using_namespaces(&self) -> Vec<String> {
@@ -903,12 +975,12 @@ impl CSharpSource for CSharpAnalyzer {
 }
 
 impl CSharpAnalyzer {
-    pub(crate) fn signature_metadata_limited(
+    crate::analyzer::tree_sitter_analyzer::delegate_inner_methods! {
+        pub(crate) fn signature_metadata_limited(
         &self,
         code_unit: &CodeUnit,
         limit: usize,
-    ) -> crate::analyzer::store::LimitedQueryRows<SignatureMetadata> {
-        self.inner.signature_metadata_limited(code_unit, limit)
+    ) -> crate::analyzer::store::LimitedQueryRows<SignatureMetadata>;
     }
 
     pub(crate) fn signatures_limited(
@@ -927,12 +999,12 @@ impl CSharpAnalyzer {
         self.inner.ranges_limited(code_unit, limit)
     }
 
-    pub(crate) fn raw_supertypes_limited(
+    crate::analyzer::tree_sitter_analyzer::delegate_inner_methods! {
+        pub(crate) fn raw_supertypes_limited(
         &self,
         code_unit: &CodeUnit,
         limit: usize,
-    ) -> crate::analyzer::store::LimitedQueryRows<String> {
-        self.inner.raw_supertypes_limited(code_unit, limit)
+    ) -> crate::analyzer::store::LimitedQueryRows<String>;
     }
 }
 
@@ -941,98 +1013,97 @@ impl TestDetectionProvider for CSharpAnalyzer {}
 use crate::analyzer::CodeUnitIndex;
 
 impl CodeUnitIndex for CSharpAnalyzer {
-    /// Forwarded so the request-scoped memo on the inner analyzer answers
-    /// (#2679); the trait default would rebuild uncached per call.
-    fn class_range_index(
+    crate::analyzer::tree_sitter_analyzer::delegate_inner_methods! {
+        /// Forwarded so the request-scoped memo on the inner analyzer answers
+        /// (#2679); the trait default would rebuild uncached per call.
+        fn class_range_index(
         &self,
         file: &ProjectFile,
-    ) -> std::sync::Arc<brokk_bifrost_core::analyzer::usages::inverted_edges::ClassRangeIndex> {
-        self.inner.class_range_index(file)
+    ) -> std::sync::Arc<brokk_bifrost_core::analyzer::usages::inverted_edges::ClassRangeIndex>;
     }
 
-    fn enclosing_code_unit(
+    crate::analyzer::tree_sitter_analyzer::delegate_inner_methods! {
+        fn enclosing_code_unit(
         &self,
         file: &ProjectFile,
         range: &crate::analyzer::Range,
-    ) -> Option<CodeUnit> {
-        self.inner.enclosing_code_unit(file, range)
+    ) -> Option<CodeUnit>;
     }
 
-    fn enclosing_code_unit_for_lines(
+    crate::analyzer::tree_sitter_analyzer::delegate_inner_methods! {
+        fn enclosing_code_unit_for_lines(
+            &self,
+            file: &ProjectFile,
+            start_line: usize,
+            end_line: usize,
+        ) -> Option<CodeUnit>;
+    }
+
+    crate::analyzer::tree_sitter_analyzer::delegate_inner_methods! {
+        fn top_level_declarations(&self, file: &ProjectFile) -> Vec<CodeUnit>;
+    }
+
+    crate::analyzer::tree_sitter_analyzer::delegate_inner_methods! {
+        fn summary_file_projection(
         &self,
         file: &ProjectFile,
-        start_line: usize,
-        end_line: usize,
-    ) -> Option<CodeUnit> {
-        self.inner
-            .enclosing_code_unit_for_lines(file, start_line, end_line)
+    ) -> Option<Arc<crate::analyzer::SummaryFileProjection>>;
     }
 
-    fn top_level_declarations(&self, file: &ProjectFile) -> Vec<CodeUnit> {
-        self.inner.top_level_declarations(file)
+    crate::analyzer::tree_sitter_analyzer::delegate_inner_methods! {
+        fn analyzed_files(&self) -> Vec<ProjectFile>;
     }
 
-    fn summary_file_projection(
-        &self,
-        file: &ProjectFile,
-    ) -> Option<Arc<crate::analyzer::SummaryFileProjection>> {
-        self.inner.summary_file_projection(file)
+    crate::analyzer::tree_sitter_analyzer::delegate_inner_methods! {
+        fn indexed_source(&self, file: &ProjectFile) -> Option<String>;
     }
 
-    fn analyzed_files(&self) -> Vec<ProjectFile> {
-        self.inner.analyzed_files()
+    crate::analyzer::tree_sitter_analyzer::delegate_inner_methods! {
+        fn location_declarations(&self, file: &ProjectFile) -> BTreeSet<CodeUnit>;
     }
 
-    fn indexed_source(&self, file: &ProjectFile) -> Option<String> {
-        self.inner.indexed_source(file)
+    crate::analyzer::tree_sitter_analyzer::delegate_inner_methods! {
+        fn location_ranges(&self, code_unit: &CodeUnit) -> Vec<crate::analyzer::Range>;
     }
 
-    fn location_declarations(&self, file: &ProjectFile) -> BTreeSet<CodeUnit> {
-        self.inner.location_declarations(file)
+    crate::analyzer::tree_sitter_analyzer::delegate_inner_methods! {
+        fn indexed_source_matches(&self, file: &ProjectFile, source: &str) -> bool;
     }
 
-    fn location_ranges(&self, code_unit: &CodeUnit) -> Vec<crate::analyzer::Range> {
-        self.inner.location_ranges(code_unit)
+    crate::analyzer::tree_sitter_analyzer::delegate_inner_methods! {
+        fn is_analyzed(&self, file: &ProjectFile) -> bool;
     }
 
-    fn indexed_source_matches(&self, file: &ProjectFile, source: &str) -> bool {
-        self.inner.indexed_source_matches(file, source)
-    }
-
-    fn is_analyzed(&self, file: &ProjectFile) -> bool {
-        self.inner.is_analyzed(file)
-    }
-
-    fn retain_analyzed(&self, candidates: &[ProjectFile]) -> Vec<ProjectFile> {
-        self.inner.retain_analyzed(candidates)
+    crate::analyzer::tree_sitter_analyzer::delegate_inner_methods! {
+        fn retain_analyzed(&self, candidates: &[ProjectFile]) -> Vec<ProjectFile>;
     }
 
     fn all_declarations(&self) -> Box<dyn Iterator<Item = CodeUnit> + '_> {
         self.inner.all_declarations()
     }
 
-    fn declarations_sharing_name(&self, unit: &CodeUnit) -> Vec<CodeUnit> {
-        self.inner.declarations_sharing_name(unit)
+    crate::analyzer::tree_sitter_analyzer::delegate_inner_methods! {
+        fn declarations_sharing_name(&self, unit: &CodeUnit) -> Vec<CodeUnit>;
     }
 
-    fn declarations(&self, file: &ProjectFile) -> BTreeSet<CodeUnit> {
-        self.inner.declarations(file)
+    crate::analyzer::tree_sitter_analyzer::delegate_inner_methods! {
+        fn declarations(&self, file: &ProjectFile) -> BTreeSet<CodeUnit>;
     }
 
     fn definitions(&self, fq_name: &str) -> Box<dyn Iterator<Item = CodeUnit> + '_> {
         self.inner.definitions(fq_name)
     }
 
-    fn direct_children(&self, code_unit: &CodeUnit) -> Vec<CodeUnit> {
-        self.inner.direct_children(code_unit)
+    crate::analyzer::tree_sitter_analyzer::delegate_inner_methods! {
+        fn direct_children(&self, code_unit: &CodeUnit) -> Vec<CodeUnit>;
     }
 
     fn parent_of(&self, code_unit: &CodeUnit) -> Option<CodeUnit> {
         self.inner.structural_parent_of(code_unit)
     }
 
-    fn ranges(&self, code_unit: &CodeUnit) -> Vec<crate::analyzer::Range> {
-        self.inner.ranges(code_unit)
+    crate::analyzer::tree_sitter_analyzer::delegate_inner_methods! {
+        fn ranges(&self, code_unit: &CodeUnit) -> Vec<crate::analyzer::Range>;
     }
 
     fn ranges_with_limit(
@@ -1049,66 +1120,57 @@ impl CodeUnitIndex for CSharpAnalyzer {
         self.inner.signatures(code_unit)
     }
 
-    fn signature_metadata(&self, code_unit: &CodeUnit) -> Vec<SignatureMetadata> {
-        self.inner.signature_metadata(code_unit)
+    crate::analyzer::tree_sitter_analyzer::delegate_inner_methods! {
+        fn signature_metadata(&self, code_unit: &CodeUnit) -> Vec<SignatureMetadata>;
     }
 
-    fn get_analyzed_files(&self) -> BTreeSet<ProjectFile> {
-        self.inner.get_analyzed_files()
+    crate::analyzer::tree_sitter_analyzer::delegate_inner_methods! {
+        fn languages(&self) -> BTreeSet<Language>;
     }
 
-    fn languages(&self) -> BTreeSet<Language> {
-        self.inner.languages()
+    crate::analyzer::tree_sitter_analyzer::delegate_inner_methods! {
+        fn project(&self) -> &dyn Project;
     }
 
-    fn project(&self) -> &dyn Project {
-        self.inner.project()
-    }
-
-    fn get_all_declarations(&self) -> Vec<CodeUnit> {
-        self.inner.get_all_declarations()
-    }
-
-    fn get_definitions(&self, fq_name: &str) -> Vec<CodeUnit> {
-        self.inner.get_definitions(fq_name)
+    crate::analyzer::tree_sitter_analyzer::delegate_inner_methods! {
+        fn get_all_declarations(&self) -> Vec<CodeUnit>;
     }
 
     fn get_skeleton(&self, code_unit: &CodeUnit) -> Option<String> {
         self.inner.get_skeleton(code_unit)
     }
 
-    fn get_skeleton_header(&self, code_unit: &CodeUnit) -> Option<String> {
-        self.inner.get_skeleton_header(code_unit)
+    crate::analyzer::tree_sitter_analyzer::delegate_inner_methods! {
+        fn get_skeleton_header(&self, code_unit: &CodeUnit) -> Option<String>;
     }
 
-    fn get_source(&self, code_unit: &CodeUnit, include_comments: bool) -> Option<String> {
-        self.inner.get_source(code_unit, include_comments)
+    crate::analyzer::tree_sitter_analyzer::delegate_inner_methods! {
+        fn get_source(&self, code_unit: &CodeUnit, include_comments: bool) -> Option<String>;
     }
 
-    fn get_sources(&self, code_unit: &CodeUnit, include_comments: bool) -> BTreeSet<String> {
-        self.inner.get_sources(code_unit, include_comments)
+    crate::analyzer::tree_sitter_analyzer::delegate_inner_methods! {
+        fn get_sources(&self, code_unit: &CodeUnit, include_comments: bool) -> BTreeSet<String>;
     }
 
-    fn search_definitions(&self, pattern: &str, auto_quote: bool) -> BTreeSet<CodeUnit> {
-        self.inner.search_definitions(pattern, auto_quote)
+    crate::analyzer::tree_sitter_analyzer::delegate_inner_methods! {
+        fn search_definitions(&self, pattern: &str, auto_quote: bool) -> BTreeSet<CodeUnit>;
     }
 
-    fn search_definitions_by_suffix_pattern(
+    crate::analyzer::tree_sitter_analyzer::delegate_inner_methods! {
+        fn search_definitions_by_suffix_pattern(
         &self,
         pattern: &str,
         terminal_identifiers: &[String],
         language: Language,
-    ) -> BTreeSet<CodeUnit> {
-        self.inner
-            .search_definitions_by_suffix_pattern(pattern, terminal_identifiers, language)
+    ) -> BTreeSet<CodeUnit>;
     }
 
-    fn lookup_candidates_by_short_name(&self, symbol: &str) -> BTreeSet<CodeUnit> {
-        self.inner.lookup_candidates_by_short_name(symbol)
+    crate::analyzer::tree_sitter_analyzer::delegate_inner_methods! {
+        fn lookup_candidates_by_short_name(&self, symbol: &str) -> BTreeSet<CodeUnit>;
     }
 
-    fn has_complete_symbol_lookup_index(&self) -> bool {
-        self.inner.has_complete_symbol_lookup_index()
+    crate::analyzer::tree_sitter_analyzer::delegate_inner_methods! {
+        fn has_complete_symbol_lookup_index(&self) -> bool;
     }
 
     fn lookup_candidates_by_identifier(&self, identifier: &str) -> BTreeSet<CodeUnit> {
@@ -1117,6 +1179,8 @@ impl CodeUnitIndex for CSharpAnalyzer {
 }
 
 impl IAnalyzer for CSharpAnalyzer {
+    crate::analyzer::tree_sitter_analyzer::delegate_inner_procedure_fact_methods!();
+
     crate::analyzer::i_analyzer::forward_relational_definition_batch!();
 
     crate::analyzer::i_analyzer::forward_file_identity_invalidation!();
@@ -1164,22 +1228,22 @@ impl IAnalyzer for CSharpAnalyzer {
         self.inner.end_query(context);
     }
 
-    fn prefetch_definitions(&self, fq_names: &[String]) {
-        self.inner.prefetch_definitions(fq_names);
+    crate::analyzer::tree_sitter_analyzer::delegate_inner_methods! {
+        fn prefetch_definitions(&self, fq_names: &[String]);
     }
 
-    fn record_query_failure(&self, error: crate::analyzer::store::StoreError) {
-        self.inner.record_query_failure(error);
+    crate::analyzer::tree_sitter_analyzer::delegate_inner_methods! {
+        fn record_query_failure(&self, error: crate::analyzer::store::StoreError);
     }
 
-    fn workspace_file_index_cell(&self) -> Option<crate::analyzer::WorkspaceFileIndexCell> {
-        self.inner.workspace_file_index_cell()
+    crate::analyzer::tree_sitter_analyzer::delegate_inner_methods! {
+        fn workspace_file_index_cell(&self) -> Option<crate::analyzer::WorkspaceFileIndexCell>;
     }
 
-    fn definition_lookup_memo(
+    crate::analyzer::tree_sitter_analyzer::delegate_inner_methods! {
+        fn definition_lookup_memo(
         &self,
-    ) -> Option<std::sync::Arc<crate::analyzer::DefinitionLookupMemo>> {
-        self.inner.definition_lookup_memo()
+    ) -> Option<std::sync::Arc<crate::analyzer::DefinitionLookupMemo>>;
     }
 
     fn partial_declaration_parts(&self, code_unit: &CodeUnit) -> Option<Vec<CodeUnit>> {
@@ -1189,10 +1253,10 @@ impl IAnalyzer for CSharpAnalyzer {
         Some(graph_support::partial_type_parts(self, code_unit))
     }
 
-    fn structural_fact_providers(
+    crate::analyzer::tree_sitter_analyzer::delegate_inner_methods! {
+        fn structural_fact_providers(
         &self,
-    ) -> Vec<&dyn crate::analyzer::structural::StructuralFactProvider> {
-        self.inner.structural_fact_providers()
+    ) -> Vec<&dyn crate::analyzer::structural::StructuralFactProvider>;
     }
 
     fn snapshot_caches(&self) -> Option<&crate::analyzer::AnalyzerSnapshotCaches> {
@@ -1216,29 +1280,26 @@ impl IAnalyzer for CSharpAnalyzer {
         )
     }
 
-    fn workspace_fact_indexes(
+    crate::analyzer::tree_sitter_analyzer::delegate_inner_methods! {
+        fn workspace_fact_indexes(
         &self,
-    ) -> Vec<&dyn crate::analyzer::read_verification::WorkspaceFactIndex> {
-        self.inner.workspace_fact_indexes()
+    ) -> Vec<&dyn crate::analyzer::read_verification::WorkspaceFactIndex>;
     }
 
-    fn import_statements(&self, file: &ProjectFile) -> Vec<String> {
-        self.inner.import_statements(file)
+    crate::analyzer::tree_sitter_analyzer::delegate_inner_methods! {
+        fn import_statements(&self, file: &ProjectFile) -> Vec<String>;
     }
 
-    fn compute_cognitive_complexities(&self, file: &ProjectFile) -> Vec<(CodeUnit, u32)> {
-        self.inner.compute_cognitive_complexities(file)
+    crate::analyzer::tree_sitter_analyzer::delegate_inner_methods! {
+        fn compute_cognitive_complexities(&self, file: &ProjectFile) -> Vec<(CodeUnit, u32)>;
     }
 
     fn update(&self, changed_files: &BTreeSet<ProjectFile>) -> Self {
-        let external_index = if changed_files
-            .iter()
-            .any(dependency_discovery::is_csharp_dependency_input)
-        {
-            Arc::new(std::sync::OnceLock::new())
-        } else {
-            self.external_index.clone()
-        };
+        let external_index = crate::analyzer::updated_external_index(
+            &self.external_index,
+            changed_files,
+            dependency_discovery::is_csharp_dependency_input,
+        );
         Self {
             inner: self.inner.update(changed_files),
             memo_caches: Arc::new(CSharpMemoCaches::new(self.memo_caches.budget_bytes())),
@@ -1248,35 +1309,29 @@ impl IAnalyzer for CSharpAnalyzer {
     }
 
     fn update_all(&self) -> Self {
-        Self {
-            inner: self.inner.update_all(),
-            memo_caches: Arc::new(CSharpMemoCaches::new(self.memo_caches.budget_bytes())),
-            csharp_config: self.csharp_config.clone(),
-            external_index: Arc::new(std::sync::OnceLock::new()),
-        }
+        self.update_all_with_progress(None)
     }
 
     fn parse_errors(&self, file: &ProjectFile) -> Option<Vec<crate::analyzer::ParseError>> {
         self.inner.parse_errors(file)
     }
 
-    fn extract_call_receiver(&self, reference: &str) -> Option<String> {
-        self.inner.extract_call_receiver(reference)
+    crate::analyzer::tree_sitter_analyzer::delegate_inner_methods! {
+        fn extract_call_receiver(&self, reference: &str) -> Option<String>;
     }
 
-    fn is_access_expression(&self, file: &ProjectFile, start_byte: usize, end_byte: usize) -> bool {
-        self.inner.is_access_expression(file, start_byte, end_byte)
+    crate::analyzer::tree_sitter_analyzer::delegate_inner_methods! {
+        fn is_access_expression(&self, file: &ProjectFile, start_byte: usize, end_byte: usize) -> bool;
     }
 
-    fn find_nearest_declaration(
-        &self,
-        file: &ProjectFile,
-        start_byte: usize,
-        end_byte: usize,
-        ident: &str,
-    ) -> Option<crate::analyzer::DeclarationInfo> {
-        self.inner
-            .find_nearest_declaration(file, start_byte, end_byte, ident)
+    crate::analyzer::tree_sitter_analyzer::delegate_inner_methods! {
+        fn find_nearest_declaration(
+            &self,
+            file: &ProjectFile,
+            start_byte: usize,
+            end_byte: usize,
+            ident: &str,
+        ) -> Option<crate::analyzer::DeclarationInfo>;
     }
 
     fn search_symbol_candidates(
@@ -1300,13 +1355,9 @@ impl IAnalyzer for CSharpAnalyzer {
         file: &ProjectFile,
         weights: TestAssertionWeights,
     ) -> Vec<TestAssertionSmell> {
-        if !self.contains_tests(file) || file_language(file) != Language::CSharp {
-            return Vec::new();
-        }
-        let Ok(source) = self.inner.project().read_source(file) else {
-            return Vec::new();
-        };
-        detect_csharp_test_assertion_smells(file, &source, &weights)
+        crate::analyzer::test_assertion_smells_for_file(self, file, Language::CSharp, |source| {
+            detect_csharp_test_assertion_smells(file, source, &weights)
+        })
     }
 
     fn find_structural_clone_smells(
@@ -1322,32 +1373,12 @@ impl IAnalyzer for CSharpAnalyzer {
         files: &[ProjectFile],
         weights: CloneSmellWeights,
     ) -> Vec<CloneSmell> {
-        let requested_files: Vec<ProjectFile> = files
-            .iter()
-            .filter(|file| file_language(file) == Language::CSharp)
-            .cloned()
-            .collect();
-        if requested_files.is_empty() {
-            return Vec::new();
-        }
-
-        let corpus_units =
-            crate::analyzer::clone_detection::clone_corpus_function_units(self, Language::CSharp);
-        let _query_scope = crate::analyzer::AnalyzerQueryScope::new(self);
-        let all_candidates: Vec<CloneCandidateProfile> = corpus_units
-            .iter()
-            .filter_map(|code_unit| build_csharp_clone_candidate_data(self, code_unit, weights))
-            .map(|candidate| CloneCandidateProfile::create(candidate, weights))
-            .collect();
-        if all_candidates.is_empty() {
-            return Vec::new();
-        }
-
-        detect_structural_clone_smells(
-            &requested_files,
-            all_candidates,
+        detect_language_structural_clone_smells(
+            self,
+            files,
             weights,
-            refine_clone_similarity_with_ast,
+            Language::CSharp,
+            |code_unit| build_csharp_clone_candidate_data(self, code_unit, weights),
         )
     }
 
@@ -1399,60 +1430,48 @@ impl crate::analyzer::usages::MemberFamilyProvider for CSharpAnalyzer {
 
 #[cfg(any(test, feature = "test-support"))]
 impl crate::analyzer::AnalyzerTestHooks for CSharpAnalyzer {
-    fn reset_definition_candidates_query_count_for_test(&self) {
-        self.inner
-            .test_hooks()
-            .reset_definition_candidates_query_count_for_test();
+    crate::analyzer::tree_sitter_analyzer::delegate_inner_test_hook_methods! {
+        fn reset_definition_candidates_query_count_for_test(&self);
     }
 
-    fn definition_candidates_query_count_for_test(&self) -> usize {
-        self.inner
-            .test_hooks()
-            .definition_candidates_query_count_for_test()
+    crate::analyzer::tree_sitter_analyzer::delegate_inner_test_hook_methods! {
+        fn definition_candidates_query_count_for_test(&self) -> usize;
     }
 
-    fn reset_relational_definition_batch_call_count_for_test(&self) {
-        self.inner
-            .test_hooks()
-            .reset_relational_definition_batch_call_count_for_test();
+    crate::analyzer::tree_sitter_analyzer::delegate_inner_test_hook_methods! {
+        fn reset_relational_definition_batch_call_count_for_test(&self);
     }
 
-    fn relational_definition_batch_call_count_for_test(&self) -> usize {
-        self.inner
-            .test_hooks()
-            .relational_definition_batch_call_count_for_test()
+    crate::analyzer::tree_sitter_analyzer::delegate_inner_test_hook_methods! {
+        fn relational_definition_batch_call_count_for_test(&self) -> usize;
     }
 
-    fn reset_full_declaration_scan_count_for_test(&self) {
-        self.inner
-            .test_hooks()
-            .reset_full_declaration_scan_count_for_test();
+    crate::analyzer::tree_sitter_analyzer::delegate_inner_test_hook_methods! {
+        fn reset_full_declaration_scan_count_for_test(&self);
     }
 
-    fn full_declaration_scan_count_for_test(&self) -> usize {
-        self.inner
-            .test_hooks()
-            .full_declaration_scan_count_for_test()
+    crate::analyzer::tree_sitter_analyzer::delegate_inner_test_hook_methods! {
+        fn full_declaration_scan_count_for_test(&self) -> usize;
     }
 
-    fn reset_package_declaration_scan_count_for_test(&self) {
-        self.inner
-            .test_hooks()
-            .reset_package_declaration_scan_count_for_test();
+    crate::analyzer::tree_sitter_analyzer::delegate_inner_test_hook_methods! {
+        fn reset_package_declaration_scan_count_for_test(&self);
     }
 
-    fn package_declaration_scan_count_for_test(&self) -> usize {
-        self.inner
-            .test_hooks()
-            .package_declaration_scan_count_for_test()
+    crate::analyzer::tree_sitter_analyzer::delegate_inner_test_hook_methods! {
+        fn package_declaration_scan_count_for_test(&self) -> usize;
     }
 
     fn reset_candidate_hydration_count_for_test(&self) {
         self.inner.reset_full_hydration_count_for_test();
     }
 
-    fn candidate_hydration_count_for_test(&self) -> usize {
-        self.inner.full_hydration_count_for_test() + self.inner.bulk_hydration_count_for_test()
+    crate::analyzer::tree_sitter_analyzer::delegate_inner_test_hook_methods! {
+        fn full_candidate_hydration_count_for_test(&self) -> usize;
+    }
+
+    crate::analyzer::tree_sitter_analyzer::delegate_inner_test_hook_methods! {
+        fn bulk_candidate_hydration_count_for_test(&self) -> usize;
     }
 }
 
@@ -1489,7 +1508,7 @@ impl LanguageSupport for CSharpSupport {
     }
 
     fn alias_name_segment<'s>(&self, segment: &'s str) -> &'s str {
-        strip_csharp_generic_arity(segment)
+        csharp_source_name_segment(segment)
     }
 
     fn signature_metadata_limited(
@@ -1518,8 +1537,30 @@ impl LanguageSupport for CSharpSupport {
         unit: &CodeUnit,
         limit: usize,
     ) -> Option<LimitedQueryRows<Range>> {
-        resolve_analyzer::<CSharpAnalyzer>(analyzer)
-            .map(|csharp| csharp.ranges_limited(unit, limit))
+        crate::analyzer::languages::with_resolved_analyzer::<CSharpAnalyzer, _>(
+            analyzer,
+            |csharp| csharp.ranges_limited(unit, limit),
+        )
+    }
+
+    fn external_member_is_static(
+        &self,
+        analyzer: &dyn IAnalyzer,
+        packs: Option<Arc<crate::analyzer::semantic_model::SemanticModelOverlay>>,
+        owner: &str,
+        member: &str,
+    ) -> Option<bool> {
+        resolve_analyzer::<CSharpAnalyzer>(analyzer)?
+            .external_member_is_static(packs, owner, member)
+    }
+
+    fn external_type_is_sealed(
+        &self,
+        analyzer: &dyn IAnalyzer,
+        packs: Option<Arc<crate::analyzer::semantic_model::SemanticModelOverlay>>,
+        owner: &str,
+    ) -> Option<bool> {
+        resolve_analyzer::<CSharpAnalyzer>(analyzer)?.external_type_is_sealed(packs, owner)
     }
 
     fn forward_query_provider<'a>(
@@ -1533,11 +1574,19 @@ impl LanguageSupport for CSharpSupport {
         UsageEcosystem::CSharp
     }
 
-    fn reference_plugin(&self) -> crate::analyzer::languages::ReferenceLanguagePlugin {
-        crate::analyzer::languages::ReferenceLanguagePlugin::new(
-            &CSHARP_USAGE_STRATEGY,
-            &CSharpEdgePass,
-        )
+    fn call_argument_conversion_prover(
+        &self,
+    ) -> Option<&'static dyn crate::analyzer::usages::call_conversion::CallArgumentConversionProver>
+    {
+        Some(&call_conversion::CALL_ARGUMENT_CONVERSION_PROVER)
+    }
+
+    fn reference_usage_strategy(&self) -> &'static dyn crate::analyzer::usages::GraphUsageAnalyzer {
+        &CSHARP_USAGE_STRATEGY
+    }
+
+    fn reference_graph_backend(&self) -> crate::analyzer::languages::LanguageGraphBackend {
+        crate::analyzer::languages::LanguageGraphBackend::Legacy(&CSharpEdgePass)
     }
 
     fn dead_code(&self) -> DeadCodeSupport {
@@ -1572,21 +1621,23 @@ impl LanguageEdgePass for CSharpEdgePass {
     }
 
     fn edge_sites(&self, ctx: &EdgeSiteScanCtx<'_>) -> Option<LanguageEdgeSites> {
-        let scope = AnalyzerQueryScope::new(ctx.analyzer);
-        let token = scope.token();
-        build_rooted_csharp_usage_edges(ctx.analyzer, token, ctx.fqns, ctx.keep_file)
-            .map(LanguageEdgeSites::Fqn)
+        crate::analyzer::languages::fqn_edge_sites(ctx, |token| {
+            build_rooted_csharp_usage_edges(ctx.analyzer, token, ctx.fqns, ctx.keep_file)
+        })
     }
 
     fn edge_weights(&self, ctx: &EdgeWeightScanCtx<'_>) -> Option<LanguageEdgeWeights> {
-        let scope = AnalyzerQueryScope::new(ctx.analyzer);
-        let token = scope.token();
-        build_csharp_usage_edge_weights(ctx.analyzer, token, ctx.fqns, ctx.keep_file)
-            .map(LanguageEdgeWeights::Fqn)
+        crate::analyzer::languages::fqn_edge_weights(ctx, |token| {
+            build_csharp_usage_edge_weights(ctx.analyzer, token, ctx.fqns, ctx.keep_file)
+        })
     }
 }
 
 impl StructuralReceiverResolver for CSharpSupport {
+    fn member_target_input_mode(&self) -> ReceiverSiteInputMode {
+        ReceiverSiteInputMode::ContainingSite
+    }
+
     fn resolve_type_bounded(
         &self,
         query: BoundedReceiverQuery<'_>,
@@ -1609,18 +1660,18 @@ impl StructuralReceiverResolver for CSharpSupport {
         &self,
         query: BoundedReceiverQuery<'_>,
     ) -> BoundedResolution<DefinitionLookupOutcome> {
-        let scope = AnalyzerQueryScope::new(query.analyzer);
-        let token = scope.token();
-        resolve_csharp_bounded(
-            query.analyzer,
-            token,
-            query.file,
-            query.source,
-            query.tree,
-            query.site,
-            query.budget,
-            query.cancellation,
-        )
+        crate::analyzer::languages::with_bounded_receiver_query(query, |query, token| {
+            resolve_csharp_bounded(
+                query.analyzer,
+                token,
+                query.file,
+                query.source,
+                query.tree,
+                query.site,
+                query.budget,
+                query.cancellation,
+            )
+        })
     }
 }
 
@@ -1683,10 +1734,7 @@ impl DeadCodeBulkProof for CSharpDeadCodeBulk {
     }
 
     fn preflight(&self, analyzer: &dyn IAnalyzer) -> DeadCodeBulkPreflight {
-        DeadCodeBulkPreflight::Ready {
-            label: "C#",
-            files: analyzable_file_count(analyzer, Language::CSharp),
-        }
+        ready_preflight(analyzer, Language::CSharp, "C#")
     }
 
     fn build(
@@ -1695,14 +1743,14 @@ impl DeadCodeBulkProof for CSharpDeadCodeBulk {
         candidates: &[CodeUnit],
     ) -> Option<DeadCodeBulkEdges> {
         let csharp = resolve_analyzer::<CSharpAnalyzer>(analyzer)?;
-        let callees = candidate_fqns(candidates);
-        cached_dead_code_usage_edges(
+        crate::analyzer::languages::build_fqn_dead_code_edges(
             analyzer,
             &csharp.memo_caches.dead_code_usage_edges,
-            &callees,
-            |token| build_inbound_csharp_usage_edges_with_completeness(analyzer, token, &callees),
+            candidates,
+            |token, callees| {
+                build_inbound_csharp_usage_edges_with_completeness(analyzer, token, callees)
+            },
         )
-        .map(DeadCodeBulkEdges::Fqn)
     }
 }
 
@@ -1724,29 +1772,13 @@ mod dead_code_cache_tests {
             .dead_code_usage_edges
             .insert(key.clone(), Arc::new(UsageEdges::default()));
 
-        let updated = analyzer.update(&std::collections::BTreeSet::new());
-        assert!(
-            updated
-                .memo_caches
-                .dead_code_usage_edges
-                .get(&key)
-                .is_none()
-        );
-        let rebuilt = analyzer.update_all();
-        assert!(
-            rebuilt
-                .memo_caches
-                .dead_code_usage_edges
-                .get(&key)
-                .is_none()
-        );
-        let overlay = analyzer.clone_with_project(fixture.project_dyn());
-        assert!(
-            overlay
-                .memo_caches
-                .dead_code_usage_edges
-                .get(&key)
-                .is_none()
+        crate::analyzer::test_support::assert_dead_code_cache_reset_after_update_paths(
+            &analyzer,
+            &key,
+            |analyzer| &analyzer.memo_caches.dead_code_usage_edges,
+            |analyzer| analyzer.update(&std::collections::BTreeSet::new()),
+            |analyzer| analyzer.update_all(),
+            |analyzer| analyzer.clone_with_project(fixture.project_dyn()),
         );
     }
 }

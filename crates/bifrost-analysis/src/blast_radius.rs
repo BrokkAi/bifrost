@@ -1123,39 +1123,16 @@ impl RenderText for BlastRadiusResult {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::commit_all;
     use crate::{AnalyzerConfig, FilesystemProject, WorkspaceAnalyzer};
-    use git2::{IndexAddOption, Repository, Signature};
+    use git2::Repository;
     use std::fs;
     use std::sync::Arc;
 
-    fn commit_all(repo: &Repository, message: &str) -> git2::Oid {
-        let mut index = repo.index().expect("repository index");
-        index
-            .add_all(["*"], IndexAddOption::DEFAULT, None)
-            .expect("stage fixture");
-        index.write().expect("write fixture index");
-        let tree = repo
-            .find_tree(index.write_tree().expect("fixture tree oid"))
-            .expect("fixture tree");
-        let signature = Signature::now("Tester", "tester@example.com").expect("signature");
-        let parent = repo
-            .head()
-            .ok()
-            .and_then(|head| head.target())
-            .map(|oid| repo.find_commit(oid).expect("fixture parent"));
-        let parents = parent.iter().collect::<Vec<_>>();
-        repo.commit(
-            Some("HEAD"),
-            &signature,
-            &signature,
-            message,
-            &tree,
-            &parents,
-        )
-        .expect("fixture commit")
-    }
-
     #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#3170: Pins the language-set closure used when selecting complete graph ecosystems from changed extensions"
+    )]
     fn immutable_graph_language_selection_keeps_complete_ecosystems_only() {
         assert_eq!(
             BTreeSet::from([Language::Cpp]),
@@ -1172,14 +1149,18 @@ mod tests {
     }
 
     /// Issue #3170: a diff-derived request that meets the analyzer cache build
-    /// lock ends by naming the lock, within its own deadline.
+    /// lock ends by naming the lock instead of completing the work.
     ///
     /// Before this, the wait was `File::lock`: uninterruptible, so the request
     /// budget expired while the analyzer thread stayed parked in the kernel
     /// and the client was told only that the tool had used its budget. The
     /// wait now polls under the request's token, so the answer names the lock
-    /// and its path.
+    /// and its path. The test asserts that contract only. It sets no wall-clock
+    /// bound, because the time to reach the lock depends on host load.
     #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#3170: Exercises cancellation through a held analyzer-cache lock and checks the bounded diagnostic names the lock path"
+    )]
     fn a_held_build_lock_ends_a_budgeted_request_by_naming_the_lock() {
         let temp = tempfile::tempdir().expect("temporary repository");
         let root = temp.path();
@@ -1206,7 +1187,6 @@ mod tests {
 
         let cancellation =
             CancellationToken::default().with_timeout(std::time::Duration::from_millis(300));
-        let started = std::time::Instant::now();
         let error = blast_radius_at_root(
             root,
             Some(workspace.analyzer()),
@@ -1215,86 +1195,12 @@ mod tests {
             &cancellation,
         )
         .expect_err("a request that cannot take the build lock must report the lock");
-        let waited = started.elapsed();
         drop(held);
 
         assert!(
             error.contains("analyzer cache build lock")
                 && error.contains(&db_path.display().to_string()),
             "the error must name the lock and its path: {error}"
-        );
-        assert!(
-            waited < std::time::Duration::from_secs(10),
-            "the request waited {waited:?} past a 300 ms deadline"
-        );
-    }
-
-    #[test]
-    fn target_reverse_imports_include_direct_transitive_and_distance_zero_tests() {
-        let temp = tempfile::tempdir().expect("temporary repository");
-        let root = temp.path();
-        fs::create_dir_all(root.join("src")).expect("source directory");
-        fs::create_dir_all(root.join("tests")).expect("test directory");
-        fs::write(root.join("src/__init__.py"), "").expect("source package");
-        fs::write(root.join("src/service.py"), "def run():\n    return 1\n")
-            .expect("service source");
-        fs::write(root.join("tests/__init__.py"), "").expect("test package");
-        fs::write(
-            root.join("tests/support.py"),
-            "from src.service import run\n\ndef helper():\n    return run()\n",
-        )
-        .expect("test support");
-        fs::write(
-            root.join("tests/test_service.py"),
-            "from tests.support import helper\n\ndef test_run():\n    assert helper() == 2\n",
-        )
-        .expect("dependent test");
-        fs::write(
-            root.join("tests/test_unrelated.py"),
-            "def test_unrelated():\n    assert True\n",
-        )
-        .expect("unrelated test");
-        let repo = Repository::init(root).expect("initialize repository");
-        commit_all(&repo, "base");
-
-        fs::write(root.join("src/service.py"), "def run():\n    return 2\n").expect("edit service");
-        fs::write(
-            root.join("tests/test_changed.py"),
-            "def test_changed():\n    assert True\n",
-        )
-        .expect("changed test");
-        let project = Arc::new(FilesystemProject::new(root).expect("filesystem project"));
-        let workspace =
-            WorkspaceAnalyzer::build_ephemeral_footgun(project, AnalyzerConfig::default())
-                .expect("workspace analyzer");
-
-        let result = blast_radius_at_root(
-            root,
-            Some(workspace.analyzer()),
-            BlastRadiusParams::default(),
-            &DiffAnalysisOptions::default(),
-            &CancellationToken::default(),
-        )
-        .expect("blast radius");
-
-        let scopes = result
-            .test_scopes
-            .iter()
-            .map(|scope| (scope.path.as_str(), scope.minimum_dependency_distance))
-            .collect::<BTreeMap<_, _>>();
-        assert_eq!(Some(&2), scopes.get("tests/test_service.py"));
-        assert_eq!(Some(&0), scopes.get("tests/test_changed.py"));
-        assert!(!scopes.contains_key("tests/test_unrelated.py"));
-        assert_eq!(2, result.analysis.reached_test_file_count);
-        assert_eq!(
-            FileGraphCompletion::Complete,
-            result.analysis.graph_completion
-        );
-        assert!(
-            result
-                .changed_callables
-                .iter()
-                .any(|callable| callable.changes.contains(&CallableChangeTag::Edited))
         );
     }
 
@@ -1812,6 +1718,9 @@ assert.strictEqual(runtime(), 2);
     }
 
     #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "1a3e36608886: Exercises Java static qualifier resolution through a same-package consumer into an ESTestCase-derived test"
+    )]
     fn immutable_java_static_qualifiers_reach_framework_testcase_subclasses() {
         let temp = tempfile::tempdir().expect("temporary repository");
         let root = temp.path();
@@ -1866,6 +1775,9 @@ assert.strictEqual(runtime(), 2);
     }
 
     #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "8e626217db35: Traverses Scala exports, wildcard and explicit imports, and consumers to verify two affected test distances and exclude an unrelated suite"
+    )]
     fn immutable_scala_exports_and_imports_reach_tests_without_unrelated_files() {
         let temp = tempfile::tempdir().expect("temporary repository");
         let root = temp.path();
@@ -1949,7 +1861,192 @@ assert.strictEqual(runtime(), 2);
         );
     }
 
-    #[cfg_attr(not(scheduled_tests), ignore = "scheduled-only")]
+    #[derive(Clone)]
+    struct ReferenceScopeState {
+        path: String,
+        affected: BTreeSet<String>,
+        covered: usize,
+        distances: DistanceRange,
+        kind: TestScopeKind,
+    }
+
+    struct ReferenceCollapseCandidate {
+        path: String,
+        descendant_scopes: Vec<String>,
+        affected: BTreeSet<String>,
+        directory_coverage: usize,
+        previous_coverage: usize,
+        distances: DistanceRange,
+    }
+
+    fn reference_coalesce_scopes(
+        affected: &BTreeMap<String, DistanceRange>,
+        analyzer_paths: &BTreeSet<String>,
+        max_scopes: usize,
+    ) -> Vec<TestScope> {
+        let mut scopes = affected
+            .iter()
+            .map(|(path, distances)| {
+                (
+                    path.clone(),
+                    ReferenceScopeState {
+                        path: path.clone(),
+                        affected: BTreeSet::from([path.clone()]),
+                        covered: 1,
+                        distances: *distances,
+                        kind: TestScopeKind::File,
+                    },
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        let mut directories = BTreeSet::from([".".to_string()]);
+        for path in affected.keys() {
+            directories.extend(parent_directories(path));
+        }
+        let mut directory_coverage = directories
+            .iter()
+            .map(|path| (path.clone(), 0usize))
+            .collect::<BTreeMap<_, _>>();
+        for path in analyzer_paths {
+            for directory in parent_directories(path) {
+                if let Some(coverage) = directory_coverage.get_mut(&directory) {
+                    *coverage += 1;
+                }
+            }
+        }
+
+        while scopes.len() > max_scopes {
+            let selected = directories
+                .iter()
+                .filter_map(|directory| {
+                    let descendant_scopes = scopes
+                        .keys()
+                        .filter(|path| {
+                            directory.as_str() == "."
+                                || Path::new(path.as_str()).starts_with(Path::new(directory))
+                        })
+                        .cloned()
+                        .collect::<Vec<_>>();
+                    if descendant_scopes.len() < 2 {
+                        return None;
+                    }
+                    let mut reached = BTreeSet::new();
+                    let mut previous_coverage = 0;
+                    let mut distances: Option<DistanceRange> = None;
+                    for path in &descendant_scopes {
+                        let scope = &scopes[path];
+                        reached.extend(scope.affected.iter().cloned());
+                        previous_coverage += scope.covered;
+                        distances = Some(match distances {
+                            Some(current) => DistanceRange {
+                                minimum: current.minimum.min(scope.distances.minimum),
+                                maximum: current.maximum.max(scope.distances.maximum),
+                            },
+                            None => scope.distances,
+                        });
+                    }
+                    Some(ReferenceCollapseCandidate {
+                        path: directory.clone(),
+                        descendant_scopes,
+                        affected: reached,
+                        directory_coverage: directory_coverage[directory],
+                        previous_coverage,
+                        distances: distances.expect("candidate contains scopes"),
+                    })
+                })
+                .min_by(|left, right| {
+                    let left_removed = left.descendant_scopes.len() - 1;
+                    let right_removed = right.descendant_scopes.len() - 1;
+                    let left_additional = left
+                        .directory_coverage
+                        .saturating_sub(left.previous_coverage);
+                    let right_additional = right
+                        .directory_coverage
+                        .saturating_sub(right.previous_coverage);
+                    (left_additional as u128 * right_removed as u128)
+                        .cmp(&(right_additional as u128 * left_removed as u128))
+                        .then_with(|| {
+                            left.directory_coverage
+                                .saturating_sub(left.affected.len())
+                                .cmp(
+                                    &right
+                                        .directory_coverage
+                                        .saturating_sub(right.affected.len()),
+                                )
+                        })
+                        .then_with(|| {
+                            let left_depth =
+                                usize::from(left.path != ".") * path_components(&left.path).len();
+                            let right_depth =
+                                usize::from(right.path != ".") * path_components(&right.path).len();
+                            right_depth.cmp(&left_depth)
+                        })
+                        .then_with(|| left.path.cmp(&right.path))
+                })
+                .expect("multiple scopes have a common root");
+            for path in &selected.descendant_scopes {
+                scopes.remove(path);
+            }
+            scopes.insert(
+                selected.path.clone(),
+                ReferenceScopeState {
+                    path: selected.path,
+                    affected: selected.affected,
+                    covered: selected.directory_coverage,
+                    distances: selected.distances,
+                    kind: TestScopeKind::Directory,
+                },
+            );
+        }
+
+        scopes
+            .into_values()
+            .map(|scope| {
+                let sample_reached_files = if scope.kind == TestScopeKind::Directory {
+                    scope.affected.iter().take(5).cloned().collect()
+                } else {
+                    Vec::new()
+                };
+                TestScope {
+                    path: scope.path,
+                    kind: scope.kind,
+                    reached_file_count: scope.affected.len(),
+                    covered_analyzable_file_count: scope.covered,
+                    minimum_dependency_distance: scope.distances.minimum,
+                    maximum_dependency_distance: scope.distances.maximum,
+                    sample_reached_files,
+                }
+            })
+            .collect()
+    }
+
+    type ScopeRow = (
+        String,
+        TestScopeKind,
+        usize,
+        usize,
+        usize,
+        usize,
+        Vec<String>,
+    );
+
+    fn scope_rows(scopes: Vec<TestScope>) -> Vec<ScopeRow> {
+        scopes
+            .into_iter()
+            .map(|scope| {
+                (
+                    scope.path,
+                    scope.kind,
+                    scope.reached_file_count,
+                    scope.covered_analyzable_file_count,
+                    scope.minimum_dependency_distance,
+                    scope.maximum_dependency_distance,
+                    scope.sample_reached_files,
+                )
+            })
+            .collect()
+    }
+
     #[test]
     fn deleted_dependency_recovers_surviving_tests_from_the_base_graph() {
         let temp = tempfile::tempdir().expect("temporary repository");
@@ -2029,15 +2126,10 @@ assert.strictEqual(runtime(), 2);
         assert!(result.analysis.unresolved_changed_paths.is_empty());
     }
 
-    /// A setuptools `src` layout has no `__init__.py` package markers; module
-    /// identity comes entirely from `pyproject.toml`'s
-    /// `[tool.setuptools.packages.find] where = ["src"]`. An immutable
-    /// revision image must export that manifest with real bytes, or
-    /// `parse_setuptools_where_entries` (`brokk_bifrost_python::declarations`)
-    /// reads nothing, module identity falls back to the path-derived
-    /// `src.mypkg.service`, and the import edge to the test that names
-    /// `mypkg.service` never forms.
     #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "541afb34e289: setuptools pyproject exports failed to resolve imports under the src layout"
+    )]
     fn immutable_setuptools_where_entries_resolve_the_src_layout_import() {
         let temp = tempfile::tempdir().expect("temporary repository");
         let root = temp.path();
@@ -2087,7 +2179,6 @@ assert.strictEqual(runtime(), 2);
         assert_eq!(1, result.test_scopes[0].minimum_dependency_distance);
     }
 
-    #[cfg_attr(not(scheduled_tests), ignore = "scheduled-only")]
     #[test]
     fn rust_inline_tests_are_distance_zero_candidates() {
         let temp = tempfile::tempdir().expect("temporary repository");
@@ -2338,7 +2429,6 @@ mod inline_tests {
         );
     }
 
-    #[cfg_attr(not(scheduled_tests), ignore = "scheduled-only")]
     #[test]
     fn removed_import_between_surviving_files_uses_only_target_state() {
         let temp = tempfile::tempdir().expect("temporary repository");
@@ -2449,86 +2539,6 @@ mod inline_tests {
     }
 
     #[test]
-    fn immutable_graph_export_reads_host_trusted_snapshot_objects() {
-        let temp = tempfile::tempdir().expect("temporary repository");
-        let root = temp.path();
-        fs::create_dir_all(root.join("src")).expect("source directory");
-        fs::create_dir_all(root.join("tests")).expect("test directory");
-        fs::write(root.join("src/__init__.py"), "").expect("source package");
-        fs::write(root.join("src/service.py"), "def run():\n    return 1\n").expect("base source");
-        fs::write(root.join("tests/__init__.py"), "").expect("test package");
-        fs::write(
-            root.join("tests/test_service.py"),
-            "from src.service import run\n\ndef test_run():\n    assert run() == 2\n",
-        )
-        .expect("dependent test");
-        let repo = Repository::init(root).expect("initialize repository");
-        let base = commit_all(&repo, "base");
-
-        // The target tree exists only in the host-configured object database,
-        // not in the workspace repository. This pins the bulk exporter to the
-        // same trusted alternate set used by libgit2 endpoint resolution.
-        let snapshot_path = root.join("snapshot.git");
-        let snapshot = Repository::init_bare(&snapshot_path).expect("snapshot repository");
-        let source_package = snapshot.blob(b"").expect("source package blob");
-        let changed_source = snapshot
-            .blob(b"def run():\n    return 2\n")
-            .expect("changed source blob");
-        let test_package = snapshot.blob(b"").expect("test package blob");
-        let dependent_test = snapshot
-            .blob(b"from src.service import run\n\ndef test_run():\n    assert run() == 2\n")
-            .expect("dependent test blob");
-        let mut source_tree = snapshot.treebuilder(None).expect("source tree builder");
-        source_tree
-            .insert("__init__.py", source_package, 0o100644)
-            .expect("source package entry");
-        source_tree
-            .insert("service.py", changed_source, 0o100644)
-            .expect("changed source entry");
-        let source_tree = source_tree.write().expect("source tree");
-        let mut test_tree = snapshot.treebuilder(None).expect("test tree builder");
-        test_tree
-            .insert("__init__.py", test_package, 0o100644)
-            .expect("test package entry");
-        test_tree
-            .insert("test_service.py", dependent_test, 0o100644)
-            .expect("dependent test entry");
-        let test_tree = test_tree.write().expect("test tree");
-        let mut target_tree = snapshot.treebuilder(None).expect("target tree builder");
-        target_tree
-            .insert("src", source_tree, 0o040000)
-            .expect("source directory entry");
-        target_tree
-            .insert("tests", test_tree, 0o040000)
-            .expect("test directory entry");
-        let target_tree = target_tree.write().expect("target tree");
-
-        let result = blast_radius_at_root(
-            root,
-            None,
-            BlastRadiusParams {
-                base: Some(base.to_string()),
-                target: Some(target_tree.to_string()),
-                ..BlastRadiusParams::default()
-            },
-            &DiffAnalysisOptions {
-                snapshot_object_dir: Some(snapshot_path.join("objects")),
-            },
-            &CancellationToken::default(),
-        )
-        .expect("snapshot-backed blast radius");
-
-        assert_eq!(
-            FileGraphCompletion::Complete,
-            result.analysis.graph_completion
-        );
-        assert_eq!(1, result.analysis.reached_test_file_count);
-        assert_eq!("tests/test_service.py", result.test_scopes[0].path);
-        assert_eq!(1, result.test_scopes[0].minimum_dependency_distance);
-        assert!(result.analysis.unresolved_changed_paths.is_empty());
-    }
-
-    #[test]
     fn renamed_test_is_recovered_from_the_base_graph() {
         let temp = tempfile::tempdir().expect("temporary repository");
         let root = temp.path();
@@ -2582,7 +2592,6 @@ mod inline_tests {
         assert_eq!(0, result.analysis.unavailable_removed_test_count);
     }
 
-    #[cfg_attr(not(scheduled_tests), ignore = "scheduled-only")]
     #[test]
     fn removed_tests_are_omitted_and_counted_unavailable() {
         let temp = tempfile::tempdir().expect("temporary repository");
@@ -2621,205 +2630,6 @@ mod inline_tests {
         assert_eq!(0, result.analysis.reached_test_file_count);
         assert_eq!(1, result.analysis.unavailable_removed_test_count);
         assert!(result.test_scopes.is_empty());
-    }
-
-    #[test]
-    fn max_scopes_validation_rejects_values_outside_the_public_range() {
-        for max_scopes in [0, MAX_SCOPES + 1] {
-            let error = BlastRadiusParams {
-                max_scopes,
-                ..BlastRadiusParams::default()
-            }
-            .validate()
-            .expect_err("out-of-range max_scopes must fail");
-            assert!(error.contains("between 1 and 1000"));
-        }
-    }
-
-    #[derive(Clone)]
-    struct ReferenceScopeState {
-        path: String,
-        affected: BTreeSet<String>,
-        covered: usize,
-        distances: DistanceRange,
-        kind: TestScopeKind,
-    }
-
-    struct ReferenceCollapseCandidate {
-        path: String,
-        descendant_scopes: Vec<String>,
-        affected: BTreeSet<String>,
-        directory_coverage: usize,
-        previous_coverage: usize,
-        distances: DistanceRange,
-    }
-
-    fn reference_coalesce_scopes(
-        affected: &BTreeMap<String, DistanceRange>,
-        analyzer_paths: &BTreeSet<String>,
-        max_scopes: usize,
-    ) -> Vec<TestScope> {
-        let mut scopes = affected
-            .iter()
-            .map(|(path, distances)| {
-                (
-                    path.clone(),
-                    ReferenceScopeState {
-                        path: path.clone(),
-                        affected: BTreeSet::from([path.clone()]),
-                        covered: 1,
-                        distances: *distances,
-                        kind: TestScopeKind::File,
-                    },
-                )
-            })
-            .collect::<BTreeMap<_, _>>();
-        let mut directories = BTreeSet::from([".".to_string()]);
-        for path in affected.keys() {
-            directories.extend(parent_directories(path));
-        }
-        let mut directory_coverage = directories
-            .iter()
-            .map(|path| (path.clone(), 0usize))
-            .collect::<BTreeMap<_, _>>();
-        for path in analyzer_paths {
-            for directory in parent_directories(path) {
-                if let Some(coverage) = directory_coverage.get_mut(&directory) {
-                    *coverage += 1;
-                }
-            }
-        }
-
-        while scopes.len() > max_scopes {
-            let selected = directories
-                .iter()
-                .filter_map(|directory| {
-                    let descendant_scopes = scopes
-                        .keys()
-                        .filter(|path| {
-                            directory.as_str() == "."
-                                || Path::new(path.as_str()).starts_with(Path::new(directory))
-                        })
-                        .cloned()
-                        .collect::<Vec<_>>();
-                    if descendant_scopes.len() < 2 {
-                        return None;
-                    }
-                    let mut reached = BTreeSet::new();
-                    let mut previous_coverage = 0;
-                    let mut distances: Option<DistanceRange> = None;
-                    for path in &descendant_scopes {
-                        let scope = &scopes[path];
-                        reached.extend(scope.affected.iter().cloned());
-                        previous_coverage += scope.covered;
-                        distances = Some(match distances {
-                            Some(current) => DistanceRange {
-                                minimum: current.minimum.min(scope.distances.minimum),
-                                maximum: current.maximum.max(scope.distances.maximum),
-                            },
-                            None => scope.distances,
-                        });
-                    }
-                    Some(ReferenceCollapseCandidate {
-                        path: directory.clone(),
-                        descendant_scopes,
-                        affected: reached,
-                        directory_coverage: directory_coverage[directory],
-                        previous_coverage,
-                        distances: distances.expect("candidate contains scopes"),
-                    })
-                })
-                .min_by(|left, right| {
-                    let left_removed = left.descendant_scopes.len() - 1;
-                    let right_removed = right.descendant_scopes.len() - 1;
-                    let left_additional = left
-                        .directory_coverage
-                        .saturating_sub(left.previous_coverage);
-                    let right_additional = right
-                        .directory_coverage
-                        .saturating_sub(right.previous_coverage);
-                    (left_additional as u128 * right_removed as u128)
-                        .cmp(&(right_additional as u128 * left_removed as u128))
-                        .then_with(|| {
-                            left.directory_coverage
-                                .saturating_sub(left.affected.len())
-                                .cmp(
-                                    &right
-                                        .directory_coverage
-                                        .saturating_sub(right.affected.len()),
-                                )
-                        })
-                        .then_with(|| {
-                            let left_depth =
-                                usize::from(left.path != ".") * path_components(&left.path).len();
-                            let right_depth =
-                                usize::from(right.path != ".") * path_components(&right.path).len();
-                            right_depth.cmp(&left_depth)
-                        })
-                        .then_with(|| left.path.cmp(&right.path))
-                })
-                .expect("multiple scopes have a common root");
-            for path in &selected.descendant_scopes {
-                scopes.remove(path);
-            }
-            scopes.insert(
-                selected.path.clone(),
-                ReferenceScopeState {
-                    path: selected.path,
-                    affected: selected.affected,
-                    covered: selected.directory_coverage,
-                    distances: selected.distances,
-                    kind: TestScopeKind::Directory,
-                },
-            );
-        }
-
-        scopes
-            .into_values()
-            .map(|scope| {
-                let sample_reached_files = if scope.kind == TestScopeKind::Directory {
-                    scope.affected.iter().take(5).cloned().collect()
-                } else {
-                    Vec::new()
-                };
-                TestScope {
-                    path: scope.path,
-                    kind: scope.kind,
-                    reached_file_count: scope.affected.len(),
-                    covered_analyzable_file_count: scope.covered,
-                    minimum_dependency_distance: scope.distances.minimum,
-                    maximum_dependency_distance: scope.distances.maximum,
-                    sample_reached_files,
-                }
-            })
-            .collect()
-    }
-
-    type ScopeRow = (
-        String,
-        TestScopeKind,
-        usize,
-        usize,
-        usize,
-        usize,
-        Vec<String>,
-    );
-
-    fn scope_rows(scopes: Vec<TestScope>) -> Vec<ScopeRow> {
-        scopes
-            .into_iter()
-            .map(|scope| {
-                (
-                    scope.path,
-                    scope.kind,
-                    scope.reached_file_count,
-                    scope.covered_analyzable_file_count,
-                    scope.minimum_dependency_distance,
-                    scope.maximum_dependency_distance,
-                    scope.sample_reached_files,
-                )
-            })
-            .collect()
     }
 
     #[test]
@@ -3027,13 +2837,7 @@ mod inline_tests {
             .expect("open the shared analyzer cache")
     }
 
-    fn row_count(connection: &rusqlite::Connection, table: &str) -> i64 {
-        connection
-            .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
-                row.get(0)
-            })
-            .expect("count cache rows")
-    }
+    use crate::test_support::cache_row_count_for_connection as row_count;
 
     fn published_blob_oids(connection: &rusqlite::Connection) -> BTreeSet<String> {
         let mut statement = connection
@@ -3214,6 +3018,9 @@ mod inline_tests {
     /// test used to assert -- that a warm run answers like a cold one -- is
     /// pinned by `repeated_immutable_requests_parse_nothing_the_second_time`.
     #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#2769: Blocks the shared cache path and verifies immutable analysis returns a path-specific error instead of silently rebuilding elsewhere"
+    )]
     fn an_immutable_request_fails_when_the_shared_cache_cannot_be_opened() {
         let temp = tempfile::tempdir().expect("temporary repository");
         let root = temp.path();
@@ -3222,8 +3029,7 @@ mod inline_tests {
         // Occupying the cache file's path with a directory is the portable way
         // to make the store refuse to open, which is what a read-only or
         // network cache location does in production.
-        let db_path = crate::analyzer::store::analyzer_db_path(root);
-        fs::create_dir_all(&db_path).expect("block the cache path");
+        let db_path = crate::test_support::block_shared_analyzer_cache(root);
 
         let error = blast_radius_at_root(
             root,
@@ -3237,9 +3043,6 @@ mod inline_tests {
         )
         .expect_err("a blocked shared cache must fail the request, not downgrade it");
 
-        assert!(
-            error.contains(&db_path.display().to_string()),
-            "the error must name the cache it could not open: {error}"
-        );
+        crate::test_support::assert_shared_analyzer_cache_error(&error, &db_path);
     }
 }

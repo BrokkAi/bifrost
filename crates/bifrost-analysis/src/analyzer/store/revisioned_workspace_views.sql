@@ -1,7 +1,7 @@
 -- The workspace projections, as TEMP views over the content-addressed tables.
 --
 -- Fact rows are keyed by an interned integer `blob_id` that only `blobs` can
--- mint (`.agents/plans/store-blob-id-interning.md`). `workspace_file_versions`
+-- mint. `workspace_file_versions`
 -- still stores the forty-character blob OID, because its rows outlive any one
 -- publication and a republished blob gets a new id. `live_workspace_files`
 -- therefore carries BOTH: the hex it read from the projection and the id its

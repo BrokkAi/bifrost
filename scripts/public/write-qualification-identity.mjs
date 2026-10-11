@@ -23,13 +23,10 @@
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { requireValue } from "../lib/value-validation.mjs";
 
 function required(name) {
-  const value = process.env[name];
-  if (!value) {
-    throw new Error(`${name} is required.`);
-  }
-  return value;
+  return requireValue(process.env[name], `${name} is required.`);
 }
 
 export function buildIdentity(env) {

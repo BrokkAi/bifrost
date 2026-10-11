@@ -291,6 +291,56 @@ mod tests {
     }
 
     #[test]
+    fn explicit_only_nodes_do_not_hide_predecessor_cycles() {
+        let error = SchemaVersionRegistry::new(&[
+            descriptor(1, None, true),
+            descriptor(2, Some(3), false),
+            descriptor(3, Some(2), true),
+        ])
+        .unwrap_err();
+
+        assert_eq!(
+            error,
+            SchemaVersionRegistryError::PredecessorCycle { version: 2 }
+        );
+    }
+
+    #[test]
+    fn forked_implicit_lineages_are_rejected() {
+        let error = SchemaVersionRegistry::new(&[
+            ROOT,
+            descriptor(3, Some(2), true),
+            descriptor(4, Some(2), true),
+        ])
+        .unwrap_err();
+
+        assert_eq!(
+            error,
+            SchemaVersionRegistryError::MultipleImplicitHeads {
+                versions: vec![3, 4],
+            }
+        );
+    }
+
+    #[test]
+    fn compatible_lineage_cannot_cross_an_explicit_only_version() {
+        let error = SchemaVersionRegistry::new(&[
+            ROOT,
+            descriptor(3, Some(2), false),
+            descriptor(4, Some(3), true),
+        ])
+        .unwrap_err();
+
+        assert_eq!(
+            error,
+            SchemaVersionRegistryError::IncompatibleImplicitPredecessor {
+                version: 4,
+                predecessor: 3,
+            }
+        );
+    }
+
+    #[test]
     fn omitted_and_explicit_versions_have_distinct_origins() {
         let registry = SchemaVersionRegistry::new(&[ROOT]).unwrap();
 
@@ -379,21 +429,6 @@ mod tests {
     }
 
     #[test]
-    fn explicit_only_nodes_do_not_hide_predecessor_cycles() {
-        let error = SchemaVersionRegistry::new(&[
-            descriptor(1, None, true),
-            descriptor(2, Some(3), false),
-            descriptor(3, Some(2), true),
-        ])
-        .unwrap_err();
-
-        assert_eq!(
-            error,
-            SchemaVersionRegistryError::PredecessorCycle { version: 2 }
-        );
-    }
-
-    #[test]
     fn registry_requires_an_implicit_head() {
         let error = SchemaVersionRegistry::new(&[descriptor(2, None, false)]).unwrap_err();
 
@@ -408,41 +443,6 @@ mod tests {
             error,
             SchemaVersionRegistryError::MultipleImplicitHeads {
                 versions: vec![2, 3],
-            }
-        );
-    }
-
-    #[test]
-    fn forked_implicit_lineages_are_rejected() {
-        let error = SchemaVersionRegistry::new(&[
-            ROOT,
-            descriptor(3, Some(2), true),
-            descriptor(4, Some(2), true),
-        ])
-        .unwrap_err();
-
-        assert_eq!(
-            error,
-            SchemaVersionRegistryError::MultipleImplicitHeads {
-                versions: vec![3, 4],
-            }
-        );
-    }
-
-    #[test]
-    fn compatible_lineage_cannot_cross_an_explicit_only_version() {
-        let error = SchemaVersionRegistry::new(&[
-            ROOT,
-            descriptor(3, Some(2), false),
-            descriptor(4, Some(3), true),
-        ])
-        .unwrap_err();
-
-        assert_eq!(
-            error,
-            SchemaVersionRegistryError::IncompatibleImplicitPredecessor {
-                version: 4,
-                predecessor: 3,
             }
         );
     }

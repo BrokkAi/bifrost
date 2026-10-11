@@ -1,16 +1,20 @@
 ---
 title: Helix LSP
-description: Configure Helix to run Bifrost as a stdio language server.
+description: Configure Helix to start the bifrost-lsp language server.
 ---
 
-Helix can run Bifrost directly through its built-in language-server configuration. No Bifrost-specific Helix plugin is required.
+Helix can start the Bifrost language server, `bifrost-lsp`, through its built-in language-server configuration. No Bifrost-specific Helix plugin is needed.
+
+:::caution[bifrost-lsp is not released yet]
+Bifrost built after release 0.12.0 does not serve LSP: `bifrost --lsp` exits with an error. The language server is now the separate `bifrost-lsp` program, and `bifrost-lsp` has no release yet. The configuration below is ready for its first release. See [LSP Server](/lsp/) for the status and for what to use until then.
+:::
 
 Put this in `~/.config/helix/languages.toml`, start Helix from the workspace root, and open a supported source file:
 
 ```toml
 [language-server.bifrost]
-command = "bifrost"
-args = ["--root", ".", "--lsp"]
+command = "bifrost-lsp"
+args = ["--root", "."]
 
 [[language]]
 name = "c"
@@ -73,35 +77,13 @@ name = "kotlin"
 language-servers = ["bifrost"]
 ```
 
-This assumes `bifrost` is installed on `PATH`:
+This assumes `bifrost-lsp` is on `PATH`. If it is not, set `command` to the absolute path of the binary.
 
-```bash
-cargo install brokk-bifrost --locked --force
-```
-
-For local development, build this checkout and use an absolute binary path:
-
-```bash
-cargo build --bin bifrost
-```
-
-Then update the Helix config:
-
-```toml
-[language-server.bifrost]
-command = "/path/to/bifrost/target/debug/bifrost"
-args = ["--root", ".", "--lsp"]
-
-[[language]]
-name = "java"
-language-servers = ["bifrost"]
-```
-
-Add the same `language-servers = ["bifrost"]` entry for the other languages you want Bifrost to handle.
+Bifrost handles only the languages that list `bifrost` in `language-servers`. Remove the entries for languages you do not want it to handle.
 
 ## Workspace Roots
 
-`--root` is the fallback workspace root. Helix sends the current working directory as `rootPath`, so `args = ["--root", ".", "--lsp"]` works when you start Helix from the repository root:
+`--root` is the fallback workspace root. Helix sends the current working directory as `rootPath`, so `args = ["--root", "."]` works when you start Helix from the repository root:
 
 ```bash
 cd /path/to/project
@@ -112,8 +94,8 @@ If you start Helix outside the project, pass an absolute root instead:
 
 ```toml
 [language-server.bifrost]
-command = "bifrost"
-args = ["--root", "/path/to/project", "--lsp"]
+command = "bifrost-lsp"
+args = ["--root", "/path/to/project"]
 ```
 
 Helix supports multiple language servers per language. If you want Bifrost to coexist with a language-specific server, include both names in that language's list:
@@ -144,11 +126,11 @@ hx -vvv --log /tmp/helix-bifrost.log src/main/java/example/App.java
 
 Open a supported file and use Helix's normal LSP navigation commands, such as `gd` for go to definition or `gr` for references. The log should show `initialize`, `textDocument/definition`, or `textDocument/references` messages for `bifrost`.
 
-For deeper Bifrost-side request timing in Helix's log, add debug environment variables to the language-server entry:
+For request timing from the server, set the two variables that the VS Code extension passes to `bifrost-lsp`. `BIFROST_LSP_DEBUG = "1"` logs every request and notification. `BIFROST_LSP_SLOW_MS` logs requests that take at least that many milliseconds; `0` logs all of them. The `bifrost` CLI does not read these variables. See [LSP Server](/lsp/).
 
 ```toml
 [language-server.bifrost]
-command = "bifrost"
-args = ["--root", ".", "--lsp"]
+command = "bifrost-lsp"
+args = ["--root", "."]
 environment = { BIFROST_LSP_DEBUG = "1", BIFROST_LSP_SLOW_MS = "0" }
 ```

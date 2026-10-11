@@ -1,5 +1,6 @@
 //! Demand-driven reverse queries sharing one selected inventory and fact session.
 
+use super::rust_reverse_rows::RustReverseCandidateSet;
 use super::*;
 use crate::analyzer::resolution::FactReverseReferenceBinding;
 
@@ -17,15 +18,46 @@ pub(crate) enum SelectedRustReverseBatchOutcome {
     Cancelled,
 }
 
+#[cfg(test)]
+fn test_reverse_source_does_not_own_sql_reader() -> ! {
+    unreachable!("test reverse source does not own a selected SQL reader")
+}
+
 /// Values returned inside this callback are provisional. Only the enclosing
 /// selected operation can authorize publication after its final authority check.
 pub(crate) trait SelectedRustReverseQueries {
-    fn candidate_files(&mut self, _targets: &[CodeUnit]) -> Result<Option<HashSet<ProjectFile>>> {
-        Err(StoreError::new(
-            "candidate admission requires crate-row discovery",
-        ))
-    }
-    fn references_to(&mut self, targets: &[CodeUnit]) -> Result<SelectedRustReverseBatchOutcome>;
+    /// The project's analysis generation, as this operation captured it when
+    /// it opened. `finish` checks it again before authorizing publication.
+    fn analysis_generation(&self) -> u64;
+
+    /// Enumerate each target's reverse candidates, one set per target in
+    /// order. None stops the query; a target without a selected definition
+    /// becomes this operation's unavailable outcome.
+    fn candidate_sets(
+        &mut self,
+        targets: &[CodeUnit],
+    ) -> Result<Option<Vec<RustReverseCandidateSet>>>;
+
+    /// Query one batch of targets with the sets `candidate_sets` returned for
+    /// them. A set is consumed here without being enumerated again, and may
+    /// come from an earlier selected operation.
+    fn references_to(
+        &mut self,
+        targets: &[CodeUnit],
+        candidates: &[RustReverseCandidateSet],
+    ) -> Result<SelectedRustReverseBatchOutcome>;
+
+    fn rust_cfg_activation_for_caller_under_site_cfg(
+        &mut self,
+        caller: &std::path::Path,
+        condition: &brokk_bifrost_core::analyzer::rust_facts::RustCfgCondition,
+        cancellation: &CancellationToken,
+    ) -> Result<
+        Option<(
+            brokk_bifrost_rust::selected_context::RustSelectedActivation,
+            bool,
+        )>,
+    >;
 
     /// Resolve requested canonical occurrences in this same selected session.
     /// None stops publication; the enclosing operation retains its terminal.
@@ -41,11 +73,11 @@ pub(crate) trait SelectedRustReverseQueries {
 
     #[cfg(test)]
     fn begin_sql_work_trace(&self) {
-        unreachable!("test reverse source does not own a selected SQL reader")
+        test_reverse_source_does_not_own_sql_reader()
     }
 
     #[cfg(test)]
     fn finish_sql_work_trace(&self) -> (usize, usize) {
-        unreachable!("test reverse source does not own a selected SQL reader")
+        test_reverse_source_does_not_own_sql_reader()
     }
 }

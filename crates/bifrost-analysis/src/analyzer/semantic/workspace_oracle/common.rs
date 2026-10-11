@@ -3,17 +3,17 @@
 use crate::analyzer::semantic::{
     EvidenceCompleteness, EvidenceHandle, EvidenceId, OracleContractError, ProcedureHandle,
     ProofStatus, SemanticArtifactCollector, SemanticBudget, SemanticBudgetExceeded,
-    SemanticExecutionBudget, SemanticProviderError, SemanticRequest, SemanticWork, ValueHandle,
-    ValueId,
+    SemanticCapability, SemanticExecutionBudget, SemanticProviderError, SemanticRequest,
+    SemanticWork, ValueHandle, ValueId,
 };
 
 #[derive(Debug)]
-pub(super) enum Interruption {
+pub(crate) enum Interruption {
     Budget(SemanticBudgetExceeded),
     Cancelled,
 }
 
-pub(super) struct WorkStager {
+pub(crate) struct WorkStager {
     pub(super) budget: SemanticBudget,
     pub(super) work: SemanticWork,
     execution: Option<SemanticExecutionBudget>,
@@ -63,6 +63,21 @@ pub(super) fn internal_contract(
     error: OracleContractError,
 ) -> SemanticProviderError {
     SemanticProviderError::internal(format!("{context}: {error}"))
+}
+
+pub(super) fn value_flow_core_capabilities_are_open(procedure: &ProcedureHandle) -> bool {
+    let capabilities = procedure.artifact().capabilities();
+    [
+        SemanticCapability::Values,
+        SemanticCapability::Assignments,
+        SemanticCapability::Allocations,
+        SemanticCapability::LocalFlow,
+        SemanticCapability::ParameterFlow,
+        SemanticCapability::ReceiverFlow,
+        SemanticCapability::ReturnFlow,
+    ]
+    .into_iter()
+    .any(|capability| !capabilities.is_available(capability))
 }
 
 pub(super) fn evidence_handle(

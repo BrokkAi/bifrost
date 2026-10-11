@@ -27,8 +27,7 @@
 #   scala-steward-org__scala-steward
 #   tokio-rs__tokio
 #
-# Regenerate with the `dump_pinned_plans_for_store` tooling described in
-# .agents/plans/issue-3016-analyzer-store-planner-statistics.md.
+# Regenerate with the `dump_pinned_plans_for_store` tool.
 analysis_epochs	analysis_epochs	5 1
 analysis_generation_sequence		1
 blob_meta	blob_meta	9676 1

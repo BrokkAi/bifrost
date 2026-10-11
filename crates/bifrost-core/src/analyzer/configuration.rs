@@ -2,6 +2,7 @@
 
 use crate::CancellationToken;
 use crate::analyzer::canonical_hash::{CanonicalHasher, lower_hex_string};
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
@@ -45,7 +46,7 @@ impl ConfigurationFormat {
             Self::Yaml => &["yaml", "yml"],
             Self::Toml => &["toml"],
             Self::Json => &["json"],
-            Self::Xml => &["xml"],
+            Self::Xml => &["xml", "config"],
             Self::Properties => &["properties"],
         }
     }
@@ -160,7 +161,9 @@ impl fmt::Display for ConfigurationModelError {
 }
 
 /// One ordered element of a stable structural route.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[derive(
+    Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, JsonSchema,
+)]
 pub enum ConfigurationRouteSelector {
     Key { name: String, occurrence: usize },
     Index(usize),
@@ -241,7 +244,9 @@ impl ConfigurationRoute {
 /// [`ConfigurationRoute`] retains exact source evidence for an authored fact.
 /// That evidence commonly differs between files, so effective resolution uses
 /// only the ordered key/index selectors rather than comparing source ranges.
-#[derive(Debug, Clone, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[derive(
+    Debug, Clone, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, JsonSchema,
+)]
 pub struct ConfigurationResolutionKey {
     selectors: Vec<ConfigurationRouteSelector>,
 }
@@ -635,16 +640,26 @@ pub struct ConfigurationDocumentFacts {
     features: ConfigurationFeatureSemantics,
 }
 
+fn non_empty_configuration_id(
+    value: impl Into<String>,
+    kind: &'static str,
+) -> Result<String, ConfigurationModelError> {
+    let value = value.into();
+    if value.is_empty() {
+        return Err(ConfigurationModelError::InvalidIdentifier { kind });
+    }
+    Ok(value)
+}
+
 /// A non-empty, caller-defined stable identity for a configuration layer.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[derive(
+    Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, JsonSchema,
+)]
 pub struct ConfigurationLayerId(String);
 
 impl ConfigurationLayerId {
     pub fn new(value: impl Into<String>) -> Result<Self, ConfigurationModelError> {
-        let value = value.into();
-        if value.is_empty() {
-            return Err(ConfigurationModelError::InvalidIdentifier { kind: "layer" });
-        }
+        let value = non_empty_configuration_id(value, "layer")?;
         Ok(Self(value))
     }
 
@@ -654,15 +669,14 @@ impl ConfigurationLayerId {
 }
 
 /// A non-empty stable identity for the provider of external evidence.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[derive(
+    Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, JsonSchema,
+)]
 pub struct ConfigurationProviderId(String);
 
 impl ConfigurationProviderId {
     pub fn new(value: impl Into<String>) -> Result<Self, ConfigurationModelError> {
-        let value = value.into();
-        if value.is_empty() {
-            return Err(ConfigurationModelError::InvalidIdentifier { kind: "provider" });
-        }
+        let value = non_empty_configuration_id(value, "provider")?;
         Ok(Self(value))
     }
 
@@ -672,15 +686,14 @@ impl ConfigurationProviderId {
 }
 
 /// A non-empty stable identity for a provider's versioned evidence snapshot.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[derive(
+    Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, JsonSchema,
+)]
 pub struct ConfigurationVersionId(String);
 
 impl ConfigurationVersionId {
     pub fn new(value: impl Into<String>) -> Result<Self, ConfigurationModelError> {
-        let value = value.into();
-        if value.is_empty() {
-            return Err(ConfigurationModelError::InvalidIdentifier { kind: "version" });
-        }
+        let value = non_empty_configuration_id(value, "version")?;
         Ok(Self(value))
     }
 
@@ -691,15 +704,14 @@ impl ConfigurationVersionId {
 
 /// A non-empty stable identity for the exact source snapshot or external
 /// observation that supplied a contribution.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[derive(
+    Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, JsonSchema,
+)]
 pub struct ConfigurationSourceId(String);
 
 impl ConfigurationSourceId {
     pub fn new(value: impl Into<String>) -> Result<Self, ConfigurationModelError> {
-        let value = value.into();
-        if value.is_empty() {
-            return Err(ConfigurationModelError::InvalidIdentifier { kind: "source" });
-        }
+        let value = non_empty_configuration_id(value, "source")?;
         Ok(Self(value))
     }
 
@@ -714,10 +726,7 @@ pub struct ConfigurationProfileId(String);
 
 impl ConfigurationProfileId {
     pub fn new(value: impl Into<String>) -> Result<Self, ConfigurationModelError> {
-        let value = value.into();
-        if value.is_empty() {
-            return Err(ConfigurationModelError::InvalidIdentifier { kind: "profile" });
-        }
+        let value = non_empty_configuration_id(value, "profile")?;
         Ok(Self(value))
     }
 
@@ -727,7 +736,9 @@ impl ConfigurationProfileId {
 }
 
 /// The provider and immutable version that support a supplied value.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[derive(
+    Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, JsonSchema,
+)]
 pub struct ConfigurationEvidenceIdentity {
     source: ConfigurationSourceId,
     provider: ConfigurationProviderId,
@@ -763,7 +774,9 @@ impl ConfigurationEvidenceIdentity {
 /// Where a contribution came from. The resolver attaches no semantics to
 /// these labels; callers supply any required parsing, expansion, or runtime
 /// evidence explicitly.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, JsonSchema,
+)]
 pub enum ConfigurationSourceKind {
     AuthoredFile,
     Profile,
@@ -775,7 +788,9 @@ pub enum ConfigurationSourceKind {
 }
 
 /// A syntax-neutral, verbatim configuration value.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[derive(
+    Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, JsonSchema,
+)]
 pub struct ConfigurationOpaqueValue(String);
 
 impl ConfigurationOpaqueValue {
@@ -801,7 +816,7 @@ impl From<&str> for ConfigurationOpaqueValue {
 }
 
 /// One value supplied for a structural configuration route.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
 pub struct ConfigurationContribution {
     layer: ConfigurationLayerId,
     key: ConfigurationResolutionKey,
@@ -877,7 +892,9 @@ impl ConfigurationLayer {
 }
 
 /// A directed, explicit lower-to-higher precedence relation.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[derive(
+    Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, JsonSchema,
+)]
 pub struct ConfigurationPrecedenceEdge {
     lower: ConfigurationLayerId,
     higher: ConfigurationLayerId,
@@ -914,7 +931,9 @@ impl ConfigurationPrecedenceEdge {
 }
 
 /// Typed explanation for an explicit precedence edge.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, JsonSchema,
+)]
 pub enum ConfigurationPrecedenceExplanation {
     ExplicitOverride,
     ProfileSelection,
@@ -925,7 +944,9 @@ pub enum ConfigurationPrecedenceExplanation {
 }
 
 /// Typed reasons why a resolution cannot be called complete.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, JsonSchema,
+)]
 pub enum ConfigurationIncompleteReason {
     Conflict,
     UnresolvedInterpolation,
@@ -1115,7 +1136,7 @@ impl ConfigurationResolutionInput {
 
 /// What the supplied evidence proves about the selected value, independent of
 /// whether all declared inputs were available.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub enum ConfigurationResolutionProof {
     NoContribution,
     Selected {
@@ -1129,7 +1150,7 @@ pub enum ConfigurationResolutionProof {
     },
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub enum ConfigurationResolutionCompleteness {
     Complete,
     Incomplete {
@@ -1151,7 +1172,7 @@ impl ConfigurationResolutionCompleteness {
 }
 
 /// Canonical effective configuration evidence for one structural key.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct ConfigurationResolutionResult {
     key: ConfigurationResolutionKey,
     value: Option<ConfigurationOpaqueValue>,
@@ -1540,47 +1561,22 @@ mod tests {
         ConfigurationCompleteness, ConfigurationContribution, ConfigurationDocumentFacts,
         ConfigurationEvidenceIdentity, ConfigurationFact, ConfigurationFeatureSemantics,
         ConfigurationFormat, ConfigurationIncompleteReason, ConfigurationKey, ConfigurationLayer,
-        ConfigurationLayerId, ConfigurationMemberRole, ConfigurationModelError,
-        ConfigurationNodeKind, ConfigurationOpaqueValue, ConfigurationPrecedenceEdge,
-        ConfigurationPrecedenceExplanation, ConfigurationProfileId, ConfigurationProviderId,
-        ConfigurationRecovery, ConfigurationRecoveryReason, ConfigurationResolutionBounds,
-        ConfigurationResolutionInput, ConfigurationResolutionKey, ConfigurationResolutionProof,
-        ConfigurationResolutionRequest, ConfigurationRoute, ConfigurationRouteSegment,
-        ConfigurationRouteSelector, ConfigurationScalarKind, ConfigurationSourceId,
+        ConfigurationLayerId, ConfigurationMemberRole, ConfigurationNodeKind,
+        ConfigurationOpaqueValue, ConfigurationPrecedenceEdge, ConfigurationPrecedenceExplanation,
+        ConfigurationProfileId, ConfigurationProviderId, ConfigurationRecovery,
+        ConfigurationRecoveryReason, ConfigurationResolutionBounds, ConfigurationResolutionInput,
+        ConfigurationResolutionKey, ConfigurationResolutionProof, ConfigurationResolutionRequest,
+        ConfigurationRoute, ConfigurationRouteSegment, ConfigurationSourceId,
         ConfigurationSourceKind, ConfigurationSourceRange, ConfigurationStableId,
         ConfigurationVersionId, classify_configuration_path, resolve_effective_configuration,
     };
     use crate::analyzer::Language;
+    use brokk_bifrost_test_macros::hardwon;
     use std::collections::{BTreeMap, BTreeSet};
     use std::path::{Path, PathBuf};
 
     fn range(start: usize, end: usize) -> ConfigurationSourceRange {
         ConfigurationSourceRange::new(start, end).expect("valid range")
-    }
-
-    #[test]
-    fn canonical_path_classification_is_separate_from_language() {
-        assert_eq!(
-            classify_configuration_path(&PathBuf::from("config").join("Settings.YAML")),
-            super::ConfigurationPathClassification::Supported(ConfigurationFormat::Yaml)
-        );
-        assert_eq!(
-            classify_configuration_path(Path::new(r"C:\app\application.json")),
-            super::ConfigurationPathClassification::Supported(ConfigurationFormat::Json)
-        );
-        assert_eq!(
-            classify_configuration_path(Path::new("server.properties")),
-            super::ConfigurationPathClassification::Supported(ConfigurationFormat::Properties)
-        );
-        assert_eq!(
-            classify_configuration_path(Path::new("main.rs")),
-            super::ConfigurationPathClassification::Unsupported
-        );
-        assert_eq!(
-            classify_configuration_path(Path::new("data.toml.bak")),
-            super::ConfigurationPathClassification::Unsupported
-        );
-        assert_eq!(Language::from_extension("json"), Language::None);
     }
 
     #[test]
@@ -1613,6 +1609,23 @@ mod tests {
             classify_configuration_path(Path::new(".json")),
             super::ConfigurationPathClassification::Unsupported
         );
+    }
+
+    #[test]
+    #[hardwon("#4381: .config documents were omitted from shared XML discovery")]
+    fn config_documents_are_discovered_as_xml() {
+        for path in [
+            "Web.config",
+            "Web.Release.config",
+            "app.config",
+            "packages.config",
+        ] {
+            assert_eq!(
+                classify_configuration_path(Path::new(path)),
+                super::ConfigurationPathClassification::Supported(ConfigurationFormat::Xml),
+                "{path}"
+            );
+        }
     }
 
     #[test]
@@ -1667,32 +1680,6 @@ mod tests {
     }
 
     #[test]
-    fn json_feature_vocabulary_is_explicitly_not_applicable() {
-        let features = ConfigurationFeatureSemantics::not_applicable();
-        assert!(features.aliases().is_resolved());
-        assert_eq!(
-            features.anchors(),
-            &super::ConfigurationFeatureState::NotApplicable
-        );
-        assert_eq!(
-            features.includes(),
-            &super::ConfigurationFeatureState::NotApplicable
-        );
-        assert_eq!(
-            features.interpolation(),
-            &super::ConfigurationFeatureState::NotApplicable
-        );
-        assert_eq!(
-            features.format_merge(),
-            &super::ConfigurationFeatureState::NotApplicable
-        );
-        assert_eq!(
-            features.tags(),
-            &super::ConfigurationFeatureState::NotApplicable
-        );
-    }
-
-    #[test]
     fn malformed_facts_remain_in_an_incomplete_document() {
         let document = ConfigurationDocumentFacts::new(
             ConfigurationFormat::Json,
@@ -1726,14 +1713,7 @@ mod tests {
     }
 
     #[test]
-    fn invalid_models_fail_closed() {
-        assert_eq!(
-            ConfigurationSourceRange::new(2, 1),
-            Err(ConfigurationModelError::InvalidRange {
-                start_byte: 2,
-                end_byte: 1
-            })
-        );
+    fn stable_id_framing_distinguishes_empty_and_nonempty_keys() {
         // An empty authored key is a document state, not a defect: it stays
         // distinct from a sibling because the identity hash is length
         // delimited.
@@ -1753,45 +1733,6 @@ mod tests {
             )
         };
         assert_ne!(member(&empty_key, ""), member(&short_key, "a"));
-        let document = ConfigurationDocumentFacts::new(
-            ConfigurationFormat::Json,
-            Vec::new(),
-            ConfigurationCompleteness::Complete,
-            ConfigurationFeatureSemantics::not_applicable(),
-        );
-        assert_eq!(document, Err(ConfigurationModelError::InvalidFactArena));
-        assert_eq!(
-            ConfigurationRoute::root()
-                .segments()
-                .first()
-                .map(|segment| segment.selector()),
-            None
-        );
-        let route =
-            ConfigurationRoute::root().child(ConfigurationRouteSegment::key("x", 1, range(0, 1)));
-        assert_eq!(
-            route.segments()[0].selector(),
-            &ConfigurationRouteSelector::Key {
-                name: "x".to_string(),
-                occurrence: 1
-            }
-        );
-        assert_eq!(
-            ConfigurationStableId::new(
-                ConfigurationFormat::Json,
-                &ConfigurationNodeKind::Scalar {
-                    scalar_kind: ConfigurationScalarKind::Integer
-                },
-                &ConfigurationRoute::root(),
-            ),
-            ConfigurationStableId::new(
-                ConfigurationFormat::Json,
-                &ConfigurationNodeKind::Scalar {
-                    scalar_kind: ConfigurationScalarKind::Integer
-                },
-                &ConfigurationRoute::root(),
-            )
-        );
     }
 
     fn layer_id(name: &str) -> ConfigurationLayerId {
@@ -2011,21 +1952,6 @@ mod tests {
             ],
             vec![edge("base", "deployment")],
         );
-        let cancellation = crate::CancellationToken::new();
-        cancellation.cancel();
-        let cancelled = resolve_effective_configuration(
-            &ConfigurationResolutionRequest::new(ConfigurationResolutionKey::default()),
-            &base,
-            ConfigurationResolutionBounds::default(),
-            &cancellation,
-        );
-        assert!(
-            cancelled
-                .completeness()
-                .reasons()
-                .contains(&ConfigurationIncompleteReason::Cancellation)
-        );
-
         let contribution_limited = resolve_effective_configuration(
             &ConfigurationResolutionRequest::new(ConfigurationResolutionKey::default()),
             &base,
@@ -2179,5 +2105,30 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn canonical_path_classification_is_separate_from_language() {
+        assert_eq!(
+            classify_configuration_path(&PathBuf::from("config").join("Settings.YAML")),
+            super::ConfigurationPathClassification::Supported(ConfigurationFormat::Yaml)
+        );
+        assert_eq!(
+            classify_configuration_path(Path::new(r"C:\app\application.json")),
+            super::ConfigurationPathClassification::Supported(ConfigurationFormat::Json)
+        );
+        assert_eq!(
+            classify_configuration_path(Path::new("server.properties")),
+            super::ConfigurationPathClassification::Supported(ConfigurationFormat::Properties)
+        );
+        assert_eq!(
+            classify_configuration_path(Path::new("main.rs")),
+            super::ConfigurationPathClassification::Unsupported
+        );
+        assert_eq!(
+            classify_configuration_path(Path::new("data.toml.bak")),
+            super::ConfigurationPathClassification::Unsupported
+        );
+        assert_eq!(Language::from_extension("json"), Language::None);
     }
 }

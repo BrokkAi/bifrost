@@ -7,7 +7,9 @@
 //! `left`, ...) point at either another fact or, when the target expression is
 //! not itself normalized, at a raw source span.
 
-pub use brokk_bifrost_core::analyzer::structural::facts::Span;
+pub use brokk_bifrost_core::analyzer::structural::facts::{
+    AssignmentSequenceKind, AssignmentShape, IntegerLiteralValue, Span,
+};
 
 use brokk_bifrost_core::analyzer::source_facts::SourceFactRows;
 use brokk_bifrost_core::analyzer::structural::facts::StructuralFactRows;
@@ -38,6 +40,12 @@ pub struct RoleTarget {
 pub struct NormalizedNode {
     pub kind: NormalizedKind,
     pub boolean_value: Option<bool>,
+    pub parenthesized: Option<bool>,
+    pub assignment_shape: Option<AssignmentShape>,
+    pub integer_literal_value: Option<IntegerLiteralValue>,
+    pub duplicate_key: Option<bool>,
+    pub is_async: Option<bool>,
+    pub string_value: Option<String>,
     pub construct: Option<String>,
     pub range: Range,
     pub parent: Option<u32>,
@@ -52,6 +60,43 @@ impl NormalizedNode {
             start_byte: self.range.start_byte,
             end_byte: self.range.end_byte,
         }
+    }
+}
+
+/// One region tree-sitter error recovery produced: an outermost `ERROR` node,
+/// or a zero-width `MISSING` token (#3777). A node of any kind inside an
+/// `ERROR` region may have produced no fact.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RecoveredRegion {
+    pub range: Range,
+    /// Whether a callable fact's range contains the region: its body, its
+    /// signature or a default value. The store answers this in SQL from the
+    /// persisted rows when it hydrates them. `None` when these facts were
+    /// built from a parse the store has not answered for.
+    pub inside_callable: Option<bool>,
+}
+
+impl RecoveredRegion {
+    /// Whether this region could hold a node of one of `kinds` that recovery
+    /// left without a fact, so a selection of those kinds that finds nothing
+    /// in the file is not a complete answer for it.
+    ///
+    /// The rule follows [`NormalizedKind::is_statement_level`]. A selection
+    /// whose every kind is statement-level is hidden only by a region inside
+    /// a callable. A selection with any other kind, or with no kind
+    /// constraint, is hidden by every region. A region whose containment the
+    /// store has not answered may be inside a callable.
+    pub fn may_hide(&self, kinds: &[NormalizedKind]) -> bool {
+        if !kinds.is_empty()
+            && kinds
+                .iter()
+                .all(|kind| *kind == NormalizedKind::SyntaxError)
+        {
+            return false;
+        }
+        let statement_level =
+            !kinds.is_empty() && kinds.iter().all(|kind| kind.is_statement_level());
+        !statement_level || self.inside_callable != Some(false)
     }
 }
 
@@ -129,7 +174,35 @@ impl NormalizedNode {
 /// scope facts (#3547).
 /// Version 28 classifies C and C++ binders and adds their block, switch and
 /// range-`for` scope facts (#3544, #3545).
-pub(crate) const STRUCTURAL_FACTS_VERSION: i64 = 28;
+/// Version 29 records decoded values for normalized string literals.
+/// Version 29 records the regions tree-sitter error recovery produced, each
+/// outermost `ERROR` node and `MISSING` token, as recovered-region rows
+/// (#3777). Older facts cannot say whether recovery removed a node.
+/// Version 30 stores nested Python regex facts and recovery-derived comments/errors.
+/// Version 31 adds Python comparison/binary facts and string parenthesization.
+/// Version 32 adds Python parameter/directive kinds and paired assignment shapes.
+/// Version 33 adds canonical integer-literal values.
+/// Version 34 bounds decimal spellings and stores integer permission bits.
+/// Version 35 records duplicate-key status on Python dictionary entries.
+/// Version 36 adds tuple-literal facts alongside the Python literal facts.
+/// Version 37 seals the combined 2026-10-03 structural-facts generation.
+/// Version 38 adds decoded Python strings and the distinct list-literal kind.
+/// Version 39 adds origin vocabulary and polynomial Python regex-risk facts.
+/// Version 40 combines those with local facts and vocabulary.
+/// Version 41 combines local version-40 facts with origin async-callable and await-node facts.
+/// Version 42 adds Python module roots to normalized declaration facts.
+/// Version 43 combines version 42 with C# field modifiers and initializers,
+/// integer and string literal values, the distinct character-literal kind,
+/// and assignment-operator and element-access roles (#4380, #4382).
+/// Version 44 publishes Java underscore patterns and exact Rust macro-derived
+/// call-shape coverage for selectors (#4366).
+/// Version 45 adds JS/TS decoded string and template literals, constructor
+/// call kinds, named function binders, object-method properties, and
+/// collection and parameter positions (#4386, #4387, #4388).
+/// Version 47 combines the signed integer literal values for repeated-literal
+/// aggregation with Java enhanced-for binder classification. These changes
+/// diverged as version 46 on the two branches.
+pub(crate) const STRUCTURAL_FACTS_VERSION: i64 = 47;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct StructuralFactsPersistenceError(String);
@@ -160,6 +233,12 @@ pub(crate) struct PersistedStructuralNode {
     /// `NormalizedKind::code()`, decoded in `from_persisted_rows`.
     pub(crate) kind: u8,
     pub(crate) boolean_value: Option<bool>,
+    pub(crate) parenthesized: Option<bool>,
+    pub(crate) assignment_shape: Option<AssignmentShape>,
+    pub(crate) integer_literal_value: Option<IntegerLiteralValue>,
+    pub(crate) duplicate_key: Option<bool>,
+    pub(crate) is_async: Option<bool>,
+    pub(crate) string_value: Option<String>,
     pub(crate) construct: Option<String>,
     pub(crate) span: PersistedSpan,
     pub(crate) parent: Option<u32>,
@@ -196,12 +275,21 @@ pub(crate) struct PersistedOccurrenceRole {
     pub(crate) role: u8,
 }
 
+/// One `source_structural_recovered_regions` row with the store's answer to
+/// whether a callable fact contains it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct PersistedRecoveredRegion {
+    pub(crate) span: PersistedSpan,
+    pub(crate) inside_callable: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct PersistedStructuralFacts {
     pub(crate) source_bytes: u32,
     pub(crate) nodes: Vec<PersistedStructuralNode>,
     pub(crate) roles: Vec<PersistedStructuralRole>,
     pub(crate) occurrence_roles: Vec<PersistedOccurrenceRole>,
+    pub(crate) recovered_regions: Vec<PersistedRecoveredRegion>,
 }
 
 #[cfg(test)]
@@ -243,6 +331,33 @@ fn line_of_byte(line_starts: &[usize], byte: usize) -> usize {
     line_starts.partition_point(|&start| start <= byte)
 }
 
+fn is_canonical_integer_decimal(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    !bytes.is_empty()
+        && ((bytes[0] == b'0' && bytes.len() == 1)
+            || (matches!(bytes[0], b'1'..=b'9')
+                && bytes[1..].iter().all(|byte| byte.is_ascii_digit())))
+}
+
+fn is_valid_integer_literal_value(value: &IntegerLiteralValue) -> bool {
+    value.decimal.as_deref().is_none_or(|decimal| {
+        is_canonical_integer_decimal(decimal)
+            && if value.negative {
+                0u32.wrapping_sub(decimal_low_bits(decimal)) == value.low_bits
+            } else {
+                decimal_low_bits(decimal) == value.low_bits
+            }
+    })
+}
+
+fn decimal_low_bits(value: &str) -> u32 {
+    value.bytes().fold(0u32, |low_bits, digit| {
+        debug_assert!(digit.is_ascii_digit());
+        let next = u64::from(low_bits) * 10 + u64::from(digit - b'0');
+        u32::try_from(next & u64::from(u32::MAX)).expect("masked integer literal bits fit in u32")
+    })
+}
+
 fn materialize_rows(
     source_facts: &SourceFactRows,
     rows: &StructuralFactRows,
@@ -253,6 +368,12 @@ fn materialize_rows(
         .map(|node| NormalizedNode {
             kind: node.kind,
             boolean_value: node.boolean_value,
+            parenthesized: node.parenthesized,
+            assignment_shape: node.assignment_shape,
+            integer_literal_value: node.integer_literal_value.clone(),
+            duplicate_key: node.duplicate_key,
+            is_async: node.is_async,
+            string_value: node.string_value.clone(),
             construct: node.construct.clone(),
             range: source_facts.occurrence(node.occurrence).range,
             parent: node.parent,
@@ -299,6 +420,61 @@ fn materialize_rows(
     (nodes, roles.finish())
 }
 
+fn append_empty_rows<T: Clone>(rows: CompactRows<T>, count: usize) -> CompactRows<T> {
+    let mut builder =
+        CompactRowsBuilder::with_capacity(rows.rows().saturating_add(count), rows.len());
+    for row in 0..rows.rows() {
+        builder.push_row(rows.row(row).iter().cloned());
+    }
+    for _ in 0..count {
+        builder.finish_row();
+    }
+    builder.finish()
+}
+
+fn append_syntax_error_facts(
+    mut nodes: Vec<NormalizedNode>,
+    roles: CompactRows<RoleTarget>,
+    occurrence_roles: CompactRows<OccurrenceRole>,
+    recovered_regions: &[RecoveredRegion],
+) -> (
+    Vec<NormalizedNode>,
+    CompactRows<RoleTarget>,
+    CompactRows<OccurrenceRole>,
+) {
+    if recovered_regions.is_empty() {
+        return (nodes, roles, occurrence_roles);
+    }
+
+    let error_count = recovered_regions.len();
+    let roles = append_empty_rows(roles, error_count);
+    let occurrence_roles = append_empty_rows(occurrence_roles, error_count);
+    for region in recovered_regions {
+        let node_id = u32::try_from(nodes.len())
+            .expect("structural fact ids must fit in u32 before allocation");
+        let subtree_end = node_id
+            .checked_add(1)
+            .expect("synthetic syntax-error fact id must leave room for its subtree end");
+        nodes.push(NormalizedNode {
+            kind: NormalizedKind::SyntaxError,
+            boolean_value: None,
+            parenthesized: None,
+            assignment_shape: None,
+            integer_literal_value: None,
+            duplicate_key: None,
+            is_async: None,
+            string_value: None,
+            construct: None,
+            range: region.range,
+            parent: None,
+            name: None,
+            subtree_end,
+            call_site: None,
+        });
+    }
+    (nodes, roles, occurrence_roles)
+}
+
 /// All normalized facts for one file. `source` is a private copy so spans stay
 /// valid however the analyzer's own file state evolves; `line_starts` maps
 /// byte offsets to 1-based lines for capture reporting.
@@ -310,6 +486,7 @@ pub struct FileFacts {
     nodes: Vec<NormalizedNode>,
     roles: CompactRows<RoleTarget>,
     occurrence_roles: CompactRows<OccurrenceRole>,
+    recovered_regions: Vec<RecoveredRegion>,
 }
 
 impl FileFacts {
@@ -319,12 +496,44 @@ impl FileFacts {
         nodes: Vec<NormalizedNode>,
         roles: CompactRows<RoleTarget>,
         occurrence_roles: CompactRows<OccurrenceRole>,
+        recovered_regions: Vec<RecoveredRegion>,
     ) -> Self {
         assert_eq!(roles.rows(), nodes.len());
         assert_eq!(occurrence_roles.rows(), nodes.len());
         assert!(nodes.iter().all(
             |node| node.boolean_value.is_none() || node.kind == NormalizedKind::BooleanLiteral
         ));
+        assert!(nodes.iter().all(|node| {
+            node.parenthesized.is_none() || node.kind == NormalizedKind::StringLiteral
+        }));
+        assert!(nodes.iter().all(|node| {
+            node.assignment_shape.is_none() || node.kind == NormalizedKind::Assignment
+        }));
+        assert!(nodes.iter().all(|node| {
+            node.integer_literal_value.as_ref().is_none_or(|value| {
+                node.kind == NormalizedKind::NumericLiteral && is_valid_integer_literal_value(value)
+            })
+        }));
+        assert!(nodes.iter().all(|node| {
+            node.duplicate_key.is_none() || node.kind == NormalizedKind::ObjectProperty
+        }));
+        assert!(nodes.iter().all(|node| {
+            node.string_value.is_none() || node.kind == NormalizedKind::StringLiteral
+        }));
+        assert!(
+            nodes
+                .iter()
+                .all(|node| node.string_value.is_none()
+                    || node.kind == NormalizedKind::StringLiteral),
+            "string values must be attached only to string literals: {nodes:?}"
+        );
+        assert!(
+            recovered_regions
+                .iter()
+                .all(|region| region.range.end_byte <= source.len()),
+            "recovered regions must lie inside the {}-byte source: {recovered_regions:?}",
+            source.len()
+        );
         let source_identity = ContentIdentity::hash_bytes(source.as_bytes());
         Self {
             source,
@@ -333,9 +542,12 @@ impl FileFacts {
             nodes,
             roles,
             occurrence_roles,
+            recovered_regions,
         }
     }
 
+    /// Facts built from a parse rather than read from the store, so no
+    /// recovered region has a containment answer.
     pub(crate) fn from_source_and_rows(
         source: String,
         source_facts: SourceFactRows,
@@ -343,8 +555,29 @@ impl FileFacts {
     ) -> Self {
         let line_starts = compute_line_starts(&source);
         let (nodes, roles) = materialize_rows(&source_facts, &rows);
-        let (_, _, occurrence_roles) = rows.into_parts();
-        Self::new(source, line_starts, nodes, roles, occurrence_roles)
+        let (_, _, occurrence_roles, recovered_regions) = rows.into_parts();
+        let recovered_regions = recovered_regions
+            .into_iter()
+            .map(|span| RecoveredRegion {
+                range: Range {
+                    start_byte: span.start_byte,
+                    end_byte: span.end_byte,
+                    start_line: line_of_byte(&line_starts, span.start_byte),
+                    end_line: line_of_byte(&line_starts, span.end_byte),
+                },
+                inside_callable: None,
+            })
+            .collect::<Vec<_>>();
+        let (nodes, roles, occurrence_roles) =
+            append_syntax_error_facts(nodes, roles, occurrence_roles, &recovered_regions);
+        Self::new(
+            source,
+            line_starts,
+            nodes,
+            roles,
+            occurrence_roles,
+            recovered_regions,
+        )
     }
 
     pub fn source(&self) -> &str {
@@ -362,9 +595,20 @@ impl FileFacts {
         let source_bytes = u32::try_from(self.source.len()).map_err(|_| {
             StructuralFactsPersistenceError::invalid("structural source length exceeds u32")
         })?;
+        let persisted_node_count = self
+            .nodes
+            .iter()
+            .position(|node| node.kind == NormalizedKind::SyntaxError)
+            .unwrap_or(self.nodes.len());
+        assert!(
+            self.nodes[persisted_node_count..]
+                .iter()
+                .all(|node| node.kind == NormalizedKind::SyntaxError)
+        );
         let nodes = self
             .nodes
             .iter()
+            .take(persisted_node_count)
             .enumerate()
             .map(|(node_id, node)| {
                 Ok(PersistedStructuralNode {
@@ -375,6 +619,12 @@ impl FileFacts {
                     })?,
                     kind: node.kind.code(),
                     boolean_value: node.boolean_value,
+                    parenthesized: node.parenthesized,
+                    assignment_shape: node.assignment_shape,
+                    integer_literal_value: node.integer_literal_value.clone(),
+                    duplicate_key: node.duplicate_key,
+                    is_async: node.is_async,
+                    string_value: node.string_value.clone(),
                     construct: node.construct.clone(),
                     span: persist_span(node.span())?,
                     parent: node.parent,
@@ -389,7 +639,7 @@ impl FileFacts {
             })
             .collect::<Result<Vec<_>, StructuralFactsPersistenceError>>()?;
         let mut roles = Vec::with_capacity(self.roles.len());
-        for source_node_id in 0..self.nodes.len() {
+        for source_node_id in 0..persisted_node_count {
             let source_node_id = u32::try_from(source_node_id).map_err(|_| {
                 StructuralFactsPersistenceError::invalid("structural node count exceeds u32")
             })?;
@@ -409,7 +659,7 @@ impl FileFacts {
             }
         }
         let mut occurrence_roles = Vec::with_capacity(self.occurrence_role_count());
-        for node_id in 0..self.nodes.len() {
+        for node_id in 0..persisted_node_count {
             let node_id = u32::try_from(node_id).map_err(|_| {
                 StructuralFactsPersistenceError::invalid("structural node count exceeds u32")
             })?;
@@ -425,11 +675,29 @@ impl FileFacts {
                 });
             }
         }
+        let recovered_regions = self
+            .recovered_regions
+            .iter()
+            .map(|region| {
+                Ok(PersistedRecoveredRegion {
+                    span: persist_span(Span {
+                        start_byte: region.range.start_byte,
+                        end_byte: region.range.end_byte,
+                    })?,
+                    inside_callable: region.inside_callable.ok_or_else(|| {
+                        StructuralFactsPersistenceError::invalid(
+                            "only store-answered recovered regions have persisted rows",
+                        )
+                    })?,
+                })
+            })
+            .collect::<Result<Vec<_>, StructuralFactsPersistenceError>>()?;
         Ok(PersistedStructuralFacts {
             source_bytes,
             nodes,
             roles,
             occurrence_roles,
+            recovered_regions,
         })
     }
 
@@ -535,9 +803,47 @@ impl FileFacts {
                     kind.label()
                 )));
             }
+            if node.parenthesized.is_some() && kind != NormalizedKind::StringLiteral {
+                return Err(StructuralFactsPersistenceError::invalid(format!(
+                    "structural node {id} carries parenthesized state for non-string kind {}",
+                    kind.label()
+                )));
+            }
+            if node.assignment_shape.is_some() && kind != NormalizedKind::Assignment {
+                return Err(StructuralFactsPersistenceError::invalid(format!(
+                    "structural node {id} carries assignment shape for non-assignment kind {}",
+                    kind.label()
+                )));
+            }
+            if node.integer_literal_value.as_ref().is_some_and(|value| {
+                kind != NormalizedKind::NumericLiteral || !is_valid_integer_literal_value(value)
+            }) {
+                return Err(StructuralFactsPersistenceError::invalid(format!(
+                    "structural node {id} carries an invalid integer value for kind {}",
+                    kind.label()
+                )));
+            }
+            if node.duplicate_key.is_some() && kind != NormalizedKind::ObjectProperty {
+                return Err(StructuralFactsPersistenceError::invalid(format!(
+                    "structural node {id} carries duplicate-key state for non-object-property kind {}",
+                    kind.label()
+                )));
+            }
+            if node.string_value.is_some() && kind != NormalizedKind::StringLiteral {
+                return Err(StructuralFactsPersistenceError::invalid(format!(
+                    "structural node {id} carries a decoded string value for non-string kind {}",
+                    kind.label()
+                )));
+            }
             nodes.push(NormalizedNode {
                 kind,
                 boolean_value: node.boolean_value,
+                parenthesized: node.parenthesized,
+                assignment_shape: node.assignment_shape,
+                integer_literal_value: node.integer_literal_value,
+                duplicate_key: node.duplicate_key,
+                is_async: node.is_async,
+                string_value: node.string_value,
                 construct: node.construct,
                 call_site,
                 range: Range {
@@ -661,12 +967,38 @@ impl FileFacts {
             CompactRows::try_from_parts(occurrence_role_offsets, occurrence_roles)
                 .map_err(StructuralFactsPersistenceError::invalid)?;
 
+        let mut recovered_regions = Vec::with_capacity(persisted.recovered_regions.len());
+        for region in persisted.recovered_regions {
+            let span = hydrate_span(region.span, &source)?;
+            if recovered_regions
+                .last()
+                .is_some_and(|previous: &RecoveredRegion| previous.range.end_byte > span.start_byte)
+            {
+                return Err(StructuralFactsPersistenceError::invalid(format!(
+                    "recovered region {}..{} is out of order or overlaps its predecessor",
+                    span.start_byte, span.end_byte
+                )));
+            }
+            recovered_regions.push(RecoveredRegion {
+                range: Range {
+                    start_byte: span.start_byte,
+                    end_byte: span.end_byte,
+                    start_line: line_of_byte(&line_starts, span.start_byte),
+                    end_line: line_of_byte(&line_starts, span.end_byte),
+                },
+                inside_callable: Some(region.inside_callable),
+            });
+        }
+
+        let (nodes, roles, occurrence_roles) =
+            append_syntax_error_facts(nodes, roles, occurrence_roles, &recovered_regions);
         Ok(Self::new(
             source,
             line_starts,
             nodes,
             roles,
             occurrence_roles,
+            recovered_regions,
         ))
     }
 
@@ -700,6 +1032,11 @@ impl FileFacts {
         self.occurrence_roles.len()
     }
 
+    /// The regions tree-sitter error recovery produced, in source order.
+    pub fn recovered_regions(&self) -> &[RecoveredRegion] {
+        &self.recovered_regions
+    }
+
     /// Total semantic role edges retained across every fact in this file.
     ///
     /// This is representation-neutral bookkeeping for diagnostics and
@@ -724,7 +1061,11 @@ impl FileFacts {
     /// 1-based line containing `byte`, matching the `Range` convention used
     /// across the analyzer.
     pub fn line_of_byte(&self, byte: usize) -> usize {
-        self.line_starts.partition_point(|&start| start <= byte)
+        line_of_byte(&self.line_starts, byte)
+    }
+
+    pub(crate) fn line_starts(&self) -> &[usize] {
+        &self.line_starts
     }
 
     pub fn line_column_of_byte(&self, byte: usize) -> (usize, usize) {
@@ -746,10 +1087,21 @@ impl FileFacts {
             .saturating_add(self.roles.estimated_bytes())
             .saturating_add(self.occurrence_roles.estimated_bytes())
             .saturating_add(
+                (self.recovered_regions.capacity() as u64)
+                    .saturating_mul(std::mem::size_of::<RecoveredRegion>() as u64),
+            )
+            .saturating_add(
                 self.nodes
                     .iter()
                     .filter_map(|node| node.construct.as_ref())
                     .map(|construct| construct.capacity() as u64)
+                    .sum::<u64>(),
+            )
+            .saturating_add(
+                self.nodes
+                    .iter()
+                    .filter_map(|node| node.string_value.as_ref())
+                    .map(|value| value.capacity() as u64)
                     .sum::<u64>(),
             )
     }
@@ -762,7 +1114,10 @@ impl FileFacts {
 
 #[cfg(test)]
 mod tests {
-    use super::{FileFacts, NormalizedNode, PersistedSpan, RoleTarget, Span};
+    use super::{
+        AssignmentSequenceKind, AssignmentShape, FileFacts, IntegerLiteralValue, NormalizedNode,
+        PersistedSpan, RoleTarget, Span,
+    };
     use crate::analyzer::Range;
     use crate::analyzer::structural::kinds::{NormalizedKind, Role};
     use crate::analyzer::structural::occurrences::OccurrenceRole;
@@ -771,6 +1126,7 @@ mod tests {
         CallKind, CallShapeCoverage, CallSiteFacts,
     };
     use brokk_bifrost_core::analyzer::structural::code::VocabularyCode;
+    use brokk_bifrost_test_macros::hardwon;
 
     fn role_target(role: Role, start_byte: usize) -> RoleTarget {
         RoleTarget {
@@ -794,6 +1150,12 @@ mod tests {
         NormalizedNode {
             kind: NormalizedKind::Call,
             boolean_value: None,
+            parenthesized: None,
+            assignment_shape: None,
+            integer_literal_value: None,
+            duplicate_key: None,
+            is_async: None,
+            string_value: None,
             construct: None,
             range: Range {
                 start_byte: 0,
@@ -814,6 +1176,12 @@ mod tests {
             NormalizedNode {
                 kind: NormalizedKind::Call,
                 boolean_value: None,
+                parenthesized: None,
+                assignment_shape: None,
+                integer_literal_value: None,
+                duplicate_key: None,
+                is_async: None,
+                string_value: None,
                 construct: Some("fixture_call".to_owned()),
                 range: Range {
                     start_byte: 0,
@@ -836,6 +1204,12 @@ mod tests {
             NormalizedNode {
                 kind: NormalizedKind::BooleanLiteral,
                 boolean_value: Some(true),
+                parenthesized: None,
+                assignment_shape: None,
+                integer_literal_value: None,
+                duplicate_key: None,
+                is_async: None,
+                string_value: None,
                 construct: None,
                 range: Range {
                     start_byte: 2,
@@ -896,84 +1270,8 @@ mod tests {
             nodes,
             roles.finish(),
             occurrence_roles.finish(),
+            Vec::new(),
         )
-    }
-
-    #[test]
-    fn estimated_bytes_counts_retained_allocation_capacity() {
-        let mut source = String::with_capacity(128);
-        source.push('x');
-        let mut line_starts = Vec::with_capacity(32);
-        line_starts.push(0);
-        let mut nodes = Vec::with_capacity(8);
-        nodes.push(node());
-        let mut roles = CompactRowsBuilder::with_capacity(1, 1);
-        roles.push_row([role_target(Role::Callee, 0)]);
-        let roles = roles.finish();
-        let occurrence_roles = empty_occurrence_rows(1);
-        let facts = FileFacts::new(source, line_starts, nodes, roles, occurrence_roles);
-
-        let source_length_based = facts.source.len() as u64
-            + (facts.line_starts.len() * std::mem::size_of::<usize>()) as u64
-            + (facts.nodes.len() * std::mem::size_of::<NormalizedNode>()) as u64
-            + facts.roles.estimated_bytes()
-            + facts.occurrence_roles.estimated_bytes()
-            + facts
-                .nodes
-                .iter()
-                .filter_map(|node| node.construct.as_ref())
-                .map(|construct| construct.capacity() as u64)
-                .sum::<u64>();
-        let capacity_based = facts.source.capacity() as u64
-            + (facts.line_starts.capacity() * std::mem::size_of::<usize>()) as u64
-            + (facts.nodes.capacity() * std::mem::size_of::<NormalizedNode>()) as u64
-            + facts.roles.estimated_bytes()
-            + facts.occurrence_roles.estimated_bytes()
-            + facts
-                .nodes
-                .iter()
-                .filter_map(|node| node.construct.as_ref())
-                .map(|construct| construct.capacity() as u64)
-                .sum::<u64>();
-
-        assert!(capacity_based > source_length_based);
-        assert_eq!(facts.estimated_bytes(), capacity_based);
-        assert_eq!(facts.role_count(), 1);
-        assert_eq!(facts.roles(0).len(), 1);
-        assert_eq!(facts.role_targets(0, Role::Callee).count(), 1);
-        assert_eq!(facts.occurrence_role_count(), 0);
-        assert!(facts.occurrence_roles(0).is_empty());
-    }
-
-    #[test]
-    fn compact_role_rows_preserve_boundaries_and_source_order() {
-        let mut roles = CompactRowsBuilder::with_capacity(2, 3);
-        roles.push_row([role_target(Role::Callee, 1), role_target(Role::Arg, 2)]);
-        roles.push_row([role_target(Role::Decorator, 3)]);
-        let facts = FileFacts::new(
-            "abcd".to_owned(),
-            vec![0],
-            vec![node(), node()],
-            roles.finish(),
-            empty_occurrence_rows(2),
-        );
-
-        assert_eq!(
-            facts
-                .roles(0)
-                .iter()
-                .map(|target| (target.role, target.span.start_byte))
-                .collect::<Vec<_>>(),
-            vec![(Role::Callee, 1), (Role::Arg, 2)]
-        );
-        assert_eq!(
-            facts
-                .roles(1)
-                .iter()
-                .map(|target| (target.role, target.span.start_byte))
-                .collect::<Vec<_>>(),
-            vec![(Role::Decorator, 3)]
-        );
     }
 
     #[test]
@@ -995,6 +1293,10 @@ mod tests {
         for (actual, expected) in decoded.nodes().iter().zip(original.nodes()) {
             assert_eq!(actual.kind, expected.kind);
             assert_eq!(actual.boolean_value, expected.boolean_value);
+            assert_eq!(actual.parenthesized, expected.parenthesized);
+            assert_eq!(actual.assignment_shape, expected.assignment_shape);
+            assert_eq!(actual.integer_literal_value, expected.integer_literal_value);
+            assert_eq!(actual.duplicate_key, expected.duplicate_key);
             assert_eq!(actual.construct, expected.construct);
             assert_eq!(actual.range, expected.range);
             assert_eq!(actual.parent, expected.parent);
@@ -1019,6 +1321,67 @@ mod tests {
         }
         assert_eq!(decoded.line_of_byte(0), 1);
         assert_eq!(decoded.line_of_byte(6), 2);
+    }
+
+    #[test]
+    fn assignment_shape_survives_relational_hydration() {
+        let fixture = relational_fixture();
+        let expected = AssignmentShape {
+            target_kind: AssignmentSequenceKind::Tuple,
+            value_kind: AssignmentSequenceKind::List,
+            target_unstarred_count: 2,
+            value_unstarred_count: 3,
+            target_starred: false,
+            value_starred: false,
+        };
+        let mut rows = fixture.persisted_rows().unwrap();
+        rows.nodes[0].kind = NormalizedKind::Assignment.code();
+        rows.nodes[0].call_site = None;
+        rows.nodes[0].assignment_shape = Some(expected);
+
+        let hydrated = FileFacts::from_persisted_rows(fixture.source().to_owned(), rows)
+            .expect("assignment shape persists as typed fields");
+
+        assert_eq!(hydrated.nodes()[0].assignment_shape, Some(expected));
+    }
+
+    #[test]
+    fn integer_literal_value_survives_relational_hydration() {
+        let fixture = relational_fixture();
+        let mut rows = fixture.persisted_rows().unwrap();
+        rows.nodes[0].kind = NormalizedKind::NumericLiteral.code();
+        rows.nodes[0].call_site = None;
+        rows.nodes[0].integer_literal_value = Some(IntegerLiteralValue {
+            decimal: Some("340282366920938463463374607431768211455".into()),
+            low_bits: u32::MAX,
+            negative: false,
+        });
+
+        let hydrated = FileFacts::from_persisted_rows(fixture.source().to_owned(), rows)
+            .expect("exact integer value persists as a scalar string");
+
+        assert_eq!(
+            hydrated.nodes()[0].integer_literal_value,
+            Some(IntegerLiteralValue {
+                decimal: Some("340282366920938463463374607431768211455".into()),
+                low_bits: u32::MAX,
+                negative: false,
+            })
+        );
+    }
+
+    #[test]
+    fn duplicate_key_fact_survives_relational_hydration() {
+        let fixture = relational_fixture();
+        let mut rows = fixture.persisted_rows().unwrap();
+        rows.nodes[0].kind = NormalizedKind::ObjectProperty.code();
+        rows.nodes[0].call_site = None;
+        rows.nodes[0].duplicate_key = Some(true);
+
+        let hydrated = FileFacts::from_persisted_rows(fixture.source().to_owned(), rows)
+            .expect("duplicate-key fact persists as a typed scalar");
+
+        assert_eq!(hydrated.nodes()[0].duplicate_key, Some(true));
     }
 
     #[test]
@@ -1110,5 +1473,59 @@ mod tests {
                 .to_string()
                 .contains("non-boolean kind call")
         );
+    }
+
+    #[hardwon("#783: structural fact memory accounting ignored retained allocation capacity")]
+    #[test]
+    fn estimated_bytes_counts_retained_allocation_capacity() {
+        let mut source = String::with_capacity(128);
+        source.push('x');
+        let mut line_starts = Vec::with_capacity(32);
+        line_starts.push(0);
+        let mut nodes = Vec::with_capacity(8);
+        nodes.push(node());
+        let mut roles = CompactRowsBuilder::with_capacity(1, 1);
+        roles.push_row([role_target(Role::Callee, 0)]);
+        let roles = roles.finish();
+        let occurrence_roles = empty_occurrence_rows(1);
+        let facts = FileFacts::new(
+            source,
+            line_starts,
+            nodes,
+            roles,
+            occurrence_roles,
+            Vec::new(),
+        );
+
+        let source_length_based = facts.source.len() as u64
+            + (facts.line_starts.len() * std::mem::size_of::<usize>()) as u64
+            + (facts.nodes.len() * std::mem::size_of::<NormalizedNode>()) as u64
+            + facts.roles.estimated_bytes()
+            + facts.occurrence_roles.estimated_bytes()
+            + facts
+                .nodes
+                .iter()
+                .filter_map(|node| node.construct.as_ref())
+                .map(|construct| construct.capacity() as u64)
+                .sum::<u64>();
+        let capacity_based = facts.source.capacity() as u64
+            + (facts.line_starts.capacity() * std::mem::size_of::<usize>()) as u64
+            + (facts.nodes.capacity() * std::mem::size_of::<NormalizedNode>()) as u64
+            + facts.roles.estimated_bytes()
+            + facts.occurrence_roles.estimated_bytes()
+            + facts
+                .nodes
+                .iter()
+                .filter_map(|node| node.construct.as_ref())
+                .map(|construct| construct.capacity() as u64)
+                .sum::<u64>();
+
+        assert!(capacity_based > source_length_based);
+        assert_eq!(facts.estimated_bytes(), capacity_based);
+        assert_eq!(facts.role_count(), 1);
+        assert_eq!(facts.roles(0).len(), 1);
+        assert_eq!(facts.role_targets(0, Role::Callee).count(), 1);
+        assert_eq!(facts.occurrence_role_count(), 0);
+        assert!(facts.occurrence_roles(0).is_empty());
     }
 }

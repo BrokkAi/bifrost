@@ -5,6 +5,155 @@ analysis behavior, integrations, and release artifacts. It is curated from the
 complete private release range because the public open-core repository is a
 projection and its commit history does not contain every source commit.
 
+## [0.13.1] - Unreleased
+
+### Added
+
+- RQL exposes cross-language callable size, nesting, and complexity metrics.
+  Cleanup-flow queries can identify when JavaScript `finally` or Ruby `ensure`
+  overrides pending control flow; unsupported or incomplete paths stay open.
+
+- Rust taint policies compose stored per-procedure flow evidence and support
+  diff-scoped runs through the CLI and MCP, retaining explicit analysis scope
+  and incomplete-boundary reporting.
+
+- Complete, accepted semantic summaries now let taint analysis report definite
+  findings; stale, missing, conflicting, or partial model evidence remains
+  uncertain.
+
+- Public SARIF scans can acquire pinned external rule releases and their
+  semantic dependencies, verify cached content, and fail closed when
+  acquisition or policy evidence is incomplete.
+
+- Discarded-result checks now cover reviewed transformation and must-use results
+  in Java, Python, Rust, C, and C++ when dispatch and result-use evidence is
+  complete. Go contradictory-condition checks use typed scalar facts, and
+  unsupported or ambiguous cases remain incomplete.
+
+- Policy `why-not` explanations now cover flow and taint candidates through the
+  library and CLI. Reached candidates identify the ordinary finding; negative
+  answers are `failed` only with complete coverage, while unresolved dispatch,
+  model, cancellation, and budget boundaries remain `unknown`.
+
+- Java CodeQuery preserves annotation source provenance. JavaScript and
+  TypeScript queries preserve more declaration, import, and usage identities,
+  including catch-parameter references.
+
+- Rust taint and value-flow analysis models supported built-in formatting
+  macros, while Rust resolution and navigation reuse macro-target and
+  per-unit summary evidence across bounded queries. C++ queries likewise reuse
+  preprocessor and macro-binding evidence within a request.
+
+- Python queries and policies expose more precise receiver, member, iterator,
+  type-guard, import, and annotation evidence while keeping shadowed or
+  ambiguous cases incomplete.
+
+- PHP import queries now follow supported literal and `__DIR__` `include` and
+  `require` paths; dynamic targets remain incomplete.
+
+- Rust SQL-injection taint analysis now closes supported standard-library and
+  SQL-driver flows so complete runs can report definite findings. Unsupported
+  sources, drivers, macros, and asynchronous or closure boundaries remain
+  incomplete.
+
+- Rust analysis now follows workspace Cargo configuration for target and cfg
+  selection, rustflags, and `[patch]` dependency routing.
+
+- RQL, JSON CodeQuery, and RQLP expose the initial cross-domain operators:
+  `configuration-key` links a resolver-proven Java call argument to a key in a
+  declared `.properties` document, while `require-both` checks both domains
+  without pairing their rows; unproven bindings remain incomplete.
+
+- RQL, RQLP, the CLI, and MCP also expose declared and locked Cargo dependency
+  evidence with incomplete bindings kept explicit.
+
+- RQL can expose Rust pointer-safety findings with invalidation, lifetime, and
+  bounds evidence; unsupported or incomplete proof remains explicit.
+
+### Changed
+
+- Diff analysis defaults to reference facts on changed lines, with explicit
+  full-file and patch-symbol-only modes. MCP and Python responses report the
+  selected scope and endpoint completeness instead of treating missing or
+  uncertain call evidence as an exact delta.
+
+- Independent policies can run concurrently with configurable bounded
+  parallelism, preserving report ordering and exit-status semantics.
+
+- External semantic-pack acquisition supports explicit version and channel
+  requests, replayable receipts, and typed selection and failure outcomes.
+  Verified cached content remains reusable when the release inventory changes.
+
+- Policy selection supports individual exclusions in the CLI and GitHub Action,
+  with selected and excluded policy identities retained in JSON reports.
+
+- Policy reports now name the expected standard-library pack and why it did or
+  did not activate, including missing or incompatible content.
+
+- Rust import navigation refreshes only affected indexed edges for warm
+  `importers-of` queries, and C++ assignment-policy preparation avoids repeated
+  header work while preserving findings and completion status.
+
+- Pull-request policy scans reuse compatible base-revision analysis across the
+  CLI, GitHub Action, and MCP while preserving report ordering and completeness
+  evidence.
+
+- MCP progress notifications now include measured workspace-indexing phases
+  and counters, with bounded snapshots for shared builds and no invented global
+  percentage.
+
+### Removed
+
+- The Go data-race analyzer and its associated policy are no longer shipped by
+  the engine.
+
+### Fixed
+
+- Python context-manager control flow retains uncertain paths and excludes
+  exception suppression only when exact exit behavior is proven. Stub class
+  aliases retain their binding and base-order evidence.
+
+- Rust reverse usages enumerate each target candidate set once per request,
+  retaining generation checks and explicit macro frontier gaps.
+
+
+- Taint findings retain uncertainty when the endpoint dispatch needed to
+  select a sink is unresolved, while independently proven findings remain
+  available.
+
+- Incoming-call queries choose a stable subset when candidate limits apply.
+  Rust navigation and macro reverse lookup no longer lose valid targets or
+  crash during type proof and enum export discovery.
+
+- C++ definition lookups now return the same targets and status regardless of
+  how many requests share a batch.
+
+- Pointer-flow analysis now follows proven pointer invalidations through
+  helper calls while keeping caller accesses before the call unaffected.
+
+- PHP analysis now parses PHP 8.5 clone-with expressions without recovery and
+  preserves receiver and member resolution through property updates.
+
+- Python source mapping now preserves exact locations for CRLF signatures and
+  zero-width embedded regex groups.
+
+- Rust member queries no longer report existing members as incomplete when a
+  fully matched item macro is proven not to affect them; open expansion cases
+  remain incomplete.
+
+- Structural queries and policies now keep parser-recovered regions and
+  unclosed C/C++ constructs explicitly incomplete when they could hide a
+  selected node, while retaining matches proved elsewhere in the file.
+
+- The JMOD producer now handles qualified `opens` tables, resources beside
+  module class files, and enclosing-class type variables correctly, so
+  zero-configuration JDK generation no longer drops supported declarations or
+  rejects valid resources.
+
+- The TypeScript declaration producer no longer drops complete generated packs
+  when a declaration surface contains a recoverable unsupported shape; the
+  affected surface remains explicitly partial instead.
+
 ## [0.13.0] - 2026-10-06
 
 ### Added

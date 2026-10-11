@@ -1,6 +1,5 @@
 [package]
 name = "brokk-bifrost-jvm"
-build = "src/scala/grammar/build.rs"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -20,8 +19,10 @@ exclude = [
 name = "brokk_bifrost_jvm"
 
 [dependencies]
-brokk-bifrost-core = { path = "../bifrost-core", version = "=0.13.0" }
+brokk-bifrost-core = { path = "../bifrost-core", version = "=0.13.1" }
 brokk-tree-sitter-kotlin = "=0.4.6"
+brokk-tree-sitter-scala = "=0.26.3"
+moka = { version = "0.12.11", features = ["sync"] }
 regex = "1.12.2"
 # Scala's supertype lookup path is stored as its own JSON envelope inside the
 # declaration index, so the type that owns that encoding travels with `serde`.
@@ -32,10 +33,7 @@ tree-sitter = "0.25.10"
 # same class as tree-sitter-cpp 0.23.4, tree-sitter-c-sharp 0.23.1,
 # tree-sitter-php 0.23.11 and tree-sitter-ruby 0.23.1.
 tree-sitter-java = "0.23.5"
-tree-sitter-language = "0.1.7"
-
-[build-dependencies]
-cc = "1.2.56"
+tree-sitter-javadoc = "=0.3.1"
 
 [features]
 default = []
@@ -46,10 +44,11 @@ default = []
 test-support = ["brokk-bifrost-core/test-support"]
 
 [dev-dependencies]
+brokk-bifrost-test-macros = { path = "../bifrost-test-macros" }
 # Cargo unifies this with the plain `[dependencies]` entry above for this
 # crate's test targets, which is what makes core's test-support surface exist
 # while this crate's unit tests are built.
-brokk-bifrost-core = { path = "../bifrost-core", version = "=0.13.0", features = ["test-support"] }
+brokk-bifrost-core = { path = "../bifrost-core", version = "=0.13.1", features = ["test-support"] }
 
 [lints]
 workspace = true

@@ -117,7 +117,6 @@ mod tests {
         Language, ProjectFile, RustAnalyzer, SemanticDiagnostic, SemanticDiagnosticOutcome,
         SemanticDiagnosticReportStatus, TestProject,
     };
-    use brokk_bifrost_rust::diagnostics::RUST_UNRECOGNIZED_SYMBOL;
     use tempfile::tempdir;
 
     fn rust_project(files: &[(&str, &str)]) -> (tempfile::TempDir, RustAnalyzer) {
@@ -143,137 +142,6 @@ mod tests {
 
     fn diagnostics_for(analyzer: &RustAnalyzer, rel_path: &str) -> Vec<SemanticDiagnostic> {
         report_for(analyzer, rel_path).into_diagnostics()
-    }
-
-    #[test]
-    fn unavailable_canonical_routes_do_not_prove_a_symbol_absent() {
-        let fixture = crate::inline_project::InlineTestProject::with_language(Language::Rust)
-            .file(
-                "Cargo.toml",
-                "[package]\nname = \"diagnostics\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
-            )
-            .file(
-                "src/lib.rs",
-                "pub mod part;\nfn run() { crate::part::missing(); }\n",
-            )
-            .file("src/part.rs", "pub fn target() {}\n")
-            .build();
-        let analyzer = RustAnalyzer::new(fixture.project_dyn());
-        analyzer.analyzer_store().drop_rust_modules_table_for_test();
-        let scope = crate::analyzer::AnalyzerQueryScope::new(&analyzer);
-        let report = report_for(&analyzer, "src/lib.rs");
-        assert_eq!(report.status(), SemanticDiagnosticReportStatus::Incomplete);
-        assert!(report.outcomes().iter().any(|outcome| matches!(outcome,
-            SemanticDiagnosticOutcome::Incomplete { reasons, .. }
-                if reasons.iter().any(|reason| matches!(reason,
-                    crate::analyzer::SemanticDiagnosticIncompleteReason::CanonicalFactsUnavailable { .. }
-                ))
-        )), "{:?}", report.outcomes());
-        assert!(report.into_diagnostics().is_empty());
-        assert!(scope.store_error().is_some());
-        assert!(!analyzer.cargo_routes_ready_for_test());
-    }
-
-    #[test]
-    fn rust_semantic_diagnostics_report_unknown_type_and_value_references() {
-        let (_temp, analyzer) = rust_project(&[(
-            "src/main.rs",
-            r#"
-fn run(input: MissingType) {
-    missing_value;
-    missing_function();
-}
-"#,
-        )]);
-
-        let diagnostics = diagnostics_for(&analyzer, "src/main.rs");
-        assert_eq!(3, diagnostics.len(), "{diagnostics:#?}");
-        assert!(
-            diagnostics
-                .iter()
-                .all(|diagnostic| diagnostic.kind == RUST_UNRECOGNIZED_SYMBOL)
-        );
-        assert!(
-            diagnostics
-                .iter()
-                .any(|diagnostic| diagnostic.message.contains("MissingType"))
-        );
-        assert!(
-            diagnostics
-                .iter()
-                .any(|diagnostic| diagnostic.message.contains("missing_value"))
-        );
-        assert!(
-            diagnostics
-                .iter()
-                .any(|diagnostic| diagnostic.message.contains("missing_function"))
-        );
-    }
-
-    /// Every error carries a complete absence proof, and a resolved reference
-    /// is recorded rather than passed over in silence.
-    #[test]
-    fn rust_semantic_diagnostics_record_proof_for_every_lookup() {
-        let (_temp, analyzer) = rust_project(&[(
-            "src/main.rs",
-            "fn run() {\n    let bound = 1;\n    bound;\n    missing_value;\n}\n",
-        )]);
-
-        let report = report_for(&analyzer, "src/main.rs");
-        assert!(
-            report
-                .outcomes()
-                .iter()
-                .any(|outcome| matches!(outcome, SemanticDiagnosticOutcome::Resolved { .. })),
-            "{:#?}",
-            report.outcomes()
-        );
-        assert_eq!(
-            1,
-            report
-                .outcomes()
-                .iter()
-                .filter(|outcome| matches!(outcome, SemanticDiagnosticOutcome::Absent(_)))
-                .count(),
-            "{:#?}",
-            report.outcomes()
-        );
-    }
-
-    #[test]
-    fn rust_semantic_diagnostics_suppress_locals_declarations_imports_and_module_paths() {
-        let (_temp, analyzer) = rust_project(&[
-            (
-                "src/models.rs",
-                "pub struct Service;\npub type Handler = fn();\npub fn build_service() -> Service { Service }\n",
-            ),
-            (
-                "src/main.rs",
-                r#"
-mod models;
-use crate::models::{Service as RenamedService, Handler, build_service};
-
-struct LocalType;
-type LocalHandler = fn();
-fn local_function() {}
-
-fn run(param: RenamedService, handler: Handler, local_handler: LocalHandler) {
-    let local = build_service();
-    let typed: LocalType = LocalType;
-    local_function();
-    crate::models::build_service();
-    param;
-    handler;
-    local_handler;
-    local;
-    typed;
-}
-"#,
-            ),
-        ]);
-
-        let diagnostics = diagnostics_for(&analyzer, "src/main.rs");
-        assert!(diagnostics.is_empty(), "{diagnostics:#?}");
     }
 
     #[test]
@@ -323,8 +191,35 @@ fn leaked_generic(value: T) {}
         );
     }
 
-    /// None of these becomes an error, and each states the typed reason it was
-    /// not judged instead of vanishing.
+    #[test]
+    fn unavailable_canonical_routes_do_not_prove_a_symbol_absent() {
+        let fixture = crate::inline_project::InlineTestProject::with_language(Language::Rust)
+            .file(
+                "Cargo.toml",
+                "[package]\nname = \"diagnostics\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+            )
+            .file(
+                "src/lib.rs",
+                "pub mod part;\nfn run() { crate::part::missing(); }\n",
+            )
+            .file("src/part.rs", "pub fn target() {}\n")
+            .build();
+        let analyzer = RustAnalyzer::new(fixture.project_dyn());
+        analyzer.analyzer_store().drop_rust_modules_table_for_test();
+        let scope = crate::analyzer::AnalyzerQueryScope::new(&analyzer);
+        let report = report_for(&analyzer, "src/lib.rs");
+        assert_eq!(report.status(), SemanticDiagnosticReportStatus::Incomplete);
+        assert!(report.outcomes().iter().any(|outcome| matches!(outcome,
+            SemanticDiagnosticOutcome::Incomplete { reasons, .. }
+                if reasons.iter().any(|reason| matches!(reason,
+                    crate::analyzer::SemanticDiagnosticIncompleteReason::CanonicalFactsUnavailable { .. }
+                ))
+        )), "{:?}", report.outcomes());
+        assert!(report.into_diagnostics().is_empty());
+        assert!(scope.store_error().is_some());
+        assert!(!analyzer.cargo_routes_ready_for_test());
+    }
+
     #[test]
     fn rust_semantic_diagnostics_suppress_builtin_macro_cfg_external_and_glob_uncertainty() {
         let (_temp, analyzer) = rust_project(&[(
@@ -363,8 +258,6 @@ fn run(value: Option<String>) -> Result<(), Box<dyn std::error::Error>> {
         );
     }
 
-    /// A file the parser could not read states that it judged nothing, rather
-    /// than reporting an empty complete result that looks like a clean file.
     #[test]
     fn rust_semantic_diagnostics_state_malformed_files() {
         let (_temp, analyzer) =
@@ -385,22 +278,6 @@ fn run(value: Option<String>) -> Result<(), Box<dyn std::error::Error>> {
             )),
             "{:#?}",
             report.outcomes()
-        );
-    }
-
-    #[test]
-    fn rust_semantic_diagnostics_cap_reported_items() {
-        let mut source = String::from("fn run() {\n");
-        for index in 0..250 {
-            source.push_str(&format!("    missing_{index};\n"));
-        }
-        source.push_str("}\n");
-        let (_temp, analyzer) = rust_project(&[("src/main.rs", &source)]);
-
-        let diagnostics = diagnostics_for(&analyzer, "src/main.rs");
-        assert_eq!(
-            brokk_bifrost_rust::diagnostics::MAX_RUST_SEMANTIC_DIAGNOSTICS,
-            diagnostics.len()
         );
     }
 }

@@ -1,20 +1,18 @@
 //! Shared Java source-property construction and independent projection laws.
 
 use brokk_bifrost_core::analyzer::ProjectFile;
-use brokk_bifrost_core::analyzer::parsed_file::{ParsedFile, ParsedSourceFacts};
+use brokk_bifrost_core::analyzer::parsed_file::ParsedFile;
 use brokk_bifrost_core::analyzer::source_facts::SourceDeclarationId;
 use brokk_bifrost_core::analyzer::structural::resolution::DeclaredVisibility;
 use brokk_bifrost_core::analyzer::tree_walk::{WalkControl, walk_named_tree_preorder};
-use tree_sitter::{Node, Parser, Tree};
+use brokk_bifrost_test_macros::hardwon;
+use tree_sitter::{Node, Tree};
 
 use super::declarations::parse_java_file;
+use super::test_support::source_facts as facts;
 
 fn parse(source: &str) -> (ParsedFile, Tree) {
-    let mut parser = Parser::new();
-    parser
-        .set_language(&tree_sitter_java::LANGUAGE.into())
-        .expect("Java grammar is valid");
-    let tree = parser.parse(source, None).expect("Java source parses");
+    let tree = super::declarations::parse_tree(source).expect("Java source parses");
     let file = ProjectFile::new(
         std::env::current_dir()
             .expect("current directory")
@@ -24,25 +22,8 @@ fn parse(source: &str) -> (ParsedFile, Tree) {
     (parse_java_file(&file, source, &tree), tree)
 }
 
-fn facts(parsed: &ParsedFile) -> &ParsedSourceFacts {
-    parsed
-        .source_facts
-        .as_ref()
-        .expect("Java producer publishes source facts")
-}
-
 fn named_node<'tree>(root: Node<'tree>, source: &str, kind: &str, name: &str) -> Node<'tree> {
-    let mut found = Vec::new();
-    walk_named_tree_preorder(root, true, |node| {
-        if node.kind() == kind
-            && node.child_by_field_name("name").is_some_and(|name_node| {
-                &source[name_node.start_byte()..name_node.end_byte()] == name
-            })
-        {
-            found.push(node);
-        }
-        WalkControl::Continue
-    });
+    let found = super::test_support::named_nodes(root, source, kind, name);
     assert_eq!(found.len(), 1, "one {kind} named {name:?}");
     found[0]
 }
@@ -52,35 +33,21 @@ fn source_declaration_for_node(
     node: Node<'_>,
 ) -> (SourceDeclarationId, DeclaredVisibility) {
     let facts = facts(parsed);
-    let expected_name = node
-        .child_by_field_name("name")
-        .map(|name| (name.start_byte(), name.end_byte()));
-    let matches = facts
+    let visibility_facts = facts
         .declaration_visibilities
         .as_ref()
-        .expect("Java visibility family is published")
+        .expect("Java visibility family is published");
+    let declaration = super::test_support::source_declaration_for_node(
+        parsed,
+        node,
+        visibility_facts.iter().map(|fact| fact.declaration),
+    );
+    let visibility = visibility_facts
         .iter()
-        .filter_map(|fact| {
-            let declaration = facts.occurrences.declaration(fact.declaration);
-            let occurrence = facts.occurrences.occurrence(declaration.occurrence);
-            if (occurrence.range.start_byte, occurrence.range.end_byte)
-                != (node.start_byte(), node.end_byte())
-            {
-                return None;
-            }
-            let name_matches = match (expected_name, declaration.name) {
-                (None, None) => true,
-                (Some((start, end)), Some(name)) => {
-                    let range = facts.occurrences.occurrence(name).range;
-                    (range.start_byte, range.end_byte) == (start, end)
-                }
-                _ => false,
-            };
-            name_matches.then_some((fact.declaration, fact.visibility))
-        })
-        .collect::<Vec<_>>();
-    assert_eq!(matches.len(), 1, "one source property for AST node");
-    matches[0]
+        .find(|fact| fact.declaration == declaration)
+        .expect("source declaration visibility")
+        .visibility;
+    (declaration, visibility)
 }
 
 fn assert_visibility(
@@ -400,6 +367,7 @@ class Outer {
 }
 
 #[test]
+#[hardwon("43053b9ef08a: synthetic Java scopes leaked into source visibility")]
 fn java_synthetic_class_scope_has_no_source_visibility_authority() {
     use brokk_bifrost_core::analyzer::resolution_facts::ResolutionSiteKind;
 

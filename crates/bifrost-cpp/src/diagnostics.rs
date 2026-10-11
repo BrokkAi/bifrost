@@ -18,6 +18,7 @@
 //! fixtures that build a real `CppAnalyzer`.
 
 use crate::compile_context::CppCompileContext;
+use crate::declarations::cpp_unclosed_construct_openers;
 use crate::graph_support::CppSource;
 use brokk_bifrost_core::analyzer::model::{
     SemanticAbsenceProof, SemanticDiagnostic, SemanticDiagnosticDomain,
@@ -50,6 +51,27 @@ pub fn collect_cpp_semantic_diagnostics(
     }
 
     let tree = parse_cpp_tree(source);
+    let openers = cpp_unclosed_construct_openers(tree.root_node());
+    if let Some(outermost) = openers.first() {
+        // Not one stray error but a file the parse ended inside of: every
+        // declaration after the outermost opener is placed by recovery (#3501).
+        let open: Vec<_> = openers
+            .iter()
+            .map(|opener| (opener.kind(), opener.start_byte()))
+            .collect();
+        report.push_incomplete(
+            None,
+            vec![SemanticDiagnosticIncompleteReason::UnsupportedSemantics {
+                detail: format!(
+                    "C/C++ source ends inside an unclosed `{}` at byte {} (line {}), so tree-sitter recovered the whole file as one ERROR node; constructs left open (opener, byte): {open:?}",
+                    outermost.kind(),
+                    outermost.start_byte(),
+                    outermost.start_position().row + 1,
+                ),
+            }],
+        );
+        return report;
+    }
     if has_parse_errors(tree.root_node()) {
         // The parse errors themselves reach the host through the analyzer's
         // parse-diagnostic path. What this report records is that the tree this
@@ -107,7 +129,7 @@ pub fn collect_cpp_semantic_diagnostics(
                 record_type_reference(&mut report, &closures, name, node_range(node, &line_starts));
             }
         }
-        push_named_children(&mut stack, node);
+        brokk_bifrost_core::analyzer::tree_walk::push_named_children_reversed(node, &mut stack);
     }
     report
 }
@@ -224,7 +246,7 @@ impl ProvenClosure {
     }
 }
 
-fn parse_cpp_tree(source: &str) -> Tree {
+pub(crate) fn parse_cpp_tree(source: &str) -> Tree {
     let mut parser = Parser::new();
     parser
         .set_language(&tree_sitter_cpp::LANGUAGE.into())
@@ -345,6 +367,7 @@ fn prove_include_closure(
                         ),
                     });
                 }
+                "preproc_linkage_open" | "preproc_linkage_close" => {}
                 kind if kind.starts_with("preproc_") => {
                     // Closed by default: an unclassified directive is refused
                     // rather than walked past, so a grammar that grows a new
@@ -364,7 +387,9 @@ fn prove_include_closure(
                         }
                         closure.declared.insert(name);
                     }
-                    push_named_children(&mut stack, node);
+                    brokk_bifrost_core::analyzer::tree_walk::push_named_children_reversed(
+                        node, &mut stack,
+                    );
                 }
                 "type_definition" | "alias_declaration" => {
                     // `typedef int Meters;` and `using Meters = int;` introduce
@@ -372,9 +397,13 @@ fn prove_include_closure(
                     for name in alias_type_names(node, &source) {
                         closure.declared.insert(name);
                     }
-                    push_named_children(&mut stack, node);
+                    brokk_bifrost_core::analyzer::tree_walk::push_named_children_reversed(
+                        node, &mut stack,
+                    );
                 }
-                _ => push_named_children(&mut stack, node),
+                _ => brokk_bifrost_core::analyzer::tree_walk::push_named_children_reversed(
+                    node, &mut stack,
+                ),
             }
         }
     }
@@ -416,7 +445,7 @@ fn alias_type_names(node: Node<'_>, source: &str) -> Vec<String> {
             }
             continue;
         }
-        push_named_children(&mut stack, current);
+        brokk_bifrost_core::analyzer::tree_walk::push_named_children_reversed(current, &mut stack);
     }
     names
 }
@@ -434,9 +463,7 @@ fn quoted_include_path(node: Node<'_>, source: &str) -> Option<String> {
     let literal = node
         .named_children(&mut cursor)
         .find(|child| child.kind() == "string_literal")?;
-    let text = node_text(literal, source);
-    text.strip_prefix('"')?
-        .strip_suffix('"')
+    crate::imports::include_path_literal_value(literal, source)
         .filter(|path| !path.is_empty())
         .map(ToOwned::to_owned)
 }
@@ -514,10 +541,4 @@ fn is_plain_type_reference(node: Node<'_>) -> bool {
         current = ancestor;
     }
     true
-}
-
-fn push_named_children<'tree>(stack: &mut Vec<Node<'tree>>, node: Node<'tree>) {
-    let mut cursor = node.walk();
-    let children: Vec<_> = node.named_children(&mut cursor).collect();
-    stack.extend(children.into_iter().rev());
 }

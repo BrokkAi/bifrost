@@ -23,6 +23,7 @@ pub mod bounded_output;
 pub mod cache_db;
 pub mod cache_gc;
 pub mod cancellation;
+pub mod clones;
 pub mod compact_graph;
 pub mod complete_value_cache;
 pub mod git_file;
@@ -31,9 +32,18 @@ pub mod hash;
 pub mod panic_report;
 pub mod path_normalization;
 pub mod path_utils;
+pub mod process;
 pub mod profiling;
 pub mod schema_version;
+pub mod sqlite_template;
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub mod test_support;
 pub mod text_utils;
 pub mod util;
+
+#[cfg(any(test, feature = "test-support"))]
+#[path = "../../../test-support/git.rs"]
+pub(crate) mod test_git_support;
 
 pub use cancellation::CancellationToken;

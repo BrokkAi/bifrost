@@ -220,6 +220,15 @@ fn occurrence_role(value: CppOccurrenceRole) -> i64 {
     }
 }
 
+fn base_access_specifier(value: CppAccessSpecifier) -> &'static str {
+    match value {
+        CppAccessSpecifier::Public => "public",
+        CppAccessSpecifier::Protected => "protected",
+        CppAccessSpecifier::Private => "private",
+        CppAccessSpecifier::Unknown => "unknown",
+    }
+}
+
 fn insert(
     tx: &Transaction<'_>,
     blob_id: i64,
@@ -280,8 +289,8 @@ fn insert(
     )?;
     let mut bases = tx.prepare_cached(
         "INSERT INTO source_cpp_bases
-         (blob_id, declaration_id, ordinal, is_virtual, absolute)
-         VALUES(?1, ?2, ?3, ?4, ?5)",
+         (blob_id, declaration_id, ordinal, is_virtual, absolute, access)
+         VALUES(?1, ?2, ?3, ?4, ?5, ?6)",
     )?;
     let mut base_components = tx.prepare_cached(
         "INSERT INTO source_cpp_base_components
@@ -384,7 +393,8 @@ fn insert(
                 fact.declaration.get(),
                 usize_to_i64(ordinal)?,
                 i64::from(base.is_virtual),
-                i64::from(base.absolute)
+                i64::from(base.absolute),
+                base_access_specifier(base.access)
             ])?;
             for (component_ordinal, component) in base.components.iter().enumerate() {
                 base_components.execute(params![

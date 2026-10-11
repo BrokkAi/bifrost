@@ -125,8 +125,13 @@ UNION ALL
 SELECT 'open_export_inventory', candidate.module_path,
        json_object('member_blob', candidate.blob_id,
                    'declaration_id', candidate.declaration_id,
-                   'reason', 'UnloweredDeclaration')
+                   'reason', CASE WHEN properties.generated_surface=1
+                                  THEN 'GeneratedItemSurface'
+                                  ELSE 'UnloweredDeclaration' END)
 FROM cr_source_declarations AS candidate
+CROSS JOIN source_rust_declaration_properties AS properties
+ ON properties.blob_id=candidate.blob_id
+ AND properties.declaration_id=candidate.declaration_id
 WHERE candidate.nearest_declaration_boundary = 0
   AND candidate.declaration_kind NOT IN (8, 9, 14)
   AND candidate.activation = 1

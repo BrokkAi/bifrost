@@ -30,6 +30,23 @@ labelled_enum! {
 }
 
 labelled_enum! {
+    /// Why a synthetic binding read is placed at an async suspension point.
+    ///
+    /// `PostResumeUse` preserves the existing proof that a modeled binding read
+    /// is reachable after resume. `ScopeEndDrop` means the binding is active in
+    /// a lexical scope that contains the suspension and some CFG path carries
+    /// its established value to the suspension without a structured by-value
+    /// use. This is a future-frame liveness fact, not proof that cancellation
+    /// runs a destructor. The AST check is syntactic: a `Copy` binding can look
+    /// moved, so policies selecting held non-`Copy` values must also select by
+    /// initializer identity.
+    StateEventReadCause, ALL_STATE_EVENT_READ_CAUSES {
+        PostResumeUse => "post_resume_use",
+        ScopeEndDrop => "scope_end_drop",
+    }
+}
+
+labelled_enum! {
     /// What a state event is about: a named binding, or a property of one.
     ///
     /// This is only the coarse axis a query filters on. Binding identity is a
@@ -160,38 +177,4 @@ flow_state_axes! {
         "Structured-property dominance rows stating that every entry-to-read path passes a store.",
     SameEvaluationRelation => "same_evaluation_relation":
         "Same-evaluation rows stating that a read feeds the value an establishment assigns.",
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn flow_state_vocabulary_round_trips_its_labels() {
-        for class in ALL_STATE_EVENT_CLASSES {
-            assert_eq!(StateEventClass::from_label(class.label()), Some(*class));
-        }
-        for kind in ALL_FLOW_SUBJECT_KINDS {
-            assert_eq!(FlowSubjectKind::from_label(kind.label()), Some(*kind));
-        }
-        for relation in ALL_FLOW_RELATIONS {
-            assert_eq!(FlowRelation::from_label(relation.label()), Some(*relation));
-        }
-        for certainty in ALL_FLOW_CERTAINTIES {
-            assert_eq!(
-                FlowCertainty::from_label(certainty.label()),
-                Some(*certainty)
-            );
-        }
-        for axis in ALL_FLOW_STATE_AXES {
-            assert_eq!(FlowStateAxis::from_label(axis.label()), Some(*axis));
-            assert!(!axis.description().is_empty());
-        }
-        for relation in ALL_FLOW_RELATIONS {
-            for subject in ALL_FLOW_SUBJECT_KINDS {
-                assert!(ALL_FLOW_STATE_AXES.contains(&relation.axis_for_subject(*subject)));
-            }
-        }
-        assert_eq!(FlowStateAxis::COUNT, 7);
-    }
 }

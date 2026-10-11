@@ -39,9 +39,17 @@
 //! splits source text on `.` or `::` to recover that structure.
 
 use brokk_bifrost_core::analyzer::Range;
-use brokk_bifrost_core::analyzer::tree_walk::{first_named_child_of_kind, named_children};
+use brokk_bifrost_core::analyzer::tree_walk::{
+    first_named_child_of_kind, is_comment_kind, named_children,
+};
+use brokk_bifrost_core::analyzer::usages::common::node_text;
 use brokk_bifrost_core::analyzer::usages::reference_site::smallest_named_node_covering;
 use tree_sitter::Node;
+
+/// Whether a `this@Label` label names an owner's simple name.
+pub fn kotlin_owner_label_matches(owner_simple_name: &str, label: &str) -> bool {
+    owner_simple_name == label
+}
 
 /// The callee expression of a Kotlin call.
 ///
@@ -74,6 +82,26 @@ pub fn kotlin_value_arguments(call: Node<'_>) -> Option<Node<'_>> {
     }
     first_named_child_of_kind(call, "call_suffix")
         .and_then(|suffix| first_named_child_of_kind(suffix, "value_arguments"))
+}
+
+/// The first variable binding a Kotlin property or loop introduces.
+pub fn kotlin_binding_node(node: Node<'_>) -> Option<Node<'_>> {
+    named_children(node).into_iter().find(|child| {
+        matches!(
+            child.kind(),
+            "variable_declaration" | "multi_variable_declaration"
+        )
+    })
+}
+
+/// The expression a delegated Kotlin property supplies after `by`.
+pub fn kotlin_property_delegate_expression(property: Node<'_>) -> Option<Node<'_>> {
+    let delegate = named_children(property)
+        .into_iter()
+        .find(|child| child.kind() == "property_delegate")?;
+    named_children(delegate)
+        .into_iter()
+        .find(|child| !is_comment_kind(child.kind()))
 }
 
 /// How many arguments a call passes.
@@ -138,16 +166,98 @@ pub fn kotlin_navigation_member(navigation: Node<'_>) -> Option<Node<'_>> {
         .and_then(|suffix| first_named_child_of_kind(suffix, "simple_identifier"))
 }
 
+/// The first anonymous token kind among a node's direct children.
+pub fn kotlin_first_token(node: Node<'_>) -> Option<&'static str> {
+    let mut cursor = node.walk();
+    node.children(&mut cursor)
+        .find(|child| !child.is_named())
+        .map(|child| child.kind())
+}
+
+/// The `lambda_literal` a call passes outside its parentheses, if any.
+pub fn kotlin_call_trailing_lambda_body(call: Node<'_>) -> Option<Node<'_>> {
+    first_named_child_of_kind(call, "call_suffix")
+        .and_then(|suffix| first_named_child_of_kind(suffix, "annotated_lambda"))
+        .and_then(|annotated| first_named_child_of_kind(annotated, "lambda_literal"))
+}
+
+/// Every simple identifier introduced by a Kotlin binding, in source order.
+pub fn kotlin_binding_name_nodes<'tree>(binding: Node<'tree>) -> Vec<Node<'tree>> {
+    match binding.kind() {
+        "variable_declaration" => first_named_child_of_kind(binding, "simple_identifier")
+            .into_iter()
+            .collect(),
+        "multi_variable_declaration" => named_children(binding)
+            .into_iter()
+            .filter(|child| child.kind() == "variable_declaration")
+            .filter_map(|declaration| first_named_child_of_kind(declaration, "simple_identifier"))
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
 /// The identifier nodes of a dotted navigation, outermost qualifier first, when
 /// every link of it is a plain name.
 ///
 /// `lib.Base` yields the `lib` token then the `Base` token. `None` when any link
 /// is something other than a name — `f().Base` spells no dotted name at all.
 pub fn kotlin_dotted_navigation_segments(navigation: Node<'_>) -> Option<Vec<Node<'_>>> {
+    kotlin_dotted_navigation_segments_with_max_depth(navigation, usize::MAX)
+}
+
+/// The dotted components of a navigation when every segment has a spelling.
+pub fn kotlin_dotted_navigation_components(
+    navigation: Node<'_>,
+    source: &str,
+) -> Option<Vec<String>> {
+    let segments = kotlin_dotted_navigation_segments(navigation)?;
+    let names: Vec<&str> = segments
+        .iter()
+        .map(|segment| node_text(*segment, source))
+        .collect();
+    (!names.iter().any(|name| name.is_empty()))
+        .then(|| names.into_iter().map(str::to_string).collect())
+}
+
+/// The named type segments selected by a Kotlin class literal.
+pub fn kotlin_class_literal_type_segments(literal: Node<'_>) -> Option<Vec<Node<'_>>> {
+    match literal.kind() {
+        "type_identifier" | "simple_identifier" => Some(vec![literal]),
+        kind if kotlin_is_navigation_kind(kind) => kotlin_dotted_navigation_segments(literal),
+        _ => None,
+    }
+}
+
+/// The terminal token and ordered name tokens of a Kotlin constructor callee.
+pub fn kotlin_constructed_type_name_nodes(callee: Node<'_>) -> Option<(Node<'_>, Vec<Node<'_>>)> {
+    match callee.kind() {
+        "simple_identifier" => Some((callee, vec![callee])),
+        "user_type" => {
+            let segments = kotlin_user_type_segments(callee);
+            Some((*segments.last()?, segments))
+        }
+        kind if kotlin_is_navigation_kind(kind) => Some((
+            kotlin_navigation_member(callee)?,
+            kotlin_dotted_navigation_segments(callee)?,
+        )),
+        _ => None,
+    }
+}
+
+/// The bounded form of [`kotlin_dotted_navigation_segments`].
+pub fn kotlin_dotted_navigation_segments_with_max_depth(
+    navigation: Node<'_>,
+    max_navigation_depth: usize,
+) -> Option<Vec<Node<'_>>> {
     let mut segments = Vec::new();
     let mut current = navigation;
+    let mut depth = 0;
     loop {
+        if depth >= max_navigation_depth {
+            return None;
+        }
         segments.push(kotlin_navigation_member(current)?);
+        depth += 1;
         let receiver = kotlin_navigation_receiver(current)?;
         match receiver.kind() {
             kind if kotlin_is_navigation_kind(kind) => current = receiver,
@@ -440,6 +550,19 @@ pub fn kotlin_binding_type_components(binding: Node<'_>, source: &str) -> Option
     kotlin_type_name_components(kotlin_binding_type_node(binding)?, source)
 }
 
+/// The name introduced by a Kotlin value declaration supported by usage scans.
+pub fn kotlin_value_declaration_name(binding: Node<'_>, source: &str) -> Option<String> {
+    if !matches!(
+        binding.kind(),
+        "variable_declaration" | "parameter" | "class_parameter" | "parameter_with_optional_type"
+    ) {
+        return None;
+    }
+    let name = first_named_child_of_kind(binding, "simple_identifier")?;
+    let name = node_text(name, source);
+    (!name.is_empty()).then(|| name.to_string())
+}
+
 /// The node kinds that spell a written Kotlin type.
 pub const KOTLIN_TYPE_NODE_KINDS: &[&str] = &[
     "user_type",
@@ -461,6 +584,143 @@ pub fn kotlin_binding_type_node(binding: Node<'_>) -> Option<Node<'_>> {
     named_children(binding)
         .into_iter()
         .find(|child| KOTLIN_TYPE_NODE_KINDS.contains(&child.kind()))
+}
+
+/// The Kotlin scalar types whose primitive operators have JVM scalar semantics.
+///
+/// This intentionally excludes nullable, unsigned, floating-point, character,
+/// and user-defined types. Kotlin routes operators for those through calls or
+/// representation-specific rules that the scalar solver cannot prove here.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KotlinScalarType {
+    Int,
+    Long,
+    Short,
+    Byte,
+    Boolean,
+}
+
+/// Classify a written Kotlin type when it is exactly one supported, non-nullable
+/// scalar type. Qualified `kotlin.Int` spellings are accepted; aliases and
+/// arbitrary qualified names remain unresolved and therefore open.
+pub fn kotlin_declared_scalar_type(type_node: Node<'_>, source: &str) -> Option<KotlinScalarType> {
+    let mut current = type_node;
+    for _ in 0..MAX_TYPE_WRAPPER_DEPTH {
+        match current.kind() {
+            "user_type" => {
+                let segments = kotlin_user_type_segments(current);
+                let names = segments
+                    .iter()
+                    .filter_map(|segment| segment.utf8_text(source.as_bytes()).ok())
+                    .collect::<Vec<_>>();
+                return match names.as_slice() {
+                    [name] => kotlin_scalar_type_name(name),
+                    [prefix, name] if *prefix == "kotlin" => kotlin_scalar_type_name(name),
+                    _ => None,
+                };
+            }
+            // A nullable wrapper must stay open even when its inner type is a
+            // supported scalar: nullability changes equality and comparison.
+            "nullable_type" => return None,
+            "parenthesized_type" | "not_nullable_type" => {
+                current = named_children(current).into_iter().next()?;
+            }
+            _ => return None,
+        }
+    }
+    None
+}
+
+fn kotlin_scalar_type_name(name: &str) -> Option<KotlinScalarType> {
+    match name {
+        "Int" => Some(KotlinScalarType::Int),
+        "Long" => Some(KotlinScalarType::Long),
+        "Short" => Some(KotlinScalarType::Short),
+        "Byte" => Some(KotlinScalarType::Byte),
+        "Boolean" => Some(KotlinScalarType::Boolean),
+        _ => None,
+    }
+}
+
+/// Read a supported decimal integer literal, including a directly signed
+/// decimal literal. Hexadecimal, binary, unsigned, real, and arbitrary unary
+/// expressions remain unclassified.
+pub fn kotlin_decimal_integer_value(node: Node<'_>, source: &str) -> Option<i128> {
+    match node.kind() {
+        "integer_literal" => node
+            .utf8_text(source.as_bytes())
+            .ok()?
+            .replace('_', "")
+            .parse()
+            .ok(),
+        "long_literal" => first_named_child_of_kind(node, "integer_literal").and_then(|child| {
+            child
+                .utf8_text(source.as_bytes())
+                .ok()?
+                .replace('_', "")
+                .parse()
+                .ok()
+        }),
+        "prefix_expression" if node.named_child_count() == 1 => {
+            let operand = node.named_child(0)?;
+            let value = kotlin_decimal_integer_value(operand, source)?;
+            let operator = node
+                .children(&mut node.walk())
+                .find(|child| !child.is_named())
+                .map(|child| child.kind())?;
+            match operator {
+                "+" => Some(value),
+                "-" => value.checked_neg(),
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
+
+/// Classify a literal whose default Kotlin type is one of the supported scalar
+/// types. The value itself is read separately so the semantic producer can
+/// publish an exact constant.
+pub fn kotlin_literal_scalar_type(node: Node<'_>, source: &str) -> Option<KotlinScalarType> {
+    match node.kind() {
+        "integer_literal" => kotlin_decimal_integer_value(node, source).and_then(|value| {
+            if i32::MIN as i128 <= value && value <= i32::MAX as i128 {
+                Some(KotlinScalarType::Int)
+            } else if i64::MIN as i128 <= value && value <= i64::MAX as i128 {
+                Some(KotlinScalarType::Long)
+            } else {
+                None
+            }
+        }),
+        "long_literal" => Some(KotlinScalarType::Long),
+        "boolean_literal"
+            if matches!(node.utf8_text(source.as_bytes()).ok()?, "true" | "false") =>
+        {
+            Some(KotlinScalarType::Boolean)
+        }
+        "prefix_expression" if node.named_child_count() == 1 => {
+            let operator = node
+                .children(&mut node.walk())
+                .find(|child| !child.is_named())
+                .map(|child| child.kind())?;
+            if !matches!(operator, "+" | "-") {
+                return None;
+            }
+            let operand = node.named_child(0)?;
+            if operand.kind() == "long_literal" {
+                return Some(KotlinScalarType::Long);
+            }
+            let value = kotlin_decimal_integer_value(node, source)?;
+            if i32::MIN as i128 <= value && value <= i32::MAX as i128 {
+                Some(KotlinScalarType::Int)
+            } else if i64::MIN as i128 <= value && value <= i64::MAX as i128 {
+                Some(KotlinScalarType::Long)
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
 }
 
 pub fn kotlin_extension_receiver_components(

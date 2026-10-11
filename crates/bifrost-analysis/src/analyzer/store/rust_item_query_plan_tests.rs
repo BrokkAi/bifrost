@@ -5,7 +5,7 @@
 //! relation is selected by its leading `blob_id` key before its publication
 //! rows are hydrated.
 
-use rusqlite::{Connection, params_from_iter, types::Value};
+use rusqlite::{Connection, types::Value};
 
 use crate::analyzer::rust::RustAdapter;
 use crate::inline_project::InlineTestProject;
@@ -53,14 +53,12 @@ struct QueryPlanCase {
 }
 
 fn explain(connection: &Connection, case: &QueryPlanCase) -> Vec<String> {
-    let mut statement = connection
-        .prepare(&format!("EXPLAIN QUERY PLAN {}", case.sql))
-        .unwrap_or_else(|error| panic!("{} SQL failed to prepare: {error}", case.name));
-    statement
-        .query_map(params_from_iter(case.parameters.iter()), |row| row.get(3))
-        .unwrap_or_else(|error| panic!("{} SQL failed to explain: {error}", case.name))
-        .collect::<rusqlite::Result<Vec<_>>>()
-        .unwrap_or_else(|error| panic!("{} query plan failed to decode: {error}", case.name))
+    crate::analyzer::store::planner_statistics::pinned_plans::plan_rows_for_sql(
+        connection,
+        case.sql,
+        &case.parameters,
+    )
+    .unwrap_or_else(|error| panic!("{} query plan failed: {error}", case.name))
 }
 
 fn reader_explain(store: &AnalyzerStore, case: &QueryPlanCase) -> Vec<String> {

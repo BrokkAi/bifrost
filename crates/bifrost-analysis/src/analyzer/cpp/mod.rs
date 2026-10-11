@@ -8,7 +8,11 @@ pub(crate) mod external;
 mod hierarchy;
 mod identity;
 mod imports;
+pub mod initializer_facts;
+mod native_obligation;
 mod projection;
+pub mod provenance_facts;
+pub mod range_facts;
 mod semantic;
 pub(crate) mod source_publication;
 pub(crate) mod source_publication_context;
@@ -17,15 +21,15 @@ mod structural;
 #[cfg(test)]
 mod tests;
 
-use crate::analyzer::clone_detection::{
-    CloneCandidateProfile, detect_structural_clone_smells, refine_clone_similarity_with_ast,
-};
+use crate::analyzer::assignment_facts::OverwrittenLocalCandidates;
+use crate::analyzer::clone_detection::detect_structural_clone_smells_for_corpus;
 use crate::analyzer::common::language_for_file as file_language;
 use crate::analyzer::languages::{
     BoundedReceiverQuery, DeadCodeBulkEdges, DeadCodeBulkPreflight, DeadCodeBulkProof,
     DeadCodeRouting, DeadCodeSupport, EdgePassId, EdgeSiteScanCtx, EdgeWeightScanCtx,
     LanguageEdgePass, LanguageEdgeSites, LanguageEdgeWeights, LanguageSupport,
     StructuralReceiverResolver, analyzable_file_count, fqn_bulk_nodes, overloaded_function_fqns,
+    ready_preflight,
 };
 use crate::analyzer::store::LimitedQueryRows;
 use crate::analyzer::tree_sitter_analyzer::{BulkFileStateSource, LanguageAdapter};
@@ -45,7 +49,7 @@ use crate::analyzer::{
     IAnalyzer, ImportAnalysisProvider, ImportInfo, KeyedPoolSafeMemo, Language, PoolSafeMemo,
     Project, ProjectFile, Range, SignatureMetadata, TestAssertionSmell, TestAssertionWeights,
     TestDetectionProvider, TreeSitterAnalyzer, TypeAliasProvider, TypeHierarchyProvider,
-    resolve_analyzer,
+    WorkspaceAnalyzer, resolve_analyzer,
 };
 use crate::analyzer::{AnalyzerQueryScope, QueryScope, QueryToken};
 use crate::hash::{HashMap, HashSet};
@@ -53,6 +57,12 @@ use moka::sync::Cache;
 use rayon::prelude::*;
 use std::collections::{BTreeSet, VecDeque};
 use std::sync::{Arc, OnceLock};
+
+type CallMacroHazards = Arc<HashMap<(usize, usize), bool>>;
+type CAssignmentCandidateKey = (
+    crate::analyzer::semantic::SemanticArtifactMaterializationId,
+    crate::analyzer::semantic::ProcedureId,
+);
 
 pub(crate) use adapter::CppAdapter;
 use brokk_bifrost_cpp::adapter::parse_cpp_file_with_object_macro_fields;
@@ -70,12 +80,14 @@ use brokk_bifrost_cpp::graph::resolver::{
 use brokk_bifrost_cpp::graph::syntax::ObjectMacroReplacement;
 use brokk_bifrost_cpp::graph_support::CppSource;
 use brokk_bifrost_cpp::identity::{
-    CppReconcileCandidates, CppReconcileGroupKey, CppReconciledDefinitionIndex,
+    CppReconcileCandidates, CppReconcileGroupKey, CppReconciledDefinitionIndex, CppReconciledGroup,
     cpp_reconcile_candidates_from_units, cpp_reconcile_group, cpp_reconcile_group_key,
+    cpp_reconcile_group_key_for_fq,
 };
 use brokk_bifrost_cpp::imports::{
     IncludeTargetIndex, include_paths, resolve_include_targets_with_index,
 };
+pub use brokk_bifrost_cpp::structural::{CppCallResultUseIndex, cpp_call_result_use};
 use brokk_bifrost_cpp::test_detection::detect_cpp_test_assertion_smells;
 use cache::{
     weight_code_unit_set_by_file, weight_code_unit_vec_by_file, weight_include_reachability,
@@ -83,6 +95,7 @@ use cache::{
     weight_source_using_index,
 };
 use clones::build_clone_candidate_data;
+pub use native_obligation::{CppNativeObligationProof, cpp_native_result_obligation};
 
 pub(crate) use brokk_bifrost_cpp::declarations::{
     ObjectMacroFieldEvent, collect_cpp_object_macro_field_events, cpp_sentinel_recovered_classes,
@@ -90,8 +103,8 @@ pub(crate) use brokk_bifrost_cpp::declarations::{
 };
 use brokk_bifrost_cpp::identity::cpp_callable_unit_role;
 pub(crate) use brokk_bifrost_cpp::identity::{
-    CppCallableUnitRole, CppOccurrenceRole, cpp_indexed_callable_linkage,
-    cpp_is_range_for_binding_name, cpp_range_is_pure_virtual_declaration,
+    CppCallableUnitRole, CppOccurrenceRole, cpp_is_range_for_binding_name,
+    cpp_range_is_pure_virtual_declaration,
 };
 
 #[derive(Clone)]
@@ -130,6 +143,28 @@ pub struct CppAnalyzer {
     /// owner's include closure. This remains an analyzer overlay because the
     /// donor macro and consuming aggregate live in different parsed blobs.
     macro_composed_fields_by_file: Cache<ProjectFile, Arc<Vec<MacroComposedField>>>,
+    /// Structured facts shared by C++ semantic lowering and assignment
+    /// candidates. The cache is per file and byte bounded so a policy query
+    /// does not re-walk the translation unit for every procedure.
+    file_facts_by_file: Cache<ProjectFile, Arc<semantic::CppFileFacts>>,
+    /// Structured call-resolution macro hazards, computed once over a
+    /// translation unit and reused by every procedure candidate in it.
+    call_macro_hazards_by_file: Cache<ProjectFile, CallMacroHazards>,
+    /// Query-lifetime statement rows are retained per file so a policy with
+    /// several structural seeds parses each translation unit only once. The
+    /// weighted cap keeps this file-derived cache bounded by the analyzer
+    /// memo budget.
+    statement_facts_by_file: Cache<
+        ProjectFile,
+        Arc<brokk_bifrost_core::analyzer::statement_facts::CppStatementFactRows>,
+    >,
+    /// C assignment syntax candidates are requested by more than one
+    /// relation binding. Retain one completed answer per immutable procedure
+    /// artifact so the prepared tree and semantic joins are not repeated.
+    c_assignment_candidates_by_procedure:
+        Cache<CAssignmentCandidateKey, Arc<expression_branch_facts::CAssignmentCandidates>>,
+    cpp_overwritten_candidates_by_procedure:
+        Cache<CAssignmentCandidateKey, Arc<OverwrittenLocalCandidates>>,
     referencing_files: Cache<ProjectFile, Arc<HashSet<ProjectFile>>>,
     direct_ancestors: Cache<CodeUnit, Arc<Vec<CodeUnit>>>,
     visible_type_units_by_file: Cache<ProjectFile, Arc<Vec<CodeUnit>>>,
@@ -139,7 +174,10 @@ pub struct CppAnalyzer {
     /// query, and rebuilding this index per query re-walked a 9.5 MB
     /// amalgamation's AST once per candidate (issue #1927).
     source_using_index_by_file: Cache<ProjectFile, Arc<SourceUsingIndex>>,
-    unconditional_include_reachability: Cache<(ProjectFile, ProjectFile, bool), bool>,
+    /// The immutable analyzer generation and reference root determine the
+    /// language and source-only guard proof without evaluating that proof
+    /// before a cache lookup.
+    unconditional_include_reachability: Cache<(ProjectFile, ProjectFile, ProjectFile), bool>,
     /// The declaration-strength answer behind
     /// [`CppSource::cached_class_declaration_strength`]. Memoized here rather
     /// than per query for the same reason as `source_using_index_by_file`: the
@@ -194,8 +232,7 @@ pub struct CppAnalyzer {
     /// exactly that pair, so the old per-fq key never hit for a bare identifier
     /// whose namesakes have distinct owners: 1,277 distinct keys, 1,277
     /// identical rebuilds (#1908). See `reconciled_definitions`.
-    reconciled_definitions_by_group:
-        Cache<CppReconcileGroupKey, Arc<HashMap<String, Arc<CppReconciledDefinitionIndex>>>>,
+    reconciled_definitions_by_group: Cache<CppReconcileGroupKey, Arc<CppReconciledGroup>>,
     include_target_index: Arc<OnceLock<IncludeTargetIndex>>,
     reverse_include_index: Arc<PoolSafeMemo<HashMap<ProjectFile, Arc<HashSet<ProjectFile>>>>>,
     /// The transitive answer over [`Self::reverse_include_index`]: for a
@@ -219,10 +256,10 @@ pub struct CppAnalyzer {
     direct_descendant_index: Arc<KeyedPoolSafeMemo<DescendantIndexVariant, DirectDescendantIndex>>,
     compile_contexts: Arc<OnceLock<CppCompileContexts>>,
     external_header_closures: Arc<KeyedPoolSafeMemo<ProjectFile, external::ReachedExternalHeaders>>,
-    #[cfg(test)]
-    type_alias_classification_count: Arc<std::sync::atomic::AtomicUsize>,
     #[cfg(any(test, feature = "test-support"))]
     authoritative_visibility_build_count: Arc<std::sync::atomic::AtomicUsize>,
+    #[cfg(test)]
+    type_alias_classification_count: Arc<std::sync::atomic::AtomicUsize>,
     #[cfg(any(test, feature = "test-support"))]
     target_spec_scan_count: Arc<std::sync::atomic::AtomicUsize>,
     #[cfg(any(test, feature = "test-support"))]
@@ -317,6 +354,13 @@ impl ForwardQueryProvider for CppAnalyzer {
 }
 
 impl CppAnalyzer {
+    pub(crate) fn update_all_with_progress(
+        &self,
+        progress: Option<crate::analyzer::BuildProgress>,
+    ) -> Self {
+        self.with_updated_inner(self.inner.update_all_with_progress(progress))
+    }
+
     /// Share only completed file-derived values. A waiter receives the same
     /// typed failure as its builder, and records it on its own open scopes.
     fn cached_complete_read<K, T>(
@@ -349,6 +393,125 @@ impl CppAnalyzer {
         })
     }
 
+    pub(crate) fn file_facts_for(
+        &self,
+        file: &ProjectFile,
+        source: &str,
+        root: tree_sitter::Node<'_>,
+        is_c_source: bool,
+    ) -> Arc<semantic::CppFileFacts> {
+        self.cached_complete_read(&self.file_facts_by_file, file, || {
+            semantic::CppFileFacts::build(source, root, is_c_source)
+        })
+    }
+
+    pub(crate) fn c_assignment_candidates_for(
+        &self,
+        workspace: &WorkspaceAnalyzer,
+        procedure: &crate::analyzer::semantic::ProcedureHandle,
+        cancellation: Option<&crate::CancellationToken>,
+    ) -> Arc<expression_branch_facts::CAssignmentCandidates> {
+        let key = (procedure.artifact().materialization_id(), procedure.id());
+        self.cached_complete_read(&self.c_assignment_candidates_by_procedure, &key, || {
+            expression_branch_facts::build_c_assignment_candidates(
+                workspace,
+                procedure,
+                cancellation,
+            )
+        })
+    }
+
+    pub(crate) fn cpp_overwritten_candidates_for(
+        &self,
+        workspace: &WorkspaceAnalyzer,
+        procedure: &crate::analyzer::semantic::ProcedureHandle,
+        cancellation: Option<&crate::CancellationToken>,
+    ) -> Arc<OverwrittenLocalCandidates> {
+        let key = (procedure.artifact().materialization_id(), procedure.id());
+        match self
+            .cpp_overwritten_candidates_by_procedure
+            .try_get_with_by_ref(&key, || {
+                let scope = AnalyzerQueryScope::new(self);
+                let value = expression_branch_facts::build_cpp_overwritten_local_candidates(
+                    workspace,
+                    procedure,
+                    cancellation,
+                );
+                scope.read_completion()?;
+                Ok::<_, crate::analyzer::QueryReadIncomplete>(Arc::new(value))
+            }) {
+            Ok(value) => value,
+            Err(reason) => {
+                self.record_query_incomplete((*reason).clone());
+                Arc::new(OverwrittenLocalCandidates {
+                    rows: Vec::new(),
+                    complete: false,
+                    reason: Some("query_incomplete"),
+                })
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn call_macro_hazards_for(
+        &self,
+        file: &ProjectFile,
+        source: &str,
+        root: tree_sitter::Node<'_>,
+        is_c_source: bool,
+        function_like_macros: &HashSet<Box<str>>,
+        artifact: &crate::analyzer::semantic::SemanticArtifact,
+        cancellation: Option<&crate::CancellationToken>,
+    ) -> Arc<HashMap<(usize, usize), bool>> {
+        self.cached_complete_read(&self.call_macro_hazards_by_file, file, || {
+            expression_branch_facts::build_file_call_macro_hazards(
+                self,
+                source,
+                root,
+                is_c_source,
+                function_like_macros,
+                artifact,
+                cancellation,
+            )
+        })
+    }
+
+    pub(crate) fn statement_facts_for(
+        &self,
+        file: &ProjectFile,
+        source: &str,
+    ) -> Arc<brokk_bifrost_core::analyzer::statement_facts::CppStatementFactRows> {
+        self.cached_complete_read(&self.statement_facts_by_file, file, || {
+            brokk_bifrost_cpp::source_facts::parse_statement_fact_rows(source)
+        })
+    }
+
+    /// Return the exact scalar types the C/C++ producer can prove for one
+    /// procedure. File-wide typedef facts are read from the same bounded cache
+    /// used by semantic lowering and assignment candidates.
+    pub fn declared_scalar_types(
+        &self,
+        file: &ProjectFile,
+        procedure: &crate::analyzer::semantic::ProcedureHandle,
+        prepared: &crate::analyzer::tree_sitter_analyzer::PreparedSyntaxTree,
+    ) -> Vec<(
+        crate::analyzer::semantic::ValueId,
+        crate::analyzer::declared_scalar::DeclaredScalarType,
+    )> {
+        let is_c_source = file
+            .rel_path()
+            .extension()
+            .and_then(|extension| extension.to_str())
+            == Some("c");
+        let facts = self.file_facts_for(
+            file,
+            prepared.source(),
+            prepared.tree().root_node(),
+            is_c_source,
+        );
+        semantic::cpp_declared_scalar_types(procedure, prepared, &facts.scalar_types)
+    }
+
     fn all_macro_composed_fields(&self) -> Vec<MacroComposedField> {
         self.inner
             .get_analyzed_files()
@@ -360,6 +523,19 @@ impl CppAnalyzer {
                     .into_iter()
             })
             .collect()
+    }
+
+    fn extend_with_macro_composed_fields(
+        &self,
+        units: &mut BTreeSet<CodeUnit>,
+        mut matches: impl FnMut(&CodeUnit) -> bool,
+    ) {
+        units.extend(
+            self.all_macro_composed_fields()
+                .into_iter()
+                .filter(|field| matches(&field.unit))
+                .map(|field| field.unit),
+        );
     }
 
     fn all_macro_composed_fields_while(
@@ -629,9 +805,25 @@ impl CppAnalyzer {
     }
 
     pub(crate) fn reconciled_provisional(&self, unit: &CodeUnit) -> Option<CodeUnit> {
-        self.reconciled_definitions(&unit.fq_name())
-            .provisional_of
-            .get(unit)
+        self.reconciled_provisional_with_cancellation(unit, None)
+    }
+
+    fn reconciled_provisional_with_cancellation(
+        &self,
+        unit: &CodeUnit,
+        cancellation: Option<&crate::CancellationToken>,
+    ) -> Option<CodeUnit> {
+        if !unit.is_callable() || !unit.owner_is_type_scope() {
+            return None;
+        }
+        // Cached ownership still depends on this snapshot's C++ content and
+        // configuration. Replayable callers must retain that proof on a hit.
+        self.inner
+            .record_reads(|sink| sink.push(self.inner.scope_read_key()));
+        self.reconciled_group_for_key(cpp_reconcile_group_key_for_fq(unit.fq()), cancellation)
+            .by_name
+            .get(unit.fq_name_str())
+            .and_then(|index| index.provisional_of.get(unit))
             .cloned()
     }
 
@@ -644,9 +836,11 @@ impl CppAnalyzer {
     }
 
     pub fn new_with_config(project: Arc<dyn Project>, config: AnalyzerConfig) -> Self {
-        let memo_budget = config.memo_cache_budget_bytes();
-        let inner = TreeSitterAnalyzer::new_with_config(project, CppAdapter, config);
-        Self::from_inner(inner, memo_budget)
+        TreeSitterAnalyzer::wrap_with_config(
+            config,
+            |config| TreeSitterAnalyzer::new_with_config(project, CppAdapter, config),
+            Self::from_inner,
+        )
     }
 
     pub(crate) fn new_with_config_store_context(
@@ -655,15 +849,19 @@ impl CppAnalyzer {
         store_context: AnalyzerStoreContext,
         progress: Option<BuildProgress>,
     ) -> Result<Self, crate::analyzer::store::StoreError> {
-        let memo_budget = config.memo_cache_budget_bytes();
-        let inner = TreeSitterAnalyzer::new_with_config_storage_context_and_progress(
-            project,
-            CppAdapter,
+        TreeSitterAnalyzer::try_wrap_with_config(
             config,
-            store_context,
-            progress,
-        )?;
-        Ok(Self::from_inner(inner, memo_budget))
+            |config| {
+                TreeSitterAnalyzer::new_with_config_storage_context_and_progress(
+                    project,
+                    CppAdapter,
+                    config,
+                    store_context,
+                    progress,
+                )
+            },
+            Self::from_inner,
+        )
     }
 
     fn from_inner(inner: TreeSitterAnalyzer<CppAdapter>, memo_budget: u64) -> Self {
@@ -683,6 +881,23 @@ impl CppAnalyzer {
             macro_composed_fields_by_file: build_weighted_cache(
                 memo_budget / 8,
                 cache::weight_macro_composed_field_vec_by_file,
+            ),
+            file_facts_by_file: build_weighted_cache(memo_budget / 8, cache::weight_cpp_file_facts),
+            call_macro_hazards_by_file: build_weighted_cache(
+                memo_budget / 8,
+                cache::weight_call_macro_hazards,
+            ),
+            statement_facts_by_file: build_weighted_cache(
+                memo_budget / 8,
+                cache::weight_statement_fact_rows,
+            ),
+            c_assignment_candidates_by_procedure: build_weighted_cache(
+                memo_budget / 8,
+                cache::weight_c_assignment_candidates,
+            ),
+            cpp_overwritten_candidates_by_procedure: build_weighted_cache(
+                memo_budget / 8,
+                cache::weight_cpp_overwritten_candidates,
             ),
             referencing_files: build_weighted_cache(memo_budget / 8, weight_project_file_set),
             direct_ancestors: build_weighted_cache(memo_budget / 8, weight_code_unit_vec_by_unit),
@@ -733,10 +948,10 @@ impl CppAnalyzer {
             direct_descendant_index: Arc::new(KeyedPoolSafeMemo::new()),
             compile_contexts: Arc::new(OnceLock::new()),
             external_header_closures: Arc::new(KeyedPoolSafeMemo::new()),
-            #[cfg(test)]
-            type_alias_classification_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             #[cfg(any(test, feature = "test-support"))]
             authoritative_visibility_build_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            #[cfg(test)]
+            type_alias_classification_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             #[cfg(any(test, feature = "test-support"))]
             target_spec_scan_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             #[cfg(any(test, feature = "test-support"))]
@@ -795,8 +1010,28 @@ impl CppAnalyzer {
         request_cancellation: Option<&crate::CancellationToken>,
     ) -> Arc<CppReconciledDefinitionIndex> {
         static EMPTY: OnceLock<Arc<CppReconciledDefinitionIndex>> = OnceLock::new();
+        self.reconciled_group_with_cancellation(fq_name, request_cancellation)
+            .by_name
+            .get(fq_name)
+            .map_or_else(|| Arc::clone(EMPTY.get_or_init(Arc::default)), Arc::clone)
+    }
+
+    fn reconciled_group_with_cancellation(
+        &self,
+        fq_name: &str,
+        request_cancellation: Option<&crate::CancellationToken>,
+    ) -> Arc<CppReconciledGroup> {
+        self.reconciled_group_for_key(cpp_reconcile_group_key(fq_name), request_cancellation)
+    }
+
+    fn reconciled_group_for_key(
+        &self,
+        key: Option<CppReconcileGroupKey>,
+        request_cancellation: Option<&crate::CancellationToken>,
+    ) -> Arc<CppReconciledGroup> {
+        static EMPTY: OnceLock<Arc<CppReconciledGroup>> = OnceLock::new();
         let empty = || Arc::clone(EMPTY.get_or_init(Arc::default));
-        let Some(key) = cpp_reconcile_group_key(fq_name) else {
+        let Some(key) = key else {
             return empty();
         };
         // The request's deadline, if its opener set one. `IAnalyzer::definitions`
@@ -898,119 +1133,17 @@ impl CppAnalyzer {
                     .map(Arc::new)
                     .ok_or(crate::analyzer::QueryReadIncomplete::Cancelled)
             });
-        let groups = match groups {
+        match groups {
             Ok(groups) => groups,
             Err(reason) => {
                 self.record_query_incomplete((*reason).clone());
-                return empty();
+                empty()
             }
-        };
-        groups.get(fq_name).map_or_else(empty, Arc::clone)
+        }
     }
 
     fn with_updated_inner(&self, inner: TreeSitterAnalyzer<CppAdapter>) -> Self {
-        let analyzer = Self {
-            inner,
-            memo_budget: self.memo_budget,
-            canonical_source_facts: build_weighted_cache(
-                self.memo_budget / 8,
-                |_, facts: &Arc<brokk_bifrost_cpp::source_facts::CppFileSourceFacts>| {
-                    facts.estimated_retained_bytes().min(u32::MAX as usize) as u32
-                },
-            ),
-            imported_code_units: build_weighted_cache(
-                self.memo_budget / 4,
-                weight_code_unit_set_by_file,
-            ),
-            macro_composed_fields_by_file: build_weighted_cache(
-                self.memo_budget / 8,
-                cache::weight_macro_composed_field_vec_by_file,
-            ),
-            referencing_files: build_weighted_cache(self.memo_budget / 8, weight_project_file_set),
-            direct_ancestors: build_weighted_cache(
-                self.memo_budget / 8,
-                weight_code_unit_vec_by_unit,
-            ),
-            visible_type_units_by_file: build_weighted_cache(
-                self.memo_budget / 8,
-                weight_code_unit_vec_by_file,
-            ),
-            source_using_index_by_file: build_weighted_cache(
-                self.memo_budget / 8,
-                weight_source_using_index,
-            ),
-            unconditional_include_reachability: build_weighted_cache(
-                self.memo_budget / 8,
-                weight_include_reachability,
-            ),
-            class_declaration_strength: build_weighted_cache(
-                self.memo_budget / 8,
-                cache::weight_class_declaration_strength,
-            ),
-            recovered_export_class_index_by_file: build_weighted_cache(
-                self.memo_budget / 8,
-                cache::weight_recovered_export_class_index,
-            ),
-            orphaned_namespace_scopes_by_file: build_weighted_cache(
-                self.memo_budget / 8,
-                cache::weight_orphaned_namespace_scopes,
-            ),
-            c_readings_by_file: build_weighted_cache(self.memo_budget / 8, cache::weight_c_reading),
-            header_language_attribution_by_file: build_weighted_cache(
-                self.memo_budget / 8,
-                cache::weight_header_language_attribution,
-            ),
-            object_macro_field_events_by_file: build_weighted_cache(
-                self.memo_budget / 8,
-                cache::weight_object_macro_field_events,
-            ),
-            reconcile_candidates_by_identifier: build_weighted_cache(
-                self.memo_budget / 8,
-                weight_reconcile_candidates,
-            ),
-            reconciled_definitions_by_group: build_weighted_cache(
-                self.memo_budget / 8,
-                weight_reconciled_groups,
-            ),
-            include_target_index: Arc::new(OnceLock::new()),
-            reverse_include_index: Arc::new(PoolSafeMemo::new()),
-            transitive_reverse_tu_index: Arc::new(PoolSafeMemo::new()),
-            direct_descendant_index: Arc::new(KeyedPoolSafeMemo::new()),
-            compile_contexts: Arc::new(OnceLock::new()),
-            external_header_closures: Arc::new(KeyedPoolSafeMemo::new()),
-            #[cfg(test)]
-            type_alias_classification_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
-            #[cfg(any(test, feature = "test-support"))]
-            authoritative_visibility_build_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
-            #[cfg(any(test, feature = "test-support"))]
-            target_spec_scan_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
-            #[cfg(any(test, feature = "test-support"))]
-            cpp_parent_resolution_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
-            #[cfg(any(test, feature = "test-support"))]
-            cpp_class_strength_parse_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
-            #[cfg(any(test, feature = "test-support"))]
-            visible_type_units_build_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
-            #[cfg(any(test, feature = "test-support"))]
-            source_using_index_build_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
-            #[cfg(any(test, feature = "test-support"))]
-            using_guard_context_inspection_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
-            #[cfg(any(test, feature = "test-support"))]
-            macro_composed_fields_build_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
-            #[cfg(any(test, feature = "test-support"))]
-            reconcile_candidate_scan_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
-            #[cfg(any(test, feature = "test-support"))]
-            reconcile_candidate_evaluation_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
-            #[cfg(any(test, feature = "test-support"))]
-            reconcile_stored_signature_metadata_count: Arc::new(
-                std::sync::atomic::AtomicUsize::new(0),
-            ),
-            #[cfg(test)]
-            external_header_closure_build_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
-            #[cfg(test)]
-            external_header_parse_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
-        };
-        analyzer.sync_published_c_reading_workspace();
-        analyzer
+        Self::from_inner(inner, self.memo_budget)
     }
 
     fn relational_definition_values(
@@ -1159,11 +1292,19 @@ impl CppAnalyzer {
         if source.for_unit(unit).next().is_some() {
             physical_units.push(unit.clone());
         }
-        // Reconciliation can retain a declaration and rekey its out-of-line
-        // definition in the same file. Both exact physical bridges contribute
-        // occurrences to the published unit. Only callable identities can be
-        // rekeyed; type-property reads must not scan global callable candidates.
+        // Reconciliation preserves source, kind, identifier and signature.
+        // A reverse lookup can add a bridge only if this file has a distinct
+        // physical callable with those attributes. Keep the same-file
+        // declaration/body union, but do not build a workspace cohort merely
+        // to read an already-mounted callable's source properties.
         if unit.is_callable()
+            && source.declaration_units.values().flatten().any(|physical| {
+                physical != unit
+                    && physical.kind() == unit.kind()
+                    && physical.identifier() == unit.identifier()
+                    && physical.signature() == unit.signature()
+                    && physical.is_synthetic() == unit.is_synthetic()
+            })
             && let Some(physical) = self.reconciled_provisional(unit)
             && physical != *unit
             && source.for_unit(&physical).next().is_some()
@@ -1215,14 +1356,16 @@ impl CppAnalyzer {
             .contexts_for(file)
     }
 
-    pub(crate) fn resolve_external_angle_include(
+    pub(crate) fn resolve_external_include(
         &self,
         file: &ProjectFile,
+        including_file: &std::path::Path,
         include: &std::path::Path,
+        quoted: bool,
     ) -> brokk_bifrost_cpp::compile_context::CppExternalIncludeResolution {
         self.compile_contexts
             .get_or_init(|| CppCompileContexts::load(self.inner.project()))
-            .resolve_external_angle_include(file, include)
+            .resolve_external_include(file, including_file, include, quoted)
     }
 
     pub(crate) fn prepared_syntax(
@@ -1284,8 +1427,8 @@ impl CppAnalyzer {
             .collect()
     }
 
-    pub(crate) fn active_query_cancellation(&self) -> Option<crate::CancellationToken> {
-        self.inner.active_query_cancellation()
+    crate::analyzer::tree_sitter_analyzer::delegate_inner_methods! {
+        pub(crate) fn active_query_cancellation(&self) -> Option<crate::CancellationToken>;
     }
 
     fn external_header_closure_cell(
@@ -1335,6 +1478,31 @@ impl CppAnalyzer {
     ) -> LimitedQueryRows<CodeUnit> {
         self.inner
             .lookup_members_for_owner_name_limited(owner_fqn, name, limit, continue_query)
+    }
+
+    pub(crate) fn identifier_candidates_limited(
+        &self,
+        identifier: &str,
+        limit: usize,
+        continue_query: impl FnMut() -> bool,
+    ) -> LimitedQueryRows<CodeUnit> {
+        self.inner
+            .lookup_declarations_by_identifier_limited(identifier, limit, continue_query)
+    }
+
+    pub(crate) fn fqn_candidates_limited(
+        &self,
+        fqn: &str,
+        normalized: bool,
+        limit: usize,
+        continue_query: impl FnMut() -> bool,
+    ) -> LimitedQueryRows<CodeUnit> {
+        self.inner.lookup_declarations_by_persisted_fqn_limited(
+            fqn,
+            normalized,
+            limit,
+            continue_query,
+        )
     }
 
     pub(crate) fn signature_metadata_limited(
@@ -1507,12 +1675,12 @@ impl CppAnalyzer {
         }
     }
 
-    pub(crate) fn signatures_limited(
+    crate::analyzer::tree_sitter_analyzer::delegate_inner_methods! {
+        pub(crate) fn signatures_limited(
         &self,
         code_unit: &CodeUnit,
         limit: usize,
-    ) -> LimitedQueryRows<String> {
-        self.inner.signatures_limited(code_unit, limit)
+    ) -> LimitedQueryRows<String>;
     }
 
     pub(crate) fn ranges_limited(
@@ -1599,13 +1767,26 @@ impl CppAnalyzer {
 
     #[cfg(any(test, feature = "test-support"))]
     pub fn reset_authoritative_visibility_build_count_for_test(&self) {
-        self.authoritative_visibility_build_count
-            .store(0, std::sync::atomic::Ordering::Relaxed);
+        crate::analyzer::i_analyzer::reset_test_hook_counter(
+            &self.authoritative_visibility_build_count,
+        );
     }
 
     #[cfg(any(test, feature = "test-support"))]
     pub fn authoritative_visibility_build_count_for_test(&self) -> usize {
         self.authoritative_visibility_build_count
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn reset_type_alias_classification_count_for_test(&self) {
+        self.type_alias_classification_count
+            .store(0, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn type_alias_classification_count_for_test(&self) -> usize {
+        self.type_alias_classification_count
             .load(std::sync::atomic::Ordering::Relaxed)
     }
 
@@ -1661,8 +1842,7 @@ impl CppAnalyzer {
 
     #[cfg(any(test, feature = "test-support"))]
     pub fn reset_visible_type_units_build_count_for_test(&self) {
-        self.visible_type_units_build_count
-            .store(0, std::sync::atomic::Ordering::Relaxed);
+        crate::analyzer::i_analyzer::reset_test_hook_counter(&self.visible_type_units_build_count);
     }
 
     #[cfg(any(test, feature = "test-support"))]
@@ -1743,35 +1923,13 @@ impl CppAnalyzer {
     pub fn sql_definitions_query_count_for_test(&self) -> usize {
         self.inner.sql_definitions_query_count_for_test()
     }
-
-    #[cfg(test)]
-    pub(crate) fn reset_live_oid_validation_counts_for_test(&self) {
-        self.inner.reset_live_oid_validation_counts_for_test();
-    }
-
-    #[cfg(test)]
-    pub(crate) fn live_oid_validation_count_for_test(&self, file: &ProjectFile) -> usize {
-        self.inner.live_oid_validation_count_for_test(file)
-    }
-
-    #[cfg(test)]
-    pub(crate) fn reset_type_alias_classification_count_for_test(&self) {
-        self.type_alias_classification_count
-            .store(0, std::sync::atomic::Ordering::Relaxed);
-    }
-
-    #[cfg(test)]
-    pub(crate) fn type_alias_classification_count_for_test(&self) -> usize {
-        self.type_alias_classification_count
-            .load(std::sync::atomic::Ordering::Relaxed)
-    }
 }
 
 use crate::analyzer::CodeUnitIndex;
 
 /// The memoized C++ products [`brokk_bifrost_cpp`]'s free functions resolve
 /// through. Every method answers from an accessor `CppAnalyzer` already had, so
-/// the five caches, two `OnceLock`s and two `PoolSafeMemo`s stay here and no
+/// the bounded caches, two `OnceLock`s and two `PoolSafeMemo`s stay here and no
 /// function on the other side of the crate line can reach past this surface.
 impl CppSource for CppAnalyzer {
     fn declaration_source_facts(
@@ -1829,19 +1987,7 @@ impl CppSource for CppAnalyzer {
                 .iter()
                 .flat_map(|unit| source.for_unit(unit))
                 .filter(|fact| seen.insert(fact.declaration))
-                .map(|fact| {
-                    let declaration = source.source.declaration(fact.declaration);
-                    let range = source.source.occurrence(declaration.occurrence).range;
-                    let conditional_family = fact.conditional_family.map(|id| {
-                        let range = source.source.occurrence(id).range;
-                        (range.start_byte, range.end_byte)
-                    });
-                    brokk_bifrost_cpp::source_facts::CppNavigationOccurrence {
-                        range,
-                        role: fact.occurrence_role,
-                        conditional_family,
-                    }
-                })
+                .map(|fact| source.navigation_occurrence(fact))
                 .collect(),
         )
     }
@@ -1881,6 +2027,19 @@ impl CppSource for CppAnalyzer {
         self.reconcile_stored_signature_metadata_count
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         cpp_callable_unit_role(&self.inner, callable)
+    }
+
+    fn stored_signature_metadata(&self, callable: &CodeUnit) -> Vec<SignatureMetadata> {
+        let metadata = self.inner.signature_metadata(callable);
+        if !metadata.is_empty() {
+            return metadata;
+        }
+        self.reconciled_definitions(&callable.fq_name())
+            .provisional_of
+            .get(callable)
+            .map_or_else(Vec::new, |provisional| {
+                self.inner.signature_metadata(provisional)
+            })
     }
 
     fn include_target_index(&self) -> &IncludeTargetIndex {
@@ -1947,12 +2106,12 @@ impl CppSource for CppAnalyzer {
         &self,
         first: &ProjectFile,
         donor_source: &ProjectFile,
-        reference_is_c: bool,
+        reference_file: &ProjectFile,
     ) -> Option<bool> {
         self.unconditional_include_reachability.get(&(
             first.clone(),
             donor_source.clone(),
-            reference_is_c,
+            reference_file.clone(),
         ))
     }
 
@@ -1960,7 +2119,7 @@ impl CppSource for CppAnalyzer {
         &self,
         first: &ProjectFile,
         donor_source: &ProjectFile,
-        reference_is_c: bool,
+        reference_file: &ProjectFile,
         reaches: bool,
     ) {
         let scope = AnalyzerQueryScope::new(self);
@@ -1969,7 +2128,7 @@ impl CppSource for CppAnalyzer {
         }
 
         self.unconditional_include_reachability.insert(
-            (first.clone(), donor_source.clone(), reference_is_c),
+            (first.clone(), donor_source.clone(), reference_file.clone()),
             reaches,
         );
     }
@@ -2111,50 +2270,49 @@ impl CppWorkspaceSource for CppAnalyzer {
 }
 
 impl CodeUnitIndex for CppAnalyzer {
-    /// Forwarded so the request-scoped memo on the inner analyzer answers
-    /// (#2679); the trait default would rebuild uncached per call.
-    fn class_range_index(
+    crate::analyzer::tree_sitter_analyzer::delegate_inner_methods! {
+        /// Forwarded so the request-scoped memo on the inner analyzer answers
+        /// (#2679); the trait default would rebuild uncached per call.
+        fn class_range_index(
         &self,
         file: &ProjectFile,
-    ) -> std::sync::Arc<brokk_bifrost_core::analyzer::usages::inverted_edges::ClassRangeIndex> {
-        self.inner.class_range_index(file)
+    ) -> std::sync::Arc<brokk_bifrost_core::analyzer::usages::inverted_edges::ClassRangeIndex>;
     }
 
-    fn enclosing_code_unit(
+    crate::analyzer::tree_sitter_analyzer::delegate_inner_methods! {
+        fn enclosing_code_unit(
         &self,
         file: &ProjectFile,
         range: &crate::analyzer::Range,
-    ) -> Option<CodeUnit> {
-        self.inner.enclosing_code_unit(file, range)
+    ) -> Option<CodeUnit>;
     }
 
-    fn enclosing_code_unit_for_lines(
+    crate::analyzer::tree_sitter_analyzer::delegate_inner_methods! {
+        fn enclosing_code_unit_for_lines(
+            &self,
+            file: &ProjectFile,
+            start_line: usize,
+            end_line: usize,
+        ) -> Option<CodeUnit>;
+    }
+
+    crate::analyzer::tree_sitter_analyzer::delegate_inner_methods! {
+        fn top_level_declarations(&self, file: &ProjectFile) -> Vec<CodeUnit>;
+    }
+
+    crate::analyzer::tree_sitter_analyzer::delegate_inner_methods! {
+        fn summary_file_projection(
         &self,
         file: &ProjectFile,
-        start_line: usize,
-        end_line: usize,
-    ) -> Option<CodeUnit> {
-        self.inner
-            .enclosing_code_unit_for_lines(file, start_line, end_line)
+    ) -> Option<Arc<crate::analyzer::SummaryFileProjection>>;
     }
 
-    fn top_level_declarations(&self, file: &ProjectFile) -> Vec<CodeUnit> {
-        self.inner.top_level_declarations(file)
+    crate::analyzer::tree_sitter_analyzer::delegate_inner_methods! {
+        fn analyzed_files(&self) -> Vec<ProjectFile>;
     }
 
-    fn summary_file_projection(
-        &self,
-        file: &ProjectFile,
-    ) -> Option<Arc<crate::analyzer::SummaryFileProjection>> {
-        self.inner.summary_file_projection(file)
-    }
-
-    fn analyzed_files(&self) -> Vec<ProjectFile> {
-        self.inner.analyzed_files()
-    }
-
-    fn indexed_source(&self, file: &ProjectFile) -> Option<String> {
-        self.inner.indexed_source(file)
+    crate::analyzer::tree_sitter_analyzer::delegate_inner_methods! {
+        fn indexed_source(&self, file: &ProjectFile) -> Option<String>;
     }
 
     /// #1970/#3287: the `cpp` row-set answers for a header's C++ reading only,
@@ -2181,16 +2339,16 @@ impl CodeUnitIndex for CppAnalyzer {
         self.c_reading_ranges(token, code_unit).unwrap_or(ranges)
     }
 
-    fn indexed_source_matches(&self, file: &ProjectFile, source: &str) -> bool {
-        self.inner.indexed_source_matches(file, source)
+    crate::analyzer::tree_sitter_analyzer::delegate_inner_methods! {
+        fn indexed_source_matches(&self, file: &ProjectFile, source: &str) -> bool;
     }
 
-    fn is_analyzed(&self, file: &ProjectFile) -> bool {
-        self.inner.is_analyzed(file)
+    crate::analyzer::tree_sitter_analyzer::delegate_inner_methods! {
+        fn is_analyzed(&self, file: &ProjectFile) -> bool;
     }
 
-    fn retain_analyzed(&self, candidates: &[ProjectFile]) -> Vec<ProjectFile> {
-        self.inner.retain_analyzed(candidates)
+    crate::analyzer::tree_sitter_analyzer::delegate_inner_methods! {
+        fn retain_analyzed(&self, candidates: &[ProjectFile]) -> Vec<ProjectFile>;
     }
 
     /// #1970: the relational workspace snapshot mounts a header's published C
@@ -2236,6 +2394,10 @@ impl CodeUnitIndex for CppAnalyzer {
         file: &ProjectFile,
     ) -> Vec<crate::analyzer::structural::materialization::MaterializationRecord> {
         self.inner.materialization_records(file)
+    }
+
+    fn parse_completeness(&self, file: &ProjectFile) -> crate::analyzer::ParseCompleteness {
+        self.inner.parse_completeness(file)
     }
 
     fn definitions(&self, fq_name: &str) -> Box<dyn Iterator<Item = CodeUnit> + '_> {
@@ -2292,12 +2454,8 @@ impl CodeUnitIndex for CppAnalyzer {
         // #1134: a re-keyed reconciled definition (canonical identity, real
         // `.cpp` source) is not itself in the store; its ranges live under the
         // provisional identity extraction assigned it.
-        if let Some(provisional) = self
-            .reconciled_definitions(&code_unit.fq_name())
-            .provisional_of
-            .get(code_unit)
-        {
-            return self.inner.ranges(provisional);
+        if let Some(provisional) = self.reconciled_provisional(code_unit) {
+            return self.inner.ranges(&provisional);
         }
         // #1970: likewise for a unit only the C reading of a header mints.
         self.c_reading_ranges(token, code_unit).unwrap_or(ranges)
@@ -2322,8 +2480,12 @@ impl CodeUnitIndex for CppAnalyzer {
                 total <= max_ranges && !cancellation.is_cancelled(),
             );
         }
-        self.inner
-            .ranges_with_limit(code_unit, max_ranges, cancellation)
+        let physical = self.reconciled_provisional_with_cancellation(code_unit, Some(cancellation));
+        self.inner.ranges_with_limit(
+            physical.as_ref().unwrap_or(code_unit),
+            max_ranges,
+            cancellation,
+        )
     }
 
     fn signatures(&self, code_unit: &CodeUnit) -> Vec<String> {
@@ -2352,12 +2514,8 @@ impl CodeUnitIndex for CppAnalyzer {
         // the `.cpp` definition are misread as an ambiguous cross-file duplicate.
         // Stored units always return non-empty here, so this never re-enters the
         // lazily-built index during its own construction.
-        if let Some(provisional) = self
-            .reconciled_definitions(&code_unit.fq_name())
-            .provisional_of
-            .get(code_unit)
-        {
-            let mut metadata = self.inner.signature_metadata(provisional);
+        if let Some(provisional) = self.reconciled_provisional(code_unit) {
+            let mut metadata = self.inner.signature_metadata(&provisional);
             self.reconcile_member_modifiers(code_unit, &mut metadata);
             self.reconcile_member_dispatch_extensibility(code_unit, &mut metadata);
             return metadata;
@@ -2365,16 +2523,12 @@ impl CodeUnitIndex for CppAnalyzer {
         metadata
     }
 
-    fn get_analyzed_files(&self) -> BTreeSet<ProjectFile> {
-        self.inner.get_analyzed_files()
+    crate::analyzer::tree_sitter_analyzer::delegate_inner_methods! {
+        fn languages(&self) -> BTreeSet<Language>;
     }
 
-    fn languages(&self) -> BTreeSet<Language> {
-        self.inner.languages()
-    }
-
-    fn project(&self) -> &dyn Project {
-        self.inner.project()
+    crate::analyzer::tree_sitter_analyzer::delegate_inner_methods! {
+        fn project(&self) -> &dyn Project;
     }
 
     /// See [`CodeUnitIndex::all_declarations`] above: both identities of a
@@ -2383,16 +2537,12 @@ impl CodeUnitIndex for CppAnalyzer {
         self.all_declarations().collect()
     }
 
-    fn get_definitions(&self, fq_name: &str) -> Vec<CodeUnit> {
-        self.definitions(fq_name).collect()
-    }
-
     fn get_skeleton(&self, code_unit: &CodeUnit) -> Option<String> {
         self.inner.get_skeleton(code_unit)
     }
 
-    fn get_skeleton_header(&self, code_unit: &CodeUnit) -> Option<String> {
-        self.inner.get_skeleton_header(code_unit)
+    crate::analyzer::tree_sitter_analyzer::delegate_inner_methods! {
+        fn get_skeleton_header(&self, code_unit: &CodeUnit) -> Option<String>;
     }
 
     fn get_source(&self, code_unit: &CodeUnit, include_comments: bool) -> Option<String> {
@@ -2419,12 +2569,7 @@ impl CodeUnitIndex for CppAnalyzer {
 
     fn search_definitions(&self, pattern: &str, auto_quote: bool) -> BTreeSet<CodeUnit> {
         let mut definitions = self.inner.search_definitions(pattern, auto_quote);
-        definitions.extend(
-            self.all_macro_composed_fields()
-                .iter()
-                .filter(|field| field.unit.fq_name() == pattern)
-                .map(|field| field.unit.clone()),
-        );
+        self.extend_with_macro_composed_fields(&mut definitions, |unit| unit.fq_name() == pattern);
         definitions
     }
 
@@ -2439,33 +2584,25 @@ impl CodeUnitIndex for CppAnalyzer {
             terminal_identifiers,
             language,
         );
-        definitions.extend(
-            self.all_macro_composed_fields()
+        self.extend_with_macro_composed_fields(&mut definitions, |unit| {
+            terminal_identifiers
                 .iter()
-                .filter(|field| {
-                    terminal_identifiers
-                        .iter()
-                        .any(|identifier| field.unit.identifier() == identifier)
-                        && field.unit.fq_name().ends_with(pattern)
-                })
-                .map(|field| field.unit.clone()),
-        );
+                .any(|identifier| unit.identifier() == identifier)
+                && unit.fq_name().ends_with(pattern)
+        });
         definitions
     }
 
     fn lookup_candidates_by_short_name(&self, symbol: &str) -> BTreeSet<CodeUnit> {
         let mut candidates = self.inner.lookup_candidates_by_short_name(symbol);
-        candidates.extend(
-            self.all_macro_composed_fields()
-                .iter()
-                .filter(|field| field.unit.short_name() == symbol || field.unit.fq_name() == symbol)
-                .map(|field| field.unit.clone()),
-        );
+        self.extend_with_macro_composed_fields(&mut candidates, |unit| {
+            unit.short_name() == symbol || unit.fq_name() == symbol
+        });
         candidates
     }
 
-    fn has_complete_symbol_lookup_index(&self) -> bool {
-        self.inner.has_complete_symbol_lookup_index()
+    crate::analyzer::tree_sitter_analyzer::delegate_inner_methods! {
+        fn has_complete_symbol_lookup_index(&self) -> bool;
     }
 
     fn lookup_candidates_by_identifier(&self, identifier: &str) -> BTreeSet<CodeUnit> {
@@ -2476,12 +2613,51 @@ impl CodeUnitIndex for CppAnalyzer {
 }
 
 impl IAnalyzer for CppAnalyzer {
+    crate::analyzer::tree_sitter_analyzer::delegate_inner_procedure_fact_methods!();
+
+    fn cpp_expression_source_facts(
+        &self,
+        file: &ProjectFile,
+    ) -> Option<Arc<brokk_bifrost_core::analyzer::cpp_facts::CppExpressionSourceFacts>> {
+        let source = self.inner.file_source(file)?;
+        Some(Arc::new(
+            brokk_bifrost_cpp::source_facts::parse_cpp_expression_source_facts(&source),
+        ))
+    }
+
+    fn cpp_statement_source_facts(
+        &self,
+        file: &ProjectFile,
+    ) -> Option<Arc<brokk_bifrost_core::analyzer::statement_facts::CppStatementFactRows>> {
+        let source = self.file_source(file)?;
+        Some(self.statement_facts_for(file, &source))
+    }
+
+    fn cpp_class_source_facts(
+        &self,
+        file: &ProjectFile,
+    ) -> Option<Arc<brokk_bifrost_core::analyzer::cpp_facts::CppClassFactRows>> {
+        let source = self.inner.file_source(file)?;
+        Some(Arc::new(
+            brokk_bifrost_cpp::source_facts::parse_cpp_class_fact_rows(&source),
+        ))
+    }
+
+    fn cpp_class_declaration_source_facts(
+        &self,
+        token: QueryToken<'_>,
+        file: &ProjectFile,
+    ) -> Option<Arc<Vec<brokk_bifrost_core::analyzer::cpp_facts::CppDeclarationSourceFact>>> {
+        let source = self.declaration_source_facts(token, file)?;
+        Some(Arc::new(source.facts.declarations.clone()))
+    }
+
     fn source_file_inventory(&self) -> crate::analyzer::QueryBatch<ProjectFile> {
         self.inner.source_file_inventory()
     }
 
-    fn active_query_cancellation(&self) -> Option<crate::CancellationToken> {
-        self.inner.active_query_cancellation()
+    crate::analyzer::tree_sitter_analyzer::delegate_inner_methods! {
+        fn active_query_cancellation(&self) -> Option<crate::CancellationToken>;
     }
 
     fn active_query_semantic_model_overlay(
@@ -2618,6 +2794,9 @@ impl IAnalyzer for CppAnalyzer {
                         .filter(|unit| self.inner.unit_matches_relational_request(unit, request))
                         .collect::<Vec<_>>();
                     units.extend(additions);
+                    for unit in units.iter_mut() {
+                        *unit = self.canonical_code_unit(unit, Some(cancellation));
+                    }
                     let macro_fields_can_match = match &request.query {
                         crate::analyzer::RelationalDefinitionQuery::ExactName
                         | crate::analyzer::RelationalDefinitionQuery::NormalizedName
@@ -2777,6 +2956,10 @@ impl IAnalyzer for CppAnalyzer {
                         }
                     }
                     facts.extend(additions);
+                    for fact in facts.iter_mut() {
+                        fact.declaration =
+                            self.canonical_code_unit(&fact.declaration, Some(cancellation));
+                    }
                 }
                 crate::analyzer::RelationalDefinitionValue::PackageRelation(_) => {}
             }
@@ -2823,26 +3006,26 @@ impl IAnalyzer for CppAnalyzer {
         self.inner.end_query(context);
     }
 
-    fn prefetch_definitions(&self, fq_names: &[String]) {
-        self.inner.prefetch_definitions(fq_names);
+    crate::analyzer::tree_sitter_analyzer::delegate_inner_methods! {
+        fn prefetch_definitions(&self, fq_names: &[String]);
     }
 
-    fn record_query_failure(&self, error: crate::analyzer::store::StoreError) {
-        self.inner.record_query_failure(error);
+    crate::analyzer::tree_sitter_analyzer::delegate_inner_methods! {
+        fn record_query_failure(&self, error: crate::analyzer::store::StoreError);
     }
 
     fn record_query_incomplete(&self, reason: crate::analyzer::QueryReadIncomplete) {
         self.inner.record_query_incomplete(reason);
     }
 
-    fn workspace_file_index_cell(&self) -> Option<crate::analyzer::WorkspaceFileIndexCell> {
-        self.inner.workspace_file_index_cell()
+    crate::analyzer::tree_sitter_analyzer::delegate_inner_methods! {
+        fn workspace_file_index_cell(&self) -> Option<crate::analyzer::WorkspaceFileIndexCell>;
     }
 
-    fn definition_lookup_memo(
+    crate::analyzer::tree_sitter_analyzer::delegate_inner_methods! {
+        fn definition_lookup_memo(
         &self,
-    ) -> Option<std::sync::Arc<crate::analyzer::DefinitionLookupMemo>> {
-        self.inner.definition_lookup_memo()
+    ) -> Option<std::sync::Arc<crate::analyzer::DefinitionLookupMemo>>;
     }
 
     fn import_statements(&self, file: &ProjectFile) -> Vec<String> {
@@ -2851,8 +3034,8 @@ impl IAnalyzer for CppAnalyzer {
         self.import_statements_from_projection(token, file)
     }
 
-    fn compute_cognitive_complexities(&self, file: &ProjectFile) -> Vec<(CodeUnit, u32)> {
-        self.inner.compute_cognitive_complexities(file)
+    crate::analyzer::tree_sitter_analyzer::delegate_inner_methods! {
+        fn compute_cognitive_complexities(&self, file: &ProjectFile) -> Vec<(CodeUnit, u32)>;
     }
 
     fn update(&self, changed_files: &BTreeSet<ProjectFile>) -> Self {
@@ -2860,7 +3043,7 @@ impl IAnalyzer for CppAnalyzer {
     }
 
     fn update_all(&self) -> Self {
-        self.with_updated_inner(self.inner.update_all())
+        self.update_all_with_progress(None)
     }
 
     fn parse_errors(&self, file: &ProjectFile) -> Option<Vec<crate::analyzer::ParseError>> {
@@ -2882,23 +3065,22 @@ impl IAnalyzer for CppAnalyzer {
         crate::analyzer::semantic_model::degrade_pack_gap_absences(self, report)
     }
 
-    fn extract_call_receiver(&self, reference: &str) -> Option<String> {
-        self.inner.extract_call_receiver(reference)
+    crate::analyzer::tree_sitter_analyzer::delegate_inner_methods! {
+        fn extract_call_receiver(&self, reference: &str) -> Option<String>;
     }
 
-    fn is_access_expression(&self, file: &ProjectFile, start_byte: usize, end_byte: usize) -> bool {
-        self.inner.is_access_expression(file, start_byte, end_byte)
+    crate::analyzer::tree_sitter_analyzer::delegate_inner_methods! {
+        fn is_access_expression(&self, file: &ProjectFile, start_byte: usize, end_byte: usize) -> bool;
     }
 
-    fn find_nearest_declaration(
-        &self,
-        file: &ProjectFile,
-        start_byte: usize,
-        end_byte: usize,
-        ident: &str,
-    ) -> Option<crate::analyzer::DeclarationInfo> {
-        self.inner
-            .find_nearest_declaration(file, start_byte, end_byte, ident)
+    crate::analyzer::tree_sitter_analyzer::delegate_inner_methods! {
+        fn find_nearest_declaration(
+            &self,
+            file: &ProjectFile,
+            start_byte: usize,
+            end_byte: usize,
+            ident: &str,
+        ) -> Option<crate::analyzer::DeclarationInfo>;
     }
 
     fn search_symbol_candidates(
@@ -2906,7 +3088,41 @@ impl IAnalyzer for CppAnalyzer {
         patterns: &crate::analyzer::SearchSymbolPatternBatch,
         cancellation: Option<&crate::CancellationToken>,
     ) -> crate::analyzer::SearchSymbolCandidates {
-        self.inner.search_symbol_candidates(patterns, cancellation)
+        let scope = AnalyzerQueryScope::new(self);
+        let mut candidates =
+            self.inner
+                .search_symbol_candidates_reconciled(patterns, cancellation, &|unit| {
+                    self.canonical_code_unit(unit, cancellation)
+                });
+        if scope.read_completion().is_err() {
+            candidates.complete = false;
+        }
+        candidates
+    }
+
+    fn canonical_code_unit(
+        &self,
+        unit: &CodeUnit,
+        cancellation: Option<&crate::CancellationToken>,
+    ) -> CodeUnit {
+        // A namespace-qualified free function has no class owner to reconcile.
+        // Use recorded segment kinds, including provisional member owners.
+        if !unit.is_callable() || !unit.owner_is_type_scope() {
+            return unit.clone();
+        }
+        if cancellation.is_some_and(crate::CancellationToken::is_cancelled) {
+            self.record_query_incomplete(crate::analyzer::QueryReadIncomplete::Cancelled);
+            return unit.clone();
+        }
+        // Cached ownership still depends on this snapshot's C++ content and
+        // configuration. Replayable callers must retain that proof on a hit.
+        self.inner
+            .record_reads(|sink| sink.push(self.inner.scope_read_key()));
+        self.reconciled_group_for_key(cpp_reconcile_group_key_for_fq(unit.fq()), cancellation)
+            .canonical_of
+            .get(unit)
+            .cloned()
+            .unwrap_or_else(|| unit.clone())
     }
 
     fn import_analysis_provider(&self) -> Option<&dyn ImportAnalysisProvider> {
@@ -2932,30 +3148,30 @@ impl IAnalyzer for CppAnalyzer {
         Some(identity::cpp_declaration_definition_peers(self, file))
     }
 
-    fn structural_fact_providers(
+    crate::analyzer::tree_sitter_analyzer::delegate_inner_methods! {
+        fn structural_fact_providers(
         &self,
-    ) -> Vec<&dyn crate::analyzer::structural::StructuralFactProvider> {
-        self.inner.structural_fact_providers()
+    ) -> Vec<&dyn crate::analyzer::structural::StructuralFactProvider>;
     }
 
     fn snapshot_caches(&self) -> Option<&crate::analyzer::AnalyzerSnapshotCaches> {
         Some(self.inner.snapshot_caches())
     }
 
-    fn workspace_content_identities(
+    crate::analyzer::tree_sitter_analyzer::delegate_inner_methods! {
+        fn workspace_content_identities(
         &self,
-    ) -> Option<crate::analyzer::content_identity::WorkspaceContentIdentities> {
-        self.inner.workspace_content_identities()
+    ) -> Option<crate::analyzer::content_identity::WorkspaceContentIdentities>;
     }
 
-    fn workspace_fact_indexes(
+    crate::analyzer::tree_sitter_analyzer::delegate_inner_methods! {
+        fn workspace_fact_indexes(
         &self,
-    ) -> Vec<&dyn crate::analyzer::read_verification::WorkspaceFactIndex> {
-        self.inner.workspace_fact_indexes()
+    ) -> Vec<&dyn crate::analyzer::read_verification::WorkspaceFactIndex>;
     }
 
-    fn contains_tests(&self, file: &ProjectFile) -> bool {
-        self.inner.contains_tests(file)
+    crate::analyzer::tree_sitter_analyzer::delegate_inner_methods! {
+        fn contains_tests(&self, file: &ProjectFile) -> bool;
     }
 
     fn in_test_region(&self, code_unit: &crate::analyzer::CodeUnit) -> bool {
@@ -2967,13 +3183,9 @@ impl IAnalyzer for CppAnalyzer {
         file: &ProjectFile,
         weights: TestAssertionWeights,
     ) -> Vec<TestAssertionSmell> {
-        if !self.contains_tests(file) || file_language(file) != Language::Cpp {
-            return Vec::new();
-        }
-        let Ok(source) = self.inner.project().read_source(file) else {
-            return Vec::new();
-        };
-        detect_cpp_test_assertion_smells(file, &source, &weights)
+        crate::analyzer::test_assertion_smells_for_file(self, file, Language::Cpp, |source| {
+            detect_cpp_test_assertion_smells(file, source, &weights)
+        })
     }
 
     fn find_structural_clone_smells(
@@ -3007,23 +3219,12 @@ impl IAnalyzer for CppAnalyzer {
                 code_unit.is_function() && requested_file_set.contains(code_unit.source())
             })
             .collect();
-        let _query_scope = crate::analyzer::AnalyzerQueryScope::new(self);
-        let all_candidates: Vec<CloneCandidateProfile> = corpus_units
-            .iter()
-            .filter_map(|code_unit| {
-                build_clone_candidate_data(self, code_unit, weights, &mut parser)
-            })
-            .map(|candidate| CloneCandidateProfile::create(candidate, weights))
-            .collect();
-        if all_candidates.is_empty() {
-            return Vec::new();
-        }
-
-        detect_structural_clone_smells(
+        detect_structural_clone_smells_for_corpus(
+            self,
             &requested_files,
-            all_candidates,
+            &corpus_units,
             weights,
-            refine_clone_similarity_with_ast,
+            |code_unit| build_clone_candidate_data(self, code_unit, weights, &mut parser),
         )
     }
 
@@ -3034,60 +3235,48 @@ impl IAnalyzer for CppAnalyzer {
 
 #[cfg(any(test, feature = "test-support"))]
 impl crate::analyzer::AnalyzerTestHooks for CppAnalyzer {
-    fn reset_relational_definition_batch_call_count_for_test(&self) {
-        self.inner
-            .test_hooks()
-            .reset_relational_definition_batch_call_count_for_test();
+    crate::analyzer::tree_sitter_analyzer::delegate_inner_test_hook_methods! {
+        fn reset_relational_definition_batch_call_count_for_test(&self);
     }
 
-    fn relational_definition_batch_call_count_for_test(&self) -> usize {
-        self.inner
-            .test_hooks()
-            .relational_definition_batch_call_count_for_test()
+    crate::analyzer::tree_sitter_analyzer::delegate_inner_test_hook_methods! {
+        fn relational_definition_batch_call_count_for_test(&self) -> usize;
     }
 
-    fn reset_definition_candidates_query_count_for_test(&self) {
-        self.inner
-            .test_hooks()
-            .reset_definition_candidates_query_count_for_test();
+    crate::analyzer::tree_sitter_analyzer::delegate_inner_test_hook_methods! {
+        fn reset_definition_candidates_query_count_for_test(&self);
     }
 
-    fn definition_candidates_query_count_for_test(&self) -> usize {
-        self.inner
-            .test_hooks()
-            .definition_candidates_query_count_for_test()
+    crate::analyzer::tree_sitter_analyzer::delegate_inner_test_hook_methods! {
+        fn definition_candidates_query_count_for_test(&self) -> usize;
     }
 
-    fn reset_definition_prefetch_batch_count_for_test(&self) {
-        self.inner
-            .test_hooks()
-            .reset_definition_prefetch_batch_count_for_test();
+    crate::analyzer::tree_sitter_analyzer::delegate_inner_test_hook_methods! {
+        fn reset_definition_prefetch_batch_count_for_test(&self);
     }
 
-    fn definition_prefetch_batch_count_for_test(&self) -> usize {
-        self.inner
-            .test_hooks()
-            .definition_prefetch_batch_count_for_test()
+    crate::analyzer::tree_sitter_analyzer::delegate_inner_test_hook_methods! {
+        fn definition_prefetch_batch_count_for_test(&self) -> usize;
     }
 
-    fn reset_full_declaration_scan_count_for_test(&self) {
-        self.inner
-            .test_hooks()
-            .reset_full_declaration_scan_count_for_test();
+    crate::analyzer::tree_sitter_analyzer::delegate_inner_test_hook_methods! {
+        fn reset_full_declaration_scan_count_for_test(&self);
     }
 
-    fn full_declaration_scan_count_for_test(&self) -> usize {
-        self.inner
-            .test_hooks()
-            .full_declaration_scan_count_for_test()
+    crate::analyzer::tree_sitter_analyzer::delegate_inner_test_hook_methods! {
+        fn full_declaration_scan_count_for_test(&self) -> usize;
     }
 
     fn reset_candidate_hydration_count_for_test(&self) {
         self.inner.reset_full_hydration_count_for_test();
     }
 
-    fn candidate_hydration_count_for_test(&self) -> usize {
-        self.inner.full_hydration_count_for_test() + self.inner.bulk_hydration_count_for_test()
+    crate::analyzer::tree_sitter_analyzer::delegate_inner_test_hook_methods! {
+        fn full_candidate_hydration_count_for_test(&self) -> usize;
+    }
+
+    crate::analyzer::tree_sitter_analyzer::delegate_inner_test_hook_methods! {
+        fn bulk_candidate_hydration_count_for_test(&self) -> usize;
     }
 
     fn reset_blob_hash_count_for_test(&self) {
@@ -3145,6 +3334,10 @@ pub(crate) struct CppSupport;
 impl LanguageSupport for CppSupport {
     fn language(&self) -> Language {
         Language::Cpp
+    }
+
+    fn procedure_syntax_roles(&self) -> Option<crate::analyzer::languages::ProcedureSyntaxRoles> {
+        Some(semantic::PROCEDURE_SYNTAX_ROLES)
     }
 
     fn focus_resolves_lexically(&self, focus: tree_sitter::Node<'_>) -> bool {
@@ -3259,15 +3452,19 @@ impl LanguageSupport for CppSupport {
         &self,
         analyzer: &'a dyn IAnalyzer,
     ) -> Option<&'a dyn ForwardQueryProvider> {
-        resolve_analyzer::<CppAnalyzer>(analyzer).map(|value| value as _)
+        crate::analyzer::forward_query_provider::<CppAnalyzer>(analyzer)
     }
 
     fn ecosystem(&self) -> UsageEcosystem {
         UsageEcosystem::Cpp
     }
 
-    fn reference_plugin(&self) -> crate::analyzer::languages::ReferenceLanguagePlugin {
-        crate::analyzer::languages::ReferenceLanguagePlugin::new(&CPP_USAGE_STRATEGY, &CppEdgePass)
+    fn reference_usage_strategy(&self) -> &'static dyn crate::analyzer::usages::GraphUsageAnalyzer {
+        &CPP_USAGE_STRATEGY
+    }
+
+    fn reference_graph_backend(&self) -> crate::analyzer::languages::LanguageGraphBackend {
+        crate::analyzer::languages::LanguageGraphBackend::Legacy(&CppEdgePass)
     }
 
     fn dead_code(&self) -> DeadCodeSupport {
@@ -3342,8 +3539,23 @@ fn cpp_focus_is_non_lexical(focus: tree_sitter::Node<'_>) -> bool {
 /// `function_declarator`, so the ownership edge must be checked rather than the
 /// visible node kind alone.
 fn cpp_parameter_is_callable_binder(parameter: tree_sitter::Node<'_>) -> bool {
-    let Some(parameter_list) = parameter.parent() else {
+    let Some(parameter_parent) = parameter.parent() else {
         return false;
+    };
+    let parameter_list = if parameter_parent.kind() == "explicit_object_parameter_declaration" {
+        // The explicit-object wrapper owns exactly `this` and this parameter;
+        // only its parent can own the real parameter list.
+        if parameter_parent.named_child(0).map(|node| node.kind()) != Some("this")
+            || parameter_parent.named_child(1) != Some(parameter)
+        {
+            return false;
+        }
+        let Some(parameter_list) = parameter_parent.parent() else {
+            return false;
+        };
+        parameter_list
+    } else {
+        parameter_parent
     };
     if parameter_list.kind() != "parameter_list" {
         return false;
@@ -3352,7 +3564,10 @@ fn cpp_parameter_is_callable_binder(parameter: tree_sitter::Node<'_>) -> bool {
         return false;
     };
 
-    if declarator.kind() == "abstract_function_declarator" {
+    if matches!(
+        declarator.kind(),
+        "lambda_declarator" | "abstract_function_declarator"
+    ) {
         return declarator.parent().is_some_and(|lambda| {
             lambda.kind() == "lambda_expression"
                 && lambda.child_by_field_name("declarator") == Some(declarator)
@@ -3507,10 +3722,7 @@ impl DeadCodeBulkProof for CppDeadCodeBulk {
     }
 
     fn preflight(&self, analyzer: &dyn IAnalyzer) -> DeadCodeBulkPreflight {
-        DeadCodeBulkPreflight::Ready {
-            label: "C++",
-            files: analyzable_file_count(analyzer, Language::Cpp),
-        }
+        ready_preflight(analyzer, Language::Cpp, "C++")
     }
 
     fn build(
@@ -3526,5 +3738,91 @@ impl DeadCodeBulkProof for CppDeadCodeBulk {
         );
         build_cpp_usage_edges(analyzer, &nodes, |_| true)
             .map(|edges| DeadCodeBulkEdges::Fqn(Arc::new(edges)))
+    }
+}
+
+#[cfg(test)]
+mod cpp_explicit_object_parameter_tests {
+    use super::{cpp_focus_is_non_lexical, cpp_parameter_is_callable_binder};
+    use tree_sitter::{Node, Parser};
+
+    fn identifier_at<'tree>(root: Node<'tree>, start: usize, length: usize) -> Node<'tree> {
+        root.descendant_for_byte_range(start, start + length)
+            .filter(|node| node.kind() == "identifier")
+            .expect("identifier at source span")
+    }
+
+    fn ancestor<'tree>(mut node: Node<'tree>, kind: &str) -> Node<'tree> {
+        while let Some(parent) = node.parent() {
+            if parent.kind() == kind {
+                return parent;
+            }
+            node = parent;
+        }
+        panic!("missing {kind} ancestor")
+    }
+
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#4407: ABI 15 explicit-object and lambda binders lost callable ownership"
+    )]
+    fn cpp_explicit_object_parameter_is_lexical_and_preserves_negative_shapes() {
+        let source = concat!(
+            "struct Visitor {\n",
+            "    int visit(this Visitor const& self, int ordinary) {\n",
+            "        return self.value + ordinary;\n",
+            "    }\n",
+            "};\n",
+            "using Callback = void (*)(int nested);\n",
+            "auto lambda = [](int lambda) { return lambda; };\n",
+        );
+        let mut parser = Parser::new();
+        parser
+            .set_language(&tree_sitter_cpp::LANGUAGE.into())
+            .expect("C++ grammar");
+        let tree = parser.parse(source, None).expect("C++ parse");
+        assert!(
+            !tree.root_node().has_error(),
+            "{}",
+            tree.root_node().to_sexp()
+        );
+        let root = tree.root_node();
+
+        let receiver = identifier_at(root, source.find("self,").expect("receiver binder"), 4);
+        let receiver_parameter = ancestor(receiver, "parameter_declaration");
+        assert!(cpp_parameter_is_callable_binder(receiver_parameter));
+        assert!(!cpp_focus_is_non_lexical(receiver));
+
+        let receiver_body = identifier_at(
+            root,
+            source.find("return self").expect("receiver body reference") + "return ".len(),
+            4,
+        );
+        assert!(!cpp_focus_is_non_lexical(receiver_body));
+
+        let function_type_parameter = identifier_at(
+            root,
+            source.find("nested").expect("function type parameter"),
+            6,
+        );
+        assert!(!cpp_parameter_is_callable_binder(ancestor(
+            function_type_parameter,
+            "parameter_declaration",
+        )));
+        assert!(cpp_focus_is_non_lexical(function_type_parameter));
+
+        let lambda_parameter =
+            identifier_at(root, source.find("lambda)").expect("lambda parameter"), 6);
+        assert!(cpp_parameter_is_callable_binder(ancestor(
+            lambda_parameter,
+            "parameter_declaration",
+        )));
+        assert!(!cpp_focus_is_non_lexical(lambda_parameter));
+        let lambda_body = identifier_at(
+            root,
+            source.find("return lambda").expect("lambda body reference") + "return ".len(),
+            6,
+        );
+        assert!(!cpp_focus_is_non_lexical(lambda_body));
     }
 }

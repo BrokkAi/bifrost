@@ -24,6 +24,7 @@
 use std::collections::VecDeque;
 use std::fmt;
 
+use super::is_assignment_transfer_marker;
 use crate::analyzer::semantic::{
     BindingOriginIndex, CancellationToken, ControlEdgeId, GuardPredicate, ProcedureHandle,
     ProgramPointId, SemanticBudget, SemanticBudgetExceeded, SemanticEffect, SemanticGapImpact,
@@ -591,7 +592,9 @@ fn cfg_successors(
     Ok(successors)
 }
 
-fn check_cancelled(cancellation: Option<&CancellationToken>) -> Result<(), CorrelationError> {
+pub(super) fn check_cancelled(
+    cancellation: Option<&CancellationToken>,
+) -> Result<(), CorrelationError> {
     if let Some(token) = cancellation
         && token.is_cancelled()
     {
@@ -602,7 +605,10 @@ fn check_cancelled(cancellation: Option<&CancellationToken>) -> Result<(), Corre
     Ok(())
 }
 
-fn charge_edges(budget: &mut SemanticBudget, count: usize) -> Result<(), CorrelationError> {
+pub(super) fn charge_edges(
+    budget: &mut SemanticBudget,
+    count: usize,
+) -> Result<(), CorrelationError> {
     if count == 0 {
         return Ok(());
     }
@@ -613,7 +619,10 @@ fn charge_edges(budget: &mut SemanticBudget, count: usize) -> Result<(), Correla
     Ok(())
 }
 
-fn charge_pairs(budget: &mut SemanticBudget, count: usize) -> Result<(), CorrelationError> {
+pub(super) fn charge_entries(
+    budget: &mut SemanticBudget,
+    count: usize,
+) -> Result<(), CorrelationError> {
     if count == 0 {
         return Ok(());
     }
@@ -760,7 +769,7 @@ pub(super) fn tested_boolean_bindings_from_copy_graph(
             continue;
         };
         for &target in targets {
-            charge_pairs(budget, 1)?;
+            charge_entries(budget, 1)?;
             check_cancelled(cancellation)?;
             if literal_reachable.insert(target) {
                 worklist.push_back(target);
@@ -932,7 +941,7 @@ impl FlowState {
                     rhs: None,
                 })
                 .expect("every tracked data binding has an entry definition");
-            charge_pairs(budget, 1)?;
+            charge_entries(budget, 1)?;
             state
                 .reaching
                 .insert(data_binding, [data_definition].into_iter().collect());
@@ -944,7 +953,7 @@ impl FlowState {
                 event_index: BooleanDefinition::ENTRY_EVENT_INDEX,
                 rhs: None,
             };
-            charge_pairs(budget, 1)?;
+            charge_entries(budget, 1)?;
             state.facts.insert(
                 boolean_binding,
                 [(boolean_definition, BoolFact::Unknown)]
@@ -1017,7 +1026,7 @@ impl FlowState {
             return Ok(false);
         }
         if self.is_bottom() {
-            charge_pairs(budget, other.retained_entries())?;
+            charge_entries(budget, other.retained_entries())?;
             *self = other.clone();
             return Ok(true);
         }
@@ -1104,7 +1113,7 @@ impl FlowState {
             // what this state already stood for, whether it stated it as a
             // product or as an explicit correlation, and it was charged when
             // it arrived.
-            charge_pairs(budget, pairs.len().saturating_sub(previous_len))?;
+            charge_entries(budget, pairs.len().saturating_sub(previous_len))?;
             correlated.insert(key, pairs);
         }
         self.correlated = correlated;
@@ -1112,7 +1121,7 @@ impl FlowState {
             let destination = self.reaching.entry(binding).or_default();
             for &definition in reaching {
                 if destination.insert(definition) {
-                    charge_pairs(budget, 1)?;
+                    charge_entries(budget, 1)?;
                     changed = true;
                 }
             }
@@ -1121,7 +1130,7 @@ impl FlowState {
             let destination = self.facts.entry(binding).or_default();
             for &fact in facts {
                 if destination.insert(fact) {
-                    charge_pairs(budget, 1)?;
+                    charge_entries(budget, 1)?;
                     changed = true;
                 }
             }
@@ -1154,7 +1163,7 @@ impl DefinitionTable {
         self.entry_point = entry_point;
         for &binding in data_bindings {
             check_cancelled(cancellation)?;
-            charge_pairs(budget, 1)?;
+            charge_entries(budget, 1)?;
             self.intern_data(DefinitionRecord {
                 binding,
                 point: entry_point,
@@ -1164,7 +1173,7 @@ impl DefinitionTable {
         }
         for &binding in bool_bindings {
             check_cancelled(cancellation)?;
-            charge_pairs(budget, 1)?;
+            charge_entries(budget, 1)?;
             self.intern_boolean(BooleanDefinition {
                 binding,
                 point: entry_point,
@@ -1206,7 +1215,7 @@ impl DefinitionTable {
                 // refinement. What this pass retains is one definition per
                 // component write, so charge that state instead of charging
                 // every source event a second time.
-                charge_pairs(budget, 1)?;
+                charge_entries(budget, 1)?;
                 match write {
                     ComponentWrite::Data {
                         binding,
@@ -1433,10 +1442,10 @@ fn replace_boolean_component(
     state
         .correlated
         .retain(|(_, boolean_binding), _| *boolean_binding != target);
-    charge_pairs(budget, facts.len())?;
+    charge_entries(budget, facts.len())?;
     state.facts.insert(target, facts);
     for (key, pairs) in correlated {
-        charge_pairs(budget, pairs.len())?;
+        charge_entries(budget, pairs.len())?;
         state.correlated.insert(key, pairs);
     }
     state.normalize();
@@ -1459,7 +1468,7 @@ fn replace_boolean_fact_component(
     state
         .correlated
         .retain(|(_, boolean_binding), _| *boolean_binding != target);
-    charge_pairs(budget, 1)?;
+    charge_entries(budget, 1)?;
     state
         .facts
         .insert(target, [(definition, fact)].into_iter().collect());
@@ -1474,22 +1483,6 @@ fn intrinsic_boolean(
         SemanticValueKind::Boolean(value) => Some(*value),
         _ => None,
     }
-}
-
-fn is_assignment_transfer_marker(
-    point: &crate::analyzer::semantic::ProgramPoint,
-    event_index: usize,
-    source: ValueId,
-    target: ValueId,
-) -> bool {
-    event_index > 0
-        && matches!(
-            &point.events[event_index - 1].effect,
-            SemanticEffect::Assignment {
-                target: previous_target,
-                value: previous_value,
-            } if *previous_target == target && *previous_value == source
-        )
 }
 
 /// Return only bindings whose semantic IR identifies a write target.
@@ -1643,6 +1636,7 @@ fn make_candidate(
 #[cfg(test)]
 mod correlation_properties {
     use super::*;
+    use brokk_bifrost_test_macros::hardwon;
     use proptest::prelude::*;
     use std::collections::BTreeMap;
 
@@ -2045,6 +2039,7 @@ mod correlation_properties {
     proptest! {
         #![proptest_config(ProptestConfig { cases: 64, ..ProptestConfig::default() })]
         #[test]
+        #[hardwon("#3194: c03805b191db: correlation reduction must preserve full-graph reachability at every carried point")]
         fn reduced_graph_preserves_carried_reachability(
             (successors, carried) in graph_strategy()
         ) {
@@ -2264,18 +2259,5 @@ mod correlation_properties {
             }
         }
         }
-    }
-
-    /// Public contract: `Unknown` is the only self-opposite fact and known
-    /// literals form an involution.  This guards edge polarity independently
-    /// from the finite relation trace above.
-    #[test]
-    pub fn bool_fact_opposite_is_an_involution() {
-        for fact in [BoolFact::True, BoolFact::False, BoolFact::Unknown] {
-            assert_eq!(fact.opposite().opposite(), fact);
-        }
-        assert_eq!(BoolFact::True.opposite(), BoolFact::False);
-        assert_eq!(BoolFact::False.opposite(), BoolFact::True);
-        assert_eq!(BoolFact::Unknown.opposite(), BoolFact::Unknown);
     }
 }

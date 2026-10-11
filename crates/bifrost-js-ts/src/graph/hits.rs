@@ -1,8 +1,9 @@
 use crate::graph::extractor::ScanCtx;
-use brokk_bifrost_core::analyzer::usages::common::{SNIPPET_CONTEXT_LINES, usage_hit};
+use brokk_bifrost_core::analyzer::CodeUnit;
+use brokk_bifrost_core::analyzer::usages::common::{
+    insert_import_hit, insert_unproven_hit, usage_hit_for_node,
+};
 use brokk_bifrost_core::analyzer::usages::model::UsageHit;
-use brokk_bifrost_core::analyzer::{CodeUnit, Range};
-use brokk_bifrost_core::text_utils::{find_line_index_for_offset, trimmed_snippet_around_line};
 use tree_sitter::Node;
 
 pub fn record_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
@@ -15,9 +16,8 @@ pub fn record_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
 /// into this file). The IDE find-references surface includes these; the
 /// call-graph / relevance surfaces filter them out.
 pub fn record_import_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
-    if let Some(hit) = build_hit(node, ctx) {
-        ctx.hits.insert(hit.into_import());
-    }
+    let hit = build_hit(node, ctx);
+    insert_import_hit(ctx.hits, hit);
 }
 
 /// Record `node` as a binding-only re-export. The token is useful to IDE
@@ -46,43 +46,18 @@ pub fn record_declared_reference_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
 }
 
 pub fn record_unproven_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
-    if let Some(hit) = build_hit(node, ctx) {
-        ctx.unproven_hits.insert(hit.into_unproven());
-    }
+    let hit = build_hit(node, ctx);
+    insert_unproven_hit(ctx.unproven_hits, hit);
 }
 
 fn build_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) -> Option<UsageHit> {
-    let start_byte = node.start_byte();
-    let end_byte = node.end_byte();
-    if start_byte >= end_byte {
-        return None;
-    }
-
-    let line_idx = find_line_index_for_offset(ctx.line_starts, start_byte);
-    let snippet =
-        trimmed_snippet_around_line(ctx.source, ctx.line_starts, line_idx, SNIPPET_CONTEXT_LINES);
-    let range = Range {
-        start_byte,
-        end_byte,
-        start_line: line_idx,
-        end_line: line_idx,
-    };
-
-    // Every hit is attributed to the declaration that encloses it. When the
-    // analyzer holds no declaration around this range -- it refused the file
-    // (`is_unparseable_source`), or the file is outside what it indexed -- the
-    // reference is still a real occurrence in a real file, so it is attributed
-    // to that file's own scope instead of being discarded. `CodeUnit::file_scope`
-    // is the same unit `ParsedFile::add_file_scope` and the store's hydration
-    // synthesize for every file the analyzer *did* index, so the value is stable
-    // across scans and dedups against the indexed answer rather than competing
-    // with it (#1785).
-    let enclosing = ctx
-        .analyzer
-        .enclosing_code_unit(ctx.file, &range)
-        .unwrap_or_else(|| CodeUnit::file_scope(ctx.file.clone()));
-
-    Some(usage_hit(
-        ctx.file, line_idx, start_byte, end_byte, enclosing, snippet,
-    ))
+    usage_hit_for_node(node, ctx.file, ctx.source, ctx.line_starts, |range| {
+        // Preserve the JS/TS file-scope attribution for hits without an indexed
+        // enclosing declaration (#1785).
+        Some(
+            ctx.analyzer
+                .enclosing_code_unit(ctx.file, range)
+                .unwrap_or_else(|| CodeUnit::file_scope(ctx.file.clone())),
+        )
+    })
 }

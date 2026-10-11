@@ -4,18 +4,18 @@
 //! subtyping is structural -- a concrete type satisfies an interface by having
 //! its method set, with nothing written at either declaration site.
 
-use crate::declarations::go_identifier_is_exported;
+use crate::declarations::{go_identifier_is_exported, is_predeclared_go_type};
 use crate::graph::resolver::{
     GoFactFile, GoGraphBuildError, GoGraphSource, go_fact_file_is_complete, go_fact_owner_fqns,
-    go_unit_parent_fqn, load_go_fact_files, mounted_units,
+    load_go_fact_files, mounted_units,
 };
-use brokk_bifrost_core::analyzer::CodeUnit;
 use brokk_bifrost_core::analyzer::go_facts::{
     GoChannelDirection, GoSourceTypeId, GoSourceTypeShape, GoTypeCompoundKind,
 };
 use brokk_bifrost_core::analyzer::type_relations::{MethodKey, MethodSet};
 #[cfg(any(test, feature = "test-support"))]
 use brokk_bifrost_core::analyzer::type_relations::{TypeRelation, TypeRelationKind};
+use brokk_bifrost_core::analyzer::{CodeUnit, default_parent_fq_name};
 use brokk_bifrost_core::hash::{HashMap, HashSet};
 
 const EMPTY_INTERFACE_DESCENDANT_CAP: usize = 0;
@@ -683,7 +683,7 @@ impl<'a> GoHierarchyBuilder<'a> {
                 for unit in
                     mounted_units(file, callable.declaration).filter(|unit| unit.is_function())
                 {
-                    let Some(owner) = go_unit_parent_fqn(&unit) else {
+                    let Some(owner) = default_parent_fq_name(&unit) else {
                         continue;
                     };
                     if !owners.iter().any(|candidate| candidate == &owner) {
@@ -1259,34 +1259,6 @@ fn rebuild_direct_descendants(
         }
     }
     direct_descendants
-}
-
-fn is_predeclared_go_type(name: &str) -> bool {
-    matches!(
-        name,
-        "any"
-            | "bool"
-            | "byte"
-            | "comparable"
-            | "complex64"
-            | "complex128"
-            | "error"
-            | "float32"
-            | "float64"
-            | "int"
-            | "int8"
-            | "int16"
-            | "int32"
-            | "int64"
-            | "rune"
-            | "string"
-            | "uint"
-            | "uint8"
-            | "uint16"
-            | "uint32"
-            | "uint64"
-            | "uintptr"
-    )
 }
 
 fn method_set_satisfies(candidate: &MethodSet, required: &MethodSet) -> bool {

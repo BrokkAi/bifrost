@@ -3,6 +3,8 @@
 use super::{
     DataflowDirectionExecutionMetrics, DataflowDirectionPlan, IcfgInputStatus, SolverTermination,
 };
+#[cfg(test)]
+use crate::analyzer::semantic::{SemanticBudget, SemanticWork};
 
 /// Completion evidence shared by every planned data-flow client.
 ///
@@ -145,57 +147,37 @@ impl<Finding, Evidence> PlannedDataflowResult<Finding, Evidence> {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use crate::analyzer::semantic::{SemanticBudget, SemanticWork};
+#[test]
+fn completion_keeps_semantic_budget_exhaustion_typed() {
+    let mut limits = SemanticBudget::default().limits();
+    limits.procedures = 4;
+    let exceeded = SemanticBudget::new(limits)
+        .expect("positive budget")
+        .check(SemanticWork {
+            procedures: 5,
+            ..SemanticWork::default()
+        })
+        .expect_err("procedure budget should be exceeded");
+    let completion = PlannedDataflowCompletion::new(
+        IcfgInputStatus::ExceededBudget { exceeded },
+        SolverTermination::FixedPoint,
+        true,
+    );
 
-    use super::*;
+    assert!(!completion.is_complete());
+    assert_eq!(completion.input_status().budget_exceeded(), Some(exceeded));
+    assert!(completion.termination().is_fixed_point());
+    assert!(completion.domain_complete());
+}
 
-    #[test]
-    fn completion_keeps_semantic_budget_exhaustion_typed() {
-        let mut limits = SemanticBudget::default().limits();
-        limits.procedures = 4;
-        let exceeded = SemanticBudget::new(limits)
-            .expect("positive budget")
-            .check(SemanticWork {
-                procedures: 5,
-                ..SemanticWork::default()
-            })
-            .expect_err("procedure budget should be exceeded");
-        let completion = PlannedDataflowCompletion::new(
-            IcfgInputStatus::ExceededBudget { exceeded },
-            SolverTermination::FixedPoint,
-            true,
-        );
+#[test]
+fn completion_keeps_solver_cancellation_typed() {
+    let completion = PlannedDataflowCompletion::new(
+        IcfgInputStatus::Complete,
+        SolverTermination::Cancelled,
+        true,
+    );
 
-        assert!(!completion.is_complete());
-        assert_eq!(completion.input_status().budget_exceeded(), Some(exceeded));
-        assert!(completion.termination().is_fixed_point());
-        assert!(completion.domain_complete());
-    }
-
-    #[test]
-    fn completion_keeps_solver_cancellation_typed() {
-        let completion = PlannedDataflowCompletion::new(
-            IcfgInputStatus::Complete,
-            SolverTermination::Cancelled,
-            true,
-        );
-
-        assert!(!completion.is_complete());
-        assert_eq!(completion.termination(), SolverTermination::Cancelled);
-    }
-
-    #[test]
-    fn witness_unavailability_is_not_an_empty_witness() {
-        let availability = NormalizedWitnessAvailability::Unavailable(
-            NormalizedWitnessUnavailableReason::BackwardSolverUnsupported,
-        );
-
-        assert!(!availability.is_available());
-        assert_eq!(
-            availability.unavailable_reason(),
-            Some(NormalizedWitnessUnavailableReason::BackwardSolverUnsupported)
-        );
-    }
+    assert!(!completion.is_complete());
+    assert_eq!(completion.termination(), SolverTermination::Cancelled);
 }

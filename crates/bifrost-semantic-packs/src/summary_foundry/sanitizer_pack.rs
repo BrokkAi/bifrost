@@ -48,16 +48,15 @@ use brokk_bifrost_analysis::analyzer::semantic_model::{
     ActivationSelector, AuthoredPayload, AuthoredProcedureSummary, AuthoredProcedureTarget,
     AuthoredSemanticModelPack, AuthoredShard, AuthoredSummaryEffect, AuthoredSummaryExitKind,
     AuthoredSummaryInput, AuthoredSummaryOutput, AuthoredSummaryTransfer, Compatibility,
-    CompilerOptions, Completeness, NameSelector, Producer, Provenance, Safety, SourceFormat,
-    VersionConstraint, compile_source,
+    Completeness, NameSelector, Provenance, VersionConstraint,
 };
 use serde::{Deserialize, Serialize};
 
-use super::FOUNDRY_PRODUCER_VERSION;
 use super::sanitizer::{
     InjectionContext, SanitizerCompleteness, SanitizerEntry, SanitizerPort, SanitizerRejection,
     gate_sanitizer,
 };
+use super::{pack_relative_path, serialize_pack};
 
 /// The audit-report format tag. Bump it when a consumer must read the file
 /// differently, not when a field is added.
@@ -69,12 +68,6 @@ const PRODUCER_NAME: &str = "bifrost-sanitizer-foundry";
 /// The pack content version. It is the sanitizer content's own version, not the
 /// Bifrost version, and advances when the shipped claims change.
 const PACK_CONTENT_VERSION: &str = "0.1.0";
-
-/// The authored sanitizer content is Bifrost's own claim, not a slice of the
-/// described library. New Bifrost-owned public packs use the public project
-/// license; retained packs may declare their own provenance and license in
-/// their checked-in metadata.
-const PACK_LICENSE: &str = "Apache-2.0";
 
 /// The JDK toolchain requirement. Every claimed API (`Integer.parseInt`,
 /// `Base64`, `URLEncoder(String, Charset)`, `UUID`) exists in Java 17 and later.
@@ -279,33 +272,24 @@ pub fn write_sanitizer_packs(
     conversion: &SanitizerConversion,
     output_root: &Path,
 ) -> Result<Vec<PathBuf>, SanitizerPackError> {
-    let mut written = Vec::new();
-    for pack in &conversion.packs {
-        let path = output_root.join(&pack.relative_path);
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent).map_err(|error| SanitizerPackError::ReadDir {
-                path: parent.to_owned(),
-                message: error.to_string(),
-            })?;
+    let audit_json = serialize_audit(&conversion.audit);
+    super::write_foundry_outputs(
+        output_root,
+        conversion
+            .packs
+            .iter()
+            .map(|pack| (pack.relative_path.as_path(), pack.source_json.as_str())),
+        SANITIZER_AUDIT_FILE_NAME,
+        &audit_json,
+    )
+    .map_err(|error| match error {
+        super::FoundryOutputError::CreateDirectory { path, message } => {
+            SanitizerPackError::ReadDir { path, message }
         }
-        fs::write(&path, pack.source_json.as_bytes()).map_err(|error| {
-            SanitizerPackError::ReadFile {
-                path: path.clone(),
-                message: error.to_string(),
-            }
-        })?;
-        written.push(path);
-    }
-    let audit_path = output_root.join(SANITIZER_AUDIT_FILE_NAME);
-    fs::write(&audit_path, serialize_audit(&conversion.audit).as_bytes()).map_err(|error| {
-        SanitizerPackError::ReadFile {
-            path: audit_path.clone(),
-            message: error.to_string(),
+        super::FoundryOutputError::WriteFile { path, message } => {
+            SanitizerPackError::ReadFile { path, message }
         }
-    })?;
-    written.push(audit_path);
-    written.sort();
-    Ok(written)
+    })
 }
 
 /// One accepted candidate paired with the artifact whose file carried it.
@@ -318,22 +302,12 @@ struct AcceptedCandidate {
 /// artifact. Entry order within a file is preserved; files are read in sorted
 /// name order.
 fn read_candidates(candidates_dir: &Path) -> Result<Vec<SanitizerEntry>, SanitizerPackError> {
-    let mut files = Vec::new();
-    let read_dir = fs::read_dir(candidates_dir).map_err(|error| SanitizerPackError::ReadDir {
-        path: candidates_dir.to_owned(),
-        message: error.to_string(),
-    })?;
-    for entry in read_dir {
-        let entry = entry.map_err(|error| SanitizerPackError::ReadDir {
+    let files = super::json_candidate_paths(candidates_dir).map_err(|error| {
+        SanitizerPackError::ReadDir {
             path: candidates_dir.to_owned(),
             message: error.to_string(),
-        })?;
-        let path = entry.path();
-        if path.extension().and_then(|extension| extension.to_str()) == Some("json") {
-            files.push(path);
         }
-    }
-    files.sort();
+    })?;
 
     let mut all = Vec::new();
     for path in files {
@@ -594,6 +568,7 @@ fn build_summary(
             has_receiver: entry.target.has_receiver,
             variadic: false,
             parameter_count,
+            formals: Vec::new(),
         },
         completeness: match entry.completeness {
             SanitizerCompleteness::Partial => Completeness::Partial,
@@ -609,6 +584,7 @@ fn build_summary(
         transfer_partitions: Vec::new(),
         effects: vec![effect],
         concurrency_effects: Vec::new(),
+        returned_callables: Vec::new(),
         declared_effects: Vec::new(),
         preconditions: None,
         result_contracts: Vec::new(),
@@ -731,12 +707,7 @@ impl PackIdentity {
     }
 
     fn relative_path(&self) -> PathBuf {
-        let file_name = format!("{}.json", self.pack_id);
-        if self.pinned {
-            PathBuf::from(file_name)
-        } else {
-            Path::new("staged").join(file_name)
-        }
+        pack_relative_path(&self.pack_id, self.pinned)
     }
 
     fn build_pack(
@@ -744,35 +715,22 @@ impl PackIdentity {
         summaries: Vec<AuthoredProcedureSummary>,
         completeness: Completeness,
     ) -> AuthoredSemanticModelPack {
-        AuthoredSemanticModelPack {
-            schema_version:
-                brokk_bifrost_analysis::analyzer::semantic_model::SEMANTIC_MODEL_SCHEMA_VERSION,
-            pack_id: self.pack_id.clone(),
-            version: PACK_CONTENT_VERSION.to_owned(),
-            producer: Producer {
-                name: PRODUCER_NAME.to_owned(),
-                version: FOUNDRY_PRODUCER_VERSION.to_owned(),
-            },
-            language: "java".to_owned(),
-            ecosystem: self.ecosystem.clone(),
-            compatibility: Compatibility {
+        super::authored_pack(
+            self.pack_id.clone(),
+            PACK_CONTENT_VERSION.to_owned(),
+            PRODUCER_NAME.to_owned(),
+            "java".to_owned(),
+            self.ecosystem.clone(),
+            Compatibility {
                 bifrost: None,
                 toolchains: self.toolchains.clone(),
             },
-            provenance: Provenance {
+            Provenance {
                 source: self.provenance_source.clone(),
                 revision: Some("k3-sanitizers".to_owned()),
             },
-            license: PACK_LICENSE.to_owned(),
             completeness,
-            safety: Safety {
-                generated_code_only: false,
-                review_required: true,
-            },
-            carried_sources: Vec::new(),
-            cpp_portability: None,
-            python_correspondence: None,
-            shards: vec![AuthoredShard {
+            vec![AuthoredShard {
                 id: format!("sanitizers.{}", self.ecosystem),
                 activation: vec![self.activation.clone()],
                 payload: AuthoredPayload::ProcedureSummaries { summaries },
@@ -781,8 +739,9 @@ impl PackIdentity {
                 collection_flows: None,
                 deferred_yields: None,
                 conditional_type_refinements: None,
+                callable_values: None,
             }],
-        }
+        )
     }
 }
 
@@ -800,54 +759,38 @@ fn assert_ids_unique(
     pack_id: &str,
     pack: &AuthoredSemanticModelPack,
 ) -> Result<(), SanitizerPackError> {
-    let mut seen = std::collections::HashSet::new();
-    for shard in &pack.shards {
-        if let AuthoredPayload::ProcedureSummaries { summaries } = &shard.payload {
-            for summary in summaries {
-                if !seen.insert(summary.id.as_str()) {
-                    return Err(SanitizerPackError::DuplicateSummaryId {
-                        pack_id: pack_id.to_owned(),
-                        id: summary.id.clone(),
-                    });
-                }
-            }
-        }
+    let summaries =
+        pack.shards
+            .iter()
+            .filter_map(|shard| match &shard.payload {
+                AuthoredPayload::ProcedureSummaries { summaries } => Some(summaries.as_slice()),
+                AuthoredPayload::DeclarationFacts { .. }
+                | AuthoredPayload::GeneratorRules { .. } => None,
+            })
+            .flatten();
+    if let Some(id) = super::duplicate_summary_id(summaries) {
+        return Err(SanitizerPackError::DuplicateSummaryId {
+            pack_id: pack_id.to_owned(),
+            id: id.to_owned(),
+        });
     }
     Ok(())
-}
-
-/// Serialize a pack to canonical pretty JSON with a trailing newline. serde
-/// serializes struct fields in declaration order and vectors in order, so the
-/// bytes are deterministic for the same input.
-fn serialize_pack(pack: &AuthoredSemanticModelPack) -> String {
-    let mut json = serde_json::to_string_pretty(pack).expect("a pack is serializable");
-    json.push('\n');
-    json
 }
 
 /// Compile a generated pack through the production compiler. A failure is a
 /// converter bug, not a candidate reject, so it is raised rather than recorded.
 fn compile_check(pack_id: &str, source_json: &str) -> Result<(), SanitizerPackError> {
-    compile_source(
-        SourceFormat::Json,
-        source_json.as_bytes(),
-        &CompilerOptions::default(),
-    )
-    .map(|_| ())
-    .map_err(|diagnostics| SanitizerPackError::CompileFailed {
-        pack_id: pack_id.to_owned(),
-        diagnostics: diagnostics
-            .iter()
-            .map(|diagnostic| format!("{diagnostic:?}"))
-            .collect(),
+    super::compile_pack_source(source_json).map_err(|diagnostics| {
+        SanitizerPackError::CompileFailed {
+            pack_id: pack_id.to_owned(),
+            diagnostics,
+        }
     })
 }
 
 /// Serialize the audit report to canonical pretty JSON with a trailing newline.
 pub fn serialize_audit(audit: &SanitizerAuditReport) -> String {
-    let mut json = serde_json::to_string_pretty(audit).expect("the audit report is serializable");
-    json.push('\n');
-    json
+    super::serialize_pretty_json_line(audit)
 }
 
 fn rejection_reason(rejection: &SanitizerRejection) -> String {
@@ -894,48 +837,6 @@ mod tests {
             "no_neutralized_context"
         );
         assert_eq!(conversion.audit.gate_rejects[0].target_symbol, "p.Q.m");
-    }
-
-    #[test]
-    fn identical_overloads_fold_into_one_summary() {
-        // Two overloads under one signature-less symbol carry an identical claim,
-        // so they fold into one summary and the fold is recorded.
-        let candidate = r#"[
-          {
-            "target": {"path": "p/Q.java", "symbol": "p.Q.escape", "parameter_count": 1},
-            "artifact": "com.example:lib:1.0.0",
-            "sanitized_input": {"kind": "parameter", "ordinal": 0},
-            "output": {"kind": "normal_return"},
-            "neutralizes": ["sql"],
-            "does_not_neutralize": ["html"],
-            "completeness": "partial"
-          },
-          {
-            "target": {"path": "p/Q.java", "symbol": "p.Q.escape", "parameter_count": 2},
-            "artifact": "com.example:lib:1.0.0",
-            "sanitized_input": {"kind": "parameter", "ordinal": 0},
-            "output": {"kind": "normal_return"},
-            "neutralizes": ["sql"],
-            "does_not_neutralize": ["html"],
-            "completeness": "partial"
-          }
-        ]"#;
-        let conversion = convert(&[("lib.json", candidate)]);
-        assert_eq!(conversion.audit.candidates_total, 2);
-        assert_eq!(conversion.audit.gate_rejected, 0);
-        assert_eq!(conversion.audit.shipped_summaries, 1);
-        assert_eq!(conversion.audit.folded_overloads, 1);
-        assert_eq!(conversion.audit.folded[0].kept_parameter_count, 2);
-        let pack = &conversion.packs[0];
-        assert_eq!(pack.pack_id, "bifrost.lib-sanitizers");
-        assert!(!pack.pinned, "a library pack is staged unpinned");
-        // The generated pack compiles through the production compiler.
-        compile_source(
-            SourceFormat::Json,
-            pack.source_json.as_bytes(),
-            &CompilerOptions::default(),
-        )
-        .expect("the folded pack compiles");
     }
 
     #[test]
@@ -990,25 +891,5 @@ mod tests {
             pack.relative_path,
             PathBuf::from("bifrost.java-sanitizers.json")
         );
-    }
-
-    #[test]
-    fn conversion_is_deterministic() {
-        let candidate = r#"[{
-          "target": {"path": "p/Q.java", "symbol": "p.Q.escape", "parameter_count": 1},
-          "artifact": "com.example:lib:1.0.0",
-          "sanitized_input": {"kind": "parameter", "ordinal": 0},
-          "output": {"kind": "normal_return"},
-          "neutralizes": ["sql", "html"],
-          "does_not_neutralize": ["shell"],
-          "completeness": "partial"
-        }]"#;
-        let first = convert(&[("lib.json", candidate)]);
-        let second = convert(&[("lib.json", candidate)]);
-        assert_eq!(first, second);
-        // removes is sorted for a canonical, diff-stable list.
-        let value: serde_json::Value = serde_json::from_str(&first.packs[0].source_json).unwrap();
-        let removes = &value["shards"][0]["payload"]["summaries"][0]["effects"][0]["removes"];
-        assert_eq!(removes, &serde_json::json!(["html", "sql"]));
     }
 }

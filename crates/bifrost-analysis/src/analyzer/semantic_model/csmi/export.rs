@@ -1,25 +1,26 @@
-//! Translation from Bifrost semantic-model packs to CSMI v0.1 documents.
+//! Translation from Bifrost semantic-model packs to CSMI 0.2 documents.
 
 use crate::analyzer::semantic_model::{ConditionalTypeRefinementsPayload, DeferredYieldsPayload};
 
 use super::canonical::{canonical_json, sha256_hex};
+use super::cpp::cpp_symbol_definition;
 use super::identity::{
-    callable_disambiguator, member_symbol_id, type_expression, type_symbol, type_symbol_id,
+    callable_disambiguator, go_anonymous_callable_symbol, go_member_symbol, go_type_symbol,
+    member_symbol_id, type_expression, type_symbol, type_symbol_id,
 };
 use super::model::*;
 use super::pack::{CsmiLogicalPack, InMemoryCsmiResourceResolver};
 use super::validate::{CsmiVocabularySupport, validate_csmi_pack};
 use crate::analyzer::semantic_model::{
-    AuthoredSemanticModelPack, CollectionFlowsPayload, CompiledPayload, CompiledSemanticModelPack,
-    CompiledShard, CompiledSummaryExitKind, CompiledSummaryInput, CompiledSummaryMoveInvalidation,
-    CompiledSummaryOutput, CompiledSummaryValuePreservation, CompiledSummaryValueTransferKind,
-    CompiledSummaryValueTransferLimitationKind, CompiledSummaryValueTransferOperation,
-    CompilerOptions, Completeness, CppArtifactSelector, CppCanonicalType, CppDescriptorRole,
-    CppDigestAlgorithm, CppHeaderClosure, CppIdentityStability, CppLanguage,
-    CppPortabilityEvidence, CppPortableSymbolKey, CppReferenceKind, CppResolutionContextRef,
+    AuthoredSemanticModelPack, CallableValuesFamily, CallableValuesPayload, CollectionFlowsPayload,
+    CompiledPayload, CompiledSemanticModelPack, CompiledShard, CompiledSummaryExitKind,
+    CompiledSummaryInput, CompiledSummaryMoveInvalidation, CompiledSummaryOutput,
+    CompiledSummaryValuePreservation, CompiledSummaryValueTransferKind,
+    CompiledSummaryValueTransferOperation, CompilerOptions, Completeness, CppCanonicalType,
+    CppLanguage, CppPortabilityEvidence, CppPortableSymbolKey, CppReferenceKind,
     CppSpecialMemberOperation, CppTypeQualifier, DecodeLimits, ImplicitOperation, MemberFact,
-    MemberKind, RuntimeValuesPayload, TypeCopySemantics, TypeMoveSemantics, TypeRef, compile_pack,
-    decode_shard,
+    MemberKind, ParameterRole, RuntimeValuesPayload, TypeCopySemantics, TypeFact, TypeKind,
+    TypeMoveSemantics, TypeRef, compile_pack, decode_shard,
 };
 use serde_json::json;
 use std::collections::{HashMap, HashSet};
@@ -108,6 +109,21 @@ impl std::error::Error for CsmiExportError {}
 /// Compatibility alias for callers that treat export diagnostics as a report.
 pub type CsmiExportReport = CsmiExportError;
 
+fn reject_unmapped_callable_values(shards: &[CompiledShard]) -> Result<(), CsmiExportError> {
+    if let Some(shard) = shards
+        .iter()
+        .find(|shard| shard.callable_values().is_some())
+    {
+        return Err(CsmiExportError::Unsupported {
+            path: format!("shards.{}.callable_values", shard.shard_id()),
+            semantic:
+                "native callable-values transport is retained but has no CSMI export mapping yet"
+                    .to_owned(),
+        });
+    }
+    Ok(())
+}
+
 pub fn export_csmi_pack(
     pack: &CompiledSemanticModelPack,
     artifact: &CsmiArtifactEvidence,
@@ -163,6 +179,7 @@ pub fn export_csmi_pack(
         return logical_pack(semantic, provenance, &pack.manifest.license, options);
     }
     let (semantic, provenance) = export_semantic_document(
+        &pack.manifest.language,
         &pack.manifest.producer,
         &pack.manifest.provenance,
         pack.manifest.completeness,
@@ -189,6 +206,7 @@ pub fn export_runtime_contracts_csmi_pack(
         .map(|shard| decode_shard(&shard.descriptor, &shard.bytes, &DecodeLimits::default()))
         .collect::<Result<Vec<_>, _>>()
         .map_err(|error| CsmiExportError::Canonical(error.to_string()))?;
+    reject_unmapped_callable_values(&decoded)?;
     let mut retained: Option<serde_json::Value> = None;
     for shard in &decoded {
         let Some(carrier) = shard.runtime_contracts() else {
@@ -270,13 +288,19 @@ pub fn export_runtime_contracts_csmi_pack(
 
 /// Author and export a portable runtime-contract pack while preserving its
 /// retained CSMI semantic-document envelope.
+fn compile_authored_pack(
+    pack: &AuthoredSemanticModelPack,
+) -> Result<CompiledSemanticModelPack, CsmiExportError> {
+    compile_pack(pack, &CompilerOptions::default()).map_err(|diagnostics| {
+        CsmiExportError::Canonical(format!("Bifrost pack did not compile: {diagnostics:?}"))
+    })
+}
+
 pub fn export_authored_runtime_contracts_csmi_pack(
     pack: &AuthoredSemanticModelPack,
     options: &CsmiExportOptions,
 ) -> Result<CsmiLogicalPack, CsmiExportReport> {
-    let compiled = compile_pack(pack, &CompilerOptions::default()).map_err(|diagnostics| {
-        CsmiExportError::Canonical(format!("Bifrost pack did not compile: {diagnostics:?}"))
-    })?;
+    let compiled = compile_authored_pack(pack)?;
     export_runtime_contracts_csmi_pack(&compiled, options)
 }
 
@@ -285,13 +309,13 @@ pub fn export_authored_csmi_pack(
     artifact: &CsmiArtifactEvidence,
     options: &CsmiExportOptions,
 ) -> Result<CsmiLogicalPack, CsmiExportReport> {
-    let compiled = compile_pack(pack, &CompilerOptions::default()).map_err(|diagnostics| {
-        CsmiExportError::Canonical(format!("Bifrost pack did not compile: {diagnostics:?}"))
-    })?;
+    let compiled = compile_authored_pack(pack)?;
     export_csmi_pack(&compiled, artifact, options)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn export_semantic_document<'a>(
+    language: &str,
     producer: &crate::analyzer::semantic_model::Producer,
     pack_provenance: &crate::analyzer::semantic_model::Provenance,
     pack_completeness: Completeness,
@@ -308,6 +332,8 @@ fn export_semantic_document<'a>(
     let has_deferred_yields = shards.iter().any(|shard| shard.deferred_yields().is_some());
     if cpp_portability.is_some() {
         validate_exact_artifact_evidence(artifact)?;
+    } else if language == "go" {
+        validate_go_artifact_evidence(artifact)?;
     } else if has_runtime_values || has_collection_flows || has_deferred_yields {
         // Runtime profiles select exact versioned runtime distributions, which
         // may use a non-Maven PURL such as pkg:generic. Keep that evidence
@@ -317,6 +343,7 @@ fn export_semantic_document<'a>(
     } else {
         validate_maven_evidence(artifact)?;
     }
+    let artifact_selector = csmi_artifact_selector(artifact);
     let mut types = Vec::new();
     let mut members = Vec::new();
     let mut relations = Vec::new();
@@ -379,37 +406,60 @@ fn export_semantic_document<'a>(
     let mut symbols = Vec::new();
     let mut declarations = Vec::new();
     let mut seen_symbols = HashSet::new();
+    let go_types_by_id: HashMap<String, &TypeFact> =
+        types.iter().map(|fact| (fact.id.clone(), *fact)).collect();
+    #[allow(clippy::too_many_arguments)]
     fn ensure_type(
         name: &str,
         native_id: &str,
         cpp_keys: &HashMap<String, &CppPortableSymbolKey>,
+        go_types_by_id: &HashMap<String, &TypeFact>,
+        language: &str,
+        artifact_selector: &CsmiArtifactSelector,
         symbols: &mut Vec<CsmiSymbolDefinition>,
         seen_symbols: &mut HashSet<String>,
     ) -> Result<String, CsmiExportError> {
-        let id = if cpp_keys.is_empty() {
-            type_symbol_id(name).map_err(|error| CsmiExportError::Identity(error.to_string()))?
+        let symbol = if language == "go" && cpp_keys.is_empty() {
+            let fact = go_types_by_id.get(native_id).ok_or_else(|| {
+                CsmiExportError::Unsupported {
+                    path: format!("types.{native_id}"),
+                    semantic: "Go source identity requires the exact native type fact and artifact locator".to_owned(),
+                }
+            })?;
+            go_type_symbol(fact, artifact_selector).map_err(|semantic| {
+                CsmiExportError::Unsupported {
+                    path: format!("types.{native_id}.locator"),
+                    semantic,
+                }
+            })?
+        } else if cpp_keys.is_empty() {
+            type_symbol(name).map_err(|error| CsmiExportError::Identity(error.to_string()))?
         } else {
-            cpp_local_id(cpp_keys.get(native_id).copied().ok_or_else(|| {
+            let id = cpp_local_id(cpp_keys.get(native_id).copied().ok_or_else(|| {
                 CsmiExportError::MissingDeclaration {
                     path: "cpp_portability.symbols".to_owned(),
                     target: native_id.to_owned(),
                 }
-            })?)?
+            })?)?;
+            cpp_symbol_definition(
+                &id,
+                cpp_keys.get(native_id).copied().ok_or_else(|| {
+                    CsmiExportError::MissingDeclaration {
+                        path: "cpp_portability.symbols".to_owned(),
+                        target: native_id.to_owned(),
+                    }
+                })?,
+            )
+        };
+        let id = if cpp_keys.is_empty() && language == "go" {
+            symbol.id.clone()
+        } else if cpp_keys.is_empty() {
+            type_symbol_id(name).map_err(|error| CsmiExportError::Identity(error.to_string()))?
+        } else {
+            symbol.id.clone()
         };
         if seen_symbols.insert(id.clone()) {
-            symbols.push(if cpp_keys.is_empty() {
-                type_symbol(name).map_err(|error| CsmiExportError::Identity(error.to_string()))?
-            } else {
-                cpp_symbol_definition(
-                    &id,
-                    cpp_keys.get(native_id).copied().ok_or_else(|| {
-                        CsmiExportError::MissingDeclaration {
-                            path: "cpp_portability.symbols".to_owned(),
-                            target: native_id.to_owned(),
-                        }
-                    })?,
-                )
-            });
+            symbols.push(symbol);
         }
         Ok(id)
     }
@@ -436,6 +486,9 @@ fn export_semantic_document<'a>(
             &fact.name,
             &fact.id,
             &cpp_keys,
+            &go_types_by_id,
+            language,
+            &artifact_selector,
             &mut symbols,
             &mut seen_symbols,
         )?;
@@ -456,9 +509,18 @@ fn export_semantic_document<'a>(
         } else {
             None
         };
+        let go_alias_target = (language == "go" && fact.type_kind == TypeKind::TypeAlias)
+            .then_some({
+                CsmiTypeExpression::Unknown(CsmiUnknownType {
+                    kind: CsmiUnknownTypeKind::Unknown,
+                })
+            });
+        let alias_target = cpp_alias_target.or(go_alias_target);
         declarations.push(CsmiDeclaration {
             symbol: id,
-            category: if cpp_alias_target.is_some() {
+            category: if language == "go" && fact.type_kind == TypeKind::Module {
+                CsmiDeclarationCategory::Namespace
+            } else if alias_target.is_some() {
                 CsmiDeclarationCategory::TypeAlias
             } else {
                 CsmiDeclarationCategory::Type
@@ -466,7 +528,9 @@ fn export_semantic_document<'a>(
             owner: None,
             generic_parameters: Vec::new(),
             callable: None,
-            alias_target: cpp_alias_target,
+            value_type: None,
+            proxied_type: None,
+            alias_target,
             provenance: vec![options.provenance_id.clone()],
             extensions: Vec::new(),
         });
@@ -482,10 +546,39 @@ fn export_semantic_document<'a>(
             &owner_name,
             &fact.owner,
             &cpp_keys,
+            &go_types_by_id,
+            language,
+            &artifact_selector,
             &mut symbols,
             &mut seen_symbols,
         )?;
-        let id = if cpp_keys.is_empty() {
+        let value_member = matches!(
+            fact.member_kind,
+            MemberKind::Field | MemberKind::Property | MemberKind::Constant | MemberKind::Static
+        );
+        let go_symbol = if language == "go" && cpp_keys.is_empty() {
+            let owner_fact =
+                go_types_by_id
+                    .get(&fact.owner)
+                    .ok_or_else(|| CsmiExportError::Unsupported {
+                        path: format!("members.{}.owner", fact.id),
+                        semantic: "Go source identity requires the exact native owner type fact"
+                            .to_owned(),
+                    })?;
+            Some(
+                go_member_symbol(fact, owner_fact, &artifact_selector, value_member).map_err(
+                    |semantic| CsmiExportError::Unsupported {
+                        path: format!("members.{}.locator", fact.id),
+                        semantic,
+                    },
+                )?,
+            )
+        } else {
+            None
+        };
+        let id = if let Some(symbol) = &go_symbol {
+            symbol.id.clone()
+        } else if cpp_keys.is_empty() {
             member_symbol_id(&owner_name, fact, &type_names_by_id)
                 .map_err(|error| CsmiExportError::Identity(error.to_string()))?
         } else {
@@ -498,7 +591,9 @@ fn export_semantic_document<'a>(
         };
         symbol_by_bifrost_id.insert(fact.id.clone(), id.clone());
         if seen_symbols.insert(id.clone()) {
-            symbols.push(if cpp_keys.is_empty() {
+            symbols.push(if let Some(symbol) = go_symbol {
+                symbol
+            } else if cpp_keys.is_empty() {
                 let mut symbol = type_symbol(&owner_name)
                     .map_err(|error| CsmiExportError::Identity(error.to_string()))?;
                 symbol.id = id.clone();
@@ -523,23 +618,96 @@ fn export_semantic_document<'a>(
                 )
             });
         }
+        let category = if language == "go" && value_member {
+            CsmiDeclarationCategory::Value
+        } else {
+            CsmiDeclarationCategory::Callable
+        };
+        let callable = if category == CsmiDeclarationCategory::Callable {
+            Some(if language == "go" {
+                go_member_callable_shape(fact, &owner_id)?
+            } else {
+                callable_shape(fact, &|value| {
+                    core_type_expression(
+                        value,
+                        &type_names_by_id,
+                        &symbol_by_bifrost_id,
+                        !cpp_keys.is_empty(),
+                    )
+                })?
+            })
+        } else {
+            None
+        };
         declarations.push(CsmiDeclaration {
             symbol: id,
-            category: CsmiDeclarationCategory::Callable,
+            category,
             owner: Some(owner_id.clone()),
             generic_parameters: Vec::new(),
-            callable: Some(callable_shape(fact, &|value| {
-                core_type_expression(
-                    value,
-                    &type_names_by_id,
-                    &symbol_by_bifrost_id,
-                    !cpp_keys.is_empty(),
-                )
-            })?),
+            callable,
+            value_type: None,
+            proxied_type: None,
             alias_target: None,
             provenance: vec![options.provenance_id.clone()],
             extensions: Vec::new(),
         });
+    }
+    for shard in &shards {
+        let Some(callable_values) = shard.callable_values() else {
+            continue;
+        };
+        if language != "go" && !callable_values.anonymous_callables.is_empty() {
+            return Err(CsmiExportError::Unsupported {
+                path: format!(
+                    "shards.{}.callable_values.anonymous_callables",
+                    shard.shard_id()
+                ),
+                semantic:
+                    "anonymous callable identities currently have an exact Go-source mapping only"
+                        .to_owned(),
+            });
+        }
+        for identity in &callable_values.anonymous_callables {
+            let (symbol, shape) = go_anonymous_callable_symbol(identity, &artifact_selector)
+                .map_err(|semantic| CsmiExportError::Unsupported {
+                    path: format!(
+                        "shards.{}.callable_values.anonymous_callables.{}",
+                        shard.shard_id(),
+                        identity.id
+                    ),
+                    semantic,
+                })?;
+            if symbol_by_bifrost_id.contains_key(&identity.id) {
+                return Err(CsmiExportError::Identity(format!(
+                    "Go anonymous callable ID {} collides with another declaration ID",
+                    identity.id
+                )));
+            }
+            if seen_symbols.insert(symbol.id.clone()) {
+                symbols.push(symbol.clone());
+                declarations.push(CsmiDeclaration {
+                    symbol: symbol.id.clone(),
+                    category: CsmiDeclarationCategory::Callable,
+                    owner: None,
+                    generic_parameters: Vec::new(),
+                    callable: Some(shape),
+                    value_type: None,
+                    proxied_type: None,
+                    alias_target: None,
+                    provenance: vec![options.provenance_id.clone()],
+                    extensions: Vec::new(),
+                });
+            }
+            if symbol_by_bifrost_id
+                .insert(identity.id.clone(), symbol.id.clone())
+                .is_some_and(|previous| previous != symbol.id)
+            {
+                return Err(CsmiExportError::Identity(format!(
+                    "Go anonymous callable ID {} has inconsistent source identities",
+                    identity.id
+                )));
+            }
+        }
     }
     if let Some(relation) = relations.first() {
         return Err(CsmiExportError::Unsupported {
@@ -570,6 +738,8 @@ fn export_semantic_document<'a>(
     let mut conditional_type_completeness = Vec::new();
     let mut deferred_yield_affects = Vec::new();
     let mut deferred_yield_completeness = Vec::new();
+    let mut callable_values_affects = Vec::new();
+    let mut callable_values_completeness = Vec::new();
     let callable_shape_completeness: HashMap<String, bool> = member_facts
         .iter()
         .map(|member| (member.id.clone(), member.callable_family_complete))
@@ -623,6 +793,21 @@ fn export_semantic_document<'a>(
             &mut extension_facts,
             &mut collection_flow_affects,
             &mut collection_flow_completeness,
+        )?;
+    }
+    for shard in &shards {
+        let Some(callable_values) = shard.callable_values() else {
+            continue;
+        };
+        export_callable_values(
+            language,
+            shard.shard_id(),
+            callable_values,
+            options,
+            &symbol_by_bifrost_id,
+            &mut extension_facts,
+            &mut callable_values_affects,
+            &mut callable_values_completeness,
         )?;
     }
     for fact in &types {
@@ -800,16 +985,7 @@ fn export_semantic_document<'a>(
             extensions: Vec::new(),
         });
     }
-    let selector = CsmiArtifactSelector {
-        purl: artifact.purl.clone(),
-        version_range: None,
-        digests: vec![CsmiArtifactDigest {
-            algorithm: CsmiDigestAlgorithm::Sha256,
-            coverage: artifact.coverage.clone(),
-            canonicalization: None,
-            value: artifact.sha256.clone(),
-        }],
-    };
+    let selector = artifact_selector.clone();
     let mut completeness_statements = Vec::new();
     let summary_ids: HashSet<String> = summaries
         .iter()
@@ -914,6 +1090,7 @@ fn export_semantic_document<'a>(
     completeness_statements.extend(collection_flow_completeness);
     completeness_statements.extend(deferred_yield_completeness);
     completeness_statements.extend(conditional_type_completeness);
+    completeness_statements.extend(callable_values_completeness);
     let declaration_status = match pack_completeness {
         Completeness::Complete => CsmiCoverageStatus::Complete,
         Completeness::Partial => CsmiCoverageStatus::Partial,
@@ -923,8 +1100,20 @@ fn export_semantic_document<'a>(
         version: None,
         family: "declaration-records".to_owned(),
         scope: json!({
-            "scheme": if cpp_keys.is_empty() { super::identity::JVM_IDENTITY_SCHEME } else { CSMI_CPP_DECLARATION_IDENTITY_SCHEME },
-            "schemeVersion": if cpp_keys.is_empty() { super::identity::JVM_IDENTITY_VERSION } else { CSMI_CPP_DECLARATION_IDENTITY_SCHEME_VERSION }
+            "scheme": if cpp_keys.is_empty() && language == "go" {
+                super::identity::GO_SOURCE_IDENTITY_SCHEME
+            } else if cpp_keys.is_empty() {
+                super::identity::JVM_IDENTITY_SCHEME
+            } else {
+                CSMI_CPP_DECLARATION_IDENTITY_SCHEME
+            },
+            "schemeVersion": if cpp_keys.is_empty() && language == "go" {
+                super::identity::GO_SOURCE_IDENTITY_VERSION
+            } else if cpp_keys.is_empty() {
+                super::identity::JVM_IDENTITY_VERSION
+            } else {
+                CSMI_CPP_DECLARATION_IDENTITY_SCHEME_VERSION
+            }
         }),
         status: declaration_status,
         limitations: if declaration_status == CsmiCoverageStatus::Partial {
@@ -980,7 +1169,9 @@ fn export_semantic_document<'a>(
                     language: CsmiCppProfileLanguage::Cpp,
                     alias: alias_symbol,
                     target: csmi_cpp_type(&alias.target, &cpp_keys)?,
-                    resolution_context: csmi_cpp_context_ref(&alias.resolution_context)?,
+                    resolution_context: CsmiCppResolutionContext::try_from(
+                        &alias.resolution_context,
+                    )?,
                 })
                 .map_err(|error| CsmiExportError::Canonical(error.to_string()))?,
                 provenance: vec![options.provenance_id.clone()],
@@ -1187,6 +1378,15 @@ fn export_semantic_document<'a>(
                         affects: deferred_yield_affects,
                     });
                 }
+                if !callable_values_affects.is_empty() {
+                    uses.push(CsmiVocabularyUse {
+                        identifier: CSMI_CALLABLE_VALUES_PROFILE_ID.to_owned(),
+                        version: CSMI_CALLABLE_VALUES_PROFILE_VERSION.to_owned(),
+                        schema: CSMI_CALLABLE_VALUES_PROFILE_SCHEMA.to_owned(),
+                        requirement: CsmiVocabularyRequirement::Required,
+                        affects: callable_values_affects,
+                    });
+                }
                 if cpp_portability.is_some() {
                     uses.push(CsmiVocabularyUse {
                         identifier: CSMI_C_CPP_RESOLUTION_PROFILE_ID.to_owned(),
@@ -1312,6 +1512,11 @@ fn logical_pack(
         CSMI_DEFERRED_YIELD_PROFILE_SCHEMA,
     );
     support.add(
+        CSMI_CALLABLE_VALUES_PROFILE_ID,
+        CSMI_CALLABLE_VALUES_PROFILE_VERSION,
+        CSMI_CALLABLE_VALUES_PROFILE_SCHEMA,
+    );
+    support.add(
         CSMI_C_CPP_RESOLUTION_PROFILE_ID,
         CSMI_C_CPP_RESOLUTION_PROFILE_VERSION,
         CSMI_CPP_PROFILE_SCHEMA,
@@ -1322,13 +1527,140 @@ fn logical_pack(
         CSMI_CPP_PROFILE_SCHEMA,
     );
     let validation = validate_csmi_pack(&manifest_bytes, &pack.resources, &support);
-    if !validation.usable() {
+    let only_uninterpretable_callable_values = validation.valid()
+        && !validation.interpretable
+        && validation
+            .profiles
+            .iter()
+            .any(|profile| !profile.semantically_supported)
+        && validation.profiles.iter().all(|profile| {
+            profile.semantically_supported
+                || (profile.identifier == CSMI_CALLABLE_VALUES_PROFILE_ID
+                    && profile.version == CSMI_CALLABLE_VALUES_PROFILE_VERSION
+                    && profile.schema == CSMI_CALLABLE_VALUES_PROFILE_SCHEMA)
+        });
+    if !validation.usable() && !only_uninterpretable_callable_values {
         return Err(CsmiExportError::Canonical(format!(
             "exported CSMI pack failed self-validation: {:?}",
             validation.diagnostics
         )));
     }
     Ok(pack)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn export_callable_values(
+    language: &str,
+    shard_id: &str,
+    native: &CallableValuesPayload,
+    options: &CsmiExportOptions,
+    symbol_by_bifrost_id: &HashMap<String, String>,
+    facts: &mut Vec<CsmiExtensionFact>,
+    affects: &mut Vec<CsmiAffectedUnit>,
+    completeness: &mut Vec<CsmiCompletenessStatement>,
+) -> Result<(), CsmiExportError> {
+    if language != "go" && (!native.facts.is_empty() || !native.coverage.is_empty()) {
+        return Err(CsmiExportError::Unsupported {
+            path: format!("shards.{shard_id}.callable_values"),
+            semantic: "callable-values native identity remapping is currently defined for exact Go source declarations only".to_owned(),
+        });
+    }
+    let remap = |native_id: &str| {
+        symbol_by_bifrost_id
+            .get(native_id)
+            .cloned()
+            .ok_or_else(|| native_id.to_owned())
+    };
+    let mut add_affect = |family: &str, scope: serde_json::Value| {
+        let affect = CsmiAffectedUnit::FactFamily(CsmiAffectedFactFamily {
+            kind: CsmiAffectedFactFamilyKind::FactFamily,
+            family: family.to_owned(),
+            scope,
+        });
+        if !affects.contains(&affect) {
+            affects.push(affect);
+        }
+    };
+    for (index, native_fact) in native.facts.iter().enumerate() {
+        let mut payload = native_fact.payload.clone();
+        if let Err(error) = payload.remap_symbols(remap) {
+            match error {
+                CsmiCallableValuesRemapError::Symbol(native_id) => {
+                    return Err(CsmiExportError::Unsupported {
+                        path: format!("shards.{shard_id}.callable_values.facts[{index}]"),
+                        semantic: format!(
+                            "Go callable-values reference {native_id} has no exact native declaration identity mapping"
+                        ),
+                    });
+                }
+                CsmiCallableValuesRemapError::UnsupportedProjection(projection) => {
+                    return Err(CsmiExportError::Unsupported {
+                        path: format!("shards.{shard_id}.callable_values.facts[{index}].payload"),
+                        semantic: format!(
+                            "Go callable-values projection is unsupported by the pinned structured-locations mapping: {projection:?}"
+                        ),
+                    });
+                }
+            }
+        }
+        let (family, callable) = match &payload {
+            CsmiCallableValuesPayload::ReturnedCallable { callable, .. } => (
+                CSMI_CALLABLE_VALUES_RETURNED_CALLABLES_FAMILY,
+                callable.as_str(),
+            ),
+            CsmiCallableValuesPayload::CallbackInvocation { callable, .. } => (
+                CSMI_CALLABLE_VALUES_CALLBACK_INVOCATIONS_FAMILY,
+                callable.as_str(),
+            ),
+        };
+        let scope = json!({"callable": callable});
+        facts.push(CsmiExtensionFact {
+            vocabulary: CSMI_CALLABLE_VALUES_PROFILE_ID.to_owned(),
+            version: CSMI_CALLABLE_VALUES_PROFILE_VERSION.to_owned(),
+            family: family.to_owned(),
+            scope: scope.clone(),
+            payload: serde_json::to_value(payload)
+                .map_err(|error| CsmiExportError::Canonical(error.to_string()))?,
+            provenance: vec![options.provenance_id.clone()],
+            extensions: Vec::new(),
+        });
+        add_affect(family, scope);
+    }
+    for (index, native_coverage) in native.coverage.iter().enumerate() {
+        let callable = symbol_by_bifrost_id
+            .get(&native_coverage.callable)
+            .cloned()
+            .ok_or_else(|| CsmiExportError::Unsupported {
+                path: format!(
+                    "shards.{shard_id}.callable_values.coverage[{index}].callable"
+                ),
+                semantic: format!(
+                    "Go callable-values coverage target {} has no exact native declaration identity mapping",
+                    native_coverage.callable
+                ),
+            })?;
+        let family = match native_coverage.family {
+            CallableValuesFamily::ReturnedCallables => {
+                CSMI_CALLABLE_VALUES_RETURNED_CALLABLES_FAMILY
+            }
+            CallableValuesFamily::CallbackInvocations => {
+                CSMI_CALLABLE_VALUES_CALLBACK_INVOCATIONS_FAMILY
+            }
+        };
+        let scope = json!({"callable": callable});
+        completeness.push(CsmiCompletenessStatement {
+            vocabulary: Some(CSMI_CALLABLE_VALUES_PROFILE_ID.to_owned()),
+            version: Some(CSMI_CALLABLE_VALUES_PROFILE_VERSION.to_owned()),
+            family: family.to_owned(),
+            scope: scope.clone(),
+            status: native_coverage.status,
+            limitations: native_coverage.limitations.clone(),
+            provenance: vec![options.provenance_id.clone()],
+            extensions: Vec::new(),
+        });
+        add_affect(family, scope);
+    }
+    Ok(())
 }
 
 fn export_collection_flows(
@@ -1612,68 +1944,14 @@ fn remap_deferred_yield_payload(
     payload: &mut CsmiDeferredYieldPayload,
     symbols: &HashMap<String, String>,
 ) -> Result<(), CsmiExportError> {
-    payload.factory = export_deferred_id(&payload.factory, symbols, "payload.factory")?;
-    payload.resume = export_deferred_id(&payload.resume, symbols, "payload.resume")?;
-    payload.handle_type = export_deferred_id(&payload.handle_type, symbols, "payload.handleType")?;
-    if let Some(CsmiDeferredYieldSubstitution::ReceiverArguments { declaration }) =
-        &mut payload.receiver_substitution
-    {
-        *declaration = export_deferred_id(
-            declaration,
-            symbols,
-            "payload.receiverSubstitution.declaration",
-        )?;
-    }
-    for (position, root) in payload.roots.iter_mut().enumerate() {
-        root.callable = export_deferred_id(
-            &root.callable,
-            symbols,
-            &format!("payload.roots[{position}].callable"),
-        )?;
-        remap_deferred_yield_shape(
-            &mut root.shape,
-            symbols,
-            &format!("payload.roots[{position}].shape"),
-        )?;
-    }
-    remap_deferred_yield_location(
-        &mut payload.construction.source,
-        symbols,
-        "payload.construction.source",
-    )?;
-    remap_deferred_yield_location(
-        &mut payload.construction.handle,
-        symbols,
-        "payload.construction.handle",
-    )?;
-    remap_deferred_yield_location(
-        &mut payload.resume_contract.handle_input,
-        symbols,
-        "payload.resumeContract.handleInput",
-    )?;
-    remap_deferred_yield_location(
-        &mut payload.resume_contract.yielded_result,
-        symbols,
-        "payload.resumeContract.yieldedResult",
-    )?;
-    remap_deferred_yield_location(
-        &mut payload.resume_contract.factory_result_flow.factory_result,
-        symbols,
-        "payload.resumeContract.factoryResultFlow.factoryResult",
-    )?;
-    remap_deferred_yield_location(
-        &mut payload.resume_contract.factory_result_flow.resume_input,
-        symbols,
-        "payload.resumeContract.factoryResultFlow.resumeInput",
-    )?;
-    for (position, member) in payload.yield_contract.members.iter_mut().enumerate() {
-        remap_deferred_yield_location(
-            &mut member.source,
-            symbols,
-            &format!("payload.yield.members[{position}].source"),
-        )?;
-    }
-    Ok(())
+    super::deferred_yield::remap_payload(
+        payload,
+        "payload",
+        |id, path| export_deferred_id(id, symbols, path),
+        |id, path| export_deferred_id(id, symbols, path),
+        |location, path| remap_deferred_yield_location(location, symbols, path),
+        |shape, path| remap_deferred_yield_shape(shape, symbols, path),
+    )
 }
 
 fn export_deferred_id(
@@ -1705,25 +1983,9 @@ fn remap_deferred_yield_shape(
     symbols: &HashMap<String, String>,
     path: &str,
 ) -> Result<(), CsmiExportError> {
-    let mut stack = vec![(shape, path.to_owned())];
-    while let Some((shape, path)) = stack.pop() {
-        match shape {
-            CsmiDeferredYieldShape::Value { r#type } => {
-                remap_deferred_yield_type_expression(r#type, symbols, &format!("{path}.type"))?;
-            }
-            CsmiDeferredYieldShape::Product { components } => {
-                for (position, component) in components.iter_mut().enumerate().rev() {
-                    stack.push((component, format!("{path}.components[{position}]")));
-                }
-            }
-            CsmiDeferredYieldShape::Keyed { key, value, .. } => {
-                stack.push((value, format!("{path}.value")));
-                stack.push((key, format!("{path}.key")));
-            }
-            CsmiDeferredYieldShape::Unknown { .. } => {}
-        }
-    }
-    Ok(())
+    super::deferred_yield::visit_shape(shape, path, |r#type, path| {
+        remap_deferred_yield_type_expression(r#type, symbols, path)
+    })
 }
 
 fn remap_deferred_yield_type_expression(
@@ -1957,22 +2219,7 @@ fn validate_maven_evidence(artifact: &CsmiArtifactEvidence) -> Result<(), CsmiEx
             "Maven group, artifact, and exact version must be non-empty".to_owned(),
         ));
     }
-    if artifact.sha256.len() != 64
-        || !artifact
-            .sha256
-            .bytes()
-            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
-    {
-        return Err(CsmiExportError::InvalidEvidence(
-            "artifact SHA-256 must be lowercase hexadecimal".to_owned(),
-        ));
-    }
-    if artifact.coverage.is_empty() {
-        return Err(CsmiExportError::InvalidEvidence(
-            "digest coverage is empty".to_owned(),
-        ));
-    }
-    Ok(())
+    validate_digest_evidence(artifact)
 }
 
 fn validate_exact_artifact_evidence(
@@ -1983,6 +2230,10 @@ fn validate_exact_artifact_evidence(
             "portable C/C++ export requires an exact versioned PURL".to_owned(),
         ));
     }
+    validate_digest_evidence(artifact)
+}
+
+fn validate_digest_evidence(artifact: &CsmiArtifactEvidence) -> Result<(), CsmiExportError> {
     if artifact.sha256.len() != 64
         || !artifact
             .sha256
@@ -2001,42 +2252,40 @@ fn validate_exact_artifact_evidence(
     Ok(())
 }
 
-fn cpp_symbol_definition(id: &str, key: &CppPortableSymbolKey) -> CsmiSymbolDefinition {
-    CsmiSymbolDefinition {
-        id: id.to_owned(),
-        artifact_selectors: Some(
-            key.artifact_selectors
-                .iter()
-                .map(cpp_core_artifact_selector)
-                .collect(),
-        ),
-        scheme: key.scheme.clone(),
-        scheme_version: key.scheme_version.clone(),
-        stability: match key.stability {
-            CppIdentityStability::Portable => CsmiStability::Portable,
-        },
-        descriptors: key
-            .descriptors
-            .iter()
-            .map(|descriptor| CsmiDescriptor {
-                role: match descriptor.role {
-                    CppDescriptorRole::Namespace => CsmiDescriptorRole::Namespace,
-                    CppDescriptorRole::Type => CsmiDescriptorRole::Type,
-                    CppDescriptorRole::Callable => CsmiDescriptorRole::Callable,
-                },
-                name: Some(descriptor.name.clone()),
-                disambiguator: Some(descriptor.disambiguator.clone()),
-            })
-            .collect(),
-        display_name: None,
-        qualified_display_name: None,
-        native_signature: None,
-        documentation_name: None,
-        abi_name: None,
-        origin: Some(CsmiSymbolOrigin::Named),
-        external_identities: Vec::new(),
-        provenance: Vec::new(),
-        extensions: Vec::new(),
+fn validate_go_artifact_evidence(artifact: &CsmiArtifactEvidence) -> Result<(), CsmiExportError> {
+    let Some(coordinate) = artifact.purl.strip_prefix("pkg:golang/") else {
+        return Err(CsmiExportError::InvalidEvidence(
+            "Go source identity requires an exact versioned pkg:golang PURL".to_owned(),
+        ));
+    };
+    let Some((package, version)) = coordinate.split_once('@') else {
+        return Err(CsmiExportError::InvalidEvidence(
+            "Go source identity requires an exact versioned pkg:golang PURL".to_owned(),
+        ));
+    };
+    if package.is_empty()
+        || version.is_empty()
+        || version.contains('@')
+        || coordinate.contains(['?', '#'])
+    {
+        return Err(CsmiExportError::InvalidEvidence(
+            "Go PURL must identify one package and exact version without qualifiers or subpath"
+                .to_owned(),
+        ));
+    }
+    validate_exact_artifact_evidence(artifact)
+}
+
+fn csmi_artifact_selector(artifact: &CsmiArtifactEvidence) -> CsmiArtifactSelector {
+    CsmiArtifactSelector {
+        purl: artifact.purl.clone(),
+        version_range: None,
+        digests: vec![CsmiArtifactDigest {
+            algorithm: CsmiDigestAlgorithm::Sha256,
+            coverage: artifact.coverage.clone(),
+            canonicalization: None,
+            value: artifact.sha256.clone(),
+        }],
     }
 }
 
@@ -2046,65 +2295,8 @@ fn cpp_local_id(key: &CppPortableSymbolKey) -> Result<String, CsmiExportError> {
     Ok(format!("cpp.{}", sha256_hex(&bytes)))
 }
 
-fn cpp_core_artifact_selector(selector: &CppArtifactSelector) -> CsmiArtifactSelector {
-    CsmiArtifactSelector {
-        purl: selector.purl.clone(),
-        version_range: None,
-        digests: selector
-            .digests
-            .iter()
-            .map(|digest| CsmiArtifactDigest {
-                algorithm: match digest.algorithm {
-                    CppDigestAlgorithm::Sha256 => CsmiDigestAlgorithm::Sha256,
-                },
-                coverage: digest.coverage.clone(),
-                canonicalization: digest.canonicalization.clone(),
-                value: digest.value.clone(),
-            })
-            .collect(),
-    }
-}
-
-fn cpp_profile_artifact_selector(selector: &CppArtifactSelector) -> CsmiCppArtifactSelector {
-    CsmiCppArtifactSelector {
-        purl: selector.purl.clone(),
-        digests: selector
-            .digests
-            .iter()
-            .map(|digest| CsmiCppArtifactDigest {
-                algorithm: CsmiCppDigestAlgorithm::Sha256,
-                coverage: digest.coverage.clone(),
-                canonicalization: digest.canonicalization.clone(),
-                value: digest.value.clone(),
-            })
-            .collect(),
-    }
-}
-
 fn csmi_cpp_key(key: &CppPortableSymbolKey) -> CsmiCppSymbolKey {
-    CsmiCppSymbolKey {
-        artifact_selectors: key
-            .artifact_selectors
-            .iter()
-            .map(cpp_profile_artifact_selector)
-            .collect(),
-        scheme: key.scheme.clone(),
-        scheme_version: key.scheme_version.clone(),
-        stability: CsmiCppIdentityStability::Portable,
-        descriptors: key
-            .descriptors
-            .iter()
-            .map(|descriptor| CsmiCppDescriptor {
-                role: match descriptor.role {
-                    CppDescriptorRole::Namespace => CsmiCppDescriptorRole::Namespace,
-                    CppDescriptorRole::Type => CsmiCppDescriptorRole::Type,
-                    CppDescriptorRole::Callable => CsmiCppDescriptorRole::Callable,
-                },
-                name: descriptor.name.clone(),
-                disambiguator: descriptor.disambiguator.clone(),
-            })
-            .collect(),
-    }
+    key.into()
 }
 
 pub(crate) fn csmi_resolution_context(
@@ -2123,33 +2315,11 @@ pub(crate) fn csmi_resolution_context(
             .iter()
             .map(|header| CsmiCppDirectHeader {
                 include_name: header.include_name.clone(),
-                artifact: cpp_profile_artifact_selector(&header.artifact),
+                artifact: (&header.artifact).into(),
             })
             .collect(),
         header_closure: CsmiCompleteHeaderClosure::Complete,
     }
-}
-
-fn csmi_cpp_context_ref(
-    context: &CppResolutionContextRef,
-) -> Result<CsmiCppResolutionContext, CsmiExportError> {
-    if context.vocabulary != CSMI_C_CPP_RESOLUTION_PROFILE_ID
-        || context.version != CSMI_C_CPP_RESOLUTION_PROFILE_VERSION
-        || context.language != CppLanguage::Cpp
-        || context.header_closure != CppHeaderClosure::Complete
-    {
-        return Err(CsmiExportError::Unsupported {
-            path: "cpp_portability.resolution_context".to_owned(),
-            semantic: "C++ facts require the exact complete C/C++ resolution profile".to_owned(),
-        });
-    }
-    Ok(CsmiCppResolutionContext {
-        vocabulary: CsmiCCppResolutionVocabulary::CCppResolution,
-        version: context.version.clone(),
-        context_digest: context.context_digest.clone(),
-        language: CsmiCppProfileLanguage::Cpp,
-        header_closure: CsmiCompleteHeaderClosure::Complete,
-    })
 }
 
 fn csmi_cpp_type(
@@ -2289,7 +2459,7 @@ fn csmi_special_member(
         },
         signature: csmi_cpp_signature(&member.signature, keys)?,
         member_disambiguator: member.member_disambiguator.clone(),
-        resolution_context: csmi_cpp_context_ref(&member.resolution_context)?,
+        resolution_context: CsmiCppResolutionContext::try_from(&member.resolution_context)?,
     })
 }
 
@@ -2392,6 +2562,9 @@ pub(super) fn callable_shape(
                 position: position as u32,
                 binding,
                 label: parameter.name.clone(),
+                role: parameter.role.map(|role| match role {
+                    ParameterRole::Request => CsmiParameterRole::Request,
+                }),
                 required: !parameter.optional,
                 symbol: None,
                 parameter_type: Some(parameter_type),
@@ -2435,6 +2608,95 @@ pub(super) fn callable_shape(
         receiver,
         parameters,
         results,
+        return_classes: member
+            .exact_return_classes
+            .iter()
+            .map(resolve_type)
+            .collect::<Result<Vec<_>, _>>()?,
+        extensions: Vec::new(),
+    })
+}
+
+fn go_member_callable_shape(
+    member: &MemberFact,
+    owner_symbol: &str,
+) -> Result<CsmiCallableShape, CsmiExportError> {
+    let signature = member
+        .signature
+        .as_ref()
+        .ok_or_else(|| CsmiExportError::Unsupported {
+            path: format!("members.{}.signature", member.id),
+            semantic: "Go callable declaration has no native signature".to_owned(),
+        })?;
+    let unknown_type = || {
+        CsmiTypeExpression::Unknown(CsmiUnknownType {
+            kind: CsmiUnknownTypeKind::Unknown,
+        })
+    };
+    let mut parameters = Vec::with_capacity(signature.parameters.len());
+    for (position, parameter) in signature.parameters.iter().enumerate() {
+        parameters.push(CsmiParameter {
+            position: u32::try_from(position).map_err(|_| CsmiExportError::Unsupported {
+                path: format!("members.{}.signature.parameters", member.id),
+                semantic: "Go callable has more parameters than CSMI can index".to_owned(),
+            })?,
+            binding: if parameter.variadic {
+                CsmiParameterBinding::VariadicPositional
+            } else {
+                CsmiParameterBinding::PositionalOnly
+            },
+            label: None,
+            role: parameter.role.map(|role| match role {
+                ParameterRole::Request => CsmiParameterRole::Request,
+            }),
+            required: true,
+            symbol: None,
+            parameter_type: Some(unknown_type()),
+            extensions: Vec::new(),
+        });
+    }
+    let result_count = match signature.returns.as_ref() {
+        None => 0,
+        Some(TypeRef::Tuple { elements }) => elements.len(),
+        Some(_) => 1,
+    };
+    let mut results = Vec::with_capacity(result_count);
+    for position in 0..result_count {
+        results.push(CsmiResult {
+            position: u32::try_from(position).map_err(|_| CsmiExportError::Unsupported {
+                path: format!("members.{}.signature.returns", member.id),
+                semantic: "Go callable has more results than CSMI can index".to_owned(),
+            })?,
+            label: None,
+            result_type: Some(unknown_type()),
+            extensions: Vec::new(),
+        });
+    }
+    let receiver = member.receiver.map(|receiver| CsmiReceiver {
+        kind: CsmiReceiverKind::Instance,
+        receiver_type: Some(if receiver.pointer {
+            CsmiTypeExpression::Unknown(CsmiUnknownType {
+                kind: CsmiUnknownTypeKind::Unknown,
+            })
+        } else {
+            CsmiTypeExpression::Reference(CsmiReferenceType {
+                kind: CsmiReferenceTypeKind::Reference,
+                symbol: owner_symbol.to_owned(),
+                arguments: Vec::new(),
+            })
+        }),
+        extensions: Vec::new(),
+    });
+    Ok(CsmiCallableShape {
+        kind: if receiver.is_some() {
+            CsmiCallableKind::Method
+        } else {
+            CsmiCallableKind::Function
+        },
+        receiver,
+        parameters,
+        results,
+        return_classes: Vec::new(),
         extensions: Vec::new(),
     })
 }
@@ -2503,6 +2765,9 @@ fn core_type_expression(
             kind: CsmiParameterTypeKind::Parameter,
             symbol: format!("type-parameter.{name}"),
         })),
+        TypeRef::Unknown => Ok(CsmiTypeExpression::Unknown(CsmiUnknownType {
+            kind: CsmiUnknownTypeKind::Unknown,
+        })),
         other => Err(CsmiExportError::Unsupported {
             path: "declarations.callable.type".to_owned(),
             semantic: format!("C++ core type shape {other:?} is not representable"),
@@ -2528,64 +2793,15 @@ pub(super) fn transfer_to_csmi(
         .value_transfer
         .as_ref()
         .map(|value_transfer| {
-            let payload = CsmiValueTransferAttachment {
-                kind: CsmiValueTransferAttachmentKind::Transfer,
-                transfer_kind: match value_transfer.kind {
-                    CompiledSummaryValueTransferKind::Copy {} => CsmiValueTransferKind::Copy {},
-                    CompiledSummaryValueTransferKind::AggregateCopy {} => {
-                        CsmiValueTransferKind::AggregateCopy {}
+            let payload = super::value_transfer::csmi_from_compiled(value_transfer, |member| {
+                symbol_by_bifrost_id.get(member).cloned().ok_or_else(|| {
+                    CsmiExportError::MissingDeclaration {
+                        path: "procedureSummaries.transfers.valueTransfer.operation.member"
+                            .to_owned(),
+                        target: member.to_owned(),
                     }
-                    CompiledSummaryValueTransferKind::Move { invalidation } => {
-                        CsmiValueTransferKind::Move {
-                            invalidation: match invalidation {
-                                CompiledSummaryMoveInvalidation::Invalidated => CsmiMoveInvalidation::Invalidated,
-                                CompiledSummaryMoveInvalidation::Unknown => CsmiMoveInvalidation::Unknown,
-                            },
-                        }
-                    }
-                    CompiledSummaryValueTransferKind::Conversion { preservation } => {
-                        CsmiValueTransferKind::Conversion {
-                            preservation: match preservation {
-                                CompiledSummaryValuePreservation::Identity => CsmiValuePreservation::Identity,
-                                CompiledSummaryValuePreservation::Preserving => CsmiValuePreservation::Preserving,
-                                CompiledSummaryValuePreservation::Changing => CsmiValuePreservation::Changing,
-                                CompiledSummaryValuePreservation::Unknown => CsmiValuePreservation::Unknown,
-                            },
-                        }
-                    }
-                    CompiledSummaryValueTransferKind::Boxing {} => CsmiValueTransferKind::Boxing {},
-                    CompiledSummaryValueTransferKind::Unboxing {} => CsmiValueTransferKind::Unboxing {},
-                },
-                operation: match &value_transfer.operation {
-                    CompiledSummaryValueTransferOperation::None {} => CsmiValueTransferOperation::None {},
-                    CompiledSummaryValueTransferOperation::Implicit { member } => {
-                        CsmiValueTransferOperation::Implicit {
-                            symbol: symbol_by_bifrost_id.get(member).cloned().ok_or_else(|| {
-                                CsmiExportError::MissingDeclaration {
-                                    path: "procedureSummaries.transfers.valueTransfer.operation.member".to_owned(),
-                                    target: member.clone(),
-                                }
-                            })?,
-                        }
-                    }
-                    CompiledSummaryValueTransferOperation::Unknown { limitation } => {
-                        CsmiValueTransferOperation::Unknown {
-                            limitation: CsmiProfileLimitation {
-                                kind: match limitation.kind {
-                                    CompiledSummaryValueTransferLimitationKind::BudgetExhausted => CsmiProfileLimitationKind::BudgetExhausted,
-                                    CompiledSummaryValueTransferLimitationKind::Cancelled => CsmiProfileLimitationKind::Cancelled,
-                                    CompiledSummaryValueTransferLimitationKind::Unsupported => CsmiProfileLimitationKind::Unsupported,
-                                    CompiledSummaryValueTransferLimitationKind::UnresolvedIdentity => CsmiProfileLimitationKind::UnresolvedIdentity,
-                                    CompiledSummaryValueTransferLimitationKind::AmbiguousIdentity => CsmiProfileLimitationKind::AmbiguousIdentity,
-                                    CompiledSummaryValueTransferLimitationKind::IncompleteInput => CsmiProfileLimitationKind::IncompleteInput,
-                                    CompiledSummaryValueTransferLimitationKind::Other => CsmiProfileLimitationKind::Other,
-                                },
-                                message: limitation.message.clone(),
-                            },
-                        }
-                    }
-                },
-            };
+                })
+            })?;
             Ok(CsmiExtensionAttachment {
                 vocabulary: CSMI_VALUE_TRANSFER_PROFILE_ID.to_owned(),
                 version: CSMI_VALUE_TRANSFER_PROFILE_VERSION.to_owned(),

@@ -26,9 +26,7 @@
 //!
 //! `JavaAnalyzer` lives in `brokk-bifrost-analysis`; this crate never names it.
 
-use brokk_bifrost_core::analyzer::capabilities::{
-    ImportAnalysisProvider, TypeHierarchyProvider, build_reverse_file_index,
-};
+use brokk_bifrost_core::analyzer::capabilities::{ImportAnalysisProvider, TypeHierarchyProvider};
 use brokk_bifrost_core::analyzer::fq_name::{FqName, SegmentKind, segment_interner};
 use brokk_bifrost_core::analyzer::model::{CallableArity, ImportInfo, JavaTypeConstructorShape};
 use brokk_bifrost_core::analyzer::prepared_syntax::PreparedSyntaxTree;
@@ -73,6 +71,20 @@ pub enum UniqueClassInFile {
     /// More than one distinct unit under the name: the lexical walk fails
     /// closed rather than pick one.
     Ambiguous,
+}
+
+/// Select one class declaration when every candidate has the same identity.
+pub fn unique_class_from_candidates<'a>(
+    candidates: impl IntoIterator<Item = &'a CodeUnit>,
+) -> UniqueClassInFile {
+    let mut candidates = candidates.into_iter();
+    let Some(first) = candidates.next() else {
+        return UniqueClassInFile::None;
+    };
+    if candidates.any(|candidate| candidate != first) {
+        return UniqueClassInFile::Ambiguous;
+    }
+    UniqueClassInFile::Unique(first.clone())
 }
 
 pub trait JavaSource: CodeUnitIndex + ImportAnalysisProvider + TypeHierarchyProvider {
@@ -126,16 +138,11 @@ pub trait JavaSource: CodeUnitIndex + ImportAnalysisProvider + TypeHierarchyProv
     /// set per ask.
     fn unique_class_by_fqn_in_file(&self, fqn: &str, file: &ProjectFile) -> UniqueClassInFile {
         let units = self.declarations(file);
-        let mut candidates = units
-            .iter()
-            .filter(|unit| unit.is_class() && unit.fq_name() == fqn);
-        let Some(first) = candidates.next() else {
-            return UniqueClassInFile::None;
-        };
-        if candidates.any(|candidate| candidate != first) {
-            return UniqueClassInFile::Ambiguous;
-        }
-        UniqueClassInFile::Unique(first.clone())
+        unique_class_from_candidates(
+            units
+                .iter()
+                .filter(|unit| unit.is_class() && unit.fq_name() == fqn),
+        )
     }
 
     /// The supertype names written on `code_unit`, unresolved.
@@ -1131,19 +1138,7 @@ pub fn resolve_java_type_name(
         }
     }
 
-    let imports = source.resolved_imports(file);
-    if let Some(code_unit) = imports.get(normalized) {
-        return Some(code_unit.clone());
-    }
-
-    let same_package_fqn = java_same_package_fqn(source, file, normalized);
-    if let Some(code_unit) = usage_source_type_by_fqn(source, token, &same_package_fqn) {
-        return Some(code_unit);
-    }
-
-    java_file_is_in_default_package(source, file)
-        .then(|| usage_source_type_by_fqn(source, token, normalized))
-        .flatten()
+    resolve_java_visible_simple_type(source, token, file, normalized)
 }
 
 fn resolve_java_nested_type_name(
@@ -1488,37 +1483,24 @@ pub fn compute_java_same_package_reference_index(
     source: &dyn JavaSource,
     parallel: bool,
 ) -> HashMap<ProjectFile, Arc<HashSet<ProjectFile>>> {
-    let mut targets_by_package_and_name: HashMap<(String, String), Vec<ProjectFile>> =
-        HashMap::default();
-    for file in source.all_files() {
-        let package = java_package_name_of(source, &file).unwrap_or_default();
-        for declaration in source.top_level_declarations(&file) {
-            if declaration.is_class() || declaration.is_module() {
-                targets_by_package_and_name
-                    .entry((package.clone(), declaration.identifier().to_string()))
-                    .or_default()
-                    .push(file.clone());
-            }
-        }
-    }
-
     let files: Vec<_> = source.all_files();
-    build_reverse_file_index(
+    crate::same_package_reference_index(
         &files,
+        |file| {
+            let package = java_package_name_of(source, file).unwrap_or_default();
+            let names = source
+                .top_level_declarations(file)
+                .into_iter()
+                .filter(|declaration| declaration.is_class() || declaration.is_module())
+                .map(|declaration| declaration.identifier().to_string())
+                .collect();
+            Some((package, names))
+        },
         |candidate| {
             let package = java_package_name_of(source, candidate).unwrap_or_default();
-            let Some(identifiers) = source.type_identifiers_of(candidate) else {
-                return Vec::new();
-            };
-            let mut targets = Vec::new();
-            for identifier in identifiers {
-                if let Some(matching_targets) =
-                    targets_by_package_and_name.get(&(package.clone(), identifier.clone()))
-                {
-                    targets.extend(matching_targets.iter().cloned());
-                }
-            }
-            targets
+            source
+                .type_identifiers_of(candidate)
+                .map(|identifiers| (package, identifiers.into_iter().collect()))
         },
         parallel,
     )

@@ -3,7 +3,7 @@
 -- the route's terminal name and the reference site that demands it, so this
 -- reads one relation per member blob instead of joining path bodies.
 INSERT INTO cr_root_sources
-SELECT members.blob_id, route.path_key, members.module_path,
+SELECT DISTINCT members.blob_id, route.path_key, members.module_path,
        route.terminal_spelling, route.reference_source_site
 FROM cr_members AS members
 CROSS JOIN resolution_root_route_segments AS route

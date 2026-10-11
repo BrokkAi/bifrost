@@ -2,9 +2,124 @@
 
 use crate::analyzer::cognitive_complexity;
 use crate::analyzer::java::JavaAdapter;
+use crate::analyzer::store::{AnalyzerStore, WorkspaceId};
 use crate::analyzer::tree_sitter_analyzer::{LanguageAdapter, ParsedFile};
-use crate::analyzer::{FqName, Language, ProjectFile};
+use crate::analyzer::workspace::WorkspaceAnalyzer;
+use crate::analyzer::{AnalyzerConfig, FqName, Language, Project, ProjectFile, TestProject};
+use crate::gitblob::test_repo::{commit_all, init_repo};
+use rusqlite::params;
+use std::path::PathBuf;
+use std::sync::Arc;
 use tree_sitter::Tree;
+
+/// Insert one complete Python blob for class-set store fixtures.
+pub(crate) fn insert_complete_python_blob(store: &AnalyzerStore, oid: &str, generation: i64) {
+    let conn = store.conn.lock().unwrap();
+    conn.execute(
+        "INSERT INTO blobs(blob_oid, lang, generation) VALUES(?1, 'python', ?2)",
+        params![oid, generation],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO blob_meta(
+           blob_id, lang, contains_tests, content_package, stored_unit_count,
+           range_count, signature_count, signature_metadata_count, supertype_count,
+           child_count, import_statement_count, type_identifier_count, is_complete
+         )
+         SELECT id, lang, 0, '', 0, 0, 0, 0, 0, 0, 0, 0, 1
+         FROM blobs WHERE blob_oid = ?1 AND lang = 'python'",
+        params![oid],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO blob_payload_costs(blob_id, payload_bytes)
+         SELECT id, 0 FROM blobs WHERE blob_oid = ?1 AND lang = 'python'",
+        params![oid],
+    )
+    .unwrap();
+}
+
+pub(crate) fn ephemeral_store_with_complete_python_blob(
+    oid: &str,
+    generation: i64,
+) -> AnalyzerStore {
+    let store = AnalyzerStore::open_ephemeral().unwrap();
+    insert_complete_python_blob(&store, oid, generation);
+    store
+}
+
+pub(crate) fn stored_blob_cascade_costs(store: &AnalyzerStore, oid: &str) -> (usize, usize) {
+    let conn = store.conn.lock().unwrap();
+    conn.query_row(
+        &super::stored_blob_cascade_costs_sql(1),
+        params![oid, "python"],
+        |row| Ok((row.get(3)?, row.get::<_, Option<usize>>(4)?.unwrap())),
+    )
+    .unwrap()
+}
+
+pub(crate) struct TwoRevisionCollectionFixture {
+    pub(crate) root: PathBuf,
+    pub(crate) repository: git2::Repository,
+    pub(crate) db_path: PathBuf,
+    pub(crate) store: AnalyzerStore,
+    _temp: tempfile::TempDir,
+}
+
+pub(crate) fn two_revision_collection_fixture() -> TwoRevisionCollectionFixture {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().canonicalize().unwrap();
+    let first = "pub fn widget() -> u32 { 1 }\n";
+    let second = "pub fn widget() -> u32 { 2 }\npub fn extra() -> u32 { 3 }\n";
+    std::fs::write(root.join(".gitignore"), ".bifrost/cache/\n").unwrap();
+    std::fs::write(root.join("app.rs"), first).unwrap();
+    let repository = init_repo(&root);
+    let first_commit = commit_all(&repository, "first content");
+    let project: Arc<dyn Project> = Arc::new(TestProject::new(root.clone(), Language::Rust));
+    let workspace = WorkspaceAnalyzer::build_persisted_without_automatic_gc(
+        Arc::clone(&project),
+        AnalyzerConfig::default(),
+    )
+    .expect("persisted analyzer should build");
+    let db_path = workspace
+        .persisted_store_path()
+        .expect("a persisted build reports its store path");
+    drop(workspace);
+
+    std::fs::write(root.join("app.rs"), second).unwrap();
+    commit_all(&repository, "second content");
+    drop(
+        WorkspaceAnalyzer::build_persisted_without_automatic_gc(
+            Arc::clone(&project),
+            AnalyzerConfig::default(),
+        )
+        .expect("persisted analyzer should rebuild"),
+    );
+
+    let head = repository.head().unwrap();
+    let branch = head.name().expect("a named branch").to_string();
+    repository
+        .reference(&branch, first_commit, true, "drop the second commit")
+        .unwrap();
+    drop(head);
+    std::fs::write(root.join("app.rs"), first).unwrap();
+
+    let store = AnalyzerStore::open_persistent(&db_path).expect("open the collected store");
+    assert!(
+        store
+            .delete_workspace_projection(&WorkspaceId::for_root(&root))
+            .expect("release the workspace projection")
+            > 0
+    );
+
+    TwoRevisionCollectionFixture {
+        _temp: temp,
+        root,
+        repository,
+        db_path,
+        store,
+    }
+}
 
 /// Java behavior with the pre-canonical source-publication contract.
 ///

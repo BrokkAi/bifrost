@@ -33,16 +33,15 @@ use crate::analyzer::rust::source_publication::{
     RUST_TYPE_FORMS_VERSION, rust_item_source_cost,
 };
 use crate::analyzer::store::source_facts::{
-    SOURCE_DECLARATION_UNITS_SQL, SOURCE_FACTS_VERSION, nonnegative_usize, read_source_imports,
-    source_occurrence, strict_bool,
+    SOURCE_DECLARATION_UNITS_SQL, SOURCE_FACTS_VERSION, checked_source_id, nonnegative_usize,
+    read_source_imports, source_occurrence, strict_bool,
 };
 use crate::analyzer::store::{
     AnalyzerStore, GenerationId, Result, StoreError, read_source_unit_map,
 };
 
 fn source_declaration(value: i64, label: &str) -> Result<SourceDeclarationId> {
-    let value = u32::try_from(value)
-        .map_err(|_| StoreError::new(format!("invalid {label} source declaration id {value}")))?;
+    let value = checked_source_id(value, label, "source declaration")?;
     Ok(SourceDeclarationId::new(value))
 }
 
@@ -215,15 +214,17 @@ fn macro_expansion(kind: i64, root: Option<SourceOccurrenceId>) -> Result<RustIt
     }
 }
 
-fn require_context(
-    contexts: &[RustSourceContextFact],
+fn require_source_fact_index<T: std::fmt::Debug>(
+    facts: &[T],
     indices: &HashMap<SourceOccurrenceId, usize>,
-    context: SourceOccurrenceId,
+    occurrence: SourceOccurrenceId,
     label: &str,
+    kind: &str,
+    collection: &str,
 ) -> Result<usize> {
-    indices.get(&context).copied().ok_or_else(|| {
+    indices.get(&occurrence).copied().ok_or_else(|| {
         StoreError::new(format!(
-            "Rust item {label} references missing context {context:?}; contexts={contexts:?}"
+            "Rust item {label} references missing {kind} {occurrence:?}; {collection}={facts:?}"
         ))
     })
 }
@@ -237,7 +238,14 @@ fn require_owned_context(
     expected: RustSourceContextKind,
     label: &str,
 ) -> Result<usize> {
-    let containing_index = require_context(contexts, context_indices, containing_context, label)?;
+    let containing_index = require_source_fact_index(
+        contexts,
+        context_indices,
+        containing_context,
+        label,
+        "context",
+        "contexts",
+    )?;
     let Some(own_index) = owner_context_indices.get(&owner).copied() else {
         return Err(StoreError::new(format!(
             "Rust item {label} has no owned context for declaration {owner:?}; contexts={contexts:?}"
@@ -250,19 +258,6 @@ fn require_owned_context(
         )));
     }
     Ok(containing_index)
-}
-
-fn require_type(
-    types: &[RustTypeSourceFact],
-    indices: &HashMap<SourceOccurrenceId, usize>,
-    occurrence: SourceOccurrenceId,
-    label: &str,
-) -> Result<usize> {
-    indices.get(&occurrence).copied().ok_or_else(|| {
-        StoreError::new(format!(
-            "Rust item {label} references missing type {occurrence:?}; types={types:?}"
-        ))
-    })
 }
 
 fn require_dense_ordinal(ordinal: i64, expected: usize, label: &str) -> Result<usize> {
@@ -489,8 +484,14 @@ impl AnalyzerStore {
                 let Some(parent) = context.parent else {
                     continue;
                 };
-                let parent_index =
-                    require_context(&contexts, &context_indices, parent, "context parent")?;
+                let parent_index = require_source_fact_index(
+                    &contexts,
+                    &context_indices,
+                    parent,
+                    "context parent",
+                    "context",
+                    "contexts",
+                )?;
                 if parent_index >= index {
                     return Err(StoreError::new(format!(
                         "Rust item context parent is not earlier: child={context:?}, parent={parent:?}, contexts={contexts:?}"
@@ -618,7 +619,14 @@ impl AnalyzerStore {
                 }
                 let declaration = source_declaration(row.get(0)?, "alias")?;
                 let context = source_occurrence(row.get(1)?, "alias context")?;
-                require_context(&contexts, &context_indices, context, "alias")?;
+                require_source_fact_index(
+                    &contexts,
+                    &context_indices,
+                    context,
+                    "alias",
+                    "context",
+                    "contexts",
+                )?;
                 if alias_indices.insert(declaration, aliases.len()).is_some() {
                     return Err(StoreError::new(format!(
                         "duplicate Rust alias declaration {declaration:?}; aliases={aliases:?}"
@@ -698,7 +706,14 @@ impl AnalyzerStore {
                 }
                 let declaration = source_declaration(row.get(0)?, "value")?;
                 let context = source_occurrence(row.get(1)?, "value context")?;
-                require_context(&contexts, &context_indices, context, "value")?;
+                require_source_fact_index(
+                    &contexts,
+                    &context_indices,
+                    context,
+                    "value",
+                    "context",
+                    "contexts",
+                )?;
                 values.push(RustValueSourceFact {
                     declaration,
                     context,
@@ -887,7 +902,14 @@ impl AnalyzerStore {
                 }
                 let invocation = source_occurrence(row.get(0)?, "item macro invocation")?;
                 let context = source_occurrence(row.get(1)?, "item macro context")?;
-                require_context(&contexts, &context_indices, context, "item macro")?;
+                require_source_fact_index(
+                    &contexts,
+                    &context_indices,
+                    context,
+                    "item macro",
+                    "context",
+                    "contexts",
+                )?;
                 let root = row
                     .get::<_, Option<i64>>(3)?
                     .map(|value| source_occurrence(value, "item macro root"))
@@ -915,8 +937,14 @@ impl AnalyzerStore {
                     ));
                 }
                 if let RustItemMacroExpansion::Parsed(root) = fact.expansion {
-                    let root_index =
-                        require_context(&contexts, &context_indices, root, "parsed item macro root")?;
+                    let root_index = require_source_fact_index(
+                        &contexts,
+                        &context_indices,
+                        root,
+                        "parsed item macro root",
+                        "context",
+                        "contexts",
+                    )?;
                     if contexts[root_index].kind != RustSourceContextKind::FileRoot
                         || contexts[root_index].parent != Some(context)
                     {
@@ -962,7 +990,14 @@ impl AnalyzerStore {
                 }
                 let declaration = source_occurrence(row.get(0)?, "item import declaration")?;
                 let context = source_occurrence(row.get(1)?, "item import context")?;
-                require_context(&contexts, &context_indices, context, "item import")?;
+                require_source_fact_index(
+                    &contexts,
+                    &context_indices,
+                    context,
+                    "item import",
+                    "context",
+                    "contexts",
+                )?;
                 if import_indices
                     .insert(declaration, import_contexts.len())
                     .is_some()
@@ -1099,9 +1134,23 @@ impl AnalyzerStore {
                     return Ok(None);
                 }
                 let owner = source_occurrence(row.get(0)?, "compound type owner")?;
-                let index = require_type(&types, &type_indices, owner, "compound owner")?;
+                let index = require_source_fact_index(
+                    &types,
+                    &type_indices,
+                    owner,
+                    "compound owner",
+                    "type",
+                    "types",
+                )?;
                 let child = source_occurrence(row.get(2)?, "compound child")?;
-                require_type(&types, &type_indices, child, "compound child")?;
+                require_source_fact_index(
+                    &types,
+                    &type_indices,
+                    child,
+                    "compound child",
+                    "type",
+                    "types",
+                )?;
                 let RustTypeSourceShape::Compound { children, .. } = &mut types[index].shape else {
                     return Err(StoreError::new(format!(
                         "compound child belongs to a non-compound type: owner={owner:?}, child={child:?}"
@@ -1124,7 +1173,14 @@ impl AnalyzerStore {
                     return Ok(None);
                 }
                 let type_occurrence = source_occurrence(row.get(0)?, "wrapper type")?;
-                let index = require_type(&types, &type_indices, type_occurrence, "wrapper")?;
+                let index = require_source_fact_index(
+                    &types,
+                    &type_indices,
+                    type_occurrence,
+                    "wrapper",
+                    "type",
+                    "types",
+                )?;
                 require_dense_ordinal(row.get(1)?, types[index].wrappers.len(), "type wrapper")?;
                 types[index].wrappers.push(RustTypeWrapperSourceFact {
                     occurrence: source_occurrence(row.get(2)?, "type wrapper")?,
@@ -1145,7 +1201,14 @@ impl AnalyzerStore {
                     return Ok(None);
                 }
                 let type_occurrence = source_occurrence(row.get(0)?, "segment type")?;
-                let index = require_type(&types, &type_indices, type_occurrence, "segment")?;
+                let index = require_source_fact_index(
+                    &types,
+                    &type_indices,
+                    type_occurrence,
+                    "segment",
+                    "type",
+                    "types",
+                )?;
                 let segment = RustTypePathSegmentSourceFact {
                     occurrence: source_occurrence(row.get(2)?, "type segment")?,
                     name: row.get(3)?,
@@ -1173,7 +1236,14 @@ impl AnalyzerStore {
                     return Ok(None);
                 }
                 let type_occurrence = source_occurrence(row.get(0)?, "generic list type")?;
-                let index = require_type(&types, &type_indices, type_occurrence, "generic list")?;
+                let index = require_source_fact_index(
+                    &types,
+                    &type_indices,
+                    type_occurrence,
+                    "generic list",
+                    "type",
+                    "types",
+                )?;
                 let segment_ordinal = nonnegative_usize(row.get(1)?, "generic list segment ordinal")?;
                 let RustTypeSourceShape::Path { segments, .. } = &mut types[index].shape else {
                     return Err(StoreError::new(format!(
@@ -1210,7 +1280,14 @@ impl AnalyzerStore {
                     return Ok(None);
                 }
                 let type_occurrence = source_occurrence(row.get(0)?, "generic argument type")?;
-                let index = require_type(&types, &type_indices, type_occurrence, "generic argument")?;
+                let index = require_source_fact_index(
+                    &types,
+                    &type_indices,
+                    type_occurrence,
+                    "generic argument",
+                    "type",
+                    "types",
+                )?;
                 let segment_ordinal =
                     nonnegative_usize(row.get(1)?, "generic argument segment ordinal")?;
                 let RustTypeSourceShape::Path { segments, .. } = &mut types[index].shape else {
@@ -1246,24 +1323,52 @@ impl AnalyzerStore {
                     ("impl target type", item.target_type),
                 ] {
                     if let Some(occurrence) = occurrence {
-                        require_type(&types, &type_indices, occurrence, label)?;
+                        require_source_fact_index(
+                            &types,
+                            &type_indices,
+                            occurrence,
+                            label,
+                            "type",
+                            "types",
+                        )?;
                     }
                 }
             }
             for item in &aliases {
                 if let Some(occurrence) = item.target_type {
-                    require_type(&types, &type_indices, occurrence, "alias target type")?;
+                    require_source_fact_index(
+                        &types,
+                        &type_indices,
+                        occurrence,
+                        "alias target type",
+                        "type",
+                        "types",
+                    )?;
                 }
             }
 
             for item in &callables {
                 if let Some(occurrence) = item.return_type {
-                    require_type(&types, &type_indices, occurrence, "callable return type")?;
+                    require_source_fact_index(
+                        &types,
+                        &type_indices,
+                        occurrence,
+                        "callable return type",
+                        "type",
+                        "types",
+                    )?;
                 }
             }
             for item in &values {
                 if let Some(occurrence) = item.declared_type {
-                    require_type(&types, &type_indices, occurrence, "value declared type")?;
+                    require_source_fact_index(
+                        &types,
+                        &type_indices,
+                        occurrence,
+                        "value declared type",
+                        "type",
+                        "types",
+                    )?;
                 }
             }
 
@@ -1280,7 +1385,14 @@ impl AnalyzerStore {
                             .filter_map(|segment| segment.generic_arguments.as_ref())
                             .flat_map(|arguments| &arguments.arguments)
                         {
-                            require_type(&types, &type_indices, *argument, "generic argument type")?;
+                            require_source_fact_index(
+                                &types,
+                                &type_indices,
+                                *argument,
+                                "generic argument type",
+                                "type",
+                                "types",
+                            )?;
                         }
                         if segments.is_empty() {
                             return Err(StoreError::new(format!(
@@ -1321,7 +1433,14 @@ impl AnalyzerStore {
                             if !keep_going() {
                                 return Ok(None);
                             }
-                            require_type(&types, &type_indices, *child, "compound child")?;
+                            require_source_fact_index(
+                                &types,
+                                &type_indices,
+                                *child,
+                                "compound child",
+                                "type",
+                                "types",
+                            )?;
                         }
                     }
                 }
@@ -1523,7 +1642,8 @@ pub(crate) fn read_rust_macro_definition_rows(
     let mut arm_indices = HashMap::default();
     let mut arm_occurrences = HashMap::default();
     let mut statement = tx.prepare_cached(
-        "SELECT declaration_id, ordinal, occurrence_id, pattern_occurrence_id
+        "SELECT declaration_id, ordinal, occurrence_id, pattern_occurrence_id,
+                transcriber_identifiers
            FROM source_rust_macro_arms
           WHERE blob_id = ?1 ORDER BY declaration_id, ordinal",
     )?;
@@ -1565,6 +1685,15 @@ pub(crate) fn read_rust_macro_definition_rows(
                 .transpose()?,
             patterns: Vec::new(),
             ident_roles: Vec::new(),
+            transcriber_identifiers: row
+                .get::<_, Option<String>>(4)?
+                .map(|json| serde_json::from_str(&json))
+                .transpose()
+                .map_err(|error| {
+                    StoreError::corrupt(format!(
+                        "invalid Rust macro transcriber identifiers for declaration={declaration:?}, arm={arm_ordinal}: {error}"
+                    ))
+                })?,
         });
     }
     drop(rows);

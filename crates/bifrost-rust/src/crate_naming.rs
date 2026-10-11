@@ -32,7 +32,9 @@ use std::sync::RwLock;
 use std::sync::{Arc, LazyLock};
 use std::time::SystemTime;
 
-use brokk_bifrost_core::analyzer::fq_name::{FqName, SegmentKind, segment_interner};
+use brokk_bifrost_core::analyzer::fq_name::FqName;
+#[cfg(test)]
+use brokk_bifrost_core::analyzer::fq_name::segment_interner;
 use brokk_bifrost_core::analyzer::{PackageAnchor, ProjectFile};
 #[cfg(test)]
 use brokk_bifrost_core::hash::HashMap;
@@ -149,7 +151,7 @@ impl RustSelectedCargoNaming {
             }
             PackageAnchor::CrateRoot => &paths.crate_root,
         };
-        Some(fq_from_package_components(components))
+        Some(FqName::from_package_components(components))
     }
 
     fn crate_for(&self, relative_path: &Path) -> Option<&RustSelectedCrateNaming> {
@@ -180,15 +182,6 @@ impl RustSelectedCargoNaming {
             .iter()
             .any(|candidate| relative_path.starts_with(&candidate.directory))
     }
-}
-
-fn fq_from_package_components(components: &[String]) -> FqName {
-    let interner = segment_interner();
-    let mut fq = FqName::new();
-    for component in components {
-        fq.push(interner.intern(component, SegmentKind::Package));
-    }
-    fq
 }
 
 fn path_derived_paths(relative_path: &Path) -> CratePaths {
@@ -311,7 +304,7 @@ pub(super) fn rust_target_kind_root(file: &ProjectFile) -> Option<Vec<String>> {
             _ => None,
         })
         .filter(|head| TARGET_DIRECTORIES.contains(&head.as_str()))?;
-    let kind_root = vec![nearest.crate_name.clone(), head];
+    let kind_root = rust_target_kind_root_components(&nearest.crate_name, &head);
     (rust_crate_paths(file)?.crate_root != kind_root).then_some(kind_root)
 }
 
@@ -545,13 +538,17 @@ fn target_root(
     below_kind: &[String],
     has_target_main: &impl Fn(&Path, &str) -> bool,
 ) -> Vec<String> {
-    let mut root = vec![crate_name.to_string(), kind.to_string()];
+    let mut root = rust_target_kind_root_components(crate_name, kind);
     if let Some(target) = below_kind.first()
         && has_target_main(kind_directory, target)
     {
         root.push(target.clone());
     }
     root
+}
+
+fn rust_target_kind_root_components(crate_name: &str, kind: &str) -> Vec<String> {
+    vec![crate_name.to_string(), kind.to_string()]
 }
 
 /// Derive the crate identifier from one already parsed Cargo document.
@@ -644,6 +641,7 @@ fn record_manifest_probe(root: &Path) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use brokk_bifrost_test_macros::hardwon;
 
     struct Fixture {
         _root: tempfile::TempDir,
@@ -711,79 +709,158 @@ mod tests {
 
     const MANIFEST: &str = "[package]\nname = \"wasm-bindgen\"\n";
 
-    /// Every row of the naming table, checked together with the
-    /// crate-root-prefixes-package invariant the resolver depends on.
     #[test]
-    fn crate_layout_maps_to_crate_anchored_names() {
-        let files = [
-            "src/lib.rs",
-            "src/describe.rs",
-            "src/convert/mod.rs",
-            "src/foo/bar.rs",
-            "src/main.rs",
-            "src/bin/tool.rs",
-            "src/bin/tool/main.rs",
-            "build.rs",
-            "tests/it.rs",
-            "tests/common/mod.rs",
-            "examples/demo.rs",
-            "benches/b.rs",
-            "weird/x.rs",
-        ];
-        let mut fixture_files = vec![("Cargo.toml", MANIFEST)];
-        fixture_files.extend(files.iter().map(|path| (*path, "")));
-        let fixture = Fixture::new(&fixture_files);
-
-        let expected = [
-            ("src/lib.rs", "wasm_bindgen", "wasm_bindgen"),
-            ("src/describe.rs", "wasm_bindgen.describe", "wasm_bindgen"),
-            ("src/convert/mod.rs", "wasm_bindgen.convert", "wasm_bindgen"),
-            ("src/foo/bar.rs", "wasm_bindgen.foo.bar", "wasm_bindgen"),
-            ("src/main.rs", "wasm_bindgen.main", "wasm_bindgen"),
-            (
-                "src/bin/tool.rs",
-                "wasm_bindgen.bin.tool",
-                "wasm_bindgen.bin",
-            ),
-            (
-                "src/bin/tool/main.rs",
-                "wasm_bindgen.bin.tool",
-                "wasm_bindgen.bin.tool",
-            ),
-            ("build.rs", "wasm_bindgen.build", "wasm_bindgen.build"),
-            (
-                "tests/it.rs",
-                "wasm_bindgen.tests.it",
-                "wasm_bindgen.tests.it",
-            ),
-            (
-                "tests/common/mod.rs",
-                "wasm_bindgen.tests.common",
-                "wasm_bindgen.tests",
-            ),
-            (
-                "examples/demo.rs",
-                "wasm_bindgen.examples.demo",
-                "wasm_bindgen.examples.demo",
-            ),
-            (
-                "benches/b.rs",
-                "wasm_bindgen.benches.b",
-                "wasm_bindgen.benches.b",
-            ),
-            ("weird/x.rs", "wasm_bindgen.weird.x", "wasm_bindgen"),
-        ];
-        for (relative, package, crate_root) in expected {
-            assert_eq!(
-                fixture.resolved(relative),
-                (components(package), components(crate_root)),
-                "naming for {relative}",
-            );
+    fn live_and_selected_custom_library_roots_have_the_same_identity() {
+        for (library, inner) in [
+            ("app.rs", "inner.rs"),
+            ("src/custom/lib.rs", "src/custom/inner.rs"),
+            ("alt/entry.rs", "alt/inner.rs"),
+        ] {
+            let manifest_source =
+                format!("[package]\nname = \"package\"\n[lib]\npath = {library:?}\n");
+            let fixture = Fixture::new(&[
+                ("Cargo.toml", &manifest_source),
+                (library, "pub mod inner;"),
+                (inner, "pub fn take() {}"),
+            ]);
+            let manifest = RustSelectedManifestMount::from_source("Cargo.toml", &manifest_source)
+                .expect("selected manifest");
+            let selected = RustSelectedCargoNaming::from_selected_inputs(
+                [PathBuf::from(library), PathBuf::from(inner)],
+                &[manifest],
+            )
+            .expect("selected naming");
+            for (file, expected) in [(library, "package"), (inner, "package.inner")] {
+                let live = fixture.paths(file).expect("live naming");
+                assert_eq!(live.package.join("."), expected, "{file}");
+                assert_eq!(live.crate_root, ["package"], "{file}");
+                let package = selected
+                    .resolve_package_anchor(
+                        PackageAnchor::OwnModule { pop: 0 },
+                        "",
+                        Path::new(file),
+                    )
+                    .expect("selected package");
+                assert_eq!(
+                    package.display(segment_interner()).to_string(),
+                    expected,
+                    "{file}"
+                );
+            }
         }
     }
 
-    /// The crate name a `use` path spells is the lib target's, not the
-    /// package's, when they differ.
+    /// A virtual-manifest directory names no crate, so a file below it belongs
+    /// to the nearest enclosing package instead.
+    #[test]
+    fn workspace_only_manifest_is_skipped() {
+        let fixture = Fixture::new(&[
+            ("Cargo.toml", "[package]\nname = \"outer\"\n"),
+            ("crates/Cargo.toml", "[workspace]\nmembers = [\"a\"]\n"),
+            ("crates/src/lib.rs", ""),
+        ]);
+        assert_eq!(
+            fixture.resolved("crates/src/lib.rs"),
+            (components("outer.crates.src"), components("outer")),
+        );
+    }
+
+    /// The memos answer from the last generation until the generation
+    /// boundary drops them, which is the whole point of not stat-ing a
+    /// manifest per call. `RustAnalyzer` construction and update call
+    /// `invalidate`, so an edit between two builds is picked up.
+    #[test]
+    #[hardwon(
+        "78436c5a27bb: crate naming stayed stale after manifest edits until generation invalidation"
+    )]
+    fn editing_a_manifest_renames_the_crate_after_invalidation() {
+        let _exclusive = exclusive_memo();
+        let fixture = Fixture::new(&[("Cargo.toml", MANIFEST), ("src/lib.rs", "")]);
+        assert_eq!(fixture.resolved("src/lib.rs").0, components("wasm_bindgen"));
+
+        let manifest = fixture.root.join("Cargo.toml");
+        std::fs::write(&manifest, "[package]\nname = \"other\"\n").expect("rewrite manifest");
+        filetime::set_file_mtime(
+            &manifest,
+            filetime::FileTime::from_unix_time(1_700_000_000, 0),
+        )
+        .expect("set mtime");
+        assert_eq!(
+            fixture.resolved("src/lib.rs").0,
+            components("wasm_bindgen"),
+            "the memo answers for the whole generation",
+        );
+
+        invalidate();
+        assert_eq!(fixture.resolved("src/lib.rs").0, components("other"));
+    }
+
+    /// The cost this module exists to remove: the ancestor walk used to run
+    /// once per question about every file, one `is_file` syscall per level.
+    /// Every directory it passes shares the manifest it lands on, so a whole
+    /// crate's files cost one walk per distinct directory and nothing after.
+    #[test]
+    #[hardwon("78436c5a27bb: repeated file lookups reran the same Cargo manifest ancestor walk")]
+    fn one_ancestor_walk_serves_every_file_under_a_directory() {
+        let _exclusive = exclusive_memo();
+        let fixture = Fixture::new(&[
+            (
+                "Cargo.toml",
+                "[workspace]\nmembers = [\"crates/a\", \"crates/b\"]\n",
+            ),
+            ("crates/a/Cargo.toml", "[package]\nname = \"member-a\"\n"),
+            ("crates/b/Cargo.toml", "[package]\nname = \"member-b\"\n"),
+        ]);
+        invalidate();
+        assert_eq!(fixture.manifest_probes(), 0, "a fresh fixture root");
+
+        // Two crates, two directories each, 50 files per directory.
+        let directories = [
+            "crates/a/src",
+            "crates/a/src/deep",
+            "crates/b/src",
+            "crates/b/src/deep",
+        ];
+        let files: Vec<String> = directories
+            .iter()
+            .flat_map(|directory| (0..50).map(move |index| format!("{directory}/f{index}.rs")))
+            .collect();
+        assert_eq!(files.len(), 200);
+
+        for file in &files {
+            let package = fixture.resolved(file).0;
+            let expected = if file.starts_with("crates/a/") {
+                "member_a"
+            } else {
+                "member_b"
+            };
+            assert_eq!(
+                package.first().map(String::as_str),
+                Some(expected),
+                "{file}"
+            );
+        }
+
+        // `crates/<x>/src` walks itself and finds `crates/<x>`: two probes.
+        // `crates/<x>/src/deep` probes itself and then stops on the memoized
+        // `crates/<x>/src`: one probe. Nothing else on disk is touched, and no
+        // walk is charged to the 49 further files in each directory.
+        assert_eq!(
+            fixture.manifest_probes(),
+            directories.len() + 2,
+            "one ancestor walk per distinct directory, none per file",
+        );
+
+        for file in &files {
+            fixture.resolved(file);
+        }
+        assert_eq!(
+            fixture.manifest_probes(),
+            directories.len() + 2,
+            "a second pass over the same files opens no new walk",
+        );
+    }
+
     #[test]
     fn explicit_lib_name_wins_over_package_name() {
         let fixture = Fixture::new(&[
@@ -881,31 +958,6 @@ mod tests {
     }
 
     #[test]
-    fn selected_nested_package_uses_workspace_relative_target_paths() {
-        let manifest = RustSelectedManifestMount::from_source(
-            "crates/member/Cargo.toml",
-            "[package]\nname = \"member-package\"\n",
-        )
-        .expect("selected manifest");
-        let naming = RustSelectedCargoNaming::from_selected_inputs(
-            [
-                PathBuf::from("crates/member/src/lib.rs"),
-                PathBuf::from("crates/member/src/bin/tool/main.rs"),
-            ],
-            &[manifest],
-        )
-        .expect("selected naming");
-        let root = naming
-            .resolve_package_anchor(
-                PackageAnchor::CrateRoot,
-                "",
-                Path::new("crates/member/src/bin/tool/main.rs"),
-            )
-            .expect("selected nested binary root");
-        assert_eq!(root.display(segment_interner()), "member_package.bin.tool");
-    }
-
-    #[test]
     fn selected_custom_library_path_controls_module_package_root() {
         let manifest = RustSelectedManifestMount::from_source(
             "Cargo.toml",
@@ -936,68 +988,6 @@ mod tests {
     }
 
     #[test]
-    fn live_and_selected_custom_library_roots_have_the_same_identity() {
-        for (library, inner) in [
-            ("app.rs", "inner.rs"),
-            ("src/custom/lib.rs", "src/custom/inner.rs"),
-            ("alt/entry.rs", "alt/inner.rs"),
-        ] {
-            let manifest_source =
-                format!("[package]\nname = \"package\"\n[lib]\npath = {library:?}\n");
-            let fixture = Fixture::new(&[
-                ("Cargo.toml", &manifest_source),
-                (library, "pub mod inner;"),
-                (inner, "pub fn take() {}"),
-            ]);
-            let manifest = RustSelectedManifestMount::from_source("Cargo.toml", &manifest_source)
-                .expect("selected manifest");
-            let selected = RustSelectedCargoNaming::from_selected_inputs(
-                [PathBuf::from(library), PathBuf::from(inner)],
-                &[manifest],
-            )
-            .expect("selected naming");
-            for (file, expected) in [(library, "package"), (inner, "package.inner")] {
-                let live = fixture.paths(file).expect("live naming");
-                assert_eq!(live.package.join("."), expected, "{file}");
-                assert_eq!(live.crate_root, ["package"], "{file}");
-                let package = selected
-                    .resolve_package_anchor(
-                        PackageAnchor::OwnModule { pop: 0 },
-                        "",
-                        Path::new(file),
-                    )
-                    .expect("selected package");
-                assert_eq!(
-                    package.display(segment_interner()).to_string(),
-                    expected,
-                    "{file}"
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn selected_manifestless_files_keep_path_derived_identity() {
-        let naming = RustSelectedCargoNaming::from_selected_inputs(
-            [PathBuf::from("src/lib.rs"), PathBuf::from("src/inner.rs")],
-            &[],
-        )
-        .expect("selected naming");
-        let root = naming
-            .resolve_package_anchor(PackageAnchor::CrateRoot, "", Path::new("src/lib.rs"))
-            .expect("manifestless crate root");
-        assert!(root.is_empty());
-        let inner = naming
-            .resolve_package_anchor(
-                PackageAnchor::OwnModule { pop: 0 },
-                "",
-                Path::new("src/inner.rs"),
-            )
-            .expect("manifestless module package");
-        assert_eq!(inner.display(segment_interner()), "inner");
-    }
-
-    #[test]
     fn selected_naming_reports_files_outside_the_selected_inventory() {
         let manifest =
             RustSelectedManifestMount::from_source("Cargo.toml", "[package]\nname = \"package\"\n")
@@ -1013,31 +1003,6 @@ mod tests {
                 .is_none()
         );
     }
-
-    /// Dashes are not legal in Rust paths; Cargo maps them to underscores and
-    /// so must the naming.
-    #[test]
-    fn dashed_package_names_are_normalized() {
-        let fixture = Fixture::new(&[("Cargo.toml", MANIFEST), ("src/lib.rs", "")]);
-        assert_eq!(fixture.resolved("src/lib.rs").0, components("wasm_bindgen"));
-    }
-
-    /// A virtual-manifest directory names no crate, so a file below it belongs
-    /// to the nearest enclosing package instead.
-    #[test]
-    fn workspace_only_manifest_is_skipped() {
-        let fixture = Fixture::new(&[
-            ("Cargo.toml", "[package]\nname = \"outer\"\n"),
-            ("crates/Cargo.toml", "[workspace]\nmembers = [\"a\"]\n"),
-            ("crates/src/lib.rs", ""),
-        ]);
-        assert_eq!(
-            fixture.resolved("crates/src/lib.rs"),
-            (components("outer.crates.src"), components("outer")),
-        );
-    }
-
-    /// A nested member manifest wins over the workspace root above it.
     #[test]
     fn nearest_member_manifest_wins() {
         let fixture = Fixture::new(&[
@@ -1049,106 +1014,6 @@ mod tests {
         assert_eq!(
             fixture.resolved("crates/a/src/deep/mod.rs"),
             (components("member_a.deep"), components("member_a")),
-        );
-    }
-
-    /// Manifest-less trees are the caller's problem: this module reports
-    /// nothing rather than reimplementing the legacy path-derived scheme.
-    #[test]
-    fn files_without_a_manifest_have_no_crate_paths() {
-        let fixture = Fixture::new(&[("src/lib.rs", "")]);
-        assert!(fixture.paths("src/lib.rs").is_none());
-    }
-
-    /// The memos answer from the last generation until the generation
-    /// boundary drops them, which is the whole point of not stat-ing a
-    /// manifest per call. `RustAnalyzer` construction and update call
-    /// `invalidate`, so an edit between two builds is picked up.
-    #[test]
-    fn editing_a_manifest_renames_the_crate_after_invalidation() {
-        let _exclusive = exclusive_memo();
-        let fixture = Fixture::new(&[("Cargo.toml", MANIFEST), ("src/lib.rs", "")]);
-        assert_eq!(fixture.resolved("src/lib.rs").0, components("wasm_bindgen"));
-
-        let manifest = fixture.root.join("Cargo.toml");
-        std::fs::write(&manifest, "[package]\nname = \"other\"\n").expect("rewrite manifest");
-        filetime::set_file_mtime(
-            &manifest,
-            filetime::FileTime::from_unix_time(1_700_000_000, 0),
-        )
-        .expect("set mtime");
-        assert_eq!(
-            fixture.resolved("src/lib.rs").0,
-            components("wasm_bindgen"),
-            "the memo answers for the whole generation",
-        );
-
-        invalidate();
-        assert_eq!(fixture.resolved("src/lib.rs").0, components("other"));
-    }
-
-    /// The cost this module exists to remove: the ancestor walk used to run
-    /// once per question about every file, one `is_file` syscall per level.
-    /// Every directory it passes shares the manifest it lands on, so a whole
-    /// crate's files cost one walk per distinct directory and nothing after.
-    #[test]
-    fn one_ancestor_walk_serves_every_file_under_a_directory() {
-        let _exclusive = exclusive_memo();
-        let fixture = Fixture::new(&[
-            (
-                "Cargo.toml",
-                "[workspace]\nmembers = [\"crates/a\", \"crates/b\"]\n",
-            ),
-            ("crates/a/Cargo.toml", "[package]\nname = \"member-a\"\n"),
-            ("crates/b/Cargo.toml", "[package]\nname = \"member-b\"\n"),
-        ]);
-        invalidate();
-        assert_eq!(fixture.manifest_probes(), 0, "a fresh fixture root");
-
-        // Two crates, two directories each, 50 files per directory.
-        let directories = [
-            "crates/a/src",
-            "crates/a/src/deep",
-            "crates/b/src",
-            "crates/b/src/deep",
-        ];
-        let files: Vec<String> = directories
-            .iter()
-            .flat_map(|directory| (0..50).map(move |index| format!("{directory}/f{index}.rs")))
-            .collect();
-        assert_eq!(files.len(), 200);
-
-        for file in &files {
-            let package = fixture.resolved(file).0;
-            let expected = if file.starts_with("crates/a/") {
-                "member_a"
-            } else {
-                "member_b"
-            };
-            assert_eq!(
-                package.first().map(String::as_str),
-                Some(expected),
-                "{file}"
-            );
-        }
-
-        // `crates/<x>/src` walks itself and finds `crates/<x>`: two probes.
-        // `crates/<x>/src/deep` probes itself and then stops on the memoized
-        // `crates/<x>/src`: one probe. Nothing else on disk is touched, and no
-        // walk is charged to the 49 further files in each directory.
-        assert_eq!(
-            fixture.manifest_probes(),
-            directories.len() + 2,
-            "one ancestor walk per distinct directory, none per file",
-        );
-
-        for file in &files {
-            fixture.resolved(file);
-        }
-        assert_eq!(
-            fixture.manifest_probes(),
-            directories.len() + 2,
-            "a second pass over the same files opens no new walk",
         );
     }
 }

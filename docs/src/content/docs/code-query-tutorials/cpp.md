@@ -3,11 +3,11 @@ title: C and C++
 description: Query C and C++ together through the cpp structural adapter and language filter.
 ---
 
-> Last verified end to end: 2026-07-14 (`query_code` schema version 1).
+> Last verified end to end: 2026-10-05 (`query_code` schema version 1).
 
-For exact inbound and outbound symbol edges, proof tiers, and adapter-specific caveats, see [Reference Traversal](../reference-traversal/).
+For exact inbound and outbound symbol edges, proof tiers, and adapter-specific caveats, see [Reference Traversal](/code-query-tutorials/reference-traversal/).
 
-C and C++ files share the `cpp` analyzer, structural adapter, and language-filter label. Use `languages: ["cpp"]` for `.c`, `.cc`, `.cpp`, and the supported C-family header extensions; use `where` when source syntax or directory layout needs a narrower boundary.
+C and C++ files share the `cpp` analyzer, structural adapter, and language-filter label. Use `languages: ["cpp"]` for source files ending in `.c`, `.cc`, `.cpp`, or `.cxx` and headers ending in `.h`, `.hh`, `.hpp`, `.hxx`, or `.hin`. Use `where` when you need a narrower boundary, for example `**/*.c` for C files only. Bifrost also analyzes files such as `.inc` or `.inl` when a C or C++ file includes them with a quoted `#include`; see [language support](/reference/languages/).
 
 ## Fixtures
 
@@ -44,6 +44,50 @@ int main() {
     service.run(retries);
     audit("cpp");
     return 0;
+}
+```
+
+<!-- code-query-fixture:cpp/control-flow.cpp -->
+```cpp
+int statement_word_decoys() {
+    int switch_value = 0;
+    int case_value = switch_value;
+    int label_value = case_value;
+    int goto_value = label_value;
+    int break_value = goto_value;
+    int continue_value = break_value;
+    return continue_value;
+}
+
+int route(int selector) {
+    goto forward_target;
+
+    if (selector < 0) {
+        return 0;
+    }
+
+forward_target:
+    for (int index = 0; index < 2; ++index) {
+        switch (index) {
+        case 0:
+            if (selector == index) {
+                continue;
+            }
+            break;
+        default:
+            goto done;
+        }
+    }
+
+    switch (selector) {
+    case 1:
+        break;
+    default:
+        selector = 2;
+    }
+
+done:
+    return selector;
 }
 ```
 
@@ -185,6 +229,140 @@ The path glob excludes the C fixture. Receiver, callee, and argument roles ident
 {
   "results": [
     {"result_type":"structural_match","path":"c-family/service.cpp","language":"cpp","kind":"import","start_line":1,"end_line":2,"text":"#include <vector>…"}
+  ],
+  "truncated": false
+}
+```
+
+## Query C++ Control-Flow Constructs
+
+Statement kinds match parsed C++ constructs rather than words in identifiers or
+comments. The fixture includes ordinary variables named after the constructs as
+decoys, while the queries below select the two switches, four case/default arms,
+two labels, two gotos, two breaks, and one continue.
+
+<!-- code-query-case:control-switch:rql -->
+```lisp
+(where "cpp/**/*.cpp" (language cpp (switch)))
+```
+
+<!-- code-query-case:control-switch:json -->
+```json
+{"where":["cpp/**/*.cpp"],"languages":["cpp"],"match":{"kind":"switch"}}
+```
+
+<!-- code-query-case:control-switch:expected -->
+```json
+{
+  "results": [
+    {"result_type":"structural_match","path":"cpp/control-flow.cpp","language":"cpp","kind":"switch","start_line":20,"end_line":28,"text":"switch (index) {…","enclosing_symbol":"route"},
+    {"result_type":"structural_match","path":"cpp/control-flow.cpp","language":"cpp","kind":"switch","start_line":31,"end_line":36,"text":"switch (selector) {…","enclosing_symbol":"route"}
+  ],
+  "truncated": false
+}
+```
+
+<!-- code-query-case:control-case:rql -->
+```lisp
+(where "cpp/**/*.cpp" (language cpp (case)))
+```
+
+<!-- code-query-case:control-case:json -->
+```json
+{"where":["cpp/**/*.cpp"],"languages":["cpp"],"match":{"kind":"case"}}
+```
+
+<!-- code-query-case:control-case:expected -->
+```json
+{
+  "results": [
+    {"result_type":"structural_match","path":"cpp/control-flow.cpp","language":"cpp","kind":"case","start_line":21,"end_line":25,"text":"case 0:…","enclosing_symbol":"route"},
+    {"result_type":"structural_match","path":"cpp/control-flow.cpp","language":"cpp","kind":"case","start_line":26,"end_line":27,"text":"default:…","enclosing_symbol":"route"},
+    {"result_type":"structural_match","path":"cpp/control-flow.cpp","language":"cpp","kind":"case","start_line":32,"end_line":33,"text":"case 1:…","enclosing_symbol":"route"},
+    {"result_type":"structural_match","path":"cpp/control-flow.cpp","language":"cpp","kind":"case","start_line":34,"end_line":35,"text":"default:…","enclosing_symbol":"route"}
+  ],
+  "truncated": false
+}
+```
+
+<!-- code-query-case:control-label:rql -->
+```lisp
+(where "cpp/**/*.cpp" (language cpp (label)))
+```
+
+<!-- code-query-case:control-label:json -->
+```json
+{"where":["cpp/**/*.cpp"],"languages":["cpp"],"match":{"kind":"label"}}
+```
+
+<!-- code-query-case:control-label:expected -->
+```json
+{
+  "results": [
+    {"result_type":"structural_match","path":"cpp/control-flow.cpp","language":"cpp","kind":"label","start_line":18,"end_line":29,"text":"forward_target:…","enclosing_symbol":"route"},
+    {"result_type":"structural_match","path":"cpp/control-flow.cpp","language":"cpp","kind":"label","start_line":38,"end_line":39,"text":"done:…","enclosing_symbol":"route"}
+  ],
+  "truncated": false
+}
+```
+
+<!-- code-query-case:control-goto:rql -->
+```lisp
+(where "cpp/**/*.cpp" (language cpp (goto)))
+```
+
+<!-- code-query-case:control-goto:json -->
+```json
+{"where":["cpp/**/*.cpp"],"languages":["cpp"],"match":{"kind":"goto"}}
+```
+
+<!-- code-query-case:control-goto:expected -->
+```json
+{
+  "results": [
+    {"result_type":"structural_match","path":"cpp/control-flow.cpp","language":"cpp","kind":"goto","start_line":12,"end_line":12,"text":"goto forward_target;","enclosing_symbol":"route"},
+    {"result_type":"structural_match","path":"cpp/control-flow.cpp","language":"cpp","kind":"goto","start_line":27,"end_line":27,"text":"goto done;","enclosing_symbol":"route"}
+  ],
+  "truncated": false
+}
+```
+
+<!-- code-query-case:control-break:rql -->
+```lisp
+(where "cpp/**/*.cpp" (language cpp (break)))
+```
+
+<!-- code-query-case:control-break:json -->
+```json
+{"where":["cpp/**/*.cpp"],"languages":["cpp"],"match":{"kind":"break"}}
+```
+
+<!-- code-query-case:control-break:expected -->
+```json
+{
+  "results": [
+    {"result_type":"structural_match","path":"cpp/control-flow.cpp","language":"cpp","kind":"break","start_line":25,"end_line":25,"text":"break;","enclosing_symbol":"route"},
+    {"result_type":"structural_match","path":"cpp/control-flow.cpp","language":"cpp","kind":"break","start_line":33,"end_line":33,"text":"break;","enclosing_symbol":"route"}
+  ],
+  "truncated": false
+}
+```
+
+<!-- code-query-case:control-continue:rql -->
+```lisp
+(where "cpp/**/*.cpp" (language cpp (continue)))
+```
+
+<!-- code-query-case:control-continue:json -->
+```json
+{"where":["cpp/**/*.cpp"],"languages":["cpp"],"match":{"kind":"continue"}}
+```
+
+<!-- code-query-case:control-continue:expected -->
+```json
+{
+  "results": [
+    {"result_type":"structural_match","path":"cpp/control-flow.cpp","language":"cpp","kind":"continue","start_line":23,"end_line":23,"text":"continue;","enclosing_symbol":"route"}
   ],
   "truncated": false
 }

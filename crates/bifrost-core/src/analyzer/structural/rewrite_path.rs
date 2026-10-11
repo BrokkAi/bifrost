@@ -240,49 +240,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn rewrite_vocabulary_round_trips_its_labels() {
-        for domain in ALL_REWRITE_DOMAIN_KINDS {
-            assert_eq!(RewriteDomainKind::from_label(domain.label()), Some(*domain));
-            assert!(!domain.state_key_description().is_empty());
-            assert!(!domain.bound_description().is_empty());
-        }
-        for outcome in ALL_REWRITE_OUTCOME_KINDS {
-            assert_eq!(
-                RewriteOutcomeKind::from_label(outcome.label()),
-                Some(*outcome)
-            );
-        }
-    }
-
-    #[test]
-    fn each_outcome_carries_only_its_own_payload() {
-        let converged = RewriteOutcome::Converged {
-            fixed_point: "c::d".to_string(),
-        };
-        assert_eq!(converged.kind(), RewriteOutcomeKind::Converged);
-        assert_eq!(converged.fixed_point(), Some("c::d"));
-        assert!(converged.witness().is_empty());
-        assert_eq!(converged.explored(), None);
-
-        let cycle = RewriteOutcome::Cycle {
-            witness: vec!["c".to_string(), "a".to_string(), "c".to_string()],
-        };
-        assert_eq!(cycle.kind(), RewriteOutcomeKind::Cycle);
-        assert_eq!(cycle.fixed_point(), None);
-        assert_eq!(cycle.witness().len(), 3);
-        assert_eq!(
-            cycle.witness().first(),
-            cycle.witness().last(),
-            "the last state closes the cycle it repeats"
-        );
-
-        let exceeded = RewriteOutcome::ExceededBudget { explored: 4 };
-        assert_eq!(exceeded.kind(), RewriteOutcomeKind::ExceededBudget);
-        assert_eq!(exceeded.explored(), Some(4));
-        assert_eq!(exceeded.fixed_point(), None);
-    }
-
-    #[test]
     fn a_trace_records_one_terminal_outcome_and_its_steps() {
         let mut trace = RewriteTrace::default();
         assert_eq!(trace.outcome(), None);

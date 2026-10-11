@@ -6,7 +6,10 @@ use crate::graph::PhpGraphSource;
 use crate::graph_support::PhpSource;
 use crate::graph_support::php_direct_declared_class_parent;
 use crate::phpdoc::parameter_element_type as phpdoc_parameter_element_type;
-use brokk_bifrost_core::analyzer::php_facts::{PhpDeclaredSourceType, PhpFieldWriteKind};
+use brokk_bifrost_core::analyzer::php_facts::{
+    PhpDeclarationSourceFact, PhpDeclaredSourceType, PhpFieldWriteKind,
+};
+use brokk_bifrost_core::analyzer::tree_walk::{is_comment_kind, unwrap_parenthesized_expression};
 use brokk_bifrost_core::analyzer::usages::local_inference::{
     LocalInferenceConfig, LocalInferenceEngine, SymbolResolution,
 };
@@ -137,17 +140,9 @@ pub fn assignment_parts(node: Node<'_>) -> Option<(Node<'_>, Node<'_>)> {
         .flatten()
 }
 
-/// Reduce `((expr))` to `expr`. Parentheses nest without bound in generated
-/// source, so this descends with a loop instead of a recursive call.
+/// Reduce nested `parenthesized_expression` nodes to their innermost child.
 pub fn unwrap_parenthesized(node: Node<'_>) -> Node<'_> {
-    let mut current = node;
-    while current.kind() == "parenthesized_expression" {
-        let Some(inner) = current.named_child(0) else {
-            break;
-        };
-        current = inner;
-    }
-    current
+    unwrap_parenthesized_expression(node)
 }
 
 /// Apply one PHP assignment to a local binding scope.
@@ -222,6 +217,97 @@ pub fn object_creation_type(node: Node<'_>) -> Option<Node<'_>> {
     let mut cursor = node.walk();
     node.named_children(&mut cursor)
         .find(|child| matches!(child.kind(), "name" | "qualified_name" | "relative_scope"))
+}
+
+/// Return the object operand of a PHP clone expression.
+///
+/// Legacy cloning stores its operand as the clone expression's first named
+/// child. PHP 8.5 clone-with stores an argument list in the `arguments` field;
+/// the object may be the first positional argument or a named `object`
+/// argument after the property-update argument. Variadic operands do not prove
+/// an object identity, so this helper fails closed for them.
+pub fn clone_object_operand<'tree>(node: Node<'tree>, source: &str) -> Option<Node<'tree>> {
+    debug_assert_eq!(node.kind(), "clone_expression");
+
+    let Some(arguments) = node.child_by_field_name("arguments") else {
+        let mut cursor = node.walk();
+        return node
+            .named_children(&mut cursor)
+            .find(|child| !is_comment_kind(child.kind()));
+    };
+
+    let mut cursor = arguments.walk();
+    let mut named_object = None;
+    let mut first_positional = None;
+    for argument in arguments.named_children(&mut cursor) {
+        if is_comment_kind(argument.kind()) {
+            continue;
+        }
+        if is_clone_variadic_kind(argument.kind())
+            || argument.kind() != "argument"
+            || clone_argument_value(argument)
+                .is_some_and(|value| is_clone_variadic_kind(value.kind()))
+        {
+            return None;
+        }
+
+        if let Some(name) = argument.child_by_field_name("name") {
+            if name
+                .utf8_text(source.as_bytes())
+                .ok()
+                .is_some_and(|name| name == "object")
+            {
+                if named_object.is_some() || first_positional.is_some() {
+                    return None;
+                }
+                named_object = Some(argument);
+            }
+        } else {
+            if named_object.is_some() {
+                return None;
+            }
+            if first_positional.is_none() {
+                first_positional = Some(argument);
+            }
+        }
+    }
+
+    named_object
+        .or(first_positional)
+        .and_then(|argument| clone_argument_value(argument))
+}
+
+fn clone_argument_value(argument: Node<'_>) -> Option<Node<'_>> {
+    if is_clone_variadic_kind(argument.kind()) {
+        return None;
+    }
+
+    if let Some(value) = argument.child_by_field_name("value") {
+        return Some(value);
+    }
+
+    let name = argument.child_by_field_name("name");
+    let reference_modifier = argument.child_by_field_name("reference_modifier");
+    let mut cursor = argument.walk();
+    let values = argument
+        .named_children(&mut cursor)
+        .filter(|child| {
+            !is_comment_kind(child.kind())
+                && Some(child.id()) != name.map(|name| name.id())
+                && Some(child.id()) != reference_modifier.map(|modifier| modifier.id())
+        })
+        .collect::<Vec<_>>();
+    let [value] = values.as_slice() else {
+        return None;
+    };
+    Some(*value)
+}
+
+fn is_clone_variadic_kind(kind: &str) -> bool {
+    matches!(
+        kind,
+        "variadic_placeholder" | "variadic_unpacking" | "argument_placeholder"
+    )
 }
 
 /// Return the type name a `binary_expression` spells on the right of
@@ -1042,8 +1128,21 @@ where
 pub fn parameter_type_node<'tree, F>(
     value: Node<'tree>,
     source: &str,
-    mut step: F,
+    step: F,
 ) -> Option<Node<'tree>>
+where
+    F: FnMut() -> bool,
+{
+    parameter_node_for_value(value, source, step)?
+        .0
+        .child_by_field_name("type")
+}
+
+fn parameter_node_for_value<'tree, F>(
+    value: Node<'tree>,
+    source: &str,
+    mut step: F,
+) -> Option<(Node<'tree>, Node<'tree>)>
 where
     F: FnMut() -> bool,
 {
@@ -1077,7 +1176,7 @@ where
             continue;
         };
         if variable_identifier(name, source) == parameter_name {
-            return parameter.child_by_field_name("type");
+            return Some((parameter, scope));
         }
     }
     None
@@ -1090,36 +1189,8 @@ pub fn parameter_doc_element_type<F>(value: Node<'_>, source: &str, mut step: F)
 where
     F: FnMut() -> bool,
 {
-    if value.kind() != "variable_name" {
-        return None;
-    }
-    let parameter_name = variable_identifier(value, source);
-    let mut ancestor = value.parent();
-    let scope = loop {
-        let node = ancestor?;
-        if !step() {
-            return None;
-        }
-        if is_local_scope(node) {
-            break node;
-        }
-        ancestor = node.parent();
-    };
-    let parameters = scope.child_by_field_name("parameters")?;
-    let mut cursor = parameters.walk();
-    let declared = parameters.named_children(&mut cursor).any(|parameter| {
-        step()
-            && matches!(
-                parameter.kind(),
-                "simple_parameter" | "property_promotion_parameter"
-            )
-            && parameter
-                .child_by_field_name("name")
-                .is_some_and(|name| variable_identifier(name, source) == parameter_name)
-    });
-    if !declared {
-        return None;
-    }
+    let (parameter, scope) = parameter_node_for_value(value, source, &mut step)?;
+    let parameter_name = variable_identifier(parameter.child_by_field_name("name")?, source);
     phpdoc_parameter_element_type(declaration_doc_comment(scope, source)?, parameter_name)
 }
 
@@ -1288,20 +1359,27 @@ pub fn declared_callable_return_element_type_fq_name(
 }
 
 pub fn canonical_doc_nominal_type(php: &dyn PhpSource, unit: &CodeUnit) -> Option<String> {
-    let source = php.php_source_facts(unit.source())?;
-    let mut declarations = source.declarations_for(unit);
-    let first = declarations.next()?.doc_nominal_type.as_ref()?;
-    declarations
-        .all(|declaration| declaration.doc_nominal_type.as_ref() == Some(first))
-        .then(|| first.clone())
+    canonical_doc_value(php, unit, |declaration| {
+        declaration.doc_nominal_type.as_ref()
+    })
 }
 
 pub fn canonical_doc_element_type(php: &dyn PhpSource, unit: &CodeUnit) -> Option<String> {
+    canonical_doc_value(php, unit, |declaration| {
+        declaration.doc_element_type.as_ref()
+    })
+}
+
+fn canonical_doc_value(
+    php: &dyn PhpSource,
+    unit: &CodeUnit,
+    value: impl for<'a> Fn(&'a PhpDeclarationSourceFact) -> Option<&'a String>,
+) -> Option<String> {
     let source = php.php_source_facts(unit.source())?;
     let mut declarations = source.declarations_for(unit);
-    let first = declarations.next()?.doc_element_type.as_ref()?;
+    let first = value(declarations.next()?)?;
     declarations
-        .all(|declaration| declaration.doc_element_type.as_ref() == Some(first))
+        .all(|declaration| value(declaration) == Some(first))
         .then(|| first.clone())
 }
 
@@ -1326,6 +1404,34 @@ pub fn collection_element_type_fq_name(
     )
 }
 
+/// PHP syntax shapes that can name a collection whose element type is queried.
+pub enum CollectionElementTypeAccess<'tree> {
+    IndexedLocal,
+    ThisField(Node<'tree>),
+    MemberCall(Node<'tree>),
+}
+
+/// Classify the supported PHP collection expression without resolving its type.
+pub fn collection_element_type_access<'tree>(
+    collection: Node<'tree>,
+    source: &str,
+) -> Option<CollectionElementTypeAccess<'tree>> {
+    match collection.kind() {
+        "variable_name" => Some(CollectionElementTypeAccess::IndexedLocal),
+        "member_access_expression" | "nullsafe_member_access_expression" => {
+            let object = collection.child_by_field_name("object")?;
+            if object.kind() != "variable_name" || variable_identifier(object, source) != "this" {
+                return None;
+            }
+            Some(CollectionElementTypeAccess::ThisField(collection))
+        }
+        "member_call_expression" | "nullsafe_member_call_expression" => {
+            Some(CollectionElementTypeAccess::MemberCall(collection))
+        }
+        _ => None,
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn collection_element_type_fq_name_inner(
     php: &dyn PhpSource,
@@ -1337,29 +1443,28 @@ fn collection_element_type_fq_name_inner(
     enclosing_owner: &mut dyn FnMut(usize, usize) -> Option<String>,
     remaining_collection_depth: usize,
 ) -> Option<String> {
-    match collection.kind() {
-        "variable_name" if remaining_collection_depth > 0 => infer_indexed_local_element_type(
-            collection,
-            source,
-            collection.start_byte(),
-            &mut |right| {
-                instance_receiver_type_fq_name_inner(
-                    php,
-                    analyzer,
-                    right,
-                    source,
-                    ctx,
-                    bindings,
-                    enclosing_owner,
-                    remaining_collection_depth - 1,
-                )
-            },
-        ),
-        "member_access_expression" | "nullsafe_member_access_expression" => {
-            let object = collection.child_by_field_name("object")?;
-            if object.kind() != "variable_name" || variable_identifier(object, source) != "this" {
-                return None;
-            }
+    match collection_element_type_access(collection, source)? {
+        CollectionElementTypeAccess::IndexedLocal if remaining_collection_depth > 0 => {
+            infer_indexed_local_element_type(
+                collection,
+                source,
+                collection.start_byte(),
+                &mut |right| {
+                    instance_receiver_type_fq_name_inner(
+                        php,
+                        analyzer,
+                        right,
+                        source,
+                        ctx,
+                        bindings,
+                        enclosing_owner,
+                        remaining_collection_depth - 1,
+                    )
+                },
+            )
+        }
+        CollectionElementTypeAccess::IndexedLocal => None,
+        CollectionElementTypeAccess::ThisField(collection) => {
             let member = collection.child_by_field_name("name")?;
             let field_name = literal_member_identifier(member, source)?;
             let owner = enclosing_owner(collection.start_byte(), collection.end_byte())?;
@@ -1372,7 +1477,7 @@ fn collection_element_type_fq_name_inner(
                 |field| declared_field_element_type_fq_name(php, analyzer, field),
             )
         }
-        "member_call_expression" | "nullsafe_member_call_expression" => {
+        CollectionElementTypeAccess::MemberCall(collection) => {
             let object = collection.child_by_field_name("object")?;
             let owner = instance_receiver_type_fq_name_inner(
                 php,
@@ -1394,7 +1499,6 @@ fn collection_element_type_fq_name_inner(
                 |callable| declared_callable_return_element_type_fq_name(php, callable),
             )
         }
-        _ => None,
     }
 }
 
@@ -1649,11 +1753,10 @@ fn instance_receiver_type_fq_name_inner(
                     | "nullsafe_member_access_expression"
                     | "member_call_expression"
                     | "nullsafe_member_call_expression" => {
-                        let dependency = if matches!(
-                            node.kind(),
-                            "parenthesized_expression" | "clone_expression"
-                        ) {
+                        let dependency = if node.kind() == "parenthesized_expression" {
                             node.named_child(0)
+                        } else if node.kind() == "clone_expression" {
+                            clone_object_operand(node, source)
                         } else {
                             node.child_by_field_name("object")
                         };
@@ -1669,8 +1772,10 @@ fn instance_receiver_type_fq_name_inner(
             Visit::Finish(node) => node,
         };
 
-        let dependency = if matches!(node.kind(), "parenthesized_expression" | "clone_expression") {
+        let dependency = if node.kind() == "parenthesized_expression" {
             node.named_child(0)
+        } else if node.kind() == "clone_expression" {
+            clone_object_operand(node, source)
         } else {
             node.child_by_field_name("object")
         }?;
@@ -1735,6 +1840,28 @@ pub fn direct_variable_receiver_type_fq_names(
     owners.sort();
     owners.dedup();
     owners
+}
+
+pub(super) fn direct_receiver_union_member(
+    receiver: Node<'_>,
+    source: &str,
+    bindings: &LocalInferenceEngine<String>,
+    mut lookup: impl FnMut(&str) -> Option<CodeUnit>,
+) -> Option<CodeUnit> {
+    let owners = direct_variable_receiver_type_fq_names(receiver, source, bindings);
+    if owners.len() < 2 {
+        return None;
+    }
+    let mut candidates = owners
+        .into_iter()
+        .filter_map(|owner| lookup(&owner))
+        .collect::<Vec<_>>();
+    candidates.sort();
+    candidates.dedup();
+    let [candidate] = candidates.as_slice() else {
+        return None;
+    };
+    Some(candidate.clone())
 }
 
 pub fn declared_instance_callable(
@@ -1969,15 +2096,11 @@ pub fn magic_member_names(surface: PhpMagicSurface) -> &'static [&'static str] {
 #[cfg(test)]
 mod declaration_name_range_tests {
     use super::php_declaration_name_range;
+    use brokk_bifrost_test_macros::hardwon;
     use tree_sitter::Node;
 
     fn parse(source: &str) -> tree_sitter::Tree {
-        use tree_sitter::Parser;
-        let mut parser = Parser::new();
-        parser
-            .set_language(&tree_sitter_php::LANGUAGE_PHP.into())
-            .expect("PHP grammar");
-        parser.parse(source, None).expect("PHP tree")
+        crate::aliases::parse_php_tree(source).expect("PHP tree")
     }
 
     /// The node generic name-range selection lands on: the `name` whose text is
@@ -2005,6 +2128,9 @@ mod declaration_name_range_tests {
     /// must too -- even though the identity stays sigil-free so that the
     /// declaration and every `->last` access share one name.
     #[test]
+    #[hardwon(
+        "#2416: PHP property declaration ranges omitted the variable sigil or widened to unrelated names"
+    )]
     fn a_property_declarator_range_covers_the_sigil() {
         assert_eq!(
             range_text(
@@ -2018,6 +2144,7 @@ mod declaration_name_range_tests {
     /// The static form parses to the same `property_element -> variable_name`
     /// shape; `static` only changes the modifier text.
     #[test]
+    #[hardwon("#2416: PHP property declaration ranges omitted the leading dollar sigil")]
     fn a_static_property_declarator_range_covers_the_sigil() {
         assert_eq!(
             range_text(
@@ -2027,9 +2154,11 @@ mod declaration_name_range_tests {
             "$sent"
         );
     }
-
     /// A constructor-promoted property is declared with the same `$` token.
     #[test]
+    #[hardwon(
+        "#2416: PHP property declaration ranges omitted the variable sigil or widened to unrelated names"
+    )]
     fn a_promoted_property_declarator_range_covers_the_sigil() {
         assert_eq!(
             range_text(
@@ -2043,11 +2172,63 @@ mod declaration_name_range_tests {
     /// A method name is a bare `name` with no `variable_name` parent. Widening
     /// must not reach it, and must not reach a sigil-free `->last` access.
     #[test]
+    #[hardwon(
+        "#2416: PHP property declaration ranges omitted the variable sigil or widened to unrelated names"
+    )]
     fn a_name_without_a_variable_parent_is_left_alone() {
         assert_eq!(
             range_text("<?php\nclass F {\n    public function bar() {}\n}\n", "bar"),
             "bar"
         );
         assert_eq!(range_text("<?php\n$r->last;\n", "last"), "last");
+    }
+}
+
+#[cfg(test)]
+mod clone_object_operand_tests {
+    use super::clone_object_operand;
+    use crate::aliases::parse_php_tree;
+    use brokk_bifrost_test_macros::hardwon;
+    use tree_sitter::Node;
+
+    fn clone_expression<'tree>(root: Node<'tree>) -> Node<'tree> {
+        let mut stack = vec![root];
+        while let Some(node) = stack.pop() {
+            if node.kind() == "clone_expression" {
+                return node;
+            }
+            let mut cursor = node.walk();
+            stack.extend(node.named_children(&mut cursor));
+        }
+        panic!("source has no clone expression: {root:?}");
+    }
+
+    #[test]
+    #[hardwon("#4408: PHP clone consumers treated the new arguments node as the object")]
+    fn clone_object_operand_reads_structured_arguments_and_fails_closed_on_near_misses() {
+        for (source, expected) in [
+            ("<?php clone /* comment */ $object;", Some("$object")),
+            (
+                "<?php clone(/* object */ $object, /* properties */ withProperties: ['x' => $value]);",
+                Some("$object"),
+            ),
+            (
+                "<?php clone(withProperties: ['x' => $value], object: $object);",
+                Some("$object"),
+            ),
+            ("<?php clone(namedObject: $object);", None),
+            ("<?php clone(Object: $object);", None),
+            ("<?php clone(...);", None),
+            ("<?php clone($first, ...$args);", None),
+            ("<?php clone(...$args, object: $object);", None),
+            ("<?php clone(object: $first, object: $second);", None),
+            ("<?php clone($first, object: $second);", None),
+        ] {
+            let tree = parse_php_tree(source).expect("PHP tree");
+            let clone = clone_expression(tree.root_node());
+            let actual = clone_object_operand(clone, source)
+                .map(|node| &source[node.start_byte()..node.end_byte()]);
+            assert_eq!(actual, expected, "source: {source}");
+        }
     }
 }

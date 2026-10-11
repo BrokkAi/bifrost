@@ -6,7 +6,7 @@ use crate::analyzer::relational_frontier::{
 };
 use crate::analyzer::usages::common::language_for_file;
 use crate::analyzer::usages::inverted_edges::{
-    ClassRangeIndex, EdgeNodeDomain, UsageEdgeBuildOutput, UsageEdgeBuildResult, UsageEdgeWeights,
+    ClassRangeIndex, EdgeNodeDomain, PerFileEdges, UsageEdgeBuildOutput, UsageEdgeBuildResult,
     UsageEdges, build_edge_output, build_edge_output_with_completeness,
     build_file_declarations_from_declaration_ranges_filtered,
     class_range_index_from_declaration_ranges,
@@ -63,35 +63,7 @@ where
 {
     let language = brokk_bifrost_jvm::scala::language::LANGUAGE.into();
     build_edge_output(&graph.files, keep_file, |file| {
-        let state = graph.types.bulk_file_state(file)?;
-        // Synthetic anonymous classes are not public graph nodes. Do not let
-        // their ranges hide references from the enclosing callable. Their
-        // named members remain eligible callers through their own ranges.
-        let declarations = build_file_declarations_from_declaration_ranges_filtered(
-            &state.declarations,
-            &state.ranges,
-            |unit| !(unit.is_class() && unit.is_synthetic()),
-        );
-        let class_ranges =
-            class_range_index_from_declaration_ranges(&state.declarations, &state.ranges);
-        parse_source_and_collect_with_declarations_and_domain(
-            graph.types.source_for_file(scala, file)?,
-            file,
-            domain,
-            ParseSpec::whole(&language),
-            declarations,
-            |input| {
-                scan_edge_file(
-                    scala,
-                    token,
-                    &graph.types,
-                    file,
-                    &state,
-                    class_ranges,
-                    input,
-                )
-            },
-        )
+        collect_scala_file_edges(scala, token, graph, domain, file, &language)
     })
 }
 
@@ -108,33 +80,44 @@ where
 {
     let language = brokk_bifrost_jvm::scala::language::LANGUAGE.into();
     build_edge_output_with_completeness(&graph.files, keep_file, |file| {
-        let state = graph.types.bulk_file_state(file)?;
-        let declarations = build_file_declarations_from_declaration_ranges_filtered(
-            &state.declarations,
-            &state.ranges,
-            |unit| !(unit.is_class() && unit.is_synthetic()),
-        );
-        let class_ranges =
-            class_range_index_from_declaration_ranges(&state.declarations, &state.ranges);
-        parse_source_and_collect_with_declarations_and_domain(
-            graph.types.source_for_file(scala, file)?,
-            file,
-            domain,
-            ParseSpec::whole(&language),
-            declarations,
-            |input| {
-                scan_edge_file(
-                    scala,
-                    token,
-                    &graph.types,
-                    file,
-                    &state,
-                    class_ranges,
-                    input,
-                )
-            },
-        )
+        collect_scala_file_edges(scala, token, graph, domain, file, &language)
     })
+}
+
+fn collect_scala_file_edges(
+    scala: &ScalaAnalyzer,
+    token: QueryToken<'_>,
+    graph: &ScalaEdgeGraph,
+    domain: EdgeNodeDomain<'_>,
+    file: &ProjectFile,
+    language: &tree_sitter::Language,
+) -> Option<PerFileEdges<String>> {
+    let state = graph.types.bulk_file_state(file)?;
+    let declarations = build_file_declarations_from_declaration_ranges_filtered(
+        &state.declarations,
+        &state.ranges,
+        |unit| !(unit.is_class() && unit.is_synthetic()),
+    );
+    let class_ranges =
+        class_range_index_from_declaration_ranges(&state.declarations, &state.ranges);
+    parse_source_and_collect_with_declarations_and_domain(
+        graph.types.source_for_file(scala, file)?,
+        file,
+        domain,
+        ParseSpec::whole(language),
+        declarations,
+        |input| {
+            scan_edge_file(
+                scala,
+                token,
+                &graph.types,
+                file,
+                &state,
+                class_ranges,
+                input,
+            )
+        },
+    )
 }
 
 pub(crate) struct ScalaQueryResolver<'a> {
@@ -209,10 +192,7 @@ impl ScalaWorkspaceSource for ScalaFrontierDispatch<'_> {
         if code_unit.is_file_scope() && code_unit.source() == self.file {
             return vec![self.file_scope_range];
         }
-        self.types
-            .bulk_file_state(code_unit.source())
-            .and_then(|state| state.ranges.get(code_unit).cloned())
-            .unwrap_or_default()
+        self.types.declaration_ranges_for(code_unit)
     }
 
     fn definitions_by_normalized_fqn(&self, normalized: &str) -> Vec<CodeUnit> {
@@ -671,15 +651,15 @@ impl<'a> ScalaEdgeResolver<'a> {
         })
     }
 
-    #[cfg(test)]
-    pub(crate) fn build_edges<F>(
+    pub(crate) fn build_edges<Output, F>(
         &self,
         _analyzer: &dyn IAnalyzer,
         token: QueryToken<'_>,
         nodes: &HashSet<String>,
         keep_file: F,
-    ) -> UsageEdges
+    ) -> Output
     where
+        Output: UsageEdgeBuildOutput<String>,
         F: Fn(&ProjectFile) -> bool + Sync,
     {
         build_scala_edges(
@@ -725,25 +705,6 @@ impl<'a> ScalaEdgeResolver<'a> {
             token,
             &self.graph,
             EdgeNodeDomain::Inbound(callees),
-            keep_file,
-        )
-    }
-
-    pub(crate) fn build_edge_weights<F>(
-        &self,
-        _analyzer: &dyn IAnalyzer,
-        token: QueryToken<'_>,
-        nodes: &HashSet<String>,
-        keep_file: F,
-    ) -> UsageEdgeWeights
-    where
-        F: Fn(&ProjectFile) -> bool + Sync,
-    {
-        build_scala_edges(
-            self.scala,
-            token,
-            &self.graph,
-            EdgeNodeDomain::Closed(nodes),
             keep_file,
         )
     }

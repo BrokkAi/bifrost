@@ -38,11 +38,11 @@ use brokk_bifrost_core::analyzer::semantic_diagnostics::{
 use brokk_bifrost_core::analyzer::structural::facts::Span;
 use brokk_bifrost_core::analyzer::structural::resolution::BoundaryStatus;
 use brokk_bifrost_core::analyzer::tree_walk::{
-    WalkControl, collect_parse_errors, walk_tree_preorder,
+    WalkControl, collect_parse_errors, push_named_children_reversed_where_as, walk_tree_preorder,
 };
 use brokk_bifrost_core::analyzer::{BoundedDefinitionLookup, CodeUnit, ProjectFile, Range};
 use brokk_bifrost_core::hash::HashMap;
-use brokk_bifrost_core::text_utils::{compute_line_starts, find_line_index_for_offset};
+use brokk_bifrost_core::text_utils::compute_line_starts;
 use tree_sitter::{Node, Parser};
 
 pub const PYTHON_UNRECOGNIZED_SYMBOL: &str = "python_unrecognized_symbol";
@@ -102,9 +102,9 @@ impl PythonEnvironmentSurface for UnacquiredPythonEnvironment {
 
 fn unknown_boundary() -> PythonEnvironmentBoundary {
     PythonEnvironmentBoundary::Incomplete(
-        SemanticDiagnosticIncompleteReason::MissingDependencyDiscovery {
-            boundary: BoundaryStatus::ExternalUnknown,
-        },
+        SemanticDiagnosticIncompleteReason::missing_dependency_discovery(
+            BoundaryStatus::ExternalUnknown,
+        ),
     )
 }
 
@@ -366,7 +366,11 @@ impl PythonDiagnosticCollector<'_> {
         stack: &mut Vec<ScanFrame<'tree>>,
     ) {
         match node.kind() {
-            "module" => push_named_children(stack, node),
+            "module" => brokk_bifrost_core::analyzer::tree_walk::push_named_children_reversed_as(
+                node,
+                stack,
+                ScanFrame::Node,
+            ),
             "function_definition" | "lambda" => {
                 self.seed_named_declaration(node, scopes);
                 scopes.enter();
@@ -390,7 +394,11 @@ impl PythonDiagnosticCollector<'_> {
                 scopes.enter();
                 self.seed_comprehension_targets(node, scopes);
                 stack.push(ScanFrame::ExitScope);
-                push_named_children(stack, node);
+                brokk_bifrost_core::analyzer::tree_walk::push_named_children_reversed_as(
+                    node,
+                    stack,
+                    ScanFrame::Node,
+                );
             }
             "match_statement" => {
                 // A capture pattern binds names this pass does not model, so
@@ -418,11 +426,19 @@ impl PythonDiagnosticCollector<'_> {
             }
             "with_statement" | "with_item" => {
                 stack.push(ScanFrame::SeedTargets(node));
-                push_named_children(stack, node);
+                brokk_bifrost_core::analyzer::tree_walk::push_named_children_reversed_as(
+                    node,
+                    stack,
+                    ScanFrame::Node,
+                );
             }
             "except_clause" => {
                 self.seed_except_alias(node, scopes);
-                push_named_children(stack, node);
+                brokk_bifrost_core::analyzer::tree_walk::push_named_children_reversed_as(
+                    node,
+                    stack,
+                    ScanFrame::Node,
+                );
             }
             "identifier" => self.check_identifier(node, scopes),
             "attribute" => {
@@ -432,7 +448,11 @@ impl PythonDiagnosticCollector<'_> {
                 }
             }
             "string" | "string_content" | "comment" => {}
-            _ => push_named_children(stack, node),
+            _ => brokk_bifrost_core::analyzer::tree_walk::push_named_children_reversed_as(
+                node,
+                stack,
+                ScanFrame::Node,
+            ),
         }
     }
 
@@ -672,12 +692,11 @@ impl PythonDiagnosticCollector<'_> {
 }
 
 fn span_range(span: Span, line_starts: &[usize]) -> Range {
-    Range {
-        start_byte: span.start_byte,
-        end_byte: span.end_byte,
-        start_line: find_line_index_for_offset(line_starts, span.start_byte) + 1,
-        end_line: find_line_index_for_offset(line_starts, span.end_byte.saturating_sub(1)) + 1,
-    }
+    brokk_bifrost_core::analyzer::semantic_diagnostics::range_for_byte_span(
+        line_starts,
+        span.start_byte,
+        span.end_byte,
+    )
 }
 
 /// Every dynamic-namespace feature the file uses, each as the typed reason it
@@ -779,25 +798,7 @@ fn collect_parameter_names(node: Node<'_>, source: &str, scopes: &mut ScopeStack
     }
 }
 
-fn python_parameter_name(node: Node<'_>, source: &str) -> Option<String> {
-    match node.kind() {
-        "identifier" => Some(node_text(node, source).trim().to_string()),
-        "typed_parameter"
-        | "typed_default_parameter"
-        | "default_parameter"
-        | "list_splat_pattern"
-        | "dictionary_splat_pattern" => node
-            .child_by_field_name("name")
-            .or_else(|| {
-                let mut cursor = node.walk();
-                node.named_children(&mut cursor)
-                    .find(|child| child.kind() == "identifier")
-            })
-            .and_then(|name| python_parameter_name(name, source)),
-        _ => None,
-    }
-    .filter(|name| !name.is_empty())
-}
+use crate::syntax::python_parameter_name;
 
 fn collect_alias_children(node: Node<'_>, source: &str, scopes: &mut ScopeStack) {
     let mut cursor = node.walk();
@@ -813,27 +814,17 @@ fn collect_alias_children(node: Node<'_>, source: &str, scopes: &mut ScopeStack)
     }
 }
 
-fn push_named_children<'tree>(stack: &mut Vec<ScanFrame<'tree>>, node: Node<'tree>) {
-    let mut cursor = node.walk();
-    let children: Vec<_> = node.named_children(&mut cursor).collect();
-    for child in children.into_iter().rev() {
-        stack.push(ScanFrame::Node(child));
-    }
-}
-
 fn push_named_children_except<'tree>(
     stack: &mut Vec<ScanFrame<'tree>>,
     node: Node<'tree>,
     excluded: Option<Node<'tree>>,
 ) {
-    let mut cursor = node.walk();
-    let children: Vec<_> = node
-        .named_children(&mut cursor)
-        .filter(|child| excluded.is_none_or(|excluded| !same_node(*child, excluded)))
-        .collect();
-    for child in children.into_iter().rev() {
-        stack.push(ScanFrame::Node(child));
-    }
+    push_named_children_reversed_where_as(
+        node,
+        stack,
+        |child| excluded.is_none_or(|excluded| !same_node(child, excluded)),
+        ScanFrame::Node,
+    );
 }
 
 fn is_declaration_identifier(node: Node<'_>) -> bool {

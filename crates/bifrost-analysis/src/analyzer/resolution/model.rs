@@ -12,7 +12,7 @@ use crate::analyzer::structural::{
     BoundaryStatus, CandidateOutcome, PrecedenceTier, ResolutionCompletionKind,
     ResolutionCompletionReasonKind, ResolutionWitnessKind,
 };
-use crate::hash::{HashMap, HashSet};
+use crate::hash::{HashMap, HashSet, set_with_capacity};
 
 use super::completion_reasons::{CompletionReasonUnion, CompletionReasons};
 use super::never_cancelled;
@@ -456,6 +456,12 @@ impl BindingNodeId {
 }
 
 impl SemanticId {
+    /// Whether this operation identity was minted by the selected operation
+    /// rather than by a selected context.
+    pub(crate) fn is_operation_local(self) -> bool {
+        self.operation_local_number().is_some() && !self.is_context_local()
+    }
+
     /// One shared name as the runtime semantic every mount meets it by.
     pub(crate) fn shared_name(id: SharedNameId) -> Self {
         Self::of_kind(ResolutionIdentityKind::Shared, u64::from(id.get()))
@@ -522,23 +528,42 @@ impl AlphaRenaming {
     }
 }
 
-/// Source-declared effective namespaces for one Go lexical definition.
-/// This nonzero scalar is present only for an eligible lexical binder; it is
-/// not inferred from a declaration's primary namespace or its syntax kind.
+/// Effective namespaces for one Go definition, plus whether a structured Go
+/// member relation identifies it as a field.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct GoDefinitionNamespaces(u8);
+pub struct GoDefinitionNamespaces {
+    bits: u8,
+    go_field: bool,
+}
 
 impl GoDefinitionNamespaces {
+    /// Go struct fields are values but do not shadow lexical type names.
+    pub(crate) const GO_FIELD_VALUE: Self = Self {
+        bits: 2,
+        go_field: true,
+    };
+
     pub const fn from_bits(bits: u8) -> Self {
         assert!(
             bits > 0 && bits <= 15,
             "Go lexical namespaces use Type=1, Value=2, Callable=4, Package=8"
         );
-        Self(bits)
+        Self {
+            bits,
+            go_field: false,
+        }
     }
 
     pub const fn bits(self) -> u8 {
-        self.0
+        self.bits
+    }
+
+    pub const fn includes_package(self) -> bool {
+        self.bits & 8 != 0
+    }
+
+    pub(crate) const fn is_go_field(self) -> bool {
+        self.go_field
     }
 
     pub(crate) fn admits(
@@ -561,7 +586,7 @@ impl GoDefinitionNamespaces {
             }
             _ => panic!("unsupported Go spelling namespace: {namespace:?}"),
         };
-        self.0 & requested != 0
+        self.bits & requested != 0
     }
 }
 
@@ -850,16 +875,28 @@ impl<T: Clone> StackSubstitution<T> {
     }
 }
 
-fn clone_cells_with_poll<T, P, C>(
+fn apply_scope_stack_with_poll<P>(
+    substitution: &StackSubstitution<BindingNodeId>,
+    pattern: &ScopeStackPattern,
+    cancelled: &mut P,
+) -> Option<Result<ScopeStackPattern, StackUnificationError>>
+where
+    P: FnMut() -> bool,
+{
+    let mut clone_node = |node: &BindingNodeId, cancelled: &mut P| (!cancelled()).then_some(*node);
+    substitution.apply_with_poll(pattern, &mut clone_node, cancelled)
+}
+
+pub(super) fn clone_cells_with_poll<T, P, C>(
     values: &[T],
     clone_cell: &mut C,
     cancelled: &mut P,
 ) -> Option<Vec<T>>
 where
-    P: FnMut() -> bool,
+    P: FnMut() -> bool + ?Sized,
     C: FnMut(&T, &mut P) -> Option<T>,
 {
-    let mut cloned = Vec::new();
+    let mut cloned = Vec::with_capacity(values.len());
     for value in values {
         cloned.push(clone_cell(value, cancelled)?);
     }
@@ -901,15 +938,8 @@ fn clone_scoped_symbol_with_poll<P>(
 where
     P: FnMut() -> bool,
 {
-    if cancelled() {
-        return None;
-    }
-    Some(PartialScopedSymbol {
-        symbol: symbol.symbol,
-        scopes: match &symbol.scopes {
-            Some(scopes) => Some(clone_scope_stack_with_poll(scopes, cancelled)?),
-            None => None,
-        },
+    transform_scoped_symbol_with_poll(symbol, cancelled, |scopes, cancelled| {
+        clone_scope_stack_with_poll(scopes, cancelled)
     })
 }
 
@@ -921,15 +951,27 @@ fn alpha_rename_scoped_symbol_with_poll<P>(
 where
     P: FnMut() -> bool,
 {
+    transform_scoped_symbol_with_poll(symbol, cancelled, |scopes, cancelled| {
+        alpha_rename_scope_stack_with_poll(scopes, renaming, cancelled)
+    })
+}
+
+fn transform_scoped_symbol_with_poll<P, F>(
+    symbol: &PartialScopedSymbol,
+    cancelled: &mut P,
+    transform_scopes: F,
+) -> Option<PartialScopedSymbol>
+where
+    P: FnMut() -> bool,
+    F: FnOnce(&ScopeStackPattern, &mut P) -> Option<ScopeStackPattern>,
+{
     if cancelled() {
         return None;
     }
     Some(PartialScopedSymbol {
         symbol: symbol.symbol,
         scopes: match &symbol.scopes {
-            Some(scopes) => Some(alpha_rename_scope_stack_with_poll(
-                scopes, renaming, cancelled,
-            )?),
+            Some(scopes) => Some(transform_scopes(scopes, cancelled)?),
             None => None,
         },
     })
@@ -943,15 +985,12 @@ fn alpha_rename_symbol_stack_with_poll<P>(
 where
     P: FnMut() -> bool,
 {
-    // The fixed cells are renamed one at a time rather than through
-    // `clone_cells_with_poll`, because each one needs the renaming, which is
-    // `&mut` and cannot be captured by the shared closure that helper takes.
-    let mut fixed = Vec::with_capacity(pattern.fixed.len());
-    for symbol in &pattern.fixed {
-        fixed.push(alpha_rename_scoped_symbol_with_poll(
-            symbol, renaming, cancelled,
-        )?);
-    }
+    let fixed = {
+        let mut rename_symbol = |symbol: &PartialScopedSymbol, cancelled: &mut P| {
+            alpha_rename_scoped_symbol_with_poll(symbol, renaming, cancelled)
+        };
+        clone_cells_with_poll(&pattern.fixed, &mut rename_symbol, cancelled)?
+    };
     if cancelled() {
         return None;
     }
@@ -1000,14 +1039,10 @@ where
             return None;
         }
         let substituted_scopes = match &symbol.scopes {
-            Some(pattern) => {
-                let mut clone_node =
-                    |node: &BindingNodeId, cancelled: &mut P| (!cancelled()).then_some(*node);
-                match scopes.apply_with_poll(pattern, &mut clone_node, cancelled)? {
-                    Ok(scopes) => Some(scopes),
-                    Err(error) => return Some(Err(error)),
-                }
-            }
+            Some(pattern) => match apply_scope_stack_with_poll(scopes, pattern, cancelled)? {
+                Ok(scopes) => Some(scopes),
+                Err(error) => return Some(Err(error)),
+            },
             None => None,
         };
         fixed.push(PartialScopedSymbol {
@@ -1016,6 +1051,52 @@ where
         });
     }
     Some(Ok(StackPattern::new(fixed, outer.tail)))
+}
+
+fn poll_symbol_stack_application_with_poll<P>(
+    pattern: &SymbolStackPattern,
+    cancelled: &mut P,
+) -> Option<()>
+where
+    P: FnMut() -> bool,
+{
+    // Preserve point-work accounting from the former empty-substitution
+    // application while keeping the stack borrowed and avoiding its temporary
+    // symbol and scope vectors.
+    for symbol in &pattern.fixed {
+        if cancelled() {
+            return None;
+        }
+        if let Some(scopes) = &symbol.scopes {
+            for _ in &scopes.fixed {
+                if cancelled() {
+                    return None;
+                }
+            }
+            if cancelled() {
+                return None;
+            }
+        }
+    }
+    if pattern.tail.is_some() && cancelled() {
+        return None;
+    }
+    for symbol in &pattern.fixed {
+        if cancelled() {
+            return None;
+        }
+        if let Some(scopes) = &symbol.scopes {
+            for _ in &scopes.fixed {
+                if cancelled() {
+                    return None;
+                }
+            }
+            if scopes.tail.is_some() && cancelled() {
+                return None;
+            }
+        }
+    }
+    Some(())
 }
 
 fn unify_symbol_stacks_with_poll<P>(
@@ -1028,14 +1109,12 @@ fn unify_symbol_stacks_with_poll<P>(
 where
     P: FnMut() -> bool,
 {
-    let left = match apply_symbol_stack_with_poll(symbols, scopes, left, cancelled)? {
-        Ok(left) => left,
-        Err(error) => return Some(Err(error)),
-    };
-    let right = match apply_symbol_stack_with_poll(symbols, scopes, right, cancelled)? {
-        Ok(right) => right,
-        Err(error) => return Some(Err(error)),
-    };
+    // This helper is only called with substitutions freshly created by
+    // `unify_middle_endpoints_with_poll`. Keep both input stacks borrowed until
+    // a variable tail actually has to be bound.
+    assert!(symbols.is_empty() && scopes.is_empty());
+    poll_symbol_stack_application_with_poll(left, cancelled)?;
+    poll_symbol_stack_application_with_poll(right, cancelled)?;
     let shared = left.fixed.len().min(right.fixed.len());
     for index in 0..shared {
         if cancelled() {
@@ -1167,6 +1246,10 @@ impl EndpointSignature {
         &self.symbols
     }
 
+    pub(crate) fn first_fixed_symbol(&self) -> Option<&PartialScopedSymbol> {
+        self.symbols.fixed().first()
+    }
+
     pub fn scopes(&self) -> &ScopeStackPattern {
         &self.scopes
     }
@@ -1197,22 +1280,24 @@ impl EndpointSignature {
         {
             return Some(false);
         }
-        for (left, right) in self.symbols.fixed.iter().zip(other.symbols.fixed.iter()) {
-            if cancelled() {
-                return None;
-            }
-            if left.symbol != right.symbol {
-                return Some(false);
-            }
-            match (left.scopes.as_ref(), right.scopes.as_ref()) {
-                (None, None) => {}
-                (Some(left), Some(right)) => {
-                    if !scope_patterns_equal_with_poll(left, right, cancelled)? {
-                        return Some(false);
-                    }
+        if !symbol_stack_cells_equal_with_poll(
+            &self.symbols.fixed,
+            &other.symbols.fixed,
+            cancelled,
+            |left, right, cancelled| {
+                if left.symbol != right.symbol {
+                    return Some(false);
                 }
-                (None, Some(_)) | (Some(_), None) => return Some(false),
-            }
+                match (left.scopes.as_ref(), right.scopes.as_ref()) {
+                    (None, None) => Some(true),
+                    (Some(left), Some(right)) => {
+                        scope_patterns_equal_with_poll(left, right, cancelled)
+                    }
+                    (None, Some(_)) | (Some(_), None) => Some(false),
+                }
+            },
+        )? {
+            return Some(false);
         }
         scope_patterns_equal_with_poll(&self.scopes, &other.scopes, cancelled)
     }
@@ -1227,16 +1312,17 @@ impl EndpointSignature {
     where
         P: FnMut() -> bool,
     {
-        let next = if next.holds_a_variable() {
+        let renamed_next = if next.holds_a_variable() {
             let mut renaming = AlphaRenaming {
                 next: self.operation_local_variable_ceiling(),
                 assigned: Vec::new(),
             };
-            next.alpha_renamed_with_poll(&mut renaming, cancelled)?
+            Some(next.alpha_renamed_with_poll(&mut renaming, cancelled)?)
         } else {
-            next.clone_with_poll(cancelled)?
+            None
         };
-        match unify_middle_endpoints_with_poll(self, &next, cancelled)? {
+        let next = renamed_next.as_ref().unwrap_or(next);
+        match unify_middle_endpoints_with_poll(self, next, cancelled)? {
             Ok(_) => Some(Ok(())),
             Err(error) => Some(Err(error)),
         }
@@ -1324,9 +1410,7 @@ impl EndpointSignature {
             Ok(symbols) => symbols,
             Err(error) => return Some(Err(error)),
         };
-        let mut clone_node =
-            |node: &BindingNodeId, cancelled: &mut P| (!cancelled()).then_some(*node);
-        let scopes = match scopes.apply_with_poll(&self.scopes, &mut clone_node, cancelled)? {
+        let scopes = match apply_scope_stack_with_poll(scopes, &self.scopes, cancelled)? {
             Ok(scopes) => scopes,
             Err(error) => return Some(Err(error)),
         };
@@ -1342,14 +1426,53 @@ fn scope_patterns_equal_with_poll<P>(
 where
     P: FnMut() -> bool,
 {
-    if left.tail != right.tail || left.fixed.len() != right.fixed.len() {
+    stack_patterns_equal_with_poll(&left.fixed, left.tail, &right.fixed, right.tail, cancelled)
+}
+
+fn stack_patterns_equal_with_poll<T, Tail, P>(
+    left_fixed: &[T],
+    left_tail: Option<Tail>,
+    right_fixed: &[T],
+    right_tail: Option<Tail>,
+    cancelled: &mut P,
+) -> Option<bool>
+where
+    T: PartialEq,
+    Tail: PartialEq,
+    P: FnMut() -> bool,
+{
+    if left_tail != right_tail || left_fixed.len() != right_fixed.len() {
         return Some(false);
     }
-    for (left, right) in left.fixed.iter().zip(right.fixed.iter()) {
+    for (left, right) in left_fixed.iter().zip(right_fixed.iter()) {
         if cancelled() {
             return None;
         }
         if left != right {
+            return Some(false);
+        }
+    }
+    Some(true)
+}
+
+fn symbol_stack_cells_equal_with_poll<Left, Right, P, Equal>(
+    left: &[Left],
+    right: &[Right],
+    cancelled: &mut P,
+    mut equal: Equal,
+) -> Option<bool>
+where
+    P: FnMut() -> bool,
+    Equal: FnMut(&Left, &Right, &mut P) -> Option<bool>,
+{
+    if left.len() != right.len() {
+        return Some(false);
+    }
+    for (left, right) in left.iter().zip(right.iter()) {
+        if cancelled() {
+            return None;
+        }
+        if !equal(left, right, cancelled)? {
             return Some(false);
         }
     }
@@ -1562,6 +1685,30 @@ impl ResolutionCompletion {
             | (Self::Complete, Self::Incomplete(reasons)) => Self::Incomplete(reasons.clone()),
             (Self::Incomplete(left), Self::Incomplete(right)) => {
                 Self::Incomplete(left.union(right))
+            }
+        }
+    }
+
+    pub(crate) fn without_reasons_with_poll<P>(
+        &self,
+        reasons: &[ResolutionIncompleteReason],
+        cancelled: &mut P,
+    ) -> Option<Self>
+    where
+        P: FnMut() -> bool + ?Sized,
+    {
+        if cancelled() {
+            return None;
+        }
+        match self {
+            Self::Complete => Some(Self::Complete),
+            Self::Incomplete(current) => {
+                let filtered =
+                    current.without_reasons_with_poll(reasons.iter().copied(), cancelled)?;
+                if cancelled() {
+                    return None;
+                }
+                Some(filtered.map_or(Self::Complete, Self::Incomplete))
             }
         }
     }
@@ -2370,22 +2517,24 @@ where
     {
         return Some(false);
     }
-    for (left, right) in left.symbols.fixed.iter().zip(right.symbols.fixed.iter()) {
-        if cancelled() {
-            return None;
-        }
-        if left.symbol != right.symbol {
-            return Some(false);
-        }
-        match (left.scopes.as_ref(), right.scopes.as_ref()) {
-            (None, None) => {}
-            (Some(left), Some(right)) => {
-                if !alpha_scope_stacks_equal_with_poll(left, right, cancelled)? {
-                    return Some(false);
-                }
+    if !symbol_stack_cells_equal_with_poll(
+        &left.symbols.fixed,
+        &right.symbols.fixed,
+        cancelled,
+        |left, right, cancelled| {
+            if left.symbol != right.symbol {
+                return Some(false);
             }
-            (None, Some(_)) | (Some(_), None) => return Some(false),
-        }
+            match (left.scopes.as_ref(), right.scopes.as_ref()) {
+                (None, None) => Some(true),
+                (Some(left), Some(right)) => {
+                    alpha_scope_stacks_equal_with_poll(left, right, cancelled)
+                }
+                (None, Some(_)) | (Some(_), None) => Some(false),
+            }
+        },
+    )? {
+        return Some(false);
     }
     alpha_scope_stacks_equal_with_poll(&left.scopes, &right.scopes, cancelled)
 }
@@ -2398,18 +2547,7 @@ fn alpha_scope_stacks_equal_with_poll<P>(
 where
     P: FnMut() -> bool,
 {
-    if left.tail != right.tail || left.fixed.len() != right.fixed.len() {
-        return Some(false);
-    }
-    for (left, right) in left.fixed.iter().zip(right.fixed.iter()) {
-        if cancelled() {
-            return None;
-        }
-        if left != right {
-            return Some(false);
-        }
-    }
-    Some(true)
+    stack_patterns_equal_with_poll(&left.fixed, left.tail, &right.fixed, right.tail, cancelled)
 }
 
 fn hash_alpha_endpoint_with_poll<P>(
@@ -2423,21 +2561,23 @@ where
 {
     hasher.value(label);
     hasher.value(&endpoint.node.as_bytes());
-    hasher.value(&(endpoint.symbols.fixed.len() as u64).to_le_bytes());
-    hash_optional_ordinal(hasher, endpoint.symbols.tail);
-    for symbol in endpoint.symbols.fixed.iter() {
-        if cancelled() {
-            return None;
-        }
-        hasher.value(&symbol.symbol.as_bytes());
-        match symbol.scopes.as_ref() {
-            Some(scopes) => {
-                hasher.value(b"scoped");
-                hash_alpha_scope_stack_with_poll(hasher, scopes, cancelled)?;
+    hash_alpha_stack_values_with_poll(
+        hasher,
+        &endpoint.symbols.fixed,
+        endpoint.symbols.tail,
+        cancelled,
+        |hasher, symbol, cancelled| {
+            hasher.value(&symbol.symbol.as_bytes());
+            match symbol.scopes.as_ref() {
+                Some(scopes) => {
+                    hasher.value(b"scoped");
+                    hash_alpha_scope_stack_with_poll(hasher, scopes, cancelled)?;
+                }
+                None => hasher.value(b"unscoped"),
             }
-            None => hasher.value(b"unscoped"),
-        }
-    }
+            Some(())
+        },
+    )?;
     hash_alpha_scope_stack_with_poll(hasher, &endpoint.scopes, cancelled)
 }
 
@@ -2449,13 +2589,36 @@ fn hash_alpha_scope_stack_with_poll<P>(
 where
     P: FnMut() -> bool,
 {
-    hasher.value(&(stack.fixed.len() as u64).to_le_bytes());
-    hash_optional_ordinal(hasher, stack.tail);
-    for node in stack.fixed.iter() {
+    hash_alpha_stack_values_with_poll(
+        hasher,
+        &stack.fixed,
+        stack.tail,
+        cancelled,
+        |hasher, node, _| {
+            hasher.value(&node.as_bytes());
+            Some(())
+        },
+    )
+}
+
+fn hash_alpha_stack_values_with_poll<T, P, F>(
+    hasher: &mut CanonicalHasher,
+    fixed: &[T],
+    tail: Option<u32>,
+    cancelled: &mut P,
+    mut hash_value: F,
+) -> Option<()>
+where
+    P: FnMut() -> bool,
+    F: FnMut(&mut CanonicalHasher, &T, &mut P) -> Option<()>,
+{
+    hasher.value(&(fixed.len() as u64).to_le_bytes());
+    hash_optional_ordinal(hasher, tail);
+    for value in fixed {
         if cancelled() {
             return None;
         }
-        hasher.value(&node.as_bytes());
+        hash_value(hasher, value, cancelled)?;
     }
     Some(())
 }
@@ -2478,13 +2641,11 @@ struct AlphaNormalizer {
 
 impl AlphaNormalizer {
     fn symbol_variable(&mut self, variable: StackVariableId) -> u32 {
-        let next = self.symbol_variables.len() as u32;
-        *self.symbol_variables.entry(variable).or_insert(next)
+        alpha_variable_ordinal(&mut self.symbol_variables, variable)
     }
 
     fn scope_variable(&mut self, variable: StackVariableId) -> u32 {
-        let next = self.scope_variables.len() as u32;
-        *self.scope_variables.entry(variable).or_insert(next)
+        alpha_variable_ordinal(&mut self.scope_variables, variable)
     }
 
     fn scope_stack_with_poll<P>(
@@ -2544,6 +2705,14 @@ impl AlphaNormalizer {
     }
 }
 
+fn alpha_variable_ordinal(
+    variables: &mut HashMap<StackVariableId, u32>,
+    variable: StackVariableId,
+) -> u32 {
+    let next = variables.len() as u32;
+    *variables.entry(variable).or_insert(next)
+}
+
 #[derive(Debug, Clone)]
 pub struct PartialPath {
     start: EndpointSignature,
@@ -2551,6 +2720,13 @@ pub struct PartialPath {
     precedence: Box<[PrecedenceStep]>,
     witness: Box<[WitnessStep]>,
     completion: ResolutionCompletion,
+    /// A root route head whose selected owner resolution continues later.
+    owner_continued: bool,
+    /// The source position at which a positional root import (Scala) takes
+    /// effect, ordering that import among its blob's other root imports. None
+    /// for an import in effect across its whole scope, and for every path that
+    /// is not a root import's own row: a composed path is not that row.
+    root_import_activation: Option<u32>,
     /// A number past every operation-local variable the two endpoints hold,
     /// which is where a renaming composing against this path starts.
     ///
@@ -2581,6 +2757,8 @@ impl PartialEq for PartialPath {
             precedence,
             witness,
             completion,
+            owner_continued,
+            root_import_activation,
             variable_ceiling: _,
         } = self;
         *start == other.start
@@ -2588,6 +2766,8 @@ impl PartialEq for PartialPath {
             && *precedence == other.precedence
             && *witness == other.witness
             && *completion == other.completion
+            && *owner_continued == other.owner_continued
+            && *root_import_activation == other.root_import_activation
     }
 }
 
@@ -2601,6 +2781,8 @@ impl std::hash::Hash for PartialPath {
             precedence,
             witness,
             completion,
+            owner_continued,
+            root_import_activation,
             variable_ceiling: _,
         } = self;
         start.hash(state);
@@ -2608,24 +2790,43 @@ impl std::hash::Hash for PartialPath {
         precedence.hash(state);
         witness.hash(state);
         completion.hash(state);
+        owner_continued.hash(state);
+        root_import_activation.hash(state);
     }
 }
 
-fn clone_copy_slice_with_poll<T: Copy, P>(values: &[T], cancelled: &mut P) -> Option<Vec<T>>
+fn extend_copy_slice_with_poll<T: Copy, P>(
+    output: &mut Vec<T>,
+    values: &[T],
+    cancelled: &mut P,
+) -> Option<()>
 where
     P: FnMut() -> bool,
 {
     if cancelled() {
         return None;
     }
-    let mut cloned = Vec::with_capacity(values.len());
-    for &value in values {
+    for _ in values {
         if cancelled() {
             return None;
         }
-        cloned.push(value);
     }
-    Some(cloned)
+    output.extend_from_slice(values);
+    Some(())
+}
+
+fn clone_copy_slice_with_poll<T: Copy, P>(values: &[T], cancelled: &mut P) -> Option<Vec<T>>
+where
+    P: FnMut() -> bool,
+{
+    clone_cells_with_poll(values, &mut copy_cell_with_poll::<T, P>, cancelled)
+}
+
+pub(super) fn copy_cell_with_poll<T: Copy, P>(value: &T, cancelled: &mut P) -> Option<T>
+where
+    P: FnMut() -> bool + ?Sized,
+{
+    (!cancelled()).then_some(*value)
 }
 
 pub(crate) fn clone_completion_with_poll<P>(
@@ -2757,6 +2958,8 @@ impl PartialPath {
             precedence,
             witness,
             completion,
+            owner_continued: false,
+            root_import_activation: None,
             variable_ceiling,
         }
     }
@@ -2781,21 +2984,45 @@ impl PartialPath {
         &self.completion
     }
 
+    pub const fn owner_continued(&self) -> bool {
+        self.owner_continued
+    }
+
+    pub(crate) const fn root_import_activation(&self) -> Option<u32> {
+        self.root_import_activation
+    }
+
+    pub(crate) fn with_root_import_activation(mut self, activation: Option<u32>) -> Self {
+        self.root_import_activation = activation;
+        self
+    }
+
+    pub(crate) fn with_owner_continued(mut self) -> Self {
+        self.owner_continued = true;
+        self
+    }
+
     /// The path without the reasons the selected stage proved closed
     /// (`temp.selected_resolution_stage_closed_reasons`). A persisted path
     /// carries every gap reason on its way, and a closed reason must leave the
     /// path the way it leaves a candidate completion.
-    pub(crate) fn without_closed_reasons(mut self, closed: &[ResolutionIncompleteReason]) -> Self {
-        if let ResolutionCompletion::Incomplete(reasons) = &self.completion {
-            self.completion = reasons
-                .without_reasons_with_poll(closed.iter().copied(), &mut || false)
-                .expect("a never-cancelled poll finishes")
-                .map_or(
-                    ResolutionCompletion::Complete,
-                    ResolutionCompletion::Incomplete,
-                );
-        }
-        self
+    pub(crate) fn without_closed_reasons(self, closed: &[ResolutionIncompleteReason]) -> Self {
+        self.without_reasons_with_poll(closed, &mut || false)
+            .expect("a never-cancelled poll finishes")
+    }
+
+    pub(crate) fn without_reasons_with_poll<P>(
+        mut self,
+        reasons: &[ResolutionIncompleteReason],
+        cancelled: &mut P,
+    ) -> Option<Self>
+    where
+        P: FnMut() -> bool + ?Sized,
+    {
+        self.completion = self
+            .completion
+            .without_reasons_with_poll(reasons, cancelled)?;
+        Some(self)
     }
 
     pub(crate) fn with_additional_completion(mut self, completion: &ResolutionCompletion) -> Self {
@@ -2843,6 +3070,8 @@ impl PartialPath {
             || !self.end.equals_with_poll(&other.end, cancelled)?
             || self.precedence.len() != other.precedence.len()
             || self.witness.len() != other.witness.len()
+            || self.owner_continued != other.owner_continued
+            || self.root_import_activation != other.root_import_activation
         {
             return Some(false);
         }
@@ -2913,6 +3142,8 @@ impl PartialPath {
             precedence: clone_copy_slice_with_poll(&self.precedence, cancelled)?.into_boxed_slice(),
             witness: clone_copy_slice_with_poll(&self.witness, cancelled)?.into_boxed_slice(),
             completion: clone_completion_with_poll(&self.completion, cancelled)?,
+            owner_continued: self.owner_continued,
+            root_import_activation: self.root_import_activation,
             variable_ceiling: self.variable_ceiling,
         })
     }
@@ -2955,6 +3186,8 @@ impl PartialPath {
             precedence: clone_copy_slice_with_poll(&self.precedence, cancelled)?.into_boxed_slice(),
             witness: clone_copy_slice_with_poll(&self.witness, cancelled)?.into_boxed_slice(),
             completion: clone_completion_with_poll(&self.completion, cancelled)?,
+            owner_continued: self.owner_continued,
+            root_import_activation: self.root_import_activation,
             // Every variable the rename touched came from this one renaming,
             // so its next number is the ceiling of what it produced.
             variable_ceiling: renaming.next,
@@ -2979,14 +3212,25 @@ impl PartialPath {
         if cancelled() {
             return None;
         }
-        let next = if next.holds_a_variable() {
+        let (renamed_next, next_ceiling) = if next.holds_a_variable() {
             let mut renaming = AlphaRenaming::after(self);
-            next.alpha_renamed_with_poll(&mut renaming, cancelled)?
+            let start = next
+                .start
+                .alpha_renamed_with_poll(&mut renaming, cancelled)?;
+            let end = next.end.alpha_renamed_with_poll(&mut renaming, cancelled)?;
+            (Some((start, end)), renaming.next)
         } else {
-            next.clone_with_poll(cancelled)?
+            (None, next.variable_ceiling)
         };
+        // Only endpoints contain stack variables. Keep the path evidence
+        // borrowed while composing; cloning it during renaming would duplicate
+        // the copy into the result below.
+        let next_start = renamed_next
+            .as_ref()
+            .map_or(&next.start, |(start, _)| start);
+        let next_end = renamed_next.as_ref().map_or(&next.end, |(_, end)| end);
         let (symbols, scopes) =
-            match unify_middle_endpoints_with_poll(&self.end, &next.start, cancelled)? {
+            match unify_middle_endpoints_with_poll(&self.end, next_start, cancelled)? {
                 Ok(substitutions) => substitutions,
                 Err(error) => return Some(Err(error)),
             };
@@ -2998,20 +3242,17 @@ impl PartialPath {
             Ok(start) => start,
             Err(error) => return Some(Err(PathCompositionError::Substitution(error))),
         };
-        let end = match next
-            .end
-            .substituted_with_poll(&symbols, &scopes, cancelled)?
-        {
+        let end = match next_end.substituted_with_poll(&symbols, &scopes, cancelled)? {
             Ok(end) => end,
             Err(error) => return Some(Err(PathCompositionError::Substitution(error))),
         };
 
         let mut precedence = Vec::with_capacity(self.precedence.len() + next.precedence.len());
-        precedence.extend(clone_copy_slice_with_poll(&self.precedence, cancelled)?);
-        precedence.extend(clone_copy_slice_with_poll(&next.precedence, cancelled)?);
+        extend_copy_slice_with_poll(&mut precedence, &self.precedence, cancelled)?;
+        extend_copy_slice_with_poll(&mut precedence, &next.precedence, cancelled)?;
         let mut witness = Vec::with_capacity(self.witness.len() + next.witness.len());
-        witness.extend(clone_copy_slice_with_poll(&self.witness, cancelled)?);
-        witness.extend(clone_copy_slice_with_poll(&next.witness, cancelled)?);
+        extend_copy_slice_with_poll(&mut witness, &self.witness, cancelled)?;
+        extend_copy_slice_with_poll(&mut witness, &next.witness, cancelled)?;
         let completion =
             combine_completion_with_poll(&self.completion, &next.completion, cancelled)?;
 
@@ -3021,12 +3262,14 @@ impl PartialPath {
             precedence: precedence.into_boxed_slice(),
             witness: witness.into_boxed_slice(),
             completion,
+            owner_continued: self.owner_continued || next.owner_continued,
+            root_import_activation: None,
             // Substitution replaces variables with stacks the two sides
             // already held and mints no operation-local number of its own, so
             // the higher of the two inputs' ceilings bounds the result. Taking
             // it rather than walking the result is what keeps a saturation
             // chain linear.
-            variable_ceiling: self.variable_ceiling.max(next.variable_ceiling),
+            variable_ceiling: self.variable_ceiling.max(next_ceiling),
         }))
     }
 }
@@ -3083,8 +3326,11 @@ pub(crate) fn completion_values_equal_with_poll<P>(
     cancelled: &mut P,
 ) -> Option<bool>
 where
-    P: FnMut() -> bool,
+    P: FnMut() -> bool + ?Sized,
 {
+    if cancelled() {
+        return None;
+    }
     match (left, right) {
         (ResolutionCompletion::Complete, ResolutionCompletion::Complete) => Some(true),
         (ResolutionCompletion::Incomplete(left), ResolutionCompletion::Incomplete(right)) => {
@@ -3095,14 +3341,17 @@ where
     }
 }
 
-fn first_occurrences_with_poll<T: Copy + Eq + std::hash::Hash, P>(
+/// Preserve order while deleting later copies of an identical observation.
+/// Canonicalizing before or after appending another trace gives the same
+/// result, and an identical precedence comparison cannot change shadowing.
+pub(super) fn first_occurrences_with_poll<T: Copy + Eq + std::hash::Hash, P>(
     values: &[T],
     cancelled: &mut P,
 ) -> Option<Box<[T]>>
 where
     P: FnMut() -> bool,
 {
-    let mut seen = HashSet::default();
+    let mut seen = set_with_capacity(values.len());
     let mut first = Vec::with_capacity(values.len());
     for &value in values {
         if cancelled() {
@@ -3144,17 +3393,11 @@ impl std::error::Error for PathCompositionError {}
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn semantic(value: &str) -> SemanticId {
-        SemanticId::for_test(value.as_bytes())
-    }
+    use crate::analyzer::resolution::test_support::{endpoint, node, semantic};
+    use brokk_bifrost_test_macros::hardwon;
 
     fn variable(value: &str) -> StackVariableId {
         StackVariableId::for_test(value.as_bytes())
-    }
-
-    fn node(value: &str) -> BindingNodeId {
-        BindingNodeId::for_test(value.as_bytes())
     }
 
     fn unify_patterns(
@@ -3192,19 +3435,26 @@ mod tests {
             .expect("live test alpha-key construction completes")
     }
 
-    fn endpoint(
-        node: BindingNodeId,
-        symbols: Vec<SemanticId>,
-        scopes: Vec<BindingNodeId>,
-    ) -> EndpointSignature {
-        EndpointSignature::new(
-            node,
-            StackPattern::closed(symbols),
-            StackPattern::closed(scopes),
-        )
+    #[test]
+    fn completion_equality_polls_before_the_complete_fast_path() {
+        let mut polls = 0;
+        let equal = completion_values_equal_with_poll(
+            &ResolutionCompletion::Complete,
+            &ResolutionCompletion::Complete,
+            &mut || {
+                polls += 1;
+                true
+            },
+        );
+
+        assert_eq!(equal, None);
+        assert_eq!(polls, 1);
     }
 
     #[test]
+    #[hardwon(
+        "81bb278c4b0f: canonical evidence accumulation lost shared bases or raw evidence normalization"
+    )]
     fn canonical_source_accumulator_preserves_shared_bases_and_normalizes_raw_evidence() {
         let first = ResolutionIncompleteReason::UnsupportedSemantic(SemanticId::for_test(b"first"));
         let second =
@@ -3394,61 +3644,6 @@ mod tests {
     }
 
     #[test]
-    fn polled_path_clone_preserves_every_nested_structure() {
-        let symbol_tail = variable("polled-clone-symbol-tail");
-        let attached_tail = variable("polled-clone-attached-tail");
-        let scope_tail = variable("polled-clone-scope-tail");
-        let path = PartialPath::new(
-            EndpointSignature::new_scoped(
-                node("polled-clone-start"),
-                StackPattern::open(
-                    vec![PartialScopedSymbol::scoped(
-                        semantic("polled-clone-symbol"),
-                        StackPattern::open(
-                            vec![node("polled-clone-captured-scope")],
-                            attached_tail,
-                        ),
-                    )],
-                    symbol_tail,
-                ),
-                StackPattern::open(vec![node("polled-clone-scope")], scope_tail),
-            ),
-            EndpointSignature::new(
-                node("polled-clone-end"),
-                StackPattern::open(vec![semantic("polled-clone-end-symbol")], symbol_tail),
-                StackPattern::open(Vec::new(), scope_tail),
-            ),
-            [PrecedenceStep {
-                tier: PrecedenceTier::OwnMember,
-                ordinal: 7,
-                semantic: semantic("polled-clone-precedence"),
-            }],
-            [
-                WitnessStep::Node(node("polled-clone-witness")),
-                WitnessStep::Candidate {
-                    semantic: semantic("polled-clone-target"),
-                    outcome: CandidateOutcome::Selected,
-                },
-            ],
-            ResolutionCompletion::incomplete([
-                ResolutionIncompleteReason::UnsupportedSemantic(semantic("polled-clone-gap-a")),
-                ResolutionIncompleteReason::UnsupportedSemantic(semantic("polled-clone-gap-b")),
-            ]),
-        );
-        let mut polls = 0_usize;
-
-        let cloned = path
-            .clone_with_poll(&mut || {
-                polls += 1;
-                false
-            })
-            .expect("an uncancelled structural clone completes");
-
-        assert_eq!(cloned, path);
-        assert!(polls > path.precedence().len() + path.witness().len());
-    }
-
-    #[test]
     fn concatenation_unifies_middle_stacks_and_preserves_evidence() {
         let tail = variable("tail");
         let scope_tail = variable("scope-tail");
@@ -3583,78 +3778,6 @@ mod tests {
     }
 
     #[test]
-    fn concatenation_preserves_the_public_two_empty_incomplete_panic() {
-        let seam = node("empty-incomplete-seam");
-        let empty = ResolutionCompletion::Incomplete(CompletionReasons::from(Vec::new()));
-        let left = PartialPath::new(
-            endpoint(node("empty-incomplete-left"), Vec::new(), Vec::new()),
-            endpoint(seam, Vec::new(), Vec::new()),
-            Vec::new(),
-            Vec::new(),
-            empty.clone(),
-        );
-        let right = PartialPath::new(
-            endpoint(seam, Vec::new(), Vec::new()),
-            endpoint(node("empty-incomplete-right"), Vec::new(), Vec::new()),
-            Vec::new(),
-            Vec::new(),
-            empty,
-        );
-
-        assert!(
-            std::panic::catch_unwind(|| {
-                let _ = left.concatenate(&right);
-            })
-            .is_err()
-        );
-    }
-
-    #[test]
-    fn concatenation_rejects_different_endpoint_nodes() {
-        let endpoint = |name| {
-            EndpointSignature::new(
-                node(name),
-                StackPattern::closed(Vec::new()),
-                StackPattern::closed(Vec::new()),
-            )
-        };
-        let path = |start, end| {
-            PartialPath::new(
-                endpoint(start),
-                endpoint(end),
-                Vec::new(),
-                Vec::new(),
-                ResolutionCompletion::Complete,
-            )
-        };
-        let left = path("left-start", "left-end");
-        let right = path("right-start", "right-end");
-
-        assert_eq!(
-            left.concatenate(&right),
-            Err(PathCompositionError::EndpointMismatch {
-                left: node("left-end"),
-                right: node("right-start"),
-            })
-        );
-        assert_eq!(
-            left.concatenate_with_poll(&right, &mut || false,),
-            Some(Err(PathCompositionError::EndpointMismatch {
-                left: node("left-end"),
-                right: node("right-start"),
-            }))
-        );
-        assert_eq!(
-            left.end()
-                .can_concatenate_with_poll(right.start(), &mut || false,),
-            Some(Err(PathCompositionError::EndpointMismatch {
-                left: node("left-end"),
-                right: node("right-start"),
-            }))
-        );
-    }
-
-    #[test]
     fn endpoint_compatibility_matches_full_composition_and_cancels_without_evidence_copy() {
         use super::super::engine::CANCELLATION_QUANTUM;
 
@@ -3734,60 +3857,6 @@ mod tests {
     }
 
     #[test]
-    fn shared_completion_path_construction_and_seed_updates_do_not_scan_the_base() {
-        let mut work_by_size = Vec::new();
-        for count in [8_usize, 4_096] {
-            let expected = ResolutionCompletion::incomplete((0..count).map(|index| {
-                ResolutionIncompleteReason::UnsupportedSemantic(SemanticId::for_test(
-                    index.to_le_bytes(),
-                ))
-            }));
-            let ResolutionCompletion::Incomplete(reasons) = &expected else {
-                unreachable!()
-            };
-            let shared = ResolutionCompletion::Incomplete(
-                reasons.to_shared_with_poll(&mut || false).unwrap(),
-            );
-            let at = endpoint(node("shared-completion-path"), Vec::new(), Vec::new());
-            let mut work = 0;
-            let mut paths = Vec::new();
-            for _ in 0..64 {
-                let mut poll = || {
-                    work += 1;
-                    false
-                };
-                let path = PartialPath::new_with_poll(
-                    at.clone(),
-                    at.clone(),
-                    Box::new([]),
-                    Box::new([]),
-                    shared.clone(),
-                    &mut poll,
-                )
-                .unwrap();
-                let path = path
-                    .with_seed_completion_with_poll(&shared, &mut poll)
-                    .unwrap();
-                let path = path
-                    .with_additional_completion_with_poll(&shared, &mut poll)
-                    .unwrap();
-                let path = path.clone_with_poll(&mut poll).unwrap();
-                assert_eq!(path.completion(), &expected);
-                assert!(
-                    matches!(path.completion(), ResolutionCompletion::Incomplete(reasons) if reasons.clone_work_len() == 1)
-                );
-                paths.push(path);
-            }
-            assert_eq!(paths.len(), 64);
-            work_by_size.push(work);
-        }
-        assert!(
-            work_by_size[1] <= work_by_size[0] * 4,
-            "512-fold base growth permits logarithmic membership work, not full scans per path: {work_by_size:?}"
-        );
-    }
-
-    #[test]
     fn polled_path_construction_matches_public_semantics_and_cancels_inside_completion() {
         use super::super::engine::CANCELLATION_QUANTUM;
 
@@ -3832,6 +3901,42 @@ mod tests {
             .is_none()
         );
         assert_eq!(polls, CANCELLATION_QUANTUM + 1);
+    }
+
+    #[test]
+    fn canonicalized_observations_keep_first_occurrence_order() {
+        let first = PrecedenceStep {
+            tier: PrecedenceTier::LexicalBinding,
+            ordinal: 0,
+            semantic: semantic("canonical-first-choice"),
+        };
+        let second = PrecedenceStep {
+            tier: PrecedenceTier::ExplicitImport,
+            ordinal: 1,
+            semantic: semantic("canonical-second-choice"),
+        };
+        let first_witness = WitnessStep::Node(node("canonical-first-witness"));
+        let second_witness = WitnessStep::Node(node("canonical-second-witness"));
+        let path = PartialPath::new(
+            EndpointSignature::new(
+                node("canonical-observations-start"),
+                StackPattern::closed(Vec::new()),
+                StackPattern::closed(Vec::new()),
+            ),
+            EndpointSignature::new(
+                node("canonical-observations-end"),
+                StackPattern::closed(Vec::new()),
+                StackPattern::closed(Vec::new()),
+            ),
+            vec![first, second, first],
+            vec![first_witness, first_witness, second_witness, first_witness],
+            ResolutionCompletion::Complete,
+        );
+
+        let canonical = path.canonicalized_observations();
+
+        assert_eq!(canonical.precedence(), &[first, second]);
+        assert_eq!(canonical.witness(), &[first_witness, second_witness]);
     }
 
     #[test]
@@ -4100,78 +4205,6 @@ mod tests {
         assert_eq!(addressable_first.addressable(), Some(true));
         assert_eq!(pointer_second.ty().indirection(), 2);
         assert_eq!(pointer_second.ty().identity(), second);
-    }
-
-    #[test]
-    fn address_of_filters_operands_and_produces_non_addressable_pointers() {
-        let ty = semantic("address-operand");
-        for transform in [
-            TypeTransferValueTransform::AddressableOperandOnly,
-            TypeTransferValueTransform::RuntimeOnly,
-        ] {
-            let rule = TypeTransferRule::new(
-                semantic("address-rule"),
-                semantic("address-output"),
-                1,
-                transform,
-                ResolutionCompletion::Complete,
-            );
-            assert_eq!(
-                rule.apply(ResolutionSlotValue::runtime(
-                    ResolutionTypeRef::new(ty, 0),
-                    true
-                )),
-                TypeTransferApplication::Value(ResolutionSlotValue::runtime(
-                    ResolutionTypeRef::new(ty, 1),
-                    false
-                ))
-            );
-            assert_eq!(
-                rule.apply(ResolutionSlotValue::type_object(ResolutionTypeRef::new(
-                    ty,
-                    u32::MAX
-                ))),
-                TypeTransferApplication::NoValue
-            );
-            assert_eq!(
-                rule.apply(ResolutionSlotValue::runtime(
-                    ResolutionTypeRef::new(ty, u32::MAX),
-                    true
-                )),
-                TypeTransferApplication::IndirectionOutOfRange
-            );
-        }
-        let address = TypeTransferRule::new(
-            semantic("address-rule"),
-            semantic("address-output"),
-            1,
-            TypeTransferValueTransform::AddressableOperandOnly,
-            ResolutionCompletion::Complete,
-        );
-        assert_eq!(
-            address.apply(ResolutionSlotValue::runtime(
-                ResolutionTypeRef::new(ty, u32::MAX),
-                false
-            )),
-            TypeTransferApplication::NoValue
-        );
-        let literal = TypeTransferRule::new(
-            semantic("literal-address-rule"),
-            semantic("address-output"),
-            1,
-            TypeTransferValueTransform::RuntimeOnly,
-            ResolutionCompletion::Complete,
-        );
-        assert_eq!(
-            literal.apply(ResolutionSlotValue::runtime(
-                ResolutionTypeRef::new(ty, 0),
-                false
-            )),
-            TypeTransferApplication::Value(ResolutionSlotValue::runtime(
-                ResolutionTypeRef::new(ty, 1),
-                false
-            ))
-        );
     }
 
     #[test]

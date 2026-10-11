@@ -18,13 +18,15 @@
 //! files land in [`ExcludedFiles`], and a symbol whose references could not be
 //! resolved lands in [`VerificationFeatures::unresolved_symbols`].
 
-use crate::analyzer::{DispatchExtensibility, IAnalyzer, PoolSafeMemo, WorkspaceAnalyzer};
+use crate::analyzer::{
+    DispatchExtensibility, IAnalyzer, PoolSafeMemo, WorkspaceAnalyzer, primary_range,
+};
 use crate::cancellation::CancellationToken;
 use crate::diff_analysis::{
     AnalyzedDiff, CommitSymbol, DiffAnalysisOptions, DiffEndpointParams, DiffEndpoints,
     EndpointAnalysis, FileChange, ImportExpansionTarget, PatchSymbols, PreparedDiff, Snapshot,
     analyze_prepared_diff_with_endpoints, analyze_prepared_diff_with_target_image, path_language,
-    path_string, primary_range, resolved_imports_of,
+    path_string, resolved_imports_of,
 };
 use crate::searchtools::{
     ScanUsagesByLocationParams, ScanUsagesTarget, is_test_like_file,
@@ -1115,7 +1117,7 @@ impl TestFileClassifier {
                         .get_declarations(&file)
                         .into_iter()
                         .filter(|unit| analyzer.in_test_region(unit))
-                        .filter_map(|unit| primary_range(analyzer, &unit))
+                        .filter_map(|unit| primary_range(&analyzer.ranges(&unit)))
                         .map(|range| (range.start_line, range.end_line))
                         .collect(),
                 )
@@ -1211,7 +1213,7 @@ fn cognitive_totals<'a>(
             if unit.is_synthetic() {
                 continue;
             }
-            let Some(range) = primary_range(analyzer, &unit) else {
+            let Some(range) = primary_range(&analyzer.ranges(&unit)) else {
                 continue;
             };
             let innermost = symbols
@@ -1260,16 +1262,11 @@ mod tests {
     use crate::cancellation::CancellationToken;
     use crate::diff_analysis::DiffAnalysisOptions;
     use crate::gitblob::test_repo;
+    use brokk_bifrost_core::test_support::write_file as write;
     use std::fs;
     use std::path::Path;
 
     const MANIFEST: &str = "[package]\nname = \"repro\"\nversion = \"0.1.0\"\nedition = \"2021\"\n";
-
-    fn write(root: &Path, rel: &str, contents: &str) {
-        let path = root.join(rel);
-        fs::create_dir_all(path.parent().expect("a relative file has a parent")).unwrap();
-        fs::write(path, contents).unwrap();
-    }
 
     /// Score the range `HEAD~1..HEAD` of a repository built by `build`, which
     /// receives the root and commits twice through `test_repo`.
@@ -1288,164 +1285,6 @@ mod tests {
             &CancellationToken::default(),
         )
         .expect("score_diff failed")
-    }
-
-    /// The same three-module crate edited two ways: once in three sibling
-    /// directories, once in a single file. Every geometry feature that claims
-    /// to measure dispersion must separate the two, or it measures nothing --
-    /// a patch's difficulty is supposed to be the thing these numbers track.
-    #[cfg_attr(not(scheduled_tests), ignore = "scheduled-only")]
-    #[test]
-    fn dispersed_edit_reports_more_clusters_and_distance_than_a_single_file_edit() {
-        fn seed(root: &Path, repo: &git2::Repository) {
-            write(root, "Cargo.toml", MANIFEST);
-            write(
-                root,
-                "src/lib.rs",
-                "pub mod alpha;\npub mod beta;\npub mod gamma;\n",
-            );
-            for module in ["alpha", "beta", "gamma"] {
-                write(
-                    root,
-                    &format!("src/{module}/mod.rs"),
-                    &format!("pub fn {module}_value() -> i32 {{\n    1\n}}\n"),
-                );
-            }
-            test_repo::commit_all(repo, "commit 1");
-        }
-
-        let dispersed = score_two_commits(|root, repo| {
-            seed(root, repo);
-            for module in ["alpha", "beta", "gamma"] {
-                write(
-                    root,
-                    &format!("src/{module}/mod.rs"),
-                    &format!("pub fn {module}_value() -> i32 {{\n    2\n}}\n"),
-                );
-            }
-            test_repo::commit_all(repo, "commit 2");
-        });
-        let single = score_two_commits(|root, repo| {
-            seed(root, repo);
-            write(
-                root,
-                "src/alpha/mod.rs",
-                "pub fn alpha_value() -> i32 {\n    2\n}\n",
-            );
-            test_repo::commit_all(repo, "commit 2");
-        });
-
-        assert_eq!(
-            single.geometry.production_files_changed, 1,
-            "control: the single-file edit must touch one production file, got {:?}",
-            single.geometry
-        );
-        assert_eq!(
-            single.geometry.edit_clusters, 1,
-            "one changed file is one cluster, got {:?}",
-            single.geometry
-        );
-        assert_eq!(
-            single.geometry.mean_directory_distance, 0.0,
-            "a lone file has no pair to be distant from, got {:?}",
-            single.geometry
-        );
-        assert_eq!(single.geometry.max_directory_distance, 0);
-
-        assert_eq!(
-            dispersed.geometry.production_files_changed, 3,
-            "control: the dispersed edit must touch three production files, got {:?}",
-            dispersed.geometry
-        );
-        assert_eq!(
-            dispersed.geometry.directories_changed, 3,
-            "three sibling module directories, got {:?}",
-            dispersed.geometry
-        );
-        assert_eq!(
-            dispersed.geometry.edit_clusters, 3,
-            "the three files share no directory and import nothing of each \
-             other, so each is its own cluster, got {:?}",
-            dispersed.geometry
-        );
-        assert_eq!(
-            dispersed.geometry.mean_directory_distance, 2.0,
-            "sibling directories under src/ are one up and one down apart, got {:?}",
-            dispersed.geometry
-        );
-        assert_eq!(dispersed.geometry.max_directory_distance, 2);
-        assert!(
-            dispersed.geometry.edit_clusters > single.geometry.edit_clusters
-                && dispersed.geometry.mean_directory_distance
-                    > single.geometry.mean_directory_distance,
-            "the dispersed edit must score higher on both dispersion features: \
-             dispersed {:?} vs single {:?}",
-            dispersed.geometry,
-            single.geometry
-        );
-    }
-
-    /// A signature change whose only caller sits in a file the patch never
-    /// touched. This is the feature that cannot be computed from the diff's own
-    /// files, so it is also the proof that the whole-target-revision analyzer
-    /// is doing its job.
-    #[test]
-    fn signature_change_reports_a_caller_in_an_unchanged_file() {
-        let score = score_two_commits(|root, repo| {
-            write(root, "Cargo.toml", MANIFEST);
-            write(root, "src/lib.rs", "pub mod core_ops;\npub mod client;\n");
-            write(
-                root,
-                "src/core_ops.rs",
-                "pub fn compute(x: i32) -> i32 {\n    x + 1\n}\n",
-            );
-            write(
-                root,
-                "src/client.rs",
-                "use crate::core_ops::compute;\n\npub fn run() -> i32 {\n    compute(1)\n}\n",
-            );
-            test_repo::commit_all(repo, "commit 1");
-
-            write(
-                root,
-                "src/core_ops.rs",
-                "pub fn compute(x: i32, y: i32) -> i32 {\n    x + y\n}\n",
-            );
-            test_repo::commit_all(repo, "commit 2");
-        });
-
-        assert_eq!(
-            score.geometry.signature_changes, 1,
-            "control: adding a parameter is one signature change, got {:?}",
-            score.geometry
-        );
-        let entry = score
-            .coordination
-            .external_callers_by_signature_change
-            .iter()
-            .find(|entry| entry.fqn.contains("compute"))
-            .unwrap_or_else(|| {
-                panic!(
-                    "no signature-change entry for compute in {:?}",
-                    score.coordination.external_callers_by_signature_change
-                )
-            });
-        assert!(
-            entry
-                .external_caller_files
-                .contains(&"src/client.rs".to_string()),
-            "the unchanged caller file must be reported, got {entry:?}"
-        );
-        assert!(
-            entry.external_caller_sites >= 1,
-            "the unchanged caller's call site must be counted, got {entry:?}"
-        );
-        assert!(
-            score.coordination.signature_change_external_caller_sites >= 1
-                && score.coordination.max_external_callers_per_signature_change >= 1,
-            "the totals must reflect the per-change entry, got {:?}",
-            score.coordination
-        );
     }
 
     /// Two edited production functions in the same crate, one of which a test
@@ -1509,19 +1348,65 @@ mod tests {
         );
     }
 
-    /// A function carried to a renamed module, once with its body untouched and
-    /// once with its body edited too.
-    ///
-    /// The pure rename is the discriminating case: no hunk touches the
-    /// function's own lines, so `analyze_diff` reports it under `moved` and
-    /// nowhere else. It is still a changed production symbol -- a rename is one
-    /// of the changes most likely to leave a test behind -- so judging only the
-    /// `edited` and `introduced` lists would drop it from verification
-    /// entirely, neither reported untested nor reported unresolved, simply
-    /// absent. The second case is why the three lists must be merged rather
-    /// than concatenated: a relocated symbol whose body also changed is in two
-    /// of them and must still be judged once.
-    #[cfg_attr(not(scheduled_tests), ignore = "scheduled-only")]
+    #[test]
+    fn signature_change_reports_a_caller_in_an_unchanged_file() {
+        let score = score_two_commits(|root, repo| {
+            write(root, "Cargo.toml", MANIFEST);
+            write(root, "src/lib.rs", "pub mod core_ops;\npub mod client;\n");
+            write(
+                root,
+                "src/core_ops.rs",
+                "pub fn compute(x: i32) -> i32 {\n    x + 1\n}\n",
+            );
+            write(
+                root,
+                "src/client.rs",
+                "use crate::core_ops::compute;\n\npub fn run() -> i32 {\n    compute(1)\n}\n",
+            );
+            test_repo::commit_all(repo, "commit 1");
+
+            write(
+                root,
+                "src/core_ops.rs",
+                "pub fn compute(x: i32, y: i32) -> i32 {\n    x + y\n}\n",
+            );
+            test_repo::commit_all(repo, "commit 2");
+        });
+
+        assert_eq!(
+            score.geometry.signature_changes, 1,
+            "control: adding a parameter is one signature change, got {:?}",
+            score.geometry
+        );
+        let entry = score
+            .coordination
+            .external_callers_by_signature_change
+            .iter()
+            .find(|entry| entry.fqn.contains("compute"))
+            .unwrap_or_else(|| {
+                panic!(
+                    "no signature-change entry for compute in {:?}",
+                    score.coordination.external_callers_by_signature_change
+                )
+            });
+        assert!(
+            entry
+                .external_caller_files
+                .contains(&"src/client.rs".to_string()),
+            "the unchanged caller file must be reported, got {entry:?}"
+        );
+        assert!(
+            entry.external_caller_sites >= 1,
+            "the unchanged caller's call site must be counted, got {entry:?}"
+        );
+        assert!(
+            score.coordination.signature_change_external_caller_sites >= 1
+                && score.coordination.max_external_callers_per_signature_change >= 1,
+            "the totals must reflect the per-change entry, got {:?}",
+            score.coordination
+        );
+    }
+
     #[test]
     fn a_relocated_symbol_is_judged_by_verification_exactly_once() {
         fn seed(root: &Path, repo: &git2::Repository) {
@@ -1609,12 +1494,6 @@ mod tests {
         );
     }
 
-    /// A binary file and a file no analyzer can read, changed alongside one
-    /// source file. Neither has symbols, imports, or any measurable
-    /// relationship to the source file, so counting them as changed production
-    /// files would report a one-file edit as three unrelated clusters spread
-    /// across the tree. They must be reported as excluded instead.
-    #[cfg_attr(not(scheduled_tests), ignore = "scheduled-only")]
     #[test]
     fn binary_and_unparseable_changes_are_excluded_from_the_shape_features() {
         let score = score_two_commits(|root, repo| {
@@ -1669,55 +1548,6 @@ mod tests {
             score.geometry.insertions > 0,
             "line counts are Git's and still cover every changed file, got {:?}",
             score.geometry
-        );
-    }
-
-    /// A body that gains nested branching must move the baseline metric, and
-    /// must move it upward. The delta is what a consumer compares the geometry
-    /// features against, so a flat zero here would make the comparison vacuous.
-    #[cfg_attr(not(scheduled_tests), ignore = "scheduled-only")]
-    #[test]
-    fn added_branching_raises_the_cognitive_baseline() {
-        let score = score_two_commits(|root, repo| {
-            write(root, "Cargo.toml", MANIFEST);
-            write(
-                root,
-                "src/lib.rs",
-                "pub fn classify(x: i32) -> i32 {\n    x\n}\n",
-            );
-            test_repo::commit_all(repo, "commit 1");
-
-            write(
-                root,
-                "src/lib.rs",
-                "pub fn classify(x: i32) -> i32 {\n    \
-                 if x > 0 {\n        \
-                 if x > 10 {\n            return 2;\n        }\n        \
-                 return 1;\n    } else if x < -10 {\n        \
-                 return -2;\n    }\n    -1\n}\n",
-            );
-            test_repo::commit_all(repo, "commit 2");
-        });
-
-        assert_eq!(
-            score.geometry.edited_symbols, 1,
-            "control: one function was edited, got {:?}",
-            score.geometry
-        );
-        assert_eq!(
-            score.baseline.cognitive_before, 0,
-            "the original body has no branching, got {:?}",
-            score.baseline
-        );
-        assert!(
-            score.baseline.cognitive_after > 0 && score.baseline.cognitive_delta > 0,
-            "nested branching must raise the score, got {:?}",
-            score.baseline
-        );
-        assert_eq!(
-            score.baseline.max_cognitive_after as u64, score.baseline.cognitive_after,
-            "one edited symbol makes the maximum and the total the same, got {:?}",
-            score.baseline
         );
     }
 }

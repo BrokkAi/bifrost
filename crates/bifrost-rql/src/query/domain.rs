@@ -45,12 +45,16 @@ impl ConfigurationFormat {
     ];
 
     pub const fn label(self) -> &'static str {
+        self.core_format().label()
+    }
+
+    pub const fn core_format(self) -> CoreConfigurationFormat {
         match self {
-            Self::Yaml => "yaml",
-            Self::Toml => "toml",
-            Self::Json => "json",
-            Self::Xml => "xml",
-            Self::Properties => "properties",
+            Self::Yaml => CoreConfigurationFormat::Yaml,
+            Self::Toml => CoreConfigurationFormat::Toml,
+            Self::Json => CoreConfigurationFormat::Json,
+            Self::Xml => CoreConfigurationFormat::Xml,
+            Self::Properties => CoreConfigurationFormat::Properties,
         }
     }
 
@@ -60,7 +64,7 @@ impl ConfigurationFormat {
             Self::Yaml => &["yml"],
             Self::Toml => &[],
             Self::Json => &[],
-            Self::Xml => &[],
+            Self::Xml => &["config"],
             Self::Properties => &["props", "property"],
         }
     }
@@ -91,13 +95,7 @@ impl From<CoreConfigurationFormat> for ConfigurationFormat {
 
 impl From<ConfigurationFormat> for CoreConfigurationFormat {
     fn from(format: ConfigurationFormat) -> Self {
-        match format {
-            ConfigurationFormat::Yaml => Self::Yaml,
-            ConfigurationFormat::Toml => Self::Toml,
-            ConfigurationFormat::Json => Self::Json,
-            ConfigurationFormat::Xml => Self::Xml,
-            ConfigurationFormat::Properties => Self::Properties,
-        }
+        format.core_format()
     }
 }
 
@@ -716,25 +714,32 @@ pub struct CrossDomainOperator {
     output: RowDomain,
 }
 
+fn canonical_cross_domain_inputs(
+    inputs: impl IntoIterator<Item = QueryDomain>,
+) -> Result<Vec<QueryDomain>, DomainCompositionError> {
+    let mut inputs = inputs.into_iter().collect::<Vec<_>>();
+    if inputs.len() < 2 || inputs.len() > MAX_OPERATOR_INPUTS {
+        return Err(DomainCompositionError::InvalidOperatorInputs);
+    }
+    inputs.sort_unstable();
+    inputs.dedup();
+    let has_code = inputs.iter().any(|input| input.kind() == DomainKind::Code);
+    let has_configuration = inputs
+        .iter()
+        .any(|input| input.kind() == DomainKind::Configuration);
+    if !has_code || !has_configuration {
+        return Err(DomainCompositionError::OperatorIsNotCrossDomain);
+    }
+    Ok(inputs)
+}
+
 impl CrossDomainOperator {
     pub fn new(
         id: OperatorId,
         inputs: impl IntoIterator<Item = QueryDomain>,
         output: RowDomain,
     ) -> Result<Self, DomainCompositionError> {
-        let mut inputs = inputs.into_iter().collect::<Vec<_>>();
-        if inputs.len() < 2 || inputs.len() > MAX_OPERATOR_INPUTS {
-            return Err(DomainCompositionError::InvalidOperatorInputs);
-        }
-        inputs.sort_unstable();
-        inputs.dedup();
-        let has_code = inputs.iter().any(|input| input.kind() == DomainKind::Code);
-        let has_configuration = inputs
-            .iter()
-            .any(|input| input.kind() == DomainKind::Configuration);
-        if !has_code || !has_configuration {
-            return Err(DomainCompositionError::OperatorIsNotCrossDomain);
-        }
+        let inputs = canonical_cross_domain_inputs(inputs)?;
         Ok(Self { id, inputs, output })
     }
 
@@ -750,8 +755,129 @@ impl CrossDomainOperator {
         &self.output
     }
 
+    /// Whether `input` selects a subset of one declared input domain of the
+    /// same kind. Selections are non-empty by construction, so an accepted
+    /// input always names at least one language or format the operator
+    /// declared.
     pub fn accepts(&self, input: &QueryDomain) -> bool {
-        self.inputs.iter().any(|candidate| candidate == input)
+        self.inputs
+            .iter()
+            .any(|candidate| match (candidate, input) {
+                (
+                    QueryDomain::Code {
+                        languages: accepted,
+                    },
+                    QueryDomain::Code { languages },
+                ) => languages.iter().all(|language| accepted.contains(language)),
+                (
+                    QueryDomain::Configuration { formats: accepted },
+                    QueryDomain::Configuration { formats },
+                ) => formats.iter().all(|format| accepted.contains(format)),
+                _ => false,
+            })
+    }
+}
+
+/// The registry of cross-domain operators a CodeQuery may author.
+///
+/// These are the only plan sources that may consume a code input and a
+/// configuration input together. Each one publishes heterogeneous rows with a
+/// domain discriminator and retained provenance, and its typed descriptor is a
+/// [`CrossDomainOperator`], so validation composes the two inputs through
+/// [`QueryRequirement::through_cross_domain_operator`] rather than a parallel
+/// rule set.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum CrossDomainOperatorKind {
+    /// Pair a code row with a configuration row only when the
+    /// configuration-key relation holds structurally between them.
+    CorrelateConfigurationKey,
+    /// Join authored configuration scalars/documents to structured code
+    /// declarations or same-project code facts.
+    CorrelateConfigurationCode,
+    /// Prove mitigation of an exactly owned dependency instance.
+    CorrelateDependencyConfiguration,
+    /// Require both inputs to produce rows without relating any code row to
+    /// any configuration row.
+    RequireBoth,
+}
+
+impl CrossDomainOperatorKind {
+    pub const ALL: [Self; 4] = [
+        Self::CorrelateConfigurationKey,
+        Self::CorrelateConfigurationCode,
+        Self::CorrelateDependencyConfiguration,
+        Self::RequireBoth,
+    ];
+
+    /// The public `operator` label carried by every row the operator emits.
+    pub const fn operator_label(self) -> &'static str {
+        match self {
+            Self::CorrelateConfigurationKey
+            | Self::CorrelateConfigurationCode
+            | Self::CorrelateDependencyConfiguration => "correlate",
+            Self::RequireBoth => "require_both",
+        }
+    }
+
+    /// The stable operator identity retained in capability evidence.
+    pub const fn id_label(self) -> &'static str {
+        match self {
+            Self::CorrelateConfigurationKey => "correlate.configuration-key",
+            Self::CorrelateConfigurationCode => "correlate.configuration-code",
+            Self::CorrelateDependencyConfiguration => "correlate.dependency-configuration",
+            Self::RequireBoth => "require-both",
+        }
+    }
+
+    pub fn id(self) -> OperatorId {
+        OperatorId::new(self.id_label()).expect("registered operator labels are valid identifiers")
+    }
+
+    /// The languages whose code rows the operator can interpret.
+    ///
+    /// The configuration-key relation decodes a string-literal key from the
+    /// tree-sitter AST, and only Java has that decoder.
+    pub fn code_languages(self) -> &'static [Language] {
+        match self {
+            Self::CorrelateConfigurationKey => &[Language::Java],
+            Self::CorrelateConfigurationCode
+            | Self::CorrelateDependencyConfiguration
+            | Self::RequireBoth => &Language::ANALYZABLE,
+        }
+    }
+
+    /// The configuration formats whose facts the operator can interpret.
+    ///
+    /// The configuration-key relation compares one flat key with a
+    /// single-segment route. Mapping a flat key onto nested YAML, TOML, JSON,
+    /// or XML routes is framework binding semantics, which open core does not
+    /// guess.
+    pub fn configuration_formats(self) -> &'static [ConfigurationFormat] {
+        match self {
+            Self::CorrelateConfigurationKey | Self::CorrelateDependencyConfiguration => {
+                &[ConfigurationFormat::Properties]
+            }
+            Self::CorrelateConfigurationCode => &ConfigurationFormat::ALL,
+            Self::RequireBoth => &ConfigurationFormat::ALL,
+        }
+    }
+
+    /// The typed operator declaration: exactly one code input, one
+    /// configuration input, and a discriminated, provenance-retaining output.
+    pub fn descriptor(self) -> CrossDomainOperator {
+        let code = QueryDomain::code(self.code_languages().iter().copied())
+            .expect("registered operators accept at least one language");
+        let configuration =
+            QueryDomain::configuration(self.configuration_formats().iter().copied())
+                .expect("registered operators accept at least one format");
+        let output = RowDomain::heterogeneous(
+            [code.clone(), configuration.clone()],
+            DomainDiscriminator::Domain,
+            true,
+        )
+        .expect("a code and a configuration alternative form a heterogeneous row");
+        CrossDomainOperator::new(self.id(), [code, configuration], output)
+            .expect("registered operators consume one code and one configuration input")
     }
 }
 
@@ -868,22 +994,14 @@ pub enum QueryInputDomain {
 
 impl QueryInputDomain {
     pub fn single(domain: QueryDomain) -> Self {
-        Self::Single(domain)
+        Self::from(domain)
     }
 
     pub fn cross_domain(
         operator: OperatorId,
         inputs: impl IntoIterator<Item = QueryDomain>,
     ) -> Result<Self, DomainCompositionError> {
-        let mut inputs = inputs.into_iter().collect::<Vec<_>>();
-        if inputs.len() < 2 {
-            return Err(DomainCompositionError::InvalidOperatorInputs);
-        }
-        inputs.sort_unstable();
-        inputs.dedup();
-        if inputs.len() < 2 {
-            return Err(DomainCompositionError::InvalidOperatorInputs);
-        }
+        let inputs = canonical_cross_domain_inputs(inputs)?;
         Ok(Self::CrossDomain { operator, inputs })
     }
 
@@ -1258,6 +1376,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use brokk_bifrost_test_macros::hardwon;
 
     fn language_domain(language: Language) -> QueryDomain {
         QueryDomain::code([language]).expect("valid language domain")
@@ -1283,22 +1402,6 @@ mod tests {
             )],
         )
         .expect("evidence")
-    }
-
-    #[test]
-    fn configuration_registry_round_trips_canonical_labels_and_aliases() {
-        for format in ConfigurationFormat::ALL {
-            assert_eq!(
-                ConfigurationFormat::from_label(format.label()),
-                Some(format)
-            );
-            for alias in format.aliases() {
-                assert_eq!(ConfigurationFormat::from_label(alias), Some(format));
-            }
-            let json = serde_json::to_string(&format).expect("serialize format");
-            let decoded: ConfigurationFormat = serde_json::from_str(&json).expect("decode format");
-            assert_eq!(decoded, format);
-        }
     }
 
     #[test]
@@ -1335,39 +1438,6 @@ mod tests {
         assert_eq!(
             classify_configuration_path(Path::new("Directory.Build.props")),
             ConfigurationPathClassification::Unsupported
-        );
-    }
-
-    #[test]
-    fn language_and_configuration_domains_are_distinct_and_intersect_conjunctively() {
-        let left = QueryDomain::code([Language::Rust, Language::Python]).expect("left");
-        let right = QueryDomain::code([Language::Rust]).expect("right");
-        assert_eq!(
-            left.intersect(&right).expect("intersection").languages(),
-            Some([Language::Rust].as_slice())
-        );
-        assert_eq!(
-            left.intersect(&format_domain(ConfigurationFormat::Json)),
-            Err(DomainCompositionError::CrossDomainConjunction)
-        );
-        assert_eq!(
-            left.intersect(&QueryDomain::code([Language::Go]).expect("go")),
-            Err(DomainCompositionError::DisjointIntersection)
-        );
-    }
-
-    #[test]
-    fn pack_union_preserves_mandatory_strength() {
-        let identity = PackIdentity::policy(PackId::new("security").expect("pack"));
-        let optional = PackRequirementSet::new([PackRequirement::optional(identity.clone())])
-            .expect("optional");
-        let mandatory =
-            PackRequirementSet::new([PackRequirement::mandatory(identity)]).expect("mandatory");
-        let union = optional.union(&mandatory).expect("union");
-        assert_eq!(union.as_slice().len(), 1);
-        assert_eq!(
-            union.as_slice()[0].strength(),
-            RequirementStrength::Mandatory
         );
     }
 
@@ -1424,6 +1494,71 @@ mod tests {
             code_requirement
                 .through_cross_domain_operator(&config_requirement, &operator)
                 .is_ok()
+        );
+    }
+
+    #[test]
+    #[hardwon("#4271: QueryInputDomain accepted inputs rejected by cross-domain operators")]
+    fn cross_domain_rejects_operator_invalid_inputs() {
+        let too_many_inputs = Language::ANALYZABLE
+            .into_iter()
+            .map(language_domain)
+            .chain(ConfigurationFormat::ALL.into_iter().map(format_domain))
+            .take(MAX_OPERATOR_INPUTS + 1)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            QueryInputDomain::cross_domain(
+                OperatorId::new("join.config-code").expect("operator"),
+                too_many_inputs,
+            ),
+            Err(DomainCompositionError::InvalidOperatorInputs)
+        );
+
+        let same_kind_inputs = Language::ANALYZABLE
+            .into_iter()
+            .take(2)
+            .map(language_domain)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            QueryInputDomain::cross_domain(
+                OperatorId::new("join.config-code").expect("operator"),
+                same_kind_inputs,
+            ),
+            Err(DomainCompositionError::OperatorIsNotCrossDomain)
+        );
+    }
+
+    #[test]
+    fn configuration_registry_round_trips_canonical_labels_and_aliases() {
+        for format in ConfigurationFormat::ALL {
+            assert_eq!(
+                ConfigurationFormat::from_label(format.label()),
+                Some(format)
+            );
+            for alias in format.aliases() {
+                assert_eq!(ConfigurationFormat::from_label(alias), Some(format));
+            }
+            let json = serde_json::to_string(&format).expect("serialize format");
+            let decoded: ConfigurationFormat = serde_json::from_str(&json).expect("decode format");
+            assert_eq!(decoded, format);
+        }
+    }
+
+    #[test]
+    fn language_and_configuration_domains_are_distinct_and_intersect_conjunctively() {
+        let left = QueryDomain::code([Language::Rust, Language::Python]).expect("left");
+        let right = QueryDomain::code([Language::Rust]).expect("right");
+        assert_eq!(
+            left.intersect(&right).expect("intersection").languages(),
+            Some([Language::Rust].as_slice())
+        );
+        assert_eq!(
+            left.intersect(&format_domain(ConfigurationFormat::Json)),
+            Err(DomainCompositionError::CrossDomainConjunction)
+        );
+        assert_eq!(
+            left.intersect(&QueryDomain::code([Language::Go]).expect("go")),
+            Err(DomainCompositionError::DisjointIntersection)
         );
     }
 

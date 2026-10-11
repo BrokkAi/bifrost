@@ -26,33 +26,13 @@
 use super::*;
 use brokk_bifrost_cpp::compile_context::CompiledLanguage;
 use brokk_bifrost_cpp::graph_support::CppSource;
+pub(crate) use brokk_bifrost_cpp::imports::is_cpp_translation_unit;
 use brokk_bifrost_cpp::imports::{
     canonical_include_statement, extract_type_identifiers, resolve_include_targets_with_index,
 };
 use std::collections::VecDeque;
 use std::path::Path;
 use std::sync::Arc;
-
-/// Extensions [`Language::Cpp`] claims that are headers, not translation
-/// units. Everything else in [`Language::Cpp::extensions`] (`c`, `cc`, `cpp`,
-/// `cxx`) is a translation unit -- see [`is_cpp_translation_unit`]. `hin` is
-/// the C header-template spelling (krb5's `krb5.hin`), so it is a header too.
-const CPP_HEADER_EXTENSIONS: &[&str] = &["h", "hin", "hpp", "hh", "hxx"];
-
-/// Whether `file` is a C/C++ translation unit (as opposed to a header): one of
-/// [`Language::Cpp::extensions`] that is not in [`CPP_HEADER_EXTENSIONS`].
-/// Matched case-insensitively, the same normalization `Language::from_extension`
-/// applies.
-pub(crate) fn is_cpp_translation_unit(file: &ProjectFile) -> bool {
-    file.rel_path()
-        .extension()
-        .and_then(|extension| extension.to_str())
-        .map(|extension| extension.to_ascii_lowercase())
-        .is_some_and(|extension| {
-            Language::Cpp.extensions().contains(&extension.as_str())
-                && !CPP_HEADER_EXTENSIONS.contains(&extension.as_str())
-        })
-}
 
 /// What a compile configuration or a workspace extension says about the
 /// language(s) that reach one header, reduced to the four attribution states.
@@ -75,9 +55,8 @@ fn attribution_from_languages(
     }
 }
 
-/// Which language(s) provably compile a header, evidence-ranked per the
-/// ExecPlan (`.agents/plans/c-compilation-language-tag-scope.md`, Milestone
-/// 2): pure infrastructure -- no resolution surface reads this yet.
+/// Which language(s) provably compile a header, evidence-ranked. This is pure
+/// infrastructure; no resolution surface reads it yet.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HeaderLanguageAttribution {
     /// Every translation unit that reaches this header (by compile-database
@@ -673,14 +652,11 @@ impl TranslationUnitSet {
     }
 
     fn is_empty(&self) -> bool {
-        self.words.iter().all(|word| *word == 0)
+        brokk_bifrost_core::analyzer::common::packed_bits_is_empty(&self.words)
     }
 
     fn len(&self) -> usize {
-        self.words
-            .iter()
-            .map(|word| word.count_ones() as usize)
-            .sum()
+        brokk_bifrost_core::analyzer::common::packed_bits_len(&self.words)
     }
 
     fn iter(&self) -> impl Iterator<Item = usize> + '_ {

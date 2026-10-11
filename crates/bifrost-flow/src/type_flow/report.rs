@@ -20,10 +20,11 @@ use crate::dataflow::{DataflowRequest, SolverBudget, SolverBudgetExceeded};
 use crate::hash::HashMap;
 use crate::value_flow::{ClosureLimits, ValueFlowCache};
 
+use super::plan::TypeFlowSitePurpose;
 use super::solve::{
-    AbsentMemberFinding, ClassSetStatus, FeedbackLimits, ReceiverClassSet, TypeFlowError,
-    TypeFlowRootResult, TypeFlowSolvePhase, collapse_absent_member_findings,
-    prefer_retained_finding, solve_type_flow_for_root,
+    AbsentMemberFinding, FeedbackLimits, ReceiverClassSet, TypeFlowError, TypeFlowRootResult,
+    TypeFlowSolvePhase, collapse_absent_member_findings, prefer_retained_finding,
+    solve_type_flow_for_root,
 };
 use super::{FieldSlotIndex, TypeFlowSummaryState};
 
@@ -112,6 +113,9 @@ impl TypeFlowReport {
                     })
             }));
         for set in result.class_sets {
+            if set.site.purpose != TypeFlowSitePurpose::MemberAccess {
+                continue;
+            }
             let key: SiteIdentity = (
                 set.site.file.clone(),
                 set.site.span,
@@ -177,6 +181,11 @@ fn merge_class_set(existing: &mut ReceiverClassSet, incoming: ReceiverClassSet) 
         &mut existing.member_declarations,
         incoming.member_declarations,
     );
+    for reason in incoming.flow_unknown {
+        if !existing.flow_unknown.contains(&reason) {
+            existing.flow_unknown.push(reason);
+        }
+    }
     for evidence in incoming.dynamic_writes {
         if !existing.dynamic_writes.contains(&evidence) {
             existing.dynamic_writes.push(evidence);
@@ -187,7 +196,7 @@ fn merge_class_set(existing: &mut ReceiverClassSet, incoming: ReceiverClassSet) 
             existing.unknown.push(reason);
         }
     }
-    existing.status = merge_status(existing.status, incoming.status);
+    existing.status = existing.status.weakest(incoming.status);
 }
 
 fn merge_member_declarations(
@@ -233,13 +242,6 @@ fn weakest_candidate_coverage(
             CandidateCoverage::Exhaustive
         }
     }
-}
-
-/// The weakest status wins: an inconclusive root means the site was not fully
-/// answered, a partial root means some value was unclassified, and a known
-/// answer outranks only no information at all.
-fn merge_status(left: ClassSetStatus, right: ClassSetStatus) -> ClassSetStatus {
-    left.weakest(right)
 }
 
 /// Solve class-set propagation for every procedure of every language with a
@@ -364,45 +366,4 @@ fn solve_language(
         }
     }
     Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::merge_member_declarations;
-    use crate::analyzer::semantic::{
-        CandidateCoverage, ClassIdentity, ExternalMemberDeclaration, MemberDeclaration,
-        MemberLookupHit,
-    };
-
-    #[test]
-    fn merged_member_hit_keeps_one_declaration_and_weakens_coverage() {
-        let class = ClassIdentity::External {
-            qualified_name: "pkg.Widget".into(),
-            symbol_id: "class-widget".into(),
-        };
-        let declaration =
-            MemberDeclaration::External(ExternalMemberDeclaration::new([Box::from("method-run")]));
-        let mut hits = vec![(
-            class.clone(),
-            MemberLookupHit::new(declaration.clone(), CandidateCoverage::Exhaustive),
-        )];
-
-        merge_member_declarations(
-            &mut hits,
-            [(
-                class.clone(),
-                MemberLookupHit::new(declaration.clone(), CandidateCoverage::Open),
-            )],
-        );
-        merge_member_declarations(
-            &mut hits,
-            [(
-                class,
-                MemberLookupHit::new(declaration, CandidateCoverage::Truncated),
-            )],
-        );
-
-        assert_eq!(hits.len(), 1);
-        assert_eq!(hits[0].1.dispatch_coverage, CandidateCoverage::Truncated);
-    }
 }

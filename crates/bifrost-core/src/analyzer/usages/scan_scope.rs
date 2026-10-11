@@ -10,6 +10,7 @@ use crate::hash::HashSet;
 pub struct UsageScanScope<'a> {
     candidate_files: &'a HashSet<ProjectFile>,
     cancellation: Option<&'a CancellationToken>,
+    include_tests: bool,
 }
 
 impl<'a> UsageScanScope<'a> {
@@ -17,6 +18,7 @@ impl<'a> UsageScanScope<'a> {
         Self {
             candidate_files,
             cancellation: None,
+            include_tests: true,
         }
     }
 
@@ -27,11 +29,22 @@ impl<'a> UsageScanScope<'a> {
         Self {
             candidate_files,
             cancellation: Some(cancellation),
+            include_tests: true,
         }
+    }
+
+    /// Set whether test source participates in this usage query's inventory.
+    pub fn with_test_inclusion(mut self, include_tests: bool) -> Self {
+        self.include_tests = include_tests;
+        self
     }
 
     pub fn candidate_files(&self) -> &'a HashSet<ProjectFile> {
         self.candidate_files
+    }
+
+    pub const fn includes_tests(&self) -> bool {
+        self.include_tests
     }
 
     pub fn allows(&self, file: &ProjectFile) -> bool {
@@ -43,7 +56,6 @@ impl<'a> UsageScanScope<'a> {
     }
 
     pub fn is_cancelled(&self) -> bool {
-        self.cancellation
-            .is_some_and(CancellationToken::is_cancelled)
+        crate::cancellation::optional_is_cancelled(self.cancellation)
     }
 }

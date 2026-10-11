@@ -5,6 +5,7 @@ use std::path::{Component, Path, PathBuf};
 
 use sha2::{Digest, Sha256};
 
+use super::ir::{EvidenceCompleteness, ProofStatus};
 use crate::analyzer::dense_id::define_dense_id;
 
 pub use crate::analyzer::LanguageDialect as SemanticLanguage;
@@ -62,6 +63,7 @@ dense_ids! {
     SemanticGapId,
     GuardId,
     SwitchFactId,
+    PointerOriginId,
 }
 
 /// One stable SHA-256 digest. Domain-specific wrappers prevent accidental key mixing.
@@ -80,10 +82,9 @@ impl StableDigest {
     }
 
     pub fn sha256(bytes: impl AsRef<[u8]>) -> Self {
-        let digest = Sha256::digest(bytes.as_ref());
-        let mut value = [0_u8; 32];
-        value.copy_from_slice(&digest);
-        Self(value)
+        Self(crate::analyzer::canonical_hash::sha256_bytes(
+            bytes.as_ref(),
+        ))
     }
 
     pub const fn as_bytes(&self) -> &[u8; 32] {
@@ -93,10 +94,7 @@ impl StableDigest {
 
 impl fmt::Display for StableDigest {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        for byte in self.0 {
-            write!(formatter, "{byte:02x}")?;
-        }
-        Ok(())
+        brokk_bifrost_core::analyzer::canonical_hash::write_lower_hex(&self.0, formatter)
     }
 }
 
@@ -172,7 +170,7 @@ impl StructuralNodeIdentity {
 
     /// Alias for callers that use the structural fact vocabulary directly.
     pub const fn node_id(self) -> u32 {
-        self.normalized_node_id
+        self.normalized_node_id()
     }
 }
 
@@ -188,6 +186,19 @@ impl WorkspaceMountId {
 pub const SEMANTIC_IR_SCHEMA_DOMAIN: &[u8] = b"bifrost-language-neutral-semantic-ir";
 
 /// Current language-neutral semantic IR schema revision.
+/// Revision 45 adds call receiver type facts: the written receiver type of a
+/// method call as the file alone proves it, so a query can apply model
+/// contracts at the call port instead of the lowerer applying them during
+/// lowering. This is what lets a blob's lowered IR be stored as rows that
+/// depend on nothing but the file's bytes and the producer version.
+/// Revision 43 adds typed lifecycle and pointer provenance relations.
+/// Revision 42 carries conditional Go predeclared-builtin package-scope proofs.
+///
+/// Revision 40 adds two gap discharges: `InertDropGlue`, for an omitted
+/// implicit drop of parameters and `let` bindings that a language proof can
+/// show runs no user code, and `NonRejoiningExceptionalExitAfterInertDrops`,
+/// for an abort whose only active cleanups are those drops.
+///
 /// Revision 39 adds explicit pointer-dereference memory locations and accesses.
 ///
 /// Revision 38 records module-qualified callable references whose namespace
@@ -232,7 +243,7 @@ pub const SEMANTIC_IR_SCHEMA_DOMAIN: &[u8] = b"bifrost-language-neutral-semantic
 /// and every wire id derived from one rotates exactly once when this constant
 /// moves; that is a mechanical consequence of extending the IR, not a signal
 /// that anything else changed.
-pub const SEMANTIC_IR_SCHEMA_VERSION: u32 = 39;
+pub const SEMANTIC_IR_SCHEMA_VERSION: u32 = 45;
 
 impl SemanticIrVersion {
     /// The contract-owned fingerprint shared by every language adapter that
@@ -641,6 +652,11 @@ impl SourceAnchor {
     }
 }
 
+/// Name of the `Initializer` segment for a synthetic whole-file procedure
+/// (a Ruby or JS/TS program body). Structural lookup uses it to recognize the
+/// file root when a top-level callable has the same source span.
+pub const FILE_INITIALIZER_SEGMENT_NAME: &str = "<file>";
+
 /// A normalized declaration-path segment kind.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum DeclarationSegmentKind {
@@ -767,6 +783,10 @@ impl DeclarationLocator {
     pub fn segments(&self) -> &[DeclarationSegment] {
         &self.0
     }
+
+    pub fn last_segment_name(&self) -> Option<&str> {
+        self.0.last().and_then(|segment| segment.name())
+    }
 }
 
 /// The source-facing role of a semantic locator.
@@ -805,6 +825,11 @@ impl SemanticRole {
     }
 }
 
+/// Workspace path of every Rust field-member identity. The path is synthetic
+/// and no source file owns it, so a member locator with this path names one
+/// field in every artifact.
+pub const RUST_FIELD_MEMBER_PATH: &str = "__bifrost__/rust-field-members";
+
 /// A remappable source-facing semantic locator. It is not a cache-validity key.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct SemanticLocator {
@@ -835,6 +860,18 @@ impl SemanticLocator {
         }
     }
 
+    /// Build a memory-location locator with this locator's source identity.
+    pub(crate) fn memory_location_at(&self, anchor: SourceAnchor) -> Self {
+        Self::new(
+            self.mount,
+            self.path.clone(),
+            self.language,
+            self.declaration.clone(),
+            SemanticRole::MemoryLocation,
+            anchor,
+        )
+    }
+
     pub const fn mount(&self) -> WorkspaceMountId {
         self.mount
     }
@@ -857,6 +894,13 @@ impl SemanticLocator {
 
     pub const fn anchor(&self) -> SourceAnchor {
         self.anchor
+    }
+
+    /// Whether this locator names a field member that no artifact owns: the
+    /// Rust field-member identity, which is the same entity wherever it is
+    /// read. Every other locator is tied to the artifact that holds it.
+    pub fn is_artifact_independent_field(&self) -> bool {
+        self.path.as_str() == RUST_FIELD_MEMBER_PATH
     }
 
     /// Whether this locator belongs to the same structured procedure
@@ -925,13 +969,7 @@ impl SemanticLocator {
                 return;
             };
             digest.push(b"procedure-local-locator");
-            digest.push(self.path.as_str().as_bytes());
-            digest.push(self.language.stable_label().as_bytes());
-            digest.push(self.role.stable_label().as_bytes());
-            digest.push(&start.to_le_bytes());
-            digest.push(&end.to_le_bytes());
-            digest.push(&self.anchor.occurrence().to_le_bytes());
-            push_declaration_shape(digest, &self.declaration);
+            self.push_local_identity_fields(digest, start, end);
         } else {
             digest.push(b"external-locator");
             self.push_stable_identity(digest);
@@ -961,6 +999,10 @@ impl SemanticLocator {
             .checked_sub(owner_start)
             .expect("a procedure-owned locator ends within its declaration");
         digest.push(b"enclosing-procedure-local-locator");
+        self.push_local_identity_fields(digest, start, end);
+    }
+
+    fn push_local_identity_fields(&self, digest: &mut LengthDelimitedDigest, start: u32, end: u32) {
         digest.push(self.path.as_str().as_bytes());
         digest.push(self.language.stable_label().as_bytes());
         digest.push(self.role.stable_label().as_bytes());
@@ -1006,22 +1048,34 @@ fn declaration_shapes_equal(left: &DeclarationLocator, right: &DeclarationLocato
             })
 }
 
-fn push_declaration_shape(digest: &mut LengthDelimitedDigest, declaration: &DeclarationLocator) {
+/// Append a declaration locator's stable shape, excluding source anchors.
+pub fn push_declaration_shape(
+    digest: &mut LengthDelimitedDigest,
+    declaration: &DeclarationLocator,
+) {
     digest.push(
         &u64::try_from(declaration.segments().len())
             .expect("declaration segment count fits in u64")
             .to_le_bytes(),
     );
+    for_each_declaration_lineage_part(declaration, |part| digest.push(part));
+}
+
+/// Visit the anchor-free parts that identify a declaration's lineage.
+pub fn for_each_declaration_lineage_part(
+    declaration: &DeclarationLocator,
+    mut push: impl FnMut(&[u8]),
+) {
     for segment in declaration.segments() {
-        digest.push(segment.kind().stable_label().as_bytes());
+        push(segment.kind().stable_label().as_bytes());
         match segment.name() {
             Some(name) => {
-                digest.push(b"named");
-                digest.push(name.as_bytes());
+                push(b"named");
+                push(name.as_bytes());
             }
-            None => digest.push(b"anonymous"),
+            None => push(b"anonymous"),
         }
-        digest.push(&segment.sibling_ordinal().to_le_bytes());
+        push(&segment.sibling_ordinal().to_le_bytes());
     }
 }
 
@@ -1111,11 +1165,7 @@ impl SemanticArtifactKey {
                 digest.push(snapshot.as_bytes());
             }
         }
-        digest.push(self.adapter.name().as_bytes());
-        digest.push(self.adapter.fingerprint().as_bytes());
-        digest.push(self.ir_version.as_bytes());
-        digest.push(self.configuration.as_bytes());
-        digest.push(self.dependencies.as_bytes());
+        self.push_environment_identity(&mut digest);
         digest.finish()
     }
 
@@ -1131,11 +1181,7 @@ impl SemanticArtifactKey {
         digest.push(self.path.as_str().as_bytes());
         digest.push(self.language.stable_label().as_bytes());
         digest.push(self.revision.content().as_bytes());
-        digest.push(self.adapter.name().as_bytes());
-        digest.push(self.adapter.fingerprint().as_bytes());
-        digest.push(self.ir_version.as_bytes());
-        digest.push(self.configuration.as_bytes());
-        digest.push(self.dependencies.as_bytes());
+        self.push_environment_identity(&mut digest);
         digest.finish()
     }
 
@@ -1148,12 +1194,16 @@ impl SemanticArtifactKey {
         let mut digest = LengthDelimitedDigest::new(b"bifrost-semantic-procedure-environment-v1");
         digest.push(self.path.as_str().as_bytes());
         digest.push(self.language.stable_label().as_bytes());
+        self.push_environment_identity(&mut digest);
+        digest.finish()
+    }
+
+    fn push_environment_identity(&self, digest: &mut LengthDelimitedDigest) {
         digest.push(self.adapter.name().as_bytes());
         digest.push(self.adapter.fingerprint().as_bytes());
         digest.push(self.ir_version.as_bytes());
         digest.push(self.configuration.as_bytes());
         digest.push(self.dependencies.as_bytes());
-        digest.finish()
     }
 
     /// Stable lineage of one procedure declaration in this artifact's
@@ -1166,17 +1216,7 @@ impl SemanticArtifactKey {
     pub fn procedure_lineage_fingerprint(&self, declaration: &DeclarationLocator) -> StableDigest {
         let mut digest = LengthDelimitedDigest::new(b"bifrost-procedure-summary-lineage-v1");
         digest.push(self.procedure_environment_fingerprint().as_bytes());
-        for segment in declaration.segments() {
-            digest.push(segment.kind().stable_label().as_bytes());
-            match segment.name() {
-                Some(name) => {
-                    digest.push(b"named");
-                    digest.push(name.as_bytes());
-                }
-                None => digest.push(b"anonymous"),
-            }
-            digest.push(&segment.sibling_ordinal().to_le_bytes());
-        }
+        for_each_declaration_lineage_part(declaration, |part| digest.push(part));
         digest.finish()
     }
 }
@@ -1186,16 +1226,11 @@ pub struct LengthDelimitedDigest(Sha256);
 
 impl LengthDelimitedDigest {
     pub fn new(domain: &[u8]) -> Self {
-        let mut value = Self(Sha256::new());
-        value.push(domain);
-        value
+        Self(crate::analyzer::digest::new_length_delimited_sha256(domain))
     }
 
     pub fn push(&mut self, value: &[u8]) {
-        let length =
-            u64::try_from(value.len()).expect("semantic identity input length fits in u64");
-        self.0.update(length.to_le_bytes());
-        self.0.update(value);
+        crate::analyzer::digest::update_length_delimited_sha256(&mut self.0, value);
     }
 
     pub fn push_anchor(&mut self, anchor: SourceAnchor) {
@@ -1221,60 +1256,51 @@ impl LengthDelimitedDigest {
     }
 }
 
+/// Fingerprint one numeric semantics version under a length-delimited domain.
+pub(crate) fn versioned_dependency_fingerprint(
+    domain: &[u8],
+    version: i64,
+) -> DependencyFingerprint {
+    let mut digest = LengthDelimitedDigest::new(domain);
+    digest.push(&version.to_le_bytes());
+    DependencyFingerprint::from_digest(digest.finish())
+}
+
+pub(crate) fn push_optional_bytes(digest: &mut LengthDelimitedDigest, value: Option<&[u8]>) {
+    match value {
+        Some(value) => {
+            digest.push(b"some");
+            digest.push(value);
+        }
+        None => digest.push(b"none"),
+    }
+}
+
+/// Append a proof status using the canonical length-delimited encoding.
+pub fn push_proof_status(digest: &mut LengthDelimitedDigest, proof: &ProofStatus) {
+    digest.push(proof.label().as_bytes());
+    if let ProofStatus::Unproven(reason) = proof {
+        digest.push(reason.as_bytes());
+    }
+}
+
+/// Append evidence completeness using the canonical length-delimited encoding.
+pub fn push_evidence_completeness(
+    digest: &mut LengthDelimitedDigest,
+    completeness: &EvidenceCompleteness,
+) {
+    digest.push(completeness.label().as_bytes());
+    if let EvidenceCompleteness::Partial(reason) = completeness {
+        digest.push(reason.as_bytes());
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use std::collections::HashSet;
     use std::path::Path;
 
     use super::*;
     use crate::analyzer::Language;
-
-    #[test]
-    fn dense_ids_are_fixed_width_checked_and_not_interchangeable() {
-        let procedure = ProcedureId::try_from_index(17).unwrap();
-        let control_edge = ControlEdgeId::try_from_index(17).unwrap();
-        assert_eq!(procedure.get(), 17);
-        assert_eq!(procedure.index(), 17);
-        assert_eq!(procedure.to_string(), "17");
-        assert_eq!(std::mem::size_of::<ProcedureId>(), 4);
-        assert_eq!(std::mem::size_of::<ControlEdgeId>(), 4);
-        assert_ne!(format!("{procedure:?}"), format!("{:?}", BlockId::new(17)));
-        assert_ne!(
-            format!("{control_edge:?}"),
-            format!("{:?}", ProgramPointId::new(17))
-        );
-
-        #[cfg(target_pointer_width = "64")]
-        {
-            let overflow = u32::MAX as usize + 1;
-            let error = ProcedureId::try_from_index(overflow).unwrap_err();
-            assert_eq!(error.id_type(), "ProcedureId");
-            assert_eq!(error.index(), overflow);
-        }
-    }
-
-    #[test]
-    fn workspace_path_strings_are_slash_canonical_and_relative() {
-        let path = WorkspaceRelativePath::new("src/nested/main.ts").unwrap();
-        assert_eq!(path.as_str(), "src/nested/main.ts");
-
-        for invalid in [
-            "",
-            "/src/main.ts",
-            r"\src\main.ts",
-            "C:/src/main.ts",
-            "C:main.ts",
-        ] {
-            assert!(WorkspaceRelativePath::new(invalid).is_err(), "{invalid:?}");
-        }
-        for invalid in ["src/../main.ts", "src/./main.ts", "src//main.ts", "src/"] {
-            assert!(WorkspaceRelativePath::new(invalid).is_err(), "{invalid:?}");
-        }
-        assert_eq!(
-            WorkspaceRelativePath::new(r"src\nested\main.ts"),
-            Err(WorkspaceRelativePathError::InvalidCharacter)
-        );
-    }
 
     #[test]
     fn native_paths_use_platform_components_without_aliasing_unix_backslashes() {
@@ -1365,10 +1391,10 @@ mod tests {
         let current = SemanticIrVersion::current();
         assert_eq!(
             current.to_string(),
-            "075c7df26dc9530d64d9f2f9e43e4aa6e8d94b230f4d7f3b2033201209635856"
+            "b40c973d99e45f180a5e2fc24146e1c06db8c40c0e00ba8bba4afc50307d44d9"
         );
         assert_ne!(current.as_bytes(), &[0_u8; 32]);
-        assert_eq!(SEMANTIC_IR_SCHEMA_VERSION, 39);
+        assert_eq!(SEMANTIC_IR_SCHEMA_VERSION, 45);
     }
 
     fn digest(label: &str) -> StableDigest {
@@ -1387,167 +1413,17 @@ mod tests {
         configuration: &str,
         dependencies: &str,
     ) -> SemanticArtifactKey {
-        SemanticArtifactKey::new(
-            WorkspaceMountId::from_digest(digest(mount)),
-            WorkspaceRelativePath::new(path).unwrap(),
+        crate::test_support::semantic_artifact_key_fixture(
+            mount,
+            path,
             language,
             revision,
-            AdapterSemanticsVersion::new(adapter_name, digest(adapter)).unwrap(),
-            SemanticIrVersion::from_digest(digest(ir)),
-            ConfigurationFingerprint::from_digest(digest(configuration)),
-            DependencyFingerprint::from_digest(digest(dependencies)),
+            adapter_name,
+            adapter,
+            ir,
+            configuration,
+            dependencies,
         )
-    }
-
-    #[test]
-    fn artifact_fingerprint_changes_for_every_validity_input() {
-        let disk = |content: &str| SourceRevision::Disk {
-            content: ContentIdentity::from_digest(digest(content)),
-        };
-        let overlay = |content: &str, snapshot: &str| SourceRevision::Overlay {
-            content: ContentIdentity::from_digest(digest(content)),
-            snapshot: OverlaySnapshotId::from_digest(digest(snapshot)),
-        };
-        let base = key(
-            "mount-a",
-            "src/main.ts",
-            SemanticLanguage::Standard(Language::TypeScript),
-            disk("content-a"),
-            "typescript",
-            "adapter-a",
-            "ir-a",
-            "config-a",
-            "deps-a",
-        );
-        let variants = [
-            key(
-                "mount-b",
-                "src/main.ts",
-                base.language(),
-                base.revision(),
-                "typescript",
-                "adapter-a",
-                "ir-a",
-                "config-a",
-                "deps-a",
-            ),
-            key(
-                "mount-a",
-                "src/copy.ts",
-                base.language(),
-                base.revision(),
-                "typescript",
-                "adapter-a",
-                "ir-a",
-                "config-a",
-                "deps-a",
-            ),
-            key(
-                "mount-a",
-                "src/main.ts",
-                SemanticLanguage::TypeScriptTsx,
-                base.revision(),
-                "typescript",
-                "adapter-a",
-                "ir-a",
-                "config-a",
-                "deps-a",
-            ),
-            key(
-                "mount-a",
-                "src/main.ts",
-                base.language(),
-                disk("content-b"),
-                "typescript",
-                "adapter-a",
-                "ir-a",
-                "config-a",
-                "deps-a",
-            ),
-            key(
-                "mount-a",
-                "src/main.ts",
-                base.language(),
-                overlay("content-a", "overlay-a"),
-                "typescript",
-                "adapter-a",
-                "ir-a",
-                "config-a",
-                "deps-a",
-            ),
-            key(
-                "mount-a",
-                "src/main.ts",
-                base.language(),
-                overlay("content-a", "overlay-b"),
-                "typescript",
-                "adapter-a",
-                "ir-a",
-                "config-a",
-                "deps-a",
-            ),
-            key(
-                "mount-a",
-                "src/main.ts",
-                base.language(),
-                base.revision(),
-                "typescript-next",
-                "adapter-a",
-                "ir-a",
-                "config-a",
-                "deps-a",
-            ),
-            key(
-                "mount-a",
-                "src/main.ts",
-                base.language(),
-                base.revision(),
-                "typescript",
-                "adapter-b",
-                "ir-a",
-                "config-a",
-                "deps-a",
-            ),
-            key(
-                "mount-a",
-                "src/main.ts",
-                base.language(),
-                base.revision(),
-                "typescript",
-                "adapter-a",
-                "ir-b",
-                "config-a",
-                "deps-a",
-            ),
-            key(
-                "mount-a",
-                "src/main.ts",
-                base.language(),
-                base.revision(),
-                "typescript",
-                "adapter-a",
-                "ir-a",
-                "config-b",
-                "deps-a",
-            ),
-            key(
-                "mount-a",
-                "src/main.ts",
-                base.language(),
-                base.revision(),
-                "typescript",
-                "adapter-a",
-                "ir-a",
-                "config-a",
-                "deps-b",
-            ),
-        ];
-
-        let mut fingerprints = HashSet::from([base.fingerprint()]);
-        for variant in variants {
-            assert_ne!(base, variant);
-            assert!(fingerprints.insert(variant.fingerprint()));
-        }
     }
 
     #[test]
@@ -1631,24 +1507,6 @@ mod tests {
             changed_adapter.procedure_lineage_fingerprint(&moved_declaration),
             "semantic environment remains part of the lineage"
         );
-    }
-
-    #[test]
-    fn declaration_locator_preserves_nested_anonymous_segments() {
-        let span = SourceSpan::new(
-            SourcePosition::new(10, 1, 2),
-            SourcePosition::new(20, 1, 12),
-        )
-        .unwrap();
-        let anchor = SourceAnchor::new(span, 0);
-        let outer =
-            DeclarationSegment::named(DeclarationSegmentKind::Method, "outer", anchor, 0).unwrap();
-        let lambda = DeclarationSegment::anonymous(DeclarationSegmentKind::Lambda, anchor, 1);
-        let locator = DeclarationLocator::new(vec![outer, lambda]).unwrap();
-
-        assert_eq!(locator.segments().len(), 2);
-        assert_eq!(locator.segments()[1].name(), None);
-        assert_eq!(locator.segments()[1].sibling_ordinal(), 1);
     }
 
     #[test]
@@ -1744,36 +1602,5 @@ mod tests {
             shifted.finish(),
             "procedure lineage excludes mount and source anchors"
         );
-    }
-
-    #[test]
-    fn source_spans_are_half_open_and_monotonic() {
-        let start = SourcePosition::new(4, 0, 4);
-        let end = SourcePosition::new(9, 0, 9);
-        let span = SourceSpan::new(start, end).unwrap();
-        assert_eq!(span.start_byte(), 4);
-        assert_eq!(span.end_byte(), 9);
-        assert_eq!(
-            SourceSpan::new(end, start),
-            Err(SourceSpanError::ReversedBytes)
-        );
-    }
-
-    #[test]
-    fn source_spans_require_coordinate_consistency() {
-        let start = SourcePosition::new(4, 2, 4);
-        for end in [
-            SourcePosition::new(4, 2, 5),
-            SourcePosition::new(4, 3, 0),
-            SourcePosition::new(9, 2, 8),
-        ] {
-            assert_eq!(
-                SourceSpan::new(start, end),
-                Err(SourceSpanError::InconsistentCoordinates)
-            );
-        }
-
-        assert!(SourceSpan::new(start, SourcePosition::new(6, 2, 6)).is_ok());
-        assert!(SourceSpan::new(start, SourcePosition::new(9, 3, 1)).is_ok());
     }
 }

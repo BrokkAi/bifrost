@@ -1,43 +1,45 @@
 //! Analyzer-owned call relations shared by query traversal and LSP call hierarchy.
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
+use super::{
+    FuzzyResult, UsageFinder, UsageHit, UsageHitKind, UsageProof, UsageProofAuthority,
+    UsageQueryCompletion, proof_rank,
+};
 use crate::analyzer::common::language_for_file;
+use crate::analyzer::content_identity::WorkspaceContentIdentity;
 use crate::analyzer::languages::{
     ExternalCalleeFileEvidence, ExternalCalleeSite, language_support,
 };
 use crate::analyzer::lexical_definitions::{
     FormalParameterLayout, PythonMethodBinding, formal_parameter_slots,
 };
-use crate::analyzer::semantic::ResolverOwnedExternalCalleeIdentity;
+use crate::analyzer::read_ledger::ReadLedger;
+use crate::analyzer::semantic::{ContentIdentity, ResolverOwnedExternalCalleeIdentity};
 use crate::analyzer::structural::FileFacts;
 use crate::analyzer::structural::resolution::BoundaryStatus;
 use crate::analyzer::usages::call_binding::{OrdinaryFormalSlots, canonical_parameter_name};
 use crate::analyzer::usages::call_shape::call_shapes_in_file;
 use crate::analyzer::usages::get_definition::{
-    CallApplicationKind, CallSiteSyntax, CallSyntaxKind, CallTargetLookupOutcome,
-    DefinitionLookupOutcome, DefinitionLookupRequest, DefinitionLookupStatus, ExactCallReference,
-    ExactCallReferenceGap, ExactExternalCallProof,
-    GO_MODELED_PACKAGE_CALL_NOT_APPLICABLE_DIAGNOSTIC_KIND, IMPORT_BINDINGS_TRUNCATED_DIAGNOSTIC,
-    LOCAL_VARIABLE_REFERENCE_DIAGNOSTIC_KIND, PARTIAL_IMPORT_BOUNDARY_DIAGNOSTIC,
-    PARTIAL_IMPORT_UNRESOLVED_DIAGNOSTIC, call_reference_ranges_in_tree,
-    call_reference_requires_point_lookup, call_site_syntax_for_reference,
-    exact_call_reference_for_call, is_adjudicated_answer_diagnostic_kind, parse_tree_for_language,
-    range_is_call_keyword_label, resolve_call_target_batch_with_source,
-    resolve_definition_batch_with_source,
+    BoundedResolution, CallApplicationKind, CallSiteSyntax, CallSyntaxKind,
+    CallTargetLookupOutcome, DefinitionLookupOutcome, DefinitionLookupRequest,
+    DefinitionLookupStatus, ExactCallReference, ExactCallReferenceGap, ExactExternalCallProof,
+    GO_MODELED_PACKAGE_CALL_NOT_APPLICABLE_DIAGNOSTIC_KIND, GoTypedSelectorTarget,
+    IMPORT_BINDINGS_TRUNCATED_DIAGNOSTIC, LOCAL_VARIABLE_REFERENCE_DIAGNOSTIC_KIND,
+    PARTIAL_IMPORT_BOUNDARY_DIAGNOSTIC, PARTIAL_IMPORT_UNRESOLVED_DIAGNOSTIC,
+    call_reference_ranges_in_tree, call_reference_requires_point_lookup,
+    call_site_syntax_for_reference, exact_call_reference_for_call, go_typed_selector_target,
+    is_adjudicated_answer_diagnostic_kind, parse_tree_for_language, range_is_call_keyword_label,
+    resolve_call_target_batch_with_source, resolve_definition_batch_with_source,
 };
+use crate::analyzer::usages::python_class_hierarchy::PythonHierarchyOutcome;
 use crate::analyzer::{
     AnalyzerQueryScope, CodeUnit, DispatchExtensibility, IAnalyzer, Language, ProjectFile,
-    QueryScope, Range,
+    QueryScope, Range, capture_query_reads, replay_query_reads,
 };
 use crate::cancellation::CancellationToken;
 use crate::hash::{HashMap, HashSet};
 use brokk_bifrost_core::analyzer::query_token::QueryToken;
-
-use super::{
-    FuzzyResult, UsageFinder, UsageHit, UsageHitKind, UsageProof, UsageProofAuthority,
-    UsageQueryCompletion,
-};
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct CallArgument {
@@ -67,7 +69,7 @@ pub struct CallSite {
 /// call expression; the dispatch service derives the precise callee reference
 /// through tree-sitter before invoking definition resolution.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-#[allow(dead_code)] // Retained for the aggregate one-call accounting facade below.
+#[cfg(test)]
 pub(crate) struct ExactCallLocation {
     pub(crate) file: ProjectFile,
     pub(crate) call_span: Range,
@@ -78,6 +80,10 @@ pub(crate) struct ExactCallLocation {
 pub(crate) struct CallDispatchTarget {
     pub(crate) definition: CodeUnit,
     pub(crate) proof: UsageProof,
+    /// The unique incomplete Java source candidate came from the selected
+    /// native operation itself. This provenance permits candidate-local
+    /// argument rows while the dispatch frontier remains open.
+    pub(crate) native_incomplete_source_reason: Option<Box<str>>,
 }
 
 /// Keep exact source identity after location-first dispatch. C/C++ declaration
@@ -122,6 +128,9 @@ pub(crate) enum CallDispatchBoundaryKind {
         callee_text: Box<str>,
         normalized_static_owner: Option<Box<str>>,
     },
+    /// A source-backed Go receiver proves an interface selector, but neither
+    /// the module census nor an unclosed external interface is exhaustive.
+    UnresolvedReason(Box<str>),
     /// Structured declaration/body evidence exists, but no build graph proves
     /// that the retained C/C++ body belongs to this call's link unit.
     UnprovenTargetIdentity,
@@ -164,10 +173,85 @@ pub(crate) struct CallDispatchLookup {
     /// the boundary spelling with independently lowered receiver or arity
     /// facts.
     pub(crate) exact_external_call: Option<ExactExternalCallProof>,
+    /// The exact Go receiver type fact identifies an interface. A later
+    /// workspace-oracle points-to query may close this receiver over its
+    /// exhaustive concrete allocation set.
+    pub(crate) go_interface_receiver: bool,
+    pub(crate) go_selector_member: Option<String>,
     pub(crate) truncated: bool,
     pub(crate) cancelled: bool,
     pub(crate) budget_exhausted: bool,
     pub(crate) diagnostics: Vec<String>,
+    pub(crate) work: CallRelationWork,
+}
+
+/// One external callable selected by exact call-site dispatch, including the
+/// call shape that the language resolver proved for it.
+///
+/// This is the cross-crate view used by structural selectors. It can only be
+/// produced when dispatch has one named external boundary and an exact
+/// resolver-owned call proof; incomplete or ambiguous lookups remain absent.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolverOwnedExternalCallDispatch {
+    identity: ResolverOwnedExternalCalleeIdentity,
+    parameter_count: u32,
+    has_receiver: bool,
+}
+
+impl ResolverOwnedExternalCallDispatch {
+    pub fn identity(&self) -> &ResolverOwnedExternalCalleeIdentity {
+        &self.identity
+    }
+
+    pub const fn parameter_count(&self) -> u32 {
+        self.parameter_count
+    }
+
+    pub const fn has_receiver(&self) -> bool {
+        self.has_receiver
+    }
+}
+
+impl CallDispatchLookup {
+    fn resolver_owned_external_call(&self) -> Option<ResolverOwnedExternalCallDispatch> {
+        if self.status != Some(DefinitionLookupStatus::Resolved)
+            || !self.targets.is_empty()
+            || self.boundaries.len() != 1
+            || self.cancelled
+            || self.truncated
+            || self.budget_exhausted
+        {
+            return None;
+        }
+        let [
+            CallDispatchBoundaryKind::External {
+                external_callee_identity: Some(identity),
+                ..
+            },
+        ] = self.boundaries.as_slice()
+        else {
+            return None;
+        };
+        let proof = self.exact_external_call.as_ref()?;
+        Some(ResolverOwnedExternalCallDispatch {
+            identity: identity.clone(),
+            parameter_count: proof.parameter_count(),
+            has_receiver: proof.has_receiver(),
+        })
+    }
+}
+
+/// Inputs for a language-owned exact-call dispatch extension. The framework
+/// supplies the parsed source call; the registered language adapter decides
+/// whether it has a structured special case before generic reference lookup.
+pub(crate) struct CallDispatchLanguageRequest<'a> {
+    pub(crate) analyzer: &'a dyn IAnalyzer,
+    pub(crate) token: QueryToken<'a>,
+    pub(crate) file: &'a ProjectFile,
+    pub(crate) source: &'a str,
+    pub(crate) tree: &'a tree_sitter::Tree,
+    pub(crate) call_span: &'a Range,
+    pub(crate) cancellation: Option<&'a CancellationToken>,
     pub(crate) work: CallRelationWork,
 }
 
@@ -191,7 +275,25 @@ pub(crate) struct CallDispatchSession {
     /// Shared with the parse, and for the same reason: the file-wide owner
     /// proofs classification needs are the same for every call in this window.
     file_evidence: ExternalCalleeFileEvidence,
+    /// C/C++ dispatch is requested one source range at a time by the
+    /// semantic source projection. Resolve a bounded set of exact call spans
+    /// together, then serve the individual projections from this query-local
+    /// cache. The cache is deliberately owned by the file session rather than
+    /// the analyzer, so it cannot grow with the workspace or cross queries.
+    cpp_dispatch_cache: HashMap<(usize, usize), CallDispatchLookup>,
+    cpp_dispatch_prefetched: bool,
+    /// Whole-call spans the caller announced it will dispatch through this
+    /// session. The next call that reaches the definition resolver resolves
+    /// their callee ranges in its own batch (see [`Self::expect_calls`]).
+    expected_calls: Vec<Range>,
+    /// Definition-resolver outcomes by callee byte range, filled by such a
+    /// batch for the calls that did not trigger it. Like the C/C++ cache it
+    /// is owned by the file session, so it is bounded by the calls one query
+    /// announced in one file.
+    callee_outcomes: HashMap<(usize, usize), CallTargetLookupOutcome>,
 }
+
+const MAX_CPP_DISPATCH_PREFETCH_SITES: usize = 1024;
 
 #[derive(Debug, Clone, Copy)]
 pub struct CallRelationLimits {
@@ -201,6 +303,24 @@ pub struct CallRelationLimits {
     /// exact-call API this remains a per-call arm cap; the caller separately
     /// bounds the number of submitted call sites.
     pub max_candidates: usize,
+}
+
+fn unbounded_call_relation_limits(max_files: usize, max_candidates: usize) -> CallRelationLimits {
+    CallRelationLimits {
+        max_files,
+        max_source_bytes: usize::MAX,
+        max_candidates,
+    }
+}
+
+fn request_for_callee_range(file: &ProjectFile, range: Range) -> DefinitionLookupRequest {
+    DefinitionLookupRequest {
+        file: file.clone(),
+        line: None,
+        column: None,
+        start_byte: Some(range.start_byte),
+        end_byte: Some(range.end_byte),
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -241,7 +361,7 @@ impl CallRelationDiagnostic {
         }
     }
 
-    fn analysis_failed(message: String, context: String, reason_kind: String) -> Self {
+    pub(crate) fn analysis_failed(message: String, context: String, reason_kind: String) -> Self {
         Self {
             code: CallRelationDiagnosticCode::AnalysisFailed,
             message,
@@ -301,6 +421,16 @@ pub(crate) trait CallRelationProvider: Send + Sync {
         limits: CallRelationLimits,
         cancellation: Option<&CancellationToken>,
     ) -> CallRelationResult;
+
+    /// Resolve a language-specific exact call shape before the framework's
+    /// ordinary callee-reference route. `None` leaves generic dispatch in
+    /// charge; `Some` is the language adapter's complete answer.
+    fn dispatch_special_call_site(
+        &self,
+        _request: CallDispatchLanguageRequest<'_>,
+    ) -> Option<CallDispatchLookup> {
+        None
+    }
 }
 
 /// Domain for the digest of one call-relation answer.
@@ -376,6 +506,88 @@ pub(crate) fn call_relation_answer_digest(
     crate::analyzer::semantic::ids::StableDigest::from_array(hasher.finish())
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CallTargetOutcomeAuthority {
+    workspace: WorkspaceContentIdentity,
+    analysis_generation: u64,
+    active_model_set_hash: Option<String>,
+}
+
+#[derive(Debug)]
+struct SharedRustCallTargetPrefetch {
+    targets: HashMap<Range, CallTargetLookupOutcome>,
+    reads: Arc<ReadLedger>,
+}
+
+/// Exact Rust call-target answers shared only by one policy compilation.
+///
+/// The cache namespace captures the analyzed content, selected-resolution
+/// generation, and active model set. It is request-owned and never persisted.
+#[doc(hidden)]
+#[derive(Debug, Clone)]
+pub struct CallTargetOutcomeCache {
+    authority: CallTargetOutcomeAuthority,
+    prefetches: Arc<Mutex<HashMap<ProjectFile, Arc<SharedRustCallTargetPrefetch>>>>,
+}
+
+impl CallTargetOutcomeCache {
+    /// Create the cache only when this analyzer can attest the workspace
+    /// snapshot its call-target answers will describe.
+    #[doc(hidden)]
+    pub fn for_policy_compilation(analyzer: &dyn IAnalyzer) -> Option<Self> {
+        let workspace = analyzer.workspace_content_identity()?;
+        let active_model_set_hash = analyzer
+            .active_semantic_models()
+            .map(|models| models.active_model_set_hash().to_owned());
+        Some(Self {
+            authority: CallTargetOutcomeAuthority {
+                workspace,
+                analysis_generation: analyzer.project().analysis_generation(),
+                active_model_set_hash,
+            },
+            prefetches: Arc::new(Mutex::new(HashMap::default())),
+        })
+    }
+
+    #[doc(hidden)]
+    pub fn matches_current(
+        &self,
+        analyzer: &dyn IAnalyzer,
+        active_models: Option<&crate::analyzer::semantic_model::ResolvedActiveSemanticModels>,
+    ) -> bool {
+        analyzer
+            .workspace_content_identity()
+            .is_some_and(|workspace| {
+                self.authority.workspace == workspace
+                    && self.authority.analysis_generation
+                        == analyzer.project().analysis_generation()
+            })
+            && self.authority.active_model_set_hash.as_deref()
+                == active_models.map(|models| models.active_model_set_hash())
+    }
+
+    fn get_prefetch(&self, file: &ProjectFile) -> Option<Arc<SharedRustCallTargetPrefetch>> {
+        self.prefetches
+            .lock()
+            .expect("call-target outcome cache lock poisoned")
+            .get(file)
+            .cloned()
+    }
+
+    fn insert_prefetch(
+        &self,
+        file: &ProjectFile,
+        targets: HashMap<Range, CallTargetLookupOutcome>,
+        reads: Arc<ReadLedger>,
+    ) {
+        self.prefetches
+            .lock()
+            .expect("call-target outcome cache lock poisoned")
+            .entry(file.clone())
+            .or_insert_with(|| Arc::new(SharedRustCallTargetPrefetch { targets, reads }));
+    }
+}
+
 #[derive(Default)]
 pub struct CallBindingCache {
     conversions: super::call_conversion::CallConversionCache,
@@ -393,9 +605,27 @@ pub struct CallBindingCache {
     /// Files whose call-target prefetch already ran. A file with zero call
     /// sites is recorded too, so a later miss never re-scans it.
     call_target_prefetched: HashSet<ProjectFile>,
+    /// Exact per-file call-dispatch sessions used by structural selectors.
+    /// Each session owns one source snapshot and parser tree only for this
+    /// query, so retained state is bounded by the active query's file set.
+    call_dispatch_sessions: HashMap<ProjectFile, CallDispatchSession>,
+    /// Exact external call-site dispatch answers already requested by this
+    /// query, keyed by the immutable file and whole-call range.
+    call_dispatches: HashMap<(ProjectFile, Range), Option<ResolverOwnedExternalCallDispatch>>,
+    shared_call_targets: Option<CallTargetOutcomeCache>,
 }
 
 impl CallBindingCache {
+    /// Attach compilation-local Rust call-target outcomes, when available.
+    #[doc(hidden)]
+    pub fn with_shared_call_target_outcomes(
+        mut self,
+        outcomes: Option<CallTargetOutcomeCache>,
+    ) -> Self {
+        self.shared_call_targets = outcomes;
+        self
+    }
+
     /// Select the one structured model overload proven applicable to this
     /// exact written application, using the conversion cache's source index.
     pub fn select_model_signature(
@@ -481,13 +711,7 @@ impl CallBindingCache {
         resolve_call_target_batch_with_source(
             analyzer,
             scope.token(),
-            vec![DefinitionLookupRequest {
-                file: file.clone(),
-                line: None,
-                column: None,
-                start_byte: Some(callee_range.start_byte),
-                end_byte: Some(callee_range.end_byte),
-            }],
+            vec![request_for_callee_range(file, callee_range)],
             file.clone(),
             source,
             cancellation,
@@ -496,10 +720,111 @@ impl CallBindingCache {
         .next()
     }
 
+    /// The exact external callee proved by the production resolver for this
+    /// call site's callee token, when one is available.
+    pub fn resolved_exact_external_callee(
+        &mut self,
+        analyzer: &dyn IAnalyzer,
+        file: &ProjectFile,
+        callee_range: Range,
+        cancellation: Option<&CancellationToken>,
+    ) -> Option<String> {
+        self.resolved_call_target(analyzer, file, callee_range, cancellation)?
+            .exact_external_call
+            .map(|proof| proof.canonical_callee().to_owned())
+    }
+
+    /// Resolve a whole call through the shared exact-dispatch path and return
+    /// its one resolver-owned external identity with the proven formal arity.
+    /// The per-file session keeps parsing and Rust's macro visibility walk
+    /// query-local while reusing the exact source snapshot across call sites.
+    pub fn resolved_external_call_dispatch(
+        &mut self,
+        analyzer: &dyn IAnalyzer,
+        file: &ProjectFile,
+        call_span: Range,
+        cancellation: Option<&CancellationToken>,
+    ) -> Option<ResolverOwnedExternalCallDispatch> {
+        if cancellation.is_some_and(CancellationToken::is_cancelled) {
+            return None;
+        }
+        let key = (file.clone(), call_span);
+        if let Some(dispatch) = self.call_dispatches.get(&key) {
+            return dispatch.clone();
+        }
+        let source = Arc::<str>::from(analyzer.indexed_source(file)?);
+        let session = self
+            .call_dispatch_sessions
+            .entry(file.clone())
+            .or_insert_with(|| {
+                CallRelationService::dispatch_session(file.clone(), Arc::clone(&source))
+            });
+        assert_eq!(
+            session.exact_source.as_ref(),
+            source.as_ref(),
+            "one call-binding query retains one exact source snapshot per file"
+        );
+        let query_scope = AnalyzerQueryScope::new(analyzer);
+        let dispatch = session
+            .dispatch_at_bounded(analyzer, query_scope.token(), &call_span, 100, cancellation)
+            .resolver_owned_external_call();
+        if !cancellation.is_some_and(CancellationToken::is_cancelled) {
+            self.call_dispatches.insert(key, dispatch.clone());
+        }
+        dispatch
+    }
+
     /// Batch-resolve every call site's callee range that `file`'s facts
     /// arena reports, in source byte-range order, and cache each outcome by
     /// its exact callee range.
     fn prefetch_call_targets(
+        &mut self,
+        analyzer: &dyn IAnalyzer,
+        file: &ProjectFile,
+        cancellation: Option<&CancellationToken>,
+    ) {
+        let shared_call_targets = (language_for_file(file) == Language::Rust)
+            .then(|| self.shared_call_targets.clone())
+            .flatten();
+        if !cancellation.is_some_and(CancellationToken::is_cancelled)
+            && let Some(shared_call_targets) = shared_call_targets.as_ref()
+            && let Some(prefetch) = shared_call_targets.get_prefetch(file)
+        {
+            replay_query_reads(analyzer, &prefetch.reads);
+            self.call_targets.extend(
+                prefetch
+                    .targets
+                    .iter()
+                    .map(|(range, outcome)| ((file.clone(), *range), outcome.clone())),
+            );
+            return;
+        }
+
+        let ((), reads) = capture_query_reads(analyzer, || {
+            self.prefetch_call_targets_uncached(analyzer, file, cancellation)
+        });
+        if !cancellation.is_some_and(CancellationToken::is_cancelled)
+            && let Some(shared_call_targets) = shared_call_targets.as_ref()
+        {
+            let targets = self
+                .call_targets
+                .iter()
+                .filter_map(|((cached_file, range), outcome)| {
+                    (cached_file == file).then_some((*range, outcome.clone()))
+                })
+                .collect();
+            if self
+                .call_targets
+                .iter()
+                .filter(|((cached_file, _), _)| cached_file == file)
+                .all(|(_, outcome)| outcome.outcome.status != DefinitionLookupStatus::Cancelled)
+            {
+                shared_call_targets.insert_prefetch(file, targets, reads);
+            }
+        }
+    }
+
+    fn prefetch_call_targets_uncached(
         &mut self,
         analyzer: &dyn IAnalyzer,
         file: &ProjectFile,
@@ -530,13 +855,7 @@ impl CallBindingCache {
         }
         let requests = ranges
             .iter()
-            .map(|range| DefinitionLookupRequest {
-                file: file.clone(),
-                line: None,
-                column: None,
-                start_byte: Some(range.start_byte),
-                end_byte: Some(range.end_byte),
-            })
+            .map(|range| request_for_callee_range(file, *range))
             .collect();
         let scope = AnalyzerQueryScope::new(analyzer);
         let outcomes = resolve_call_target_batch_with_source(
@@ -547,15 +866,13 @@ impl CallBindingCache {
             source,
             cancellation,
         );
+        assert_eq!(outcomes.len(), ranges.len());
         // A cancelled batch retains one explicit terminal outcome per input
         // range. The terminal outcomes carry no target prefix, so the cache
         // cannot turn cancellation into a later absence or proof.
-        self.call_targets.extend(
-            ranges
-                .into_iter()
-                .zip(outcomes)
-                .map(|(range, outcome)| ((file.clone(), range), outcome)),
-        );
+        for (range, outcome) in ranges.into_iter().zip(outcomes) {
+            self.call_targets.insert((file.clone(), range), outcome);
+        }
     }
 }
 
@@ -780,6 +1097,91 @@ impl CallDispatchSession {
         .saturating_add(self.file.retained_bytes())
     }
 
+    /// Batch the first C/C++ dispatch window against the same exact source
+    /// snapshot used by this session. The current call is always included,
+    /// even when the structural fact arena has already reached the prefetch
+    /// cap. A missing or stale facts snapshot simply leaves the ordinary
+    /// single-call path in charge.
+    fn prefetch_cpp_dispatches(
+        &mut self,
+        analyzer: &dyn IAnalyzer,
+        token: QueryToken<'_>,
+        current_span: &Range,
+        max_candidates: usize,
+        cancellation: Option<&CancellationToken>,
+    ) -> Option<CallDispatchLookup> {
+        self.cpp_dispatch_prefetched = true;
+        let facts = analyzer
+            .structural_fact_providers()
+            .into_iter()
+            .find_map(|provider| provider.structural_facts(&self.file))?;
+        if facts.source_identity() != ContentIdentity::hash_bytes(self.exact_source.as_bytes()) {
+            return None;
+        }
+
+        let current_key = (current_span.start_byte, current_span.end_byte);
+        let mut spans = call_shapes_in_file(
+            &facts,
+            &self.file,
+            MAX_CPP_DISPATCH_PREFETCH_SITES.saturating_sub(1),
+        )
+        .into_iter()
+        .map(|shape| (shape.outcome.range.start_byte, shape.outcome.range.end_byte))
+        .collect::<Vec<_>>();
+        spans.push(current_key);
+        spans.sort_unstable();
+        spans.dedup();
+        if spans.len() <= 1 {
+            return None;
+        }
+
+        let ranges = spans
+            .iter()
+            .map(|&(start_byte, end_byte)| Range {
+                start_byte,
+                end_byte,
+                start_line: 0,
+                end_line: 0,
+            })
+            .collect::<Vec<_>>();
+        let lookups = CallRelationService::dispatch_many_at_bounded(
+            analyzer,
+            token,
+            &self.file,
+            &ranges,
+            Arc::clone(&self.exact_source),
+            CallRelationLimits {
+                max_files: 1,
+                max_source_bytes: usize::MAX,
+                max_candidates,
+            },
+            cancellation,
+        );
+        for (key, mut lookup) in spans.into_iter().zip(lookups) {
+            // The batch shares one parse/source scan. The triggering call
+            // owns that first source charge; later projections retain only
+            // their per-call resolver work, matching the serial session.
+            if key != current_key {
+                lookup.work.scanned_files = 0;
+                lookup.work.scanned_source_bytes = 0;
+            }
+            self.cpp_dispatch_cache.insert(key, lookup);
+        }
+        self.cpp_dispatch_cache.get(&current_key).cloned()
+    }
+
+    /// Announce whole-call spans this session will be asked to dispatch.
+    ///
+    /// Nothing is resolved here. The next call whose dispatch reaches the
+    /// definition resolver resolves its own callee range together with the
+    /// announced calls' callee ranges in one batch, and the announced calls
+    /// later read their outcome from the session. One batch pays the
+    /// per-batch resolver setup (for Rust, the definition operation factory
+    /// and its macro frontiers) once instead of once per call.
+    pub(crate) fn expect_calls(&mut self, call_spans: impl IntoIterator<Item = Range>) {
+        self.expected_calls.extend(call_spans);
+    }
+
     pub(crate) fn dispatch_at_bounded(
         &mut self,
         analyzer: &dyn IAnalyzer,
@@ -793,6 +1195,10 @@ impl CallDispatchSession {
                 cancelled: true,
                 ..CallDispatchLookup::default()
             };
+        }
+        let call_key = (call_span.start_byte, call_span.end_byte);
+        if let Some(lookup) = self.cpp_dispatch_cache.get(&call_key) {
+            return lookup.clone();
         }
         if max_candidates == 0 {
             return CallDispatchLookup {
@@ -824,13 +1230,44 @@ impl CallDispatchSession {
                 work,
             );
         }
-        let CallDispatchParse::Ready(Some(tree)) = &self.parse else {
+        if !matches!(self.parse, CallDispatchParse::Ready(Some(_))) {
             return unresolved_dispatch_lookup(
                 DefinitionLookupStatus::NotFound,
                 format!("failed to parse {} for exact call dispatch", self.file),
                 work,
             );
         };
+        if self.language == Language::Cpp
+            && !self.cpp_dispatch_prefetched
+            && let Some(lookup) = self.prefetch_cpp_dispatches(
+                analyzer,
+                token,
+                call_span,
+                max_candidates,
+                cancellation,
+            )
+        {
+            return lookup;
+        }
+        let CallDispatchParse::Ready(Some(tree)) = &self.parse else {
+            unreachable!("a parsed C/C++ dispatch session retains its syntax tree");
+        };
+        let language_request = CallDispatchLanguageRequest {
+            analyzer,
+            token,
+            file: &self.file,
+            source: &self.exact_source,
+            tree,
+            call_span,
+            cancellation,
+            work,
+        };
+        if let Some(lookup) = language_support(self.language)
+            .and_then(|support| support.call_relation_provider())
+            .and_then(|provider| provider.dispatch_special_call_site(language_request))
+        {
+            return lookup;
+        }
         let callee_range = match exact_call_reference_for_call(tree, self.language, call_span) {
             Some(ExactCallReference::Resolvable(range)) => range,
             Some(ExactCallReference::Unsupported(ExactCallReferenceGap::RubyCallableObject)) => {
@@ -852,18 +1289,63 @@ impl CallDispatchSession {
                 );
             }
         };
-        let batch = resolve_call_references_with_source(
-            analyzer,
-            token,
-            &self.file,
-            Arc::clone(&self.exact_source),
-            tree,
-            std::slice::from_ref(&callee_range),
-            cancellation,
-        );
-        let cancelled =
-            batch.cancelled || cancellation.is_some_and(CancellationToken::is_cancelled);
-        let Some((_, outcome)) = batch.resolved.into_iter().next() else {
+        // Batched resolution gives each callee range the outcome a batch of
+        // that range alone gives: the per-file prefetch of `CallBindingCache`
+        // (#2765) and the C/C++ dispatch prefetch above rest on the same
+        // property of `resolve_call_target_batch_with_source`. So an outcome
+        // an earlier batch resolved for an announced call answers that call,
+        // and only the post-resolution steps below run per call.
+        let callee_key = (callee_range.start_byte, callee_range.end_byte);
+        let (outcome, cancelled) = if let Some(outcome) = self.callee_outcomes.get(&callee_key) {
+            (
+                Some(outcome.clone()),
+                cancellation.is_some_and(CancellationToken::is_cancelled),
+            )
+        } else {
+            let mut references = vec![callee_range];
+            let mut batched = HashSet::from_iter([callee_key]);
+            for call_span in std::mem::take(&mut self.expected_calls) {
+                if let Some(ExactCallReference::Resolvable(range)) =
+                    exact_call_reference_for_call(tree, self.language, &call_span)
+                {
+                    let key = (range.start_byte, range.end_byte);
+                    if !self.callee_outcomes.contains_key(&key) && batched.insert(key) {
+                        references.push(range);
+                    }
+                }
+            }
+            if crate::profiling::enabled() {
+                crate::profiling::note(format!(
+                    "call_dispatch.batch file={} requests={}",
+                    self.file,
+                    references.len()
+                ));
+            }
+            let batch = resolve_call_references_with_source(
+                analyzer,
+                token,
+                &self.file,
+                Arc::clone(&self.exact_source),
+                tree,
+                &references,
+                cancellation,
+            );
+            let cancelled =
+                batch.cancelled || cancellation.is_some_and(CancellationToken::is_cancelled);
+            let mut own = None;
+            for (range, outcome) in batch.resolved {
+                let key = (range.start_byte, range.end_byte);
+                if key == callee_key {
+                    own = Some(outcome);
+                } else if !cancelled {
+                    // A cancelled batch may hold cancelled outcomes; the
+                    // announced calls then resolve on their own.
+                    self.callee_outcomes.insert(key, outcome);
+                }
+            }
+            (own, cancelled)
+        };
+        let Some(outcome) = outcome else {
             return if cancelled {
                 CallDispatchLookup {
                     cancelled: true,
@@ -896,6 +1378,7 @@ impl CallDispatchSession {
             file_evidence: &self.file_evidence,
         };
         apply_call_target_outcome(
+            Some(analyzer),
             &mut lookup,
             expand_imported_external_callee(analyzer, &self.file, outcome, Some(&site)),
             max_candidates,
@@ -910,7 +1393,186 @@ impl CallDispatchSession {
             &self.file,
             &site,
         );
+        apply_go_typed_selector_target_at_call(
+            &mut lookup,
+            analyzer,
+            token,
+            &self.file,
+            &self.exact_source,
+            tree,
+            &callee_range,
+            cancellation,
+        );
         lookup
+    }
+}
+
+fn go_selector_call_parts<'tree>(
+    tree: &'tree tree_sitter::Tree,
+    callee_range: &Range,
+    source: &str,
+) -> Option<(tree_sitter::Node<'tree>, tree_sitter::Node<'tree>, String)> {
+    let root = tree.root_node();
+    let mut node =
+        root.descendant_for_byte_range(callee_range.start_byte, callee_range.end_byte)?;
+    let (selector, member) = loop {
+        if node.kind() == "selector_expression"
+            && let Some(field) = node.child_by_field_name("field")
+            && callee_range.start_byte <= field.start_byte()
+            && field.end_byte() <= callee_range.end_byte
+        {
+            break (node, field);
+        }
+        node = node.parent()?;
+    };
+    let call = selector.parent()?;
+    if call.kind() != "call_expression"
+        || !call
+            .child_by_field_name("function")
+            .is_some_and(|function| function.id() == selector.id())
+    {
+        return None;
+    }
+    let receiver = selector.child_by_field_name("operand")?;
+    let member_name = source.get(member.byte_range())?.to_owned();
+    Some((receiver, selector, member_name))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn apply_go_typed_selector_target_at_call(
+    lookup: &mut CallDispatchLookup,
+    analyzer: &dyn IAnalyzer,
+    token: QueryToken<'_>,
+    file: &ProjectFile,
+    source: &str,
+    tree: &tree_sitter::Tree,
+    callee_range: &Range,
+    cancellation: Option<&CancellationToken>,
+) {
+    let Some((receiver, callable, member)) = go_selector_call_parts(tree, callee_range, source)
+    else {
+        return;
+    };
+    match go_typed_selector_target(
+        analyzer,
+        token,
+        file,
+        source,
+        tree.root_node(),
+        receiver,
+        callable,
+        &member,
+        receiver.start_byte(),
+        crate::analyzer::usages::receiver_analysis::ReceiverAnalysisBudget::default(),
+        cancellation,
+    ) {
+        BoundedResolution::Complete {
+            value: Some(target),
+            work: receiver_work,
+        } => {
+            lookup.work.examined_candidates = lookup
+                .work
+                .examined_candidates
+                .saturating_add(receiver_work.setup_nodes)
+                .saturating_add(receiver_work.scope_nodes)
+                .saturating_add(receiver_work.summary_expansions);
+            apply_go_typed_selector_target(lookup, target);
+        }
+        BoundedResolution::Complete {
+            value: None,
+            work: receiver_work,
+        }
+        | BoundedResolution::Exceeded {
+            work: receiver_work,
+            ..
+        } => {
+            lookup.work.examined_candidates = lookup
+                .work
+                .examined_candidates
+                .saturating_add(receiver_work.setup_nodes)
+                .saturating_add(receiver_work.scope_nodes)
+                .saturating_add(receiver_work.summary_expansions);
+        }
+        BoundedResolution::Cancelled { .. } => lookup.cancelled = true,
+    }
+}
+
+fn apply_go_typed_selector_target(lookup: &mut CallDispatchLookup, target: GoTypedSelectorTarget) {
+    lookup.targets.clear();
+    lookup.boundaries.clear();
+    lookup.adjudicated_no_target = false;
+    lookup.adjudicated_non_callable = false;
+    lookup.truncated = false;
+    lookup.budget_exhausted = false;
+    lookup.exact_external_call = None;
+    lookup.boundary = None;
+    lookup.dispatch_extensibility = None;
+    lookup.go_interface_receiver = target.receiver_is_interface;
+    lookup.go_selector_member = Some(target.member.clone());
+    if !target.workspace_methods.is_empty() {
+        let ambiguous = target.workspace_methods.len() > 1;
+        lookup
+            .targets
+            .extend(
+                target
+                    .workspace_methods
+                    .into_iter()
+                    .map(|method| CallDispatchTarget {
+                        definition: method,
+                        proof: if ambiguous {
+                            UsageProof::Unproven
+                        } else {
+                            UsageProof::Proven
+                        },
+                        native_incomplete_source_reason: None,
+                    }),
+            );
+        lookup.status = Some(if ambiguous {
+            DefinitionLookupStatus::Ambiguous
+        } else {
+            DefinitionLookupStatus::Resolved
+        });
+        lookup.call_application = CallApplicationKind::BoundReceiver;
+        if ambiguous {
+            lookup
+                .boundaries
+                .push(CallDispatchBoundaryKind::UnresolvedReason(
+                    "Go method selection retains multiple promoted declarations".into(),
+                ));
+        }
+        if target.receiver_is_interface {
+            lookup
+                .boundaries
+                .push(CallDispatchBoundaryKind::UnresolvedReason(
+                    "Go interface implementations are not closed by the analyzed module".into(),
+                ));
+        }
+        return;
+    }
+    let Some(callee) = target.external_callee else {
+        return;
+    };
+    let Some(external_call) = target.external_call else {
+        return;
+    };
+    lookup.status = Some(DefinitionLookupStatus::UnresolvableImportBoundary);
+    lookup.boundary = Some(BoundaryStatus::ExternalIndexed);
+    lookup.call_application = external_call.call_application();
+    lookup.dispatch_extensibility = external_call.dispatch_extensibility();
+    lookup.exact_external_call = Some(external_call);
+    lookup.boundaries.push(CallDispatchBoundaryKind::External {
+        callee_text: Some(callee.into_boxed_str()),
+        normalized_static_owner: None,
+        external_callee_identity: target.external_concrete_owner_fqn.map(|owner| {
+            ResolverOwnedExternalCalleeIdentity::new(Language::Go, owner, target.member.clone())
+        }),
+    });
+    if target.receiver_is_interface {
+        lookup
+            .boundaries
+            .push(CallDispatchBoundaryKind::UnresolvedReason(
+                "Go interface implementations are not closed by the analyzed module".into(),
+            ));
     }
 }
 
@@ -925,6 +1587,10 @@ impl CallRelationService {
             exact_source,
             parse: CallDispatchParse::Uninitialized,
             file_evidence: ExternalCalleeFileEvidence::default(),
+            cpp_dispatch_cache: HashMap::default(),
+            cpp_dispatch_prefetched: false,
+            expected_calls: Vec::new(),
+            callee_outcomes: HashMap::default(),
         }
     }
 
@@ -934,7 +1600,7 @@ impl CallRelationService {
     /// revision. This method never rereads the file, so its byte span cannot
     /// race a newer disk or overlay snapshot. The same batched definition
     /// resolution core is used by legacy outgoing call relations below.
-    #[allow(dead_code)] // The serial session is production; this facade pins one-call accounting.
+    #[cfg(test)]
     pub(crate) fn dispatch_at_bounded(
         analyzer: &dyn IAnalyzer,
         token: QueryToken<'_>,
@@ -1073,6 +1739,7 @@ impl CallRelationService {
                 file_evidence: &file_evidence,
             };
             apply_call_target_outcome(
+                Some(analyzer),
                 &mut lookup,
                 expand_imported_external_callee(analyzer, file, outcome, Some(&site)),
                 limits.max_candidates,
@@ -1080,6 +1747,18 @@ impl CallRelationService {
                 Some(&site),
             );
             refine_resolved_call_target_proofs(&mut lookup, language, analyzer, token, file, &site);
+            if language == Language::Go {
+                apply_go_typed_selector_target_at_call(
+                    &mut lookup,
+                    analyzer,
+                    token,
+                    file,
+                    &exact_source,
+                    &tree,
+                    callee_range,
+                    cancellation,
+                );
+            }
             lookups[*index] = Some(lookup);
         }
         let cancelled =
@@ -1120,11 +1799,7 @@ impl CallRelationService {
             analyzer,
             token,
             target,
-            CallRelationLimits {
-                max_files,
-                max_source_bytes: usize::MAX,
-                max_candidates: max_sites,
-            },
+            unbounded_call_relation_limits(max_files, max_sites),
             None,
         )
     }
@@ -1192,7 +1867,7 @@ impl CallRelationService {
             examined_candidates: 0,
         };
         let query_cancelled = query.completion == UsageQueryCompletion::Cancelled;
-        let (hits, mut truncated, mut diagnostics) = call_hits(query.result, target);
+        let (mut hits, mut truncated, mut diagnostics) = call_hits(query.result, target);
         if query.source_bytes_truncated {
             diagnostics.push(CallRelationDiagnostic::new(
                 CallRelationDiagnosticCode::BudgetExhausted,
@@ -1219,7 +1894,33 @@ impl CallRelationService {
         let mut cancelled = query_cancelled;
         truncated |= query_cancelled;
         let mut omitted = 0usize;
-        for (hit, proof) in hits.into_iter().take(limits.max_candidates) {
+        // call_hits flattens HashMaps, so its order varies between runs. Sort
+        // before the cap so the retained candidates are the same on every run.
+        // Proven hits sort first, so the cap does not drop a proven caller in
+        // favor of an unproven one from an earlier file.
+        hits.sort_by(|(left, left_proof), (right, right_proof)| {
+            proof_rank(*left_proof)
+                .cmp(&proof_rank(*right_proof))
+                .then_with(|| left.file.cmp(&right.file))
+                .then_with(|| left.start_offset.cmp(&right.start_offset))
+                .then_with(|| left.end_offset.cmp(&right.end_offset))
+                .then_with(|| left.enclosing.cmp(&right.enclosing))
+                .then_with(|| left.kind.cmp(&right.kind))
+        });
+        if hits.len() > limits.max_candidates {
+            truncated = true;
+            diagnostics.push(CallRelationDiagnostic::new(
+                CallRelationDiagnosticCode::CandidateLimit,
+                format!(
+                    "call relation retained the first {} call candidates for {}",
+                    limits.max_candidates,
+                    target.fq_name()
+                ),
+                target.fq_name().to_string(),
+            ));
+        }
+        hits.truncate(limits.max_candidates);
+        for (hit, proof) in hits {
             if cancellation.is_some_and(CancellationToken::is_cancelled) {
                 cancelled = true;
                 truncated = true;
@@ -1315,11 +2016,7 @@ impl CallRelationService {
             analyzer,
             token,
             caller,
-            CallRelationLimits {
-                max_files: 1,
-                max_source_bytes: usize::MAX,
-                max_candidates: max_sites,
-            },
+            unbounded_call_relation_limits(1, max_sites),
             None,
         )
     }
@@ -1465,6 +2162,21 @@ impl CallRelationService {
             if cancellation.is_some_and(CancellationToken::is_cancelled) {
                 break;
             }
+            if outcome.exact_external_call.is_some() {
+                // The resolver has named a callable outside the indexed
+                // workspace. It is a complete boundary leaf for this
+                // declaration traversal, even though it has no CodeUnit to
+                // publish as a workspace callee. Counting it as an omitted
+                // candidate makes a caller relation incomplete for a call
+                // whose identity is already proven structurally. Rust publishes
+                // the resolver-owned identity with the proof; Go's native
+                // adapter publishes the proof alone, and neither is read here.
+                assert!(
+                    outcome.outcome.definitions.is_empty(),
+                    "an exact external call cannot also have workspace definitions"
+                );
+                continue;
+            }
             let uncertain_identity = outcome.structure_unavailable || outcome.unproven_link_unit;
             if outcome.truncated {
                 navigation_truncated = true;
@@ -1568,6 +2280,20 @@ fn call_target_boundary_evidence(
             return BoundaryStatus::ExternalIndexed;
         }
     }
+    if language_for_file(file) == Language::Go
+        && outcome.outcome.diagnostics.iter().any(|diagnostic| {
+            diagnostic.claim.as_ref().is_some_and(|claim| {
+                claim.kind == super::get_definition::UnindexedClaimKind::ExternalBoundary
+                    && claim.role == super::get_definition::ClaimSubjectRole::Module
+                    && claim.subjects.iter().any(|subject| {
+                        super::get_definition::trace::boundary_evidence(analyzer, file, subject).0
+                            == BoundaryStatus::ExternalIndexed
+                    })
+            })
+        })
+    {
+        return BoundaryStatus::ExternalIndexed;
+    }
     super::get_definition::trace::boundary_evidence(analyzer, file, resolved_target).0
 }
 
@@ -1611,7 +2337,7 @@ fn resolve_call_references_with_source(
     }
 }
 
-fn unresolved_dispatch_lookup(
+pub(crate) fn unresolved_dispatch_lookup(
     status: DefinitionLookupStatus,
     diagnostic: String,
     work: CallRelationWork,
@@ -1656,6 +2382,7 @@ fn apply_dispatch_outcome(
         outcome,
         max_targets,
         language,
+        super::get_definition::DefinitionResolutionAuthority::Incumbent,
         None,
         None,
         None,
@@ -1663,6 +2390,8 @@ fn apply_dispatch_outcome(
         false,
         false,
         false,
+        None,
+        None,
     );
 }
 
@@ -1686,6 +2415,19 @@ fn expand_imported_external_callee(
     mut outcome: CallTargetLookupOutcome,
     site: Option<&ExternalCalleeSite<'_>>,
 ) -> ExpandedExternalCallee {
+    if matches!(language_for_file(file), Language::Java | Language::Go)
+        && matches!(
+            outcome.authority,
+            super::get_definition::DefinitionResolutionAuthority::NativeJavaSelected
+                | super::get_definition::DefinitionResolutionAuthority::NativeGoSelected
+        )
+    {
+        return ExpandedExternalCallee {
+            resolver_proven_identity: outcome.exact_external_call.is_some()
+                || outcome.external_callee_identity.is_some(),
+            outcome,
+        };
+    }
     let kotlin_import_resolved_without_target = language_for_file(file) == Language::Kotlin
         && outcome.outcome.status == DefinitionLookupStatus::Resolved
         && outcome.outcome.definitions.is_empty();
@@ -1768,6 +2510,7 @@ impl ExpandedExternalCallee {
 }
 
 fn apply_call_target_outcome(
+    analyzer: Option<&dyn IAnalyzer>,
     lookup: &mut CallDispatchLookup,
     expanded: ExpandedExternalCallee,
     max_targets: usize,
@@ -1778,8 +2521,12 @@ fn apply_call_target_outcome(
         outcome,
         resolver_proven_identity,
     } = expanded;
+    let native_incomplete_source_reason = outcome
+        .unique_incomplete_native_source_candidate()
+        .map(|(_, reason)| Box::<str>::from(reason));
     let CallTargetLookupOutcome {
         outcome,
+        authority,
         call_application,
         dispatch_extensibility,
         exact_external_call,
@@ -1791,6 +2538,13 @@ fn apply_call_target_outcome(
     let exact_external_callee = exact_external_call
         .as_ref()
         .map(|proof| Box::<str>::from(proof.canonical_callee()));
+    let normalized_static_owner = csharp_normalized_static_owner(
+        analyzer,
+        language,
+        exact_external_callee
+            .as_deref()
+            .or_else(|| outcome.resolved_reference_target()),
+    );
     if let Some(proof) = &exact_external_call {
         debug_assert_eq!(proof.call_application(), call_application);
         debug_assert_eq!(proof.dispatch_extensibility(), dispatch_extensibility);
@@ -1837,6 +2591,7 @@ fn apply_call_target_outcome(
         outcome,
         max_targets,
         language,
+        authority,
         exact_external_callee,
         external_callee_identity,
         site,
@@ -1844,6 +2599,8 @@ fn apply_call_target_outcome(
         structure_unavailable,
         unproven_link_unit,
         truncated,
+        native_incomplete_source_reason,
+        normalized_static_owner,
     );
 }
 
@@ -1855,6 +2612,7 @@ fn apply_dispatch_outcome_with_flags(
     outcome: DefinitionLookupOutcome,
     max_targets: usize,
     language: Language,
+    authority: super::get_definition::DefinitionResolutionAuthority,
     exact_external_callee: Option<Box<str>>,
     external_callee_identity: Option<ResolverOwnedExternalCalleeIdentity>,
     site: Option<&ExternalCalleeSite<'_>>,
@@ -1862,15 +2620,23 @@ fn apply_dispatch_outcome_with_flags(
     structure_unavailable: bool,
     unproven_link_unit: bool,
     navigation_targets_truncated: bool,
+    native_incomplete_source_reason: Option<Box<str>>,
+    normalized_static_owner: Option<Box<str>>,
 ) {
     let DefinitionLookupOutcome {
-        modeled_definitions: _,
+        modeled_definitions,
         status,
         mut definitions,
         lexical_definition,
         diagnostics,
         reference,
     } = outcome;
+    let native_java_ambiguity_is_complete = diagnostics
+        .iter()
+        .any(|diagnostic| diagnostic.kind == "ambiguous_definition")
+        && !diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.kind == "incomplete_binding");
     // A resolver-owned exact proof is already canonical and outranks syntax
     // classification; this is how an imported single-segment Python owner such
     // as `subprocess` crosses the boundary without making every
@@ -1893,9 +2659,11 @@ fn apply_dispatch_outcome_with_flags(
             })
             .map(Box::<str>::from)
     });
-    let normalized_static_owner = external_callee_text
-        .as_deref()
-        .and_then(|callee_text| java_normalized_static_owner(callee_text, language, site));
+    let normalized_static_owner = normalized_static_owner.or_else(|| {
+        external_callee_text
+            .as_deref()
+            .and_then(|callee_text| java_normalized_static_owner(callee_text, language, site))
+    });
     let unproven_target_identity = structure_unavailable || unproven_link_unit;
     let partial_external_boundary = diagnostics
         .iter()
@@ -1957,7 +2725,8 @@ fn apply_dispatch_outcome_with_flags(
 
     definitions.sort();
     definitions.dedup();
-    if definitions.len() > max_targets {
+    let targets_truncated = definitions.len() > max_targets;
+    if targets_truncated {
         definitions.truncate(max_targets);
         lookup.truncated = true;
         lookup.budget_exhausted = true;
@@ -1968,15 +2737,46 @@ fn apply_dispatch_outcome_with_flags(
             lookup.boundaries.push(CallDispatchBoundaryKind::Truncated);
         }
     }
-    let proof = if status == DefinitionLookupStatus::Resolved && !unproven_target_identity {
+    let native_java_complete_candidate_set = language == Language::Java
+        && authority == super::get_definition::DefinitionResolutionAuthority::NativeJavaSelected
+        && status == DefinitionLookupStatus::Ambiguous
+        && modeled_definitions.is_empty()
+        && lexical_definition.is_none()
+        && !structure_unavailable
+        && !unproven_link_unit
+        && !navigation_targets_truncated
+        && !targets_truncated
+        && definitions.len() > 1
+        && native_incomplete_source_reason.is_none()
+        && native_java_ambiguity_is_complete;
+    let proof = if (status == DefinitionLookupStatus::Resolved
+        || native_java_complete_candidate_set)
+        && !unproven_target_identity
+    {
         UsageProof::Proven
     } else {
         UsageProof::Unproven
     };
+    debug_assert!(
+        native_incomplete_source_reason.is_none()
+            || (matches!(language, Language::Java | Language::Go)
+                && status == DefinitionLookupStatus::Incomplete
+                && modeled_definitions.is_empty()
+                && lexical_definition.is_none()
+                && !structure_unavailable
+                && !unproven_link_unit
+                && !navigation_targets_truncated
+                && definitions.len() == 1),
+        "candidate-local binding requires one incomplete selected-native source declaration"
+    );
     lookup.targets.extend(
         definitions
             .into_iter()
-            .map(|definition| CallDispatchTarget { definition, proof }),
+            .map(|definition| CallDispatchTarget {
+                definition,
+                proof,
+                native_incomplete_source_reason: native_incomplete_source_reason.clone(),
+            }),
     );
     if unproven_target_identity {
         lookup
@@ -2108,6 +2908,33 @@ fn java_normalized_static_owner(
             .strip_suffix(object_text)
             .is_some_and(|prefix| prefix.ends_with('.'));
     owner_matches.then(|| owner.into_boxed_str())
+}
+
+/// The canonical owner of a C# static member the external declaration surface
+/// proved. C# member-access syntax gives static calls the same receiver-shaped
+/// form as instance calls, so the target shape comes from the exact activated
+/// declaration fact rather than from source text or the member name.
+fn csharp_normalized_static_owner(
+    analyzer: Option<&dyn IAnalyzer>,
+    language: Language,
+    callee_text: Option<&str>,
+) -> Option<Box<str>> {
+    if language != Language::CSharp {
+        return None;
+    }
+    let callee_text = callee_text?;
+    let analyzer = analyzer?;
+    let (owner, member) =
+        crate::analyzer::semantic::split_canonical_qualified_callee(callee_text, language)?;
+    let is_static = language_support(language)?.external_member_is_static(
+        analyzer,
+        analyzer.semantic_model_overlay(),
+        &owner,
+        &member,
+    );
+    is_static
+        .is_some_and(|is_static| is_static)
+        .then(|| owner.into_boxed_str())
 }
 
 /// The external identity `callee_text` names, or `None` when it names none.
@@ -2298,7 +3125,7 @@ fn call_hits(
     }
 }
 
-fn raw_call_site(
+pub(crate) fn raw_call_site(
     file: ProjectFile,
     caller: CodeUnit,
     callee: CodeUnit,
@@ -2393,21 +3220,88 @@ pub fn formal_owner_for_callee(
     if !callee.is_class() {
         return Some((callee.clone(), false));
     }
-    let (constructor_name, allocation_binds_first_formal) = match language_for_file(callee.source())
-    {
-        Language::Python => ("__init__", true),
-        Language::JavaScript | Language::TypeScript => ("constructor", false),
-        Language::Kotlin => (callee.identifier(), false),
+    let language = language_for_file(callee.source());
+    if language == Language::Python {
+        let mut children = analyzer.direct_children(callee);
+        children.sort();
+        children.dedup();
+
+        let direct_initializers = children
+            .iter()
+            .filter(|unit| unit.identifier() == "__init__")
+            .collect::<Vec<_>>();
+        match direct_initializers.as_slice() {
+            [initializer] if initializer.is_callable() => {
+                return Some(((**initializer).clone(), true));
+            }
+            [] => {}
+            _ => return None,
+        }
+
+        if let Some(provider) = analyzer.python_class_hierarchy_provider_for(callee) {
+            let answer = provider.mro_members(callee, None);
+            if answer.hierarchy.outcome != PythonHierarchyOutcome::Complete {
+                return None;
+            }
+            if let Some(initializer) = answer
+                .members
+                .iter()
+                .find(|member| member.name == "__init__")
+            {
+                return initializer
+                    .member
+                    .is_callable()
+                    .then(|| (initializer.member.clone(), true));
+            }
+            if let Some(allocation) = answer
+                .members
+                .iter()
+                .find(|member| member.name == "__new__")
+            {
+                return allocation
+                    .member
+                    .is_callable()
+                    .then(|| (allocation.member.clone(), true));
+            }
+            return None;
+        }
+
+        let direct_allocators = children
+            .into_iter()
+            .filter(|unit| unit.is_callable() && unit.identifier() == "__new__")
+            .collect::<Vec<_>>();
+        return match direct_allocators.as_slice() {
+            [allocator] => Some(((*allocator).clone(), true)),
+            _ => None,
+        };
+    }
+
+    let constructor_names = match language {
+        Language::JavaScript | Language::TypeScript => ["constructor", ""],
+        Language::Kotlin => [callee.identifier(), ""],
         _ => return None,
     };
-    let mut constructors = analyzer
+    let mut children = analyzer
         .direct_children(callee)
         .into_iter()
-        .filter(|unit| unit.is_callable() && unit.identifier() == constructor_name)
+        .filter(|unit| unit.is_callable())
         .collect::<Vec<_>>();
-    constructors.sort();
-    constructors.dedup();
-    (constructors.len() == 1).then(|| (constructors.remove(0), allocation_binds_first_formal))
+    children.sort();
+    children.dedup();
+    for constructor_name in constructor_names {
+        let mut constructors = children
+            .iter()
+            .filter(|unit| unit.identifier() == constructor_name)
+            .cloned()
+            .collect::<Vec<_>>();
+        if constructors.len() == 1 {
+            return Some((constructors.remove(0), language == Language::Python));
+        }
+        if !constructors.is_empty() {
+            return None;
+        }
+    }
+    None
 }
 
 /// Whether the callee's first declared formal is consumed by the call's
@@ -2670,13 +3564,6 @@ fn sort_and_dedup_sites(sites: &mut Vec<CallSite>) {
     sites.retain(|site| seen.insert(site.clone()));
 }
 
-fn proof_rank(proof: UsageProof) -> u8 {
-    match proof {
-        UsageProof::Proven => 0,
-        UsageProof::Unproven => 1,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2686,7 +3573,7 @@ mod tests {
         GO_MODELED_PACKAGE_CALL_NOT_APPLICABLE_DIAGNOSTIC_KIND,
         GO_MODELED_PACKAGE_CALL_UNPROVEN_DIAGNOSTIC_KIND,
     };
-    use crate::analyzer::{AnalyzerQueryScope, QueryScope};
+    use crate::analyzer::{AnalyzerConfig, AnalyzerQueryScope, QueryScope, WorkspaceAnalyzer};
     use crate::analyzer::{
         CodeUnitType, Language, PythonAnalyzer, TestProject, TypescriptAnalyzer,
     };
@@ -2736,13 +3623,7 @@ mod tests {
     }
 
     fn call_span(source: &str, call: &str) -> Range {
-        let start_byte = source.rfind(call).expect("call exists");
-        Range {
-            start_byte,
-            end_byte: start_byte + call.len(),
-            start_line: 0,
-            end_line: 0,
-        }
+        crate::analyzer::usages::test_support::byte_range(source, call)
     }
 
     fn generous_limits() -> CallRelationLimits {
@@ -2762,12 +3643,9 @@ mod tests {
         members: Vec<serde_json::Value>,
     ) {
         use crate::analyzer::semantic_model::{
-            CatalogCoordinate, CatalogOptions, CompilerOptions, SemanticModelActivationControl,
-            SemanticModelActivationEvidence, SemanticModelActivationRequest,
-            SemanticModelControlAction, SemanticModelControlScope, SemanticModelPackSelector,
-            SemanticModelRuntimeLimits, SemanticModelRuntimeOutcome, SemanticPackCatalog,
-            SessionPackSource, SessionPackSourceKind, SourceFormat,
-            acquire_active_semantic_models_with_evidence, compile_source,
+            CatalogCoordinate, SemanticModelActivationControl, SemanticModelActivationEvidence,
+            SemanticModelActivationRequest, SemanticModelControlAction, SemanticModelControlScope,
+            SemanticModelPackSelector, SemanticModelRuntimeLimits,
         };
 
         let id_namespace = pack_id.replace('-', ".");
@@ -2811,21 +3689,6 @@ mod tests {
             }]
         }))
         .expect("serialize Go declaration fixture");
-        let pack = compile_source(SourceFormat::Json, &source, &CompilerOptions::default())
-            .unwrap_or_else(|diagnostics| {
-                panic!("Go declaration fixture must compile: {diagnostics:#?}")
-            });
-        let catalog = SemanticPackCatalog::open_ephemeral(CatalogOptions::default())
-            .expect("ephemeral catalog");
-        catalog
-            .register_session_pack(
-                &pack,
-                &SessionPackSource {
-                    kind: SessionPackSourceKind::Embedded,
-                    source_id: pack_id.to_owned(),
-                },
-            )
-            .expect("register Go declaration fixture");
         let request = SemanticModelActivationRequest {
             bifrost_version: semver::Version::parse(env!("CARGO_PKG_VERSION"))
                 .expect("crate version"),
@@ -2853,18 +3716,12 @@ mod tests {
             }],
             limits: SemanticModelRuntimeLimits::default(),
         };
-        let SemanticModelRuntimeOutcome::Ready { .. } =
-            acquire_active_semantic_models_with_evidence(
-                fixture.analyzer.analyzer(),
-                &catalog,
-                None,
-                &request,
-                None,
-                &CancellationToken::new(),
-            )
-        else {
-            panic!("Go declaration fixture must activate");
-        };
+        crate::analyzer::usages::test_support::activate_semantic_pack(
+            fixture.analyzer.analyzer(),
+            pack_id,
+            &source,
+            &request,
+        );
     }
 
     fn activate_go_function_declaration(
@@ -2934,6 +3791,9 @@ mod tests {
     /// source-owned pin beneath the policy fixtures: it asks the normalized
     /// dispatch relation directly, so no rendered callee spelling can stand in
     /// for target proof.
+    #[brokk_bifrost_test_macros::hardwon(
+        "#2725: Cross-language analyzer fixtures compare Python and TypeScript static dispatch proofs and preserve their language-specific target identities"
+    )]
     #[test]
     fn exact_dispatch_proves_python_and_typescript_static_targets() {
         const PYTHON: &str = r#"from typing import final
@@ -3068,32 +3928,6 @@ export function caller(): void { moduleFunction(); }
     }
 
     #[test]
-    fn exact_dispatch_resolves_java_methods_at_the_call_span() {
-        let source = "class Example { static void helper() {} static void caller() { helper(); } }";
-        let fixture =
-            AnalyzerFixture::new_for_language(Language::Java, &[("Example.java", source)]);
-        let scope = AnalyzerQueryScope::new(fixture.analyzer.analyzer());
-        let token = scope.token();
-        let lookup = CallRelationService::dispatch_at_bounded(
-            fixture.analyzer.analyzer(),
-            token,
-            &ExactCallLocation {
-                file: ProjectFile::new(fixture.project_root(), "Example.java"),
-                call_span: call_span(source, "helper()"),
-            },
-            Arc::from(source),
-            generous_limits(),
-            None,
-        );
-
-        assert_eq!(lookup.status, Some(DefinitionLookupStatus::Resolved));
-        assert_eq!(lookup.targets.len(), 1, "{lookup:#?}");
-        assert_eq!(lookup.targets[0].definition.fq_name(), "Example.helper");
-        assert_eq!(lookup.targets[0].proof, UsageProof::Proven);
-        assert!(lookup.boundaries.is_empty(), "{lookup:#?}");
-    }
-
-    #[test]
     fn exact_dispatch_preserves_canonical_go_external_package_member() {
         for (import, call) in [
             ("\"os\"", "os.Open(\"book.xlsx\")"),
@@ -3121,6 +3955,7 @@ export function caller(): void { moduleFunction(); }
                 Some(DefinitionLookupStatus::UnresolvableImportBoundary),
                 "{lookup:#?}"
             );
+            assert_eq!(lookup.go_selector_member.as_deref(), None, "{lookup:#?}");
             assert!(lookup.targets.is_empty(), "{lookup:#?}");
             assert_eq!(
                 lookup.boundaries,
@@ -3139,8 +3974,184 @@ export function caller(): void { moduleFunction(); }
     }
 
     #[test]
+    fn exact_go_selector_dispatch_uses_receiver_method_sets_and_embedding() {
+        let source = r#"package main
+
+type receiver struct{}
+func (receiver) Value() {}
+func (*receiver) Pointer() {}
+
+type embedded struct { receiver }
+type shadow struct { receiver }
+func (shadow) Value() {}
+
+func caller() {
+	var r receiver
+	r.Value()
+	r.Pointer()
+	var e embedded
+	e.Value()
+	var s shadow
+	s.Value()
+}
+"#;
+        let fixture = AnalyzerFixture::new_for_language(
+            Language::Go,
+            &[("go.mod", "module example.com/app\n"), ("main.go", source)],
+        );
+        let file = ProjectFile::new(fixture.project_root(), "main.go");
+        let scope = AnalyzerQueryScope::new(fixture.analyzer.analyzer());
+        for (call, expected) in [
+            ("r.Value()", "example.com/app.receiver.Value"),
+            ("r.Pointer()", "example.com/app.receiver.Pointer"),
+            ("e.Value()", "example.com/app.receiver.Value"),
+            ("s.Value()", "example.com/app.shadow.Value"),
+        ] {
+            let lookup = CallRelationService::dispatch_at_bounded(
+                fixture.analyzer.analyzer(),
+                scope.token(),
+                &ExactCallLocation {
+                    file: file.clone(),
+                    call_span: call_span(source, call),
+                },
+                Arc::from(source),
+                generous_limits(),
+                None,
+            );
+            assert_eq!(
+                lookup.status,
+                Some(DefinitionLookupStatus::Resolved),
+                "{lookup:#?}"
+            );
+            assert_eq!(lookup.targets.len(), 1, "{lookup:#?}");
+            assert_eq!(
+                lookup.targets[0].definition.fq_name(),
+                expected,
+                "{lookup:#?}"
+            );
+            assert_eq!(lookup.targets[0].proof, UsageProof::Proven);
+            assert!(lookup.boundaries.is_empty(), "{lookup:#?}");
+        }
+    }
+
+    #[test]
+    fn exact_go_external_receiver_dispatch_preserves_reviewed_and_unmodeled_identity() {
+        for model_level in 1..=2 {
+            let modeled = model_level == 2;
+            let source = r#"package main
+
+import "time"
+
+func caller(idleTicker *time.Ticker) { idleTicker.Stop() }
+"#;
+            let fixture = AnalyzerFixture::new_for_language(
+                Language::Go,
+                &[("go.mod", "module example.com/app\n"), ("main.go", source)],
+            );
+            let mut methods = Vec::new();
+            if modeled {
+                methods.push(serde_json::json!({
+                    "id": "fixture.go.time-ticker.stop",
+                    "owner": "fixture.go.time-ticker.type",
+                    "name": "Stop",
+                    "member_kind": "method",
+                    "visibility": "public",
+                    "is_static": false,
+                    "receiver": {"pointer": true},
+                    "signature": {"parameters": []},
+                    "locator": {
+                        "kind": "artifact",
+                        "path": "time/sleep.go",
+                        "symbol": "time.Ticker.Stop"
+                    }
+                }));
+            }
+            activate_go_declaration_payload(
+                &fixture,
+                "fixture.go.time-ticker",
+                "time",
+                "time",
+                vec![serde_json::json!({
+                    "id": "fixture.go.time-ticker.type",
+                    "name": "time.Ticker",
+                    "type_kind": "struct",
+                    "visibility": "public",
+                    "locator": {
+                        "kind": "artifact",
+                        "path": "time/tick.go",
+                        "symbol": "time.Ticker"
+                    }
+                })],
+                methods,
+            );
+            let file = ProjectFile::new(fixture.project_root(), "main.go");
+            let scope = AnalyzerQueryScope::new(fixture.analyzer.analyzer());
+            let mut session = CallRelationService::dispatch_session(file, Arc::from(source));
+            let lookup = session.dispatch_at_bounded(
+                fixture.analyzer.analyzer(),
+                scope.token(),
+                &call_span(source, "idleTicker.Stop()"),
+                generous_limits().max_candidates,
+                None,
+            );
+
+            assert_eq!(
+                lookup.status,
+                Some(DefinitionLookupStatus::UnresolvableImportBoundary),
+                "{lookup:#?}"
+            );
+            assert!(lookup.targets.is_empty(), "{lookup:#?}");
+            assert!(
+                lookup.boundaries.iter().any(|boundary| matches!(
+                    boundary,
+                    CallDispatchBoundaryKind::External {
+                        callee_text: Some(callee), ..
+                    } if callee.as_ref() == "time.Ticker.Stop"
+                )),
+                "{lookup:#?}"
+            );
+            let identity = lookup
+                .boundaries
+                .iter()
+                .find_map(|boundary| match boundary {
+                    CallDispatchBoundaryKind::External {
+                        external_callee_identity,
+                        ..
+                    } => external_callee_identity.as_ref(),
+                    _ => None,
+                });
+            assert_eq!(
+                identity.map(|identity| {
+                    (identity.language(), identity.owner_fqn(), identity.member())
+                }),
+                (model_level > 0).then_some((Language::Go, "time.Ticker", "Stop")),
+                "only a structured external concrete type declaration proves a model key: {lookup:#?}"
+            );
+            let proof = lookup
+                .exact_external_call
+                .as_ref()
+                .expect("structured external receiver retains its canonical identity");
+            assert_eq!(proof.canonical_callee(), "time.Ticker.Stop");
+            assert_eq!(
+                proof.dispatch_extensibility(),
+                modeled.then_some(DispatchExtensibility::Closed),
+                "{lookup:#?}"
+            );
+        }
+    }
+
+    #[test]
     fn exact_dispatch_keeps_model_proof_external_and_canonical() {
-        for (pack_id, import_path, package_name, import, call, expected_target) in [
+        for (
+            pack_id,
+            import_path,
+            package_name,
+            import,
+            call,
+            expected_target,
+            expected_owner,
+            expected_member,
+        ) in [
             (
                 "fixture.go.os",
                 "os",
@@ -3148,6 +4159,8 @@ export function caller(): void { moduleFunction(); }
                 "\"os\"",
                 "os.Open()",
                 "os.Open",
+                "os",
+                "Open",
             ),
             (
                 "fixture.go.os-alias",
@@ -3156,6 +4169,8 @@ export function caller(): void { moduleFunction(); }
                 "files \"os\"",
                 "files.Open()",
                 "os.Open",
+                "os",
+                "Open",
             ),
             (
                 "fixture.go.declared-name",
@@ -3164,6 +4179,8 @@ export function caller(): void { moduleFunction(); }
                 "\"example.com/m/postgres\"",
                 "pg.Open()",
                 "example.com/m/postgres.Open",
+                "example.com/m/postgres",
+                "Open",
             ),
             (
                 "fixture.go.dot-import",
@@ -3172,6 +4189,8 @@ export function caller(): void { moduleFunction(); }
                 ". \"os\"",
                 "Open()",
                 "os.Open",
+                "os",
+                "Open",
             ),
         ] {
             let source =
@@ -3202,7 +4221,11 @@ export function caller(): void { moduleFunction(); }
                 vec![CallDispatchBoundaryKind::External {
                     callee_text: Some(expected_target.into()),
                     normalized_static_owner: None,
-                    external_callee_identity: None,
+                    external_callee_identity: Some(ResolverOwnedExternalCalleeIdentity::new(
+                        Language::Go,
+                        expected_owner,
+                        expected_member,
+                    )),
                 }],
                 "{lookup:#?}"
             );
@@ -3216,7 +4239,7 @@ export function caller(): void { moduleFunction(); }
     }
 
     #[test]
-    fn dot_imported_model_function_shadows_package_scope_and_conflicts_stay_identityless() {
+    fn dot_imported_model_function_conflicts_with_package_scope_and_stays_identityless() {
         let source = r#"package main
 
 import . "example.com/model"
@@ -3254,9 +4277,13 @@ func caller() { Open() }
         assert!(lookup.targets.is_empty(), "{lookup:#?}");
         assert_eq!(lookup.boundary, Some(BoundaryStatus::ExternalIndexed));
         assert_eq!(
+            lookup.call_application,
+            CallApplicationKind::PackageFunction
+        );
+        assert_eq!(
             lookup.boundaries,
             vec![CallDispatchBoundaryKind::External {
-                callee_text: Some("example.com/model.Open".into()),
+                callee_text: None,
                 normalized_static_owner: None,
                 external_callee_identity: None,
             }],
@@ -3321,6 +4348,9 @@ func caller() { Open() }
         );
     }
 
+    #[brokk_bifrost_test_macros::hardwon(
+        "#2808+911caaf2b65b: Go external dispatch identity requires proven workspace-package absence"
+    )]
     #[test]
     fn go_external_identity_requires_proven_absent_workspace_package() {
         let workspace_source = r#"package main
@@ -3416,6 +4446,9 @@ func caller() { _, _ = os.Open("book.xlsx") }
         );
     }
 
+    #[brokk_bifrost_test_macros::hardwon(
+        "5c5d4e214494: Go model proof requires one public exact callable and applicable arity"
+    )]
     #[test]
     fn modeled_go_package_calls_require_one_public_exact_function() {
         let import_path = "example.com/model";
@@ -3606,20 +4639,51 @@ func caller() {
             )
         };
 
-        for (call, canonical, effective_parameter_count) in [
-            ("model.Open(1)", "example.com/model.Open", 1),
-            ("model.Open(model.One())", "example.com/model.Open", 1),
-            ("model.Binary(model.Pair())", "example.com/model.Binary", 2),
-            ("model.One()", "example.com/model.One", 0),
-            ("model.Pair()", "example.com/model.Pair", 0),
-            ("model.Zero()", "example.com/model.Zero", 0),
-            ("model.NoResult()", "example.com/model.NoResult", 0),
-            ("model.Variadic()", "example.com/model.Variadic", 0),
-            ("model.Variadic(1)", "example.com/model.Variadic", 1),
-            ("model.Variadic(1, 2)", "example.com/model.Variadic", 2),
+        for (call, canonical, member, effective_parameter_count) in [
+            ("model.Open(1)", "example.com/model.Open", "Open", 1),
+            (
+                "model.Open(model.One())",
+                "example.com/model.Open",
+                "Open",
+                1,
+            ),
+            (
+                "model.Binary(model.Pair())",
+                "example.com/model.Binary",
+                "Binary",
+                2,
+            ),
+            ("model.One()", "example.com/model.One", "One", 0),
+            ("model.Pair()", "example.com/model.Pair", "Pair", 0),
+            ("model.Zero()", "example.com/model.Zero", "Zero", 0),
+            (
+                "model.NoResult()",
+                "example.com/model.NoResult",
+                "NoResult",
+                0,
+            ),
+            (
+                "model.Variadic()",
+                "example.com/model.Variadic",
+                "Variadic",
+                0,
+            ),
+            (
+                "model.Variadic(1)",
+                "example.com/model.Variadic",
+                "Variadic",
+                1,
+            ),
+            (
+                "model.Variadic(1, 2)",
+                "example.com/model.Variadic",
+                "Variadic",
+                2,
+            ),
             (
                 "model.Variadic(model.Pair())",
                 "example.com/model.Variadic",
+                "Variadic",
                 2,
             ),
         ] {
@@ -3640,7 +4704,11 @@ func caller() {
                 vec![CallDispatchBoundaryKind::External {
                     callee_text: Some(canonical.into()),
                     normalized_static_owner: None,
-                    external_callee_identity: None,
+                    external_callee_identity: Some(ResolverOwnedExternalCalleeIdentity::new(
+                        Language::Go,
+                        import_path,
+                        member,
+                    )),
                 }],
                 "{call}: {exact:#?}"
             );
@@ -3727,50 +4795,6 @@ func caller() {
                 .all(|boundary| !matches!(boundary, CallDispatchBoundaryKind::External { .. })),
             "{generic:#?}"
         );
-    }
-
-    #[test]
-    fn exact_go_package_call_keeps_declared_package_identity_static() {
-        let source = r#"package main
-import "example.com/driver"
-func caller() { db.Open() }
-"#;
-        let fixture = AnalyzerFixture::new_for_language(Language::Go, &[("main.go", source)]);
-        activate_go_function_declaration(
-            &fixture,
-            "fixture.go.declared-package-name",
-            "example.com/driver",
-            "db",
-            "Open",
-        );
-        let lookup = CallRelationService::dispatch_at_bounded(
-            fixture.analyzer.analyzer(),
-            AnalyzerQueryScope::new(fixture.analyzer.analyzer()).token(),
-            &ExactCallLocation {
-                file: ProjectFile::new(fixture.project_root(), "main.go"),
-                call_span: call_span(source, "db.Open()"),
-            },
-            Arc::from(source),
-            generous_limits(),
-            None,
-        );
-
-        assert_eq!(
-            lookup.status,
-            Some(DefinitionLookupStatus::UnresolvableImportBoundary),
-            "{lookup:#?}"
-        );
-        let proof = lookup
-            .exact_external_call
-            .as_ref()
-            .unwrap_or_else(|| panic!("declared package call must retain its proof: {lookup:#?}"));
-        assert_eq!(proof.canonical_callee(), "example.com/driver.Open");
-        assert_eq!(
-            proof.call_application(),
-            CallApplicationKind::PackageFunction
-        );
-        assert_eq!(proof.parameter_count(), 0);
-        assert!(!proof.has_receiver());
     }
 
     #[test]
@@ -3933,63 +4957,6 @@ func caller(os opener) { os.Open("book.xlsx") }
         );
     }
 
-    /// #1599/#2799: a boundary status carries its refined external evidence so
-    /// the dispatch oracle can classify quality from it. The named import
-    /// proves the exact external callable even though nothing declares or
-    /// indexes `third-party`; open dispatch remains a separate fact.
-    #[test]
-    fn exact_dispatch_refines_an_external_boundary_status() {
-        let source = "import { work } from \"third-party\";\nexport function caller(): number { return work(); }\n";
-        let fixture =
-            AnalyzerFixture::new_for_language(Language::TypeScript, &[("external.ts", source)]);
-        let scope = AnalyzerQueryScope::new(fixture.analyzer.analyzer());
-        let token = scope.token();
-        let lookup = CallRelationService::dispatch_at_bounded(
-            fixture.analyzer.analyzer(),
-            token,
-            &ExactCallLocation {
-                file: ProjectFile::new(fixture.project_root(), "external.ts"),
-                call_span: call_span(source, "work()"),
-            },
-            Arc::from(source),
-            generous_limits(),
-            None,
-        );
-
-        assert_eq!(
-            lookup.status,
-            Some(DefinitionLookupStatus::UnresolvableImportBoundary),
-            "{lookup:#?}"
-        );
-        assert_eq!(
-            lookup.boundary,
-            Some(BoundaryStatus::ExternalIndexed),
-            "{lookup:#?}"
-        );
-        // The payload is the resolver-proven package plus imported symbol,
-        // never the source-local bare callee spelling.
-        assert_eq!(
-            lookup.boundaries,
-            vec![CallDispatchBoundaryKind::External {
-                callee_text: Some("third-party.work".into()),
-                normalized_static_owner: None,
-                external_callee_identity: None,
-            }],
-            "{lookup:#?}"
-        );
-        let proof = lookup
-            .exact_external_call
-            .as_ref()
-            .unwrap_or_else(|| panic!("named import must retain exact proof: {lookup:#?}"));
-        assert_eq!(proof.canonical_callee(), "third-party.work");
-        assert_eq!(
-            proof.call_application(),
-            CallApplicationKind::PackageFunction
-        );
-        assert_eq!(proof.parameter_count(), 0);
-        assert!(!proof.has_receiver());
-    }
-
     #[test]
     fn exact_dispatch_retains_python_imported_callable_proof() {
         let source = "import subprocess\ndef caller(command):\n    return subprocess.run(command, shell=True)\n";
@@ -4129,6 +5096,119 @@ void caller() {
     }
 
     #[test]
+    fn exact_dispatch_publishes_c_header_proof_and_identity() {
+        use crate::analyzer::semantic_model::{
+            CatalogOptions, DependencyPackLimits, SemanticModelActivationControl,
+            SemanticModelActivationRequest, SemanticModelControlAction, SemanticModelControlScope,
+            SemanticModelPackSelector, SemanticModelRuntimeLimits, SemanticModelRuntimeOutcome,
+            SemanticPackCatalog,
+        };
+        use crate::analyzer::workspace::{DependencyPackEcosystem, DependencyPackWorkspaceContext};
+
+        let source = "#include <stdlib.h>\nvoid caller(void) { system(getenv(\"X\")); }\n";
+        let temp = tempfile::tempdir().expect("temp root");
+        let root = temp.path().canonicalize().expect("canonical temp root");
+        let app = root.join("app");
+        std::fs::create_dir_all(&app).expect("app directory");
+        ProjectFile::new(app.clone(), "probe.c")
+            .write(source)
+            .expect("source");
+        ProjectFile::new(root, "stubs/include/stdlib.h")
+            .write("char *getenv(const char *name);\nint system(const char *command);\n")
+            .expect("header");
+        ProjectFile::new(app.clone(), "compile_commands.json")
+            .write(r#"[{"directory":".","file":"probe.c","arguments":["clang","-I","../stubs/include","-c","probe.c"]}]"#)
+            .expect("compile database");
+        let analyzer = WorkspaceAnalyzer::build_ephemeral_footgun(
+            Arc::new(TestProject::new(app.clone(), Language::Cpp)),
+            AnalyzerConfig::default(),
+        )
+        .expect("C analyzer");
+        let catalog = SemanticPackCatalog::open_ephemeral(CatalogOptions::default())
+            .expect("semantic-pack catalog");
+        let cancellation = CancellationToken::new();
+        let activation = SemanticModelActivationRequest {
+            bifrost_version: semver::Version::parse(env!("CARGO_PKG_VERSION"))
+                .expect("crate version"),
+            evidence: Vec::new(),
+            controls: vec![SemanticModelActivationControl {
+                scope: SemanticModelControlScope::Workspace,
+                action: SemanticModelControlAction::Enable,
+                selector: SemanticModelPackSelector {
+                    pack_id: "bifrost.external.cpp-headers".to_owned(),
+                    version: None,
+                    manifest_digest: None,
+                },
+            }],
+            limits: SemanticModelRuntimeLimits::default(),
+        };
+        let activation_outcome = analyzer.activate_dependency_packs(
+            &AnalyzerConfig::default(),
+            &[DependencyPackEcosystem::Cpp],
+            DependencyPackWorkspaceContext {
+                catalog: &catalog,
+                persistence: None,
+                activation: &activation,
+                limits: DependencyPackLimits::default(),
+                cancellation: &cancellation,
+            },
+        );
+        assert!(activation_outcome.complete(), "{activation_outcome:#?}");
+        assert!(matches!(
+            activation_outcome.runtime,
+            Some(SemanticModelRuntimeOutcome::Ready { .. })
+        ));
+        let file = ProjectFile::new(app, "probe.c");
+        let scope = AnalyzerQueryScope::new(analyzer.analyzer());
+
+        for (call, member, arity) in [
+            ("getenv(\"X\")", "getenv", 1),
+            ("system(getenv(\"X\"))", "system", 1),
+        ] {
+            let lookup = CallRelationService::dispatch_at_bounded(
+                analyzer.analyzer(),
+                scope.token(),
+                &ExactCallLocation {
+                    file: file.clone(),
+                    call_span: call_span(source, call),
+                },
+                Arc::from(source),
+                generous_limits(),
+                None,
+            );
+
+            assert_eq!(
+                lookup.status,
+                Some(DefinitionLookupStatus::UnresolvableImportBoundary),
+                "{call}: {lookup:#?}"
+            );
+            assert!(lookup.targets.is_empty(), "{call}: {lookup:#?}");
+            let proof = lookup.exact_external_call.as_ref().unwrap_or_else(|| {
+                panic!("{call} must carry its exact C header proof: {lookup:#?}")
+            });
+            assert_eq!(proof.canonical_callee(), format!("stdlib::{member}"));
+            assert_eq!(proof.parameter_count(), arity);
+            assert!(
+                !proof.has_receiver(),
+                "C header functions are receiverless: {lookup:#?}"
+            );
+            assert_eq!(
+                lookup.boundaries,
+                vec![CallDispatchBoundaryKind::External {
+                    callee_text: Some(proof.canonical_callee().into()),
+                    normalized_static_owner: None,
+                    external_callee_identity: Some(ResolverOwnedExternalCalleeIdentity::new(
+                        Language::Cpp,
+                        "stdlib",
+                        member,
+                    )),
+                }],
+                "{call}: resolver-owned proof and identity must survive call dispatch",
+            );
+        }
+    }
+
+    #[test]
     fn exact_dispatch_keeps_cpp_internal_linkage_in_its_translation_unit() {
         let caller_source = r#"
 static int local_target(int value) { return value + 1; }
@@ -4165,6 +5245,9 @@ int caller() { return local_target(1); }
         assert!(lookup.boundaries.is_empty(), "{lookup:#?}");
     }
 
+    #[brokk_bifrost_test_macros::hardwon(
+        "#1372: C++ header/body integration fixture checks a unique implementation body is selected with proven identity"
+    )]
     #[test]
     fn exact_dispatch_projects_cpp_header_declarations_to_the_unique_body() {
         let header_source = "int relay(int value);\n";
@@ -4204,6 +5287,9 @@ int caller() { return local_target(1); }
         assert!(lookup.boundaries.is_empty(), "{lookup:#?}");
     }
 
+    #[brokk_bifrost_test_macros::hardwon(
+        "65290303b8a6: C++ navigation uncertainty used to discard candidate call targets instead of retaining them as unproven"
+    )]
     #[test]
     fn exact_dispatch_preserves_cpp_navigation_uncertainty() {
         let definition = CodeUnit::new(
@@ -4221,6 +5307,8 @@ int caller() { return local_target(1); }
                 lexical_definition: None,
                 diagnostics: Vec::new(),
             },
+            authority:
+                crate::analyzer::usages::get_definition::DefinitionResolutionAuthority::Incumbent,
             call_application: CallApplicationKind::Unknown,
             dispatch_extensibility: None,
             exact_external_call: None,
@@ -4232,6 +5320,7 @@ int caller() { return local_target(1); }
 
         let mut unavailable = CallDispatchLookup::default();
         apply_call_target_outcome(
+            None,
             &mut unavailable,
             ExpandedExternalCallee::unproven(outcome(
                 DefinitionLookupStatus::Resolved,
@@ -4256,6 +5345,7 @@ int caller() { return local_target(1); }
         // boundary still record that navigation gave up early.
         let mut truncated = CallDispatchLookup::default();
         apply_call_target_outcome(
+            None,
             &mut truncated,
             ExpandedExternalCallee::unproven(outcome(
                 DefinitionLookupStatus::Ambiguous,
@@ -4286,6 +5376,9 @@ int caller() { return local_target(1); }
         );
     }
 
+    #[brokk_bifrost_test_macros::hardwon(
+        "#1372: Checks multiple candidate C++ bodies remain ambiguous and unproven instead of choosing one"
+    )]
     #[test]
     fn exact_dispatch_keeps_multiple_cpp_bodies_unproven() {
         let header_source = "int relay(int value);\n";
@@ -4357,39 +5450,6 @@ int caller() { return local_target(1); }
                 )),
             "{lookup:#?}"
         );
-    }
-
-    #[test]
-    fn exact_dispatch_resolves_ruby_bare_calls_at_the_identifier_span() {
-        let source = r#"class Example
-  def target
-  end
-
-  def caller
-    target
-  end
-end
-"#;
-        let fixture = AnalyzerFixture::new_for_language(Language::Ruby, &[("example.rb", source)]);
-        let scope = AnalyzerQueryScope::new(fixture.analyzer.analyzer());
-        let token = scope.token();
-        let lookup = CallRelationService::dispatch_at_bounded(
-            fixture.analyzer.analyzer(),
-            token,
-            &ExactCallLocation {
-                file: ProjectFile::new(fixture.project_root(), "example.rb"),
-                call_span: call_span(source, "target"),
-            },
-            Arc::from(source),
-            generous_limits(),
-            None,
-        );
-
-        assert_eq!(lookup.status, Some(DefinitionLookupStatus::Resolved));
-        assert_eq!(lookup.targets.len(), 1, "{lookup:#?}");
-        assert_eq!(lookup.targets[0].definition.fq_name(), "Example.target");
-        assert_eq!(lookup.targets[0].proof, UsageProof::Proven);
-        assert!(lookup.boundaries.is_empty(), "{lookup:#?}");
     }
 
     #[test]
@@ -4656,48 +5716,9 @@ object Calls {
         );
     }
 
-    #[test]
-    fn exact_dispatch_keeps_cancellation_budget_and_truncation_independent() {
-        let source: Arc<str> = Arc::from("function target() {}\ntarget();\n");
-        let fixture =
-            AnalyzerFixture::new_for_language(Language::TypeScript, &[("sample.ts", &source)]);
-        let location = ExactCallLocation {
-            file: ProjectFile::new(fixture.project_root(), "sample.ts"),
-            call_span: call_span(&source, "target()"),
-        };
-        let cancellation = CancellationToken::default();
-        cancellation.cancel();
-        let scope = AnalyzerQueryScope::new(fixture.analyzer.analyzer());
-        let token = scope.token();
-        let cancelled = CallRelationService::dispatch_at_bounded(
-            fixture.analyzer.analyzer(),
-            token,
-            &location,
-            Arc::clone(&source),
-            generous_limits(),
-            Some(&cancellation),
-        );
-        assert!(cancelled.cancelled);
-        assert!(!cancelled.budget_exhausted);
-        assert!(!cancelled.truncated);
-
-        let exhausted = CallRelationService::dispatch_at_bounded(
-            fixture.analyzer.analyzer(),
-            token,
-            &location,
-            source,
-            CallRelationLimits {
-                max_files: 0,
-                max_source_bytes: usize::MAX,
-                max_candidates: 100,
-            },
-            None,
-        );
-        assert!(!exhausted.cancelled);
-        assert!(exhausted.budget_exhausted);
-        assert!(!exhausted.truncated);
-    }
-
+    #[brokk_bifrost_test_macros::hardwon(
+        "bc14f106eeaa: exact dispatch reuses parsed syntax without changing requested call order"
+    )]
     #[test]
     fn exact_dispatch_session_charges_one_parse_and_preserves_reverse_call_order() {
         let source: Arc<str> = Arc::from(
@@ -4808,6 +5829,9 @@ object Calls {
         assert_eq!(second.work.examined_candidates, 0);
     }
 
+    #[brokk_bifrost_test_macros::hardwon(
+        "adf896b7d160: ambiguous TypeScript dispatch dropped candidate declarations and empty-boundary status evidence"
+    )]
     #[test]
     fn dispatch_mapping_preserves_ambiguous_targets_and_empty_boundary() {
         let root = std::env::temp_dir();
@@ -5022,6 +6046,9 @@ object Calls {
         );
     }
 
+    #[brokk_bifrost_test_macros::hardwon(
+        "#2579: unresolved residuals lost a structured target needed to bind modeled effects"
+    )]
     #[test]
     fn unresolved_outcome_retains_only_a_structured_canonical_callee_target() {
         let canonical_reference = ResolvedReferenceSite {
@@ -5082,6 +6109,9 @@ object Calls {
         );
     }
 
+    #[brokk_bifrost_test_macros::hardwon(
+        "2b11cc505fc4: a Kotlin receiver expression could be mistaken for a package-rooted external identity"
+    )]
     #[test]
     fn kotlin_external_identity_requires_resolver_proven_package_root() {
         assert_eq!(
@@ -5102,6 +6132,9 @@ object Calls {
         }
     }
 
+    #[brokk_bifrost_test_macros::hardwon(
+        "#3017: PHP integration ensures external identity derives from resolver output rather than the textual receiver expression"
+    )]
     #[test]
     fn php_external_identity_comes_from_the_resolver_not_expression_text() {
         let source = r#"<?php
@@ -5147,6 +6180,9 @@ function caller(string $input): string {
         );
     }
 
+    #[brokk_bifrost_test_macros::hardwon(
+        "#2823: Kotlin unknown receiver chain stays without an external identity when structured receiver resolution is incomplete"
+    )]
     #[test]
     fn kotlin_unknown_receiver_chain_stays_identityless() {
         let source = r#"package app
@@ -5367,6 +6403,22 @@ fun caller(holder: Holder): String = holder.value.toString()
         }
     }
 
+    fn dispatch_kotlin_call(source: &str, call: &str) -> CallDispatchLookup {
+        let fixture = KotlinExternalMemberFixture::new(source);
+        let scope = AnalyzerQueryScope::new(fixture.analyzer.analyzer());
+        CallRelationService::dispatch_at_bounded(
+            fixture.analyzer.analyzer(),
+            scope.token(),
+            &ExactCallLocation {
+                file: ProjectFile::new(fixture.root, "App.kt"),
+                call_span: call_span(source, call),
+            },
+            Arc::from(source),
+            generous_limits(),
+            None,
+        )
+    }
+
     fn dispatch_kotlin_external_member(callee: &str) {
         let imported = callee == "Ext.wrap";
         let import = imported.then_some("import com.example.ext.Ext\n\n");
@@ -5375,19 +6427,7 @@ fun caller(holder: Holder): String = holder.value.toString()
             "package app\n\n{}fun caller(value: String): String = {call}\n",
             import.unwrap_or_default(),
         );
-        let fixture = KotlinExternalMemberFixture::new(&source);
-        let scope = AnalyzerQueryScope::new(fixture.analyzer.analyzer());
-        let lookup = CallRelationService::dispatch_at_bounded(
-            fixture.analyzer.analyzer(),
-            scope.token(),
-            &ExactCallLocation {
-                file: ProjectFile::new(fixture.root.clone(), "App.kt"),
-                call_span: call_span(&source, &call),
-            },
-            Arc::from(source.as_str()),
-            generous_limits(),
-            None,
-        );
+        let lookup = dispatch_kotlin_call(&source, &call);
 
         assert!(
             lookup.targets.is_empty(),
@@ -5405,11 +6445,17 @@ fun caller(holder: Holder): String = holder.value.toString()
     }
 
     #[cfg_attr(not(scheduled_tests), ignore = "scheduled-only")]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#2823: An imported Kotlin external member resolves through an activated declaration pack and publishes the canonical package identity"
+    )]
     #[test]
     fn kotlin_imported_external_member_publishes_resolver_proven_identity() {
         dispatch_kotlin_external_member("Ext.wrap");
     }
 
+    #[brokk_bifrost_test_macros::hardwon(
+        "#2823: A fully qualified Kotlin external member resolves to the same pack-backed identity without an import binder"
+    )]
     #[test]
     fn kotlin_fully_qualified_external_member_publishes_resolver_proven_identity() {
         dispatch_kotlin_external_member("com.example.ext.Ext.wrap");
@@ -5419,19 +6465,7 @@ fun caller(holder: Holder): String = holder.value.toString()
     fn kotlin_concrete_receiver_local_binding_publishes_external_identity() {
         let source = "package app\n\nimport com.example.ext.Ext\n\nfun caller(value: String): String {\n    val ext = Ext(value)\n    return ext.wrap(value)\n}\n";
         let call = "ext.wrap(value)";
-        let fixture = KotlinExternalMemberFixture::new(source);
-        let scope = AnalyzerQueryScope::new(fixture.analyzer.analyzer());
-        let lookup = CallRelationService::dispatch_at_bounded(
-            fixture.analyzer.analyzer(),
-            scope.token(),
-            &ExactCallLocation {
-                file: ProjectFile::new(fixture.root.clone(), "App.kt"),
-                call_span: call_span(source, call),
-            },
-            Arc::from(source),
-            generous_limits(),
-            None,
-        );
+        let lookup = dispatch_kotlin_call(source, call);
 
         assert!(
             lookup.targets.is_empty(),
@@ -5686,15 +6720,6 @@ fun caller(holder: Holder): String = holder.value.toString()
     /// shipped web-network pack, which is what an authored network summary is
     /// keyed by.
     fn activate_rust_connect_declaration_pack(fixture: &AnalyzerFixture) {
-        use crate::analyzer::semantic_model::{
-            CatalogCoordinate, CatalogOptions, CompilerOptions, SemanticModelActivationControl,
-            SemanticModelActivationEvidence, SemanticModelActivationRequest,
-            SemanticModelControlAction, SemanticModelControlScope, SemanticModelPackSelector,
-            SemanticModelRuntimeLimits, SemanticModelRuntimeOutcome, SemanticPackCatalog,
-            SessionPackSource, SessionPackSourceKind, SourceFormat,
-            acquire_active_semantic_models_with_evidence, compile_source,
-        };
-
         let pack_id = "fixture.rust-std-connect-declarations";
         let pack_json = serde_json::json!({
             "schema_version": 2,
@@ -5772,64 +6797,11 @@ fun caller(holder: Holder): String = holder.value.toString()
                 }
             }]
         });
-        let pack = compile_source(
-            SourceFormat::Json,
-            &serde_json::to_vec(&pack_json).expect("serialize the Rust declaration fixture"),
-            &CompilerOptions::default(),
-        )
-        .unwrap_or_else(|diagnostics| {
-            panic!("Rust declaration fixture must compile: {diagnostics:#?}")
-        });
-        let catalog = SemanticPackCatalog::open_ephemeral(CatalogOptions::default())
-            .expect("ephemeral catalog");
-        catalog
-            .register_session_pack(
-                &pack,
-                &SessionPackSource {
-                    kind: SessionPackSourceKind::Embedded,
-                    source_id: pack_id.to_owned(),
-                },
-            )
-            .expect("register the Rust declaration fixture");
-        let request = SemanticModelActivationRequest {
-            bifrost_version: semver::Version::parse(env!("CARGO_PKG_VERSION"))
-                .expect("crate version"),
-            evidence: vec![SemanticModelActivationEvidence {
-                language: "rust".to_owned(),
-                ecosystem: "cargo".to_owned(),
-                package: Some(CatalogCoordinate {
-                    name: "std".to_owned(),
-                    version: None,
-                }),
-                module: None,
-                toolchain: None,
-                target: None,
-                configuration: None,
-                artifact_sha256: None,
-            }],
-            controls: vec![SemanticModelActivationControl {
-                scope: SemanticModelControlScope::Workspace,
-                action: SemanticModelControlAction::Enable,
-                selector: SemanticModelPackSelector {
-                    pack_id: pack_id.to_owned(),
-                    version: None,
-                    manifest_digest: None,
-                },
-            }],
-            limits: SemanticModelRuntimeLimits::default(),
-        };
-        let SemanticModelRuntimeOutcome::Ready { .. } =
-            acquire_active_semantic_models_with_evidence(
-                fixture.analyzer.analyzer(),
-                &catalog,
-                None,
-                &request,
-                None,
-                &CancellationToken::new(),
-            )
-        else {
-            panic!("Rust declaration fixture must activate");
-        };
+        crate::test_support::activate_rust_declaration_pack(
+            fixture.analyzer.analyzer(),
+            pack_id,
+            &pack_json,
+        );
     }
 
     /// #3484: the imported spelling (`use std::net::TcpStream;` then

@@ -7,20 +7,8 @@
 use super::*;
 use rusqlite::params;
 
-fn current_connection() -> Connection {
-    let mut conn = Connection::open_in_memory().unwrap();
-    configure_connection(&mut conn).unwrap();
-    migrate(&mut conn).unwrap();
-    conn
-}
-
 fn seal(conn: &Connection, blob_id: i64) -> rusqlite::Result<()> {
-    conn.execute(
-        "UPDATE source_fact_manifests
-            SET publication_state = 'complete'
-          WHERE blob_id = ?1",
-        [blob_id],
-    )?;
+    seal_rust_source_manifest(conn, blob_id)?;
     conn.execute_batch("COMMIT")?;
     Ok(())
 }
@@ -229,7 +217,7 @@ fn assert_context_rejected(conn: &Connection, blob_id: i64, reason: &str) {
 
 #[test]
 fn fresh_macro_context_accepts_enclosing_primary_context() {
-    let mut conn = current_connection();
+    let mut conn = current_rust_connection();
     let blob_id = seed_fresh_macro_blob(&mut conn, "macro-context-positive", Some(0));
     assert_eq!(
         conn.query_row(
@@ -255,17 +243,17 @@ fn fresh_macro_context_accepts_enclosing_primary_context() {
 
 #[test]
 fn fresh_macro_context_rejects_missing_wrong_provenance_outside_and_self() {
-    let mut conn = current_connection();
+    let mut conn = current_rust_connection();
     let blob_id = seed_fresh_macro_blob_building(&mut conn, "macro-context-missing", None);
     assert_context_rejected(&conn, blob_id, "missing context");
 
-    let mut conn = current_connection();
+    let mut conn = current_rust_connection();
     let blob_id = seed_fresh_macro_blob_building(&mut conn, "macro-context-provenance", Some(5));
     // The base fixture's embedded FileRoot is itself valid because of its
     // matching macro-expansion row; only this mismatch belongs to schema 60.
     assert_context_rejected(&conn, blob_id, "wrong context provenance");
 
-    let mut conn = current_connection();
+    let mut conn = current_rust_connection();
     let blob_id = seed_fresh_macro_blob_building(&mut conn, "macro-context-span", Some(5));
     conn.execute(
         "UPDATE source_occurrence_arenas
@@ -294,7 +282,7 @@ fn fresh_macro_context_rejects_missing_wrong_provenance_outside_and_self() {
     assert_context_rejected(&conn, blob_id, "outside context span");
     conn.execute_batch("ROLLBACK").unwrap();
 
-    let mut conn = current_connection();
+    let mut conn = current_rust_connection();
     let blob_id = seed_fresh_macro_blob_building(&mut conn, "macro-context-self", Some(0));
     conn.execute(
         "UPDATE source_declarations
@@ -308,7 +296,7 @@ fn fresh_macro_context_rejects_missing_wrong_provenance_outside_and_self() {
 
 #[test]
 fn sealed_macro_definition_context_is_immutable() {
-    let mut conn = current_connection();
+    let mut conn = current_rust_connection();
     let blob_id = seed_fresh_macro_blob(&mut conn, "macro-context-sealed", Some(0));
     assert!(
         conn.execute(
@@ -324,7 +312,7 @@ fn sealed_macro_definition_context_is_immutable() {
 
 #[test]
 fn populated_macro_context_validation_lookup_stays_bound_after_analyze() {
-    let mut conn = current_connection();
+    let mut conn = current_rust_connection();
     let mut blob_ids = Vec::new();
     for index in 0..12 {
         blob_ids.push(seed_fresh_macro_blob(

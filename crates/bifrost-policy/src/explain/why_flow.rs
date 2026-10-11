@@ -293,15 +293,10 @@ pub(super) fn certainty_node(finding: &PolicyFinding) -> RawNode {
     } else {
         ExplanationOutcome::Unknown
     };
-    let actual = if reasons.is_empty() {
-        finding.certainty().label().to_owned()
-    } else {
-        format!(
-            "{}: {}",
-            finding.certainty().label(),
-            join_labels(reasons.iter().map(CertaintyReason::label))
-        )
-    };
+    let actual = label_with_reasons(
+        finding.certainty().label(),
+        reasons.iter().map(CertaintyReason::label),
+    );
     RawNode::new(
         ExplanationNodeKind::CoverageObligation,
         outcome,
@@ -317,11 +312,10 @@ pub(super) fn proof_node(proof: &ProofMetadata) -> RawNode {
         ProofState::Proven => ExplanationOutcome::Satisfied,
         ProofState::Unproven | ProofState::Ambiguous => ExplanationOutcome::Unknown,
     };
-    let mut actual = proof.state().label().to_owned();
-    if !proof.reasons().is_empty() {
-        actual.push_str(": ");
-        actual.push_str(&join_labels(proof.reasons().iter().map(ProofReason::label)));
-    }
+    let actual = label_with_reasons(
+        proof.state().label(),
+        proof.reasons().iter().map(ProofReason::label),
+    );
     RawNode::new(
         ExplanationNodeKind::CoverageObligation,
         outcome,
@@ -380,15 +374,10 @@ pub(super) fn retained_witness_node(finding: &PolicyFinding) -> RawNode {
 /// The finding's own completeness as one obligation.
 pub(super) fn completeness_node(finding: &PolicyFinding) -> RawNode {
     let reasons = finding.completeness().reasons();
-    let actual = if reasons.is_empty() {
-        finding.completeness().label().to_owned()
-    } else {
-        format!(
-            "{}: {}",
-            finding.completeness().label(),
-            join_labels(reasons.iter().copied().map(FindingIncompleteReason::label))
-        )
-    };
+    let actual = label_with_reasons(
+        finding.completeness().label(),
+        reasons.iter().copied().map(FindingIncompleteReason::label),
+    );
     RawNode::new(
         ExplanationNodeKind::CoverageObligation,
         if reasons.is_empty() {
@@ -443,6 +432,15 @@ fn with_evidence_refs(mut text: String, origin: &TaintOriginEvidence) -> String 
 
 fn join_labels<'a>(labels: impl Iterator<Item = &'a str>) -> String {
     labels.collect::<Vec<_>>().join(", ")
+}
+
+fn label_with_reasons<'a>(label: &str, reasons: impl Iterator<Item = &'a str>) -> String {
+    let mut reasons = reasons.peekable();
+    if reasons.peek().is_none() {
+        label.to_owned()
+    } else {
+        format!("{label}: {}", join_labels(reasons))
+    }
 }
 
 /// The authored entry a resolved endpoint identity names.

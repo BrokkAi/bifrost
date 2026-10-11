@@ -11,11 +11,15 @@ use crate::analyzer::semantic_model::{SemanticModelCallableKey, SemanticModelOve
 use crate::analyzer::usages::get_definition::parse_go_tree;
 use crate::analyzer::usages::reference_site::smallest_named_node_covering;
 use crate::analyzer::{
-    AnalyzerQueryScope, CodeUnitIndex, CodeUnitType, GoAnalyzer, IAnalyzer, ProjectFile,
-    QueryScope, Range, StructuredTypeIdentity, resolve_analyzer,
+    AnalyzerQueryScope, CodeUnit, CodeUnitIndex, CodeUnitType, GoAnalyzer, IAnalyzer, Language,
+    ProjectFile, QueryScope, Range, StructuredTypeIdentity, resolve_analyzer,
 };
 use crate::hash::HashMap;
 use brokk_bifrost_core::analyzer::model::{StructuredTypeNodeId, StructuredTypeNodeView};
+use brokk_bifrost_core::analyzer::structural::native_obligation::{
+    NativeResultObligation, NativeResultObligationBasis,
+};
+use brokk_bifrost_core::path_utils::rel_path_string;
 use brokk_bifrost_go::declarations::{go_structured_type_identity, is_predeclared_go_type};
 use brokk_bifrost_go::graph::reference::go_name_shadowed_at_with_scope;
 use tree_sitter::Node;
@@ -25,6 +29,255 @@ pub const GO_MODELED_RESULT_BINDING_TYPE_PROOF_MAX_SOURCE_BYTES: usize = 1024 * 
 
 /// Maximum syntax work the lexical-shadow half of one proof may consume.
 pub const GO_MODELED_RESULT_BINDING_TYPE_PROOF_MAX_STEPS: usize = 100_000;
+
+/// Prove the native Go B5 obligation for one resolved declaration and result
+/// port. The caller supplies a target that the structured resolver already
+/// selected; this function only checks the target's declaration metadata and
+/// source-owned predeclared `error` identity. An unresolved or ambiguous
+/// declaration deliberately returns `None`.
+pub fn go_native_error_result_obligation(
+    analyzer: &dyn IAnalyzer,
+    target: &CodeUnit,
+    result_ordinal: u32,
+) -> Option<NativeResultObligation> {
+    if target.source().declaration_language() != Language::Go {
+        return None;
+    }
+    let ordinal = usize::try_from(result_ordinal).ok()?;
+    let metadata = analyzer.signature_metadata(target);
+    let [metadata] = metadata.as_slice() else {
+        return None;
+    };
+    let identity = metadata.result_type_identity(ordinal)?;
+    let Some(StructuredTypeNodeView::Named(name)) = identity.view(identity.root_id()) else {
+        return None;
+    };
+    if name.is_absolute()
+        || !name.lexical_scope().is_empty()
+        || name.path() != [String::from("error")]
+    {
+        return None;
+    }
+
+    let go = resolve_analyzer::<GoAnalyzer>(analyzer)?;
+    let source = analyzer.indexed_source(target.source())?;
+    if source.len() > GO_MODELED_RESULT_BINDING_TYPE_PROOF_MAX_SOURCE_BYTES {
+        return None;
+    }
+    let tree = parse_go_tree(&source)?;
+    let root = tree.root_node();
+    let declaration = go_target_declaration_node(root, analyzer.ranges_of(target))?;
+    if declaration.has_error() {
+        return None;
+    };
+    let result_type = go_result_type_node(declaration, ordinal)?;
+    if go_type_parameter_binds_error(declaration, &source) {
+        return None;
+    }
+
+    let scope = AnalyzerQueryScope::new(analyzer);
+    let (imports, _dot_imports) = go.definition_import_namespaces(scope.token(), target.source());
+    let packages = GoOverlayPackages::new(None);
+    let mut context = GoTypeIdentityContext {
+        go,
+        packages: &packages,
+        source: &source,
+        root,
+        type_byte: result_type.start_byte(),
+        imports,
+        package: go.go_package_of(target.source()),
+        remaining_shadow_steps: go_shadow_step_limit(&source),
+    };
+    if !context.predeclared_name_is_exact("error") {
+        return None;
+    }
+
+    Some(NativeResultObligation::fallible_status(
+        result_ordinal,
+        NativeResultObligationBasis::StaticSignature,
+    ))
+}
+
+/// Prove the native Go B5 obligation for a function-valued call whose local
+/// value flow has a known indexed result type but no declaration dispatch arm.
+/// The callee expression is resolved through the structured Go definition
+/// resolver; unresolved values and modeled-only values abstain.
+pub fn go_native_error_function_value_obligation(
+    analyzer: &dyn IAnalyzer,
+    file: &ProjectFile,
+    range: Range,
+    result_ordinal: u32,
+) -> Option<NativeResultObligation> {
+    let identity = crate::analyzer::usages::get_definition::go_function_value_result_type_identity(
+        analyzer,
+        file,
+        range,
+        usize::try_from(result_ordinal).ok()?,
+    )?;
+    let Some(StructuredTypeNodeView::Named(name)) = identity.view(identity.root_id()) else {
+        return None;
+    };
+    if name.is_absolute()
+        || !name.lexical_scope().is_empty()
+        || name.path() != [String::from("error")]
+    {
+        return None;
+    }
+    Some(NativeResultObligation::fallible_status(
+        result_ordinal,
+        NativeResultObligationBasis::StaticSignature,
+    ))
+}
+
+/// Return the reviewed standard-library identities whose Go documentation
+/// guarantees that `Write`-family methods never return a non-nil error.
+///
+/// The owner/member pair is the resolver's exact import-path-qualified Go
+/// identity (for example `bytes.Buffer.Write`), not a method-name heuristic.
+/// The contracts were checked against the package documentation:
+/// `https://pkg.go.dev/bytes#Buffer`, `https://pkg.go.dev/strings#Builder`,
+/// and `https://pkg.go.dev/hash#Hash`; each listed method documents an always
+/// nil error, while `hash.Hash.Write` says that it never returns an error.
+pub fn go_native_obligation_exclusion(owner_fqn: &str, member: &str) -> Option<&'static str> {
+    let excluded = match owner_fqn {
+        // bytes.Buffer Write, WriteString, WriteByte and WriteRune all
+        // document that their returned error is always nil.
+        "bytes.Buffer" => matches!(member, "Write" | "WriteString" | "WriteByte" | "WriteRune"),
+        // strings.Builder has the same no-error contract for these methods.
+        "strings.Builder" => {
+            matches!(member, "Write" | "WriteString" | "WriteByte" | "WriteRune")
+        }
+        // The hash.Hash interface documentation states: "It never returns an
+        // error." This excludes only the exact interface method identity.
+        "hash.Hash" => member == "Write",
+        _ => false,
+    };
+    excluded.then_some("native_excluded_stdlib_never_error")
+}
+
+fn go_target_declaration_node<'tree>(root: Node<'tree>, ranges: Vec<Range>) -> Option<Node<'tree>> {
+    let mut stack = vec![root];
+    let mut exact = None;
+    let mut enclosing: Option<(usize, Node<'tree>)> = None;
+    while let Some(node) = stack.pop() {
+        let declaration = matches!(
+            node.kind(),
+            "function_declaration" | "method_declaration" | "method_elem" | "func_literal"
+        );
+        if declaration {
+            let start = node.start_byte();
+            let end = node.end_byte();
+            if ranges
+                .iter()
+                .any(|range| range.start_byte == start && range.end_byte == end)
+            {
+                exact = Some(node);
+                break;
+            }
+            for range in &ranges {
+                if range.start_byte <= start && end <= range.end_byte {
+                    let width = end - start;
+                    if enclosing.as_ref().is_none_or(|(best, _)| width < *best) {
+                        enclosing = Some((width, node));
+                    }
+                }
+            }
+        }
+        let mut cursor = node.walk();
+        stack.extend(node.named_children(&mut cursor));
+    }
+    exact.or_else(|| enclosing.map(|(_, node)| node))
+}
+
+fn go_result_type_node(declaration: Node<'_>, ordinal: usize) -> Option<Node<'_>> {
+    let result = declaration.child_by_field_name("result")?;
+    if result.kind() != "parameter_list" {
+        return (ordinal == 0).then_some(result);
+    }
+    let mut current_ordinal = 0usize;
+    let mut cursor = result.walk();
+    for parameter in result.named_children(&mut cursor) {
+        if !matches!(
+            parameter.kind(),
+            "parameter_declaration" | "variadic_parameter_declaration"
+        ) {
+            continue;
+        }
+        let mut names = parameter.walk();
+        let named_count = parameter
+            .named_children(&mut names)
+            .filter(|child| child.kind() == "identifier")
+            .count()
+            .max(1);
+        if ordinal < current_ordinal.saturating_add(named_count) {
+            return parameter.child_by_field_name("type");
+        }
+        current_ordinal = current_ordinal.saturating_add(named_count);
+    }
+    None
+}
+
+fn go_type_parameter_binds_error(declaration: Node<'_>, source: &str) -> bool {
+    let Some(parameters) = declaration.child_by_field_name("type_parameters") else {
+        return false;
+    };
+    let mut stack = vec![parameters];
+    while let Some(node) = stack.pop() {
+        if node.kind().starts_with("type_parameter") {
+            let mut children = node.walk();
+            if node
+                .named_children(&mut children)
+                .find(|child| child.kind() == "identifier")
+                .is_some_and(|name| name.utf8_text(source.as_bytes()).ok() == Some("error"))
+            {
+                return true;
+            }
+        }
+        let mut cursor = node.walk();
+        stack.extend(node.named_children(&mut cursor));
+    }
+    false
+}
+
+/// Prove whether a parser-selected Go type name is the predeclared type with
+/// the same spelling. `Some(false)` is a proven shadow or a different name;
+/// `None` means the declaration/index facts needed for an exact answer are not
+/// available. Callers use that distinction to keep unresolved native failure
+/// branches open instead of treating an incomplete lookup as a negative fact.
+pub(crate) fn go_predeclared_type_name_is_exact(
+    analyzer: &dyn IAnalyzer,
+    file: &ProjectFile,
+    source: &str,
+    root: Node<'_>,
+    type_node: Node<'_>,
+    name: &str,
+) -> Option<bool> {
+    if !is_predeclared_go_type(name) {
+        return Some(false);
+    }
+    if type_node.has_error() || type_node.is_missing() {
+        return None;
+    }
+    let go = resolve_analyzer::<GoAnalyzer>(analyzer)?;
+    if !go.workspace_declaration_identities_authoritative() {
+        return None;
+    }
+    let scope = AnalyzerQueryScope::new(analyzer);
+    let (imports, dot_imports) = go.definition_import_namespaces(scope.token(), file);
+    if !dot_imports.is_empty() || imports.contains_key(name) {
+        return Some(false);
+    }
+    match go_name_shadowed_at_with_scope(root, source, type_node.start_byte(), name, || true) {
+        Some(true) => return Some(false),
+        Some(false) => {}
+        None => return None,
+    }
+    match go.predeclared_builtin_shadow_status_limited(&rel_path_string(file), name, 256, || true) {
+        Some(true) => Some(false),
+        Some(false) => Some(true),
+        None => None,
+    }
+}
 
 /// Conservative query work to charge before a proof-cache miss.
 ///
@@ -184,12 +437,7 @@ fn parameter_has_generic_callable_context(parameter: Node<'_>) -> bool {
 }
 
 fn node_has_field_child(parent: Node<'_>, field: &str, target: Node<'_>) -> bool {
-    (0..parent.child_count()).any(|index| {
-        parent
-            .child(index)
-            .is_some_and(|child| child.id() == target.id())
-            && parent.field_name_for_child(index as u32) == Some(field)
-    })
+    brokk_bifrost_core::analyzer::structural::adapter_helpers::is_field_of(parent, target, field)
 }
 
 struct GoTypeIdentityContext<'tree, 'source, 'context, 'overlay> {
@@ -294,7 +542,8 @@ fn modeled_result_matches_target(
                 | TypeRef::Channel { .. }
                 | TypeRef::Wildcard { .. }
                 | TypeRef::Tuple { .. }
-                | TypeRef::Function { .. } => return false,
+                | TypeRef::Function { .. }
+                | TypeRef::Unknown => return false,
             },
             TypeMatchFrame::DeclaredName(declaration_id, target_id) => {
                 let Some(qualified_name) = context
@@ -401,14 +650,6 @@ mod tests {
     use crate::analyzer::{Language, ProjectFile};
     use crate::test_support::AnalyzerFixture;
 
-    fn named(name: &str) -> TypeRef {
-        TypeRef::Named {
-            name: name.to_owned(),
-            arguments: Vec::new(),
-            nullable: false,
-        }
-    }
-
     fn binding_range(source: &str, name: &str) -> Range {
         let start_byte = source.find(name).expect("binding name");
         Range {
@@ -438,6 +679,42 @@ mod tests {
     }
 
     #[test]
+    fn expression_case_type_shadow_ends_before_sibling_and_post_switch_bindings() {
+        let source = r#"package main
+func run(choice int) {
+    switch choice {
+    case 0:
+        type error struct{}
+        var shadowed error
+        _ = shadowed
+    case 1:
+        var sibling error
+        _ = sibling
+    }
+    var after error
+    _ = after
+}
+"#;
+        let fixture = AnalyzerFixture::new_for_language(
+            Language::Go,
+            &[("go.mod", "module example.com/app\n"), ("main.go", source)],
+        );
+
+        assert!(
+            !binding_matches(&fixture, source, "shadowed", &TypeRef::named("error")),
+            "a case-local type must shadow the universe error type within its own clause"
+        );
+        assert!(
+            binding_matches(&fixture, source, "sibling", &TypeRef::named("error")),
+            "a case-local type must not poison a sibling clause's exact type proof"
+        );
+        assert!(
+            binding_matches(&fixture, source, "after", &TypeRef::named("error")),
+            "a case-local type must not poison the post-switch exact type proof"
+        );
+    }
+
+    #[test]
     fn explicit_unshadowed_error_is_exact_but_inference_and_wrapper_changes_abstain() {
         let source = r#"package main
 
@@ -452,20 +729,30 @@ func run() {
             &[("go.mod", "module example.com/app\n"), ("main.go", source)],
         );
 
-        assert!(binding_matches(&fixture, source, "exact", &named("error")));
+        assert!(binding_matches(
+            &fixture,
+            source,
+            "exact",
+            &TypeRef::named("error")
+        ));
         assert!(!binding_matches(
             &fixture,
             source,
             "inferred",
-            &named("error")
+            &TypeRef::named("error")
         ));
-        assert!(!binding_matches(&fixture, source, "boxed", &named("error")));
+        assert!(!binding_matches(
+            &fixture,
+            source,
+            "boxed",
+            &TypeRef::named("error")
+        ));
         assert!(!binding_matches(
             &fixture,
             source,
             "boxed",
             &TypeRef::Pointer {
-                element: Box::new(named("error")),
+                element: Box::new(TypeRef::named("error")),
             }
         ));
     }
@@ -505,46 +792,10 @@ func run(error int) {
                 &[("go.mod", "module example.com/app\n"), ("main.go", source)],
             );
             assert!(
-                !binding_matches(&fixture, source, "typed", &named("error")),
+                !binding_matches(&fixture, source, "typed", &TypeRef::named("error")),
                 "{label} must shadow the universe type"
             );
         }
-    }
-
-    #[test]
-    fn expression_case_type_shadow_ends_before_sibling_and_post_switch_bindings() {
-        let source = r#"package main
-func run(choice int) {
-    switch choice {
-    case 0:
-        type error struct{}
-        var shadowed error
-        _ = shadowed
-    case 1:
-        var sibling error
-        _ = sibling
-    }
-    var after error
-    _ = after
-}
-"#;
-        let fixture = AnalyzerFixture::new_for_language(
-            Language::Go,
-            &[("go.mod", "module example.com/app\n"), ("main.go", source)],
-        );
-
-        assert!(
-            !binding_matches(&fixture, source, "shadowed", &named("error")),
-            "a case-local type must shadow the universe error type within its own clause"
-        );
-        assert!(
-            binding_matches(&fixture, source, "sibling", &named("error")),
-            "a case-local type must not poison a sibling clause's exact type proof"
-        );
-        assert!(
-            binding_matches(&fixture, source, "after", &named("error")),
-            "a case-local type must not poison the post-switch exact type proof"
-        );
     }
 
     #[test]
@@ -566,7 +817,7 @@ func run() {
             &package_fixture,
             package_source,
             "typed",
-            &named("error")
+            &TypeRef::named("error")
         ));
 
         let import_source = r#"package main
@@ -586,7 +837,7 @@ func run() {
             &import_fixture,
             import_source,
             "typed",
-            &named("error")
+            &TypeRef::named("error")
         ));
     }
 
@@ -611,7 +862,7 @@ func run[error interface{ ~int }](typed error) {}
                 &[("go.mod", "module example.com/app\n"), ("main.go", source)],
             );
             assert!(
-                !binding_matches(&fixture, source, "typed", &named("error")),
+                !binding_matches(&fixture, source, "typed", &TypeRef::named("error")),
                 "{label} must stay outside the exact binding proof"
             );
         }

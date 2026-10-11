@@ -52,7 +52,7 @@ impl FactReadSession<'_> {
         // addressable runtime operands. No implicit dereference applies here.
         if matches!(
             self.go_member_declarations.get(&value.ty().identity()),
-            Some(Some(declaration)) if declaration.kind == GoMemberDeclarationKind::Interface
+            Some(Some(declaration)) if matches!(declaration.kind, GoMemberDeclarationKind::Interface { .. })
         ) {
             return value.ty().indirection() == 0;
         }
@@ -75,7 +75,8 @@ impl FactReadSession<'_> {
             .and_then(Option::as_ref)
             .and_then(|declaration| match declaration.kind {
                 GoMemberDeclarationKind::Method { pointer_receiver } => pointer_receiver,
-                GoMemberDeclarationKind::Struct { .. } | GoMemberDeclarationKind::Interface => None,
+                GoMemberDeclarationKind::Struct { .. }
+                | GoMemberDeclarationKind::Interface { .. } => None,
             })
     }
 
@@ -88,6 +89,71 @@ impl FactReadSession<'_> {
             || matches!(value, ResolutionSlotValue::Runtime { ty, .. }
                 if ty.has_only_reference_indirection())
             || (value.ty().indirection() == 1 && self.go_method_receiver(target).is_some())
+    }
+}
+
+impl FactEvaluation<'_, '_> {
+    /// A Go interface method declaration is a statically selected name, but
+    /// invoking it can dispatch to implementations that are not in this
+    /// binding. Preserve that open receiver boundary on the call answer.
+    pub(super) fn retain_go_interface_dispatch_boundary(
+        &mut self,
+        answer: ResolutionAnswer,
+        obligation: &LoweredCallApplicabilityObligation,
+        states: &StateMap,
+    ) -> StoreResult<Option<ResolutionAnswer>> {
+        if !self.session.lexical_source.supports_go_universe() || answer.targets().len() != 1 {
+            return Ok(Some(answer));
+        }
+        if self
+            .session
+            .go_receiver_slot_type_overlay
+            .as_ref()
+            .is_some_and(|overlay| {
+                overlay.query_binding == (obligation.callee_reference(), answer.targets()[0])
+            })
+        {
+            // This point site's keyed receiver chain names the exact interface
+            // declaration that the shared lookup selected. Dynamic
+            // implementations cannot change which declaration the name at this
+            // source site denotes.
+            return Ok(Some(answer));
+        }
+        let Some(receiver_slot) = obligation.receiver_slot() else {
+            return Ok(Some(answer));
+        };
+        let Some(receiver) = states.get(&receiver_slot) else {
+            return Ok(Some(answer));
+        };
+        let [value] = receiver.possible_values() else {
+            return Ok(Some(answer));
+        };
+        let owner = value.ty().identity();
+        if !self.session.ensure_go_member_declarations(&[owner])? {
+            self.cancellation_observed = true;
+            return Ok(None);
+        }
+        if !matches!(
+            self.session
+                .go_member_declarations
+                .get(&owner)
+                .and_then(Option::as_ref)
+                .map(|declaration| &declaration.kind),
+            Some(GoMemberDeclarationKind::Interface { .. })
+        ) {
+            return Ok(Some(answer));
+        }
+
+        let reason = service_reason(
+            &*self.hierarchy,
+            b"go-interface-call-dynamic-dispatch",
+            &[
+                obligation.callee_reference().as_bytes().as_slice(),
+                owner.as_bytes().as_slice(),
+            ],
+        );
+        let completion = answer.completion().combine(&incomplete(reason));
+        Ok(Some(answer_with_completion(answer, completion)))
     }
 }
 
@@ -110,7 +176,14 @@ pub(super) struct GoSelectedMember {
 
 pub(super) struct GoMemberSearch {
     pub(super) members: Vec<GoSelectedMember>,
+    pub(super) rejected: Vec<GoRejectedMember>,
     pub(super) completion: ResolutionCompletion,
+}
+
+pub(super) struct GoRejectedMember {
+    pub(super) target: SemanticId,
+    pub(super) kind: ResolutionMemberKind,
+    pub(super) owners: Box<[SemanticId]>,
 }
 
 impl FactEvaluation<'_, '_> {
@@ -142,7 +215,7 @@ impl FactEvaluation<'_, '_> {
                         owner.hierarchy_depth == 0
                             && matches!(
                     self.session.go_member_declarations.get(&owner.receiver),
-                    Some(Some(row)) if row.kind == GoMemberDeclarationKind::Interface)
+                    Some(Some(row)) if matches!(row.kind, GoMemberDeclarationKind::Interface { .. }))
                     })
             })
             .collect::<Vec<_>>();
@@ -292,7 +365,7 @@ impl FactEvaluation<'_, '_> {
                 .into_iter()
                 .filter(|owner| {
                     matches!(self.session.go_member_declarations.get(owner),
-                Some(Some(row)) if row.kind == GoMemberDeclarationKind::Interface)
+                Some(Some(row)) if matches!(row.kind, GoMemberDeclarationKind::Interface { .. }))
                 })
                 .collect(),
         ))
@@ -387,6 +460,57 @@ impl FactEvaluation<'_, '_> {
         Ok(Some(lookups))
     }
 
+    pub(super) fn go_package_inventory_covers_placement_frontier(
+        &mut self,
+        completion: &ResolutionCompletion,
+    ) -> StoreResult<Option<bool>> {
+        let ResolutionCompletion::Incomplete(reasons) = completion else {
+            return Ok(Some(false));
+        };
+        let mut evidence = BTreeMap::<SemanticId, (bool, bool)>::new();
+        for reason in reasons.iter() {
+            if self.poll_cancelled() {
+                return Ok(None);
+            }
+            let ResolutionIncompleteReason::UnsupportedSemantic(reason) = reason else {
+                return Ok(Some(false));
+            };
+            evidence.insert(*reason, (false, true));
+        }
+        if evidence.is_empty() {
+            return Ok(Some(false));
+        }
+        let candidates = evidence.keys().copied().collect::<Vec<_>>();
+        for chunk in candidates.chunks(MAX_TYPED_FACT_REQUESTS_PER_BATCH) {
+            let read = self.session.gap_reason_provenance_for_reasons(chunk)?;
+            let Some(rows) = self.accept_session_read(read) else {
+                return Ok(None);
+            };
+            for row in rows {
+                if self.poll_cancelled() {
+                    return Ok(None);
+                }
+                let row = row.get(self.session);
+                let provenance_is_package_placement = row.origin()
+                    == LoweringGapOrigin::Extracted(
+                        ResolutionGapKind::UnsupportedPlacementBoundary,
+                    )
+                    && self
+                        .session
+                        .lexical_source
+                        .go_package_inventory_complete_for_fragment(row.fragment());
+                let reason = evidence
+                    .get_mut(&row.reason())
+                    .expect("gap provenance belongs to the requested reason batch");
+                reason.0 = true;
+                reason.1 &= provenance_is_package_placement;
+            }
+        }
+        Ok(Some(evidence.values().all(|(seen, package_placement)| {
+            *seen && *package_placement
+        })))
+    }
+
     /// Search fields and methods at the same depth before testing callability.
     /// None means the receiver has no selected Go struct metadata. Cancellation
     /// is also reflected in the evaluation, as at the other selected readers.
@@ -439,14 +563,46 @@ impl FactEvaluation<'_, '_> {
                     .get(&owner)
                     .cloned()
                     .flatten();
-                let Some(super::super::fact_source::GoMemberDeclaration {
-                    kind: GoMemberDeclarationKind::Struct { fields },
-                    ..
-                }) = metadata
-                else {
-                    unavailable = true;
-                    continue;
+                let (fields, interface_methods) = match metadata.map(|declaration| declaration.kind)
+                {
+                    Some(GoMemberDeclarationKind::Struct { fields }) => (fields, Vec::new()),
+                    // A struct may embed an interface value. The interface
+                    // has no fields to expand, but its declared methods are
+                    // still candidates for promoted selector lookup below.
+                    Some(GoMemberDeclarationKind::Interface { methods }) => (Vec::new(), methods),
+                    _ => {
+                        unavailable = true;
+                        continue;
+                    }
                 };
+                if path.fields.is_empty() && matches!(receiver, ResolutionSlotValue::Runtime { .. })
+                {
+                    let mut direct_fields = fields
+                        .iter()
+                        .filter(|field| field.callable_lookup == lookup);
+                    if let Some(field) = direct_fields.next()
+                        && direct_fields.next().is_none()
+                        && let (Some(target), Some(_value_type)) = (field.field, field.value_type)
+                    {
+                        // The receiver identity selected this exact struct,
+                        // whose direct field shadows every promoted member.
+                        // Its ordinary binding projection carries the field's
+                        // declared type; unresolved methods on other owners
+                        // cannot make that receiver route incomplete.
+                        return Ok(Some(GoMemberSearch {
+                            members: vec![GoSelectedMember {
+                                target,
+                                kind: ResolutionMemberKind::Field,
+                                value: path.value,
+                                owners: path.owners.into_boxed_slice(),
+                                fields: path.fields,
+                                completion: path.completion.clone(),
+                            }],
+                            rejected: Vec::new(),
+                            completion: path.completion,
+                        }));
+                    }
+                }
                 // Distinct paths intentionally produce distinct candidates,
                 // including paths that end at the very same declaration.
                 for row in rows {
@@ -454,19 +610,28 @@ impl FactEvaluation<'_, '_> {
                         self.cancellation_observed = true;
                         return Ok(None);
                     }
+                    // Go struct metadata owns field selection. The lowered
+                    // owner frontier is only needed to associate method rows
+                    // with this receiver; an unrelated field row's frontier
+                    // must not make the structured field walk incomplete.
+                    if row.kind() != ResolutionMemberKind::Method {
+                        continue;
+                    }
                     let Some(state) = states.get(&row.owner_frontier()) else {
                         unavailable = true;
                         continue;
                     };
-                    completion = completion.combine(state.completion());
-                    if row.kind() != ResolutionMemberKind::Method
-                        || !state.possible_values().iter().any(|value| {
-                            matches!(value, ResolutionSlotValue::TypeObject(ty)
+                    let owner_matches = state.possible_values().iter().any(|value| {
+                        matches!(value, ResolutionSlotValue::TypeObject(ty)
                                 if ty.indirection() <= 1 && ty.identity() == owner)
-                        })
-                    {
+                    });
+                    if !owner_matches {
+                        if state.completion() != &ResolutionCompletion::Complete {
+                            completion = completion.combine(state.completion());
+                        }
                         continue;
                     }
+                    completion = completion.combine(state.completion());
                     selected.push(GoSelectedMember {
                         target: row.definition(),
                         kind: row.kind(),
@@ -475,6 +640,23 @@ impl FactEvaluation<'_, '_> {
                         fields: path.fields.clone(),
                         completion: path.completion.combine(state.completion()),
                     });
+                }
+                for method in &interface_methods {
+                    if method.callable_lookup != lookup {
+                        continue;
+                    }
+                    if let Some(target) = method.definition {
+                        selected.push(GoSelectedMember {
+                            target,
+                            kind: ResolutionMemberKind::Method,
+                            value: path.value,
+                            owners: path.owners.clone().into_boxed_slice(),
+                            fields: path.fields.clone(),
+                            completion: path.completion.clone(),
+                        });
+                    } else {
+                        unavailable = true;
+                    }
                 }
                 for field in &fields {
                     if self.poll_cancelled() || !self.session.charge_scope_steps(1) {
@@ -510,12 +692,31 @@ impl FactEvaluation<'_, '_> {
                     )),
                 ]));
             }
+            if matches!(receiver, ResolutionSlotValue::TypeObject(_))
+                && selected
+                    .iter()
+                    .any(|member| member.kind != ResolutionMemberKind::Method)
+            {
+                return Ok(Some(GoMemberSearch {
+                    members: Vec::new(),
+                    rejected: Vec::new(),
+                    completion,
+                }));
+            }
             if selected.len() > 1 {
                 completion = completion.combine(&ResolutionCompletion::incomplete([
                     ResolutionIncompleteReason::InconsistentPrecedence(reference),
                 ]));
+                let has_method = selected
+                    .iter()
+                    .any(|member| member.kind == ResolutionMemberKind::Method);
                 return Ok(Some(GoMemberSearch {
-                    members: Vec::new(),
+                    // An ambiguous method promotion is not a callable target,
+                    // even when every path reaches the same declaration.
+                    // Keep field candidates so definition lookup can report
+                    // the exact declarations reached through those paths.
+                    members: if has_method { Vec::new() } else { selected },
+                    rejected: Vec::new(),
                     completion,
                 }));
             }
@@ -527,16 +728,14 @@ impl FactEvaluation<'_, '_> {
                 {
                     return Ok(Some(GoMemberSearch {
                         members: Vec::new(),
+                        rejected: Vec::new(),
                         completion,
                     }));
                 }
                 if member.kind == ResolutionMemberKind::Method
-                    && (!self
+                    && !self
                         .session
                         .receiver_indirection_supported(member.target, member.value)
-                        || !self
-                            .session
-                            .go_receiver_eligible(member.target, member.value))
                 {
                     completion = completion.combine(&ResolutionCompletion::incomplete([
                         ResolutionIncompleteReason::UnsupportedSemantic(service_reason(
@@ -550,11 +749,38 @@ impl FactEvaluation<'_, '_> {
                     ]));
                     return Ok(Some(GoMemberSearch {
                         members: Vec::new(),
+                        rejected: Vec::new(),
+                        completion,
+                    }));
+                }
+                if member.kind == ResolutionMemberKind::Method
+                    && !self
+                        .session
+                        .go_receiver_eligible(member.target, member.value)
+                {
+                    completion = completion.combine(&ResolutionCompletion::incomplete([
+                        ResolutionIncompleteReason::UnsupportedSemantic(service_reason(
+                            &*self.hierarchy,
+                            b"go-pointer-method-requires-addressable-receiver",
+                            &[
+                                reference.as_bytes().as_slice(),
+                                member.target.as_bytes().as_slice(),
+                            ],
+                        )),
+                    ]));
+                    return Ok(Some(GoMemberSearch {
+                        members: Vec::new(),
+                        rejected: vec![GoRejectedMember {
+                            target: member.target,
+                            kind: member.kind,
+                            owners: member.owners,
+                        }],
                         completion,
                     }));
                 }
                 return Ok(Some(GoMemberSearch {
                     members: vec![member],
+                    rejected: Vec::new(),
                     completion,
                 }));
             }
@@ -577,12 +803,25 @@ impl FactEvaluation<'_, '_> {
                     };
                     self.demand_slot(slot);
                     let Some(state) = states.get(&slot) else {
-                        unavailable = true;
+                        // This snapshot predates the slot demand above. The
+                        // fixed-point pass will revisit the frontier after
+                        // materializing the embedded field's type state.
                         continue;
                     };
-                    completion = completion.combine(state.completion());
+                    // This slot models the embedded field's value flow, while
+                    // selector promotion needs only its declared type. Keep
+                    // every unrelated incompleteness but do not let that
+                    // field's own memory blocker prevent type-based lookup.
+                    let state_completion =
+                        completion_without_unsupported_semantic(state.completion(), field_id);
+                    completion = completion.combine(&state_completion);
                     if state.possible_values().is_empty() {
-                        unavailable = true;
+                        let Some(inventory_closes_frontier) =
+                            self.go_package_inventory_covers_placement_frontier(&state_completion)?
+                        else {
+                            return Ok(None);
+                        };
+                        unavailable |= !inventory_closes_frontier;
                     }
                     for value in state.possible_values() {
                         if self.poll_cancelled() || !self.session.charge_scope_steps(1) {
@@ -616,7 +855,7 @@ impl FactEvaluation<'_, '_> {
                             },
                             owners,
                             fields,
-                            completion: path.completion.combine(state.completion()),
+                            completion: path.completion.combine(&state_completion),
                         });
                     }
                 }
@@ -638,6 +877,7 @@ impl FactEvaluation<'_, '_> {
         }
         Ok(Some(GoMemberSearch {
             members: Vec::new(),
+            rejected: Vec::new(),
             completion,
         }))
     }

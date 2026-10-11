@@ -5,12 +5,13 @@
 //! manifest becomes complete, and a completed publication must remain
 //! immutable.
 
-use super::tests::{oid_for, parse_state};
+use super::tests::{blob_id, oid_for, parse_state};
 use super::*;
 
 use crate::analyzer::rust::RustAdapter;
 use crate::analyzer::rust::source_publication::SOURCE_STORAGE;
 use crate::inline_project::InlineTestProject;
+use brokk_bifrost_test_macros::hardwon;
 use git2::Oid;
 use rusqlite::Connection;
 
@@ -102,15 +103,6 @@ fn rust_source_capability_cost_matches_each_persisted_extension_family() {
         })
         .expect("Rust extension families are persisted");
     assert_eq!(actual_rows, expected_rows);
-}
-
-fn blob_id(conn: &Connection, oid: Oid) -> i64 {
-    conn.query_row(
-        "SELECT id FROM blobs WHERE blob_oid = ?1 AND lang = 'rust'",
-        [oid.to_string()],
-        |row| row.get(0),
-    )
-    .expect("published Rust blob id")
 }
 
 fn assert_seal_rejects<F>(
@@ -344,6 +336,9 @@ fn canonical_module_seal_rejects_bad_paths_headers_placement_gates_and_ordinals(
 }
 
 #[test]
+#[hardwon(
+    "#3737: source-fact validation moved out of seal triggers while sealed module rows stayed immutable"
+)]
 fn canonical_module_facts_are_immutable_after_seal() {
     let (store, oid, _) = published_module_fixture();
     let conn = store.read_conn().unwrap();

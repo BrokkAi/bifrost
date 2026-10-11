@@ -1,9 +1,22 @@
 //! Canonical declaration properties captured by the C/C++ primary producer.
 
+pub use super::cpp_range_facts::{
+    CppArrayStorage, CppLoopDirection, CppRangeFact, CppRangeFactOutcome,
+};
+pub use super::statement_facts::*;
+
 use super::model::{CppTemplateExpression, StructuredTypeName};
 use super::source_facts::{SourceDeclarationId, SourceOccurrenceId};
 
-pub const CPP_SOURCE_FACTS_VERSION: i64 = 1;
+pub use super::cpp_class_facts::*;
+pub use super::cpp_expression_facts::*;
+pub use super::cpp_initializer_facts::{
+    CppInitializerAccessKind, CppInitializerCandidate, CppInitializerCandidates,
+    CppInitializerSyntaxVerdict,
+};
+pub use super::cpp_provenance::{CppProvenanceFact, CppProvenanceRule, CppProvenanceStorage};
+
+pub const CPP_SOURCE_FACTS_VERSION: i64 = 2;
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub enum CppOccurrenceRole {
@@ -234,6 +247,7 @@ pub struct CppBaseSpecifierFact {
     pub absolute: bool,
     pub components: Vec<String>,
     pub is_virtual: bool,
+    pub access: CppAccessSpecifier,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -328,53 +342,73 @@ pub struct CppSourceFacts {
     pub includes: Vec<CppIncludeFact>,
     pub declarations: Vec<CppDeclarationSourceFact>,
     pub using_namespaces: Vec<(SourceOccurrenceId, String)>,
+    pub expressions: Vec<CppExpressionFact>,
+    pub statement_facts: CppStatementFactRows,
 }
 
 impl CppSourceFacts {
     pub fn valid_links(&self, source: &super::source_facts::SourceFactRows) -> bool {
         let mut seen = crate::hash::HashSet::default();
-        self.includes.iter().all(|include| {
-            include.declaration.index() < source.occurrence_count()
-                && include.target.index() < source.occurrence_count()
-        }) && self.declarations.iter().all(|fact| {
-            fact.declaration.index() < source.declaration_count()
-                && fact
-                    .conditional_family
-                    .is_none_or(|occurrence| occurrence.index() < source.occurrence_count())
-                && fact
-                    .guard_requirements
-                    .as_ref()
-                    .is_none_or(CppGuardSet::valid)
-                && fact.callable_guards.as_ref().is_none_or(CppGuardSet::valid)
-                && fact
-                    .exhaustive_conditional_family
-                    .is_none_or(|occurrence| occurrence.index() < source.occurrence_count())
-                && fact
-                    .displaced_namespace_closing_brace
-                    .is_none_or(|occurrence| occurrence.index() < source.occurrence_count())
-                && fact
-                    .callable_comparable_shapes
-                    .as_ref()
-                    .is_none_or(|shapes| {
-                        shapes.iter().all(|shape| {
-                            !matches!(
-                                shape,
-                                CppComparableSlot::Shape(parameter) if !parameter.valid()
-                            )
+        self.statement_facts.valid()
+            && self.includes.iter().all(|include| {
+                include.declaration.index() < source.occurrence_count()
+                    && include.target.index() < source.occurrence_count()
+            })
+            && self.declarations.iter().all(|fact| {
+                fact.declaration.index() < source.declaration_count()
+                    && fact
+                        .conditional_family
+                        .is_none_or(|occurrence| occurrence.index() < source.occurrence_count())
+                    && fact
+                        .guard_requirements
+                        .as_ref()
+                        .is_none_or(CppGuardSet::valid)
+                    && fact.callable_guards.as_ref().is_none_or(CppGuardSet::valid)
+                    && fact
+                        .exhaustive_conditional_family
+                        .is_none_or(|occurrence| occurrence.index() < source.occurrence_count())
+                    && fact
+                        .displaced_namespace_closing_brace
+                        .is_none_or(|occurrence| occurrence.index() < source.occurrence_count())
+                    && fact
+                        .callable_comparable_shapes
+                        .as_ref()
+                        .is_none_or(|shapes| {
+                            shapes.iter().all(|shape| {
+                                !matches!(
+                                    shape,
+                                    CppComparableSlot::Shape(parameter) if !parameter.valid()
+                                )
+                            })
                         })
-                    })
-                && seen.insert(fact.declaration)
-        }) && self
-            .using_namespaces
-            .iter()
-            .all(|(occurrence, _)| occurrence.index() < source.occurrence_count())
+                    && seen.insert(fact.declaration)
+            })
+            && self
+                .using_namespaces
+                .iter()
+                .all(|(occurrence, _)| occurrence.index() < source.occurrence_count())
+            && self
+                .expressions
+                .iter()
+                .all(|fact| fact.occurrence.index() < source.occurrence_count())
     }
 
     pub fn estimated_retained_bytes(&self) -> usize {
         let mut bytes = self.includes.capacity() * std::mem::size_of::<CppIncludeFact>()
             + self.declarations.capacity() * std::mem::size_of::<CppDeclarationSourceFact>()
             + self.using_namespaces.capacity()
-                * std::mem::size_of::<(SourceOccurrenceId, String)>();
+                * std::mem::size_of::<(SourceOccurrenceId, String)>()
+            + self.expressions.capacity() * std::mem::size_of::<CppExpressionFact>()
+            + self.statement_facts.estimated_retained_bytes();
+        for fact in &self.expressions {
+            bytes += fact.name.as_ref().map_or(0, String::capacity)
+                + fact.type_text.as_ref().map_or(0, String::capacity)
+                + fact.literal_text.as_ref().map_or(0, String::capacity)
+                + fact
+                    .completeness_reason
+                    .as_ref()
+                    .map_or(0, String::capacity);
+        }
         for fact in &self.declarations {
             if let Some(alias) = &fact.file_scope_alias {
                 bytes += alias.name.capacity()

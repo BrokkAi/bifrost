@@ -82,31 +82,31 @@ location. `BIFROST_BINARY_PATH` is the explicit local development override
 that bypasses ambient `PATH` lookup. Launcher diagnostics go to stderr so
 stdio MCP traffic stays on stdin/stdout.
 
-Before a default MCP or LSP launch, the launcher asks the selected Bifrost
-binary for its `pack-engine-profile` and prepares the newest eligible public
-rules release together with its exact pinned semantic-pack
-release from [Bifrost-packs](https://github.com/BrokkAi/bifrost-packs), the home
-of open semantic packs and policies. Verified manifests, artifacts, and the extracted selection are cached
-under `BIFROST_LAUNCHER_CACHE_DIR/open-pack-releases` (or the platform cache
-directory when no launcher cache override is set). A warm verified cache is
-reused offline; disabling automatic installation also restricts packs to the
-verified cache. Set `BIFROST_OPEN_PACKS_OFFLINE=1` to require offline lookup or
-`BIFROST_OPEN_PACKS_REFRESH=1` to require fresh release discovery.
-
-Manifest schema 2 selects by required schema versions and semantic capabilities;
-engine versions describe provenance. It requires verified integrity and behavior
-that has not failed, retaining pending or limited behavior in the selection
-receipt. Historical schema 1 releases retain their engine bounds and original
+The launcher manages only the Bifrost executable. When that executable starts
+a policy scan or MCP service, it reads its engine pack profile in-process and
+selects the newest eligible public rules release together with its exact pinned
+semantic-pack release from
+[Bifrost-packs](https://github.com/BrokkAi/bifrost-packs). Manifest schema 2
+uses required schema versions and semantic capabilities; engine versions are
+provenance. Historical schema 1 releases retain their engine bounds and
 qualification rules.
 
-When an older binary does not support `pack-engine-profile`, or no eligible
-compatible set is available, the launcher reports a diagnostic on stderr and
-continues with the engine's embedded packs. Invalid release metadata, an
-invalid profile, or corrupt cached content stops launch so that verification
-failures cannot silently change the selected packs. A successfully prepared
-open selection supplies `BIFROST_OPEN_SEMANTIC_PACK_BUNDLE`,
-`BIFROST_OPEN_POLICY_PACK_ROOT`, and `BIFROST_SEMANTIC_PACK_CACHE_ROOT` to the
-engine, replacing embedded registration for those explicit pack roots.
+The binary verifies manifests, release-tag bindings, artifact hashes, indexed
+content, and safe archive extraction before it activates the packs. Its
+verified inventory, artifacts, and extracted selection are cached under
+`BIFROST_LAUNCHER_CACHE_DIR/open-pack-releases` (or the platform cache directory
+when no override is set). A warm verified cache is reused offline. Set
+`BIFROST_OPEN_PACKS_OFFLINE=1` to require cache-only selection or
+`BIFROST_OPEN_PACKS_REFRESH=1` to force fresh release discovery. Setting
+`BIFROST_LAUNCHER_AUTO_INSTALL=0` also prevents pack downloads.
+
+If no eligible compatible release is available, or the network is unavailable
+and the cache cannot satisfy selection, the binary reports a stderr diagnostic
+and uses its embedded packs. Invalid profiles or release metadata and corrupt
+cached content fail explicitly. Setting either
+`BIFROST_OPEN_SEMANTIC_PACK_BUNDLE` or `BIFROST_OPEN_POLICY_PACK_ROOT` supplies
+host-owned content and prevents automatic acquisition. `doctor` reports binary
+versions and cache selection only; it does not download or report pack content.
 
 The launcher also has commands that do not require a workspace. `doctor`
 reports the preferred and selected versions, source, and exact or compatibility
@@ -174,7 +174,7 @@ pi install "$(pwd)"
 After `@brokk/bifrost-agent` is published to npm, install a pinned release with:
 
 ```bash
-pi install npm:@brokk/bifrost-agent@0.13.0
+pi install npm:@brokk/bifrost-agent@0.13.1
 ```
 
 Run `/bifrost` in Pi's interactive TUI to configure Bifrost for the current

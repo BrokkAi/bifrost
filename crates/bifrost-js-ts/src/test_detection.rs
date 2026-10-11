@@ -1,6 +1,11 @@
 use super::model::node_text;
 use brokk_bifrost_core::analyzer::ProjectFile;
+use brokk_bifrost_core::analyzer::common::collapse_whitespace;
 use brokk_bifrost_core::analyzer::model::{TestAssertionSmell, TestAssertionWeights};
+use brokk_bifrost_core::analyzer::test_assertions::{
+    TestAssertionSignal, append_test_assertion_findings, normalize_assertion_expression,
+    oversized_quoted_literal,
+};
 use regex::Regex;
 use std::sync::LazyLock;
 use tree_sitter::{Language as TsLanguage, Node, Parser};
@@ -136,57 +141,28 @@ fn analyze_js_ts_test_case(
     weights: &TestAssertionWeights,
     out: &mut Vec<TestAssertionSmell>,
 ) {
-    let assertions = collect_js_ts_assertions(&test_case.body, weights);
-    let assertion_count = assertions.len() as i32;
     let symbol = format!("{}::{}", file, test_case.name);
-
-    if assertion_count == 0 {
-        out.push(TestAssertionSmell {
-            file: file.clone(),
-            enclosing_fq_name: symbol,
-            assertion_kind: "no-assertions".to_string(),
-            score: weights.no_assertion_weight,
-            assertion_count: 0,
-            reasons: vec!["no-assertions".to_string()],
-            excerpt: compact_test_assertion_excerpt(&test_case.body),
-            start_byte: test_case.start_byte,
-        });
-        return;
-    }
-
-    for assertion in &assertions {
-        if assertion.score <= 0 {
-            continue;
-        }
-        out.push(TestAssertionSmell {
-            file: file.clone(),
-            enclosing_fq_name: symbol.clone(),
-            assertion_kind: assertion.kind.clone(),
+    let assertions: Vec<_> = collect_js_ts_assertions(&test_case.body, weights)
+        .into_iter()
+        .map(|assertion| TestAssertionSignal {
+            kind: assertion.kind,
             score: assertion.score,
-            assertion_count,
-            reasons: vec![assertion.reason.clone()],
-            excerpt: assertion.excerpt.clone(),
+            shallow: assertion.shallow,
+            meaningful: assertion.meaningful,
+            reasons: vec![assertion.reason],
+            excerpt: assertion.excerpt,
             start_byte: test_case.start_byte + assertion.start_byte,
-        });
-    }
-
-    if assertions.iter().all(|assertion| assertion.shallow) {
-        let score = (weights.shallow_assertion_only_weight
-            - js_ts_meaningful_assertion_credit(assertions.iter(), weights))
-        .max(0);
-        if score > 0 {
-            out.push(TestAssertionSmell {
-                file: file.clone(),
-                enclosing_fq_name: symbol,
-                assertion_kind: "shallow-assertions-only".to_string(),
-                score,
-                assertion_count,
-                reasons: vec!["shallow-assertions-only".to_string()],
-                excerpt: compact_test_assertion_excerpt(&test_case.body),
-                start_byte: test_case.start_byte,
-            });
-        }
-    }
+        })
+        .collect();
+    append_test_assertion_findings(
+        file,
+        symbol,
+        collapse_whitespace(&test_case.body),
+        test_case.start_byte,
+        &assertions,
+        weights,
+        out,
+    );
 }
 
 fn collect_js_ts_assertions(
@@ -224,7 +200,7 @@ fn collect_js_ts_assertions(
                 shallow: false,
                 meaningful: false,
                 reason,
-                excerpt: compact_test_assertion_excerpt(whole.as_str()),
+                excerpt: collapse_whitespace(whole.as_str()),
                 start_byte: whole.start(),
             });
         } else if let Some(literal) = oversized_js_ts_literal(&actual, &expected, weights) {
@@ -234,7 +210,7 @@ fn collect_js_ts_assertions(
                 shallow: false,
                 meaningful: false,
                 reason: format!("overspecified-literal:{literal}"),
-                excerpt: compact_test_assertion_excerpt(whole.as_str()),
+                excerpt: collapse_whitespace(whole.as_str()),
                 start_byte: whole.start(),
             });
         } else {
@@ -244,7 +220,7 @@ fn collect_js_ts_assertions(
                 shallow: false,
                 meaningful: true,
                 reason: "meaningful-assertion".to_string(),
-                excerpt: compact_test_assertion_excerpt(whole.as_str()),
+                excerpt: collapse_whitespace(whole.as_str()),
                 start_byte: whole.start(),
             });
         }
@@ -282,7 +258,7 @@ fn collect_js_ts_assertions(
             shallow: true,
             meaningful: false,
             reason,
-            excerpt: compact_test_assertion_excerpt(whole.as_str()),
+            excerpt: collapse_whitespace(whole.as_str()),
             start_byte: whole.start(),
         });
     }
@@ -295,7 +271,7 @@ fn collect_js_ts_assertions(
             shallow: false,
             meaningful: false,
             reason: "snapshot-assertion".to_string(),
-            excerpt: compact_test_assertion_excerpt(whole.as_str()),
+            excerpt: collapse_whitespace(whole.as_str()),
             start_byte: whole.start(),
         });
     }
@@ -309,7 +285,7 @@ fn collect_js_ts_assertions(
                 shallow: false,
                 meaningful: true,
                 reason: "meaningful-assertion".to_string(),
-                excerpt: compact_test_assertion_excerpt(whole.as_str()),
+                excerpt: collapse_whitespace(whole.as_str()),
                 start_byte: whole.start(),
             });
         }
@@ -342,7 +318,7 @@ fn collect_js_ts_assertions(
                 shallow: false,
                 meaningful: false,
                 reason,
-                excerpt: compact_test_assertion_excerpt(whole.as_str()),
+                excerpt: collapse_whitespace(whole.as_str()),
                 start_byte: whole.start(),
             });
         } else if let Some(literal) = oversized_js_ts_literal(&left, &right, weights) {
@@ -352,7 +328,7 @@ fn collect_js_ts_assertions(
                 shallow: false,
                 meaningful: false,
                 reason: format!("overspecified-literal:{literal}"),
-                excerpt: compact_test_assertion_excerpt(whole.as_str()),
+                excerpt: collapse_whitespace(whole.as_str()),
                 start_byte: whole.start(),
             });
         } else {
@@ -362,7 +338,7 @@ fn collect_js_ts_assertions(
                 shallow: false,
                 meaningful: true,
                 reason: "meaningful-assertion".to_string(),
-                excerpt: compact_test_assertion_excerpt(whole.as_str()),
+                excerpt: collapse_whitespace(whole.as_str()),
                 start_byte: whole.start(),
             });
         }
@@ -404,7 +380,7 @@ fn collect_js_ts_assertions(
             shallow,
             meaningful: score == 0,
             reason,
-            excerpt: compact_test_assertion_excerpt(whole.as_str()),
+            excerpt: collapse_whitespace(whole.as_str()),
             start_byte: whole.start(),
         });
     }
@@ -412,22 +388,8 @@ fn collect_js_ts_assertions(
     assertions
 }
 
-fn js_ts_meaningful_assertion_credit<'a>(
-    assertions: impl Iterator<Item = &'a JsTsAssertionSignal>,
-    weights: &TestAssertionWeights,
-) -> i32 {
-    let count = assertions.filter(|assertion| assertion.meaningful).count() as i32;
-    let creditable = count.min(weights.meaningful_assertion_credit_cap.max(0));
-    weights.meaningful_assertion_credit.max(0) * creditable
-}
-
 fn normalize_js_ts_expr(expr: &str) -> String {
-    expr.trim()
-        .trim_end_matches(';')
-        .trim_matches(|ch| matches!(ch, '(' | ')' | ' '))
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ")
+    normalize_assertion_expression(expr.trim().trim_end_matches(';'))
 }
 
 fn is_js_ts_literal(expr: &str) -> bool {
@@ -444,19 +406,7 @@ fn oversized_js_ts_literal(
     right: &str,
     weights: &TestAssertionWeights,
 ) -> Option<String> {
-    [left, right].into_iter().find_map(|expr| {
-        let trimmed = expr.trim();
-        let unquoted = trimmed
-            .strip_prefix('"')
-            .and_then(|s| s.strip_suffix('"'))
-            .or_else(|| {
-                trimmed
-                    .strip_prefix('\'')
-                    .and_then(|s| s.strip_suffix('\''))
-            })?;
-        (unquoted.len() >= weights.large_literal_length_threshold.max(0) as usize)
-            .then(|| trimmed.to_string())
-    })
+    oversized_quoted_literal(left, right, weights, &['"', '\''])
 }
 
 fn trim_js_ts_string_literal(raw: &str) -> String {
@@ -465,8 +415,4 @@ fn trim_js_ts_string_literal(raw: &str) -> String {
         .trim_matches('"')
         .trim_matches('\'')
         .to_string()
-}
-
-fn compact_test_assertion_excerpt(text: &str) -> String {
-    text.split_whitespace().collect::<Vec<_>>().join(" ")
 }

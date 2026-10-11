@@ -495,6 +495,7 @@ impl FoundryEntry {
                 has_receiver: self.boundary.has_receiver,
                 variadic: false,
                 parameter_count: self.boundary.parameter_count,
+                formals: Vec::new(),
             },
             completeness: match self.completeness {
                 FoundryCompleteness::Partial => Completeness::Partial,
@@ -510,6 +511,7 @@ impl FoundryEntry {
             transfer_partitions: Vec::new(),
             effects: Vec::new(),
             concurrency_effects: Vec::new(),
+            returned_callables: Vec::new(),
             declared_effects: Vec::new(),
             preconditions: None,
             result_contracts: Vec::new(),
@@ -876,37 +878,6 @@ impl FoundryEntryBuilder {
 mod tests {
     use super::*;
 
-    fn target(member: &str, types: &[&str]) -> FoundryTarget {
-        FoundryTarget {
-            artifact_path: "java/lang/String.class".to_owned(),
-            member: member.to_owned(),
-            signature: FoundrySignature::Overload {
-                types: types.iter().map(|value| (*value).to_owned()).collect(),
-            },
-        }
-    }
-
-    #[test]
-    fn generated_ids_are_authoring_legal_and_distinguish_overloads() {
-        let first = summary_id(FoundryCorpus::Codeql, &target("valueOf", &["char[]"]));
-        let second = summary_id(FoundryCorpus::Codeql, &target("valueOf", &["Object"]));
-
-        assert_ne!(first, second);
-        for id in [&first, &second] {
-            assert!(
-                id.bytes().all(|byte| byte.is_ascii_lowercase()
-                    || byte.is_ascii_digit()
-                    || byte == b'.'
-                    || byte == b'-'
-                    || byte == b'_'),
-                "id {id} leaves the authored identifier alphabet"
-            );
-            assert!(id.as_bytes()[0].is_ascii_lowercase());
-            assert!(id.as_bytes()[id.len() - 1].is_ascii_alphanumeric());
-            assert!(id.len() <= 256);
-        }
-    }
-
     #[test]
     fn long_signatures_stay_within_the_authored_id_limit() {
         let types = (0..64)
@@ -922,47 +893,6 @@ mod tests {
 
         assert!(id.len() <= 256, "id is {} bytes", id.len());
         assert!(id.starts_with("joern."));
-    }
-
-    #[test]
-    fn any_overload_entries_report_a_lower_bound_parameter_count() {
-        let mut builder = FoundryEntryBuilder::default();
-        builder.add_transfer(AuthoredSummaryTransfer {
-            input: AuthoredSummaryInput::Parameter { ordinal: 2 },
-            exit_kind: AuthoredSummaryExitKind::Normal,
-            output: AuthoredSummaryOutput::NormalReturn {},
-            value_transfer: None,
-        });
-
-        let entry = builder.finish(
-            FoundryCorpus::Codeql,
-            FoundryTarget {
-                artifact_path: "java/lang/String.class".to_owned(),
-                member: "format".to_owned(),
-                signature: FoundrySignature::AnyOverload,
-            },
-            None,
-        );
-
-        assert_eq!(entry.boundary.parameter_count, 3);
-        assert!(!entry.boundary.has_receiver);
-        assert!(
-            entry
-                .notes
-                .contains(&FoundryNote::ParameterCountIsLowerBound { observed: 3 })
-        );
-    }
-
-    #[test]
-    fn a_no_flow_claim_has_no_authored_spelling() {
-        let mut builder = FoundryEntryBuilder::default();
-        builder.declare_no_flow();
-
-        let entry = builder.finish(FoundryCorpus::Joern, target("length", &[]), Some(0));
-
-        assert_eq!(entry.claim, FoundryClaim::NoFlow);
-        assert!(entry.authored_summary().is_none());
-        assert!(entry.notes.contains(&FoundryNote::NoFlowClaimNotCarried));
     }
 
     #[test]

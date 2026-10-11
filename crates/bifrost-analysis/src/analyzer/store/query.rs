@@ -257,13 +257,6 @@ impl<'a, A: LanguageAdapter> QueryResolver<'a, A> {
             file,
         )
         .expect("candidate row must contain a valid structured FqName");
-        CodeUnit::from_fq(
-            file.clone(),
-            row.kind,
-            fq,
-            package_segment_count,
-            row.signature.clone(),
-            row.flags.synthetic,
-        )
+        crate::analyzer::store::code_unit_from_hydrated_row(row, file, fq, package_segment_count)
     }
 }

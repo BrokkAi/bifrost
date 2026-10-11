@@ -3,73 +3,23 @@ use super::syntax::{
     java_field_access_segments, java_type_name_prefix_len,
 };
 use super::*;
-
-#[test]
-fn free_this_scan_honors_cancellation() {
-    let mut parser = tree_sitter::Parser::new();
-    parser
-        .set_language(&tree_sitter_java::LANGUAGE.into())
-        .expect("Java grammar must load");
-    let tree = parser
-        .parse(
-            "class Example { Object value() { int first = 1; int second = 2; return this; } }",
-            None,
-        )
-        .expect("Java source must parse");
-    let mut body = None;
-    crate::analyzer::tree_sitter_analyzer::walk_named_tree_preorder(
-        tree.root_node(),
-        true,
-        |node| {
-            if node.kind() == "block" {
-                body = Some(node);
-                WalkControl::Break
-            } else {
-                WalkControl::Continue
-            }
-        },
-    );
-
-    let cancellation = CancellationToken::cancel_after_checks_for_test(2);
-    assert_eq!(
-        body_contains_free_this(body.expect("method body"), &cancellation),
-        Err(LoweringCancelled)
-    );
-}
+use crate::analyzer::semantic::floating_value_for_test as floating;
+use crate::test_support::procedure_named as method;
 
 fn parse_java(source: &str) -> tree_sitter::Tree {
-    let mut parser = tree_sitter::Parser::new();
-    parser
-        .set_language(&tree_sitter_java::LANGUAGE.into())
-        .expect("Java grammar must load");
-    parser.parse(source, None).expect("Java source must parse")
+    brokk_bifrost_jvm::java::declarations::parse_tree(source).expect("Java source must parse")
 }
 
 fn first_kind<'a>(root: tree_sitter::Node<'a>, kind: &str) -> tree_sitter::Node<'a> {
-    let mut found = None;
-    crate::analyzer::tree_sitter_analyzer::walk_named_tree_preorder(root, true, |node| {
-        if node.kind() == kind && found.is_none() {
-            found = Some(node);
-            WalkControl::Break
-        } else {
-            WalkControl::Continue
-        }
-    });
-    found.unwrap_or_else(|| panic!("missing {kind}"))
+    brokk_bifrost_core::analyzer::tree_walk::first_named_descendant_of_kind_inclusive(root, kind)
+        .unwrap_or_else(|| panic!("missing {kind}"))
 }
 
+use brokk_bifrost_test_macros::hardwon;
 #[test]
-fn type_name_prefix_recognizes_qualified_stdlib_types() {
-    assert_eq!(java_type_name_prefix_len(&["java", "net", "URLDecoder"]), 3);
-    assert_eq!(
-        java_type_name_prefix_len(&["java", "net", "URLDecoder", "SOME_CONST"]),
-        3
-    );
-    assert_eq!(java_type_name_prefix_len(&["inheritedField", "nested"]), 0);
-    assert_eq!(java_type_name_prefix_len(&["Outer", "Inner"]), 2);
-}
-
-#[test]
+#[hardwon(
+    "#2363: A package-qualified type name used as a call object must not be lowered as heap memory"
+)]
 fn qualified_stdlib_method_object_is_a_type_qualifier() {
     let source = r#"class App {
   void run(String value) {
@@ -96,6 +46,9 @@ fn qualified_stdlib_method_object_is_a_type_qualifier() {
 /// intrafile value inventory. Unknown roots must retain heap identity; positive
 /// type evidence may still classify the same spelling as a qualifier.
 #[test]
+#[hardwon(
+    "#2452: Parses real Java source with Tree-sitter and checks semantic lowerer output; fix regression: a cross-file uppercase field chain lost heap identity because its spelling was mistaken for a type qualifier"
+)]
 fn uppercase_cross_file_inherited_field_requires_positive_type_evidence() {
     let source = r#"class App {
   void run() {
@@ -123,6 +76,7 @@ fn uppercase_cross_file_inherited_field_requires_positive_type_evidence() {
 }
 
 #[test]
+#[hardwon("#2363: An inherited field chain must remain heap memory when type evidence is absent")]
 fn inherited_field_chain_is_not_a_type_qualifier() {
     let source = r#"class App {
   void run() {
@@ -168,6 +122,9 @@ fn declarator_named<'a>(
 // directly, independent of the gap-emission wiring in `control.rs`.
 
 #[test]
+#[hardwon(
+    "#2480: Parses real Java source with Tree-sitter and checks semantic lowerer output; regression: the ubiquitous lone serialVersionUID initializer incorrectly carried a DeferredExecution gap"
+)]
 fn a_lone_static_field_initializer_is_the_sole_fragment_in_its_group() {
     // The corpus's own dominant shape (#2545's census): boilerplate
     // `serialVersionUID`, nothing else in the static group.
@@ -178,6 +135,9 @@ fn a_lone_static_field_initializer_is_the_sole_fragment_in_its_group() {
 }
 
 #[test]
+#[hardwon(
+    "#2480: Parses real Java source with Tree-sitter and checks semantic lowerer output; regression: interacting static initializer fragments must retain their source-order DeferredExecution gap"
+)]
 fn two_static_field_initializers_are_not_sole_in_their_shared_group() {
     // A genuine source-order-composition case: `b`'s value can depend on
     // `a` having already run. Both fragments must keep the gap.
@@ -190,6 +150,9 @@ fn two_static_field_initializers_are_not_sole_in_their_shared_group() {
 }
 
 #[test]
+#[hardwon(
+    "#2480: Parses real Java source with Tree-sitter and checks semantic lowerer output; regression: a static field and static block compose in the same initializer order group"
+)]
 fn a_static_field_and_a_static_initializer_block_share_one_group() {
     let source = "class App {\n  private static int a = 1;\n  static { a = a + 1; }\n}\n";
     let tree = parse_java(source);
@@ -200,6 +163,9 @@ fn a_static_field_and_a_static_initializer_block_share_one_group() {
 }
 
 #[test]
+#[hardwon(
+    "#2480: Parses real Java source with Tree-sitter and checks semantic lowerer output; regression: static and instance initializer fragments belong to separate ordering groups"
+)]
 fn static_and_instance_groups_are_independent() {
     // One member in each group: neither fragment has a sibling to compose
     // with, even though the class has two initializer fragments overall.
@@ -212,6 +178,9 @@ fn static_and_instance_groups_are_independent() {
 }
 
 #[test]
+#[hardwon(
+    "#2480: Parses real Java source with Tree-sitter and checks semantic lowerer output; regression: interacting instance initializer fragments must retain their source-order gap"
+)]
 fn two_instance_field_initializers_are_not_sole_in_their_shared_group() {
     let source = "class App {\n  private int a = 1;\n  private int b = a + 1;\n}\n";
     let tree = parse_java(source);
@@ -222,6 +191,9 @@ fn two_instance_field_initializers_are_not_sole_in_their_shared_group() {
 }
 
 #[test]
+#[hardwon(
+    "#2480: Parses real Java source with Tree-sitter and checks semantic lowerer output; regression: a field with no initializer must not make a lone initialized field look compositional"
+)]
 fn an_uninitialized_sibling_field_does_not_count_as_a_fragment() {
     // `plain` has no `value`, so `callable_shape` never lowers it as an
     // Initializer procedure at all; it must not inflate the group count
@@ -233,6 +205,9 @@ fn an_uninitialized_sibling_field_does_not_count_as_a_fragment() {
 }
 
 #[test]
+#[hardwon(
+    "#2480: Parses real Java source with Tree-sitter and checks semantic lowerer output; regression: one field declaration can contain multiple ordered initializer fragments"
+)]
 fn multiple_declarators_in_one_field_declaration_each_count() {
     // `private static int a = 1, b = 2;` is two composed fragments in JLS
     // source order, even though they share one `field_declaration`.
@@ -263,550 +238,15 @@ fn java_semantics(source: &str) -> std::sync::Arc<SemanticArtifact> {
         .expect("Java semantic artifact")
 }
 
-fn method<'a>(artifact: &'a SemanticArtifact, name: &str) -> &'a ProcedureSemantics {
-    artifact
-        .procedures()
-        .iter()
-        .find(|procedure| {
-            procedure
-                .locator()
-                .declaration()
-                .segments()
-                .last()
-                .and_then(|segment| segment.name())
-                == Some(name)
-        })
-        .unwrap_or_else(|| panic!("missing procedure {name}"))
-}
-
 fn mapping_text<'s>(
     procedure: &ProcedureSemantics,
     source: &'s str,
     mapping: SourceMappingId,
 ) -> &'s str {
-    let span = procedure.source_mappings()[mapping.index()]
-        .locator
-        .anchor()
-        .span();
-    &source[span.start_byte() as usize..span.end_byte() as usize]
-}
-
-fn value_text<'s>(procedure: &ProcedureSemantics, source: &'s str, value: ValueId) -> &'s str {
-    mapping_text(procedure, source, procedure.values()[value.index()].source)
-}
-
-fn value_kind(procedure: &ProcedureSemantics, value: ValueId) -> SemanticValueKind {
-    procedure.values()[value.index()].kind.clone()
-}
-
-/// The normalized shape of one guard, with its constant resolved to the
-/// published value kind.
-#[derive(Debug, PartialEq)]
-enum Shape {
-    Integer(IntegerComparison, SemanticValueKind),
-    Float(IntegerComparison, SemanticValueKind),
-    Equality(bool, SemanticValueKind),
-    Nan(bool),
-    Constant(bool),
-    Opaque,
-}
-
-fn floating(value: f64) -> SemanticValueKind {
-    SemanticValueKind::FloatingPoint {
-        bits: value.to_bits(),
-    }
-}
-
-/// The one guard recorded for `condition`, and its subject's spelling.
-fn guard_shape<'s>(
-    procedure: &ProcedureSemantics,
-    source: &'s str,
-    condition: &str,
-) -> (Shape, Option<&'s str>) {
-    let guards = procedure
-        .guard_facts()
-        .iter()
-        .filter(|guard| mapping_text(procedure, source, guard.source) == condition)
-        .collect::<Vec<_>>();
-    let [guard] = guards[..] else {
-        panic!("expected one guard for {condition}: {guards:?}");
-    };
-    let shape = match guard.predicate {
-        GuardPredicate::OrderedIntegerComparison { relation, constant } => {
-            Shape::Integer(relation, value_kind(procedure, constant))
-        }
-        GuardPredicate::OrderedFloatComparison { relation, constant } => {
-            Shape::Float(relation, value_kind(procedure, constant))
-        }
-        GuardPredicate::ConstantEquality { negated, constant } => {
-            Shape::Equality(negated, value_kind(procedure, constant))
-        }
-        GuardPredicate::NanComparison { nan_on_true } => Shape::Nan(nan_on_true),
-        GuardPredicate::ConstantBoolean { value } => Shape::Constant(value),
-        GuardPredicate::Opaque { .. } => Shape::Opaque,
-        ref other => panic!("unexpected guard for {condition}: {other:?}"),
-    };
-    let subject = match shape {
-        Shape::Opaque | Shape::Constant(_) => None,
-        _ => guard
-            .subject
-            .map(|subject| value_text(procedure, source, subject)),
-    };
-    (shape, subject)
-}
-
-/// The control-edge kind of the arm on which `condition`'s predicate holds.
-fn true_arm_kind(procedure: &ProcedureSemantics, source: &str, condition: &str) -> ControlEdgeKind {
-    let guard = procedure
-        .guard_facts()
-        .iter()
-        .find(|guard| mapping_text(procedure, source, guard.source) == condition)
-        .unwrap_or_else(|| panic!("no guard for {condition}"));
-    procedure
-        .control_edge(guard.true_edge.expect("true arm"))
-        .expect("guard arm edge")
-        .kind
-}
-
-/// Every value flow into the value of the expression spelled `target`, as
-/// its kind and source spelling.
-fn flows_into<'s>(
-    procedure: &ProcedureSemantics,
-    source: &'s str,
-    target: &str,
-) -> Vec<(ValueFlowKind, &'s str)> {
-    procedure
-        .points()
-        .iter()
-        .flat_map(|point| point.events.iter())
-        .filter_map(|event| match event.effect {
-            SemanticEffect::ValueFlow {
-                kind,
-                source: from,
-                target: to,
-            } if value_text(procedure, source, to) == target => {
-                Some((kind, value_text(procedure, source, from)))
-            }
-            _ => None,
-        })
-        .collect()
-}
-
-#[test]
-fn primitive_integral_comparisons_publish_typed_integer_guards() {
-    use IntegerComparison::*;
-    use SemanticValueKind::{SignedInteger, UnsignedInteger};
-    let source = r#"class Fixture {
-  int count;
-  void run(int x, long y, byte b, char c, Integer boxed, int[] values) {
-    var inferred = 1;
-    if (x < -1L) {}
-    if (5 >= x) {}
-    if (!(x < 3)) {}
-    if (y > 0x7FFFFFFFFFFFFFFFL) {}
-    if (x <= 0xFFFFFFFF) {}
-    if (b == 0xF) {}
-    if (c != 65) {}
-    if (y == -9223372036854775808L) {}
-    if (x < 1.5) {}
-    if (x == 1.5) {}
-    if (boxed < 5) {}
-    if (inferred < 5) {}
-    if (count < 5) {}
-    if (values.length < 5) {}
-    if (x < x) {}
-    if (x <= x) {}
-  }
-}
-"#;
-    let artifact = java_semantics(source);
-    let run = method(&artifact, "run");
-    let guard = |condition| guard_shape(run, source, condition);
-    assert_eq!(
-        guard("x < -1L"),
-        (Shape::Integer(LessThan, SignedInteger(-1)), Some("x"))
-    );
-    assert_eq!(
-        guard("5 >= x"),
-        (
-            Shape::Integer(LessThanOrEqual, UnsignedInteger(5)),
-            Some("x")
-        )
-    );
-    assert_eq!(
-        guard("!(x < 3)"),
-        (
-            Shape::Integer(GreaterThanOrEqual, UnsignedInteger(3)),
-            Some("x")
-        )
-    );
-    assert_eq!(
-        guard("y > 0x7FFFFFFFFFFFFFFFL"),
-        (
-            Shape::Integer(GreaterThan, UnsignedInteger(i64::MAX as u128)),
-            Some("y")
-        )
-    );
-    assert_eq!(
-        guard("x <= 0xFFFFFFFF"),
-        (
-            Shape::Integer(LessThanOrEqual, SignedInteger(-1)),
-            Some("x")
-        )
-    );
-    assert_eq!(
-        guard("b == 0xF"),
-        (Shape::Equality(false, UnsignedInteger(15)), Some("b"))
-    );
-    assert_eq!(
-        guard("c != 65"),
-        (Shape::Equality(true, UnsignedInteger(65)), Some("c"))
-    );
-    assert_eq!(
-        guard("y == -9223372036854775808L"),
-        (
-            Shape::Equality(false, SignedInteger(i128::from(i64::MIN))),
-            Some("y")
-        )
-    );
-    // A floating literal promotes the integral subject: no integer guard,
-    // and equality keeps an unrepresented constant.
-    assert_eq!(guard("x < 1.5"), (Shape::Opaque, None));
-    assert_eq!(
-        guard("x == 1.5"),
-        (
-            Shape::Equality(false, SemanticValueKind::Constant),
-            Some("x")
-        )
-    );
-    // An ordering unboxes a boxed subject to its primitive type; a null one
-    // throws before the guard decides.
-    assert_eq!(
-        guard("boxed < 5"),
-        (Shape::Integer(LessThan, UnsignedInteger(5)), Some("boxed"))
-    );
-    // Inferred, field and array-length subjects stay open.
-    for condition in ["inferred < 5", "count < 5", "values.length < 5"] {
-        assert_eq!(guard(condition), (Shape::Opaque, None), "{condition}");
-    }
-    assert_eq!(guard("x < x"), (Shape::Constant(false), None));
-    assert_eq!(guard("x <= x"), (Shape::Constant(true), None));
-}
-
-#[test]
-fn primitive_floating_comparisons_publish_float_and_nan_guards() {
-    use IntegerComparison::*;
-    let source = r#"class Fixture {
-  void run(double d, float f, Double boxed, double[] values) {
-    if (d < 0.5) {}
-    if (2 < d) {}
-    if (f <= 0.1f) {}
-    if (f < 16777216) {}
-    if (f < 16777217) {}
-    if (d < 16777217) {}
-    if (d < 9007199254740993L) {}
-    if (!(d < 1.0)) {}
-    if (d == 1.5) {}
-    if (f != 3) {}
-    if (d != d) {}
-    if (d == d) {}
-    if (!(f <= f)) {}
-    if (d >= d) {}
-    if (d < d) {}
-    if (boxed == boxed) {}
-    if (boxed < 1.0) {}
-    if (boxed <= boxed) {}
-    if (values[0] < 1.0) {}
-  }
-}
-"#;
-    let artifact = java_semantics(source);
-    let run = method(&artifact, "run");
-    let guard = |condition| guard_shape(run, source, condition);
-    assert_eq!(
-        guard("d < 0.5"),
-        (Shape::Float(LessThan, floating(0.5)), Some("d"))
-    );
-    assert_eq!(
-        guard("2 < d"),
-        (Shape::Float(GreaterThan, floating(2.0)), Some("d"))
-    );
-    assert_eq!(
-        guard("f <= 0.1f"),
-        (
-            Shape::Float(LessThanOrEqual, floating(f64::from(0.1_f32))),
-            Some("f")
-        )
-    );
-    assert_eq!(
-        guard("f < 16777216"),
-        (Shape::Float(LessThan, floating(16_777_216.0)), Some("f"))
-    );
-    // `float` promotion would round 2^24 + 1; `double` holds it exactly but
-    // not 2^53 + 1.
-    assert_eq!(guard("f < 16777217"), (Shape::Opaque, None));
-    assert_eq!(
-        guard("d < 16777217"),
-        (Shape::Float(LessThan, floating(16_777_217.0)), Some("d"))
-    );
-    assert_eq!(guard("d < 9007199254740993L"), (Shape::Opaque, None));
-    // NaN fails both `d < 1.0` and `d >= 1.0`, so the negation keeps the
-    // un-negated predicate on swapped arms: it holds on the false successor.
-    assert_eq!(
-        guard("!(d < 1.0)"),
-        (Shape::Float(LessThan, floating(1.0)), Some("d"))
-    );
-    assert_eq!(
-        true_arm_kind(run, source, "!(d < 1.0)"),
-        ControlEdgeKind::ConditionalFalse
-    );
-    assert_eq!(
-        true_arm_kind(run, source, "d < 0.5"),
-        ControlEdgeKind::ConditionalTrue
-    );
-    assert_eq!(
-        guard("d == 1.5"),
-        (Shape::Equality(false, floating(1.5)), Some("d"))
-    );
-    assert_eq!(
-        guard("f != 3"),
-        (Shape::Equality(true, floating(3.0)), Some("f"))
-    );
-    assert_eq!(guard("d != d"), (Shape::Nan(true), Some("d")));
-    assert_eq!(guard("d == d"), (Shape::Nan(false), Some("d")));
-    assert_eq!(guard("!(f <= f)"), (Shape::Nan(true), Some("f")));
-    assert_eq!(guard("d >= d"), (Shape::Nan(false), Some("d")));
-    assert_eq!(guard("d < d"), (Shape::Constant(false), None));
-    // A boxed value compares by reference identity under `==` and unboxes
-    // under an ordering, where a null one throws before the guard decides.
-    assert_eq!(guard("boxed == boxed"), (Shape::Constant(true), None));
-    assert_eq!(
-        guard("boxed < 1.0"),
-        (Shape::Float(LessThan, floating(1.0)), Some("boxed"))
-    );
-    assert_eq!(guard("boxed <= boxed"), (Shape::Nan(false), Some("boxed")));
-    assert_eq!(guard("values[0] < 1.0"), (Shape::Opaque, None));
-}
-
-#[test]
-fn numeric_literal_assignments_publish_typed_constants() {
-    use SemanticValueKind::{Constant, SignedInteger, UnsignedInteger};
-    // `wide`, `narrowed` and `single` do not compile; they check that a
-    // literal the assignment cannot convert stays unrepresented.
-    let source = r#"class Fixture {
-  void run() {
-    int min = -2147483648;
-    long top = 0x8000000000000000L;
-    char letter = 65;
-    byte small = -0x80;
-    short wide = 0x8000;
-    int narrowed = 5L;
-    double tenth = 0.1f;
-    double three = 3;
-    float single = 0.1;
-    float exact = 2.5f;
-    Integer boxed = 5;
-    var inferred = 5;
-    long later;
-    later = -1L;
-  }
-}
-"#;
-    let artifact = java_semantics(source);
-    let run = method(&artifact, "run");
-    let assigned = |name: &str| {
-        let values = run
-            .points()
-            .iter()
-            .flat_map(|point| point.events.iter())
-            .filter_map(|event| match event.effect {
-                SemanticEffect::Assignment { target, value }
-                    if value_text(run, source, target) == name =>
-                {
-                    Some(value_kind(run, value))
-                }
-                _ => None,
-            })
-            .collect::<Vec<_>>();
-        let [value] = &values[..] else {
-            panic!("expected one assignment to {name}: {values:?}");
-        };
-        value.clone()
-    };
-    assert_eq!(assigned("min"), SignedInteger(i128::from(i32::MIN)));
-    assert_eq!(assigned("top"), SignedInteger(i128::from(i64::MIN)));
-    assert_eq!(assigned("letter"), UnsignedInteger(65));
-    assert_eq!(assigned("small"), SignedInteger(-128));
-    assert_eq!(assigned("wide"), Constant);
-    assert_eq!(assigned("narrowed"), Constant);
-    assert_eq!(assigned("tenth"), floating(f64::from(0.1_f32)));
-    assert_eq!(assigned("three"), UnsignedInteger(3));
-    assert_eq!(assigned("single"), Constant);
-    assert_eq!(assigned("exact"), floating(2.5));
-    // Boxing keeps the literal's value.
-    assert_eq!(assigned("boxed"), UnsignedInteger(5));
-    assert_eq!(assigned("inferred"), Constant);
-    assert_eq!(assigned("later"), SignedInteger(-1));
-}
-
-#[test]
-fn integral_literal_offsets_publish_integer_offset_flows() {
-    let offset = |negative, magnitude| ValueFlowKind::IntegerOffset {
-        offset: SignedIntegerMagnitude::new(negative, magnitude),
-    };
-    let source = r#"class Fixture {
-  void run(int x, byte b, Integer boxed, double d, int[] values) {
-    int a = x + 1;
-    int c = 2 + x;
-    int e = x - -3;
-    int f = x - 7;
-    long m = b + 4294967296L;
-    int g = 5 - x;
-    int h = boxed + 1;
-    double k = d + 1;
-    int n = x + x;
-    int p = x * 2;
-    int q = values[0] + 1;
-  }
-}
-"#;
-    let artifact = java_semantics(source);
-    let run = method(&artifact, "run");
-    let flows = |expression| flows_into(run, source, expression);
-    assert_eq!(flows("x + 1"), [(offset(false, 1), "x")]);
-    assert_eq!(flows("2 + x"), [(offset(false, 2), "x")]);
-    assert_eq!(flows("x - -3"), [(offset(false, 3), "x")]);
-    assert_eq!(flows("x - 7"), [(offset(true, 7), "x")]);
-    assert_eq!(flows("b + 4294967296L"), [(offset(false, 1 << 32), "b")]);
-    for (expression, operands) in [
-        ("5 - x", ["5", "x"]),
-        ("boxed + 1", ["boxed", "1"]),
-        ("d + 1", ["d", "1"]),
-        ("x + x", ["x", "x"]),
-        ("x * 2", ["x", "2"]),
-        ("values[0] + 1", ["values[0]", "1"]),
-    ] {
-        assert_eq!(
-            flows(expression),
-            operands.map(|operand| (ValueFlowKind::LanguageDefined, operand)),
-            "{expression}"
-        );
-    }
-}
-
-#[test]
-fn integral_updates_and_literal_compound_assignments_publish_offsets() {
-    let offset = |negative, magnitude| ValueFlowKind::IntegerOffset {
-        offset: SignedIntegerMagnitude::new(negative, magnitude),
-    };
-    let source = r#"class Fixture {
-  void run(int x, long y, Integer boxed, int[] a) {
-    x++;
-    ++x;
-    x--;
-    --x;
-    y += 3;
-    y -= 2L;
-    x += -1;
-    boxed++;
-    a[0]++;
-    x *= 2;
-    x += y;
-  }
-}
-"#;
-    let artifact = java_semantics(source);
-    let run = method(&artifact, "run");
-    let flows = |expression| flows_into(run, source, expression);
-    for (expression, negative, magnitude, operand) in [
-        ("x++", false, 1, "x"),
-        ("++x", false, 1, "x"),
-        ("x--", true, 1, "x"),
-        ("--x", true, 1, "x"),
-        ("y += 3", false, 3, "y"),
-        ("y -= 2L", true, 2, "y"),
-        ("x += -1", true, 1, "x"),
-    ] {
-        assert_eq!(
-            flows(expression),
-            [(offset(negative, magnitude), operand)],
-            "{expression}"
-        );
-    }
-    assert_eq!(
-        flows("boxed++"),
-        [(ValueFlowKind::LanguageDefined, "boxed")]
-    );
-    assert_eq!(flows("a[0]++"), [(ValueFlowKind::LanguageDefined, "a[0]")]);
-    for (expression, operands) in [("x *= 2", ["x", "2"]), ("x += y", ["x", "y"])] {
-        assert_eq!(
-            flows(expression),
-            operands.map(|operand| (ValueFlowKind::LanguageDefined, operand)),
-            "{expression}"
-        );
-    }
-    // A literal offset on a primitive cannot unbox, throw or call; general
-    // compound arithmetic keeps its gaps.
-    let gapped = run
-        .gaps()
-        .iter()
-        .map(|gap| mapping_text(run, source, gap.source))
-        .collect::<std::collections::BTreeSet<_>>();
-    assert_eq!(
-        gapped,
-        ["x *= 2", "x += y"].into_iter().collect(),
-        "{:?}",
-        run.gaps()
-    );
-}
-
-#[test]
-fn value_preserving_primitive_casts_publish_local_flows() {
-    let source = r#"class Fixture {
-  void run(int x, long w, char c, byte b, float f, double d, Integer boxed, Object o) {
-    long a = (long) x;
-    int l = (int) x;
-    int e = (int) c;
-    short s = (short) b;
-    double g = (double) f;
-    int i = (int) w;
-    short t = (short) c;
-    char u = (char) b;
-    float h = (float) d;
-    double v = (double) x;
-    int j = (int) boxed;
-    Integer k = (Integer) o;
-  }
-}
-"#;
-    let artifact = java_semantics(source);
-    let run = method(&artifact, "run");
-    for (cast, operand) in [
-        ("(long) x", "x"),
-        ("(int) x", "x"),
-        ("(int) c", "c"),
-        ("(short) b", "b"),
-        ("(double) f", "f"),
-    ] {
-        assert_eq!(
-            flows_into(run, source, cast),
-            [(ValueFlowKind::Local, operand)],
-            "{cast}"
-        );
-    }
-    // Narrowing, sign-changing, rounding, unboxing and reference casts keep
-    // an unknown result.
-    for cast in [
-        "(int) w",
-        "(short) c",
-        "(char) b",
-        "(float) d",
-        "(double) x",
-        "(int) boxed",
-        "(Integer) o",
-    ] {
-        assert_eq!(flows_into(run, source, cast), [], "{cast}");
-    }
+    crate::analyzer::test_support::source_mapping_text(
+        &procedure.source_mappings()[mapping.index()],
+        source,
+    )
 }
 
 #[test]
@@ -1158,4 +598,316 @@ fn labeled_loop_header_keeps_its_own_source_mapping() {
         }),
         "the label enters its separately mapped loop header"
     );
+}
+
+#[test]
+fn free_this_scan_honors_cancellation() {
+    let mut parser = tree_sitter::Parser::new();
+    parser
+        .set_language(&tree_sitter_java::LANGUAGE.into())
+        .expect("Java grammar must load");
+    let tree = parser
+        .parse(
+            "class Example { Object value() { int first = 1; int second = 2; return this; } }",
+            None,
+        )
+        .expect("Java source must parse");
+    let mut body = None;
+    crate::analyzer::tree_sitter_analyzer::walk_named_tree_preorder(
+        tree.root_node(),
+        true,
+        |node| {
+            if node.kind() == "block" {
+                body = Some(node);
+                WalkControl::Break
+            } else {
+                WalkControl::Continue
+            }
+        },
+    );
+
+    let cancellation = CancellationToken::cancel_after_checks_for_test(2);
+    assert_eq!(
+        body_contains_free_this(body.expect("method body"), &cancellation),
+        Err(LoweringCancelled)
+    );
+}
+
+fn value_text<'s>(procedure: &ProcedureSemantics, source: &'s str, value: ValueId) -> &'s str {
+    mapping_text(procedure, source, procedure.values()[value.index()].source)
+}
+
+fn value_kind(procedure: &ProcedureSemantics, value: ValueId) -> SemanticValueKind {
+    procedure.values()[value.index()].kind.clone()
+}
+
+/// The normalized shape of one guard, with its constant resolved to the
+/// published value kind.
+#[derive(Debug, PartialEq)]
+enum Shape {
+    Integer(IntegerComparison, SemanticValueKind),
+    Float(IntegerComparison, SemanticValueKind),
+    Equality(bool, SemanticValueKind),
+    Nan(bool),
+    Constant(bool),
+    Opaque,
+}
+
+/// The one guard recorded for `condition`, and its subject's spelling.
+fn guard_shape<'s>(
+    procedure: &ProcedureSemantics,
+    source: &'s str,
+    condition: &str,
+) -> (Shape, Option<&'s str>) {
+    let guards = procedure
+        .guard_facts()
+        .iter()
+        .filter(|guard| mapping_text(procedure, source, guard.source) == condition)
+        .collect::<Vec<_>>();
+    let [guard] = guards[..] else {
+        panic!("expected one guard for {condition}: {guards:?}");
+    };
+    let shape = match guard.predicate {
+        GuardPredicate::OrderedIntegerComparison { relation, constant } => {
+            Shape::Integer(relation, value_kind(procedure, constant))
+        }
+        GuardPredicate::OrderedFloatComparison { relation, constant } => {
+            Shape::Float(relation, value_kind(procedure, constant))
+        }
+        GuardPredicate::ConstantEquality { negated, constant } => {
+            Shape::Equality(negated, value_kind(procedure, constant))
+        }
+        GuardPredicate::NanComparison { nan_on_true } => Shape::Nan(nan_on_true),
+        GuardPredicate::ConstantBoolean { value } => Shape::Constant(value),
+        GuardPredicate::Opaque { .. } => Shape::Opaque,
+        ref other => panic!("unexpected guard for {condition}: {other:?}"),
+    };
+    let subject = match shape {
+        Shape::Opaque | Shape::Constant(_) => None,
+        _ => guard
+            .subject
+            .map(|subject| value_text(procedure, source, subject)),
+    };
+    (shape, subject)
+}
+
+/// The control-edge kind of the arm on which `condition`'s predicate holds.
+fn true_arm_kind(procedure: &ProcedureSemantics, source: &str, condition: &str) -> ControlEdgeKind {
+    let guard = procedure
+        .guard_facts()
+        .iter()
+        .find(|guard| mapping_text(procedure, source, guard.source) == condition)
+        .unwrap_or_else(|| panic!("no guard for {condition}"));
+    procedure
+        .control_edge(guard.true_edge.expect("true arm"))
+        .expect("guard arm edge")
+        .kind
+}
+
+#[test]
+fn primitive_integral_comparisons_publish_typed_integer_guards() {
+    use IntegerComparison::*;
+    use SemanticValueKind::{SignedInteger, UnsignedInteger};
+    let source = r#"class Fixture {
+  int count;
+  void run(int x, long y, byte b, char c, Integer boxed, int[] values) {
+    var inferred = 1;
+    if (x < -1L) {}
+    if (5 >= x) {}
+    if (!(x < 3)) {}
+    if (y > 0x7FFFFFFFFFFFFFFFL) {}
+    if (x <= 0xFFFFFFFF) {}
+    if (b == 0xF) {}
+    if (c != 65) {}
+    if (y == -9223372036854775808L) {}
+    if (x < 1.5) {}
+    if (x == 1.5) {}
+    if (boxed < 5) {}
+    if (inferred < 5) {}
+    if (count < 5) {}
+    if (values.length < 5) {}
+    if (x < x) {}
+    if (x <= x) {}
+  }
+}
+"#;
+    let artifact = java_semantics(source);
+    let run = method(&artifact, "run");
+    let guard = |condition| guard_shape(run, source, condition);
+    assert_eq!(
+        guard("x < -1L"),
+        (Shape::Integer(LessThan, SignedInteger(-1)), Some("x"))
+    );
+    assert_eq!(
+        guard("5 >= x"),
+        (
+            Shape::Integer(LessThanOrEqual, UnsignedInteger(5)),
+            Some("x")
+        )
+    );
+    assert_eq!(
+        guard("!(x < 3)"),
+        (
+            Shape::Integer(GreaterThanOrEqual, UnsignedInteger(3)),
+            Some("x")
+        )
+    );
+    assert_eq!(
+        guard("y > 0x7FFFFFFFFFFFFFFFL"),
+        (
+            Shape::Integer(GreaterThan, UnsignedInteger(i64::MAX as u128)),
+            Some("y")
+        )
+    );
+    assert_eq!(
+        guard("x <= 0xFFFFFFFF"),
+        (
+            Shape::Integer(LessThanOrEqual, SignedInteger(-1)),
+            Some("x")
+        )
+    );
+    assert_eq!(
+        guard("b == 0xF"),
+        (Shape::Equality(false, UnsignedInteger(15)), Some("b"))
+    );
+    assert_eq!(
+        guard("c != 65"),
+        (Shape::Equality(true, UnsignedInteger(65)), Some("c"))
+    );
+    assert_eq!(
+        guard("y == -9223372036854775808L"),
+        (
+            Shape::Equality(false, SignedInteger(i128::from(i64::MIN))),
+            Some("y")
+        )
+    );
+    // A floating literal promotes the integral subject: no integer guard,
+    // and equality keeps an unrepresented constant.
+    assert_eq!(guard("x < 1.5"), (Shape::Opaque, None));
+    assert_eq!(
+        guard("x == 1.5"),
+        (
+            Shape::Equality(false, SemanticValueKind::Constant),
+            Some("x")
+        )
+    );
+    // An ordering unboxes a boxed subject to its primitive type; a null one
+    // throws before the guard decides.
+    assert_eq!(
+        guard("boxed < 5"),
+        (Shape::Integer(LessThan, UnsignedInteger(5)), Some("boxed"))
+    );
+    // Inferred, field and array-length subjects stay open.
+    for condition in ["inferred < 5", "count < 5", "values.length < 5"] {
+        assert_eq!(guard(condition), (Shape::Opaque, None), "{condition}");
+    }
+    assert_eq!(guard("x < x"), (Shape::Constant(false), None));
+    assert_eq!(guard("x <= x"), (Shape::Constant(true), None));
+}
+
+#[test]
+fn primitive_floating_comparisons_publish_float_and_nan_guards() {
+    use IntegerComparison::*;
+    let source = r#"class Fixture {
+  void run(double d, float f, Double boxed, double[] values) {
+    if (d < 0.5) {}
+    if (2 < d) {}
+    if (f <= 0.1f) {}
+    if (f < 16777216) {}
+    if (f < 16777217) {}
+    if (d < 16777217) {}
+    if (d < 9007199254740993L) {}
+    if (!(d < 1.0)) {}
+    if (d == 1.5) {}
+    if (f != 3) {}
+    if (d != d) {}
+    if (d == d) {}
+    if (!(f <= f)) {}
+    if (d >= d) {}
+    if (d < d) {}
+    if (boxed == boxed) {}
+    if (boxed < 1.0) {}
+    if (boxed <= boxed) {}
+    if (values[0] < 1.0) {}
+  }
+}
+"#;
+    let artifact = java_semantics(source);
+    let run = method(&artifact, "run");
+    let guard = |condition| guard_shape(run, source, condition);
+    assert_eq!(
+        guard("d < 0.5"),
+        (Shape::Float(LessThan, floating(0.5)), Some("d"))
+    );
+    assert_eq!(
+        guard("2 < d"),
+        (Shape::Float(GreaterThan, floating(2.0)), Some("d"))
+    );
+    assert_eq!(
+        guard("f <= 0.1f"),
+        (
+            Shape::Float(LessThanOrEqual, floating(f64::from(0.1_f32))),
+            Some("f")
+        )
+    );
+    assert_eq!(
+        guard("f < 16777216"),
+        (Shape::Float(LessThan, floating(16_777_216.0)), Some("f"))
+    );
+    // `float` promotion would round 2^24 + 1; `double` holds it exactly but
+    // not 2^53 + 1.
+    assert_eq!(guard("f < 16777217"), (Shape::Opaque, None));
+    assert_eq!(
+        guard("d < 16777217"),
+        (Shape::Float(LessThan, floating(16_777_217.0)), Some("d"))
+    );
+    assert_eq!(guard("d < 9007199254740993L"), (Shape::Opaque, None));
+    // NaN fails both `d < 1.0` and `d >= 1.0`, so the negation keeps the
+    // un-negated predicate on swapped arms: it holds on the false successor.
+    assert_eq!(
+        guard("!(d < 1.0)"),
+        (Shape::Float(LessThan, floating(1.0)), Some("d"))
+    );
+    assert_eq!(
+        true_arm_kind(run, source, "!(d < 1.0)"),
+        ControlEdgeKind::ConditionalFalse
+    );
+    assert_eq!(
+        true_arm_kind(run, source, "d < 0.5"),
+        ControlEdgeKind::ConditionalTrue
+    );
+    assert_eq!(
+        guard("d == 1.5"),
+        (Shape::Equality(false, floating(1.5)), Some("d"))
+    );
+    assert_eq!(
+        guard("f != 3"),
+        (Shape::Equality(true, floating(3.0)), Some("f"))
+    );
+    assert_eq!(guard("d != d"), (Shape::Nan(true), Some("d")));
+    assert_eq!(guard("d == d"), (Shape::Nan(false), Some("d")));
+    assert_eq!(guard("!(f <= f)"), (Shape::Nan(true), Some("f")));
+    assert_eq!(guard("d >= d"), (Shape::Nan(false), Some("d")));
+    assert_eq!(guard("d < d"), (Shape::Constant(false), None));
+    // A boxed value compares by reference identity under `==` and unboxes
+    // under an ordering, where a null one throws before the guard decides.
+    assert_eq!(guard("boxed == boxed"), (Shape::Constant(true), None));
+    assert_eq!(
+        guard("boxed < 1.0"),
+        (Shape::Float(LessThan, floating(1.0)), Some("boxed"))
+    );
+    assert_eq!(guard("boxed <= boxed"), (Shape::Nan(false), Some("boxed")));
+    assert_eq!(guard("values[0] < 1.0"), (Shape::Opaque, None));
+}
+
+#[test]
+#[hardwon("#2363: qualified external Java calls lost their owner type prefix")]
+fn type_name_prefix_recognizes_qualified_stdlib_types() {
+    assert_eq!(java_type_name_prefix_len(&["java", "net", "URLDecoder"]), 3);
+    assert_eq!(
+        java_type_name_prefix_len(&["java", "net", "URLDecoder", "SOME_CONST"]),
+        3
+    );
+    assert_eq!(java_type_name_prefix_len(&["inheritedField", "nested"]), 0);
+    assert_eq!(java_type_name_prefix_len(&["Outer", "Inner"]), 2);
 }

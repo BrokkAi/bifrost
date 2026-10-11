@@ -1,5 +1,6 @@
 use super::*;
 use schemars::JsonSchema;
+use serde::Deserialize;
 
 #[cfg_attr(feature = "query-result-fixtures", derive(Default))]
 #[derive(Debug, Clone, Serialize, JsonSchema)]
@@ -94,6 +95,44 @@ pub struct CodeQueryExport {
     /// The declaration the export materialized, when the analyzer models one.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub target_fq_name: Option<String>,
+    /// For Python `__all__` members, whether a structured module binding
+    /// proves this name defined, absent, or potentially dynamic.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub local_definition: Option<CodeQueryExportLocalDefinition>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum CodeQueryExportLocalDefinition {
+    Defined { binding: CodeQueryExportBinding },
+    Undefined,
+    Unknown,
+}
+
+impl CodeQueryExportLocalDefinition {
+    pub const fn status(&self) -> &'static str {
+        match self {
+            Self::Defined { .. } => "defined",
+            Self::Undefined => "undefined",
+            Self::Unknown => "unknown",
+        }
+    }
+
+    pub fn binding(&self) -> Option<&CodeQueryExportBinding> {
+        match self {
+            Self::Defined { binding } => Some(binding),
+            Self::Undefined | Self::Unknown => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct CodeQueryExportBinding {
+    pub name: String,
+    pub kind: String,
+    pub start_byte: usize,
+    pub end_byte: usize,
+    pub range: CodeQueryRange,
 }
 
 /// The state of one declaration: where it came from and what it must not be
@@ -347,6 +386,11 @@ pub struct CodeQueryStateEvent {
     pub end_byte: usize,
     /// `establish`, `kill`, or `read`.
     pub event_class: &'static str,
+    /// Why a synthetic binding read was placed at an async suspension point;
+    /// `scope_end_drop` records syntactic future-frame liveness and does not
+    /// prove a cancellation destructor runs. Absent for ordinary events.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub read_cause: Option<&'static str>,
     /// `binding` or `property`.
     pub subject: &'static str,
     /// The member a property subject names; absent for a binding subject.
@@ -372,6 +416,29 @@ pub struct CodeQueryStateEvent {
     #[schemars(default)]
     pub uncovered_axes: Vec<&'static str>,
     pub generation: u64,
+}
+
+/// One exact call on a binding initializer's result or method-receiver chain.
+///
+/// `establishment_event_id` joins this relation to the establishing end of a
+/// `flow_relation`. `site_ast_id` reuses the content-scoped call identity
+/// published by `call_effect` and `dispatch_target`, so policies can join the
+/// initializer to its resolved API evidence without comparing procedure row
+/// identifiers from different row domains.
+#[cfg_attr(feature = "query-result-fixtures", derive(Default))]
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+pub struct CodeQueryBindingInitializerCall {
+    pub id: String,
+    pub establishment_event_id: String,
+    pub site_ast_id: String,
+    /// `result` is the call whose result initializes the binding; `receiver`
+    /// is an exact call result used as the receiver of the next chain call.
+    pub initializer_role: &'static str,
+    pub path: String,
+    pub language: &'static str,
+    pub range: CodeQueryRange,
+    pub start_byte: usize,
+    pub end_byte: usize,
 }
 
 /// One end of a flow relation, rendered inline so the relation is readable

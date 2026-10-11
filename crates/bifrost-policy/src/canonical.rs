@@ -7,6 +7,7 @@
 
 use std::{cmp::Ordering, collections::HashSet, fmt};
 
+use brokk_bifrost_analysis::analyzer::usages::UsageHitSurface;
 use serde_json::{Map, Value, json};
 
 use super::definition::*;
@@ -268,10 +269,7 @@ fn extend_taint_selector_paths<T: TaintSelectorEntry>(
     entries: &[T],
 ) {
     paths.extend(entries.iter().map(|entry| {
-        format!(
-            "/analysis/{set_name}/entries/{}/selector",
-            json_pointer_segment(entry.entry_id().as_str())
-        )
+        super::resolved::taint_entry_selector_path(set_name, entry.entry_id().as_str())
     }));
 }
 
@@ -301,10 +299,6 @@ impl_taint_selector_entry!(
     TaintStoreWriteSpec,
     TaintStoreReadSpec,
 );
-
-fn json_pointer_segment(value: &str) -> String {
-    value.replace('~', "~0").replace('/', "~1")
-}
 
 fn ensure_inline_local_taint(
     spec: &TaintPolicySpec,
@@ -628,11 +622,7 @@ fn endpoint_definition_to_json(definition: &MatchEndpointDefinition) -> Value {
         "help_uri",
         definition.help_uri.as_ref().map(|value| json!(value)),
     );
-    insert(
-        &mut object,
-        "role",
-        json!(endpoint_role_label(definition.role)),
-    );
+    insert(&mut object, "role", json!((definition.role).label()));
     insert(
         &mut object,
         "categories",
@@ -769,11 +759,16 @@ fn policy_analysis_to_json(analysis: &PolicyAnalysis) -> Value {
         }
         PolicyAnalysis::Taint { spec } => {
             let mut object = tagged("taint");
-            insert(&mut object, "mode", json!(may_mode_label(spec.mode)));
+            insert(&mut object, "mode", json!(spec.mode.label()));
             insert(
                 &mut object,
                 "call_modeling",
                 call_modeling_to_json(spec.call_modeling),
+            );
+            insert(
+                &mut object,
+                "threat_models",
+                string_set(spec.threat_models.iter().map(|model| model.label())),
             );
             insert(
                 &mut object,
@@ -884,7 +879,7 @@ fn policy_analysis_to_json(analysis: &PolicyAnalysis) -> Value {
             // keeps the semantic hash sensitive to exactly the flow-relevant
             // fields.
             let mut object = tagged("flow");
-            insert(&mut object, "mode", json!(may_mode_label(spec.mode)));
+            insert(&mut object, "mode", json!(spec.mode.label()));
             insert(
                 &mut object,
                 "call_modeling",
@@ -932,7 +927,7 @@ fn policy_analysis_to_json(analysis: &PolicyAnalysis) -> Value {
         }
         PolicyAnalysis::Typestate { spec } => {
             let mut object = tagged("typestate");
-            insert(&mut object, "mode", json!(may_mode_label(spec.mode)));
+            insert(&mut object, "mode", json!(spec.mode.label()));
             insert(
                 &mut object,
                 "call_modeling",
@@ -1100,6 +1095,7 @@ fn row_literal_to_json(literal: &RowLiteral) -> Value {
     match literal {
         RowLiteral::String(value) | RowLiteral::ConstrainedEnum(value) => json!(value),
         RowLiteral::StringList(values) => json!(values),
+        RowLiteral::IntegerList(values) => json!(values),
         RowLiteral::Integer(value) => json!(value),
         RowLiteral::Boolean(value) => json!(value),
     }
@@ -1109,6 +1105,7 @@ pub(crate) fn resolved_locator_to_json(locator: &ResolvedPolicyLocator) -> Value
     let role = match locator.role {
         ResolvedPolicyLocatorRole::Callable => "callable",
         ResolvedPolicyLocatorRole::ReceiverType => "receiver_type",
+        ResolvedPolicyLocatorRole::Value => "value",
     };
     let kind = match locator.kind {
         ResolvedPolicyLocatorKind::WorkspaceDeclaration => "workspace_declaration",
@@ -1175,12 +1172,40 @@ fn policy_assert_to_json(assertion: &PolicyAssert) -> Value {
     }
 }
 
+fn assertion_object(kind: &str, id: &str, at: &str) -> Map<String, Value> {
+    let mut object = Map::new();
+    insert(&mut object, "kind", json!(kind));
+    insert(&mut object, "id", json!(id));
+    insert(&mut object, "at", json!(at));
+    object
+}
+
+fn insert_assertion_role(object: &mut Map<String, Value>, role: &str) {
+    insert(object, "role", json!(role));
+}
+
+fn edge_assertion_object(
+    kind: &str,
+    id: &str,
+    at: &str,
+    role: &str,
+    surface: Option<UsageHitSurface>,
+) -> Map<String, Value> {
+    let mut object = assertion_object(kind, id, at);
+    insert_assertion_role(&mut object, role);
+    insert(
+        &mut object,
+        "surface",
+        surface.map_or(Value::Null, |surface| {
+            json!(brokk_bifrost_rql::schema::usage_surface_label(surface))
+        }),
+    );
+    object
+}
+
 fn flow_establishment_assert_to_json(assertion: &FlowEstablishmentAssert) -> Value {
-    let mut object = serde_json::Map::new();
-    insert(&mut object, "kind", json!("flow_establishment"));
-    insert(&mut object, "id", json!(assertion.id.as_str()));
-    insert(&mut object, "at", json!(assertion.at));
-    insert(&mut object, "role", json!(assertion.role.label()));
+    let mut object = assertion_object("flow_establishment", assertion.id.as_str(), &assertion.at);
+    insert_assertion_role(&mut object, assertion.role.label());
     insert(&mut object, "require", json!(assertion.require.label()));
     insert(
         &mut object,
@@ -1271,29 +1296,24 @@ fn declaration_state_assert_to_json(assertion: &DeclarationStateAssert) -> Value
 }
 
 fn edge_parity_assert_to_json(assertion: &EdgeParityAssert) -> Value {
-    let mut object = serde_json::Map::new();
-    insert(&mut object, "kind", json!("edge_parity"));
-    insert(&mut object, "id", json!(assertion.id.as_str()));
-    insert(&mut object, "at", json!(assertion.at));
-    insert(&mut object, "role", json!(assertion.role.label()));
-    insert(
-        &mut object,
-        "surface",
-        match assertion.surface {
-            Some(surface) => json!(brokk_bifrost_rql::schema::usage_surface_label(surface)),
-            None => Value::Null,
-        },
-    );
-    Value::Object(object)
+    Value::Object(edge_assertion_object(
+        "edge_parity",
+        assertion.id.as_str(),
+        &assertion.at,
+        assertion.role.label(),
+        assertion.surface,
+    ))
 }
 
 fn edge_class_assert_to_json(assertion: &EdgeClassAssert) -> Value {
-    use brokk_bifrost_rql::schema::{reference_kind_label, usage_surface_label};
-    let mut object = serde_json::Map::new();
-    insert(&mut object, "kind", json!("edge_class"));
-    insert(&mut object, "id", json!(assertion.id.as_str()));
-    insert(&mut object, "at", json!(assertion.at));
-    insert(&mut object, "role", json!(assertion.role.label()));
+    use brokk_bifrost_rql::schema::reference_kind_label;
+    let mut object = edge_assertion_object(
+        "edge_class",
+        assertion.id.as_str(),
+        &assertion.at,
+        assertion.role.label(),
+        assertion.surface,
+    );
     insert(
         &mut object,
         "axis",
@@ -1331,23 +1351,12 @@ fn edge_class_assert_to_json(assertion: &EdgeClassAssert) -> Value {
     };
     insert(&mut object, "require", Value::Array(require));
     insert(&mut object, "forbid", Value::Array(forbid));
-    insert(
-        &mut object,
-        "surface",
-        match assertion.surface {
-            Some(surface) => json!(usage_surface_label(surface)),
-            None => Value::Null,
-        },
-    );
     Value::Object(object)
 }
 
 fn canonical_assert_to_json(assertion: &CanonicalAssert) -> Value {
-    let mut object = serde_json::Map::new();
-    insert(&mut object, "kind", json!("canonical"));
-    insert(&mut object, "id", json!(assertion.id.as_str()));
-    insert(&mut object, "at", json!(assertion.at));
-    insert(&mut object, "role", json!(assertion.role.label()));
+    let mut object = assertion_object("canonical", assertion.id.as_str(), &assertion.at);
+    insert_assertion_role(&mut object, assertion.role.label());
     insert(&mut object, "equals", json!(assertion.equals));
     insert(
         &mut object,
@@ -1359,11 +1368,8 @@ fn canonical_assert_to_json(assertion: &CanonicalAssert) -> Value {
 }
 
 fn route_assert_to_json(assertion: &RouteAssert) -> Value {
-    let mut object = serde_json::Map::new();
-    insert(&mut object, "kind", json!("route"));
-    insert(&mut object, "id", json!(assertion.id.as_str()));
-    insert(&mut object, "at", json!(assertion.at));
-    insert(&mut object, "role", json!(assertion.role.label()));
+    let mut object = assertion_object("route", assertion.id.as_str(), &assertion.at);
+    insert_assertion_role(&mut object, assertion.role.label());
     insert(&mut object, "to", json!(assertion.to));
     insert(&mut object, "to_role", json!(assertion.to_role.label()));
     insert(
@@ -1386,20 +1392,14 @@ fn route_assert_to_json(assertion: &RouteAssert) -> Value {
 }
 
 fn round_trip_assert_to_json(assertion: &RoundTripAssert) -> Value {
-    let mut object = serde_json::Map::new();
-    insert(&mut object, "kind", json!("round_trip"));
-    insert(&mut object, "id", json!(assertion.id.as_str()));
-    insert(&mut object, "at", json!(assertion.at));
-    insert(&mut object, "role", json!(assertion.role.label()));
+    let mut object = assertion_object("round_trip", assertion.id.as_str(), &assertion.at);
+    insert_assertion_role(&mut object, assertion.role.label());
     Value::Object(object)
 }
 
 fn resolution_assert_to_json(assertion: &ResolutionAssert) -> Value {
-    let mut object = serde_json::Map::new();
-    insert(&mut object, "kind", json!("resolution"));
-    insert(&mut object, "id", json!(assertion.id.as_str()));
-    insert(&mut object, "at", json!(assertion.at));
-    insert(&mut object, "role", json!(assertion.role.label()));
+    let mut object = assertion_object("resolution", assertion.id.as_str(), &assertion.at);
+    insert_assertion_role(&mut object, assertion.role.label());
     insert(
         &mut object,
         "expect_tier",
@@ -1423,11 +1423,8 @@ fn resolution_assert_to_json(assertion: &ResolutionAssert) -> Value {
 }
 
 fn binding_scope_assert_to_json(assertion: &BindingScopeAssert) -> Value {
-    let mut object = serde_json::Map::new();
-    insert(&mut object, "kind", json!("binding_scope"));
-    insert(&mut object, "id", json!(assertion.id.as_str()));
-    insert(&mut object, "at", json!(assertion.at));
-    insert(&mut object, "role", json!(assertion.role.label()));
+    let mut object = assertion_object("binding_scope", assertion.id.as_str(), &assertion.at);
+    insert_assertion_role(&mut object, assertion.role.label());
     insert(
         &mut object,
         "declared",
@@ -1438,23 +1435,17 @@ fn binding_scope_assert_to_json(assertion: &BindingScopeAssert) -> Value {
 }
 
 fn origin_shape_assert_to_json(assertion: &OriginShapeAssert) -> Value {
-    let mut object = serde_json::Map::new();
-    insert(&mut object, "kind", json!("origin_shape"));
-    insert(&mut object, "id", json!(assertion.id.as_str()));
-    insert(&mut object, "at", json!(assertion.at));
+    let mut object = assertion_object("origin_shape", assertion.id.as_str(), &assertion.at);
     insert(&mut object, "anchor", json!(assertion.anchor));
-    insert(&mut object, "role", json!(assertion.role.label()));
+    insert_assertion_role(&mut object, assertion.role.label());
     insert(&mut object, "shape", json!(assertion.shape.label()));
     insert(&mut object, "max_elements", json!(assertion.max_elements));
     Value::Object(object)
 }
 
 fn value_origin_assert_to_json(assertion: &ValueOriginAssert) -> Value {
-    let mut object = serde_json::Map::new();
-    insert(&mut object, "kind", json!("value_origin"));
-    insert(&mut object, "id", json!(assertion.id.as_str()));
-    insert(&mut object, "at", json!(assertion.at));
-    insert(&mut object, "role", json!(assertion.role.label()));
+    let mut object = assertion_object("value_origin", assertion.id.as_str(), &assertion.at);
+    insert_assertion_role(&mut object, assertion.role.label());
     insert(
         &mut object,
         "established",
@@ -1465,11 +1456,8 @@ fn value_origin_assert_to_json(assertion: &ValueOriginAssert) -> Value {
 }
 
 fn boundary_assert_to_json(assertion: &BoundaryAssert) -> Value {
-    let mut object = serde_json::Map::new();
-    insert(&mut object, "kind", json!("boundary"));
-    insert(&mut object, "id", json!(assertion.id.as_str()));
-    insert(&mut object, "at", json!(assertion.at));
-    insert(&mut object, "role", json!(assertion.role.label()));
+    let mut object = assertion_object("boundary", assertion.id.as_str(), &assertion.at);
+    insert_assertion_role(&mut object, assertion.role.label());
     insert(
         &mut object,
         "forbid_fallback_past",
@@ -1479,11 +1467,8 @@ fn boundary_assert_to_json(assertion: &BoundaryAssert) -> Value {
 }
 
 fn occurrence_assert_to_json(assertion: &OccurrenceAssert) -> Value {
-    let mut object = serde_json::Map::new();
-    insert(&mut object, "kind", json!("occurrence"));
-    insert(&mut object, "id", json!(assertion.id.as_str()));
-    insert(&mut object, "at", json!(assertion.at));
-    insert(&mut object, "role", json!(assertion.role.label()));
+    let mut object = assertion_object("occurrence", assertion.id.as_str(), &assertion.at);
+    insert_assertion_role(&mut object, assertion.role.label());
     insert(&mut object, "expect", json!(assertion.expect.label()));
     insert(
         &mut object,
@@ -1519,26 +1504,27 @@ fn policy_message_to_json(message: &PolicyMessageSpec) -> Value {
     }
 }
 
-fn policy_severity_to_json(severity: &PolicySeveritySpec) -> Value {
+pub(crate) fn policy_severity_to_json(severity: &PolicySeveritySpec) -> Value {
     match severity {
         PolicySeveritySpec::Fixed { level } => {
-            json!({ "type": "fixed", "level": policy_level_label(*level) })
+            json!({ "type": "fixed", "level": (*level).label() })
         }
         PolicySeveritySpec::Unrated => json!({ "type": "unrated" }),
         PolicySeveritySpec::Cvss { when_unscored } => json!({
             "type": "cvss",
-            "when_unscored": finding_severity_label(*when_unscored),
+            "when_unscored": when_unscored.label(),
         }),
     }
 }
 
 pub(crate) fn selector_to_json(selector: &PolicySelector) -> Value {
     match selector {
-        PolicySelector::Inline { schema, query, .. } => {
+        PolicySelector::Inline { .. } => {
+            let (schema_version, query) = inline_selector_fields(selector);
             json!({
                 "type": "inline",
-                "schema_version": schema.version,
-                "query": query.to_canonical_query_plan_json(),
+                "schema_version": schema_version,
+                "query": query,
             })
         }
         PolicySelector::File {
@@ -1560,26 +1546,45 @@ pub(crate) fn selector_to_json(selector: &PolicySelector) -> Value {
     }
 }
 
-fn endpoint_binding_to_json(binding: &PolicyEndpointBinding) -> Value {
+pub(crate) fn inline_selector_fields(selector: &PolicySelector) -> (u32, Value) {
+    let PolicySelector::Inline { schema, query, .. } = selector else {
+        unreachable!("catalog validation rejects file selectors")
+    };
+    (schema.version, query.to_canonical_query_plan_json())
+}
+
+pub(crate) fn endpoint_binding_to_json(binding: &PolicyEndpointBinding) -> Value {
     match binding {
-        PolicyEndpointBinding::MatchedValue => Value::Object(tagged("matched_value")),
-        PolicyEndpointBinding::Receiver => Value::Object(tagged("receiver")),
-        PolicyEndpointBinding::ReturnValue => Value::Object(tagged("return_value")),
+        PolicyEndpointBinding::MatchedValue => binding_tag_to_json("matched_value"),
+        PolicyEndpointBinding::Receiver => binding_tag_to_json("receiver"),
+        PolicyEndpointBinding::ReturnValue => binding_tag_to_json("return_value"),
         PolicyEndpointBinding::ResultIndex { index } => {
-            json!({ "type": "result_index", "index": index })
+            binding_index_to_json("result_index", *index)
         }
         PolicyEndpointBinding::ArgumentIndex { index } => {
-            json!({ "type": "argument_index", "index": index })
+            binding_index_to_json("argument_index", *index)
         }
-        PolicyEndpointBinding::ArgumentName { name } => {
-            json!({ "type": "argument_name", "name": name })
-        }
+        PolicyEndpointBinding::ArgumentName { name } => binding_name_to_json("argument_name", name),
     }
+}
+
+pub(crate) fn binding_tag_to_json(kind: &str) -> Value {
+    Value::Object(tagged(kind))
+}
+
+pub(crate) fn binding_index_to_json(kind: &str, index: u32) -> Value {
+    json!({ "type": kind, "index": index })
+}
+
+pub(crate) fn binding_name_to_json(kind: &str, name: &str) -> Value {
+    json!({ "type": kind, "name": name })
 }
 
 fn endpoint_taint_to_json(taint: &EndpointTaintSemantics) -> Value {
     match taint {
-        EndpointTaintSemantics::Source { labels, evidence } => {
+        EndpointTaintSemantics::Source {
+            labels, evidence, ..
+        } => {
             let mut object = tagged("source");
             insert(
                 &mut object,
@@ -1729,11 +1734,7 @@ fn match_endpoint_set_ref_to_json(reference: &MatchEndpointSetRef) -> Value {
 fn match_directory_ref_to_json(reference: &MatchDirectoryRef) -> Value {
     let mut object = Map::new();
     insert(&mut object, "path", json!(reference.path.as_str()));
-    insert(
-        &mut object,
-        "scope",
-        json!(directory_scope_label(reference.scope)),
-    );
+    insert(&mut object, "scope", json!((reference.scope).label()));
     insert(
         &mut object,
         "categories",
@@ -1749,7 +1750,7 @@ fn match_directory_ref_to_json(reference: &MatchDirectoryRef) -> Value {
     Value::Object(object)
 }
 
-fn category_predicate_to_json(predicate: &CategoryPredicate) -> Value {
+pub(super) fn category_predicate_to_json(predicate: &CategoryPredicate) -> Value {
     match predicate {
         CategoryPredicate::Any { categories } => json!({
             "type": "any",
@@ -1837,20 +1838,14 @@ fn endpoint_ref_to_json(reference: &EndpointRef) -> Value {
     }
 }
 
-fn policy_port_to_json(port: &PolicyPort) -> Value {
+pub(crate) fn policy_port_to_json(port: &PolicyPort) -> Value {
     match port {
-        PolicyPort::MatchedValue => Value::Object(tagged("matched_value")),
-        PolicyPort::Receiver => Value::Object(tagged("receiver")),
-        PolicyPort::ReturnValue => Value::Object(tagged("return_value")),
-        PolicyPort::ResultIndex { index } => {
-            json!({ "type": "result_index", "index": index })
-        }
-        PolicyPort::ArgumentIndex { index } => {
-            json!({ "type": "argument_index", "index": index })
-        }
-        PolicyPort::ArgumentName { name } => {
-            json!({ "type": "argument_name", "name": name })
-        }
+        PolicyPort::MatchedValue => binding_tag_to_json("matched_value"),
+        PolicyPort::Receiver => binding_tag_to_json("receiver"),
+        PolicyPort::ReturnValue => binding_tag_to_json("return_value"),
+        PolicyPort::ResultIndex { index } => binding_index_to_json("result_index", *index),
+        PolicyPort::ArgumentIndex { index } => binding_index_to_json("argument_index", *index),
+        PolicyPort::ArgumentName { name } => binding_name_to_json("argument_name", name),
         PolicyPort::FieldOf { base, name } => {
             json!({ "type": "field", "name": name, "of": policy_port_to_json(base) })
         }
@@ -1875,6 +1870,11 @@ fn taint_source_to_json(source: &TaintSourceSpec) -> Value {
     );
     insert_option(
         &mut object,
+        "threat_model",
+        source.threat_model.map(|model| json!(model.label())),
+    );
+    insert_option(
+        &mut object,
         "evidence",
         source.evidence.as_ref().map(taint_source_evidence_to_json),
     );
@@ -1886,16 +1886,12 @@ fn taint_source_evidence_to_json(evidence: &TaintSourceEvidence) -> Value {
     insert_option(
         &mut object,
         "trust_boundary",
-        evidence
-            .trust_boundary
-            .map(|value| json!(taint_trust_boundary_label(value))),
+        evidence.trust_boundary.map(|value| json!((value).label())),
     );
     insert_option(
         &mut object,
         "system_entry",
-        evidence
-            .system_entry
-            .map(|value| json!(taint_system_entry_label(value))),
+        evidence.system_entry.map(|value| json!((value).label())),
     );
     Value::Object(object)
 }
@@ -1932,21 +1928,21 @@ fn flow_observation_to_json(observation: &TaintSinkSpec) -> Value {
 }
 
 fn flow_kill_to_json(kill: &TaintSanitizerSpec) -> Value {
-    json!({
-        "id": kill.id.as_str(),
-        "selector": selector_to_json(&kill.selector),
-        "input": policy_port_to_json(&kill.input),
-        "output": policy_port_to_json(&kill.output),
-    })
+    Value::Object(taint_port_operation_fields_to_json(
+        &kill.id,
+        &kill.selector,
+        &kill.input,
+        &kill.output,
+    ))
 }
 
 fn flow_transform_to_json(transform: &TaintTransformSpec) -> Value {
-    json!({
-        "id": transform.id.as_str(),
-        "selector": selector_to_json(&transform.selector),
-        "input": policy_port_to_json(&transform.input),
-        "output": policy_port_to_json(&transform.output),
-    })
+    Value::Object(taint_port_operation_fields_to_json(
+        &transform.id,
+        &transform.selector,
+        &transform.input,
+        &transform.output,
+    ))
 }
 
 fn taint_entry_point_to_json(entry_point: &TaintEntryPointSpec) -> Value {
@@ -1959,62 +1955,105 @@ fn taint_entry_point_to_json(entry_point: &TaintEntryPointSpec) -> Value {
 }
 
 fn taint_sanitizer_to_json(sanitizer: &TaintSanitizerSpec) -> Value {
-    json!({
-        "id": sanitizer.id.as_str(),
-        "selector": selector_to_json(&sanitizer.selector),
-        "input": policy_port_to_json(&sanitizer.input),
-        "output": policy_port_to_json(&sanitizer.output),
-        "removes": id_set(sanitizer.removes.iter().map(TaintLabel::as_str)),
-    })
+    let mut fields = taint_port_operation_fields_to_json(
+        &sanitizer.id,
+        &sanitizer.selector,
+        &sanitizer.input,
+        &sanitizer.output,
+    );
+    insert(
+        &mut fields,
+        "removes",
+        id_set(sanitizer.removes.iter().map(TaintLabel::as_str)),
+    );
+    Value::Object(fields)
 }
 
 fn taint_store_write_to_json(write: &TaintStoreWriteSpec) -> Value {
-    let mut object = Map::new();
-    insert(&mut object, "id", json!(write.id.as_str()));
-    insert(&mut object, "selector", selector_to_json(&write.selector));
-    insert(&mut object, "store", json!(write.store.as_str()));
-    insert_option(
-        &mut object,
-        "key",
-        write.key.as_ref().map(policy_port_to_json),
-    );
-    insert_option(
-        &mut object,
-        "instance",
-        write.instance.as_ref().map(policy_port_to_json),
+    let mut object = taint_store_common_fields_to_json(
+        &write.id,
+        &write.selector,
+        write.store.as_str(),
+        write.key.as_ref(),
+        write.instance.as_ref(),
     );
     insert(&mut object, "input", policy_port_to_json(&write.input));
     Value::Object(object)
 }
 
 fn taint_store_read_to_json(read: &TaintStoreReadSpec) -> Value {
-    let mut object = Map::new();
-    insert(&mut object, "id", json!(read.id.as_str()));
-    insert(&mut object, "selector", selector_to_json(&read.selector));
-    insert(&mut object, "store", json!(read.store.as_str()));
-    insert_option(
-        &mut object,
-        "key",
-        read.key.as_ref().map(policy_port_to_json),
-    );
-    insert_option(
-        &mut object,
-        "instance",
-        read.instance.as_ref().map(policy_port_to_json),
+    let mut object = taint_store_common_fields_to_json(
+        &read.id,
+        &read.selector,
+        read.store.as_str(),
+        read.key.as_ref(),
+        read.instance.as_ref(),
     );
     insert(&mut object, "output", policy_port_to_json(&read.output));
     Value::Object(object)
 }
 
+fn taint_store_common_fields_to_json(
+    id: &TaintEntryId,
+    selector: &PolicySelector,
+    store: &str,
+    key: Option<&PolicyPort>,
+    instance: Option<&PolicyPort>,
+) -> Map<String, Value> {
+    let mut object = Map::new();
+    insert(&mut object, "id", json!(id.as_str()));
+    insert(&mut object, "selector", selector_to_json(selector));
+    insert(&mut object, "store", json!(store));
+    insert_option(&mut object, "key", key.map(policy_port_to_json));
+    insert_option(&mut object, "instance", instance.map(policy_port_to_json));
+    object
+}
+
 fn taint_transform_to_json(transform: &TaintTransformSpec) -> Value {
-    json!({
-        "id": transform.id.as_str(),
-        "selector": selector_to_json(&transform.selector),
-        "input": policy_port_to_json(&transform.input),
-        "output": policy_port_to_json(&transform.output),
-        "removes": id_set(transform.removes.iter().map(TaintLabel::as_str)),
-        "adds": id_set(transform.adds.iter().map(TaintLabel::as_str)),
-    })
+    let mut fields = taint_port_operation_fields_to_json(
+        &transform.id,
+        &transform.selector,
+        &transform.input,
+        &transform.output,
+    );
+    insert(
+        &mut fields,
+        "removes",
+        id_set(transform.removes.iter().map(TaintLabel::as_str)),
+    );
+    insert(
+        &mut fields,
+        "adds",
+        id_set(transform.adds.iter().map(TaintLabel::as_str)),
+    );
+    Value::Object(fields)
+}
+
+fn taint_port_operation_fields_to_json(
+    id: &TaintEntryId,
+    selector: &PolicySelector,
+    input: &PolicyPort,
+    output: &PolicyPort,
+) -> Map<String, Value> {
+    let mut fields = taint_port_fields_to_json(
+        selector_to_json(selector),
+        policy_port_to_json(input),
+        policy_port_to_json(output),
+    );
+    insert(&mut fields, "id", json!(id.as_str()));
+    fields
+}
+
+pub(crate) fn taint_port_fields_to_json(
+    selector: Value,
+    input: Value,
+    output: Value,
+) -> Map<String, Value> {
+    Map::from_iter([
+        ("selector".to_owned(), selector),
+        ("input".to_owned(), input),
+        ("output".to_owned(), output),
+    ])
 }
 
 fn taint_external_model_to_json(model: &TaintExternalModelSpec) -> Value {
@@ -2025,7 +2064,7 @@ fn taint_external_model_to_json(model: &TaintExternalModelSpec) -> Value {
     })
 }
 
-fn taint_transfer_to_json(transfer: &TaintTransferSpec) -> Value {
+pub(crate) fn taint_transfer_to_json(transfer: &TaintTransferSpec) -> Value {
     json!({
         "from": policy_port_to_json(&transfer.from),
         "to": policy_port_to_json(&transfer.to),
@@ -2074,24 +2113,22 @@ fn typestate_subject_to_json(subject: &TypestateSubjectSpec) -> Value {
 
 fn typestate_seed_binding_to_json(binding: &TypestateSeedBinding) -> Value {
     match binding {
-        TypestateSeedBinding::MatchedValue => Value::Object(tagged("matched_value")),
-        TypestateSeedBinding::Receiver => Value::Object(tagged("receiver")),
-        TypestateSeedBinding::ReturnValue => Value::Object(tagged("return_value")),
+        TypestateSeedBinding::MatchedValue => binding_tag_to_json("matched_value"),
+        TypestateSeedBinding::Receiver => binding_tag_to_json("receiver"),
+        TypestateSeedBinding::ReturnValue => binding_tag_to_json("return_value"),
         TypestateSeedBinding::ResultIndex { index } => {
-            json!({ "type": "result_index", "index": index })
+            binding_index_to_json("result_index", *index)
         }
         TypestateSeedBinding::ArgumentIndex { index } => {
-            json!({ "type": "argument_index", "index": index })
+            binding_index_to_json("argument_index", *index)
         }
-        TypestateSeedBinding::ArgumentName { name } => {
-            json!({ "type": "argument_name", "name": name })
-        }
+        TypestateSeedBinding::ArgumentName { name } => binding_name_to_json("argument_name", name),
     }
 }
 
 fn typestate_uncertainty_to_json(uncertainty: &TypestateUncertaintySpec) -> Value {
     json!({
-        "escape": inconclusive_policy_label(uncertainty.escape),
+        "escape": uncertainty.escape.label(),
     })
 }
 
@@ -2102,30 +2139,51 @@ fn call_modeling_to_json(call_modeling: CallModelingSpec) -> Value {
 }
 
 fn typestate_automaton_to_json(automaton: &TypestateAutomatonSpec) -> Value {
-    json!({
-        "states": id_set(automaton.states.iter().map(TypestateStateId::as_str)),
-        "initial": automaton.initial.as_str(),
-        "accepting_states": id_set(
-            automaton.accepting_states.iter().map(TypestateStateId::as_str),
+    typestate_automaton_projection_to_json(
+        id_set(automaton.states.iter().map(TypestateStateId::as_str)),
+        automaton.initial.as_str(),
+        id_set(
+            automaton
+                .accepting_states
+                .iter()
+                .map(TypestateStateId::as_str),
         ),
-        "error_states": id_set(automaton.error_states.iter().map(TypestateStateId::as_str)),
-        "events": sorted_typed_values(
+        id_set(automaton.error_states.iter().map(TypestateStateId::as_str)),
+        sorted_typed_values(
             automaton.events.iter(),
             |left, right| left.id.cmp(&right.id),
             typestate_event_to_json,
         ),
-        "transitions": sorted_typed_values(
+        sorted_typed_values(
             automaton.transitions.iter(),
             compare_typestate_transitions,
             typestate_transition_to_json,
         ),
-        "terminal_expectations": sorted_typed_values(
-            automaton
-                .terminal_expectations
-                .iter(),
+        sorted_typed_values(
+            automaton.terminal_expectations.iter(),
             |left, right| left.id.cmp(&right.id),
             typestate_terminal_expectation_to_json,
         ),
+    )
+}
+
+pub(crate) fn typestate_automaton_projection_to_json(
+    states: Value,
+    initial: &str,
+    accepting_states: Value,
+    error_states: Value,
+    events: Value,
+    transitions: Value,
+    terminal_expectations: Value,
+) -> Value {
+    json!({
+        "states": states,
+        "initial": initial,
+        "accepting_states": accepting_states,
+        "error_states": error_states,
+        "events": events,
+        "transitions": transitions,
+        "terminal_expectations": terminal_expectations,
     })
 }
 
@@ -2159,18 +2217,31 @@ fn typestate_event_trigger_to_json(trigger: &TypestateEventTrigger) -> Value {
             selector,
             subject,
             phase,
-        } => json!({
-            "type": "calls",
-            "selector": selector_to_json(selector),
-            "subject": typestate_call_binding_to_json(subject),
-            "phase": endpoint_observation_phase_label(*phase),
-        }),
-        TypestateEventTrigger::MatchEndpoints { set, role, phase } => json!({
-            "type": "match_endpoints",
-            "set": match_endpoint_set_ref_to_json(set),
-            "role": endpoint_role_label(*role),
-            "phase": endpoint_observation_phase_label(*phase),
-        }),
+            argument_condition,
+        } => {
+            let mut object = Map::from_iter([
+                ("type".to_string(), Value::String("calls".to_string())),
+                ("selector".to_string(), selector_to_json(selector)),
+                (
+                    "subject".to_string(),
+                    typestate_call_binding_to_json(subject),
+                ),
+                (
+                    "phase".to_string(),
+                    Value::String(endpoint_observation_phase_label(*phase).to_string()),
+                ),
+            ]);
+            if let Some(condition) = argument_condition {
+                object.insert(
+                    "condition".to_string(),
+                    argument_condition_to_json(*condition),
+                );
+            }
+            Value::Object(object)
+        }
+        TypestateEventTrigger::MatchEndpoints { set, role, phase } => {
+            match_endpoint_trigger_to_json(set, *role, *phase)
+        }
         TypestateEventTrigger::SemanticEvent { event } => json!({
             "type": "semantic_event",
             "event": policy_semantic_event_to_json(*event),
@@ -2178,35 +2249,40 @@ fn typestate_event_trigger_to_json(trigger: &TypestateEventTrigger) -> Value {
     }
 }
 
-fn typestate_call_binding_to_json(binding: &TypestateCallBinding) -> Value {
+fn argument_condition_to_json(condition: TypestateArgumentCondition) -> Value {
+    json!({
+        "argument_index": condition.index,
+        "equals": condition.equals,
+    })
+}
+
+pub(crate) fn typestate_call_binding_to_json(binding: &TypestateCallBinding) -> Value {
     match binding {
-        TypestateCallBinding::Receiver => Value::Object(tagged("receiver")),
-        TypestateCallBinding::ReturnValue => Value::Object(tagged("return_value")),
+        TypestateCallBinding::Receiver => binding_tag_to_json("receiver"),
+        TypestateCallBinding::ReturnValue => binding_tag_to_json("return_value"),
         TypestateCallBinding::ResultIndex { index } => {
-            json!({ "type": "result_index", "index": index })
+            binding_index_to_json("result_index", *index)
         }
         TypestateCallBinding::ArgumentIndex { index } => {
-            json!({ "type": "argument_index", "index": index })
+            binding_index_to_json("argument_index", *index)
         }
-        TypestateCallBinding::ArgumentName { name } => {
-            json!({ "type": "argument_name", "name": name })
-        }
+        TypestateCallBinding::ArgumentName { name } => binding_name_to_json("argument_name", name),
     }
 }
 
-fn policy_semantic_event_to_json(event: PolicySemanticEvent) -> Value {
+pub(crate) fn policy_semantic_event_to_json(event: PolicySemanticEvent) -> Value {
     match event {
         PolicySemanticEvent::NormalProcedureExit { scope } => json!({
             "type": "normal_procedure_exit",
-            "scope": typestate_exit_scope_label(scope),
+            "scope": (scope).label(),
         }),
         PolicySemanticEvent::ExceptionalProcedureExit { scope } => json!({
             "type": "exceptional_procedure_exit",
-            "scope": typestate_exit_scope_label(scope),
+            "scope": (scope).label(),
         }),
         PolicySemanticEvent::SuspensionBoundary { scope } => json!({
             "type": "suspension_boundary",
-            "scope": typestate_exit_scope_label(scope),
+            "scope": (scope).label(),
         }),
     }
 }
@@ -2260,17 +2336,27 @@ fn typestate_terminal_expectation_to_json(expectation: &TypestateTerminalExpecta
 
 fn typestate_terminal_trigger_to_json(trigger: &TypestateTerminalTrigger) -> Value {
     match trigger {
-        TypestateTerminalTrigger::MatchEndpoints { set, role, phase } => json!({
-            "type": "match_endpoints",
-            "set": match_endpoint_set_ref_to_json(set),
-            "role": endpoint_role_label(*role),
-            "phase": endpoint_observation_phase_label(*phase),
-        }),
+        TypestateTerminalTrigger::MatchEndpoints { set, role, phase } => {
+            match_endpoint_trigger_to_json(set, *role, *phase)
+        }
         TypestateTerminalTrigger::SemanticEvent { event } => json!({
             "type": "semantic_event",
             "event": policy_semantic_event_to_json(*event),
         }),
     }
+}
+
+fn match_endpoint_trigger_to_json(
+    set: &MatchEndpointSetRef,
+    role: EndpointRole,
+    phase: EndpointObservationPhase,
+) -> Value {
+    json!({
+        "type": "match_endpoints",
+        "set": match_endpoint_set_ref_to_json(set),
+        "role": role.label(),
+        "phase": endpoint_observation_phase_label(phase),
+    })
 }
 
 fn classification_to_json(classification: &PolicyClassificationSpec) -> Value {
@@ -2336,7 +2422,7 @@ fn classification_predicate_to_json(predicate: &ClassificationPredicate) -> Valu
         }),
         ClassificationPredicate::AnalysisType { analysis_type } => json!({
             "type": "analysis_type",
-            "analysis_type": policy_analysis_type_label(*analysis_type),
+            "analysis_type": analysis_type.label(),
         }),
         ClassificationPredicate::SourceCategories { quantifier, values } => json!({
             "type": "source_categories",
@@ -2416,7 +2502,7 @@ fn cvss_evidence_predicate_to_json(predicate: &CvssEvidencePredicate) -> Value {
         }),
         CvssEvidencePredicate::AnalysisType { analysis_type } => json!({
             "type": "analysis_type",
-            "analysis_type": policy_analysis_type_label(*analysis_type),
+            "analysis_type": analysis_type.label(),
         }),
         CvssEvidencePredicate::SourceEvidence { evidence } => json!({
             "type": "source_evidence",
@@ -2455,7 +2541,7 @@ fn cvss_evidence_scope_to_json(scope: CvssEvidenceScope) -> Value {
         CvssEvidenceScope::Global => Value::Object(tagged("global")),
         CvssEvidenceScope::System { system } => json!({
             "type": "system",
-            "system": cvss_system_scope_label(system),
+            "system": system.label(),
         }),
     }
 }
@@ -2506,7 +2592,7 @@ fn sorted_typed_values<'a, T: 'a>(
     mut compare: impl FnMut(&T, &T) -> Ordering,
     encode: impl Fn(&T) -> Value,
 ) -> Value {
-    let mut values = values
+    let values = values
         .map(|value| {
             let encoded = encode(value);
             let tie_breaker = serde_json::to_string(&encoded)
@@ -2514,22 +2600,35 @@ fn sorted_typed_values<'a, T: 'a>(
             (value, encoded, tie_breaker)
         })
         .collect::<Vec<_>>();
-    values.sort_unstable_by(|left, right| {
-        compare(left.0, right.0).then_with(|| left.2.cmp(&right.2))
-    });
-    let mut encoded = values
-        .into_iter()
-        .map(|(_, encoded, _)| encoded)
-        .collect::<Vec<_>>();
-    encoded.dedup();
-    Value::Array(encoded)
+    sorted_encoded_array(
+        values,
+        |left, right| compare(left.0, right.0).then_with(|| left.2.cmp(&right.2)),
+        |(_, encoded, _)| encoded,
+    )
 }
 
 fn sorted_values(values: impl Iterator<Item = Value>) -> Value {
-    let mut values = values.collect::<Vec<_>>();
-    values.sort_unstable_by_key(|value| {
-        serde_json::to_string(value).expect("serializing a serde_json::Value cannot fail")
-    });
+    let values = values
+        .map(|value| {
+            let sort_key =
+                serde_json::to_string(&value).expect("serializing a serde_json::Value cannot fail");
+            (sort_key, value)
+        })
+        .collect::<Vec<_>>();
+    sorted_encoded_array(
+        values,
+        |left, right| left.0.cmp(&right.0),
+        |(_, value)| value,
+    )
+}
+
+fn sorted_encoded_array<T>(
+    mut values: Vec<T>,
+    compare: impl FnMut(&T, &T) -> Ordering,
+    encode: impl FnMut(T) -> Value,
+) -> Value {
+    values.sort_unstable_by(compare);
+    let mut values = values.into_iter().map(encode).collect::<Vec<_>>();
     values.dedup();
     Value::Array(values)
 }
@@ -2570,7 +2669,7 @@ fn compare_match_endpoint_set_refs(
 fn compare_match_directory_refs(left: &MatchDirectoryRef, right: &MatchDirectoryRef) -> Ordering {
     left.path
         .cmp(&right.path)
-        .then_with(|| directory_scope_label(left.scope).cmp(directory_scope_label(right.scope)))
+        .then_with(|| (left.scope).label().cmp((right.scope).label()))
         .then_with(|| compare_category_predicates(&left.categories, &right.categories))
         .then_with(|| left.manifest_sha256.cmp(&right.manifest_sha256))
 }
@@ -2658,7 +2757,7 @@ fn compare_policy_evidence_refs(left: &PolicyEvidenceRef, right: &PolicyEvidence
     }
 }
 
-fn sorted_identifier_refs<'a>(values: impl Iterator<Item = &'a str>) -> Vec<&'a str> {
+pub(crate) fn sorted_identifier_refs<'a>(values: impl Iterator<Item = &'a str>) -> Vec<&'a str> {
     let mut values = values.collect::<Vec<_>>();
     values.sort_unstable();
     values.dedup();
@@ -2669,81 +2768,6 @@ const fn generated_relation_label(value: GeneratedRelation) -> &'static str {
     match value {
         GeneratedRelation::CanReach => "can_reach",
     }
-}
-
-const fn policy_level_label(value: PolicyLevel) -> &'static str {
-    match value {
-        PolicyLevel::Note => "note",
-        PolicyLevel::Warning => "warning",
-        PolicyLevel::Error => "error",
-    }
-}
-
-const fn finding_severity_label(value: FindingSeverity) -> &'static str {
-    match value {
-        FindingSeverity::Unrated => "unrated",
-        FindingSeverity::Note => "note",
-        FindingSeverity::Warning => "warning",
-        FindingSeverity::Error => "error",
-    }
-}
-
-const fn policy_analysis_type_label(value: PolicyAnalysisType) -> &'static str {
-    match value {
-        PolicyAnalysisType::Match => "match",
-        PolicyAnalysisType::Taint => "taint",
-        PolicyAnalysisType::Typestate => "typestate",
-        PolicyAnalysisType::Assertion => "assertion",
-        PolicyAnalysisType::Flow => "flow",
-    }
-}
-
-const fn endpoint_role_label(value: EndpointRole) -> &'static str {
-    match value {
-        EndpointRole::Source => "source",
-        EndpointRole::Sink => "sink",
-    }
-}
-
-const fn directory_scope_label(value: DirectoryScope) -> &'static str {
-    match value {
-        DirectoryScope::Direct => "direct",
-        DirectoryScope::Recursive => "recursive",
-    }
-}
-
-const fn may_mode_label(value: MayMode) -> &'static str {
-    match value {
-        MayMode::May => "may",
-    }
-}
-
-const fn taint_trust_boundary_label(value: TaintTrustBoundary) -> &'static str {
-    match value {
-        TaintTrustBoundary::External => "external",
-        TaintTrustBoundary::Internal => "internal",
-        TaintTrustBoundary::SameTrustZone => "same_trust_zone",
-    }
-}
-
-const fn taint_system_entry_label(value: TaintSystemEntry) -> &'static str {
-    match value {
-        TaintSystemEntry::VulnerableSystemNetworkStack => "vulnerable_system_network_stack",
-        TaintSystemEntry::DownloadedArtifact => "downloaded_artifact",
-        TaintSystemEntry::LocalInput => "local_input",
-        TaintSystemEntry::AdjacentNetwork => "adjacent_network",
-        TaintSystemEntry::Physical => "physical",
-    }
-}
-
-const fn inconclusive_policy_label(value: InconclusivePolicy) -> &'static str {
-    match value {
-        InconclusivePolicy::Inconclusive => "inconclusive",
-    }
-}
-
-const fn typestate_exit_scope_label(value: TypestateExitScope) -> &'static str {
-    value.label()
 }
 
 const fn endpoint_observation_phase_label(value: EndpointObservationPhase) -> &'static str {
@@ -2766,13 +2790,6 @@ const fn cvss_emit_policy_label(value: CvssEmitPolicy) -> &'static str {
 const fn policy_cvss_basis_label(value: PolicyCvssBasis) -> &'static str {
     match value {
         PolicyCvssBasis::PolicyAssertion => "policy_assertion",
-    }
-}
-
-const fn cvss_system_scope_label(value: CvssSystemScope) -> &'static str {
-    match value {
-        CvssSystemScope::VulnerableSystem => "vulnerable_system",
-        CvssSystemScope::SubsequentSystem => "subsequent_system",
     }
 }
 
@@ -2887,7 +2904,6 @@ mod tests {
         );
         assert!(semantic.pointer("/analysis/selector/type").is_none());
     }
-
     #[test]
     fn endpoint_projection_keeps_unresolved_file_selector_and_normalizes_sets() {
         let document = RqlpDocument::Endpoint {
@@ -2911,6 +2927,7 @@ mod tests {
                 binding: PolicyEndpointBinding::ArgumentIndex { index: 0 },
                 taint: Some(EndpointTaintSemantics::Source {
                     labels: vec![TaintLabel::new("user-input").unwrap()],
+                    threat_model: None,
                     evidence: Some(TaintSourceEvidence {
                         trust_boundary: Some(TaintTrustBoundary::External),
                         system_entry: None,
@@ -2951,7 +2968,6 @@ mod tests {
                 if path == "queries/request.rql"
         ));
     }
-
     #[test]
     fn taint_projection_covers_generated_message_composition_and_data_bearing_ports() {
         let mut metadata = metadata();
@@ -2972,6 +2988,7 @@ mod tests {
                             unmodeled:
                                 brokk_bifrost_flow::dataflow::UnmodeledCallBehavior::Optimistic,
                         },
+                        threat_models: vec![],
                         sources: TaintEndpointSet {
                             include_sets: vec![],
                             include_matches: vec![MatchEndpointSetRef::Exact {
@@ -3010,6 +3027,7 @@ mod tests {
                 "type": "taint",
                 "mode": "may",
                 "call_modeling": { "unmodeled": "optimistic" },
+                "threat_models": [],
                 "sources": {
                     "include_sets": [],
                     "include_matches": [{
@@ -3068,7 +3086,6 @@ mod tests {
             }) if entry_id == "missing-source"
         ));
     }
-
     #[test]
     fn typestate_projection_normalizes_transitions_and_keeps_terminal_shapes() {
         let open = TypestateStateId::new("open").unwrap();
@@ -3181,7 +3198,6 @@ mod tests {
             }) if entry_id == "missing-subject"
         ));
     }
-
     #[test]
     fn typestate_suspension_boundary_uses_a_distinct_canonical_event_type() {
         assert_eq!(
@@ -3269,7 +3285,6 @@ mod tests {
             })
         );
     }
-
     #[test]
     fn normalized_projection_excludes_version_origin_and_tags_unit_sum_variants() {
         let query = CodeQuery::from_sexp("(call)").unwrap();
@@ -3300,7 +3315,6 @@ mod tests {
             json!({ "type": "global" })
         );
     }
-
     #[test]
     fn semantic_guard_rejects_a_forged_dangling_selector_evidence_reference() {
         let value = CvssMetricValue::try_new(
@@ -3362,7 +3376,6 @@ mod tests {
             )
         );
     }
-
     #[test]
     fn typed_sets_sort_by_stable_identity_before_json_field_order() {
         let values = [
@@ -3438,35 +3451,6 @@ mod tests {
             .expect("validated policy values have a canonical JSON encoding")
     }
 
-    #[test]
-    fn receiver_family_projects_internal_identity_set() {
-        let source = r#"(policy
-  :id "test.receiver.family.canonical"
-  :name "Receiver family canonical"
-  :message "M"
-    :severity warning
-  :analysis (analysis :type assertion
-    (bind :name calls :query
-      (rql (resolved-call :resolves-to member.widget.create :proof exact
-        :receiver-type (assignable-to "pkg.Base")
-        (call-bindings (call-shape (call :callee "run"))))))))"#;
-        let parsed = crate::parse_rqlp_source(
-            source,
-            crate::PolicySourceIdentity::new("test:receiver-family-canonical"),
-        )
-        .unwrap();
-        let value = parsed
-            .document()
-            .to_inline_local_canonical_semantic_json()
-            .unwrap();
-        let step = &value["analysis"]["plan"]["bindings"][0]["query"]["query"]["steps"][2];
-        assert_eq!(step["op"], "resolved_call");
-        assert_eq!(
-            step["receiver_type"]["resolved_identities"],
-            serde_json::json!([])
-        );
-    }
-
     fn canonical_semantic_sha256(source: &str) -> String {
         use sha2::{Digest, Sha256};
         let mut hasher = Sha256::new();
@@ -3533,6 +3517,27 @@ mod tests {
             "an equality predicate over a literal keeps the object it always projected"
         );
     }
+
+    /// The subject every origin-shape variant below shares: a call written
+    /// under a loop, with both nodes captured.
+    fn origin_shape_policy(asserts: &str) -> String {
+        format!(
+            r#"(policy
+  :id "test.origin-shape.canonical"
+  :name "Origin shape canonical"
+  :message "M"
+  :severity note
+  :analysis (analysis
+    :type assertion
+    :subject (rql (inside-decl (loop :capture "region")
+                               (call :callee (name "open") :capture "smell")))
+    :asserts [{asserts}]))"#
+        )
+    }
+
+    /// A document that predates the origin-shape record (#2647), used both as
+    /// the "unchanged" pin and as the base every variant is compared against.
+    const PRE_ORIGIN_SHAPE_ASSERT: &str = r#"(assert-value-origin :id base :at "smell" :role value_reference :established outside :relative-to "region")"#;
 
     /// Every new construct is a semantic difference, so each one must move the
     /// hash. A construct that did not would let two policies that mean
@@ -3613,76 +3618,6 @@ mod tests {
             seen.push((what, hash));
         }
     }
-
-    /// An RQL filter's predicate list and projection's column list are semantic
-    /// content, not decoration: changing one changes the hash.
-    #[test]
-    fn query_row_step_contents_change_the_semantic_hash() {
-        let with_filter = |predicate: &str| {
-            relational_policy(&LEGACY_PLAN.replace(
-                "(bind :name cand :query (rql (occurrences :role [member_position])))",
-                &format!(
-                    "(bind :name cand :query (rql (filter :where (({predicate})) (occurrences :role [member_position]))))"
-                ),
-            ))
-        };
-        assert_ne!(
-            canonical_semantic_sha256(&with_filter("role eq member_position")),
-            canonical_semantic_sha256(&with_filter("role eq value_reference")),
-            "a filter literal is semantic content"
-        );
-        assert_ne!(
-            canonical_semantic_sha256(&with_filter("target_count gt 0")),
-            canonical_semantic_sha256(&with_filter("target_count ge 0")),
-            "a filter operator is semantic content"
-        );
-
-        let with_projection = |columns: &str| {
-            relational_policy(
-                &LEGACY_PLAN
-                    .replace(
-                        "(bind :name cand :query (rql (occurrences :role [member_position])))",
-                        &format!(
-                            "(bind :name narrow :query (rql (project :columns ({columns}) (occurrences :role [member_position]))))"
-                        ),
-                    )
-                    .replace("right cand", "right narrow")
-                    .replace("cand.", "narrow."),
-            )
-        };
-        assert_ne!(
-            canonical_semantic_sha256(&with_projection("ast_id role")),
-            canonical_semantic_sha256(&with_projection("ast_id role target_count")),
-            "a projected column set is semantic content"
-        );
-        assert_ne!(
-            canonical_semantic_sha256(&with_projection("ast_id role target_count")),
-            canonical_semantic_sha256(&with_projection("ast_id role (target_count hits)")),
-            "a projected column rename is semantic content"
-        );
-    }
-
-    /// The subject every origin-shape variant below shares: a call written
-    /// under a loop, with both nodes captured.
-    fn origin_shape_policy(asserts: &str) -> String {
-        format!(
-            r#"(policy
-  :id "test.origin-shape.canonical"
-  :name "Origin shape canonical"
-  :message "M"
-  :severity note
-  :analysis (analysis
-    :type assertion
-    :subject (rql (inside-decl (loop :capture "region")
-                               (call :callee (name "open") :capture "smell")))
-    :asserts [{asserts}]))"#
-        )
-    }
-
-    /// A document that predates the origin-shape record (#2647), used both as
-    /// the "unchanged" pin and as the base every variant is compared against.
-    const PRE_ORIGIN_SHAPE_ASSERT: &str = r#"(assert-value-origin :id base :at "smell" :role value_reference :established outside :relative-to "region")"#;
-
     /// The semantic hash is the finding identity, the baseline key, and the
     /// suppression key. Adding the origin-shape record must therefore be
     /// invisible to documents that do not use it, and every field of it that

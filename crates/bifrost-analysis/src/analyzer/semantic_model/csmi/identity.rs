@@ -1,11 +1,17 @@
-//! Analyzer-neutral JVM identity used by the CSMI adapter.
+//! Analyzer-neutral JVM and provisional Go source identity mappings.
 
 use super::model::{
-    CsmiDescriptor, CsmiDescriptorRole, CsmiMemberRelationship, CsmiReferenceType,
-    CsmiReferenceTypeKind, CsmiTypeExpression,
+    CsmiArtifactSelector, CsmiCallableKind, CsmiCallableShape, CsmiDescriptor, CsmiDescriptorRole,
+    CsmiMemberRelationship, CsmiParameter, CsmiParameterBinding, CsmiReferenceType,
+    CsmiReferenceTypeKind, CsmiResult, CsmiStability, CsmiSymbolDefinition, CsmiSymbolOrigin,
+    CsmiTypeExpression, CsmiUnknownType, CsmiUnknownTypeKind,
 };
-use crate::analyzer::semantic_model::{MemberFact, TypeFact, TypeRef};
+use crate::analyzer::semantic_model::{
+    AnonymousCallableIdentity, Locator, MemberFact, SourceAnchor, SourceCallableShape,
+    SourceDeclarationKind, SourceTypeNode, TypeFact, TypeKind, TypeRef,
+};
 use serde::Serialize;
+use serde_json::json;
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 
@@ -13,6 +19,12 @@ use std::collections::HashMap;
 /// reverse-DNS name, rather than a Bifrost database or pack identifier.
 pub const JVM_IDENTITY_SCHEME: &str = "ai.brokk.csmi.jvm-symbol";
 pub const JVM_IDENTITY_VERSION: &str = "0.1";
+
+/// Provisional local recipe for exact Go source identities. This is a
+/// scheme-defined CSMI core identity mapping, not a claim that CSMI has
+/// published or standardized a Go identity profile.
+pub const GO_SOURCE_IDENTITY_SCHEME: &str = "ai.brokk.csmi.go-source-symbol";
+pub const GO_SOURCE_IDENTITY_VERSION: &str = "0.1";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum IdentityError {
@@ -203,6 +215,9 @@ pub fn type_expression(
                 ),
             },
         )),
+        TypeRef::Unknown => Ok(CsmiTypeExpression::Unknown(CsmiUnknownType {
+            kind: CsmiUnknownTypeKind::Unknown,
+        })),
         other => Err(IdentityError::UnsupportedType(format!("{other:?}"))),
     }
 }
@@ -225,6 +240,369 @@ pub fn type_symbol(name: &str) -> Result<super::model::CsmiSymbolDefinition, Ide
         provenance: Vec::new(),
         extensions: Vec::new(),
     })
+}
+
+/// Map a source-anchored Go function literal to an artifact-local CSMI symbol.
+/// The identity digest retains the exact package, file/range, lexical owners,
+/// signature AST anchors, and artifact digest without inventing a name.
+pub fn go_anonymous_callable_symbol(
+    identity: &AnonymousCallableIdentity,
+    artifact: &CsmiArtifactSelector,
+) -> Result<(CsmiSymbolDefinition, CsmiCallableShape), String> {
+    validate_go_anonymous_callable_identity(identity, artifact)?;
+    let identity_digest = digest_json(identity)?;
+    let anchor_disambiguator =
+        format!("go-function-literal-{GO_SOURCE_IDENTITY_VERSION}:{identity_digest}");
+    let descriptors = vec![
+        CsmiDescriptor {
+            role: CsmiDescriptorRole::Namespace,
+            name: Some(identity.package_identity.clone()),
+            disambiguator: None,
+        },
+        CsmiDescriptor {
+            role: CsmiDescriptorRole::Meta,
+            name: Some(identity.anchor.file.clone()),
+            disambiguator: Some(anchor_disambiguator),
+        },
+        CsmiDescriptor {
+            role: CsmiDescriptorRole::Callable,
+            name: None,
+            disambiguator: Some(format!(
+                "go-anonymous-callable-{GO_SOURCE_IDENTITY_VERSION}:{identity_digest}"
+            )),
+        },
+    ];
+    let symbol = go_source_symbol(artifact, descriptors, CsmiSymbolOrigin::Local)?;
+    let shape = go_callable_shape(&identity.signature)?;
+    Ok((symbol, shape))
+}
+
+/// Map a Go declaration from its exact native artifact locator. All identity
+/// components come from the retained artifact locator and native declaration
+/// handle; no qualified name is split or reconstructed.
+pub fn go_type_symbol(
+    fact: &TypeFact,
+    artifact: &CsmiArtifactSelector,
+) -> Result<CsmiSymbolDefinition, String> {
+    let (path, source_symbol) = go_artifact_locator(&fact.locator)?;
+    let identity_digest = digest_json(&json!({
+        "artifact": artifact,
+        "nativeId": fact.id,
+        "sourcePath": path,
+        "sourceSymbol": source_symbol,
+        "typeKind": fact.type_kind,
+    }))?;
+    go_source_symbol(
+        artifact,
+        vec![
+            CsmiDescriptor {
+                role: CsmiDescriptorRole::Meta,
+                name: Some(path.to_owned()),
+                disambiguator: None,
+            },
+            CsmiDescriptor {
+                role: if fact.type_kind == TypeKind::Module {
+                    CsmiDescriptorRole::Namespace
+                } else {
+                    CsmiDescriptorRole::Type
+                },
+                name: Some(source_symbol.to_owned()),
+                disambiguator: Some(format!(
+                    "go-type-{GO_SOURCE_IDENTITY_VERSION}:{identity_digest}"
+                )),
+            },
+        ],
+        CsmiSymbolOrigin::Named,
+    )
+}
+
+/// Map a Go callable or value member from its exact native source locator,
+/// owner declaration, kind, and signature.
+pub fn go_member_symbol(
+    fact: &MemberFact,
+    owner: &TypeFact,
+    artifact: &CsmiArtifactSelector,
+    value_member: bool,
+) -> Result<CsmiSymbolDefinition, String> {
+    let (path, source_symbol) = go_artifact_locator(&fact.locator)?;
+    let (owner_path, owner_source_symbol) = go_artifact_locator(&owner.locator)?;
+    let identity_digest = digest_json(&json!({
+        "artifact": artifact,
+        "nativeId": fact.id,
+        "ownerNativeId": fact.owner,
+        "ownerSourcePath": owner_path,
+        "ownerSourceSymbol": owner_source_symbol,
+        "sourcePath": path,
+        "sourceSymbol": source_symbol,
+        "memberName": fact.name,
+        "memberKind": fact.member_kind,
+        "isStatic": fact.is_static,
+        "receiver": fact.receiver,
+        "signature": fact.signature,
+    }))?;
+    go_source_symbol(
+        artifact,
+        vec![
+            CsmiDescriptor {
+                role: CsmiDescriptorRole::Meta,
+                name: Some(path.to_owned()),
+                disambiguator: None,
+            },
+            CsmiDescriptor {
+                role: CsmiDescriptorRole::Meta,
+                name: None,
+                disambiguator: Some(format!("go-owner:{owner_path}:{owner_source_symbol}")),
+            },
+            CsmiDescriptor {
+                role: if value_member {
+                    CsmiDescriptorRole::Term
+                } else {
+                    CsmiDescriptorRole::Callable
+                },
+                name: Some(fact.name.clone()),
+                disambiguator: Some(format!(
+                    "go-member-{GO_SOURCE_IDENTITY_VERSION}:{identity_digest}"
+                )),
+            },
+        ],
+        CsmiSymbolOrigin::Named,
+    )
+}
+
+/// Recompute the local handle defined by the provisional Go source identity
+/// recipe. The validator uses this to reject symbols whose handle disagrees
+/// with their scheme descriptors or artifact selector.
+pub(crate) fn go_source_symbol_id(
+    artifact_selectors: &[CsmiArtifactSelector],
+    descriptors: &[CsmiDescriptor],
+) -> Result<String, String> {
+    let digest = digest_json(&json!({
+        "artifactSelectors": artifact_selectors,
+        "scheme": GO_SOURCE_IDENTITY_SCHEME,
+        "schemeVersion": GO_SOURCE_IDENTITY_VERSION,
+        "descriptors": descriptors,
+    }))?;
+    Ok(format!("go.{digest}"))
+}
+
+fn go_source_symbol(
+    artifact: &CsmiArtifactSelector,
+    descriptors: Vec<CsmiDescriptor>,
+    origin: CsmiSymbolOrigin,
+) -> Result<CsmiSymbolDefinition, String> {
+    let artifact_selectors = vec![artifact.clone()];
+    Ok(CsmiSymbolDefinition {
+        id: go_source_symbol_id(&artifact_selectors, &descriptors)?,
+        artifact_selectors: Some(artifact_selectors),
+        scheme: GO_SOURCE_IDENTITY_SCHEME.to_owned(),
+        scheme_version: GO_SOURCE_IDENTITY_VERSION.to_owned(),
+        stability: CsmiStability::ArtifactLocal,
+        descriptors,
+        display_name: None,
+        qualified_display_name: None,
+        native_signature: None,
+        documentation_name: None,
+        abi_name: None,
+        origin: Some(origin),
+        external_identities: Vec::new(),
+        provenance: Vec::new(),
+        extensions: Vec::new(),
+    })
+}
+
+fn validate_go_anonymous_callable_identity(
+    identity: &AnonymousCallableIdentity,
+    artifact: &CsmiArtifactSelector,
+) -> Result<(), String> {
+    let artifact_digests = artifact
+        .digests
+        .iter()
+        .find(|digest| matches!(digest.algorithm, super::model::CsmiDigestAlgorithm::Sha256))
+        .map(|digest| digest.value.as_str());
+    if identity.id.is_empty() || artifact_digests != Some(identity.artifact_sha256.as_str()) {
+        return Err(
+            "Go anonymous callable ID must be nonempty and match the selected artifact digest"
+                .to_owned(),
+        );
+    }
+    if identity.package_identity.is_empty() {
+        return Err("Go anonymous callable package import path is empty".to_owned());
+    }
+    if identity.anchor.kind != SourceDeclarationKind::FunctionLiteral {
+        return Err("Go anonymous callable anchor must be a function literal".to_owned());
+    }
+    validate_source_anchor(&identity.anchor)?;
+    let mut previous_owner: Option<&SourceAnchor> = None;
+    for owner in &identity.lexical_owner_chain {
+        validate_source_anchor(owner)?;
+        if !matches!(
+            owner.kind,
+            SourceDeclarationKind::Function
+                | SourceDeclarationKind::Method
+                | SourceDeclarationKind::FunctionLiteral
+        ) || owner.file != identity.anchor.file
+        {
+            return Err(
+                "Go lexical owner chain must contain callable anchors in the literal's file"
+                    .to_owned(),
+            );
+        }
+        if let Some(outer) = previous_owner
+            && !(outer.byte_range.start <= owner.byte_range.start
+                && owner.byte_range.end <= outer.byte_range.end)
+        {
+            return Err(
+                "Go lexical owner anchors are not ordered from outermost to innermost".to_owned(),
+            );
+        }
+        previous_owner = Some(owner);
+    }
+    if let Some(owner) = previous_owner
+        && !(owner.byte_range.start <= identity.anchor.byte_range.start
+            && identity.anchor.byte_range.end <= owner.byte_range.end)
+    {
+        return Err("Go function literal is outside its innermost lexical owner".to_owned());
+    }
+    let function_type = &identity.signature.function_type;
+    validate_source_type_node(function_type)?;
+    if function_type.file != identity.anchor.file
+        || !(identity.anchor.byte_range.start <= function_type.byte_range.start
+            && function_type.byte_range.end <= identity.anchor.byte_range.end)
+    {
+        return Err("Go function type anchor must be inside its function literal".to_owned());
+    }
+    for (kind, groups) in [
+        ("parameter", identity.signature.parameters.as_slice()),
+        ("result", identity.signature.results.as_slice()),
+    ] {
+        let mut variadic_seen = false;
+        for (index, group) in groups.iter().enumerate() {
+            if group.arity == 0 {
+                return Err(format!("Go callable {kind} group has zero arity"));
+            }
+            if group.variadic {
+                if kind != "parameter" || index + 1 != groups.len() || variadic_seen {
+                    return Err(
+                        "Go callable variadic parameter must be its single final group".to_owned(),
+                    );
+                }
+                variadic_seen = true;
+            }
+            validate_source_type_node(&group.type_node)?;
+        }
+        let count = groups
+            .iter()
+            .try_fold(0usize, |total, group| total.checked_add(group.arity));
+        if count.is_none_or(|count| count > u16::MAX as usize) {
+            return Err(format!(
+                "Go callable {kind} count exceeds callable-values profile range"
+            ));
+        }
+    }
+    for anchor in &identity.signature.declaration_chain {
+        validate_source_anchor(anchor)?;
+    }
+    Ok(())
+}
+
+fn validate_source_anchor(anchor: &SourceAnchor) -> Result<(), String> {
+    if !crate::analyzer::semantic_model::is_canonical_relative_path(&anchor.file)
+        || anchor.byte_range.start >= anchor.byte_range.end
+    {
+        return Err(
+            "Go source anchor must have a canonical relative path and nonempty byte range"
+                .to_owned(),
+        );
+    }
+    Ok(())
+}
+
+fn go_artifact_locator(locator: &Locator) -> Result<(&str, &str), String> {
+    match locator {
+        Locator::Artifact { path, symbol }
+            if crate::analyzer::semantic_model::is_canonical_relative_path(path)
+                && !symbol.is_empty() =>
+        {
+            Ok((path, symbol))
+        }
+        Locator::Artifact { .. } => {
+            Err("Go artifact locator is not canonical or has an empty source symbol".to_owned())
+        }
+        Locator::Source { .. } | Locator::Interchange { .. } => {
+            Err("Go declaration identity requires an exact native artifact locator".to_owned())
+        }
+    }
+}
+
+fn validate_source_type_node(node: &SourceTypeNode) -> Result<(), String> {
+    if !crate::analyzer::semantic_model::is_canonical_relative_path(&node.file)
+        || node.byte_range.start >= node.byte_range.end
+    {
+        return Err(
+            "Go AST type anchor must have a canonical relative path and nonempty byte range"
+                .to_owned(),
+        );
+    }
+    Ok(())
+}
+
+fn go_callable_shape(signature: &SourceCallableShape) -> Result<CsmiCallableShape, String> {
+    let mut position = 0usize;
+    let mut parameters = Vec::new();
+    for group in &signature.parameters {
+        for index in 0..group.arity {
+            let variadic = group.variadic && index + 1 == group.arity;
+            parameters.push(CsmiParameter {
+                position: u32::try_from(position)
+                    .map_err(|_| "Go callable parameter count exceeds CSMI's position range")?,
+                binding: if variadic {
+                    CsmiParameterBinding::VariadicPositional
+                } else {
+                    CsmiParameterBinding::PositionalOnly
+                },
+                label: None,
+                role: None,
+                required: true,
+                symbol: None,
+                parameter_type: Some(CsmiTypeExpression::Unknown(CsmiUnknownType {
+                    kind: CsmiUnknownTypeKind::Unknown,
+                })),
+                extensions: Vec::new(),
+            });
+            position += 1;
+        }
+    }
+    let mut position = 0usize;
+    let mut results = Vec::new();
+    for group in &signature.results {
+        for _ in 0..group.arity {
+            results.push(CsmiResult {
+                position: u32::try_from(position)
+                    .map_err(|_| "Go callable result count exceeds CSMI's position range")?,
+                label: None,
+                result_type: Some(CsmiTypeExpression::Unknown(CsmiUnknownType {
+                    kind: CsmiUnknownTypeKind::Unknown,
+                })),
+                extensions: Vec::new(),
+            });
+            position += 1;
+        }
+    }
+    Ok(CsmiCallableShape {
+        kind: CsmiCallableKind::Function,
+        receiver: None,
+        parameters,
+        results,
+        return_classes: Vec::new(),
+        extensions: Vec::new(),
+    })
+}
+
+fn digest_json(value: &impl Serialize) -> Result<String, String> {
+    let bytes = super::canonical::canonical_json(value)
+        .map_err(|error| format!("Go source identity canonicalization failed: {error}"))?;
+    let digest = Sha256::digest(bytes);
+    Ok(digest.iter().map(|byte| format!("{byte:02x}")).collect())
 }
 
 fn digest<T: Serialize>(value: &T) -> String {

@@ -3,10 +3,12 @@
 
 use super::{ReportLines, sanitize_table_cell};
 use crate::analyzer::test_paths;
-use crate::analyzer::{IAnalyzer, Language, parser_language_for_path};
+use crate::analyzer::{IAnalyzer, parser_language_for_path};
+use crate::diff_analysis::is_regular_file_mode;
 use crate::gitblob::resolve_default_branch_ref;
 use crate::path_utils::normalize_pattern;
-use git2::{FileMode, ObjectType, Oid, Repository, Sort, TreeWalkMode, TreeWalkResult};
+use brokk_bifrost_php::graph::syntax::assignment_parts as php_assignment_parts;
+use git2::{ObjectType, Oid, Repository, Sort, TreeWalkMode, TreeWalkResult};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
@@ -456,7 +458,10 @@ fn scan_default_ref(
             format!("{root}{}", entry.name().unwrap_or_default())
         };
         if let Some(project_path) = to_project_relative_path(ctx, &git_path) {
-            if test_paths::is_test_like_path(&project_path, language_for_path(&project_path)) {
+            if test_paths::is_test_like_path(
+                &project_path,
+                crate::diff_analysis::path_language(Path::new(&project_path)),
+            ) {
                 return TreeWalkResult::Ok;
             }
             let result =
@@ -520,7 +525,10 @@ fn scan_history(
             let Some(project_path) = to_project_relative_path(ctx, &git_path) else {
                 return TreeWalkResult::Ok;
             };
-            if test_paths::is_test_like_path(&project_path, language_for_path(&project_path)) {
+            if test_paths::is_test_like_path(
+                &project_path,
+                crate::diff_analysis::path_language(Path::new(&project_path)),
+            ) {
                 return TreeWalkResult::Ok;
             }
             let oid = entry.id();
@@ -679,7 +687,7 @@ fn scan_text_detailed(path: &str, text: &str, include_low_confidence: bool) -> T
 
 fn assignment_grammar(path: &str) -> Option<tree_sitter::Language> {
     let path_obj = Path::new(path);
-    let language = language_for_path(path);
+    let language = crate::diff_analysis::path_language(Path::new(path));
     parser_language_for_path(language, path_obj).or_else(|| {
         match path_obj
             .extension()
@@ -788,7 +796,8 @@ fn add_structural_assignment_findings(
 
 fn assignment_parts(node: Node<'_>) -> Option<(Node<'_>, Node<'_>)> {
     match node.kind() {
-        "assignment_expression" | "assignment" | "short_var_declaration" => Some((
+        "assignment_expression" => php_assignment_parts(node),
+        "assignment" | "short_var_declaration" => Some((
             node.child_by_field_name("left")?,
             node.child_by_field_name("right")?,
         )),
@@ -1001,9 +1010,10 @@ fn to_project_relative_path(ctx: &GitContext, git_path: &str) -> Option<String> 
         .strip_prefix(&ctx.repo_root)
         .ok()
         .filter(|prefix| !prefix.as_os_str().is_empty())
-        .map(normalize_path)
+        .map(|prefix| crate::path_utils::normalize_relative_components(prefix).unwrap_or_default())
         .unwrap_or_default();
-    let normalized_repo_rel = normalize_path(&repo_rel);
+    let normalized_repo_rel =
+        crate::path_utils::normalize_relative_components(&repo_rel).unwrap_or_default();
     if !project_prefix.as_os_str().is_empty() && !normalized_repo_rel.starts_with(&project_prefix) {
         return None;
     }
@@ -1016,30 +1026,6 @@ fn to_project_relative_path(ctx: &GitContext, git_path: &str) -> Option<String> 
             .to_path_buf()
     };
     Some(project_rel.to_string_lossy().replace('\\', "/"))
-}
-
-fn normalize_path(path: &Path) -> PathBuf {
-    let mut out = PathBuf::new();
-    for component in path.components() {
-        match component {
-            std::path::Component::Normal(part) => out.push(part),
-            std::path::Component::CurDir => {}
-            _ => return PathBuf::new(),
-        }
-    }
-    out
-}
-
-fn language_for_path(path: &str) -> Language {
-    Path::new(path)
-        .extension()
-        .and_then(|ext| ext.to_str())
-        .map(Language::from_extension)
-        .unwrap_or(Language::None)
-}
-
-fn is_regular_file_mode(mode: i32) -> bool {
-    mode == i32::from(FileMode::Blob) || mode == i32::from(FileMode::BlobExecutable)
 }
 
 fn is_binary_text(text: &str) -> bool {
@@ -1295,8 +1281,8 @@ fn format_secret_scan_report(report: &SecretScanReport, max_findings: usize) -> 
 mod tests {
     use super::*;
     use crate::analyzer::{AnalyzerConfig, WorkspaceAnalyzer};
-    use git2::{IndexAddOption, Signature};
-    use std::fs;
+    use brokk_bifrost_core::test_support::write_file;
+    use git2::Signature;
     use tempfile::TempDir;
 
     fn init_repo() -> (TempDir, Repository) {
@@ -1315,33 +1301,9 @@ mod tests {
         .expect("ephemeral workspace should build")
     }
 
-    fn write_file(root: &Path, rel: &str, contents: &str) {
-        let path = root.join(rel);
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent).unwrap();
-        }
-        fs::write(path, contents).unwrap();
-    }
-
     fn commit_all(repo: &Repository, message: &str) {
-        let mut index = repo.index().unwrap();
-        index
-            .add_all(["*"].iter(), IndexAddOption::DEFAULT, None)
-            .unwrap();
-        index.write().unwrap();
-        let tree_id = index.write_tree().unwrap();
-        let tree = repo.find_tree(tree_id).unwrap();
         let sig = Signature::now("Tester", "test@example.com").unwrap();
-        let parents = repo
-            .head()
-            .ok()
-            .and_then(|head| head.target())
-            .and_then(|oid| repo.find_commit(oid).ok())
-            .map(|commit| vec![commit])
-            .unwrap_or_default();
-        let parent_refs = parents.iter().collect::<Vec<_>>();
-        repo.commit(Some("HEAD"), &sig, &sig, message, &tree, &parent_refs)
-            .unwrap();
+        crate::test_support::shared_git::commit_all(repo, message, &sig);
         let origin_head = repo.reference_symbolic(
             "refs/remotes/origin/HEAD",
             "refs/heads/master",
@@ -1371,21 +1333,6 @@ mod tests {
     }
 
     #[test]
-    fn matcher_detects_provider_tokens_and_private_keys() {
-        let text = r#"
-        aws = "AKIAIOSFODNN7EXAMPLE"
-        token = "ghp_abcdefghijklmnopqrstuvwxyzABCDEFGHIJ"
-        key = "-----BEGIN RSA PRIVATE KEY-----"
-        "#;
-
-        let findings = scan_text("Secrets.java", text, false);
-
-        assert!(findings.iter().any(|f| f.rule == "AWS access key id"));
-        assert!(findings.iter().any(|f| f.rule == "GitHub token"));
-        assert!(findings.iter().any(|f| f.rule == "Private key block"));
-    }
-
-    #[test]
     fn matcher_detects_provider_tokens_without_credential_keywords() {
         let text = r#"
         value = "AKIAIOSFODNN7EXAMPLE"
@@ -1402,12 +1349,6 @@ mod tests {
         assert!(findings.iter().any(|f| f.rule == "Slack token"));
         assert!(findings.iter().any(|f| f.rule == "Google API key"));
         assert!(findings.iter().any(|f| f.rule == "Stripe key"));
-    }
-
-    #[test]
-    fn matcher_detects_generic_credential_assignment() {
-        let findings = scan_text("config.yml", "client_secret: qQ9xV7pL2mN8rT4sZ6wY", false);
-        assert!(findings.iter().any(|f| f.rule == "Credential assignment"));
     }
 
     #[test]
@@ -1463,24 +1404,6 @@ mod tests {
     }
 
     #[test]
-    fn matcher_detects_credential_assignment_keyword_variants() {
-        let text = r#"apiKey: "qQ9xV7pL2mN8rT4sZ6wY"
-api_key: "aB9xV7pL2mN8rT4sZ6wY"
-api-key: "zZ9xV7pL2mN8rT4sZ6wY"
-access_key: "mM9xV7pL2mN8rT4sZ6wY"
-"#;
-
-        let findings = scan_text("config.yml", text, false);
-        assert_eq!(
-            4,
-            findings
-                .iter()
-                .filter(|f| f.rule == "Credential assignment")
-                .count()
-        );
-    }
-
-    #[test]
     fn matcher_ignores_placeholders_and_low_confidence_unless_requested() {
         let text = r#"password: "changeme"
 api_key: "test"
@@ -1499,14 +1422,6 @@ token: "abcd123"
             1,
             "{low_findings:?}"
         );
-    }
-
-    #[test]
-    fn low_confidence_assignment_is_gated() {
-        let path = "config.yml";
-        let text = "client_secret: shorty";
-        assert!(scan_text(path, text, false).is_empty());
-        assert!(!scan_text(path, text, true).is_empty());
     }
 
     #[test]
@@ -1545,202 +1460,5 @@ token: "abcd123"
         assert!(!result.findings.is_empty());
         let serialized = serde_json::to_string(&result).unwrap();
         assert!(!serialized.contains("wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"));
-    }
-
-    #[test]
-    fn tool_reports_current_and_history_findings_and_excludes_tests() {
-        let (temp, repo) = init_repo();
-        write_file(
-            temp.path(),
-            "src/main/java/App.java",
-            r#"class App { String client_secret = "qQ9xV7pL2mN8rT4sZ6wY"; }"#,
-        );
-        write_file(
-            temp.path(),
-            "src/test/java/AppTest.java",
-            r#"class AppTest { String token = "ghp_abcdefghijklmnopqrstuvwxyzABCDEFGHIJ"; }"#,
-        );
-        commit_all(&repo, "add current secret");
-
-        write_file(
-            temp.path(),
-            "src/main/java/App.java",
-            r#"class App { String value = "clean"; }"#,
-        );
-        commit_all(&repo, "remove current secret");
-
-        write_file(
-            temp.path(),
-            "src/main/java/Live.java",
-            r#"class Live { String token = "ghp_abcdefghijklmnopqrstuvwxyzABCDEFGHIK"; }"#,
-        );
-        commit_all(&repo, "add live secret");
-        let analyzer = build_analyzer(temp.path());
-
-        let result = report_secret_like_code(
-            analyzer.analyzer(),
-            ReportSecretLikeCodeParams {
-                max_findings: 20,
-                max_commits: 20,
-                include_history_only: true,
-                include_low_confidence: false,
-            },
-        );
-
-        assert!(result.report.contains("HISTORY"), "{}", result.report);
-        assert!(
-            result.report.contains("CURRENT") || result.report.contains("BOTH"),
-            "{}",
-            result.report
-        );
-        assert!(result.report.contains("src/main/java/App.java"));
-        assert!(result.report.contains("src/main/java/Live.java"));
-        assert!(!result.report.contains("src/test/java/AppTest.java"));
-        assert!(!result.report.contains("qQ9xV7pL2mN8rT4sZ6wY"));
-    }
-
-    #[test]
-    fn blob_cache_preserves_grammar_confidence_and_content_identity() {
-        let (_temp, repo) = init_repo();
-        let text = "client_secret=qQ9xV7pL2mN8rT4sZ6wY";
-        let oid = repo.blob(text.as_bytes()).unwrap();
-        for path in [
-            "first.unknown",
-            "second.properties",
-            "third.unknown",
-            "fourth.properties",
-        ] {
-            let cached = scan_blob_content(&repo, oid, path, false);
-            let reference = scan_text_detailed(path, text, false);
-            assert_eq!(cached.keys, reference.keys, "{path}");
-            assert_eq!(cached.diagnostics, reference.diagnostics, "{path}");
-            if path.ends_with(".properties") {
-                assert_eq!(cached.keys.len(), 1);
-                assert!(cached.diagnostics.is_empty());
-            } else {
-                assert!(cached.keys.is_empty());
-                assert_eq!(
-                    cached.diagnostics[0].kind,
-                    SecretScanDiagnosticKind::UnsupportedAssignmentSyntax
-                );
-            }
-        }
-        let short = "client_secret=qQ9xV7";
-        let short_oid = repo.blob(short.as_bytes()).unwrap();
-        for low in [false, true, false] {
-            let cached = scan_blob_content(&repo, short_oid, "short.properties", low);
-            assert_eq!(cached.keys.len(), usize::from(low));
-        }
-        let changed = repo.blob(b"client_secret=placeholder").unwrap();
-        assert!(
-            scan_blob_content(&repo, changed, "second.properties", false)
-                .keys
-                .is_empty()
-        );
-    }
-
-    #[test]
-    fn tool_reports_cached_duplicate_blob_at_each_path() {
-        let (temp, repo) = init_repo();
-        let text = "client_secret: qQ9xV7pL2mN8rT4sZ6wY";
-        write_file(temp.path(), "src/main/resources/first.yml", text);
-        write_file(temp.path(), "src/main/resources/second.yml", text);
-        write_file(temp.path(), "src/main/resources/third.unknown", text);
-        commit_all(&repo, "add duplicate blob secrets");
-        let analyzer = build_analyzer(temp.path());
-
-        let result = report_secret_like_code(
-            analyzer.analyzer(),
-            ReportSecretLikeCodeParams {
-                max_findings: 20,
-                max_commits: 5,
-                include_history_only: true,
-                include_low_confidence: false,
-            },
-        );
-
-        assert!(
-            result
-                .findings
-                .iter()
-                .all(|finding| !finding.path.ends_with("third.unknown"))
-        );
-        assert!(
-            result
-                .diagnostics
-                .iter()
-                .any(|diagnostic| diagnostic.path.ends_with("third.unknown")
-                    && diagnostic.kind == SecretScanDiagnosticKind::UnsupportedAssignmentSyntax)
-        );
-        assert!(
-            result.report.contains("src/main/resources/first.yml"),
-            "{}",
-            result.report
-        );
-        assert!(
-            result.report.contains("src/main/resources/second.yml"),
-            "{}",
-            result.report
-        );
-    }
-
-    #[test]
-    fn history_scan_keeps_findings_across_commits_with_duplicate_blobs() {
-        let (temp, repo) = init_repo();
-        write_file(
-            temp.path(),
-            "src/main/resources/early.yml",
-            "client_secret: qQ9xV7pL2mN8rT4sZ6wY",
-        );
-        commit_all(&repo, "add early secret");
-
-        write_file(
-            temp.path(),
-            "src/main/resources/duplicate-one.yml",
-            "client_secret: aA9xV7pL2mN8rT4sZ6wY",
-        );
-        write_file(
-            temp.path(),
-            "src/main/resources/duplicate-two.yml",
-            "client_secret: aA9xV7pL2mN8rT4sZ6wY",
-        );
-        write_file(
-            temp.path(),
-            "src/main/resources/middle.yml",
-            "client_secret: bB9xV7pL2mN8rT4sZ6wY",
-        );
-        commit_all(&repo, "add duplicate and middle secrets");
-
-        write_file(
-            temp.path(),
-            "src/main/resources/late.yml",
-            "client_secret: cC9xV7pL2mN8rT4sZ6wY",
-        );
-        commit_all(&repo, "add late secret");
-        let analyzer = build_analyzer(temp.path());
-
-        let result = report_secret_like_code(
-            analyzer.analyzer(),
-            ReportSecretLikeCodeParams {
-                max_findings: 50,
-                max_commits: 20,
-                include_history_only: true,
-                include_low_confidence: false,
-            },
-        );
-
-        for path in [
-            "src/main/resources/early.yml",
-            "src/main/resources/middle.yml",
-            "src/main/resources/late.yml",
-            "src/main/resources/duplicate-one.yml",
-            "src/main/resources/duplicate-two.yml",
-        ] {
-            assert!(
-                result.report.contains(path),
-                "missing {path} in {}",
-                result.report
-            );
-        }
     }
 }

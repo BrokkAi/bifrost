@@ -6,8 +6,6 @@
 **/node_modules/
 /benchmark/.cache/
 /benchmark/benchmark-output/
-/benchmark/go-data-races/.cache/
-/benchmark/go-data-races/benchmark-output/
 /benchmark/interactive-latency-output/
 __pycache__/
 .codex
@@ -31,3 +29,7 @@ bifrost_searchtools/*.so
 /.brokk.local-hold/
 # Private comparison checkout created by quick-performance.yml.
 /.quick-performance-base/
+
+# Uncommitted agent evidence: logs, raw measurements, per-item campaign
+# output. Post conclusions on the GitHub issue; see AGENTS.md.
+/.agents/scratch/

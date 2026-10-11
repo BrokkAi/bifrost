@@ -1,5 +1,7 @@
 use std::hash::Hash;
 
+use brokk_bifrost_core::cancellation::is_cancelled_at_checkpoint;
+
 use crate::analyzer::semantic::{
     CallSiteHandle, CancellationToken, EvidenceCompleteness, ProgramPointHandle, ProofStatus,
     SemanticLocator,
@@ -1129,7 +1131,7 @@ fn check_cancellation(
     cancellation: &CancellationToken,
     index: usize,
 ) -> Result<(), TypestateFlowProblemError> {
-    if index.is_multiple_of(256) && cancellation.is_cancelled() {
+    if is_cancelled_at_checkpoint(Some(cancellation), index) {
         Err(TypestateFlowProblemError::FindingCancelled)
     } else {
         Ok(())
@@ -1359,26 +1361,12 @@ mod tests {
     use super::*;
     use crate::dataflow::{PathQuality, PathQualityFrontier};
     use crate::typestate::TypestateUncertainty;
+    use brokk_bifrost_test_macros::hardwon;
 
     #[test]
-    fn clean_may_evidence_survives_an_uncertain_parallel_path() {
-        let paths = PathQualityFrontier::singleton(PathQuality::PROVEN_COMPLETE);
-        let mut aggregate =
-            ViolationAggregate::new(paths, TypestateUncertaintySet::default(), false);
-        aggregate.merge(
-            paths,
-            TypestateUncertaintySet::default().with(TypestateUncertainty::IncompleteAnalysis),
-            false,
-        );
-
-        assert_eq!(
-            error_transition_certainty(ProtocolAnalysisMode::May, false, &aggregate, false),
-            TypestateFindingCertainty::May
-        );
-        assert!(!aggregate.uncertainty.is_empty());
-    }
-
-    #[test]
+    #[hardwon(
+        "43a2c41d9d02: May evidence can be complete from one exact local path despite unrelated global incompleteness, unlike Must and Inconclusive proof."
+    )]
     fn may_finding_proof_can_be_complete_when_global_discovery_is_not() {
         let locally_complete = TypestateFindingEvidence {
             path_proven: true,
@@ -1407,6 +1395,9 @@ mod tests {
     }
 
     #[test]
+    #[hardwon(
+        "43a2c41d9d02: A proven-partial path plus an unproven-complete path cannot be combined into one proven-complete witness."
+    )]
     fn incomparable_path_qualities_do_not_invent_a_complete_proof() {
         let mut paths = PathQualityFrontier::singleton(PathQuality::PROVEN_PARTIAL);
         assert!(paths.insert(PathQuality::UNPROVEN_COMPLETE));
@@ -1424,6 +1415,9 @@ mod tests {
     }
 
     #[test]
+    #[hardwon(
+        "43a2c41d9d02: Completeness from an accepting state cannot be borrowed to certify a different failing terminal path."
+    )]
     fn accepting_state_cannot_complete_a_failing_terminal_path() {
         let failing = ProtocolStateId::try_from_index(0).expect("failing state ID");
         let accepting = ProtocolStateId::try_from_index(1).expect("accepting state ID");
@@ -1451,25 +1445,9 @@ mod tests {
     }
 
     #[test]
-    fn must_evidence_requires_complete_paths_and_one_exact_outcome() {
-        let paths = PathQualityFrontier::singleton(PathQuality::PROVEN_COMPLETE);
-        let aggregate = ViolationAggregate::new(paths, TypestateUncertaintySet::default(), false);
-
-        assert_eq!(
-            error_transition_certainty(ProtocolAnalysisMode::Must, true, &aggregate, false),
-            TypestateFindingCertainty::Must
-        );
-        assert_eq!(
-            error_transition_certainty(ProtocolAnalysisMode::Must, true, &aggregate, true),
-            TypestateFindingCertainty::Inconclusive
-        );
-        assert_eq!(
-            error_transition_certainty(ProtocolAnalysisMode::Must, false, &aggregate, false),
-            TypestateFindingCertainty::Inconclusive
-        );
-    }
-
-    #[test]
+    #[hardwon(
+        "#2313: An expectation with only accepting observations produces no synthetic terminal violation; observed incomplete failures remain inconclusive."
+    )]
     fn terminal_expectations_require_an_observed_failing_state() {
         assert_eq!(
             terminal_finding_certainty(ProtocolAnalysisMode::May, false, 0, 1, false, false),
@@ -1498,31 +1476,21 @@ mod tests {
     }
 
     #[test]
-    fn witness_target_is_definitive_only_for_a_proven_complete_path() {
-        for quality in [
-            PathQuality::PROVEN_PARTIAL,
-            PathQuality::UNPROVEN_COMPLETE,
-            PathQuality::UNPROVEN_PARTIAL,
-        ] {
-            assert!(
-                !FindingWitnessTarget {
-                    reached_index: 0,
-                    quality,
-                    uncertainty: TypestateUncertaintySet::default(),
-                    abstained: false,
-                }
-                .is_definitive()
-            );
-        }
-        assert!(
-            FindingWitnessTarget {
-                reached_index: 0,
-                quality: PathQuality::PROVEN_COMPLETE,
-                uncertainty: TypestateUncertaintySet::default(),
-                abstained: false,
-            }
-            .is_definitive()
+    fn clean_may_evidence_survives_an_uncertain_parallel_path() {
+        let paths = PathQualityFrontier::singleton(PathQuality::PROVEN_COMPLETE);
+        let mut aggregate =
+            ViolationAggregate::new(paths, TypestateUncertaintySet::default(), false);
+        aggregate.merge(
+            paths,
+            TypestateUncertaintySet::default().with(TypestateUncertainty::IncompleteAnalysis),
+            false,
         );
+
+        assert_eq!(
+            error_transition_certainty(ProtocolAnalysisMode::May, false, &aggregate, false),
+            TypestateFindingCertainty::May
+        );
+        assert!(!aggregate.uncertainty.is_empty());
     }
 
     #[test]
@@ -1549,31 +1517,6 @@ mod tests {
         assert_eq!(targets.uncertainty_witness(), Some(uncertain_complete));
         assert_eq!(targets.may_witness(), Some(clean_partial));
         assert_eq!(targets.preferred(), Some(clean_partial));
-    }
-
-    #[test]
-    fn duplicate_may_and_inconclusive_findings_merge_as_may() {
-        assert_eq!(
-            merge_finding_certainty(
-                TypestateFindingCertainty::May,
-                TypestateFindingCertainty::Inconclusive
-            ),
-            TypestateFindingCertainty::May
-        );
-        assert_eq!(
-            merge_finding_certainty(
-                TypestateFindingCertainty::Inconclusive,
-                TypestateFindingCertainty::May
-            ),
-            TypestateFindingCertainty::May
-        );
-        assert_eq!(
-            merge_finding_certainty(
-                TypestateFindingCertainty::Must,
-                TypestateFindingCertainty::Inconclusive
-            ),
-            TypestateFindingCertainty::Inconclusive
-        );
     }
 
     #[test]

@@ -1,5 +1,17 @@
 use super::*;
 
+struct UnaryPlanContinuation {
+    node_id: PhysicalQueryNodeId,
+    terminal_cap: Option<usize>,
+    invocation_started: Option<Instant>,
+    dependency_started: Option<Instant>,
+}
+
+struct PlanDependencyExecution {
+    execution: PlanExecution,
+    elapsed_ns: u64,
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(super) fn execute_plan(
     plan: &PhysicalQueryPlan,
@@ -11,11 +23,107 @@ pub(super) fn execute_plan(
     diagnostics: &mut Vec<CodeQueryDiagnostic>,
     profile_branch: &mut Option<Vec<usize>>,
 ) -> PlanExecution {
+    let mut continuations = Vec::new();
+    let mut current_node_id = node_id;
+    let mut current_terminal_cap = terminal_cap;
+
+    loop {
+        let node = plan.node(current_node_id);
+        let profiling = state.profile.is_some();
+        match (
+            node.operator(),
+            plan.logical_node(current_node_id).operator(),
+        ) {
+            (PhysicalQueryOperator::PipelineStep, LogicalQueryOperator::Step { .. }) => {
+                continuations.push(UnaryPlanContinuation {
+                    node_id: current_node_id,
+                    terminal_cap: current_terminal_cap,
+                    invocation_started: profiling.then(Instant::now),
+                    dependency_started: profiling.then(Instant::now),
+                });
+                current_node_id = node.dependencies()[0];
+                current_terminal_cap = None;
+            }
+            (PhysicalQueryOperator::Limit, LogicalQueryOperator::Limit { count, .. }) => {
+                let dependency = node.dependencies()[0];
+                continuations.push(UnaryPlanContinuation {
+                    node_id: current_node_id,
+                    terminal_cap: current_terminal_cap,
+                    invocation_started: profiling.then(Instant::now),
+                    dependency_started: profiling.then(Instant::now),
+                });
+                current_node_id = dependency;
+                current_terminal_cap = (state.source_row_boundary != Some(dependency))
+                    .then_some(count.saturating_add(1));
+            }
+            _ => break,
+        }
+    }
+
     let profiling = state.profile.is_some();
-    let invocation_started = profiling.then(Instant::now);
+    let mut execution = execute_plan_node(
+        plan,
+        token,
+        current_node_id,
+        state,
+        limits,
+        current_terminal_cap,
+        diagnostics,
+        profile_branch,
+        profiling.then(Instant::now),
+        None,
+    );
+
+    while let Some(continuation) = continuations.pop() {
+        let elapsed_ns = continuation
+            .dependency_started
+            .map(elapsed_ns)
+            .unwrap_or_default();
+        execution = execute_plan_node(
+            plan,
+            token,
+            continuation.node_id,
+            state,
+            limits,
+            continuation.terminal_cap,
+            diagnostics,
+            profile_branch,
+            continuation.invocation_started,
+            Some(PlanDependencyExecution {
+                execution,
+                elapsed_ns,
+            }),
+        );
+    }
+
+    execution
+}
+
+#[allow(clippy::too_many_arguments)]
+fn execute_plan_node(
+    plan: &PhysicalQueryPlan,
+    token: QueryToken<'_>,
+    node_id: PhysicalQueryNodeId,
+    state: &mut QueryExecutionState<'_>,
+    limits: CodeQueryExecutionLimits,
+    terminal_cap: Option<usize>,
+    diagnostics: &mut Vec<CodeQueryDiagnostic>,
+    profile_branch: &mut Option<Vec<usize>>,
+    invocation_started: Option<Instant>,
+    dependency_execution: Option<PlanDependencyExecution>,
+) -> PlanExecution {
+    let profiling = state.profile.is_some();
     let physical_node = plan.node(node_id);
     let physical_operator = physical_node.operator();
     let logical_operator = plan.logical_node(node_id).operator();
+    assert_eq!(
+        matches!(
+            physical_operator,
+            PhysicalQueryOperator::PipelineStep | PhysicalQueryOperator::Limit
+        ),
+        dependency_execution.is_some(),
+        "unary query operators receive exactly one completed dependency"
+    );
     let mut input_rows = 0;
     let mut rows_visited = 0;
     let mut relation_expansions = 0;
@@ -234,6 +342,18 @@ pub(super) fn execute_plan(
             }
         }
         (
+            PhysicalQueryOperator::DependencyEvidenceScan,
+            LogicalQueryOperator::DependencyEvidenceSeed(seed),
+        ) => {
+            let execution =
+                execute_dependency_evidence_seed(seed, terminal_cap, state, limits, diagnostics);
+            self_truncated = execution.truncated;
+            if execution.cancelled {
+                disposition = QueryOperatorDisposition::Cancelled;
+            }
+            execution
+        }
+        (
             PhysicalQueryOperator::ConfigurationFactsScan,
             LogicalQueryOperator::ConfigurationFactsSeed(seed),
         ) => {
@@ -280,7 +400,14 @@ pub(super) fn execute_plan(
                 );
                 cancelled_plan_execution()
             } else {
-                let execution = execute_seed(seed, terminal_cap, state, limits, diagnostics);
+                let execution = execute_seed(
+                    seed,
+                    physical_node.source_enumeration_constraint(),
+                    terminal_cap,
+                    state,
+                    limits,
+                    diagnostics,
+                );
                 if terminal_cap.is_some_and(|cap| execution.rows.len() >= cap) {
                     push_operator_termination(
                         &mut terminations,
@@ -302,22 +429,11 @@ pub(super) fn execute_plan(
                 ..
             },
         ) => {
-            let dependency = physical_node.dependencies()[0];
-            let dependency_started = profiling.then(Instant::now);
-            let child = execute_plan(
-                plan,
-                token,
-                dependency,
-                state,
-                limits,
-                None,
-                diagnostics,
-                profile_branch,
-            );
-            if let Some(started) = dependency_started {
-                dependency_execution_ns =
-                    dependency_execution_ns.saturating_add(elapsed_ns(started));
-            }
+            let PlanDependencyExecution {
+                execution: child,
+                elapsed_ns,
+            } = dependency_execution.expect("pipeline step has a completed dependency");
+            dependency_execution_ns = dependency_execution_ns.saturating_add(elapsed_ns);
             input_rows = child.rows.len();
             work_started = profiling.then(|| state_execution_work_snapshot(state));
             cache_started = state.cache_profile;
@@ -614,6 +730,51 @@ pub(super) fn execute_plan(
                     }
                 }
                 let truncated = branch_attempts.iter().any(|attempt| attempt.truncated);
+                // A scoped BindingUses query can withhold just the binders
+                // whose reference scope is incomplete. Other incomplete
+                // exclusion branches have no per-binding coverage, so none
+                // of their difference rows can support a negative finding.
+                let incomplete_exclusion = if *op != SetOperator::Except {
+                    None
+                } else if branch_attempts
+                    .iter()
+                    .skip(1)
+                    .any(|attempt| attempt.truncated)
+                {
+                    Some(false)
+                } else {
+                    let incomplete = branch_diagnostics
+                        .iter()
+                        .skip(1)
+                        .flatten()
+                        .filter(|diagnostic| {
+                            diagnostic.impact == CodeQueryDiagnosticImpact::Incomplete
+                        })
+                        .collect::<Vec<_>>();
+                    if incomplete.is_empty() {
+                        None
+                    } else {
+                        let scope_diagnostics = incomplete.iter().all(|diagnostic| {
+                            matches!(
+                                diagnostic.code,
+                                CodeQueryDiagnosticCode::OccurrenceResolutionIncomplete
+                                    | CodeQueryDiagnosticCode::OccurrenceRoleUnsupported
+                                    | CodeQueryDiagnosticCode::EnvironmentAxisUnsupported
+                                    | CodeQueryDiagnosticCode::EnvironmentDerivationIncomplete
+                            )
+                        });
+                        let left_bindings_are_covered = branch_rows.first().is_some_and(|rows| {
+                            rows.iter().all(|row| match &row.value {
+                                PipelineValue::Binding(binding) => state
+                                    .environment_cache
+                                    .binding_use_completeness(binding)
+                                    .is_some(),
+                                _ => false,
+                            })
+                        });
+                        Some(scope_diagnostics && left_bindings_are_covered)
+                    }
+                };
                 for mut branch in branch_diagnostics {
                     diagnostics.append(&mut branch);
                 }
@@ -627,11 +788,34 @@ pub(super) fn execute_plan(
                     let merge_started = profiling.then(Instant::now);
                     let (mut rows, merge_measurement) =
                         combine_set_rows(*op, branch_rows, profiling);
+                    let incomplete_rows_discarded = match incomplete_exclusion {
+                        Some(true) => {
+                            let before = rows.len();
+                            rows.retain(|row| match &row.value {
+                                PipelineValue::Binding(binding) => {
+                                    state.environment_cache.binding_use_completeness(binding)
+                                        == Some(true)
+                                }
+                                _ => false,
+                            });
+                            before.saturating_sub(rows.len())
+                        }
+                        Some(false) => {
+                            let count = rows.len();
+                            rows.clear();
+                            count
+                        }
+                        None => 0,
+                    };
                     if let Some(started) = merge_started {
                         merge_ns = merge_ns.saturating_add(elapsed_ns(started));
                     }
                     if let Some(merge_measurement) = merge_measurement {
-                        rows_discarded = Some(merge_measurement.rows_discarded);
+                        rows_discarded = Some(
+                            merge_measurement
+                                .rows_discarded
+                                .saturating_add(incomplete_rows_discarded),
+                        );
                         temporary_capacity_bytes_lower_bound =
                             merge_measurement.temporary_capacity_bytes_lower_bound;
                     }
@@ -660,24 +844,11 @@ pub(super) fn execute_plan(
             }
         }
         (PhysicalQueryOperator::Limit, LogicalQueryOperator::Limit { count, .. }) => {
-            let dependency = physical_node.dependencies()[0];
-            let dependency_started = profiling.then(Instant::now);
-            let child_terminal_cap =
-                (state.source_row_boundary != Some(dependency)).then_some(count.saturating_add(1));
-            let mut child = execute_plan(
-                plan,
-                token,
-                dependency,
-                state,
-                limits,
-                child_terminal_cap,
-                diagnostics,
-                profile_branch,
-            );
-            if let Some(started) = dependency_started {
-                dependency_execution_ns =
-                    dependency_execution_ns.saturating_add(elapsed_ns(started));
-            }
+            let PlanDependencyExecution {
+                execution: mut child,
+                elapsed_ns,
+            } = dependency_execution.expect("limit has a completed dependency");
+            dependency_execution_ns = dependency_execution_ns.saturating_add(elapsed_ns);
             input_rows = child.rows.len();
             rows_visited = input_rows;
             rows_discarded = Some(0);
@@ -716,6 +887,148 @@ pub(super) fn execute_plan(
             }
             child
         }
+        (
+            PhysicalQueryOperator::CrossDomainCorrelate
+            | PhysicalQueryOperator::CrossDomainRequireBoth,
+            LogicalQueryOperator::Correlate { .. } | LogicalQueryOperator::RequireBoth { .. },
+        ) => {
+            if state
+                .cancellation
+                .is_some_and(CancellationToken::is_cancelled)
+            {
+                disposition = QueryOperatorDisposition::Skipped;
+                push_operator_termination(
+                    &mut terminations,
+                    QueryOperatorTermination::CancellationBeforeWork,
+                );
+                cancelled_plan_execution()
+            } else {
+                // The code input is branch 0 and the configuration input is
+                // branch 1, in both row provenance and diagnostics. Each runs
+                // under a fair share of the remaining budget, like a set
+                // branch, and neither sees the other's rows.
+                let dependencies = physical_node.dependencies();
+                debug_assert_eq!(dependencies.len(), 2);
+                let mut inputs = Vec::with_capacity(2);
+                let mut cancelled_child = None;
+                for (index, dependency) in dependencies.iter().copied().enumerate() {
+                    let branch_limits = fair_branch_limits(
+                        &state.budget,
+                        limits,
+                        dependencies.len().saturating_sub(index),
+                    );
+                    let mut child_diagnostics = Vec::new();
+                    if let Some(branch) = profile_branch.as_mut() {
+                        branch.push(index);
+                    }
+                    let dependency_started = profiling.then(Instant::now);
+                    let mut child = execute_plan(
+                        plan,
+                        token,
+                        dependency,
+                        state,
+                        branch_limits,
+                        None,
+                        &mut child_diagnostics,
+                        profile_branch,
+                    );
+                    if let Some(started) = dependency_started {
+                        dependency_execution_ns =
+                            dependency_execution_ns.saturating_add(elapsed_ns(started));
+                    }
+                    if let Some(branch) = profile_branch.as_mut() {
+                        let popped = branch.pop();
+                        debug_assert_eq!(popped, Some(index));
+                    }
+                    input_rows = input_rows.saturating_add(child.rows.len());
+                    rows_visited = rows_visited.saturating_add(child.rows.len());
+                    prefix_branch_rows(&mut child.rows, index);
+                    prefix_branch_diagnostics(&mut child_diagnostics, index);
+                    diagnostics.append(&mut child_diagnostics);
+                    if child.cancelled {
+                        push_operator_termination(
+                            &mut terminations,
+                            QueryOperatorTermination::DependencyCancelled,
+                        );
+                        cancelled_child = Some(child);
+                        break;
+                    }
+                    inputs.push(child);
+                }
+                work_started = profiling.then(|| state_execution_work_snapshot(state));
+                cache_started = state.cache_profile;
+                own_diagnostic_start = diagnostics.len();
+                if let Some(child) = cancelled_child {
+                    disposition = QueryOperatorDisposition::Skipped;
+                    child
+                } else {
+                    let configuration = inputs.pop().expect("the configuration input ran");
+                    let code = inputs.pop().expect("the code input ran");
+                    let execution = match logical_operator {
+                        LogicalQueryOperator::Correlate {
+                            relation: CrossDomainRelation::DependencyConfiguration(relation),
+                            configuration_seeds,
+                            ..
+                        } => execute_dependency_configuration(
+                            relation,
+                            configuration_seeds,
+                            code,
+                            configuration,
+                            terminal_cap,
+                            state,
+                            limits,
+                            diagnostics,
+                        ),
+                        LogicalQueryOperator::Correlate {
+                            relation: CrossDomainRelation::ConfigurationKey(relation),
+                            configuration_seeds,
+                            ..
+                        } => execute_correlate_configuration_key(
+                            relation,
+                            configuration_seeds,
+                            code,
+                            configuration,
+                            terminal_cap,
+                            state,
+                            limits,
+                            diagnostics,
+                        ),
+                        LogicalQueryOperator::Correlate {
+                            relation: CrossDomainRelation::ConfigurationCode(relation),
+                            ..
+                        } => super::configuration_join::execute(
+                            relation,
+                            code,
+                            configuration,
+                            terminal_cap,
+                            state,
+                            limits,
+                            diagnostics,
+                        ),
+                        LogicalQueryOperator::RequireBoth { .. } => execute_require_both(
+                            code,
+                            configuration,
+                            terminal_cap,
+                            state,
+                            limits,
+                            diagnostics,
+                        ),
+                        _ => unreachable!("cross-domain physical operators run cross-domain nodes"),
+                    };
+                    if terminal_cap.is_some_and(|cap| execution.rows.len() >= cap) {
+                        push_operator_termination(
+                            &mut terminations,
+                            QueryOperatorTermination::TerminalCap,
+                        );
+                    }
+                    self_truncated = execution.truncated;
+                    if execution.cancelled {
+                        disposition = QueryOperatorDisposition::Cancelled;
+                    }
+                    execution
+                }
+            }
+        }
         _ => unreachable!("physical operator must implement its logical query node"),
     };
 
@@ -726,7 +1039,7 @@ pub(super) fn execute_plan(
             .expect("a source-row boundary requires source-row selection")
             .source_rows();
         execution.rows.retain(|row| {
-            let evidence = detailed_evidence_for_pipeline_value(0, &row.value, None);
+            let evidence = detailed_evidence_for_pipeline_value(0, &row.value, None, None);
             source_rows.iter().any(|source| {
                 source.domain == evidence.domain
                     && source.key == evidence.key
@@ -865,7 +1178,7 @@ pub(super) fn execute_parallel_seed_union(
     );
     let analyzer = state.analyzer;
     let cancellation = state.cancellation;
-    let scope = state.scope;
+    let scope = state.scope.clone();
     let source_row_boundary = state.source_row_boundary;
     let receiver_budget_override = state.receiver_budget_override;
     let access_mode = state.access_mode;
@@ -888,7 +1201,7 @@ pub(super) fn execute_parallel_seed_union(
                     // steps execute later against the parent workspace state.
                     workspace: None,
                     cancellation,
-                    scope,
+                    scope: scope.clone(),
                     source_row_boundary,
                     step_outputs: vec![0; plan.node_count()],
                     receiver_budget_override,
@@ -909,12 +1222,18 @@ pub(super) fn execute_parallel_seed_union(
                     control_relation_cache:
                         control_relations::ControlRelationTraversalCache::default(),
                     branch_relation_cache: BranchRelationTraversalCache::default(),
+                    cpp_expression_cache: HashMap::default(),
+                    cpp_class_fact_cache: HashMap::default(),
+                    cpp_class_declaration_cache: HashMap::default(),
+                    callable_metrics_cache: HashMap::default(),
                     failure_handler_state_cache: FailureHandlerStateCache::default(),
                     topology_cache: topology_rows::TopologyTraversalCache::default(),
                     rewrite_path_cache: RewritePathTraversalCache::default(),
                     path_cache: PathTraversalCache::default(),
                     call_cache: CallTraversalCache::default(),
+                    call_binding_identity_request: state.call_binding_identity_request,
                     receiver_facts: HashMap::default(),
+                    receiver_service: None,
                     semantic: None,
                     import_graph: None,
                     import_graph_content: None,
@@ -1149,6 +1468,7 @@ pub(super) fn append_diagnostic_terminations(
             CodeQueryDiagnosticCode::UnsupportedStructuralFeature
             | CodeQueryDiagnosticCode::MissingStructuralAdapter
             | CodeQueryDiagnosticCode::UnsupportedImportAnalysis
+            | CodeQueryDiagnosticCode::DynamicImportTarget
             | CodeQueryDiagnosticCode::UsesParserUnsupported
             | CodeQueryDiagnosticCode::SemanticWorkspaceRequired
             | CodeQueryDiagnosticCode::SemanticCapabilityUnsupported
@@ -1201,6 +1521,7 @@ pub(super) fn append_diagnostic_terminations(
             | CodeQueryDiagnosticCode::EnvironmentDerivationIncomplete
             | CodeQueryDiagnosticCode::MaterializationDerivationIncomplete
             | CodeQueryDiagnosticCode::ResolutionTraceIncomplete
+            | CodeQueryDiagnosticCode::PythonHierarchyDerivationIncomplete
             | CodeQueryDiagnosticCode::EdgeAxisUnsupported
             | CodeQueryDiagnosticCode::EdgeDerivationIncomplete
             | CodeQueryDiagnosticCode::FlowStateAxisUnsupported
@@ -1209,9 +1530,11 @@ pub(super) fn append_diagnostic_terminations(
             | CodeQueryDiagnosticCode::RewritePathDerivationIncomplete
             | CodeQueryDiagnosticCode::ControlRelationDerivationIncomplete
             | CodeQueryDiagnosticCode::BranchRelationDerivationIncomplete
+            | CodeQueryDiagnosticCode::RecoveredSyntaxIncomplete
             | CodeQueryDiagnosticCode::LoopRelationDerivationIncomplete
             | CodeQueryDiagnosticCode::FailureHandlerDerivationIncomplete
             | CodeQueryDiagnosticCode::StatementReachabilityDerivationIncomplete
+            | CodeQueryDiagnosticCode::PendingCleanupFlowDerivationIncomplete
             | CodeQueryDiagnosticCode::ControlRelationExitPartitionPartial
             | CodeQueryDiagnosticCode::TopologyDerivationIncomplete
             | CodeQueryDiagnosticCode::TopologyOwnershipAmbiguous
@@ -1220,10 +1543,14 @@ pub(super) fn append_diagnostic_terminations(
             | CodeQueryDiagnosticCode::ResultContractDerivationIncomplete
             | CodeQueryDiagnosticCode::ResultObligationDerivationIncomplete
             | CodeQueryDiagnosticCode::CallShapeCoverageIncomplete
-            | CodeQueryDiagnosticCode::JsxProjectionIncomplete => {
+            | CodeQueryDiagnosticCode::JsxProjectionIncomplete
+            | CodeQueryDiagnosticCode::CrossDomainBindingUnproven
+            | CodeQueryDiagnosticCode::CrossDomainKeyUnsupported
+            | CodeQueryDiagnosticCode::CrossDomainDocumentIncomplete => {
                 Some(QueryOperatorTermination::AnalysisIncomplete)
             }
-            CodeQueryDiagnosticCode::InvalidPlan
+            CodeQueryDiagnosticCode::CrossDomainCorrelationAmbiguous
+            | CodeQueryDiagnosticCode::InvalidPlan
             | CodeQueryDiagnosticCode::NoEnclosingProcedure
             | CodeQueryDiagnosticCode::CallRelationTargetsAmbiguous
             | CodeQueryDiagnosticCode::ReferenceTargetsAmbiguous

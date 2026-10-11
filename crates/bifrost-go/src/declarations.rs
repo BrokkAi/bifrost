@@ -1,4 +1,4 @@
-use brokk_bifrost_core::analyzer::fq_name::{FqName, SegmentId, SegmentKind, segment_interner};
+use brokk_bifrost_core::analyzer::fq_name::{FqName, SegmentKind, segment_interner};
 use brokk_bifrost_core::analyzer::go_facts::GoCallableFact;
 use brokk_bifrost_core::analyzer::model::StructuredTypeIdentityBuilder;
 use brokk_bifrost_core::analyzer::model::{
@@ -8,11 +8,15 @@ use brokk_bifrost_core::analyzer::model::{
 use brokk_bifrost_core::analyzer::parsed_file::{ParsedFile, ParsedSourceFacts, SourceImportFact};
 use brokk_bifrost_core::analyzer::rust_facts::RustItemSourceFacts;
 use brokk_bifrost_core::analyzer::source_facts::{SourceDeclarationId, SourceImportId};
+use brokk_bifrost_core::analyzer::structural::adapter_helpers::child_by_field_or_first_named_child;
 use brokk_bifrost_core::analyzer::structural::callable::CallSiteContext;
 use brokk_bifrost_core::analyzer::structural::collector::StructuralFactCollector;
 use brokk_bifrost_core::analyzer::structural::resolution::DeclaredVisibility;
 use brokk_bifrost_core::analyzer::structural::spec::{CompiledKinds, StructuralSpec};
+pub use brokk_bifrost_core::analyzer::tree_walk::children_by_field_name as children_by_field;
+pub use brokk_bifrost_core::analyzer::tree_walk::last_named_child as go_last_named_type_child;
 use brokk_bifrost_core::analyzer::tree_walk::{ParentIndex, TreeWalkAction};
+pub use brokk_bifrost_core::analyzer::tree_walk::{named_children, named_children_of_kind};
 use brokk_bifrost_core::analyzer::{CodeUnit, ProjectFile};
 use tree_sitter::{Node, Tree};
 
@@ -20,9 +24,7 @@ use crate::packages::{GO_MODULE_SCOPE_SEGMENT, canonical_go_package_name};
 use crate::resolution::{GoResolutionBuilder, GoResolutionOutput};
 use crate::structural::GO_STRUCTURAL_SPEC;
 
-pub fn go_node_text<'a>(node: Node<'_>, source: &'a str) -> &'a str {
-    brokk_bifrost_core::analyzer::common::node_source_text(node, source)
-}
+pub use brokk_bifrost_core::analyzer::common::node_source_text as go_node_text;
 
 /// Whether a Go identifier is exported from its declaring package.
 ///
@@ -67,11 +69,6 @@ pub fn is_predeclared_go_type(name: &str) -> bool {
     )
 }
 
-/// Intern one qualified-name segment in the process-global interner.
-pub fn go_segment(text: &str, kind: SegmentKind) -> SegmentId {
-    segment_interner().intern(text, kind)
-}
-
 /// Build the structured package prefix for a Go declaration.
 ///
 /// A Go `package_name` is the canonical *import path* (e.g.
@@ -99,26 +96,56 @@ pub fn go_segment(text: &str, kind: SegmentKind) -> SegmentId {
 pub fn go_package_fq(package_name: &str) -> FqName {
     let mut fq = FqName::new();
     for component in package_name.split('/').filter(|c| !c.is_empty()) {
-        fq.push(go_segment(component, SegmentKind::Path));
+        fq.push(segment_interner().intern(component, SegmentKind::Path));
     }
     fq
 }
 
 pub fn determine_go_package_name(root: Node<'_>, source: &str) -> String {
+    try_determine_go_package_name(root, source, || true)
+        .expect("unconditional Go package-name walk cannot cancel")
+}
+
+/// Read the Go package clause, returning `None` when `continue_query` stops
+/// the structured tree walk.
+pub fn try_determine_go_package_name(
+    root: Node<'_>,
+    source: &str,
+    continue_query: impl FnMut() -> bool,
+) -> Option<String> {
+    find_go_package_name(root, source, continue_query).map(|declared| declared.unwrap_or_default())
+}
+
+pub fn declared_go_package_name(root: Node<'_>, source: &str) -> Option<String> {
+    find_go_package_name(root, source, || true)
+        .expect("unconditional Go package-name walk cannot cancel")
+}
+
+fn find_go_package_name(
+    root: Node<'_>,
+    source: &str,
+    mut continue_query: impl FnMut() -> bool,
+) -> Option<Option<String>> {
     let mut cursor = root.walk();
     for child in root.named_children(&mut cursor) {
+        if !continue_query() {
+            return None;
+        }
         if child.kind() != "package_clause" {
             continue;
         }
         let mut package_cursor = child.walk();
         for package_child in child.named_children(&mut package_cursor) {
+            if !continue_query() {
+                return None;
+            }
             if package_child.kind() == "package_identifier" || package_child.kind() == "identifier"
             {
-                return go_node_text(package_child, source).trim().to_string();
+                return Some(Some(go_node_text(package_child, source).trim().to_string()));
             }
         }
     }
-    String::new()
+    Some(None)
 }
 
 /// Collect every import declaration from a Go source tree.
@@ -638,7 +665,9 @@ pub fn go_structured_type_identity_with(
                     }
                     "pointer_type" => {
                         frames.push(GoStructuredTypeFrame::Pointer);
-                        frames.push(GoStructuredTypeFrame::Visit(go_type_wrapper_child(node)?));
+                        frames.push(GoStructuredTypeFrame::Visit(
+                            child_by_field_or_first_named_child(node, "type")?,
+                        ));
                     }
                     "array_type" | "implicit_length_array_type" => {
                         frames.push(GoStructuredTypeFrame::Array);
@@ -686,7 +715,9 @@ pub fn go_structured_type_identity_with(
                         frames.push(GoStructuredTypeFrame::Visit(base));
                     }
                     "parenthesized_type" | "negated_type" => {
-                        frames.push(GoStructuredTypeFrame::Visit(go_type_wrapper_child(node)?));
+                        frames.push(GoStructuredTypeFrame::Visit(
+                            child_by_field_or_first_named_child(node, "type")?,
+                        ));
                     }
                     "interface_type" => {
                         if node.has_error() || node.is_missing() {
@@ -753,18 +784,6 @@ pub fn go_structured_type_identity_with(
         .and_then(|root| builder.finish(root))
 }
 
-pub fn go_type_wrapper_child(node: Node<'_>) -> Option<Node<'_>> {
-    node.child_by_field_name("type").or_else(|| {
-        let mut cursor = node.walk();
-        node.named_children(&mut cursor).next()
-    })
-}
-
-pub fn go_last_named_type_child(node: Node<'_>) -> Option<Node<'_>> {
-    let mut cursor = node.walk();
-    node.named_children(&mut cursor).last()
-}
-
 pub fn go_embedded_type_texts(node: Node<'_>, source: &str) -> Vec<String> {
     let mut embedded = go_embedded_type_nodes(node)
         .into_iter()
@@ -827,21 +846,52 @@ pub fn go_embedded_type_nodes(node: Node<'_>) -> Vec<Node<'_>> {
     }
 }
 
-pub fn named_children(node: Node<'_>) -> Vec<Node<'_>> {
-    let mut cursor = node.walk();
-    node.named_children(&mut cursor).collect()
+/// The parser-backed syntax of one Go parameter declaration.
+pub struct GoParameterSyntax<'tree> {
+    /// The parameter's type node, where the grammar provides one.
+    pub type_node: Option<Node<'tree>>,
+    /// The declared names, empty for an unnamed parameter.
+    pub name_nodes: Vec<Node<'tree>>,
+    /// Whether the declaration uses Go's variadic parameter form.
+    pub variadic: bool,
 }
 
-pub fn named_children_of_kind<'tree>(node: Node<'tree>, kind: &str) -> Vec<Node<'tree>> {
-    let mut cursor = node.walk();
-    node.named_children(&mut cursor)
-        .filter(|child| child.kind() == kind)
+/// Select Go parameter declarations and their grouped names and type nodes.
+pub fn go_parameter_syntax(parameters: Node<'_>) -> Vec<GoParameterSyntax<'_>> {
+    named_children(parameters)
+        .into_iter()
+        .filter(|parameter| {
+            matches!(
+                parameter.kind(),
+                "parameter_declaration" | "variadic_parameter_declaration"
+            )
+        })
+        .map(|parameter| GoParameterSyntax {
+            type_node: parameter
+                .child_by_field_name("type")
+                .or_else(|| parameter.named_child(parameter.named_child_count().saturating_sub(1))),
+            name_nodes: children_by_field(parameter, "name"),
+            variadic: parameter.kind() == "variadic_parameter_declaration",
+        })
         .collect()
 }
 
-pub fn children_by_field<'tree>(node: Node<'tree>, field: &str) -> Vec<Node<'tree>> {
-    let mut cursor = node.walk();
-    node.children_by_field_name(field, &mut cursor).collect()
+/// The parser-backed shape of a Go callable's result declaration.
+pub enum GoCallableResultSyntax<'tree> {
+    None,
+    Type(Node<'tree>),
+    Parameters(Node<'tree>),
+}
+
+/// Classify the result field shared by Go callable analysis and source facts.
+pub fn go_callable_result_syntax(callable: Node<'_>) -> GoCallableResultSyntax<'_> {
+    match callable.child_by_field_name("result") {
+        None => GoCallableResultSyntax::None,
+        Some(result) if result.kind() == "parameter_list" => {
+            GoCallableResultSyntax::Parameters(result)
+        }
+        Some(result) => GoCallableResultSyntax::Type(result),
+    }
 }
 
 /// The declared type of the parameter a label node names.
@@ -1009,13 +1059,9 @@ pub fn go_field_inline_container_type(node: Node<'_>) -> Option<Node<'_>> {
 
 pub fn go_value_is_simple_literal(value: &str) -> bool {
     let trimmed = value.trim();
-    trimmed == "iota"
-        || trimmed == "true"
-        || trimmed == "false"
-        || trimmed == "nil"
+    brokk_bifrost_core::analyzer::test_assertions::is_common_assertion_literal(trimmed)
+        || matches!(trimmed, "iota" | "true" | "false" | "nil")
         || trimmed.parse::<i128>().is_ok()
-        || trimmed.parse::<f64>().is_ok()
-        || (trimmed.starts_with('"') && trimmed.ends_with('"'))
         || (trimmed.starts_with('`') && trimmed.ends_with('`'))
         || (trimmed.starts_with('\'') && trimmed.ends_with('\''))
 }
@@ -1030,6 +1076,15 @@ pub fn parse_go_file(file: &ProjectFile, source: &str, tree: &Tree) -> ParsedFil
     let declared_package = determine_go_package_name(tree.root_node(), source);
     let package_name = canonical_go_package_name(file, &declared_package);
     parse_go_file_with_package_name(file, source, tree, declared_package, package_name)
+}
+
+#[cfg(test)]
+pub(crate) fn parse_go_tree(source: &str) -> Tree {
+    let mut parser = tree_sitter::Parser::new();
+    parser
+        .set_language(&tree_sitter_go::LANGUAGE.into())
+        .expect("Go grammar is valid");
+    parser.parse(source, None).expect("Go source parses")
 }
 
 pub fn parse_go_file_with_package_name(
@@ -1059,7 +1114,7 @@ pub fn parse_go_file_with_package_name(
         &call_site_context,
     );
     walk_go_primary_tree(root, &mut state);
-    state.finish();
+    state.finish(root);
     parsed
 }
 
@@ -1529,7 +1584,7 @@ where
             Some(parent) => parent.fq().clone(),
             None => go_package_fq(&self.package_name),
         }
-        .with_pushed(go_segment(name, SegmentKind::Member));
+        .with_pushed(segment_interner().intern(name, SegmentKind::Member));
         let signature = node
             .child_by_field_name("parameters")
             .map(|parameters| go_node_text(parameters, self.source).trim().to_string());
@@ -1603,7 +1658,7 @@ where
             return;
         };
         let parent_fq = go_package_fq(&self.package_name)
-            .with_pushed(go_segment(&receiver_name, SegmentKind::Type));
+            .with_pushed(segment_interner().intern(&receiver_name, SegmentKind::Type));
         let parent = CodeUnit::new_fq(
             self.file.clone(),
             CodeUnitType::Class,
@@ -1625,7 +1680,8 @@ where
             .native
             .capture_source_type(type_node)
             .expect("Go type declaration has a source type fact");
-        let fq = go_package_fq(&self.package_name).with_pushed(go_segment(name, SegmentKind::Type));
+        let fq = go_package_fq(&self.package_name)
+            .with_pushed(segment_interner().intern(name, SegmentKind::Type));
         let code_unit = CodeUnit::new_fq(
             self.file.clone(),
             CodeUnitType::Class,
@@ -1698,8 +1754,8 @@ where
             .child_by_field_name("type")
             .and_then(|type_node| self.native.capture_source_type(type_node));
         let fq = go_package_fq(&self.package_name)
-            .with_pushed(go_segment(GO_MODULE_SCOPE_SEGMENT, SegmentKind::Package))
-            .with_pushed(go_segment(name, SegmentKind::Member));
+            .with_pushed(segment_interner().intern(GO_MODULE_SCOPE_SEGMENT, SegmentKind::Package))
+            .with_pushed(segment_interner().intern(name, SegmentKind::Member));
         let code_unit = CodeUnit::new_fq(
             self.file.clone(),
             CodeUnitType::Field,
@@ -1744,8 +1800,10 @@ where
                 continue;
             }
             let fq = go_package_fq(&self.package_name)
-                .with_pushed(go_segment(GO_MODULE_SCOPE_SEGMENT, SegmentKind::Package))
-                .with_pushed(go_segment(name, SegmentKind::Member));
+                .with_pushed(
+                    segment_interner().intern(GO_MODULE_SCOPE_SEGMENT, SegmentKind::Package),
+                )
+                .with_pushed(segment_interner().intern(name, SegmentKind::Member));
             let code_unit = CodeUnit::new_fq(
                 self.file.clone(),
                 CodeUnitType::Field,
@@ -1783,11 +1841,10 @@ where
                 let mut declaration_id = None;
                 for owner_index in 0..owner_count {
                     let owner = self.field_owner_lists[owner_list][owner_index].clone();
-                    let fq = owner
-                        .unit
-                        .fq()
-                        .clone()
-                        .with_pushed(go_segment(&field_name, SegmentKind::Member));
+                    let fq =
+                        owner.unit.fq().clone().with_pushed(
+                            segment_interner().intern(&field_name, SegmentKind::Member),
+                        );
                     let code_unit = CodeUnit::new_fq(
                         self.file.clone(),
                         CodeUnitType::Field,
@@ -1862,7 +1919,7 @@ where
                     .unit
                     .fq()
                     .clone()
-                    .with_pushed(go_segment(field_name, SegmentKind::Member));
+                    .with_pushed(segment_interner().intern(field_name, SegmentKind::Member));
                 let code_unit = CodeUnit::new_fq(
                     self.file.clone(),
                     CodeUnitType::Field,
@@ -1958,7 +2015,7 @@ where
                 .unit
                 .fq()
                 .clone()
-                .with_pushed(go_segment(name, SegmentKind::Member));
+                .with_pushed(segment_interner().intern(name, SegmentKind::Member));
             let code_unit = CodeUnit::with_signature_and_fq(
                 self.file.clone(),
                 CodeUnitType::Function,
@@ -2046,12 +2103,12 @@ where
         owner_list
     }
 
-    fn finish(self) {
+    fn finish(self, root: Node<'_>) {
         assert_eq!(self.declaration_contexts.len(), 1);
         assert_eq!(self.structural_parents, vec![None]);
         let structural = self
             .structural
-            .finish()
+            .finish(root)
             .expect("Go structural fact collection must finish");
         let native = self.native.finish();
         let GoResolutionOutput {
@@ -2111,16 +2168,11 @@ where
 mod coordinated_producer_tests {
     use super::*;
     use brokk_bifrost_core::analyzer::ProjectFile;
-    use brokk_bifrost_core::analyzer::structural::kinds::NormalizedKind;
+    use brokk_bifrost_core::analyzer::structural::kinds::{NormalizedKind, Role};
     use std::collections::BTreeSet;
-    use tree_sitter::Parser;
 
     fn parse(source: &str) -> ParsedFile {
-        let mut parser = Parser::new();
-        parser
-            .set_language(&tree_sitter_go::LANGUAGE.into())
-            .expect("Go grammar is valid");
-        let tree = parser.parse(source, None).expect("Go source parses");
+        let tree = parse_go_tree(source);
         let root = std::env::current_dir()
             .expect("test working directory")
             .join("bifrost-go-producer-tests");
@@ -2134,6 +2186,33 @@ mod coordinated_producer_tests {
             .iter()
             .map(|unit| unit.short_name().to_string())
             .collect()
+    }
+
+    #[test]
+    fn generic_indexed_call_keeps_its_structured_callee_name() {
+        let source = "package p\nfunc use() { _ = lib.New[int]() }\n";
+        let parsed = parse(source);
+        let facts = parsed.source_facts.as_ref().expect("source facts");
+        let call_id = facts
+            .structural
+            .nodes()
+            .iter()
+            .position(|node| node.kind == NormalizedKind::Call)
+            .expect("generic invocation has a call fact") as u32;
+        let call = facts.structural.node(call_id);
+        let callee = call.name.expect("generic invocation keeps its callee name");
+        let callee_range = facts.occurrences.occurrence(callee).range;
+        assert_eq!(
+            &source[callee_range.start_byte..callee_range.end_byte],
+            "New"
+        );
+        assert!(facts.structural.roles(call_id).iter().any(|role| {
+            role.role == Role::Callee
+                && role.name.is_some_and(|name| {
+                    let range = facts.occurrences.occurrence(name).range;
+                    &source[range.start_byte..range.end_byte] == "New"
+                })
+        }));
     }
 
     #[test]
@@ -2193,7 +2272,6 @@ mod coordinated_producer_tests {
         );
         assert!(!facts.structural.nodes().is_empty());
     }
-
     #[test]
     fn untyped_consts_keep_native_bindings_without_fabricated_runtime_types() {
         let source = "package p\nconst one, two = 1, 2\n";
@@ -2223,12 +2301,20 @@ mod coordinated_producer_tests {
                 "constant declaration {site:?} has inferred-type gaps: {:#?}",
                 parsed.resolution_facts.gaps.iter().filter(|gap| gap.site == *site).collect::<Vec<_>>());
         }
-        assert!(
-            parsed.resolution_facts.intrinsic_type_seeds.is_empty(),
-            "untyped constant values must not acquire default runtime types"
+        assert_eq!(
+            parsed.resolution_facts.intrinsic_type_seeds.len(),
+            2,
+            "each constant literal carries its exact untyped identity"
+        );
+        assert!(parsed
+            .resolution_facts
+            .intrinsic_type_seeds
+            .iter()
+            .all(|seed| seed.kind
+                == brokk_bifrost_core::analyzer::resolution_facts::IntrinsicTypeKind::LanguageBuiltin),
+            "untyped constant values do not acquire primitive runtime types"
         );
     }
-
     #[test]
     fn imports_keep_alias_forms_and_source_projection_links() {
         let source = concat!(
@@ -2336,12 +2422,17 @@ mod coordinated_producer_tests {
                     == "import (\nalias \"example.com/alias\"\n. \"example.com/dot\"\n_ \"example.com/blank\"\n)"
             })
             .expect("whole import declaration native site");
-        assert!(parsed.resolution_facts.gaps.iter().any(|gap| {
+        assert!(!parsed.resolution_facts.gaps.iter().any(|gap| {
             gap.site == declaration_site.id
                 && gap.kind == brokk_bifrost_core::analyzer::resolution_facts::ResolutionGapKind::UnsupportedRoute
         }));
+        assert!(
+            parsed
+                .resolution_facts
+                .reference_enumeration_gaps
+                .is_empty()
+        );
     }
-
     #[test]
     fn structural_admission_survives_native_unsupported_subtrees() {
         let source = "package p\nfunc f() { if true { missing() } }\n";
@@ -2355,7 +2446,6 @@ mod coordinated_producer_tests {
                 .any(|node| node.kind == NormalizedKind::Call)
         );
     }
-
     #[test]
     fn unsupported_type_descendants_do_not_leak_member_owners() {
         let source = concat!(
@@ -2380,7 +2470,6 @@ mod coordinated_producer_tests {
             );
         }
     }
-
     #[test]
     fn type_and_embedded_metadata_share_the_original_display_signature() {
         let source = concat!(
@@ -2447,7 +2536,6 @@ mod coordinated_producer_tests {
             Some(&vec![0])
         );
     }
-
     #[test]
     fn inline_multi_name_containers_preserve_direct_and_synthetic_members() {
         let source = concat!(
@@ -2512,56 +2600,6 @@ mod coordinated_producer_tests {
             source_declaration("Outer.D.Method")
         );
     }
-
-    #[test]
-    fn go_source_facts_capture_shapes_and_complete_callable_lists() {
-        let source = concat!(
-            "package p\n",
-            "type Base struct{}\n",
-            "type Alias = [4]*Base\n",
-            "type Holder struct { *Base }\n",
-            "func Run(a, b [4]*Base, tail ...chan<- Base) (Base, error) { }\n",
-        );
-        let parsed = parse(source);
-        let facts = parsed.source_facts.as_ref().expect("source facts");
-        let go = facts.go.as_ref().expect("Go source facts");
-        assert!(go.types.iter().any(|fact| matches!(
-            &fact.shape,
-            brokk_bifrost_core::analyzer::go_facts::GoSourceTypeShape::Array {
-                length_text, ..
-            } if length_text == "4"
-        )));
-        assert!(go.types.iter().any(|fact| matches!(
-            &fact.shape,
-            brokk_bifrost_core::analyzer::go_facts::GoSourceTypeShape::Channel {
-                direction: brokk_bifrost_core::analyzer::go_facts::GoChannelDirection::Send,
-                ..
-            }
-        )));
-        let run = go
-            .callables
-            .iter()
-            .find(|callable| callable.name == "Run")
-            .expect("Run source callable");
-        assert_eq!(run.parameters.as_ref().map(Vec::len), Some(3));
-        assert_eq!(run.results.len(), 2);
-        assert!(run.parameters.as_ref().unwrap()[2].variadic);
-        assert!(go.aliases.iter().any(|alias| alias.name == "Alias"));
-        let holder = go
-            .declarations
-            .iter()
-            .find(|declaration| declaration.name == "Holder")
-            .expect("Holder source type");
-        let embedded = go
-            .fields
-            .iter()
-            .find(|field| field.owner == holder.ty && field.embedded)
-            .expect("Holder embedded field");
-        assert!(matches!(
-            embedded.ty.map(|id| &go.types[id.index()].shape),
-            Some(brokk_bifrost_core::analyzer::go_facts::GoSourceTypeShape::Pointer(_))
-        ));
-    }
 }
 
 #[cfg(test)]
@@ -2569,14 +2607,6 @@ mod tests {
     use super::*;
     use crate::parse::parse_go;
 
-    /// Go declarations record the modifier facts the language states, so a Go
-    /// workspace callable has a receiver contract and therefore a canonical
-    /// procedure key (#3455).
-    ///
-    /// Go writes no static modifier, so the receiver contract is decided by
-    /// the declaration's own shape: a package-level function binds nothing, a
-    /// method states its receiver, and an interface method is dispatched on
-    /// the interface value. Visibility is the exported-identifier rule.
     #[test]
     fn callable_metadata_records_go_receiver_contracts_structurally() {
         const SOURCE: &str = concat!(

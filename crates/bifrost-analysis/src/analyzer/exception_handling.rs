@@ -13,10 +13,18 @@ use crate::analyzer::{
     ExceptionHandlingAnalysis, ExceptionHandlingSmell, ExceptionSmellWeights, IAnalyzer, Language,
     ProjectFile, parser_language_for_path,
 };
-use crate::path_utils::rel_path_string;
+use brokk_bifrost_core::analyzer::common::{
+    nonempty_node_source_text as node_text, try_node_source_text,
+};
 use brokk_bifrost_core::analyzer::exception_handling::{
-    HandlerScoreInput, collect_nodes_by_kind, compact_excerpt, find_first_named_descendant,
-    has_descendant_of_kind, score_handler, sort_findings,
+    HandlerScoreInput, build_handler_smell, collect_nodes_by_kind, find_first_named_descendant,
+    has_descendant_of_kind, sort_findings,
+};
+use brokk_bifrost_core::analyzer::structural::adapter_helpers::first_named_child;
+use brokk_bifrost_core::analyzer::tree_walk::{
+    children_by_field_name, find_ancestor, first_named_child_matching,
+    first_named_child_of_kind as named_child_by_kind, has_child_of_kind as has_direct_child_kind,
+    last_named_child as last_named_child_for_handler,
 };
 use tree_sitter::{Node, Parser};
 
@@ -238,7 +246,7 @@ fn analyze_go(
             continue;
         };
         for if_node in collect_nodes_by_kind(function_body, "if_statement") {
-            if nearest_ancestor_of_kind(if_node, "func_literal") != Some(function) {
+            if find_ancestor(if_node, |parent| parent.kind() == "func_literal") != Some(function) {
                 continue;
             }
             if let Some(body) = if_node.child_by_field_name("consequence")
@@ -295,7 +303,8 @@ fn analyze_rust(
             .child_by_field_name("value")
             .is_some_and(|value| contains_call_named(value, source, "catch_unwind"));
         for arm in collect_nodes_by_kind(match_node, "match_arm") {
-            if nearest_ancestor_of_kind(arm, "match_expression") != Some(match_node) {
+            if find_ancestor(arm, |parent| parent.kind() == "match_expression") != Some(match_node)
+            {
                 continue;
             }
             let pattern = arm
@@ -429,7 +438,9 @@ fn analyze_scala(
     let mut cases = Vec::new();
     for catch_clause in collect_nodes_by_kind(root, "catch_clause") {
         for case_clause in collect_nodes_by_kind(catch_clause, "case_clause") {
-            if nearest_ancestor_of_kind(case_clause, "catch_clause") == Some(catch_clause) {
+            if find_ancestor(case_clause, |parent| parent.kind() == "catch_clause")
+                == Some(catch_clause)
+            {
                 cases.push(case_clause);
             }
         }
@@ -545,7 +556,12 @@ fn analyze_handler_nodes<'tree>(
             .any(|kind| has_descendant_of_kind(body, kind));
         let log_only =
             body_statement_count == 1 && !rethrow_present && contains_logging_call(body, source);
-        let Some(scored) = score_handler(
+        let Some(finding) = build_handler_smell(
+            analyzer,
+            file,
+            source,
+            handler,
+            catch_type,
             weights,
             HandlerScoreInput {
                 broad_handler,
@@ -556,26 +572,7 @@ fn analyze_handler_nodes<'tree>(
         ) else {
             continue;
         };
-        let enclosing_fq_name = analyzer
-            .enclosing_code_unit_for_lines(
-                file,
-                handler.start_position().row,
-                handler.end_position().row,
-            )
-            .map(|unit| unit.fq_name())
-            .unwrap_or_else(|| rel_path_string(file));
-        findings.push(ExceptionHandlingSmell {
-            file: file.clone(),
-            enclosing_fq_name,
-            catch_type,
-            score: scored.score,
-            body_statement_count,
-            reasons: scored.reasons,
-            excerpt: node_text(handler, source)
-                .map(|text| compact_excerpt(&text))
-                .unwrap_or_default(),
-            start_byte: handler.start_byte(),
-        });
+        findings.push(finding);
     }
     sort_findings(&mut findings);
     findings
@@ -597,7 +594,12 @@ fn analyze_preextracted_handlers<'tree>(
         let has_comment = contains_comment(body);
         let log_only =
             body_statement_count == 1 && !is_rethrow(body) && contains_logging_call(body, source);
-        let Some(scored) = score_handler(
+        let Some(finding) = build_handler_smell(
+            analyzer,
+            file,
+            source,
+            handler,
+            catch_type,
             weights,
             HandlerScoreInput {
                 broad_handler,
@@ -608,28 +610,43 @@ fn analyze_preextracted_handlers<'tree>(
         ) else {
             continue;
         };
-        findings.push(ExceptionHandlingSmell {
-            file: file.clone(),
-            enclosing_fq_name: analyzer
-                .enclosing_code_unit_for_lines(
-                    file,
-                    handler.start_position().row,
-                    handler.end_position().row,
-                )
-                .map(|unit| unit.fq_name())
-                .unwrap_or_else(|| rel_path_string(file)),
-            catch_type,
-            score: scored.score,
-            body_statement_count,
-            reasons: scored.reasons,
-            excerpt: node_text(handler, source)
-                .map(|text| compact_excerpt(&text))
-                .unwrap_or_default(),
-            start_byte: handler.start_byte(),
-        });
+        findings.push(finding);
     }
     sort_findings(&mut findings);
     findings
+}
+
+#[derive(Clone, Copy)]
+enum ExceptionFamilyWeight {
+    Throwable,
+    RuntimeException,
+    Exception,
+}
+
+const JAVA_EXCEPTION_FAMILIES: &[(&str, ExceptionFamilyWeight)] = &[
+    ("Throwable", ExceptionFamilyWeight::Throwable),
+    ("RuntimeException", ExceptionFamilyWeight::RuntimeException),
+    ("Exception", ExceptionFamilyWeight::Exception),
+];
+
+const RUBY_EXCEPTION_FAMILIES: &[(&str, ExceptionFamilyWeight)] = &[
+    ("Exception", ExceptionFamilyWeight::Throwable),
+    ("RuntimeError", ExceptionFamilyWeight::RuntimeException),
+    ("StandardError", ExceptionFamilyWeight::Exception),
+];
+
+fn classify_exception_family(
+    weights: &ExceptionSmellWeights,
+    families: &[(&str, ExceptionFamilyWeight)],
+    mut matches: impl FnMut(&str) -> bool,
+) -> Option<(i32, String)> {
+    let (label, family) = families.iter().copied().find(|(name, _)| matches(name))?;
+    let weight = match family {
+        ExceptionFamilyWeight::Throwable => weights.generic_throwable_weight,
+        ExceptionFamilyWeight::RuntimeException => weights.generic_runtime_exception_weight,
+        ExceptionFamilyWeight::Exception => weights.generic_exception_weight,
+    };
+    Some((weight, format!("generic-catch:{label}")))
 }
 
 fn classify_exact_java_family(
@@ -637,24 +654,9 @@ fn classify_exact_java_family(
     source: &str,
     weights: &ExceptionSmellWeights,
 ) -> Option<(i32, String)> {
-    if contains_identifier(type_node, source, "Throwable") {
-        Some((
-            weights.generic_throwable_weight,
-            "generic-catch:Throwable".to_string(),
-        ))
-    } else if contains_identifier(type_node, source, "RuntimeException") {
-        Some((
-            weights.generic_runtime_exception_weight,
-            "generic-catch:RuntimeException".to_string(),
-        ))
-    } else if contains_identifier(type_node, source, "Exception") {
-        Some((
-            weights.generic_exception_weight,
-            "generic-catch:Exception".to_string(),
-        ))
-    } else {
-        None
-    }
+    classify_exception_family(weights, JAVA_EXCEPTION_FAMILIES, |name| {
+        contains_identifier(type_node, source, name)
+    })
 }
 
 fn classify_cpp_type(catch_type: &str, weights: &ExceptionSmellWeights) -> Option<(i32, String)> {
@@ -684,42 +686,13 @@ fn classify_ruby_type(
     source: &str,
     weights: &ExceptionSmellWeights,
 ) -> Option<(i32, String)> {
-    if contains_identifier(type_node, source, "Exception") {
-        Some((
-            weights.generic_throwable_weight,
-            "generic-catch:Exception".to_string(),
-        ))
-    } else if contains_identifier(type_node, source, "RuntimeError") {
-        Some((
-            weights.generic_runtime_exception_weight,
-            "generic-catch:RuntimeError".to_string(),
-        ))
-    } else if contains_identifier(type_node, source, "StandardError") {
-        Some((
-            weights.generic_exception_weight,
-            "generic-catch:StandardError".to_string(),
-        ))
-    } else {
-        None
-    }
+    classify_exception_family(weights, RUBY_EXCEPTION_FAMILIES, |name| {
+        contains_identifier(type_node, source, name)
+    })
 }
 
 fn classify_ruby_name(catch_type: &str, weights: &ExceptionSmellWeights) -> Option<(i32, String)> {
-    match catch_type {
-        "Exception" => Some((
-            weights.generic_throwable_weight,
-            "generic-catch:Exception".to_string(),
-        )),
-        "RuntimeError" => Some((
-            weights.generic_runtime_exception_weight,
-            "generic-catch:RuntimeError".to_string(),
-        )),
-        "StandardError" => Some((
-            weights.generic_exception_weight,
-            "generic-catch:StandardError".to_string(),
-        )),
-        _ => None,
-    }
+    classify_exception_family(weights, RUBY_EXCEPTION_FAMILIES, |name| catch_type == name)
 }
 
 fn cpp_catch_type(parameters: Node<'_>, source: &str) -> String {
@@ -1047,77 +1020,20 @@ fn single_statement_through_wrappers(mut node: Node<'_>) -> Option<Node<'_>> {
 }
 
 fn single_non_comment_named_child(node: Node<'_>) -> Option<Node<'_>> {
-    let mut cursor = node.walk();
-    let mut children = node
-        .named_children(&mut cursor)
-        .filter(|child| !child.kind().ends_with("comment") && child.kind() != "comment");
-    let only = children.next()?;
-    children.next().is_none().then_some(only)
-}
-
-fn has_direct_child_kind(node: Node<'_>, kind: &str) -> bool {
-    (0..node.child_count()).any(|index| node.child(index).is_some_and(|child| child.kind() == kind))
-}
-
-fn node_text(node: Node<'_>, source: &str) -> Option<String> {
-    node_text_ref(node, source).map(str::to_string)
+    crate::analyzer::tree_walk::single_named_child_matching(node, |child| {
+        !child.kind().ends_with("comment") && child.kind() != "comment"
+    })
 }
 
 fn node_text_ref<'source>(node: Node<'_>, source: &'source str) -> Option<&'source str> {
-    source
-        .get(node.start_byte()..node.end_byte())
+    try_node_source_text(node, source)
         .map(str::trim)
         .filter(|text| !text.is_empty())
-}
-
-fn first_named_child(node: Node<'_>) -> Option<Node<'_>> {
-    let mut cursor = node.walk();
-    node.named_children(&mut cursor).next()
-}
-
-fn last_named_child_for_handler(node: Node<'_>) -> Option<Node<'_>> {
-    let mut cursor = node.walk();
-    node.named_children(&mut cursor).last()
-}
-
-fn named_child_by_kind<'tree>(node: Node<'tree>, kind: &str) -> Option<Node<'tree>> {
-    let mut cursor = node.walk();
-    node.named_children(&mut cursor)
-        .find(|child| child.kind() == kind)
 }
 
 fn direct_named_child_matching(
     node: Node<'_>,
     mut predicate: impl FnMut(&str) -> bool,
 ) -> Option<Node<'_>> {
-    let mut cursor = node.walk();
-    node.named_children(&mut cursor)
-        .find(|child| predicate(child.kind()))
-}
-
-fn children_by_field_name<'tree>(node: Node<'tree>, field: &str) -> Vec<Node<'tree>> {
-    let mut values = Vec::new();
-    let mut cursor = node.walk();
-    if cursor.goto_first_child() {
-        loop {
-            if cursor.field_name() == Some(field) {
-                values.push(cursor.node());
-            }
-            if !cursor.goto_next_sibling() {
-                break;
-            }
-        }
-    }
-    values
-}
-
-fn nearest_ancestor_of_kind<'tree>(node: Node<'tree>, kind: &str) -> Option<Node<'tree>> {
-    let mut current = node.parent();
-    while let Some(parent) = current {
-        if parent.kind() == kind {
-            return Some(parent);
-        }
-        current = parent.parent();
-    }
-    None
+    first_named_child_matching(node, |child| predicate(child.kind()))
 }

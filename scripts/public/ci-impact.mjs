@@ -238,6 +238,7 @@ function isRustPath(path) {
     "crates/bifrost-rql/src/",
     "crates/bifrost-semantic-packs/src/",
     "crates/bifrost-semantic-packs/tests/",
+    "crates/bifrost-test-macros/src/",
     "tests/",
     "examples/",
   ]);
@@ -255,7 +256,7 @@ function classifyExtractedLanguagePath(path) {
 
 function isDocumentationPath(path) {
   return (
-    startsWithAny(path, [".agents/docs/", ".agents/plans/", "docs/"]) ||
+    startsWithAny(path, [".agents/docs/", ".agents/plans/", ".agents/records/", "docs/"]) ||
     [
       ".agents/PLANS.md",
       "AGENTS.md",

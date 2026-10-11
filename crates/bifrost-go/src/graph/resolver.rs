@@ -11,12 +11,11 @@ use crate::graph::ast::{
     CompositeLiteralContainerStep, field_owner_token, first_named_child, selector_parts,
 };
 use crate::imports::{default_go_import_local_name, go_import_path};
-use crate::packages::{GO_MODULE_SCOPE_SEGMENT, GoWorkspacePathIndex};
+use crate::packages::{GoWorkspacePathIndex, is_go_module_field, source_inventory_role};
 use crate::source_facts::{GoFileSourceFacts, GoSourceFactProvider};
 use crate::source_properties::go_source_type_identity;
 use brokk_bifrost_core::analyzer::capabilities::{ImportAnalysisProvider, TypeAliasProvider};
 use brokk_bifrost_core::analyzer::common::language_for_file;
-use brokk_bifrost_core::analyzer::fq_name::segment_interner;
 use brokk_bifrost_core::analyzer::go_facts::{
     GoSourceTypeId, GoSourceTypeShape, GoTypeCompoundKind,
 };
@@ -183,6 +182,24 @@ pub(crate) fn load_go_fact_files(
     unavailable.sort();
     unavailable.dedup();
     (loaded, unavailable)
+}
+
+fn load_complete_go_fact_files(
+    source: GoGraphSource<'_>,
+    files: impl IntoIterator<Item = ProjectFile>,
+) -> Result<Vec<GoFactFile>, GoGraphBuildError> {
+    let (fact_files, mut unavailable) = load_go_fact_files(source, files);
+    unavailable.extend(
+        fact_files
+            .iter()
+            .filter(|file| !go_fact_file_is_complete(file))
+            .map(|file| file.file.clone()),
+    );
+    if unavailable.is_empty() {
+        Ok(fact_files)
+    } else {
+        Err(GoGraphBuildError::from_files(unavailable))
+    }
 }
 
 pub struct ParsedFile {
@@ -584,23 +601,7 @@ pub fn build_go_edge_index(
     files: &[ProjectFile],
 ) -> Result<GoEdgeIndex, GoGraphBuildError> {
     let _scope = brokk_bifrost_core::profiling::scope("go_edge_index::build");
-    let (fact_files, unavailable) = load_go_fact_files(
-        source,
-        files
-            .iter()
-            .filter(|file| language_for_file(file) == Language::Go)
-            .cloned(),
-    );
-    let mut unavailable = unavailable;
-    unavailable.extend(
-        fact_files
-            .iter()
-            .filter(|file| !go_fact_file_is_complete(file))
-            .map(|file| file.file.clone()),
-    );
-    if !unavailable.is_empty() {
-        return Err(GoGraphBuildError::from_files(unavailable));
-    }
+    let fact_files = load_complete_go_fact_files(source, files.iter().cloned())?;
     build_go_edge_index_from_facts(source, &fact_files)
 }
 
@@ -622,23 +623,7 @@ pub fn build_go_workspace_indexes(
     files: &[ProjectFile],
 ) -> Result<GoWorkspaceIndexes, GoGraphBuildError> {
     let _scope = brokk_bifrost_core::profiling::scope("go_workspace_indexes::build");
-    let (fact_files, unavailable) = load_go_fact_files(
-        source,
-        files
-            .iter()
-            .filter(|file| language_for_file(file) == Language::Go)
-            .cloned(),
-    );
-    let mut unavailable = unavailable;
-    unavailable.extend(
-        fact_files
-            .iter()
-            .filter(|file| !go_fact_file_is_complete(file))
-            .map(|file| file.file.clone()),
-    );
-    if !unavailable.is_empty() {
-        return Err(GoGraphBuildError::from_files(unavailable));
-    }
+    let fact_files = load_complete_go_fact_files(source, files.iter().cloned())?;
     let edges = build_go_edge_index_from_facts(source, &fact_files)?;
     let hierarchy = crate::hierarchy::GoHierarchyIndex::build_from_fact_files(source, fact_files);
     Ok(GoWorkspaceIndexes {
@@ -815,17 +800,6 @@ pub(crate) fn mounted_units(
         .into_iter()
         .flatten()
         .cloned()
-}
-
-/// Return a mounted unit's exact Go owner from its structured qualified name.
-/// The rendered spelling is only the final API key; owner matching must pop a
-/// structured segment so package/type names containing dots cannot create a
-/// cross-product of repeated inline projections.
-pub(crate) fn go_unit_parent_fqn(unit: &CodeUnit) -> Option<String> {
-    unit.fq()
-        .parent()
-        .filter(|parent| !parent.is_empty())
-        .map(|parent| parent.display_native(Language::Go, segment_interner()))
 }
 
 fn collect_go_type_maps(files: &[GoFactFile]) -> GoFactTypeMaps {
@@ -1125,7 +1099,8 @@ fn collect_go_fact_declaration_facts(
                 if !unit.is_field() {
                     continue;
                 }
-                let Some(unit_owner) = go_unit_parent_fqn(&unit) else {
+                let Some(unit_owner) = brokk_bifrost_core::analyzer::default_parent_fq_name(&unit)
+                else {
                     continue;
                 };
                 let Some(owner) = owners.iter().find(|owner| **owner == unit_owner) else {
@@ -1158,7 +1133,8 @@ fn collect_go_fact_declaration_facts(
                 if !unit.is_function() {
                     continue;
                 }
-                let Some(unit_owner) = go_unit_parent_fqn(&unit) else {
+                let Some(unit_owner) = brokk_bifrost_core::analyzer::default_parent_fq_name(&unit)
+                else {
                     continue;
                 };
                 let Some(owner) = owners.iter().find(|owner| **owner == unit_owner) else {
@@ -1367,6 +1343,9 @@ fn import_bindings_from_imports(
             .iter()
             .filter_map(|target| {
                 let clause = target_package_name(target)?;
+                if source_inventory_role(target, &clause) == "xtest" {
+                    return None;
+                }
                 let canonical = workspace_paths.canonical_package_name(target, &clause);
                 (!clause.is_empty() && !canonical.is_empty()).then_some((clause, canonical))
             })
@@ -1521,12 +1500,20 @@ fn parse_go_graph_file(
     source: GoGraphSource<'_>,
     file: &ProjectFile,
 ) -> Result<ParsedFile, GoGraphBuildError> {
-    let package_name = graph_package_clause(source, file)?;
     let source_text = source
         .index
         .indexed_source(file)
         .ok_or_else(|| GoGraphBuildError::for_file(file.clone()))?;
+    parse_go_graph_source(source, file, source_text)
+}
+
+fn parse_go_graph_source(
+    source: GoGraphSource<'_>,
+    file: &ProjectFile,
+    source_text: String,
+) -> Result<ParsedFile, GoGraphBuildError> {
     let imports = checked_import_infos(source, file)?;
+    let package_name = graph_package_clause(source, file)?;
     parse_go_source(source_text, imports, package_name)
         .ok_or_else(|| GoGraphBuildError::for_file(file.clone()))
 }
@@ -1608,17 +1595,7 @@ pub fn build_go_graph(
         return Err(GoGraphBuildError::from_files(unavailable_files));
     }
 
-    let (fact_files, unavailable) = load_go_fact_files(source, all_parsed.keys().cloned());
-    let mut unavailable = unavailable;
-    unavailable.extend(
-        fact_files
-            .iter()
-            .filter(|file| !go_fact_file_is_complete(file))
-            .map(|file| file.file.clone()),
-    );
-    if !unavailable.is_empty() {
-        return Err(GoGraphBuildError::from_files(unavailable));
-    }
+    let fact_files = load_complete_go_fact_files(source, all_parsed.keys().cloned())?;
     let edge_index = Arc::new(build_go_edge_index_from_facts(source, &fact_files)?);
 
     // Only candidate and target trees survive the build. The remaining parses
@@ -1675,10 +1652,7 @@ pub fn build_go_graph_with_edge_index(
                 {
                     return Ok(None);
                 }
-                let imports = checked_import_infos(source, &file)?;
-                let package_name = graph_package_clause(source, &file)?;
-                let parsed = parse_go_source(source_text, imports, package_name)
-                    .ok_or_else(|| GoGraphBuildError::for_file(file.clone()))?;
+                let parsed = parse_go_graph_source(source, &file, source_text)?;
                 Ok(Some((file, Arc::new(parsed))))
             })
             .collect();
@@ -1755,7 +1729,7 @@ impl TargetSpec {
     pub fn new(source: GoGraphSource<'_>, graph: &GoProjectGraph, target: &CodeUnit) -> Self {
         let identifier = target.identifier().to_string();
         let owner = owner_name(target);
-        let top_level_seeds = if owner.is_none() || is_module_field(target) {
+        let top_level_seeds = if owner.is_none() || is_go_module_field(target) {
             let seeds = graph.seeds_for_target(target.source(), &identifier);
             (!seeds.is_empty()).then_some(seeds)
         } else {
@@ -1822,7 +1796,7 @@ impl TargetSpec {
     }
 
     pub fn is_member(&self) -> bool {
-        self.owner.is_some() && !is_module_field(&self.target)
+        self.owner.is_some() && !is_go_module_field(&self.target)
     }
 
     pub fn owner_is_interface(&self) -> bool {
@@ -1950,7 +1924,7 @@ fn receiver_type_seeds(
 }
 
 fn owner_name(target: &CodeUnit) -> Option<String> {
-    if is_module_field(target) {
+    if is_go_module_field(target) {
         return None;
     }
     let short = target.short_name();
@@ -1958,15 +1932,6 @@ fn owner_name(target: &CodeUnit) -> Option<String> {
         .rsplit_once('.') // fqname-M4: package-less short_name owner; fq.parent() would render the package-qualified owner
         .map(|(owner, _)| owner.to_string())
         .filter(|owner| !owner.is_empty())
-}
-
-fn is_module_field(target: &CodeUnit) -> bool {
-    target.is_field()
-        && target
-            .short_name()
-            .split('.') // fqname-M4: first-segment sentinel check on the package-less short_name; no shared accessor exposes a raw first-segment text without routing through the client-selector normalizer (which strips generic/receiver decoration not applicable to this already-canonical internal string)
-            .next()
-            .is_some_and(|segment| segment == GO_MODULE_SCOPE_SEGMENT)
 }
 
 pub fn go_indexed_member_candidates_at_nearest_depth<T: Clone>(
@@ -2233,6 +2198,39 @@ pub struct TypeRef {
     pub name: Option<String>,
 }
 
+/// Resolve a type reference through the file package or imports, then normalize
+/// aliases to their underlying workspace type. Both usage scans use this so
+/// local receiver inference sees the same candidates.
+pub(crate) fn resolve_type_candidates(
+    ty: &TypeRef,
+    file_pkg: &str,
+    alias_packages: &HashMap<String, Vec<String>>,
+    dot_packages: &[String],
+    index: &GoEdgeIndex,
+) -> Vec<String> {
+    let Some(name) = ty.name.as_deref() else {
+        return Vec::new();
+    };
+    let mut candidates = Vec::new();
+    match ty.qualifier.as_deref() {
+        None => candidates.extend(
+            std::iter::once(file_pkg)
+                .chain(dot_packages.iter().map(String::as_str))
+                .map(|package| index.resolve_type_alias(&format!("{package}.{name}"))),
+        ),
+        Some(qualifier) => {
+            if let Some(packages) = alias_packages.get(qualifier) {
+                candidates.extend(
+                    packages
+                        .iter()
+                        .map(|package| index.resolve_type_alias(&format!("{package}.{name}"))),
+                );
+            }
+        }
+    }
+    candidates
+}
+
 fn same_go_package(graph: &GoProjectGraph, left: &ProjectFile, right: &ProjectFile) -> bool {
     if left.parent() != right.parent() {
         return false;
@@ -2244,4 +2242,175 @@ fn same_go_package(graph: &GoProjectGraph, left: &ProjectFile, right: &ProjectFi
         return false;
     };
     left_package == right_package
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{build_parent_dir_index, import_bindings_from_imports, resolve_go_module};
+    use crate::packages::{GoWorkspacePathIndex, source_inventory_role};
+    use brokk_bifrost_core::analyzer::model::{
+        ImportInfo, StructuredImportPath, StructuredImportPathKind,
+    };
+    use brokk_bifrost_core::analyzer::project::{Project, TestProject};
+    use brokk_bifrost_core::analyzer::{Language, ProjectFile};
+    use brokk_bifrost_core::path_utils::rel_path_string;
+    use brokk_bifrost_test_macros::hardwon;
+    use std::collections::BTreeMap;
+
+    #[test]
+    #[hardwon("#4474: Go imports admitted external-test siblings as ordinary packages")]
+    fn go_import_bindings_exclude_external_test_provider_but_keep_ordinary_suffix_test_package() {
+        let repo = tempfile::tempdir().unwrap();
+        let root = repo.path().canonicalize().unwrap();
+        let files = [
+            ("go.mod", "module github.com/gohugoio/hugo\n"),
+            (
+                "consumer.go",
+                "package main\n\nimport (\n\ttemplate \"github.com/gohugoio/hugo/tpl/internal/go_templates/texttemplate\"\n\t\"github.com/gohugoio/hugo/tpl/internal/go_templates/ordinarysuffix\"\n)\n",
+            ),
+            (
+                "tpl/internal/go_templates/texttemplate/template.go",
+                "package template\n\nvar FuncMap int\n",
+            ),
+            (
+                "tpl/internal/go_templates/texttemplate/template_test.go",
+                "package template_test\n\nvar ExternalTestOnly int\n",
+            ),
+            (
+                "tpl/internal/go_templates/ordinarysuffix/ordinary.go",
+                "package ordinary_test\n\nvar OrdinaryPackage int\n",
+            ),
+        ];
+        for (path, source) in files {
+            let file = root.join(path);
+            std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+            std::fs::write(file, source).unwrap();
+        }
+
+        let project = TestProject::new(root.clone(), Language::Go);
+        let package_clauses = |file: &ProjectFile| match rel_path_string(file).as_str() {
+            "consumer.go" => Some("main".to_owned()),
+            "tpl/internal/go_templates/texttemplate/template.go" => Some("template".to_owned()),
+            "tpl/internal/go_templates/texttemplate/template_test.go" => {
+                Some("template_test".to_owned())
+            }
+            "tpl/internal/go_templates/ordinarysuffix/ordinary.go" => {
+                Some("ordinary_test".to_owned())
+            }
+            _ => None,
+        };
+        let workspace_paths = GoWorkspacePathIndex::build(&project, &package_clauses);
+        let all_files = project.all_files().unwrap();
+        let consumer = ProjectFile::new(root.clone(), "consumer.go");
+        let dir_index = build_parent_dir_index(all_files.iter());
+        let imports = vec![
+            import_info(
+                "github.com/gohugoio/hugo/tpl/internal/go_templates/texttemplate",
+                Some("template"),
+            ),
+            import_info(
+                "github.com/gohugoio/hugo/tpl/internal/go_templates/ordinarysuffix",
+                None,
+            ),
+        ];
+        let package_clause = |file: &ProjectFile| package_clauses(file);
+
+        let hugo_targets = resolve_go_module(
+            &consumer,
+            "github.com/gohugoio/hugo/tpl/internal/go_templates/texttemplate",
+            &dir_index,
+            &workspace_paths,
+        );
+        let mut hugo_canonical_counts = BTreeMap::new();
+        for target in &hugo_targets {
+            let clause = package_clause(target).unwrap();
+            let canonical = workspace_paths.canonical_package_name(target, &clause);
+            *hugo_canonical_counts
+                .entry((source_inventory_role(target, &clause), canonical))
+                .or_insert(0usize) += 1;
+        }
+        assert_eq!(
+            hugo_canonical_counts,
+            BTreeMap::from([
+                (
+                    (
+                        "go",
+                        "github.com/gohugoio/hugo/tpl/internal/go_templates/texttemplate"
+                            .to_owned(),
+                    ),
+                    1,
+                ),
+                (
+                    (
+                        "xtest",
+                        "github.com/gohugoio/hugo/tpl/internal/go_templates/texttemplate_test"
+                            .to_owned(),
+                    ),
+                    1,
+                ),
+            ])
+        );
+
+        let hugo_alias_targets: Vec<_> = hugo_targets
+            .iter()
+            .map(|target| {
+                let clause = package_clause(target).unwrap();
+                workspace_paths.canonical_package_name(target, &clause)
+            })
+            .collect();
+        assert_eq!(
+            hugo_alias_targets,
+            vec![
+                "github.com/gohugoio/hugo/tpl/internal/go_templates/texttemplate".to_owned(),
+                "github.com/gohugoio/hugo/tpl/internal/go_templates/texttemplate_test".to_owned(),
+            ]
+        );
+
+        let bindings = import_bindings_from_imports(
+            &consumer,
+            &imports,
+            &dir_index,
+            &workspace_paths,
+            package_clause,
+            |_| None,
+        );
+        assert_eq!(
+            bindings.workspace.get("template"),
+            Some(&vec![
+                "github.com/gohugoio/hugo/tpl/internal/go_templates/texttemplate".to_owned()
+            ])
+        );
+        assert!(!bindings.workspace.contains_key("template_test"));
+        assert_eq!(
+            bindings.workspace.get("ordinary_test"),
+            Some(&vec![
+                "github.com/gohugoio/hugo/tpl/internal/go_templates/ordinarysuffix".to_owned()
+            ])
+        );
+    }
+
+    fn import_info(path: &str, alias: Option<&str>) -> ImportInfo {
+        let identifier = alias
+            .or_else(|| path.rsplit('/').next())
+            .unwrap()
+            .to_owned();
+        ImportInfo {
+            raw_snippet: match alias {
+                Some(alias) => format!("import {alias} \"{path}\""),
+                None => format!("import \"{path}\""),
+            },
+            is_wildcard: false,
+            is_global: false,
+            identifier: Some(identifier),
+            alias: alias.map(str::to_owned),
+            path: Some(StructuredImportPath {
+                segments: path.split('/').map(str::to_owned).collect(),
+                kind: Some(StructuredImportPathKind::Namespace),
+                lexical_prefixes: Vec::new(),
+                lexical_scopes: Vec::new(),
+                declaration_start_byte: 0,
+            }),
+            binder_span: None,
+        }
+    }
 }

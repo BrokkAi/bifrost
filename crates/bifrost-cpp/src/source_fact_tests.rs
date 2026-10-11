@@ -1,16 +1,164 @@
 use crate::adapter::{parse_cpp_file, parse_cpp_file_with_readings};
+use crate::declarations::cpp_unclosed_construct_openers;
 use brokk_bifrost_core::analyzer::ProjectFile;
 use brokk_bifrost_core::analyzer::source_facts::SourceOccurrenceProvenance;
+use brokk_bifrost_core::analyzer::statement_facts::StatementFactKind;
 use brokk_bifrost_core::analyzer::structural::kinds::NormalizedKind;
 use brokk_bifrost_core::analyzer::tree_walk::ParentIndex;
-use tree_sitter::{Parser, Tree};
+use tree_sitter::Tree;
 
 fn tree(source: &str) -> Tree {
-    let mut parser = Parser::new();
-    parser
-        .set_language(&tree_sitter_cpp::LANGUAGE.into())
-        .unwrap();
-    parser.parse(source, None).unwrap()
+    crate::diagnostics::parse_cpp_tree(source)
+}
+
+#[test]
+fn expression_facts_capture_structured_cpp_shapes() {
+    let source = r#"
+struct Bits { int signed_value : 3; unsigned value : 2; int : 2; };
+enum class Kind { First, Second = 4, Third };
+struct LargePayload { char bytes[65]; };
+class Interface {
+public:
+  void arrays(int values[4], int (&reference)[4]);
+  const int member_value();
+  int clean_member() const;
+};
+const int free_value();
+void inspect(int values[4]) { sizeof(values); }
+void run(LargePayload payload) {
+  for (int i = 0; i < 2; ++i) {
+    for (int j = 0; j < 2; ++j) { sizeof(++i); }
+  }
+}
+"#;
+    let file = ProjectFile::new(std::env::temp_dir(), "expression_facts.cpp");
+    let parsed = parse_cpp_file(&file, source, &tree(source));
+    let facts = parsed.source_facts.as_ref().unwrap().cpp.as_ref().unwrap();
+    assert!(
+        facts
+            .expressions
+            .iter()
+            .any(|fact| fact.kind.label() == "bit_field" && fact.bit_field_width == Some(3))
+    );
+    assert!(facts.expressions.iter().any(|fact| {
+        fact.kind.label() == "bit_field" && fact.bit_field_anonymous == Some(true)
+    }));
+    assert!(facts.expressions.iter().any(|fact| {
+        fact.kind.label() == "enumerator"
+            && fact.enum_value == Some(4)
+            && fact.enum_has_implicit_before_nonreference == Some(true)
+    }));
+    assert!(
+        facts
+            .expressions
+            .iter()
+            .any(|fact| { fact.kind.label() == "array_parameter" && fact.array_extent == Some(4) })
+    );
+    assert!(facts.expressions.iter().any(|fact| {
+        fact.kind.label() == "sizeof_expression"
+            && fact.sizeof_has_side_effect == Some(true)
+            && fact.sizeof_operand_is_parameter == Some(false)
+    }));
+    assert!(facts.expressions.iter().any(|fact| {
+        fact.kind.label() == "sizeof_expression" && fact.sizeof_operand_is_parameter == Some(true)
+    }));
+    assert!(facts.expressions.iter().any(|fact| {
+        fact.kind.label() == "loop_variable"
+            && fact.name.as_deref() == Some("j")
+            && fact.loop_has_short_ancestor == Some(true)
+    }));
+    assert!(facts.expressions.iter().any(|fact| {
+        fact.kind.label() == "function_parameter"
+            && fact.name.as_deref() == Some("payload")
+            && fact.type_size_bytes == Some(65)
+            && fact.type_size_exact == Some(true)
+    }));
+    assert!(facts.expressions.iter().any(|fact| {
+        fact.kind.label() == "function_signature"
+            && fact.name.as_deref() == Some("member_value")
+            && fact.member_function == Some(true)
+            && fact.return_top_level_const == Some(true)
+            && fact.member_function_const == Some(false)
+    }));
+    assert!(facts.expressions.iter().any(|fact| {
+        fact.kind.label() == "array_parameter"
+            && fact.name.as_deref() == Some("values")
+            && fact.member_function == Some(true)
+            && fact.array_is_reference == Some(false)
+    }));
+}
+
+#[test]
+fn captures_cpp_statement_rows_from_structured_nodes() {
+    let source = r#"
+enum Color { Red, Green, Blue };
+int run(bool a, bool b, bool c, bool d, bool e, bool f, bool g, bool h, bool i, bool j, bool k, bool l) {
+  label:
+  if (a && b || c && d || e && f || g && h || i && j || k && l) {}
+  for (int i = 0; i < 10; ++i) {
+    for (i = 0; i < 10; ++i) {}
+  }
+  switch (Red) {
+    case Red: break;
+    case Green: break;
+  }
+  goto label;
+}
+"#;
+    let rows = crate::source_facts::parse_statement_fact_rows(source);
+    assert!(rows.valid());
+    assert!(
+        rows.conditions
+            .iter()
+            .any(|fact| fact.logical_operator_count > 5)
+    );
+    assert!(
+        rows.loops
+            .iter()
+            .filter_map(|fact| fact.variable.as_deref())
+            .any(|name| name == "i")
+    );
+    assert!(rows.switches.iter().any(|fact| fact.missing_enum_case));
+    assert_eq!(rows.switch_cases.len(), 2);
+    assert_eq!(rows.enums.len(), 1);
+    assert_eq!(rows.enumerators.len(), 3);
+    assert_eq!(rows.labels.len(), 1);
+    assert_eq!(rows.gotos.len(), 1);
+    assert!(!rows.gotos[0].forward);
+    assert!(
+        rows.statements
+            .iter()
+            .any(|fact| fact.kind == StatementFactKind::ComplexCondition)
+    );
+    assert!(
+        rows.statements
+            .iter()
+            .any(|fact| fact.kind == StatementFactKind::MissingCaseInSwitch)
+    );
+}
+
+#[test]
+fn alloca_rows_exclude_tightly_bounded_and_outside_calls() {
+    let source = r#"
+void *alloca(unsigned long);
+void probe() {
+  for (int i = 0; i < 10; ++i) {
+    alloca(16);
+  }
+  for (int i = 0; i < 1; ++i) {
+    alloca(16);
+  }
+  alloca(16);
+}
+"#;
+    let rows = crate::source_facts::parse_statement_fact_rows(source);
+    let alloca_rows: Vec<_> = rows
+        .statements
+        .iter()
+        .filter(|fact| fact.kind == StatementFactKind::AllocaInLoop)
+        .collect();
+    assert_eq!(alloca_rows.len(), 1);
+    assert_eq!(alloca_rows[0].range.start_line, 5);
 }
 
 #[test]
@@ -279,6 +427,9 @@ fn canonical_properties_preserve_multiname_fields_aliases_and_cpp_owners() {
 }
 
 #[test]
+#[brokk_bifrost_test_macros::hardwon(
+    "353d8206a88c: C++ override or typedef navigation lost the canonical declaration identity/mount"
+)]
 fn typedef_tag_navigation_preserves_the_definition_mount() {
     let source = "typedef struct internal_tag public_name;\nstruct internal_tag { static void member(); };\n";
     let tree = tree(source);
@@ -318,47 +469,31 @@ fn typedef_tag_navigation_preserves_the_definition_mount() {
 }
 
 #[test]
-fn malformed_exported_class_publishes_structured_recovered_bases() {
-    let source = r#"#define VIEWS_EXPORT
-namespace internal { class NativeWidgetDelegate {}; }
-namespace ui {
-class EventSource {};
-class NativeThemeObserver {};
-class ColorProviderSource {};
-class PropertyHandler {};
-class AXModeObserver {};
-namespace metadata { class MetaDataProvider {}; }
-}
-class FocusTraversable {};
-namespace views {
-class VIEWS_EXPORT Widget : public internal::NativeWidgetDelegate,
-                            public ui::EventSource,
-                            public FocusTraversable,
-                            public ui::NativeThemeObserver,
-                            public ui::ColorProviderSource,
-                            public ui::PropertyHandler,
-                            public ui::AXModeObserver,
-                            public ui::metadata::MetaDataProvider {
-    ADVANCED_MEMORY_SAFETY_CHECKS();
- public:
-    Widget();
+fn generic_exported_class_publishes_structured_recovered_bases() {
+    let source = r#"
+#define GENERIC_EXPORT
+namespace base { class Primary {}; }
+class Secondary {};
+namespace demo {
+class GENERIC_EXPORT Widget : public base::Primary, public Secondary {
+    UNKNOWN_ATTRIBUTE();
 };
 }
 "#;
-    let file = ProjectFile::new(std::env::temp_dir(), "widget.h");
+    let file = ProjectFile::new(std::env::temp_dir(), "generic_widget.h");
     let parsed = parse_cpp_file(&file, source, &tree(source));
     let widget = parsed
         .declarations()
         .iter()
-        .find(|unit| unit.fq_name() == "views.Widget")
-        .expect("recovered Widget declaration");
+        .find(|unit| unit.fq_name() == "demo.Widget")
+        .expect("recovered generic Widget declaration");
     let facts = parsed.source_facts.as_ref().unwrap();
     let declaration = parsed
         .source_declaration_units
         .iter()
         .find(|(_, unit)| unit == widget)
         .map(|(id, _)| *id)
-        .expect("Widget source bridge");
+        .expect("generic Widget source bridge");
     let bases = facts
         .cpp
         .as_ref()
@@ -366,24 +501,15 @@ class VIEWS_EXPORT Widget : public internal::NativeWidgetDelegate,
         .declarations
         .iter()
         .find(|fact| fact.declaration == declaration)
-        .expect("Widget source fact")
+        .expect("generic Widget source fact")
         .bases
         .iter()
         .map(|base| base.components.clone())
         .collect::<Vec<_>>();
     assert_eq!(
         bases,
-        vec![
-            vec!["internal", "NativeWidgetDelegate"],
-            vec!["ui", "EventSource"],
-            vec!["FocusTraversable"],
-            vec!["ui", "NativeThemeObserver"],
-            vec!["ui", "ColorProviderSource"],
-            vec!["ui", "PropertyHandler"],
-            vec!["ui", "AXModeObserver"],
-            vec!["ui", "metadata", "MetaDataProvider"],
-        ],
-        "recovered Widget bases must remain structured"
+        vec![vec!["base", "Primary"], vec!["Secondary"],],
+        "generic exported base components must remain structured"
     );
 }
 
@@ -435,6 +561,9 @@ PN_CPP_CLASS_EXTERN connection : public internal::object<pn_connection_t>, publi
 }
 
 #[test]
+#[brokk_bifrost_test_macros::hardwon(
+    "353d8206a88c: recovered C++ macro namespace declarations preserve original conditional guards"
+)]
 fn compound_conditional_macro_namespace_declarations_preserve_guards() {
     let source = "namespace absl {\n#if defined(ABSL_USES_STD_SOURCE_LOCATION) && defined(ABSL_HAVE_STD_SOURCE_LOCATION)\nABSL_NAMESPACE_BEGIN\nusing SourceLocation = std::source_location;\nABSL_NAMESPACE_END\n#else\nABSL_NAMESPACE_BEGIN\nclass SourceLocation {};\nABSL_NAMESPACE_END\n#endif\n}\n";
     let tree = tree(source);
@@ -491,6 +620,9 @@ fn compound_conditional_macro_namespace_declarations_preserve_guards() {
 }
 
 #[test]
+#[brokk_bifrost_test_macros::hardwon(
+    "5610741cdb03: C++ override or typedef navigation lost the canonical declaration identity/mount"
+)]
 fn overriding_member_keeps_the_base_callable_identity_qualifiers() {
     let source = "struct Base { virtual void run(int value) const; }; struct Derived : Base { void run(int value) const override final {} };";
     let file = ProjectFile::new(std::env::temp_dir(), "override.hpp");
@@ -556,6 +688,9 @@ struct Templated : ::outer::Generic<int> {};
 }
 
 #[test]
+#[brokk_bifrost_test_macros::hardwon(
+    "c7baf85ab85c: displaced macro return type preserves unmatched namespace brace evidence"
+)]
 fn displaced_macro_return_type_retains_unmatched_namespace_brace_evidence() {
     let source = "#define FMT_API\nFMT_API void vformat_to(int& out);\n}\nvoid run() {}\n";
     let tree = tree(source);
@@ -685,6 +820,9 @@ fn macro_parameter_expansion_uses_canonical_declaration_type_spelling() {
 }
 
 #[test]
+#[brokk_bifrost_test_macros::hardwon(
+    "#3501: recovered macro-exported C++ aliases retain their structured target"
+)]
 fn macro_exported_class_alias_retains_structured_target() {
     let source = r#"#pragma once
 #include "callback.h"
@@ -722,4 +860,151 @@ class DEVICE_BLUETOOTH_EXPORT BluetoothGattCharacteristicClient {
             "{unit:?}: {fact:?}"
         );
     }
+}
+
+/// One header of the SQLite amalgamation's shape: an include guard around an
+/// `extern "C"` block that `#if 0` opens and a second `#if 0` closes.
+fn amalgamated_header(guard: &str, aggregate: &str) -> String {
+    format!(
+        "#ifndef {guard}\n#define {guard}\n#if 0\nextern \"C\" {{\n#endif\n\
+         struct {aggregate} {{ int value; }};\n\
+         #if 0\n}}  /* End of the 'extern \"C\"' block */\n#endif\n#endif\n"
+    )
+}
+
+/// #3501: the 0.23.5 grammar left conditional `extern "C"` headers in
+/// tree-sitter's whole-file ERROR root over the constructs still open at the
+/// end of input. The 0.24.0 grammar recognizes those header pairs as linkage
+/// nodes, so keep that former witness as a clean positive and use an actually
+/// unclosed construct to retain the recovery contract below.
+#[test]
+#[brokk_bifrost_test_macros::hardwon(
+    "#3501: C grammar failure on large files dropped declarations inside constructs left open by recovery"
+)]
+fn declarations_inside_constructs_left_open_are_recorded_as_recovered() {
+    use brokk_bifrost_core::analyzer::model::ParseCompleteness;
+    use brokk_bifrost_core::analyzer::structural::materialization::MaterializationRecord;
+
+    fn recovered(
+        parsed: &brokk_bifrost_core::analyzer::parsed_file::ParsedFile,
+    ) -> Vec<(String, usize, usize)> {
+        let mut recovered: Vec<_> = parsed
+            .materialization_records
+            .iter()
+            .filter_map(|record| match record {
+                MaterializationRecord::RecoveredDeclaration { recovery, unit } => {
+                    Some((unit.fq_name(), recovery.start_byte, recovery.end_byte))
+                }
+                _ => None,
+            })
+            .collect();
+        recovered.sort();
+        recovered
+    }
+
+    let open = "int sqlite3_open(void) { return 0; }\n";
+    let file = ProjectFile::new(std::env::temp_dir(), "sqlite3.c");
+    let repaired = format!(
+        "#include <stdarg.h>\n{}{open}",
+        amalgamated_header("SQLITE3_H", "sqlite3_file")
+    );
+    let repaired_tree = tree(&repaired);
+    assert_eq!(repaired_tree.root_node().kind(), "translation_unit");
+    assert!(cpp_unclosed_construct_openers(repaired_tree.root_node()).is_empty());
+    let repaired_parsed = parse_cpp_file(&file, &repaired, &repaired_tree);
+    assert_eq!(recovered(&repaired_parsed), Vec::new());
+    assert_eq!(repaired_parsed.completeness, ParseCompleteness::Complete);
+
+    let source = format!(
+        "#include <stdarg.h>\n{}{}{open}",
+        amalgamated_header("SQLITE3_H", "sqlite3_file"),
+        amalgamated_header("_SQLITE3RTREE_H_", "sqlite3_rtree_geometry")
+    );
+    let clean_tree = tree(&source);
+    let clean_root = clean_tree.root_node();
+    assert_eq!(
+        clean_root.kind(),
+        "translation_unit",
+        "{}",
+        clean_root.to_sexp()
+    );
+    assert!(!clean_root.has_error(), "{}", clean_root.to_sexp());
+    assert_eq!(clean_root.byte_range(), 0..source.len());
+    assert!(cpp_unclosed_construct_openers(clean_root).is_empty());
+    let clean_parsed = parse_cpp_file(&file, &source, &clean_tree);
+    let mut names: Vec<_> = clean_parsed
+        .declarations()
+        .iter()
+        .map(|unit| unit.fq_name())
+        .collect();
+    names.sort();
+    assert_eq!(
+        names,
+        [
+            "SQLITE3_H",
+            "_SQLITE3RTREE_H_",
+            "sqlite3_file",
+            "sqlite3_file.value",
+            "sqlite3_open",
+            "sqlite3_rtree_geometry",
+            "sqlite3_rtree_geometry.value",
+        ],
+        "the repaired linkage nodes keep every declaration it reads"
+    );
+    assert_eq!(recovered(&clean_parsed), Vec::new());
+    assert_eq!(clean_parsed.completeness, ParseCompleteness::Complete);
+
+    // Thirty-two unmatched braces are intentional: with fewer, tree-sitter's
+    // EOF recovery synthesizes closes and keeps a translation_unit root rather
+    // than producing the whole-root ERROR required by this contract.
+    let unmatched_openers = 32;
+    let malformed = format!("{}\n{}", "{".repeat(unmatched_openers), source);
+    let malformed_tree = tree(&malformed);
+    let malformed_root = malformed_tree.root_node();
+    assert_eq!(
+        malformed_root.kind(),
+        "ERROR",
+        "{}",
+        malformed_root.to_sexp()
+    );
+    assert_eq!(malformed_root.byte_range(), 0..malformed.len());
+    let malformed_parsed = parse_cpp_file(&file, &malformed, &malformed_tree);
+    let mut malformed_names: Vec<_> = malformed_parsed
+        .declarations()
+        .iter()
+        .map(|unit| unit.fq_name())
+        .collect();
+    malformed_names.sort();
+    assert_eq!(
+        malformed_names, names,
+        "recovery keeps every declaration it reads"
+    );
+    assert_eq!(malformed_parsed.completeness, ParseCompleteness::Partial);
+    // The first unmatched brace is at byte 0, and every declaration follows
+    // it inside the root's recovered interval.
+    assert_eq!(
+        recovered(&malformed_parsed),
+        names
+            .iter()
+            .map(|name| (name.clone(), 0, malformed.len()))
+            .collect::<Vec<_>>()
+    );
+    let openers: Vec<_> = cpp_unclosed_construct_openers(malformed_root)
+        .iter()
+        .map(|opener| (opener.kind(), opener.start_byte()))
+        .collect();
+    assert_eq!(
+        openers,
+        (0..unmatched_openers)
+            .map(|byte| ("{", byte))
+            .chain([
+                ("#ifndef", 53),
+                ("#if", 89),
+                ("{", 106),
+                ("#ifndef", 210),
+                ("#if", 260),
+                ("{", 277),
+            ])
+            .collect::<Vec<_>>()
+    );
 }

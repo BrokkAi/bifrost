@@ -8,6 +8,9 @@
 use super::java_artifact::{
     JavaClassSurfaceOutcome, class_surface, class_surface_facts, zip_directory_status_with_limits,
 };
+use super::{
+    equivalent_java_type_identity, failed_with_diagnostics, restrict_visibility, valid_module_name,
+};
 use crate::CancellationToken;
 use crate::analyzer::install_on_dedicated_build_pool;
 use crate::analyzer::semantic_model::{
@@ -26,6 +29,7 @@ const MAX_JMOD_ARCHIVE_ENTRIES: usize = 10_000;
 const MAX_JMOD_CLASS_ENTRY_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_JMOD_TOTAL_CLASS_BYTES: u64 = 128 * 1024 * 1024;
 const MAX_JMOD_CENTRAL_DIRECTORY_BYTES: u64 = 32 * 1024 * 1024;
+const MODULE_INFO_ENTRY: &str = "classes/module-info.class";
 
 #[derive(Debug, Clone, Copy, Default)]
 pub(crate) struct JdkJmodSetPackProducer;
@@ -46,15 +50,9 @@ impl ExternalArtifactPackProducer for JdkJmodSetPackProducer {
         cancellation: Option<&CancellationToken>,
     ) -> ArtifactProduction {
         if cancellation.is_some_and(CancellationToken::is_cancelled) {
-            return ArtifactProduction::failed(
-                ProducerDiagnostic {
-                    severity: ProducerDiagnosticSeverity::Error,
-                    source_entry: None,
-                    code: "artifact.cancelled".to_owned(),
-                    location: None,
-                    declaration: None,
-                    message: "JDK JMOD production was cancelled".to_owned(),
-                },
+            return crate::analyzer::semantic_model::failed_artifact_production(
+                "artifact.cancelled",
+                "JDK JMOD production was cancelled",
                 limits,
             );
         }
@@ -124,7 +122,13 @@ impl JdkJmodSetPackProducer {
         // and that case falls back to the single pass below.
         let loaded = match self.load_jmod_modules(artifact, limits, cancellation) {
             Some(loaded) => loaded,
-            None => return cancelled_production(limits),
+            None => {
+                return crate::analyzer::semantic_model::failed_artifact_production(
+                    "artifact.cancelled",
+                    "JDK JMOD production was cancelled",
+                    limits,
+                );
+            }
         };
         if loaded_demands_shared_budget(&loaded, limits) {
             return self.produce_single_pass(request, limits, cancellation, artifact);
@@ -179,11 +183,19 @@ impl JdkJmodSetPackProducer {
         let mut loaded = Vec::with_capacity(artifact.source_entries().len());
         for source_entry in artifact.source_entries() {
             if cancellation.is_some_and(CancellationToken::is_cancelled) {
-                return cancelled_production(limits);
+                return crate::analyzer::semantic_model::failed_artifact_production(
+                    "artifact.cancelled",
+                    "JDK JMOD production was cancelled",
+                    limits,
+                );
             }
             let Some(entry) = load_jmod_entry(source_entry, limits, cancellation, &mut budget)
             else {
-                return cancelled_production(limits);
+                return crate::analyzer::semantic_model::failed_artifact_production(
+                    "artifact.cancelled",
+                    "JDK JMOD production was cancelled",
+                    limits,
+                );
             };
             loaded.push(entry);
         }
@@ -292,6 +304,7 @@ impl JdkJmodSetPackProducer {
                 collection_flows: None,
                 deferred_yields: None,
                 conditional_type_refinements: None,
+                callable_values: None,
             });
         }
 
@@ -486,23 +499,10 @@ fn load_jmod_entry(
             format!("producer inspected at most {MAX_JMOD_ARCHIVE_ENTRIES} JMOD archive entries"),
         );
     }
-    let mut total_class_bytes = 0u64;
-    let mut class_entries = Vec::new();
-    let mut module_info = None;
-    for index in 0..entry_limit {
-        if cancellation.is_some_and(CancellationToken::is_cancelled) {
-            return None;
-        }
-        let Ok(mut entry) = archive.by_index(index) else {
-            diagnostics.warning(
-                "jdk.jmod.entry",
-                Some(relative_path.to_owned()),
-                format!("could not read JMOD entry at index {index}"),
-            );
-            continue;
-        };
-        let entry_name = entry.name().to_owned();
-        if entry_name == "classes/module-info.class" {
+    // The module descriptor decides which packages reach the pack, so it is
+    // read before any class entry.
+    let module_info = match archive.by_name(MODULE_INFO_ENTRY) {
+        Ok(mut entry) => {
             let mut bytes = Vec::new();
             if entry
                 .by_ref()
@@ -513,17 +513,59 @@ fn load_jmod_entry(
             {
                 diagnostics.error(
                     "jdk.jmod.module_info",
-                    Some(format!("{relative_path}:{entry_name}")),
+                    Some(format!("{relative_path}:{MODULE_INFO_ENTRY}")),
                     "could not read bounded module-info.class bytes",
                 );
+                None
             } else {
-                module_info = Some(bytes);
+                Some(bytes)
             }
+        }
+        Err(_) => None,
+    };
+    let Some(exported_packages) = module_info
+        .as_deref()
+        .and_then(|bytes| parse_module_exports(bytes).ok())
+    else {
+        diagnostics.error(
+            "jdk.jmod.module_info",
+            Some(relative_path.to_owned()),
+            "JDK JMOD is missing a structurally valid module-info.class descriptor",
+        );
+        return Some(loaded_without_surfaces(
+            Some(module),
+            diagnostics,
+            records_before,
+            budget,
+        ));
+    };
+    let mut total_class_bytes = 0u64;
+    let mut class_entries = Vec::new();
+    for index in 0..entry_limit {
+        if cancellation.is_some_and(CancellationToken::is_cancelled) {
+            return None;
+        }
+        let entry_name = archive
+            .name_for_index(index)
+            .expect("an index below the archive length names an entry");
+        let Some(class_entry) = jmod_class_entry(entry_name, &mut diagnostics, relative_path)
+        else {
+            continue;
+        };
+        // A class outside every unqualified export never reaches the pack, so
+        // it is not read: what it would cost, and anything its bytes would
+        // report, belongs to no published declaration.
+        if !exported_packages.contains(&class_entry.package) {
             continue;
         }
-        let class_entry = match jmod_class_entry(&entry_name, &mut diagnostics, relative_path) {
-            Some(entry) => entry,
-            None => continue,
+        let class_entry = class_entry.name;
+        let Ok(mut entry) = archive.by_index(index) else {
+            diagnostics.warning(
+                "jdk.jmod.entry",
+                Some(relative_path.to_owned()),
+                format!("could not read JMOD entry at index {index}"),
+            );
+            continue;
         };
         let next_total = total_class_bytes.saturating_add(entry.size());
         if entry.size() > MAX_JMOD_CLASS_ENTRY_BYTES || next_total > MAX_JMOD_TOTAL_CLASS_BYTES {
@@ -553,28 +595,8 @@ fn load_jmod_entry(
         class_entries.push((class_entry, class_bytes));
     }
     class_entries.sort_unstable_by(|left, right| left.0.cmp(&right.0));
-    let exported_packages = match module_info
-        .as_deref()
-        .and_then(|bytes| parse_module_exports(bytes).ok())
-    {
-        Some(packages) => packages,
-        None => {
-            diagnostics.error(
-                "jdk.jmod.module_info",
-                Some(relative_path.to_owned()),
-                "JDK JMOD is missing a structurally valid module-info.class descriptor",
-            );
-            return Some(loaded_without_surfaces(
-                Some(module),
-                diagnostics,
-                records_before,
-                budget,
-            ));
-        }
-    };
     // The surfaces are parsed here but their facts are handed to the caller,
     // which inserts them in source-entry order.
-    let read_diagnostics = diagnostics.take_retained();
     let mut surfaces = Vec::new();
     let mut parsed = Vec::new();
     for (class_entry, class_bytes) in class_entries {
@@ -600,6 +622,10 @@ fn load_jmod_entry(
         };
         parsed.push(surface);
     }
+    // Parsing reports before any surface is retained, and a module can retain
+    // none, so what it reported travels with the read rather than with the
+    // first retained surface.
+    let read_diagnostics = diagnostics.take_retained();
     let visibility_by_name = parsed
         .iter()
         .map(|surface| (surface.name.clone(), surface.visibility))
@@ -635,15 +661,6 @@ fn load_jmod_entry(
         records_used: records_before - budget.remaining,
         record_limit_hit: budget.exhausted,
     })
-}
-
-fn restrict_visibility(declared: Visibility, enclosing: Visibility) -> Visibility {
-    match (declared, enclosing) {
-        (Visibility::Private, _) | (_, Visibility::Private) => Visibility::Private,
-        (Visibility::Package, _) | (_, Visibility::Package) => Visibility::Package,
-        (Visibility::Protected, _) | (_, Visibility::Protected) => Visibility::Protected,
-        _ => Visibility::Public,
-    }
 }
 
 #[derive(Clone, Copy)]
@@ -754,19 +771,24 @@ fn parse_module_exports(bytes: &[u8]) -> Result<HashSet<String>, ()> {
         module.u16()?;
         module.u16()?;
         module.u16()?;
+        // `requires`: module, flags, version.
         skip_table(&mut module, 6)?;
         let export_count = module.u16()? as usize;
         let mut packages = HashSet::default();
         for _ in 0..export_count {
-            let package = package_constant(&constants, module.u16()?)?;
-            module.u16()?;
-            let targets = module.u16()? as usize;
-            module.skip(targets.checked_mul(2).ok_or(())?)?;
+            let (package, targets) = package_directive(&mut module)?;
+            let package = package_constant(&constants, package)?;
             if targets == 0 {
                 packages.insert(package.replace('/', "."));
             }
         }
-        skip_table(&mut module, 6)?;
+        // An `opens` entry carries a target module list exactly as an
+        // `exports` entry does. `java.desktop` opens `javax.swing.plaf.basic`
+        // to `jdk.jconsole`, so a fixed width misaligns every later field.
+        let open_count = module.u16()? as usize;
+        for _ in 0..open_count {
+            package_directive(&mut module)?;
+        }
         let uses = module.u16()? as usize;
         module.skip(uses.checked_mul(2).ok_or(())?)?;
         let provides = module.u16()? as usize;
@@ -781,6 +803,17 @@ fn parse_module_exports(bytes: &[u8]) -> Result<HashSet<String>, ()> {
         exports = Some(packages);
     }
     exports.ok_or(())
+}
+
+/// Read one `exports` or `opens` entry of a `Module` attribute: the package's
+/// constant index, its flags, and the modules it is qualified to. Returns the
+/// package index and how many target modules the entry names.
+fn package_directive(module: &mut ClassReader<'_>) -> Result<(u16, usize), ()> {
+    let package = module.u16()?;
+    module.u16()?;
+    let targets = module.u16()? as usize;
+    module.skip(targets.checked_mul(2).ok_or(())?)?;
+    Ok((package, targets))
 }
 
 fn skip_table(reader: &mut ClassReader<'_>, width: usize) -> Result<(), ()> {
@@ -859,14 +892,8 @@ impl ModuleFacts {
 }
 
 fn equivalent_type_fact(left: &TypeFact, right: &TypeFact) -> bool {
-    left.id == right.id
-        && left.name == right.name
-        && left.type_kind == right.type_kind
-        && left.visibility == right.visibility
-        && left.is_abstract == right.is_abstract
-        && left.is_sealed == right.is_sealed
+    equivalent_java_type_identity(left, right)
         && left.has_explicit_type_terms == right.has_explicit_type_terms
-        && left.type_parameters == right.type_parameters
         && left.type_parameter_constraints == right.type_parameter_constraints
         && left.underlying_type == right.underlying_type
         && left.embedded_types == right.embedded_types
@@ -930,11 +957,25 @@ fn jmod_module_name(
     None
 }
 
+/// A class file in a JMOD's `classes/` section, and the package its path
+/// places it in, spelled with dots as the module descriptor's exports are.
+struct JmodClassEntry {
+    name: String,
+    package: String,
+}
+
+/// Classify one JMOD archive entry.
+///
+/// Only class files under `classes/` declare anything. The same section also
+/// carries the module's resources (`java/util/currency.data`,
+/// `META-INF/services/...`, `.properties` bundles, icons): a JDK 25 has 800 of
+/// them, and they are skipped without a diagnostic. A `classes/` path that is
+/// not well formed is still reported, whatever it names.
 fn jmod_class_entry(
     entry_name: &str,
     diagnostics: &mut BoundedProducerDiagnostics,
     relative_path: &str,
-) -> Option<String> {
+) -> Option<JmodClassEntry> {
     if !entry_name.starts_with("classes/") {
         if entry_name.starts_with("classes\\") {
             diagnostics.error(
@@ -946,100 +987,110 @@ fn jmod_class_entry(
         return None;
     }
     let components = entry_name.split('/').collect::<Vec<_>>();
-    if components.len() < 2
-        || components
-            .iter()
-            .any(|component| component.is_empty() || *component == "." || *component == "..")
-        || !components
-            .last()
-            .is_some_and(|name| name.ends_with(".class"))
+    if components
+        .iter()
+        .any(|component| component.is_empty() || *component == "." || *component == "..")
     {
         diagnostics.error(
             "jdk.jmod.path",
             Some(format!("{relative_path}:{entry_name}")),
-            "JDK JMOD class entries must be relative classes/**/*.class paths",
+            "JDK JMOD class-section entries must be relative classes/** paths",
         );
         return None;
     }
-    if components
-        .last()
-        .is_some_and(|name| *name == "module-info.class")
-    {
+    let (file_name, package) = components[1..]
+        .split_last()
+        .expect("a classes/ path names an entry below the section");
+    if !file_name.ends_with(".class") || *file_name == "module-info.class" {
         return None;
     }
-    Some(entry_name.to_owned())
+    Some(JmodClassEntry {
+        name: entry_name.to_owned(),
+        package: package.join("."),
+    })
 }
 
-fn valid_module_name(name: &str) -> bool {
-    let mut segment_start = true;
-    for character in name.chars() {
-        if character == '.' {
-            if segment_start {
-                return false;
-            }
-            segment_start = true;
-        } else if segment_start {
-            if character != '_' && !character.is_ascii_alphabetic() {
-                return false;
-            }
-            segment_start = false;
-        } else if character != '_' && !character.is_ascii_alphanumeric() {
-            return false;
-        }
+/// The bytes of a `module-info.class` that exports each of `exports`
+/// unqualified and opens each `(package, module)` of `opens` to that one
+/// module. Packages use the internal `/` spelling the class file holds.
+#[cfg(any(test, feature = "test-support"))]
+pub fn test_module_info_class_bytes(exports: &[&str], opens: &[(&str, &str)]) -> Vec<u8> {
+    const CLASS: u8 = 7;
+    const MODULE: u8 = 19;
+    const PACKAGE: u8 = 20;
+    /// Append a `CONSTANT_Utf8` and return its pool index.
+    fn utf8(pool: &mut Vec<u8>, next_index: &mut u16, text: &str) -> u16 {
+        pool.push(1);
+        pool.extend((text.len() as u16).to_be_bytes());
+        pool.extend(text.as_bytes());
+        *next_index += 1;
+        *next_index - 1
     }
-    !segment_start
-}
+    /// Append a constant of `tag` that names `name`, and return its index.
+    fn named(pool: &mut Vec<u8>, next_index: &mut u16, tag: u8, name: &str) -> u16 {
+        let name = utf8(pool, next_index, name);
+        pool.push(tag);
+        pool.extend(name.to_be_bytes());
+        *next_index += 1;
+        *next_index - 1
+    }
+    let mut pool = Vec::new();
+    let mut next_index = 1u16;
+    let this_class = named(&mut pool, &mut next_index, CLASS, "module-info");
+    let module = named(&mut pool, &mut next_index, MODULE, "java.base");
+    let module_attribute = utf8(&mut pool, &mut next_index, "Module");
+    let exports = exports
+        .iter()
+        .map(|package| named(&mut pool, &mut next_index, PACKAGE, package))
+        .collect::<Vec<_>>();
+    let opens = opens
+        .iter()
+        .map(|(package, target)| {
+            (
+                named(&mut pool, &mut next_index, PACKAGE, package),
+                named(&mut pool, &mut next_index, MODULE, target),
+            )
+        })
+        .collect::<Vec<_>>();
 
-#[cfg(test)]
-pub(crate) fn test_module_info_class_bytes(exports: &[&str]) -> Vec<u8> {
-    let constant_count = 6 + exports.len() * 2;
-    let mut bytes = Vec::new();
     let put_u16 = |bytes: &mut Vec<u8>, value: u16| bytes.extend(value.to_be_bytes());
+    let mut attribute = Vec::new();
+    put_u16(&mut attribute, module);
+    put_u16(&mut attribute, 0);
+    put_u16(&mut attribute, 0);
+    put_u16(&mut attribute, 0);
+    put_u16(&mut attribute, exports.len() as u16);
+    for package in exports {
+        put_u16(&mut attribute, package);
+        put_u16(&mut attribute, 0);
+        put_u16(&mut attribute, 0);
+    }
+    put_u16(&mut attribute, opens.len() as u16);
+    for (package, target) in opens {
+        put_u16(&mut attribute, package);
+        put_u16(&mut attribute, 0);
+        put_u16(&mut attribute, 1);
+        put_u16(&mut attribute, target);
+    }
+    put_u16(&mut attribute, 0);
+    put_u16(&mut attribute, 0);
+
+    let mut bytes = Vec::new();
     bytes.extend(0xCAFEBABEu32.to_be_bytes());
     put_u16(&mut bytes, 0);
     put_u16(&mut bytes, 53);
-    put_u16(&mut bytes, constant_count as u16);
-    let utf8 = |bytes: &mut Vec<u8>, text: &str| {
-        bytes.push(1);
-        put_u16(bytes, text.len() as u16);
-        bytes.extend(text.as_bytes());
-    };
-    utf8(&mut bytes, "module-info");
-    bytes.push(7);
-    put_u16(&mut bytes, 1);
-    utf8(&mut bytes, "java.base");
-    bytes.push(19);
-    put_u16(&mut bytes, 3);
-    utf8(&mut bytes, "Module");
-    for (index, package) in exports.iter().enumerate() {
-        utf8(&mut bytes, package);
-        bytes.push(20);
-        put_u16(&mut bytes, (6 + index * 2) as u16);
-    }
-    bytes.extend(0x8000u16.to_be_bytes());
-    put_u16(&mut bytes, 2);
+    put_u16(&mut bytes, next_index);
+    bytes.extend(pool);
+    put_u16(&mut bytes, 0x8000);
+    put_u16(&mut bytes, this_class);
     put_u16(&mut bytes, 0);
     put_u16(&mut bytes, 0);
     put_u16(&mut bytes, 0);
     put_u16(&mut bytes, 0);
     put_u16(&mut bytes, 1);
-    put_u16(&mut bytes, 5);
-    let attribute_length = 6 + 2 + exports.len() * 6 + 2 + 2 + 2 + 2;
-    bytes.extend((attribute_length as u32).to_be_bytes());
-    put_u16(&mut bytes, 4);
-    put_u16(&mut bytes, 0);
-    put_u16(&mut bytes, 0);
-    put_u16(&mut bytes, 0);
-    put_u16(&mut bytes, exports.len() as u16);
-    for (index, _) in exports.iter().enumerate() {
-        put_u16(&mut bytes, (7 + index * 2) as u16);
-        put_u16(&mut bytes, 0);
-        put_u16(&mut bytes, 0);
-    }
-    put_u16(&mut bytes, 0);
-    put_u16(&mut bytes, 0);
-    put_u16(&mut bytes, 0);
-    put_u16(&mut bytes, 0);
+    put_u16(&mut bytes, module_attribute);
+    bytes.extend((attribute.len() as u32).to_be_bytes());
+    bytes.extend(attribute);
     bytes
 }
 
@@ -1060,42 +1111,11 @@ fn unsupported_direct_production(
     )
 }
 
-fn cancelled_production(limits: &ArtifactProducerLimits) -> ArtifactProduction {
-    ArtifactProduction::failed(
-        ProducerDiagnostic {
-            severity: ProducerDiagnosticSeverity::Error,
-            source_entry: None,
-            code: "artifact.cancelled".to_owned(),
-            location: None,
-            declaration: None,
-            message: "JDK JMOD production was cancelled".to_owned(),
-        },
-        limits,
-    )
-}
-
-fn failed_with_diagnostics(
-    artifact_sha256: &str,
-    diagnostics: BoundedProducerDiagnostics,
-) -> ArtifactProduction {
-    let (diagnostics, suppressed_diagnostics) = diagnostics.finish();
-    ArtifactProduction {
-        artifact_sha256: Some(artifact_sha256.to_owned()),
-        pack: None,
-        completeness: Completeness::Partial,
-        diagnostics,
-        suppressed_diagnostics,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::analyzer::jvm::external::{TestClassFile, TestClassMethod, test_class_file_bytes};
-    use crate::analyzer::semantic_model::{
-        ActivationSelector, Compatibility, CompilerOptions, NameSelector, Provenance, Safety,
-        VersionConstraint, compile_pack, read_exact_source_set,
-    };
+    use crate::analyzer::semantic_model::{CompilerOptions, compile_pack, read_exact_source_set};
     use std::fs::{self, File};
     use std::io::Write;
     use std::path::{Path, PathBuf};
@@ -1133,7 +1153,7 @@ mod tests {
             &[
                 (
                     "classes/module-info.class",
-                    test_module_info_class_bytes(&["java/lang"]),
+                    test_module_info_class_bytes(&["java/lang"], &[]),
                 ),
                 ("classes/java/lang/Object.class", object),
             ],
@@ -1257,28 +1277,11 @@ mod tests {
         );
     }
 
+    use brokk_bifrost_test_macros::hardwon;
     #[test]
-    fn oversized_jmod_archive_is_rejected_by_the_exact_source_set_bound() {
-        let root = tempfile::tempdir().unwrap();
-        let jmods = root.path().join("jmods");
-        fs::create_dir(&jmods).unwrap();
-        fs::write(jmods.join("java.base.jmod"), vec![0_u8; 128]).unwrap();
-        let limits = ArtifactProducerLimits {
-            max_artifact_bytes: 64,
-            ..ArtifactProducerLimits::default()
-        };
-        let error = read_exact_source_set(
-            root.path(),
-            &[PathBuf::from("jmods/java.base.jmod")],
-            16,
-            8,
-            &limits,
-        )
-        .expect_err("the bounded source-set reader must reject oversized JMOD input");
-        assert_eq!(error.code, "limit.artifact_bytes");
-    }
-
-    #[test]
+    #[hardwon(
+        "#3444: Artifact locator strings must keep ZIP entry separators independent of the host Path separator"
+    )]
     fn jmod_class_paths_use_forward_slashes_across_platforms() {
         let root = tempfile::tempdir().unwrap();
         let jmods = root.path().join("jmods");
@@ -1320,6 +1323,264 @@ mod tests {
         };
         assert_eq!(path, "jmods/java.base.jmod");
         assert_eq!(symbol, "classes/java/lang/Object.class");
+    }
+
+    /// `java.desktop` opens `javax.swing.plaf.basic` to `jdk.jconsole`. An
+    /// `opens` entry lists its target modules exactly as an `exports` entry
+    /// does, and reading it as six fixed bytes misaligned the rest of the
+    /// descriptor, so the whole module was rejected and AWT, Swing, and
+    /// `java.beans` never reached a JDK pack (#3444).
+    #[test]
+    #[hardwon(
+        "#3444: Exercises the module-info classfile `opens ... to` target list through JMOD production and pack compilation"
+    )]
+    fn module_opened_to_a_named_module_keeps_its_exported_declarations() {
+        let root = tempfile::tempdir().unwrap();
+        let jmods = root.path().join("jmods");
+        fs::create_dir(&jmods).unwrap();
+        write_jmod(
+            &jmods.join("java.desktop.jmod"),
+            &[
+                (
+                    "classes/module-info.class",
+                    test_module_info_class_bytes(
+                        &["javax/swing", "javax/swing/plaf/basic"],
+                        &[("javax/swing/plaf/basic", "jdk.jconsole")],
+                    ),
+                ),
+                (
+                    "classes/javax/swing/JFrame.class",
+                    sample_class("javax/swing/JFrame"),
+                ),
+                (
+                    "classes/javax/swing/plaf/basic/BasicLookAndFeel.class",
+                    sample_class("javax/swing/plaf/basic/BasicLookAndFeel"),
+                ),
+            ],
+        );
+        let production = produce(root.path(), &["jmods/java.desktop.jmod"]);
+        assert!(
+            production.diagnostics.is_empty(),
+            "{:?}",
+            production.diagnostics
+        );
+        assert_eq!(production.completeness, Completeness::Complete);
+        let pack = production
+            .pack
+            .expect("the opened module still emits a pack");
+        compile_pack(&pack, &CompilerOptions::default()).unwrap();
+        assert_eq!(
+            type_names(&pack),
+            [
+                "javax.swing.JFrame",
+                "javax.swing.plaf.basic.BasicLookAndFeel"
+            ]
+        );
+    }
+
+    /// A JMOD's `classes/` section carries the module's resources beside its
+    /// class files, 800 of them in a JDK 25. Each was reported as a path
+    /// reject, which made every JDK pack partial and spent the diagnostic
+    /// budget (#3444). A malformed path is still a reject.
+    #[test]
+    #[hardwon(
+        "#3444: Valid JMOD resources beside class entries must be ignored while malformed entry paths still produce the precise rejection"
+    )]
+    fn module_resources_beside_class_files_are_not_rejects() {
+        let root = tempfile::tempdir().unwrap();
+        let jmods = root.path().join("jmods");
+        fs::create_dir(&jmods).unwrap();
+        write_jmod(
+            &jmods.join("java.base.jmod"),
+            &[
+                (
+                    "classes/java/lang/Object.class",
+                    sample_class("java/lang/Object"),
+                ),
+                ("classes/java/util/currency.data", b"currency".to_vec()),
+                (
+                    "classes/META-INF/services/java.nio.file.spi.FileSystemProvider",
+                    b"jdk.nio.zipfs.ZipFileSystemProvider\n".to_vec(),
+                ),
+                (
+                    "classes/sun/util/resources/CalendarData.properties",
+                    b"firstDayOfWeek=1\n".to_vec(),
+                ),
+                ("classes/java/lang/./Object.class", b"malformed".to_vec()),
+            ],
+        );
+        let production = produce(root.path(), &["jmods/java.base.jmod"]);
+        assert_eq!(
+            production
+                .diagnostics
+                .iter()
+                .map(|diagnostic| (diagnostic.code.as_str(), diagnostic.location.as_deref()))
+                .collect::<Vec<_>>(),
+            [(
+                "jdk.jmod.path",
+                Some("jmods/java.base.jmod:classes/java/lang/./Object.class")
+            )],
+            "only the malformed path is a reject: {:?}",
+            production.diagnostics
+        );
+        let pack = production.pack.expect("the module emits a pack");
+        assert_eq!(type_names(&pack), ["java.lang.Object"]);
+    }
+
+    /// A class outside every unqualified export never reaches the pack, so the
+    /// producer does not read it. A JDK 25 has about twice as many such classes
+    /// as published ones, and nothing their bytes would report describes a
+    /// published declaration.
+    #[test]
+    #[hardwon(
+        "#3444: An invalid class in a non-exported package must remain unread and must not make the exported module partial"
+    )]
+    fn class_outside_an_exported_package_is_never_read() {
+        let root = tempfile::tempdir().unwrap();
+        let jmods = root.path().join("jmods");
+        fs::create_dir(&jmods).unwrap();
+        write_jmod(
+            &jmods.join("java.base.jmod"),
+            &[
+                (
+                    "classes/module-info.class",
+                    test_module_info_class_bytes(&["java/lang"], &[]),
+                ),
+                (
+                    "classes/java/lang/Object.class",
+                    sample_class("java/lang/Object"),
+                ),
+                (
+                    "classes/jdk/internal/misc/Unsafe.class",
+                    b"not a class file".to_vec(),
+                ),
+            ],
+        );
+        let production = produce(root.path(), &["jmods/java.base.jmod"]);
+        assert!(
+            production.diagnostics.is_empty(),
+            "{:?}",
+            production.diagnostics
+        );
+        assert_eq!(production.completeness, Completeness::Complete);
+        let pack = production.pack.expect("the module emits a pack");
+        assert_eq!(type_names(&pack), ["java.lang.Object"]);
+    }
+
+    /// A real JDK's JMOD set produces one complete pack that compiles (#3444).
+    ///
+    /// Every module the JDK exports must reach the pack: `java.desktop` and
+    /// `java.security.jgss` each open a package to a named module, resources
+    /// sit beside the class files, and `java.desktop` declares an inner-class
+    /// constructor whose signature names its enclosing class's type variable.
+    #[test]
+    #[hardwon(
+        "#3444: Scheduled end-to-end check compiles all actual JMODs and verifies the JDK modules implicated by the regression"
+    )]
+    #[ignore = "requires BIFROST_JDK_HOME pointing to a JDK with a jmods directory"]
+    fn real_jdk_jmod_set_produces_one_complete_compilable_pack() {
+        use crate::analyzer::semantic_model::DependencyPackLimits;
+
+        let home =
+            PathBuf::from(std::env::var_os("BIFROST_JDK_HOME").expect("set BIFROST_JDK_HOME"));
+        let mut relative_paths = fs::read_dir(home.join("jmods"))
+            .unwrap()
+            .map(|entry| PathBuf::from("jmods").join(entry.unwrap().file_name()))
+            .filter(|path| {
+                path.extension()
+                    .is_some_and(|extension| extension == "jmod")
+            })
+            .collect::<Vec<_>>();
+        relative_paths.sort();
+        let limits = DependencyPackLimits::default();
+        let artifact = read_exact_source_set(
+            &home,
+            &relative_paths,
+            limits.max_source_files_per_artifact,
+            limits.max_source_path_depth,
+            &limits.producer,
+        )
+        .unwrap();
+        let production = JdkJmodSetPackProducer.produce_loaded_artifact(
+            &request(&home),
+            &limits.producer,
+            None,
+            &artifact,
+        );
+        let pack = production.pack.as_ref().expect("a real JDK emits a pack");
+        let records = pack
+            .shards
+            .iter()
+            .map(|shard| match &shard.payload {
+                AuthoredPayload::DeclarationFacts {
+                    types,
+                    members,
+                    relations,
+                } => types.len() + members.len() + relations.len(),
+                _ => 0,
+            })
+            .sum::<usize>();
+        let mut codes = BTreeMap::<&str, usize>::new();
+        for diagnostic in &production.diagnostics {
+            *codes.entry(diagnostic.code.as_str()).or_default() += 1;
+        }
+        eprintln!(
+            "archives={} completeness={:?} shards={} records={records} diagnostics={} suppressed={:?} codes={codes:?}",
+            relative_paths.len(),
+            production.completeness,
+            pack.shards.len(),
+            production.diagnostics.len(),
+            production.suppressed_diagnostics,
+        );
+        assert!(
+            production.diagnostics.is_empty(),
+            "{:?}",
+            production.diagnostics
+        );
+        assert_eq!(production.suppressed_diagnostics.total(), 0);
+        assert_eq!(production.completeness, Completeness::Complete);
+        let names = type_names(pack);
+        for expected in [
+            "java.awt.Component",
+            "javax.swing.JFrame",
+            "javax.swing.JList.AccessibleJList.AccessibleJListChild",
+            "org.ietf.jgss.GSSManager",
+        ] {
+            assert!(names.contains(&expected), "missing {expected}");
+        }
+        compile_pack(pack, &limits.compiler).unwrap();
+    }
+
+    fn produce(root: &Path, relative_paths: &[&str]) -> ArtifactProduction {
+        let artifact = read_exact_source_set(
+            root,
+            &relative_paths.iter().map(PathBuf::from).collect::<Vec<_>>(),
+            16,
+            8,
+            &ArtifactProducerLimits::default(),
+        )
+        .unwrap();
+        JdkJmodSetPackProducer.produce_loaded_artifact(
+            &request(root),
+            &ArtifactProducerLimits::default(),
+            None,
+            &artifact,
+        )
+    }
+
+    /// Every type name the pack declares, sorted.
+    fn type_names(pack: &AuthoredSemanticModelPack) -> Vec<&str> {
+        let mut names = pack
+            .shards
+            .iter()
+            .flat_map(|shard| match &shard.payload {
+                AuthoredPayload::DeclarationFacts { types, .. } => types.as_slice(),
+                _ => &[],
+            })
+            .map(|fact| fact.name.as_str())
+            .collect::<Vec<_>>();
+        names.sort_unstable();
+        names
     }
 
     /// The per-module parallel read must assemble exactly the bytes of the
@@ -1424,40 +1685,12 @@ mod tests {
     }
 
     fn request(path: &Path) -> ArtifactProductionRequest {
-        ArtifactProductionRequest {
-            path: path.to_path_buf(),
-            artifact_kind: ExternalArtifactKind::JdkJmodSet,
-            pack_id: "jdk-21".to_owned(),
-            pack_version: "21.0.8".to_owned(),
-            ecosystem: "jdk".to_owned(),
-            compatibility: Compatibility {
-                bifrost: None,
-                toolchains: vec![VersionConstraint {
-                    name: "jdk".to_owned(),
-                    requirement: "=21.0.8".to_owned(),
-                }],
-            },
-            activation: vec![ActivationSelector {
-                package: None,
-                module: None,
-                toolchain: Some(NameSelector {
-                    name: "jdk".to_owned(),
-                    version: Some("=21.0.8".to_owned()),
-                }),
-                targets: vec!["jvm".to_owned()],
-                configurations: vec![],
-                artifact_sha256: None,
-            }],
-            provenance: Provenance {
-                source: "OpenJDK".to_owned(),
-                revision: Some("jdk-21.0.8".to_owned()),
-            },
-            license: "GPL-2.0-only WITH Classpath-exception-2.0".to_owned(),
-            safety: Safety {
-                generated_code_only: false,
-                review_required: false,
-            },
-        }
+        crate::analyzer::jvm::jdk_artifact_request(
+            path.to_path_buf(),
+            ExternalArtifactKind::JdkJmodSet,
+            "21.0.8",
+            vec!["jvm".to_owned()],
+        )
     }
 
     fn write_jmod(path: &Path, entries: &[(&str, Vec<u8>)]) {
@@ -1482,7 +1715,7 @@ mod tests {
                 )
                 .unwrap();
             archive
-                .write_all(&test_module_info_class_bytes(&packages))
+                .write_all(&test_module_info_class_bytes(&packages, &[]))
                 .unwrap();
         }
         for (name, bytes) in entries {
@@ -1495,5 +1728,25 @@ mod tests {
             archive.write_all(bytes).unwrap();
         }
         archive.finish().unwrap();
+    }
+    #[test]
+    fn oversized_jmod_archive_is_rejected_by_the_exact_source_set_bound() {
+        let root = tempfile::tempdir().unwrap();
+        let jmods = root.path().join("jmods");
+        fs::create_dir(&jmods).unwrap();
+        fs::write(jmods.join("java.base.jmod"), vec![0_u8; 128]).unwrap();
+        let limits = ArtifactProducerLimits {
+            max_artifact_bytes: 64,
+            ..ArtifactProducerLimits::default()
+        };
+        let error = read_exact_source_set(
+            root.path(),
+            &[PathBuf::from("jmods/java.base.jmod")],
+            16,
+            8,
+            &limits,
+        )
+        .expect_err("the bounded source-set reader must reject oversized JMOD input");
+        assert_eq!(error.code, "limit.artifact_bytes");
     }
 }

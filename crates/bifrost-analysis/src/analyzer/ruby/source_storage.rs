@@ -67,7 +67,9 @@ impl AnalyzerStore {
                 parse_errors,
                 boundary,
             ) = header.ok_or_else(|| {
-                StoreError::new(format!("canonical Ruby load facts unavailable for {oid}"))
+                StoreError::missing_required_source_facts(format!(
+                    "canonical Ruby load facts unavailable for {oid}"
+                ))
             })?;
             let mut loads = Vec::new();
             let mut statement = tx.prepare_cached(RUBY_LOADS_SQL)?;

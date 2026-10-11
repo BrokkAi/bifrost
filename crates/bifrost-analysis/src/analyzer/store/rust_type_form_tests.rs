@@ -1,6 +1,6 @@
 //! Canonical compound Rust type-form publication through the real producer and store.
 
-use super::tests::{oid_for, parse_state};
+use super::tests::{assert_rust_source_read_cancellation_retries, oid_for, parse_state};
 use super::*;
 use crate::analyzer::rust::RustAdapter;
 use crate::inline_project::InlineTestProject;
@@ -235,30 +235,13 @@ fn compound_type_read_cancellation_retries_without_partial_rows() {
         .write_parsed_blob(oid, "rust", &RustAdapter, &state)
         .unwrap();
     let generation = store.current_generation("rust").unwrap();
-    let checks = std::cell::Cell::new(0usize);
-    let complete = store
-        .rust_hierarchy_source_facts(oid, generation, &RustAdapter, &file, &|| {
-            checks.set(checks.get() + 1);
-            true
-        })
-        .unwrap()
-        .unwrap();
-    let total_checks = checks.get();
-    assert!(total_checks > 12, "type read had too few checkpoints");
-    let cancelled_checks = std::cell::Cell::new(0usize);
-    assert!(
-        store
-            .rust_hierarchy_source_facts(oid, generation, &RustAdapter, &file, &|| {
-                cancelled_checks.set(cancelled_checks.get() + 1);
-                cancelled_checks.get() < total_checks
-            })
-            .unwrap()
-            .is_none()
+    assert_rust_source_read_cancellation_retries(
+        |cancellation| {
+            store
+                .rust_hierarchy_source_facts(oid, generation, &RustAdapter, &file, cancellation)
+                .unwrap()
+        },
+        12,
+        |complete, retried| assert_eq!(retried.types, complete.types),
     );
-    assert!(cancelled_checks.get() >= total_checks);
-    let retried = store
-        .rust_hierarchy_source_facts(oid, generation, &RustAdapter, &file, &|| true)
-        .unwrap()
-        .unwrap();
-    assert_eq!(retried.types, complete.types);
 }

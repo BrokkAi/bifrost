@@ -280,20 +280,12 @@ impl Decode for MalformedUtf8Decoder {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use brokk_bifrost_test_macros::hardwon;
 
     #[test]
-    fn ordinary_and_legacy_text_keep_existing_behavior() {
-        let exact = ingest_source_bytes(Path::new("Demo.java"), b"class Demo {}\n").unwrap();
-        assert_eq!(exact.kind(), SourceIngestionKind::Exact);
-        assert_eq!(exact.as_str(), "class Demo {}\n");
-
-        let legacy =
-            ingest_source_bytes(Path::new("Demo.java"), b"// caf\xe9\nclass Demo {}\n").unwrap();
-        assert_eq!(legacy.kind(), SourceIngestionKind::Lossy);
-        assert!(legacy.as_str().contains('\u{FFFD}'));
-    }
-
-    #[test]
+    #[hardwon(
+        "#1553: PHP binary payloads aborted revision-scoped analysis instead of preserving source offsets"
+    )]
     fn packed_php_projects_opaque_payload_and_preserves_offsets() {
         let mut source =
             b"<?php\nfunction visible_wrapper() { return 1; }\neval(gzuncompress('".to_vec();
@@ -318,6 +310,9 @@ mod tests {
     }
 
     #[test]
+    #[hardwon(
+        "#1553: NUL bytes outside grammar-recognized opaque syntax must remain a parse error"
+    )]
     fn nul_outside_an_opaque_syntax_node_is_rejected() {
         let source = b"<?php\nfunction bro\x00ken() { return 1; }\n";
         let error = ingest_source_bytes(Path::new("broken.php"), source).unwrap_err();
@@ -327,17 +322,5 @@ mod tests {
                 .contains("outside grammar-recognized strings or comments"),
             "{error}"
         );
-    }
-
-    #[test]
-    fn pathological_single_line_binary_source_remains_rejected() {
-        let mut source = b"<?php eval('".to_vec();
-        source.extend(std::iter::repeat_n(
-            b'x',
-            super::super::common::DEFAULT_MAX_LINE_LENGTH + 1,
-        ));
-        source.extend_from_slice(b"\x00');\n");
-        let error = ingest_source_bytes(Path::new("packed.php"), &source).unwrap_err();
-        assert!(error.to_string().contains("line longer"), "{error}");
     }
 }

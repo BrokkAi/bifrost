@@ -302,12 +302,10 @@ fn push_incomplete(
     }) {
         return;
     }
-    diagnostics.push(CodeQueryDiagnostic {
-        code: CodeQueryDiagnosticCode::JsxProjectionIncomplete,
-        impact: CodeQueryDiagnosticImpact::Incomplete,
-        branch: Vec::new(),
-        language: language.config_label(),
-        message: message.to_string(),
-        exhausted_roots: Vec::new(),
-    });
+    diagnostics.push(incomplete_diagnostic(
+        CodeQueryDiagnosticCode::JsxProjectionIncomplete,
+        language.config_label(),
+        message.to_string(),
+        Vec::new(),
+    ));
 }

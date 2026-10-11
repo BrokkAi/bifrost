@@ -94,6 +94,37 @@ struct DeadCodeFinding {
     rationale: String,
 }
 
+struct GraphFindingDetails {
+    score: i32,
+    confidence: f64,
+    external_usage_count: usize,
+    evidence: String,
+    rationale: String,
+}
+
+fn build_graph_dead_code_finding(
+    language: Language,
+    candidate: &CodeUnit,
+    range: Range,
+    total_usage_count: usize,
+    details: GraphFindingDetails,
+) -> DeadCodeFinding {
+    DeadCodeFinding {
+        language,
+        score: details.score,
+        confidence: details.confidence,
+        kind: candidate.kind().display_lowercase().to_string(),
+        symbol: candidate.fq_name(),
+        file: candidate.source().clone(),
+        start_line: range.start_line + 1,
+        end_line: range.end_line + 1,
+        total_usage_count,
+        external_usage_count: details.external_usage_count,
+        evidence: details.evidence,
+        rationale: details.rationale,
+    }
+}
+
 pub fn report_dead_code_and_unused_abstraction_smells(
     analyzer: &dyn IAnalyzer,
     params: ReportDeadCodeAndUnusedAbstractionSmellsParams,
@@ -157,8 +188,11 @@ pub fn report_dead_code_and_unused_abstraction_smells(
     let graph_passes = edge_passes();
     let mut native_buckets: HashMap<EdgePassId, NativeDeadCodeBucket> = HashMap::default();
     for candidate in &candidate_selection.candidates {
-        if language_support(code_unit_language(candidate))
-            .is_some_and(|support| support.dead_code_needs_precise_scan(analyzer, candidate))
+        let support = language_support(code_unit_language(candidate));
+        let dead_code = support
+            .map(|support| support.dead_code())
+            .unwrap_or_default();
+        if support.is_some_and(|support| support.dead_code_needs_precise_scan(analyzer, candidate))
         {
             if let Some(finding) = analyze_candidate(
                 analyzer,
@@ -172,7 +206,11 @@ pub fn report_dead_code_and_unused_abstraction_smells(
             }
             continue;
         }
+        // A language's specialized dead-code proof can retain caller evidence
+        // that the general workspace graph does not project, such as Go package
+        // variable initializer edges. Keep that proof authoritative when present.
         if is_graph_declaration(candidate)
+            && dead_code.bulk.is_none()
             && let Some((entry, provider)) = graph_passes.iter().find_map(|entry| {
                 let LanguageGraphBackend::Native(provider) = entry.backend else {
                     return None;
@@ -194,9 +232,7 @@ pub fn report_dead_code_and_unused_abstraction_smells(
                 .push(candidate.clone());
             continue;
         }
-        if let Some(proof) = language_support(code_unit_language(candidate))
-            .and_then(|support| support.dead_code().bulk)
-        {
+        if let Some(proof) = dead_code.bulk {
             let bucket = buckets
                 .entry(proof.id())
                 .or_insert_with(|| DeadCodeBulkBucket {
@@ -452,7 +488,7 @@ fn dead_code_candidates(
                     continue;
                 }
                 if code_unit_language(&definition) == Language::Cpp
-                    && cpp_implicit_entry_point(analyzer, &definition)
+                    && crate::analyzer::usages::cpp_graph::is_cpp_global_main(analyzer, &definition)
                 {
                     continue;
                 }
@@ -482,7 +518,10 @@ fn dead_code_candidates(
                     continue;
                 }
                 if code_unit_language(&declaration) == Language::Cpp
-                    && cpp_implicit_entry_point(analyzer, &declaration)
+                    && crate::analyzer::usages::cpp_graph::is_cpp_global_main(
+                        analyzer,
+                        &declaration,
+                    )
                 {
                     continue;
                 }
@@ -522,13 +561,200 @@ fn canonical_file_identity(file: &ProjectFile) -> PathBuf {
 mod tests {
     use super::{
         PreciseInboundPreflightDecision, canonical_file_identity,
-        inbound_usage_inconclusive_reason, precise_inbound_preflight_decision,
+        precise_inbound_preflight_decision,
     };
     use crate::analyzer::{
-        CodeUnit, CodeUnitIndex, GoAnalyzer, Language, OverlayProject, Project, ProjectFile,
+        CSharpAnalyzer, CodeUnit, CodeUnitIndex, GoAnalyzer, Language, OverlayProject, Project,
+        ProjectFile,
     };
     use crate::inline_project::InlineTestProject;
+    use brokk_bifrost_test_macros::hardwon;
     use std::sync::Arc;
+
+    fn go_main_candidate(analyzer: &GoAnalyzer, file: &ProjectFile) -> CodeUnit {
+        analyzer
+            .declarations(file)
+            .into_iter()
+            .find(|unit| unit.is_function() && unit.identifier() == "main")
+            .unwrap_or_else(|| panic!("no Go main declaration in {}", file.rel_path().display()))
+    }
+
+    /// A candidate is called dead because no edge reaches it, so a pass whose
+    /// canonical facts could not be read must make the evidence inconclusive
+    /// rather than make every candidate look unreferenced.
+    ///
+    /// The native bucket had no input-authority preflight: the legacy pass
+    /// owned `input_failure`, and routing a language to a native provider left
+    /// the bucket projecting an empty graph over an unpublished workspace and
+    /// reporting its live functions as dead. The Rust provider's own answer is
+    /// covered end to end by
+    /// `native_rust_usage_graph_reports_unavailable_canonical_facts_before_scanning`;
+    /// this pins the bucket's side of it, that a reported failure stops the
+    /// projection before any candidate is proved.
+    #[test]
+    fn native_dead_code_reports_unavailable_facts_instead_of_an_empty_graph() {
+        use crate::CancellationToken;
+        use crate::analyzer::languages::{
+            EdgePassId, LanguageEdgeFailure, NativeWorkspaceGraphProvider,
+        };
+        use crate::analyzer::usages::workspace_graph::SelectedWorkspaceUsageGraphProjectionOutcome;
+        use crate::analyzer::{IAnalyzer, RustAnalyzer};
+
+        struct UnreadableFacts(ProjectFile);
+        impl NativeWorkspaceGraphProvider for UnreadableFacts {
+            fn id(&self) -> EdgePassId {
+                EdgePassId::Rust
+            }
+
+            fn input_failure(
+                &self,
+                _analyzer: &dyn IAnalyzer,
+                _request_files: &[ProjectFile],
+            ) -> Option<LanguageEdgeFailure> {
+                Some(LanguageEdgeFailure {
+                    reason: "canonical Rust facts are unavailable for live files",
+                    files: vec![self.0.clone()],
+                })
+            }
+
+            fn project(
+                &self,
+                _analyzer: &dyn IAnalyzer,
+                _admitted_callers: &[ProjectFile],
+                _cancellation: &CancellationToken,
+            ) -> crate::analyzer::store::Result<SelectedWorkspaceUsageGraphProjectionOutcome>
+            {
+                unreachable!("a reported input failure must stop the projection")
+            }
+        }
+
+        let fixture = InlineTestProject::with_language(Language::Rust)
+            .file(
+                "Cargo.toml",
+                "[package]\nname = \"dead_preflight\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+            )
+            .file(
+                "src/lib.rs",
+                "pub fn target() {}\npub fn caller() { target(); }\n",
+            )
+            .build();
+        let file = fixture.file("src/lib.rs");
+        let analyzer = RustAnalyzer::new(fixture.project_dyn());
+        let candidates = analyzer
+            .declarations(&file)
+            .into_iter()
+            .filter(|unit| unit.identifier() == "target")
+            .collect::<Vec<_>>();
+        assert_eq!(candidates.len(), 1);
+
+        let provider = UnreadableFacts(file);
+        let mut skipped = Vec::new();
+        let findings = super::prove_native_candidates(
+            &analyzer,
+            &provider,
+            &[Language::Rust],
+            &candidates,
+            10,
+            2,
+            &mut skipped,
+        );
+        assert!(
+            findings.is_empty(),
+            "an unreadable fact base proves nothing dead: {findings:#?}"
+        );
+        assert_eq!(skipped.len(), 1, "{skipped:?}");
+        assert!(
+            skipped[0].contains("canonical Rust facts are unavailable for live files"),
+            "{skipped:?}"
+        );
+        assert!(
+            skipped[0].contains("evidence is inconclusive"),
+            "{skipped:?}"
+        );
+    }
+
+    #[test]
+    fn rust_dead_code_visibility_catches_up_missing_facts() {
+        use crate::RustAnalyzer;
+        use crate::analyzer::CodeUnitIndex;
+        let fixture = crate::inline_project::InlineTestProject::with_language(
+            crate::analyzer::Language::Rust,
+        )
+        .file("src/lib.rs", "pub fn unused() {}\n")
+        .build();
+        let project = fixture.project_dyn();
+        let context =
+            crate::analyzer::tree_sitter_analyzer::ephemeral_store_context(project.as_ref())
+                .unwrap();
+        let store = std::sync::Arc::clone(&context.store);
+        let analyzer = RustAnalyzer::new_with_config_store_context(
+            project,
+            crate::AnalyzerConfig::default(),
+            context,
+            None,
+        )
+        .unwrap();
+        let candidate = analyzer
+            .declarations(&fixture.file("src/lib.rs"))
+            .into_iter()
+            .find(|unit| unit.identifier() == "unused")
+            .unwrap();
+        store.delete_rust_facts_for_test("rust");
+        let mut skipped = Vec::new();
+        assert!(
+            super::bulk_graph_finding(
+                &analyzer,
+                &Default::default(),
+                &candidate,
+                super::GraphIncomingUsage::default(),
+                &mut skipped
+            )
+            .is_some()
+        );
+        assert!(skipped.is_empty(), "{skipped:?}");
+    }
+
+    #[test]
+    fn canonical_file_identity_ignores_equivalent_project_roots() {
+        let temp = tempfile::tempdir().unwrap();
+        let nested_root = temp.path().join("nested");
+        std::fs::create_dir(&nested_root).unwrap();
+        std::fs::write(nested_root.join("A.java"), "class A {}\n").unwrap();
+
+        let from_workspace_root = ProjectFile::new(temp.path(), "nested/A.java");
+        let from_nested_root = ProjectFile::new(&nested_root, "A.java");
+
+        assert_ne!(from_workspace_root.rel_path(), from_nested_root.rel_path(),);
+        assert_eq!(
+            canonical_file_identity(&from_workspace_root),
+            canonical_file_identity(&from_nested_root),
+        );
+    }
+
+    #[test]
+    #[hardwon("#2603: incomplete exact inbound evidence cannot prove a candidate dead")]
+    fn precise_inbound_preflight_never_proves_absence_from_an_fqn_graph() {
+        assert_eq!(
+            precise_inbound_preflight_decision(true, false, 1, 1, 0),
+            PreciseInboundPreflightDecision::SkipInconclusive
+        );
+        assert_eq!(
+            precise_inbound_preflight_decision(false, false, 0, 1, 0),
+            PreciseInboundPreflightDecision::SkipInconclusive
+        );
+        assert_eq!(
+            precise_inbound_preflight_decision(false, false, 0, 1, 1),
+            PreciseInboundPreflightDecision::SkipInconclusive
+        );
+        assert_eq!(
+            precise_inbound_preflight_decision(false, true, 1, 1, 0),
+            PreciseInboundPreflightDecision::SkipInconclusive
+        );
+        assert_eq!(
+            precise_inbound_preflight_decision(false, false, 1, 1, 0),
+            PreciseInboundPreflightDecision::RetireUsed
+        );
+    }
 
     #[test]
     fn native_bulk_proof_requires_complete_and_proven_exact_inbound_inventory() {
@@ -749,100 +975,6 @@ mod tests {
         assert_ne!(findings[0].start_line, findings[1].start_line);
     }
 
-    /// A candidate is called dead because no edge reaches it, so a pass whose
-    /// canonical facts could not be read must make the evidence inconclusive
-    /// rather than make every candidate look unreferenced.
-    ///
-    /// The native bucket had no input-authority preflight: the legacy pass
-    /// owned `input_failure`, and routing a language to a native provider left
-    /// the bucket projecting an empty graph over an unpublished workspace and
-    /// reporting its live functions as dead. The Rust provider's own answer is
-    /// covered end to end by
-    /// `native_rust_usage_graph_reports_unavailable_canonical_facts_before_scanning`;
-    /// this pins the bucket's side of it, that a reported failure stops the
-    /// projection before any candidate is proved.
-    #[test]
-    fn native_dead_code_reports_unavailable_facts_instead_of_an_empty_graph() {
-        use crate::CancellationToken;
-        use crate::analyzer::languages::{
-            EdgePassId, LanguageEdgeFailure, NativeWorkspaceGraphProvider,
-        };
-        use crate::analyzer::usages::workspace_graph::SelectedWorkspaceUsageGraphProjectionOutcome;
-        use crate::analyzer::{IAnalyzer, RustAnalyzer};
-
-        struct UnreadableFacts(ProjectFile);
-        impl NativeWorkspaceGraphProvider for UnreadableFacts {
-            fn id(&self) -> EdgePassId {
-                EdgePassId::Rust
-            }
-
-            fn input_failure(
-                &self,
-                _analyzer: &dyn IAnalyzer,
-                _request_files: &[ProjectFile],
-            ) -> Option<LanguageEdgeFailure> {
-                Some(LanguageEdgeFailure {
-                    reason: "canonical Rust facts are unavailable for live files",
-                    files: vec![self.0.clone()],
-                })
-            }
-
-            fn project(
-                &self,
-                _analyzer: &dyn IAnalyzer,
-                _admitted_callers: &[ProjectFile],
-                _cancellation: &CancellationToken,
-            ) -> crate::analyzer::store::Result<SelectedWorkspaceUsageGraphProjectionOutcome>
-            {
-                unreachable!("a reported input failure must stop the projection")
-            }
-        }
-
-        let fixture = InlineTestProject::with_language(Language::Rust)
-            .file(
-                "Cargo.toml",
-                "[package]\nname = \"dead_preflight\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
-            )
-            .file(
-                "src/lib.rs",
-                "pub fn target() {}\npub fn caller() { target(); }\n",
-            )
-            .build();
-        let file = fixture.file("src/lib.rs");
-        let analyzer = RustAnalyzer::new(fixture.project_dyn());
-        let candidates = analyzer
-            .declarations(&file)
-            .into_iter()
-            .filter(|unit| unit.identifier() == "target")
-            .collect::<Vec<_>>();
-        assert_eq!(candidates.len(), 1);
-
-        let provider = UnreadableFacts(file);
-        let mut skipped = Vec::new();
-        let findings = super::prove_native_candidates(
-            &analyzer,
-            &provider,
-            &[Language::Rust],
-            &candidates,
-            10,
-            2,
-            &mut skipped,
-        );
-        assert!(
-            findings.is_empty(),
-            "an unreadable fact base proves nothing dead: {findings:#?}"
-        );
-        assert_eq!(skipped.len(), 1, "{skipped:?}");
-        assert!(
-            skipped[0].contains("canonical Rust facts are unavailable for live files"),
-            "{skipped:?}"
-        );
-        assert!(
-            skipped[0].contains("evidence is inconclusive"),
-            "{skipped:?}"
-        );
-    }
-
     #[test]
     fn native_rust_incomplete_inventory_keeps_unused_declaration_indeterminate() {
         use crate::analyzer::RustAnalyzer;
@@ -928,15 +1060,10 @@ mod tests {
         }
     }
 
-    fn go_main_candidate(analyzer: &GoAnalyzer, file: &ProjectFile) -> CodeUnit {
-        analyzer
-            .declarations(file)
-            .into_iter()
-            .find(|unit| unit.is_function() && unit.identifier() == "main")
-            .unwrap_or_else(|| panic!("no Go main declaration in {}", file.rel_path().display()))
-    }
-
     #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "94224b15a07d: Go main detection must read the package clause when a trailing line comment follows it"
+    )]
     fn go_main_entry_point_accepts_a_package_clause_with_a_trailing_comment() {
         let fixture = InlineTestProject::with_language(Language::Go)
             .file("go.mod", "module example.com/comments\n\ngo 1.24\n")
@@ -959,6 +1086,9 @@ mod tests {
     }
 
     #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "94224b15a07d: a fake package main inside a block comment must not turn a worker into a Go entry point"
+    )]
     fn go_main_entry_point_ignores_a_block_comment_fake_package_in_worker() {
         let fixture = InlineTestProject::with_language(Language::Go)
             .file("go.mod", "module example.com/block-comments\n\ngo 1.24\n")
@@ -981,6 +1111,9 @@ mod tests {
     }
 
     #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "94224b15a07d: Go entry-point identity comes from the declared package, not a directory named main"
+    )]
     fn go_main_entry_point_uses_declared_package_not_import_path() {
         let fixture = InlineTestProject::with_language(Language::Go)
             .file("go.mod", "module example.com/import-path\n\ngo 1.24\n")
@@ -1005,6 +1138,9 @@ mod tests {
     }
 
     #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "94224b15a07d: entry-point detection must use the active Go overlay package clause instead of stale disk text"
+    )]
     fn go_main_entry_point_uses_overlay_package_clause_instead_of_disk_source() {
         let fixture = InlineTestProject::with_language(Language::Go)
             .file("go.mod", "module example.com/overlay\n\ngo 1.24\n")
@@ -1030,6 +1166,9 @@ mod tests {
     }
 
     #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "94224b15a07d: a missing Go package clause must remain inconclusive instead of fabricating main-package identity"
+    )]
     fn go_main_entry_point_with_missing_package_clause_is_inconclusive() {
         let fixture = InlineTestProject::with_language(Language::Go)
             .file("go.mod", "module example.com/missing-clause\n\ngo 1.24\n")
@@ -1053,116 +1192,44 @@ mod tests {
     }
 
     #[test]
-    fn rust_dead_code_visibility_failure_is_inconclusive_and_retryable() {
-        use crate::RustAnalyzer;
-        use crate::analyzer::CodeUnitIndex;
-        let fixture = crate::inline_project::InlineTestProject::with_language(
-            crate::analyzer::Language::Rust,
-        )
-        .file("src/lib.rs", "pub fn unused() {}\n")
-        .build();
-        let project = fixture.project_dyn();
-        let context =
-            crate::analyzer::tree_sitter_analyzer::ephemeral_store_context(project.as_ref())
-                .unwrap();
-        let store = std::sync::Arc::clone(&context.store);
-        let analyzer = RustAnalyzer::new_with_config_store_context(
-            project,
-            crate::AnalyzerConfig::default(),
-            context,
-            None,
-        )
-        .unwrap();
+    #[hardwon("#4271: NUnit TestCase methods must count as dead-code entry points")]
+    fn csharp_nunit_testcase_entry_point_is_not_reported_as_dead_code() {
+        let fixture = InlineTestProject::with_language(Language::CSharp)
+            .file(
+                "Tests.cs",
+                "using NUnit.Framework;\n\
+                 public class ArithmeticTests {\n\
+                     [TestCase(1)]\n\
+                     public void HandlesInput(int value) {}\n\
+                 }\n",
+            )
+            .build();
+        let file = fixture.file("Tests.cs");
+        let analyzer = CSharpAnalyzer::new(fixture.project_dyn());
         let candidate = analyzer
-            .declarations(&fixture.file("src/lib.rs"))
+            .declarations(&file)
             .into_iter()
-            .find(|unit| unit.identifier() == "unused")
-            .unwrap();
-        store.delete_rust_facts_for_test("rust");
-        let mut skipped = Vec::new();
+            .find(|unit| unit.is_function() && unit.identifier() == "HandlesInput")
+            .expect("NUnit test method should be indexed as a declaration");
+
         assert!(
-            super::bulk_graph_finding(
-                &analyzer,
-                &Default::default(),
-                &candidate,
-                super::GraphIncomingUsage::default(),
-                &mut skipped
-            )
-            .is_none()
-        );
-        assert_eq!(skipped.len(), 1);
-        assert!(
-            skipped[0].contains("Unavailable") && skipped[0].contains("inconclusive"),
-            "{skipped:?}"
-        );
-        analyzer.warm_usage_facts();
-        skipped.clear();
-        assert!(
-            super::bulk_graph_finding(
-                &analyzer,
-                &Default::default(),
-                &candidate,
-                super::GraphIncomingUsage::default(),
-                &mut skipped
-            )
-            .is_some()
-        );
-        assert!(skipped.is_empty(), "{skipped:?}");
-    }
-
-    #[test]
-    fn canonical_file_identity_ignores_equivalent_project_roots() {
-        let temp = tempfile::tempdir().unwrap();
-        let nested_root = temp.path().join("nested");
-        std::fs::create_dir(&nested_root).unwrap();
-        std::fs::write(nested_root.join("A.java"), "class A {}\n").unwrap();
-
-        let from_workspace_root = ProjectFile::new(temp.path(), "nested/A.java");
-        let from_nested_root = ProjectFile::new(&nested_root, "A.java");
-
-        assert_ne!(from_workspace_root.rel_path(), from_nested_root.rel_path(),);
-        assert_eq!(
-            canonical_file_identity(&from_workspace_root),
-            canonical_file_identity(&from_nested_root),
-        );
-    }
-
-    #[test]
-    fn truncated_inbound_usage_is_inconclusive_without_a_workspace_fixture() {
-        let total = crate::analyzer::usages::inverted_edges::MAX_CALLSITES + 1;
-        let reason = inbound_usage_inconclusive_reason("helpers.helper", Some(total), 0, 1, 0)
-            .expect("truncated usage must be inconclusive");
-
-        assert_eq!(
-            reason,
-            format!(
-                "`helpers.helper`: too many workspace inbound call sites ({total}, limit {}); evidence is inconclusive",
-                crate::analyzer::usages::inverted_edges::MAX_CALLSITES
+            crate::analyzer::usages::csharp_graph::csharp_implicit_entry_point(
+                &analyzer, &candidate
             )
         );
-    }
 
-    #[test]
-    fn precise_inbound_preflight_never_proves_absence_from_an_fqn_graph() {
-        assert_eq!(
-            precise_inbound_preflight_decision(true, false, 1, 1, 0),
-            PreciseInboundPreflightDecision::SkipInconclusive
+        let result = super::report_dead_code_and_unused_abstraction_smells(
+            &analyzer,
+            super::ReportDeadCodeAndUnusedAbstractionSmellsParams {
+                file_paths: vec!["Tests.cs".into()],
+                min_score: 1,
+                ..Default::default()
+            },
         );
-        assert_eq!(
-            precise_inbound_preflight_decision(false, false, 0, 1, 0),
-            PreciseInboundPreflightDecision::SkipInconclusive
-        );
-        assert_eq!(
-            precise_inbound_preflight_decision(false, false, 0, 1, 1),
-            PreciseInboundPreflightDecision::SkipInconclusive
-        );
-        assert_eq!(
-            precise_inbound_preflight_decision(false, true, 1, 1, 0),
-            PreciseInboundPreflightDecision::SkipInconclusive
-        );
-        assert_eq!(
-            precise_inbound_preflight_decision(false, false, 1, 1, 0),
-            PreciseInboundPreflightDecision::RetireUsed
+        assert!(
+            !result.report.contains("HandlesInput"),
+            "NUnit test entry point appeared in dead-code report:\n{}",
+            result.report
         );
     }
 }
@@ -2119,30 +2186,29 @@ fn rust_graph_finding(
             return None;
         }
     };
-    let score = rust_graph_score(usage.total, declaration_lines, is_public);
-    let confidence = rust_graph_confidence(usage.total, is_public);
+    let score = public_api_graph_score(usage.total, declaration_lines, is_public);
+    let confidence = public_api_graph_confidence(usage.total, is_public);
     let evidence = graph_inbound_evidence(&usage);
     let rationale = rust_graph_rationale(usage.total, is_public);
 
-    Some(DeadCodeFinding {
-        language: Language::Rust,
-        score,
-        confidence,
-        kind: candidate.kind().display_lowercase().to_string(),
-        symbol: candidate.fq_name(),
-        file: candidate.source().clone(),
-        start_line: range.start_line + 1,
-        end_line: range.end_line + 1,
-        total_usage_count: usage.total,
-        external_usage_count: external_usage_count(
-            analyzer,
-            declarations_by_fqn,
-            candidate,
-            &usage,
-        ),
-        evidence,
-        rationale,
-    })
+    Some(build_graph_dead_code_finding(
+        Language::Rust,
+        candidate,
+        range,
+        usage.total,
+        GraphFindingDetails {
+            score,
+            confidence,
+            external_usage_count: external_usage_count(
+                analyzer,
+                declarations_by_fqn,
+                candidate,
+                &usage,
+            ),
+            evidence,
+            rationale,
+        },
+    ))
 }
 
 fn graph_finding_for_language(
@@ -2176,25 +2242,24 @@ fn graph_finding_for_language(
         )
     };
 
-    Some(DeadCodeFinding {
+    Some(build_graph_dead_code_finding(
         language,
-        score,
-        confidence,
-        kind: candidate.kind().display_lowercase().to_string(),
-        symbol: candidate.fq_name(),
-        file: candidate.source().clone(),
-        start_line: range.start_line + 1,
-        end_line: range.end_line + 1,
-        total_usage_count: usage.total,
-        external_usage_count: external_usage_count(
-            analyzer,
-            declarations_by_fqn,
-            candidate,
-            &usage,
-        ),
-        evidence,
-        rationale,
-    })
+        candidate,
+        range,
+        usage.total,
+        GraphFindingDetails {
+            score,
+            confidence,
+            external_usage_count: external_usage_count(
+                analyzer,
+                declarations_by_fqn,
+                candidate,
+                &usage,
+            ),
+            evidence,
+            rationale,
+        },
+    ))
 }
 
 fn java_graph_finding(
@@ -2243,7 +2308,7 @@ fn go_graph_finding(
         declarations_by_fqn,
         candidate,
         usage,
-        go_exported_declaration(candidate),
+        brokk_bifrost_go::declarations::go_identifier_is_exported(candidate.identifier()),
         "exported",
     )
 }
@@ -2336,25 +2401,24 @@ fn php_method_graph_finding(
             .to_string()
     };
 
-    Some(DeadCodeFinding {
-        language: Language::Php,
-        score,
-        confidence,
-        kind: candidate.kind().display_lowercase().to_string(),
-        symbol: candidate.fq_name(),
-        file: candidate.source().clone(),
-        start_line: range.start_line + 1,
-        end_line: range.end_line + 1,
-        total_usage_count: usage.total,
-        external_usage_count: external_usage_count(
-            analyzer,
-            declarations_by_fqn,
-            candidate,
-            &usage,
-        ),
-        evidence,
-        rationale,
-    })
+    Some(build_graph_dead_code_finding(
+        Language::Php,
+        candidate,
+        range,
+        usage.total,
+        GraphFindingDetails {
+            score,
+            confidence,
+            external_usage_count: external_usage_count(
+                analyzer,
+                declarations_by_fqn,
+                candidate,
+                &usage,
+            ),
+            evidence,
+            rationale,
+        },
+    ))
 }
 
 fn ruby_graph_finding(
@@ -2403,25 +2467,24 @@ fn public_surface_graph_finding(
         public_label,
     );
 
-    Some(DeadCodeFinding {
+    Some(build_graph_dead_code_finding(
         language,
-        score,
-        confidence,
-        kind: candidate.kind().display_lowercase().to_string(),
-        symbol: candidate.fq_name(),
-        file: candidate.source().clone(),
-        start_line: range.start_line + 1,
-        end_line: range.end_line + 1,
-        total_usage_count: usage.total,
-        external_usage_count: external_usage_count(
-            analyzer,
-            declarations_by_fqn,
-            candidate,
-            &usage,
-        ),
-        evidence,
-        rationale,
-    })
+        candidate,
+        range,
+        usage.total,
+        GraphFindingDetails {
+            score,
+            confidence,
+            external_usage_count: external_usage_count(
+                analyzer,
+                declarations_by_fqn,
+                candidate,
+                &usage,
+            ),
+            evidence,
+            rationale,
+        },
+    ))
 }
 
 #[derive(Clone, Debug, Default)]
@@ -2462,25 +2525,24 @@ fn scoped_graph_finding_for_language(
         )
     };
 
-    Some(DeadCodeFinding {
+    Some(build_graph_dead_code_finding(
         language,
-        score,
-        confidence,
-        kind: candidate.kind().display_lowercase().to_string(),
-        symbol: candidate.fq_name(),
-        file: candidate.source().clone(),
-        start_line: range.start_line + 1,
-        end_line: range.end_line + 1,
-        total_usage_count: usage.total,
-        external_usage_count: scoped_external_usage_count(
-            analyzer,
-            declarations_by_key,
-            candidate,
-            &usage,
-        ),
-        evidence,
-        rationale,
-    })
+        candidate,
+        range,
+        usage.total,
+        GraphFindingDetails {
+            score,
+            confidence,
+            external_usage_count: scoped_external_usage_count(
+                analyzer,
+                declarations_by_key,
+                candidate,
+                &usage,
+            ),
+            evidence,
+            rationale,
+        },
+    ))
 }
 
 fn graph_score(total_usage_count: usize, declaration_lines: usize) -> i32 {
@@ -2488,15 +2550,6 @@ fn graph_score(total_usage_count: usize, declaration_lines: usize) -> i32 {
         30 + (declaration_lines / 4).min(20) as i32
     } else {
         12 + (declaration_lines / 8).min(12) as i32
-    }
-}
-
-fn rust_graph_score(total_usage_count: usize, declaration_lines: usize, is_public: bool) -> i32 {
-    match (total_usage_count, is_public) {
-        (0, true) => 10 + (declaration_lines / 8).min(8) as i32,
-        (0, false) => 30 + (declaration_lines / 4).min(20) as i32,
-        (_, true) => 8 + (declaration_lines / 16).min(6) as i32,
-        (_, false) => 12 + (declaration_lines / 8).min(12) as i32,
     }
 }
 
@@ -2513,15 +2566,6 @@ fn public_api_graph_score(
     }
 }
 
-fn rust_graph_confidence(total_usage_count: usize, is_public: bool) -> f64 {
-    match (total_usage_count, is_public) {
-        (0, true) => 0.55,
-        (0, false) => 0.90,
-        (_, true) => 0.45,
-        (_, false) => 0.70,
-    }
-}
-
 fn public_api_graph_confidence(total_usage_count: usize, is_public: bool) -> f64 {
     match (total_usage_count, is_public) {
         (0, true) => 0.55,
@@ -2532,35 +2576,40 @@ fn public_api_graph_confidence(total_usage_count: usize, is_public: bool) -> f64
 }
 
 fn graph_inbound_evidence(usage: &GraphIncomingUsage) -> String {
-    if usage.total == 0 {
-        return "no non-self usages found".to_string();
-    }
-    if let Some((caller, weight)) = usage.callers.iter().next() {
-        if *weight == 1 {
-            format!("one workspace inbound edge from {caller}")
-        } else {
-            format!("one workspace inbound caller: {caller} ({weight} references)")
-        }
-    } else {
-        "one workspace inbound edge".to_string()
-    }
+    graph_inbound_evidence_for(
+        usage.total,
+        usage
+            .callers
+            .iter()
+            .next()
+            .map(|(caller, weight)| (caller, *weight)),
+    )
 }
 
 fn scoped_graph_inbound_evidence(usage: &ScopedGraphIncomingUsage) -> String {
-    if usage.total == 0 {
+    graph_inbound_evidence_for(
+        usage.total,
+        usage
+            .callers
+            .iter()
+            .next()
+            .map(|(caller, weight)| (&caller.fqn, *weight)),
+    )
+}
+
+fn graph_inbound_evidence_for<C: std::fmt::Display>(
+    total: usize,
+    caller: Option<(C, usize)>,
+) -> String {
+    if total == 0 {
         return "no non-self usages found".to_string();
     }
-    if let Some((caller, weight)) = usage.callers.iter().next() {
-        if *weight == 1 {
-            format!("one workspace inbound edge from {}", caller.fqn)
-        } else {
-            format!(
-                "one workspace inbound caller: {} ({weight} references)",
-                caller.fqn
-            )
+    match caller {
+        Some((caller, 1)) => format!("one workspace inbound edge from {caller}"),
+        Some((caller, weight)) => {
+            format!("one workspace inbound caller: {caller} ({weight} references)")
         }
-    } else {
-        "one workspace inbound edge".to_string()
+        None => "one workspace inbound edge".to_string(),
     }
 }
 
@@ -2631,11 +2680,7 @@ fn scoped_external_usage_count(
             else {
                 return true;
             };
-            let defining_owner = analyzer
-                .parent_of(candidate)
-                .unwrap_or_else(|| candidate.clone());
-            let caller_owner = analyzer.parent_of(caller).unwrap_or_else(|| caller.clone());
-            caller_owner != defining_owner
+            caller_has_different_owner(analyzer, candidate, caller)
         })
         .map(|(_, weight)| *weight)
         .sum()
@@ -2665,18 +2710,6 @@ fn cpp_public_like_declaration(analyzer: &dyn IAnalyzer, candidate: &CodeUnit) -
     let source = analyzer.get_source(candidate, true).unwrap_or_default();
     let header = declaration_header(&source);
     !contains_java_visibility_modifier(header, "static")
-}
-
-fn go_exported_declaration(candidate: &CodeUnit) -> bool {
-    candidate
-        .identifier()
-        .chars()
-        .next()
-        .is_some_and(char::is_uppercase)
-}
-
-fn cpp_implicit_entry_point(analyzer: &dyn IAnalyzer, candidate: &CodeUnit) -> bool {
-    crate::analyzer::usages::cpp_graph::is_cpp_global_main(analyzer, candidate)
 }
 
 pub(crate) fn declaration_header(source: &str) -> &str {
@@ -2723,15 +2756,23 @@ fn external_usage_count(
                 edge_is_external(analyzer, declarations_by_fqn, name, candidate)
             }
             GraphIncomingCaller::Declaration(caller) => {
-                let defining_owner = analyzer
-                    .parent_of(candidate)
-                    .unwrap_or_else(|| candidate.clone());
-                let caller_owner = analyzer.parent_of(caller).unwrap_or_else(|| caller.clone());
-                caller_owner != defining_owner
+                caller_has_different_owner(analyzer, candidate, caller)
             }
         })
         .map(|(_, weight)| *weight)
         .sum()
+}
+
+fn caller_has_different_owner(
+    analyzer: &dyn IAnalyzer,
+    candidate: &CodeUnit,
+    caller: &CodeUnit,
+) -> bool {
+    let defining_owner = analyzer
+        .parent_of(candidate)
+        .unwrap_or_else(|| candidate.clone());
+    let caller_owner = analyzer.parent_of(caller).unwrap_or_else(|| caller.clone());
+    caller_owner != defining_owner
 }
 
 fn edge_is_external(

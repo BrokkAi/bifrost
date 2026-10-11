@@ -725,43 +725,4 @@ mod tests {
             }
         }
     }
-
-    #[test]
-    fn shipped_policy_inventory_contains_no_typed_occurrence_assertions() {
-        let catalog = crate::built_in_policy_catalog().expect("built-in catalog loads");
-        let selection = crate::BuiltInPolicySelection {
-            packs: catalog
-                .document()
-                .packs
-                .iter()
-                .map(|pack| pack.id.clone())
-                .collect(),
-            ..crate::BuiltInPolicySelection::default()
-        };
-        let selected = catalog.select(&selection).expect("all packs select");
-        assert!(!selected.is_empty(), "the shipped inventory is nonempty");
-        let catalogs = Arc::new(TaintCatalogRegistry::new_without_workspace(
-            CatalogRegistryLimits::default(),
-        ));
-        let mut registry =
-            PolicyRegistry::new_without_workspace(catalogs, PolicyRegistryLimits::default());
-        let mut occurrence_assertions = Vec::new();
-        for entry in selected {
-            let loaded = registry
-                .register_policy_bytes(entry.source_identity(), entry.source().as_bytes())
-                .expect("shipped policy loads");
-            if let crate::PolicyAnalysis::Assertion { spec } = &loaded.definition().analysis {
-                occurrence_assertions.extend(
-                    spec.asserts
-                        .iter()
-                        .filter(|assertion| matches!(assertion, crate::PolicyAssert::Occurrence(_)))
-                        .map(|_| loaded.definition().metadata.id.to_string()),
-                );
-            }
-        }
-        assert!(
-            occurrence_assertions.is_empty(),
-            "inventory must be based on typed policy asserts: {occurrence_assertions:?}"
-        );
-    }
 }

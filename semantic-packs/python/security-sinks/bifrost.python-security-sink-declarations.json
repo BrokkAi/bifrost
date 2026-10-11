@@ -1,0 +1,222 @@
+{
+  "schema_version": 2,
+  "pack_id": "bifrost.python-security-sink-declarations",
+  "version": "0.1.0",
+  "producer": {
+    "name": "bifrost-reviewed-python-models",
+    "version": "0.1.0"
+  },
+  "language": "python",
+  "ecosystem": "python",
+  "compatibility": {
+    "bifrost": ">=0.11.0, <1.0.0",
+    "toolchains": [
+      {
+        "name": "cpython",
+        "requirement": ">=3.13.5, <3.13.6"
+      }
+    ]
+  },
+  "provenance": {
+    "source": "CPython standard-library reference and typeshed",
+    "revision": "v3.13.5"
+  },
+  "license": "PSF-2.0",
+  "completeness": "partial",
+  "safety": {
+    "generated_code_only": false,
+    "review_required": false
+  },
+  "shards": [
+    {
+      "id": "declarations.python-security-sink-apis",
+      "activation": [
+        {
+          "toolchain": {
+            "name": "cpython",
+            "version": ">=3.13.5, <3.13.6"
+          },
+          "targets": []
+        }
+      ],
+      "payload": {
+        "kind": "declaration_facts",
+        "types": [
+          {
+            "id": "type.python.socket",
+            "name": "socket",
+            "type_kind": "module",
+            "visibility": "public",
+            "aliases": ["socket"],
+            "locator": {
+              "kind": "artifact",
+              "path": "socket.pyi",
+              "symbol": "socket"
+            }
+          },
+          {
+            "id": "type.python.socket.socket",
+            "name": "socket.socket",
+            "type_kind": "class",
+            "visibility": "public",
+            "locator": {
+              "kind": "artifact",
+              "path": "socket.pyi",
+              "symbol": "socket.socket"
+            }
+          },
+          {
+            "id": "type.python.xml.etree-elementtree",
+            "name": "xml.etree.ElementTree",
+            "type_kind": "module",
+            "visibility": "public",
+            "aliases": ["xml.etree.ElementTree"],
+            "locator": {
+              "kind": "artifact",
+              "path": "xml/etree/ElementTree.pyi",
+              "symbol": "xml.etree.ElementTree"
+            }
+          },
+          {
+            "id": "type.python.xml.sax",
+            "name": "xml.sax",
+            "type_kind": "module",
+            "visibility": "public",
+            "aliases": ["xml.sax"],
+            "locator": {
+              "kind": "artifact",
+              "path": "xml/sax.pyi",
+              "symbol": "xml.sax"
+            }
+          },
+          {
+            "id": "type.python.xml.dom.minidom",
+            "name": "xml.dom.minidom",
+            "type_kind": "module",
+            "visibility": "public",
+            "aliases": ["xml.dom.minidom"],
+            "locator": {
+              "kind": "artifact",
+              "path": "xml/dom/minidom.pyi",
+              "symbol": "xml.dom.minidom"
+            }
+          }
+        ],
+        "members": [
+          {
+            "id": "member.python.socket.socket.bind",
+            "owner": "type.python.socket.socket",
+            "name": "bind",
+            "member_kind": "method",
+            "visibility": "public",
+            "is_static": false,
+            "callable_family_complete": true,
+            "signature": {
+              "parameters": [
+                {
+                  "name": "address",
+                  "type": {"kind": "named", "name": "builtins.object"}
+                }
+              ],
+              "returns": {"kind": "named", "name": "builtins.NoneType"}
+            },
+            "locator": {
+              "kind": "artifact",
+              "path": "socket.pyi",
+              "symbol": "socket.socket.bind(address)"
+            }
+          },
+          {
+            "id": "member.python.xml.etree-elementtree.fromstring",
+            "owner": "type.python.xml.etree-elementtree",
+            "name": "fromstring",
+            "member_kind": "function",
+            "visibility": "public",
+            "is_static": true,
+            "callable_family_complete": true,
+            "signature": {
+              "parameters": [
+                {
+                  "name": "text",
+                  "type": {"kind": "named", "name": "builtins.str"}
+                },
+                {
+                  "name": "parser",
+                  "type": {"kind": "named", "name": "builtins.object"},
+                  "optional": true
+                }
+              ],
+              "returns": {"kind": "named", "name": "builtins.object"}
+            },
+            "locator": {
+              "kind": "artifact",
+              "path": "xml/etree/ElementTree.pyi",
+              "symbol": "xml.etree.ElementTree.fromstring(text, parser)"
+            }
+          },
+          {
+            "id": "member.python.xml.sax.parse-string",
+            "owner": "type.python.xml.sax",
+            "name": "parseString",
+            "member_kind": "function",
+            "visibility": "public",
+            "is_static": true,
+            "callable_family_complete": true,
+            "signature": {
+              "parameters": [
+                {
+                  "name": "string",
+                  "type": {"kind": "named", "name": "builtins.object"}
+                },
+                {
+                  "name": "handler",
+                  "type": {"kind": "named", "name": "builtins.object"}
+                },
+                {
+                  "name": "errorHandler",
+                  "type": {"kind": "named", "name": "builtins.object"},
+                  "optional": true
+                }
+              ],
+              "returns": {"kind": "named", "name": "builtins.object"}
+            },
+            "locator": {
+              "kind": "artifact",
+              "path": "xml/sax.pyi",
+              "symbol": "xml.sax.parseString(string, handler, errorHandler)"
+            }
+          },
+          {
+            "id": "member.python.xml.dom.minidom.parse-string",
+            "owner": "type.python.xml.dom.minidom",
+            "name": "parseString",
+            "member_kind": "function",
+            "visibility": "public",
+            "is_static": true,
+            "callable_family_complete": true,
+            "signature": {
+              "parameters": [
+                {
+                  "name": "string",
+                  "type": {"kind": "named", "name": "builtins.str"}
+                },
+                {
+                  "name": "parser",
+                  "type": {"kind": "named", "name": "builtins.object"},
+                  "optional": true
+                }
+              ],
+              "returns": {"kind": "named", "name": "builtins.object"}
+            },
+            "locator": {
+              "kind": "artifact",
+              "path": "xml/dom/minidom.pyi",
+              "symbol": "xml.dom.minidom.parseString(string, parser)"
+            }
+          }
+        ],
+        "relations": []
+      }
+    }
+  ]
+}

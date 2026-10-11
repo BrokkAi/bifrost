@@ -1,18 +1,18 @@
-use crate::analyzer::common::language_for_file;
+use crate::analyzer::common::{language_for_file, workspace_language_for_file};
 use crate::analyzer::jvm::realm_builder::jvm_source_realm;
 use crate::analyzer::store::StoreError;
 use crate::analyzer::{
     AdditionalFileDependencies, AnalyzerConfig, AnalyzerStoreContext, BuildProgress,
     CSharpAnalyzer, CloneSmell, CloneSmellWeights, CodeUnit, CommentDensityStats, CppAnalyzer,
     DeclarationInfo, DefinitionLanguageScope, ExceptionHandlingAnalysis, ExceptionSmellWeights,
-    FileDependencyFacts, GoAnalyzer, IAnalyzer, ImportAnalysisProvider, ImportInfo,
-    ImportReachability, JavaAnalyzer, JavascriptAnalyzer, KotlinAnalyzer, Language, PhpAnalyzer,
-    Project, ProjectFile, PythonAnalyzer, QueryReadIncomplete, Range, RelationalBatchError,
-    RelationalBatchOutcome, RelationalDefinitionRequest, RelationalDefinitionResult,
-    RelationalDefinitionValue, RubyAnalyzer, RustAnalyzer, ScalaAnalyzer, SearchSymbolCandidates,
-    SearchSymbolPatternBatch, SignatureMetadata, SummaryFileProjection, TestAssertionAnalysis,
-    TestAssertionSmell, TestAssertionWeights, TestDetectionProvider, TypeAliasProvider,
-    TypeHierarchyProvider, TypescriptAnalyzer,
+    FileDependencyFacts, ForwardQueryProvider, GoAnalyzer, IAnalyzer, ImportAnalysisProvider,
+    ImportInfo, ImportReachability, JavaAnalyzer, JavascriptAnalyzer, KotlinAnalyzer, Language,
+    PhpAnalyzer, Project, ProjectFile, PythonAnalyzer, QueryReadIncomplete, Range,
+    RelationalBatchError, RelationalBatchOutcome, RelationalDefinitionRequest,
+    RelationalDefinitionResult, RelationalDefinitionValue, RubyAnalyzer, RustAnalyzer,
+    ScalaAnalyzer, SearchSymbolCandidates, SearchSymbolPatternBatch, SignatureMetadata,
+    SummaryFileProjection, TestAssertionAnalysis, TestAssertionSmell, TestAssertionWeights,
+    TestDetectionProvider, TypeAliasProvider, TypeHierarchyProvider, TypescriptAnalyzer,
 };
 use crate::analyzer::{AnalyzerQueryScope, QueryScope};
 use crate::hash::{HashMap, HashSet};
@@ -43,6 +43,12 @@ pub fn resolve_analyzer<T: Any>(analyzer: &dyn IAnalyzer) -> Option<&T> {
         .delegates()
         .values()
         .find_map(|delegate| (delegate.analyzer() as &dyn Any).downcast_ref::<T>())
+}
+
+pub(crate) fn forward_query_provider<T: Any + ForwardQueryProvider>(
+    analyzer: &dyn IAnalyzer,
+) -> Option<&dyn ForwardQueryProvider> {
+    resolve_analyzer::<T>(analyzer).map(|value| value as _)
 }
 
 // One delegate exists per language in a workspace, so the variants' size
@@ -226,20 +232,24 @@ impl AnalyzerDelegate {
             || is_language_configuration_input(language, file)
     }
 
-    pub(crate) fn update_all(&self) -> Self {
+    pub(crate) fn update_all_with_progress(&self, progress: Option<BuildProgress>) -> Self {
         match self {
-            Self::Java(analyzer) => Self::Java(analyzer.update_all()),
-            Self::CSharp(analyzer) => Self::CSharp(analyzer.update_all()),
-            Self::Cpp(analyzer) => Self::Cpp(analyzer.update_all()),
-            Self::Go(analyzer) => Self::Go(analyzer.update_all()),
-            Self::JavaScript(analyzer) => Self::JavaScript(analyzer.update_all()),
-            Self::Php(analyzer) => Self::Php(analyzer.update_all()),
-            Self::Python(analyzer) => Self::Python(analyzer.update_all()),
-            Self::TypeScript(analyzer) => Self::TypeScript(analyzer.update_all()),
-            Self::Rust(analyzer) => Self::Rust(analyzer.update_all()),
-            Self::Scala(analyzer) => Self::Scala(analyzer.update_all()),
-            Self::Ruby(analyzer) => Self::Ruby(analyzer.update_all()),
-            Self::Kotlin(analyzer) => Self::Kotlin(analyzer.update_all()),
+            Self::Java(analyzer) => Self::Java(analyzer.update_all_with_progress(progress)),
+            Self::CSharp(analyzer) => Self::CSharp(analyzer.update_all_with_progress(progress)),
+            Self::Cpp(analyzer) => Self::Cpp(analyzer.update_all_with_progress(progress)),
+            Self::Go(analyzer) => Self::Go(analyzer.update_all_with_progress(progress)),
+            Self::JavaScript(analyzer) => {
+                Self::JavaScript(analyzer.update_all_with_progress(progress))
+            }
+            Self::Php(analyzer) => Self::Php(analyzer.update_all_with_progress(progress)),
+            Self::Python(analyzer) => Self::Python(analyzer.update_all_with_progress(progress)),
+            Self::TypeScript(analyzer) => {
+                Self::TypeScript(analyzer.update_all_with_progress(progress))
+            }
+            Self::Rust(analyzer) => Self::Rust(analyzer.update_all_with_progress(progress)),
+            Self::Scala(analyzer) => Self::Scala(analyzer.update_all_with_progress(progress)),
+            Self::Ruby(analyzer) => Self::Ruby(analyzer.update_all_with_progress(progress)),
+            Self::Kotlin(analyzer) => Self::Kotlin(analyzer.update_all_with_progress(progress)),
         }
     }
 }
@@ -341,6 +351,17 @@ impl WorkspaceBuildContext {
         &self.config
     }
 
+    /// The store context every delegate of this workspace was built against.
+    pub(crate) fn store_context(&self) -> &AnalyzerStoreContext {
+        &self.store_context
+    }
+
+    /// The languages this workspace was restricted to, or `None` for every
+    /// language the project holds.
+    pub(crate) fn requested_languages(&self) -> Option<&BTreeSet<Language>> {
+        self.requested_languages.as_ref()
+    }
+
     pub(crate) fn derived_layer_budget_bytes(&self) -> u64 {
         self.config.memo_cache_budget_bytes() / 8
     }
@@ -359,6 +380,165 @@ impl WorkspaceBuildContext {
     /// to be kept in step with this one.
     pub(crate) fn store(&self) -> &Arc<crate::analyzer::store::AnalyzerStore> {
         &self.store_context.store
+    }
+
+    fn read_import_graph(
+        &self,
+        content_identity: crate::analyzer::content_identity::WorkspaceContentIdentity,
+        direction: crate::analyzer::PersistedImportDirection,
+        files: &[ProjectFile],
+        edge_limit: usize,
+    ) -> crate::analyzer::store::Result<Option<crate::analyzer::PersistedImportAdjacency>> {
+        let paths = files
+            .iter()
+            .map(crate::path_utils::rel_path_string)
+            .collect::<Vec<_>>();
+        let store_direction = match direction {
+            crate::analyzer::PersistedImportDirection::Forward => {
+                crate::analyzer::store::WorkspaceImportDirection::Forward
+            }
+            crate::analyzer::PersistedImportDirection::Reverse => {
+                crate::analyzer::store::WorkspaceImportDirection::Reverse
+            }
+        };
+        let Some(read) = self.store_context.store.read_workspace_import_graph(
+            &self.store_context.workspace_id,
+            content_identity.as_bytes(),
+            store_direction,
+            &paths,
+            edge_limit,
+        )?
+        else {
+            return Ok(None);
+        };
+        let mut by_file = files
+            .iter()
+            .cloned()
+            .map(|file| (file, Vec::new()))
+            .collect::<crate::hash::HashMap<_, _>>();
+        let root_file = files.first();
+        for (importer, target) in &read.edges {
+            let (seed_path, adjacency_path) = match direction {
+                crate::analyzer::PersistedImportDirection::Forward => (importer, target),
+                crate::analyzer::PersistedImportDirection::Reverse => (target, importer),
+            };
+            let root_file = root_file.expect("stored adjacency rows require source seeds");
+            by_file
+                .entry(root_file.with_rel_path(std::path::PathBuf::from(seed_path)))
+                .or_insert_with(Vec::new)
+                .push(root_file.with_rel_path(std::path::PathBuf::from(adjacency_path)));
+        }
+        for adjacency in by_file.values_mut() {
+            adjacency.sort();
+            adjacency.dedup();
+        }
+        Ok(Some(crate::analyzer::PersistedImportAdjacency {
+            rows_read: read.edges.len(),
+            by_file,
+            exhausted: read.exhausted,
+        }))
+    }
+
+    fn import_graph_resolver_identity(
+        &self,
+        languages: &[String],
+    ) -> crate::analyzer::store::Result<[u8; 32]> {
+        self.store_context
+            .store
+            .workspace_import_resolver_identity(format!("{:?}", self.config), languages)
+    }
+
+    fn plan_import_graph_refresh(
+        &self,
+        content_identity: crate::analyzer::content_identity::WorkspaceContentIdentity,
+        resolver_identity: &[u8; 32],
+        sources: &[crate::analyzer::store::WorkspaceImportGraphSource],
+    ) -> crate::analyzer::store::Result<crate::analyzer::store::WorkspaceImportGraphRefreshPlan>
+    {
+        self.store_context
+            .store
+            .plan_workspace_import_graph_refresh(
+                &self.store_context.workspace_id,
+                content_identity.as_bytes(),
+                resolver_identity,
+                sources,
+            )
+    }
+
+    // Each value is an independent input to this one atomic publication.
+    #[allow(clippy::too_many_arguments)]
+    fn advance_import_graph_identity(
+        &self,
+        content_identity: crate::analyzer::content_identity::WorkspaceContentIdentity,
+        resolver_identity: &[u8; 32],
+        plan: &crate::analyzer::store::WorkspaceImportGraphRefreshPlan,
+        sources: &[crate::analyzer::store::WorkspaceImportGraphSource],
+    ) -> crate::analyzer::store::Result<bool> {
+        self.store_context
+            .store
+            .advance_workspace_import_graph_identity(
+                &self.store_context.workspace_id,
+                content_identity.as_bytes(),
+                resolver_identity,
+                plan,
+                sources,
+            )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn publish_import_graph_refresh(
+        &self,
+        content_identity: crate::analyzer::content_identity::WorkspaceContentIdentity,
+        resolver_identity: &[u8; 32],
+        plan: &crate::analyzer::store::WorkspaceImportGraphRefreshPlan,
+        source_count: usize,
+        sources: &[crate::analyzer::store::WorkspaceImportGraphSource],
+        edges: &[crate::analyzer::PersistedImportEdge],
+        dependencies: &[crate::analyzer::PersistedImportDependencies],
+    ) -> crate::analyzer::store::Result<bool> {
+        let edges = edges
+            .iter()
+            .map(|edge| crate::analyzer::store::WorkspaceImportGraphEdge {
+                importer_path: crate::path_utils::rel_path_string(&edge.importer),
+                import_ordinal: edge.import_ordinal,
+                target_path: crate::path_utils::rel_path_string(&edge.target),
+                provenance_json: edge.provenance_json.clone(),
+                route_dependencies: edge.route_dependencies.clone(),
+            })
+            .collect::<Vec<_>>();
+        let dependencies = dependencies
+            .iter()
+            .map(
+                |dependency| crate::analyzer::store::WorkspaceImportGraphDependencies {
+                    importer_path: crate::path_utils::rel_path_string(&dependency.importer),
+                    lookups: dependency
+                        .facts
+                        .lookups
+                        .iter()
+                        .map(|lookup| {
+                            (
+                                lookup.import_ordinal,
+                                crate::path_utils::rel_path_string(&lookup.consulted_file),
+                                lookup.name.clone(),
+                            )
+                        })
+                        .collect(),
+                    missing_module_path_keys: dependency.facts.missing_module_path_keys.clone(),
+                },
+            )
+            .collect::<Vec<_>>();
+        self.store_context
+            .store
+            .publish_workspace_import_graph_refresh(
+                &self.store_context.workspace_id,
+                content_identity.as_bytes(),
+                resolver_identity,
+                plan,
+                source_count,
+                sources,
+                &edges,
+                &dependencies,
+            )
     }
 
     #[cfg(test)]
@@ -385,31 +565,46 @@ impl WorkspaceBuildContext {
                 .is_none_or(|languages| languages.contains(&language))
     }
 
-    pub(crate) fn changed_languages(
+    fn allowed_languages_for_files<'file>(
         &self,
-        changed_files: &BTreeSet<ProjectFile>,
+        files: impl Iterator<Item = &'file ProjectFile>,
     ) -> BTreeSet<Language> {
-        changed_files
-            .iter()
-            .filter(|file| file.exists() || self.project.has_overlay(file))
-            .map(language_for_file)
+        files
+            .map(workspace_language_for_file)
             .filter(|language| self.allows_language(*language))
             .collect()
     }
 
+    pub(crate) fn changed_languages(
+        &self,
+        changed_files: &BTreeSet<ProjectFile>,
+    ) -> BTreeSet<Language> {
+        self.allowed_languages_for_files(
+            changed_files
+                .iter()
+                .filter(|file| file.exists() || self.project.has_overlay(file)),
+        )
+    }
+
     pub(crate) fn project_languages(&self) -> BTreeSet<Language> {
-        self.project
+        let files = self
+            .project
             .all_files_shared()
-            .expect("failed to list workspace files while refreshing analyzer languages")
-            .iter()
-            .map(language_for_file)
-            .filter(|language| self.allows_language(*language))
-            .collect()
+            .expect("failed to list workspace files while refreshing analyzer languages");
+        self.allowed_languages_for_files(files.iter())
     }
 
     pub(crate) fn build_delegate(
         &self,
         language: Language,
+    ) -> Result<AnalyzerDelegate, StoreError> {
+        self.build_delegate_with_progress(language, None)
+    }
+
+    pub(crate) fn build_delegate_with_progress(
+        &self,
+        language: Language,
+        progress: Option<BuildProgress>,
     ) -> Result<AnalyzerDelegate, StoreError> {
         debug_assert!(self.allows_language(language));
         build_language_delegate(
@@ -417,7 +612,7 @@ impl WorkspaceBuildContext {
             Arc::clone(&self.project),
             self.config.clone(),
             self.store_context.clone(),
-            None,
+            progress,
         )
     }
 }
@@ -437,7 +632,7 @@ pub fn is_language_configuration_input(language: Language, file: &ProjectFile) -
         Language::Cpp => brokk_bifrost_cpp::compile_context::is_cpp_compile_context_input(file),
         Language::JavaScript | Language::TypeScript => is_js_ts_config_file(file),
         Language::Go => is_go_module_manifest(file),
-        Language::Rust => crate::analyzer::rust::is_cargo_manifest(file),
+        Language::Rust => crate::analyzer::rust::is_cargo_evidence_input(file),
         Language::Php | Language::Python | Language::Ruby | Language::None => false,
     }
 }
@@ -445,7 +640,15 @@ pub fn is_language_configuration_input(language: Language, file: &ProjectFile) -
 fn is_js_ts_config_file(file: &ProjectFile) -> bool {
     matches!(
         file.rel_path().file_name().and_then(|name| name.to_str()),
-        Some("tsconfig.json" | "jsconfig.json")
+        Some(
+            "tsconfig.json"
+                | "jsconfig.json"
+                | "package.json"
+                | "package-lock.json"
+                | "npm-shrinkwrap.json"
+                | "pnpm-lock.yaml"
+                | "yarn.lock"
+        )
     )
 }
 
@@ -454,6 +657,32 @@ fn is_go_module_manifest(file: &ProjectFile) -> bool {
         file.rel_path().file_name().and_then(|name| name.to_str()),
         Some("go.mod" | "go.sum")
     )
+}
+
+fn group_files_by_language(
+    files: &[ProjectFile],
+    mut language_for: impl FnMut(&ProjectFile) -> Language,
+) -> BTreeMap<Language, Vec<ProjectFile>> {
+    let mut grouped: BTreeMap<Language, Vec<ProjectFile>> = BTreeMap::new();
+    for file in files {
+        grouped
+            .entry(language_for(file))
+            .or_default()
+            .push(file.clone());
+    }
+    grouped
+}
+
+fn delegate_or_default<T>(
+    delegate: Option<&AnalyzerDelegate>,
+    query: impl FnOnce(&dyn IAnalyzer) -> T,
+) -> T
+where
+    T: Default,
+{
+    delegate
+        .map(|delegate| query(delegate.analyzer()))
+        .unwrap_or_default()
 }
 
 pub struct MultiAnalyzer {
@@ -508,6 +737,65 @@ impl Clone for MultiAnalyzer {
 }
 
 impl MultiAnalyzer {
+    pub(crate) fn update_all_with_progress(&self, progress: Option<BuildProgress>) -> Self {
+        let mut delegates = self.delegates.clone();
+        if let Some(context) = &self.build_context {
+            let active_languages = context.project_languages();
+            delegates.retain(|language, _| active_languages.contains(language));
+            for language in active_languages {
+                if let std::collections::btree_map::Entry::Vacant(entry) = delegates.entry(language)
+                {
+                    let delegate = context.build_delegate_with_progress(language, progress.clone()).unwrap_or_else(|error| {
+                        panic!(
+                            "failed to initialize {language:?} analyzer during full update: {error}"
+                        )
+                    });
+                    entry.insert(delegate);
+                }
+            }
+        }
+        let delegates = delegates
+            .iter()
+            .collect::<Vec<_>>()
+            .into_par_iter()
+            .map(|(language, delegate)| {
+                (
+                    *language,
+                    delegate.update_all_with_progress(progress.clone()),
+                )
+            })
+            .collect();
+        Self::new_with_build_context(
+            delegates,
+            self.derived_layer_budget_bytes,
+            self.build_context.clone(),
+        )
+        .with_snapshot_caches(self.snapshot_caches.carry_content_keyed_values_forward())
+    }
+
+    fn prefetch_delegates(&self, fq_names: &[String]) {
+        self.delegates
+            .values()
+            .for_each(|delegate| IAnalyzer::prefetch_definitions(delegate.analyzer(), fq_names));
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    fn delegate_test_hooks(
+        &self,
+    ) -> impl Iterator<Item = &dyn crate::analyzer::AnalyzerTestHooks> + '_ {
+        self.delegates
+            .values()
+            .map(|delegate| delegate.analyzer().test_hooks())
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    fn sum_delegate_test_hook_counts(
+        &self,
+        count: impl Fn(&dyn crate::analyzer::AnalyzerTestHooks) -> usize,
+    ) -> usize {
+        self.delegate_test_hooks().map(count).sum()
+    }
+
     pub fn new(delegates: BTreeMap<Language, AnalyzerDelegate>) -> Self {
         Self::new_with_derived_layer_budget(
             delegates,
@@ -652,12 +940,55 @@ impl MultiAnalyzer {
         self.delegates.get(&self.dispatch_language(file))
     }
 
+    /// The prepared syntax the analysis walk holds for `file`. Only Rust
+    /// answers today; the M2.5 differential reads Rust files alone.
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn prepared_syntax_for_test(
+        &self,
+        file: &ProjectFile,
+    ) -> Option<Arc<crate::analyzer::tree_sitter_analyzer::PreparedSyntaxTree>> {
+        let delegate = self.delegate_for_file(file)?;
+        let scope = AnalyzerQueryScope::new(delegate.analyzer());
+        match delegate {
+            AnalyzerDelegate::Rust(rust) => rust.prepared_syntax(scope.token(), file),
+            _ => None,
+        }
+    }
+
+    fn delegate_for_procedure(
+        &self,
+        workspace: &crate::analyzer::WorkspaceAnalyzer,
+        procedure: &crate::analyzer::semantic::ProcedureHandle,
+    ) -> Option<&AnalyzerDelegate> {
+        let file = crate::analyzer::semantic::type_flow::file_for_locator(
+            workspace,
+            procedure.semantics().locator(),
+        )?;
+        if procedure.artifact().key().mount()
+            != crate::analyzer::semantic::WorkspaceMountId::from_root(file.root())
+        {
+            return None;
+        }
+        self.delegate_for_file(&file)
+    }
+
     pub(crate) fn program_semantics_provider_for_file(
         &self,
         file: &ProjectFile,
     ) -> Option<&dyn crate::analyzer::semantic::ProgramSemanticsProvider> {
-        self.delegate_for_file(file)
-            .map(AnalyzerDelegate::program_semantics_provider)
+        self.program_semantics_provider_context_for_file(file)
+            .map(|(_, provider)| provider)
+    }
+
+    pub(crate) fn program_semantics_provider_context_for_file(
+        &self,
+        file: &ProjectFile,
+    ) -> Option<(
+        &dyn IAnalyzer,
+        &dyn crate::analyzer::semantic::ProgramSemanticsProvider,
+    )> {
+        let delegate = self.delegate_for_file(file)?;
+        Some((delegate.analyzer(), delegate.program_semantics_provider()))
     }
 
     fn delegate_for_code_unit(&self, code_unit: &CodeUnit) -> Option<&AnalyzerDelegate> {
@@ -712,6 +1043,39 @@ impl MultiAnalyzer {
                 acc.extend(found);
                 acc
             })
+    }
+
+    fn for_each_import_provider_group(
+        &self,
+        files: &[ProjectFile],
+        cancellation: &crate::CancellationToken,
+        mut visit: impl FnMut(&dyn ImportAnalysisProvider, &[ProjectFile]),
+    ) {
+        for (language, group) in group_files_by_language(files, language_for_file) {
+            if cancellation.is_cancelled() {
+                return;
+            }
+            let Some(provider) = self
+                .delegates
+                .get(&language)
+                .and_then(AnalyzerDelegate::import_analysis_provider)
+            else {
+                continue;
+            };
+            visit(provider, &group);
+        }
+    }
+
+    fn member_family_provider_for_code_unit(
+        &self,
+        member: &CodeUnit,
+    ) -> Option<&dyn crate::analyzer::usages::MemberFamilyProvider> {
+        self.delegate_for_code_unit(member)
+            .and_then(|delegate| delegate.analyzer().member_family_provider())
+    }
+
+    fn any_delegate(&self, predicate: impl Fn(&AnalyzerDelegate) -> bool) -> bool {
+        self.delegates.values().any(predicate)
     }
 }
 
@@ -795,8 +1159,7 @@ impl ImportAnalysisProvider for MultiAnalyzer {
     }
 
     fn import_info_of(&self, token: QueryToken<'_>, file: &ProjectFile) -> Vec<ImportInfo> {
-        self.delegate_for_file(file)
-            .and_then(AnalyzerDelegate::import_analysis_provider)
+        self.import_analysis_provider_for_file(file)
             .map(|provider| provider.import_info_of(token, file))
             .unwrap_or_default()
     }
@@ -806,8 +1169,7 @@ impl ImportAnalysisProvider for MultiAnalyzer {
         token: QueryToken<'_>,
         file: &ProjectFile,
     ) -> Option<Vec<ImportInfo>> {
-        self.delegate_for_file(file)
-            .and_then(AnalyzerDelegate::import_analysis_provider)
+        self.import_analysis_provider_for_file(file)
             .and_then(|provider| provider.import_info_of_checked(token, file))
     }
 
@@ -827,13 +1189,7 @@ impl ImportAnalysisProvider for MultiAnalyzer {
         // reads within their own group so the merged map still covers every
         // file, keeping the caller's result identical to the file-at-a-time
         // path while collapsing thousands of single-row queries into one.
-        let mut grouped: BTreeMap<Language, Vec<ProjectFile>> = BTreeMap::new();
-        for file in files {
-            grouped
-                .entry(self.dispatch_language(file))
-                .or_default()
-                .push(file.clone());
-        }
+        let grouped = group_files_by_language(files, |file| self.dispatch_language(file));
         let mut out: HashMap<ProjectFile, Vec<ImportInfo>> = HashMap::default();
         let mut any = false;
         for (language, group) in grouped {
@@ -864,13 +1220,7 @@ impl ImportAnalysisProvider for MultiAnalyzer {
         if files.is_empty() {
             return None;
         }
-        let mut grouped: BTreeMap<Language, Vec<ProjectFile>> = BTreeMap::new();
-        for file in files {
-            grouped
-                .entry(self.dispatch_language(file))
-                .or_default()
-                .push(file.clone());
-        }
+        let grouped = group_files_by_language(files, |file| self.dispatch_language(file));
         let mut out = HashMap::default();
         let mut any = false;
         for (language, group) in grouped {
@@ -894,13 +1244,7 @@ impl ImportAnalysisProvider for MultiAnalyzer {
         files: &[ProjectFile],
         cancellation: &crate::CancellationToken,
     ) -> Option<AdditionalFileDependencies> {
-        let mut grouped: BTreeMap<Language, Vec<ProjectFile>> = BTreeMap::new();
-        for file in files {
-            grouped
-                .entry(self.dispatch_language(file))
-                .or_default()
-                .push(file.clone());
-        }
+        let grouped = group_files_by_language(files, |file| self.dispatch_language(file));
         let mut out: HashMap<ProjectFile, HashSet<ProjectFile>> = HashMap::default();
         let mut complete = true;
         for (language, group) in grouped {
@@ -980,29 +1324,9 @@ impl ImportAnalysisProvider for MultiAnalyzer {
         import_infos: Option<&HashMap<ProjectFile, Vec<ImportInfo>>>,
         cancellation: &crate::CancellationToken,
     ) {
-        if files.is_empty() {
-            return;
-        }
-        let mut grouped: BTreeMap<Language, Vec<ProjectFile>> = BTreeMap::new();
-        for file in files {
-            grouped
-                .entry(language_for_file(file))
-                .or_default()
-                .push(file.clone());
-        }
-        for (language, group) in grouped {
-            if cancellation.is_cancelled() {
-                return;
-            }
-            let Some(provider) = self
-                .delegates
-                .get(&language)
-                .and_then(AnalyzerDelegate::import_analysis_provider)
-            else {
-                continue;
-            };
-            provider.prefetch_import_targets(&group, import_infos, cancellation);
-        }
+        self.for_each_import_provider_group(files, cancellation, |provider, group| {
+            provider.prefetch_import_targets(group, import_infos, cancellation);
+        });
     }
 
     fn prefetch_file_dependency_targets(
@@ -1011,29 +1335,9 @@ impl ImportAnalysisProvider for MultiAnalyzer {
         import_infos: Option<&HashMap<ProjectFile, Vec<ImportInfo>>>,
         cancellation: &crate::cancellation::CancellationToken,
     ) {
-        if files.is_empty() {
-            return;
-        }
-        let mut grouped: BTreeMap<Language, Vec<ProjectFile>> = BTreeMap::new();
-        for file in files {
-            grouped
-                .entry(language_for_file(file))
-                .or_default()
-                .push(file.clone());
-        }
-        for (language, group) in grouped {
-            if cancellation.is_cancelled() {
-                return;
-            }
-            let Some(provider) = self
-                .delegates
-                .get(&language)
-                .and_then(AnalyzerDelegate::import_analysis_provider)
-            else {
-                continue;
-            };
-            provider.prefetch_file_dependency_targets(&group, import_infos, cancellation);
-        }
+        self.for_each_import_provider_group(files, cancellation, |provider, group| {
+            provider.prefetch_file_dependency_targets(group, import_infos, cancellation);
+        });
     }
 
     /// A file whose language has no delegate is undecided, not unreachable:
@@ -1059,8 +1363,7 @@ impl ImportAnalysisProvider for MultiAnalyzer {
         file: &ProjectFile,
         imports: &[ImportInfo],
     ) -> Option<Arc<HashSet<CodeUnit>>> {
-        self.delegate_for_file(file)
-            .and_then(AnalyzerDelegate::import_analysis_provider)
+        self.import_analysis_provider_for_file(file)
             .and_then(|provider| provider.imported_code_units_from_infos(file, imports))
     }
 
@@ -1078,8 +1381,7 @@ impl ImportAnalysisProvider for MultiAnalyzer {
         file: &ProjectFile,
         imports: &[ImportInfo],
     ) -> Option<HashSet<ProjectFile>> {
-        self.delegate_for_file(file)
-            .and_then(AnalyzerDelegate::import_analysis_provider)
+        self.import_analysis_provider_for_file(file)
             .and_then(|provider| provider.imported_files_from_infos(file, imports))
     }
 }
@@ -1109,12 +1411,9 @@ impl TypeHierarchyProvider for MultiAnalyzer {
     }
 
     fn get_direct_descendants(&self, code_unit: &CodeUnit) -> HashSet<CodeUnit> {
-        let uncancelled = crate::cancellation::CancellationToken::default();
-        self.get_direct_descendants_within(
-            code_unit,
-            &crate::analyzer::DescendantIndexScope::whole_workspace(&uncancelled),
-        )
-        .expect("a descendant index that cannot stop always completes")
+        crate::analyzer::whole_workspace_descendants(|scope| {
+            self.get_direct_descendants_within(code_unit, scope)
+        })
     }
 
     fn get_direct_ancestors_within(
@@ -1226,8 +1525,7 @@ impl crate::analyzer::usages::MemberFamilyProvider for MultiAnalyzer {
                 crate::analyzer::usages::scala_member_family_capability(self, member)
             }
             _ => self
-                .delegate_for_code_unit(member)
-                .and_then(|delegate| delegate.analyzer().member_family_provider())
+                .member_family_provider_for_code_unit(member)
                 .map(|provider| provider.member_family_capability(member))
                 .unwrap_or(
                     crate::analyzer::structural::resolution::MemberFamilyCapability::Unsupported,
@@ -1248,8 +1546,7 @@ impl crate::analyzer::usages::MemberFamilyProvider for MultiAnalyzer {
                 crate::analyzer::usages::scala_member_family(self, self, member, cancellation)
             }
             _ => self
-                .delegate_for_code_unit(member)
-                .and_then(|delegate| delegate.analyzer().member_family_provider())
+                .member_family_provider_for_code_unit(member)
                 .map(|provider| provider.member_family(member, cancellation))
                 .unwrap_or_else(crate::analyzer::usages::MemberFamilyAnswer::unsupported_answer),
         }
@@ -1356,10 +1653,9 @@ impl CodeUnitIndex for MultiAnalyzer {
     }
 
     fn top_level_declarations(&self, file: &ProjectFile) -> Vec<CodeUnit> {
-        match self.delegate_for_file(file) {
-            Some(delegate) => delegate.analyzer().top_level_declarations(file),
-            None => Vec::new(),
-        }
+        delegate_or_default(self.delegate_for_file(file), |analyzer| {
+            analyzer.top_level_declarations(file)
+        })
     }
 
     fn summary_file_projection(&self, file: &ProjectFile) -> Option<Arc<SummaryFileProjection>> {
@@ -1418,9 +1714,9 @@ impl CodeUnitIndex for MultiAnalyzer {
     }
 
     fn location_declarations(&self, file: &ProjectFile) -> BTreeSet<CodeUnit> {
-        self.delegate_for_file(file)
-            .map(|delegate| delegate.analyzer().location_declarations(file))
-            .unwrap_or_default()
+        delegate_or_default(self.delegate_for_file(file), |analyzer| {
+            analyzer.location_declarations(file)
+        })
     }
 
     fn location_ranges(&self, code_unit: &CodeUnit) -> Vec<Range> {
@@ -1500,10 +1796,9 @@ impl CodeUnitIndex for MultiAnalyzer {
     }
 
     fn declarations(&self, file: &ProjectFile) -> BTreeSet<CodeUnit> {
-        match self.delegate_for_file(file) {
-            Some(delegate) => delegate.analyzer().declarations(file),
-            None => BTreeSet::new(),
-        }
+        delegate_or_default(self.delegate_for_file(file), |analyzer| {
+            analyzer.declarations(file)
+        })
     }
 
     fn declares(&self, file: &ProjectFile, unit: &CodeUnit) -> bool {
@@ -1534,6 +1829,13 @@ impl CodeUnitIndex for MultiAnalyzer {
         match self.delegate_for_file(file) {
             Some(delegate) => delegate.analyzer().materialization_records(file),
             None => Vec::new(),
+        }
+    }
+
+    fn parse_completeness(&self, file: &ProjectFile) -> crate::analyzer::ParseCompleteness {
+        match self.delegate_for_file(file) {
+            Some(delegate) => delegate.analyzer().parse_completeness(file),
+            None => crate::analyzer::ParseCompleteness::Complete,
         }
     }
 
@@ -1572,9 +1874,7 @@ impl CodeUnitIndex for MultiAnalyzer {
     }
 
     fn prefetch_definitions(&self, fq_names: &[String]) {
-        self.delegates
-            .values()
-            .for_each(|delegate| IAnalyzer::prefetch_definitions(delegate.analyzer(), fq_names));
+        self.prefetch_delegates(fq_names);
     }
 
     fn direct_children(&self, code_unit: &CodeUnit) -> Vec<CodeUnit> {
@@ -1667,14 +1967,14 @@ impl CodeUnitIndex for MultiAnalyzer {
         let matches =
             self.merged_from_delegates(|analyzer| analyzer.lookup_candidates_by_short_name(symbol));
         if IAnalyzer::read_ledger_attached(self) {
-            self.record_read(crate::analyzer::read_ledger::ReadKey::lookup(
-                crate::analyzer::read_ledger::LookupKind::ShortNameCandidates,
-                crate::analyzer::read_ledger::LookupQuestion::Name {
-                    language: None,
-                    name: symbol.into(),
-                },
-                crate::analyzer::read_ledger::declaration_set_digest(&matches),
-            ));
+            self.record_read(
+                crate::analyzer::read_ledger::declaration_candidates_lookup_key(
+                    crate::analyzer::read_ledger::LookupKind::ShortNameCandidates,
+                    None,
+                    symbol,
+                    &matches,
+                ),
+            );
         }
         matches
     }
@@ -1693,14 +1993,14 @@ impl CodeUnitIndex for MultiAnalyzer {
         let matches = self
             .merged_from_delegates(|analyzer| analyzer.lookup_candidates_by_identifier(identifier));
         if IAnalyzer::read_ledger_attached(self) {
-            self.record_read(crate::analyzer::read_ledger::ReadKey::lookup(
-                crate::analyzer::read_ledger::LookupKind::IdentifierCandidates,
-                crate::analyzer::read_ledger::LookupQuestion::Name {
-                    language: None,
-                    name: identifier.into(),
-                },
-                crate::analyzer::read_ledger::declaration_set_digest(&matches),
-            ));
+            self.record_read(
+                crate::analyzer::read_ledger::declaration_candidates_lookup_key(
+                    crate::analyzer::read_ledger::LookupKind::IdentifierCandidates,
+                    None,
+                    identifier,
+                    &matches,
+                ),
+            );
         }
         matches
     }
@@ -1714,19 +2014,176 @@ impl CodeUnitIndex for MultiAnalyzer {
     }
 
     fn signatures(&self, code_unit: &CodeUnit) -> Vec<String> {
-        self.delegate_for_code_unit(code_unit)
-            .map(|delegate| delegate.analyzer().signatures(code_unit))
-            .unwrap_or_default()
+        delegate_or_default(self.delegate_for_code_unit(code_unit), |analyzer| {
+            analyzer.signatures(code_unit)
+        })
     }
 
     fn signature_metadata(&self, code_unit: &CodeUnit) -> Vec<SignatureMetadata> {
-        self.delegate_for_code_unit(code_unit)
-            .map(|delegate| delegate.analyzer().signature_metadata(code_unit))
-            .unwrap_or_default()
+        delegate_or_default(self.delegate_for_code_unit(code_unit), |analyzer| {
+            analyzer.signature_metadata(code_unit)
+        })
     }
 }
 
 impl IAnalyzer for MultiAnalyzer {
+    fn dynamic_import_sources(
+        &self,
+        seed_files: Option<&[ProjectFile]>,
+    ) -> std::result::Result<Vec<(String, String)>, crate::analyzer::store::StoreError> {
+        let Some(context) = &self.build_context else {
+            return Ok(Vec::new());
+        };
+        let seed_paths = seed_files.map(|files| {
+            files
+                .iter()
+                .map(|file| {
+                    (
+                        file.language().config_label().to_owned(),
+                        crate::path_utils::rel_path_string(file),
+                    )
+                })
+                .collect::<Vec<_>>()
+        });
+        context
+            .store_context
+            .store
+            .read_dynamic_import_sources(&context.store_context.workspace_id, seed_paths.as_deref())
+    }
+
+    fn loop_candidates_for(
+        &self,
+        workspace: &crate::analyzer::WorkspaceAnalyzer,
+        procedure: &crate::analyzer::semantic::ProcedureHandle,
+        cancellation: Option<&crate::CancellationToken>,
+    ) -> Arc<crate::analyzer::LoopCandidates> {
+        match self.delegate_for_procedure(workspace, procedure) {
+            Some(delegate) => {
+                delegate
+                    .analyzer()
+                    .loop_candidates_for(workspace, procedure, cancellation)
+            }
+            None => Arc::new(crate::analyzer::build_loop_candidates(
+                workspace,
+                procedure,
+                cancellation,
+            )),
+        }
+    }
+
+    fn statement_assessments_for(
+        &self,
+        workspace: &crate::analyzer::WorkspaceAnalyzer,
+        procedure: &crate::analyzer::semantic::ProcedureHandle,
+        cancellation: Option<&crate::CancellationToken>,
+    ) -> Arc<crate::analyzer::semantic::StatementAssessments> {
+        match self.delegate_for_procedure(workspace, procedure) {
+            Some(delegate) => {
+                delegate
+                    .analyzer()
+                    .statement_assessments_for(workspace, procedure, cancellation)
+            }
+            None => Arc::new(
+                crate::analyzer::semantic::statement_entries::build_statement_assessments(
+                    workspace,
+                    procedure,
+                    cancellation,
+                ),
+            ),
+        }
+    }
+
+    fn cpp_expression_source_facts(
+        &self,
+        file: &ProjectFile,
+    ) -> Option<Arc<brokk_bifrost_core::analyzer::cpp_facts::CppExpressionSourceFacts>> {
+        self.delegate_for_file(file)
+            .and_then(|delegate| delegate.analyzer().cpp_expression_source_facts(file))
+    }
+
+    fn cpp_statement_source_facts(
+        &self,
+        file: &ProjectFile,
+    ) -> Option<Arc<brokk_bifrost_core::analyzer::statement_facts::CppStatementFactRows>> {
+        (language_for_file(file) == Language::Cpp)
+            .then(|| self.delegate_for_file(file))
+            .flatten()
+            .and_then(|delegate| delegate.analyzer().cpp_statement_source_facts(file))
+    }
+
+    fn cpp_class_source_facts(
+        &self,
+        file: &ProjectFile,
+    ) -> Option<Arc<brokk_bifrost_core::analyzer::cpp_facts::CppClassFactRows>> {
+        self.delegate_for_file(file)
+            .and_then(|delegate| delegate.analyzer().cpp_class_source_facts(file))
+    }
+
+    fn cpp_class_declaration_source_facts(
+        &self,
+        token: QueryToken<'_>,
+        file: &ProjectFile,
+    ) -> Option<Arc<Vec<brokk_bifrost_core::analyzer::cpp_facts::CppDeclarationSourceFact>>> {
+        self.delegate_for_file(file).and_then(|delegate| {
+            delegate
+                .analyzer()
+                .cpp_class_declaration_source_facts(token, file)
+        })
+    }
+
+    fn dependency_file_locations(
+        &self,
+    ) -> crate::analyzer::store::Result<
+        Vec<(
+            String,
+            crate::analyzer::semantic_model::DependencyEvidenceLocation,
+        )>,
+    > {
+        let mut result = Vec::new();
+        for delegate in self.delegates.values() {
+            result.extend(delegate.analyzer().dependency_file_locations()?);
+        }
+        Ok(result)
+    }
+
+    fn dependency_file_evidence(
+        &self,
+    ) -> crate::analyzer::store::Result<crate::analyzer::semantic_model::DependencyFileEvidence>
+    {
+        use crate::analyzer::semantic_model::{
+            DependencyEvidenceGap, DependencyEvidenceGapKind, DependencyFileEvidence,
+        };
+        let mut result = DependencyFileEvidence::default();
+        for (language, delegate) in &self.delegates {
+            match delegate.analyzer().dependency_file_evidence() {
+                Ok(evidence) => {
+                    result.rows.extend(evidence.rows);
+                    result.gaps.extend(evidence.gaps);
+                    result.files_read = result.files_read.saturating_add(evidence.files_read);
+                    result.bytes_read = result.bytes_read.saturating_add(evidence.bytes_read);
+                }
+                Err(error) => result.gaps.push(DependencyEvidenceGap {
+                    kind: DependencyEvidenceGapKind::Missing,
+                    build_file: Default::default(),
+                    byte_range: 0..0,
+                    message: format!(
+                        "{language:?} selected dependency publication unavailable: {error}"
+                    ),
+                }),
+            }
+        }
+        result.rows.sort_by_cached_key(|row| row.id());
+        // JS and TS publish the same package evidence; this is one fact.
+        result.rows.dedup_by(|left, right| left.id() == right.id());
+        result.gaps.sort_by(|left, right| {
+            left.build_file
+                .cmp(&right.build_file)
+                .then_with(|| left.message.cmp(&right.message))
+        });
+        result.gaps.dedup();
+        Ok(result)
+    }
+
     fn source_file_inventory(&self) -> crate::analyzer::QueryBatch<ProjectFile> {
         let mut inventory = crate::analyzer::QueryBatch::complete(Vec::new(), 0);
         for delegate in self.delegates.values() {
@@ -1830,9 +2287,11 @@ impl IAnalyzer for MultiAnalyzer {
         contexts.retain(|active| !Arc::ptr_eq(active, context));
         let retired = contexts.len() < before;
         drop(contexts);
-        if retired && context.read_ledger().is_some() {
-            let before = self.attached_read_ledgers.fetch_sub(1, Ordering::Relaxed);
-            debug_assert!(before > 0, "an attached read ledger was retired twice");
+        if retired {
+            crate::analyzer::i_analyzer::decrement_attached_read_ledger(
+                &self.attached_read_ledgers,
+                context,
+            );
         }
     }
 
@@ -1872,18 +2331,17 @@ impl IAnalyzer for MultiAnalyzer {
     }
 
     fn current_thread_read_ledger(&self) -> Option<Arc<crate::analyzer::read_ledger::ReadLedger>> {
-        self.query_contexts
+        let contexts = self
+            .query_contexts
             .lock()
-            .expect("multi-analyzer query context mutex poisoned")
-            .iter()
-            .rev()
-            .find_map(|context| context.current_thread_read_ledger().cloned())
+            .expect("multi-analyzer query context mutex poisoned");
+        crate::analyzer::i_analyzer::innermost_query_context_value(&contexts, |context| {
+            context.current_thread_read_ledger().cloned()
+        })
     }
 
     fn prefetch_definitions(&self, fq_names: &[String]) {
-        self.delegates
-            .values()
-            .for_each(|delegate| IAnalyzer::prefetch_definitions(delegate.analyzer(), fq_names));
+        self.prefetch_delegates(fq_names);
     }
 
     fn active_query_cancellation(&self) -> Option<crate::CancellationToken> {
@@ -1898,25 +2356,25 @@ impl IAnalyzer for MultiAnalyzer {
     fn active_query_semantic_model_overlay(
         &self,
     ) -> Option<Option<Arc<crate::analyzer::semantic_model::SemanticModelOverlay>>> {
-        self.query_contexts
+        let contexts = self
+            .query_contexts
             .lock()
-            .expect("multi-analyzer query context mutex poisoned")
-            .iter()
-            .rev()
-            .find_map(|context| context.semantic_model_overlay_override_for_current_thread())
+            .expect("multi-analyzer query context mutex poisoned");
+        crate::analyzer::i_analyzer::innermost_query_context_value(&contexts, |context| {
+            context.semantic_model_overlay_override_for_current_thread()
+        })
     }
 
     fn active_query_semantic_model_snapshot(
         &self,
     ) -> Option<Option<Arc<crate::analyzer::semantic_model::ActiveSemanticModelSnapshot>>> {
-        self.query_contexts
+        let contexts = self
+            .query_contexts
             .lock()
-            .expect("multi-analyzer query context mutex poisoned")
-            .iter()
-            .rev()
-            .find_map(|context| {
-                context.active_semantic_model_snapshot_override_for_current_thread()
-            })
+            .expect("multi-analyzer query context mutex poisoned");
+        crate::analyzer::i_analyzer::innermost_query_context_value(&contexts, |context| {
+            context.active_semantic_model_snapshot_override_for_current_thread()
+        })
     }
 
     fn relational_definition_batch(
@@ -2048,9 +2506,7 @@ impl IAnalyzer for MultiAnalyzer {
             .lock()
             .expect("multi-analyzer query context mutex poisoned")
             .clone();
-        for context in contexts {
-            context.record_read_incomplete(reason.clone());
-        }
+        crate::analyzer::i_analyzer::record_query_incomplete_on_active_contexts(&contexts, reason);
     }
 
     fn warm_query_indexes(&self) {
@@ -2187,34 +2643,7 @@ impl IAnalyzer for MultiAnalyzer {
     }
 
     fn update_all(&self) -> Self {
-        let mut delegates = self.delegates.clone();
-        if let Some(context) = &self.build_context {
-            let active_languages = context.project_languages();
-            delegates.retain(|language, _| active_languages.contains(language));
-            for language in active_languages {
-                if let std::collections::btree_map::Entry::Vacant(entry) = delegates.entry(language)
-                {
-                    let delegate = context.build_delegate(language).unwrap_or_else(|error| {
-                        panic!(
-                            "failed to initialize {language:?} analyzer during full update: {error}"
-                        )
-                    });
-                    entry.insert(delegate);
-                }
-            }
-        }
-        let delegates = delegates
-            .iter()
-            .collect::<Vec<_>>()
-            .into_par_iter()
-            .map(|(language, delegate)| (*language, delegate.update_all()))
-            .collect();
-        Self::new_with_build_context(
-            delegates,
-            self.derived_layer_budget_bytes,
-            self.build_context.clone(),
-        )
-        .with_snapshot_caches(self.snapshot_caches.carry_content_keyed_values_forward())
+        self.update_all_with_progress(None)
     }
 
     /// A view over the delegates' own indexes, never a merged copy.
@@ -2495,13 +2924,9 @@ impl IAnalyzer for MultiAnalyzer {
         file: &ProjectFile,
         weights: CloneSmellWeights,
     ) -> Vec<CloneSmell> {
-        self.delegate_for_file(file)
-            .map(|delegate| {
-                delegate
-                    .analyzer()
-                    .find_structural_clone_smells(file, weights)
-            })
-            .unwrap_or_default()
+        delegate_or_default(self.delegate_for_file(file), |analyzer| {
+            analyzer.find_structural_clone_smells(file, weights)
+        })
     }
 
     fn find_structural_clone_smells_for_files(
@@ -2509,13 +2934,7 @@ impl IAnalyzer for MultiAnalyzer {
         files: &[ProjectFile],
         weights: CloneSmellWeights,
     ) -> Vec<CloneSmell> {
-        let mut grouped: BTreeMap<Language, Vec<ProjectFile>> = BTreeMap::new();
-        for file in files {
-            grouped
-                .entry(self.dispatch_language(file))
-                .or_default()
-                .push(file.clone());
-        }
+        let grouped = group_files_by_language(files, |file| self.dispatch_language(file));
 
         let mut findings = Vec::new();
         for (language, group) in grouped {
@@ -2548,6 +2967,17 @@ impl IAnalyzer for MultiAnalyzer {
                 || SearchSymbolCandidates::complete(Vec::new(), 0),
                 SearchSymbolCandidates::merge,
             )
+    }
+
+    fn canonical_code_unit(
+        &self,
+        unit: &CodeUnit,
+        cancellation: Option<&crate::CancellationToken>,
+    ) -> CodeUnit {
+        self.delegate_for_code_unit(unit).map_or_else(
+            || unit.clone(),
+            |delegate| delegate.analyzer().canonical_code_unit(unit, cancellation),
+        )
     }
 
     fn partial_declaration_parts(&self, code_unit: &CodeUnit) -> Option<Vec<CodeUnit>> {
@@ -2587,24 +3017,31 @@ impl IAnalyzer for MultiAnalyzer {
     }
 
     fn type_hierarchy_provider(&self) -> Option<&dyn TypeHierarchyProvider> {
-        self.delegates
-            .values()
-            .any(|delegate| delegate.type_hierarchy_provider().is_some())
+        self.any_delegate(|delegate| delegate.type_hierarchy_provider().is_some())
             .then_some(self as &dyn TypeHierarchyProvider)
     }
 
     fn type_alias_provider(&self) -> Option<&dyn TypeAliasProvider> {
-        self.delegates
-            .values()
-            .any(|delegate| delegate.type_alias_provider().is_some())
+        self.any_delegate(|delegate| delegate.type_alias_provider().is_some())
             .then_some(self as &dyn TypeAliasProvider)
     }
 
     fn member_family_provider(&self) -> Option<&dyn crate::analyzer::usages::MemberFamilyProvider> {
-        self.delegates
-            .values()
-            .any(|delegate| delegate.analyzer().member_family_provider().is_some())
+        self.any_delegate(|delegate| delegate.analyzer().member_family_provider().is_some())
             .then_some(self as &dyn crate::analyzer::usages::MemberFamilyProvider)
+    }
+
+    fn python_class_hierarchy_provider_for(
+        &self,
+        declaration: &CodeUnit,
+    ) -> Option<&dyn crate::analyzer::usages::python_class_hierarchy::PythonClassHierarchyProvider>
+    {
+        self.delegate_for_code_unit(declaration)
+            .and_then(|delegate| {
+                delegate
+                    .analyzer()
+                    .python_class_hierarchy_provider_for(declaration)
+            })
     }
 
     fn test_detection_provider(&self) -> Option<&dyn TestDetectionProvider> {
@@ -2650,6 +3087,405 @@ impl IAnalyzer for MultiAnalyzer {
         Some(crate::analyzer::content_identity::WorkspaceContentIdentities::new(entries))
     }
 
+    fn read_persisted_import_adjacency(
+        &self,
+        content_identity: crate::analyzer::content_identity::WorkspaceContentIdentity,
+        direction: crate::analyzer::PersistedImportDirection,
+        files: &[ProjectFile],
+        edge_limit: usize,
+    ) -> Result<Option<crate::analyzer::PersistedImportAdjacency>, crate::analyzer::store::StoreError>
+    {
+        match &self.build_context {
+            Some(context) => {
+                context.read_import_graph(content_identity, direction, files, edge_limit)
+            }
+            None => Ok(None),
+        }
+    }
+
+    fn publish_persisted_import_graph(
+        &self,
+        _content_identity: crate::analyzer::content_identity::WorkspaceContentIdentity,
+        _sources: &[ProjectFile],
+        _edges: &[crate::analyzer::PersistedImportEdge],
+    ) -> Result<bool, crate::analyzer::store::StoreError> {
+        Ok(false)
+    }
+
+    fn refresh_persisted_import_graph(
+        &self,
+        content_identity: crate::analyzer::content_identity::WorkspaceContentIdentity,
+        cancellation: Option<&crate::cancellation::CancellationToken>,
+        max_files: usize,
+        max_edges: usize,
+    ) -> Result<
+        Option<crate::analyzer::PersistedImportGraphRefresh>,
+        crate::analyzer::store::StoreError,
+    > {
+        let diagnostics = std::env::var_os("BIFROST_IMPORT_GRAPH_REFRESH_DIAGNOSTICS")
+            .is_some_and(|value| value == "1");
+        let refresh_started = std::time::Instant::now();
+        let Some(context) = &self.build_context else {
+            return Ok(None);
+        };
+        if !self.workspace_content_matches(content_identity)
+            || cancellation.is_some_and(crate::cancellation::CancellationToken::is_cancelled)
+        {
+            return Ok(None);
+        }
+
+        let mut files = self.analyzed_files();
+        files.sort_by_key(crate::path_utils::rel_path_string);
+        files.dedup();
+        let fact_indexes = self.workspace_fact_indexes();
+        let mut indexed_languages = fact_indexes
+            .iter()
+            .map(|index| index.fact_index_language())
+            .collect::<Vec<_>>();
+        indexed_languages.sort();
+        indexed_languages.dedup();
+        let mut workspace_languages = self.languages().into_iter().collect::<Vec<_>>();
+        workspace_languages.sort();
+        if indexed_languages != workspace_languages {
+            return Ok(None);
+        }
+
+        let mut blobs_by_path: HashMap<String, Vec<(String, git2::Oid)>> = HashMap::default();
+        for index in fact_indexes {
+            let language = index.fact_index_language().config_label().to_owned();
+            for (file, blob) in index.analyzed_blobs() {
+                blobs_by_path
+                    .entry(crate::path_utils::rel_path_string(&file))
+                    .or_default()
+                    .push((language.clone(), blob));
+            }
+        }
+        let files_by_language = group_files_by_language(&files, language_for_file);
+        let mut complete_dependency_paths: HashSet<String> = HashSet::default();
+        let mut module_path_keys_by_path: HashMap<String, Vec<String>> = HashMap::default();
+        for language_files in files_by_language.values() {
+            let Some(provider) = language_files
+                .first()
+                .and_then(|file| self.import_analysis_provider_for_file(file))
+            else {
+                continue;
+            };
+            if !provider.has_complete_import_resolution_dependencies() {
+                continue;
+            }
+            let Some(keys) = provider.import_graph_module_path_keys_for_files(language_files)
+            else {
+                continue;
+            };
+            assert_eq!(
+                keys.len(),
+                language_files.len(),
+                "complete import providers return module-path keys for every source"
+            );
+            for (file, keys) in keys {
+                let path = crate::path_utils::rel_path_string(&file);
+                complete_dependency_paths.insert(path.clone());
+                module_path_keys_by_path.insert(path, keys);
+            }
+        }
+        let mut sources = Vec::with_capacity(files.len());
+        for file in &files {
+            let path = crate::path_utils::rel_path_string(file);
+            let Some(mut blobs) = blobs_by_path.remove(&path) else {
+                return Ok(None);
+            };
+            blobs.sort_by(|left, right| left.0.cmp(&right.0).then_with(|| left.1.cmp(&right.1)));
+            let mut hasher = brokk_bifrost_core::analyzer::canonical_hash::CanonicalHasher::new(
+                b"bifrost-workspace-import-source:v1",
+            );
+            for (language, blob) in blobs {
+                hasher.field(&language, blob.as_bytes());
+            }
+            let module_path_keys = module_path_keys_by_path.remove(&path).unwrap_or_default();
+            let complete_resolution_dependencies = complete_dependency_paths.contains(&path);
+            sources.push(crate::analyzer::store::WorkspaceImportGraphSource {
+                source_path: path,
+                source_identity: hasher.finish(),
+                module_path_keys,
+                complete_resolution_dependencies,
+                input_digests: None,
+                binding_surface: None,
+            });
+        }
+        if !blobs_by_path.is_empty() {
+            return Ok(None);
+        }
+
+        let languages = workspace_languages
+            .iter()
+            .map(|language| language.config_label().to_owned())
+            .collect::<Vec<_>>();
+        let plan_started = std::time::Instant::now();
+        let resolver_identity = context.import_graph_resolver_identity(&languages)?;
+        let mut plan =
+            context.plan_import_graph_refresh(content_identity, &resolver_identity, &sources)?;
+        if plan.current {
+            return Ok(Some(crate::analyzer::PersistedImportGraphRefresh::default()));
+        }
+
+        let input_paths = if plan.full_rebuild {
+            files
+                .iter()
+                .map(crate::path_utils::rel_path_string)
+                .collect::<HashSet<_>>()
+        } else {
+            plan.changed_source_paths.iter().cloned().collect()
+        };
+        let mut input_digest_ns = 0_u128;
+        let mut input_digest_sources = 0_usize;
+        for language_files in files_by_language.values() {
+            let selected = language_files
+                .iter()
+                .filter(|file| input_paths.contains(&crate::path_utils::rel_path_string(file)))
+                .cloned()
+                .collect::<Vec<_>>();
+            if selected.is_empty() {
+                continue;
+            }
+            let Some(provider) = language_files
+                .first()
+                .and_then(|file| self.import_analysis_provider_for_file(file))
+            else {
+                continue;
+            };
+            if !provider.has_complete_import_resolution_dependencies() {
+                continue;
+            }
+            let started = std::time::Instant::now();
+            let Some(digests) =
+                provider.import_graph_input_digests_for_files(&selected, cancellation)
+            else {
+                input_digest_ns = input_digest_ns.saturating_add(started.elapsed().as_nanos());
+                continue;
+            };
+            input_digest_ns = input_digest_ns.saturating_add(started.elapsed().as_nanos());
+            assert_eq!(
+                digests.len(),
+                selected.len(),
+                "complete import providers return input digests for every selected source"
+            );
+            input_digest_sources += digests.len();
+            for (file, input_digests) in digests {
+                let path = crate::path_utils::rel_path_string(&file);
+                let source = sources
+                    .iter_mut()
+                    .find(|source| source.source_path == path)
+                    .expect("fingerprinted file belongs to the workspace source inventory");
+                source.input_digests = Some(input_digests);
+            }
+        }
+        let plan_ns = plan_started.elapsed().as_nanos();
+        let publish_started = std::time::Instant::now();
+        let identity_advanced = context.advance_import_graph_identity(
+            content_identity,
+            &resolver_identity,
+            &plan,
+            &sources,
+        )?;
+        let publish_ns = publish_started.elapsed().as_nanos();
+        if identity_advanced {
+            if diagnostics {
+                eprintln!(
+                    "BIFROST_IMPORT_GRAPH_REFRESH total_ns={} plan_ns={} surface_ns=0 input_digest_ns={} resolve_ns=0 publish_ns={} changed_sources={} dirty_importers={} dirty_import_ordinals={} dirty_lookup_ordinals={} input_digest_sources={} resolved_files=0 resolved_imports=0 resolved_edges=0 edge_snapshot_rows=0 dependency_delta_rows=0 dml_rows=0 full_rebuild=false identity_only=true",
+                    refresh_started.elapsed().as_nanos(),
+                    plan_ns,
+                    input_digest_ns,
+                    publish_ns,
+                    plan.changed_source_paths.len(),
+                    plan.dirty_importer_paths.len(),
+                    plan.dirty_import_ordinals.len(),
+                    plan.dirty_lookup_ordinals.len(),
+                    input_digest_sources,
+                );
+            }
+            return Ok(Some(crate::analyzer::PersistedImportGraphRefresh::default()));
+        }
+        let surface_paths = if plan.full_rebuild {
+            files
+                .iter()
+                .map(crate::path_utils::rel_path_string)
+                .collect::<HashSet<_>>()
+        } else {
+            plan.changed_source_paths.iter().cloned().collect()
+        };
+        let mut surface_ns = 0_u128;
+        for language_files in files_by_language.values() {
+            let selected = language_files
+                .iter()
+                .filter(|file| surface_paths.contains(&crate::path_utils::rel_path_string(file)))
+                .cloned()
+                .collect::<Vec<_>>();
+            if selected.is_empty() {
+                continue;
+            }
+            let Some(provider) = language_files
+                .first()
+                .and_then(|file| self.import_analysis_provider_for_file(file))
+            else {
+                continue;
+            };
+            if !provider.has_complete_import_resolution_dependencies() {
+                continue;
+            }
+            let started = std::time::Instant::now();
+            let Some(surfaces) =
+                provider.import_graph_binding_surfaces_for_files(&selected, cancellation)
+            else {
+                surface_ns = surface_ns.saturating_add(started.elapsed().as_nanos());
+                continue;
+            };
+            surface_ns = surface_ns.saturating_add(started.elapsed().as_nanos());
+            assert_eq!(
+                surfaces.len(),
+                selected.len(),
+                "complete import providers return binding surfaces for every selected source"
+            );
+            for (file, bindings) in surfaces {
+                let path = crate::path_utils::rel_path_string(&file);
+                let source = sources
+                    .iter_mut()
+                    .find(|source| source.source_path == path)
+                    .expect("changed binding surface belongs to a workspace source");
+                source.binding_surface = Some(
+                    bindings
+                        .into_iter()
+                        .flat_map(
+                            crate::analyzer::store::WorkspaceImportGraphBinding::from_provider_surface,
+                        )
+                        .collect(),
+                );
+            }
+        }
+        plan = context.plan_import_graph_refresh(content_identity, &resolver_identity, &sources)?;
+        let plan_ns = plan_started.elapsed().as_nanos();
+        if plan.full_rebuild {
+            assert_eq!(
+                plan.dirty_importer_paths.len(),
+                files.len(),
+                "a full import graph refresh resolves every analyzed source"
+            );
+        }
+        if plan.current {
+            return Ok(Some(crate::analyzer::PersistedImportGraphRefresh::default()));
+        }
+        let mut dirty_paths = plan
+            .dirty_importer_paths
+            .iter()
+            .map(String::as_str)
+            .collect::<HashSet<_>>();
+        dirty_paths.extend(
+            plan.dirty_import_ordinals
+                .iter()
+                .map(|(path, _)| path.as_str()),
+        );
+        let dirty_files = files
+            .iter()
+            .filter(|file| dirty_paths.contains(crate::path_utils::rel_path_string(file).as_str()))
+            .cloned()
+            .collect::<Vec<_>>();
+        let mut selected_paths: HashMap<String, Vec<u32>> = HashMap::default();
+        for (path, ordinal) in &plan.dirty_import_ordinals {
+            if plan.dirty_importer_paths.binary_search(path).is_ok() {
+                continue;
+            }
+            selected_paths
+                .entry(path.clone())
+                .or_default()
+                .push(*ordinal);
+        }
+        for ordinals in selected_paths.values_mut() {
+            ordinals.sort_unstable();
+            ordinals.dedup();
+        }
+        let selected_ordinals = files
+            .iter()
+            .filter_map(|file| {
+                selected_paths
+                    .remove(&crate::path_utils::rel_path_string(file))
+                    .map(|ordinals| (file.clone(), ordinals))
+            })
+            .collect::<HashMap<_, _>>();
+        let mut graph =
+            crate::analyzer::structural::derived_cache::RequestLocalDirectImportGraph::from_files(
+                files.clone(),
+            );
+        let scope = cancellation.map_or_else(
+            || AnalyzerQueryScope::new(self),
+            |token| AnalyzerQueryScope::with_cancellation(self, token),
+        );
+        let resolve_started = std::time::Instant::now();
+        let exhausted = graph.ensure_forward_selected(
+            self,
+            scope.token(),
+            &dirty_files,
+            &selected_ordinals,
+            max_files,
+            max_edges,
+            cancellation,
+        );
+        let resolve_ns = resolve_started.elapsed().as_nanos();
+        if exhausted
+            || cancellation.is_some_and(crate::cancellation::CancellationToken::is_cancelled)
+            || dirty_files
+                .iter()
+                .any(|file| !graph.has_cached_forward(file) || !graph.supports_source(file))
+            || dirty_files.iter().any(|file| {
+                let path = crate::path_utils::rel_path_string(file);
+                complete_dependency_paths.contains(&path)
+                    && !graph.has_resolution_dependencies(file)
+            })
+            || !self.workspace_content_matches(content_identity)
+        {
+            return Ok(None);
+        }
+        let edges = graph.persisted_edges();
+        let dependencies = graph.persisted_resolution_dependencies();
+        let publish_started = std::time::Instant::now();
+        let published = context.publish_import_graph_refresh(
+            content_identity,
+            &resolver_identity,
+            &plan,
+            sources.len(),
+            &sources,
+            &edges,
+            &dependencies,
+        )?;
+        let publish_ns = publish_started.elapsed().as_nanos();
+        if !published {
+            return Ok(None);
+        }
+        if diagnostics {
+            eprintln!(
+                "BIFROST_IMPORT_GRAPH_REFRESH total_ns={} plan_ns={} surface_ns={} input_digest_ns={} resolve_ns={} publish_ns={} changed_sources={} dirty_importers={} dirty_import_ordinals={} dirty_lookup_ordinals={} input_digest_sources={} resolved_files={} resolved_imports={} resolved_edges={} full_rebuild={} identity_only=false",
+                refresh_started.elapsed().as_nanos(),
+                plan_ns,
+                surface_ns,
+                input_digest_ns,
+                resolve_ns,
+                publish_ns,
+                plan.changed_source_paths.len(),
+                dirty_files.len(),
+                plan.dirty_import_ordinals.len(),
+                plan.dirty_lookup_ordinals.len(),
+                input_digest_sources,
+                graph.resolved_files(),
+                graph.resolved_imports(),
+                graph.resolved_edges(),
+                plan.full_rebuild
+            );
+        }
+        Ok(Some(crate::analyzer::PersistedImportGraphRefresh {
+            recomputed_files: graph.resolved_files(),
+            recomputed_imports: graph.resolved_imports(),
+            recomputed_edges: graph.resolved_edges(),
+        }))
+    }
+
     /// One entry per delegate that publishes one, in delegate order.
     ///
     /// A delegate that publishes none is simply absent, which is why the
@@ -2686,13 +3522,7 @@ impl IAnalyzer for MultiAnalyzer {
     }
 
     fn get_test_modules(&self, files: &[ProjectFile]) -> Vec<String> {
-        let mut grouped: BTreeMap<Language, Vec<ProjectFile>> = BTreeMap::new();
-        for file in files {
-            grouped
-                .entry(self.dispatch_language(file))
-                .or_default()
-                .push(file.clone());
-        }
+        let grouped = group_files_by_language(files, |file| self.dispatch_language(file));
 
         let mut modules = Vec::new();
         for (language, group) in grouped {
@@ -2708,13 +3538,7 @@ impl IAnalyzer for MultiAnalyzer {
     }
 
     fn test_files_to_code_units(&self, files: &[ProjectFile]) -> BTreeSet<CodeUnit> {
-        let mut grouped: BTreeMap<Language, Vec<ProjectFile>> = BTreeMap::new();
-        for file in files {
-            grouped
-                .entry(self.dispatch_language(file))
-                .or_default()
-                .push(file.clone());
-        }
+        let grouped = group_files_by_language(files, |file| self.dispatch_language(file));
 
         let mut result = BTreeSet::new();
         for (language, group) in grouped {
@@ -2731,34 +3555,22 @@ impl IAnalyzer for MultiAnalyzer {
 #[cfg(any(test, feature = "test-support"))]
 impl crate::analyzer::AnalyzerTestHooks for MultiAnalyzer {
     fn arm_selector_continuation_semantic_cache_invalidation_for_test(&self) {
-        for delegate in self.delegates.values() {
-            delegate
-                .analyzer()
-                .test_hooks()
-                .arm_selector_continuation_semantic_cache_invalidation_for_test();
-        }
+        self.delegate_test_hooks().for_each(|hooks| {
+            hooks.arm_selector_continuation_semantic_cache_invalidation_for_test();
+        });
     }
 
     fn invalidate_selector_continuation_semantic_cache_if_armed_for_test(&self) {
-        for delegate in self.delegates.values() {
-            delegate
-                .analyzer()
-                .test_hooks()
-                .invalidate_selector_continuation_semantic_cache_if_armed_for_test();
-        }
+        self.delegate_test_hooks().for_each(|hooks| {
+            hooks.invalidate_selector_continuation_semantic_cache_if_armed_for_test();
+        });
     }
 
     fn selector_continuation_semantic_cache_revival_census_for_test(
         &self,
     ) -> crate::analyzer::semantic::SemanticCacheRevivalCensus {
-        self.delegates
-            .values()
-            .map(|delegate| {
-                delegate
-                    .analyzer()
-                    .test_hooks()
-                    .selector_continuation_semantic_cache_revival_census_for_test()
-            })
+        self.delegate_test_hooks()
+            .map(|hooks| hooks.selector_continuation_semantic_cache_revival_census_for_test())
             .fold(
                 crate::analyzer::semantic::SemanticCacheRevivalCensus::default(),
                 crate::analyzer::semantic::SemanticCacheRevivalCensus::saturating_add,
@@ -2766,33 +3578,23 @@ impl crate::analyzer::AnalyzerTestHooks for MultiAnalyzer {
     }
 
     fn arm_evaluation_root_continuation_semantic_cache_invalidation_for_test(&self) {
-        for delegate in self.delegates.values() {
-            delegate
-                .analyzer()
-                .test_hooks()
-                .arm_evaluation_root_continuation_semantic_cache_invalidation_for_test();
-        }
+        self.delegate_test_hooks().for_each(|hooks| {
+            hooks.arm_evaluation_root_continuation_semantic_cache_invalidation_for_test();
+        });
     }
 
     fn invalidate_evaluation_root_continuation_semantic_cache_if_armed_for_test(&self) {
-        for delegate in self.delegates.values() {
-            delegate
-                .analyzer()
-                .test_hooks()
-                .invalidate_evaluation_root_continuation_semantic_cache_if_armed_for_test();
-        }
+        self.delegate_test_hooks().for_each(|hooks| {
+            hooks.invalidate_evaluation_root_continuation_semantic_cache_if_armed_for_test();
+        });
     }
 
     fn evaluation_root_continuation_semantic_cache_revival_census_for_test(
         &self,
     ) -> crate::analyzer::semantic::SemanticCacheRevivalCensus {
-        self.delegates
-            .values()
-            .map(|delegate| {
-                delegate
-                    .analyzer()
-                    .test_hooks()
-                    .evaluation_root_continuation_semantic_cache_revival_census_for_test()
+        self.delegate_test_hooks()
+            .map(|hooks| {
+                hooks.evaluation_root_continuation_semantic_cache_revival_census_for_test()
             })
             .fold(
                 crate::analyzer::semantic::SemanticCacheRevivalCensus::default(),
@@ -2807,80 +3609,42 @@ impl crate::analyzer::AnalyzerTestHooks for MultiAnalyzer {
         crate::analyzer::semantic::SemanticMaterializationCensus,
     )> {
         let mut census: Vec<_> = self
-            .delegates
-            .values()
-            .flat_map(|delegate| {
-                delegate
-                    .analyzer()
-                    .test_hooks()
-                    .semantic_materialization_census_for_test()
-            })
+            .delegate_test_hooks()
+            .flat_map(|hooks| hooks.semantic_materialization_census_for_test())
             .collect();
         census.sort_by(|left, right| left.0.cmp(&right.0));
         census
     }
 
     fn reset_definition_candidates_query_count_for_test(&self) {
-        for delegate in self.delegates.values() {
-            delegate
-                .analyzer()
-                .test_hooks()
-                .reset_definition_candidates_query_count_for_test();
-        }
+        self.delegate_test_hooks()
+            .for_each(|hooks| hooks.reset_definition_candidates_query_count_for_test());
     }
 
     fn definition_candidates_query_count_for_test(&self) -> usize {
-        self.delegates
-            .values()
-            .map(|delegate| {
-                delegate
-                    .analyzer()
-                    .test_hooks()
-                    .definition_candidates_query_count_for_test()
-            })
-            .sum()
+        self.sum_delegate_test_hook_counts(|hooks| {
+            hooks.definition_candidates_query_count_for_test()
+        })
     }
 
     fn reset_definition_prefetch_batch_count_for_test(&self) {
-        for delegate in self.delegates.values() {
-            delegate
-                .analyzer()
-                .test_hooks()
-                .reset_definition_prefetch_batch_count_for_test();
-        }
+        self.delegate_test_hooks()
+            .for_each(|hooks| hooks.reset_definition_prefetch_batch_count_for_test());
     }
 
     fn definition_prefetch_batch_count_for_test(&self) -> usize {
-        self.delegates
-            .values()
-            .map(|delegate| {
-                delegate
-                    .analyzer()
-                    .test_hooks()
-                    .definition_prefetch_batch_count_for_test()
-            })
-            .sum()
+        self.sum_delegate_test_hook_counts(|hooks| hooks.definition_prefetch_batch_count_for_test())
     }
 
     fn reset_relational_definition_batch_call_count_for_test(&self) {
-        for delegate in self.delegates.values() {
-            delegate
-                .analyzer()
-                .test_hooks()
-                .reset_relational_definition_batch_call_count_for_test();
-        }
+        self.delegate_test_hooks()
+            .for_each(|hooks| hooks.reset_relational_definition_batch_call_count_for_test());
     }
 
     fn relational_definition_batch_call_count_for_test(&self) -> usize {
-        self.delegates
-            .values()
-            .map(|delegate| {
-                delegate
-                    .analyzer()
-                    .test_hooks()
-                    .relational_definition_batch_call_count_for_test()
-            })
-            .sum()
+        self.sum_delegate_test_hook_counts(|hooks| {
+            hooks.relational_definition_batch_call_count_for_test()
+        })
     }
 
     // `resolve_definition_batch_with_source` is called with whatever
@@ -2889,13 +3653,15 @@ impl crate::analyzer::AnalyzerTestHooks for MultiAnalyzer {
     // therefore lives on this instance directly instead of being summed from
     // the delegates the way the other counters above are.
     fn record_resolve_definition_batch_with_source_call_for_test(&self) {
-        self.resolve_definition_batch_with_source_call_count
-            .fetch_add(1, Ordering::Relaxed);
+        crate::analyzer::i_analyzer::increment_test_hook_counter(
+            &self.resolve_definition_batch_with_source_call_count,
+        );
     }
 
     fn reset_resolve_definition_batch_with_source_call_count_for_test(&self) {
-        self.resolve_definition_batch_with_source_call_count
-            .store(0, Ordering::Relaxed);
+        crate::analyzer::i_analyzer::reset_test_hook_counter(
+            &self.resolve_definition_batch_with_source_call_count,
+        );
     }
 
     fn resolve_definition_batch_with_source_call_count_for_test(&self) -> usize {
@@ -2904,75 +3670,34 @@ impl crate::analyzer::AnalyzerTestHooks for MultiAnalyzer {
     }
 
     fn reset_full_declaration_scan_count_for_test(&self) {
-        for delegate in self.delegates.values() {
-            delegate
-                .analyzer()
-                .test_hooks()
-                .reset_full_declaration_scan_count_for_test();
-        }
+        self.delegate_test_hooks()
+            .for_each(|hooks| hooks.reset_full_declaration_scan_count_for_test());
     }
 
     fn full_declaration_scan_count_for_test(&self) -> usize {
-        self.delegates
-            .values()
-            .map(|delegate| {
-                delegate
-                    .analyzer()
-                    .test_hooks()
-                    .full_declaration_scan_count_for_test()
-            })
-            .sum()
+        self.sum_delegate_test_hook_counts(|hooks| hooks.full_declaration_scan_count_for_test())
     }
 
     fn reset_candidate_hydration_count_for_test(&self) {
-        for delegate in self.delegates.values() {
-            delegate
-                .analyzer()
-                .test_hooks()
-                .reset_candidate_hydration_count_for_test();
-        }
+        self.delegate_test_hooks()
+            .for_each(|hooks| hooks.reset_candidate_hydration_count_for_test());
     }
 
     fn candidate_hydration_count_for_test(&self) -> usize {
-        self.delegates
-            .values()
-            .map(|delegate| {
-                delegate
-                    .analyzer()
-                    .test_hooks()
-                    .candidate_hydration_count_for_test()
-            })
-            .sum()
+        self.sum_delegate_test_hook_counts(|hooks| hooks.candidate_hydration_count_for_test())
     }
 
     fn full_candidate_hydration_count_for_test(&self) -> usize {
-        self.delegates
-            .values()
-            .map(|delegate| {
-                delegate
-                    .analyzer()
-                    .test_hooks()
-                    .full_candidate_hydration_count_for_test()
-            })
-            .sum()
+        self.sum_delegate_test_hook_counts(|hooks| hooks.full_candidate_hydration_count_for_test())
     }
 
     fn bulk_candidate_hydration_count_for_test(&self) -> usize {
-        self.delegates
-            .values()
-            .map(|delegate| {
-                delegate
-                    .analyzer()
-                    .test_hooks()
-                    .bulk_candidate_hydration_count_for_test()
-            })
-            .sum()
+        self.sum_delegate_test_hook_counts(|hooks| hooks.bulk_candidate_hydration_count_for_test())
     }
 
     fn reset_java_usage_evidence_cache_stats_for_test(&self) {
         self.snapshot_caches
-            .java_usage_evidence()
-            .reset_stats_for_test();
+            .reset_java_usage_evidence_stats_for_test();
     }
 
     fn java_usage_evidence_cache_stats_for_test(
@@ -2982,99 +3707,43 @@ impl crate::analyzer::AnalyzerTestHooks for MultiAnalyzer {
     }
 
     fn reset_workspace_path_scan_count_for_test(&self) {
-        for delegate in self.delegates.values() {
-            delegate
-                .analyzer()
-                .test_hooks()
-                .reset_workspace_path_scan_count_for_test();
-        }
+        self.delegate_test_hooks()
+            .for_each(|hooks| hooks.reset_workspace_path_scan_count_for_test());
     }
 
     fn workspace_path_scan_count_for_test(&self) -> usize {
-        self.delegates
-            .values()
-            .map(|delegate| {
-                delegate
-                    .analyzer()
-                    .test_hooks()
-                    .workspace_path_scan_count_for_test()
-            })
-            .sum()
+        self.sum_delegate_test_hook_counts(|hooks| hooks.workspace_path_scan_count_for_test())
     }
 
     fn reset_scala_project_types_build_count_for_test(&self) {
-        for delegate in self.delegates.values() {
-            delegate
-                .analyzer()
-                .test_hooks()
-                .reset_scala_project_types_build_count_for_test();
-        }
+        self.delegate_test_hooks()
+            .for_each(|hooks| hooks.reset_scala_project_types_build_count_for_test());
     }
 
     fn scala_project_types_build_count_for_test(&self) -> usize {
-        self.delegates
-            .values()
-            .map(|delegate| {
-                delegate
-                    .analyzer()
-                    .test_hooks()
-                    .scala_project_types_build_count_for_test()
-            })
-            .sum()
+        self.sum_delegate_test_hook_counts(|hooks| hooks.scala_project_types_build_count_for_test())
     }
 
     fn reset_scala_query_scan_counts_for_test(&self) {
-        for delegate in self.delegates.values() {
-            delegate
-                .analyzer()
-                .test_hooks()
-                .reset_scala_query_scan_counts_for_test();
-        }
+        self.delegate_test_hooks()
+            .for_each(|hooks| hooks.reset_scala_query_scan_counts_for_test());
     }
 
     fn scala_query_parse_count_for_test(&self) -> usize {
-        self.delegates
-            .values()
-            .map(|delegate| {
-                delegate
-                    .analyzer()
-                    .test_hooks()
-                    .scala_query_parse_count_for_test()
-            })
-            .sum()
+        self.sum_delegate_test_hook_counts(|hooks| hooks.scala_query_parse_count_for_test())
     }
 
     fn scala_query_walk_count_for_test(&self) -> usize {
-        self.delegates
-            .values()
-            .map(|delegate| {
-                delegate
-                    .analyzer()
-                    .test_hooks()
-                    .scala_query_walk_count_for_test()
-            })
-            .sum()
+        self.sum_delegate_test_hook_counts(|hooks| hooks.scala_query_walk_count_for_test())
     }
 
     fn reset_scala_query_file_facts_touched_for_test(&self) {
-        for delegate in self.delegates.values() {
-            delegate
-                .analyzer()
-                .test_hooks()
-                .reset_scala_query_file_facts_touched_for_test();
-        }
+        self.delegate_test_hooks()
+            .for_each(|hooks| hooks.reset_scala_query_file_facts_touched_for_test());
     }
 
     fn scala_query_file_facts_touched_for_test(&self) -> usize {
-        self.delegates
-            .values()
-            .map(|delegate| {
-                delegate
-                    .analyzer()
-                    .test_hooks()
-                    .scala_query_file_facts_touched_for_test()
-            })
-            .sum()
+        self.sum_delegate_test_hook_counts(|hooks| hooks.scala_query_file_facts_touched_for_test())
     }
 }
 
@@ -3083,113 +3752,6 @@ mod tests {
     use super::*;
     use crate::analyzer::FileSetProject;
     use brokk_bifrost_core::analyzer::{RelationalDefinitionQuery, RelationalName};
-
-    fn project_file(rel_path: &str) -> ProjectFile {
-        let root = if cfg!(windows) {
-            std::path::PathBuf::from("C:\\tmp")
-        } else {
-            std::path::PathBuf::from("/tmp")
-        };
-        ProjectFile::new(root, rel_path)
-    }
-
-    #[test]
-    fn js_ts_config_files_are_routed_as_delegate_relevant_changes() {
-        assert!(is_js_ts_config_file(&project_file("tsconfig.json")));
-        assert!(is_js_ts_config_file(&project_file(
-            "packages/app/jsconfig.json"
-        )));
-        assert!(!is_js_ts_config_file(&project_file("package.json")));
-        assert!(!is_js_ts_config_file(&project_file("src/app.ts")));
-    }
-
-    #[test]
-    fn default_multi_analyzer_preserves_the_default_derived_layer_budget() {
-        let analyzer = MultiAnalyzer::default();
-        assert_eq!(
-            analyzer.derived_layer_budget_bytes,
-            crate::analyzer::structural::derived_cache::SnapshotDerivedLayerCache::DEFAULT_MAX_RETAINED_BYTES
-        );
-        assert_eq!(
-            analyzer
-                .snapshot_caches
-                .derived_layers()
-                .max_retained_bytes(),
-            analyzer.derived_layer_budget_bytes
-        );
-    }
-
-    #[test]
-    fn java_build_inputs_are_routed_as_delegate_relevant_changes() {
-        assert!(is_language_configuration_input(
-            Language::Java,
-            &project_file("pom.xml")
-        ));
-        assert!(is_language_configuration_input(
-            Language::Java,
-            &project_file("gradle/dependency-locks/runtime.lockfile")
-        ));
-        assert!(is_language_configuration_input(
-            Language::Java,
-            &project_file("buildSrc/src/main/java/Plugin.java")
-        ));
-        assert!(!is_language_configuration_input(
-            Language::Java,
-            &project_file("src/App.java")
-        ));
-    }
-
-    #[test]
-    fn csharp_dependency_inputs_are_routed_as_delegate_relevant_changes() {
-        assert!(is_language_configuration_input(
-            Language::CSharp,
-            &project_file("obj/project.assets.json")
-        ));
-        assert!(is_language_configuration_input(
-            Language::CSharp,
-            &project_file("App.csproj")
-        ));
-        assert!(is_language_configuration_input(
-            Language::CSharp,
-            &project_file("bin/App.dll")
-        ));
-        assert!(!is_language_configuration_input(
-            Language::CSharp,
-            &project_file("src/App.cs")
-        ));
-    }
-
-    #[test]
-    fn go_module_manifests_are_routed_as_delegate_relevant_changes() {
-        assert!(is_language_configuration_input(
-            Language::Go,
-            &project_file("go.mod")
-        ));
-        assert!(is_language_configuration_input(
-            Language::Go,
-            &project_file("go.sum")
-        ));
-        assert!(!is_language_configuration_input(
-            Language::Go,
-            &project_file("pkg/foo.go")
-        ));
-    }
-
-    #[test]
-    fn cargo_manifests_are_routed_as_delegate_relevant_changes() {
-        assert!(is_language_configuration_input(
-            Language::Rust,
-            &project_file("Cargo.toml")
-        ));
-        assert!(is_language_configuration_input(
-            Language::Rust,
-            &project_file("crates/dep/Cargo.toml")
-        ));
-        assert!(!is_language_configuration_input(
-            Language::Rust,
-            &project_file("src/lib.rs")
-        ));
-    }
 
     /// A two-language workspace on disk, as a `MultiAnalyzer` over real
     /// per-language delegates.  The merged definition view is only meaningful
@@ -3224,55 +3786,6 @@ mod tests {
             ),
         ]);
         (temp, MultiAnalyzer::new(delegates))
-    }
-
-    #[test]
-    fn relational_workspace_batch_merges_language_projections() {
-        let (_temp, analyzer) = two_language_analyzer();
-        let root = analyzer.project().root().to_path_buf();
-        let java_file = ProjectFile::new(root.clone(), "src/App.java");
-        let rust_file = ProjectFile::new(root, "src/lib.rs");
-        let java = analyzer
-            .declarations(&java_file)
-            .into_iter()
-            .find(CodeUnit::is_class)
-            .expect("Java class declaration");
-        let rust = analyzer
-            .declarations(&rust_file)
-            .into_iter()
-            .find(CodeUnit::is_class)
-            .expect("Rust struct declaration");
-        let requests = [
-            RelationalDefinitionRequest {
-                ordinal: 9,
-                language_scope: DefinitionLanguageScope::Workspace,
-                name: RelationalName::stable(java.fq().clone()),
-                query: RelationalDefinitionQuery::ExactName,
-            },
-            RelationalDefinitionRequest {
-                ordinal: 4,
-                language_scope: DefinitionLanguageScope::Workspace,
-                name: RelationalName::stable(rust.fq().clone()),
-                query: RelationalDefinitionQuery::ExactName,
-            },
-        ];
-
-        let RelationalBatchOutcome::Complete(results) =
-            analyzer.relational_definition_batch(&requests, &crate::CancellationToken::new())
-        else {
-            panic!("mixed relational batch should complete");
-        };
-        assert_eq!(results.len(), 2);
-        assert_eq!(results[0].ordinal, 9);
-        assert_eq!(results[1].ordinal, 4);
-        assert_eq!(
-            results[0].value,
-            RelationalDefinitionValue::Definitions(vec![java])
-        );
-        assert_eq!(
-            results[1].value,
-            RelationalDefinitionValue::Definitions(vec![rust])
-        );
     }
 
     #[cfg_attr(not(scheduled_tests), ignore = "scheduled-only")]
@@ -3349,9 +3862,7 @@ mod tests {
         ecosystem: crate::analyzer::usages::workspace_graph::UsageEcosystem,
     ) -> crate::analyzer::usages::workspace_graph_cache::WorkspaceUsageGraphCacheLifecycle {
         use crate::analyzer::usages::workspace_graph::WorkspaceUsageRankingGraph;
-        use crate::analyzer::usages::workspace_graph_cache::{
-            WorkspaceUsageGraphCacheAcquisition, WorkspaceUsageGraphCacheBuildOutcome,
-        };
+        use crate::analyzer::usages::workspace_graph_cache::WorkspaceUsageGraphCacheBuildOutcome;
         let acquisition = analyzer.snapshot_caches.usage_graphs().acquire(
             usage_graph_key(analyzer, ecosystem),
             &crate::cancellation::CancellationToken::default(),
@@ -3365,14 +3876,7 @@ mod tests {
             },
             || true,
         );
-        match acquisition {
-            WorkspaceUsageGraphCacheAcquisition::Ready { lifecycle, .. } => lifecycle,
-            WorkspaceUsageGraphCacheAcquisition::Incomplete(_) => {
-                panic!("complete test graph unexpectedly incomplete")
-            }
-            WorkspaceUsageGraphCacheAcquisition::Cancelled => panic!("unexpected cancellation"),
-            WorkspaceUsageGraphCacheAcquisition::Stale => panic!("unexpected stale result"),
-        }
+        crate::analyzer::usages::workspace_graph_cache::ready_graph(acquisition).1
     }
 
     /// Milestone J (#2449) case (a): a usage graph is scoped to its ecosystems,
@@ -3565,19 +4069,52 @@ mod tests {
         );
     }
 
-    #[cfg_attr(not(scheduled_tests), ignore = "scheduled-only")]
     #[test]
-    fn overlay_snapshot_allocates_fresh_snapshot_caches() {
+    fn relational_workspace_batch_merges_language_projections() {
         let (_temp, analyzer) = two_language_analyzer();
-        let project: Arc<dyn Project> = Arc::new(FileSetProject::new(
-            analyzer.project().root().to_path_buf(),
-            [std::path::PathBuf::from("src/App.java")],
-        ));
-        let snapshot = analyzer.clone_with_project(project);
+        let root = analyzer.project().root().to_path_buf();
+        let java_file = ProjectFile::new(root.clone(), "src/App.java");
+        let rust_file = ProjectFile::new(root, "src/lib.rs");
+        let java = analyzer
+            .declarations(&java_file)
+            .into_iter()
+            .find(CodeUnit::is_class)
+            .expect("Java class declaration");
+        let rust = analyzer
+            .declarations(&rust_file)
+            .into_iter()
+            .find(CodeUnit::is_class)
+            .expect("Rust struct declaration");
+        let requests = [
+            RelationalDefinitionRequest {
+                ordinal: 9,
+                language_scope: DefinitionLanguageScope::Workspace,
+                name: RelationalName::stable(java.fq().clone()),
+                query: RelationalDefinitionQuery::ExactName,
+            },
+            RelationalDefinitionRequest {
+                ordinal: 4,
+                language_scope: DefinitionLanguageScope::Workspace,
+                name: RelationalName::stable(rust.fq().clone()),
+                query: RelationalDefinitionQuery::ExactName,
+            },
+        ];
 
-        assert!(!Arc::ptr_eq(
-            &analyzer.snapshot_caches,
-            &snapshot.snapshot_caches
-        ));
+        let RelationalBatchOutcome::Complete(results) =
+            analyzer.relational_definition_batch(&requests, &crate::CancellationToken::new())
+        else {
+            panic!("mixed relational batch should complete");
+        };
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0].ordinal, 9);
+        assert_eq!(results[1].ordinal, 4);
+        assert_eq!(
+            results[0].value,
+            RelationalDefinitionValue::Definitions(vec![java])
+        );
+        assert_eq!(
+            results[1].value,
+            RelationalDefinitionValue::Definitions(vec![rust])
+        );
     }
 }

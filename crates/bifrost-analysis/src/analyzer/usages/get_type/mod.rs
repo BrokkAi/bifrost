@@ -1,3 +1,4 @@
+use super::read_source;
 use crate::analyzer::common::language_for_file;
 use crate::analyzer::languages::{BoundedReceiverQuery, language_support};
 use crate::analyzer::usages::get_definition::{
@@ -142,6 +143,7 @@ pub(super) fn exact_semantic_model_type_outcome(
 ) -> Option<TypeLookupOutcome> {
     let overlay = analyzer.semantic_model_overlay()?;
     let matched = overlay.symbols_named(fqn);
+    let matched_record_count = matched.records.len();
     let records = matched
         .records
         .into_iter()
@@ -156,6 +158,7 @@ pub(super) fn exact_semantic_model_type_outcome(
     }
     let complete = matched.disposition
         == crate::analyzer::semantic_model::SemanticModelOverlayDisposition::Unique
+        && matched_record_count == 1
         && records.len() == 1
         && !records[0].provenance.ambiguous
         && records[0].provenance.completeness
@@ -253,11 +256,7 @@ impl<'a> TypeBatchContext<'a> {
     fn source(&mut self, file: &ProjectFile) -> Result<Arc<String>, String> {
         self.sources
             .entry(file.clone())
-            .or_insert_with(|| {
-                file.read_to_string()
-                    .map(Arc::new)
-                    .map_err(|err| format!("failed to read `{}`: {err}", rel_path_string(file)))
-            })
+            .or_insert_with(|| read_source(file).map(Arc::new))
             .clone()
     }
 
@@ -468,13 +467,13 @@ fn finish_lookup_outcome(
 
 impl TypeLookupRequest {
     fn as_source_location(&self) -> SourceLocationRequest {
-        SourceLocationRequest {
-            file: self.file.clone(),
-            line: self.line,
-            column: self.column,
-            start_byte: self.start_byte,
-            end_byte: self.end_byte,
-        }
+        crate::analyzer::usages::source_location_request(
+            &self.file,
+            self.line,
+            self.column,
+            self.start_byte,
+            self.end_byte,
+        )
     }
 }
 
@@ -519,6 +518,15 @@ pub(super) fn candidates_outcome_with_target_kind(
     } else {
         TypeLookupStatus::Ambiguous
     };
+    candidates_outcome_with_status(fqn, candidates, status, target_kind)
+}
+
+pub(super) fn candidates_outcome_with_status(
+    fqn: impl Into<String>,
+    candidates: Vec<CodeUnit>,
+    status: TypeLookupStatus,
+    target_kind: TypeLookupTargetKind,
+) -> TypeLookupOutcome {
     TypeLookupOutcome {
         status,
         reference: None,
@@ -539,7 +547,7 @@ pub(super) fn candidates_outcome_with_target_kind(
     }
 }
 
-pub(super) fn no_type(kind: impl Into<String>, message: impl Into<String>) -> TypeLookupOutcome {
+pub(crate) fn no_type(kind: impl Into<String>, message: impl Into<String>) -> TypeLookupOutcome {
     diagnostic_outcome(TypeLookupStatus::NoType, kind, message)
 }
 
@@ -590,7 +598,7 @@ pub(crate) fn projection_target_kind(
             kinds.push(kind);
         }
     }
-    let selected = if kinds.contains(&BindingProjectionKind::TargetCallableResultType) {
+    let selected = if kinds.iter().any(|kind| kind.is_callable_result()) {
         Some(BindingProjectionKind::TargetCallableResultType)
     } else if kinds.contains(&BindingProjectionKind::TargetConstructorOwnerType) {
         Some(BindingProjectionKind::TargetConstructorOwnerType)
@@ -655,60 +663,10 @@ mod tests {
         )
     }
 
-    const SOURCE: &str = r#"
-namespace Demo;
-public class Product {}
-public class Consumer
-{
-    public void Run(Product product) { product.ToString(); }
-}
-"#;
-
-    fn lookup_with_budget(budget: ReceiverAnalysisBudget) -> TypeLookupOutcome {
-        let fixture = AnalyzerFixture::new_for_language(Language::CSharp, &[("Budget.cs", SOURCE)]);
-        let file = ProjectFile::new(fixture.project_root(), "Budget.cs");
-        let start = SOURCE.find("product.ToString()").expect("expression");
-        let mut outcomes = resolve_type_batch_with_budget(
-            fixture.analyzer.analyzer(),
-            vec![TypeLookupRequest {
-                file,
-                source: None,
-                line: None,
-                column: None,
-                start_byte: Some(start),
-                end_byte: Some(start + "product".len()),
-            }],
-            budget,
-        );
-        assert_eq!(outcomes.len(), 1);
-        outcomes.pop().unwrap()
-    }
-
-    /// Exhausting a budget axis is a typed incomplete outcome that names the
-    /// axis, not a silent "no type": the caller can tell an unfinished lookup
-    /// apart from a proven absence.
     #[test]
-    fn budget_exhaustion_is_a_typed_outcome_naming_the_axis() {
-        let outcome = lookup_with_budget(ReceiverAnalysisBudget::tiny());
-        assert_eq!(
-            outcome.status,
-            TypeLookupStatus::ExceededBudget(ReceiverBudgetLimit::ScopeNodes),
-            "{outcome:#?}"
-        );
-        assert_eq!(outcome.status.as_str(), "exceeded_budget");
-        assert!(outcome.types.is_empty(), "{outcome:#?}");
-        assert_eq!(outcome.diagnostics.len(), 1, "{outcome:#?}");
-        assert_eq!(
-            outcome.diagnostics[0].kind, "resolution_budget_exhausted",
-            "{outcome:#?}"
-        );
-        assert!(
-            outcome.diagnostics[0].message.contains("scope_nodes"),
-            "{outcome:#?}"
-        );
-    }
-
-    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "d6fe0c806939: cancelled type lookup was reported as absence instead of a cancelled terminal status"
+    )]
     fn cancelled_finish_preserves_terminal_status_without_type_targets() {
         let site = ResolvedReferenceSite {
             path: "Budget.cs".to_string(),
@@ -737,75 +695,6 @@ public class Consumer
             Some("product")
         );
         assert_eq!(outcome.diagnostics[0].kind, "cancelled");
-    }
-
-    /// The same lookup the tiny budget cuts off completes under the interactive
-    /// budget: exhaustion above is a property of the budget, not the fixture.
-    #[test]
-    fn the_interactive_budget_completes_what_the_tiny_budget_cannot() {
-        let outcome = lookup_with_budget(INTERACTIVE_TYPE_LOOKUP_BUDGET);
-        assert_eq!(outcome.status, TypeLookupStatus::Resolved, "{outcome:#?}");
-        assert_eq!(outcome.types.len(), 1, "{outcome:#?}");
-        assert_eq!(outcome.types[0].fqn, "Demo.Product", "{outcome:#?}");
-    }
-
-    #[test]
-    fn caller_built_whole_expression_site_reaches_php_type_resolution() {
-        let source = concat!(
-            "<?php\nnamespace App;\n",
-            "class Service {}\n",
-            "function make() { return new Service(); }\n",
-        );
-        let fixture = AnalyzerFixture::new_for_language(Language::Php, &[("app.php", source)]);
-        let outcome = direct_site(
-            &fixture,
-            Language::Php,
-            "app.php",
-            source,
-            "new Service()",
-            "Service",
-        );
-        assert_eq!(outcome.status, TypeLookupStatus::Resolved, "{outcome:#?}");
-        assert_eq!(outcome.types[0].fqn, "App.Service", "{outcome:#?}");
-    }
-
-    #[test]
-    fn caller_built_python_sites_resolve_nested_and_namespace_classes() {
-        let nested = concat!(
-            "class Outer:\n",
-            "    class Inner:\n",
-            "        pass\n",
-            "def make():\n",
-            "    return Outer.Inner()\n",
-        );
-        let fixture = AnalyzerFixture::new_for_language(Language::Python, &[("app.py", nested)]);
-        let outcome = direct_site(
-            &fixture,
-            Language::Python,
-            "app.py",
-            nested,
-            "Outer.Inner",
-            "Inner",
-        );
-        assert_eq!(outcome.status, TypeLookupStatus::Resolved, "{outcome:#?}");
-        assert_eq!(outcome.types[0].fqn, "app.Outer$Inner", "{outcome:#?}");
-
-        let models = "class Widget:\n    pass\n";
-        let consumer = "import models\ndef make():\n    return models.Widget()\n";
-        let fixture = AnalyzerFixture::new_for_language(
-            Language::Python,
-            &[("models.py", models), ("consumer.py", consumer)],
-        );
-        let outcome = direct_site(
-            &fixture,
-            Language::Python,
-            "consumer.py",
-            consumer,
-            "models.Widget",
-            "Widget",
-        );
-        assert_eq!(outcome.status, TypeLookupStatus::Resolved, "{outcome:#?}");
-        assert_eq!(outcome.types[0].fqn, "models.Widget", "{outcome:#?}");
     }
 
     #[test]

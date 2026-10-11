@@ -1,5 +1,6 @@
 use super::*;
 use crate::CancellationToken;
+use crate::analyzer::languages::StructuralReceiverResolver;
 use crate::analyzer::semantic_model::{
     DependencyPackLimits, SemanticModelActivationRequest, SemanticModelRuntimeLimits,
     SemanticPackCatalog,
@@ -8,16 +9,34 @@ use crate::analyzer::usages::get_definition::{
     DefinitionLookupStatus, ExactExternalCallProof, ResolvedReferenceSite,
 };
 use crate::analyzer::{
-    AnalyzerConfig, CodeUnitIndex, DependencyPackEcosystem, DependencyPackWorkspaceContext,
-    GoAnalyzerConfig, GoDependencyDiscoveryConfig, GoDependencyDiscoveryMode, Language, Project,
-    Range,
+    AnalyzerConfig, CodeUnitIndex, DependencyPackActivationOutcome, DependencyPackEcosystem,
+    DependencyPackWorkspaceContext, GoAnalyzerConfig, GoDependencyDiscoveryConfig,
+    GoDependencyDiscoveryMode, IAnalyzer, Language, Project, Range,
 };
 use crate::inline_project::{BuiltInlineTestProject, InlineTestProject};
-use brokk_bifrost_core::analyzer::usages::receiver_analysis::ReceiverAnalysisBudget;
+use brokk_bifrost_core::analyzer::usages::receiver_analysis::{
+    INTERACTIVE_TYPE_LOOKUP_BUDGET, ReceiverAnalysisBudget,
+};
+use brokk_bifrost_test_macros::hardwon;
 use std::sync::Arc;
+use tree_sitter::Parser;
 
 const PROVIDER: &str = "provider/item.go";
 const CALLER: &str = "consumer/use.go";
+
+fn assert_go_discovery_completed(outcome: &DependencyPackActivationOutcome) {
+    let Some(go) = outcome
+        .ecosystems
+        .iter()
+        .find(|ecosystem| ecosystem.ecosystem == DependencyPackEcosystem::Go)
+    else {
+        panic!("live go tool setup failure: Go discovery was not attempted: {outcome:#?}");
+    };
+    assert!(
+        go.discovery.complete,
+        "live go tool setup failure: Go dependency discovery was incomplete: {outcome:#?}"
+    );
+}
 
 fn fixture(source: &str) -> (BuiltInlineTestProject, GoAnalyzer) {
     let fixture = InlineTestProject::with_language(Language::Go)
@@ -50,6 +69,363 @@ fn site_for(source: &str, identifier: &str) -> ResolvedReferenceSite {
     }
 }
 
+fn selector_field_start(source: &str, name: &str, ordinal: usize) -> usize {
+    let mut parser = Parser::new();
+    parser
+        .set_language(&tree_sitter_go::LANGUAGE.into())
+        .expect("configure Go parser for the selected member site");
+    let tree = parser.parse(source, None).expect("parse Go member fixture");
+    let mut pending = vec![tree.root_node()];
+    let mut found = 0;
+    while let Some(node) = pending.pop() {
+        if node.kind() == "selector_expression"
+            && let Some(field) = node.child_by_field_name("field")
+            && field
+                .utf8_text(source.as_bytes())
+                .expect("selector field text")
+                == name
+        {
+            if found == ordinal {
+                return field.start_byte();
+            }
+            found += 1;
+        }
+        pending.extend(
+            (0..node.named_child_count())
+                .rev()
+                .filter_map(|index| node.named_child(index)),
+        );
+    }
+    panic!("selector field {name:?} at ordinal {ordinal} is absent from the Go AST");
+}
+
+fn member_site(source: &str, operand_text: &str, field_name: &str) -> ResolvedReferenceSite {
+    let tree = crate::analyzer::usages::get_definition::parse_go_tree(source).unwrap();
+    let mut pending = vec![tree.root_node()];
+    while let Some(node) = pending.pop() {
+        if node.kind() == "selector_expression"
+            && node
+                .child_by_field_name("operand")
+                .and_then(|operand| operand.utf8_text(source.as_bytes()).ok())
+                == Some(operand_text)
+            && let Some(field) = node.child_by_field_name("field")
+            && field.utf8_text(source.as_bytes()).ok() == Some(field_name)
+        {
+            let start_byte = field.start_byte();
+            let end_byte = field.end_byte();
+            return ResolvedReferenceSite {
+                path: CALLER.into(),
+                text: field_name.into(),
+                range: Range {
+                    start_byte,
+                    end_byte,
+                    start_line: 0,
+                    end_line: 0,
+                },
+                focus_start_byte: start_byte,
+                focus_end_byte: end_byte,
+            };
+        }
+        pending.extend(
+            (0..node.named_child_count())
+                .rev()
+                .filter_map(|index| node.named_child(index)),
+        );
+    }
+    panic!("selector {operand_text:?}.{field_name} is absent from the Go AST");
+}
+
+#[test]
+#[hardwon(
+    "a25945887125: reverse receiver confirmation missed parameter, typed-local, and field-chain bindings"
+)]
+fn go_point_receiver_anchor_selects_local_and_parameter_bindings() {
+    let source = r#"package consumer
+type Client struct{}
+type Options struct { Client *Client }
+type Connection struct { TunnelClient *Options }
+type TestCase struct { Options *Options }
+func parameter(parameterOpts *Options) { _ = parameterOpts.Client }
+func local() { var localOpts *Options; _ = localOpts.Client }
+func (c *Connection) chain() { _ = c.TunnelClient.Client }
+func fieldInitializer(cases []TestCase) {
+	for _, testCase := range cases {
+		fieldOpts := testCase.Options
+		_ = fieldOpts.Client
+	}
+}
+func newOptions() *Options { return nil }
+func callInitializer() {
+	callOpts := newOptions()
+	_ = callOpts.Client
+}
+func rangeOwner(cases []TestCase) {
+	for _, tc := range cases {
+		_ = tc.Options.Client
+	}
+}
+"#;
+    let tree = crate::analyzer::usages::get_definition::parse_go_tree(source).unwrap();
+
+    for (operand, expected_name, expected_first_member, followup) in [
+        ("parameterOpts", "parameterOpts", "Client", None),
+        ("localOpts", "localOpts", "Client", None),
+        ("tc.Options", "tc", "Options", Some("Client")),
+    ] {
+        let site = member_site(source, operand, "Client");
+        let anchor = go_point_receiver_anchor(&site, &tree, source)
+            .expect("selected member access has a receiver anchor");
+        let binding = anchor
+            .binding
+            .expect("name-based receiver is anchored at its local binding");
+        assert_eq!(
+            &source[binding.declaration_start_byte..binding.declaration_end_byte],
+            expected_name
+        );
+        assert_eq!(binding.member_name, expected_first_member);
+        assert_eq!(binding.followup_member_name.as_deref(), followup);
+    }
+
+    // A spelled owner type takes the declared-type route, as the point operation
+    // did before binding anchors: the binding route only follows an owner whose
+    // type name and call callee are both unavailable.
+    let chain_site = member_site(source, "c.TunnelClient", "Client");
+    let chain_anchor = go_point_receiver_anchor(&chain_site, &tree, source)
+        .expect("field-chain member access has a receiver anchor");
+    assert!(chain_anchor.binding.is_none());
+    assert_eq!(chain_anchor.owner_type_name.as_deref(), Some("Connection"));
+
+    let local_site = member_site(source, "localOpts", "Client");
+    let local_anchor = go_point_receiver_anchor(&local_site, &tree, source)
+        .expect("typed local member access has a receiver anchor");
+    let local_binding = local_anchor
+        .binding
+        .expect("typed local uses its declared binding");
+    let line_before_local = &source[..local_binding.declaration_start_byte];
+    assert!(line_before_local.ends_with("var "));
+
+    let field_site = member_site(source, "fieldOpts", "Client");
+    let field_anchor = go_point_receiver_anchor(&field_site, &tree, source)
+        .expect("field-initialized local member access has a receiver anchor");
+    let field_binding = field_anchor
+        .binding
+        .expect("field-initialized local uses its selected binding");
+    let Some(GoPointBindingInitializer::FieldChain {
+        root_declaration_start_byte,
+        root_declaration_end_byte,
+        member_names,
+        ..
+    }) = field_binding.initializer
+    else {
+        panic!("field initializer must preserve its root binding and field path");
+    };
+    assert_eq!(
+        &source[root_declaration_start_byte..root_declaration_end_byte],
+        "testCase"
+    );
+    assert_eq!(member_names, ["Options"]);
+
+    let call_site = member_site(source, "callOpts", "Client");
+    let call_anchor = go_point_receiver_anchor(&call_site, &tree, source)
+        .expect("call-initialized local member access has a receiver anchor");
+    let call_binding = call_anchor
+        .binding
+        .expect("call-initialized local uses its selected binding");
+    let Some(GoPointBindingInitializer::CallResult {
+        function_start_byte,
+        function_end_byte,
+    }) = call_binding.initializer
+    else {
+        panic!("call initializer must preserve the selected function range");
+    };
+    assert_eq!(
+        &source[function_start_byte..function_end_byte],
+        "newOptions"
+    );
+}
+
+#[test]
+#[hardwon("f24c78ded6c7: generic calls with arguments were rejected before keyed call lookup")]
+fn go_point_call_anchor_reads_generic_invocations_with_arguments() {
+    let source = r#"package consumer
+func caller() {
+	cache := New[string, struct{}](true)
+	_ = cache
+}
+"#;
+    let tree = crate::analyzer::usages::get_definition::parse_go_tree(source).unwrap();
+    let cache = site_for(source, "cache");
+    let reference = tree
+        .root_node()
+        .named_descendant_for_byte_range(cache.focus_start_byte, cache.focus_end_byte)
+        .unwrap();
+
+    assert_eq!(
+        go_point_call_callee_reference(reference, reference, source),
+        Some((
+            source.find("New").unwrap(),
+            source.find("New").unwrap() + "New".len()
+        ))
+    );
+}
+
+fn go_types_generic_answers(source: &str) -> std::collections::HashMap<String, String> {
+    let oracle = r##"
+package main
+
+import (
+    "go/ast"
+    "go/importer"
+    "go/parser"
+    "go/token"
+    "go/types"
+    "encoding/json"
+    "fmt"
+    "os"
+)
+
+func main() {
+    if len(os.Args) != 2 { panic("expected source file") }
+    source, err := os.ReadFile(os.Args[1])
+    if err != nil { panic(err) }
+    fset := token.NewFileSet()
+    file, err := parser.ParseFile(fset, "generic.go", source, 0)
+    if err != nil { panic(err) }
+    info := &types.Info{
+        Types: make(map[ast.Expr]types.TypeAndValue),
+        Defs: make(map[*ast.Ident]types.Object),
+        Uses: make(map[*ast.Ident]types.Object),
+        Selections: make(map[*ast.SelectorExpr]*types.Selection),
+        Instances: make(map[*ast.Ident]types.Instance),
+    }
+    pkg, err := (&types.Config{Importer: importer.Default()}).Check(
+        "example.test/native/consumer", fset, []*ast.File{file}, info,
+    )
+    if err != nil { panic(err) }
+    if len(info.Defs) == 0 || len(info.Uses) == 0 || len(info.Types) == 0 ||
+       len(info.Selections) < 3 || len(info.Instances) < 4 {
+        panic(fmt.Sprintf("go/types did not populate the generic oracle maps: defs=%d uses=%d types=%d selections=%d instances=%d",
+            len(info.Defs), len(info.Uses), len(info.Types), len(info.Selections), len(info.Instances)))
+    }
+    stringify := func(typ types.Type) string {
+        return types.TypeString(typ, func(p *types.Package) string { return p.Path() })
+    }
+    answers := make(map[string]string)
+    declarationNames := map[string]string{
+        "fieldInt": "field-int",
+        "fieldSlice": "field-slice",
+        "receiverResult": "receiver-result",
+        "constructedResult": "constructed-result",
+        "cacheEntries": "cache-entries",
+        "identityExplicit": "identity-explicit",
+        "identityInferred": "identity-inferred",
+        "sliceResult": "slice-result",
+        "nestedResult": "nested-result",
+        "inferredNested": "inferred-nested",
+    }
+    for identifier := range info.Instances {
+        switch identifier.Name {
+        case "Echo", "Wrap", "Nested", "InferNested":
+        default:
+            continue
+        }
+        answers["instance:"+identifier.Name] = "present"
+    }
+    if answers["instance:Echo"] == "" || answers["instance:Wrap"] == "" || answers["instance:Nested"] == "" ||
+       answers["instance:InferNested"] == "" {
+        panic(fmt.Sprintf("go/types Instances omitted explicit applications: %v", answers))
+    }
+    ast.Inspect(file, func(node ast.Node) bool {
+        switch current := node.(type) {
+        case *ast.SelectorExpr:
+            if current.Sel.Name == "Value" || current.Sel.Name == "entries" {
+                selection := info.Selections[current]
+                if selection == nil || selection.Kind() != types.FieldVal {
+                    panic(current.Sel.Name + " selector has no go/types field selection")
+                }
+            }
+        case *ast.AssignStmt:
+            if current.Tok != token.DEFINE { break }
+            for index, left := range current.Lhs {
+                identifier, ok := left.(*ast.Ident)
+                if !ok || index >= len(current.Rhs) { continue }
+                key, ok := declarationNames[identifier.Name]
+                if !ok { continue }
+                answers[key] = stringify(info.Types[current.Rhs[index]].Type)
+            }
+        case *ast.CallExpr:
+            name := ""
+            explicit := false
+            switch function := current.Fun.(type) {
+            case *ast.Ident:
+                name = function.Name
+            case *ast.IndexExpr:
+                explicit = true
+                if identifier, ok := function.X.(*ast.Ident); ok { name = identifier.Name }
+            case *ast.IndexListExpr:
+                explicit = true
+                if identifier, ok := function.X.(*ast.Ident); ok { name = identifier.Name }
+            case *ast.SelectorExpr:
+                name = function.Sel.Name
+            }
+            switch name {
+            case "Get":
+                if selection := info.Selections[current.Fun.(*ast.SelectorExpr)]; selection == nil || selection.Kind() != types.MethodVal {
+                    panic("Get selector has no go/types method selection")
+                }
+                answers["receiver-result"] = stringify(info.Types[current].Type)
+            case "ExpiresAt":
+                if selection := info.Selections[current.Fun.(*ast.SelectorExpr)]; selection == nil || selection.Kind() != types.MethodVal {
+                    panic("ExpiresAt selector has no go/types method selection")
+                }
+                answers["constructed-result"] = stringify(info.Types[current].Type)
+            case "Echo":
+                key := "identity-inferred"
+                if explicit { key = "identity-explicit" }
+                answers[key] = stringify(info.Types[current].Type)
+            case "Wrap":
+                answers["slice-result"] = stringify(info.Types[current].Type)
+            case "Nested":
+                answers["nested-result"] = stringify(info.Types[current].Type)
+            case "InferNested":
+                answers["inferred-nested"] = stringify(info.Types[current].Type)
+            }
+        }
+        return true
+    })
+    for _, instance := range []string{"Echo", "Wrap", "Nested", "InferNested"} {
+        delete(answers, "instance:"+instance)
+    }
+    if len(answers) != 10 || pkg.Path() != "example.test/native/consumer" {
+        panic(fmt.Sprintf("incomplete go/types cases: %v", answers))
+    }
+    encoded, err := json.Marshal(answers)
+    if err != nil { panic(err) }
+    if _, err := os.Stdout.Write(encoded); err != nil { panic(err) }
+}
+"##;
+    let directory = tempfile::tempdir().expect("Go oracle temp directory");
+    let path = directory.path().join("generic_oracle.go");
+    std::fs::write(&path, oracle).expect("write go/types oracle");
+    let source_path = directory.path().join("consumer.gosrc");
+    std::fs::write(&source_path, source).expect("write Go type fixture");
+    let output = std::process::Command::new("go")
+        .args([
+            "run",
+            path.to_str().expect("oracle path is UTF-8"),
+            source_path.to_str().expect("source path is UTF-8"),
+        ])
+        .env("GO111MODULE", "off")
+        .output()
+        .expect("the local Go toolchain runs the go/types oracle");
+    assert!(
+        output.status.success(),
+        "go/types oracle failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    serde_json::from_slice(&output.stdout).expect("go/types oracle emits a JSON type map")
+}
+
 fn complete(result: BoundedResolution<DefinitionLookupOutcome>) -> DefinitionLookupOutcome {
     let BoundedResolution::Complete { value, .. } = result else {
         panic!("{result:?}")
@@ -67,6 +443,155 @@ fn complete_with_evidence(
 }
 
 #[test]
+fn go_native_point_request_reuses_operation_and_path_context_per_file() {
+    // The points are value references. A type-name site answers no_type, so the
+    // reuse check reads the imported type through the declared values instead.
+    let source = "package consumer\n\nimport p \"example.test/native/provider\"\n\nvar First p.Item\nvar Second p.Item\nvar Third = First\nvar Fourth = Second\n";
+    let (fixture, analyzer) = fixture(source);
+    let file = fixture.file(CALLER);
+    let cancellation = CancellationToken::default();
+    crate::analyzer::native_points::reset_native_point_operation_open_count_for_test();
+    let mut request = match GoNativePointRequest::open(
+        &analyzer,
+        analyzer.inner.semantic_model_overlay(),
+        &cancellation,
+    )
+    .unwrap()
+    {
+        GoNativePointRequestOpen::Ready(request) => request,
+        GoNativePointRequestOpen::Unavailable { kind, message } => {
+            panic!("selected Go point request unavailable: {kind}: {message}")
+        }
+        GoNativePointRequestOpen::Cancelled => panic!("selected Go point request was cancelled"),
+    };
+    assert_eq!(
+        crate::analyzer::native_points::native_point_operation_open_count_for_test(),
+        1
+    );
+
+    let resolve_at = |request: &mut GoNativePointRequest<'_>, offset: usize, text: &str, budget| {
+        let site = ResolvedReferenceSite {
+            path: CALLER.into(),
+            text: text.into(),
+            range: Range {
+                start_byte: offset,
+                end_byte: offset + text.len(),
+                start_line: 0,
+                end_line: 0,
+            },
+            focus_start_byte: offset,
+            focus_end_byte: offset + text.len(),
+        };
+        request.resolve_type(BoundedReceiverQuery {
+            analyzer: &analyzer,
+            file: &file,
+            source,
+            tree: None,
+            site: &site,
+            budget,
+            cancellation: Some(&cancellation),
+        })
+    };
+    let first_offset = source.rfind("First").expect("first selected value");
+    let second_offset = source.rfind("Second").expect("second selected value");
+    let limited = resolve_at(
+        &mut request,
+        first_offset,
+        "First",
+        ReceiverAnalysisBudget {
+            max_scope_nodes: 0,
+            ..ReceiverAnalysisBudget::default()
+        },
+    );
+    assert!(
+        matches!(&limited, BoundedResolution::Exceeded { .. }),
+        "the first point honors its own zero scope budget: {limited:?}"
+    );
+    let BoundedResolution::Complete { value: first, .. } = resolve_at(
+        &mut request,
+        first_offset,
+        "First",
+        ReceiverAnalysisBudget::default(),
+    ) else {
+        panic!("the next point gets a fresh budget");
+    };
+    let hits_after_first = request
+        .forward_candidate_artifacts
+        .get(CALLER)
+        .expect("the caller file owns its artifact cache")
+        .cache_hit_count();
+    let BoundedResolution::Complete {
+        value: repeated_first,
+        ..
+    } = resolve_at(
+        &mut request,
+        first_offset,
+        "First",
+        ReceiverAnalysisBudget::default(),
+    )
+    else {
+        panic!("a repeated point gets a fresh budget");
+    };
+    assert!(
+        request
+            .forward_candidate_artifacts
+            .get(CALLER)
+            .expect("the caller file owns its artifact cache")
+            .cache_hit_count()
+            > hits_after_first,
+        "a repeated same-file point reuses immutable forward artifacts"
+    );
+    let hits_before_second = request
+        .forward_candidate_artifacts
+        .get(CALLER)
+        .expect("the caller file owns its artifact cache")
+        .cache_hit_count();
+    let BoundedResolution::Complete { value: second, .. } = resolve_at(
+        &mut request,
+        second_offset,
+        "Second",
+        ReceiverAnalysisBudget::default(),
+    ) else {
+        panic!("the second point gets a fresh budget");
+    };
+    assert!(
+        request
+            .forward_candidate_artifacts
+            .get(CALLER)
+            .expect("the caller file owns its artifact cache")
+            .cache_hit_count()
+            > hits_before_second,
+        "a distinct same-file point reuses immutable forward artifacts"
+    );
+
+    // Cache warmth may close the completion status, but it cannot change the
+    // selected declaration for this exact imported type reference.
+    assert_eq!(first.types.len(), 1, "{first:?}");
+    assert_eq!(
+        first.types[0].fqn, "example.test/native/provider.Item",
+        "{first:?}"
+    );
+    for cached in [&repeated_first, &second] {
+        assert_eq!(cached.types.len(), first.types.len(), "{cached:?}");
+        for (expected, actual) in first.types.iter().zip(&cached.types) {
+            assert_eq!(actual.fqn, expected.fqn, "{cached:?}");
+            assert_eq!(actual.definitions, expected.definitions, "{cached:?}");
+            assert_eq!(
+                actual.semantic_model_id, expected.semantic_model_id,
+                "{cached:?}"
+            );
+        }
+    }
+    assert_eq!(request.files.len(), 1, "one file context per touched path");
+    assert_eq!(
+        crate::analyzer::native_points::native_point_operation_open_count_for_test(),
+        1,
+        "both points share the selected operation opened at request start"
+    );
+}
+
+#[test]
+#[hardwon("#3790: live Go discovery failures must surface as setup failures")]
 fn go_native_point_binds_standard_package_and_external_member_identity() {
     // The standard library comes from the host Go toolchain. Without one the
     // qualifier is correctly incomplete, so this test needs `go` on PATH.
@@ -112,6 +637,7 @@ fn go_native_point_binds_standard_package_and_external_member_identity() {
             cancellation: &cancellation,
         },
     );
+    assert_go_discovery_completed(&discovery);
     assert_eq!(discovery.ecosystems.len(), 1);
     assert_eq!(
         discovery.ecosystems[0].ecosystem,
@@ -189,6 +715,179 @@ fn go_native_point_binds_standard_package_and_external_member_identity() {
 }
 
 #[test]
+fn go_native_point_resolves_modeled_external_receiver_through_field_type() {
+    let source = r#"package consumer
+
+import "sync"
+
+type Pool struct { once sync.Once }
+
+func (p *Pool) use() { p.once.Do(func() {}) }
+"#;
+    let fixture = InlineTestProject::with_language(Language::Go)
+        .file("go.mod", "module example.test/native\n\ngo 1.22\n")
+        .file(CALLER, source)
+        .build();
+    let workspace = fixture.workspace_analyzer(AnalyzerConfig::default());
+    let analyzer = workspace.analyzer();
+    let overlay = crate::analyzer::semantic_model::go_external_receiver_test_overlay();
+    let _overlay_scope =
+        crate::analyzer::AnalyzerQueryScope::with_semantic_model_overlay(analyzer, Some(overlay));
+    let file = fixture.file(CALLER);
+    let tree = crate::analyzer::usages::get_definition::parse_go_tree(source)
+        .expect("parse imported external receiver field call");
+    let resolution = complete_with_evidence(resolve_go_definition_with_evidence_bounded(
+        BoundedReceiverQuery {
+            analyzer,
+            file: &file,
+            source,
+            tree: Some(&tree),
+            site: &site_for(source, "Do"),
+            budget: ReceiverAnalysisBudget::default(),
+            cancellation: None,
+        },
+        || {},
+    ));
+
+    assert_eq!(
+        resolution.outcome.status,
+        DefinitionLookupStatus::UnresolvableImportBoundary,
+        "the modeled external field method resolves to its exact package boundary: {:?}",
+        resolution.outcome
+    );
+    assert_eq!(
+        resolution.outcome.resolved_reference_target(),
+        Some("sync.Once.Do")
+    );
+    assert_eq!(
+        resolution.call_application,
+        CallApplicationKind::BoundReceiver
+    );
+    assert!(resolution.exact_external_call.is_some());
+}
+
+#[test]
+fn go_native_point_resolves_unqualified_calls_from_complete_source_inventory() {
+    let source = format!(
+        "package main\nfunc caller() {{ {} }}\n",
+        (0..20)
+            .map(|_| "go writePointer(&Cell{})")
+            .collect::<Vec<_>>()
+            .join("; ")
+    );
+    let fixture = InlineTestProject::with_language(Language::Go)
+        .file("main.go", &source)
+        .file(
+            "helper.go",
+            "package main\ntype Cell struct {}\nfunc writePointer(cell *Cell) {}\n",
+        )
+        .build();
+    let workspace = fixture.workspace_analyzer(AnalyzerConfig::default());
+    let go = workspace.analyzer();
+    let start_byte = source.find("writePointer").expect("call callee");
+    let site = ResolvedReferenceSite {
+        path: "main.go".into(),
+        text: "writePointer".into(),
+        range: Range {
+            start_byte,
+            end_byte: start_byte + "writePointer".len(),
+            start_line: 1,
+            end_line: 1,
+        },
+        focus_start_byte: start_byte,
+        focus_end_byte: start_byte + "writePointer".len(),
+    };
+    let file = fixture.file("main.go");
+    let tree = crate::analyzer::usages::get_definition::parse_go_tree(&source)
+        .expect("parse same-package call");
+
+    let resolution = complete_with_evidence(resolve_go_definition_with_evidence_bounded(
+        BoundedReceiverQuery {
+            analyzer: go,
+            file: &file,
+            source: &source,
+            tree: Some(&tree),
+            site: &site,
+            budget: ReceiverAnalysisBudget::default(),
+            cancellation: None,
+        },
+        || {},
+    ));
+
+    assert_eq!(
+        resolution.outcome.status,
+        DefinitionLookupStatus::Resolved,
+        "same-package source inventory resolves the call: {:?}",
+        resolution.outcome
+    );
+    let [target] = resolution.outcome.definitions.as_slice() else {
+        panic!("one same-package function target: {:?}", resolution.outcome);
+    };
+    assert_eq!(target.identifier(), "writePointer");
+    assert_eq!(
+        resolution.call_application,
+        CallApplicationKind::PackageFunction
+    );
+}
+
+#[test]
+fn go_native_point_preserves_source_import_boundary_without_go_tool_context() {
+    let source =
+        "package consumer\n\nimport files \"os\"\n\nfunc use() { _, _ = files.Open(\"x\") }\n";
+    let fixture = InlineTestProject::with_language(Language::Go)
+        .file(CALLER, source)
+        .build();
+    let workspace = fixture.workspace_analyzer(AnalyzerConfig::default());
+    let analyzer = workspace.analyzer();
+    let file = fixture.file(CALLER);
+    let tree = crate::analyzer::usages::get_definition::parse_go_tree(source)
+        .expect("parse source-only external package call");
+    let start_byte = source
+        .rfind("Open")
+        .expect("source contains package member");
+    let site = ResolvedReferenceSite {
+        path: CALLER.into(),
+        text: "Open".into(),
+        range: Range {
+            start_byte,
+            end_byte: start_byte + "Open".len(),
+            start_line: 5,
+            end_line: 5,
+        },
+        focus_start_byte: start_byte,
+        focus_end_byte: start_byte + "Open".len(),
+    };
+    let resolution = complete_with_evidence(resolve_go_definition_with_evidence_bounded(
+        BoundedReceiverQuery {
+            analyzer,
+            file: &file,
+            source,
+            tree: Some(&tree),
+            site: &site,
+            budget: ReceiverAnalysisBudget::default(),
+            cancellation: None,
+        },
+        || {},
+    ));
+
+    assert_eq!(
+        resolution.outcome.status,
+        DefinitionLookupStatus::UnresolvableImportBoundary,
+        "structured source import facts establish the external package boundary: {:?}",
+        resolution.outcome
+    );
+    assert_eq!(
+        resolution.outcome.resolved_reference_target(),
+        Some("os.Open")
+    );
+    assert_eq!(
+        resolution.call_application,
+        CallApplicationKind::PackageFunction
+    );
+    assert!(resolution.exact_external_call.is_none());
+}
+
+#[test]
 fn go_native_point_binds_model_backed_import_without_discovery() {
     let source = "package consumer\nimport \"example.com/acme/codec\"\nvar value wire.Buffer\n";
     let fixture = InlineTestProject::with_language(Language::Go)
@@ -262,18 +961,32 @@ func caller(file *os.File) {
     let file = fixture.file(CALLER);
     let tree = crate::analyzer::usages::get_definition::parse_go_tree(source)
         .expect("parse modeled os receiver call");
-    let resolution = complete_with_evidence(resolve_go_definition_with_evidence_bounded(
-        BoundedReceiverQuery {
-            analyzer: &analyzer,
-            file: &file,
-            source,
-            tree: Some(&tree),
-            site: &site_for(source, "Close"),
-            budget: ReceiverAnalysisBudget::default(),
-            cancellation: None,
-        },
-        || {},
-    ));
+    let query = BoundedReceiverQuery {
+        analyzer: &analyzer,
+        file: &file,
+        source,
+        tree: Some(&tree),
+        site: &site_for(source, "Close"),
+        budget: ReceiverAnalysisBudget::default(),
+        cancellation: None,
+    };
+    let resolution = GoNativeRolloutPoints.resolve_definition_with_evidence_bounded(query);
+    let resolution = match resolution {
+        BoundedResolution::Complete { value, .. } => {
+            let external_callee_identity = external_callee_identity(value.1.as_ref());
+            let call_application = value.1.as_ref().map_or(
+                CallApplicationKind::Unknown,
+                ExactExternalCallProof::call_application,
+            );
+            GoNativeDefinitionResolution {
+                outcome: value.0,
+                call_application,
+                exact_external_call: value.1,
+                external_callee_identity,
+            }
+        }
+        other => panic!("Go native structural receiver returned {other:?}"),
+    };
 
     assert_eq!(
         resolution.outcome.status,
@@ -292,6 +1005,7 @@ func caller(file *os.File) {
 }
 
 #[test]
+#[hardwon("#3790: live Go discovery failures must surface as setup failures")]
 fn go_native_external_receiver_calls_use_typed_imported_models() {
     let source = r#"package consumer
 
@@ -349,6 +1063,7 @@ func useUnknown[T interface{ Release() error }](receiver T) {
             cancellation: &cancellation,
         },
     );
+    assert_go_discovery_completed(&discovery);
     assert_eq!(discovery.ecosystems.len(), 1);
     let analyzer = workspace.analyzer();
     let file = fixture.file(CALLER);
@@ -467,7 +1182,7 @@ fn go_native_point_uses_selected_alias_and_canonical_package_name() {
         ));
         assert_eq!(
             outcome.status,
-            DefinitionLookupStatus::Incomplete,
+            DefinitionLookupStatus::Resolved,
             "source={source}, {outcome:?}"
         );
         assert_eq!(outcome.definitions.len(), 1, "source={source}, {outcome:?}");
@@ -686,7 +1401,7 @@ fn go_native_point_unsaved_body_edit_keeps_selected_package_membership() {
     let outcome = resolve_last(&analyzer, &fixture, CALLER, &changed, "Item");
     assert_eq!(
         outcome.status,
-        DefinitionLookupStatus::Incomplete,
+        DefinitionLookupStatus::Resolved,
         "{outcome:?}"
     );
     assert_eq!(outcome.definitions.len(), 1, "{outcome:?}");
@@ -703,12 +1418,14 @@ fn go_native_point_reads_unsaved_package_peer_only_with_proven_placement() {
     const USE: &str = "consumer/use.go";
     const LOCAL: &str = "consumer/local.go";
     const OTHER: &str = "consumer/other.go";
+    const UNRELATED: &str = "unrelated/other.go";
     let use_source = "package consumer\n\nvar Value Local\n\nvar Second Other\n";
     let fixture = InlineTestProject::with_language(Language::Go)
         .file("go.mod", "module example.test/native\n\ngo 1.22\n")
         .file(USE, use_source)
         .file(LOCAL, "package consumer\n\ntype Local struct{}\n")
         .file(OTHER, "package consumer\n\ntype Other struct{}\n")
+        .file(UNRELATED, "package unrelated\n\ntype Elsewhere struct{}\n")
         .build();
     let disk = GoAnalyzer::new(fixture.project_dyn());
     let local = fixture.file(LOCAL);
@@ -723,6 +1440,21 @@ fn go_native_point_reads_unsaved_package_peer_only_with_proven_placement() {
     let outcome = resolve_last(&analyzer, &fixture, USE, use_source, "Other");
     assert_eq!(outcome.definitions.len(), 1, "{outcome:?}");
     assert!(!reports_unplaced(&outcome), "{outcome:?}");
+
+    let unrelated_edit = "package unrelated\n\nimport \"strings\"\n\nvar _ = strings.ToUpper\n";
+    let analyzer = unsaved(&fixture, &disk, &[(UNRELATED, unrelated_edit)]);
+    let outcome = resolve_last(&analyzer, &fixture, USE, use_source, "Local");
+    assert_eq!(
+        outcome.status,
+        DefinitionLookupStatus::Resolved,
+        "{outcome:?}"
+    );
+    assert_eq!(outcome.definitions.len(), 1, "{outcome:?}");
+    assert_eq!(outcome.definitions[0].source(), &local);
+    assert!(
+        !reports_unplaced(&outcome),
+        "an unrelated package has no effect: {outcome:?}"
+    );
 
     // A new import changes what the Go tool reads for placement. The peer
     // keeps its declaration, but no selected membership vouches for it, so
@@ -751,15 +1483,21 @@ fn go_native_point_reads_unsaved_package_peer_only_with_proven_placement() {
 }
 
 #[test]
-fn go_native_type_retains_nominal_target_and_universe_incompleteness() {
+fn go_native_type_preserves_nominal_target_and_projects_predeclared_types() {
     use crate::analyzer::usages::get_type::TypeLookupStatus;
-    for source in [
-        "package consumer; import renamed \"example.test/native/provider\"; var Value renamed.Item",
-        "package consumer; func f(Item int) int { return Item }",
+    for (source, identifier) in [
+        (
+            "package consumer; import renamed \"example.test/native/provider\"; var Value renamed.Item; func f() { _ = Value }",
+            "Value",
+        ),
+        (
+            "package consumer; func f(Item int) int { return Item }",
+            "Item",
+        ),
     ] {
         let (fixture, analyzer) = fixture(source);
         let file = fixture.file(CALLER);
-        let site = site(source);
+        let site = site_for(source, identifier);
         let result = resolve_go_type_bounded(
             BoundedReceiverQuery {
                 analyzer: &analyzer,
@@ -776,23 +1514,62 @@ fn go_native_type_retains_nominal_target_and_universe_incompleteness() {
             panic!("{result:?}")
         };
         assert!(work.scope_nodes > 0);
-        assert_eq!(value.status, TypeLookupStatus::Incomplete, "{value:?}");
         if source.contains("renamed") {
+            assert_eq!(value.status, TypeLookupStatus::Resolved, "{value:?}");
             assert_eq!(value.types.len(), 1, "{value:?}");
             assert_eq!(value.types[0].definitions.len(), 1);
             let unit = &value.types[0].definitions[0];
             assert_eq!(unit.source(), &fixture.file(PROVIDER));
             assert_eq!(value.types[0].fqn, unit.fq_name().to_string());
         } else {
-            assert!(value.types.is_empty(), "{value:?}");
-            assert!(
-                value
-                    .diagnostics
-                    .iter()
-                    .any(|reason| reason.kind == "incomplete_native_type")
-            );
+            assert_eq!(value.status, TypeLookupStatus::Resolved, "{value:?}");
+            assert_eq!(value.types.len(), 1, "{value:?}");
+            assert_eq!(value.types[0].fqn, "int");
+            assert!(value.types[0].definitions.is_empty());
         }
     }
+}
+
+#[test]
+fn go_native_type_lookup_propagates_the_call_result_type_to_a_local_binding() {
+    use crate::analyzer::usages::get_type::TypeLookupStatus;
+
+    let source = r#"package main
+
+func external() any { return nil }
+
+func Run() {
+    value := external()
+    _ = value
+}
+"#;
+    let fixture = InlineTestProject::with_language(Language::Go)
+        .file("go.mod", "module example.test/native\n\ngo 1.22\n")
+        .file(CALLER, source)
+        .build();
+    let analyzer = GoAnalyzer::new(fixture.project_dyn());
+    let file = fixture.file(CALLER);
+    let site = site_for(source, "value");
+    let result = resolve_go_type_bounded(
+        BoundedReceiverQuery {
+            analyzer: &analyzer,
+            file: &file,
+            source,
+            tree: None,
+            site: &site,
+            budget: ReceiverAnalysisBudget::default(),
+            cancellation: None,
+        },
+        || {},
+    );
+    let BoundedResolution::Complete { value, .. } = result else {
+        panic!("{result:?}")
+    };
+
+    assert_eq!(value.status, TypeLookupStatus::Resolved, "{value:?}");
+    assert_eq!(value.types.len(), 1, "{value:?}");
+    assert_eq!(value.types[0].fqn, "any", "{value:?}");
+    assert!(value.types[0].definitions.is_empty(), "{value:?}");
 }
 
 #[test]
@@ -857,7 +1634,63 @@ fn go_native_definition_projects_parameters_receivers_and_locals() {
 }
 
 #[test]
-fn go_native_point_resolves_local_alias_to_receiver_field() {
+fn go_native_definition_projects_type_switch_and_select_clause_binders() {
+    use brokk_bifrost_core::analyzer::model::DeclarationKind;
+
+    let source = "package consumer\nfunc inspect(value any, input <-chan int) {\n switch item := value.(type) {\n case int: _ = item\n default: _ = item\n }\n select {\n case item := <-input: _ = item\n }\n}";
+    let (fixture, analyzer) = fixture(source);
+    let file = fixture.file(CALLER);
+    let tree = crate::analyzer::usages::get_definition::parse_go_tree(source)
+        .expect("parse Go clause binders");
+    for (reference, declaration) in [
+        ("case int: _ = item", "item := value.(type)"),
+        ("default: _ = item", "item := value.(type)"),
+        ("case item := <-input: _ = item", "item := <-input"),
+    ] {
+        let start_byte = source
+            .find(reference)
+            .and_then(|start| start.checked_add(reference.rfind("item")?))
+            .expect("clause reference");
+        let site = ResolvedReferenceSite {
+            path: CALLER.into(),
+            text: "item".into(),
+            range: Range {
+                start_byte,
+                end_byte: start_byte + "item".len(),
+                start_line: 0,
+                end_line: 0,
+            },
+            focus_start_byte: start_byte,
+            focus_end_byte: start_byte + "item".len(),
+        };
+        let outcome = complete(resolve_go_definition_bounded(
+            BoundedReceiverQuery {
+                analyzer: &analyzer,
+                file: &file,
+                source,
+                tree: Some(&tree),
+                site: &site,
+                budget: ReceiverAnalysisBudget::default(),
+                cancellation: None,
+            },
+            || {},
+        ));
+        assert_eq!(
+            outcome.status,
+            DefinitionLookupStatus::Resolved,
+            "{outcome:?}"
+        );
+        assert!(outcome.definitions.is_empty(), "{outcome:?}");
+        let lexical = outcome.lexical_definition.expect("lexical clause binder");
+        assert_eq!(lexical.kind, DeclarationKind::LocalVariable);
+        assert_eq!(lexical.identifier, "item");
+        let declaration_start = source.find(declaration).expect("clause declaration");
+        assert_eq!(lexical.name_range.start_byte, declaration_start);
+    }
+}
+
+#[test]
+fn go_native_point_resolves_local_alias_field_through_matching_type_name() {
     let source = "package consumer; type status struct { disabledGroups []string }; type BlockingResolver struct { status *status }; func (r *BlockingResolver) setDisabledGroups(groups []string) { s := r.status; s.disabledGroups = groups }";
     let (fixture, analyzer) = fixture(source);
     let file = fixture.file(CALLER);
@@ -875,10 +1708,392 @@ fn go_native_point_resolves_local_alias_to_receiver_field() {
         || {},
     ));
 
+    assert_eq!(
+        outcome.status,
+        DefinitionLookupStatus::Resolved,
+        "{outcome:?}"
+    );
+    assert!(outcome.diagnostics.is_empty(), "{outcome:?}");
     assert_eq!(outcome.definitions.len(), 1, "{outcome:?}");
     assert_eq!(
         outcome.definitions[0].fq_name().to_string(),
         "example.test/native/consumer.status.disabledGroups",
+        "{outcome:?}"
+    );
+}
+
+#[test]
+fn go_native_point_resolves_method_through_named_receiver_field() {
+    let source = r#"package consumer
+
+type Helper struct{}
+func (h Helper) UpdatePackageMetadata() error { return nil }
+type Client struct { npmMetadataHelper Helper }
+func (c *Client) Build() error {
+    return c.npmMetadataHelper.UpdatePackageMetadata()
+}
+"#;
+    let (fixture, analyzer) = fixture(source);
+
+    let field = resolve_last(&analyzer, &fixture, CALLER, source, "npmMetadataHelper");
+    assert_eq!(field.status, DefinitionLookupStatus::Resolved, "{field:?}");
+    assert_eq!(field.definitions.len(), 1, "{field:?}");
+    assert_eq!(
+        field.definitions[0].fq_name().to_string(),
+        "example.test/native/consumer.Client.npmMetadataHelper",
+        "{field:?}"
+    );
+
+    let method = resolve_last(&analyzer, &fixture, CALLER, source, "UpdatePackageMetadata");
+    assert_eq!(
+        method.status,
+        DefinitionLookupStatus::Resolved,
+        "{method:?}"
+    );
+    assert_eq!(method.definitions.len(), 1, "{method:?}");
+    assert_eq!(
+        method.definitions[0].fq_name().to_string(),
+        "example.test/native/consumer.Helper.UpdatePackageMetadata",
+        "{method:?}"
+    );
+}
+
+#[test]
+fn go_native_point_types_direct_field_uses_the_selected_receiver_route() {
+    use crate::analyzer::usages::get_type::TypeLookupStatus;
+
+    let source = r#"package consumer
+
+type baselineState struct { collect []string }
+func (b *baselineState) values() []string { return b.collect }
+"#;
+    let (fixture, analyzer) = fixture(source);
+    let definition = resolve_last(&analyzer, &fixture, CALLER, source, "collect");
+
+    assert_eq!(
+        definition.status,
+        DefinitionLookupStatus::Resolved,
+        "the receiver's exact direct field yields a complete typed route: {definition:?}"
+    );
+    assert_eq!(definition.definitions.len(), 1, "{definition:?}");
+    assert_eq!(
+        definition.definitions[0].fq_name().to_string(),
+        "example.test/native/consumer.baselineState.collect",
+        "{definition:?}"
+    );
+
+    let file = fixture.file(CALLER);
+    let site = site_for(source, "collect");
+    let result = resolve_go_type_bounded(
+        BoundedReceiverQuery {
+            analyzer: &analyzer,
+            file: &file,
+            source,
+            tree: None,
+            site: &site,
+            budget: ReceiverAnalysisBudget::default(),
+            cancellation: None,
+        },
+        || {},
+    );
+    let BoundedResolution::Complete { value, .. } = result else {
+        panic!("{result:?}")
+    };
+    assert_eq!(value.status, TypeLookupStatus::Resolved, "{value:?}");
+    assert_eq!(value.types.len(), 1, "{value:?}");
+    assert_eq!(value.types[0].fqn, "[]string", "{value:?}");
+}
+
+#[test]
+fn go_native_type_resolves_cross_file_named_parameter_and_local_types() {
+    use crate::analyzer::usages::get_type::TypeLookupStatus;
+
+    let types = r#"package main
+
+type counters struct { total int }
+type inner struct { counters counters }
+type holder struct { inner *inner }
+"#;
+    let source = r#"package main
+
+func update(holding *holder) {
+    _ = holding.inner.counters
+}
+
+func local() {
+    holding := &holder{inner: &inner{}}
+    _ = holding.inner.counters
+}
+"#;
+    let fixture = InlineTestProject::with_language(Language::Go)
+        .file("go.mod", "module example.test/native\n\ngo 1.22\n")
+        .file("types.go", types)
+        .file("use.go", source)
+        .build();
+    let analyzer = GoAnalyzer::new(fixture.project_dyn());
+    let file = fixture.file("use.go");
+    let first_chain = source.find("holding.inner.counters").unwrap();
+    let local_chain = source.rfind("holding.inner.counters").unwrap();
+
+    for (name, start_byte, expected) in [
+        ("holding", first_chain, "*example.test/native.holder"),
+        ("holding", local_chain, "*example.test/native.holder"),
+    ] {
+        let site = ResolvedReferenceSite {
+            path: "use.go".into(),
+            text: name.into(),
+            range: Range {
+                start_byte,
+                end_byte: start_byte + name.len(),
+                start_line: 0,
+                end_line: 0,
+            },
+            focus_start_byte: start_byte,
+            focus_end_byte: start_byte + name.len(),
+        };
+        let result = resolve_go_type_bounded(
+            BoundedReceiverQuery {
+                analyzer: &analyzer,
+                file: &file,
+                source,
+                tree: None,
+                site: &site,
+                budget: ReceiverAnalysisBudget::default(),
+                cancellation: None,
+            },
+            || {},
+        );
+        let BoundedResolution::Complete { value, .. } = result else {
+            panic!("type lookup for {name} did not complete: {result:?}")
+        };
+        assert_eq!(
+            value.status,
+            TypeLookupStatus::Resolved,
+            "{name}: {value:?}"
+        );
+        assert_eq!(value.types.len(), 1, "{name}: {value:?}");
+        assert_eq!(value.types[0].fqn, expected, "{name}: {value:?}");
+    }
+}
+
+#[test]
+fn go_native_point_types_common_operators_and_contextual_nil() {
+    use crate::analyzer::usages::get_type::TypeLookupStatus;
+
+    let source = r#"package consumer
+
+func use(x int, y int, text string, enabled bool, pointer *int) {
+    summed := x + y
+    added := x + 1
+    less := x < 1
+    joined := text + "!"
+    both := enabled && true
+    either := enabled || false
+    negated := -x
+    positive := +x
+    complement := ^x
+    inverted := !enabled
+    pointer = nil
+    _ = []any{summed, added, less, joined, both, either, negated, positive, complement, inverted, pointer}
+}
+"#;
+    let (fixture, analyzer) = fixture(source);
+
+    for (name, expected) in [
+        ("summed", "int"),
+        ("added", "int"),
+        ("less", "bool"),
+        ("joined", "string"),
+        ("both", "bool"),
+        ("either", "bool"),
+        ("negated", "int"),
+        ("positive", "int"),
+        ("complement", "int"),
+        ("inverted", "bool"),
+    ] {
+        let site = site_for(source, name);
+        let file = fixture.file(CALLER);
+        let result = resolve_go_type_bounded(
+            BoundedReceiverQuery {
+                analyzer: &analyzer,
+                file: &file,
+                source,
+                tree: None,
+                site: &site,
+                budget: ReceiverAnalysisBudget::default(),
+                cancellation: None,
+            },
+            || {},
+        );
+        let BoundedResolution::Complete { value, .. } = result else {
+            panic!("type of {name} did not complete: {result:?}")
+        };
+        assert_eq!(
+            value.status,
+            TypeLookupStatus::Resolved,
+            "{name}: {value:?}"
+        );
+        assert_eq!(value.types.len(), 1, "{name}: {value:?}");
+        assert_eq!(value.types[0].fqn, expected, "{name}: {value:?}");
+    }
+
+    let site = site_for(source, "pointer");
+    let file = fixture.file(CALLER);
+    let result = resolve_go_type_bounded(
+        BoundedReceiverQuery {
+            analyzer: &analyzer,
+            file: &file,
+            source,
+            tree: None,
+            site: &site,
+            budget: ReceiverAnalysisBudget::default(),
+            cancellation: None,
+        },
+        || {},
+    );
+    let BoundedResolution::Complete { value, .. } = result else {
+        panic!("contextual nil assignment did not retain its pointer type: {result:?}")
+    };
+    assert_eq!(value.status, TypeLookupStatus::Resolved, "{value:?}");
+    assert_eq!(value.types.len(), 1, "{value:?}");
+    assert_eq!(value.types[0].fqn, "*int", "{value:?}");
+}
+
+#[test]
+fn go_native_point_resolves_exact_shallower_field_with_complete_package_inventory() {
+    let source = r#"package consumer
+
+type C struct { ID string }
+type B struct { C }
+type A struct { ID string }
+type Service struct { A; B }
+func use(s Service) { _ = s.ID }
+"#;
+    let (fixture, analyzer) = fixture(source);
+    let outcome = resolve_last(&analyzer, &fixture, CALLER, source, "ID");
+
+    assert_eq!(
+        outcome.status,
+        DefinitionLookupStatus::Resolved,
+        "{outcome:?}"
+    );
+    assert_eq!(outcome.definitions.len(), 1, "{outcome:?}");
+    assert_eq!(
+        outcome.definitions[0].fq_name().to_string(),
+        "example.test/native/consumer.A.ID",
+        "{outcome:?}"
+    );
+}
+
+#[test]
+fn go_native_point_lowers_anonymous_struct_type_body_owner() {
+    let source = "package consumer\ntype Item struct{}\nvar value struct { Field Item }\n";
+    let (fixture, analyzer) = fixture(source);
+    let outcome = resolve_last(&analyzer, &fixture, CALLER, source, "Item");
+
+    assert_eq!(
+        outcome.status,
+        DefinitionLookupStatus::Resolved,
+        "{outcome:?}"
+    );
+    assert_eq!(outcome.definitions.len(), 1, "{outcome:?}");
+    assert_eq!(
+        outcome.definitions[0].fq_name().to_string(),
+        "example.test/native/consumer.Item",
+        "the field type reference inside the anonymous TypeBody retains its package target"
+    );
+}
+
+#[test]
+#[hardwon("0a185cf6f3eb: build-constrained package siblings lost native point incompleteness")]
+fn go_native_point_keeps_frontier_open_for_unplaced_package_file() {
+    let source = r#"package consumer
+
+type C struct { ID string }
+type B struct { C }
+type A struct { ID string }
+type Service struct { A; B }
+func use(s Service) { _ = s.ID }
+"#;
+    let fixture = InlineTestProject::with_language(Language::Go)
+        .file("go.mod", "module example.test/native\n\ngo 1.22\n")
+        .file(PROVIDER, "package vocabulary; type Item struct {}")
+        .file(CALLER, source)
+        .file(
+            "consumer/build_constrained.go",
+            "//go:build bifrost_unselected\n\npackage consumer\n\nfunc (Service) ID() {}\n",
+        )
+        .file("decoy/item.go", "package vocabulary; type Item struct {}")
+        .build();
+    let analyzer = GoAnalyzer::new(fixture.project_dyn());
+    let snapshot = analyzer
+        .inner
+        .selected_workspace_snapshots()
+        .get("go")
+        .cloned()
+        .expect("selected Go snapshot");
+    let profile = analyzer.native_context_profile().expect("Go profile");
+    let context = analyzer
+        .inner
+        .analyzer_store()
+        .selected_go_context(&snapshot, &profile)
+        .unwrap()
+        .expect("selected Go package context");
+    // Reproduce a selected package publication that marks its member inventory
+    // complete even though a saved sibling carries a build constraint.
+    crate::analyzer::store::resolution_operation::go_reverse_rows::
+        mark_go_package_complete_for_test(
+            analyzer.inner.analyzer_store(),
+            context.context_id,
+            "example.test/native/consumer",
+        )
+        .unwrap();
+    let outcome = resolve_last(&analyzer, &fixture, CALLER, source, "ID");
+
+    assert_eq!(
+        outcome.status,
+        DefinitionLookupStatus::Incomplete,
+        "the excluded same-package method could shadow the promoted field: {outcome:?}"
+    );
+    assert!(
+        outcome
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.kind == "go-package-incomplete"),
+        "the unplaced file must keep the structured package frontier open: {outcome:?}"
+    );
+    assert_eq!(outcome.definitions.len(), 1, "{outcome:?}");
+    assert_eq!(
+        outcome.definitions[0].fq_name().to_string(),
+        "example.test/native/consumer.A.ID",
+        "the selected build's visible promoted field remains a partial answer"
+    );
+}
+
+#[test]
+fn go_native_point_reports_shared_promoted_field_paths_as_ambiguous() {
+    let source = r#"package consumer
+
+type Shared struct{ ID string }
+type Left struct{ Shared }
+type Right struct{ Shared }
+type Model struct{ Left; Right }
+
+func use(model Model) { _ = model.ID }
+"#;
+    let (fixture, analyzer) = fixture(source);
+    let outcome = resolve_last(&analyzer, &fixture, CALLER, source, "ID");
+
+    assert_eq!(
+        outcome.status,
+        DefinitionLookupStatus::Ambiguous,
+        "{outcome:?}"
+    );
+    assert!(
+        outcome
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.kind == "ambiguous_definition"),
         "{outcome:?}"
     );
 }
@@ -988,6 +2203,91 @@ func caller(value Widget) {
         outcome.status,
         DefinitionLookupStatus::Resolved,
         "T.M must remain unresolved when M has only a pointer receiver: {outcome:?}"
+    );
+}
+
+#[test]
+#[hardwon("f24c78ded6c7: Go point receiver frontiers lacked peer-file declared type anchors")]
+fn go_native_point_resolves_member_receivers_from_peer_type_anchors() {
+    let caller_source = r#"package consumer
+
+func exerciseLoad(getOpts options) {
+	getOpts.loader.Load(nil)
+	getOpts.loader.Load(nil)
+}
+"#;
+    let test_source = r#"package consumer
+
+func exerciseExpiresAt() {
+	cache := NewCache[string, struct{}]()
+	updatedItem := cache.Set()
+	func() { updatedItem.ExpiresAt() }()
+}
+"#;
+    let fixture = InlineTestProject::with_language(Language::Go)
+        .file("go.mod", "module example.test/native\n\ngo 1.22\n")
+        .file(
+            "consumer/options.go",
+            "package consumer\ntype options struct { loader Loader }\n",
+        )
+        .file(
+            "consumer/cache.go",
+            "package consumer\n\
+             type Loader interface { Load(*Cache) *Item }\n\
+             type Cache struct{}\n\
+             func NewCache[K comparable, V any]() *Cache { return &Cache{} }\n\
+             func (c *Cache) Set() *Item { return &Item{} }\n",
+        )
+        .file(
+            "consumer/item.go",
+            "package consumer\ntype Item struct{}\nfunc (i *Item) ExpiresAt() {}\n",
+        )
+        .file(CALLER, caller_source)
+        .file("consumer/cache_test.go", test_source)
+        .build();
+    let analyzer = GoAnalyzer::new(fixture.project_dyn());
+
+    for ordinal in 0..2 {
+        let start_byte = selector_field_start(caller_source, "Load", ordinal);
+        let outcome = resolve_at(
+            &analyzer,
+            &fixture,
+            CALLER,
+            caller_source,
+            start_byte,
+            "Load",
+        );
+        assert_eq!(
+            outcome.status,
+            DefinitionLookupStatus::Resolved,
+            "Load #{ordinal}: {outcome:?}"
+        );
+        assert!(
+            outcome.diagnostics.is_empty(),
+            "Load #{ordinal}: {outcome:?}"
+        );
+        assert_eq!(outcome.definitions.len(), 1, "Load #{ordinal}: {outcome:?}");
+        assert_eq!(
+            outcome.definitions[0].fq_name().to_string(),
+            "example.test/native/consumer.Loader.Load",
+            "Load #{ordinal}: {outcome:?}"
+        );
+    }
+
+    let start_byte = selector_field_start(test_source, "ExpiresAt", 0);
+    let outcome = resolve_at(
+        &analyzer,
+        &fixture,
+        "consumer/cache_test.go",
+        test_source,
+        start_byte,
+        "ExpiresAt",
+    );
+    assert_eq!(outcome.definitions.len(), 1, "ExpiresAt: {outcome:?}");
+    assert_eq!(
+        outcome.definitions[0].fq_name().to_string(),
+        "example.test/native/consumer.Item.ExpiresAt",
+        "ExpiresAt: {outcome:?}"
     );
 }
 
@@ -1360,6 +2660,224 @@ fn go_native_type_preserves_pointer_depth_and_nominal_identity() {
 }
 
 #[test]
+fn go_native_generic_type_answers_match_go_types_with_argument_inference() {
+    let source = r#"package consumer
+
+type Number struct{}
+type Box[T any] struct { Value T }
+type Cache[K comparable, V any] struct { entries map[K]V }
+type Item[T any] struct{}
+func (c *Cache[Key, Value]) Get() Value { var zero Value; return zero }
+func (c *Cache[Key, Value]) Put(key Key, value Value) *Item[Value] { return &Item[Value]{} }
+func (item *Item[Value]) ExpiresAt() Value { var zero Value; return zero }
+func NewCache[K comparable, V any]() *Cache[K, V] { return &Cache[K, V]{} }
+func Echo[T any](value T) T { return value }
+func Wrap[T any](value T) []T { return []T{value} }
+func Nested[T any](value T) Box[[]T] { return Box[[]T]{Value: []T{value}} }
+func use() {
+    var boxInt Box[int]
+    fieldInt := boxInt.Value
+    var boxSlice Box[[]int]
+    fieldSlice := boxSlice.Value
+    var cache *Cache[string, Number]
+    receiverResult := cache.Get()
+    constructedCache := NewCache[string, Number]()
+    constructedItem := constructedCache.Put("key", Number{})
+    constructedResult := constructedItem.ExpiresAt()
+    cacheEntries := cache.entries
+    identityExplicit := Echo[Number](Number{})
+    identityInferred := Echo(Number{})
+    sliceResult := Wrap[Number](Number{})
+    nestedResult := Nested[Number](Number{})
+    inferredNested := InferNested(Box[Box[Number]]{})
+    _, _, _, _, _, _, _, _, _, _ = fieldInt, fieldSlice, receiverResult, constructedResult, cacheEntries, identityExplicit, identityInferred, sliceResult, nestedResult, inferredNested
+}
+func InferNested[T any](box Box[Box[T]]) T { return box.Value.Value }
+"#;
+    let expected = [
+        ("fieldInt", "field-int"),
+        ("fieldSlice", "field-slice"),
+        ("receiverResult", "receiver-result"),
+        ("constructedResult", "constructed-result"),
+        ("cacheEntries", "cache-entries"),
+        ("identityExplicit", "identity-explicit"),
+        ("identityInferred", "identity-inferred"),
+        ("sliceResult", "slice-result"),
+        ("nestedResult", "nested-result"),
+        ("inferredNested", "inferred-nested"),
+    ];
+    let oracle = go_types_generic_answers(source);
+    let (fixture, analyzer) = fixture(source);
+
+    let type_reference_start = source.find("Value T").unwrap() + "Value ".len();
+    let type_reference_site = ResolvedReferenceSite {
+        path: CALLER.into(),
+        text: "T".into(),
+        range: Range {
+            start_byte: type_reference_start,
+            end_byte: type_reference_start + 1,
+            start_line: 0,
+            end_line: 0,
+        },
+        focus_start_byte: type_reference_start,
+        focus_end_byte: type_reference_start + 1,
+    };
+    let type_reference = complete(resolve_go_definition_bounded(
+        BoundedReceiverQuery {
+            analyzer: &analyzer,
+            file: &fixture.file(CALLER),
+            source,
+            tree: Some(
+                &crate::analyzer::usages::get_definition::parse_go_tree(source)
+                    .expect("parse generic type reference"),
+            ),
+            site: &type_reference_site,
+            budget: ReceiverAnalysisBudget::default(),
+            cancellation: None,
+        },
+        || {},
+    ));
+    assert_eq!(
+        type_reference.status,
+        DefinitionLookupStatus::Resolved,
+        "Box.Value's T reference resolves to its scoped generic formal: {type_reference:?}"
+    );
+    let lexical_formal = type_reference
+        .lexical_definition
+        .as_ref()
+        .expect("the selected generic formal is a lexical declaration");
+    assert_eq!(lexical_formal.identifier, "T");
+    assert_eq!(
+        &source[lexical_formal.name_range.start_byte..lexical_formal.name_range.end_byte],
+        "T"
+    );
+
+    let get_tree = crate::analyzer::usages::get_definition::parse_go_tree(source)
+        .expect("parse generic receiver result type");
+    let mut pending = vec![get_tree.root_node()];
+    let get_node = loop {
+        let node = pending.pop().expect("Get has a method declaration");
+        if node
+            .child_by_field_name("name")
+            .is_some_and(|name| name.utf8_text(source.as_bytes()).ok() == Some("Get"))
+        {
+            break node;
+        }
+        pending.extend((0..node.named_child_count()).filter_map(|i| node.named_child(i)));
+    };
+    let result_type = get_node
+        .child_by_field_name("result")
+        .expect("Get has a result type");
+    let result_start = result_type.start_byte();
+    let result_site = ResolvedReferenceSite {
+        path: CALLER.into(),
+        text: "Value".into(),
+        range: Range {
+            start_byte: result_start,
+            end_byte: result_type.end_byte(),
+            start_line: 0,
+            end_line: 0,
+        },
+        focus_start_byte: result_start,
+        focus_end_byte: result_type.end_byte(),
+    };
+    let result_definition = complete(resolve_go_definition_bounded(
+        BoundedReceiverQuery {
+            analyzer: &analyzer,
+            file: &fixture.file(CALLER),
+            source,
+            tree: Some(&get_tree),
+            site: &result_site,
+            budget: ReceiverAnalysisBudget::default(),
+            cancellation: None,
+        },
+        || {},
+    ));
+    assert_eq!(
+        result_definition.status,
+        DefinitionLookupStatus::Resolved,
+        "the renamed receiver formal binds inside the method result: {result_definition:?}"
+    );
+    assert_eq!(
+        result_definition
+            .lexical_definition
+            .as_ref()
+            .map(|definition| definition.identifier.as_str()),
+        Some("Value")
+    );
+
+    let file = fixture.file(CALLER);
+    let cancellation = CancellationToken::default();
+    let mut native_request = match GoNativePointRequest::open(
+        &analyzer,
+        analyzer.inner.semantic_model_overlay(),
+        &cancellation,
+    )
+    .expect("open the selected native Go point operation")
+    {
+        GoNativePointRequestOpen::Ready(request) => request,
+        GoNativePointRequestOpen::Unavailable { kind, message } => {
+            panic!("native Go point operation unavailable: {kind}: {message}")
+        }
+        GoNativePointRequestOpen::Cancelled => panic!("native Go point operation cancelled"),
+    };
+
+    for (declaration, oracle_key) in expected {
+        let expected_type = &oracle[oracle_key];
+        let (start, query_text) = match declaration {
+            "fieldInt" => (selector_field_start(source, "Value", 0), "Value"),
+            "fieldSlice" => (selector_field_start(source, "Value", 1), "Value"),
+            "cacheEntries" => (selector_field_start(source, "entries", 0), "entries"),
+            "receiverResult" => (source.find("cache.Get()").unwrap() + "cache.".len(), "Get"),
+            "constructedResult" => (
+                source.rfind("constructedItem.ExpiresAt()").unwrap() + "constructedItem.".len(),
+                "ExpiresAt",
+            ),
+            "identityExplicit" => (source.find("Echo[Number]").unwrap(), "Echo"),
+            "identityInferred" => (source.find("Echo(Number").unwrap(), "Echo"),
+            "sliceResult" => (source.find("Wrap[Number]").unwrap(), "Wrap"),
+            "nestedResult" => (source.find("Nested[Number]").unwrap(), "Nested"),
+            "inferredNested" => (source.find("InferNested(Box").unwrap(), "InferNested"),
+            _ => unreachable!("every oracle case has a selected expression"),
+        };
+        let site = ResolvedReferenceSite {
+            path: CALLER.into(),
+            text: query_text.into(),
+            range: Range {
+                start_byte: start,
+                end_byte: start + query_text.len(),
+                start_line: 0,
+                end_line: 0,
+            },
+            focus_start_byte: start,
+            focus_end_byte: start + query_text.len(),
+        };
+        let result = native_request.resolve_type(BoundedReceiverQuery {
+            analyzer: &analyzer,
+            file: &file,
+            source,
+            tree: None,
+            site: &site,
+            budget: INTERACTIVE_TYPE_LOOKUP_BUDGET,
+            cancellation: Some(&cancellation),
+        });
+        let BoundedResolution::Complete { value: answer, .. } = result else {
+            panic!("{declaration}: {result:?}")
+        };
+        assert_eq!(
+            answer.status,
+            crate::analyzer::usages::get_type::TypeLookupStatus::Resolved,
+            "{declaration} differs from go/types {expected_type}: {answer:?}"
+        );
+        assert_eq!(answer.types.len(), 1, "{declaration}: {answer:?}");
+        assert_eq!(
+            answer.types[0].fqn, *expected_type,
+            "{declaration}: {answer:?}"
+        );
+    }
+}
+
+#[test]
 fn go_native_point_keeps_generic_call_result_incomplete() {
     let source = r#"package consumer
 
@@ -1381,6 +2899,225 @@ func use() { Identity(Result{}).Maybe() }
         "{outcome:?}"
     );
     assert!(outcome.definitions.is_empty(), "{outcome:?}");
+}
+
+#[test]
+fn go_native_generic_inference_uses_fixed_arguments_on_variadic_signatures() {
+    let source = r#"package consumer
+
+type Number struct{}
+type Box[T any] struct { Value T }
+func InferVariadic[T any](box Box[T], ignored ...T) T { return box.Value }
+func use() {
+    ignored := []Number{}
+    result := InferVariadic(Box[Number]{}, ignored...)
+    var _ Number = result
+}
+"#;
+    let oracle_dir = tempfile::tempdir().expect("Go compiler oracle directory");
+    std::fs::write(oracle_dir.path().join("variadic.go"), source)
+        .expect("write variadic generic compiler oracle");
+    let oracle = std::process::Command::new("go")
+        .arg("test")
+        .current_dir(oracle_dir.path())
+        .env("GO111MODULE", "off")
+        .output()
+        .expect("the local Go compiler runs the variadic generic oracle");
+    assert!(
+        oracle.status.success(),
+        "Go compiler rejected the inferred Number result: {}",
+        String::from_utf8_lossy(&oracle.stderr)
+    );
+
+    let (fixture, analyzer) = fixture(source);
+    let cancellation = CancellationToken::default();
+    let mut native_request = match GoNativePointRequest::open(
+        &analyzer,
+        analyzer.inner.semantic_model_overlay(),
+        &cancellation,
+    )
+    .expect("open selected native Go point operation")
+    {
+        GoNativePointRequestOpen::Ready(request) => request,
+        GoNativePointRequestOpen::Unavailable { kind, message } => {
+            panic!("native Go point operation unavailable: {kind}: {message}")
+        }
+        GoNativePointRequestOpen::Cancelled => panic!("native Go point operation cancelled"),
+    };
+    let start = source
+        .find("InferVariadic(Box")
+        .expect("variadic call expression");
+    let site = ResolvedReferenceSite {
+        path: CALLER.into(),
+        text: "InferVariadic".into(),
+        range: Range {
+            start_byte: start,
+            end_byte: start + "InferVariadic".len(),
+            start_line: 0,
+            end_line: 0,
+        },
+        focus_start_byte: start,
+        focus_end_byte: start + "InferVariadic".len(),
+    };
+    let BoundedResolution::Complete { value, .. } =
+        native_request.resolve_type(BoundedReceiverQuery {
+            analyzer: &analyzer,
+            file: &fixture.file(CALLER),
+            source,
+            tree: None,
+            site: &site,
+            budget: INTERACTIVE_TYPE_LOOKUP_BUDGET,
+            cancellation: Some(&cancellation),
+        })
+    else {
+        panic!("variadic generic type lookup did not complete")
+    };
+    assert_eq!(
+        value.status,
+        crate::analyzer::usages::get_type::TypeLookupStatus::Resolved,
+        "fixed generic parameter must determine the call result: {value:?}"
+    );
+    assert_eq!(value.types.len(), 1, "{value:?}");
+    assert_eq!(
+        value.types[0].fqn, "example.test/native/consumer.Number",
+        "Go compiler accepted assignment of the result to Number"
+    );
+}
+
+#[test]
+fn go_native_propagates_options_result_to_loader_method_value() {
+    let source = r#"package consumer
+
+type Loader[K comparable, V any] interface {
+    Load(cache *Cache[K, V], key K) *Item[K, V]
+}
+type Option[K comparable, V any] interface {
+    apply(value options[K, V]) options[K, V]
+}
+type options[K comparable, V any] struct {
+    loader Loader[K, V]
+}
+func applyOptions[K comparable, V any](value options[K, V], values ...Option[K, V]) options[K, V] {
+    return value
+}
+type Item[K comparable, V any] struct{}
+type Cache[K comparable, V any] struct {
+    options options[K, V]
+}
+func (cache *Cache[K, V]) get(key K, values ...Option[K, V]) *Item[K, V] {
+    getOpts := options[K, V]{loader: cache.options.loader}
+    getOpts = applyOptions(getOpts, values...)
+    _ = getOpts.loader.Load
+    return getOpts.loader.Load(cache, key)
+}
+"#;
+    let oracle_dir = tempfile::tempdir().expect("Go compiler oracle directory");
+    std::fs::write(oracle_dir.path().join("cache.go"), source)
+        .expect("write generic options fixture for Go compiler oracle");
+    let oracle = std::process::Command::new("go")
+        .arg("test")
+        .current_dir(oracle_dir.path())
+        .env("GO111MODULE", "off")
+        .output()
+        .expect("the local Go compiler runs the generic options oracle");
+    assert!(
+        oracle.status.success(),
+        "Go compiler rejected the options[K,V] call: {}",
+        String::from_utf8_lossy(&oracle.stderr)
+    );
+
+    let fixture = InlineTestProject::with_language(Language::Go)
+        .file("go.mod", "module example.test/native\n\ngo 1.22\n")
+        .file("cache.go", source)
+        .build();
+    let analyzer = GoAnalyzer::new(fixture.project_dyn());
+    let resolve_at = |start_byte: usize, budget: ReceiverAnalysisBudget| {
+        let site = ResolvedReferenceSite {
+            path: "cache.go".into(),
+            text: "Load".into(),
+            range: Range {
+                start_byte,
+                end_byte: start_byte + "Load".len(),
+                start_line: 0,
+                end_line: 0,
+            },
+            focus_start_byte: start_byte,
+            focus_end_byte: start_byte + "Load".len(),
+        };
+        resolve_go_definition_bounded(
+            BoundedReceiverQuery {
+                analyzer: &analyzer,
+                file: &fixture.file("cache.go"),
+                source,
+                tree: None,
+                site: &site,
+                budget,
+                cancellation: None,
+            },
+            || {},
+        )
+    };
+    let definition_at = |start_byte: usize, budget: ReceiverAnalysisBudget| {
+        complete(resolve_at(start_byte, budget))
+    };
+    let method_value_start = source
+        .find("_ = getOpts.loader.Load")
+        .expect("generic Loader.Load method value")
+        + "_ = getOpts.loader.".len();
+    let default_method_value = resolve_at(method_value_start, ReceiverAnalysisBudget::default());
+    let default_work = match default_method_value {
+        BoundedResolution::Exceeded { limit, work } => {
+            assert_eq!(
+                limit,
+                brokk_bifrost_core::analyzer::usages::receiver_analysis::ReceiverBudgetLimit::SummaryExpansions
+            );
+            work
+        }
+        other => panic!("default-budget method-value query unexpectedly finished: {other:?}"),
+    };
+    assert_eq!(default_work.summary_expansions, 64);
+    let wide_method_value = resolve_at(
+        method_value_start,
+        ReceiverAnalysisBudget {
+            max_summary_expansions: 512,
+            max_scope_nodes: 16_384,
+            ..ReceiverAnalysisBudget::default()
+        },
+    );
+    let (method_value, method_value_work) = match wide_method_value {
+        BoundedResolution::Complete { value, work } => (value, work),
+        other => panic!("wide-budget method-value query did not finish: {other:?}"),
+    };
+    assert_eq!(method_value_work.summary_expansions, 65);
+    assert_eq!(
+        method_value.status,
+        DefinitionLookupStatus::Resolved,
+        "the exact generic Loader receiver resolves without call applicability: {method_value:?}"
+    );
+    assert_eq!(method_value.definitions.len(), 1, "{method_value:?}");
+    assert_eq!(
+        method_value.definitions[0].fq_name().to_string(),
+        "example.test/native.Loader.Load",
+        "{method_value:?}"
+    );
+    let invocation_start = source
+        .rfind("getOpts.loader.Load(cache, key)")
+        .expect("generic Loader.Load invocation")
+        + "getOpts.loader.".len();
+    let invocation = definition_at(
+        invocation_start,
+        ReceiverAnalysisBudget {
+            max_summary_expansions: 512,
+            max_scope_nodes: 16_384,
+            ..ReceiverAnalysisBudget::default()
+        },
+    );
+    assert_eq!(
+        invocation.status,
+        DefinitionLookupStatus::Incomplete,
+        "the static method binding is known; only Go interface dispatch remains open: {invocation:?}"
+    );
+    assert_eq!(invocation.definitions, method_value.definitions);
 }
 
 #[test]
@@ -1466,5 +3203,93 @@ func use() { _ = Detect().Name }
         outcome.definitions[0].fq_name().to_string(),
         "example.test/native/consumer.Result.Name",
         "{outcome:?}"
+    );
+}
+
+#[test]
+#[hardwon(
+    "6c6570acd34a: a binder of a multi-value call's first result stayed Unknown (cli usages row 924)"
+)]
+fn go_native_point_resolves_first_result_of_multi_value_call_member() {
+    let source = r#"package consumer
+
+type Options struct{}
+type CreateContext struct{}
+
+func (c *CreateContext) Run() {}
+
+func NewCreateContext(opts *Options) (*CreateContext, error) { return &CreateContext{}, nil }
+
+func createRun(opts *Options) error {
+	ctx, err := NewCreateContext(opts)
+	if err != nil {
+		return err
+	}
+	ctx.Run()
+	return nil
+}
+"#;
+    let fixture = InlineTestProject::with_language(Language::Go)
+        .file("go.mod", "module example.test/native\n\ngo 1.22\n")
+        .file("consumer/create.go", source)
+        .build();
+    let analyzer = GoAnalyzer::new(fixture.project_dyn());
+    let start_byte = selector_field_start(source, "Run", 0);
+    let outcome = resolve_at(
+        &analyzer,
+        &fixture,
+        "consumer/create.go",
+        source,
+        start_byte,
+        "Run",
+    );
+    assert_eq!(
+        outcome.status,
+        DefinitionLookupStatus::Resolved,
+        "{outcome:?}"
+    );
+    assert_eq!(outcome.definitions.len(), 1, "{outcome:?}");
+    assert_eq!(
+        outcome.definitions[0].fq_name().to_string(),
+        "example.test/native/consumer.CreateContext.Run",
+        "{outcome:?}"
+    );
+}
+
+#[test]
+#[hardwon(
+    "a25945887125: a Go type-name site answered the named type natively where the incumbent answers no_type"
+)]
+fn go_native_type_name_site_answers_no_type_like_the_incumbent() {
+    use crate::analyzer::usages::get_type::TypeLookupStatus;
+    let source = "package consumer; import renamed \"example.test/native/provider\"; func f(values []renamed.Item) {}";
+    let (fixture, analyzer) = fixture(source);
+    let file = fixture.file(CALLER);
+    let site = site(source);
+    let result = resolve_go_type_bounded(
+        BoundedReceiverQuery {
+            analyzer: &analyzer,
+            file: &file,
+            source,
+            tree: None,
+            site: &site,
+            budget: ReceiverAnalysisBudget::default(),
+            cancellation: None,
+        },
+        || {},
+    );
+    let BoundedResolution::Complete { value, .. } = result else {
+        panic!("{result:?}")
+    };
+    assert_eq!(value.status, TypeLookupStatus::NoType, "{value:?}");
+    assert!(value.types.is_empty(), "{value:?}");
+    assert_eq!(value.diagnostics.len(), 1, "{value:?}");
+    assert_eq!(
+        value.diagnostics[0].kind, "go_no_supported_type",
+        "{value:?}"
+    );
+    assert_eq!(
+        value.diagnostics[0].message, "`Item` does not have a supported explicit Go type",
+        "{value:?}"
     );
 }

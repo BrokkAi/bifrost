@@ -189,6 +189,12 @@ If the first call is impossible because `query_code` is missing, the agent has n
 
 ## Journey 4: VS Code
 
+The VS Code extension and its language server come from the separate
+`bifrost-lsp` project, not from the `bifrost` binary. The `bifrost` command no
+longer serves LSP. This journey therefore depends on the extension's own
+release and on the Bifrost binary it downloads; see [LSP Server](/lsp/) for
+the current status.
+
 Install the [Bifrost VS Code extension](/vscode/), then open the fixture directory as the workspace:
 
 ```bash

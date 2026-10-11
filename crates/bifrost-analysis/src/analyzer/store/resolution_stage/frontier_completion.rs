@@ -151,13 +151,9 @@ pub(in crate::analyzer::store) fn visit_frontier_completion(
                 let frontier = decode_pair(row.get(1)?, row.get(2)?);
                 let reasons: Vec<i64> =
                     serde_json::from_str(&row.get::<_, String>(3)?).expect("frontier reasons JSON");
-                let completion = if reasons.is_empty() {
-                    ResolutionCompletion::Complete
-                } else {
-                    ResolutionCompletion::incomplete(reasons.into_iter().map(|key| {
-                        ResolutionIncompleteReason::UnsupportedSemantic(codec::decode_semantic(key))
-                    }))
-                };
+                let completion = super::completion_from_reasons(reasons.into_iter().map(|key| {
+                    ResolutionIncompleteReason::UnsupportedSemantic(codec::decode_semantic(key))
+                }));
                 evidence.include(&completion);
                 answer.push(SelectedTypeFrontierCompletion::new(
                     BindingFragmentId::at_ordinal(host),

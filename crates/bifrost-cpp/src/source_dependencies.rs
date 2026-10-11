@@ -214,6 +214,7 @@ impl Drop for RecoveryAncestry<'_, '_> {
 mod tests {
     use super::*;
     use brokk_bifrost_core::analyzer::tree_walk::ParentIndex;
+    use brokk_bifrost_test_macros::hardwon;
 
     #[test]
     fn deeply_nested_dependency_index_consumes_each_ast_node_once() {
@@ -245,6 +246,9 @@ mod tests {
         assert_eq!(dependencies.spans[&first.id()], 0..depth + 1);
     }
     #[test]
+    #[hardwon(
+        "31cd61c0a23e: recovered C++ dependency indexes remained live beyond their nested traversal lifetime"
+    )]
     fn recovery_dependency_arenas_follow_nested_traversal_lifetimes() {
         let source = "struct Outer { Member value; };";
         let mut parser = tree_sitter::Parser::new();

@@ -22,9 +22,8 @@
 #[allow(unused_imports)]
 mod common;
 
-use std::io::{BufRead, BufReader, Read, Write};
 use std::path::Path;
-use std::process::{Child, Command, Stdio};
+use std::process::Child;
 
 use brokk_bifrost_analysis::Language;
 use brokk_bifrost_mcp::benchmark_api::{
@@ -44,62 +43,21 @@ const UNRELIABLE_APP: &str = include_str!("fixtures/policy-substrate-p0/Unreliab
 const POLICY_PATH: &str = "policies/acme-pure-has-no-network-io.rqlp";
 const MODEL_PATH: &str = ".bifrost/semantic-models/acme-http-client.json";
 
-fn mcp_server_binary() -> &'static str {
-    option_env!("CARGO_BIN_EXE_bifrost-mcp-test-server")
-        .or(option_env!("CARGO_BIN_EXE_bifrost"))
-        .expect("Cargo did not provide an MCP server binary")
-}
-
 fn spawn_server(root: &Path) -> Child {
-    Command::new(mcp_server_binary())
-        // The workspace-authoring location for semantic models is opt-in.
-        .env("BIFROST_WORKSPACE_SEMANTIC_MODELS", "on")
-        // A functional wire test must not incidentally assert the cold-start
-        // budget: left at the production default a first call made during the
-        // workspace build is held to COLD_WORKSPACE_REQUEST_BUDGET (4.5s), and
-        // suite saturation then fails a protocol assertion for box load. Two
-        // tests prove the cold-start claim deliberately instead, on a reserved
-        // machine -- see `apply_test_request_budget` in
-        // `crates/bifrost-mcp/tests/bifrost_mcp_server.rs`.
-        .env(
-            MCP_ANALYZER_REQUEST_BUDGET_SECS_ENV,
-            BENCHMARK_MCP_REQUEST_BUDGET_SECS.to_string(),
-        )
-        .arg("--root")
-        .arg(root)
-        .arg("--mcp")
-        .arg("extended")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("spawn the bifrost MCP server")
-}
-
-fn write_line(stdin: &mut impl Write, payload: Value) {
-    writeln!(stdin, "{payload}").expect("write request");
-    stdin.flush().expect("flush request");
-}
-
-fn read_line(reader: &mut impl BufRead, stderr: &mut impl Read) -> Value {
-    let mut line = String::new();
-    let bytes = reader.read_line(&mut line).expect("read response");
-    if bytes == 0 {
-        let mut buffer = String::new();
-        let _ = stderr.read_to_string(&mut buffer);
-        panic!("server closed before responding; stderr:\n{buffer}");
-    }
-    serde_json::from_str(&line).expect("valid JSON response")
-}
-
-fn round_trip(
-    stdin: &mut impl Write,
-    reader: &mut impl BufRead,
-    stderr: &mut impl Read,
-    payload: Value,
-) -> Value {
-    write_line(stdin, payload);
-    read_line(reader, stderr)
+    // Policy assertions use a generous request budget; production cold-start
+    // behavior is covered separately by the reserved budget guards.
+    let request_budget = BENCHMARK_MCP_REQUEST_BUDGET_SECS.to_string();
+    common::mcp_server::spawn_mcp_server(
+        common::mcp_server::mcp_server_binary(),
+        root,
+        "extended",
+        &[],
+        &[
+            ("BIFROST_WORKSPACE_SEMANTIC_MODELS", "on"),
+            (MCP_ANALYZER_REQUEST_BUDGET_SECS_ENV, &request_budget),
+        ],
+    )
+    .expect("spawn the bifrost MCP server")
 }
 
 /// Run reference policy B over one workspace through MCP `run_policy`.
@@ -113,48 +71,16 @@ fn run_policy_over(app: &str) -> Value {
         .build();
 
     let mut child = spawn_server(project.root());
-    let mut stdin = child.stdin.take().expect("stdin");
-    let stdout = child.stdout.take().expect("stdout");
-    let mut stderr = child.stderr.take().expect("stderr");
-    let mut reader = BufReader::new(stdout);
-
-    let initialize = round_trip(
-        &mut stdin,
-        &mut reader,
-        &mut stderr,
+    let response = common::mcp_wire::call_mcp_tool(
+        &mut child,
+        "policy-substrate-p0",
+        0,
+        1,
+        "run_policy",
         json!({
-            "jsonrpc": "2.0",
-            "id": 0,
-            "method": "initialize",
-            "params": {
-                "protocolVersion": "2025-11-25",
-                "capabilities": {},
-                "clientInfo": { "name": "policy-substrate-p0", "version": "0.1.0" }
-            }
-        }),
-    );
-    assert_eq!(initialize["result"]["protocolVersion"], "2025-11-25");
-    write_line(
-        &mut stdin,
-        json!({ "jsonrpc": "2.0", "method": "notifications/initialized" }),
-    );
-
-    let response = round_trip(
-        &mut stdin,
-        &mut reader,
-        &mut stderr,
-        json!({
-            "jsonrpc": "2.0",
-            "id": 1,
-            "method": "tools/call",
-            "params": {
-                "name": "run_policy",
-                "arguments": {
-                    "policy_files": [POLICY_PATH],
-                    "evaluation_date": "2026-08-20",
-                    "fail_on": "warning"
-                }
-            }
+            "policy_files": [POLICY_PATH],
+            "evaluation_date": "2026-08-20",
+            "fail_on": "warning"
         }),
     );
     let _ = child.kill();
@@ -173,7 +99,7 @@ fn mcp_run_policy_reports_the_forbidden_transitive_effect() {
     assert_eq!(structured["exit_status"], 1, "{structured}");
 
     let report = &structured["report"];
-    assert_eq!(report["schema_version"], 5);
+    assert_eq!(report["schema_version"], 6);
     assert_eq!(
         report["evaluation"]["evaluation_date"], "2026-08-20",
         "{report}"
@@ -218,29 +144,10 @@ fn mcp_run_policy_reports_the_forbidden_transitive_effect() {
 #[test]
 fn mcp_run_policy_abstains_instead_of_reporting_a_clean_verdict() {
     let structured = run_policy_over(UNRELIABLE_APP);
-    assert_eq!(structured["exit_status"], 2, "{structured}");
-    assert_ne!(
-        structured["status"], "clean",
-        "an open effect set is never clean: {structured}"
-    );
-
+    common::policy_report::assert_mcp_policy_abstains(&structured);
     let run = &structured["report"]["runs"][0];
-    assert_eq!(run["completion"]["type"], "inconclusive", "{run}");
-    assert!(
-        run["findings"]
-            .as_array()
-            .expect("findings array")
-            .is_empty(),
-        "nothing modeled is reached, so there is no positive evidence: {run}"
-    );
-    let obligations = run["obligations"].as_array().expect("obligations array");
-    assert_eq!(obligations.len(), 1, "{run}");
     assert_eq!(
-        obligations[0]["kind"],
-        "absence_requires_exhaustive_coverage"
-    );
-    assert_eq!(
-        obligations[0]["assertion"],
+        run["obligations"][0]["assertion"],
         "pure-procedure-network-effects"
     );
 }

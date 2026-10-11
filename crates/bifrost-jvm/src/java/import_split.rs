@@ -53,8 +53,9 @@ pub enum JavaImportSplitGap {
     /// That owner can still carry the rest of the route as an inherited nested
     /// type, so the split cannot be closed.
     AlternativeFirstSegmentOwner,
-    /// The caller's inventory cannot answer exhaustively for a package, so an
-    /// empty answer is a miss rather than a proof of absence.
+    /// The caller's inventory cannot answer exhaustively for a package, so a
+    /// partial hit cannot prove uniqueness and an empty answer cannot prove
+    /// absence.
     IncompleteAlternativeInventory,
 }
 
@@ -76,21 +77,23 @@ pub enum JavaSingleTypeImportProof {
 }
 
 impl JavaSingleTypeImportProof {
+    fn target_iter(&self) -> impl Iterator<Item = &CodeUnit> {
+        let targets = match self {
+            Self::Proven(unit) => std::slice::from_ref(unit),
+            Self::Open { targets, .. } => targets.as_slice(),
+        };
+        targets.iter()
+    }
+
     /// The proof's one binding, or the strongest reading when no split is
     /// proven.
     pub fn single_target(&self) -> Option<CodeUnit> {
-        match self {
-            Self::Proven(unit) => Some(unit.clone()),
-            Self::Open { targets, .. } => targets.first().cloned(),
-        }
+        self.target_iter().next().cloned()
     }
 
     /// Every reading this proof keeps, strongest first.
     pub fn targets(&self) -> Vec<CodeUnit> {
-        match self {
-            Self::Proven(unit) => vec![unit.clone()],
-            Self::Open { targets, .. } => targets.clone(),
-        }
+        self.target_iter().cloned().collect()
     }
 
     /// The typed reason the proof stayed open, or `None` when it is proven.
@@ -199,6 +202,61 @@ pub fn prove_java_single_type_import(
     )
 }
 
+/// Prove a single-type import from the selected workspace's package/type rows.
+///
+/// `selected_types` contains only type declarations reached through selected
+/// package and type identity rows. It excludes external classpath artifacts:
+/// a duplicate external class is a build-configuration conflict, not another
+/// workspace declaration. The caller marks the inventory complete only after
+/// the selected package rows and every matching root/member type query have
+/// exhausted without gaps. An incomplete inventory keeps the route open even
+/// when its partial rows happen to contain one target.
+pub fn prove_java_single_type_import_from_selected_rows(
+    path: &[String],
+    selected_types: &[CodeUnit],
+    package_type_inventory_complete: bool,
+) -> JavaSingleTypeImportProof {
+    assert!(
+        !path.is_empty(),
+        "a single-type import path has at least one segment"
+    );
+    let readings = ImportReadings::from_selected_rows(path, selected_types);
+    let targets = readings.readings();
+    if !package_type_inventory_complete {
+        return open(JavaImportSplitGap::IncompleteAlternativeInventory, targets);
+    }
+    if path.len() < 2 {
+        return open(JavaImportSplitGap::NoPackagePrefix, targets);
+    }
+    if readings.top_level.is_empty() {
+        let gap = if readings.nested.is_empty() {
+            JavaImportSplitGap::MissingDestination
+        } else {
+            JavaImportSplitGap::NestedOnlyMatch
+        };
+        return open(gap, targets);
+    }
+    if readings.top_level.len() > 1 {
+        return open(JavaImportSplitGap::MultipleMatches, targets);
+    }
+    if !readings.nested.is_empty() {
+        return open(JavaImportSplitGap::AlternativeFirstSegmentOwner, targets);
+    }
+    for prefix_len in 1..path.len() - 1 {
+        let owner = ImportReadings::from_selected_rows(&path[..=prefix_len], selected_types);
+        if !owner.top_level.is_empty() {
+            return open(JavaImportSplitGap::AlternativeFirstSegmentOwner, targets);
+        }
+    }
+    JavaSingleTypeImportProof::Proven(
+        readings
+            .top_level
+            .into_iter()
+            .next()
+            .expect("a proven split holds exactly one top-level type"),
+    )
+}
+
 fn open(gap: JavaImportSplitGap, targets: Vec<CodeUnit>) -> JavaSingleTypeImportProof {
     JavaSingleTypeImportProof::Open { gap, targets }
 }
@@ -221,6 +279,44 @@ struct ImportReadings {
 }
 
 impl ImportReadings {
+    /// Classify selected declaration rows against the parsed import segments.
+    /// The row's segment identities and kinds establish its canonical package
+    /// and type route; rendered FQ-name strings are not used as proof keys.
+    fn from_selected_rows(path: &[String], selected_types: &[CodeUnit]) -> Self {
+        let interner = segment_interner();
+        let mut readings = Self::default();
+        for unit in selected_types {
+            if !unit.is_class() {
+                continue;
+            }
+            let segments = unit.fq().segments();
+            if segments.len() != path.len()
+                || !segments
+                    .iter()
+                    .zip(path)
+                    .all(|(&id, text)| interner.resolve(id).0 == text)
+            {
+                continue;
+            }
+            let namespace_len = segments
+                .iter()
+                .take_while(|&&id| interner.resolve(id).1.denotes_namespace())
+                .count();
+            if namespace_len == path.len()
+                || !segments[namespace_len..]
+                    .iter()
+                    .all(|&id| denotes_type_segment(interner.resolve(id).1))
+            {
+                readings.other.push(unit.clone());
+            } else if namespace_len == path.len() - 1 {
+                readings.top_level.push(unit.clone());
+            } else {
+                readings.nested.push(unit.clone());
+            }
+        }
+        readings
+    }
+
     fn of(path: &[String], classes: Vec<CodeUnit>) -> Self {
         let interner = segment_interner();
         let mut readings = Self::default();
@@ -310,6 +406,7 @@ mod tests {
     use brokk_bifrost_core::analyzer::ProjectFile;
     use brokk_bifrost_core::analyzer::fq_name::{FqName, segment_interner};
     use brokk_bifrost_core::analyzer::model::CodeUnitType;
+    use brokk_bifrost_test_macros::hardwon;
     use std::collections::HashMap;
     use std::path::PathBuf;
 
@@ -372,12 +469,7 @@ mod tests {
     /// The segment kinds of one target, so a test can tell the two readings of
     /// one rendered name apart.
     fn shapes(unit: &CodeUnit) -> Vec<(&'static str, SegmentKind)> {
-        let interner = segment_interner();
-        unit.fq()
-            .segments()
-            .iter()
-            .map(|&id| interner.resolve(id))
-            .collect()
+        unit.fq().resolved_segments().collect()
     }
 
     fn target_shapes(proof: &JavaSingleTypeImportProof) -> Vec<Vec<SegmentKind>> {
@@ -386,9 +478,8 @@ mod tests {
             .iter()
             .map(|unit| {
                 unit.fq()
-                    .segments()
-                    .iter()
-                    .map(|&id| segment_interner().resolve(id).1)
+                    .resolved_segments()
+                    .map(|(_, kind)| kind)
                     .collect()
             })
             .collect()
@@ -414,7 +505,27 @@ mod tests {
         )
     }
 
+    fn prove_selected(
+        inventory: &FakeInventory,
+        path: &[&str],
+        package_type_inventory_complete: bool,
+    ) -> JavaSingleTypeImportProof {
+        let selected_types = inventory
+            .classes
+            .values()
+            .flatten()
+            .filter(|unit| unit.is_class())
+            .cloned()
+            .collect::<Vec<_>>();
+        prove_java_single_type_import_from_selected_rows(
+            &import_path(path),
+            &selected_types,
+            package_type_inventory_complete,
+        )
+    }
+
     #[test]
+    #[hardwon("#2045: field lookup missed nested anonymous and inherited Java owners")]
     fn two_prefix_import_proves_the_exact_top_level_split() {
         let inventory = FakeInventory::new(&[&[
             ("bench", Package),
@@ -438,6 +549,7 @@ mod tests {
     }
 
     #[test]
+    #[hardwon("#2045: field lookup missed nested anonymous and inherited Java owners")]
     fn an_alternative_first_segment_owner_keeps_the_split_open() {
         let inventory = FakeInventory::new(&[
             &[("bench", Package), ("mod00000", Type)],
@@ -464,6 +576,7 @@ mod tests {
     }
 
     #[test]
+    #[hardwon("#2045: field lookup missed nested anonymous and inherited Java owners")]
     fn a_nested_reading_of_the_same_name_joins_the_exact_split() {
         let inventory = FakeInventory::new(&[
             &[
@@ -497,6 +610,7 @@ mod tests {
     }
 
     #[test]
+    #[hardwon("#2045: field lookup missed nested anonymous and inherited Java owners")]
     fn a_nested_only_reading_stays_open() {
         let inventory = FakeInventory::new(&[&[
             ("bench", Package),
@@ -516,6 +630,7 @@ mod tests {
     }
 
     #[test]
+    #[hardwon("#2045: field lookup missed nested anonymous and inherited Java owners")]
     fn several_top_level_matches_stay_open() {
         let inventory = FakeInventory::new(&[
             &[
@@ -545,6 +660,7 @@ mod tests {
     /// A bounded, budgeted or cancelled lookup truncates its rows instead of
     /// failing, so its empty answer is a miss and never a proof of absence.
     #[test]
+    #[hardwon("#2045: field lookup missed nested anonymous and inherited Java owners")]
     fn a_partial_inventory_cannot_close_an_alternative_split() {
         let inventory = FakeInventory::new(&[&[
             ("bench", Package),
@@ -576,6 +692,36 @@ mod tests {
     }
 
     #[test]
+    fn selected_package_and_type_rows_close_only_one_complete_workspace_route() {
+        let unique =
+            FakeInventory::new(&[&[("p", Package), ("config", Package), ("Configuration", Type)]]);
+        assert!(matches!(
+            prove_selected(&unique, &["p", "config", "Configuration"], true),
+            JavaSingleTypeImportProof::Proven(_)
+        ));
+        assert_eq!(
+            prove_selected(&unique, &["p", "config", "Configuration"], false).gap(),
+            Some(JavaImportSplitGap::IncompleteAlternativeInventory)
+        );
+
+        let duplicate = FakeInventory::new(&[
+            &[("p", Package), ("config", Package), ("Configuration", Type)],
+            &[("p", Package), ("config", Package), ("Configuration", Type)],
+        ]);
+        assert_eq!(
+            prove_selected(&duplicate, &["p", "config", "Configuration"], true).gap(),
+            Some(JavaImportSplitGap::MultipleMatches)
+        );
+
+        let missing = FakeInventory::new(&[]);
+        assert_eq!(
+            prove_selected(&missing, &["p", "config", "Configuration"], true).gap(),
+            Some(JavaImportSplitGap::MissingDestination)
+        );
+    }
+
+    #[test]
+    #[hardwon("#2045: field lookup missed nested anonymous and inherited Java owners")]
     fn a_missing_destination_stays_open_with_no_target() {
         let inventory = FakeInventory::new(&[]);
         let proof = prove(&inventory, &["bench", "mod00000", "Module00000"]);
@@ -585,6 +731,7 @@ mod tests {
     }
 
     #[test]
+    #[hardwon("#2045: field lookup missed nested anonymous and inherited Java owners")]
     fn a_path_without_a_package_segment_is_not_a_split() {
         let inventory = FakeInventory::new(&[]);
         let proof = prove(&inventory, &["Module00000"]);

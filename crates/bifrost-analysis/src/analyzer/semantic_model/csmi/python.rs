@@ -183,6 +183,11 @@ pub(crate) fn validate_identity(identity: &CsmiPortableSymbolIdentity) -> Result
             {
                 in_namespace = false;
             }
+            CsmiDescriptorRole::Term
+                if in_namespace && index > 0 && index + 1 == identity.descriptors.len() =>
+            {
+                in_namespace = false;
+            }
             _ => {
                 return Err(format!(
                     "unsupported Python descriptor ownership {descriptor:?}"
@@ -334,6 +339,37 @@ pub(crate) fn qualified_name(identity: &CsmiPortableSymbolIdentity) -> String {
         })
         .collect::<Vec<_>>()
         .join(".")
+}
+
+pub(crate) fn external_class_qualified_name(
+    descriptors: &[CsmiDescriptor],
+) -> Result<String, String> {
+    if descriptors.len() < 2 {
+        return Err("Python external class type needs a module and type descriptor".to_owned());
+    }
+    let last = descriptors.len() - 1;
+    let mut names = Vec::with_capacity(descriptors.len());
+    for (index, descriptor) in descriptors.iter().enumerate() {
+        let Some(name) = descriptor.name.as_deref() else {
+            return Err("Python external class type has an unnamed descriptor".to_owned());
+        };
+        if name.is_empty() || name.contains('.') || descriptor.disambiguator.is_some() {
+            return Err(format!(
+                "unsupported Python external class descriptor {descriptor:?}"
+            ));
+        }
+        match descriptor.role {
+            CsmiDescriptorRole::Namespace if index < last => {}
+            CsmiDescriptorRole::Type if index == last => {}
+            _ => {
+                return Err(format!(
+                    "Python external class path must end in one type descriptor: {descriptor:?}"
+                ));
+            }
+        }
+        names.push(name);
+    }
+    Ok(names.join("."))
 }
 
 fn validate_python_payload(payload: &serde_json::Value) -> Result<(), String> {
@@ -901,6 +937,7 @@ pub(crate) fn validate_model(model: &CsmiSemanticModel) -> Result<(), String> {
             .last()
             .expect("validated nonempty identity")
             .role;
+        let value_declaration = declaration.category == CsmiDeclarationCategory::Value;
         if !matches!(
             (declaration.category, role),
             (
@@ -911,11 +948,47 @@ pub(crate) fn validate_model(model: &CsmiSemanticModel) -> Result<(), String> {
                     CsmiDeclarationCategory::Callable,
                     CsmiDescriptorRole::Callable
                 )
+                | (CsmiDeclarationCategory::Value, CsmiDescriptorRole::Term)
         ) || !declaration.generic_parameters.is_empty()
             || !declaration.extensions.is_empty()
         {
             return Err(format!(
                 "unsupported Python declaration shape {}",
+                declaration.symbol
+            ));
+        }
+        if value_declaration {
+            let Some(owner_id) = declaration.owner.as_ref() else {
+                return Err(format!(
+                    "Python module value {} has no namespace owner",
+                    declaration.symbol
+                ));
+            };
+            let owner_declaration = model
+                .declarations
+                .iter()
+                .find(|candidate| candidate.symbol == *owner_id);
+            if !owner_declaration
+                .is_some_and(|owner| owner.category == CsmiDeclarationCategory::Namespace)
+            {
+                return Err(format!(
+                    "Python module value {} is not owned by a namespace declaration",
+                    declaration.symbol
+                ));
+            }
+            let Some(value_type) = declaration.value_type.as_ref() else {
+                return Err(format!(
+                    "Python module value {} has no declared class type",
+                    declaration.symbol
+                ));
+            };
+            validate_declared_class_type(value_type, model)?;
+            if let Some(proxied_type) = declaration.proxied_type.as_ref() {
+                validate_declared_class_type(proxied_type, model)?;
+            }
+        } else if declaration.value_type.is_some() || declaration.proxied_type.is_some() {
+            return Err(format!(
+                "non-value Python declaration {} carries module value types",
                 declaration.symbol
             ));
         }
@@ -931,6 +1004,34 @@ pub(crate) fn validate_model(model: &CsmiSemanticModel) -> Result<(), String> {
                     declaration.symbol
                 ));
             }
+        }
+    }
+    Ok(())
+}
+
+fn validate_declared_class_type(
+    declared_type: &CsmiDeclaredClassType,
+    model: &CsmiSemanticModel,
+) -> Result<(), String> {
+    match declared_type {
+        CsmiDeclaredClassType::Reference { symbol } => {
+            let target = model
+                .declarations
+                .iter()
+                .find(|declaration| declaration.symbol == *symbol);
+            if !target
+                .is_some_and(|declaration| declaration.category == CsmiDeclarationCategory::Type)
+            {
+                return Err(format!(
+                    "Python module value type reference {symbol} does not identify a declared class"
+                ));
+            }
+        }
+        CsmiDeclaredClassType::External {
+            language: CsmiExternalTypeLanguage::Python,
+            descriptors,
+        } => {
+            external_class_qualified_name(descriptors)?;
         }
     }
     Ok(())
@@ -1088,16 +1189,25 @@ pub(crate) fn validate_native_identities(
             let Some(descriptor) = identity.descriptors.last() else {
                 continue;
             };
-            if !matches!(
+            let callable_identity = matches!(
                 fact.member_kind,
-                MemberKind::Function | MemberKind::Method | MemberKind::Constructor
-            ) || descriptor.role != CsmiDescriptorRole::Callable
+                MemberKind::Function
+                    | MemberKind::Method
+                    | MemberKind::Constructor
+                    | MemberKind::Property
+            ) && descriptor.role == CsmiDescriptorRole::Callable;
+            let module_value_identity = fact.member_kind == MemberKind::Field
+                && descriptor.role == CsmiDescriptorRole::Term
+                && types
+                    .get(fact.owner.as_str())
+                    .is_some_and(|owner| owner.type_kind == TypeKind::Module);
+            if (!callable_identity && !module_value_identity)
                 || descriptor.name.as_deref() != Some(fact.name.as_str())
             {
                 diagnostics.push(Diagnostic::error(
                     "locator.interchange_declaration",
                     format!("members.{}", fact.id),
-                    "native callable name or kind disagrees with its portable identity",
+                    "native member name or kind disagrees with its portable identity",
                 ));
             }
             if let Some(owner) = types.get(fact.owner.as_str()) {
@@ -1109,7 +1219,7 @@ pub(crate) fn validate_native_identities(
                     diagnostics.push(Diagnostic::error(
                         "locator.interchange_owner",
                         format!("members.{}", fact.id),
-                        "native callable owner disagrees with its portable identity",
+                        "native member owner disagrees with its portable identity",
                     ));
                 }
             }
@@ -1168,10 +1278,7 @@ pub(crate) fn native_profile_digest(
     if let Some(evidence) = bare.python_correspondence.as_mut() {
         evidence.native_sha256.clear();
     }
-    let normalized = crate::analyzer::semantic_model::compiler::normalize(bare);
-    super::canonical::sha256_hex(
-        &serde_json::to_vec(&normalized).expect("native semantic pack serializes"),
-    )
+    normalized_native_pack_digest(bare).expect("native semantic pack serializes")
 }
 
 /// Bind the typed correspondence and all retained producer evidence to the
@@ -1185,10 +1292,16 @@ pub(crate) fn native_correspondence_digest(
         .as_mut()
         .expect("correspondence digest requires its carrier");
     evidence.native_sha256.clear();
-    let normalized = crate::analyzer::semantic_model::compiler::normalize(bare);
-    super::canonical::sha256_hex(
-        &serde_json::to_vec(&normalized).expect("native correspondence pack serializes"),
-    )
+    normalized_native_pack_digest(bare).expect("native correspondence pack serializes")
+}
+
+fn normalized_native_pack_digest(
+    pack: crate::analyzer::semantic_model::AuthoredSemanticModelPack,
+) -> Result<String, serde_json::Error> {
+    let normalized = crate::analyzer::semantic_model::compiler::normalize(pack);
+    Ok(super::canonical::sha256_hex(&serde_json::to_vec(
+        &normalized,
+    )?))
 }
 
 fn profile_carriers(
@@ -1736,6 +1849,22 @@ fn validate_correspondence_evidence(
     diagnostics
 }
 
+/// The branch semantics of a `typing` predicate special form, named by its
+/// canonical `module.member` spelling.
+pub(crate) fn conditional_special_form_semantics(
+    canonical: &str,
+) -> Option<CsmiConditionalTypeSemantics> {
+    match canonical {
+        "typing.TypeIs" | "typing_extensions.TypeIs" => {
+            Some(CsmiConditionalTypeSemantics::Biconditional)
+        }
+        "typing.TypeGuard" | "typing_extensions.TypeGuard" => {
+            Some(CsmiConditionalTypeSemantics::PositiveOnly)
+        }
+        _ => None,
+    }
+}
+
 pub(crate) fn narrowing_annotation(
     returns: &TypeRef,
 ) -> Option<(CsmiConditionalTypeSemantics, &TypeRef)> {
@@ -1747,13 +1876,7 @@ pub(crate) fn narrowing_annotation(
     else {
         return None;
     };
-    let semantics = match name.as_str() {
-        "typing.TypeIs" | "typing_extensions.TypeIs" => CsmiConditionalTypeSemantics::Biconditional,
-        "typing.TypeGuard" | "typing_extensions.TypeGuard" => {
-            CsmiConditionalTypeSemantics::PositiveOnly
-        }
-        _ => return None,
-    };
+    let semantics = conditional_special_form_semantics(name)?;
     let [target] = arguments.as_slice() else {
         return None;
     };
@@ -1776,6 +1899,12 @@ fn export_type_expression(
         match next {
             Work::Visit(value) => {
                 let (native_id, arguments) = match value {
+                    TypeRef::Unknown => {
+                        values.push(CsmiTypeExpression::Unknown(CsmiUnknownType {
+                            kind: CsmiUnknownTypeKind::Unknown,
+                        }));
+                        continue;
+                    }
                     TypeRef::Declared {
                         id,
                         arguments,
@@ -1829,6 +1958,61 @@ fn export_type_expression(
     Ok(values.pop().expect("root expression"))
 }
 
+fn export_declared_class_type(
+    value: &TypeRef,
+    symbols: &std::collections::HashMap<String, String>,
+) -> Result<CsmiDeclaredClassType, super::export::CsmiExportError> {
+    use super::export::CsmiExportError;
+    match value {
+        TypeRef::Declared {
+            id,
+            arguments,
+            nullable: false,
+        } if arguments.is_empty() => symbols
+            .get(id)
+            .cloned()
+            .map(|symbol| CsmiDeclaredClassType::Reference { symbol })
+            .ok_or_else(|| CsmiExportError::MissingDeclaration {
+                path: "python.module-value.type".to_owned(),
+                target: id.clone(),
+            }),
+        TypeRef::Named {
+            name,
+            arguments,
+            nullable: false,
+        } if arguments.is_empty() => {
+            let parts = name.split('.').collect::<Vec<_>>();
+            if parts.len() < 2 || parts.iter().any(|part| part.is_empty()) {
+                return Err(CsmiExportError::Unsupported {
+                    path: "python.module-value.type".to_owned(),
+                    semantic: format!("external Python class name is not qualified: {name}"),
+                });
+            }
+            let last = parts.len() - 1;
+            Ok(CsmiDeclaredClassType::External {
+                language: CsmiExternalTypeLanguage::Python,
+                descriptors: parts
+                    .into_iter()
+                    .enumerate()
+                    .map(|(index, part)| CsmiDescriptor {
+                        role: if index == last {
+                            CsmiDescriptorRole::Type
+                        } else {
+                            CsmiDescriptorRole::Namespace
+                        },
+                        name: Some(part.to_owned()),
+                        disambiguator: None,
+                    })
+                    .collect(),
+            })
+        }
+        _ => Err(CsmiExportError::Unsupported {
+            path: "python.module-value.type".to_owned(),
+            semantic: format!("unrepresentable Python declared class type {value:?}"),
+        }),
+    }
+}
+
 pub(super) fn export_document(
     manifest: &crate::analyzer::semantic_model::CompiledPackManifest,
     shards: &[crate::analyzer::semantic_model::CompiledShard],
@@ -1838,7 +2022,7 @@ pub(super) fn export_document(
     use super::export::CsmiExportError;
     use crate::analyzer::semantic_model::{
         CompiledPayload, Completeness, ConditionalTypeRefinementFact,
-        ConditionalTypeRefinementsPayload, Locator, TypeKind, Visibility,
+        ConditionalTypeRefinementsPayload, Locator, MemberKind, TypeKind, Visibility,
     };
     use serde_json::json;
     use std::collections::HashMap;
@@ -2090,7 +2274,7 @@ pub(super) fn export_document(
     let mut names = HashMap::new();
     let mut ambiguous_names = std::collections::HashSet::new();
     let mut declarations = Vec::new();
-    for fact in types {
+    for fact in &types {
         if !matches!(fact.type_kind, TypeKind::Class | TypeKind::Module)
             || fact.visibility != Visibility::Public
             || fact.is_abstract
@@ -2133,6 +2317,8 @@ pub(super) fn export_document(
             owner,
             generic_parameters: Vec::new(),
             callable: None,
+            value_type: None,
+            proxied_type: None,
             alias_target: None,
             provenance: vec![options.provenance_id.clone()],
             extensions: Vec::new(),
@@ -2152,6 +2338,66 @@ pub(super) fn export_document(
     let mut callable_shape_provenance = Vec::new();
     let mut callable_shape_defaults = Vec::new();
     for member in members {
+        if member.member_kind == MemberKind::Field {
+            let Some(owner) = types.iter().find(|fact| fact.id == member.owner) else {
+                return Err(unsupported("Python module value has no declared owner"));
+            };
+            if owner.type_kind != TypeKind::Module
+                || member.signature.is_some()
+                || member.visibility != Visibility::Public
+                || member.is_abstract
+                || member.is_virtual
+                || member.value_type.is_none()
+            {
+                return Err(unsupported(
+                    "Python module value must be a public typed field on a module",
+                ));
+            }
+            let identity = keys
+                .get(member.id.as_str())
+                .ok_or_else(|| unsupported("Python module value has no portable identity"))?;
+            if identity
+                .descriptors
+                .last()
+                .is_none_or(|descriptor| descriptor.role != CsmiDescriptorRole::Term)
+            {
+                return Err(unsupported(
+                    "Python module value identity must end in a term descriptor",
+                ));
+            }
+            let owner_symbol = symbol_ids
+                .get(&member.owner)
+                .ok_or_else(|| unsupported("Python module value owner has no portable identity"))?
+                .clone();
+            declarations.push(CsmiDeclaration {
+                symbol: symbol_ids[&member.id].clone(),
+                category: CsmiDeclarationCategory::Value,
+                owner: Some(owner_symbol),
+                generic_parameters: Vec::new(),
+                callable: None,
+                value_type: Some(export_declared_class_type(
+                    member
+                        .value_type
+                        .as_ref()
+                        .expect("typed module value checked"),
+                    &symbol_ids,
+                )?),
+                proxied_type: member
+                    .proxied_type
+                    .as_ref()
+                    .map(|value| export_declared_class_type(value, &symbol_ids))
+                    .transpose()?,
+                alias_target: None,
+                provenance: vec![options.provenance_id.clone()],
+                extensions: Vec::new(),
+            });
+            continue;
+        }
+        if member.value_type.is_some() || member.proxied_type.is_some() {
+            return Err(unsupported(
+                "Python declared member types are supported only on module value fields",
+            ));
+        }
         let signature = member
             .signature
             .as_ref()
@@ -2272,6 +2518,8 @@ pub(super) fn export_document(
             ),
             generic_parameters: Vec::new(),
             callable: Some(shape),
+            value_type: None,
+            proxied_type: None,
             alias_target: None,
             provenance: vec![options.provenance_id.clone()],
             extensions: Vec::new(),
@@ -2738,4 +2986,40 @@ pub(super) fn export_document(
         semantic_models: vec![model],
     };
     Ok((document, record))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::export_type_expression;
+    use crate::analyzer::semantic_model::TypeRef;
+    use std::collections::HashMap;
+
+    #[test]
+    fn unknown_generic_arguments_export_as_structured_unknown_types() {
+        let names = HashMap::from([("builtins.list".to_owned(), "native-list".to_owned())]);
+        let symbols = HashMap::from([("native-list".to_owned(), "python-list".to_owned())]);
+        let value = TypeRef::Named {
+            name: "builtins.list".to_owned(),
+            arguments: vec![TypeRef::Unknown],
+            nullable: false,
+        };
+
+        let expression = export_type_expression(&value, &names, &symbols)
+            .expect("known Python generic identity preserves its unknown argument");
+
+        assert_eq!(
+            expression,
+            super::super::model::CsmiTypeExpression::Reference(
+                super::super::model::CsmiReferenceType {
+                    kind: super::super::model::CsmiReferenceTypeKind::Reference,
+                    symbol: "python-list".to_owned(),
+                    arguments: vec![super::super::model::CsmiTypeExpression::Unknown(
+                        super::super::model::CsmiUnknownType {
+                            kind: super::super::model::CsmiUnknownTypeKind::Unknown,
+                        }
+                    )],
+                }
+            )
+        );
+    }
 }

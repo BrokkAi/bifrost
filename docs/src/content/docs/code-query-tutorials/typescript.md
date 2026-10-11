@@ -3,9 +3,9 @@ title: TypeScript
 description: Query TypeScript declarations, callable refinements, decorators, and TSX with query_code.
 ---
 
-> Last verified end to end: 2026-08-26 (`query_code` schema version 1).
+> Last verified end to end: 2026-10-01 (`query_code` schema version 1).
 
-For exact inbound and outbound symbol edges, proof tiers, and adapter-specific caveats, see [Reference Traversal](../reference-traversal/). For bounded allocation/factory provenance, ambiguity, exact member targets, and call-input composition, see [Receiver Traversal](../receiver-traversal/).
+For exact inbound and outbound symbol edges, proof tiers, and adapter-specific caveats, see [Reference Traversal](/code-query-tutorials/reference-traversal/). For bounded allocation/factory provenance, ambiguity, exact member targets, and call-input composition, see [Receiver Traversal](/code-query-tutorials/receiver-traversal/).
 
 TypeScript shares JavaScript's structural adapter and adds interface, enum, abstract-class, type-alias, type-identifier, decorator, and TSX grammar shapes.
 
@@ -362,7 +362,7 @@ remain distinct from static keys, while spreads use the context-free
 
 <!-- code-query-case:computed-property:rql -->
 ```lisp
-(language typescript (computed_property :value "dynamicKey"))
+(language typescript (computed_property :value (name "dynamicKey")))
 ```
 
 <!-- code-query-case:computed-property:json -->
@@ -430,9 +430,9 @@ remain distinct from static keys, while spreads use the context-free
 
 ## Precision Boundary
 
-Interfaces, enums, and abstract classes intentionally share the normalized `class` kind. Use `name`, containment, or source/path scoping when their source syntax matters; there is no separate public `interface` kind.
+Interfaces, enums, abstract classes, and `type` aliases share the normalized `class` kind. Use `name`, containment, or source/path scoping when their source syntax matters; there is no separate public `interface` or type-alias kind.
 
-This example exposes bounded receiver values through the shared public `query_code` contract. The adapter preserves explicit `unknown`, `ambiguous`, `unsupported`, and budget outcomes; it does not provide whole-program points-to, general alias analysis, path-sensitive control flow, taint, or general data flow.
+This example exposes bounded receiver values through the shared public `query_code` contract. The receiver steps preserve explicit `unknown`, `ambiguous`, `unsupported`, and budget outcomes. They do not compute whole-program points-to, general alias analysis, path-sensitive control flow, taint, or value flow. For taint and value flow, run a taint or flow `.rqlp` policy, or a registered value-flow plan from Rust. TypeScript supports them at the bounded baseline described in [Data Flow, Taint, and Typestate](/data-flow-and-typestate/). The `class-set` and `absent-member` steps also run for TypeScript.
 
 ## Traverse Indexed Types And Members
 

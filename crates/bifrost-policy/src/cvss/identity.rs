@@ -7,6 +7,8 @@ use super::{
     CvssUnscoredReason, SourceScenarioSetHash, VulnerabilityIdentity,
 };
 
+pub(super) use brokk_bifrost_analysis::analyzer::canonical_hash::write_length_prefixed as update_field;
+
 const EVIDENCE_SET_DOMAIN: &[u8] = b"bifrost-cvss-evidence-set/v1";
 const VARIANT_DOMAIN: &[u8] = b"bifrost-policy-cvss-variant/v1";
 
@@ -131,12 +133,6 @@ const fn incomplete_reason_label(reason: super::PolicyIncompleteReason) -> &'sta
 fn update_count(hasher: &mut Sha256, count: usize) {
     let count = u64::try_from(count).unwrap_or(u64::MAX);
     update_field(hasher, &count.to_be_bytes());
-}
-
-pub(super) fn update_field(hasher: &mut Sha256, bytes: &[u8]) {
-    let length = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
-    hasher.update(length.to_be_bytes());
-    hasher.update(bytes);
 }
 
 #[cfg(test)]

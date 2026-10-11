@@ -80,19 +80,7 @@ pub fn build_go_package_files(
     index: &dyn CodeUnitIndex,
     files: &[ProjectFile],
 ) -> HashMap<String, Arc<Vec<ProjectFile>>> {
-    let mut files_by_package: HashMap<String, Vec<ProjectFile>> = HashMap::default();
-    for file in files {
-        if let Some(package) = go_package_of(index, file) {
-            files_by_package
-                .entry(package)
-                .or_default()
-                .push(file.clone());
-        }
-    }
-    files_by_package
-        .into_iter()
-        .map(|(package, files)| (package, Arc::new(files)))
-        .collect()
+    group_go_files_by_key(index, files, |_, package| vec![package.to_string()])
 }
 
 /// Go files grouped by their parent directory path.
@@ -100,20 +88,7 @@ pub fn build_go_dir_parent_files(
     index: &dyn CodeUnitIndex,
     files: &[ProjectFile],
 ) -> HashMap<String, Arc<Vec<ProjectFile>>> {
-    let mut files_by_parent: HashMap<String, Vec<ProjectFile>> = HashMap::default();
-    for file in files {
-        if go_package_of(index, file).is_none() {
-            continue;
-        }
-        files_by_parent
-            .entry(parent_path_key(file))
-            .or_default()
-            .push(file.clone());
-    }
-    files_by_parent
-        .into_iter()
-        .map(|(parent, files)| (parent, Arc::new(files)))
-        .collect()
+    group_go_files_by_key(index, files, |file, _| vec![parent_path_key(file)])
 }
 
 /// Go files grouped by every path suffix of their parent directory.
@@ -121,21 +96,30 @@ pub fn build_go_dir_parent_suffix_files(
     index: &dyn CodeUnitIndex,
     files: &[ProjectFile],
 ) -> HashMap<String, Arc<Vec<ProjectFile>>> {
-    let mut files_by_suffix: HashMap<String, Vec<ProjectFile>> = HashMap::default();
+    group_go_files_by_key(index, files, |file, _| {
+        path_suffixes(&parent_path_key(file))
+            .map(str::to_owned)
+            .collect()
+    })
+}
+
+fn group_go_files_by_key(
+    index: &dyn CodeUnitIndex,
+    files: &[ProjectFile],
+    mut keys_for_file: impl FnMut(&ProjectFile, &str) -> Vec<String>,
+) -> HashMap<String, Arc<Vec<ProjectFile>>> {
+    let mut files_by_key: HashMap<String, Vec<ProjectFile>> = HashMap::default();
     for file in files {
-        if go_package_of(index, file).is_none() {
+        let Some(package) = go_package_of(index, file) else {
             continue;
-        }
-        for suffix in path_suffixes(&parent_path_key(file)) {
-            files_by_suffix
-                .entry(suffix.to_string())
-                .or_default()
-                .push(file.clone());
+        };
+        for key in keys_for_file(file, &package) {
+            files_by_key.entry(key).or_default().push(file.clone());
         }
     }
-    files_by_suffix
+    files_by_key
         .into_iter()
-        .map(|(suffix, files)| (suffix, Arc::new(files)))
+        .map(|(key, files)| (key, Arc::new(files)))
         .collect()
 }
 

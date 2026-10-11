@@ -14,36 +14,10 @@ pub struct JavaFileSourceFacts {
 
 impl JavaFileSourceFacts {
     pub fn estimated_retained_bytes(&self) -> usize {
-        self.source
-            .estimated_bytes()
-            .saturating_add(self.facts.estimated_retained_bytes())
-            .saturating_add(
-                self.declaration_units
-                    .capacity()
-                    .saturating_mul(std::mem::size_of::<(SourceDeclarationId, Vec<CodeUnit>)>()),
-            )
-            .saturating_add(
-                self.declaration_units
-                    .values()
-                    .map(|units| {
-                        units
-                            .capacity()
-                            .saturating_mul(std::mem::size_of::<CodeUnit>())
-                            .saturating_add(
-                                units
-                                    .iter()
-                                    .map(|unit| {
-                                        unit.fq_name()
-                                            .len()
-                                            .saturating_add(unit.signature().map_or(0, str::len))
-                                            .saturating_add(
-                                                unit.source().rel_path().to_string_lossy().len(),
-                                            )
-                                    })
-                                    .sum::<usize>(),
-                            )
-                    })
-                    .sum::<usize>(),
-            )
+        brokk_bifrost_core::analyzer::source_facts::source_projection_retained_bytes(
+            &self.source,
+            self.facts.estimated_retained_bytes(),
+            &self.declaration_units,
+        )
     }
 }

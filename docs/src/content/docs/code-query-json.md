@@ -5,7 +5,7 @@ description: Use the canonical JSON representation for Bifrost's query_code engi
 
 JSON `CodeQuery` is the canonical machine-facing representation accepted by Bifrost's `query_code` tool. MCP hosts and the Python client send this shape directly. Author queries in RQL, then generate this serialization from the decoded `CodeQuery`; the RQL REPL prints it with `:json`. JSON examples on this page describe the machine wire contract, not a second authoring syntax. Generated `.json` query files remain supported; JSON text in `.rql` files or editor buffers is not supported.
 
-The single supported schema version is `"1"`; it carries the complete vocabulary below. A taint query names only a registered immutable result; it cannot load a policy, compile selectors, run propagation, reconstruct witnesses, or perform policy classification.
+The single supported schema version is `"1"`. The [CodeQuery and RQL Vocabulary Reference](/reference/code-query/) lists every field, kind, role, step, option, value label, result type, diagnostic code, and limit. This page explains the JSON shape. A taint query names only a registered immutable result; it cannot load a policy, compile selectors, run propagation, reconstruct witnesses, or perform policy classification.
 
 ## Minimal Query
 
@@ -26,19 +26,21 @@ The `match` object is the root pattern. It must constrain at least one of `kind`
 
 ## Top-Level Fields
 
-| Field | Shape | Meaning |
-| --- | --- | --- |
-| `schema_version` | string | Optional. Version `"1"` is the only supported version; omit it or pin it explicitly. Other versions are rejected. Legacy numeric `1` input is accepted and canonicalized to `"1"`. |
-| `match` | pattern | Required root pattern. |
-| `where` | string array or array of non-empty string arrays | Optional project-relative globs. A flat list uses OR; nested lists use AND between groups and OR within each group. Absolute paths or globs inside the active workspace are normalized by MCP and CLI entrypoints. |
-| `languages` | string array | Optional language labels such as `python` or `cpp`, or fixed families `jvm` (`java`, `kotlin`, `scala`) and `js-ts` (`javascript`, `typescript`). Empty means every structural adapter. |
-| `inside` | pattern | Require the root match to be lexically inside a matching ancestor. |
-| `inside_decl` | pattern | Require containment in a matching ancestor without crossing a nested callable declaration. A Rust impl member can also match the resolved type declaration that owns the impl. |
-| `not_inside` | pattern | Reject the root match when a matching ancestor exists. |
-| `steps` | step array | Ordered typed transformations applied after structural matching. At most `16`. |
-| `limit` | integer | Maximum terminal results after pipeline deduplication. Defaults to `100`; valid range is `1` through `1000`. |
-| `result_detail` | string | `compact` by default or `full` for stable IDs and precise ranges. |
-| `execution_mode` | string | `results` by default, `explain` for planning without execution, or `profile` for results plus opt-in measurements. |
+A query object has exactly one source:
+
+- `match`, a root pattern;
+- a set operator, `union`, `intersect`, or `except`, holding 2 to 16 complete child queries; or
+- one seed source: `occurrences`, `scopes`, `bindings`, `paths`, `generation_sites`, `exports`, `dependency_evidence`, or `configuration_facts`. Each seed source takes a filter object, and an empty object `{}` selects every row.
+
+The other top-level fields scope or shape the query:
+
+- `where` holds project-relative globs. A flat list means any glob. Nested lists mean every group, with any glob inside a group. MCP and CLI entry points normalize absolute paths and globs inside the active workspace.
+- `languages` holds at most 32 language labels. The labels are `java`, `go`, `cpp`, `javascript`, `typescript`, `python`, `rust`, `php`, `scala`, `csharp`, `ruby`, and `kotlin`, plus the families `jvm` (`java`, `kotlin`, `scala`) and `js-ts` (`javascript`, `typescript`). The list also accepts `c++`, `c#`, and any file extension that Bifrost indexes, such as `py`, `kts`, `tsx`, or `h`; each one selects the language that owns it. An extension selects the whole language, so `c` and `h` select every `cpp` file. Omit `languages` to search every structural adapter. `configuration_facts` rejects it. See [the label table](/reference/code-query/#languages) and [language support](/reference/languages/).
+- `inside`, `inside_decl`, and `not_inside` constrain the ancestors of a `match` root.
+- `steps` is an ordered array of at most 16 typed steps.
+- `limit` (1 to 1000, default 100), `result_detail` (`compact` or `full`), `execution_mode` (`results`, `explain`, or `profile`), and `schema_version` (`"1"`) control the output. The number `1` is also accepted for `schema_version` and is rewritten to `"1"`.
+
+The [query plan field table](/reference/code-query/#query-plan-fields) gives the value shape and default of each field, and the [seed source filter table](/reference/code-query/#seed-source-filters) lists every filter axis.
 
 Unknown fields are rejected rather than ignored.
 
@@ -48,19 +50,18 @@ When calling `query_code`, MCP clients may instead send a tool-call envelope suc
 
 ## Pattern Fields
 
-A pattern combines all supplied constraints with logical AND.
+A pattern combines all supplied constraints with logical AND. Its fields are `kind`, `not_kind`, `async`, `name`, `text`, `boolean_value`, `capture`, `arity`, `visibility`, `parameter_type`, `has`, `not_has`, and the [roles](/reference/code-query/#roles) that the pattern's kind allows. The [pattern field table](/reference/code-query/#patterns) gives each value shape and limit.
 
-| Field | Shape | Meaning |
-| --- | --- | --- |
-| `kind` | string or string array | Match one normalized kind or a union. Every entry is subtype-aware. |
-| `not_kind` | string or string array | Exclude matching kinds and their subtypes. It never helps candidate pruning. |
-| `name` | string or `{ "regex": string }` | Match a normalized name exactly or by Rust regular expression. |
-| `text` | `{ "regex": string }` | Match parser-backed source text by Rust regular expression. There is no exact string shorthand. |
-| `visibility` | string or string array | Match a callable whose adapter recorded one of these modifier visibilities: `public`, `protected`, `internal`, `package_private`, `private`, `crate_or_module`, `unknown`. `unknown` means the adapter looked and could not classify; it is never equal to `public`. Valid only on callable kinds. An unrecorded modifier, and a recorded `unknown` against a concrete label, are incomplete, not a miss. |
-| `parameter_type` | string or `{ "regex": string }` | Match a callable that has a parameter whose recorded type spelling satisfies this predicate. The spelling is a discriminator, not a resolved type identity. Valid only on callable kinds. Unrecorded parameter types are incomplete, not a miss. |
-| `capture` | string | Return this node or role target under the supplied capture label. |
-| `has` | pattern | Require some structural descendant to match. |
-| `not_has` | pattern | Reject the node if any structural descendant matches. It never helps candidate pruning. |
+Notes on the JSON form:
+
+- `kind` and `not_kind` take one kind or an array. Matching includes subtypes. `not_kind` and `not_has` are never used to skip files.
+- `async` takes `true` or `false` and matches AST-backed callable asyncness. Valid only on callable kinds; an adapter that cannot provide the fact reports incomplete.
+- `name` and `parameter_type` take an exact string or `{ "regex": "..." }`. `text` takes only `{ "regex": "..." }`; there is no exact-text form.
+- `arity` takes an exact count, such as `2`, or inclusive bounds, such as `{ "min": 1 }` or `{ "min": 1, "max": 3 }`. It counts a call's positional arguments or a collection literal's elements.
+- `boolean_value` takes `true` or `false` and matches a boolean literal by its value.
+- `visibility` takes one label or an array: `public`, `protected`, `internal`, `package_private`, `private`, `crate_or_module`, or `unknown`. `unknown` means the adapter looked and could not classify; it is never equal to `public`. Valid only on callable kinds. An unrecorded modifier, and a recorded `unknown` against a concrete label, are incomplete, not a miss.
+- `parameter_type` matches a callable that has a parameter whose recorded type spelling satisfies the predicate. The spelling is a discriminator, not a resolved type identity. Valid only on callable kinds. Unrecorded parameter types are incomplete, not a miss.
+- `capture` returns this node or role target under the label.
 
 Nested role targets may be capture-only or otherwise unconstrained. The root `match` may not.
 
@@ -135,28 +136,17 @@ loop
 └── while_loop
 ```
 
-The remaining kinds are independent leaves: `call`, `assignment`, `field_access`, `identifier`, `return`, `throw`, `catch`, `if`, `decorator`, and `block`. `block` matches a statement list that opens a lexical scope of its own — a method body, a bare block, a loop or conditional body, a `switch` body — and never a class or interface member list. `for_loop` covers the for-each family (iteration over a collection, iterator, or range); `while_loop` covers condition-controlled loops including do-while and until. Loop forms a language cannot refine lexically — Go's single `for` construct, C-style counting `for`, and Rust's bare `loop` — remain plain `loop`, so query `loop` when every form must match. `collection_literal` covers collection display literals — array, list, set, dictionary, and tuple literals — in the adapters that classify them (JavaScript, TypeScript, Python, Java array initializers, Rust arrays and tuples); a Rust `[value; length]` repeat array is a `collection_literal` fact with no `elements` edges because its run-time size is not its spelled element count. `module` covers a module or namespace declaration that encloses other declarations — a Rust `mod`, a C# `namespace` (block or file-scoped), a C++ or PHP `namespace`, and a Ruby `module` — and is a containment parent, so `not_inside` a `module` pattern excludes everything written inside it. Languages whose module structure is not a container declaration report a capability diagnostic instead: Python has no module declaration syntax at all, and a Java `package`, Go `package`, Kotlin or Scala `package` clause names the file's module without enclosing it.
+The remaining kinds are independent leaves: `call`, `concurrent_spawn`, `resource_release`, `assignment`, `field_access`, `identifier`, `jsx_element`, `jsx_attribute`, `jsx_spread_attribute`, `object_property`, `computed_property`, `spread_element`, `return`, `throw`, `catch`, `if`, `decorator`, and `block`. The [kind table](/reference/code-query/#normalized-kinds) gives a one-line meaning for each kind. `block` matches a statement list that opens a lexical scope of its own — a method body, a bare block, a loop or conditional body, a `switch` body — and never a class or interface member list. `for_loop` covers the for-each family (iteration over a collection, iterator, or range); `while_loop` covers condition-controlled loops including do-while and until. Loop forms a language cannot refine lexically — Go's single `for` construct, C-style counting `for`, and Rust's bare `loop` — remain plain `loop`, so query `loop` when every form must match. `collection_literal` covers collection display literals — array, list, set, dictionary, and tuple literals — in the adapters that classify them (JavaScript, TypeScript, Python, Java array initializers, Rust arrays and tuples); a Rust `[value; length]` repeat array is a `collection_literal` fact with no `elements` edges because its run-time size is not its spelled element count. `module` covers a module or namespace declaration that encloses other declarations — a Rust `mod`, a C# `namespace` (block or file-scoped), a C++ or PHP `namespace`, and a Ruby `module` — and is a containment parent, so `not_inside` a `module` pattern excludes everything written inside it. Languages whose module structure is not a container declaration report a capability diagnostic instead: Python has no module declaration syntax at all, and a Java `package`, Go `package`, Kotlin or Scala `package` clause names the file's module without enclosing it.
 
 Therefore `{"kind":"callable"}` matches functions, methods, constructors, and lambdas, and `{"kind":"literal"}` matches every normalized literal subtype. There is deliberately no exact-kind operator. Use a leaf kind or subtract unwanted subtypes with `not_kind`.
 
 ## Roles
 
-Roles are normalized edges from one structural fact to a related node or source span. The parent pattern must declare a kind for which the role is valid.
+Roles are normalized edges from one structural fact to a related node or source span. The parent pattern must declare a kind for which the role is valid. For example, `callee`, `receiver`, `args`, and `kwargs` are valid on `call` and `concurrent_spawn`; `left`, `right`, and `operator` on `assignment`; and `tag`, `attributes`, and `children` on `jsx_element`. The [role table](/reference/code-query/#roles) lists all 18 roles with their valid parent kinds.
 
-| Role | Cardinality | Valid parent kinds | Meaning |
-| --- | --- | --- | --- |
-| `callee` | one | `call` | Terminal call target, such as `run` in `service.run()`. |
-| `receiver` | one | `call` | Receiver or qualifying scope, such as `service`. |
-| `args` | ordered list | `call` | Positional argument patterns. |
-| `kwargs` | name-to-pattern map | `call` | Named or keyword argument values. |
-| `left`, `right` | one each | `assignment` | Assignment target and assigned value. |
-| `module` | one | `import`, `declaration` | Imported module or binding target. |
-| `decorators` | ordered list | callable or class-like declarations | Decorators, annotations, or attributes. |
-| `object`, `field` | one each | `field_access` | Object and terminal field sides of member access. |
-| `iterable` | one | `for_loop` | The expression a for-each loop iterates. |
-| `elements` | ordered list | `collection_literal` | The entries of a collection display literal. |
+In JSON, a single-target role takes a pattern object, a list role takes an array of patterns, and `kwargs` takes an object that maps argument names to patterns.
 
-Every ordered-list role reads the same way: each listed pattern must match a distinct edge of that role in source order, but the matches need not be contiguous and do not assert exact arity. So `"args": [a, b]` needs two different arguments with `a` before `b`, and `"decorators": [a, a]` needs two decorators rather than one matched twice. The `arity` predicate counts a call's positional arguments or a collection literal's elements exactly. For exact positions or arity, narrow the surrounding source shape in a follow-up query; there is no positional-index operator.
+Every ordered-list role reads the same way: each listed pattern must match a distinct edge of that role in source order, but the matches need not be contiguous and do not assert exact arity. So `"args": [a, b]` needs two different arguments with `a` before `b`, and `"decorators": [a, a]` needs two decorators rather than one matched twice. Use the `arity` field to fix the count: an exact number, or inclusive `min` and `max` bounds. There is no positional-index operator; to pin a position, narrow the surrounding source shape in a follow-up query.
 
 `kwargs` support is adapter-specific. Python, PHP, Scala, C#, Ruby, and Kotlin expose normalized named arguments; languages without that role return a capability diagnostic.
 
@@ -166,7 +156,7 @@ Every ordered-list role reads the same way: each listed pattern must match a dis
 
 The same capture label may appear more than once in a query. Every occurrence must bind exactly the same source text, allowing equality constraints such as “both arguments use the same expression.”
 
-The response contains a `results` array. Every item has a `result_type`: `structural_match`, `declaration`, `procedure`, `program_point`, `control_edge`, `reference_site`, `call_site`, `expression_site`, `receiver_analysis`, `occurrence`, `lexical_scope`, `binding`, `resolution_candidate`, `reference_edge`, or `file`. A query without steps returns structural matches with path, language, kind, line range, a bounded text snippet, captures, and a best-effort `enclosing_symbol`.
+The response contains a `results` array. Every item has a `result_type`, which names the output domain of the last step, or the source domain when there are no steps. The reference lists [all 75 result types](/reference/code-query/#result-types). `bifrost --list-row-schemas` prints every domain's fields, scalar types, nullability, and enum labels. A query without steps returns structural matches with path, language, kind, line range, a bounded text snippet, captures, and a best-effort `enclosing_symbol`.
 
 With `result_detail: "full"`, results additionally include:
 
@@ -192,7 +182,7 @@ For completeness claims, result metadata is mandatory: inspect diagnostics, requ
 
 ## Typed Set Composition
 
-At every query-plan node, use exactly one source field: `match`, `union`, `intersect`, or `except`. Set fields contain between two and sixteen complete child plans. Every child must end in exactly the same typed domain; Bifrost rejects incompatible branches before workspace execution with a path such as `union[1].steps[0]`.
+At every query-plan node, use exactly one source field: `match`, a seed source, or one of `union`, `intersect`, and `except`. Set fields contain between two and sixteen complete child plans. Every child must end in exactly the same typed domain; Bifrost rejects incompatible branches before workspace execution with a path such as `union[1].steps[0]`.
 
 ```json
 {
@@ -210,70 +200,84 @@ Union and intersection merge at most sixteen provenance traces in branch order. 
 
 The public `limit` applies after the complete root set and common suffix. Execution budgets are shared across the request and fairly reserve work for later immediate operands. An incomplete operand sets `truncated: true` and produces a branch-labeled diagnostic rather than claiming a complete set. See the executable [Typed Set Composition](/code-query-tutorials/set-composition/) cookbook.
 
+Set composition stays inside one input domain. A code branch beside a `configuration_facts` branch is rejected before execution: configuration formats are not languages, and two rows that merely co-occur in one repository are not related.
+
+## Code And Configuration Correlation
+
+Two registered cross-domain sources combine a programming-code query with a configuration-fact query. Both take a `code` query and a `configuration` query, run them independently, and return `cross_domain` rows.
+
+`correlate` pairs a code row with a configuration fact only where its typed `relation` holds. The `configuration_key` relation pairs a Java argument with a `.properties` member. The argument must be bound by a resolver-proven call to a formal parameter of the accessor the code query selects, and it must be a plain string literal. The member's route must be exactly one key segment equal to that literal, inside one of the declared `documents`:
+
+<!-- code-query-test:json:correlate -->
+```json
+{
+  "correlate": {
+    "relation": {
+      "configuration_key": {"documents": ["src/main/resources/app.properties"]}
+    },
+    "code": {
+      "match": {"kind": "method", "name": "get"},
+      "inside": {"kind": "class", "name": "AppConfig"},
+      "steps": [
+        {"op": "enclosing_decl"},
+        {"op": "call_sites_to", "proof": "proven"},
+        {"op": "call_input", "parameter_index": 0}
+      ]
+    },
+    "configuration": {
+      "configuration_facts": {"formats": ["properties"], "node_kinds": ["member"]}
+    }
+  }
+}
+```
+
+The same query in RQL:
+
+<!-- code-query-test:rql:correlate -->
+```lisp
+(correlate
+  :relation (configuration-key :documents ["src/main/resources/app.properties"])
+  :code (call-input :parameter-index 0
+          (call-sites-to :proof proven
+            (enclosing-decl (inside (class (name "AppConfig")) (method (name "get"))))))
+  :configuration (configuration-facts :format properties :node-kind member))
+```
+
+The correlation key is structural, never a spelling match. `audit.get("db.url")` on an unrelated `Audit` class is not a call of `AppConfig.get`, so the code query never returns it. `log("db.url")` is not a bound argument at all. `db.url` in an undeclared `config/other.properties` never pairs, and an unrelated `db.user` row in the declared document pairs with nothing. Documents are exact workspace-relative `.properties` paths, never globs, because a glob would correlate every document in the repository.
+
+Each correlated row has `operator: "correlate"`, `domain: "correlated"`, `relation`, the `key`, and a `binding` of `unique` or `ambiguous`. It carries a reference to the code row in `code` (its own `result_type`, exact location, and identity fields) and the whole configuration fact in `configuration`, with `code_id`, `code_path`, `configuration_id`, and `configuration_path`. `configuration_id` equals the configuration fact row's `id`. `path` and `range` anchor the row at the code row. A key that names more than one authored fact, such as a duplicate key or the same key in two declared documents, pairs with every candidate, marks each row `ambiguous`, and adds an advisory `cross_domain_correlation_ambiguous` diagnostic. Which value wins is an effective-configuration question this operator does not answer.
+
+`require_both` checks boolean satisfaction:
+
+<!-- code-query-test:rql:require-both -->
+```lisp
+(require-both
+  :code (call-sites-to :proof proven
+          (enclosing-decl (inside (class (name "AppConfig")) (method (name "get")))))
+  :configuration (configuration-facts :format properties :key "db.url"))
+```
+
+When both queries return rows, it returns each of them as a `cross_domain` row with `operator: "require_both"` and `domain` set to `code` or `configuration`; each carries one input row (a code reference or a whole configuration fact) and no `relation` or `key`. When either query returns nothing, the answer is empty. It never pairs rows, so satisfying both predicates does not claim that any code row and configuration row are related.
+
+Neither operator turns a gap into a clean answer. These diagnostics have `incomplete` impact:
+
+- `cross_domain_binding_unproven`: a bound call did not resolve to its callee with proof.
+- `cross_domain_key_unsupported`: a bound argument is not a plain string literal (an escape, a text block, a concatenation, or a constant), its source could not be read, or it is in a language other than Java.
+- `cross_domain_document_incomplete`: a declared document is missing from the workspace, outside the configuration query's `where` or format scope, produced no facts, or was only partly recovered.
+
+Either operator's inputs report their own diagnostics under branch `0` (code) and branch `1` (configuration). The operators are whole-workspace sources: they cannot sit inside `union`, `intersect`, or `except`, and a policy runs them once rather than per seed file. Only `filter` and `project` may follow them.
+
 ## Typed Pipeline Steps
 
-Steps execute in array order and are validated before the workspace is searched:
+Steps execute in array order and are validated before the workspace is searched. Each step is an object whose `op` names the step; its options are sibling fields:
 
-| Operation | Input | Output | Meaning |
-| --- | --- | --- | --- |
-| `filter` | any typed row | same row schema | Retain rows satisfying every typed predicate in `where`. |
-| `project` | any typed row | selected dynamic row schema | Publish the fields selected by `columns`, optionally renamed, while preserving source and evidence anchors. Only another `project` or `filter` may follow. |
-| `enclosing_decl` | structural match | declaration | Smallest non-synthetic indexed declaration containing the exact match range, inclusive of a matched declaration itself. |
-| `procedure_of` | structural match or declaration | procedure | Unique smallest source-backed executable procedure enclosing the exact input range. |
-| `cfg_entry` | procedure | program point | Validated entry boundary. |
-| `cfg_exits` | procedure | program point | Validated normal then exceptional exit boundaries. |
-| `cfg_successor_edges` | program point | control edge | One-hop outgoing control edges. |
-| `cfg_predecessor_edges` | program point | control edge | One-hop incoming control edges. |
-| `cfg_edge_source` | control edge | program point | Source endpoint of an edge. |
-| `cfg_edge_target` | control edge | program point | Target endpoint of an edge. |
-| `typestate` | procedure | typestate finding | Run the host-registered protocol/binding pair named by `protocol_ref` once for the exact procedure. |
-| `value_flow` | procedure | flow endpoint | Run the host-registered `ValueFlowPlan` named by `plan_ref` once for the exact procedure. |
-| `taint` | procedure | taint finding | Project the retained production `TaintFindingReport` named by `taint_ref` for the exact procedure. |
-| `witness` | typestate finding, flow endpoint, or absent-member finding | matching witness domain | Project already-retained evidence, optionally reducing it with non-negative `max_steps` and `max_bytes`. |
-| `references_of` | declaration | reference site | Exact structured source sites targeting the declaration. |
-| `used_by` | declaration | declaration | Smallest exact declaration enclosing each matching site. |
-| `uses` | declaration | declaration | Exact indexed declarations referenced by this semantic owner. |
-| `callers` | declaration | declaration | Resolved incoming call edges; accepts positive `depth`, optional `proof`, and explicit `proven_subset` completeness. |
-| `callees` | declaration | declaration | Resolved outgoing call edges; accepts positive `depth` and optional `proof`. |
-| `call_sites_to` | declaration | call site | Structured incoming sites; accepts optional `proof`. |
-| `call_sites_from` | declaration | call site | Structured outgoing sites; accepts optional `proof`. |
-| `call_input` | call site | expression site | Direct receiver or formal-parameter input selected by exactly one selector. |
-| `receiver_targets` | structural match, reference site, call site, expression site, or occurrence | receiver analysis | Receiver values extracted from a call/member site or supplied as an exact expression. |
-| `points_to` | structural match, reference site, expression site, or occurrence | receiver analysis | Bounded value, allocation, type, module, current-receiver, and factory provenance. |
-| `member_targets` | structural match, reference site, or occurrence | receiver analysis | Exact indexed declarations selected by a receiver-qualified member access. |
-| `receiver_outcome` | structural match, reference site, call site, expression site, occurrence, receiver analysis, or member-target analysis | receiver outcome | Analyze an ordinary call/member site directly, or project an existing analysis, into the mandatory terminal row: outcome, coverage, candidate accounting, and stable `site_id`/`site_ast_id`. |
-| `receiver_evidence` | structural match, reference site, call site, expression site, occurrence, or receiver analysis | receiver evidence | Analyze an ordinary call/member site directly, or project an existing analysis, into one flat row per retained observation, parent-linked for factory chains and keyed by `site_id`. |
-| `member_selection` | occurrence | member selection | The mandatory selection summary per reference occurrence, projected from the production resolver's candidate trace. |
-| `file_of` | structural match, declaration, procedure, program point, control edge, typestate finding, typestate witness, flow endpoint, flow witness, class-set row, absent-member finding, absent-member witness, reference site, call site, expression site, receiver analysis, receiver outcome, receiver evidence, occurrence, lexical scope, or binding | file | Exact project file containing the analyzed input value. |
-| `imports_of` | file | file | Direct project-local files imported by the input file. |
-| `importers_of` | file | file | Direct project-local files importing the input file. |
-| `supertypes` | declaration | declaration | Direct ancestors by default, or a bounded/full indexed ancestor closure. |
-| `subtypes` | declaration | declaration | Direct descendants by default, or a bounded/full indexed descendant closure. |
-| `members` | declaration | declaration | Real direct declaration children of a type. |
-| `owner` | declaration | declaration | Exact declaring type of a direct member. |
-| `occurrences_in` | structural match or file | occurrence | Classified identifier occurrences lexically inside the node or file; accepts `class`, `role`, and `namespace`. |
-| `occurrences_of` | declaration | occurrence | The declaration's own name occurrence plus every reference-class occurrence resolving to it. |
-| `occurrence_target` | occurrence | declaration | Resolved semantic targets of reference-class occurrences. |
-| `scope_of` | binding, occurrence, or structural match | lexical scope | Innermost lexical scope owning the input. |
-| `scope_ancestors` | lexical scope | lexical scope | Enclosing scopes, innermost first, excluding the scope itself. |
-| `bindings_in` | lexical scope or structural match | binding | Bindings declared in the scope, or whose binder token is inside the match; accepts `kind`, `name`, and `hoisting`. |
-| `binding_of` | occurrence | binding | The binding of the occurrence's name in effect at its exact position; accepts `include_shadowed`. |
-| `binding_occurrence` | binding | occurrence | The binder-class occurrence row of the binding's declaring token. |
-| `candidates_of` | occurrence | resolution candidate | Candidates the resolver considered; accepts `tier`, `outcome`, and `boundary`. |
-| `candidate_hierarchy` | occurrence | candidate hop | The exact hierarchy hops each traced member candidate was found through. Each row's `candidate_id` equals the `id` of the `resolution_candidate` row it belongs to, so the two domains join on that field. A depth-zero (direct) candidate emits zero hop rows, and a candidate the resolver recorded without member attribution emits none either -- zero rows is never a claim that no hierarchy was walked, and the mandatory per-occurrence outcome stays `member_selection`'s. |
-| `dispatch_outcome` | structural match, call site, reference site, or occurrence | dispatch outcome | The mandatory bounded-dispatch outcome for the site: the semantic outcome (`resolved`, `ambiguous`, `unproven`, `unknown`, `unsupported`, `exceeded_budget`, or `cancelled`), the oracle's candidate `coverage`, the retained `target_count`, and the unsupported capability or exceeded budget lane. `exceeded_limit` is nullable and its domain is exactly `source`, `rows`, `retained_bytes`, `steps`, and `files`. Exactly one row per input site, so zero target rows never read as a proven-empty target set. |
-| `dispatch_targets` | structural match, call site, reference site, or occurrence | dispatch target | Zero or more bounded dispatch arms of the site: one per retained candidate, plus one per boundary arm that names a target. Each row keeps the oracle's own `proof` and `completeness`, repeats the site `coverage`, and states `dispatch` as `proven_dispatch` only for a proven, complete arm inside an exhaustive set. An unresolved or truncated residual arm names no target and emits no row; it is already stated by the site's coverage. |
-| `member_family` | declaration | member family | The mandatory canonical method-family outcome for the member declaration: `outcome` (`proven`, `no_family`, `incomplete`, or `unsupported`), the typed `reason` when it is not proven, the measured `capability`, the `coverage`, the `family_id` when the family is proven, and the per-relation edge counts. `family_id` digests this member's own proven family roots: two members carry the same id exactly when their root closures coincide, so a member that redeclares one root shares that root's id, and a member that redeclares several roots (a class implementing two interfaces that declare the same method) carries an id of its own. Exactly one row per input declaration, so an unsupported language or an unprovable overload identity is stated rather than silently empty. |
-| `family_edges` | declaration | member family edge | The typed method-family edges of the member: the forward `overrides` and `implements` edges the analyzer proves from the real hierarchy walk, plus the bounded inversion of those same edges as `overridden_by` and `implemented_by`. The edge round-trips: the same two declarations appear from either end with the relation reversed. `family_id` is the id of the row's own member, so both ends match only when both members prove the same roots. `proof` is `proven` when the ancestor held exactly one member of that name and recorded arity, and `unproven` when only recorded parameter-type spellings separated an overload set. Emitted only from a proven family. |
-| `candidate_target` | resolution candidate | declaration | Workspace declarations of unit-backed candidates; partial by construction. |
-| `edges_of` | declaration | reference edge | The inverse projection: every usage site the usage index enumerates for the declaration; accepts `reference_kinds`, `proof`, `surface`, `usage`, `relation`, and `site_class`. |
-| `edges_from` | occurrence | reference edge | The forward projection: the resolver's own resolved targets for that exact token; accepts the same six filters. |
-| `edge_target` | reference edge | declaration | Exact indexed target declaration of each edge. |
-| `state_events_of` | procedure or declaration | state event | Establishment, kill, and read events of bindings and properties, derived from the production CFG; accepts `event_class` and `subject`. |
-| `flow_relations_of` | state event or procedure | flow relation | Reaching-definition, dominance, and same-evaluation relations between those events, with `exact` or `may` certainty; accepts `flow_relation` and `certainty`. |
-| `flow_source` | flow relation | state event | The establishment or kill end of the relation. |
-| `flow_target` | flow relation | state event | The read end of the relation. |
-| `rewrite_paths_of` | file | rewrite path | The bounded rewrite chases the file engages in a declared finite domain, with their steps, declared bound, and terminal outcome; accepts `domain` and `rewrite_outcome`. |
+```json
+{"op": "callers", "depth": 2, "proof": "proven"}
+```
+
+Each step consumes one row domain and produces another, so a pipeline is valid only when every step accepts the domain the previous step produced. Bifrost groups query steps into row operations, declarations and imports, type hierarchy, references and calls, reference edges, occurrences and resolution, qualified paths, receivers and dispatch, call shape and bindings, effects and result contracts, control flow, flow and typestate, values, build topology, materialization, and rewrite paths. The [step tables](/reference/code-query/#steps) give every step's input and output domains, options, and meaning, and the [step option table](/reference/code-query/#step-options) gives each option's values and default. `bifrost --help query_code` prints the step list for the running build.
+
+The sections below explain the steps whose rows need more than one sentence.
 
 Repeat an import step for multiple hops. Traversal is cycle-safe and deterministic; it does not silently compute a transitive closure.
 
@@ -319,7 +323,11 @@ Comparison `value` accepts exactly one of `string`, `integer`, `boolean`, or
 array of at most 64 typed literals. A filter carries 1 through 16 predicates.
 A projection carries 1 through 32 `{ "source", "name" }` entries with unique
 output names. Its output schema contains exactly those names in that order,
-with the source fields' public types, nullability, and enum domains.
+with the source fields' public types, nullability, and enum domains. After a
+`project` step, only `filter` and `project` steps may follow, and they see only
+the projected names. The projected schema is what a later filter and a relational
+policy binding read; the `query_code` result still renders each row as its source
+row.
 
 ### Procedure-local CFG inspection
 
@@ -345,6 +353,19 @@ This query starts from a structural function match, resolves its executable proc
 Every semantic row carries one `evidence` object: `proof` is `proven` or `unproven`, `completeness` is `complete` or `partial`, and optional `reason` preserves the typed failure or limit when either axis is degraded. There is no composite quality label and no separate per-axis reason field. Public IDs never expose dense semantic arena IDs and remain stable for identical indexed content mounted at different absolute checkout paths. Diagnostics distinguish unsupported/partial capability, provider failure, missing workspace services, no enclosing procedure, cancellation, and budget exhaustion. An incomplete diagnostic prevents a complete-negative conclusion even when the result array is empty.
 
 Each edge operation is exactly one hop. Compose more steps for a finite traversal; the CFG surface does not provide an unbounded closure, ICFG, data-flow, taint, typestate, finding, or witness endpoint. The registered typestate adapter described next is the only typestate entry point.
+
+`program_point_of` projects a structural match to its unique source-mapped CFG point. An `await` match selects the point carrying `AsyncSuspend`; missing or ambiguous mappings produce an incomplete diagnostic.
+The point row's `id` joins to `program_point_id` on state-event rows from `state_events_of`, so a consumer can correlate an await with binding reads at that suspension.
+
+<!-- code-query-test:json:program-point-of-await -->
+```json
+{
+  "schema_version": "1",
+  "languages": ["rust"],
+  "match": { "kind": "await" },
+  "steps": [{ "op": "program_point_of" }]
+}
+```
 
 ### Registered typestate findings and witnesses
 
@@ -404,11 +425,25 @@ When solver termination and semantic input are both limited, `status` names the 
 
 ### Caller-driven absent-member witnesses
 
-`class_set` follows caller values to receiver accesses; `absent_member` emits
-only Proven class/member absences. Python absence queries require an active
-Python declaration-model surface. Unknown receivers and incomplete member
-models suppress findings; a complete empty result does not mean every runtime
-receiver was classified.
+`class_set` follows caller values to receiver accesses. By default,
+`absent_member` emits only proven class/member absences; set `finding_proof`
+to `conditional` or `any` to also select conditional findings. Both steps run only for `python`,
+`javascript`, `typescript`, `php`, and `ruby`. For other languages they return
+no rows and a `semantic_capability_unsupported` diagnostic with the message
+`class-set propagation is unsupported for <label>`. Python absence queries
+require an active Python declaration-model surface. Unknown receivers and incomplete member
+models suppress Proven findings; a complete empty result does not mean every
+runtime receiver was classified. The explicitly limited Conditional cases
+below can retain their stated remainder.
+
+Conditional findings may retain other unclassified receiver values, or a
+possible member installation by a listed global dynamic write only when every
+matching write has no receiver bound and an Any member-name set; the condition
+names those write sites. A `DeclaredParameter` origin is admitted only when its
+annotation resolves to one workspace class with no workspace subclasses,
+unresolved or unmodeled external bases, or attribute hooks such as
+`__getattr__`, `__getattribute__`, or `__setattr__`. Its condition states the
+annotated type and that no workspace subclass exists.
 
 <!-- code-query-test:json:absent-member-witness -->
 ```json
@@ -500,7 +535,7 @@ Occurrence support is declared per language and per role. Where a language's ada
 
 ### The lexical environment and resolution candidates
 
-An occurrence says *what* an identifier resolved to. Schema v9 adds the rows that say *why*, and why not.
+An occurrence says *what* an identifier resolved to. Scope, binding, and candidate rows say *why*, and why not.
 
 A **lexical scope** is a region a file is made of. Every file contributes a synthesized whole-file scope at index 0 plus one row per scope-forming node, parent-linked by index so ancestry is a chain walk. `scopes` is a source of its own:
 
@@ -575,7 +610,7 @@ The **package clause** is fields on the file row rather than a fourth row kind, 
 
 ### Canonical reference edges
 
-Bifrost derives "X uses Y" twice: the resolver derives it forward, from one classified token to the declaration it resolved to, and the usage index derives it backward, from one declaration to the sites that point at it. Schema v11 states both in one row shape so the two answers can be compared instead of merely coexisting.
+Bifrost derives "X uses Y" twice: the resolver derives it forward, from one classified token to the declaration it resolved to, and the usage index derives it backward, from one declaration to the sites that point at it. Reference edges state both in one row shape, so the two answers can be compared.
 
 `edges_of` is the inverse projection and `edges_from` the forward one:
 
@@ -616,7 +651,7 @@ Four absences here are answers rather than gaps:
 
 `surface` is optional and has **no default**, unlike `references_of`. The canonical edge answer includes editor-only rows, and silently defaulting to `external_usages` would narrow the compared ground set without the author saying so.
 
-Only Java, Rust, Python, JavaScript and TypeScript answer the forward projection today. `edges_from` in any other language reports `edge_axis_unsupported` with `incomplete` impact rather than a clean empty answer, and a derivation that was truncated, cancelled or failed reports `edge_derivation_incomplete`.
+Only Java, Kotlin, Rust, Python, JavaScript, and TypeScript answer the forward projection. `edges_from` in any other language reports `edge_axis_unsupported` with `incomplete` impact rather than a clean empty answer, and a derivation that was truncated, cancelled or failed reports `edge_derivation_incomplete`.
 
 ```json
 {
@@ -640,7 +675,7 @@ Zero depth, `transitive: false`, unknown fields, `depth` together with `transiti
 
 Hierarchy and ownership results are restricted to declarations returned by the active analyzer's index and having renderable ranges. Bifrost may observe usages that refer to library code without having indexed that library's declaration; such a declaration is intentionally absent from these results. This is the current precision boundary until library code can be targeted and indexed explicitly.
 
-Reference steps accept optional `reference_kinds`, `proof`, and `surface` fields. `reference_kinds` is a non-empty array drawn from `method_call`, `constructor_call`, `field_read`, `field_write`, `type_reference`, `static_reference`, `super_call`, and `inheritance`. `proof` is `proven` or `unproven`. `surface` is `external_usages` (the default) or `lsp_references`. Omitted kind and proof fields include both tiers; a kind filter excludes unclassified structured hits. See the executable [Reference Traversal](/code-query-tutorials/reference-traversal/) recipes.
+Reference steps accept optional `reference_kinds`, `proof`, and `surface` fields. `reference_kinds` is a non-empty array drawn from `method_call`, `constructor_call`, `field_read`, `field_write`, `type_reference`, `self_type_alias` (a reference through a `Self`-style type alias), `static_reference`, `super_call`, and `inheritance`. `proof` is `proven` or `unproven`. `surface` is `external_usages` (the default) or `lsp_references`. Omitted kind and proof fields include both tiers; a kind filter excludes unclassified structured hits. See the executable [Reference Traversal](/code-query-tutorials/reference-traversal/) recipes.
 
 Call traversal is direct by default. `callers` and `callees` accept a positive finite `depth`; there is deliberately no unbounded `transitive` form. Traversal is iterative and cycle-safe. A real recursive or cyclic edge is returned, but Bifrost stops expanding when the next declaration is already present on that provenance path. The same declaration may still be expanded through a different path, preserving alternate provenance within the execution budget. Every declaration reached by a call step records the proving `call_site` under provenance `via`.
 
@@ -648,13 +683,13 @@ Call traversal is direct by default. `callers` and `callees` accept a positive f
 
 `call_sites_to` and `call_sites_from` expose the full call range, callee range, caller and callee declarations, call kind, proof tier, optional explicit receiver, and arguments. `call_input` requires exactly one of `{"receiver":true}`, `{"parameter_index":0}`, or `{"parameter_name":"payload"}`. Parameter indexes are zero-based formal slots and exclude receiver-bound parameters; keyword/named arguments bind by the callee's declared parameter name. A variadic slot may yield several expression rows. Spreads/splats are retained on the call-site result but are not guessed into a formal slot. An implicit receiver has no synthetic expression row.
 
-The three receiver-analysis steps return a tagged `receiver_analysis` row for every input, including unknown and unsupported cases. Each row includes `analysis_kind`, input path/language/range/text/kind, and `outcome`. `receiver_targets` and `points_to` use recursive `values`; `member_targets` uses exact `CodeQueryDeclaration` values under `member_targets`. Allocation values include their exact type declaration and allocation site. Factory returns include the exact factory declaration plus a nested returned value. Unsupported shapes/providers add `reason`; budget exits add `limit`.
+The three receiver-analysis steps return one row for every input, including unknown and unsupported cases. `receiver_targets` and `points_to` return `receiver_analysis` rows. Each includes `analysis_kind`, input path, language, range, text, and kind, `outcome`, and recursive `values`. `member_targets` returns `member_target_analysis` rows, which carry `outcome`, `coverage`, `target_count`, `site_id`, `site_ast_id`, and the exact member declarations under `member_targets` when they are resolved. Allocation values include their exact type declaration and allocation site. Factory returns include the exact factory declaration plus a nested returned value. Unsupported shapes/providers add `reason`; budget exits add `limit`.
 
 The `member_selection` projection emits exactly one summary row per input occurrence, from the same resolver candidate trace `candidates_of` exposes: a stable domain-separated `id`, the exact `site_ast_id` join key, the decoded `member` spelling and `role`, an `outcome` of `selected`/`unresolved`/`untraced`, `selected_count` and `candidate_count`, `trace_completeness` (`full`, `selection_only`, or `absent`), and `coverage` (`exhaustive` only for a full trace, `open` for a selection-only trace, `unsupported` when the language records no trace). Selected `resolution_candidate` rows additionally carry `canonical_member_id`, a digest of the structured canonical identity (kind-tagged segments, namespace, language, recorded generic arity) -- same-spelling members of different owners always hash apart. Member-position occurrence support is per language: Rust records a full trace; TypeScript and Python record selection-only traces; Java summarizes its trace; Go, C#, C++, PHP, and Ruby do not classify member-position occurrences yet and state that as an `occurrence_role_unsupported` incomplete diagnostic, which makes policies over their rows unreliable rather than clean.
 
 The `receiver_outcome` and `receiver_evidence` steps expose the same analysis as flat typed rows for policy correlation. They may consume an existing receiver-analysis row or perform `receiver_targets` analysis directly from an ordinary call/member site, so a relational binding needs only the one authored step. `receiver_outcome` always emits exactly one row per analyzed site with `outcome`, `coverage` (`exhaustive`, `open`, `truncated`, `unknown`, or `unsupported`), `candidate_count`, `candidates_truncated`, and stable `site_id`/`site_ast_id` keys. `receiver_evidence` emits zero or more rows keyed by `site_id`, each with its own stable `id`, source `range`, `ordinal`, `chain_hop`, `evidence_kind`, resolved declaration identity, and per-row `proof`/`completeness`; model-backed declarations also expose exact `model_id` and `pack_id` string fields for policy predicates. Factory chains are parent-linked through `parent_evidence_id` instead of nesting. An empty evidence set is meaningful only next to its outcome row. See [Receiver Traversal](/code-query-tutorials/receiver-traversal/#typed-receiver-rows) for executed examples.
 
-Stable outcomes are `precise`, `ambiguous`, `unknown`, `unsupported`, and `exceeded_budget`. Ordinary bounded ambiguity retains every candidate and does not set top-level `truncated`. Candidate-cap truncation and `exceeded_budget` do set `truncated` and emit an aggregated limit diagnostic. Adapters return structured candidates where their neutral facts prove them and preserve dynamic, unmodeled, or non-receiver source forms as `ambiguous`, `unknown`, or `unsupported`. Receiver-analysis rows may feed `file_of`, `receiver_outcome`, or `receiver_evidence`; the flat terminal rows may feed `file_of`.
+Stable outcomes are `precise`, `ambiguous`, `unknown`, `unsupported`, and `exceeded_budget`. Ordinary bounded ambiguity retains every candidate and does not set top-level `truncated`. Candidate-cap truncation and `exceeded_budget` do set `truncated` and emit an aggregated limit diagnostic. Adapters return structured candidates where their neutral facts prove them and preserve dynamic, unmodeled, or non-receiver source forms as `ambiguous`, `unknown`, or `unsupported`. `receiver_analysis` rows may feed `file_of`, `receiver_outcome`, or `receiver_evidence`. `member_target_analysis` rows may feed `file_of`, `receiver_outcome`, or `field_write_value`, but not `receiver_evidence`. The flat terminal rows may feed `file_of`.
 
 An optional `capture` is valid only when the preceding domain is a structural match. It must be between 1 and 128 bytes and name a positive capture declared by the structural query; every unique bound range is analyzed. Without a capture, `points_to` analyzes the match or the normalized `right` side of assignment/binding shapes, `receiver_targets` extracts the call `receiver` or field-access `object`, and `member_targets` extracts the receiver plus terminal member. See [Receiver Traversal](/code-query-tutorials/receiver-traversal/) for exact JSON/RQL/output triples.
 
@@ -671,6 +706,18 @@ These steps use normalized tree-sitter call shapes and the selected adapter's ex
 }
 ```
 
+
+### Dispatch and method families
+
+`dispatch_outcome` emits exactly one row per input site, so zero target rows never read as a proven-empty target set. The row carries the semantic `outcome` (`resolved`, `ambiguous`, `unproven`, `unknown`, `unsupported`, `exceeded_budget`, or `cancelled`), the oracle's candidate `coverage`, the retained `target_count`, and the unsupported capability or exceeded budget lane. `exceeded_limit` is nullable and its domain is exactly `source`, `rows`, `retained_bytes`, `steps`, and `files`.
+
+`dispatch_targets` emits zero or more rows per site: one per retained candidate, plus one per boundary arm that names a target. Each row keeps the oracle's own `proof` and `completeness`, repeats the site `coverage`, and states `dispatch` as `proven_dispatch` only for a proven, complete arm inside an exhaustive set. An unresolved or truncated residual arm names no target and emits no row; the site's coverage already states it.
+
+`member_family` emits exactly one row per input declaration: `outcome` (`proven`, `no_family`, `incomplete`, or `unsupported`), the typed `reason` when it is not proven, the measured `capability`, the `coverage`, the `family_id` when the family is proven, and the per-relation edge counts. `family_id` is a digest of this member's own proven family roots. Two members carry the same ID exactly when their root closures are the same. A member that redeclares one root shares that root's ID. A member that redeclares several roots, such as a class method that implements the same method from two interfaces, carries an ID of its own.
+
+`family_edges` returns the forward `overrides` and `implements` edges the analyzer proves from the real hierarchy walk, plus the inverse `overridden_by` and `implemented_by` edges. The same two declarations appear from either end with the relation reversed. `family_id` is the ID of the row's own member, so both ends match only when both members prove the same roots. `proof` is `proven` when the ancestor held exactly one member with that name and recorded arity, and `unproven` when only recorded parameter-type spellings separated an overload set. Edges are emitted only from a proven family.
+
+`candidate_hierarchy` returns the hierarchy hops through which each traced member candidate was found. Each row's `candidate_id` equals the `id` of its `resolution_candidate` row, so the two domains join on that field. A direct candidate emits no hop rows, and neither does a candidate recorded without member attribution. Zero rows never claim that no hierarchy was walked; the per-occurrence outcome is `member_selection`'s.
 
 ### Flow-sensitive state and flow relations
 
@@ -922,34 +969,20 @@ structural adapter for javascript does not support role(s): kwargs
 
 That diagnostic means the affected language was not searched for that feature; it does not silently claim that no matches exist.
 
+Every diagnostic has a `code`, an `impact`, a `language`, and a `message`. The impact says what the diagnostic means for your conclusion:
+
+- `invalid`: the query could not run as written.
+- `incomplete`: some work was skipped, unsupported, cut short, or cancelled. Positive rows stay valid, but an empty or short answer does not prove absence.
+- `declared_non_exhaustive`: the query asked for a proven subset, such as `callers` with `completeness: "proven_subset"`. The rows are proven but are not all the answers.
+- `advisory`: guidance only, such as `broad_query`.
+
+The [diagnostic code table](/reference/code-query/#diagnostic-codes) lists every code with its impact and meaning.
+
 ## Limits And Validation Errors
 
-The engine enforces these budgets:
+The engine enforces fixed limits on query shape, scanning, pipeline rows, provenance, semantic work, and registered analyses. The [limit tables](/reference/code-query/#limits) list each value. Exceeding a scan limit sets `truncated: true` and adds `execution_budget_exhausted`; exceeding the seed and edge row limit sets `truncated: true` and adds `pipeline_budget_exhausted`.
 
-| Budget | Maximum |
-| --- | --- |
-| Results | `1000` |
-| `where` globs | `128` entries, `1024` bytes each |
-| Language filters | `32` |
-| Pattern nodes | `256` |
-| Pattern nesting | `64` levels |
-| Kinds in one union/exclusion | `32` |
-| Entries in one role list | `64` |
-| Named arguments | `64`; names at most `128` bytes |
-| Name predicate source (exact or regex) and text regex source | `4096` bytes |
-| Capture label | `128` bytes |
-| Pipeline steps | `16` |
-| Set operands at one node | `16` |
-| Query-plan nodes / composition depth | `64` nodes / `16` levels |
-| Seed and edge rows per execution | `50000` |
-| Provenance paths per terminal result | `16` |
-| Semantic materialized files | `256` |
-| Semantic source bytes | `16 MiB` |
-| Semantic retained rows per dimension | `1,000,000` |
-| Semantic retained artifact/source bytes | `64 MiB` |
-| Semantic traversal steps | `1,000,000` |
-
-The semantic limits are a separate typed sub-budget. They are charged only when a v3 semantic step reaches a source file; structural-only queries and `explain` mode do not materialize semantic artifacts. `profile` reports materialization attempts, successful unique files, request-cache hits, source/row/retained/traversal work, and budget exhaustion on the physical pipeline step that performed the work.
+The semantic limits are a separate typed sub-budget. They are charged only when a semantic step reads a source file; structural-only queries and `explain` mode do not materialize semantic artifacts. `profile` reports materialization attempts, successful unique files, request-cache hits, source/row/retained/traversal work, and budget exhaustion on the physical pipeline step that performed the work.
 
 Public semantic budget failures use five coarse lanes: `source` for input source
 bytes, `rows` for retained semantic records, `retained_bytes` for retained text
@@ -973,7 +1006,7 @@ Validation failures carry a JSON path so agents can correct the precise field. F
 }
 ```
 
-reports an error at `match.calee` and lists the accepted pattern fields. Invalid regexes report paths such as `match.callee.name.regex`; malformed kind arrays include the failing index, such as `match.kind[1]`.
+reports `unknown field in pattern object` at `match.calee`. The message does not list the accepted fields; see the [pattern field table](/reference/code-query/#patterns). Invalid regexes report paths such as `match.callee.name.regex`; malformed kind arrays include the failing index, such as `match.kind[1]`.
 
 ## RQL Interoperability
 

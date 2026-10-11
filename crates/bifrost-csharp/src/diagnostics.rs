@@ -26,13 +26,15 @@ use std::cell::RefCell;
 use std::collections::BTreeSet;
 
 use brokk_bifrost_core::analyzer::model::{
-    SemanticAbsenceProof, SemanticDiagnostic, SemanticDiagnosticDomain,
-    SemanticDiagnosticIncompleteReason, SemanticDiagnosticReport,
+    SemanticAbsenceProof, SemanticDiagnosticDomain, SemanticDiagnosticIncompleteReason,
+    SemanticDiagnosticReport, push_absent_diagnostic,
 };
 use brokk_bifrost_core::analyzer::query_token::QueryToken;
 use brokk_bifrost_core::analyzer::semantic_diagnostics::{node_range, node_text, same_node};
 use brokk_bifrost_core::analyzer::structural::resolution::BoundaryStatus;
-use brokk_bifrost_core::analyzer::tree_walk::collect_parse_errors;
+use brokk_bifrost_core::analyzer::tree_walk::{
+    collect_parse_errors, push_named_children_reversed_as,
+};
 use brokk_bifrost_core::analyzer::usages::local_inference::LocalInferenceEngine;
 use brokk_bifrost_core::analyzer::{CodeUnit, ProjectFile, Range};
 use brokk_bifrost_core::text_utils::compute_line_starts;
@@ -45,7 +47,7 @@ use crate::graph_support::{
 use crate::imports::csharp_using_alias_from_node;
 use crate::syntax::{
     csharp_type_node_identity, csharp_using_directive_is_static, csharp_using_directive_namespace,
-    normalize_csharp_type_fragment,
+    csharp_using_directive_target_node_matching, normalize_csharp_type_fragment,
 };
 use brokk_bifrost_core::hash::{HashMap, HashSet};
 
@@ -269,6 +271,13 @@ enum MemberOwner {
     External { fqn: String },
 }
 
+fn unique_workspace_member_owner(candidates: &[CodeUnit]) -> Option<MemberOwner> {
+    (logical_type_count(candidates) == 1)
+        .then(|| first_logical_type_fqn(candidates))
+        .flatten()
+        .map(|fqn| MemberOwner::Workspace { fqn })
+}
+
 enum ScanFrame<'tree> {
     Node(Node<'tree>),
     ExitTypeParameters,
@@ -474,7 +483,7 @@ impl CSharpDiagnosticCollector<'_> {
         } else if is_type_reference_position(node) {
             self.check_type_reference(token, node);
         }
-        push_named_children(stack, node);
+        push_named_children_reversed_as(node, stack, ScanFrame::Node);
     }
 
     // -- type references ----------------------------------------------------
@@ -794,10 +803,8 @@ impl CSharpDiagnosticCollector<'_> {
             1,
             "resolved receiver type `{fqn}` looked up as {candidates:?}"
         );
-        if logical_type_count(&candidates) == 1
-            && let Some(owner) = first_logical_type_fqn(&candidates)
-        {
-            return Ok(MemberOwner::Workspace { fqn: owner });
+        if let Some(owner) = unique_workspace_member_owner(&candidates) {
+            return Ok(owner);
         }
         Err(SemanticDiagnosticIncompleteReason::UnsupportedSemantics {
             detail: format!("receiver `{symbol}` has no uniquely resolved type"),
@@ -807,8 +814,8 @@ impl CSharpDiagnosticCollector<'_> {
     /// The unique declaration a type name identifies, workspace first.
     fn type_owner(&self, token: QueryToken<'_>, identity: &str) -> Option<MemberOwner> {
         let candidates = self.visible_types(token, identity);
-        if logical_type_count(&candidates) == 1 {
-            return first_logical_type_fqn(&candidates).map(|fqn| MemberOwner::Workspace { fqn });
+        if let Some(owner) = unique_workspace_member_owner(&candidates) {
+            return Some(owner);
         }
         if !candidates.is_empty() || self.unreadable_external.is_some() {
             return None;
@@ -1091,19 +1098,17 @@ impl CSharpDiagnosticCollector<'_> {
         kind: &'static str,
         message: String,
     ) {
-        self.diagnostic_count += 1;
-        self.report.push_absent(
+        push_absent_diagnostic(
+            &mut self.report,
+            &mut self.diagnostic_count,
             SemanticAbsenceProof {
                 range,
                 domain,
                 boundary,
             },
-            SemanticDiagnostic {
-                range,
-                source: CSHARP_SEMANTIC_DIAGNOSTIC_SOURCE,
-                kind,
-                message,
-            },
+            CSHARP_SEMANTIC_DIAGNOSTIC_SOURCE,
+            kind,
+            message,
         );
     }
 
@@ -1128,19 +1133,9 @@ enum InheritedTypeName {
     Spelled(String),
 }
 
-fn describe_reason(reason: &SemanticDiagnosticIncompleteReason) -> String {
-    match reason {
-        SemanticDiagnosticIncompleteReason::MissingDependencyDiscovery { boundary } => {
-            format!("the assembly index is unreadable at {boundary:?}")
-        }
-        other => format!("the assembly index is unreadable: {other:?}"),
-    }
-}
-
 /// The identity a `using static X;` directive names.
 fn csharp_using_directive_target_identity(node: Node<'_>, source: &str) -> Option<String> {
-    let mut cursor = node.walk();
-    let target = node.named_children(&mut cursor).find(|child| {
+    let target = csharp_using_directive_target_node_matching(node, |child| {
         matches!(
             child.kind(),
             "identifier" | "qualified_name" | "alias_qualified_name" | "generic_name"
@@ -1148,6 +1143,15 @@ fn csharp_using_directive_target_identity(node: Node<'_>, source: &str) -> Optio
     })?;
     let identity = csharp_type_node_identity(target, source);
     (!identity.is_empty()).then_some(identity)
+}
+
+fn describe_reason(reason: &SemanticDiagnosticIncompleteReason) -> String {
+    match reason {
+        SemanticDiagnosticIncompleteReason::MissingDependencyDiscovery { boundary } => {
+            format!("the assembly index is unreadable at {boundary:?}")
+        }
+        other => format!("the assembly index is unreadable: {other:?}"),
+    }
 }
 
 /// The generic parameter names a declaration introduces, when it has any.
@@ -1220,23 +1224,21 @@ fn is_type_reference_position(node: Node<'_>) -> bool {
 
 /// The name of the type declaration `node` sits in.
 fn enclosing_type_name(node: Node<'_>, source: &str) -> Option<String> {
-    let mut current = node;
-    while let Some(parent) = current.parent() {
-        if matches!(
-            parent.kind(),
-            "class_declaration"
-                | "struct_declaration"
-                | "record_declaration"
-                | "record_struct_declaration"
-                | "interface_declaration"
-        ) && let Some(name) = parent.child_by_field_name("name")
-        {
-            let name = node_text(name, source).trim();
-            return (!name.is_empty()).then(|| name.to_string());
-        }
-        current = parent;
-    }
-    None
+    let parent = brokk_bifrost_core::analyzer::structural::adapter_helpers::nearest_ancestor(
+        node,
+        |kind| {
+            matches!(
+                kind,
+                "class_declaration"
+                    | "struct_declaration"
+                    | "record_declaration"
+                    | "record_struct_declaration"
+                    | "interface_declaration"
+            )
+        },
+    )?;
+    let name = node_text(parent.child_by_field_name("name")?, source).trim();
+    (!name.is_empty()).then(|| name.to_string())
 }
 
 /// The file's root node, which bounds the local-binding seeding.
@@ -1285,11 +1287,4 @@ fn is_csharp_keyword_type(name: &str) -> bool {
             | "nint"
             | "nuint"
     )
-}
-
-fn push_named_children<'tree>(stack: &mut Vec<ScanFrame<'tree>>, node: Node<'tree>) {
-    let mut cursor = node.walk();
-    for child in node.named_children(&mut cursor) {
-        stack.push(ScanFrame::Node(child));
-    }
 }

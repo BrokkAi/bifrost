@@ -1,19 +1,28 @@
 use super::results::CodeQueryAbsentMemberLocation;
 use super::results::CodeQueryConfigurationFact;
+use super::results::CodeQueryCrossDomain;
+use super::results::CodeQueryMatchRelations;
+use super::results::CodeQueryPointsToCandidate;
 use super::results::CodeQueryRuntimeKeyedReadValue;
-use super::results::CodeQueryUnresolvedCall;
 use super::*;
 
 use brokk_bifrost_core::analyzer::model::CallableArity;
 use brokk_bifrost_core::analyzer::structural::resolution::MethodFamilyRelation;
 use brokk_bifrost_flow::type_flow::AbsentMemberProof;
 
-use super::call_binding::{
-    semantic_model_completeness_label, semantic_model_origin_label, semantic_model_proof_label,
-};
-use brokk_bifrost_core::analyzer::configuration::{
-    ConfigurationMemberRole, ConfigurationNodeKind, ConfigurationScalarKind,
-};
+use super::call_binding::{semantic_model_origin_label, semantic_model_proof_label};
+use brokk_bifrost_core::analyzer::configuration::ConfigurationNodeKind;
+use brokk_bifrost_core::analyzer::structural::materialization::SourceExportLocalDefinition;
+
+pub(super) fn public_range(facts: &FileFacts, range: Range) -> CodeQueryRange {
+    range_for_span(
+        facts,
+        Span {
+            start_byte: range.start_byte,
+            end_byte: range.end_byte,
+        },
+    )
+}
 
 pub(super) fn insert_pipeline_row(
     rows: &mut Vec<PipelineRow>,
@@ -58,8 +67,8 @@ pub(super) fn render_pipeline_item(
         .map(|trace| render_provenance(analyzer, trace, detail, cache))
         .collect();
     let value = match row.value {
-        PipelineValue::StructuralMatch(seed) => CodeQueryResultValue::StructuralMatch {
-            value: render_match(
+        PipelineValue::StructuralMatch(seed) => {
+            let mut value = render_match(
                 analyzer,
                 seed.language,
                 &seed.file,
@@ -67,8 +76,10 @@ pub(super) fn render_pipeline_item(
                 &seed.fact_match,
                 detail,
                 cache,
-            ),
-        },
+            );
+            value.python_import = seed.python_import.clone().map(Box::new);
+            CodeQueryResultValue::StructuralMatch { value }
+        }
         PipelineValue::Declaration(declaration) => CodeQueryResultValue::Declaration {
             value: render_declaration(analyzer, &declaration, detail, cache),
         },
@@ -101,6 +112,9 @@ pub(super) fn render_pipeline_item(
         },
         PipelineValue::ReceiverEvidence(value) => CodeQueryResultValue::ReceiverEvidence {
             value: Box::new(render_receiver_evidence(analyzer, &value, cache)),
+        },
+        PipelineValue::PointsToCandidate(value) => CodeQueryResultValue::PointsToCandidate {
+            value: Box::new(render_points_to_candidate(analyzer, &value, cache)),
         },
         PipelineValue::FieldWriteValue(value) => CodeQueryResultValue::FieldWriteValue {
             value: Box::new(render_field_write_value(analyzer, &value, detail, cache)),
@@ -163,11 +177,6 @@ pub(super) fn render_pipeline_item(
         PipelineValue::AssignmentRelation(value) => CodeQueryResultValue::AssignmentRelation {
             value: Box::new(render_assignment_relation(analyzer, &value, cache)),
         },
-        PipelineValue::ConcurrentAccessConflict(value) => {
-            CodeQueryResultValue::ConcurrentAccessConflict {
-                value: Box::new(render_concurrent_access_conflict(analyzer, &value, cache)),
-            }
-        }
         PipelineValue::ClassSetRow(value) => CodeQueryResultValue::ClassSetRow {
             value: Box::new(render_class_set_row(analyzer, &value, cache)),
         },
@@ -182,6 +191,12 @@ pub(super) fn render_pipeline_item(
         },
         PipelineValue::CallableSignature(value) => CodeQueryResultValue::CallableSignature {
             value: Box::new(render_callable_signature(analyzer, &value, detail, cache)),
+        },
+        PipelineValue::LiteralOccurrence(value) => CodeQueryResultValue::LiteralOccurrence {
+            value: Box::new(render_literal_occurrence(&value)),
+        },
+        PipelineValue::CallableMetrics(value) => CodeQueryResultValue::CallableMetrics {
+            value: Box::new(render_callable_metrics(analyzer, &value, detail, cache)),
         },
         PipelineValue::SignatureParameter(value) => CodeQueryResultValue::SignatureParameter {
             value: Box::new(render_signature_parameter(analyzer, &value, cache)),
@@ -229,6 +244,11 @@ pub(super) fn render_pipeline_item(
         PipelineValue::MemberFamilyEdge(value) => CodeQueryResultValue::MemberFamilyEdge {
             value: Box::new(render_member_family_edge(analyzer, &value, detail, cache)),
         },
+        PipelineValue::PythonHierarchyFact(value) => CodeQueryResultValue::PythonHierarchyFact {
+            value: Box::new(render_python_hierarchy_fact(
+                analyzer, &value, detail, cache,
+            )),
+        },
         PipelineValue::GenerationSite(value) => CodeQueryResultValue::GenerationSite {
             value: Box::new(render_generation_site(analyzer, &value, cache)),
         },
@@ -244,6 +264,11 @@ pub(super) fn render_pipeline_item(
         PipelineValue::StateEvent(value) => CodeQueryResultValue::StateEvent {
             value: Box::new(render_state_event(analyzer, &value, cache)),
         },
+        PipelineValue::BindingInitializerCall(value) => {
+            CodeQueryResultValue::BindingInitializerCall {
+                value: Box::new(value.row.clone()),
+            }
+        }
         PipelineValue::FlowRelation(value) => CodeQueryResultValue::FlowRelation {
             value: Box::new(render_flow_relation(analyzer, &value, cache)),
         },
@@ -259,11 +284,20 @@ pub(super) fn render_pipeline_item(
         PipelineValue::LoopRelation(value) => CodeQueryResultValue::LoopRelation {
             value: Box::new(value.row.clone()),
         },
+        PipelineValue::CppExpression(value) => CodeQueryResultValue::CppExpression {
+            value: Box::new(value.row.clone()),
+        },
         PipelineValue::StatementReachability(value) => {
             CodeQueryResultValue::StatementReachability {
                 value: Box::new(value.row.clone()),
             }
         }
+        PipelineValue::PendingCleanupFlow(value) => CodeQueryResultValue::PendingCleanupFlow {
+            value: Box::new(value.row.clone()),
+        },
+        PipelineValue::PythonRuleFact(value) => CodeQueryResultValue::PythonRuleFact {
+            value: Box::new(value.row.clone()),
+        },
         PipelineValue::Guard(value) => CodeQueryResultValue::Guard {
             value: Box::new(guards::public_guard(&value)),
         },
@@ -285,8 +319,14 @@ pub(super) fn render_pipeline_item(
         PipelineValue::PathSegment(value) => CodeQueryResultValue::PathSegment {
             value: Box::new(render_path_segment(analyzer, &value, cache)),
         },
+        PipelineValue::DependencyEvidence(value) => CodeQueryResultValue::DependencyEvidence {
+            value: Box::new(dependency_evidence::public_row(&value)),
+        },
         PipelineValue::ConfigurationFact(value) => CodeQueryResultValue::ConfigurationFact {
             value: Box::new(render_configuration_fact(&value, cache)),
+        },
+        PipelineValue::CrossDomain(value) => CodeQueryResultValue::CrossDomain {
+            value: Box::new(render_cross_domain(analyzer, *value, detail, cache)),
         },
     };
     CodeQueryResultItem {
@@ -311,400 +351,7 @@ pub(super) fn render_provenance(
             .iter()
             .map(|step| CodeQueryProvenanceStep {
                 op: step.op.label(),
-                result: match &step.value {
-                    PipelineTraceValue::StructuralMatch(seed) => render_seed_ref(seed, detail),
-                    PipelineTraceValue::Declaration(declaration) => {
-                        render_declaration_ref(analyzer, declaration, detail, cache)
-                    }
-                    PipelineTraceValue::Semantic(value) => value.public_ref(),
-                    PipelineTraceValue::File(file) => render_file_ref(file),
-                    PipelineTraceValue::ReferenceSite(site) => {
-                        render_reference_site_ref(analyzer, site, detail, cache)
-                    }
-                    PipelineTraceValue::CallSite(site) => {
-                        render_call_site_ref(analyzer, site, cache)
-                    }
-                    PipelineTraceValue::ExpressionSite(site) => {
-                        render_expression_site_ref(analyzer, site, cache)
-                    }
-                    PipelineTraceValue::JsxAttributeValue(value) => {
-                        render_jsx_attribute_value_ref(analyzer, value, cache)
-                    }
-                    PipelineTraceValue::ReceiverAnalysis(value) => {
-                        render_receiver_analysis_ref(analyzer, value, cache)
-                    }
-                    PipelineTraceValue::MemberTargetAnalysis(value) => {
-                        render_member_target_analysis_ref(analyzer, value, cache)
-                    }
-                    PipelineTraceValue::ReceiverOutcome(value) => {
-                        render_receiver_outcome_ref(analyzer, value, cache)
-                    }
-                    PipelineTraceValue::ReceiverEvidence(value) => {
-                        render_receiver_evidence_ref(analyzer, value, cache)
-                    }
-                    PipelineTraceValue::FieldWriteValue(value) => {
-                        render_field_write_value_ref(analyzer, value, cache)
-                    }
-                    PipelineTraceValue::RuntimeKeyedReadValue(value) => {
-                        render_runtime_keyed_read_value_ref(analyzer, value, cache)
-                    }
-                    PipelineTraceValue::CallShape(value) => {
-                        let rendered = render_call_shape(analyzer, value, cache);
-                        CodeQueryResultRef::CallShape {
-                            id: rendered.id,
-                            site_id: rendered.site_id,
-                            path: rendered.path,
-                            range: rendered.range,
-                            call_kind: rendered.call_kind,
-                            coverage: rendered.coverage,
-                        }
-                    }
-                    PipelineTraceValue::CallArgumentGroup(value) => {
-                        let rendered = render_call_argument_group(analyzer, value, cache);
-                        CodeQueryResultRef::CallArgumentGroup {
-                            id: rendered.id,
-                            site_id: rendered.site_id,
-                            path: rendered.path,
-                            range: rendered.range,
-                            kind: rendered.kind,
-                        }
-                    }
-                    PipelineTraceValue::CallArgument(value) => {
-                        let rendered = render_call_shape_argument(analyzer, value, cache);
-                        CodeQueryResultRef::CallArgument {
-                            id: rendered.id,
-                            group_id: rendered.group_id,
-                            path: rendered.path,
-                            range: rendered.range,
-                            argument_index: rendered.argument_index,
-                        }
-                    }
-                    PipelineTraceValue::CallBinding(value) => {
-                        let rendered = render_call_binding(analyzer, value, detail, cache);
-                        CodeQueryResultRef::CallBinding {
-                            id: rendered.id,
-                            site_id: rendered.site_id,
-                            path: rendered.path,
-                            range: rendered.range,
-                            semantic_target_id: rendered.semantic_target_id,
-                            target_origin: rendered.target_origin,
-                            model_id: rendered.model_id,
-                            receiver_type_id: rendered.receiver_type_id,
-                            pack_id: rendered.pack_id,
-                            model_record_id: rendered.model_record_id,
-                            model_activation_status: rendered.model_activation_status,
-                            model_activation_source_kind: rendered.model_activation_source_kind,
-                            model_activation_source_id: rendered.model_activation_source_id,
-                            model_origin: rendered.model_origin,
-                            model_proof: rendered.model_proof,
-                            model_completeness: rendered.model_completeness,
-                            binding_kind: rendered.binding_kind,
-                            mapping: rendered.mapping,
-                            coverage: rendered.coverage,
-                        }
-                    }
-                    PipelineTraceValue::CallEffect(value) => {
-                        let rendered = render_call_effect(analyzer, value, detail, cache);
-                        CodeQueryResultRef::CallEffect {
-                            id: rendered.id,
-                            site_id: rendered.site_id,
-                            path: rendered.path,
-                            range: rendered.range,
-                            effect_id: rendered.effect_id,
-                            derivation: rendered.derivation,
-                            coverage: rendered.coverage,
-                        }
-                    }
-                    PipelineTraceValue::CallResultContract(value) => {
-                        let rendered = render_call_result_contract(analyzer, value, detail, cache);
-                        CodeQueryResultRef::CallResultContract {
-                            id: rendered.id,
-                            site_id: rendered.site_id,
-                            path: rendered.path,
-                            range: rendered.range,
-                            result_ordinal: rendered.result_ordinal,
-                            condition_result_ordinal: rendered.condition_result_ordinal,
-                            predicate: rendered.predicate,
-                            result_success_predicate: rendered.result_success_predicate,
-                            coverage: rendered.coverage,
-                        }
-                    }
-                    PipelineTraceValue::CallResultObligation(value) => {
-                        let rendered = render_call_result_obligation(analyzer, value, cache);
-                        CodeQueryResultRef::CallResultObligation {
-                            id: rendered.id,
-                            site_id: rendered.site_id,
-                            path: rendered.path,
-                            range: rendered.range,
-                            obligation_kind: rendered.obligation_kind,
-                            result_use: rendered.result_use,
-                            coverage: rendered.coverage,
-                        }
-                    }
-                    PipelineTraceValue::ResultSubjectUse(value) => {
-                        let row = &value.row;
-                        CodeQueryResultRef::ResultSubjectUse {
-                            id: row.id.clone(),
-                            origin_id: row.origin.as_ref().map(|origin| origin.id.clone()),
-                            path: row.path.clone(),
-                            range: row.receiver_range,
-                            proof: row.proof,
-                            completeness: row.completeness,
-                            outcome: row.outcome,
-                        }
-                    }
-                    PipelineTraceValue::ResultContractUse(value) => {
-                        let rendered = render_result_contract_use(analyzer, value, cache);
-                        CodeQueryResultRef::ResultContractUse {
-                            id: rendered.id,
-                            acquisition_id: rendered.acquisition_id,
-                            path: rendered.path,
-                            range: rendered.range,
-                            use_kind: rendered.use_kind,
-                            parameter_ordinal: rendered.parameter_ordinal,
-                            applicability: rendered.applicability,
-                            guard: rendered.guard,
-                            coverage: rendered.coverage,
-                        }
-                    }
-                    PipelineTraceValue::ResultContractFailureUse(value) => {
-                        let rendered = render_result_contract_failure_use(analyzer, value, cache);
-                        CodeQueryResultRef::ResultContractFailureUse {
-                            id: rendered.id,
-                            acquisition_id: rendered.acquisition_id,
-                            path: rendered.path,
-                            range: rendered.range,
-                            provenance: rendered.failure_provenance,
-                            consumer: rendered.consumer,
-                            coverage: rendered.coverage,
-                        }
-                    }
-                    PipelineTraceValue::NilnessOperation(value) => {
-                        let rendered = render_nilness_operation(analyzer, value, cache);
-                        CodeQueryResultRef::NilnessOperation {
-                            id: rendered.id,
-                            path: rendered.path,
-                            range: rendered.range,
-                            use_kind: rendered.use_kind,
-                            fact: rendered.fact,
-                            coverage: rendered.coverage,
-                        }
-                    }
-                    PipelineTraceValue::SwitchCoverage(value) => {
-                        let rendered = render_switch_coverage(analyzer, value, cache);
-                        CodeQueryResultRef::SwitchCoverage {
-                            id: rendered.id,
-                            path: rendered.path,
-                            range: rendered.range,
-                            verdict: rendered.verdict,
-                            proof: rendered.proof,
-                        }
-                    }
-                    PipelineTraceValue::AssignmentRelation(value) => {
-                        let rendered = render_assignment_relation(analyzer, value, cache);
-                        CodeQueryResultRef::AssignmentRelation {
-                            id: rendered.id,
-                            procedure_id: rendered.procedure_id,
-                            path: rendered.path,
-                            range: rendered.range,
-                            verdict: rendered.verdict,
-                            proof: rendered.proof,
-                        }
-                    }
-                    PipelineTraceValue::ConcurrentAccessConflict(value) => {
-                        let rendered = render_concurrent_access_conflict(analyzer, value, cache);
-                        CodeQueryResultRef::ConcurrentAccessConflict {
-                            id: rendered.id,
-                            path: rendered.path,
-                            range: rendered.range,
-                            ordering: rendered.ordering,
-                            protection: rendered.protection,
-                            proof: rendered.proof,
-                        }
-                    }
-                    PipelineTraceValue::ClassSetRow(value) => {
-                        let rendered = render_class_set_row(analyzer, value, cache);
-                        CodeQueryResultRef::ClassSetRow {
-                            id: rendered.id,
-                            path: rendered.file,
-                            range: rendered.range,
-                            member: rendered.member,
-                            status: rendered.status,
-                        }
-                    }
-                    PipelineTraceValue::AbsentMemberFinding(value) => {
-                        let rendered = render_absent_member_finding(analyzer, value, cache);
-                        CodeQueryResultRef::AbsentMemberFinding {
-                            id: rendered.id,
-                            path: rendered.file,
-                            range: rendered.range,
-                            member: rendered.member,
-                            class: rendered.class,
-                        }
-                    }
-                    PipelineTraceValue::DetachedTaskTransfer(value) => {
-                        let rendered = render_detached_task_transfer(analyzer, value, cache);
-                        CodeQueryResultRef::DetachedTaskTransfer {
-                            id: rendered.id,
-                            path: rendered.path,
-                            range: rendered.range,
-                            role: rendered.role,
-                            timing: rendered.timing,
-                            coverage: rendered.coverage,
-                        }
-                    }
-                    PipelineTraceValue::ProcedureEffect(value) => {
-                        let rendered = render_procedure_effect(analyzer, value, cache);
-                        CodeQueryResultRef::ProcedureEffect {
-                            id: rendered.id,
-                            procedure_id: rendered.procedure_id,
-                            site_id: rendered.site_id,
-                            path: rendered.path,
-                            range: rendered.range,
-                            effect_id: rendered.effect_id,
-                            derivation: rendered.derivation,
-                            coverage: rendered.coverage,
-                        }
-                    }
-                    PipelineTraceValue::CallableSignature(value) => {
-                        let rendered = render_callable_signature(analyzer, value, detail, cache);
-                        CodeQueryResultRef::CallableSignature {
-                            id: rendered.id,
-                            declaration_id: rendered.declaration.id,
-                            site_id: rendered.site_id,
-                            path: rendered.path,
-                            range: rendered.range,
-                            role: rendered.role,
-                            coverage: rendered.coverage,
-                        }
-                    }
-                    PipelineTraceValue::SignatureParameter(value) => {
-                        let rendered = render_signature_parameter(analyzer, value, cache);
-                        CodeQueryResultRef::SignatureParameter {
-                            id: rendered.id,
-                            signature_id: rendered.signature_id,
-                            path: rendered.path,
-                            range: rendered.range,
-                            parameter_index: rendered.parameter_index,
-                        }
-                    }
-                    PipelineTraceValue::DecoratedParameter(value) => {
-                        let rendered = render_decorated_parameter(value);
-                        CodeQueryResultRef::DecoratedParameter {
-                            id: rendered.id,
-                            parameter_id: rendered.parameter_id,
-                            decorator_id: rendered.decorator_id,
-                            path: rendered.path,
-                            range: rendered.range,
-                            decorator_range: rendered.decorator_range,
-                            parameter_ordinal: rendered.parameter_ordinal,
-                            binding_status: rendered.binding_status,
-                            coverage: rendered.coverage,
-                        }
-                    }
-                    PipelineTraceValue::CallableApplicability(value) => {
-                        let rendered =
-                            render_callable_applicability(analyzer, value, detail, cache);
-                        CodeQueryResultRef::CallableApplicability {
-                            id: rendered.id,
-                            site_ast_id: rendered.site_ast_id,
-                            path: rendered.path,
-                            range: rendered.range,
-                            ordinal: rendered.ordinal,
-                            verdict: rendered.verdict,
-                            selected: rendered.selected,
-                        }
-                    }
-                    PipelineTraceValue::OverloadSelection(value) => {
-                        let rendered = render_overload_selection(analyzer, value, cache);
-                        CodeQueryResultRef::OverloadSelection {
-                            id: rendered.id,
-                            site_ast_id: rendered.site_ast_id,
-                            path: rendered.path,
-                            range: rendered.range,
-                            resolution: rendered.resolution,
-                        }
-                    }
-                    PipelineTraceValue::MemberSelection(value) => {
-                        render_member_selection_ref(analyzer, value, cache)
-                    }
-                    PipelineTraceValue::Occurrence(value) => {
-                        render_occurrence_ref(analyzer, value, cache)
-                    }
-                    PipelineTraceValue::GenerationSite(value) => {
-                        render_generation_site_ref(analyzer, value, cache)
-                    }
-                    PipelineTraceValue::Export(value) => render_export_ref(analyzer, value, cache),
-                    PipelineTraceValue::DeclarationState(value) => {
-                        render_declaration_state_ref(value)
-                    }
-                    PipelineTraceValue::LexicalScope(value) => {
-                        render_scope_ref(analyzer, value, cache)
-                    }
-                    PipelineTraceValue::Binding(value) => {
-                        render_binding_ref(analyzer, value, cache)
-                    }
-                    PipelineTraceValue::ResolutionCandidate(value) => {
-                        render_candidate_ref(analyzer, value, cache)
-                    }
-                    PipelineTraceValue::CandidateHop(value) => {
-                        render_candidate_hop_ref(analyzer, value, cache)
-                    }
-                    PipelineTraceValue::DispatchOutcome(value) => {
-                        render_dispatch_outcome_ref(analyzer, value, cache)
-                    }
-                    PipelineTraceValue::DispatchTarget(value) => {
-                        render_dispatch_target_ref(analyzer, value, cache)
-                    }
-                    PipelineTraceValue::MemberFamily(value) => {
-                        render_member_family_ref(analyzer, value, cache)
-                    }
-                    PipelineTraceValue::MemberFamilyEdge(value) => {
-                        render_member_family_edge_ref(analyzer, value, cache)
-                    }
-                    PipelineTraceValue::ReferenceEdge(value) => {
-                        render_edge_ref(analyzer, value, cache)
-                    }
-                    PipelineTraceValue::StateEvent(value) => {
-                        render_state_event_ref(analyzer, value, cache)
-                    }
-                    PipelineTraceValue::FlowRelation(value) => {
-                        render_flow_relation_ref(analyzer, value, cache)
-                    }
-                    PipelineTraceValue::ControlRelation(value) => {
-                        control_relations::control_relation_ref(value)
-                    }
-                    PipelineTraceValue::BranchRelation(value) => {
-                        branch_relations::result_ref(value)
-                    }
-                    PipelineTraceValue::LoopRelation(value) => loop_relations::result_ref(value),
-                    PipelineTraceValue::FailureHandlerState(value) => {
-                        failure_handler_state::result_ref(value)
-                    }
-                    PipelineTraceValue::StatementReachability(value) => {
-                        statement_reachability::result_ref(value)
-                    }
-                    PipelineTraceValue::Guard(value) => guards::guard_ref(value),
-                    PipelineTraceValue::SourceSet(value) => topology_rows::source_set_ref(value),
-                    PipelineTraceValue::BuildTarget(value) => {
-                        topology_rows::build_target_ref(value)
-                    }
-                    PipelineTraceValue::TopologyEdge(value) => {
-                        topology_rows::topology_edge_ref(value)
-                    }
-                    PipelineTraceValue::RewritePath(value) => {
-                        render_rewrite_path_ref(analyzer, value, cache)
-                    }
-                    PipelineTraceValue::QualifiedPath(value) => {
-                        render_qualified_path_ref(analyzer, value, cache)
-                    }
-                    PipelineTraceValue::PathSegment(value) => {
-                        render_path_segment_ref(analyzer, value, cache)
-                    }
-                    PipelineTraceValue::ConfigurationFact(value) => {
-                        render_configuration_fact_ref(value, cache)
-                    }
-                },
+                result: render_trace_value_ref(analyzer, &step.value, detail, cache),
                 via: step.via.as_ref().map(|via| match via {
                     PipelineVia::ReferenceSite(site) => {
                         render_reference_site_ref(analyzer, site, detail, cache)
@@ -716,20 +363,435 @@ pub(super) fn render_provenance(
     }
 }
 
+/// Render one provenance value as a compact reference to its row: the row's
+/// family, exact location, and the identity fields that family carries.
+pub(super) fn render_trace_value_ref(
+    analyzer: &dyn IAnalyzer,
+    value: &PipelineTraceValue,
+    detail: CodeQueryResultDetail,
+    cache: &mut PipelineRenderCache,
+) -> CodeQueryResultRef {
+    match value {
+        PipelineTraceValue::StructuralMatch(seed) => render_seed_ref(seed, detail),
+        PipelineTraceValue::Declaration(declaration) => {
+            render_declaration_ref(analyzer, declaration, detail, cache)
+        }
+        PipelineTraceValue::Semantic(value) => value.public_ref(),
+        PipelineTraceValue::File(file) => render_file_ref(file),
+        PipelineTraceValue::ReferenceSite(site) => {
+            render_reference_site_ref(analyzer, site, detail, cache)
+        }
+        PipelineTraceValue::CallSite(site) => render_call_site_ref(analyzer, site, cache),
+        PipelineTraceValue::ExpressionSite(site) => {
+            render_expression_site_ref(analyzer, site, cache)
+        }
+        PipelineTraceValue::JsxAttributeValue(value) => {
+            render_jsx_attribute_value_ref(analyzer, value, cache)
+        }
+        PipelineTraceValue::ReceiverAnalysis(value) => {
+            render_receiver_analysis_ref(analyzer, value, cache)
+        }
+        PipelineTraceValue::MemberTargetAnalysis(value) => {
+            render_member_target_analysis_ref(analyzer, value, cache)
+        }
+        PipelineTraceValue::ReceiverOutcome(value) => {
+            render_receiver_outcome_ref(analyzer, value, cache)
+        }
+        PipelineTraceValue::ReceiverEvidence(value) => {
+            render_receiver_evidence_ref(analyzer, value, cache)
+        }
+        PipelineTraceValue::PointsToCandidate(value) => {
+            render_points_to_candidate_ref(analyzer, value, cache)
+        }
+        PipelineTraceValue::FieldWriteValue(value) => {
+            render_field_write_value_ref(analyzer, value, cache)
+        }
+        PipelineTraceValue::RuntimeKeyedReadValue(value) => {
+            render_runtime_keyed_read_value_ref(analyzer, value, cache)
+        }
+        PipelineTraceValue::CallShape(value) => {
+            let rendered = render_call_shape(analyzer, value, cache);
+            CodeQueryResultRef::CallShape {
+                id: rendered.id,
+                site_id: rendered.site_id,
+                path: rendered.path,
+                range: rendered.range,
+                call_kind: rendered.call_kind,
+                coverage: rendered.coverage,
+            }
+        }
+        PipelineTraceValue::CallArgumentGroup(value) => {
+            let rendered = render_call_argument_group(analyzer, value, cache);
+            CodeQueryResultRef::CallArgumentGroup {
+                id: rendered.id,
+                site_id: rendered.site_id,
+                path: rendered.path,
+                range: rendered.range,
+                kind: rendered.kind,
+            }
+        }
+        PipelineTraceValue::CallArgument(value) => {
+            let rendered = render_call_shape_argument(analyzer, value, cache);
+            CodeQueryResultRef::CallArgument {
+                id: rendered.id,
+                group_id: rendered.group_id,
+                path: rendered.path,
+                range: rendered.range,
+                argument_index: rendered.argument_index,
+            }
+        }
+        PipelineTraceValue::CallBinding(value) => {
+            let rendered = render_call_binding(analyzer, value, detail, cache);
+            CodeQueryResultRef::CallBinding {
+                id: rendered.id,
+                site_id: rendered.site_id,
+                path: rendered.path,
+                range: rendered.range,
+                semantic_target_id: rendered.semantic_target_id,
+                target_origin: rendered.target_origin,
+                model_id: rendered.model_id,
+                receiver_type_id: rendered.receiver_type_id,
+                pack_id: rendered.pack_id,
+                model_record_id: rendered.model_record_id,
+                model_activation_status: rendered.model_activation_status,
+                model_activation_source_kind: rendered.model_activation_source_kind,
+                model_activation_source_id: rendered.model_activation_source_id,
+                model_origin: rendered.model_origin,
+                model_proof: rendered.model_proof,
+                model_completeness: rendered.model_completeness,
+                binding_kind: rendered.binding_kind,
+                mapping: rendered.mapping,
+                coverage: rendered.coverage,
+            }
+        }
+        PipelineTraceValue::CallEffect(value) => {
+            let rendered = render_call_effect(analyzer, value, detail, cache);
+            CodeQueryResultRef::CallEffect {
+                id: rendered.id,
+                site_id: rendered.site_id,
+                path: rendered.path,
+                range: rendered.range,
+                effect_id: rendered.effect_id,
+                derivation: rendered.derivation,
+                coverage: rendered.coverage,
+            }
+        }
+        PipelineTraceValue::CallResultContract(value) => {
+            let rendered = render_call_result_contract(analyzer, value, detail, cache);
+            CodeQueryResultRef::CallResultContract {
+                id: rendered.id,
+                site_id: rendered.site_id,
+                path: rendered.path,
+                range: rendered.range,
+                result_ordinal: rendered.result_ordinal,
+                condition_result_ordinal: rendered.condition_result_ordinal,
+                predicate: rendered.predicate,
+                result_success_predicate: rendered.result_success_predicate,
+                coverage: rendered.coverage,
+            }
+        }
+        PipelineTraceValue::CallResultObligation(value) => {
+            let rendered = render_call_result_obligation(analyzer, value, cache);
+            CodeQueryResultRef::CallResultObligation {
+                id: rendered.id,
+                site_id: rendered.site_id,
+                path: rendered.path,
+                range: rendered.range,
+                obligation_kind: rendered.obligation_kind,
+                result_use: rendered.result_use,
+                coverage: rendered.coverage,
+            }
+        }
+        PipelineTraceValue::ResultSubjectUse(value) => {
+            let row = &value.row;
+            CodeQueryResultRef::ResultSubjectUse {
+                id: row.id.clone(),
+                origin_id: row.origin.as_ref().map(|origin| origin.id.clone()),
+                path: row.path.clone(),
+                range: row.receiver_range,
+                proof: row.proof,
+                completeness: row.completeness,
+                outcome: row.outcome,
+            }
+        }
+        PipelineTraceValue::ResultContractUse(value) => {
+            let rendered = render_result_contract_use(analyzer, value, cache);
+            CodeQueryResultRef::ResultContractUse {
+                id: rendered.id,
+                acquisition_id: rendered.acquisition_id,
+                path: rendered.path,
+                range: rendered.range,
+                use_kind: rendered.use_kind,
+                parameter_ordinal: rendered.parameter_ordinal,
+                applicability: rendered.applicability,
+                guard: rendered.guard,
+                coverage: rendered.coverage,
+            }
+        }
+        PipelineTraceValue::ResultContractFailureUse(value) => {
+            let rendered = render_result_contract_failure_use(analyzer, value, cache);
+            CodeQueryResultRef::ResultContractFailureUse {
+                id: rendered.id,
+                acquisition_id: rendered.acquisition_id,
+                path: rendered.path,
+                range: rendered.range,
+                provenance: rendered.failure_provenance,
+                consumer: rendered.consumer,
+                coverage: rendered.coverage,
+            }
+        }
+        PipelineTraceValue::NilnessOperation(value) => {
+            let rendered = render_nilness_operation(analyzer, value, cache);
+            CodeQueryResultRef::NilnessOperation {
+                id: rendered.id,
+                path: rendered.path,
+                range: rendered.range,
+                use_kind: rendered.use_kind,
+                fact: rendered.fact,
+                coverage: rendered.coverage,
+            }
+        }
+        PipelineTraceValue::SwitchCoverage(value) => {
+            let rendered = render_switch_coverage(analyzer, value, cache);
+            CodeQueryResultRef::SwitchCoverage {
+                id: rendered.id,
+                path: rendered.path,
+                range: rendered.range,
+                verdict: rendered.verdict,
+                proof: rendered.proof,
+            }
+        }
+        PipelineTraceValue::AssignmentRelation(value) => {
+            let rendered = render_assignment_relation(analyzer, value, cache);
+            CodeQueryResultRef::AssignmentRelation {
+                id: rendered.id,
+                procedure_id: rendered.procedure_id,
+                path: rendered.path,
+                range: rendered.range,
+                verdict: rendered.verdict,
+                proof: rendered.proof,
+            }
+        }
+        PipelineTraceValue::ClassSetRow(value) => {
+            let rendered = render_class_set_row(analyzer, value, cache);
+            CodeQueryResultRef::ClassSetRow {
+                id: rendered.id,
+                path: rendered.file,
+                range: rendered.range,
+                member: rendered.member,
+                status: rendered.status,
+            }
+        }
+        PipelineTraceValue::AbsentMemberFinding(value) => {
+            let rendered = render_absent_member_finding(analyzer, value, cache);
+            CodeQueryResultRef::AbsentMemberFinding {
+                id: rendered.id,
+                path: rendered.file,
+                range: rendered.range,
+                member: rendered.member,
+                class: rendered.class,
+            }
+        }
+        PipelineTraceValue::DetachedTaskTransfer(value) => {
+            let rendered = render_detached_task_transfer(analyzer, value, cache);
+            CodeQueryResultRef::DetachedTaskTransfer {
+                id: rendered.id,
+                path: rendered.path,
+                range: rendered.range,
+                role: rendered.role,
+                timing: rendered.timing,
+                coverage: rendered.coverage,
+            }
+        }
+        PipelineTraceValue::ProcedureEffect(value) => {
+            let rendered = render_procedure_effect(analyzer, value, cache);
+            CodeQueryResultRef::ProcedureEffect {
+                id: rendered.id,
+                procedure_id: rendered.procedure_id,
+                site_id: rendered.site_id,
+                path: rendered.path,
+                range: rendered.range,
+                effect_id: rendered.effect_id,
+                derivation: rendered.derivation,
+                coverage: rendered.coverage,
+            }
+        }
+        PipelineTraceValue::CallableSignature(value) => {
+            let rendered = render_callable_signature(analyzer, value, detail, cache);
+            CodeQueryResultRef::CallableSignature {
+                id: rendered.id,
+                declaration_id: rendered.declaration.id,
+                site_id: rendered.site_id,
+                path: rendered.path,
+                range: rendered.range,
+                role: rendered.role,
+                coverage: rendered.coverage,
+            }
+        }
+        PipelineTraceValue::LiteralOccurrence(value) => {
+            let rendered = render_literal_occurrence(value);
+            CodeQueryResultRef::LiteralOccurrence {
+                id: rendered.id,
+                path: rendered.path,
+                range: rendered.range,
+                kind: rendered.kind,
+                coverage: rendered.coverage,
+            }
+        }
+        PipelineTraceValue::CallableMetrics(value) => {
+            let rendered = render_callable_metrics(analyzer, value, detail, cache);
+            CodeQueryResultRef::CallableMetrics {
+                id: rendered.id,
+                callable_id: rendered.callable_id,
+                site_id: rendered.site_id,
+                path: rendered.path,
+                range: rendered.range,
+                coverage: rendered.coverage,
+            }
+        }
+        PipelineTraceValue::SignatureParameter(value) => {
+            let rendered = render_signature_parameter(analyzer, value, cache);
+            CodeQueryResultRef::SignatureParameter {
+                id: rendered.id,
+                signature_id: rendered.signature_id,
+                path: rendered.path,
+                range: rendered.range,
+                parameter_index: rendered.parameter_index,
+            }
+        }
+        PipelineTraceValue::DecoratedParameter(value) => {
+            let rendered = render_decorated_parameter(value);
+            CodeQueryResultRef::DecoratedParameter {
+                id: rendered.id,
+                parameter_id: rendered.parameter_id,
+                decorator_id: rendered.decorator_id,
+                path: rendered.path,
+                range: rendered.range,
+                decorator_range: rendered.decorator_range,
+                parameter_ordinal: rendered.parameter_ordinal,
+                binding_status: rendered.binding_status,
+                coverage: rendered.coverage,
+            }
+        }
+        PipelineTraceValue::CallableApplicability(value) => {
+            let rendered = render_callable_applicability(analyzer, value, detail, cache);
+            CodeQueryResultRef::CallableApplicability {
+                id: rendered.id,
+                site_ast_id: rendered.site_ast_id,
+                path: rendered.path,
+                range: rendered.range,
+                ordinal: rendered.ordinal,
+                verdict: rendered.verdict,
+                selected: rendered.selected,
+            }
+        }
+        PipelineTraceValue::OverloadSelection(value) => {
+            let rendered = render_overload_selection(analyzer, value, cache);
+            CodeQueryResultRef::OverloadSelection {
+                id: rendered.id,
+                site_ast_id: rendered.site_ast_id,
+                path: rendered.path,
+                range: rendered.range,
+                resolution: rendered.resolution,
+            }
+        }
+        PipelineTraceValue::MemberSelection(value) => {
+            render_member_selection_ref(analyzer, value, cache)
+        }
+        PipelineTraceValue::Occurrence(value) => render_occurrence_ref(analyzer, value, cache),
+        PipelineTraceValue::GenerationSite(value) => {
+            render_generation_site_ref(analyzer, value, cache)
+        }
+        PipelineTraceValue::Export(value) => render_export_ref(analyzer, value, cache),
+        PipelineTraceValue::DeclarationState(value) => render_declaration_state_ref(value),
+        PipelineTraceValue::LexicalScope(value) => render_scope_ref(analyzer, value, cache),
+        PipelineTraceValue::Binding(value) => render_binding_ref(analyzer, value, cache),
+        PipelineTraceValue::ResolutionCandidate(value) => {
+            render_candidate_ref(analyzer, value, cache)
+        }
+        PipelineTraceValue::CandidateHop(value) => render_candidate_hop_ref(analyzer, value, cache),
+        PipelineTraceValue::DispatchOutcome(value) => {
+            render_dispatch_outcome_ref(analyzer, value, cache)
+        }
+        PipelineTraceValue::DispatchTarget(value) => {
+            render_dispatch_target_ref(analyzer, value, cache)
+        }
+        PipelineTraceValue::MemberFamily(value) => render_member_family_ref(analyzer, value, cache),
+        PipelineTraceValue::MemberFamilyEdge(value) => {
+            render_member_family_edge_ref(analyzer, value, cache)
+        }
+        PipelineTraceValue::PythonHierarchyFact(value) => {
+            render_python_hierarchy_fact_ref(analyzer, value, cache)
+        }
+        PipelineTraceValue::ReferenceEdge(value) => render_edge_ref(analyzer, value, cache),
+        PipelineTraceValue::StateEvent(value) => render_state_event_ref(analyzer, value, cache),
+        PipelineTraceValue::BindingInitializerCall(value) => {
+            let row = &value.row;
+            CodeQueryResultRef::BindingInitializerCall {
+                id: row.id.clone(),
+                establishment_event_id: row.establishment_event_id.clone(),
+                site_ast_id: row.site_ast_id.clone(),
+                path: row.path.clone(),
+                range: row.range,
+                initializer_role: row.initializer_role,
+            }
+        }
+        PipelineTraceValue::FlowRelation(value) => render_flow_relation_ref(analyzer, value, cache),
+        PipelineTraceValue::ControlRelation(value) => {
+            control_relations::control_relation_ref(value)
+        }
+        PipelineTraceValue::BranchRelation(value) => branch_relations::result_ref(value),
+        PipelineTraceValue::LoopRelation(value) => loop_relations::result_ref(value),
+        PipelineTraceValue::CppExpression(value) => cpp_expressions::result_ref(value),
+        PipelineTraceValue::FailureHandlerState(value) => failure_handler_state::result_ref(value),
+        PipelineTraceValue::StatementReachability(value) => {
+            statement_reachability::result_ref(value)
+        }
+        PipelineTraceValue::PendingCleanupFlow(value) => pending_cleanup_flow::result_ref(value),
+        PipelineTraceValue::PythonRuleFact(value) => python_rule_facts::result_ref(value),
+        PipelineTraceValue::Guard(value) => guards::guard_ref(value),
+        PipelineTraceValue::SourceSet(value) => topology_rows::source_set_ref(value),
+        PipelineTraceValue::BuildTarget(value) => topology_rows::build_target_ref(value),
+        PipelineTraceValue::TopologyEdge(value) => topology_rows::topology_edge_ref(value),
+        PipelineTraceValue::RewritePath(value) => render_rewrite_path_ref(analyzer, value, cache),
+        PipelineTraceValue::QualifiedPath(value) => {
+            render_qualified_path_ref(analyzer, value, cache)
+        }
+        PipelineTraceValue::PathSegment(value) => render_path_segment_ref(analyzer, value, cache),
+        PipelineTraceValue::DependencyEvidence(value) => CodeQueryResultRef::DependencyEvidence {
+            id: value.row.id(),
+            path: rel_path_string(value.file()),
+        },
+        PipelineTraceValue::ConfigurationFact(value) => render_configuration_fact_ref(value, cache),
+        PipelineTraceValue::CrossDomain(value) => {
+            let row = render_cross_domain(analyzer, (**value).clone(), detail, cache);
+            CodeQueryResultRef::CrossDomain {
+                id: row.id,
+                operator: row.operator,
+                domain: row.domain,
+                path: row.path,
+                range: row.range,
+            }
+        }
+    }
+}
+
 pub(super) fn render_seed_ref(
     seed: &SeedMatch,
     detail: CodeQueryResultDetail,
 ) -> CodeQueryResultRef {
     let fact = seed.facts.node(seed.fact_match.node);
+    let span = seed.fact_match.display_span(&seed.facts);
+    let range = range_for_span(&seed.facts, span);
     let full = !detail.is_compact();
     let path = rel_path_string(&seed.file);
     CodeQueryResultRef::StructuralMatch {
-        id: full.then(|| match_id(&path, fact.kind.label(), fact.span())),
+        id: full.then(|| match_id(&path, fact.kind.label(), span)),
         path,
         kind: fact.kind.label(),
-        start_line: fact.range.start_line,
-        end_line: fact.range.end_line,
-        node_range: full.then(|| range_for_span(&seed.facts, fact.span())),
+        start_line: range.start_line,
+        end_line: range.end_line,
+        node_range: full.then_some(range),
     }
 }
 
@@ -763,22 +825,43 @@ pub(super) fn render_file_ref(file: &ProjectFile) -> CodeQueryResultRef {
     }
 }
 
+struct RenderedReferenceSiteMetadata {
+    path: String,
+    range: CodeQueryRange,
+    proof: &'static str,
+    reference_kind: Option<&'static str>,
+}
+
+fn render_reference_site_metadata(
+    analyzer: &dyn IAnalyzer,
+    site: &ReferenceSiteValue,
+    cache: &mut PipelineRenderCache,
+) -> RenderedReferenceSiteMetadata {
+    RenderedReferenceSiteMetadata {
+        path: rel_path_string(&site.file),
+        range: render_reference_range(analyzer, site, cache),
+        proof: usage_proof_label(site.proof),
+        reference_kind: site.reference_kind.map(reference_kind_label),
+    }
+}
+
 pub(super) fn render_reference_site_ref(
     analyzer: &dyn IAnalyzer,
     site: &ReferenceSiteValue,
     detail: CodeQueryResultDetail,
     cache: &mut PipelineRenderCache,
 ) -> CodeQueryResultRef {
+    let metadata = render_reference_site_metadata(analyzer, site, cache);
     let target_fq_name = site.target.unit.fq_name();
     CodeQueryResultRef::ReferenceSite {
-        path: rel_path_string(&site.file),
-        range: render_reference_range(analyzer, site, cache),
+        path: metadata.path,
+        range: metadata.range,
         target_id: (!detail.is_compact()).then(|| site.target.declaration_id()),
         target_fq_name,
         usage_kind: (site.usage_kind != UsageHitKind::Reference)
             .then(|| site.usage_kind.wire_label()),
-        proof: usage_proof_label(site.proof),
-        reference_kind: site.reference_kind.map(reference_kind_label),
+        proof: metadata.proof,
+        reference_kind: metadata.reference_kind,
     }
 }
 
@@ -801,10 +884,11 @@ pub(super) fn render_expression_site_ref(
     site: &ExpressionSiteValue,
     cache: &mut PipelineRenderCache,
 ) -> CodeQueryResultRef {
+    let location = render_source_location(analyzer, &site.call_site.0.file, &site.range, cache);
     let (input_kind, parameter_index, parameter_name) = expression_input_parts(&site.input);
     CodeQueryResultRef::ExpressionSite {
-        path: rel_path_string(&site.call_site.0.file),
-        range: render_source_range(analyzer, &site.call_site.0.file, &site.range, cache),
+        path: location.path,
+        range: location.range,
         input_kind,
         parameter_index,
         parameter_name,
@@ -816,15 +900,11 @@ pub(super) fn render_receiver_analysis_ref(
     value: &ReceiverAnalysisValue,
     cache: &mut PipelineRenderCache,
 ) -> CodeQueryResultRef {
+    let site = render_receiver_site(analyzer, value, cache);
     CodeQueryResultRef::ReceiverAnalysis {
-        path: rel_path_string(&value.report.site.file),
-        range: render_source_range(
-            analyzer,
-            &value.report.site.file,
-            &value.report.site.range,
-            cache,
-        ),
-        analysis_kind: value.report.operation.as_str(),
+        path: site.path,
+        range: site.range,
+        analysis_kind: site.analysis_kind,
         outcome: receiver_query_outcome_label(&value.report.analysis),
         capture: value.capture.clone(),
     }
@@ -879,6 +959,20 @@ pub(super) fn render_receiver_evidence_ref(
             cache,
         ),
         evidence_kind: receiver_evidence_kind(&value.value),
+    }
+}
+
+pub(super) fn render_points_to_candidate_ref(
+    analyzer: &dyn IAnalyzer,
+    value: &PointsToCandidateValue,
+    cache: &mut PipelineRenderCache,
+) -> CodeQueryResultRef {
+    let rendered = render_points_to_candidate(analyzer, value, cache);
+    CodeQueryResultRef::PointsToCandidate {
+        id: rendered.id,
+        site_id: rendered.site_id,
+        path: rendered.path,
+        range: rendered.range,
     }
 }
 
@@ -965,14 +1059,14 @@ pub(super) fn render_state_event_ref(
     value: &StateEventValue,
     cache: &mut PipelineRenderCache,
 ) -> CodeQueryResultRef {
-    let row = value.row();
+    let rendered = render_state_event(analyzer, value, cache);
     CodeQueryResultRef::StateEvent {
-        id: value.id(),
-        ast_id: row.site.ast_id.clone(),
-        path: rel_path_string(&row.site.file),
-        range: render_source_range(analyzer, &row.site.file, &row.site.range, cache),
-        procedure_id: value.procedure_id.to_string(),
-        event_class: row.event_class.label(),
+        id: rendered.id,
+        ast_id: rendered.ast_id,
+        path: rendered.path,
+        range: rendered.range,
+        procedure_id: rendered.procedure_id,
+        event_class: rendered.event_class,
     }
 }
 
@@ -1229,7 +1323,17 @@ pub(super) fn render_export(
 ) -> CodeQueryExport {
     let row = value.row();
     let range = render_source_range(analyzer, &row.file, &row.range, cache);
-    materialization::public_export(value, range)
+    let binding_range = match &row.local_definition {
+        Some(SourceExportLocalDefinition::Defined { binding }) => Some(render_source_range(
+            analyzer,
+            &row.file,
+            &binding.range,
+            cache,
+        )),
+        Some(SourceExportLocalDefinition::Undefined | SourceExportLocalDefinition::Unknown)
+        | None => None,
+    };
+    materialization::public_export(value, range, binding_range)
 }
 
 pub(super) fn render_declaration_state(
@@ -1375,6 +1479,10 @@ pub(super) fn render_dispatch_target(
         ordinal: value.ordinal,
         target_id: arm.target_id.clone(),
         target_path: arm.target_path.clone(),
+        target_fq_name: arm
+            .external_callee_identity
+            .as_ref()
+            .map(|identity| format!("{}.{}", identity.owner_fqn(), identity.member())),
         target_declaration: arm
             .target_unit
             .as_ref()
@@ -1392,13 +1500,14 @@ pub(super) fn render_dispatch_outcome_ref(
     value: &DispatchSiteValue,
     cache: &mut PipelineRenderCache,
 ) -> CodeQueryResultRef {
+    let rendered = render_dispatch_outcome(analyzer, value, cache);
     CodeQueryResultRef::DispatchOutcome {
-        id: value.site_id.clone(),
-        site_id: value.site_id.clone(),
-        path: rel_path_string(&value.file),
-        range: render_source_range(analyzer, &value.file, &value.range, cache),
-        outcome: value.answer.outcome,
-        coverage: value.answer.coverage.label(),
+        id: rendered.id,
+        site_id: rendered.site_id,
+        path: rendered.path,
+        range: rendered.range,
+        outcome: rendered.outcome,
+        coverage: rendered.coverage,
     }
 }
 
@@ -1419,6 +1528,25 @@ pub(super) fn render_dispatch_target_ref(
 }
 
 /// The mandatory method-family outcome row of one member.
+struct RenderedMemberFamilySite {
+    member_id: String,
+    path: String,
+    range: CodeQueryRange,
+}
+
+fn render_member_family_site(
+    analyzer: &dyn IAnalyzer,
+    value: &MemberFamilyValue,
+    cache: &mut PipelineRenderCache,
+) -> RenderedMemberFamilySite {
+    let file = value.file();
+    RenderedMemberFamilySite {
+        member_id: value.member_id.clone(),
+        path: rel_path_string(file),
+        range: render_source_range(analyzer, file, &value.member.range, cache),
+    }
+}
+
 pub(super) fn render_member_family(
     analyzer: &dyn IAnalyzer,
     value: &MemberFamilyValue,
@@ -1426,6 +1554,7 @@ pub(super) fn render_member_family(
     cache: &mut PipelineRenderCache,
 ) -> CodeQueryMemberFamily {
     let answer = &value.answer;
+    let site = render_member_family_site(analyzer, value, cache);
     let count = |relation: MethodFamilyRelation| {
         value
             .edges
@@ -1436,10 +1565,10 @@ pub(super) fn render_member_family(
     let file = value.file();
     CodeQueryMemberFamily {
         id: value.id(),
-        member_id: value.member_id.clone(),
-        path: rel_path_string(file),
+        member_id: site.member_id,
+        path: site.path,
         language: crate::analyzer::common::language_for_file(file).config_label(),
-        range: render_source_range(analyzer, file, &value.member.range, cache),
+        range: site.range,
         member: render_unit_declaration(analyzer, &value.member.unit, detail, cache),
         outcome: answer.outcome.label(),
         reason: answer.reason.map(|reason| reason.label()),
@@ -1468,12 +1597,12 @@ pub(super) fn render_member_family_edge(
 ) -> CodeQueryMemberFamilyEdge {
     let family = &value.family;
     let edge = value.edge();
-    let file = family.file();
+    let site = render_member_family_site(analyzer, family, cache);
     CodeQueryMemberFamilyEdge {
         id: value.id(),
-        member_id: family.member_id.clone(),
-        path: rel_path_string(file),
-        range: render_source_range(analyzer, file, &family.member.range, cache),
+        member_id: site.member_id,
+        path: site.path,
+        range: site.range,
         ordinal: value.ordinal,
         source: render_unit_declaration(analyzer, &family.member.unit, detail, cache),
         target_id: edge.target_id.clone(),
@@ -1492,12 +1621,12 @@ pub(super) fn render_member_family_ref(
     value: &MemberFamilyValue,
     cache: &mut PipelineRenderCache,
 ) -> CodeQueryResultRef {
-    let file = value.file();
+    let site = render_member_family_site(analyzer, value, cache);
     CodeQueryResultRef::MemberFamily {
         id: value.id(),
-        member_id: value.member_id.clone(),
-        path: rel_path_string(file),
-        range: render_source_range(analyzer, file, &value.member.range, cache),
+        member_id: site.member_id,
+        path: site.path,
+        range: site.range,
         outcome: value.answer.outcome.label(),
         coverage: member_family::family_coverage(value.answer.outcome),
     }
@@ -1509,14 +1638,159 @@ pub(super) fn render_member_family_edge_ref(
     cache: &mut PipelineRenderCache,
 ) -> CodeQueryResultRef {
     let family = &value.family;
-    let file = family.file();
+    let site = render_member_family_site(analyzer, family, cache);
     CodeQueryResultRef::MemberFamilyEdge {
         id: value.id(),
-        member_id: family.member_id.clone(),
-        path: rel_path_string(file),
-        range: render_source_range(analyzer, file, &family.member.range, cache),
+        member_id: site.member_id,
+        path: site.path,
+        range: site.range,
         ordinal: value.ordinal,
         relation: value.edge().relation.label(),
+    }
+}
+
+pub(super) fn render_python_hierarchy_fact(
+    analyzer: &dyn IAnalyzer,
+    value: &PythonHierarchyFactValue,
+    detail: CodeQueryResultDetail,
+    cache: &mut PipelineRenderCache,
+) -> CodeQueryPythonHierarchyFact {
+    let declaration = value
+        .declaration
+        .as_ref()
+        .and_then(|unit| render_unit_declaration(analyzer, unit, detail, cache));
+    let owner = value
+        .owner
+        .as_ref()
+        .and_then(|unit| render_unit_declaration(analyzer, unit, detail, cache));
+    let target = value
+        .target
+        .as_ref()
+        .and_then(|unit| render_unit_declaration(analyzer, unit, detail, cache));
+    let target_owner = value
+        .target_owner
+        .as_ref()
+        .and_then(|unit| render_unit_declaration(analyzer, unit, detail, cache));
+    let root = render_unit_declaration(analyzer, &value.root.unit, detail, cache);
+    CodeQueryPythonHierarchyFact {
+        id: value.id(),
+        root_id: value.root_id.clone(),
+        path: rel_path_string(value.file()),
+        language: crate::analyzer::common::language_for_file(value.file()).config_label(),
+        range: render_source_range(
+            analyzer,
+            value.file(),
+            &value.site_range.unwrap_or(value.root.range),
+            cache,
+        ),
+        root,
+        root_declaration_id: Some(value.root_id.clone()),
+        fact_kind: value.fact_kind,
+        outcome: value.outcome,
+        reason: value.reason,
+        coverage: value.coverage,
+        ordinal: value.ordinal,
+        base_spelling: value.base_spelling.clone(),
+        base_resolution: value.base_resolution,
+        declaration_id: value
+            .declaration
+            .as_ref()
+            .map(|unit| canonical_member_digest(analyzer, unit)),
+        declaration,
+        owner_id: value
+            .owner
+            .as_ref()
+            .map(|unit| canonical_member_digest(analyzer, unit)),
+        owner,
+        target_id: value
+            .target
+            .as_ref()
+            .map(|unit| canonical_member_digest(analyzer, unit)),
+        target,
+        target_owner_id: value
+            .target_owner
+            .as_ref()
+            .map(|unit| canonical_member_digest(analyzer, unit)),
+        target_owner,
+        member_name: value.member_name.clone(),
+        mro_rank: value.mro_rank,
+        target_non_trivial: value.target_non_trivial,
+        target_reads_self: value.target_reads_self,
+        base_branch_definition_count: value.base_branch_definition_count,
+        has_strict_ordering: value.has_strict_ordering,
+        has_non_strict_ordering: value.has_non_strict_ordering,
+        total_ordering_decorator: value.total_ordering_decorator,
+        inherited_ne_present: value.inherited_ne_present,
+        inherited_ne_delegates: value.inherited_ne_delegates,
+        source_signature_id: value
+            .override_signatures
+            .as_ref()
+            .map(|pair| pair.source.id.clone()),
+        source_signature_ordinal: value
+            .override_signatures
+            .as_ref()
+            .map(|pair| pair.source.ordinal),
+        source_signature_coverage: value
+            .override_signatures
+            .as_ref()
+            .map(|pair| pair.source.coverage),
+        source_required_arity: value
+            .override_signatures
+            .as_ref()
+            .and_then(|pair| pair.source.required_arity),
+        source_total_arity: value
+            .override_signatures
+            .as_ref()
+            .and_then(|pair| pair.source.total_arity),
+        source_repeated_arity: value
+            .override_signatures
+            .as_ref()
+            .and_then(|pair| pair.source.repeated),
+        target_signature_id: value
+            .override_signatures
+            .as_ref()
+            .and_then(|pair| pair.target.as_ref().map(|target| target.id.clone())),
+        target_signature_ordinal: value
+            .override_signatures
+            .as_ref()
+            .and_then(|pair| pair.target.as_ref().map(|target| target.ordinal)),
+        target_signature_coverage: value
+            .override_signatures
+            .as_ref()
+            .and_then(|pair| pair.target.as_ref().map(|target| target.coverage)),
+        target_required_arity: value.override_signatures.as_ref().and_then(|pair| {
+            pair.target
+                .as_ref()
+                .and_then(|target| target.required_arity)
+        }),
+        target_total_arity: value
+            .override_signatures
+            .as_ref()
+            .and_then(|pair| pair.target.as_ref().and_then(|target| target.total_arity)),
+        target_repeated_arity: value
+            .override_signatures
+            .as_ref()
+            .and_then(|pair| pair.target.as_ref().and_then(|target| target.repeated)),
+    }
+}
+
+pub(super) fn render_python_hierarchy_fact_ref(
+    analyzer: &dyn IAnalyzer,
+    value: &PythonHierarchyFactValue,
+    cache: &mut PipelineRenderCache,
+) -> CodeQueryResultRef {
+    CodeQueryResultRef::PythonHierarchyFact {
+        id: value.id(),
+        root_id: value.root_id.clone(),
+        path: rel_path_string(value.file()),
+        range: render_source_range(
+            analyzer,
+            value.file(),
+            &value.site_range.unwrap_or(value.root.range),
+            cache,
+        ),
+        fact_kind: value.fact_kind,
+        outcome: value.outcome,
     }
 }
 
@@ -1632,11 +1906,12 @@ pub(super) fn render_scope_ref(
     cache: &mut PipelineRenderCache,
 ) -> CodeQueryResultRef {
     let row = value.row();
+    let location = render_source_location(analyzer, &row.file, &row.range, cache);
     CodeQueryResultRef::LexicalScope {
         id: value.id(),
         ast_id: row.ast_id(),
-        path: rel_path_string(&row.file),
-        range: render_source_range(analyzer, &row.file, &row.range, cache),
+        path: location.path,
+        range: location.range,
         index: row.index,
     }
 }
@@ -1667,11 +1942,12 @@ pub(super) fn render_qualified_path_ref(
     cache: &mut PipelineRenderCache,
 ) -> CodeQueryResultRef {
     let row = value.row();
+    let location = render_source_location(analyzer, &row.file, &row.range, cache);
     CodeQueryResultRef::QualifiedPath {
         id: value.id(),
         ast_id: row.ast_id(),
-        path: rel_path_string(&row.file),
-        range: render_source_range(analyzer, &row.file, &row.range, cache),
+        path: location.path,
+        range: location.range,
         segment_count: row.segment_count,
     }
 }
@@ -1680,28 +1956,138 @@ pub(super) fn render_configuration_fact_ref(
     value: &ConfigurationFactValue,
     cache: &mut PipelineRenderCache,
 ) -> CodeQueryResultRef {
-    let fact = value.fact();
-    let evidence = fact.evidence();
-    let range = cache
-        .coordinates_for(&value.file, || Some(value.source.to_string()))
-        .map(|coordinates| {
-            range_for_offsets(
-                &coordinates.source,
-                &coordinates.line_starts,
-                evidence.start_byte(),
-                evidence.end_byte(),
-            )
-        })
-        .unwrap_or(CodeQueryRange {
-            start_line: 1,
-            start_column: 1,
-            end_line: 1,
-            end_column: 1,
-        });
+    let range = render_configuration_fact_range(value, cache);
     CodeQueryResultRef::ConfigurationFact {
         id: value.id(),
         fact_id: value.fact_id(),
         path: rel_path_string(&value.file),
+        range,
+    }
+}
+
+/// Render one cross-domain row with both nested rows rendered exactly as
+/// their own inputs would render them.
+pub(super) fn render_cross_domain(
+    analyzer: &dyn IAnalyzer,
+    value: CrossDomainValue,
+    detail: CodeQueryResultDetail,
+    cache: &mut PipelineRenderCache,
+) -> CodeQueryCrossDomain {
+    let id = value.id();
+    let code_id = value.code_id();
+    let configuration_id = value.configuration_id();
+    let operator = value.operator().operator_label();
+    let domain = value.domain_label();
+    let relation = value.relation_label();
+    let path = rel_path_string(value.anchor_file());
+    let mut mitigated = None;
+    let mut dependency_id = None;
+    let mut owner = None;
+    let mut mapping_id = None;
+    let mut effective_configuration = None;
+    let mut configuration_contributors = Vec::new();
+    let (code, configuration, key, binding) = match value {
+        CrossDomainValue::DependencyConfiguration(value) => {
+            mitigated = Some(value.mitigated);
+            dependency_id = code_id.clone();
+            owner = Some(value.owner);
+            mapping_id = Some(value.mapping_id);
+            effective_configuration = value
+                .effective
+                .as_ref()
+                .map(|effective| effective.as_ref().clone());
+            configuration_contributors = value
+                .contributors
+                .iter()
+                .map(|fact| render_configuration_fact(fact, cache))
+                .collect();
+            {
+                let binding = value
+                    .configuration
+                    .as_ref()
+                    .map(|_| super::cross_domain::CrossDomainBinding::Unique);
+                (Some(*value.code), value.configuration, None, binding)
+            }
+        }
+        CrossDomainValue::Correlated {
+            code,
+            configuration,
+            key,
+            binding,
+        } => (Some(*code), Some(configuration), Some(key), Some(binding)),
+        CrossDomainValue::ConfigurationCode {
+            code,
+            configuration,
+            key,
+            binding,
+        } => (Some(*code), Some(configuration), Some(key), Some(binding)),
+        CrossDomainValue::ConfigurationCodeAbsent { configuration, key } => {
+            (None, Some(configuration), Some(key), None)
+        }
+        CrossDomainValue::CodeWitness(code) => (Some(*code), None, None, None),
+        CrossDomainValue::ConfigurationWitness(configuration) => {
+            (None, Some(configuration), None, None)
+        }
+    };
+    let code_path = code.as_ref().map(|_| path.clone());
+    // The row's anchor is the code row's exact byte span, rendered through
+    // the same retained source coordinates as every other row.
+    let code_range = code.as_ref().map(|code| {
+        if let PipelineValue::DependencyEvidence(dependency) = code {
+            return dependency.display_range();
+        }
+        let evidence = detailed_evidence_for_pipeline_value(
+            0,
+            code,
+            None,
+            pipeline_export_binding_range(code, cache),
+        );
+        let span = evidence.byte_span?;
+        cache
+            .coordinates_for(&evidence.file, || analyzer.indexed_source(&evidence.file))
+            .map(|coordinates| {
+                range_for_offsets(
+                    &coordinates.source,
+                    &coordinates.line_starts,
+                    span.start,
+                    span.end,
+                )
+            })
+    });
+    let configuration_path = configuration
+        .as_ref()
+        .map(|configuration| rel_path_string(configuration.file()));
+    let code = code.map(|code| {
+        let value = pipeline_trace_value(&code).expect("every code row has a provenance value");
+        render_trace_value_ref(analyzer, &value, detail, cache)
+    });
+    let configuration = configuration
+        .map(|configuration| Box::new(render_configuration_fact(&configuration, cache)));
+    let range = match (&code_range, &configuration) {
+        (Some(range), _) => *range,
+        (None, Some(configuration)) => Some(configuration.range),
+        (None, None) => unreachable!("every cross-domain row carries at least one input row"),
+    };
+    CodeQueryCrossDomain {
+        id,
+        operator,
+        domain,
+        relation,
+        binding: binding.map(super::cross_domain::CrossDomainBinding::label),
+        key,
+        code_id,
+        code_path,
+        code,
+        configuration_id,
+        configuration_path,
+        configuration,
+        mitigated,
+        dependency_id,
+        owner,
+        mapping_id,
+        effective_configuration,
+        configuration_contributors,
+        path,
         range,
     }
 }
@@ -1712,22 +2098,7 @@ pub(super) fn render_configuration_fact(
 ) -> CodeQueryConfigurationFact {
     let fact = value.fact();
     let evidence = fact.evidence();
-    let range = cache
-        .coordinates_for(&value.file, || Some(value.source.to_string()))
-        .map(|coordinates| {
-            range_for_offsets(
-                &coordinates.source,
-                &coordinates.line_starts,
-                evidence.start_byte(),
-                evidence.end_byte(),
-            )
-        })
-        .unwrap_or(CodeQueryRange {
-            start_line: 1,
-            start_column: 1,
-            end_line: 1,
-            end_column: 1,
-        });
+    let range = render_configuration_fact_range(value, cache);
     let format = value.format();
     let (role, key, occurrence) = match fact.kind() {
         ConfigurationNodeKind::Member { role, key, .. } => {
@@ -1779,8 +2150,9 @@ pub(super) fn render_configuration_fact(
         path: rel_path_string(&value.file),
         format: format.label(),
         node_kind: node_kind_label(fact.kind()),
-        role: role.map(role_label),
-        scalar_kind: scalar_kind.map(scalar_kind_label),
+        role: role.map(crate::query::schema::configuration_member_role_label),
+        scalar_kind: scalar_kind.map(crate::query::schema::configuration_scalar_kind_label),
+        value: value.scalar_value(),
         provenance: "authored",
         completeness: match value.completeness() {
             crate::query::ConfigurationCompletenessFilter::Complete => "complete",
@@ -1797,6 +2169,29 @@ pub(super) fn render_configuration_fact(
     }
 }
 
+fn render_configuration_fact_range(
+    value: &ConfigurationFactValue,
+    cache: &mut PipelineRenderCache,
+) -> CodeQueryRange {
+    let evidence = value.fact().evidence();
+    cache
+        .coordinates_for(&value.file, || Some(value.source.to_string()))
+        .map(|coordinates| {
+            range_for_offsets(
+                &coordinates.source,
+                &coordinates.line_starts,
+                evidence.start_byte(),
+                evidence.end_byte(),
+            )
+        })
+        .unwrap_or(CodeQueryRange {
+            start_line: 1,
+            start_column: 1,
+            end_line: 1,
+            end_column: 1,
+        })
+}
+
 fn node_kind_label(kind: &ConfigurationNodeKind) -> &'static str {
     match kind {
         ConfigurationNodeKind::Document { .. } => "document",
@@ -1808,40 +2203,18 @@ fn node_kind_label(kind: &ConfigurationNodeKind) -> &'static str {
     }
 }
 
-fn role_label(role: ConfigurationMemberRole) -> &'static str {
-    match role {
-        ConfigurationMemberRole::ObjectMember => "object-member",
-        ConfigurationMemberRole::TableEntry => "table-entry",
-        ConfigurationMemberRole::Property => "property",
-        ConfigurationMemberRole::XmlAttribute => "xml-attribute",
-        ConfigurationMemberRole::XmlElement => "xml-element",
-    }
-}
-
-fn scalar_kind_label(scalar_kind: ConfigurationScalarKind) -> &'static str {
-    match scalar_kind {
-        ConfigurationScalarKind::String => "string",
-        ConfigurationScalarKind::Boolean => "boolean",
-        ConfigurationScalarKind::Integer => "integer",
-        ConfigurationScalarKind::Decimal => "decimal",
-        ConfigurationScalarKind::Null => "null",
-        ConfigurationScalarKind::Url => "url",
-        ConfigurationScalarKind::Duration => "duration",
-        ConfigurationScalarKind::Opaque => "opaque",
-    }
-}
-
 pub(super) fn render_path_segment_ref(
     analyzer: &dyn IAnalyzer,
     value: &SegmentValue,
     cache: &mut PipelineRenderCache,
 ) -> CodeQueryResultRef {
     let row = value.row();
+    let location = render_source_location(analyzer, &row.file, &row.range, cache);
     CodeQueryResultRef::PathSegment {
         id: value.id(),
         ast_id: row.ast_id(),
-        path: rel_path_string(&row.file),
-        range: render_source_range(analyzer, &row.file, &row.range, cache),
+        path: location.path,
+        range: location.range,
         ordinal: row.ordinal,
         text: row.text.clone(),
     }
@@ -1853,11 +2226,12 @@ pub(super) fn render_binding_ref(
     cache: &mut PipelineRenderCache,
 ) -> CodeQueryResultRef {
     let row = value.row();
+    let location = render_source_location(analyzer, &row.file, &row.range, cache);
     CodeQueryResultRef::Binding {
         id: value.id(),
         ast_id: row.ast_id(),
-        path: rel_path_string(&row.file),
-        range: render_source_range(analyzer, &row.file, &row.range, cache),
+        path: location.path,
+        range: location.range,
         name: row.name.clone(),
         kind: row.kind.label(),
     }
@@ -1885,11 +2259,12 @@ pub(super) fn render_occurrence_ref(
     cache: &mut PipelineRenderCache,
 ) -> CodeQueryResultRef {
     let row = &value.row;
+    let location = render_source_location(analyzer, &row.file, &row.range, cache);
     CodeQueryResultRef::Occurrence {
         id: row.id(),
         ast_id: row.ast_id(),
-        path: rel_path_string(&row.file),
-        range: render_source_range(analyzer, &row.file, &row.range, cache),
+        path: location.path,
+        range: location.range,
         class: row.class.label(),
         role: row.role.label(),
         namespace: row.namespace.label(),
@@ -1902,10 +2277,19 @@ pub(super) fn render_declaration(
     detail: CodeQueryResultDetail,
     cache: &mut PipelineRenderCache,
 ) -> CodeQueryDeclaration {
-    let path = rel_path_string(declaration.unit.source());
-    let fq_name = declaration.unit.fq_name();
-    let kind = declaration.kind_label();
-    let full = !detail.is_compact();
+    let CodeQueryResultRef::Declaration {
+        id,
+        site_id,
+        path,
+        kind,
+        fq_name,
+        start_line,
+        end_line,
+        node_range,
+    } = render_declaration_ref(analyzer, declaration, detail, cache)
+    else {
+        unreachable!("declaration reference renderer returns its declaration variant")
+    };
     let signature = declaration
         .unit
         .signature()
@@ -1913,19 +2297,17 @@ pub(super) fn render_declaration(
         .or_else(|| analyzer.signatures_of(&declaration.unit).into_iter().next());
     let semantic_model = exact_semantic_model_declaration(analyzer, declaration, &path, &fq_name);
     CodeQueryDeclaration {
-        id: full.then(|| declaration.declaration_id()),
-        site_id: full.then(|| declaration.site_id()),
+        id,
+        site_id,
         path,
         language: crate::analyzer::common::language_for_file(declaration.unit.source())
             .config_label(),
         kind,
         fq_name,
-        start_line: declaration.range.start_line,
-        end_line: declaration.range.end_line,
+        start_line,
+        end_line,
         signature,
-        node_range: full
-            .then(|| cache.range_for_declaration(analyzer, declaration))
-            .flatten(),
+        node_range,
         semantic_model: semantic_model.map(|(_, provenance)| provenance),
     }
 }
@@ -2286,18 +2668,19 @@ pub(super) fn render_reference_site(
     detail: CodeQueryResultDetail,
     cache: &mut PipelineRenderCache,
 ) -> CodeQueryReferenceSite {
+    let metadata = render_reference_site_metadata(analyzer, site, cache);
     CodeQueryReferenceSite {
-        path: rel_path_string(&site.file),
+        path: metadata.path,
         language: crate::analyzer::common::language_for_file(&site.file).config_label(),
-        range: render_reference_range(analyzer, site, cache),
+        range: metadata.range,
         target: render_declaration(analyzer, &site.target, detail, cache),
         enclosing_declaration: site
             .enclosing
             .as_ref()
             .map(|declaration| render_declaration(analyzer, declaration, detail, cache)),
         usage_kind: site.usage_kind.wire_label(),
-        proof: usage_proof_label(site.proof),
-        reference_kind: site.reference_kind.map(reference_kind_label),
+        proof: metadata.proof,
+        reference_kind: metadata.reference_kind,
     }
 }
 
@@ -2310,6 +2693,8 @@ pub(super) fn render_call_site(
     let caller = declaration_value_for_unit(analyzer, &site.0.caller, site.0.range);
     let callee = declaration_value_for_unit(analyzer, &site.0.callee, site.0.callee_range);
     CodeQueryCallSite {
+        site_id: site.4.clone(),
+        program_point_id: site.3.clone(),
         path: rel_path_string(&site.0.file),
         language: crate::analyzer::common::language_for_file(&site.0.file).config_label(),
         range: render_source_range(analyzer, &site.0.file, &site.0.range, cache),
@@ -2318,6 +2703,14 @@ pub(super) fn render_call_site(
         callee: render_declaration(analyzer, &callee, detail, cache),
         call_kind: call_syntax_kind_label(site.0.kind),
         proof: usage_proof_label(site.0.proof),
+        receiver_kind: site.5.receiver_kind,
+        argument_identity: site.5.argument_identities.first().cloned().flatten(),
+        caller_parameter_identity: site
+            .5
+            .caller_parameter_identities
+            .first()
+            .cloned()
+            .flatten(),
         receiver: site
             .0
             .receiver
@@ -2327,7 +2720,8 @@ pub(super) fn render_call_site(
             .0
             .arguments
             .iter()
-            .map(|argument| CodeQueryCallArgument {
+            .enumerate()
+            .map(|(index, argument)| CodeQueryCallArgument {
                 range: render_source_range(analyzer, &site.0.file, &argument.range, cache),
                 name: argument.name.clone(),
                 position: argument.position,
@@ -2335,6 +2729,13 @@ pub(super) fn render_call_site(
                 formal_name: argument.formal_name.clone(),
                 variadic: argument.variadic,
                 spread: argument.spread,
+                identity: site.5.argument_identities.get(index).cloned().flatten(),
+                caller_parameter_identity: site
+                    .5
+                    .caller_parameter_identities
+                    .get(index)
+                    .cloned()
+                    .flatten(),
             })
             .collect(),
     }
@@ -2345,6 +2746,16 @@ pub(super) fn render_expression_site(
     site: &ExpressionSiteValue,
     cache: &mut PipelineRenderCache,
 ) -> CodeQueryExpressionSite {
+    let CodeQueryResultRef::ExpressionSite {
+        path,
+        range,
+        input_kind,
+        parameter_index,
+        parameter_name,
+    } = render_expression_site_ref(analyzer, site, cache)
+    else {
+        unreachable!("expression-site reference renderer returns its expression-site variant")
+    };
     let file = &site.call_site.0.file;
     let text = cache
         .coordinates_for(file, || analyzer.indexed_source(file))
@@ -2355,11 +2766,10 @@ pub(super) fn render_expression_site(
         })
         .map(snippet)
         .unwrap_or_default();
-    let (input_kind, parameter_index, parameter_name) = expression_input_parts(&site.input);
     CodeQueryExpressionSite {
-        path: rel_path_string(file),
+        path,
         language: crate::analyzer::common::language_for_file(file).config_label(),
-        range: render_source_range(analyzer, file, &site.range, cache),
+        range,
         text,
         input_kind,
         parameter_index,
@@ -2440,6 +2850,7 @@ pub(super) fn render_receiver_analysis(
     detail: CodeQueryResultDetail,
     cache: &mut PipelineRenderCache,
 ) -> CodeQueryReceiverAnalysis {
+    let site = render_receiver_site(analyzer, value, cache);
     let fallback = value.report.site.range;
     let (outcome, values, member_targets, reason, limit) = match &value.report.analysis {
         ReceiverQueryAnalysis::Values(outcome) => {
@@ -2458,17 +2869,12 @@ pub(super) fn render_receiver_analysis(
         }
     };
     CodeQueryReceiverAnalysis {
-        site_id: value.site_id.clone(),
-        site_ast_id: value.site_ast_id.clone(),
-        analysis_kind: value.report.operation.as_str(),
-        path: rel_path_string(&value.report.site.file),
-        language: value.report.site.language.config_label(),
-        range: render_source_range(
-            analyzer,
-            &value.report.site.file,
-            &value.report.site.range,
-            cache,
-        ),
+        site_id: site.site_id,
+        site_ast_id: site.site_ast_id,
+        analysis_kind: site.analysis_kind,
+        path: site.path,
+        language: site.language,
+        range: site.range,
         text: snippet(&value.report.site.text),
         input_kind: value.report.site.syntax_kind.clone(),
         capture: value.capture.clone(),
@@ -2486,6 +2892,7 @@ pub(super) fn render_member_target_analysis(
     detail: CodeQueryResultDetail,
     cache: &mut PipelineRenderCache,
 ) -> CodeQueryMemberTargetAnalysis {
+    let site = render_receiver_site(analyzer, value, cache);
     let ReceiverQueryAnalysis::MemberTargets(outcome) = &value.report.analysis else {
         unreachable!("member-target rows carry member-target analysis");
     };
@@ -2498,18 +2905,13 @@ pub(super) fn render_member_target_analysis(
         })
         .collect();
     let (outcome, reason, limit) = receiver_outcome_metadata(outcome);
-    let coverage = render_receiver_outcome(analyzer, value, cache).coverage;
+    let coverage = receiver_coverage(value, outcome);
     CodeQueryMemberTargetAnalysis {
-        site_id: value.site_id.clone(),
-        site_ast_id: value.site_ast_id.clone(),
-        path: rel_path_string(&value.report.site.file),
-        language: value.report.site.language.config_label(),
-        receiver_range: render_source_range(
-            analyzer,
-            &value.report.site.file,
-            &value.report.site.range,
-            cache,
-        ),
+        site_id: site.site_id,
+        site_ast_id: site.site_ast_id,
+        path: site.path,
+        language: site.language,
+        receiver_range: site.range,
         member_range: value
             .report
             .member_range
@@ -2763,18 +3165,19 @@ fn model_symbol_kind_label(
     kind: crate::analyzer::semantic_model::SemanticModelSymbolKind,
 ) -> &'static str {
     use crate::analyzer::semantic_model::SemanticModelSymbolKind as Kind;
+    use crate::analyzer::semantic_model::TypeKind;
     match kind {
-        Kind::Class => "class",
-        Kind::Annotation => "annotation",
-        Kind::Delegate => "delegate",
-        Kind::Interface => "interface",
-        Kind::Trait => "trait",
-        Kind::Struct => "struct",
-        Kind::Union => "union",
-        Kind::Enum => "enum",
-        Kind::Record => "record",
-        Kind::Module => "module",
-        Kind::TypeAlias => "type_alias",
+        Kind::Class => TypeKind::Class.stable_label(),
+        Kind::Annotation => TypeKind::Annotation.stable_label(),
+        Kind::Delegate => TypeKind::Delegate.stable_label(),
+        Kind::Interface => TypeKind::Interface.stable_label(),
+        Kind::Trait => TypeKind::Trait.stable_label(),
+        Kind::Struct => TypeKind::Struct.stable_label(),
+        Kind::Union => TypeKind::Union.stable_label(),
+        Kind::Enum => TypeKind::Enum.stable_label(),
+        Kind::Record => TypeKind::Record.stable_label(),
+        Kind::Module => TypeKind::Module.stable_label(),
+        Kind::TypeAlias => TypeKind::TypeAlias.stable_label(),
         Kind::Constructor => "constructor",
         Kind::Method => "method",
         Kind::Function => "function",
@@ -2798,16 +3201,33 @@ pub(super) const RECEIVER_COVERAGE_LABELS: &[&str] =
 /// evidence row is `precise` exactly when its site's analysis was precise.
 pub(super) const RECEIVER_EVIDENCE_PROOF_LABELS: &[&str] = &["precise", "ambiguous"];
 
-pub(super) fn render_receiver_outcome(
+struct RenderedReceiverSite {
+    site_id: String,
+    site_ast_id: Option<String>,
+    path: String,
+    language: &'static str,
+    range: CodeQueryRange,
+    analysis_kind: &'static str,
+}
+
+fn render_receiver_site(
     analyzer: &dyn IAnalyzer,
     value: &ReceiverAnalysisValue,
     cache: &mut PipelineRenderCache,
-) -> CodeQueryReceiverOutcome {
-    let (outcome, reason, limit) = match &value.report.analysis {
-        ReceiverQueryAnalysis::Values(outcome) => receiver_outcome_metadata(outcome),
-        ReceiverQueryAnalysis::MemberTargets(outcome) => receiver_outcome_metadata(outcome),
-    };
-    let coverage = if outcome == "unsupported" {
+) -> RenderedReceiverSite {
+    let site = &value.report.site;
+    RenderedReceiverSite {
+        site_id: value.site_id.clone(),
+        site_ast_id: value.site_ast_id.clone(),
+        path: rel_path_string(&site.file),
+        language: site.language.config_label(),
+        range: render_source_range(analyzer, &site.file, &site.range, cache),
+        analysis_kind: value.report.operation.as_str(),
+    }
+}
+
+fn receiver_coverage(value: &ReceiverAnalysisValue, outcome: &str) -> &'static str {
+    if outcome == "unsupported" {
         "unsupported"
     } else if outcome == "exceeded_budget" || value.report.candidates_truncated {
         "truncated"
@@ -2817,20 +3237,28 @@ pub(super) fn render_receiver_outcome(
         "unknown"
     } else {
         "exhaustive"
+    }
+}
+
+pub(super) fn render_receiver_outcome(
+    analyzer: &dyn IAnalyzer,
+    value: &ReceiverAnalysisValue,
+    cache: &mut PipelineRenderCache,
+) -> CodeQueryReceiverOutcome {
+    let (outcome, reason, limit) = match &value.report.analysis {
+        ReceiverQueryAnalysis::Values(outcome) => receiver_outcome_metadata(outcome),
+        ReceiverQueryAnalysis::MemberTargets(outcome) => receiver_outcome_metadata(outcome),
     };
+    let coverage = receiver_coverage(value, outcome);
+    let site = render_receiver_site(analyzer, value, cache);
     CodeQueryReceiverOutcome {
-        id: value.site_id.clone(),
-        site_id: value.site_id.clone(),
-        site_ast_id: value.site_ast_id.clone(),
-        path: rel_path_string(&value.report.site.file),
-        language: value.report.site.language.config_label(),
-        range: render_source_range(
-            analyzer,
-            &value.report.site.file,
-            &value.report.site.range,
-            cache,
-        ),
-        analysis_kind: value.report.operation.as_str(),
+        id: site.site_id.clone(),
+        site_id: site.site_id,
+        site_ast_id: site.site_ast_id,
+        path: site.path,
+        language: site.language,
+        range: site.range,
+        analysis_kind: site.analysis_kind,
         outcome,
         coverage,
         candidate_count: receiver_candidate_count(&value.report),
@@ -2861,6 +3289,7 @@ pub(super) fn render_call_shape(
             .callee_range
             .map(|range| render_source_range(analyzer, &outcome.file, &range, cache)),
         callee_name: outcome.callee_name.clone(),
+        resolved_external_callee: value.resolved_external_callee.clone(),
         call_kind: outcome.call_kind.label(),
         coverage: outcome.coverage.label(),
         group_count: value.report.groups.len(),
@@ -2901,6 +3330,7 @@ pub(super) fn render_call_shape_argument(
         range: render_source_range(analyzer, &outcome.file, &argument.range, cache),
         argument_index: argument.argument_index,
         name: argument.name.clone(),
+        literal_value: argument.literal_value.clone(),
         spread: argument.spread,
     }
 }
@@ -2928,15 +3358,46 @@ pub(super) fn render_call_binding(
     );
     let provenance = value.site.semantic_model_provenance.as_deref();
     let summary = value.site.selector.summary_provenance.as_deref();
+    let binding_id = value.site.binding_ids.get(value.index).cloned().flatten();
+    let literal_value = row.argument_id.as_ref().and_then(|argument_id| {
+        let argument = value
+            .site
+            .shape
+            .report
+            .arguments
+            .iter()
+            .find(|argument| &argument.id == argument_id)?;
+        value
+            .site
+            .shape
+            .facts
+            .as_ref()?
+            .nodes()
+            .iter()
+            .find_map(|node| {
+                (node.kind == NormalizedKind::StringLiteral && node.range == argument.range)
+                    .then(|| node.string_value.clone())
+                    .flatten()
+            })
+    });
     CodeQueryCallBinding {
         id: row.id.clone(),
         site_id: row.site_id.clone(),
         site_ast_id: report.site_ast_id.clone(),
+        program_point_id: value.site.program_point_id.clone(),
         path: rel_path_string(&report.file),
         language: crate::analyzer::common::language_for_file(&report.file).config_label(),
         range: render_source_range(analyzer, &report.file, &row.range, cache),
         group_id: row.group_id.clone(),
         argument_id: row.argument_id.clone(),
+        binding_id,
+        literal_value,
+        path_identity: value
+            .site
+            .path_identities
+            .get(value.index)
+            .cloned()
+            .flatten(),
         target: value
             .site
             .target
@@ -2962,8 +3423,7 @@ pub(super) fn render_call_binding(
         selector_summary_record_id: summary.map(|value| value.record_id.clone()),
         selector_summary_origin: summary.map(|value| semantic_model_origin_label(value.origin)),
         selector_summary_model_proof: summary.map(|value| semantic_model_proof_label(value.proof)),
-        selector_summary_completeness: summary
-            .map(|value| semantic_model_completeness_label(value.completeness)),
+        selector_summary_completeness: summary.map(|value| value.completeness.label()),
         selector_summary_producer: summary.map(|value| value.producer.clone()),
         selector_summary_producer_version: summary.map(|value| value.producer_version.clone()),
         signature_id: value.site.signature_id.clone(),
@@ -2982,8 +3442,7 @@ pub(super) fn render_call_binding(
         model_activation_source_id: provenance.map(|value| value.activation.source_id.clone()),
         model_origin: provenance.map(|value| semantic_model_origin_label(value.origin)),
         model_proof: provenance.map(|value| semantic_model_proof_label(value.proof)),
-        model_completeness: provenance
-            .map(|value| semantic_model_completeness_label(value.completeness)),
+        model_completeness: provenance.map(|value| value.completeness.label()),
         model_ambiguous: provenance.map(|value| value.ambiguous),
         model_producer: provenance.map(|value| value.producer.clone()),
         model_producer_version: provenance.map(|value| value.producer_version.clone()),
@@ -3047,6 +3506,11 @@ pub(super) fn render_call_effect(
         arm_count: report.arm_count,
         modeled_arm_count: report.modeled_arm_count,
         terminal: row.terminal,
+        captures: value
+            .seed
+            .as_ref()
+            .map(|seed| render_captures(&seed.fact_match, detail))
+            .unwrap_or_default(),
     }
 }
 
@@ -3115,7 +3579,10 @@ pub(super) fn render_call_result_obligation(
         result_ordinal: value.result_ordinal,
         obligation_kind: value.obligation_kind,
         failure_predicate: value.failure_predicate,
+        provenance: value.provenance,
+        obligation_basis: value.obligation_basis,
         result_use: value.result_use,
+        result_use_detail: value.result_use_detail,
         coverage: value.coverage.label(),
         reason: value.reason,
         pack_id: value.pack_id.clone(),
@@ -3253,129 +3720,6 @@ pub(super) fn render_assignment_relation(
     }
 }
 
-pub(super) fn render_concurrent_access_conflict(
-    analyzer: &dyn IAnalyzer,
-    value: &concurrency::ConcurrentAccessConflictValue,
-    cache: &mut PipelineRenderCache,
-) -> CodeQueryConcurrentAccessConflict {
-    use brokk_bifrost_flow::concurrency::{
-        ConcurrencyOpenReason, ConcurrentAccessMode, ConcurrentOrdering, ConcurrentProtection,
-        ConcurrentTaskRelation,
-    };
-    let access = |mode| match mode {
-        ConcurrentAccessMode::Read => "read",
-        ConcurrentAccessMode::Write => "write",
-    };
-    let relation = match value.conflict.task_relation {
-        ConcurrentTaskRelation::ParentChild => "parent_child",
-        ConcurrentTaskRelation::Siblings => "siblings",
-        ConcurrentTaskRelation::Nested => "nested",
-        ConcurrentTaskRelation::Repeated => "repeated",
-    };
-    let ordering = match value.conflict.ordering {
-        ConcurrentOrdering::Unordered => "unordered",
-        ConcurrentOrdering::HappensBefore => "happens_before",
-        ConcurrentOrdering::Open => "open",
-    };
-    let protection = match value.conflict.protection {
-        ConcurrentProtection::Unprotected => "unprotected",
-        ConcurrentProtection::CompatibleLock => "compatible_lock",
-        ConcurrentProtection::AtomicOnly => "atomic_only",
-        ConcurrentProtection::Open => "open",
-    };
-    let reason = |reason: &ConcurrencyOpenReason| match reason {
-        ConcurrencyOpenReason::UnresolvedTarget => "unresolved_target".to_owned(),
-        ConcurrencyOpenReason::AmbiguousTarget => "ambiguous_target".to_owned(),
-        ConcurrencyOpenReason::UnknownLocation => "unknown_location".to_owned(),
-        ConcurrencyOpenReason::AliasSetTruncated => "alias_set_truncated".to_owned(),
-        ConcurrencyOpenReason::UnknownOwnership => "unknown_ownership".to_owned(),
-        ConcurrencyOpenReason::UnknownPublication => "unknown_publication".to_owned(),
-        ConcurrencyOpenReason::AmbiguousSynchronization => "ambiguous_synchronization".to_owned(),
-        ConcurrencyOpenReason::UnsupportedSynchronization(protocol) => {
-            format!("unsupported_synchronization:{protocol}")
-        }
-        ConcurrencyOpenReason::IncompleteControlFlow(detail) => {
-            format!("incomplete_control_flow:{detail}")
-        }
-        ConcurrencyOpenReason::RecursiveExpansion => "recursive_expansion".to_owned(),
-        ConcurrencyOpenReason::BudgetExhausted => "budget_exhausted".to_owned(),
-        ConcurrencyOpenReason::UnmodeledMemory(capability) => {
-            format!("unmodeled_memory:{capability}")
-        }
-    };
-    let mut unresolved_calls = value
-        .unresolved_calls
-        .iter()
-        .map(|call| CodeQueryUnresolvedCall {
-            callee: call.callee.clone(),
-            reason: call.reason.clone(),
-            path: rel_path_string(&call.file),
-            range: render_source_range(analyzer, &call.file, &call.range, cache),
-        })
-        .collect::<Vec<_>>();
-    unresolved_calls.sort_by_key(|call| {
-        (
-            call.path.clone(),
-            call.range.start_line,
-            call.range.start_column,
-            call.range.end_line,
-            call.range.end_column,
-            call.callee.clone(),
-            call.reason.clone(),
-        )
-    });
-    unresolved_calls.dedup();
-    CodeQueryConcurrentAccessConflict {
-        id: value.id.clone(),
-        root_procedure_id: value.root_procedure_id.clone(),
-        ast_id: value.ast_id.clone(),
-        path: rel_path_string(&value.file),
-        language: crate::analyzer::common::language_for_file(&value.file).config_label(),
-        range: render_source_range(analyzer, &value.file, &value.range, cache),
-        location_id: value.conflict.location.identity.to_string(),
-        location_kind: value.conflict.location.kind.to_string(),
-        first_procedure_id: super::semantic::procedure_wire_id(&value.conflict.first.procedure),
-        first_point_id: value.conflict.first.point.get(),
-        first_access: access(value.conflict.first.mode),
-        first_path: rel_path_string(&value.first_file),
-        first_range: render_source_range(analyzer, &value.first_file, &value.first_range, cache),
-        first_start_byte: value.first_range.start_byte,
-        first_end_byte: value.first_range.end_byte,
-        second_procedure_id: super::semantic::procedure_wire_id(&value.conflict.second.procedure),
-        second_point_id: value.conflict.second.point.get(),
-        second_access: access(value.conflict.second.mode),
-        second_path: rel_path_string(&value.second_file),
-        second_range: render_source_range(analyzer, &value.second_file, &value.second_range, cache),
-        second_start_byte: value.second_range.start_byte,
-        second_end_byte: value.second_range.end_byte,
-        task_relation: relation,
-        ordering,
-        protection,
-        verdict: if value.conflict.ordering == ConcurrentOrdering::HappensBefore {
-            "ordered"
-        } else if matches!(
-            value.conflict.protection,
-            ConcurrentProtection::CompatibleLock | ConcurrentProtection::AtomicOnly
-        ) {
-            "protected"
-        } else {
-            "conflict"
-        },
-        proof: if value.conflict.proven {
-            "proven"
-        } else {
-            "open"
-        },
-        coverage: if value.conflict.exhaustive {
-            "exhaustive"
-        } else {
-            "open"
-        },
-        reasons: value.conflict.reasons.iter().map(reason).collect(),
-        unresolved_calls,
-    }
-}
-
 pub(super) fn render_class_set_row(
     analyzer: &dyn IAnalyzer,
     value: &type_flow::ClassSetRowValue,
@@ -3432,7 +3776,10 @@ pub(super) fn render_absent_member_finding(
     let origin_range = render_source_range(analyzer, &root.origin_file, &root.origin_range, cache);
     let (remainders, condition) = match &value.proof {
         AbsentMemberProof::Proven => (Vec::new(), None),
-        AbsentMemberProof::Conditional { remainders } => {
+        AbsentMemberProof::Conditional {
+            remainders,
+            unbounded_dynamic_writes,
+        } => {
             let origin = format!("{origin_file}:{}", origin_range.start_line);
             let admission = if root.origin_is_guard {
                 format!("which the guard at {origin} admits")
@@ -3441,18 +3788,45 @@ pub(super) fn render_absent_member_finding(
             };
             let class = &value.class;
             let member = &value.member;
-            let condition = match absent_member_receiver_text(analyzer, value, cache) {
-                Some(receiver) => format!(
-                    "if `{receiver}` is a `{class}`, {admission}, then `{receiver}.{member}` fails"
-                ),
-                None => format!(
-                    "if the receiver is a `{class}`, {admission}, then the access to `{member}` fails"
-                ),
+            let mut condition = if root.origin_kind
+                == crate::analyzer::semantic::SourceSiteKind::DeclaredParameter
+            {
+                match absent_member_receiver_text(analyzer, value, cache) {
+                    Some(receiver) => format!(
+                        "if `{receiver}` has type `{}` (as annotated; no workspace subclass of `{}` exists), then `{receiver}.{member}` fails",
+                        value.class_name, value.class_name
+                    ),
+                    None => format!(
+                        "if the receiver has type `{}` (as annotated; no workspace subclass of `{}` exists), then the access to `{member}` fails",
+                        value.class_name, value.class_name
+                    ),
+                }
+            } else {
+                match absent_member_receiver_text(analyzer, value, cache) {
+                    Some(receiver) => format!(
+                        "if `{receiver}` is a `{class}`, {admission}, then `{receiver}.{member}` fails"
+                    ),
+                    None => format!(
+                        "if the receiver is a `{class}`, {admission}, then the access to `{member}` fails"
+                    ),
+                }
             };
-            (
-                remainders.iter().map(ToString::to_string).collect(),
-                Some(condition),
-            )
+            let mut rendered_remainders = remainders
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>();
+            if !unbounded_dynamic_writes.is_empty() {
+                let sites = unbounded_dynamic_writes
+                    .iter()
+                    .map(|write| write.location())
+                    .collect::<Vec<_>>();
+                rendered_remainders.push(format!("unbounded_dynamic_write:{}", sites.join(", ")));
+                condition.push_str(&format!(
+                    " unless one of the dynamic writes at {} installs `{member}`",
+                    sites.join(", ")
+                ));
+            }
+            (rendered_remainders, Some(condition))
         }
     };
     CodeQueryAbsentMemberFinding {
@@ -3566,7 +3940,7 @@ pub(super) fn render_procedure_effect(
     CodeQueryProcedureEffect {
         id: row.id.clone(),
         procedure_id: row.procedure_declaration_id.clone(),
-        site_id: declaration.site_id(),
+        site_id: value.subject.site_id.clone(),
         procedure_name: row.procedure_name.clone(),
         path: rel_path_string(declaration.unit.source()),
         language: crate::analyzer::common::language_for_file(declaration.unit.source())
@@ -3574,7 +3948,7 @@ pub(super) fn render_procedure_effect(
         range: render_source_range(
             analyzer,
             declaration.unit.source(),
-            &declaration.range,
+            &value.subject.range,
             cache,
         ),
         effect_id: row.effect_id.clone(),
@@ -3619,15 +3993,65 @@ pub(super) fn render_callable_signature(
         ordinal: signature.ordinal,
         coverage: signature.coverage.label(),
         role: signature.role.label(),
+        first_parameter: value
+            .report
+            .parameters
+            .first()
+            .map(|parameter| parameter.label.clone()),
         label: signature.label.clone(),
         required_arity: signature.arity.map(CallableArity::required),
         total_arity: signature.arity.map(CallableArity::total),
         repeated: signature.arity.is_some_and(CallableArity::is_repeated),
         generic_arity: signature.generic_arity,
         receiver_contract: signature.receiver_contract.map(|contract| contract.label()),
+        python_method_kind: value.python_receiver.kind,
+        python_owner_is_metaclass: value.python_receiver.owner_is_metaclass,
+        python_owner_is_zope_interface: value.python_receiver.owner_is_zope_interface,
+        python_used_in_class_body: value.python_receiver.used_in_class_body,
+        python_no_args_with_decorator: value.python_receiver.no_args_with_decorator,
         return_type: signature.return_type.clone(),
         declaration_only: signature.declaration_only,
         parameter_count: signature.parameter_count,
+        special_method_status: value.python_special_method.map(|contract| contract.status),
+        special_method_expected_minimum: value
+            .python_special_method
+            .and_then(|contract| contract.expected_minimum),
+        special_method_expected_maximum: value
+            .python_special_method
+            .and_then(|contract| contract.expected_maximum),
+        special_method_reason: value
+            .python_special_method
+            .and_then(|contract| contract.reason),
+    }
+}
+
+pub(super) fn render_literal_occurrence(
+    value: &LiteralOccurrenceValue,
+) -> CodeQueryLiteralOccurrence {
+    value.row.clone()
+}
+pub(super) fn render_callable_metrics(
+    analyzer: &dyn IAnalyzer,
+    value: &CallableMetricsValue,
+    detail: CodeQueryResultDetail,
+    cache: &mut PipelineRenderCache,
+) -> CodeQueryCallableMetrics {
+    let file = value.file();
+    let metrics = value.metrics;
+    CodeQueryCallableMetrics {
+        id: value.declaration.site_id(),
+        callable_id: Some(value.declaration.declaration_id()),
+        site_id: value.declaration.site_id(),
+        path: rel_path_string(file),
+        language: crate::analyzer::common::language_for_file(file).config_label(),
+        range: render_source_range(analyzer, file, &value.declaration.range, cache),
+        declaration: render_declaration(analyzer, &value.declaration, detail, cache),
+        coverage: value.coverage(),
+        max_nesting: metrics.and_then(|metrics| metrics.max_nesting.map(|metric| metric as usize)),
+        cognitive_complexity: metrics
+            .and_then(|metrics| metrics.cognitive_complexity.map(|metric| metric as usize)),
+        owned_body_span_lines: metrics
+            .and_then(|metrics| metrics.owned_body_span_lines.map(|metric| metric as usize)),
     }
 }
 
@@ -3725,6 +4149,27 @@ pub(super) fn render_receiver_evidence(
         factory_id,
         proof,
         completeness,
+    }
+}
+
+pub(super) fn render_points_to_candidate(
+    analyzer: &dyn IAnalyzer,
+    value: &PointsToCandidateValue,
+    cache: &mut PipelineRenderCache,
+) -> CodeQueryPointsToCandidate {
+    CodeQueryPointsToCandidate {
+        id: value.id.clone(),
+        site_id: value.site_id.clone(),
+        program_point_id: value.program_point_id.clone(),
+        path: rel_path_string(&value.file),
+        language: value.language.config_label(),
+        range: render_source_range(analyzer, &value.file, &value.range, cache),
+        candidate_index: value.candidate_index,
+        object_id: value.object_id.clone(),
+        object_cardinality: value.object_cardinality,
+        proof: value.proof,
+        completeness: value.completeness,
+        coverage: value.coverage,
     }
 }
 
@@ -3853,6 +4298,23 @@ pub(super) fn render_reference_range(
     render_source_range(analyzer, &site.file, &site.range, cache)
 }
 
+struct RenderedSourceLocation {
+    path: String,
+    range: CodeQueryRange,
+}
+
+fn render_source_location(
+    analyzer: &dyn IAnalyzer,
+    file: &ProjectFile,
+    range: &Range,
+    cache: &mut PipelineRenderCache,
+) -> RenderedSourceLocation {
+    RenderedSourceLocation {
+        path: rel_path_string(file),
+        range: render_source_range(analyzer, file, range, cache),
+    }
+}
+
 pub(super) fn render_source_range(
     analyzer: &dyn IAnalyzer,
     file: &ProjectFile,
@@ -3901,6 +4363,13 @@ pub(super) fn provider_supports_feature(
         QueryFeature::Kind(kind) => provider.structural_supports_kind(kind),
         QueryFeature::Role(role) => provider.structural_supports_role(role),
         QueryFeature::BooleanLiteralValue => provider.structural_supports_boolean_literal_value(),
+        QueryFeature::AsyncCallableValue => provider.structural_supports_async_callable_value(),
+        QueryFeature::StringLiteralValue => provider.structural_supports_string_literal_value(),
+        QueryFeature::AssignmentShape => provider.structural_supports_assignment_shape(),
+        QueryFeature::IntegerLiteralValue => provider.structural_supports_integer_literal_value(),
+        QueryFeature::DuplicateDictionaryKey => {
+            provider.structural_supports_duplicate_dictionary_keys()
+        }
         QueryFeature::OccurrenceRole(role) => provider.structural_supports_occurrence_role(role),
         QueryFeature::EnvironmentAxis(axis) => provider.structural_supports_environment_axis(axis),
         QueryFeature::MaterializationAxis(axis) => {
@@ -3963,14 +4432,12 @@ pub(super) fn push_budget_diagnostic(
     ) {
         return;
     }
-    diagnostics.push(CodeQueryDiagnostic {
-        code: CodeQueryDiagnosticCode::ExecutionBudgetExhausted,
-        impact: CodeQueryDiagnosticImpact::Incomplete,
-        branch: Vec::new(),
-        language: "workspace",
-        message: "query_code execution budget exhausted before the query finished; refine the query with where, languages, kind/name anchors, or a narrower pattern".to_string(),
-    exhausted_roots: Vec::new(),
-    });
+    diagnostics.push(incomplete_diagnostic(
+        CodeQueryDiagnosticCode::ExecutionBudgetExhausted,
+        "workspace",
+        "query_code execution budget exhausted before the query finished; refine the query with where, languages, kind/name anchors, or a narrower pattern".to_string(),
+        Vec::new(),
+    ));
 }
 
 pub(super) fn push_pipeline_budget_diagnostic(
@@ -3984,26 +4451,25 @@ pub(super) fn push_pipeline_budget_diagnostic(
     ) {
         return;
     }
-    diagnostics.push(CodeQueryDiagnostic {
-        code: CodeQueryDiagnosticCode::PipelineBudgetExhausted,
-        impact: CodeQueryDiagnosticImpact::Incomplete,
-        branch: Vec::new(),
-        language: "workspace",
-        message: "query_code pipeline budget exhausted while producing seed and edge rows; refine the match, where, or languages filters".to_string(),
-    exhausted_roots: Vec::new(),
-    });
+    diagnostics.push(incomplete_diagnostic(
+        CodeQueryDiagnosticCode::PipelineBudgetExhausted,
+        "workspace",
+        "query_code pipeline budget exhausted while producing seed and edge rows; refine the match, where, or languages filters".to_string(),
+        Vec::new(),
+    ));
 }
 
 pub(super) fn push_import_graph_budget_diagnostic(
     diagnostics: &mut Vec<CodeQueryDiagnostic>,
-    graph: &RequestLocalDirectImportGraph,
+    resolved_files: usize,
+    resolved_edges: usize,
 ) {
     crate::profiling::note_with(|| {
         format!(
             "query_code.{} resolved_files={} resolved_edges={}",
             CodeQueryDiagnosticCode::ImportGraphBudgetExhausted.as_str(),
-            graph.resolved_files(),
-            graph.resolved_edges()
+            resolved_files,
+            resolved_edges
         )
     });
     if already_reported(
@@ -4012,14 +4478,12 @@ pub(super) fn push_import_graph_budget_diagnostic(
     ) {
         return;
     }
-    diagnostics.push(CodeQueryDiagnostic {
-        code: CodeQueryDiagnosticCode::ImportGraphBudgetExhausted,
-        impact: CodeQueryDiagnosticImpact::Incomplete,
-        branch: Vec::new(),
-        language: "workspace",
-        message: "query_code import graph budget exhausted while resolving files and direct edges; import traversal results are partial".to_string(),
-    exhausted_roots: Vec::new(),
-    });
+    diagnostics.push(incomplete_diagnostic(
+        CodeQueryDiagnosticCode::ImportGraphBudgetExhausted,
+        "workspace",
+        "query_code import graph budget exhausted while resolving files and direct edges; import traversal results are partial".to_string(),
+        Vec::new(),
+    ));
 }
 
 pub(super) fn push_truncation_diagnostic(
@@ -4028,16 +4492,14 @@ pub(super) fn push_truncation_diagnostic(
     limit: usize,
 ) {
     note_budget_work(CodeQueryDiagnosticCode::ResultLimitReached, budget);
-    diagnostics.push(CodeQueryDiagnostic {
-        code: CodeQueryDiagnosticCode::ResultLimitReached,
-        impact: CodeQueryDiagnosticImpact::Incomplete,
-        branch: Vec::new(),
-        language: "workspace",
-        message: format!(
+    diagnostics.push(incomplete_diagnostic(
+        CodeQueryDiagnosticCode::ResultLimitReached,
+        "workspace",
+        format!(
             "query_code reached the query limit of {limit} and returned the first {limit} results; results are ordered by project-relative path; refine the query with where, languages, exact names, or a narrower pattern"
         ),
-    exhausted_roots: Vec::new(),
-    });
+        Vec::new(),
+    ));
 }
 
 pub(super) fn should_report_broad_query(
@@ -4067,6 +4529,133 @@ pub(super) fn push_broad_query_diagnostic(
     });
 }
 
+/// Generic structural relationships projected alongside a match row.
+///
+/// These are facts about the normalized tree and role edges, not framework
+/// knowledge. Keeping them on the ordinary structural row lets policy joins
+/// correlate siblings and callable bodies without reparsing source text.
+fn structural_match_relations(facts: &FileFacts, node_id: u32) -> CodeQueryMatchRelations {
+    let fact = facts.node(node_id);
+    let parent_ast_id = fact
+        .parent
+        .map(|parent| super::super::occurrence_rows::ast_id(facts.source_identity(), parent));
+    let role_ast_id = |role| {
+        facts
+            .role_targets(node_id, role)
+            .find_map(|target| target.node)
+            .map(|target| super::super::occurrence_rows::ast_id(facts.source_identity(), target))
+    };
+    let left_ast_id = role_ast_id(Role::Left);
+    let right_ast_id = role_ast_id(Role::Right);
+    let object_ast_id = role_ast_id(Role::Object);
+    let object_name = facts
+        .role_targets(node_id, Role::Object)
+        .find_map(|target| target.node)
+        .or_else(|| {
+            facts
+                .role_targets(node_id, Role::Left)
+                .find_map(|target| target.node)
+                .and_then(|left| {
+                    facts
+                        .role_targets(left, Role::Object)
+                        .find_map(|target| target.node)
+                })
+        })
+        .and_then(|object| facts.node(object).name)
+        .map(|name| name.text(facts.source()).to_owned());
+    let callee_ast_id = role_ast_id(Role::Callee);
+    let receiver_ast_id = role_ast_id(Role::Receiver);
+
+    let enclosing_callable = if fact.kind.satisfies(NormalizedKind::Callable) {
+        Some(node_id)
+    } else {
+        let mut current = fact.parent;
+        let mut found = None;
+        while let Some(parent) = current {
+            if facts.node(parent).kind.satisfies(NormalizedKind::Callable) {
+                found = Some(parent);
+                break;
+            }
+            current = facts.node(parent).parent;
+        }
+        found
+    };
+    let enclosing_callable_ast_id = enclosing_callable
+        .map(|callable| super::super::occurrence_rows::ast_id(facts.source_identity(), callable));
+
+    let name = fact.name.map(|name| name.text(facts.source()).to_owned());
+    let string_value = fact.string_value.clone();
+    let construct = fact.construct.clone();
+    let occurrence_role = facts
+        .occurrence_roles(node_id)
+        .first()
+        .map(|role| role.label());
+
+    let mut element_index = None;
+    let mut element_count = None;
+    if let Some(parent) = fact.parent
+        && facts
+            .node(parent)
+            .kind
+            .satisfies(NormalizedKind::CollectionLiteral)
+    {
+        let mut count = 0usize;
+        for target in facts.role_targets(parent, Role::Element) {
+            if target.node == Some(node_id) {
+                element_index = Some(count);
+            }
+            count += 1;
+        }
+        if element_index.is_some() {
+            element_count = Some(count);
+        }
+    }
+    let is_last_element = element_index
+        .zip(element_count)
+        .map(|(index, count)| index + 1 == count);
+
+    let parameter_index = if fact.kind.satisfies(NormalizedKind::Parameter) {
+        enclosing_callable.and_then(|callable| {
+            let end = facts.node(callable).subtree_end;
+            let mut ordinal = 0usize;
+            for candidate in (callable + 1)..end {
+                let candidate_fact = facts.node(candidate);
+                if candidate_fact.parent != Some(callable)
+                    || !candidate_fact.kind.satisfies(NormalizedKind::Parameter)
+                {
+                    continue;
+                }
+                if candidate == node_id {
+                    return Some(ordinal);
+                }
+                ordinal += 1;
+            }
+            None
+        })
+    } else {
+        None
+    };
+
+    CodeQueryMatchRelations {
+        parent_ast_id,
+        left_ast_id,
+        right_ast_id,
+        object_ast_id,
+        object_name,
+        callee_ast_id,
+        receiver_ast_id,
+        enclosing_callable_ast_id,
+        name,
+        string_value,
+        construct,
+        occurrence_role,
+        element_index,
+        element_count,
+        is_last_element,
+        parameter_index,
+    }
+}
+
 pub(super) fn file_matches_globs(file: &ProjectFile, query: &CodeQuerySeed) -> bool {
     if query.where_globs.is_empty() {
         return true;
@@ -4085,33 +4674,13 @@ pub(super) fn render_match(
     cache: &mut PipelineRenderCache,
 ) -> CodeQueryMatch {
     let fact = facts.node(fact_match.node);
-    let full_detail = matches!(detail, CodeQueryResultDetail::Full);
+    let relations = structural_match_relations(facts, fact_match.node);
+    let span = fact_match.display_span(facts);
+    let range = range_for_span(facts, span);
     let path = rel_path_string(file);
-    let captures = fact_match
-        .captures
-        .iter()
-        .map(|capture| CodeQueryCapture {
-            name: capture.name.clone(),
-            text: snippet(&capture.text),
-            start_line: capture.start_line,
-            range: full_detail.then_some(CodeQueryRange {
-                start_line: capture.start_line,
-                start_column: capture.start_column,
-                end_line: capture.end_line,
-                end_column: capture.end_column,
-            }),
-            kind: if full_detail {
-                capture.kind.map(|kind| kind.label())
-            } else {
-                None
-            },
-            ast_id: full_detail
-                .then_some(capture.node)
-                .flatten()
-                .map(|node| super::super::occurrence_rows::ast_id(capture.source_identity, node)),
-        })
-        .collect();
-    let node_range = full_detail.then(|| range_for_span(facts, fact.span()));
+    let captures = render_captures(fact_match, detail);
+    let full_detail = matches!(detail, CodeQueryResultDetail::Full);
+    let node_range = full_detail.then_some(range);
     let decorator_spans: Vec<_> = if full_detail {
         facts
             .role_targets(fact_match.node, Role::Decorator)
@@ -4135,24 +4704,54 @@ pub(super) fn render_match(
         None
     };
     CodeQueryMatch {
-        id: full_detail.then(|| match_id(&path, fact.kind.label(), fact.span())),
+        id: full_detail.then(|| match_id(&path, fact.kind.label(), span)),
         ast_id: full_detail.then(|| {
             super::super::occurrence_rows::ast_id(facts.source_identity(), fact_match.node)
         }),
+        relations: full_detail.then_some(Box::new(relations)),
         path,
         language: language.config_label(),
         kind: fact.kind.label(),
-        start_line: fact.range.start_line,
-        end_line: fact.range.end_line,
-        text: snippet(fact.span().text(facts.source())),
+        start_line: range.start_line,
+        end_line: range.end_line,
+        text: snippet(span.text(facts.source())),
         node_range,
         decorated_range,
         decorator_ranges,
         captures,
         enclosing_symbol: cache
-            .enclosing_unit_for_lines(analyzer, file, fact.range.start_line, fact.range.end_line)
+            .enclosing_unit_for_lines(analyzer, file, range.start_line, range.end_line)
             .map(|code_unit| code_unit.fq_name()),
+        python_import: None,
     }
+}
+
+fn render_captures(fact_match: &FactMatch, detail: CodeQueryResultDetail) -> Vec<CodeQueryCapture> {
+    let full_detail = matches!(detail, CodeQueryResultDetail::Full);
+    fact_match
+        .captures
+        .iter()
+        .map(|capture| CodeQueryCapture {
+            name: capture.name.clone(),
+            text: snippet(&capture.text),
+            start_line: capture.start_line,
+            range: full_detail.then_some(CodeQueryRange {
+                start_line: capture.start_line,
+                start_column: capture.start_column,
+                end_line: capture.end_line,
+                end_column: capture.end_column,
+            }),
+            kind: if full_detail {
+                capture.kind.map(|kind| kind.label())
+            } else {
+                None
+            },
+            ast_id: full_detail
+                .then_some(capture.node)
+                .flatten()
+                .map(|node| super::super::occurrence_rows::ast_id(capture.source_identity, node)),
+        })
+        .collect()
 }
 
 pub(super) fn match_id(path: &str, kind: &str, span: Span) -> String {

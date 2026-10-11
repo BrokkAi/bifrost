@@ -1,14 +1,26 @@
 use std::path::Path;
+use std::sync::LazyLock;
 use std::time::{Duration, Instant};
 
 use rusqlite::ffi::ErrorCode;
 use rusqlite::{Connection, OpenFlags, TransactionBehavior};
 
 use super::{CatalogError, CatalogOpenMode};
+use crate::sqlite_template;
 
 pub(super) const CATALOG_DB_FILE_NAME: &str = "catalog.db";
-pub(super) const CURRENT_CATALOG_VERSION: i64 = 11;
+pub(super) const CURRENT_CATALOG_VERSION: i64 = 20;
 const PRE_NATIVE_COMPATIBILITY_CATALOG_VERSION: i64 = 10;
+const NATIVE_COMPATIBILITY_CATALOG_VERSION: i64 = 11;
+const UNKNOWN_TYPES_CATALOG_VERSION: i64 = 12;
+const CALLABLE_VALUES_CATALOG_VERSION: i64 = 13;
+const CALLABLE_VALUE_ROWS_CATALOG_VERSION: i64 = 14;
+const STRUCTURED_FORMALS_CATALOG_VERSION: i64 = 15;
+const SEMANTIC_MODEL_SCHEMA_CATALOG_VERSION: i64 = 16;
+const EXACT_GO_SOURCE_ROWS_CATALOG_VERSION: i64 = 17;
+const SEMANTIC_MODEL_SCHEMA_V14_CATALOG_VERSION: i64 = 18;
+const SEMANTIC_MODEL_SCHEMA_V15_CATALOG_VERSION: i64 = 19;
+const SEMANTIC_MODEL_SCHEMA_V16_CATALOG_VERSION: i64 = 20;
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 const INITIALIZATION_RETRY_BACKOFF: Duration = Duration::from_millis(5);
 const INITIALIZATION_RETRY_MAX_BACKOFF: Duration = Duration::from_millis(100);
@@ -36,6 +48,56 @@ const SHARD_VALIDATION_SQL: &str =
     include_str!("../../../../migrations/semantic-pack-catalog/0010-shard-validation.sql");
 const NATIVE_COMPATIBILITY_SQL: &str =
     include_str!("../../../../migrations/semantic-pack-catalog/0011-native-compatibility.sql");
+const UNKNOWN_TYPES_SQL: &str =
+    include_str!("../../../../migrations/semantic-pack-catalog/0012-unknown-types.sql");
+const CALLABLE_VALUES_SQL: &str =
+    include_str!("../../../../migrations/semantic-pack-catalog/0013-callable-values.sql");
+pub(super) const CALLABLE_VALUE_ROWS_SQL: &str =
+    include_str!("../../../../migrations/semantic-pack-catalog/0014-callable-value-rows.sql");
+const STRUCTURED_FORMALS_SQL: &str =
+    include_str!("../../../../migrations/semantic-pack-catalog/0015-structured-formals.sql");
+const SEMANTIC_MODEL_SCHEMA_SQL: &str =
+    include_str!("../../../../migrations/semantic-pack-catalog/0016-semantic-model-schema.sql");
+pub(super) const EXACT_GO_SOURCE_ROWS_SQL: &str =
+    include_str!("../../../../migrations/semantic-pack-catalog/0017-exact-go-source-rows.sql");
+const SEMANTIC_MODEL_SCHEMA_V14_SQL: &str =
+    include_str!("../../../../migrations/semantic-pack-catalog/0018-semantic-model-schema-v14.sql");
+const SEMANTIC_MODEL_SCHEMA_V15_SQL: &str =
+    include_str!("../../../../migrations/semantic-pack-catalog/0019-semantic-model-schema-v15.sql");
+const SEMANTIC_MODEL_SCHEMA_V16_SQL: &str =
+    include_str!("../../../../migrations/semantic-pack-catalog/0020-semantic-model-schema-v16.sql");
+
+/// This build's empty-catalog template. The migrations are the schema inputs:
+/// on an empty catalog their Rust steps have no rows to change, so the SQL
+/// alone decides the bytes.
+static CATALOG_TEMPLATE: LazyLock<sqlite_template::Template> = LazyLock::new(|| {
+    sqlite_template::Template::new(
+        "semantic-pack-catalog",
+        CURRENT_CATALOG_VERSION,
+        &[
+            BASELINE_SQL.as_bytes(),
+            LIFECYCLE_SQL.as_bytes(),
+            PROCEDURE_SUMMARIES_SQL.as_bytes(),
+            GENERATED_PRODUCTIONS_SQL.as_bytes(),
+            EXTRACTION_GAPS_SQL.as_bytes(),
+            EXTRACTION_SOURCE_ENTRIES_SQL.as_bytes(),
+            ACQUISITION_ABSENCE_RECEIPTS_SQL.as_bytes(),
+            GENERATED_SOURCE_IDENTITIES_SQL.as_bytes(),
+            GENERATED_CACHE_EPOCHS_SQL.as_bytes(),
+            SHARD_VALIDATION_SQL.as_bytes(),
+            NATIVE_COMPATIBILITY_SQL.as_bytes(),
+            UNKNOWN_TYPES_SQL.as_bytes(),
+            CALLABLE_VALUES_SQL.as_bytes(),
+            CALLABLE_VALUE_ROWS_SQL.as_bytes(),
+            STRUCTURED_FORMALS_SQL.as_bytes(),
+            SEMANTIC_MODEL_SCHEMA_SQL.as_bytes(),
+            EXACT_GO_SOURCE_ROWS_SQL.as_bytes(),
+            SEMANTIC_MODEL_SCHEMA_V14_SQL.as_bytes(),
+            SEMANTIC_MODEL_SCHEMA_V15_SQL.as_bytes(),
+            SEMANTIC_MODEL_SCHEMA_V16_SQL.as_bytes(),
+        ],
+    )
+});
 
 pub(super) fn open(root: &Path, mode: CatalogOpenMode) -> Result<Connection, CatalogError> {
     // The catalog is the other database a Bifrost process can open first, and
@@ -52,11 +114,27 @@ pub(super) fn open(root: &Path, mode: CatalogOpenMode) -> Result<Connection, Cat
             OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NOFOLLOW
         }
     };
+    if mode == CatalogOpenMode::ReadWrite {
+        // A new catalog runs twenty migrations. Copy a template instead; see
+        // `sqlite_template`. The caller holds the catalog's initialization
+        // lock, so no other opener is creating this file.
+        let _scope = crate::profiling::scope("semantic_pack.catalog.seed_from_template");
+        let template_dir = sqlite_template::template_dir();
+        sqlite_template::seed_missing_database(
+            &path,
+            template_dir.as_deref(),
+            &CATALOG_TEMPLATE,
+            build_fresh_catalog,
+        )?;
+    }
     let mut connection = {
         let _scope = crate::profiling::scope("semantic_pack.catalog.sqlite_open");
         Connection::open_with_flags(&path, flags)
             .map_err(|error| CatalogError::sqlite("open catalog", error))?
     };
+    if mode == CatalogOpenMode::ReadWrite {
+        connection.set_transaction_behavior(TransactionBehavior::Immediate);
+    }
     connection
         .busy_timeout(BUSY_TIMEOUT)
         .map_err(|error| CatalogError::sqlite("configure busy timeout", error))?;
@@ -83,6 +161,26 @@ pub(super) fn open(root: &Path, mode: CatalogOpenMode) -> Result<Connection, Cat
     Ok(connection)
 }
 
+/// Create an empty current-schema catalog at `path` through the ordinary path.
+fn build_fresh_catalog(path: &Path) -> Result<(), CatalogError> {
+    let mut connection = Connection::open_with_flags(
+        path,
+        OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NOFOLLOW,
+    )
+    .map_err(|error| CatalogError::sqlite("open catalog template", error))?;
+    connection.set_transaction_behavior(TransactionBehavior::Immediate);
+    connection
+        .busy_timeout(BUSY_TIMEOUT)
+        .map_err(|error| CatalogError::sqlite("configure busy timeout", error))?;
+    configure_writer(&mut connection)?;
+    migrate(&mut connection, CatalogOpenMode::ReadWrite)?;
+    // Closing the only connection checkpoints the WAL into the main file and
+    // removes the WAL, so the main file alone is the complete catalog.
+    connection
+        .close()
+        .map_err(|(_, error)| CatalogError::sqlite("close catalog template", error))
+}
+
 fn configure_writer(connection: &mut Connection) -> Result<(), CatalogError> {
     ensure_wal_journal_mode(connection)?;
     connection
@@ -96,9 +194,10 @@ fn configure_writer(connection: &mut Connection) -> Result<(), CatalogError> {
 }
 
 fn ensure_wal_journal_mode(connection: &Connection) -> Result<(), CatalogError> {
-    let enabled = retry_initialization(|| set_wal_journal_mode(connection))
-        .map_err(|error| CatalogError::sqlite("configure catalog journal mode", error))?;
-    if !enabled {
+    let updated =
+        retry_initialization(|| brokk_bifrost_core::cache_db::set_wal_journal_mode(connection))
+            .map_err(|error| CatalogError::sqlite("configure catalog journal mode", error))?;
+    if !updated.eq_ignore_ascii_case("wal") {
         return Err(CatalogError::Integrity(
             "SQLite did not enable WAL mode for the semantic-pack catalog".to_owned(),
         ));
@@ -148,16 +247,6 @@ fn is_transient_initialization_error(error: &rusqlite::Error) -> bool {
     )
 }
 
-fn set_wal_journal_mode(connection: &Connection) -> rusqlite::Result<bool> {
-    let current: String = connection.query_row("PRAGMA journal_mode", [], |row| row.get(0))?;
-    if current.eq_ignore_ascii_case("wal") {
-        return Ok(true);
-    }
-    let updated: String =
-        connection.pragma_update_and_check(None, "journal_mode", "WAL", |row| row.get(0))?;
-    Ok(updated.eq_ignore_ascii_case("wal"))
-}
-
 fn configure_reader(connection: &Connection) -> Result<(), CatalogError> {
     connection
         .execute_batch(
@@ -178,7 +267,7 @@ fn migrate(connection: &mut Connection, mode: CatalogOpenMode) -> Result<(), Cat
             supported: CURRENT_CATALOG_VERSION,
         });
     }
-    if version == CURRENT_CATALOG_VERSION {
+    if version >= CURRENT_CATALOG_VERSION {
         return Ok(());
     }
     if mode == CatalogOpenMode::ReadOnly {
@@ -188,7 +277,16 @@ fn migrate(connection: &mut Connection, mode: CatalogOpenMode) -> Result<(), Cat
         });
     }
     migrate_legacy_catalog_versions(connection)?;
-    migrate_native_compatibility(connection)
+    migrate_native_compatibility(connection)?;
+    migrate_unknown_types(connection)?;
+    migrate_callable_values(connection)?;
+    migrate_callable_value_rows(connection)?;
+    migrate_structured_formals(connection)?;
+    migrate_semantic_model_schema(connection)?;
+    migrate_exact_go_source_rows(connection)?;
+    migrate_semantic_model_schema_v14(connection)?;
+    migrate_semantic_model_schema_v15(connection)?;
+    migrate_semantic_model_schema_v16(connection)
 }
 
 fn migrate_legacy_catalog_versions(connection: &mut Connection) -> Result<(), CatalogError> {
@@ -204,7 +302,7 @@ fn migrate_legacy_catalog_versions(connection: &mut Connection) -> Result<(), Ca
             supported: CURRENT_CATALOG_VERSION,
         });
     }
-    if locked_version >= CURRENT_CATALOG_VERSION {
+    if locked_version >= PRE_NATIVE_COMPATIBILITY_CATALOG_VERSION {
         return transaction
             .commit()
             .map_err(|error| CatalogError::sqlite("commit catalog migration", error));
@@ -330,7 +428,7 @@ fn migrate_native_compatibility(connection: &mut Connection) -> Result<(), Catal
             supported: CURRENT_CATALOG_VERSION,
         });
     }
-    if version == CURRENT_CATALOG_VERSION {
+    if version >= NATIVE_COMPATIBILITY_CATALOG_VERSION {
         return Ok(());
     }
     if version != PRE_NATIVE_COMPATIBILITY_CATALOG_VERSION {
@@ -377,7 +475,7 @@ fn migrate_native_compatibility_transaction(
             supported: CURRENT_CATALOG_VERSION,
         });
     }
-    if locked_version == CURRENT_CATALOG_VERSION {
+    if locked_version >= NATIVE_COMPATIBILITY_CATALOG_VERSION {
         return transaction.commit().map_err(|error| {
             CatalogError::sqlite("commit concurrent catalog migration 11", error)
         });
@@ -423,16 +521,975 @@ fn migrate_native_compatibility_transaction(
         )));
     }
     transaction
-        .pragma_update(None, "user_version", CURRENT_CATALOG_VERSION)
+        .pragma_update(None, "user_version", NATIVE_COMPATIBILITY_CATALOG_VERSION)
         .map_err(|error| CatalogError::sqlite("publish catalog schema version 11", error))?;
     transaction
         .commit()
         .map_err(|error| CatalogError::sqlite("commit catalog migration 11", error))
 }
 
+fn migrate_unknown_types(connection: &mut Connection) -> Result<(), CatalogError> {
+    let version: i64 = connection
+        .query_row("PRAGMA user_version", [], |row| row.get(0))
+        .map_err(|error| {
+            CatalogError::sqlite("read catalog schema version before migration 12", error)
+        })?;
+    if version > CURRENT_CATALOG_VERSION {
+        return Err(CatalogError::CatalogTooNew {
+            found: version,
+            supported: CURRENT_CATALOG_VERSION,
+        });
+    }
+    if version >= UNKNOWN_TYPES_CATALOG_VERSION {
+        return Ok(());
+    }
+    if version != NATIVE_COMPATIBILITY_CATALOG_VERSION {
+        return Err(CatalogError::Integrity(format!(
+            "catalog schema reached unexpected version {version} before migration 12"
+        )));
+    }
+
+    connection
+        .pragma_update(None, "foreign_keys", false)
+        .map_err(|error| {
+            CatalogError::sqlite("disable catalog foreign keys for migration 12", error)
+        })?;
+    let migration_result = migrate_unknown_types_transaction(connection);
+    let foreign_keys_result = connection
+        .pragma_update(None, "foreign_keys", true)
+        .map_err(|error| {
+            CatalogError::sqlite("restore catalog foreign keys after migration 12", error)
+        });
+    match (migration_result, foreign_keys_result) {
+        (Err(migration_error), Ok(())) => Err(migration_error),
+        (Err(migration_error), Err(foreign_keys_error)) => Err(CatalogError::Integrity(format!(
+            "catalog migration 12 failed: {migration_error}; restoring foreign-key enforcement failed: {foreign_keys_error}"
+        ))),
+        (Ok(()), Err(error)) => Err(error),
+        (Ok(()), Ok(())) => Ok(()),
+    }
+}
+
+fn migrate_unknown_types_transaction(connection: &mut Connection) -> Result<(), CatalogError> {
+    let transaction = connection
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(|error| CatalogError::sqlite("begin catalog migration 12", error))?;
+    let locked_version: i64 = transaction
+        .query_row("PRAGMA user_version", [], |row| row.get(0))
+        .map_err(|error| {
+            CatalogError::sqlite("recheck catalog schema before migration 12", error)
+        })?;
+    if locked_version > CURRENT_CATALOG_VERSION {
+        return Err(CatalogError::CatalogTooNew {
+            found: locked_version,
+            supported: CURRENT_CATALOG_VERSION,
+        });
+    }
+    if locked_version >= UNKNOWN_TYPES_CATALOG_VERSION {
+        return transaction.commit().map_err(|error| {
+            CatalogError::sqlite("commit concurrent catalog migration 12", error)
+        });
+    }
+    if locked_version != NATIVE_COMPATIBILITY_CATALOG_VERSION {
+        return Err(CatalogError::Integrity(format!(
+            "catalog schema changed to unexpected version {locked_version} before migration 12"
+        )));
+    }
+
+    transaction
+        .execute_batch(UNKNOWN_TYPES_SQL)
+        .map_err(|error| CatalogError::sqlite("apply unknown-types catalog migration", error))?;
+    let foreign_key_violations = {
+        let mut statement = transaction
+            .prepare("PRAGMA foreign_key_check")
+            .map_err(|error| {
+                CatalogError::sqlite("prepare migration 12 foreign-key check", error)
+            })?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, Option<i64>>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, i64>(3)?,
+                ))
+            })
+            .map_err(|error| CatalogError::sqlite("run migration 12 foreign-key check", error))?;
+        let mut violations = Vec::new();
+        for row in rows {
+            violations.push(row.map_err(|error| {
+                CatalogError::sqlite("read migration 12 foreign-key violation", error)
+            })?);
+        }
+        violations
+    };
+    if !foreign_key_violations.is_empty() {
+        return Err(CatalogError::Integrity(format!(
+            "catalog migration 12 found foreign-key violations: {foreign_key_violations:?}"
+        )));
+    }
+    transaction
+        .pragma_update(None, "user_version", UNKNOWN_TYPES_CATALOG_VERSION)
+        .map_err(|error| CatalogError::sqlite("publish catalog schema version 12", error))?;
+    transaction
+        .commit()
+        .map_err(|error| CatalogError::sqlite("commit catalog migration 12", error))
+}
+
+fn migrate_callable_values(connection: &mut Connection) -> Result<(), CatalogError> {
+    let version: i64 = connection
+        .query_row("PRAGMA user_version", [], |row| row.get(0))
+        .map_err(|error| {
+            CatalogError::sqlite("read catalog schema version before migration 13", error)
+        })?;
+    if version > CURRENT_CATALOG_VERSION {
+        return Err(CatalogError::CatalogTooNew {
+            found: version,
+            supported: CURRENT_CATALOG_VERSION,
+        });
+    }
+    if version >= CALLABLE_VALUES_CATALOG_VERSION {
+        return Ok(());
+    }
+    if version != UNKNOWN_TYPES_CATALOG_VERSION {
+        return Err(CatalogError::Integrity(format!(
+            "catalog schema reached unexpected version {version} before migration 13"
+        )));
+    }
+
+    connection
+        .pragma_update(None, "foreign_keys", false)
+        .map_err(|error| {
+            CatalogError::sqlite("disable catalog foreign keys for migration 13", error)
+        })?;
+    let migration_result = migrate_callable_values_transaction(connection);
+    let foreign_keys_result = connection
+        .pragma_update(None, "foreign_keys", true)
+        .map_err(|error| {
+            CatalogError::sqlite("restore catalog foreign keys after migration 13", error)
+        });
+    match (migration_result, foreign_keys_result) {
+        (Err(migration_error), Ok(())) => Err(migration_error),
+        (Err(migration_error), Err(foreign_keys_error)) => Err(CatalogError::Integrity(format!(
+            "catalog migration 13 failed: {migration_error}; restoring foreign-key enforcement failed: {foreign_keys_error}"
+        ))),
+        (Ok(()), Err(error)) => Err(error),
+        (Ok(()), Ok(())) => Ok(()),
+    }
+}
+
+fn migrate_callable_values_transaction(connection: &mut Connection) -> Result<(), CatalogError> {
+    let transaction = connection
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(|error| CatalogError::sqlite("begin catalog migration 13", error))?;
+    let locked_version: i64 = transaction
+        .query_row("PRAGMA user_version", [], |row| row.get(0))
+        .map_err(|error| {
+            CatalogError::sqlite("recheck catalog schema before migration 13", error)
+        })?;
+    if locked_version > CURRENT_CATALOG_VERSION {
+        return Err(CatalogError::CatalogTooNew {
+            found: locked_version,
+            supported: CURRENT_CATALOG_VERSION,
+        });
+    }
+    if locked_version >= CALLABLE_VALUES_CATALOG_VERSION {
+        return transaction.commit().map_err(|error| {
+            CatalogError::sqlite("commit concurrent catalog migration 13", error)
+        });
+    }
+    if locked_version != UNKNOWN_TYPES_CATALOG_VERSION {
+        return Err(CatalogError::Integrity(format!(
+            "catalog schema changed to unexpected version {locked_version} before migration 13"
+        )));
+    }
+
+    transaction
+        .execute_batch(CALLABLE_VALUES_SQL)
+        .map_err(|error| CatalogError::sqlite("apply callable-values catalog migration", error))?;
+    let foreign_key_violations = {
+        let mut statement = transaction
+            .prepare("PRAGMA foreign_key_check")
+            .map_err(|error| {
+                CatalogError::sqlite("prepare migration 13 foreign-key check", error)
+            })?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, Option<i64>>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, i64>(3)?,
+                ))
+            })
+            .map_err(|error| CatalogError::sqlite("run migration 13 foreign-key check", error))?;
+        let mut violations = Vec::new();
+        for row in rows {
+            violations.push(row.map_err(|error| {
+                CatalogError::sqlite("read migration 13 foreign-key violation", error)
+            })?);
+        }
+        violations
+    };
+    if !foreign_key_violations.is_empty() {
+        return Err(CatalogError::Integrity(format!(
+            "catalog migration 13 found foreign-key violations: {foreign_key_violations:?}"
+        )));
+    }
+    transaction
+        .pragma_update(None, "user_version", CALLABLE_VALUES_CATALOG_VERSION)
+        .map_err(|error| CatalogError::sqlite("publish catalog schema version 13", error))?;
+    transaction
+        .commit()
+        .map_err(|error| CatalogError::sqlite("commit catalog migration 13", error))
+}
+
+fn migrate_callable_value_rows(connection: &mut Connection) -> Result<(), CatalogError> {
+    let version: i64 = connection
+        .query_row("PRAGMA user_version", [], |row| row.get(0))
+        .map_err(|error| {
+            CatalogError::sqlite("read catalog schema version before migration 14", error)
+        })?;
+    if version > CURRENT_CATALOG_VERSION {
+        return Err(CatalogError::CatalogTooNew {
+            found: version,
+            supported: CURRENT_CATALOG_VERSION,
+        });
+    }
+    if version >= CALLABLE_VALUE_ROWS_CATALOG_VERSION {
+        return Ok(());
+    }
+    if version != CALLABLE_VALUES_CATALOG_VERSION {
+        return Err(CatalogError::Integrity(format!(
+            "catalog schema reached unexpected version {version} before migration 14"
+        )));
+    }
+
+    let transaction = connection
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(|error| CatalogError::sqlite("begin catalog migration 14", error))?;
+    let locked_version: i64 = transaction
+        .query_row("PRAGMA user_version", [], |row| row.get(0))
+        .map_err(|error| {
+            CatalogError::sqlite("recheck catalog schema before migration 14", error)
+        })?;
+    if locked_version > CURRENT_CATALOG_VERSION {
+        return Err(CatalogError::CatalogTooNew {
+            found: locked_version,
+            supported: CURRENT_CATALOG_VERSION,
+        });
+    }
+    if locked_version >= CALLABLE_VALUE_ROWS_CATALOG_VERSION {
+        return transaction.commit().map_err(|error| {
+            CatalogError::sqlite("commit concurrent catalog migration 14", error)
+        });
+    }
+    if locked_version != CALLABLE_VALUES_CATALOG_VERSION {
+        return Err(CatalogError::Integrity(format!(
+            "catalog schema changed to unexpected version {locked_version} before migration 14"
+        )));
+    }
+
+    transaction
+        .execute_batch(CALLABLE_VALUE_ROWS_SQL)
+        .map_err(|error| CatalogError::sqlite("apply callable-value-row migration", error))?;
+    let foreign_key_violations = {
+        let mut statement = transaction
+            .prepare("PRAGMA foreign_key_check")
+            .map_err(|error| {
+                CatalogError::sqlite("prepare migration 14 foreign-key check", error)
+            })?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, Option<i64>>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, i64>(3)?,
+                ))
+            })
+            .map_err(|error| CatalogError::sqlite("run migration 14 foreign-key check", error))?;
+        let mut violations = Vec::new();
+        for row in rows {
+            violations.push(row.map_err(|error| {
+                CatalogError::sqlite("read migration 14 foreign-key violation", error)
+            })?);
+        }
+        violations
+    };
+    if !foreign_key_violations.is_empty() {
+        return Err(CatalogError::Integrity(format!(
+            "catalog migration 14 found foreign-key violations: {foreign_key_violations:?}"
+        )));
+    }
+    transaction
+        .pragma_update(None, "user_version", CALLABLE_VALUE_ROWS_CATALOG_VERSION)
+        .map_err(|error| CatalogError::sqlite("publish catalog schema version 14", error))?;
+    transaction
+        .commit()
+        .map_err(|error| CatalogError::sqlite("commit catalog migration 14", error))
+}
+
+fn migrate_structured_formals(connection: &mut Connection) -> Result<(), CatalogError> {
+    let version: i64 = connection
+        .query_row("PRAGMA user_version", [], |row| row.get(0))
+        .map_err(|error| {
+            CatalogError::sqlite("read catalog schema version before migration 15", error)
+        })?;
+    if version > CURRENT_CATALOG_VERSION {
+        return Err(CatalogError::CatalogTooNew {
+            found: version,
+            supported: CURRENT_CATALOG_VERSION,
+        });
+    }
+    if version >= STRUCTURED_FORMALS_CATALOG_VERSION {
+        return Ok(());
+    }
+    if version != CALLABLE_VALUE_ROWS_CATALOG_VERSION {
+        return Err(CatalogError::Integrity(format!(
+            "catalog schema reached unexpected version {version} before migration 15"
+        )));
+    }
+
+    connection
+        .pragma_update(None, "foreign_keys", false)
+        .map_err(|error| {
+            CatalogError::sqlite("disable catalog foreign keys for migration 15", error)
+        })?;
+    let migration_result = migrate_structured_formals_transaction(connection);
+    let foreign_keys_result = connection
+        .pragma_update(None, "foreign_keys", true)
+        .map_err(|error| {
+            CatalogError::sqlite("restore catalog foreign keys after migration 15", error)
+        });
+    match (migration_result, foreign_keys_result) {
+        (Err(migration_error), Ok(())) => Err(migration_error),
+        (Err(migration_error), Err(foreign_keys_error)) => Err(CatalogError::Integrity(format!(
+            "catalog migration 15 failed: {migration_error}; restoring foreign-key enforcement failed: {foreign_keys_error}"
+        ))),
+        (Ok(()), Err(error)) => Err(error),
+        (Ok(()), Ok(())) => Ok(()),
+    }
+}
+
+fn migrate_structured_formals_transaction(connection: &mut Connection) -> Result<(), CatalogError> {
+    let transaction = connection
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(|error| CatalogError::sqlite("begin catalog migration 15", error))?;
+    let locked_version: i64 = transaction
+        .query_row("PRAGMA user_version", [], |row| row.get(0))
+        .map_err(|error| {
+            CatalogError::sqlite("recheck catalog schema before migration 15", error)
+        })?;
+    if locked_version > CURRENT_CATALOG_VERSION {
+        return Err(CatalogError::CatalogTooNew {
+            found: locked_version,
+            supported: CURRENT_CATALOG_VERSION,
+        });
+    }
+    if locked_version >= STRUCTURED_FORMALS_CATALOG_VERSION {
+        return transaction.commit().map_err(|error| {
+            CatalogError::sqlite("commit concurrent catalog migration 15", error)
+        });
+    }
+    if locked_version != CALLABLE_VALUE_ROWS_CATALOG_VERSION {
+        return Err(CatalogError::Integrity(format!(
+            "catalog schema changed to unexpected version {locked_version} before migration 15"
+        )));
+    }
+
+    transaction
+        .execute_batch(STRUCTURED_FORMALS_SQL)
+        .map_err(|error| {
+            CatalogError::sqlite("apply structured-formals catalog migration", error)
+        })?;
+    let foreign_key_violations = {
+        let mut statement = transaction
+            .prepare("PRAGMA foreign_key_check")
+            .map_err(|error| {
+                CatalogError::sqlite("prepare migration 15 foreign-key check", error)
+            })?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, Option<i64>>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, i64>(3)?,
+                ))
+            })
+            .map_err(|error| CatalogError::sqlite("run migration 15 foreign-key check", error))?;
+        let mut violations = Vec::new();
+        for row in rows {
+            violations.push(row.map_err(|error| {
+                CatalogError::sqlite("read migration 15 foreign-key violation", error)
+            })?);
+        }
+        violations
+    };
+    if !foreign_key_violations.is_empty() {
+        return Err(CatalogError::Integrity(format!(
+            "catalog migration 15 found foreign-key violations: {foreign_key_violations:?}"
+        )));
+    }
+    transaction
+        .pragma_update(None, "user_version", STRUCTURED_FORMALS_CATALOG_VERSION)
+        .map_err(|error| CatalogError::sqlite("publish catalog schema version 15", error))?;
+    transaction
+        .commit()
+        .map_err(|error| CatalogError::sqlite("commit catalog migration 15", error))
+}
+
+fn migrate_semantic_model_schema(connection: &mut Connection) -> Result<(), CatalogError> {
+    let version: i64 = connection
+        .query_row("PRAGMA user_version", [], |row| row.get(0))
+        .map_err(|error| {
+            CatalogError::sqlite("read catalog schema version before migration 16", error)
+        })?;
+    if version > CURRENT_CATALOG_VERSION {
+        return Err(CatalogError::CatalogTooNew {
+            found: version,
+            supported: CURRENT_CATALOG_VERSION,
+        });
+    }
+    if version >= SEMANTIC_MODEL_SCHEMA_CATALOG_VERSION {
+        return Ok(());
+    }
+    if version != STRUCTURED_FORMALS_CATALOG_VERSION {
+        return Err(CatalogError::Integrity(format!(
+            "catalog schema reached unexpected version {version} before migration 16"
+        )));
+    }
+
+    connection
+        .pragma_update(None, "foreign_keys", false)
+        .map_err(|error| {
+            CatalogError::sqlite("disable catalog foreign keys for migration 16", error)
+        })?;
+    let migration_result = migrate_semantic_model_schema_transaction(connection);
+    let foreign_keys_result = connection
+        .pragma_update(None, "foreign_keys", true)
+        .map_err(|error| {
+            CatalogError::sqlite("restore catalog foreign keys after migration 16", error)
+        });
+    match (migration_result, foreign_keys_result) {
+        (Err(migration_error), Ok(())) => Err(migration_error),
+        (Err(migration_error), Err(foreign_keys_error)) => Err(CatalogError::Integrity(format!(
+            "catalog migration 16 failed: {migration_error}; restoring foreign-key enforcement failed: {foreign_keys_error}"
+        ))),
+        (Ok(()), Err(error)) => Err(error),
+        (Ok(()), Ok(())) => Ok(()),
+    }
+}
+
+fn migrate_semantic_model_schema_transaction(
+    connection: &mut Connection,
+) -> Result<(), CatalogError> {
+    let transaction = connection
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(|error| CatalogError::sqlite("begin catalog migration 16", error))?;
+    let locked_version: i64 = transaction
+        .query_row("PRAGMA user_version", [], |row| row.get(0))
+        .map_err(|error| {
+            CatalogError::sqlite("recheck catalog schema before migration 16", error)
+        })?;
+    if locked_version > CURRENT_CATALOG_VERSION {
+        return Err(CatalogError::CatalogTooNew {
+            found: locked_version,
+            supported: CURRENT_CATALOG_VERSION,
+        });
+    }
+    if locked_version >= SEMANTIC_MODEL_SCHEMA_CATALOG_VERSION {
+        return transaction.commit().map_err(|error| {
+            CatalogError::sqlite("commit concurrent catalog migration 16", error)
+        });
+    }
+    if locked_version != STRUCTURED_FORMALS_CATALOG_VERSION {
+        return Err(CatalogError::Integrity(format!(
+            "catalog schema changed to unexpected version {locked_version} before migration 16"
+        )));
+    }
+
+    transaction
+        .execute_batch(SEMANTIC_MODEL_SCHEMA_SQL)
+        .map_err(|error| {
+            CatalogError::sqlite("apply semantic-model-schema catalog migration", error)
+        })?;
+    let foreign_key_violations = {
+        let mut statement = transaction
+            .prepare("PRAGMA foreign_key_check")
+            .map_err(|error| {
+                CatalogError::sqlite("prepare migration 16 foreign-key check", error)
+            })?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, Option<i64>>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, i64>(3)?,
+                ))
+            })
+            .map_err(|error| CatalogError::sqlite("run migration 16 foreign-key check", error))?;
+        let mut violations = Vec::new();
+        for row in rows {
+            violations.push(row.map_err(|error| {
+                CatalogError::sqlite("read migration 16 foreign-key violation", error)
+            })?);
+        }
+        violations
+    };
+    if !foreign_key_violations.is_empty() {
+        return Err(CatalogError::Integrity(format!(
+            "catalog migration 16 found foreign-key violations: {foreign_key_violations:?}"
+        )));
+    }
+    transaction
+        .pragma_update(None, "user_version", SEMANTIC_MODEL_SCHEMA_CATALOG_VERSION)
+        .map_err(|error| CatalogError::sqlite("publish catalog schema version 16", error))?;
+    transaction
+        .commit()
+        .map_err(|error| CatalogError::sqlite("commit catalog migration 16", error))
+}
+
+fn migrate_exact_go_source_rows(connection: &mut Connection) -> Result<(), CatalogError> {
+    let version: i64 = connection
+        .query_row("PRAGMA user_version", [], |row| row.get(0))
+        .map_err(|error| {
+            CatalogError::sqlite("read catalog schema version before migration 17", error)
+        })?;
+    if version > CURRENT_CATALOG_VERSION {
+        return Err(CatalogError::CatalogTooNew {
+            found: version,
+            supported: CURRENT_CATALOG_VERSION,
+        });
+    }
+    if version >= EXACT_GO_SOURCE_ROWS_CATALOG_VERSION {
+        return Ok(());
+    }
+    if version != SEMANTIC_MODEL_SCHEMA_CATALOG_VERSION {
+        return Err(CatalogError::Integrity(format!(
+            "catalog schema reached unexpected version {version} before migration 17"
+        )));
+    }
+
+    let transaction = connection
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(|error| CatalogError::sqlite("begin catalog migration 17", error))?;
+    let locked_version: i64 = transaction
+        .query_row("PRAGMA user_version", [], |row| row.get(0))
+        .map_err(|error| {
+            CatalogError::sqlite("recheck catalog schema before migration 17", error)
+        })?;
+    if locked_version > CURRENT_CATALOG_VERSION {
+        return Err(CatalogError::CatalogTooNew {
+            found: locked_version,
+            supported: CURRENT_CATALOG_VERSION,
+        });
+    }
+    if locked_version >= EXACT_GO_SOURCE_ROWS_CATALOG_VERSION {
+        return transaction.commit().map_err(|error| {
+            CatalogError::sqlite("commit concurrent catalog migration 17", error)
+        });
+    }
+    if locked_version != SEMANTIC_MODEL_SCHEMA_CATALOG_VERSION {
+        return Err(CatalogError::Integrity(format!(
+            "catalog schema changed to unexpected version {locked_version} before migration 17"
+        )));
+    }
+
+    transaction
+        .execute_batch(EXACT_GO_SOURCE_ROWS_SQL)
+        .map_err(|error| CatalogError::sqlite("apply exact Go source-row migration", error))?;
+    let foreign_key_violations = {
+        let mut statement = transaction
+            .prepare("PRAGMA foreign_key_check")
+            .map_err(|error| {
+                CatalogError::sqlite("prepare migration 17 foreign-key check", error)
+            })?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, Option<i64>>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, i64>(3)?,
+                ))
+            })
+            .map_err(|error| CatalogError::sqlite("run migration 17 foreign-key check", error))?;
+        let mut violations = Vec::new();
+        for row in rows {
+            violations.push(row.map_err(|error| {
+                CatalogError::sqlite("read migration 17 foreign-key violation", error)
+            })?);
+        }
+        violations
+    };
+    if !foreign_key_violations.is_empty() {
+        return Err(CatalogError::Integrity(format!(
+            "catalog migration 17 found foreign-key violations: {foreign_key_violations:?}"
+        )));
+    }
+    transaction
+        .pragma_update(None, "user_version", EXACT_GO_SOURCE_ROWS_CATALOG_VERSION)
+        .map_err(|error| CatalogError::sqlite("publish catalog schema version 17", error))?;
+    transaction
+        .commit()
+        .map_err(|error| CatalogError::sqlite("commit catalog migration 17", error))
+}
+
+fn migrate_semantic_model_schema_v14(connection: &mut Connection) -> Result<(), CatalogError> {
+    let version: i64 = connection
+        .query_row("PRAGMA user_version", [], |row| row.get(0))
+        .map_err(|error| {
+            CatalogError::sqlite("read catalog schema version before migration 18", error)
+        })?;
+    if version > CURRENT_CATALOG_VERSION {
+        return Err(CatalogError::CatalogTooNew {
+            found: version,
+            supported: CURRENT_CATALOG_VERSION,
+        });
+    }
+    if version >= SEMANTIC_MODEL_SCHEMA_V14_CATALOG_VERSION {
+        return Ok(());
+    }
+    if version != EXACT_GO_SOURCE_ROWS_CATALOG_VERSION {
+        return Err(CatalogError::Integrity(format!(
+            "catalog schema reached unexpected version {version} before migration 18"
+        )));
+    }
+
+    connection
+        .pragma_update(None, "foreign_keys", false)
+        .map_err(|error| {
+            CatalogError::sqlite("disable catalog foreign keys for migration 18", error)
+        })?;
+    let migration_result = migrate_semantic_model_schema_v14_transaction(connection);
+    let foreign_keys_result = connection
+        .pragma_update(None, "foreign_keys", true)
+        .map_err(|error| {
+            CatalogError::sqlite("restore catalog foreign keys after migration 18", error)
+        });
+    match (migration_result, foreign_keys_result) {
+        (Err(migration_error), Ok(())) => Err(migration_error),
+        (Err(migration_error), Err(foreign_keys_error)) => Err(CatalogError::Integrity(format!(
+            "catalog migration 18 failed: {migration_error}; restoring foreign-key enforcement failed: {foreign_keys_error}"
+        ))),
+        (Ok(()), Err(error)) => Err(error),
+        (Ok(()), Ok(())) => Ok(()),
+    }
+}
+
+fn migrate_semantic_model_schema_v14_transaction(
+    connection: &mut Connection,
+) -> Result<(), CatalogError> {
+    let transaction = connection
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(|error| CatalogError::sqlite("begin catalog migration 18", error))?;
+    let locked_version: i64 = transaction
+        .query_row("PRAGMA user_version", [], |row| row.get(0))
+        .map_err(|error| {
+            CatalogError::sqlite("recheck catalog schema before migration 18", error)
+        })?;
+    if locked_version > CURRENT_CATALOG_VERSION {
+        return Err(CatalogError::CatalogTooNew {
+            found: locked_version,
+            supported: CURRENT_CATALOG_VERSION,
+        });
+    }
+    if locked_version >= SEMANTIC_MODEL_SCHEMA_V14_CATALOG_VERSION {
+        return transaction.commit().map_err(|error| {
+            CatalogError::sqlite("commit concurrent catalog migration 18", error)
+        });
+    }
+    if locked_version != EXACT_GO_SOURCE_ROWS_CATALOG_VERSION {
+        return Err(CatalogError::Integrity(format!(
+            "catalog schema changed to unexpected version {locked_version} before migration 18"
+        )));
+    }
+
+    transaction
+        .execute_batch(SEMANTIC_MODEL_SCHEMA_V14_SQL)
+        .map_err(|error| {
+            CatalogError::sqlite("apply semantic-model-schema-v14 catalog migration", error)
+        })?;
+    let foreign_key_violations = {
+        let mut statement = transaction
+            .prepare("PRAGMA foreign_key_check")
+            .map_err(|error| {
+                CatalogError::sqlite("prepare migration 18 foreign-key check", error)
+            })?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, Option<i64>>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, i64>(3)?,
+                ))
+            })
+            .map_err(|error| CatalogError::sqlite("run migration 18 foreign-key check", error))?;
+        let mut violations = Vec::new();
+        for row in rows {
+            violations.push(row.map_err(|error| {
+                CatalogError::sqlite("read migration 18 foreign-key violation", error)
+            })?);
+        }
+        violations
+    };
+    if !foreign_key_violations.is_empty() {
+        return Err(CatalogError::Integrity(format!(
+            "catalog migration 18 found foreign-key violations: {foreign_key_violations:?}"
+        )));
+    }
+    transaction
+        .pragma_update(
+            None,
+            "user_version",
+            SEMANTIC_MODEL_SCHEMA_V14_CATALOG_VERSION,
+        )
+        .map_err(|error| CatalogError::sqlite("publish catalog schema version 18", error))?;
+    transaction
+        .commit()
+        .map_err(|error| CatalogError::sqlite("commit catalog migration 18", error))
+}
+
+fn migrate_semantic_model_schema_v15(connection: &mut Connection) -> Result<(), CatalogError> {
+    let version: i64 = connection
+        .query_row("PRAGMA user_version", [], |row| row.get(0))
+        .map_err(|error| {
+            CatalogError::sqlite("read catalog schema version before migration 19", error)
+        })?;
+    if version > CURRENT_CATALOG_VERSION {
+        return Err(CatalogError::CatalogTooNew {
+            found: version,
+            supported: CURRENT_CATALOG_VERSION,
+        });
+    }
+    if version >= SEMANTIC_MODEL_SCHEMA_V15_CATALOG_VERSION {
+        return Ok(());
+    }
+    if version != SEMANTIC_MODEL_SCHEMA_V14_CATALOG_VERSION {
+        return Err(CatalogError::Integrity(format!(
+            "catalog schema reached unexpected version {version} before migration 19"
+        )));
+    }
+
+    connection
+        .pragma_update(None, "foreign_keys", false)
+        .map_err(|error| {
+            CatalogError::sqlite("disable catalog foreign keys for migration 19", error)
+        })?;
+    let migration_result = migrate_semantic_model_schema_v15_transaction(connection);
+    let foreign_keys_result = connection
+        .pragma_update(None, "foreign_keys", true)
+        .map_err(|error| {
+            CatalogError::sqlite("restore catalog foreign keys after migration 19", error)
+        });
+    match (migration_result, foreign_keys_result) {
+        (Err(migration_error), Ok(())) => Err(migration_error),
+        (Err(migration_error), Err(foreign_keys_error)) => Err(CatalogError::Integrity(format!(
+            "catalog migration 19 failed: {migration_error}; restoring foreign-key enforcement failed: {foreign_keys_error}"
+        ))),
+        (Ok(()), Err(error)) => Err(error),
+        (Ok(()), Ok(())) => Ok(()),
+    }
+}
+
+fn migrate_semantic_model_schema_v15_transaction(
+    connection: &mut Connection,
+) -> Result<(), CatalogError> {
+    let transaction = connection
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(|error| CatalogError::sqlite("begin catalog migration 19", error))?;
+    let locked_version: i64 = transaction
+        .query_row("PRAGMA user_version", [], |row| row.get(0))
+        .map_err(|error| {
+            CatalogError::sqlite("recheck catalog schema before migration 19", error)
+        })?;
+    if locked_version > CURRENT_CATALOG_VERSION {
+        return Err(CatalogError::CatalogTooNew {
+            found: locked_version,
+            supported: CURRENT_CATALOG_VERSION,
+        });
+    }
+    if locked_version >= SEMANTIC_MODEL_SCHEMA_V15_CATALOG_VERSION {
+        return transaction.commit().map_err(|error| {
+            CatalogError::sqlite("commit concurrent catalog migration 19", error)
+        });
+    }
+    if locked_version != SEMANTIC_MODEL_SCHEMA_V14_CATALOG_VERSION {
+        return Err(CatalogError::Integrity(format!(
+            "catalog schema changed to unexpected version {locked_version} before migration 19"
+        )));
+    }
+
+    transaction
+        .execute_batch(SEMANTIC_MODEL_SCHEMA_V15_SQL)
+        .map_err(|error| {
+            CatalogError::sqlite("apply semantic-model-schema-v15 catalog migration", error)
+        })?;
+    let foreign_key_violations = {
+        let mut statement = transaction
+            .prepare("PRAGMA foreign_key_check")
+            .map_err(|error| {
+                CatalogError::sqlite("prepare migration 19 foreign-key check", error)
+            })?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, Option<i64>>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, i64>(3)?,
+                ))
+            })
+            .map_err(|error| CatalogError::sqlite("run migration 19 foreign-key check", error))?;
+        let mut violations = Vec::new();
+        for row in rows {
+            violations.push(row.map_err(|error| {
+                CatalogError::sqlite("read migration 19 foreign-key violation", error)
+            })?);
+        }
+        violations
+    };
+    if !foreign_key_violations.is_empty() {
+        return Err(CatalogError::Integrity(format!(
+            "catalog migration 19 found foreign-key violations: {foreign_key_violations:?}"
+        )));
+    }
+    transaction
+        .pragma_update(
+            None,
+            "user_version",
+            SEMANTIC_MODEL_SCHEMA_V15_CATALOG_VERSION,
+        )
+        .map_err(|error| CatalogError::sqlite("publish catalog schema version 19", error))?;
+    transaction
+        .commit()
+        .map_err(|error| CatalogError::sqlite("commit catalog migration 19", error))
+}
+
+fn migrate_semantic_model_schema_v16(connection: &mut Connection) -> Result<(), CatalogError> {
+    let version: i64 = connection
+        .query_row("PRAGMA user_version", [], |row| row.get(0))
+        .map_err(|error| {
+            CatalogError::sqlite("read catalog schema version before migration 20", error)
+        })?;
+    if version > CURRENT_CATALOG_VERSION {
+        return Err(CatalogError::CatalogTooNew {
+            found: version,
+            supported: CURRENT_CATALOG_VERSION,
+        });
+    }
+    if version >= SEMANTIC_MODEL_SCHEMA_V16_CATALOG_VERSION {
+        return Ok(());
+    }
+    if version != SEMANTIC_MODEL_SCHEMA_V15_CATALOG_VERSION {
+        return Err(CatalogError::Integrity(format!(
+            "catalog schema reached unexpected version {version} before migration 20"
+        )));
+    }
+
+    connection
+        .pragma_update(None, "foreign_keys", false)
+        .map_err(|error| {
+            CatalogError::sqlite("disable catalog foreign keys for migration 20", error)
+        })?;
+    let migration_result = migrate_semantic_model_schema_v16_transaction(connection);
+    let foreign_keys_result = connection
+        .pragma_update(None, "foreign_keys", true)
+        .map_err(|error| {
+            CatalogError::sqlite("restore catalog foreign keys after migration 20", error)
+        });
+    match (migration_result, foreign_keys_result) {
+        (Err(migration_error), Ok(())) => Err(migration_error),
+        (Err(migration_error), Err(foreign_keys_error)) => Err(CatalogError::Integrity(format!(
+            "catalog migration 20 failed: {migration_error}; restoring foreign-key enforcement failed: {foreign_keys_error}"
+        ))),
+        (Ok(()), Err(error)) => Err(error),
+        (Ok(()), Ok(())) => Ok(()),
+    }
+}
+
+fn migrate_semantic_model_schema_v16_transaction(
+    connection: &mut Connection,
+) -> Result<(), CatalogError> {
+    let transaction = connection
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(|error| CatalogError::sqlite("begin catalog migration 20", error))?;
+    let locked_version: i64 = transaction
+        .query_row("PRAGMA user_version", [], |row| row.get(0))
+        .map_err(|error| {
+            CatalogError::sqlite("recheck catalog schema before migration 20", error)
+        })?;
+    if locked_version > CURRENT_CATALOG_VERSION {
+        return Err(CatalogError::CatalogTooNew {
+            found: locked_version,
+            supported: CURRENT_CATALOG_VERSION,
+        });
+    }
+    if locked_version >= SEMANTIC_MODEL_SCHEMA_V16_CATALOG_VERSION {
+        return transaction.commit().map_err(|error| {
+            CatalogError::sqlite("commit concurrent catalog migration 20", error)
+        });
+    }
+    if locked_version != SEMANTIC_MODEL_SCHEMA_V15_CATALOG_VERSION {
+        return Err(CatalogError::Integrity(format!(
+            "catalog schema changed to unexpected version {locked_version} before migration 20"
+        )));
+    }
+
+    transaction
+        .execute_batch(SEMANTIC_MODEL_SCHEMA_V16_SQL)
+        .map_err(|error| {
+            CatalogError::sqlite("apply semantic-model-schema-v16 catalog migration", error)
+        })?;
+    let foreign_key_violations = {
+        let mut statement = transaction
+            .prepare("PRAGMA foreign_key_check")
+            .map_err(|error| {
+                CatalogError::sqlite("prepare migration 20 foreign-key check", error)
+            })?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, Option<i64>>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, i64>(3)?,
+                ))
+            })
+            .map_err(|error| CatalogError::sqlite("run migration 20 foreign-key check", error))?;
+        let mut violations = Vec::new();
+        for row in rows {
+            violations.push(row.map_err(|error| {
+                CatalogError::sqlite("read migration 20 foreign-key violation", error)
+            })?);
+        }
+        violations
+    };
+    if !foreign_key_violations.is_empty() {
+        return Err(CatalogError::Integrity(format!(
+            "catalog migration 20 found foreign-key violations: {foreign_key_violations:?}"
+        )));
+    }
+    transaction
+        .pragma_update(
+            None,
+            "user_version",
+            SEMANTIC_MODEL_SCHEMA_V16_CATALOG_VERSION,
+        )
+        .map_err(|error| CatalogError::sqlite("publish catalog schema version 20", error))?;
+    transaction
+        .commit()
+        .map_err(|error| CatalogError::sqlite("commit catalog migration 20", error))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use brokk_bifrost_test_macros::hardwon;
     use rusqlite::params;
     use tempfile::TempDir;
 
@@ -463,68 +1520,6 @@ mod tests {
             verified_at: row.get(8)?,
             last_used_at: row.get(9)?,
         })
-    }
-
-    fn sqlite_error(code: i32) -> rusqlite::Error {
-        rusqlite::Error::SqliteFailure(rusqlite::ffi::Error::new(code), None)
-    }
-
-    #[test]
-    fn initialization_retry_admits_busy_and_locking_protocol_failures() {
-        let mut attempts = 0;
-        let value = retry_initialization_with(
-            Duration::from_secs(1),
-            |_| {},
-            || {
-                attempts += 1;
-                match attempts {
-                    1 => Err(sqlite_error(rusqlite::ffi::SQLITE_BUSY)),
-                    2 => Err(sqlite_error(rusqlite::ffi::SQLITE_PROTOCOL)),
-                    _ => Ok(42),
-                }
-            },
-        )
-        .unwrap();
-
-        assert_eq!(value, 42);
-        assert_eq!(attempts, 3);
-    }
-
-    #[test]
-    fn initialization_retry_does_not_admit_other_sqlite_errors() {
-        let mut attempts = 0;
-        let error = retry_initialization_with(
-            Duration::from_secs(1),
-            |_| {},
-            || {
-                attempts += 1;
-                Err::<(), _>(sqlite_error(rusqlite::ffi::SQLITE_LOCKED))
-            },
-        )
-        .unwrap_err();
-
-        assert_eq!(error.sqlite_error_code(), Some(ErrorCode::DatabaseLocked));
-        assert_eq!(attempts, 1);
-    }
-
-    #[test]
-    fn initialization_retry_returns_transient_error_at_deadline() {
-        let mut attempts = 0;
-        let error = retry_initialization_with(
-            Duration::ZERO,
-            |_| panic!("an expired retry must not sleep"),
-            || {
-                attempts += 1;
-                Err::<(), _>(sqlite_error(rusqlite::ffi::SQLITE_PROTOCOL))
-            },
-        )
-        .unwrap_err();
-
-        assert_eq!(
-            error.sqlite_error_code(),
-            Some(ErrorCode::FileLockingProtocolFailed)
-        );
-        assert_eq!(attempts, 1);
     }
 
     fn create_schema_10(connection: &mut Connection) {
@@ -660,6 +1655,86 @@ mod tests {
     }
 
     #[test]
+    fn a_catalog_seeded_from_the_template_matches_a_catalog_built_by_migration() {
+        let temp = TempDir::new().unwrap();
+        // The template builders open with SQLITE_OPEN_NOFOLLOW, which rejects a
+        // symlink anywhere in the path, and production passes canonical paths.
+        // macOS temp directories live under /var -> /private/var (#4604).
+        let root = std::fs::canonicalize(temp.path()).unwrap();
+        let template_dir = root.join("templates");
+        let reference = root.join("reference.db");
+        std::fs::File::create(&reference).unwrap();
+        build_fresh_catalog(&reference).unwrap();
+
+        // The first catalog builds and publishes the template; the second copies it.
+        let first = root.join("first.db");
+        let second = root.join("second.db");
+        for seeded in [&first, &second] {
+            assert!(
+                sqlite_template::seed_missing_database(
+                    seeded,
+                    Some(&template_dir),
+                    &CATALOG_TEMPLATE,
+                    build_fresh_catalog,
+                )
+                .unwrap()
+            );
+        }
+        let template_entries = std::fs::read_dir(&template_dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            template_entries,
+            vec![CATALOG_TEMPLATE.file_name().to_owned()]
+        );
+
+        let describe = |path: &Path| {
+            let connection = Connection::open(path).unwrap();
+            let version: i64 = connection
+                .query_row("PRAGMA user_version", [], |row| row.get(0))
+                .unwrap();
+            let journal_mode: String = connection
+                .query_row("PRAGMA journal_mode", [], |row| row.get(0))
+                .unwrap();
+            let mut statement = connection
+                .prepare("SELECT type, name, sql FROM sqlite_master ORDER BY type, name")
+                .unwrap();
+            let objects = statement
+                .query_map([], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, Option<String>>(2)?,
+                    ))
+                })
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap();
+            let rows = objects
+                .iter()
+                .filter(|(object_type, name, _)| {
+                    object_type == "table" && !name.starts_with("sqlite_")
+                })
+                .map(|(_, name, _)| {
+                    connection
+                        .query_row(&format!("SELECT COUNT(*) FROM \"{name}\""), [], |row| {
+                            row.get::<_, i64>(0)
+                        })
+                        .unwrap()
+                })
+                .collect::<Vec<_>>();
+            (version, journal_mode, objects, rows)
+        };
+        let expected = describe(&reference);
+        assert_eq!(expected.0, CURRENT_CATALOG_VERSION);
+        for seeded in [&first, &second] {
+            assert_eq!(describe(seeded), expected, "{}", seeded.display());
+        }
+    }
+
+    #[test]
+    #[hardwon("#3815: schema-aware pack admission migration broke catalog compatibility")]
     fn migration_11_preserves_legacy_rows_and_matches_fresh_schema() {
         let mut migrated = Connection::open_in_memory().unwrap();
         create_schema_10(&mut migrated);
@@ -825,12 +1900,13 @@ mod tests {
     }
 
     #[test]
+    #[hardwon("#3815: failed catalog migration left partial schema changes behind")]
     fn failed_migration_rolls_back_and_restores_foreign_keys() {
         let mut connection = Connection::open_in_memory().unwrap();
         create_schema_10(&mut connection);
         insert_legacy_pack(&connection);
         connection
-            .execute("UPDATE catalog_packs SET schema_version = 9", [])
+            .execute("UPDATE catalog_packs SET schema_version = 10", [])
             .unwrap();
         let old_objects = schema_objects(&connection);
         let old_pack_row = table_rows(&connection, "catalog_packs");
@@ -880,10 +1956,17 @@ mod tests {
     }
 
     #[test]
+    #[hardwon("#3815: native packs were admitted under the wrong schema gate")]
     fn migration_11_check_requires_legacy_gate_and_forbids_native_gate() {
         let mut connection = Connection::open_in_memory().unwrap();
         create_schema_10(&mut connection);
-        migrate(&mut connection, CatalogOpenMode::ReadWrite).unwrap();
+        migrate_native_compatibility(&mut connection).unwrap();
+        assert_eq!(
+            connection
+                .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            NATIVE_COMPATIBILITY_CATALOG_VERSION
+        );
 
         let insert_pack = |digest: &str, schema_version: i64, compatibility: Option<&str>| {
             connection.execute(
@@ -906,6 +1989,429 @@ mod tests {
     }
 
     #[test]
+    fn migration_12_preserves_catalog_rows_and_admits_schema_nine() {
+        let mut connection = Connection::open_in_memory().unwrap();
+        create_schema_10(&mut connection);
+        insert_legacy_pack(&connection);
+        migrate_native_compatibility(&mut connection).unwrap();
+        assert!(matches!(
+            migrate(&mut connection, CatalogOpenMode::ReadOnly),
+            Err(CatalogError::ReadOnlySchema {
+                found: NATIVE_COMPATIBILITY_CATALOG_VERSION,
+                required: CURRENT_CATALOG_VERSION,
+            })
+        ));
+
+        let schema_eight_digest = "9".repeat(64);
+        connection
+            .execute(
+                "INSERT INTO catalog_packs(
+               manifest_digest, semantic_digest, manifest_bytes, schema_version,
+               pack_id, pack_version, producer_name, producer_version, language,
+               ecosystem, bifrost_compatibility, provenance_json, license,
+               completeness, state, installed_at, verified_at
+             ) VALUES(?1, ?2, X'01', 8, 'schema-eight', '1.0.0', 'producer', '1.0.0',
+               'java', 'jvm', NULL, X'7B7D', 'Apache-2.0', 'complete', 'verified', 1, 1)",
+                params![schema_eight_digest, "b".repeat(64)],
+            )
+            .unwrap();
+        let initial_epoch: i64 = connection
+            .query_row(
+                "SELECT mutation_epoch FROM catalog_semantic_state WHERE singleton = 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let pack_rows = table_rows(&connection, "catalog_packs");
+        let source_rows = table_rows(&connection, "catalog_sources");
+        let pin_rows = table_rows(&connection, "catalog_pins");
+        let generated_rows = table_rows(&connection, "catalog_generated_productions");
+        let semantic_epoch = table_rows(&connection, "catalog_semantic_state");
+        let child_rows: Vec<(&str, Vec<Vec<rusqlite::types::Value>>)> = [
+            "catalog_pack_shards",
+            "catalog_sources",
+            "catalog_pins",
+            "catalog_generated_source_identities",
+            "catalog_shard_validations",
+            "catalog_quarantine",
+        ]
+        .into_iter()
+        .map(|table| (table, table_rows(&connection, table)))
+        .collect();
+        let pack_indexes_and_triggers = {
+            let mut statement = connection
+                .prepare(
+                    "SELECT type, name, sql FROM sqlite_schema
+                     WHERE tbl_name = 'catalog_packs' AND type IN ('index', 'trigger')
+                     ORDER BY type, name",
+                )
+                .unwrap();
+            statement
+                .query_map([], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, Option<String>>(2)?,
+                    ))
+                })
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap()
+        };
+        let generated_view_sql: String = connection
+            .query_row(
+                "SELECT sql FROM sqlite_schema
+                 WHERE type = 'view' AND name = 'catalog_verified_generated_productions'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+
+        migrate(&mut connection, CatalogOpenMode::ReadWrite).unwrap();
+
+        assert_eq!(
+            connection
+                .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            CURRENT_CATALOG_VERSION
+        );
+        assert!(table_rows(&connection, "catalog_exact_go_source_sets").is_empty());
+        assert!(table_rows(&connection, "catalog_exact_go_source_files").is_empty());
+        assert!(table_rows(&connection, "catalog_exact_go_packages").is_empty());
+        assert!(table_rows(&connection, "catalog_exact_go_package_files").is_empty());
+        assert_eq!(table_rows(&connection, "catalog_packs"), pack_rows);
+        assert_eq!(table_rows(&connection, "catalog_sources"), source_rows);
+        assert_eq!(table_rows(&connection, "catalog_pins"), pin_rows);
+        assert_eq!(
+            table_rows(&connection, "catalog_generated_productions"),
+            generated_rows
+        );
+        assert_eq!(
+            table_rows(&connection, "catalog_semantic_state"),
+            semantic_epoch,
+            "the parent-table rebuild must not fire mutation triggers"
+        );
+        for (table, rows) in child_rows {
+            assert_eq!(table_rows(&connection, table), rows, "{table}");
+        }
+        let actual_pack_indexes_and_triggers = {
+            let mut statement = connection
+                .prepare(
+                    "SELECT type, name, sql FROM sqlite_schema
+                     WHERE tbl_name = 'catalog_packs' AND type IN ('index', 'trigger')
+                     ORDER BY type, name",
+                )
+                .unwrap();
+            statement
+                .query_map([], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, Option<String>>(2)?,
+                    ))
+                })
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap()
+        };
+        assert_eq!(actual_pack_indexes_and_triggers, pack_indexes_and_triggers);
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT sql FROM sqlite_schema
+                     WHERE type = 'view' AND name = 'catalog_verified_generated_productions'",
+                    [],
+                    |row| row.get::<_, String>(0),
+                )
+                .unwrap(),
+            generated_view_sql
+        );
+        assert_eq!(
+            connection
+                .query_row("PRAGMA foreign_keys", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            connection
+                .query_row("SELECT count(*) FROM pragma_foreign_key_check", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .unwrap(),
+            0
+        );
+
+        let insert_pack = |digest: &str, schema_version: i64, compatibility: Option<&str>| {
+            connection.execute(
+                "INSERT INTO catalog_packs(
+                   manifest_digest, semantic_digest, manifest_bytes, schema_version,
+                   pack_id, pack_version, producer_name, producer_version, language,
+                   ecosystem, bifrost_compatibility, provenance_json, license,
+                   completeness, state, installed_at, verified_at
+                 ) VALUES(?1, ?2, X'01', ?3, 'fixture', '1.0.0', 'producer', '1.0.0',
+                   'java', 'jvm', ?4, X'7B7D', 'Apache-2.0', 'complete', 'verified', 1, 1)",
+                params![digest, "f".repeat(64), schema_version, compatibility],
+            )
+        };
+        insert_pack(&"c".repeat(64), 9, None).expect("schema 9 omits the engine gate");
+        assert!(insert_pack(&"d".repeat(64), 9, Some("*")).is_err());
+        assert!(insert_pack(&"e".repeat(64), 2, None).is_err());
+        assert!(insert_pack(&"f".repeat(64), 8, Some("*")).is_err());
+        assert!(
+            initial_epoch
+                < connection
+                    .query_row(
+                        "SELECT mutation_epoch FROM catalog_semantic_state WHERE singleton = 1",
+                        [],
+                        |row| row.get::<_, i64>(0),
+                    )
+                    .unwrap()
+        );
+    }
+
+    #[test]
+    fn migrations_13_through_20_preserve_catalog_rows_and_defer_old_shards_to_demand() {
+        let mut connection = Connection::open_in_memory().unwrap();
+        create_schema_10(&mut connection);
+        insert_legacy_pack(&connection);
+        migrate_native_compatibility(&mut connection).unwrap();
+        migrate_unknown_types(&mut connection).unwrap();
+        assert_eq!(
+            connection
+                .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            UNKNOWN_TYPES_CATALOG_VERSION
+        );
+
+        let pack_rows = table_rows(&connection, "catalog_packs");
+        let source_rows = table_rows(&connection, "catalog_sources");
+        let generated_rows = table_rows(&connection, "catalog_generated_productions");
+        let identity_rows = table_rows(&connection, "catalog_generated_source_identities");
+        let quarantine_rows = table_rows(&connection, "catalog_quarantine");
+        let epoch_rows = table_rows(&connection, "catalog_semantic_state");
+
+        migrate_callable_values(&mut connection).unwrap();
+        assert_eq!(
+            connection
+                .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            CALLABLE_VALUES_CATALOG_VERSION
+        );
+        migrate_callable_value_rows(&mut connection).unwrap();
+        assert_eq!(
+            connection
+                .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            CALLABLE_VALUE_ROWS_CATALOG_VERSION
+        );
+        migrate_structured_formals(&mut connection).unwrap();
+
+        assert_eq!(
+            connection
+                .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            STRUCTURED_FORMALS_CATALOG_VERSION
+        );
+        assert_eq!(table_rows(&connection, "catalog_packs"), pack_rows);
+        assert_eq!(table_rows(&connection, "catalog_sources"), source_rows);
+        assert_eq!(
+            table_rows(&connection, "catalog_generated_productions"),
+            generated_rows
+        );
+        assert_eq!(
+            table_rows(&connection, "catalog_generated_source_identities"),
+            identity_rows
+        );
+        assert_eq!(
+            table_rows(&connection, "catalog_quarantine"),
+            quarantine_rows
+        );
+        assert_eq!(
+            table_rows(&connection, "catalog_semantic_state"),
+            epoch_rows,
+            "the parent-table rebuild must not fire mutation triggers"
+        );
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT count(*) FROM catalog_callable_values_indexed_shards",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            0,
+            "schema migration leaves old shards unindexed until an exact demand reconciles them"
+        );
+
+        let rows_after_callable_values = table_rows(&connection, "catalog_packs");
+        let epoch_after_callable_values = table_rows(&connection, "catalog_semantic_state");
+        migrate_semantic_model_schema(&mut connection).unwrap();
+        assert_eq!(
+            connection
+                .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            SEMANTIC_MODEL_SCHEMA_CATALOG_VERSION
+        );
+        migrate_exact_go_source_rows(&mut connection).unwrap();
+        migrate_semantic_model_schema_v14(&mut connection).unwrap();
+        migrate_semantic_model_schema_v15(&mut connection).unwrap();
+        migrate_semantic_model_schema_v16(&mut connection).unwrap();
+        assert_eq!(
+            connection
+                .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            CURRENT_CATALOG_VERSION
+        );
+        assert_eq!(
+            table_rows(&connection, "catalog_packs"),
+            rows_after_callable_values
+        );
+        assert_eq!(
+            table_rows(&connection, "catalog_semantic_state"),
+            epoch_after_callable_values,
+            "the schema-compatibility rebuild must not fire mutation triggers"
+        );
+
+        let schema_ten_digest = "9".repeat(64);
+        connection
+            .execute(
+                "INSERT INTO catalog_packs(
+               manifest_digest, semantic_digest, manifest_bytes, schema_version,
+               pack_id, pack_version, producer_name, producer_version, language,
+               ecosystem, bifrost_compatibility, provenance_json, license,
+               completeness, state, installed_at, verified_at
+             ) VALUES(?1, ?2, X'01', 10, 'schema-ten', '1.0.0', 'producer', '1.0.0',
+               'go', 'go', NULL, X'7B7D', 'Apache-2.0', 'complete', 'verified', 1, 1)",
+                params![schema_ten_digest, "b".repeat(64)],
+            )
+            .expect("schema 10 is admitted after migration 15");
+        assert!(
+            connection
+                .execute(
+                    "INSERT INTO catalog_packs(
+               manifest_digest, semantic_digest, manifest_bytes, schema_version,
+               pack_id, pack_version, producer_name, producer_version, language,
+               ecosystem, bifrost_compatibility, provenance_json, license,
+               completeness, state, installed_at, verified_at
+             ) VALUES(?1, ?2, X'01', 10, 'schema-ten-invalid', '1.0.0', 'producer', '1.0.0',
+               'go', 'go', '*', X'7B7D', 'Apache-2.0', 'complete', 'verified', 1, 1)",
+                    params!["8".repeat(64), "c".repeat(64)],
+                )
+                .is_err()
+        );
+        connection
+            .execute(
+                "INSERT INTO catalog_packs(
+               manifest_digest, semantic_digest, manifest_bytes, schema_version,
+               pack_id, pack_version, producer_name, producer_version, language,
+               ecosystem, bifrost_compatibility, provenance_json, license,
+               completeness, state, installed_at, verified_at
+             ) VALUES(?1, ?2, X'01', 11, 'schema-eleven', '1.0.0', 'producer', '1.0.0',
+               'go', 'go', NULL, X'7B7D', 'Apache-2.0', 'complete', 'verified', 1, 1)",
+                params!["4".repeat(64), "3".repeat(64)],
+            )
+            .expect("schema 11 remains supported after migration 18");
+        let schema_twelve_digest = "7".repeat(64);
+        connection
+            .execute(
+                "INSERT INTO catalog_packs(
+               manifest_digest, semantic_digest, manifest_bytes, schema_version,
+               pack_id, pack_version, producer_name, producer_version, language,
+               ecosystem, bifrost_compatibility, provenance_json, license,
+               completeness, state, installed_at, verified_at
+             ) VALUES(?1, ?2, X'01', 12, 'schema-twelve', '1.0.0', 'producer', '1.0.0',
+               'go', 'go', NULL, X'7B7D', 'Apache-2.0', 'complete', 'verified', 1, 1)",
+                params![schema_twelve_digest, "f".repeat(64)],
+            )
+            .expect("schema 12 is admitted after migration 18");
+        connection
+            .execute(
+                "INSERT INTO catalog_packs(
+               manifest_digest, semantic_digest, manifest_bytes, schema_version,
+               pack_id, pack_version, producer_name, producer_version, language,
+               ecosystem, bifrost_compatibility, provenance_json, license,
+               completeness, state, installed_at, verified_at
+             ) VALUES(?1, ?2, X'01', 13, 'schema-thirteen', '1.0.0', 'producer', '1.0.0',
+               'go', 'go', NULL, X'7B7D', 'Apache-2.0', 'complete', 'verified', 1, 1)",
+                params!["5".repeat(64), "2".repeat(64)],
+            )
+            .expect("schema 13 is admitted after migration 18");
+        connection
+            .execute(
+                "INSERT INTO catalog_packs(
+               manifest_digest, semantic_digest, manifest_bytes, schema_version,
+               pack_id, pack_version, producer_name, producer_version, language,
+               ecosystem, bifrost_compatibility, provenance_json, license,
+               completeness, state, installed_at, verified_at
+             ) VALUES(?1, ?2, X'01', 14, 'schema-fourteen', '1.0.0', 'producer', '1.0.0',
+               'go', 'go', NULL, X'7B7D', 'Apache-2.0', 'complete', 'verified', 1, 1)",
+                params!["6".repeat(64), "d".repeat(64)],
+            )
+            .expect("schema 14 remains admitted after migration 19");
+        connection
+            .execute(
+                "INSERT INTO catalog_packs(
+               manifest_digest, semantic_digest, manifest_bytes, schema_version,
+               pack_id, pack_version, producer_name, producer_version, language,
+               ecosystem, bifrost_compatibility, provenance_json, license,
+               completeness, state, installed_at, verified_at
+            ) VALUES(?1, ?2, X'01', 15, 'schema-fifteen', '1.0.0', 'producer', '1.0.0',
+               'python', 'pypi', NULL, X'7B7D', 'Apache-2.0', 'complete', 'verified', 1, 1)",
+                params!["1".repeat(64), "0".repeat(64)],
+            )
+            .expect("schema 15 is admitted after migration 19");
+        connection
+            .execute(
+                "INSERT INTO catalog_packs(
+               manifest_digest, semantic_digest, manifest_bytes, schema_version,
+               pack_id, pack_version, producer_name, producer_version, language,
+               ecosystem, bifrost_compatibility, provenance_json, license,
+               completeness, state, installed_at, verified_at
+             ) VALUES(?1, ?2, X'01', 16, 'schema-sixteen', '1.0.0', 'producer', '1.0.0',
+               'python', 'pypi', NULL, X'7B7D', 'Apache-2.0', 'complete', 'verified', 1, 1)",
+                params!["2".repeat(64), "9".repeat(64)],
+            )
+            .expect("schema 16 is admitted after migration 20");
+        assert!(
+            connection
+                .execute(
+                    "INSERT INTO catalog_packs(
+               manifest_digest, semantic_digest, manifest_bytes, schema_version,
+               pack_id, pack_version, producer_name, producer_version, language,
+               ecosystem, bifrost_compatibility, provenance_json, license,
+               completeness, state, installed_at, verified_at
+             ) VALUES(?1, ?2, X'01', 15, 'schema-fifteen-invalid', '1.0.0', 'producer', '1.0.0',
+               'go', 'go', '*', X'7B7D', 'Apache-2.0', 'complete', 'verified', 1, 1)",
+                    params!["8".repeat(64), "e".repeat(64)],
+                )
+                .is_err()
+        );
+        assert!(
+            connection
+                .execute(
+                    "INSERT INTO catalog_packs(
+               manifest_digest, semantic_digest, manifest_bytes, schema_version,
+               pack_id, pack_version, producer_name, producer_version, language,
+               ecosystem, bifrost_compatibility, provenance_json, license,
+               completeness, state, installed_at, verified_at
+             ) VALUES(?1, ?2, X'01', 16, 'schema-sixteen-invalid', '1.0.0', 'producer', '1.0.0',
+               'python', 'pypi', '*', X'7B7D', 'Apache-2.0', 'complete', 'verified', 1, 1)",
+                    params!["3".repeat(64), "8".repeat(64)],
+                )
+                .is_err()
+        );
+        assert_eq!(
+            connection
+                .query_row("SELECT count(*) FROM pragma_foreign_key_check", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    #[hardwon("#3815: catalog schema rejection modified a read-only database")]
     fn read_only_old_and_too_new_catalog_errors_leave_database_bytes_unchanged() {
         for (version, expected_error) in [
             (
@@ -916,9 +2422,9 @@ mod tests {
                 },
             ),
             (
-                12,
+                CURRENT_CATALOG_VERSION + 1,
                 CatalogError::CatalogTooNew {
-                    found: 12,
+                    found: CURRENT_CATALOG_VERSION + 1,
                     supported: CURRENT_CATALOG_VERSION,
                 },
             ),
@@ -942,12 +2448,14 @@ mod tests {
                     CatalogError::ReadOnlySchema { .. },
                 ) => {}
                 (
+                    CatalogError::CatalogTooNew { found, supported },
                     CatalogError::CatalogTooNew {
-                        found: 12,
-                        supported: CURRENT_CATALOG_VERSION,
+                        found: expected_found,
+                        supported: expected_supported,
                     },
-                    CatalogError::CatalogTooNew { .. },
-                ) => {}
+                ) => {
+                    assert_eq!((found, supported), (expected_found, expected_supported));
+                }
                 (error, expected) => panic!("expected {expected:?}, found {error:?}"),
             }
             assert_eq!(std::fs::read(&path).unwrap(), original_bytes);
@@ -959,5 +2467,88 @@ mod tests {
                 version
             );
         }
+        let root = TempDir::new().unwrap();
+        let path = root.path().join(CATALOG_DB_FILE_NAME);
+        let root_path = std::fs::canonicalize(root.path()).unwrap();
+        let mut connection = Connection::open(&path).unwrap();
+        create_schema_10(&mut connection);
+        migrate_native_compatibility(&mut connection).unwrap();
+        drop(connection);
+        let error = open(&root_path, CatalogOpenMode::ReadOnly).unwrap_err();
+        assert!(matches!(
+            error,
+            CatalogError::ReadOnlySchema { found, required }
+                if found == NATIVE_COMPATIBILITY_CATALOG_VERSION
+                    && required == CURRENT_CATALOG_VERSION
+        ));
+    }
+
+    #[test]
+    #[hardwon("003c2dc95f7d: transient BUSY and PROTOCOL locks were not retried")]
+    fn initialization_retry_admits_busy_and_locking_protocol_failures() {
+        let mut attempts = 0;
+        let value = retry_initialization_with(
+            Duration::from_secs(1),
+            |_| {},
+            || {
+                attempts += 1;
+                match attempts {
+                    1 => Err(brokk_bifrost_core::test_support::sqlite_error(
+                        rusqlite::ffi::SQLITE_BUSY,
+                    )),
+                    2 => Err(brokk_bifrost_core::test_support::sqlite_error(
+                        rusqlite::ffi::SQLITE_PROTOCOL,
+                    )),
+                    _ => Ok(42),
+                }
+            },
+        )
+        .unwrap();
+
+        assert_eq!(value, 42);
+        assert_eq!(attempts, 3);
+    }
+
+    #[test]
+    #[hardwon("003c2dc95f7d: SQLITE_LOCKED must stay terminal")]
+    fn initialization_retry_does_not_admit_other_sqlite_errors() {
+        let mut attempts = 0;
+        let error = retry_initialization_with(
+            Duration::from_secs(1),
+            |_| {},
+            || {
+                attempts += 1;
+                Err::<(), _>(brokk_bifrost_core::test_support::sqlite_error(
+                    rusqlite::ffi::SQLITE_LOCKED,
+                ))
+            },
+        )
+        .unwrap_err();
+
+        assert_eq!(error.sqlite_error_code(), Some(ErrorCode::DatabaseLocked));
+        assert_eq!(attempts, 1);
+    }
+
+    #[test]
+    #[hardwon("003c2dc95f7d: the final transient error must be returned at the deadline")]
+    fn initialization_retry_returns_transient_error_at_deadline() {
+        let mut attempts = 0;
+        let error = retry_initialization_with(
+            Duration::ZERO,
+            |_| panic!("an expired retry must not sleep"),
+            || {
+                attempts += 1;
+                Err::<(), _>(brokk_bifrost_core::test_support::sqlite_error(
+                    rusqlite::ffi::SQLITE_PROTOCOL,
+                ))
+            },
+        )
+        .unwrap_err();
+
+        assert_eq!(
+            error.sqlite_error_code(),
+            Some(ErrorCode::FileLockingProtocolFailed)
+        );
+        assert_eq!(attempts, 1);
     }
 }

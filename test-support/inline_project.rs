@@ -115,6 +115,27 @@ impl InlineTestProject {
     }
 }
 
+/// Build a Rust inline project with one additional authored file.
+pub fn rust_project_with_file(
+    relative_path: impl Into<PathBuf>,
+    contents: impl Into<String>,
+) -> InlineTestProject {
+    InlineTestProject::with_language(Language::Rust)
+        .file("src/lib.rs", "pub fn ignored() {}\n")
+        .file(relative_path, contents)
+}
+
+/// Build a Python inline project and its default workspace analyzer.
+pub fn python_workspace(files: &[(&str, &str)]) -> (BuiltInlineTestProject, WorkspaceAnalyzer) {
+    let mut builder = InlineTestProject::with_language(Language::Python);
+    for (path, source) in files {
+        builder = builder.file(*path, *source);
+    }
+    let project = builder.build();
+    let analyzer = project.workspace_analyzer(AnalyzerConfig::default());
+    (project, analyzer)
+}
+
 pub struct BuiltInlineTestProject {
     temp: tempfile::TempDir,
     project: TestProject,

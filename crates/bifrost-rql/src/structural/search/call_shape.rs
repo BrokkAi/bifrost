@@ -22,7 +22,7 @@
 //! separates them.
 
 use super::*;
-use brokk_bifrost_core::analyzer::structural::callable::CallShapeCoverage;
+use brokk_bifrost_core::analyzer::structural::callable::{CallKind, CallShapeCoverage};
 
 /// Derive call-shape expansions for one pipeline input position.
 ///
@@ -38,6 +38,7 @@ pub(super) fn call_shape_expansions_for_input(
     range: Range,
     known_facts: Option<&Arc<FileFacts>>,
     known_node: Option<u32>,
+    bindings: &mut CallBindingCache,
     receiver_facts: &mut HashMap<ProjectFile, Arc<FileFacts>>,
     budget: &mut CodeQueryExecutionBudget,
     limits: CodeQueryExecutionLimits,
@@ -69,18 +70,44 @@ pub(super) fn call_shape_expansions_for_input(
         },
     };
     let call_id = known_node
-        .filter(|&node| facts.node(node).kind == NormalizedKind::Call)
+        .filter(|&node| facts.node(node).kind.satisfies(NormalizedKind::Call))
+        .map(|node| spawn_operand_call(&facts, node).unwrap_or(node))
         .or_else(|| innermost_call_for_range(&facts, range));
     let Some(call_id) = call_id else {
         return Vec::new();
     };
-    let Some(report) =
+    let Some(mut report) =
         crate::analyzer::usages::call_shape::call_shape_for_call(&facts, file, call_id)
     else {
         return Vec::new();
     };
+    // Python's grammar uses the same call expression for functions and
+    // classes. Match the resolved-source rule used by the binding relation:
+    // only one complete resolver result that names a class upgrades the
+    // syntactic function/method kind to a constructor.
+    if crate::analyzer::common::language_for_file(file) == Language::Python
+        && let Some(callee_range) = report.outcome.callee_range
+        && let Some(lookup) =
+            bindings.resolved_call_target(analyzer, file, callee_range, cancellation)
+        && lookup.outcome.status == DefinitionLookupStatus::Resolved
+    {
+        let model_definitions = lookup.outcome.modeled_definitions;
+        let mut definitions = lookup.outcome.definitions;
+        definitions.sort();
+        definitions.dedup();
+        let unique_source_class = model_definitions.is_empty()
+            && matches!(definitions.as_slice(), [class] if class.is_class());
+        let unique_model_class = definitions.is_empty()
+            && matches!(model_definitions.as_slice(), [class]
+                if class.language == Language::Python.config_label()
+                    && class.kind == crate::analyzer::semantic_model::SemanticModelSymbolKind::Class
+                    && !class.provenance.ambiguous);
+        if unique_source_class || unique_model_class {
+            report.outcome.call_kind = CallKind::Constructor;
+        }
+    }
     let outcome = &report.outcome;
-    if outcome.coverage != CallShapeCoverage::Exact
+    if !outcome.coverage.is_exact()
         && reported_suppressed_shapes.insert(outcome.site_ast_id.clone())
     {
         diagnostics.push(CodeQueryDiagnostic {
@@ -91,7 +118,7 @@ pub(super) fn call_shape_expansions_for_input(
             message: format!(
                 "call_shape coverage is {} at {}:{} (site_ast_id={}), so the argument-group, argument and binding rows this shape heads were suppressed rather than emitted empty",
                 outcome.coverage.label(),
-                outcome.file,
+                crate::path_utils::workspace_relative_slash_path(outcome.file.rel_path()),
                 outcome.range.start_line,
                 outcome.site_ast_id,
             ),
@@ -100,9 +127,61 @@ pub(super) fn call_shape_expansions_for_input(
     }
     let value = CallShapeValue {
         report: Arc::new(report),
+        seed: traces.first().map(|trace| Arc::clone(&trace.seed)),
         source: Some(Arc::from(facts.source())),
+        facts: Some(facts),
+        resolved_external_callee: None,
     };
     vec![pipeline_expansion(PipelineValue::CallShape(value))]
+}
+
+/// Attach the resolver's exact external identity to a call shape only when a
+/// query explicitly requests the `exact_external_callee` relation.
+pub(super) fn exact_external_callee_expansions(
+    analyzer: &dyn IAnalyzer,
+    bindings: &mut CallBindingCache,
+    value: &CallShapeValue,
+    cancellation: Option<&CancellationToken>,
+) -> Vec<PipelineExpansion> {
+    let outcome = &value.report.outcome;
+    let resolved_external_callee = match crate::analyzer::common::language_for_file(&outcome.file) {
+        Language::Python => outcome.callee_range.and_then(|callee_range| {
+            bindings.resolved_exact_external_callee(
+                analyzer,
+                &outcome.file,
+                callee_range,
+                cancellation,
+            )
+        }),
+        Language::Rust if outcome.coverage == CallShapeCoverage::ExactMacroDerived => bindings
+            .resolved_external_call_dispatch(analyzer, &outcome.file, outcome.range, cancellation)
+            .map(|target| {
+                format!(
+                    "{}.{}",
+                    target.identity().owner_fqn(),
+                    target.identity().member()
+                )
+            }),
+        _ => None,
+    };
+    let mut value = value.clone();
+    value.resolved_external_callee = resolved_external_callee;
+    vec![pipeline_expansion(PipelineValue::CallShape(value))]
+}
+
+/// A Go `go_statement` wraps the call it starts. Project its call shape onto
+/// that exact child call so selectors do not publish the wrapper and call as
+/// two independently bindable invocations. Standalone spawn-call expressions
+/// (such as Rust `tokio::spawn`) keep their own shape.
+fn spawn_operand_call(facts: &FileFacts, node_id: u32) -> Option<u32> {
+    let node = facts.node(node_id);
+    if node.kind != NormalizedKind::ConcurrentSpawn {
+        return None;
+    }
+    (node_id + 1..node.subtree_end).find(|&candidate_id| {
+        let candidate = facts.node(candidate_id);
+        candidate.parent == Some(node_id) && candidate.kind == NormalizedKind::Call
+    })
 }
 
 /// The innermost (smallest) call node whose exact span contains `range`.
@@ -115,7 +194,7 @@ fn innermost_call_for_range(facts: &FileFacts, range: Range) -> Option<u32> {
         .nodes()
         .iter()
         .enumerate()
-        .filter(|(_, node)| node.kind == NormalizedKind::Call)
+        .filter(|(_, node)| node.kind.satisfies(NormalizedKind::Call))
         .filter(|(_, node)| {
             node.range.start_byte <= range.start_byte && range.end_byte <= node.range.end_byte
         })

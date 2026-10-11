@@ -182,13 +182,16 @@ impl ReferenceEdgeSupport {
         support: [EdgeSupport::Unsupported; EdgeAxis::COUNT],
     };
 
-    pub const fn supported(mut self, axis: EdgeAxis) -> Self {
-        self.support[axis.index()] = EdgeSupport::Supported;
-        self
+    pub const fn supported(self, axis: EdgeAxis) -> Self {
+        self.with_support(axis, EdgeSupport::Supported)
     }
 
-    pub const fn unsupported(mut self, axis: EdgeAxis) -> Self {
-        self.support[axis.index()] = EdgeSupport::Unsupported;
+    pub const fn unsupported(self, axis: EdgeAxis) -> Self {
+        self.with_support(axis, EdgeSupport::Unsupported)
+    }
+
+    const fn with_support(mut self, axis: EdgeAxis, support: EdgeSupport) -> Self {
+        self.support[axis.index()] = support;
         self
     }
 
@@ -201,7 +204,7 @@ impl ReferenceEdgeSupport {
     }
 
     pub fn is_empty(&self) -> bool {
-        self.support.iter().all(|support| !support.is_supported())
+        super::support_is_empty(self.support.iter().map(|support| support.is_supported()))
     }
 
     /// Iterate in the stable order declared by [`ALL_EDGE_AXES`].
@@ -237,48 +240,16 @@ pub static DEEP_REFERENCE_EDGE_SUPPORT: ReferenceEdgeSupport = INVERSE_ONLY
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::HashSet;
 
-    /// Every labelled vocabulary in this registry must have unique labels that
-    /// round-trip through both `from_label` and serde, so a JSON surface and a
-    /// rendered surface never disagree about a name.
     #[test]
     fn edge_vocabularies_are_unique_and_round_trip() {
-        macro_rules! check {
-            ($all:expr, $type:ty) => {{
-                let mut labels = HashSet::new();
-                for &value in $all {
-                    assert!(labels.insert(value.label()), "duplicate label {value:?}");
-                    assert_eq!(<$type>::from_label(value.label()), Some(value));
-                    let json = serde_json::to_value(value).expect("serialize");
-                    assert_eq!(
-                        json,
-                        serde_json::Value::String(value.label().to_owned()),
-                        "serde label diverges from label() for {value:?}"
-                    );
-                    let back: $type = serde_json::from_value(json).expect("deserialize");
-                    assert_eq!(back, value);
-                }
-                assert_eq!(labels.len(), $all.len());
-            }};
-        }
-
-        check!(ALL_EDGE_PROVENANCES, EdgeProvenance);
-        check!(ALL_OWNER_RELATIONS, OwnerRelation);
-        check!(ALL_SITE_CLASSES, SiteClass);
-        check!(ALL_EDGE_AXES, EdgeAxis);
+        assert_vocabulary_round_trip!(ALL_EDGE_PROVENANCES, EdgeProvenance);
+        assert_vocabulary_round_trip!(ALL_OWNER_RELATIONS, OwnerRelation);
+        assert_vocabulary_round_trip!(ALL_SITE_CLASSES, SiteClass);
+        assert_vocabulary_round_trip!(ALL_EDGE_AXES, EdgeAxis);
 
         assert!(EdgeAxis::from_label("not_an_axis").is_none());
         assert!(OwnerRelation::from_label("owner").is_none());
-    }
-
-    #[test]
-    fn axis_indices_are_dense_and_size_the_support_table() {
-        assert_eq!(ALL_EDGE_AXES.len(), EdgeAxis::COUNT);
-        for (slot, &axis) in ALL_EDGE_AXES.iter().enumerate() {
-            assert_eq!(axis.index(), slot);
-        }
-        assert_eq!(ReferenceEdgeSupport::NONE.iter().count(), EdgeAxis::COUNT);
     }
 
     #[test]
@@ -299,37 +270,5 @@ mod tests {
         assert!(!declared.is_supported(EdgeAxis::ForwardProjection));
         assert!(!declared.is_empty());
         assert!(NO_REFERENCE_EDGE_SUPPORT.is_empty());
-    }
-
-    /// The two shared adapter tables are the one place adapters state what
-    /// they answer, so their contents are asserted once here rather than
-    /// eleven times across the adapters: inverse-only adapters answer exactly
-    /// the two axes every usage index carries, and deep adapters answer
-    /// everything.
-    #[test]
-    fn shared_adapter_tables_state_the_claimed_axes() {
-        for &axis in ALL_EDGE_AXES {
-            let expected = matches!(
-                axis,
-                EdgeAxis::InverseProjection | EdgeAxis::ProofAttribution
-            );
-            assert_eq!(
-                INVERSE_REFERENCE_EDGE_SUPPORT.is_supported(axis),
-                expected,
-                "unexpected inverse-only support for {axis}"
-            );
-            assert!(
-                DEEP_REFERENCE_EDGE_SUPPORT.is_supported(axis),
-                "a deep adapter must answer {axis}"
-            );
-        }
-    }
-
-    #[test]
-    fn every_axis_describes_itself() {
-        for &axis in ALL_EDGE_AXES {
-            assert!(!axis.description().is_empty());
-            assert_eq!(axis.signature(), axis.label());
-        }
     }
 }

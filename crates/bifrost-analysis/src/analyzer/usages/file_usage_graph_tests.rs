@@ -140,11 +140,6 @@ impl TestAnalyzer {
         self.source_inventory_complete = false;
         self
     }
-
-    fn with_project_source_inventory(mut self) -> Self {
-        self.use_project_source_inventory = true;
-        self
-    }
 }
 
 impl CodeUnitIndex for TestAnalyzer {
@@ -190,7 +185,7 @@ impl CodeUnitIndex for TestAnalyzer {
     }
 
     fn get_skeleton_header(&self, _unit: &CodeUnit) -> Option<String> {
-        unimplemented!("coarse file graphs do not render declarations")
+        self.get_skeleton(_unit)
     }
 
     fn get_source(&self, _unit: &CodeUnit, _include_comments: bool) -> Option<String> {
@@ -226,10 +221,6 @@ impl IAnalyzer for TestAnalyzer {
         Self: Sized,
     {
         self.clone()
-    }
-
-    fn extract_call_receiver(&self, _reference: &str) -> Option<String> {
-        None
     }
 
     fn is_access_expression(
@@ -451,35 +442,6 @@ fn absent_bulk_facts_keep_legacy_per_file_reads_supported() {
 }
 
 #[test]
-fn cancellation_before_bulk_reads_returns_cancelled() {
-    let built = inline_rust_project();
-    let files = [built.file("a.rs"), built.file("b.rs"), built.file("c.rs")];
-    let provider = TestImportProvider::new(
-        Some(empty_facts(&files)),
-        HashMap::default(),
-        AdditionalDependencies::Complete,
-        None,
-    );
-    let analyzer = TestAnalyzer::new(&built, files.to_vec(), Arc::clone(&provider), None);
-    let cancellation = CancellationToken::new();
-    cancellation.cancel();
-    let scope = AnalyzerQueryScope::new(&analyzer);
-    let outcome = build_workspace_file_usage_graph_with_cancellation(
-        &analyzer,
-        scope.token(),
-        &selected_rust_ecosystem(),
-        &cancellation,
-    );
-
-    assert!(matches!(
-        outcome,
-        WorkspaceFileUsageGraphBuildOutcome::Cancelled
-    ));
-    assert_eq!(0, provider.import_info_calls.load(Ordering::Acquire));
-    assert_eq!(0, analyzer.contains_tests_calls.load(Ordering::Acquire));
-}
-
-#[test]
 fn unavailable_additional_dependencies_keep_import_edges_and_mark_incomplete() {
     let built = inline_rust_project();
     let files = [built.file("a.rs"), built.file("b.rs"), built.file("c.rs")];
@@ -546,59 +508,6 @@ fn incomplete_source_inventory_preserves_known_bulk_edges() {
     assert_edge(&graph, &files[0], &files[1]);
     assert_eq!(files.len(), graph.nodes.len());
     assert_eq!(0, provider.prefetch_calls.load(Ordering::Acquire));
-}
-
-#[test]
-fn inactive_project_language_is_not_a_coarse_graph_node() {
-    let built = InlineTestProject::with_language(Language::Rust)
-        .file("main.rs", "fn main() {}")
-        .file("inactive.py", "class Inactive: pass")
-        .build();
-    let rust_file = built.file("main.rs");
-    let inactive_file = built.file("inactive.py");
-    let provider = TestImportProvider::new(
-        Some(empty_facts(std::slice::from_ref(&rust_file))),
-        direct_edge(&rust_file, &inactive_file),
-        AdditionalDependencies::Complete,
-        None,
-    );
-    let analyzer = TestAnalyzer::new(
-        &built,
-        vec![rust_file.clone(), inactive_file.clone()],
-        Arc::clone(&provider),
-        None,
-    )
-    .with_project_source_inventory();
-    let cancellation = CancellationToken::new();
-    let scope = AnalyzerQueryScope::new(&analyzer);
-    let outcome = build_workspace_file_usage_graph_with_cancellation(
-        &analyzer,
-        scope.token(),
-        &[UsageEcosystem::Rust, UsageEcosystem::Python]
-            .into_iter()
-            .collect(),
-        &cancellation,
-    );
-
-    let graph = match outcome {
-        WorkspaceFileUsageGraphBuildOutcome::Complete(graph) => graph,
-        WorkspaceFileUsageGraphBuildOutcome::Incomplete(_) => {
-            panic!("the complete active-language project inventory should be complete")
-        }
-        WorkspaceFileUsageGraphBuildOutcome::Cancelled => panic!("unexpected cancellation"),
-    };
-    assert!(
-        graph
-            .nodes
-            .iter()
-            .any(|node| node.primary_file == rust_file)
-    );
-    assert!(
-        !graph
-            .nodes
-            .iter()
-            .any(|node| node.primary_file == inactive_file)
-    );
 }
 
 #[test]

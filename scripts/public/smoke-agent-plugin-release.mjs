@@ -10,7 +10,7 @@ import { pathToFileURL } from "node:url";
 import { promisify } from "node:util";
 
 import { toolInventoryFromMarkdown, unavailableSkillTools } from "./skill-tool-contract.mjs";
-import { required } from "./cli-argument-helpers.mjs";
+import { parseCamelCaseArgs, required } from "./cli-argument-helpers.mjs";
 import { roundTrip, waitForSpawn, writeMessage } from "./mcp-smoke-transport.mjs";
 
 const execFileAsync = promisify(execFile);
@@ -94,24 +94,15 @@ function validateRecordedCodexHandshake(fixture) {
 }
 
 function parseArgs(args) {
-  const options = {};
-  for (let index = 0; index < args.length; index += 2) {
-    const key = args[index];
-    const value = args[index + 1];
-    if (!key?.startsWith("--") || value === undefined) {
-      throw new Error(
-        "Usage: smoke-agent-plugin-release.mjs --plugin-dir <dir> --cache-dir <empty-dir> " +
-        "[--binary-path <bifrost>]"
-      );
-    }
-    options[key.slice(2).replace(/-([a-z])/g, (_match, letter) => letter.toUpperCase())] = value;
-  }
-  return options;
+  return parseCamelCaseArgs(
+    args,
+    "Usage: smoke-agent-plugin-release.mjs --plugin-dir <dir> --cache-dir <empty-dir> " +
+      "[--binary-path <bifrost>]",
+  );
 }
 
 async function requiredDirectory(value, name) {
-  const directory = path.resolve(required(value, name));
-  const stat = await fs.stat(directory);
+  const { target: directory, stat } = await requiredPathStat(value, name);
   if (!stat.isDirectory()) {
     throw new Error(`--${name} must be a directory: ${directory}`);
   }
@@ -119,12 +110,16 @@ async function requiredDirectory(value, name) {
 }
 
 async function requiredFile(value, name) {
-  const file = path.resolve(required(value, name));
-  const stat = await fs.stat(file);
+  const { target: file, stat } = await requiredPathStat(value, name);
   if (!stat.isFile()) {
     throw new Error(`--${name} must be a file: ${file}`);
   }
   return file;
+}
+
+async function requiredPathStat(value, name) {
+  const target = path.resolve(required(value, name));
+  return { target, stat: await fs.stat(target) };
 }
 
 async function resolvePortablePluginLaunch(pluginRoot) {
@@ -152,8 +147,7 @@ async function resolvePortablePluginLaunch(pluginRoot) {
   );
   assert.deepEqual(server.args, ["--mcp", "symbol|extended"]);
   const command = path.resolve(pluginRoot, server.command);
-  await fs.access(command);
-  return { command, cwd: pluginRoot, args: server.args, manifestPath, mcpConfigPath };
+  return resolvedPluginLaunch(pluginRoot, command, server.args, manifestPath, mcpConfigPath);
 }
 
 async function resolveCodexPluginLaunch(pluginRoot) {
@@ -184,14 +178,7 @@ async function resolveCodexPluginLaunch(pluginRoot) {
   assert.equal(server.tool_timeout_sec, 300);
   const installedPackageRoot = path.resolve(pluginRoot, server.cwd);
   const command = path.resolve(installedPackageRoot, server.command);
-  await fs.access(command);
-  return {
-    command,
-    cwd: pluginRoot,
-    args: server.args,
-    manifestPath,
-    mcpConfigPath,
-  };
+  return resolvedPluginLaunch(pluginRoot, command, server.args, manifestPath, mcpConfigPath);
 }
 
 async function resolveClaudePluginLaunch(pluginRoot) {
@@ -213,8 +200,12 @@ async function resolveClaudePluginLaunch(pluginRoot) {
   );
   assert.deepEqual(server.args, ["--mcp", "symbol|extended"]);
   const command = path.join(pluginRoot, "bin", "bifrost-launcher.mjs");
+  return resolvedPluginLaunch(pluginRoot, command, server.args, manifestPath, mcpConfigPath);
+}
+
+async function resolvedPluginLaunch(pluginRoot, command, args, manifestPath, mcpConfigPath) {
   await fs.access(command);
-  return { command, cwd: pluginRoot, args: server.args, manifestPath, mcpConfigPath };
+  return { command, cwd: pluginRoot, args, manifestPath, mcpConfigPath };
 }
 
 async function assertEmptyCache(directory) {

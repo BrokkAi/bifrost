@@ -38,8 +38,7 @@ use brokk_bifrost_core::analyzer::definition_lookup::sort_units;
 use brokk_bifrost_core::analyzer::js_ts_facts::{
     JsTsDeclarationFact, JsTsSourceTypeId, JsTsTypeShape,
 };
-use brokk_bifrost_core::analyzer::usages::inverted_edges::ClassRangeIndex;
-use brokk_bifrost_core::analyzer::usages::model::ImportKind;
+use brokk_bifrost_core::analyzer::usages::model::{ImportBinding, ImportKind};
 use brokk_bifrost_core::analyzer::usages::receiver_analysis::{
     ReceiverAnalysisBudget, ReceiverAnalysisOutcome,
 };
@@ -115,8 +114,7 @@ pub fn jsts_member_candidates(
 }
 
 pub fn ts_direct_object_literal_value(node: Node<'_>) -> Option<Node<'_>> {
-    let node = ts_unwrap_expression(node)?;
-    (node.kind() == "object").then_some(node)
+    crate::syntax::js_ts_object_literal_value(node)
 }
 
 /// The expression inside parentheses and `as`, `satisfies` and `<T>` type
@@ -227,22 +225,15 @@ fn jsts_enclosing_class(
     file: &ProjectFile,
     byte: usize,
 ) -> Option<CodeUnit> {
-    ClassRangeIndex::build(unit_index, file)
+    unit_index
+        .class_range_index(file)
         .enclosing_unit(byte)
         .cloned()
 }
 
 pub fn jsts_enclosing_function_scope(root: Node<'_>, byte: usize) -> Option<Node<'_>> {
-    let mut current = smallest_named_node_covering(root, byte, byte)?;
-    loop {
-        if matches!(
-            current.kind(),
-            "function_declaration" | "function_expression" | "arrow_function" | "method_definition"
-        ) {
-            return Some(current);
-        }
-        current = current.parent()?;
-    }
+    let node = smallest_named_node_covering(root, byte, byte)?;
+    crate::graph::common::enclosing_function_scope(node)
 }
 
 /// Whether a simple receiver binding has a visible assignment before one use.
@@ -589,30 +580,8 @@ fn ts_collect_receiver_owners_from_bindings(
     out: &mut ReceiverOwnerWrites,
     resolution: &TsReceiverResolution,
 ) {
-    let mut stack = vec![node];
-    while let Some(node) = stack.pop() {
-        if node.start_byte() >= before_byte {
-            continue;
-        }
-        if node.id() != root_id
-            && matches!(
-                node.kind(),
-                "function_declaration"
-                    | "function_expression"
-                    | "arrow_function"
-                    | "method_definition"
-                    | "class_declaration"
-                    | "abstract_class_declaration"
-                    | "interface_declaration"
-            )
-        {
-            continue;
-        }
-
-        if node.kind() == "variable_declarator"
-            && let Some(name) = node.child_by_field_name("name")
-            && node_text_matches(name, source, receiver)
-        {
+    visit_local_receiver_binding_writes(node, root_id, source, receiver, before_byte, |node| {
+        if node.kind() == "variable_declarator" {
             if let Some(value) = node.child_by_field_name("value") {
                 let initialized = ts_expression_property_owners(
                     host,
@@ -654,11 +623,7 @@ fn ts_collect_receiver_owners_from_bindings(
             }
         }
 
-        if node.kind() == "assignment_expression"
-            && let Some(left) = node.child_by_field_name("left")
-            && matches!(left.kind(), "identifier" | "type_identifier")
-            && node_text_matches(left, source, receiver)
-        {
+        if node.kind() == "assignment_expression" {
             let latest = node
                 .child_by_field_name("right")
                 .map(|value| {
@@ -678,7 +643,50 @@ fn ts_collect_receiver_owners_from_bindings(
                 .unwrap_or_default();
             out.record(latest);
         }
+    });
+}
 
+fn is_nested_local_receiver_scope(node: Node<'_>, root_id: usize) -> bool {
+    node.id() != root_id
+        && matches!(
+            node.kind(),
+            "function_declaration"
+                | "function_expression"
+                | "arrow_function"
+                | "method_definition"
+                | "class_declaration"
+                | "abstract_class_declaration"
+                | "interface_declaration"
+        )
+}
+
+/// Visit local declarations and assignments to `receiver` before a source cutoff.
+/// Nested functions and types are outside the current receiver binding scope.
+pub fn visit_local_receiver_binding_writes<'tree>(
+    node: Node<'tree>,
+    root_id: usize,
+    source: &str,
+    receiver: &str,
+    before_byte: usize,
+    mut visit: impl FnMut(Node<'tree>),
+) {
+    let mut stack = vec![node];
+    while let Some(node) = stack.pop() {
+        if node.start_byte() >= before_byte || is_nested_local_receiver_scope(node, root_id) {
+            continue;
+        }
+        let is_receiver_declaration = node.kind() == "variable_declarator"
+            && node
+                .child_by_field_name("name")
+                .is_some_and(|name| node_text_matches(name, source, receiver));
+        let is_receiver_assignment = node.kind() == "assignment_expression"
+            && node.child_by_field_name("left").is_some_and(|left| {
+                matches!(left.kind(), "identifier" | "type_identifier")
+                    && node_text_matches(left, source, receiver)
+            });
+        if is_receiver_declaration || is_receiver_assignment {
+            visit(node);
+        }
         let mut cursor = node.walk();
         let children: Vec<_> = node.named_children(&mut cursor).collect();
         stack.extend(children.into_iter().rev());
@@ -1014,7 +1022,36 @@ pub fn jsts_identifier_candidates(
     name: &str,
     value_position: bool,
 ) -> Vec<CodeUnit> {
-    let mut candidates = resolve_js_ts_direct_import_candidates(
+    let mut candidates = jsts_identifier_candidates_unfiltered(
+        host,
+        support,
+        language,
+        file,
+        imports,
+        aliases,
+        name,
+        value_position,
+    );
+    if value_position {
+        candidates = jsts_value_space_candidates(host, candidates);
+    } else {
+        candidates = jsts_type_space_candidates(host, candidates);
+    }
+    candidates
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn jsts_identifier_candidates_unfiltered(
+    host: &dyn JsTsSource,
+    support: &dyn BoundedDefinitionLookup,
+    language: Language,
+    file: &ProjectFile,
+    imports: &JsTsImportBinder,
+    aliases: &AliasResolver,
+    name: &str,
+    value_position: bool,
+) -> Vec<CodeUnit> {
+    resolve_js_ts_direct_import_candidates(
         host,
         support,
         language,
@@ -1030,13 +1067,7 @@ pub fn jsts_identifier_candidates(
         } else {
             support.file_identifier(file, name)
         }
-    });
-    if value_position {
-        candidates = jsts_value_space_candidates(host, candidates);
-    } else {
-        candidates = jsts_type_space_candidates(host, candidates);
-    }
-    candidates
+    })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1074,7 +1105,7 @@ pub fn ts_resolve_type_text_to_property_owners(
     else {
         return Vec::new();
     };
-    ts_resolve_type_node_to_property_owner_outcome(
+    ts_type_node_property_owners(
         host,
         support,
         file,
@@ -1083,11 +1114,7 @@ pub fn ts_resolve_type_text_to_property_owners(
         aliases,
         type_node,
         depth,
-        ReceiverAnalysisBudget::default(),
     )
-    .values()
-    .map(|values| values.to_vec())
-    .unwrap_or_default()
 }
 
 /// Resolve a TypeScript type node into the declarations that can own the
@@ -1275,16 +1302,16 @@ fn ts_named_type_path_candidates(
             return Vec::new();
         };
         let member = segment.as_str();
-        resolve_js_ts_module_binding_candidates(
+        ts_namespace_import_member_candidates(
             host,
             support,
-            Language::TypeScript,
             file,
-            &binding.module_specifier,
+            binding,
+            aliases,
             member,
-            Some(aliases),
             value_position,
         )
+        .expect("the namespace import was checked above")
     } else if has_qualified_tail {
         // A namespace/module qualifier is neither purely a type nor purely a
         // value. Preserve its raw declaration candidates until the terminal
@@ -1313,16 +1340,46 @@ fn ts_named_type_path_candidates(
     candidates
 }
 
+/// Resolve one member selected from a TypeScript namespace or CommonJS import.
+/// Both the type-reference path and the multi-segment owner path use this same
+/// module-binding query.
+pub fn ts_namespace_import_member_candidates(
+    host: &dyn JsTsSource,
+    support: &dyn BoundedDefinitionLookup,
+    file: &ProjectFile,
+    binding: &ImportBinding,
+    aliases: &AliasResolver,
+    member: &str,
+    value_position: bool,
+) -> Option<Vec<CodeUnit>> {
+    if !matches!(
+        binding.kind,
+        ImportKind::Namespace | ImportKind::CommonJsRequire
+    ) {
+        return None;
+    }
+    Some(resolve_js_ts_module_binding_candidates(
+        host,
+        support,
+        Language::TypeScript,
+        file,
+        &binding.module_specifier,
+        member,
+        Some(aliases),
+        value_position,
+    ))
+}
+
 fn source_declarations_for_unit<'a>(
     facts: &'a JsTsFileSourceFacts,
     unit: &'a CodeUnit,
 ) -> impl Iterator<Item = &'a JsTsDeclarationFact> {
-    facts.facts.declarations.iter().filter(|fact| {
-        facts
-            .declaration_units
-            .get(&fact.declaration)
-            .is_some_and(|units| units.contains(unit))
-    })
+    brokk_bifrost_core::analyzer::source_facts::declarations_for_unit(
+        &facts.facts.declarations,
+        &facts.declaration_units,
+        unit,
+        |fact| fact.declaration,
+    )
 }
 
 /// Resolve already captured declaration type syntax without reparsing a
@@ -1402,6 +1459,55 @@ pub(crate) fn ts_resolve_source_type_to_property_owner_outcome(
     ReceiverAnalysisOutcome::merge_branch_outcomes(outcomes, budget)
 }
 
+pub(crate) fn ts_source_type_property_owners(
+    host: &dyn JsTsSource,
+    support: &dyn BoundedDefinitionLookup,
+    file: &ProjectFile,
+    facts: &JsTsFileSourceFacts,
+    type_id: JsTsSourceTypeId,
+    depth: usize,
+) -> Vec<CodeUnit> {
+    ts_resolve_source_type_to_property_owner_outcome(
+        host,
+        support,
+        file,
+        facts,
+        type_id,
+        depth,
+        ReceiverAnalysisBudget::default(),
+    )
+    .values()
+    .map(|values| values.to_vec())
+    .unwrap_or_default()
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn ts_type_node_property_owners(
+    host: &dyn JsTsSource,
+    support: &dyn BoundedDefinitionLookup,
+    file: &ProjectFile,
+    source: &str,
+    imports: &JsTsImportBinder,
+    aliases: &AliasResolver,
+    type_node: Node<'_>,
+    depth: usize,
+) -> Vec<CodeUnit> {
+    ts_resolve_type_node_to_property_owner_outcome(
+        host,
+        support,
+        file,
+        source,
+        imports,
+        aliases,
+        type_node,
+        depth,
+        ReceiverAnalysisBudget::default(),
+    )
+    .values()
+    .map(|values| values.to_vec())
+    .unwrap_or_default()
+}
+
 fn known_non_receiver_type(node: Node<'_>, source: &str) -> bool {
     matches!(slice(node, source).trim(), "null" | "undefined" | "never")
 }
@@ -1437,18 +1543,14 @@ fn ts_expand_property_owners(
             let expanded = source_declarations_for_unit(&facts, &candidate)
                 .filter_map(|declaration| declaration.alias_type)
                 .flat_map(|type_id| {
-                    ts_resolve_source_type_to_property_owner_outcome(
+                    ts_source_type_property_owners(
                         host,
                         support,
                         candidate.source(),
                         &facts,
                         type_id,
                         depth + 1,
-                        ReceiverAnalysisBudget::default(),
                     )
-                    .values()
-                    .map(|values| values.to_vec())
-                    .unwrap_or_default()
                 })
                 .collect::<Vec<_>>();
             if expanded.is_empty() {
@@ -1640,18 +1742,14 @@ fn ts_function_return_property_owners_with_resolution(
     let mut owners = source_declarations_for_unit(&facts, function)
         .filter_map(|declaration| declaration.return_type)
         .flat_map(|type_id| {
-            ts_resolve_source_type_to_property_owner_outcome(
+            ts_source_type_property_owners(
                 host,
                 support,
                 function.source(),
                 &facts,
                 type_id,
                 depth + 1,
-                ReceiverAnalysisBudget::default(),
             )
-            .values()
-            .map(|values| values.to_vec())
-            .unwrap_or_default()
         })
         .collect::<Vec<_>>();
     sort_units(&mut owners);
@@ -1730,18 +1828,7 @@ fn ts_collect_return_property_owners(
     }
     let mut stack = vec![node];
     while let Some(node) = stack.pop() {
-        if node.id() != root_id
-            && matches!(
-                node.kind(),
-                "function_declaration"
-                    | "function_expression"
-                    | "arrow_function"
-                    | "method_definition"
-                    | "class_declaration"
-                    | "abstract_class_declaration"
-                    | "interface_declaration"
-            )
-        {
+        if is_nested_local_receiver_scope(node, root_id) {
             continue;
         }
         if node.kind() == "return_statement" {
@@ -1781,18 +1868,14 @@ fn ts_field_signature_type_owners(
     source_declarations_for_unit(&facts, field)
         .filter_map(|declaration| declaration.member_type)
         .flat_map(|type_id| {
-            ts_resolve_source_type_to_property_owner_outcome(
+            ts_source_type_property_owners(
                 host,
                 support,
                 field.source(),
                 &facts,
                 type_id,
                 depth + 1,
-                ReceiverAnalysisBudget::default(),
             )
-            .values()
-            .map(|values| values.to_vec())
-            .unwrap_or_default()
         })
         .collect()
 }
@@ -1834,15 +1917,46 @@ pub fn node_text_matches(node: Node<'_>, source: &str, expected: &str) -> bool {
 }
 
 fn ts_call_reference_name(node: Node<'_>, source: &str) -> Option<String> {
-    match node.kind() {
-        "identifier" | "property_identifier" => source
-            .get(node.start_byte()..node.end_byte())
-            .map(|text| text.trim().to_string()),
+    ts_simple_call_reference_name(node, source).or_else(|| match node.kind() {
         "member_expression" => node
             .child_by_field_name("property")
             .and_then(|property| ts_call_reference_name(property, source)),
         _ => None,
+    })
+}
+
+pub fn ts_simple_call_reference_name(node: Node<'_>, source: &str) -> Option<String> {
+    match node.kind() {
+        "identifier" | "property_identifier" => source
+            .get(node.start_byte()..node.end_byte())
+            .map(|text| text.trim().to_string()),
+        _ => None,
     }
+}
+
+pub fn ts_contextual_object_literal_type_node<'tree>(object: Node<'tree>) -> Option<Node<'tree>> {
+    if let Some(variable) = object
+        .parent()
+        .filter(|parent| parent.kind() == "variable_declarator")
+        && variable
+            .child_by_field_name("value")
+            .is_some_and(|value| value.id() == object.id())
+    {
+        return variable.child_by_field_name("type");
+    }
+
+    let return_statement = object
+        .parent()
+        .filter(|parent| parent.kind() == "return_statement")?;
+    let mut cursor = return_statement.walk();
+    if return_statement
+        .named_children(&mut cursor)
+        .next()
+        .is_none_or(|value| value.id() != object.id())
+    {
+        return None;
+    }
+    crate::graph::common::enclosing_function_scope(object)?.child_by_field_name("return_type")
 }
 
 #[cfg(test)]
@@ -1855,6 +1969,7 @@ mod tests {
     use brokk_bifrost_core::analyzer::project::{Project, TestProject};
     use brokk_bifrost_core::analyzer::query_token::QueryToken;
     use brokk_bifrost_core::hash::HashMap;
+    use brokk_bifrost_test_macros::hardwon;
     use std::collections::BTreeSet;
     use std::sync::Arc;
 
@@ -2091,6 +2206,10 @@ export function caller(items: string[]): Wrapped<string> | string {
             vec![self.file.clone()]
         }
 
+        fn import_statements(&self, _file: &ProjectFile) -> Vec<String> {
+            Vec::new()
+        }
+
         fn bulk_import_infos(
             &self,
             _files: &[ProjectFile],
@@ -2099,10 +2218,6 @@ export function caller(items: string[]): Wrapped<string> | string {
         }
 
         fn raw_supertypes_of(&self, _code_unit: &CodeUnit) -> Vec<String> {
-            Vec::new()
-        }
-
-        fn import_statements(&self, _file: &ProjectFile) -> Vec<String> {
             Vec::new()
         }
 
@@ -2163,10 +2278,6 @@ export function caller(items: string[]): Wrapped<string> | string {
             false
         }
 
-        fn fqn_exists(&self, fqn: &str) -> bool {
-            !self.fqn(fqn).is_empty()
-        }
-
         fn fqn_prefix_exists(&self, _prefix: &str) -> bool {
             false
         }
@@ -2174,6 +2285,47 @@ export function caller(items: string[]): Wrapped<string> | string {
         fn fqn_direct_children(&self, _fqn: &str) -> Vec<CodeUnit> {
             Vec::new()
         }
+    }
+
+    /// Before #2744, the receiver-owner cluster reset both of its bounded
+    /// recursion guards once per cycle turn: the accumulated `depth` budget was
+    /// replaced with a literal `0` on the local-bindings hop, and
+    /// `ts_collect_return_property_owners` built a fresh `TsReceiverResolution`,
+    /// clearing both the visited-key set and the
+    /// `MAX_TS_RECEIVER_RESOLUTION_DEPTH` counter. This fixture drove that cycle
+    /// until the process aborted on a stack overflow, which no in-process
+    /// harness could contain. Completing at all is the assertion.
+    #[test]
+    #[hardwon("#2744: self-recursive union returns caused unbounded owner resolution")]
+    fn self_recursive_union_return_terminates() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let host = FakeJsTsSource::new(root.path(), RECURSIVE_UNION_SOURCE);
+        let tree = parse_js_ts_tree(&host.file, &host.source, Language::TypeScript).expect("parse");
+        let imports = compute_jsts_import_binder(&host.source, &tree);
+
+        // `rolled` is bound to the self-recursive call, so resolving its owner
+        // enters the cluster the same way `resolve_one` does.
+        let byte = host
+            .source
+            .find("return rolled.then")
+            .expect("caller return site")
+            + "return ".len();
+
+        let owners = ts_receiver_owner_candidates_at_byte(
+            &host,
+            &host,
+            &host.file,
+            &host.source,
+            tree.root_node(),
+            &imports,
+            host.aliases.as_ref(),
+            "rolled",
+            byte,
+        );
+
+        // The budgets bound the walk; the answer itself is whatever the bounded
+        // walk reaches, so only termination is pinned here.
+        assert!(owners.len() < 64, "unexpected owner explosion: {owners:?}");
     }
 
     #[test]
@@ -2207,6 +2359,9 @@ export function caller(items: string[]): Wrapped<string> | string {
     }
 
     #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#2744: Issue #2744 fixed graph construction that accepted an incomplete source inventory."
+    )]
     fn usage_graph_rejects_incomplete_source_inventory() {
         let root = tempfile::tempdir().expect("tempdir");
         let mut host = FakeJsTsSource::new(root.path(), "");
@@ -2225,6 +2380,9 @@ export function caller(items: string[]): Wrapped<string> | string {
     }
 
     #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#2744: Issue #2744 fixed declaration type resolution remaining stale after its source file was removed."
+    )]
     fn declaration_types_resolve_after_source_file_is_removed() {
         let root = tempfile::tempdir().expect("tempdir");
         let host = FakeJsTsSource::new(
@@ -2263,45 +2421,5 @@ export function caller(items: string[]): Wrapped<string> | string {
             ReceiverAnalysisBudget::default(),
         );
         assert_eq!(outcome.values(), Some([props].as_slice()));
-    }
-
-    /// Before #2744, the receiver-owner cluster reset both of its bounded
-    /// recursion guards once per cycle turn: the accumulated `depth` budget was
-    /// replaced with a literal `0` on the local-bindings hop, and
-    /// `ts_collect_return_property_owners` built a fresh `TsReceiverResolution`,
-    /// clearing both the visited-key set and the
-    /// `MAX_TS_RECEIVER_RESOLUTION_DEPTH` counter. This fixture drove that cycle
-    /// until the process aborted on a stack overflow, which no in-process
-    /// harness could contain. Completing at all is the assertion.
-    #[test]
-    fn self_recursive_union_return_terminates() {
-        let root = tempfile::tempdir().expect("tempdir");
-        let host = FakeJsTsSource::new(root.path(), RECURSIVE_UNION_SOURCE);
-        let tree = parse_js_ts_tree(&host.file, &host.source, Language::TypeScript).expect("parse");
-        let imports = compute_jsts_import_binder(&host.source, &tree);
-
-        // `rolled` is bound to the self-recursive call, so resolving its owner
-        // enters the cluster the same way `resolve_one` does.
-        let byte = host
-            .source
-            .find("return rolled.then")
-            .expect("caller return site")
-            + "return ".len();
-
-        let owners = ts_receiver_owner_candidates_at_byte(
-            &host,
-            &host,
-            &host.file,
-            &host.source,
-            tree.root_node(),
-            &imports,
-            host.aliases.as_ref(),
-            "rolled",
-            byte,
-        );
-
-        // The budgets bound the walk; the answer itself is whatever the bounded
-        // walk reaches, so only termination is pinned here.
-        assert!(owners.len() < 64, "unexpected owner explosion: {owners:?}");
     }
 }

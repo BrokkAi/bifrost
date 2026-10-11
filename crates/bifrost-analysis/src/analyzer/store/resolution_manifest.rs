@@ -12,7 +12,11 @@ pub(super) const BODY_MANIFEST_COLUMNS: &[&str] = &[
     "expected_type_frontier_count",
     "expected_type_transfer_count",
     "expected_type_component_count",
+    "expected_declared_type_argument_count",
+    "expected_type_argument_count",
     "expected_underlying_type_count",
+    "expected_generic_type_alias_parameter_count",
+    "expected_generic_formal_count",
     "expected_intrinsic_seed_count",
     "expected_intrinsic_seed_identity_count",
     "expected_binding_projection_count",
@@ -123,6 +127,7 @@ impl CanonicalCell for PathBodyToken {
             Self::Null => hash.field("token", b"null"),
             Self::Int(value) => value.hash(hash, shared, cancellation)?,
             Self::Shared(slot) => slot.hash(hash, shared, cancellation)?,
+            Self::Text(value) => hash.field("text", value.as_bytes()),
         }
         Some(())
     }
@@ -219,6 +224,35 @@ canonical_row!(
     kind,
     component_slot
 );
+canonical_row!(
+    PreparedDeclaredTypeArgumentRow,
+    owner_slot,
+    ordinal,
+    argument_slot
+);
+canonical_row!(
+    PreparedTypeArgumentRow,
+    application_slot,
+    ordinal,
+    argument_slot,
+    indirection_delta,
+    reference_indirection_delta
+);
+canonical_row!(
+    PreparedGenericTypeAliasParameterRow,
+    alias_definition,
+    ordinal,
+    parameter_definition,
+    target_slot,
+    indirection_delta,
+    reference_indirection_delta
+);
+canonical_row!(
+    PreparedGenericFormalRow,
+    owner_definition,
+    ordinal,
+    parameter_definition
+);
 canonical_row!(PreparedUnderlyingTypeRow, definition, slot);
 canonical_row!(
     PreparedIntrinsicSeedRow,
@@ -256,7 +290,14 @@ canonical_row!(
     required_owner_definition,
     kind
 );
-canonical_row!(PreparedSupertypeRow, definition, reference, frontier, kind);
+canonical_row!(
+    PreparedSupertypeRow,
+    definition,
+    reference,
+    frontier,
+    kind,
+    parent_ordinal
+);
 canonical_row!(
     PreparedDefinitionPropertyGapRow,
     definition,
@@ -340,7 +381,11 @@ pub(super) fn complete_body_digest(
         type_frontiers,
         type_transfers,
         type_components,
+        declared_type_arguments,
+        type_arguments,
         underlying_types,
+        generic_type_alias_parameters,
+        generic_formals,
         intrinsic_seeds,
         intrinsic_seed_identities,
         binding_projections,
@@ -395,7 +440,11 @@ pub(super) fn body_counts(
         typed.type_frontiers.len(),
         typed.type_transfers.len(),
         typed.type_components.len(),
+        typed.declared_type_arguments.len(),
+        typed.type_arguments.len(),
         typed.underlying_types.len(),
+        typed.generic_type_alias_parameters.len(),
+        typed.generic_formals.len(),
         typed.intrinsic_seeds.len(),
         typed.intrinsic_seed_identities.len(),
         typed.binding_projections.len(),
@@ -428,6 +477,7 @@ pub(super) const COMPLETE_PUBLICATION_COST_SQL: &str = "SELECT (SELECT COUNT(*) 
        (SELECT COUNT(*) FROM resolution_path_terminal_headers WHERE blob_id = ?1),
        (SELECT COUNT(*) FROM resolution_reference_lookup_identities WHERE blob_id = ?1),
        (SELECT COUNT(*) FROM resolution_root_route_segments WHERE blob_id = ?1),
+       (SELECT COUNT(*) FROM resolution_rust_reverse_gap_candidates WHERE blob_id = ?1),
        (SELECT COUNT(*) FROM resolution_semantic_sites WHERE blob_id = ?1),
        (SELECT COUNT(*) FROM resolution_additional_definition_namespaces WHERE blob_id = ?1),
        (SELECT COUNT(*) FROM resolution_definition_unit_crosswalks WHERE blob_id = ?1),
@@ -436,6 +486,20 @@ pub(super) const COMPLETE_PUBLICATION_COST_SQL: &str = "SELECT (SELECT COUNT(*) 
        (SELECT COUNT(*) FROM resolution_member_owner_properties WHERE blob_id = ?1),
        (SELECT COUNT(*) FROM resolution_trait_implementations WHERE blob_id = ?1),
        (SELECT COUNT(*) FROM resolution_typed_fact_lookups WHERE blob_id = ?1),
+       (SELECT COUNT(*) FROM resolution_call_argument_lists WHERE blob_id = ?1),
+       (SELECT COUNT(*) FROM resolution_call_arguments WHERE blob_id = ?1),
+       (SELECT COUNT(*) FROM resolution_named_argument_labels WHERE blob_id = ?1),
+       (SELECT COUNT(*) FROM resolution_callable_parameter_lists WHERE blob_id = ?1),
+       (SELECT COUNT(*) FROM resolution_callable_parameter_semantics WHERE blob_id = ?1),
+       (SELECT COUNT(*) FROM resolution_extension_receivers WHERE blob_id = ?1),
+       (SELECT COUNT(*) FROM resolution_import_selectors WHERE blob_id = ?1),
+       (SELECT COUNT(*) FROM resolution_invocation_roles WHERE blob_id = ?1),
+       (SELECT COUNT(*) FROM resolution_jvm_aliases WHERE blob_id = ?1),
+       (SELECT COUNT(*) FROM resolution_jvm_alias_owner_segments WHERE blob_id = ?1),
+       (SELECT COUNT(*) FROM resolution_package_object_exports WHERE blob_id = ?1),
+       (SELECT COUNT(*) FROM resolution_package_routes WHERE blob_id = ?1),
+       (SELECT COUNT(*) FROM resolution_package_route_segments WHERE blob_id = ?1),
+       (SELECT COUNT(*) FROM resolution_singleton_relations WHERE blob_id = ?1),
        (SELECT COUNT(*) FROM resolution_paths WHERE blob_id = ?1),
        (SELECT COUNT(*) FROM resolution_sites WHERE blob_id = ?1),
        (SELECT COUNT(*) FROM resolution_gaps WHERE blob_id = ?1),
@@ -443,7 +507,11 @@ pub(super) const COMPLETE_PUBLICATION_COST_SQL: &str = "SELECT (SELECT COUNT(*) 
        (SELECT COUNT(*) FROM resolution_type_frontiers WHERE blob_id = ?1),
        (SELECT COUNT(*) FROM resolution_type_transfers WHERE blob_id = ?1),
        (SELECT COUNT(*) FROM resolution_type_components WHERE blob_id = ?1),
+       (SELECT COUNT(*) FROM resolution_declared_type_arguments WHERE blob_id = ?1),
+       (SELECT COUNT(*) FROM resolution_type_arguments WHERE blob_id = ?1),
        (SELECT COUNT(*) FROM resolution_underlying_types WHERE blob_id = ?1),
+       (SELECT COUNT(*) FROM resolution_generic_type_alias_parameters WHERE blob_id = ?1),
+       (SELECT COUNT(*) FROM resolution_generic_formals WHERE blob_id = ?1),
        (SELECT COUNT(*) FROM resolution_intrinsic_seeds WHERE blob_id = ?1),
        (SELECT COUNT(*) FROM resolution_intrinsic_seed_identities WHERE blob_id = ?1),
        (SELECT COUNT(*) FROM resolution_binding_projections WHERE blob_id = ?1),
@@ -469,12 +537,22 @@ pub(super) const COMPLETE_PUBLICATION_COST_SQL: &str = "SELECT (SELECT COUNT(*) 
        + (SELECT COALESCE(SUM(COALESCE(length(CAST(direction AS BLOB)),0)),0) FROM resolution_path_endpoint_headers WHERE blob_id = ?1)
        + (SELECT COALESCE(SUM(COALESCE(length(CAST(direction AS BLOB)),0)),0) FROM resolution_path_terminal_headers WHERE blob_id = ?1)
        + (SELECT COALESCE(SUM(COALESCE(length(CAST(segment AS BLOB)),0) + COALESCE(length(CAST(terminal_spelling AS BLOB)),0)),0) FROM resolution_root_route_segments WHERE blob_id = ?1)
+       + (SELECT COALESCE(SUM(COALESCE(length(CAST(candidate_name AS BLOB)),0) + COALESCE(length(CAST(namespace AS BLOB)),0)),0) FROM resolution_rust_reverse_gap_candidates WHERE blob_id = ?1)
        + (SELECT COALESCE(SUM(COALESCE(length(CAST(namespace AS BLOB)),0) + COALESCE(length(CAST(semantic_role AS BLOB)),0)),0) FROM resolution_semantic_sites WHERE blob_id = ?1)
        + (SELECT COALESCE(SUM(COALESCE(length(CAST(namespace AS BLOB)),0) + COALESCE(length(CAST(hoisting AS BLOB)),0)),0) FROM resolution_additional_definition_namespaces WHERE blob_id = ?1)
        + (SELECT COALESCE(SUM(COALESCE(length(CAST(identity_digest AS BLOB)),0)),0) FROM resolution_definition_unit_crosswalks WHERE blob_id = ?1)
        + (SELECT COALESCE(SUM(COALESCE(length(CAST(visibility AS BLOB)),0)),0) FROM resolution_declaration_visibility_properties WHERE blob_id = ?1)
        + (SELECT COALESCE(SUM(COALESCE(length(CAST(member_kind AS BLOB)),0) + COALESCE(length(CAST(member_access AS BLOB)),0) + COALESCE(length(CAST(qualifier_compatibility AS BLOB)),0)),0) FROM resolution_member_owner_properties WHERE blob_id = ?1)
        + (SELECT COALESCE(SUM(COALESCE(length(CAST(side AS BLOB)),0) + COALESCE(length(CAST(segment AS BLOB)),0) + COALESCE(length(CAST(terminal_spelling AS BLOB)),0)),0) FROM resolution_trait_implementations WHERE blob_id = ?1)
+       + (SELECT COALESCE(SUM(COALESCE(length(CAST(label AS BLOB)),0)),0) FROM resolution_call_arguments WHERE blob_id = ?1)
+       + (SELECT COALESCE(SUM(COALESCE(length(CAST(label AS BLOB)),0)),0) FROM resolution_named_argument_labels WHERE blob_id = ?1)
+       + (SELECT COALESCE(SUM(COALESCE(length(CAST(label AS BLOB)),0)),0) FROM resolution_callable_parameter_semantics WHERE blob_id = ?1)
+       + (SELECT COALESCE(SUM(COALESCE(length(CAST(kind AS BLOB)),0) + COALESCE(length(CAST(source_name AS BLOB)),0) + COALESCE(length(CAST(local_name AS BLOB)),0)),0) FROM resolution_import_selectors WHERE blob_id = ?1)
+       + (SELECT COALESCE(SUM(COALESCE(length(CAST(role AS BLOB)),0)),0) FROM resolution_invocation_roles WHERE blob_id = ?1)
+       + (SELECT COALESCE(SUM(COALESCE(length(CAST(member_name AS BLOB)),0) + COALESCE(length(CAST(kind AS BLOB)),0) + COALESCE(length(CAST(status AS BLOB)),0)),0) FROM resolution_jvm_aliases WHERE blob_id = ?1)
+       + (SELECT COALESCE(SUM(COALESCE(length(CAST(spelling AS BLOB)),0)),0) FROM resolution_jvm_alias_owner_segments WHERE blob_id = ?1)
+       + (SELECT COALESCE(SUM(COALESCE(length(CAST(spelling AS BLOB)),0)),0) FROM resolution_package_route_segments WHERE blob_id = ?1)
+       + (SELECT COALESCE(SUM(COALESCE(length(CAST(kind AS BLOB)),0)),0) FROM resolution_singleton_relations WHERE blob_id = ?1)
        + (SELECT COALESCE(SUM(COALESCE(length(CAST(body AS BLOB)),0) + COALESCE(length(CAST(end_fixed_key AS BLOB)),0)),0) FROM resolution_paths WHERE blob_id = ?1)
        + (SELECT COALESCE(SUM(COALESCE(length(CAST(completion AS BLOB)),0)),0) FROM resolution_type_transfers WHERE blob_id = ?1)
        + (SELECT COALESCE(SUM(COALESCE(length(CAST(spelling AS BLOB)),0) + COALESCE(length(CAST(possible_values AS BLOB)),0) + COALESCE(length(CAST(completion AS BLOB)),0)),0) FROM resolution_intrinsic_seeds WHERE blob_id = ?1)
@@ -501,6 +579,9 @@ fn estimated_body_bytes(body: &[PathBodyToken], cancellation: &CancellationToken
             PathBodyToken::Open | PathBodyToken::Null => MAX_JSONB_HEADER_BYTES,
             PathBodyToken::Int(value) => MAX_JSONB_HEADER_BYTES + value.to_string().len(),
             PathBodyToken::Shared(_) => MAX_JSONB_HEADER_BYTES + 1 + u32::MAX.to_string().len(),
+            PathBodyToken::Text(value) => {
+                MAX_JSONB_HEADER_BYTES + serde_json::to_string(value).expect("body text JSON").len()
+            }
         };
         bytes = bytes.saturating_add(cell);
     }
@@ -520,14 +601,14 @@ pub(super) fn estimated_body_payload_bytes(
         bytes = bytes.saturating_add(estimated_body_bytes(&path.body, cancellation)?);
         if let Some(endpoint) = &path.root_endpoint {
             let mut builder = RootKeyBuilder::default();
-            for &(symbol, scoped) in &endpoint.symbols {
+            for (symbol, scoped) in &endpoint.symbols {
                 if cancellation.is_cancelled() {
                     return None;
                 }
                 match symbol {
-                    PathBodyToken::Int(local) => builder.push(Some(local), None, scoped),
+                    PathBodyToken::Int(local) => builder.push(Some(*local), None, *scoped),
                     PathBodyToken::Shared(_) => {
-                        builder.push(None, Some(i64::from(u32::MAX)), scoped)
+                        builder.push(None, Some(i64::from(u32::MAX)), *scoped)
                     }
                     symbol => panic!("a root prefix cell is a structured identity: {symbol:?}"),
                 }
@@ -587,6 +668,7 @@ pub(super) fn estimated_body_payload_bytes(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use brokk_bifrost_test_macros::hardwon;
 
     #[test]
     fn admission_proof_changes_invalidate_the_complete_body_identity() {
@@ -695,6 +777,7 @@ mod tests {
     }
 
     #[test]
+    #[hardwon("3da13ca2218b: resolution body identity changed with row or shared-intern order")]
     fn body_identity_is_independent_of_row_order_and_shared_intern_order() {
         let row = PreparedPathRow {
             path: 1,
@@ -707,6 +790,7 @@ mod tests {
             end_lead_shared: Some(1),
             end_lead_scoped: true,
             root_terminal: Some(1),
+            root_import_activation: None,
             root_endpoint: Some(PreparedRootEndpoint {
                 symbols: vec![(PathBodyToken::Shared(1), true)],
                 open_tail: false,

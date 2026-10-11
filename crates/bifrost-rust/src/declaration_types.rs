@@ -15,16 +15,16 @@ use brokk_bifrost_core::analyzer::source_facts::{SourceDeclarationId, SourceOccu
 use brokk_bifrost_core::hash::HashMap;
 use std::sync::Arc;
 
+#[cfg(test)]
+#[path = "declaration_types_tests.rs"]
+mod tests;
+
 #[derive(Clone, Copy)]
 enum AnnotationRow {
     Value(usize),
     Callable(usize),
     Alias(usize),
 }
-
-#[cfg(test)]
-#[path = "declaration_types_tests.rs"]
-mod tests;
 
 /// The annotation and containing context belonging to one exact declaration.
 #[derive(Clone, Copy, Debug)]

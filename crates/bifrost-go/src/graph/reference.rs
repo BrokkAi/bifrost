@@ -3,10 +3,13 @@ use crate::graph::ast::{
     clause_binding_names, clause_statement_list, declared_names, is_clause,
     is_definition_identifier, parameter_names, selector_parts,
 };
+use brokk_bifrost_core::analyzer::common::node_source_text as node_text;
 use brokk_bifrost_core::analyzer::usages::local_inference::{
     LocalInferenceConfig, LocalInferenceEngine,
 };
-use brokk_bifrost_core::analyzer::usages::reference_site::ResolvedReferenceSite;
+use brokk_bifrost_core::analyzer::usages::reference_site::{
+    ResolvedReferenceSite, smallest_named_node_covering_with_scope,
+};
 use brokk_bifrost_core::hash::HashMap;
 use tree_sitter::Node;
 
@@ -113,34 +116,6 @@ pub fn go_selector_descriptor_with_scope<'tree>(
     })
 }
 
-fn smallest_named_node_covering_with_scope<'tree>(
-    mut node: Node<'tree>,
-    start: usize,
-    end: usize,
-    scope_step: &mut impl FnMut() -> bool,
-) -> Option<Node<'tree>> {
-    if !scope_step() || node.end_byte() < end || node.start_byte() > start {
-        return None;
-    }
-    loop {
-        let mut cursor = node.walk();
-        let mut containing_child = None;
-        for child in node.named_children(&mut cursor) {
-            if !scope_step() {
-                return None;
-            }
-            if child.start_byte() <= start && child.end_byte() >= end {
-                containing_child = Some(child);
-                break;
-            }
-        }
-        match containing_child {
-            Some(child) => node = child,
-            None => return Some(node),
-        }
-    }
-}
-
 pub struct GoReferenceResolution {
     pub fqn_candidates: Vec<String>,
     pub resolved_import_packages: Vec<String>,
@@ -228,10 +203,6 @@ pub fn resolve_go_reference_with_namespaces(
         resolved_import_packages: visible_dot_packages.to_vec(),
         shadowed: false,
     }
-}
-
-fn node_text<'source>(node: Node<'_>, source: &'source str) -> &'source str {
-    brokk_bifrost_core::analyzer::common::node_source_text(node, source)
 }
 
 /// Whether `node` is a top-level declaration (a direct child of the source file),
@@ -615,55 +586,12 @@ mod tests {
             focus_end_byte: end_byte,
         }
     }
+    use brokk_bifrost_test_macros::hardwon;
 
     #[test]
-    fn dot_import_exposes_only_exported_identifiers_to_reference_resolution() {
-        let source = r#"package main
-import . "os"
-
-func len(values []int) (int, error) { return 0, nil }
-
-func run(values []int) {
-    _, _ = len(values)
-    _ = Open
-}
-"#;
-        let mut parser = tree_sitter::Parser::new();
-        parser
-            .set_language(&tree_sitter_go::LANGUAGE.into())
-            .expect("Go grammar loads");
-        let tree = parser.parse(source, None).expect("source parses");
-        let aliases = HashMap::default();
-        let dot_packages = vec!["os".to_owned()];
-
-        let local = resolve_go_reference_with_namespaces(
-            tree.root_node(),
-            source,
-            "example.com/mod",
-            &aliases,
-            &dot_packages,
-            &reference_site(source, "len(values)", "len"),
-            None,
-        );
-        assert_eq!(local.fqn_candidates, ["example.com/mod.len"]);
-        assert!(local.resolved_import_packages.is_empty());
-        assert!(!local.shadowed);
-
-        let exported = resolve_go_reference_with_namespaces(
-            tree.root_node(),
-            source,
-            "example.com/mod",
-            &aliases,
-            &dot_packages,
-            &reference_site(source, "_ = Open", "Open"),
-            None,
-        );
-        assert_eq!(exported.fqn_candidates, ["example.com/mod.Open", "os.Open"]);
-        assert_eq!(exported.resolved_import_packages, ["os"]);
-        assert!(!exported.shadowed);
-    }
-
-    #[test]
+    #[hardwon(
+        "aa501216592e: A declaration in a grouped Go type spec becomes visible only after the earlier RHS is resolved."
+    )]
     fn later_local_type_spec_does_not_shadow_an_earlier_spec_rhs() {
         let source = r#"package main
 import embedded "embed"
@@ -698,6 +626,9 @@ func f() {
     }
 
     #[test]
+    #[hardwon(
+        "aa501216592e: A receiver type parameter named like an import shadows that package inside the method."
+    )]
     fn generic_method_receiver_type_argument_shadows_an_import() {
         let source = r#"package main
 import T "embed"
@@ -723,6 +654,9 @@ func (generic Generic[T]) openTheme(receiver T) {
     }
 
     #[test]
+    #[hardwon(
+        "499616c60cc3: Range := binders activate after the clause and stay confined to the loop body."
+    )]
     fn range_short_declarations_shadow_only_after_the_clause_and_inside_the_loop() {
         let source = r#"package main
 import T "embed"
@@ -785,5 +719,52 @@ func f() {
         ranges.sort_by_key(Node::start_byte);
         assert_eq!(declared_names(ranges[0], source), ["T"]);
         assert!(declared_names(ranges[1], source).is_empty());
+    }
+
+    #[test]
+    fn dot_import_exposes_only_exported_identifiers_to_reference_resolution() {
+        let source = r#"package main
+import . "os"
+
+func len(values []int) (int, error) { return 0, nil }
+
+func run(values []int) {
+    _, _ = len(values)
+    _ = Open
+}
+"#;
+        let mut parser = tree_sitter::Parser::new();
+        parser
+            .set_language(&tree_sitter_go::LANGUAGE.into())
+            .expect("Go grammar loads");
+        let tree = parser.parse(source, None).expect("source parses");
+        let aliases = HashMap::default();
+        let dot_packages = vec!["os".to_owned()];
+
+        let local = resolve_go_reference_with_namespaces(
+            tree.root_node(),
+            source,
+            "example.com/mod",
+            &aliases,
+            &dot_packages,
+            &reference_site(source, "len(values)", "len"),
+            None,
+        );
+        assert_eq!(local.fqn_candidates, ["example.com/mod.len"]);
+        assert!(local.resolved_import_packages.is_empty());
+        assert!(!local.shadowed);
+
+        let exported = resolve_go_reference_with_namespaces(
+            tree.root_node(),
+            source,
+            "example.com/mod",
+            &aliases,
+            &dot_packages,
+            &reference_site(source, "_ = Open", "Open"),
+            None,
+        );
+        assert_eq!(exported.fqn_candidates, ["example.com/mod.Open", "os.Open"]);
+        assert_eq!(exported.resolved_import_packages, ["os"]);
+        assert!(!exported.shadowed);
     }
 }

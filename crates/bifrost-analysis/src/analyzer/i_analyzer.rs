@@ -1,6 +1,6 @@
 use crate::analyzer::common::display_identifier_for_target;
 use crate::analyzer::store::StoreError;
-use crate::analyzer::usages::{DEFAULT_MAX_FILES, DEFAULT_MAX_USAGES, FuzzyResult, UsageFinder};
+use crate::analyzer::usages::{FuzzyResult, UsageFinder};
 use crate::analyzer::{
     CloneSmell, CloneSmellWeights, CodeBaseMetrics, CodeUnit, CodeUnitType, CommentDensityStats,
     DeclarationInfo, ExceptionHandlingAnalysis, ExceptionSmellWeights, ImportAnalysisProvider,
@@ -10,6 +10,7 @@ use crate::analyzer::{
 };
 use crate::cancellation::CancellationToken;
 use crate::gitblob;
+use crate::hash::HashMap;
 use brokk_bifrost_core::analyzer::code_unit_index::CodeUnitIndex;
 pub(crate) use brokk_bifrost_core::analyzer::code_unit_index::default_parent_fq_name;
 pub use brokk_bifrost_core::analyzer::query_batch::QueryBatch;
@@ -18,7 +19,7 @@ use regex::{Regex, RegexBuilder, RegexSet, RegexSetBuilder};
 use std::any::Any;
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
-use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 use std::sync::{Arc, Mutex, OnceLock};
 
 /// One analyzer's contribution to a batched symbol-search request.
@@ -28,6 +29,55 @@ use std::sync::{Arc, Mutex, OnceLock};
 /// must not present an incomplete batch as an authoritative search result.
 #[doc(hidden)]
 pub type SearchSymbolCandidates = QueryBatch<SearchSymbolCandidate>;
+
+/// A resolved file import edge persisted by the workspace import graph.
+#[doc(hidden)]
+#[derive(Debug, Clone)]
+pub struct PersistedImportEdge {
+    pub importer: ProjectFile,
+    pub import_ordinal: u32,
+    pub target: ProjectFile,
+    pub provenance_json: String,
+    /// Workspace-relative files consulted along this import's route,
+    /// including the importer and direct target.
+    pub route_dependencies: Vec<String>,
+}
+
+/// Candidate dependencies for one source, persisted even when it currently
+/// resolves no file edges.
+#[doc(hidden)]
+#[derive(Debug, Clone)]
+pub struct PersistedImportDependencies {
+    pub importer: ProjectFile,
+    pub facts: crate::analyzer::ImportResolutionDependencies,
+}
+
+/// Work performed while advancing a persisted import graph to the current
+/// workspace identity.
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy, Default)]
+pub struct PersistedImportGraphRefresh {
+    pub recomputed_files: usize,
+    pub recomputed_imports: usize,
+    pub recomputed_edges: usize,
+}
+
+/// One indexed adjacency read from the persistent workspace import graph.
+#[doc(hidden)]
+#[derive(Debug)]
+pub struct PersistedImportAdjacency {
+    pub by_file: HashMap<ProjectFile, Vec<ProjectFile>>,
+    pub rows_read: usize,
+    pub exhausted: bool,
+}
+
+/// Direction for a persistent file import adjacency query.
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PersistedImportDirection {
+    Forward,
+    Reverse,
+}
 
 /// Forward [`IAnalyzer::relational_definition_batch`] from a public language
 /// analyzer wrapper to its generic `TreeSitterAnalyzer`. Keeping the forwarding
@@ -431,13 +481,16 @@ fn alternation_literals(children: Vec<RequiredLiterals>) -> RequiredLiterals {
 }
 
 fn literal_node_literals(bytes: &[u8]) -> RequiredLiterals {
-    if bytes.iter().all(|byte| is_storage_byte(*byte)) {
+    if bytes
+        .iter()
+        .all(|byte| brokk_bifrost_core::text_utils::is_ident_byte(*byte))
+    {
         return RequiredLiterals::exact(storage_run(bytes));
     }
     RequiredLiterals {
         exact: None,
         substrings: bytes
-            .split(|byte| !is_storage_byte(*byte))
+            .split(|byte| !brokk_bifrost_core::text_utils::is_ident_byte(*byte))
             .filter(|run| !run.is_empty())
             .map(storage_run)
             .collect(),
@@ -480,7 +533,7 @@ fn class_node_literals(class: &regex_syntax::hir::Class) -> RequiredLiterals {
         _ => None,
     };
     single
-        .filter(|byte| is_storage_byte(*byte))
+        .filter(|byte| brokk_bifrost_core::text_utils::is_ident_byte(*byte))
         .map_or_else(RequiredLiterals::default, |byte| {
             RequiredLiterals::exact(storage_run(&[byte]))
         })
@@ -510,13 +563,11 @@ fn reduce_literals(literals: Vec<String>) -> Vec<String> {
     kept
 }
 
-fn is_storage_byte(byte: u8) -> bool {
-    byte.is_ascii_alphanumeric() || byte == b'_'
-}
-
 fn storage_run(bytes: &[u8]) -> String {
     debug_assert!(
-        bytes.iter().all(|byte| is_storage_byte(*byte)),
+        bytes
+            .iter()
+            .all(|byte| brokk_bifrost_core::text_utils::is_ident_byte(*byte)),
         "storage runs are ASCII by construction: {bytes:?}"
     );
     bytes.iter().map(|byte| char::from(*byte)).collect()
@@ -627,6 +678,7 @@ pub struct AnalyzerQueryContext {
     first_store_error: Mutex<Option<StoreError>>,
     first_read_incomplete: Mutex<Option<QueryReadIncomplete>>,
     cancellation: Option<CancellationToken>,
+    identifier_candidate_memo_owner: Option<std::thread::ThreadId>,
     /// A resolver overlay frozen by this scope's owner thread. The outer
     /// `Option` distinguishes no override from a deliberately frozen absence;
     /// the thread identity prevents the analyzer's shared context stack from
@@ -669,6 +721,7 @@ impl Default for AnalyzerQueryContext {
             first_store_error: Mutex::new(None),
             first_read_incomplete: Mutex::new(None),
             cancellation: None,
+            identifier_candidate_memo_owner: None,
             semantic_model_overlay_override: None,
             active_semantic_model_snapshot_override: None,
             tier_accesses: Default::default(),
@@ -708,11 +761,11 @@ impl AnalyzerBuildTierAccess {
         if !self.active.load(std::sync::atomic::Ordering::Acquire) {
             return;
         }
-        self.tier_accesses[tier.index()].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        record_tier_access_in(&self.tier_accesses, tier);
     }
 
     pub fn tier_access_count(&self, tier: InformationTier) -> usize {
-        self.tier_accesses[tier.index()].load(std::sync::atomic::Ordering::Relaxed)
+        tier_access_count_from(&self.tier_accesses, tier)
     }
 }
 
@@ -757,6 +810,20 @@ impl InformationTier {
     pub const fn index(self) -> usize {
         self as usize
     }
+}
+
+fn record_tier_access_in(
+    tier_accesses: &[AtomicUsize; InformationTier::COUNT],
+    tier: InformationTier,
+) {
+    tier_accesses[tier.index()].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+fn tier_access_count_from(
+    tier_accesses: &[AtomicUsize; InformationTier::COUNT],
+    tier: InformationTier,
+) -> usize {
+    tier_accesses[tier.index()].load(std::sync::atomic::Ordering::Relaxed)
 }
 
 /// Analyzer-snapshot-owned query caches. The container is public only because
@@ -836,6 +903,11 @@ impl AnalyzerSnapshotCaches {
         &self,
     ) -> &crate::analyzer::usages::java_usage_evidence_cache::SnapshotJavaUsageEvidenceCache {
         &self.java_usage_evidence
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn reset_java_usage_evidence_stats_for_test(&self) {
+        self.java_usage_evidence.reset_stats_for_test();
     }
 
     pub(crate) fn semantic_models(
@@ -977,15 +1049,8 @@ impl WorkspaceFileIndex {
 impl AnalyzerQueryContext {
     pub fn with_cancellation(cancellation: CancellationToken) -> Self {
         Self {
-            first_store_error: Mutex::new(None),
-            first_read_incomplete: Mutex::new(None),
             cancellation: Some(cancellation),
-            semantic_model_overlay_override: None,
-            active_semantic_model_snapshot_override: None,
-            tier_accesses: Default::default(),
-            read_ledger: None,
-            read_ledger_owner: None,
-            shadowed_read_ledger: None,
+            ..Self::default()
         }
     }
 
@@ -993,18 +1058,11 @@ impl AnalyzerQueryContext {
         semantic_model_overlay: Option<Arc<crate::analyzer::semantic_model::SemanticModelOverlay>>,
     ) -> Self {
         Self {
-            first_store_error: Mutex::new(None),
-            first_read_incomplete: Mutex::new(None),
-            cancellation: None,
             semantic_model_overlay_override: Some((
                 std::thread::current().id(),
                 semantic_model_overlay,
             )),
-            active_semantic_model_snapshot_override: None,
-            tier_accesses: Default::default(),
-            read_ledger: None,
-            read_ledger_owner: None,
-            shadowed_read_ledger: None,
+            ..Self::default()
         }
     }
 
@@ -1012,16 +1070,20 @@ impl AnalyzerQueryContext {
         snapshot: Option<Arc<crate::analyzer::semantic_model::ActiveSemanticModelSnapshot>>,
     ) -> Self {
         Self {
-            first_store_error: Mutex::new(None),
-            first_read_incomplete: Mutex::new(None),
-            cancellation: None,
-            semantic_model_overlay_override: None,
             active_semantic_model_snapshot_override: Some((std::thread::current().id(), snapshot)),
-            tier_accesses: Default::default(),
-            read_ledger: None,
-            read_ledger_owner: None,
-            shadowed_read_ledger: None,
+            ..Self::default()
         }
+    }
+
+    fn for_identifier_candidate_memo() -> Self {
+        Self {
+            identifier_candidate_memo_owner: Some(std::thread::current().id()),
+            ..Self::default()
+        }
+    }
+
+    pub(crate) fn identifier_candidate_memo_owner(&self) -> Option<std::thread::ThreadId> {
+        self.identifier_candidate_memo_owner
     }
 
     pub(crate) fn semantic_model_overlay_override_for_current_thread(
@@ -1045,15 +1107,9 @@ impl AnalyzerQueryContext {
 
     fn with_read_ledger(ledger: Arc<crate::analyzer::read_ledger::ReadLedger>) -> Self {
         Self {
-            first_store_error: Mutex::new(None),
-            first_read_incomplete: Mutex::new(None),
-            cancellation: None,
-            semantic_model_overlay_override: None,
-            active_semantic_model_snapshot_override: None,
-            tier_accesses: Default::default(),
             read_ledger: Some(ledger),
             read_ledger_owner: Some(std::thread::current().id()),
-            shadowed_read_ledger: None,
+            ..Self::default()
         }
     }
 
@@ -1062,15 +1118,10 @@ impl AnalyzerQueryContext {
         shadowed: Arc<crate::analyzer::read_ledger::ReadLedger>,
     ) -> Self {
         Self {
-            first_store_error: Mutex::new(None),
-            first_read_incomplete: Mutex::new(None),
-            cancellation: None,
-            semantic_model_overlay_override: None,
-            active_semantic_model_snapshot_override: None,
-            tier_accesses: Default::default(),
             read_ledger: Some(ledger),
             read_ledger_owner: Some(std::thread::current().id()),
             shadowed_read_ledger: Some(shadowed),
+            ..Self::default()
         }
     }
 
@@ -1116,14 +1167,14 @@ impl AnalyzerQueryContext {
 
     /// Records one crossing of `tier`'s storage funnel under this request.
     pub fn record_tier_access(&self, tier: InformationTier) {
-        self.tier_accesses[tier.index()].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        record_tier_access_in(&self.tier_accesses, tier);
     }
 
     /// Crossings of `tier`'s storage funnel observed while this request was
     /// active. Read relaxed: the counts are advisory bounds for tests and
     /// diagnostics, not a synchronization edge.
     pub fn tier_access_count(&self, tier: InformationTier) -> usize {
-        self.tier_accesses[tier.index()].load(std::sync::atomic::Ordering::Relaxed)
+        tier_access_count_from(&self.tier_accesses, tier)
     }
 
     /// The deadline this request is running under, if its opener set one.
@@ -1178,6 +1229,32 @@ impl AnalyzerQueryContext {
     }
 }
 
+pub(crate) fn decrement_attached_read_ledger(
+    attached_read_ledgers: &AtomicUsize,
+    context: &AnalyzerQueryContext,
+) {
+    if context.read_ledger().is_some() {
+        let before = attached_read_ledgers.fetch_sub(1, AtomicOrdering::Relaxed);
+        debug_assert!(before > 0, "an attached read ledger was retired twice");
+    }
+}
+
+pub(crate) fn innermost_query_context_value<T>(
+    contexts: &[Arc<AnalyzerQueryContext>],
+    mut select: impl FnMut(&AnalyzerQueryContext) -> Option<T>,
+) -> Option<T> {
+    contexts.iter().rev().find_map(|context| select(context))
+}
+
+pub(crate) fn record_query_incomplete_on_active_contexts(
+    contexts: &[Arc<AnalyzerQueryContext>],
+    reason: crate::analyzer::QueryReadIncomplete,
+) {
+    for context in contexts {
+        context.record_read_incomplete(reason.clone());
+    }
+}
+
 /// Enumerate source identities independently of persisted parse-product readiness.
 pub(crate) fn project_source_file_inventory(
     analyzer: &(impl IAnalyzer + ?Sized),
@@ -1214,7 +1291,148 @@ pub(crate) fn project_source_file_inventory(
     inventory
 }
 
+fn active_query_model_or_snapshot<T>(
+    active_query: Option<Option<Arc<T>>>,
+    snapshot: impl FnOnce() -> Option<Arc<T>>,
+) -> Option<Arc<T>> {
+    active_query.unwrap_or_else(snapshot)
+}
+
+fn structural_index_inputs(
+    provider: &dyn crate::analyzer::structural::StructuralFactProvider,
+) -> Option<(
+    &crate::analyzer::structural::provider::StructuralFactSnapshotCache,
+    crate::analyzer::content_identity::WorkspaceContentIdentity,
+)> {
+    let cache = provider.snapshot_structural_index_cache();
+    let content_identity = provider.structural_content_identity();
+    match (cache, content_identity) {
+        (Some(cache), Some(content_identity)) => Some((cache, content_identity)),
+        _ => None,
+    }
+}
+
 pub trait IAnalyzer: CodeUnitIndex + Send + Sync + Any {
+    /// Read live dynamic import source paths from the selected workspace
+    /// publication. `seed_files` scopes `imports-of`; `None` asks for every
+    /// live source, which is the scope required by `importers-of`.
+    fn dynamic_import_sources(
+        &self,
+        _seed_files: Option<&[ProjectFile]>,
+    ) -> std::result::Result<Vec<(String, String)>, crate::analyzer::store::StoreError> {
+        Ok(Vec::new())
+    }
+
+    /// The snapshot's confirmed structural identity for a physical declaration.
+    /// Extraction identities and their persisted facts are immutable. An
+    /// adapter may reconcile ownership from structured cross-file evidence,
+    /// retaining physical provenance for later range/source reads. Ambiguous
+    /// ownership remains provisional; incomplete reads retain the query's typed
+    /// completion state and must never be admitted to an identity cache.
+    fn canonical_code_unit(
+        &self,
+        unit: &CodeUnit,
+        _cancellation: Option<&crate::CancellationToken>,
+    ) -> CodeUnit {
+        unit.clone()
+    }
+
+    /// Build loop candidates for one semantic procedure.
+    fn loop_candidates_for(
+        &self,
+        workspace: &crate::analyzer::WorkspaceAnalyzer,
+        procedure: &crate::analyzer::semantic::ProcedureHandle,
+        cancellation: Option<&CancellationToken>,
+    ) -> Arc<crate::analyzer::LoopCandidates> {
+        Arc::new(crate::analyzer::build_loop_candidates(
+            workspace,
+            procedure,
+            cancellation,
+        ))
+    }
+
+    /// Build statement assessments for one semantic procedure.
+    fn statement_assessments_for(
+        &self,
+        workspace: &crate::analyzer::WorkspaceAnalyzer,
+        procedure: &crate::analyzer::semantic::ProcedureHandle,
+        cancellation: Option<&CancellationToken>,
+    ) -> Arc<crate::analyzer::semantic::StatementAssessments> {
+        Arc::new(
+            crate::analyzer::semantic::statement_entries::build_statement_assessments(
+                workspace,
+                procedure,
+                cancellation,
+            ),
+        )
+    }
+
+    /// Return query-lifetime, AST-owned C++ expression facts for one file.
+    /// Languages without the C++ adapter return `None`; an empty expression
+    /// vector is an authoritative expression-free C++ source snapshot.
+    fn cpp_expression_source_facts(
+        &self,
+        _file: &ProjectFile,
+    ) -> Option<std::sync::Arc<brokk_bifrost_core::analyzer::cpp_facts::CppExpressionSourceFacts>>
+    {
+        None
+    }
+
+    /// Return query-lifetime, AST-owned C++ statement facts for one file.
+    /// Languages without the C++ adapter return `None`.
+    fn cpp_statement_source_facts(
+        &self,
+        _file: &ProjectFile,
+    ) -> Option<Arc<brokk_bifrost_core::analyzer::statement_facts::CppStatementFactRows>> {
+        None
+    }
+
+    /// Return query-lifetime, AST-owned C++ class and exception facts for one
+    /// file. Languages without the C++ adapter return `None`; an empty row
+    /// set is an authoritative class-free C++ source snapshot.
+    fn cpp_class_source_facts(
+        &self,
+        _file: &ProjectFile,
+    ) -> Option<std::sync::Arc<brokk_bifrost_core::analyzer::cpp_facts::CppClassFactRows>> {
+        None
+    }
+
+    /// Return the existing query-lifetime C++ declaration/base rows for one
+    /// file. The class relation uses these rows for bounded hierarchy joins;
+    /// no second hierarchy is retained in RQL.
+    fn cpp_class_declaration_source_facts(
+        &self,
+        _token: QueryToken<'_>,
+        _file: &ProjectFile,
+    ) -> Option<
+        std::sync::Arc<Vec<brokk_bifrost_core::analyzer::cpp_facts::CppDeclarationSourceFact>>,
+    > {
+        None
+    }
+
+    /// Read bounded presentation proofs from the same selected publication.
+    fn dependency_file_locations(
+        &self,
+    ) -> crate::analyzer::store::Result<
+        Vec<(
+            String,
+            crate::analyzer::semantic_model::DependencyEvidenceLocation,
+        )>,
+    > {
+        Ok(Vec::new())
+    }
+
+    /// Read bounded static dependency facts from this immutable store selection.
+    /// This method must never discover files or prepare dependency artifacts.
+    fn dependency_file_evidence(
+        &self,
+    ) -> crate::analyzer::store::Result<crate::analyzer::semantic_model::DependencyFileEvidence>
+    {
+        Err(StoreError::new(
+            "static dependency evidence is unavailable for this analyzer",
+        ))
+    }
+
     /// Source files owned by this analyzer, including files whose parse products
     /// are unavailable. Listing failures preserve available identities and mark
     /// the batch incomplete. This inventory must not hydrate declarations, read
@@ -1310,14 +1528,10 @@ pub trait IAnalyzer: CodeUnitIndex + Send + Sync + Any {
     }
 
     /// Best-effort batch-warm the request-scoped `definitions()` memo for
-    /// many names at once. A caller that already knows a name superset (for
-    /// instance every declaration a whole-workspace scan already enumerated)
-    /// can call this once so later individual `definitions()` lookups against
-    /// those same names -- inside `get_definition`'s per-occurrence
-    /// resolution, for instance -- hit a warm memo instead of paying one
-    /// relational round trip each. A no-op with no open query boundary, and
-    /// for analyzers without a `definitions()` memo to warm.
-    fn prefetch_definitions(&self, _fq_names: &[String]) {}
+    /// names the caller already knows it will query.
+    fn prefetch_definitions(&self, fq_names: &[String]) {
+        CodeUnitIndex::prefetch_definitions(self, fq_names);
+    }
 
     /// The cancellation token carried by the innermost active query boundary.
     ///
@@ -1448,10 +1662,7 @@ pub trait IAnalyzer: CodeUnitIndex + Send + Sync + Any {
         crate::analyzer::install_on_dedicated_build_pool(|| {
             use rayon::prelude::*;
             providers.into_par_iter().for_each(|provider| {
-                let (Some(cache), Some(content_identity)) = (
-                    provider.snapshot_structural_index_cache(),
-                    provider.structural_content_identity(),
-                ) else {
+                let Some((cache, content_identity)) = structural_index_inputs(provider) else {
                     return;
                 };
                 let cache = cache.inner();
@@ -1466,13 +1677,9 @@ pub trait IAnalyzer: CodeUnitIndex + Send + Sync + Any {
     /// already built or already rejected for this analyzer generation.
     fn structural_indexes_warm(&self) -> bool {
         self.structural_fact_providers().iter().all(|provider| {
-            let (Some(cache), Some(content_identity)) = (
-                provider.snapshot_structural_index_cache(),
-                provider.structural_content_identity(),
-            ) else {
-                return true;
-            };
-            !cache.inner().auto_build_outstanding(content_identity)
+            structural_index_inputs(*provider).is_none_or(|(cache, content_identity)| {
+                !cache.inner().auto_build_outstanding(content_identity)
+            })
         })
     }
 
@@ -1616,7 +1823,9 @@ pub trait IAnalyzer: CodeUnitIndex + Send + Sync + Any {
         report
     }
 
-    fn extract_call_receiver(&self, reference: &str) -> Option<String>;
+    fn extract_call_receiver(&self, _reference: &str) -> Option<String> {
+        None
+    }
 
     fn import_statements(&self, _file: &ProjectFile) -> Vec<String> {
         Vec::new()
@@ -1753,6 +1962,16 @@ pub trait IAnalyzer: CodeUnitIndex + Send + Sync + Any {
         None
     }
 
+    /// Python's ordered direct bases, C3 linearization, effective members, and
+    /// nearest inherited method overrides for one selected declaration.
+    fn python_class_hierarchy_provider_for(
+        &self,
+        _declaration: &CodeUnit,
+    ) -> Option<&dyn crate::analyzer::usages::python_class_hierarchy::PythonClassHierarchyProvider>
+    {
+        None
+    }
+
     fn test_detection_provider(&self) -> Option<&dyn TestDetectionProvider> {
         None
     }
@@ -1773,12 +1992,10 @@ pub trait IAnalyzer: CodeUnitIndex + Send + Sync + Any {
         &self,
     ) -> Option<Arc<crate::analyzer::semantic_model::SemanticModelOverlay>> {
         let overlay =
-            if let Some(semantic_model_overlay) = self.active_query_semantic_model_overlay() {
-                semantic_model_overlay
-            } else {
+            active_query_model_or_snapshot(self.active_query_semantic_model_overlay(), || {
                 self.snapshot_caches()
                     .and_then(AnalyzerSnapshotCaches::semantic_model_overlay)
-            };
+            });
         if self.read_ledger_attached()
             && let Some(overlay) = overlay.as_ref()
         {
@@ -1796,12 +2013,11 @@ pub trait IAnalyzer: CodeUnitIndex + Send + Sync + Any {
     fn active_semantic_model_snapshot(
         &self,
     ) -> Option<Arc<crate::analyzer::semantic_model::ActiveSemanticModelSnapshot>> {
-        let snapshot = if let Some(snapshot) = self.active_query_semantic_model_snapshot() {
-            snapshot
-        } else {
-            self.snapshot_caches()
-                .and_then(AnalyzerSnapshotCaches::active_semantic_model_snapshot)
-        };
+        let snapshot =
+            active_query_model_or_snapshot(self.active_query_semantic_model_snapshot(), || {
+                self.snapshot_caches()
+                    .and_then(AnalyzerSnapshotCaches::active_semantic_model_snapshot)
+            });
         if self.read_ledger_attached()
             && let Some(snapshot) = snapshot.as_ref()
         {
@@ -1929,6 +2145,45 @@ pub trait IAnalyzer: CodeUnitIndex + Send + Sync + Any {
         self.workspace_content_identity() == Some(expected)
     }
 
+    /// Incrementally refresh the durable import graph after a content change.
+    /// `None` means this analyzer cannot prove a complete persistent update.
+    #[doc(hidden)]
+    fn refresh_persisted_import_graph(
+        &self,
+        _content_identity: crate::analyzer::content_identity::WorkspaceContentIdentity,
+        _cancellation: Option<&CancellationToken>,
+        _max_files: usize,
+        _max_edges: usize,
+    ) -> Result<Option<PersistedImportGraphRefresh>, StoreError> {
+        Ok(None)
+    }
+
+    /// Read adjacency rows from the complete durable import graph for this
+    /// exact workspace identity. `None` means no durable graph is available or
+    /// one or more seeds are outside its supported source set.
+    #[doc(hidden)]
+    fn read_persisted_import_adjacency(
+        &self,
+        _content_identity: crate::analyzer::content_identity::WorkspaceContentIdentity,
+        _direction: PersistedImportDirection,
+        _files: &[ProjectFile],
+        _edge_limit: usize,
+    ) -> Result<Option<PersistedImportAdjacency>, StoreError> {
+        Ok(None)
+    }
+
+    /// Atomically replace the durable import graph for this content identity.
+    /// A workspace without persistent analyzer storage returns `false`.
+    #[doc(hidden)]
+    fn publish_persisted_import_graph(
+        &self,
+        _content_identity: crate::analyzer::content_identity::WorkspaceContentIdentity,
+        _sources: &[ProjectFile],
+        _edges: &[PersistedImportEdge],
+    ) -> Result<bool, StoreError> {
+        Ok(false)
+    }
+
     fn autocomplete_definitions(&self, query: &str) -> Vec<CodeUnit> {
         if query.is_empty() {
             return Vec::new();
@@ -1985,11 +2240,7 @@ pub trait IAnalyzer: CodeUnitIndex + Send + Sync + Any {
     where
         Self: Sized,
     {
-        let result = capture_usage_lookup_reads(self as &dyn IAnalyzer, || {
-            UsageFinder::new().find_usages(self, overloads, DEFAULT_MAX_FILES, DEFAULT_MAX_USAGES)
-        });
-        record_usage_lookup(self as &dyn IAnalyzer, overloads, &result);
-        result
+        crate::analyzer::usages::find_usages(self as &dyn IAnalyzer, overloads)
     }
 
     /// Like [`Self::find_usages`] but returns the candidate file set alongside the result.
@@ -2204,6 +2455,14 @@ pub trait IAnalyzer: CodeUnitIndex + Send + Sync + Any {
     }
 }
 
+pub(crate) fn increment_test_hook_counter(counter: &AtomicUsize) {
+    counter.fetch_add(1, AtomicOrdering::Relaxed);
+}
+
+pub(crate) fn reset_test_hook_counter(counter: &AtomicUsize) {
+    counter.store(0, AtomicOrdering::Relaxed);
+}
+
 /// The `*_for_test` counter hooks, reached through
 /// [`IAnalyzer::test_hooks`]. Every method keeps the no-op / `0` default the
 /// hook carried on `IAnalyzer`, so an implementor that instruments nothing
@@ -2301,7 +2560,8 @@ pub trait AnalyzerTestHooks {
 
     #[doc(hidden)]
     fn candidate_hydration_count_for_test(&self) -> usize {
-        0
+        self.full_candidate_hydration_count_for_test()
+            + self.bulk_candidate_hydration_count_for_test()
     }
 
     #[doc(hidden)]
@@ -2442,10 +2702,26 @@ pub struct AnalyzerQueryScope<'a> {
 }
 
 impl<'a> AnalyzerQueryScope<'a> {
-    pub fn new(analyzer: &'a dyn IAnalyzer) -> Self {
-        let context = Arc::new(AnalyzerQueryContext::default());
+    fn with_context(analyzer: &'a dyn IAnalyzer, context: AnalyzerQueryContext) -> Self {
+        let context = Arc::new(context);
         analyzer.begin_query(&context);
         Self { analyzer, context }
+    }
+
+    pub fn new(analyzer: &'a dyn IAnalyzer) -> Self {
+        Self::with_context(analyzer, AnalyzerQueryContext::default())
+    }
+
+    /// Open a request boundary that memoizes identifier candidate results
+    /// without retaining the analyzer's other request caches on this thread.
+    /// This is for census work that repeats the same bounded store lookup
+    /// across many reference sites (#4510).
+    #[doc(hidden)]
+    pub fn for_identifier_candidate_memo(analyzer: &'a dyn IAnalyzer) -> Self {
+        Self::with_context(
+            analyzer,
+            AnalyzerQueryContext::for_identifier_candidate_memo(),
+        )
     }
 
     /// Open a request boundary that carries the caller's deadline, so reads
@@ -2454,11 +2730,10 @@ impl<'a> AnalyzerQueryScope<'a> {
         analyzer: &'a dyn IAnalyzer,
         cancellation: &CancellationToken,
     ) -> Self {
-        let context = Arc::new(AnalyzerQueryContext::with_cancellation(
-            cancellation.clone(),
-        ));
-        analyzer.begin_query(&context);
-        Self { analyzer, context }
+        Self::with_context(
+            analyzer,
+            AnalyzerQueryContext::with_cancellation(cancellation.clone()),
+        )
     }
 
     /// Open a resolver boundary against one exact semantic-model overlay.
@@ -2468,11 +2743,10 @@ impl<'a> AnalyzerQueryScope<'a> {
         analyzer: &'a dyn IAnalyzer,
         semantic_model_overlay: Option<Arc<crate::analyzer::semantic_model::SemanticModelOverlay>>,
     ) -> Self {
-        let context = Arc::new(AnalyzerQueryContext::with_semantic_model_overlay(
-            semantic_model_overlay,
-        ));
-        analyzer.begin_query(&context);
-        Self { analyzer, context }
+        Self::with_context(
+            analyzer,
+            AnalyzerQueryContext::with_semantic_model_overlay(semantic_model_overlay),
+        )
     }
 
     /// Open a request boundary against one atomic active/overlay publication.
@@ -2482,11 +2756,10 @@ impl<'a> AnalyzerQueryScope<'a> {
         analyzer: &'a dyn IAnalyzer,
         snapshot: Option<Arc<crate::analyzer::semantic_model::ActiveSemanticModelSnapshot>>,
     ) -> Self {
-        let context = Arc::new(AnalyzerQueryContext::with_active_semantic_model_snapshot(
-            snapshot,
-        ));
-        analyzer.begin_query(&context);
-        Self { analyzer, context }
+        Self::with_context(
+            analyzer,
+            AnalyzerQueryContext::with_active_semantic_model_snapshot(snapshot),
+        )
     }
 
     /// Open a request boundary that records every input it reads into
@@ -2501,9 +2774,7 @@ impl<'a> AnalyzerQueryScope<'a> {
         analyzer: &'a dyn IAnalyzer,
         ledger: Arc<crate::analyzer::read_ledger::ReadLedger>,
     ) -> Self {
-        let context = Arc::new(AnalyzerQueryContext::with_read_ledger(ledger));
-        analyzer.begin_query(&context);
-        Self { analyzer, context }
+        Self::with_context(analyzer, AnalyzerQueryContext::with_read_ledger(ledger))
     }
 
     fn with_nested_read_ledger(
@@ -2511,11 +2782,10 @@ impl<'a> AnalyzerQueryScope<'a> {
         ledger: Arc<crate::analyzer::read_ledger::ReadLedger>,
         shadowed: Arc<crate::analyzer::read_ledger::ReadLedger>,
     ) -> Self {
-        let context = Arc::new(AnalyzerQueryContext::with_nested_read_ledger(
-            ledger, shadowed,
-        ));
-        analyzer.begin_query(&context);
-        Self { analyzer, context }
+        Self::with_context(
+            analyzer,
+            AnalyzerQueryContext::with_nested_read_ledger(ledger, shadowed),
+        )
     }
 
     pub fn store_error(&self) -> Option<StoreError> {
@@ -2543,6 +2813,14 @@ impl<'a> AnalyzerQueryScope<'a> {
 /// The one mint for [`QueryToken`]: an open scope proves request-scoped
 /// memoization is active, which is exactly what the syntax accessors demand.
 impl QueryScope for AnalyzerQueryScope<'_> {}
+
+pub(crate) fn with_query_scope<R>(
+    analyzer: &dyn IAnalyzer,
+    query: impl FnOnce(QueryToken<'_>) -> R,
+) -> R {
+    let scope = AnalyzerQueryScope::new(analyzer);
+    query(scope.token())
+}
 
 impl Drop for AnalyzerQueryScope<'_> {
     fn drop(&mut self) {
@@ -2621,13 +2899,28 @@ pub(crate) fn capture_nested_reads<T>(
         // there is no caller ledger whose inputs this funnel needs to narrow.
         return (read(), Vec::new());
     };
+    let (result, captured) = capture_with_read_ledger_scope(analyzer, Some(&enclosing), read);
+    (result, captured.keys())
+}
+
+fn capture_with_read_ledger_scope<T>(
+    analyzer: &dyn IAnalyzer,
+    enclosing: Option<&Arc<crate::analyzer::read_ledger::ReadLedger>>,
+    query: impl FnOnce() -> T,
+) -> (T, Arc<crate::analyzer::read_ledger::ReadLedger>) {
     let captured = Arc::new(crate::analyzer::read_ledger::ReadLedger::new());
     let result = {
-        let _scope =
-            AnalyzerQueryScope::with_nested_read_ledger(analyzer, Arc::clone(&captured), enclosing);
-        read()
+        let _scope = match enclosing {
+            Some(enclosing) => AnalyzerQueryScope::with_nested_read_ledger(
+                analyzer,
+                Arc::clone(&captured),
+                Arc::clone(enclosing),
+            ),
+            None => AnalyzerQueryScope::with_read_ledger(analyzer, Arc::clone(&captured)),
+        };
+        query()
     };
-    (result, captured.keys())
+    (result, captured)
 }
 
 /// Replay all dependencies of a completed query into its current caller.
@@ -2656,18 +2949,7 @@ pub fn capture_query_reads<T>(
     query: impl FnOnce() -> T,
 ) -> (T, Arc<crate::analyzer::read_ledger::ReadLedger>) {
     let enclosing = analyzer.current_thread_read_ledger();
-    let captured = Arc::new(crate::analyzer::read_ledger::ReadLedger::new());
-    let result = {
-        let _scope = match &enclosing {
-            Some(enclosing) => AnalyzerQueryScope::with_nested_read_ledger(
-                analyzer,
-                Arc::clone(&captured),
-                Arc::clone(enclosing),
-            ),
-            None => AnalyzerQueryScope::with_read_ledger(analyzer, Arc::clone(&captured)),
-        };
-        query()
-    };
+    let (result, captured) = capture_with_read_ledger_scope(analyzer, enclosing.as_ref(), query);
     if let Some(enclosing) = enclosing {
         for key in captured.keys() {
             enclosing.record(key);
@@ -2685,6 +2967,13 @@ pub(crate) fn record_read_on_active_ledgers(
     contexts: &[Arc<AnalyzerQueryContext>],
     key: crate::analyzer::read_ledger::ReadKey,
 ) {
+    for_each_unshadowed_active_ledger(contexts, |ledger| ledger.record(key.clone()));
+}
+
+fn for_each_unshadowed_active_ledger(
+    contexts: &[Arc<AnalyzerQueryContext>],
+    mut record: impl FnMut(&crate::analyzer::read_ledger::ReadLedger),
+) {
     for context in contexts {
         let Some(ledger) = context.read_ledger() else {
             continue;
@@ -2695,25 +2984,14 @@ pub(crate) fn record_read_on_active_ledgers(
         {
             continue;
         }
-        ledger.record(key.clone());
+        record(ledger);
     }
 }
 
 /// Record one unattributed funnel crossing under the same shadowing contract
 /// as [`record_read_on_active_ledgers`].
 pub(crate) fn record_unattributed_on_active_ledgers(contexts: &[Arc<AnalyzerQueryContext>]) {
-    for context in contexts {
-        let Some(ledger) = context.read_ledger() else {
-            continue;
-        };
-        if contexts
-            .iter()
-            .any(|candidate| candidate.shadows_read_ledger(ledger))
-        {
-            continue;
-        }
-        ledger.record_unattributed();
-    }
+    for_each_unshadowed_active_ledger(contexts, |ledger| ledger.record_unattributed());
 }
 
 /// Record one usage lookup per overload the caller asked about, each carrying
@@ -2985,7 +3263,7 @@ fn ordered_summary_children<A: IAnalyzer + ?Sized>(
     ordered
 }
 
-fn child_first_start<A: IAnalyzer + ?Sized>(analyzer: &A, child: &CodeUnit) -> usize {
+pub(crate) fn child_first_start<A: IAnalyzer + ?Sized>(analyzer: &A, child: &CodeUnit) -> usize {
     analyzer
         .ranges(child)
         .iter()
@@ -3041,6 +3319,7 @@ mod read_ledger_scope_tests {
     };
     use crate::analyzer::read_ledger::{ReadKey, ReadLedger};
     use crate::analyzer::semantic::ids::StableDigest;
+    use brokk_bifrost_test_macros::hardwon;
     use std::sync::Arc;
 
     #[test]
@@ -3074,6 +3353,7 @@ mod read_ledger_scope_tests {
     }
 
     #[test]
+    #[hardwon("#2586: shared policy subject scans double-charged nested read ledgers")]
     fn query_capture_preserves_nested_funnel_attribution_without_double_charging() {
         let project = crate::inline_project::InlineTestProject::with_language(
             crate::analyzer::Language::Rust,
@@ -3113,6 +3393,7 @@ mod read_ledger_scope_tests {
 #[cfg(test)]
 mod required_literal_tests {
     use super::{SearchSymbolPatternBatch, required_storage_literals};
+    use brokk_bifrost_test_macros::hardwon;
 
     /// Longest first, then alphabetical, which is the order the prefilter emits.
     fn literals(pattern: &str) -> Vec<String> {
@@ -3120,16 +3401,17 @@ mod required_literal_tests {
     }
 
     #[test]
+    #[hardwon("#2316: required-literal prefilter must retain a plain identifier match")]
     fn a_plain_identifier_is_its_own_required_literal() {
         assert_eq!(
             literals("ProductionTaintPolicyEvaluator"),
             vec!["productiontaintpolicyevaluator".to_string()]
         );
     }
-
-    /// The three shapes from issue #2316: a wildcard between literals leaves
-    /// every literal required.
     #[test]
+    #[hardwon(
+        "#2316: regex searches scanned every indexed declaration when literal pushdown was available"
+    )]
     fn wildcards_between_literals_keep_every_literal() {
         assert_eq!(
             literals("Java.*Value.*Flow"),
@@ -3143,6 +3425,9 @@ mod required_literal_tests {
     }
 
     #[test]
+    #[hardwon(
+        "#2316: regex literal pushdown excluded valid matches when an optional group was absent"
+    )]
     fn an_optional_group_contributes_nothing() {
         assert_eq!(literals("Foo(Bar)?"), vec!["foo".to_string()]);
         assert_eq!(literals("Foo(Bar)*"), vec!["foo".to_string()]);
@@ -3159,6 +3444,9 @@ mod required_literal_tests {
     /// An alternation is required only where every branch requires the same
     /// literal, so a differing branch yields nothing rather than a wrong filter.
     #[test]
+    #[hardwon(
+        "#2316: regex literal pushdown excluded valid alternatives by requiring a branch-specific literal"
+    )]
     fn an_alternation_requires_only_what_every_branch_requires() {
         assert!(literals("Foo|Bar").is_empty());
         assert_eq!(literals("Search(Foo|Bar)"), vec!["search".to_string()]);
@@ -3168,6 +3456,9 @@ mod required_literal_tests {
     /// An escaped metacharacter is a literal character, but it is not in the
     /// storage charset, so it ends the run instead of joining it.
     #[test]
+    #[hardwon(
+        "#2316: regex literal pushdown built an unsound substring across the stored-name join"
+    )]
     fn a_non_charset_character_splits_the_run_instead_of_joining_it() {
         assert_eq!(
             literals(r"Foo\.Bar"),
@@ -3179,6 +3470,9 @@ mod required_literal_tests {
     }
 
     #[test]
+    #[hardwon(
+        "#2316: regex literal pushdown excluded case-insensitive matches from normalized storage"
+    )]
     fn case_insensitive_groups_recover_their_letters() {
         assert_eq!(literals("(?i)Solver"), vec!["solver".to_string()]);
         assert_eq!(
@@ -3194,6 +3488,7 @@ mod required_literal_tests {
     }
 
     #[test]
+    #[hardwon("#2316: regex literal pushdown must not narrow patterns with no mandatory literal")]
     fn a_pattern_without_a_required_literal_yields_none() {
         for pattern in [".*", r"\w+", "^$", "[A-Za-z]+", ".", "(a|b)+"] {
             assert!(
@@ -3205,13 +3500,14 @@ mod required_literal_tests {
     }
 
     #[test]
+    #[hardwon("#2316: substring reduction must preserve the symbol-search result set")]
     fn a_literal_another_literal_contains_is_dropped() {
         assert_eq!(literals("Foo.*FooBar"), vec!["foobar".to_string()]);
     }
-
     /// The literal count per pattern is bounded, and dropping a required literal
     /// only widens the prefilter.
     #[test]
+    #[hardwon("#2316: literal prefilter cap must only widen the candidate scan")]
     fn the_literal_set_is_bounded() {
         assert_eq!(
             literals("aa.*bb.*cc.*dd.*ee"),
@@ -3223,8 +3519,10 @@ mod required_literal_tests {
             ]
         );
     }
-
     #[test]
+    #[hardwon(
+        "#3279: structural MCP regex batches stalled because one pattern disabled safe per-pattern pushdown"
+    )]
     fn a_mixed_batch_prefilters_every_pattern_separately() {
         let batch = SearchSymbolPatternBatch::compile(
             vec![
@@ -3255,6 +3553,7 @@ mod required_literal_tests {
     /// unconditionally true disjunct would filter nothing anyway, and emitting
     /// the others would drop rows that pattern matches.
     #[test]
+    #[hardwon("#3279: an unfilterable symbol selector must disable the entire batch prefilter")]
     fn one_unfilterable_pattern_voids_the_batch_prefilter() {
         let batch = SearchSymbolPatternBatch::compile(
             vec!["ValueFlow".to_string(), ".*".to_string()],
@@ -3267,6 +3566,7 @@ mod required_literal_tests {
     /// `auto_quote` wraps a pattern in wildcards, which leaves the quoted
     /// identifier required.
     #[test]
+    #[hardwon("#3279: auto-quoted symbol patterns must retain their identifier literal")]
     fn auto_quoted_patterns_keep_their_identifier_literal() {
         let batch = SearchSymbolPatternBatch::compile(vec!["ValueFlow".to_string()], true, None);
         assert_eq!(
@@ -3281,6 +3581,7 @@ mod required_literal_tests {
     /// matching nothing. The translated pattern keeps its required literal so
     /// the storage prefilter still applies.
     #[test]
+    #[hardwon("#3279: leading wildcard symbol selectors must compile as glob containment")]
     fn leading_wildcard_patterns_compile_as_glob_containment() {
         let batch = SearchSymbolPatternBatch::compile(
             vec!["*Language*".to_string(), "*Query*Domain*".to_string()],
@@ -3309,6 +3610,7 @@ mod required_literal_tests {
     /// be interpreted at all. It must be reported, not dropped: a dropped
     /// pattern answers "no such symbols" about a request that was malformed.
     #[test]
+    #[hardwon("#3279: invalid symbol selectors must be reported instead of silently dropped")]
     fn uninterpretable_patterns_are_reported_not_dropped() {
         let batch = SearchSymbolPatternBatch::compile(
             vec!["foo(bar".to_string(), "Language".to_string()],

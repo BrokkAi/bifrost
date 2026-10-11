@@ -28,8 +28,8 @@
 //!   content-keyed facts cache behind it.
 //! - [`search`]: parallel workspace execution and the tool-facing output.
 //!
-//! See `.agents/plans/ISSUE_328_SEARCH_AST_EXECPLAN.md` for the original plan
-//! and `.agents/plans/issue-449-query-code-reference.md` for the public rename.
+//! The public query is `CodeQuery` (#328); its reference-rendering contract is
+//! tracked by #449.
 
 pub(crate) mod adapter_helpers;
 pub mod branch_relations;
@@ -47,6 +47,15 @@ pub mod provider;
 pub mod qualified_paths;
 pub mod reference_edges;
 pub mod rewrite_paths;
+#[cfg(test)]
+pub(crate) mod test_support;
+
+/// Add an incompleteness reason once, preserving its first-seen order.
+fn note_once<T: PartialEq>(reasons: &mut Vec<T>, reason: T) {
+    if !reasons.contains(&reason) {
+        reasons.push(reason);
+    }
+}
 
 // The normalized kind/role registry and the spec trait a language implements
 // live in `brokk-bifrost-core`, below every grammar; only the engine that
@@ -95,7 +104,7 @@ pub use occurrence_rows::{
     OccurrenceCompleteness, OccurrenceDerivationOptions, OccurrenceFileResult,
     OccurrenceIncompleteReason, OccurrenceRow, OccurrenceTarget, OccurrencesCancelled,
     occurrences_for_file, occurrences_for_file_with_options,
-    occurrences_for_file_with_options_roles_and_ast_ids,
+    occurrences_for_file_with_options_roles_and_ast_ids, resolve_occurrence_targets_for_rows,
 };
 pub use occurrences::{
     ALL_OCCURRENCE_ROLES, NO_OCCURRENCE_ROLE_SUPPORT, Namespace, OccurrenceClass, OccurrenceRole,

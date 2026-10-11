@@ -10,12 +10,14 @@ use crate::analyzer::usages::call_conversion::{
 };
 use crate::analyzer::{CodeUnit, IAnalyzer, Language, ProjectFile};
 use crate::hash::HashMap;
+use brokk_bifrost_jvm::scala::graph::syntax::scala_literal_type_name;
 
 use super::scala_type_lookup_segments;
 use super::semantic_adaptation::{
     AdaptationFailure, ScalaAdaptationCatalog, ScalaTypeBinding, SelectedAdaptationKind,
-    scala_nominal_types_match,
+    scala_nominal_types_match, type_identity as scala_type_identity,
 };
+use std::sync::Arc;
 
 pub(crate) static CALL_ARGUMENT_CONVERSION_PROVER: ScalaCallArgumentConversionProver =
     ScalaCallArgumentConversionProver;
@@ -205,7 +207,7 @@ fn resolved_nominal(segments: &[String]) -> ResolvedConversionType {
     ))
 }
 
-fn formal_type_identity(formal: Node<'_>, source: &str) -> Option<Vec<String>> {
+fn formal_type_identity(formal: Node<'_>, source: &str) -> Option<Arc<[String]>> {
     let declared = formal.child_by_field_name("type").or_else(|| {
         named_children(formal)
             .into_iter()
@@ -217,8 +219,7 @@ fn formal_type_identity(formal: Node<'_>, source: &str) -> Option<Vec<String>> {
     {
         return None;
     }
-    let segments = scala_type_lookup_segments(declared, source);
-    (!segments.is_empty()).then_some(segments)
+    scala_type_identity(declared, source)
 }
 
 fn expression_nominal_type(mut node: Node<'_>, source: &str) -> Option<Vec<String>> {
@@ -229,18 +230,13 @@ fn expression_nominal_type(mut node: Node<'_>, source: &str) -> Option<Vec<Strin
                 let name = node_text(source, node).filter(|name| !name.is_empty())?;
                 return lexical_type(node, name, source);
             }
-            "integer_literal" => return Some(vec!["Int".to_owned()]),
-            "floating_point_literal" => return Some(vec!["Double".to_owned()]),
-            "boolean_literal" => return Some(vec!["Boolean".to_owned()]),
-            "character_literal" => return Some(vec!["Char".to_owned()]),
-            "string" | "string_literal" => return Some(vec!["String".to_owned()]),
             "instance_expression" => {
                 let constructed = node.child_by_field_name("type")?;
                 let segments = scala_type_lookup_segments(constructed, source);
                 return (!segments.is_empty()).then_some(segments);
             }
             _ => {
-                if let Some(name) = literal_type_name(node) {
+                if let Some(name) = scala_literal_type_name(source, node) {
                     return Some(vec![name.to_owned()]);
                 }
                 return None;
@@ -248,18 +244,6 @@ fn expression_nominal_type(mut node: Node<'_>, source: &str) -> Option<Vec<Strin
         }
     }
     None
-}
-
-fn literal_type_name(node: Node<'_>) -> Option<&'static str> {
-    match node.kind() {
-        "integer_literal" => Some("Int"),
-        "floating_point_literal" => Some("Double"),
-        "boolean_literal" => Some("Boolean"),
-        "character_literal" => Some("Char"),
-        "string" | "string_literal" => Some("String"),
-        "unit" => Some("Unit"),
-        _ => None,
-    }
 }
 
 fn lexical_type(node: Node<'_>, name: &str, source: &str) -> Option<Vec<String>> {
@@ -304,14 +288,7 @@ fn lexical_type(node: Node<'_>, name: &str, source: &str) -> Option<Vec<String>>
     None
 }
 
-fn compilation_unit(mut node: Node<'_>) -> Option<Node<'_>> {
-    loop {
-        if node.kind() == "compilation_unit" {
-            return Some(node);
-        }
-        node = node.parent()?;
-    }
-}
+use super::syntax::compilation_unit;
 
 fn subtree_has_kind(node: Node<'_>, kind: &str) -> bool {
     let mut stack = vec![node];

@@ -332,10 +332,30 @@ impl Default for SnapshotWorkspaceUsageGraphCache {
 }
 
 #[cfg(test)]
+pub(crate) fn ready_graph(
+    acquisition: WorkspaceUsageGraphCacheAcquisition,
+) -> (
+    Arc<WorkspaceUsageRankingGraph>,
+    WorkspaceUsageGraphCacheLifecycle,
+) {
+    match acquisition {
+        WorkspaceUsageGraphCacheAcquisition::Ready {
+            graph, lifecycle, ..
+        } => (graph, lifecycle),
+        WorkspaceUsageGraphCacheAcquisition::Incomplete(_) => {
+            panic!("complete test graph unexpectedly incomplete")
+        }
+        WorkspaceUsageGraphCacheAcquisition::Cancelled => panic!("unexpected cancellation"),
+        WorkspaceUsageGraphCacheAcquisition::Stale => panic!("unexpected stale result"),
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::analyzer::usages::workspace_graph::WorkspaceUsageRankingNode;
     use crate::hash::HashMap;
+    use brokk_bifrost_test_macros::hardwon;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::mpsc;
     use std::thread;
@@ -344,16 +364,21 @@ mod tests {
     fn key_with_kind(
         content_seed: u64,
         kind: WorkspaceUsageGraphKind,
+        ecosystem: UsageEcosystem,
     ) -> WorkspaceUsageGraphCacheKey {
         WorkspaceUsageGraphCacheKey::new(
             kind,
-            [UsageEcosystem::Rust],
+            [ecosystem],
             WorkspaceContentIdentity::for_test(content_seed),
         )
     }
 
     fn key(content_seed: u64) -> WorkspaceUsageGraphCacheKey {
-        key_with_kind(content_seed, WorkspaceUsageGraphKind::Exact)
+        key_with_kind(
+            content_seed,
+            WorkspaceUsageGraphKind::Exact,
+            UsageEcosystem::Rust,
+        )
     }
 
     fn selected_key(content_seed: u64) -> WorkspaceUsageGraphCacheKey {
@@ -366,10 +391,10 @@ mod tests {
     }
 
     fn incumbent_jvm_key(content_seed: u64) -> WorkspaceUsageGraphCacheKey {
-        WorkspaceUsageGraphCacheKey::new(
+        key_with_kind(
+            content_seed,
             WorkspaceUsageGraphKind::Exact,
-            [UsageEcosystem::Jvm],
-            WorkspaceContentIdentity::for_test(content_seed),
+            UsageEcosystem::Jvm,
         )
     }
 
@@ -382,25 +407,10 @@ mod tests {
         }
     }
 
-    fn ready_graph(
-        acquisition: WorkspaceUsageGraphCacheAcquisition,
-    ) -> (
-        Arc<WorkspaceUsageRankingGraph>,
-        WorkspaceUsageGraphCacheLifecycle,
-    ) {
-        match acquisition {
-            WorkspaceUsageGraphCacheAcquisition::Ready {
-                graph, lifecycle, ..
-            } => (graph, lifecycle),
-            WorkspaceUsageGraphCacheAcquisition::Incomplete(_) => {
-                panic!("complete test graph unexpectedly incomplete")
-            }
-            WorkspaceUsageGraphCacheAcquisition::Cancelled => panic!("unexpected cancellation"),
-            WorkspaceUsageGraphCacheAcquisition::Stale => panic!("unexpected stale result"),
-        }
-    }
-
     #[test]
+    #[hardwon(
+        "#1317: A completed usage graph is reused by the exact warm key without a second build"
+    )]
     fn issue_1304_complete_usage_graph_is_reused_warm() {
         let cache = SnapshotWorkspaceUsageGraphCache::default();
         let builds = AtomicUsize::new(0);
@@ -456,6 +466,7 @@ mod tests {
     }
 
     #[test]
+    #[hardwon("#1317: Cancellation does not publish a graph, and a later request can build it")]
     fn issue_1304_cancelled_usage_graph_is_not_published() {
         let cache = SnapshotWorkspaceUsageGraphCache::default();
         let cancellation = CancellationToken::default();
@@ -514,7 +525,7 @@ mod tests {
             WorkspaceUsageGraphKind::Exact,
         ] {
             let (_, lifecycle) = ready_graph(cache.acquire(
-                key_with_kind(1, kind),
+                key_with_kind(1, kind, UsageEcosystem::Rust),
                 &cancellation,
                 || WorkspaceUsageGraphCacheBuildOutcome::Complete(empty_graph()),
                 || true,
@@ -631,6 +642,7 @@ mod tests {
     }
 
     #[test]
+    #[hardwon("#1317: Concurrent usage ranking requests share one in-flight build")]
     fn issue_1304_concurrent_usage_graph_requests_are_single_flight() {
         let cache = Arc::new(SnapshotWorkspaceUsageGraphCache::default());
         let builds = Arc::new(AtomicUsize::new(0));

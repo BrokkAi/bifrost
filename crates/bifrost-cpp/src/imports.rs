@@ -17,6 +17,27 @@ use tree_sitter::Node;
 
 use crate::source_facts::CppFileSourceFacts;
 
+/// Extensions [`Language::Cpp`] claims that are headers, not translation
+/// units. Everything else in [`Language::Cpp::extensions`] (`c`, `cc`, `cpp`,
+/// `cxx`) is a translation unit -- see [`is_cpp_translation_unit`]. `hin` is
+/// the C header-template spelling (krb5's `krb5.hin`), so it is a header too.
+const CPP_HEADER_EXTENSIONS: &[&str] = &["h", "hin", "hpp", "hh", "hxx"];
+
+/// Whether `file` is a C/C++ translation unit (as opposed to a header): one of
+/// [`Language::Cpp::extensions`] that is not a header extension.
+/// Matched case-insensitively, the same normalization `Language::from_extension`
+/// applies.
+pub fn is_cpp_translation_unit(file: &ProjectFile) -> bool {
+    file.rel_path()
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .map(|extension| extension.to_ascii_lowercase())
+        .is_some_and(|extension| {
+            Language::Cpp.extensions().contains(&extension.as_str())
+                && !CPP_HEADER_EXTENSIONS.contains(&extension.as_str())
+        })
+}
+
 /// Workspace-wide resolution table for `#include` targets: every analyzable file
 /// keyed both by its full workspace-relative path and by its bare file name.
 ///
@@ -124,26 +145,11 @@ impl IncludeTargetIndex {
     }
 
     fn resolve_direct(&self, source_file: &ProjectFile, include: &str) -> Vec<ProjectFile> {
-        let include_path = Path::new(include);
         let mut matched = HashSet::default();
         let mut resolved = Vec::new();
-        if include_path.is_absolute() {
-            if let Some(rel_path) = project_relative_include_path(source_file.root(), include_path)
-            {
-                self.extend_rel_path(&rel_path, &mut matched, &mut resolved);
-            }
-            return resolved;
+        for rel_path in direct_include_candidate_paths(source_file.root(), source_file, include) {
+            self.extend_rel_path(&rel_path, &mut matched, &mut resolved);
         }
-
-        let source_relative = ProjectFile::new(
-            source_file.root().to_path_buf(),
-            source_file.parent().join(include_path),
-        );
-        self.extend_rel_path(source_relative.rel_path(), &mut matched, &mut resolved);
-
-        let project_relative =
-            ProjectFile::new(source_file.root().to_path_buf(), include_path.to_path_buf());
-        self.extend_rel_path(project_relative.rel_path(), &mut matched, &mut resolved);
         resolved
     }
 
@@ -246,30 +252,34 @@ pub fn resolve_include_targets(
     include: &str,
 ) -> Vec<ProjectFile> {
     let mut candidates = Vec::new();
-    let include_path = Path::new(include);
     let source_root = project.root().to_path_buf();
-    let relative_path = if include_path.is_absolute() {
-        match project_relative_include_path(project.root(), include_path) {
-            Some(path) => path,
-            None => return candidates,
-        }
-    } else {
-        source_file.parent().join(include_path)
-    };
-    let relative_file = ProjectFile::new(source_root.clone(), relative_path);
-    if relative_file.exists() {
-        candidates.push(relative_file);
-    }
-    if !include_path.is_absolute() {
-        let project_relative_file = ProjectFile::new(source_root.clone(), include_path);
-        if project_relative_file.exists() {
-            candidates.push(project_relative_file);
+    for rel_path in direct_include_candidate_paths(project.root(), source_file, include) {
+        let file = ProjectFile::new(source_root.clone(), rel_path);
+        if file.exists() {
+            candidates.push(file);
         }
     }
 
     candidates.sort();
     candidates.dedup();
     candidates
+}
+
+fn direct_include_candidate_paths(
+    root: &Path,
+    source_file: &ProjectFile,
+    include: &str,
+) -> Vec<PathBuf> {
+    let include_path = Path::new(include);
+    if include_path.is_absolute() {
+        return project_relative_include_path(root, include_path)
+            .into_iter()
+            .collect();
+    }
+    vec![
+        source_file.parent().join(include_path),
+        include_path.to_path_buf(),
+    ]
 }
 
 pub fn resolve_include_targets_with_index(
@@ -493,27 +503,23 @@ pub fn include_paths(parsed: &[String]) -> Vec<String> {
 /// The path is read from the grammar's `path` child, so malformed directives
 /// and arbitrary source text never become include facts. Only the fixed
 /// delimiters represented by tree-sitter's literal node kinds are removed.
+pub(crate) fn include_path_literal_value<'a>(path: Node<'_>, source: &'a str) -> Option<&'a str> {
+    let text = source.get(path.byte_range())?;
+    match path.kind() {
+        "string_literal" => text.strip_prefix('"')?.strip_suffix('"'),
+        "system_lib_string" => text.strip_prefix('<')?.strip_suffix('>'),
+        _ => None,
+    }
+}
+
 pub fn include_path_from_node<'a>(node: Node<'_>, source: &'a str) -> Option<(&'a str, bool)> {
     if node.kind() != "preproc_include" {
         return None;
     }
     let path = node.child_by_field_name("path")?;
-    let text = source.get(path.byte_range())?;
-    match path.kind() {
-        "string_literal" => Some((
-            text.strip_prefix('"')?
-                .strip_suffix('"')
-                .filter(|path| !path.is_empty())?,
-            true,
-        )),
-        "system_lib_string" => Some((
-            text.strip_prefix('<')?
-                .strip_suffix('>')
-                .filter(|path| !path.is_empty())?,
-            false,
-        )),
-        _ => None,
-    }
+    let quoted = path.kind() == "string_literal";
+    let value = include_path_literal_value(path, source).filter(|path| !path.is_empty())?;
+    Some((value, quoted))
 }
 
 /// Collect capitalized identifier nodes from one live C++ syntax subtree.
@@ -578,23 +584,19 @@ fn strip_path_prefix(path: &Path, root: &Path) -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::fs;
+    use brokk_bifrost_core::test_support::write_file;
     use tempfile::TempDir;
 
-    fn write_file(root: &Path, rel: &str) -> ProjectFile {
-        let path = root.join(rel);
-        fs::create_dir_all(path.parent().expect("test file has parent")).unwrap();
-        fs::write(&path, "").unwrap();
-        ProjectFile::new(root.to_path_buf(), rel)
-    }
-
     #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "4b224ec22cdb: C/C++ include resolution missed the unique source-reachable header or selected a conflicting path"
+    )]
     fn indexed_include_resolution_uses_unique_suffix_fallback() {
         let temp = TempDir::new().unwrap();
         let root = temp.path().canonicalize().unwrap();
-        let source = write_file(&root, "src/lib.c");
-        let target = write_file(&root, "include/git2/sys/credential.h");
-        let duplicate = write_file(&root, "vendor/credential.h");
+        let source = write_file(&root, "src/lib.c", "");
+        let target = write_file(&root, "include/git2/sys/credential.h", "");
+        let duplicate = write_file(&root, "vendor/credential.h", "");
         let index = IncludeTargetIndex::build([&source, &target, &duplicate]);
 
         let resolved = resolve_include_targets_with_index(&source, "git2/sys/credential.h", &index);
@@ -605,13 +607,16 @@ mod tests {
     }
 
     #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "cf45b06757c2: C/C++ include resolution missed the unique source-reachable header or selected a conflicting path"
+    )]
     fn indexed_include_resolution_prefers_unique_source_reachable_root() {
         let temp = TempDir::new().unwrap();
         let root = temp.path().canonicalize().unwrap();
-        let source = write_file(&root, "src/config/parse.c");
-        let target = write_file(&root, "src/config/parse.h");
-        let nested_decoy = write_file(&root, "src/build/config/parse.h");
-        let unrelated_source = write_file(&root, "app/main.c");
+        let source = write_file(&root, "src/config/parse.c", "");
+        let target = write_file(&root, "src/config/parse.h", "");
+        let nested_decoy = write_file(&root, "src/build/config/parse.h", "");
+        let unrelated_source = write_file(&root, "app/main.c", "");
         let index = IncludeTargetIndex::build([&source, &target, &nested_decoy, &unrelated_source]);
 
         let resolved = resolve_include_targets_with_index(&source, "config/parse.h", &index);
@@ -621,8 +626,8 @@ mod tests {
             resolve_include_targets_with_index(&unrelated_source, "config/parse.h", &index);
         assert!(unrelated.is_empty());
 
-        let ambiguous_source = write_file(&root, "src/config/deeper/main.c");
-        let second_reachable = write_file(&root, "src/config/config/parse.h");
+        let ambiguous_source = write_file(&root, "src/config/deeper/main.c", "");
+        let second_reachable = write_file(&root, "src/config/config/parse.h", "");
         let ambiguous_index = IncludeTargetIndex::build([
             &ambiguous_source,
             &target,
@@ -638,11 +643,14 @@ mod tests {
     }
 
     #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "d8cf28cfbabb: C/C++ include resolution missed the unique source-reachable header or selected a conflicting path"
+    )]
     fn indexed_include_resolution_accepts_one_unique_installed_prefix_alias() {
         let temp = TempDir::new().unwrap();
         let root = temp.path().canonicalize().unwrap();
-        let source = write_file(&root, "src/lib/asn1/asn1_obj.cpp");
-        let target = write_file(&root, "src/lib/asn1/asn1_obj.h");
+        let source = write_file(&root, "src/lib/asn1/asn1_obj.cpp", "");
+        let target = write_file(&root, "src/lib/asn1/asn1_obj.h", "");
         let index = IncludeTargetIndex::build([&source, &target]);
 
         assert_eq!(
@@ -650,7 +658,7 @@ mod tests {
             vec![target.clone()]
         );
 
-        let duplicate = write_file(&root, "vendor/asn1_obj.h");
+        let duplicate = write_file(&root, "vendor/asn1_obj.h", "");
         let ambiguous = IncludeTargetIndex::build([&source, &target, &duplicate]);
         assert!(
             resolve_include_targets_with_index(&source, "botan/asn1_obj.h", &ambiguous).is_empty()
@@ -658,11 +666,14 @@ mod tests {
     }
 
     #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "53f52b136fc7: C/C++ include resolution missed the unique source-reachable header or selected a conflicting path"
+    )]
     fn unresolved_h_include_falls_back_to_hin_template() {
         let temp = TempDir::new().unwrap();
         let root = temp.path().canonicalize().unwrap();
-        let stub = write_file(&root, "src/include/krb5.h");
-        let template = write_file(&root, "src/include/krb5/krb5.hin");
+        let stub = write_file(&root, "src/include/krb5.h", "");
+        let template = write_file(&root, "src/include/krb5/krb5.hin", "");
         let index = IncludeTargetIndex::build([&stub, &template]);
 
         let resolved = resolve_include_targets_with_index(&stub, "krb5/krb5.h", &index);
@@ -670,12 +681,15 @@ mod tests {
     }
 
     #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "53f52b136fc7: C/C++ include resolution missed the unique source-reachable header or selected a conflicting path"
+    )]
     fn real_header_wins_over_hin_template() {
         let temp = TempDir::new().unwrap();
         let root = temp.path().canonicalize().unwrap();
-        let stub = write_file(&root, "src/include/krb5.h");
-        let generated = write_file(&root, "src/include/krb5/krb5.h");
-        let template = write_file(&root, "src/include/krb5/krb5.hin");
+        let stub = write_file(&root, "src/include/krb5.h", "");
+        let generated = write_file(&root, "src/include/krb5/krb5.h", "");
+        let template = write_file(&root, "src/include/krb5/krb5.hin", "");
         let index = IncludeTargetIndex::build([&stub, &generated, &template]);
 
         let resolved = resolve_include_targets_with_index(&stub, "krb5/krb5.h", &index);

@@ -1,6 +1,7 @@
 //! Set-oriented, diagnostic-neutral taint analysis over the shared IDE kernel.
 
 mod client;
+pub mod compose;
 mod finding;
 mod model;
 mod plan;

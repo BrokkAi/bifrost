@@ -1,12 +1,28 @@
 //! Java method inheritance precedes invocation applicability. All state here
 //! belongs to one selected query; declarations remain indexed source rows.
 
-use super::super::fact_source::{JavaInheritanceDeclaration, JavaInheritanceDeclarationKind};
+use super::super::fact_source::{
+    JavaInheritanceDeclaration, JavaInheritanceDeclarationKind,
+    language_can_close_interface_object_frontier,
+};
 use super::*;
+use crate::analyzer::usages::call_conversion::JavaPrimitive;
 use brokk_bifrost_core::analyzer::structural::resolution::DeclaredVisibility;
 
+const JAVA_OBJECT_METHOD_NAMES: [&str; 9] = [
+    "clone",
+    "equals",
+    "finalize",
+    "getClass",
+    "hashCode",
+    "notify",
+    "notifyAll",
+    "toString",
+    "wait",
+];
+
 impl FactReadSession<'_> {
-    fn java_declarations(
+    pub(super) fn java_declarations(
         &mut self,
         definitions: &[SemanticId],
     ) -> StoreResult<Option<Vec<JavaInheritanceDeclaration>>> {
@@ -47,11 +63,227 @@ impl FactReadSession<'_> {
 }
 
 impl FactEvaluation<'_, '_> {
+    pub(super) fn java_call_candidate_type_frontier_reasons(
+        &mut self,
+        obligation: &LoweredCallApplicabilityObligation,
+        signature: &LoweredCallableSignatureProperty,
+        states: &StateMap,
+    ) -> StoreResult<Option<Option<BTreeSet<SemanticId>>>> {
+        if obligation.explicit_type_argument_count() != 0
+            || signature.completion() != &ResolutionCompletion::Complete
+            || signature.type_parameter_count() != 0
+            || signature
+                .parameters()
+                .iter()
+                .any(|parameter| parameter.repeated())
+            || signature.parameters().len() != obligation.argument_slots().len()
+        {
+            return Ok(Some(None));
+        }
+        let mut reasons = BTreeSet::new();
+        for (&argument, parameter) in obligation
+            .argument_slots()
+            .iter()
+            .zip(signature.parameters())
+        {
+            if self.poll_cancelled() {
+                return Ok(None);
+            }
+            for slot in [argument, parameter.slot()] {
+                let Some(state) = states.get(&slot) else {
+                    return Ok(Some(None));
+                };
+                if state
+                    .possible_values()
+                    .iter()
+                    .any(|value| !matches!(value, ResolutionSlotValue::Runtime { .. }))
+                    || (state.completion() == &ResolutionCompletion::Complete
+                        && state.possible_values().is_empty())
+                {
+                    return Ok(Some(None));
+                }
+                if let ResolutionCompletion::Incomplete(incomplete) = state.completion() {
+                    for reason in incomplete.iter() {
+                        if self.poll_cancelled() {
+                            return Ok(None);
+                        }
+                        let ResolutionIncompleteReason::UnsupportedSemantic(reason) = reason else {
+                            return Ok(Some(None));
+                        };
+                        reasons.insert(*reason);
+                    }
+                }
+            }
+        }
+        Ok(Some(Some(reasons)))
+    }
+
+    /// The call's receiver hierarchy contributes only unindexed `java.lang.Object`
+    /// methods, and none of the selected source methods can collide with an
+    /// Object method. In that case the missing methods cannot add a same-name
+    /// overload, so their exact traversal reasons do not keep this call's
+    /// candidate set open.
+    pub(super) fn java_call_implicit_object_gap_reasons(
+        &mut self,
+        language: Language,
+        answer: &ResolutionAnswer,
+        completion: &ResolutionCompletion,
+    ) -> StoreResult<Option<BTreeSet<SemanticId>>> {
+        let mut reasons = BTreeSet::new();
+        if answer.targets().is_empty() || !self.session.typed_source.selection_has_jvm_semantics() {
+            return Ok(Some(reasons));
+        }
+        let mut owners = BTreeSet::new();
+        let mut member_owners = BTreeSet::new();
+        for &target in answer.targets() {
+            let Some(Some(owner)) = self.member_owner_by_target.get(&target) else {
+                return Ok(Some(reasons));
+            };
+            let Some(root) = owner.owner_path.first().copied() else {
+                return Ok(Some(reasons));
+            };
+            owners.insert(root);
+            member_owners.insert(owner.owner());
+        }
+        let mut requested = answer.targets().iter().copied().collect::<BTreeSet<_>>();
+        requested.extend(owners.iter().copied());
+        requested.extend(member_owners.iter().copied());
+        let Some(declarations) = self
+            .session
+            .java_declarations(&requested.into_iter().collect::<Vec<_>>())?
+        else {
+            self.cancellation_observed = true;
+            return Ok(None);
+        };
+        let declarations = declarations
+            .into_iter()
+            .map(|row| (row.definition, row))
+            .collect::<HashMap<_, _>>();
+        let mut call_name: Option<&str> = None;
+        for &target in answer.targets() {
+            if self.poll_cancelled() {
+                return Ok(None);
+            }
+            let Some(method) = declarations.get(&target) else {
+                return Ok(Some(reasons));
+            };
+            // An implicit java.lang.Object edge cannot add a same-name
+            // candidate when none of the source methods use an Object method
+            // name. Static source methods are covered too: the Object method
+            // inventory is name-based, and static/instance kind cannot make a
+            // differently named method applicable.
+            if !matches!(&method.kind, JavaInheritanceDeclarationKind::Method { .. })
+                || JAVA_OBJECT_METHOD_NAMES.contains(&method.name.as_str())
+                || call_name.is_some_and(|name| name != method.name.as_str())
+            {
+                return Ok(Some(reasons));
+            }
+            call_name.get_or_insert(method.name.as_str());
+        }
+
+        let mut interface_object_gaps = BTreeSet::new();
+        if language_can_close_interface_object_frontier(language) {
+            for &owner in &member_owners {
+                if self.poll_cancelled() {
+                    return Ok(None);
+                }
+                // A bound or inherited owner still has a route beyond the
+                // receiver itself, so its hierarchy frontier remains open.
+                if !owners.contains(&owner) {
+                    continue;
+                }
+                let Some(declaration) = declarations.get(&owner) else {
+                    continue;
+                };
+                if !matches!(
+                    &declaration.kind,
+                    JavaInheritanceDeclarationKind::Type {
+                        is_interface: true,
+                        ..
+                    }
+                ) {
+                    continue;
+                }
+                let read = self.session.supertypes_for_definitions(&[owner])?;
+                let Some(supertypes) = self.accept_session_read(read) else {
+                    return Ok(None);
+                };
+                if supertypes.is_empty() {
+                    interface_object_gaps.insert(owner);
+                }
+            }
+        }
+
+        let mut implicit_object_references = BTreeSet::new();
+        for owner in owners {
+            if self.poll_cancelled() {
+                return Ok(None);
+            }
+            if interface_object_gaps.contains(&owner) {
+                continue;
+            }
+            let Some(Some(references)) =
+                self.java_hierarchy_implicit_object_gap_references(owner)?
+            else {
+                return Ok(Some(reasons));
+            };
+            implicit_object_references.extend(references);
+        }
+        if implicit_object_references.is_empty() && interface_object_gaps.is_empty() {
+            return Ok(Some(reasons));
+        }
+
+        let ResolutionCompletion::Incomplete(incomplete) = completion else {
+            return Ok(Some(reasons));
+        };
+        let candidates = incomplete
+            .iter()
+            .filter_map(|reason| match reason {
+                ResolutionIncompleteReason::UnsupportedSemantic(reason) => Some(*reason),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        for chunk in candidates.chunks(MAX_TYPED_FACT_REQUESTS_PER_BATCH) {
+            if self.poll_cancelled() {
+                return Ok(None);
+            }
+            let read = self.session.gap_reason_provenance_for_reasons(chunk)?;
+            let Some(provenance) = self.accept_session_read(read) else {
+                return Ok(None);
+            };
+            for provenance in provenance {
+                if self.poll_cancelled() {
+                    return Ok(None);
+                }
+                let provenance = provenance.get(self.session);
+                if provenance.origin()
+                    == LoweringGapOrigin::Extracted(
+                        ResolutionGapKind::UnsupportedHierarchyTraversal,
+                    )
+                    && {
+                        let source_site = super::super::fact_lowering::site_semantic(
+                            provenance.fragment(),
+                            provenance.source_site(),
+                        );
+                        implicit_object_references.contains(&source_site)
+                            || interface_object_gaps.contains(&source_site)
+                    }
+                {
+                    reasons.insert(provenance.reason());
+                }
+            }
+        }
+        Ok(Some(reasons))
+    }
+
     pub(super) fn java_method_origin_owners(
         &mut self,
         selection: &QualifiedOriginSelection,
         rust_owners: &BTreeSet<SemanticId>,
     ) -> StoreResult<Option<BTreeSet<SemanticId>>> {
+        if !self.session.typed_source.selection_has_java_semantics() {
+            return Ok(Some(BTreeSet::new()));
+        }
         // The Rust classifier already proved these owners' language. Avoid
         // another source read on the existing Rust point path.
         let owners = selection
@@ -80,7 +312,7 @@ impl FactEvaluation<'_, '_> {
         ))
     }
 
-    pub(super) fn filter_java_inherited_methods(
+    pub(crate) fn filter_java_inherited_methods(
         &mut self,
         answer: ResolutionAnswer,
         signatures: &HashMap<
@@ -156,7 +388,10 @@ impl FactEvaluation<'_, '_> {
             if is_static
                 && matches!(
                     declaration.kind,
-                    JavaInheritanceDeclarationKind::Type { is_interface: true }
+                    JavaInheritanceDeclarationKind::Type {
+                        is_interface: true,
+                        ..
+                    }
                 )
             {
                 removed.insert(target);
@@ -207,11 +442,15 @@ impl FactEvaluation<'_, '_> {
                 };
                 let class_over_interface = matches!(
                     declarations.get(&base_owner.owner).map(|row| &row.kind),
-                    Some(JavaInheritanceDeclarationKind::Type { is_interface: true })
+                    Some(JavaInheritanceDeclarationKind::Type {
+                        is_interface: true,
+                        ..
+                    })
                 ) && matches!(
                     declarations.get(&derived_owner.owner).map(|row| &row.kind),
                     Some(JavaInheritanceDeclarationKind::Type {
-                        is_interface: false
+                        is_interface: false,
+                        ..
                     })
                 );
                 if !nearer && !class_over_interface {
@@ -493,7 +732,7 @@ impl FactEvaluation<'_, '_> {
     /// A primitive-to-reference argument needs boxing and cannot compete in
     /// that phase. Unknown conversions remain candidates until
     /// their own applicability/specificity proof is available.
-    pub(super) fn filter_java_boxing_after_strict_invocation(
+    pub(crate) fn filter_java_boxing_after_strict_invocation(
         &mut self,
         answer: ResolutionAnswer,
         obligation: &LoweredCallApplicabilityObligation,
@@ -502,16 +741,19 @@ impl FactEvaluation<'_, '_> {
             InternedFactRow<SelectedTypedRow<LoweredCallableSignatureProperty>>,
         >,
         states: &StateMap,
+        argument_receiver_gap_reason: Option<SemanticId>,
     ) -> StoreResult<Option<ResolutionAnswer>> {
-        if answer.targets().len() < 2
-            || obligation.explicit_type_argument_count() != 0
-            || completion_without_unsupported_semantic(
-                obligation.completion(),
-                obligation.applicability_reason(),
-            ) != ResolutionCompletion::Complete
-        {
+        if answer.targets().len() < 2 || obligation.explicit_type_argument_count() != 0 {
             return Ok(Some(answer));
         }
+        // Candidate method rows are query-local inputs to this native
+        // applicability operation. They are not necessarily cached by the
+        // earlier inheritance refinement (which only needs owner rows).
+        let targets = answer.targets().to_vec();
+        let Some(_) = self.session.java_declarations(&targets)? else {
+            self.cancellation_observed = true;
+            return Ok(None);
+        };
         let java_methods = answer
             .targets()
             .iter()
@@ -532,10 +774,9 @@ impl FactEvaluation<'_, '_> {
         let mut arguments = Vec::new();
         for slot in obligation.argument_slots() {
             self.demand_slot(*slot);
-            let Some(ty) = states
-                .get(slot)
-                .and_then(|state| exact_singleton_runtime_type(state))
-            else {
+            let Some(ty) = states.get(slot).and_then(|state| {
+                java_invocation_argument_type(state, argument_receiver_gap_reason)
+            }) else {
                 return Ok(Some(answer));
             };
             arguments.push(ty);
@@ -549,8 +790,7 @@ impl FactEvaluation<'_, '_> {
                 continue;
             };
             let signature = signature.get(self.session).row().clone();
-            if signature.completion() != &ResolutionCompletion::Complete
-                || signature.type_parameter_count() != 0
+            if signature.type_parameter_count() != 0
                 || signature.parameters().len() != arguments.len()
                 || signature
                     .parameters()
@@ -562,11 +802,9 @@ impl FactEvaluation<'_, '_> {
             let mut parameters = Vec::new();
             for parameter in signature.parameters() {
                 self.demand_slot(parameter.slot());
-                parameters.push(
-                    states
-                        .get(&parameter.slot())
-                        .and_then(|state| exact_singleton_runtime_type(state)),
-                );
+                parameters.push(states.get(&parameter.slot()).and_then(|state| {
+                    java_invocation_argument_type(state, argument_receiver_gap_reason)
+                }));
             }
             candidates.push((
                 target,
@@ -589,8 +827,7 @@ impl FactEvaluation<'_, '_> {
             .collect::<BTreeSet<_>>()
             .into_iter()
             .collect::<Vec<_>>();
-        let read = self.session.intrinsics_for_type_identities(&type_ids)?;
-        let Some(intrinsics) = self.accept_session_read(read) else {
+        let Some(intrinsics) = self.session.intrinsic_type_descriptors(&type_ids)? else {
             return Ok(None);
         };
         let mut primitives = HashMap::default();
@@ -598,14 +835,11 @@ impl FactEvaluation<'_, '_> {
             if self.poll_cancelled() {
                 return Ok(None);
             }
-            let intrinsic = intrinsic.get(self.session).row();
             if intrinsic.kind() == IntrinsicTypeKind::Primitive
                 && let Some(primitive) =
                     crate::analyzer::java::primitive_for_name(intrinsic.spelling())
             {
-                for value in intrinsic.frontier().possible_values() {
-                    primitives.insert(value.ty().identity(), primitive);
-                }
+                primitives.insert(intrinsic.identity(), primitive);
             }
         }
         let strict = candidates.iter().any(|(_, parameters, _)| {
@@ -674,6 +908,23 @@ impl FactEvaluation<'_, '_> {
         if excluded.is_empty() {
             return Ok(Some(answer));
         }
+        if obligation.callee_reference() == self.root {
+            for &target in &excluded {
+                assert!(
+                    self.callable_candidate_applicability
+                        .insert(
+                            target,
+                            FactCallableCandidateApplicability {
+                                target,
+                                verdict: ApplicabilityVerdict::Inapplicable,
+                                reason: Some(CallableRejectionReason::RequiresBoxing),
+                            },
+                        )
+                        .is_none(),
+                    "one native Java candidate has one final applicability reason"
+                );
+            }
+        }
         let (targets, witnesses, completion) = answer.into_parts();
         let targets = targets
             .iter()
@@ -692,6 +943,261 @@ impl FactEvaluation<'_, '_> {
         Ok(Some(ResolutionAnswer::new(targets, witnesses, completion)))
     }
 
+    /// Java primitive widening can make several fixed-arity overloads
+    /// applicable, but the JLS chooses the candidate with the most specific
+    /// primitive formals. This operation removes only candidates dominated by
+    /// an applicable sibling whose formal types widen to theirs. Exact
+    /// argument and formal primitive descriptors are required; any gap leaves
+    /// the candidate set open for the later applicability classifier.
+    pub(crate) fn filter_java_primitive_less_specific(
+        &mut self,
+        answer: ResolutionAnswer,
+        obligation: &LoweredCallApplicabilityObligation,
+        signatures: &HashMap<
+            SemanticId,
+            InternedFactRow<SelectedTypedRow<LoweredCallableSignatureProperty>>,
+        >,
+        states: &StateMap,
+        argument_receiver_gap_reason: Option<SemanticId>,
+    ) -> StoreResult<Option<ResolutionAnswer>> {
+        if answer.targets().len() < 2 || obligation.explicit_type_argument_count() != 0 {
+            return Ok(Some(answer));
+        }
+        if !answer.targets().iter().all(|target| {
+            self.session
+                .java_inheritance_declarations
+                .get(target)
+                .and_then(Option::as_ref)
+                .is_some_and(|row| {
+                    matches!(row.kind, JavaInheritanceDeclarationKind::Method { .. })
+                })
+        }) {
+            return Ok(Some(answer));
+        }
+
+        let mut arguments = Vec::with_capacity(obligation.argument_slots().len());
+        for &slot in obligation.argument_slots() {
+            self.demand_slot(slot);
+            let Some(ty) = states
+                .get(&slot)
+                .and_then(|state| {
+                    java_invocation_argument_type(state, argument_receiver_gap_reason)
+                })
+                .filter(|ty| ty.indirection() == 0)
+            else {
+                return Ok(Some(answer));
+            };
+            arguments.push(ty.identity());
+        }
+
+        let mut formal_identities = Vec::new();
+        let mut candidate_formals = Vec::with_capacity(answer.targets().len());
+        for &target in answer.targets() {
+            if self.poll_cancelled() {
+                return Ok(None);
+            }
+            let Some(signature) = signatures.get(&target) else {
+                return Ok(Some(answer));
+            };
+            let signature = signature.get(self.session).row().clone();
+            if signature.parameters().len() != arguments.len() {
+                continue;
+            }
+            if signature.completion() != &ResolutionCompletion::Complete
+                || signature.type_parameter_count() != 0
+                || signature
+                    .parameters()
+                    .iter()
+                    .any(|parameter| parameter.repeated())
+            {
+                return Ok(Some(answer));
+            }
+            let mut formals = Vec::with_capacity(signature.parameters().len());
+            for parameter in signature.parameters() {
+                self.demand_slot(parameter.slot());
+                let Some(ty) = states
+                    .get(&parameter.slot())
+                    .and_then(|state| {
+                        java_invocation_argument_type(state, argument_receiver_gap_reason)
+                    })
+                    .filter(|ty| ty.indirection() == 0)
+                else {
+                    return Ok(Some(answer));
+                };
+                formal_identities.push(ty.identity());
+                formals.push(ty.identity());
+            }
+            candidate_formals.push((target, formals));
+        }
+        if candidate_formals.is_empty() {
+            return Ok(Some(answer));
+        }
+
+        let mut identities = arguments.clone();
+        identities.extend(formal_identities);
+        identities.sort_unstable();
+        identities.dedup();
+        let Some(intrinsics) = self.session.intrinsic_type_descriptors(&identities)? else {
+            return Ok(None);
+        };
+        let mut primitives = HashMap::default();
+        for intrinsic in intrinsics {
+            if self.poll_cancelled() {
+                return Ok(None);
+            }
+            if intrinsic.kind() == IntrinsicTypeKind::Primitive
+                && let Some(primitive) =
+                    crate::analyzer::java::primitive_for_name(intrinsic.spelling())
+            {
+                primitives.insert(intrinsic.identity(), primitive);
+            }
+        }
+        if arguments
+            .iter()
+            .chain(candidate_formals.iter().flat_map(|(_, formals)| formals))
+            .any(|identity| !primitives.contains_key(identity))
+        {
+            return Ok(Some(answer));
+        }
+        let argument_primitives = arguments
+            .iter()
+            .map(|identity| primitives[identity])
+            .collect::<Vec<_>>();
+
+        let candidates = candidate_formals
+            .into_iter()
+            .map(|(target, formals)| {
+                let formals = formals
+                    .into_iter()
+                    .map(|identity| primitives[&identity])
+                    .collect::<Vec<JavaPrimitive>>();
+                let applicable =
+                    argument_primitives
+                        .iter()
+                        .zip(&formals)
+                        .all(|(&argument, &formal)| {
+                            argument == formal
+                                || crate::analyzer::java::primitive_converts(argument, formal)
+                        });
+                (target, formals, applicable)
+            })
+            .collect::<Vec<_>>();
+        if !candidates.iter().any(|(_, _, applicable)| *applicable) {
+            if obligation.callee_reference() == self.root {
+                for (target, _, _) in candidates {
+                    assert!(
+                        self.callable_candidate_applicability
+                            .insert(
+                                target,
+                                FactCallableCandidateApplicability {
+                                    target,
+                                    verdict: ApplicabilityVerdict::Inapplicable,
+                                    reason: Some(CallableRejectionReason::PrimitiveTypeMismatch),
+                                },
+                            )
+                            .is_none(),
+                        "one native Java candidate has one final applicability reason"
+                    );
+                }
+            }
+            return Ok(Some(answer));
+        }
+
+        let dominates = |left: &[JavaPrimitive], right: &[JavaPrimitive]| {
+            let mut strictly_more_specific = false;
+            for (&left, &right) in left.iter().zip(right) {
+                if left == right {
+                    continue;
+                }
+                if !crate::analyzer::java::primitive_converts(left, right) {
+                    return false;
+                }
+                strictly_more_specific = true;
+            }
+            strictly_more_specific
+        };
+        let most_specific = candidates
+            .iter()
+            .filter(|(_, _, applicable)| *applicable)
+            .filter(|(_, formals, _)| {
+                !candidates
+                    .iter()
+                    .any(|(_, other_formals, other_applicable)| {
+                        *other_applicable && dominates(other_formals, formals)
+                    })
+            })
+            .map(|(target, _, _)| *target)
+            .collect::<BTreeSet<_>>();
+        assert!(
+            !most_specific.is_empty(),
+            "an applicable finite primitive overload set has a maximal candidate"
+        );
+        if obligation.callee_reference() == self.root {
+            for (target, _, applicable) in &candidates {
+                let (verdict, reason) = if !applicable {
+                    (
+                        ApplicabilityVerdict::Inapplicable,
+                        Some(CallableRejectionReason::PrimitiveTypeMismatch),
+                    )
+                } else if most_specific.contains(target) {
+                    (ApplicabilityVerdict::Applicable, None)
+                } else {
+                    (
+                        ApplicabilityVerdict::Inapplicable,
+                        Some(CallableRejectionReason::LessSpecificPrimitiveOverload),
+                    )
+                };
+                assert!(
+                    self.callable_candidate_applicability
+                        .insert(
+                            *target,
+                            FactCallableCandidateApplicability {
+                                target: *target,
+                                verdict,
+                                reason,
+                            },
+                        )
+                        .is_none(),
+                    "one native Java candidate has one final applicability reason"
+                );
+            }
+        }
+        let excluded = candidates
+            .iter()
+            .filter_map(|(target, _, applicable)| {
+                if !applicable {
+                    Some((*target, CallableRejectionReason::PrimitiveTypeMismatch))
+                } else if !most_specific.contains(target) {
+                    Some((
+                        *target,
+                        CallableRejectionReason::LessSpecificPrimitiveOverload,
+                    ))
+                } else {
+                    None
+                }
+            })
+            .collect::<Vec<_>>();
+        if excluded.is_empty() {
+            return Ok(Some(answer));
+        }
+        let excluded = excluded
+            .into_iter()
+            .map(|(target, _)| target)
+            .collect::<BTreeSet<_>>();
+        let (targets, witnesses, completion) = answer.into_parts();
+        let targets = targets
+            .iter()
+            .copied()
+            .filter(|target| !excluded.contains(target))
+            .collect::<Vec<_>>();
+        let witnesses = witnesses
+            .into_vec()
+            .into_iter()
+            .filter(|witness| !excluded.contains(&witness.target()))
+            .collect::<Vec<_>>();
+        Ok(Some(ResolutionAnswer::new(targets, witnesses, completion)))
+    }
+
     /// JLS 15.12.2: a candidate is applicable only if each argument type
     /// converts to its formal. For two Java source class or interface types a
     /// widening reference conversion exists exactly when the formal is a
@@ -702,7 +1208,7 @@ impl FactEvaluation<'_, '_> {
     /// no source type (an unindexed Object cannot equal a source class). Any
     /// other gap keeps the candidate. The filter never removes every
     /// candidate and leaves completion to the call's own obligation.
-    pub(super) fn filter_java_reference_inapplicable(
+    pub(crate) fn filter_java_reference_inapplicable(
         &mut self,
         answer: ResolutionAnswer,
         obligation: &LoweredCallApplicabilityObligation,
@@ -711,6 +1217,7 @@ impl FactEvaluation<'_, '_> {
             InternedFactRow<SelectedTypedRow<LoweredCallableSignatureProperty>>,
         >,
         states: &StateMap,
+        argument_receiver_gap_reason: Option<SemanticId>,
     ) -> StoreResult<Option<ResolutionAnswer>> {
         if answer.targets().len() < 2 || obligation.explicit_type_argument_count() != 0 {
             return Ok(Some(answer));
@@ -720,7 +1227,9 @@ impl FactEvaluation<'_, '_> {
             self.demand_slot(*slot);
             let Some(ty) = states
                 .get(slot)
-                .and_then(|state| exact_singleton_runtime_type(state))
+                .and_then(|state| {
+                    java_invocation_argument_type(state, argument_receiver_gap_reason)
+                })
                 .filter(|ty| ty.indirection() == 0)
             else {
                 return Ok(Some(answer));
@@ -763,7 +1272,9 @@ impl FactEvaluation<'_, '_> {
                 formals.push(
                     states
                         .get(&parameter.slot())
-                        .and_then(|state| exact_singleton_runtime_type(state))
+                        .and_then(|state| {
+                            java_invocation_argument_type(state, argument_receiver_gap_reason)
+                        })
                         .filter(|ty| ty.indirection() == 0)
                         .map(|ty| ty.identity()),
                 );
@@ -953,5 +1464,81 @@ impl FactEvaluation<'_, '_> {
             }
         }
         Ok(Some(result))
+    }
+}
+
+/// The static-call producer gap also reaches argument frontiers because the
+/// call expression is one typed graph. Once the native member-owner facts
+/// prove this call uses static methods, discard only that exact receiver gap
+/// while reading the source argument's known type. Call applicability keeps
+/// the original completion, so this local view cannot make the call complete.
+fn java_invocation_argument_type(
+    state: &TypedFrontierState,
+    ignored_receiver_gap: Option<SemanticId>,
+) -> Option<ResolutionTypeRef> {
+    let completion = ignored_receiver_gap.map_or_else(
+        || state.completion().clone(),
+        |reason| completion_without_unsupported_semantic(state.completion(), reason),
+    );
+    if completion != ResolutionCompletion::Complete {
+        return None;
+    }
+    match state.possible_values() {
+        [ResolutionSlotValue::Runtime { ty, .. }] => Some(*ty),
+        _ => None,
+    }
+}
+
+impl FactEvaluation<'_, '_> {
+    /// Java primitive widening (JLS 5.1.2) for call candidates whose actuals
+    /// and formals all have exact primitive types: proven applicable when
+    /// every pair converts, a mismatch when every pair is primitive but some
+    /// pair does not, and unresolved otherwise.
+    pub(crate) fn classify_java_primitive_pairs(
+        &mut self,
+        primitive_pairs: &[(SemanticId, SemanticId)],
+    ) -> StoreResult<Option<CallCandidateApplicability>> {
+        let identities = primitive_pairs
+            .iter()
+            .flat_map(|(argument, parameter)| [*argument, *parameter])
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>();
+        let Some(intrinsics) = self.session.intrinsic_type_descriptors(&identities)? else {
+            return Ok(None);
+        };
+        let mut primitives = HashMap::default();
+        for intrinsic in intrinsics {
+            if self.poll_cancelled() {
+                return Ok(None);
+            }
+            if intrinsic.kind() != IntrinsicTypeKind::Primitive {
+                continue;
+            }
+            let Some(primitive) = crate::analyzer::java::primitive_for_name(intrinsic.spelling())
+            else {
+                continue;
+            };
+            primitives.insert(intrinsic.identity(), primitive);
+        }
+        let applicable = primitive_pairs.iter().all(|(argument, parameter)| {
+            primitives
+                .get(argument)
+                .zip(primitives.get(parameter))
+                .is_some_and(|(&source, &target)| {
+                    crate::analyzer::java::primitive_converts(source, target)
+                })
+        });
+        if applicable {
+            return Ok(Some(CallCandidateApplicability::ProvenApplicable));
+        }
+        let every_pair_is_primitive = primitive_pairs.iter().all(|(argument, parameter)| {
+            primitives.contains_key(argument) && primitives.contains_key(parameter)
+        });
+        Ok(Some(if every_pair_is_primitive {
+            CallCandidateApplicability::PrimitiveTypeMismatch
+        } else {
+            CallCandidateApplicability::Unresolved
+        }))
     }
 }

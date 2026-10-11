@@ -1,5 +1,10 @@
 use brokk_bifrost_core::analyzer::ProjectFile;
+use brokk_bifrost_core::analyzer::common::collapse_whitespace;
 use brokk_bifrost_core::analyzer::model::{ImportInfo, TestAssertionSmell, TestAssertionWeights};
+use brokk_bifrost_core::analyzer::test_assertions::{
+    CommonTestAssertionKind, TestAssertionSignal, append_test_assertion_findings,
+    classify_common_test_assertion, is_common_assertion_literal, normalize_assertion_expression,
+};
 use brokk_bifrost_core::analyzer::tree_walk::{WalkControl, walk_named_tree_preorder};
 use brokk_bifrost_core::hash::HashSet;
 use regex::Regex;
@@ -88,57 +93,28 @@ fn analyze_go_test_case(
     weights: &TestAssertionWeights,
     out: &mut Vec<TestAssertionSmell>,
 ) {
-    let assertions = collect_go_assertions(body, start_byte, testify_assertions, weights);
-    let assertion_count = assertions.len() as i32;
     let symbol = format!("{}::{}", file, name);
-
-    if assertion_count == 0 {
-        out.push(TestAssertionSmell {
-            file: file.clone(),
-            enclosing_fq_name: symbol,
-            assertion_kind: "no-assertions".to_string(),
-            score: weights.no_assertion_weight,
-            assertion_count: 0,
-            reasons: vec!["no-assertions".to_string()],
-            excerpt: compact_go_excerpt(body),
-            start_byte,
-        });
-        return;
-    }
-
-    for assertion in &assertions {
-        if assertion.score <= 0 {
-            continue;
-        }
-        out.push(TestAssertionSmell {
-            file: file.clone(),
-            enclosing_fq_name: symbol.clone(),
-            assertion_kind: assertion.kind.clone(),
+    let assertions: Vec<_> = collect_go_assertions(body, start_byte, testify_assertions, weights)
+        .into_iter()
+        .map(|assertion| TestAssertionSignal {
+            kind: assertion.kind,
             score: assertion.score,
-            assertion_count,
-            reasons: vec![assertion.reason.clone()],
-            excerpt: assertion.excerpt.clone(),
+            shallow: assertion.shallow,
+            meaningful: assertion.meaningful,
+            reasons: vec![assertion.reason],
+            excerpt: assertion.excerpt,
             start_byte: start_byte + assertion.start_byte,
-        });
-    }
-
-    if assertions.iter().all(|assertion| assertion.shallow) {
-        let score = (weights.shallow_assertion_only_weight
-            - go_meaningful_assertion_credit(assertions.iter(), weights))
-        .max(0);
-        if score > 0 {
-            out.push(TestAssertionSmell {
-                file: file.clone(),
-                enclosing_fq_name: symbol,
-                assertion_kind: "shallow-assertions-only".to_string(),
-                score,
-                assertion_count,
-                reasons: vec!["shallow-assertions-only".to_string()],
-                excerpt: compact_go_excerpt(body),
-                start_byte,
-            });
-        }
-    }
+        })
+        .collect();
+    append_test_assertion_findings(
+        file,
+        symbol,
+        collapse_whitespace(body),
+        start_byte,
+        &assertions,
+        weights,
+        out,
+    );
 }
 
 fn collect_go_assertions(
@@ -153,60 +129,47 @@ fn collect_go_assertions(
         let whole = captures.get(0).expect("whole match");
         let left = normalize_go_expr(captures.name("left").map(|m| m.as_str()).unwrap_or(""));
         let right = normalize_go_expr(captures.name("right").map(|m| m.as_str()).unwrap_or(""));
-        let signal = if left == right {
-            let (kind, reason, score) = if is_go_literal(&left) {
-                (
-                    "constant-equality",
-                    "constant-equality",
-                    weights.constant_equality_weight,
-                )
-            } else {
-                (
-                    "self-comparison",
-                    "self-comparison",
-                    weights.tautological_assertion_weight,
-                )
-            };
-            GoAssertionSignal {
-                kind: kind.to_string(),
-                score,
-                shallow: false,
-                meaningful: false,
-                reason: reason.to_string(),
-                excerpt: compact_go_excerpt(whole.as_str()),
-                start_byte: whole.start(),
-            }
+        let classification = if left == right {
+            classify_common_test_assertion(
+                if is_go_literal(&left) {
+                    CommonTestAssertionKind::ConstantEquality
+                } else {
+                    CommonTestAssertionKind::SelfComparison
+                },
+                weights,
+            )
         } else {
-            GoAssertionSignal {
-                kind: "meaningful-assertion".to_string(),
-                score: 0,
-                shallow: false,
-                meaningful: true,
-                reason: "meaningful-assertion".to_string(),
-                excerpt: compact_go_excerpt(whole.as_str()),
-                start_byte: whole.start(),
-            }
+            classify_common_test_assertion(CommonTestAssertionKind::Meaningful, weights)
         };
-        assertions.push(signal);
+        assertions.push(GoAssertionSignal {
+            kind: classification.kind.to_string(),
+            score: classification.score,
+            shallow: classification.shallow,
+            meaningful: classification.kind == "meaningful-assertion",
+            reason: classification.kind.to_string(),
+            excerpt: collapse_whitespace(whole.as_str()),
+            start_byte: whole.start(),
+        });
     }
 
     for captures in GO_ASSERT_TRUTH_RE.captures_iter(body) {
         let whole = captures.get(0).expect("whole match");
         let matcher = captures.name("matcher").map(|m| m.as_str()).unwrap_or("");
         let arg = normalize_go_expr(captures.name("arg").map(|m| m.as_str()).unwrap_or(""));
-        let (kind, score, shallow) = match matcher {
-            "True" if arg == "true" => ("constant-truth", weights.constant_truth_weight, true),
-            "False" if arg == "false" => ("constant-truth", weights.constant_truth_weight, true),
-            "Nil" | "NotNil" => ("nullness-only", weights.nullness_only_weight, true),
-            _ => ("meaningful-assertion", 0, false),
+        let kind = match matcher {
+            "True" if arg == "true" => CommonTestAssertionKind::ConstantTruth,
+            "False" if arg == "false" => CommonTestAssertionKind::ConstantTruth,
+            "Nil" | "NotNil" => CommonTestAssertionKind::NullnessOnly,
+            _ => CommonTestAssertionKind::Meaningful,
         };
+        let classification = classify_common_test_assertion(kind, weights);
         assertions.push(GoAssertionSignal {
-            kind: kind.to_string(),
-            score,
-            shallow,
-            meaningful: score == 0,
-            reason: kind.to_string(),
-            excerpt: compact_go_excerpt(whole.as_str()),
+            kind: classification.kind.to_string(),
+            score: classification.score,
+            shallow: classification.shallow,
+            meaningful: classification.score == 0,
+            reason: classification.kind.to_string(),
+            excerpt: collapse_whitespace(whole.as_str()),
             start_byte: whole.start(),
         });
     }
@@ -220,7 +183,7 @@ fn collect_go_assertions(
                 shallow: false,
                 meaningful: true,
                 reason: "meaningful-assertion".to_string(),
-                excerpt: compact_go_excerpt(whole.as_str()),
+                excerpt: collapse_whitespace(whole.as_str()),
                 start_byte: whole.start(),
             });
         }
@@ -229,75 +192,33 @@ fn collect_go_assertions(
     for captures in GO_TESTING_ERRORF_BRANCH_RE.captures_iter(body) {
         let whole = captures.get(0).expect("whole match");
         let cond = normalize_go_expr(captures.name("cond").map(|m| m.as_str()).unwrap_or(""));
-        let signal = if let Some((left, right)) = split_go_comparison(&cond, "==") {
+        let classification = if let Some((left, right)) = split_go_comparison(&cond, "==") {
             if left == right {
-                let (kind, reason, score, shallow) = if is_go_literal(&left) {
-                    (
-                        "constant-equality",
-                        "constant-equality",
-                        weights.constant_equality_weight,
-                        false,
-                    )
-                } else {
-                    (
-                        "self-comparison",
-                        "self-comparison",
-                        weights.tautological_assertion_weight,
-                        false,
-                    )
-                };
-                GoAssertionSignal {
-                    kind: kind.to_string(),
-                    score,
-                    shallow,
-                    meaningful: false,
-                    reason: reason.to_string(),
-                    excerpt: compact_go_excerpt(whole.as_str()),
-                    start_byte: whole.start(),
-                }
+                classify_common_test_assertion(
+                    if is_go_literal(&left) {
+                        CommonTestAssertionKind::ConstantEquality
+                    } else {
+                        CommonTestAssertionKind::SelfComparison
+                    },
+                    weights,
+                )
             } else if matches!(right.as_str(), "nil") || matches!(left.as_str(), "nil") {
-                GoAssertionSignal {
-                    kind: "nullness-only".to_string(),
-                    score: weights.nullness_only_weight,
-                    shallow: true,
-                    meaningful: false,
-                    reason: "nullness-only".to_string(),
-                    excerpt: compact_go_excerpt(whole.as_str()),
-                    start_byte: whole.start(),
-                }
+                classify_common_test_assertion(CommonTestAssertionKind::NullnessOnly, weights)
             } else {
-                GoAssertionSignal {
-                    kind: "meaningful-assertion".to_string(),
-                    score: 0,
-                    shallow: false,
-                    meaningful: true,
-                    reason: "meaningful-assertion".to_string(),
-                    excerpt: compact_go_excerpt(whole.as_str()),
-                    start_byte: whole.start(),
-                }
-            }
-        } else if let Some((_left, _right)) = split_go_comparison(&cond, "!=") {
-            GoAssertionSignal {
-                kind: "meaningful-assertion".to_string(),
-                score: 0,
-                shallow: false,
-                meaningful: true,
-                reason: "meaningful-assertion".to_string(),
-                excerpt: compact_go_excerpt(whole.as_str()),
-                start_byte: whole.start(),
+                classify_common_test_assertion(CommonTestAssertionKind::Meaningful, weights)
             }
         } else {
-            GoAssertionSignal {
-                kind: "meaningful-assertion".to_string(),
-                score: 0,
-                shallow: false,
-                meaningful: true,
-                reason: "meaningful-assertion".to_string(),
-                excerpt: compact_go_excerpt(whole.as_str()),
-                start_byte: whole.start(),
-            }
+            classify_common_test_assertion(CommonTestAssertionKind::Meaningful, weights)
         };
-        assertions.push(signal);
+        assertions.push(GoAssertionSignal {
+            kind: classification.kind.to_string(),
+            score: classification.score,
+            shallow: classification.shallow,
+            meaningful: classification.kind == "meaningful-assertion",
+            reason: classification.kind.to_string(),
+            excerpt: collapse_whitespace(whole.as_str()),
+            start_byte: whole.start(),
+        });
     }
 
     let mut assertion_starts = assertions
@@ -369,7 +290,7 @@ fn collect_testify_assertions(source: &str, imports: &[ImportInfo]) -> Vec<GoAss
             shallow: false,
             meaningful: true,
             reason: "meaningful-assertion".to_string(),
-            excerpt: compact_go_excerpt(go_node_text(node, source)),
+            excerpt: collapse_whitespace(go_node_text(node, source)),
             start_byte: node.start_byte(),
         });
         WalkControl::SkipChildren
@@ -377,34 +298,13 @@ fn collect_testify_assertions(source: &str, imports: &[ImportInfo]) -> Vec<GoAss
     assertions
 }
 
-fn go_meaningful_assertion_credit<'a>(
-    assertions: impl Iterator<Item = &'a GoAssertionSignal>,
-    weights: &TestAssertionWeights,
-) -> i32 {
-    let count = assertions.filter(|assertion| assertion.meaningful).count() as i32;
-    let creditable = count.min(weights.meaningful_assertion_credit_cap.max(0));
-    weights.meaningful_assertion_credit.max(0) * creditable
-}
-
 fn normalize_go_expr(expr: &str) -> String {
-    expr.trim()
-        .trim_end_matches(',')
-        .trim_matches(|ch| matches!(ch, '(' | ')' | ' '))
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ")
+    normalize_assertion_expression(expr.trim().trim_end_matches(','))
 }
 
 fn is_go_literal(expr: &str) -> bool {
     let trimmed = expr.trim();
-    (trimmed.starts_with('"') && trimmed.ends_with('"'))
-        || matches!(trimmed, "true" | "false" | "nil")
-        || trimmed.parse::<i64>().is_ok()
-        || trimmed.parse::<f64>().is_ok()
-}
-
-fn compact_go_excerpt(text: &str) -> String {
-    text.split_whitespace().collect::<Vec<_>>().join(" ")
+    is_common_assertion_literal(trimmed) || matches!(trimmed, "true" | "false" | "nil")
 }
 
 fn split_go_comparison(expr: &str, op: &str) -> Option<(String, String)> {

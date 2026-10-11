@@ -1,8 +1,8 @@
 //! Complete subject selections shared inside one serial coordinator batch.
 
-use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
-use std::rc::Rc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 
 use brokk_bifrost_analysis::analyzer::ReadKey;
 use brokk_bifrost_analysis::analyzer::capture_query_reads;
@@ -28,12 +28,12 @@ pub(crate) struct SubjectQueryBatch<'a> {
     content: Option<WorkspaceContentIdentity>,
     limits: brokk_bifrost_rql::structural::CodeQueryExecutionLimits,
     repeated: HashSet<String>,
-    products: RefCell<HashMap<String, Rc<SubjectProduct>>>,
-    retained_weight: Cell<usize>,
+    products: Mutex<HashMap<String, Arc<SubjectProduct>>>,
+    retained_weight: AtomicUsize,
 }
 
 struct SubjectProduct {
-    rows: Rc<ExecutedQueryRows>,
+    rows: Arc<ExecutedQueryRows>,
     reads: Vec<ReadKey>,
 }
 
@@ -67,8 +67,8 @@ impl<'a> SubjectQueryBatch<'a> {
                 .into_iter()
                 .filter_map(|(query, count)| (count > 1).then_some(query))
                 .collect(),
-            products: RefCell::new(HashMap::new()),
-            retained_weight: Cell::new(0),
+            products: Mutex::new(HashMap::new()),
+            retained_weight: AtomicUsize::new(0),
         }
     }
 
@@ -77,21 +77,28 @@ impl<'a> SubjectQueryBatch<'a> {
         query: &CodeQuery,
         context: &PolicyEvaluationContext<'_>,
         budget: &PolicyBudget,
-    ) -> Rc<ExecutedQueryRows> {
+    ) -> Arc<ExecutedQueryRows> {
         assert!(
             std::ptr::addr_eq(self.analyzer, context.analyzer),
             "subject batches belong to exactly one analyzer snapshot"
         );
         let execute = || {
             let _timing = brokk_bifrost_analysis::profiling::scope("policy.subject_scan");
-            Rc::new(ExecutedQueryRows::of_detailed(
-                execute_code_query_detailed_eager_index(
+            let detailed = match context.workspace {
+                Some(workspace) => execute_code_query_detailed_eager_index_workspace(
+                    workspace,
+                    query,
+                    budget.query_limits(),
+                    context.cancellation,
+                ),
+                None => execute_code_query_detailed_eager_index(
                     context.analyzer,
                     query,
                     budget.query_limits(),
                     context.cancellation,
                 ),
-            ))
+            };
+            Arc::new(ExecutedQueryRows::of_detailed(detailed))
         };
         let cancelled = || {
             context
@@ -114,7 +121,12 @@ impl<'a> SubjectQueryBatch<'a> {
         if !self.repeated.contains(&key) {
             return execute();
         }
-        let cached = self.products.borrow().get(&key).cloned();
+        let cached = self
+            .products
+            .lock()
+            .expect("policy subject batch products mutex poisoned")
+            .get(&key)
+            .cloned();
         if let Some(product) = cached {
             // Replay through the analyzer, not the producer's closed ledger:
             // every currently open consumer ledger must observe these reads.
@@ -125,7 +137,7 @@ impl<'a> SubjectQueryBatch<'a> {
                 return execute();
             }
             brokk_bifrost_analysis::profiling::note("policy.subject_query reused");
-            return Rc::clone(&product.rows);
+            return Arc::clone(&product.rows);
         }
 
         let (rows, reads) = capture_query_reads(context.analyzer, execute);
@@ -141,16 +153,26 @@ impl<'a> SubjectQueryBatch<'a> {
                 .len()
                 .saturating_add(rows.evidence.len())
                 .saturating_add(reads.len());
-            let retained = self.retained_weight.get().saturating_add(weight);
+            // Reserving the retained weight and inserting the product are one
+            // critical section: two workers that both passed the cap check
+            // would otherwise retain past the bound.
+            let mut products = self
+                .products
+                .lock()
+                .expect("policy subject batch products mutex poisoned");
+            let retained = self
+                .retained_weight
+                .load(Ordering::Relaxed)
+                .saturating_add(weight);
             if retained <= self.limits.max_pipeline_rows {
-                self.products.borrow_mut().insert(
+                products.insert(
                     key,
-                    Rc::new(SubjectProduct {
-                        rows: Rc::clone(&rows),
+                    Arc::new(SubjectProduct {
+                        rows: Arc::clone(&rows),
                         reads,
                     }),
                 );
-                self.retained_weight.set(retained);
+                self.retained_weight.store(retained, Ordering::Relaxed);
             }
         }
         rows
@@ -161,40 +183,36 @@ impl<'a> SubjectQueryBatch<'a> {
 mod tests {
     use brokk_bifrost_analysis::analyzer::read_ledger::ReadLedger;
     use brokk_bifrost_analysis::analyzer::{AnalyzerConfig, AnalyzerQueryScope, Language};
+    use brokk_bifrost_test_macros::hardwon;
 
+    use crate::PolicyRegistry;
     use crate::inline_project::InlineTestProject;
-    use crate::{
-        CatalogRegistryLimits, PolicyRegistry, PolicyRegistryLimits, PolicySourceIdentity,
-        TaintCatalogRegistry,
-    };
 
     use super::*;
 
     const SOURCE: &str = "fn work(mut values: Vec<i32>) { for _ in 0..2 { values.sort(); } }";
 
     fn registry() -> PolicyRegistry {
-        let catalogs = Arc::new(TaintCatalogRegistry::new_without_workspace(
-            CatalogRegistryLimits::default(),
-        ));
-        let mut registry =
-            PolicyRegistry::new_without_workspace(catalogs, PolicyRegistryLimits::default());
         let source = include_str!(
             "../../../policy-packs/bifrost.code-smells/policies/loop-invariant-sort.rqlp"
         );
-        for id in ["test.first", "test.second"] {
-            registry
-                .register_policy_bytes(
-                    PolicySourceIdentity::new(id),
-                    source
-                        .replace("bifrost.performance.loop-invariant-sort", id)
-                        .as_bytes(),
-                )
-                .expect("valid production policy");
-        }
-        registry
+        let sources = [
+            (
+                "test.first",
+                source.replace("bifrost.performance.loop-invariant-sort", "test.first"),
+            ),
+            (
+                "test.second",
+                source.replace("bifrost.performance.loop-invariant-sort", "test.second"),
+            ),
+        ];
+        crate::test_support::registry_with_policies(&sources, "valid production policy")
     }
 
     #[test]
+    #[hardwon(
+        "#2586: a reused subject result must replay its read dependencies into the consumer ledger"
+    )]
     fn complete_subjects_replay_reads_to_the_consumers_ledger() {
         let project = InlineTestProject::with_language(Language::Rust)
             .file("lib.rs", SOURCE)
@@ -233,7 +251,7 @@ mod tests {
         };
         assert_eq!(first.completion, CodeQueryCompletion::Complete);
         assert!(!first.items.is_empty());
-        assert!(Rc::ptr_eq(&first, &second), "execute one subject scan");
+        assert!(Arc::ptr_eq(&first, &second), "execute one subject scan");
         assert!(!first_reads.is_empty(), "record actual source dependencies");
         assert!(first_reads.is_bounded());
         assert_eq!(first_reads.keys(), second_reads.keys());
@@ -244,6 +262,7 @@ mod tests {
     }
 
     #[test]
+    #[hardwon("#2586: a complete scan must not be reused under narrower budgets or cancellation")]
     fn cancellation_and_narrower_budgets_cannot_reuse_complete_subjects() {
         let project = InlineTestProject::with_language(Language::Rust)
             .file("lib.rs", SOURCE)
@@ -290,14 +309,15 @@ mod tests {
         context.cancellation = Some(&token);
         let cancelled = batch.execute(&query, &context, &budget);
         assert_eq!(cancelled.completion, CodeQueryCompletion::Cancelled);
-        assert!(!Rc::ptr_eq(&complete, &cancelled));
+        assert!(!Arc::ptr_eq(&complete, &cancelled));
         context.cancellation = None;
         let _scope = AnalyzerQueryScope::with_cancellation(workspace.analyzer(), &token);
         let cancelled = batch.execute(&query, &context, &budget);
-        assert!(!Rc::ptr_eq(&complete, &cancelled));
+        assert!(!Arc::ptr_eq(&complete, &cancelled));
     }
 
     #[test]
+    #[hardwon("#2586: incomplete subject scans must not become reusable products")]
     fn incomplete_subjects_are_not_published() {
         let project = InlineTestProject::with_language(Language::Rust)
             .file("lib.rs", SOURCE)
@@ -325,6 +345,12 @@ mod tests {
         };
         let rows = batch.execute(&query, &context, &budget);
         assert_ne!(rows.completion, CodeQueryCompletion::Complete);
-        assert!(batch.products.borrow().is_empty());
+        assert!(
+            batch
+                .products
+                .lock()
+                .expect("policy subject batch products mutex poisoned")
+                .is_empty()
+        );
     }
 }

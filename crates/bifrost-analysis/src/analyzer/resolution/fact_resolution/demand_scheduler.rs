@@ -18,9 +18,7 @@ impl Resources<'_, '_> {
         target: &mut CancellationEvidenceLedger,
         work: &mut usize,
     ) {
-        self.hierarchy
-            .cancellation_reasons
-            .include_retained_evidence(target, self.session.cancellation, work);
+        super::include_hierarchy_cancellation(self.hierarchy, self.session, target, work);
     }
 }
 
@@ -28,6 +26,128 @@ impl Resources<'_, '_> {
 pub(crate) struct RootPlan {
     pub(crate) prefixes: Vec<SemanticId>,
     pub(crate) completion: ResolutionCompletion,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct ClosureDischarges {
+    pub(crate) reasons: BTreeSet<SemanticId>,
+    /// The selected prefix provider has evidence to retire operation-local
+    /// hierarchy placeholders after the closed route binds a target.
+    pub(crate) operation_local_placeholders: bool,
+    /// A closed selected route's exact terminal targets, including an empty
+    /// set when the provider exhausted the route and proved no target exists.
+    pub(crate) selected_targets: Option<BTreeSet<SemanticId>>,
+    /// The selected route may remove the listed gaps on its own empty answer.
+    pub(crate) authoritative_empty_result: bool,
+    /// A type-prefix proof also closes the same exact prefix reference's gap.
+    pub(crate) prefix_reference: Option<SemanticId>,
+    pub(crate) prefix_reasons: BTreeSet<SemanticId>,
+    pub(crate) prefix_operation_local_placeholders: bool,
+}
+
+impl ClosureDischarges {
+    pub(crate) fn exact(reasons: impl IntoIterator<Item = SemanticId>) -> Self {
+        Self {
+            reasons: reasons.into_iter().collect(),
+            operation_local_placeholders: false,
+            selected_targets: None,
+            authoritative_empty_result: false,
+            prefix_reference: None,
+            prefix_reasons: BTreeSet::new(),
+            prefix_operation_local_placeholders: false,
+        }
+    }
+
+    pub(crate) fn with_operation_local_placeholders(
+        reasons: impl IntoIterator<Item = SemanticId>,
+    ) -> Self {
+        Self {
+            reasons: reasons.into_iter().collect(),
+            operation_local_placeholders: true,
+            selected_targets: None,
+            authoritative_empty_result: false,
+            prefix_reference: None,
+            prefix_reasons: BTreeSet::new(),
+            prefix_operation_local_placeholders: false,
+        }
+    }
+
+    pub(crate) fn with_selected_targets(
+        mut self,
+        targets: impl IntoIterator<Item = SemanticId>,
+    ) -> Self {
+        let targets = targets.into_iter().collect::<BTreeSet<_>>();
+        if let Some(selected) = &mut self.selected_targets {
+            selected.extend(targets);
+        } else {
+            self.selected_targets = Some(targets);
+        }
+        self
+    }
+
+    pub(crate) fn with_authoritative_empty_result(mut self) -> Self {
+        self.selected_targets = Some(BTreeSet::new());
+        self.authoritative_empty_result = true;
+        self
+    }
+
+    pub(crate) fn for_prefix(
+        mut self,
+        reference: SemanticId,
+        reasons: impl IntoIterator<Item = SemanticId>,
+        operation_local_placeholders: bool,
+    ) -> Self {
+        assert!(
+            self.prefix_reference.is_none() || self.prefix_reference == Some(reference),
+            "one closed route has one selected prefix reference"
+        );
+        self.prefix_reference = Some(reference);
+        self.prefix_reasons.extend(reasons);
+        self.prefix_operation_local_placeholders |= operation_local_placeholders;
+        self
+    }
+
+    pub(crate) fn for_prefix_only(&self) -> Option<(SemanticId, Self)> {
+        self.prefix_reference.map(|reference| {
+            (
+                reference,
+                Self {
+                    reasons: self.prefix_reasons.clone(),
+                    operation_local_placeholders: self.prefix_operation_local_placeholders,
+                    ..Self::default()
+                },
+            )
+        })
+    }
+
+    pub(crate) fn without_prefix(self) -> Self {
+        Self {
+            prefix_reference: None,
+            prefix_reasons: BTreeSet::new(),
+            prefix_operation_local_placeholders: false,
+            ..self
+        }
+    }
+
+    pub(crate) fn merge(&mut self, other: Self) {
+        self.reasons.extend(other.reasons);
+        self.operation_local_placeholders |= other.operation_local_placeholders;
+        if let Some(targets) = other.selected_targets {
+            self.selected_targets
+                .get_or_insert_with(BTreeSet::new)
+                .extend(targets);
+        }
+        self.authoritative_empty_result |= other.authoritative_empty_result;
+        if let Some(reference) = other.prefix_reference {
+            assert!(
+                self.prefix_reference.is_none() || self.prefix_reference == Some(reference),
+                "merged closed routes agree on their selected prefix reference"
+            );
+            self.prefix_reference = Some(reference);
+        }
+        self.prefix_reasons.extend(other.prefix_reasons);
+        self.prefix_operation_local_placeholders |= other.prefix_operation_local_placeholders;
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -69,6 +189,26 @@ pub(crate) trait RootProvider {
     /// operation's fixed selection. No evaluator may run inside this call.
     fn discover(&mut self, endpoint: &EndpointSignature) -> StoreResult<RootDiscovery>;
 
+    /// Whether this provider can prepare keyed root reads for all pending
+    /// endpoints in a scheduler round. Providers that do not opt in retain the
+    /// original interleaved discover-and-admit order.
+    fn supports_batched_discoveries(&self) -> bool {
+        false
+    }
+
+    /// Discover a set of independent pending endpoints. Providers with a
+    /// keyed batch source can prepare the reads together; the default keeps
+    /// existing providers scalar.
+    fn discover_many(
+        &mut self,
+        endpoints: &[EndpointSignature],
+    ) -> StoreResult<Vec<RootDiscovery>> {
+        endpoints
+            .iter()
+            .map(|endpoint| self.discover(endpoint))
+            .collect()
+    }
+
     /// Install one immutable relation from complete root-specific evaluations.
     /// This is not permission to mutate previously closed endpoint relations.
     /// The installed lexical relation must carry its plan and materialization
@@ -85,12 +225,13 @@ pub(crate) trait RootProvider {
     /// continued. `Some` says the closure answered the boundary question its
     /// endpoint asked with its own positive witness: the requesting reference's
     /// selected route reasons and the listed placeholder reasons no longer
-    /// describe an open branch. `None` says the closure decided nothing beyond
-    /// its candidate paths.
+    /// describe an open branch. It can also allow operation-local placeholders
+    /// to retire once that route binds selected targets. `None` says the closure
+    /// decided nothing beyond its candidate paths.
     fn resolved_closure_discharges(
         &self,
         _endpoint: &EndpointSignature,
-    ) -> Option<Vec<SemanticId>> {
+    ) -> Option<ClosureDischarges> {
         None
     }
 }
@@ -122,6 +263,7 @@ pub(crate) enum Outcome {
         endpoint: EndpointSignature,
         reason: RootUnavailableReason,
         completion: ResolutionCompletion,
+        root_seed_completions: Vec<(SemanticId, ResolutionCompletion)>,
     },
     Unsupported(Unsupported),
 }
@@ -148,6 +290,7 @@ pub(crate) enum BatchOutcome {
         endpoint: EndpointSignature,
         reason: RootUnavailableReason,
         completion: ResolutionCompletion,
+        root_seed_completions: Vec<(SemanticId, ResolutionCompletion)>,
     },
     Unsupported(Unsupported),
 }
@@ -216,7 +359,7 @@ struct Scheduler<'a> {
     claims: HashMap<SemanticId, DemandedReferenceOwner>,
     /// Placeholder reasons each closed relation retired for the lookups it
     /// continued, handed to a waiting task before its next poll.
-    closure_discharges: HashMap<EndpointSignature, BTreeSet<SemanticId>>,
+    closure_discharges: HashMap<EndpointSignature, ClosureDischarges>,
     evidence: CancellationEvidenceLedger,
     work: usize,
 }
@@ -227,6 +370,7 @@ impl<'a> Scheduler<'a> {
         operation: &mut Resources<'_, 'a>,
         endpoint: EndpointSignature,
         reason: RootUnavailableReason,
+        root_seed_completions: Vec<(SemanticId, ResolutionCompletion)>,
     ) -> BatchOutcome {
         let cancellation = operation.session.cancellation;
         for task in &self.tasks {
@@ -279,6 +423,7 @@ impl<'a> Scheduler<'a> {
             endpoint,
             reason,
             completion,
+            root_seed_completions,
         }
     }
 
@@ -444,10 +589,12 @@ pub(super) fn resolve_with_metrics<'a>(
                 endpoint,
                 reason,
                 completion,
+                root_seed_completions,
             } => Outcome::Unavailable {
                 endpoint,
                 reason,
                 completion,
+                root_seed_completions,
             },
             BatchOutcome::Unsupported(unsupported) => Outcome::Unsupported(unsupported),
         },
@@ -542,6 +689,14 @@ fn resolve_admitted_batch<'a>(
     provider: &mut (impl RootProvider + ?Sized),
     metrics: &mut ResolutionBatchMetrics,
 ) -> StoreResult<BatchOutcome> {
+    let root_seed_completions = admitted
+        .iter()
+        .filter_map(|(root, seed)| {
+            let seed = seed.as_ref()?;
+            matches!(seed.completion(), ResolutionCompletion::Incomplete(_))
+                .then(|| (*root, seed.completion().clone()))
+        })
+        .collect::<Vec<_>>();
     let mut root_tasks = Vec::with_capacity(admitted.len());
     for (root, seed) in admitted {
         let Some(id) = scheduler.admit(operation, root, seed) else {
@@ -600,7 +755,12 @@ fn resolve_admitted_batch<'a>(
                 }
                 RoundOutcome::Cancelled => return Ok(scheduler.cancelled(operation)),
                 RoundOutcome::Unavailable { endpoint, reason } => {
-                    return Ok(scheduler.unavailable(operation, endpoint, reason));
+                    return Ok(scheduler.unavailable(
+                        operation,
+                        endpoint,
+                        reason,
+                        root_seed_completions,
+                    ));
                 }
             }
         }
@@ -673,7 +833,7 @@ fn resolve_admitted_batch<'a>(
                 .closure_discharges
                 .entry(relation.endpoint.clone())
                 .or_default()
-                .extend(retired);
+                .merge(retired);
         }
         scheduler
             .evidence
@@ -730,6 +890,8 @@ fn poll_round<'a>(
     root_task_count: usize,
     answered_roots: &mut usize,
 ) -> StoreResult<RoundOutcome> {
+    let cancellation = operation.session.cancellation;
+    let mut awaiting_dependencies = Vec::new();
     for &id in round {
         let cancellation = operation.session.cancellation;
         if cancellation.is_cancelled()
@@ -948,13 +1110,19 @@ fn poll_round<'a>(
                     !endpoints.is_empty(),
                     "pending task retains exact endpoint requests"
                 );
+                if provider.supports_batched_discoveries() {
+                    awaiting_dependencies.push((id, endpoints));
+                    continue;
+                }
                 let mut waiting = HashSet::default();
                 for endpoint in endpoints {
                     if !operation.session.charge_scope_steps(1) {
                         return Ok(RoundOutcome::Cancelled);
                     }
-                    let relation_id = if let Some(&id) = scheduler.relation_ids.get(&endpoint) {
-                        id
+                    let relation_id = if let Some(&relation_id) =
+                        scheduler.relation_ids.get(&endpoint)
+                    {
+                        relation_id
                     } else {
                         if !operation.session.charge_scope_steps(1) {
                             return Ok(RoundOutcome::Cancelled);
@@ -1048,13 +1216,147 @@ fn poll_round<'a>(
                         scheduler.tasks[id].waits_on.push(relation_id);
                     }
                 }
-                // The readiness gate covered the complete lexical frontier.
-                // Discovery may certify every endpoint as already served by
-                // the base source, leaving no selected relation to await.
                 if scheduler.tasks[id].waiting == 0 {
                     scheduler.runnable.push_back(Runnable::Task(id));
                 }
             }
+        }
+    }
+    if awaiting_dependencies.is_empty() {
+        return Ok(RoundOutcome::Continue);
+    }
+
+    // Discover all new endpoints from this poll round together. Languages
+    // with a keyed source can then batch those reads per blob while the
+    // scheduler still installs relations in task and request order below.
+    let mut new_endpoints = Vec::new();
+    let mut seen_endpoints = HashSet::default();
+    for (_, endpoints) in &awaiting_dependencies {
+        for endpoint in endpoints {
+            if !operation.session.charge_scope_steps(1) {
+                return Ok(RoundOutcome::Cancelled);
+            }
+            if !scheduler.relation_ids.contains_key(endpoint)
+                && seen_endpoints.insert(endpoint.clone())
+            {
+                if !operation.session.charge_scope_steps(1) {
+                    return Ok(RoundOutcome::Cancelled);
+                }
+                new_endpoints.push(endpoint.clone());
+            }
+        }
+    }
+    let discovered = provider.discover_many(&new_endpoints)?;
+    assert_eq!(
+        discovered.len(),
+        new_endpoints.len(),
+        "batched root discovery returns one result per endpoint"
+    );
+    let mut discovered = new_endpoints
+        .into_iter()
+        .zip(discovered)
+        .collect::<HashMap<_, _>>();
+
+    for (id, endpoints) in awaiting_dependencies {
+        let mut waiting = HashSet::default();
+        for endpoint in endpoints {
+            let relation_id = if let Some(&relation_id) = scheduler.relation_ids.get(&endpoint) {
+                relation_id
+            } else {
+                let discovery = discovered
+                    .remove(&endpoint)
+                    .expect("every new pending endpoint was batch-discovered");
+                let completion = match &discovery {
+                    RootDiscovery::Ready(plan) => &plan.completion,
+                    RootDiscovery::AlreadyReady { completion }
+                    | RootDiscovery::Unavailable { completion, .. }
+                    | RootDiscovery::Cancelled(completion) => completion,
+                };
+                scheduler
+                    .evidence
+                    .include(completion, cancellation, &mut scheduler.work);
+                if cancellation.is_cancelled()
+                    || operation.session.resolution_stopped()
+                    || scheduler.evidence.cancellation_observed()
+                {
+                    return Ok(RoundOutcome::Cancelled);
+                }
+                let plan = match discovery {
+                    RootDiscovery::AlreadyReady { .. } => {
+                        let relation_id = scheduler.relations.len();
+                        assert!(
+                            scheduler
+                                .relation_ids
+                                .insert(endpoint.clone(), relation_id)
+                                .is_none()
+                        );
+                        scheduler.relations.push(Relation {
+                            endpoint,
+                            dependencies: Vec::new(),
+                            pending: 0,
+                            waiters: Vec::new(),
+                            closed: true,
+                        });
+                        continue;
+                    }
+                    RootDiscovery::Ready(plan) => plan,
+                    RootDiscovery::Unavailable { reason, .. } => {
+                        return Ok(RoundOutcome::Unavailable { endpoint, reason });
+                    }
+                    RootDiscovery::Cancelled(_) => return Ok(RoundOutcome::Cancelled),
+                };
+                let mut dependencies = Vec::new();
+                let mut seen_dependencies = HashSet::default();
+                for prefix in plan.prefixes {
+                    if !operation.session.charge_scope_steps(1) {
+                        return Ok(RoundOutcome::Cancelled);
+                    }
+                    let Some(dependency) = scheduler.admit(operation, prefix, None) else {
+                        return Ok(RoundOutcome::Cancelled);
+                    };
+                    if seen_dependencies.insert(dependency) {
+                        dependencies.push(dependency);
+                    }
+                }
+                let relation_id = scheduler.relations.len();
+                assert!(
+                    scheduler
+                        .relation_ids
+                        .insert(endpoint.clone(), relation_id)
+                        .is_none()
+                );
+                let mut pending = 0;
+                for &dependency in &dependencies {
+                    if scheduler.tasks[dependency].answer.is_none() {
+                        scheduler.tasks[dependency].dependents.push(relation_id);
+                        pending += 1;
+                    }
+                }
+                scheduler.relations.push(Relation {
+                    endpoint,
+                    dependencies,
+                    pending,
+                    waiters: Vec::new(),
+                    closed: false,
+                });
+                if pending == 0 {
+                    scheduler
+                        .runnable
+                        .push_back(Runnable::Relation(relation_id));
+                }
+                relation_id
+            };
+            if !scheduler.relations[relation_id].closed && waiting.insert(relation_id) {
+                scheduler.relations[relation_id].waiters.push(id);
+                scheduler.tasks[id].waiting += 1;
+                scheduler.tasks[id].waits_on.push(relation_id);
+            }
+        }
+        // The readiness gate covered the complete lexical frontier.
+        // Discovery may certify every endpoint as already served by the base
+        // source, leaving no selected relation to await.
+        if scheduler.tasks[id].waiting == 0 {
+            scheduler.runnable.push_back(Runnable::Task(id));
         }
     }
     Ok(RoundOutcome::Continue)
@@ -1304,18 +1606,7 @@ fn read_root_seeds<'a>(
             .include_reason(ResolutionIncompleteReason::Cancelled);
         return Ok(None);
     }
-    if rows.len() != queries.len() {
-        return Err(StoreError::new(format!(
-            "demand batch seed read returned mismatched rows: rows={rows:?}, queries={queries:?}"
-        )));
-    }
-    for (ordinal, row) in rows.iter().enumerate() {
-        if row.request_ordinal() != ordinal || row.query() != queries[ordinal] {
-            return Err(StoreError::new(format!(
-                "demand batch seed row at ordinal {ordinal} disagrees with its request: rows={rows:?}, queries={queries:?}"
-            )));
-        }
-    }
+    super::validate_reference_seed_rows(&rows, &queries, "demand batch seed read")?;
     let mut seeds = HashMap::default();
     for row in rows.into_vec() {
         let reference = row.query().reference();

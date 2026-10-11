@@ -28,16 +28,17 @@ use super::results::{
     CodeQueryDiagnostic, CodeQueryDiagnosticCode, CodeQueryDiagnosticImpact, CodeQueryImportBinder,
     CodeQueryLexicalScope, CodeQueryRange, CodeQueryResolutionCandidate,
 };
-use crate::analyzer::semantic::LengthDelimitedDigest;
+use crate::analyzer::semantic::{ContentIdentity, LengthDelimitedDigest};
 use crate::analyzer::usages::get_definition::trace::HierarchyHopRecord;
 use crate::analyzer::usages::get_definition::{
     ResolutionTraceResult, TraceCandidate, TraceCandidateRef,
 };
-use crate::analyzer::{IAnalyzer, Language, ProjectFile};
+use crate::analyzer::{IAnalyzer, Language, ProjectFile, Range};
 use crate::cancellation::CancellationToken;
 use crate::hash::{HashMap, HashSet};
 use brokk_bifrost_rql::{BindingFilter, CandidateFilter, ScopeFilter};
 use std::sync::{Arc, Mutex};
+use tree_sitter::{Parser, Tree};
 
 /// Complete environment products retained by an explicitly scoped row-family
 /// session. Query-local diagnostic suppression never enters this store.
@@ -72,12 +73,27 @@ const CANDIDATE_ID_DOMAIN: &[u8] = b"bifrost.code_query.resolution_candidate.v1"
 /// Domain separator for a candidate-hierarchy hop row's stable id.
 const CANDIDATE_HOP_ID_DOMAIN: &[u8] = b"bifrost.code_query.candidate_hop.v1";
 
+type PythonSyntaxTree = (
+    ProjectFile,
+    ContentIdentity,
+    Result<Arc<Tree>, &'static str>,
+);
+type PythonVariableIndexCache = (
+    ProjectFile,
+    ContentIdentity,
+    Arc<super::python_variables::PythonVariableIndex>,
+);
+
 /// Per-request memo of derived environments plus the diagnostics already
 /// reported, so one file is derived once and one axis gap is reported once.
 #[derive(Default)]
 pub(super) struct EnvironmentTraversalCache {
     files: HashMap<ProjectFile, Arc<EnvironmentFileResult>>,
+    python_dynamic_scope_calls: HashMap<ProjectFile, Arc<Vec<Range>>>,
+    binding_use_completeness: HashMap<BindingKey, bool>,
     traced: HashMap<ProjectFile, Arc<OccurrenceFileResult>>,
+    python_syntax_tree: Option<PythonSyntaxTree>,
+    python_variable_index: Option<PythonVariableIndexCache>,
     shared: Option<Arc<Mutex<EnvironmentTraversalStore>>>,
     select_joined_scopes: bool,
     reported: HashSet<(ProjectFile, CodeQueryDiagnosticCode)>,
@@ -85,6 +101,69 @@ pub(super) struct EnvironmentTraversalCache {
 }
 
 impl EnvironmentTraversalCache {
+    /// Retain only the most recently used file's Python variable grouping.
+    /// Each emitted variable row keeps its own facts; this cache never grows
+    /// with the number of files visited by a workspace query.
+    pub(super) fn python_variable_index_for(
+        &mut self,
+        file: &ProjectFile,
+        content_identity: ContentIdentity,
+        source: &str,
+        environment: &EnvironmentFileResult,
+    ) -> Option<Arc<super::python_variables::PythonVariableIndex>> {
+        if let Some((cached_file, cached_content, index)) = &self.python_variable_index
+            && cached_file == file
+            && cached_content == &content_identity
+        {
+            return Some(Arc::clone(index));
+        }
+        let tree = super::python_rule_facts::parse_python(source)?;
+        let index = Arc::new(super::python_variables::derive(
+            file,
+            source,
+            &tree,
+            environment,
+        ));
+        self.python_variable_index = Some((file.clone(), content_identity, Arc::clone(&index)));
+        Some(index)
+    }
+
+    /// Retain the most recently used Python syntax tree for this query request.
+    /// Row-local Python relations visit many rows from one file, so this avoids
+    /// reparsing that source per row without retaining ASTs for multiple files.
+    pub(super) fn python_syntax_tree_for(
+        &mut self,
+        file: &ProjectFile,
+        content_identity: ContentIdentity,
+        source: &str,
+    ) -> Result<Arc<Tree>, &'static str> {
+        if let Some((cached_file, cached_content, result)) = &self.python_syntax_tree
+            && cached_file == file
+            && cached_content == &content_identity
+        {
+            return result.clone();
+        }
+
+        let result = (|| {
+            let Some(language) = crate::analyzer::parser_language_for(Language::Python) else {
+                return Err("the Python parser is unavailable");
+            };
+            let mut parser = Parser::new();
+            parser
+                .set_language(&language)
+                .map_err(|_| "the Python grammar is unavailable")?;
+            let tree = parser
+                .parse(source, None)
+                .ok_or("the selected Python source could not be parsed")?;
+            if tree.root_node().has_error() {
+                return Err("the selected Python source has recovered syntax");
+            }
+            Ok(Arc::new(tree))
+        })();
+        self.python_syntax_tree = Some((file.clone(), content_identity, result.clone()));
+        result
+    }
+
     pub(super) fn with_shared_store(
         shared: Arc<Mutex<EnvironmentTraversalStore>>,
         select_joined_scopes: bool,
@@ -147,6 +226,24 @@ impl EnvironmentTraversalCache {
         )
     }
 
+    pub(super) fn record_binding_use_completeness(&mut self, value: &BindingValue, complete: bool) {
+        let key = value.set_difference_key();
+        if let Some(previous) = self.binding_use_completeness.get(&key) {
+            assert_eq!(
+                *previous, complete,
+                "one query derives stable binding-use completeness for each binder"
+            );
+        } else {
+            self.binding_use_completeness.insert(key, complete);
+        }
+    }
+
+    pub(super) fn binding_use_completeness(&self, value: &BindingValue) -> Option<bool> {
+        self.binding_use_completeness
+            .get(&value.set_difference_key())
+            .copied()
+    }
+
     /// Derive (or replay) one file's lexical environment.
     ///
     /// `environment_for_file` takes no cancellation token because it resolves
@@ -186,6 +283,60 @@ impl EnvironmentTraversalCache {
         }
         self.files.insert(file.clone(), Arc::clone(&derived));
         derived
+    }
+
+    /// Python calls that make lexical reads dynamic within their containing
+    /// scope. The ranges come from normalized call facts, not source scanning.
+    pub(super) fn python_dynamic_scope_calls(
+        &mut self,
+        analyzer: &dyn IAnalyzer,
+        file: &ProjectFile,
+    ) -> Arc<Vec<Range>> {
+        if let Some(cached) = self.python_dynamic_scope_calls.get(file) {
+            return Arc::clone(cached);
+        }
+        let calls = if crate::analyzer::common::language_for_file(file) == Language::Python {
+            analyzer
+                .structural_fact_providers()
+                .into_iter()
+                .find(|provider| provider.structural_language() == Language::Python)
+                .and_then(|provider| provider.structural_facts(file))
+                .map(|facts| {
+                    facts
+                        .nodes()
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, node)| {
+                            node.kind == brokk_bifrost_core::analyzer::structural::kinds::NormalizedKind::Call
+                        })
+                        .filter_map(|(index, node)| {
+                            let node_id = u32::try_from(index)
+                                .expect("normalized node ids fit in u32");
+                            if facts
+                                .role_targets(
+                                    node_id,
+                                    brokk_bifrost_core::analyzer::structural::kinds::Role::Receiver,
+                                )
+                                .next()
+                                .is_some()
+                            {
+                                return None;
+                            }
+                            let name = node.name?;
+                            let spelling = facts.source().get(name.start_byte..name.end_byte)?;
+                            matches!(spelling, "locals" | "globals" | "vars" | "eval" | "exec")
+                                .then_some(node.range)
+                        })
+                        .collect()
+                })
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+        let calls = Arc::new(calls);
+        self.python_dynamic_scope_calls
+            .insert(file.clone(), Arc::clone(&calls));
+        calls
     }
 
     /// Derive (or replay) one file's occurrence rows *with* resolution traces.
@@ -434,6 +585,15 @@ impl BindingValue {
         }
     }
 
+    pub(super) fn set_difference_key(&self) -> BindingKey {
+        BindingKey {
+            file: self.file.clone(),
+            index: self.index,
+            shadowed: false,
+            reached_from: None,
+        }
+    }
+
     pub(super) fn file(&self) -> &ProjectFile {
         &self.file
     }
@@ -495,9 +655,12 @@ impl CandidateValue {
 /// RQLP join between the two domains lands.
 fn candidate_row_id(occurrence: &OccurrenceRow, ordinal: usize) -> String {
     let mut digest = LengthDelimitedDigest::new(CANDIDATE_ID_DOMAIN);
-    digest.push(occurrence.content_identity.as_bytes());
-    digest.push(&occurrence.node.to_le_bytes());
-    digest.push(occurrence.role.label().as_bytes());
+    brokk_bifrost_analysis::analyzer::structural::occurrence_rows::push_occurrence_id_fields(
+        &mut digest,
+        occurrence.content_identity,
+        occurrence.node,
+        occurrence.role,
+    );
     digest.push(&ordinal.to_le_bytes());
     digest.finish().to_string()
 }
@@ -597,16 +760,17 @@ pub(super) const BINDING_QUERY_AXES: &[EnvironmentAxis] =
 /// The public projection of one scope row.
 pub(super) fn public_scope(value: &ScopeValue, range: CodeQueryRange) -> CodeQueryLexicalScope {
     let row = value.row();
+    let metadata = super::public_source_metadata(&row.file, row.range, range);
     CodeQueryLexicalScope {
         id: value.id(),
         ast_id: row.ast_id(),
-        path: super::rel_path_string(&row.file),
-        language: crate::analyzer::common::language_for_file(&row.file).config_label(),
+        path: metadata.path,
+        language: metadata.language,
         index: row.index,
         kind: row.anchor.kind().map(|kind| kind.label()),
-        range,
-        start_byte: row.range.start_byte,
-        end_byte: row.range.end_byte,
+        range: metadata.range,
+        start_byte: metadata.start_byte,
+        end_byte: metadata.end_byte,
         parent_index: row.parent_scope,
     }
 }

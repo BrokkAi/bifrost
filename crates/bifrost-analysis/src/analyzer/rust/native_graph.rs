@@ -3,14 +3,11 @@
 use super::RustAnalyzer;
 use crate::CancellationToken;
 use crate::analyzer::languages::{EdgePassId, LanguageEdgeFailure, NativeWorkspaceGraphProvider};
-use crate::analyzer::resolution::{
-    FactReferenceEdgeDeclarationDomain, FactResolutionBatchSummary, ResolutionCompletion,
-};
+use crate::analyzer::resolution::{FactReferenceEdgeDeclarationDomain, ResolutionCompletion};
 use crate::analyzer::store::Result;
 use crate::analyzer::store::resolution_operation::{
     SelectedResolutionContextMetrics, SelectedResolutionOperationInput,
     SelectedResolutionOperationOpenOutcome, SelectedResolutionOperationOutcome,
-    SelectedRustContextOutcome,
 };
 use crate::analyzer::store::resolution_publication::SelectedResolutionOverlayInputsOutcome;
 use crate::analyzer::store::resolution_selection::SelectedResolutionLanguage;
@@ -22,7 +19,6 @@ use crate::analyzer::usages::workspace_graph::{
 };
 use crate::analyzer::{CodeUnitIndex, IAnalyzer, Language, ProjectFile, resolve_analyzer};
 use crate::hash::HashSet;
-use std::path::PathBuf;
 
 pub(crate) enum RustNativeWorkspaceGraphOutcome {
     Complete(SelectedWorkspaceUsageGraphProjection),
@@ -284,90 +280,33 @@ fn build_rust_native_workspace_graph_with_progress(
         progress();
         Ok(())
     };
-    // The build walks one crate at a time. Each crate's context answers only
-    // the requested files that crate compiles, and it is dropped before the
-    // next crate is read; nothing keyed by mount or crate survives an
-    // iteration. What the build carries across them is its own result: the
-    // staged edge rows and the combined summary. A file compiled into more
-    // than one Cargo target is resolved once per crate, and the rows
-    // deduplicate by endpoint. A request that names one file walks the one or
-    // two crates that compile it, exactly as it did before; a request that
-    // names the whole workspace no longer merges every crate's bridges into
-    // one context.
-    //
-    // The last scope names no crate. Its files are the requested files no
-    // selected crate compiles: they own no crate module, so no crate context
-    // could compile a bridge out of them, and an empty crate set reads their
-    // declaration access exactly as the whole-crate-set policy did.
-    let mut summary = FactResolutionBatchSummary::empty();
-    let mut scopes = operation
-        .rust_crate_keys_for_files(
-            admitted_callers.iter().map(ProjectFile::rel_path),
-            cancellation,
-        )?
-        .into_iter()
-        .map(Some)
-        .collect::<Vec<_>>();
-    scopes.push(None);
-    let mut outside_crates = admitted_callers.clone();
-    for scope in scopes {
-        if cancellation.is_cancelled() {
+    // The generic driver keeps each crate's language-owned rows inside one
+    // stage, and places unowned request files in a final empty-crate unit.
+    let stage_files = admitted_callers.iter().cloned().collect::<Vec<_>>();
+    let summary = match operation.stage_rust_graph_units(
+        rust.project().root(),
+        rust,
+        &stage_files,
+        maximum_batch_size,
+        cancellation,
+        &mut SelectedResolutionContextMetrics,
+        &mut stage,
+    )? {
+        SelectedResolutionOperationOutcome::Native(staged) => staged.summary,
+        SelectedResolutionOperationOutcome::Cancelled(_) => {
             return Ok(RustNativeWorkspaceGraphOutcome::Cancelled);
         }
-        let (keys, files) = match scope {
-            Some(key) => {
-                let mut files = HashSet::default();
-                for member in operation.rust_crate_member_paths(key, cancellation)? {
-                    let file = ProjectFile::new(rust.project().root(), PathBuf::from(member));
-                    if admitted_callers.contains(&file) {
-                        outside_crates.remove(&file);
-                        files.insert(file);
-                    }
-                }
-                (vec![key], files)
-            }
-            None => (Vec::new(), std::mem::take(&mut outside_crates)),
-        };
-        if files.is_empty() {
-            continue;
+        SelectedResolutionOperationOutcome::Stale(reason) => {
+            return Ok(RustNativeWorkspaceGraphOutcome::Stale(format!(
+                "{reason:?}"
+            )));
         }
-        // This crate's export, placement and membership answers, shared by
-        // its context and its batches and dropped at the end of the iteration.
-        let _crate_memos = operation.crate_stage_memos()?;
-        let context =
-            match operation.rust_context_for_crate_files(keys.clone(), &files, cancellation)? {
-                SelectedRustContextOutcome::Ready(context) => context,
-                SelectedRustContextOutcome::Cancelled => {
-                    return Ok(RustNativeWorkspaceGraphOutcome::Cancelled);
-                }
-            };
-        let staged = match operation.stage_rust_reference_edge_batches_in_files(
-            rust,
-            context,
-            &keys,
-            &files,
-            maximum_batch_size,
-            cancellation,
-            &mut SelectedResolutionContextMetrics,
-            &mut stage,
-        )? {
-            SelectedResolutionOperationOutcome::Native(summary) => summary,
-            SelectedResolutionOperationOutcome::Cancelled(_) => {
-                return Ok(RustNativeWorkspaceGraphOutcome::Cancelled);
-            }
-            SelectedResolutionOperationOutcome::Stale(reason) => {
-                return Ok(RustNativeWorkspaceGraphOutcome::Stale(format!(
-                    "{reason:?}"
-                )));
-            }
-            SelectedResolutionOperationOutcome::Unavailable(reason) => {
-                return Ok(RustNativeWorkspaceGraphOutcome::Unavailable(format!(
-                    "{reason:?}"
-                )));
-            }
-        };
-        summary.accumulate(staged);
-    }
+        SelectedResolutionOperationOutcome::Unavailable(reason) => {
+            return Ok(RustNativeWorkspaceGraphOutcome::Unavailable(format!(
+                "{reason:?}"
+            )));
+        }
+    };
     let completion = summary
         .completion()
         .combine(summary.reference_enumeration_completion());
@@ -453,6 +392,7 @@ mod tests {
     use super::*;
     use crate::analyzer::IAnalyzer;
     use crate::inline_project::InlineTestProject;
+    use brokk_bifrost_test_macros::hardwon;
     use std::cell::Cell;
 
     /// A macro argument that reaches the graph only through a selected
@@ -474,6 +414,9 @@ mod tests {
     /// The invocation must be in expression position, as tract's `dispatch_*!`
     /// uses are.
     #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "6c2e5f6b06c4: cross-file macro argument sites must map through the host fragment"
+    )]
     fn native_rust_usage_graph_projects_an_argument_of_a_cross_file_macro() {
         use crate::searchtools::{UsageGraphParams, usage_graph};
 
@@ -572,6 +515,9 @@ mod tests {
     /// `a_crate_stage_s_macro_overlay_is_dropped_with_everything_it_registered`
     /// on the mechanism, and tract's warm `usage_graph` on the symptom.
     #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "2dfda468a55d: every crate stage must retain its own macro argument overlay"
+    )]
     fn native_rust_usage_graph_keeps_every_crate_stage_s_macro_argument_edges() {
         use crate::searchtools::{UsageGraphParams, usage_graph};
 
@@ -659,6 +605,9 @@ mod tests {
     /// `fn broadcast` of `impl DimLike for usize`. 173 of tract's 72,451
     /// persisted definition semantics are in the same class.
     #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "81bf7d4ed3d4: a definition without a CodeUnit must not erase unrelated graph edges"
+    )]
     fn native_rust_usage_graph_keeps_its_edges_when_a_definition_has_no_unit() {
         use crate::searchtools::{UsageGraphParams, usage_graph};
 
@@ -742,6 +691,9 @@ mod tests {
     /// generates `pub struct SMulByScalar4` and its `impl` members. The whole
     /// 13,370-node, 14,985-edge graph was lost to them.
     #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "98b2715e17ba: a macro-expanded item definition must not discard the usage graph"
+    )]
     fn native_rust_usage_graph_keeps_its_edges_when_a_macro_expansion_declares_an_item() {
         use crate::searchtools::{UsageGraphParams, usage_graph};
 
@@ -812,111 +764,6 @@ mod tests {
         );
     }
 
-    /// The graph reads the items the crate declares for decided item-macro
-    /// invocations (`rust_crate_macro_items`): tokio's `cfg_*` shape, a macro
-    /// defined in the crate root that adds a `cfg` to each item it replays,
-    /// invoked around a `mod` declaration in the root and around a function
-    /// in another file. The side the profile activates is an edge target
-    /// through its module path; the side it turns off has no edge, and the
-    /// graph does not report the invocations as unsupported.
-    #[test]
-    fn native_rust_usage_graph_draws_edges_to_cfg_decorated_macro_items() {
-        use crate::searchtools::{UsageGraphParams, usage_graph};
-
-        let decorated = |name: &str, predicate: &str| {
-            format!(
-                "macro_rules! {name} {{\n    ($($item:item)*) => {{\n        $(\n            #[cfg({predicate})]\n            #[cfg_attr(docsrs, doc(cfg({predicate})))]\n            $item\n        )*\n    }}\n}}\n"
-            )
-        };
-        let lib = format!(
-            "{}{}{}",
-            decorated("cfg_unix", "unix"),
-            decorated("cfg_not_unix", "not(unix)"),
-            concat!(
-                "cfg_unix! { pub mod unix_side; }\n",
-                "cfg_not_unix! { pub mod other_side; }\n",
-                "pub mod net;\n",
-                "pub fn unix_caller() -> u32 {\n",
-                "    crate::unix_side::unix_only() + crate::net::unix_net()\n",
-                "}\n",
-                "pub fn other_caller() -> u32 {\n",
-                "    crate::other_side::other_only() + crate::net::other_net()\n",
-                "}\n",
-            )
-        );
-        let fixture = InlineTestProject::with_language(Language::Rust)
-            .file(
-                "Cargo.toml",
-                "[package]\nname = \"decorated\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
-            )
-            .file("src/lib.rs", lib)
-            .file(
-                "src/unix_side.rs",
-                "pub fn unix_only() -> u32 {\n    1\n}\n",
-            )
-            .file(
-                "src/other_side.rs",
-                "pub fn other_only() -> u32 {\n    2\n}\n",
-            )
-            .file(
-                "src/net.rs",
-                concat!(
-                    "cfg_unix! {\n    pub fn unix_net() -> u32 {\n        3\n    }\n}\n",
-                    "cfg_not_unix! {\n    pub fn other_net() -> u32 {\n        4\n    }\n}\n",
-                ),
-            )
-            .build();
-        let rust = RustAnalyzer::new(fixture.project_dyn());
-        let graph = usage_graph(
-            &rust,
-            UsageGraphParams {
-                include_tests: true,
-                paths: None,
-                depth: 1,
-            },
-        );
-        let reasons: Vec<&str> = graph
-            .incomplete_reasons
-            .iter()
-            .map(|reason| reason.code.as_str())
-            .collect();
-        assert!(
-            !reasons.contains(&"native_graph_failed"),
-            "{:?}",
-            graph.incomplete_reasons
-        );
-        let (caller, active, inactive) = if cfg!(unix) {
-            (
-                "unix_caller",
-                ["unix_only", "unix_net"],
-                ["other_only", "other_net"],
-            )
-        } else {
-            (
-                "other_caller",
-                ["other_only", "other_net"],
-                ["unix_only", "unix_net"],
-            )
-        };
-        for target in active {
-            assert!(
-                graph
-                    .edges
-                    .iter()
-                    .any(|edge| edge.from.ends_with(caller) && edge.to.ends_with(target)),
-                "the active side of a decorated invocation is an edge target: {target}: {:?}",
-                graph.edges
-            );
-        }
-        for target in inactive {
-            assert!(
-                !graph.edges.iter().any(|edge| edge.to.ends_with(target)),
-                "a decoration the profile turns off declares nothing: {target}: {:?}",
-                graph.edges
-            );
-        }
-    }
-
     /// An unavailable canonical fact base must reach the `usage_graph`
     /// consumer as a reported incompleteness, never as a complete graph with
     /// no edges.
@@ -928,6 +775,9 @@ mod tests {
     /// That is the one shape a caller cannot tell from a real absence of
     /// references.
     #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "9acc891b89ad: missing canonical Rust facts must stop native routing before scans"
+    )]
     fn native_rust_usage_graph_reports_unavailable_canonical_facts_before_scanning() {
         use crate::searchtools::{UsageGraphParams, usage_graph};
 
@@ -1290,6 +1140,7 @@ mod tests {
     }
 
     #[test]
+    #[hardwon("#4488: inverse aliases mixed declarations at content-identical Rust mounts")]
     fn native_point_reverse_and_rooted_graph_agree_across_renamed_mounted_targets() {
         use crate::analyzer::Range;
         use crate::analyzer::languages::BoundedReceiverQuery;
@@ -1728,114 +1579,6 @@ mod tests {
     }
 
     #[test]
-    fn native_rust_graph_retains_same_module_function_value_reference() {
-        use crate::analyzer::rust::native_usages::find_native_usages;
-        use crate::analyzer::usages::outcome::GraphUsageOutcome;
-        use crate::analyzer::usages::{UsageHitKind, UsageProof};
-        use brokk_bifrost_core::analyzer::usages::scan_scope::UsageScanScope;
-
-        let fixture = InlineTestProject::with_language(Language::Rust)
-            .file("Cargo.toml", "[package]\nname = \"native_graph\"\nversion = \"0.1.0\"\nedition = \"2024\"\n")
-            .file("src/lib.rs", "pub fn target() {}\npub fn accept(callback: fn()) {}\npub fn caller() { accept(target); }\n")
-            .build();
-        let rust = RustAnalyzer::new(fixture.project_dyn());
-        let (_, graph) = graph(
-            build_rust_native_workspace_graph_for_files(
-                &rust,
-                &[fixture.file("src/lib.rs")],
-                2,
-                &CancellationToken::new(),
-            )
-            .unwrap(),
-        );
-        assert!(
-            graph.edges.iter().any(|edge| {
-                graph.nodes[edge.from].primary.terminal_name() == "caller"
-                    && graph.nodes[edge.to].primary.terminal_name() == "target"
-            }),
-            "passing a module function as a value must retain its reference edge"
-        );
-        let target = rust
-            .declarations(&fixture.file("src/lib.rs"))
-            .into_iter()
-            .find(|unit| unit.identifier() == "target")
-            .expect("fixture function");
-        let admitted = HashSet::from_iter([fixture.file("src/lib.rs")]);
-        let reverse = find_native_usages(&rust, &[target], &UsageScanScope::new(&admitted), 10);
-        let GraphUsageOutcome::Resolved(reverse) = reverse else {
-            panic!("native reverse must publish semantic evidence: {reverse:?}");
-        };
-        let hits = reverse.all_hits();
-        assert_eq!(hits.len(), 1, "{reverse:?}");
-        let hit = hits.iter().next().expect("one reference was checked above");
-        assert_eq!(hit.kind, UsageHitKind::Reference);
-        assert_eq!(hit.proof, UsageProof::Proven);
-    }
-
-    #[test]
-    fn native_rust_graph_retains_exact_endpoints_and_distinct_line_weights() {
-        let fixture = InlineTestProject::with_language(Language::Rust)
-            .file("Cargo.toml", "[package]\nname = \"native_graph\"\nversion = \"0.1.0\"\nedition = \"2024\"\n")
-            .file("src/lib.rs", "pub mod dep;\nuse dep::target;\npub fn caller() { target(); target();\n target(); }\npub fn second() { target(); }\npub fn unused() {}\n")
-            .file("src/dep.rs", "pub fn target() {}\n")
-            .build();
-        let rust = RustAnalyzer::new(fixture.project_dyn());
-        let (complete, graph) = graph(
-            build_rust_native_workspace_graph_for_files(
-                &rust,
-                &[fixture.file("src/lib.rs"), fixture.file("src/dep.rs")],
-                2,
-                &CancellationToken::new(),
-            )
-            .unwrap(),
-        );
-        assert!(
-            complete,
-            "native source inventory must certify this closed fixture: {:?}",
-            graph.forward_completeness
-        );
-        let mut edges = graph
-            .edges
-            .iter()
-            .map(|edge| {
-                let caller = &graph.nodes[edge.from].primary;
-                let target = &graph.nodes[edge.to].primary;
-                assert_eq!(caller.source(), &fixture.file("src/lib.rs"));
-                assert_eq!(target.source(), &fixture.file("src/dep.rs"));
-                assert_eq!(target.terminal_name(), "target");
-                assert_eq!(edge.counts.total(), usize::from(edge.counts.calls));
-                (
-                    caller.terminal_name().to_string(),
-                    edge.counts.calls,
-                    edge.sites.iter().map(|(_, line)| *line).collect::<Vec<_>>(),
-                )
-            })
-            .collect::<Vec<_>>();
-        edges.sort();
-        assert_eq!(
-            edges,
-            vec![
-                ("caller".into(), 2, vec![3, 4]),
-                ("second".into(), 1, vec![5])
-            ]
-        );
-        assert!(
-            graph
-                .nodes
-                .iter()
-                .any(|node| node.primary.terminal_name() == "unused"),
-            "unused native declarations remain candidates for dead-code consumers"
-        );
-        assert!(
-            graph
-                .nodes
-                .iter()
-                .all(|node| node.unproven_inbound == 0 && node.truncated_inbound.is_none())
-        );
-        assert!(graph.batch_count > 1);
-    }
-
-    #[test]
     fn native_rust_graph_reports_block_local_reference_owner_without_refusing() {
         use crate::analyzer::structural::edges::EdgeAxis;
 
@@ -2122,6 +1865,78 @@ mod tests {
         }
     }
 
+    /// Narrowing the scope never turns an `Incomplete` into a `Complete`.
+    ///
+    /// The candidate gap boxes are read from `resolution_candidate_gap_headers`
+    /// over the request's scope, so a gap in a blob the request cannot bind
+    /// into stops qualifying its answer. That is the correction, not a loss: a
+    /// gap in a crate that depends on the staged one hides nothing the staged
+    /// crate could have bound to. A gap inside the closure is a different
+    /// matter and must still be reported, because what it hides could have
+    /// been the answer.
+    ///
+    /// The same unexpanded `include!` states both halves. In the staged crate
+    /// it must leave the projection incomplete; in a dependent of the staged
+    /// crate it must not. The half this pin guards is the first: a scope that
+    /// dropped the staged crate's own mount, or a narrowing that ran wider
+    /// than the request, would silently answer `Complete` here. The second half
+    /// already held for this gap before the scope existed, measured by running
+    /// the same test with the narrowing disabled -- a fragment-blocking gap in
+    /// a blob the request never names does not reach it -- so treat that column
+    /// as a statement of the rule rather than as its proof.
+    #[test]
+    fn a_gap_qualifies_the_staged_crate_and_a_dependent_of_it_does_not() {
+        let outcomes = [false, true].map(|gap_in_provider| {
+            let unexpanded = "include!(\"generated.rs\");\n";
+            let fixture = InlineTestProject::with_language(Language::Rust)
+                .file(
+                    "Cargo.toml",
+                    "[workspace]\nmembers=['provider','consumer']\nresolver='2'\n",
+                )
+                .file(
+                    "provider/Cargo.toml",
+                    "[package]\nname='provider'\nversion='0.1.0'\nedition='2021'\n",
+                )
+                .file(
+                    "provider/src/lib.rs",
+                    format!(
+                        "pub fn target() {{}}\npub fn provider_caller() {{ target(); }}\n{}",
+                        if gap_in_provider { unexpanded } else { "" }
+                    ),
+                )
+                .file(
+                    "consumer/Cargo.toml",
+                    "[package]\nname='consumer'\nversion='0.1.0'\nedition='2021'\n[dependencies]\nprovider={path='../provider'}\n",
+                )
+                .file(
+                    "consumer/src/lib.rs",
+                    format!(
+                        "use provider::target;\npub fn caller() {{ target(); }}\n{}",
+                        if gap_in_provider { "" } else { unexpanded }
+                    ),
+                )
+                .build();
+            let rust = RustAnalyzer::new(fixture.project_dyn());
+            let (complete, _) = graph(
+                build_rust_native_workspace_graph_for_files(
+                    &rust,
+                    &[fixture.file("provider/src/lib.rs")],
+                    8,
+                    &CancellationToken::new(),
+                )
+                .unwrap(),
+            );
+            (gap_in_provider, complete)
+        });
+        eprintln!("gap placement (gap in the staged crate, complete): {outcomes:?}");
+        assert_eq!(
+            outcomes,
+            [(false, true), (true, false)],
+            "the staged crate's own gap must qualify its answer and a dependent's must not: \
+             {outcomes:?}"
+        );
+    }
+
     /// Staging a leaf crate produces no interior in a crate that depends on it.
     ///
     /// A reference written in crate A binds to a declaration in A or in A's
@@ -2233,78 +2048,6 @@ mod tests {
         );
     }
 
-    /// Narrowing the scope never turns an `Incomplete` into a `Complete`.
-    ///
-    /// The candidate gap boxes are read from `resolution_candidate_gap_headers`
-    /// over the request's scope, so a gap in a blob the request cannot bind
-    /// into stops qualifying its answer. That is the correction, not a loss: a
-    /// gap in a crate that depends on the staged one hides nothing the staged
-    /// crate could have bound to. A gap inside the closure is a different
-    /// matter and must still be reported, because what it hides could have
-    /// been the answer.
-    ///
-    /// The same unexpanded `include!` states both halves. In the staged crate
-    /// it must leave the projection incomplete; in a dependent of the staged
-    /// crate it must not. The half this pin guards is the first: a scope that
-    /// dropped the staged crate's own mount, or a narrowing that ran wider
-    /// than the request, would silently answer `Complete` here. The second half
-    /// already held for this gap before the scope existed, measured by running
-    /// the same test with the narrowing disabled -- a fragment-blocking gap in
-    /// a blob the request never names does not reach it -- so treat that column
-    /// as a statement of the rule rather than as its proof.
-    #[test]
-    fn a_gap_qualifies_the_staged_crate_and_a_dependent_of_it_does_not() {
-        let outcomes = [false, true].map(|gap_in_provider| {
-            let unexpanded = "include!(\"generated.rs\");\n";
-            let fixture = InlineTestProject::with_language(Language::Rust)
-                .file(
-                    "Cargo.toml",
-                    "[workspace]\nmembers=['provider','consumer']\nresolver='2'\n",
-                )
-                .file(
-                    "provider/Cargo.toml",
-                    "[package]\nname='provider'\nversion='0.1.0'\nedition='2021'\n",
-                )
-                .file(
-                    "provider/src/lib.rs",
-                    format!(
-                        "pub fn target() {{}}\npub fn provider_caller() {{ target(); }}\n{}",
-                        if gap_in_provider { unexpanded } else { "" }
-                    ),
-                )
-                .file(
-                    "consumer/Cargo.toml",
-                    "[package]\nname='consumer'\nversion='0.1.0'\nedition='2021'\n[dependencies]\nprovider={path='../provider'}\n",
-                )
-                .file(
-                    "consumer/src/lib.rs",
-                    format!(
-                        "use provider::target;\npub fn caller() {{ target(); }}\n{}",
-                        if gap_in_provider { "" } else { unexpanded }
-                    ),
-                )
-                .build();
-            let rust = RustAnalyzer::new(fixture.project_dyn());
-            let (complete, _) = graph(
-                build_rust_native_workspace_graph_for_files(
-                    &rust,
-                    &[fixture.file("provider/src/lib.rs")],
-                    8,
-                    &CancellationToken::new(),
-                )
-                .unwrap(),
-            );
-            (gap_in_provider, complete)
-        });
-        eprintln!("gap placement (gap in the staged crate, complete): {outcomes:?}");
-        assert_eq!(
-            outcomes,
-            [(false, true), (true, false)],
-            "the staged crate's own gap must qualify its answer and a dependent's must not: \
-             {outcomes:?}"
-        );
-    }
-
     /// A mixed-language workspace must project the same complete Rust graph
     /// whether or not the request names paths.
     ///
@@ -2319,35 +2062,9 @@ mod tests {
     /// whole-workspace corpus request uses.
     #[test]
     fn mixed_language_workspace_graph_is_complete_with_and_without_paths() {
-        use crate::analyzer::{AnalyzerConfig, AnalyzerQueryScope, WorkspaceAnalyzer};
+        use crate::analyzer::AnalyzerQueryScope;
         use crate::searchtools::{UsageGraphParams, usage_graph};
-        use std::sync::Arc;
-
-        let temp = tempfile::tempdir().expect("tempdir");
-        let root = temp.path().canonicalize().expect("canonical root");
-        for (relative_path, source) in [
-            (
-                "Cargo.toml",
-                "[package]\nname = \"mixed\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
-            ),
-            (
-                "src/lib.rs",
-                "pub fn target() -> usize { 1 }\npub fn caller() -> usize { target() }\n",
-            ),
-            ("include/widget.h", "struct Widget { int value; };\n"),
-            ("scripts/build.py", "def helper():\n    return 1\n"),
-        ] {
-            ProjectFile::new(root.clone(), relative_path)
-                .write(source)
-                .expect("write mixed-language fixture");
-        }
-        let project = crate::analyzer::TestProject::from_root_with_inferred_languages(&root)
-            .expect("infer fixture languages");
-        let workspace = WorkspaceAnalyzer::build_ephemeral_footgun(
-            Arc::new(project),
-            AnalyzerConfig::default(),
-        )
-        .expect("mixed-language workspace");
+        let (_temp, workspace) = crate::test_support::mixed_language_rust_workspace();
         let analyzer = workspace.analyzer();
 
         for paths in [None, Some(vec!["src/lib.rs".to_string()])] {

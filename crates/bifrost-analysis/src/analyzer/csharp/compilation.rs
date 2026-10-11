@@ -8,6 +8,7 @@
 //! without presenting it as authoritative.
 
 use crate::analyzer::canonical_hash::CanonicalHasher;
+use crate::analyzer::common::local_xml_name;
 use crate::analyzer::semantic::ids::StableDigest;
 use crate::analyzer::{Project, ProjectFile};
 use crate::hash::{HashMap, HashSet};
@@ -87,7 +88,9 @@ impl CSharpCompilationIndex {
         let mut hasher = CanonicalHasher::new(CONFIG_IDENTITY_DOMAIN);
         let mut digest_available = !config_limit_exceeded;
         for file in &config_files {
-            let Some(source) = read_bounded_source(project, file) else {
+            let Some(source) =
+                crate::analyzer::common::read_bounded_source(project, file, MAX_PROJECT_BYTES)
+            else {
                 digest_available = false;
                 complete = false;
                 unresolved.insert(file.clone());
@@ -119,7 +122,11 @@ impl CSharpCompilationIndex {
 
         let mut memberships: HashMap<ProjectFile, Vec<usize>> = HashMap::default();
         for (compilation, project_file) in project_files.iter().enumerate() {
-            let Some(source) = read_bounded_source(project, project_file) else {
+            let Some(source) = crate::analyzer::common::read_bounded_source(
+                project,
+                project_file,
+                MAX_PROJECT_BYTES,
+            ) else {
                 complete = false;
                 unresolved.insert(project_file.clone());
                 continue;
@@ -631,16 +638,6 @@ fn attribute<'a>(attributes: &'a [(String, String)], name: &str) -> Option<&'a s
         .map(|(_, value)| value.as_str())
 }
 
-fn local_xml_name(name: &[u8]) -> Option<String> {
-    let name = std::str::from_utf8(name).ok()?;
-    Some(
-        name.rsplit_once(':')
-            .map(|(_, local)| local)
-            .unwrap_or(name)
-            .to_owned(),
-    )
-}
-
 fn static_item_path(path: &str) -> bool {
     let path = path.trim();
     !path.is_empty()
@@ -683,13 +680,6 @@ fn sorted_intersects(left: &[usize], right: &[usize]) -> bool {
         }
     }
     false
-}
-
-fn read_bounded_source(project: &dyn Project, file: &ProjectFile) -> Option<String> {
-    project
-        .read_source_limited(file, MAX_PROJECT_BYTES)
-        .ok()
-        .flatten()
 }
 
 fn has_extension(path: &Path, expected: &str) -> bool {

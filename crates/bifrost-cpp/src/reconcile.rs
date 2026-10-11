@@ -140,6 +140,7 @@ fn join_namespace(namespace: &str, extra_segments: &[&str]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use brokk_bifrost_test_macros::hardwon;
 
     fn identity(package: &str, owner_chain: &str, member: &str) -> ReconciledIdentity {
         ReconciledIdentity {
@@ -155,6 +156,7 @@ mod tests {
     /// table confirms `log4cxx::Outer::Inner`, so the whole qualifier is a class
     /// chain under `log4cxx`, not a namespace path.
     #[test]
+    #[hardwon("#1134: out-of-line nested C++ members were assigned the wrong namespace")]
     fn file_scope_using_directive_shape_recovers_namespace_and_chain() {
         let table = [
             VisibleClass {
@@ -183,6 +185,7 @@ mod tests {
     /// splitter mis-reads `Outer` as a namespace. The class table confirms
     /// `ns::Outer::Inner`, folding `Outer` back into the class chain.
     #[test]
+    #[hardwon("#1134: template-specialized nested C++ members were assigned the wrong owner")]
     fn template_shape_inside_namespace_block_folds_outer_into_chain() {
         let table = [VisibleClass {
             package: "ns",
@@ -199,6 +202,7 @@ mod tests {
     /// segments. Reconciliation confirms the namespace reading unchanged -- it
     /// must never corrupt the owner into `ns1$ns2$Klass`.
     #[test]
+    #[hardwon("#1134: real namespace segments were mistaken for class nesting")]
     fn genuine_namespace_chain_keeps_namespace_reading() {
         let table = [VisibleClass {
             package: "ns1::ns2",
@@ -216,6 +220,7 @@ mod tests {
     /// Deepest confirmed nesting wins: when both a shallow and a deep reading are
     /// visible, the deeper class chain is the more specific true identity.
     #[test]
+    #[hardwon("#1134: nested owner reconciliation preferred a shallower class chain")]
     fn prefers_longest_confirmed_class_chain() {
         let table = [
             VisibleClass {
@@ -235,6 +240,7 @@ mod tests {
     /// Nothing visible confirms any reading: leave the provisional identity
     /// untouched (caller keeps today's behavior).
     #[test]
+    #[hardwon("#1134: unconfirmed class identities were fabricated from qualifiers")]
     fn no_visible_class_returns_none() {
         let reconciled = reconcile_out_of_line_member_identity(
             &["Outer", "Inner"],
@@ -248,6 +254,7 @@ mod tests {
     /// Two visible classes confirm distinct readings at the same (deepest)
     /// nesting depth -- genuinely ambiguous, so refuse rather than guess.
     #[test]
+    #[hardwon("#1134: equally deep visible owner readings were guessed instead of refused")]
     fn ambiguous_equal_depth_readings_return_none() {
         let table = [
             VisibleClass {
@@ -270,6 +277,7 @@ mod tests {
 
     /// Empty owner segments or empty member name cannot name a member.
     #[test]
+    #[hardwon("#1134: empty owner inputs fabricated an out-of-line member identity")]
     fn degenerate_inputs_return_none() {
         assert_eq!(
             reconcile_out_of_line_member_identity(&[], "method", &["ns"], &[]),

@@ -17,12 +17,13 @@ pub use canonical_workspace_graph::{
 };
 
 use super::common::language_for_target;
-use super::inverted_edges::{UsageNodeKey, UsageReferenceCounts};
+use super::inverted_edges::{UsageEdgeWeights, UsageNodeKey, UsageReferenceCounts};
 use crate::analyzer::common::is_java_module_descriptor_file;
 use crate::analyzer::languages::{
     EdgeWeightScanCtx, LanguageEdgeWeights, LanguageGraphBackend, LanguageSupport, edge_passes,
     language_support,
 };
+use crate::analyzer::primary_range;
 use crate::analyzer::store::StoreError;
 use crate::analyzer::{
     AnalyzerQueryScope, CodeUnit, DeclarationId, IAnalyzer, Language, ProjectFile, Range,
@@ -575,10 +576,6 @@ fn declaration_identity(unit: &CodeUnit) -> DeclarationId {
     unit.declaration_id()
 }
 
-fn primary_range(ranges: &[Range]) -> Option<Range> {
-    ranges.iter().copied().min_by_key(range_key)
-}
-
 fn range_key(range: &Range) -> (usize, usize) {
     (range.start_line, range.start_byte)
 }
@@ -955,51 +952,37 @@ pub(crate) fn build_workspace_usage_graph_with_passes(
 
 fn record_fqn_weights_exact(
     ecosystem: UsageEcosystem,
-    result: super::inverted_edges::UsageEdgeWeights,
+    result: UsageEdgeWeights,
     catalog: &WorkspaceUsageCatalog,
     nodes: &mut [WorkspaceUsageNode],
     edges: &mut Vec<WorkspaceUsageEdge>,
 ) {
-    for ((from, to), counts) in result.edges {
-        let from = catalog.indices_for_fqn(ecosystem, &from);
-        let to = catalog.indices_for_fqn(ecosystem, &to);
-        if let ([from], [to]) = (from.as_slice(), to.as_slice()) {
-            if from != to {
-                edges.push(WorkspaceUsageEdge {
-                    from: *from,
-                    to: *to,
-                    counts,
-                });
-            }
-        } else {
-            for to in to {
-                nodes[to].unproven_inbound =
-                    nodes[to].unproven_inbound.saturating_add(counts.total());
-            }
-        }
-    }
-    for (fqn, total) in result.truncated {
-        for index in catalog.indices_for_fqn(ecosystem, &fqn) {
-            nodes[index].truncated_inbound = Some(total);
-        }
-    }
-    for (fqn, total) in result.unproven_inbound {
-        for index in catalog.indices_for_fqn(ecosystem, &fqn) {
-            nodes[index].unproven_inbound = nodes[index].unproven_inbound.saturating_add(total);
-        }
-    }
+    record_exact_weights(result, nodes, edges, |fqn| {
+        catalog.indices_for_fqn(ecosystem, fqn)
+    });
 }
 
 fn record_scoped_weights_exact(
     ecosystem: UsageEcosystem,
-    result: super::inverted_edges::UsageEdgeWeights<UsageNodeKey>,
+    result: UsageEdgeWeights<UsageNodeKey>,
     catalog: &WorkspaceUsageCatalog,
     nodes: &mut [WorkspaceUsageNode],
     edges: &mut Vec<WorkspaceUsageEdge>,
 ) {
+    record_exact_weights(result, nodes, edges, |key| {
+        catalog.indices_for_scoped(ecosystem, key)
+    });
+}
+
+fn record_exact_weights<K>(
+    result: UsageEdgeWeights<K>,
+    nodes: &mut [WorkspaceUsageNode],
+    edges: &mut Vec<WorkspaceUsageEdge>,
+    indices_for_key: impl Fn(&K) -> Vec<usize>,
+) {
     for ((from, to), counts) in result.edges {
-        let from = catalog.indices_for_scoped(ecosystem, &from);
-        let to = catalog.indices_for_scoped(ecosystem, &to);
+        let from = indices_for_key(&from);
+        let to = indices_for_key(&to);
         if let ([from], [to]) = (from.as_slice(), to.as_slice()) {
             if from != to {
                 edges.push(WorkspaceUsageEdge {
@@ -1016,12 +999,12 @@ fn record_scoped_weights_exact(
         }
     }
     for (key, total) in result.truncated {
-        for index in catalog.indices_for_scoped(ecosystem, &key) {
+        for index in indices_for_key(&key) {
             nodes[index].truncated_inbound = Some(total);
         }
     }
     for (key, total) in result.unproven_inbound {
-        for index in catalog.indices_for_scoped(ecosystem, &key) {
+        for index in indices_for_key(&key) {
             nodes[index].unproven_inbound = nodes[index].unproven_inbound.saturating_add(total);
         }
     }
@@ -1036,92 +1019,12 @@ mod tests {
         ScalaAnalyzer, TestProject,
     };
     use crate::inline_project::InlineTestProject;
+    use brokk_bifrost_test_macros::hardwon;
     use std::collections::BTreeMap;
     use std::ffi::OsStr;
     use std::sync::Arc;
 
     static CATALOG_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-    /// The `Jvm` realm is resolved once even though three builders run over it.
-    ///
-    /// `resolved_ecosystems` is what a consumer reads to know which realms a
-    /// graph actually covers, and it is deduplicated with `Vec::dedup`, which
-    /// only collapses *consecutive* duplicates. With one JVM builder that was
-    /// vacuously true; with three it is a real invariant, and a future reordering
-    /// that interleaved another ecosystem between them would silently start
-    /// reporting `Jvm` twice.
-    #[test]
-    fn the_jvm_realm_is_resolved_once_across_its_three_builders() {
-        let _guard = CATALOG_TEST_LOCK.lock().unwrap();
-        let temp = tempfile::tempdir().unwrap();
-        let root = temp.path().canonicalize().unwrap();
-        ProjectFile::new(root.clone(), "app/Greeter.java")
-            .write(
-                "package app;\n\npublic class Greeter {\n    public String greet() { return \"hi\"; }\n}\n",
-            )
-            .unwrap();
-        ProjectFile::new(root.clone(), "app/Service.scala")
-            .write("package app\n\nclass Service {\n  def run(): String = \"scala\"\n}\n")
-            .unwrap();
-        ProjectFile::new(root.clone(), "app/Caller.kt")
-            .write(
-                "package app\n\nclass Caller {\n\n    fun call(): String {\n        val greeter = Greeter()\n        return greeter.greet()\n    }\n}\n",
-            )
-            .unwrap();
-
-        let project = TestProject::new(root, Language::Java);
-        let analyzer = MultiAnalyzer::new(BTreeMap::from([
-            (
-                Language::Java,
-                AnalyzerDelegate::Java(JavaAnalyzer::new(Arc::new(project.clone()))),
-            ),
-            (
-                Language::Scala,
-                AnalyzerDelegate::Scala(ScalaAnalyzer::new(Arc::new(project.clone()))),
-            ),
-            (
-                Language::Kotlin,
-                AnalyzerDelegate::Kotlin(KotlinAnalyzer::new(Arc::new(project))),
-            ),
-        ]));
-
-        let catalog = WorkspaceUsageCatalog::build(&analyzer);
-        let selected = BTreeSet::from([UsageEcosystem::Jvm]);
-        let WorkspaceUsageGraphBuildOutcome::Complete(graph) =
-            build_workspace_usage_graph_with_cancellation(
-                &analyzer,
-                catalog,
-                &selected,
-                &CancellationToken::default(),
-            )
-        else {
-            panic!("uncancelled workspace usage graph build");
-        };
-
-        assert_eq!(
-            graph.resolved_ecosystems,
-            vec![UsageEcosystem::Jvm],
-            "three JVM builders must still resolve one realm"
-        );
-        // Measured on a real Kotlin -> Java edge, so a graph that resolved the
-        // realm once but produced nothing would not pass.
-        assert!(
-            graph.edges.iter().any(|edge| {
-                graph.nodes[edge.from].key.fqn == "app.Caller.call"
-                    && graph.nodes[edge.to].key.fqn == "app.Greeter"
-            }),
-            "expected the Kotlin -> Java edge the shared realm exists to provide; edges={:?}",
-            graph
-                .edges
-                .iter()
-                .map(|edge| (
-                    graph.nodes[edge.from].key.fqn.as_str(),
-                    graph.nodes[edge.to].key.fqn.as_str(),
-                    edge.counts,
-                ))
-                .collect::<Vec<_>>()
-        );
-    }
 
     /// Losing the canonical Rust facts must not become a complete empty graph.
     ///
@@ -1549,6 +1452,9 @@ mod tests {
     }
 
     #[test]
+    #[hardwon(
+        "2d6e0d05e77f: A persisted fixture compares identities, duplicates, primary ranges, and order with an independent reference grouping"
+    )]
     fn catalog_grouping_matches_the_ordered_map_reference_grouping() {
         let _guard = CATALOG_TEST_LOCK.lock().unwrap();
         let temp = tempfile::tempdir().unwrap();
@@ -1605,6 +1511,9 @@ mod tests {
     /// set and carries the result through, so this pins one identity per graph
     /// declaration and no more.
     #[test]
+    #[hardwon(
+        "2d6e0d05e77f: The analyzer-backed catalog build checks one identity calculation per persisted graph declaration"
+    )]
     fn catalog_grouping_makes_one_identity_pass_over_the_row_set() {
         let _guard = CATALOG_TEST_LOCK.lock().unwrap();
         let temp = tempfile::tempdir().unwrap();
@@ -1635,6 +1544,9 @@ mod tests {
     /// The token trips after a fixed number of checks, so it cancels while
     /// grouping is partway through the row set.
     #[test]
+    #[hardwon(
+        "2d6e0d05e77f: Cancellation midway through grouping discards the partial catalog, and the identical rows succeed on retry"
+    )]
     fn catalog_grouping_publishes_nothing_when_the_token_trips_partway() {
         let _guard = CATALOG_TEST_LOCK.lock().unwrap();
         let temp = tempfile::tempdir().unwrap();

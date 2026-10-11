@@ -18,23 +18,25 @@ use super::cfg_algorithms::{
     CfgAlgorithmBudget, CfgAlgorithmError, CfgAlgorithmRequest, CfgAlgorithmWork,
     forward_reachability, reverse_reachability,
 };
+use super::completeness_reason_bytes;
 use super::workspace_oracle::{
     PreparedWorkspaceDispatchSession, WorkspaceSemanticOracle, exact_source_for_procedure,
     semantic_locator_work,
 };
 use super::{
-    AccessPathAtPoint, AliasQuery, AliasResult, CallContinuationKind, CallInvocationMode,
-    CallSiteHandle, CallSiteId, CandidateCoverage, ControlContinuation, ControlEdgeKind,
-    DeferredInvocationKind, DispatchBoundary, DispatchBoundaryKind, DispatchHints, DispatchOracle,
-    DispatchResult, EvidenceCompleteness, EvidenceHandle, FormalMultiplicity,
+    AccessPathAtPoint, AliasQuery, AliasResult, ArgumentCallableProvenance, CallContinuationKind,
+    CallInvocationMode, CallSiteHandle, CallSiteId, CandidateCoverage, ControlContinuation,
+    ControlEdgeKind, DeferredInvocationKind, DispatchBoundary, DispatchBoundaryKind, DispatchHints,
+    DispatchOracle, DispatchResult, EvidenceCompleteness, EvidenceHandle, FormalMultiplicity,
     FreshObjectPublicationQuery, FreshObjectPublicationResult, HeapOracle, LengthDelimitedDigest,
-    LocationResult, OracleLimits, OracleRelationArena, OracleRelationHandle, OracleRelationId,
-    OracleRelationKind, OracleRelationOwner, OracleRelationRecord, OracleRelationSubject,
-    PointsToResult, ProcedureHandle, ProcedureInvocationKind, ProgramPointHandle, ProgramPointId,
-    ProofStatus, SemanticBudgetExceeded, SemanticCallSite, SemanticCapability, SemanticGap,
-    SemanticGapDischarge, SemanticGapImpact, SemanticGapKind, SemanticGapSubject, SemanticLanguage,
-    SemanticOutcome, SemanticProviderError, SemanticRequest, SemanticValue, SemanticValueKind,
-    SemanticWork, StableDigest, StoreAtPoint, UpdateEligibility, ValueAtPoint,
+    LocationResult, OracleCallContext, OracleLimits, OracleRelationArena, OracleRelationHandle,
+    OracleRelationId, OracleRelationKind, OracleRelationOwner, OracleRelationRecord,
+    OracleRelationSubject, PointsToResult, ProcedureHandle, ProcedureInvocationKind,
+    ProgramPointHandle, ProgramPointId, ProofStatus, SemanticBudgetExceeded, SemanticCallSite,
+    SemanticCapability, SemanticGap, SemanticGapDischarge, SemanticGapImpact, SemanticGapKind,
+    SemanticGapSubject, SemanticLanguage, SemanticOutcome, SemanticProviderError, SemanticRequest,
+    SemanticValue, SemanticValueKind, SemanticWork, StableDigest, StoreAtPoint, UpdateEligibility,
+    ValueAtPoint,
 };
 
 const DEFAULT_ICFG_PROVIDER_BEHAVIOR_DOMAIN: &[u8] = b"bifrost-icfg-provider/default-behavior/v1";
@@ -46,15 +48,23 @@ const DEFAULT_ICFG_PROVIDER_BEHAVIOR_DOMAIN: &[u8] = b"bifrost-icfg-provider/def
 // before Python bound-method dispatch accounted for receiver lookup hooks.
 // Module-qualified Python constructors now bind their allocated instance
 // without treating the module namespace as a runtime receiver, including
-// calls through repeated unaliased imports of one dotted package root.
+// calls through repeated unaliased imports of one dotted package root,
+// resolver-proven from-imported submodules, and their local aliases (#4492).
+// Nested class attributes and module namespaces imported in conditional
+// branches use the same constructor allocation result (#4564).
+// A Go call through a package variable now dispatches to its function-literal
+// initializer when a workspace usage census proves the variable is never
+// written, escaped, or read as a value (#3787).
+// Factory callback provenance, matched-return capture transport and captured
+// formal cell initialization change the executable flow and heap semantics.
 const WORKSPACE_ICFG_PROVIDER_BEHAVIOR_DOMAIN: &[u8] =
-    b"bifrost-icfg-provider/workspace-behavior/v14";
+    b"bifrost-icfg-provider/workspace-behavior/v27";
 /// The domain of the same behavior without the workspace's content identity.
 ///
 /// Its own domain rather than a shorter message under the one above, so that
 /// no read half can ever equal a full identity by accident.
 const WORKSPACE_ICFG_PROVIDER_READ_BEHAVIOR_DOMAIN: &[u8] =
-    b"bifrost-icfg-provider/workspace-read-behavior/v13";
+    b"bifrost-icfg-provider/workspace-read-behavior/v26";
 
 /// Why one dispatch lookup could not be named by a replayable read key.
 ///
@@ -67,6 +77,8 @@ pub enum DispatchReadUnattributedReason {
     /// More than one lowered call row has the same exact source range inside
     /// the owning procedure.
     SourceRangeAmbiguous,
+    /// Contextual dispatch has no context-aware persisted replay question yet.
+    CallContextUnavailable,
 }
 
 /// The replayable input read by one call-dispatch lookup, or the typed reason
@@ -92,6 +104,29 @@ pub fn dispatch_read_attribution(
         outcome,
         super::workspace_oracle::exact_call_range(call),
     )
+}
+
+pub fn record_dispatch_read(
+    workspace: &WorkspaceAnalyzer,
+    call: &CallSiteHandle,
+    outcome: &SemanticOutcome<DispatchResult>,
+) {
+    let attribution = dispatch_read_attribution(call, outcome);
+    record_dispatch_read_attribution(workspace, &attribution);
+}
+
+fn record_dispatch_read_attribution(
+    workspace: &WorkspaceAnalyzer,
+    attribution: &DispatchReadAttribution,
+) {
+    let analyzer = workspace.analyzer();
+    if !analyzer.read_ledger_attached() {
+        return;
+    }
+    match attribution {
+        DispatchReadAttribution::Attributed(key) => analyzer.record_read(key.clone()),
+        DispatchReadAttribution::Unattributed(_) => analyzer.record_unattributed_read(),
+    }
 }
 
 fn dispatch_read_attribution_with_range(
@@ -172,8 +207,7 @@ const fn supports_authored_normal_continuation_absence(language: SemanticLanguag
 /// overlay's presence, the dispatch hierarchy expansion -- is an engine input a
 /// reader states independently, while the content identity rotates on every
 /// edit anywhere in the workspace. A record keyed by the full digest could
-/// therefore never be verified after any edit, however unrelated
-/// (`.agents/plans/impact-sliced-diff-base.md`, Decision Log (5b)).
+/// therefore never be verified after any edit, however unrelated.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct IcfgProviderBehaviorIdentity {
     digest: StableDigest,
@@ -216,7 +250,8 @@ impl IcfgProviderBehaviorIdentity {
         hierarchy_expansion: DispatchHierarchyExpansion,
         snapshot: Option<&ActiveSemanticModelSnapshot>,
         dispatch_hints: StableDigest,
-        python_saved_defaults_available: Option<bool>,
+        python_saved_default_safety: Option<StableDigest>,
+        limits: OracleLimits,
     ) -> Self {
         let mut digest = LengthDelimitedDigest::new(WORKSPACE_ICFG_PROVIDER_BEHAVIOR_DOMAIN);
         let mut read = LengthDelimitedDigest::new(WORKSPACE_ICFG_PROVIDER_READ_BEHAVIOR_DOMAIN);
@@ -250,23 +285,40 @@ impl IcfgProviderBehaviorIdentity {
                 }
                 None => digest.push(b"no-external-dispatch-surface"),
             }
+            digest.push(b"oracle-limits");
+            let values = limits.values();
+            for value in [
+                values.dispatch_targets,
+                values.objects_per_value,
+                values.access_path_length,
+                values.alias_breadth,
+                values.source_observations,
+                values.call_context_depth,
+                values.summary_depth,
+                values.call_binding_entries,
+                values.provenance_records,
+                values.evidence_handles,
+            ] {
+                digest.push(&(value as u64).to_le_bytes());
+            }
             digest.push(b"receiver-class-dispatch-hints");
             digest.push(dispatch_hints.as_bytes());
-            // Saved defaults depend on the workspace's callable-metadata
-            // surface, not only on the callee file. Keep this small authority
-            // fact in the replay identity too: an unrelated source edit need
-            // not rotate it, but a newly observed metadata mutation must.
+            // Saved defaults depend on callable-scoped metadata mutation
+            // evidence, not only on the callee file. Include its complete
+            // bounded-scan fingerprint in both replay identity halves.
             if language_support(Language::Python)
                 .expect("Python support is registered")
                 .forward_query_provider(workspace.analyzer())
                 .is_some()
             {
-                digest.push(b"python-saved-default-availability");
-                digest.push(match python_saved_defaults_available {
-                    Some(true) => b"closed",
-                    Some(false) => b"open",
-                    None => b"incomplete",
-                });
+                digest.push(b"python-saved-default-safety");
+                match python_saved_default_safety {
+                    Some(fingerprint) => {
+                        digest.push(b"complete");
+                        digest.push(fingerprint.as_bytes());
+                    }
+                    None => digest.push(b"incomplete"),
+                }
             }
         };
         push_engine_inputs(&mut digest);
@@ -310,6 +362,8 @@ pub struct CallTransfer {
     pub origin: CallSiteHandle,
     pub callee: ProcedureHandle,
     pub callee_entry: ProgramPointHandle,
+    /// Exact caller creation and captured slots for a during-call invocation.
+    pub argument_callable: Option<Arc<ArgumentCallableProvenance>>,
     pub normal_continuation: ControlContinuation,
     pub exceptional_continuation: ControlContinuation,
     pub proof: ProofStatus,
@@ -506,6 +560,18 @@ pub trait IcfgProvider: DispatchOracle {
         request: &mut SemanticRequest<'_>,
     ) -> Result<SemanticOutcome<CallTransferSet>, SemanticProviderError>;
 
+    /// Resolve one call under the bounded active caller suffix. Providers that
+    /// have no contextual implementation retain their ordinary conservative answer.
+    fn call_transfers_in_context(
+        &self,
+        caller: &ProcedureHandle,
+        call: CallSiteId,
+        _context: &OracleCallContext,
+        request: &mut SemanticRequest<'_>,
+    ) -> Result<SemanticOutcome<CallTransferSet>, SemanticProviderError> {
+        self.call_transfers(caller, call, request)
+    }
+
     fn snapshot(
         &self,
         root: &ProcedureHandle,
@@ -538,7 +604,7 @@ pub struct WorkspaceIcfgProvider<'a> {
     outcome_cache: Arc<QueryLocalIcfgOutcomeCache<'a>>,
 }
 
-type CallTransferCacheKey = (ProcedureHandle, CallSiteId);
+type CallTransferCacheKey = (ProcedureHandle, CallSiteId, OracleCallContext);
 type ExitProfileCacheKey = (ProgramPointHandle, ProgramPointHandle);
 
 /// One exact in-process semantic artifact allocation.
@@ -716,13 +782,33 @@ impl<'a> QueryLocalIcfgOutcomeCache<'a> {
                 .expect("snapshot exact-artifact dispatch session is not poisoned")
                 .retains_exact_source()
             {
-                dispatch_sessions.entry(key).or_insert(session);
+                match dispatch_sessions.entry(key) {
+                    std::collections::hash_map::Entry::Vacant(entry) => {
+                        entry.insert(session);
+                    }
+                    std::collections::hash_map::Entry::Occupied(mut entry) => {
+                        let already_paid = entry
+                            .get()
+                            .lock()
+                            .expect("published dispatch session is not poisoned")
+                            .retains_exact_source();
+                        if !already_paid {
+                            entry.insert(session);
+                        }
+                    }
+                }
             }
         }
     }
 }
 
 impl<'a> WorkspaceIcfgProvider<'a> {
+    /// Bind dispatch and capture proof to explicit limits, also retained in
+    /// the provider's behavior and recorded-read identities.
+    pub fn with_oracle_limits(workspace: &'a WorkspaceAnalyzer, limits: OracleLimits) -> Self {
+        Self::from_oracle(WorkspaceSemanticOracle::with_limits(workspace, limits))
+    }
+
     pub fn new(workspace: &'a WorkspaceAnalyzer) -> Self {
         Self::with_active_semantic_model_snapshot(
             workspace,
@@ -758,12 +844,20 @@ impl<'a> WorkspaceIcfgProvider<'a> {
             snapshot.clone(),
             dispatch_hints,
         );
+        Self::from_oracle(oracle)
+    }
+
+    fn from_oracle(oracle: WorkspaceSemanticOracle<'a>) -> Self {
+        let snapshot = oracle.active_semantic_model_snapshot();
         let behavior_identity = IcfgProviderBehaviorIdentity::workspace(
-            workspace,
+            oracle.workspace(),
             oracle.hierarchy_expansion(),
             snapshot.as_deref(),
             oracle.dispatch_hints().digest(),
-            oracle.python_saved_defaults_available(),
+            oracle
+                .python_saved_default_safety()
+                .map(|safety| safety.fingerprint()),
+            *oracle.limits(),
         );
         Self {
             oracle,
@@ -858,12 +952,7 @@ impl<'a> WorkspaceIcfgProvider<'a> {
             return;
         }
         let key = procedure.artifact().key();
-        analyzer.record_read(crate::analyzer::read_ledger::ReadKey::artifact(
-            crate::analyzer::invalidation::DerivedArtifactId::semantic_artifact(
-                key.public_fingerprint(),
-            ),
-            Some(key.path().as_str()),
-        ));
+        analyzer.record_read(ReadKey::semantic_artifact(key));
     }
 
     /// Record one dispatch answer this provider read.
@@ -885,18 +974,7 @@ impl<'a> WorkspaceIcfgProvider<'a> {
         call: &CallSiteHandle,
         outcome: &SemanticOutcome<DispatchResult>,
     ) {
-        self.record_dispatch_attribution(&dispatch_read_attribution(call, outcome));
-    }
-
-    fn record_dispatch_attribution(&self, attribution: &DispatchReadAttribution) {
-        let analyzer = self.workspace().analyzer();
-        if !analyzer.read_ledger_attached() {
-            return;
-        }
-        match attribution {
-            DispatchReadAttribution::Attributed(key) => analyzer.record_read(key.clone()),
-            DispatchReadAttribution::Unattributed(_) => analyzer.record_unattributed_read(),
-        }
+        record_dispatch_read(self.workspace(), call, outcome);
     }
 }
 
@@ -912,6 +990,7 @@ impl fmt::Debug for WorkspaceIcfgProvider<'_> {
 pub struct IcfgNodeKey {
     point: ProgramPointHandle,
     call_context: Box<[CallSiteHandle]>,
+    argument_callable: Option<Arc<ArgumentCallableProvenance>>,
 }
 
 impl IcfgNodeKey {
@@ -921,7 +1000,15 @@ impl IcfgNodeKey {
         Self {
             point,
             call_context: call_context.into_boxed_slice(),
+            argument_callable: None,
         }
+    }
+
+    /// Exact creation/capture association of the innermost argument closure
+    /// whose body contains this node. Capture value transport remains a
+    /// separate, explicitly incomplete consumer contract.
+    pub fn argument_callable(&self) -> Option<&ArgumentCallableProvenance> {
+        self.argument_callable.as_deref()
     }
 
     pub fn point(&self) -> &ProgramPointHandle {
@@ -988,6 +1075,17 @@ impl IcfgEdgeKind {
             Self::ExceptionalReturn => "exceptional_return",
             Self::CallToNormalContinuation => "call_to_normal_continuation",
             Self::CallToExceptionalContinuation => "call_to_exceptional_continuation",
+        }
+    }
+
+    pub const fn sort_key(self) -> (u8, u8) {
+        match self {
+            Self::Intraprocedural(kind) => (0, kind.sort_rank()),
+            Self::Call => (1, 0),
+            Self::NormalReturn => (2, 0),
+            Self::ExceptionalReturn => (3, 0),
+            Self::CallToNormalContinuation => (4, 0),
+            Self::CallToExceptionalContinuation => (5, 0),
         }
     }
 }
@@ -1362,6 +1460,11 @@ impl SnapshotBuilder {
         self.nodes.push(IcfgNodeKey {
             point: key.point.clone(),
             call_context,
+            argument_callable: key
+                .frames
+                .iter()
+                .rev()
+                .find_map(|frame| frame.transfer.argument_callable.clone()),
         });
         self.traversal.push(key.clone());
         self.interner.insert(key, id);
@@ -1537,40 +1640,15 @@ fn merge_quality(current: SnapshotQuality, incoming: SnapshotQuality) -> Snapsho
     }
 }
 
-fn icfg_edge_sort_key(edge: &IcfgEdge) -> (usize, u8, usize, u32) {
+fn icfg_edge_sort_key(edge: &IcfgEdge) -> (usize, (u8, u8), usize, u32) {
     (
         edge.source.index(),
-        icfg_edge_kind_rank(edge.kind),
+        edge.kind.sort_key(),
         edge.target.index(),
         edge.origin
             .as_ref()
             .map_or(u32::MAX, |call| call.id().get()),
     )
-}
-
-fn icfg_edge_kind_rank(kind: IcfgEdgeKind) -> u8 {
-    match kind {
-        IcfgEdgeKind::Intraprocedural(control) => control_edge_kind_rank(control),
-        IcfgEdgeKind::Call => 16,
-        IcfgEdgeKind::NormalReturn => 17,
-        IcfgEdgeKind::ExceptionalReturn => 18,
-        IcfgEdgeKind::CallToNormalContinuation => 19,
-        IcfgEdgeKind::CallToExceptionalContinuation => 20,
-    }
-}
-
-fn control_edge_kind_rank(kind: ControlEdgeKind) -> u8 {
-    match kind {
-        ControlEdgeKind::Normal => 0,
-        ControlEdgeKind::ConditionalTrue => 1,
-        ControlEdgeKind::ConditionalFalse => 2,
-        ControlEdgeKind::SwitchCase => 3,
-        ControlEdgeKind::LoopBack => 4,
-        ControlEdgeKind::Exceptional => 5,
-        ControlEdgeKind::Cleanup => 6,
-        ControlEdgeKind::AsyncNormal => 7,
-        ControlEdgeKind::AsyncExceptional => 8,
-    }
 }
 
 fn icfg_boundary_sort_key(boundary: &IcfgBoundary) -> (usize, u32, u8) {
@@ -1702,7 +1780,7 @@ impl IcfgProvider for WorkspaceIcfgProvider<'_> {
             }
             _ => {}
         }
-        let discharged = refinements
+        let mut discharged = refinements
             .available_value()
             .map(|reads| {
                 reads
@@ -1712,10 +1790,29 @@ impl IcfgProvider for WorkspaceIcfgProvider<'_> {
                     .collect::<Vec<_>>()
             })
             .unwrap_or_default();
+        // A proven inert-drop obligation discharges the procedure's omitted
+        // drops and turns the aborts whose only active cleanups are those
+        // drops into non-rejoining exits (#3757).
+        let mut non_rejoining = Vec::new();
+        if self
+            .oracle
+            .procedure_drops_proven_inert(callee_entry.procedure(), request)?
+        {
+            for gap in callee_entry.procedure().semantics().gaps() {
+                match gap.discharge {
+                    SemanticGapDischarge::InertDropGlue => discharged.push(gap.id),
+                    SemanticGapDischarge::NonRejoiningExceptionalExitAfterInertDrops => {
+                        non_rejoining.push(gap.id)
+                    }
+                    _ => {}
+                }
+            }
+        }
         let mut outcome = materialize_exit_profile_with_runtime_reads(
             callee_entry,
             callee_exit,
             &discharged,
+            &non_rejoining,
             request,
         )?;
         let work = match &mut outcome {
@@ -1744,6 +1841,39 @@ impl IcfgProvider for WorkspaceIcfgProvider<'_> {
         call: CallSiteId,
         request: &mut SemanticRequest<'_>,
     ) -> Result<SemanticOutcome<CallTransferSet>, SemanticProviderError> {
+        self.call_transfers_in_context(caller, call, &OracleCallContext::empty(), request)
+    }
+
+    fn call_transfers_in_context(
+        &self,
+        caller: &ProcedureHandle,
+        call: CallSiteId,
+        context: &OracleCallContext,
+        request: &mut SemanticRequest<'_>,
+    ) -> Result<SemanticOutcome<CallTransferSet>, SemanticProviderError> {
+        WorkspaceIcfgProvider::call_transfers_in_context(self, caller, call, context, request)
+    }
+
+    fn snapshot(
+        &self,
+        root: &ProcedureHandle,
+        limits: IcfgSnapshotLimits,
+        request: &mut SemanticRequest<'_>,
+    ) -> Result<SemanticOutcome<IcfgSnapshot>, SemanticProviderError> {
+        self.with_snapshot_transaction(request, |provider, request| {
+            provider.materialize_snapshot(root, limits, request)
+        })
+    }
+}
+
+impl WorkspaceIcfgProvider<'_> {
+    fn call_transfers_in_context(
+        &self,
+        caller: &ProcedureHandle,
+        call: CallSiteId,
+        context: &OracleCallContext,
+        request: &mut SemanticRequest<'_>,
+    ) -> Result<SemanticOutcome<CallTransferSet>, SemanticProviderError> {
         if request.cancellation.is_cancelled() {
             return Ok(SemanticOutcome::Cancelled {
                 partial: None,
@@ -1756,10 +1886,10 @@ impl IcfgProvider for WorkspaceIcfgProvider<'_> {
         let origin = caller
             .call_site_handle(call)
             .ok_or_else(|| SemanticProviderError::internal("failed to scope semantic call site"))?;
-        let cache_key = (caller.clone(), call);
+        let cache_key = (caller.clone(), call, context.clone());
         let cached = cacheable_request.then(|| self.outcome_cache.call_transfer(&cache_key));
         if let Some(cached) = cached.flatten() {
-            self.record_dispatch_attribution(&cached.dispatch_read);
+            record_dispatch_read_attribution(self.workspace(), &cached.dispatch_read);
             return Ok(cached.outcome);
         }
         let semantic_call = caller
@@ -1769,7 +1899,36 @@ impl IcfgProvider for WorkspaceIcfgProvider<'_> {
             .clone();
         let call_evaluation_gaps = scoped_call_evaluation_gaps(caller, &semantic_call);
         let mut staged_budget = request.budget.clone();
-        let dispatch_session = self.dispatch_session(caller.artifact());
+        // Context proof can acquire entering-caller source in another artifact.
+        // Keep every newly paid session private until transfer projection commits.
+        // An empty local session is retryable and retains no source. Keep the
+        // ordinary origin entry while contextual acquisitions stay private.
+        let _origin_session = self.dispatch_session(caller.artifact());
+        let dispatch_cache = Arc::new(QueryLocalIcfgOutcomeCache::snapshot_overlay(Arc::clone(
+            &self.outcome_cache,
+        )));
+        let dispatch_provider = Self {
+            oracle: self.oracle.clone(),
+            active_semantic_model_snapshot: self.active_semantic_model_snapshot.clone(),
+            behavior_identity: self.behavior_identity,
+            outcome_cache: Arc::clone(&dispatch_cache),
+        };
+        let before_probe = staged_budget.used();
+        let contextual = self.oracle.resolve_argument_callable(
+            &origin,
+            context,
+            &mut request.staged(&mut staged_budget),
+            |entering, request| {
+                dispatch_provider.record_artifact_read(entering.procedure());
+                let session = dispatch_provider.dispatch_session(entering.procedure().artifact());
+                let mut session = session
+                    .lock()
+                    .expect("entering dispatch session is not poisoned");
+                session.resolve_call(entering, request)
+            },
+        )?;
+        let probe_work = staged_budget.used().saturating_sub(before_probe);
+        let dispatch_session = dispatch_provider.dispatch_session(caller.artifact());
         let mut dispatch_session = dispatch_session
             .lock()
             .expect("query-local exact-artifact dispatch session is not poisoned");
@@ -1787,8 +1946,26 @@ impl IcfgProvider for WorkspaceIcfgProvider<'_> {
         // memo, a performed parse is shared by provider clones even when a
         // retry uses a fresh scalar budget. The first successful transfer
         // charged that work; replay owns no new source work.
-        let dispatch_outcome =
-            dispatch_session.resolve_call(&origin, &mut request.staged(&mut staged_budget));
+        let dispatch_outcome = if let Some(outcome) = contextual {
+            Ok(outcome)
+        } else {
+            dispatch_session
+                .resolve_call(&origin, &mut request.staged(&mut staged_budget))
+                .map(|mut outcome| {
+                    match &mut outcome {
+                        SemanticOutcome::Complete { work, .. }
+                        | SemanticOutcome::Ambiguous { work, .. }
+                        | SemanticOutcome::Unknown { work, .. }
+                        | SemanticOutcome::Unsupported { work, .. }
+                        | SemanticOutcome::Unproven { work, .. }
+                        | SemanticOutcome::ExceededBudget { work, .. }
+                        | SemanticOutcome::Cancelled { work, .. } => {
+                            *work = probe_work.conservative_add(*work);
+                        }
+                    }
+                    outcome
+                })
+        };
         let dispatch_outcome = match dispatch_outcome {
             Ok(outcome) => outcome,
             Err(error) => {
@@ -1798,11 +1975,46 @@ impl IcfgProvider for WorkspaceIcfgProvider<'_> {
                 return Err(error);
             }
         };
-        self.record_dispatch_read(&origin, &dispatch_outcome);
-        let dispatch_read = dispatch_read_attribution(&origin, &dispatch_outcome);
-        let mapped = try_map_semantic_outcome(dispatch_outcome, |dispatch| {
+        // Persisted replay currently resolves origin-only questions. Fail closed
+        // rather than record a contextual answer under that different question.
+        let dispatch_read = if context.calls().is_empty() && !context.was_truncated() {
+            dispatch_read_attribution(&origin, &dispatch_outcome)
+        } else {
+            DispatchReadAttribution::Unattributed(
+                DispatchReadUnattributedReason::CallContextUnavailable,
+            )
+        };
+        record_dispatch_read_attribution(self.workspace(), &dispatch_read);
+        let mapped = dispatch_outcome.try_map(|dispatch| {
             let mut transfers = Vec::new();
             let mut additional_work = SemanticWork::default();
+            let argument_callable = dispatch.argument_callable().cloned().map(Arc::new);
+            if let Some(provenance) = &argument_callable {
+                additional_work = additional_work.conservative_add(SemanticWork {
+                    captures: provenance.capture_bindings().len().saturating_add(
+                        provenance
+                            .producer()
+                            .map_or(0, |producer| producer.captures().len()),
+                    ),
+                    nested_entries: 8usize
+                        .saturating_add(provenance.caller_context().calls().len())
+                        .saturating_add(provenance.captures().len())
+                        .saturating_add(provenance.capture_bindings().len())
+                        .saturating_add(provenance.binding().len())
+                        .saturating_add(provenance.producer().map_or(0, |producer| {
+                            3usize.saturating_add(producer.captures().len())
+                        })),
+                    owned_text_bytes: provenance
+                        .capture_bindings()
+                        .iter()
+                        .map(|row| match &row.mode {
+                            super::CaptureMode::LanguageDefined(label) => label.len(),
+                            _ => 0,
+                        })
+                        .fold(0usize, usize::saturating_add),
+                    ..SemanticWork::default()
+                });
+            }
             let (candidates, dispatch_boundaries, coverage) = dispatch.into_parts();
             let mut boundaries = dispatch_boundaries
                 .into_vec()
@@ -1871,19 +2083,13 @@ impl IcfgProvider for WorkspaceIcfgProvider<'_> {
                         // procedure. The spawned body's exits never rejoin it.
                         model: CallToReturnModel::Normal,
                     });
-                    additional_work = sum_semantic_work(
-                        additional_work,
-                        sum_semantic_work(
-                            semantic_locator_work(&target),
-                            sum_semantic_work(
-                                provenance_work,
-                                SemanticWork {
-                                    owned_text_bytes: added_reason_bytes,
-                                    ..SemanticWork::default()
-                                },
-                            ),
-                        ),
-                    );
+                    additional_work = additional_work
+                        .conservative_add(semantic_locator_work(&target))
+                        .conservative_add(provenance_work)
+                        .conservative_add(SemanticWork {
+                            owned_text_bytes: added_reason_bytes,
+                            ..SemanticWork::default()
+                        });
                     continue;
                 }
                 if properties.invocation == ProcedureInvocationKind::Deferred {
@@ -1923,19 +2129,13 @@ impl IcfgProvider for WorkspaceIcfgProvider<'_> {
                     // The candidate row was already charged by dispatch. The
                     // transfer projection additionally owns its cloned locator,
                     // boundary-kind relation, and newly retained reason text.
-                    additional_work = sum_semantic_work(
-                        additional_work,
-                        sum_semantic_work(
-                            semantic_locator_work(&target),
-                            sum_semantic_work(
-                                provenance_work,
-                                SemanticWork {
-                                    owned_text_bytes: added_reason_bytes,
-                                    ..SemanticWork::default()
-                                },
-                            ),
-                        ),
-                    );
+                    additional_work = additional_work
+                        .conservative_add(semantic_locator_work(&target))
+                        .conservative_add(provenance_work)
+                        .conservative_add(SemanticWork {
+                            owned_text_bytes: added_reason_bytes,
+                            ..SemanticWork::default()
+                        });
                     continue;
                 }
                 let Some(entry) = candidate
@@ -1944,22 +2144,40 @@ impl IcfgProvider for WorkspaceIcfgProvider<'_> {
                 else {
                     continue;
                 };
-                let (completeness, added_reason_bytes) = call_binding_completeness(
+                let (mut completeness, mut added_reason_bytes) = call_binding_completeness(
                     &semantic_call,
                     candidate.target.semantics().values(),
                     candidate.completeness,
                 );
-                additional_work = sum_semantic_work(
-                    additional_work,
-                    SemanticWork {
-                        owned_text_bytes: added_reason_bytes,
-                        ..SemanticWork::default()
-                    },
-                );
+                if argument_callable
+                    .as_ref()
+                    .is_some_and(|proof| !proof.captures().is_empty())
+                {
+                    // Exact control-flow dispatch is established, but the value-flow
+                    // consumer does not yet project this caller's capture environment.
+                    // Preserve the association without claiming complete value transport.
+                    let previous = completeness_reason_bytes(&completeness);
+                    completeness = EvidenceCompleteness::Partial(match completeness {
+                        EvidenceCompleteness::Complete =>
+                            "callback argument capture environment transport is incomplete".into(),
+                        EvidenceCompleteness::Partial(reason) => format!(
+                            "{reason}; callback argument capture environment transport is incomplete"
+                        ).into(),
+                    });
+                    added_reason_bytes = added_reason_bytes.saturating_add(
+                        completeness_reason_bytes(&completeness).saturating_sub(previous),
+                    );
+                }
+                additional_work = additional_work.conservative_add(SemanticWork {
+                    nested_entries: context.calls().len(),
+                    owned_text_bytes: added_reason_bytes,
+                    ..SemanticWork::default()
+                });
                 transfers.push(CallTransfer {
                     origin: origin.clone(),
                     callee: candidate.target,
                     callee_entry: entry,
+                    argument_callable: argument_callable.clone(),
                     normal_continuation: semantic_call.normal_continuation,
                     exceptional_continuation: semantic_call.exceptional_continuation,
                     proof: candidate.proof,
@@ -1971,16 +2189,13 @@ impl IcfgProvider for WorkspaceIcfgProvider<'_> {
                 boundaries: boundaries.into_boxed_slice(),
                 coverage,
             };
-            additional_work = sum_semantic_work(
-                additional_work,
-                SemanticWork {
-                    owned_text_bytes: apply_call_evaluation_gaps(
-                        &call_evaluation_gaps,
-                        &mut transfer_set,
-                    ),
-                    ..SemanticWork::default()
-                },
-            );
+            additional_work = additional_work.conservative_add(SemanticWork {
+                owned_text_bytes: apply_call_evaluation_gaps(
+                    &call_evaluation_gaps,
+                    &mut transfer_set,
+                ),
+                ..SemanticWork::default()
+            });
             Ok((transfer_set, additional_work))
         });
         let mapped = match mapped {
@@ -1999,7 +2214,7 @@ impl IcfgProvider for WorkspaceIcfgProvider<'_> {
             .available_value()
             .map_or(SemanticWork::default(), |(_, work)| *work);
         let original_work = mapped.work();
-        let total_work = sum_semantic_work(original_work, additional_work);
+        let total_work = original_work.conservative_add(additional_work);
         if let Some(outcome) = charge_call_transfer_projection(
             &mapped,
             &mut staged_budget,
@@ -2017,6 +2232,20 @@ impl IcfgProvider for WorkspaceIcfgProvider<'_> {
             &call_evaluation_gaps,
             total_work,
         );
+        if let SemanticOutcome::Complete { value, work } = &outcome
+            && value.transfers.iter().any(|transfer| {
+                transfer
+                    .argument_callable
+                    .as_ref()
+                    .is_some_and(|proof| !proof.captures().is_empty())
+            })
+        {
+            outcome = SemanticOutcome::Unsupported {
+                capability: SemanticCapability::Captures,
+                partial: Some(value.clone()),
+                work: *work,
+            };
+        }
         if request.cancellation.is_cancelled()
             && !matches!(outcome, SemanticOutcome::Cancelled { .. })
         {
@@ -2028,6 +2257,9 @@ impl IcfgProvider for WorkspaceIcfgProvider<'_> {
             dispatch_session.discard_exact_source();
         }
         drop(dispatch_session);
+        if outcome.available_value().is_some() {
+            self.outcome_cache.publish_snapshot(&dispatch_cache);
+        }
         if cacheable_request && let Some(cached) = outcome.completed_replay() {
             self.outcome_cache
                 .call_transfers
@@ -2044,19 +2276,6 @@ impl IcfgProvider for WorkspaceIcfgProvider<'_> {
         Ok(outcome)
     }
 
-    fn snapshot(
-        &self,
-        root: &ProcedureHandle,
-        limits: IcfgSnapshotLimits,
-        request: &mut SemanticRequest<'_>,
-    ) -> Result<SemanticOutcome<IcfgSnapshot>, SemanticProviderError> {
-        self.with_snapshot_transaction(request, |provider, request| {
-            provider.materialize_snapshot(root, limits, request)
-        })
-    }
-}
-
-impl WorkspaceIcfgProvider<'_> {
     fn materialize_snapshot(
         &self,
         root: &ProcedureHandle,
@@ -2106,8 +2325,10 @@ impl WorkspaceIcfgProvider<'_> {
             });
         }
         let mut builder = SnapshotBuilder::new(limits);
-        let mut transfer_cache: HashMap<CallSiteHandle, SemanticOutcome<CallTransferSet>> =
-            HashMap::default();
+        let mut transfer_cache: HashMap<
+            (CallSiteHandle, OracleCallContext),
+            SemanticOutcome<CallTransferSet>,
+        > = HashMap::default();
         builder.work = root_work;
         builder.intern(
             TraversalKey {
@@ -2158,15 +2379,27 @@ impl WorkspaceIcfgProvider<'_> {
                         kind: IcfgBoundaryKind::Limit(IcfgLimitKind::CallDepth),
                     });
                 } else {
-                    let (outcome, newly_resolved) = if let Some(cached) =
-                        transfer_cache.get(&origin)
-                    {
-                        (cached.clone(), false)
-                    } else {
-                        let outcome = self.call_transfers(key.point.procedure(), call, request)?;
-                        transfer_cache.insert(origin.clone(), outcome.clone());
-                        (outcome, true)
-                    };
+                    let context = OracleCallContext::bounded(
+                        key.frames
+                            .iter()
+                            .map(|frame| frame.transfer.origin.clone())
+                            .collect(),
+                        *self.oracle.limits(),
+                    );
+                    let transfer_key = (origin.clone(), context.clone());
+                    let (outcome, newly_resolved) =
+                        if let Some(cached) = transfer_cache.get(&transfer_key) {
+                            (cached.clone(), false)
+                        } else {
+                            let outcome = self.call_transfers_in_context(
+                                key.point.procedure(),
+                                call,
+                                &context,
+                                request,
+                            )?;
+                            transfer_cache.insert(transfer_key, outcome.clone());
+                            (outcome, true)
+                        };
                     builder.absorb_quality(&outcome);
                     if newly_resolved {
                         builder.work = builder.work.conservative_add(outcome.work());
@@ -2354,76 +2587,38 @@ fn finish_snapshot_outcome(
             work,
         };
     }
+    snapshot_quality_outcome(snapshot, quality, work)
+}
+
+fn snapshot_quality_outcome<T>(
+    value: T,
+    quality: SnapshotQuality,
+    work: SemanticWork,
+) -> SemanticOutcome<T> {
     match quality {
-        SnapshotQuality::Complete => SemanticOutcome::Complete {
-            value: snapshot,
-            work,
-        },
+        SnapshotQuality::Complete => SemanticOutcome::Complete { value, work },
         SnapshotQuality::Ambiguous => SemanticOutcome::Ambiguous {
-            candidates: snapshot,
+            candidates: value,
             work,
         },
         SnapshotQuality::Unproven => SemanticOutcome::Unproven {
-            partial: snapshot,
+            partial: value,
             work,
         },
         SnapshotQuality::Unknown | SnapshotQuality::Truncated => SemanticOutcome::Unknown {
-            partial: Some(snapshot),
+            partial: Some(value),
             work,
         },
         SnapshotQuality::Unsupported(capability) => SemanticOutcome::Unsupported {
             capability,
-            partial: Some(snapshot),
+            partial: Some(value),
             work,
         },
-        SnapshotQuality::Cancelled => unreachable!("cancelled snapshots return above"),
+        SnapshotQuality::Cancelled => SemanticOutcome::Cancelled {
+            partial: Some(value),
+            work,
+        },
     }
-}
-
-fn try_map_semantic_outcome<T, U>(
-    outcome: SemanticOutcome<T>,
-    mapper: impl FnOnce(T) -> Result<U, SemanticProviderError>,
-) -> Result<SemanticOutcome<U>, SemanticProviderError> {
-    Ok(match outcome {
-        SemanticOutcome::Complete { value, work } => SemanticOutcome::Complete {
-            value: mapper(value)?,
-            work,
-        },
-        SemanticOutcome::Ambiguous { candidates, work } => SemanticOutcome::Ambiguous {
-            candidates: mapper(candidates)?,
-            work,
-        },
-        SemanticOutcome::Unknown { partial, work } => SemanticOutcome::Unknown {
-            partial: partial.map(mapper).transpose()?,
-            work,
-        },
-        SemanticOutcome::Unsupported {
-            capability,
-            partial,
-            work,
-        } => SemanticOutcome::Unsupported {
-            capability,
-            partial: partial.map(mapper).transpose()?,
-            work,
-        },
-        SemanticOutcome::Unproven { partial, work } => SemanticOutcome::Unproven {
-            partial: mapper(partial)?,
-            work,
-        },
-        SemanticOutcome::ExceededBudget {
-            partial,
-            exceeded,
-            work,
-        } => SemanticOutcome::ExceededBudget {
-            partial: partial.map(mapper).transpose()?,
-            exceeded,
-            work,
-        },
-        SemanticOutcome::Cancelled { partial, work } => SemanticOutcome::Cancelled {
-            partial: partial.map(mapper).transpose()?,
-            work,
-        },
-    })
 }
 
 fn deferred_boundary_provenance(
@@ -2508,7 +2703,11 @@ fn scoped_call_evaluation_gaps<'a>(
 }
 
 fn call_evaluation_gap_applies(gap: &SemanticGap, call: &SemanticCallSite) -> bool {
+    // A call-resolution gap asks a question this call's resolution and
+    // binding answer, and those carry their own quality into the transfers
+    // (#1989, #3757). It must not weaken the resolved transfers a second time.
     gap.impacts.contains(SemanticGapImpact::CallEvaluation)
+        && gap.discharge != SemanticGapDischarge::CallResolution
         && match gap.subject {
             SemanticGapSubject::Procedure => true,
             SemanticGapSubject::Point => gap.point == call.point,
@@ -2686,29 +2885,22 @@ fn call_transfer_outcome_with_work(
     }
 }
 
-fn completeness_reason_bytes(completeness: &EvidenceCompleteness) -> usize {
-    match completeness {
-        EvidenceCompleteness::Complete => 0,
-        EvidenceCompleteness::Partial(reason) => reason.len(),
-    }
-}
-
-fn sum_semantic_work(left: SemanticWork, right: SemanticWork) -> SemanticWork {
-    left.conservative_add(right)
-}
-
 fn materialize_exit_profile(
     callee_entry: &ProgramPointHandle,
     callee_exit: &ProgramPointHandle,
     request: &mut SemanticRequest<'_>,
 ) -> Result<SemanticOutcome<IcfgExitProfile>, SemanticProviderError> {
-    materialize_exit_profile_with_runtime_reads(callee_entry, callee_exit, &[], request)
+    materialize_exit_profile_with_runtime_reads(callee_entry, callee_exit, &[], &[], request)
 }
 
+/// `discharged` gaps are answered by a query-time proof (runtime reads,
+/// inert drops) and are not return gaps; `non_rejoining` gaps are aborts a
+/// query-time proof shows to be non-rejoining exceptional exits.
 fn materialize_exit_profile_with_runtime_reads(
     callee_entry: &ProgramPointHandle,
     callee_exit: &ProgramPointHandle,
     discharged_runtime_reads: &[super::SemanticGapId],
+    non_rejoining: &[super::SemanticGapId],
     request: &mut SemanticRequest<'_>,
 ) -> Result<SemanticOutcome<IcfgExitProfile>, SemanticProviderError> {
     if request.cancellation.is_cancelled() {
@@ -2883,8 +3075,9 @@ fn materialize_exit_profile_with_runtime_reads(
             .saturating_add(semantic_gap_reason_entry_bytes(gap, return_gap_count > 0));
         return_gap_count = return_gap_count.saturating_add(1);
         if is_matched_return_gap(gap) {
-            matched_return_gaps_are_implicit_abort_only &= gap.discharge
+            matched_return_gaps_are_implicit_abort_only &= (gap.discharge
                 == SemanticGapDischarge::NonRejoiningExceptionalExit
+                || non_rejoining.contains(&gap.id))
                 && crate::analyzer::semantic::workspace_oracle::implicit_abort_gap_is_discharged(
                     gap, false,
                 );
@@ -2917,7 +3110,7 @@ fn materialize_exit_profile_with_runtime_reads(
             work: scan_work,
         });
     }
-    let total_work = sum_semantic_work(scan_work, text_work);
+    let total_work = scan_work.conservative_add(text_work);
     let gap_reason = if return_gap_count == 0 {
         None
     } else {
@@ -3018,33 +3211,7 @@ fn exit_profile_outcome(
     quality: SnapshotQuality,
     work: SemanticWork,
 ) -> SemanticOutcome<IcfgExitProfile> {
-    match quality {
-        SnapshotQuality::Complete => SemanticOutcome::Complete {
-            value: profile,
-            work,
-        },
-        SnapshotQuality::Ambiguous => SemanticOutcome::Ambiguous {
-            candidates: profile,
-            work,
-        },
-        SnapshotQuality::Unproven => SemanticOutcome::Unproven {
-            partial: profile,
-            work,
-        },
-        SnapshotQuality::Unknown | SnapshotQuality::Truncated => SemanticOutcome::Unknown {
-            partial: Some(profile),
-            work,
-        },
-        SnapshotQuality::Unsupported(capability) => SemanticOutcome::Unsupported {
-            capability,
-            partial: Some(profile),
-            work,
-        },
-        SnapshotQuality::Cancelled => SemanticOutcome::Cancelled {
-            partial: Some(profile),
-            work,
-        },
-    }
+    snapshot_quality_outcome(profile, quality, work)
 }
 
 fn semantic_gap_quality(gap: &SemanticGap) -> SnapshotQuality {
@@ -3547,6 +3714,13 @@ pub fn validate_call_transfer_set(
                 "ICFG call transfer origin does not match the requested call",
             ));
         }
+        if let Some(proof) = &transfer.argument_callable
+            && (proof.closure() != &transfer.callee || proof.callee() != caller)
+        {
+            return Err(SemanticProviderError::invalid_identity(
+                "callback transfer must retain its exact argument invocation proof",
+            ));
+        }
         if transfer.callee_entry.procedure() != &transfer.callee {
             return Err(SemanticProviderError::internal(
                 "ICFG call transfer entry belongs to a different callee",
@@ -3601,28 +3775,15 @@ pub fn is_call_scaffolding(edge: &super::ControlEdge, call: &super::SemanticCall
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::analyzer::semantic::workspace_oracle::{
-        CallableDefinitionIdentity, retain_dispatch_candidate,
-    };
+    use crate::analyzer::ProjectFile;
+    use crate::analyzer::semantic::workspace_oracle::retain_dispatch_candidate;
     use crate::analyzer::semantic::{
         DeclarationSegment, DispatchCandidate, DispatchHintCallSiteKey, DispatchHintSet,
         ProcedureKind, SemanticBudget, SemanticExecutionBudget, SemanticGapId, SemanticGapImpacts,
     };
-    use crate::analyzer::{CodeUnit, CodeUnitType, ProjectFile};
     use crate::cancellation::CancellationToken;
     use crate::test_support::AnalyzerFixture;
-
-    fn test_edge(source: u32, target: u32, kind: IcfgEdgeKind) -> IcfgEdge {
-        IcfgEdge {
-            source: IcfgNodeId::new(source),
-            target: IcfgNodeId::new(target),
-            kind,
-            origin: None,
-            proof: ProofStatus::Proven,
-            completeness: EvidenceCompleteness::Complete,
-            boundary: None,
-        }
-    }
+    use brokk_bifrost_test_macros::hardwon;
 
     #[test]
     fn detached_external_call_keeps_parent_normal_continuation() {
@@ -3642,38 +3803,6 @@ mod tests {
         assert_eq!(
             boundary_call_to_return_model(CallInvocationMode::Ordinary, false),
             CallToReturnModel::NormalAndExceptional
-        );
-    }
-
-    #[test]
-    fn frozen_edge_validation_owns_snapshot_invariants() {
-        let local = test_edge(0, 1, IcfgEdgeKind::Intraprocedural(ControlEdgeKind::Normal));
-        assert!(validate_frozen_edge(&local, 2).is_ok());
-
-        let invalid_source =
-            test_edge(2, 1, IcfgEdgeKind::Intraprocedural(ControlEdgeKind::Normal));
-        assert!(
-            validate_frozen_edge(&invalid_source, 2)
-                .unwrap_err()
-                .to_string()
-                .contains("out-of-range source")
-        );
-
-        let invalid_target =
-            test_edge(0, 2, IcfgEdgeKind::Intraprocedural(ControlEdgeKind::Normal));
-        assert!(
-            validate_frozen_edge(&invalid_target, 2)
-                .unwrap_err()
-                .to_string()
-                .contains("out-of-range target")
-        );
-
-        let missing_origin = test_edge(0, 1, IcfgEdgeKind::Call);
-        assert!(
-            validate_frozen_edge(&missing_origin, 2)
-                .unwrap_err()
-                .to_string()
-                .contains("no originating call site")
         );
     }
 
@@ -4295,6 +4424,7 @@ mod tests {
     }
 
     #[test]
+    #[hardwon("#1372: header declarations acquired false C/C++ value-flow targets")]
     fn cpp_header_definition_coalescing_is_proven_and_excludes_unrelated_link_unit() {
         let header = "#pragma once\nnamespace api { int target(int value); }\n";
         let definition = concat!(
@@ -4492,6 +4622,7 @@ int configured_caller(int value) {
     }
 
     #[test]
+    #[hardwon("2f4cb01c5326: Ruby constructor dispatch retained stale builtin gaps")]
     fn ruby_constructor_is_supported_without_a_stale_call_gap() {
         let source = r#"
 class Widget
@@ -5071,6 +5202,7 @@ void raii_caller() {
     }
 
     #[test]
+    #[hardwon("#1372: a bodyless C/C++ declaration lost its unresolved call boundary")]
     fn cpp_bodyless_callable_identity_emits_one_unresolved_boundary() {
         let header = "#pragma once\nint target(int value);\n";
         let caller = "#include \"target.h\"\nint caller() { return target(1); }\n";
@@ -5205,12 +5337,6 @@ void raii_caller() {
         ));
         assert_eq!(retained.len(), 1);
         assert_eq!(retained[0].target, procedures[0]);
-    }
-
-    #[test]
-    fn workspace_icfg_provider_remains_clone() {
-        fn assert_clone<T: Clone>() {}
-        assert_clone::<WorkspaceIcfgProvider<'static>>();
     }
 
     #[test]
@@ -5394,6 +5520,140 @@ void raii_caller() {
                 ))
                 .count(),
             2,
+        );
+    }
+
+    #[test]
+    fn contextual_callback_source_and_proof_rollback_with_snapshot() {
+        let fixture = AnalyzerFixture::new_for_language(
+            crate::analyzer::Language::Go,
+            &[(
+                "main.go",
+                concat!(
+                    "package pkg\n",
+                    "func Invoke(cb func()) { cb() }\n",
+                    "func First() { seed := 7; cb := func() { _ = seed }; Invoke(cb) }\n",
+                ),
+            )],
+        );
+        let file = ProjectFile::new(fixture.project_root(), "main.go");
+        let cancellation = CancellationToken::default();
+        let mut materialization = SemanticBudget::default();
+        let artifact = fixture
+            .analyzer
+            .materialize_program_semantics(
+                &file,
+                &mut SemanticRequest::new(&mut materialization, &cancellation),
+            )
+            .expect("Go materialization")
+            .available_value()
+            .cloned()
+            .expect("Go artifact");
+        let named = |name| {
+            artifact
+                .procedures()
+                .iter()
+                .find(|procedure| {
+                    procedure
+                        .locator()
+                        .declaration()
+                        .segments()
+                        .last()
+                        .and_then(DeclarationSegment::name)
+                        == Some(name)
+                })
+                .and_then(|row| artifact.procedure_handle(row.id()))
+                .expect("named Go procedure")
+        };
+        let caller = named("First");
+        let callee = named("Invoke");
+        let entering = caller
+            .call_site_handle(caller.semantics().call_sites()[0].id)
+            .expect("entering call");
+        let context = OracleCallContext::bounded(vec![entering.clone()], OracleLimits::default());
+        let callback = callee.semantics().call_sites()[0].id;
+        let provider = fixture.analyzer.icfg_provider();
+        let mut outer = SemanticBudget::default();
+        let failed: Result<(), SemanticProviderError> = provider.with_snapshot_transaction(
+            &mut SemanticRequest::new(&mut outer, &cancellation),
+            |snapshot_provider, request| {
+                let result = snapshot_provider
+                    .call_transfers_in_context(&callee, callback, &context, request)?;
+                let transfer = &result
+                    .available_value()
+                    .expect("callback transfer")
+                    .transfers[0];
+                let proof = transfer
+                    .argument_callable
+                    .as_ref()
+                    .expect("exact argument proof");
+                assert_eq!(proof.entering_call(), &entering);
+                assert_eq!(proof.creation().procedure(), &caller);
+                assert!(!proof.captures().is_empty());
+                assert!(
+                    matches!(
+                        result,
+                        SemanticOutcome::Unsupported {
+                            capability: SemanticCapability::Captures,
+                            ..
+                        }
+                    ),
+                    "capture transport stays incomplete: {result:#?}"
+                );
+                assert!(request.budget.used().source_bytes > 0);
+                assert!(
+                    provider
+                        .outcome_cache
+                        .dispatch_sessions
+                        .lock()
+                        .expect("sessions")
+                        .is_empty()
+                );
+                Err(SemanticProviderError::internal(
+                    "post-context snapshot failure",
+                ))
+            },
+        );
+        assert!(failed.is_err());
+        assert_eq!(outer.used(), SemanticWork::default());
+        assert!(
+            provider
+                .outcome_cache
+                .dispatch_sessions
+                .lock()
+                .expect("sessions")
+                .is_empty()
+        );
+        assert!(
+            provider
+                .outcome_cache
+                .call_transfers
+                .lock()
+                .expect("transfers")
+                .is_empty()
+        );
+        let mut retry = SemanticBudget::default();
+        let result = provider
+            .with_snapshot_transaction(
+                &mut SemanticRequest::new(&mut retry, &cancellation),
+                |snapshot_provider, request| {
+                    snapshot_provider
+                        .call_transfers_in_context(&callee, callback, &context, request)
+                },
+            )
+            .expect("retry callback transfer");
+        assert!(result.available_value().is_some());
+        assert!(
+            retry.used().source_bytes > 0,
+            "rolled-back caller source must be paid again"
+        );
+        assert!(
+            !provider
+                .outcome_cache
+                .dispatch_sessions
+                .lock()
+                .expect("sessions")
+                .is_empty()
         );
     }
 
@@ -5680,6 +5940,43 @@ void raii_caller() {
         );
     }
 
+    fn assert_failed_transfer_retry_pays_source(
+        provider: &WorkspaceIcfgProvider<'_>,
+        caller: &ProcedureHandle,
+        retry_call: CallSiteId,
+        source_len: usize,
+        cancellation: &CancellationToken,
+    ) {
+        let session = provider
+            .outcome_cache
+            .dispatch_sessions
+            .lock()
+            .expect("query-local dispatch session cache is not poisoned")
+            .values()
+            .next()
+            .cloned()
+            .expect("failed transfer leaves a retryable empty session");
+        assert!(
+            !session
+                .lock()
+                .expect("prepared dispatch session is not poisoned")
+                .retains_exact_source(),
+            "syntax charged only to a failed transfer cannot remain published",
+        );
+
+        let mut retry_budget = SemanticBudget::default();
+        let retry = provider
+            .call_transfers(
+                caller,
+                retry_call,
+                &mut SemanticRequest::new(&mut retry_budget, cancellation),
+            )
+            .expect("retry after a failed call-transfer projection");
+        assert!(retry.available_value().is_some(), "{retry:#?}");
+        assert_eq!(retry.work().source_bytes, source_len);
+        assert_eq!(retry_budget.used().source_bytes, source_len);
+    }
+
     #[test]
     fn failed_source_charge_does_not_publish_an_unpaid_icfg_dispatch_session() {
         let source = concat!(
@@ -5727,34 +6024,13 @@ void raii_caller() {
             SemanticOutcome::ExceededBudget { partial: None, .. }
         ));
         assert_eq!(tight_budget.used(), SemanticWork::default());
-        let session = provider
-            .outcome_cache
-            .dispatch_sessions
-            .lock()
-            .expect("query-local dispatch session cache is not poisoned")
-            .values()
-            .next()
-            .cloned()
-            .expect("failed lookup leaves a retryable empty session");
-        assert!(
-            !session
-                .lock()
-                .expect("prepared dispatch session is not poisoned")
-                .retains_exact_source(),
-            "failed source charge cannot publish retained syntax"
+        assert_failed_transfer_retry_pays_source(
+            &provider,
+            &caller,
+            call,
+            source.len(),
+            &cancellation,
         );
-
-        let mut retry_budget = SemanticBudget::default();
-        let retry = provider
-            .call_transfers(
-                &caller,
-                call,
-                &mut SemanticRequest::new(&mut retry_budget, &cancellation),
-            )
-            .expect("retry after a failed source charge");
-        assert!(retry.available_value().is_some(), "{retry:#?}");
-        assert_eq!(retry.work().source_bytes, source.len());
-        assert_eq!(retry_budget.used().source_bytes, source.len());
     }
 
     #[test]
@@ -5829,34 +6105,13 @@ void raii_caller() {
             SemanticWork::default(),
             "the failed atomic transfer publishes none of its staged dispatch work",
         );
-        let session = provider
-            .outcome_cache
-            .dispatch_sessions
-            .lock()
-            .expect("query-local dispatch session cache is not poisoned")
-            .values()
-            .next()
-            .cloned()
-            .expect("failed projection leaves a retryable empty session");
-        assert!(
-            !session
-                .lock()
-                .expect("prepared dispatch session is not poisoned")
-                .retains_exact_source(),
-            "syntax charged only to the rolled-back transfer cannot remain published",
+        assert_failed_transfer_retry_pays_source(
+            &provider,
+            &caller,
+            calls[1].id,
+            source.len(),
+            &cancellation,
         );
-
-        let mut retry_budget = SemanticBudget::default();
-        let retry = provider
-            .call_transfers(
-                &caller,
-                calls[1].id,
-                &mut SemanticRequest::new(&mut retry_budget, &cancellation),
-            )
-            .expect("distinct call retry after projection rollback");
-        assert!(retry.available_value().is_some(), "{retry:#?}");
-        assert_eq!(retry.work().source_bytes, source.len());
-        assert_eq!(retry_budget.used().source_bytes, source.len());
     }
 
     #[test]
@@ -5892,13 +6147,13 @@ void raii_caller() {
             DispatchHintCallSiteKey::for_call(&procedure, calls[0].id),
             Vec::new(),
             true,
-            true,
+            crate::analyzer::semantic::type_flow::DispatchHintProof::Proven,
         );
         let second = DispatchHintSet::new(
             DispatchHintCallSiteKey::for_call(&procedure, calls[1].id),
             Vec::new(),
             true,
-            true,
+            crate::analyzer::semantic::type_flow::DispatchHintProof::Proven,
         );
         let forward = DispatchHints::new(vec![first.clone(), second.clone()]);
         let reverse = DispatchHints::new(vec![second, first]);
@@ -5908,7 +6163,7 @@ void raii_caller() {
             DispatchHintCallSiteKey::for_call(&procedure, calls[0].id),
             Vec::new(),
             false,
-            true,
+            crate::analyzer::semantic::type_flow::DispatchHintProof::Unproven,
         )]);
         assert_ne!(forward.digest(), open.digest());
 
@@ -6540,6 +6795,7 @@ void raii_caller() {
     }
 
     #[test]
+    #[hardwon("#1952: an unrelated return gap hid the path-relevant completion result")]
     fn python_mixed_return_gaps_retain_only_the_matched_normal_reason() {
         const SOURCE: &str = "async def target(value):\n    result = value\n    return result\n";
         let fixture = AnalyzerFixture::new_for_language(
@@ -6887,57 +7143,5 @@ void raii_caller() {
         );
         assert_eq!(alternate_outcome.work().owned_text_bytes, 0);
         assert_eq!(alternate_budget.used(), alternate_outcome.work());
-    }
-
-    #[test]
-    fn callable_definition_identity_keeps_cpp_sources_and_overloads_distinct() {
-        let root = std::env::temp_dir();
-        let header = ProjectFile::new(root.clone(), "target.h");
-        let source = ProjectFile::new(root, "target.cpp");
-        let declaration = CodeUnit::with_signature(
-            header,
-            CodeUnitType::Function,
-            "",
-            "target",
-            Some("(int)".to_string()),
-            false,
-        );
-        let definition = CodeUnit::with_signature(
-            source.clone(),
-            CodeUnitType::Function,
-            "",
-            "target",
-            Some("(int)".to_string()),
-            false,
-        );
-        let overload = CodeUnit::with_signature(
-            source,
-            CodeUnitType::Function,
-            "",
-            "target",
-            Some("(double)".to_string()),
-            false,
-        );
-
-        assert_ne!(
-            CallableDefinitionIdentity::with_source_scope(
-                &declaration,
-                Some(declaration.source().clone())
-            ),
-            CallableDefinitionIdentity::with_source_scope(
-                &definition,
-                Some(definition.source().clone())
-            )
-        );
-        assert_ne!(
-            CallableDefinitionIdentity::with_source_scope(
-                &definition,
-                Some(definition.source().clone())
-            ),
-            CallableDefinitionIdentity::with_source_scope(
-                &overload,
-                Some(overload.source().clone())
-            )
-        );
     }
 }

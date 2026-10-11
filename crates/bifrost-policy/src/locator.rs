@@ -1,4 +1,4 @@
-//! Loaded-policy resolution of qualified call and receiver locators.
+//! Loaded-policy resolution of qualified call, receiver and value locators.
 //!
 //! Qualified locators are authoring convenience only. This module resolves
 //! them once, against the analyzer's existing declaration lookup and active
@@ -11,12 +11,12 @@ use brokk_bifrost_analysis::analyzer::semantic_model::{
 };
 use brokk_bifrost_analysis::analyzer::{CodeUnit, CodeUnitType, DescendantIndexScope, IAnalyzer};
 use brokk_bifrost_rql::{
-    CallIdentity, CodeQuery, CodeQueryPlanSource, QueryStep, ResolvedCallIdentity,
-    ResolvedCallIdentityKind, ResolvedCallProof, ResolvedCallReceiverType,
+    CallIdentity, CodeQuery, QueryStep, ResolvedCallIdentity, ResolvedCallIdentityKind,
+    ResolvedCallProof, ResolvedCallReceiverType,
 };
 
 use super::definition::*;
-use super::source::{PolicySourceDiagnostic, PolicySourceDiagnosticSeverity, PolicySourceError};
+use super::source::{PolicySourceError, source_error};
 
 /// How the loaded-policy boundary treats qualified call and receiver locators.
 ///
@@ -50,15 +50,17 @@ impl<'a> LocatorResolution<'a> {
 enum LocatorRole {
     Callable,
     ReceiverType,
+    Value,
 }
 
 impl LocatorRole {
-    const ALL: [Self; 2] = [Self::Callable, Self::ReceiverType];
+    const ALL: [Self; 3] = [Self::Callable, Self::ReceiverType, Self::Value];
 
     const fn public(self) -> ResolvedPolicyLocatorRole {
         match self {
             Self::Callable => ResolvedPolicyLocatorRole::Callable,
             Self::ReceiverType => ResolvedPolicyLocatorRole::ReceiverType,
+            Self::Value => ResolvedPolicyLocatorRole::Value,
         }
     }
 
@@ -66,6 +68,7 @@ impl LocatorRole {
         match self {
             Self::Callable => "call",
             Self::ReceiverType => "receiver type",
+            Self::Value => "value",
         }
     }
 }
@@ -104,6 +107,11 @@ impl LocatorFailure {
             (LocatorRole::ReceiverType, Self::Incomplete) => {
                 "qualified-receiver-locator-incomplete"
             }
+            (LocatorRole::Value, Self::Zero) => "qualified-value-locator-zero",
+            (LocatorRole::Value, Self::Ambiguous) => "qualified-value-locator-ambiguous",
+            (LocatorRole::Value, Self::Partial) => "qualified-value-locator-partial",
+            (LocatorRole::Value, Self::InactiveModel) => "qualified-value-locator-inactive-model",
+            (LocatorRole::Value, Self::Incomplete) => "qualified-value-locator-incomplete",
         }
     }
 
@@ -404,41 +412,49 @@ pub(super) fn resolve_query_locators(
 ) -> Result<(), PolicySourceError> {
     let mut pending = vec![&mut query.plan];
     while let Some(plan) = pending.pop() {
-        if let CodeQueryPlanSource::Set { branches, .. } = &mut plan.source {
-            pending.extend(branches);
-        }
+        pending.extend(plan.source.child_plans_mut());
         for step in &mut plan.steps {
-            let QueryStep::ResolvedCall(filter) = step else {
-                continue;
-            };
-            resolve_query_identity(
-                &mut filter.resolves_to,
-                filter.proof,
-                LocatorRole::Callable,
-                ReceiverTypeConstraintKind::Exact,
-                locators,
-                resolved_locators,
-            )?;
-            if let Some(receiver_type) = &mut filter.receiver_type {
-                match receiver_type {
-                    ResolvedCallReceiverType::Exact(identity) => resolve_query_identity(
-                        identity,
+            match step {
+                QueryStep::ResolvedCall(filter) => {
+                    resolve_query_identity(
+                        &mut filter.resolves_to,
                         filter.proof,
-                        LocatorRole::ReceiverType,
+                        LocatorRole::Callable,
                         ReceiverTypeConstraintKind::Exact,
                         locators,
                         resolved_locators,
-                    )?,
-                    ResolvedCallReceiverType::AssignableTo {
-                        root,
-                        resolved_identities,
-                    } => resolve_query_receiver_family(
-                        root,
-                        resolved_identities,
-                        locators,
-                        resolved_locators,
-                    )?,
+                    )?;
+                    if let Some(receiver_type) = &mut filter.receiver_type {
+                        match receiver_type {
+                            ResolvedCallReceiverType::Exact(identity) => resolve_query_identity(
+                                identity,
+                                filter.proof,
+                                LocatorRole::ReceiverType,
+                                ReceiverTypeConstraintKind::Exact,
+                                locators,
+                                resolved_locators,
+                            )?,
+                            ResolvedCallReceiverType::AssignableTo {
+                                root,
+                                resolved_identities,
+                            } => resolve_query_receiver_family(
+                                root,
+                                resolved_identities,
+                                locators,
+                                resolved_locators,
+                            )?,
+                        }
+                    }
                 }
+                QueryStep::ResolvedValue(filter) => resolve_query_identity(
+                    &mut filter.resolves_to,
+                    filter.proof,
+                    LocatorRole::Value,
+                    ReceiverTypeConstraintKind::Exact,
+                    locators,
+                    resolved_locators,
+                )?,
+                _ => {}
             }
         }
     }
@@ -461,6 +477,13 @@ fn resolve_query_identity(
     else {
         return Ok(());
     };
+    if matches!(role, LocatorRole::Value) && matches!(proof, ResolvedCallProof::Declared) {
+        return Err(source_error(
+            "invalid-resolved-value-proof",
+            source_range.clone().unwrap_or(0..0),
+            "resolved_value supports only :proof exact",
+        ));
+    }
     if resolved.is_some() || locators.is_deferred() {
         return Ok(());
     }
@@ -645,6 +668,7 @@ fn resolve_qualified_locator(
         .filter(|unit| match role {
             LocatorRole::Callable => unit.kind() == CodeUnitType::Function,
             LocatorRole::ReceiverType => unit.kind() == CodeUnitType::Class,
+            LocatorRole::Value => unit.kind() != CodeUnitType::FileScope,
         })
         .collect::<Vec<_>>();
     let source_identities = source_matches
@@ -728,6 +752,13 @@ fn resolve_qualified_locator(
                 ));
             }
             if matches!(role, LocatorRole::Callable) {
+                if record.language == "python" && record.has_complete_callable_shape_evidence() {
+                    // Python shape evidence identifies one declaration without closing its family.
+                    return Ok(ResolvedLocatorIdentity::ActiveSemanticModel {
+                        identity: record.id.clone(),
+                        provenance: Box::new(record.provenance.clone()),
+                    });
+                }
                 let Some(identity) = overlay
                     .as_ref()
                     .and_then(|overlay| overlay.callable_family_id_for_symbol(record))
@@ -817,6 +848,7 @@ fn model_symbol_matches_role(symbol: &SemanticModelSymbol, role: LocatorRole) ->
                 | SemanticModelSymbolKind::Module
                 | SemanticModelSymbolKind::TypeAlias
         ),
+        LocatorRole::Value => true,
     }
 }
 
@@ -853,21 +885,4 @@ pub(crate) fn is_qualified_locator_code(code: &str) -> bool {
                 .map(move |failure| failure.code(*role))
         })
         .any(|candidate| candidate == code)
-}
-
-fn source_error(
-    code: &'static str,
-    range: std::ops::Range<usize>,
-    message: impl Into<String>,
-) -> PolicySourceError {
-    PolicySourceError {
-        diagnostic: PolicySourceDiagnostic {
-            code,
-            severity: PolicySourceDiagnosticSeverity::Error,
-            message: message.into(),
-            range,
-            fix: None,
-            related: Vec::new(),
-        },
-    }
 }

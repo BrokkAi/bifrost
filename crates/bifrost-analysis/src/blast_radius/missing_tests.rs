@@ -23,6 +23,9 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
+#[cfg(test)]
+use crate::test_support::commit_all;
+
 #[cfg(any(test, feature = "test-support"))]
 #[path = "selected_missing_tests.rs"]
 mod selected_missing_tests;
@@ -118,6 +121,33 @@ struct ExactNodeOutcome {
     reaches_test_context: bool,
     callers: BTreeMap<DeclarationId, CodeUnit>,
     incomplete_reasons: BTreeSet<MissingTestsIncompleteReason>,
+}
+
+fn propagate_reachability_frontier(
+    pending: &mut BTreeSet<(usize, DeclarationId)>,
+    visited: &mut BTreeSet<(usize, DeclarationId)>,
+    outcomes: &BTreeMap<DeclarationId, ExactNodeOutcome>,
+    candidates: &mut [CandidateState],
+) {
+    let current = std::mem::take(pending);
+    for (candidate_index, id) in current {
+        if candidates[candidate_index].reached || !visited.insert((candidate_index, id.clone())) {
+            continue;
+        }
+        let outcome = &outcomes[&id];
+        if outcome.reaches_test_context {
+            candidates[candidate_index].reached = true;
+            continue;
+        }
+        candidates[candidate_index]
+            .incomplete_reasons
+            .extend(outcome.incomplete_reasons.iter().copied());
+        for caller_id in outcome.callers.keys() {
+            if !visited.contains(&(candidate_index, caller_id.clone())) {
+                pending.insert((candidate_index, caller_id.clone()));
+            }
+        }
+    }
 }
 
 struct PreparedMissingTests {
@@ -483,26 +513,7 @@ fn trace_exact_test_reachability(
             }
         }
 
-        let current = std::mem::take(&mut pending);
-        for (candidate_index, id) in current {
-            if candidates[candidate_index].reached || !visited.insert((candidate_index, id.clone()))
-            {
-                continue;
-            }
-            let outcome = &outcomes[&id];
-            if outcome.reaches_test_context {
-                candidates[candidate_index].reached = true;
-                continue;
-            }
-            candidates[candidate_index]
-                .incomplete_reasons
-                .extend(outcome.incomplete_reasons.iter().copied());
-            for caller_id in outcome.callers.keys() {
-                if !visited.contains(&(candidate_index, caller_id.clone())) {
-                    pending.insert((candidate_index, caller_id.clone()));
-                }
-            }
-        }
+        propagate_reachability_frontier(&mut pending, &mut visited, &outcomes, candidates);
     }
 }
 
@@ -741,42 +752,9 @@ fn render_function_section(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use git2::{IndexAddOption, Repository, Signature};
+    use crate::test_support::write_file as write;
+    use git2::Repository;
     use std::fs;
-
-    fn commit_all(repo: &Repository, message: &str) -> git2::Oid {
-        let mut index = repo.index().expect("repository index");
-        index
-            .add_all(["*"], IndexAddOption::DEFAULT, None)
-            .expect("stage fixture");
-        index.update_all(["*"], None).expect("stage deletions");
-        index.write().expect("write fixture index");
-        let tree = repo
-            .find_tree(index.write_tree().expect("fixture tree oid"))
-            .expect("fixture tree");
-        let signature = Signature::now("Tester", "tester@example.com").expect("signature");
-        let parent = repo
-            .head()
-            .ok()
-            .and_then(|head| head.target())
-            .map(|oid| repo.find_commit(oid).expect("fixture parent"));
-        let parents = parent.iter().collect::<Vec<_>>();
-        repo.commit(
-            Some("HEAD"),
-            &signature,
-            &signature,
-            message,
-            &tree,
-            &parents,
-        )
-        .expect("fixture commit")
-    }
-
-    fn write(root: &Path, path: &str, contents: &str) {
-        let target = root.join(path);
-        fs::create_dir_all(target.parent().expect("fixture parent")).expect("fixture directory");
-        fs::write(target, contents).expect("fixture source");
-    }
 
     #[cfg_attr(not(scheduled_tests), ignore = "scheduled-only")]
     #[test]

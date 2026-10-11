@@ -2,23 +2,27 @@
 
 use super::RustAnalyzer;
 use super::selected_reverse::{
-    RustSelectedReverseOutcome, with_rust_selected_reverse_queries,
+    RustSelectedReverseOutcome, RustSelectedReverseQueries, with_rust_selected_reverse_queries,
     with_rust_selected_reverse_queries_in_files,
 };
 use crate::CancellationToken;
 use crate::analyzer::resolution::MAX_REVERSE_TARGETS_PER_BATCH;
+use crate::analyzer::store::resolution_operation::RustReverseCandidateSet;
 use crate::analyzer::structural::reference_edges::EdgeCompleteness;
 use crate::analyzer::usages::outcome::GraphUsageOutcome;
 use crate::analyzer::usages::{
-    FuzzyResult, UsageAnalysisDiagnostic, UsageHit, UsageHitSurface, UsageProof,
-    UsageProofAuthority,
+    FuzzyResult, ReferenceKind, UsageAnalysisDiagnostic, UsageHit, UsageHitKind, UsageHitSurface,
+    UsageProof, UsageProofAuthority,
 };
 use crate::analyzer::usages::{GraphUsageAnalyzer, PreparedUsageQuery};
-use crate::analyzer::{CodeUnit, CodeUnitIndex, IAnalyzer, ProjectFile, resolve_analyzer};
+use crate::analyzer::{
+    AnalyzerQueryScope, CodeUnit, CodeUnitIndex, IAnalyzer, ProjectFile, QueryScope, Range,
+    resolve_analyzer,
+};
 use crate::hash::{HashMap, HashSet};
 use crate::text_utils::{compute_line_starts, trimmed_snippet_around_line};
 use brokk_bifrost_core::analyzer::usages::scan_scope::UsageScanScope;
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 #[derive(Default)]
 pub struct RustNativeUsageStrategy;
@@ -29,8 +33,38 @@ impl RustNativeUsageStrategy {
     }
 }
 
+/// What the prepare phase enumerated, kept for the find phase to borrow.
+///
+/// The candidate sets are the expensive part of a reverse query: enumerating
+/// one walks the target's export, import and glob routes through SQL. Prepare
+/// runs in its own selected operation and find in another, so a find that
+/// enumerated again would pay for every set twice. The sets are plain data,
+/// not handles into the prepare operation.
+///
+/// Each operation captures the project's analysis generation when it opens and
+/// checks it again when it finishes, but nothing carries one operation's value
+/// to the other. The candidate sets hold locators and topology ids that mean
+/// something only under the generation they were enumerated in, so the find
+/// phase asserts that its operation captured the same one. Request analyzers
+/// use frozen snapshots and disk projects report 0, so a mismatch is a broken
+/// design assumption, not an input to handle.
 struct PreparedNativeUsageQuery {
-    candidates: HashSet<ProjectFile>,
+    /// The analysis generation the prepare operation captured.
+    generation: u64,
+    /// The distinct overloads prepared, in order; `candidate_sets` is parallel.
+    targets: Vec<CodeUnit>,
+    candidate_sets: Vec<RustReverseCandidateSet>,
+    files: HashSet<ProjectFile>,
+}
+
+struct PendingNativeUsageHit {
+    target_index: usize,
+    range: Range,
+    enclosing: CodeUnit,
+    proof: UsageProof,
+    kind: UsageHitKind,
+    reference_kind: Option<ReferenceKind>,
+    external_edge: bool,
 }
 
 impl GraphUsageAnalyzer for RustNativeUsageStrategy {
@@ -49,14 +83,29 @@ impl GraphUsageAnalyzer for RustNativeUsageStrategy {
         cancellation: &CancellationToken,
     ) -> Option<Box<dyn PreparedUsageQuery>> {
         let rust = resolve_analyzer::<RustAnalyzer>(analyzer)?;
-        let RustSelectedReverseOutcome::Ready(Some(candidates)) =
+        let targets = unique_targets(overloads);
+        let RustSelectedReverseOutcome::Ready((generation, Some(candidate_sets))) =
             with_rust_selected_reverse_queries(rust, cancellation, |queries| {
-                queries.candidate_files(overloads)
+                Ok((
+                    queries.analysis_generation(),
+                    queries.candidate_sets(&targets)?,
+                ))
             })
         else {
             return None;
         };
-        Some(Box::new(PreparedNativeUsageQuery { candidates }))
+        let root = rust.inner.project().root();
+        let files = targets
+            .iter()
+            .zip(&candidate_sets)
+            .flat_map(|(target, set)| set.files(root, target))
+            .collect();
+        Some(Box::new(PreparedNativeUsageQuery {
+            generation,
+            targets,
+            candidate_sets,
+            files,
+        }))
     }
 
     fn find_graph_usages(
@@ -66,23 +115,15 @@ impl GraphUsageAnalyzer for RustNativeUsageStrategy {
         scan_scope: &UsageScanScope<'_>,
         max_usages: usize,
     ) -> GraphUsageOutcome {
-        let Some(primary) = overloads.first() else {
-            return GraphUsageOutcome::Resolved(FuzzyResult::empty_success());
-        };
-        let Some(rust) = resolve_analyzer::<RustAnalyzer>(analyzer) else {
-            return GraphUsageOutcome::TerminalFailure(diagnostic(
-                primary,
-                "native_resolution_unavailable",
-                "selected Rust analyzer is unavailable".into(),
-            ));
-        };
-        find_native_usages(rust, overloads, scan_scope, max_usages)
+        with_native_rust(analyzer, overloads, |rust| {
+            find_native_usages(rust, overloads, scan_scope, max_usages)
+        })
     }
 }
 
 impl PreparedUsageQuery for PreparedNativeUsageQuery {
     fn candidate_files(&self) -> &HashSet<ProjectFile> {
-        &self.candidates
+        &self.files
     }
 
     fn find_graph_usages(
@@ -92,9 +133,60 @@ impl PreparedUsageQuery for PreparedNativeUsageQuery {
         scan_scope: &UsageScanScope<'_>,
         max_usages: usize,
     ) -> GraphUsageOutcome {
-        RustNativeUsageStrategy::new()
-            .find_graph_usages(analyzer, overloads, scan_scope, max_usages)
+        with_native_rust(analyzer, overloads, |rust| {
+            execute_native_usages_with(
+                rust,
+                overloads,
+                scan_scope,
+                max_usages,
+                |queries, targets| {
+                    assert_eq!(
+                        targets,
+                        self.targets.as_slice(),
+                        "the find phase answers the overloads the prepare phase enumerated"
+                    );
+                    assert_eq!(
+                        queries.analysis_generation(),
+                        self.generation,
+                        "the candidate sets were enumerated under another analysis generation \
+                         than the find operation captured: the project moved between the \
+                         prepare and find operations, so the sets' locators and topology ids \
+                         may be stale"
+                    );
+                    Ok(Some(self.candidate_sets.as_slice()))
+                },
+            )
+            .outcome
+        })
     }
+}
+
+/// Run `find` on the selected Rust analyzer, or say why there is none.
+fn with_native_rust(
+    analyzer: &dyn IAnalyzer,
+    overloads: &[CodeUnit],
+    find: impl FnOnce(&RustAnalyzer) -> GraphUsageOutcome,
+) -> GraphUsageOutcome {
+    let Some(primary) = overloads.first() else {
+        return GraphUsageOutcome::Resolved(FuzzyResult::empty_success());
+    };
+    let Some(rust) = resolve_analyzer::<RustAnalyzer>(analyzer) else {
+        return GraphUsageOutcome::TerminalFailure(diagnostic(
+            primary,
+            "native_resolution_unavailable",
+            "selected Rust analyzer is unavailable".into(),
+        ));
+    };
+    find(rust)
+}
+
+fn unique_targets(targets: &[CodeUnit]) -> Vec<CodeUnit> {
+    let mut seen = HashSet::default();
+    targets
+        .iter()
+        .filter(|target| seen.insert(*target))
+        .cloned()
+        .collect()
 }
 
 fn diagnostic(target: &CodeUnit, kind: &str, reason: String) -> UsageAnalysisDiagnostic {
@@ -134,11 +226,30 @@ struct NativeUsageWork {
     snippet_sources: Vec<ProjectFile>,
 }
 
+/// Answer without prepared sets: each target's set is enumerated once, inside
+/// the same selected operation that queries it.
 fn execute_native_usages(
     rust: &RustAnalyzer,
     targets: &[CodeUnit],
     scope: &UsageScanScope<'_>,
     max_usages: usize,
+) -> NativeUsageExecution {
+    execute_native_usages_with(rust, targets, scope, max_usages, |queries, targets| {
+        queries.candidate_sets(targets)
+    })
+}
+
+/// `sets_for` yields the sets of the distinct targets, in order: either
+/// enumerated inside the operation, or borrowed from a prepare phase.
+fn execute_native_usages_with<Sets: AsRef<[RustReverseCandidateSet]>>(
+    rust: &RustAnalyzer,
+    targets: &[CodeUnit],
+    scope: &UsageScanScope<'_>,
+    max_usages: usize,
+    sets_for: impl FnOnce(
+        &mut dyn RustSelectedReverseQueries,
+        &[CodeUnit],
+    ) -> crate::analyzer::store::Result<Option<Sets>>,
 ) -> NativeUsageExecution {
     #[cfg(test)]
     let mut work = NativeUsageWork::default();
@@ -148,30 +259,39 @@ fn execute_native_usages(
         };
         let fallback_cancellation = CancellationToken::new();
         let cancellation = scope.cancellation().unwrap_or(&fallback_cancellation);
-        let mut seen = HashSet::default();
-        let targets = targets
-            .iter()
-            .filter(|target| seen.insert(*target))
-            .cloned()
-            .collect::<Vec<_>>();
+        let targets = unique_targets(targets);
         let outcome = with_rust_selected_reverse_queries_in_files(
             rust,
             scope.candidate_files(),
             cancellation,
             |queries| {
                 let result = (|| {
-                    let mut hits_by_overload = HashMap::default();
-                    let mut unproven_by_overload = HashMap::default();
-                    let mut unproven_total_by_overload = HashMap::default();
+                    let Some(candidate_sets) = sets_for(&mut *queries, &targets)? else {
+                        return Ok(None);
+                    };
+                    let candidate_sets = candidate_sets.as_ref();
+                    assert_eq!(
+                        targets.len(),
+                        candidate_sets.len(),
+                        "every distinct target has one candidate set"
+                    );
                     let mut diagnostics = Vec::new();
-                    let mut external_hits = BTreeSet::new();
-                    let mut sources = HashMap::default();
-                    for targets in targets.chunks(MAX_REVERSE_TARGETS_PER_BATCH) {
-                        let Some(answers) = queries.inverse_for(targets)? else {
+                    let mut pending_by_file =
+                        BTreeMap::<ProjectFile, Vec<PendingNativeUsageHit>>::new();
+                    let mut target_start = 0;
+                    for target_batch in targets.chunks(MAX_REVERSE_TARGETS_PER_BATCH) {
+                        let Some(answers) = queries.inverse_for_candidates(
+                            target_batch,
+                            &candidate_sets[target_start..target_start + target_batch.len()],
+                        )?
+                        else {
                             return Ok(None);
                         };
-                        assert_eq!(targets.len(), answers.len());
-                        for (target, answer) in targets.iter().zip(answers) {
+                        assert_eq!(target_batch.len(), answers.len());
+                        for (batch_offset, (target, answer)) in
+                            target_batch.iter().zip(answers).enumerate()
+                        {
+                            let target_index = target_start + batch_offset;
                             if let EdgeCompleteness::Incomplete { reasons } = &answer.completeness {
                                 diagnostics.push(diagnostic(
                                     target,
@@ -187,77 +307,31 @@ fn execute_native_usages(
                                     ),
                                 ));
                             }
-                            let mut hits = BTreeSet::new();
-                            let mut unproven = BTreeSet::new();
                             for edge in answer.edges {
                                 if cancellation.is_cancelled() {
                                     return Ok(None);
                                 }
                                 assert_eq!(&edge.target, target);
                                 assert!(scope.allows(&edge.site.file));
-                                if !sources.contains_key(&edge.site.file) {
-                                    let source =
-                                        rust.indexed_source(&edge.site.file).ok_or_else(|| {
-                                            crate::analyzer::store::StoreError::new(format!(
-                                                "selected usage source is unavailable for {}",
-                                                edge.site.file
-                                            ))
-                                        })?;
-                                    #[cfg(test)]
-                                    work.snippet_sources.push(edge.site.file.clone());
-                                    if !rust.inner.source_matches_selected_native_content(
-                                        &edge.site.file,
-                                        &source,
-                                    ) {
-                                        return Err(crate::analyzer::store::StoreError::new(
-                                            format!(
-                                                "selected usage source changed for {}",
-                                                edge.site.file
-                                            ),
-                                        ));
-                                    }
-                                    let line_starts = compute_line_starts(&source);
-                                    sources.insert(edge.site.file.clone(), (source, line_starts));
-                                }
-                                let (source, line_starts) = sources
-                                    .get(&edge.site.file)
-                                    .expect("selected usage source was admitted");
-                                let snippet = trimmed_snippet_around_line(
-                                    source,
-                                    line_starts,
-                                    edge.site.range.start_line.saturating_sub(1),
-                                    0,
-                                );
                                 // Imports and other module-level occurrences have no
                                 // enclosing callable. A file-scope display owner does
                                 // not invent a semantic target or a callable edge.
-                                let owner = edge.site.enclosing.unwrap_or_else(|| {
-                                    CodeUnit::file_scope(edge.site.file.clone())
-                                });
-                                let mut hit = UsageHit::new(
-                                    edge.site.file,
-                                    edge.site.range.start_line,
-                                    edge.site.range.start_byte,
-                                    edge.site.range.end_byte,
-                                    owner,
-                                    if edge.proof == UsageProof::Proven {
-                                        1.0
-                                    } else {
-                                        0.0
+                                let file = edge.site.file;
+                                let owner = edge
+                                    .site
+                                    .enclosing
+                                    .unwrap_or_else(|| CodeUnit::file_scope(file.clone()));
+                                pending_by_file.entry(file).or_default().push(
+                                    PendingNativeUsageHit {
+                                        target_index,
+                                        range: edge.site.range,
+                                        enclosing: owner,
+                                        proof: edge.proof,
+                                        kind: edge.usage_kind,
+                                        reference_kind: edge.reference_kind,
+                                        external_edge: true,
                                     },
-                                    snippet,
                                 );
-                                hit.kind = edge.usage_kind;
-                                hit.proof = edge.proof;
-                                hit.reference_kind = edge.reference_kind;
-                                if hit.proof == UsageProof::Proven {
-                                    if hit.kind.included_in(UsageHitSurface::ExternalUsages) {
-                                        external_hits.insert(hit.clone());
-                                    }
-                                    hits.insert(hit);
-                                } else {
-                                    unproven.insert(hit);
-                                }
                             }
                             if (target.is_class() || target.is_field())
                                 && let Some(implementations) = rust
@@ -274,65 +348,148 @@ fn execute_native_usages(
                                     if !scope.allows(&file) {
                                         continue;
                                     }
-                                    if !sources.contains_key(&file) {
-                                        let source = rust.indexed_source(&file).ok_or_else(|| {
-                                            crate::analyzer::store::StoreError::new(format!(
-                                                "selected implementation source is unavailable for {file}"
-                                            ))
-                                        })?;
-                                        if !rust
-                                            .inner
-                                            .source_matches_selected_native_content(&file, &source)
-                                        {
-                                            return Err(crate::analyzer::store::StoreError::new(
-                                                format!(
-                                                    "selected implementation source changed for {file}"
-                                                ),
-                                            ));
-                                        }
-                                        let line_starts = compute_line_starts(&source);
-                                        sources.insert(file.clone(), (source, line_starts));
-                                    }
-                                    let (source, line_starts) = sources
-                                        .get(&file)
-                                        .expect("selected implementation source was admitted");
                                     for range in rust.ranges_of(&implementation) {
-                                        let snippet = trimmed_snippet_around_line(
-                                            source,
-                                            line_starts,
-                                            range.start_line.saturating_sub(1),
-                                            0,
-                                        );
-                                        hits.insert(
-                                            UsageHit::new(
-                                                file.clone(),
-                                                range.start_line,
-                                                range.start_byte,
-                                                range.end_byte,
-                                                implementation.clone(),
-                                                1.0,
-                                                snippet,
-                                            )
-                                            // The impl declaration implements the queried
-                                            // trait member and belongs on the usage surface.
-                                            .into_override_declaration(),
+                                        pending_by_file.entry(file.clone()).or_default().push(
+                                            PendingNativeUsageHit {
+                                                target_index,
+                                                range,
+                                                enclosing: implementation.clone(),
+                                                proof: UsageProof::Proven,
+                                                kind: UsageHitKind::OverrideDeclaration,
+                                                reference_kind: None,
+                                                external_edge: false,
+                                            },
                                         );
                                     }
                                 }
                             }
-                            let FuzzyResult::Success {
-                                hits_by_overload: proven,
-                                unproven_by_overload: uncertain,
-                                unproven_total_by_overload: totals,
-                            } = FuzzyResult::success_with_unproven(target.clone(), hits, unproven)
-                            else {
-                                unreachable!("success constructor produces Success");
-                            };
-                            hits_by_overload.extend(proven);
-                            unproven_by_overload.extend(uncertain);
-                            unproven_total_by_overload.extend(totals);
                         }
-                        if external_hits.len() > max_usages {
+                        target_start += target_batch.len();
+                    }
+
+                    let syntax_scope = AnalyzerQueryScope::with_cancellation(rust, cancellation);
+                    let mut hits_by_target = (0..targets.len())
+                        .map(|_| BTreeSet::new())
+                        .collect::<Vec<BTreeSet<UsageHit>>>();
+                    let mut unproven_by_target = (0..targets.len())
+                        .map(|_| BTreeSet::new())
+                        .collect::<Vec<BTreeSet<UsageHit>>>();
+                    let mut external_by_target = (0..targets.len())
+                        .map(|_| BTreeSet::new())
+                        .collect::<Vec<BTreeSet<UsageHit>>>();
+                    for (file, pending) in pending_by_file {
+                        if cancellation.is_cancelled() {
+                            return Ok(None);
+                        }
+                        let source = rust.indexed_source(&file).ok_or_else(|| {
+                            crate::analyzer::store::StoreError::new(format!(
+                                "selected usage source is unavailable for {file}"
+                            ))
+                        })?;
+                        #[cfg(test)]
+                        if pending.iter().any(|hit| hit.external_edge) {
+                            work.snippet_sources.push(file.clone());
+                        }
+                        if !rust
+                            .inner
+                            .source_matches_selected_native_content(&file, &source)
+                        {
+                            return Err(crate::analyzer::store::StoreError::new(format!(
+                                "selected usage source changed for {file}"
+                            )));
+                        }
+                        let prepared = rust
+                            .prepared_syntax(syntax_scope.token(), &file)
+                            .ok_or_else(|| {
+                                crate::analyzer::store::StoreError::new(format!(
+                                    "selected usage syntax is unavailable for {file}"
+                                ))
+                            })?;
+                        if prepared.source() != source {
+                            return Err(crate::analyzer::store::StoreError::new(format!(
+                                "selected usage syntax source changed for {file}"
+                            )));
+                        }
+                        let line_starts = compute_line_starts(&source);
+                        for pending_hit in pending {
+                            let activation = super::site_activation::rust_site_activation(
+                                Some(prepared.tree()),
+                                &source,
+                                pending_hit.range.start_byte..pending_hit.range.end_byte,
+                                |condition| {
+                                    queries.rust_cfg_activation_for_caller_under_site_cfg(
+                                        file.rel_path(),
+                                        condition,
+                                        cancellation,
+                                    )
+                                },
+                            )?;
+                            let Some(activation) = activation else {
+                                return Ok(None);
+                            };
+                            let (proof, reason_kind) = match activation {
+                                super::site_activation::RustSiteActivation::NoNode => {
+                                    return Err(crate::analyzer::store::StoreError::new(format!(
+                                        "Rust usage hit has no syntax node: {file}:{}..{}",
+                                        pending_hit.range.start_byte, pending_hit.range.end_byte
+                                    )));
+                                }
+                                super::site_activation::RustSiteActivation::Inactive => continue,
+                                super::site_activation::RustSiteActivation::Active => {
+                                    (pending_hit.proof, None)
+                                }
+                                super::site_activation::RustSiteActivation::Unknown { .. } => {
+                                    (UsageProof::Unproven, Some("unknown_activation"))
+                                }
+                            };
+                            let snippet = trimmed_snippet_around_line(
+                                &source,
+                                &line_starts,
+                                pending_hit.range.start_line.saturating_sub(1),
+                                0,
+                            );
+                            let mut hit = UsageHit::new(
+                                file.clone(),
+                                pending_hit.range.start_line,
+                                pending_hit.range.start_byte,
+                                pending_hit.range.end_byte,
+                                pending_hit.enclosing,
+                                if proof == UsageProof::Proven {
+                                    1.0
+                                } else {
+                                    0.0
+                                },
+                                snippet,
+                            );
+                            hit.kind = pending_hit.kind;
+                            hit.proof = proof;
+                            hit.reference_kind = pending_hit.reference_kind;
+                            if let Some(reason_kind) = reason_kind {
+                                hit.reason_kind = Some(reason_kind.to_owned());
+                            }
+                            if proof == UsageProof::Proven {
+                                if pending_hit.external_edge
+                                    && hit.kind.included_in(UsageHitSurface::ExternalUsages)
+                                {
+                                    external_by_target[pending_hit.target_index]
+                                        .insert(hit.clone());
+                                }
+                                hits_by_target[pending_hit.target_index].insert(hit);
+                            } else {
+                                unproven_by_target[pending_hit.target_index].insert(hit);
+                            }
+                        }
+                    }
+
+                    let mut hits_by_overload = HashMap::default();
+                    let mut unproven_by_overload = HashMap::default();
+                    let mut unproven_total_by_overload = HashMap::default();
+                    let mut external_hits = BTreeSet::new();
+                    for (target_index, target) in targets.iter().enumerate() {
+                        external_hits.extend(external_by_target[target_index].iter().cloned());
+                        let last_in_batch = target_index + 1 == targets.len()
+                            || (target_index + 1) % MAX_REVERSE_TARGETS_PER_BATCH == 0;
+                        if last_in_batch && external_hits.len() > max_usages {
                             return Ok(Some(FuzzyResult::TooManyCallsites {
                                 short_name: primary.short_name().to_owned(),
                                 total_callsites: external_hits.len(),
@@ -340,6 +497,21 @@ fn execute_native_usages(
                                 sample_hits: external_hits.into_iter().take(max_usages).collect(),
                             }));
                         }
+                        let FuzzyResult::Success {
+                            hits_by_overload: proven,
+                            unproven_by_overload: uncertain,
+                            unproven_total_by_overload: totals,
+                        } = FuzzyResult::success_with_unproven(
+                            target.clone(),
+                            std::mem::take(&mut hits_by_target[target_index]),
+                            std::mem::take(&mut unproven_by_target[target_index]),
+                        )
+                        else {
+                            unreachable!("success constructor produces Success");
+                        };
+                        hits_by_overload.extend(proven);
+                        unproven_by_overload.extend(uncertain);
+                        unproven_total_by_overload.extend(totals);
                     }
                     Ok(Some(if diagnostics.is_empty() {
                         FuzzyResult::Success {
@@ -412,6 +584,9 @@ mod tests {
     /// for the import, and dropped its root route, its bridge and every
     /// reference that arrives through it -- in both directions.
     #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "76ae6f046f6d: root exposure, rather than file bytes, owns file-scope imports"
+    )]
     fn native_usage_follows_root_exposure_whatever_the_root_file_opens_with() {
         for lead in ["", "\n", "\n\n", "// root\n"] {
             for (label, files) in [
@@ -489,6 +664,108 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// The usages path enumerates each target's candidate set once. Prepare
+    /// and find are separate selected operations, and find used to enumerate
+    /// the same sets again: four enumerations for a two-target request.
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "9e0ebc694953: the usages path enumerated every candidate set in prepare and again in find"
+    )]
+    fn the_usages_path_enumerates_each_targets_candidate_set_once() {
+        use crate::analyzer::store::resolution_operation::{
+            candidate_set_enumerations_for_test, reset_candidate_set_enumerations_for_test,
+        };
+        let fixture = InlineTestProject::with_language(Language::Rust)
+            .file("Cargo.toml", "[package]\nname = \"usage\"\nversion = \"0.1.0\"\nedition = \"2024\"\n")
+            .file("src/lib.rs", "pub mod api;\nuse crate::api::{first, second};\npub fn caller() { first(); second(); }\n")
+            .file("src/api.rs", "pub fn first() {}\npub fn second() {}\n")
+            .build();
+        let rust = RustAnalyzer::new(fixture.project_dyn());
+        let targets = ["first", "second"].map(|name| {
+            rust.declarations(&fixture.file("src/api.rs"))
+                .into_iter()
+                .find(|unit| unit.identifier() == name)
+                .unwrap()
+        });
+        let admitted = HashSet::from_iter([fixture.file("src/lib.rs")]);
+
+        reset_candidate_set_enumerations_for_test();
+        let prepared = RustNativeUsageStrategy
+            .prepare_usage_query(
+                &rust,
+                &targets,
+                &HashSet::default(),
+                &CancellationToken::new(),
+            )
+            .expect("native Rust candidate inventory");
+        assert_eq!(candidate_set_enumerations_for_test(), 2, "prepare");
+        let result =
+            prepared.find_graph_usages(&rust, &targets, &UsageScanScope::new(&admitted), 10);
+        assert_eq!(
+            candidate_set_enumerations_for_test(),
+            2,
+            "find borrows the prepared sets"
+        );
+        let GraphUsageOutcome::Resolved(result @ FuzzyResult::Success { .. }) = result else {
+            panic!("both calls must resolve: {result:?}");
+        };
+        assert_eq!(result.all_hits().len(), 2, "{result:?}");
+
+        reset_candidate_set_enumerations_for_test();
+        let unprepared = find_native_usages(&rust, &targets, &UsageScanScope::new(&admitted), 10);
+        assert_eq!(
+            candidate_set_enumerations_for_test(),
+            2,
+            "without a prepare phase, find enumerates once itself"
+        );
+        let GraphUsageOutcome::Resolved(unprepared @ FuzzyResult::Success { .. }) = unprepared
+        else {
+            panic!("both calls must resolve: {unprepared:?}");
+        };
+        assert_eq!(unprepared.all_hits().len(), 2, "{unprepared:?}");
+    }
+
+    /// The prepared sets are valid only under the generation they were
+    /// enumerated in. A live overlay project, unlike the frozen snapshots
+    /// requests use, can move between the prepare and find operations.
+    #[test]
+    #[should_panic(expected = "the project moved between the prepare and find operations")]
+    fn a_find_under_a_moved_generation_does_not_use_the_prepared_sets() {
+        let fixture = InlineTestProject::with_language(Language::Rust)
+            .file(
+                "Cargo.toml",
+                "[package]\nname = \"usage\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+            )
+            .file(
+                "src/lib.rs",
+                "pub fn target() {}\npub fn caller() { target(); }\n",
+            )
+            .build();
+        let overlay = std::sync::Arc::new(crate::OverlayProject::new(fixture.project_dyn()));
+        let rust = RustAnalyzer::new(fixture.project_dyn()).clone_with_project(overlay.clone());
+        let target = rust
+            .declarations(&fixture.file("src/lib.rs"))
+            .into_iter()
+            .find(|unit| unit.identifier() == "target")
+            .unwrap();
+        let admitted = HashSet::from_iter([fixture.file("src/lib.rs")]);
+        let prepared = RustNativeUsageStrategy
+            .prepare_usage_query(
+                &rust,
+                std::slice::from_ref(&target),
+                &HashSet::default(),
+                &CancellationToken::new(),
+            )
+            .expect("native Rust candidate inventory");
+        assert!(overlay.set(fixture.file("notes.txt").abs_path(), "moved\n".to_owned()));
+        prepared.find_graph_usages(
+            &rust,
+            std::slice::from_ref(&target),
+            &UsageScanScope::new(&admitted),
+            10,
+        );
     }
 
     #[test]
@@ -711,6 +988,36 @@ mod tests {
     /// routes therefore never narrow that scope, and this is the pin: a usage
     /// of a provider crate's function, written in a crate that depends on it,
     /// is still found.
+
+    #[test]
+    fn native_usage_retains_proven_calls_without_certifying_incomplete_inventory() {
+        let fixture = InlineTestProject::with_language(Language::Rust)
+            .file("Cargo.toml", "[package]\nname = \"usage\"\nversion = \"0.1.0\"\nedition = \"2024\"\n")
+            // A module mount keeps the token tree unenumerable; a bare `unknown_macro!()`
+            // no longer leaves the reference inventory incomplete.
+            .file("src/lib.rs", "pub fn target() {}\npub fn caller() { target(); }\npub fn opaque() { unknown_macro! { mod generated; } }\n")
+            .build();
+        let rust = RustAnalyzer::new(fixture.project_dyn());
+        let target = rust
+            .declarations(&fixture.file("src/lib.rs"))
+            .into_iter()
+            .find(|unit| unit.identifier() == "target")
+            .unwrap();
+        let admitted = HashSet::from_iter([fixture.file("src/lib.rs")]);
+        let result = find_native_usages(&rust, &[target], &UsageScanScope::new(&admitted), 10);
+        let GraphUsageOutcome::Resolved(result @ FuzzyResult::Incomplete { .. }) = result else {
+            panic!("native inventory gap must remain explicit: {result:?}");
+        };
+        assert_eq!(result.all_hits().len(), 1, "{result:?}");
+        assert!(
+            result
+                .all_hits()
+                .iter()
+                .all(|hit| hit.proof == UsageProof::Proven)
+        );
+        assert!(result.into_either().is_err());
+    }
+
     #[test]
     fn a_reverse_request_still_finds_a_usage_in_a_dependent_crate() {
         let fixture = InlineTestProject::with_language(Language::Rust)
@@ -771,35 +1078,6 @@ mod tests {
                     && hit.proof == UsageProof::Proven),
             "the call in the dependent crate is a proven hit: {result:?}"
         );
-    }
-
-    #[test]
-    fn native_usage_retains_proven_calls_without_certifying_incomplete_inventory() {
-        let fixture = InlineTestProject::with_language(Language::Rust)
-            .file("Cargo.toml", "[package]\nname = \"usage\"\nversion = \"0.1.0\"\nedition = \"2024\"\n")
-            // A module mount keeps the token tree unenumerable; a bare `unknown_macro!()`
-            // no longer leaves the reference inventory incomplete.
-            .file("src/lib.rs", "pub fn target() {}\npub fn caller() { target(); }\npub fn opaque() { unknown_macro! { mod generated; } }\n")
-            .build();
-        let rust = RustAnalyzer::new(fixture.project_dyn());
-        let target = rust
-            .declarations(&fixture.file("src/lib.rs"))
-            .into_iter()
-            .find(|unit| unit.identifier() == "target")
-            .unwrap();
-        let admitted = HashSet::from_iter([fixture.file("src/lib.rs")]);
-        let result = find_native_usages(&rust, &[target], &UsageScanScope::new(&admitted), 10);
-        let GraphUsageOutcome::Resolved(result @ FuzzyResult::Incomplete { .. }) = result else {
-            panic!("native inventory gap must remain explicit: {result:?}");
-        };
-        assert_eq!(result.all_hits().len(), 1, "{result:?}");
-        assert!(
-            result
-                .all_hits()
-                .iter()
-                .all(|hit| hit.proof == UsageProof::Proven)
-        );
-        assert!(result.into_either().is_err());
     }
 
     #[test]

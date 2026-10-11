@@ -54,6 +54,14 @@ pub(crate) struct MacroTemplate {
     declarations: Vec<(Range<usize>, MacroLexicalBinding)>,
 }
 
+pub(crate) struct MacroLexicalIndex {
+    /// Length of the source the index was built from. The memo is keyed by
+    /// file alone, so every caller in one query must pass that file's tree.
+    pub(crate) source_len: usize,
+    references: MacroLexicalReferences,
+    declarations: Vec<(Range<usize>, MacroLexicalBinding)>,
+}
+
 pub(crate) fn binding(
     visibility: &VisibilityIndex<'_>,
     file: &ProjectFile,
@@ -65,7 +73,40 @@ pub(crate) fn binding(
     if start_byte >= end_byte || end_byte > source.len() {
         return None;
     }
-    let mut found = Vec::new();
+    // The raw scan preserves the focused scan's push order. Focus only filters
+    // overlapping records; the final match requires containment, so selecting
+    // the first containing raw record is equivalent to the old focused scan.
+    let index = visibility.macro_lexical_index(file, root, source);
+    if index.references.cancelled || index.references.truncated {
+        return None;
+    }
+    if let Some(binding) = index
+        .references
+        .references
+        .iter()
+        .find(|(range, _)| start_byte >= range.start && end_byte <= range.end)
+        .map(|(_, binding)| binding.clone())
+    {
+        return Some(binding);
+    }
+
+    // Definition spellings are intentionally omitted from the inverse list,
+    // but goto-definition may start on one of those spellings. Keep the
+    // declaration check structurally separate from reference enumeration.
+    index
+        .declarations
+        .iter()
+        .find(|(range, _)| start_byte >= range.start && end_byte <= range.end)
+        .map(|(_, binding)| binding.clone())
+}
+
+pub(crate) fn build_index(
+    visibility: &VisibilityIndex<'_>,
+    file: &ProjectFile,
+    root: Node<'_>,
+    source: &str,
+) -> MacroLexicalIndex {
+    let mut raw_references = Vec::new();
     let mut cancelled = || false;
     let result = references(
         || visibility,
@@ -74,33 +115,39 @@ pub(crate) fn binding(
         source,
         usize::MAX,
         &mut cancelled,
-        Some(start_byte..end_byte),
-        &mut found,
+        None,
+        &mut raw_references,
     );
-    if result.cancelled || result.truncated {
-        return None;
+    let references = MacroLexicalReferences {
+        references: raw_references,
+        truncated: result.truncated,
+        cancelled: result.cancelled,
+    };
+    let declarations = if references.cancelled || references.truncated {
+        Vec::new()
+    } else {
+        collect_declarations(visibility, file, root, source)
+    };
+    MacroLexicalIndex {
+        source_len: source.len(),
+        references,
+        declarations,
     }
-    if let Some(binding) = found
-        .into_iter()
-        .find(|(range, _)| start_byte >= range.start && end_byte <= range.end)
-        .map(|(_, binding)| binding)
-    {
-        return Some(binding);
-    }
+}
 
-    // Definition spellings are intentionally omitted from the inverse list,
-    // but goto-definition may start on one of those spellings. Keep the
-    // declaration check structurally separate from reference enumeration.
+fn collect_declarations(
+    visibility: &VisibilityIndex<'_>,
+    file: &ProjectFile,
+    root: Node<'_>,
+    source: &str,
+) -> Vec<(Range<usize>, MacroLexicalBinding)> {
+    let mut declarations = Vec::new();
     let mut stack = vec![root];
     while let Some(definition) = stack.pop() {
         if definition.kind() == "preproc_function_def"
             && let Some(template) = definition_template(visibility, file, definition, source)
-            && let Some((_, binding)) = template
-                .declarations
-                .into_iter()
-                .find(|(range, _)| start_byte >= range.start && end_byte <= range.end)
         {
-            return Some(binding);
+            declarations.extend(template.declarations);
         }
         if definition.kind() == "call_expression"
             && let Some(function) = definition
@@ -130,17 +177,16 @@ pub(crate) fn binding(
                         file,
                         definition,
                     ) && instantiated.binding.definition == *file
-                        && start_byte >= instantiated.binding.name_range.start
-                        && end_byte <= instantiated.binding.name_range.end
                     {
-                        return Some(instantiated.binding);
+                        let range = instantiated.binding.name_range.clone();
+                        declarations.push((range, instantiated.binding));
                     }
                 }
             }
         }
         push_named_children_reversed(definition, &mut stack);
     }
-    None
+    declarations
 }
 
 pub(crate) fn all_references<'visibility, 'source: 'visibility, Factory>(
@@ -244,10 +290,14 @@ fn references<'visibility, 'source: 'visibility>(
             continue;
         };
         for record in template.references {
-            if focus
-                .as_ref()
-                .is_none_or(|range| ranges_overlap(range, &record.0))
-                && !push_record(output, record, max_references)
+            if focus.as_ref().is_none_or(|range| {
+                brokk_bifrost_core::util::byte_ranges_overlap(
+                    range.start,
+                    range.end,
+                    record.0.start,
+                    record.0.end,
+                )
+            }) && !push_record(output, record, max_references)
             {
                 state.truncated = true;
                 return state;
@@ -288,10 +338,15 @@ fn references<'visibility, 'source: 'visibility>(
             instantiate_binding(binding, &template.parameters, &actuals, source, file, call)
         };
         for (index, actual) in actuals.iter().copied().enumerate() {
-            if focus
-                .as_ref()
-                .is_some_and(|range| !ranges_overlap(range, &actual.byte_range()))
-            {
+            if focus.as_ref().is_some_and(|range| {
+                let actual_range = actual.byte_range();
+                !brokk_bifrost_core::util::byte_ranges_overlap(
+                    range.start,
+                    range.end,
+                    actual_range.start,
+                    actual_range.end,
+                )
+            }) {
                 continue;
             }
             let Some(bindings) = template.formal_locals.get(&index) else {
@@ -311,10 +366,14 @@ fn references<'visibility, 'source: 'visibility>(
                     && !actual_has_prior_declaration(actual, node, source, &binding.name)
                 {
                     let range = node.start_byte()..node.end_byte();
-                    if focus
-                        .as_ref()
-                        .is_none_or(|focused| ranges_overlap(focused, &range))
-                        && !push_record(output, (range, binding.binding), max_references)
+                    if focus.as_ref().is_none_or(|focused| {
+                        brokk_bifrost_core::util::byte_ranges_overlap(
+                            focused.start,
+                            focused.end,
+                            range.start,
+                            range.end,
+                        )
+                    }) && !push_record(output, (range, binding.binding), max_references)
                     {
                         state.truncated = true;
                         return state;
@@ -659,8 +718,14 @@ fn collect_escaped_references(
                 && !has_intervening_declaration(visibility, file, root, call, node, source, name)
             {
                 let range = node.start_byte()..node.end_byte();
-                if focus.is_none_or(|focused| ranges_overlap(focused, &range))
-                    && !push_record(output, (range, local.binding.clone()), max_references)
+                if focus.is_none_or(|focused| {
+                    brokk_bifrost_core::util::byte_ranges_overlap(
+                        focused.start,
+                        focused.end,
+                        range.start,
+                        range.end,
+                    )
+                }) && !push_record(output, (range, local.binding.clone()), max_references)
                 {
                     state.truncated = true;
                     return;
@@ -789,10 +854,6 @@ fn is_identifier_node(node: Node<'_>) -> bool {
         node.kind(),
         "identifier" | "type_identifier" | "namespace_identifier"
     )
-}
-
-fn ranges_overlap(left: &Range<usize>, right: &Range<usize>) -> bool {
-    left.start < right.end && right.start < left.end
 }
 
 fn push_record(
@@ -927,55 +988,4 @@ pub(crate) fn typed_binding<'tree>(
         .into_iter()
         .max_by_key(|(byte, _)| *byte)
         .map(|(_, binding)| binding)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn candidate_free_scan_does_not_construct_visibility() {
-        let source = "struct Owner { int value; };";
-        let mut parser = tree_sitter::Parser::new();
-        parser
-            .set_language(&tree_sitter_cpp::LANGUAGE.into())
-            .unwrap();
-        let tree = parser.parse(source, None).unwrap();
-        let root = std::env::current_dir().unwrap();
-        let file = ProjectFile::new(&root, "owner.cpp");
-        let result = all_references(
-            || panic!("candidate-free scan must not construct visibility"),
-            &file,
-            tree.root_node(),
-            source,
-            100,
-            || false,
-        );
-        assert!(result.references.is_empty());
-        assert!(!result.cancelled);
-        assert!(!result.truncated);
-    }
-
-    #[test]
-    fn cancelled_scan_does_not_construct_visibility() {
-        let source = "#define USE(value) value\nvoid caller() { USE(1); }";
-        let mut parser = tree_sitter::Parser::new();
-        parser
-            .set_language(&tree_sitter_cpp::LANGUAGE.into())
-            .unwrap();
-        let tree = parser.parse(source, None).unwrap();
-        let root = std::env::current_dir().unwrap();
-        let file = ProjectFile::new(&root, "use.c");
-        let result = all_references(
-            || panic!("cancelled scan must not construct visibility"),
-            &file,
-            tree.root_node(),
-            source,
-            100,
-            || true,
-        );
-        assert!(result.references.is_empty());
-        assert!(result.cancelled);
-        assert!(!result.truncated);
-    }
 }

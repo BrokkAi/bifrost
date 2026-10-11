@@ -282,6 +282,7 @@ policy_records! {
     GeneratedMessage { labels: ["generated-message"], layout: KeywordPairs, owner: OwnerApplicability::POLICY_TAINT, signature: "(generated-message :relation can-reach)", description: "Generate the fixed source-display can-reach sink-display message after proven flow." }
     CvssSeverity { labels: ["cvss-severity"], layout: KeywordPairs, owner: OwnerApplicability::POLICY_ALL, signature: "(cvss-severity :when-unscored unrated|note|warning|error)", description: "Derive severity from CVSS with an explicit unscored fallback." }
     Argument { labels: ["argument"], layout: KeywordPairs, owner: OwnerApplicability::BOTH, signature: "(argument :index N) | (argument :name \"NAME\")", description: "Bind a zero-based argument index or exact formal argument name." }
+    ArgumentCondition { labels: ["argument-condition"], layout: KeywordPairs, owner: OwnerApplicability::POLICY_TYPESTATE, signature: "(argument-condition :argument (argument :index N) :equals true|false)", description: "Require one direct call argument to have an exact Boolean value." }
     Result { labels: ["result"], layout: KeywordPairs, owner: OwnerApplicability::BOTH, signature: "(result :index N)", description: "Bind one zero-based normal call result." }
     SourceSemantics { labels: ["source-semantics"], layout: KeywordPairs, owner: OwnerApplicability::ENDPOINT, signature: "(source-semantics :labels [LABEL...] [:evidence EVIDENCE])", description: "Attach diagnostic-neutral taint source semantics to a source endpoint." }
     SinkSemantics { labels: ["sink-semantics"], layout: KeywordPairs, owner: OwnerApplicability::ENDPOINT, signature: "(sink-semantics :accepts [LABEL...] [:tags [...]] [:impacts [...]])", description: "Attach diagnostic-neutral taint sink semantics to a sink endpoint." }
@@ -297,7 +298,7 @@ policy_records! {
     CategoriesPredicate { labels: ["categories"], layout: KeywordPairs, owner: OwnerApplicability::POLICY_TAINT_OR_TYPESTATE, signature: "(categories :any [...] | :all [...])", description: "Select endpoints by an exact any-or-all category predicate." }
     EndpointsPredicate { labels: ["endpoints"], layout: Positional, owner: OwnerApplicability::POLICY_TAINT_OR_TYPESTATE, signature: "(endpoints [ENDPOINT-REF...])", description: "Select a finite exact set of local, catalog, or match endpoint identities." }
     EndpointRef { labels: ["endpoint-ref"], layout: KeywordPairs, owner: OwnerApplicability::POLICY_TAINT_OR_TYPESTATE, signature: "(endpoint-ref (:local ID | :catalog CATALOG :entry ID | :match-endpoint ID))", description: "Name one endpoint in the current policy, an explicit catalog, or the endpoint index." }
-    Source { labels: ["source"], layout: KeywordPairs, owner: OwnerApplicability::POLICY_TAINT, signature: "(source :id ID :display-name TEXT :categories [...] :selector SELECTOR :bind PORT :labels [...] [:evidence EVIDENCE])", description: "Declare one policy-local taint source." }
+    Source { labels: ["source"], layout: KeywordPairs, owner: OwnerApplicability::POLICY_TAINT, signature: "(source :id ID :display-name TEXT :categories [...] :selector SELECTOR :bind PORT :labels [...] [:threat-model KIND] [:evidence EVIDENCE])", description: "Declare one policy-local taint source." }
     Sink { labels: ["sink"], layout: KeywordPairs, owner: OwnerApplicability::POLICY_TAINT, signature: "(sink :id ID :display-name TEXT :categories [...] :selector SELECTOR :dangerous-operand PORT :accepts [...] [:tags [...]] [:impacts [...]])", description: "Declare one policy-local taint sink." }
     Sanitizer { labels: ["sanitizer"], layout: KeywordPairs, owner: OwnerApplicability::POLICY_TAINT, signature: "(sanitizer :id ID :selector SELECTOR :input PORT :output PORT :removes [LABEL...])", description: "Declare one policy-local sanitizer transfer." }
     StoreWrite { labels: ["store-write"], layout: KeywordPairs, owner: OwnerApplicability::POLICY_TAINT, signature: "(store-write :id ID :selector SELECTOR :store STORE [:key PORT] [:instance PORT] :input PORT)", description: "Declare that the selected call writes its input port's value into the named persistence store, optionally discriminated by a key port and an instance port." }
@@ -560,6 +561,7 @@ macro_rules! value_shapes {
                     | Self::ExternalModelPort
                     | Self::ExternalModelWritePort => Some(AtomDomain::CallPort),
                     Self::TaintMode => Some(AtomDomain::TaintMode),
+                    Self::ThreatModel => Some(AtomDomain::ThreatModel),
                     Self::UnmodeledCallBehavior => Some(AtomDomain::UnmodeledCallBehavior),
                     Self::UnknownVerdict => Some(AtomDomain::UnknownVerdict),
                     Self::TrustBoundary => Some(AtomDomain::TrustBoundary),
@@ -592,6 +594,7 @@ macro_rules! value_shapes {
                     Self::RowJoinKind => Some(AtomDomain::RowJoinKind),
                     Self::RowAggregateOp => Some(AtomDomain::RowAggregateOp),
                     Self::CaptureName
+                    | Self::TypestateArgumentCondition
                     | Self::AssertCardinality
                     | Self::AssertEntries
                     | Self::EdgeClassValues
@@ -687,7 +690,8 @@ macro_rules! value_shapes {
                     | Self::RowFieldRefs
                     | Self::RowJoinConditions
                     | Self::RowAggregateOperand
-                    | Self::RowPredicates => None,
+                    | Self::RowPredicates
+                    | Self::ThreatModels => None,
                 }
             }
 
@@ -709,6 +713,7 @@ macro_rules! value_shapes {
                     | Self::TypestateBinding
                     | Self::TypestateCallBinding
                     | Self::ExternalModelPort => &[PolicyRecord::Argument, PolicyRecord::Result],
+                    Self::TypestateArgumentCondition => &[PolicyRecord::ArgumentCondition],
                     Self::ExternalModelWritePort => &[
                         PolicyRecord::Argument,
                         PolicyRecord::Result,
@@ -871,6 +876,8 @@ macro_rules! value_shapes {
                     | Self::GeneratedRelation
                     | Self::EndpointRole
                     | Self::TaintMode
+                    | Self::ThreatModel
+                    | Self::ThreatModels
                     | Self::UnmodeledCallBehavior
                     | Self::UnknownVerdict
                     | Self::TrustBoundary
@@ -977,6 +984,8 @@ value_shapes! {
     EndpointSemantics => "source-semantics or sink-semantics matching the endpoint role",
     PolicyPort => "matched-value, receiver, return-value, an indexed result record, or an argument record",
     TaintMode => "the may analysis mode",
+    ThreatModel => "remote, commandargs, environment, stdin, file, or database",
+    ThreatModels => "a non-empty set of threat-model values",
     UnmodeledCallBehavior => "paranoid, optimistic, or require-model",
     UnknownVerdict => "abstain, warn-unreliable, fail-closed, or treat-may-as-finding",
     TaintEndpointSet => "an endpoint-set record",
@@ -993,6 +1002,7 @@ value_shapes! {
     TransferEffect => "propagate, sanitize, or transform transfer semantics",
     TypestateBinding => "matched-value, receiver, return-value, an indexed result record, or an argument record",
     TypestateCallBinding => "receiver, return-value, an indexed result record, or an argument record",
+    TypestateArgumentCondition => "a Boolean equality condition on one indexed call argument",
     ExternalModelPort => "receiver, return-value, an indexed result record, or an argument record; matched-value is forbidden",
     ExternalModelWritePort => "an external-model call port, or a field record naming one written field of an argument or receiver; matched-value is forbidden",
     InconclusivePolicy => "the inconclusive uncertainty policy",
@@ -1171,6 +1181,7 @@ macro_rules! policy_child_context {
 const SCALAR: ValueMultiplicity = ValueMultiplicity::Scalar;
 const SET_64: ValueMultiplicity = ValueMultiplicity::set(0, 64);
 const NON_EMPTY_SET_64: ValueMultiplicity = ValueMultiplicity::set(1, 64);
+const NON_EMPTY_SET_6: ValueMultiplicity = ValueMultiplicity::set(1, 6);
 const SET_256: ValueMultiplicity = ValueMultiplicity::set(0, 256);
 const NON_EMPTY_SET_256: ValueMultiplicity = ValueMultiplicity::set(1, 256);
 
@@ -1215,6 +1226,7 @@ policy_fields! {
     AnalysisSelector { record: Analysis, labels: ["selector"], placement: FieldPlacement::Keyword, required: Required, multiplicity: SCALAR, shape: Selector, owner: OwnerApplicability::POLICY_MATCH, signature: ":selector (rql ...)|(rql-file ...)", description: "Select positive location-bearing match results." }
     AnalysisMode { record: Analysis, labels: ["mode"], placement: FieldPlacement::Keyword, required: Required, multiplicity: SCALAR, shape: TaintMode, owner: OwnerApplicability::POLICY_TAINT_TYPESTATE_OR_FLOW, signature: ":mode may", description: "Select the schema-version-1 may analysis mode." }
     AnalysisCallModeling { record: Analysis, labels: ["call-modeling"], placement: FieldPlacement::Keyword, required: Optional, multiplicity: SCALAR, shape: CallModelingSpec, owner: OwnerApplicability::POLICY_TAINT_TYPESTATE_OR_FLOW, signature: ":call-modeling (call-modeling :unmodeled paranoid|optimistic|require-model)", description: "Choose fallback behavior for unmodeled calls; omission defaults to paranoid." }
+    AnalysisThreatModels { record: Analysis, labels: ["threat-models"], placement: FieldPlacement::Keyword, required: Optional, multiplicity: NON_EMPTY_SET_6, shape: ThreatModels, owner: OwnerApplicability::POLICY_TAINT, signature: ":threat-models [remote|commandargs|environment|stdin|file|database...]", description: "Select the active threat models for source endpoints; omission defaults to [remote]." }
     AnalysisOnUnknown { record: Analysis, labels: ["on-unknown"], placement: FieldPlacement::Keyword, required: Optional, multiplicity: SCALAR, shape: OnUnknownSpec, owner: OwnerApplicability::POLICY_ALL, signature: ":on-unknown (on-unknown :verdict abstain|warn-unreliable|fail-closed|treat-may-as-finding)", description: "Choose what a verdict blocked by unknown evidence does; omission defaults to abstain." }
     AnalysisLanguages { record: Analysis, labels: ["languages"], placement: FieldPlacement::Keyword, required: Optional, multiplicity: ValueMultiplicity::sequence(1, 64), shape: SelectorLanguages, owner: OwnerApplicability::POLICY_ALL, signature: ":languages [LANGUAGE...]", description: "Conjoin one shared language scope with every inline RQL and referenced RQL selector in this analysis; `jvm` expands to [java, kotlin, scala] and `js-ts` expands to [javascript, typescript]." }
     AnalysisWhereGlobs { record: Analysis, labels: ["where"], placement: FieldPlacement::Keyword, required: Optional, multiplicity: ValueMultiplicity::sequence(1, 64), shape: SelectorWhereGlobs, owner: OwnerApplicability::POLICY_ALL, signature: ":where [\"GLOB\"...]", description: "Conjoin one shared workspace-relative path-glob scope with every inline RQL and referenced RQL selector in this analysis." }
@@ -1324,6 +1336,7 @@ policy_fields! {
     SourceSelector { record: Source, labels: ["selector"], placement: FieldPlacement::Keyword, required: Required, multiplicity: SCALAR, shape: Selector, owner: OwnerApplicability::POLICY_TAINT, signature: ":selector SELECTOR", description: "Select the source sites." }
     SourceBind { record: Source, labels: ["bind"], placement: FieldPlacement::Keyword, required: Required, multiplicity: SCALAR, shape: PolicyPort, owner: OwnerApplicability::POLICY_TAINT, signature: ":bind PORT", description: "Bind the source value at each selected site." }
     SourceLabels { record: Source, labels: ["labels"], placement: FieldPlacement::Keyword, required: Required, multiplicity: NON_EMPTY_SET_64, shape: TaintLabels, owner: OwnerApplicability::POLICY_TAINT, signature: ":labels [LABEL...]", description: "Declare the non-empty labels introduced by the source." }
+    SourceThreatModel { record: Source, labels: ["threat-model"], placement: FieldPlacement::Keyword, required: Optional, multiplicity: SCALAR, shape: ThreatModel, owner: OwnerApplicability::POLICY_TAINT, signature: ":threat-model remote|commandargs|environment|stdin|file|database", description: "Classify this source for analysis-level threat-model selection; omission keeps the source active for every selection." }
     SourceEvidenceField { record: Source, labels: ["evidence"], placement: FieldPlacement::Keyword, required: Optional, multiplicity: SCALAR, shape: SourceEvidence, owner: OwnerApplicability::POLICY_TAINT, signature: ":evidence (evidence ...)", description: "Attach coherent source trust/entry evidence." }
     SinkId { record: Sink, labels: ["id"], placement: FieldPlacement::Keyword, required: Required, multiplicity: SCALAR, shape: LocalEntryId, owner: OwnerApplicability::POLICY_TAINT, signature: ":id \"entry-id\"", description: "Set the policy-local sink identity." }
     SinkDisplayName { record: Sink, labels: ["display-name"], placement: FieldPlacement::Keyword, required: Required, multiplicity: SCALAR, shape: DisplayText, owner: OwnerApplicability::POLICY_TAINT, signature: ":display-name \"phrase\"", description: "Set the generated-message phrase for this sink." }
@@ -1417,6 +1430,9 @@ policy_fields! {
     CallsSelector { record: Calls, labels: ["selector"], placement: FieldPlacement::Keyword, required: Required, multiplicity: SCALAR, shape: Selector, owner: OwnerApplicability::POLICY_TYPESTATE, signature: ":selector SELECTOR", description: "Select direct call observations." }
     CallsSubject { record: Calls, labels: ["subject"], placement: FieldPlacement::Keyword, required: Required, multiplicity: SCALAR, shape: TypestateCallBinding, owner: OwnerApplicability::POLICY_TYPESTATE, signature: ":subject receiver|return-value|(result :index N)|(argument ...)", description: "Bind the already tracked object at the call." }
     CallsPhase { record: Calls, labels: ["phase"], placement: FieldPlacement::Keyword, required: Required, multiplicity: SCALAR, shape: ObservationPhase, owner: OwnerApplicability::POLICY_TYPESTATE, signature: ":phase PHASE", description: "Observe before the call or after a specific continuation." }
+    CallsCondition { record: Calls, labels: ["condition"], placement: FieldPlacement::Keyword, required: Optional, multiplicity: SCALAR, shape: TypestateArgumentCondition, owner: OwnerApplicability::POLICY_TYPESTATE, signature: ":condition (argument-condition ...)", description: "Require one direct call argument to equal a Boolean constant before the event can match." }
+    ArgumentConditionArgument { record: ArgumentCondition, labels: ["argument"], placement: FieldPlacement::Keyword, required: Required, multiplicity: SCALAR, shape: TypestateCallBinding, owner: OwnerApplicability::POLICY_TYPESTATE, signature: ":argument (argument :index N)", description: "Select the positional argument whose direct value is tested." }
+    ArgumentConditionEquals { record: ArgumentCondition, labels: ["equals"], placement: FieldPlacement::Keyword, required: Required, multiplicity: SCALAR, shape: Boolean, owner: OwnerApplicability::POLICY_TYPESTATE, signature: ":equals true|false", description: "Set the exact Boolean value required by the event." }
     TransitionFrom { record: Transition, labels: ["from"], placement: FieldPlacement::Keyword, required: Required, multiplicity: SCALAR, shape: StateId, owner: OwnerApplicability::POLICY_TYPESTATE, signature: ":from STATE", description: "Name the declared source state." }
     TransitionOn { record: Transition, labels: ["on"], placement: FieldPlacement::Keyword, required: Required, multiplicity: SCALAR, shape: EventId, owner: OwnerApplicability::POLICY_TYPESTATE, signature: ":on EVENT", description: "Name the declared triggering event." }
     TransitionTo { record: Transition, labels: ["to"], placement: FieldPlacement::Keyword, required: Required, multiplicity: SCALAR, shape: StateId, owner: OwnerApplicability::POLICY_TYPESTATE, signature: ":to STATE", description: "Name the declared destination state." }
@@ -1574,8 +1590,7 @@ pub fn applicable_fields_for_record(
 }
 
 pub fn lookup_field(record: PolicyRecord, label: &str) -> Option<&'static PolicyFieldDescriptor> {
-    let label = label.strip_prefix(':').unwrap_or(label);
-    fields_for_record(record).find(|descriptor| descriptor.labels.contains(&label))
+    lookup_field_in(fields_for_record(record), label)
 }
 
 pub fn lookup_applicable_field(
@@ -1585,9 +1600,18 @@ pub fn lookup_applicable_field(
     analysis: Option<PolicyAnalysisKind>,
     context: PolicyRecordContext,
 ) -> Option<&'static PolicyFieldDescriptor> {
+    lookup_field_in(
+        applicable_fields_for_record(record, document, analysis, context),
+        label,
+    )
+}
+
+fn lookup_field_in(
+    mut fields: impl Iterator<Item = &'static PolicyFieldDescriptor>,
+    label: &str,
+) -> Option<&'static PolicyFieldDescriptor> {
     let label = label.strip_prefix(':').unwrap_or(label);
-    applicable_fields_for_record(record, document, analysis, context)
-        .find(|descriptor| descriptor.labels.contains(&label))
+    fields.find(|descriptor| descriptor.labels.contains(&label))
 }
 
 pub fn required_fields_for_record(
@@ -1620,6 +1644,7 @@ pub enum AtomDomain {
     Port,
     CallPort,
     TaintMode,
+    ThreatModel,
     UnmodeledCallBehavior,
     UnknownVerdict,
     TrustBoundary,
@@ -1755,6 +1780,12 @@ atom_values! {
     CallPortReceiver { domain: CallPort, spellings: ["receiver"], owner: OwnerApplicability::POLICY_TYPESTATE, description: "Bind the already tracked call receiver." }
     CallPortReturnValue { domain: CallPort, spellings: ["return-value"], owner: OwnerApplicability::POLICY_TYPESTATE, description: "Bind the already tracked normal return value." }
     ModeMay { domain: TaintMode, spellings: ["may"], owner: OwnerApplicability::POLICY_TAINT_OR_TYPESTATE, description: "Report flows or protocol paths that may occur." }
+    ThreatRemote { domain: ThreatModel, spellings: ["remote"], owner: OwnerApplicability::POLICY_TAINT, description: "Select sources representing remote input." }
+    ThreatCommandArgs { domain: ThreatModel, spellings: ["commandargs"], owner: OwnerApplicability::POLICY_TAINT, description: "Select sources representing command-line arguments." }
+    ThreatEnvironment { domain: ThreatModel, spellings: ["environment"], owner: OwnerApplicability::POLICY_TAINT, description: "Select sources representing environment input." }
+    ThreatStdin { domain: ThreatModel, spellings: ["stdin"], owner: OwnerApplicability::POLICY_TAINT, description: "Select sources representing standard input." }
+    ThreatFile { domain: ThreatModel, spellings: ["file"], owner: OwnerApplicability::POLICY_TAINT, description: "Select sources representing file input." }
+    ThreatDatabase { domain: ThreatModel, spellings: ["database"], owner: OwnerApplicability::POLICY_TAINT, description: "Select sources representing database input." }
     UnmodeledCallParanoid { domain: UnmodeledCallBehavior, spellings: ["paranoid"], owner: OwnerApplicability::POLICY_TAINT_OR_TYPESTATE, description: "Conservatively propagate every transfer justified by structured call-site metadata." }
     UnmodeledCallOptimistic { domain: UnmodeledCallBehavior, spellings: ["optimistic"], owner: OwnerApplicability::POLICY_TAINT_OR_TYPESTATE, description: "Preserve existing facts without adding flows through the unseen body." }
     UnmodeledCallRequireModel { domain: UnmodeledCallBehavior, spellings: ["require-model"], owner: OwnerApplicability::POLICY_TAINT_OR_TYPESTATE, description: "Abstain from input-dependent transfer when no exact or curated model applies." }
@@ -1799,6 +1830,8 @@ atom_values! {
     RolePatternPosition { domain: OccurrenceRole, spellings: ["pattern_position"], owner: OwnerApplicability::POLICY_ASSERTION, description: "A non-binding identifier inside a pattern." }
     RoleGeneratedSource { domain: OccurrenceRole, spellings: ["generated_source"], owner: OwnerApplicability::POLICY_ASSERTION, description: "A token whose presence generates declarations elsewhere." }
     RoleValueReference { domain: OccurrenceRole, spellings: ["value_reference"], owner: OwnerApplicability::POLICY_ASSERTION, description: "A plain read or write of a value in expression position." }
+    RoleGlobalDirective { domain: OccurrenceRole, spellings: ["global_directive"], owner: OwnerApplicability::POLICY_ASSERTION, description: "A name declared by a Python global statement." }
+    RoleNonlocalDirective { domain: OccurrenceRole, spellings: ["nonlocal_directive"], owner: OwnerApplicability::POLICY_ASSERTION, description: "A name declared by a Python nonlocal statement." }
     ExpectDeclaration { domain: ExpectedOccurrence, spellings: ["declaration"], owner: OwnerApplicability::POLICY_ASSERTION, description: "Require declaration-class rows at the asserted role." }
     ExpectReference { domain: ExpectedOccurrence, spellings: ["reference"], owner: OwnerApplicability::POLICY_ASSERTION, description: "Require reference-class rows at the asserted role." }
     ExpectBinding { domain: ExpectedOccurrence, spellings: ["binding"], owner: OwnerApplicability::POLICY_ASSERTION, description: "Require binding-class rows at the asserted role." }
@@ -1945,440 +1978,6 @@ pub fn lookup_cvss_base_metric(spelling: &str) -> Option<&'static CvssBaseMetric
 mod tests {
     use super::*;
     use brokk_bifrost_analysis::schema_version::SchemaVersionOrigin;
-    use std::collections::HashSet;
-
-    #[test]
-    fn policy_schema_version_one_is_the_compatible_head_and_exact_pin() {
-        let inferred = resolve_policy_schema_version(None).unwrap();
-        assert_eq!(inferred.version, POLICY_SCHEMA_VERSION);
-        assert_eq!(inferred.origin, SchemaVersionOrigin::ImplicitCompatible);
-
-        let explicit = resolve_policy_schema_version(Some(1)).unwrap();
-        assert_eq!(explicit.version, POLICY_SCHEMA_VERSION);
-        assert_eq!(explicit.origin, SchemaVersionOrigin::Explicit);
-        assert!(resolve_policy_schema_version(Some(2)).is_err());
-    }
-
-    #[test]
-    fn every_record_and_field_has_help_and_signatures() {
-        for record in ALL_POLICY_RECORDS {
-            assert!(!record.labels().is_empty(), "{record:?}");
-            assert!(!record.signature().is_empty(), "{record:?}");
-            assert!(!record.description().is_empty(), "{record:?}");
-            assert!(fields_for_record(*record).next().is_some(), "{record:?}");
-        }
-        for field in ALL_POLICY_FIELDS {
-            assert!(!field.signature.is_empty(), "{:?}", field.field);
-            assert!(!field.description.is_empty(), "{:?}", field.field);
-            assert!(!field.value_shape.description().is_empty());
-            assert_eq!(field.occurrence, FieldOccurrence::Single);
-            if field.placement == FieldPlacement::Keyword {
-                assert!(!field.labels.is_empty(), "{:?}", field.field);
-            }
-        }
-    }
-
-    #[test]
-    fn field_spellings_and_positions_are_unique_within_each_record() {
-        for record in ALL_POLICY_RECORDS {
-            for context in [
-                PolicyRecordContext::Ordinary,
-                PolicyRecordContext::TaintSources,
-                PolicyRecordContext::TaintSinks,
-                PolicyRecordContext::TaintSanitizers,
-                PolicyRecordContext::TaintEntryPoints,
-                PolicyRecordContext::Transforms,
-                PolicyRecordContext::TaintExternalModels,
-                PolicyRecordContext::TaintStores,
-                PolicyRecordContext::FlowOrigins,
-                PolicyRecordContext::FlowObservations,
-                PolicyRecordContext::FlowKills,
-                PolicyRecordContext::TypestateTrigger,
-            ] {
-                let mut labels = HashSet::new();
-                let mut positions = HashSet::new();
-                let mut has_variadic = false;
-                for field in fields_for_record(*record)
-                    .filter(|descriptor| descriptor.context.allows(context))
-                {
-                    match field.placement {
-                        FieldPlacement::Keyword => {
-                            for label in field.labels {
-                                assert!(
-                                    labels.insert(*label),
-                                    "duplicate {label} in {record:?}/{context:?}"
-                                );
-                            }
-                        }
-                        FieldPlacement::Positional { index } => {
-                            assert!(
-                                positions.insert(index),
-                                "duplicate position {index} in {record:?}/{context:?}"
-                            );
-                        }
-                        FieldPlacement::VariadicPositional => {
-                            assert!(
-                                !has_variadic,
-                                "duplicate variadic field in {record:?}/{context:?}"
-                            );
-                            has_variadic = true;
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    #[test]
-    fn lookup_is_record_contextual_and_accepts_colon_prefixed_keywords() {
-        assert_eq!(
-            lookup_field(PolicyRecord::Policy, ":id").unwrap().field,
-            PolicyField::PolicyId
-        );
-        assert_eq!(
-            lookup_field(PolicyRecord::Endpoint, "id").unwrap().field,
-            PolicyField::EndpointId
-        );
-        assert!(lookup_field(PolicyRecord::Rql, "path").is_none());
-        assert_eq!(
-            positional_field(PolicyRecord::Rql, 0).unwrap().field,
-            PolicyField::RqlQuery
-        );
-    }
-
-    #[test]
-    fn context_sensitive_record_spellings_keep_all_candidates() {
-        let transforms = records_from_label("transform").collect::<Vec<_>>();
-        assert_eq!(
-            transforms,
-            vec![PolicyRecord::TransformEntry, PolicyRecord::TransformEffect]
-        );
-
-        let all = records_from_label("all").collect::<Vec<_>>();
-        assert_eq!(
-            all,
-            vec![
-                PolicyRecord::CategoryAll,
-                PolicyRecord::PredicateAll,
-                PolicyRecord::CvssPredicateAll,
-            ]
-        );
-
-        assert_eq!(
-            PolicyValueShape::ClassificationPredicate.accepted_records()[0],
-            PolicyRecord::PredicateAll
-        );
-        assert_eq!(
-            PolicyValueShape::CvssEvidencePredicate.accepted_records()[0],
-            PolicyRecord::CvssPredicateAll
-        );
-    }
-
-    #[test]
-    fn applicability_rejects_fields_owned_by_another_analysis() {
-        let selector = lookup_field(PolicyRecord::Analysis, "selector").unwrap();
-        assert!(
-            selector
-                .applicability
-                .allows(RqlpDocumentKind::Policy, Some(PolicyAnalysisKind::Match))
-        );
-        assert!(
-            !selector
-                .applicability
-                .allows(RqlpDocumentKind::Policy, Some(PolicyAnalysisKind::Taint))
-        );
-
-        let sources = lookup_field(PolicyRecord::Analysis, "sources").unwrap();
-        assert!(
-            sources
-                .applicability
-                .allows(RqlpDocumentKind::Policy, Some(PolicyAnalysisKind::Taint))
-        );
-        assert!(!sources.applicability.allows(
-            RqlpDocumentKind::Policy,
-            Some(PolicyAnalysisKind::Typestate)
-        ));
-
-        assert!(
-            lookup_applicable_field(
-                PolicyRecord::Analysis,
-                "sources",
-                RqlpDocumentKind::Policy,
-                Some(PolicyAnalysisKind::Match),
-                PolicyRecordContext::Ordinary,
-            )
-            .is_none()
-        );
-        assert_eq!(
-            required_fields_for_record(
-                PolicyRecord::Analysis,
-                RqlpDocumentKind::Policy,
-                Some(PolicyAnalysisKind::Typestate),
-                PolicyRecordContext::Ordinary,
-            )
-            .map(|field| field.field)
-            .collect::<Vec<_>>(),
-            vec![
-                PolicyField::AnalysisType,
-                PolicyField::AnalysisMode,
-                PolicyField::AnalysisSubjects,
-                PolicyField::AnalysisUncertainty,
-                PolicyField::AnalysisAutomaton,
-            ]
-        );
-
-        assert_eq!(
-            applicable_records_from_label("endpoint", RqlpDocumentKind::Endpoint, None)
-                .collect::<Vec<_>>(),
-            vec![PolicyRecord::Endpoint]
-        );
-
-        assert!(
-            lookup_applicable_field(
-                PolicyRecord::MatchDirectory,
-                "role",
-                RqlpDocumentKind::Policy,
-                Some(PolicyAnalysisKind::Taint),
-                PolicyRecordContext::Ordinary,
-            )
-            .is_none()
-        );
-        assert!(
-            lookup_applicable_field(
-                PolicyRecord::MatchDirectory,
-                "phase",
-                RqlpDocumentKind::Policy,
-                Some(PolicyAnalysisKind::Typestate),
-                PolicyRecordContext::Ordinary,
-            )
-            .is_none()
-        );
-        assert_eq!(
-            lookup_applicable_field(
-                PolicyRecord::MatchDirectory,
-                "phase",
-                RqlpDocumentKind::Policy,
-                Some(PolicyAnalysisKind::Typestate),
-                PolicyRecordContext::TypestateTrigger,
-            )
-            .unwrap()
-            .field,
-            PolicyField::MatchDirectoryPhase
-        );
-
-        assert_eq!(
-            lookup_field(PolicyRecord::Analysis, "sources")
-                .unwrap()
-                .child_context,
-            PolicyRecordContext::TaintSources
-        );
-        assert_eq!(
-            lookup_applicable_field(
-                PolicyRecord::EndpointSet,
-                "entries",
-                RqlpDocumentKind::Policy,
-                Some(PolicyAnalysisKind::Taint),
-                PolicyRecordContext::TaintSources,
-            )
-            .unwrap()
-            .value_shape,
-            PolicyValueShape::SourceEntries
-        );
-        assert!(
-            lookup_applicable_field(
-                PolicyRecord::EndpointSet,
-                "include-matches",
-                RqlpDocumentKind::Policy,
-                Some(PolicyAnalysisKind::Taint),
-                PolicyRecordContext::TaintSanitizers,
-            )
-            .is_none()
-        );
-
-        // Stores are policy-local only: the store entries slot is reachable in
-        // exactly the store context, and neither composition field is.
-        assert_eq!(
-            lookup_field(PolicyRecord::Analysis, "stores")
-                .unwrap()
-                .child_context,
-            PolicyRecordContext::TaintStores
-        );
-        assert_eq!(
-            lookup_applicable_field(
-                PolicyRecord::EndpointSet,
-                "entries",
-                RqlpDocumentKind::Policy,
-                Some(PolicyAnalysisKind::Taint),
-                PolicyRecordContext::TaintStores,
-            )
-            .unwrap()
-            .value_shape,
-            PolicyValueShape::StoreEntries
-        );
-        assert!(
-            lookup_applicable_field(
-                PolicyRecord::EndpointSet,
-                "include-sets",
-                RqlpDocumentKind::Policy,
-                Some(PolicyAnalysisKind::Taint),
-                PolicyRecordContext::TaintStores,
-            )
-            .is_none()
-        );
-        assert!(
-            lookup_applicable_field(
-                PolicyRecord::EndpointSet,
-                "include-matches",
-                RqlpDocumentKind::Policy,
-                Some(PolicyAnalysisKind::Taint),
-                PolicyRecordContext::TaintStores,
-            )
-            .is_none()
-        );
-        assert!(
-            lookup_applicable_field(
-                PolicyRecord::EndpointSet,
-                "include-sets",
-                RqlpDocumentKind::Policy,
-                Some(PolicyAnalysisKind::Taint),
-                PolicyRecordContext::TaintSanitizers,
-            )
-            .is_some()
-        );
-        let stores = lookup_field(PolicyRecord::Analysis, "stores").unwrap();
-        assert!(
-            stores
-                .applicability
-                .allows(RqlpDocumentKind::Policy, Some(PolicyAnalysisKind::Taint))
-        );
-        assert!(
-            !stores
-                .applicability
-                .allows(RqlpDocumentKind::Policy, Some(PolicyAnalysisKind::Flow))
-        );
-        assert_eq!(
-            PolicyValueShape::StoreEntries.accepted_records(),
-            &[PolicyRecord::StoreWrite, PolicyRecord::StoreRead]
-        );
-
-        let transforms = lookup_field(PolicyRecord::Analysis, "transforms").unwrap();
-        assert!(
-            transforms
-                .applicability
-                .allows(RqlpDocumentKind::Policy, Some(PolicyAnalysisKind::Taint))
-        );
-        assert!(
-            transforms
-                .applicability
-                .allows(RqlpDocumentKind::Policy, Some(PolicyAnalysisKind::Flow))
-        );
-        assert_eq!(transforms.child_context, PolicyRecordContext::Transforms);
-        let flow_transforms = lookup_applicable_field(
-            PolicyRecord::Analysis,
-            "transforms",
-            RqlpDocumentKind::Policy,
-            Some(PolicyAnalysisKind::Flow),
-            PolicyRecordContext::Ordinary,
-        )
-        .unwrap();
-        assert_eq!(
-            flow_transforms.child_context,
-            PolicyRecordContext::Transforms
-        );
-        assert_eq!(
-            lookup_applicable_field(
-                PolicyRecord::EndpointSet,
-                "entries",
-                RqlpDocumentKind::Policy,
-                Some(PolicyAnalysisKind::Flow),
-                PolicyRecordContext::Transforms,
-            )
-            .unwrap()
-            .value_shape,
-            PolicyValueShape::TransformEntries
-        );
-        assert!(
-            lookup_applicable_field(
-                PolicyRecord::TransformEntry,
-                "removes",
-                RqlpDocumentKind::Policy,
-                Some(PolicyAnalysisKind::Flow),
-                PolicyRecordContext::Transforms,
-            )
-            .is_none()
-        );
-    }
-
-    #[test]
-    fn atom_spellings_are_unique_within_their_domains() {
-        for domain in [
-            AtomDomain::AnalysisType,
-            AtomDomain::GeneratedRelation,
-            AtomDomain::Severity,
-            AtomDomain::EndpointRole,
-            AtomDomain::Port,
-            AtomDomain::CallPort,
-            AtomDomain::TaintMode,
-            AtomDomain::UnmodeledCallBehavior,
-            AtomDomain::UnknownVerdict,
-            AtomDomain::TrustBoundary,
-            AtomDomain::SystemEntry,
-            AtomDomain::DirectoryScope,
-            AtomDomain::TransferEffect,
-            AtomDomain::Uncertainty,
-            AtomDomain::ObservationPhase,
-            AtomDomain::ExitScope,
-            AtomDomain::CvssVersion,
-            AtomDomain::CvssEmit,
-            AtomDomain::CvssBasis,
-            AtomDomain::CvssScope,
-            AtomDomain::EvidenceRef,
-            AtomDomain::OccurrenceRole,
-            AtomDomain::ExpectedOccurrence,
-            AtomDomain::OccurrenceNamespace,
-            AtomDomain::Boolean,
-        ] {
-            let mut spellings = HashSet::new();
-            for value in atom_values(domain) {
-                assert!(!value.description.is_empty());
-                for spelling in value.spellings {
-                    assert!(
-                        spellings.insert(*spelling),
-                        "duplicate {spelling} in {domain:?}"
-                    );
-                    assert_eq!(lookup_atom(domain, spelling), Some(value));
-                }
-            }
-        }
-
-        assert!(lookup_atom(AtomDomain::CallPort, "receiver").is_some());
-        assert!(lookup_atom(AtomDomain::CallPort, "return-value").is_some());
-        assert!(lookup_atom(AtomDomain::CallPort, "matched-value").is_none());
-        assert_eq!(
-            PolicyValueShape::TypestateCallBinding.atom_domain(),
-            Some(AtomDomain::CallPort)
-        );
-        let selector = lookup_atom(AtomDomain::EvidenceRef, "selector:/analysis/selector")
-            .expect("selector evidence references are registry-defined");
-        assert_eq!(selector.value, PolicyAtomValue::EvidenceSelector);
-        assert_eq!(
-            selector.matched_suffix("selector:/analysis/selector"),
-            Some("/analysis/selector")
-        );
-        assert_eq!(
-            PolicyValueShape::EvidenceReferences.atom_domain(),
-            Some(AtomDomain::EvidenceRef)
-        );
-        assert_eq!(
-            PolicyValueShape::EvidenceReferences.accepted_records(),
-            &[PolicyRecord::EndpointRef]
-        );
-        assert!(
-            PolicyValueShape::FixedOrUnratedSeverity
-                .accepted_records()
-                .is_empty()
-        );
-    }
 
     /// The assertion vocabulary must not become a private keyword list: every
     /// spelling an author can write for `:role` and `:namespace` is exactly one
@@ -2425,6 +2024,60 @@ mod tests {
     }
 
     #[test]
+    fn policy_schema_version_one_is_the_compatible_head_and_exact_pin() {
+        let inferred = resolve_policy_schema_version(None).unwrap();
+        assert_eq!(inferred.version, POLICY_SCHEMA_VERSION);
+        assert_eq!(inferred.origin, SchemaVersionOrigin::ImplicitCompatible);
+
+        let explicit = resolve_policy_schema_version(Some(1)).unwrap();
+        assert_eq!(explicit.version, POLICY_SCHEMA_VERSION);
+        assert_eq!(explicit.origin, SchemaVersionOrigin::Explicit);
+        assert!(resolve_policy_schema_version(Some(2)).is_err());
+    }
+    #[test]
+    fn lookup_is_record_contextual_and_accepts_colon_prefixed_keywords() {
+        assert_eq!(
+            lookup_field(PolicyRecord::Policy, ":id").unwrap().field,
+            PolicyField::PolicyId
+        );
+        assert_eq!(
+            lookup_field(PolicyRecord::Endpoint, "id").unwrap().field,
+            PolicyField::EndpointId
+        );
+        assert!(lookup_field(PolicyRecord::Rql, "path").is_none());
+        assert_eq!(
+            positional_field(PolicyRecord::Rql, 0).unwrap().field,
+            PolicyField::RqlQuery
+        );
+    }
+    #[test]
+    fn context_sensitive_record_spellings_keep_all_candidates() {
+        let transforms = records_from_label("transform").collect::<Vec<_>>();
+        assert_eq!(
+            transforms,
+            vec![PolicyRecord::TransformEntry, PolicyRecord::TransformEffect]
+        );
+
+        let all = records_from_label("all").collect::<Vec<_>>();
+        assert_eq!(
+            all,
+            vec![
+                PolicyRecord::CategoryAll,
+                PolicyRecord::PredicateAll,
+                PolicyRecord::CvssPredicateAll,
+            ]
+        );
+
+        assert_eq!(
+            PolicyValueShape::ClassificationPredicate.accepted_records()[0],
+            PolicyRecord::PredicateAll
+        );
+        assert_eq!(
+            PolicyValueShape::CvssEvidencePredicate.accepted_records()[0],
+            PolicyRecord::CvssPredicateAll
+        );
+    }
+    #[test]
     fn registry_collection_order_matches_canonical_normalization() {
         for field in [
             PolicyField::ExternalModelTransfers,
@@ -2461,21 +2114,6 @@ mod tests {
                     ..
                 }
             ));
-        }
-    }
-
-    #[test]
-    fn cvss_base_metric_table_is_complete_and_rejects_x() {
-        assert_eq!(ALL_CVSS_BASE_METRICS.len(), 11);
-        let names = ALL_CVSS_BASE_METRICS
-            .iter()
-            .map(|descriptor| descriptor.spelling)
-            .collect::<HashSet<_>>();
-        assert_eq!(names.len(), 11);
-        for metric in ALL_CVSS_BASE_METRICS {
-            assert!(!metric.legal_values.is_empty());
-            assert!(!metric.legal_values.contains(&CvssMetricValueToken::X));
-            assert_eq!(lookup_cvss_base_metric(metric.spelling), Some(metric));
         }
     }
 }

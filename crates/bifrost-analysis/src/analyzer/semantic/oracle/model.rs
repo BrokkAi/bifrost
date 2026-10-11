@@ -3,7 +3,7 @@ use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 
 use super::super::ids::{
-    MemoryLocationId, SemanticLocator, SemanticRole, SourceMappingId, StableDigest,
+    MemoryLocationId, SemanticLocator, SemanticRole, SourceMappingId, StableDigest, ValueId,
 };
 use super::super::ir::{
     AllocationHandle, CallSiteHandle, EvidenceCompleteness, ExecutionTiming, FormalMultiplicity,
@@ -286,23 +286,6 @@ mod runtime_object_tests {
     }
 
     #[test]
-    fn runtime_root_rejects_profile_or_exposure_mismatch() {
-        let result = RuntimeObjectRoot::captured(
-            "other-profile".into(),
-            "main".into(),
-            "process".into(),
-            "env".into(),
-            "entry".into(),
-            StableDigest::sha256("read"),
-            activation(),
-        );
-        assert!(matches!(
-            result,
-            Err(OracleContractError::InvalidAccessRoot(_))
-        ));
-    }
-
-    #[test]
     fn runtime_root_single_realm_constructor_allows_singleton() {
         let root = RuntimeObjectRoot::captured_single_realm(
             "node".into(),
@@ -321,6 +304,23 @@ mod runtime_object_tests {
             )
             .is_ok()
         );
+    }
+
+    #[test]
+    fn runtime_root_rejects_profile_or_exposure_mismatch() {
+        let result = RuntimeObjectRoot::captured(
+            "other-profile".into(),
+            "main".into(),
+            "process".into(),
+            "env".into(),
+            "entry".into(),
+            StableDigest::sha256("read"),
+            activation(),
+        );
+        assert!(matches!(
+            result,
+            Err(OracleContractError::InvalidAccessRoot(_))
+        ));
     }
 }
 /// A recent-call suffix retained by a bounded oracle query.
@@ -598,8 +598,7 @@ impl Eq for ScopedSemanticLocator {}
 
 impl Hash for ScopedSemanticLocator {
     fn hash<H: Hasher>(&self, state: &mut H) {
-        Arc::as_ptr(&self.scope).hash(state);
-        self.locator.hash(state);
+        crate::analyzer::semantic::hash_arc_key(&self.scope, &self.locator, state);
     }
 }
 
@@ -826,6 +825,22 @@ pub enum AccessPathRoot {
     ModuleObject(ScopedSemanticLocator),
     External(ScopedSemanticLocator),
     RuntimeObject(RuntimeObjectRoot),
+    /// One field selected from an exact base-object identity. The member
+    /// locator is either the declaration locator or a canonical structured
+    /// selector identity supplied by the language adapter.
+    FieldPath {
+        base: Box<AccessPathRoot>,
+        member: SemanticLocator,
+    },
+    /// An object passed through an exact incoming call binding. Its base is
+    /// durable so the candidate can be retained in the callee's procedure
+    /// domain without keeping caller-scoped handles alive.
+    CallSubstitution {
+        procedure: ProcedureHandle,
+        context: OracleCallContext,
+        base: Box<DurableObjectIdentity>,
+        base_cardinality: ObjectCardinality,
+    },
 }
 
 impl AccessPathRoot {
@@ -842,6 +857,11 @@ impl AccessPathRoot {
             | Self::ModuleObject(_)
             | Self::External(_)
             | Self::RuntimeObject(_) => None,
+            // A field path can be rooted in an object resolved through an
+            // incoming call in another procedure. It is a query-local
+            // composite identity, not a handle scoped to the current procedure.
+            Self::FieldPath { .. } => None,
+            Self::CallSubstitution { procedure, .. } => Some(procedure),
         }
     }
 
@@ -867,6 +887,15 @@ impl AccessPathRoot {
                     ));
                 }
             }
+            Self::FieldPath { base, member } => {
+                base.validate_shape()?;
+                if member.role() != SemanticRole::MemoryLocation {
+                    return Err(OracleContractError::InvalidAccessRoot(
+                        "field-path members must name a memory-location locator",
+                    ));
+                }
+            }
+            Self::CallSubstitution { .. } => {}
             Self::CaptureSlot(port)
                 if !matches!(port.kind(), ProcedurePortKind::Capture { .. }) =>
             {
@@ -911,6 +940,10 @@ impl AccessPathRoot {
             | Self::ModuleObject(locator)
             | Self::External(locator) => locator.validate_at(procedure),
             Self::RuntimeObject(_) => Ok(()),
+            Self::FieldPath { .. } => Ok(()),
+            Self::CallSubstitution {
+                procedure: owner, ..
+            } => require_same_procedure(owner, procedure),
         }
     }
 }
@@ -1055,7 +1088,9 @@ impl AccessPath {
             | AccessPathRoot::Allocation(_)
             | AccessPathRoot::LexicalCell(_)
             | AccessPathRoot::CaptureSlot(_)
-            | AccessPathRoot::RuntimeObject(_) => {}
+            | AccessPathRoot::RuntimeObject(_)
+            | AccessPathRoot::FieldPath { .. }
+            | AccessPathRoot::CallSubstitution { .. } => {}
         }
         Ok(())
     }
@@ -1243,6 +1278,14 @@ impl DurableCallContext {
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum DurableObjectIdentity {
     Value(DurableValueIdentity),
+    FieldPath {
+        base: Box<DurableObjectIdentity>,
+        member: SemanticLocator,
+    },
+    CallSubstitution {
+        context: DurableCallContext,
+        base: Box<DurableObjectIdentity>,
+    },
     CallResult {
         call: SemanticLocator,
         result: DurableValueIdentity,
@@ -1300,6 +1343,16 @@ impl AccessPathRoot {
     pub fn durable_identity(&self) -> Result<DurableObjectIdentity, DurableIdentityError> {
         Ok(match self {
             Self::Value(value) => DurableObjectIdentity::Value(DurableValueIdentity::of(value)?),
+            Self::FieldPath { base, member } => DurableObjectIdentity::FieldPath {
+                base: Box::new(base.durable_identity()?),
+                member: member.clone(),
+            },
+            Self::CallSubstitution { context, base, .. } => {
+                DurableObjectIdentity::CallSubstitution {
+                    context: DurableCallContext::of(context)?,
+                    base: base.clone(),
+                }
+            }
             Self::CallResult(result) => DurableObjectIdentity::CallResult {
                 call: durable_call_locator(result.call())?,
                 result: DurableValueIdentity::of(result.result())?,
@@ -1377,19 +1430,20 @@ fn durable_source_locator(
     source: SourceMappingId,
 ) -> Result<SemanticLocator, DurableIdentityError> {
     procedure
-        .semantics()
-        .source_mapping(source)
-        .map(|mapping| mapping.locator.clone())
+        .source_locator(source)
+        .cloned()
         .ok_or(DurableIdentityError::StaleSourceMapping)
 }
 
 fn durable_call_locator(call: &CallSiteHandle) -> Result<SemanticLocator, DurableIdentityError> {
-    let row = call
+    let _row = call
         .procedure()
         .semantics()
         .call_site(call.id())
         .ok_or(DurableIdentityError::StaleRow)?;
-    durable_source_locator(call.procedure(), row.source)
+    call.locator()
+        .cloned()
+        .ok_or(DurableIdentityError::StaleSourceMapping)
 }
 
 /// An abstract object candidate.  Cardinality is explicit and never inferred
@@ -1907,44 +1961,60 @@ fn access_path_matches_memory_location(
     }
 }
 
+pub(super) fn access_root_identity_matches_value(
+    root: &AccessPathRoot,
+    procedure: &ProcedureHandle,
+    value: ValueId,
+) -> bool {
+    match root {
+        AccessPathRoot::Value(actual) => actual.id() == value,
+        AccessPathRoot::ProcedurePort(port) => procedure
+            .semantics()
+            .value(value)
+            .is_some_and(|row| match port.kind() {
+                ProcedurePortKind::Receiver => {
+                    matches!(row.kind, SemanticValueKind::Receiver { .. })
+                }
+                ProcedurePortKind::Parameter { ordinal } => {
+                    matches!(row.kind, SemanticValueKind::Parameter { ordinal: actual, .. } if actual == ordinal)
+                }
+                ProcedurePortKind::NormalReturn
+                | ProcedurePortKind::IndexedNormalReturn { .. }
+                | ProcedurePortKind::ExceptionalReturn
+                | ProcedurePortKind::Capture { .. } => false,
+            }),
+        AccessPathRoot::Allocation(allocation) => procedure
+            .semantics()
+            .allocation(allocation.id())
+            .is_some_and(|row| row.result == value),
+        AccessPathRoot::Static(_)
+        | AccessPathRoot::CallResult(_)
+        | AccessPathRoot::LexicalCell(_)
+        | AccessPathRoot::CaptureSlot(_)
+        | AccessPathRoot::TypeSummary(_)
+        | AccessPathRoot::ModuleObject(_)
+        | AccessPathRoot::External(_)
+        | AccessPathRoot::RuntimeObject(_)
+        | AccessPathRoot::FieldPath { .. }
+        | AccessPathRoot::CallSubstitution { .. } => false,
+    }
+}
+
 fn access_root_matches_value(root: &AccessPathRoot, value: &ValueHandle) -> bool {
     match root {
-        AccessPathRoot::Value(actual) => actual == value,
+        AccessPathRoot::Value(actual) => {
+            actual.procedure() == value.procedure()
+                && access_root_identity_matches_value(root, value.procedure(), value.id())
+        }
         AccessPathRoot::CallResult(result) => result.result() == value,
         AccessPathRoot::ProcedurePort(port) => {
             require_same_procedure(port.procedure(), value.procedure()).is_ok()
-                && match port.kind() {
-                    ProcedurePortKind::Receiver => value
-                        .procedure()
-                        .semantics()
-                        .value(value.id())
-                        .is_some_and(|row| matches!(row.kind, SemanticValueKind::Receiver { .. })),
-                    ProcedurePortKind::Parameter { ordinal } => value
-                        .procedure()
-                        .semantics()
-                        .value(value.id())
-                        .is_some_and(|row| {
-                            matches!(
-                                row.kind,
-                                SemanticValueKind::Parameter {
-                                    ordinal: actual,
-                                    ..
-                                } if actual == ordinal
-                            )
-                        }),
-                    ProcedurePortKind::NormalReturn
-                    | ProcedurePortKind::IndexedNormalReturn { .. }
-                    | ProcedurePortKind::ExceptionalReturn
-                    | ProcedurePortKind::Capture { .. } => false,
-                }
+                && access_root_identity_matches_value(root, value.procedure(), value.id())
         }
-        AccessPathRoot::Allocation(allocation) => allocation
-            .procedure()
-            .semantics()
-            .allocation(allocation.id())
-            .is_some_and(|row| {
-                allocation.procedure() == value.procedure() && row.result == value.id()
-            }),
+        AccessPathRoot::Allocation(allocation) => {
+            allocation.procedure() == value.procedure()
+                && access_root_identity_matches_value(root, value.procedure(), value.id())
+        }
         AccessPathRoot::LexicalCell(location) => location
             .procedure()
             .semantics()
@@ -1958,7 +2028,9 @@ fn access_root_matches_value(root: &AccessPathRoot, value: &ValueHandle) -> bool
         | AccessPathRoot::TypeSummary(_)
         | AccessPathRoot::ModuleObject(_)
         | AccessPathRoot::External(_)
-        | AccessPathRoot::RuntimeObject(_) => false,
+        | AccessPathRoot::RuntimeObject(_)
+        | AccessPathRoot::FieldPath { .. }
+        | AccessPathRoot::CallSubstitution { .. } => false,
     }
 }
 /// A dispatch arm that cannot enter a materialized workspace procedure.
@@ -2061,8 +2133,7 @@ impl ExecutionTimingClaim {
     /// Whether a consumer may act on this timing without adding its own
     /// justification.
     pub const fn is_proven_complete(&self) -> bool {
-        matches!(self.proof, ProofStatus::Proven)
-            && matches!(self.completeness, EvidenceCompleteness::Complete)
+        self.proof.establishes_complete_evidence(&self.completeness)
     }
 }
 

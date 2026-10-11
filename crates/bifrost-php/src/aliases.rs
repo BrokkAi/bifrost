@@ -30,27 +30,21 @@ impl PhpUseAliases {
     /// Unlike `type_aliases`, this retains both targets when different
     /// namespace scopes reuse one local alias for different declarations.
     pub fn type_targets(&self) -> impl Iterator<Item = &String> {
-        self.type_aliases
-            .values()
-            .chain(self.ambiguous_type_targets.iter())
+        alias_targets(&self.type_aliases, &self.ambiguous_type_targets)
     }
 
     /// Function targets represented by this alias summary. The iterator may
     /// repeat a target when it appears in both a public map and the retained
     /// target set.
     pub fn function_targets(&self) -> impl Iterator<Item = &String> {
-        self.function_aliases
-            .values()
-            .chain(self.ambiguous_function_targets.iter())
+        alias_targets(&self.function_aliases, &self.ambiguous_function_targets)
     }
 
     /// Constant targets represented by this alias summary. The iterator may
     /// repeat a target when it appears in both a public map and the retained
     /// target set.
     pub fn const_targets(&self) -> impl Iterator<Item = &String> {
-        self.const_aliases
-            .values()
-            .chain(self.ambiguous_const_targets.iter())
+        alias_targets(&self.const_aliases, &self.ambiguous_const_targets)
     }
 
     fn insert(&mut self, kind: PhpUseKind, local: String, imported: String) {
@@ -73,6 +67,13 @@ impl PhpUseAliases {
         aliases.extend(self.const_aliases.clone());
         aliases
     }
+}
+
+fn alias_targets<'a>(
+    aliases: &'a HashMap<String, String>,
+    ambiguous_targets: &'a HashSet<String>,
+) -> impl Iterator<Item = &'a String> {
+    aliases.values().chain(ambiguous_targets.iter())
 }
 
 #[derive(Debug, Clone)]
@@ -122,14 +123,7 @@ fn php_alias_event(
     step: &mut impl FnMut() -> bool,
 ) -> Option<PhpAliasEvent> {
     let bindings = php_use_bindings_from_node(declaration, source, step)?;
-    let mut aliases = PhpUseAliases::default();
-    for binding in &bindings {
-        aliases.insert(
-            binding.kind,
-            binding.local.clone(),
-            binding.segments.join("."),
-        );
-    }
+    let aliases = php_use_aliases_from_bindings(&bindings);
     Some(PhpAliasEvent {
         start: declaration.start_byte(),
         end: declaration.end_byte(),
@@ -303,8 +297,7 @@ impl PhpFileContextIndex {
         }
         // Namespace scopes are assembled in the order they close, not the
         // order they open, so declarations are put back into source order
-        // here: `import_statements` and every source-order visibility rule
-        // downstream read them that way.
+        // here.
         use_declarations.sort_by_key(|declaration| declaration.start_byte);
         Some(Self {
             source_len: source.len(),
@@ -845,11 +838,20 @@ pub fn php_use_aliases_from_node(
     source: &str,
     step: &mut impl FnMut() -> bool,
 ) -> Option<PhpUseAliases> {
+    let bindings = php_use_bindings_from_node(declaration, source, step)?;
+    Some(php_use_aliases_from_bindings(&bindings))
+}
+
+fn php_use_aliases_from_bindings(bindings: &[PhpUseBinding]) -> PhpUseAliases {
     let mut aliases = PhpUseAliases::default();
-    for binding in php_use_bindings_from_node(declaration, source, step)? {
-        aliases.insert(binding.kind, binding.local, binding.segments.join("."));
+    for binding in bindings {
+        aliases.insert(
+            binding.kind,
+            binding.local.clone(),
+            binding.segments.join("."),
+        );
     }
-    Some(aliases)
+    aliases
 }
 
 /// The token that spells the last segment of a written path.
@@ -1208,9 +1210,7 @@ pub fn resolve_php_type_node_arms(
         let Some(arm) = resolve_php_type_node(child, source, ctx, &mut step) else {
             return Vec::new();
         };
-        if !arms.contains(&arm) {
-            arms.push(arm);
-        }
+        push_unique_php_type_arm(&mut arms, arm);
     }
     php_capped_type_arms(arms)
 }
@@ -1258,13 +1258,21 @@ pub fn resolve_php_constant_node(
     if !step() {
         return None;
     }
-    Some(match public.global_fallback {
-        Some(global) => PhpCallableCandidates::shadowing(
-            module_constant_fq(&public.primary),
-            module_constant_fq(&global),
-        ),
-        None => PhpCallableCandidates::exact(module_constant_fq(&public.primary)),
-    })
+    Some(php_constant_candidates(
+        public.primary,
+        public.global_fallback,
+    ))
+}
+
+fn php_constant_candidates(
+    primary: String,
+    global_fallback: Option<String>,
+) -> PhpCallableCandidates {
+    let primary = module_constant_fq(&primary);
+    match global_fallback {
+        Some(global) => PhpCallableCandidates::shadowing(primary, module_constant_fq(&global)),
+        None => PhpCallableCandidates::exact(primary),
+    }
 }
 
 fn php_only_named_child<'tree>(
@@ -1406,7 +1414,7 @@ fn php_join_structured_segments(
 }
 
 fn php_leaf_text<'a>(node: Node<'_>, source: &'a str) -> Option<&'a str> {
-    node.utf8_text(source.as_bytes()).ok().map(str::trim)
+    brokk_bifrost_core::analyzer::common::try_node_source_text(node, source).map(str::trim)
 }
 
 /// Collect a conservative whole-file alias summary from an already parsed tree.
@@ -1422,10 +1430,7 @@ pub fn parse_php_use_aliases_from_source(source: &str) -> PhpUseAliases {
     let Some(tree) = parse_php_tree(source) else {
         return PhpUseAliases::default();
     };
-    let Some(index) = PhpFileContextIndex::from_tree(tree.root_node(), source, || true) else {
-        return PhpUseAliases::default();
-    };
-    index.merged_aliases()
+    php_use_aliases_from_tree(tree.root_node(), source)
 }
 
 pub fn parse_php_use_aliases_by_kind(raw: &str) -> PhpUseAliases {
@@ -1437,11 +1442,12 @@ pub fn parse_php_use_aliases(raw: &str) -> HashMap<String, String> {
     parse_php_use_aliases_by_kind(raw).merged()
 }
 
-fn parse_php_tree(source: &str) -> Option<Tree> {
+/// Parse PHP source with the bundled Tree-sitter grammar.
+pub fn parse_php_tree(source: &str) -> Option<Tree> {
     let mut parser = Parser::new();
     parser
         .set_language(&tree_sitter_php::LANGUAGE_PHP.into())
-        .ok()?;
+        .expect("failed to load php parser");
     parser.parse(source, None)
 }
 
@@ -1499,9 +1505,7 @@ pub fn resolve_php_type_arms(raw: &str, ctx: &PhpFileContext) -> Vec<String> {
         let Some(arm) = resolve_php_nominal_type(piece, ctx) else {
             return Vec::new();
         };
-        if !arms.contains(&arm) {
-            arms.push(arm);
-        }
+        push_unique_php_type_arm(&mut arms, arm);
     }
     php_capped_type_arms(arms)
 }
@@ -1511,6 +1515,12 @@ fn php_capped_type_arms(arms: Vec<String>) -> Vec<String> {
         return Vec::new();
     }
     arms
+}
+
+fn push_unique_php_type_arm(arms: &mut Vec<String>, arm: String) {
+    if !arms.contains(&arm) {
+        arms.push(arm);
+    }
 }
 
 /// Resolves one already isolated nominal type name against the file's imports
@@ -1560,19 +1570,15 @@ pub fn resolve_php_function(raw: &str, ctx: &PhpFileContext) -> Option<PhpCallab
 
 pub fn resolve_php_constant(raw: &str, ctx: &PhpFileContext) -> Option<PhpCallableCandidates> {
     if raw.starts_with('\\') {
-        return Some(PhpCallableCandidates::exact(module_constant_fq(
-            &php_namespace_to_fq(raw),
-        )));
+        return Some(php_constant_candidates(php_namespace_to_fq(raw), None));
     }
     let normalized = php_namespace_to_fq(raw);
     if let Some(imported) = ctx.aliases.const_aliases.get(&normalized) {
-        return Some(PhpCallableCandidates::exact(module_constant_fq(imported)));
+        return Some(php_constant_candidates(imported.clone(), None));
     }
     let namespaced = join_namespace(&ctx.namespace, &format!("_module_.{normalized}"));
-    Some(match php_global_fallback_applies(&normalized, ctx) {
-        true => PhpCallableCandidates::shadowing(namespaced, module_constant_fq(&normalized)),
-        false => PhpCallableCandidates::exact(namespaced),
-    })
+    let global_fallback = php_global_fallback_applies(&normalized, ctx).then_some(normalized);
+    Some(php_constant_candidates(namespaced, global_fallback))
 }
 
 /// Whether PHP's global-namespace fallback applies to an already normalized,
@@ -1622,10 +1628,12 @@ mod source_alias_tests {
         php_file_context_from_tree_at, resolve_php_type_node,
     };
     use brokk_bifrost_core::hash::HashSet;
+    use brokk_bifrost_test_macros::hardwon;
 
     /// Found while building the PHP builtin declaration pack (issue #2374).
     ///
     #[test]
+    #[hardwon("#3026: imports inside a braced namespace were lost by the column-zero scan")]
     fn php_use_alias_inside_a_braced_namespace_is_structured() {
         let source = concat!(
             "<?php\n",
@@ -1647,6 +1655,7 @@ mod source_alias_tests {
     }
 
     #[test]
+    #[hardwon("#3026: grouped type, function, and constant imports were conflated")]
     fn grouped_mixed_imports_keep_type_function_and_const_maps_separate() {
         let aliases = parse_php_use_aliases_by_kind(
             "use Vendor\\Package\\{Target, Helper as Tool, function run, const LIMIT};",
@@ -1660,6 +1669,7 @@ mod source_alias_tests {
     }
 
     #[test]
+    #[hardwon("#3026: comments, strings, and trait use were mistaken for imports")]
     fn comments_strings_and_trait_use_are_not_imports() {
         let aliases = parse_php_use_aliases_from_source(
             r#"<?php
@@ -1676,6 +1686,7 @@ mod source_alias_tests {
     }
 
     #[test]
+    #[hardwon("#3026: aliases leaked across braced namespace and import-kind boundaries")]
     fn contexts_partition_braced_namespaces_and_all_alias_kinds() {
         let source = concat!(
             "<?php\n",
@@ -1742,6 +1753,7 @@ mod source_alias_tests {
     }
 
     #[test]
+    #[hardwon("#3026: aliases leaked across unbraced namespace boundaries")]
     fn contexts_partition_unbraced_namespaces() {
         let source = concat!(
             "<?php\n",
@@ -1770,6 +1782,7 @@ mod source_alias_tests {
     }
 
     #[test]
+    #[hardwon("#3503: namespace-relative types were truncated or routed through aliases")]
     fn namespace_relative_type_keeps_ast_provenance_and_ignores_aliases() {
         let source = concat!(
             "<?php\n",
@@ -1799,6 +1812,7 @@ mod source_alias_tests {
     }
 
     #[test]
+    #[hardwon("#3026: an import was visible before its source declaration boundary")]
     fn aliases_are_invisible_before_their_declaration() {
         let source = "<?php\nnamespace N;\nclass Before extends Alias {}\nuse Vendor\\Base as Alias;\nclass After extends Alias {}\n";
         let tree = parse_php_tree(source).expect("PHP source parses");
@@ -1811,25 +1825,14 @@ mod source_alias_tests {
     }
 
     #[test]
+    #[hardwon("#3026: the statement API bypassed complete structured PHP parsing")]
     fn raw_statement_apis_route_through_complete_php_parse() {
         let aliases = parse_php_use_aliases("use Vendor\\Widget\\Renderable as Renderer;");
         assert_eq!(aliases["Renderer"], "Vendor.Widget.Renderable");
     }
 
     #[test]
-    fn public_alias_map_mutations_are_visible_to_conservative_targets() {
-        let mut aliases = PhpUseAliases::default();
-        aliases
-            .type_aliases
-            .insert("Manual".to_string(), "Vendor.Manual".to_string());
-        assert!(
-            aliases
-                .type_targets()
-                .any(|target| target == "Vendor.Manual")
-        );
-    }
-
-    #[test]
+    #[hardwon("#3026: an import became visible before its terminating semicolon")]
     fn context_at_uses_exact_import_boundaries() {
         let source = concat!(
             "<?php\n",
@@ -1895,6 +1898,7 @@ mod source_alias_tests {
     }
 
     #[test]
+    #[hardwon("#3026: a near-start alias query scanned irrelevant suffix declarations")]
     fn single_byte_context_does_not_scan_irrelevant_suffix_nodes() {
         let mut source = String::from("<?php\nuse Vendor\\Thing as Thing;\nclass Target {}\n");
         for index in 0..128 {
@@ -1919,6 +1923,22 @@ mod source_alias_tests {
             })
             .is_none(),
             "the full-file index should exceed the near-start budget"
+        );
+    }
+
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#3026: Issue #3026/#3037 fixed alias-map mutations not reaching conservative PHP targets."
+    )]
+    fn public_alias_map_mutations_are_visible_to_conservative_targets() {
+        let mut aliases = PhpUseAliases::default();
+        aliases
+            .type_aliases
+            .insert("Manual".to_string(), "Vendor.Manual".to_string());
+        assert!(
+            aliases
+                .type_targets()
+                .any(|target| target == "Vendor.Manual")
         );
     }
 }

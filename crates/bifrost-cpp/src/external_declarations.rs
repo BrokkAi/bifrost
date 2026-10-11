@@ -7,10 +7,12 @@
 use crate::adapter::parse_cpp_file;
 use crate::declarations::{
     CppComparableNode, CppComparableSlot, CppParameterType, cpp_active_template_type_parameter,
-    cpp_callable_parameter_type_identities, cpp_callable_return_type_identity,
-    cpp_comparable_parameter_shapes, cpp_function_declarator_at, node_text,
+    cpp_callable_parameter_names, cpp_callable_parameter_type_identities,
+    cpp_callable_return_type_identity, cpp_comparable_parameter_shapes, cpp_function_declarator_at,
+    node_text,
 };
 use crate::graph::resolver::cpp_name_for;
+use crate::structural::is_cpp_preprocessor_conditional;
 use brokk_bifrost_core::analyzer::ProjectFile;
 use brokk_bifrost_core::analyzer::model::{
     CallableArity, CodeUnit, CodeUnitType, CppTemplateMetadata, SignatureMetadata,
@@ -130,6 +132,9 @@ pub struct CppExternalMember {
     /// Invocation arity, including default and repeated parameters, when the
     /// declaration is callable and its parameter list was reached.
     pub callable_arity: Option<CallableArity>,
+    /// The written name of each invocation parameter, when one exists. The
+    /// positions match `parameter_types`; unnamed C parameters remain `None`.
+    pub parameter_names: Option<Vec<Option<String>>>,
     /// Whether a constructor is available to implicit conversion.
     pub explicitness: Option<CppCallableExplicitness>,
     pub return_type: Option<StructuredTypeIdentity>,
@@ -172,39 +177,44 @@ pub struct CppExternalDeclarationSet {
     pub diagnostics: Vec<CppExternalDeclarationDiagnostic>,
 }
 
-/// Return the literal paths from angle-bracket includes in one C++ source.
+/// Return literal include paths and their delimiter kind from one C++ source.
 ///
-/// Quoted and computed includes are not external-root evidence. Conditional
-/// includes are retained because compile-context resolution still proves the
-/// root, while pack completeness records preprocessor uncertainty separately.
-pub fn external_angle_include_paths(source: &str) -> Vec<PathBuf> {
+/// The boolean is `true` for a quoted include and `false` for an angle include.
+/// Computed and conditional includes are not external-root evidence; pack
+/// completeness records preprocessor uncertainty separately.
+pub fn external_include_paths(source: &str) -> Vec<(PathBuf, bool)> {
     let mut parser = Parser::new();
     parser
         .set_language(&tree_sitter_cpp::LANGUAGE.into())
         .expect("the linked tree-sitter-cpp grammar matches this tree-sitter version");
     let tree = parser.parse(source, None).expect("uncancelled C++ parse");
-    external_angle_include_paths_from_root(source, tree.root_node())
+    external_include_paths_from_root(source, tree.root_node())
 }
 
-/// Return literal unconditional angle includes from an existing C++ syntax tree.
-///
-/// The source and root must describe the same immutable snapshot. Analyzer
-/// callers use this form to reuse prepared workspace syntax; standalone
-/// external headers use [`external_angle_include_paths`].
-pub fn external_angle_include_paths_from_root(source: &str, root: Node<'_>) -> Vec<PathBuf> {
+/// Return literal include paths and their delimiter kind from an existing C++
+/// syntax tree.
+pub fn external_include_paths_from_root(source: &str, root: Node<'_>) -> Vec<(PathBuf, bool)> {
     let mut paths = Vec::new();
     let mut stack = vec![root];
     while let Some(node) = stack.pop() {
         if node.kind() == "preproc_include"
             && !has_conditional_preprocessor_ancestor(node)
             && let Some(path) = node.child_by_field_name("path")
-            && path.kind() == "system_lib_string"
-            && let Some(path) = node_text(path, source)
-                .strip_prefix('<')
-                .and_then(|path| path.strip_suffix('>'))
-                .filter(|path| !path.is_empty())
+            && let Some((path, quoted)) = match path.kind() {
+                "string_literal" => node_text(path, source)
+                    .strip_prefix('"')
+                    .and_then(|path| path.strip_suffix('"'))
+                    .filter(|path| !path.is_empty())
+                    .map(|path| (PathBuf::from(path), true)),
+                "system_lib_string" => node_text(path, source)
+                    .strip_prefix('<')
+                    .and_then(|path| path.strip_suffix('>'))
+                    .filter(|path| !path.is_empty())
+                    .map(|path| (PathBuf::from(path), false)),
+                _ => None,
+            }
         {
-            paths.push(PathBuf::from(path));
+            paths.push((path, quoted));
         }
         let mut cursor = node.walk();
         stack.extend(node.named_children(&mut cursor));
@@ -214,12 +224,33 @@ pub fn external_angle_include_paths_from_root(source: &str, root: Node<'_>) -> V
     paths
 }
 
+/// Return the literal paths from angle-bracket includes in one C++ source.
+///
+/// Quoted includes are intentionally omitted from this compatibility helper;
+/// callers that resolve compiler search semantics should use
+/// [`external_include_paths`] instead.
+pub fn external_angle_include_paths(source: &str) -> Vec<PathBuf> {
+    external_include_paths(source)
+        .into_iter()
+        .filter_map(|(path, quoted)| (!quoted).then_some(path))
+        .collect()
+}
+
+/// Return literal unconditional angle includes from an existing C++ syntax tree.
+///
+/// The source and root must describe the same immutable snapshot. Analyzer
+/// callers use this form to reuse prepared workspace syntax; standalone
+/// external headers use [`external_angle_include_paths`].
+pub fn external_angle_include_paths_from_root(source: &str, root: Node<'_>) -> Vec<PathBuf> {
+    external_include_paths_from_root(source, root)
+        .into_iter()
+        .filter_map(|(path, quoted)| (!quoted).then_some(path))
+        .collect()
+}
+
 fn has_conditional_preprocessor_ancestor(mut node: Node<'_>) -> bool {
     while let Some(parent) = node.parent() {
-        if matches!(
-            parent.kind(),
-            "preproc_if" | "preproc_ifdef" | "preproc_ifndef" | "preproc_elif" | "preproc_else"
-        ) {
+        if is_cpp_preprocessor_conditional(parent) {
             return true;
         }
         node = parent;
@@ -364,6 +395,11 @@ pub fn extract_external_declarations(
                 let parameter_types = function_declarator.map(|declarator| {
                     cpp_callable_parameter_type_identities(declarator, source, &ancestry)
                 });
+                let parameter_names = function_declarator.and_then(|declarator| {
+                    declarator
+                        .child_by_field_name("parameters")
+                        .map(|parameters| cpp_callable_parameter_names(parameters, source))
+                });
                 let parameter_shapes = function_declarator.map(|declarator| {
                     cpp_comparable_parameter_shapes(declarator, source, &ancestry)
                 });
@@ -404,6 +440,7 @@ pub fn extract_external_declarations(
                     parameter_types,
                     parameter_shapes,
                     callable_arity: metadata.and_then(SignatureMetadata::callable_arity),
+                    parameter_names,
                     explicitness: function_declarator.and_then(cpp_callable_explicitness),
                     return_type,
                     returns_forwarding_reference,
@@ -670,8 +707,15 @@ mod tests {
     }
 
     #[test]
-    fn extracts_only_literal_angle_include_paths() {
+    fn extracts_literal_include_paths_with_delimiters() {
         let source = "#include <vector>\n#include \"local.hpp\"\n#include HEADER\n#if FEATURE\n#include <conditional.hpp>\n#endif\n";
+        assert_eq!(
+            vec![
+                (PathBuf::from("local.hpp"), true),
+                (PathBuf::from("vector"), false),
+            ],
+            external_include_paths(source)
+        );
         assert_eq!(
             vec![PathBuf::from("vector")],
             external_angle_include_paths(source)
@@ -815,6 +859,28 @@ mod tests {
                 .iter()
                 .any(|member| { member.callable_arity == Some(CallableArity::new(2, 2, false)) }),
             "non-defaulted constructor arity must be required=2,total=2: {constructors:#?}"
+        );
+    }
+
+    #[test]
+    fn preserves_callable_parameter_names() {
+        let declarations = extract("int connect(int fd, const char *address, unsigned length);\n");
+        let connect_candidates = declarations
+            .members
+            .iter()
+            .filter(|member| member.name == "connect")
+            .collect::<Vec<_>>();
+        let [connect] = connect_candidates.as_slice() else {
+            panic!("connect declaration: {declarations:#?}");
+        };
+        assert_eq!(
+            Some(vec![
+                Some("fd".to_owned()),
+                Some("address".to_owned()),
+                Some("length".to_owned()),
+            ]),
+            connect.parameter_names,
+            "formal names must remain aligned with the declaration's argument slots"
         );
     }
 

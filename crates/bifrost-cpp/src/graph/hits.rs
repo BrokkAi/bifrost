@@ -1,7 +1,7 @@
-use crate::graph::extractor::{EnclosingContext, ScanCtx};
+use crate::graph::extractor::{EnclosingContext, ScanCtx, node_inside_target_declaration};
 use crate::graph::resolver::{
     TargetKind, declarator_name_node, precise_parent_of, same_logical_symbol,
-    visible_owner_from_member_name,
+    type_reference_hit_node, visible_owner_from_member_name,
 };
 use brokk_bifrost_core::analyzer::usages::common::{SNIPPET_CONTEXT_LINES, usage_hit};
 use brokk_bifrost_core::analyzer::usages::model::{UsageHitKind, UsageHitSurface};
@@ -14,11 +14,12 @@ pub fn push_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
 }
 
 pub fn push_type_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
-    if ctx.has_proven_visible_type_target {
-        push_hit_with_options(node, ctx, false, UsageHitKind::Reference, true);
+    let node = if ctx.analyzer.reference_uses_c_semantics(ctx.file) {
+        node
     } else {
-        push_unproven_hit(node, ctx);
-    }
+        type_reference_hit_node(node)
+    };
+    push_type_hit_range(node, node.start_byte(), node.end_byte(), ctx);
 }
 
 pub fn push_type_hit_range(anchor: Node<'_>, start: usize, end: usize, ctx: &mut ScanCtx<'_>) {
@@ -124,16 +125,13 @@ pub fn push_declared_reference_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
         return;
     }
     let line_idx = find_line_index_for_offset(ctx.line_starts, node.start_byte());
-    let hit = usage_hit(
-        ctx.file,
-        line_idx,
-        node.start_byte(),
-        node.end_byte(),
+    insert_hit(
+        node,
+        ctx,
         ctx.spec.target.clone(),
-        snippet_around_line(ctx.source, ctx.line_starts, line_idx, SNIPPET_CONTEXT_LINES),
-    )
-    .into_declared_reference();
-    ctx.hits.insert(hit);
+        line_idx,
+        UsageHitKind::DeclaredReference,
+    );
 }
 
 /// Record a recovered callable definition name as an editor-only definition
@@ -145,16 +143,13 @@ pub fn push_recovered_definition_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
         return;
     }
     let line_idx = find_line_index_for_offset(ctx.line_starts, node.start_byte());
-    let hit = usage_hit(
-        ctx.file,
-        line_idx,
-        node.start_byte(),
-        node.end_byte(),
+    insert_hit(
+        node,
+        ctx,
         ctx.spec.target.clone(),
-        snippet_around_line(ctx.source, ctx.line_starts, line_idx, SNIPPET_CONTEXT_LINES),
-    )
-    .into_definition();
-    ctx.hits.insert(hit);
+        line_idx,
+        UsageHitKind::Definition,
+    );
 }
 
 pub fn push_unproven_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
@@ -176,7 +171,7 @@ fn push_unproven_hit_range(
     ctx: &mut ScanCtx<'_>,
     kind: UsageHitKind,
 ) {
-    if is_inside_target_declaration(anchor, ctx) || is_member_field_own_declarator(anchor, ctx) {
+    if node_inside_target_declaration(anchor, ctx) || is_member_field_own_declarator(anchor, ctx) {
         return;
     }
     let line_idx = find_line_index_for_offset(ctx.line_starts, start);
@@ -246,7 +241,7 @@ fn push_hit_range_with_options(
         return;
     }
     let inside_target_declaration =
-        !allow_inside_target_declaration && is_inside_target_declaration(anchor, ctx);
+        !allow_inside_target_declaration && node_inside_target_declaration(anchor, ctx);
     let line_idx = find_line_index_for_offset(ctx.line_starts, start);
     let Some(enclosing) = enclosing_context(anchor, ctx).enclosing.clone() else {
         return;
@@ -392,12 +387,6 @@ fn is_target_declaration_name(node: Node<'_>, ctx: &ScanCtx<'_>) -> bool {
         current = candidate.parent();
     }
     false
-}
-
-fn is_inside_target_declaration(node: Node<'_>, ctx: &ScanCtx<'_>) -> bool {
-    ctx.target_declaration_ranges
-        .iter()
-        .any(|range| node.start_byte() >= range.start_byte && node.end_byte() <= range.end_byte)
 }
 
 /// Returns whether `node` is on the declared-name path of a class field.

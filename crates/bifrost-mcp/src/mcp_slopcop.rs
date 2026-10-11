@@ -1,5 +1,6 @@
 use crate::mcp_common::{
-    McpRenderOptions, WeightThreshold, run_stdio_server, tool_descriptor, weight_knob_descriptor,
+    McpRenderOptions, WeightThreshold, run_named_stdio_server, tool_descriptor,
+    weight_knob_descriptor,
 };
 use serde_json::{Value, json};
 use std::path::PathBuf;
@@ -22,8 +23,7 @@ pub fn run_slopcop_stdio_server(
     root: PathBuf,
     render_options: McpRenderOptions,
 ) -> Result<(), String> {
-    let spec = crate::mcp_registry::resolve_server_spec("slopcop")?;
-    run_stdio_server(Some(root), render_options, &spec, None)
+    run_named_stdio_server(root, render_options, "slopcop")
 }
 
 pub(crate) fn slopcop_tool_descriptors() -> Vec<Value> {
@@ -395,7 +395,7 @@ pub(crate) fn slopcop_tool_descriptors() -> Vec<Value> {
         ),
         tool_descriptor(
             "report_secret_like_code",
-            "Scans non-test text files for secret-looking strings, including current/default-branch files and git history. Findings are heuristic and redacted for downstream LLM triage. Use maxFindings/maxCommits to bound output and work.",
+            "Scans non-test text files for secret-looking strings, including current/default-branch files and git history. Findings are heuristic and redacted for downstream LLM triage. Use max_findings/max_commits to bound output and work.",
             json!({
                 "type": "object",
                 "properties": {

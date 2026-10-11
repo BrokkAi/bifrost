@@ -86,11 +86,19 @@ pub fn write_policy_json<W: Write>(
     max_serialized_bytes: usize,
 ) -> Result<u64, PolicyRenderError> {
     ensure_supported_schema(report)?;
+    write_canonical_json(report, output, max_serialized_bytes)
+}
+
+pub(crate) fn write_canonical_json<T: Serialize, W: Write>(
+    value: &T,
+    output: W,
+    max_serialized_bytes: usize,
+) -> Result<u64, PolicyRenderError> {
     let mut output = BoundedWriter::new(output, max_serialized_bytes);
     let serialized = {
         let mut serializer =
             serde_json::Serializer::with_formatter(&mut output, CanonicalJsonFormatter);
-        report.serialize(&mut serializer)
+        value.serialize(&mut serializer)
     };
     if let Err(error) = serialized {
         if output.limit_exceeded() {
@@ -329,7 +337,8 @@ pub(crate) fn should_escape_text_character(character: char) -> bool {
     character.is_control() || is_bidi_control(character)
 }
 
-pub(crate) const fn is_bidi_control(character: char) -> bool {
+/// Whether a character is a Unicode bidirectional control character.
+pub const fn is_bidi_control(character: char) -> bool {
     matches!(
         character,
         '\u{061C}'
@@ -342,7 +351,6 @@ pub(crate) const fn is_bidi_control(character: char) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use std::io;
     use std::sync::Arc;
 
     use super::*;
@@ -350,21 +358,14 @@ mod tests {
         CatalogRegistryLimits, DefaultPolicyEvaluator, PolicyBudget, PolicyEvaluationContext,
         PolicyEvaluator, PolicyRegistry, PolicyRegistryLimits, PolicyReportDiagnostic,
         PolicyReportDiagnosticCode, PolicyRuleDescriptor, PolicyRunCompletion,
-        PolicySourceIdentity, TaintCatalogRegistry,
+        PolicySelectionProvenance, PolicySourceIdentity, TaintCatalogRegistry,
+        UnavailablePolicyCapability,
     };
     use brokk_bifrost_analysis::CancellationToken;
     use brokk_bifrost_analysis::analyzer::{
         Language, ProjectFile, TestProject, TypescriptAnalyzer,
     };
-
-    const MATCHING_POLICY: &str = r#"(policy
-      :schema-version 1
-      :id "test.render"
-      :name "Render"
-      :message "Avoid target"
-      :severity warning
-      :analysis (analysis :type match :selector
-        (rql :schema-version 1 (language typescript (function :name "target")))))"#;
+    use brokk_bifrost_test_macros::hardwon;
 
     fn evaluated_report(
         policy_source: &str,
@@ -411,41 +412,29 @@ mod tests {
             .expect("canonical report")
     }
 
-    fn report_with_run_completion(completion: PolicyRunCompletion) -> PolicyReportDocument {
-        use crate::{PolicyAnalysisType, PolicyRun, PolicyWorkReport};
+    const MATCHING_POLICY: &str = r#"(policy
+      :schema-version 1
+      :id "test.render"
+      :name "Render"
+      :message "Avoid target"
+      :severity warning
+      :analysis (analysis :type match :selector
+        (rql :schema-version 1 (language typescript (function :name "target")))))"#;
 
-        let catalogs = Arc::new(TaintCatalogRegistry::new_without_workspace(
-            CatalogRegistryLimits::default(),
-        ));
-        let mut registry =
-            PolicyRegistry::new_without_workspace(catalogs, PolicyRegistryLimits::default());
-        registry
-            .register_policy_bytes(
-                PolicySourceIdentity::new("test:render-completion"),
-                MATCHING_POLICY.as_bytes(),
-            )
-            .expect("valid policy");
-        let policy = registry.policies().next().expect("one policy");
-        let descriptor = PolicyRuleDescriptor::from_loaded(policy);
-        let run = PolicyRun::try_new(
-            policy.definition().metadata.id.clone(),
-            policy.semantic_hash(),
-            PolicyAnalysisType::Match,
+    fn report_with_run_completion(completion: PolicyRunCompletion) -> PolicyReportDocument {
+        crate::test_support::report_with_run_completion(
+            "test:render-completion",
+            MATCHING_POLICY,
             completion,
-            Vec::new(),
-            Vec::new(),
-            false,
-            PolicyWorkReport::default(),
-            &PolicyBudget::default(),
         )
-        .expect("synthetic run");
-        PolicyReportDocument::try_new(vec![descriptor], vec![run], Vec::new(), false, 0, None)
-            .expect("canonical report")
     }
 
     /// The `ProvenBySummary` tier (#1916) must stay distinct and visible in both
     /// renderers, never collapsed into `complete`.
     #[test]
+    #[hardwon(
+        "#1916: summary-proven policy runs must remain visibly non-exhaustive in human and SARIF reports"
+    )]
     fn issue_1916_proven_by_summary_renders_distinctly_in_human_and_sarif() {
         let report = report_with_run_completion(PolicyRunCompletion::ProvenBySummary);
 
@@ -499,6 +488,82 @@ mod tests {
     }
 
     #[test]
+    fn capability_gated_policy_renders_as_not_run_in_human_and_sarif() {
+        let report = report_with_run_completion(PolicyRunCompletion::NotRun {
+            unavailable_capabilities: vec![UnavailablePolicyCapability {
+                label: "python-declaration-models".to_owned(),
+                reason: "the active semantic snapshot does not publish a complete Python declaration surface"
+                    .to_owned(),
+            }],
+            selected_by: PolicySelectionProvenance::ExplicitPolicyId,
+        });
+
+        let mut concise = Vec::new();
+        write_policy_human(
+            &report,
+            &HumanRenderOptions::default(),
+            &mut concise,
+            usize::MAX,
+        )
+        .unwrap();
+        let concise = String::from_utf8(concise).unwrap();
+        assert!(
+            concise.contains("Policies not run\npolicy test.render (Render): not run"),
+            "{concise}"
+        );
+        assert!(concise.contains("python-declaration-models:"), "{concise}");
+        assert!(
+            concise.contains("Analysis warnings\n  None."),
+            "not-run belongs in its own section, not the warning section:\n{concise}"
+        );
+
+        let mut human = Vec::new();
+        write_policy_human(
+            &report,
+            &HumanRenderOptions::new(HumanRenderDetail::Verbose, HumanRenderColor::Plain),
+            &mut human,
+            usize::MAX,
+        )
+        .unwrap();
+        let human = String::from_utf8(human).unwrap();
+        assert!(
+            human.contains("Policies not run\npolicy test.render (Render): not run"),
+            "{human}"
+        );
+        assert!(human.contains("1 not-run policy run"), "{human}");
+        assert!(human.contains("selected by explicit policy ID"), "{human}");
+        assert!(human.contains("python-declaration-models:"), "{human}");
+        assert!(
+            !human.contains("Analysis warnings\n  test.render:"),
+            "{human}"
+        );
+
+        let mut sarif = Vec::new();
+        write_policy_sarif(
+            &report,
+            &SarifToolIdentity::default(),
+            &mut sarif,
+            usize::MAX,
+        )
+        .unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&sarif).unwrap();
+        let notification = value["runs"][0]["invocations"][0]["toolExecutionNotifications"]
+            .as_array()
+            .expect("execution notifications")
+            .iter()
+            .find(|notification| notification["descriptor"]["id"] == "BIFROST_POLICY_NOT_RUN")
+            .expect("not-run notification");
+        assert_eq!(notification["level"], "note", "{notification}");
+        assert_eq!(
+            notification["properties"]["bifrost.completion"]["type"], "not_run",
+            "{notification}"
+        );
+    }
+
+    #[test]
+    #[hardwon(
+        "92fd71e09f01: rendered policy output lost the identity of the authored summary that closed a dispatch arm"
+    )]
     fn authored_arm_closure_renders_in_human_and_sarif() {
         use crate::{PolicyAnalysisType, PolicyRun, PolicyWorkReport};
 
@@ -589,45 +654,6 @@ mod tests {
     }
 
     #[test]
-    fn bounded_writer_rejects_the_next_write_without_crossing_the_limit() {
-        let mut output = Vec::new();
-        let mut writer = BoundedWriter::new(&mut output, 4);
-        writer.write_all(b"1234").unwrap();
-        let error = writer.write_all(b"5").unwrap_err();
-        assert!(matches!(
-            map_io_error(error),
-            PolicyRenderError::SerializedReportLimit {
-                max_serialized_bytes: 4
-            }
-        ));
-        assert_eq!(writer.bytes_written(), 4);
-        assert_eq!(output, b"1234");
-    }
-
-    #[test]
-    fn bounded_writer_preserves_destination_failures() {
-        struct FailingWriter;
-
-        impl Write for FailingWriter {
-            fn write(&mut self, _bytes: &[u8]) -> io::Result<usize> {
-                Err(io::Error::new(io::ErrorKind::BrokenPipe, "closed"))
-            }
-
-            fn flush(&mut self) -> io::Result<()> {
-                Ok(())
-            }
-        }
-
-        let error = BoundedWriter::new(FailingWriter, 16)
-            .write_all(b"report")
-            .unwrap_err();
-        assert!(matches!(
-            map_io_error(error),
-            PolicyRenderError::Output(error) if error.kind() == io::ErrorKind::BrokenPipe
-        ));
-    }
-
-    #[test]
     fn canonical_formatter_escapes_controls_and_bidi_without_touching_unicode_text() {
         #[derive(Serialize)]
         struct Text<'a> {
@@ -647,7 +673,6 @@ mod tests {
             r#"{"value":"line\u000A\u0009\u001B\u007F\u0085\u202E\u2066 café"}"#
         );
     }
-
     #[test]
     fn canonical_json_is_deterministic_and_the_exact_encoded_size_is_the_bound() {
         let report = evaluated_report(
@@ -664,7 +689,7 @@ mod tests {
         );
         assert_eq!(first, second);
         assert_eq!(usize::try_from(exact).unwrap(), first.len());
-        assert!(first.starts_with(br#"{"schema_version":5,"evaluation":{"#));
+        assert!(first.starts_with(br#"{"schema_version":6,"evaluation":{"#));
 
         let limit = first.len() - 1;
         let mut bounded = Vec::new();
@@ -680,7 +705,6 @@ mod tests {
         );
         assert!(bounded.len() <= limit);
     }
-
     #[test]
     fn canonical_json_escapes_workspace_control_text_after_encoding() {
         let report = diagnostic_report("workspace:bad\n\u{001B}\u{007F}\u{0085}\u{202E}\u{2066}");
@@ -690,153 +714,6 @@ mod tests {
         assert!(output.contains(r#"workspace:bad\u000A\u001B\u007F\u0085\u202E\u2066"#));
         assert!(!output.contains('\n'));
         assert!(!output.contains('\u{001B}'));
-    }
-
-    #[test]
-    fn canonical_json_preserves_broken_pipe_as_an_output_error() {
-        struct BrokenPipe;
-
-        impl Write for BrokenPipe {
-            fn write(&mut self, _bytes: &[u8]) -> io::Result<usize> {
-                Err(io::Error::new(io::ErrorKind::BrokenPipe, "closed"))
-            }
-
-            fn flush(&mut self) -> io::Result<()> {
-                Ok(())
-            }
-        }
-
-        let report = diagnostic_report("workspace:policy.rqlp");
-        assert!(matches!(
-            write_policy_json(&report, BrokenPipe, usize::MAX),
-            Err(PolicyRenderError::Output(error))
-                if error.kind() == io::ErrorKind::BrokenPipe
-        ));
-    }
-
-    #[test]
-    fn human_report_has_findings_clean_and_incomplete_summaries_without_ansi() {
-        let finding = evaluated_report(
-            MATCHING_POLICY,
-            "export function target() { return 1; }\n",
-            None,
-        );
-        let mut first = Vec::new();
-        write_policy_human(
-            &finding,
-            &HumanRenderOptions::default(),
-            &mut first,
-            usize::MAX,
-        )
-        .unwrap();
-        let mut second = Vec::new();
-        write_policy_human(
-            &finding,
-            &HumanRenderOptions::default(),
-            &mut second,
-            usize::MAX,
-        )
-        .unwrap();
-        assert_eq!(first, second);
-        let finding = String::from_utf8(first).unwrap();
-        assert!(finding.starts_with("1 finding | Analysis complete\n\nFindings\n"));
-        assert!(finding.contains("[warning] test.render: Avoid target\n"));
-        assert!(finding.contains("    Location: app.ts:1:8\n"));
-        assert!(
-            finding.contains("    Certainty: definite; proof: proven; completeness: complete\n")
-        );
-        assert!(!finding.contains("  evidence: structural_match function\n"));
-        assert!(!finding.contains("policy rule: test.render (Render)\n"));
-        assert!(finding.contains("\nAnalysis warnings\n  None.\n"));
-        assert!(finding.contains("\nDependency models\n  Not reported.\n"));
-        assert!(!finding.contains('\u{001B}'));
-
-        let clean = evaluated_report(
-            MATCHING_POLICY,
-            "export function other() { return 1; }\n",
-            None,
-        );
-        let mut output = Vec::new();
-        write_policy_human(
-            &clean,
-            &HumanRenderOptions::default(),
-            &mut output,
-            usize::MAX,
-        )
-        .unwrap();
-        let output = String::from_utf8(output).unwrap();
-        assert!(!output.contains("policy rule: test.render (Render)\n"));
-        assert!(output.starts_with("0 findings | Analysis complete\n\nFindings\n"));
-        assert!(output.contains("  No findings reported.\n"));
-        assert!(!output.contains("does not establish"));
-
-        let cancellation = CancellationToken::new();
-        cancellation.cancel();
-        let incomplete = evaluated_report(
-            MATCHING_POLICY,
-            "export function target() { return 1; }\n",
-            Some(&cancellation),
-        );
-        assert!(matches!(
-            incomplete.runs()[0].completion(),
-            PolicyRunCompletion::Inconclusive { .. }
-        ));
-        let mut output = Vec::new();
-        write_policy_human(
-            &incomplete,
-            &HumanRenderOptions::default(),
-            &mut output,
-            usize::MAX,
-        )
-        .unwrap();
-        let output = String::from_utf8(output).unwrap();
-        assert!(output.starts_with("0 findings | Analysis incomplete\n\nFindings\n"));
-        assert!(output.contains(
-            "Incomplete coverage: zero findings does not establish that the code is safe."
-        ));
-        assert!(output.contains("\nAnalysis warnings\n"));
-        assert!(output.contains("  test.render: inconclusive (cancelled)\n"));
-    }
-
-    #[test]
-    fn human_report_emits_one_concise_note_for_inferred_policy_and_rql_schemas() {
-        let inferred = MATCHING_POLICY
-            .replacen("\n      :schema-version 1", "", 1)
-            .replacen("rql :schema-version 1", "rql", 1);
-        let report = evaluated_report(&inferred, "export function other() { return 1; }\n", None);
-        let mut output = Vec::new();
-        write_policy_human(
-            &report,
-            &HumanRenderOptions::default(),
-            &mut output,
-            usize::MAX,
-        )
-        .unwrap();
-        let output = String::from_utf8(output).unwrap();
-        let compatible_rql_version = brokk_bifrost_rql::schema::resolve_rql_schema_version(None)
-            .expect("compiled-in RQL schema lineage is valid")
-            .version;
-        let note = format!(
-            "note: policy test.render inferred policy schema 1 and RQL schema {compatible_rql_version}\n"
-        );
-        assert!(output.starts_with("0 findings | Analysis complete\n"));
-        assert!(output.contains(&format!("\nAnalysis warnings\n{note}")));
-        assert_eq!(output.matches(note.as_str()).count(), 1);
-        assert!(!output.contains("policy rule: test.render (Render)\n"));
-
-        let mut verbose = Vec::new();
-        write_policy_human(
-            &report,
-            &HumanRenderOptions::new(HumanRenderDetail::Verbose, HumanRenderColor::Plain),
-            &mut verbose,
-            usize::MAX,
-        )
-        .unwrap();
-        let verbose = String::from_utf8(verbose).unwrap();
-        assert!(verbose.starts_with("0 findings | Analysis complete\n"));
-        assert!(verbose.contains(&format!("\nAnalysis warnings\n{note}")));
-        assert_eq!(verbose.matches(note.as_str()).count(), 1);
-        assert!(verbose.contains("policy rule: test.render (Render)\n"));
     }
 
     #[test]

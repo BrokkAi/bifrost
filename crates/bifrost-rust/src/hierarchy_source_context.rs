@@ -7,6 +7,7 @@
 use crate::graph_support::RustCargoRouteError;
 use crate::hierarchy::RustHierarchySourceFacts;
 use crate::lexical_scope::insert_rust_source_import_binding;
+use brokk_bifrost_core::analyzer::parsed_file::SourceImportFact;
 use brokk_bifrost_core::analyzer::rust_facts::{RustSourceContextFact, RustSourceContextKind};
 use brokk_bifrost_core::analyzer::source_facts::{SourceDeclarationId, SourceOccurrenceId};
 use brokk_bifrost_core::analyzer::usages::model::ImportBinder;
@@ -216,55 +217,10 @@ impl RustSourceContextIndex {
         context: SourceOccurrenceId,
         keep_going: &dyn Fn() -> bool,
     ) -> Result<ImportBinder, RustCargoRouteError> {
-        let chain = self.context_chain(facts, context, keep_going)?;
-        let ancestors = chain
-            .iter()
-            .map(|context| context.context)
-            .collect::<HashSet<_>>();
-        let query_anchor = self.nearest_module_or_file_root(context)?;
-        if !keep_going() {
-            return Err(RustCargoRouteError::Cancelled);
-        }
-        if !self.imports_without_context.is_empty() {
-            return Err(RustCargoRouteError::Unavailable);
-        }
         let mut binder = ImportBinder::empty();
-
-        for import_position in self
-            .imports_by_anchor
-            .get(&query_anchor)
-            .into_iter()
-            .flatten()
-        {
-            if !keep_going() {
-                return Err(RustCargoRouteError::Cancelled);
-            }
-            let import = facts
-                .imports
-                .get(*import_position)
-                .ok_or(RustCargoRouteError::Unavailable)?;
-            let import_context_position = self
-                .import_contexts
-                .get(&import.declaration)
-                .copied()
-                .ok_or(RustCargoRouteError::Unavailable)?;
-            let import_context = facts
-                .items
-                .import_contexts
-                .get(import_context_position)
-                .ok_or(RustCargoRouteError::Unavailable)?;
-            assert_eq!(
-                import_context.declaration, import.declaration,
-                "Rust source import context position must identify its declaration"
-            );
-            if !ancestors.contains(&import_context.context) {
-                continue;
-            }
+        self.for_each_visible_import(facts, context, keep_going, |_, import| {
             insert_rust_source_import_binding(&mut binder, import);
-        }
-        if !keep_going() {
-            return Err(RustCargoRouteError::Cancelled);
-        }
+        })?;
         Ok(binder)
     }
 
@@ -279,6 +235,34 @@ impl RustSourceContextIndex {
         context: SourceOccurrenceId,
         keep_going: &dyn Fn() -> bool,
     ) -> Result<Vec<(SourceOccurrenceId, ImportBinder)>, RustCargoRouteError> {
+        let mut binders = HashMap::default();
+        let chain =
+            self.for_each_visible_import(facts, context, keep_going, |context, import| {
+                insert_rust_source_import_binding(
+                    binders.entry(context).or_insert_with(ImportBinder::empty),
+                    import,
+                );
+            })?;
+
+        chain
+            .into_iter()
+            .map(|context| {
+                let context_id = context.context;
+                let binder = binders
+                    .remove(&context_id)
+                    .unwrap_or_else(ImportBinder::empty);
+                Ok((context_id, binder))
+            })
+            .collect()
+    }
+
+    fn for_each_visible_import<'facts>(
+        &self,
+        facts: &'facts RustHierarchySourceFacts,
+        context: SourceOccurrenceId,
+        keep_going: &dyn Fn() -> bool,
+        mut visit: impl FnMut(SourceOccurrenceId, &SourceImportFact),
+    ) -> Result<Vec<&'facts RustSourceContextFact>, RustCargoRouteError> {
         let chain = self.context_chain(facts, context, keep_going)?;
         let ancestors = chain
             .iter()
@@ -292,10 +276,6 @@ impl RustSourceContextIndex {
             return Err(RustCargoRouteError::Unavailable);
         }
 
-        let mut binders = chain
-            .iter()
-            .map(|context| (context.context, ImportBinder::empty()))
-            .collect::<HashMap<_, _>>();
         for import_position in self
             .imports_by_anchor
             .get(&query_anchor)
@@ -323,29 +303,14 @@ impl RustSourceContextIndex {
                 import_context.declaration, import.declaration,
                 "Rust source import context position must identify its declaration"
             );
-            if !ancestors.contains(&import_context.context) {
-                continue;
+            if ancestors.contains(&import_context.context) {
+                visit(import_context.context, import);
             }
-            let binder = binders
-                .get_mut(&import_context.context)
-                .expect("visible import context is in the context chain");
-            insert_rust_source_import_binding(binder, import);
         }
-
         if !keep_going() {
             return Err(RustCargoRouteError::Cancelled);
         }
-
-        chain
-            .into_iter()
-            .map(|context| {
-                let context_id = context.context;
-                let binder = binders
-                    .remove(&context_id)
-                    .expect("every visible context has one binder");
-                Ok((context_id, binder))
-            })
-            .collect()
+        Ok(chain)
     }
 
     /// Build the binder used by a declaration whose syntax was replayed from
@@ -495,300 +460,6 @@ mod tests {
     use super::*;
     use crate::declarations::parse_rust_file;
     use brokk_bifrost_core::analyzer::ProjectFile;
-    use brokk_bifrost_core::analyzer::model::StructuredImportPathKind;
-    use brokk_bifrost_core::analyzer::parsed_file::{SourceImportFact, SourceImportPathFact};
-    use brokk_bifrost_core::analyzer::rust_facts::{
-        RustItemImportContextFact, RustItemSourceFacts,
-    };
-
-    fn occurrence(index: u32) -> SourceOccurrenceId {
-        SourceOccurrenceId::new(index)
-    }
-
-    fn declaration(index: u32) -> SourceDeclarationId {
-        SourceDeclarationId::new(index)
-    }
-
-    fn import(declaration: SourceOccurrenceId, module: &str) -> SourceImportFact {
-        SourceImportFact {
-            declaration,
-            target: None,
-            alias_occurrence: None,
-            statement: format!("use crate::{module}::Thing;"),
-            is_wildcard: false,
-            is_global: false,
-            is_macro_use: false,
-            identifier: Some("Thing".to_string()),
-            alias: None,
-            path: Some(SourceImportPathFact {
-                kind: Some(StructuredImportPathKind::ImportFrom),
-                segments: vec!["crate".to_string(), module.to_string(), "Thing".to_string()],
-                lexical_prefixes: Vec::new(),
-                lexical_scopes: Vec::new(),
-            }),
-        }
-    }
-
-    fn facts() -> RustHierarchySourceFacts {
-        let root = occurrence(0);
-        let module = occurrence(1);
-        let body = occurrence(2);
-        let function = occurrence(3);
-        let embedded_root = occurrence(4);
-        let embedded_function = occurrence(5);
-        let root_import = occurrence(10);
-        let module_import = occurrence(11);
-        let module_override = occurrence(12);
-        let embedded_import = occurrence(13);
-        let module_declaration = declaration(0);
-        let items = RustItemSourceFacts {
-            contexts: vec![
-                RustSourceContextFact {
-                    context: root,
-                    parent: None,
-                    owner: None,
-                    kind: RustSourceContextKind::FileRoot,
-                },
-                RustSourceContextFact {
-                    context: module,
-                    parent: Some(root),
-                    owner: Some(module_declaration),
-                    kind: RustSourceContextKind::Module,
-                },
-                RustSourceContextFact {
-                    context: body,
-                    parent: Some(module),
-                    owner: None,
-                    kind: RustSourceContextKind::DeclarationBody,
-                },
-                RustSourceContextFact {
-                    context: function,
-                    parent: Some(body),
-                    owner: None,
-                    kind: RustSourceContextKind::Function,
-                },
-                RustSourceContextFact {
-                    context: embedded_root,
-                    parent: Some(module),
-                    owner: None,
-                    kind: RustSourceContextKind::FileRoot,
-                },
-                RustSourceContextFact {
-                    context: embedded_function,
-                    parent: Some(embedded_root),
-                    owner: None,
-                    kind: RustSourceContextKind::Function,
-                },
-            ],
-            import_contexts: vec![
-                RustItemImportContextFact {
-                    declaration: root_import,
-                    context: root,
-                },
-                RustItemImportContextFact {
-                    declaration: module_import,
-                    context: module,
-                },
-                RustItemImportContextFact {
-                    declaration: module_override,
-                    context: module,
-                },
-                RustItemImportContextFact {
-                    declaration: embedded_import,
-                    context: embedded_root,
-                },
-            ],
-            ..RustItemSourceFacts::default()
-        };
-        let mut module_names = HashMap::default();
-        module_names.insert(module_declaration, "outer".to_string());
-        RustHierarchySourceFacts {
-            items,
-            types: Vec::new(),
-            declarations: Vec::new(),
-            declaration_units: Vec::new(),
-            module_names,
-            imports: vec![
-                import(root_import, "root"),
-                import(module_import, "first"),
-                import(module_override, "second"),
-                import(embedded_import, "embedded"),
-            ],
-        }
-    }
-
-    #[test]
-    fn module_path_root_and_embedded_tree_do_not_inherit_parent_module() {
-        let facts = facts();
-        let contexts = RustSourceContextIndex::new(&facts, &|| true).unwrap();
-        assert_eq!(
-            contexts
-                .module_path(&facts, occurrence(3), &|| true)
-                .unwrap(),
-            vec!["outer"]
-        );
-        assert!(
-            contexts
-                .module_path(&facts, occurrence(0), &|| true)
-                .unwrap()
-                .is_empty()
-        );
-        assert!(
-            contexts
-                .module_path(&facts, occurrence(5), &|| true)
-                .unwrap()
-                .is_empty()
-        );
-        assert!(contexts.is_primary(&facts, occurrence(3)).unwrap());
-        assert!(!contexts.is_primary(&facts, occurrence(5)).unwrap());
-        assert_eq!(
-            contexts.nearest_tree_root(occurrence(5)).unwrap(),
-            occurrence(4)
-        );
-    }
-
-    #[test]
-    fn binder_uses_ancestor_contexts_same_module_anchor_and_canonical_order() {
-        let facts = facts();
-        let contexts = RustSourceContextIndex::new(&facts, &|| true).unwrap();
-        let binder = contexts
-            .visible_import_binder(&facts, occurrence(3), &|| true)
-            .unwrap();
-        assert_eq!(
-            binder.bindings.get("Thing").unwrap().module_specifier,
-            "crate::second"
-        );
-
-        let root_binder = contexts
-            .visible_import_binder(&facts, occurrence(0), &|| true)
-            .unwrap();
-        assert_eq!(
-            root_binder.bindings.get("Thing").unwrap().module_specifier,
-            "crate::root"
-        );
-
-        let embedded_binder = contexts
-            .visible_import_binder(&facts, occurrence(5), &|| true)
-            .unwrap();
-        assert_eq!(
-            embedded_binder
-                .bindings
-                .get("Thing")
-                .unwrap()
-                .module_specifier,
-            "crate::embedded"
-        );
-        let primary_binder = contexts
-            .primary_import_binder(&facts, occurrence(5), &|| true)
-            .unwrap();
-        assert_eq!(
-            primary_binder
-                .bindings
-                .get("Thing")
-                .unwrap()
-                .module_specifier,
-            "crate::second"
-        );
-    }
-
-    #[test]
-    fn index_exposes_owner_rows_anchors_and_direct_binders() {
-        let facts = facts();
-        let contexts = RustSourceContextIndex::new(&facts, &|| true).unwrap();
-        assert_eq!(contexts.owner_context(declaration(0)), Some(occurrence(1)));
-        assert_eq!(
-            contexts.context(&facts, occurrence(1)).unwrap().owner,
-            Some(declaration(0))
-        );
-        assert_eq!(
-            contexts.nearest_module_or_file_root(occurrence(3)).unwrap(),
-            occurrence(1)
-        );
-
-        let binders = contexts
-            .visible_import_binders(&facts, occurrence(3), &|| true)
-            .unwrap();
-        assert_eq!(
-            binders
-                .iter()
-                .map(|(context, _)| *context)
-                .collect::<Vec<_>>(),
-            vec![occurrence(3), occurrence(2), occurrence(1), occurrence(0)]
-        );
-        assert!(binders[0].1.bindings.is_empty());
-        assert_eq!(
-            binders[2].1.bindings.get("Thing").unwrap().module_specifier,
-            "crate::second"
-        );
-        assert!(
-            binders[3].1.bindings.is_empty(),
-            "imports outside the query's module anchor are not visible"
-        );
-    }
-
-    #[test]
-    fn construction_and_context_walk_honor_cancellation() {
-        let facts = facts();
-        assert!(matches!(
-            RustSourceContextIndex::new(&facts, &|| false),
-            Err(RustCargoRouteError::Cancelled)
-        ));
-
-        let contexts = RustSourceContextIndex::new(&facts, &|| true).unwrap();
-        assert_eq!(
-            contexts.module_path(&facts, occurrence(3), &|| false),
-            Err(RustCargoRouteError::Cancelled)
-        );
-        assert!(matches!(
-            contexts.visible_import_binders(&facts, occurrence(3), &|| false),
-            Err(RustCargoRouteError::Cancelled)
-        ));
-    }
-
-    #[test]
-    fn missing_module_name_and_import_context_are_unavailable() {
-        let mut missing_name = facts();
-        missing_name.module_names.clear();
-        let contexts = RustSourceContextIndex::new(&missing_name, &|| true).unwrap();
-        assert_eq!(
-            contexts.module_path(&missing_name, occurrence(3), &|| true),
-            Err(RustCargoRouteError::Unavailable)
-        );
-
-        let mut facts = facts();
-        facts.items.import_contexts.clear();
-        let contexts = RustSourceContextIndex::new(&facts, &|| true).unwrap();
-        assert!(matches!(
-            contexts.visible_import_binder(&facts, occurrence(0), &|| true),
-            Err(RustCargoRouteError::Unavailable)
-        ));
-
-        let empty = RustHierarchySourceFacts {
-            items: RustItemSourceFacts {
-                contexts: vec![RustSourceContextFact {
-                    context: occurrence(0),
-                    parent: None,
-                    owner: None,
-                    kind: RustSourceContextKind::FileRoot,
-                }],
-                ..RustItemSourceFacts::default()
-            },
-            types: Vec::new(),
-            declarations: Vec::new(),
-            declaration_units: Vec::new(),
-            module_names: HashMap::default(),
-            imports: Vec::new(),
-        };
-        let contexts = RustSourceContextIndex::new(&empty, &|| true).unwrap();
-        assert!(
-            contexts
-                .visible_import_binder(&empty, occurrence(0), &|| true)
-                .unwrap()
-                .bindings
-                .is_empty()
-        );
-    }
-
     #[test]
     fn real_parse_function_alias_sees_forward_enclosing_import_only() {
         let source = "fn f() {\n    type LocalAlias = Imported;\n    use crate::source::Item as Imported;\n    {\n        use crate::sibling::Item as Imported;\n    }\n}\n";

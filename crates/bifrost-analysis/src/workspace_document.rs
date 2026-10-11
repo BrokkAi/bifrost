@@ -142,6 +142,34 @@ pub fn read_workspace_document(
     open_workspace_document(root, relative_path, max_bytes)
 }
 
+/// Read an optional workspace document, treating only a missing file as absent.
+pub fn read_optional_workspace_document(
+    root: &WorkspaceRoot,
+    relative_path: &Path,
+    allowed_extensions: &[&str],
+    max_bytes: u64,
+) -> Result<Option<WorkspaceDocument>, WorkspaceDocumentError> {
+    match read_workspace_document(root, relative_path, allowed_extensions, max_bytes) {
+        Ok(document) => Ok(Some(document)),
+        Err(error) if error.is_not_found() => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
+/// Write the shared diagnostic used by workspace documents with this wording.
+pub fn fmt_json_decode_error(
+    formatter: &mut fmt::Formatter<'_>,
+    document: &str,
+    message: &str,
+    line: usize,
+    column: usize,
+) -> fmt::Result {
+    write!(
+        formatter,
+        "{document} document is not valid JSON at line {line} column {column}: {message}"
+    )
+}
+
 /// Open, classify, bounded-read, and UTF-8-decode one workspace document whose
 /// name carries no extension.
 ///
@@ -587,6 +615,14 @@ pub enum WorkspaceDocumentError {
 }
 
 impl WorkspaceDocumentError {
+    /// Whether opening the requested workspace-relative file failed because it is absent.
+    pub fn is_not_found(&self) -> bool {
+        matches!(
+            self,
+            Self::OpenFile { source, .. } if source.kind() == io::ErrorKind::NotFound
+        )
+    }
+
     pub fn path(&self) -> &Path {
         match self {
             Self::OpenWorkspace { path, .. }
@@ -744,10 +780,8 @@ impl std::error::Error for WorkspaceDocumentError {
 mod tests {
     use super::*;
     #[cfg(unix)]
-    use std::ffi::CString;
+    use crate::test_support::create_fifo;
     use std::fs;
-    #[cfg(unix)]
-    use std::os::unix::ffi::OsStrExt;
     #[cfg(unix)]
     use std::os::unix::fs::OpenOptionsExt as _;
     #[cfg(unix)]
@@ -759,26 +793,38 @@ mod tests {
     use tempfile::TempDir;
 
     #[cfg(unix)]
-    fn create_fifo(path: &Path) {
-        let path = CString::new(path.as_os_str().as_bytes()).unwrap();
-        // SAFETY: `path` is a live NUL-terminated string and `mkfifo` retains
-        // neither the pointer nor any Rust-owned memory.
-        let result = unsafe { libc::mkfifo(path.as_ptr(), 0o600) };
-        assert_eq!(result, 0, "mkfifo failed: {}", io::Error::last_os_error());
-    }
+    fn assert_fifo_operations_return_promptly<T>(
+        fifo_paths: Vec<PathBuf>,
+        operation: impl FnOnce() -> T,
+    ) -> T {
+        let (done_tx, done_rx) = mpsc::channel();
+        let fallback = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_secs(2));
+            let guards = fifo_paths
+                .into_iter()
+                .map(|path| {
+                    fs::OpenOptions::new()
+                        .read(true)
+                        .write(true)
+                        .custom_flags(libc::O_NONBLOCK)
+                        .open(path)
+                        .unwrap()
+                })
+                .collect::<Vec<_>>();
+            done_rx.recv().unwrap();
+            drop(guards);
+        });
 
-    #[test]
-    fn bounded_read_uses_relative_capability() {
-        let temp = TempDir::new().unwrap();
-        fs::create_dir(temp.path().join("queries")).unwrap();
-        fs::write(temp.path().join("queries/query.rql"), "(name \"A\")").unwrap();
-        let root = WorkspaceRoot::open(temp.path()).unwrap();
-
-        let document =
-            read_workspace_document(&root, Path::new("queries/query.rql"), &["rql"], 64).unwrap();
-
-        assert_eq!(document.relative_path(), Path::new("queries/query.rql"));
-        assert_eq!(document.source(), "(name \"A\")");
+        let started = Instant::now();
+        let result = operation();
+        let elapsed = started.elapsed();
+        done_tx.send(()).unwrap();
+        fallback.join().unwrap();
+        assert!(
+            elapsed < Duration::from_secs(1),
+            "special-file open blocked for {elapsed:?}"
+        );
+        result
     }
 
     #[test]
@@ -915,31 +961,9 @@ mod tests {
         create_fifo(&fifo_path);
         let root = WorkspaceRoot::open(workspace.path()).unwrap();
 
-        // A delayed read/write peer guarantees that a regression to blocking
-        // open still completes and fails on elapsed time instead of hanging.
-        let (done_tx, done_rx) = mpsc::channel();
-        let fallback = std::thread::spawn(move || {
-            std::thread::sleep(Duration::from_secs(2));
-            let guard = fs::OpenOptions::new()
-                .read(true)
-                .write(true)
-                .custom_flags(libc::O_NONBLOCK)
-                .open(fifo_path)
-                .unwrap();
-            done_rx.recv().unwrap();
-            drop(guard);
+        let result = assert_fifo_operations_return_promptly(vec![fifo_path], || {
+            read_workspace_document(&root, Path::new("query.rql"), &["rql"], 64)
         });
-
-        let started = Instant::now();
-        let result = read_workspace_document(&root, Path::new("query.rql"), &["rql"], 64);
-        let elapsed = started.elapsed();
-        done_tx.send(()).unwrap();
-        fallback.join().unwrap();
-
-        assert!(
-            elapsed < Duration::from_secs(1),
-            "explicit FIFO open blocked for {elapsed:?}"
-        );
         assert!(matches!(
             result,
             Err(WorkspaceDocumentError::NotRegularFile { .. })
@@ -1024,39 +1048,10 @@ mod tests {
         create_fifo(&file_path);
         create_fifo(&directory_path);
 
-        // If the production open loses its nonblocking/type constraint, this
-        // delayed peer still releases both FIFO opens so the regression fails
-        // on elapsed time and error kind instead of hanging the test process.
-        let (done_tx, done_rx) = mpsc::channel();
-        let fallback = std::thread::spawn(move || {
-            std::thread::sleep(Duration::from_secs(2));
-            let file_guard = fs::OpenOptions::new()
-                .read(true)
-                .write(true)
-                .custom_flags(libc::O_NONBLOCK)
-                .open(file_path)
-                .unwrap();
-            let directory_guard = fs::OpenOptions::new()
-                .read(true)
-                .write(true)
-                .custom_flags(libc::O_NONBLOCK)
-                .open(directory_path)
-                .unwrap();
-            done_rx.recv().unwrap();
-            drop((file_guard, directory_guard));
-        });
-
-        let started = Instant::now();
-        let file_result = file.read_document(&["rqlp"], 64);
-        let directory_result = nested.open_directory();
-        let elapsed = started.elapsed();
-        done_tx.send(()).unwrap();
-        fallback.join().unwrap();
-
-        assert!(
-            elapsed < Duration::from_secs(1),
-            "special-file replacement blocked for {elapsed:?}"
-        );
+        let (file_result, directory_result) =
+            assert_fifo_operations_return_promptly(vec![file_path, directory_path], || {
+                (file.read_document(&["rqlp"], 64), nested.open_directory())
+            });
         assert!(matches!(
             file_result,
             Err(WorkspaceDocumentError::NotRegularFile { .. })

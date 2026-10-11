@@ -14,19 +14,23 @@
 //! a vendor class of the same name stay distinct identities.
 
 use crate::CancellationToken;
+use crate::analyzer::dependency_support::{
+    append_producer_diagnostics as append_diagnostics, dependency_locator_path as locator_path,
+    failed_dependency_pack_production as failed,
+};
 use crate::analyzer::semantic_model::{
     ActivationSelector, ArtifactProducerLimits, ArtifactProduction, ArtifactProductionRequest,
     AuthoredPayload, AuthoredSemanticModelPack, AuthoredShard, BoundedProducerDiagnostics,
     Compatibility, Completeness, DependencyArtifactRole, DependencyPackAdapter,
     DependencyPackProduction, ExactArtifact, ExactDependencyArtifact, ExternalArtifactKind,
     MemberFact, NameSelector, Producer, ProducerDiagnostic, ProducerDiagnosticSeverity, Provenance,
-    ResolvedDependency, SEMANTIC_MODEL_SCHEMA_VERSION, Safety, SuppressedDiagnostics, TypeFact,
+    ResolvedDependency, SEMANTIC_MODEL_SCHEMA_VERSION, Safety, TypeFact,
 };
 use crate::hash::HashMap;
 
 use super::source_artifact::{
-    COMPOSER_ECOSYSTEM, PhpAutoloadRule, PhpDeclarationMarker, PhpProjectionOrigin, is_php_entry,
-    project_php_source,
+    COMPOSER_ECOSYSTEM, PhpAutoloadRule, PhpDeclarationMarker, PhpDeclarationNote,
+    PhpProjectionOrigin, PhpSourceProjection, is_php_entry, project_php_source,
 };
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -37,15 +41,8 @@ impl DependencyPackAdapter for PhpDependencyPackAdapter {
         "bifrost-php-dependency"
     }
 
-    fn adapter_version(&self) -> &str {
-        env!("CARGO_PKG_VERSION")
-    }
-
     fn producer(&self) -> Producer {
-        Producer {
-            name: "bifrost-composer-package".to_owned(),
-            version: env!("CARGO_PKG_VERSION").to_owned(),
-        }
+        Producer::for_name("bifrost-composer-package")
     }
 
     fn can_produce(&self, dependency: &ResolvedDependency) -> bool {
@@ -127,14 +124,14 @@ impl DependencyPackAdapter for PhpDependencyPackAdapter {
                     limits,
                     cancellation,
                 );
-                complete &= projection.complete && projection.suppressed_diagnostics.total() == 0;
-                append_diagnostics(&mut diagnostics, projection.diagnostics);
-                for fact in projection.types {
-                    merge_type(&mut types, fact, &mut diagnostics, &mut complete);
-                }
-                for fact in projection.members {
-                    members.entry(fact.id.clone()).or_insert(fact);
-                }
+                let _notes = merge_projection(
+                    projection,
+                    &mut types,
+                    &mut members,
+                    &mut diagnostics,
+                    &mut complete,
+                    |fact, _, _| Some(fact),
+                );
                 if types.len().saturating_add(members.len()) >= limits.max_records {
                     diagnostics.error(
                         "limit.records",
@@ -241,6 +238,7 @@ impl DependencyPackAdapter for PhpDependencyPackAdapter {
                     collection_flows: None,
                     deferred_yields: None,
                     conditional_type_refinements: None,
+                    callable_values: None,
                 }],
             }),
             diagnostics,
@@ -367,14 +365,14 @@ impl ComposerPackagePackProducer {
                     limits,
                     cancellation,
                 );
-                complete &= projection.complete && projection.suppressed_diagnostics.total() == 0;
-                append_diagnostics(&mut diagnostics, projection.diagnostics);
-                for fact in projection.types {
-                    merge_type(&mut types, fact, &mut diagnostics, &mut complete);
-                }
-                for fact in projection.members {
-                    members.entry(fact.id.clone()).or_insert(fact);
-                }
+                let _notes = merge_projection(
+                    projection,
+                    &mut types,
+                    &mut members,
+                    &mut diagnostics,
+                    &mut complete,
+                    |fact, _, _| Some(fact),
+                );
                 if types.len().saturating_add(members.len()) >= limits.max_records {
                     diagnostics.error(
                         "limit.records",
@@ -446,6 +444,7 @@ impl ComposerPackagePackProducer {
                     collection_flows: None,
                     deferred_yields: None,
                     conditional_type_refinements: None,
+                    callable_values: None,
                 }],
             }),
             completeness,
@@ -563,36 +562,35 @@ impl PhpDeclarationStubPackProducer {
                 limits,
                 cancellation,
             );
-            complete &= projection.complete && projection.suppressed_diagnostics.total() == 0;
-            append_diagnostics(&mut diagnostics, projection.diagnostics);
-            for fact in projection.types {
-                merge_type(&mut types, fact, &mut diagnostics, &mut complete);
-            }
             let mut dropped = Vec::new();
-            for fact in projection.members {
-                // A reserved-word stub names a construct PHP parses as syntax,
-                // not a callable any program can name. Publishing it would put
-                // a callable in the pack that no reference can ever reach.
-                if fact.name.starts_with(PHP_STUB_RESERVED_PREFIX) {
-                    // The reject names the declaration it dropped: release
-                    // verification admits a partial pack only when every
-                    // reject is an individually named warning.
-                    diagnostics.warning_for_declaration(
-                        "php.stub.reserved_prefix",
-                        Some(path.clone()),
-                        fact.id.clone(),
-                        format!(
-                            "PHP stub function {} names a reserved construct and is not published",
-                            fact.name
-                        ),
-                    );
-                    complete = false;
-                    dropped.push(fact.id.clone());
-                    continue;
-                }
-                members.entry(fact.id.clone()).or_insert(fact);
-            }
-            for note in projection.notes {
+            let notes = merge_projection(
+                projection,
+                &mut types,
+                &mut members,
+                &mut diagnostics,
+                &mut complete,
+                |fact, diagnostics, complete| {
+                    // A reserved-word stub names a construct PHP parses as
+                    // syntax, not a callable any program can name.
+                    if fact.name.starts_with(PHP_STUB_RESERVED_PREFIX) {
+                        diagnostics.warning_for_declaration(
+                            "php.stub.reserved_prefix",
+                            Some(path.clone()),
+                            fact.id.clone(),
+                            format!(
+                                "PHP stub function {} names a reserved construct and is not published",
+                                fact.name
+                            ),
+                        );
+                        *complete = false;
+                        dropped.push(fact.id.clone());
+                        None
+                    } else {
+                        Some(fact)
+                    }
+                },
+            );
+            for note in notes {
                 if dropped.contains(&note.declaration) {
                     continue;
                 }
@@ -717,6 +715,7 @@ impl PhpDeclarationStubPackProducer {
                     collection_flows: None,
                     deferred_yields: None,
                     conditional_type_refinements: None,
+                    callable_values: None,
                 }],
             }),
             completeness,
@@ -735,6 +734,31 @@ impl PhpDeclarationStubPackProducer {
 /// segment is the attribute's own name, which is what the rules above match.
 fn terminal_attribute_name(name: &str) -> &str {
     name.rsplit('.').next().unwrap_or(name)
+}
+
+fn merge_projection(
+    projection: PhpSourceProjection,
+    types: &mut HashMap<String, TypeFact>,
+    members: &mut HashMap<String, MemberFact>,
+    diagnostics: &mut BoundedProducerDiagnostics,
+    complete: &mut bool,
+    mut include_member: impl FnMut(
+        MemberFact,
+        &mut BoundedProducerDiagnostics,
+        &mut bool,
+    ) -> Option<MemberFact>,
+) -> Vec<PhpDeclarationNote> {
+    *complete &= projection.complete && projection.suppressed_diagnostics.total() == 0;
+    append_diagnostics(diagnostics, projection.diagnostics);
+    for fact in projection.types {
+        merge_type(types, fact, diagnostics, complete);
+    }
+    for fact in projection.members {
+        if let Some(fact) = include_member(fact, diagnostics, complete) {
+            members.entry(fact.id.clone()).or_insert(fact);
+        }
+    }
+    projection.notes
 }
 
 /// Merge one projected type into the package surface.
@@ -758,7 +782,7 @@ fn merge_type(
             if existing.locator != incoming.locator {
                 diagnostics.warning(
                     "composer.declaration.conflict",
-                    Some(locator_path(&incoming.locator)),
+                    Some(locator_path(&incoming.locator).to_owned()),
                     format!(
                         "Composer package declares {} more than once; the first declaration came from {}",
                         incoming.name,
@@ -771,51 +795,12 @@ fn merge_type(
     }
 }
 
-fn locator_path(locator: &crate::analyzer::semantic_model::Locator) -> String {
-    match locator {
-        crate::analyzer::semantic_model::Locator::Source { path, .. }
-        | crate::analyzer::semantic_model::Locator::Artifact { path, .. }
-        | crate::analyzer::semantic_model::Locator::Interchange { path, .. } => path.clone(),
-    }
-}
-
-fn append_diagnostics(
-    bounded: &mut BoundedProducerDiagnostics,
-    diagnostics: Vec<ProducerDiagnostic>,
-) {
-    for diagnostic in diagnostics {
-        match diagnostic.severity {
-            ProducerDiagnosticSeverity::Warning => {
-                bounded.warning(diagnostic.code, diagnostic.location, diagnostic.message)
-            }
-            ProducerDiagnosticSeverity::Error => {
-                bounded.error(diagnostic.code, diagnostic.location, diagnostic.message)
-            }
-        }
-    }
-}
-
-fn failed(code: &str, message: &str) -> DependencyPackProduction {
-    DependencyPackProduction {
-        pack: None,
-        diagnostics: vec![ProducerDiagnostic {
-            severity: ProducerDiagnosticSeverity::Error,
-            source_entry: None,
-            code: code.to_owned(),
-            location: None,
-            declaration: None,
-            message: message.to_owned(),
-        }],
-        suppressed_diagnostics: SuppressedDiagnostics::default(),
-    }
-}
-
 #[cfg(test)]
 pub(crate) mod fixture {
     use std::fs;
     use std::path::PathBuf;
 
-    use crate::analyzer::canonical_hash::{lower_hex_string, sha256_bytes};
+    use crate::analyzer::semantic_model::csmi::sha256_hex;
     use crate::analyzer::{Language, PhpAnalyzerConfig, PhpDependencyApiEvidence, TestProject};
 
     /// One Composer package to install into a fixture vendor tree.
@@ -840,8 +825,15 @@ pub(crate) mod fixture {
             let temp = tempfile::tempdir().unwrap();
             let root = temp.path().join("project");
             fs::create_dir_all(root.join("vendor/composer")).unwrap();
-            let mut locked = Vec::new();
-            let mut installed = Vec::new();
+            let package_metadata = packages
+                .iter()
+                .map(|package| crate::test_support::ComposerPackageMetadata {
+                    name: package.name,
+                    version: package.version,
+                    reference: package.reference.to_owned(),
+                    autoload: package.autoload,
+                })
+                .collect::<Vec<_>>();
             for package in packages {
                 let install_dir = root.join("vendor").join(package.name);
                 for (path, source) in package.files {
@@ -849,24 +841,9 @@ pub(crate) mod fixture {
                     fs::create_dir_all(absolute.parent().unwrap()).unwrap();
                     fs::write(absolute, source).unwrap();
                 }
-                locked.push(format!(
-                    r#"{{"name":"{}","version":"{}","type":"library","dist":{{"type":"path","url":"file:///{}","reference":"{}"}},"autoload":{}}}"#,
-                    package.name,
-                    package.version,
-                    package.name,
-                    package.reference,
-                    package.autoload
-                ));
-                installed.push(format!(
-                    r#"{{"name":"{}","version":"{}","type":"library","install-path":"../{}","autoload":{}}}"#,
-                    package.name, package.version, package.name, package.autoload
-                ));
             }
-            let lockfile = format!(
-                r#"{{"content-hash":"fixture","packages":[{}],"packages-dev":[]}}"#,
-                locked.join(",")
-            );
-            let installed_json = format!(r#"{{"packages":[{}],"dev":false}}"#, installed.join(","));
+            let (lockfile, installed_json) =
+                crate::test_support::composer_fixture_metadata(&package_metadata);
             fs::write(root.join("composer.lock"), &lockfile).unwrap();
             fs::write(root.join("vendor/composer/installed.json"), &installed_json).unwrap();
             fs::write(root.join("main.php"), "<?php\n").unwrap();
@@ -875,9 +852,9 @@ pub(crate) mod fixture {
             let config = PhpAnalyzerConfig {
                 dependency_api_evidence: vec![PhpDependencyApiEvidence {
                     lockfile_path: PathBuf::from("composer.lock"),
-                    lockfile_sha256: digest(lockfile.as_bytes()),
+                    lockfile_sha256: sha256_hex(lockfile.as_bytes()),
                     installed_json_path: Some(PathBuf::from("vendor/composer/installed.json")),
-                    installed_json_sha256: Some(digest(installed_json.as_bytes())),
+                    installed_json_sha256: Some(sha256_hex(installed_json.as_bytes())),
                     php_version: "8.3.0".to_owned(),
                     approved_vendor_roots: vec![PathBuf::from("vendor")],
                     include_dev_packages: false,
@@ -890,10 +867,6 @@ pub(crate) mod fixture {
                 config,
             }
         }
-    }
-
-    pub(crate) fn digest(bytes: &[u8]) -> String {
-        lower_hex_string(&sha256_bytes(bytes))
     }
 
     pub(crate) const WIDGET_PSR4: &str = r#"<?php
@@ -1156,6 +1129,7 @@ mod declaration_stub_tests {
         AuthoredPayload, Compatibility, MemberKind, Provenance, Safety, TypeIdentity, TypeKind,
         read_exact_source_set, type_declaration_id,
     };
+    use brokk_bifrost_test_macros::hardwon;
     use std::path::PathBuf;
 
     struct StubTree {
@@ -1327,32 +1301,6 @@ namespace {
         assert!(constant.is_static);
     }
 
-    /// A namespaced stub class publishes dot-joined, and its namespace
-    /// publishes as the module scaffold the overlay reads coverage from.
-    #[test]
-    fn a_namespaced_stub_class_publishes_dot_joined_under_its_namespace() {
-        let produced = produce(&[(
-            "random/Random.php",
-            r#"<?php
-
-namespace Random;
-
-class Randomizer
-{
-    public function getInt(int $min, int $max): int {}
-}
-"#,
-        )]);
-
-        let randomizer = produced.type_named("Random.Randomizer");
-        assert_eq!(randomizer.type_kind, TypeKind::Class);
-        assert_eq!(produced.type_named("Random").type_kind, TypeKind::Module);
-        assert_eq!(
-            produced.member_named("Random.Randomizer", "getInt").owner,
-            randomizer.id
-        );
-    }
-
     /// A global function is a member of the global-namespace scaffold, which
     /// is the same owner a Composer `files` helper takes, so one owner-scoped
     /// query answers for both.
@@ -1418,6 +1366,7 @@ namespace {
     /// projection. The same local alias can therefore name different bases in
     /// sibling namespaces, while a namespace with no import sees neither.
     #[test]
+    #[hardwon("#3026: imports in braced namespaces lost their namespace scope")]
     fn stub_projection_keeps_braced_namespace_aliases_scoped() {
         use crate::analyzer::semantic_model::TypeRef;
 

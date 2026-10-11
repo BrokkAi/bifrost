@@ -1,0 +1,1578 @@
+{
+  "schema_version": 2,
+  "pack_id": "bifrost.rust-std-threat-sources",
+  "version": "0.1.0",
+  "producer": {
+    "name": "bifrost-reviewed-rust-threat-sources",
+    "version": "0.1.0"
+  },
+  "language": "rust",
+  "ecosystem": "cargo",
+  "compatibility": {
+    "bifrost": ">=0.12.0, <1.0.0",
+    "toolchains": []
+  },
+  "provenance": {
+    "source": "Reviewed Rust standard-library threat-model source declarations and receiver-carrying summaries for command arguments, environment, stdin, file, and remote inputs. The existing rust-sql-taint pack remains the owner of std.env.var, std.env.args, std.env.Args.nth, std.io.stdin, std.io.Stdin.read_line, Result/Option unwrap, and the in-code std facts.",
+    "revision": "rust-std-1.100"
+  },
+  "license": "Apache-2.0",
+  "completeness": "complete",
+  "safety": {
+    "generated_code_only": false,
+    "review_required": false
+  },
+  "shards": [
+    {
+      "id": "declarations.rust-codeql-parity.std-threat-sources",
+      "activation": [
+        {
+          "targets": [],
+          "configurations": []
+        }
+      ],
+      "payload": {
+        "kind": "declaration_facts",
+        "types": [
+          {
+            "id": "type.cq01.rust-std-env-args-os",
+            "name": "std.env.ArgsOs",
+            "type_kind": "struct",
+            "visibility": "public",
+            "locator": {
+              "kind": "artifact",
+              "path": "library/std/src/env.rs",
+              "symbol": "std.env.ArgsOs"
+            }
+          },
+          {
+            "id": "type.cq01.rust-std-env-vars",
+            "name": "std.env.Vars",
+            "type_kind": "struct",
+            "visibility": "public",
+            "locator": {
+              "kind": "artifact",
+              "path": "library/std/src/env.rs",
+              "symbol": "std.env.Vars"
+            }
+          },
+          {
+            "id": "type.cq01.rust-std-env-vars-os",
+            "name": "std.env.VarsOs",
+            "type_kind": "struct",
+            "visibility": "public",
+            "locator": {
+              "kind": "artifact",
+              "path": "library/std/src/env.rs",
+              "symbol": "std.env.VarsOs"
+            }
+          },
+          {
+            "id": "type.cq01.rust-std-io-stdin-lock",
+            "name": "std.io.StdinLock",
+            "type_kind": "struct",
+            "visibility": "public",
+            "locator": {
+              "kind": "artifact",
+              "path": "library/std/src/io/stdio.rs",
+              "symbol": "std.io.StdinLock"
+            }
+          },
+          {
+            "id": "type.cq01.rust-std-io-lines",
+            "name": "std.io.Lines",
+            "type_kind": "struct",
+            "visibility": "public",
+            "locator": {
+              "kind": "artifact",
+              "path": "library/std/src/io/mod.rs",
+              "symbol": "std.io.Lines"
+            }
+          },
+          {
+            "id": "type.cq01.rust-std-fs",
+            "name": "std.fs",
+            "type_kind": "module",
+            "visibility": "public",
+            "locator": {
+              "kind": "artifact",
+              "path": "library/std/src/fs.rs",
+              "symbol": "std.fs"
+            }
+          },
+          {
+            "id": "type.cq01.rust-std-fs-file",
+            "name": "std.fs.File",
+            "type_kind": "struct",
+            "visibility": "public",
+            "locator": {
+              "kind": "artifact",
+              "path": "library/std/src/fs.rs",
+              "symbol": "std.fs.File"
+            }
+          },
+          {
+            "id": "type.cq01.rust-std-fs-open-options",
+            "name": "std.fs.OpenOptions",
+            "type_kind": "struct",
+            "visibility": "public",
+            "locator": {
+              "kind": "artifact",
+              "path": "library/std/src/fs.rs",
+              "symbol": "std.fs.OpenOptions"
+            }
+          },
+          {
+            "id": "type.cq01.rust-std-fs-dir-entry",
+            "name": "std.fs.DirEntry",
+            "type_kind": "struct",
+            "visibility": "public",
+            "locator": {
+              "kind": "artifact",
+              "path": "library/std/src/fs.rs",
+              "symbol": "std.fs.DirEntry"
+            }
+          },
+          {
+            "id": "type.cq01.rust-std-path",
+            "name": "std.path",
+            "type_kind": "module",
+            "visibility": "public",
+            "locator": {
+              "kind": "artifact",
+              "path": "library/std/src/path.rs",
+              "symbol": "std.path"
+            }
+          },
+          {
+            "id": "type.cq01.rust-std-path-path",
+            "name": "std.path.Path",
+            "type_kind": "struct",
+            "visibility": "public",
+            "locator": {
+              "kind": "artifact",
+              "path": "library/std/src/path.rs",
+              "symbol": "std.path.Path"
+            }
+          },
+          {
+            "id": "type.cq01.rust-std-path-pathbuf",
+            "name": "std.path.PathBuf",
+            "type_kind": "struct",
+            "visibility": "public",
+            "locator": {
+              "kind": "artifact",
+              "path": "library/std/src/path.rs",
+              "symbol": "std.path.PathBuf"
+            }
+          },
+          {
+            "id": "type.cq01.rust-std-net",
+            "name": "std.net",
+            "type_kind": "module",
+            "visibility": "public",
+            "locator": {
+              "kind": "artifact",
+              "path": "library/std/src/net/mod.rs",
+              "symbol": "std.net"
+            }
+          },
+          {
+            "id": "type.cq01.rust-std-net-tcp-stream",
+            "name": "std.net.TcpStream",
+            "type_kind": "struct",
+            "visibility": "public",
+            "locator": {
+              "kind": "artifact",
+              "path": "library/std/src/net/tcp.rs",
+              "symbol": "std.net.TcpStream"
+            }
+          }
+        ],
+        "members": [
+          {
+            "id": "member.cq01.rust-std-fs-dir-entry-file-name",
+            "owner": "type.cq01.rust-std-fs-dir-entry",
+            "name": "file_name",
+            "member_kind": "method",
+            "visibility": "public",
+            "is_static": false,
+            "callable_family_complete": true,
+            "signature": {
+              "parameters": [],
+              "returns": {
+                "kind": "named",
+                "name": "untyped"
+              }
+            },
+            "locator": {
+              "kind": "artifact",
+              "path": "library/std/src/fs.rs",
+              "symbol": "std.fs.DirEntry.file_name"
+            }
+          },
+          {
+            "id": "member.cq01.rust-std-fs-dir-entry-path",
+            "owner": "type.cq01.rust-std-fs-dir-entry",
+            "name": "path",
+            "member_kind": "method",
+            "visibility": "public",
+            "is_static": false,
+            "callable_family_complete": true,
+            "signature": {
+              "parameters": [],
+              "returns": {
+                "kind": "named",
+                "name": "std.path.PathBuf"
+              }
+            },
+            "locator": {
+              "kind": "artifact",
+              "path": "library/std/src/fs.rs",
+              "symbol": "std.fs.DirEntry.path"
+            }
+          },
+          {
+            "id": "member.cq01.rust-std-fs-file-open",
+            "owner": "type.cq01.rust-std-fs-file",
+            "name": "open",
+            "member_kind": "method",
+            "visibility": "public",
+            "is_static": true,
+            "callable_family_complete": true,
+            "signature": {
+              "parameters": [
+                {
+                  "name": "path",
+                  "type": {
+                    "kind": "named",
+                    "name": "untyped"
+                  }
+                }
+              ],
+              "returns": {
+                "kind": "named",
+                "name": "std.result.Result"
+              }
+            },
+            "locator": {
+              "kind": "artifact",
+              "path": "library/std/src/fs.rs",
+              "symbol": "std.fs.File.open"
+            }
+          },
+          {
+            "id": "member.cq01.rust-std-fs-file-read",
+            "owner": "type.cq01.rust-std-fs-file",
+            "name": "read",
+            "member_kind": "method",
+            "visibility": "public",
+            "is_static": false,
+            "callable_family_complete": true,
+            "signature": {
+              "parameters": [
+                {
+                  "name": "buf",
+                  "type": {
+                    "kind": "named",
+                    "name": "untyped"
+                  }
+                }
+              ],
+              "returns": {
+                "kind": "named",
+                "name": "std.result.Result"
+              }
+            },
+            "locator": {
+              "kind": "artifact",
+              "path": "library/std/src/fs.rs",
+              "symbol": "std.fs.File.read"
+            }
+          },
+          {
+            "id": "member.cq01.rust-std-fs-file-read-to-end",
+            "owner": "type.cq01.rust-std-fs-file",
+            "name": "read_to_end",
+            "member_kind": "method",
+            "visibility": "public",
+            "is_static": false,
+            "callable_family_complete": true,
+            "signature": {
+              "parameters": [
+                {
+                  "name": "buf",
+                  "type": {
+                    "kind": "named",
+                    "name": "untyped"
+                  }
+                }
+              ],
+              "returns": {
+                "kind": "named",
+                "name": "std.result.Result"
+              }
+            },
+            "locator": {
+              "kind": "artifact",
+              "path": "library/std/src/fs.rs",
+              "symbol": "std.fs.File.read_to_end"
+            }
+          },
+          {
+            "id": "member.cq01.rust-std-fs-file-read-to-string",
+            "owner": "type.cq01.rust-std-fs-file",
+            "name": "read_to_string",
+            "member_kind": "method",
+            "visibility": "public",
+            "is_static": false,
+            "callable_family_complete": true,
+            "signature": {
+              "parameters": [
+                {
+                  "name": "buf",
+                  "type": {
+                    "kind": "named",
+                    "name": "untyped"
+                  }
+                }
+              ],
+              "returns": {
+                "kind": "named",
+                "name": "std.result.Result"
+              }
+            },
+            "locator": {
+              "kind": "artifact",
+              "path": "library/std/src/fs.rs",
+              "symbol": "std.fs.File.read_to_string"
+            }
+          },
+          {
+            "id": "member.cq01.rust-std-fs-metadata",
+            "owner": "type.cq01.rust-std-fs",
+            "name": "metadata",
+            "member_kind": "method",
+            "visibility": "public",
+            "is_static": true,
+            "callable_family_complete": true,
+            "signature": {
+              "parameters": [
+                {
+                  "name": "path",
+                  "type": {
+                    "kind": "named",
+                    "name": "untyped"
+                  }
+                }
+              ],
+              "returns": {
+                "kind": "named",
+                "name": "std.result.Result"
+              }
+            },
+            "locator": {
+              "kind": "artifact",
+              "path": "library/std/src/fs.rs",
+              "symbol": "std.fs.metadata"
+            }
+          },
+          {
+            "id": "member.cq01.rust-std-fs-open-options-open",
+            "owner": "type.cq01.rust-std-fs-open-options",
+            "name": "open",
+            "member_kind": "method",
+            "visibility": "public",
+            "is_static": false,
+            "callable_family_complete": true,
+            "signature": {
+              "parameters": [
+                {
+                  "name": "path",
+                  "type": {
+                    "kind": "named",
+                    "name": "untyped"
+                  }
+                }
+              ],
+              "returns": {
+                "kind": "named",
+                "name": "std.result.Result"
+              }
+            },
+            "locator": {
+              "kind": "artifact",
+              "path": "library/std/src/fs.rs",
+              "symbol": "std.fs.OpenOptions.open"
+            }
+          },
+          {
+            "id": "member.cq01.rust-std-fs-read",
+            "owner": "type.cq01.rust-std-fs",
+            "name": "read",
+            "member_kind": "method",
+            "visibility": "public",
+            "is_static": true,
+            "callable_family_complete": true,
+            "signature": {
+              "parameters": [
+                {
+                  "name": "path",
+                  "type": {
+                    "kind": "named",
+                    "name": "untyped"
+                  }
+                }
+              ],
+              "returns": {
+                "kind": "named",
+                "name": "std.result.Result"
+              }
+            },
+            "locator": {
+              "kind": "artifact",
+              "path": "library/std/src/fs.rs",
+              "symbol": "std.fs.read"
+            }
+          },
+          {
+            "id": "member.cq01.rust-std-fs-read-dir",
+            "owner": "type.cq01.rust-std-fs",
+            "name": "read_dir",
+            "member_kind": "method",
+            "visibility": "public",
+            "is_static": true,
+            "callable_family_complete": true,
+            "signature": {
+              "parameters": [
+                {
+                  "name": "path",
+                  "type": {
+                    "kind": "named",
+                    "name": "untyped"
+                  }
+                }
+              ],
+              "returns": {
+                "kind": "named",
+                "name": "std.result.Result"
+              }
+            },
+            "locator": {
+              "kind": "artifact",
+              "path": "library/std/src/fs.rs",
+              "symbol": "std.fs.read_dir"
+            }
+          },
+          {
+            "id": "member.cq01.rust-std-fs-read-link",
+            "owner": "type.cq01.rust-std-fs",
+            "name": "read_link",
+            "member_kind": "method",
+            "visibility": "public",
+            "is_static": true,
+            "callable_family_complete": true,
+            "signature": {
+              "parameters": [
+                {
+                  "name": "path",
+                  "type": {
+                    "kind": "named",
+                    "name": "untyped"
+                  }
+                }
+              ],
+              "returns": {
+                "kind": "named",
+                "name": "std.result.Result"
+              }
+            },
+            "locator": {
+              "kind": "artifact",
+              "path": "library/std/src/fs.rs",
+              "symbol": "std.fs.read_link"
+            }
+          },
+          {
+            "id": "member.cq01.rust-std-fs-read-to-string",
+            "owner": "type.cq01.rust-std-fs",
+            "name": "read_to_string",
+            "member_kind": "method",
+            "visibility": "public",
+            "is_static": true,
+            "callable_family_complete": true,
+            "signature": {
+              "parameters": [
+                {
+                  "name": "path",
+                  "type": {
+                    "kind": "named",
+                    "name": "untyped"
+                  }
+                }
+              ],
+              "returns": {
+                "kind": "named",
+                "name": "std.result.Result"
+              }
+            },
+            "locator": {
+              "kind": "artifact",
+              "path": "library/std/src/fs.rs",
+              "symbol": "std.fs.read_to_string"
+            }
+          },
+          {
+            "id": "member.cq01.rust-std-fs-symlink-metadata",
+            "owner": "type.cq01.rust-std-fs",
+            "name": "symlink_metadata",
+            "member_kind": "method",
+            "visibility": "public",
+            "is_static": true,
+            "callable_family_complete": true,
+            "signature": {
+              "parameters": [
+                {
+                  "name": "path",
+                  "type": {
+                    "kind": "named",
+                    "name": "untyped"
+                  }
+                }
+              ],
+              "returns": {
+                "kind": "named",
+                "name": "std.result.Result"
+              }
+            },
+            "locator": {
+              "kind": "artifact",
+              "path": "library/std/src/fs.rs",
+              "symbol": "std.fs.symlink_metadata"
+            }
+          },
+          {
+            "id": "member.cq01.rust-std-io-stdin-lock-lines",
+            "owner": "type.cq01.rust-std-io-stdin-lock",
+            "name": "lines",
+            "member_kind": "method",
+            "visibility": "public",
+            "is_static": false,
+            "callable_family_complete": true,
+            "signature": {
+              "parameters": [],
+              "returns": {
+                "kind": "named",
+                "name": "std.io.Lines"
+              }
+            },
+            "locator": {
+              "kind": "artifact",
+              "path": "library/std/src/io/stdio.rs",
+              "symbol": "std.io.StdinLock.lines"
+            }
+          },
+          {
+            "id": "member.cq01.rust-std-io-stdin-lock-read",
+            "owner": "type.cq01.rust-std-io-stdin-lock",
+            "name": "read",
+            "member_kind": "method",
+            "visibility": "public",
+            "is_static": false,
+            "callable_family_complete": true,
+            "signature": {
+              "parameters": [
+                {
+                  "name": "buf",
+                  "type": {
+                    "kind": "named",
+                    "name": "untyped"
+                  }
+                }
+              ],
+              "returns": {
+                "kind": "named",
+                "name": "std.result.Result"
+              }
+            },
+            "locator": {
+              "kind": "artifact",
+              "path": "library/std/src/io/stdio.rs",
+              "symbol": "std.io.StdinLock.read"
+            }
+          },
+          {
+            "id": "member.cq01.rust-std-io-stdin-lock-read-to-end",
+            "owner": "type.cq01.rust-std-io-stdin-lock",
+            "name": "read_to_end",
+            "member_kind": "method",
+            "visibility": "public",
+            "is_static": false,
+            "callable_family_complete": true,
+            "signature": {
+              "parameters": [
+                {
+                  "name": "buf",
+                  "type": {
+                    "kind": "named",
+                    "name": "untyped"
+                  }
+                }
+              ],
+              "returns": {
+                "kind": "named",
+                "name": "std.result.Result"
+              }
+            },
+            "locator": {
+              "kind": "artifact",
+              "path": "library/std/src/io/stdio.rs",
+              "symbol": "std.io.StdinLock.read_to_end"
+            }
+          },
+          {
+            "id": "member.cq01.rust-std-io-stdin-lock-read-to-string",
+            "owner": "type.cq01.rust-std-io-stdin-lock",
+            "name": "read_to_string",
+            "member_kind": "method",
+            "visibility": "public",
+            "is_static": false,
+            "callable_family_complete": true,
+            "signature": {
+              "parameters": [
+                {
+                  "name": "buf",
+                  "type": {
+                    "kind": "named",
+                    "name": "untyped"
+                  }
+                }
+              ],
+              "returns": {
+                "kind": "named",
+                "name": "std.result.Result"
+              }
+            },
+            "locator": {
+              "kind": "artifact",
+              "path": "library/std/src/io/stdio.rs",
+              "symbol": "std.io.StdinLock.read_to_string"
+            }
+          },
+          {
+            "id": "member.cq01.rust-std-io-stdin-lock-read-until",
+            "owner": "type.cq01.rust-std-io-stdin-lock",
+            "name": "read_until",
+            "member_kind": "method",
+            "visibility": "public",
+            "is_static": false,
+            "callable_family_complete": true,
+            "signature": {
+              "parameters": [
+                {
+                  "name": "byte",
+                  "type": {
+                    "kind": "named",
+                    "name": "untyped"
+                  }
+                },
+                {
+                  "name": "buf",
+                  "type": {
+                    "kind": "named",
+                    "name": "untyped"
+                  }
+                }
+              ],
+              "returns": {
+                "kind": "named",
+                "name": "std.result.Result"
+              }
+            },
+            "locator": {
+              "kind": "artifact",
+              "path": "library/std/src/io/stdio.rs",
+              "symbol": "std.io.StdinLock.read_until"
+            }
+          },
+          {
+            "id": "member.cq01.rust-std-net-tcp-stream-connect",
+            "owner": "type.cq01.rust-std-net-tcp-stream",
+            "name": "connect",
+            "member_kind": "method",
+            "visibility": "public",
+            "is_static": true,
+            "callable_family_complete": true,
+            "signature": {
+              "parameters": [
+                {
+                  "name": "addr",
+                  "type": {
+                    "kind": "named",
+                    "name": "untyped"
+                  }
+                }
+              ],
+              "returns": {
+                "kind": "named",
+                "name": "std.result.Result"
+              }
+            },
+            "locator": {
+              "kind": "artifact",
+              "path": "library/std/src/net/tcp.rs",
+              "symbol": "std.net.TcpStream.connect"
+            }
+          },
+          {
+            "id": "member.cq01.rust-std-net-tcp-stream-connect-timeout",
+            "owner": "type.cq01.rust-std-net-tcp-stream",
+            "name": "connect_timeout",
+            "member_kind": "method",
+            "visibility": "public",
+            "is_static": true,
+            "callable_family_complete": true,
+            "signature": {
+              "parameters": [
+                {
+                  "name": "addr",
+                  "type": {
+                    "kind": "named",
+                    "name": "untyped"
+                  }
+                },
+                {
+                  "name": "timeout",
+                  "type": {
+                    "kind": "named",
+                    "name": "untyped"
+                  }
+                }
+              ],
+              "returns": {
+                "kind": "named",
+                "name": "std.result.Result"
+              }
+            },
+            "locator": {
+              "kind": "artifact",
+              "path": "library/std/src/net/tcp.rs",
+              "symbol": "std.net.TcpStream.connect_timeout"
+            }
+          },
+          {
+            "id": "member.cq01.rust-std-net-tcp-stream-read-to-string",
+            "owner": "type.cq01.rust-std-net-tcp-stream",
+            "name": "read_to_string",
+            "member_kind": "method",
+            "visibility": "public",
+            "is_static": false,
+            "callable_family_complete": true,
+            "signature": {
+              "parameters": [
+                {
+                  "name": "buf",
+                  "type": {
+                    "kind": "named",
+                    "name": "untyped"
+                  }
+                }
+              ],
+              "returns": {
+                "kind": "named",
+                "name": "std.result.Result"
+              }
+            },
+            "locator": {
+              "kind": "artifact",
+              "path": "library/std/src/net/tcp.rs",
+              "symbol": "std.net.TcpStream.read_to_string"
+            }
+          },
+          {
+            "id": "member.cq01.rust-std-path-exists",
+            "owner": "type.cq01.rust-std-path-path",
+            "name": "exists",
+            "member_kind": "method",
+            "visibility": "public",
+            "is_static": false,
+            "callable_family_complete": true,
+            "signature": {
+              "parameters": [],
+              "returns": {
+                "kind": "named",
+                "name": "untyped"
+              }
+            },
+            "locator": {
+              "kind": "artifact",
+              "path": "library/std/src/path.rs",
+              "symbol": "std.path.Path.exists"
+            }
+          },
+          {
+            "id": "member.cq01.rust-std-path-read-dir",
+            "owner": "type.cq01.rust-std-path-path",
+            "name": "read_dir",
+            "member_kind": "method",
+            "visibility": "public",
+            "is_static": false,
+            "callable_family_complete": true,
+            "signature": {
+              "parameters": [],
+              "returns": {
+                "kind": "named",
+                "name": "std.result.Result"
+              }
+            },
+            "locator": {
+              "kind": "artifact",
+              "path": "library/std/src/path.rs",
+              "symbol": "std.path.Path.read_dir"
+            }
+          },
+          {
+            "id": "member.cq01.rust-std-path-read-link",
+            "owner": "type.cq01.rust-std-path-path",
+            "name": "read_link",
+            "member_kind": "method",
+            "visibility": "public",
+            "is_static": false,
+            "callable_family_complete": true,
+            "signature": {
+              "parameters": [],
+              "returns": {
+                "kind": "named",
+                "name": "std.result.Result"
+              }
+            },
+            "locator": {
+              "kind": "artifact",
+              "path": "library/std/src/path.rs",
+              "symbol": "std.path.Path.read_link"
+            }
+          }
+        ],
+        "relations": []
+      }
+    },
+    {
+      "id": "summaries.rust-codeql-parity.std-threat-sources",
+      "activation": [
+        {
+          "targets": [],
+          "configurations": []
+        }
+      ],
+      "payload": {
+        "kind": "procedure_summaries",
+        "summaries": [
+          {
+            "id": "summary.cq01.rust-std-env-args-os",
+            "target": {
+              "path": "library/std/src/env.rs",
+              "symbol": "std.env.args_os",
+              "has_receiver": false,
+              "parameter_count": 0
+            },
+            "completeness": "complete",
+            "locations": [],
+            "transfers": [],
+            "effects": [
+              {
+                "kind": "allocation",
+                "event": "event.summary.cq01.rust-std-env-args-os.result",
+                "output": {
+                  "kind": "normal_return"
+                }
+              }
+            ]
+          },
+          {
+            "id": "summary.cq01.rust-std-env-current-dir",
+            "target": {
+              "path": "library/std/src/env.rs",
+              "symbol": "std.env.current_dir",
+              "has_receiver": false,
+              "parameter_count": 0
+            },
+            "completeness": "complete",
+            "locations": [],
+            "transfers": [],
+            "effects": [
+              {
+                "kind": "allocation",
+                "event": "event.summary.cq01.rust-std-env-current-dir.result",
+                "output": {
+                  "kind": "normal_return"
+                }
+              }
+            ]
+          },
+          {
+            "id": "summary.cq01.rust-std-env-current-exe",
+            "target": {
+              "path": "library/std/src/env.rs",
+              "symbol": "std.env.current_exe",
+              "has_receiver": false,
+              "parameter_count": 0
+            },
+            "completeness": "complete",
+            "locations": [],
+            "transfers": [],
+            "effects": [
+              {
+                "kind": "allocation",
+                "event": "event.summary.cq01.rust-std-env-current-exe.result",
+                "output": {
+                  "kind": "normal_return"
+                }
+              }
+            ]
+          },
+          {
+            "id": "summary.cq01.rust-std-env-home-dir",
+            "target": {
+              "path": "library/std/src/env.rs",
+              "symbol": "std.env.home_dir",
+              "has_receiver": false,
+              "parameter_count": 0
+            },
+            "completeness": "complete",
+            "locations": [],
+            "transfers": [],
+            "effects": [
+              {
+                "kind": "allocation",
+                "event": "event.summary.cq01.rust-std-env-home-dir.result",
+                "output": {
+                  "kind": "normal_return"
+                }
+              }
+            ]
+          },
+          {
+            "id": "summary.cq01.rust-std-env-var-os",
+            "target": {
+              "path": "library/std/src/env.rs",
+              "symbol": "std.env.var_os",
+              "has_receiver": false,
+              "parameter_count": 1
+            },
+            "completeness": "complete",
+            "locations": [],
+            "transfers": [],
+            "effects": [
+              {
+                "kind": "allocation",
+                "event": "event.summary.cq01.rust-std-env-var-os.result",
+                "output": {
+                  "kind": "normal_return"
+                }
+              }
+            ]
+          },
+          {
+            "id": "summary.cq01.rust-std-env-vars",
+            "target": {
+              "path": "library/std/src/env.rs",
+              "symbol": "std.env.vars",
+              "has_receiver": false,
+              "parameter_count": 0
+            },
+            "completeness": "complete",
+            "locations": [],
+            "transfers": [],
+            "effects": [
+              {
+                "kind": "allocation",
+                "event": "event.summary.cq01.rust-std-env-vars.result",
+                "output": {
+                  "kind": "normal_return"
+                }
+              }
+            ]
+          },
+          {
+            "id": "summary.cq01.rust-std-env-vars-os",
+            "target": {
+              "path": "library/std/src/env.rs",
+              "symbol": "std.env.vars_os",
+              "has_receiver": false,
+              "parameter_count": 0
+            },
+            "completeness": "complete",
+            "locations": [],
+            "transfers": [],
+            "effects": [
+              {
+                "kind": "allocation",
+                "event": "event.summary.cq01.rust-std-env-vars-os.result",
+                "output": {
+                  "kind": "normal_return"
+                }
+              }
+            ]
+          },
+          {
+            "id": "summary.cq01.rust-std-io-stdin-lock",
+            "target": {
+              "path": "library/std/src/io/stdio.rs",
+              "symbol": "std.io.Stdin.lock",
+              "has_receiver": true,
+              "parameter_count": 0
+            },
+            "completeness": "complete",
+            "locations": [],
+            "transfers": [
+              {
+                "input": {
+                  "kind": "receiver"
+                },
+                "exit_kind": "normal",
+                "output": {
+                  "kind": "normal_return"
+                }
+              }
+            ],
+            "effects": []
+          },
+          {
+            "id": "summary.cq01.rust-std-io-stdin-lock-read-to-string",
+            "target": {
+              "path": "library/std/src/io/stdio.rs",
+              "symbol": "std.io.StdinLock.read_to_string",
+              "has_receiver": true,
+              "parameter_count": 1
+            },
+            "completeness": "complete",
+            "locations": [],
+            "transfers": [
+              {
+                "input": {
+                  "kind": "receiver"
+                },
+                "exit_kind": "normal",
+                "output": {
+                  "kind": "normal_return"
+                }
+              }
+            ],
+            "effects": []
+          },
+          {
+            "id": "summary.cq01.rust-std-io-stdin-lock-read-to-end",
+            "target": {
+              "path": "library/std/src/io/stdio.rs",
+              "symbol": "std.io.StdinLock.read_to_end",
+              "has_receiver": true,
+              "parameter_count": 1
+            },
+            "completeness": "complete",
+            "locations": [],
+            "transfers": [
+              {
+                "input": {
+                  "kind": "receiver"
+                },
+                "exit_kind": "normal",
+                "output": {
+                  "kind": "normal_return"
+                }
+              }
+            ],
+            "effects": []
+          },
+          {
+            "id": "summary.cq01.rust-std-io-stdin-lock-read",
+            "target": {
+              "path": "library/std/src/io/stdio.rs",
+              "symbol": "std.io.StdinLock.read",
+              "has_receiver": true,
+              "parameter_count": 1
+            },
+            "completeness": "complete",
+            "locations": [],
+            "transfers": [
+              {
+                "input": {
+                  "kind": "receiver"
+                },
+                "exit_kind": "normal",
+                "output": {
+                  "kind": "normal_return"
+                }
+              }
+            ],
+            "effects": []
+          },
+          {
+            "id": "summary.cq01.rust-std-io-stdin-lock-lines",
+            "target": {
+              "path": "library/std/src/io/stdio.rs",
+              "symbol": "std.io.StdinLock.lines",
+              "has_receiver": true,
+              "parameter_count": 0
+            },
+            "completeness": "complete",
+            "locations": [],
+            "transfers": [
+              {
+                "input": {
+                  "kind": "receiver"
+                },
+                "exit_kind": "normal",
+                "output": {
+                  "kind": "normal_return"
+                }
+              }
+            ],
+            "effects": []
+          },
+          {
+            "id": "summary.cq01.rust-std-io-stdin-lock-read-until",
+            "target": {
+              "path": "library/std/src/io/stdio.rs",
+              "symbol": "std.io.StdinLock.read_until",
+              "has_receiver": true,
+              "parameter_count": 2
+            },
+            "completeness": "complete",
+            "locations": [],
+            "transfers": [
+              {
+                "input": {
+                  "kind": "receiver"
+                },
+                "exit_kind": "normal",
+                "output": {
+                  "kind": "normal_return"
+                }
+              }
+            ],
+            "effects": []
+          },
+          {
+            "id": "summary.cq01.rust-std-fs-read",
+            "target": {
+              "path": "library/std/src/fs.rs",
+              "symbol": "std.fs.read",
+              "has_receiver": false,
+              "parameter_count": 1
+            },
+            "completeness": "complete",
+            "locations": [],
+            "transfers": [],
+            "effects": [
+              {
+                "kind": "allocation",
+                "event": "event.summary.cq01.rust-std-fs-read.result",
+                "output": {
+                  "kind": "normal_return"
+                }
+              }
+            ]
+          },
+          {
+            "id": "summary.cq01.rust-std-fs-read-to-string",
+            "target": {
+              "path": "library/std/src/fs.rs",
+              "symbol": "std.fs.read_to_string",
+              "has_receiver": false,
+              "parameter_count": 1
+            },
+            "completeness": "complete",
+            "locations": [],
+            "transfers": [],
+            "effects": [
+              {
+                "kind": "allocation",
+                "event": "event.summary.cq01.rust-std-fs-read-to-string.result",
+                "output": {
+                  "kind": "normal_return"
+                }
+              }
+            ]
+          },
+          {
+            "id": "summary.cq01.rust-std-fs-read-dir",
+            "target": {
+              "path": "library/std/src/fs.rs",
+              "symbol": "std.fs.read_dir",
+              "has_receiver": false,
+              "parameter_count": 1
+            },
+            "completeness": "complete",
+            "locations": [],
+            "transfers": [],
+            "effects": [
+              {
+                "kind": "allocation",
+                "event": "event.summary.cq01.rust-std-fs-read-dir.result",
+                "output": {
+                  "kind": "normal_return"
+                }
+              }
+            ]
+          },
+          {
+            "id": "summary.cq01.rust-std-fs-read-link",
+            "target": {
+              "path": "library/std/src/fs.rs",
+              "symbol": "std.fs.read_link",
+              "has_receiver": false,
+              "parameter_count": 1
+            },
+            "completeness": "complete",
+            "locations": [],
+            "transfers": [],
+            "effects": [
+              {
+                "kind": "allocation",
+                "event": "event.summary.cq01.rust-std-fs-read-link.result",
+                "output": {
+                  "kind": "normal_return"
+                }
+              }
+            ]
+          },
+          {
+            "id": "summary.cq01.rust-std-fs-metadata",
+            "target": {
+              "path": "library/std/src/fs.rs",
+              "symbol": "std.fs.metadata",
+              "has_receiver": false,
+              "parameter_count": 1
+            },
+            "completeness": "complete",
+            "locations": [],
+            "transfers": [],
+            "effects": [
+              {
+                "kind": "allocation",
+                "event": "event.summary.cq01.rust-std-fs-metadata.result",
+                "output": {
+                  "kind": "normal_return"
+                }
+              }
+            ]
+          },
+          {
+            "id": "summary.cq01.rust-std-fs-symlink-metadata",
+            "target": {
+              "path": "library/std/src/fs.rs",
+              "symbol": "std.fs.symlink_metadata",
+              "has_receiver": false,
+              "parameter_count": 1
+            },
+            "completeness": "complete",
+            "locations": [],
+            "transfers": [],
+            "effects": [
+              {
+                "kind": "allocation",
+                "event": "event.summary.cq01.rust-std-fs-symlink-metadata.result",
+                "output": {
+                  "kind": "normal_return"
+                }
+              }
+            ]
+          },
+          {
+            "id": "summary.cq01.rust-std-fs-file-open",
+            "target": {
+              "path": "library/std/src/fs.rs",
+              "symbol": "std.fs.File.open",
+              "has_receiver": false,
+              "parameter_count": 1
+            },
+            "completeness": "complete",
+            "locations": [],
+            "transfers": [],
+            "effects": [
+              {
+                "kind": "allocation",
+                "event": "event.summary.cq01.rust-std-fs-file-open.result",
+                "output": {
+                  "kind": "normal_return"
+                }
+              }
+            ]
+          },
+          {
+            "id": "summary.cq01.rust-std-fs-file-read-to-string",
+            "target": {
+              "path": "library/std/src/fs.rs",
+              "symbol": "std.fs.File.read_to_string",
+              "has_receiver": true,
+              "parameter_count": 1
+            },
+            "completeness": "complete",
+            "locations": [],
+            "transfers": [
+              {
+                "input": {
+                  "kind": "receiver"
+                },
+                "exit_kind": "normal",
+                "output": {
+                  "kind": "normal_return"
+                }
+              }
+            ],
+            "effects": []
+          },
+          {
+            "id": "summary.cq01.rust-std-fs-file-read-to-end",
+            "target": {
+              "path": "library/std/src/fs.rs",
+              "symbol": "std.fs.File.read_to_end",
+              "has_receiver": true,
+              "parameter_count": 1
+            },
+            "completeness": "complete",
+            "locations": [],
+            "transfers": [
+              {
+                "input": {
+                  "kind": "receiver"
+                },
+                "exit_kind": "normal",
+                "output": {
+                  "kind": "normal_return"
+                }
+              }
+            ],
+            "effects": []
+          },
+          {
+            "id": "summary.cq01.rust-std-fs-file-read",
+            "target": {
+              "path": "library/std/src/fs.rs",
+              "symbol": "std.fs.File.read",
+              "has_receiver": true,
+              "parameter_count": 1
+            },
+            "completeness": "complete",
+            "locations": [],
+            "transfers": [
+              {
+                "input": {
+                  "kind": "receiver"
+                },
+                "exit_kind": "normal",
+                "output": {
+                  "kind": "normal_return"
+                }
+              }
+            ],
+            "effects": []
+          },
+          {
+            "id": "summary.cq01.rust-std-fs-open-options-open",
+            "target": {
+              "path": "library/std/src/fs.rs",
+              "symbol": "std.fs.OpenOptions.open",
+              "has_receiver": true,
+              "parameter_count": 1
+            },
+            "completeness": "complete",
+            "locations": [],
+            "transfers": [
+              {
+                "input": {
+                  "kind": "receiver"
+                },
+                "exit_kind": "normal",
+                "output": {
+                  "kind": "normal_return"
+                }
+              }
+            ],
+            "effects": []
+          },
+          {
+            "id": "summary.cq01.rust-std-fs-dir-entry-path",
+            "target": {
+              "path": "library/std/src/fs.rs",
+              "symbol": "std.fs.DirEntry.path",
+              "has_receiver": true,
+              "parameter_count": 0
+            },
+            "completeness": "complete",
+            "locations": [],
+            "transfers": [
+              {
+                "input": {
+                  "kind": "receiver"
+                },
+                "exit_kind": "normal",
+                "output": {
+                  "kind": "normal_return"
+                }
+              }
+            ],
+            "effects": []
+          },
+          {
+            "id": "summary.cq01.rust-std-fs-dir-entry-file-name",
+            "target": {
+              "path": "library/std/src/fs.rs",
+              "symbol": "std.fs.DirEntry.file_name",
+              "has_receiver": true,
+              "parameter_count": 0
+            },
+            "completeness": "complete",
+            "locations": [],
+            "transfers": [
+              {
+                "input": {
+                  "kind": "receiver"
+                },
+                "exit_kind": "normal",
+                "output": {
+                  "kind": "normal_return"
+                }
+              }
+            ],
+            "effects": []
+          },
+          {
+            "id": "summary.cq01.rust-std-path-exists",
+            "target": {
+              "path": "library/std/src/path.rs",
+              "symbol": "std.path.Path.exists",
+              "has_receiver": true,
+              "parameter_count": 0
+            },
+            "completeness": "complete",
+            "locations": [],
+            "transfers": [
+              {
+                "input": {
+                  "kind": "receiver"
+                },
+                "exit_kind": "normal",
+                "output": {
+                  "kind": "normal_return"
+                }
+              }
+            ],
+            "effects": []
+          },
+          {
+            "id": "summary.cq01.rust-std-path-read-dir",
+            "target": {
+              "path": "library/std/src/path.rs",
+              "symbol": "std.path.Path.read_dir",
+              "has_receiver": true,
+              "parameter_count": 0
+            },
+            "completeness": "complete",
+            "locations": [],
+            "transfers": [
+              {
+                "input": {
+                  "kind": "receiver"
+                },
+                "exit_kind": "normal",
+                "output": {
+                  "kind": "normal_return"
+                }
+              }
+            ],
+            "effects": []
+          },
+          {
+            "id": "summary.cq01.rust-std-path-read-link",
+            "target": {
+              "path": "library/std/src/path.rs",
+              "symbol": "std.path.Path.read_link",
+              "has_receiver": true,
+              "parameter_count": 0
+            },
+            "completeness": "complete",
+            "locations": [],
+            "transfers": [
+              {
+                "input": {
+                  "kind": "receiver"
+                },
+                "exit_kind": "normal",
+                "output": {
+                  "kind": "normal_return"
+                }
+              }
+            ],
+            "effects": []
+          },
+          {
+            "id": "summary.cq01.rust-std-net-tcp-stream-connect",
+            "target": {
+              "path": "library/std/src/net/tcp.rs",
+              "symbol": "std.net.TcpStream.connect",
+              "has_receiver": false,
+              "parameter_count": 1
+            },
+            "completeness": "complete",
+            "locations": [],
+            "transfers": [],
+            "effects": [
+              {
+                "kind": "allocation",
+                "event": "event.summary.cq01.rust-std-net-tcp-stream-connect.result",
+                "output": {
+                  "kind": "normal_return"
+                }
+              }
+            ]
+          },
+          {
+            "id": "summary.cq01.rust-std-net-tcp-stream-connect-timeout",
+            "target": {
+              "path": "library/std/src/net/tcp.rs",
+              "symbol": "std.net.TcpStream.connect_timeout",
+              "has_receiver": false,
+              "parameter_count": 2
+            },
+            "completeness": "complete",
+            "locations": [],
+            "transfers": [],
+            "effects": [
+              {
+                "kind": "allocation",
+                "event": "event.summary.cq01.rust-std-net-tcp-stream-connect-timeout.result",
+                "output": {
+                  "kind": "normal_return"
+                }
+              }
+            ]
+          },
+          {
+            "id": "summary.cq01.rust-std-net-tcp-stream-read-to-string",
+            "target": {
+              "path": "library/std/src/net/tcp.rs",
+              "symbol": "std.net.TcpStream.read_to_string",
+              "has_receiver": true,
+              "parameter_count": 1
+            },
+            "completeness": "complete",
+            "locations": [],
+            "transfers": [
+              {
+                "input": {
+                  "kind": "receiver"
+                },
+                "exit_kind": "normal",
+                "output": {
+                  "kind": "normal_return"
+                }
+              }
+            ],
+            "effects": []
+          }
+        ]
+      }
+    }
+  ]
+}

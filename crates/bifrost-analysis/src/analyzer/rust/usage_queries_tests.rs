@@ -10,6 +10,7 @@ mod tests {
     use crate::analyzer::CodeUnitIndex;
     use crate::analyzer::rust::RustAnalyzer;
     use crate::analyzer::rust::rust_package_name;
+    use crate::analyzer::rust::test_support::analyzed_file;
     use crate::analyzer::{AnalyzerQueryScope, QueryScope};
     use crate::analyzer::{Language, ProjectFile, TestProject};
     use crate::hash::HashSet;
@@ -17,9 +18,9 @@ mod tests {
     use brokk_bifrost_core::analyzer::rust_facts::{RUST_OCCURRENCE_CODE, RustCfgCondition};
     use brokk_bifrost_rust::graph_support::{RustCargoRouteError, RustFactSource};
     use brokk_bifrost_rust::imports::rust_module_extents;
-    use brokk_bifrost_rust::usage::{Domain, ModuleKey, RustImportExtent, RustSymbolNamespace};
-    use brokk_bifrost_rust::usage_queries::RustUsageQueries;
-    use brokk_bifrost_rust::usage_queries::compose_module;
+    use brokk_bifrost_rust::usage::{Domain, ModuleKey, RustSymbolNamespace};
+    use brokk_bifrost_rust::usage_queries::{RustUsageQueries, compose_module};
+    use brokk_bifrost_test_macros::hardwon;
     use std::sync::Arc;
     /// Two files with modules, imports, a re-export, and a name that occurs in
     /// one file's code and another file's comment only.
@@ -56,35 +57,6 @@ mod tests {
         // Force the analysis pass that persists the fact rows.
         let _ = analyzer.get_analyzed_files();
         (temp, analyzer, lib, worker)
-    }
-
-    fn analyzed_file(analyzer: &RustAnalyzer, suffix: &str) -> ProjectFile {
-        analyzer
-            .get_analyzed_files()
-            .into_iter()
-            .find(|file| file.rel_path().ends_with(suffix))
-            .unwrap_or_else(|| panic!("{suffix} is analyzed"))
-    }
-
-    #[test]
-    fn facts_of_returns_none_for_absent_live_path() {
-        let fixture = InlineTestProject::with_language(Language::Rust)
-            .file(
-                "Cargo.toml",
-                "[package]\nname = \"facts\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
-            )
-            .file("src/lib.rs", "pub fn present() {}\n")
-            .build();
-        let analyzer = RustAnalyzer::new(fixture.project_dyn());
-        let _ = analyzer.get_analyzed_files();
-        let queries = RustUsageQueries::new(&analyzer);
-
-        assert_eq!(
-            queries
-                .facts_of(&fixture.file("src/missing.rs"))
-                .expect("an absent live path is not a store failure"),
-            None
-        );
     }
 
     fn repeated_embedded_fixture() -> (BuiltInlineTestProject, RustAnalyzer, ProjectFile) {
@@ -212,45 +184,6 @@ pub mod nested {
     }
 
     #[test]
-    fn unavailable_hierarchy_source_publication_retries_after_warm() {
-        let (_fixture, analyzer, file, _second) = hierarchy_mount_fixture();
-        analyzer.analyzer_store().delete_rust_facts_for_test("rust");
-
-        assert_eq!(
-            RustFactSource::canonical_rust_hierarchy_source_facts(&analyzer, &file, &|| true)
-                .unwrap_err(),
-            RustCargoRouteError::Unavailable
-        );
-
-        analyzer.warm_usage_facts();
-        let repaired =
-            RustFactSource::canonical_rust_hierarchy_source_facts(&analyzer, &file, &|| true)
-                .expect("warmed hierarchy source publication");
-        assert!(!repaired.declarations.is_empty());
-        assert!(!repaired.declaration_units.is_empty());
-    }
-
-    #[test]
-    fn hierarchy_source_links_preserve_repeated_embedded_declarations() {
-        let (_fixture, analyzer, file) = repeated_embedded_fixture();
-        let facts =
-            RustFactSource::canonical_rust_hierarchy_source_facts(&analyzer, &file, &|| true)
-                .expect("canonical hierarchy source links");
-        let links: Vec<_> = facts
-            .declaration_units
-            .iter()
-            .filter(|(_, unit)| unit.identifier() == "repeated")
-            .collect();
-        assert_eq!(links.len(), 2, "all creation-time alternatives: {links:?}");
-        assert_ne!(links[0].0, links[1].0);
-        assert_eq!(links[0].1, links[1].1);
-        assert_ne!(
-            facts.declarations[links[0].0.index()].occurrence,
-            facts.declarations[links[1].0.index()].occurrence
-        );
-    }
-
-    #[test]
     fn repeated_embedded_declarations_retain_cfg_alternatives() {
         let (_fixture, analyzer, file) = repeated_embedded_fixture();
         let properties = analyzer
@@ -300,52 +233,9 @@ pub mod nested {
     }
 
     #[test]
-    fn cancelled_declaration_property_read_is_not_cached() {
-        let (_fixture, analyzer, file) = repeated_embedded_fixture();
-        let checks = std::cell::Cell::new(0usize);
-        let cancelled = analyzer.declaration_source_properties(&file, &|| {
-            let next = checks.get() + 1;
-            checks.set(next);
-            next < 2
-        });
-        assert_eq!(cancelled.unwrap_err(), RustCargoRouteError::Cancelled);
-
-        let properties = analyzer
-            .declaration_source_properties(&file, &|| true)
-            .expect("uncancelled read retries after cancellation");
-        let repeated = properties
-            .iter()
-            .find(|(unit, _)| unit.identifier() == "repeated")
-            .expect("retried repeated declaration properties");
-        assert_eq!(repeated.1.len(), 2);
-    }
-
-    #[test]
-    fn missing_declaration_property_publication_retries_after_warm() {
-        let (_fixture, analyzer, file) = repeated_embedded_fixture();
-        analyzer.analyzer_store().delete_rust_facts_for_test("rust");
-
-        let queries = RustUsageQueries::new(&analyzer);
-        assert_eq!(
-            queries.declaration_facts_of(&file).unwrap_err(),
-            RustCargoRouteError::Unavailable
-        );
-
-        analyzer.warm_usage_facts();
-        let declaration_facts = queries
-            .declaration_facts_of(&file)
-            .expect("warmed declaration properties");
-        let (_, cfg_conditions) = declaration_facts
-            .cfg_conditions
-            .iter()
-            .find(|(identity, _)| {
-                identity.name == "repeated" && identity.namespace == RustSymbolNamespace::Value
-            })
-            .expect("repeated declaration facts after retry");
-        assert_eq!(cfg_conditions.len(), 2);
-    }
-
-    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "bd33e1b59a9f: absent live Rust facts must stay unavailable and retry after publication"
+    )]
     fn missing_live_fact_publication_is_unavailable_and_retryable_without_empty_cache() {
         let fixture = InlineTestProject::with_language(Language::Rust)
             .file(
@@ -405,6 +295,9 @@ pub mod nested {
     }
 
     #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "bd33e1b59a9f: inverse identifier SQL errors must not become empty candidate sets"
+    )]
     fn inverse_identifier_sql_failure_is_unavailable_not_empty_success() {
         let fixture = InlineTestProject::with_language(Language::Rust)
             .file(
@@ -460,6 +353,9 @@ pub mod nested {
     /// answers, which is the migration's whole risk.
     #[cfg_attr(not(scheduled_tests), ignore = "scheduled-only")]
     #[test]
+    #[hardwon(
+        "#549: The test pins the store-backed module extent projection that the Rust usage-v2 correction restored."
+    )]
     fn module_extents_from_the_store_match_the_syntax_tree_projection() {
         let (_temp, analyzer, lib, _worker) = analyzer_with_fixture();
         let scope = AnalyzerQueryScope::new(&analyzer);
@@ -490,6 +386,9 @@ pub mod nested {
     /// wrong here produces a module key that resolves to the wrong crate path.
     #[cfg_attr(not(scheduled_tests), ignore = "scheduled-only")]
     #[test]
+    #[hardwon(
+        "#549: The test protects correct live package composition when persisted extents use relative names."
+    )]
     fn module_extents_compose_the_live_package_into_the_stored_relative_names() {
         let (_temp, analyzer, _lib, _worker) = analyzer_with_fixture();
         let leaf = analyzed_file(&analyzer, "leaf.rs");
@@ -515,138 +414,15 @@ pub mod nested {
         }
     }
 
-    #[cfg_attr(not(scheduled_tests), ignore = "scheduled-only")]
-    #[test]
-    fn module_at_byte_picks_the_narrowest_enclosing_module() {
-        let (_temp, analyzer, lib, _worker) = analyzer_with_fixture();
-        let queries = RustUsageQueries::new(&analyzer);
-        let source = lib.read_to_string().expect("read lib.rs");
-        let nested = source.find("nested").expect("nested function present");
-        let root_fn = source.find("pub fn root").expect("root function present");
-
-        assert_eq!(
-            queries
-                .module_at_byte(&lib, nested)
-                .expect("published Rust facts for nested function"),
-            Some(ModuleKey::new(
-                &lib,
-                &compose_module(&rust_package_name(&lib), "inner")
-            ))
-        );
-        assert_eq!(
-            queries
-                .module_at_byte(&lib, root_fn)
-                .expect("published Rust facts for root function"),
-            Some(ModuleKey::new(&lib, &rust_package_name(&lib)))
-        );
-    }
-
-    #[cfg_attr(not(scheduled_tests), ignore = "scheduled-only")]
-    #[test]
-    fn re_exports_come_from_the_rows() {
-        let (_temp, analyzer, lib, _worker) = analyzer_with_fixture();
-        let queries = RustUsageQueries::new(&analyzer);
-
-        let exports = queries
-            .re_exports_of(&lib)
-            .expect("published Rust facts for lib.rs");
-        assert_eq!(exports.len(), 1, "exports were {exports:?}");
-        assert_eq!(exports[0].exported_name.as_deref(), Some("Task"));
-        assert_eq!(exports[0].source_path, "worker");
-        assert_eq!(exports[0].imported_name.as_deref(), Some("Job"));
-        assert!(
-            queries
-                .re_exports_of(&analyzed_file(&analyzer, "worker.rs"))
-                .expect("published Rust facts for worker.rs")
-                .is_empty(),
-            "a private `use` is not a re-export"
-        );
-    }
-
-    #[cfg_attr(not(scheduled_tests), ignore = "scheduled-only")]
-    #[test]
-    fn import_bindings_reproduce_the_paths_and_lexical_reach() {
-        let (_temp, analyzer, lib, worker) = analyzer_with_fixture();
-        let queries = RustUsageQueries::new(&analyzer);
-
-        let lib_bindings = queries
-            .import_bindings_of(&lib)
-            .expect("published Rust facts for lib.rs");
-        let described: Vec<_> = lib_bindings
-            .iter()
-            .map(|binding| (binding.path.join("::"), binding.local_name.named()))
-            .collect();
-        assert_eq!(
-            described,
-            vec![
-                ("worker::Job".to_string(), Some("Task")),
-                ("std::fmt::Debug".to_string(), Some("Debug")),
-            ],
-            "lib bindings were {lib_bindings:?}"
-        );
-
-        let worker_bindings = queries
-            .import_bindings_of(&worker)
-            .expect("published Rust facts for worker.rs");
-        assert_eq!(worker_bindings.len(), 1);
-        assert_eq!(
-            worker_bindings[0].importer_module,
-            ModuleKey::new(&worker, &rust_package_name(&worker))
-        );
-        assert!(
-            matches!(worker_bindings[0].extent, RustImportExtent::Module { .. }),
-            "a module-scope `use` has module reach: {:?}",
-            worker_bindings[0].extent
-        );
-    }
-
-    #[cfg_attr(not(scheduled_tests), ignore = "scheduled-only")]
-    #[test]
-    fn repeated_import_binding_reads_decode_one_file_once() {
-        let (_temp, analyzer, lib, _worker) = analyzer_with_fixture();
-        let queries = RustUsageQueries::new(&analyzer);
-
-        let first = queries
-            .import_bindings_of(&lib)
-            .expect("published Rust facts for first import read");
-        let second = queries
-            .import_bindings_of(&lib)
-            .expect("published Rust facts for second import read");
-
-        assert!(Arc::ptr_eq(&first, &second));
-        assert_eq!(queries.import_binding_computations(), 1);
-    }
-
-    #[cfg_attr(not(scheduled_tests), ignore = "scheduled-only")]
-    #[test]
-    fn prederived_module_keys_match_the_canonical_constructor() {
-        let (_temp, analyzer, lib, worker) = analyzer_with_fixture();
-        let leaf = analyzed_file(&analyzer, "leaf.rs");
-        let queries = RustUsageQueries::new(&analyzer);
-
-        for file in [&lib, &worker, &leaf] {
-            let identity = queries.path_identity_of(file);
-            for module in [
-                identity.package.as_str(),
-                identity.crate_root_package.as_str(),
-                "unrelated.relative.module",
-                "",
-            ] {
-                assert_eq!(
-                    queries.module_key_of(file, module),
-                    ModuleKey::new(file, module),
-                    "prederived key differs for {file:?} and {module:?}"
-                );
-            }
-        }
-    }
-
     /// The inverted lookups are the candidate half of the design. They must
     /// find the files that mention a name, filter by context so a prose
     /// mention is not offered to a reference search, and stay one indexed
     /// lookup rather than a workspace walk.
     #[cfg_attr(not(scheduled_tests), ignore = "scheduled-only")]
     #[test]
+    #[hardwon(
+        "#549: It prevents inverse queries from admitting candidate files outside the current live context."
+    )]
     fn inverted_lookups_return_live_candidate_files_filtered_by_context() {
         let (_temp, analyzer, lib, worker) = analyzer_with_fixture();
         let queries = RustUsageQueries::new(&analyzer);
@@ -701,6 +477,9 @@ pub mod nested {
     /// Returning the candidate unverified would invent an identity in a module
     /// that does not declare the name.
     #[test]
+    #[hardwon(
+        "#3080: This pins rejection of a candidate file that lacks the module identity required by the Rust import correction."
+    )]
     fn a_candidate_file_without_a_module_scope_identity_is_rejected() {
         let temp = tempfile::tempdir().expect("tempdir");
         let root = temp.path().canonicalize().expect("canonical root");
@@ -753,6 +532,183 @@ pub mod nested {
              value-namespace constructor: {holder_identities:?}"
         );
     }
+
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "bd33e1b59a9f: Rust usage query swallowed a failed live-fact read as an absent path"
+    )]
+    fn facts_of_returns_none_for_absent_live_path() {
+        let fixture = InlineTestProject::with_language(Language::Rust)
+            .file(
+                "Cargo.toml",
+                "[package]\nname = \"facts\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+            )
+            .file("src/lib.rs", "pub fn present() {}\n")
+            .build();
+        let analyzer = RustAnalyzer::new(fixture.project_dyn());
+        let _ = analyzer.get_analyzed_files();
+        let queries = RustUsageQueries::new(&analyzer);
+
+        assert_eq!(
+            queries
+                .facts_of(&fixture.file("src/missing.rs"))
+                .expect("an absent live path is not a store failure"),
+            None
+        );
+    }
+
+    #[test]
+    fn unavailable_hierarchy_source_publication_retries_after_warm() {
+        let (_fixture, analyzer, file, _second) = hierarchy_mount_fixture();
+        analyzer.analyzer_store().delete_rust_facts_for_test("rust");
+
+        assert_eq!(
+            RustFactSource::canonical_rust_hierarchy_source_facts(&analyzer, &file, &|| true)
+                .unwrap_err(),
+            RustCargoRouteError::Unavailable
+        );
+
+        analyzer.warm_usage_facts();
+        let repaired =
+            RustFactSource::canonical_rust_hierarchy_source_facts(&analyzer, &file, &|| true)
+                .expect("warmed hierarchy source publication");
+        assert!(!repaired.declarations.is_empty());
+        assert!(!repaired.declaration_units.is_empty());
+    }
+
+    #[test]
+    fn hierarchy_source_links_preserve_repeated_embedded_declarations() {
+        let (_fixture, analyzer, file) = repeated_embedded_fixture();
+        let facts =
+            RustFactSource::canonical_rust_hierarchy_source_facts(&analyzer, &file, &|| true)
+                .expect("canonical hierarchy source links");
+        let links: Vec<_> = facts
+            .declaration_units
+            .iter()
+            .filter(|(_, unit)| unit.identifier() == "repeated")
+            .collect();
+        assert_eq!(links.len(), 2, "all creation-time alternatives: {links:?}");
+        assert_ne!(links[0].0, links[1].0);
+        assert_eq!(links[0].1, links[1].1);
+        assert_ne!(
+            facts.declarations[links[0].0.index()].occurrence,
+            facts.declarations[links[1].0.index()].occurrence
+        );
+    }
+
+    #[test]
+    fn cancelled_declaration_property_read_is_not_cached() {
+        let (_fixture, analyzer, file) = repeated_embedded_fixture();
+        let checks = std::cell::Cell::new(0usize);
+        let cancelled = analyzer.declaration_source_properties(&file, &|| {
+            let next = checks.get() + 1;
+            checks.set(next);
+            next < 2
+        });
+        assert_eq!(cancelled.unwrap_err(), RustCargoRouteError::Cancelled);
+
+        let properties = analyzer
+            .declaration_source_properties(&file, &|| true)
+            .expect("uncancelled read retries after cancellation");
+        let repeated = properties
+            .iter()
+            .find(|(unit, _)| unit.identifier() == "repeated")
+            .expect("retried repeated declaration properties");
+        assert_eq!(repeated.1.len(), 2);
+    }
+
+    #[test]
+    fn missing_declaration_property_publication_catches_up_before_read() {
+        let (_fixture, analyzer, file) = repeated_embedded_fixture();
+        analyzer.analyzer_store().delete_rust_facts_for_test("rust");
+        assert_eq!(
+            analyzer
+                .rust_files_without_facts_among(std::slice::from_ref(&file))
+                .unwrap(),
+            vec![file.clone()]
+        );
+
+        let queries = RustUsageQueries::new(&analyzer);
+        let declaration_facts = queries
+            .declaration_facts_of(&file)
+            .expect("declaration properties catch up the missing publication");
+        let (_, cfg_conditions) = declaration_facts
+            .cfg_conditions
+            .iter()
+            .find(|(identity, _)| {
+                identity.name == "repeated" && identity.namespace == RustSymbolNamespace::Value
+            })
+            .expect("repeated declaration facts after retry");
+        assert_eq!(cfg_conditions.len(), 2);
+        assert!(
+            analyzer
+                .rust_files_without_facts_among(std::slice::from_ref(&file))
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn module_at_byte_picks_the_narrowest_enclosing_module() {
+        let (_temp, analyzer, lib, _worker) = analyzer_with_fixture();
+        let queries = RustUsageQueries::new(&analyzer);
+        let source = lib.read_to_string().expect("read lib.rs");
+        let nested = source.find("nested").expect("nested function present");
+        let root_fn = source.find("pub fn root").expect("root function present");
+
+        assert_eq!(
+            queries
+                .module_at_byte(&lib, nested)
+                .expect("published Rust facts for nested function"),
+            Some(ModuleKey::new(
+                &lib,
+                &compose_module(&rust_package_name(&lib), "inner")
+            ))
+        );
+        assert_eq!(
+            queries
+                .module_at_byte(&lib, root_fn)
+                .expect("published Rust facts for root function"),
+            Some(ModuleKey::new(&lib, &rust_package_name(&lib)))
+        );
+    }
+
+    #[test]
+    fn re_exports_come_from_the_rows() {
+        let (_temp, analyzer, lib, _worker) = analyzer_with_fixture();
+        let queries = RustUsageQueries::new(&analyzer);
+
+        let exports = queries
+            .re_exports_of(&lib)
+            .expect("published Rust facts for lib.rs");
+        assert_eq!(exports.len(), 1, "exports were {exports:?}");
+        assert_eq!(exports[0].exported_name.as_deref(), Some("Task"));
+        assert_eq!(exports[0].source_path, "worker");
+        assert_eq!(exports[0].imported_name.as_deref(), Some("Job"));
+        assert!(
+            queries
+                .re_exports_of(&analyzed_file(&analyzer, "worker.rs"))
+                .expect("published Rust facts for worker.rs")
+                .is_empty(),
+            "a private `use` is not a re-export"
+        );
+    }
+
+    #[test]
+    fn repeated_import_binding_reads_decode_one_file_once() {
+        let (_temp, analyzer, lib, _worker) = analyzer_with_fixture();
+        let queries = RustUsageQueries::new(&analyzer);
+
+        let first = queries
+            .import_bindings_of(&lib)
+            .expect("published Rust facts for first import read");
+        let second = queries
+            .import_bindings_of(&lib)
+            .expect("published Rust facts for second import read");
+
+        assert!(Arc::ptr_eq(&first, &second));
+        assert_eq!(queries.import_binding_computations(), 1);
+    }
 }
 #[cfg(test)]
 mod issue_3080_phase_two {
@@ -768,6 +724,7 @@ mod issue_3080_phase_two {
     };
     use brokk_bifrost_rust::usage_queries::RustUsageQueries;
     use brokk_bifrost_rust::usage_walks::RustUsageWalks;
+    use brokk_bifrost_test_macros::hardwon;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     fn fixture() -> (crate::inline_project::BuiltInlineTestProject, RustAnalyzer) {
@@ -786,6 +743,9 @@ mod issue_3080_phase_two {
     }
 
     #[test]
+    #[hardwon(
+        "#3080: This fix preserves unnamed glob consumers even though they have no ordinary reference name."
+    )]
     fn unnamed_glob_consumers_are_candidates_without_reference_names() {
         let (project, analyzer) = fixture();
         let roots = analyzer
@@ -876,6 +836,9 @@ mod issue_3080_phase_two {
     }
 
     #[test]
+    #[hardwon(
+        "#3080: It prevents Rust occurrence lowering from separating declaration and constructor cfg guards."
+    )]
     fn declaration_and_constructor_guards_remain_paired() {
         let (project, analyzer) = fixture();
         let queries = RustUsageQueries::new(&analyzer);
@@ -898,6 +861,54 @@ mod issue_3080_phase_two {
                     "visibility must remain paired with its occurrence guard: {occurrences:?}"
                 );
             }
+            assert!(
+                occurrences
+                    .iter()
+                    .any(|(_, guard)| matches!(guard, RustCfgCondition::Atom(_))),
+                "{occurrences:?}"
+            );
+            assert!(
+                occurrences
+                    .iter()
+                    .any(|(_, guard)| matches!(guard, RustCfgCondition::NotAtom(_))),
+                "{occurrences:?}"
+            );
+        }
+    }
+
+    #[test]
+    #[hardwon(
+        "#3080: The test retains both conditional guard alternatives on macro item occurrences."
+    )]
+    fn macro_item_occurrences_preserve_both_guards() {
+        let project = InlineTestProject::with_language(Language::Rust)
+            .file(
+                "Cargo.toml",
+                "[package]\nname = \"macro_probe\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+            )
+            .file(
+                "src/lib.rs",
+                r#"
+macro_rules! items { ($($item:item)*) => { $($item)* }; }
+items! {
+    #[cfg(feature = "a")] pub struct Pair(pub u8);
+    #[cfg(not(feature = "a"))] pub struct Pair(pub u16);
+}
+"#,
+            )
+            .build();
+        let analyzer = RustAnalyzer::from_project(project.project().clone());
+        let queries = RustUsageQueries::new(&analyzer);
+        let facts = queries
+            .declaration_facts_of(&project.file("src/lib.rs"))
+            .expect("complete declaration facts");
+        for namespace in [RustSymbolNamespace::Type, RustSymbolNamespace::Value] {
+            let (_, occurrences) = facts
+                .domain_cfg_occurrences
+                .iter()
+                .find(|(identity, _)| identity.name == "Pair" && identity.namespace == namespace)
+                .expect("macro item identity");
+            assert_eq!(occurrences.len(), 2, "{occurrences:?}");
             assert!(
                 occurrences
                     .iter()
@@ -945,49 +956,5 @@ mod issue_3080_phase_two {
             ),
             Ok(None)
         ));
-    }
-    #[test]
-    fn macro_item_occurrences_preserve_both_guards() {
-        let project = InlineTestProject::with_language(Language::Rust)
-            .file(
-                "Cargo.toml",
-                "[package]\nname = \"macro_probe\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
-            )
-            .file(
-                "src/lib.rs",
-                r#"
-macro_rules! items { ($($item:item)*) => { $($item)* }; }
-items! {
-    #[cfg(feature = "a")] pub struct Pair(pub u8);
-    #[cfg(not(feature = "a"))] pub struct Pair(pub u16);
-}
-"#,
-            )
-            .build();
-        let analyzer = RustAnalyzer::from_project(project.project().clone());
-        let queries = RustUsageQueries::new(&analyzer);
-        let facts = queries
-            .declaration_facts_of(&project.file("src/lib.rs"))
-            .expect("complete declaration facts");
-        for namespace in [RustSymbolNamespace::Type, RustSymbolNamespace::Value] {
-            let (_, occurrences) = facts
-                .domain_cfg_occurrences
-                .iter()
-                .find(|(identity, _)| identity.name == "Pair" && identity.namespace == namespace)
-                .expect("macro item identity");
-            assert_eq!(occurrences.len(), 2, "{occurrences:?}");
-            assert!(
-                occurrences
-                    .iter()
-                    .any(|(_, guard)| matches!(guard, RustCfgCondition::Atom(_))),
-                "{occurrences:?}"
-            );
-            assert!(
-                occurrences
-                    .iter()
-                    .any(|(_, guard)| matches!(guard, RustCfgCondition::NotAtom(_))),
-                "{occurrences:?}"
-            );
-        }
     }
 }

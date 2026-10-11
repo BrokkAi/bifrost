@@ -71,6 +71,9 @@ impl SemanticModelOverlay {
                     return None;
                 }
                 let signature = member.structured_signature.as_ref()?;
+                if signature.contains_unknown_types() {
+                    return None;
+                }
                 // A generic function type cannot be implemented by a lambda.
                 // Inherited type-variable substitution is not yet retained by
                 // overlay hierarchy edges, so do not merge those signatures.
@@ -277,7 +280,9 @@ fn same_signature(left: &SemanticModelSymbol, right: &SemanticModelSymbol) -> bo
     else {
         return false;
     };
-    left.name == right.name
+    !left_signature.contains_unknown_types()
+        && !right_signature.contains_unknown_types()
+        && left.name == right.name
         && left_signature.type_parameters == right_signature.type_parameters
         && left_signature.parameters.len() == right_signature.parameters.len()
         && left_signature

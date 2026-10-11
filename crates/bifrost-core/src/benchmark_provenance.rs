@@ -7,7 +7,7 @@ use std::process::Command;
 use sha2::{Digest, Sha256};
 
 pub fn git_tree_fingerprint(root: &Path, excluded_paths: &[&Path]) -> Option<String> {
-    let commit = command_output_in(root, "git", &["rev-parse", "HEAD"])?;
+    let commit = git_commit(root)?;
     let excluded = excluded_paths
         .iter()
         .filter_map(|path| path.strip_prefix(root).ok())
@@ -51,7 +51,16 @@ pub fn git_tree_fingerprint(root: &Path, excluded_paths: &[&Path]) -> Option<Str
         }
         hash_field(&mut hasher, b'f', &fs::read(path).ok()?)?;
     }
-    Some(hex_digest(hasher.finalize()))
+    let digest: [u8; 32] = hasher.finalize().into();
+    Some(crate::analyzer::canonical_hash::lower_hex_string(&digest))
+}
+
+pub fn git_commit(root: &Path) -> Option<String> {
+    command_output_in(root, "git", &["rev-parse", "HEAD"])
+}
+
+pub fn command_output(program: &str, arguments: &[&str]) -> Option<String> {
+    command_output_in(Path::new("."), program, arguments)
 }
 
 pub fn command_output_in(root: &Path, program: &str, arguments: &[&str]) -> Option<String> {
@@ -72,18 +81,6 @@ fn hash_field(hasher: &mut Sha256, tag: u8, bytes: &[u8]) -> Option<()> {
     Some(())
 }
 
-fn hex_digest(bytes: impl AsRef<[u8]>) -> String {
-    use std::fmt::Write as _;
-
-    bytes
-        .as_ref()
-        .iter()
-        .fold(String::with_capacity(64), |mut output, byte| {
-            write!(output, "{byte:02x}").expect("write to String");
-            output
-        })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -95,7 +92,8 @@ mod tests {
             for &(tag, bytes) in fields {
                 hash_field(&mut hasher, tag, bytes).unwrap();
             }
-            hex_digest(hasher.finalize())
+            let digest: [u8; 32] = hasher.finalize().into();
+            crate::analyzer::canonical_hash::lower_hex_string(&digest)
         }
 
         assert_ne!(

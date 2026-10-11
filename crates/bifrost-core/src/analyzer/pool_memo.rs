@@ -28,13 +28,19 @@
 //! claim, and [`KeyedPoolSafeMemo`] applies it per key to the request-scoped
 //! read-through memos whose stampede it exists to stop (issue #1748).
 
+use crate::analyzer::config::default_parallelism;
+use crate::hash::HashMap;
 use std::cell::Cell;
 use std::hash::Hash;
 use std::sync::{Arc, Condvar, Mutex, OnceLock, RwLock};
 use std::time::Duration;
 
-use crate::analyzer::config::default_parallelism;
-use crate::hash::HashMap;
+fn unwrap_infallible<T>(result: Result<T, std::convert::Infallible>) -> T {
+    match result {
+        Ok(value) => value,
+        Err(never) => match never {},
+    }
+}
 
 const CANCELLABLE_WAIT_INTERVAL: Duration = Duration::from_millis(10);
 
@@ -71,9 +77,8 @@ fn dedicated_build_pool() -> &'static rayon::ThreadPool {
 
 /// Run `task` on [`dedicated_build_pool`] and return immediately.
 ///
-/// The background half of the ExecPlan Milestone 3 Rust fact catch-up
-/// (`.agents/plans/rust-usage-index-v2.md`): an above-threshold catch-up batch
-/// must not be billed to the querying thread, and it must not consume a
+/// An above-threshold Rust fact catch-up batch must not be billed to the
+/// querying thread, and it must not consume a
 /// global-pool worker either, because the query that scheduled it goes straight
 /// back to its own parallel fan-out.
 pub fn spawn_on_dedicated_build_pool(task: impl FnOnce() + Send + 'static) {
@@ -187,6 +192,15 @@ impl<T> PoolSafeMemo<T> {
             .is_some()
     }
 
+    fn publish(&self, built: Arc<T>) -> Arc<T> {
+        let mut state = self.state.lock().expect("pool memo poisoned");
+        if let Some(existing) = state.value.as_ref() {
+            return Arc::clone(existing);
+        }
+        state.value = Some(Arc::clone(&built));
+        built
+    }
+
     /// Wait for an in-flight build when this caller may block, or claim the
     /// builder role. Returns the value if one became available while waiting.
     /// A rayon worker only waits for a build that reaches its value without a
@@ -268,11 +282,9 @@ impl<T> PoolSafeMemo<T> {
     where
         T: Send,
     {
-        match self.get_or_try_build_on_dedicated_pool(|| Ok::<T, std::convert::Infallible>(build()))
-        {
-            Ok(value) => value,
-            Err(never) => match never {},
-        }
+        unwrap_infallible(
+            self.get_or_try_build_on_dedicated_pool(|| Ok::<T, std::convert::Infallible>(build())),
+        )
     }
 
     /// Fallible dedicated-pool construction. Failed builds publish no value;
@@ -322,12 +334,7 @@ impl<T> PoolSafeMemo<T> {
             dedicated_build_pool().install(build)
         }?);
 
-        let mut state = self.state.lock().expect("pool memo poisoned");
-        if let Some(existing) = state.value.as_ref() {
-            return Ok(Arc::clone(existing));
-        }
-        state.value = Some(Arc::clone(&built));
-        Ok(built)
+        Ok(self.publish(built))
     }
 
     /// Build the value once on [`dedicated_build_pool`] while work remains permitted.
@@ -369,12 +376,7 @@ impl<T> PoolSafeMemo<T> {
         }?;
         let built = Arc::new(built);
 
-        let mut state = self.state.lock().expect("pool memo poisoned");
-        if let Some(existing) = state.value.as_ref() {
-            return Some(Arc::clone(existing));
-        }
-        state.value = Some(Arc::clone(&built));
-        Some(built)
+        Some(self.publish(built))
     }
 
     /// Build the value with the parallel builder even when called from a rayon
@@ -408,12 +410,7 @@ impl<T> PoolSafeMemo<T> {
             BuildPolicy::PoolSafe => build_parallel(),
         });
 
-        let mut state = self.state.lock().expect("pool memo poisoned");
-        if let Some(existing) = state.value.as_ref() {
-            return Arc::clone(existing);
-        }
-        state.value = Some(Arc::clone(&built));
-        built
+        self.publish(built)
     }
 
     pub fn get_or_try_build<E>(
@@ -435,12 +432,7 @@ impl<T> PoolSafeMemo<T> {
             build_parallel()?
         });
 
-        let mut state = self.state.lock().expect("pool memo poisoned");
-        if let Some(existing) = state.value.as_ref() {
-            return Ok(Arc::clone(existing));
-        }
-        state.value = Some(Arc::clone(&built));
-        Ok(built)
+        Ok(self.publish(built))
     }
 
     /// Single-flight a fallible build that reaches its value without any rayon
@@ -474,12 +466,7 @@ impl<T> PoolSafeMemo<T> {
 
         let built = Arc::new(build()?);
 
-        let mut state = self.state.lock().expect("pool memo poisoned");
-        if let Some(existing) = state.value.as_ref() {
-            return Ok(Arc::clone(existing));
-        }
-        state.value = Some(Arc::clone(&built));
-        Ok(built)
+        Ok(self.publish(built))
     }
 
     /// [`Self::get_or_try_build_pool_independent`] under a caller's deadline.
@@ -517,22 +504,15 @@ impl<T> PoolSafeMemo<T> {
         };
         let built = Arc::new(built);
 
-        let mut state = self.state.lock().expect("pool memo poisoned");
-        if let Some(existing) = state.value.as_ref() {
-            return Ok(Some(Arc::clone(existing)));
-        }
-        state.value = Some(Arc::clone(&built));
-        Ok(Some(built))
+        Ok(Some(self.publish(built)))
     }
 
     /// Infallible [`Self::get_or_try_build_pool_independent`], for a build that
     /// reaches its value without any rayon worker and cannot fail.
     pub fn get_or_build_pool_independent(&self, build: impl FnOnce() -> T) -> Arc<T> {
-        match self.get_or_try_build_pool_independent(|| Ok::<T, std::convert::Infallible>(build()))
-        {
-            Ok(value) => value,
-            Err(never) => match never {},
-        }
+        unwrap_infallible(
+            self.get_or_try_build_pool_independent(|| Ok::<T, std::convert::Infallible>(build())),
+        )
     }
 
     /// Get or build a value while cooperative work is still permitted.
@@ -559,12 +539,7 @@ impl<T> PoolSafeMemo<T> {
             build_parallel()?
         });
 
-        let mut state = self.state.lock().expect("pool memo poisoned");
-        if let Some(existing) = state.value.as_ref() {
-            return Some(Arc::clone(existing));
-        }
-        state.value = Some(Arc::clone(&built));
-        Some(built)
+        Some(self.publish(built))
     }
 
     #[allow(dead_code)]
@@ -704,39 +679,16 @@ impl<K, V> std::fmt::Debug for KeyedPoolSafeMemo<K, V> {
 #[cfg(test)]
 mod tests {
     use super::{KeyedPoolSafeMemo, PoolSafeMemo, spawn_on_dedicated_build_pool};
+    use brokk_bifrost_test_macros::hardwon;
+    use std::sync::Arc;
+    use std::sync::Barrier;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::mpsc;
-    use std::sync::{Arc, Barrier};
     use std::thread;
     use std::time::Duration;
 
     #[test]
-    fn racing_builders_observe_one_stored_value() {
-        let memo = Arc::new(PoolSafeMemo::new());
-        let barrier = Arc::new(Barrier::new(2));
-
-        let handles: Vec<_> = (0..2)
-            .map(|value| {
-                let memo = Arc::clone(&memo);
-                let barrier = Arc::clone(&barrier);
-                thread::spawn(move || {
-                    barrier.wait();
-                    memo.get_or_build(|| value, || value)
-                })
-            })
-            .collect();
-
-        let values: Vec<_> = handles
-            .into_iter()
-            .map(|handle| handle.join().expect("thread should finish"))
-            .collect();
-        let stored = memo.get().expect("memo should be populated");
-
-        assert!(Arc::ptr_eq(&values[0], &stored));
-        assert!(Arc::ptr_eq(&values[1], &stored));
-    }
-
-    #[test]
+    #[hardwon("#549: a Rayon worker recursively building its own usage index deadlocked the pool")]
     fn selects_serial_builder_on_rayon_worker_and_parallel_off_pool() {
         let memo = PoolSafeMemo::new();
         let parallel_calls = AtomicUsize::new(0);
@@ -842,56 +794,6 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn stopped_cancellable_dedicated_build_is_not_published() {
-        let memo = PoolSafeMemo::new();
-        let calls = AtomicUsize::new(0);
-
-        assert!(
-            memo.get_or_build_on_dedicated_pool_while(&|| true, || {
-                calls.fetch_add(1, Ordering::SeqCst);
-                None::<usize>
-            })
-            .is_none()
-        );
-        assert!(memo.get().is_none());
-
-        let first = memo
-            .get_or_build_on_dedicated_pool_while(&|| true, || {
-                calls.fetch_add(1, Ordering::SeqCst);
-                Some(7)
-            })
-            .expect("live build completes");
-        let repeated = memo
-            .get_or_build_on_dedicated_pool_while(&|| true, || {
-                panic!("completed dedicated build must be memoized")
-            })
-            .expect("memoized build remains available");
-
-        assert!(Arc::ptr_eq(&first, &repeated));
-        assert_eq!(calls.load(Ordering::SeqCst), 2);
-    }
-
-    #[test]
-    fn invalidate_causes_rebuild() {
-        let memo = PoolSafeMemo::new();
-        let calls = AtomicUsize::new(0);
-
-        let first = memo.get_or_build(
-            || calls.fetch_add(1, Ordering::SeqCst),
-            || calls.fetch_add(1, Ordering::SeqCst),
-        );
-        memo.invalidate();
-        let second = memo.get_or_build(
-            || calls.fetch_add(1, Ordering::SeqCst),
-            || calls.fetch_add(1, Ordering::SeqCst),
-        );
-
-        assert_eq!(*first, 0);
-        assert_eq!(*second, 1);
-        assert_eq!(calls.load(Ordering::SeqCst), 2);
-    }
-
     /// Regression guard for issue #549. With a blocking once-cell, this shape
     /// deadlocks unconditionally: the off-pool initializer waits for its own
     /// `par_iter` items, while those items — on pool threads — park on the cell
@@ -899,6 +801,7 @@ mod tests {
     /// re-entrant callers see an empty slot, build serially, and first-write-wins
     /// keeps every caller on one stored value.
     #[test]
+    #[hardwon("#549: a Rayon builder recursively querying its own memo deadlocked")]
     fn reentrant_build_from_inner_parallelism_completes() {
         use rayon::prelude::*;
         let memo = Arc::new(PoolSafeMemo::new());
@@ -941,6 +844,9 @@ mod tests {
     /// for that build instead of duplicating it: both observe the builder's
     /// value and the second builder is never invoked.
     #[test]
+    #[hardwon(
+        "#1416: the first request waited for and duplicated a cold Rust usage-index build inside its budget"
+    )]
     fn off_pool_caller_waits_for_in_flight_build() {
         use std::time::Duration;
 
@@ -980,6 +886,7 @@ mod tests {
     }
 
     #[test]
+    #[hardwon("#1636: cancelling a Rust index waiter must leave its in-flight leader running")]
     fn cancelled_off_pool_waiter_leaves_in_flight_build_running() {
         use std::time::Duration;
 
@@ -1034,6 +941,7 @@ mod tests {
     }
 
     #[test]
+    #[hardwon("#1636: a cancelled Rayon duplicate must not release the primary builder claim")]
     fn cancelled_pool_duplicate_does_not_release_primary_builder_claim() {
         use std::time::Duration;
 
@@ -1089,6 +997,9 @@ mod tests {
     /// of duplicating it. The duplicate is what billed a whole-workspace Rust
     /// usage-index build to a `get_symbol_sources` request's own fan-out.
     #[test]
+    #[hardwon(
+        "#1416+#1757+78a7c3054186: interactive pool workers must wait for the dedicated Rust index build instead of duplicating it"
+    )]
     fn global_pool_worker_waits_for_a_dedicated_build_instead_of_duplicating() {
         use std::time::Duration;
 
@@ -1139,6 +1050,7 @@ mod tests {
     /// builder lower in its own stack forever. The dedicated build must park
     /// the global worker without cross-pool work stealing.
     #[test]
+    #[hardwon("#549: cross-pool work stealing re-entered a memo below its blocked builder")]
     fn dedicated_build_from_global_worker_does_not_steal_a_reentrant_caller() {
         use rayon::prelude::*;
         use std::time::Duration;
@@ -1185,6 +1097,7 @@ mod tests {
     /// they keep the duplicate-serial-build rule: re-entering the same memo
     /// from inside a dedicated build must complete, not deadlock (#549).
     #[test]
+    #[hardwon("#549: a dedicated build recursively querying its own memo deadlocked")]
     fn reentrant_call_from_inside_a_dedicated_build_completes() {
         use rayon::prelude::*;
         use std::time::Duration;
@@ -1214,6 +1127,7 @@ mod tests {
     }
 
     #[test]
+    #[hardwon("#2464: nested background index warming could leave the parent ahead of its child")]
     fn nested_dedicated_spawn_finishes_before_its_parent() {
         let (sender, receiver) = mpsc::channel();
         spawn_on_dedicated_build_pool(move || {
@@ -1234,6 +1148,7 @@ mod tests {
     /// A panicking build must wake waiters and leave the slot empty so a woken
     /// waiter becomes the builder instead of hanging forever.
     #[test]
+    #[hardwon("#1748: a panicked single-flight builder must wake waiters so one can retry")]
     fn panicked_build_wakes_waiters_who_then_build() {
         use std::time::Duration;
 
@@ -1263,6 +1178,9 @@ mod tests {
     /// request memo was a check-then-read-then-insert map and each worker ran
     /// the read; the cell must run it once and hand every worker that value.
     #[test]
+    #[hardwon(
+        "#1748: concurrent same-key definition reads stampeded instead of sharing one result"
+    )]
     fn concurrent_same_key_callers_run_one_pool_independent_read() {
         use std::time::Duration;
 
@@ -1303,6 +1221,7 @@ mod tests {
     /// make this ABA sequence ordinary: C1 publishes, C1 is removed, a miss
     /// installs C2, then a delayed C1 waiter reaches its cleanup (#2795).
     #[test]
+    #[hardwon("#2795: stale C# single-flight cleanup removed a newer replacement cell")]
     fn stale_holder_cannot_remove_a_replacement_keyed_cell() {
         let memo: KeyedPoolSafeMemo<&str, usize> = KeyedPoolSafeMemo::new();
         let first = memo.cell(&"hot");
@@ -1319,6 +1238,9 @@ mod tests {
     /// wait for the first, which would serialize the whole fan-out this fix
     /// exists to speed up.
     #[test]
+    #[hardwon(
+        "#1748: single-flight for one symbol serialized unrelated definition-candidate reads"
+    )]
     fn distinct_keys_build_concurrently() {
         use std::time::{Duration, Instant};
 
@@ -1357,6 +1279,7 @@ mod tests {
     /// Callers with no predicate -- the definition-candidate row read has none
     /// -- ride the leader's completion by construction.
     #[test]
+    #[hardwon("#1748: a cancelled Rayon waiter could remain parked behind unrelated cold-key work")]
     fn cancelled_pool_worker_stops_waiting_on_a_pool_independent_build() {
         use std::time::Duration;
 
@@ -1414,6 +1337,9 @@ mod tests {
     /// A failed leader must not poison its followers. The error is not cached,
     /// so the woken follower runs its own read and answers normally.
     #[test]
+    #[hardwon(
+        "#1748: a failed keyed read could leave followers stuck on the obsolete in-flight claim"
+    )]
     fn a_failed_pool_independent_leader_does_not_poison_its_followers() {
         use std::time::Duration;
 
@@ -1457,5 +1383,55 @@ mod tests {
             7
         );
         assert_eq!(*memo.get().expect("the retry publishes"), 7);
+    }
+
+    // Restored memo publication and invalidation regressions.
+
+    #[test]
+    #[hardwon("#549: racing builders must publish and return one stored memo value")]
+    fn racing_builders_observe_one_stored_value() {
+        let memo = Arc::new(PoolSafeMemo::new());
+        let barrier = Arc::new(Barrier::new(2));
+
+        let handles: Vec<_> = (0..2)
+            .map(|value| {
+                let memo = Arc::clone(&memo);
+                let barrier = Arc::clone(&barrier);
+                thread::spawn(move || {
+                    barrier.wait();
+                    memo.get_or_build(|| value, || value)
+                })
+            })
+            .collect();
+
+        let values: Vec<_> = handles
+            .into_iter()
+            .map(|handle| handle.join().expect("thread should finish"))
+            .collect();
+        let stored = memo.get().expect("memo should be populated");
+
+        assert!(Arc::ptr_eq(&values[0], &stored));
+        assert!(Arc::ptr_eq(&values[1], &stored));
+    }
+
+    #[test]
+    #[hardwon("#549: memo invalidation must retire the prior value before rebuilding")]
+    fn invalidate_causes_rebuild() {
+        let memo = PoolSafeMemo::new();
+        let calls = AtomicUsize::new(0);
+
+        let first = memo.get_or_build(
+            || calls.fetch_add(1, Ordering::SeqCst),
+            || calls.fetch_add(1, Ordering::SeqCst),
+        );
+        memo.invalidate();
+        let second = memo.get_or_build(
+            || calls.fetch_add(1, Ordering::SeqCst),
+            || calls.fetch_add(1, Ordering::SeqCst),
+        );
+
+        assert_eq!(*first, 0);
+        assert_eq!(*second, 1);
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
     }
 }

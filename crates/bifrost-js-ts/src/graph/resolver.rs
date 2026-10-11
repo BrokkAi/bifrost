@@ -1,6 +1,7 @@
 use crate::graph::common::language_for_target_filtered;
 use crate::graph::source::export_index_from_source_facts;
 use crate::imports::resolve_js_ts_module_specifier;
+pub use crate::parse::tree_sitter_language_for;
 use crate::providers::JsTsSource;
 use crate::syntax::{JsTsImportBinder, JsTsLexicalBindingIndex, slice};
 use crate::tsconfig::AliasResolver;
@@ -132,7 +133,7 @@ pub fn build_jsts_usage_index_with_cancellation(
 }
 
 fn is_cancelled(cancellation: Option<&CancellationToken>) -> bool {
-    cancellation.is_some_and(CancellationToken::is_cancelled)
+    brokk_bifrost_core::cancellation::optional_is_cancelled(cancellation)
 }
 
 impl JsTsUsageIndex {
@@ -144,55 +145,26 @@ impl JsTsUsageIndex {
         exported_name: &str,
     ) -> BTreeSet<(ProjectFile, String)> {
         let mut resolved = BTreeSet::new();
-        let mut visited = HashSet::default();
-        let mut frontier: VecDeque<(ProjectFile, String)> = module_files
-            .iter()
-            .cloned()
-            .map(|file| (file, exported_name.to_string()))
-            .collect();
-
-        while let Some((file, name)) = frontier.pop_front() {
-            if !visited.insert((file.clone(), name.clone())) {
-                continue;
-            }
-
-            if let Some(targets) = self
-                .direct_reexport_edges
-                .get(&(file.clone(), name.clone()))
-            {
-                for target in targets {
-                    frontier.push_back(target.clone());
-                }
-                continue;
-            }
-
-            if let Some(exports) = self.exports_by_file.get(&file)
-                && let Some(entry) = exports.exports_by_name.get(&name)
-            {
+        self.visit_reexport_leaves::<()>(
+            module_files,
+            exported_name,
+            |file, _, entry| {
                 match entry {
                     ExportEntry::Local { local_name } => {
-                        resolved.insert((file, local_name.clone()));
+                        resolved.insert((file.clone(), local_name.clone()));
                     }
                     ExportEntry::Default { local_name } => {
                         resolved.insert((
-                            file,
+                            file.clone(),
                             local_name.clone().unwrap_or_else(|| "default".to_string()),
                         ));
                     }
                     ExportEntry::ReexportedNamed { .. } | ExportEntry::ReexportedModule { .. } => {}
                 }
-                continue;
-            }
-
-            // Per ES module semantics, `export * from` does not forward default.
-            if name != "default"
-                && let Some(target_files) = self.direct_star_reexports.get(&file)
-            {
-                for target_file in target_files {
-                    frontier.push_back((target_file.clone(), name.clone()));
-                }
-            }
-        }
+                None
+            },
+            |_, _, _| None,
+        );
 
         resolved
     }
@@ -206,6 +178,32 @@ impl JsTsUsageIndex {
         module_files: &[ProjectFile],
         exported_name: &str,
     ) -> Option<(ProjectFile, String)> {
+        self.visit_reexport_leaves(
+            module_files,
+            exported_name,
+            |file, _, entry| match entry {
+                ExportEntry::ReexportedNamed {
+                    module_specifier, ..
+                } => Some((file.clone(), module_specifier.clone())),
+                // Local/default entries can involve resolved CommonJS module
+                // objects whose edge shape intentionally differs. Without a
+                // recorded direct named re-export, they are not evidence of
+                // an external boundary.
+                ExportEntry::Local { .. }
+                | ExportEntry::Default { .. }
+                | ExportEntry::ReexportedModule { .. } => None,
+            },
+            |file, _, module_specifier| Some((file.clone(), module_specifier.to_string())),
+        )
+    }
+
+    fn visit_reexport_leaves<T>(
+        &self,
+        module_files: &[ProjectFile],
+        exported_name: &str,
+        mut visit_entry: impl FnMut(&ProjectFile, &str, &ExportEntry) -> Option<T>,
+        mut visit_external_star: impl FnMut(&ProjectFile, &str, &str) -> Option<T>,
+    ) -> Option<T> {
         let mut visited = HashSet::default();
         let mut frontier: VecDeque<(ProjectFile, String)> = module_files
             .iter()
@@ -231,21 +229,13 @@ impl JsTsUsageIndex {
                 .get(&file)
                 .and_then(|exports| exports.exports_by_name.get(&name))
             {
-                match entry {
-                    ExportEntry::ReexportedNamed {
-                        module_specifier, ..
-                    } => return Some((file, module_specifier.clone())),
-                    // Local/default entries can involve resolved CommonJS module
-                    // objects whose edge shape intentionally differs. Without a
-                    // recorded direct named re-export, they are not evidence of
-                    // an external boundary.
-                    ExportEntry::Local { .. }
-                    | ExportEntry::Default { .. }
-                    | ExportEntry::ReexportedModule { .. } => {}
+                if let Some(result) = visit_entry(&file, &name, entry) {
+                    return Some(result);
                 }
                 continue;
             }
 
+            // Per ES module semantics, `export * from` does not forward default.
             if name == "default" {
                 continue;
             }
@@ -262,8 +252,9 @@ impl JsTsUsageIndex {
                 .exports_by_file
                 .get(&file)
                 .and_then(|exports| exports.reexport_stars.first())
+                && let Some(result) = visit_external_star(&file, &name, &star.module_specifier)
             {
-                return Some((file, star.module_specifier.clone()));
+                return Some(result);
             }
         }
 
@@ -709,14 +700,6 @@ pub fn collect_jsts_files(
 }
 
 /// The default tree-sitter grammar for a JS/TS language, or `None` for anything else.
-pub fn tree_sitter_language_for(language: Language) -> Option<tree_sitter::Language> {
-    match language {
-        Language::JavaScript => Some(tree_sitter_javascript::LANGUAGE.into()),
-        Language::TypeScript => Some(tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into()),
-        _ => None,
-    }
-}
-
 pub fn target_language(target: &CodeUnit) -> Language {
     language_for_target_filtered(target, |lang| {
         matches!(lang, Language::JavaScript | Language::TypeScript)

@@ -310,11 +310,20 @@ macro_rules! lang_epoch {
 // `resource_release` structural fact, and its implicit close is lowered on
 // both continuations. Warm rows carry neither.
 // Static imports now publish source-owned root demands; reparse old blobs.
+// Salt bumped: Java method callable signatures now publish their declared
+// result type slots. Warm rows with empty result lists cannot project nested
+// source-call results into argument applicability.
+// Salt bumped: Java callable metadata now records whether final, private,
+// static, constructor, and final-owner declarations close method dispatch.
+// Warm rows with no dispatch fact cannot prove those target sets complete.
+// Salt bumped: expression-context simple-name type candidates now publish
+// same-package references through the type/value lookup choice.
+// #4366: underscore patterns are identifier facts; warm rows lack them.
 lang_epoch!(
     Java,
     "java",
     "treesitter/java/",
-    "synthetic-file-scope-code-units-2026-07;no-implicit-constructor-units-2026-07;source-backed-package-modules-2026-07;ast-test-detection-2026-07;callable-arity-metadata-2026-07;annotated-spread-parameter-metadata-2026-07;compact-record-constructors-2026-07;fq-interned-segments-2026-07;field-modifier-metadata-2026-08;static-import-path-kind-2026-08;jvm-query-assets-in-brokk-bifrost-jvm-2026-08;class-like-static-metadata-2026-08;native-callable-modifier-metadata-2026-08;local-anonymous-and-enum-body-owners-2026-08;nested-anonymous-owner-identity-2026-08;enum-constant-body-and-coordinate-local-class-owners-2026-08;same-package-type-identifier-facts-2026-08;native-resolution-visibility-eligibility-2026-09;native-resolution-root-import-anchors-2026-09;declaration-type-parameter-arity-2026-09;coordinated-canonical-source-production-2026-09;structured-package-identity-2026-09;source-owned-declaration-visibility-2026-09;canonical-visibility-storage-2026-09;shared-java-declaration-shapes-2026-09;canonical-java-declaration-types-2026-09;implicit-resource-release-3410;native-static-import-root-demands-2026-09-28;java-array-type-components-2026-09"
+    "synthetic-file-scope-code-units-2026-07;no-implicit-constructor-units-2026-07;source-backed-package-modules-2026-07;ast-test-detection-2026-07;callable-arity-metadata-2026-07;annotated-spread-parameter-metadata-2026-07;compact-record-constructors-2026-07;fq-interned-segments-2026-07;field-modifier-metadata-2026-08;static-import-path-kind-2026-08;jvm-query-assets-in-brokk-bifrost-jvm-2026-08;class-like-static-metadata-2026-08;native-callable-modifier-metadata-2026-08;local-anonymous-and-enum-body-owners-2026-08;nested-anonymous-owner-identity-2026-08;enum-constant-body-and-coordinate-local-class-owners-2026-08;same-package-type-identifier-facts-2026-08;native-resolution-visibility-eligibility-2026-09;native-resolution-root-import-anchors-2026-09;declaration-type-parameter-arity-2026-09;coordinated-canonical-source-production-2026-09;structured-package-identity-2026-09;source-owned-declaration-visibility-2026-09;canonical-visibility-storage-2026-09;shared-java-declaration-shapes-2026-09;canonical-java-declaration-types-2026-09;implicit-resource-release-3410;native-static-import-root-demands-2026-09-28;java-array-type-components-2026-09;annotation-and-class-literal-reference-sites-2026-10;java-callable-result-types-2026-10;java-callable-dispatch-extensibility-2026-10;java-same-package-type-or-value-references-2026-10;java-recovered-missing-identifier-gaps-4290-4364-4391-2026-10-03;java-underscore-pattern-identifiers-4366-2026-10"
 );
 // Package names now use the shared directive AST interpretation. Old text-based
 // names can contain comments or omit annotated declarations; reparse their units.
@@ -357,18 +366,65 @@ lang_epoch!(
 // typed resolution facts and must be rebuilt.
 // Selector callees and references inside function literals now have complete
 // source owners, so warm bundles lack the call and graph identity facts.
+// Named and blank imports plus qualified type syntax now rely on their
+// structured root-import routes; only dot imports leave name inventory open.
+// Warm bundles retain false unsupported-route gaps on imported call/type sites.
+// Function literals now own lexical scopes, named result binders, and ordered
+// return observations; prior facts treated each literal and its returns as
+// inventory-blocking frontiers.
+// Generic indexed callees now retain their terminal call name and receiver in
+// structural facts; warm rows otherwise classify the exact generic call as a
+// field access and cannot project its call relation.
+// Generic applications retain an exact base-name reference while the full
+// application semantics remain an explicit unsupported frontier.
+// Go publishes package references through the shared source-owned helper and
+// scopes placement gaps to package declaration endpoints. Warm parsed facts
+// still contain the fragment-wide gap and must be re-extracted.
 lang_epoch!(
     Go,
     "go",
     "treesitter/go/",
-    "go-canonical-import-path-fqn-2026-06;synthetic-file-scope-code-units-2026-07;raw-package-qualifier-2026-07;fq-interned-segments-2026-07;return-expression-list-value-identity-2026-07;go-query-assets-in-brokk-bifrost-go-2026-08;named-type-underlying-identity-2026-08;native-resolution-root-import-anchors-2026-09;coordinated-canonical-source-production-2026-09;canonical-go-declaration-source-2026-09;empty-interface-map-key-identity-2026-09;go-1-26-new-expression-parse-2026-09;go-constant-string-values-2026-09;go-callable-modifier-metadata-2026-09;native-unnamed-signatures-and-result-arity-2026-09-28;go-container-type-components-2026-09;native-go-selector-assignment-references-2026-09-30;native-go-call-type-conversion-identities-2026-09-30;native-go-if-condition-reference-traversal-2026-09-30;go-universe-call-name-binding-2026-09;native-go-selector-callees-and-reference-owners-2026-09-30"
+    "go-canonical-import-path-fqn-2026-06;synthetic-file-scope-code-units-2026-07;raw-package-qualifier-2026-07;fq-interned-segments-2026-07;return-expression-list-value-identity-2026-07;go-query-assets-in-brokk-bifrost-go-2026-08;named-type-underlying-identity-2026-08;native-resolution-root-import-anchors-2026-09;coordinated-canonical-source-production-2026-09;canonical-go-declaration-source-2026-09;empty-interface-map-key-identity-2026-09;go-1-26-new-expression-parse-2026-09;go-constant-string-values-2026-09;go-callable-modifier-metadata-2026-09;native-unnamed-signatures-and-result-arity-2026-09-28;go-container-type-components-2026-09;native-go-selector-assignment-references-2026-09-30;native-go-call-type-conversion-identities-2026-09-30;native-go-if-condition-reference-traversal-2026-09-30;go-universe-call-name-binding-2026-09;native-go-selector-callees-and-reference-owners-2026-09-30;go-exact-named-qualified-import-routes-2026-10;go-positioned-callee-projections-direct-type-switch-defaults-4284-4285-2026-10-03;go-expression-reference-type-frontiers-2026-10-04;go-function-literal-callable-scopes-2026-10-04;go-statement-binder-reference-frontiers-2026-10-04;go-interface-and-function-types-2026-10-04;go-call-composite-reference-enumeration-frontiers-2026-10-04;go-anonymous-interface-dot-import-switch-reference-routes-2026-10-04;go-indexed-generic-call-structural-names-2026-10;go-generic-navigation-formals-applications-receivers-2026-10-04;go-function-type-parameter-owner-exclusion-2026-10-04;go-type-answer-parity-2026-10-04;go-explicit-generic-type-substitution-2026-10-05;go-generic-application-frontiers-2026-10-05;go-source-membership-digest-2026-10;go-source-owned-package-lookups-and-scoped-placement-gaps-2026-10;go-argument-independent-call-reference-coverage-2026-10"
 );
 
 /// The Go epoch as it stood before the #3455 callable-modifier bump.
 #[cfg(test)]
 pub(super) fn go_epoch_before_callable_modifier_metadata() -> String {
-    let prior = salt_before_bump(Go::SALT, "go-callable-modifier-metadata-2026-09");
+    compute_epoch_before_bump::<Go>(
+        &tree_sitter_go::LANGUAGE.into(),
+        "go-callable-modifier-metadata-2026-09",
+    )
+}
+
+/// The Go epoch immediately before the transient-placement membership digest.
+#[cfg(test)]
+pub(super) fn go_epoch_before_source_membership_digest() -> String {
+    let prior = salt_before_bump(
+        Go::SALT,
+        "go-source-owned-package-lookups-and-scoped-placement-gaps-2026-10",
+    );
+    let prior = salt_before_bump(prior, "go-source-membership-digest-2026-10");
     compute_epoch::<Go>(&tree_sitter_go::LANGUAGE.into(), prior)
+}
+
+/// The Go epoch immediately before source-owned package lookup facts.
+#[cfg(test)]
+pub(super) fn go_epoch_before_source_owned_package_lookups() -> String {
+    let prior = salt_before_bump(
+        Go::SALT,
+        "go-source-owned-package-lookups-and-scoped-placement-gaps-2026-10",
+    );
+    compute_epoch::<Go>(&tree_sitter_go::LANGUAGE.into(), prior)
+}
+
+/// The Go epoch immediately before argument-independent call gaps stopped
+/// contributing to lexical reference coverage.
+#[cfg(test)]
+pub(super) fn go_epoch_before_argument_independent_call_reference_coverage() -> String {
+    compute_epoch_before_bump::<Go>(
+        &tree_sitter_go::LANGUAGE.into(),
+        "go-argument-independent-call-reference-coverage-2026-10",
+    )
 }
 // Salt bumped: out-of-line member definitions whose owner class is named with
 // no namespace segment of its own (`Class::method` under an in-effect `using
@@ -565,30 +621,43 @@ pub(super) fn go_epoch_before_callable_modifier_metadata() -> String {
 // and Module ownership.
 // #3806: quoted native header paths now publish structured include facts.
 // Retire prior rows even if the public node/field fingerprint stays unchanged.
+// Salt bumped again (#3501): when a C or C++ parse ends inside constructs it
+// never closed, tree-sitter returns an ERROR root, and the walk now records
+// every declaration after the outermost open construct as recovered over an
+// interval that runs to the end of the file. A warm row holds no such record,
+// so the SQLite amalgamation's declarations would read as complete parses.
+// Salt bumped again (#3501): such a blob is now persisted with
+// `blob_meta.parse_completeness = 'partial'` (migration 0143). A warm row
+// written before reads back as the column default, 'complete', so the
+// amalgamation would again be reported as a complete parse.
+// Salt bumped again (#4343): C++ base rows now retain their access specifier
+// in the persisted source-facts publication. Warm rows written before the
+// migration have only the `unknown` default, so they must be republished.
+// The ABI 15 transition changes the grammar fingerprint, but the 0.24.2
+// namespace-constructor repair changes parser tables without changing node
+// kinds or fields. Rotate warm rows produced by the 0.24.1 candidate too.
 lang_epoch!(
     Cpp,
     "cpp",
     "treesitter/cpp/",
-    "synthetic-file-scope-code-units-2026-07;recovered-designator-declarations-2026-07;fielded-declarator-routing-2026-07;bare-exported-class-declarators-2026-07;function-like-exported-class-declarators-2026-07;malformed-multiple-base-exported-class-declarators-2026-07;template-alias-declarations-2026-07;structured-return-type-metadata-2026-07;class-owned-alias-identity-2026-07;templated-out-of-line-owner-identity-2026-07;macro-exported-class-field-owner-2026-07;cpp-partial-specialization-ownership-dispatch-2026-07;abstract-parameter-declarator-signatures-2026-07;cpp-template-alias-specialization-dispatch-2026-07;single-base-exported-class-identity-2026-07;callable-linkage-metadata-2026-07;callable-declaration-role-metadata-2026-07;cpp-parameter-type-qualifiers-2026-07;macro-sentinel-region-reparse-2026-07;fragmented-export-class-member-recovery-2026-07;using-directive-owner-namespace-recovery-2026-07;bare-call-global-namespace-lookup-2026-07;nested-class-out-of-line-owner-identity-2026-07;fq-interned-segments-2026-07;recovered-typedef-base-alias-identity-2026-07;inline-classlike-and-macro-prefix-declarations-2026-08;template-parameter-pack-binding-and-qualified-base-initializers-2026-08;recovered-partial-specialization-member-ownership-2026-08;macro-field-terminator-scope-2026-08;complete-sentinel-class-tail-2026-08;sentinel-class-before-member-callable-2026-08;fragmented-class-signature-error-members-2026-08;plain-fragmented-class-constraint-constructor-2026-08;plain-fragmented-class-sibling-ownership-2026-08;fragmented-export-constructor-initializer-2026-08;fragmented-export-constructor-structured-sibling-boundary-2026-08;fragmented-export-sibling-class-parent-scope-2026-08;macro-decorated-template-class-scope-2026-08;conditional-alias-physical-ranges-2026-08;macro-argument-typedef-declarator-2026-08;enum-enumerator-child-ownership-2026-08;sentinel-error-envelope-sibling-recovery-2026-08;cpp-query-assets-in-brokk-bifrost-cpp-2026-08;structural-declarator-qualifier-suffix-and-top-level-parameter-cv-2026-08;macro-fragmented-plain-class-member-signatures-2026-08;namespaced-plain-fragment-boundary-2026-08;templated-plain-fragment-prefix-and-sibling-ownership-2026-08;macro-displaced-scalar-return-callable-name-2026-08;explicit-object-callable-arity-2026-08;structured-callable-parameter-types-2026-08;macro-template-return-free-function-ownership-2026-08;abstract-reference-declarator-identity-2026-08;c-tag-scope-2026-08;c-header-projection-2026-08;temporal-macro-definition-identity-2026-08;nested-include-claims-2026-08;recovered-named-class-member-linkage-2026-09;positional-export-macro-class-names-2026-09;collapsed-namespace-head-scope-2026-09;collapsed-aggregate-definition-ranges-2026-09;lexical-container-partition-2026-09;function-macro-replacement-local-scope-2026-09;canonical-primary-source-ownership-2026-09;canonical-field-activation-and-recovered-context-2026-09;canonical-generated-field-types-and-context-2026-09;canonical-recovered-field-types-and-callable-bodies-2026-09;forward-declared-class-declaration-ranges-2026-09;unterminated-macro-invocation-fields-2026-09;anonymous-aggregate-members-in-both-dialects-2026-09;recovered-namespace-header-ranges-2026-09;unproven-brace-pairing-extents-2026-09;free-function-callee-value-references-2026-09;cpp-callable-modifier-metadata-2026-09;cpp-declared-access-separate-from-linkage-2026-09;cpp-source-member-prototype-units-2026-09;cpp-member-dispatch-extensibility-2026-09;namespace-recovery-ancestry-authority-2026-09;cpp-completed-callable-guard-proof-2771-2026-09-26;raw-quoted-include-header-paths-3806-2026-10"
+    "synthetic-file-scope-code-units-2026-07;recovered-designator-declarations-2026-07;fielded-declarator-routing-2026-07;bare-exported-class-declarators-2026-07;function-like-exported-class-declarators-2026-07;malformed-multiple-base-exported-class-declarators-2026-07;template-alias-declarations-2026-07;structured-return-type-metadata-2026-07;class-owned-alias-identity-2026-07;templated-out-of-line-owner-identity-2026-07;macro-exported-class-field-owner-2026-07;cpp-partial-specialization-ownership-dispatch-2026-07;abstract-parameter-declarator-signatures-2026-07;cpp-template-alias-specialization-dispatch-2026-07;single-base-exported-class-identity-2026-07;callable-linkage-metadata-2026-07;callable-declaration-role-metadata-2026-07;cpp-parameter-type-qualifiers-2026-07;macro-sentinel-region-reparse-2026-07;fragmented-export-class-member-recovery-2026-07;using-directive-owner-namespace-recovery-2026-07;bare-call-global-namespace-lookup-2026-07;nested-class-out-of-line-owner-identity-2026-07;fq-interned-segments-2026-07;recovered-typedef-base-alias-identity-2026-07;inline-classlike-and-macro-prefix-declarations-2026-08;template-parameter-pack-binding-and-qualified-base-initializers-2026-08;recovered-partial-specialization-member-ownership-2026-08;macro-field-terminator-scope-2026-08;complete-sentinel-class-tail-2026-08;sentinel-class-before-member-callable-2026-08;fragmented-class-signature-error-members-2026-08;plain-fragmented-class-constraint-constructor-2026-08;plain-fragmented-class-sibling-ownership-2026-08;fragmented-export-constructor-initializer-2026-08;fragmented-export-constructor-structured-sibling-boundary-2026-08;fragmented-export-sibling-class-parent-scope-2026-08;macro-decorated-template-class-scope-2026-08;conditional-alias-physical-ranges-2026-08;macro-argument-typedef-declarator-2026-08;enum-enumerator-child-ownership-2026-08;sentinel-error-envelope-sibling-recovery-2026-08;cpp-query-assets-in-brokk-bifrost-cpp-2026-08;structural-declarator-qualifier-suffix-and-top-level-parameter-cv-2026-08;macro-fragmented-plain-class-member-signatures-2026-08;namespaced-plain-fragment-boundary-2026-08;templated-plain-fragment-prefix-and-sibling-ownership-2026-08;macro-displaced-scalar-return-callable-name-2026-08;explicit-object-callable-arity-2026-08;structured-callable-parameter-types-2026-08;macro-template-return-free-function-ownership-2026-08;abstract-reference-declarator-identity-2026-08;c-tag-scope-2026-08;c-header-projection-2026-08;temporal-macro-definition-identity-2026-08;nested-include-claims-2026-08;recovered-named-class-member-linkage-2026-09;positional-export-macro-class-names-2026-09;collapsed-namespace-head-scope-2026-09;collapsed-aggregate-definition-ranges-2026-09;lexical-container-partition-2026-09;function-macro-replacement-local-scope-2026-09;canonical-primary-source-ownership-2026-09;canonical-field-activation-and-recovered-context-2026-09;canonical-generated-field-types-and-context-2026-09;canonical-recovered-field-types-and-callable-bodies-2026-09;forward-declared-class-declaration-ranges-2026-09;unterminated-macro-invocation-fields-2026-09;anonymous-aggregate-members-in-both-dialects-2026-09;recovered-namespace-header-ranges-2026-09;unproven-brace-pairing-extents-2026-09;free-function-callee-value-references-2026-09;cpp-callable-modifier-metadata-2026-09;cpp-declared-access-separate-from-linkage-2026-09;cpp-source-member-prototype-units-2026-09;cpp-member-dispatch-extensibility-2026-09;namespace-recovery-ancestry-authority-2026-09;cpp-completed-callable-guard-proof-2771-2026-09-26;raw-quoted-include-header-paths-3806-2026-10;unclosed-construct-recovery-3501-2026-10;unclosed-construct-partial-completeness-3501-2026-10;cpp-recovered-namespace-name-tokens-4292-2026-10-03;cpp-direct-linkage-body-declarations-4414-2026-10-03;c-projection-keeps-tags-nested-in-cpp-classes-4427-2026-10-04;cpp-base-specifier-access-4343-2026-10;brokk-tree-sitter-cpp-0.24.2-abi15-4407-2026-10"
 );
+
+/// The C and C++ epoch before a parse left inside an unclosed construct was
+/// persisted as partial (#3501).
+#[cfg(test)]
+pub(super) fn cpp_epoch_before_partial_parse_completeness() -> String {
+    let prior = salt_before_bump(
+        Cpp::SALT,
+        "unclosed-construct-partial-completeness-3501-2026-10",
+    );
+    compute_epoch::<Cpp>(&tree_sitter_cpp::LANGUAGE.into(), prior)
+}
 
 /// The C and C++ epoch before native quoted header paths were parsed correctly.
 #[cfg(test)]
 pub(super) fn cpp_epoch_before_raw_quoted_include_header_paths() -> String {
     let prior = salt_before_bump(Cpp::SALT, "raw-quoted-include-header-paths-3806-2026-10");
-    compute_epoch::<Cpp>(&tree_sitter_cpp::LANGUAGE.into(), prior)
-}
-
-/// The C and C++ epoch as it stood before the #3508 source member-prototype bump.
-#[cfg(test)]
-pub(super) fn cpp_epoch_before_source_member_prototype_units() -> String {
-    let prior = salt_before_bump(Cpp::SALT, "cpp-source-member-prototype-units-2026-09");
-    compute_epoch::<Cpp>(&tree_sitter_cpp::LANGUAGE.into(), prior)
-}
-
-#[cfg(test)]
-pub(super) fn cpp_epoch_before_namespace_recovery_ancestry_authority() -> String {
-    let prior = salt_before_bump(Cpp::SALT, "namespace-recovery-ancestry-authority-2026-09");
     compute_epoch::<Cpp>(&tree_sitter_cpp::LANGUAGE.into(), prior)
 }
 
@@ -623,35 +692,37 @@ pub(super) fn salt_before_bump<'a>(salt: &'a str, bump: &str) -> &'a str {
     &salt[..start - 1]
 }
 
-/// The C and C++ epoch as it stood before the #3493 callable-modifier bump.
 #[cfg(test)]
-pub(super) fn cpp_epoch_before_callable_modifier_metadata() -> String {
-    let prior = salt_before_bump(Cpp::SALT, "cpp-callable-modifier-metadata-2026-09");
-    compute_epoch::<Cpp>(&tree_sitter_cpp::LANGUAGE.into(), prior)
+pub(super) enum TestEpochLanguage {
+    Cpp,
+    JavaScript,
+    TypeScript,
+    Kotlin,
 }
 
 #[cfg(test)]
-pub(super) fn cpp_epoch_before_nested_include_claims() -> String {
-    let prior = salt_before_bump(Cpp::SALT, "nested-include-claims-2026-08");
-    compute_epoch::<Cpp>(&tree_sitter_cpp::LANGUAGE.into(), prior)
+pub(super) fn epoch_before_bump(language: TestEpochLanguage, bump: &str) -> String {
+    match language {
+        TestEpochLanguage::Cpp => {
+            compute_epoch_before_bump::<Cpp>(&tree_sitter_cpp::LANGUAGE.into(), bump)
+        }
+        TestEpochLanguage::JavaScript => {
+            compute_epoch_before_bump::<JavaScript>(&tree_sitter_javascript::LANGUAGE.into(), bump)
+        }
+        TestEpochLanguage::TypeScript => compute_epoch_before_bump::<TypeScript>(
+            &tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
+            bump,
+        ),
+        TestEpochLanguage::Kotlin => compute_epoch_before_bump::<Kotlin>(
+            &crate::analyzer::kotlin::language::LANGUAGE.into(),
+            bump,
+        ),
+    }
 }
 
 #[cfg(test)]
-pub(super) fn cpp_epoch_before_c_header_projection() -> String {
-    let prior = salt_before_bump(Cpp::SALT, "c-header-projection-2026-08");
-    compute_epoch::<Cpp>(&tree_sitter_cpp::LANGUAGE.into(), prior)
-}
-
-#[cfg(test)]
-pub(super) fn cpp_epoch_before_c_tag_scope() -> String {
-    let prior = salt_before_bump(Cpp::SALT, "c-tag-scope-2026-08");
-    compute_epoch::<Cpp>(&tree_sitter_cpp::LANGUAGE.into(), prior)
-}
-
-#[cfg(test)]
-pub(super) fn cpp_epoch_before_abstract_reference_declarator_identity() -> String {
-    let prior = salt_before_bump(Cpp::SALT, "abstract-reference-declarator-identity-2026-08");
-    compute_epoch::<Cpp>(&tree_sitter_cpp::LANGUAGE.into(), prior)
+fn compute_epoch_before_bump<L: LanguageEpoch>(ts_language: &TsLanguage, bump: &str) -> String {
+    compute_epoch::<L>(ts_language, salt_before_bump(L::SALT, bump))
 }
 
 #[cfg(test)]
@@ -664,111 +735,33 @@ pub(super) fn cpp_epoch_before_macro_template_return_free_function_ownership() -
 }
 
 #[cfg(test)]
-pub(super) fn cpp_epoch_before_structured_callable_parameter_types() -> String {
-    let prior = salt_before_bump(Cpp::SALT, "structured-callable-parameter-types-2026-08");
-    compute_epoch::<Cpp>(&tree_sitter_cpp::LANGUAGE.into(), prior)
-}
-
-#[cfg(test)]
-pub(super) fn cpp_epoch_before_explicit_object_callable_arity() -> String {
-    let prior = salt_before_bump(Cpp::SALT, "explicit-object-callable-arity-2026-08");
-    compute_epoch::<Cpp>(&tree_sitter_cpp::LANGUAGE.into(), prior)
-}
-
-#[cfg(test)]
-pub(super) fn cpp_epoch_before_macro_displaced_callable_name() -> String {
-    let prior = salt_before_bump(
-        Cpp::SALT,
-        "macro-displaced-scalar-return-callable-name-2026-08",
-    );
-    compute_epoch::<Cpp>(&tree_sitter_cpp::LANGUAGE.into(), prior)
-}
-
-#[cfg(test)]
-pub(super) fn cpp_epoch_before_templated_plain_fragment_ownership() -> String {
-    let prior = salt_before_bump(
-        Cpp::SALT,
-        "templated-plain-fragment-prefix-and-sibling-ownership-2026-08",
-    );
-    compute_epoch::<Cpp>(&tree_sitter_cpp::LANGUAGE.into(), prior)
-}
-
-#[cfg(test)]
-pub(super) fn cpp_epoch_before_namespaced_plain_fragment_boundary() -> String {
-    let prior = salt_before_bump(Cpp::SALT, "namespaced-plain-fragment-boundary-2026-08");
-    compute_epoch::<Cpp>(&tree_sitter_cpp::LANGUAGE.into(), prior)
-}
-
-#[cfg(test)]
-pub(super) fn cpp_epoch_before_sentinel_class_before_member_callable() -> String {
-    let prior = salt_before_bump(Cpp::SALT, "sentinel-class-before-member-callable-2026-08");
-    compute_epoch::<Cpp>(&tree_sitter_cpp::LANGUAGE.into(), prior)
-}
-
-#[cfg(test)]
-pub(super) fn cpp_epoch_before_plain_fragmented_class_sibling_ownership() -> String {
-    let prior = salt_before_bump(
-        Cpp::SALT,
-        "plain-fragmented-class-sibling-ownership-2026-08",
-    );
-    compute_epoch::<Cpp>(&tree_sitter_cpp::LANGUAGE.into(), prior)
-}
-
-#[cfg(test)]
-pub(super) fn cpp_epoch_before_fragmented_export_sibling_class_parent_scope() -> String {
-    let prior = salt_before_bump(
-        Cpp::SALT,
-        "fragmented-export-sibling-class-parent-scope-2026-08",
-    );
-    compute_epoch::<Cpp>(&tree_sitter_cpp::LANGUAGE.into(), prior)
-}
-
-#[cfg(test)]
-pub(super) fn cpp_epoch_before_macro_decorated_template_class_scope() -> String {
-    let prior = salt_before_bump(Cpp::SALT, "macro-decorated-template-class-scope-2026-08");
-    compute_epoch::<Cpp>(&tree_sitter_cpp::LANGUAGE.into(), prior)
-}
-
-#[cfg(test)]
-pub(super) fn cpp_epoch_before_recovered_typedef_base() -> String {
-    let prior = salt_before_bump(Cpp::SALT, "recovered-typedef-base-alias-identity-2026-07");
-    compute_epoch::<Cpp>(&tree_sitter_cpp::LANGUAGE.into(), prior)
-}
-
-#[cfg(test)]
-pub(super) fn cpp_epoch_before_complete_sentinel_class_tail() -> String {
-    let prior = salt_before_bump(Cpp::SALT, "complete-sentinel-class-tail-2026-08");
-    compute_epoch::<Cpp>(&tree_sitter_cpp::LANGUAGE.into(), prior)
-}
-
-#[cfg(test)]
-pub(super) fn cpp_epoch_before_conditional_alias_physical_ranges() -> String {
-    let prior = salt_before_bump(Cpp::SALT, "conditional-alias-physical-ranges-2026-08");
-    compute_epoch::<Cpp>(&tree_sitter_cpp::LANGUAGE.into(), prior)
-}
-
-#[cfg(test)]
-pub(super) fn cpp_epoch_before_macro_argument_typedef_declarator() -> String {
-    let prior = salt_before_bump(Cpp::SALT, "macro-argument-typedef-declarator-2026-08");
-    compute_epoch::<Cpp>(&tree_sitter_cpp::LANGUAGE.into(), prior)
-}
-
-#[cfg(test)]
 pub(super) fn kotlin_epoch_before_type_alias_type_identity() -> String {
-    let prior = salt_before_bump(Kotlin::SALT, "kotlin-type-alias-type-identity-2026-09");
-    compute_epoch::<Kotlin>(&crate::analyzer::kotlin::language::LANGUAGE.into(), prior)
+    compute_epoch_before_bump::<Kotlin>(
+        &crate::analyzer::kotlin::language::LANGUAGE.into(),
+        "kotlin-type-alias-type-identity-2026-09",
+    )
 }
 
-/// The Kotlin epoch as it stood before the #3453 callable-modifier bump.
 #[cfg(test)]
-pub(super) fn kotlin_epoch_before_callable_modifier_metadata() -> String {
-    let prior = salt_before_bump(Kotlin::SALT, "kotlin-callable-modifier-metadata-2026-09");
+pub(super) fn kotlin_epoch_before_call_navigation_receiver_facts() -> String {
+    let prior = salt_before_bump(
+        Kotlin::SALT,
+        "kotlin-call-navigation-receiver-facts-2026-10",
+    );
     compute_epoch::<Kotlin>(&crate::analyzer::kotlin::language::LANGUAGE.into(), prior)
 }
 
 #[cfg(test)]
 pub(super) fn scala_epoch_before_type_alias_type_identity() -> String {
-    let prior = salt_before_bump(Scala::SALT, "scala-type-alias-type-identity-2026-09");
+    compute_epoch_before_bump::<Scala>(
+        &crate::analyzer::scala::language::LANGUAGE.into(),
+        "scala-type-alias-type-identity-2026-09",
+    )
+}
+
+#[cfg(test)]
+pub(super) fn scala_epoch_before_native_root_route_facts() -> String {
+    let prior = salt_before_bump(Scala::SALT, "scala-native-root-route-facts-2026-10");
     compute_epoch::<Scala>(&crate::analyzer::scala::language::LANGUAGE.into(), prior)
 }
 
@@ -806,6 +799,13 @@ mod query_content_tests {
         );
     }
 }
+// The JavaScript salt includes the 0.25.3 JavaScript-grammar ampersand repair
+// (#4409): `.js` files with JSX parse with that grammar, and the repair adds no
+// node kind or field, so the grammar fingerprint cannot detect it.
+// Both language salts include the 0.23.5 TSX ampersand repair. The epoch is
+// memoized per language, so its first plain-JS/TS grammar fingerprint cannot
+// detect a TSX-only parser change. Rotate both languages to retire old .jsx
+// and .tsx rows parsed through ERROR recovery, including trailing-quote cases.
 // JS/TS salts bumped: anonymous `export default` expressions/declarations now
 // emit a synthetic `default` code unit, changing each file's persisted unit set.
 // JS salt bumped again (#1167): a `<ns>.object({...})` schema-builder call
@@ -867,27 +867,16 @@ mod query_content_tests {
 // stored value from the target and operand values, and a template string or
 // substitution now derives its value from its substituted expressions.
 // Persisted value-flow rows written before carry an isolated result for both.
+// #4385: JS/TS structural facts gain decoded literals, constructor call kinds,
+// function binders, object-method properties and positions; warm rows lack them.
+// #3843: generic import rows now include source-bearing re-exports. Old
+// JS/TS blobs omit these direct dependencies and must be republished.
 lang_epoch!(
     JavaScript,
     "javascript",
     "treesitter/javascript/",
-    "synthetic-file-scope-code-units-2026-07;anonymous-default-export-units-2026-07;fq-interned-segments-2026-07;js-ts-drift-parity-2026-07;js-ts-query-assets-in-brokk-bifrost-js-ts-2026-08;structured-class-field-properties-2026-08;ts-overload-declaration-only-metadata-2026-08;program-scope-plain-value-identities-2026-08;js-ts-callable-modifier-metadata-2026-08;js-private-name-assignment-is-not-a-declaration-2026-08;structured-rule-tester-test-detection-2026-08;structured-js-ts-test-classification-2026-08;canonical-primary-source-ownership-2026-09;js-nested-object-literal-property-indexing-2026-09;jsx-dialect-parsed-with-tsx-grammar-2026-09;js-grammar-reserved-word-jsx-names-2026-09;js-ts-augmented-template-operand-flows-3386;js-primary-walk-alias-and-local-object-metadata-2771-2026-09-26"
+    "synthetic-file-scope-code-units-2026-07;anonymous-default-export-units-2026-07;fq-interned-segments-2026-07;js-ts-drift-parity-2026-07;js-ts-query-assets-in-brokk-bifrost-js-ts-2026-08;structured-class-field-properties-2026-08;ts-overload-declaration-only-metadata-2026-08;program-scope-plain-value-identities-2026-08;js-ts-callable-modifier-metadata-2026-08;js-private-name-assignment-is-not-a-declaration-2026-08;structured-rule-tester-test-detection-2026-08;structured-js-ts-test-classification-2026-08;canonical-primary-source-ownership-2026-09;js-nested-object-literal-property-indexing-2026-09;jsx-dialect-parsed-with-tsx-grammar-2026-09;js-grammar-reserved-word-jsx-names-2026-09;js-ts-augmented-template-operand-flows-3386;js-primary-walk-alias-and-local-object-metadata-2771-2026-09-26;tsx-literal-ampersands-0.23.5;js-ts-codeql-parity-facts-4385-2026-10;js-ts-source-bearing-reexport-file-dependencies-3843-2026-10;js-jsx-literal-ampersands-0.25.3-4409"
 );
-
-#[cfg(test)]
-pub(super) fn javascript_epoch_before_structured_test_classification() -> String {
-    let prior = salt_before_bump(
-        JavaScript::SALT,
-        "structured-js-ts-test-classification-2026-08",
-    );
-    compute_epoch::<JavaScript>(&tree_sitter_javascript::LANGUAGE.into(), prior)
-}
-
-#[cfg(test)]
-pub(super) fn javascript_epoch_before_callable_modifier_metadata() -> String {
-    let prior = salt_before_bump(JavaScript::SALT, "js-ts-callable-modifier-metadata-2026-08");
-    compute_epoch::<JavaScript>(&tree_sitter_javascript::LANGUAGE.into(), prior)
-}
 
 #[cfg(test)]
 pub(super) fn javascript_epoch_before_private_name_assignment_declarations() -> String {
@@ -935,39 +924,24 @@ pub(super) fn javascript_epoch_before_private_name_assignment_declarations() -> 
 // These precedence and external-scanner changes can alter declaration ranges
 // without changing the grammar's node-kind or field inventory, so the live
 // grammar fingerprint alone cannot retire rows parsed through ERROR recovery.
+// Salt bumped again (#3502 reopened): array and indexed-access import types
+// now retain complete declarations instead of publishing ranges from MISSING
+// recovery. Both TypeScript and TSX storage identities must retire old rows.
 lang_epoch!(
     TypeScript,
     "typescript",
     "treesitter/typescript/",
-    "synthetic-file-scope-code-units-2026-07;anonymous-default-export-units-2026-07;fq-interned-segments-2026-07;js-ts-drift-parity-2026-07;js-ts-query-assets-in-brokk-bifrost-js-ts-2026-08;ts-overload-declaration-only-metadata-2026-08;program-scope-plain-value-identities-2026-08;ts-inline-return-type-members-2026-08;js-ts-callable-modifier-metadata-2026-08;structured-rule-tester-test-detection-2026-08;structured-js-ts-test-classification-2026-08;ts-type-alias-type-identity-2026-09;canonical-primary-source-ownership-2026-09;js-ts-augmented-template-operand-flows-3386;ts-grammar-declaration-correctness-3502"
+    "synthetic-file-scope-code-units-2026-07;anonymous-default-export-units-2026-07;fq-interned-segments-2026-07;js-ts-drift-parity-2026-07;js-ts-query-assets-in-brokk-bifrost-js-ts-2026-08;ts-overload-declaration-only-metadata-2026-08;program-scope-plain-value-identities-2026-08;ts-inline-return-type-members-2026-08;js-ts-callable-modifier-metadata-2026-08;structured-rule-tester-test-detection-2026-08;structured-js-ts-test-classification-2026-08;ts-type-alias-type-identity-2026-09;canonical-primary-source-ownership-2026-09;js-ts-augmented-template-operand-flows-3386;ts-grammar-declaration-correctness-3502;ts-import-type-compositions-3502;tsx-literal-ampersands-0.23.5;js-ts-codeql-parity-facts-4385-2026-10;js-ts-source-bearing-reexport-file-dependencies-3843-2026-10"
 );
 
 #[cfg(test)]
 pub(super) fn typescript_epoch_before_type_alias_type_identity() -> String {
-    let prior = salt_before_bump(TypeScript::SALT, "ts-type-alias-type-identity-2026-09");
-    compute_epoch::<TypeScript>(&tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(), prior)
+    compute_epoch_before_bump::<TypeScript>(
+        &tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
+        "ts-type-alias-type-identity-2026-09",
+    )
 }
 
-#[cfg(test)]
-pub(super) fn typescript_epoch_before_structured_test_classification() -> String {
-    let prior = salt_before_bump(
-        TypeScript::SALT,
-        "structured-js-ts-test-classification-2026-08",
-    );
-    compute_epoch::<TypeScript>(&tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(), prior)
-}
-
-#[cfg(test)]
-pub(super) fn typescript_epoch_before_inline_return_type_members() -> String {
-    let prior = salt_before_bump(TypeScript::SALT, "ts-inline-return-type-members-2026-08");
-    compute_epoch::<TypeScript>(&tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(), prior)
-}
-
-#[cfg(test)]
-pub(super) fn typescript_epoch_before_callable_modifier_metadata() -> String {
-    let prior = salt_before_bump(TypeScript::SALT, "js-ts-callable-modifier-metadata-2026-08");
-    compute_epoch::<TypeScript>(&tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(), prior)
-}
 // Salt bumped (#1548 stage 3 fleet): the Python `.scm` query assets moved from
 // this crate's `resources/treesitter/python/` into `brokk-bifrost-python`, so
 // the salted content now comes from a different crate's `include_str!`. The
@@ -1010,18 +984,26 @@ pub(super) fn typescript_epoch_before_callable_modifier_metadata() -> String {
 // summary stays inert on a warm workspace with no error raised anywhere. The
 // same gap was bumped for JavaScript and TypeScript (#2597) and for PHP and
 // Ruby (#2912).
+// Salts bumped (#4323, #4332, #4455): Python callable signature metadata
+// retains multiline headers, AST-derived parameter identity spans after
+// header normalization, and positional arity.
+// The origin merge combines those facts with origin's decoded literal and
+// string/list structural facts; invalidate workspaces that persisted either
+// side's pre-merge fact set. #3851 adds normalized Python await facts.
 lang_epoch!(
     Python,
     "python",
     "treesitter/python/",
-    "synthetic-file-scope-code-units-2026-07;structured-python-import-paths-2026-07;fq-interned-segments-2026-07;python-query-assets-in-brokk-bifrost-python-2026-08;python-setuptools-import-roots-2026-08;python-class-rebinding-navigation-ranges-2026-08;python-setup-py-import-roots-2026-09;coordinated-python-source-production-2026-09;canonical-python-declaration-annotations-2026-09;python-source-only-callable-annotations-2026-09;python-subscripted-and-unnameable-bases-2026-09;python-bracketed-unpacking-self-attributes-2026-09;python-chained-assignment-targets-2026-09;python-class-qualified-call-binding-2026-09;python-type-flow-builtin-class-identities-2026-09;python-type-flow-unmodeled-guards-2026-09;python-scoped-dynamic-writes-3129;python-declared-diverging-calls-3135;python-structured-refinement-targets-3196;canonical-python-generic-return-owner-2026-09;python-implicit-resource-release-3410;python-augmented-string-operand-flows-3386;python-callable-modifier-metadata-2026-09;python-replacement-owned-metadata-links-2771-2026-09-26"
+    "synthetic-file-scope-code-units-2026-07;structured-python-import-paths-2026-07;fq-interned-segments-2026-07;python-query-assets-in-brokk-bifrost-python-2026-08;python-setuptools-import-roots-2026-08;python-class-rebinding-navigation-ranges-2026-08;python-setup-py-import-roots-2026-09;coordinated-python-source-production-2026-09;canonical-python-declaration-annotations-2026-09;python-source-only-callable-annotations-2026-09;python-subscripted-and-unnameable-bases-2026-09;python-bracketed-unpacking-self-attributes-2026-09;python-chained-assignment-targets-2026-09;python-class-qualified-call-binding-2026-09;python-type-flow-builtin-class-identities-2026-09;python-type-flow-unmodeled-guards-2026-09;python-scoped-dynamic-writes-3129;python-declared-diverging-calls-3135;python-structured-refinement-targets-3196;canonical-python-generic-return-owner-2026-09;python-implicit-resource-release-3410;python-augmented-string-operand-flows-3386;python-callable-modifier-metadata-2026-09;python-replacement-owned-metadata-links-2771-2026-09-26;python-await-structural-kind-3851-2026-10;python-explicit-export-precedence-and-constructor-attribution-3390-4416-4417-2026-10-03;python-binding-parameter-roles-4323-2026-10;python-comparison-binary-structural-facts-4334-2026-10-03;python-structural-literal-collection-facts-2026-10;python-direct-assignment-shapes-2026-10;python-integer-literal-bounded-values-2026-10;python-decoded-duplicate-dictionary-keys-4335-2026-10;python-callable-arity-4332-2026-10-03;python-decoded-string-values-and-list-literals-4342-2026-10;python-origin-merge-facts-2026-10-04;python-crlf-formal-offsets-2026-10-04;python-regex-zero-width-ranges-4454-2026-10;python-empty-regex-sequence-ranges-2026-10-04;python-node-derived-parameter-offsets-4455-2026-10-04;python-exact-factory-and-access-results-4321-2026-10-06;python-exact-call-result-class-flow-4321-2026-10-06;python-codeql-regex-facts-4650-2026-10"
 );
 
 /// The Python epoch as it stood before the #3451 callable-modifier bump.
 #[cfg(test)]
 pub(super) fn python_epoch_before_callable_modifier_metadata() -> String {
-    let prior = salt_before_bump(Python::SALT, "python-callable-modifier-metadata-2026-09");
-    compute_epoch::<Python>(&tree_sitter_python::LANGUAGE.into(), prior)
+    compute_epoch_before_bump::<Python>(
+        &tree_sitter_python::LANGUAGE.into(),
+        "python-callable-modifier-metadata-2026-09",
+    )
 }
 // Salt bumped (#1548 stage 3 fleet): the Rust `.scm` query assets moved from
 // this crate's `resources/treesitter/rust/` into `brokk-bifrost-rust`, so the
@@ -1039,8 +1021,7 @@ pub(super) fn python_epoch_before_callable_modifier_metadata() -> String {
 // resolved as a bare module name carry the phantom owner package (`impls.m`)
 // for every member of such an impl, so a warm workspace would answer the alias
 // spelling and never the real owner (`model.Writer.act`).
-// Rust salt bumped again (Phase 2 of
-// `.agents/plans/port-optimization-arc-to-upstream.md`): the Rust walk now
+// Rust salt bumped again: the Rust walk now
 // records per-file usage facts (`rust_exports`, `rust_import_targets`,
 // `rust_modules`, `rust_identifier_occurrences`) and per-file Cargo module
 // routes (`rust_module_scopes`, `rust_module_routes`,
@@ -1316,18 +1297,64 @@ pub(super) fn python_epoch_before_callable_modifier_metadata() -> String {
 // macros; only a selected workspace transcriber can establish pattern roles.
 // Salt bumped (#3746): lower the unindexed `matches!` pattern operand as a
 // refutable pattern so enum variants and fallback binders keep their roles.
+// #3851: Rust structural facts publish async callable modifiers and await
+// expressions; rebuild rows produced before those AST-backed facts existed.
+// Salt bumped (#3828): Rust generic type aliases publish relational formal,
+// target-expression, and ordered type-application argument facts.
+// Salt bumped (#3828): qualified macro references retain their source-owned
+// crate-root route, so old interiors must be republished for macro discovery.
+// Salt bumped (#4389): reference and pointer alias transfers use the written
+// pointee identity and preserve its structured qualifier deltas.
+// Salt bumped again: a non-generic alias such as `type Alias = Box<Item>`
+// transfers its applied written identity again instead of the nominal head,
+// so Deref payloads behind the alias resolve; only generic aliases transfer
+// the nominal head.
+// Salt bumped (#4314): Rust call structural facts now publish the written
+// generic type arguments of callable and scoped turbofish paths.
+// Salt bumped (#4450): malformed cooked and raw string literals can retain
+// structural facts with no value instead of aborting source-fact collection.
+// Salt bumped (#4448): omit empty recovered inner-attribute names and retain
+// source visibility per declaration when signature metadata is deduplicated.
+// Salt bumped (#4451): cfg alternatives that share a CodeUnit and signature
+// retain separate metadata rows when their source visibility differs.
+// Salt bumped (#4457): numeric tuple selectors split from one macro-input token
+// remain internal references without claiming separate host token occurrences.
+// Salt bumped (#3828): named gap candidates survive nameless Call and
+// FieldAccess wrappers instead of persisting an unnecessary wildcard.
+// The 0.24.4 grammar accepts attributes on struct-pattern fields without
+// changing its node/field names or ABI. Retire interiors parsed under 0.24.3;
+// the public grammar fingerprint alone cannot distinguish that parser change.
+// Salt bumped (#4310): qualified macro call facts now expose the structured
+// root path as receiver evidence for precise RQL selection.
+// Salt bumped (#4460): Rust module-self routes and generated attribute
+// surfaces change the persisted route and binding facts.
+// Salt bumped (#4626): selected macro type and path fragments lower from the
+// fragment type, not the synthetic alias declaration used to parse them.
+// Salt bumped: macro identifier roles reparse repetition bodies in an impl
+// context so value-side `self` inputs are not published as type fragments.
+// Salt bumped: macro fragment recovery now keeps lifetime and path bindings in
+// their written roles, and a keyword `ident` capture such as `self` or `crate`
+// no longer takes a type or value role, changing persisted Rust resolution facts.
+// Salt bumped (#4458): effective `cfg_attr` payloads now classify item
+// boundaries and derive facts, changing persisted Rust resolution facts.
+// Salt bumped (#4458): reference impl receivers keep their reference layers
+// while member lookup uses the nominal target owner.
+// Salt bumped (#4458): item-level derive-helper names now retain conditional
+// binding gaps for the crate-level absence proof.
 lang_epoch!(
     Rust,
     "rust",
     "treesitter/rust/",
-    "synthetic-file-scope-code-units-2026-07;embedded-macro-rules-code-units-2026-07;ast-test-detection-2026-07;canonical-impl-owner-identities-2026-07;macro-invocation-item-reparse-2026-07;proven-macro-definition-replay-2026-07;per-declaration-test-taint-2026-07;raw-identifier-normalization-2026-07;inline-module-const-static-type-items-2026-07;fq-interned-segments-2026-07;structural-macro-invocation-arguments-2026-08;structural-attributes-and-fields-2026-08;anchored-fq-encoding-2026-08;crate-aware-packages-2026-08;rust-query-assets-in-brokk-bifrost-rust-2026-08;renamed-import-impl-owner-route-2026-08;per-file-usage-facts-2026-08;cargo-route-facts-2026-08;include-edge-facts-2026-08;import-cfg-and-extern-crate-2026-08;enum-variant-named-fields-2026-08;callable-parameter-type-spellings-2026-08;raw-identifier-cargo-module-routes-2026-08;bounded-declaration-labels-2026-08;nested-and-extern-crate-import-facts-2026-08;declaration-type-parameter-arity-2026-09;rust-type-alias-type-identity-2026-09;unnamed-rust-import-binding-facts-2026-09;source-external-module-signatures-2026-09;proc-macro-kind-and-macro-use-extern-facts-2026-09;module-cfg-and-exported-macro-facts-2026-09;native-resolution-first-tranche-2026-09;native-resolution-root-route-halves-2026-09;native-resolution-cfg-fail-closed-2026-09;native-resolution-root-glob-demands-2026-09;native-resolution-type-references-2026-09;native-resolution-item-macros-2026-09;native-resolution-definition-unit-crosswalks-2026-09;native-resolution-point-gap-authority-2026-09;native-resolution-proc-macro-member-boundaries-2026-09;native-resolution-const-static-values-2026-09;native-resolution-extern-crate-routes-2026-09;native-resolution-local-pattern-scopes-2026-09;native-resolution-direct-let-condition-scopes-2026-09;native-resolution-or-pattern-binders-2026-09;native-resolution-foreign-functions-2026-09;native-resolution-union-types-2026-09;native-resolution-unprojectable-item-boundaries-2026-09;native-resolution-bare-condition-assignment-references-2026-09;native-resolution-struct-value-constructors-2026-09;native-resolution-generic-item-interiors-2026-09;native-resolution-const-generic-boundaries-2026-09;native-resolution-declared-rule-authority-2026-09;native-resolution-qualified-reference-boundaries-2026-09;native-resolution-item-macro-surface-boundaries-2026-09;native-resolution-cfg-route-placement-boundaries-2026-09;native-resolution-exact-reference-enumeration-gaps-2026-09;native-resolution-builtin-test-attribute-2026-09;cargo-manifest-default-target-inventory-2026-09;native-resolution-module-cycle-guard-2026-09;native-resolution-include-cycle-guard-2026-09;native-resolution-inline-module-ancestry-2026-09;native-resolution-inline-visibility-and-parent-cfg-2026-09;native-resolution-inline-include-scope-2026-09;native-resolution-inline-module-root-bridge-2026-09;native-resolution-inline-import-scope-2026-09;native-resolution-let-chain-scopes-2026-09;native-resolution-leading-absolute-imports-2026-09;native-resolution-positioned-call-callees-2026-09;native-resolution-member-scope-gaps-2026-09|native-resolution-root-references-2026-09;native-resolution-inherent-callable-bodies-2026-09;canonical-source-facts-2026-09;structured-extern-crate-import-form-2026-09;canonical-import-source-occurrences-2026-09;canonical-import-module-segments-2026-09;canonical-generic-import-spans-2026-09;canonical-import-properties-2026-09;canonical-rust-import-contexts-2026-09;canonical-embedded-declaration-identities-2026-09;canonical-rust-declaration-properties-2026-09;canonical-rust-declaration-classification-2026-09;canonical-rust-declaration-boundaries-2026-09;canonical-primary-module-properties-2026-09;shared-secondary-module-properties-2026-09;canonical-module-source-links-2026-09;ast-signature-header-boundaries-2026-09;source-owned-impl-type-construction-2026-09;shared-embedded-source-occurrences-2026-09;ast-parameter-label-spans-2026-09;primary-item-source-inventory-2026-09;secondary-item-source-inventory-2026-09;embedded-import-source-contexts-2026-09;normalized-item-syntax-2026-09;canonical-item-type-source-publication-2026-09;canonical-recovered-tree-root-contexts-2026-09;canonical-macro-source-position-2026-09;canonical-declaration-annotations-2026-09;canonical-generic-type-contexts-2026-09;canonical-macro-definition-patterns-2026-09;canonical-trait-type-forms-2026-09;canonical-macro-contexts-2026-09;canonical-native-declaration-bridge-publication-2026-09;native-resolution-reference-indirection-provenance-2026-09;native-resolution-let-initialization-2026-09;native-resolution-exact-import-demand-targets-2026-09;native-resolution-generic-argument-type-syntax-2026-09;native-resolution-wrapper-payload-projection-and-unwraps-2026-09;native-resolution-block-local-cfg-route-binders-2026-09;native-resolution-path-prefix-and-field-chain-occurrences-2026-09;native-resolution-qualified-type-projection-references-2026-09;native-resolution-detached-crate-module-trees-2026-09;native-resolution-enum-variant-members-2026-09;canonical-local-field-source-projections-2026-09;native-resolution-qualified-value-projections-2026-09;native-resolution-producer-reference-enumeration-b3-2026-09;native-resolution-census-ch-lexical-import-bindings-2026-09;native-resolution-selected-cfg-activation-2026-09;native-resolution-scoped-single-name-imports-and-serde-helpers-2026-09;native-resolution-trait-impl-bodies-ty-a-2026-09;native-resolution-type-alias-frontiers-ty-b-2026-09;native-resolution-associated-types-ty-c-2026-09;native-resolution-trait-bound-receivers-ty-d-2026-09-r2;native-resolution-macro-matcher-replay-mc-a-2026-09;native-resolution-macro-routes-mc-canonical-inputs-2026-09;native-resolution-include-splice-scopes-and-macros-mc-b-2026-09;transfer-owned-type-identity-observations-2026-09-13;native-resolution-enum-constructor-members-2026-09;native-resolution-terminal-prefix-qualifiers-ec-2026-09;native-resolution-enum-runtime-receivers-ec-2026-09;native-resolution-expression-name-focus-ec-2026-09;native-resolution-explicit-module-anchor-preservation-ec-2026-09;native-resolution-macro-callee-prefix-preservation-ec-2026-09;native-resolution-compound-member-receiver-enumeration-2026-09-13;native-resolution-initializer-field-reference-enumeration-2026-09-13;native-resolution-pattern-path-and-field-enumeration-2026-09-13;native-resolution-compound-type-operand-enumeration-2026-09-13;native-resolution-use-module-prefix-enumeration-2026-09-13;native-resolution-macro-use-module-body-enumeration-2026-09-13;native-resolution-literal-receiver-reference-enumeration-2026-09-13;native-resolution-unified-pending-receivers-reconciliation-2026-09-13;rust-crate-row-schema-cr-r8-1-2026-09;rust-crate-reconcile-cr-r8-2-2026-09;rust-crate-derivation-cr-r8-3-2026-09;rust-single-name-import-binder-cr-2026-09;rust-source-visibility-cr-2026-09;rust-conditional-module-definition-sites-cr-2026-09;rust-signature-source-links-cr-2026-09;rust-crate-target-dependencies-cr-2026-09;rust-canonical-visibility-evidence-cr-2026-09;rust-lexical-macro-access-cr-2026-09;rust-crate-blob-repair-cr-2026-09;rust-crate-held-blob-repair-cr-2026-09;rust-crate-module-sources-and-scoped-imports-cr-2026-09-13;rust-crate-glob-reexport-subtype-cr-2026-09-13;tuple-positional-field-receivers-2026-09-13;tuple-field-empty-name-anchors-2026-09-13;macro-fragment-source-node-identity-2026-09-13;rust-crate-public-use-binders-fw-2026-09-13;rust-crate-reexport-alias-identity-fw-2026-09-13;rust-crate-transitive-import-namespaces-fw-2026-09-13;rust-crate-inline-declaration-names-fw-2026-09-13;rust-crate-open-export-inventory-fw-2026-09-13;rust-crate-file-naming-fw-2026-09-13;rust-crate-local-reexport-inventory-routes-fw-2026-09-13;rust-crate-unknown-export-activation-fw-2026-09-13;rust-crate-2015-explicit-self-routes-fw-2026-09-13;rust-crate-import-placement-keys-fw-2026-09-13;rust-crate-canonical-restricted-visibility-fw-2026-09-13;rust-crate-external-import-gap-classification-fw-2026-09-13;rust-crate-external-bare-import-gap-fw-2026-09-13;rust-enum-export-containers-v1;native-resolution-tier-1-discovery-headers-li3-2026-09-14;native-resolution-root-demand-headers-rv-2026-09;native-resolution-crate-import-reexport-namespaces-rv-2026-09;native-resolution-sparse-reverse-lookup-identities-rv-2026-09;rust-crate-relative-import-roots-rv-2026-09;rust-crate-import-placement-key-rv-2026-09;root-path-route-segments-rv-2026-09;rust-crate-root-reference-routes-rv-2026-09",
-    ";rust-crate-per-blob-declaration-candidates-rc-2026-09-14;rust-crate-import-head-staging-rc-2026-09-14;native-resolution-dense-rekey-source-identities-dg-2026-09-14;native-resolution-inline-cfg-module-placement-mr-2026-09-14;native-resolution-tier-2-families-not-persisted-li4-2026-09-15;native-resolution-tier-1-root-routes-li5-2026-09-15;native-resolution-definition-less-macro-argument-enumeration-mc2-2026-09-15;native-resolution-self-receiver-value-reference-g6-2026-09-16;native-resolution-struct-literal-let-initializer-dc-2026-09-16;native-resolution-block-local-item-scopes-pr-2026-09-17;native-resolution-member-bodies-and-item-macro-arguments-pm-2026-09-17;m8-batch-one-self-root-routes-anchors-derive-surface-lifetime-args-initializers-root-scopes-2026-09-21;m8-batch-two-conditional-binder-sites-cfg-inline-module-exports-2026-09-22;m8-batch-three-trait-body-self-sites-open-member-surface-type-bindings-item-groups-2026-09-22;m8-batch-four-impl-declaration-rows-decided-macro-decorations-inline-modules-owning-traits-2026-09-24;capital-self-type-references-2026-09;primitive-spelled-impl-owners-2026-09;scoped-generated-rust-model-declarations-2026-09;attributed-impl-member-declarations-2026-09;rust-stack-graph-batch-five-macro-export-context-2771-2026-09-26;rust-method-values-enum-field-visibility-2771-2026-09-27;rust-attributed-member-owner-2771-2026-09-27;rust-self-constructor-binding-2771-2026-09-27;rust-conditional-file-module-exports-2771-2026-09-27;rust-inert-test-attributes-2771-2026-09-27;rust-alias-nominal-identity-2771-2026-09-27;rust-projection-outputs-unsafe-attributes-2771-2026-09-27;rust-import-anchor-occurrences-2771-2026-09-27;rust-function-signature-owners-2771-2026-09-27;rust-trait-signature-owners-2771-2026-09-27;rust-declaration-reference-owners-2771-2026-09-27;rust-shared-unit-type-identity-2771-2026-09-27;rust-impl-bound-and-turbofish-reference-owners-2771-2026-09-27;rust-computed-receiver-members-enumerated-3764-2026-09-29;rust-struct-constructor-root-exports-3746-2026-09;rust-struct-pattern-variant-field-owner-3746-2026-09;rust-unit-self-value-identity-3746-2026-09-29;rust-unwrapped-member-receivers-3746-2026-09-29;rust-u1-3746-producer-2026-09-29;rust-u1-3746-parenthesized-types-2026-09-29;rust-impl-subject-frontier-resolution-gap-3746-2026-09-29;rust-tt-binding-runs-3746-2026-09-29;rust-attributed-inline-module-macros-3746-2026-09-29;rust-tt-static-call-facts-3746-2026-09-29;rust-tt-transcriber-output-proof-3746-2026-09-30;rust-closure-parameter-declared-types-3746-2026-09-30;rust-impl-generic-parameter-owner-c-2026-09-30;rust-macro-scope-f-3746-2026-09-30;rust-u2-bare-transcriber-references-matches-pattern-2026-09-30-a;rust-generic-alias-target-identity-3746-2026-09-30;rust-unindexed-macro-argument-enumeration-restored-2026-09-30-a;rust-unindexed-matches-refutable-patterns-2026-09-30-a"
+    "synthetic-file-scope-code-units-2026-07;embedded-macro-rules-code-units-2026-07;ast-test-detection-2026-07;canonical-impl-owner-identities-2026-07;macro-invocation-item-reparse-2026-07;proven-macro-definition-replay-2026-07;per-declaration-test-taint-2026-07;raw-identifier-normalization-2026-07;inline-module-const-static-type-items-2026-07;fq-interned-segments-2026-07;structural-macro-invocation-arguments-2026-08;structural-attributes-and-fields-2026-08;anchored-fq-encoding-2026-08;crate-aware-packages-2026-08;rust-query-assets-in-brokk-bifrost-rust-2026-08;renamed-import-impl-owner-route-2026-08;per-file-usage-facts-2026-08;cargo-route-facts-2026-08;include-edge-facts-2026-08;import-cfg-and-extern-crate-2026-08;enum-variant-named-fields-2026-08;callable-parameter-type-spellings-2026-08;raw-identifier-cargo-module-routes-2026-08;bounded-declaration-labels-2026-08;nested-and-extern-crate-import-facts-2026-08;declaration-type-parameter-arity-2026-09;rust-type-alias-type-identity-2026-09;unnamed-rust-import-binding-facts-2026-09;source-external-module-signatures-2026-09;proc-macro-kind-and-macro-use-extern-facts-2026-09;module-cfg-and-exported-macro-facts-2026-09;native-resolution-first-tranche-2026-09;native-resolution-root-route-halves-2026-09;native-resolution-cfg-fail-closed-2026-09;native-resolution-root-glob-demands-2026-09;native-resolution-type-references-2026-09;native-resolution-item-macros-2026-09;native-resolution-definition-unit-crosswalks-2026-09;native-resolution-point-gap-authority-2026-09;native-resolution-proc-macro-member-boundaries-2026-09;native-resolution-const-static-values-2026-09;native-resolution-extern-crate-routes-2026-09;native-resolution-local-pattern-scopes-2026-09;native-resolution-direct-let-condition-scopes-2026-09;native-resolution-or-pattern-binders-2026-09;native-resolution-foreign-functions-2026-09;native-resolution-union-types-2026-09;native-resolution-unprojectable-item-boundaries-2026-09;native-resolution-bare-condition-assignment-references-2026-09;native-resolution-struct-value-constructors-2026-09;native-resolution-generic-item-interiors-2026-09;native-resolution-const-generic-boundaries-2026-09;native-resolution-declared-rule-authority-2026-09;native-resolution-qualified-reference-boundaries-2026-09;native-resolution-item-macro-surface-boundaries-2026-09;native-resolution-cfg-route-placement-boundaries-2026-09;native-resolution-exact-reference-enumeration-gaps-2026-09;native-resolution-builtin-test-attribute-2026-09;cargo-manifest-default-target-inventory-2026-09;native-resolution-module-cycle-guard-2026-09;native-resolution-include-cycle-guard-2026-09;native-resolution-inline-module-ancestry-2026-09;native-resolution-inline-visibility-and-parent-cfg-2026-09;native-resolution-inline-include-scope-2026-09;native-resolution-inline-module-root-bridge-2026-09;native-resolution-inline-import-scope-2026-09;native-resolution-let-chain-scopes-2026-09;native-resolution-leading-absolute-imports-2026-09;native-resolution-positioned-call-callees-2026-09;native-resolution-member-scope-gaps-2026-09|native-resolution-root-references-2026-09;native-resolution-inherent-callable-bodies-2026-09;canonical-source-facts-2026-09;structured-extern-crate-import-form-2026-09;canonical-import-source-occurrences-2026-09;canonical-import-module-segments-2026-09;canonical-generic-import-spans-2026-09;canonical-import-properties-2026-09;canonical-rust-import-contexts-2026-09;canonical-embedded-declaration-identities-2026-09;canonical-rust-declaration-properties-2026-09;canonical-rust-declaration-classification-2026-09;canonical-rust-declaration-boundaries-2026-09;canonical-primary-module-properties-2026-09;shared-secondary-module-properties-2026-09;canonical-module-source-links-2026-09;ast-signature-header-boundaries-2026-09;source-owned-impl-type-construction-2026-09;shared-embedded-source-occurrences-2026-09;ast-parameter-label-spans-2026-09;primary-item-source-inventory-2026-09;secondary-item-source-inventory-2026-09;embedded-import-source-contexts-2026-09;normalized-item-syntax-2026-09;canonical-item-type-source-publication-2026-09;canonical-recovered-tree-root-contexts-2026-09;canonical-macro-source-position-2026-09;canonical-declaration-annotations-2026-09;canonical-generic-type-contexts-2026-09;canonical-macro-definition-patterns-2026-09;canonical-trait-type-forms-2026-09;canonical-macro-contexts-2026-09;canonical-native-declaration-bridge-publication-2026-09;native-resolution-reference-indirection-provenance-2026-09;native-resolution-let-initialization-2026-09;native-resolution-exact-import-demand-targets-2026-09;native-resolution-generic-argument-type-syntax-2026-09;native-resolution-wrapper-payload-projection-and-unwraps-2026-09;native-resolution-block-local-cfg-route-binders-2026-09;native-resolution-path-prefix-and-field-chain-occurrences-2026-09;native-resolution-qualified-type-projection-references-2026-09;native-resolution-detached-crate-module-trees-2026-09;native-resolution-enum-variant-members-2026-09;canonical-local-field-source-projections-2026-09;native-resolution-qualified-value-projections-2026-09;native-resolution-producer-reference-enumeration-b3-2026-09;native-resolution-census-ch-lexical-import-bindings-2026-09;native-resolution-selected-cfg-activation-2026-09;native-resolution-scoped-single-name-imports-and-serde-helpers-2026-09;native-resolution-trait-impl-bodies-ty-a-2026-09;native-resolution-type-alias-frontiers-ty-b-2026-09;native-resolution-associated-types-ty-c-2026-09;native-resolution-trait-bound-receivers-ty-d-2026-09-r2;native-resolution-macro-matcher-replay-mc-a-2026-09;native-resolution-macro-routes-mc-canonical-inputs-2026-09;native-resolution-include-splice-scopes-and-macros-mc-b-2026-09;transfer-owned-type-identity-observations-2026-09-13;native-resolution-enum-constructor-members-2026-09;native-resolution-terminal-prefix-qualifiers-ec-2026-09;native-resolution-enum-runtime-receivers-ec-2026-09;native-resolution-expression-name-focus-ec-2026-09;native-resolution-explicit-module-anchor-preservation-ec-2026-09;native-resolution-macro-callee-prefix-preservation-ec-2026-09;native-resolution-compound-member-receiver-enumeration-2026-09-13;native-resolution-initializer-field-reference-enumeration-2026-09-13;native-resolution-pattern-path-and-field-enumeration-2026-09-13;native-resolution-compound-type-operand-enumeration-2026-09-13;native-resolution-use-module-prefix-enumeration-2026-09-13;native-resolution-macro-use-module-body-enumeration-2026-09-13;native-resolution-literal-receiver-reference-enumeration-2026-09-13;native-resolution-unified-pending-receivers-reconciliation-2026-09-13;rust-crate-row-schema-cr-r8-1-2026-09;rust-crate-reconcile-cr-r8-2-2026-09;rust-crate-derivation-cr-r8-3-2026-09;rust-single-name-import-binder-cr-2026-09;rust-source-visibility-cr-2026-09;rust-conditional-module-definition-sites-cr-2026-09;rust-signature-source-links-cr-2026-09;rust-crate-target-dependencies-cr-2026-09;rust-canonical-visibility-evidence-cr-2026-09;rust-lexical-macro-access-cr-2026-09;rust-crate-blob-repair-cr-2026-09;rust-crate-held-blob-repair-cr-2026-09;rust-crate-module-sources-and-scoped-imports-cr-2026-09-13;rust-crate-glob-reexport-subtype-cr-2026-09-13;tuple-positional-field-receivers-2026-09-13;tuple-field-empty-name-anchors-2026-09-13;macro-fragment-source-node-identity-2026-09-13;rust-crate-public-use-binders-fw-2026-09-13;rust-crate-reexport-alias-identity-fw-2026-09-13;rust-crate-transitive-import-namespaces-fw-2026-09-13;rust-crate-inline-declaration-names-fw-2026-09-13;rust-crate-open-export-inventory-fw-2026-09-13;rust-crate-file-naming-fw-2026-09-13;rust-crate-local-reexport-inventory-routes-fw-2026-09-13;rust-crate-unknown-export-activation-fw-2026-09-13;rust-crate-2015-explicit-self-routes-fw-2026-09-13;rust-crate-import-placement-keys-fw-2026-09-13;rust-crate-canonical-restricted-visibility-fw-2026-09-13;rust-crate-external-import-gap-classification-fw-2026-09-13;rust-crate-external-bare-import-gap-fw-2026-09-13;rust-enum-export-containers-v1;native-resolution-tier-1-discovery-headers-li3-2026-09-14;native-resolution-root-demand-headers-rv-2026-09;native-resolution-crate-import-reexport-namespaces-rv-2026-09;native-resolution-sparse-reverse-lookup-identities-rv-2026-09;rust-crate-relative-import-roots-rv-2026-09;rust-crate-import-placement-key-rv-2026-09;root-path-route-segments-rv-2026-09;rust-crate-root-reference-routes-rv-2026-09;rust-generic-type-alias-substitution-3828-2026-10-01;rust-generic-type-argument-source-ordinals-3828-2026-10-02;rust-reference-pointer-alias-transfer-input-4389-2026-10-02;rust-non-generic-alias-applied-identity-2026-10-02;rust-plain-extern-crate-import-frontier-3828-2026-10;rust-target-scoped-gap-ast-names-3828-2026-10-05",
+    ";rust-crate-per-blob-declaration-candidates-rc-2026-09-14;rust-crate-import-head-staging-rc-2026-09-14;native-resolution-dense-rekey-source-identities-dg-2026-09-14;native-resolution-inline-cfg-module-placement-mr-2026-09-14;native-resolution-tier-2-families-not-persisted-li4-2026-09-15;native-resolution-tier-1-root-routes-li5-2026-09-15;native-resolution-definition-less-macro-argument-enumeration-mc2-2026-09-15;native-resolution-self-receiver-value-reference-g6-2026-09-16;native-resolution-struct-literal-let-initializer-dc-2026-09-16;native-resolution-block-local-item-scopes-pr-2026-09-17;native-resolution-member-bodies-and-item-macro-arguments-pm-2026-09-17;m8-batch-one-self-root-routes-anchors-derive-surface-lifetime-args-initializers-root-scopes-2026-09-21;m8-batch-two-conditional-binder-sites-cfg-inline-module-exports-2026-09-22;m8-batch-three-trait-body-self-sites-open-member-surface-type-bindings-item-groups-2026-09-22;m8-batch-four-impl-declaration-rows-decided-macro-decorations-inline-modules-owning-traits-2026-09-24;capital-self-type-references-2026-09;primitive-spelled-impl-owners-2026-09;scoped-generated-rust-model-declarations-2026-09;attributed-impl-member-declarations-2026-09;rust-stack-graph-batch-five-macro-export-context-2771-2026-09-26;rust-method-values-enum-field-visibility-2771-2026-09-27;rust-attributed-member-owner-2771-2026-09-27;rust-self-constructor-binding-2771-2026-09-27;rust-conditional-file-module-exports-2771-2026-09-27;rust-inert-test-attributes-2771-2026-09-27;rust-alias-nominal-identity-2771-2026-09-27;rust-projection-outputs-unsafe-attributes-2771-2026-09-27;rust-import-anchor-occurrences-2771-2026-09-27;rust-function-signature-owners-2771-2026-09-27;rust-trait-signature-owners-2771-2026-09-27;rust-declaration-reference-owners-2771-2026-09-27;rust-shared-unit-type-identity-2771-2026-09-27;rust-impl-bound-and-turbofish-reference-owners-2771-2026-09-27;rust-computed-receiver-members-enumerated-3764-2026-09-29;rust-struct-constructor-root-exports-3746-2026-09;rust-struct-pattern-variant-field-owner-3746-2026-09;rust-unit-self-value-identity-3746-2026-09-29;rust-unwrapped-member-receivers-3746-2026-09-29;rust-u1-3746-producer-2026-09-29;rust-u1-3746-parenthesized-types-2026-09-29;rust-impl-subject-frontier-resolution-gap-3746-2026-09-29;rust-tt-binding-runs-3746-2026-09-29;rust-attributed-inline-module-macros-3746-2026-09-29;rust-tt-static-call-facts-3746-2026-09-29;rust-tt-transcriber-output-proof-3746-2026-09-30;rust-closure-parameter-declared-types-3746-2026-09-30;rust-impl-generic-parameter-owner-c-2026-09-30;rust-macro-scope-f-3746-2026-09-30;rust-u2-bare-transcriber-references-matches-pattern-2026-09-30-a;rust-generic-alias-target-identity-3746-2026-09-30;rust-unindexed-macro-argument-enumeration-restored-2026-09-30-a;rust-unindexed-matches-refutable-patterns-2026-09-30-a;rust-qualified-macro-root-routes-3828-2026-10-02;rust-recovered-syntax-and-type-position-call-lowering-4279-4286-4289-4291-2026-10-03;rust-async-callable-await-structural-facts-3851-2026-10;rust-qualified-task-spawn-structural-facts-3853-2026-10-02;rust-call-type-argument-role-4314-2026-10-02;rust-matched-macro-closed-member-surface-2026-10-04;rust-crate-member-path-identity-4449-2026-10;rust-malformed-string-literal-absence-4450-2026-10-04;rust-struct-pattern-field-attributes-2026-10-05;rust-named-gap-wrapper-candidates-3828-2026-10-05;rust-empty-recovered-inner-attribute-and-source-visibility-4448-2026-10-04;rust-source-declaration-metadata-visibility-alternatives-4451-2026-10;rust-embedded-primary-reference-publication-4451-2026-10;rust-macro-positional-field-token-occurrences-4457-2026-10-05;rust-cq06-log-macro-lowering-2026-10;rust-macro-qualified-call-receivers-4310-2026-10;rust-attribute-source-declaration-bridges-4459-2026-10;rust-import-module-self-route-4460-2026-10-07;rust-cfg-attr-derived-surface-4460-2026-10-07;rust-transforming-attribute-surface-boundary-4460-2026-10-07;rust-selected-macro-type-path-fragment-root-4626-2026-10-08;rust-macro-ident-impl-context-2026-10-08;rust-recovered-macro-fragment-bindings-2026-10-09;rust-interior-path-anchors-4289-2026-10-08;rust-cfg-attr-effective-item-attributes-4458-2026-10;rust-reference-impl-member-owners-4458-2026-10;rust-conditional-derive-helper-attributes-4458-2026-10"
 );
 
 #[cfg(test)]
 pub(super) fn rust_epoch_before_type_alias_type_identity() -> String {
-    let prior = salt_before_bump(Rust::SALT, "rust-type-alias-type-identity-2026-09");
-    compute_epoch::<Rust>(&tree_sitter_rust::LANGUAGE.into(), prior)
+    compute_epoch_before_bump::<Rust>(
+        &tree_sitter_rust::LANGUAGE.into(),
+        "rust-type-alias-type-identity-2026-09",
+    )
 }
 
 #[cfg(test)]
@@ -1342,6 +1369,39 @@ pub(super) fn rust_epoch_before_anchored_fq_encoding() -> String {
         &tree_sitter_rust::LANGUAGE.into(),
         "synthetic-file-scope-code-units-2026-07;embedded-macro-rules-code-units-2026-07;ast-test-detection-2026-07;canonical-impl-owner-identities-2026-07;macro-invocation-item-reparse-2026-07;proven-macro-definition-replay-2026-07;per-declaration-test-taint-2026-07;raw-identifier-normalization-2026-07;inline-module-const-static-type-items-2026-07;fq-interned-segments-2026-07;structural-macro-invocation-arguments-2026-08;structural-attributes-and-fields-2026-08",
     )
+}
+
+#[cfg(test)]
+pub(super) fn rust_epoch_before_recovered_macro_fragment_bindings() -> String {
+    let prior = salt_before_bump(
+        Rust::SALT,
+        "rust-recovered-macro-fragment-bindings-2026-10-09",
+    );
+    compute_epoch::<Rust>(&tree_sitter_rust::LANGUAGE.into(), prior)
+}
+
+#[cfg(test)]
+pub(super) fn rust_epoch_before_cfg_attr_effective_item_attributes() -> String {
+    let prior = salt_before_bump(
+        Rust::SALT,
+        "rust-cfg-attr-effective-item-attributes-4458-2026-10",
+    );
+    compute_epoch::<Rust>(&tree_sitter_rust::LANGUAGE.into(), prior)
+}
+
+#[cfg(test)]
+pub(super) fn rust_epoch_before_reference_impl_member_owners() -> String {
+    let prior = salt_before_bump(Rust::SALT, "rust-reference-impl-member-owners-4458-2026-10");
+    compute_epoch::<Rust>(&tree_sitter_rust::LANGUAGE.into(), prior)
+}
+
+#[cfg(test)]
+pub(super) fn rust_epoch_before_conditional_derive_helper_attributes() -> String {
+    let prior = salt_before_bump(
+        Rust::SALT,
+        "rust-conditional-derive-helper-attributes-4458-2026-10",
+    );
+    compute_epoch::<Rust>(&tree_sitter_rust::LANGUAGE.into(), prior)
 }
 // Salt bumped after #1420: namespace-level structural traversal now emits
 // conditionally declared free functions that older PHP blobs omitted.
@@ -1372,11 +1432,16 @@ pub(super) fn rust_epoch_before_anchored_fq_encoding() -> String {
 // pin's fixture published `Monolog.Test.MongoDBFormatterTest`, not
 // `Demo.MongoDBFormatterTest`), and the file-level qualifier those rows carry
 // is that same first namespace, so both identities change.
+// Salt bumped again (#3503): Brokk PHP grammar 0.24.3 accepts asymmetric
+// visibility on constructor-promoted properties. Parser-table changes are not
+// part of the live grammar fingerprint, so retire rows from the prior parser.
+// Salt bumped again (#4408): Brokk PHP grammar 0.24.4 parses clone argument
+// lists, and PHP resolves their object operands from structured arguments.
 lang_epoch!(
     Php,
     "php",
     "treesitter/php/",
-    "synthetic-file-scope-code-units-2026-07;ast-test-detection-2026-07;fq-interned-segments-2026-07;conditional-free-function-declarations-2026-07;php-query-assets-in-brokk-bifrost-php-2026-08;structured-declared-return-identities-2026-08;php-callable-modifier-metadata-2026-09;php-imported-type-names-2026-09;php-per-statement-namespace-scope-2026-09;canonical-primary-source-ownership-2026-09"
+    "synthetic-file-scope-code-units-2026-07;ast-test-detection-2026-07;fq-interned-segments-2026-07;conditional-free-function-declarations-2026-07;php-query-assets-in-brokk-bifrost-php-2026-08;structured-declared-return-identities-2026-08;php-callable-modifier-metadata-2026-09;php-imported-type-names-2026-09;php-per-statement-namespace-scope-2026-09;canonical-primary-source-ownership-2026-09;php-canonical-import-projection-order-4288-2026-10-03;php-trait-relative-names-from-ast-scope-3390-2026-10-03;php-promoted-asymmetric-grammar-0.24.3-3503;php-clone-with-grammar-0.24.4-4408;php-include-edge-facts-3840-2026-10"
 );
 
 #[cfg(test)]
@@ -1445,11 +1510,26 @@ pub(super) fn php_epoch_before_conditional_free_function_declarations() -> Strin
 // written before this change hold a 0-based one for that header, so a warm
 // workspace reports it a line early -- and the source mtime and size that
 // gate reanalysis are unchanged, so nothing else evicts those rows.
+// Salt bumped again: import paths and selectors publish positioned references
+// and supported import routes no longer claim an unsupported route gap. Named
+// givens publish callable routes, and unsupported anonymous given routes stay
+// scoped to their declaration instead of tainting the enclosing type. Warm
+// source facts contain none of those distinctions.
+// Salt bumped (root import activation): Scala root imports now store the source
+// position at which they take effect, and the selected import context consumes
+// a blob's imports in that order. Warm rows were written without that column.
+// Salt bumped again: Scala qualified terminal paths publish selected
+// TypeOrValue member routes, including absolute paths and singleton owners.
+// Warm facts predate those root-route facts and cannot close the same paths.
+// Salt bumped again: a Scala class's synthetic primary constructor is now a
+// source declaration of its own instead of a second unit of the class's
+// declaration. Warm rows link both units to the class declaration, which the
+// selected unit read and the Java inheritance read reject as duplicates.
 lang_epoch!(
     Scala,
     "scala",
     "treesitter/scala/",
-    "synthetic-file-scope-code-units-2026-07;scala-raw-supertypes-and-traits-2026-07;ast-test-detection-2026-07;curried-constructor-and-parameter-field-semantics-2026-07;recovered-indentation-type-ownership-2026-07;parser-backed-export-facts-2026-07;parameterized-enum-case-declarations-2026-07;supertype-package-prefix-context-2026-07;supertype-lexical-scope-context-2026-07;tree-sitter-scala-bifrost-patches-1016-1068-1073-2026-07;comment-immune-tuple-pattern-binding-names-2026-07;fq-interned-segments-2026-07;scalachess-fqn-recovery-2026-07;jvm-query-assets-in-brokk-bifrost-jvm-2026-08;tree-sitter-scala-0.26.2-2026-08;scala-anonymous-template-code-units-2026-08;package-object-package-scope-2026-08;same-package-type-identifier-facts-2026-08;top-level-extension-declarations-2026-08;declaration-type-parameter-arity-2026-09;scala-type-alias-type-identity-2026-09;callable-modifiers-parameter-types-and-trait-marker-2026-09;canonical-primary-source-ownership-2026-09;recovered-type-header-one-based-range-2026-09;named-given-declarations-2026-09;abstract-val-var-declarations-export-selector-3499-2026-09"
+    "synthetic-file-scope-code-units-2026-07;scala-raw-supertypes-and-traits-2026-07;ast-test-detection-2026-07;curried-constructor-and-parameter-field-semantics-2026-07;recovered-indentation-type-ownership-2026-07;parser-backed-export-facts-2026-07;parameterized-enum-case-declarations-2026-07;supertype-package-prefix-context-2026-07;supertype-lexical-scope-context-2026-07;tree-sitter-scala-bifrost-patches-1016-1068-1073-2026-07;comment-immune-tuple-pattern-binding-names-2026-07;fq-interned-segments-2026-07;scalachess-fqn-recovery-2026-07;jvm-query-assets-in-brokk-bifrost-jvm-2026-08;tree-sitter-scala-0.26.2-2026-08;scala-anonymous-template-code-units-2026-08;package-object-package-scope-2026-08;same-package-type-identifier-facts-2026-08;top-level-extension-declarations-2026-08;declaration-type-parameter-arity-2026-09;scala-type-alias-type-identity-2026-09;callable-modifiers-parameter-types-and-trait-marker-2026-09;canonical-primary-source-ownership-2026-09;recovered-type-header-one-based-range-2026-09;named-given-declarations-2026-09;abstract-val-var-declarations-export-selector-3499-2026-09;scala-native-root-route-facts-2026-10;scala-trait-source-routes-and-scoped-jvm-aliases-2026-10;scala-case-class-companion-routes-2026-10;scala-positioned-import-references-and-scoped-given-routes-2026-10;scala-package-object-module-aliases-2026-10;scala-unqualified-extractor-type-or-value-2026-10;scala-complete-positioned-import-routes-2026-10;scala-qualified-terminal-type-or-value-member-routes-2026-10;scala-owner-continued-type-or-value-routes-2026-10;scala-same-file-imports-and-deduplicated-package-object-exports-3499-4412-2026-10-03;scala-call-argument-state-with-shared-applicability-2026-10;scala-external-provider-type-identity-frontiers-2026-10;scala-contextual-private-protected-visibility-2026-10;scala-singleton-receiver-without-inferred-gap-2026-10;scala-argument-expression-value-transfers-2026-10;scala-selection-value-is-selected-member-2026-10;scala-singleton-owner-selection-root-reference-2026-10;scala-head-ambiguity-only-without-root-reference-2026-10;scala-selection-argument-uses-projected-member-value-2026-10;scala-root-import-activation-ordinal-2026-10;scala-package-segment-demands-term-namespaces-2026-10;scala-primary-constructor-own-declaration-2026-10;scala-jvm-reconciliation-merge-3-2026-10"
 );
 // Salt bumped (#1548 stage 3 fleet): the C# `.scm` query assets moved from this
 // crate's `resources/treesitter/c_sharp/` into `brokk-bifrost-csharp`, so the
@@ -1513,11 +1593,14 @@ lang_epoch!(
 // from a truncated type body is now indexed as that type's member, and the
 // type's recorded range grows to contain it, so warm rows hold neither the
 // member row nor the owner's real extent.
+// #3851: C# await nodes now share the normalized Await kind.
+// #4379: C# source facts record instance-method return types, and C#
+// external constructors, properties and indexers resolve to modeled members.
 lang_epoch!(
     CSharp,
     "csharp",
     "treesitter/c_sharp/",
-    "synthetic-file-scope-code-units-2026-07;ast-test-detection-2026-07;static-using-type-identifiers-2026-07;as-expression-type-identifiers-2026-07;generic-type-identity-2026-07;attribute-type-identifiers-2026-07;callable-arity-and-static-import-metadata-2026-07;generic-method-arity-identity-2026-07;structured-return-type-metadata-2026-07;tuple-element-type-identifiers-2026-07;nameof-type-identifiers-2026-07;callable-dispatch-extensibility-metadata-2026-07;fq-interned-segments-2026-07;csharp-query-assets-in-brokk-bifrost-csharp-2026-08;interop-optional-callable-arity-2026-08;callable-modifier-metadata-2026-08;preprocessor-directive-aware-parsing-2026-08;multiplication-not-pointer-type-reference-2026-08;verbatim-identifier-canonical-declaration-names-2026-08;structured-csharp-runnable-test-classification-2026-08;csharp-inherited-test-classification-2026-08;declaration-type-parameter-arity-2026-09;callable-parameter-types-and-interface-marker-2026-09;callable-override-modifier-2026-09;comment-aware-canonical-using-targets-2026-09;brokk-csharp-grammar-0.23.5-2026-09;static-local-function-grammar-0.23.6-2026-09;generic-attribute-shorthand-identity-2026-09;recovered-type-member-ownership-2026-09;contextual-partial-required-grammar-0.23.7-2026-09"
+    "synthetic-file-scope-code-units-2026-07;ast-test-detection-2026-07;static-using-type-identifiers-2026-07;as-expression-type-identifiers-2026-07;generic-type-identity-2026-07;attribute-type-identifiers-2026-07;callable-arity-and-static-import-metadata-2026-07;generic-method-arity-identity-2026-07;structured-return-type-metadata-2026-07;tuple-element-type-identifiers-2026-07;nameof-type-identifiers-2026-07;callable-dispatch-extensibility-metadata-2026-07;fq-interned-segments-2026-07;csharp-query-assets-in-brokk-bifrost-csharp-2026-08;interop-optional-callable-arity-2026-08;callable-modifier-metadata-2026-08;preprocessor-directive-aware-parsing-2026-08;multiplication-not-pointer-type-reference-2026-08;verbatim-identifier-canonical-declaration-names-2026-08;structured-csharp-runnable-test-classification-2026-08;csharp-inherited-test-classification-2026-08;declaration-type-parameter-arity-2026-09;callable-parameter-types-and-interface-marker-2026-09;callable-override-modifier-2026-09;comment-aware-canonical-using-targets-2026-09;brokk-csharp-grammar-0.23.5-2026-09;static-local-function-grammar-0.23.6-2026-09;generic-attribute-shorthand-identity-2026-09;recovered-type-member-ownership-2026-09;contextual-partial-required-grammar-0.23.7-2026-09;csharp-await-structural-kind-3851-2026-10;csharp-codeql-parity-facts-4379-2026-10;csharp-unsafe-pointer-expressions-0.23.8-4410"
 );
 
 #[cfg(test)]
@@ -1611,42 +1694,13 @@ lang_epoch!(
 // workspace with no error raised anywhere. The same gap was bumped for
 // JavaScript and TypeScript (#2597), PHP and Ruby (#2912), and Python
 // (#3451).
+// Salt bumped (#3387): scalar Kotlin additive expressions now publish their
+// operand-result transfer, and top-level private declarations no longer carry
+// an unsupported-visibility gap because file-local lookup is explicit. The
+// labeled-this salt records owner-qualified receiver transfers.
 lang_epoch!(
     Kotlin,
     "kotlin",
     "treesitter/kotlin/",
-    "brokk-tree-sitter-kotlin-0.4.6-2026-09;kotlin-core-indexing-2026-07;kotlin-class-parameter-default-arity-2026-07;kotlin-backtick-identifier-names-2026-07;kotlin-jvm-realm-imports-supertypes-2026-07;kotlin-signature-returns-receivers-2026-07;kotlin-companion-object-marker-2026-07;kotlin-structured-signature-types-2026-08;jvm-query-assets-in-brokk-bifrost-jvm-2026-08;kotlin-constructor-callable-metadata-2026-08;declaration-type-parameter-arity-2026-09;kotlin-type-alias-type-identity-2026-09;kotlin-coordinated-source-facts-parameter-names-enum-types-2026-09;kotlin-call-binding-constructor-identity-2026-09;kotlin-callable-modifier-metadata-2026-09"
+    "brokk-tree-sitter-kotlin-0.4.6-2026-09;kotlin-core-indexing-2026-07;kotlin-class-parameter-default-arity-2026-07;kotlin-backtick-identifier-names-2026-07;kotlin-jvm-realm-imports-supertypes-2026-07;kotlin-signature-returns-receivers-2026-07;kotlin-companion-object-marker-2026-07;kotlin-structured-signature-types-2026-08;jvm-query-assets-in-brokk-bifrost-jvm-2026-08;kotlin-constructor-callable-metadata-2026-08;declaration-type-parameter-arity-2026-09;kotlin-type-alias-type-identity-2026-09;kotlin-coordinated-source-facts-parameter-names-enum-types-2026-09;kotlin-call-binding-constructor-identity-2026-09;kotlin-callable-modifier-metadata-2026-09;kotlin-call-navigation-receiver-facts-2026-10;kotlin-class-type-expression-receiver-2026-10;kotlin-scalar-additive-expression-and-file-private-visibility-2026-10;kotlin-labeled-this-receiver-2026-10"
 );
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn ts_python() -> TsLanguage {
-        tree_sitter_python::LANGUAGE.into()
-    }
-
-    fn ts_go() -> TsLanguage {
-        tree_sitter_go::LANGUAGE.into()
-    }
-
-    #[test]
-    fn epoch_is_stable_across_calls() {
-        let a = epoch_for(Language::Python, &ts_python());
-        let b = epoch_for(Language::Python, &ts_python());
-        assert_eq!(a, b);
-        assert_eq!(a.len(), 64); // sha256 hex
-    }
-
-    #[test]
-    fn epochs_differ_per_language() {
-        let py = epoch_for(Language::Python, &ts_python());
-        let go = epoch_for(Language::Go, &ts_go());
-        assert_ne!(py, go);
-    }
-
-    #[test]
-    fn no_epoch_for_language_none() {
-        assert_eq!(epoch_for(Language::None, &ts_python()), "");
-    }
-}

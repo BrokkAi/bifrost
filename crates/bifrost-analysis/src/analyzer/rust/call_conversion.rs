@@ -19,6 +19,7 @@ use crate::analyzer::usages::get_definition::{
 use crate::analyzer::{
     AnalyzerQueryScope, IAnalyzer, Language, ProjectFile, RustAnalyzer, resolve_analyzer,
 };
+use brokk_bifrost_core::analyzer::tree_walk::root_node;
 use brokk_bifrost_rust::declarations::rust_node_text;
 use brokk_bifrost_rust::lexical_scope::{rust_lexical_scope_index, visible_import_binder_in_tree};
 use brokk_bifrost_rust::ownership::{
@@ -69,13 +70,13 @@ impl CallArgumentConversionProver for RustCallArgumentConversionProver {
             analyzer,
             file,
             source,
-            root: node_root(actual),
+            root: root_node(actual),
         };
         let formal_context = RustTypeContext {
             analyzer,
             file: formal_file,
             source: formal_source,
-            root: node_root(formal),
+            root: root_node(formal),
         };
 
         let source_type = actual_context.expression_type(actual, 0)?;
@@ -459,9 +460,7 @@ fn primitive_for_spelling(spelling: &str) -> Option<RustPrimitive> {
 }
 
 fn has_named_child_kind(node: Node<'_>, kind: &str) -> bool {
-    let mut cursor = node.walk();
-    node.named_children(&mut cursor)
-        .any(|child| child.kind() == kind)
+    brokk_bifrost_core::analyzer::tree_walk::first_named_child_of_kind(node, kind).is_some()
 }
 
 fn supported_type_context(node: Node<'_>) -> Result<(), ConversionUnknown> {
@@ -494,13 +493,6 @@ fn supported_type_context(node: Node<'_>) -> Result<(), ConversionUnknown> {
         current = scope.parent();
     }
     Ok(())
-}
-
-fn node_root<'tree>(mut node: Node<'tree>) -> Node<'tree> {
-    while let Some(parent) = node.parent() {
-        node = parent;
-    }
-    node
 }
 
 #[cfg(test)]

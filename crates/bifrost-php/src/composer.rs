@@ -3,7 +3,7 @@ use brokk_bifrost_core::analyzer::project::Project;
 use brokk_bifrost_core::analyzer::{CodeUnit, CodeUnitIndex, ProjectFile};
 use brokk_bifrost_core::hash::HashSet;
 use serde_json::Value;
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, Default)]
 pub struct PhpComposerAutoload {
@@ -150,20 +150,7 @@ fn dotted_fqn_to_path(fq_name: &str) -> PathBuf {
 }
 
 fn normalize_project_relative_path(path: &Path) -> Option<PathBuf> {
-    let mut out = PathBuf::new();
-    for component in path.components() {
-        match component {
-            Component::CurDir => {}
-            Component::Normal(part) => out.push(part),
-            Component::ParentDir => {
-                if !out.pop() {
-                    return None;
-                }
-            }
-            Component::RootDir | Component::Prefix(_) => return None,
-        }
-    }
-    Some(out)
+    brokk_bifrost_core::path_utils::normalize_relative_path_from(Path::new(""), path)
 }
 
 fn normalize_rel_path(path: impl AsRef<Path>) -> PathBuf {

@@ -1,5 +1,6 @@
 //! Stable CLI and Python facade for the Bifrost workspace packages.
 
+pub mod engine_contracts;
 pub mod mcp_install;
 // OWASP BenchmarkJava taint bakeoff scorer. Like `summary_foundry_demand`, it
 // runs the require-model taint policy through the production evaluator and so
@@ -10,6 +11,7 @@ pub mod mcp_install;
 pub mod owasp_benchmark;
 #[cfg(feature = "python")]
 mod python_module;
+mod shard;
 // Stage 4 of the procedure-summary foundry (#1871). It runs generated fixtures
 // through the production policy evaluator, so it needs both the foundry IR from
 // brokk-bifrost-semantic-packs and the evaluator from brokk-bifrost-policy;
@@ -26,8 +28,8 @@ pub use brokk_bifrost_analysis::{
     JavascriptAnalyzer, JvmAnalyzerConfig, JvmDependencyDiscoveryConfig,
     JvmDependencyDiscoveryMode, JvmExternalArtifact, JvmExternalDependencies, JvmMavenCoordinate,
     KotlinAnalyzer, Language, MultiAnalyzer, MultiRootProject, NavigationOperation, OverlayProject,
-    ParseError, ParseErrorKind, PhpAnalyzer, PhpAnalyzerConfig, PhpDependencyApiEvidence,
-    PhpDependencyPackAdapter, Project, ProjectFile, PythonAnalyzer,
+    ParseCompleteness, ParseError, ParseErrorKind, PhpAnalyzer, PhpAnalyzerConfig,
+    PhpDependencyApiEvidence, PhpDependencyPackAdapter, Project, ProjectFile, PythonAnalyzer,
     PythonSemanticModelWorkspaceContext, Range, RenderedSummary, RubyAnalyzer, RubyAnalyzerConfig,
     RubyDependencyApiEvidence, RubyDependencyPackAdapter, RubyGemApiArtifact, RustAnalyzer,
     RustAnalyzerConfig, RustDependencyApiEvidence, RustDependencyPackAdapter,
@@ -42,8 +44,8 @@ pub use brokk_bifrost_analysis::{
     analyzer, cache_db, cache_gc, cancellation, code_quality, compact_graph,
     cyclomatic_complexity_diff, diff_analysis, file_tools, git_file, gitblob, hash, model_context,
     navigation, panic_report, path_normalization, path_utils, process, profiling, relevance,
-    schema_version, seam_profile, searchtools, searchtools_render, summary, symbol_rename,
-    text_utils, usages, util, workspace_document,
+    schema_version, seam_profile, searchtools, searchtools_render, sqlite_template, summary,
+    symbol_rename, text_utils, usages, util, workspace_document,
 };
 #[cfg(any(test, feature = "test-support"))]
 pub use brokk_bifrost_analysis::{
@@ -89,11 +91,23 @@ fn register_bifrost_semantic_model_packs(
                 "BIFROST_OPEN_SEMANTIC_PACK_BUNDLE must name a native bundle directory".into(),
             );
         }
-        let installed = brokk_bifrost_semantic_packs::release_bundle::install_release_bundle(
-            std::path::Path::new(&bundle),
-            catalog,
-        )
-        .map_err(|error| format!("failed to install configured open semantic packs: {error}"))?;
+        let root = std::path::Path::new(&bundle);
+        if root
+            .join(brokk_bifrost_semantic_packs::prepared_registry::PREPARED_REGISTRY_MARKER)
+            .try_exists()
+            .map_err(|error| format!("read configured semantic selection: {error}"))?
+        {
+            return brokk_bifrost_semantic_packs::prepared_registry::register_prepared_registry(
+                root, catalog,
+            )
+            .map(|_| ())
+            .map_err(|error| format!("failed to register configured semantic selection: {error}"));
+        }
+        let installed =
+            brokk_bifrost_semantic_packs::release_bundle::install_release_bundle(root, catalog)
+                .map_err(|error| {
+                    format!("failed to install configured open semantic packs: {error}")
+                })?;
         if installed.is_empty() {
             return Err("configured open semantic bundle installs no compatible packs".into());
         }
@@ -116,16 +130,7 @@ fn register_bifrost_semantic_model_packs(
 pub fn open_pack_engine_profile() -> serde_json::Value {
     use sha2::{Digest, Sha256};
 
-    let mut capabilities = Vec::new();
-    if extension::PUBLISHED_OPERATIONS.iter().any(|operation| {
-        operation.id == "structural.query"
-            && operation.support == extension::CapabilitySupport::Complete
-    }) {
-        capabilities.push("structural-match");
-    }
-    if rql::query::schema::ALL_QUERY_STEP_OPS.contains(&rql::query::schema::QueryStepOp::CfgExits) {
-        capabilities.push("normal-and-exceptional-exit");
-    }
+    let capabilities = engine_contracts::advertised_capability_ids().collect::<Vec<_>>();
 
     let mut model_set = Sha256::new();
     for pack in semantic_packs::BIFROST_EMBEDDED_PACKS.packs() {

@@ -10,27 +10,27 @@ use brokk_bifrost_core::analyzer::model::{DeclarationKind, JavaTypeConstructorSh
 use brokk_bifrost_core::analyzer::resolution_facts::{
     BindingProjectionFact, BindingProjectionKind, DeclarationTypeRole, DeclarationTypeSlotFact,
     FileResolutionFacts, IntrinsicTypeKind, IntrinsicTypeSeedFact, PositionedIdentifierFact,
-    ResolutionBinderFact, ResolutionBinderKind, ResolutionCallArgumentFact, ResolutionCallFact,
-    ResolutionCallableParameterFact, ResolutionCallableReceiverOrigin,
-    ResolutionCallableReceiverOriginFact, ResolutionCallableSignatureFact,
-    ResolutionConstructionRequirementFact, ResolutionConstructionRequirementKind,
-    ResolutionDeclarationVisibilityFact, ResolutionEngineRuleEligibilityFact,
+    ResolutionBinderFact, ResolutionBinderKind, ResolutionCallableParameterFact,
+    ResolutionCallableReceiverOrigin, ResolutionCallableReceiverOriginFact,
+    ResolutionCallableResultTypeFact, ResolutionCallableResultTypeParameterFact,
+    ResolutionCallableSignatureFact, ResolutionConstructionRequirementFact,
+    ResolutionConstructionRequirementKind, ResolutionDeclarationVisibilityFact,
+    ResolutionDeclaredTypeArgumentFact, ResolutionDeclaredTypeRelationFact,
+    ResolutionDeclaredTypeRelationKind, ResolutionEngineRuleEligibilityFact,
     ResolutionEngineRuleKind, ResolutionGapFact, ResolutionGapKind, ResolutionIdentifierRole,
     ResolutionImportRouteFact, ResolutionImportRouteKind, ResolutionImportRouteSegmentFact,
     ResolutionMemberAccess, ResolutionMemberKind, ResolutionMemberOwnerFact,
-    ResolutionMemberQualifierCompatibility, ResolutionNameFact, ResolutionNameId,
-    ResolutionNamespace, ResolutionPackageFact, ResolutionPackageMemberFact,
-    ResolutionPackageReferenceFact, ResolutionPackageSegmentFact,
-    ResolutionReferenceEnumerationGapFact, ResolutionReferenceOwnerFact, ResolutionRootExportFact,
-    ResolutionRootImportAnchor, ResolutionRootImportDemandFact, ResolutionRootImportFact,
-    ResolutionRootImportSegmentFact, ResolutionRootReferenceFact,
-    ResolutionRootReferenceSegmentFact, ResolutionScopeFact, ResolutionScopeId,
-    ResolutionScopeInheritance, ResolutionScopeKind, ResolutionSiteFact, ResolutionSiteId,
-    ResolutionSiteKind, ResolutionSupertypeFact, ResolutionSupertypeKind,
+    ResolutionMemberQualifierCompatibility, ResolutionNameId, ResolutionNamespace,
+    ResolutionPackageFact, ResolutionPackageMemberFact, ResolutionPackageSegmentFact,
+    ResolutionReferenceOwnerFact, ResolutionRootExportFact, ResolutionRootImportAnchor,
+    ResolutionRootImportDemandFact, ResolutionRootImportFact, ResolutionRootImportSegmentFact,
+    ResolutionRootReferenceFact, ResolutionRootReferenceSegmentFact, ResolutionScopeFact,
+    ResolutionScopeId, ResolutionScopeInheritance, ResolutionScopeKind, ResolutionSiteFact,
+    ResolutionSiteId, ResolutionSiteKind, ResolutionSupertypeFact, ResolutionSupertypeKind,
     ResolutionTypeComponentFact, ResolutionTypeComponentKind, ResolutionTypeConstructorKind,
-    ResolutionTypeSlotFact, ResolutionTypeSlotId, ResolutionTypeSlotRole,
+    ResolutionTypeRelationId, ResolutionTypeSlotFact, ResolutionTypeSlotId, ResolutionTypeSlotRole,
     ResolutionTypeTransferFact, ResolutionTypeTransferKind, ResolutionTypeTransferValueTransform,
-    ResolutionVisibilityEligibilityFact,
+    ResolutionVisibilityEligibilityFact, dense_ordinal,
 };
 use brokk_bifrost_core::analyzer::source_facts::{
     PrimarySourceFactCollector, SourceDeclarationId, SourceFactRows, SourceOccurrenceId,
@@ -47,10 +47,13 @@ use super::declarations::{
     JavaCallableShape, JavaDeclarationModifiers, JavaFieldShape, JavaTypeShape, is_declared_name,
     looks_like_pascal_identifier, node_text,
 };
-use super::graph_support::{java_declared_type_parameters, java_switch_selector_expression};
+use super::graph_support::{
+    java_declared_type_parameters, java_switch_selector_expression, java_type_argument_nodes,
+    java_type_parameter_bounds, java_type_parameter_name_node,
+};
 use super::imports::{JavaImportSyntax, JavaPackageSyntax};
 use super::source_types::JavaSourceTypeCollector;
-use super::source_types::is_java_synthetic_class_body;
+use super::source_types::{is_java_synthetic_class_body, java_named_type_child};
 use brokk_bifrost_core::analyzer::java_facts::{
     JavaSourceFacts, JavaSourceTypeId, JavaTypeSyntaxShape,
 };
@@ -77,9 +80,11 @@ pub(super) struct JavaResolutionBuilder<'source> {
     name_ids: HashMap<String, ResolutionNameId>,
     scope_stack: Vec<ResolutionScopeId>,
     exit_actions: Vec<ExitAction>,
+    type_parameter_scopes: HashSet<ResolutionSiteId>,
     suppression_depth: usize,
     type_contexts: Vec<TypeContext>,
     callable_contexts: Vec<CallableContext>,
+    lambda_contexts: Vec<LambdaContext>,
     declaration_contexts: Vec<ResolutionSiteId>,
     reference_enclosing_declaration_overrides: Vec<ResolutionSiteId>,
     body_scopes: HashMap<usize, ResolutionScopeId>,
@@ -89,6 +94,9 @@ pub(super) struct JavaResolutionBuilder<'source> {
     claimed_identifier_nodes: HashSet<usize>,
     gapped_semantic_subtrees: HashSet<usize>,
     next_parameter_ordinal: HashMap<ResolutionSiteId, u32>,
+    next_parent_ordinal: HashMap<ResolutionSiteId, u32>,
+    local_value_binders_by_scope:
+        HashMap<(ResolutionScopeId, ResolutionNameId), Vec<(usize, usize)>>,
     unsupported_implicit_receiver_scopes: HashSet<ResolutionScopeId>,
     unsupported_implicit_receiver_context_depth: usize,
     package_declaration: Option<ResolutionSiteId>,
@@ -102,14 +110,18 @@ pub(super) struct JavaResolutionBuilder<'source> {
     source_type_shapes: HashMap<usize, JavaTypeShape>,
     source_field_shapes: HashMap<usize, JavaFieldShape>,
     source_callable_shapes: HashMap<usize, JavaCallableShape>,
+    type_parameter_positions: HashMap<ResolutionSiteId, HashMap<ResolutionNameId, u32>>,
 }
 
 #[derive(Debug, Clone, Copy)]
 enum ExitAction {
     Scope,
     TypeContext,
+    TypeContextWithParameters,
     SyntheticTypeContext,
     CallableContext,
+    CallableContextWithParameters,
+    LambdaContext,
     Suppression,
 }
 
@@ -132,6 +144,7 @@ enum TypeFlavor {
 #[derive(Debug, Clone, Copy)]
 struct TypeContext {
     declaration: ResolutionSiteId,
+    body_scope: Option<ResolutionScopeId>,
     name: Option<ResolutionNameId>,
     flavor: TypeFlavor,
     direct_default_construction_proof_eligible: bool,
@@ -148,6 +161,30 @@ struct CallableContext {
     activation_start: usize,
     activation_end: usize,
     source_node_id: usize,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct LambdaContext {
+    node_id: usize,
+    scope: ResolutionScopeId,
+    activation_start: usize,
+    activation_end: usize,
+}
+
+/// A MISSING identifier from recovery is a zero-width token with no spelling.
+fn is_spelled_identifier(node: Node<'_>) -> bool {
+    node.kind() == "identifier" && !node.is_missing()
+}
+
+fn resolution_site(facts: &FileResolutionFacts, id: ResolutionSiteId) -> &ResolutionSiteFact {
+    &facts.sites[id.get() as usize]
+}
+
+fn insert_source_shape<T>(shapes: &mut HashMap<usize, T>, node: Node<'_>, shape: T, kind: &str) {
+    assert!(
+        shapes.insert(node.id(), shape).is_none(),
+        "one Java native {kind}-shape handoff per declaration node"
+    );
 }
 
 impl<'source> JavaResolutionBuilder<'source> {
@@ -203,9 +240,11 @@ impl<'source> JavaResolutionBuilder<'source> {
             name_ids: HashMap::default(),
             scope_stack: vec![root_scope],
             exit_actions: Vec::new(),
+            type_parameter_scopes: HashSet::default(),
             suppression_depth: 0,
             type_contexts: Vec::new(),
             callable_contexts: Vec::new(),
+            lambda_contexts: Vec::new(),
             declaration_contexts: Vec::new(),
             reference_enclosing_declaration_overrides: Vec::new(),
             body_scopes: HashMap::default(),
@@ -215,6 +254,8 @@ impl<'source> JavaResolutionBuilder<'source> {
             claimed_identifier_nodes: HashSet::default(),
             gapped_semantic_subtrees: HashSet::default(),
             next_parameter_ordinal: HashMap::default(),
+            next_parent_ordinal: HashMap::default(),
+            local_value_binders_by_scope: HashMap::default(),
             unsupported_implicit_receiver_scopes: HashSet::default(),
             unsupported_implicit_receiver_context_depth: 0,
             package_declaration: None,
@@ -228,6 +269,7 @@ impl<'source> JavaResolutionBuilder<'source> {
             source_type_shapes: HashMap::default(),
             source_field_shapes: HashMap::default(),
             source_callable_shapes: HashMap::default(),
+            type_parameter_positions: HashMap::default(),
         }
     }
 
@@ -325,6 +367,7 @@ impl<'source> JavaResolutionBuilder<'source> {
         assert_eq!(self.suppression_depth, 0);
         assert!(self.type_contexts.is_empty());
         assert!(self.callable_contexts.is_empty());
+        assert!(self.lambda_contexts.is_empty());
         assert!(self.declaration_contexts.is_empty());
         assert!(self.reference_enclosing_declaration_overrides.is_empty());
         assert_eq!(self.unsupported_implicit_receiver_context_depth, 0);
@@ -365,12 +408,6 @@ impl<'source> JavaResolutionBuilder<'source> {
                     }),
             );
         }
-        let rooted_references = self
-            .facts
-            .root_references
-            .iter()
-            .map(|reference| reference.reference)
-            .collect::<HashSet<_>>();
         if !self.package_is_invalid {
             self.facts
                 .package_members
@@ -384,22 +421,18 @@ impl<'source> JavaResolutionBuilder<'source> {
                             namespace: export.namespace,
                         }),
                 );
-            self.facts.package_references.extend(
-                self.facts
-                    .identifiers
-                    .iter()
-                    .filter(|identifier| {
-                        identifier.role == ResolutionIdentifierRole::Reference
-                            && identifier.namespace == ResolutionNamespace::Type
-                            && identifier.qualifier.is_none()
-                            && !explicit_types.contains(&identifier.name)
-                            && !rooted_references.contains(&identifier.site)
-                    })
-                    .map(|identifier| ResolutionPackageReferenceFact {
-                        reference: identifier.site,
-                        root_scope: root.id,
-                    }),
+            let package_references = crate::package_lookup::source_owned_package_references(
+                &self.facts,
+                |identifier, _| identifier.qualifier.is_none(),
+                |identifier, _| {
+                    (matches!(
+                        identifier.namespace,
+                        ResolutionNamespace::Type | ResolutionNamespace::TypeOrValue
+                    ) && !explicit_types.contains(&identifier.name))
+                    .then_some(root.id)
+                },
             );
+            self.facts.package_references.extend(package_references);
         }
         self.facts.validate_package_relations();
         self.finish_root_import_demands();
@@ -578,10 +611,10 @@ impl<'source> JavaResolutionBuilder<'source> {
                 ),
                 "Java callable receiver must name a terminal callable reference: {fact:?}"
             );
-            assert_eq!(
-                reference.qualifier.is_none(),
-                fact.origin == ResolutionCallableReceiverOrigin::Implicit,
-                "only an implicit Java callable receiver may omit its qualifier slot: {fact:?}"
+            assert!(
+                fact.origin
+                    .is_reference_qualification_valid(reference.qualifier.is_none()),
+                "Java callable receiver origin must agree with reference qualification: {fact:?}"
             );
             assert!(
                 receivers.insert(fact.reference),
@@ -689,18 +722,8 @@ impl<'source> JavaResolutionBuilder<'source> {
 
     fn enter_after_preamble(&mut self, node: Node<'_>) -> TreeWalkAction {
         if matches!(node.kind(), "annotation" | "marker_annotation") {
-            // Annotation uses do not introduce lexical declarations. Their
-            // omitted references remain explicit enumeration gaps, without
-            // opening every unrelated name lookup in the fragment.
-            return self.suppress_with_gap(
-                node,
-                ResolutionSiteKind::UnsupportedExpression,
-                if node.has_error() {
-                    ResolutionGapKind::MalformedSyntax
-                } else {
-                    ResolutionGapKind::UnsupportedExpression
-                },
-            );
+            self.lower_annotation(node);
+            return self.suppress_semantics();
         }
 
         if node.kind() == "method_reference" {
@@ -719,6 +742,16 @@ impl<'source> JavaResolutionBuilder<'source> {
             );
         }
 
+        match node.kind() {
+            "lambda_expression" => return self.enter_lambda_expression(node),
+            "catch_clause" => return self.enter_catch_clause(node),
+            "catch_formal_parameter" => {
+                self.lower_catch_formal_parameter(node);
+                return TreeWalkAction::Descend;
+            }
+            _ => {}
+        }
+
         if self.is_unsupported_semantic_subtree(node) {
             return self.suppress_with_gap(
                 node,
@@ -729,6 +762,18 @@ impl<'source> JavaResolutionBuilder<'source> {
 
         if self.gapped_semantic_subtrees.contains(&node.id()) {
             return self.suppress_semantics();
+        }
+
+        if let Some(lambda) = self.lambda_contexts.last().copied()
+            && node.kind() != "block"
+            && node.parent().is_some_and(|parent| {
+                parent.kind() == "lambda_expression"
+                    && parent.id() == lambda.node_id
+                    && parent.child_by_field_name("body") == Some(node)
+            })
+        {
+            self.lower_expression(node);
+            return TreeWalkAction::Skip;
         }
 
         if node.kind() == "switch_expression" {
@@ -757,6 +802,26 @@ impl<'source> JavaResolutionBuilder<'source> {
                 ResolutionSiteKind::UnsupportedDeclaration,
                 ResolutionGapKind::UnsupportedScopeOrBinder,
             );
+        }
+
+        if let Some(lambda) = self.lambda_context_for_parameter(node) {
+            match node.kind() {
+                "formal_parameter" => {
+                    self.lower_lambda_formal_parameter(node, lambda);
+                    return TreeWalkAction::Descend;
+                }
+                "inferred_parameters" => {
+                    for parameter in named_children(node) {
+                        self.lower_lambda_inferred_parameter(parameter, lambda);
+                    }
+                    return TreeWalkAction::Skip;
+                }
+                "identifier" => {
+                    self.lower_lambda_inferred_parameter(node, lambda);
+                    return TreeWalkAction::Skip;
+                }
+                _ => unreachable!("only Java lambda parameter nodes have lambda contexts"),
+            }
         }
 
         if self.is_scope_body(node) {
@@ -790,7 +855,13 @@ impl<'source> JavaResolutionBuilder<'source> {
                 if let Some(context) = self.lower_type_declaration(node) {
                     self.declaration_contexts.push(context.declaration);
                     self.type_contexts.push(context);
-                    self.exit_actions.push(ExitAction::TypeContext);
+                    self.exit_actions.push(
+                        if self.type_parameter_scopes.contains(&context.declaration) {
+                            ExitAction::TypeContextWithParameters
+                        } else {
+                            ExitAction::TypeContext
+                        },
+                    );
                     return TreeWalkAction::DescendWithExit;
                 }
             }
@@ -801,12 +872,34 @@ impl<'source> JavaResolutionBuilder<'source> {
                 if let Some(context) = self.lower_callable_declaration(node) {
                     self.declaration_contexts.push(context.declaration);
                     self.callable_contexts.push(context);
-                    self.exit_actions.push(ExitAction::CallableContext);
+                    self.exit_actions.push(
+                        if self.type_parameter_scopes.contains(&context.declaration) {
+                            ExitAction::CallableContextWithParameters
+                        } else {
+                            ExitAction::CallableContext
+                        },
+                    );
                     return TreeWalkAction::DescendWithExit;
                 }
             }
             "static_initializer" => self.lower_initializer(node),
-            "formal_parameter" => self.lower_parameter(node),
+            "formal_parameter" => {
+                let belongs_to_callable = self.callable_contexts.last().is_some_and(|callable| {
+                    self.source_callable_shapes
+                        .get(&callable.source_node_id)
+                        .and_then(|shape| shape.repeated_for(node.id()))
+                        .is_some()
+                });
+                if belongs_to_callable {
+                    self.lower_parameter(node);
+                } else {
+                    return self.suppress_with_gap(
+                        node,
+                        ResolutionSiteKind::UnsupportedDeclaration,
+                        ResolutionGapKind::UnsupportedScopeOrBinder,
+                    );
+                }
+            }
             "type_pattern" => self.lower_type_pattern(node),
             "spread_parameter" => {
                 return if self.lower_spread_parameter(node) {
@@ -835,10 +928,9 @@ impl<'source> JavaResolutionBuilder<'source> {
             _ => {}
         }
 
-        if matches!(
-            node.kind(),
-            "identifier" | "type_identifier" | "this" | "super"
-        ) && !self.claimed_identifier_nodes.contains(&node.id())
+        if (is_spelled_identifier(node)
+            || matches!(node.kind(), "type_identifier" | "this" | "super"))
+            && !self.claimed_identifier_nodes.contains(&node.id())
         {
             let site = self.add_site(
                 node,
@@ -858,6 +950,266 @@ impl<'source> JavaResolutionBuilder<'source> {
         }
 
         TreeWalkAction::Descend
+    }
+
+    fn enter_lambda_expression(&mut self, node: Node<'_>) -> TreeWalkAction {
+        let Some(body) = node.child_by_field_name("body") else {
+            return self.suppress_with_gap(
+                node,
+                ResolutionSiteKind::UnsupportedExpression,
+                ResolutionGapKind::MalformedSyntax,
+            );
+        };
+        if !self.expression_slots_by_node.contains_key(&node.id()) {
+            self.lower_unsupported_expression_preserving_children(node);
+        }
+        let callable = self.slot(self.expression_slot(node)).site;
+        let scope = self.allocate_scope(
+            self.current_scope(),
+            Some(callable),
+            ResolutionScopeKind::Executable,
+            node.start_byte(),
+            node.end_byte(),
+        );
+        let context = LambdaContext {
+            node_id: node.id(),
+            scope,
+            activation_start: body.start_byte(),
+            activation_end: body.end_byte(),
+        };
+        self.scope_stack.push(scope);
+        self.lambda_contexts.push(context);
+        self.exit_actions.push(ExitAction::LambdaContext);
+        TreeWalkAction::DescendWithExit
+    }
+
+    fn enter_catch_clause(&mut self, node: Node<'_>) -> TreeWalkAction {
+        if node.child_by_field_name("body").is_none() {
+            return self.suppress_with_gap(
+                node,
+                ResolutionSiteKind::UnsupportedDeclaration,
+                ResolutionGapKind::MalformedSyntax,
+            );
+        }
+        let scope = self.allocate_scope(
+            self.current_scope(),
+            None,
+            ResolutionScopeKind::Block,
+            node.start_byte(),
+            node.end_byte(),
+        );
+        self.scope_stack.push(scope);
+        self.exit_actions.push(ExitAction::Scope);
+        TreeWalkAction::DescendWithExit
+    }
+
+    fn lower_catch_formal_parameter(&mut self, node: Node<'_>) {
+        let Some(clause) = node
+            .parent()
+            .filter(|parent| parent.kind() == "catch_clause")
+        else {
+            let site = self.add_site(node, ResolutionSiteKind::UnsupportedDeclaration);
+            self.add_gap(site, ResolutionGapKind::MalformedSyntax);
+            return;
+        };
+        let types = named_children(node)
+            .into_iter()
+            .filter(|child| child.kind() == "catch_type")
+            .flat_map(named_children)
+            .filter(|child| self.is_type_syntax(child.kind()))
+            .collect::<Vec<_>>();
+        let Some(name) = node.child_by_field_name("name") else {
+            for type_node in types {
+                self.lower_type(type_node);
+            }
+            let site = self.add_site(node, ResolutionSiteKind::UnsupportedDeclaration);
+            self.add_gap(site, ResolutionGapKind::MalformedSyntax);
+            return;
+        };
+        if name.kind() != "identifier" {
+            for type_node in types {
+                self.lower_type(type_node);
+            }
+            let site = self.add_site(node, ResolutionSiteKind::UnsupportedDeclaration);
+            self.add_gap(site, ResolutionGapKind::UnsupportedScopeOrBinder);
+            return;
+        }
+
+        let scope = self.current_scope();
+        let declaration = self.add_identifier_site(
+            name,
+            ResolutionSiteKind::ValueDeclaration,
+            scope,
+            ResolutionIdentifierRole::Declaration,
+            ResolutionNamespace::Value,
+            None,
+        );
+        let source_declaration = self.record_declaration_source(node, declaration);
+        self.source_collector
+            .mark_lexical(source_declaration, DeclarationKind::CatchParameter);
+        let body = clause
+            .child_by_field_name("body")
+            .expect("validated Java catch clause has a body");
+        let activation_start = body.start_byte();
+        let activation_end = body.end_byte();
+        self.facts.binders.push(ResolutionBinderFact {
+            declaration,
+            scope,
+            kind: ResolutionBinderKind::Local,
+            hoisting: HoistingClass::DeclaredHead,
+            activation_start,
+            activation_end,
+        });
+        self.register_local_value_binder(scope, name, activation_start, activation_end);
+
+        match types.as_slice() {
+            [type_node] => {
+                if let Some(dimensions) = node.child_by_field_name("dimensions") {
+                    self.attach_declaration_gap_type(
+                        declaration,
+                        dimensions,
+                        DeclarationTypeRole::Parameter,
+                        ResolutionGapKind::PostfixArrayDimensions,
+                    );
+                } else {
+                    self.attach_declaration_type(
+                        declaration,
+                        *type_node,
+                        DeclarationTypeRole::Parameter,
+                    );
+                }
+            }
+            [] => self.add_gap(declaration, ResolutionGapKind::MalformedSyntax),
+            _ => {
+                for type_node in types.iter().copied() {
+                    self.lower_type(type_node);
+                }
+                self.add_gap(declaration, ResolutionGapKind::UnsupportedTypeSyntax);
+            }
+        }
+    }
+
+    fn lambda_context_for_parameter(&self, node: Node<'_>) -> Option<LambdaContext> {
+        let lambda = match node.kind() {
+            "formal_parameter" => {
+                let parameters = node.parent()?;
+                let lambda = parameters.parent()?;
+                (parameters.kind() == "formal_parameters"
+                    && lambda.kind() == "lambda_expression"
+                    && lambda.child_by_field_name("parameters") == Some(parameters))
+                .then_some(lambda)?
+            }
+            "inferred_parameters" => {
+                let lambda = node.parent()?;
+                (lambda.kind() == "lambda_expression"
+                    && lambda.child_by_field_name("parameters") == Some(node))
+                .then_some(lambda)?
+            }
+            "identifier" => {
+                let lambda = node.parent()?;
+                (lambda.kind() == "lambda_expression"
+                    && lambda.child_by_field_name("parameters") == Some(node))
+                .then_some(lambda)?
+            }
+            _ => return None,
+        };
+        self.lambda_contexts
+            .last()
+            .copied()
+            .filter(|context| context.node_id == lambda.id())
+    }
+
+    fn lower_lambda_formal_parameter(&mut self, node: Node<'_>, lambda: LambdaContext) {
+        let Some(name) = node
+            .child_by_field_name("name")
+            .filter(|name| name.kind() == "identifier")
+        else {
+            let site = self.add_site_in_scope(
+                node,
+                ResolutionSiteKind::UnsupportedDeclaration,
+                lambda.scope,
+            );
+            self.add_gap(site, ResolutionGapKind::UnsupportedScopeOrBinder);
+            return;
+        };
+        let declaration = self.add_identifier_site(
+            name,
+            ResolutionSiteKind::ValueDeclaration,
+            lambda.scope,
+            ResolutionIdentifierRole::Declaration,
+            ResolutionNamespace::Value,
+            None,
+        );
+        let source_declaration = self.record_declaration_source(node, declaration);
+        self.source_collector
+            .mark_lexical(source_declaration, DeclarationKind::LambdaParameter);
+        self.facts.binders.push(ResolutionBinderFact {
+            declaration,
+            scope: lambda.scope,
+            kind: ResolutionBinderKind::Parameter,
+            hoisting: HoistingClass::ScopeWide,
+            activation_start: lambda.activation_start,
+            activation_end: lambda.activation_end,
+        });
+        self.register_local_value_binder(
+            lambda.scope,
+            name,
+            lambda.activation_start,
+            lambda.activation_end,
+        );
+        let Some(type_node) = node.child_by_field_name("type") else {
+            self.add_gap(declaration, ResolutionGapKind::MalformedSyntax);
+            return;
+        };
+        if let Some(dimensions) = node.child_by_field_name("dimensions") {
+            self.attach_declaration_gap_type(
+                declaration,
+                dimensions,
+                DeclarationTypeRole::Parameter,
+                ResolutionGapKind::PostfixArrayDimensions,
+            );
+        } else {
+            self.attach_declaration_type(declaration, type_node, DeclarationTypeRole::Parameter);
+        }
+    }
+
+    fn lower_lambda_inferred_parameter(&mut self, name: Node<'_>, lambda: LambdaContext) {
+        if name.kind() != "identifier" {
+            let site = self.add_site_in_scope(
+                name,
+                ResolutionSiteKind::UnsupportedDeclaration,
+                lambda.scope,
+            );
+            self.add_gap(site, ResolutionGapKind::UnsupportedScopeOrBinder);
+            return;
+        }
+        let declaration = self.add_identifier_site(
+            name,
+            ResolutionSiteKind::ValueDeclaration,
+            lambda.scope,
+            ResolutionIdentifierRole::Declaration,
+            ResolutionNamespace::Value,
+            None,
+        );
+        let source_declaration =
+            self.record_declaration_source_with_name(name, Some(name), declaration);
+        self.source_collector
+            .mark_lexical(source_declaration, DeclarationKind::LambdaParameter);
+        self.facts.binders.push(ResolutionBinderFact {
+            declaration,
+            scope: lambda.scope,
+            kind: ResolutionBinderKind::Parameter,
+            hoisting: HoistingClass::ScopeWide,
+            activation_start: lambda.activation_start,
+            activation_end: lambda.activation_end,
+        });
+        self.register_local_value_binder(
+            lambda.scope,
+            name,
+            lambda.activation_start,
+            lambda.activation_end,
+        );
+        self.add_gap(declaration, ResolutionGapKind::InferredType);
     }
 
     fn reject_misplaced_directive(
@@ -881,6 +1233,133 @@ impl<'source> JavaResolutionBuilder<'source> {
             );
         }
         self.suppress_semantics()
+    }
+
+    /// Lower annotation names and their structured element values before the
+    /// tree walk suppresses the annotation subtree. Annotation element keys
+    /// are labels, not references; only each pair's `value` field participates
+    /// in name resolution.
+    fn lower_annotation(&mut self, root: Node<'_>) {
+        let mut pending = vec![root];
+        while let Some(node) = pending.pop() {
+            match node.kind() {
+                "annotation" | "marker_annotation" => {
+                    if let Some(name) = node.child_by_field_name("name") {
+                        self.lower_annotation_type_name(name);
+                    } else {
+                        let site = self.add_site(node, ResolutionSiteKind::UnsupportedExpression);
+                        self.add_gap(site, ResolutionGapKind::MalformedSyntax);
+                        self.add_reference_enumeration_gap_if_omitted(
+                            node,
+                            site,
+                            ResolutionGapKind::MalformedSyntax,
+                        );
+                    }
+                    if let Some(arguments) = node.child_by_field_name("arguments") {
+                        pending.push(arguments);
+                    }
+                    if node.has_error() || node.is_missing() {
+                        let site = self.add_site(node, ResolutionSiteKind::UnsupportedExpression);
+                        self.add_gap(site, ResolutionGapKind::MalformedSyntax);
+                        self.add_reference_enumeration_gap_if_omitted(
+                            node,
+                            site,
+                            ResolutionGapKind::MalformedSyntax,
+                        );
+                    }
+                }
+                "annotation_argument_list" | "element_value_array_initializer" => {
+                    pending.extend(named_children(node).into_iter().rev());
+                }
+                "element_value_pair" => {
+                    if let Some(value) = node.child_by_field_name("value") {
+                        pending.push(value);
+                    } else {
+                        let site = self.add_site(node, ResolutionSiteKind::UnsupportedExpression);
+                        self.add_gap(site, ResolutionGapKind::MalformedSyntax);
+                        self.add_reference_enumeration_gap_if_omitted(
+                            node,
+                            site,
+                            ResolutionGapKind::MalformedSyntax,
+                        );
+                    }
+                }
+                _ => {
+                    self.lower_expression(node);
+                }
+            }
+        }
+    }
+
+    fn lower_annotation_type_name(&mut self, node: Node<'_>) {
+        if matches!(node.kind(), "identifier" | "type_identifier") {
+            self.lower_plain_type_reference(node);
+            return;
+        }
+        if node.kind() != "scoped_identifier" {
+            self.lower_unsupported_type(node);
+            return;
+        }
+
+        let mut current = node;
+        let mut members = Vec::new();
+        while current.kind() == "scoped_identifier" {
+            let (Some(scope), Some(name)) = (
+                current.child_by_field_name("scope"),
+                current.child_by_field_name("name"),
+            ) else {
+                self.lower_unsupported_type(node);
+                return;
+            };
+            members.push((current, name));
+            current = scope;
+        }
+        if !matches!(current.kind(), "identifier" | "type_identifier") {
+            self.lower_unsupported_type(node);
+            return;
+        }
+
+        let root_slot = self.lower_plain_type_reference(current);
+        let root_reference = self.slot(root_slot).site;
+        let mut qualifier = root_slot;
+        let mut qualified_sites = Vec::with_capacity(members.len());
+        for (qualified, name) in members.iter().rev().copied() {
+            let reference = self.add_identifier_site(
+                name,
+                ResolutionSiteKind::MemberReference,
+                self.current_scope(),
+                ResolutionIdentifierRole::Reference,
+                ResolutionNamespace::Type,
+                Some(qualifier),
+            );
+            let output = self.add_slot(reference, ResolutionTypeSlotRole::TargetTypeIdentity);
+            self.facts.binding_projections.push(BindingProjectionFact {
+                reference,
+                output,
+                kind: BindingProjectionKind::TargetTypeIdentity,
+            });
+            self.type_slots_by_node.insert(name.id(), output);
+            self.type_slots_by_node.insert(qualified.id(), output);
+            qualified_sites.push(reference);
+            qualifier = output;
+        }
+
+        let terminal = self.slot(qualifier).site;
+        let mut route_segments = vec![self.intern_name(node_text(current, self.source))];
+        route_segments.extend(
+            members
+                .iter()
+                .rev()
+                .map(|(_, name)| self.intern_name(node_text(*name, self.source))),
+        );
+        route_segments
+            .pop()
+            .expect("qualified annotation has a terminal name");
+        self.record_rooted_type_route(terminal, root_reference, route_segments);
+        self.add_gap(root_reference, ResolutionGapKind::AmbiguousQualifiedType);
+        for site in qualified_sites {
+            self.add_gap(site, ResolutionGapKind::AmbiguousQualifiedType);
+        }
     }
 
     fn lower_package_declaration<'tree>(
@@ -1033,12 +1512,16 @@ impl<'source> JavaResolutionBuilder<'source> {
                 Some(names.as_slice())
             }
             ResolutionImportRouteKind::SingleType | ResolutionImportRouteKind::SingleStatic => None,
+            ResolutionImportRouteKind::Named | ResolutionImportRouteKind::Star => {
+                unreachable!("Java imports use Java-specific route kinds")
+            }
         };
         if let Some(segments) = root_segments {
             self.facts.root_imports.push(ResolutionRootImportFact {
                 site,
                 root_scope,
                 anchor: ResolutionRootImportAnchor::Lexical,
+                position: None,
             });
             self.facts
                 .root_import_segments
@@ -1069,6 +1552,9 @@ impl<'source> JavaResolutionBuilder<'source> {
                 ResolutionImportRouteKind::SingleStatic
                 | ResolutionImportRouteKind::StaticOnDemand => {
                     self.pending_static_imports.push((site, bound_name));
+                }
+                ResolutionImportRouteKind::Named | ResolutionImportRouteKind::Star => {
+                    unreachable!("Java imports use Java-specific route kinds")
                 }
             }
         }
@@ -1104,19 +1590,10 @@ impl<'source> JavaResolutionBuilder<'source> {
                     && !explicit_demands.contains(&(identifier.namespace, identifier.name))
                     && seen.insert(identifier.name)
             })
-            .map(|identifier| identifier.name)
+            .map(|identifier| (identifier.namespace, identifier.name))
             .collect::<Vec<_>>();
-        for import_site in &self.pending_type_on_demand_imports {
-            for &name in &demands {
-                self.facts
-                    .root_import_demands
-                    .push(ResolutionRootImportDemandFact {
-                        import_site: *import_site,
-                        namespace: ResolutionNamespace::Type,
-                        name,
-                    });
-            }
-        }
+        self.facts
+            .extend_root_import_demands(&self.pending_type_on_demand_imports, &demands);
 
         // A static import can expose a nested type, a field, or a method. The
         // source reference supplies the requested namespace; selecting a
@@ -1250,6 +1727,9 @@ impl<'source> JavaResolutionBuilder<'source> {
                     route.bound_name.is_none(),
                     "on-demand import cannot bind one source-owned name"
                 ),
+                ResolutionImportRouteKind::Named | ResolutionImportRouteKind::Star => {
+                    unreachable!("Java imports use Java-specific route kinds")
+                }
             }
             validated_segments += segments.len();
         }
@@ -1278,6 +1758,10 @@ impl<'source> JavaResolutionBuilder<'source> {
                 }
             }
             ExitAction::TypeContext => self.exit_type_context(),
+            ExitAction::TypeContextWithParameters => {
+                self.exit_type_context();
+                self.exit_type_parameter_scope();
+            }
             ExitAction::SyntheticTypeContext => {
                 unreachable!("synthetic type contexts exit with their body scope")
             }
@@ -1291,6 +1775,26 @@ impl<'source> JavaResolutionBuilder<'source> {
                     Some(context.declaration),
                     "callable declaration containment must balance"
                 );
+            }
+            ExitAction::CallableContextWithParameters => {
+                let context = self
+                    .callable_contexts
+                    .pop()
+                    .expect("callable context exit must balance");
+                assert_eq!(
+                    self.declaration_contexts.pop(),
+                    Some(context.declaration),
+                    "callable declaration containment must balance"
+                );
+                self.exit_type_parameter_scope();
+            }
+            ExitAction::LambdaContext => {
+                let context = self
+                    .lambda_contexts
+                    .pop()
+                    .expect("lambda context exit must balance");
+                assert!(self.scope_stack.len() > 1, "cannot exit the root scope");
+                assert_eq!(self.scope_stack.pop(), Some(context.scope));
             }
             ExitAction::Suppression => {
                 assert!(self.suppression_depth > 0);
@@ -1329,19 +1833,24 @@ impl<'source> JavaResolutionBuilder<'source> {
         }
     }
 
+    fn exit_type_parameter_scope(&mut self) {
+        assert!(self.scope_stack.len() > 1, "cannot exit the root scope");
+        self.scope_stack.pop();
+    }
+
     fn current_scope(&self) -> ResolutionScopeId {
-        *self
-            .scope_stack
-            .last()
-            .expect("root scope is always present")
+        brokk_bifrost_core::analyzer::resolution_facts::current_scope_id(
+            &self.scope_stack,
+            "root scope is always present",
+        )
     }
 
     fn scope(&self, id: ResolutionScopeId) -> &ResolutionScopeFact {
-        &self.facts.scopes[id.get() as usize]
+        self.facts.scope(id)
     }
 
     fn site(&self, id: ResolutionSiteId) -> &ResolutionSiteFact {
-        &self.facts.sites[id.get() as usize]
+        resolution_site(&self.facts, id)
     }
 
     fn allocate_scope(
@@ -1352,19 +1861,8 @@ impl<'source> JavaResolutionBuilder<'source> {
         start_byte: usize,
         end_byte: usize,
     ) -> ResolutionScopeId {
-        assert!(start_byte <= end_byte);
-        let id = ResolutionScopeId::try_from_index(self.facts.scopes.len())
-            .expect("resolution scope count exceeds u32");
-        self.facts.scopes.push(ResolutionScopeFact {
-            id,
-            parent: Some(parent),
-            owner,
-            kind,
-            inheritance: ResolutionScopeInheritance::Lexical,
-            start_byte,
-            end_byte,
-        });
-        id
+        self.facts
+            .allocate_lexical_scope(parent, owner, kind, start_byte, end_byte)
     }
 
     fn add_site(&mut self, node: Node<'_>, kind: ResolutionSiteKind) -> ResolutionSiteId {
@@ -1388,16 +1886,10 @@ impl<'source> JavaResolutionBuilder<'source> {
         scope: ResolutionScopeId,
     ) -> ResolutionSiteId {
         let range = self.source_collector.occurrence(occurrence).range;
-        let id = ResolutionSiteId::try_from_index(self.facts.sites.len())
-            .expect("resolution site count exceeds u32");
+        let id = self
+            .facts
+            .add_site(scope, kind, range.start_byte, range.end_byte);
         self.site_occurrences.push(occurrence);
-        self.facts.sites.push(ResolutionSiteFact {
-            id,
-            scope,
-            kind,
-            start_byte: range.start_byte,
-            end_byte: range.end_byte,
-        });
         id
     }
 
@@ -1416,9 +1908,7 @@ impl<'source> JavaResolutionBuilder<'source> {
         name: Option<Node<'_>>,
         site: ResolutionSiteId,
     ) -> SourceDeclarationId {
-        let occurrence = self.source_collector.intern_node(node);
-        let name = name.map(|name| self.source_collector.intern_node(name));
-        let declaration = self.source_collector.declare(occurrence, name);
+        let declaration = self.source_collector.declare_node(node, name);
         self.declaration_sources.push((site, declaration));
         assert!(
             self.declaration_sites.insert(node.id(), site).is_none(),
@@ -1428,18 +1918,7 @@ impl<'source> JavaResolutionBuilder<'source> {
     }
 
     fn intern_name(&mut self, spelling: &str) -> ResolutionNameId {
-        if let Some(id) = self.name_ids.get(spelling) {
-            return *id;
-        }
-        let id = ResolutionNameId::try_from_index(self.facts.names.len())
-            .expect("resolution name count exceeds u32");
-        let owned = spelling.to_string();
-        self.name_ids.insert(owned.clone(), id);
-        self.facts.names.push(ResolutionNameFact {
-            id,
-            spelling: owned,
-        });
-        id
+        self.facts.intern_name(&mut self.name_ids, spelling)
     }
 
     fn add_identifier_to_site(
@@ -1450,6 +1929,67 @@ impl<'source> JavaResolutionBuilder<'source> {
         namespace: ResolutionNamespace,
         qualifier: Option<ResolutionTypeSlotId>,
     ) {
+        let name = self.record_identifier_to_site(site, node, role, namespace, qualifier);
+        if role == ResolutionIdentifierRole::Reference
+            && qualifier.is_none()
+            && matches!(
+                namespace,
+                ResolutionNamespace::TypeOrValue
+                    | ResolutionNamespace::Value
+                    | ResolutionNamespace::Callable
+            )
+            && (self.unsupported_implicit_receiver_context_depth > 0
+                || self.scope_has_unsupported_implicit_receiver(self.site(site).scope))
+            && !self.has_visible_local_value(name, self.site(site).scope, node.start_byte())
+        {
+            self.add_gap(site, ResolutionGapKind::UnsupportedImplicitReceiver);
+        }
+    }
+
+    fn add_explicit_this_identifier_to_site(
+        &mut self,
+        site: ResolutionSiteId,
+        node: Node<'_>,
+        role: ResolutionIdentifierRole,
+        namespace: ResolutionNamespace,
+    ) {
+        self.record_identifier_to_site(site, node, role, namespace, None);
+        if self.unsupported_implicit_receiver_context_depth > 0
+            || self.explicit_this_is_in_static_context()
+        {
+            self.add_gap(site, ResolutionGapKind::UnsupportedExpression);
+        }
+    }
+
+    fn explicit_this_is_in_static_context(&self) -> bool {
+        let Some(type_body_scope) = self
+            .type_contexts
+            .last()
+            .and_then(|context| context.body_scope)
+        else {
+            return false;
+        };
+        let mut scope = self.current_scope();
+        while scope != type_body_scope {
+            if self.unsupported_implicit_receiver_scopes.contains(&scope) {
+                return true;
+            }
+            let Some(parent) = self.scope(scope).parent else {
+                return false;
+            };
+            scope = parent;
+        }
+        false
+    }
+
+    fn record_identifier_to_site(
+        &mut self,
+        site: ResolutionSiteId,
+        node: Node<'_>,
+        role: ResolutionIdentifierRole,
+        namespace: ResolutionNamespace,
+        qualifier: Option<ResolutionTypeSlotId>,
+    ) -> ResolutionNameId {
         let spelling = node_text(node, self.source).trim();
         assert!(
             !spelling.is_empty(),
@@ -1477,19 +2017,7 @@ impl<'source> JavaResolutionBuilder<'source> {
                     owner,
                 });
         }
-        if role == ResolutionIdentifierRole::Reference
-            && qualifier.is_none()
-            && matches!(
-                namespace,
-                ResolutionNamespace::TypeOrValue
-                    | ResolutionNamespace::Value
-                    | ResolutionNamespace::Callable
-            )
-            && (self.unsupported_implicit_receiver_context_depth > 0
-                || self.scope_has_unsupported_implicit_receiver(self.site(site).scope))
-        {
-            self.add_gap(site, ResolutionGapKind::UnsupportedImplicitReceiver);
-        }
+        name
     }
 
     fn add_identifier_site(
@@ -1511,12 +2039,7 @@ impl<'source> JavaResolutionBuilder<'source> {
         site: ResolutionSiteId,
         role: ResolutionTypeSlotRole,
     ) -> ResolutionTypeSlotId {
-        let id = ResolutionTypeSlotId::try_from_index(self.facts.type_slots.len())
-            .expect("resolution type slot count exceeds u32");
-        self.facts
-            .type_slots
-            .push(ResolutionTypeSlotFact { id, site, role });
-        id
+        self.facts.allocate_type_slot(site, role)
     }
 
     fn add_transfer(
@@ -1532,6 +2055,8 @@ impl<'source> JavaResolutionBuilder<'source> {
             ResolutionTypeTransferKind::TypeIdentity
             | ResolutionTypeTransferKind::TypeUnion
             | ResolutionTypeTransferKind::Initialization
+            | ResolutionTypeTransferKind::Contextual
+            | ResolutionTypeTransferKind::ExpressionResult
             | ResolutionTypeTransferKind::Assignment
             | ResolutionTypeTransferKind::Receiver
             | ResolutionTypeTransferKind::Argument
@@ -1563,19 +2088,162 @@ impl<'source> JavaResolutionBuilder<'source> {
         value_transform: ResolutionTypeTransferValueTransform,
     ) {
         assert_ne!(input, output);
-        self.facts.type_transfers.push(ResolutionTypeTransferFact {
-            input,
-            output,
-            kind,
-            indirection_delta: 0,
-            reference_indirection_delta: 0,
-            value_transform,
-        });
+        self.facts
+            .type_transfers
+            .push(ResolutionTypeTransferFact::new(
+                input,
+                output,
+                kind,
+                0,
+                0,
+                value_transform,
+            ));
+    }
+
+    /// Put Java type parameters in a declaration-local lexical scope and
+    /// connect each parameter identity to every written upper bound. The
+    /// bounds are producer facts; the shared resolver sees ordinary type
+    /// identities and union transfers, with no Java-specific lookup rule.
+    fn lower_java_type_parameters(&mut self, owner_node: Node<'_>, owner: ResolutionSiteId) {
+        let parameters = java_declared_type_parameters(owner_node);
+        if parameters.is_empty() {
+            return;
+        }
+        let scope = self.allocate_scope(
+            self.current_scope(),
+            Some(owner),
+            ResolutionScopeKind::Block,
+            owner_node.start_byte(),
+            owner_node.end_byte(),
+        );
+        self.scope_stack.push(scope);
+        assert!(self.type_parameter_scopes.insert(owner));
+        let scope_fact = *self.scope(scope);
+        let mut lowered = Vec::with_capacity(parameters.len());
+        for (position, parameter) in parameters.into_iter().enumerate() {
+            let Some(name_node) = java_type_parameter_name_node(parameter) else {
+                continue;
+            };
+            let declaration = self.add_identifier_site(
+                name_node,
+                ResolutionSiteKind::TypeDeclaration,
+                scope,
+                ResolutionIdentifierRole::Declaration,
+                ResolutionNamespace::Type,
+                None,
+            );
+            self.record_declaration_source(parameter, declaration);
+            self.facts.binders.push(ResolutionBinderFact {
+                declaration,
+                scope,
+                kind: ResolutionBinderKind::Type,
+                hoisting: HoistingClass::ScopeWide,
+                activation_start: scope_fact.start_byte,
+                activation_end: scope_fact.end_byte,
+            });
+            let identity = self.add_slot(declaration, ResolutionTypeSlotRole::TargetTypeIdentity);
+            self.facts
+                .declaration_type_slots
+                .push(DeclarationTypeSlotFact {
+                    declaration,
+                    slot: identity,
+                    role: DeclarationTypeRole::Identity,
+                });
+            let name = self.intern_name(node_text(name_node, self.source));
+            let position = dense_ordinal(position, "Java type parameter");
+            let previous = self
+                .type_parameter_positions
+                .entry(owner)
+                .or_default()
+                .insert(name, position);
+            assert!(previous.is_none(), "Java type-parameter names are unique");
+            lowered.push((parameter, declaration, identity));
+        }
+
+        for (parameter, declaration, identity) in lowered {
+            let bounds = java_type_parameter_bounds(parameter);
+            if bounds.is_empty() {
+                // JLS 4.4 supplies java.lang.Object here. Until the platform
+                // type is selected from the indexed workspace, retain the
+                // missing upper-bound surface as an explicit frontier.
+                self.add_gap(
+                    declaration,
+                    ResolutionGapKind::UnsupportedHierarchyTraversal,
+                );
+                continue;
+            }
+            for bound in bounds {
+                self.reference_enclosing_declaration_overrides
+                    .push(declaration);
+                let bound_slot = self.lower_type(bound);
+                assert_eq!(
+                    self.reference_enclosing_declaration_overrides.pop(),
+                    Some(declaration),
+                    "Java type-bound reference owner must balance"
+                );
+                let reference = self.slot(bound_slot).site;
+                let relation = ResolutionTypeRelationId::try_from_index(
+                    self.facts.declared_type_relations.len(),
+                )
+                .expect("Java type-relation count exceeds u32");
+                self.facts
+                    .declared_type_relations
+                    .push(ResolutionDeclaredTypeRelationFact {
+                        id: relation,
+                        subject: identity,
+                        kind: ResolutionDeclaredTypeRelationKind::TraitBound,
+                        target_reference: Some(reference),
+                        target: Some(bound_slot),
+                    });
+                self.add_transfer(bound_slot, identity, ResolutionTypeTransferKind::TypeUnion);
+            }
+        }
+    }
+
+    fn lower_java_callable_result_type_parameter(
+        &mut self,
+        callable: ResolutionSiteId,
+        result_type: Node<'_>,
+    ) {
+        if result_type.kind() != "type_identifier" {
+            return;
+        }
+        let name = self.intern_name(node_text(result_type, self.source));
+        if let Some(&position) = self
+            .type_parameter_positions
+            .get(&callable)
+            .and_then(|positions| positions.get(&name))
+        {
+            self.facts.callable_result_type_parameters.push(
+                ResolutionCallableResultTypeParameterFact {
+                    callable,
+                    position,
+                    indirection_delta: 0,
+                    reference_indirection_delta: 0,
+                },
+            );
+            return;
+        }
+        if let Some(owner) = self.type_contexts.last().map(|context| context.declaration)
+            && let Some(&position) = self
+                .type_parameter_positions
+                .get(&owner)
+                .and_then(|positions| positions.get(&name))
+        {
+            self.facts.callable_result_owner_type_parameters.push(
+                ResolutionCallableResultTypeParameterFact {
+                    callable,
+                    position,
+                    indirection_delta: 0,
+                    reference_indirection_delta: 0,
+                },
+            );
+        }
     }
 
     fn lower_type_declaration(&mut self, node: Node<'_>) -> Option<TypeContext> {
         let name = node.child_by_field_name("name")?;
-        if name.kind() != "identifier" {
+        if !is_spelled_identifier(name) {
             return None;
         }
         let flavor = match node.kind() {
@@ -1665,9 +2333,11 @@ impl<'source> JavaResolutionBuilder<'source> {
             }
         }
 
-        if let Some(body) = node.child_by_field_name("body") {
+        self.lower_java_type_parameters(node, declaration);
+
+        let body_scope = if let Some(body) = node.child_by_field_name("body") {
             let body_scope = self.allocate_scope(
-                binding_scope,
+                self.current_scope(),
                 Some(declaration),
                 ResolutionScopeKind::TypeBody,
                 body.start_byte(),
@@ -1680,9 +2350,13 @@ impl<'source> JavaResolutionBuilder<'source> {
                     "one Java type-body scope per type declaration"
                 );
             }
-        }
+            Some(body_scope)
+        } else {
+            None
+        };
         Some(TypeContext {
             declaration,
+            body_scope,
             name: Some(type_name),
             flavor,
             direct_default_construction_proof_eligible,
@@ -1710,10 +2384,7 @@ impl<'source> JavaResolutionBuilder<'source> {
             ),
             "only anonymous creation and enum-constant bodies are synthetic classes"
         );
-        let enclosing = *self
-            .type_contexts
-            .last()
-            .expect("synthetic Java classes are nested in a declared type");
+        let enclosing = self.type_contexts.last().copied();
         let declaration = self.add_site(body, ResolutionSiteKind::TypeDeclaration);
         let position = body.start_position();
         let synthetic_name_text = format!("$anon${}:{}", position.row, position.column);
@@ -1739,8 +2410,8 @@ impl<'source> JavaResolutionBuilder<'source> {
         } else {
             let reference = self.add_site(body, ResolutionSiteKind::TypeReference);
             let name = enclosing
-                .name
-                .expect("enum declarations have a structured source name");
+                .and_then(|context| context.name)
+                .expect("enum constant bodies are nested under their declaring enum");
             self.facts.identifiers.push(PositionedIdentifierFact {
                 site: reference,
                 name,
@@ -1777,6 +2448,7 @@ impl<'source> JavaResolutionBuilder<'source> {
         );
         self.type_contexts.push(TypeContext {
             declaration,
+            body_scope: Some(body_scope),
             name: None,
             flavor: TypeFlavor::Class,
             direct_default_construction_proof_eligible: false,
@@ -1792,7 +2464,7 @@ impl<'source> JavaResolutionBuilder<'source> {
         let Some(name) = node.child_by_field_name("name") else {
             return;
         };
-        if name.kind() != "identifier" {
+        if !is_spelled_identifier(name) {
             return;
         }
         let scope_id = self.current_scope();
@@ -1855,7 +2527,7 @@ impl<'source> JavaResolutionBuilder<'source> {
         let Some(name) = children.get(type_index + 1).copied() else {
             return;
         };
-        if name.kind() != "identifier" {
+        if !is_spelled_identifier(name) {
             let site = self.add_site(pattern, ResolutionSiteKind::UnsupportedDeclaration);
             self.add_gap(site, ResolutionGapKind::UnsupportedScopeOrBinder);
             return;
@@ -1896,7 +2568,7 @@ impl<'source> JavaResolutionBuilder<'source> {
             if expression.kind() == "pattern" || expression.kind() == "guard" {
                 continue;
             }
-            if expression.kind() == "identifier" {
+            if is_spelled_identifier(expression) {
                 if constant_variable_selector {
                     self.lower_value_reference_in_namespace(expression, ResolutionNamespace::Value);
                 } else {
@@ -1924,7 +2596,7 @@ impl<'source> JavaResolutionBuilder<'source> {
         } else {
             Some(selector)
         };
-        let Some(binding) = binding.filter(|node| node.kind() == "identifier") else {
+        let Some(binding) = binding.filter(|node| is_spelled_identifier(*node)) else {
             return false;
         };
         let Some(type_slot) = self.visible_value_type_slot(binding) else {
@@ -2009,7 +2681,7 @@ impl<'source> JavaResolutionBuilder<'source> {
 
     fn lower_callable_declaration(&mut self, node: Node<'_>) -> Option<CallableContext> {
         let name = node.child_by_field_name("name")?;
-        if name.kind() != "identifier" || self.current_type_owner().is_none() {
+        if !is_spelled_identifier(name) || self.current_type_owner().is_none() {
             return None;
         }
         let callable_properties = self.source_callable_shape_for(node).properties();
@@ -2033,6 +2705,7 @@ impl<'source> JavaResolutionBuilder<'source> {
         );
         let source_declaration = self.record_declaration_source(node, declaration);
         self.add_declaration_visibility(declaration, node, source_declaration);
+        let signature_index = self.facts.callable_signatures.len();
         self.facts
             .callable_signatures
             .push(ResolutionCallableSignatureFact {
@@ -2109,6 +2782,8 @@ impl<'source> JavaResolutionBuilder<'source> {
             });
         }
 
+        self.lower_java_type_parameters(node, declaration);
+
         let body = node.child_by_field_name("body");
         let (body_start, body_end) = body
             .map(|body| (body.start_byte(), body.end_byte()))
@@ -2117,7 +2792,7 @@ impl<'source> JavaResolutionBuilder<'source> {
             .child_by_field_name("parameters")
             .map_or(body_start, |parameters| parameters.start_byte());
         let callable_scope = self.allocate_scope(
-            binding_scope,
+            self.current_scope(),
             Some(declaration),
             ResolutionScopeKind::Executable,
             executable_start,
@@ -2137,7 +2812,15 @@ impl<'source> JavaResolutionBuilder<'source> {
         if let Some(return_type) = node.child_by_field_name("type") {
             self.reference_enclosing_declaration_overrides
                 .push(declaration);
-            self.attach_declaration_type(declaration, return_type, DeclarationTypeRole::Return);
+            let value_type =
+                self.attach_declaration_type(declaration, return_type, DeclarationTypeRole::Return);
+            self.facts.callable_signatures[signature_index]
+                .result_types
+                .push(ResolutionCallableResultTypeFact {
+                    ordinal: 0,
+                    value_type,
+                });
+            self.lower_java_callable_result_type_parameter(declaration, return_type);
             assert_eq!(
                 self.reference_enclosing_declaration_overrides.pop(),
                 Some(declaration),
@@ -2174,11 +2857,55 @@ impl<'source> JavaResolutionBuilder<'source> {
         self.body_scopes.insert(body.id(), scope);
     }
 
+    fn add_parameter_binder_fact(
+        &mut self,
+        declaration: ResolutionSiteId,
+        scope: ResolutionScopeId,
+        activation_start: usize,
+        activation_end: usize,
+    ) {
+        self.facts.binders.push(ResolutionBinderFact {
+            declaration,
+            scope,
+            kind: ResolutionBinderKind::Parameter,
+            hoisting: HoistingClass::ScopeWide,
+            activation_start,
+            activation_end,
+        });
+    }
+
+    fn next_callable_parameter_ordinal(&mut self, callable: ResolutionSiteId) -> u32 {
+        let next = self.next_parameter_ordinal.entry(callable).or_insert(0);
+        let ordinal = *next;
+        *next += 1;
+        ordinal
+    }
+
+    fn record_callable_parameter_fact(
+        &mut self,
+        callable: ResolutionSiteId,
+        ordinal: u32,
+        parameter: ResolutionSiteId,
+        value_type: ResolutionTypeSlotId,
+        repeated: bool,
+    ) {
+        self.facts
+            .callable_parameters
+            .push(ResolutionCallableParameterFact {
+                callable,
+                list_ordinal: 0,
+                ordinal,
+                parameter,
+                value_type,
+                repeated,
+            });
+    }
+
     fn lower_parameter(&mut self, node: Node<'_>) {
         let Some(name) = node.child_by_field_name("name") else {
             return;
         };
-        if name.kind() != "identifier" {
+        if !is_spelled_identifier(name) {
             return;
         }
         let Some(callable) = self.callable_contexts.last().copied() else {
@@ -2195,14 +2922,18 @@ impl<'source> JavaResolutionBuilder<'source> {
         let source_declaration = self.record_declaration_source(node, declaration);
         self.source_collector
             .mark_lexical(source_declaration, DeclarationKind::Parameter);
-        self.facts.binders.push(ResolutionBinderFact {
+        self.add_parameter_binder_fact(
             declaration,
-            scope: callable.scope,
-            kind: ResolutionBinderKind::Parameter,
-            hoisting: HoistingClass::ScopeWide,
-            activation_start: callable.activation_start,
-            activation_end: callable.activation_end,
-        });
+            callable.scope,
+            callable.activation_start,
+            callable.activation_end,
+        );
+        self.register_local_value_binder(
+            callable.scope,
+            name,
+            callable.activation_start,
+            callable.activation_end,
+        );
 
         let Some(type_node) = node.child_by_field_name("type") else {
             return;
@@ -2218,29 +2949,19 @@ impl<'source> JavaResolutionBuilder<'source> {
         } else {
             self.attach_declaration_type(declaration, type_node, DeclarationTypeRole::Parameter)
         };
-        let ordinal = {
-            let next = self
-                .next_parameter_ordinal
-                .entry(callable.declaration)
-                .or_insert(0);
-            let ordinal = *next;
-            *next += 1;
-            ordinal
-        };
+        let ordinal = self.next_callable_parameter_ordinal(callable.declaration);
         let repeated = self
             .source_callable_shape_for_node(callable.source_node_id)
             .repeated_for(node.id())
             .expect("Java native parameter must have a captured source shape");
         assert!(!repeated, "formal parameters cannot be repeated");
-        self.facts
-            .callable_parameters
-            .push(ResolutionCallableParameterFact {
-                callable: callable.declaration,
-                ordinal,
-                parameter: declaration,
-                value_type,
-                repeated,
-            });
+        self.record_callable_parameter_fact(
+            callable.declaration,
+            ordinal,
+            declaration,
+            value_type,
+            repeated,
+        );
     }
 
     fn lower_spread_parameter(&mut self, node: Node<'_>) -> bool {
@@ -2262,7 +2983,7 @@ impl<'source> JavaResolutionBuilder<'source> {
         let Some(name) = declarator.child_by_field_name("name") else {
             return false;
         };
-        if name.kind() != "identifier" {
+        if !is_spelled_identifier(name) {
             return false;
         }
         let Some(callable) = self.callable_contexts.last().copied() else {
@@ -2279,14 +3000,12 @@ impl<'source> JavaResolutionBuilder<'source> {
         let source_declaration = self.record_declaration_source(declarator, declaration);
         self.source_collector
             .mark_lexical(source_declaration, DeclarationKind::Parameter);
-        self.facts.binders.push(ResolutionBinderFact {
+        self.add_parameter_binder_fact(
             declaration,
-            scope: callable.scope,
-            kind: ResolutionBinderKind::Parameter,
-            hoisting: HoistingClass::ScopeWide,
-            activation_start: callable.activation_start,
-            activation_end: callable.activation_end,
-        });
+            callable.scope,
+            callable.activation_start,
+            callable.activation_end,
+        );
         let value_type = if let Some(dimensions) = declarator.child_by_field_name("dimensions") {
             self.attach_declaration_gap_type(
                 declaration,
@@ -2297,29 +3016,19 @@ impl<'source> JavaResolutionBuilder<'source> {
         } else {
             self.attach_declaration_type(declaration, type_node, DeclarationTypeRole::Parameter)
         };
-        let ordinal = {
-            let next = self
-                .next_parameter_ordinal
-                .entry(callable.declaration)
-                .or_insert(0);
-            let ordinal = *next;
-            *next += 1;
-            ordinal
-        };
+        let ordinal = self.next_callable_parameter_ordinal(callable.declaration);
         let repeated = self
             .source_callable_shape_for_node(callable.source_node_id)
             .repeated_for(node.id())
             .expect("Java native spread parameter must have a captured source shape");
         assert!(repeated, "spread parameters must be repeated");
-        self.facts
-            .callable_parameters
-            .push(ResolutionCallableParameterFact {
-                callable: callable.declaration,
-                ordinal,
-                parameter: declaration,
-                value_type,
-                repeated,
-            });
+        self.record_callable_parameter_fact(
+            callable.declaration,
+            ordinal,
+            declaration,
+            value_type,
+            repeated,
+        );
         true
     }
 
@@ -2334,14 +3043,20 @@ impl<'source> JavaResolutionBuilder<'source> {
         let field_is_static = is_field && self.source_field_shape_for(declaration_form).is_static;
         let scope_id = self.current_scope();
         let scope = *self.scope(scope_id);
-        for node in named_children(declaration_form)
+        let declaration_children = named_children(declaration_form);
+        let single_declarator = declaration_children
+            .iter()
+            .filter(|child| child.kind() == "variable_declarator")
+            .count()
+            == 1;
+        for node in declaration_children
             .into_iter()
             .filter(|child| child.kind() == "variable_declarator")
         {
             let Some(name) = node.child_by_field_name("name") else {
                 continue;
             };
-            if name.kind() != "identifier" {
+            if !is_spelled_identifier(name) {
                 continue;
             }
             let declaration = self.add_identifier_site(
@@ -2359,6 +3074,13 @@ impl<'source> JavaResolutionBuilder<'source> {
                 self.source_collector
                     .mark_lexical(source_declaration, DeclarationKind::LocalVariable);
             }
+            let activation_start = if is_field {
+                scope.start_byte
+            } else if let Some(initializer) = node.child_by_field_name("value") {
+                initializer.start_byte()
+            } else {
+                node.end_byte()
+            };
             self.facts.binders.push(ResolutionBinderFact {
                 declaration,
                 scope: scope_id,
@@ -2372,15 +3094,12 @@ impl<'source> JavaResolutionBuilder<'source> {
                 } else {
                     HoistingClass::SourceOrder
                 },
-                activation_start: if is_field {
-                    scope.start_byte
-                } else if let Some(initializer) = node.child_by_field_name("value") {
-                    initializer.start_byte()
-                } else {
-                    node.end_byte()
-                },
+                activation_start,
                 activation_end: scope.end_byte,
             });
+            if !is_field {
+                self.register_local_value_binder(scope_id, name, activation_start, scope.end_byte);
+            }
 
             if is_field && let Some(owner) = self.type_contexts.last().copied() {
                 self.facts.member_owners.push(ResolutionMemberOwnerFact {
@@ -2400,25 +3119,68 @@ impl<'source> JavaResolutionBuilder<'source> {
                 });
             }
 
+            let inferred_type = if !is_field
+                && single_declarator
+                && node.child_by_field_name("dimensions").is_none()
+            {
+                let source_type = self.capture_source_type(type_node);
+                self.source_types.is_inferred_type(source_type)
+            } else {
+                false
+            };
+            let inferred_initializer = if inferred_type {
+                node.child_by_field_name("value")
+                    .map(|value| self.lower_expression(value))
+            } else {
+                None
+            };
             if is_field {
                 self.reference_enclosing_declaration_overrides
                     .push(declaration);
             }
-            if let Some(dimensions) = node.child_by_field_name("dimensions") {
+            if let Some(initializer) = inferred_initializer {
+                // JLS 14.4.1: a local var declaration takes its static type
+                // from the initializer's produced value.
+                assert_eq!(type_node.kind(), "type_identifier");
+                assert!(
+                    self.claimed_identifier_nodes.insert(type_node.id()),
+                    "one inferred local declaration claims its var token"
+                );
+                let value_type = self.add_slot(declaration, ResolutionTypeSlotRole::DeclaredValue);
+                self.facts
+                    .declaration_type_slots
+                    .push(DeclarationTypeSlotFact {
+                        declaration,
+                        slot: value_type,
+                        role: DeclarationTypeRole::Value,
+                    });
+                self.add_transfer(
+                    initializer,
+                    value_type,
+                    ResolutionTypeTransferKind::Initialization,
+                );
+                assert!(
+                    self.declaration_type_slots
+                        .insert(declaration, value_type)
+                        .is_none(),
+                    "one Java declaration has one declared-value slot"
+                );
+            } else if let Some(dimensions) = node.child_by_field_name("dimensions") {
                 self.attach_declaration_gap_type(
                     declaration,
                     dimensions,
                     DeclarationTypeRole::Value,
                     ResolutionGapKind::PostfixArrayDimensions,
-                )
+                );
             } else {
-                self.attach_declaration_type(declaration, type_node, DeclarationTypeRole::Value)
-            };
+                self.attach_declaration_type(declaration, type_node, DeclarationTypeRole::Value);
+            }
             if let Some(value) = node.child_by_field_name("value") {
                 if field_is_static {
                     self.unsupported_implicit_receiver_context_depth += 1;
                 }
-                let initializer = self.lower_expression(value);
+                let initializer =
+                    inferred_initializer.unwrap_or_else(|| self.lower_expression(value));
                 if field_is_static {
                     assert!(self.unsupported_implicit_receiver_context_depth > 0);
                     self.unsupported_implicit_receiver_context_depth -= 1;
@@ -2441,6 +3203,20 @@ impl<'source> JavaResolutionBuilder<'source> {
     }
 
     fn lower_return(&mut self, node: Node<'_>) {
+        if let Some(lambda) = self.lambda_contexts.last().copied().filter(|lambda| {
+            lambda.activation_start <= node.start_byte() && node.end_byte() <= lambda.activation_end
+        }) {
+            let lambda_is_nearest_callable = self.callable_contexts.last().is_none_or(|callable| {
+                lambda.activation_start >= callable.activation_start
+                    && lambda.activation_end <= callable.activation_end
+            });
+            if lambda_is_nearest_callable {
+                if let Some(value) = first_named_child(node) {
+                    self.lower_expression(value);
+                }
+                return;
+            }
+        }
         let Some(callable) = self.callable_contexts.last().copied() else {
             return;
         };
@@ -2465,6 +3241,16 @@ impl<'source> JavaResolutionBuilder<'source> {
         role: DeclarationTypeRole,
     ) -> ResolutionTypeSlotId {
         let input = self.lower_type(type_node);
+        self.attach_lowered_declaration_type(declaration, input, type_node, role)
+    }
+
+    fn attach_lowered_declaration_type(
+        &mut self,
+        declaration: ResolutionSiteId,
+        input: ResolutionTypeSlotId,
+        type_node: Node<'_>,
+        role: DeclarationTypeRole,
+    ) -> ResolutionTypeSlotId {
         let output = self.add_slot(declaration, ResolutionTypeSlotRole::DeclaredValue);
         self.facts
             .declaration_type_slots
@@ -2478,10 +3264,10 @@ impl<'source> JavaResolutionBuilder<'source> {
         } else {
             ResolutionTypeTransferValueTransform::ToRuntime { addressable: false }
         };
-        self.add_transfer_with_transform(
+        crate::call_arguments::publish_jvm_declared_type_transfer(
+            &mut self.facts,
             input,
             output,
-            ResolutionTypeTransferKind::DeclaredType,
             value_transform,
         );
         self.declaration_type_slots.insert(declaration, output);
@@ -2496,27 +3282,7 @@ impl<'source> JavaResolutionBuilder<'source> {
         gap: ResolutionGapKind,
     ) -> ResolutionTypeSlotId {
         let input = self.lower_gap_type(type_node, gap);
-        let output = self.add_slot(declaration, ResolutionTypeSlotRole::DeclaredValue);
-        self.facts
-            .declaration_type_slots
-            .push(DeclarationTypeSlotFact {
-                declaration,
-                slot: output,
-                role,
-            });
-        let value_transform = if type_node.kind() == "void_type" {
-            ResolutionTypeTransferValueTransform::ToNoValue
-        } else {
-            ResolutionTypeTransferValueTransform::ToRuntime { addressable: false }
-        };
-        self.add_transfer_with_transform(
-            input,
-            output,
-            ResolutionTypeTransferKind::DeclaredType,
-            value_transform,
-        );
-        self.declaration_type_slots.insert(declaration, output);
-        output
+        self.attach_lowered_declaration_type(declaration, input, type_node, role)
     }
 
     fn lower_inheritance_clause(&mut self, node: Node<'_>) {
@@ -2588,6 +3354,7 @@ impl<'source> JavaResolutionBuilder<'source> {
                 root_scope: self.facts.scopes[0].id,
                 anchor: ResolutionRootImportAnchor::Absolute,
                 prefix_reference: None,
+                owner_continued: false,
             });
         for (position, spelling) in ["java", "lang"].into_iter().enumerate() {
             let name = self.intern_name(spelling);
@@ -2599,8 +3366,24 @@ impl<'source> JavaResolutionBuilder<'source> {
                     name,
                 });
         }
+        for parent in self
+            .facts
+            .supertypes
+            .iter_mut()
+            .filter(|parent| parent.subtype == subtype)
+        {
+            parent.parent_ordinal = parent
+                .parent_ordinal
+                .checked_add(1)
+                .expect("a declaration's parent count fits u32");
+        }
+        let next = self.next_parent_ordinal.entry(subtype).or_default();
+        *next = next
+            .checked_add(1)
+            .expect("a declaration's parent count fits u32");
         self.facts.supertypes.push(ResolutionSupertypeFact {
             subtype,
+            parent_ordinal: 0,
             supertype_reference: reference,
             supertype_slot: slot,
             kind: ResolutionSupertypeKind::ImplicitSuperclass,
@@ -2637,8 +3420,10 @@ impl<'source> JavaResolutionBuilder<'source> {
             self.add_gap(subtype, ResolutionGapKind::UnsupportedHierarchyTraversal);
             return;
         }
+        let parent_ordinal = self.take_parent_ordinal(subtype);
         self.facts.supertypes.push(ResolutionSupertypeFact {
             subtype,
+            parent_ordinal,
             supertype_reference,
             supertype_slot,
             kind,
@@ -2660,8 +3445,10 @@ impl<'source> JavaResolutionBuilder<'source> {
             self.site(supertype_reference).kind,
             ResolutionSiteKind::TypeReference | ResolutionSiteKind::MemberReference
         ));
+        let parent_ordinal = self.take_parent_ordinal(subtype);
         self.facts.supertypes.push(ResolutionSupertypeFact {
             subtype,
+            parent_ordinal,
             supertype_reference,
             supertype_slot,
             kind,
@@ -2672,10 +3459,18 @@ impl<'source> JavaResolutionBuilder<'source> {
         );
     }
 
-    /// Generic arguments are not yet a typed relation family, but the base
-    /// type still owns the hierarchy reference. Walk through nested generic
-    /// wrappers iteratively so the unsupported frontier remains explicit while
-    /// the positioned base reference retains its subtype owner.
+    fn take_parent_ordinal(&mut self, subtype: ResolutionSiteId) -> u32 {
+        let next = self.next_parent_ordinal.entry(subtype).or_default();
+        let ordinal = *next;
+        *next = next
+            .checked_add(1)
+            .expect("a declaration's parent count fits u32");
+        ordinal
+    }
+
+    /// The base type still owns the hierarchy reference. Walk nested generic
+    /// wrappers iteratively so argument rows retain their owner without
+    /// recursive source-tree traversal.
     fn lower_supertype_base(&mut self, node: Node<'_>) -> Option<ResolutionTypeSlotId> {
         let mut current = node;
         loop {
@@ -2693,95 +3488,195 @@ impl<'source> JavaResolutionBuilder<'source> {
         }
     }
 
-    /// Iteratively lowers wrappers and scoped type paths. The explicit stack
-    /// keeps generated or adversarially deep qualified names stack-safe.
+    /// Iteratively lowers generic, array, and scoped type syntax. The explicit
+    /// postorder stack keeps generated or adversarially deep types stack-safe.
     fn lower_type(&mut self, node: Node<'_>) -> ResolutionTypeSlotId {
         if let Some(slot) = self.type_slots_by_node.get(&node.id()) {
             return *slot;
         }
-
-        let mut wrappers = Vec::new();
-        let mut current = node;
-        let base = loop {
-            if let Some(slot) = self.type_slots_by_node.get(&current.id()) {
-                break *slot;
+        let mut pending = vec![(node, false)];
+        let mut qualified_base_nodes = Vec::new();
+        let mut seen_qualified_bases = HashSet::default();
+        let mut qualified_member_sites = Vec::new();
+        while let Some((current, finishing)) = pending.pop() {
+            if self.type_slots_by_node.contains_key(&current.id()) {
+                continue;
+            }
+            // Error recovery can insert a zero-width MISSING token of any type
+            // kind, which spells nothing to resolve.
+            if current.is_missing() || current.is_error() {
+                self.lower_gap_type(current, ResolutionGapKind::MalformedSyntax);
+                continue;
             }
             let source_type = self.capture_source_type(current);
             let shape = self
                 .source_types
                 .shape(source_type)
                 .expect("captured Java source type has a shape");
+            if finishing {
+                match current.kind() {
+                    "generic_type" => {
+                        let base = current
+                            .child_by_field_name("type")
+                            .or_else(|| java_named_type_child(current))
+                            .expect("Java generic type has a base type");
+                        let owner = self.type_slots_by_node[&base.id()];
+                        let arguments = java_type_argument_nodes(current);
+                        assert!(
+                            !arguments.is_empty(),
+                            "captured Java generic syntax has at least one type argument"
+                        );
+                        for (ordinal, argument) in arguments.into_iter().enumerate() {
+                            self.facts.declared_type_arguments.push(
+                                ResolutionDeclaredTypeArgumentFact {
+                                    owner,
+                                    ordinal: dense_ordinal(ordinal, "Java type argument"),
+                                    argument: self.type_slots_by_node[&argument.id()],
+                                },
+                            );
+                        }
+                        self.type_slots_by_node.insert(current.id(), owner);
+                    }
+                    "scoped_type_identifier" => {
+                        let Some((scope, name)) =
+                            scoped_type_parts(current).filter(|(_, name)| !name.is_missing())
+                        else {
+                            let slot = self.lower_unsupported_type(current);
+                            self.type_slots_by_node.insert(current.id(), slot);
+                            continue;
+                        };
+                        let qualifier = self.type_slots_by_node[&scope.id()];
+                        let reference = self.add_identifier_site(
+                            name,
+                            ResolutionSiteKind::MemberReference,
+                            self.current_scope(),
+                            ResolutionIdentifierRole::Reference,
+                            ResolutionNamespace::Type,
+                            Some(qualifier),
+                        );
+                        let slot =
+                            self.add_slot(reference, ResolutionTypeSlotRole::TargetTypeIdentity);
+                        self.facts.binding_projections.push(BindingProjectionFact {
+                            reference,
+                            output: slot,
+                            kind: BindingProjectionKind::TargetTypeIdentity,
+                        });
+                        qualified_member_sites.push(reference);
+                        self.record_qualified_type_root(current, reference);
+                        self.type_slots_by_node.insert(name.id(), slot);
+                        self.type_slots_by_node.insert(current.id(), slot);
+                    }
+                    "array_type" => {
+                        let element = current
+                            .child_by_field_name("element")
+                            .expect("captured Java array has an element type");
+                        let element = self.type_slots_by_node[&element.id()];
+                        let slot = self.lower_structural_array_type(current, element);
+                        self.type_slots_by_node.insert(current.id(), slot);
+                    }
+                    _ => unreachable!("only structured Java type wrappers finish"),
+                }
+                continue;
+            }
             match (current.kind(), shape) {
-                // Type arguments require their own normalized relation. Until
-                // that row family exists, preserving only the raw type would
-                // falsely certify a complete typed frontier.
-                ("generic_type", _) => break self.lower_unsupported_type(current),
+                ("generic_type", JavaTypeSyntaxShape::Generic { .. }) => {
+                    let Some(base) = current
+                        .child_by_field_name("type")
+                        .or_else(|| java_named_type_child(current))
+                    else {
+                        let slot = self.lower_unsupported_type(current);
+                        self.type_slots_by_node.insert(current.id(), slot);
+                        continue;
+                    };
+                    let arguments = java_type_argument_nodes(current);
+                    if arguments.is_empty() {
+                        let slot = self.lower_unsupported_type(current);
+                        self.type_slots_by_node.insert(current.id(), slot);
+                        continue;
+                    }
+                    pending.push((current, true));
+                    for argument in arguments.into_iter().rev() {
+                        pending.push((argument, false));
+                    }
+                    pending.push((base, false));
+                }
                 ("scoped_type_identifier", _) => {
                     let Some((scope, _)) = scoped_type_parts(current) else {
-                        break self.lower_unsupported_type(current);
+                        let slot = self.lower_unsupported_type(current);
+                        self.type_slots_by_node.insert(current.id(), slot);
+                        continue;
                     };
-                    wrappers.push(current);
-                    current = scope;
+                    let mut base = current;
+                    loop {
+                        match base.kind() {
+                            "generic_type" => {
+                                let Some(inner) = base
+                                    .child_by_field_name("type")
+                                    .or_else(|| java_named_type_child(base))
+                                else {
+                                    break;
+                                };
+                                base = inner;
+                            }
+                            "scoped_type_identifier" => {
+                                let Some((inner, _)) = scoped_type_parts(base) else {
+                                    break;
+                                };
+                                base = inner;
+                            }
+                            _ => break,
+                        }
+                    }
+                    if seen_qualified_bases.insert(base.id()) {
+                        qualified_base_nodes.push(base.id());
+                    }
+                    pending.push((current, true));
+                    pending.push((scope, false));
+                }
+                ("array_type", _) => {
+                    let Some(element) = current.child_by_field_name("element") else {
+                        let slot = self.lower_unsupported_type(current);
+                        self.type_slots_by_node.insert(current.id(), slot);
+                        continue;
+                    };
+                    pending.push((current, true));
+                    pending.push((element, false));
                 }
                 ("type_identifier", JavaTypeSyntaxShape::Named { .. }) => {
-                    break self.lower_plain_type_reference(current);
+                    self.lower_plain_type_reference(current);
                 }
                 ("type_identifier", JavaTypeSyntaxShape::Unknown)
                     if self.source_types.is_inferred_type(source_type) =>
                 {
-                    break self.lower_gap_type(current, ResolutionGapKind::InferredType);
+                    self.lower_gap_type(current, ResolutionGapKind::InferredType);
                 }
-                ("array_type", _) => break self.lower_structural_array_type(current),
                 (
                     "integral_type" | "floating_point_type" | "boolean_type" | "void_type",
                     JavaTypeSyntaxShape::NonNominal,
                 ) => {
-                    break self.lower_intrinsic_type(current, IntrinsicTypeKind::Primitive);
+                    self.lower_intrinsic_type(current, IntrinsicTypeKind::Primitive);
                 }
-                _ => break self.lower_unsupported_type(current),
+                _ => {
+                    self.lower_unsupported_type(current);
+                }
             }
-        };
-
-        if !wrappers.is_empty() {
-            let base_site = self.slot(base).site;
-            self.add_gap(base_site, ResolutionGapKind::AmbiguousQualifiedType);
         }
-        let mut output = base;
-        while let Some(wrapper) = wrappers.pop() {
-            output = match wrapper.kind() {
-                "scoped_type_identifier" => {
-                    let Some((_, name)) = scoped_type_parts(wrapper) else {
-                        output = self.lower_unsupported_type(wrapper);
-                        continue;
-                    };
-                    let reference = self.add_identifier_site(
-                        name,
-                        ResolutionSiteKind::MemberReference,
-                        self.current_scope(),
-                        ResolutionIdentifierRole::Reference,
-                        ResolutionNamespace::Type,
-                        Some(output),
-                    );
-                    let slot = self.add_slot(reference, ResolutionTypeSlotRole::TargetTypeIdentity);
-                    self.facts.binding_projections.push(BindingProjectionFact {
-                        reference,
-                        output: slot,
-                        kind: BindingProjectionKind::TargetTypeIdentity,
-                    });
-                    self.add_gap(reference, ResolutionGapKind::AmbiguousQualifiedType);
-                    self.record_qualified_type_root(wrapper, reference);
-                    self.type_slots_by_node.insert(name.id(), slot);
-                    slot
-                }
-                _ => unreachable!("only known wrappers are pushed"),
-            };
-            self.type_slots_by_node.insert(wrapper.id(), output);
+        for base in qualified_base_nodes {
+            let slot = self.type_slots_by_node[&base];
+            let site = self.slot(slot).site;
+            self.add_gap(site, ResolutionGapKind::AmbiguousQualifiedType);
         }
-        self.type_slots_by_node.insert(node.id(), output);
-        output
+        for site in qualified_member_sites {
+            self.add_gap(site, ResolutionGapKind::AmbiguousQualifiedType);
+        }
+        self.type_slots_by_node[&node.id()]
     }
 
-    fn lower_structural_array_type(&mut self, node: Node<'_>) -> ResolutionTypeSlotId {
+    fn lower_structural_array_type(
+        &mut self,
+        node: Node<'_>,
+        element: ResolutionTypeSlotId,
+    ) -> ResolutionTypeSlotId {
         let site = self.add_site(node, ResolutionSiteKind::TypeReference);
         let container = self.add_slot(site, ResolutionTypeSlotRole::TargetTypeIdentity);
         let name = self.intern_name("structural-type");
@@ -2811,11 +3706,7 @@ impl<'source> JavaResolutionBuilder<'source> {
             });
             containers.push(nested);
         }
-        let Some(element_node) = node.child_by_field_name("element") else {
-            self.add_gap(site, ResolutionGapKind::MalformedSyntax);
-            return container;
-        };
-        let mut component = self.lower_type(element_node);
+        let mut component = element;
         for container in containers.into_iter().rev() {
             self.facts
                 .type_components
@@ -2856,6 +3747,18 @@ impl<'source> JavaResolutionBuilder<'source> {
         segments.push(self.intern_name(node_text(current, self.source)));
         segments.reverse();
         segments.pop().expect("qualified type has a terminal name");
+        self.record_rooted_type_route(reference, prefix, segments);
+    }
+
+    fn record_rooted_type_route(
+        &mut self,
+        reference: ResolutionSiteId,
+        prefix: ResolutionSiteId,
+        segments: Vec<ResolutionNameId>,
+    ) {
+        if self.site(prefix).kind != ResolutionSiteKind::TypeReference {
+            return;
+        }
         self.facts
             .root_references
             .push(ResolutionRootReferenceFact {
@@ -2863,13 +3766,14 @@ impl<'source> JavaResolutionBuilder<'source> {
                 root_scope: self.facts.scopes[0].id,
                 anchor: ResolutionRootImportAnchor::Lexical,
                 prefix_reference: Some(prefix),
+                owner_continued: false,
             });
         self.facts
             .root_reference_segments
             .extend(segments.into_iter().enumerate().map(|(position, name)| {
                 ResolutionRootReferenceSegmentFact {
                     reference,
-                    position: u32::try_from(position).expect("Java type route fits source offsets"),
+                    position: dense_ordinal(position, "Java type route segment"),
                     name,
                 }
             }));
@@ -2888,11 +3792,9 @@ impl<'source> JavaResolutionBuilder<'source> {
             None,
         );
         let slot = self.add_slot(reference, ResolutionTypeSlotRole::TargetTypeIdentity);
-        self.facts.binding_projections.push(BindingProjectionFact {
-            reference,
-            output: slot,
-            kind: BindingProjectionKind::TargetTypeIdentity,
-        });
+        self.facts
+            .binding_projections
+            .push(BindingProjectionFact::target_type_identity(reference, slot));
         self.type_slots_by_node.insert(node.id(), slot);
         slot
     }
@@ -2905,16 +3807,18 @@ impl<'source> JavaResolutionBuilder<'source> {
         if let Some(slot) = self.type_slots_by_node.get(&node.id()) {
             return *slot;
         }
+        // Error recovery can wrap a MISSING keyword in a zero-width intrinsic
+        // type node, which spells nothing to seed.
+        if node.is_missing() || node.has_error() {
+            return self.lower_gap_type(node, ResolutionGapKind::MalformedSyntax);
+        }
         let site = self.add_site(node, ResolutionSiteKind::TypeReference);
         let slot = self.add_slot(site, ResolutionTypeSlotRole::TargetTypeIdentity);
         let spelling = node_text(node, self.source).trim();
         let name = self.intern_name(spelling);
-        self.facts.intrinsic_type_seeds.push(IntrinsicTypeSeedFact {
-            output: slot,
-            name,
-            kind,
-            indirection: 0,
-        });
+        self.facts
+            .intrinsic_type_seeds
+            .push(IntrinsicTypeSeedFact::direct(slot, name, kind));
         self.type_slots_by_node.insert(node.id(), slot);
         slot
     }
@@ -2927,12 +3831,22 @@ impl<'source> JavaResolutionBuilder<'source> {
         if let Some(slot) = self.type_slots_by_node.get(&node.id()) {
             return *slot;
         }
+        let slot = self.add_gap_slot(node, kind, ResolutionTypeSlotRole::TargetTypeIdentity);
+        self.type_slots_by_node.insert(node.id(), slot);
+        slot
+    }
+
+    fn add_gap_slot(
+        &mut self,
+        node: Node<'_>,
+        kind: ResolutionGapKind,
+        role: ResolutionTypeSlotRole,
+    ) -> ResolutionTypeSlotId {
         let site = self.add_site(node, ResolutionSiteKind::UnsupportedExpression);
-        let slot = self.add_slot(site, ResolutionTypeSlotRole::TargetTypeIdentity);
+        let slot = self.add_slot(site, role);
         self.add_gap(site, kind);
         self.add_reference_enumeration_gap_if_omitted(node, site, kind);
         self.gapped_semantic_subtrees.insert(node.id());
-        self.type_slots_by_node.insert(node.id(), slot);
         slot
     }
 
@@ -2970,7 +3884,7 @@ impl<'source> JavaResolutionBuilder<'source> {
                     };
                     stack.push((node, true));
                     stack.push((right, false));
-                    if left.kind() == "identifier" && !left.is_missing() {
+                    if is_spelled_identifier(left) {
                         self.lower_value_location_reference(left);
                     } else {
                         stack.push((left, false));
@@ -2988,13 +3902,27 @@ impl<'source> JavaResolutionBuilder<'source> {
                     stack.push((right, false));
                     stack.push((left, false));
                 }
+                "ternary_expression" => {
+                    let (Some(condition), Some(consequence), Some(alternative)) = (
+                        node.child_by_field_name("condition"),
+                        node.child_by_field_name("consequence"),
+                        node.child_by_field_name("alternative"),
+                    ) else {
+                        self.lower_unsupported_expression(node);
+                        continue;
+                    };
+                    stack.push((node, true));
+                    stack.push((alternative, false));
+                    stack.push((consequence, false));
+                    stack.push((condition, false));
+                }
                 "update_expression" => {
                     let Some(operand) = first_named_child(node) else {
                         self.lower_unsupported_expression(node);
                         continue;
                     };
                     stack.push((node, true));
-                    if operand.kind() == "identifier" {
+                    if is_spelled_identifier(operand) {
                         self.lower_value_location_reference(operand);
                     } else {
                         stack.push((operand, false));
@@ -3039,6 +3967,28 @@ impl<'source> JavaResolutionBuilder<'source> {
                         stack.push((inner, false));
                     }
                 }
+                "class_literal" => {
+                    let Some(type_node) = first_named_child(node) else {
+                        self.lower_unsupported_expression_as(
+                            node,
+                            ResolutionGapKind::MalformedSyntax,
+                        );
+                        continue;
+                    };
+                    stack.push((node, true));
+                    self.lower_type(type_node);
+                }
+                "cast_expression" => {
+                    let (Some(_type), Some(value)) = (
+                        node.child_by_field_name("type"),
+                        node.child_by_field_name("value"),
+                    ) else {
+                        self.lower_unsupported_expression(node);
+                        continue;
+                    };
+                    stack.push((node, true));
+                    stack.push((value, false));
+                }
                 "unary_expression" => {
                     let Some(operator) = node.child_by_field_name("operator") else {
                         self.lower_unsupported_expression(node);
@@ -3057,10 +4007,7 @@ impl<'source> JavaResolutionBuilder<'source> {
                         self.lower_unsupported_expression(node);
                     }
                 }
-                "lambda_expression" => self.lower_unsupported_expression_as(
-                    node,
-                    ResolutionGapKind::UnsupportedScopeOrBinder,
-                ),
+                "lambda_expression" => self.lower_unsupported_expression_preserving_children(node),
                 "method_reference" => self.lower_unsupported_expression(node),
                 "identifier"
                 | "string_literal"
@@ -3092,10 +4039,13 @@ impl<'source> JavaResolutionBuilder<'source> {
             "assignment_expression" => self.finish_assignment_expression(node),
             "update_expression" => self.finish_update_expression(node),
             "binary_expression" => self.finish_binary_expression(node),
+            "ternary_expression" => self.finish_ternary_expression(node),
             "method_invocation" => self.finish_method_invocation(node),
             "field_access" => self.finish_field_access(node),
             "object_creation_expression" => self.finish_object_creation(node),
             "switch_expression" => self.lower_unsupported_expression_preserving_children(node),
+            "class_literal" => self.finish_class_literal_expression(node),
+            "cast_expression" => self.finish_cast_expression(node),
             "parenthesized_expression" | "unary_expression" => {
                 let Some(inner) = first_named_child(node) else {
                     self.lower_unsupported_expression(node);
@@ -3123,6 +4073,35 @@ impl<'source> JavaResolutionBuilder<'source> {
         }
     }
 
+    fn finish_cast_expression(&mut self, node: Node<'_>) {
+        let (Some(type_node), Some(_value)) = (
+            node.child_by_field_name("type"),
+            node.child_by_field_name("value"),
+        ) else {
+            self.lower_unsupported_expression(node);
+            return;
+        };
+        let type_slot = self.lower_type(type_node);
+        let Some(type_seed) = self
+            .facts
+            .intrinsic_type_seeds
+            .iter()
+            .find(|seed| seed.output == type_slot)
+            .copied()
+            .filter(|seed| seed.kind == IntrinsicTypeKind::Primitive && seed.indirection == 0)
+        else {
+            self.lower_unsupported_expression(node);
+            return;
+        };
+        let site = self.add_site(node, ResolutionSiteKind::UnaryExpression);
+        let output = self.add_slot(site, ResolutionTypeSlotRole::ExpressionValue);
+        self.facts.intrinsic_type_seeds.push(IntrinsicTypeSeedFact {
+            output,
+            ..type_seed
+        });
+        self.expression_slots_by_node.insert(node.id(), output);
+    }
+
     fn finish_assignment_expression(&mut self, node: Node<'_>) {
         let (Some(left), Some(right)) = (
             node.child_by_field_name("left"),
@@ -3132,8 +4111,7 @@ impl<'source> JavaResolutionBuilder<'source> {
             return;
         };
         debug_assert!(self.expression_slots_by_node.contains_key(&right.id()));
-        self.expression_slots_by_node
-            .insert(node.id(), self.expression_slot(left));
+        self.finish_expression_with_value(node, left);
     }
 
     fn finish_update_expression(&mut self, node: Node<'_>) {
@@ -3141,13 +4119,18 @@ impl<'source> JavaResolutionBuilder<'source> {
             self.lower_unsupported_expression(node);
             return;
         };
+        self.finish_expression_with_value(node, operand);
+    }
+
+    fn finish_expression_with_value(&mut self, expression: Node<'_>, value: Node<'_>) {
         self.expression_slots_by_node
-            .insert(node.id(), self.expression_slot(operand));
+            .insert(expression.id(), self.expression_slot(value));
     }
 
     fn finish_binary_expression(&mut self, node: Node<'_>) {
-        let (Some(left), Some(right)) = (
+        let (Some(left), Some(operator), Some(right)) = (
             node.child_by_field_name("left"),
+            node.child_by_field_name("operator"),
             node.child_by_field_name("right"),
         ) else {
             self.lower_unsupported_expression(node);
@@ -3155,12 +4138,83 @@ impl<'source> JavaResolutionBuilder<'source> {
         };
         debug_assert!(self.expression_slots_by_node.contains_key(&left.id()));
         debug_assert!(self.expression_slots_by_node.contains_key(&right.id()));
-        let site = self.add_site(node, ResolutionSiteKind::UnsupportedExpression);
+        let operator = node_text(operator, self.source);
+        let has_boolean_result = matches!(
+            operator,
+            "==" | "!=" | "<" | "<=" | ">" | ">=" | "&&" | "||"
+        );
+        let site = self.add_site(
+            node,
+            if has_boolean_result {
+                ResolutionSiteKind::BinaryExpression
+            } else {
+                ResolutionSiteKind::UnsupportedExpression
+            },
+        );
         let output = self.add_slot(site, ResolutionTypeSlotRole::ExpressionValue);
-        // Java's operator-specific promotion is not represented yet. Retain
-        // both structured operands, but do not publish a guessed result type
-        // until that source-owned rule family exists.
-        self.add_gap(site, ResolutionGapKind::InferredType);
+        if has_boolean_result {
+            let name = self.intern_name("boolean");
+            self.facts.intrinsic_type_seeds.push(IntrinsicTypeSeedFact {
+                output,
+                name,
+                kind: IntrinsicTypeKind::Primitive,
+                indirection: 0,
+            });
+        } else {
+            // Numeric and string operator result promotion is not represented
+            // yet. Keep both operands and identify the missing rule locally.
+            self.add_gap(site, ResolutionGapKind::InferredType);
+        }
+        self.expression_slots_by_node.insert(node.id(), output);
+    }
+
+    fn finish_ternary_expression(&mut self, node: Node<'_>) {
+        let (Some(condition), Some(consequence), Some(alternative)) = (
+            node.child_by_field_name("condition"),
+            node.child_by_field_name("consequence"),
+            node.child_by_field_name("alternative"),
+        ) else {
+            self.lower_unsupported_expression(node);
+            return;
+        };
+        debug_assert!(self.expression_slots_by_node.contains_key(&condition.id()));
+        debug_assert!(
+            self.expression_slots_by_node
+                .contains_key(&consequence.id())
+        );
+        debug_assert!(
+            self.expression_slots_by_node
+                .contains_key(&alternative.id())
+        );
+        let site = self.add_site(node, ResolutionSiteKind::ConditionalExpression);
+        let output = self.add_slot(site, ResolutionTypeSlotRole::ExpressionValue);
+        let consequence_type = self
+            .facts
+            .intrinsic_type_seeds
+            .iter()
+            .find(|seed| seed.output == self.expression_slot(consequence))
+            .copied();
+        let alternative_type = self
+            .facts
+            .intrinsic_type_seeds
+            .iter()
+            .find(|seed| seed.output == self.expression_slot(alternative))
+            .copied();
+        if let (Some(consequence_type), Some(alternative_type)) =
+            (consequence_type, alternative_type)
+            && consequence_type.name == alternative_type.name
+            && consequence_type.kind == alternative_type.kind
+            && consequence_type.indirection == alternative_type.indirection
+        {
+            self.facts.intrinsic_type_seeds.push(IntrinsicTypeSeedFact {
+                output,
+                ..consequence_type
+            });
+        } else {
+            // The JLS branch-promotion rules are not represented yet. Preserve
+            // the expression and its branches while keeping its type gap open.
+            self.add_gap(site, ResolutionGapKind::InferredType);
+        }
         self.expression_slots_by_node.insert(node.id(), output);
     }
 
@@ -3217,16 +4271,23 @@ impl<'source> JavaResolutionBuilder<'source> {
             self.lower_unsupported_expression(node);
             return;
         };
+        if name.is_missing() {
+            self.lower_unsupported_expression_as(node, ResolutionGapKind::MalformedSyntax);
+            return;
+        }
         let call = self.add_site(node, ResolutionSiteKind::Call);
-        let receiver = node.child_by_field_name("object").map(|object| {
-            let input = self.expression_slot(object);
-            let output = self.add_slot(call, ResolutionTypeSlotRole::Receiver);
-            self.add_transfer(input, output, ResolutionTypeTransferKind::Receiver);
-            output
-        });
+        let object = node.child_by_field_name("object");
+        let receiver = object
+            .filter(|object| object.kind() != "this")
+            .map(|object| {
+                let input = self.expression_slot(object);
+                let output = self.add_slot(call, ResolutionTypeSlotRole::Receiver);
+                self.add_transfer(input, output, ResolutionTypeTransferKind::Receiver);
+                output
+            });
         let callee = self.add_identifier_site(
             name,
-            if receiver.is_some() {
+            if object.is_some() {
                 ResolutionSiteKind::MemberReference
             } else {
                 ResolutionSiteKind::CallableReference
@@ -3249,14 +4310,13 @@ impl<'source> JavaResolutionBuilder<'source> {
             output: result,
             kind: BindingProjectionKind::TargetCallableResultType,
         });
-        self.facts.calls.push(ResolutionCallFact {
+        self.facts.add_single_result_call(
             call,
             callee,
             receiver,
             result,
-            extra_result_slots: Vec::new(),
-            explicit_type_argument_count: explicit_type_argument_count(node),
-        });
+            explicit_type_argument_count(node),
+        );
         self.facts
             .engine_rule_eligibilities
             .push(ResolutionEngineRuleEligibilityFact {
@@ -3276,9 +4336,18 @@ impl<'source> JavaResolutionBuilder<'source> {
             self.lower_unsupported_expression_as(node, ResolutionGapKind::MalformedSyntax);
             return;
         }
-        let reference = self.add_site(field, ResolutionSiteKind::MemberReference);
         let object = node.child_by_field_name("object");
         let explicit_this = object.is_some_and(|object| object.kind() == "this");
+        let reference_scope = if explicit_this {
+            self.type_contexts
+                .last()
+                .and_then(|context| context.body_scope)
+                .expect("an explicit Java this member access has a current type body")
+        } else {
+            self.current_scope()
+        };
+        let reference =
+            self.add_site_in_scope(field, ResolutionSiteKind::MemberReference, reference_scope);
         let qualifier = object.and_then(|object| {
             if explicit_this {
                 None
@@ -3289,17 +4358,22 @@ impl<'source> JavaResolutionBuilder<'source> {
                 Some(output)
             }
         });
-        self.add_identifier_to_site(
-            reference,
-            field,
-            ResolutionIdentifierRole::Reference,
-            if explicit_this {
-                ResolutionNamespace::Value
-            } else {
-                ResolutionNamespace::TypeOrValue
-            },
-            qualifier,
-        );
+        if explicit_this {
+            self.add_explicit_this_identifier_to_site(
+                reference,
+                field,
+                ResolutionIdentifierRole::Reference,
+                ResolutionNamespace::Value,
+            );
+        } else {
+            self.add_identifier_to_site(
+                reference,
+                field,
+                ResolutionIdentifierRole::Reference,
+                ResolutionNamespace::TypeOrValue,
+                qualifier,
+            );
+        }
         let output = self.add_slot(reference, ResolutionTypeSlotRole::ExpressionValue);
         self.facts.binding_projections.push(BindingProjectionFact {
             reference,
@@ -3337,18 +4411,20 @@ impl<'source> JavaResolutionBuilder<'source> {
                 output
             });
         let constructed_type = self.lower_type(type_node);
-        let Some(name) = self.type_terminal_name(type_node) else {
+        let Some(name) = self
+            .type_terminal_name(type_node)
+            .filter(|name| !name.is_missing())
+        else {
             let callee = self.add_site(type_node, ResolutionSiteKind::UnsupportedExpression);
             self.add_gap(callee, ResolutionGapKind::UnsupportedTypeSyntax);
             let result = self.add_slot(call, ResolutionTypeSlotRole::CallResult);
-            self.facts.calls.push(ResolutionCallFact {
+            self.facts.add_single_result_call(
                 call,
                 callee,
                 receiver,
                 result,
-                extra_result_slots: Vec::new(),
-                explicit_type_argument_count: explicit_type_argument_count(node),
-            });
+                explicit_type_argument_count(node),
+            );
             self.attach_call_arguments(node, call);
             self.expression_slots_by_node.insert(node.id(), result);
             return;
@@ -3368,14 +4444,13 @@ impl<'source> JavaResolutionBuilder<'source> {
             output: result,
             kind: BindingProjectionKind::TargetConstructorOwnerType,
         });
-        self.facts.calls.push(ResolutionCallFact {
+        self.facts.add_single_result_call(
             call,
             callee,
             receiver,
             result,
-            extra_result_slots: Vec::new(),
-            explicit_type_argument_count: explicit_type_argument_count(node),
-        });
+            explicit_type_argument_count(node),
+        );
         self.facts
             .engine_rule_eligibilities
             .push(ResolutionEngineRuleEligibilityFact {
@@ -3384,6 +4459,19 @@ impl<'source> JavaResolutionBuilder<'source> {
             });
         self.attach_call_arguments(node, call);
         self.expression_slots_by_node.insert(node.id(), result);
+    }
+
+    fn finish_class_literal_expression(&mut self, node: Node<'_>) {
+        if first_named_child(node).is_none() {
+            self.lower_unsupported_expression_as(node, ResolutionGapKind::MalformedSyntax);
+            return;
+        }
+        let site = self.add_site(node, ResolutionSiteKind::UnsupportedExpression);
+        let output = self.add_slot(site, ResolutionTypeSlotRole::ExpressionValue);
+        // The literal's operand is a resolved type reference above. The
+        // runtime Class<?> result type is not modeled by the Java facts yet.
+        self.add_gap(site, ResolutionGapKind::InferredType);
+        self.expression_slots_by_node.insert(node.id(), output);
     }
 
     fn type_terminal_name<'tree>(&self, root: Node<'tree>) -> Option<Node<'tree>> {
@@ -3431,12 +4519,9 @@ impl<'source> JavaResolutionBuilder<'source> {
         let site = self.add_site(node, ResolutionSiteKind::Literal);
         let output = self.add_slot(site, ResolutionTypeSlotRole::ExpressionValue);
         let name = self.intern_name(spelling);
-        self.facts.intrinsic_type_seeds.push(IntrinsicTypeSeedFact {
-            output,
-            name,
-            kind,
-            indirection: 0,
-        });
+        self.facts
+            .intrinsic_type_seeds
+            .push(IntrinsicTypeSeedFact::direct(output, name, kind));
         self.expression_slots_by_node.insert(node.id(), output);
     }
 
@@ -3456,11 +4541,7 @@ impl<'source> JavaResolutionBuilder<'source> {
         if self.expression_slots_by_node.contains_key(&node.id()) {
             return;
         }
-        let site = self.add_site(node, ResolutionSiteKind::UnsupportedExpression);
-        let output = self.add_slot(site, ResolutionTypeSlotRole::ExpressionValue);
-        self.add_gap(site, kind);
-        self.add_reference_enumeration_gap_if_omitted(node, site, kind);
-        self.gapped_semantic_subtrees.insert(node.id());
+        let output = self.add_gap_slot(node, kind, ResolutionTypeSlotRole::ExpressionValue);
         self.expression_slots_by_node.insert(node.id(), output);
     }
 
@@ -3482,17 +4563,24 @@ impl<'source> JavaResolutionBuilder<'source> {
     }
 
     fn slot(&self, id: ResolutionTypeSlotId) -> &ResolutionTypeSlotFact {
-        &self.facts.type_slots[id.get() as usize]
+        self.facts.type_slot(id)
     }
 
     fn push_call_dependencies<'tree>(
-        &self,
+        &mut self,
         node: Node<'tree>,
         stack: &mut Vec<(Node<'tree>, bool)>,
     ) {
         self.push_argument_dependencies(node, stack);
         if let Some(object) = node.child_by_field_name("object") {
-            stack.push((object, false));
+            if object.kind() == "this" {
+                // The current instance is represented by the callable
+                // receiver origin and lexical type scope. It is not an
+                // unsupported expression whose value needs a guessed type.
+                assert!(self.claimed_identifier_nodes.insert(object.id()));
+            } else {
+                stack.push((object, false));
+            }
         }
     }
 
@@ -3505,7 +4593,10 @@ impl<'source> JavaResolutionBuilder<'source> {
             return;
         };
         let mut cursor = arguments.walk();
-        let values = arguments.named_children(&mut cursor).collect::<Vec<_>>();
+        let values = arguments
+            .named_children(&mut cursor)
+            .filter(|value| !value.is_extra())
+            .collect::<Vec<_>>();
         stack.extend(values.into_iter().rev().map(|value| (value, false)));
     }
 
@@ -3514,15 +4605,20 @@ impl<'source> JavaResolutionBuilder<'source> {
             return;
         };
         let mut cursor = arguments.walk();
-        for (ordinal, argument) in arguments.named_children(&mut cursor).enumerate() {
+        for (ordinal, argument) in arguments
+            .named_children(&mut cursor)
+            .filter(|argument| !argument.is_extra())
+            .enumerate()
+        {
             let input = self.expression_slot(argument);
-            let value = self.add_slot(call, ResolutionTypeSlotRole::Argument);
-            self.add_transfer(input, value, ResolutionTypeTransferKind::Argument);
-            self.facts.call_arguments.push(ResolutionCallArgumentFact {
+            crate::call_arguments::publish_jvm_call_argument(
+                &mut self.facts,
                 call,
-                ordinal: dense_ordinal(ordinal, "call argument"),
-                value,
-            });
+                0,
+                dense_ordinal(ordinal, "call argument"),
+                Some(input),
+                None,
+            );
         }
     }
 
@@ -3535,6 +4631,46 @@ impl<'source> JavaResolutionBuilder<'source> {
     fn scope_has_unsupported_implicit_receiver(&self, mut scope: ResolutionScopeId) -> bool {
         loop {
             if self.unsupported_implicit_receiver_scopes.contains(&scope) {
+                return true;
+            }
+            let Some(parent) = self.scope(scope).parent else {
+                return false;
+            };
+            scope = parent;
+        }
+    }
+
+    fn register_local_value_binder(
+        &mut self,
+        scope: ResolutionScopeId,
+        name: Node<'_>,
+        activation_start: usize,
+        activation_end: usize,
+    ) {
+        let spelling = node_text(name, self.source).trim();
+        let name = self.intern_name(spelling);
+        self.local_value_binders_by_scope
+            .entry((scope, name))
+            .or_default()
+            .push((activation_start, activation_end));
+    }
+
+    fn has_visible_local_value(
+        &self,
+        name: ResolutionNameId,
+        mut scope: ResolutionScopeId,
+        byte: usize,
+    ) -> bool {
+        loop {
+            if self
+                .local_value_binders_by_scope
+                .get(&(scope, name))
+                .is_some_and(|bindings| {
+                    bindings
+                        .iter()
+                        .any(|&(start, end)| start <= byte && byte < end)
+                })
+            {
                 return true;
             }
             let Some(parent) = self.scope(scope).parent else {
@@ -3572,10 +4708,7 @@ impl<'source> JavaResolutionBuilder<'source> {
     }
 
     fn add_gap(&mut self, site: ResolutionSiteId, kind: ResolutionGapKind) {
-        let gap = ResolutionGapFact { site, kind };
-        if !self.facts.gaps.contains(&gap) {
-            self.facts.gaps.push(gap);
-        }
+        self.facts.add_gap(site, kind);
     }
 
     fn add_reference_enumeration_gap_if_omitted(
@@ -3595,10 +4728,9 @@ impl<'source> JavaResolutionBuilder<'source> {
     fn subtree_has_unclaimed_reference_occurrence(&self, root: Node<'_>) -> bool {
         let mut stack = vec![root];
         while let Some(node) = stack.pop() {
-            if matches!(
-                node.kind(),
-                "identifier" | "type_identifier" | "this" | "super"
-            ) && !self.claimed_identifier_nodes.contains(&node.id())
+            if (is_spelled_identifier(node)
+                || matches!(node.kind(), "type_identifier" | "this" | "super"))
+                && !self.claimed_identifier_nodes.contains(&node.id())
             {
                 return true;
             }
@@ -3609,10 +4741,7 @@ impl<'source> JavaResolutionBuilder<'source> {
     }
 
     fn add_reference_enumeration_gap(&mut self, site: ResolutionSiteId, kind: ResolutionGapKind) {
-        let gap = ResolutionReferenceEnumerationGapFact { site, kind };
-        if !self.facts.reference_enumeration_gaps.contains(&gap) {
-            self.facts.reference_enumeration_gaps.push(gap);
-        }
+        self.facts.add_reference_enumeration_gap(site, kind);
     }
 
     fn add_declaration_visibility(
@@ -3641,10 +4770,7 @@ impl<'source> JavaResolutionBuilder<'source> {
     }
 
     pub(super) fn set_source_type_shape(&mut self, node: Node<'_>, shape: JavaTypeShape) {
-        assert!(
-            self.source_type_shapes.insert(node.id(), shape).is_none(),
-            "one Java native type-shape handoff per declaration node"
-        );
+        insert_source_shape(&mut self.source_type_shapes, node, shape, "type");
     }
 
     pub(super) fn source_type_shape_for(&self, node: Node<'_>) -> JavaTypeShape {
@@ -3655,10 +4781,7 @@ impl<'source> JavaResolutionBuilder<'source> {
     }
 
     pub(super) fn set_source_field_shape(&mut self, node: Node<'_>, shape: JavaFieldShape) {
-        assert!(
-            self.source_field_shapes.insert(node.id(), shape).is_none(),
-            "one Java native field-shape handoff per declaration node"
-        );
+        insert_source_shape(&mut self.source_field_shapes, node, shape, "field");
     }
 
     pub(super) fn source_field_shape_for(&self, node: Node<'_>) -> JavaFieldShape {
@@ -3669,24 +4792,31 @@ impl<'source> JavaResolutionBuilder<'source> {
     }
 
     pub(super) fn set_source_callable_shape(&mut self, node: Node<'_>, shape: JavaCallableShape) {
-        assert!(
-            self.source_callable_shapes
-                .insert(node.id(), shape)
-                .is_none(),
-            "one Java native callable-shape handoff per declaration node"
-        );
+        insert_source_shape(&mut self.source_callable_shapes, node, shape, "callable");
     }
 
     pub(super) fn source_callable_shape_for(&self, node: Node<'_>) -> &JavaCallableShape {
-        self.source_callable_shapes
-            .get(&node.id())
-            .expect("Java native callable-shape use must follow source capture")
+        self.source_callable_shape_by_node_id(
+            node.id(),
+            "Java native callable-shape use must follow source capture",
+        )
     }
 
     fn source_callable_shape_for_node(&self, node_id: usize) -> &JavaCallableShape {
+        self.source_callable_shape_by_node_id(
+            node_id,
+            "Java native parameter use must follow callable source capture",
+        )
+    }
+
+    fn source_callable_shape_by_node_id(
+        &self,
+        node_id: usize,
+        missing_message: &str,
+    ) -> &JavaCallableShape {
         self.source_callable_shapes
             .get(&node_id)
-            .expect("Java native parameter use must follow callable source capture")
+            .unwrap_or_else(|| panic!("{missing_message}"))
     }
 
     fn record_scoped_type_visibility(&mut self, declaration: ResolutionSiteId) {
@@ -3753,13 +4883,9 @@ impl<'source> JavaResolutionBuilder<'source> {
             "throws"
                 | "permits"
                 | "module_declaration"
-                | "lambda_expression"
-                | "catch_clause"
-                | "catch_formal_parameter"
                 | "resource"
                 | "enhanced_for_statement"
                 | "for_statement"
-                | "type_parameter"
                 | "record_pattern"
                 | "receiver_parameter"
         )
@@ -3798,7 +4924,7 @@ impl<'source> JavaResolutionBuilder<'source> {
         let text = node_text(node, self.source).trim();
         if !text.is_empty()
             && (matches!(node.kind(), "type_identifier" | "scoped_type_identifier")
-                || (node.kind() == "identifier"
+                || (is_spelled_identifier(node)
                     && looks_like_pascal_identifier(text)
                     && !is_declared_name(node)))
         {
@@ -3924,18 +5050,11 @@ fn callable_receiver_origin(node: Node<'_>) -> ResolutionCallableReceiverOrigin 
     }
 }
 
-fn dense_ordinal(index: usize, relation: &str) -> u32 {
-    u32::try_from(index).unwrap_or_else(|_| panic!("{relation} count exceeds u32"))
-}
-
 fn explicit_type_argument_count(node: Node<'_>) -> u32 {
-    node.child_by_field_name("type_arguments")
-        .map_or(0, |arguments| {
-            dense_ordinal(
-                named_children(arguments).len(),
-                "Java explicit invocation type argument",
-            )
-        })
+    dense_ordinal(
+        brokk_bifrost_core::analyzer::tree_walk::named_child_count_by_field(node, "type_arguments"),
+        "Java explicit invocation type argument",
+    )
 }
 
 #[cfg(test)]
@@ -3943,14 +5062,9 @@ mod tests {
     use super::*;
     use brokk_bifrost_core::analyzer::ProjectFile;
     use brokk_bifrost_core::analyzer::parsed_file::ParsedFile;
-    use tree_sitter::Parser;
 
     fn parse_file(source: &str) -> ParsedFile {
-        let mut parser = Parser::new();
-        parser
-            .set_language(&tree_sitter_java::LANGUAGE.into())
-            .expect("java grammar");
-        let tree = parser.parse(source, None).expect("java tree");
+        let tree = super::super::declarations::parse_tree(source).expect("java tree");
         let root = std::env::current_dir()
             .expect("current directory")
             .join("java-resolution-fixture-root");
@@ -3969,6 +5083,9 @@ mod tests {
     }
 
     #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#3739: a recovered MISSING Java operand panicked during resolution instead of remaining a syntax gap"
+    )]
     fn recovered_missing_operand_is_a_malformed_syntax_gap() {
         // Recovery inserts a zero-width MISSING identifier as the right
         // operand of `true +` (#3739).
@@ -3986,70 +5103,123 @@ mod tests {
     }
 
     #[test]
-    fn file_has_one_compilation_unit_placement_boundary() {
-        let facts = parse("class A {}");
-        let placement = facts
-            .gaps
-            .iter()
-            .filter(|gap| gap.kind == ResolutionGapKind::UnsupportedPlacementBoundary)
-            .collect::<Vec<_>>();
-        assert_eq!(placement.len(), 1);
-        let site = site(&facts, placement[0].site);
-        assert_eq!(
-            facts.scopes[site.scope.index()].kind,
-            ResolutionScopeKind::CompilationUnit
-        );
-        assert_eq!(facts.packages.len(), 1);
-        assert_eq!(facts.packages[0].root_scope, site.scope);
-        assert_eq!(facts.packages[0].declaration, None);
-        assert_eq!(facts.packages[0].placement_gap_site, site.id);
-        assert!(facts.package_segments.is_empty());
-    }
-
-    #[test]
-    fn package_lookup_uses_actual_top_level_types_and_unqualified_references() {
+    fn recovered_missing_names_are_malformed_syntax_gaps() {
+        // Recovery inserts zero-width MISSING tokens that report the kind they
+        // stand in for; a declaration or expression gate that admits one meets
+        // the identifier spelling invariant with an empty range (#4290).
         for source in [
-            "package use; class Outer { class Nested {} Peer field; dep.Remote qualified; } class Peer {}",
-            "class Outer { class Nested {} Peer field; dep.Remote qualified; } class Peer {}",
+            "static DEVICE_ID = \"\";",
+            "class A { static DEVICE_ID = \"\"; }",
         ] {
             let facts = parse(source);
-            facts.validate_package_relations();
-            let member_names = facts
-                .package_members
-                .iter()
-                .map(|member| {
-                    let identifier = facts
-                        .identifiers
-                        .iter()
-                        .find(|identifier| identifier.site == member.declaration)
-                        .unwrap();
-                    assert_eq!(member.namespace, ResolutionNamespace::Type);
-                    name(&facts, identifier.name)
-                })
-                .collect::<Vec<_>>();
-            assert_eq!(member_names, ["Outer", "Peer"]);
-            let references = facts
-                .package_references
-                .iter()
-                .map(|reference| {
-                    let identifier = facts
-                        .identifiers
-                        .iter()
-                        .find(|identifier| identifier.site == reference.reference)
-                        .unwrap();
-                    assert_eq!(reference.root_scope, facts.packages[0].root_scope);
-                    name(&facts, identifier.name)
-                })
-                .collect::<Vec<_>>();
-            assert!(references.contains(&"Peer"), "{references:?}");
-            assert!(!references.contains(&"Remote"), "{references:?}");
+            assert!(
+                facts
+                    .gaps
+                    .iter()
+                    .any(|gap| gap.kind == ResolutionGapKind::MalformedSyntax),
+                "{source:?}: {:?}",
+                facts.gaps
+            );
         }
-        let malformed = parse("package broken.; class A { Peer field; }");
-        assert!(malformed.package_members.is_empty());
-        assert!(malformed.package_references.is_empty());
+        // The sibling declaration and expression gates reject MISSING names
+        // the same way; each recovered snippet must surface some gap rather
+        // than panic.
+        for source in [
+            "class {}",
+            "class A { void () {} }",
+            "class A { void f(int) {} }",
+            "class A { void f(int...) {} }",
+            "class A { void f() { foo.(); } }",
+            "class A { void f() { new (); } }",
+            "class A { B. x; }",
+            "class A { void f() { ++; } }",
+        ] {
+            let facts = parse(source);
+            assert!(!facts.gaps.is_empty(), "{source:?}");
+        }
     }
 
     #[test]
+    fn package_lookup_includes_type_or_value_qualified_receivers() {
+        let facts = parse(
+            "package use; class Caller { void call() { Peer.call(); } } class Peer { static void call() {} }",
+        );
+        let receiver = facts
+            .identifiers
+            .iter()
+            .find(|identifier| {
+                identifier.role == ResolutionIdentifierRole::Reference
+                    && identifier.namespace == ResolutionNamespace::TypeOrValue
+                    && name(&facts, identifier.name) == "Peer"
+            })
+            .expect("qualified Java expression receiver has a type/value reference");
+        assert!(
+            facts
+                .package_references
+                .iter()
+                .any(|reference| reference.reference == receiver.site)
+        );
+    }
+
+    #[test]
+    fn top_level_anonymous_class_body_needs_no_enclosing_type() {
+        // tree-sitter-java admits top-level statements (JEP 463), so an
+        // anonymous class body can appear without any declared type (#4364).
+        let facts = parse("package p; Runnable r = new Runnable() { public void run() {} };");
+        let run = identifier(
+            &facts,
+            "run",
+            ResolutionIdentifierRole::Declaration,
+            ResolutionNamespace::Callable,
+        )
+        .site;
+        let owner = facts
+            .member_owners
+            .iter()
+            .find(|owner| owner.member == run)
+            .expect("run has a member owner");
+        let synthetic = site(&facts, owner.owner);
+        assert_eq!(synthetic.kind, ResolutionSiteKind::TypeDeclaration);
+        let synthetic_identifier = identifier_for_site(&facts, owner.owner);
+        assert!(
+            name(&facts, synthetic_identifier.name).starts_with("$anon$"),
+            "{:?}",
+            synthetic_identifier
+        );
+    }
+
+    #[test]
+    fn top_level_main_anonymous_class_body_needs_no_enclosing_type() {
+        let facts = parse("void main() { Object x = new X() { }; }");
+        assert!(
+            facts.identifiers.iter().any(|identifier| {
+                identifier.role == ResolutionIdentifierRole::Declaration
+                    && identifier.namespace == ResolutionNamespace::Type
+                    && name(&facts, identifier.name).starts_with("$anon$")
+            }),
+            "{:?}",
+            facts.identifiers
+        );
+    }
+
+    #[test]
+    fn compact_constructor_in_a_plain_class_agrees_with_the_type_shape() {
+        // The grammar admits a compact constructor as a direct child of a
+        // plain class body; the captured constructor shape must count it so
+        // admission does not contradict it (#4391).
+        let facts = parse("class Odd { Odd { } }");
+        identifier(
+            &facts,
+            "Odd",
+            ResolutionIdentifierRole::Declaration,
+            ResolutionNamespace::Constructor,
+        );
+    }
+
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "09d3c596ba2e: an unavailable explicit Java type import must own its simple name without erasing lexical bindings"
+    )]
     fn explicit_type_import_prevents_package_fallback_without_erasing_lexical_references() {
         let facts = parse(
             "package use; import missing.Target; import other.*; class Use { Target field; Peer peer; class Target {} }",
@@ -4106,7 +5276,7 @@ mod tests {
     }
 
     fn name(facts: &FileResolutionFacts, id: ResolutionNameId) -> &str {
-        &facts.names[id.get() as usize].spelling
+        facts.name(id)
     }
 
     fn identifier<'a>(
@@ -4115,11 +5285,9 @@ mod tests {
         role: ResolutionIdentifierRole,
         namespace: ResolutionNamespace,
     ) -> &'a PositionedIdentifierFact {
-        let mut matches = facts.identifiers.iter().filter(|identifier| {
-            name(facts, identifier.name) == spelling
-                && identifier.role == role
-                && identifier.namespace == namespace
-        });
+        let mut matches = facts
+            .identifiers_named(spelling, role, namespace)
+            .into_iter();
         let result = matches
             .next()
             .unwrap_or_else(|| panic!("missing {role:?} {namespace:?} identifier {spelling:?}"));
@@ -4131,11 +5299,11 @@ mod tests {
     }
 
     fn site(facts: &FileResolutionFacts, id: ResolutionSiteId) -> ResolutionSiteFact {
-        facts.sites[id.get() as usize]
+        *resolution_site(facts, id)
     }
 
     fn slot(facts: &FileResolutionFacts, id: ResolutionTypeSlotId) -> ResolutionTypeSlotFact {
-        facts.type_slots[id.get() as usize]
+        *facts.type_slot(id)
     }
 
     fn identifier_for_site(
@@ -4227,176 +5395,6 @@ mod tests {
             })
             .expect("ordinary class has a synthetic superclass reference")
             .supertype_reference
-    }
-
-    #[test]
-    fn reference_owners_separate_declaration_containment_from_lookup_scope() {
-        let facts = parse(
-            r#"
-                class Base {}
-                class Child extends Base {
-                    Base field;
-                    Base method(Base parameter) {
-                        return field;
-                    }
-                }
-            "#,
-        );
-        let owners = facts
-            .reference_owners
-            .iter()
-            .map(|fact| {
-                let reference = identifier_for_site(&facts, fact.reference);
-                let owner = fact
-                    .owner
-                    .map(|owner| name(&facts, identifier_for_site(&facts, owner).name));
-                (name(&facts, reference.name), owner)
-            })
-            .collect::<Vec<_>>();
-        assert_eq!(owners.len(), 6);
-        assert!(owners.contains(&("Object", Some("Base"))));
-        assert_eq!(
-            owners
-                .iter()
-                .filter(|&&(reference, owner)| reference == "Base" && owner == Some("Child"))
-                .count(),
-            1,
-            "the supertype occurrence belongs to its subtype declaration"
-        );
-        assert_eq!(
-            owners
-                .iter()
-                .filter(|&&(reference, owner)| reference == "Base" && owner == Some("field"))
-                .count(),
-            1,
-            "the field type occurrence belongs to the analyzer-owned field declaration without changing its lookup scope"
-        );
-        assert_eq!(
-            owners
-                .iter()
-                .filter(|&&(reference, owner)| reference == "Base" && owner == Some("method"))
-                .count(),
-            2,
-            "return and parameter type references belong to the callable header"
-        );
-        assert_eq!(
-            owners
-                .iter()
-                .filter(|&&(reference, owner)| reference == "field" && owner == Some("method"))
-                .count(),
-            1,
-            "body references belong to the executable declaration"
-        );
-        let supertype = facts
-            .supertypes
-            .iter()
-            .find(|supertype| {
-                name(
-                    &facts,
-                    identifier_for_site(&facts, supertype.supertype_reference).name,
-                ) == "Base"
-            })
-            .expect("Child must retain its explicit Base supertype");
-        assert_eq!(
-            facts
-                .reference_owners
-                .iter()
-                .find(|owner| owner.reference == supertype.supertype_reference)
-                .expect("supertype reference must have an explicit source owner")
-                .owner,
-            Some(supertype.subtype)
-        );
-    }
-
-    #[test]
-    fn field_type_and_initializer_references_belong_to_the_field_declaration() {
-        let facts = parse(
-            r#"
-                class Dependency {
-                    static Dependency create() { return null; }
-                }
-                class Owner {
-                    Dependency field = Dependency.create();
-                    void method() {
-                        Dependency local = Dependency.create();
-                    }
-                }
-            "#,
-        );
-        let declaration_site = |spelling: &str, kind: ResolutionSiteKind| {
-            facts
-                .identifiers
-                .iter()
-                .find(|identifier| {
-                    identifier.role == ResolutionIdentifierRole::Declaration
-                        && name(&facts, identifier.name) == spelling
-                        && site(&facts, identifier.site).kind == kind
-                })
-                .unwrap_or_else(|| panic!("missing {kind:?} declaration {spelling:?}"))
-                .site
-        };
-        let field = declaration_site("field", ResolutionSiteKind::ValueDeclaration);
-        let method = declaration_site("method", ResolutionSiteKind::CallableDeclaration);
-        assert!(
-            facts.member_owners.iter().any(|owner| {
-                owner.member == field && owner.kind == ResolutionMemberKind::Field
-            })
-        );
-
-        let owned_references = |owner| {
-            facts
-                .reference_owners
-                .iter()
-                .filter(|reference_owner| reference_owner.owner == Some(owner))
-                .map(|reference_owner| {
-                    let identifier = identifier_for_site(&facts, reference_owner.reference);
-                    (
-                        site(&facts, reference_owner.reference).kind,
-                        identifier.namespace,
-                        name(&facts, identifier.name),
-                    )
-                })
-                .collect::<Vec<_>>()
-        };
-        let field_references = owned_references(field);
-        assert!(
-            field_references.iter().any(|&(kind, namespace, spelling)| {
-                kind == ResolutionSiteKind::TypeReference
-                    && namespace == ResolutionNamespace::Type
-                    && spelling == "Dependency"
-            }),
-            "the declared field type must be field-owned: {field_references:?}"
-        );
-        assert!(
-            field_references.iter().any(|&(kind, namespace, spelling)| {
-                kind == ResolutionSiteKind::MemberReference
-                    && namespace == ResolutionNamespace::Callable
-                    && spelling == "create"
-            }),
-            "the field initializer call must be field-owned: {field_references:?}"
-        );
-
-        let method_references = owned_references(method);
-        assert!(
-            method_references
-                .iter()
-                .any(|&(kind, namespace, spelling)| {
-                    kind == ResolutionSiteKind::TypeReference
-                        && namespace == ResolutionNamespace::Type
-                        && spelling == "Dependency"
-                }),
-            "a local declaration type must remain callable-owned: {method_references:?}"
-        );
-        assert!(
-            method_references
-                .iter()
-                .any(|&(kind, namespace, spelling)| {
-                    kind == ResolutionSiteKind::MemberReference
-                        && namespace == ResolutionNamespace::Callable
-                        && spelling == "create"
-                }),
-            "a local initializer call must remain callable-owned: {method_references:?}"
-        );
     }
 
     #[test]
@@ -4621,50 +5619,6 @@ mod tests {
     }
 
     #[test]
-    fn qualified_type_package_route_retains_lexical_shadowing_prefix() {
-        let source = "class Use extends dep.Outer.Inner {}";
-        let facts = parse(source);
-        let prefix = identifier(
-            &facts,
-            "dep",
-            ResolutionIdentifierRole::Reference,
-            ResolutionNamespace::Type,
-        );
-        let terminal = identifier(
-            &facts,
-            "Inner",
-            ResolutionIdentifierRole::Reference,
-            ResolutionNamespace::Type,
-        );
-        assert!(
-            terminal.qualifier.is_some(),
-            "typed member interpretation remains available"
-        );
-        let route = facts
-            .root_references
-            .iter()
-            .find(|route| route.reference == terminal.site)
-            .unwrap();
-        assert_eq!(route.prefix_reference, Some(prefix.site));
-        assert_eq!(route.anchor, ResolutionRootImportAnchor::Lexical);
-        assert_eq!(
-            site(&facts, prefix.site).scope,
-            site(&facts, terminal.site).scope
-        );
-        let segments = facts
-            .root_reference_segments
-            .iter()
-            .filter(|segment| segment.reference == terminal.site)
-            .map(|segment| (segment.position, name(&facts, segment.name)))
-            .collect::<Vec<_>>();
-        assert_eq!(segments, [(0, "dep"), (1, "Outer")]);
-        assert_eq!(
-            site(&facts, prefix.site).start_byte,
-            source.find("dep").unwrap()
-        );
-    }
-
-    #[test]
     fn qualified_nested_type_rows_preserve_shape_with_explicit_root_ambiguity() {
         // IntelliJ Community psi/resolve class/ClassExtendsItsInner1.
         let source = "class A extends B.Foo implements B {} interface B { static class Foo {} }";
@@ -4819,229 +5773,6 @@ mod tests {
     }
 
     #[test]
-    fn typed_local_call_rows_cover_activation_receiver_argument_and_result() {
-        // IntelliJ Community psi/resolve method/Simple.
-        let source = "class Simple { void method(String s) {} static { Simple a = new Simple(); a.method(\"blah\"); } }";
-        let facts = parse(source);
-
-        let method = identifier(
-            &facts,
-            "method",
-            ResolutionIdentifierRole::Declaration,
-            ResolutionNamespace::Callable,
-        )
-        .site;
-        let parameter = identifier(
-            &facts,
-            "s",
-            ResolutionIdentifierRole::Declaration,
-            ResolutionNamespace::Value,
-        )
-        .site;
-        let local = identifier(
-            &facts,
-            "a",
-            ResolutionIdentifierRole::Declaration,
-            ResolutionNamespace::Value,
-        )
-        .site;
-        assert_eq!(
-            facts.callable_parameters,
-            vec![ResolutionCallableParameterFact {
-                callable: method,
-                ordinal: 0,
-                parameter,
-                value_type: facts
-                    .declaration_type_slots
-                    .iter()
-                    .find(|row| row.declaration == parameter)
-                    .expect("parameter type")
-                    .slot,
-                repeated: false,
-            }]
-        );
-        assert_eq!(
-            facts
-                .callable_signatures
-                .iter()
-                .find(|signature| signature.callable == method)
-                .expect("method signature header")
-                .type_parameter_count,
-            0
-        );
-        let local_binder = facts
-            .binders
-            .iter()
-            .find(|binder| binder.declaration == local)
-            .expect("local binder");
-        assert_eq!(local_binder.kind, ResolutionBinderKind::Local);
-        assert_eq!(local_binder.hoisting, HoistingClass::SourceOrder);
-        assert!(local_binder.activation_start > site(&facts, local).end_byte);
-
-        let declared_local = facts
-            .declaration_type_slots
-            .iter()
-            .find(|row| row.declaration == local)
-            .expect("local declared type")
-            .slot;
-        assert_eq!(
-            slot(&facts, declared_local).role,
-            ResolutionTypeSlotRole::DeclaredValue
-        );
-        let assignment = facts
-            .type_transfers
-            .iter()
-            .find(|transfer| {
-                transfer.kind == ResolutionTypeTransferKind::Assignment
-                    && slot(&facts, transfer.output).site == local
-            })
-            .expect("local initializer observation");
-        assert_eq!(
-            slot(&facts, assignment.output).role,
-            ResolutionTypeSlotRole::AssignmentValue
-        );
-        assert_ne!(assignment.output, declared_local);
-        assert!(facts.type_transfers.iter().all(|transfer| {
-            transfer.kind != ResolutionTypeTransferKind::Assignment
-                || transfer.output != declared_local
-        }));
-
-        let constructor_reference = identifier(
-            &facts,
-            "Simple",
-            ResolutionIdentifierRole::Reference,
-            ResolutionNamespace::Constructor,
-        );
-        assert_eq!(
-            site(&facts, constructor_reference.site).kind,
-            ResolutionSiteKind::ConstructorReference
-        );
-        let constructed_type = constructor_reference
-            .qualifier
-            .expect("constructor owner type slot");
-        assert_eq!(
-            name(
-                &facts,
-                identifier_for_site(&facts, slot(&facts, constructed_type).site).name,
-            ),
-            "Simple"
-        );
-        let constructor_call = facts
-            .calls
-            .iter()
-            .find(|call| call.callee == constructor_reference.site)
-            .expect("constructor call");
-        assert!(
-            facts
-                .engine_rule_eligibilities
-                .contains(&ResolutionEngineRuleEligibilityFact {
-                    site: constructor_call.call,
-                    rule: ResolutionEngineRuleKind::DefaultConstruction,
-                })
-        );
-        assert!(facts.binding_projections.contains(&BindingProjectionFact {
-            reference: constructor_reference.site,
-            output: constructor_call.result,
-            kind: BindingProjectionKind::TargetConstructorOwnerType,
-        }));
-        assert!(facts.type_transfers.iter().all(|transfer| {
-            transfer.kind != ResolutionTypeTransferKind::Construction
-                || transfer.output != constructor_call.result
-        }));
-
-        let method_reference = identifier(
-            &facts,
-            "method",
-            ResolutionIdentifierRole::Reference,
-            ResolutionNamespace::Callable,
-        );
-        let receiver = method_reference.qualifier.expect("typed receiver");
-        let receiver_input = facts
-            .type_transfers
-            .iter()
-            .find(|transfer| {
-                transfer.output == receiver && transfer.kind == ResolutionTypeTransferKind::Receiver
-            })
-            .expect("receiver transfer")
-            .input;
-        assert_eq!(
-            name(
-                &facts,
-                identifier_for_site(&facts, slot(&facts, receiver_input).site).name,
-            ),
-            "a"
-        );
-
-        let call = facts
-            .calls
-            .iter()
-            .find(|call| call.callee == method_reference.site)
-            .expect("method call");
-        assert_eq!(call.receiver, Some(receiver));
-        assert_eq!(call.explicit_type_argument_count, 0);
-        assert!(
-            facts
-                .engine_rule_eligibilities
-                .contains(&ResolutionEngineRuleEligibilityFact {
-                    site: call.call,
-                    rule: ResolutionEngineRuleKind::DirectOwnerExactPrimitiveDominance,
-                })
-        );
-        assert_eq!(facts.call_arguments.len(), 1);
-        assert_eq!(facts.call_arguments[0].call, call.call);
-        assert!(facts.intrinsic_type_seeds.iter().any(|seed| {
-            name(&facts, seed.name) == "java.lang.String"
-                && seed.kind == IntrinsicTypeKind::LanguageBuiltin
-        }));
-        assert!(facts.binding_projections.iter().any(|projection| {
-            projection.reference == method_reference.site
-                && projection.output == call.result
-                && projection.kind == BindingProjectionKind::TargetCallableResultType
-        }));
-        let simple = identifier(
-            &facts,
-            "Simple",
-            ResolutionIdentifierRole::Declaration,
-            ResolutionNamespace::Type,
-        )
-        .site;
-        assert_eq!(
-            non_visibility_gaps(&facts),
-            vec![
-                ResolutionGapFact {
-                    site: constructor_reference.site,
-                    kind: ResolutionGapKind::UnsupportedCallApplicability,
-                },
-                ResolutionGapFact {
-                    site: slot(&facts, receiver_input).site,
-                    kind: ResolutionGapKind::UnsupportedImplicitReceiver,
-                },
-                ResolutionGapFact {
-                    site: method_reference.site,
-                    kind: ResolutionGapKind::UnsupportedCallApplicability,
-                },
-                ResolutionGapFact {
-                    site: implicit_superclass_reference(&facts, simple),
-                    kind: ResolutionGapKind::UnsupportedHierarchyTraversal,
-                },
-                ResolutionGapFact {
-                    site: simple,
-                    kind: ResolutionGapKind::ImplicitConstructor,
-                },
-                ResolutionGapFact {
-                    site: facts.gaps.last().expect("placement gap").site,
-                    kind: ResolutionGapKind::UnsupportedPlacementBoundary,
-                },
-            ]
-        );
-        assert_eq!(visibility_gap_sites(&facts), vec![simple, method]);
-        assert_eq!(
-            site(&facts, simple).kind,
-            ResolutionSiteKind::TypeDeclaration
-        );
-    }
-
-    #[test]
     fn local_scope_begins_with_its_own_initializer() {
         let source = "class C { int x; void f() { int x = x; } }";
         let facts = parse(source);
@@ -5070,133 +5801,6 @@ mod tests {
             "JLS 6.3 puts the local in scope throughout its own initializer"
         );
         assert!(local.activation_start > site(&facts, local.declaration).end_byte);
-    }
-
-    #[test]
-    fn void_declared_return_is_a_complete_no_value_transfer() {
-        let source = "abstract class C { abstract void f(); void g() { f(); } }";
-        let facts = parse(source);
-        let declaration = identifier(
-            &facts,
-            "f",
-            ResolutionIdentifierRole::Declaration,
-            ResolutionNamespace::Callable,
-        )
-        .site;
-        let declared_slot = facts
-            .declaration_type_slots
-            .iter()
-            .find(|row| row.declaration == declaration && row.role == DeclarationTypeRole::Return)
-            .expect("f declared return slot")
-            .slot;
-        let transfer = facts
-            .type_transfers
-            .iter()
-            .find(|transfer| {
-                transfer.output == declared_slot
-                    && transfer.kind == ResolutionTypeTransferKind::DeclaredType
-            })
-            .expect("void declared-type transfer");
-        assert_eq!(
-            transfer.value_transform,
-            ResolutionTypeTransferValueTransform::ToNoValue
-        );
-        assert_eq!(transfer.indirection_delta, 0);
-
-        let call = identifier(
-            &facts,
-            "f",
-            ResolutionIdentifierRole::Reference,
-            ResolutionNamespace::Callable,
-        );
-        assert!(facts.binding_projections.iter().any(|projection| {
-            projection.reference == call.site
-                && projection.kind == BindingProjectionKind::TargetCallableResultType
-                && slot(&facts, projection.output).role == ResolutionTypeSlotRole::CallResult
-        }));
-    }
-
-    #[test]
-    fn qualified_field_rows_retain_owner_and_receiver_projection() {
-        // IntelliJ Community psi/resolve variable/Qualified1, reduced to its
-        // exact typed receiver and field access.
-        let source = "class Box { int value; int read(Box b) { return b.value; } }";
-        let facts = parse(source);
-
-        let box_declaration = identifier(
-            &facts,
-            "Box",
-            ResolutionIdentifierRole::Declaration,
-            ResolutionNamespace::Type,
-        )
-        .site;
-        let field_declaration = identifier(
-            &facts,
-            "value",
-            ResolutionIdentifierRole::Declaration,
-            ResolutionNamespace::Value,
-        )
-        .site;
-        let read_declaration = identifier(
-            &facts,
-            "read",
-            ResolutionIdentifierRole::Declaration,
-            ResolutionNamespace::Callable,
-        )
-        .site;
-        assert!(facts.member_owners.contains(&ResolutionMemberOwnerFact {
-            member: field_declaration,
-            owner: box_declaration,
-            kind: ResolutionMemberKind::Field,
-            access: ResolutionMemberAccess::Instance,
-            qualifier_compatibility: ResolutionMemberQualifierCompatibility::RuntimeOnly,
-        }));
-
-        let field_reference = identifier(
-            &facts,
-            "value",
-            ResolutionIdentifierRole::Reference,
-            ResolutionNamespace::TypeOrValue,
-        );
-        let receiver = field_reference.qualifier.expect("field receiver");
-        let receiver_input = facts
-            .type_transfers
-            .iter()
-            .find(|transfer| transfer.output == receiver)
-            .expect("receiver transfer")
-            .input;
-        assert_eq!(
-            name(
-                &facts,
-                identifier_for_site(&facts, slot(&facts, receiver_input).site).name,
-            ),
-            "b"
-        );
-        assert!(facts.binding_projections.iter().any(|projection| {
-            projection.reference == field_reference.site
-                && projection.kind == BindingProjectionKind::TargetTypeOrDeclaredValueType
-        }));
-        assert_eq!(
-            non_visibility_gaps(&facts),
-            vec![
-                ResolutionGapFact {
-                    site: implicit_superclass_reference(&facts, box_declaration),
-                    kind: ResolutionGapKind::UnsupportedHierarchyTraversal,
-                },
-                ResolutionGapFact {
-                    site: box_declaration,
-                    kind: ResolutionGapKind::ImplicitConstructor,
-                },
-                ResolutionGapFact {
-                    site: facts.gaps.last().expect("placement gap").site,
-                    kind: ResolutionGapKind::UnsupportedPlacementBoundary,
-                },
-            ]
-        );
-        assert_eq!(
-            visibility_gap_sites(&facts),
-            vec![box_declaration, field_declaration, read_declaration]
-        );
     }
 
     #[test]
@@ -5296,7 +5900,7 @@ mod tests {
             (
                 "fromThis",
                 ResolutionCallableReceiverOrigin::CurrentInstance,
-                true,
+                false,
             ),
             ("fromSuper", ResolutionCallableReceiverOrigin::Super, true),
             (
@@ -5330,12 +5934,17 @@ mod tests {
             assert_eq!(reference.qualifier.is_some(), qualified);
             assert_eq!(
                 site(&facts, reference.site).kind,
-                if qualified {
-                    ResolutionSiteKind::MemberReference
-                } else {
-                    ResolutionSiteKind::CallableReference
+                match origin {
+                    ResolutionCallableReceiverOrigin::Implicit => {
+                        ResolutionSiteKind::CallableReference
+                    }
+                    ResolutionCallableReceiverOrigin::CurrentInstance
+                    | ResolutionCallableReceiverOrigin::Super
+                    | ResolutionCallableReceiverOrigin::ExplicitExpression => {
+                        ResolutionSiteKind::MemberReference
+                    }
                 },
-                "receiver-origin metadata must not change lexical lookup shape"
+                "explicit receiver syntax must retain a member reference site"
             );
         }
     }
@@ -5376,6 +5985,33 @@ mod tests {
                 .explicit_type_argument_count,
             2
         );
+    }
+
+    #[test]
+    fn method_result_type_is_published_for_call_result_projection() {
+        let source = "class Token {} class App { Token source() { return null; } void sink(Token value) {} void run() { sink(source()); } }";
+        let facts = parse(source);
+        let declaration = identifier(
+            &facts,
+            "source",
+            ResolutionIdentifierRole::Declaration,
+            ResolutionNamespace::Callable,
+        )
+        .site;
+        let signature = facts
+            .callable_signatures
+            .iter()
+            .find(|signature| signature.callable == declaration)
+            .expect("source method signature");
+        let [result] = signature.result_types.as_slice() else {
+            panic!("Java method return type must reach the selected call result: {signature:?}");
+        };
+        assert_eq!(result.ordinal, 0);
+        assert_eq!(
+            slot(&facts, result.value_type).role,
+            ResolutionTypeSlotRole::DeclaredValue
+        );
+        assert_eq!(slot(&facts, result.value_type).site, declaration);
     }
 
     #[test]
@@ -5469,6 +6105,91 @@ mod tests {
                 .count(),
             3
         );
+    }
+
+    #[test]
+    fn primitive_cast_expression_has_its_static_type_in_call_argument_facts() {
+        let facts = parse(
+            "class C { long render(long value) { return value; } long call(int value) { return render((long) value); } }",
+        );
+        let cast_site = facts
+            .sites
+            .iter()
+            .find(|site| site.kind == ResolutionSiteKind::UnaryExpression)
+            .expect("primitive cast expression site");
+        let cast_value = facts
+            .type_slots
+            .iter()
+            .find(|slot| {
+                slot.site == cast_site.id && slot.role == ResolutionTypeSlotRole::ExpressionValue
+            })
+            .expect("cast expression value slot");
+        let cast_seed = facts
+            .intrinsic_type_seeds
+            .iter()
+            .find(|seed| seed.output == cast_value.id)
+            .expect("static primitive type seed for cast result");
+        assert_eq!(cast_seed.kind, IntrinsicTypeKind::Primitive);
+        assert_eq!(name(&facts, cast_seed.name), "long");
+        assert!(!facts.gaps.iter().any(|gap| gap.site == cast_site.id));
+        assert!(facts.type_transfers.iter().any(|transfer| {
+            transfer.kind == ResolutionTypeTransferKind::Argument && transfer.input == cast_value.id
+        }));
+    }
+
+    #[test]
+    fn static_context_keeps_local_arguments_separate_from_implicit_receiver_gaps() {
+        let facts = parse(
+            "class C { static void take(long value) {} static void call(int value) { take(value); } }",
+        );
+        let argument_reference = identifier(
+            &facts,
+            "value",
+            ResolutionIdentifierRole::Reference,
+            ResolutionNamespace::Value,
+        );
+        let callee = identifier(
+            &facts,
+            "take",
+            ResolutionIdentifierRole::Reference,
+            ResolutionNamespace::Callable,
+        );
+        assert!(!facts.gaps.iter().any(|gap| {
+            gap.site == argument_reference.site
+                && gap.kind == ResolutionGapKind::UnsupportedImplicitReceiver
+        }));
+        assert!(facts.gaps.iter().any(|gap| {
+            gap.site == callee.site && gap.kind == ResolutionGapKind::UnsupportedImplicitReceiver
+        }));
+        let call = facts
+            .calls
+            .iter()
+            .find(|call| call.callee == callee.site)
+            .expect("call uses the unqualified method reference");
+        let call_argument = facts
+            .call_arguments
+            .iter()
+            .find(|argument| argument.call == call.call)
+            .expect("call has one argument");
+        assert_eq!(
+            facts
+                .gaps
+                .iter()
+                .filter(|gap| gap.site == callee.site)
+                .count(),
+            2,
+            "the callable site's implicit receiver and applicability remain distinct"
+        );
+        let local_value = facts
+            .binding_projections
+            .iter()
+            .find(|projection| projection.reference == argument_reference.site)
+            .expect("local parameter projection");
+        assert!(facts.type_transfers.iter().any(|transfer| {
+            transfer.kind == ResolutionTypeTransferKind::Argument
+                && transfer.input == local_value.output
+                && transfer.output == call_argument.value
+        }));
     }
 
     #[test]
@@ -5829,7 +6550,7 @@ mod tests {
     }
 
     #[test]
-    fn generic_supertype_keeps_base_reference_owner_while_gapping_arguments() {
+    fn generic_supertype_keeps_base_reference_owner_while_lowering_deep_arguments() {
         let mut source = String::from("class Box<T> {} class Deep extends ");
         for _ in 0..256 {
             source.push_str("Box<");
@@ -5847,18 +6568,13 @@ mod tests {
             ResolutionNamespace::Type,
         )
         .site;
-        let base = identifier(
-            &facts,
-            "Box",
-            ResolutionIdentifierRole::Reference,
-            ResolutionNamespace::Type,
-        );
         let supertype = facts
             .supertypes
             .iter()
             .find(|fact| fact.subtype == deep)
             .expect("generic superclass must retain one hierarchy row");
-        assert_eq!(supertype.supertype_reference, base.site);
+        let base = identifier_for_site(&facts, supertype.supertype_reference);
+        assert_eq!(name(&facts, base.name), "Box");
         assert_eq!(
             facts
                 .reference_owners
@@ -5868,9 +6584,10 @@ mod tests {
                 .owner,
             Some(deep)
         );
-        assert!(facts.gaps.iter().any(|gap| {
-            gap.kind == ResolutionGapKind::UnsupportedTypeSyntax
-                && site(&facts, gap.site).kind == ResolutionSiteKind::UnsupportedExpression
+        assert_eq!(facts.declared_type_arguments.len(), 256);
+        assert!(facts.gaps.iter().all(|gap| {
+            gap.kind != ResolutionGapKind::UnsupportedTypeSyntax
+                || site(&facts, gap.site).kind != ResolutionSiteKind::UnsupportedExpression
         }));
     }
 
@@ -6114,432 +6831,6 @@ mod tests {
     }
 
     #[test]
-    fn unsupported_expression_is_an_explicit_local_gap() {
-        let facts = parse("class A { int f(int a) { return -a; } }");
-        let unsupported_expression = facts
-            .gaps
-            .iter()
-            .find(|gap| gap.kind == ResolutionGapKind::UnsupportedExpression)
-            .expect("unary expression gap");
-        assert_eq!(
-            site(&facts, unsupported_expression.site).kind,
-            ResolutionSiteKind::UnsupportedExpression
-        );
-        assert_eq!(
-            non_visibility_gaps(&facts)
-                .iter()
-                .map(|gap| gap.kind)
-                .collect::<Vec<_>>(),
-            vec![
-                ResolutionGapKind::UnsupportedExpression,
-                ResolutionGapKind::UnsupportedHierarchyTraversal,
-                ResolutionGapKind::ImplicitConstructor,
-                ResolutionGapKind::UnsupportedPlacementBoundary,
-            ]
-        );
-        assert_eq!(visibility_gap_sites(&facts).len(), 2);
-    }
-
-    #[test]
-    fn assignment_update_and_binary_expressions_preserve_structured_children() {
-        let source = "class A { int id(int value) { return value; } int assign(int total, int value) { return total += id(value); } int update(int total) { return total++; } int binary(int left, int right) { return id(left) + id(right); } }";
-        let facts = parse(source);
-
-        let assignment_text = "total += id(value)";
-        let assignment_start = source.find(assignment_text).expect("assignment source");
-        let update_text = "total++";
-        let update_start = source.find(update_text).expect("update source");
-        let binary_text = "id(left) + id(right)";
-        let binary_start = source.find(binary_text).expect("binary source");
-        let reference_at = |start: usize| {
-            facts
-                .identifiers
-                .iter()
-                .find(|identifier| {
-                    identifier.role == ResolutionIdentifierRole::Reference
-                        && site(&facts, identifier.site).start_byte == start
-                })
-                .expect("positioned value reference")
-        };
-        let reference_slot = |reference: &PositionedIdentifierFact| {
-            facts
-                .type_slots
-                .iter()
-                .find(|slot| {
-                    slot.site == reference.site
-                        && slot.role == ResolutionTypeSlotRole::ExpressionValue
-                })
-                .expect("value-reference expression slot")
-                .id
-        };
-        let observed_return_input = |callable: ResolutionSiteId| {
-            facts
-                .type_transfers
-                .iter()
-                .find(|transfer| {
-                    transfer.kind == ResolutionTypeTransferKind::Return
-                        && slot(&facts, transfer.output).site == callable
-                })
-                .expect("observed return transfer")
-                .input
-        };
-
-        for (method, start) in [("assign", assignment_start), ("update", update_start)] {
-            let reference = reference_at(start);
-            assert_eq!(reference.namespace, ResolutionNamespace::Value);
-            let output = reference_slot(reference);
-            assert!(facts.binding_projections.contains(&BindingProjectionFact {
-                reference: reference.site,
-                output,
-                kind: BindingProjectionKind::TargetDeclaredValueType,
-            }));
-            let callable = identifier(
-                &facts,
-                method,
-                ResolutionIdentifierRole::Declaration,
-                ResolutionNamespace::Callable,
-            );
-            assert_eq!(observed_return_input(callable.site), output);
-        }
-
-        let binary_site = facts
-            .sites
-            .iter()
-            .find(|site| {
-                site.start_byte == binary_start
-                    && site.end_byte == binary_start + binary_text.len()
-                    && site.kind == ResolutionSiteKind::UnsupportedExpression
-            })
-            .expect("binary expression site");
-        let binary_output = facts
-            .type_slots
-            .iter()
-            .find(|slot| {
-                slot.site == binary_site.id && slot.role == ResolutionTypeSlotRole::ExpressionValue
-            })
-            .expect("binary result frontier")
-            .id;
-        assert!(
-            facts
-                .type_transfers
-                .iter()
-                .all(|transfer| transfer.output != binary_output),
-            "unknown Java operator typing must not publish a guessed result"
-        );
-        let binary_callable = identifier(
-            &facts,
-            "binary",
-            ResolutionIdentifierRole::Declaration,
-            ResolutionNamespace::Callable,
-        );
-        assert_eq!(observed_return_input(binary_callable.site), binary_output);
-
-        let calls_within = |start: usize, end: usize| {
-            facts
-                .calls
-                .iter()
-                .filter(|call| {
-                    let call_site = site(&facts, call.call);
-                    call_site.start_byte >= start && call_site.end_byte <= end
-                })
-                .count()
-        };
-        assert_eq!(
-            calls_within(assignment_start, assignment_start + assignment_text.len()),
-            1
-        );
-        assert_eq!(
-            calls_within(binary_site.start_byte, binary_site.end_byte),
-            2
-        );
-        assert_eq!(
-            facts
-                .identifiers
-                .iter()
-                .filter(|identifier| {
-                    identifier.role == ResolutionIdentifierRole::Reference
-                        && identifier.namespace == ResolutionNamespace::Callable
-                        && name(&facts, identifier.name) == "id"
-                })
-                .count(),
-            3,
-            "calls nested under assignment and binary expressions stay structured"
-        );
-        assert_eq!(
-            facts
-                .gaps
-                .iter()
-                .filter(|gap| gap.site == binary_site.id)
-                .copied()
-                .collect::<Vec<_>>(),
-            vec![ResolutionGapFact {
-                site: binary_site.id,
-                kind: ResolutionGapKind::InferredType,
-            }]
-        );
-        assert!(
-            facts
-                .gaps
-                .iter()
-                .all(|gap| gap.kind != ResolutionGapKind::UnsupportedExpression)
-        );
-    }
-
-    #[test]
-    fn package_and_import_routes_emit_only_connected_gaps() {
-        let source = "package Foo.Bar; import com.acme.Outer.Inner; import static com.acme.Util.call; import com.wild.*; import static com.tools.Util.*; class A {}";
-        let facts = parse(source);
-
-        assert_eq!(identifier_spellings(&facts), vec!["A", "Object"]);
-        assert!(facts.identifiers.iter().all(|identifier| identifier.role
-            == ResolutionIdentifierRole::Declaration
-            || site(&facts, identifier.site).kind == ResolutionSiteKind::SyntheticReference));
-        assert_eq!(facts.packages.len(), 1);
-        let package = facts.packages[0];
-        assert_eq!(package.root_scope, ResolutionScopeId::new(0));
-        let package_declaration = package.declaration.expect("named package declaration");
-        let package_site = site(&facts, package_declaration);
-        assert_eq!(package_site.kind, ResolutionSiteKind::PackageDeclaration);
-        assert_eq!(
-            &source[package_site.start_byte..package_site.end_byte],
-            "package Foo.Bar;"
-        );
-        assert_eq!(
-            facts
-                .package_segments
-                .iter()
-                .map(|segment| (segment.ordinal, name(&facts, segment.name)))
-                .collect::<Vec<_>>(),
-            vec![(0, "Foo"), (1, "Bar")]
-        );
-        assert!(!facts.gaps.contains(&ResolutionGapFact {
-            site: package_declaration,
-            kind: ResolutionGapKind::UnsupportedRoute,
-        }));
-
-        assert_eq!(facts.import_routes.len(), 4);
-        assert!(
-            facts
-                .import_routes
-                .iter()
-                .all(|route| route.root_scope == ResolutionScopeId::new(0))
-        );
-        assert_eq!(
-            facts
-                .import_routes
-                .iter()
-                .map(|route| (
-                    route.kind,
-                    route.bound_name.map(|name_id| name(&facts, name_id)),
-                    facts
-                        .import_route_segments
-                        .iter()
-                        .filter(|segment| segment.import_site == route.site)
-                        .map(|segment| name(&facts, segment.name))
-                        .collect::<Vec<_>>(),
-                ))
-                .collect::<Vec<_>>(),
-            vec![
-                (
-                    ResolutionImportRouteKind::SingleType,
-                    Some("Inner"),
-                    vec!["com", "acme", "Outer", "Inner"],
-                ),
-                (
-                    ResolutionImportRouteKind::SingleStatic,
-                    Some("call"),
-                    vec!["com", "acme", "Util", "call"],
-                ),
-                (
-                    ResolutionImportRouteKind::TypeOnDemand,
-                    None,
-                    vec!["com", "wild"],
-                ),
-                (
-                    ResolutionImportRouteKind::StaticOnDemand,
-                    None,
-                    vec!["com", "tools", "Util"],
-                ),
-            ]
-        );
-        assert!(facts.import_routes.iter().all(|route| {
-            site(&facts, route.site).kind == ResolutionSiteKind::ImportDeclaration
-                && facts.gaps.contains(&ResolutionGapFact {
-                    site: route.site,
-                    kind: ResolutionGapKind::UnsupportedRoute,
-                })
-        }));
-        assert!(
-            facts
-                .sites
-                .iter()
-                .filter(|site| site.kind == ResolutionSiteKind::ImportDeclaration)
-                .all(|site| facts
-                    .import_routes
-                    .iter()
-                    .any(|route| route.site == site.id))
-        );
-
-        assert_eq!(facts.gaps.len(), 8);
-        assert!(facts.gaps.iter().take(4).all(|gap| {
-            gap.kind == ResolutionGapKind::UnsupportedRoute
-                && site(&facts, gap.site).kind == ResolutionSiteKind::ImportDeclaration
-        }));
-        assert_eq!(facts.gaps[4].kind, ResolutionGapKind::UnsupportedVisibility);
-        assert_eq!(
-            facts.gaps[5].kind,
-            ResolutionGapKind::UnsupportedHierarchyTraversal
-        );
-        assert_eq!(facts.gaps[6].kind, ResolutionGapKind::ImplicitConstructor);
-        assert_eq!(
-            facts.gaps[7].kind,
-            ResolutionGapKind::UnsupportedPlacementBoundary
-        );
-    }
-
-    #[test]
-    fn package_imports_and_top_level_types_emit_common_root_facts() {
-        let source = "package p.q; import x.y.Target; import x.z.*; class Local { Target exact; Wild demanded; } class Second {}";
-        let facts = parse(source);
-        let root_scope = ResolutionScopeId::new(0);
-
-        assert_eq!(
-            facts
-                .package_segments
-                .iter()
-                .map(|segment| (segment.ordinal, name(&facts, segment.name)))
-                .collect::<Vec<_>>(),
-            vec![(0, "p"), (1, "q")]
-        );
-        assert_eq!(facts.root_imports.len(), 2);
-        let root_route = |site| {
-            facts
-                .root_import_segments
-                .iter()
-                .filter(|segment| segment.import_site == site)
-                .map(|segment| (segment.position, name(&facts, segment.name)))
-                .collect::<Vec<_>>()
-        };
-        assert_eq!(
-            root_route(facts.root_imports[0].site),
-            vec![(0, "x"), (1, "y")]
-        );
-        assert_eq!(
-            root_route(facts.root_imports[1].site),
-            vec![(0, "x"), (1, "z")]
-        );
-        assert_eq!(
-            facts
-                .root_import_demands
-                .iter()
-                .map(|demand| {
-                    (
-                        demand.import_site,
-                        demand.namespace,
-                        name(&facts, demand.name),
-                    )
-                })
-                .collect::<Vec<_>>(),
-            vec![
-                (
-                    facts.root_imports[0].site,
-                    ResolutionNamespace::Type,
-                    "Target",
-                ),
-                (
-                    facts.root_imports[1].site,
-                    ResolutionNamespace::Type,
-                    "Wild",
-                ),
-            ]
-        );
-        assert_eq!(
-            facts
-                .root_exports
-                .iter()
-                .map(|export| {
-                    let declaration = facts
-                        .identifiers
-                        .iter()
-                        .find(|identifier| identifier.site == export.declaration)
-                        .expect("root export names a positioned declaration");
-                    (
-                        export.root_scope,
-                        export.namespace,
-                        name(&facts, declaration.name),
-                    )
-                })
-                .collect::<Vec<_>>(),
-            vec![
-                (root_scope, ResolutionNamespace::Type, "Local"),
-                (root_scope, ResolutionNamespace::Type, "Second"),
-            ]
-        );
-        assert!(
-            facts
-                .root_imports
-                .iter()
-                .all(|import| import.root_scope == root_scope)
-        );
-    }
-
-    #[test]
-    fn static_import_roots_request_observed_namespaces_without_proving_targets() {
-        let source = r#"
-            import static p.Owner.Nested;
-            import static p.Owner.VALUE;
-            import static p.Owner.read;
-            import static p.Owner.UNUSED;
-            class Use {
-                Nested field;
-                void run() { VALUE = 1; read(); read(); }
-            }
-        "#;
-        let facts = parse(source);
-        let requested = facts
-            .root_import_demands
-            .iter()
-            .map(|demand| (demand.namespace, name(&facts, demand.name)))
-            .collect::<Vec<_>>();
-        assert_eq!(
-            requested,
-            vec![
-                (ResolutionNamespace::Type, "Nested"),
-                (ResolutionNamespace::Value, "VALUE"),
-                (ResolutionNamespace::Callable, "read"),
-            ],
-            "a use requests its namespace; unused names and duplicate calls add no demands"
-        );
-        assert_eq!(facts.root_imports.len(), 4);
-        for import in &facts.root_imports {
-            assert_eq!(import.root_scope, ResolutionScopeId::new(0));
-            assert_eq!(import.anchor, ResolutionRootImportAnchor::Lexical);
-            assert_eq!(
-                facts
-                    .root_import_segments
-                    .iter()
-                    .filter(|segment| segment.import_site == import.site)
-                    .map(|segment| (segment.position, name(&facts, segment.name)))
-                    .collect::<Vec<_>>(),
-                vec![(0, "p"), (1, "Owner")]
-            );
-            assert!(facts.gaps.contains(&ResolutionGapFact {
-                site: import.site,
-                kind: ResolutionGapKind::UnsupportedRoute,
-            }));
-        }
-        assert!(
-            facts.root_imports.iter().all(|import| {
-                !facts
-                    .binders
-                    .iter()
-                    .any(|binder| binder.declaration == import.site)
-            }),
-            "an imported name is not a locally proved declaration"
-        );
-    }
-
-    #[test]
     fn static_wildcard_demands_keep_ambiguous_names_and_distinct_import_sites() {
         let source = r#"
             import static p.Owner.*;
@@ -6613,72 +6904,6 @@ mod tests {
             vec![(ResolutionNamespace::Type, "Nested")],
             "construction requests a type, declarations and qualified members do not request imports"
         );
-    }
-
-    #[test]
-    fn directive_comments_and_malformed_package_annotation_preserve_exact_paths() {
-        let source =
-            "@Anno(value=) package p /* package */ . q; import p /* import */ . Target; class A {}";
-        let parsed = parse_file(source);
-        assert_eq!(
-            parsed.resolution_facts,
-            parse_once(source),
-            "directive facts must remain deterministic"
-        );
-        assert_eq!(parsed.imports.len(), 1);
-        assert_eq!(
-            parsed.imports[0]
-                .path
-                .as_ref()
-                .expect("structured import path")
-                .segments,
-            vec!["p", "Target"]
-        );
-        let facts = parsed.resolution_facts;
-
-        assert_eq!(facts.packages.len(), 1);
-        let package = facts.packages[0];
-        assert_eq!(
-            facts
-                .package_segments
-                .iter()
-                .map(|segment| (segment.ordinal, name(&facts, segment.name)))
-                .collect::<Vec<_>>(),
-            vec![(0, "p"), (1, "q")]
-        );
-        let package_declaration = package.declaration.expect("named package");
-        assert!(!facts.gaps.contains(&ResolutionGapFact {
-            site: package_declaration,
-            kind: ResolutionGapKind::UnsupportedRoute,
-        }));
-
-        assert_eq!(facts.import_routes.len(), 1);
-        let route = facts.import_routes[0];
-        assert_eq!(
-            name(&facts, route.bound_name.expect("single-type bound name")),
-            "Target"
-        );
-        assert_eq!(
-            facts
-                .import_route_segments
-                .iter()
-                .map(|segment| (segment.ordinal, name(&facts, segment.name)))
-                .collect::<Vec<_>>(),
-            vec![(0, "p"), (1, "Target")]
-        );
-
-        let annotation = facts
-            .sites
-            .iter()
-            .find(|site| {
-                site.kind == ResolutionSiteKind::UnsupportedDeclaration
-                    && &source[site.start_byte..site.end_byte] == "@Anno(value=)"
-            })
-            .expect("package annotation site");
-        assert!(facts.gaps.contains(&ResolutionGapFact {
-            site: annotation.id,
-            kind: ResolutionGapKind::MalformedSyntax,
-        }));
     }
 
     #[test]
@@ -7100,18 +7325,69 @@ mod tests {
         let facts = parse(source);
         let spellings = identifier_spellings(&facts);
 
-        for unsupported in ["T", "component", "caught", "item", "items", "hidden"] {
+        for unsupported in ["component", "item", "items"] {
             assert!(
                 !spellings.contains(&unsupported),
                 "unsupported subtree leaked {unsupported:?}: {spellings:?}"
             );
         }
-        for supported in ["ONE", "Local", "m", "hidden2"] {
+        for supported in ["ONE", "Local", "m", "hidden2", "T", "caught", "hidden"] {
             assert!(
                 spellings.contains(&supported),
                 "supported enum, local or anonymous scope omitted {supported:?}: {spellings:?}"
             );
         }
+        let caught = identifier(
+            &facts,
+            "caught",
+            ResolutionIdentifierRole::Declaration,
+            ResolutionNamespace::Value,
+        )
+        .site;
+        let caught_binder = facts
+            .binders
+            .iter()
+            .find(|binder| binder.declaration == caught)
+            .expect("catch parameter has a lexical binder");
+        assert_eq!(caught_binder.kind, ResolutionBinderKind::Local);
+        let lambda_range = source
+            .find("() -> { return hidden; }")
+            .expect("lambda source range");
+        let lambda_site = facts
+            .sites
+            .iter()
+            .find(|site| {
+                site.kind == ResolutionSiteKind::UnsupportedExpression
+                    && site.start_byte == lambda_range
+                    && site.end_byte == lambda_range + "() -> { return hidden; }".len()
+            })
+            .expect("lambda expression has a value site");
+        let lambda_scope = facts
+            .scopes
+            .iter()
+            .find(|scope| {
+                scope.owner == Some(lambda_site.id) && scope.kind == ResolutionScopeKind::Executable
+            })
+            .expect("lambda owns an executable lexical scope");
+        let hidden = identifier(
+            &facts,
+            "hidden",
+            ResolutionIdentifierRole::Reference,
+            ResolutionNamespace::Value,
+        );
+        let mut hidden_scope = site(&facts, hidden.site).scope;
+        let mut nested_in_lambda = false;
+        loop {
+            if hidden_scope == lambda_scope.id {
+                nested_in_lambda = true;
+                break;
+            }
+            let Some(parent) = facts.scopes[hidden_scope.index()].parent else {
+                break;
+            };
+            hidden_scope = parent;
+        }
+        assert!(nested_in_lambda, "lambda body reference escaped its scope");
         assert_eq!(
             facts
                 .type_transfers
@@ -7128,7 +7404,7 @@ mod tests {
                 .iter()
                 .filter(|gap| gap.kind == ResolutionGapKind::UnsupportedScopeOrBinder)
                 .count(),
-            5,
+            2,
             "all resolution gaps: {:?}",
             facts.gaps
         );
@@ -7148,7 +7424,7 @@ mod tests {
                 .iter()
                 .filter(|gap| gap.kind == ResolutionGapKind::UnsupportedHierarchyTraversal)
                 .count(),
-            5,
+            6,
             "all resolution gaps: {:?}",
             facts.gaps
         );
@@ -7173,7 +7449,7 @@ mod tests {
     }
 
     #[test]
-    fn unsupported_routes_preserve_legacy_names_without_affirmative_resolution_rows() {
+    fn structured_annotation_references_are_not_enumeration_gaps() {
         let source = "@Marker @Configured(value = \"x\") sealed class A permits Allowed { void f() throws Failure {} }";
         let parsed = parse_file(source);
         for spelling in ["Allowed", "Failure"] {
@@ -7185,7 +7461,13 @@ mod tests {
         }
 
         let facts = parsed.resolution_facts;
-        assert_eq!(identifier_spellings(&facts), vec!["A", "f", "Object"]);
+        let spellings = identifier_spellings(&facts);
+        for spelling in ["A", "f", "Object", "Marker", "Configured"] {
+            assert!(
+                spellings.contains(&spelling),
+                "structured annotation or declaration reference omitted {spelling:?}: {spellings:?}"
+            );
+        }
         let unsupported = facts
             .gaps
             .iter()
@@ -7201,8 +7483,6 @@ mod tests {
                 .map(|gap| gap.kind)
                 .collect::<Vec<_>>(),
             vec![
-                ResolutionGapKind::UnsupportedExpression,
-                ResolutionGapKind::UnsupportedExpression,
                 ResolutionGapKind::UnsupportedScopeOrBinder,
                 ResolutionGapKind::UnsupportedScopeOrBinder,
                 ResolutionGapKind::UnsupportedHierarchyTraversal,
@@ -7211,19 +7491,25 @@ mod tests {
             ]
         );
         assert_eq!(visibility_gap_sites(&facts).len(), 2);
-        for annotation in ["@Marker", "@Configured(value = \"x\")"] {
-            let site = facts
-                .sites
+        for spelling in ["Marker", "Configured"] {
+            let identifier = facts
+                .identifiers
                 .iter()
-                .find(|site| &source[site.start_byte..site.end_byte] == annotation)
+                .find(|identifier| {
+                    identifier.role == ResolutionIdentifierRole::Reference
+                        && identifier.namespace == ResolutionNamespace::Type
+                        && name(&facts, identifier.name) == spelling
+                })
                 .unwrap();
-            assert_eq!(site.kind, ResolutionSiteKind::UnsupportedExpression);
+            let reference = site(&facts, identifier.site);
+            assert_eq!(&source[reference.start_byte..reference.end_byte], spelling);
             assert!(
-                facts
-                    .reference_enumeration_gaps
-                    .iter()
-                    .any(|gap| gap.site == site.id),
-                "unsupported annotation references must remain visible: {:?}",
+                facts.reference_enumeration_gaps.iter().all(|gap| {
+                    let omitted = site(&facts, gap.site);
+                    omitted.end_byte <= reference.start_byte
+                        || reference.end_byte <= omitted.start_byte
+                }),
+                "structured annotation reference must not retain an omission gap: {:?}",
                 facts.reference_enumeration_gaps
             );
         }
@@ -7258,22 +7544,6 @@ mod tests {
     }
 
     #[test]
-    fn unclaimed_semantic_occurrences_become_connected_gaps() {
-        let source = "class A { boolean f() { if (probe()) return true; return false; } }";
-        let facts = parse(source);
-
-        assert_eq!(identifier_spellings(&facts), vec!["A", "f", "Object"]);
-        let probe_start = source.find("probe").expect("probe spelling");
-        assert!(facts.gaps.iter().any(|gap| {
-            let gap_site = site(&facts, gap.site);
-            gap.kind == ResolutionGapKind::UnsupportedExpression
-                && gap_site.kind == ResolutionSiteKind::UnsupportedExpression
-                && gap_site.start_byte == probe_start
-                && gap_site.end_byte == probe_start + "probe".len()
-        }));
-    }
-
-    #[test]
     fn omitted_reference_occurrences_own_exact_enumeration_gaps() {
         let source = r#"class A {
     java.util.List<String> values;
@@ -7283,17 +7553,7 @@ mod tests {
     }
 }"#;
         let facts = parse(source);
-        let expected = [
-            (
-                "java.util.List<String>",
-                ResolutionGapKind::UnsupportedTypeSyntax,
-            ),
-            ("probe", ResolutionGapKind::UnsupportedExpression),
-            (
-                "() -> hidden()",
-                ResolutionGapKind::UnsupportedScopeOrBinder,
-            ),
-        ];
+        let expected = [("probe", ResolutionGapKind::UnsupportedExpression)];
 
         assert_eq!(facts.reference_enumeration_gaps.len(), expected.len());
         for (snippet, kind) in expected {
@@ -7317,6 +7577,70 @@ mod tests {
                 kind,
             }));
         }
+        assert!(facts.identifiers.iter().any(|identifier| {
+            identifier.role == ResolutionIdentifierRole::Reference
+                && identifier.namespace == ResolutionNamespace::Callable
+                && name(&facts, identifier.name) == "hidden"
+        }));
+        let [argument] = facts.declared_type_arguments.as_slice() else {
+            panic!("List<String> must retain its positional declared type argument");
+        };
+        let argument_site = site(&facts, facts.type_slots[argument.argument.index()].site);
+        assert_eq!(
+            &source[argument_site.start_byte..argument_site.end_byte],
+            "String"
+        );
+    }
+
+    #[test]
+    fn qualified_annotation_names_and_element_values_keep_structured_sites() {
+        let source = r#"package p;
+@q.Marker(value = Flags.VALUE, type = String.class)
+class A {}
+class Flags { static final String VALUE = "x"; }
+"#;
+        let facts = parse(source);
+        let spellings = identifier_spellings(&facts);
+        for spelling in ["q", "Marker", "Flags", "VALUE", "String", "A"] {
+            assert!(
+                spellings.contains(&spelling),
+                "annotation name or element value omitted {spelling:?}: {spellings:?}"
+            );
+        }
+        for label in ["value", "type"] {
+            assert!(
+                !spellings.contains(&label),
+                "annotation element label was treated as a reference: {spellings:?}"
+            );
+        }
+
+        let marker = identifier(
+            &facts,
+            "Marker",
+            ResolutionIdentifierRole::Reference,
+            ResolutionNamespace::Type,
+        );
+        let route = facts
+            .root_references
+            .iter()
+            .find(|route| route.reference == marker.site)
+            .expect("qualified annotation retains its package route");
+        assert!(route.prefix_reference.is_some());
+        assert_eq!(
+            facts
+                .root_reference_segments
+                .iter()
+                .filter(|segment| segment.reference == marker.site)
+                .map(|segment| name(&facts, segment.name))
+                .collect::<Vec<_>>(),
+            vec!["q"]
+        );
+
+        assert!(
+            facts.reference_enumeration_gaps.is_empty(),
+            "supported annotation syntax must fully enumerate its references: {:?}",
+            facts.reference_enumeration_gaps
+        );
     }
 
     #[test]
@@ -7393,44 +7717,6 @@ class A {
             ]
         );
         assert_eq!(visibility_gap_sites(&facts).len(), 3);
-    }
-
-    #[test]
-    fn uncertain_type_and_literal_shapes_are_connected_gaps() {
-        let facts = parse(
-            "class A { java.util.List x; Object y() { var local = 1.0; int values[]; return x; } }",
-        );
-
-        assert_eq!(
-            non_visibility_gaps(&facts)
-                .iter()
-                .map(|gap| gap.kind)
-                .collect::<Vec<_>>(),
-            vec![
-                ResolutionGapKind::AmbiguousQualifiedType,
-                ResolutionGapKind::AmbiguousQualifiedType,
-                ResolutionGapKind::AmbiguousQualifiedType,
-                ResolutionGapKind::InferredType,
-                ResolutionGapKind::AmbiguousNumericLiteral,
-                ResolutionGapKind::PostfixArrayDimensions,
-                ResolutionGapKind::UnsupportedHierarchyTraversal,
-                ResolutionGapKind::ImplicitConstructor,
-                ResolutionGapKind::UnsupportedPlacementBoundary,
-            ]
-        );
-        assert_eq!(visibility_gap_sites(&facts).len(), 3);
-        let numeric_site = facts
-            .gaps
-            .iter()
-            .find(|gap| gap.kind == ResolutionGapKind::AmbiguousNumericLiteral)
-            .expect("numeric gap")
-            .site;
-        assert!(
-            facts
-                .intrinsic_type_seeds
-                .iter()
-                .all(|seed| { slot(&facts, seed.output).site != numeric_site })
-        );
     }
 
     #[test]
@@ -7554,44 +7840,67 @@ class A {
     }
 
     #[test]
-    fn other_languages_start_with_empty_resolution_facts() {
-        let parsed = brokk_bifrost_core::analyzer::parsed_file::ParsedFile::new(String::new());
-        assert!(parsed.resolution_facts.is_empty());
-    }
+    fn generic_bounds_and_declared_arguments_keep_owner_positions() {
+        let facts = parse_once(
+            "interface FieldElement<T> { T add(T value) { return value; } }\
+             class Block<T extends FieldElement<T>> { T step(T value) { return value.add(value); } }",
+        );
+        let [bound] = facts
+            .declared_type_relations
+            .iter()
+            .filter(|relation| relation.kind == ResolutionDeclaredTypeRelationKind::TraitBound)
+            .collect::<Vec<_>>()[..]
+        else {
+            panic!("the Java type parameter publishes its written upper bound");
+        };
+        let target = bound.target.expect("a trait bound has a typed target");
+        assert_eq!(
+            bound.target_reference,
+            Some(facts.type_slots[target.index()].site)
+        );
+        assert!(facts.type_transfers.iter().any(|transfer| {
+            transfer.input == target
+                && transfer.output == bound.subject
+                && transfer.kind == ResolutionTypeTransferKind::TypeUnion
+        }));
+        let parameter_declaration = facts.type_slots[bound.subject.index()].site;
+        assert!(facts.declaration_type_slots.iter().any(|property| {
+            property.declaration == parameter_declaration
+                && property.slot == bound.subject
+                && property.role == DeclarationTypeRole::Identity
+        }));
+        assert!(
+            facts
+                .gaps
+                .iter()
+                .all(|gap| gap.kind != ResolutionGapKind::UnsupportedScopeOrBinder)
+        );
 
-    #[test]
-    fn same_pass_preserves_the_type_identifier_superset() {
-        let source = "class Outer { Target field; void f() { SamePackageOwner.INSTANCE.use(); } }";
-        let mut parser = Parser::new();
-        parser
-            .set_language(&tree_sitter_java::LANGUAGE.into())
-            .expect("java grammar");
-        let tree = parser.parse(source, None).expect("java tree");
-        let root = std::env::current_dir()
-            .expect("current directory")
-            .join("java-resolution-fixture-root");
-        let file = ProjectFile::new(root, "src/Outer.java");
-        let parsed = super::super::declarations::parse_java_file(&file, source, &tree);
-        assert!(parsed.type_identifiers.contains("Target"));
-        assert!(parsed.type_identifiers.contains("SamePackageOwner"));
-        assert!(!parsed.type_identifiers.contains("Outer"));
-        assert!(!parsed.resolution_facts.is_empty());
-    }
-
-    #[test]
-    fn array_type_syntax_lowers_nested_sequence_element_facts() {
-        let facts = parse_once("class Fixture { String[] items; int[][] matrix; }");
-        assert_eq!(facts.type_components.len(), 3);
-        for component in &facts.type_components {
-            assert_eq!(
-                component.constructor,
-                ResolutionTypeConstructorKind::Sequence
+        let [argument] = facts.declared_type_arguments.as_slice() else {
+            panic!(
+                "FieldElement<T> publishes its one positional type argument: {:?}; identifiers={:?}",
+                facts.declared_type_arguments, facts.identifiers
             );
-            assert_eq!(component.kind, ResolutionTypeComponentKind::Element);
-            assert_eq!(
-                facts.type_slots[component.component.index()].role,
-                ResolutionTypeSlotRole::TargetTypeIdentity
-            );
-        }
+        };
+        assert_eq!(argument.ordinal, 0);
+        assert_eq!(
+            facts.type_slots[argument.argument.index()].role,
+            ResolutionTypeSlotRole::TargetTypeIdentity
+        );
+        let add = facts
+            .identifiers
+            .iter()
+            .find(|identifier| {
+                identifier.role == ResolutionIdentifierRole::Declaration
+                    && identifier.namespace == ResolutionNamespace::Callable
+                    && name(&facts, identifier.name) == "add"
+            })
+            .expect("FieldElement.add declaration");
+        let result_parameter = facts
+            .callable_result_owner_type_parameters
+            .iter()
+            .find(|parameter| parameter.callable == add.site)
+            .expect("FieldElement.add returns its owner's type parameter");
+        assert_eq!(result_parameter.position, 0);
     }
 }

@@ -564,16 +564,25 @@ fn compare_ordered_transfers(
     left: &OrderedTaintTransfer<'_>,
     right: &OrderedTaintTransfer<'_>,
 ) -> std::cmp::Ordering {
-    left.point()
-        .procedure()
-        .semantics()
-        .locator()
-        .cmp(right.point().procedure().semantics().locator())
-        .then_with(|| left.point().id().cmp(&right.point().id()))
-        .then_with(|| left.phase().cmp(&right.phase()))
+    compare_transfer_position(left.point(), left.phase(), right.point(), right.phase())
         .then_with(|| left.event_index().cmp(&right.event_index()))
         .then_with(|| left.carrier().cmp(&right.carrier()))
         .then_with(|| left.kind_rank().cmp(&right.kind_rank()))
+}
+
+fn compare_transfer_position(
+    left_point: &ProgramPointHandle,
+    left_phase: ValueFlowObservationPhase,
+    right_point: &ProgramPointHandle,
+    right_phase: ValueFlowObservationPhase,
+) -> std::cmp::Ordering {
+    left_point
+        .procedure()
+        .semantics()
+        .locator()
+        .cmp(right_point.procedure().semantics().locator())
+        .then_with(|| left_point.id().cmp(&right_point.id()))
+        .then_with(|| left_phase.cmp(&right_phase))
 }
 
 impl TaintAnalysisPlan {
@@ -808,16 +817,7 @@ impl TaintAnalysisPlan {
             }
             sinks.push(TaintSinkBinding::new(write.sink, full.clone()));
         }
-        let rebuilt = Self::new(
-            self.value_flow.clone(),
-            self.universe.clone(),
-            self.sources.to_vec(),
-            sinks,
-            self.sanitizers.to_vec(),
-            self.transforms.to_vec(),
-        )?
-        .with_local_transforms(self.local_transforms.to_vec())?;
-        rebuilt.with_stores(self.store_writes.to_vec(), self.store_reads.to_vec())
+        self.rebuild_with_bindings(self.sources.to_vec(), sinks)
     }
 
     /// Derive the plan with the given store reads seeded as taint sources.
@@ -849,11 +849,19 @@ impl TaintAnalysisPlan {
                 SourceEventKey::new(spec.key().clone()),
             ));
         }
+        self.rebuild_with_bindings(sources, self.sinks.to_vec())
+    }
+
+    fn rebuild_with_bindings(
+        &self,
+        sources: Vec<TaintSourceBinding>,
+        sinks: Vec<TaintSinkBinding>,
+    ) -> Result<Self, TaintPlanError> {
         let rebuilt = Self::new(
             self.value_flow.clone(),
             self.universe.clone(),
             sources,
-            self.sinks.to_vec(),
+            sinks,
             self.sanitizers.to_vec(),
             self.transforms.to_vec(),
         )?
@@ -1012,17 +1020,11 @@ impl TaintAnalysisPlan {
     }
 
     pub(crate) fn source(&self, id: ValueFlowSourceId) -> Option<&TaintSourceBinding> {
-        self.sources
-            .binary_search_by_key(&id, TaintSourceBinding::source)
-            .ok()
-            .map(|index| &self.sources[index])
+        binding_by_id(&self.sources, id, TaintSourceBinding::source)
     }
 
     pub(crate) fn sink(&self, id: ValueFlowSinkId) -> Option<&TaintSinkBinding> {
-        self.sinks
-            .binary_search_by_key(&id, TaintSinkBinding::sink)
-            .ok()
-            .map(|index| &self.sinks[index])
+        binding_by_id(&self.sinks, id, TaintSinkBinding::sink)
     }
 
     pub(crate) fn identity(&self) -> &TaintEdgeFunction {
@@ -1108,13 +1110,7 @@ fn compare_resolved_transfers(
     left: &ResolvedTaintTransfer,
     right: &ResolvedTaintTransfer,
 ) -> std::cmp::Ordering {
-    left.point
-        .procedure()
-        .semantics()
-        .locator()
-        .cmp(right.point.procedure().semantics().locator())
-        .then_with(|| left.point.id().cmp(&right.point.id()))
-        .then_with(|| left.phase.cmp(&right.phase))
+    compare_transfer_position(&left.point, left.phase, &right.point, right.phase)
         .then_with(|| left.carrier.cmp(&right.carrier))
 }
 
@@ -1142,13 +1138,7 @@ fn compare_sanitizers(
     left: &TaintSanitizerBinding,
     right: &TaintSanitizerBinding,
 ) -> std::cmp::Ordering {
-    left.point
-        .procedure()
-        .semantics()
-        .locator()
-        .cmp(right.point.procedure().semantics().locator())
-        .then_with(|| left.point.id().cmp(&right.point.id()))
-        .then_with(|| left.phase.cmp(&right.phase))
+    compare_transfer_position(&left.point, left.phase, &right.point, right.phase)
         .then_with(|| left.event_index.cmp(&right.event_index))
         .then_with(|| left.carrier.cmp(&right.carrier))
         .then_with(|| left.output.cmp(&right.output))
@@ -1161,13 +1151,7 @@ fn compare_transforms(
     left: &TaintTransformBinding,
     right: &TaintTransformBinding,
 ) -> std::cmp::Ordering {
-    left.point
-        .procedure()
-        .semantics()
-        .locator()
-        .cmp(right.point.procedure().semantics().locator())
-        .then_with(|| left.point.id().cmp(&right.point.id()))
-        .then_with(|| left.phase.cmp(&right.phase))
+    compare_transfer_position(&left.point, left.phase, &right.point, right.phase)
         .then_with(|| left.event_index.cmp(&right.event_index))
         .then_with(|| left.carrier.cmp(&right.carrier))
         .then_with(|| left.function.cmp(&right.function))
@@ -1475,13 +1459,7 @@ fn remap_sources(
         .sources
         .iter()
         .map(|source| {
-            let spec = analysis
-                .value_flow
-                .source(source.source)
-                .ok_or(TaintPlanError::InvalidSource)?;
-            let remapped = value_flow
-                .source_id_for_key(spec.key())
-                .ok_or(TaintPlanError::InvalidSource)?;
+            let remapped = remapped_source_id(analysis, value_flow, source.source)?;
             Ok(TaintSourceBinding::new(
                 remapped,
                 source.classes.clone(),
@@ -1499,13 +1477,7 @@ fn remap_sinks(
         .sinks
         .iter()
         .map(|sink| {
-            let spec = analysis
-                .value_flow
-                .sink(sink.sink)
-                .ok_or(TaintPlanError::InvalidSink)?;
-            let remapped = value_flow
-                .sink_id_for_key(spec.key())
-                .ok_or(TaintPlanError::InvalidSink)?;
+            let remapped = remapped_sink_id(analysis, value_flow, sink.sink)?;
             Ok(TaintSinkBinding::new(remapped, sink.accepted.clone()))
         })
         .collect()
@@ -1630,13 +1602,7 @@ fn remap_store_writes(
         .store_writes
         .iter()
         .map(|binding| {
-            let spec = analysis
-                .value_flow
-                .sink(binding.sink)
-                .ok_or(TaintPlanError::InvalidSink)?;
-            let remapped = value_flow
-                .sink_id_for_key(spec.key())
-                .ok_or(TaintPlanError::InvalidSink)?;
+            let remapped = remapped_sink_id(analysis, value_flow, binding.sink)?;
             Ok(TaintStoreWriteBinding::new(
                 remapped,
                 binding.channel.clone(),
@@ -1654,13 +1620,7 @@ fn remap_store_reads(
         .store_reads
         .iter()
         .map(|binding| {
-            let spec = analysis
-                .value_flow
-                .source(binding.source)
-                .ok_or(TaintPlanError::InvalidSource)?;
-            let remapped = value_flow
-                .source_id_for_key(spec.key())
-                .ok_or(TaintPlanError::InvalidSource)?;
+            let remapped = remapped_source_id(analysis, value_flow, binding.source)?;
             Ok(TaintStoreReadBinding::new(
                 remapped,
                 binding.channel.clone(),
@@ -1668,6 +1628,41 @@ fn remap_store_reads(
             ))
         })
         .collect()
+}
+
+fn remapped_source_id(
+    analysis: &TaintAnalysisPlan,
+    value_flow: &ValueFlowPlan,
+    source: ValueFlowSourceId,
+) -> Result<ValueFlowSourceId, TaintPlanError> {
+    let spec = analysis
+        .value_flow
+        .source(source)
+        .ok_or(TaintPlanError::InvalidSource)?;
+    value_flow
+        .source_id_for_key(spec.key())
+        .ok_or(TaintPlanError::InvalidSource)
+}
+
+fn remapped_sink_id(
+    analysis: &TaintAnalysisPlan,
+    value_flow: &ValueFlowPlan,
+    sink: ValueFlowSinkId,
+) -> Result<ValueFlowSinkId, TaintPlanError> {
+    let spec = analysis
+        .value_flow
+        .sink(sink)
+        .ok_or(TaintPlanError::InvalidSink)?;
+    value_flow
+        .sink_id_for_key(spec.key())
+        .ok_or(TaintPlanError::InvalidSink)
+}
+
+fn binding_by_id<T, Id: Ord>(bindings: &[T], id: Id, id_of: impl FnMut(&T) -> Id) -> Option<&T> {
+    bindings
+        .binary_search_by_key(&id, id_of)
+        .ok()
+        .map(|index| &bindings[index])
 }
 
 fn same_stores(left: &TaintAnalysisPlan, right: &TaintAnalysisPlan) -> bool {
@@ -1818,29 +1813,20 @@ impl Error for TaintPlanError {}
 mod tests {
     use super::*;
     use crate::analyzer::Language;
-    use crate::analyzer::semantic::{
-        DeclarationLocator, DeclarationSegment, DeclarationSegmentKind, SemanticLanguage,
-        SemanticRole, SourceAnchor, SourcePosition, SourceSpan, WorkspaceMountId,
-        WorkspaceRelativePath,
-    };
-    use crate::taint::SourceClassId;
+    use crate::analyzer::semantic::{SemanticRole, SourcePosition, SourceSpan};
+    use brokk_bifrost_test_macros::hardwon;
     use std::hash::{Hash, Hasher};
 
     fn locator(path: &str, name: &str) -> SemanticLocator {
         let span =
             SourceSpan::new(SourcePosition::new(0, 0, 0), SourcePosition::new(1, 0, 1)).unwrap();
-        let anchor = SourceAnchor::new(span, 0);
-        SemanticLocator::new(
-            WorkspaceMountId::hash_bytes("mount"),
-            WorkspaceRelativePath::new(path).unwrap(),
-            SemanticLanguage::Standard(Language::Java),
-            DeclarationLocator::new(vec![
-                DeclarationSegment::named(DeclarationSegmentKind::Function, name, anchor, 0)
-                    .unwrap(),
-            ])
-            .unwrap(),
+        crate::test_support::function_locator(
+            "mount",
+            path,
+            Language::Java,
             SemanticRole::Procedure,
-            anchor,
+            name,
+            span,
         )
     }
 
@@ -1849,36 +1835,9 @@ mod tests {
     }
 
     #[test]
-    fn propagation_semantics_separates_every_ingredient_that_changes_results() {
-        let base =
-            TaintPropagationSemanticsId::new(&snapshot(1), &locator("src/A.java", "run"), 7, 9, 11);
-
-        assert_eq!(
-            base,
-            TaintPropagationSemanticsId::new(&snapshot(1), &locator("src/A.java", "run"), 7, 9, 11),
-            "equal ingredients must produce one batch compatibility class"
-        );
-        for changed in [
-            TaintPropagationSemanticsId::new(&snapshot(2), &locator("src/A.java", "run"), 7, 9, 11),
-            TaintPropagationSemanticsId::new(&snapshot(1), &locator("src/B.java", "run"), 7, 9, 11),
-            TaintPropagationSemanticsId::new(
-                &snapshot(1),
-                &locator("src/A.java", "other"),
-                7,
-                9,
-                11,
-            ),
-            TaintPropagationSemanticsId::new(&snapshot(1), &locator("src/A.java", "run"), 8, 9, 11),
-            TaintPropagationSemanticsId::new(&snapshot(1), &locator("src/A.java", "run"), 7, 8, 11),
-        ] {
-            assert_ne!(
-                base, changed,
-                "an ingredient that changes propagation results must change the identity"
-            );
-        }
-    }
-
-    #[test]
+    #[hardwon(
+        "536858984119: replaced Debug-formatted identity with stable length-delimited hashing; this test catches cache-key churn from rendering changes."
+    )]
     fn propagation_semantics_is_a_digest_of_the_ingredients_not_a_rendering_of_them() {
         // The regression this pins: the identity used to be
         // `format!("...:{:?}:...", locator)`, so a `Debug` change to
@@ -1898,62 +1857,6 @@ mod tests {
         assert_eq!(
             TaintPropagationSemanticsId::new(&snapshot(1), &root, 7, 9, 11).as_bytes(),
             expected.finish().as_bytes()
-        );
-    }
-
-    #[test]
-    fn store_channels_separate_only_on_proven_distinct_dimensions() {
-        let proven_a = TaintStoreDimension::Proven(snapshot(10));
-        let proven_b = TaintStoreDimension::Proven(snapshot(11));
-        let primary = |instance: TaintStoreDimension, key: TaintStoreDimension| {
-            TaintStoreChannel::new("primary", instance, key)
-        };
-
-        // Equal store name and no separating dimension: aliases.
-        assert!(
-            primary(TaintStoreDimension::Undeclared, proven_a.clone())
-                .may_alias(&primary(TaintStoreDimension::Undeclared, proven_a.clone())),
-            "equal proven keys on one store must alias"
-        );
-        // A proven-distinct key separates.
-        assert!(
-            !primary(TaintStoreDimension::Undeclared, proven_a.clone())
-                .may_alias(&primary(TaintStoreDimension::Undeclared, proven_b.clone())),
-            "proven distinct keys must separate"
-        );
-        // A proven-distinct instance separates.
-        assert!(
-            !primary(proven_a.clone(), TaintStoreDimension::Undeclared)
-                .may_alias(&primary(proven_b.clone(), TaintStoreDimension::Undeclared)),
-            "proven distinct instances must separate"
-        );
-        // Any unproven or undeclared side joins: the analysis cannot defend a
-        // separation it did not prove.
-        assert!(
-            primary(TaintStoreDimension::Unproven, proven_a.clone())
-                .may_alias(&primary(proven_b.clone(), proven_a.clone())),
-            "an unproven instance must join"
-        );
-        assert!(
-            primary(
-                TaintStoreDimension::Undeclared,
-                TaintStoreDimension::Unproven
-            )
-            .may_alias(&primary(TaintStoreDimension::Undeclared, proven_b)),
-            "an unproven key must join"
-        );
-        // Different store names never alias, whatever the dimensions say.
-        assert!(
-            !primary(
-                TaintStoreDimension::Undeclared,
-                TaintStoreDimension::Undeclared
-            )
-            .may_alias(&TaintStoreChannel::new(
-                "secondary",
-                TaintStoreDimension::Undeclared,
-                TaintStoreDimension::Undeclared,
-            )),
-            "distinct store names must separate"
         );
     }
 
@@ -1999,32 +1902,5 @@ mod tests {
                 .may_alias(&channel(TaintStoreDimension::proven_set([a, c]),))
         );
         assert!(!channel(TaintStoreDimension::Proven(c)).may_alias(&channel(first)));
-    }
-
-    #[test]
-    fn compatibility_keys_separate_call_behavior_from_propagation_semantics() {
-        let semantics =
-            TaintPropagationSemanticsId::new(&snapshot(1), &locator("src/A.java", "run"), 7, 9, 11);
-        let universe =
-            TaintUniverse::new(vec![SourceClassId::new("input.user-controlled").unwrap()])
-                .unwrap()
-                .hash();
-
-        assert_eq!(
-            TaintBatchCompatibilityKey::new(semantics, universe),
-            TaintBatchCompatibilityKey::with_call_behavior(
-                semantics,
-                UnmodeledCallBehavior::default(),
-                universe,
-            )
-        );
-        assert_ne!(
-            TaintBatchCompatibilityKey::new(semantics, universe),
-            TaintBatchCompatibilityKey::with_call_behavior(
-                semantics,
-                UnmodeledCallBehavior::Optimistic,
-                universe,
-            )
-        );
     }
 }

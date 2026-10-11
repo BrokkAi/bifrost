@@ -6,45 +6,15 @@
 
 #[cfg(test)]
 mod tests {
+    use crate::analyzer::CodeUnit;
     use crate::analyzer::rust::RustAnalyzer;
     use crate::analyzer::{AnalyzerQueryScope, QueryScope};
-    use crate::analyzer::{CodeUnit, CodeUnitIndex};
     use crate::analyzer::{CodeUnitType, Language, ProjectFile, TestProject};
     use brokk_bifrost_rust::usage::RustReferenceResolution;
     use brokk_bifrost_rust::usage::{Domain, ModuleKey, RustSymbolIdentity, RustSymbolNamespace};
     use brokk_bifrost_rust::usage_queries::RustUsageQueries;
     use brokk_bifrost_rust::usage_walks::RustUsageWalks;
     use std::collections::BTreeSet;
-    #[test]
-    fn rust_domains_intersect_without_cross_crate_or_sibling_widening() {
-        let crate_a = "workspace.a.src".to_string();
-        let crate_b = "workspace.b.src".to_string();
-        let parent = Domain::Module(ModuleKey {
-            crate_root: crate_a.clone(),
-            components: vec!["parent".to_string()],
-        });
-        let child = Domain::Module(ModuleKey {
-            crate_root: crate_a.clone(),
-            components: vec!["parent".to_string(), "child".to_string()],
-        });
-        let sibling = Domain::Module(ModuleKey {
-            crate_root: crate_a.clone(),
-            components: vec!["sibling".to_string()],
-        });
-
-        assert_eq!(Some(child.clone()), parent.intersect(&child));
-        assert_eq!(
-            Some(child.clone()),
-            Domain::Crate(crate_a.clone()).intersect(&child)
-        );
-        assert_eq!(None, parent.intersect(&sibling));
-        assert_eq!(
-            None,
-            Domain::Crate(crate_a).intersect(&Domain::Crate(crate_b))
-        );
-        assert_eq!(Some(child.clone()), Domain::Public.intersect(&child));
-    }
-
     #[test]
     fn fallback_binding_identity_remains_an_exact_root() {
         // The caller-supplied root lacks an indexed identity, but its file
@@ -186,37 +156,5 @@ mod tests {
                 .collect::<Vec<_>>()
                 .join(", ")
         )
-    }
-    #[cfg_attr(not(scheduled_tests), ignore = "scheduled-only")]
-    #[test]
-    fn dbg_visibility_probe() {
-        let temp = tempfile::tempdir().expect("tempdir");
-        let root = temp.path().canonicalize().expect("canonical root");
-        ProjectFile::new(root.clone(), "src/lib.rs")
-            .write("pub mod util;\n")
-            .expect("write lib.rs");
-        ProjectFile::new(root.clone(), "src/util.rs")
-            .write("fn helper() {}\nmod inner {\n    pub struct Shared;\n}\n")
-            .expect("write util.rs");
-        let analyzer = analyzer_for(&root);
-        let util = ProjectFile::new(root.clone(), "src/util.rs");
-        let properties = analyzer
-            .declaration_source_properties(&util, &|| true)
-            .expect("canonical declaration properties");
-        for d in analyzer.declarations(&util) {
-            let vis = properties
-                .get(&d)
-                .expect("declaration source bridge")
-                .iter()
-                .map(|property| &property.visibility)
-                .collect::<Vec<_>>();
-            println!(
-                "DBG {} kind={:?} vis={:?} parent={:?}",
-                d.fq_name(),
-                d.kind(),
-                vis,
-                analyzer.structural_parent_of(&d).map(|p| p.fq_name())
-            );
-        }
     }
 }

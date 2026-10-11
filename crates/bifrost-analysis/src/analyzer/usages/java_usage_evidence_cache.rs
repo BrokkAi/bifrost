@@ -67,11 +67,18 @@ impl JavaUsageEvidenceTargetKey {
         targets: &[CodeUnit],
         structured_target_fingerprint: StableDigest,
     ) -> Self {
-        assert!(!targets.is_empty(), "Java target key must not be empty");
-        let mut target_ids = targets
-            .iter()
-            .map(CodeUnit::declaration_id)
-            .collect::<Vec<_>>();
+        Self::from_target_ids(
+            targets.iter().map(CodeUnit::declaration_id),
+            structured_target_fingerprint,
+        )
+    }
+
+    fn from_target_ids(
+        target_ids: impl IntoIterator<Item = DeclarationId>,
+        structured_target_fingerprint: StableDigest,
+    ) -> Self {
+        let mut target_ids = target_ids.into_iter().collect::<Vec<_>>();
+        assert!(!target_ids.is_empty(), "Java target key must not be empty");
         target_ids.sort_unstable();
         target_ids.dedup();
         Self {
@@ -88,14 +95,7 @@ impl JavaUsageEvidenceTargetKey {
         target_ids: impl IntoIterator<Item = DeclarationId>,
         structured_target_fingerprint: StableDigest,
     ) -> Self {
-        let mut target_ids = target_ids.into_iter().collect::<Vec<_>>();
-        assert!(!target_ids.is_empty(), "Java target key must not be empty");
-        target_ids.sort_unstable();
-        target_ids.dedup();
-        Self {
-            target_ids: target_ids.into_boxed_slice(),
-            structured_target_fingerprint,
-        }
+        Self::from_target_ids(target_ids, structured_target_fingerprint)
     }
 
     fn retained_bytes(&self) -> u64 {
@@ -441,7 +441,6 @@ mod tests {
     use crate::analyzer::model::CodeUnitType;
     use std::sync::atomic::{AtomicBool, AtomicUsize};
     use std::thread;
-    use std::time::{Duration, Instant};
 
     fn digest(seed: u64) -> StableDigest {
         StableDigest::sha256(seed.to_be_bytes())
@@ -475,14 +474,10 @@ mod tests {
     }
 
     fn wait_for_follower(cache: &SnapshotJavaUsageEvidenceCache) {
-        let deadline = Instant::now() + Duration::from_secs(5);
-        while cache.waiting_count_for_test() == 0 {
-            assert!(
-                Instant::now() < deadline,
-                "follower did not enter single-flight wait"
-            );
-            thread::yield_now();
-        }
+        brokk_bifrost_core::test_support::wait_for_nonzero_count(
+            || cache.waiting_count_for_test(),
+            "follower did not enter single-flight wait",
+        );
     }
 
     fn ready(

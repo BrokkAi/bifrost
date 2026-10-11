@@ -15,7 +15,7 @@ The query is deliberately answerable only in part. Its row set is complete, but
 one row is `ambiguous`, so an embedder that reads only the values and ignores
 `outcome` reaches a confident wrong conclusion.
 
-> Last verified end to end: 2026-09-02 (`query_code` schema version 1).
+> Last verified end to end: 2026-10-01 (`query_code` schema version 1).
 
 ## Fixture
 
@@ -310,7 +310,7 @@ concludes the wrong thing. `ambiguous` means the analysis proved a bounded
 candidate set, not a single value. The other uncertain outcomes are
 `unknown`, `unsupported`, and `exceeded_budget`; treat all four as "not
 proven", never as an empty result. See
-[Receiver Traversal](../receiver-traversal/) for what each one means.
+[Receiver Traversal](/code-query-tutorials/receiver-traversal/) for what each one means.
 
 The same query through the CLI returns the same structured content:
 
@@ -398,6 +398,12 @@ want those counters for one run.
 Python client use, so the argument object is the canonical query's JSON, without
 the `limit` the section above added.
 
+The `bifrost` binary registers Bifrost's shipped semantic packs when it starts,
+and the Python client registers them when it opens a session. A Rust program
+must do this itself: call
+`install_bifrost_semantic_model_packs()` once before it builds a
+`SearchToolsService`. See the [Rust API reference](/reference/rust-api/).
+
 ```rust
 use brokk_bifrost::rql::{CodeQueryDiagnosticImpact, CodeQueryResultValue};
 use brokk_bifrost::SearchToolsService;
@@ -406,6 +412,9 @@ use std::path::PathBuf;
 
 /// Split the `commit` receivers into proven single targets and unproven sites.
 fn commit_receivers(root: PathBuf) -> Result<(Vec<String>, Vec<String>), String> {
+    // Register the shipped semantic packs once per process. Without this
+    // call, no shipped pack activates in an embedding process.
+    brokk_bifrost::install_bifrost_semantic_model_packs()?;
     let service = SearchToolsService::new(root)?;
     let response = service
         .query_code_result(json!({

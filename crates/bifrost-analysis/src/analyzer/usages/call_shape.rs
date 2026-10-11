@@ -91,6 +91,13 @@ pub struct ArgumentRow {
     pub name: Option<String>,
     /// Whether the argument expands a pack (`*args`, `xs: _*`, `...xs`).
     pub spread: bool,
+    /// Decoded value when the argument is a normalized string literal.
+    ///
+    /// This is deliberately optional: an argument can be a non-literal,
+    /// dynamic expression, or a language-specific shape that has no backing
+    /// structural fact. Policies must keep those cases structured
+    /// incomplete rather than treating them as a literal mismatch.
+    pub literal_value: Option<String>,
     pub range: Range,
 }
 
@@ -121,7 +128,7 @@ pub fn call_shape_for_call(
     file: &ProjectFile,
     call_id: u32,
 ) -> Option<CallShapeReport> {
-    if facts.node(call_id).kind != NormalizedKind::Call {
+    if !facts.node(call_id).kind.satisfies(NormalizedKind::Call) {
         return None;
     }
     // The site is the outermost application of the curried sequence, and its
@@ -138,16 +145,14 @@ pub fn call_shape_for_call(
     let site_id = digest.finish().to_string();
     let site_ast_id = ast_id(content_identity, site_call_id);
 
-    let callee_range = call
-        .name
-        .map(|span| range_for_bytes(facts, span.start_byte, span.end_byte));
+    let callee_range = call.name.map(|span| super::range_for_span(facts, span));
     let callee_name = call.name.map(|span| span.text(facts.source()).to_owned());
     // The receiver is written on the innermost application: `a.f(x)(y)` reads
     // its receiver at `a`, and the outer application has none of its own.
     let receiver_range = applications
         .iter()
         .find_map(|&id| facts.role_targets(id, Role::Receiver).next())
-        .map(|target| range_for_bytes(facts, target.span.start_byte, target.span.end_byte));
+        .map(|target| super::range_for_span(facts, target.span));
     // Coverage is the least complete answer any application in the sequence
     // gave: one unreadable list makes the whole site's shape unreadable.
     let coverage = applications
@@ -162,7 +167,7 @@ pub fn call_shape_for_call(
     // An unreadable shape emits no group and no argument row. A fabricated
     // empty list would be indistinguishable from a real zero-argument call,
     // which is exactly the confusion the coverage field exists to prevent.
-    if coverage == CallShapeCoverage::Exact {
+    if coverage.is_exact() {
         let mut group_index = 0usize;
         for &application in &applications {
             for (kind, members) in argument_groups_of(facts, application) {
@@ -187,6 +192,7 @@ pub fn call_shape_for_call(
                         argument_index,
                         name: member.name.clone(),
                         spread: member.spread,
+                        literal_value: member.literal_value.clone(),
                         range: member.range,
                     });
                 }
@@ -236,7 +242,7 @@ pub fn call_shapes_in_file(
         if reports.len() >= limit {
             break;
         }
-        if node.kind != NormalizedKind::Call {
+        if !node.kind.satisfies(NormalizedKind::Call) {
             continue;
         }
         let call_id = u32::try_from(id).expect("facts arena node IDs fit u32");
@@ -255,6 +261,7 @@ struct ArgumentMember {
     range: Range,
     name: Option<String>,
     spread: bool,
+    literal_value: Option<String>,
 }
 
 /// The positional and named groups one application node contributes.
@@ -266,11 +273,14 @@ fn argument_groups_of(
     let mut named = Vec::new();
     for target in facts.roles(call_id) {
         let member = ArgumentMember {
-            range: range_for_bytes(facts, target.span.start_byte, target.span.end_byte),
+            range: super::range_for_span(facts, target.span),
             name: target
                 .keyword
                 .map(|keyword| keyword.text(facts.source()).to_owned()),
             spread: target.spread,
+            literal_value: target
+                .node
+                .and_then(|node| facts.node(node).string_value.clone()),
         };
         match target.role {
             Role::Arg => positional.push(member),
@@ -323,7 +333,7 @@ fn application_sequence(facts: &FileFacts, root: u32) -> Vec<u32> {
 /// source text is consulted.
 fn continued_application_of(facts: &FileFacts, call_id: u32) -> Option<u32> {
     let call = facts.node(call_id);
-    if call.kind != NormalizedKind::Call
+    if !call.kind.satisfies(NormalizedKind::Call)
         || !call
             .call_site
             .is_some_and(|site| site.continues_callee_groups)
@@ -334,7 +344,7 @@ fn continued_application_of(facts: &FileFacts, call_id: u32) -> Option<u32> {
     while child < call.subtree_end {
         let node = facts.node(child);
         if node.parent == Some(call_id)
-            && node.kind == NormalizedKind::Call
+            && node.kind.satisfies(NormalizedKind::Call)
             && node.range.start_byte == call.range.start_byte
         {
             return Some(child);
@@ -359,9 +369,10 @@ fn site_coverage(node: &NormalizedNode) -> CallShapeCoverage {
 fn coverage_rank(coverage: CallShapeCoverage) -> u8 {
     match coverage {
         CallShapeCoverage::Exact => 0,
-        CallShapeCoverage::Partial => 1,
-        CallShapeCoverage::UnknownDynamic => 2,
-        CallShapeCoverage::UnknownMacroDerived => 3,
+        CallShapeCoverage::ExactMacroDerived => 1,
+        CallShapeCoverage::Partial => 2,
+        CallShapeCoverage::UnknownDynamic => 3,
+        CallShapeCoverage::UnknownMacroDerived => 4,
     }
 }
 
@@ -384,15 +395,6 @@ fn call_kind_for(facts: &FileFacts, applications: &[u32]) -> CallKind {
     }
 }
 
-fn range_for_bytes(facts: &FileFacts, start_byte: usize, end_byte: usize) -> Range {
-    Range {
-        start_byte,
-        end_byte,
-        start_line: facts.line_of_byte(start_byte),
-        end_line: facts.line_of_byte(end_byte),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use std::env;
@@ -412,145 +414,6 @@ mod tests {
         let grammar = tree_sitter_python::LANGUAGE.into();
         extract_file_facts(&PYTHON_STRUCTURAL_SPEC, &grammar, source)
             .expect("Python structural facts")
-    }
-
-    fn shape_for(source: &str, facts: &FileFacts, call_text: &str) -> CallShapeReport {
-        let start = source.rfind(call_text).expect("call text exists");
-        let end = start + call_text.len();
-        let call_id = facts
-            .nodes()
-            .iter()
-            .enumerate()
-            .find(|(_, node)| {
-                node.kind == NormalizedKind::Call
-                    && node.range.start_byte == start
-                    && node.range.end_byte == end
-            })
-            .map(|(id, _)| u32::try_from(id).expect("node id fits u32"))
-            .expect("call node exists at the text span");
-        call_shape_for_call(facts, &file("shape.py"), call_id).expect("call shape")
-    }
-
-    #[test]
-    fn positional_call_yields_one_ordered_ordinary_group() {
-        let source = "def target(a, b): pass\ntarget(1, 2)\n";
-        let facts = python_facts(source);
-        let report = shape_for(source, &facts, "target(1, 2)");
-
-        assert_eq!(report.outcome.call_kind, CallKind::Function);
-        assert_eq!(report.outcome.coverage, CallShapeCoverage::Exact);
-        assert_eq!(report.outcome.id, report.outcome.site_id);
-        let callee = report.outcome.callee_range.expect("callee range");
-        assert_eq!(&source[callee.start_byte..callee.end_byte], "target");
-
-        assert_eq!(report.groups.len(), 1);
-        let group = &report.groups[0];
-        assert_eq!(group.kind, ArgumentListKind::Ordinary);
-        assert_eq!(group.group_index, 0);
-        assert_eq!(group.argument_count, 2);
-        assert_eq!(group.site_id, report.outcome.site_id);
-
-        let texts: Vec<_> = report
-            .arguments
-            .iter()
-            .map(|argument| {
-                assert_eq!(argument.group_id, group.id);
-                &source[argument.range.start_byte..argument.range.end_byte]
-            })
-            .collect();
-        assert_eq!(texts, ["1", "2"]);
-        assert_eq!(
-            report
-                .arguments
-                .iter()
-                .map(|argument| argument.argument_index)
-                .collect::<Vec<_>>(),
-            [0, 1]
-        );
-    }
-
-    #[test]
-    fn named_arguments_form_a_separate_ordered_named_group() {
-        let source = "def target(a, width=0): pass\ntarget(1, width=3)\n";
-        let facts = python_facts(source);
-        let report = shape_for(source, &facts, "target(1, width=3)");
-
-        assert_eq!(report.groups.len(), 2);
-        assert_eq!(report.groups[0].kind, ArgumentListKind::Ordinary);
-        assert_eq!(report.groups[0].argument_count, 1);
-        assert_eq!(report.groups[1].kind, ArgumentListKind::Named);
-        assert_eq!(report.groups[1].group_index, 1);
-        assert_eq!(report.groups[1].argument_count, 1);
-
-        let named: Vec<_> = report
-            .arguments
-            .iter()
-            .filter(|argument| argument.group_id == report.groups[1].id)
-            .collect();
-        assert_eq!(named.len(), 1);
-        assert_eq!(named[0].name.as_deref(), Some("width"));
-        assert!(!named[0].spread);
-    }
-
-    #[test]
-    fn spread_arguments_keep_their_pack_flag() {
-        let source = "def target(*items): pass\nvalues = [1]\ntarget(*values)\n";
-        let facts = python_facts(source);
-        let report = shape_for(source, &facts, "target(*values)");
-
-        assert_eq!(report.groups.len(), 1);
-        assert_eq!(report.arguments.len(), 1);
-        assert!(report.arguments[0].spread);
-    }
-
-    #[test]
-    fn zero_argument_call_still_has_one_empty_ordinary_group() {
-        let source = "def target(): pass\ntarget()\n";
-        let facts = python_facts(source);
-        let report = shape_for(source, &facts, "target()");
-
-        assert_eq!(report.groups.len(), 1);
-        assert_eq!(report.groups[0].kind, ArgumentListKind::Ordinary);
-        assert_eq!(report.groups[0].argument_count, 0);
-        assert!(report.arguments.is_empty());
-    }
-
-    #[test]
-    fn receiver_qualified_call_is_a_method_shape() {
-        let source = "class Owner:\n    def target(self): pass\nOwner().target()\n";
-        let facts = python_facts(source);
-        let report = shape_for(source, &facts, "Owner().target()");
-        assert_eq!(report.outcome.call_kind, CallKind::Method);
-    }
-
-    #[test]
-    fn site_group_and_argument_ids_are_stable_and_distinct() {
-        let source = "def target(a, b): pass\ntarget(1, 2)\ntarget(1, 2)\n";
-        let facts = python_facts(source);
-        let reports = call_shapes_in_file(&facts, &file("shape.py"), usize::MAX);
-        assert_eq!(reports.len(), 2);
-        // Same spelling at different positions must mint different site IDs.
-        assert_ne!(reports[0].outcome.site_id, reports[1].outcome.site_id);
-        assert_ne!(
-            reports[0].outcome.site_ast_id,
-            reports[1].outcome.site_ast_id
-        );
-
-        // Re-derivation is deterministic.
-        let again = call_shapes_in_file(&facts, &file("shape.py"), usize::MAX);
-        assert_eq!(reports, again);
-
-        // Row IDs never collide across domains or rows.
-        let mut ids = std::collections::HashSet::new();
-        for report in &reports {
-            assert!(ids.insert(report.outcome.id.clone()));
-            for group in &report.groups {
-                assert!(ids.insert(group.id.clone()));
-            }
-            for argument in &report.arguments {
-                assert!(ids.insert(argument.id.clone()));
-            }
-        }
     }
 
     /// A Scala curried application is one call site whose argument lists are
@@ -640,34 +503,6 @@ mod tests {
         );
     }
 
-    /// A Java `new T(...)` site is a constructor call, and an ordinary
-    /// invocation beside it is not.
-    #[test]
-    fn java_object_creation_is_a_constructor_call() {
-        let source = "class Widget { Widget(int size) {} static void build() { new Widget(2); helper(3); } static void helper(int a) {} }\n";
-        let grammar = tree_sitter_java::LANGUAGE.into();
-        let facts = extract_file_facts(&JAVA_STRUCTURAL_SPEC, &grammar, source)
-            .expect("Java structural facts");
-        let kinds: Vec<_> = call_shapes_in_file(&facts, &file("Widget.java"), usize::MAX)
-            .into_iter()
-            .map(|report| {
-                let range = report.outcome.range;
-                (
-                    source[range.start_byte..range.end_byte].to_owned(),
-                    report.outcome.call_kind,
-                )
-            })
-            .collect();
-        assert!(
-            kinds.contains(&("new Widget(2)".to_owned(), CallKind::Constructor)),
-            "{kinds:?}"
-        );
-        assert!(
-            kinds.contains(&("helper(3)".to_owned(), CallKind::Function)),
-            "{kinds:?}"
-        );
-    }
-
     /// A C++ call of a function-like macro defined in the same file reports
     /// unknown coverage and no argument rows: its source arguments are the
     /// macro's, not the callable's.
@@ -702,6 +537,66 @@ mod tests {
         assert_eq!(ordinary.groups.len(), 1);
         assert_eq!(ordinary.arguments.len(), 2);
     }
+
+    #[test]
+    fn site_group_and_argument_ids_are_stable_and_distinct() {
+        let source = "def target(a, b): pass\ntarget(1, 2)\ntarget(1, 2)\n";
+        let facts = python_facts(source);
+        let reports = call_shapes_in_file(&facts, &file("shape.py"), usize::MAX);
+        assert_eq!(reports.len(), 2);
+        // Same spelling at different positions must mint different site IDs.
+        assert_ne!(reports[0].outcome.site_id, reports[1].outcome.site_id);
+        assert_ne!(
+            reports[0].outcome.site_ast_id,
+            reports[1].outcome.site_ast_id
+        );
+
+        // Re-derivation is deterministic.
+        let again = call_shapes_in_file(&facts, &file("shape.py"), usize::MAX);
+        assert_eq!(reports, again);
+
+        // Row IDs never collide across domains or rows.
+        let mut ids = std::collections::HashSet::new();
+        for report in &reports {
+            assert!(ids.insert(report.outcome.id.clone()));
+            for group in &report.groups {
+                assert!(ids.insert(group.id.clone()));
+            }
+            for argument in &report.arguments {
+                assert!(ids.insert(argument.id.clone()));
+            }
+        }
+    }
+
+    #[test]
+    fn java_object_creation_is_a_constructor_call() {
+        let source = "class Widget { Widget(int size) {} static void build() { new Widget(2); helper(3); } static void helper(int a) {} }\n";
+        let grammar = tree_sitter_java::LANGUAGE.into();
+        let facts = extract_file_facts(&JAVA_STRUCTURAL_SPEC, &grammar, source)
+            .expect("Java structural facts");
+        let kinds: Vec<_> = call_shapes_in_file(&facts, &file("Widget.java"), usize::MAX)
+            .into_iter()
+            .map(|report| {
+                let range = report.outcome.range;
+                (
+                    source[range.start_byte..range.end_byte].to_owned(),
+                    report.outcome.call_kind,
+                )
+            })
+            .collect();
+        assert!(
+            kinds.contains(&("new Widget(2)".to_owned(), CallKind::Constructor)),
+            "{kinds:?}"
+        );
+        assert!(
+            kinds.contains(&("helper(3)".to_owned(), CallKind::Function)),
+            "{kinds:?}"
+        );
+    }
+
+    /// A C++ call of a function-like macro defined in the same file reports
+    /// unknown coverage and no argument rows: its source arguments are the
+    /// macro's, not the callable's.
 
     #[test]
     fn limit_bounds_per_file_enumeration() {

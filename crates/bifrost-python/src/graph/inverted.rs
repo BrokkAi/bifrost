@@ -19,7 +19,7 @@
 use super::extractor::{
     call_result_types, collect_assigned_identifiers, collect_function_scope_facts_from_node,
     collect_scope_facts_from_parsed_source, enclosing_scope_facts, is_declaration_identifier,
-    reference_is_deferred_function_body, slice,
+    slice,
 };
 use super::resolver::{
     annotation_reference_candidates, resolve_callable_parameter_default_types,
@@ -30,6 +30,9 @@ use crate::bindings::{python_comprehension_binds_name_at, python_type_parameter_
 use crate::graph::PythonGraphSource;
 use crate::graph_support::PythonUsageSource;
 use crate::imports::{imported_module_assignment_at, resolve_fqn_candidates};
+use crate::syntax::{
+    attribute_chain, leftmost_identifier, python_reference_is_deferred_function_body,
+};
 use crate::usage_index::{
     ModuleBindingEventKind, ModuleBindingTimeline, usage_module_binding_timeline,
     usage_resolve_module_files, usage_scope_facts,
@@ -132,21 +135,11 @@ impl<'a> PythonEdgeScan<'a> {
                         } else {
                             format!("{module}.{imported}")
                         };
-                        if let Some(imported_module) =
-                            canonical_import_module_fqn(graph, python, file, &imported_fqn)
-                        {
-                            namespace.insert(
-                                local.clone(),
-                                NamespaceBinding {
-                                    root_module: imported_module.clone(),
-                                    module: imported_module,
-                                    workspace_module: true,
-                                    consumed_attributes: 0,
-                                },
-                            );
-                        } else {
-                            named.insert(local.clone(), imported_fqn);
-                        }
+                        // The binder has already resolved a `from` import's
+                        // package attribute before falling back to a same-named
+                        // child module. Reinterpreting a named export as a
+                        // namespace here would undo that decision (#3390).
+                        named.insert(local.clone(), imported_fqn);
                     }
                 }
                 ImportKind::Namespace => {
@@ -331,7 +324,7 @@ impl PyScan<'_> {
 
     fn visible_namespace_root(&self, local: &str, node: Node<'_>) -> Option<String> {
         let events = self.module_bindings.get(local)?;
-        let cutoff = if reference_is_deferred_function_body(node) {
+        let cutoff = if python_reference_is_deferred_function_body(node) {
             usize::MAX
         } else {
             node.start_byte()
@@ -470,9 +463,21 @@ impl PyScan<'_> {
         start: usize,
         end: usize,
     ) {
-        if self.accepts_target(&callee) {
-            self.edges.record_kind(self.input, callee, kind, start, end);
+        self.record_if_accepted(callee, kind, start, end);
+    }
+
+    fn record_if_accepted(
+        &mut self,
+        callee: String,
+        kind: UsageReferenceKind,
+        start: usize,
+        end: usize,
+    ) -> bool {
+        if !self.accepts_target(&callee) {
+            return false;
         }
+        self.edges.record_kind(self.input, callee, kind, start, end);
+        true
     }
 
     /// `record_direct_or_namespace_fallback`'s immediate decision, also
@@ -506,15 +511,11 @@ impl PyScan<'_> {
         start: usize,
         end: usize,
     ) {
-        if self.accepts_target(&direct) {
-            self.edges.record_kind(self.input, direct, kind, start, end);
+        if self.record_if_accepted(direct, kind, start, end) {
             return;
         }
         for candidate in inherited {
-            if self.accepts_target(&candidate) {
-                self.edges
-                    .record_kind(self.input, candidate, kind, start, end);
-            }
+            self.record_if_accepted(candidate, kind, start, end);
         }
     }
 
@@ -565,17 +566,8 @@ impl PyScan<'_> {
     }
 
     fn record_unproven_name(&mut self, name: &str, node: Node<'_>) {
-        let Some(targets) = self.targets_by_terminal.get(name) else {
-            return;
-        };
-        for target in targets {
-            self.edges.record_unproven(
-                self.input,
-                target.clone(),
-                node.start_byte(),
-                node.end_byte(),
-            );
-        }
+        self.edges
+            .record_unproven_name_at_node(self.input, name, node);
     }
 
     fn accepts_target(&self, fqn: &str) -> bool {
@@ -702,11 +694,9 @@ fn push_children<'tree>(
     facts: Option<usize>,
     stack: &mut Vec<WalkFrame<'tree>>,
 ) {
-    for index in (0..node.named_child_count()).rev() {
-        if let Some(child) = node.named_child(index) {
-            stack.push(WalkFrame::Enter { node: child, facts });
-        }
-    }
+    brokk_bifrost_core::analyzer::tree_walk::push_named_children_reversed_as(node, stack, |node| {
+        WalkFrame::Enter { node, facts }
+    });
 }
 
 fn push_function_children<'tree>(
@@ -989,7 +979,7 @@ fn handle_keyword_argument(node: Node<'_>, ctx: &mut PyScan<'_>, scopes: &[Funct
     let root_shadowed = leftmost_identifier(function)
         .is_some_and(|root| is_shadowed(scopes, slice(root, ctx.source)));
     if !root_shadowed && let Some(local_name) = function_name {
-        let cutoff = if reference_is_deferred_function_body(function) {
+        let cutoff = if python_reference_is_deferred_function_body(function) {
             usize::MAX
         } else {
             function.start_byte()
@@ -1043,32 +1033,6 @@ fn lexical_class(ctx: &PyScan<'_>, node: Node<'_>) -> Option<CodeUnit> {
             .index
             .parent_of(&enclosing)
             .filter(CodeUnit::is_class)
-    }
-}
-
-fn leftmost_identifier(mut node: Node<'_>) -> Option<Node<'_>> {
-    loop {
-        match node.kind() {
-            "identifier" => return Some(node),
-            "attribute" => node = node.child_by_field_name("object")?,
-            _ => return None,
-        }
-    }
-}
-
-fn attribute_chain<'a>(node: Node<'a>) -> Option<(Node<'a>, Vec<Node<'a>>)> {
-    let mut attributes = Vec::new();
-    let mut current = node;
-    loop {
-        if current.kind() != "attribute" {
-            return None;
-        }
-        attributes.push(current.child_by_field_name("attribute")?);
-        current = current.child_by_field_name("object")?;
-        if current.kind() == "identifier" {
-            attributes.reverse();
-            return Some((current, attributes));
-        }
     }
 }
 

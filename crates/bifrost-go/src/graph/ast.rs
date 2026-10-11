@@ -6,6 +6,7 @@
 //! the analysis-owned scan drivers and this crate's resolver can both use it.
 
 use crate::graph::resolver::TypeRef;
+pub use brokk_bifrost_core::analyzer::tree_walk::last_named_child;
 use brokk_bifrost_core::analyzer::usages::common::{node_text, same_node};
 use tree_sitter::Node;
 
@@ -56,15 +57,10 @@ pub fn declared_names(node: Node<'_>, source: &str) -> Vec<String> {
     }
 }
 pub fn var_spec_names(node: Node<'_>, source: &str) -> Vec<String> {
-    let mut out = Vec::new();
-    let mut cursor = node.walk();
-    for name_node in node.children_by_field_name("name", &mut cursor) {
-        let name = node_text(name_node, source);
-        if name != "_" {
-            out.push(name.to_string());
-        }
-    }
-    out
+    var_spec_name_slots(node, source)
+        .into_iter()
+        .flatten()
+        .collect()
 }
 pub fn var_spec_name_slots(node: Node<'_>, source: &str) -> Vec<Option<String>> {
     let mut out = Vec::new();
@@ -76,25 +72,53 @@ pub fn var_spec_name_slots(node: Node<'_>, source: &str) -> Vec<Option<String>> 
     out
 }
 pub fn for_each_var_spec(node: Node<'_>, f: &mut impl FnMut(Node<'_>)) {
+    for_each_value_spec(node, &mut |spec| {
+        if spec.kind() == "var_spec" {
+            f(spec);
+        }
+    });
+}
+
+pub fn for_each_value_spec(node: Node<'_>, f: &mut impl FnMut(Node<'_>)) {
     let mut cursor = node.walk();
-    for child in node.named_children(&mut cursor) {
-        match child.kind() {
-            "var_spec" => f(child),
-            "var_spec_list" => for_each_var_spec(child, f),
+    let mut stack = node.named_children(&mut cursor).collect::<Vec<_>>();
+    stack.reverse();
+    while let Some(current) = stack.pop() {
+        match current.kind() {
+            "var_spec" | "const_spec" => f(current),
+            "var_spec_list" | "const_spec_list" => {
+                let mut cursor = current.walk();
+                let children = current.named_children(&mut cursor).collect::<Vec<_>>();
+                stack.extend(children.into_iter().rev());
+            }
             _ => {}
         }
     }
 }
+
+pub fn method_receiver_parameter_list(node: Node<'_>) -> Option<Node<'_>> {
+    (node.kind() == "method_declaration")
+        .then(|| node.child_by_field_name("receiver"))
+        .flatten()
+}
+
+pub fn for_each_function_parameter_list<'tree>(
+    node: Node<'tree>,
+    mut visit: impl FnMut(Node<'tree>),
+) {
+    let receiver = method_receiver_parameter_list(node);
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        if child.kind() == "parameter_list" && Some(child) != receiver {
+            visit(child);
+        }
+    }
+}
+
 pub fn lhs_identifiers(node: Node<'_>, source: &str) -> Vec<String> {
-    let Some(left) = node
-        .child_by_field_name("left")
-        .or_else(|| first_named_child(node))
-    else {
-        return Vec::new();
-    };
-    identifiers_in_node(left, source)
+    lhs_identifier_slots(node, source)
         .into_iter()
-        .filter(|name| name != "_")
+        .flatten()
         .collect()
 }
 pub fn lhs_identifier_slots(node: Node<'_>, source: &str) -> Vec<Option<String>> {
@@ -194,6 +218,113 @@ pub fn clause_binding_names(node: Node<'_>, source: &str) -> Vec<String> {
 
 pub fn receive_statement_is_short_declaration(node: Node<'_>) -> bool {
     node.kind() == "receive_statement" && has_short_declaration_token(node)
+}
+
+pub fn for_each_clause_prebody_node<'tree>(node: Node<'tree>, mut visit: impl FnMut(Node<'tree>)) {
+    let body = clause_statement_list(node);
+    let communication = node.child_by_field_name("communication");
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        if body == Some(child) {
+            continue;
+        }
+        if communication == Some(child) && receive_statement_is_short_declaration(child) {
+            if let Some(right) = child.child_by_field_name("right") {
+                visit(right);
+            }
+        } else {
+            visit(child);
+        }
+    }
+}
+
+pub fn for_each_type_switch_child<'tree>(node: Node<'tree>, mut visit: impl FnMut(Node<'tree>)) {
+    let alias = node.child_by_field_name("alias");
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        if alias != Some(child) {
+            visit(child);
+        }
+    }
+}
+
+pub fn for_each_parameter_declaration<'tree>(
+    node: Node<'tree>,
+    mut visit: impl FnMut(Node<'tree>),
+) {
+    let mut cursor = node.walk();
+    for parameter in node.named_children(&mut cursor) {
+        if matches!(
+            parameter.kind(),
+            "parameter_declaration" | "variadic_parameter_declaration"
+        ) {
+            visit(parameter);
+        }
+    }
+}
+
+pub fn for_each_callable_header_node<'tree>(node: Node<'tree>, mut visit: impl FnMut(Node<'tree>)) {
+    let body = node.child_by_field_name("body");
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        if body == Some(child) {
+            continue;
+        }
+        if child.kind() == "parameter_list" {
+            for_each_parameter_declaration(child, |parameter| {
+                if let Some(type_node) = parameter.child_by_field_name("type") {
+                    visit(type_node);
+                }
+            });
+        } else {
+            visit(child);
+        }
+    }
+}
+
+pub fn for_each_var_spec_prebinding_node<'tree>(
+    node: Node<'tree>,
+    mut visit: impl FnMut(Node<'tree>),
+) {
+    if let Some(type_node) = node.child_by_field_name("type") {
+        visit(type_node);
+    }
+    for value in rhs_expressions(node) {
+        visit(value);
+    }
+}
+
+pub fn infer_before_declaring_short_var_bindings<B, State>(
+    node: Node<'_>,
+    source: &str,
+    state: &mut State,
+    infer: impl FnOnce(Vec<Option<String>>, Vec<Node<'_>>, &State) -> B,
+    declare_shadow: impl FnMut(&mut State, String),
+    apply: impl FnOnce(&mut State, B),
+) {
+    infer_before_declaring_bindings(
+        lhs_identifier_slots(node, source),
+        rhs_expressions(node),
+        state,
+        infer,
+        declare_shadow,
+        apply,
+    );
+}
+
+pub fn infer_before_declaring_bindings<B, State>(
+    slots: Vec<Option<String>>,
+    values: Vec<Node<'_>>,
+    state: &mut State,
+    infer: impl FnOnce(Vec<Option<String>>, Vec<Node<'_>>, &State) -> B,
+    mut declare_shadow: impl FnMut(&mut State, String),
+    apply: impl FnOnce(&mut State, B),
+) {
+    let bindings = infer(slots.clone(), values, state);
+    for name in slots.into_iter().flatten() {
+        declare_shadow(state, name);
+    }
+    apply(state, bindings);
 }
 
 pub fn range_clause_is_short_declaration(node: Node<'_>) -> bool {
@@ -297,14 +428,7 @@ pub fn type_ref_from_node(node: Node<'_>, source: &str) -> Option<TypeRef> {
         _ => None,
     }
 }
-pub fn first_named_child(node: Node<'_>) -> Option<Node<'_>> {
-    let mut cursor = node.walk();
-    node.named_children(&mut cursor).next()
-}
-pub fn last_named_child(node: Node<'_>) -> Option<Node<'_>> {
-    let mut cursor = node.walk();
-    node.named_children(&mut cursor).last()
-}
+pub use brokk_bifrost_core::analyzer::structural::adapter_helpers::first_named_child;
 pub fn is_definition_identifier(node: Node<'_>, _source: &str) -> bool {
     let Some(parent) = node.parent() else {
         return false;
@@ -349,21 +473,23 @@ pub fn is_definition_identifier(node: Node<'_>, _source: &str) -> bool {
         .and_then(|parent| parent.child_by_field_name("name"))
         .is_some_and(|name| same_node(name, node))
 }
-pub fn is_method_receiver_type(node: Node<'_>) -> bool {
+fn method_receiver_parameter_ancestor(node: Node<'_>) -> Option<Node<'_>> {
     let mut ancestor = node.parent();
     while let Some(current) = ancestor {
         if current.kind() == "parameter_declaration" {
-            return is_method_receiver_parameter(current)
-                && current
-                    .child_by_field_name("type")
-                    .is_some_and(|type_node| {
-                        type_node.start_byte() <= node.start_byte()
-                            && node.end_byte() <= type_node.end_byte()
-                    });
+            return is_method_receiver_parameter(current).then_some(current);
         }
         ancestor = current.parent();
     }
-    false
+    None
+}
+
+pub fn is_method_receiver_type(node: Node<'_>) -> bool {
+    method_receiver_parameter_ancestor(node)
+        .and_then(|receiver| receiver.child_by_field_name("type"))
+        .is_some_and(|type_node| {
+            type_node.start_byte() <= node.start_byte() && node.end_byte() <= type_node.end_byte()
+        })
 }
 
 /// Whether `node` is the type name a method receiver attaches the method to --
@@ -379,15 +505,9 @@ pub fn is_method_receiver_type_name(node: Node<'_>) -> bool {
     if node.kind() != "type_identifier" {
         return false;
     }
-    let mut ancestor = node.parent();
-    while let Some(current) = ancestor {
-        if current.kind() == "parameter_declaration" {
-            return is_method_receiver_parameter(current)
-                && receiver_type_name(current).is_some_and(|name| same_node(name, node));
-        }
-        ancestor = current.parent();
-    }
-    false
+    method_receiver_parameter_ancestor(node)
+        .and_then(receiver_type_name)
+        .is_some_and(|name| same_node(name, node))
 }
 
 /// Peel the receiver's declared type down to the `type_identifier` it names.
@@ -509,8 +629,20 @@ pub fn composite_literal_owner_type_for_key(node: Node<'_>) -> Option<Node<'_>> 
     }
     Some(owner)
 }
-fn go_map_key_type(mut node: Node<'_>) -> Option<Node<'_>> {
+fn go_map_key_type(node: Node<'_>) -> Option<Node<'_>> {
+    go_map_key_type_with_scope(node, || true)
+}
+
+/// Find a map key type through pointer and parenthesized type wrappers.
+/// `scope_step` charges one step for each inspected type node.
+pub fn go_map_key_type_with_scope(
+    mut node: Node<'_>,
+    mut scope_step: impl FnMut() -> bool,
+) -> Option<Node<'_>> {
     loop {
+        if !scope_step() {
+            return None;
+        }
         match node.kind() {
             "map_type" => return node.child_by_field_name("key"),
             "pointer_type" | "parenthesized_type" => node = node.named_child(0)?,
@@ -519,16 +651,29 @@ fn go_map_key_type(mut node: Node<'_>) -> Option<Node<'_>> {
     }
 }
 pub fn go_container_element_or_value_type(node: Node<'_>) -> Option<Node<'_>> {
-    match node.kind() {
-        "array_type" => node.child_by_field_name("element"),
-        "slice_type" => node.named_child(0),
-        "map_type" => node.child_by_field_name("value"),
-        "pointer_type" | "parenthesized_type" => node
-            .named_child(0)
-            .and_then(go_container_element_or_value_type),
-        _ => None,
+    go_container_element_or_value_type_with_scope(node, || true)
+}
+
+/// Find a container element or value type through type wrappers.
+/// `scope_step` charges one step for each inspected type node.
+pub fn go_container_element_or_value_type_with_scope(
+    mut node: Node<'_>,
+    mut scope_step: impl FnMut() -> bool,
+) -> Option<Node<'_>> {
+    loop {
+        if !scope_step() {
+            return None;
+        }
+        match node.kind() {
+            "array_type" => return node.child_by_field_name("element"),
+            "slice_type" => return node.named_child(0),
+            "map_type" => return node.child_by_field_name("value"),
+            "pointer_type" | "parenthesized_type" => node = node.named_child(0)?,
+            _ => return None,
+        }
     }
 }
+
 pub fn keyed_element_for_key(node: Node<'_>) -> Option<Node<'_>> {
     let parent = node.parent()?;
     let keyed = if parent.kind() == "keyed_element" {

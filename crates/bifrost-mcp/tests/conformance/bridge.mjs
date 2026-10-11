@@ -30,6 +30,7 @@
 import http from 'node:http';
 import { spawn } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
+import { writeMessage } from '../../../../scripts/public/mcp-smoke-transport.mjs';
 
 const [, , portArg, cmd, ...args] = process.argv;
 if (portArg === undefined || cmd === undefined) {
@@ -135,7 +136,7 @@ child.stdout.on('data', (chunk) => {
 // ---- HTTP server -----------------------------------------------------------
 
 function writeToChild(messages) {
-  for (const m of messages) child.stdin.write(JSON.stringify(m) + '\n');
+  for (const m of messages) writeMessage(child, m);
 }
 
 const server = http.createServer((req, res) => {

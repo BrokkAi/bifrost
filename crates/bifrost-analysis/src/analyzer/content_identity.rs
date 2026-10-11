@@ -124,7 +124,8 @@ impl WorkspaceContentIdentities {
     }
 
     /// The identity of every language this analyzer serves.
-    pub(crate) fn whole_workspace(&self) -> Option<WorkspaceContentIdentity> {
+    #[doc(hidden)]
+    pub fn whole_workspace(&self) -> Option<WorkspaceContentIdentity> {
         self.scope(|_| true)
     }
 
@@ -261,10 +262,8 @@ pub(crate) fn language_content_identity<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn oid(byte: u8) -> Oid {
-        Oid::from_bytes(&[byte; 20]).expect("twenty bytes is a valid object id")
-    }
+    use crate::test_support::synthetic_oid as oid;
+    use brokk_bifrost_test_macros::hardwon;
 
     #[test]
     fn a_file_set_digest_is_a_function_of_the_set_and_not_of_its_order() {
@@ -355,6 +354,9 @@ mod tests {
     }
 
     #[test]
+    #[hardwon(
+        "9581b0d66d89: workspace caches lacked a content identity for empty and single-language scopes"
+    )]
     fn an_empty_scope_has_no_identity() {
         let identities =
             WorkspaceContentIdentities::new([(Language::Rust, StableDigest::sha256(b"rust"))]);
@@ -367,6 +369,9 @@ mod tests {
     }
 
     #[test]
+    #[hardwon(
+        "9581b0d66d89: single-language cache scope identity must equal that language identity"
+    )]
     fn a_single_language_analyzer_scopes_its_whole_workspace_to_that_language() {
         let identities =
             WorkspaceContentIdentities::new([(Language::Rust, StableDigest::sha256(b"rust"))]);

@@ -15,6 +15,7 @@ use crate::analyzer::semantic::{
     LengthDelimitedDigest, ProcedureHandle, SemanticArtifact, SemanticArtifactKey,
 };
 use crate::taint::{TaintAnalysisPlan, TaintBatchCompatibilityKey, TaintFindingReport};
+use crate::value_flow::ValueFlowEventKey;
 
 /// Observed production phase costs for one retained compatible taint batch.
 ///
@@ -111,6 +112,7 @@ pub struct ProductionTaintAnalysisResult {
     retained_artifact_bytes: usize,
     registration_digest: Box<str>,
     phase_metrics: ProductionTaintPhaseMetrics,
+    frontier_sources: Box<[ValueFlowEventKey]>,
 }
 
 /// Query-neutral bounds retained with a production taint result.
@@ -179,6 +181,7 @@ impl ProductionTaintAnalysisResult {
             retained_artifact_bytes: usize::try_from(retained_artifact_bytes).unwrap_or(usize::MAX),
             registration_digest: "".into(),
             phase_metrics: ProductionTaintPhaseMetrics::default(),
+            frontier_sources: Box::default(),
         }
     }
 
@@ -256,6 +259,24 @@ impl ProductionTaintAnalysisResult {
 
     pub const fn phase_metrics(&self) -> &ProductionTaintPhaseMetrics {
         &self.phase_metrics
+    }
+
+    /// The source events a composed run bound on the frontier, in key order.
+    /// The plan holds only a composed run's sinks, so these are the sources
+    /// the run observed beside the plan's own; empty for a run whose plan
+    /// holds its sources.
+    pub fn frontier_sources(&self) -> &[ValueFlowEventKey] {
+        &self.frontier_sources
+    }
+
+    /// Record the source events the run bound on the frontier. A source may
+    /// be bound more than once as the search re-enters a procedure; each
+    /// event is kept once.
+    pub fn set_frontier_sources(&mut self, sources: impl IntoIterator<Item = ValueFlowEventKey>) {
+        let mut sources = sources.into_iter().collect::<Vec<_>>();
+        sources.sort();
+        sources.dedup();
+        self.frontier_sources = sources.into_boxed_slice();
     }
 
     pub fn set_phase_metrics(&mut self, phase_metrics: ProductionTaintPhaseMetrics) {

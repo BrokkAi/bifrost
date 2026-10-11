@@ -8,6 +8,91 @@
 use super::ProjectFile;
 use super::model::{TestAssertionSmell, TestAssertionWeights};
 
+/// A shared assertion category whose score and shallow status are language-neutral.
+#[derive(Clone, Copy)]
+pub enum CommonTestAssertionKind {
+    ConstantEquality,
+    SelfComparison,
+    ConstantTruth,
+    NullnessOnly,
+    Meaningful,
+}
+
+/// The common classification fields consumed by language-specific signals.
+#[derive(Clone, Copy)]
+pub struct CommonTestAssertionClassification {
+    pub kind: &'static str,
+    pub score: i32,
+    pub shallow: bool,
+}
+
+/// Assign shared names, weights, and shallow status to a common assertion class.
+pub fn classify_common_test_assertion(
+    kind: CommonTestAssertionKind,
+    weights: &TestAssertionWeights,
+) -> CommonTestAssertionClassification {
+    let (name, score, shallow) = match kind {
+        CommonTestAssertionKind::ConstantEquality => {
+            ("constant-equality", weights.constant_equality_weight, false)
+        }
+        CommonTestAssertionKind::SelfComparison => (
+            "self-comparison",
+            weights.tautological_assertion_weight,
+            false,
+        ),
+        CommonTestAssertionKind::ConstantTruth => {
+            ("constant-truth", weights.constant_truth_weight, true)
+        }
+        CommonTestAssertionKind::NullnessOnly => {
+            ("nullness-only", weights.nullness_only_weight, true)
+        }
+        CommonTestAssertionKind::Meaningful => ("meaningful-assertion", 0, false),
+    };
+    CommonTestAssertionClassification {
+        kind: name,
+        score,
+        shallow,
+    }
+}
+
+/// Normalize a captured assertion expression after its language adapter has
+/// removed any language-specific trailing punctuation.
+pub fn normalize_assertion_expression(expression: &str) -> String {
+    expression
+        .trim()
+        .trim_matches(|ch| matches!(ch, '(' | ')' | ' '))
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// The literal spellings common to the language-specific assertion detectors.
+pub fn is_common_assertion_literal(expression: &str) -> bool {
+    let trimmed = expression.trim();
+    (trimmed.starts_with('"') && trimmed.ends_with('"'))
+        || trimmed.parse::<i64>().is_ok()
+        || trimmed.parse::<f64>().is_ok()
+}
+/// Find the first quoted test expression whose contents exceed the configured
+/// large-literal threshold.
+pub fn oversized_quoted_literal(
+    left: &str,
+    right: &str,
+    weights: &TestAssertionWeights,
+    quote_delimiters: &[char],
+) -> Option<String> {
+    [left, right].into_iter().find_map(|expression| {
+        let trimmed = expression.trim();
+        let unquoted = quote_delimiters.iter().find_map(|delimiter| {
+            trimmed
+                .strip_prefix(*delimiter)
+                .and_then(|value| value.strip_suffix(*delimiter))
+        })?;
+        (unquoted.len() >= weights.large_literal_length_threshold.max(0) as usize)
+            .then(|| trimmed.to_string())
+    })
+}
+
 #[derive(Clone)]
 pub struct TestAssertionSignal {
     pub kind: String,

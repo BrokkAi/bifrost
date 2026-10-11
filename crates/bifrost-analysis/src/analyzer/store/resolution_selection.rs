@@ -18,8 +18,8 @@ use brokk_bifrost_core::analyzer::canonical_hash::{
 
 use crate::CancellationToken;
 use crate::analyzer::resolution::{
-    BindingFragmentId, MountRebaser, SelectedResolutionFragmentDigest,
-    SelectedResolutionMountOrdinal, selected_resolution_fragment_id,
+    BindingFragmentId, MountRebaser, SelectedContextPathToken, SelectedResolutionFragmentDigest,
+    SelectedResolutionMountOrdinal, language_has_jvm_semantics, selected_resolution_fragment_id,
 };
 use crate::hash::{HashMap, HashSet};
 
@@ -272,6 +272,31 @@ ORDER BY files.valid_from
 LIMIT 2
 "#;
 
+fn selected_mount_status_counts() -> String {
+    RESOLUTION_MANIFEST_COUNT_COLUMNS
+        .iter()
+        .map(|column| format!("interiors.{column}"))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn selected_mount_status_joins(mount_alias: &str, language_column: &str) -> String {
+    format!(
+        "LEFT JOIN main.blobs AS blobs\n\
+           ON blobs.blob_oid = {mount_alias}.blob_oid\n\
+          AND blobs.lang = {mount_alias}.{language_column}\n\
+         LEFT JOIN main.blob_meta AS meta\n\
+           ON meta.blob_id = blobs.id\n\
+          AND meta.lang = blobs.lang\n\
+          AND EXISTS (\n\
+            SELECT 1 FROM main.source_fact_readiness AS visibility\n\
+            WHERE visibility.blob_id = blobs.id AND visibility.available = 1\n\
+          )\n\
+         LEFT JOIN main.resolution_fragment_interiors AS interiors\n\
+           ON interiors.blob_id = blobs.id"
+    )
+}
+
 fn selected_mount_status_sql(continuation: bool) -> &'static str {
     static INITIAL_SQL: OnceLock<String> = OnceLock::new();
     static CONTINUATION_SQL: OnceLock<String> = OnceLock::new();
@@ -281,11 +306,8 @@ fn selected_mount_status_sql(continuation: bool) -> &'static str {
         &INITIAL_SQL
     };
     cell.get_or_init(|| {
-        let counts = RESOLUTION_MANIFEST_COUNT_COLUMNS
-            .iter()
-            .map(|column| format!("interiors.{column}"))
-            .collect::<Vec<_>>()
-            .join(", ");
+        let counts = selected_mount_status_counts();
+        let status_joins = selected_mount_status_joins("files", "lang");
         let sql = format!(
             "SELECT files.workspace_id, files.revision, files.file_version_id,
                     files.valid_from, files.lang, files.generation, files.rel_path, files.blob_oid,
@@ -301,18 +323,7 @@ fn selected_mount_status_sql(continuation: bool) -> &'static str {
              LEFT JOIN temp.selected_resolution_overlay_masks AS masks
                ON masks.storage_language = files.lang
               AND masks.persisted_relative_path = files.rel_path
-             LEFT JOIN main.blobs AS blobs
-              ON blobs.blob_oid = files.blob_oid
-              AND blobs.lang = files.lang
-             LEFT JOIN main.blob_meta AS meta
-               ON meta.blob_id = blobs.id
-              AND meta.lang = blobs.lang
-              AND EXISTS (
-                SELECT 1 FROM main.source_fact_readiness AS visibility
-                WHERE visibility.blob_id = blobs.id AND visibility.available = 1
-              )
-             LEFT JOIN main.resolution_fragment_interiors AS interiors
-               ON interiors.blob_id = blobs.id
+             {status_joins}
              WHERE languages.storage_language = ?1
                AND masks.storage_language IS NULL
                {continuation_predicate}
@@ -333,11 +344,8 @@ fn selected_mount_status_sql(continuation: bool) -> &'static str {
 fn selected_content_mount_status_sql() -> &'static str {
     static SQL: OnceLock<String> = OnceLock::new();
     SQL.get_or_init(|| {
-        let counts = RESOLUTION_MANIFEST_COUNT_COLUMNS
-            .iter()
-            .map(|column| format!("interiors.{column}"))
-            .collect::<Vec<_>>()
-            .join(", ");
+        let counts = selected_mount_status_counts();
+        let status_joins = selected_mount_status_joins("requests", "storage_language");
         let sql = format!(
             "SELECT requests.storage_language, requests.generation,
                     requests.persisted_relative_path, requests.blob_oid,
@@ -348,18 +356,7 @@ fn selected_content_mount_status_sql() -> &'static str {
                     interiors.publication_state, interiors.logical_rows,
                     interiors.payload_bytes, {counts}
              FROM temp.selected_resolution_content_mounts AS requests
-             LEFT JOIN main.blobs AS blobs
-               ON blobs.blob_oid = requests.blob_oid
-              AND blobs.lang = requests.storage_language
-             LEFT JOIN main.blob_meta AS meta
-               ON meta.blob_id = blobs.id
-              AND meta.lang = blobs.lang
-              AND EXISTS (
-                SELECT 1 FROM main.source_fact_readiness AS visibility
-                WHERE visibility.blob_id = blobs.id AND visibility.available = 1
-              )
-             LEFT JOIN main.resolution_fragment_interiors AS interiors
-               ON interiors.blob_id = blobs.id
+             {status_joins}
              ORDER BY requests.storage_language, requests.persisted_relative_path"
         );
         #[cfg(test)]
@@ -783,26 +780,24 @@ impl SelectedResolutionContentMountRequest {
         }
     }
 
-    pub(crate) fn with_live_overlay_content_digest(mut self, content_digest: [u8; 32]) -> Self {
-        assert!(
-            self.overlay_authority
-                .replace(SelectedResolutionOverlayAuthority::LiveOverlay { content_digest })
-                .is_none(),
-            "a content mount cannot have two overlay authorities"
-        );
-        self
+    pub(crate) fn with_live_overlay_content_digest(self, content_digest: [u8; 32]) -> Self {
+        self.with_overlay_authority(SelectedResolutionOverlayAuthority::LiveOverlay {
+            content_digest,
+        })
     }
 
     pub(crate) fn with_counterfactual_base_content_digest(
-        mut self,
+        self,
         base_content_digest: [u8; 32],
     ) -> Self {
+        self.with_overlay_authority(SelectedResolutionOverlayAuthority::Counterfactual {
+            base_content_digest,
+        })
+    }
+
+    fn with_overlay_authority(mut self, authority: SelectedResolutionOverlayAuthority) -> Self {
         assert!(
-            self.overlay_authority
-                .replace(SelectedResolutionOverlayAuthority::Counterfactual {
-                    base_content_digest,
-                })
-                .is_none(),
+            self.overlay_authority.replace(authority).is_none(),
             "a content mount cannot have two overlay authorities"
         );
         self
@@ -1171,6 +1166,9 @@ impl SelectedResolutionMountRecord {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum SelectedResolutionUnavailable {
+    GoContextUnavailable {
+        persisted_relative_path: String,
+    },
     MissingWorkspaceSnapshot {
         storage_language: String,
     },
@@ -1297,6 +1295,8 @@ pub(crate) struct SelectedResolutionMountInventory<'store> {
     stage_request_used: Cell<bool>,
     stage_request_identity: u64,
     stage_content_epoch: Cell<u64>,
+    /// Set by an uncounted temp write, which may have staged rows (tests do).
+    stage_written_directly: Cell<bool>,
     /// Which mounts the request may currently bind into, as a value.
     ///
     /// Written by the scope relation's two writers and read by
@@ -1314,9 +1314,22 @@ pub(crate) struct SelectedResolutionMountInventory<'store> {
     /// The current crate stage's checked publications; `None` outside a crate
     /// stage. See `resolution_authority::AuthorityValidations`.
     authority_validations: RefCell<Option<super::resolution_authority::AuthorityValidations>>,
+    /// Published authority and identity answers touched by this one operation.
+    authority_request_memo: RefCell<super::resolution_authority::AuthorityRequestMemo>,
+    /// Published site rows touched by this one operation.
+    site_row_memo: RefCell<super::resolution_lexical::SiteRowMemo>,
+    /// Context tokens committed by this operation, whose rows live in its temp database.
+    published_context_tokens: RefCell<HashSet<i64>>,
+    /// The derive-helper gaps this operation has already decided; see
+    /// `resolution_operation::rust_derive_helpers`.
+    derive_helper_decisions:
+        RefCell<super::resolution_operation::rust_derive_helpers::DeriveHelperDecisions>,
     /// Whether a crate stage holds a read transaction on this reader; see
     /// [`SelectedResolutionMountInventory::begin_stage_read`].
     stage_read: Cell<bool>,
+    /// Whether this request has ensured the optional generic-formals stage
+    /// family exists on its connection.
+    generic_formals_schema_ready: Cell<bool>,
 }
 
 /// Freshness of the retained reader, excluding only its private request buffers.
@@ -1492,12 +1505,28 @@ impl SelectedResolutionMountInventory<'_> {
         self.retained().ready.has_java_semantics
     }
 
+    pub(crate) fn has_jvm_semantics(&self) -> bool {
+        self.retained().ready.has_jvm_semantics
+    }
+
+    /// Whether any selected language has a fixed universe table to consult.
+    pub(crate) fn has_universe_semantics(&self) -> bool {
+        self.retained().ready.has_universe_semantics
+    }
+
     pub(crate) fn workspace_id(&self) -> &str {
         &self.retained().ready.workspace_id
     }
 
     pub(crate) fn workspace_digest(&self) -> Result<[u8; 32]> {
         parse_digest_text(self.workspace_id(), "workspace identity")
+    }
+
+    /// Canonical selected-input identity used by dependency-complete caches.
+    /// The retained selection separately checks its exact TEMP rows and
+    /// freshness stamp before an operation can use this digest.
+    pub(crate) fn routing_digest(&self) -> [u8; 32] {
+        self.retained().routing_digest
     }
 
     pub(crate) fn languages(&self) -> Result<&[SelectedResolutionLanguageState]> {
@@ -1694,6 +1723,17 @@ impl SelectedResolutionMountInventory<'_> {
             .total_changes()
             .checked_sub(before)
             .expect("a temp write cannot lower the connection's change counter");
+        self.account_committed_request_changes(changed);
+        if changed != 0 {
+            // An arbitrary temp write may have written stage content (tests
+            // stage rows this way), so stage readers must run again. This is
+            // not a content commit and does not move the coverage fingerprint.
+            self.stage_written_directly.set(true);
+        }
+        Ok(value)
+    }
+
+    fn account_committed_request_changes(&self, changed: u64) {
         let committed = &self.retained().committed_request_changes;
         committed.set(
             committed
@@ -1701,11 +1741,18 @@ impl SelectedResolutionMountInventory<'_> {
                 .checked_add(changed)
                 .expect("committed request changes fit u64"),
         );
-        Ok(value)
     }
 
     pub(super) fn mark_stage_used(&self) {
         self.stage_request_used.set(true);
+    }
+
+    /// Whether this operation has committed no stage content. Production
+    /// content enters only through a capsule admission or projection, each of
+    /// which counts its commit; a stage reader over content tables may then
+    /// answer from the flag without issuing a statement.
+    pub(in crate::analyzer::store) fn stage_has_no_content(&self) -> bool {
+        self.stage_content_epoch.get() == 0 && !self.stage_written_directly.get()
     }
 
     pub(super) fn note_stage_content_commit(&self) {
@@ -1757,13 +1804,7 @@ impl SelectedResolutionMountInventory<'_> {
                     .total_changes()
                     .checked_sub(before)
                     .expect("a transaction cannot lower total changes");
-                let committed = &self.retained().committed_request_changes;
-                committed.set(
-                    committed
-                        .get()
-                        .checked_add(changed)
-                        .expect("committed request changes fit u64"),
-                );
+                self.account_committed_request_changes(changed);
                 Ok(value)
             }
             SelectedResolutionTempTransaction::Rollback(value) => {
@@ -1838,6 +1879,16 @@ impl SelectedResolutionMountInventory<'_> {
         &self.mount_rebaser
     }
 
+    pub(crate) fn mount_ordinal_for_fragment(
+        &self,
+        fragment: BindingFragmentId,
+    ) -> Option<SelectedResolutionMountOrdinal> {
+        self.mount_rebaser
+            .borrow()
+            .mount_for_fragment(fragment)
+            .map(|mount| mount.ordinal())
+    }
+
     pub(crate) fn fingerprint(&self) -> [u8; 32] {
         self.retained
             .as_ref()
@@ -1858,6 +1909,25 @@ impl SelectedResolutionMountInventory<'_> {
         &self.conn
     }
 
+    pub(in crate::analyzer::store) fn ensure_generic_formals_schema(
+        &self,
+        connection: &Connection,
+    ) -> Result<()> {
+        if self.generic_formals_schema_ready.get() {
+            return Ok(());
+        }
+        let exists: bool = connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM temp.sqlite_schema WHERE type='table' AND name=?1)",
+            ["selected_resolution_stage_generic_formals"],
+            |row| row.get(0),
+        )?;
+        if !exists {
+            connection.execute_batch(super::resolution_stage::generic_formals_schema_sql())?;
+        }
+        self.generic_formals_schema_ready.set(true);
+        Ok(())
+    }
+
     /// Where this request's lowerings get a shared name's id.
     pub(super) fn shared_names(&self) -> super::resolution::StoreSharedNames<'_> {
         self.shared_names.interner(self.connection())
@@ -1873,6 +1943,44 @@ impl SelectedResolutionMountInventory<'_> {
         &self,
     ) -> &RefCell<Option<super::resolution_authority::AuthorityValidations>> {
         &self.authority_validations
+    }
+
+    pub(super) fn authority_validation_memo_stats(&self) -> (u64, usize) {
+        self.authority_validations.borrow().as_ref().map_or(
+            (0, 0),
+            super::resolution_authority::AuthorityValidations::memo_stats,
+        )
+    }
+
+    pub(super) fn authority_request_memo(
+        &self,
+    ) -> &RefCell<super::resolution_authority::AuthorityRequestMemo> {
+        &self.authority_request_memo
+    }
+
+    pub(super) fn site_row_memo(&self) -> &RefCell<super::resolution_lexical::SiteRowMemo> {
+        &self.site_row_memo
+    }
+
+    pub(super) fn derive_helper_decisions(
+        &self,
+    ) -> &RefCell<super::resolution_operation::rust_derive_helpers::DeriveHelperDecisions> {
+        &self.derive_helper_decisions
+    }
+
+    pub(super) fn has_published_context(&self, context: SelectedContextPathToken) -> bool {
+        self.published_context_tokens
+            .borrow()
+            .contains(&context.get())
+    }
+
+    pub(super) fn record_published_context(&self, context: SelectedContextPathToken) {
+        assert!(
+            self.published_context_tokens
+                .borrow_mut()
+                .insert(context.get()),
+            "one operation publishes each context token once"
+        );
     }
 
     /// Hold one read transaction on this reader for a crate stage.
@@ -1948,45 +2056,17 @@ impl SelectedResolutionMountInventory<'_> {
         requests: impl IntoIterator<Item = (SelectedResolutionMountOrdinal, i64)>,
         cancellation: &CancellationToken,
     ) -> Result<bool> {
-        let requests = requests.into_iter().collect::<Vec<_>>();
-        assert!(requests.len() <= SELECTED_MOUNT_PAGE_ROWS);
-        assert!(requests.iter().all(|(_, key)| *key >= 0));
-        if cancellation.is_cancelled() {
-            return Ok(false);
-        }
-        let transaction = TempWrite::begin(self.connection())?;
-        let mut changed = self
-            .connection()
-            .prepare_cached("DELETE FROM temp.selected_resolution_typed_requests_1")?
-            .execute([])?;
-        let mut statement = self.connection().prepare_cached(
+        let requests = requests
+            .into_iter()
+            .map(|(mount, key)| (mount, [key]))
+            .collect();
+        self.replace_resolution_request_rows(
+            requests,
+            "DELETE FROM temp.selected_resolution_typed_requests_1",
             "INSERT INTO temp.selected_resolution_typed_requests_1(mount_ordinal, key0) \
              VALUES(?1, ?2)",
-        )?;
-        for (mount, key) in requests {
-            if cancellation.is_cancelled() {
-                drop(statement);
-                transaction.rollback()?;
-                return Ok(false);
-            }
-            changed += statement.execute([i64::from(mount.get()), key])?;
-        }
-        drop(statement);
-        if cancellation.is_cancelled() {
-            transaction.rollback()?;
-            return Ok(false);
-        }
-        transaction.commit()?;
-        // Subtract exact committed direct writes, never a fresh total-change
-        // baseline: preceding unowned mutations and rolled-back work stay visible.
-        let committed = &self.retained().committed_request_changes;
-        committed.set(
-            committed
-                .get()
-                .checked_add(u64::try_from(changed).expect("request changes fit u64"))
-                .expect("committed request changes fit u64"),
-        );
-        Ok(!cancellation.is_cancelled())
+            cancellation,
+        )
     }
 
     pub(super) fn replace_resolution_requests_2(
@@ -1994,32 +2074,46 @@ impl SelectedResolutionMountInventory<'_> {
         requests: impl IntoIterator<Item = (SelectedResolutionMountOrdinal, i64, i64)>,
         cancellation: &CancellationToken,
     ) -> Result<bool> {
-        let requests = requests.into_iter().collect::<Vec<_>>();
+        let requests = requests
+            .into_iter()
+            .map(|(mount, first, second)| (mount, [first, second]))
+            .collect();
+        self.replace_resolution_request_rows(
+            requests,
+            "DELETE FROM temp.selected_resolution_typed_requests_2",
+            "INSERT INTO temp.selected_resolution_typed_requests_2(mount_ordinal, key0, key1) \
+             VALUES(?1, ?2, ?3)",
+            cancellation,
+        )
+    }
+
+    fn replace_resolution_request_rows<const WIDTH: usize>(
+        &self,
+        requests: Vec<(SelectedResolutionMountOrdinal, [i64; WIDTH])>,
+        delete_sql: &str,
+        insert_sql: &str,
+        cancellation: &CancellationToken,
+    ) -> Result<bool> {
         assert!(requests.len() <= SELECTED_MOUNT_PAGE_ROWS);
         assert!(
             requests
                 .iter()
-                .all(|(_, first, second)| *first >= 0 && *second >= 0)
+                .all(|(_, keys)| keys.iter().all(|key| *key >= 0))
         );
         if cancellation.is_cancelled() {
             return Ok(false);
         }
         let transaction = TempWrite::begin(self.connection())?;
-        let mut changed = self
-            .connection()
-            .prepare_cached("DELETE FROM temp.selected_resolution_typed_requests_2")?
-            .execute([])?;
-        let mut statement = self.connection().prepare_cached(
-            "INSERT INTO temp.selected_resolution_typed_requests_2(mount_ordinal, key0, key1) \
-             VALUES(?1, ?2, ?3)",
-        )?;
-        for (mount, first, second) in requests {
+        let mut changed = self.connection().prepare_cached(delete_sql)?.execute([])?;
+        let mut statement = self.connection().prepare_cached(insert_sql)?;
+        for (mount, keys) in requests {
             if cancellation.is_cancelled() {
                 drop(statement);
                 transaction.rollback()?;
                 return Ok(false);
             }
-            changed += statement.execute([i64::from(mount.get()), first, second])?;
+            let parameters = std::iter::once(i64::from(mount.get())).chain(keys);
+            changed += statement.execute(params_from_iter(parameters))?;
         }
         drop(statement);
         if cancellation.is_cancelled() {
@@ -2027,12 +2121,8 @@ impl SelectedResolutionMountInventory<'_> {
             return Ok(false);
         }
         transaction.commit()?;
-        let committed = &self.retained().committed_request_changes;
-        committed.set(
-            committed
-                .get()
-                .checked_add(u64::try_from(changed).expect("request changes fit u64"))
-                .expect("committed request changes fit u64"),
+        self.account_committed_request_changes(
+            u64::try_from(changed).expect("request changes fit u64"),
         );
         Ok(!cancellation.is_cancelled())
     }
@@ -2259,6 +2349,12 @@ struct RetainedSelectedMetadata {
     // Likewise for the Java lexical hierarchy replay: a selection without Java
     // semantics never prepares one, so Rust-only points pay no read for it.
     has_java_semantics: bool,
+    // The shared JVM hierarchy replay is available to Java, Kotlin, and Scala
+    // selections while keeping Rust-only point work out of that path.
+    has_jvm_semantics: bool,
+    // A selection whose languages have no universe table never reads a
+    // reference spelling for one.
+    has_universe_semantics: bool,
     workspace_id: String,
     fingerprint: [u8; 32],
     persisted_mount_count: usize,
@@ -2276,6 +2372,13 @@ impl RetainedSelectedMetadata {
                 .languages
                 .iter()
                 .any(|language| language.semantic_language() == Language::Java),
+            has_jvm_semantics: staged
+                .languages
+                .iter()
+                .any(|language| language_has_jvm_semantics(language.semantic_language())),
+            has_universe_semantics: staged.languages.iter().any(|language| {
+                crate::analyzer::resolution::universe_has_table(language.semantic_language())
+            }),
             workspace_id: staged.workspace_id.clone(),
             fingerprint: staged.fingerprint,
             persisted_mount_count: staged.mounts.len(),
@@ -2439,10 +2542,16 @@ impl AnalyzerStore {
                             stage_request_used: Cell::new(false),
                             stage_request_identity: next_stage_request_identity(),
                             stage_content_epoch: Cell::new(0),
+                            stage_written_directly: Cell::new(false),
                             scope_identity: Cell::new(scope_identity_of(&[])),
                             crate_access: RefCell::default(),
                             authority_validations: RefCell::default(),
+                            authority_request_memo: RefCell::default(),
+                            site_row_memo: RefCell::default(),
+                            published_context_tokens: RefCell::default(),
+                            derive_helper_decisions: RefCell::default(),
                             stage_read: Cell::new(false),
+                            generic_formals_schema_ready: Cell::new(false),
                             shared_names: super::resolution::SharedNameTable::new(
                                 self.resolution_shared_name_cache().clone(),
                             ),
@@ -2474,80 +2583,97 @@ impl AnalyzerStore {
             conn.cleanup_before_checkin(CLEAR_SELECTED_RESOLUTION_TEMP_SQL);
             return Err(error.into());
         }
-        let selection_start_stamp = match read_change_stamp(&conn, conn.total_changes(), 0) {
-            Ok(stamp) => stamp,
-            Err(error) => {
-                conn.cleanup_before_checkin(CLEAR_SELECTED_RESOLUTION_TEMP_SQL);
-                return Err(error);
-            }
-        };
+        // A publication that commits to the main store while this selection
+        // stages leaves the staged inventory stale. That is a race with a
+        // concurrent writer, not a property of the request, so stage again
+        // against a fresh start stamp a bounded number of times; publication
+        // that keeps moving still reports stale (#3823).
+        let mut remaining_attempts = SELECTED_INVENTORY_ACQUISITION_ATTEMPTS;
+        let (staged, verified_stamp) = loop {
+            remaining_attempts -= 1;
+            let selection_start_stamp = match read_change_stamp(&conn, conn.total_changes(), 0) {
+                Ok(stamp) => stamp,
+                Err(error) => {
+                    conn.cleanup_before_checkin(CLEAR_SELECTED_RESOLUTION_TEMP_SQL);
+                    return Err(error);
+                }
+            };
 
-        let result = with_resolution_progress_handler(&mut conn, cancellation, |conn| {
-            let tx = conn.transaction()?;
-            if !insert_selection_input(
-                &tx,
-                workspace_id,
-                selected_snapshots,
-                languages,
-                overlay_masks,
-                content_mounts,
-                cancellation,
-            )? {
-                tx.rollback()?;
-                return Ok(StagedSelection::Cancelled);
-            }
-            let staged = read_selected_inventory(&tx, cancellation)?;
-            if let StagedSelection::Ready(ready) = &staged
-                && !persist_selected_inventory(&tx, ready, cancellation)?
-            {
-                tx.rollback()?;
-                return Ok(StagedSelection::Cancelled);
-            }
-            tx.commit()?;
-            Ok(staged)
-        });
+            let result = with_resolution_progress_handler(&mut conn, cancellation, |conn| {
+                let tx = conn.transaction()?;
+                if !insert_selection_input(
+                    &tx,
+                    workspace_id,
+                    selected_snapshots,
+                    languages,
+                    overlay_masks,
+                    content_mounts,
+                    cancellation,
+                )? {
+                    tx.rollback()?;
+                    return Ok(StagedSelection::Cancelled);
+                }
+                let staged = read_selected_inventory(&tx, cancellation)?;
+                if let StagedSelection::Ready(ready) = &staged
+                    && !persist_selected_inventory(&tx, ready, cancellation)?
+                {
+                    tx.rollback()?;
+                    return Ok(StagedSelection::Cancelled);
+                }
+                tx.commit()?;
+                Ok(staged)
+            });
 
-        let staged = match result {
-            Err(error) if error.is_sqlite_interrupted() && cancellation.is_cancelled() => {
-                conn.cleanup_before_checkin(CLEAR_SELECTED_RESOLUTION_TEMP_SQL);
-                return Ok(SelectedResolutionMountInventoryOutcome::Cancelled);
-            }
-            Err(error) => {
-                conn.cleanup_before_checkin(CLEAR_SELECTED_RESOLUTION_TEMP_SQL);
-                return Err(error);
-            }
-            Ok(staged) => staged,
-        };
-        if cancellation.is_cancelled() {
-            conn.cleanup_before_checkin(CLEAR_SELECTED_RESOLUTION_TEMP_SQL);
-            return Ok(SelectedResolutionMountInventoryOutcome::Cancelled);
-        }
-        match staged {
-            StagedSelection::Ready(staged) => {
-                if cancellation.is_cancelled() {
+            let staged = match result {
+                Err(error) if error.is_sqlite_interrupted() && cancellation.is_cancelled() => {
                     conn.cleanup_before_checkin(CLEAR_SELECTED_RESOLUTION_TEMP_SQL);
                     return Ok(SelectedResolutionMountInventoryOutcome::Cancelled);
                 }
-                debug_assert!(
-                    conn.is_autocommit(),
-                    "selected mount inventory must not pin a main-database read transaction"
-                );
-                let owned_change_baseline = conn.total_changes();
-                let stamp = match read_change_stamp(&conn, owned_change_baseline, 0) {
-                    Ok(stamp) => stamp,
-                    Err(error) => {
-                        conn.cleanup_before_checkin(CLEAR_SELECTED_RESOLUTION_TEMP_SQL);
-                        return Err(error);
-                    }
-                };
-                if stamp.main_data_version != selection_start_stamp.main_data_version
-                    || stamp.main_schema_version != selection_start_stamp.main_schema_version
-                {
+                Err(error) => {
                     conn.cleanup_before_checkin(CLEAR_SELECTED_RESOLUTION_TEMP_SQL);
-                    return Ok(SelectedResolutionMountInventoryOutcome::Stale(
-                        SelectedResolutionStale::MountInventoryChanged,
-                    ));
+                    return Err(error);
                 }
+                Ok(staged) => staged,
+            };
+            if cancellation.is_cancelled() {
+                conn.cleanup_before_checkin(CLEAR_SELECTED_RESOLUTION_TEMP_SQL);
+                return Ok(SelectedResolutionMountInventoryOutcome::Cancelled);
+            }
+            if !matches!(staged, StagedSelection::Ready(_)) {
+                break (staged, None);
+            }
+            debug_assert!(
+                conn.is_autocommit(),
+                "selected mount inventory must not pin a main-database read transaction"
+            );
+            let owned_change_baseline = conn.total_changes();
+            let stamp = match read_change_stamp(&conn, owned_change_baseline, 0) {
+                Ok(stamp) => stamp,
+                Err(error) => {
+                    conn.cleanup_before_checkin(CLEAR_SELECTED_RESOLUTION_TEMP_SQL);
+                    return Err(error);
+                }
+            };
+            if stamp.main_data_version == selection_start_stamp.main_data_version
+                && stamp.main_schema_version == selection_start_stamp.main_schema_version
+            {
+                break (staged, Some((stamp, owned_change_baseline)));
+            }
+            if remaining_attempts == 0 {
+                conn.cleanup_before_checkin(CLEAR_SELECTED_RESOLUTION_TEMP_SQL);
+                return Ok(SelectedResolutionMountInventoryOutcome::Stale(
+                    SelectedResolutionStale::MountInventoryChanged,
+                ));
+            }
+            if let Err(error) = conn.execute_batch(CLEAR_SELECTED_RESOLUTION_TEMP_SQL) {
+                conn.cleanup_before_checkin(CLEAR_SELECTED_RESOLUTION_TEMP_SQL);
+                return Err(error.into());
+            }
+        };
+        match staged {
+            StagedSelection::Ready(staged) => {
+                let (stamp, owned_change_baseline) =
+                    verified_stamp.expect("a ready selection carries its verified change stamp");
                 let retained = RetainedResolutionSelection {
                     routing_digest: validated.routing_digest(),
                     ready: RetainedSelectedMetadata::from_staged(&staged),
@@ -2571,10 +2697,16 @@ impl AnalyzerStore {
                         stage_request_used: Cell::new(false),
                         stage_request_identity: next_stage_request_identity(),
                         stage_content_epoch: Cell::new(0),
+                        stage_written_directly: Cell::new(false),
                         scope_identity: Cell::new(scope_identity_of(&[])),
                         crate_access: RefCell::default(),
                         authority_validations: RefCell::default(),
+                        authority_request_memo: RefCell::default(),
+                        site_row_memo: RefCell::default(),
+                        published_context_tokens: RefCell::default(),
+                        derive_helper_decisions: RefCell::default(),
                         stage_read: Cell::new(false),
+                        generic_formals_schema_ready: Cell::new(false),
                         shared_names: super::resolution::SharedNameTable::new(
                             self.resolution_shared_name_cache().clone(),
                         ),
@@ -2596,6 +2728,10 @@ impl AnalyzerStore {
         }
     }
 }
+
+/// How many times selection staging may restart after a concurrent main-store
+/// commit before the request reports `MountInventoryChanged`.
+const SELECTED_INVENTORY_ACQUISITION_ATTEMPTS: usize = 3;
 
 type ValidatedSelectionInput = RetainedResolutionSelectionKey;
 
@@ -3700,12 +3836,13 @@ fn nonnegative_u64(value: i64, label: &str) -> Result<u64> {
 }
 
 fn usize_to_i64(value: usize) -> Result<i64> {
-    i64::try_from(value)
-        .map_err(|_| StoreError::new("selected resolution count exceeds SQLite integer"))
+    crate::analyzer::store::sqlite_integer(value)
+        .ok_or_else(|| StoreError::new("selected resolution count exceeds SQLite integer"))
 }
 
 fn u64_to_i64(value: u64, label: &str) -> Result<i64> {
-    i64::try_from(value).map_err(|_| StoreError::new(format!("{label} exceeds SQLite integer")))
+    crate::analyzer::store::sqlite_integer(value)
+        .ok_or_else(|| StoreError::new(format!("{label} exceeds SQLite integer")))
 }
 
 fn usize_as_u64(value: usize) -> u64 {
@@ -3723,7 +3860,9 @@ pub(super) mod tests {
     use crate::analyzer::cpp::CppAdapter;
     use crate::analyzer::java::JavaAdapter;
     use crate::analyzer::rust::RustAdapter;
-    use crate::analyzer::tree_sitter_analyzer::{FileState, LanguageAdapter, ParsedFile};
+    use crate::analyzer::tree_sitter_analyzer::{
+        FileState, LanguageAdapter, ParsedFile, TreeSitterAnalyzer,
+    };
     use crate::analyzer::typescript::TypescriptAdapter;
 
     use super::super::{GenerationId, WorkspaceSnapshotId};
@@ -3750,40 +3889,13 @@ pub(super) mod tests {
         let mut parsed: ParsedFile = adapter.parse_file(&file, source, &tree);
         parsed.add_file_scope(&file, source);
         let contains_tests = adapter.contains_tests(&file, source, &tree, &parsed);
-        let declarations = parsed.declarations().clone();
-        FileState {
-            source: source.to_owned(),
-            package_name: parsed.package_name,
-            content_qualifier: parsed.content_qualifier,
-            top_level_declarations: parsed.top_level_declarations,
-            declarations,
-            definition_lookup_units: parsed.definition_lookup_units,
-            imports: parsed.imports,
-            scala_exports: parsed.scala_exports,
-            rust_usage_facts: parsed.rust_usage_facts,
-            source_facts: parsed.source_facts,
-            source_declaration_units: parsed.source_declaration_units,
-            source_declaration_metadata: parsed.source_declaration_metadata,
-            resolution_facts: parsed.resolution_facts,
-            raw_supertypes: parsed.raw_supertypes,
-            supertype_lookup_paths: parsed.supertype_lookup_paths,
-            type_identifiers: parsed.type_identifiers,
-            signatures: parsed.signatures,
-            signature_metadata: parsed.signature_metadata,
-            signature_metadata_signature_ordinals: parsed.signature_metadata_signature_ordinals,
-            cpp_template_metadata: parsed.cpp_template_metadata,
-            ruby_method_dispatch_modes: parsed.ruby_method_dispatch_modes,
-            ranges: parsed.ranges,
-            children: parsed.children,
-            scala_traits: parsed.scala_traits,
-            type_aliases: parsed.type_aliases,
+        TreeSitterAnalyzer::<A>::file_state_from_parsed(
+            source.to_owned(),
+            parsed,
             contains_tests,
-            test_region_units: parsed.test_region_units,
-            materialization_records: parsed.materialization_records,
-            parse_errors: Some(Vec::new()),
-            parse_complete: true,
-            additional_projections: Vec::new(),
-        }
+            Some(Vec::new()),
+            true,
+        )
     }
 
     fn write_fixture_blob(
@@ -3803,6 +3915,7 @@ pub(super) mod tests {
             Language::Java => {
                 let state = parsed_fixture_state(&JavaAdapter, relative_path, source);
                 store.write_parsed_blob_at_generation(
+                    &crate::analyzer::store::test_blob_file(),
                     Oid::from_str(oid).unwrap(),
                     storage_language,
                     generation,
@@ -3813,6 +3926,7 @@ pub(super) mod tests {
             Language::TypeScript => {
                 let state = parsed_fixture_state(&TypescriptAdapter, relative_path, source);
                 store.write_parsed_blob_at_generation(
+                    &crate::analyzer::store::test_blob_file(),
                     Oid::from_str(oid).unwrap(),
                     storage_language,
                     generation,
@@ -3823,6 +3937,7 @@ pub(super) mod tests {
             Language::Cpp => {
                 let state = parsed_fixture_state(&CppAdapter, relative_path, source);
                 store.write_parsed_blob_at_generation(
+                    &crate::analyzer::store::test_blob_file(),
                     Oid::from_str(oid).unwrap(),
                     storage_language,
                     generation,
@@ -3884,26 +3999,27 @@ pub(super) mod tests {
         }
 
         pub(in crate::analyzer::store) fn custom_source(mount_count: usize, source: &str) -> Self {
-            Self::with_store(
-                AnalyzerStore::open_ephemeral().unwrap(),
-                mount_count,
-                "java",
-                Language::Java,
-                false,
-                false,
-                Some(source),
-            )
+            Self::custom_language_source(mount_count, source, "java", Language::Java)
         }
 
         pub(in crate::analyzer::store) fn custom_rust_source(
             mount_count: usize,
             source: &str,
         ) -> Self {
+            Self::custom_language_source(mount_count, source, "rust", Language::Rust)
+        }
+
+        fn custom_language_source(
+            mount_count: usize,
+            source: &str,
+            storage_language: &str,
+            semantic_language: Language,
+        ) -> Self {
             Self::with_store(
                 AnalyzerStore::open_ephemeral().unwrap(),
                 mount_count,
-                "rust",
-                Language::Rust,
+                storage_language,
+                semantic_language,
                 false,
                 false,
                 Some(source),
@@ -4043,6 +4159,7 @@ pub(super) mod tests {
                             let state =
                                 parsed_fixture_state(&JavaAdapter, "src/Model.java", source);
                             store.write_parsed_blob_at_generation(
+                                &crate::analyzer::store::test_blob_file(),
                                 Oid::from_str(oid).unwrap(),
                                 storage_language,
                                 generation,
@@ -4053,6 +4170,7 @@ pub(super) mod tests {
                         Language::Rust => {
                             let state = parsed_fixture_state(&RustAdapter, "src/Model.rs", source);
                             store.write_parsed_blob_at_generation(
+                                &crate::analyzer::store::test_blob_file(),
                                 Oid::from_str(oid).unwrap(),
                                 storage_language,
                                 generation,
@@ -4462,28 +4580,6 @@ pub(super) mod tests {
     }
 
     #[test]
-    fn empty_requested_language_set_retains_explicit_workspace_identity() {
-        let fixture = SelectionFixture::new(0);
-        let ready = match fixture
-            .store
-            .open_selected_resolution_mount_inventory(
-                &fixture.workspace_id,
-                &WorkspaceSnapshots::default(),
-                &[],
-                &[],
-                &CancellationToken::default(),
-            )
-            .unwrap()
-        {
-            SelectedResolutionMountInventoryOutcome::Ready(ready) => ready,
-            _ => panic!("empty exact selection must be Ready"),
-        };
-        assert_eq!(ready.workspace_id(), WORKSPACE_ID);
-        assert!(ready.languages().unwrap().is_empty());
-        assert!(ready.mounts().unwrap().is_empty());
-    }
-
-    #[test]
     fn requested_language_permutation_has_one_deterministic_missing_reason() {
         let fixture = SelectionFixture::new(0);
         for languages in [
@@ -4515,206 +4611,6 @@ pub(super) mod tests {
                 ) if storage_language == "java"
             ));
         }
-    }
-
-    #[test]
-    fn duplicate_or_cross_workspace_selection_input_fails_before_publication() {
-        let fixture = SelectionFixture::new(0);
-        let duplicate_languages = fixture.store.open_selected_resolution_mount_inventory(
-            &fixture.workspace_id,
-            &fixture.snapshots,
-            &[fixture.language(), fixture.language()],
-            &[],
-            &CancellationToken::default(),
-        );
-        let duplicate_languages = match duplicate_languages {
-            Err(error) => error,
-            Ok(_) => panic!("duplicate languages must fail before publication"),
-        };
-        assert!(
-            duplicate_languages
-                .to_string()
-                .contains("duplicate selected resolution language")
-        );
-
-        let duplicate_masks = fixture.store.open_selected_resolution_mount_inventory(
-            &fixture.workspace_id,
-            &fixture.snapshots,
-            &[fixture.language()],
-            &[
-                SelectedResolutionOverlayMask::replacement("java", "src/New.java"),
-                SelectedResolutionOverlayMask::removal("java", "src/New.java"),
-            ],
-            &CancellationToken::default(),
-        );
-        let duplicate_masks = match duplicate_masks {
-            Err(error) => error,
-            Ok(_) => panic!("duplicate masks must fail before publication"),
-        };
-        assert!(
-            duplicate_masks
-                .to_string()
-                .contains("duplicate selected resolution mask")
-        );
-
-        let mut foreign_snapshots = fixture.snapshots.clone();
-        foreign_snapshots.get_mut("java").unwrap().workspace_id =
-            WorkspaceId("cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc".into());
-        let foreign = fixture.store.open_selected_resolution_mount_inventory(
-            &fixture.workspace_id,
-            &foreign_snapshots,
-            &[fixture.language()],
-            &[],
-            &CancellationToken::default(),
-        );
-        let foreign = match foreign {
-            Err(error) => error,
-            Ok(_) => panic!("cross-workspace snapshots must fail before publication"),
-        };
-        assert!(foreign.to_string().contains("different workspace"));
-    }
-
-    #[test]
-    fn overlay_masks_keep_suppressed_base_and_replacement_obligations_separate() {
-        let fixture = SelectionFixture::new(3);
-        let masks = [
-            SelectedResolutionOverlayMask::replacement("java", "src/0000.java"),
-            SelectedResolutionOverlayMask::removal("java", "src/0001.java"),
-            SelectedResolutionOverlayMask::replacement("java", "src/new.java"),
-        ];
-        let ready = fixture.open_ready(&masks);
-        assert_eq!(ready.mounts().unwrap().len(), 1);
-        assert_eq!(
-            ready.mounts().unwrap()[0].persisted_relative_path(),
-            "src/0002.java"
-        );
-        assert_eq!(ready.overlay_masks().unwrap().len(), 3);
-        assert_eq!(
-            ready
-                .overlay_masks()
-                .unwrap()
-                .iter()
-                .filter(|mask| mask.masked_base().is_some())
-                .count(),
-            2
-        );
-        assert_eq!(ready.expected_transient_replacement_count(), 2);
-        assert_eq!(ready.languages().unwrap()[0].expected_base_mount_count(), 3);
-        assert_eq!(ready.languages().unwrap()[0].masked_base_mount_count(), 2);
-        assert_eq!(
-            ready.languages().unwrap()[0].expected_unmasked_mount_count(),
-            1
-        );
-    }
-
-    #[test]
-    fn cached_content_mounts_replace_masked_paths_without_transient_count() {
-        let fixture = SelectionFixture::new(1);
-        let content_mount = SelectedResolutionContentMountRequest::new(
-            fixture.content_witness("0000000000000000000000000000000000000001"),
-            WorkspaceFileRow {
-                rel_path: "src/cached.java".to_owned(),
-                blob_oid: Oid::from_str("0000000000000000000000000000000000000001").unwrap(),
-            },
-            Vec::new(),
-            Vec::new(),
-            Vec::new(),
-            Vec::new(),
-        );
-        let second_content_mount = SelectedResolutionContentMountRequest::new(
-            fixture.content_witness("0000000000000000000000000000000000000001"),
-            WorkspaceFileRow {
-                rel_path: "src/cached-again.java".to_owned(),
-                blob_oid: Oid::from_str("0000000000000000000000000000000000000001").unwrap(),
-            },
-            Vec::new(),
-            Vec::new(),
-            Vec::new(),
-            Vec::new(),
-        );
-        let ready = fixture
-            .store
-            .open_selected_resolution_mount_inventory_with_content_mounts(
-                &fixture.workspace_id,
-                &fixture.snapshots,
-                &[fixture.language()],
-                &[
-                    SelectedResolutionOverlayMask::replacement("java", "src/cached.java"),
-                    SelectedResolutionOverlayMask::replacement("java", "src/cached-again.java"),
-                ],
-                &[content_mount, second_content_mount],
-                &CancellationToken::default(),
-            )
-            .unwrap();
-        let ready = match ready {
-            SelectedResolutionMountInventoryOutcome::Ready(ready) => ready,
-            _ => panic!("cached content mount should be ready"),
-        };
-        assert_eq!(ready.mounts().unwrap().len(), 3);
-        assert_eq!(
-            ready.mounts().unwrap()[0].persisted_relative_path(),
-            "src/0000.java"
-        );
-        assert_eq!(
-            ready.mounts().unwrap()[1].persisted_relative_path(),
-            "src/cached-again.java"
-        );
-        assert_eq!(
-            ready.mounts().unwrap()[2].persisted_relative_path(),
-            "src/cached.java"
-        );
-        assert!(
-            ready.mounts().unwrap()[1..]
-                .iter()
-                .all(|mount| mount.file_version_id().is_none())
-        );
-        assert_ne!(
-            ready.mounts().unwrap()[1].fragment_id(),
-            ready.mounts().unwrap()[2].fragment_id()
-        );
-        assert_eq!(ready.expected_transient_replacement_count(), 0);
-        assert_eq!(ready.languages().unwrap()[0].expected_base_mount_count(), 1);
-        assert_eq!(ready.languages().unwrap()[0].masked_base_mount_count(), 0);
-    }
-
-    #[test]
-    fn cached_content_mount_requires_a_published_interior() {
-        let fixture = SelectionFixture::new(1);
-        let content_mount = SelectedResolutionContentMountRequest::new(
-            fixture.content_witness("0000000000000000000000000000000000000001"),
-            WorkspaceFileRow {
-                rel_path: "src/cached.java".to_owned(),
-                blob_oid: Oid::from_str("0000000000000000000000000000000000000001").unwrap(),
-            },
-            Vec::new(),
-            Vec::new(),
-            Vec::new(),
-            Vec::new(),
-        );
-        fixture.store.conn.execute(|conn| {
-            conn.execute("DELETE FROM resolution_fragment_interiors", [])
-                .unwrap();
-        });
-        let outcome = fixture
-            .store
-            .open_selected_resolution_mount_inventory_with_content_mounts(
-                &fixture.workspace_id,
-                &fixture.snapshots,
-                &[fixture.language()],
-                &[SelectedResolutionOverlayMask::replacement(
-                    "java",
-                    "src/cached.java",
-                )],
-                &[content_mount],
-                &CancellationToken::default(),
-            )
-            .unwrap();
-        assert!(matches!(
-            outcome,
-            SelectedResolutionMountInventoryOutcome::Unavailable(
-                SelectedResolutionUnavailable::MissingInterior { .. }
-            )
-        ));
     }
 
     #[test]
@@ -5087,118 +4983,6 @@ pub(super) mod tests {
     }
 
     #[test]
-    fn missing_and_stale_authority_are_typed_whole_operation_outcomes() {
-        let fixture = SelectionFixture::new(1);
-        let missing_snapshot = fixture
-            .store
-            .open_selected_resolution_mount_inventory(
-                &fixture.workspace_id,
-                &WorkspaceSnapshots::default(),
-                &[fixture.language()],
-                &[],
-                &CancellationToken::default(),
-            )
-            .unwrap();
-        assert!(matches!(
-            missing_snapshot,
-            SelectedResolutionMountInventoryOutcome::Unavailable(
-                SelectedResolutionUnavailable::MissingWorkspaceSnapshot { .. }
-            )
-        ));
-
-        let language = fixture.storage_language.clone();
-        fixture.store.conn.execute(move |conn| {
-            conn.execute(
-                "DELETE FROM resolution_producer_epochs WHERE lang = ?1",
-                [language],
-            )
-            .unwrap();
-        });
-        let missing_epoch = fixture
-            .store
-            .open_selected_resolution_mount_inventory(
-                &fixture.workspace_id,
-                &fixture.snapshots,
-                &[fixture.language()],
-                &[],
-                &CancellationToken::default(),
-            )
-            .unwrap();
-        assert!(matches!(
-            missing_epoch,
-            SelectedResolutionMountInventoryOutcome::Unavailable(
-                SelectedResolutionUnavailable::MissingProducerEpoch { .. }
-            )
-        ));
-
-        fixture
-            .store
-            .ensure_resolution_producer_epoch("java", Language::Java)
-            .unwrap();
-        fixture.store.conn.execute(|conn| {
-            conn.execute(
-                "UPDATE resolution_producer_epochs SET producer_epoch = 'future'
-                 WHERE lang = 'java'",
-                [],
-            )
-            .unwrap();
-        });
-        let stale = fixture
-            .store
-            .open_selected_resolution_mount_inventory(
-                &fixture.workspace_id,
-                &fixture.snapshots,
-                &[fixture.language()],
-                &[],
-                &CancellationToken::default(),
-            )
-            .unwrap();
-        assert!(matches!(
-            stale,
-            SelectedResolutionMountInventoryOutcome::Stale(
-                SelectedResolutionStale::ProducerEpoch { .. }
-            )
-        ));
-    }
-
-    #[test]
-    fn bootstrap_generation_without_analysis_epoch_is_current() {
-        let bootstrap = SelectionFixture::bootstrap(1);
-        let epoch_rows = bootstrap.store.conn.execute(|conn| {
-            conn.query_row("SELECT COUNT(*) FROM analysis_epochs", [], |row| {
-                row.get::<_, usize>(0)
-            })
-            .unwrap()
-        });
-        assert_eq!(epoch_rows, 0);
-        let ready = bootstrap.open_ready(&[]);
-        assert_eq!(ready.languages().unwrap()[0].generation(), 0);
-        drop(ready);
-
-        let non_bootstrap = SelectionFixture::new(1);
-        non_bootstrap.store.conn.execute(|conn| {
-            conn.execute("DELETE FROM analysis_epochs WHERE lang = 'java'", [])
-                .unwrap();
-        });
-        let stale = non_bootstrap
-            .store
-            .open_selected_resolution_mount_inventory(
-                &non_bootstrap.workspace_id,
-                &non_bootstrap.snapshots,
-                &[non_bootstrap.language()],
-                &[],
-                &CancellationToken::default(),
-            )
-            .unwrap();
-        assert!(matches!(
-            stale,
-            SelectedResolutionMountInventoryOutcome::Stale(
-                SelectedResolutionStale::AnalysisGeneration { .. }
-            )
-        ));
-    }
-
-    #[test]
     fn read_change_stamp_excludes_only_committed_private_request_rows() {
         let fixture = SelectionFixture::new(1);
         let ready = fixture.open_ready(&[]);
@@ -5357,53 +5141,6 @@ pub(super) mod tests {
             before_external.main_schema_version
         );
         assert_eq!(external.unowned_changes, before_external.unowned_changes);
-    }
-
-    #[test]
-    fn missing_interior_and_incomplete_parent_cannot_disappear_from_inventory() {
-        let missing = SelectionFixture::new(1);
-        missing.store.conn.execute(|conn| {
-            conn.execute("DELETE FROM resolution_fragment_interiors", [])
-                .unwrap();
-        });
-        let outcome = missing
-            .store
-            .open_selected_resolution_mount_inventory(
-                &missing.workspace_id,
-                &missing.snapshots,
-                &[missing.language()],
-                &[],
-                &CancellationToken::default(),
-            )
-            .unwrap();
-        assert!(matches!(
-            outcome,
-            SelectedResolutionMountInventoryOutcome::Unavailable(
-                SelectedResolutionUnavailable::MissingInterior { .. }
-            )
-        ));
-
-        let incomplete = SelectionFixture::new(1);
-        incomplete.store.conn.execute(|conn| {
-            conn.execute("UPDATE blob_meta SET is_complete = 0", [])
-                .unwrap();
-        });
-        let outcome = incomplete
-            .store
-            .open_selected_resolution_mount_inventory(
-                &incomplete.workspace_id,
-                &incomplete.snapshots,
-                &[incomplete.language()],
-                &[],
-                &CancellationToken::default(),
-            )
-            .unwrap();
-        assert!(matches!(
-            outcome,
-            SelectedResolutionMountInventoryOutcome::Unavailable(
-                SelectedResolutionUnavailable::IncompleteParsedBlob { .. }
-            )
-        ));
     }
 
     #[test]
@@ -6001,12 +5738,12 @@ pub(super) mod tests {
     }
 
     fn explain_plan(conn: &Connection, sql: &str, parameters: Vec<Value>) -> Vec<String> {
-        conn.prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
-            .unwrap()
-            .query_map(params_from_iter(parameters), |row| row.get::<_, String>(3))
-            .unwrap()
-            .collect::<std::result::Result<Vec<_>, _>>()
-            .unwrap()
+        crate::analyzer::store::planner_statistics::pinned_plans::plan_rows_for_sql(
+            conn,
+            sql,
+            &parameters,
+        )
+        .unwrap()
     }
 
     fn required_plan_step(plan: &[String], label: &str, needles: &[&str]) -> usize {
@@ -6421,5 +6158,310 @@ pub(super) mod tests {
             (0..RESOLUTION_MANIFEST_COUNT_COLUMNS.len())
                 .all(|index| staged.mounts[0].manifest_counts().get(index) == expected[index])
         );
+    }
+    #[test]
+    fn empty_requested_language_set_retains_explicit_workspace_identity() {
+        let fixture = SelectionFixture::new(0);
+        let ready = match fixture
+            .store
+            .open_selected_resolution_mount_inventory(
+                &fixture.workspace_id,
+                &WorkspaceSnapshots::default(),
+                &[],
+                &[],
+                &CancellationToken::default(),
+            )
+            .unwrap()
+        {
+            SelectedResolutionMountInventoryOutcome::Ready(ready) => ready,
+            _ => panic!("empty exact selection must be Ready"),
+        };
+        assert_eq!(ready.workspace_id(), WORKSPACE_ID);
+        assert!(ready.languages().unwrap().is_empty());
+        assert!(ready.mounts().unwrap().is_empty());
+    }
+
+    #[test]
+    fn duplicate_or_cross_workspace_selection_input_fails_before_publication() {
+        let fixture = SelectionFixture::new(0);
+        let duplicate_languages = fixture.store.open_selected_resolution_mount_inventory(
+            &fixture.workspace_id,
+            &fixture.snapshots,
+            &[fixture.language(), fixture.language()],
+            &[],
+            &CancellationToken::default(),
+        );
+        let duplicate_languages = match duplicate_languages {
+            Err(error) => error,
+            Ok(_) => panic!("duplicate languages must fail before publication"),
+        };
+        assert!(
+            duplicate_languages
+                .to_string()
+                .contains("duplicate selected resolution language")
+        );
+
+        let duplicate_masks = fixture.store.open_selected_resolution_mount_inventory(
+            &fixture.workspace_id,
+            &fixture.snapshots,
+            &[fixture.language()],
+            &[
+                SelectedResolutionOverlayMask::replacement("java", "src/New.java"),
+                SelectedResolutionOverlayMask::removal("java", "src/New.java"),
+            ],
+            &CancellationToken::default(),
+        );
+        let duplicate_masks = match duplicate_masks {
+            Err(error) => error,
+            Ok(_) => panic!("duplicate masks must fail before publication"),
+        };
+        assert!(
+            duplicate_masks
+                .to_string()
+                .contains("duplicate selected resolution mask")
+        );
+
+        let mut foreign_snapshots = fixture.snapshots.clone();
+        foreign_snapshots.get_mut("java").unwrap().workspace_id =
+            WorkspaceId("cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc".into());
+        let foreign = fixture.store.open_selected_resolution_mount_inventory(
+            &fixture.workspace_id,
+            &foreign_snapshots,
+            &[fixture.language()],
+            &[],
+            &CancellationToken::default(),
+        );
+        let foreign = match foreign {
+            Err(error) => error,
+            Ok(_) => panic!("cross-workspace snapshots must fail before publication"),
+        };
+        assert!(foreign.to_string().contains("different workspace"));
+    }
+
+    #[test]
+    fn overlay_masks_keep_suppressed_base_and_replacement_obligations_separate() {
+        let fixture = SelectionFixture::new(3);
+        let masks = [
+            SelectedResolutionOverlayMask::replacement("java", "src/0000.java"),
+            SelectedResolutionOverlayMask::removal("java", "src/0001.java"),
+            SelectedResolutionOverlayMask::replacement("java", "src/new.java"),
+        ];
+        let ready = fixture.open_ready(&masks);
+        assert_eq!(ready.mounts().unwrap().len(), 1);
+        assert_eq!(
+            ready.mounts().unwrap()[0].persisted_relative_path(),
+            "src/0002.java"
+        );
+        assert_eq!(ready.overlay_masks().unwrap().len(), 3);
+        assert_eq!(
+            ready
+                .overlay_masks()
+                .unwrap()
+                .iter()
+                .filter(|mask| mask.masked_base().is_some())
+                .count(),
+            2
+        );
+        assert_eq!(ready.expected_transient_replacement_count(), 2);
+        assert_eq!(ready.languages().unwrap()[0].expected_base_mount_count(), 3);
+        assert_eq!(ready.languages().unwrap()[0].masked_base_mount_count(), 2);
+        assert_eq!(
+            ready.languages().unwrap()[0].expected_unmasked_mount_count(),
+            1
+        );
+    }
+
+    #[test]
+    fn cached_content_mounts_replace_masked_paths_without_transient_count() {
+        let fixture = SelectionFixture::new(1);
+        let content_mount = SelectedResolutionContentMountRequest::new(
+            fixture.content_witness("0000000000000000000000000000000000000001"),
+            WorkspaceFileRow {
+                rel_path: "src/cached.java".to_owned(),
+                blob_oid: Oid::from_str("0000000000000000000000000000000000000001").unwrap(),
+            },
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+        );
+        let second_content_mount = SelectedResolutionContentMountRequest::new(
+            fixture.content_witness("0000000000000000000000000000000000000001"),
+            WorkspaceFileRow {
+                rel_path: "src/cached-again.java".to_owned(),
+                blob_oid: Oid::from_str("0000000000000000000000000000000000000001").unwrap(),
+            },
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+        );
+        let ready = fixture
+            .store
+            .open_selected_resolution_mount_inventory_with_content_mounts(
+                &fixture.workspace_id,
+                &fixture.snapshots,
+                &[fixture.language()],
+                &[
+                    SelectedResolutionOverlayMask::replacement("java", "src/cached.java"),
+                    SelectedResolutionOverlayMask::replacement("java", "src/cached-again.java"),
+                ],
+                &[content_mount, second_content_mount],
+                &CancellationToken::default(),
+            )
+            .unwrap();
+        let ready = match ready {
+            SelectedResolutionMountInventoryOutcome::Ready(ready) => ready,
+            _ => panic!("cached content mount should be ready"),
+        };
+        assert_eq!(ready.mounts().unwrap().len(), 3);
+        assert_eq!(
+            ready.mounts().unwrap()[0].persisted_relative_path(),
+            "src/0000.java"
+        );
+        assert_eq!(
+            ready.mounts().unwrap()[1].persisted_relative_path(),
+            "src/cached-again.java"
+        );
+        assert_eq!(
+            ready.mounts().unwrap()[2].persisted_relative_path(),
+            "src/cached.java"
+        );
+        assert!(
+            ready.mounts().unwrap()[1..]
+                .iter()
+                .all(|mount| mount.file_version_id().is_none())
+        );
+        assert_ne!(
+            ready.mounts().unwrap()[1].fragment_id(),
+            ready.mounts().unwrap()[2].fragment_id()
+        );
+        assert_eq!(ready.expected_transient_replacement_count(), 0);
+        assert_eq!(ready.languages().unwrap()[0].expected_base_mount_count(), 1);
+        assert_eq!(ready.languages().unwrap()[0].masked_base_mount_count(), 0);
+    }
+
+    #[test]
+    fn cached_content_mount_requires_a_published_interior() {
+        let fixture = SelectionFixture::new(1);
+        let content_mount = SelectedResolutionContentMountRequest::new(
+            fixture.content_witness("0000000000000000000000000000000000000001"),
+            WorkspaceFileRow {
+                rel_path: "src/cached.java".to_owned(),
+                blob_oid: Oid::from_str("0000000000000000000000000000000000000001").unwrap(),
+            },
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+        );
+        fixture.store.conn.execute(|conn| {
+            conn.execute("DELETE FROM resolution_fragment_interiors", [])
+                .unwrap();
+        });
+        let outcome = fixture
+            .store
+            .open_selected_resolution_mount_inventory_with_content_mounts(
+                &fixture.workspace_id,
+                &fixture.snapshots,
+                &[fixture.language()],
+                &[SelectedResolutionOverlayMask::replacement(
+                    "java",
+                    "src/cached.java",
+                )],
+                &[content_mount],
+                &CancellationToken::default(),
+            )
+            .unwrap();
+        assert!(matches!(
+            outcome,
+            SelectedResolutionMountInventoryOutcome::Unavailable(
+                SelectedResolutionUnavailable::MissingInterior { .. }
+            )
+        ));
+    }
+
+    #[test]
+    fn bootstrap_generation_without_analysis_epoch_is_current() {
+        let bootstrap = SelectionFixture::bootstrap(1);
+        let epoch_rows = bootstrap.store.conn.execute(|conn| {
+            conn.query_row("SELECT COUNT(*) FROM analysis_epochs", [], |row| {
+                row.get::<_, usize>(0)
+            })
+            .unwrap()
+        });
+        assert_eq!(epoch_rows, 0);
+        let ready = bootstrap.open_ready(&[]);
+        assert_eq!(ready.languages().unwrap()[0].generation(), 0);
+        drop(ready);
+
+        let non_bootstrap = SelectionFixture::new(1);
+        non_bootstrap.store.conn.execute(|conn| {
+            conn.execute("DELETE FROM analysis_epochs WHERE lang = 'java'", [])
+                .unwrap();
+        });
+        let stale = non_bootstrap
+            .store
+            .open_selected_resolution_mount_inventory(
+                &non_bootstrap.workspace_id,
+                &non_bootstrap.snapshots,
+                &[non_bootstrap.language()],
+                &[],
+                &CancellationToken::default(),
+            )
+            .unwrap();
+        assert!(matches!(
+            stale,
+            SelectedResolutionMountInventoryOutcome::Stale(
+                SelectedResolutionStale::AnalysisGeneration { .. }
+            )
+        ));
+    }
+
+    #[test]
+    fn missing_interior_and_incomplete_parent_cannot_disappear_from_inventory() {
+        let missing = SelectionFixture::new(1);
+        missing.store.conn.execute(|conn| {
+            conn.execute("DELETE FROM resolution_fragment_interiors", [])
+                .unwrap();
+        });
+        let outcome = missing
+            .store
+            .open_selected_resolution_mount_inventory(
+                &missing.workspace_id,
+                &missing.snapshots,
+                &[missing.language()],
+                &[],
+                &CancellationToken::default(),
+            )
+            .unwrap();
+        assert!(matches!(
+            outcome,
+            SelectedResolutionMountInventoryOutcome::Unavailable(
+                SelectedResolutionUnavailable::MissingInterior { .. }
+            )
+        ));
+
+        let incomplete = SelectionFixture::new(1);
+        incomplete.store.conn.execute(|conn| {
+            conn.execute("UPDATE blob_meta SET is_complete = 0", [])
+                .unwrap();
+        });
+        let outcome = incomplete
+            .store
+            .open_selected_resolution_mount_inventory(
+                &incomplete.workspace_id,
+                &incomplete.snapshots,
+                &[incomplete.language()],
+                &[],
+                &CancellationToken::default(),
+            )
+            .unwrap();
+        assert!(matches!(
+            outcome,
+            SelectedResolutionMountInventoryOutcome::Unavailable(
+                SelectedResolutionUnavailable::IncompleteParsedBlob { .. }
+            )
+        ));
     }
 }

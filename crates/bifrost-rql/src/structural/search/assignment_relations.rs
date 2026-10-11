@@ -2,15 +2,16 @@
 
 use super::*;
 
-use crate::analyzer::semantic::LengthDelimitedDigest;
+use crate::analyzer::semantic::{LengthDelimitedDigest, SemanticValueKind};
 use crate::analyzer::usages::effects::EffectCoverage;
 use crate::query::{AssignmentRelationFilter, AssignmentRelationKind};
 use brokk_bifrost_analysis::analyzer::{
     CAssignmentCandidate, CAssignmentSyntaxVerdict, OverwrittenLocalCandidate,
     OverwrittenLocalSourceKind, PlainAssignmentCandidate, PlainAssignmentVerdict,
-    c_assignment_candidates, go_overwritten_local_candidates, java_overwritten_local_candidates,
-    js_ts_overwritten_local_candidates, plain_assignment_candidates,
-    python_overwritten_local_candidates, single_target_overwritten_local_candidates,
+    c_assignment_candidates, cpp_overwritten_local_candidates, go_overwritten_local_candidates,
+    java_overwritten_local_candidates, js_ts_overwritten_local_candidates,
+    plain_assignment_candidates, python_overwritten_local_candidates,
+    single_target_overwritten_local_candidates,
 };
 use brokk_bifrost_flow::flow_state::{
     BindingInitializationAnswer, FlowCertainty, FlowRelation, FlowStateAxis, FlowStateCompleteness,
@@ -73,6 +74,17 @@ pub(super) fn assignment_relation_expansions(
     } else {
         Vec::new()
     };
+    if filter.includes(AssignmentRelationKind::SelfInitializer) {
+        expansions.extend(
+            super::initializer_relations::initializer_relation_expansions(
+                workspace,
+                flow_state_cache,
+                cancellation,
+                diagnostics,
+                procedure,
+            ),
+        );
+    }
     if filter.includes(AssignmentRelationKind::OverwrittenUnread) {
         expansions.extend(overwritten_unread_expansions(
             workspace,
@@ -86,6 +98,57 @@ pub(super) fn assignment_relation_expansions(
     expansions
 }
 
+/// Whether this language dialect publishes the requested assignment relation.
+///
+/// Keep this predicate next to the expansion dispatch so query preflight and
+/// row execution cannot drift into disagreeing support claims.
+pub(super) fn supports_relation(
+    dialect: crate::analyzer::LanguageDialect,
+    relation: AssignmentRelationKind,
+) -> bool {
+    let language = dialect.language();
+    let cpp_family = matches!(
+        dialect,
+        crate::analyzer::LanguageDialect::CppC
+            | crate::analyzer::LanguageDialect::Standard(Language::Cpp)
+    );
+    match relation {
+        AssignmentRelationKind::SelfInitializer => cpp_family,
+        AssignmentRelationKind::SelfAssignment | AssignmentRelationKind::FailedSwap => {
+            matches!(
+                language,
+                Language::Java
+                    | Language::JavaScript
+                    | Language::TypeScript
+                    | Language::Python
+                    | Language::CSharp
+                    | Language::Kotlin
+                    | Language::Go
+                    | Language::Scala
+                    | Language::Rust
+                    | Language::Php
+                    | Language::Ruby
+            ) || cpp_family
+        }
+        AssignmentRelationKind::OverwrittenUnread => {
+            matches!(
+                language,
+                Language::Java
+                    | Language::JavaScript
+                    | Language::TypeScript
+                    | Language::Python
+                    | Language::Go
+                    | Language::CSharp
+                    | Language::Kotlin
+                    | Language::Rust
+                    | Language::Scala
+                    | Language::Php
+                    | Language::Ruby
+            ) || cpp_family
+        }
+    }
+}
+
 fn ordinary_assignment_relation_expansions(
     workspace: &WorkspaceAnalyzer,
     semantic: &mut semantic::SemanticQueryContext<'_>,
@@ -97,21 +160,15 @@ fn ordinary_assignment_relation_expansions(
 ) -> Vec<PipelineExpansion> {
     let dialect = procedure.handle.artifact().key().language();
     let language = dialect.language();
-    let pilot = matches!(
-        language,
-        Language::Java
-            | Language::JavaScript
-            | Language::TypeScript
-            | Language::Python
-            | Language::CSharp
-            | Language::Kotlin
-            | Language::Go
-            | Language::Rust
-    );
     let self_selected = filter.includes(AssignmentRelationKind::SelfAssignment);
     let swap_selected = filter.includes(AssignmentRelationKind::FailedSwap);
-    let self_supported = pilot || dialect == crate::analyzer::LanguageDialect::CppC;
-    let swap_supported = pilot || dialect == crate::analyzer::LanguageDialect::CppC;
+    let self_supported = supports_relation(dialect, AssignmentRelationKind::SelfAssignment);
+    let swap_supported = supports_relation(dialect, AssignmentRelationKind::FailedSwap);
+    let cpp_family = matches!(
+        dialect,
+        crate::analyzer::LanguageDialect::CppC
+            | crate::analyzer::LanguageDialect::Standard(Language::Cpp)
+    );
     let mut unsupported = Vec::new();
     if self_selected && !self_supported {
         unsupported.push(AssignmentRelationKind::SelfAssignment.label());
@@ -136,7 +193,7 @@ fn ordinary_assignment_relation_expansions(
     if !(self_selected && self_supported || swap_selected && swap_supported) {
         return Vec::new();
     }
-    let candidates = if dialect == crate::analyzer::LanguageDialect::CppC {
+    let candidates = if cpp_family {
         let candidates = c_assignment_candidates(workspace, &procedure.handle, cancellation);
         brokk_bifrost_analysis::analyzer::PlainAssignmentCandidates {
             rows: candidates.rows.into_iter().map(plain_c_candidate).collect(),
@@ -245,20 +302,43 @@ fn ordinary_assignment_relation_expansions(
         report_open_candidates(procedure, &expansions, diagnostics);
         return expansions;
     };
-    let is_c = dialect == crate::analyzer::LanguageDialect::CppC;
-    let proof_complete = if is_c {
+    let proof_complete = if cpp_family {
+        // An unrelated local that has no establishment is handled by each
+        // candidate's initialization proof below. It must not hide a
+        // separately initialized ordinary binding in the same C/C++ procedure
+        // (for example, a volatile pointer sibling in one declaration).
+        let reasons = derivation
+            .completeness
+            .reasons()
+            .iter()
+            .filter(|reason| {
+                ASSIGNMENT_RELATION_AXES
+                    .iter()
+                    .any(|axis| reason.blocks(*axis))
+                    && !matches!(
+                        reason,
+                        FlowStateIncompleteReason::BindingWithoutEstablishment { .. }
+                    )
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        let completeness = if reasons.is_empty() {
+            FlowStateCompleteness::Complete
+        } else {
+            FlowStateCompleteness::Incomplete { reasons }
+        };
         flow_state_cache.report_completeness(
             &procedure.wire_id(),
             language,
-            &derivation.completeness,
+            &completeness,
             ASSIGNMENT_RELATION_AXES,
             derivation.generation,
             diagnostics,
         );
         candidates.complete
-            && ASSIGNMENT_RELATION_AXES
-                .iter()
-                .all(|axis| derivation.completeness.covers(*axis))
+            && completeness.covers(FlowStateAxis::BindingEvents)
+            && completeness.covers(FlowStateAxis::ReachingRelation)
+            && completeness.covers(FlowStateAxis::SameEvaluationRelation)
     } else {
         // The same-evaluation, reaching, and initialization proofs below
         // scope lowering gaps to each assignment. Only a procedure-wide hole
@@ -298,7 +378,7 @@ fn ordinary_assignment_relation_expansions(
             .iter()
             .cloned()
             .map(|candidate| {
-                if is_c {
+                if cpp_family {
                     qualify_c_candidate(procedure, derivation, proof_complete, candidate)
                 } else {
                     qualify_candidate(procedure, derivation, proof_complete, candidate)
@@ -332,17 +412,12 @@ fn overwritten_unread_expansions(
     procedure: &semantic::SemanticProcedureValue,
 ) -> Vec<PipelineExpansion> {
     let dialect = procedure.handle.artifact().key().language();
-    if !matches!(
-        dialect.language(),
-        Language::Java
-            | Language::JavaScript
-            | Language::TypeScript
-            | Language::Python
-            | Language::Go
-            | Language::CSharp
-            | Language::Kotlin
-            | Language::Rust
-    ) {
+    let cpp_family = matches!(
+        dialect,
+        crate::analyzer::LanguageDialect::CppC
+            | crate::analyzer::LanguageDialect::Standard(Language::Cpp)
+    );
+    if !supports_relation(dialect, AssignmentRelationKind::OverwrittenUnread) {
         diagnostics.push(CodeQueryDiagnostic {
             code: CodeQueryDiagnosticCode::EffectDerivationIncomplete,
             impact: CodeQueryDiagnosticImpact::Incomplete,
@@ -357,22 +432,50 @@ fn overwritten_unread_expansions(
         });
         return Vec::new();
     }
-    let candidates = match dialect.language() {
-        Language::Java => {
-            java_overwritten_local_candidates(workspace, &procedure.handle, cancellation)
+    let mut candidates = if cpp_family {
+        cpp_overwritten_local_candidates(workspace, &procedure.handle, cancellation)
+    } else {
+        match dialect.language() {
+            Language::Java => {
+                java_overwritten_local_candidates(workspace, &procedure.handle, cancellation)
+            }
+            Language::JavaScript | Language::TypeScript => {
+                js_ts_overwritten_local_candidates(workspace, &procedure.handle, cancellation)
+            }
+            Language::Python => {
+                python_overwritten_local_candidates(workspace, &procedure.handle, cancellation)
+            }
+            Language::Go => {
+                go_overwritten_local_candidates(workspace, &procedure.handle, cancellation)
+            }
+            Language::CSharp
+            | Language::Kotlin
+            | Language::Rust
+            | Language::Scala
+            | Language::Php
+            | Language::Ruby => single_target_overwritten_local_candidates(
+                workspace,
+                &procedure.handle,
+                cancellation,
+            ),
+            _ => unreachable!("dialect was validated"),
         }
-        Language::JavaScript | Language::TypeScript => {
-            js_ts_overwritten_local_candidates(workspace, &procedure.handle, cancellation)
-        }
-        Language::Python => {
-            python_overwritten_local_candidates(workspace, &procedure.handle, cancellation)
-        }
-        Language::Go => go_overwritten_local_candidates(workspace, &procedure.handle, cancellation),
-        Language::CSharp | Language::Kotlin | Language::Rust => {
-            single_target_overwritten_local_candidates(workspace, &procedure.handle, cancellation)
-        }
-        _ => unreachable!("dialect was validated"),
     };
+    // C/C++ macro and in-procedure preprocessing facts are procedure-wide.
+    // Keep every otherwise supported row open when either fact is present;
+    // the flow graph alone cannot prove that the source write was the one
+    // lowered by the analyzer.
+    if cpp_family && !candidates.complete {
+        let reason = candidates
+            .reason
+            .unwrap_or("syntax_qualification_incomplete");
+        for candidate in &mut candidates.rows {
+            if candidate.verdict == PlainAssignmentVerdict::Supported {
+                candidate.verdict = PlainAssignmentVerdict::Unknown;
+                candidate.reason = reason;
+            }
+        }
+    }
     if !candidates.complete {
         diagnostics.push(CodeQueryDiagnostic {
             code: CodeQueryDiagnosticCode::EffectDerivationIncomplete,
@@ -519,8 +622,9 @@ fn overwritten_unread_expansions(
                     }
                 }
             }
-            match derivation.overwritten_unread_local(&procedure.handle, write.event, &mut request)
-            {
+            let answer =
+                derivation.overwritten_unread_local(&procedure.handle, write.event, &mut request);
+            match answer {
                 OverwrittenUnreadAnswer::Proven { replacement_events } => {
                     has_proven_copy = true;
                     replacements.extend(replacement_events);
@@ -706,23 +810,21 @@ fn report_open_candidates(
     open_reasons.sort_unstable();
     open_reasons.dedup();
     if !open_reasons.is_empty() {
-        diagnostics.push(CodeQueryDiagnostic {
-            code: CodeQueryDiagnosticCode::EffectDerivationIncomplete,
-            impact: CodeQueryDiagnosticImpact::Incomplete,
-            branch: Vec::new(),
-            language: procedure
+        diagnostics.push(super::incomplete_diagnostic(
+            CodeQueryDiagnosticCode::EffectDerivationIncomplete,
+            procedure
                 .handle
                 .artifact()
                 .key()
                 .language()
                 .language()
                 .config_label(),
-            message: format!(
+            format!(
                 "{} has open assignment-relation candidates: {open_reasons:?}",
                 procedure.wire_id()
             ),
-            exhausted_roots: Vec::new(),
-        });
+            Vec::new(),
+        ));
     }
 }
 
@@ -871,6 +973,26 @@ fn qualify_c_candidate(
             && relations[0].certainty == FlowCertainty::Exact
             && relations[0].source_event != establishment.event
     }) {
+        return row(
+            procedure,
+            candidate,
+            Some(read.value),
+            "self_assignment",
+            "exact",
+            EffectCoverage::Exhaustive,
+            None,
+        );
+    }
+    if reaching.iter().all(Vec::is_empty)
+        && matches!(
+            procedure.handle.semantics().value(target),
+            Some(value) if matches!(&value.kind, SemanticValueKind::Parameter { .. })
+        )
+        && matches!(
+            derivation.binding_initialization_at_read(&procedure.handle, read.event),
+            BindingInitializationAnswer::Proven
+        )
+    {
         return row(
             procedure,
             candidate,
@@ -1333,8 +1455,4 @@ fn row(
             replacement_events: Vec::new(),
         },
     )))
-}
-
-fn same_range(left: &Range, right: &Range) -> bool {
-    left.start_byte == right.start_byte && left.end_byte == right.end_byte
 }

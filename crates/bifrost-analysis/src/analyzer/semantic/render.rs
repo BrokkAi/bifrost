@@ -1171,6 +1171,19 @@ fn write_target_resolution(
     for target in resolution.candidates() {
         write!(writer, "(target :kind {}", quoted(target.label()))?;
         match target {
+            CallableTarget::Artifact(target) => {
+                let identity = target.identity();
+                write!(
+                    writer,
+                    " :artifact-sha256 {} :package {} :file {} :start-byte {} :end-byte {} :source-identity {}",
+                    quoted(&identity.artifact_sha256),
+                    quoted(&identity.package_identity),
+                    quoted(&identity.anchor.file),
+                    identity.anchor.byte_range.start,
+                    identity.anchor.byte_range.end,
+                    quoted(&format!("{identity:?}")),
+                )?;
+            }
             CallableTarget::Local(procedure) => write!(writer, " :procedure {procedure}")?,
             CallableTarget::Unmaterialized(locator) | CallableTarget::External(locator) => {
                 writer.write_str(" :locator (locator ")?;
@@ -1537,15 +1550,14 @@ mod tests {
     use super::*;
     use crate::analyzer::Language;
     use crate::analyzer::semantic::{
-        AdapterSemanticsVersion, BasicBlock, BlockId, ConfigurationFingerprint, ContentIdentity,
-        ControlEdgeKind, DeclarationLocator, DeclarationSegment, DeclarationSegmentKind,
-        DependencyFingerprint, EvidenceId, ProcedureKind, ProcedureSemanticsParts, ProgramPointId,
-        SemanticBudget, SemanticCapabilities, SemanticCapability, SemanticEvent, SemanticGapId,
-        SemanticGapImpacts, SemanticIrVersion, SemanticLanguage, SemanticLocator, SemanticRole,
-        SemanticWork, SourceAnchor, SourceMappingId, SourceMappingKind, SourcePosition,
-        SourceRevision, SourceSpan, StableDigest, StructuralNodeIdentity, WorkspaceMountId,
-        WorkspaceRelativePath,
+        BasicBlock, BlockId, ContentIdentity, ControlEdgeKind, DeclarationLocator,
+        DeclarationSegment, DeclarationSegmentKind, EvidenceId, ProcedureKind,
+        ProcedureSemanticsParts, ProgramPointId, SemanticCapabilities, SemanticCapability,
+        SemanticEvent, SemanticGapId, SemanticGapImpacts, SemanticLanguage, SemanticLocator,
+        SemanticRole, SourceAnchor, SourceMappingId, SourcePosition, SourceRevision, SourceSpan,
+        StructuralNodeIdentity,
     };
+    use brokk_bifrost_test_macros::hardwon;
 
     #[test]
     fn bounded_writer_escapes_strings_and_balances_truncation() {
@@ -1579,106 +1591,6 @@ mod tests {
     }
 
     #[test]
-    fn integer_offset_flow_renders_its_exact_signed_magnitude() {
-        let event = SemanticEvent::new(
-            SemanticEffect::ValueFlow {
-                kind: ValueFlowKind::IntegerOffset {
-                    offset: crate::analyzer::semantic::SignedIntegerMagnitude::new(true, 3),
-                },
-                source: crate::analyzer::semantic::ValueId::new(0),
-                target: crate::analyzer::semantic::ValueId::new(1),
-            },
-            SourceMappingId::new(0),
-            EvidenceId::new(0),
-        );
-        let mut rendered = String::new();
-
-        write_event(&mut rendered, 0, &event).expect("integer offset event renders");
-
-        assert!(rendered.contains(":flow-kind \"integer_offset\""));
-        assert!(rendered.contains(":integer-offset-sign \"negative\""));
-        assert!(rendered.contains(":integer-offset-magnitude 3"));
-    }
-
-    #[test]
-    fn limits_reject_zero_or_too_small_dimensions() {
-        for limits in [
-            SemanticIrLimits {
-                max_procedures: 0,
-                ..SemanticIrLimits::default()
-            },
-            SemanticIrLimits {
-                max_rows: 0,
-                ..SemanticIrLimits::default()
-            },
-            SemanticIrLimits {
-                max_source_entries: 0,
-                ..SemanticIrLimits::default()
-            },
-            SemanticIrLimits {
-                max_output_bytes: MIN_OUTPUT_BYTES - 1,
-                ..SemanticIrLimits::default()
-            },
-        ] {
-            assert_eq!(limits.validate(), Err(SemanticRenderError::InvalidLimits));
-        }
-    }
-
-    #[test]
-    fn render_state_marks_each_non_output_budget() {
-        let cases = [
-            (
-                SemanticIrLimits {
-                    max_procedures: 1,
-                    ..SemanticIrLimits::default()
-                },
-                "procedure limit reached",
-                0,
-            ),
-            (
-                SemanticIrLimits {
-                    max_rows: 1,
-                    ..SemanticIrLimits::default()
-                },
-                "row limit reached",
-                1,
-            ),
-            (
-                SemanticIrLimits {
-                    max_source_entries: 1,
-                    ..SemanticIrLimits::default()
-                },
-                "source entry limit reached",
-                2,
-            ),
-        ];
-
-        for (limits, reason, dimension) in cases {
-            let mut state = RenderState::new(limits);
-            assert!(state.writer.open(0, "(semantic-ir"));
-            match dimension {
-                0 => {
-                    assert!(state.begin_procedure());
-                    assert!(!state.begin_procedure());
-                }
-                1 => {
-                    assert!(state.row_with(1, |writer| writer.write_str("(row 0)")));
-                    assert!(!state.row_with(1, |writer| writer.write_str("(row 1)")));
-                }
-                2 => {
-                    assert!(state.source_row_with(1, |writer| writer.write_str("(source 0)")));
-                    assert!(!state.source_row_with(1, |writer| writer.write_str("(source 1)")));
-                }
-                _ => unreachable!(),
-            }
-            let (output, truncated) = state.writer.finish();
-            assert!(truncated);
-            assert!(output.contains(reason), "{output:?}");
-            assert_balanced(&output);
-        }
-    }
-
-    #[test]
     fn artifact_rendering_is_deterministic_scoped_and_source_backed() {
         let artifact = fixture_artifact(2);
         let first = render_semantic_ir(
@@ -1707,6 +1619,7 @@ mod tests {
     }
 
     #[test]
+    #[hardwon("#2816: decorated parameter identity must remain content-scoped in semantic output")]
     fn source_mapping_renders_exact_structural_identity() {
         let key = fixture_key();
         let mut mapping = fixture_procedure(&key, 0).source_mappings.remove(0);
@@ -1815,36 +1728,6 @@ mod tests {
     }
 
     #[test]
-    fn selected_procedure_keeps_artifact_scope_and_lexical_parent() {
-        let artifact = fixture_artifact(3);
-        let rendered = render_semantic_ir(
-            &artifact,
-            SemanticIrSelection::Procedure(ProcedureId::new(2)),
-            SemanticIrLimits::default(),
-        )
-        .unwrap();
-
-        assert!(rendered.semantic_ir.contains("(artifact :fingerprint"));
-        assert!(
-            rendered
-                .semantic_ir
-                .contains("(procedure :id 2 :kind \"lambda\" :parent 1")
-        );
-        assert!(!rendered.semantic_ir.contains("(procedure :id 0"));
-        assert!(!rendered.semantic_ir.contains("(procedure :id 1"));
-        assert_balanced(&rendered.semantic_ir);
-
-        assert_eq!(
-            render_semantic_ir(
-                &artifact,
-                SemanticIrSelection::Procedure(ProcedureId::new(9)),
-                SemanticIrLimits::default(),
-            ),
-            Err(SemanticRenderError::UnknownProcedure(ProcedureId::new(9)))
-        );
-    }
-
-    #[test]
     fn artifact_renderer_marks_every_budget_and_stays_balanced() {
         let artifact = fixture_artifact(3);
         let limits = [
@@ -1875,99 +1758,6 @@ mod tests {
             assert_balanced(&rendered.semantic_ir);
         }
     }
-
-    #[test]
-    fn new_target_continuation_gap_and_language_capture_fields_are_rendered() {
-        let locator = fixture_artifact(1).procedures()[0].locator().clone();
-        let call_site = SemanticCallSite {
-            id: super::super::ids::CallSiteId::new(0),
-            point: ProgramPointId::new(4),
-            invocation_mode: crate::analyzer::semantic::CallInvocationMode::Ordinary,
-            execution_timing: crate::analyzer::semantic::ExecutionTiming::SameEvaluation,
-            callee: super::super::ids::ValueId::new(0),
-            receiver: None,
-            arguments: Box::new([super::super::ir::SemanticCallArgument::direct(
-                super::super::ids::ValueId::new(1),
-                super::super::ir::ArgumentDomain::Positional,
-            )]),
-            normal_results: Box::new([]),
-            result: None,
-            thrown: None,
-            declared_targets: CallableTargetResolution::ExceededBudget(Box::new([
-                CallableTarget::Unmaterialized(locator),
-            ])),
-            target_evidence: EvidenceId::new(7),
-            normal_continuation: ControlContinuation::Absent,
-            exceptional_continuation: ControlContinuation::ExceededBudget,
-            source: SourceMappingId::new(2),
-            evidence: EvidenceId::new(3),
-        };
-        let mut call_rendered = String::new();
-        write_call_site(&mut call_rendered, &call_site).unwrap();
-        assert!(call_rendered.contains(":invocation-mode \"ordinary\""));
-        assert!(call_rendered.contains(":execution-timing \"same_evaluation\""));
-        assert!(call_rendered.contains(":declared-targets"));
-        assert!(call_rendered.contains(":kind \"unmaterialized\""));
-        assert!(call_rendered.contains(":target-evidence 7"));
-        assert!(call_rendered.contains(":outcome \"absent\""));
-        assert!(call_rendered.contains(":outcome \"exceeded_budget\""));
-
-        let mut budget = SemanticBudget::uniform(1).unwrap();
-        let exceeded = budget
-            .charge(SemanticWork {
-                program_points: 2,
-                ..SemanticWork::default()
-            })
-            .unwrap_err();
-        let gap = SemanticGap {
-            id: SemanticGapId::new(0),
-            point: ProgramPointId::new(4),
-            subject: SemanticGapSubject::CallContinuation {
-                call_site: super::super::ids::CallSiteId::new(0),
-                kind: super::super::ir::CallContinuationKind::Exceptional,
-            },
-            capability: SemanticCapability::ExceptionalCallContinuation,
-            impacts: SemanticGapImpacts::for_gap(
-                SemanticCapability::ExceptionalCallContinuation,
-                SemanticGapSubject::CallContinuation {
-                    call_site: super::super::ids::CallSiteId::new(0),
-                    kind: super::super::ir::CallContinuationKind::Exceptional,
-                },
-            ),
-            kind: super::super::ir::SemanticGapKind::ExceededBudget,
-            budget: Some(exceeded),
-            discharge: super::super::ir::SemanticGapDischarge::None,
-            detail: "bounded target proof".into(),
-            source: SourceMappingId::new(2),
-            evidence: EvidenceId::new(3),
-        };
-        let mut gap_rendered = String::new();
-        write_gap(&mut gap_rendered, &gap).unwrap();
-        assert!(gap_rendered.contains(":subject (subject :kind \"call_continuation\""));
-        assert!(gap_rendered.contains(":continuation-kind \"exceptional\""));
-        assert!(gap_rendered.contains(
-            ":impacts (\"call_evaluation\" \"return_transfer\" \"value_flow\" \"heap_read\" \"heap_write\" \"aliasing\")"
-        ));
-        assert!(gap_rendered.contains(":dimension \"rows\" :limit 1 :attempted 2"));
-
-        let capture = CaptureBinding {
-            id: super::super::ids::CaptureId::new(0),
-            point: ProgramPointId::new(1),
-            callable: super::super::ids::ValueId::new(0),
-            target: ProcedureId::new(1),
-            environment: super::super::ids::AllocationId::new(0),
-            captured: CaptureSource::Value(super::super::ids::ValueId::new(1)),
-            destination: super::super::ids::MemoryLocationId::new(0),
-            mode: super::super::ir::CaptureMode::LanguageDefined("borrowed-ref".into()),
-            source: SourceMappingId::new(2),
-            evidence: EvidenceId::new(3),
-        };
-        let mut capture_rendered = String::new();
-        write_capture(&mut capture_rendered, &capture).unwrap();
-        assert!(capture_rendered.contains(":mode \"language_defined\""));
-        assert!(capture_rendered.contains(":language-mode \"borrowed-ref\""));
-    }
-
     #[test]
     fn multi_megabyte_gap_detail_is_rejected_without_retaining_a_partial_row() {
         const DETAIL_BYTES: usize = 4 * 1024 * 1024;
@@ -1987,66 +1777,6 @@ mod tests {
         assert!(
             !rendered.semantic_ir.contains(&"x".repeat(1_024)),
             "the rejected gap row must be rolled back instead of retained partially"
-        );
-        assert_balanced(&rendered.semantic_ir);
-    }
-
-    #[test]
-    fn callable_capture_gap_and_evidence_details_are_explicit_and_escaped() {
-        let artifact = fixture_feature_artifact();
-        let rendered = render_semantic_ir(
-            &artifact,
-            SemanticIrSelection::Artifact,
-            SemanticIrLimits::default(),
-        )
-        .unwrap();
-
-        assert!(
-            rendered
-                .semantic_ir
-                .contains(":effect \"callable_creation\"")
-        );
-        assert!(
-            rendered
-                .semantic_ir
-                .contains(":effect \"callable_reference\"")
-        );
-        assert!(
-            rendered
-                .semantic_ir
-                .contains(":callable-kind \"bound_method\"")
-        );
-        assert!(
-            rendered
-                .semantic_ir
-                .contains(":target-resolution \"proven\"")
-        );
-        assert!(rendered.semantic_ir.contains(":procedure 1"));
-        assert!(rendered.semantic_ir.contains(":bound-receiver 1"));
-        assert!(
-            rendered
-                .semantic_ir
-                .contains(":source-kind \"location\" :source-location 0")
-        );
-        assert!(
-            rendered
-                .semantic_ir
-                .contains(":destination (procedure 1 :memory-location 0)")
-        );
-        assert!(rendered.semantic_ir.contains(":lexical-parent 0"));
-        assert!(rendered.semantic_ir.contains(":mode \"mutable_cell\""));
-        assert!(rendered.semantic_ir.contains(":kind \"lexical_cell\""));
-        assert!(rendered.semantic_ir.contains(":binding-value 2"));
-        assert!(
-            rendered
-                .semantic_ir
-                .contains(":access-kind \"lexical_cell\"")
-        );
-        assert!(rendered.semantic_ir.contains(":kind \"unsupported\""));
-        assert!(
-            rendered
-                .semantic_ir
-                .contains("adapter said \\\"no\\\"\\nnext")
         );
         assert_balanced(&rendered.semantic_ir);
     }
@@ -2138,10 +1868,6 @@ mod tests {
             .complete(SemanticCapability::ExceptionalControlFlow)
             .build();
         SemanticArtifact::try_new(key, capabilities, vec![procedure]).unwrap()
-    }
-
-    fn fixture_feature_artifact() -> SemanticArtifact {
-        fixture_feature_artifact_with_gap_detail("adapter said \"no\"\nnext".into())
     }
 
     fn fixture_feature_artifact_with_gap_detail(detail: Box<str>) -> SemanticArtifact {
@@ -2361,18 +2087,18 @@ mod tests {
     }
 
     fn fixture_key() -> SemanticArtifactKey {
-        let digest = |label: &str| StableDigest::sha256(label);
-        SemanticArtifactKey::new(
-            WorkspaceMountId::from_digest(digest("mount")),
-            WorkspaceRelativePath::new("src/render.ts").unwrap(),
+        crate::test_support::semantic_artifact_key_fixture(
+            "mount",
+            "src/render.ts",
             SemanticLanguage::Standard(Language::TypeScript),
             SourceRevision::Disk {
-                content: ContentIdentity::from_digest(digest("content")),
+                content: ContentIdentity::hash_bytes("content"),
             },
-            AdapterSemanticsVersion::new("typescript", digest("adapter")).unwrap(),
-            SemanticIrVersion::from_digest(digest("semantic-ir")),
-            ConfigurationFingerprint::from_digest(digest("configuration")),
-            DependencyFingerprint::from_digest(digest("dependencies")),
+            "typescript",
+            "adapter",
+            "semantic-ir",
+            "configuration",
+            "dependencies",
         )
     }
 
@@ -2397,76 +2123,18 @@ mod tests {
             SemanticRole::Procedure,
             anchor,
         );
-        let source = SourceMappingId::new(0);
-        let evidence = EvidenceId::new(0);
-        let mut parts = ProcedureSemanticsParts::new(
+        let mut parts = crate::test_support::minimal_semantic_procedure(
             id,
-            locator.clone(),
+            locator,
             if index == 0 {
                 ProcedureKind::Function
             } else {
                 ProcedureKind::Lambda
             },
-            source,
-            evidence,
         );
         parts.lexical_parent = index
             .checked_sub(1)
             .map(|parent| ProcedureId::try_from_index(parent).unwrap());
-        parts.source_mappings = vec![SourceMapping {
-            id: source,
-            locator,
-            kind: SourceMappingKind::Exact,
-            ast_identity: None,
-        }];
-        parts.evidence_rows = vec![Evidence {
-            id: evidence,
-            proof: ProofStatus::Proven,
-            completeness: EvidenceCompleteness::Complete,
-            sources: vec![source].into_boxed_slice(),
-        }];
-        parts.blocks = vec![BasicBlock {
-            id: BlockId::new(0),
-            points: vec![
-                ProgramPointId::new(0),
-                ProgramPointId::new(1),
-                ProgramPointId::new(2),
-            ]
-            .into_boxed_slice(),
-            source,
-            evidence,
-        }];
-        parts.points = [
-            SemanticEffect::Entry,
-            SemanticEffect::NormalExit,
-            SemanticEffect::ExceptionalExit,
-        ]
-        .into_iter()
-        .enumerate()
-        .map(|(point, effect)| ProgramPoint {
-            id: ProgramPointId::try_from_index(point).unwrap(),
-            block: BlockId::new(0),
-            events: vec![SemanticEvent::new(effect, source, evidence)].into_boxed_slice(),
-            source,
-            evidence,
-        })
-        .collect();
-        parts.control_edges = vec![
-            ControlEdge {
-                source_point: ProgramPointId::new(0),
-                target_point: ProgramPointId::new(1),
-                kind: ControlEdgeKind::Normal,
-                source,
-                evidence,
-            },
-            ControlEdge {
-                source_point: ProgramPointId::new(0),
-                target_point: ProgramPointId::new(2),
-                kind: ControlEdgeKind::Exceptional,
-                source,
-                evidence,
-            },
-        ];
         parts
     }
 

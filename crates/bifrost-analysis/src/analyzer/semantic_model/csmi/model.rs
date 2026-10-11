@@ -1,4 +1,4 @@
-//! CSMI v0.1 wire types.
+//! CSMI 0.1 and 0.2 core wire types.
 //!
 //! These types intentionally do not reuse Bifrost's authored or compiled pack
 //! model.  CSMI local handles are document-local, while Bifrost IDs and runtime
@@ -19,7 +19,9 @@ pub const CSMI_TRANSFER_PARTITIONS_PROFILE_VERSION: &str = "0.1.0";
 pub const CSMI_TRANSFER_PARTITIONS_PROFILE_SCHEMA: &str =
     "https://csmi.brokk.ai/schema/profiles/transfer-partitions/0.1/schema.json";
 
-pub const CSMI_SCHEMA_URI: &str = "https://csmi.brokk.ai/schema/0.1/schema.json";
+pub const CSMI_SCHEMA_URI_V0_1: &str = "https://csmi.brokk.ai/schema/0.1/schema.json";
+pub const CSMI_SCHEMA_URI_V0_2: &str = "https://csmi.brokk.ai/schema/0.2/schema.json";
+pub const CSMI_SCHEMA_URI: &str = "https://csmi.brokk.ai/schema/0.3/schema.json";
 pub const CSMI_SEMANTIC_MODEL_VERSION: &str = "0.1";
 pub const CSMI_SERIALIZATION_VERSION: &str = "0.1-json";
 pub const CSMI_PACK_FORMAT_VERSION: &str = "0.1";
@@ -54,6 +56,15 @@ pub const CSMI_DEFERRED_YIELD_PROFILE_ID: &str = "csmi.deferred-yield";
 pub const CSMI_DEFERRED_YIELD_PROFILE_VERSION: &str = "0.1.0";
 pub const CSMI_DEFERRED_YIELD_PROFILE_SCHEMA: &str =
     "https://csmi.brokk.ai/schema/profiles/deferred-yield/0.1/schema.json";
+pub const CSMI_CALLABLE_VALUES_PROFILE_ID: &str = "csmi.callable-values";
+pub const CSMI_CALLABLE_VALUES_PROFILE_VERSION: &str = "0.1.0";
+pub const CSMI_CALLABLE_VALUES_PROFILE_SCHEMA: &str =
+    "https://csmi.brokk.ai/schema/profiles/callable-values/0.1/schema.json";
+pub const CSMI_CALLABLE_VALUES_RETURNED_CALLABLES_FAMILY: &str = "returned-callables";
+pub const CSMI_CALLABLE_VALUES_CALLBACK_INVOCATIONS_FAMILY: &str = "callback-invocations";
+
+const CSMI_STRUCTURED_LOCATIONS_SCHEME: &str = "csmi.structured-locations";
+const CSMI_STRUCTURED_LOCATIONS_VERSION: &str = "0.1.0";
 
 // Independently pinned at CSMI PR #38, e06a89ae77a2cba8443f1d0cd3edd2d5419e3af3.
 pub const CSMI_CONDITIONAL_TYPE_REFINEMENT_PROFILE_ID: &str = "csmi.conditional-type-refinement";
@@ -571,6 +582,311 @@ pub struct CsmiCollectionFlowArgument {
 #[serde(rename_all = "kebab-case")]
 pub enum CsmiCollectionFlowTiming {
     DuringCall,
+}
+
+/// Typed payloads for the CSMI callable-values profile.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "kebab-case", deny_unknown_fields)]
+pub enum CsmiCallableValuesPayload {
+    ReturnedCallable {
+        callable: LocalId,
+        result: u32,
+        target: LocalId,
+    },
+    CallbackInvocation {
+        callable: LocalId,
+        callback: CsmiInputLocation,
+        shape: CsmiCallableValuesShape,
+        arguments: Vec<CsmiCallableValuesArgument>,
+        timing: CsmiCallableValuesTiming,
+        modality: CsmiCallableValuesModality,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct CsmiCallableValuesShape {
+    pub parameters: u16,
+    pub results: u16,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "kebab-case", deny_unknown_fields)]
+pub enum CsmiCallableValuesArgument {
+    Input {
+        source: CsmiInputLocation,
+    },
+    Unknown {
+        limitation: CsmiCallableValuesLimitation,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CsmiCallableValuesLimitation {
+    pub kind: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub diagnostic: Option<CsmiCallableValuesDiagnostic>,
+}
+
+impl CsmiCallableValuesLimitation {
+    /// Compare semantic identity while ignoring diagnostic prose and details.
+    /// `None` means the available identity cannot establish equivalence.
+    pub fn semantic_equivalence(&self, other: &Self) -> Option<bool> {
+        if self.kind != other.kind {
+            return Some(false);
+        }
+        let self_code = self
+            .diagnostic
+            .as_ref()
+            .and_then(|diagnostic| diagnostic.code.as_deref());
+        let other_code = other
+            .diagnostic
+            .as_ref()
+            .and_then(|diagnostic| diagnostic.code.as_deref());
+        if self.kind == "other" && (self_code.is_none() || other_code.is_none()) {
+            return None;
+        }
+        Some(self_code == other_code)
+    }
+}
+
+impl CsmiCallableValuesArgument {
+    /// Compare argument meaning without treating diagnostic prose as identity.
+    pub fn semantic_equivalence(&self, other: &Self) -> Option<bool> {
+        match (self, other) {
+            (Self::Input { source: left }, Self::Input { source: right }) => Some(left == right),
+            (Self::Unknown { limitation: left }, Self::Unknown { limitation: right }) => {
+                left.semantic_equivalence(right)
+            }
+            _ => Some(false),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CsmiCallableValuesDiagnostic {
+    pub message: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub code: Option<String>,
+    // Unlike CsmiDiagnosticMetadata, this profile permits arbitrary JSON details.
+    // Decode through Value so an explicit JSON null remains distinct from omission.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_callable_values_details"
+    )]
+    pub details: Option<CsmiJson>,
+}
+
+fn deserialize_callable_values_details<'de, D>(
+    deserializer: D,
+) -> Result<Option<CsmiJson>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    CsmiJson::deserialize(deserializer).map(Some)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum CsmiCallableValuesTiming {
+    DuringCall,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum CsmiCallableValuesModality {
+    May,
+}
+
+#[derive(Debug)]
+pub enum CsmiCallableValuesRemapError<E> {
+    Symbol(E),
+    UnsupportedProjection(CsmiCallableValuesUnsupportedProjection),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CsmiCallableValuesUnsupportedProjection {
+    Scheme(String),
+    SchemeVersion(String),
+    StepCount(usize),
+    StepKind { index: usize, kind: String },
+    MissingStepArguments(usize),
+    InvalidFieldArguments { index: usize, message: String },
+}
+
+impl CsmiCallableValuesPayload {
+    /// Compare profile semantics, ignoring only non-semantic diagnostic prose/details.
+    pub fn semantic_equivalence(&self, other: &Self) -> Option<bool> {
+        match (self, other) {
+            (
+                Self::ReturnedCallable {
+                    callable: left_callable,
+                    result: left_result,
+                    target: left_target,
+                },
+                Self::ReturnedCallable {
+                    callable: right_callable,
+                    result: right_result,
+                    target: right_target,
+                },
+            ) => Some(
+                left_callable == right_callable
+                    && left_result == right_result
+                    && left_target == right_target,
+            ),
+            (
+                Self::CallbackInvocation {
+                    callable: left_callable,
+                    callback: left_callback,
+                    shape: left_shape,
+                    arguments: left_arguments,
+                    timing: left_timing,
+                    modality: left_modality,
+                },
+                Self::CallbackInvocation {
+                    callable: right_callable,
+                    callback: right_callback,
+                    shape: right_shape,
+                    arguments: right_arguments,
+                    timing: right_timing,
+                    modality: right_modality,
+                },
+            ) => {
+                if left_callable != right_callable
+                    || left_callback != right_callback
+                    || left_shape != right_shape
+                    || left_timing != right_timing
+                    || left_modality != right_modality
+                    || left_arguments.len() != right_arguments.len()
+                {
+                    return Some(false);
+                }
+                let mut indeterminate = false;
+                for (left, right) in left_arguments.iter().zip(right_arguments) {
+                    match left.semantic_equivalence(right) {
+                        Some(true) => {}
+                        Some(false) => return Some(false),
+                        None => indeterminate = true,
+                    }
+                }
+                (!indeterminate).then_some(true)
+            }
+            _ => Some(false),
+        }
+    }
+
+    /// Remap document-local symbol handles while preserving structured locations.
+    pub fn remap_symbols<E>(
+        &mut self,
+        mut resolve: impl FnMut(&str) -> Result<String, E>,
+    ) -> Result<(), CsmiCallableValuesRemapError<E>> {
+        let mut remapped = self.clone();
+        remapped.remap_symbols_in_place(&mut resolve)?;
+        *self = remapped;
+        Ok(())
+    }
+
+    fn remap_symbols_in_place<E>(
+        &mut self,
+        resolve: &mut impl FnMut(&str) -> Result<String, E>,
+    ) -> Result<(), CsmiCallableValuesRemapError<E>> {
+        match self {
+            Self::ReturnedCallable {
+                callable, target, ..
+            } => {
+                *callable = resolve(callable).map_err(CsmiCallableValuesRemapError::Symbol)?;
+                *target = resolve(target).map_err(CsmiCallableValuesRemapError::Symbol)?;
+            }
+            Self::CallbackInvocation {
+                callable,
+                callback,
+                arguments,
+                ..
+            } => {
+                *callable = resolve(callable).map_err(CsmiCallableValuesRemapError::Symbol)?;
+                remap_callable_values_input_location(callback, resolve)?;
+                for argument in arguments {
+                    if let CsmiCallableValuesArgument::Input { source } = argument {
+                        remap_callable_values_input_location(source, resolve)?;
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+fn remap_callable_values_input_location<E>(
+    location: &mut CsmiInputLocation,
+    resolve: &mut impl FnMut(&str) -> Result<String, E>,
+) -> Result<(), CsmiCallableValuesRemapError<E>> {
+    if let CsmiInputBoundaryRoot::Capture(root) = &mut location.root {
+        root.symbol = resolve(&root.symbol).map_err(CsmiCallableValuesRemapError::Symbol)?;
+    }
+    let Some(projection) = &mut location.projection else {
+        return Ok(());
+    };
+    if projection.scheme != CSMI_STRUCTURED_LOCATIONS_SCHEME {
+        return Err(CsmiCallableValuesRemapError::UnsupportedProjection(
+            CsmiCallableValuesUnsupportedProjection::Scheme(projection.scheme.clone()),
+        ));
+    }
+    if projection.scheme_version != CSMI_STRUCTURED_LOCATIONS_VERSION {
+        return Err(CsmiCallableValuesRemapError::UnsupportedProjection(
+            CsmiCallableValuesUnsupportedProjection::SchemeVersion(
+                projection.scheme_version.clone(),
+            ),
+        ));
+    }
+    if !(1..=16).contains(&projection.steps.len()) {
+        return Err(CsmiCallableValuesRemapError::UnsupportedProjection(
+            CsmiCallableValuesUnsupportedProjection::StepCount(projection.steps.len()),
+        ));
+    }
+    for (index, step) in projection.steps.iter_mut().enumerate() {
+        if step.kind != "field" {
+            return Err(CsmiCallableValuesRemapError::UnsupportedProjection(
+                CsmiCallableValuesUnsupportedProjection::StepKind {
+                    index,
+                    kind: step.kind.clone(),
+                },
+            ));
+        }
+        let args = step.args.as_ref().ok_or_else(|| {
+            CsmiCallableValuesRemapError::UnsupportedProjection(
+                CsmiCallableValuesUnsupportedProjection::MissingStepArguments(index),
+            )
+        })?;
+        let mut field_args: CsmiStructuredLocationFieldArguments =
+            serde_json::from_value(args.clone()).map_err(|error| {
+                CsmiCallableValuesRemapError::UnsupportedProjection(
+                    CsmiCallableValuesUnsupportedProjection::InvalidFieldArguments {
+                        index,
+                        message: error.to_string(),
+                    },
+                )
+            })?;
+        field_args.symbol =
+            resolve(&field_args.symbol).map_err(CsmiCallableValuesRemapError::Symbol)?;
+        step.args = Some(serde_json::to_value(field_args).map_err(|error| {
+            CsmiCallableValuesRemapError::UnsupportedProjection(
+                CsmiCallableValuesUnsupportedProjection::InvalidFieldArguments {
+                    index,
+                    message: error.to_string(),
+                },
+            )
+        })?);
+    }
+    Ok(())
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CsmiStructuredLocationFieldArguments {
+    symbol: LocalId,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1310,6 +1626,14 @@ pub struct CsmiDeclaration {
     pub generic_parameters: Vec<CsmiGenericParameter>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub callable: Option<CsmiCallableShape>,
+    #[serde(rename = "valueType", default, skip_serializing_if = "Option::is_none")]
+    pub value_type: Option<CsmiDeclaredClassType>,
+    #[serde(
+        rename = "proxiedType",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub proxied_type: Option<CsmiDeclaredClassType>,
     #[serde(
         rename = "aliasTarget",
         default,
@@ -1320,6 +1644,30 @@ pub struct CsmiDeclaration {
     pub provenance: Vec<LocalId>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub extensions: Vec<CsmiExtensionAttachment>,
+}
+
+/// A declared class type attached to a module-level value.
+///
+/// Local references name a class declaration in the same CSMI model. External
+/// references carry the exact Python namespace/type descriptor path; import
+/// resolves that path against the active semantic-model overlay, where it must
+/// identify one class record.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "kebab-case", deny_unknown_fields)]
+pub enum CsmiDeclaredClassType {
+    Reference {
+        symbol: LocalId,
+    },
+    External {
+        language: CsmiExternalTypeLanguage,
+        descriptors: Vec<CsmiDescriptor>,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum CsmiExternalTypeLanguage {
+    Python,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -1361,6 +1709,13 @@ pub struct CsmiCallableShape {
     pub receiver: Option<CsmiReceiver>,
     pub parameters: Vec<CsmiParameter>,
     pub results: Vec<CsmiResult>,
+    /// Complete set of runtime class references the callable can return.
+    #[serde(
+        rename = "returnClasses",
+        default,
+        skip_serializing_if = "Vec::is_empty"
+    )]
+    pub return_classes: Vec<CsmiTypeExpression>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub extensions: Vec<CsmiExtensionAttachment>,
 }
@@ -1402,6 +1757,8 @@ pub struct CsmiParameter {
     pub binding: CsmiParameterBinding,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub label: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub role: Option<CsmiParameterRole>,
     pub required: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub symbol: Option<LocalId>,
@@ -1419,6 +1776,12 @@ pub enum CsmiParameterBinding {
     NamedOnly,
     VariadicPositional,
     VariadicNamed,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum CsmiParameterRole {
+    Request,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1720,6 +2083,12 @@ pub struct CsmiProjectionStep {
     pub kind: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub args: Option<CsmiJson>,
+}
+
+impl CsmiProjectionStep {
+    pub(crate) fn key_selector(&self) -> Option<&serde_json::Value> {
+        self.args.as_ref()?.get("key")
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -2554,5 +2923,167 @@ mod profile_payload_tests {
             serde_json::from_value::<CsmiCollectionFlowPayload>(value).expect("payload parses"),
             payload
         );
+    }
+
+    fn callable_values_field_projection(steps: Vec<CsmiProjectionStep>) -> CsmiProjection {
+        CsmiProjection {
+            scheme: CSMI_STRUCTURED_LOCATIONS_SCHEME.to_owned(),
+            scheme_version: CSMI_STRUCTURED_LOCATIONS_VERSION.to_owned(),
+            steps,
+        }
+    }
+
+    fn callable_values_payload(projection: CsmiProjection) -> CsmiCallableValuesPayload {
+        let field_location = |root, symbol: &str| CsmiInputLocation {
+            root,
+            projection: Some(callable_values_field_projection(vec![CsmiProjectionStep {
+                kind: "field".to_owned(),
+                args: Some(json!({"symbol": symbol})),
+            }])),
+        };
+        CsmiCallableValuesPayload::CallbackInvocation {
+            callable: "call".to_owned(),
+            callback: CsmiInputLocation {
+                root: CsmiInputBoundaryRoot::Capture(CsmiInputCaptureRoot {
+                    phase: CsmiInputPhase::Input,
+                    role: CsmiCaptureRootRole::Capture,
+                    symbol: "capture".to_owned(),
+                }),
+                projection: Some(projection),
+            },
+            shape: CsmiCallableValuesShape {
+                parameters: 2,
+                results: 0,
+            },
+            arguments: vec![
+                CsmiCallableValuesArgument::Unknown {
+                    limitation: CsmiCallableValuesLimitation {
+                        kind: "other".to_owned(),
+                        diagnostic: Some(CsmiCallableValuesDiagnostic {
+                            message: "argument unknown".to_owned(),
+                            code: Some("origin.unknown".to_owned()),
+                            details: Some(json!({"origin": ["call", 2], "extra": null})),
+                        }),
+                    },
+                },
+                CsmiCallableValuesArgument::Input {
+                    source: field_location(
+                        CsmiInputBoundaryRoot::Parameter(CsmiInputParameterRoot {
+                            phase: CsmiInputPhase::Input,
+                            role: CsmiParameterRootRole::Parameter,
+                            position: 1,
+                        }),
+                        "argument-field",
+                    ),
+                },
+            ],
+            timing: CsmiCallableValuesTiming::DuringCall,
+            modality: CsmiCallableValuesModality::May,
+        }
+    }
+
+    #[test]
+    fn callable_values_preserve_diagnostics_compare_semantics_and_remap_symbols() {
+        let mut payload =
+            callable_values_payload(callable_values_field_projection(vec![CsmiProjectionStep {
+                kind: "field".to_owned(),
+                args: Some(json!({"symbol": "callback-field"})),
+            }]));
+        let wire = serde_json::to_value(&payload).expect("payload serializes");
+        assert_eq!(wire["timing"], "during-call");
+        assert_eq!(wire["modality"], "may");
+        assert_eq!(
+            wire["arguments"][0]["limitation"]["diagnostic"]["details"]["origin"],
+            json!(["call", 2])
+        );
+        assert_eq!(
+            wire["arguments"][0]["limitation"]["diagnostic"]["details"]["extra"],
+            serde_json::Value::Null
+        );
+        assert_eq!(
+            serde_json::from_value::<CsmiCallableValuesPayload>(wire).expect("payload parses"),
+            payload
+        );
+
+        payload
+            .remap_symbols(|symbol| Ok::<_, ()>(format!("native:{symbol}")))
+            .expect("all callable and field symbols map");
+        let remapped = serde_json::to_value(payload).expect("remapped payload serializes");
+        assert_eq!(remapped["callable"], "native:call");
+        assert_eq!(remapped["callback"]["root"]["symbol"], "native:capture");
+        assert_eq!(
+            remapped["callback"]["projection"]["steps"][0]["args"]["symbol"],
+            "native:callback-field"
+        );
+        assert_eq!(
+            remapped["arguments"][1]["source"]["projection"]["steps"][0]["args"]["symbol"],
+            "native:argument-field"
+        );
+    }
+
+    #[test]
+    fn callable_values_unsupported_projection_fails_closed() {
+        let first =
+            callable_values_payload(callable_values_field_projection(vec![CsmiProjectionStep {
+                kind: "field".to_owned(),
+                args: Some(json!({"symbol": "field"})),
+            }]));
+        let mut other_prose = first.clone();
+        if let CsmiCallableValuesPayload::CallbackInvocation { arguments, .. } = &mut other_prose
+            && let CsmiCallableValuesArgument::Unknown { limitation } = &mut arguments[0]
+        {
+            limitation.diagnostic.as_mut().unwrap().message = "different words".to_owned();
+            limitation.diagnostic.as_mut().unwrap().details = Some(json!({"different": true}));
+        }
+        assert_ne!(first, other_prose, "wire equality retains diagnostics");
+        assert_eq!(first.semantic_equivalence(&other_prose), Some(true));
+
+        let mut no_stable_code = first.clone();
+        if let CsmiCallableValuesPayload::CallbackInvocation { arguments, .. } = &mut no_stable_code
+            && let CsmiCallableValuesArgument::Unknown { limitation } = &mut arguments[0]
+        {
+            limitation.kind = "other".to_owned();
+            limitation.diagnostic.as_mut().unwrap().code = None;
+        }
+        assert_eq!(first.semantic_equivalence(&no_stable_code), None);
+
+        let invalid = [
+            CsmiProjection {
+                scheme: "csmi.other".to_owned(),
+                ..callable_values_field_projection(vec![CsmiProjectionStep {
+                    kind: "field".to_owned(),
+                    args: Some(json!({"symbol": "field"})),
+                }])
+            },
+            CsmiProjection {
+                scheme_version: "9.9.9".to_owned(),
+                ..callable_values_field_projection(vec![CsmiProjectionStep {
+                    kind: "field".to_owned(),
+                    args: Some(json!({"symbol": "field"})),
+                }])
+            },
+            callable_values_field_projection(Vec::new()),
+            callable_values_field_projection(vec![CsmiProjectionStep {
+                kind: "entry".to_owned(),
+                args: None,
+            }]),
+            callable_values_field_projection(
+                (0..17)
+                    .map(|_| CsmiProjectionStep {
+                        kind: "field".to_owned(),
+                        args: Some(json!({"symbol": "field"})),
+                    })
+                    .collect(),
+            ),
+        ];
+        for projection in invalid {
+            let mut payload = callable_values_payload(projection);
+            let original = payload.clone();
+            assert!(matches!(
+                payload.remap_symbols(|symbol| Ok::<_, ()>(format!("native:{symbol}"))),
+                Err(CsmiCallableValuesRemapError::UnsupportedProjection(_))
+            ));
+            assert_eq!(payload, original, "unsupported remap is atomic");
+        }
     }
 }

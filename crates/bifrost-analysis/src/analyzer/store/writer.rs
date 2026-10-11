@@ -38,12 +38,16 @@ pub(crate) mod attribution {
     pub(crate) static JOBS: AtomicU64 = AtomicU64::new(0);
 
     pub(crate) fn record_idle(elapsed: std::time::Duration) {
-        IDLE_NANOS.fetch_add(elapsed.as_nanos() as u64, Ordering::Relaxed);
+        record_elapsed(&IDLE_NANOS, elapsed);
     }
 
     pub(crate) fn record_job(elapsed: std::time::Duration) {
-        BUSY_NANOS.fetch_add(elapsed.as_nanos() as u64, Ordering::Relaxed);
+        record_elapsed(&BUSY_NANOS, elapsed);
         JOBS.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn record_elapsed(counter: &AtomicU64, elapsed: std::time::Duration) {
+        counter.fetch_add(elapsed.as_nanos() as u64, Ordering::Relaxed);
     }
 
     #[derive(Clone, Copy)]

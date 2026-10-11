@@ -7,7 +7,7 @@
 //! exact graph under its own bounds.
 
 use rusqlite::{OptionalExtension, TransactionBehavior, params};
-use sha2::{Digest, Sha256};
+use sha2::Sha256;
 use std::sync::LazyLock;
 
 use super::class_set_summaries::ClassSetSummaryDigest;
@@ -429,22 +429,19 @@ struct SurfaceDigest(Sha256);
 
 impl SurfaceDigest {
     fn new(domain: &[u8]) -> Self {
-        let mut hash = Self(Sha256::new());
-        hash.bytes(domain);
-        hash
+        Self(super::new_sha256_with_length_prefixed_domain(domain))
     }
     fn bytes(&mut self, value: &[u8]) {
-        self.0.update((value.len() as u64).to_le_bytes());
-        self.0.update(value);
+        super::update_sha256_with_length_prefix(&mut self.0, value);
     }
     fn text(&mut self, value: &str) {
-        self.bytes(value.as_bytes());
+        super::update_sha256_with_length_prefixed_text(&mut self.0, value);
     }
     fn tag(&mut self, value: u8) {
-        self.bytes(&[value]);
+        super::update_sha256_with_length_prefixed_byte(&mut self.0, value);
     }
     fn u64(&mut self, value: u64) {
-        self.bytes(&value.to_le_bytes());
+        super::update_sha256_with_length_prefixed_u64(&mut self.0, value);
     }
     fn status(&mut self, status: ClassSetProcedureSurfaceStatusRow) {
         let (label, capability) = status_columns(status);
@@ -464,7 +461,7 @@ impl SurfaceDigest {
         self.bytes(&identity.local_structure_digest);
     }
     fn finish(self) -> [u8; 32] {
-        self.0.finalize().into()
+        brokk_bifrost_core::analyzer::canonical_hash::finish_sha256(self.0)
     }
 }
 
@@ -665,22 +662,20 @@ fn surface_candidate(raw: RawSurface) -> Result<ClassSetProcedureSurfaceCandidat
     Ok(ClassSetProcedureSurfaceCandidateRow {
         surface_digest: digest(surface_digest, "surface digest")?,
         exact_provenance_digest: digest(exact_provenance, "exact provenance digest")?,
-        header: ClassSetProcedureSurfaceHeaderRow {
-            key: ClassSetProcedureSurfaceKey {
-                procedure_lineage: digest(lineage, "procedure lineage")?,
-                owner_rel_path: rel_path,
-                language: decode_language(&lang)?,
-                schema_version: schema,
-                local_structure_digest: digest(local_structure, "local structure digest")?,
-                behavior_read_digest: digest(behavior, "behavior read digest")?,
-            },
+        header: surface_header(SurfaceHeaderFields {
+            procedure_lineage: digest(lineage, "procedure lineage")?,
+            owner_rel_path: rel_path,
+            language: decode_language(&lang)?,
+            schema_version: schema,
+            local_structure_digest: local_structure,
+            behavior_read_digest: behavior,
             owner_blob_oid: blob_oid,
-            artifact_public_identity: digest(artifact_public, "artifact public identity")?,
-            artifact_content_identity: digest(artifact_content, "artifact content identity")?,
-            exact_behavior_digest: digest(exact_behavior, "exact behavior digest")?,
-            carrier_semantics_digest: digest(carrier_semantics, "carrier semantics digest")?,
-            direct_calls_digest: digest(direct_calls, "direct calls digest")?,
-        },
+            artifact_public_identity: artifact_public,
+            artifact_content_identity: artifact_content,
+            exact_behavior_digest: exact_behavior,
+            carrier_semantics_digest: carrier_semantics,
+            direct_calls_digest: direct_calls,
+        })?,
         call_count,
         binding_count,
         entered_count,
@@ -707,13 +702,10 @@ fn validate_surface_for_publication(
 }
 
 fn ensure_not_cancelled(cancellation: &CancellationToken) -> Result<()> {
-    if cancellation.is_cancelled() {
-        Err(StoreError::new(
-            "class-set procedure surface publication cancelled",
-        ))
-    } else {
-        Ok(())
-    }
+    super::ensure_store_not_cancelled(
+        cancellation,
+        "class-set procedure surface publication cancelled",
+    )
 }
 
 fn live_owner_blob_id(
@@ -721,16 +713,11 @@ fn live_owner_blob_id(
     surface: &ClassSetProcedureSurfaceRow,
 ) -> Result<i64> {
     let key = &surface.header.key;
-    conn.query_row(
-        &format!(
-            "SELECT meta.blob_id FROM blob_meta AS meta
-             JOIN blobs ON blobs.id=meta.blob_id
-             WHERE blobs.blob_oid=?1 AND blobs.lang=?2 AND {PARSED_BLOB_COMPLETE_CONDITION}"
-        ),
-        params![surface.header.owner_blob_oid, key.language.config_label()],
-        |row| row.get(0),
-    )
-    .optional()?
+    super::live_class_set_owner_blob_id(
+        conn,
+        &surface.header.owner_blob_oid,
+        key.language.config_label(),
+    )?
     .ok_or_else(|| StoreError::new("class-set procedure surface owner blob is absent"))
 }
 
@@ -738,23 +725,30 @@ fn load_surface_for_digest(
     conn: &rusqlite::Connection,
     digest: ClassSetSummaryDigest,
 ) -> Result<Option<ClassSetProcedureSurfaceRow>> {
-    let raw = load_raw_surface(
+    load_surface_for_sql(
         conn,
         CLASS_SET_PROCEDURE_SURFACE_DIGEST_SQL.as_str(),
-        params![digest.as_slice()],
-    )?;
-    raw.map(|raw| load_surface(conn, raw)).transpose()
+        digest,
+    )
 }
 
 fn load_physical_surface_for_digest(
     conn: &rusqlite::Connection,
     digest: ClassSetSummaryDigest,
 ) -> Result<Option<ClassSetProcedureSurfaceRow>> {
-    let raw = load_raw_surface(
+    load_surface_for_sql(
         conn,
         CLASS_SET_PROCEDURE_SURFACE_PHYSICAL_DIGEST_SQL.as_str(),
-        params![digest.as_slice()],
-    )?;
+        digest,
+    )
+}
+
+fn load_surface_for_sql(
+    conn: &rusqlite::Connection,
+    sql: &str,
+    digest: ClassSetSummaryDigest,
+) -> Result<Option<ClassSetProcedureSurfaceRow>> {
+    let raw = load_raw_surface(conn, sql, params![digest.as_slice()])?;
     raw.map(|raw| load_surface(conn, raw)).transpose()
 }
 
@@ -780,6 +774,52 @@ type RawSurface = (
     usize,
     usize,
 );
+
+struct SurfaceHeaderFields {
+    procedure_lineage: [u8; 32],
+    owner_rel_path: String,
+    language: Language,
+    schema_version: u32,
+    local_structure_digest: Vec<u8>,
+    behavior_read_digest: Vec<u8>,
+    owner_blob_oid: String,
+    artifact_public_identity: Vec<u8>,
+    artifact_content_identity: Vec<u8>,
+    exact_behavior_digest: Vec<u8>,
+    carrier_semantics_digest: Vec<u8>,
+    direct_calls_digest: Vec<u8>,
+}
+
+fn surface_header(fields: SurfaceHeaderFields) -> Result<ClassSetProcedureSurfaceHeaderRow> {
+    Ok(ClassSetProcedureSurfaceHeaderRow {
+        key: ClassSetProcedureSurfaceKey {
+            procedure_lineage: fields.procedure_lineage,
+            owner_rel_path: fields.owner_rel_path,
+            language: fields.language,
+            schema_version: fields.schema_version,
+            local_structure_digest: digest(
+                fields.local_structure_digest,
+                "local structure digest",
+            )?,
+            behavior_read_digest: digest(fields.behavior_read_digest, "behavior read digest")?,
+        },
+        owner_blob_oid: fields.owner_blob_oid,
+        artifact_public_identity: digest(
+            fields.artifact_public_identity,
+            "artifact public identity",
+        )?,
+        artifact_content_identity: digest(
+            fields.artifact_content_identity,
+            "artifact content identity",
+        )?,
+        exact_behavior_digest: digest(fields.exact_behavior_digest, "exact behavior digest")?,
+        carrier_semantics_digest: digest(
+            fields.carrier_semantics_digest,
+            "carrier semantics digest",
+        )?,
+        direct_calls_digest: digest(fields.direct_calls_digest, "direct calls digest")?,
+    })
+}
 
 fn load_raw_surface(
     conn: &rusqlite::Connection,
@@ -915,22 +955,20 @@ fn load_surface(
         ));
     }
     let row = ClassSetProcedureSurfaceRow::try_new(
-        ClassSetProcedureSurfaceHeaderRow {
-            key: ClassSetProcedureSurfaceKey {
-                procedure_lineage: digest(lineage, "procedure lineage")?,
-                owner_rel_path: rel_path,
-                language,
-                schema_version: schema,
-                local_structure_digest: digest(local_structure, "local structure digest")?,
-                behavior_read_digest: digest(behavior, "behavior read digest")?,
-            },
+        surface_header(SurfaceHeaderFields {
+            procedure_lineage: digest(lineage, "procedure lineage")?,
+            owner_rel_path: rel_path,
+            language,
+            schema_version: schema,
+            local_structure_digest: local_structure,
+            behavior_read_digest: behavior,
             owner_blob_oid: blob_oid,
-            artifact_public_identity: digest(artifact_public, "artifact public identity")?,
-            artifact_content_identity: digest(artifact_content, "artifact content identity")?,
-            exact_behavior_digest: digest(exact_behavior, "exact behavior digest")?,
-            carrier_semantics_digest: digest(carrier_semantics, "carrier semantics digest")?,
-            direct_calls_digest: digest(direct_calls, "direct calls digest")?,
-        },
+            artifact_public_identity: artifact_public,
+            artifact_content_identity: artifact_content,
+            exact_behavior_digest: exact_behavior,
+            carrier_semantics_digest: carrier_semantics,
+            direct_calls_digest: direct_calls,
+        })?,
         calls,
         lexical,
         reads,
@@ -1057,6 +1095,29 @@ fn load_bindings(
     Ok(grouped)
 }
 
+struct ProcedureIdentityLabels {
+    lineage: &'static str,
+    public_identity: &'static str,
+    content_identity: &'static str,
+    local_structure: &'static str,
+}
+
+type RawProcedureIdentity = (Vec<u8>, String, String, Vec<u8>, Vec<u8>, Vec<u8>);
+
+fn procedure_identity_row(
+    (lineage, rel_path, lang, public, content, local): RawProcedureIdentity,
+    labels: ProcedureIdentityLabels,
+) -> Result<ClassSetProcedureIdentityRow> {
+    Ok(ClassSetProcedureIdentityRow {
+        procedure_lineage: digest(lineage, labels.lineage)?,
+        rel_path,
+        language: decode_language(&lang)?,
+        artifact_public_identity: digest(public, labels.public_identity)?,
+        artifact_content_identity: digest(content, labels.content_identity)?,
+        local_structure_digest: digest(local, labels.local_structure)?,
+    })
+}
+
 fn load_entered(
     conn: &rusqlite::Connection,
     id: i64,
@@ -1089,14 +1150,15 @@ fn load_entered(
                 "class-set procedure surface entered ordinals are not dense",
             ));
         }
-        rows.push(ClassSetProcedureIdentityRow {
-            procedure_lineage: digest(lineage, "entered target lineage")?,
-            rel_path,
-            language: decode_language(&lang)?,
-            artifact_public_identity: digest(public, "entered target public identity")?,
-            artifact_content_identity: digest(content, "entered target content identity")?,
-            local_structure_digest: digest(local, "entered target local structure digest")?,
-        });
+        rows.push(procedure_identity_row(
+            (lineage, rel_path, lang, public, content, local),
+            ProcedureIdentityLabels {
+                lineage: "entered target lineage",
+                public_identity: "entered target public identity",
+                content_identity: "entered target content identity",
+                local_structure: "entered target local structure digest",
+            },
+        )?);
     }
     Ok(grouped)
 }
@@ -1126,14 +1188,15 @@ fn load_lexical_children(
                     "class-set procedure surface lexical ordinals are not dense",
                 ));
             }
-            Ok(ClassSetProcedureIdentityRow {
-                procedure_lineage: digest(lineage, "lexical child lineage")?,
-                rel_path,
-                language: decode_language(&lang)?,
-                artifact_public_identity: digest(public, "lexical child public identity")?,
-                artifact_content_identity: digest(content, "lexical child content identity")?,
-                local_structure_digest: digest(local, "lexical child local structure digest")?,
-            })
+            procedure_identity_row(
+                (lineage, rel_path, lang, public, content, local),
+                ProcedureIdentityLabels {
+                    lineage: "lexical child lineage",
+                    public_identity: "lexical child public identity",
+                    content_identity: "lexical child content identity",
+                    local_structure: "lexical child local structure digest",
+                },
+            )
         })
         .collect()
 }
@@ -1439,16 +1502,15 @@ fn decode_coverage(value: &str) -> Result<CandidateCoverage> {
 }
 
 fn decode_language(label: &str) -> Result<Language> {
-    Language::from_config_label(label)
-        .filter(|language| language.config_label() == label && *language != Language::None)
+    super::canonical_language_label(label)
+        .filter(|language| *language != Language::None)
         .ok_or_else(|| StoreError::new("class-set procedure surface language is corrupt"))
 }
 
 fn digest(bytes: Vec<u8>, field: &str) -> Result<[u8; 32]> {
-    bytes.try_into().map_err(|bytes: Vec<u8>| {
+    super::checked_fixed_digest(bytes).map_err(|length| {
         StoreError::new(format!(
-            "class-set procedure surface {field} has {} bytes",
-            bytes.len()
+            "class-set procedure surface {field} has {length} bytes"
         ))
     })
 }
@@ -1460,7 +1522,11 @@ mod tests {
     use super::*;
     use crate::analyzer::read_ledger::ProcedureCallSiteLocator;
     use crate::analyzer::semantic::ids::StableDigest;
-    use crate::analyzer::store::planner_statistics::tests::{explain_pin, pinned};
+    use crate::analyzer::store::planner_statistics::tests::assert_pinned_query_uses_index;
+    use crate::analyzer::store::test_adapters::{
+        ephemeral_store_with_complete_python_blob, insert_complete_python_blob,
+        stored_blob_cascade_costs,
+    };
     use brokk_bifrost_core::cache_gc::PlannerStatisticsState;
 
     const BLOB_A: &str = "1111111111111111111111111111111111111111";
@@ -1470,44 +1536,12 @@ mod tests {
         [value; 32]
     }
 
-    fn insert_complete_blob(store: &AnalyzerStore, oid: &str, generation: i64) {
-        let conn = store.conn.lock().unwrap();
-        conn.execute(
-            "INSERT INTO blobs(blob_oid,lang,generation) VALUES(?1,'python',?2)",
-            params![oid, generation],
-        )
-        .unwrap();
-        conn.execute(
-            "INSERT INTO blob_meta(
-               blob_id,lang,contains_tests,content_package,stored_unit_count,range_count,
-               signature_count,signature_metadata_count,supertype_count,child_count,
-               import_statement_count,type_identifier_count,is_complete)
-             SELECT id,lang,0,'',0,0,0,0,0,0,0,0,1 FROM blobs WHERE blob_oid=?1",
-            params![oid],
-        )
-        .unwrap();
-        conn.execute(
-            "INSERT INTO blob_payload_costs(blob_id,payload_bytes)
-             SELECT id,0 FROM blobs WHERE blob_oid=?1",
-            params![oid],
-        )
-        .unwrap();
-    }
-
     fn store() -> AnalyzerStore {
-        let store = AnalyzerStore::open_ephemeral().unwrap();
-        insert_complete_blob(&store, BLOB_A, 0);
-        store
+        ephemeral_store_with_complete_python_blob(BLOB_A, 0)
     }
 
     fn cascade_rows(store: &AnalyzerStore, oid: &str) -> usize {
-        let conn = store.conn.lock().unwrap();
-        conn.query_row(
-            &super::super::stored_blob_cascade_costs_sql(1),
-            params![oid, "python"],
-            |row| row.get(3),
-        )
-        .unwrap()
+        stored_blob_cascade_costs(store, oid).0
     }
 
     fn identity(lineage: u8, public: u8, content: u8, local: u8) -> ClassSetProcedureIdentityRow {
@@ -1633,7 +1667,7 @@ mod tests {
         store
             .publish_class_set_procedure_surface(original.clone(), &CancellationToken::new())
             .unwrap();
-        insert_complete_blob(&store, BLOB_B, 1);
+        insert_complete_python_blob(&store, BLOB_B, 1);
         store
             .conn
             .lock()
@@ -1937,15 +1971,7 @@ mod tests {
                 ),
                 ("class_set_procedure_surface_reads", "PRIMARY KEY"),
             ] {
-                let plan = explain_pin(&conn, &pinned(name));
-                assert!(
-                    plan.iter().any(|detail| detail.contains(expected)),
-                    "{state} {name}: {plan:#?}"
-                );
-                assert!(
-                    plan.iter().all(|detail| !detail.contains("AUTOMATIC")),
-                    "{state} {name}: {plan:#?}"
-                );
+                assert_pinned_query_uses_index(&conn, state, name, expected, &["AUTOMATIC"]);
             }
         }
     }

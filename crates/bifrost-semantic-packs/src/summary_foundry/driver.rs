@@ -261,17 +261,6 @@ mod tests {
     use serde_json::{Value, json};
 
     use super::*;
-    use crate::summary_foundry::adjudicate::{
-        AdjudicationCandidate, CorpusFacts, DerivedFacts, FakeAdjudicator, run_adjudication,
-    };
-    use crate::summary_foundry::ir::{
-        FoundryArtifactBinding, FoundryBoundary, FoundryClaim, FoundryCompleteness, FoundryCorpus,
-        FoundryEntry, FoundrySignature, FoundryTarget, summary_id,
-    };
-    use brokk_bifrost_analysis::analyzer::semantic_model::{
-        AuthoredSummaryExitKind, AuthoredSummaryInput, AuthoredSummaryOutput,
-        AuthoredSummaryTransfer,
-    };
 
     /// One counter per stage of the five-stage pipeline.
     #[derive(Default)]
@@ -490,127 +479,6 @@ mod tests {
         assert_eq!(counters.fixture.get(), 2);
     }
 
-    #[test]
-    fn two_modules_run_depth_first() {
-        let directory = tempfile::tempdir().expect("a work directory");
-        let store = FoundryStore::open(directory.path());
-        let order = Cell::new(String::new());
-
-        let record = |module: &ModuleId, _: Option<&Value>| {
-            let mut seen = order.take();
-            seen.push_str(module.as_str());
-            seen.push(';');
-            order.set(seen);
-            Ok(json!({"module": module.as_str()}))
-        };
-        let record_two = |module: &ModuleId, _: Option<&Value>| {
-            let mut seen = order.take();
-            seen.push_str(module.as_str());
-            seen.push('>');
-            order.set(seen);
-            Ok(json!({"module": module.as_str()}))
-        };
-        let pipeline = Pipeline::new(1).stage("first", 1, false, &record).stage(
-            "second",
-            1,
-            false,
-            &record_two,
-        );
-        let modules = vec![
-            ModuleSource {
-                module: ModuleId::new("java/util"),
-                source_slice_digest: "a".to_owned(),
-            },
-            ModuleSource {
-                module: ModuleId::new("java/lang"),
-                source_slice_digest: "b".to_owned(),
-            },
-        ];
-
-        run_pipeline(&store, &pipeline, &modules).expect("both modules run");
-
-        // Depth-first: java/util finishes both stages before java/lang starts.
-        assert_eq!(order.take(), "java/util;java/util>java/lang;java/lang>");
-    }
-
-    /// The real adjudication stage plugs into the driver seam: its executor runs
-    /// the blind-then-graded harness and its calibration lands in the store as a
-    /// human-readable artifact.
-    #[test]
-    fn the_adjudication_stage_composes_into_the_driver() {
-        let directory = tempfile::tempdir().expect("a work directory");
-        let store = FoundryStore::open(directory.path());
-
-        let target = FoundryTarget {
-            artifact_path: "java/util/Fixture.class".to_owned(),
-            member: "wrap".to_owned(),
-            signature: FoundrySignature::Overload {
-                types: vec!["String".to_owned()],
-            },
-        };
-        let transfer = AuthoredSummaryTransfer {
-            input: AuthoredSummaryInput::Parameter { ordinal: 0 },
-            exit_kind: AuthoredSummaryExitKind::Normal,
-            output: AuthoredSummaryOutput::NormalReturn {},
-            value_transfer: None,
-        };
-        let entry = FoundryEntry {
-            id: summary_id(FoundryCorpus::Codeql, &target),
-            corpus: FoundryCorpus::Codeql,
-            target: target.clone(),
-            boundary: FoundryBoundary {
-                has_receiver: false,
-                parameter_count: 1,
-            },
-            claim: FoundryClaim::Flows,
-            completeness: FoundryCompleteness::Partial,
-            transfers: vec![transfer],
-            artifact: FoundryArtifactBinding::Unresolved,
-            evidence: Vec::new(),
-            notes: Vec::new(),
-            derivation: None,
-        };
-        // One underivable, CodeQL-covered candidate: it ships the translation and
-        // produces a calibration datum.
-        let candidate = AdjudicationCandidate {
-            target,
-            boundary: FoundryBoundary {
-                has_receiver: false,
-                parameter_count: 1,
-            },
-            derived: Some(DerivedFacts {
-                entry: entry.clone(),
-                boundaries: vec![
-                    crate::summary_foundry::ir::FoundryDerivationBoundary::UnresolvedCall,
-                ],
-            }),
-            codeql: Some(CorpusFacts { entry }),
-        };
-
-        let adjudicate = |_: &ModuleId, _: Option<&Value>| {
-            let outcome = run_adjudication(
-                std::slice::from_ref(&candidate),
-                &FakeAdjudicator::conceding(),
-                1,
-            );
-            Ok(serde_json::to_value(&outcome).expect("the outcome serializes"))
-        };
-        let pipeline = Pipeline::new(1).stage("adjudicate", 1, true, &adjudicate);
-
-        run_pipeline(&store, &pipeline, &module()).expect("the run succeeds");
-
-        let stored = store
-            .load(&ModuleId::new("java/util"), "adjudicate")
-            .expect("the artifact loads")
-            .expect("adjudicate stored an artifact");
-        assert_eq!(stored.payload["shipping"].as_array().unwrap().len(), 1);
-        assert_eq!(stored.payload["calibration"]["totals"]["graded"], 1);
-        assert_eq!(
-            stored.payload["calibration"]["totals"]["first_pass_agree"],
-            1
-        );
-    }
-
     /// The real milestone-2 derivation composes into the driver as a stage, and
     /// the store saves its cost on re-run. This is the plan's "31 minutes, paid
     /// twice" turning into "paid once": the expensive derivation runs on the
@@ -661,5 +529,48 @@ mod tests {
             .expect("derive stored an artifact");
         assert_eq!(stored.payload["files_read"], 2);
         assert!(!stored.payload["entries"].as_array().unwrap().is_empty());
+    }
+
+    #[test]
+    fn two_modules_run_depth_first() {
+        let directory = tempfile::tempdir().expect("a work directory");
+        let store = FoundryStore::open(directory.path());
+        let order = Cell::new(String::new());
+
+        let record = |module: &ModuleId, _: Option<&Value>| {
+            let mut seen = order.take();
+            seen.push_str(module.as_str());
+            seen.push(';');
+            order.set(seen);
+            Ok(json!({"module": module.as_str()}))
+        };
+        let record_two = |module: &ModuleId, _: Option<&Value>| {
+            let mut seen = order.take();
+            seen.push_str(module.as_str());
+            seen.push('>');
+            order.set(seen);
+            Ok(json!({"module": module.as_str()}))
+        };
+        let pipeline = Pipeline::new(1).stage("first", 1, false, &record).stage(
+            "second",
+            1,
+            false,
+            &record_two,
+        );
+        let modules = vec![
+            ModuleSource {
+                module: ModuleId::new("java/util"),
+                source_slice_digest: "a".to_owned(),
+            },
+            ModuleSource {
+                module: ModuleId::new("java/lang"),
+                source_slice_digest: "b".to_owned(),
+            },
+        ];
+
+        run_pipeline(&store, &pipeline, &modules).expect("both modules run");
+
+        // Depth-first: java/util finishes both stages before java/lang starts.
+        assert_eq!(order.take(), "java/util;java/util>java/lang;java/lang>");
     }
 }

@@ -7,7 +7,7 @@
 //! server identity, the tool registry, workspace authorization, the Codex
 //! sandbox boundary, analyzer admission, and response budgets.
 //!
-//! See `.agents/plans/issue-1328-rmcp-3-adoption.md` for the migration plan.
+//! The `rmcp` adoption is tracked by #1328.
 
 use crate::analyzer_pool::{
     ANALYZER_POOL_CAPACITY, Admission, AnalyzerExecutionPool, AnalyzerPermit,
@@ -21,7 +21,7 @@ use crate::mcp_common::{
     analyzer_stop_deadline, attach_run_policy_correlation, attach_run_policy_correlation_result,
     client_root_to_path, file_uri_to_path, file_watching_enabled,
     fit_get_summaries_output_to_budget, request_correlation_id, serial_tool_request,
-    usage_scan_soft_deadline,
+    usage_scan_soft_deadline, validate_mcp_analyzer_request_budget_env,
 };
 use crate::ordered_transport::{
     OutboundResponseTimings, ResponseTimingTransport, RootsOrderedTransport, RootsRevocations,
@@ -49,11 +49,10 @@ use rmcp::task_manager::{TaskContext, TaskExit, TaskManager, TaskOptions};
 // replacement for "which directory may this server analyze". Bifrost's whole
 // security model depends on that answer, and every client Bifrost is
 // configured against still speaks Roots, so the deprecated surface is used
-// deliberately until SEP-2577's successor exists. See the Decision Log in
-// .agents/plans/issue-1328-rmcp-3-adoption.md.
+// deliberately until SEP-2577's successor exists (#1328).
 #[allow(deprecated)]
 use rmcp::model::Root;
-use rmcp::service::{NotificationContext, RequestContext};
+use rmcp::service::{NotificationContext, QuitReason, RequestContext};
 use rmcp::transport::IntoTransport;
 use rmcp::{RoleServer, ServerHandler, ServiceExt};
 use serde_json::{Value, json};
@@ -669,14 +668,13 @@ impl RootsActivations {
 /// Per-request progress reporting through `notifications/progress`, active
 /// only when the caller supplied a `progressToken`.
 ///
-/// Truthful and low volume by construction: one notification per phase the
+/// Phase reporting sends one notification per phase the
 /// call actually enters -- workspace readiness, analyzer admission, tool
 /// execution, every phase the analyzer itself enters while it runs (issue
 /// #3170), and cooperative cancellation when the request budget expires.
 /// The progress value is a per-request monotonic counter and `total` is never
-/// set, because no phase has a known item count to report: the analyzer
-/// exposes no per-item counters at this boundary, and inventing percentages
-/// is exactly what the progress pattern warns against. A phase notification
+/// set, because these values are ordinals, not item counts. Measured build
+/// counters live separately in `_meta["io.bifrost/workspace-build"]`. A phase notification
 /// says "this call entered this phase", nothing more; a wait that turns out
 /// to be zero-length was still entered.
 ///
@@ -687,33 +685,107 @@ struct ProgressReporter {
     peer: rmcp::service::Peer<RoleServer>,
     token: rmcp::model::ProgressToken,
     steps: AtomicU64,
+    request_id: Value,
+    workspace_generation: u64,
+    last_build_revision: Mutex<Option<(u64, u64)>>,
+    minimum_build_generation: u64,
+    task_id: Option<String>,
 }
 
 impl ProgressReporter {
     /// A reporter for this request, or `None` when the caller did not opt in.
     /// The token is carried through to every notification exactly as
     /// received, string or number.
-    fn from_request(context: &RequestContext<RoleServer>) -> Option<Self> {
+    fn from_request(
+        context: &RequestContext<RoleServer>,
+        service: &SearchToolsService,
+        tool_name: &str,
+        workspace_generation: u64,
+    ) -> Option<Self> {
         Some(Self {
             peer: context.peer.clone(),
             token: context.meta.get_progress_token()?,
             steps: AtomicU64::new(0),
+            request_id: json!(context.id),
+            workspace_generation,
+            // A warm refresh observes only the build it starts. Replaying the
+            // previous cold parse counters could imply cached files were parsed
+            // again. An uninstalled startup build still belongs to this wait,
+            // even when it finished before the first request arrived.
+            minimum_build_generation: if tool_name == "refresh"
+                && !service.initial_workspace_build_uninstalled()
+            {
+                service
+                    .workspace_build_progress(workspace_generation)
+                    .map_or(0, |snapshot| snapshot.generation + 1)
+            } else {
+                0
+            },
+            last_build_revision: Mutex::new(None),
+            task_id: None,
         })
     }
 
     async fn phase(&self, message: impl Into<String>) {
         let step = self.steps.fetch_add(1, Ordering::Relaxed) + 1;
-        if let Err(error) = self
-            .peer
-            .notify_progress(
-                rmcp::model::ProgressNotificationParam::new(self.token.clone(), step as f64)
-                    .with_message(message),
-            )
+        self.send(
+            rmcp::model::ProgressNotificationParam::new(self.token.clone(), step as f64)
+                .with_message(message),
+        )
+        .await;
+    }
+
+    async fn send(&self, params: rmcp::model::ProgressNotificationParam) {
+        // A slow/disconnected client loses observations, never analyzer capacity
+        // or prompt cancellation. There is at most one send per request.
+        match tokio::time::timeout(Duration::from_millis(25), self.peer.notify_progress(params))
             .await
         {
-            // A client that stops reading loses progress, not its tool result.
-            eprintln!("bifrost: failed to send MCP progress notification: {error}");
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
+                eprintln!("bifrost: failed to send MCP progress notification: {error}")
+            }
+            Err(_slow_client) => {}
         }
+    }
+
+    async fn workspace(&self, service: &SearchToolsService, request_status: Option<&str>) {
+        if service.workspace_generation() != self.workspace_generation {
+            return;
+        }
+        let Some(snapshot) = service.workspace_build_progress(self.workspace_generation) else {
+            return;
+        };
+        if snapshot.generation < self.minimum_build_generation {
+            return;
+        }
+        let revision = (snapshot.generation, snapshot.revision);
+        {
+            let mut last = self
+                .last_build_revision
+                .lock()
+                .expect("progress revision lock poisoned");
+            if *last == Some(revision) && request_status.is_none() {
+                return;
+            }
+            *last = Some(revision);
+        }
+        let step = self.steps.fetch_add(1, Ordering::Relaxed) + 1;
+        let mut params =
+            rmcp::model::ProgressNotificationParam::new(self.token.clone(), step as f64)
+                .with_message("workspace indexing");
+        let mut measured = json!(snapshot);
+        measured["request_id"] = self.request_id.clone();
+        if let Some(task_id) = &self.task_id {
+            measured["task_id"] = json!(task_id);
+        }
+        if let Some(status) = request_status {
+            measured["request_status"] = json!(status);
+        }
+        params.meta = Some(rmcp::model::NotificationMetaObject::from(
+            serde_json::Map::from_iter([("io.bifrost/workspace-build".to_owned(), measured)]),
+        ));
+        self.send(params).await;
     }
 }
 
@@ -1371,7 +1443,7 @@ impl BifrostMcpHandler {
         // the select loop below -- this request's own task -- reports it
         // (issue #3170). The receiver and this sender both live as long as that
         // loop, so `recv` cannot return `None` while the call is running.
-        let (phase_tx, mut phase_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+        let (phase_tx, mut phase_rx) = tokio::sync::mpsc::channel::<String>(32);
         let bifrost_cancellation = match progress {
             Some(_) => {
                 let phases = phase_tx.clone();
@@ -1381,9 +1453,9 @@ impl BifrostMcpHandler {
                     // already answered: a phase entered while the cancelled
                     // work unwinds has nobody left to report it to, and must
                     // not be reported after the answer anyway.
-                    match phases.send(phase.to_string()) {
+                    match phases.try_send(phase.to_string()) {
                         Ok(()) => {}
-                        Err(_after_the_answer) => {}
+                        Err(_coalesced_or_after_the_answer) => {}
                     }
                 })
             }
@@ -1403,6 +1475,7 @@ impl BifrostMcpHandler {
         // the timeout below names it instead of the tool (issue #3170).
         let _execution_phase = bifrost_cancellation.enter_phase(format!("executing {name}"));
 
+        let request_cancelled = mcp_cancellation.clone();
         let bridge_token = bifrost_cancellation.clone();
         let request_finished = McpCancellationToken::new();
         let bridge_guard = request_finished.clone().drop_guard();
@@ -1430,6 +1503,10 @@ impl BifrostMcpHandler {
             let _in_flight = in_flight;
             let _bridge_guard = bridge_guard;
             let _execution_scope = profiling::scope(execution_label);
+            // Per-statement request histograms (BIFROST_SQL_PROFILE); the
+            // request-local table is written beside the SQL profile file.
+            let _sql_scope =
+                brokk_bifrost_analysis::cache_db::sql_profile::request_scope(&execution_name);
             // The reader seam's per-request boundary (BIFROST_SEAM_PROFILE).
             // It is a no-op unless that variable names an output file.
             let _seam_scope = brokk_bifrost_analysis::seam_profile::request_scope(&execution_name);
@@ -1467,6 +1544,8 @@ impl BifrostMcpHandler {
                 output
             })
         });
+        let mut build_ticks = tokio::time::interval(Duration::from_millis(100));
+        build_ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let output = loop {
             tokio::select! {
                 // Phases first, and not at random: a phase already published
@@ -1476,15 +1555,28 @@ impl BifrostMcpHandler {
                 // keeps them ordered with the request's other phase
                 // notifications and stops any of them following the answer.
                 biased;
+                () = request_cancelled.cancelled() => {
+                    bifrost_cancellation.cancel();
+                    if let Some(progress) = progress { progress.workspace(&service, Some("cancelled")).await; }
+                    return Err(ErrorData::internal_error("the tool call was cancelled", None));
+                }
                 Some(phase) = phase_rx.recv() => {
                     progress
                         .expect("the phase sink is installed only when the caller opted into progress")
                         .phase(phase)
                         .await;
                 }
-                output = &mut output => break output.map_err(|error| {
+                _ = build_ticks.tick(), if progress.is_some() => {
+                    progress.unwrap().workspace(&service, None).await;
+                }
+                output = &mut output => {
+                    if let Some(progress) = progress { progress.workspace(&service, if bifrost_cancellation.is_cancelled() { Some("cancelled") }
+                        else if matches!(&output, Err(_) | Ok(Err(_))) { Some("failed") }
+                        else { None }).await; }
+                    break output.map_err(|error| {
                     ErrorData::internal_error(format!("MCP tool execution panicked: {error}"), None)
-                })?,
+                })?;
+                },
                 () = async {
                     match request_budget {
                         Some(request_budget) => tokio::time::sleep_until(
@@ -1500,6 +1592,7 @@ impl BifrostMcpHandler {
                     // error response, and never again after it -- the loop
                     // that forwards the analyzer's phases ends here.
                     if let Some(progress) = progress {
+                        progress.workspace(&service, Some("cancelled")).await;
                         progress.phase(format!("cancelling {name}")).await;
                     }
                     // The budget this request was accepted under, not a second
@@ -1554,6 +1647,7 @@ impl BifrostMcpHandler {
         suppression_preflight: Option<PreparedRunPolicyPreflight>,
         workspace_scope: WorkspaceRequestScope,
         request_correlation_id: Option<String>,
+        progress: Option<ProgressReporter>,
     ) -> Result<CallToolResponse, ErrorData> {
         // Bounded storage: tie the number of live tasks to the analyzer
         // backlog allowance rather than inventing a second knob. The task
@@ -1597,6 +1691,7 @@ impl BifrostMcpHandler {
                     ttl,
                     request_correlation_id,
                     task_context,
+                    progress,
                 ))
             },
         );
@@ -1749,7 +1844,11 @@ async fn run_tool_as_task(
     ttl: Duration,
     request_correlation_id: Option<String>,
     task_context: TaskContext,
+    mut progress: Option<ProgressReporter>,
 ) -> Result<CallToolResult, TaskExit> {
+    if let Some(progress) = &mut progress {
+        progress.task_id = Some(task_context.task_id().to_owned());
+    }
     let deadline = Instant::now() + ttl;
     let cancellation = crate::CancellationToken::default().with_deadline(deadline);
 
@@ -1779,18 +1878,38 @@ async fn run_tool_as_task(
     task_context.set_status_message(format!("{name}: waiting for workspace readiness"));
     let readiness_service = Arc::clone(&service);
     let readiness_cancellation = cancellation.clone();
-    tokio::task::spawn_blocking(move || {
+    let mut readiness = tokio::task::spawn_blocking(move || {
         readiness_service
             .wait_workspace_ready_until(&|| readiness_cancellation.is_cancelled(), Some(deadline))
-    })
-    .await
-    .map_err(|error| {
-        TaskExit::Error(ErrorData::internal_error(
-            format!("task readiness wait panicked: {error}"),
-            None,
-        ))
-    })?
-    .map_err(|error| task_exit(&task_context, map_service_error(error.code, error.message)))?;
+    });
+    let mut build_ticks = tokio::time::interval(Duration::from_millis(100));
+    build_ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let ready = loop {
+        tokio::select! {
+            result = &mut readiness => break result.map_err(|error| {
+                TaskExit::Error(ErrorData::internal_error(format!("task readiness wait panicked: {error}"), None))
+            })?,
+            _ = build_ticks.tick(), if progress.is_some() => {
+                progress.as_ref().unwrap().workspace(&service, None).await;
+            }
+        }
+    };
+    if let Some(progress) = &progress {
+        progress
+            .workspace(
+                &service,
+                ready.as_ref().err().map(|_| {
+                    if cancellation.is_cancelled() {
+                        "cancelled"
+                    } else {
+                        "failed"
+                    }
+                }),
+            )
+            .await;
+    }
+    ready
+        .map_err(|error| task_exit(&task_context, map_service_error(error.code, error.message)))?;
 
     task_context.set_status_message(format!("{name}: waiting for analyzer admission"));
     let admission = tokio::time::timeout(
@@ -1834,6 +1953,8 @@ async fn run_tool_as_task(
         let _permit = permit;
         let _in_flight = in_flight_guard;
         let _finished_guard = finished_guard;
+        let _sql_scope =
+            brokk_bifrost_analysis::cache_db::sql_profile::request_scope(&execution_name);
         // The reader seam's per-request boundary, as in `execute_tool`.
         let _seam_scope = brokk_bifrost_analysis::seam_profile::request_scope(&execution_name);
         let _seed_key_scope = brokk_bifrost_analysis::seed_key_profile::call_scope(&execution_name);
@@ -1969,9 +2090,7 @@ fn map_service_error(code: SearchToolsServiceErrorCode, message: String) -> Erro
 /// legacy peer but not the cache hints, so emitting those unconditionally
 /// would put fields on the wire that a `2025-11-25` client has no schema for.
 fn speaks_2026_07_28(context: &RequestContext<RoleServer>) -> bool {
-    context
-        .protocol_version()
-        .is_some_and(|version| version >= rmcp::model::ProtocolVersion::V_2026_07_28)
+    speaks_at_least(context, rmcp::model::ProtocolVersion::V_2026_07_28)
 }
 
 /// Whether this request's peer negotiated MCP `2025-06-18` or newer.
@@ -1981,9 +2100,16 @@ fn speaks_2026_07_28(context: &RequestContext<RoleServer>) -> bool {
 /// reads the request's own `_meta` first and falls back to the connection
 /// handshake, which is the same combination the cache hints use.
 fn speaks_2025_06_18(context: &RequestContext<RoleServer>) -> bool {
+    speaks_at_least(context, rmcp::model::ProtocolVersion::V_2025_06_18)
+}
+
+fn speaks_at_least(
+    context: &RequestContext<RoleServer>,
+    minimum: rmcp::model::ProtocolVersion,
+) -> bool {
     context
         .protocol_version()
-        .is_some_and(|version| version >= rmcp::model::ProtocolVersion::V_2025_06_18)
+        .is_some_and(|version| version >= minimum)
 }
 
 /// Whether this request negotiated protocol version and capabilities on its
@@ -2366,6 +2492,14 @@ impl ServerHandler for BifrostMcpHandler {
         // calls.
         let _serial_guard = serial.then_some(state).flatten();
 
+        let progress = ProgressReporter::from_request(
+            &context,
+            &service,
+            &name,
+            workspace_scope
+                .map_or_else(|| service.workspace_generation(), |scope| scope.generation),
+        );
+
         // Durable task execution (SEP-2663) for eligible batch tools. The
         // decision is server-directed and deterministic: a capable
         // `2026-07-28` request calling an eligible tool gets a task handle,
@@ -2389,14 +2523,14 @@ impl ServerHandler for BifrostMcpHandler {
                 run_policy_preflight,
                 workspace_scope,
                 correlation_id,
+                progress,
             );
         }
 
         // Progress is opt-in per request: no `progressToken`, no reporter, no
-        // notifications, no overhead. Workspace-activation rounds returned
+        // notifications. Workspace-activation rounds returned
         // above never report progress -- they are answers, not phases of an
         // executing call.
-        let progress = ProgressReporter::from_request(&context);
 
         let accepted_at = Instant::now();
         let cold_workspace = service.workspace_build_pending();
@@ -2408,22 +2542,41 @@ impl ServerHandler for BifrostMcpHandler {
         // `BIFROST_MCP_REQUEST_BUDGET_SECS` set.
         let request_budget = RequestBudget::resolve(&name, cold_workspace, accepted_at);
         let deadline = request_budget.map(|request_budget| request_budget.deadline());
-        if !serial {
+        if !serial || name == "refresh" {
             if let Some(progress) = &progress {
                 progress.phase("waiting for workspace readiness").await;
             }
-            let service = Arc::clone(&service);
+            let readiness_service = Arc::clone(&service);
             let ct = context.ct.clone();
-            let readiness = tokio::task::spawn_blocking(move || {
-                service.wait_workspace_ready_until(&|| ct.is_cancelled(), deadline)
-            })
-            .await
-            .map_err(|error| {
-                ErrorData::internal_error(
-                    format!("workspace readiness wait panicked: {error}"),
-                    None,
-                )
-            })?;
+            let mut readiness = tokio::task::spawn_blocking(move || {
+                readiness_service.wait_workspace_ready_until(&|| ct.is_cancelled(), deadline)
+            });
+            let mut ticks = tokio::time::interval(Duration::from_millis(100));
+            ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            let readiness = loop {
+                tokio::select! {
+                    result = &mut readiness => break result.map_err(|error| {
+                        ErrorData::internal_error(format!("workspace readiness wait panicked: {error}"), None)
+                    })?,
+                    _ = ticks.tick(), if progress.is_some() => {
+                        progress.as_ref().unwrap().workspace(&service, None).await;
+                    }
+                }
+            };
+            if let Some(progress) = &progress {
+                progress
+                    .workspace(
+                        &service,
+                        readiness.as_ref().err().map(|_| {
+                            if context.ct.is_cancelled() {
+                                "cancelled"
+                            } else {
+                                "failed"
+                            }
+                        }),
+                    )
+                    .await;
+            }
             if cold_workspace && readiness.is_err() {
                 profiling::duration("mcp_cold.first_tool_execution", std::time::Duration::ZERO);
             }
@@ -2443,8 +2596,26 @@ impl ServerHandler for BifrostMcpHandler {
             if let Some(progress) = &progress {
                 progress.phase("waiting for analyzer admission").await;
             }
-            await_analyzer_admission(&self.analyzer_pool, request_budget, &name, &context.ct)
-                .await?
+            match await_analyzer_admission(&self.analyzer_pool, request_budget, &name, &context.ct)
+                .await
+            {
+                Ok(permit) => permit,
+                Err(error) => {
+                    if let Some(progress) = &progress {
+                        progress
+                            .workspace(
+                                &service,
+                                Some(if context.ct.is_cancelled() {
+                                    "cancelled"
+                                } else {
+                                    "failed"
+                                }),
+                            )
+                            .await;
+                    }
+                    return Err(error);
+                }
+            }
         };
         let analyzer_admission_wait = admission_started_at.elapsed();
         let queue_wait = accepted_at.elapsed();
@@ -2605,6 +2776,14 @@ fn install_protocol_diagnostics(level: Option<&OsStr>) -> Result<(), String> {
         .map_err(|error| format!("Failed to install MCP diagnostics: {error}"))
 }
 
+/// Reads the startup environment shared by both stdio entry points. Every value
+/// is checked here, before any request, so a bad one exits 1 at launch.
+fn stdio_file_watching_enabled() -> Result<bool, String> {
+    install_protocol_diagnostics(std::env::var_os(MCP_LOG_LEVEL_ENV).as_deref())?;
+    validate_mcp_analyzer_request_budget_env()?;
+    file_watching_enabled(std::env::var_os(MCP_FILE_WATCHER_ENV).as_deref())
+}
+
 /// Serve MCP over this process's standard input and output until the client
 /// disconnects.
 ///
@@ -2620,10 +2799,8 @@ pub fn run_stdio_server_with_build_identity(
     // Explicit roots build in the background. Rootless servers answer
     // initialize without touching process cwd and bind only from a
     // client-provided workspace.
-    install_protocol_diagnostics(std::env::var_os(MCP_LOG_LEVEL_ENV).as_deref())?;
-
     let accepts_client_roots = root.is_none();
-    let watch_files = file_watching_enabled(std::env::var_os(MCP_FILE_WATCHER_ENV).as_deref())?;
+    let watch_files = stdio_file_watching_enabled()?;
     let service = match (root, watch_files) {
         (Some(root), true) => SearchToolsService::new_deferred(root)?,
         (Some(root), false) => SearchToolsService::new_deferred_manual(root)?,
@@ -2652,8 +2829,7 @@ pub fn run_named_workspace_stdio_server_with_build_identity(
     spec: &McpServerSpec,
     build_identity: &str,
 ) -> Result<(), String> {
-    install_protocol_diagnostics(std::env::var_os(MCP_LOG_LEVEL_ENV).as_deref())?;
-    let watch_files = file_watching_enabled(std::env::var_os(MCP_FILE_WATCHER_ENV).as_deref())?;
+    let watch_files = stdio_file_watching_enabled()?;
     let router = Arc::new(NamedWorkspaceRouter::new(workspaces, watch_files)?);
     let service = router.primary_service();
     run_stdio_server_impl(
@@ -2705,7 +2881,12 @@ fn run_stdio_server_impl(
         .build()
         .map_err(|error| format!("Failed to start the MCP runtime: {error}"))?;
 
-    let result = runtime.block_on(async move {
+    // rmcp handles a stateless session's first request inside `serve`, before
+    // it spawns the ordinary request loop. Poll the whole lifecycle on the
+    // runtime so cold requests use the same executor as subsequent requests;
+    // polling bootstrap on the Windows process main stack overflowed on a
+    // first task-capable run_policy call (#4488).
+    let session = runtime.spawn(async move {
         let running = handler
             .serve(RootsOrderedTransport::new(
                 ResponseTimingTransport::new(
@@ -2716,12 +2897,20 @@ fn run_stdio_server_impl(
             ))
             .await
             .map_err(|error| format!("MCP initialization failed: {error}"))?;
-        running
+        let reason = running
             .waiting()
             .await
-            .map(|_| ())
-            .map_err(|error| format!("MCP session ended abnormally: {error}"))
+            .map_err(|error| format!("MCP session ended abnormally: {error}"))?;
+        match reason {
+            QuitReason::Closed | QuitReason::Cancelled => Ok(()),
+            QuitReason::JoinError(error) => Err(format!("MCP send task failed: {error}")),
+            reason => Err(format!("MCP session ended unexpectedly: {reason:?}")),
+        }
     });
+    let result = runtime
+        .block_on(session)
+        .map_err(|error| format!("MCP session task failed: {error}"))
+        .and_then(|result| result);
     // Never drop the runtime implicitly. `tokio::io::stdin` reads on a blocking
     // thread that cannot be cancelled, and rmcp's serve loop polls it in a
     // `select!`, so a losing branch leaves a read parked in the pool. The
@@ -2752,6 +2941,7 @@ fn run_stdio_server_impl(
 #[cfg(test)]
 mod named_workspace_tests {
     use super::*;
+    use brokk_bifrost_test_macros::hardwon;
 
     fn schema_router() -> NamedWorkspaceRouter {
         let entries = ["api", "ui"]
@@ -2772,33 +2962,7 @@ mod named_workspace_tests {
     }
 
     #[test]
-    fn named_tool_schemas_require_a_configured_workspace() {
-        let descriptors = crate::mcp_core::symbol_tool_descriptors(true);
-        let routed =
-            named_workspace_descriptors(&descriptors, &schema_router()).expect("named descriptors");
-        let search = routed
-            .iter()
-            .find(|descriptor| descriptor["name"] == "search_symbols")
-            .expect("search_symbols descriptor");
-        assert_eq!(search["inputSchema"]["required"][0], "workspace");
-        assert_eq!(
-            search["inputSchema"]["properties"]["workspace"]["enum"],
-            json!(["api", "ui"])
-        );
-    }
-
-    #[test]
-    fn named_mode_removes_mutable_workspace_navigation() {
-        let descriptors = crate::mcp_core::workspace_tool_descriptors();
-        let names = named_workspace_descriptors(&descriptors, &schema_router())
-            .expect("named descriptors")
-            .into_iter()
-            .map(|descriptor| descriptor["name"].as_str().unwrap().to_string())
-            .collect::<Vec<_>>();
-        assert_eq!(names, vec!["refresh"]);
-    }
-
-    #[test]
+    #[hardwon("65092f1ba920: malformed suppressions must fail before deferred workspace readiness")]
     fn named_run_policy_preflights_suppressions_before_readiness() {
         let temp = tempfile::tempdir().expect("workspace temp dir");
         std::fs::write(temp.path().join("Policy.java"), "class Policy {}\n")
@@ -2890,45 +3054,30 @@ mod named_workspace_tests {
     }
 
     #[test]
-    fn workspace_names_use_a_model_safe_identifier() {
-        for valid in ["api", "repo-2", "foo.bar", "repo_name"] {
-            validate_workspace_name(valid).expect("valid workspace name");
-        }
-        for invalid in ["", "-repo", "two repos", "repo/path"] {
-            assert!(validate_workspace_name(invalid).is_err());
-        }
+    fn named_tool_schemas_require_a_configured_workspace() {
+        let descriptors = crate::mcp_core::symbol_tool_descriptors(true);
+        let routed =
+            named_workspace_descriptors(&descriptors, &schema_router()).expect("named descriptors");
+        let search = routed
+            .iter()
+            .find(|descriptor| descriptor["name"] == "search_symbols")
+            .expect("search_symbols descriptor");
+        assert_eq!(search["inputSchema"]["required"][0], "workspace");
+        assert_eq!(
+            search["inputSchema"]["properties"]["workspace"]["enum"],
+            json!(["api", "ui"])
+        );
     }
-}
-
-#[cfg(test)]
-mod cold_workspace_deadline_tests {
-    use super::*;
 
     #[test]
-    fn cold_search_symbols_waits_out_initialization_within_the_default_budget() {
-        // Discovery still gets to wait out a cold snapshot build (a 4.5 s
-        // fail-fast would reject the client's first discovery call right
-        // before the build finishes), but the wait is bounded by the default
-        // interactive budget instead of running forever (#3279).
-        let accepted_at = Instant::now();
-        let discovery = RequestBudget::with_configured(None, "search_symbols", true, accepted_at)
-            .expect("cold discovery must still be bounded");
-        assert_eq!(
-            discovery.deadline(),
-            accepted_at + crate::mcp_common::DEFAULT_INTERACTIVE_REQUEST_BUDGET
-        );
-        assert_eq!(
-            RequestBudget::with_configured(None, "scan_usages_by_location", true, accepted_at)
-                .expect("cold non-discovery reads stay bounded")
-                .deadline(),
-            accepted_at + crate::mcp_common::COLD_WORKSPACE_REQUEST_BUDGET
-        );
-        assert_eq!(
-            RequestBudget::with_configured(None, "search_symbols", false, accepted_at)
-                .expect("warm discovery is bounded by the default budget")
-                .deadline(),
-            accepted_at + crate::mcp_common::DEFAULT_INTERACTIVE_REQUEST_BUDGET
-        );
+    fn named_mode_removes_mutable_workspace_navigation() {
+        let descriptors = crate::mcp_core::workspace_tool_descriptors();
+        let names = named_workspace_descriptors(&descriptors, &schema_router())
+            .expect("named descriptors")
+            .into_iter()
+            .map(|descriptor| descriptor["name"].as_str().unwrap().to_string())
+            .collect::<Vec<_>>();
+        assert_eq!(names, vec!["refresh"]);
     }
 }
 
@@ -2948,12 +3097,14 @@ mod analyzer_admission_budget_tests {
         COLD_WORKSPACE_REQUEST_BUDGET, DEFAULT_INTERACTIVE_REQUEST_BUDGET,
         DEFAULT_POLICY_REQUEST_BUDGET,
     };
+    use brokk_bifrost_test_macros::hardwon;
 
     /// A request that has already spent its budget by the time admission
     /// starts -- the readiness wait is bounded by the same deadline -- against
     /// a pool whose only slot is taken. The timeout then fires immediately, so
     /// this costs no wall-clock wait.
     #[tokio::test]
+    #[hardwon("#3396: fallback admission timeouts panicked instead of returning typed errors")]
     async fn a_fallback_budget_admission_timeout_returns_the_typed_error() {
         let pool = AnalyzerExecutionPool::new(1, 1);
         let cancelled = McpCancellationToken::new();
@@ -2998,6 +3149,7 @@ mod analyzer_admission_budget_tests {
     /// through admission -- and a timer here would cut such a mutation short
     /// on a budget nobody set.
     #[tokio::test]
+    #[hardwon("#3396: unbounded admission waits must remain cancellable without a timer")]
     async fn an_unbounded_admission_wait_keeps_waiting() {
         assert_eq!(
             RequestBudget::with_configured(None, "refresh", false, Instant::now()),

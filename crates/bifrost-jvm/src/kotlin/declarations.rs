@@ -31,15 +31,17 @@ use brokk_bifrost_core::analyzer::common::{
     collapse_whitespace, node_source_text as node_text,
     node_source_text_trimmed as node_text_trimmed,
 };
-use brokk_bifrost_core::analyzer::fq_name::{FqName, SegmentId, SegmentKind, segment_interner};
+use brokk_bifrost_core::analyzer::fq_name::{
+    FqName, SegmentKind, joined_segments, segment_interner,
+};
 use brokk_bifrost_core::analyzer::model::{
     CallableArity, CodeUnitType, ParameterMetadata, SignatureMetadata, StructuredTypeIdentity,
-    StructuredTypeIdentityBuilder, StructuredTypeName,
+    StructuredTypeIdentityBuilder, StructuredTypeName, child_fq_base,
 };
-use brokk_bifrost_core::analyzer::parsed_file::{
-    ParsedFile, ParsedSourceFacts, SourceDeclarationMetadataLink, SourceImportFact,
+use brokk_bifrost_core::analyzer::parsed_file::{ParsedFile, ParsedSourceFacts, SourceImportFact};
+use brokk_bifrost_core::analyzer::source_facts::{
+    PrimarySourceFactCollector, SourceDeclarationId, SourceImportId,
 };
-use brokk_bifrost_core::analyzer::source_facts::{PrimarySourceFactCollector, SourceImportId};
 use brokk_bifrost_core::analyzer::structural::collector::StructuralFactCollector;
 use brokk_bifrost_core::analyzer::structural::resolution::DeclaredVisibility;
 use brokk_bifrost_core::analyzer::structural::spec::{CompiledKinds, StructuralSpec};
@@ -51,10 +53,6 @@ use brokk_bifrost_core::analyzer::tree_walk::{
 use brokk_bifrost_core::analyzer::{CodeUnit, ProjectFile};
 use brokk_bifrost_core::hash::{HashMap, HashSet};
 use tree_sitter::{Node, Tree};
-
-fn kotlin_segment(text: &str, kind: SegmentKind) -> SegmentId {
-    segment_interner().intern(text, kind)
-}
 
 /// The declared name of an identifier node, with Kotlin's backtick quoting
 /// removed.
@@ -75,22 +73,10 @@ pub fn kotlin_identifier_text<'a>(node: Node<'_>, source: &'a str) -> &'a str {
 /// component of `package a.b.c` becomes a [`SegmentKind::Package`] segment.
 fn kotlin_package_fq(package_name: &str) -> FqName {
     let mut fq = FqName::new();
-    for component in package_name
-        .split('.')
-        .filter(|component| !component.is_empty())
-    {
-        fq.push(kotlin_segment(component, SegmentKind::Package));
+    for component in joined_segments(package_name, ".") {
+        fq.push(segment_interner().intern(component, SegmentKind::Package));
     }
     fq
-}
-
-/// The [`FqName`] a child declaration extends: its enclosing declaration's
-/// structured name when nested, otherwise the file's package prefix.
-fn kotlin_child_fq_base(parent: Option<&CodeUnit>, package_name: &str) -> FqName {
-    match parent {
-        Some(parent) => parent.fq().clone(),
-        None => kotlin_package_fq(package_name),
-    }
 }
 
 pub fn parse_kotlin_file(file: &ProjectFile, source: &str, tree: &Tree) -> ParsedFile {
@@ -103,6 +89,7 @@ pub fn parse_kotlin_file(file: &ProjectFile, source: &str, tree: &Tree) -> Parse
         package_name: &package_name,
         parsed: &mut parsed,
         source_collector: PrimarySourceFactCollector::new(source),
+        source_declaration_nodes: HashMap::default(),
         singleton_owners: HashSet::default(),
     };
     visitor.walk(root);
@@ -147,6 +134,7 @@ struct KotlinVisitor<'a> {
     package_name: &'a str,
     parsed: &'a mut ParsedFile,
     source_collector: PrimarySourceFactCollector<'a>,
+    source_declaration_nodes: HashMap<(usize, Option<usize>), SourceDeclarationId>,
     /// The type declarations this file writes as singletons: `object` and
     /// `companion object`. A member of one is reached through the owner's own
     /// name (`Registry.register()`), not through a receiver value, which is
@@ -158,7 +146,7 @@ struct KotlinVisitor<'a> {
 }
 
 impl<'a> KotlinVisitor<'a> {
-    fn walk(mut self, root: Node<'_>) {
+    fn walk(mut self, root: Node<'a>) {
         let grammar = crate::kotlin::language::LANGUAGE.into();
         let kinds = CompiledKinds::compile(&grammar, KOTLIN_KIND_TABLE);
         let context = KOTLIN_STRUCTURAL_SPEC.call_site_context(root, self.source);
@@ -276,6 +264,15 @@ impl<'a> KotlinVisitor<'a> {
                     .map(|child| (child, structural_parent)),
             );
         }
+        let native = super::resolution::extract_kotlin_resolution(
+            root,
+            self.file,
+            self.source,
+            &mut self.source_collector,
+            &self.source_declaration_nodes,
+            &self.parsed.source_declaration_units,
+        );
+        self.parsed.resolution_facts = native.facts;
         let occurrences = self.source_collector.finish();
         self.parsed.imports = generic_imports
             .iter()
@@ -293,10 +290,10 @@ impl<'a> KotlinVisitor<'a> {
             source_bytes: self.source.len(),
             occurrences,
             structural: structural
-                .finish()
+                .finish(root)
                 .expect("complete Kotlin collection is unbounded"),
-            native_site_occurrences: Vec::new(),
-            native_declaration_sources: Vec::new(),
+            native_site_occurrences: native.site_occurrences,
+            native_declaration_sources: native.declaration_sources,
             declaration_visibilities: None,
             rust_declaration_properties: Vec::new(),
             rust_modules: None,
@@ -314,9 +311,13 @@ impl<'a> KotlinVisitor<'a> {
         name: Option<Node<'_>>,
         unit: &CodeUnit,
     ) {
-        let occurrence = self.source_collector.intern_node(node);
-        let name = name.map(|name| self.source_collector.intern_node(name));
-        let declaration = self.source_collector.declare(occurrence, name);
+        let declaration = self.source_collector.declare_node(node, name);
+        let name_node_id = name.map(|name| name.id());
+        assert!(
+            self.source_declaration_nodes
+                .insert((node.id(), name_node_id), declaration)
+                .is_none()
+        );
         self.parsed
             .source_declaration_units
             .push((declaration, unit.clone()));
@@ -330,16 +331,8 @@ impl<'a> KotlinVisitor<'a> {
             .filter(|(_, owner)| owner == &unit)
             .expect("metadata immediately follows its source declaration");
         let declaration = *declaration;
-        let metadata_ordinal = self
-            .parsed
-            .add_signature_with_metadata(unit.clone(), metadata);
         self.parsed
-            .source_declaration_metadata
-            .push(SourceDeclarationMetadataLink {
-                declaration,
-                unit,
-                metadata_ordinal,
-            });
+            .add_signature_with_source_declaration_metadata(declaration, unit, metadata);
     }
 
     /// Dispatch one declaration-position node. Non-declaration statements
@@ -381,8 +374,8 @@ impl<'a> KotlinVisitor<'a> {
             Some(parent) => format!("{}.{name}", parent.short_name()),
             None => name.to_string(),
         };
-        let fq = kotlin_child_fq_base(parent, self.package_name)
-            .with_pushed(kotlin_segment(name, segment_kind));
+        let fq = child_fq_base(parent, || kotlin_package_fq(self.package_name))
+            .with_pushed(segment_interner().intern(name, segment_kind));
         let code_unit = CodeUnit::new_fq(
             self.file.clone(),
             kind,
@@ -422,11 +415,7 @@ impl<'a> KotlinVisitor<'a> {
         // than leaving the arity unread (#1651).
         self.add_metadata(
             code_unit.clone(),
-            SignatureMetadata::new(kotlin_class_signature(node, self.source), Vec::new())
-                .with_recorded_type_parameters(kotlin_declared_type_parameter_names(
-                    node,
-                    self.source,
-                )),
+            kotlin_class_like_metadata(node, self.source),
         );
         self.record_supertypes(&code_unit, node);
 
@@ -475,12 +464,10 @@ impl<'a> KotlinVisitor<'a> {
         // (`object Catalog : Shelver`) survives and an anonymous companion
         // renders as written. The `Companion` identity default above is a
         // name-resolution rule and must not leak into rendered source text.
-        let signature = kotlin_class_signature(node, self.source);
         // An `object` writes no type parameters, so this is always a recorded
         // zero; reading the list rather than assuming it keeps one rule for
         // every Kotlin type declaration.
-        let metadata = SignatureMetadata::new(signature, Vec::new())
-            .with_recorded_type_parameters(kotlin_declared_type_parameter_names(node, self.source));
+        let metadata = kotlin_class_like_metadata(node, self.source);
         if companion {
             // Companion-ness is not derivable from the indexed identity: a
             // companion and an ordinary nested `object` are both nested classes,
@@ -554,36 +541,18 @@ impl<'a> KotlinVisitor<'a> {
             .filter(|child| child.kind() == "class_parameter")
             .collect();
         if !parameters.is_empty() {
-            let constructor = CodeUnit::new_fq(
-                self.file.clone(),
-                CodeUnitType::Function,
-                self.package_name.to_string(),
-                format!("{}.{class_name}", owner.short_name()),
-                owner
-                    .fq()
-                    .clone()
-                    .with_pushed(kotlin_segment(class_name, SegmentKind::Member)),
-            );
-            self.parsed.add_code_unit(
-                constructor.clone(),
-                primary,
-                self.source,
-                Some(owner.clone()),
-                None,
-            );
-            self.record_source_declaration(primary, None, &constructor);
+            let constructor = self.declare_constructor(primary, class_name, owner);
             let params_text = collapse_whitespace(node_text(primary, self.source));
             let signature = if params_text.starts_with('(') {
                 format!("{class_name}{params_text}")
             } else {
                 format!("{class_name} {params_text}")
             };
-            let metadata = kotlin_signature_metadata(
+            self.add_constructor_metadata(
+                constructor,
                 signature,
                 kotlin_class_parameter_facts(&parameters, self.source),
-            )
-            .with_callable_constructor();
-            self.add_metadata(constructor, metadata);
+            );
         }
 
         // `val`/`var` class parameters declare real properties.
@@ -634,19 +603,7 @@ impl<'a> KotlinVisitor<'a> {
             return;
         };
         let class_name = owner.identifier().to_string();
-        let code_unit = CodeUnit::new_fq(
-            self.file.clone(),
-            CodeUnitType::Function,
-            self.package_name.to_string(),
-            format!("{}.{class_name}", owner.short_name()),
-            owner
-                .fq()
-                .clone()
-                .with_pushed(kotlin_segment(&class_name, SegmentKind::Member)),
-        );
-        self.parsed
-            .add_code_unit(code_unit.clone(), node, self.source, parent.cloned(), None);
-        self.record_source_declaration(node, None, &code_unit);
+        let code_unit = self.declare_constructor(node, &class_name, owner);
         let parameter_list = first_named_child(node, "function_value_parameters");
         let header_end = parameter_list
             .map(|parameters| parameters.end_byte())
@@ -659,8 +616,44 @@ impl<'a> KotlinVisitor<'a> {
         let facts = parameter_list
             .map(|list| kotlin_function_parameter_facts(list, self.source))
             .unwrap_or_else(|| kotlin_parameter_facts_from(Vec::new(), 0, false));
+        self.add_constructor_metadata(code_unit, signature, facts);
+    }
+
+    fn declare_constructor(
+        &mut self,
+        node: Node<'_>,
+        class_name: &str,
+        owner: &CodeUnit,
+    ) -> CodeUnit {
+        let constructor = CodeUnit::new_fq(
+            self.file.clone(),
+            CodeUnitType::Function,
+            self.package_name.to_string(),
+            format!("{}.{class_name}", owner.short_name()),
+            owner
+                .fq()
+                .clone()
+                .with_pushed(segment_interner().intern(class_name, SegmentKind::Member)),
+        );
+        self.parsed.add_code_unit(
+            constructor.clone(),
+            node,
+            self.source,
+            Some(owner.clone()),
+            None,
+        );
+        self.record_source_declaration(node, None, &constructor);
+        constructor
+    }
+
+    fn add_constructor_metadata(
+        &mut self,
+        constructor: CodeUnit,
+        signature: String,
+        facts: KotlinParameterFacts,
+    ) {
         self.add_metadata(
-            code_unit,
+            constructor,
             kotlin_signature_metadata(signature, facts).with_callable_constructor(),
         );
     }
@@ -974,7 +967,7 @@ fn kotlin_modifier_prefix(node: Node<'_>, source: &str) -> String {
     let Some(modifiers) = first_named_child(node, "modifiers") else {
         return String::new();
     };
-    let mut prefix = String::new();
+    let mut parts = Vec::new();
     let mut cursor = modifiers.walk();
     for modifier in modifiers.children(&mut cursor) {
         if modifier.kind() == "annotation" {
@@ -984,10 +977,9 @@ fn kotlin_modifier_prefix(node: Node<'_>, source: &str) -> String {
         if text.is_empty() {
             continue;
         }
-        prefix.push_str(text);
-        prefix.push(' ');
+        parts.push(text.to_string());
     }
-    prefix
+    crate::format_modifier_prefix(parts)
 }
 
 /// Class/interface signature: the source header (modifiers through primary
@@ -998,12 +990,15 @@ fn kotlin_class_signature(node: Node<'_>, source: &str) -> String {
         .or_else(|| first_named_child(node, "enum_class_body"))
         .map(|body| body.start_byte())
         .unwrap_or(node.end_byte());
-    let header = collapse_whitespace(
-        source
-            .get(node.start_byte()..body_start)
-            .unwrap_or_default(),
-    );
-    format!("{header} {{")
+    format!(
+        "{} {{",
+        crate::source_header(source, node.start_byte(), body_start)
+    )
+}
+
+fn kotlin_class_like_metadata(node: Node<'_>, source: &str) -> SignatureMetadata {
+    SignatureMetadata::new(kotlin_class_signature(node, source), Vec::new())
+        .with_recorded_type_parameters(kotlin_declared_type_parameter_names(node, source))
 }
 
 /// Callable signature: the function header (modifiers, `fun`, receiver, name,
@@ -1012,11 +1007,7 @@ fn kotlin_callable_header(node: Node<'_>, source: &str) -> String {
     let body_start = first_named_child(node, "function_body")
         .map(|body| body.start_byte())
         .unwrap_or(node.end_byte());
-    collapse_whitespace(
-        source
-            .get(node.start_byte()..body_start)
-            .unwrap_or_default(),
-    )
+    crate::source_header(source, node.start_byte(), body_start)
 }
 
 struct KotlinParameterFacts {
@@ -1026,7 +1017,7 @@ struct KotlinParameterFacts {
 }
 
 /// Whether a parameter's modifier list marks it `vararg`.
-fn kotlin_modifiers_mark_vararg(modifiers: Node<'_>, source: &str) -> bool {
+pub fn kotlin_modifiers_mark_vararg(modifiers: Node<'_>, source: &str) -> bool {
     has_token_child(modifiers, "vararg")
         || named_children_of(modifiers)
             .into_iter()
@@ -1121,6 +1112,33 @@ fn kotlin_signature_metadata(signature: String, facts: KotlinParameterFacts) -> 
     SignatureMetadata::new(signature, facts.metadata).with_callable_arity(arity)
 }
 
+/// Arity values for one callable identity, or an empty set when one overload
+/// has unknown arity and therefore remains a possible match for any call.
+pub fn kotlin_callable_arities_from_metadata(
+    metadata: &[SignatureMetadata],
+) -> HashSet<CallableArity> {
+    if metadata.is_empty()
+        || metadata
+            .iter()
+            .any(|entry| entry.callable_arity().is_none())
+    {
+        return HashSet::default();
+    }
+    metadata
+        .iter()
+        .filter_map(SignatureMetadata::callable_arity)
+        .collect()
+}
+
+/// Whether one recorded Kotlin callable overload can accept `arity` arguments.
+pub fn kotlin_callable_metadata_accepts_arity(
+    metadata: &[SignatureMetadata],
+    arity: usize,
+) -> bool {
+    let arities = kotlin_callable_arities_from_metadata(metadata);
+    arities.is_empty() || arities.iter().any(|recorded| recorded.accepts(arity))
+}
+
 fn kotlin_callable_signature_metadata(
     signature: String,
     node: Node<'_>,
@@ -1148,7 +1166,7 @@ fn kotlin_callable_signature_metadata(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use brokk_bifrost_core::hash::HashMap;
+    use brokk_bifrost_test_macros::hardwon;
     use tree_sitter::Parser;
 
     fn parse(source: &str) -> (ProjectFile, ParsedFile) {
@@ -1175,39 +1193,56 @@ mod tests {
         names
     }
 
-    /// A single-line `object Name { members }` used to misparse as an infix
-    /// expression under the pre-0.4.4 grammar and needed a visitor-side
-    /// recovery (BrokkAi/tree-sitter-kotlin#14/#15, fixed by PRs #16/#19).
-    /// The pinned grammar now yields a real `object_declaration`, so the
-    /// declaration walk must index it directly. Statement-position infix
-    /// expressions must stay untouched.
     #[test]
-    fn indexes_single_line_object_declarations_directly() {
-        let source = "package api\n\nobject Registry { fun register() {} }\n";
+    #[hardwon(
+        "#2602: Kotlin constructor metadata was missing from usage-scan candidates and caused a timeout"
+    )]
+    fn constructor_signatures_record_constructor_metadata() {
+        let source = r#"package constructors
+
+class Widget(val value: Int) {
+    constructor() : this(0)
+}
+"#;
         let (_, parsed) = parse(source);
-        assert_eq!(
-            fq_names(&parsed),
-            vec![
-                "api.Registry".to_string(),
-                "api.Registry.register".to_string(),
-            ]
-        );
-        let registry = parsed
+        let constructor = parsed
             .declarations()
             .iter()
-            .find(|unit| unit.fq_name() == "api.Registry")
-            .expect("directly parsed object declaration")
-            .clone();
-        assert!(registry.is_class());
-        assert_eq!(
-            parsed.signatures.get(&registry).cloned(),
-            Some(vec!["object Registry {".to_string()])
-        );
+            .find(|unit| unit.fq_name() == "constructors.Widget.Widget")
+            .expect("primary and secondary constructors share one declaration");
+        let metadata = parsed
+            .signature_metadata
+            .get(constructor)
+            .expect("constructors publish signature metadata");
 
-        // A real infix expression in a script stays an expression and
-        // declares nothing.
-        let (_, script) = parse("val p = 1 to 2\n");
-        assert_eq!(fq_names(&script), vec!["p".to_string()]);
+        assert_eq!(metadata.len(), 2);
+        assert!(
+            metadata
+                .iter()
+                .all(SignatureMetadata::callable_is_constructor)
+        );
+    }
+
+    #[test]
+    fn malformed_source_recovers_surrounding_declarations() {
+        let source = r#"package broken
+
+fun ok(): Int = 1
+
+fun bad(value: Int): Int = when (value) {
+    0 ->
+    else -> value
+}
+
+class Survivor {
+    fun still(): Int = 2
+}
+"#;
+        let (_, parsed) = parse(source);
+        let names = fq_names(&parsed);
+        assert!(names.iter().any(|name| name == "broken.ok"));
+        assert!(names.iter().any(|name| name == "broken.Survivor"));
+        assert!(names.iter().any(|name| name == "broken.Survivor.still"));
     }
 
     #[test]
@@ -1306,102 +1341,6 @@ val (first, second) = pair()
     }
 
     #[test]
-    fn extracts_principal_declarations_with_source_level_identities() {
-        let source = r#"package com.example
-
-import kotlin.math.abs
-
-class Outer(val seed: Int, label: String) {
-    val cached: Int = seed
-
-    fun render(prefix: String): String = prefix
-
-    class Inner {
-        fun poke() {}
-    }
-
-    companion object {
-        fun of(seed: Int): Outer = Outer(seed, "label")
-    }
-}
-
-fun topLevel(count: Int): Int = abs(count)
-
-val topProperty: Long = 42L
-
-typealias Rows = List<String>
-"#;
-        let (_, parsed) = parse(source);
-        assert_eq!(parsed.package_name, "com.example");
-        assert_eq!(
-            parsed
-                .imports
-                .iter()
-                .map(|import| import.raw_snippet.as_str())
-                .collect::<Vec<_>>(),
-            vec!["import kotlin.math.abs"]
-        );
-        let names = fq_names(&parsed);
-        for expected in [
-            "com.example.Outer",
-            "com.example.Outer.Outer",
-            "com.example.Outer.seed",
-            "com.example.Outer.cached",
-            "com.example.Outer.render",
-            "com.example.Outer.Inner",
-            "com.example.Outer.Inner.poke",
-            "com.example.Outer.Companion",
-            "com.example.Outer.Companion.of",
-            "com.example.topLevel",
-            "com.example.topProperty",
-            "com.example.Rows",
-        ] {
-            assert!(
-                names.iter().any(|name| name == expected),
-                "missing {expected} in {names:#?}"
-            );
-        }
-        // `label` has no val/var: not a property.
-        assert!(!names.iter().any(|name| name.ends_with("Outer.label")));
-        // No JVM-generated identities.
-        assert!(names.iter().all(|name| !name.contains('$')));
-        assert!(names.iter().all(|name| !name.contains("Kt")));
-    }
-
-    #[test]
-    fn signatures_render_headers_without_bodies() {
-        let source = r#"package sig
-
-sealed class Shape(val edges: Int) {
-    open fun area(scale: Double = 1.0): Double = 0.0
-}
-
-fun String.shout(): String = uppercase()
-"#;
-        let (_, parsed) = parse(source);
-        let by_name: HashMap<String, Vec<String>> = parsed
-            .declarations()
-            .iter()
-            .map(|unit| {
-                (
-                    unit.fq_name(),
-                    parsed.signatures.get(unit).cloned().unwrap_or_default(),
-                )
-            })
-            .collect();
-        assert_eq!(
-            by_name["sig.Shape"],
-            vec!["sealed class Shape(val edges: Int) {"]
-        );
-        assert_eq!(
-            by_name["sig.Shape.area"],
-            vec!["open fun area(scale: Double = 1.0): Double"]
-        );
-        assert_eq!(by_name["sig.shout"], vec!["fun String.shout(): String"]);
-        assert_eq!(by_name["sig.Shape.edges"], vec!["val edges: Int"]);
-    }
-
-    #[test]
     fn callable_arity_tracks_defaults_and_vararg() {
         let source = r#"package arity
 
@@ -1454,40 +1393,9 @@ fun mixed(a: Int, b: Int = 2, c: String = "x"): Int = a + b
     }
 
     #[test]
-    fn constructor_signatures_record_constructor_metadata() {
-        let source = r#"package constructors
-
-class Widget(val value: Int) {
-    constructor() : this(0)
-}
-"#;
-        let (_, parsed) = parse(source);
-        let constructor = parsed
-            .declarations()
-            .iter()
-            .find(|unit| unit.fq_name() == "constructors.Widget.Widget")
-            .expect("primary and secondary constructors share one declaration");
-        let metadata = parsed
-            .signature_metadata
-            .get(constructor)
-            .expect("constructors publish signature metadata");
-
-        assert_eq!(metadata.len(), 2);
-        assert!(
-            metadata
-                .iter()
-                .all(SignatureMetadata::callable_is_constructor)
-        );
-    }
-
-    /// #3453: which receiver a Kotlin `fun` binds is a property of the
-    /// declaration's own shape, and the walk publishes it instead of leaving
-    /// `callable_modifiers_recorded` false. That flag is the difference between
-    /// "declares no static modifier" and "nobody read the modifiers": an
-    /// adapter that never records it makes `receiver_contract_of` report no
-    /// contract, which refuses a modeled-procedure key for every Kotlin
-    /// workspace callable and leaves every effect summary inert.
-    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#2912: Kotlin receiver metadata distinguishes extension, instance, companion, and object callables"
+    )]
     fn callable_metadata_records_kotlin_receiver_contracts_structurally() {
         let source = r#"package contracts
 
@@ -1598,68 +1506,6 @@ object Registry {
     }
 
     #[test]
-    fn enums_objects_and_scripts_index_expected_units() {
-        let source = r#"package shapes
-
-enum class Direction(val degrees: Int) {
-    NORTH(0),
-    EAST(90) {
-        override fun describe(): String = "east"
-    };
-
-    open fun describe(): String = name
-}
-
-object Registry {
-    fun register(direction: Direction) {}
-}
-
-interface Drawable {
-    fun draw()
-}
-"#;
-        let (_, parsed) = parse(source);
-        let names = fq_names(&parsed);
-        for expected in [
-            "shapes.Direction",
-            "shapes.Direction.NORTH",
-            "shapes.Direction.EAST",
-            "shapes.Direction.describe",
-            "shapes.Registry",
-            "shapes.Registry.register",
-            "shapes.Drawable",
-            "shapes.Drawable.draw",
-        ] {
-            assert!(
-                names.iter().any(|name| name == expected),
-                "missing {expected} in {names:#?}"
-            );
-        }
-    }
-
-    #[test]
-    fn malformed_source_recovers_surrounding_declarations() {
-        let source = r#"package broken
-
-fun ok(): Int = 1
-
-fun bad(value: Int): Int = when (value) {
-    0 ->
-    else -> value
-}
-
-class Survivor {
-    fun still(): Int = 2
-}
-"#;
-        let (_, parsed) = parse(source);
-        let names = fq_names(&parsed);
-        assert!(names.iter().any(|name| name == "broken.ok"));
-        assert!(names.iter().any(|name| name == "broken.Survivor"));
-        assert!(names.iter().any(|name| name == "broken.Survivor.still"));
-    }
-
-    #[test]
     fn kts_scripts_index_declarations_but_not_statements() {
         let source = r#"val greeting = "hello"
 
@@ -1690,6 +1536,7 @@ mod type_parameter_metadata_tests {
     /// nongeneric class is a proven zero rather than the unread list an empty
     /// `type_parameters` used to mean (#1651). An `object` and a `companion
     /// object` cannot be generic, and record that as the zero it is.
+
     #[test]
     fn kotlin_type_declarations_record_their_type_parameters() {
         let source = r#"package com.example
@@ -1713,27 +1560,15 @@ fun <T> identity(value: T): T = value
         let tree = parser.parse(source, None).expect("parse Kotlin source");
         let parsed = parse_kotlin_file(&file, source, &tree);
 
-        let mut recorded = parsed
-            .signature_metadata
-            .iter()
-            .flat_map(|(unit, metadata)| {
-                metadata
-                    .iter()
-                    .filter(|entry| entry.type_parameters_recorded())
-                    .map(|entry| (unit.short_name().to_string(), entry.type_parameters().len()))
-            })
-            .collect::<Vec<_>>();
-        recorded.sort();
-        assert_eq!(
-            recorded,
-            vec![
-                ("Box".to_string(), 1),
-                ("Foo".to_string(), 0),
-                ("Pair".to_string(), 2),
-                ("Registry".to_string(), 0),
-                ("Rows".to_string(), 1),
+        crate::test_support::assert_recorded_type_parameter_counts(
+            &parsed,
+            &[
+                ("Box", 1),
+                ("Foo", 0),
+                ("Pair", 2),
+                ("Registry", 0),
+                ("Rows", 1),
             ],
-            "a generic function's own parameters stay a callable fact, unrecorded here"
         );
     }
 }

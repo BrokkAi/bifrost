@@ -6,7 +6,7 @@
 
 use std::sync::Arc;
 
-use brokk_bifrost_core::analyzer::prepared_syntax::{PreparedSyntaxSource, PreparedSyntaxTree};
+use brokk_bifrost_core::analyzer::prepared_syntax::PreparedSyntaxTree;
 use brokk_bifrost_ruby::graph::RubyGraphSource;
 use brokk_bifrost_ruby::graph::resolver::{ReceiverMode, ReceiverType, RubySemanticIndex};
 use tree_sitter::Node;
@@ -14,13 +14,13 @@ use tree_sitter::Node;
 use super::RubyAnalyzer;
 use crate::analyzer::semantic::type_flow::{
     ClassHierarchy, ClassIdentity, ClassSeed, ExternalClassCache, ExternalMemberDeclaration,
-    MemberAccessKind, MemberAccessQuery, MemberDeclaration, MemberLookup, MemberLookupHit,
-    TypeFlowAdapter, UnknownReason, analyzer_range_for_span, class_seed_from_lookup_types,
-    external_class_identity, file_for_locator, validate_prepared_syntax_for_procedure,
+    MemberAccessKind, MemberAccessQuery, MemberDeclaration, MemberLookup, TypeFlowAdapter,
+    UnknownReason, accessed_member_locator, class_seed_from_lookup_types, external_class_identity,
+    file_for_locator,
 };
 use crate::analyzer::semantic::{
-    AdapterSemanticsVersion, AllocationSite, CandidateCoverage, MemoryLocationKind,
-    ProcedureHandle, SemanticCallSite, SemanticValue, SemanticValueKind, SourceMappingKind,
+    AdapterSemanticsVersion, AllocationSite, ProcedureHandle, SemanticCallSite, SemanticValue,
+    SemanticValueKind, SourceMappingKind,
 };
 use crate::analyzer::semantic_model::{
     SemanticModelOverlay, SemanticModelSymbolKind, semantic_model_callable_family_id,
@@ -47,13 +47,6 @@ fn ruby_analyzer(workspace: &WorkspaceAnalyzer) -> &RubyAnalyzer {
         .expect("RubyTypeFlowAdapter serves only workspaces that analyze Ruby")
 }
 
-fn overlay_of(workspace: &WorkspaceAnalyzer) -> Option<Arc<SemanticModelOverlay>> {
-    workspace
-        .analyzer()
-        .active_semantic_model_snapshot()
-        .and_then(|snapshot| snapshot.semantic_model_overlay().cloned())
-}
-
 fn prepared_for(
     workspace: &WorkspaceAnalyzer,
     file: &ProjectFile,
@@ -67,10 +60,10 @@ fn current_prepared(
     workspace: &WorkspaceAnalyzer,
     file: &ProjectFile,
 ) -> Option<Arc<PreparedSyntaxTree>> {
-    let prepared = prepared_for(workspace, file)?;
-    (matches!(prepared.backing(), PreparedSyntaxSource::Indexed(_))
-        && ruby_analyzer(workspace).indexed_source_matches(file, prepared.source()))
-    .then_some(prepared)
+    let prepared = prepared_for(workspace, file);
+    crate::analyzer::semantic::type_flow::current_indexed_prepared(prepared, |prepared| {
+        ruby_analyzer(workspace).indexed_source_matches(file, prepared.source())
+    })
 }
 
 fn prepared_for_procedure(
@@ -78,8 +71,12 @@ fn prepared_for_procedure(
     procedure: &ProcedureHandle,
     file: &ProjectFile,
 ) -> Result<Arc<PreparedSyntaxTree>, UnknownReason> {
-    let prepared = prepared_for(workspace, file).ok_or(UnknownReason::UncertainFlow)?;
-    validate_prepared_syntax_for_procedure(workspace, procedure, file, prepared)
+    crate::analyzer::semantic::type_flow::prepared_syntax_for_procedure(
+        workspace,
+        procedure,
+        file,
+        prepared_for(workspace, file),
+    )
 }
 
 fn node_at_mapping<'tree>(
@@ -105,22 +102,21 @@ fn reference_site(file: &ProjectFile, node: Node<'_>, source: &str) -> ResolvedR
         start_line: node.start_position().row,
         end_line: node.end_position().row,
     };
-    ResolvedReferenceSite {
-        path: rel_path_string(file),
-        text: node
-            .utf8_text(source.as_bytes())
+    crate::analyzer::usages::common::build_reference_site(
+        rel_path_string(file),
+        node.utf8_text(source.as_bytes())
             .expect("a prepared tree spans its own UTF-8 source")
             .to_owned(),
-        focus_start_byte: node.start_byte(),
-        focus_end_byte: node.end_byte(),
         range,
-    }
+        node.start_byte(),
+        node.end_byte(),
+    )
 }
 
 fn open_external_seed(workspace: &WorkspaceAnalyzer, name: &str) -> ClassSeed {
     let mut cache = ExternalClassCache::default();
     external_class_identity(
-        overlay_of(workspace).as_deref(),
+        workspace.analyzer().semantic_model_overlay().as_deref(),
         Language::Ruby,
         name,
         None,
@@ -128,10 +124,6 @@ fn open_external_seed(workspace: &WorkspaceAnalyzer, name: &str) -> ClassSeed {
     )
     .map(ClassSeed::ClassWithOpenBound)
     .unwrap_or(ClassSeed::Unknown(UnknownReason::ExternalNotModeled))
-}
-
-fn positive(declaration: MemberDeclaration) -> MemberLookup {
-    MemberLookup::Present(MemberLookupHit::new(declaration, CandidateCoverage::Open))
 }
 
 fn workspace_member_lookup(
@@ -192,7 +184,7 @@ fn workspace_member_lookup(
     {
         return MemberLookup::Unknown(UnknownReason::UncertainFlow);
     }
-    positive(MemberDeclaration::Workspace(declaration))
+    crate::analyzer::semantic::type_flow::present_member(MemberDeclaration::Workspace(declaration))
 }
 
 fn external_member_lookup(
@@ -228,11 +220,13 @@ fn external_member_lookup(
     {
         return MemberLookup::Unknown(UnknownReason::PackIncomplete);
     }
-    positive(MemberDeclaration::External(ExternalMemberDeclaration::new(
-        records
-            .into_iter()
-            .map(|record| Box::from(record.id.as_str())),
-    )))
+    crate::analyzer::semantic::type_flow::present_member(MemberDeclaration::External(
+        ExternalMemberDeclaration::new(
+            records
+                .into_iter()
+                .map(|record| Box::from(record.id.as_str())),
+        ),
+    ))
 }
 
 impl TypeFlowAdapter for RubyTypeFlowAdapter {
@@ -241,7 +235,7 @@ impl TypeFlowAdapter for RubyTypeFlowAdapter {
     }
 
     fn semantics_version(&self) -> AdapterSemanticsVersion {
-        AdapterSemanticsVersion::hash_bytes("ruby-type-flow", b"ruby-type-flow-open-runtime-v5")
+        AdapterSemanticsVersion::hash_bytes("ruby-type-flow", b"ruby-type-flow-open-runtime-v6")
             .expect("adapter name is non-empty")
     }
 
@@ -365,7 +359,7 @@ impl TypeFlowAdapter for RubyTypeFlowAdapter {
             }
             TypeLookupStatus::Ambiguous => ClassSeed::Unknown(UnknownReason::AmbiguousCallee),
             TypeLookupStatus::Resolved => match class_seed_from_lookup_types(
-                overlay_of(workspace).as_deref(),
+                workspace.analyzer().semantic_model_overlay().as_deref(),
                 Language::Ruby,
                 &outcome.types,
             ) {
@@ -431,6 +425,19 @@ impl TypeFlowAdapter for RubyTypeFlowAdapter {
         procedure: &ProcedureHandle,
         value: &SemanticValue,
     ) -> ClassSeed {
+        // Ruby scalar literals carry their exact payload for the
+        // contradictory-condition consumer. The type-flow planner (and
+        // direct adapter clients) can therefore reach this retained-value
+        // hook instead of `constant_class`; preserve the existing literal
+        // class seed by reusing the exact mapping there.
+        if matches!(
+            value.kind,
+            SemanticValueKind::Boolean(_)
+                | SemanticValueKind::SignedInteger(_)
+                | SemanticValueKind::UnsignedInteger(_)
+        ) {
+            return self.constant_class(workspace, procedure, value);
+        }
         if value.kind == SemanticValueKind::Callable {
             return ClassSeed::Unknown(UnknownReason::OpenTypeBound);
         }
@@ -491,19 +498,7 @@ impl TypeFlowAdapter for RubyTypeFlowAdapter {
         procedure: &ProcedureHandle,
         site: MemberAccessQuery<'_>,
     ) -> Option<Box<str>> {
-        let locator = match site {
-            MemberAccessQuery::Call(call) => {
-                let callee = procedure.semantics().value(call.callee)?;
-                let mapping = procedure.semantics().source_mapping(callee.source)?;
-                (mapping.kind == SourceMappingKind::Exact).then_some(&mapping.locator)?
-            }
-            MemberAccessQuery::Load(location) => {
-                let MemoryLocationKind::Field { member, .. } = &location.kind else {
-                    return None;
-                };
-                member
-            }
-        };
+        let locator = accessed_member_locator(procedure, site)?;
         let file = file_for_locator(workspace, locator)?;
         let prepared = prepared_for_procedure(workspace, procedure, &file).ok()?;
         let span = locator.anchor().span();
@@ -529,7 +524,9 @@ impl TypeFlowAdapter for RubyTypeFlowAdapter {
     ) -> MemberLookup {
         match class {
             ClassIdentity::Workspace(unit) => workspace_member_lookup(workspace, unit, member),
-            ClassIdentity::External { symbol_id, .. } => overlay_of(workspace)
+            ClassIdentity::External { symbol_id, .. } => workspace
+                .analyzer()
+                .semantic_model_overlay()
                 .map(|overlay| external_member_lookup(&overlay, kind, symbol_id, member))
                 .unwrap_or(MemberLookup::Unknown(UnknownReason::ExternalNotModeled)),
         }
@@ -542,15 +539,13 @@ impl TypeFlowAdapter for RubyTypeFlowAdapter {
     ) -> Option<ClassIdentity> {
         let locator = procedure.semantics().locator();
         let file = file_for_locator(workspace, locator)?;
-        let mut unit = workspace
-            .analyzer()
-            .enclosing_code_unit(&file, &analyzer_range_for_span(locator.anchor().span()))?;
-        loop {
-            if unit.is_class() {
-                return Some(ClassIdentity::Workspace(unit));
-            }
-            unit = workspace.analyzer().parent_of(&unit)?;
-        }
+        crate::analyzer::semantic::type_flow::enclosing_workspace_class_unit(
+            workspace.analyzer(),
+            &file,
+            locator.anchor().span(),
+            |_| true,
+        )
+        .map(ClassIdentity::Workspace)
     }
 
     fn class_hierarchy(

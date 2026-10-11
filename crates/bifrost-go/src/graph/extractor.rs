@@ -17,15 +17,19 @@ use brokk_bifrost_core::hash::{HashMap, HashSet};
 use crate::graph::ast::{
     NON_OWNER_TOKEN, OWNER_TOKEN, SELF_RECEIVER_TOKEN, clause_binding_names, clause_statement_list,
     composite_literal_owner_path_for_key, composite_literal_owner_type_for_key, field_owner_token,
-    for_each_var_spec, is_clause, is_definition_identifier, is_identifier_node,
-    is_method_receiver_parameter, is_method_receiver_type_name, lhs_identifier_slots,
-    parameter_names, receive_statement_is_short_declaration, receiver_symbol_from_qualifier,
+    for_each_callable_header_node, for_each_clause_prebody_node, for_each_function_parameter_list,
+    for_each_parameter_declaration, for_each_type_switch_child, for_each_var_spec,
+    for_each_var_spec_prebinding_node, infer_before_declaring_bindings,
+    infer_before_declaring_short_var_bindings, is_clause, is_definition_identifier,
+    is_identifier_node, is_method_receiver_parameter, is_method_receiver_type_name,
+    method_receiver_parameter_list, parameter_names, receiver_symbol_from_qualifier,
     rhs_expressions, selector_parts, type_ref_from_node, var_spec_name_slots, var_spec_names,
 };
 use crate::graph::hits::{record_hit, record_self_receiver_hit, record_unproven_hit};
 use crate::graph::reference::go_is_top_level_decl;
 use crate::graph::resolver::{
     GoProjectGraph, ScanBindings, TargetSpec, TypeRef, constructor_call_type_fqns, node_text,
+    resolve_type_candidates,
 };
 use rayon::prelude::*;
 use std::collections::BTreeSet;
@@ -131,26 +135,13 @@ pub struct ScanCtx<'a> {
 
 impl ScanCtx<'_> {
     fn receiver_tokens_for_type(&self, ty: &TypeRef) -> Vec<String> {
-        let resolved_types = ty
-            .name
-            .as_deref()
-            .map(|name| match ty.qualifier.as_deref() {
-                None => std::iter::once(self.file_package.as_str())
-                    .chain(self.dot_packages.iter().map(String::as_str))
-                    .map(|package| format!("{package}.{name}"))
-                    .collect::<Vec<_>>(),
-                Some(qualifier) => self
-                    .alias_packages
-                    .get(qualifier)
-                    .into_iter()
-                    .flatten()
-                    .map(|package| format!("{package}.{name}"))
-                    .collect(),
-            })
-            .unwrap_or_default()
-            .into_iter()
-            .map(|fq_name| self.graph.edge_index.resolve_type_alias(&fq_name))
-            .collect::<Vec<_>>();
+        let resolved_types = resolve_type_candidates(
+            ty,
+            &self.file_package,
+            &self.alias_packages,
+            &self.dot_packages,
+            &self.graph.edge_index,
+        );
         let known_non_alias_type = resolved_types
             .iter()
             .any(|fq_name| self.graph.is_known_non_alias_type(fq_name));
@@ -249,31 +240,12 @@ fn scan_type_switch(
     ctx: &mut ScanCtx<'_>,
     locals: &mut LocalInferenceEngine<String>,
 ) {
-    let alias = node.child_by_field_name("alias");
-    let mut cursor = node.walk();
-    for child in node.named_children(&mut cursor) {
-        if alias != Some(child) {
-            scan_node(child, ctx, locals);
-        }
-    }
+    for_each_type_switch_child(node, |child| scan_node(child, ctx, locals));
 }
 
 fn scan_clause(node: Node<'_>, ctx: &mut ScanCtx<'_>, locals: &mut LocalInferenceEngine<String>) {
     let body = clause_statement_list(node);
-    let communication = node.child_by_field_name("communication");
-    let mut cursor = node.walk();
-    for child in node.named_children(&mut cursor) {
-        if body == Some(child) {
-            continue;
-        }
-        if communication == Some(child) && receive_statement_is_short_declaration(child) {
-            if let Some(right) = child.child_by_field_name("right") {
-                scan_node(right, ctx, locals);
-            }
-        } else {
-            scan_node(child, ctx, locals);
-        }
-    }
+    for_each_clause_prebody_node(node, |child| scan_node(child, ctx, locals));
     if let Some(body) = body {
         locals.enter_scope();
         for name in clause_binding_names(node, ctx.source) {
@@ -289,12 +261,7 @@ fn scan_var_spec_before_binding(
     ctx: &mut ScanCtx<'_>,
     locals: &mut LocalInferenceEngine<String>,
 ) {
-    if let Some(type_node) = node.child_by_field_name("type") {
-        scan_node(type_node, ctx, locals);
-    }
-    for value in rhs_expressions(node) {
-        scan_node(value, ctx, locals);
-    }
+    for_each_var_spec_prebinding_node(node, |child| scan_node(child, ctx, locals));
 }
 
 fn scan_callable_header(
@@ -302,26 +269,7 @@ fn scan_callable_header(
     ctx: &mut ScanCtx<'_>,
     locals: &mut LocalInferenceEngine<String>,
 ) {
-    let mut cursor = node.walk();
-    for child in node.named_children(&mut cursor) {
-        if node.child_by_field_name("body") == Some(child) {
-            continue;
-        }
-        if child.kind() == "parameter_list" {
-            let mut params = child.walk();
-            for parameter in child.named_children(&mut params) {
-                if matches!(
-                    parameter.kind(),
-                    "parameter_declaration" | "variadic_parameter_declaration"
-                ) && let Some(type_node) = parameter.child_by_field_name("type")
-                {
-                    scan_node(type_node, ctx, locals);
-                }
-            }
-        } else {
-            scan_node(child, ctx, locals);
-        }
-    }
+    for_each_callable_header_node(node, |child| scan_node(child, ctx, locals));
 }
 
 fn scan_children(node: Node<'_>, ctx: &mut ScanCtx<'_>, locals: &mut LocalInferenceEngine<String>) {
@@ -332,18 +280,10 @@ fn scan_children(node: Node<'_>, ctx: &mut ScanCtx<'_>, locals: &mut LocalInfere
 }
 
 fn seed_parameters(node: Node<'_>, ctx: &ScanCtx<'_>, locals: &mut LocalInferenceEngine<String>) {
-    if node.kind() == "method_declaration"
-        && let Some(receiver) = node.child_by_field_name("receiver")
-    {
-        // Mark the method's own receiver variable as the same-owner receiver.
+    if let Some(receiver) = method_receiver_parameter_list(node) {
         seed_parameter_list(receiver, ctx, locals, true);
     }
-    let mut cursor = node.walk();
-    for child in node.named_children(&mut cursor) {
-        if child.kind() == "parameter_list" && node.child_by_field_name("receiver") != Some(child) {
-            seed_parameter_list(child, ctx, locals, false);
-        }
-    }
+    for_each_function_parameter_list(node, |list| seed_parameter_list(list, ctx, locals, false));
 }
 
 fn seed_parameter_list(
@@ -352,15 +292,9 @@ fn seed_parameter_list(
     locals: &mut LocalInferenceEngine<String>,
     is_method_receiver: bool,
 ) {
-    let mut params = node.walk();
-    for param in node.named_children(&mut params) {
-        if matches!(
-            param.kind(),
-            "parameter_declaration" | "variadic_parameter_declaration"
-        ) {
-            seed_parameter_declaration(param, ctx, locals, is_method_receiver);
-        }
-    }
+    for_each_parameter_declaration(node, |parameter| {
+        seed_parameter_declaration(parameter, ctx, locals, is_method_receiver)
+    });
 }
 
 fn seed_parameter_declaration(
@@ -417,16 +351,14 @@ fn seed_var_spec(node: Node<'_>, ctx: &ScanCtx<'_>, locals: &mut LocalInferenceE
         return;
     }
 
-    let bindings = infer_names_from_values(
+    infer_before_declaring_bindings(
         var_spec_name_slots(node, ctx.source),
         rhs_expressions(node),
-        ctx,
         locals,
+        |slots, values, locals| infer_names_from_values(slots, values, ctx, locals),
+        |locals, name| locals.declare_shadow(name),
+        |locals, bindings| apply_inferred_bindings(bindings, locals),
     );
-    for name in names {
-        locals.declare_shadow(name);
-    }
-    apply_inferred_bindings(bindings, locals);
 }
 
 fn seed_short_var_bindings(
@@ -434,12 +366,14 @@ fn seed_short_var_bindings(
     ctx: &ScanCtx<'_>,
     locals: &mut LocalInferenceEngine<String>,
 ) {
-    let slots = lhs_identifier_slots(node, ctx.source);
-    let bindings = infer_names_from_values(slots.clone(), rhs_expressions(node), ctx, locals);
-    for name in slots.into_iter().flatten() {
-        locals.declare_shadow(name);
-    }
-    apply_inferred_bindings(bindings, locals);
+    infer_before_declaring_short_var_bindings(
+        node,
+        ctx.source,
+        locals,
+        |slots, values, locals| infer_names_from_values(slots, values, ctx, locals),
+        |locals, name| locals.declare_shadow(name),
+        |locals, bindings| apply_inferred_bindings(bindings, locals),
+    );
 }
 
 enum InferredBinding {

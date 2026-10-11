@@ -5,11 +5,13 @@ description: Compare Bifrost language coverage, precision, and known analysis bo
 
 Bifrost supports the same broad analysis categories across its languages, but language syntax and resolution rules affect what can be proved. This page is a suitability map, not a promise that every possible program construct resolves. Capability and execution diagnostics remain authoritative for a particular query and workspace.
 
+The [Languages reference](/reference/languages/) has the complete tables: language labels and file extensions, the full capability matrix, project and build inputs, structural kinds and roles per language, and semantic IR support per language.
+
 ## How To Read The Matrix
 
-**Structural** means `query_code` can match language-neutral parsed shapes such as declarations, calls, assignments, imports, literals, and containment. **Exact graph** means an indexed declaration identity can be connected to source references, semantic users, and resolved calls without resolving a display name by text. **Proven** means the analyzer established the target from structured language facts. **Unproven** is an explicit best-effort graph candidate used when a dynamic language leaves identity incomplete; it is never silently upgraded to proven.
+**Structural** means `query_code` can match language-neutral parsed shapes such as declarations, calls, assignments, imports, literals, and containment. **Exact graph** means an indexed declaration identity can be connected to source references, semantic users, and resolved calls without resolving a display name by text. **Proven** means the analyzer established the target from structured language facts. **Unproven** is an explicit best-effort graph candidate. Any language adapter can return one when the receiver type or target identity is incomplete or ambiguous, for example an unknown receiver type or an interface call with several implementations. Bifrost never upgrades an unproven candidate to proven. Check the proof tier in every language, not only in Python and Ruby.
 
-Named arguments refer to call-site syntax represented by the normalized `kwargs` role. Import-file edges are direct, project-local file relationships used by `imports_of` and `importers_of`; matching an `import` node structurally is a separate, broader capability. Hierarchy means indexed direct `supertypes` and `subtypes`, not compiler-complete effective-member lookup. **Bounded receiver provenance** means the `receiver_targets`, `points_to`, and `member_targets` query steps return explicit analysis outcomes and bounded candidates; it is separate from ordinary call/reference receiver resolution.
+Named arguments refer to call-site syntax represented by the normalized `kwargs` role. Import-file edges are resolved, project-local file relationships used by `imports_of` and `importers_of`; matching an `import` node structurally is a separate, broader capability. Hierarchy means indexed direct `supertypes` and `subtypes`, not compiler-complete effective-member lookup. **Bounded receiver provenance** means the `receiver_targets`, `points_to`, and `member_targets` query steps return explicit analysis outcomes and bounded candidates; it is separate from ordinary call/reference receiver resolution.
 
 **Direct value-flow baseline** means the production semantic adapter has a
 source-backed helper-flow case that agrees across the direct solver, JSON
@@ -18,21 +20,32 @@ complete precision for every language construct.
 
 ## Language Matrix
 
-| Language | Structural | Exact references and calls | Call and receiver precision | Named arguments | Direct import-file edges | Indexed hierarchy |
-| --- | --- | --- | --- | --- | --- | --- |
-| Python | Yes | Yes | Resolved functions, methods, and properties; dynamic candidates may be `unproven` | Yes | Yes | Yes |
-| Java | Yes | Yes | Receiver identity, overloads, constructors, fields, and types | No | Yes | Yes |
-| JavaScript | Yes | Yes | Module and method identity; `this` references are separated by result surface | No | Yes | Yes |
-| TypeScript | Yes | Yes | JavaScript forms plus typed declaration and module identity | No | Yes | Yes |
-| Go | Yes | Yes | Package-scoped functions, methods, fields, and types | No | Yes | Yes, including indexed type relationships |
-| C | Yes, through the `cpp` query label | Yes | Functions, fields, and types; method receivers and class inheritance do not apply | No | Yes, through structured includes | Not applicable |
-| C++ | Yes, through the `cpp` query label | Yes | Functions, members, fields, types, includes, and structured receiver resolution | No | Yes, through structured includes | Yes |
-| Rust | Yes | Yes | Functions, impl members, fields, types, and explicit `self` surface handling | No | Yes | Yes |
-| PHP | Yes | Yes | Namespaces, functions, methods, fields, types, static receivers, and `$this` ownership | Yes | No; unsupported traversal returns a diagnostic | Yes |
-| Scala | Yes | Yes | Receiver and overload resolution across methods, fields, types, and inheritance | Yes | Yes | Yes |
-| C# | Yes | Yes | Receiver and overload resolution across methods, constructors, fields, and types | Yes | Yes | Yes |
-| Ruby | Yes | Yes | Resolved methods, fields, and constants; dynamic candidates may be `unproven` | Yes | Yes, for conservative static imports | Yes |
-| Kotlin | Yes | Yes | Functions, methods, real constructors, properties, and types resolved through inheritance, companion objects, extensions, and receiver chains | Yes | Yes | Yes |
+Every language supports structural matching, exact references and calls, the bounded receiver steps, and the direct value-flow baseline. C and C++ share the `cpp` query label. The table shows the capabilities that differ by language. The [Languages reference](/reference/languages/#capability-matrix) adds call and receiver precision, the forms that create import edges, build topology, and semantic-pack ecosystems.
+
+| Language | Named arguments | Import-file edges | Indexed hierarchy | Class-set type flow |
+| --- | --- | --- | --- | --- |
+| Python | Yes | Yes | Yes | Yes |
+| Java | No | Yes | Yes | No |
+| JavaScript | No | Yes | Yes | Yes |
+| TypeScript | No | Yes | Yes | Yes |
+| Go | No | Yes | Yes, including indexed type relationships | No |
+| C | No | Yes, through structured includes | Not applicable | No |
+| C++ | No | Yes, through structured includes | Yes | No |
+| Rust | No | Yes, including edges through `pub use` re-exports to the file that defines the item | Yes | No |
+| PHP | Yes | Yes, from namespace `use` clauses and class type references; `require` and `include` paths do not create edges | Yes | Yes |
+| Scala | Yes | Yes | Yes | No |
+| C# | Yes | Yes | Yes | No |
+| Ruby | Yes | Yes, for literal `require`, `require_relative`, `load`, and `autoload` paths | Yes | Yes |
+| Kotlin | Yes | Yes | Yes | No |
+
+Class-set type flow powers the `class_set` and `absent_member` query steps. For a language without it, those steps return no rows and the `semantic_capability_unsupported` diagnostic.
+
+Some language behavior limits what the index contains:
+
+- C# `#if` chains: Bifrost parses one branch of each chain, the first one whose condition is not the literal `false`. It does not model defined symbols. Declarations in other branches are not indexed, and the file's semantic diagnostics are marked incomplete.
+- Go build constraints are not evaluated. Bifrost indexes every `.go` file, including files that only build on some platforms.
+- Bifrost does not analyze `.vue`, `.svelte`, `.razor`, or `.cshtml` templates, or extensions outside the supported list such as `.pyi` and `.mts`. `scan_usages` adds a note when template files are present.
+- Build topology steps (`target_of`, `source_set_of`, `topology_edges_of`) read Maven `pom.xml` files only. Gradle builds are not read for topology.
 
 ### Bounded Receiver Provenance
 
@@ -40,17 +53,21 @@ complete precision for every language construct.
 
 Receiver availability is not defined by a static language allowlist. The selected adapter, exact source shape, workspace evidence, budgets, and cancellation state determine the result. Treat each `receiver_analysis` row and its diagnostics as authoritative for that input.
 
-The executable [language tutorials](/code-query-tutorials/) prove structural vocabulary against fixtures. [Reference Traversal](/code-query-tutorials/reference-traversal/#cross-language-support) exercises inbound and outbound graph pipelines across every graph-backed adapter, [Import Traversal](/code-query-tutorials/import-traversal/#direct-import-forms-by-language) records direct-edge support and the PHP diagnostic boundary, and [Receiver Traversal](/code-query-tutorials/receiver-traversal/) locks the shared outcome and provenance contract.
+The executable [language tutorials](/code-query-tutorials/) prove structural vocabulary against fixtures. [Reference Traversal](/code-query-tutorials/reference-traversal/) exercises inbound and outbound graph pipelines across every graph-backed adapter, [Import Traversal](/code-query-tutorials/import-traversal/) records direct-edge support, and [Receiver Traversal](/code-query-tutorials/receiver-traversal/) locks the shared outcome and provenance contract.
 
 ### Bounded Data Flow And Typestate
 
 Every language in the matrix has the direct value-flow baseline described
 above; C and C++ share the C-family semantic adapter. Advanced field,
 receiver, exceptional-flow, dynamic-dispatch, and external-model precision
-still varies by adapter and source shape.
+still varies by adapter and source shape. The
+[semantic IR table](/reference/languages/#semantic-ir-capabilities) lists,
+for each adapter, which features are complete, partial, or unsupported.
 
 The public query vocabulary exposes procedure-local CFG inspection plus
-host-registered value-flow, typestate, and retained taint projections. `.rqlp`
+value-flow, typestate, and retained taint projections. Only a Rust host that
+embeds the [Rust library](/rust-library/) can register the inputs that these
+projections read. `.rqlp`
 taint policies use the production compiler, set-oriented batch planner, solver,
 retained report, and human/JSON/SARIF projection. Typestate policies execute
 finite-state protocols over the bounded semantic graph. See [Data Flow, Taint,
@@ -61,9 +78,9 @@ boundaries.
 
 Structural matching is syntax-precise: Bifrost matches normalized Tree-sitter nodes and roles rather than regex or substring approximations. It does not make a structural call match equivalent to a resolved callee identity. Use reference and call traversal when identity matters.
 
-Graph results preserve a proof tier. Filter to `proven` when an answer must contain only analyzer-established identities. Include `unproven` when a dynamic-language best effort is useful, and describe those candidates as possible rather than exact. A proven edge is precise evidence for that returned edge; it is not by itself proof that all possible runtime edges were found.
+Graph results preserve a proof tier. Filter to `proven` when an answer must contain only analyzer-established identities. Include `unproven` when a best-effort candidate is useful, and describe those candidates as possible rather than exact. This applies to every language: statically typed languages also return `unproven` edges when a receiver type is unknown or several targets remain. A proven edge is precise evidence for that returned edge; it is not by itself proof that all possible runtime edges were found.
 
-A zero-result is conclusive only within the reported capability, workspace, filters, and budgets. Before claiming “no matches” or “all callers,” check `truncated`, capability and execution diagnostics, proof tiers, and `provenance_truncated`. [Agent Result Safety](/agent-result-safety/) gives the complete decision rule; the JSON reference sections on [diagnostics](/code-query-json/#planner-and-capability-diagnostics) and [limits](/code-query-json/#limits-and-validation-errors) define the underlying contract.
+A zero-result is conclusive only within the reported capability, workspace, filters, and budgets. Before claiming “no matches” or “all callers,” check `truncated`, capability and execution diagnostics, proof tiers, and `provenance_truncated`. [Agent Result Safety](/agent-result-safety/) gives the complete decision rule; the [Code Query Reference](/reference/code-query/) lists every diagnostic code and execution limit.
 
 ## Imports, Types, And Dependencies
 

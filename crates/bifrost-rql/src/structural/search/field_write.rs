@@ -40,10 +40,9 @@ pub(super) fn field_write_value_expansions(
         .receiver_identity_id
         .as_deref()
         .is_some_and(|wanted| target.receiver_identity_id().as_deref() != Some(wanted))
-        || filter
-            .member_target_id
-            .as_deref()
-            .is_some_and(|wanted| target.member_identity_id() != wanted)
+        || filter.member_target_id.as_deref().is_some_and(|wanted| {
+            target.member_identity_id() != wanted && target.fq_name() != wanted
+        })
     {
         return Vec::new();
     }
@@ -134,7 +133,7 @@ fn project_trace(
         return None;
     };
 
-    if !same_byte_range(
+    if !same_range(
         &facts.node(receiver_node).range,
         &analysis.report.site.range,
     ) {
@@ -145,7 +144,7 @@ fn project_trace(
         );
         return None;
     }
-    if !same_byte_range(&facts.node(member_node).range, &member_range) {
+    if !same_range(&facts.node(member_node).range, &member_range) {
         push_incomplete(
             diagnostics,
             seed.language,
@@ -180,10 +179,6 @@ fn project_trace(
     })
 }
 
-fn same_byte_range(left: &Range, right: &Range) -> bool {
-    left.start_byte == right.start_byte && left.end_byte == right.end_byte
-}
-
 fn exactly_one_node(facts: &FileFacts, source: u32, role: Role) -> Option<u32> {
     let mut nodes = facts
         .role_targets(source, role)
@@ -203,12 +198,10 @@ fn push_incomplete(
     }) {
         return;
     }
-    diagnostics.push(CodeQueryDiagnostic {
-        code: CodeQueryDiagnosticCode::SemanticResultsOmitted,
-        impact: CodeQueryDiagnosticImpact::Incomplete,
-        branch: Vec::new(),
-        language: language.config_label(),
-        message: message.to_string(),
-        exhausted_roots: Vec::new(),
-    });
+    diagnostics.push(incomplete_diagnostic(
+        CodeQueryDiagnosticCode::SemanticResultsOmitted,
+        language.config_label(),
+        message.to_string(),
+        Vec::new(),
+    ));
 }

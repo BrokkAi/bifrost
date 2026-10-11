@@ -1,11 +1,11 @@
 use crate::java::declarations::parse_tree;
 use brokk_bifrost_core::analyzer::exception_handling::{
-    HandlerScoreInput, collect_nodes_by_kind, compact_excerpt, find_first_named_descendant,
-    has_descendant_of_any_kind_inclusive, has_descendant_of_kind, score_handler, sort_findings,
+    HandlerScoreInput, build_handler_smell, collect_nodes_by_kind, find_first_named_descendant,
+    has_descendant_of_any_kind_inclusive, has_descendant_of_kind, sort_findings,
 };
 use brokk_bifrost_core::analyzer::model::{ExceptionHandlingSmell, ExceptionSmellWeights};
+pub use brokk_bifrost_core::analyzer::tree_walk::first_named_child_of_kind as named_child_by_kind;
 use brokk_bifrost_core::analyzer::{CodeUnitIndex, ProjectFile};
-use brokk_bifrost_core::path_utils::rel_path_string;
 use tree_sitter::Node;
 
 // heuristic. Kept as a private const list so the port stays explicit; do
@@ -88,7 +88,12 @@ fn analyze_catch_clause(
     } else {
         None
     };
-    let scored = score_handler(
+    build_handler_smell(
+        analyzer,
+        file,
+        source,
+        catch_node,
+        catch_type,
         weights,
         HandlerScoreInput {
             broad_handler,
@@ -96,37 +101,7 @@ fn analyze_catch_clause(
             has_comment: has_any_comment,
             log_only,
         },
-    )?;
-
-    let enclosing = analyzer
-        .enclosing_code_unit_for_lines(
-            file,
-            catch_node.start_position().row,
-            catch_node.end_position().row,
-        )
-        .map(|cu| cu.fq_name())
-        .unwrap_or_else(|| rel_path_string(file));
-    let excerpt = compact_excerpt(
-        source
-            .get(catch_node.start_byte()..catch_node.end_byte())
-            .unwrap_or(""),
-    );
-    Some(ExceptionHandlingSmell {
-        file: file.clone(),
-        enclosing_fq_name: enclosing,
-        catch_type,
-        score: scored.score,
-        body_statement_count: body_statements,
-        reasons: scored.reasons,
-        excerpt,
-        start_byte: catch_node.start_byte(),
-    })
-}
-
-pub fn named_child_by_kind<'tree>(node: Node<'tree>, kind: &str) -> Option<Node<'tree>> {
-    let mut cursor = node.walk();
-    node.named_children(&mut cursor)
-        .find(|child| child.kind() == kind)
+    )
 }
 
 fn extract_catch_type(catch_param: Node<'_>, source: &str) -> Option<String> {
@@ -181,9 +156,9 @@ fn first_non_comment_named_child<'tree>(
     node: Node<'tree>,
     comment_kinds: &[&str],
 ) -> Option<Node<'tree>> {
-    let mut cursor = node.walk();
-    node.named_children(&mut cursor)
-        .find(|child| !comment_kinds.contains(&child.kind()))
+    brokk_bifrost_core::analyzer::tree_walk::first_named_child_matching(node, |child| {
+        !comment_kinds.contains(&child.kind())
+    })
 }
 
 fn is_likely_log_only_body(body: Node<'_>, source: &str) -> bool {

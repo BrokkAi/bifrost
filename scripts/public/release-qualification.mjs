@@ -4,11 +4,12 @@ import { createHash } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { isFullCommitSha, isRecordObject, requireNonEmptyString, requireValue } from "../lib/value-validation.mjs";
+import { parseLongOptionArgs } from "./cli-argument-helpers.mjs";
 
 const SCHEMA_VERSION = 1;
 const READINESS_WORKFLOW_PATH = ".github/workflows/release-readiness.yml";
 const WORKFLOW_NAME = "release-readiness.yml";
-const COMMIT = /^[0-9a-f]{40}$/u;
 const SHA256 = /^[0-9a-f]{64}$/u;
 const REPOSITORY = /^[^/\\\s]+\/[^/\\\s]+$/u;
 const VERSION =
@@ -344,7 +345,7 @@ function validateArtifactEvidence(artifact) {
 }
 
 function exactKeys(value, allowed, label) {
-  if (value === null || typeof value !== "object" || Array.isArray(value)) {
+  if (!isRecordObject(value)) {
     throw new Error(`${label} must be an object.`);
   }
   const unexpected = Object.keys(value).filter((key) => !allowed.includes(key));
@@ -352,13 +353,12 @@ function exactKeys(value, allowed, label) {
 }
 
 function string(value, label) {
-  if (typeof value !== "string" || value.length === 0) throw new Error(`${label} must be a non-empty string.`);
-  return value;
+  return requireNonEmptyString(value, `${label} must be a non-empty string.`);
 }
 
 function commit(value, label) {
   const candidate = string(value, label);
-  if (!COMMIT.test(candidate)) throw new Error(`${label} must be 40 lowercase hexadecimal characters.`);
+  if (!isFullCommitSha(candidate)) throw new Error(`${label} must be 40 lowercase hexadecimal characters.`);
   return candidate;
 }
 
@@ -386,22 +386,11 @@ function readJsonFile(filePath, label) {
 }
 
 function parseArgs(args, usage) {
-  const options = {};
-  for (let index = 0; index < args.length; index += 2) {
-    const option = args[index];
-    const value = args[index + 1];
-    if (!option?.startsWith("--") || value === undefined || value.startsWith("--")) {
-      throw new Error(`Usage: ${usage}`);
-    }
-    if (options[option] !== undefined) throw new Error(`${option} may only be provided once.`);
-    options[option] = value;
-  }
-  return options;
+  return parseLongOptionArgs(args, `Usage: ${usage}`);
 }
 
 function required(options, option) {
-  if (!options[option]) throw new Error(`Missing required ${option}.`);
-  return options[option];
+  return requireValue(options[option], `Missing required ${option}.`);
 }
 
 function main(args) {

@@ -21,10 +21,11 @@ pub use binding::{
     MAX_TYPESTATE_SUBJECTS, MAX_TYPESTATE_TERMINAL_BINDINGS, TypestateBindingContext,
     TypestateBindingMultiplicity, TypestateBindingPlan, TypestateBindingPlanError,
     TypestateBindingQuality, TypestateCallNonInterferenceSpec, TypestateContextKey,
-    TypestateEventBindingId, TypestateEventBindingSpec, TypestateInitialSeedSpec,
-    TypestateObjectKey, TypestateObjectRole, TypestateObservationSite, TypestateProcedurePortKey,
-    TypestateSubjectClassError, TypestateSubjectClassKey, TypestateSubjectId, TypestateSubjectKey,
-    TypestateTerminalBindingId, TypestateTerminalBindingSpec,
+    TypestateEventBindingId, TypestateEventBindingSpec, TypestateEventCondition,
+    TypestateInitialSeedSpec, TypestateObjectKey, TypestateObjectRole, TypestateObservationSite,
+    TypestateProcedurePortKey, TypestateSubjectClassError, TypestateSubjectClassKey,
+    TypestateSubjectId, TypestateSubjectKey, TypestateTerminalBindingId,
+    TypestateTerminalBindingSpec,
 };
 pub use client::{
     TypestateBackwardDemand, TypestateBackwardResult, TypestateBackwardSolveError, TypestateFact,
@@ -47,21 +48,13 @@ pub use planned::{
     TypestateCanonicalObservation, TypestatePlannedEvidence, TypestatePlannedResult,
     TypestatePlannedSolveError, solve_typestate_planned,
 };
-pub(crate) use production::direct_publication_destination;
-pub(crate) use production::summary_returns_identify_call_result;
-pub(crate) use production::{
-    DirectConcurrencyPath, DirectScalarSource, direct_concurrency_modeled_subject_path,
-    direct_concurrency_path, direct_scalar_source, direct_scalar_summary_port,
-};
+pub use production::{DirectScalarSource, direct_scalar_source};
 pub use production::{
-    ProductionSemanticSummaryAcquisition, ProductionSemanticSummaryAcquisitionKind,
     ProductionSemanticSummarySet, ProductionSummaryLifecycleCounters,
     ProductionSummaryProjectionError, ProductionTypestateExecutionContext,
     ProductionTypestateSolveError, ProductionTypestateSolveResult,
     ProductionTypestateSummaryRepository, TypestateProductionCacheStatus,
-    TypestateSummaryRepositoryLimits, acquire_production_semantic_summaries,
-    acquire_production_semantic_summaries_with_concurrency, project_production_semantic_summaries,
-    project_production_semantic_summaries_with_concurrency,
+    TypestateSummaryRepositoryLimits, project_production_semantic_summaries,
     solve_typestate_with_production_summaries,
 };
 pub use protocol::{

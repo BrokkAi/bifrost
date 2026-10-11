@@ -6,12 +6,14 @@
 //! it. That keeps the metric available to every parsed language without
 //! duplicating comment token handling in each language adapter.
 
+use std::sync::Arc;
+
 use crate::analyzer::common::{is_unparseable_source, language_for_file};
 use crate::analyzer::tree_sitter_analyzer::{
     WalkControl, expanded_comment_start, walk_tree_preorder,
 };
 use crate::analyzer::{
-    CodeUnit, CommentDensityStats, IAnalyzer, Language, ProjectFile, SummaryFileProjection,
+    CodeUnit, CommentDensityStats, IAnalyzer, Language, ProjectFile, Range, SummaryFileProjection,
     parser_language_for_path,
 };
 use crate::hash::HashMap;
@@ -24,11 +26,7 @@ pub(crate) fn for_code_unit(
     code_unit: &CodeUnit,
 ) -> Option<CommentDensityStats> {
     let file = code_unit.source();
-    let projection = analyzer.summary_file_projection(file);
-    let source = analyzer
-        .indexed_source(file)
-        .or_else(|| analyzer.project().read_source(file).ok())?;
-    let density = analyze_file(analyzer, file, &source, projection.as_deref())?;
+    let (_, density) = analyze_file_from_analyzer(analyzer, file)?;
     build_roll_up_stats(code_unit, &density)
 }
 
@@ -37,14 +35,7 @@ pub(crate) fn by_top_level(
     analyzer: &(impl IAnalyzer + ?Sized),
     file: &ProjectFile,
 ) -> Vec<CommentDensityStats> {
-    let projection = analyzer.summary_file_projection(file);
-    let Some(source) = analyzer
-        .indexed_source(file)
-        .or_else(|| analyzer.project().read_source(file).ok())
-    else {
-        return Vec::new();
-    };
-    let Some(density) = analyze_file(analyzer, file, &source, projection.as_deref()) else {
+    let Some((projection, density)) = analyze_file_from_analyzer(analyzer, file) else {
         return Vec::new();
     };
     projection
@@ -54,6 +45,18 @@ pub(crate) fn by_top_level(
         .filter(|code_unit| !code_unit.is_module() && !code_unit.is_synthetic())
         .filter_map(|code_unit| build_roll_up_stats(&code_unit, &density))
         .collect()
+}
+
+fn analyze_file_from_analyzer(
+    analyzer: &(impl IAnalyzer + ?Sized),
+    file: &ProjectFile,
+) -> Option<(Option<Arc<SummaryFileProjection>>, DensityFile)> {
+    let projection = analyzer.summary_file_projection(file);
+    let source = analyzer
+        .indexed_source(file)
+        .or_else(|| analyzer.project().read_source(file).ok())?;
+    let density = analyze_file(analyzer, file, &source, projection.as_deref())?;
+    Some((projection, density))
 }
 
 fn analyze_file(
@@ -98,27 +101,41 @@ fn analyze_file(
     // Analyzer range and child lookups may hydrate persisted file state. Build
     // the declaration view once per file instead of repeating those lookups
     // for every comment in the file.
-    let declarations = projection.map_or_else(
-        || {
-            collect_declarations_from_analyzer(
-                analyzer,
-                language,
-                source,
-                file,
-                &primary_constructor_ranges,
-                &class_parameter_ranges,
+    let top_level_declarations = projection.map_or_else(
+        || analyzer.top_level_declarations(file),
+        |projection| projection.top_level_declarations.clone(),
+    );
+    let declarations = collect_declarations(
+        top_level_declarations,
+        |code_unit| {
+            projection.map_or_else(
+                || analyzer.ranges(code_unit),
+                |projection| {
+                    projection
+                        .ranges
+                        .get(code_unit)
+                        .cloned()
+                        .unwrap_or_default()
+                },
             )
         },
-        |projection| {
-            collect_declarations_from_projection(
-                projection,
-                language,
-                source,
-                file,
-                &primary_constructor_ranges,
-                &class_parameter_ranges,
+        |code_unit| {
+            projection.map_or_else(
+                || analyzer.direct_children(code_unit),
+                |projection| {
+                    projection
+                        .children
+                        .get(code_unit)
+                        .cloned()
+                        .unwrap_or_default()
+                },
             )
         },
+        language,
+        source,
+        file,
+        &primary_constructor_ranges,
+        &class_parameter_ranges,
     );
     let mut aggregates: HashMap<String, (u32, u32)> = HashMap::default();
     for comment in comments {
@@ -167,8 +184,11 @@ struct DensityRange {
     exclude_from_attribution: bool,
 }
 
-fn collect_declarations_from_analyzer(
-    analyzer: &(impl IAnalyzer + ?Sized),
+#[allow(clippy::too_many_arguments)]
+fn collect_declarations(
+    top_level_declarations: Vec<CodeUnit>,
+    mut ranges_for: impl FnMut(&CodeUnit) -> Vec<Range>,
+    mut children_for: impl FnMut(&CodeUnit) -> Vec<CodeUnit>,
     language: Language,
     source: &str,
     file: &ProjectFile,
@@ -176,8 +196,7 @@ fn collect_declarations_from_analyzer(
     class_parameter_ranges: &[(usize, usize, usize)],
 ) -> Vec<DensityDeclaration> {
     let mut declarations = Vec::new();
-    let mut pending: Vec<(CodeUnit, usize, Option<usize>)> = analyzer
-        .top_level_declarations(file)
+    let mut pending: Vec<(CodeUnit, usize, Option<usize>)> = top_level_declarations
         .into_iter()
         .map(|code_unit| (code_unit, 0, None))
         .collect();
@@ -190,7 +209,7 @@ fn collect_declarations_from_analyzer(
         if code_unit.source() != file {
             continue;
         }
-        let raw_ranges = analyzer.ranges(&code_unit);
+        let raw_ranges = ranges_for(&code_unit);
         let is_constructor =
             is_kotlin_primary_constructor(&code_unit, &raw_ranges, primary_constructor_ranges);
         let span_lines = raw_ranges
@@ -229,84 +248,10 @@ fn collect_declarations_from_analyzer(
             declarations[parent].children.push(index);
         }
         pending.extend(
-            analyzer
-                .direct_children(&declarations[index].code_unit)
+            children_for(&declarations[index].code_unit)
                 .into_iter()
                 .map(|child| (child, depth + 1, Some(index))),
         );
-    }
-    declarations
-}
-
-fn collect_declarations_from_projection(
-    projection: &SummaryFileProjection,
-    language: Language,
-    source: &str,
-    file: &ProjectFile,
-    primary_constructor_ranges: &[(usize, usize)],
-    class_parameter_ranges: &[(usize, usize, usize)],
-) -> Vec<DensityDeclaration> {
-    let mut declarations = Vec::new();
-    let mut pending: Vec<(CodeUnit, usize, Option<usize>)> = projection
-        .top_level_declarations
-        .iter()
-        .cloned()
-        .map(|code_unit| (code_unit, 0, None))
-        .collect();
-    while let Some((code_unit, depth, parent)) = pending.pop() {
-        if code_unit.source() != file {
-            continue;
-        }
-        let raw_ranges = projection
-            .ranges
-            .get(&code_unit)
-            .cloned()
-            .unwrap_or_default();
-        let is_constructor =
-            is_kotlin_primary_constructor(&code_unit, &raw_ranges, primary_constructor_ranges);
-        let span_lines = raw_ranges
-            .iter()
-            .map(|range| (range.end_line.saturating_sub(range.start_line) + 1) as u32)
-            .sum();
-        let ranges = raw_ranges
-            .into_iter()
-            .map(|range| DensityRange {
-                start: expanded_density_range_start(
-                    language,
-                    source,
-                    range.start_byte,
-                    range.end_byte,
-                    class_parameter_ranges,
-                ),
-                declaration_start: range.start_byte,
-                end: range.end_byte,
-                exclude_from_attribution: is_constructor
-                    && is_primary_constructor_range(
-                        range.start_byte,
-                        range.end_byte,
-                        primary_constructor_ranges,
-                    ),
-            })
-            .collect();
-        let index = declarations.len();
-        declarations.push(DensityDeclaration {
-            code_unit,
-            depth,
-            ranges,
-            children: Vec::new(),
-            span_lines,
-        });
-        if let Some(parent) = parent {
-            declarations[parent].children.push(index);
-        }
-        if let Some(children) = projection.children.get(&declarations[index].code_unit) {
-            pending.extend(
-                children
-                    .iter()
-                    .cloned()
-                    .map(|child| (child, depth + 1, Some(index))),
-            );
-        }
     }
     declarations
 }
@@ -429,6 +374,7 @@ fn is_primary_constructor_range(
 mod tests {
     use super::*;
     use crate::test_support::AnalyzerFixture;
+    use brokk_bifrost_test_macros::hardwon;
 
     fn assert_projection_matches_direct(
         path: &str,
@@ -457,6 +403,9 @@ mod tests {
     }
 
     #[test]
+    #[hardwon(
+        "#2592: JavaScript import projection attributed comments differently from the direct scan"
+    )]
     fn javascript_projection_preserves_imported_module_attribution() {
         let stats = assert_projection_matches_direct(
             "response.js",
@@ -474,6 +423,9 @@ mod tests {
     }
 
     #[test]
+    #[hardwon(
+        "#2592: TypeScript import projection attributed comments differently from the direct scan"
+    )]
     fn typescript_projection_preserves_imported_module_attribution() {
         let stats = assert_projection_matches_direct(
             "Ky.ts",
@@ -491,6 +443,7 @@ mod tests {
     }
 
     #[test]
+    #[hardwon("#2592: Scala synthetic constructor children stole class comment attribution")]
     fn scala_projection_filters_synthetic_children_for_attribution() {
         let stats = assert_projection_matches_direct(
             "Elem.scala",
@@ -509,6 +462,7 @@ mod tests {
     }
 
     #[test]
+    #[hardwon("#2592: Kotlin synthetic constructor children stole class comment attribution")]
     fn kotlin_projection_filters_synthetic_children_for_attribution() {
         let stats = assert_projection_matches_direct(
             "ResultRow.kt",
@@ -527,6 +481,9 @@ mod tests {
     }
 
     #[test]
+    #[hardwon(
+        "#3357: overlapping Kotlin constructor ranges lost the secondary body comment attribution"
+    )]
     fn kotlin_primary_constructor_overlap_does_not_capture_secondary_body() {
         let stats = assert_projection_matches_direct(
             "Widget.kt",
@@ -559,6 +516,9 @@ mod tests {
     }
 
     #[test]
+    #[hardwon(
+        "#3357: constructor property documentation was lost from its own and enclosing comment rollups"
+    )]
     fn kotlin_constructor_property_keeps_its_attached_documentation() {
         let source = "/** Class documentation. */\nclass Widget(\n  /** Property documentation. */\n  val name: String\n)\n";
         let property = assert_projection_matches_direct("Widget.kt", source, "Widget.name");

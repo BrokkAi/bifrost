@@ -1,7 +1,7 @@
 [project]
 name = "brokk-bifrost"
 dynamic = ["version"]
-description = "Native Bifrost code analysis CLI, MCP server, and language server"
+description = "Native Bifrost code analysis CLI and MCP server"
 requires-python = ">=3.8"
 license = "Apache-2.0"
 license-files = [".generated-licenses/*"]

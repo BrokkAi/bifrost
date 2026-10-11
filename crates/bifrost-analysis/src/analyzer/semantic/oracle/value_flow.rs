@@ -383,34 +383,8 @@ fn structured_value_origin_matches_root(
             continue;
         }
         let current_matches = match expected {
-            AccessPathRoot::Value(value) => value.id() == current,
-            AccessPathRoot::Allocation(allocation) => procedure
-                .semantics()
-                .allocation(allocation.id())
-                .is_some_and(|row| row.result == current),
-            AccessPathRoot::ProcedurePort(port) => procedure
-                .semantics()
-                .value(current)
-                .is_some_and(|value| match port.kind() {
-                    ProcedurePortKind::Receiver => {
-                        matches!(value.kind, SemanticValueKind::Receiver { .. })
-                    }
-                    ProcedurePortKind::Parameter { ordinal } => {
-                        matches!(value.kind, SemanticValueKind::Parameter { ordinal: actual, .. } if actual == ordinal)
-                    }
-                    ProcedurePortKind::NormalReturn
-                    | ProcedurePortKind::IndexedNormalReturn { .. }
-                    | ProcedurePortKind::ExceptionalReturn
-                    | ProcedurePortKind::Capture { .. } => false,
-                }),
-            AccessPathRoot::Static(_)
-            | AccessPathRoot::TypeSummary(_)
-            | AccessPathRoot::ModuleObject(_)
-            | AccessPathRoot::RuntimeObject(_)
-            | AccessPathRoot::External(_)
-            | AccessPathRoot::CallResult(_)
-            | AccessPathRoot::LexicalCell(_)
-            | AccessPathRoot::CaptureSlot(_) => false,
+            AccessPathRoot::CallResult(_) | AccessPathRoot::LexicalCell(_) => false,
+            root => super::model::access_root_identity_matches_value(root, procedure, current),
         };
         if current_matches {
             return true;
@@ -594,7 +568,7 @@ fn relation_matches_event(
             location, value, ..
         } => {
             relation.kind == ValueFlowRelationKind::MemoryStore
-                && value_endpoint(&relation.source, *value)
+                && runtime_value_endpoint(procedure, &relation.source, *value)
                 && (matches!(&relation.target, ValueFlowEndpoint::Location(_))
                     || direct_capture_port_matches(procedure, *location, &relation.target)
                     || chains
@@ -722,6 +696,10 @@ pub struct ValueFlowRelation {
     ///
     /// [`StrongUpdateCertificate`]: super::heap::StrongUpdateCertificate
     pub strong_update: bool,
+    /// Exact direct lexical-cell replacement before any possible publication.
+    /// This is a local write verdict, independent of heap escape certification.
+    /// It does not establish complete capture execution or non-escape.
+    pub direct_cell_overwrite: bool,
 }
 
 impl ValueFlowRelation {
@@ -801,8 +779,7 @@ impl ValueFlowRelation {
     }
 
     pub const fn is_proven_complete(&self) -> bool {
-        matches!(self.proof, ProofStatus::Proven)
-            && matches!(self.completeness, EvidenceCompleteness::Complete)
+        self.proof.establishes_complete_evidence(&self.completeness)
     }
 
     /// When this relation's target is evaluated relative to its source, at the
@@ -917,6 +894,23 @@ impl ValueFlowSnapshot {
                 .supports_quality(&relation.proof, &relation.completeness)
             {
                 return Err(OracleContractError::InvalidRelationQuality);
+            }
+            // The local overwrite verdict is not a heap escape claim. It can
+            // only license replacement of the exact directly named frame cell.
+            if relation.direct_cell_overwrite
+                && (relation.kind != ValueFlowRelationKind::MemoryStore
+                    || !relation.is_proven_complete()
+                    || !matches!((&event.effect, &relation.target),
+                        (SemanticEffect::MemoryStore { location: id, .. },
+                         ValueFlowEndpoint::Location(location))
+                            if location.path().is_exact()
+                                && location.path().selectors().is_empty()
+                                && matches!(location.path().root(), AccessPathRoot::LexicalCell(cell)
+                                    if cell.procedure() == &procedure && cell.id() == *id)
+                                && procedure.semantics().memory_location(*id).is_some_and(|row|
+                                    matches!(row.kind, MemoryLocationKind::LexicalCell { .. }))))
+            {
+                return Err(OracleContractError::InvalidRelationIdentity);
             }
             // A strong update is only ever a claim about one exact overwritten
             // location, backed by proven and complete evidence. Rejecting the

@@ -4,17 +4,18 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use brokk_bifrost_core::analyzer::ProjectFile;
 use brokk_bifrost_core::analyzer::resolution_facts::{
-    ResolutionBinderKind, ResolutionDeclaredTypeRelationKind, ResolutionEngineRuleKind, ResolutionGapFact,
-    ResolutionGapKind,
+    ResolutionBinderKind, ResolutionDeclaredTypeRelationKind, ResolutionEngineRuleKind,
+    ResolutionGapFact, ResolutionGapKind,
 };
 use brokk_bifrost_rust::declarations::parse_rust_file;
+use brokk_bifrost_test_macros::hardwon;
 use tree_sitter::Parser;
 
 use crate::analyzer::resolution::fact_lowering::LoweringGapOrigin;
 use crate::analyzer::resolution::fact_lowering::fixture_names::gap_reason_semantic;
 use crate::analyzer::resolution::fact_source::{
     DeclarationAccessDecision, DeclarationAccessRequest, DeclarationAccessRow, FactPageVisitor,
-    SelectedDeclarationAccessSource, SelectedTypedFactSource, TypedFactReadOutcome,
+    ReasonOwnerRow, SelectedDeclarationAccessSource, SelectedTypedFactSource, TypedFactReadOutcome,
     TypedFactRequest,
 };
 use crate::analyzer::store::Result as StoreResult;
@@ -48,8 +49,12 @@ fn parsed_rust_fixture_with_mutation(
     let mut facts = parse_rust_file(&file, source, &tree).resolution_facts;
     mutate(&mut facts);
     let fragment = BindingFragmentId::for_test(label);
-    let lexical = crate::analyzer::resolution::lower_for_test(fragment, Language::Rust, &facts).lexical().clone();
-    let typed = crate::analyzer::resolution::lower_for_test(fragment, Language::Rust, &facts).typed().clone();
+    let lexical = crate::analyzer::resolution::lower_for_test(fragment, Language::Rust, &facts)
+        .lexical()
+        .clone();
+    let typed = crate::analyzer::resolution::lower_for_test(fragment, Language::Rust, &facts)
+        .typed()
+        .clone();
     let service =
         PreloadedFactResolutionService::from_lowered_fragments([lexical.clone()], [typed.clone()]);
     ParsedRustFixture {
@@ -146,7 +151,9 @@ fn assert_incomplete(answer: &FactResolutionAnswer) {
 struct ExactDeclarationAccessSource {
     identity: SemanticId,
     decisions: Box<[(DeclarationAccessRequest, DeclarationAccessDecision)]>,
+    reason_owners: Box<[ReasonOwnerRow]>,
     visits: AtomicUsize,
+    reason_owner_visits: AtomicUsize,
 }
 
 impl ExactDeclarationAccessSource {
@@ -157,8 +164,15 @@ impl ExactDeclarationAccessSource {
         Self {
             identity,
             decisions: decisions.into(),
+            reason_owners: Box::new([]),
             visits: AtomicUsize::new(0),
+            reason_owner_visits: AtomicUsize::new(0),
         }
+    }
+
+    fn with_reason_owners(mut self, reason_owners: impl Into<Box<[ReasonOwnerRow]>>) -> Self {
+        self.reason_owners = reason_owners.into();
+        self
     }
 
     fn decision(&self, request: DeclarationAccessRequest) -> DeclarationAccessDecision {
@@ -193,6 +207,46 @@ impl SelectedDeclarationAccessSource for ExactDeclarationAccessSource {
                 activation_reason: None,
                 request,
                 decision: self.decision(request),
+                visibility_applies: false,
+                subclass_access: None,
+            })
+            .collect::<Vec<_>>();
+        if rows.is_empty() {
+            return Ok(TypedFactReadOutcome::exhausted(
+                ResolutionCompletion::Complete,
+            ));
+        }
+        if !visitor.visit_page(&rows)? {
+            return Ok(TypedFactReadOutcome::stopped(
+                ResolutionCompletion::Complete,
+            ));
+        }
+        Ok(TypedFactReadOutcome::exhausted(
+            ResolutionCompletion::Complete,
+        ))
+    }
+
+    fn visit_reason_owners(
+        &self,
+        _facts: &dyn SelectedTypedFactSource,
+        reasons: TypedFactRequest<'_, SemanticId>,
+        cancellation: &CancellationToken,
+        visitor: &mut FactPageVisitor<'_, ReasonOwnerRow>,
+    ) -> StoreResult<TypedFactReadOutcome> {
+        if cancellation.is_cancelled() {
+            return Ok(TypedFactReadOutcome::cancelled(
+                ResolutionCompletion::Complete,
+            ));
+        }
+        self.reason_owner_visits.fetch_add(1, Ordering::Relaxed);
+        let rows = reasons
+            .as_slice()
+            .iter()
+            .filter_map(|reason| {
+                self.reason_owners
+                    .iter()
+                    .find(|owner| owner.reason == *reason)
+                    .copied()
             })
             .collect::<Vec<_>>();
         if rows.is_empty() {
@@ -225,9 +279,15 @@ fn use_service(service: Service) {
 
 fn private_member_fixture(label: &[u8]) -> (ParsedRustFixture, SemanticId, SemanticId) {
     let fixture = parsed_rust_fixture(PRIVATE_MEMBER_SOURCE, label);
-    let reference = callable_reference_named_at(&fixture, "service.hidden", "hidden");
-    let target = definition_after(&fixture, "impl Service", "hidden");
+    let (reference, target) = private_member_semantics(&fixture);
     (fixture, reference, target)
+}
+
+fn private_member_semantics(fixture: &ParsedRustFixture) -> (SemanticId, SemanticId) {
+    (
+        callable_reference_named_at(fixture, "service.hidden", "hidden"),
+        definition_after(fixture, "impl Service", "hidden"),
+    )
 }
 
 fn private_member_fixture_with_other_gap(
@@ -252,8 +312,7 @@ fn private_member_fixture_with_other_gap(
             kind: ResolutionGapKind::UnsupportedImplicitReceiver,
         });
     });
-    let reference = callable_reference_named_at(&fixture, "service.hidden", "hidden");
-    let target = definition_after(&fixture, "impl Service", "hidden");
+    let (reference, target) = private_member_semantics(&fixture);
     let site = fixture
         .facts
         .identifiers
@@ -310,138 +369,7 @@ fn visibility_gap_reason(fixture: &ParsedRustFixture) -> SemanticId {
 }
 
 #[test]
-fn parsed_rust_inherent_impls_union_same_owner_and_reject_other_owner() {
-    let source = r#"
-pub struct Service;
-pub struct Other;
-
-impl Service {
-    pub fn run(&self) {}
-}
-
-impl Service {
-    pub fn run(&self) {}
-}
-
-impl Other {
-    pub fn run(&self) {}
-}
-
-fn use_service(service: Service) {
-    service.run();
-}
-
-fn use_other(other: Other) {
-    other.run();
-}
-"#;
-    let fixture = parsed_rust_fixture(source, b"rust-inherent-union");
-    let service_reference = callable_reference_named_at(&fixture, "service.run", "run");
-    let other_reference = callable_reference_named_at(&fixture, "other.run", "run");
-    let first = definition_after(&fixture, "impl Service", "run");
-    let first_marker = source.find("impl Service").expect("first impl");
-    let second_marker = source[first_marker + "impl Service".len()..]
-        .find("impl Service")
-        .map(|position| first_marker + "impl Service".len() + position)
-        .expect("second impl");
-    let second = definition_after(&fixture, &source[second_marker..], "run");
-    let other = definition_after(&fixture, "impl Other", "run");
-
-    let service_answer = fixture
-        .service
-        .resolve_reference(service_reference, &CancellationToken::new())
-        .expect("Rust inherent member evaluation succeeds");
-    let mut expected = [first, second];
-    expected.sort_unstable();
-    assert_eq!(service_answer.binding().targets(), &expected);
-    assert!(!service_answer.binding().targets().contains(&other));
-
-    let other_answer = fixture
-        .service
-        .resolve_reference(other_reference, &CancellationToken::new())
-        .expect("Rust distinct-owner member evaluation succeeds");
-    assert_eq!(other_answer.binding().targets(), &[other]);
-}
-
-#[test]
-fn parsed_rust_static_and_runtime_qualifiers_select_compatible_members() {
-    let source = r#"
-pub struct Service;
-
-impl Service {
-    pub fn make() {}
-    pub fn run(&self) {}
-}
-
-fn use_static() {
-    Service::make();
-}
-
-fn use_runtime(service: Service) {
-    service.run();
-}
-"#;
-    let fixture = parsed_rust_fixture(source, b"rust-inherent-qualifiers");
-    let static_reference = callable_reference_named_at(&fixture, "Service::make", "make");
-    let runtime_reference = callable_reference_named_at(&fixture, "service.run", "run");
-    let static_target = definition_after(&fixture, "impl Service", "make");
-    let runtime_target = definition_after(&fixture, "impl Service", "run");
-
-    let static_answer = fixture
-        .service
-        .resolve_reference(static_reference, &CancellationToken::new())
-        .expect("Rust static inherent member evaluation succeeds");
-    assert_eq!(static_answer.binding().targets(), &[static_target]);
-
-    let runtime_answer = fixture
-        .service
-        .resolve_reference(runtime_reference, &CancellationToken::new())
-        .expect("Rust runtime inherent member evaluation succeeds");
-    assert_eq!(runtime_answer.binding().targets(), &[runtime_target]);
-}
-
-#[test]
-fn parsed_rust_reference_receivers_autoderef_but_raw_pointers_do_not() {
-    let source = r#"
-pub struct Service;
-
-impl Service {
-    pub fn run(&self) {}
-}
-
-fn use_borrowed(borrowed: &&Service) {
-    borrowed.run();
-}
-
-fn use_raw(raw: *const Service) {
-    raw.run();
-}
-"#;
-    let fixture = parsed_rust_fixture(source, b"rust-reference-autoderef");
-    let target = definition_after(&fixture, "impl Service", "run");
-
-    let borrowed_reference = callable_reference_named_at(&fixture, "borrowed.run", "run");
-    let borrowed = fixture
-        .service
-        .resolve_reference(borrowed_reference, &CancellationToken::new())
-        .expect("Rust borrowed receiver evaluation succeeds");
-    assert_eq!(borrowed.binding().targets(), &[target]);
-    assert_eq!(
-        borrowed.binding().completion(),
-        &ResolutionCompletion::Complete
-    );
-
-    let raw_reference = callable_reference_named_at(&fixture, "raw.run", "run");
-    assert_ne!(borrowed_reference, raw_reference);
-    let raw = fixture
-        .service
-        .resolve_reference(raw_reference, &CancellationToken::new())
-        .expect("Rust raw-pointer receiver evaluation succeeds");
-    assert!(raw.binding().targets().is_empty());
-    assert_incomplete(&raw);
-}
-
-#[test]
+#[hardwon("#3828: smart pointer member references lost complete receiver resolution")]
 fn parsed_rust_owning_smart_pointer_receivers_reach_their_payload_members() {
     let source = r#"
 pub struct Service;
@@ -465,6 +393,10 @@ fn use_counted(counted: Rc<Service>) {
 fn use_opaque(opaque: Wrapper<Service>) {
     opaque.run();
 }
+
+fn use_plain(plain: Wrapper) {
+    plain.run();
+}
 "#;
     let fixture = parsed_rust_fixture(source, b"rust-smart-pointer-receiver");
     let target = definition_after(&fixture, "impl Service", "run");
@@ -483,91 +415,30 @@ fn use_opaque(opaque: Wrapper<Service>) {
             "{marker}"
         );
     }
-    // An unknown generic head is not transparent. Its substitution stays
-    // unproven, so the receiver keeps the head and finds no member.
-    let opaque = callable_reference_named_at(&fixture, "opaque.run", "run");
-    let answer = fixture
-        .service
-        .resolve_reference(opaque, &CancellationToken::new())
-        .expect("Rust opaque generic receiver evaluation succeeds");
-    assert!(answer.binding().targets().is_empty());
-    assert_incomplete(&answer);
-}
-
-#[test]
-fn parsed_rust_generic_impl_projects_nominal_self_receiver() {
-    let source = r#"
-pub struct Service<T>(T);
-
-impl<T> Service<T> {
-    pub fn run(&self) {}
-    pub fn call(&self) { self.run(); }
-}
-
-fn use_service(service: Service<u32>) {
-    service.run();
-}
-"#;
-    let fixture = parsed_rust_fixture(source, b"rust-generic-impl-self");
-    let target = definition_after(&fixture, "impl<T> Service<T>", "run");
-    for marker in ["self.run", "service.run"] {
+    // An unknown generic head is not transparent: the receiver keeps the
+    // head and finds no member. Since #3828 the written type argument is a
+    // relational row instead of an unsupported-syntax gap, so the generic
+    // receiver answers exactly as the same head written without arguments.
+    let answer_at = |marker| {
         let reference = callable_reference_named_at(&fixture, marker, "run");
-        let answer = fixture
+        fixture
             .service
             .resolve_reference(reference, &CancellationToken::new())
-            .expect("Rust generic inherent member evaluation succeeds");
-        assert_eq!(answer.binding().targets(), &[target], "{marker}");
-    }
+            .expect("Rust unresolved-head receiver evaluation succeeds")
+    };
+    let opaque = answer_at("opaque.run");
+    let plain = answer_at("plain.run");
+    assert!(opaque.binding().targets().is_empty(), "{opaque:?}");
+    assert!(plain.binding().targets().is_empty(), "{plain:?}");
+    assert_eq!(
+        opaque.binding().completion(),
+        plain.binding().completion(),
+        "opaque={opaque:?} plain={plain:?}"
+    );
 }
 
 #[test]
-fn parsed_rust_self_qualified_factory_resolves_through_impl_identity() {
-    let source = r#"
-pub struct Service;
-
-impl Service {
-    pub fn factory() -> Self { Self::new() }
-    pub fn new() -> Self { Service }
-}
-"#;
-    let fixture = parsed_rust_fixture(source, b"rust-self-qualified-factory");
-    let reference = callable_reference_named_at(&fixture, "Self::new", "new");
-    let target = definition_after(&fixture, "pub fn new", "new");
-    let answer = fixture
-        .service
-        .resolve_reference(reference, &CancellationToken::new())
-        .expect("Rust Self-qualified factory evaluation succeeds");
-    assert_eq!(answer.binding().targets(), &[target]);
-    assert_eq!(answer.binding().completion(), &ResolutionCompletion::Complete);
-}
-
-#[test]
-fn parsed_rust_call_initializer_types_its_let_binding() {
-    let source = r#"
-pub struct Service;
-
-impl Service {
-    pub fn new() -> Self { Service }
-    pub fn run(&self) {}
-}
-
-fn caller() {
-    let service = Service::new();
-    service.run();
-}
-"#;
-    let fixture = parsed_rust_fixture(source, b"rust-call-initializer-let-type");
-    let reference = callable_reference_named_at(&fixture, "service.run", "run");
-    let target = definition_after(&fixture, "pub fn run", "run");
-    let answer = fixture
-        .service
-        .resolve_reference(reference, &CancellationToken::new())
-        .expect("Rust inferred let receiver evaluation succeeds");
-    assert_eq!(answer.binding().targets(), &[target]);
-    assert_eq!(answer.binding().completion(), &ResolutionCompletion::Complete);
-}
-
-#[test]
+#[hardwon("4b818a2d36c1: Rust unwrap transfers failed to retain the payload for member resolution")]
 fn parsed_rust_unwrapped_initializers_reach_the_payload_and_wrapped_ones_do_not() {
     let source = r#"
 pub struct Service;
@@ -668,16 +539,20 @@ impl Service {
             .map(|origin| origin.origin),
         Some(ResolutionCallableReceiverOrigin::CurrentInstance)
     );
-    let self_declarations = fixture.facts.identifiers.iter().filter(|identifier| {
-        identifier.role == ResolutionIdentifierRole::Declaration
-            && identifier.namespace == ResolutionNamespace::Value
-            && fixture.facts.names[identifier.name.index()].spelling == "self"
-    }).collect::<Vec<_>>();
+    let self_declarations = fixture
+        .facts
+        .identifiers
+        .iter()
+        .filter(|identifier| {
+            identifier.role == ResolutionIdentifierRole::Declaration
+                && identifier.namespace == ResolutionNamespace::Value
+                && fixture.facts.names[identifier.name.index()].spelling == "self"
+        })
+        .collect::<Vec<_>>();
     assert_eq!(self_declarations.len(), 2);
     for declaration in self_declarations {
         assert!(fixture.facts.binders.iter().any(|binder| {
-            binder.declaration == declaration.site
-                && binder.kind == ResolutionBinderKind::Parameter
+            binder.declaration == declaration.site && binder.kind == ResolutionBinderKind::Parameter
         }));
         assert!(fixture.facts.declaration_type_slots.iter().any(|property| {
             property.declaration == declaration.site
@@ -697,14 +572,25 @@ impl Service {
         })
         .map(|relation| relation.subject)
         .expect("inherent impl owner frontier");
-    let nominal = fixture.facts.binding_projections.iter().find(|projection| {
-        projection.output == owner_type
-            && projection.kind == BindingProjectionKind::TargetNominalTypeIdentity
-    }).expect("impl owner uses the nominal output");
-    let receiver_type = fixture.facts.binding_projections.iter().find(|projection| {
-        projection.reference == nominal.reference
-            && projection.kind == BindingProjectionKind::TargetTypeIdentity
-    }).expect("impl receiver uses the paired payload output").output;
+    let nominal = fixture
+        .facts
+        .binding_projections
+        .iter()
+        .find(|projection| {
+            projection.output == owner_type
+                && projection.kind == BindingProjectionKind::TargetNominalTypeIdentity
+        })
+        .expect("impl owner uses the nominal output");
+    let receiver_type = fixture
+        .facts
+        .binding_projections
+        .iter()
+        .find(|projection| {
+            projection.reference == nominal.reference
+                && projection.kind == BindingProjectionKind::TargetTypeIdentity
+        })
+        .expect("impl receiver uses the paired payload output")
+        .output;
     assert_ne!(owner_type, receiver_type);
     assert!(fixture.facts.type_transfers.iter().any(|transfer| {
         transfer.input == receiver_type
@@ -801,6 +687,458 @@ fn callee_applicability_does_not_contaminate_receiver_construction() {
 }
 
 #[test]
+#[hardwon("#3746: generic type alias member calls lost their declaration owner")]
+fn parsed_rust_generic_type_alias_preserves_associated_member_owner() {
+    let source = r#"
+enum EitherWriter<A, B> { A(A), B(B) }
+type OptionalWriter<T> = EitherWriter<T, ()>;
+impl<T> OptionalWriter<T> {
+    fn some(value: T) -> Self { EitherWriter::A(value) }
+}
+fn make() { let _ = OptionalWriter::some(1usize); }
+"#;
+    let fixture = parsed_rust_fixture(source, b"rust-generic-alias-member-owner");
+    let expected = definition_after(&fixture, "impl<T> OptionalWriter<T>", "some");
+    let reference = callable_reference_named_at(&fixture, "OptionalWriter::some", "some");
+    let answer = fixture
+        .service
+        .resolve_reference(reference, &CancellationToken::new())
+        .unwrap();
+
+    assert_eq!(answer.binding().targets(), &[expected], "{answer:?}");
+}
+
+#[test]
+#[hardwon("#3828: nested generic aliases failed to substitute member call targets")]
+fn generic_alias_nested_generic_target_substitutes_for_member_calls() {
+    let source = r#"
+pub struct Square;
+impl Square { pub fn side(&self) {} }
+pub struct Circle;
+impl Circle { pub fn radius(&self) {} }
+pub struct Pair<A, B>(A, B);
+impl<A, B> Pair<A, B> { pub fn first() -> A { loop {} } }
+pub type Swap<X, Y> = Pair<Y, X>;
+pub type Reversed<X, Y> = Swap<X, Y>;
+pub struct Wrapper<T>(pub T);
+impl<T> Wrapper<Vec<T>> { pub fn only_nested(&self) {} }
+pub type Nested<X> = Wrapper<Vec<X>>;
+fn caller() {
+    Reversed::<Square, Circle>::first().radius();
+    let value: Nested<Square> = Wrapper(Vec::new());
+    value.only_nested();
+}
+"#;
+    let fixture = parsed_rust_fixture(source, b"rust-generic-alias-substitution");
+    let radius = definition_after(&fixture, "impl Circle", "radius");
+    let radius_reference = callable_reference_named_at(
+        &fixture,
+        "Reversed::<Square, Circle>::first().radius()",
+        "radius",
+    );
+    let radius_answer = fixture
+        .service
+        .resolve_reference(radius_reference, &CancellationToken::new())
+        .unwrap();
+    assert_eq!(
+        radius_answer.binding().targets(),
+        &[radius],
+        "{radius_answer:?}"
+    );
+    assert_eq!(
+        radius_answer.binding().completion(),
+        &ResolutionCompletion::Complete,
+        "{radius_answer:?}"
+    );
+
+    let nested = definition_after(&fixture, "impl<T> Wrapper<Vec<T>>", "only_nested");
+    let nested_reference =
+        callable_reference_named_at(&fixture, "value.only_nested()", "only_nested");
+    let nested_answer = fixture
+        .service
+        .resolve_reference(nested_reference, &CancellationToken::new())
+        .unwrap();
+    assert_eq!(
+        nested_answer.binding().targets(),
+        &[nested],
+        "{nested_answer:?}"
+    );
+    let reverse = fixture
+        .service
+        .references_to(nested, &CancellationToken::new())
+        .unwrap();
+    assert!(
+        reverse.references().contains(&nested_reference),
+        "{reverse:?}"
+    );
+}
+
+#[test]
+#[hardwon("#3828: recursive generic aliases escaped the structured type frontier")]
+fn generic_alias_cycle_stops_at_the_structured_type_frontier() {
+    let source = r#"
+pub struct Square;
+pub type First<T> = Second<T>;
+pub type Second<T> = First<T>;
+fn caller(value: First<Square>) { value.missing(); }
+"#;
+    let fixture = parsed_rust_fixture(source, b"rust-generic-alias-cycle");
+    let reference = callable_reference_named_at(&fixture, "value.missing()", "missing");
+    let answer = fixture
+        .service
+        .resolve_reference(reference, &CancellationToken::new())
+        .unwrap();
+    assert!(answer.binding().targets().is_empty(), "{answer:?}");
+    assert_incomplete(&answer);
+}
+
+#[test]
+fn parsed_rust_unknown_bound_keeps_an_unproven_reverse_site() {
+    let fixture = parsed_rust_fixture(
+        r#"
+pub trait Store { fn get(&self); }
+fn unknown<T: Missing>(value: &T) { value.get(); }
+"#,
+        b"rust-unknown-bound",
+    );
+    let definition = definition_after(&fixture, "pub trait Store", "get");
+    let reference = callable_reference_named_at(&fixture, "value.get", "get");
+    let forward = fixture
+        .service
+        .resolve_reference(reference, &CancellationToken::new())
+        .unwrap();
+    assert!(forward.binding().targets().is_empty(), "{forward:?}");
+    assert!(forward.type_bound_receiver);
+    let reverse = fixture
+        .service
+        .references_to(definition, &CancellationToken::new())
+        .unwrap();
+    assert_eq!(reverse.references(), &[reference]);
+    assert!(
+        reverse
+            .witnesses()
+            .iter()
+            .all(|witness| witness.completion() != &ResolutionCompletion::Complete)
+    );
+    assert_eq!(reverse.completion(), &ResolutionCompletion::Complete);
+}
+
+#[test]
+fn parsed_rust_ambiguous_bound_head_is_not_a_proven_union() {
+    let fixture = parsed_rust_fixture(
+        r#"
+pub trait Store { fn get(&self); }
+pub trait Store { fn get(&self); }
+fn ambiguous<T: Store>(value: &T) { value.get(); }
+"#,
+        b"rust-ambiguous-bound",
+    );
+    let reference = callable_reference_named_at(&fixture, "value.get", "get");
+    let answer = fixture
+        .service
+        .resolve_reference(reference, &CancellationToken::new())
+        .unwrap();
+    assert_eq!(answer.binding().targets().len(), 2, "{answer:?}");
+    assert!(
+        !answer.type_bound_receiver,
+        "ambiguous lexical alternatives are not independent bounds"
+    );
+}
+
+const RUST_BOUNDED_GENERICS: &str = r#"pub trait Shape { fn area(&self) -> f64; fn name(&self) -> u8; }
+pub struct Square;
+impl Square { pub fn side(&self) -> f64 { 1.0 } pub fn name(&self) -> u8 { 0 } }
+impl Shape for Square { fn area(&self) -> f64 { 1.0 } fn name(&self) -> u8 { 1 } }
+pub trait Consume { fn take(self) -> u8; }
+impl Consume for Square { fn take(self) -> u8 { 0 } }
+impl Square { pub fn take(&self) -> u8 { 1 } }
+pub fn pick<T: Shape>(value: T) -> T { value }
+pub fn pick_where<T>(value: T) -> T where T: Shape { value }
+pub fn identity<T>(value: T) -> T { value }
+pub fn make<T: Shape>() -> T { loop {} }
+pub fn caller(square: Square, other: Square) {
+    let picked = pick(square);
+    picked.area();
+    picked.side();
+    picked.name();
+    let chosen = pick_where(other);
+    chosen.area();
+    let copied = identity(square);
+    copied.side();
+    make::<Square>().name();
+    square.name();
+    Square::name(&square);
+    square.take();
+}
+pub fn body<T: Shape>(value: T) { value.area(); value.side(); }
+pub fn relay<U: Shape>() -> u8 { make::<U>().name() }
+pub fn gather(squares: &[Square]) -> usize { squares.iter().collect::<Vec<_>>().len() }
+"#;
+
+fn resolved(fixture: &ParsedRustFixture, marker: &str, name: &str) -> FactResolutionAnswer {
+    let reference = callable_reference_named_at(fixture, marker, name);
+    fixture
+        .service
+        .resolve_reference(reference, &CancellationToken::new())
+        .unwrap()
+}
+
+const RUST_INSTANTIATION_SOURCES: &str = r#"pub trait Shape { fn area(&self) -> f64; fn name(&self) -> u8; }
+pub struct Square;
+impl Square {
+    pub fn side(&self) -> f64 { 1.0 }
+    pub fn name(&self) -> u8 { 0 }
+    pub fn echo<T>(&self, value: T) -> T { value }
+}
+impl Shape for Square { fn area(&self) -> f64 { 1.0 } fn name(&self) -> u8 { 1 } }
+pub trait Echo { fn echo_back<T>(&self, value: T) -> T; }
+impl Echo for Square { fn echo_back<T>(&self, value: T) -> T { value } }
+pub struct Wrapper<W>(W);
+impl<W: Shape> Wrapper<W> {
+    pub fn make() -> W { loop {} }
+    pub fn inner(&self) -> &W { &self.0 }
+}
+pub fn make<T: Shape>() -> T { loop {} }
+pub fn caller(square: Square, other: Square, third: Square, wrapper: Wrapper<Square>) {
+    Wrapper::<Square>::make().name();
+    let made: Square = make();
+    let wrapped: Square = Wrapper::make();
+    Square::echo(&square, other).side();
+    Echo::echo_back(&square, third).side();
+    wrapper.inner().name();
+}
+"#;
+
+/// The result frontier of the call whose callee is `name` at `marker`.
+fn call_result(fixture: &ParsedRustFixture, marker: &str, name: &str) -> TypedFrontierState {
+    let callee = callable_reference_named_at(fixture, marker, name);
+    let obligation = fixture
+        .typed
+        .call_obligations()
+        .iter()
+        .find(|obligation| obligation.callee_reference() == callee)
+        .unwrap_or_else(|| panic!("{marker}: no call obligation"));
+    resolved(fixture, marker, name)
+        .projected_frontiers()
+        .iter()
+        .find(|frontier| frontier.slot() == obligation.result_slot())
+        .cloned()
+        .unwrap_or_else(|| panic!("{marker}: no call result frontier"))
+}
+
+const RUST_UNIT_VALUES: &str = r#"pub struct Square;
+impl Square { pub fn side(&self) -> f64 { 1.0 } }
+pub struct Pair(u8, u8);
+impl Pair { pub fn side(&self) -> f64 { 2.0 } }
+pub fn identity<T>(value: T) -> T { value }
+pub fn caller() {
+    let unit = Square;
+    unit.side();
+    identity(Square).side();
+    let constructor = Pair;
+    constructor.side();
+}
+"#;
+
+const RUST_ALIASED_TYPE_SEGMENTS: &str = r#"pub struct Square;
+impl Square { pub fn side(&self) -> f64 { 1.0 } }
+pub struct Circle;
+impl Circle { pub fn radius(&self) -> f64 { 1.0 } }
+pub struct Pair<P, Q>(P, Q);
+impl<A, B> Pair<A, B> {
+    pub fn first() -> A { loop {} }
+    pub fn second() -> B { loop {} }
+}
+pub type Swap<X, Y> = Pair<Y, X>;
+pub type Reversed<X, Y> = Swap<X, Y>;
+pub type Nested<X> = Pair<Vec<X>, X>;
+pub fn caller() {
+    Pair::<Square, Circle>::first().side();
+    Swap::<Square, Circle>::first().radius();
+    Reversed::<Square, Circle>::first().radius();
+    Nested::<Square>::second().side();
+}
+"#;
+
+/// A path's type segment writes its alias's arguments in the alias's order.
+/// Substitution follows both a parameter permutation and an alias-of-alias;
+/// nested target syntax retains the formal occurrence used by `second`.
+#[test]
+#[hardwon("#3828: generic alias type arguments were not substituted through nested aliases")]
+fn generic_alias_type_segments_substitute_concrete_and_nested_arguments() {
+    let fixture = parsed_rust_fixture(RUST_ALIASED_TYPE_SEGMENTS, b"rust-aliased-type-segments");
+    let square = definition_after(&fixture, "pub struct Square", "Square");
+    let circle = definition_after(&fixture, "pub struct Circle", "Circle");
+    for (marker, result, expected) in [
+        (
+            "Pair::<Square, Circle>::first()",
+            call_result(&fixture, "Pair::<Square, Circle>::first()", "first"),
+            square,
+        ),
+        (
+            "Swap::<Square, Circle>::first()",
+            call_result(&fixture, "Swap::<Square, Circle>::first()", "first"),
+            circle,
+        ),
+        (
+            "Reversed::<Square, Circle>::first()",
+            call_result(&fixture, "Reversed::<Square, Circle>::first()", "first"),
+            circle,
+        ),
+        (
+            "Nested::<Square>::second()",
+            call_result(&fixture, "Nested::<Square>::second()", "second"),
+            square,
+        ),
+    ] {
+        assert_eq!(
+            result.possible_values(),
+            &[ResolutionSlotValue::runtime(
+                ResolutionTypeRef::new(expected, 0),
+                false
+            )],
+            "{marker}: {result:?}"
+        );
+        assert_eq!(
+            result.completion(),
+            &ResolutionCompletion::Complete,
+            "{marker}: {result:?}"
+        );
+    }
+
+    let side = definition_after(&fixture, "pub fn side", "side");
+    let radius = definition_after(&fixture, "pub fn radius", "radius");
+    for (marker, name, expected) in [
+        ("Pair::<Square, Circle>::first().side", "side", side),
+        ("Swap::<Square, Circle>::first().radius", "radius", radius),
+        (
+            "Reversed::<Square, Circle>::first().radius",
+            "radius",
+            radius,
+        ),
+        ("Nested::<Square>::second().side", "side", side),
+    ] {
+        let answer = resolved(&fixture, marker, name);
+        assert_eq!(
+            answer.binding().targets(),
+            &[expected],
+            "{marker}: {answer:?}"
+        );
+        assert_eq!(
+            answer.binding().completion(),
+            &ResolutionCompletion::Complete,
+            "{marker}: {answer:?}"
+        );
+    }
+
+    for (target, expected_markers, name) in [
+        (
+            side,
+            vec![
+                "Pair::<Square, Circle>::first().side",
+                "Nested::<Square>::second().side",
+            ],
+            "side",
+        ),
+        (
+            radius,
+            vec![
+                "Swap::<Square, Circle>::first().radius",
+                "Reversed::<Square, Circle>::first().radius",
+            ],
+            "radius",
+        ),
+    ] {
+        let reverse = fixture
+            .service
+            .references_to(target, &CancellationToken::new())
+            .unwrap();
+        let mut expected = expected_markers
+            .iter()
+            .map(|marker| callable_reference_named_at(&fixture, marker, name))
+            .collect::<Vec<_>>();
+        expected.sort_unstable();
+        let mut references = reverse.references().to_vec();
+        references.sort_unstable();
+        assert_eq!(references, expected, "{reverse:?}");
+        assert_eq!(
+            reverse.completion(),
+            &ResolutionCompletion::Complete,
+            "{reverse:?}"
+        );
+        assert!(
+            reverse
+                .witnesses()
+                .iter()
+                .all(|witness| witness.completion() == &ResolutionCompletion::Complete),
+            "{reverse:?}"
+        );
+    }
+}
+
+const RUST_UNNAMEABLE_TRAIT_ITEM: &str = r#"pub struct Service;
+impl Display for Service { fn fmt(&self) -> u8 { 0 } }
+pub fn caller(service: Service) { service.fmt(); }
+"#;
+
+/// An impl item of a trait the rows cannot name (`Display` here names nothing
+/// in the fixture) answers alone and complete when the receiver's nameable
+/// traits are enumerated and none supplies the method. When the rows cannot
+/// place the receiver's traits, another trait could supply it too (E0034), so
+/// the item stays the target and the answer says why it is not complete.
+#[test]
+fn an_unnameable_trait_item_is_complete_only_where_the_nameable_traits_are_enumerated() {
+    let fixture = parsed_rust_fixture(RUST_UNNAMEABLE_TRAIT_ITEM, b"rust-unnameable-trait-item");
+    let fmt = definition_after(&fixture, "impl Display for Service { fn fmt", "fmt");
+    let answer = resolved(&fixture, "service.fmt", "fmt");
+    assert_eq!(answer.binding().targets(), &[fmt], "{answer:?}");
+    assert_eq!(
+        answer.binding().completion(),
+        &ResolutionCompletion::Complete,
+        "{answer:?}"
+    );
+
+    let mut fixture = parsed_rust_fixture(
+        RUST_UNNAMEABLE_TRAIT_ITEM,
+        b"rust-unnameable-trait-item-unplaced",
+    );
+    fixture.service.rust_implemented_traits_unplaced = true;
+    let fmt = definition_after(&fixture, "impl Display for Service { fn fmt", "fmt");
+    let answer = resolved(&fixture, "service.fmt", "fmt");
+    assert_eq!(answer.binding().targets(), &[fmt], "{answer:?}");
+    assert!(
+        matches!(
+            answer.binding().completion(),
+            ResolutionCompletion::Incomplete(_)
+        ),
+        "{answer:?}"
+    );
+}
+
+const RUST_TWO_UNEXPANDED_ITEM_MACROS: &str = r#"pub mod m {
+    pub struct Dim(pub i64);
+    macro_rules! from_int {
+        ($i:ty, $name:ident) => {
+            pub fn $name(v: $i) -> Dim {
+                Dim(v as i64)
+            }
+            impl From<$i> for Dim {
+                fn from(v: $i) -> Dim {
+                    $name(v)
+                }
+            }
+        };
+    }
+    from_int!(i32, from_i32);
+    from_int!(u8, from_u8);
+    from_int!(u16, from_u16);
+    pub fn bare() {
+        unbound_fn();
+    }
+}
+"#;
+
+#[test]
 fn transfer_evidence_retains_noncallee_applicability_and_other_callee_gaps() {
     let mut injected = Vec::new();
     let fixture = parsed_rust_fixture_with_mutation(
@@ -848,99 +1186,6 @@ fn transfer_evidence_retains_noncallee_applicability_and_other_callee_gaps() {
         );
     }
 }
-
-#[test]
-fn parsed_rust_named_calls_emit_argument_independent_binding_eligibility() {
-    let source = r#"
-pub fn direct() {}
-pub fn generic<T>(value: T) {}
-pub fn computed(pair: (fn(),)) {
-    pair.0();
-}
-
-pub mod nested {
-    pub fn qualified() {}
-}
-
-pub struct Service;
-
-impl Service {
-    pub fn run(&self) {}
-}
-
-pub fn caller(service: Service) {
-    direct();
-    crate::nested::qualified();
-    service.run();
-    generic::<Service>(service);
-}
-"#;
-    let fixture = parsed_rust_fixture(source, b"rust-call-eligibility");
-    let mut explicit_type_argument_counts = fixture
-        .facts
-        .calls
-        .iter()
-        .map(|call| call.explicit_type_argument_count)
-        .collect::<Vec<_>>();
-    explicit_type_argument_counts.sort_unstable();
-    assert_eq!(explicit_type_argument_counts, vec![0, 0, 0, 1]);
-    // One argument-independent-binding row per call. The Rust producer also
-    // emits an open-member-surface row per qualified reference, which is a
-    // different rule on a different site, so the count is per rule.
-    assert_eq!(
-        fixture
-            .facts
-            .engine_rule_eligibilities
-            .iter()
-            .filter(|eligibility| {
-                eligibility.rule == ResolutionEngineRuleKind::ArgumentIndependentBinding
-            })
-            .count(),
-        fixture.facts.calls.len()
-    );
-    assert!(fixture.facts.calls.iter().all(|call| {
-        fixture
-            .facts
-            .engine_rule_eligibilities
-            .iter()
-            .any(|eligibility| {
-                eligibility.site == call.call
-                    && eligibility.rule == ResolutionEngineRuleKind::ArgumentIndependentBinding
-            })
-    }));
-    let generic_call = fixture
-        .facts
-        .calls
-        .iter()
-        .find(|call| call.explicit_type_argument_count == 1)
-        .expect("generic call retains its explicit type argument count");
-    // Every argument list here is exact, so every call publishes the
-    // coercion filter's permission beside its argument rows, and none keeps a
-    // call-site applicability gap.
-    assert!(fixture.facts.calls.iter().all(|call| {
-        fixture
-            .facts
-            .engine_rule_eligibilities
-            .iter()
-            .any(|eligibility| {
-                eligibility.site == call.call
-                    && eligibility.rule == ResolutionEngineRuleKind::ArgumentCoercionFilter
-            })
-    }));
-    assert_eq!(
-        fixture
-            .facts
-            .call_arguments
-            .iter()
-            .filter(|argument| argument.call == generic_call.call)
-            .count(),
-        1
-    );
-    assert!(!fixture.facts.gaps.iter().any(|gap| {
-        gap.site == generic_call.call && gap.kind == ResolutionGapKind::UnsupportedCallApplicability
-    }));
-}
-
 #[test]
 fn parsed_rust_argument_independent_binding_is_complete_before_result_projection() {
     // An attribute on an argument can remove it, so this call keeps its
@@ -950,63 +1195,13 @@ fn parsed_rust_argument_independent_binding_is_complete_before_result_projection
     let fixture = parsed_rust_fixture(source, b"rust-argument-independent-binding");
     let reference = callable_reference_named_at(&fixture, "target(#[cfg", "target");
     let target = definition_after(&fixture, "pub fn target", "target");
-    let obligation = fixture
-        .typed
-        .call_obligations()
-        .iter()
-        .find(|obligation| obligation.callee_reference() == reference)
-        .expect("Rust call applicability obligation");
-    let call = fixture
-        .facts
-        .calls
-        .iter()
-        .find(|call| {
-            lowered_semantic_at(&fixture.lexical, call.callee, LoweredSemanticRole::Reference)
-                == reference
-        })
-        .expect("Rust call fact");
-    let callsite_reason = gap_reason_semantic(
-        fixture.lexical.fragment(),
-        call.call,
-        LoweringGapOrigin::Extracted(ResolutionGapKind::UnsupportedCallApplicability),
-    );
-    let callee_reason = obligation.applicability_reason();
-    assert!(obligation.completion().contains_reason(
-        ResolutionIncompleteReason::UnsupportedSemantic(callsite_reason)
-    ));
 
     let point = fixture
         .service
         .resolve_reference(reference, &CancellationToken::new())
         .expect("Rust argument-independent point evaluation succeeds");
+    assert_argument_independent_binding_keeps_callsite_gap(&fixture, reference, &point);
     assert_eq!(point.binding().targets(), &[target]);
-    assert_eq!(
-        point.binding().completion(),
-        &ResolutionCompletion::Complete
-    );
-    assert!(!point.binding().completion().contains_reason(
-        ResolutionIncompleteReason::UnsupportedSemantic(callee_reason)
-    ));
-    assert!(!point.binding().completion().contains_reason(
-        ResolutionIncompleteReason::UnsupportedSemantic(callsite_reason)
-    ));
-    let result_frontier = point
-        .projected_frontiers()
-        .iter()
-        .find(|frontier| frontier.slot() == obligation.result_slot())
-        .expect("Rust call result frontier");
-    assert!(result_frontier.completion().contains_reason(
-        ResolutionIncompleteReason::UnsupportedSemantic(callsite_reason)
-    ));
-    assert!(!result_frontier.completion().contains_reason(
-        ResolutionIncompleteReason::UnsupportedSemantic(callee_reason)
-    ));
-    assert!(point.completion().contains_reason(
-        ResolutionIncompleteReason::UnsupportedSemantic(callsite_reason)
-    ));
-    assert!(!point.completion().contains_reason(
-        ResolutionIncompleteReason::UnsupportedSemantic(callee_reason)
-    ));
     assert!(
         point
             .projected_frontiers()
@@ -1027,7 +1222,6 @@ fn parsed_rust_argument_independent_binding_is_complete_before_result_projection
     assert_eq!(binding.definitions(), &[target]);
     assert_eq!(binding.completion(), &ResolutionCompletion::Complete);
 }
-
 #[test]
 fn parsed_rust_argument_independent_binding_retains_name_ambiguity() {
     let source = concat!(
@@ -1054,7 +1248,6 @@ fn parsed_rust_argument_independent_binding_retains_name_ambiguity() {
         .expect("Rust ambiguous argument-independent evaluation succeeds");
     assert_eq!(answer.binding().targets(), expected.as_slice());
 }
-
 #[test]
 fn parsed_rust_argument_independent_binding_does_not_require_signature_inventory() {
     // The attributed argument keeps the call-site gap on the result frontier.
@@ -1092,70 +1285,25 @@ fn parsed_rust_argument_independent_binding_does_not_require_signature_inventory
         ResolutionCompletion::Incomplete(_)
     ));
 }
-
 #[test]
 fn parsed_rust_argument_independent_binding_closes_missing_name_without_function_target() {
     // The attributed argument keeps the call-site gap on the result frontier.
     let source = "pub fn caller() { missing(#[cfg(any())] 1); }\n";
     let fixture = parsed_rust_fixture(source, b"rust-argument-independent-missing-name");
     let reference = callable_reference_named_at(&fixture, "missing(#[cfg", "missing");
-    let obligation = fixture
-        .typed
-        .call_obligations()
-        .iter()
-        .find(|obligation| obligation.callee_reference() == reference)
-        .expect("Rust missing-name call applicability obligation");
-    let call = fixture
-        .facts
-        .calls
-        .iter()
-        .find(|call| {
-            lowered_semantic_at(&fixture.lexical, call.callee, LoweredSemanticRole::Reference)
-                == reference
-        })
-        .expect("Rust missing-name call fact");
-    let callsite_reason = gap_reason_semantic(
-        fixture.lexical.fragment(),
-        call.call,
-        LoweringGapOrigin::Extracted(ResolutionGapKind::UnsupportedCallApplicability),
-    );
-    let callee_reason = obligation.applicability_reason();
-    assert!(obligation.completion().contains_reason(
-        ResolutionIncompleteReason::UnsupportedSemantic(callsite_reason)
-    ));
     let answer = fixture
         .service
         .resolve_reference(reference, &CancellationToken::new())
         .expect("Rust missing callable name evaluation succeeds");
+    let result_slot =
+        assert_argument_independent_binding_keeps_callsite_gap(&fixture, reference, &answer);
     assert!(answer.binding().targets().is_empty());
-    assert_eq!(
-        answer.binding().completion(),
-        &ResolutionCompletion::Complete
-    );
-    assert!(!answer.binding().completion().contains_reason(
-        ResolutionIncompleteReason::UnsupportedSemantic(callee_reason)
-    ));
-    assert!(!answer.binding().completion().contains_reason(
-        ResolutionIncompleteReason::UnsupportedSemantic(callsite_reason)
-    ));
     let result_frontier = answer
         .projected_frontiers()
         .iter()
-        .find(|frontier| frontier.slot() == obligation.result_slot())
+        .find(|frontier| frontier.slot() == result_slot)
         .expect("Rust missing-name call result frontier");
     assert!(result_frontier.possible_values().is_empty());
-    assert!(result_frontier.completion().contains_reason(
-        ResolutionIncompleteReason::UnsupportedSemantic(callsite_reason)
-    ));
-    assert!(!result_frontier.completion().contains_reason(
-        ResolutionIncompleteReason::UnsupportedSemantic(callee_reason)
-    ));
-    assert!(answer.completion().contains_reason(
-        ResolutionIncompleteReason::UnsupportedSemantic(callsite_reason)
-    ));
-    assert!(!answer.completion().contains_reason(
-        ResolutionIncompleteReason::UnsupportedSemantic(callee_reason)
-    ));
     assert!(
         answer
             .projected_frontiers()
@@ -1163,7 +1311,6 @@ fn parsed_rust_argument_independent_binding_closes_missing_name_without_function
             .all(|frontier| frontier.possible_values().is_empty())
     );
 }
-
 #[test]
 fn parsed_rust_argument_independent_binding_retains_local_value_binder() {
     let source = "pub fn caller() { let local = 1; local(1); }\n";
@@ -1180,7 +1327,6 @@ fn parsed_rust_argument_independent_binding_retains_local_value_binder() {
         &ResolutionCompletion::Complete
     );
 }
-
 #[test]
 fn parsed_rust_private_member_keeps_visibility_uncertainty() {
     let source = r#"
@@ -1204,7 +1350,6 @@ fn use_service(service: Service) {
     assert!(answer.binding().targets().contains(&target));
     assert_incomplete(&answer);
 }
-
 #[test]
 fn selected_declaration_access_allowed_discharges_only_visibility_gap() {
     let (fixture, reference, target, other_gap) =
@@ -1239,6 +1384,154 @@ fn selected_declaration_access_allowed_discharges_only_visibility_gap() {
 }
 
 #[test]
+#[hardwon("#3773: an active declaration's non-activation gap remains by identity")]
+fn selected_active_local_declaration_keeps_its_unsupported_binder_reason() {
+    let source = "pub fn selected() {}\npub fn caller() { fn selected() {} selected(); }\n";
+    let fixture = parsed_rust_fixture(source, b"rust-active-local-owned-gap");
+    let local_position = source.rfind("fn selected").expect("local function") + "fn ".len();
+    let local = definition_named_at(&fixture, local_position);
+    let local_site = fixture
+        .facts
+        .identifiers
+        .iter()
+        .find(|identifier| {
+            identifier.role == ResolutionIdentifierRole::Declaration
+                && fixture_site_starts_at(&fixture.facts, identifier.site, local_position)
+        })
+        .expect("local function declaration site")
+        .site;
+    let reason = fixture
+        .lexical
+        .gaps()
+        .iter()
+        .find(|gap| {
+            gap.site() == local_site
+                && gap.origin()
+                    == LoweringGapOrigin::Extracted(ResolutionGapKind::UnsupportedScopeOrBinder)
+        })
+        .expect("active local item carries its unsupported binder reason")
+        .reason_semantic();
+    let reference = callable_reference_named_at(&fixture, "selected();", "selected");
+    let policy = ExactDeclarationAccessSource::new(
+        SemanticId::for_test(b"rust-active-local-owned-gap-policy"),
+        [(
+            DeclarationAccessRequest {
+                reference,
+                definition: local,
+            },
+            DeclarationAccessDecision::Allowed,
+        )],
+    )
+    .with_reason_owners([ReasonOwnerRow {
+        reason,
+        definition: local,
+    }]);
+    let cancellation = CancellationToken::new();
+    let mut operation =
+        FactResolutionOperation::new(&fixture.service, &fixture.service, &cancellation)
+            .with_declaration_access_source(Some(&policy));
+    let answer = operation
+        .resolve_reference(reference)
+        .expect("active local binding resolves with selected access context");
+
+    assert_eq!(answer.binding().targets(), &[local]);
+    assert!(
+        answer
+            .binding()
+            .completion()
+            .contains_reason(ResolutionIncompleteReason::UnsupportedSemantic(reason))
+    );
+    assert!(policy.reason_owner_visits.load(Ordering::Relaxed) > 0);
+}
+
+#[test]
+#[hardwon("#3773: refuting one local binder preserves a same-kind sibling reason")]
+fn selected_refuted_local_sibling_does_not_discharge_active_binder_reason() {
+    let source = "pub fn selected() {}\npub fn caller() { #[cfg(not(test))] fn selected() {} #[cfg(test)] fn selected() {} selected(); }\n";
+    let fixture = parsed_rust_fixture(source, b"rust-refuted-local-sibling-gap");
+    let inactive_prefix = "#[cfg(not(test))] fn ";
+    let active_prefix = "#[cfg(test)] fn ";
+    let inactive_position =
+        source.find(inactive_prefix).expect("inactive local") + inactive_prefix.len();
+    let active_position = source.find(active_prefix).expect("active local") + active_prefix.len();
+    let inactive = definition_named_at(&fixture, inactive_position);
+    let active = definition_named_at(&fixture, active_position);
+    let site_at = |position| {
+        fixture
+            .facts
+            .identifiers
+            .iter()
+            .find(|identifier| {
+                identifier.role == ResolutionIdentifierRole::Declaration
+                    && fixture_site_starts_at(&fixture.facts, identifier.site, position)
+            })
+            .expect("local function declaration site")
+            .site
+    };
+    let reason_at = |site| {
+        fixture
+            .lexical
+            .gaps()
+            .iter()
+            .find(|gap| {
+                gap.site() == site
+                    && gap.origin()
+                        == LoweringGapOrigin::Extracted(ResolutionGapKind::UnsupportedScopeOrBinder)
+            })
+            .expect("local item carries its unsupported binder reason")
+            .reason_semantic()
+    };
+    let inactive_reason = reason_at(site_at(inactive_position));
+    let active_reason = reason_at(site_at(active_position));
+    let reference = callable_reference_named_at(&fixture, "selected();", "selected");
+    let policy = ExactDeclarationAccessSource::new(
+        SemanticId::for_test(b"rust-refuted-local-sibling-gap-policy"),
+        [
+            (
+                DeclarationAccessRequest {
+                    reference,
+                    definition: inactive,
+                },
+                DeclarationAccessDecision::InactiveActivation,
+            ),
+            (
+                DeclarationAccessRequest {
+                    reference,
+                    definition: active,
+                },
+                DeclarationAccessDecision::Allowed,
+            ),
+        ],
+    )
+    .with_reason_owners([
+        ReasonOwnerRow {
+            reason: inactive_reason,
+            definition: inactive,
+        },
+        ReasonOwnerRow {
+            reason: active_reason,
+            definition: active,
+        },
+    ]);
+    let cancellation = CancellationToken::new();
+    let mut operation =
+        FactResolutionOperation::new(&fixture.service, &fixture.service, &cancellation)
+            .with_declaration_access_source(Some(&policy));
+    let answer = operation
+        .resolve_reference(reference)
+        .expect("complementary local declarations resolve with access context");
+
+    assert_eq!(answer.binding().targets(), &[active]);
+    assert!(!answer.binding().completion().contains_reason(
+        ResolutionIncompleteReason::UnsupportedSemantic(inactive_reason)
+    ));
+    assert!(answer.binding().completion().contains_reason(
+        ResolutionIncompleteReason::UnsupportedSemantic(active_reason)
+    ));
+    assert!(policy.reason_owner_visits.load(Ordering::Relaxed) > 0);
+}
+
+#[test]
 fn selected_declaration_access_denied_removes_target_and_witness_before_applicability() {
     let (fixture, reference, target) = private_member_fixture(b"rust-declaration-access-denied");
     let policy = ExactDeclarationAccessSource::new(
@@ -1261,7 +1554,6 @@ fn selected_declaration_access_denied_removes_target_and_witness_before_applicab
     assert!(answer.binding().targets().is_empty());
     assert!(answer.binding().witnesses().is_empty());
 }
-
 #[test]
 fn selected_declaration_access_unknown_retains_target_and_visibility_gap() {
     let (fixture, reference, target) = private_member_fixture(b"rust-declaration-access-unknown");
@@ -1281,37 +1573,6 @@ fn selected_declaration_access_unknown_retains_target_and_visibility_gap() {
         ResolutionIncompleteReason::UnsupportedSemantic(visibility_gap_reason(&fixture))
     ));
 }
-
-#[test]
-fn selected_declaration_access_exact_pair_is_memoized_across_point_evaluations() {
-    let (fixture, reference, target) = private_member_fixture(b"rust-declaration-access-memo");
-    let policy = ExactDeclarationAccessSource::new(
-        SemanticId::for_test(b"rust-declaration-access-memo-policy"),
-        [(
-            DeclarationAccessRequest {
-                reference,
-                definition: target,
-            },
-            DeclarationAccessDecision::Allowed,
-        )],
-    );
-    let cancellation = CancellationToken::new();
-    let mut operation =
-        FactResolutionOperation::new(&fixture.service, &fixture.service, &cancellation)
-            .with_declaration_access_source(Some(&policy));
-    let first = operation
-        .resolve_reference(reference)
-        .expect("first memoized selected access evaluation succeeds");
-    let first_visits = policy.visits.load(Ordering::Relaxed);
-    assert!(first_visits > 0, "the first resolution evaluates selected access");
-    let second = operation
-        .resolve_reference(reference)
-        .expect("second memoized selected access evaluation succeeds");
-    assert_eq!(first.binding().targets(), &[target]);
-    assert_eq!(second.binding().targets(), &[target]);
-    assert_eq!(policy.visits.load(Ordering::Relaxed), first_visits);
-}
-
 #[test]
 fn parsed_rust_generic_impl_self_reaches_sibling_nominal_member() {
     let fixture = parsed_rust_fixture(
@@ -1324,31 +1585,27 @@ impl<T> Wrapper<T> { pub fn second(&self) {} }
     );
     let reference = callable_reference_named_at(&fixture, "self.second", "second");
     let definition = definition_after(&fixture, "pub fn second", "second");
-    let answer = fixture.service.resolve_reference(reference, &CancellationToken::new()).unwrap();
-    assert_eq!(answer.binding().targets(), &[definition], "{answer:?}");
-    assert_eq!(answer.binding().completion(), &ResolutionCompletion::Complete, "{answer:?}");
-    let reverse = fixture.service.references_to(definition, &CancellationToken::new()).unwrap();
-    assert_eq!(reverse.references(), &[reference], "{reverse:?}");
-    assert_eq!(reverse.completion(), &ResolutionCompletion::Complete, "{reverse:?}");
-}
-
-#[test]
-fn parsed_rust_generic_receiver_remains_incomplete() {
-    let source = r#"
-fn use_generic<T>(value: T) {
-    value.run();
-}
-"#;
-    let fixture = parsed_rust_fixture(source, b"rust-inherent-generic-gap");
-    let reference = callable_reference_named_at(&fixture, "value.run", "run");
     let answer = fixture
         .service
         .resolve_reference(reference, &CancellationToken::new())
-        .expect("Rust generic receiver evaluation succeeds");
-    assert!(answer.binding().targets().is_empty());
-    assert_incomplete(&answer);
+        .unwrap();
+    assert_eq!(answer.binding().targets(), &[definition], "{answer:?}");
+    assert_eq!(
+        answer.binding().completion(),
+        &ResolutionCompletion::Complete,
+        "{answer:?}"
+    );
+    let reverse = fixture
+        .service
+        .references_to(definition, &CancellationToken::new())
+        .unwrap();
+    assert_eq!(reverse.references(), &[reference], "{reverse:?}");
+    assert_eq!(
+        reverse.completion(),
+        &ResolutionCompletion::Complete,
+        "{reverse:?}"
+    );
 }
-
 #[test]
 fn unrelated_rust_deferred_name_does_not_suppress_parsed_ordinary_callable() {
     let source = r#"
@@ -1370,7 +1627,6 @@ fn use_service(service: Service) {
         .expect("ordinary Rust callable resolution succeeds");
     assert_eq!(answer.binding().targets(), &[target]);
 }
-
 #[test]
 fn parsed_rust_trait_impl_calls_keep_the_implementing_owner() {
     let source = "pub trait Work { fn work(&self); } pub struct Service; pub struct Other; impl Work for Service { fn work(&self) { self.work(); } } impl Other { pub fn work(&self) {} } fn use_service(service: Service) { service.work(); }";
@@ -1378,67 +1634,20 @@ fn parsed_rust_trait_impl_calls_keep_the_implementing_owner() {
     let expected = definition_after(&fixture, "impl Work for Service", "work");
     for marker in ["self.work", "service.work"] {
         let reference = callable_reference_named_at(&fixture, marker, "work");
-        let answer = fixture.service.resolve_reference(reference, &CancellationToken::new()).unwrap();
+        let answer = fixture
+            .service
+            .resolve_reference(reference, &CancellationToken::new())
+            .unwrap();
         assert_eq!(answer.binding().targets(), &[expected]);
     }
     let contract = definition_after(&fixture, "pub trait Work", "work");
-    let reverse = fixture.service.references_to(contract, &CancellationToken::new()).unwrap();
+    let reverse = fixture
+        .service
+        .references_to(contract, &CancellationToken::new())
+        .unwrap();
     let caller = callable_reference_named_at(&fixture, "service.work", "work");
     assert!(reverse.references().contains(&caller), "{reverse:?}");
-
 }
-
-#[test]
-fn parsed_rust_type_alias_frontiers_preserve_exact_member_owners() {
-    let source = r#"
-pub struct First;
-pub struct Second;
-impl First { pub fn new() -> Self { First } pub fn run(&self) {} }
-impl Second { pub fn new() -> Self { Second } pub fn run(&self) {} }
-pub type Alias = First;
-pub type Chain = Alias;
-fn outer(value: Chain) { value.run(); Alias::new(); }
-fn inner() { type Alias = Second; Alias::new(); }
-"#;
-    let fixture = parsed_rust_fixture(source, b"rust-alias-exact-owners");
-    let first_run = definition_after(&fixture, "impl First", "run");
-    let first_new = definition_after(&fixture, "impl First", "new");
-    let second_new = definition_after(&fixture, "impl Second", "new");
-    for (marker, name, expected) in [
-        ("value.run", "run", first_run),
-        ("value.run(); Alias::new", "new", first_new),
-        ("Second; Alias::new", "new", second_new),
-    ] {
-        let reference = callable_reference_named_at(&fixture, marker, name);
-        let answer = fixture.service.resolve_reference(reference, &CancellationToken::new()).unwrap();
-        assert_eq!(answer.binding().targets(), &[expected], "{marker}: {answer:?}");
-        assert_eq!(answer.binding().completion(), &ResolutionCompletion::Complete, "{marker}: {answer:?}");
-    }
-    let reverse = fixture.service.references_to(first_run, &CancellationToken::new()).unwrap();
-    assert!(reverse.references().contains(&callable_reference_named_at(&fixture, "value.run", "run")), "{reverse:?}");
-}
-
-#[test]
-fn parsed_rust_generic_type_alias_preserves_associated_member_owner() {
-    let source = r#"
-enum EitherWriter<A, B> { A(A), B(B) }
-type OptionalWriter<T> = EitherWriter<T, ()>;
-impl<T> OptionalWriter<T> {
-    fn some(value: T) -> Self { EitherWriter::A(value) }
-}
-fn make() { let _ = OptionalWriter::some(1usize); }
-"#;
-    let fixture = parsed_rust_fixture(source, b"rust-generic-alias-member-owner");
-    let expected = definition_after(&fixture, "impl<T> OptionalWriter<T>", "some");
-    let reference = callable_reference_named_at(&fixture, "OptionalWriter::some", "some");
-    let answer = fixture
-        .service
-        .resolve_reference(reference, &CancellationToken::new())
-        .unwrap();
-
-    assert_eq!(answer.binding().targets(), &[expected], "{answer:?}");
-}
-
 #[test]
 fn parsed_rust_type_aliases_preserve_reference_and_pointer_qualifiers() {
     let source = r#"
@@ -1452,15 +1661,24 @@ fn raw(pointer: Raw) { pointer.run(); }
     let fixture = parsed_rust_fixture(source, b"rust-alias-reference-qualifiers");
     let target = definition_after(&fixture, "impl Service", "run");
     let reference = callable_reference_named_at(&fixture, "value.run", "run");
-    let answer = fixture.service.resolve_reference(reference, &CancellationToken::new()).unwrap();
+    let answer = fixture
+        .service
+        .resolve_reference(reference, &CancellationToken::new())
+        .unwrap();
     assert_eq!(answer.binding().targets(), &[target], "{answer:?}");
-    assert_eq!(answer.binding().completion(), &ResolutionCompletion::Complete, "{answer:?}");
+    assert_eq!(
+        answer.binding().completion(),
+        &ResolutionCompletion::Complete,
+        "{answer:?}"
+    );
     let pointer = callable_reference_named_at(&fixture, "pointer.run", "run");
-    let answer = fixture.service.resolve_reference(pointer, &CancellationToken::new()).unwrap();
+    let answer = fixture
+        .service
+        .resolve_reference(pointer, &CancellationToken::new())
+        .unwrap();
     assert!(answer.binding().targets().is_empty(), "{answer:?}");
     assert_incomplete(&answer);
 }
-
 #[test]
 fn parsed_rust_associated_types_follow_the_impl_owner() {
     let source = r#"
@@ -1479,105 +1697,65 @@ fn invoke(value: Selected) { value.run(); }
     let expected = definition_after(&fixture, "impl Runner for Service", "Output");
     for marker in ["Self::Output", "<Service as Runner>::Output"] {
         let position = source.find(marker).unwrap() + marker.rfind("Output").unwrap();
-        let identifier = fixture.facts.identifiers.iter().find(|identifier| {
-            identifier.role == ResolutionIdentifierRole::Reference
-                && fixture.facts.sites[identifier.site.index()].start_byte == position
-        }).expect("associated type reference");
-        let reference = lowered_semantic_at(&fixture.lexical, identifier.site, LoweredSemanticRole::Reference);
-        let answer = fixture.service.resolve_reference(reference, &CancellationToken::new()).unwrap();
-        assert_eq!(answer.binding().targets(), &[expected], "{marker}: {answer:?}");
-        assert_eq!(answer.binding().completion(), &ResolutionCompletion::Complete, "{marker}: {answer:?}");
+        let identifier = fixture
+            .facts
+            .identifiers
+            .iter()
+            .find(|identifier| {
+                identifier.role == ResolutionIdentifierRole::Reference
+                    && fixture.facts.sites[identifier.site.index()].start_byte == position
+            })
+            .expect("associated type reference");
+        let reference = lowered_semantic_at(
+            &fixture.lexical,
+            identifier.site,
+            LoweredSemanticRole::Reference,
+        );
+        let answer = fixture
+            .service
+            .resolve_reference(reference, &CancellationToken::new())
+            .unwrap();
+        assert_eq!(
+            answer.binding().targets(),
+            &[expected],
+            "{marker}: {answer:?}"
+        );
+        assert_eq!(
+            answer.binding().completion(),
+            &ResolutionCompletion::Complete,
+            "{marker}: {answer:?}"
+        );
     }
     let method = definition_after(&fixture, "impl Payload", "run");
-    let calls = fixture.facts.identifiers.iter().filter(|identifier| {
-        identifier.role == ResolutionIdentifierRole::Reference
-            && fixture.facts.names[identifier.name.index()].spelling == "run"
-    }).map(|identifier| lowered_semantic_at(&fixture.lexical, identifier.site, LoweredSemanticRole::Reference));
+    let calls = fixture
+        .facts
+        .identifiers
+        .iter()
+        .filter(|identifier| {
+            identifier.role == ResolutionIdentifierRole::Reference
+                && fixture.facts.names[identifier.name.index()].spelling == "run"
+        })
+        .map(|identifier| {
+            lowered_semantic_at(
+                &fixture.lexical,
+                identifier.site,
+                LoweredSemanticRole::Reference,
+            )
+        });
     for reference in calls {
-        let answer = fixture.service.resolve_reference(reference, &CancellationToken::new()).unwrap();
+        let answer = fixture
+            .service
+            .resolve_reference(reference, &CancellationToken::new())
+            .unwrap();
         assert_eq!(answer.binding().targets(), &[method], "{answer:?}");
     }
     let contract = definition_after(&fixture, "pub trait Runner", "Output");
-    let reverse = fixture.service.references_to(contract, &CancellationToken::new()).unwrap();
+    let reverse = fixture
+        .service
+        .references_to(contract, &CancellationToken::new())
+        .unwrap();
     assert_eq!(reverse.references().len(), 2, "{reverse:?}");
 }
-
-#[test]
-fn parsed_rust_trait_bound_receivers_select_declarations() {
-    let source = r#"
-pub trait Store { fn get(&self); }
-pub trait Registry { fn get(&self); }
-pub struct Concrete;
-impl Store for Concrete { fn get(&self) {} }
-fn inline<T: Store>(inline_value: &T) { inline_value.get(); }
-fn constrained<T>(where_value: &T) where T: Store { where_value.get(); }
-fn opaque(opaque_value: &impl Store) { opaque_value.get(); }
-fn dynamic(dynamic_value: &dyn Store) { dynamic_value.get(); }
-fn both<T: Store + Registry>(both_value: &T) { both_value.get(); }
-fn other<T: Registry>(other_value: &T) { other_value.get(); }
-"#;
-    let fixture = parsed_rust_fixture(source, b"rust-trait-bound-receivers");
-    let store = definition_after(&fixture, "pub trait Store", "get");
-    let registry = definition_after(&fixture, "pub trait Registry", "get");
-    for (marker, mut expected) in [
-        ("inline_value.get", vec![store]),
-        ("where_value.get", vec![store]),
-        ("opaque_value.get", vec![store]),
-        ("dynamic_value.get", vec![store]),
-        ("both_value.get", vec![store, registry]),
-        ("other_value.get", vec![registry]),
-    ] {
-        expected.sort_unstable();
-        let reference = callable_reference_named_at(&fixture, marker, "get");
-        let answer = fixture.service.resolve_reference(reference, &CancellationToken::new()).unwrap();
-        assert_eq!(answer.binding().targets(), expected, "{marker}: {answer:?}");
-        assert_eq!(answer.binding().completion(), &ResolutionCompletion::Complete, "{marker}: {answer:?}");
-    }
-    let reordered = parsed_rust_fixture_with_mutation(source, b"rust-trait-bound-receivers", |facts| {
-        facts.type_transfers.reverse();
-    });
-    let reference = callable_reference_named_at(&reordered, "both_value.get", "get");
-    let reordered_answer = reordered.service.resolve_reference(reference, &CancellationToken::new()).unwrap();
-    let reference = callable_reference_named_at(&fixture, "both_value.get", "get");
-    let original_answer = fixture.service.resolve_reference(reference, &CancellationToken::new()).unwrap();
-    assert_eq!(reordered_answer.binding(), original_answer.binding());
-    let implementation = definition_after(&fixture, "impl Store for Concrete", "get");
-    assert!(fixture.service.references_to(implementation, &CancellationToken::new()).unwrap().references().is_empty());
-    assert_eq!(fixture.service.references_to(store, &CancellationToken::new()).unwrap().references().len(), 5);
-}
-
-#[test]
-fn parsed_rust_unknown_bound_keeps_an_unproven_reverse_site() {
-    let fixture = parsed_rust_fixture(r#"
-pub trait Store { fn get(&self); }
-fn unknown<T: Missing>(value: &T) { value.get(); }
-"#, b"rust-unknown-bound");
-    let definition = definition_after(&fixture, "pub trait Store", "get");
-    let reference = callable_reference_named_at(&fixture, "value.get", "get");
-    let forward = fixture.service.resolve_reference(reference, &CancellationToken::new()).unwrap();
-    assert!(forward.binding().targets().is_empty(), "{forward:?}");
-    assert!(forward.type_bound_receiver);
-    let reverse = fixture.service.references_to(definition, &CancellationToken::new()).unwrap();
-    assert_eq!(reverse.references(), &[reference]);
-    assert!(reverse.witnesses().iter().all(|witness| witness.completion() != &ResolutionCompletion::Complete));
-    assert_eq!(reverse.completion(), &ResolutionCompletion::Complete);
-}
-
-#[test]
-fn parsed_rust_ambiguous_bound_head_is_not_a_proven_union() {
-    let fixture = parsed_rust_fixture(r#"
-pub trait Store { fn get(&self); }
-pub trait Store { fn get(&self); }
-fn ambiguous<T: Store>(value: &T) { value.get(); }
-"#, b"rust-ambiguous-bound");
-    let reference = callable_reference_named_at(&fixture, "value.get", "get");
-    let answer = fixture.service.resolve_reference(reference, &CancellationToken::new()).unwrap();
-    assert_eq!(answer.binding().targets().len(), 2, "{answer:?}");
-    assert!(!answer.type_bound_receiver, "ambiguous lexical alternatives are not independent bounds");
-}
-
-/// A call to a generic function whose result is a bare type parameter has an
-/// inferred result type, so its result frontier cannot be exact.
 #[test]
 fn a_generic_call_result_is_not_an_exact_type_parameter() {
     for (source, marker) in [
@@ -1634,171 +1812,18 @@ fn a_generic_call_result_is_not_an_exact_type_parameter() {
         );
     }
 }
-
-const RUST_BOUNDED_GENERICS: &str = r#"pub trait Shape { fn area(&self) -> f64; fn name(&self) -> u8; }
-pub struct Square;
-impl Square { pub fn side(&self) -> f64 { 1.0 } pub fn name(&self) -> u8 { 0 } }
-impl Shape for Square { fn area(&self) -> f64 { 1.0 } fn name(&self) -> u8 { 1 } }
-pub trait Consume { fn take(self) -> u8; }
-impl Consume for Square { fn take(self) -> u8 { 0 } }
-impl Square { pub fn take(&self) -> u8 { 1 } }
-pub fn pick<T: Shape>(value: T) -> T { value }
-pub fn pick_where<T>(value: T) -> T where T: Shape { value }
-pub fn identity<T>(value: T) -> T { value }
-pub fn make<T: Shape>() -> T { loop {} }
-pub fn caller(square: Square, other: Square) {
-    let picked = pick(square);
-    picked.area();
-    picked.side();
-    picked.name();
-    let chosen = pick_where(other);
-    chosen.area();
-    let copied = identity(square);
-    copied.side();
-    make::<Square>().name();
-    square.name();
-    Square::name(&square);
-    square.take();
-}
-pub fn body<T: Shape>(value: T) { value.area(); value.side(); }
-pub fn relay<U: Shape>() -> u8 { make::<U>().name() }
-pub fn gather(squares: &[Square]) -> usize { squares.iter().collect::<Vec<_>>().len() }
-"#;
-
-fn resolved(fixture: &ParsedRustFixture, marker: &str, name: &str) -> FactResolutionAnswer {
-    let reference = callable_reference_named_at(fixture, marker, name);
-    fixture
-        .service
-        .resolve_reference(reference, &CancellationToken::new())
-        .unwrap()
-}
-
-/// A generic call's result is the type its arguments instantiate, not its
-/// bound. `pick(square)` is a `Square`: its members are `Square`'s, its
-/// inherent `name` outranks the trait's, and `side` resolves instead of staying
-/// open. Where no value argument decides the instantiation, an explicit type
-/// argument does: `make::<Square>()` is a `Square` too, and `make::<U>()` is a
-/// `U`, which reaches its bound's members. A turbofish on a callee the fixture
-/// does not index (`collect::<Vec<_>>()`) decides nothing, and the call keeps
-/// the reason any unindexed method has. Inside the generic body a value typed
-/// by the bound reaches the bound's members, and nothing beyond them is
-/// proved.
 #[test]
-fn a_generic_call_result_follows_the_argument_that_binds_its_type_parameter() {
-    let fixture = parsed_rust_fixture(RUST_BOUNDED_GENERICS, b"rust-generic-instantiation");
-    let square = definition_after(&fixture, "pub struct Square", "Square");
-    let impl_area = definition_after(&fixture, "impl Shape for Square { fn area", "area");
-    let side = definition_after(&fixture, "pub fn side", "side");
-    let inherent_name = definition_after(&fixture, "pub fn name", "name");
-    let trait_area = definition_after(&fixture, "pub trait Shape { fn area", "area");
-    let trait_name = definition_after(&fixture, "fn name(&self) -> u8; }", "name");
-
-    let call = resolved(&fixture, "pick(square)", "pick");
-    let obligation = fixture
-        .typed
-        .call_obligations()
-        .iter()
-        .find(|obligation| {
-            obligation.callee_reference() == callable_reference_named_at(&fixture, "pick(square)", "pick")
-        })
-        .expect("the pick call obligation");
-    let result = call
-        .projected_frontiers()
-        .iter()
-        .find(|frontier| frontier.slot() == obligation.result_slot())
-        .expect("the pick call result frontier");
-    assert_eq!(
-        result.possible_values(),
-        &[ResolutionSlotValue::runtime(ResolutionTypeRef::new(square, 0), false)],
-        "{result:?}"
-    );
-    assert_eq!(result.completion(), &ResolutionCompletion::Complete, "{result:?}");
-
-    for (marker, name, expected) in [
-        ("picked.area", "area", impl_area),
-        ("picked.side", "side", side),
-        ("picked.name", "name", inherent_name),
-        ("chosen.area", "area", impl_area),
-        ("copied.side", "side", side),
-        ("value.area", "area", trait_area),
-    ] {
-        let answer = resolved(&fixture, marker, name);
-        assert_eq!(answer.binding().targets(), &[expected], "{marker}: {answer:?}");
-        assert_eq!(
-            answer.binding().completion(),
-            &ResolutionCompletion::Complete,
-            "{marker}: {answer:?}"
-        );
-    }
-
-    let make = callable_reference_named_at(&fixture, "make::<Square>()", "make");
-    let obligation = fixture
-        .typed
-        .call_obligations()
-        .iter()
-        .find(|obligation| obligation.callee_reference() == make)
-        .expect("the make call obligation");
-    assert_eq!(obligation.type_argument_slots().len(), 1, "{obligation:?}");
-    let result = resolved(&fixture, "make::<Square>()", "make")
-        .projected_frontiers()
-        .iter()
-        .find(|frontier| frontier.slot() == obligation.result_slot())
-        .cloned()
-        .expect("the make call result frontier");
-    assert_eq!(
-        result.possible_values(),
-        &[ResolutionSlotValue::runtime(ResolutionTypeRef::new(square, 0), false)],
-        "the type argument instantiates the result: {result:?}"
-    );
-    assert_eq!(result.completion(), &ResolutionCompletion::Complete, "{result:?}");
-    for (marker, expected) in [
-        ("make::<Square>().name", inherent_name),
-        ("make::<U>().name", trait_name),
-    ] {
-        let answer = resolved(&fixture, marker, "name");
-        assert_eq!(answer.binding().targets(), &[expected], "{marker}: {answer:?}");
-        assert_eq!(
-            answer.binding().completion(),
-            &ResolutionCompletion::Complete,
-            "{marker}: {answer:?}"
-        );
-    }
-
-    let unindexed = resolved(&fixture, "squares.iter", "iter");
-    assert!(unindexed.binding().targets().is_empty(), "{unindexed:?}");
-    assert!(
-        matches!(unindexed.binding().completion(), ResolutionCompletion::Incomplete(_)),
-        "{unindexed:?}"
-    );
-    for (marker, name) in [("collect::<Vec<_>>()", "collect"), ("collect::<Vec<_>>().len", "len")] {
-        let answer = resolved(&fixture, marker, name);
-        assert!(answer.binding().targets().is_empty(), "{marker}: {answer:?}");
-        assert_eq!(
-            answer.binding().completion(),
-            unindexed.binding().completion(),
-            "{marker}: an unindexed callee keeps its reason, type argument or not: {answer:?}"
-        );
-    }
-
-    let answer = resolved(&fixture, "value.side", "side");
-    assert!(answer.binding().targets().is_empty(), "{answer:?}");
-    assert!(
-        matches!(answer.binding().completion(), ResolutionCompletion::Incomplete(_)),
-        "a member beyond the bound is not a proved absence: {answer:?}"
-    );
-}
-
-/// An inherent method outranks a trait method of the same type where Rust's
-/// lookup does: always for a path, and for a method call when both take their
-/// receiver the same way. A by-value trait method beside a by-reference
-/// inherent one is probed first for a value receiver, so neither is dropped.
-#[test]
+#[hardwon("985c255966c6: a same-form trait method outranked the matching inherent method")]
 fn an_inherent_method_outranks_a_same_form_trait_method() {
     let fixture = parsed_rust_fixture(RUST_BOUNDED_GENERICS, b"rust-inherent-precedence");
     let inherent_name = definition_after(&fixture, "pub fn name", "name");
     for marker in ["square.name", "Square::name(&square)"] {
         let answer = resolved(&fixture, marker, "name");
-        assert_eq!(answer.binding().targets(), &[inherent_name], "{marker}: {answer:?}");
+        assert_eq!(
+            answer.binding().targets(),
+            &[inherent_name],
+            "{marker}: {answer:?}"
+        );
         assert_eq!(
             answer.binding().completion(),
             &ResolutionCompletion::Complete,
@@ -1813,11 +1838,6 @@ fn an_inherent_method_outranks_a_same_form_trait_method() {
     let answer = resolved(&fixture, "square.take", "take");
     assert_eq!(answer.binding().targets(), takes.as_slice(), "{answer:?}");
 }
-
-/// The reverse agrees with the forward answers: the calls an argument's type,
-/// or an explicit type argument, decides are proven uses of the instantiated
-/// type's members, and a type argument that is a type parameter reaches the
-/// bound's member. A member beyond the bound is an unproven site.
 #[test]
 fn instantiated_generic_results_keep_the_reverse_in_step() {
     let fixture = parsed_rust_fixture(RUST_BOUNDED_GENERICS, b"rust-generic-instantiation-reverse");
@@ -1842,7 +1862,11 @@ fn instantiated_generic_results_keep_the_reverse_in_step() {
     let (found, reverse) = references(definition_after(&fixture, "pub fn side", "side"));
     assert_eq!(
         found,
-        sorted(&[("picked.side", "side"), ("copied.side", "side"), ("value.side", "side")]),
+        sorted(&[
+            ("picked.side", "side"),
+            ("copied.side", "side"),
+            ("value.side", "side")
+        ]),
         "{reverse:?}"
     );
     let unproven = callable_reference_named_at(&fixture, "value.side", "side");
@@ -1873,9 +1897,16 @@ fn instantiated_generic_results_keep_the_reverse_in_step() {
         "every inherent `name` call is proven: {reverse:?}"
     );
 
-    let (found, reverse) =
-        references(definition_after(&fixture, "fn name(&self) -> u8; }", "name"));
-    assert_eq!(found, sorted(&[("make::<U>().name", "name")]), "{reverse:?}");
+    let (found, reverse) = references(definition_after(
+        &fixture,
+        "fn name(&self) -> u8; }",
+        "name",
+    ));
+    assert_eq!(
+        found,
+        sorted(&[("make::<U>().name", "name")]),
+        "{reverse:?}"
+    );
     assert!(
         reverse
             .witnesses()
@@ -1884,64 +1915,14 @@ fn instantiated_generic_results_keep_the_reverse_in_step() {
         "{reverse:?}"
     );
 }
-
-
-const RUST_INSTANTIATION_SOURCES: &str = r#"pub trait Shape { fn area(&self) -> f64; fn name(&self) -> u8; }
-pub struct Square;
-impl Square {
-    pub fn side(&self) -> f64 { 1.0 }
-    pub fn name(&self) -> u8 { 0 }
-    pub fn echo<T>(&self, value: T) -> T { value }
-}
-impl Shape for Square { fn area(&self) -> f64 { 1.0 } fn name(&self) -> u8 { 1 } }
-pub trait Echo { fn echo_back<T>(&self, value: T) -> T; }
-impl Echo for Square { fn echo_back<T>(&self, value: T) -> T { value } }
-pub struct Wrapper<W>(W);
-impl<W: Shape> Wrapper<W> {
-    pub fn make() -> W { loop {} }
-    pub fn inner(&self) -> &W { &self.0 }
-}
-pub fn make<T: Shape>() -> T { loop {} }
-pub fn caller(square: Square, other: Square, third: Square, wrapper: Wrapper<Square>) {
-    Wrapper::<Square>::make().name();
-    let made: Square = make();
-    let wrapped: Square = Wrapper::make();
-    Square::echo(&square, other).side();
-    Echo::echo_back(&square, third).side();
-    wrapper.inner().name();
-}
-"#;
-
-/// The result frontier of the call whose callee is `name` at `marker`.
-fn call_result(fixture: &ParsedRustFixture, marker: &str, name: &str) -> TypedFrontierState {
-    let callee = callable_reference_named_at(fixture, marker, name);
-    let obligation = fixture
-        .typed
-        .call_obligations()
-        .iter()
-        .find(|obligation| obligation.callee_reference() == callee)
-        .unwrap_or_else(|| panic!("{marker}: no call obligation"));
-    resolved(fixture, marker, name)
-        .projected_frontiers()
-        .iter()
-        .find(|frontier| frontier.slot() == obligation.result_slot())
-        .cloned()
-        .unwrap_or_else(|| panic!("{marker}: no call result frontier"))
-}
-
-/// Three more sources decide a generic call's result where no value argument
-/// lines up by position: the type arguments written on the path's type
-/// segment, which an impl's type parameters take (`Wrapper::<Square>::make()`);
-/// the type a `let` annotation expects of its call initializer, after value
-/// and type arguments (`let made: Square = make();`); and a method called in
-/// path form, whose first argument is the receiver, so its value arguments
-/// line up from the second (`Square::echo(&square, other)`, through an
-/// inherent method or a trait's).
 #[test]
 fn type_segments_expected_types_and_path_receivers_decide_generic_results() {
     let fixture = parsed_rust_fixture(RUST_INSTANTIATION_SOURCES, b"rust-instantiation-sources");
     let square = definition_after(&fixture, "pub struct Square", "Square");
-    let exact_square = [ResolutionSlotValue::runtime(ResolutionTypeRef::new(square, 0), false)];
+    let exact_square = [ResolutionSlotValue::runtime(
+        ResolutionTypeRef::new(square, 0),
+        false,
+    )];
     for (marker, name) in [
         ("Wrapper::<Square>::make()", "make"),
         ("make();", "make"),
@@ -1950,8 +1931,16 @@ fn type_segments_expected_types_and_path_receivers_decide_generic_results() {
         ("Echo::echo_back(&square, third)", "echo_back"),
     ] {
         let result = call_result(&fixture, marker, name);
-        assert_eq!(result.possible_values(), &exact_square, "{marker}: {result:?}");
-        assert_eq!(result.completion(), &ResolutionCompletion::Complete, "{marker}: {result:?}");
+        assert_eq!(
+            result.possible_values(),
+            &exact_square,
+            "{marker}: {result:?}"
+        );
+        assert_eq!(
+            result.completion(),
+            &ResolutionCompletion::Complete,
+            "{marker}: {result:?}"
+        );
     }
 
     let inherent_name = definition_after(&fixture, "pub fn name", "name");
@@ -1962,7 +1951,11 @@ fn type_segments_expected_types_and_path_receivers_decide_generic_results() {
         ("Echo::echo_back(&square, third).side", "side", side),
     ] {
         let answer = resolved(&fixture, marker, name);
-        assert_eq!(answer.binding().targets(), &[expected], "{marker}: {answer:?}");
+        assert_eq!(
+            answer.binding().targets(),
+            &[expected],
+            "{marker}: {answer:?}"
+        );
         assert_eq!(
             answer.binding().completion(),
             &ResolutionCompletion::Complete,
@@ -1975,15 +1968,13 @@ fn type_segments_expected_types_and_path_receivers_decide_generic_results() {
     // bound's surface, and says it is not proven.
     let answer = resolved(&fixture, "wrapper.inner().name", "name");
     assert!(
-        matches!(answer.binding().completion(), ResolutionCompletion::Incomplete(_)),
+        matches!(
+            answer.binding().completion(),
+            ResolutionCompletion::Incomplete(_)
+        ),
         "{answer:?}"
     );
 }
-
-/// The reverse keeps the same deciders: the member calls a type segment or a
-/// path-form receiver decides are proven uses of the instantiated type's
-/// members. The expected type of a `let` has no reverse reader: the binding
-/// takes the annotation itself, so nothing reads the call's result.
 #[test]
 fn type_segments_and_path_receivers_keep_the_reverse_in_step() {
     let fixture = parsed_rust_fixture(
@@ -2022,26 +2013,8 @@ fn type_segments_and_path_receivers_keep_the_reverse_in_step() {
         }
     }
 }
-
-const RUST_UNIT_VALUES: &str = r#"pub struct Square;
-impl Square { pub fn side(&self) -> f64 { 1.0 } }
-pub struct Pair(u8, u8);
-impl Pair { pub fn side(&self) -> f64 { 2.0 } }
-pub fn identity<T>(value: T) -> T { value }
-pub fn caller() {
-    let unit = Square;
-    unit.side();
-    identity(Square).side();
-    let constructor = Pair;
-    constructor.side();
-}
-"#;
-
-/// A unit struct's value item is an instance of it, so a value read binding
-/// `Square` is typed `Square` and decides a generic call's instantiation. A
-/// tuple struct's value item is its constructor function, which stays
-/// untyped rather than passing for an instance.
 #[test]
+#[hardwon("955f6461cafc: a unit struct value is an instance of its struct")]
 fn a_unit_struct_value_is_an_instance_of_its_struct() {
     let fixture = parsed_rust_fixture(RUST_UNIT_VALUES, b"rust-unit-values");
     let side = definition_after(&fixture, "impl Square { pub fn side", "side");
@@ -2057,7 +2030,10 @@ fn a_unit_struct_value_is_an_instance_of_its_struct() {
     let answer = resolved(&fixture, "constructor.side", "side");
     assert!(answer.binding().targets().is_empty(), "{answer:?}");
     assert!(
-        matches!(answer.binding().completion(), ResolutionCompletion::Incomplete(_)),
+        matches!(
+            answer.binding().completion(),
+            ResolutionCompletion::Incomplete(_)
+        ),
         "a tuple struct's constructor function is not an instance: {answer:?}"
     );
 
@@ -2079,169 +2055,186 @@ fn a_unit_struct_value_is_an_instance_of_its_struct() {
         "{reverse:?}"
     );
 }
-
-
-const RUST_ALIASED_TYPE_SEGMENTS: &str = r#"pub struct Square;
-impl Square { pub fn side(&self) -> f64 { 1.0 } }
-pub struct Circle;
-impl Circle { pub fn radius(&self) -> f64 { 1.0 } }
-pub struct Pair<P, Q>(P, Q);
-impl<A, B> Pair<A, B> { pub fn first() -> A { loop {} } }
-pub type Swap<X, Y> = Pair<Y, X>;
-pub type Nested<X> = Pair<Vec<X>, X>;
-pub fn caller() {
-    Pair::<Square, Circle>::first().side();
-    Swap::<Square, Circle>::first().side();
-    Nested::<Square>::first().side();
-}
-"#;
-
-/// A path's type segment writes its type's arguments only when it names the
-/// type itself. Through an alias it writes the alias's arguments, in the
-/// alias's order: `Swap::<Square, Circle>` is `Pair<Circle, Square>`, and
-/// `Nested::<Square>` is `Pair<Vec<Square>, Square>`. Neither segment decides
-/// `first`, which keeps its undecided result, so neither call's `side` is
-/// `Square::side`. Following an alias's parameters through its target is not
-/// modelled yet.
 #[test]
-fn an_aliased_type_segment_does_not_decide_the_aliased_types_parameters() {
-    let fixture = parsed_rust_fixture(RUST_ALIASED_TYPE_SEGMENTS, b"rust-aliased-type-segments");
-    let square = definition_after(&fixture, "pub struct Square", "Square");
-    let direct = call_result(&fixture, "Pair::<Square, Circle>::first()", "first");
+fn a_function_only_item_macro_does_not_open_existing_type_members() {
+    let source = r#"
+pub trait Runner { type Output; }
+pub struct Service;
+impl Runner for Service { type Output = u8; }
+impl Service { pub fn run(&self) {} }
+macro_rules! maker { ($name:ident) => { pub fn $name() -> u8 { 0 } }; }
+maker!(generated);
+fn invoke(service: Service) { service.run(); }
+type Selected = <Service as Runner>::Output;
+fn unknown() { generated(); }
+"#;
+    let fixture = parsed_rust_fixture(source, b"rust-function-only-macro-members");
+    let run = definition_after(&fixture, "impl Service", "run");
+    let answer = resolved(&fixture, "service.run", "run");
+    assert_eq!(answer.binding().targets(), &[run], "{answer:?}");
     assert_eq!(
-        direct.possible_values(),
-        &[ResolutionSlotValue::runtime(ResolutionTypeRef::new(square, 0), false)],
-        "{direct:?}"
-    );
-    assert_eq!(direct.completion(), &ResolutionCompletion::Complete, "{direct:?}");
-    for marker in ["Swap::<Square, Circle>::first()", "Nested::<Square>::first()"] {
-        let result = call_result(&fixture, marker, "first");
-        assert!(result.possible_values().is_empty(), "{marker}: {result:?}");
-        assert!(
-            matches!(result.completion(), ResolutionCompletion::Incomplete(_)),
-            "{marker}: {result:?}"
-        );
-    }
-
-    let side = definition_after(&fixture, "pub fn side", "side");
-    let answer = resolved(&fixture, "Pair::<Square, Circle>::first().side", "side");
-    assert_eq!(answer.binding().targets(), &[side], "{answer:?}");
-    assert_eq!(answer.binding().completion(), &ResolutionCompletion::Complete, "{answer:?}");
-    for marker in ["Swap::<Square, Circle>::first().side", "Nested::<Square>::first().side"] {
-        let answer = resolved(&fixture, marker, "side");
-        assert!(answer.binding().targets().is_empty(), "{marker}: {answer:?}");
-        assert!(
-            matches!(answer.binding().completion(), ResolutionCompletion::Incomplete(_)),
-            "{marker}: {answer:?}"
-        );
-    }
-
-    let reverse = fixture
-        .service
-        .references_to(side, &CancellationToken::new())
-        .unwrap();
-    let direct = callable_reference_named_at(&fixture, "Pair::<Square, Circle>::first().side", "side");
-    for witness in reverse.witnesses() {
-        assert_eq!(
-            witness.completion() == &ResolutionCompletion::Complete,
-            witness.reference() == direct,
-            "only the direct segment's call is a proven use: {reverse:?}"
-        );
-    }
-    assert!(reverse.references().contains(&direct), "{reverse:?}");
-}
-
-const RUST_UNNAMEABLE_TRAIT_ITEM: &str = r#"pub struct Service;
-impl Display for Service { fn fmt(&self) -> u8 { 0 } }
-pub fn caller(service: Service) { service.fmt(); }
-"#;
-
-/// An impl item of a trait the rows cannot name (`Display` here names nothing
-/// in the fixture) answers alone and complete when the receiver's nameable
-/// traits are enumerated and none supplies the method. When the rows cannot
-/// place the receiver's traits, another trait could supply it too (E0034), so
-/// the item stays the target and the answer says why it is not complete.
-#[test]
-fn an_unnameable_trait_item_is_complete_only_where_the_nameable_traits_are_enumerated() {
-    let fixture = parsed_rust_fixture(RUST_UNNAMEABLE_TRAIT_ITEM, b"rust-unnameable-trait-item");
-    let fmt = definition_after(&fixture, "impl Display for Service { fn fmt", "fmt");
-    let answer = resolved(&fixture, "service.fmt", "fmt");
-    assert_eq!(answer.binding().targets(), &[fmt], "{answer:?}");
-    assert_eq!(answer.binding().completion(), &ResolutionCompletion::Complete, "{answer:?}");
-
-    let mut fixture =
-        parsed_rust_fixture(RUST_UNNAMEABLE_TRAIT_ITEM, b"rust-unnameable-trait-item-unplaced");
-    fixture.service.rust_implemented_traits_unplaced = true;
-    let fmt = definition_after(&fixture, "impl Display for Service { fn fmt", "fmt");
-    let answer = resolved(&fixture, "service.fmt", "fmt");
-    assert_eq!(answer.binding().targets(), &[fmt], "{answer:?}");
-    assert!(
-        matches!(answer.binding().completion(), ResolutionCompletion::Incomplete(_)),
+        answer.binding().completion(),
+        &ResolutionCompletion::Complete,
         "{answer:?}"
     );
-}
 
-const RUST_TWO_UNEXPANDED_ITEM_MACROS: &str = r#"pub mod m {
-    pub struct Dim(pub i64);
-    macro_rules! from_int {
-        ($i:ty, $name:ident) => {
-            pub fn $name(v: $i) -> Dim {
-                Dim(v as i64)
-            }
-            impl From<$i> for Dim {
-                fn from(v: $i) -> Dim {
-                    $name(v)
-                }
-            }
-        };
-    }
-    from_int!(i32, from_i32);
-    from_int!(u8, from_u8);
-    from_int!(u16, from_u16);
-    pub fn bare() {
-        unbound_fn();
-    }
-}
-"#;
-
-/// The unexpanded item macros of one scope leave one fallback branch for the
-/// scope and one member branch per type, each carrying every invocation's
-/// reason, instead of one branch per invocation: every invocation reaches the
-/// same names at the same rank, so the copies answered each lookup once per
-/// invocation. A bare lookup the scope does not bind still ends incomplete,
-/// with each invocation's reason. The macro writes a function beside its impl,
-/// so it is an item macro, not an impl-only one (`UnexpandedImplMacro`).
-#[test]
-fn a_scope_leaves_one_fallback_branch_for_all_its_unexpanded_item_macros() {
-    let fixture = parsed_rust_fixture(
-        RUST_TWO_UNEXPANDED_ITEM_MACROS,
-        b"rust-unexpanded-item-macro-branches",
-    );
-    let invocations = fixture
+    let expected = definition_after(&fixture, "impl Runner for Service", "Output");
+    let marker = "<Service as Runner>::Output";
+    let position = source.find(marker).unwrap() + marker.rfind("Output").unwrap();
+    let identifier = fixture
         .facts
-        .gaps
+        .identifiers
         .iter()
-        .filter(|gap| gap.kind == ResolutionGapKind::UnexpandedItemMacro)
-        .count();
-    assert_eq!(invocations, 3, "{:?}", fixture.facts.gaps);
-    let branches = fixture
-        .lexical
-        .paths()
-        .iter()
-        .filter(|(_, path)| {
-            path.start().symbols().fixed().is_empty()
-                && matches!(
-                    path.completion(),
-                    ResolutionCompletion::Incomplete(reasons) if reasons.len() == invocations
-                )
+        .find(|identifier| {
+            identifier.role == ResolutionIdentifierRole::Reference
+                && fixture.facts.sites[identifier.site.index()].start_byte == position
         })
-        .count();
-    // One scope fallback and one member branch for `Dim`.
-    assert_eq!(branches, 2, "{:?}", fixture.lexical.paths());
-    let answer = resolved(&fixture, "unbound_fn()", "unbound_fn");
+        .expect("associated type reference");
+    let reference = lowered_semantic_at(
+        &fixture.lexical,
+        identifier.site,
+        LoweredSemanticRole::Reference,
+    );
+    let answer = fixture
+        .service
+        .resolve_reference(reference, &CancellationToken::new())
+        .unwrap();
+    assert_eq!(answer.binding().targets(), &[expected], "{answer:?}");
+    assert_eq!(
+        answer.binding().completion(),
+        &ResolutionCompletion::Complete,
+        "{answer:?}"
+    );
+
+    // The generated declaration is still outside declaration replay. Its
+    // unresolved lexical lookup must retain the original macro frontier.
+    let answer = resolved(&fixture, "generated();", "generated");
     assert!(answer.binding().targets().is_empty(), "{answer:?}");
+    assert_incomplete(&answer);
+}
+
+#[test]
+fn item_macros_with_impl_or_nested_expansion_keep_type_members_open() {
+    for expansion in [
+        "pub fn generated() {} impl Service { pub fn run(&self) {} }",
+        "pub fn generated() { unknown!(); }",
+        "#[unknown_attribute] pub fn generated() {}",
+        "pub fn generated() { impl Service { pub fn run(&self) {} } }",
+        "pub mod more;",
+        "use elsewhere::Extension;",
+    ] {
+        let source = format!(
+            "pub struct Service;\n\
+             impl Service {{ pub fn run(&self) {{}} }}\n\
+             macro_rules! maker {{ () => {{ {expansion} }}; }}\n\
+             maker!();\n\
+             fn invoke(service: Service) {{ service.run(); }}"
+        );
+        let fixture = parsed_rust_fixture(&source, b"rust-open-macro-members");
+        let run = definition_after(&fixture, "impl Service", "run");
+        let answer = resolved(&fixture, "service.run", "run");
+        assert_eq!(
+            answer.binding().targets(),
+            &[run],
+            "{expansion}: {answer:?}"
+        );
+        assert_incomplete(&answer);
+    }
+}
+
+#[test]
+fn a_closed_macro_does_not_hide_another_macro_member_frontier() {
+    let source = r#"
+pub struct Service;
+impl Service { pub fn run(&self) {} }
+macro_rules! closed { () => { pub fn generated() {} }; }
+macro_rules! open { () => { pub fn other() {} impl Service { pub fn extra(&self) {} } }; }
+closed!();
+open!();
+fn invoke(service: Service) { service.run(); }
+"#;
+    let fixture = parsed_rust_fixture(source, b"rust-mixed-macro-member-surfaces");
+    let run = definition_after(&fixture, "impl Service", "run");
+    let answer = resolved(&fixture, "service.run", "run");
+    assert_eq!(answer.binding().targets(), &[run], "{answer:?}");
     let ResolutionCompletion::Incomplete(reasons) = answer.binding().completion() else {
-        panic!("an unbound name beside unexpanded item macros is incomplete: {answer:?}");
+        panic!("the other macro can still introduce members: {answer:?}");
     };
-    assert!(reasons.len() >= invocations, "{answer:?}");
+    assert_eq!(
+        reasons.len(),
+        1,
+        "only the open macro affects members: {answer:?}"
+    );
+}
+
+fn assert_argument_independent_binding_keeps_callsite_gap(
+    fixture: &ParsedRustFixture,
+    reference: SemanticId,
+    answer: &FactResolutionAnswer,
+) -> SemanticId {
+    let obligation = fixture
+        .typed
+        .call_obligations()
+        .iter()
+        .find(|obligation| obligation.callee_reference() == reference)
+        .expect("Rust call applicability obligation");
+    let call = fixture
+        .facts
+        .calls
+        .iter()
+        .find(|call| {
+            lowered_semantic_at(
+                &fixture.lexical,
+                call.callee,
+                LoweredSemanticRole::Reference,
+            ) == reference
+        })
+        .expect("Rust call fact");
+    let callsite_reason = gap_reason_semantic(
+        fixture.lexical.fragment(),
+        call.call,
+        LoweringGapOrigin::Extracted(ResolutionGapKind::UnsupportedCallApplicability),
+    );
+    let callee_reason = obligation.applicability_reason();
+    let result_slot = obligation.result_slot();
+
+    assert!(obligation.completion().contains_reason(
+        ResolutionIncompleteReason::UnsupportedSemantic(callsite_reason)
+    ));
+    assert_eq!(
+        answer.binding().completion(),
+        &ResolutionCompletion::Complete
+    );
+    assert!(!answer.binding().completion().contains_reason(
+        ResolutionIncompleteReason::UnsupportedSemantic(callee_reason)
+    ));
+    assert!(!answer.binding().completion().contains_reason(
+        ResolutionIncompleteReason::UnsupportedSemantic(callsite_reason)
+    ));
+    let result_frontier = answer
+        .projected_frontiers()
+        .iter()
+        .find(|frontier| frontier.slot() == result_slot)
+        .expect("Rust call result frontier");
+    assert!(result_frontier.completion().contains_reason(
+        ResolutionIncompleteReason::UnsupportedSemantic(callsite_reason)
+    ));
+    assert!(!result_frontier.completion().contains_reason(
+        ResolutionIncompleteReason::UnsupportedSemantic(callee_reason)
+    ));
+    assert!(
+        answer
+            .completion()
+            .contains_reason(ResolutionIncompleteReason::UnsupportedSemantic(
+                callsite_reason
+            ))
+    );
+    assert!(
+        !answer
+            .completion()
+            .contains_reason(ResolutionIncompleteReason::UnsupportedSemantic(
+                callee_reason
+            ))
+    );
+    result_slot
 }

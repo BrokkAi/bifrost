@@ -27,12 +27,15 @@ use brokk_bifrost_core::profiling;
 use crate::analyzer::semantic::cfg_algorithms::{
     CfgAlgorithmBudget, CfgAlgorithmRequest, GenKillFacts, dominators, reaching_definitions,
 };
+use crate::analyzer::semantic::type_flow::DispatchHintProof;
 use crate::analyzer::semantic::{
-    CancellationToken, CandidateCoverage, ClassAtom, ClassIdentity, ControlEdgeKind, DispatchHint,
-    DispatchHintCallSiteKey, DispatchHintSet, DispatchHints, IcfgProvider, MemberAccessKind,
-    MemberLookup, MemberLookupHit, ProcedureHandle, ProgramPointId, SemanticBudget,
-    SemanticBudgetExceeded, SemanticEffect, SemanticValueKind, SourceSite, SourceSiteKind,
-    SourceSpan, TypeFlowAdapter, UnknownReason, ValueFlowKind, ValueId, WorkspaceIcfgProvider,
+    CancellationToken, CandidateCoverage, ClassAtom, ClassIdentity, ClassSeed,
+    ConstructorResultEvidence, ConstructorResultOrigin, ControlEdgeKind, DispatchHint,
+    DispatchHintCallSiteKey, DispatchHintSet, DispatchHints, ExactResultProducer, IcfgProvider,
+    MemberAccessKind, MemberLookup, MemberLookupHit, MemberReceiverQuery, ProcedureHandle,
+    ProgramPointId, SemanticBudget, SemanticBudgetExceeded, SemanticEffect, SemanticValueKind,
+    SourceMappingKind, SourceSite, SourceSiteKind, SourceSpan, TypeFlowAdapter, UnknownReason,
+    ValueFlowKind, ValueId, WorkspaceIcfgProvider,
 };
 use crate::analyzer::semantic_model::ActiveSemanticModelSnapshot;
 use crate::analyzer::{AnalyzerQueryScope, ProjectFile, WorkspaceAnalyzer};
@@ -53,7 +56,7 @@ use super::FieldSlotIndex;
 use super::field_slots::{MemberStoreEvidence, class_order};
 use super::plan::{
     MemberAccessSite, ProcedureRefinements, SourceRefinement, TypeFlowPlan, TypeFlowPlanError,
-    uncovered_reason,
+    TypeFlowSitePurpose, uncovered_reason,
 };
 use super::refinement_sources::DefinitionSources;
 use super::summary::{
@@ -103,16 +106,28 @@ impl ClassSetStatus {
     }
 }
 
-/// The classes and Unknown reasons that reached one member access under one
-/// root, plus the status a consumer may act on.
+/// The classes and Unknown reasons that reached one typed class-set site under
+/// one root, plus the status a consumer may act on.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReceiverClassSet {
     pub site: MemberAccessSite,
     pub classes: Vec<(ClassIdentity, SourceSite)>,
+    /// One exact call or access result that introduced this receiver.
+    /// Conservative value flow can add other meetings from the producer's
+    /// inputs; consumers must independently prove the stable local binding,
+    /// exact producer, and exhaustive member lookup before using this origin.
+    pub constructor_origin: Option<ConstructorResultOrigin>,
+    /// The exact call or access result passed the language's stable-local
+    /// receiver proof. Consumers may use this only with exhaustive dispatch.
+    pub exact_result_receiver_proven: bool,
     /// Exact declarations that proved a class in `classes` has this member.
     /// Retained so feedback consumes the same lookup verdict that authorized
     /// the Known set instead of repeating a language query.
     pub member_declarations: Vec<(ClassIdentity, MemberLookupHit)>,
+    /// Unknown value-flow atoms or uncertain meetings, separated from
+    /// member-lookup uncertainty so a consumer can use another structured
+    /// member inventory without treating it as a complete class set.
+    pub flow_unknown: Vec<UnknownReason>,
     pub unknown: Vec<UnknownReason>,
     pub dynamic_writes: Vec<super::dynamic_stores::DynamicWriteEvidence>,
     pub status: ClassSetStatus,
@@ -145,11 +160,15 @@ pub enum AbsentMemberProof {
     /// The receiver set is complete: every value that reaches the site is
     /// classified, so the class is one of a closed set of alternatives.
     Proven,
-    /// The class certainly reaches the site and certainly lacks the member,
-    /// but other values may also reach it. `remainders` is the sorted set of
-    /// Unknown reasons the receiver set carried; each one names another
-    /// alternative rather than doubting this class.
-    Conditional { remainders: Vec<UnknownReason> },
+    /// The class certainly reaches the site and lacks the member, but other
+    /// receiver values may remain unclassified, a listed global dynamic write
+    /// may install the member, or a declared parameter may rely on a single
+    /// closed workspace-class annotation. `remainders` is the sorted set of
+    /// Unknown reasons the receiver set carried.
+    Conditional {
+        remainders: Vec<UnknownReason>,
+        unbounded_dynamic_writes: Vec<super::dynamic_stores::DynamicWriteEvidence>,
+    },
 }
 
 impl AbsentMemberProof {
@@ -1109,7 +1128,8 @@ pub fn solve_type_flow_for_root_with_refinements(
 fn dispatch_hint_updates(plan: &TypeFlowPlan, result: &TypeFlowRootResult) -> Vec<DispatchHintSet> {
     let mut updates = Vec::new();
     for set in &result.class_sets {
-        if !matches!(set.status, ClassSetStatus::Known | ClassSetStatus::Partial)
+        if set.site.purpose != TypeFlowSitePurpose::MemberAccess
+            || !matches!(set.status, ClassSetStatus::Known | ClassSetStatus::Partial)
             || set.site.kind != MemberAccessKind::Call
         {
             continue;
@@ -1126,11 +1146,36 @@ fn dispatch_hint_updates(plan: &TypeFlowPlan, result: &TypeFlowRootResult) -> Ve
         {
             continue;
         }
-        let (exhaustive, singleton) = dispatch_hint_flags(
-            &set.member_declarations,
-            set.classes.len(),
-            set.status == ClassSetStatus::Known,
-        );
+        let exhaustive =
+            dispatch_hints_exhaustive(&set.member_declarations, set.classes.len(), set.status);
+        let exact_return_origin_proven = set.constructor_origin.as_ref().is_some_and(|origin| {
+            let origin_covers_receiver = origin.classes.iter().all(|class| {
+                set.classes
+                    .iter()
+                    .any(|(receiver_class, _)| receiver_class == class)
+            }) && set
+                .classes
+                .iter()
+                .all(|(class, _)| origin.classes.contains(class));
+            origin_covers_receiver
+                && matches!(
+                    origin.source.kind,
+                    SourceSiteKind::ExactCallResult | SourceSiteKind::ExactAccessResult
+                )
+                && set.exact_result_receiver_proven
+        });
+        let receiver_classes_share_constructor_source =
+            set.classes.first().is_some_and(|(_, first)| {
+                first.kind == SourceSiteKind::ConstructorCall
+                    && set.classes.iter().all(|(_, source)| source == first)
+            });
+        let receiver_origins_proven =
+            exact_return_origin_proven || receiver_classes_share_constructor_source;
+        let proof = if exhaustive && receiver_origins_proven {
+            DispatchHintProof::Proven
+        } else {
+            DispatchHintProof::Unproven
+        };
         let hints = set
             .member_declarations
             .iter()
@@ -1151,24 +1196,23 @@ fn dispatch_hint_updates(plan: &TypeFlowPlan, result: &TypeFlowRootResult) -> Ve
             DispatchHintCallSiteKey::for_call(&set.site.procedure, call),
             hints,
             exhaustive,
-            singleton,
+            proof,
         ));
     }
     updates
 }
 
-fn dispatch_hint_flags(
+fn dispatch_hints_exhaustive(
     declarations: &[(ClassIdentity, MemberLookupHit)],
     receiver_class_count: usize,
-    receiver_set_complete: bool,
-) -> (bool, bool) {
-    let exhaustive = receiver_set_complete
+    status: ClassSetStatus,
+) -> bool {
+    status == ClassSetStatus::Known
         && receiver_class_count > 0
         && declarations.len() == receiver_class_count
         && declarations
             .iter()
-            .all(|(_, hit)| hit.dispatch_coverage == CandidateCoverage::Exhaustive);
-    (exhaustive, exhaustive && receiver_class_count == 1)
+            .all(|(_, hit)| hit.dispatch_coverage == CandidateCoverage::Exhaustive)
 }
 
 fn interpret(
@@ -1244,7 +1288,10 @@ fn interpret(
             ValueFlowSinkOutcome::NotReached if complete => ReceiverClassSet {
                 site,
                 classes: Vec::new(),
+                constructor_origin: None,
+                exact_result_receiver_proven: false,
                 member_declarations: Vec::new(),
+                flow_unknown: Vec::new(),
                 unknown: Vec::new(),
                 dynamic_writes: Vec::new(),
                 status: ClassSetStatus::NoInformation,
@@ -1255,17 +1302,17 @@ fn interpret(
             // today, so the `NotReached` half of this arm is the contract
             // holding the line if that gate ever widens.
             ValueFlowSinkOutcome::NotReached | ValueFlowSinkOutcome::Inconclusive => {
+                let reason =
+                    unreached_reason(plan, sink_id, termination, semantic_budget_exhausted);
                 ReceiverClassSet {
                     site,
                     classes: Vec::new(),
+                    constructor_origin: None,
+                    exact_result_receiver_proven: false,
                     member_declarations: Vec::new(),
                     dynamic_writes: Vec::new(),
-                    unknown: vec![unreached_reason(
-                        plan,
-                        sink_id,
-                        termination,
-                        semantic_budget_exhausted,
-                    )],
+                    flow_unknown: vec![reason.clone()],
+                    unknown: vec![reason],
                     status: ClassSetStatus::Inconclusive,
                 }
             }
@@ -1367,6 +1414,235 @@ fn unreached_reason(
     UnknownReason::IncompleteRoot
 }
 
+fn constructor_result_evidence(
+    workspace: &WorkspaceAnalyzer,
+    plan: &TypeFlowPlan,
+    procedure: &ProcedureHandle,
+    meetings: &[&ValueFlowMeeting],
+) -> ConstructorResultEvidence {
+    let has_constructor_origin = meetings.iter().any(|meeting| {
+        plan.source_site(meeting.source()).kind == SourceSiteKind::ConstructorCall
+            && !plan.class_source_is_open_bound(meeting.source())
+    });
+    if has_constructor_origin {
+        let has_local_constructor_call = meetings.iter().any(|meeting| {
+            let source = plan.source_site(meeting.source());
+            source.kind == SourceSiteKind::ConstructorCall
+                && !plan.class_source_is_open_bound(meeting.source())
+                && procedure.semantics().call_sites().iter().any(|call| {
+                    procedure
+                        .semantics()
+                        .source_mapping(call.source)
+                        .filter(|mapping| mapping.kind == SourceMappingKind::Exact)
+                        .is_some_and(|mapping| {
+                            mapping.locator.anchor().span() == source.span
+                                && crate::analyzer::semantic::type_flow::file_for_locator(
+                                    workspace,
+                                    &mapping.locator,
+                                )
+                                .as_ref()
+                                    == Some(&source.file)
+                        })
+                })
+        });
+        // A constructor source in a callee summary is not a direct constructor
+        // result in this receiver's procedure. Leave its ordinary dispatch path
+        // unchanged; constructor evidence must belong to this exact procedure.
+        if !has_local_constructor_call {
+            return ConstructorResultEvidence::None;
+        }
+        let Some(first) = meetings.first() else {
+            return ConstructorResultEvidence::Ambiguous;
+        };
+        let source_id = first.source();
+        let ClassAtom::Class(class) = plan.atom(source_id) else {
+            return ConstructorResultEvidence::Ambiguous;
+        };
+        if plan.class_source_is_open_bound(source_id) {
+            return ConstructorResultEvidence::Ambiguous;
+        }
+        let source = plan.source_site(source_id);
+        // This is a constructor-identity candidate, not a claim that the flow
+        // solver proved the local receiver path. Adapters must prove that path
+        // from their binding facts before using this origin to close dispatch.
+        // Keep an unproven but unambiguous same-source meeting as a candidate;
+        // uncertain or mixed-origin meetings remain ambiguous here.
+        if source.kind != SourceSiteKind::ConstructorCall
+            || meetings.iter().any(|meeting| {
+                meeting.source() != source_id
+                    || meeting.is_uncertain()
+                    || !matches!(plan.atom(meeting.source()), ClassAtom::Class(candidate) if candidate == class)
+            })
+        {
+            return ConstructorResultEvidence::Ambiguous;
+        }
+        let calls = procedure
+            .semantics()
+            .call_sites()
+            .iter()
+            .filter(|call| {
+                procedure
+                    .semantics()
+                    .source_mapping(call.source)
+                    .filter(|mapping| mapping.kind == SourceMappingKind::Exact)
+                    .is_some_and(|mapping| {
+                        mapping.locator.anchor().span() == source.span
+                            && crate::analyzer::semantic::type_flow::file_for_locator(
+                                workspace,
+                                &mapping.locator,
+                            )
+                            .as_ref()
+                                == Some(&source.file)
+                    })
+            })
+            .collect::<Vec<_>>();
+        let [call] = calls.as_slice() else {
+            return ConstructorResultEvidence::Ambiguous;
+        };
+        let results = call.normal_result_values().collect::<Vec<_>>();
+        let [result] = results.as_slice() else {
+            return ConstructorResultEvidence::Ambiguous;
+        };
+        return ConstructorResultEvidence::Unique(ConstructorResultOrigin {
+            classes: vec![class.clone()].into_boxed_slice(),
+            producer: ExactResultProducer::Call(call.id),
+            result: *result,
+            source: source.clone(),
+        });
+    }
+
+    let exact_call_meetings = meetings
+        .iter()
+        .copied()
+        .filter(|meeting| {
+            plan.source_site(meeting.source()).kind == SourceSiteKind::ExactCallResult
+        })
+        .collect::<Vec<_>>();
+    if let Some(first_meeting) = exact_call_meetings.first() {
+        let source = plan.source_site(first_meeting.source());
+        if exact_call_meetings.iter().any(|meeting| {
+            meeting.is_uncertain()
+                || plan.source_site(meeting.source()) != source
+                || !matches!(plan.atom(meeting.source()), ClassAtom::Class(_))
+        }) {
+            return ConstructorResultEvidence::Ambiguous;
+        }
+        let classes = exact_call_meetings
+            .iter()
+            .map(|meeting| match plan.atom(meeting.source()) {
+                ClassAtom::Class(class) => class.clone(),
+                ClassAtom::Unknown(_) => unreachable!("exact call meetings were checked"),
+            })
+            .collect::<Vec<_>>();
+        let ClassSeed::Classes(classes) = ClassSeed::classes(classes) else {
+            unreachable!("a source class meeting yields a non-empty class set")
+        };
+        let calls = procedure
+            .semantics()
+            .call_sites()
+            .iter()
+            .filter(|call| {
+                procedure
+                    .semantics()
+                    .source_mapping(call.source)
+                    .filter(|mapping| mapping.kind == SourceMappingKind::Exact)
+                    .is_some_and(|mapping| {
+                        mapping.locator.anchor().span() == source.span
+                            && crate::analyzer::semantic::type_flow::file_for_locator(
+                                workspace,
+                                &mapping.locator,
+                            )
+                            .as_ref()
+                                == Some(&source.file)
+                    })
+            })
+            .collect::<Vec<_>>();
+        let [call] = calls.as_slice() else {
+            return ConstructorResultEvidence::Ambiguous;
+        };
+        let results = call.normal_result_values().collect::<Vec<_>>();
+        let [result] = results.as_slice() else {
+            return ConstructorResultEvidence::Ambiguous;
+        };
+        return ConstructorResultEvidence::Unique(ConstructorResultOrigin {
+            classes,
+            producer: ExactResultProducer::Call(call.id),
+            result: *result,
+            source: source.clone(),
+        });
+    }
+
+    let Some(first) = meetings.first() else {
+        return ConstructorResultEvidence::None;
+    };
+    let source = plan.source_site(first.source());
+    if source.kind != SourceSiteKind::ExactAccessResult {
+        return ConstructorResultEvidence::None;
+    }
+    let mut classes = Vec::with_capacity(meetings.len());
+    if meetings.iter().any(|meeting| {
+        let meeting_source = plan.source_site(meeting.source());
+        if meeting_source != source || meeting.is_uncertain() {
+            return true;
+        }
+        match plan.atom(meeting.source()) {
+            ClassAtom::Class(class) => {
+                classes.push(class.clone());
+                false
+            }
+            ClassAtom::Unknown(_) => true,
+        }
+    }) {
+        return ConstructorResultEvidence::Ambiguous;
+    }
+    let ClassSeed::Classes(classes) = ClassSeed::classes(classes) else {
+        unreachable!("an exact access meeting yields a non-empty class set")
+    };
+    let exact_source = |mapping_id| {
+        procedure
+            .semantics()
+            .source_mapping(mapping_id)
+            .filter(|mapping| mapping.kind == SourceMappingKind::Exact)
+            .is_some_and(|mapping| {
+                mapping.locator.anchor().span() == source.span
+                    && crate::analyzer::semantic::type_flow::file_for_locator(
+                        workspace,
+                        &mapping.locator,
+                    )
+                    .as_ref()
+                        == Some(&source.file)
+            })
+    };
+    let loads = procedure
+        .semantics()
+        .points()
+        .iter()
+        .flat_map(|point| {
+            point.events.iter().filter_map(|event| {
+                let SemanticEffect::MemoryLoad {
+                    location, result, ..
+                } = event.effect
+                else {
+                    return None;
+                };
+                exact_source(event.source).then_some((point.id, location, result))
+            })
+        })
+        .collect::<Vec<_>>();
+    let [(point, location, result)] = loads.as_slice() else {
+        return ConstructorResultEvidence::Ambiguous;
+    };
+    ConstructorResultEvidence::Unique(ConstructorResultOrigin {
+        classes,
+        producer: ExactResultProducer::MemoryLoad {
+            point: *point,
+            location: *location,
+        },
+        result: *result,
+        source: source.clone(),
+    })
+}
+
 #[allow(clippy::too_many_arguments)]
 fn reached_class_set(
     workspace: &WorkspaceAnalyzer,
@@ -1379,28 +1655,76 @@ fn reached_class_set(
     root: &ProcedureHandle,
     findings: &mut Vec<AbsentMemberFinding>,
 ) -> ReceiverClassSet {
-    // Parallel vecs: `classes[i]` was introduced by `class_meetings[i]`.
-    let mut classes: Vec<(ClassIdentity, SourceSite)> = Vec::new();
+    let constructor = constructor_result_evidence(workspace, plan, &site.procedure, meetings);
+    let constructor_origin = match &constructor {
+        ConstructorResultEvidence::Unique(origin) => Some(origin.clone()),
+        ConstructorResultEvidence::None | ConstructorResultEvidence::Ambiguous => None,
+    };
+    let exact_result_receiver_proven = if let Some(origin) = constructor_origin.as_ref()
+        && matches!(
+            origin.source.kind,
+            SourceSiteKind::ExactCallResult | SourceSiteKind::ExactAccessResult
+        )
+        && let Some(call_id) = site.call
+        && let Some(call) = site.procedure.semantics().call_site(call_id)
+    {
+        adapter.exact_result_receiver_is_stable(
+            workspace,
+            &site.procedure,
+            site.receiver,
+            call,
+            origin,
+        )
+    } else {
+        false
+    };
+    let exact_result_source = constructor_origin
+        .as_ref()
+        .filter(|_| exact_result_receiver_proven)
+        .map(|origin| origin.source.clone());
+    let effective_meetings = if let Some(source) = exact_result_source.as_ref() {
+        meetings
+            .iter()
+            .copied()
+            .filter(|meeting| {
+                let candidate = plan.source_site(meeting.source());
+                matches!(
+                    candidate.kind,
+                    SourceSiteKind::ExactCallResult | SourceSiteKind::ExactAccessResult
+                ) && candidate.file == source.file
+                    && candidate.span == source.span
+            })
+            .collect::<Vec<_>>()
+    } else {
+        meetings.to_vec()
+    };
+    // An exact callable-result claim proves the receiver's runtime class even
+    // when its value-flow summary transfers actual values into the result.
+    // Keep those transfers for data-flow consumers; ignore them here only
+    // after the adapter proves the exact local receiver binding.
+    // Each class alternative keeps whether any exact origin reached it;
+    // identity deduplication must not erase an exact origin beside a bound.
+    let mut classes: Vec<(ClassIdentity, SourceSite, bool)> = Vec::new();
     let mut class_meetings: Vec<&ValueFlowMeeting> = Vec::new();
     let mut member_declarations = Vec::new();
+    let mut flow_unknown: Vec<UnknownReason> = Vec::new();
     let mut unknown: Vec<UnknownReason> = Vec::new();
-    // These reasons can describe the value that brought a candidate class to
-    // the sink, rather than another class's member lookup. The flow graph does
-    // not retain enough class attribution to tell which candidate they doubt.
-    let mut value_flow_has_member_surface_uncertainty = false;
     let mut dynamic_writes = Vec::new();
-    for meeting in meetings {
+    for meeting in &effective_meetings {
         if meeting.is_uncertain() {
             push_reason(&mut unknown, UnknownReason::UncertainFlow);
+            push_reason(&mut flow_unknown, UnknownReason::UncertainFlow);
         }
         match plan.atom(meeting.source()) {
             ClassAtom::Class(identity) => {
                 let source_site = plan.source_site(meeting.source());
+                let exact_origin = !plan.class_source_is_open_bound(meeting.source());
                 if let Some(index) = classes
                     .iter()
-                    .position(|(existing, _)| existing == identity)
+                    .position(|(existing, _, _)| existing == identity)
                 {
                     let existing_site = &classes[index].1;
+                    let existing_has_exact_origin = classes[index].2;
                     let candidate_key = plan
                         .value_flow()
                         .source(meeting.source())
@@ -1417,32 +1741,39 @@ fn reached_class_set(
                     // rows and finding witnesses remain exact. A guard arm
                     // proves a class without producing the value, so it yields
                     // to any site that did produce one.
-                    if narrowing_guard_rank(source_site)
-                        .cmp(&narrowing_guard_rank(existing_site))
-                        .then_with(|| source_site.file.cmp(&existing_site.file))
-                        .then_with(|| source_site.span.cmp(&existing_site.span))
-                        .then_with(|| candidate_key.cmp(existing_key))
-                        .is_lt()
-                    {
+                    let prefer_exact_origin = exact_origin && !existing_has_exact_origin;
+                    let same_origin_quality = exact_origin == existing_has_exact_origin
+                        && narrowing_guard_rank(source_site)
+                            .cmp(&narrowing_guard_rank(existing_site))
+                            .then_with(|| source_site.file.cmp(&existing_site.file))
+                            .then_with(|| source_site.span.cmp(&existing_site.span))
+                            .then_with(|| candidate_key.cmp(existing_key))
+                            .is_lt();
+                    classes[index].2 |= exact_origin;
+                    if prefer_exact_origin || same_origin_quality {
                         classes[index].1 = source_site.clone();
                         class_meetings[index] = meeting;
                     }
                 } else {
-                    classes.push((identity.clone(), source_site.clone()));
+                    classes.push((identity.clone(), source_site.clone(), exact_origin));
                     class_meetings.push(meeting);
                 }
             }
             ClassAtom::Unknown(reason) => {
-                value_flow_has_member_surface_uncertainty |= is_member_surface_uncertainty(reason);
                 push_reason(&mut unknown, reason.clone());
+                push_reason(&mut flow_unknown, reason.clone());
             }
         }
     }
     let mut ordered_classes = classes.into_iter().zip(class_meetings).collect::<Vec<_>>();
-    ordered_classes.sort_unstable_by(|((left, _), _), ((right, _), _)| class_order(left, right));
-    let (classes, class_meetings): (Vec<(ClassIdentity, SourceSite)>, Vec<&ValueFlowMeeting>) =
-        ordered_classes.into_iter().unzip();
+    ordered_classes
+        .sort_unstable_by(|((left, _, _), _), ((right, _, _), _)| class_order(left, right));
+    let (classes, class_meetings): (
+        Vec<(ClassIdentity, SourceSite, bool)>,
+        Vec<&ValueFlowMeeting>,
+    ) = ordered_classes.into_iter().unzip();
     sort_unknown_reasons(&mut unknown);
+    sort_unknown_reasons(&mut flow_unknown);
     let mut status = if !unknown.is_empty() {
         ClassSetStatus::Partial
     } else if classes.is_empty() {
@@ -1455,86 +1786,144 @@ fn reached_class_set(
         // and dispatch evidence, but the open remainder prevents an Absent
         // result from authorizing a finding or an exhaustive dispatch hint.
         let complete_receiver_set = status == ClassSetStatus::Known;
-        // Classes whose own lookup proves the member absent and whose own
-        // survey records no dynamic write that could install it. Recorded for
-        // every set status; the set-level gate below decides the tier.
-        let mut absent: Vec<usize> = Vec::new();
-        for (index, (identity, _)) in classes.iter().enumerate() {
-            let lookup = adapter.member_lookup(workspace, site.kind, identity, &site.member);
-            let mut own_dynamic_writes = false;
-            if matches!(
-                lookup,
-                MemberLookup::Absent | MemberLookup::DeclarationAbsent
-            ) {
-                for evidence in field_slots.dynamic_write_evidence(workspace, adapter, identity) {
-                    own_dynamic_writes = true;
-                    if !dynamic_writes.contains(evidence) {
-                        dynamic_writes.push(evidence.clone());
-                    }
-                }
-                if !dynamic_writes.is_empty() {
-                    push_reason(&mut unknown, UnknownReason::DynamicFieldWrite);
+        // Classes whose own lookup proves the member absent. A global Any
+        // write may be carried as an explicit Conditional remainder; every
+        // other write remains a blocker for that class.
+        let mut absent: Vec<(
+            usize,
+            Vec<super::dynamic_stores::DynamicWriteEvidence>,
+            bool,
+        )> = Vec::new();
+        let mut unbounded_dynamic_writes = Vec::new();
+        let mut blocking_dynamic_write = false;
+        let mut blocking_field_slot_incomplete = false;
+        for (index, (identity, _, _)) in classes.iter().enumerate() {
+            let lookup = if site.purpose == TypeFlowSitePurpose::PythonIteratorReturn {
+                adapter.member_lookup(workspace, site.kind, identity, &site.member)
+            } else if site.kind == MemberAccessKind::Call {
+                let call_id = site
+                    .call
+                    .expect("a call-shaped member sink retains its call-site ID");
+                let call = site
+                    .procedure
+                    .semantics()
+                    .call_sites()
+                    .iter()
+                    .find(|call| call.id == call_id)
+                    .expect("a member sink retains its call site");
+                adapter.member_lookup_for_receiver(
+                    workspace,
+                    MemberReceiverQuery {
+                        procedure: &site.procedure,
+                        receiver: site.receiver,
+                        call,
+                        constructor: &constructor,
+                        class: identity,
+                        member: &site.member,
+                    },
+                )
+            } else {
+                adapter.member_lookup(workspace, site.kind, identity, &site.member)
+            };
+            let own_dynamic_writes = if matches!(lookup, MemberLookup::Present(_)) {
+                Vec::new()
+            } else {
+                field_slots
+                    .dynamic_write_evidence(workspace, adapter, identity, &site.member)
+                    .cloned()
+                    .collect::<Vec<_>>()
+            };
+            for evidence in &own_dynamic_writes {
+                if !dynamic_writes.contains(evidence) {
+                    dynamic_writes.push(evidence.clone());
                 }
             }
             match lookup {
                 MemberLookup::Present(hit) => {
                     member_declarations.push((identity.clone(), hit));
                 }
-                MemberLookup::DeclarationAbsent => match field_slots.member_store_evidence(
-                    workspace,
-                    adapter,
-                    identity,
-                    &site.member,
-                ) {
-                    MemberStoreEvidence::NoStore if !own_dynamic_writes => absent.push(index),
-                    MemberStoreEvidence::NoStore => {}
-                    MemberStoreEvidence::Stored if site.kind == MemberAccessKind::Load => {}
-                    // A stored value is not a callable declaration. Keep the
-                    // dispatch remainder open instead of inventing a target.
-                    MemberStoreEvidence::Stored | MemberStoreEvidence::Unknown => {
-                        push_reason(&mut unknown, UnknownReason::FieldSlotIncomplete)
+                MemberLookup::DeclarationAbsent => {
+                    match field_slots.member_store_evidence(
+                        workspace,
+                        adapter,
+                        identity,
+                        &site.member,
+                    ) {
+                        MemberStoreEvidence::NoStore if own_dynamic_writes.is_empty() => {
+                            absent.push((index, Vec::new(), false));
+                        }
+                        MemberStoreEvidence::NoStore => {
+                            if let Some(writes) = field_slots.unbounded_any_dynamic_write_evidence(
+                                workspace,
+                                adapter,
+                                identity,
+                                &site.member,
+                            ) {
+                                add_dynamic_write_evidence(&mut unbounded_dynamic_writes, &writes);
+                                absent.push((index, writes, false));
+                            } else {
+                                blocking_dynamic_write = true;
+                            }
+                        }
+                        MemberStoreEvidence::Stored if site.kind == MemberAccessKind::Load => {
+                            blocking_dynamic_write |= !own_dynamic_writes.is_empty();
+                        }
+                        // A stored value is not a callable declaration. Keep the
+                        // dispatch remainder open instead of inventing a target.
+                        MemberStoreEvidence::Stored => {
+                            blocking_dynamic_write |= !own_dynamic_writes.is_empty();
+                        }
+                        MemberStoreEvidence::Unknown => {
+                            if let Some(writes) = field_slots
+                                .member_store_unknown_only_from_unbounded_any_writes(
+                                    workspace,
+                                    adapter,
+                                    identity,
+                                    &site.member,
+                                )
+                            {
+                                add_dynamic_write_evidence(&mut unbounded_dynamic_writes, &writes);
+                                absent.push((index, writes, true));
+                            } else {
+                                blocking_field_slot_incomplete = true;
+                                blocking_dynamic_write |= !own_dynamic_writes.is_empty();
+                            }
+                        }
                     }
-                },
-                MemberLookup::Absent if !own_dynamic_writes => absent.push(index),
-                MemberLookup::Absent => {}
-                MemberLookup::Unknown(reason) => push_reason(&mut unknown, reason),
+                }
+                MemberLookup::Absent if own_dynamic_writes.is_empty() => {
+                    absent.push((index, Vec::new(), false));
+                }
+                MemberLookup::Absent => {
+                    if let Some(writes) = field_slots.unbounded_any_dynamic_write_evidence(
+                        workspace,
+                        adapter,
+                        identity,
+                        &site.member,
+                    ) {
+                        add_dynamic_write_evidence(&mut unbounded_dynamic_writes, &writes);
+                        absent.push((index, writes, false));
+                    } else {
+                        blocking_dynamic_write = true;
+                    }
+                }
+                MemberLookup::Unknown(reason) => {
+                    blocking_dynamic_write |= !own_dynamic_writes.is_empty();
+                    push_reason(&mut unknown, reason);
+                }
             }
         }
+        if blocking_dynamic_write || !unbounded_dynamic_writes.is_empty() {
+            push_reason(&mut unknown, UnknownReason::DynamicFieldWrite);
+        }
+        if blocking_field_slot_incomplete {
+            push_reason(&mut unknown, UnknownReason::FieldSlotIncomplete);
+        }
         if complete_receiver_set && unknown.is_empty() {
-            for index in absent {
-                let (identity, origin) = &classes[index];
-                if origin.kind == SourceSiteKind::ConditionalNarrowingGuard {
-                    continue;
-                }
-                findings.push(AbsentMemberFinding {
-                    root: root.clone(),
-                    site: site.clone(),
-                    class: identity.clone(),
-                    origin: origin.clone(),
-                    witness: best_witness(result, class_meetings[index]),
-                    proof: AbsentMemberProof::Proven,
-                    also_fails_at: Vec::new(),
-                });
-            }
-        } else {
-            debug_assert!(
-                !unknown.is_empty(),
-                "a set that is not complete names at least one remainder"
-            );
-            if complete_receiver_set {
-                status = ClassSetStatus::Partial;
-            }
-            if !value_flow_has_member_surface_uncertainty
-                && unknown.iter().all(remainder_names_another_alternative)
-            {
-                let mut remainders = unknown.clone();
-                sort_unknown_reasons(&mut remainders);
-                for index in absent {
-                    let (identity, origin) = &classes[index];
-                    // A guard-only origin does not admit the class as a value,
-                    // and an uncertain meeting does not prove that it arrives.
-                    if !conditional_origin_admits_class(origin.kind)
-                        || class_meetings[index].is_uncertain()
+            if site.purpose == TypeFlowSitePurpose::MemberAccess {
+                for (index, _, _) in absent {
+                    let (identity, origin, has_exact_origin) = &classes[index];
+                    if !has_exact_origin || origin.kind == SourceSiteKind::ConditionalNarrowingGuard
                     {
                         continue;
                     }
@@ -1544,40 +1933,129 @@ fn reached_class_set(
                         class: identity.clone(),
                         origin: origin.clone(),
                         witness: best_witness(result, class_meetings[index]),
-                        proof: AbsentMemberProof::Conditional {
-                            remainders: remainders.clone(),
-                        },
+                        proof: AbsentMemberProof::Proven,
                         also_fails_at: Vec::new(),
                     });
+                }
+            }
+        } else {
+            debug_assert!(
+                !unknown.is_empty(),
+                "a set that is not complete names at least one remainder"
+            );
+            if complete_receiver_set {
+                status = ClassSetStatus::Partial;
+            }
+            if unknown.iter().all(remainder_names_another_alternative) {
+                let mut remainders = unknown.clone();
+                sort_unknown_reasons(&mut remainders);
+                if site.purpose == TypeFlowSitePurpose::MemberAccess {
+                    for (index, unbounded_dynamic_writes, attributed_field_slot_incomplete) in
+                        absent
+                    {
+                        let (identity, origin, has_exact_origin) = &classes[index];
+                        // A guard-only origin does not admit the class as a value,
+                        // and an uncertain meeting does not prove that it arrives.
+                        let admitted_parameter_origin = origin.kind
+                            == SourceSiteKind::DeclaredParameter
+                            && adapter.declared_parameter_conditional_origin_is_closed(
+                                workspace, identity, origin,
+                            );
+                        if !has_exact_origin
+                            || (!conditional_origin_admits_class(origin.kind)
+                                && !admitted_parameter_origin)
+                            || class_meetings[index].is_uncertain()
+                        {
+                            continue;
+                        }
+                        let has_unattributed_surface_uncertainty = flow_unknown
+                            .iter()
+                            .filter(|reason| is_member_surface_uncertainty(reason))
+                            .any(|reason| match reason {
+                                UnknownReason::DynamicFieldWrite => {
+                                    unbounded_dynamic_writes.is_empty()
+                                }
+                                // A value-flow atom does not retain enough provenance
+                                // to tie its incomplete field slot to these writes.
+                                UnknownReason::FieldSlotIncomplete => true,
+                                _ => true,
+                            });
+                        if has_unattributed_surface_uncertainty {
+                            continue;
+                        }
+                        let mut finding_remainders = remainders.clone();
+                        if !unbounded_dynamic_writes.is_empty() {
+                            if !blocking_dynamic_write {
+                                finding_remainders
+                                    .retain(|reason| *reason != UnknownReason::DynamicFieldWrite);
+                            }
+                            if attributed_field_slot_incomplete && !blocking_field_slot_incomplete {
+                                finding_remainders
+                                    .retain(|reason| *reason != UnknownReason::FieldSlotIncomplete);
+                            }
+                        }
+                        sort_unknown_reasons(&mut finding_remainders);
+                        findings.push(AbsentMemberFinding {
+                            root: root.clone(),
+                            site: site.clone(),
+                            class: identity.clone(),
+                            origin: origin.clone(),
+                            witness: best_witness(result, class_meetings[index]),
+                            proof: AbsentMemberProof::Conditional {
+                                remainders: finding_remainders,
+                                unbounded_dynamic_writes,
+                            },
+                            also_fails_at: Vec::new(),
+                        });
+                    }
                 }
             }
         }
     }
     ReceiverClassSet {
         site,
-        classes,
+        classes: classes
+            .into_iter()
+            .map(|(identity, origin, _)| (identity, origin))
+            .collect(),
+        constructor_origin,
+        exact_result_receiver_proven,
         member_declarations,
+        flow_unknown,
         unknown,
         dynamic_writes,
         status,
     }
 }
 
+fn add_dynamic_write_evidence(
+    evidence: &mut Vec<super::dynamic_stores::DynamicWriteEvidence>,
+    additions: &[super::dynamic_stores::DynamicWriteEvidence],
+) {
+    for addition in additions {
+        if !evidence.contains(addition) {
+            evidence.push(addition.clone());
+        }
+    }
+    evidence.sort_unstable_by_key(super::dynamic_stores::DynamicWriteEvidence::origin);
+}
+
 /// Whether one reason in a partial receiver set still permits a Conditional
 /// finding for a class whose own arrival, meeting, and member lookup are
-/// clean. An allowed reason says only that some other value or class may also
-/// reach the site. A blocking reason can mean that this class should have been
-/// filtered out on this path, or that the answer was cut short.
+/// clean. An allowed reason describes another value or class at the site, or
+/// an explicitly attributed global dynamic write that may install the member.
+/// A blocking reason can mean that this class should have been filtered out
+/// on this path, or that the answer was cut short.
 ///
 /// The member-lookup reasons (`UnresolvedBase`, `DynamicAttributes`,
 /// `ClassCreation`, `FieldSlotIncomplete`, `DynamicFieldWrite`) are allowed
-/// because a class whose own lookup raised one is never a candidate: its
-/// lookup is not `Absent`, its store evidence is not `NoStore`, or its own
-/// dynamic-write survey is not empty. When one of these reasons arrives as a
-/// value-flow atom, class attribution is unavailable and the Conditional tier
-/// is suppressed for the whole set. `UncertainFlow` is allowed because the
-/// caller separately requires the class's own representative meeting to be
-/// certain.
+/// for another candidate class. A candidate's own write remains blocking
+/// unless every matching effect is a global write with an Any name set and
+/// every store-survey gap is attributable to those writes. When a member
+/// uncertainty arrives as a value-flow atom, class attribution is unavailable
+/// and the Conditional tier is suppressed for the whole set. `UncertainFlow`
+/// is allowed because the caller separately requires the class's own
+/// representative meeting to be certain.
 fn remainder_names_another_alternative(reason: &UnknownReason) -> bool {
     match reason {
         UnknownReason::RootParameter
@@ -1629,6 +2107,8 @@ fn is_member_surface_uncertainty(reason: &UnknownReason) -> bool {
 fn conditional_origin_admits_class(kind: SourceSiteKind) -> bool {
     match kind {
         SourceSiteKind::ConstructorCall
+        | SourceSiteKind::ExactCallResult
+        | SourceSiteKind::ExactAccessResult
         | SourceSiteKind::Literal
         | SourceSiteKind::ContainerLiteral
         | SourceSiteKind::NarrowingGuard
@@ -1660,9 +2140,7 @@ pub fn sort_unknown_reasons(reasons: &mut [UnknownReason]) {
 }
 
 fn push_reason(reasons: &mut Vec<UnknownReason>, reason: UnknownReason) {
-    if !reasons.contains(&reason) {
-        reasons.push(reason);
-    }
+    brokk_bifrost_core::util::push_if_absent(reasons, reason);
 }
 
 /// The witness at the best path quality the meeting retained.
@@ -1995,6 +2473,33 @@ pub(super) fn prefer_retained_finding(
 ) {
     let stronger = candidate.proof.is_proven() && !existing.proof.is_proven();
     let same_tier = candidate.proof.is_proven() == existing.proof.is_proven();
+    let merged_conditional_proof = match (&existing.proof, &candidate.proof) {
+        (
+            AbsentMemberProof::Conditional {
+                remainders,
+                unbounded_dynamic_writes,
+            },
+            AbsentMemberProof::Conditional {
+                remainders: candidate_remainders,
+                unbounded_dynamic_writes: candidate_writes,
+            },
+        ) => {
+            let mut merged_remainders = remainders.clone();
+            for reason in candidate_remainders {
+                if !merged_remainders.contains(reason) {
+                    merged_remainders.push(reason.clone());
+                }
+            }
+            sort_unknown_reasons(&mut merged_remainders);
+            let mut merged_writes = unbounded_dynamic_writes.clone();
+            add_dynamic_write_evidence(&mut merged_writes, candidate_writes);
+            Some(AbsentMemberProof::Conditional {
+                remainders: merged_remainders,
+                unbounded_dynamic_writes: merged_writes,
+            })
+        }
+        _ => None,
+    };
     if stronger {
         *existing = candidate;
     } else if same_tier {
@@ -2007,21 +2512,28 @@ pub(super) fn prefer_retained_finding(
             *existing = candidate;
             existing.also_fails_at = also_fails_at;
         }
+        if let Some(proof) = merged_conditional_proof {
+            existing.proof = proof;
+        }
     }
 }
 
 #[cfg(test)]
 mod retry_tests {
     use super::{
-        TypeFlowRootPersistenceRejection, TypeFlowRootPersistenceStatus,
-        TypeFlowRootPersistenceTracker, TypeFlowRootResult, dispatch_hint_flags,
+        ClassSetStatus, TypeFlowRootPersistenceRejection, TypeFlowRootPersistenceStatus,
+        TypeFlowRootPersistenceTracker, dispatch_hints_exhaustive,
     };
     use crate::analyzer::semantic::{
         CandidateCoverage, ClassIdentity, ExternalMemberDeclaration, MemberDeclaration,
         MemberLookupHit,
     };
+    use brokk_bifrost_test_macros::hardwon;
     #[test]
-    fn exact_receiver_with_open_member_hit_cannot_claim_exhaustive_or_singleton_dispatch() {
+    #[hardwon(
+        "dd9df356894c: The open-bound feedback fix in dd9df356894c pins that an exact class with open member evidence cannot close dispatch."
+    )]
+    fn exact_receiver_with_open_member_hit_cannot_claim_exhaustive_dispatch() {
         let class = ClassIdentity::External {
             qualified_name: "pkg.Widget".into(),
             symbol_id: "class-widget".into(),
@@ -2033,10 +2545,17 @@ mod retry_tests {
             MemberLookupHit::new(declaration, CandidateCoverage::Open),
         )];
 
-        assert_eq!(dispatch_hint_flags(&declarations, 1, true), (false, false));
+        assert!(!dispatch_hints_exhaustive(
+            &declarations,
+            1,
+            ClassSetStatus::Known
+        ));
     }
 
     #[test]
+    #[hardwon(
+        "#3134: fixed resolved dispatch with complete receiver feedback; every receiver class must have a declaration."
+    )]
     fn every_receiver_class_needs_a_dispatch_declaration() {
         let declaration =
             MemberDeclaration::External(ExternalMemberDeclaration::new([Box::from("method-run")]));
@@ -2047,12 +2566,23 @@ mod retry_tests {
             },
             MemberLookupHit::new(declaration, CandidateCoverage::Exhaustive),
         )];
-        assert_eq!(dispatch_hint_flags(&declarations, 1, true), (true, true));
-        assert_eq!(dispatch_hint_flags(&declarations, 2, true), (false, false));
-        assert_eq!(dispatch_hint_flags(&[], 0, true), (false, false));
+        assert!(dispatch_hints_exhaustive(
+            &declarations,
+            1,
+            ClassSetStatus::Known
+        ));
+        assert!(!dispatch_hints_exhaustive(
+            &declarations,
+            2,
+            ClassSetStatus::Known
+        ));
+        assert!(!dispatch_hints_exhaustive(&[], 0, ClassSetStatus::Known));
     }
 
     #[test]
+    #[hardwon(
+        "9d635b5199ca: fixed partial class-set dispatch; a positive exhaustive hit cannot close incomplete receiver coverage."
+    )]
     fn partial_receiver_with_exhaustive_positive_hit_cannot_close_dispatch() {
         let class = ClassIdentity::External {
             qualified_name: "pkg.Widget".into(),
@@ -2065,40 +2595,11 @@ mod retry_tests {
             MemberLookupHit::new(declaration, CandidateCoverage::Exhaustive),
         )];
 
-        assert_eq!(dispatch_hint_flags(&declarations, 1, false), (false, false));
-    }
-
-    #[test]
-    fn persistence_status_preserves_stable_opens_and_rejects_transient_work() {
-        assert_eq!(
-            TypeFlowRootPersistenceStatus::from_solve(true, false, false),
-            TypeFlowRootPersistenceStatus::Eligible,
-            "a fixed point may retain stable open boundaries in its rows"
-        );
-        assert_eq!(
-            TypeFlowRootPersistenceStatus::from_solve(true, false, true),
-            TypeFlowRootPersistenceStatus::Ineligible(
-                TypeFlowRootPersistenceRejection::ProviderFailure
-            )
-        );
-        assert_eq!(
-            TypeFlowRootPersistenceStatus::from_solve(true, true, false),
-            TypeFlowRootPersistenceStatus::Ineligible(
-                TypeFlowRootPersistenceRejection::SemanticBudget
-            )
-        );
-        assert_eq!(
-            TypeFlowRootPersistenceStatus::from_solve(false, false, false),
-            TypeFlowRootPersistenceStatus::Ineligible(
-                TypeFlowRootPersistenceRejection::SolverIncomplete
-            )
-        );
-        assert_eq!(
-            TypeFlowRootResult::feedback_fallback_status(),
-            TypeFlowRootPersistenceStatus::Ineligible(
-                TypeFlowRootPersistenceRejection::FeedbackFallback
-            )
-        );
+        assert!(!dispatch_hints_exhaustive(
+            &declarations,
+            1,
+            ClassSetStatus::Partial
+        ));
     }
 
     #[test]
@@ -2120,4 +2621,35 @@ mod retry_tests {
             "a later successful pass cannot erase an earlier transient provider failure"
         );
     }
+}
+
+#[test]
+fn persistence_status_preserves_stable_opens_and_rejects_transient_work() {
+    assert_eq!(
+        TypeFlowRootPersistenceStatus::from_solve(true, false, false),
+        TypeFlowRootPersistenceStatus::Eligible,
+        "a fixed point may retain stable open boundaries in its rows"
+    );
+    assert_eq!(
+        TypeFlowRootPersistenceStatus::from_solve(true, false, true),
+        TypeFlowRootPersistenceStatus::Ineligible(
+            TypeFlowRootPersistenceRejection::ProviderFailure
+        )
+    );
+    assert_eq!(
+        TypeFlowRootPersistenceStatus::from_solve(true, true, false),
+        TypeFlowRootPersistenceStatus::Ineligible(TypeFlowRootPersistenceRejection::SemanticBudget)
+    );
+    assert_eq!(
+        TypeFlowRootPersistenceStatus::from_solve(false, false, false),
+        TypeFlowRootPersistenceStatus::Ineligible(
+            TypeFlowRootPersistenceRejection::SolverIncomplete
+        )
+    );
+    assert_eq!(
+        TypeFlowRootResult::feedback_fallback_status(),
+        TypeFlowRootPersistenceStatus::Ineligible(
+            TypeFlowRootPersistenceRejection::FeedbackFallback
+        )
+    );
 }

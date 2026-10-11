@@ -183,6 +183,8 @@ impl SelectedRustForwardQueries for RustForwardQueries<'_, '_, '_, '_> {
         Ok(SelectedResolutionOperationOutcome::Native(
             SelectedResolutionLocated::Found(SelectedRustReferenceAnswer {
                 macro_expansion_gaps: Vec::new(),
+                generated_surface_gaps: Vec::new(),
+                retained_gap_frontiers: Vec::new(),
                 enumeration: None,
                 inventory_details: Vec::new(),
                 named_reasons: super::named_reason_details(

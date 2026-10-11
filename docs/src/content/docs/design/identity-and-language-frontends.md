@@ -64,7 +64,7 @@ A source file moves through a series of explicit contracts:
 The persistent store records extracted relational facts. The parser's in-memory
 object graph ends at the front-end boundary. Higher semantic representations
 are built as immutable artifacts under their own complete validity keys. See
-[Storage and Cache Strategy](../storage-and-cache/) for that lifetime split.
+[Storage and Cache Strategy](/design/storage-and-cache/) for that lifetime split.
 
 ## Shared declaration model
 
@@ -87,6 +87,34 @@ machinery. Their language-specific resolvers still decide what each name means.
 Rendered qualified names serve people and protocols. Resolvers use the
 underlying package, type, member, local, and other segments. Reconstructing those
 segments from display text discards structure that the front end already knows.
+
+### C++ out-of-line member identities
+
+A file-local extraction can provisionally assign an out-of-line member to a
+namespace introduced by `using namespace`. Public symbol reads reconcile the
+structured written owner against the classes visible through the source file's
+include closure. One shared canonical `CodeUnit` view serves symbol search,
+usage scans, definitions, summaries, source labels, and the declaration census.
+It preserves the physical source, signature, synthetic status, and structured
+segment roles. Range and signature reads follow the canonical-to-physical
+mapping back to the immutable extraction facts.
+
+The stored blob facts remain independent of the workspace's include graph.
+Reconciliation uses byte-bounded identifier and owner cohorts on the immutable
+analyzer snapshot; an update or persistent reopening constructs new caches.
+Warm identity and physical-provenance reads record the attested C++ scope
+(including configuration) for dependency replay. This conservatively invalidates
+cached caller results when that scope changes, even when ownership was already
+memoized. Only complete results enter those caches. Missing or ambiguous owner
+evidence keeps the provisional identity, while cancellation or failed reads retain their
+typed incomplete outcome.
+
+Search discovers a superset of potentially canonical names from relational
+written-owner and class facts before applying the requested pattern. Include
+visibility and ownership are proved by the shared reconciler after candidate
+hydration, and the pattern is then checked against the canonical structural
+unit. Re-labeling matches selected only by provisional names would lose exact
+canonical searches and make the census/scan/search round trip inconsistent.
 
 ### Module and package source anchors
 
@@ -164,12 +192,19 @@ grammar distinctions the resolver needs.
 
 ### Python import roots
 
+Each language front end reads its own project files to assign identities. For
+example, Go import paths come from the nearest `go.mod`, and JavaScript and
+TypeScript path aliases come from `tsconfig.json`. The
+[Languages reference](/reference/languages/#project-and-build-inputs) lists
+the project files for every language. This section describes the Python rules
+in detail.
+
 Python module identities start at a supported packaging import root when one
 contains the source file. Bifrost searches ancestor directories, preferring the
 nearest project and the deepest containing root. It reads
-`tool.setuptools.packages.find.where` from `pyproject.toml` (#1971).
+`tool.setuptools.packages.find.where` from `pyproject.toml`.
 
-Legacy `setup.py` files can also establish a root (#3075). Bifrost parses the
+Legacy `setup.py` files can also establish a root. Bifrost parses the
 Python syntax without executing the script and recognizes a direct call to an
 imported setuptools or distutils `setup` function with a `packages` argument:
 a literal `package_dir` mapping (`{}` or `{"": "source"}`) establishes the root
@@ -212,6 +247,12 @@ narrows possible callees using the language's dispatch and applicability rules.
 Actual-to-formal binding requires structured rows joined to stable call and
 declaration identities.
 
+Python's call syntax does not distinguish a function from a class invocation.
+RQL call-shape rows refine a Python call to `constructor` only when the
+production definition resolver selects exactly one workspace or active
+semantic-model class declaration; unresolved or ambiguous callees keep their
+syntax-derived kind.
+
 The result can distinguish:
 
 - one applicable target with exact binding;
@@ -246,9 +287,21 @@ finishes for the exact bytes. Publication says that extraction completed; the
 syntax and semantic-recovery statuses remain separate. A query whose proof
 crosses a damaged region retains that limitation.
 
+Structural facts record each recovery region as a row: an outermost `ERROR`
+node, or a zero-width missing token. A node inside an `ERROR` region may have
+produced no structural fact, so a structural selection that finds nothing in
+that file is not an authoritative absence. The selected kind decides which
+regions count. Statement-level kinds (conditionals, loops, returns, throws,
+handlers, and resource releases) occur only in executable code, so only a
+region inside a callable leaves their selection incomplete. Every other kind
+can also occur in an initializer, an annotation, or a declaration list, so any
+region in the file leaves its selection incomplete. The store answers whether a
+callable contains a region from the persisted facts. Rows found elsewhere in
+the file remain valid positive evidence.
+
 Parser timeout or cancellation leaves the extraction job unfinished, so
 publication is refused under the shared
-[complete-value cache contract](../storage-and-cache/#complete-bounded-derived-values).
+[complete-value cache contract](/design/storage-and-cache/).
 
 ## Proof, ambiguity, and completeness
 
@@ -273,7 +326,7 @@ Proof and completeness are independent. One proven edge can be returned from a
 partial search; the response cannot claim that no other edge exists. An
 empty result is authoritative only when the applicable resolver completed an
 exhaustive supported search in the stated snapshot and scope. The
-[Evidence and Result Contract](../evidence-and-results/) develops this rule at
+[Evidence and Result Contract](/design/evidence-and-results/) develops this rule at
 the API boundary.
 
 ## Exact-claim discipline
@@ -317,4 +370,7 @@ and every gap remains visible.
 
 A language can support syntax search before it supports exact calls or dataflow.
 Each exact capability ships with its corresponding identity and resolver
-contracts. Coverage still differs by language adapter.
+contracts. Coverage still differs by language adapter. The
+[Languages reference](/reference/languages/) lists the current coverage for
+each language: file extensions, graph and analysis capabilities, structural
+kinds and roles, and semantic IR features.

@@ -271,7 +271,7 @@ impl PolicyRegistry {
                     resolve_selector_locators(selector, locators)?;
                     let source_path = selector_path(format!(
                         "/set/entries/{}/selector",
-                        pointer_segment(id.as_str())
+                        json_pointer_segment(id.as_str())
                     ))?;
                     let loaded = resolve_parsed_selector(
                         Some(root),
@@ -292,7 +292,7 @@ impl PolicyRegistry {
                     let mut resolved = loaded.selector;
                     let base = format!(
                         "/analysis/{segment}/entries/{}",
-                        pointer_segment(id.as_str())
+                        json_pointer_segment(id.as_str())
                     );
                     resolved.path = selector_path(format!("{base}/selector"))?;
                     selector_values.push(json!({"id": id.as_str(), "selector": crate::canonical_loaded::resolved_selector_to_json(&resolved)}));
@@ -606,7 +606,7 @@ impl PolicyRegistry {
         {
             let path = selector_path(format!(
                 "/analysis/stores/entries/{}/selector",
-                pointer_segment(id.as_str())
+                json_pointer_segment(id.as_str())
             ))?;
             let mut retained = closure.retained_bytes;
             let resolved = self.resolve_imported_selector(
@@ -769,6 +769,19 @@ fn clear_imports(spec: &mut TaintPolicySpec) {
     spec.store_include_files.clear();
 }
 
+macro_rules! for_each_entry_collection {
+    ($spec:ident, $segments:ident, $add:ident) => {
+        $add!($segments.sources, $spec.sources.entries);
+        $add!($segments.sinks, $spec.sinks.entries);
+        $add!($segments.sanitizers, $spec.sanitizers.entries);
+        $add!($segments.transforms, $spec.transforms.entries);
+        $add!($segments.entry_points, $spec.entry_points.entries);
+        $add!($segments.external_models, $spec.external_models.entries);
+        $add!($segments.stores, $spec.store_writes);
+        $add!($segments.stores, $spec.store_reads);
+    };
+}
+
 fn all_entries(
     spec: &TaintPolicySpec,
     flow: bool,
@@ -788,14 +801,7 @@ fn all_entries(
             );
         };
     }
-    add!(segments.sources, spec.sources.entries);
-    add!(segments.sinks, spec.sinks.entries);
-    add!(segments.sanitizers, spec.sanitizers.entries);
-    add!(segments.transforms, spec.transforms.entries);
-    add!(segments.entry_points, spec.entry_points.entries);
-    add!(segments.external_models, spec.external_models.entries);
-    add!(segments.stores, spec.store_writes);
-    add!(segments.stores, spec.store_reads);
+    for_each_entry_collection!(spec, segments, add);
     entries
 }
 
@@ -818,14 +824,7 @@ fn all_entries_mut(
             );
         };
     }
-    add!(segments.sources, spec.sources.entries);
-    add!(segments.sinks, spec.sinks.entries);
-    add!(segments.sanitizers, spec.sanitizers.entries);
-    add!(segments.transforms, spec.transforms.entries);
-    add!(segments.entry_points, spec.entry_points.entries);
-    add!(segments.external_models, spec.external_models.entries);
-    add!(segments.stores, spec.store_writes);
-    add!(segments.stores, spec.store_reads);
+    for_each_entry_collection!(spec, segments, add);
     entries
 }
 

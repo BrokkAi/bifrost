@@ -7,13 +7,6 @@
 use super::*;
 use rusqlite::params;
 
-fn current_connection() -> Connection {
-    let mut conn = Connection::open_in_memory().unwrap();
-    configure_connection(&mut conn).unwrap();
-    migrate(&mut conn).unwrap();
-    conn
-}
-
 /// Insert one complete canonical source publication with a compound type at
 /// occurrence 1 and one path child at occurrence 2.  Occurrence 0 is the
 /// source-file/item root.  The returned blob is sealed by this helper.
@@ -142,12 +135,7 @@ fn seed_compound_blob_building(conn: &mut Connection, seed: &str) -> i64 {
 }
 
 fn seal_building_blob(conn: &Connection, blob_id: i64) -> rusqlite::Result<()> {
-    conn.execute(
-        "UPDATE source_fact_manifests
-            SET publication_state = 'complete'
-          WHERE blob_id = ?1",
-        [blob_id],
-    )?;
+    seal_rust_source_manifest(conn, blob_id)?;
     Ok(())
 }
 
@@ -172,7 +160,7 @@ fn assert_seal_rejected(conn: &Connection, blob_id: i64) {
 
 #[test]
 fn compound_type_seals_and_preserves_ordered_child_lookup() {
-    let mut conn = current_connection();
+    let mut conn = current_rust_connection();
     let blob_id = seed_compound_blob(&mut conn, "schema59-compound-accepted");
 
     let children = conn
@@ -205,7 +193,7 @@ fn compound_type_seals_and_preserves_ordered_child_lookup() {
 
 #[test]
 fn compound_type_rejects_wrong_cardinality_and_sparse_ordinals() {
-    let mut conn = current_connection();
+    let mut conn = current_rust_connection();
     let blob_id = seed_compound_blob_building(&mut conn, "schema59-compound-cardinality");
     assert!(
         conn.execute(
@@ -237,7 +225,7 @@ fn compound_type_rejects_wrong_cardinality_and_sparse_ordinals() {
     .unwrap();
     assert_seal_rejected(&conn, blob_id);
 
-    let mut conn = current_connection();
+    let mut conn = current_rust_connection();
     let blob_id = seed_compound_blob_building(&mut conn, "schema59-compound-sparse");
     conn.execute(
         "UPDATE source_rust_type_children SET ordinal = 1
@@ -250,7 +238,7 @@ fn compound_type_rejects_wrong_cardinality_and_sparse_ordinals() {
 
 #[test]
 fn compound_type_rejects_wrong_owner_provenance_and_child_cycle() {
-    let mut conn = current_connection();
+    let mut conn = current_rust_connection();
     let blob_id = seed_compound_blob_building(&mut conn, "schema59-compound-owner");
     conn.execute(
         "UPDATE source_rust_type_children SET type_occurrence_id = 2
@@ -260,7 +248,7 @@ fn compound_type_rejects_wrong_owner_provenance_and_child_cycle() {
     .unwrap();
     assert_seal_rejected(&conn, blob_id);
 
-    let mut conn = current_connection();
+    let mut conn = current_rust_connection();
     let blob_id = seed_compound_blob_building(&mut conn, "schema59-compound-provenance");
     conn.execute(
         // provenance code 2 is `embedded`, at position 4 of each arena entry.
@@ -292,7 +280,7 @@ fn compound_type_rejects_wrong_owner_provenance_and_child_cycle() {
     .unwrap();
     assert_seal_rejected(&conn, blob_id);
 
-    let mut conn = current_connection();
+    let mut conn = current_rust_connection();
     let blob_id = seed_compound_blob_building(&mut conn, "schema59-compound-cycle");
     conn.execute(
         "UPDATE source_rust_type_children SET occurrence_id = 1
@@ -305,7 +293,7 @@ fn compound_type_rejects_wrong_owner_provenance_and_child_cycle() {
 
 #[test]
 fn compound_type_rejects_equal_span_and_non_hrtb_parameters() {
-    let mut conn = current_connection();
+    let mut conn = current_rust_connection();
     let blob_id = seed_compound_blob_building(&mut conn, "schema59-compound-span");
     conn.execute(
         "UPDATE source_occurrence_arenas
@@ -323,7 +311,7 @@ fn compound_type_rejects_equal_span_and_non_hrtb_parameters() {
     conn.execute("UPDATE source_rust_type_segments SET start_byte=1,end_byte=9 WHERE blob_id=?1 AND occurrence_id=3", [blob_id]).unwrap();
     assert_seal_rejected(&conn, blob_id);
 
-    let mut conn = current_connection();
+    let mut conn = current_rust_connection();
     let blob_id = seed_compound_blob_building(&mut conn, "schema59-compound-parameters");
     assert!(
         conn.execute(
@@ -348,7 +336,7 @@ fn compound_type_rejects_equal_span_and_non_hrtb_parameters() {
 
 #[test]
 fn compound_type_rows_are_immutable_after_seal_and_cascade_with_blob() {
-    let mut conn = current_connection();
+    let mut conn = current_rust_connection();
     let blob_id = seed_compound_blob(&mut conn, "schema59-compound-immutable");
 
     assert!(
@@ -400,7 +388,7 @@ fn compound_type_rows_are_immutable_after_seal_and_cascade_with_blob() {
 
 #[test]
 fn compound_type_cardinality_lookup_stays_bound_after_analyze() {
-    let mut conn = current_connection();
+    let mut conn = current_rust_connection();
     let mut blob_ids = Vec::new();
     for index in 0..12 {
         blob_ids.push(seed_compound_blob(

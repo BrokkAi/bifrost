@@ -18,6 +18,7 @@
 use tree_sitter::Node;
 
 use crate::declarations::node_text;
+use brokk_bifrost_core::analyzer::tree_walk::parent_if_field;
 use brokk_bifrost_core::hash::{HashMap, HashSet};
 
 /// Base type specifiers that name provably trivially destructible types.
@@ -90,7 +91,8 @@ impl<'a> CppTemporaryFreeCallIndex<'a> {
                 kind,
                 "identifier" | "field_identifier" | "type_identifier" | "namespace_identifier"
             ) && !declaration_names.contains(&node.id())
-                && !(kind == "identifier" && is_callee_position(node))
+                && !(kind == "identifier"
+                    && parent_if_field(node, "call_expression", "function").is_some())
             {
                 facts.entry(node_text(node, source)).or_default().poisoned = true;
             }
@@ -369,26 +371,14 @@ fn declarator_contains_pointer(declarator: Node<'_>) -> bool {
     false
 }
 
-fn is_callee_position(node: Node<'_>) -> bool {
-    node.parent().is_some_and(|parent| {
-        parent.kind() == "call_expression"
-            && parent
-                .child_by_field_name("function")
-                .is_some_and(|function| function.id() == node.id())
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tree_sitter::{Parser, Tree};
+    use brokk_bifrost_test_macros::hardwon;
+    use tree_sitter::Tree;
 
     fn parse_cpp(source: &str) -> Tree {
-        let mut parser = Parser::new();
-        parser
-            .set_language(&tree_sitter_cpp::LANGUAGE.into())
-            .expect("cpp language");
-        parser.parse(source, None).expect("cpp tree")
+        crate::diagnostics::parse_cpp_tree(source)
     }
 
     /// Every `call_expression` in `source`, paired with its provability.
@@ -423,6 +413,9 @@ mod tests {
     /// The #1951 balanced positive: exact local free-function calls with
     /// provably trivial signatures are temporary-free.
     #[test]
+    #[hardwon(
+        "9bedf580d0e6: C++ RAII certainty incorrectly opened temporary-lifetime gaps or proved an unsafe call"
+    )]
     fn exact_local_free_function_calls_are_provable() {
         assert_calls(
             r#"
@@ -443,6 +436,9 @@ void run() {
     /// The #1951 balanced negative keeps both calls provable: a discarded
     /// trivial result and a literal argument.
     #[test]
+    #[hardwon(
+        "9bedf580d0e6: C++ RAII certainty incorrectly opened temporary-lifetime gaps or proved an unsafe call"
+    )]
     fn discarded_result_and_literal_argument_are_provable() {
         assert_calls(
             r#"
@@ -463,6 +459,9 @@ void run() {
 
     /// A prototype without a body still proves the signature.
     #[test]
+    #[hardwon(
+        "9bedf580d0e6: C++ RAII certainty incorrectly opened temporary-lifetime gaps or proved an unsafe call"
+    )]
     fn local_prototype_is_provable() {
         assert_calls(
             r#"
@@ -479,6 +478,9 @@ void run() {
     /// Near miss: overloaded functions stay unproven even when every
     /// overload is trivially typed.
     #[test]
+    #[hardwon(
+        "9bedf580d0e6: C++ RAII certainty incorrectly opened temporary-lifetime gaps or proved an unsafe call"
+    )]
     fn overloaded_functions_stay_unproven() {
         assert_calls(
             r#"
@@ -496,6 +498,9 @@ void run() {
     /// Near miss: a call through a function pointer stays unproven; the
     /// pointer declaration is a non-callee use of the name.
     #[test]
+    #[hardwon(
+        "9bedf580d0e6: C++ RAII certainty incorrectly opened temporary-lifetime gaps or proved an unsafe call"
+    )]
     fn function_pointer_calls_stay_unproven() {
         assert_calls(
             r#"
@@ -513,6 +518,9 @@ void run() {
     /// Near miss: member call syntax stays unproven, so virtual dispatch
     /// keeps its RAII gap.
     #[test]
+    #[hardwon(
+        "9bedf580d0e6: C++ RAII certainty incorrectly opened temporary-lifetime gaps or proved an unsafe call"
+    )]
     fn virtual_member_calls_stay_unproven() {
         assert_calls(
             r#"
@@ -531,6 +539,9 @@ void run(Producer *producer) {
     /// Near miss: an unqualified call that a same-named member could
     /// capture stays unproven; the member declaration poisons the name.
     #[test]
+    #[hardwon(
+        "9bedf580d0e6: C++ RAII certainty incorrectly opened temporary-lifetime gaps or proved an unsafe call"
+    )]
     fn member_declaration_poisons_unqualified_calls() {
         assert_calls(
             r#"
@@ -548,6 +559,9 @@ struct Wrapper {
     /// Near miss: template functions stay unproven, with or without
     /// explicit template arguments.
     #[test]
+    #[hardwon(
+        "9bedf580d0e6: C++ RAII certainty incorrectly opened temporary-lifetime gaps or proved an unsafe call"
+    )]
     fn template_functions_stay_unproven() {
         assert_calls(
             r#"
@@ -565,6 +579,9 @@ void run() {
     /// Near miss: a class return type may construct a destructible
     /// temporary; the written base type is not provably trivial.
     #[test]
+    #[hardwon(
+        "9bedf580d0e6: C++ RAII certainty incorrectly opened temporary-lifetime gaps or proved an unsafe call"
+    )]
     fn class_return_types_stay_unproven() {
         assert_calls(
             r#"
@@ -582,6 +599,9 @@ void run() {
     /// Near miss: a const reference parameter of class type can bind a
     /// converted temporary.
     #[test]
+    #[hardwon(
+        "9bedf580d0e6: C++ RAII certainty incorrectly opened temporary-lifetime gaps or proved an unsafe call"
+    )]
     fn class_reference_parameters_stay_unproven() {
         assert_calls(
             r#"
@@ -598,6 +618,9 @@ void run() {
 
     /// Near miss: default arguments can evaluate arbitrary expressions.
     #[test]
+    #[hardwon(
+        "9bedf580d0e6: C++ RAII certainty incorrectly opened temporary-lifetime gaps or proved an unsafe call"
+    )]
     fn default_arguments_stay_unproven() {
         assert_calls(
             r#"
@@ -615,6 +638,9 @@ void run() {
     /// class-typed temporary via overloaded operators, even when the
     /// callee's parameters are trivially typed.
     #[test]
+    #[hardwon(
+        "9bedf580d0e6: C++ RAII certainty incorrectly opened temporary-lifetime gaps or proved an unsafe call"
+    )]
     fn complex_argument_expressions_stay_unproven() {
         assert_calls(
             r#"
@@ -631,6 +657,9 @@ void run(const char *left) {
     /// Near miss: any preprocessor content can introduce declarations this
     /// index cannot see, so nothing in the file is provable.
     #[test]
+    #[hardwon(
+        "9bedf580d0e6: C++ RAII certainty incorrectly opened temporary-lifetime gaps or proved an unsafe call"
+    )]
     fn preprocessor_content_makes_the_file_unprovable() {
         assert_calls(
             r#"
@@ -649,6 +678,9 @@ void run() {
     /// Near miss: taking the function's address is a non-callee use, so a
     /// pointer alias can no longer be told apart from the direct call.
     #[test]
+    #[hardwon(
+        "9bedf580d0e6: C++ RAII certainty incorrectly opened temporary-lifetime gaps or proved an unsafe call"
+    )]
     fn address_taken_names_stay_unproven() {
         assert_calls(
             r#"
@@ -668,6 +700,9 @@ void run() {
     /// Pointer returns and pointer parameters are trivial regardless of the
     /// pointee type; nested parentheses stay transparent.
     #[test]
+    #[hardwon(
+        "9bedf580d0e6: C++ RAII certainty incorrectly opened temporary-lifetime gaps or proved an unsafe call"
+    )]
     fn pointer_indirection_over_class_types_is_provable() {
         assert_calls(
             r#"
@@ -689,6 +724,9 @@ void run() {
     /// built-in operators. Both yield an lvalue and run no user code, so they
     /// are exactly as temporary-free as the identifier they are rooted at.
     #[test]
+    #[hardwon(
+        "fd1479f92086: C++ RAII certainty incorrectly opened temporary-lifetime gaps or proved an unsafe call"
+    )]
     fn member_access_and_trivial_array_subscript_arguments_are_provable() {
         assert_calls(
             r#"
@@ -716,6 +754,9 @@ void run() {
     /// array of arithmetic element type may resolve through a user-defined
     /// `operator[]`, which can materialize a class-typed temporary.
     #[test]
+    #[hardwon(
+        "fd1479f92086: C++ RAII certainty incorrectly opened temporary-lifetime gaps or proved an unsafe call"
+    )]
     fn subscript_of_an_unproven_base_stays_unproven() {
         assert_calls(
             r#"

@@ -7,7 +7,7 @@ use std::process::ExitCode;
 use brokk_bifrost_analysis::CancellationToken;
 use brokk_bifrost_analysis::analyzer::semantic_model::csmi::{
     CsmiDiagnostic, CsmiDocument, CsmiProfileValidation, CsmiResourceError, CsmiResourceResolver,
-    CsmiVocabularySupport, validate_csmi_document, validate_csmi_pack,
+    CsmiVocabularySupport, validate_csmi_document, validate_csmi_pack, validate_resource_size,
 };
 use brokk_bifrost_analysis::analyzer::semantic_model::{
     CatalogCoordinate, CatalogOpenMode, CatalogOptions, CompilerOptions,
@@ -16,7 +16,8 @@ use brokk_bifrost_analysis::analyzer::semantic_model::{
     SemanticModelPackSelector, SemanticModelResolutionOutcome, SemanticModelRuntimeLimits,
     SemanticPackCatalog, SourceFormat, WorkspaceSemanticModelOptions, compile_source,
     discover_workspace_semantic_models, lint_semantic_model_source, resolve_active_semantic_models,
-    semantic_model_inventory, validate_semantic_model_source, write_compiled_semantic_model_pack,
+    semantic_model_inventory, source_format_for_path, validate_semantic_model_source,
+    write_compiled_semantic_model_pack,
 };
 use brokk_bifrost_semantic_packs::release_bundle::{
     BundleInput, ReleaseBundleRejects, generate_release_bundle, install_release_bundle,
@@ -89,6 +90,22 @@ fn run(mut arguments: Vec<OsString>) -> Result<u8, CommandFailure> {
         "compile" => compile_command(arguments, format),
         "list" => list_command(arguments, format),
         "workspace-check" => workspace_check_command(arguments, format),
+        "export-embedded-registry" => {
+            let [output] = arguments.as_slice() else {
+                return Err(failure(2, usage(), format));
+            };
+            brokk_bifrost_semantic_packs::prepared_registry::export_embedded_registry(Path::new(
+                output,
+            ))
+            .map_err(|error| {
+                failure(
+                    2,
+                    format!("prepare full semantic registry: {error}"),
+                    format,
+                )
+            })?;
+            Ok(0)
+        }
         "generate" => generate_command(arguments, format),
         "merge" => merge_command(arguments, format),
         "verify" => verify_command(arguments, format),
@@ -211,14 +228,7 @@ impl CsmiResourceResolver for DirectoryCsmiResources<'_> {
         let bytes = fs::read(resource_path).map_err(|_| CsmiResourceError::Missing {
             path: path.to_owned(),
         })?;
-        let actual = u64::try_from(bytes.len()).expect("resource length fits u64");
-        if actual != expected_size {
-            return Err(CsmiResourceError::SizeMismatch {
-                path: path.to_owned(),
-                expected: expected_size,
-                actual,
-            });
-        }
+        validate_resource_size(path, &bytes, expected_size)?;
         Ok(bytes)
     }
 }
@@ -892,15 +902,13 @@ fn take_utf8(
 }
 
 fn source_format(path: &Path, format: OutputFormat) -> Result<SourceFormat, CommandFailure> {
-    match path.extension().and_then(|extension| extension.to_str()) {
-        Some("json") => Ok(SourceFormat::Json),
-        Some("yaml" | "yml") => Ok(SourceFormat::Yaml),
-        _ => Err(failure(
+    source_format_for_path(path).ok_or_else(|| {
+        failure(
             2,
             "source file must have a .json, .yaml, or .yml suffix",
             format,
-        )),
-    }
+        )
+    })
 }
 
 fn read(path: &Path, format: OutputFormat) -> Result<Vec<u8>, CommandFailure> {
@@ -1004,6 +1012,7 @@ enum ControlScopeInput {
 enum ControlActionInput {
     Enable,
     Disable,
+    AcceptReviewed,
 }
 
 impl ActivationInput {
@@ -1094,6 +1103,7 @@ impl ActivationControlInput {
             action: match self.action {
                 ControlActionInput::Enable => SemanticModelControlAction::Enable,
                 ControlActionInput::Disable => SemanticModelControlAction::Disable,
+                ControlActionInput::AcceptReviewed => SemanticModelControlAction::AcceptReviewed,
             },
             selector: SemanticModelPackSelector {
                 pack_id: self.pack_id,
@@ -1105,5 +1115,5 @@ impl ActivationControlInput {
 }
 
 fn usage() -> &'static str {
-    "usage:\n  bifrost-semantic-pack validate SOURCE [--format human|json]\n  bifrost-semantic-pack lint SOURCE [--format human|json]\n  bifrost-semantic-pack csmi-check FILE [--format human|json]\n  bifrost-semantic-pack compile SOURCE OUTPUT [--format human|json]\n  bifrost-semantic-pack list CATALOG [ACTIVATION.json] [--format human|json]\n  bifrost-semantic-pack workspace-check WORKSPACE [--format human|json]\n  bifrost-semantic-pack generate OUTPUT SPEC ARTIFACT [SPEC ARTIFACT ...]\n  bifrost-semantic-pack merge OUTPUT INPUT...\n  bifrost-semantic-pack verify OUTPUT\n  bifrost-semantic-pack install BUNDLE CATALOG\n  bifrost-semantic-pack summary-corpus-join PINS CODEQL_MODELS JOERN_SOURCE REPORT.json [JVM_SOURCES]\n  bifrost-semantic-pack sanitizer-pack CANDIDATES_DIR OUTPUT_ROOT\n  bifrost-semantic-pack framework-decl-pack CANDIDATES_DIR OUTPUT_ROOT\n  bifrost-semantic-pack golden-summary-pack CANDIDATES_DIR OUTPUT_ROOT REALM"
+    "usage:\n  bifrost-semantic-pack validate SOURCE [--format human|json]\n  bifrost-semantic-pack lint SOURCE [--format human|json]\n  bifrost-semantic-pack csmi-check FILE [--format human|json]\n  bifrost-semantic-pack compile SOURCE OUTPUT [--format human|json]\n  bifrost-semantic-pack list CATALOG [ACTIVATION.json] [--format human|json]\n  bifrost-semantic-pack workspace-check WORKSPACE [--format human|json]\n  bifrost-semantic-pack export-embedded-registry OUTPUT\n  bifrost-semantic-pack generate OUTPUT SPEC ARTIFACT [SPEC ARTIFACT ...]\n  bifrost-semantic-pack merge OUTPUT INPUT...\n  bifrost-semantic-pack verify OUTPUT\n  bifrost-semantic-pack install BUNDLE CATALOG\n  bifrost-semantic-pack summary-corpus-join PINS CODEQL_MODELS JOERN_SOURCE REPORT.json [JVM_SOURCES]\n  bifrost-semantic-pack sanitizer-pack CANDIDATES_DIR OUTPUT_ROOT\n  bifrost-semantic-pack framework-decl-pack CANDIDATES_DIR OUTPUT_ROOT\n  bifrost-semantic-pack golden-summary-pack CANDIDATES_DIR OUTPUT_ROOT REALM"
 }

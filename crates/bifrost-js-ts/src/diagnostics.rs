@@ -24,8 +24,8 @@ use crate::parse::{
     FLOW_UNSUPPORTED_DETAIL, flow_dialect_blocks_extraction, js_ts_tree_sitter_language_for_file,
 };
 use crate::syntax::{
-    compute_import_binder, is_declaration_identifier, is_known_js_ts_global,
-    is_object_in_member_expression, is_property_key_in_member, slice,
+    compute_import_binder, for_each_parameter, introduces_js_ts_scope, is_declaration_identifier,
+    is_known_js_ts_global, is_object_in_member_expression, is_property_key_in_member, slice,
 };
 use crate::tsconfig::AliasResolver;
 use brokk_bifrost_core::analyzer::model::{
@@ -636,11 +636,11 @@ impl JsTsDiagnosticCollector<'_> {
 }
 
 fn push_named_children<'tree>(stack: &mut Vec<ScanFrame<'tree>>, node: Node<'tree>) {
-    for index in (0..node.named_child_count()).rev() {
-        if let Some(child) = node.named_child(index) {
-            stack.push(ScanFrame::Node(child));
-        }
-    }
+    brokk_bifrost_core::analyzer::tree_walk::push_named_children_reversed_as(
+        node,
+        stack,
+        ScanFrame::Node,
+    );
 }
 
 /// A `require(...)` call whose argument is not a literal module specifier. The
@@ -710,10 +710,9 @@ fn declare_function_scoped_bindings(node: Node<'_>, source: &str, scopes: &mut S
 }
 
 fn declare_parameter_bindings(node: Node<'_>, source: &str, scopes: &mut ScopeStack) {
-    let mut cursor = node.walk();
-    for child in node.named_children(&mut cursor) {
-        declare_parameter_binding(child, source, scopes);
-    }
+    for_each_parameter(node, |child| {
+        declare_parameter_binding(child, source, scopes)
+    });
 }
 
 fn declare_parameter_binding(node: Node<'_>, source: &str, scopes: &mut ScopeStack) {
@@ -774,19 +773,6 @@ fn is_var_declarator(node: Node<'_>) -> bool {
         return false;
     };
     grandparent.kind() != "lexical_declaration"
-}
-
-fn introduces_js_ts_scope(kind: &str) -> bool {
-    matches!(
-        kind,
-        "statement_block"
-            | "arrow_function"
-            | "function_expression"
-            | "generator_function"
-            | "function_declaration"
-            | "method_definition"
-            | "catch_clause"
-    )
 }
 
 fn is_suppressed_subtree(kind: &str) -> bool {

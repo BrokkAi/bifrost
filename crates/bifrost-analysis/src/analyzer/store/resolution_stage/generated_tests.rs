@@ -22,8 +22,7 @@ fn host(
     ordinal: u32,
 ) -> std::sync::Arc<SelectedResolutionMountRecord> {
     selection
-        .persisted_mount_record(SelectedResolutionMountOrdinal::new(ordinal))
-        .unwrap()
+        .mount_record_by_ordinal(SelectedResolutionMountOrdinal::new(ordinal))
         .unwrap()
 }
 
@@ -61,17 +60,7 @@ fn snapshot(connection: &Connection) -> Vec<Vec<Vec<rusqlite::types::Value>>> {
 // exact endpoint identities and variable aliasing across both endpoint stacks;
 // the allocation ceiling is derived metadata, not part of that behavior.
 fn assert_path_body(actual: &PartialPath, expected: &PartialPath) {
-    assert_eq!(
-        actual
-            .stack_effect_alpha_key_with_poll(&mut || false)
-            .unwrap(),
-        expected
-            .stack_effect_alpha_key_with_poll(&mut || false)
-            .unwrap(),
-    );
-    assert_eq!(actual.precedence(), expected.precedence());
-    assert_eq!(actual.witness(), expected.witness());
-    assert_eq!(actual.completion(), expected.completion());
+    super::super::assert_partial_path_bodies_equal(actual, expected);
 }
 
 fn assert_paths(

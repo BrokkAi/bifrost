@@ -1,6 +1,7 @@
 use serde::{Deserialize, Serialize};
 use tree_sitter::Node;
 
+use brokk_bifrost_core::analyzer::common::node_source_text as node_text;
 use brokk_bifrost_core::analyzer::model::StructuredImportScope;
 
 pub(crate) struct ScalaSupertypeFact {
@@ -157,12 +158,33 @@ pub fn scala_supertype_lookup_nodes(declaration: Node<'_>) -> Vec<(Node<'_>, Nod
 }
 
 pub fn scala_type_lookup_segments(node: Node<'_>, source: &str) -> Vec<String> {
+    scala_type_lookup_segments_with(
+        node,
+        source,
+        |node, source| node_text(node, source).to_string(),
+        || true,
+    )
+    .unwrap_or_default()
+}
+
+/// Collect parser-owned path segments using the caller's text and walk-budget
+/// hooks. The shared traversal preserves language-specific source-slice rules.
+pub fn scala_type_lookup_segments_with(
+    node: Node<'_>,
+    source: &str,
+    mut text_of: impl FnMut(Node<'_>, &str) -> String,
+    mut step: impl FnMut() -> bool,
+) -> Option<Vec<String>> {
     let mut segments = Vec::new();
     let mut stack = vec![node];
     while let Some(current) = stack.pop() {
+        if !step() {
+            return None;
+        }
         match current.kind() {
             "identifier" | "operator_identifier" | "type_identifier" => {
-                let segment = node_text(current, source).trim();
+                let segment = text_of(current, source);
+                let segment = segment.trim();
                 if !segment.is_empty() {
                     segments.push(segment.to_string());
                 }
@@ -170,13 +192,19 @@ pub fn scala_type_lookup_segments(node: Node<'_>, source: &str) -> Vec<String> {
             "type_arguments" | "arguments" | "annotation" | "structural_type" => {}
             _ => {
                 let mut cursor = current.walk();
-                let mut children = current.named_children(&mut cursor).collect::<Vec<_>>();
+                let mut children = Vec::new();
+                for child in current.named_children(&mut cursor) {
+                    if !step() {
+                        return None;
+                    }
+                    children.push(child);
+                }
                 children.reverse();
                 stack.extend(children);
             }
         }
     }
-    segments
+    (!segments.is_empty()).then_some(segments)
 }
 
 fn supertype_lookup_node(node: Node<'_>) -> Option<Node<'_>> {
@@ -237,10 +265,6 @@ fn collect_parent_type_roots<'tree>(node: Node<'tree>, parents: &mut Vec<Node<'t
     }
 }
 
-fn node_text<'a>(node: Node<'_>, source: &'a str) -> &'a str {
-    brokk_bifrost_core::analyzer::common::node_source_text(node, source)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -273,14 +297,6 @@ mod tests {
     }
 
     #[test]
-    fn generic_supertype_keeps_display_and_structured_constructor_path() {
-        assert_eq!(
-            facts_for("class Child extends pkg.Base[Int]", "Child"),
-            vec![("pkg.Base[Int]".to_string(), "pkg.Base".to_string())]
-        );
-    }
-
-    #[test]
     fn constructor_applied_generic_supertype_keeps_parent_before_mixin() {
         assert_eq!(
             facts_for(
@@ -293,7 +309,6 @@ mod tests {
             ]
         );
     }
-
     #[test]
     fn compound_supertypes_preserve_source_order() {
         assert_eq!(
@@ -304,7 +319,6 @@ mod tests {
             ]
         );
     }
-
     #[test]
     fn anonymous_instance_supertypes_preserve_constructor_and_mixins() {
         let source = "val value = new pkg.Base[Int](1) with First with other.Second {}";

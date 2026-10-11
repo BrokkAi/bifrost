@@ -20,15 +20,18 @@ use brokk_bifrost_analysis::analyzer::IAnalyzer;
 use brokk_bifrost_analysis::analyzer::semantic::WorkspaceRelativePath;
 use brokk_bifrost_analysis::workspace_document::{WorkspaceDocumentError, WorkspaceRoot};
 
+#[cfg(any(test, feature = "test-support"))]
+use super::catalog::CatalogRegistryLimits;
 use super::catalog::{RegisteredTaintCatalog, TaintCatalogRegistry};
+use super::composition::policy_port_to_endpoint_binding;
 use super::composition::{
     CompositionError, CompositionLimits, compose_taint_policy, compose_typestate_policy,
     validate_scanned_endpoint_collection,
 };
 use super::definition::*;
 use super::loading::{
-    EndpointClosureError, EndpointDirectoryError, MatchDirectoryLimitError, MatchDirectoryLimits,
-    PolicyDocumentLoadError, SelectorLoadError, enumerate_endpoint_directory,
+    EndpointClosureError, EndpointDirectoryError, LoadedRqlpSource, MatchDirectoryLimitError,
+    MatchDirectoryLimits, PolicyDocumentLoadError, SelectorLoadError, enumerate_endpoint_directory,
     load_endpoint_closure, read_rqlp_document, resolve_parsed_selector,
 };
 use super::locator::{
@@ -100,12 +103,12 @@ impl PolicyRegistryLimits {
         mut self,
         value: usize,
     ) -> Result<Self, PolicyRegistryLimitError> {
-        validate_registry_limit(
+        set_registry_limit(
+            &mut self.max_endpoint_set_files,
             "max_endpoint_set_files",
             value,
             MAX_ENDPOINT_SET_FILES_PER_POLICY,
         )?;
-        self.max_endpoint_set_files = value;
         Ok(self)
     }
 
@@ -113,12 +116,12 @@ impl PolicyRegistryLimits {
         mut self,
         value: usize,
     ) -> Result<Self, PolicyRegistryLimitError> {
-        validate_registry_limit(
+        set_registry_limit(
+            &mut self.max_endpoint_set_depth,
             "max_endpoint_set_depth",
             value,
             MAX_ENDPOINT_SET_IMPORT_DEPTH,
         )?;
-        self.max_endpoint_set_depth = value;
         Ok(self)
     }
 
@@ -126,12 +129,12 @@ impl PolicyRegistryLimits {
         mut self,
         value: usize,
     ) -> Result<Self, PolicyRegistryLimitError> {
-        validate_registry_limit(
+        set_registry_limit(
+            &mut self.max_endpoint_set_entries,
             "max_endpoint_set_entries",
             value,
             MAX_ENDPOINT_SET_IMPORT_ENTRIES,
         )?;
-        self.max_endpoint_set_entries = value;
         Ok(self)
     }
 
@@ -164,14 +167,22 @@ impl PolicyRegistryLimits {
     }
 
     pub fn with_max_policies(mut self, value: usize) -> Result<Self, PolicyRegistryLimitError> {
-        validate_registry_limit("max_policies", value, MAX_REGISTERED_POLICIES)?;
-        self.max_policies = value;
+        set_registry_limit(
+            &mut self.max_policies,
+            "max_policies",
+            value,
+            MAX_REGISTERED_POLICIES,
+        )?;
         Ok(self)
     }
 
     pub fn with_max_endpoints(mut self, value: usize) -> Result<Self, PolicyRegistryLimitError> {
-        validate_registry_limit("max_endpoints", value, MAX_REGISTERED_ENDPOINTS)?;
-        self.max_endpoints = value;
+        set_registry_limit(
+            &mut self.max_endpoints,
+            "max_endpoints",
+            value,
+            MAX_REGISTERED_ENDPOINTS,
+        )?;
         Ok(self)
     }
 
@@ -179,12 +190,12 @@ impl PolicyRegistryLimits {
         mut self,
         value: usize,
     ) -> Result<Self, PolicyRegistryLimitError> {
-        validate_registry_limit(
+        set_registry_limit(
+            &mut self.max_match_directories_per_policy,
             "max_match_directories_per_policy",
             value,
             MAX_MATCH_DIRECTORIES_PER_POLICY,
         )?;
-        self.max_match_directories_per_policy = value;
         Ok(self)
     }
 
@@ -192,12 +203,12 @@ impl PolicyRegistryLimits {
         mut self,
         value: usize,
     ) -> Result<Self, PolicyRegistryLimitError> {
-        validate_registry_limit(
+        set_registry_limit(
+            &mut self.max_match_directory_depth,
             "max_match_directory_depth",
             value,
             MAX_POLICY_MATCH_DIRECTORY_DEPTH,
         )?;
-        self.max_match_directory_depth = value;
         Ok(self)
     }
 
@@ -205,12 +216,12 @@ impl PolicyRegistryLimits {
         mut self,
         value: usize,
     ) -> Result<Self, PolicyRegistryLimitError> {
-        validate_registry_limit(
+        set_registry_limit(
+            &mut self.max_match_directory_candidates,
             "max_match_directory_candidates",
             value,
             MAX_POLICY_MATCH_DIRECTORY_CANDIDATES,
         )?;
-        self.max_match_directory_candidates = value;
         Ok(self)
     }
 
@@ -218,12 +229,12 @@ impl PolicyRegistryLimits {
         mut self,
         value: usize,
     ) -> Result<Self, PolicyRegistryLimitError> {
-        validate_registry_limit(
+        set_registry_limit(
+            &mut self.max_match_directory_entries,
             "max_match_directory_entries",
             value,
             MAX_POLICY_MATCH_DIRECTORY_ENTRIES,
         )?;
-        self.max_match_directory_entries = value;
         Ok(self)
     }
 
@@ -231,14 +242,25 @@ impl PolicyRegistryLimits {
         mut self,
         value: usize,
     ) -> Result<Self, PolicyRegistryLimitError> {
-        validate_registry_limit(
+        set_registry_limit(
+            &mut self.max_retained_source_and_selector_bytes,
             "max_retained_source_and_selector_bytes",
             value,
             MAX_RETAINED_POLICY_SOURCE_AND_SELECTOR_BYTES,
         )?;
-        self.max_retained_source_and_selector_bytes = value;
         Ok(self)
     }
+}
+
+fn set_registry_limit(
+    target: &mut usize,
+    field: &'static str,
+    value: usize,
+    hard_maximum: usize,
+) -> Result<(), PolicyRegistryLimitError> {
+    validate_registry_limit(field, value, hard_maximum)?;
+    *target = value;
+    Ok(())
 }
 
 fn validate_registry_limit(
@@ -246,7 +268,7 @@ fn validate_registry_limit(
     value: usize,
     hard_maximum: usize,
 ) -> Result<(), PolicyRegistryLimitError> {
-    if value == 0 || value > hard_maximum {
+    if !crate::within_policy_limit(value, hard_maximum) {
         return Err(PolicyRegistryLimitError {
             field,
             value,
@@ -265,11 +287,7 @@ pub struct PolicyRegistryLimitError {
 
 impl fmt::Display for PolicyRegistryLimitError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            formatter,
-            "{} must be from 1 through {}, found {}",
-            self.field, self.hard_maximum, self.value
-        )
+        crate::fmt_limit_error(formatter, &self.field, &self.hard_maximum, &self.value)
     }
 }
 
@@ -303,19 +321,7 @@ impl PolicyRegistry {
         catalogs: Arc<TaintCatalogRegistry>,
         limits: PolicyRegistryLimits,
     ) -> Self {
-        Self {
-            catalogs,
-            limits,
-            workspace_root: None,
-            policies: HashMap::new(),
-            endpoints: HashMap::new(),
-            retained_endpoint_slots: 0,
-            retained_source_and_selector_bytes: 0,
-            cancellation: None,
-            endpoint_set_cache: Vec::new(),
-            endpoint_set_parse_count: 0,
-            endpoint_set_cache_hits: 0,
-        }
+        Self::with_workspace_root(catalogs, limits, None)
     }
 
     pub fn new_for_workspace(
@@ -327,10 +333,22 @@ impl PolicyRegistry {
             return Err(PolicyRegistryError::WorkspaceRootMustBeAbsolute);
         }
         let workspace_root = WorkspaceRoot::open(&workspace_root)?;
-        Ok(Self {
+        Ok(Self::with_workspace_root(
             catalogs,
             limits,
-            workspace_root: Some(workspace_root),
+            Some(workspace_root),
+        ))
+    }
+
+    fn with_workspace_root(
+        catalogs: Arc<TaintCatalogRegistry>,
+        limits: PolicyRegistryLimits,
+        workspace_root: Option<WorkspaceRoot>,
+    ) -> Self {
+        Self {
+            catalogs,
+            limits,
+            workspace_root,
             policies: HashMap::new(),
             endpoints: HashMap::new(),
             retained_endpoint_slots: 0,
@@ -339,7 +357,18 @@ impl PolicyRegistry {
             endpoint_set_cache: Vec::new(),
             endpoint_set_parse_count: 0,
             endpoint_set_cache_hits: 0,
-        })
+        }
+    }
+
+    fn read_workspace_source(
+        &self,
+        relative_path: &Path,
+    ) -> Result<LoadedRqlpSource, PolicyRegistryError> {
+        let root = self
+            .workspace_root
+            .as_ref()
+            .ok_or(PolicyRegistryError::WorkspaceAccessUnavailable)?;
+        Ok(read_rqlp_document(root, relative_path)?)
     }
 
     pub fn load_policy_path(
@@ -347,13 +376,7 @@ impl PolicyRegistry {
         relative_path: impl AsRef<Path>,
     ) -> Result<&LoadedPolicy, PolicyRegistryError> {
         self.check_cancellation()?;
-        let loaded = {
-            let root = self
-                .workspace_root
-                .as_ref()
-                .ok_or(PolicyRegistryError::WorkspaceAccessUnavailable)?;
-            read_rqlp_document(root, relative_path.as_ref())?
-        };
+        let loaded = self.read_workspace_source(relative_path.as_ref())?;
         let (_, document, parsed) = loaded.into_parts();
         self.finish_policy_registration(
             parsed,
@@ -370,13 +393,7 @@ impl PolicyRegistry {
         relative_path: impl AsRef<Path>,
         analyzer: &dyn IAnalyzer,
     ) -> Result<&LoadedPolicy, PolicyRegistryError> {
-        let loaded = {
-            let root = self
-                .workspace_root
-                .as_ref()
-                .ok_or(PolicyRegistryError::WorkspaceAccessUnavailable)?;
-            read_rqlp_document(root, relative_path.as_ref())?
-        };
+        let loaded = self.read_workspace_source(relative_path.as_ref())?;
         let (_, document, parsed) = loaded.into_parts();
         self.finish_policy_registration(
             parsed,
@@ -390,8 +407,7 @@ impl PolicyRegistry {
         identity: PolicySourceIdentity,
         bytes: &[u8],
     ) -> Result<&LoadedPolicy, PolicyRegistryError> {
-        validate_policy_source_identity(&identity)?;
-        let parsed = parse_policy_bytes(identity, bytes)?;
+        let parsed = validate_and_parse_policy_source(identity, bytes)?;
         self.finish_policy_registration(parsed, bytes, LocatorResolution::Required)
     }
 
@@ -403,8 +419,7 @@ impl PolicyRegistry {
         bytes: &[u8],
         analyzer: &dyn IAnalyzer,
     ) -> Result<&LoadedPolicy, PolicyRegistryError> {
-        validate_policy_source_identity(&identity)?;
-        let parsed = parse_policy_bytes(identity, bytes)?;
+        let parsed = validate_and_parse_policy_source(identity, bytes)?;
         self.finish_policy_registration(parsed, bytes, LocatorResolution::Analyzer(analyzer))
     }
 
@@ -421,8 +436,7 @@ impl PolicyRegistry {
         identity: PolicySourceIdentity,
         bytes: &[u8],
     ) -> Result<&LoadedPolicy, PolicyRegistryError> {
-        validate_policy_source_identity(&identity)?;
-        let parsed = parse_policy_bytes(identity, bytes)?;
+        let parsed = validate_and_parse_policy_source(identity, bytes)?;
         self.finish_policy_registration(parsed, bytes, LocatorResolution::Deferred)
     }
 
@@ -430,13 +444,7 @@ impl PolicyRegistry {
         &mut self,
         relative_path: impl AsRef<Path>,
     ) -> Result<&LoadedEndpoint, PolicyRegistryError> {
-        let loaded = {
-            let root = self
-                .workspace_root
-                .as_ref()
-                .ok_or(PolicyRegistryError::WorkspaceAccessUnavailable)?;
-            read_rqlp_document(root, relative_path.as_ref())?
-        };
+        let loaded = self.read_workspace_source(relative_path.as_ref())?;
         let (_, document, parsed) = loaded.into_parts();
         self.finish_endpoint_registration(
             parsed,
@@ -450,8 +458,7 @@ impl PolicyRegistry {
         identity: PolicySourceIdentity,
         bytes: &[u8],
     ) -> Result<&LoadedEndpoint, PolicyRegistryError> {
-        validate_policy_source_identity(&identity)?;
-        let parsed = parse_policy_bytes(identity, bytes)?;
+        let parsed = validate_and_parse_policy_source(identity, bytes)?;
         self.finish_endpoint_registration(parsed, bytes, LocatorResolution::Required)
     }
 
@@ -463,8 +470,7 @@ impl PolicyRegistry {
         bytes: &[u8],
         analyzer: &dyn IAnalyzer,
     ) -> Result<&LoadedEndpoint, PolicyRegistryError> {
-        validate_policy_source_identity(&identity)?;
-        let parsed = parse_policy_bytes(identity, bytes)?;
+        let parsed = validate_and_parse_policy_source(identity, bytes)?;
         self.finish_endpoint_registration(parsed, bytes, LocatorResolution::Analyzer(analyzer))
     }
 
@@ -528,16 +534,7 @@ impl PolicyRegistry {
         if self.endpoints.contains_key(&endpoint_id) {
             return Err(PolicyRegistryError::DuplicateEndpointId { endpoint_id });
         }
-        let attempted_endpoints = self
-            .retained_endpoint_slots
-            .checked_add(1)
-            .ok_or(PolicyRegistryError::EndpointCountOverflow)?;
-        if attempted_endpoints > self.limits.max_endpoints {
-            return Err(PolicyRegistryError::EndpointLimitExceeded {
-                attempted: attempted_endpoints,
-                maximum: self.limits.max_endpoints,
-            });
-        }
+        let attempted_endpoints = self.checked_endpoint_total(1)?;
         let attempted_bytes = self.checked_retained_total(retained_bytes)?;
         self.endpoints.insert(
             endpoint_id.clone(),
@@ -589,16 +586,7 @@ impl PolicyRegistry {
         let imports =
             self.close_endpoint_sets(&parsed, &mut definition, source_bytes.len(), locators)?;
         let build = self.build_policy(&parsed, definition, source_bytes, locators, &imports)?;
-        let attempted_endpoints = self
-            .retained_endpoint_slots
-            .checked_add(build.endpoint_slots)
-            .ok_or(PolicyRegistryError::EndpointCountOverflow)?;
-        if attempted_endpoints > self.limits.max_endpoints {
-            return Err(PolicyRegistryError::EndpointLimitExceeded {
-                attempted: attempted_endpoints,
-                maximum: self.limits.max_endpoints,
-            });
-        }
+        let attempted_endpoints = self.checked_endpoint_total(build.endpoint_slots)?;
         // Cache replacement releases the prior parsed document. Its source
         // reservation must not remain charged to every later policy.
         let attempted_bytes = self
@@ -627,6 +615,20 @@ impl PolicyRegistry {
             return Err(PolicyRegistryError::RetainedByteLimitExceeded {
                 attempted,
                 maximum: self.limits.max_retained_source_and_selector_bytes,
+            });
+        }
+        Ok(attempted)
+    }
+
+    fn checked_endpoint_total(&self, additional: usize) -> Result<usize, PolicyRegistryError> {
+        let attempted = self
+            .retained_endpoint_slots
+            .checked_add(additional)
+            .ok_or(PolicyRegistryError::EndpointCountOverflow)?;
+        if attempted > self.limits.max_endpoints {
+            return Err(PolicyRegistryError::EndpointLimitExceeded {
+                attempted,
+                maximum: self.limits.max_endpoints,
             });
         }
         Ok(attempted)
@@ -879,7 +881,7 @@ impl PolicyRegistry {
             let base = format!(
                 "/analysis/{}/entries/{}",
                 segments.sources,
-                pointer_segment(source.id.as_str())
+                json_pointer_segment(source.id.as_str())
             );
             let path = selector_path(format!("{base}/selector"))?;
             let selector = self.resolve_imported_selector(
@@ -904,9 +906,10 @@ impl PolicyRegistry {
                     EndpointRole::Source,
                     source.display_name.clone(),
                     source.categories.clone(),
-                    port_to_endpoint_binding(&source.bind),
+                    policy_port_to_endpoint_binding(&source.bind),
                     Some(EndpointTaintSemantics::Source {
                         labels: source.labels.clone(),
+                        threat_model: source.threat_model,
                         evidence: source.evidence.clone(),
                     }),
                     Vec::new(),
@@ -922,7 +925,7 @@ impl PolicyRegistry {
             let base = format!(
                 "/analysis/{}/entries/{}",
                 segments.sinks,
-                pointer_segment(sink.id.as_str())
+                json_pointer_segment(sink.id.as_str())
             );
             let path = selector_path(format!("{base}/selector"))?;
             let selector = self.resolve_imported_selector(
@@ -947,7 +950,7 @@ impl PolicyRegistry {
                     EndpointRole::Sink,
                     sink.display_name.clone(),
                     sink.categories.clone(),
-                    port_to_endpoint_binding(&sink.dangerous_operand),
+                    policy_port_to_endpoint_binding(&sink.dangerous_operand),
                     Some(EndpointTaintSemantics::Sink {
                         accepts: sink.accepts.clone(),
                         tags: sink.tags.clone(),
@@ -972,7 +975,7 @@ impl PolicyRegistry {
             let base = format!(
                 "/analysis/{}/entries/{}",
                 segments.entry_points,
-                pointer_segment(entry_point.id.as_str())
+                json_pointer_segment(entry_point.id.as_str())
             );
             let path = selector_path(format!("{base}/selector"))?;
             let selector = self.resolve_imported_selector(
@@ -997,9 +1000,10 @@ impl PolicyRegistry {
                     EndpointRole::Source,
                     entry_point.id.as_str().to_owned(),
                     Vec::new(),
-                    port_to_endpoint_binding(&entry_point.parameter),
+                    policy_port_to_endpoint_binding(&entry_point.parameter),
                     Some(EndpointTaintSemantics::Source {
                         labels: entry_point.labels.clone(),
+                        threat_model: None,
                         evidence: None,
                     }),
                     Vec::new(),
@@ -1041,7 +1045,7 @@ impl PolicyRegistry {
         for (kind, id, authored) in entries {
             let path = selector_path(format!(
                 "/analysis/{kind}/entries/{}/selector",
-                pointer_segment(id.as_str())
+                json_pointer_segment(id.as_str())
             ))?;
             let selector = self.resolve_imported_selector(
                 parsed,
@@ -1103,9 +1107,10 @@ impl PolicyRegistry {
                         EndpointRole::Source,
                         source.display_name.clone(),
                         source.categories.clone(),
-                        port_to_endpoint_binding(&source.bind),
+                        policy_port_to_endpoint_binding(&source.bind),
                         Some(EndpointTaintSemantics::Source {
                             labels: source.labels.clone(),
+                            threat_model: source.threat_model,
                             evidence: source.evidence.clone(),
                         }),
                         Vec::new(),
@@ -1133,7 +1138,7 @@ impl PolicyRegistry {
                         EndpointRole::Sink,
                         sink.display_name.clone(),
                         sink.categories.clone(),
-                        port_to_endpoint_binding(&sink.dangerous_operand),
+                        policy_port_to_endpoint_binding(&sink.dangerous_operand),
                         Some(EndpointTaintSemantics::Sink {
                             accepts: sink.accepts.clone(),
                             tags: sink.tags.clone(),
@@ -1204,9 +1209,9 @@ impl PolicyRegistry {
             for (id, authored) in entries(catalog) {
                 let path = selector_path(format!(
                     "/dependencies/catalogs/{}@{}/{}/selector",
-                    pointer_segment(identity.name.as_str()),
+                    json_pointer_segment(identity.name.as_str()),
                     identity.version,
-                    pointer_segment(id.as_str())
+                    json_pointer_segment(id.as_str())
                 ))?;
                 let selector = inline_selector(
                     path,
@@ -1237,7 +1242,7 @@ impl PolicyRegistry {
         for subject in &spec.subjects.entries {
             let base = format!(
                 "/analysis/subjects/entries/{}",
-                pointer_segment(subject.id.as_str())
+                json_pointer_segment(subject.id.as_str())
             );
             let path = selector_path(format!("{base}/selector"))?;
             let selector =
@@ -1270,7 +1275,7 @@ impl PolicyRegistry {
             if let TypestateEventTrigger::Calls { selector, .. } = &event.trigger {
                 let path = selector_path(format!(
                     "/analysis/automaton/events/{}/selector",
-                    pointer_segment(event.id.as_str())
+                    json_pointer_segment(event.id.as_str())
                 ))?;
                 let selector =
                     self.resolve_selector(parsed, path, selector, retained_bytes, locators)?;
@@ -1345,7 +1350,9 @@ impl PolicyRegistry {
             for entry in &closure.endpoints {
                 let endpoint = &entry.loaded;
                 if endpoint.definition().role != usage.role
-                    || !category_matches(&reference.categories, &endpoint.definition().categories)
+                    || !reference
+                        .categories
+                        .matches_categories(&endpoint.definition().categories)
                 {
                     continue;
                 }
@@ -1551,17 +1558,12 @@ impl PolicyRegistry {
     }
 
     fn available_local_bytes(&self, local: usize) -> Result<usize, PolicyRegistryError> {
-        let already = self
-            .retained_source_and_selector_bytes
-            .checked_add(local)
-            .ok_or(PolicyRegistryError::RetainedByteCountOverflow)?;
-        self.limits
+        let already = self.checked_retained_total(local)?;
+        Ok(self
+            .limits
             .max_retained_source_and_selector_bytes
             .checked_sub(already)
-            .ok_or(PolicyRegistryError::RetainedByteLimitExceeded {
-                attempted: already,
-                maximum: self.limits.max_retained_source_and_selector_bytes,
-            })
+            .expect("checked retained total is within its limit"))
     }
 
     fn ensure_local_retained_bytes(&self, local: usize) -> Result<(), PolicyRegistryError> {
@@ -1662,7 +1664,7 @@ fn typestate_match_uses(spec: &TypestatePolicySpec) -> Result<Vec<MatchUse>, Pol
                 role: *role,
                 path: dependency_path(format!(
                     "/analysis/automaton/events/{}/matches",
-                    pointer_segment(event.id.as_str())
+                    json_pointer_segment(event.id.as_str())
                 ))?,
             });
         }
@@ -1674,7 +1676,7 @@ fn typestate_match_uses(spec: &TypestatePolicySpec) -> Result<Vec<MatchUse>, Pol
                 role: *role,
                 path: dependency_path(format!(
                     "/analysis/automaton/terminal-expectations/{}/on",
-                    pointer_segment(expectation.id.as_str())
+                    json_pointer_segment(expectation.id.as_str())
                 ))?,
             });
         }
@@ -1761,9 +1763,9 @@ fn catalog_selector(
         })?;
     let path = selector_path(format!(
         "/dependencies/catalogs/{}@{}/{}/selector",
-        pointer_segment(identity.name.as_str()),
+        json_pointer_segment(identity.name.as_str()),
         identity.version,
-        pointer_segment(entry_id.as_str())
+        json_pointer_segment(entry_id.as_str())
     ))?;
     let selector = inline_selector(
         path,
@@ -1779,12 +1781,7 @@ fn catalog_selector(
 fn resolved_catalog_identity(
     catalog: &RegisteredTaintCatalog,
 ) -> Result<ResolvedCatalogIdentity, PolicyRegistryError> {
-    ResolvedCatalogIdentity::try_new(
-        catalog.identity().name.clone(),
-        catalog.identity().version,
-        catalog.semantic_hash(),
-    )
-    .map_err(Into::into)
+    ResolvedCatalogIdentity::from_catalog(catalog).map_err(Into::into)
 }
 
 fn rekey_endpoint_selector(
@@ -1792,7 +1789,7 @@ fn rekey_endpoint_selector(
 ) -> Result<ResolvedPolicySelector, PolicyRegistryError> {
     let path = selector_path(format!(
         "/dependencies/match-endpoints/{}/selector",
-        pointer_segment(endpoint.definition().id.as_str())
+        json_pointer_segment(endpoint.definition().id.as_str())
     ))?;
     let (schema, query) = endpoint
         .resolved_selector()
@@ -1848,21 +1845,6 @@ fn insert_selector(
     Ok(())
 }
 
-fn category_matches(predicate: &CategoryPredicate, categories: &[PolicyCategoryId]) -> bool {
-    match predicate {
-        CategoryPredicate::Any {
-            categories: expected,
-        } => expected
-            .iter()
-            .any(|category| categories.contains(category)),
-        CategoryPredicate::All {
-            categories: expected,
-        } => expected
-            .iter()
-            .all(|category| categories.contains(category)),
-    }
-}
-
 fn merge_match_dependency(
     dependencies: &mut BTreeMap<ResolvedEndpointIdentity, ResolvedEndpointDependency>,
     mut incoming: ResolvedEndpointDependency,
@@ -1906,36 +1888,39 @@ const fn directory_scope_rank(scope: DirectoryScope) -> u8 {
 }
 
 fn selector_path(path: impl AsRef<str>) -> Result<PolicySelectorPath, PolicyRegistryError> {
-    PolicySelectorPath::new(path).map_err(Into::into)
+    checked_selector_path(path, |path| PolicySelectorPath::new(path))
 }
 
 fn dependency_path(path: impl AsRef<str>) -> Result<PolicyDependencyPath, PolicyRegistryError> {
-    PolicyDependencyPath::new(path)
-        .map_err(|error| PolicyRegistryError::SelectorPath(Box::new(error)))
+    checked_selector_path(path, |path| PolicyDependencyPath::new(path))
 }
 
-fn pointer_segment(value: &str) -> String {
-    value.replace('~', "~0").replace('/', "~1")
+fn checked_selector_path<T>(
+    path: impl AsRef<str>,
+    construct: impl FnOnce(&str) -> Result<T, PolicySelectorPathError>,
+) -> Result<T, PolicyRegistryError> {
+    construct(path.as_ref()).map_err(Into::into)
 }
 
-fn port_to_endpoint_binding(port: &PolicyPort) -> PolicyEndpointBinding {
-    match port {
-        PolicyPort::MatchedValue => PolicyEndpointBinding::MatchedValue,
-        PolicyPort::Receiver => PolicyEndpointBinding::Receiver,
-        PolicyPort::ReturnValue => PolicyEndpointBinding::ReturnValue,
-        PolicyPort::ResultIndex { index } => PolicyEndpointBinding::ResultIndex { index: *index },
-        PolicyPort::ArgumentIndex { index } => {
-            PolicyEndpointBinding::ArgumentIndex { index: *index }
-        }
-        PolicyPort::ArgumentName { name } => {
-            PolicyEndpointBinding::ArgumentName { name: name.clone() }
-        }
-        // Field ports exist only as external-model transfer destinations and
-        // never reach an endpoint binding.
-        PolicyPort::FieldOf { .. } => {
-            unreachable!("field ports are only valid as external-model transfer destinations")
-        }
-    }
+fn validate_and_parse_policy_source(
+    identity: PolicySourceIdentity,
+    bytes: &[u8],
+) -> Result<ParsedRqlpDocument, PolicyRegistryError> {
+    validate_policy_source_identity(&identity)?;
+    parse_policy_bytes(identity, bytes)
+}
+
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub fn test_registry_for_workspace(root: &Path) -> PolicyRegistry {
+    PolicyRegistry::new_for_workspace(
+        root.to_path_buf(),
+        Arc::new(TaintCatalogRegistry::new_without_workspace(
+            CatalogRegistryLimits::default(),
+        )),
+        PolicyRegistryLimits::default(),
+    )
+    .expect("workspace registry")
 }
 
 fn seed_to_endpoint_binding(binding: &TypestateSeedBinding) -> PolicyEndpointBinding {

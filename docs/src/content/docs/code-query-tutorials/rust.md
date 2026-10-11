@@ -1,11 +1,11 @@
 ---
 title: Rust
-description: Query Rust calls, assignments, imports, closures, and method receivers with query_code.
+description: Query Rust async/await, calls, assignments, imports, closures, and method receivers with query_code.
 ---
 
-> Last verified end to end: 2026-09-01 (`query_code` schema version 1).
+> Last verified end to end: 2026-10-07 (`query_code` schema version 1).
 
-For exact inbound and outbound symbol edges, proof tiers, and adapter-specific caveats, see [Reference Traversal](../reference-traversal/).
+For exact inbound and outbound symbol edges, proof tiers, and adapter-specific caveats, see [Reference Traversal](/code-query-tutorials/reference-traversal/).
 
 Rust maps turbofish calls, method receivers, grouped `use` declarations, closures, signed literals, and compound assignments into the normalized `query_code` model. The fixture includes both production code and a closure so containment and exclusion remain observable.
 
@@ -29,6 +29,14 @@ fn audit(code: &str) -> String {
     let mut service = Service { count: 0 };
     service.count += 1;
     service.run(code)
+}
+
+async fn async_value() -> u32 {
+    1
+}
+
+async fn wait_for_value() -> u32 {
+    async_value().await
 }
 ```
 
@@ -60,6 +68,151 @@ The same terminal method name can occur as a generic call or a method call. A re
       "path": "rust/lib.rs",
       "start_line": 8,
       "text": "code.parse::<String>()"
+    }
+  ],
+  "truncated": false
+}
+```
+
+<!-- code-query-case:generic-call-type-arguments:rql -->
+```lisp
+(language rust
+  (call :callee (name "parse") :type-arguments [(name "String")]))
+```
+
+<!-- code-query-case:generic-call-type-arguments:json -->
+```json
+{"languages":["rust"],"match":{"kind":"call","callee":{"name":"parse"},"type-arguments":[{"name":"String"}]}}
+```
+
+<!-- code-query-case:generic-call-type-arguments:expected -->
+```json
+{
+  "results": [
+    {
+      "result_type": "structural_match",
+      "path": "rust/lib.rs",
+      "language": "rust",
+      "kind": "call",
+      "start_line": 8,
+      "end_line": 8,
+      "text": "code.parse::<String>()",
+      "enclosing_symbol": "rust.Service.run"
+    },
+    {
+      "result_type": "structural_match",
+      "path": "rust/modules.rs",
+      "language": "rust",
+      "kind": "call",
+      "start_line": 2,
+      "end_line": 2,
+      "text": "raw.parse::<String>()",
+      "enclosing_symbol": "rust.load"
+    }
+  ],
+  "truncated": false
+}
+```
+
+## Async functions and await points
+
+The callable's AST-backed `:async true` property scopes the query to the async
+function. `(await)` selects its await expression, and `program-point-of`
+projects that source match to its unique suspension point.
+
+<!-- code-query-case:await-expression:rql -->
+```lisp
+(language rust
+  (inside (function :name "wait_for_value" :async true)
+    (await)))
+```
+
+<!-- code-query-case:await-expression:json -->
+```json
+{"languages":["rust"],"match":{"kind":"await"},"inside":{"kind":"function","name":"wait_for_value","async":true}}
+```
+
+<!-- code-query-case:await-expression:expected -->
+```json
+{
+  "results": [
+    {
+      "enclosing_symbol": "rust.wait_for_value",
+      "end_line": 24,
+      "kind": "await",
+      "language": "rust",
+      "path": "rust/lib.rs",
+      "result_type": "structural_match",
+      "start_line": 24,
+      "text": "async_value().await"
+    }
+  ],
+  "truncated": false
+}
+```
+
+<!-- code-query-case:await-suspend-point:rql -->
+```lisp
+(language rust
+  (program-point-of
+    (inside (function :name "wait_for_value" :async true)
+      (await))))
+```
+
+<!-- code-query-case:await-suspend-point:json -->
+```json
+{"languages":["rust"],"match":{"kind":"await"},"inside":{"kind":"function","name":"wait_for_value","async":true},"steps":[{"op":"program_point_of"}]}
+```
+
+<!-- code-query-case:await-suspend-point:expected -->
+```json
+{
+  "results": [
+    {
+      "event_count": 4,
+      "evidence": {
+        "completeness": "complete",
+        "proof": "proven"
+      },
+      "id": "b584199882f7fc231c855fb73e594103e0942b1fb644f074e612da17033b9d75",
+      "language": "rust",
+      "path": "rust/lib.rs",
+      "procedure_id": "b10f3f0466902307e941966d7bf8a5da3ed5d32c1aa23112f06567d0ca2cc13c",
+      "provenance": [
+        {
+          "seed": {
+            "end_line": 24,
+            "kind": "await",
+            "path": "rust/lib.rs",
+            "result_type": "structural_match",
+            "start_line": 24
+          },
+          "steps": [
+            {
+              "op": "program_point_of",
+              "result": {
+                "id": "b584199882f7fc231c855fb73e594103e0942b1fb644f074e612da17033b9d75",
+                "path": "rust/lib.rs",
+                "procedure_id": "b10f3f0466902307e941966d7bf8a5da3ed5d32c1aa23112f06567d0ca2cc13c",
+                "range": {
+                  "end_column": 24,
+                  "end_line": 24,
+                  "start_column": 5,
+                  "start_line": 24
+                },
+                "result_type": "program_point"
+              }
+            }
+          ]
+        }
+      ],
+      "range": {
+        "end_column": 24,
+        "end_line": 24,
+        "start_column": 5,
+        "start_line": 24
+      },
+      "result_type": "program_point"
     }
   ],
   "truncated": false

@@ -127,11 +127,6 @@ assert.deepStrictEqual(
   `${claudeManifestPath} should select Claude Code's host-specific MCP config`,
 );
 assert.deepStrictEqual(
-  claudeManifest.lspServers,
-  "./.lsp.json",
-  `${claudeManifestPath} should select Claude Code's packaged LSP config`,
-);
-assert.deepStrictEqual(
   cursorManifest.mcpServers,
   "./cursor-mcp.json",
   `${cursorManifestPath} should select Cursor's host-specific MCP config`,
@@ -145,8 +140,6 @@ if (!cursorPluginNamePattern.test(cursorManifest.name)) {
 
 const claudeMcpPath = "plugins/bifrost-agent/claude-mcp.json";
 const claudeMcpConfig = JSON.parse(fs.readFileSync(claudeMcpPath, "utf8"));
-const claudeLspPath = "plugins/bifrost-agent/.lsp.json";
-const claudeLspConfig = JSON.parse(fs.readFileSync(claudeLspPath, "utf8"));
 const cursorMcpPath = "plugins/bifrost-agent/cursor-mcp.json";
 const cursorMcpConfig = JSON.parse(fs.readFileSync(cursorMcpPath, "utf8"));
 const codexMcpPath = "plugins/bifrost-agent/.mcp.json";
@@ -155,37 +148,6 @@ assert.deepStrictEqual(
   claudeMcpConfig.mcpServers?.bifrost?.command,
   "${CLAUDE_PLUGIN_ROOT}/bin/bifrost-launcher.mjs",
   `${claudeMcpPath} should resolve the launcher from Claude Code's installed plugin directory`,
-);
-const claudeLspServer = claudeLspConfig.bifrost;
-assert.deepStrictEqual(
-  claudeLspServer?.command,
-  "${CLAUDE_PLUGIN_ROOT}/bin/bifrost-launcher.mjs",
-  `${claudeLspPath} should resolve the launcher from Claude Code's installed plugin directory`,
-);
-assert.deepStrictEqual(
-  claudeLspServer?.args,
-  ["--root", "${CLAUDE_PROJECT_DIR}", "--lsp"],
-  `${claudeLspPath} should launch LSP against Claude Code's active project`,
-);
-assert.deepStrictEqual(
-  claudeLspServer?.transport,
-  "stdio",
-  `${claudeLspPath} should use the Bifrost LSP stdio transport`,
-);
-assert.deepStrictEqual(
-  claudeLspServer?.workspaceFolder,
-  "${CLAUDE_PROJECT_DIR}",
-  `${claudeLspPath} should initialize against Claude Code's active project`,
-);
-assert.deepStrictEqual(
-  claudeLspServer?.startupTimeout,
-  MINIMUM_MCP_STARTUP_TIMEOUT_MS,
-  `${claudeLspPath} should cover managed binary provisioning before LSP startup`,
-);
-assert.equal(
-  typeof claudeLspServer?.extensionToLanguage,
-  "object",
-  `${claudeLspPath} should declare an extension-to-language map`,
 );
 assert.deepStrictEqual(
   claudeMcpConfig.mcpServers?.bifrost?.cwd,
@@ -456,9 +418,6 @@ assert.match(
 // plugins/bifrost-agent and the copies must not drift.
 for (const [canonical, vendored] of [
   ["plugins/bifrost-agent/bin/bifrost-launcher.mjs", "plugins/bifrost-dsh/bin/bifrost-launcher.mjs"],
-  ...["open-packs.mjs", "open-packs.d.mts", "pack-release.schema.json", "pack-release.v1.schema.json"].map((file) => [
-    `plugins/bifrost-agent/bin/${file}`, `plugins/bifrost-dsh/bin/${file}`,
-  ]),
   ["plugins/bifrost-agent/bifrost-release.json", "plugins/bifrost-dsh/bifrost-release.json"],
 ]) {
   if (!fs.readFileSync(canonical).equals(fs.readFileSync(vendored))) {

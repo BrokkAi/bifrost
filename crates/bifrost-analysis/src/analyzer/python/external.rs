@@ -4,29 +4,37 @@
 //! configured directories and distribution metadata, returning exact local
 //! files for the shared semantic-pack coordinator to hash and consume later.
 
-use std::fs;
+use std::fs::{self, File};
 use std::path::{Path, PathBuf};
+
+use crate::analyzer::common::{bounded_message, dependency_pack_warning as declaration_diagnostic};
+use crate::analyzer::dependency_support::read_bounded_declaration_file;
 
 use semver::Version;
 
 use crate::CancellationToken;
+use crate::analyzer::dependency_support::{BoundedReadError, read_bounded_bytes};
 use crate::analyzer::semantic_model::{
-    ActivationSelector, ArtifactProducerLimits, ArtifactProduction, ArtifactProductionRequest,
-    AuthoredPayload, AuthoredSemanticModelPack, AuthoredShard, BoundedProducerDiagnostics,
-    CatalogCoordinate, Compatibility, Completeness, DeclarationGuard, DependencyArtifactRole,
+    ArtifactProducerLimits, ArtifactProduction, ArtifactProductionRequest, AuthoredPayload,
+    AuthoredSemanticModelPack, AuthoredShard, BoundedProducerDiagnostics, CatalogCoordinate,
+    Compatibility, Completeness, DeclarationGuard, DependencyArtifactRole,
     DependencyDiscoveryOutcome, DependencyDiscoveryProfile, DependencyPackAdapter,
     DependencyPackDiagnostic, DependencyPackDiagnosticSeverity, DependencyPackLimits,
     DependencyPackProduction, DependencyProvenance, ExactArtifact, ExactDependencyArtifact,
-    ExternalArtifactKind, ExternalArtifactPackProducer, GuardVersion, HierarchyFact, Locator,
-    MemberFact, MemberIdentity, MemberKind, NameSelector, Parameter, ParameterPassingMode,
-    Producer, ProducerDiagnostic, ProducerDiagnosticSeverity, Provenance, ResolvedDependency,
-    ResolvedDependencyArtifact, Safety, SemanticModelActivationEvidence, Signature,
+    ExternalArtifactKind, GuardVersion, HierarchyFact, Locator, MemberFact, MemberIdentity,
+    MemberKind, Parameter, ParameterPassingMode, Producer, ProducerDiagnostic,
+    ProducerDiagnosticSeverity, Provenance, ResolvedDependency, ResolvedDependencyArtifact, Safety,
+    SemanticModelActivationEvidence, Signature, StandardLibraryPackExpectation,
     SuppressedDiagnostics, TypeFact, TypeIdentity, TypeKind, TypeRef, Visibility,
     member_declaration_id, read_exact_artifact_while, type_declaration_id,
 };
 use crate::analyzer::topology::DependencyScope;
-use crate::analyzer::{Project, PythonAnalyzerConfig, PythonEnvironmentConfig};
+use crate::analyzer::{Language, Project, PythonAnalyzerConfig, PythonEnvironmentConfig};
+use brokk_bifrost_core::analyzer::tree_walk::{
+    named_children_iter as named_children, push_named_children_reversed_as,
+};
 use brokk_bifrost_python::declarations::PythonParameterSplat;
+pub(super) use brokk_bifrost_python::distribution::{metadata_header, normalize_distribution_name};
 use brokk_bifrost_python::syntax::python_plain_string_literal;
 use tree_sitter::Node;
 
@@ -41,15 +49,8 @@ impl DependencyPackAdapter for PythonDependencyPackAdapter {
         "bifrost-python-environment"
     }
 
-    fn adapter_version(&self) -> &str {
-        env!("CARGO_PKG_VERSION")
-    }
-
     fn producer(&self) -> Producer {
-        Producer {
-            name: "bifrost-python-stub".to_owned(),
-            version: env!("CARGO_PKG_VERSION").to_owned(),
-        }
+        Producer::for_name("bifrost-python-stub")
     }
 
     fn produce(
@@ -172,6 +173,7 @@ impl DependencyPackAdapter for PythonDependencyPackAdapter {
                     collection_flows: None,
                     deferred_yields: None,
                     conditional_type_refinements: None,
+                    callable_values: None,
                 }],
             }),
             diagnostics,
@@ -180,24 +182,10 @@ impl DependencyPackAdapter for PythonDependencyPackAdapter {
     }
 }
 
-impl ExternalArtifactPackProducer for PythonArtifactPackProducer {
-    fn produce_exact_artifact(
-        &self,
-        request: &ArtifactProductionRequest,
-        limits: &ArtifactProducerLimits,
-    ) -> ArtifactProduction {
-        self.produce(request, limits, None)
-    }
-
-    fn produce_exact_artifact_with_cancellation(
-        &self,
-        request: &ArtifactProductionRequest,
-        limits: &ArtifactProducerLimits,
-        cancellation: Option<&CancellationToken>,
-    ) -> ArtifactProduction {
-        self.produce(request, limits, cancellation)
-    }
-}
+crate::analyzer::semantic_model::implement_external_artifact_pack_producer!(
+    PythonArtifactPackProducer,
+    produce
+);
 
 impl PythonArtifactPackProducer {
     fn produce(
@@ -291,7 +279,7 @@ impl PythonArtifactPackProducer {
             );
         };
         let mut diagnostics = BoundedProducerDiagnostics::new(limits);
-        let (mut types, mut members, annotated_values) = {
+        let (mut types, mut members, annotated_values, surface) = {
             let mut collector = PythonApiCollector::new(
                 module,
                 artifact.path(),
@@ -301,12 +289,15 @@ impl PythonArtifactPackProducer {
                 &mut diagnostics,
             );
             collector.collect(tree.root_node(), cancellation);
+            let surface = collector.module_surface();
             (
                 collector.types,
                 collector.members,
                 collector.annotated_values,
+                surface,
             )
         };
+        expand_explicit_reexports(std::slice::from_ref(&surface), &mut types);
         project_callable_object_values(
             &annotated_values,
             &types,
@@ -365,6 +356,7 @@ impl PythonArtifactPackProducer {
                     collection_flows: None,
                     deferred_yields: None,
                     conditional_type_refinements: None,
+                    callable_values: None,
                 }],
             }),
             completeness,
@@ -533,6 +525,7 @@ impl PythonArtifactPackProducer {
                     collection_flows: None,
                     deferred_yields: None,
                     conditional_type_refinements: None,
+                    callable_values: None,
                 }],
             }),
             completeness,
@@ -570,49 +563,9 @@ fn python_dependency_production_request(
                 .into_iter()
                 .collect(),
         },
-        activation: vec![ActivationSelector {
-            package: dependency
-                .evidence
-                .package
-                .as_ref()
-                .map(|coordinate| NameSelector {
-                    name: coordinate.name.clone(),
-                    version: coordinate
-                        .version
-                        .as_ref()
-                        .map(|version| format!("={version}")),
-                }),
-            module: dependency
-                .evidence
-                .module
-                .as_ref()
-                .map(|coordinate| NameSelector {
-                    name: coordinate.name.clone(),
-                    version: coordinate
-                        .version
-                        .as_ref()
-                        .map(|version| format!("={version}")),
-                }),
-            toolchain: dependency
-                .evidence
-                .toolchain
-                .as_ref()
-                .map(|coordinate| NameSelector {
-                    name: coordinate.name.clone(),
-                    version: coordinate
-                        .version
-                        .as_ref()
-                        .map(|version| format!("={version}")),
-                }),
-            targets: dependency.evidence.target.clone().into_iter().collect(),
-            configurations: dependency
-                .evidence
-                .configuration
-                .clone()
-                .into_iter()
-                .collect(),
-            artifact_sha256: None,
-        }],
+        activation: vec![
+            crate::analyzer::semantic_model::activation_selector_for_evidence(&dependency.evidence),
+        ],
         provenance: Provenance {
             source: "exact local Python environment artifact".to_owned(),
             revision: None,
@@ -773,6 +726,7 @@ struct HierarchyBinding {
     target: Option<String>,
     guard: Option<usize>,
     local_type: bool,
+    direct_class_alias: bool,
 }
 
 /// One hierarchy name resolved to the exact source binding it references.
@@ -940,16 +894,12 @@ impl<'a, 'd> PythonApiCollector<'a, 'd> {
         class_scope: bool,
         guard: Option<usize>,
     ) {
-        let mut cursor = node.walk();
-        let children = node.named_children(&mut cursor).collect::<Vec<_>>();
-        for child in children.into_iter().rev() {
-            stack.push(PendingNode {
-                node: child,
-                owner: owner.to_owned(),
-                class_scope,
-                guard,
-            });
-        }
+        push_named_children_reversed_as(node, stack, |child| PendingNode {
+            node: child,
+            owner: owner.to_owned(),
+            class_scope,
+            guard,
+        });
     }
 
     /// Walk one `if`/`elif`/`else` chain, recording on each branch's body the
@@ -1054,11 +1004,14 @@ impl<'a, 'd> PythonApiCollector<'a, 'd> {
                         // `metaclass=` configures class-object lookup; it is
                         // not an instance superclass and must not enter MRO.
                         .filter(|base| base.kind() != "keyword_argument")
-                        .filter(|base| !self.is_typing_marker_base(*base, &owner, guard))
-                        .map(|base| HierarchyFact {
+                        .enumerate()
+                        .filter(|(_, base)| !self.is_typing_marker_base(*base, &owner, guard))
+                        .map(|(ordinal, base)| HierarchyFact {
                             hierarchy_kind: crate::analyzer::semantic_model::HierarchyKind::Extends,
                             target: self.hierarchy_type_ref(base, &owner, guard),
-                            declaration_ordinal: None,
+                            declaration_ordinal: Some(
+                                u32::try_from(ordinal).expect("Python base ordinal fits u32"),
+                            ),
                         })
                         .collect()
                 })
@@ -1077,7 +1030,7 @@ impl<'a, 'd> PythonApiCollector<'a, 'd> {
                         arguments: Vec::new(),
                         nullable: false,
                     },
-                    declaration_ordinal: None,
+                    declaration_ordinal: Some(0),
                 });
             }
             let type_parameters = definition
@@ -1091,7 +1044,14 @@ impl<'a, 'd> PythonApiCollector<'a, 'd> {
                 hierarchy,
                 guard,
             );
-            self.record_hierarchy_binding(&owner, &name, Some(qualified.clone()), guard, true);
+            self.record_hierarchy_binding(
+                &owner,
+                &name,
+                Some(qualified.clone()),
+                guard,
+                true,
+                false,
+            );
             if let Some(body) = definition.child_by_field_name("body") {
                 stack.push(PendingNode {
                     node: body,
@@ -1130,7 +1090,7 @@ impl<'a, 'd> PythonApiCollector<'a, 'd> {
             let declared = self.hierarchy_type_ref(return_type, &owner, guard);
             signature.returns = Some(canonical_python_return_type(declared));
         }
-        self.record_hierarchy_binding(&owner, &name, None, guard, false);
+        self.record_hierarchy_binding(&owner, &name, None, guard, false, false);
         self.push_member(owner, name, member_kind, is_static, signature, guard);
     }
 
@@ -1156,7 +1116,21 @@ impl<'a, 'd> PythonApiCollector<'a, 'd> {
         if name == PYTHON_MODULE_EXPORTS && owner == self.module {
             self.record_module_exports(assignment);
         }
-        self.record_hierarchy_binding(owner, &name, None, guard, false);
+        let class_alias_target =
+            (!class_scope && owner == self.module && assignment.kind() == "assignment")
+                .then(|| assignment.child_by_field_name("right"))
+                .flatten()
+                .and_then(|right| self.resolved_hierarchy_binding(right, owner, guard))
+                .and_then(|binding| binding.target);
+        let direct_class_alias = class_alias_target.is_some();
+        self.record_hierarchy_binding(
+            owner,
+            &name,
+            class_alias_target,
+            guard,
+            false,
+            direct_class_alias,
+        );
         if !class_scope && let Some(annotation) = assignment.child_by_field_name("type") {
             self.annotated_values.push(ModuleAnnotatedValue {
                 owner: owner.to_owned(),
@@ -1254,7 +1228,7 @@ impl<'a, 'd> PythonApiCollector<'a, 'd> {
                 None => PYTHON_UNENUMERATED_BINDING,
             };
             if name != PYTHON_UNENUMERATED_BINDING {
-                self.record_hierarchy_binding(owner, name, hierarchy_target, guard, false);
+                self.record_hierarchy_binding(owner, name, hierarchy_target, guard, false, false);
             } else if import.is_wildcard && owner == self.module {
                 let target_module = self.wildcard_target_module(&import);
                 self.wildcard_imports.push(WildcardImport {
@@ -1355,12 +1329,14 @@ impl<'a, 'd> PythonApiCollector<'a, 'd> {
         target: Option<String>,
         guard: Option<usize>,
         local_type: bool,
+        direct_class_alias: bool,
     ) {
         let key = format!("{owner}.{name}");
         let next = HierarchyBinding {
             target,
             guard,
             local_type,
+            direct_class_alias,
         };
         match self.hierarchy_bindings.get(&key) {
             Some(previous) if guard.is_some() && previous != &next => {
@@ -1370,6 +1346,7 @@ impl<'a, 'd> PythonApiCollector<'a, 'd> {
                         target: None,
                         guard: None,
                         local_type: false,
+                        direct_class_alias: false,
                     },
                 );
             }
@@ -1481,6 +1458,7 @@ impl<'a, 'd> PythonApiCollector<'a, 'd> {
                         target: binding.target.clone(),
                         guard: self.guard_of(binding.guard).cloned(),
                         expanded: false,
+                        direct_class_alias: binding.direct_class_alias,
                     },
                 ))
             })
@@ -1666,6 +1644,8 @@ fn member_fact(
     MemberFact {
         non_overridable: None,
         ambient_use: None,
+        value_type: None,
+        proxied_type: None,
         id,
         owner: owner_id,
         name: name.to_owned(),
@@ -1677,6 +1657,7 @@ fn member_fact(
         implicit_operation: None,
         explicit_operation: None,
         callable_family_complete: false,
+        exact_return_classes: Vec::new(),
         signature,
         receiver: None,
         extension_receiver: None,
@@ -1717,6 +1698,9 @@ struct ModuleBinding {
     /// True when a wildcard expansion produced this binding, so the production
     /// still has to publish it.
     expanded: bool,
+    /// This name comes from a module-level assignment directly naming a
+    /// qualified class binding (`Alias = module.Class`).
+    direct_class_alias: bool,
 }
 
 /// Expand every `from m import *` whose `m` this production also collected.
@@ -1776,11 +1760,14 @@ fn expand_wildcard_reexports(
                                 .flatten(),
                             guard: DeclarationGuard::union(existing.guard.clone(), guard),
                             expanded: true,
+                            direct_class_alias: existing.direct_class_alias
+                                && binding.direct_class_alias,
                         },
                         None => ModuleBinding {
                             target: binding.target.clone(),
                             guard,
                             expanded: true,
+                            direct_class_alias: binding.direct_class_alias,
                         },
                     };
                     if surface.bindings.get(name) != Some(&gained) {
@@ -1915,10 +1902,12 @@ fn exported_bindings(surface: &CollectedModuleSurface) -> Vec<(&String, &ModuleB
 /// but the declaration's `aliases` field is the identity used by the semantic
 /// model overlay. Resolve those recorded bindings through the source set until
 /// they reach a declared type, so explicit re-export chains retain the same
-/// canonical identity as wildcard re-exports. A guarded or ambiguous binding
-/// is deliberately not published: aliases have no per-alias guard, and
-/// claiming one unconditionally would turn conditional import syntax into a
-/// false external class identity.
+/// canonical identity as wildcard re-exports. A guarded or ambiguous
+/// import/re-export binding is deliberately not published: aliases have no
+/// per-alias guard, and claiming one unconditionally would turn conditional
+/// import syntax into a false external class identity. A module-level direct
+/// class assignment may target a guarded class declaration when the target's
+/// module binding is ambiguous only because of conditional declarations.
 fn expand_explicit_reexports(surfaces: &[CollectedModuleSurface], types: &mut [TypeFact]) {
     let declarations_by_name = types.iter().enumerate().fold(
         std::collections::HashMap::<&str, Vec<usize>>::new(),
@@ -1933,6 +1922,16 @@ fn expand_explicit_reexports(surfaces: &[CollectedModuleSurface], types: &mut [T
     let declared_names = declarations_by_name
         .keys()
         .copied()
+        .collect::<std::collections::HashSet<_>>();
+    let class_names = types
+        .iter()
+        .filter(|fact| fact.type_kind == TypeKind::Class)
+        .map(|fact| fact.name.as_str())
+        .collect::<std::collections::HashSet<_>>();
+    let guarded_class_names = types
+        .iter()
+        .filter(|fact| fact.type_kind == TypeKind::Class && fact.guard.is_some())
+        .map(|fact| fact.name.as_str())
         .collect::<std::collections::HashSet<_>>();
     let mut bindings = std::collections::HashMap::new();
     for surface in surfaces {
@@ -1965,9 +1964,21 @@ fn expand_explicit_reexports(surfaces: &[CollectedModuleSurface], types: &mut [T
                 continue;
             }
             let alias = format!("{}.{}", surface.module, name);
-            let Some(canonical) =
-                resolve_explicit_reexport_target(&alias, &declared_names, &bindings)
-            else {
+            let canonical = binding
+                .direct_class_alias
+                .then(|| {
+                    binding.target.as_deref().and_then(|target| {
+                        resolve_direct_class_alias_target(
+                            target,
+                            &class_names,
+                            &guarded_class_names,
+                            &bindings,
+                        )
+                    })
+                })
+                .flatten()
+                .or_else(|| resolve_explicit_reexport_target(&alias, &declared_names, &bindings));
+            let Some(canonical) = canonical else {
                 continue;
             };
             if canonical == alias {
@@ -2015,6 +2026,26 @@ fn resolve_explicit_reexport_target(
             continue;
         }
         return declared_names.contains(current.as_str()).then_some(current);
+    }
+}
+
+/// Resolve `Alias = module.Class` when the source set directly declares that
+/// class and its module binding is either stable or ambiguous only because
+/// the class itself is conditional. A known final rebind remains authoritative.
+fn resolve_direct_class_alias_target(
+    target: &str,
+    class_names: &std::collections::HashSet<&str>,
+    guarded_class_names: &std::collections::HashSet<&str>,
+    bindings: &std::collections::HashMap<String, Option<String>>,
+) -> Option<String> {
+    if !class_names.contains(target) {
+        return None;
+    }
+    match bindings.get(target) {
+        Some(Some(binding)) if binding == target => Some(target.to_owned()),
+        Some(None) if guarded_class_names.contains(target) => Some(target.to_owned()),
+        None => Some(target.to_owned()),
+        _ => None,
     }
 }
 
@@ -2362,13 +2393,6 @@ fn string_sequence(node: Node<'_>, source: &str) -> Option<Vec<String>> {
         .collect()
 }
 
-fn named_children(node: Node<'_>) -> impl Iterator<Item = Node<'_>> {
-    let mut cursor = node.walk();
-    node.named_children(&mut cursor)
-        .collect::<Vec<_>>()
-        .into_iter()
-}
-
 fn node_identifier(node: Option<Node<'_>>, source: &str) -> Option<String> {
     let node = node?;
     match node.kind() {
@@ -2484,6 +2508,7 @@ fn function_signature(node: Node<'_>, source: &str, max_depth: usize) -> Option<
                 .unwrap_or_else(any_type),
             optional,
             variadic,
+            role: None,
             passing_mode,
         });
     }
@@ -2702,6 +2727,9 @@ const PYPROJECT_FILE_NAME: &str = "pyproject.toml";
 const SETUP_CFG_FILE_NAME: &str = "setup.cfg";
 const SETUP_PY_FILE_NAME: &str = "setup.py";
 const CPYTHON_TOOLCHAIN_NAME: &str = "cpython";
+/// The released typeshed standard-library pack a declared `cpython` version
+/// selects (`semantic-packs/python/typeshed-stdlib-*.json`).
+const PYTHON_STDLIB_PACK_ID: &str = "bifrost.python-stdlib";
 const MAX_PYTHON_TOOLCHAIN_DECLARATION_BYTES: u64 = 256 * 1024;
 
 /// Resolve the standard-library dependency a workspace *declares* rather than
@@ -2726,9 +2754,12 @@ fn resolve_declared_python_stdlib_dependency(
     inputs_considered: &mut usize,
 ) -> Result<Option<ResolvedDependency>, DependencyPackDiagnostic> {
     let version_file = project_root.join(PYTHON_VERSION_FILE_NAME);
-    if let Some(source) = read_bounded_declaration_file(&version_file).map_err(|message| {
-        declaration_diagnostic("python.toolchain.version_file", &version_file, message)
-    })? {
+    if let Some(source) =
+        read_bounded_declaration_file(&version_file, MAX_PYTHON_TOOLCHAIN_DECLARATION_BYTES)
+            .map_err(|message| {
+                declaration_diagnostic("python.toolchain.version_file", &version_file, message)
+            })?
+    {
         *inputs_considered += 1;
         let (version, declared) = parse_python_version_file(&source).map_err(|message| {
             declaration_diagnostic("python.toolchain.version_file", &version_file, message)
@@ -2740,9 +2771,12 @@ fn resolve_declared_python_stdlib_dependency(
         )));
     }
     let pyproject = project_root.join(PYPROJECT_FILE_NAME);
-    let Some(source) = read_bounded_declaration_file(&pyproject).map_err(|message| {
-        declaration_diagnostic("python.toolchain.requires_python", &pyproject, message)
-    })?
+    let Some(source) =
+        read_bounded_declaration_file(&pyproject, MAX_PYTHON_TOOLCHAIN_DECLARATION_BYTES).map_err(
+            |message| {
+                declaration_diagnostic("python.toolchain.requires_python", &pyproject, message)
+            },
+        )?
     else {
         return resolve_setuptools_python_requires(project_root, inputs_considered);
     };
@@ -2771,9 +2805,13 @@ fn resolve_setuptools_python_requires(
     inputs_considered: &mut usize,
 ) -> Result<Option<ResolvedDependency>, DependencyPackDiagnostic> {
     let setup_cfg = project_root.join(SETUP_CFG_FILE_NAME);
-    if let Some(source) = read_bounded_declaration_file(&setup_cfg).map_err(|message| {
-        declaration_diagnostic("python.toolchain.requires_python", &setup_cfg, message)
-    })? {
+    if let Some(source) =
+        read_bounded_declaration_file(&setup_cfg, MAX_PYTHON_TOOLCHAIN_DECLARATION_BYTES).map_err(
+            |message| {
+                declaration_diagnostic("python.toolchain.requires_python", &setup_cfg, message)
+            },
+        )?
+    {
         *inputs_considered += 1;
         if let Some(requirement) = parse_setup_cfg_python_requires(&source) {
             let version = requires_python_lower_bound(&requirement).map_err(|message| {
@@ -2845,38 +2883,8 @@ fn parse_setup_cfg_python_requires(source: &str) -> Option<String> {
     None
 }
 
-fn declaration_diagnostic(
-    code: &str,
-    location: &Path,
-    message: String,
-) -> DependencyPackDiagnostic {
-    DependencyPackDiagnostic {
-        severity: DependencyPackDiagnosticSeverity::Warning,
-        code: code.to_owned(),
-        dependency_id: None,
-        location: Some(location.display().to_string()),
-        message,
-    }
-}
-
 /// Read one workspace toolchain-declaration file. Absent means "the workspace
 /// declares nothing here" and is not a diagnostic.
-fn read_bounded_declaration_file(path: &Path) -> Result<Option<String>, String> {
-    let metadata = match fs::metadata(path) {
-        Ok(metadata) => metadata,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => return Err(format!("could not inspect declaration file: {error}")),
-    };
-    if !metadata.is_file() || metadata.len() > MAX_PYTHON_TOOLCHAIN_DECLARATION_BYTES {
-        return Err(format!(
-            "declaration file is not a regular file within {MAX_PYTHON_TOOLCHAIN_DECLARATION_BYTES} bytes"
-        ));
-    }
-    fs::read_to_string(path)
-        .map(Some)
-        .map_err(|error| format!("could not read declaration file: {error}"))
-}
-
 /// Parse the first declared line of a `.python-version` file into an exact
 /// cpython version. The pyenv/uv convention allows comments and multiple
 /// lines; only the first declaration decides, and only a plain numeric
@@ -3023,24 +3031,56 @@ fn declared_python_stdlib_dependency(
 
 /// The discovery outcome for a workspace with no configured Python
 /// environment: the declared-toolchain route alone (#1869). A workspace that
-/// declares nothing resolves nothing and stays complete, exactly as before.
+/// declares nothing resolves nothing and stays complete, but it still records
+/// that it selects no standard-library pack, and why (#3464).
 fn resolve_declared_python_stdlib_outcome(project: &dyn Project) -> DependencyDiscoveryOutcome {
     let mut outcome = DependencyDiscoveryOutcome::complete(Vec::new());
-    match resolve_declared_python_stdlib_dependency(
+    let expectation = match resolve_declared_python_stdlib_dependency(
         project.root(),
         &mut outcome.profile.metadata_inputs_considered,
     ) {
         Ok(Some(dependency)) => {
+            let expectation = StandardLibraryPackExpectation::declared(
+                Language::Python,
+                PYTHON_STDLIB_PACK_ID,
+                vec![dependency.id.clone()],
+            );
             outcome.dependencies.push(dependency);
             outcome.profile.dependencies_resolved = 1;
+            expectation
         }
-        Ok(None) => {}
+        Ok(None) => StandardLibraryPackExpectation::not_selected(
+            Language::Python,
+            PYTHON_STDLIB_PACK_ID,
+            format!(
+                "the workspace declares no CPython version in {PYTHON_VERSION_FILE_NAME}, \
+                 {PYPROJECT_FILE_NAME}, {SETUP_CFG_FILE_NAME} or {SETUP_PY_FILE_NAME}"
+            ),
+        ),
         Err(diagnostic) => {
+            let expectation = StandardLibraryPackExpectation::not_selected(
+                Language::Python,
+                PYTHON_STDLIB_PACK_ID,
+                declaration_refusal_reason(&diagnostic),
+            );
             outcome.diagnostics.push(diagnostic);
             outcome.complete = false;
+            expectation
         }
+    };
+    if project.analyzer_languages().contains(&Language::Python) {
+        outcome.expect_standard_library_pack(expectation);
     }
     outcome
+}
+
+/// A declaration discovery refused to read as an exact version, stated as the
+/// reason the standard-library pack was not selected.
+fn declaration_refusal_reason(diagnostic: &DependencyPackDiagnostic) -> String {
+    match &diagnostic.location {
+        Some(location) => format!("{location}: {}", diagnostic.message),
+        None => diagnostic.message.clone(),
+    }
 }
 
 /// Resolve configured Python standard-library, bundled-stub, and installed
@@ -3149,7 +3189,7 @@ impl<'a> DiscoveryState<'a> {
     }
 
     fn cancelled(&self, cancellation: Option<&CancellationToken>) -> bool {
-        cancellation.is_some_and(CancellationToken::is_cancelled)
+        brokk_bifrost_core::cancellation::optional_is_cancelled(cancellation)
     }
 
     fn cancelled_outcome(mut self) -> DependencyDiscoveryOutcome {
@@ -3159,18 +3199,15 @@ impl<'a> DiscoveryState<'a> {
             None,
             "Python environment discovery was cancelled".to_owned(),
         );
-        DependencyDiscoveryOutcome {
-            dependencies: Vec::new(),
-            diagnostics: self.diagnostics,
-            suppressed_diagnostics: self.suppressed_diagnostics,
-            complete: false,
-            cancelled: true,
-            profile: DependencyDiscoveryProfile {
+        DependencyDiscoveryOutcome::cancelled(
+            self.diagnostics,
+            self.suppressed_diagnostics,
+            DependencyDiscoveryProfile {
                 metadata_inputs_considered: self.metadata_inputs_considered,
                 dependencies_resolved: 0,
                 informational_evidence: Vec::new(),
             },
-        }
+        )
     }
 
     fn outcome(self, dependencies: Vec<ResolvedDependency>) -> DependencyDiscoveryOutcome {
@@ -3228,7 +3265,7 @@ impl<'a> DiscoveryState<'a> {
         root: &Path,
         cancellation: Option<&CancellationToken>,
     ) -> Vec<ResolvedDependency> {
-        let entries = match sorted_directory_entries(root) {
+        let entries = match brokk_bifrost_core::util::sorted_directory_entries(root) {
             Ok(entries) => entries,
             Err(error) => {
                 self.error(
@@ -3549,7 +3586,7 @@ impl<'a> DiscoveryState<'a> {
                 );
                 break;
             }
-            let entries = match sorted_directory_entries(&directory) {
+            let entries = match brokk_bifrost_core::util::sorted_directory_entries(&directory) {
                 Ok(entries) => entries,
                 Err(error) => {
                     self.error(
@@ -3803,14 +3840,6 @@ impl<'a> DiscoveryState<'a> {
     }
 }
 
-fn sorted_directory_entries(path: &Path) -> std::io::Result<Vec<PathBuf>> {
-    let mut entries = fs::read_dir(path)?
-        .map(|entry| entry.map(|entry| entry.path()))
-        .collect::<Result<Vec<_>, _>>()?;
-    entries.sort();
-    Ok(entries)
-}
-
 fn is_distribution_metadata(path: &Path) -> bool {
     path.is_dir()
         && path
@@ -3843,18 +3872,6 @@ fn artifact_role(kind: ExternalArtifactKind) -> DependencyArtifactRole {
     }
 }
 
-pub(super) fn metadata_header(metadata: &str, name: &str) -> Option<String> {
-    metadata.lines().find_map(|line| {
-        let (key, value) = line.split_once(':')?;
-        (key.eq_ignore_ascii_case(name) && !value.trim().is_empty())
-            .then(|| value.trim().to_owned())
-    })
-}
-
-pub(super) fn normalize_distribution_name(name: &str) -> String {
-    name.trim().to_ascii_lowercase().replace(['_', '.'], "-")
-}
-
 fn is_stub_only_distribution_name(name: &str) -> bool {
     name.starts_with("types-") || name.ends_with("-stubs")
 }
@@ -3866,20 +3883,21 @@ fn read_bounded(path: &Path, max_bytes: u64) -> Result<String, String> {
     if metadata.len() > max_bytes {
         return Err(format!("metadata exceeds byte limit {max_bytes}"));
     }
-    fs::read_to_string(path).map_err(|error| format!("could not read metadata: {error}"))
-}
-
-fn bounded_message(mut message: String, limit: usize) -> String {
-    if message.len() > limit {
-        message.truncate(limit);
-    }
-    message
+    let file = File::open(path).map_err(|error| format!("could not read metadata: {error}"))?;
+    let bytes = read_bounded_bytes(file, max_bytes).map_err(|error| match error {
+        BoundedReadError::Io(error) => format!("could not read metadata: {error}"),
+        BoundedReadError::LimitExceeded => format!("metadata exceeds byte limit {max_bytes}"),
+    })?;
+    String::from_utf8(bytes).map_err(|error| format!("could not read metadata: {error}"))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::analyzer::semantic_model::{CompilerOptions, compile_pack, read_exact_source_set};
+    use crate::analyzer::PythonEnvironmentLimits;
+    use crate::analyzer::semantic_model::{
+        ActivationSelector, CompilerOptions, compile_pack, read_exact_source_set,
+    };
     use tempfile::{TempDir, tempdir};
 
     #[test]
@@ -3956,6 +3974,554 @@ mod tests {
                 "{refused:?} must refuse rather than guess a pin"
             );
         }
+    }
+
+    fn source_set_rejection_fixture() -> (TempDir, ExactArtifact) {
+        let fixture = tempdir().unwrap();
+        std::fs::create_dir_all(fixture.path().join("pkg")).unwrap();
+        std::fs::write(fixture.path().join("__init__.pyi"), "class RootOnly: ...\n").unwrap();
+        std::fs::write(
+            fixture.path().join("pkg/__init__.pyi"),
+            "class Widget: ...\n",
+        )
+        .unwrap();
+        std::fs::write(fixture.path().join("pkg/bad.pyi"), [0xff, 0xfe, 0x00, 0x01]).unwrap();
+        let artifact = read_exact_source_set(
+            fixture.path(),
+            &[
+                "__init__.pyi".into(),
+                "pkg/__init__.pyi".into(),
+                "pkg/bad.pyi".into(),
+            ],
+            32,
+            16,
+            &ArtifactProducerLimits::default(),
+        )
+        .unwrap();
+        (fixture, artifact)
+    }
+
+    fn source_set_request(root: &Path) -> ArtifactProductionRequest {
+        ArtifactProductionRequest {
+            path: root.to_owned(),
+            artifact_kind: ExternalArtifactKind::PythonStub,
+            pack_id: "python-source-set-rejection-fixture".to_owned(),
+            pack_version: "1.0.0".to_owned(),
+            ecosystem: "python".to_owned(),
+            compatibility: Compatibility {
+                bifrost: None,
+                toolchains: Vec::new(),
+            },
+            activation: vec![ActivationSelector {
+                package: None,
+                module: None,
+                toolchain: None,
+                targets: Vec::new(),
+                configurations: Vec::new(),
+                artifact_sha256: None,
+            }],
+            provenance: Provenance {
+                source: "fixture".to_owned(),
+                revision: Some("fixture-v1".to_owned()),
+            },
+            license: "Apache-2.0".to_owned(),
+            safety: Safety {
+                generated_code_only: false,
+                review_required: false,
+            },
+        }
+    }
+
+    use brokk_bifrost_test_macros::hardwon;
+
+    #[test]
+    #[hardwon("#4271: Python dependency diagnostics panicked when the byte limit split UTF-8")]
+    fn dependency_diagnostic_truncation_preserves_utf8_boundaries() {
+        let environment = PythonEnvironmentConfig {
+            implementation: "cpython".to_owned(),
+            version: "3.12".to_owned(),
+            platform: "linux".to_owned(),
+            standard_library_root: PathBuf::new(),
+            bundled_stub_roots: Vec::new(),
+            distribution_roots: Vec::new(),
+            limits: PythonEnvironmentLimits {
+                max_diagnostic_message_bytes: 1,
+                ..PythonEnvironmentLimits::default()
+            },
+        };
+        let limits = DependencyPackLimits {
+            max_diagnostic_message_bytes: 1,
+            ..DependencyPackLimits::default()
+        };
+        let mut state = DiscoveryState::new(&environment, &limits);
+        state.error("test", None, None, "é".to_owned());
+
+        let outcome = state.outcome(Vec::new());
+        assert_eq!(outcome.diagnostics.len(), 1);
+        assert_eq!(outcome.diagnostics[0].message, "");
+        assert!(!outcome.complete);
+    }
+
+    #[test]
+    #[hardwon(
+        "#3027: Partial source-pack production must retain exact reject entry identities and the digest of the loaded source set"
+    )]
+    fn source_set_rejects_keep_exact_source_entries_and_artifact_digest() {
+        let (fixture, artifact) = source_set_rejection_fixture();
+        let expected_digest = artifact.sha256().to_owned();
+        let production = PythonArtifactPackProducer.produce_loaded_source_set(
+            &source_set_request(fixture.path()),
+            &ArtifactProducerLimits::default(),
+            None,
+            &artifact,
+        );
+
+        assert_eq!(
+            production.artifact_sha256.as_deref(),
+            Some(expected_digest.as_str()),
+            "source-set production retains the exact input digest"
+        );
+        assert_eq!(production.completeness, Completeness::Partial);
+        assert_eq!(
+            production.suppressed_diagnostics,
+            SuppressedDiagnostics::default()
+        );
+        assert_eq!(production.diagnostics.len(), 2);
+        let rejects = [
+            ("python.artifact_module", "__init__.pyi"),
+            ("python.source.encoding", "pkg/bad.pyi"),
+        ];
+        for (code, source_entry) in rejects {
+            let diagnostic = production
+                .diagnostics
+                .iter()
+                .find(|diagnostic| diagnostic.code == code)
+                .unwrap_or_else(|| panic!("missing diagnostic {code}"));
+            assert_eq!(diagnostic.severity, ProducerDiagnosticSeverity::Warning);
+            assert_eq!(diagnostic.location.as_deref(), Some(source_entry));
+            assert_eq!(diagnostic.source_entry.as_deref(), Some(source_entry));
+            assert_eq!(diagnostic.declaration, None);
+        }
+        assert_eq!(
+            production
+                .diagnostics
+                .iter()
+                .filter_map(|diagnostic| diagnostic.source_entry.as_deref())
+                .count(),
+            production.diagnostics.len(),
+            "every retained warning has one exact source-entry accounting subject"
+        );
+        assert!(
+            production.pack.as_ref().is_some_and(|pack| {
+                pack.shards.iter().any(|shard| match &shard.payload {
+                    AuthoredPayload::DeclarationFacts { types, .. } => {
+                        types.iter().any(|fact| fact.name == "pkg.Widget")
+                    }
+                    _ => false,
+                })
+            }),
+            "a warning-only partial source set still retains valid declarations"
+        );
+    }
+
+    #[test]
+    #[hardwon(
+        "#3027: Suppressed entry diagnostics keep aggregate counts while cancellation remains a whole-source-set failure without fabricated entry accounting"
+    )]
+    fn source_set_suppressed_and_cancelled_rejects_remain_unaccounted() {
+        let (fixture, artifact) = source_set_rejection_fixture();
+        let limits = ArtifactProducerLimits {
+            max_diagnostics: 1,
+            ..ArtifactProducerLimits::default()
+        };
+        let production = PythonArtifactPackProducer.produce_loaded_source_set(
+            &source_set_request(fixture.path()),
+            &limits,
+            None,
+            &artifact,
+        );
+        assert_eq!(production.completeness, Completeness::Partial);
+        assert_eq!(
+            production.suppressed_diagnostics,
+            SuppressedDiagnostics {
+                warnings: 1,
+                errors: 0,
+            }
+        );
+        assert_eq!(production.diagnostics.len(), 1);
+        assert_eq!(
+            production.diagnostics[0].source_entry.as_deref(),
+            Some("__init__.pyi")
+        );
+        assert_eq!(
+            production
+                .diagnostics
+                .iter()
+                .filter_map(|diagnostic| diagnostic.source_entry.as_deref())
+                .count(),
+            1,
+            "the suppressed reject has no retained identity to account for"
+        );
+
+        let cancellation = CancellationToken::new();
+        cancellation.cancel();
+        let cancelled = PythonArtifactPackProducer.produce_loaded_source_set(
+            &source_set_request(fixture.path()),
+            &ArtifactProducerLimits::default(),
+            Some(&cancellation),
+            &artifact,
+        );
+        assert_eq!(cancelled.completeness, Completeness::Partial);
+        assert!(cancelled.pack.is_none());
+        assert!(cancelled.diagnostics.iter().any(|diagnostic| {
+            diagnostic.code == "artifact.cancelled"
+                && diagnostic.severity == ProducerDiagnosticSeverity::Error
+        }));
+        assert!(
+            cancelled
+                .diagnostics
+                .iter()
+                .all(|diagnostic| diagnostic.source_entry.is_none()),
+            "cancellation is a whole-source-set failure, not an entry accounting subject"
+        );
+    }
+
+    /// Produce one pack from an inline stub source set, the way the pinned
+    /// typeshed selection is produced.
+    fn produce_stub_set(files: &[(&str, &str)]) -> ArtifactProduction {
+        let fixture = tempdir().unwrap();
+        for (relative, source) in files {
+            let path = fixture.path().join(relative);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, source).unwrap();
+        }
+        let artifact = read_exact_source_set(
+            fixture.path(),
+            &files
+                .iter()
+                .map(|(relative, _)| (*relative).into())
+                .collect::<Vec<_>>(),
+            32,
+            16,
+            &ArtifactProducerLimits::default(),
+        )
+        .unwrap();
+        PythonArtifactPackProducer.produce_loaded_source_set(
+            &ArtifactProductionRequest {
+                path: fixture.path().to_owned(),
+                artifact_kind: ExternalArtifactKind::PythonStub,
+                pack_id: "python-wildcard-fixture".to_owned(),
+                pack_version: "1.0.0".to_owned(),
+                ecosystem: "python".to_owned(),
+                compatibility: Compatibility {
+                    bifrost: None,
+                    toolchains: Vec::new(),
+                },
+                activation: vec![ActivationSelector {
+                    package: None,
+                    module: None,
+                    toolchain: None,
+                    targets: Vec::new(),
+                    configurations: Vec::new(),
+                    artifact_sha256: None,
+                }],
+                provenance: Provenance {
+                    source: "fixture".to_owned(),
+                    revision: None,
+                },
+                license: "Apache-2.0".to_owned(),
+                safety: Safety {
+                    generated_code_only: false,
+                    review_required: false,
+                },
+            },
+            &ArtifactProducerLimits::default(),
+            None,
+            &artifact,
+        )
+    }
+
+    fn declaration_facts(production: &ArtifactProduction) -> (&[TypeFact], &[MemberFact]) {
+        let (types, members, _) = crate::analyzer::test_support::authored_declaration_facts(
+            &production.pack.as_ref().unwrap().shards[0].payload,
+        )
+        .expect("declaration facts");
+        (types, members)
+    }
+
+    /// Every member name one module owns, sorted.
+    fn module_members<'a>(members: &'a [MemberFact], module: &str) -> Vec<&'a str> {
+        let owner = type_declaration_id(TypeIdentity {
+            ecosystem: "python",
+            name: module,
+        });
+        let mut names = members
+            .iter()
+            .filter(|member| member.owner == owner)
+            .map(|member| member.name.as_str())
+            .collect::<Vec<_>>();
+        names.sort_unstable();
+        names
+    }
+
+    fn callable_module_value_signature<'a>(
+        members: &'a [MemberFact],
+        module: &str,
+        member_name: &str,
+    ) -> &'a Signature {
+        let owner = type_declaration_id(TypeIdentity {
+            ecosystem: "python",
+            name: module,
+        });
+        members
+            .iter()
+            .find(|member| {
+                member.owner == owner
+                    && member.name == member_name
+                    && member.member_kind == MemberKind::Function
+            })
+            .unwrap_or_else(|| {
+                panic!("module value {module}.{member_name} projects no callable: {members:#?}")
+            })
+            .signature
+            .as_ref()
+            .expect("the projected callable carries the __call__ signature")
+    }
+
+    fn type_aliases<'a>(types: &'a [TypeFact], name: &str) -> &'a [String] {
+        &types
+            .iter()
+            .find(|fact| fact.name == name)
+            .unwrap_or_else(|| panic!("`{name}` is declared"))
+            .aliases
+    }
+
+    #[test]
+    #[hardwon(
+        "#4860: Python stub packs dropped module-level class aliases and source order for multiple bases"
+    )]
+    fn python_stub_pack_preserves_class_aliases_and_multiple_base_order() {
+        let production = produce_stub_set(&[
+            (
+                "_thread.pyi",
+                "import sys\n\
+                 if sys.version_info >= (3, 13):\n\
+                     class lock: ...\n\
+                     LockType = lock\n\
+                 else:\n\
+                     class LockType: ...\n",
+            ),
+            (
+                "threading.pyi",
+                "import _thread\n\
+                 __all__ = [\"Lock\"]\n\
+                 Lock = _thread.LockType\n",
+            ),
+            (
+                "api.pyi",
+                "import _thread\n\
+                 Lock = _thread.LockType\n\
+                 \n\
+                 class BufferedReader: ...\n\
+                 class BufferedWriter: ...\n\
+                 class BufferedRandom(BufferedReader, BufferedWriter): ...\n",
+            ),
+        ]);
+        assert!(
+            production.diagnostics.is_empty(),
+            "{:#?}",
+            production.diagnostics
+        );
+        let (types, _) = declaration_facts(&production);
+        assert!(
+            type_aliases(types, "_thread.LockType")
+                .iter()
+                .any(|alias| alias == "api.Lock"),
+            "the target class publishes its module-level alias: {types:#?}"
+        );
+        assert!(
+            type_aliases(types, "_thread.LockType")
+                .iter()
+                .any(|alias| alias == "threading.Lock"),
+            "a conditional same-name binding does not hide the declared class identity: {types:#?}"
+        );
+
+        let buffered_random = types
+            .iter()
+            .find(|fact| fact.name == "api.BufferedRandom")
+            .expect("the multi-base class is published");
+        assert_eq!(buffered_random.hierarchy.len(), 2, "{buffered_random:#?}");
+        assert_eq!(
+            buffered_random.hierarchy[0],
+            HierarchyFact {
+                hierarchy_kind: crate::analyzer::semantic_model::HierarchyKind::Extends,
+                target: TypeRef::Declared {
+                    id: type_declaration_id(TypeIdentity {
+                        ecosystem: "python",
+                        name: "api.BufferedReader",
+                    }),
+                    arguments: Vec::new(),
+                    nullable: false,
+                },
+                declaration_ordinal: Some(0),
+            }
+        );
+        assert_eq!(
+            buffered_random.hierarchy[1],
+            HierarchyFact {
+                hierarchy_kind: crate::analyzer::semantic_model::HierarchyKind::Extends,
+                target: TypeRef::Declared {
+                    id: type_declaration_id(TypeIdentity {
+                        ecosystem: "python",
+                        name: "api.BufferedWriter",
+                    }),
+                    arguments: Vec::new(),
+                    nullable: false,
+                },
+                declaration_ordinal: Some(1),
+            }
+        );
+    }
+
+    const WILDCARD_IMPL: &str =
+        "from typing import MutableSet as MutableSet\n\nclass Own: ...\n\n_private: int\n";
+
+    #[test]
+    #[hardwon(
+        "b01adbecaba5: A redundant explicit stub re-export must publish an alias back to the declaring type"
+    )]
+    fn an_explicit_named_import_publishes_a_structured_type_alias() {
+        let production = produce_stub_set(&[
+            (
+                "unittest/__init__.pyi",
+                "from .case import TestCase as TestCase\n",
+            ),
+            ("unittest/case.pyi", "class TestCase: ...\n"),
+        ]);
+        assert!(
+            production.diagnostics.is_empty(),
+            "{:#?}",
+            production.diagnostics
+        );
+        let (types, _) = declaration_facts(&production);
+        assert_eq!(
+            type_aliases(types, "unittest.case.TestCase"),
+            ["unittest.TestCase"],
+            "an explicit package re-export names the declaring class"
+        );
+    }
+
+    #[test]
+    #[hardwon(
+        "b01adbecaba5: A later rebinding of the importing name must erase the previously imported alias from the source-pack surface"
+    )]
+    fn a_rebound_explicit_import_does_not_publish_a_stale_alias() {
+        let production = produce_stub_set(&[
+            (
+                "pkg/__init__.pyi",
+                "from .case import TestCase as Public\nPublic = object\n",
+            ),
+            ("pkg/case.pyi", "class TestCase: ...\n"),
+        ]);
+        let (types, _) = declaration_facts(&production);
+        assert!(
+            type_aliases(types, "pkg.case.TestCase").is_empty(),
+            "a later structured binding removes the imported alias"
+        );
+    }
+
+    #[test]
+    #[hardwon(
+        "66e8f4eccee6: Rebinding the target name after its class declaration must stop stale re-export identity from escaping"
+    )]
+    fn a_rebound_target_type_does_not_publish_its_stale_export_alias() {
+        let production = produce_stub_set(&[
+            ("pkg/__init__.pyi", "from .case import TestCase as Public\n"),
+            ("pkg/case.pyi", "class TestCase: ...\nTestCase = object\n"),
+        ]);
+        let (types, _) = declaration_facts(&production);
+        assert!(
+            type_aliases(types, "pkg.case.TestCase").is_empty(),
+            "the final target binding, not the stale class declaration, controls export identity"
+        );
+    }
+
+    #[test]
+    #[hardwon(
+        "66e8f4eccee6: Two explicit import hops must preserve one declaring type identity through the complete stub set"
+    )]
+    fn explicit_named_imports_follow_a_stable_multi_hop_chain() {
+        let production = produce_stub_set(&[
+            ("pkg/public.pyi", "from .shim import TestCase as Public\n"),
+            ("pkg/shim.pyi", "from .case import TestCase as TestCase\n"),
+            ("pkg/case.pyi", "class TestCase: ...\n"),
+        ]);
+        let (types, _) = declaration_facts(&production);
+        assert_eq!(
+            type_aliases(types, "pkg.case.TestCase"),
+            ["pkg.public.Public", "pkg.shim.TestCase"],
+            "named re-export chains retain the declaring class identity"
+        );
+    }
+
+    #[test]
+    #[hardwon(
+        "66e8f4eccee6: An explicit import cycle has no stable declaration target and must not publish a type alias"
+    )]
+    fn cyclic_explicit_named_imports_do_not_publish_an_alias() {
+        let production = produce_stub_set(&[
+            (
+                "pkg/a.pyi",
+                "class Thing: ...\nfrom .b import Thing as Thing\n",
+            ),
+            ("pkg/b.pyi", "from .a import Thing as Thing\n"),
+        ]);
+        let (types, _) = declaration_facts(&production);
+        assert!(
+            type_aliases(types, "pkg.a.Thing").is_empty(),
+            "a cyclic binding graph has no stable canonical export"
+        );
+    }
+
+    #[test]
+    #[hardwon(
+        "7abf1cabfbfd: Competing regular-package and namespace-package surfaces must not arbitrarily choose one public alias target"
+    )]
+    fn conflicting_module_surfaces_do_not_publish_an_export_alias() {
+        let production = produce_stub_set(&[
+            ("pkg.pyi", "from first import Item as Public\n"),
+            ("pkg/__init__.pyi", "from second import Item as Public\n"),
+            ("first.pyi", "class Item: ...\n"),
+            ("second.pyi", "class Item: ...\n"),
+        ]);
+        let (types, _) = declaration_facts(&production);
+        for name in ["first.Item", "second.Item"] {
+            assert!(
+                type_aliases(types, name).is_empty(),
+                "conflicting source surfaces must not publish alias pkg.Public on {name}"
+            );
+        }
+    }
+
+    #[test]
+    #[hardwon(
+        "b01adbecaba5: Platform-conditional imports of different classes must remain ambiguous rather than become unconditional aliases"
+    )]
+    fn ambiguous_conditional_explicit_imports_do_not_publish_an_alias() {
+        let production = produce_stub_set(&[
+            (
+                "pkg/__init__.pyi",
+                "import sys\n\nif sys.platform == \"win32\":\n    from .case import TestCase as Public\nelse:\n    from .other import TestCase as Public\n",
+            ),
+            ("pkg/case.pyi", "class TestCase: ...\n"),
+            ("pkg/other.pyi", "class TestCase: ...\n"),
+        ]);
+        let (types, _) = declaration_facts(&production);
+        assert!(
+            type_aliases(types, "pkg.case.TestCase").is_empty()
+                && type_aliases(types, "pkg.other.TestCase").is_empty(),
+            "conditional rebindings remain ambiguous rather than becoming unconditional aliases"
+        );
     }
 
     #[test]
@@ -4168,317 +4734,8 @@ setup(name=\"fixture\", packages=[\"fixture\"], python_requires=\">=3.11\")
         compile_pack(&pack, &CompilerOptions::default()).unwrap();
     }
 
-    fn source_set_rejection_fixture() -> (TempDir, ExactArtifact) {
-        let fixture = tempdir().unwrap();
-        std::fs::create_dir_all(fixture.path().join("pkg")).unwrap();
-        std::fs::write(fixture.path().join("__init__.pyi"), "class RootOnly: ...\n").unwrap();
-        std::fs::write(
-            fixture.path().join("pkg/__init__.pyi"),
-            "class Widget: ...\n",
-        )
-        .unwrap();
-        std::fs::write(fixture.path().join("pkg/bad.pyi"), [0xff, 0xfe, 0x00, 0x01]).unwrap();
-        let artifact = read_exact_source_set(
-            fixture.path(),
-            &[
-                "__init__.pyi".into(),
-                "pkg/__init__.pyi".into(),
-                "pkg/bad.pyi".into(),
-            ],
-            32,
-            16,
-            &ArtifactProducerLimits::default(),
-        )
-        .unwrap();
-        (fixture, artifact)
-    }
-
-    fn source_set_request(root: &Path) -> ArtifactProductionRequest {
-        ArtifactProductionRequest {
-            path: root.to_owned(),
-            artifact_kind: ExternalArtifactKind::PythonStub,
-            pack_id: "python-source-set-rejection-fixture".to_owned(),
-            pack_version: "1.0.0".to_owned(),
-            ecosystem: "python".to_owned(),
-            compatibility: Compatibility {
-                bifrost: None,
-                toolchains: Vec::new(),
-            },
-            activation: vec![ActivationSelector {
-                package: None,
-                module: None,
-                toolchain: None,
-                targets: Vec::new(),
-                configurations: Vec::new(),
-                artifact_sha256: None,
-            }],
-            provenance: Provenance {
-                source: "fixture".to_owned(),
-                revision: Some("fixture-v1".to_owned()),
-            },
-            license: "Apache-2.0".to_owned(),
-            safety: Safety {
-                generated_code_only: false,
-                review_required: false,
-            },
-        }
-    }
-
     #[test]
-    fn source_set_rejects_keep_exact_source_entries_and_artifact_digest() {
-        let (fixture, artifact) = source_set_rejection_fixture();
-        let expected_digest = artifact.sha256().to_owned();
-        let production = PythonArtifactPackProducer.produce_loaded_source_set(
-            &source_set_request(fixture.path()),
-            &ArtifactProducerLimits::default(),
-            None,
-            &artifact,
-        );
-
-        assert_eq!(
-            production.artifact_sha256.as_deref(),
-            Some(expected_digest.as_str()),
-            "source-set production retains the exact input digest"
-        );
-        assert_eq!(production.completeness, Completeness::Partial);
-        assert_eq!(
-            production.suppressed_diagnostics,
-            SuppressedDiagnostics::default()
-        );
-        assert_eq!(production.diagnostics.len(), 2);
-        let rejects = [
-            ("python.artifact_module", "__init__.pyi"),
-            ("python.source.encoding", "pkg/bad.pyi"),
-        ];
-        for (code, source_entry) in rejects {
-            let diagnostic = production
-                .diagnostics
-                .iter()
-                .find(|diagnostic| diagnostic.code == code)
-                .unwrap_or_else(|| panic!("missing diagnostic {code}"));
-            assert_eq!(diagnostic.severity, ProducerDiagnosticSeverity::Warning);
-            assert_eq!(diagnostic.location.as_deref(), Some(source_entry));
-            assert_eq!(diagnostic.source_entry.as_deref(), Some(source_entry));
-            assert_eq!(diagnostic.declaration, None);
-        }
-        assert_eq!(
-            production
-                .diagnostics
-                .iter()
-                .filter_map(|diagnostic| diagnostic.source_entry.as_deref())
-                .count(),
-            production.diagnostics.len(),
-            "every retained warning has one exact source-entry accounting subject"
-        );
-        assert!(
-            production.pack.as_ref().is_some_and(|pack| {
-                pack.shards.iter().any(|shard| match &shard.payload {
-                    AuthoredPayload::DeclarationFacts { types, .. } => {
-                        types.iter().any(|fact| fact.name == "pkg.Widget")
-                    }
-                    _ => false,
-                })
-            }),
-            "a warning-only partial source set still retains valid declarations"
-        );
-    }
-
-    #[test]
-    fn source_set_suppressed_and_cancelled_rejects_remain_unaccounted() {
-        let (fixture, artifact) = source_set_rejection_fixture();
-        let limits = ArtifactProducerLimits {
-            max_diagnostics: 1,
-            ..ArtifactProducerLimits::default()
-        };
-        let production = PythonArtifactPackProducer.produce_loaded_source_set(
-            &source_set_request(fixture.path()),
-            &limits,
-            None,
-            &artifact,
-        );
-        assert_eq!(production.completeness, Completeness::Partial);
-        assert_eq!(
-            production.suppressed_diagnostics,
-            SuppressedDiagnostics {
-                warnings: 1,
-                errors: 0,
-            }
-        );
-        assert_eq!(production.diagnostics.len(), 1);
-        assert_eq!(
-            production.diagnostics[0].source_entry.as_deref(),
-            Some("__init__.pyi")
-        );
-        assert_eq!(
-            production
-                .diagnostics
-                .iter()
-                .filter_map(|diagnostic| diagnostic.source_entry.as_deref())
-                .count(),
-            1,
-            "the suppressed reject has no retained identity to account for"
-        );
-
-        let cancellation = CancellationToken::new();
-        cancellation.cancel();
-        let cancelled = PythonArtifactPackProducer.produce_loaded_source_set(
-            &source_set_request(fixture.path()),
-            &ArtifactProducerLimits::default(),
-            Some(&cancellation),
-            &artifact,
-        );
-        assert_eq!(cancelled.completeness, Completeness::Partial);
-        assert!(cancelled.pack.is_none());
-        assert!(cancelled.diagnostics.iter().any(|diagnostic| {
-            diagnostic.code == "artifact.cancelled"
-                && diagnostic.severity == ProducerDiagnosticSeverity::Error
-        }));
-        assert!(
-            cancelled
-                .diagnostics
-                .iter()
-                .all(|diagnostic| diagnostic.source_entry.is_none()),
-            "cancellation is a whole-source-set failure, not an entry accounting subject"
-        );
-    }
-
-    /// Produce one pack from an inline stub source set, the way the pinned
-    /// typeshed selection is produced.
-    fn produce_stub_set(files: &[(&str, &str)]) -> ArtifactProduction {
-        let fixture = tempdir().unwrap();
-        for (relative, source) in files {
-            let path = fixture.path().join(relative);
-            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-            std::fs::write(path, source).unwrap();
-        }
-        let artifact = read_exact_source_set(
-            fixture.path(),
-            &files
-                .iter()
-                .map(|(relative, _)| (*relative).into())
-                .collect::<Vec<_>>(),
-            32,
-            16,
-            &ArtifactProducerLimits::default(),
-        )
-        .unwrap();
-        PythonArtifactPackProducer.produce_loaded_source_set(
-            &ArtifactProductionRequest {
-                path: fixture.path().to_owned(),
-                artifact_kind: ExternalArtifactKind::PythonStub,
-                pack_id: "python-wildcard-fixture".to_owned(),
-                pack_version: "1.0.0".to_owned(),
-                ecosystem: "python".to_owned(),
-                compatibility: Compatibility {
-                    bifrost: None,
-                    toolchains: Vec::new(),
-                },
-                activation: vec![ActivationSelector {
-                    package: None,
-                    module: None,
-                    toolchain: None,
-                    targets: Vec::new(),
-                    configurations: Vec::new(),
-                    artifact_sha256: None,
-                }],
-                provenance: Provenance {
-                    source: "fixture".to_owned(),
-                    revision: None,
-                },
-                license: "Apache-2.0".to_owned(),
-                safety: Safety {
-                    generated_code_only: false,
-                    review_required: false,
-                },
-            },
-            &ArtifactProducerLimits::default(),
-            None,
-            &artifact,
-        )
-    }
-
-    fn declaration_facts(production: &ArtifactProduction) -> (&[TypeFact], &[MemberFact]) {
-        match &production.pack.as_ref().unwrap().shards[0].payload {
-            AuthoredPayload::DeclarationFacts { types, members, .. } => (types, members),
-            payload => panic!("declaration facts: {payload:#?}"),
-        }
-    }
-
-    /// Every member name one module owns, sorted.
-    fn module_members<'a>(members: &'a [MemberFact], module: &str) -> Vec<&'a str> {
-        let owner = type_declaration_id(TypeIdentity {
-            ecosystem: "python",
-            name: module,
-        });
-        let mut names = members
-            .iter()
-            .filter(|member| member.owner == owner)
-            .map(|member| member.name.as_str())
-            .collect::<Vec<_>>();
-        names.sort_unstable();
-        names
-    }
-
-    fn type_aliases<'a>(types: &'a [TypeFact], name: &str) -> &'a [String] {
-        &types
-            .iter()
-            .find(|fact| fact.name == name)
-            .unwrap_or_else(|| panic!("`{name}` is declared"))
-            .aliases
-    }
-
-    #[test]
-    fn an_explicit_named_import_publishes_a_structured_type_alias() {
-        let production = produce_stub_set(&[
-            (
-                "unittest/__init__.pyi",
-                "from .case import TestCase as TestCase\n",
-            ),
-            ("unittest/case.pyi", "class TestCase: ...\n"),
-        ]);
-        assert!(
-            production.diagnostics.is_empty(),
-            "{:#?}",
-            production.diagnostics
-        );
-        let (types, _) = declaration_facts(&production);
-        assert_eq!(
-            type_aliases(types, "unittest.case.TestCase"),
-            ["unittest.TestCase"],
-            "an explicit package re-export names the declaring class"
-        );
-    }
-
-    #[test]
-    fn a_rebound_explicit_import_does_not_publish_a_stale_alias() {
-        let production = produce_stub_set(&[
-            (
-                "pkg/__init__.pyi",
-                "from .case import TestCase as Public\nPublic = object\n",
-            ),
-            ("pkg/case.pyi", "class TestCase: ...\n"),
-        ]);
-        let (types, _) = declaration_facts(&production);
-        assert!(
-            type_aliases(types, "pkg.case.TestCase").is_empty(),
-            "a later structured binding removes the imported alias"
-        );
-    }
-
-    #[test]
-    fn a_rebound_target_type_does_not_publish_its_stale_export_alias() {
-        let production = produce_stub_set(&[
-            ("pkg/__init__.pyi", "from .case import TestCase as Public\n"),
-            ("pkg/case.pyi", "class TestCase: ...\nTestCase = object\n"),
-        ]);
-        let (types, _) = declaration_facts(&production);
-        assert!(
-            type_aliases(types, "pkg.case.TestCase").is_empty(),
-            "the final target binding, not the stale class declaration, controls export identity"
-        );
-    }
-
-    #[test]
+    #[hardwon("#3135: callable module values lacked exact non-returning signatures")]
     fn a_module_value_of_a_callable_class_projects_the_call_signature() {
         let production = produce_stub_set(&[
             (
@@ -4507,24 +4764,7 @@ setup(name=\"fixture\", packages=[\"fixture\"], python_requires=\">=3.11\")
             production.diagnostics
         );
         let (types, members) = declaration_facts(&production);
-        let builtins = type_declaration_id(TypeIdentity {
-            ecosystem: "python",
-            name: "builtins",
-        });
-        let projected = members
-            .iter()
-            .find(|member| {
-                member.owner == builtins
-                    && member.name == "exit"
-                    && member.member_kind == MemberKind::Function
-            })
-            .unwrap_or_else(|| {
-                panic!("the module value projects its class's __call__: {members:#?}")
-            });
-        let signature = projected
-            .signature
-            .as_ref()
-            .expect("the projected callable carries the __call__ signature");
+        let signature = callable_module_value_signature(members, "builtins", "exit");
         assert_eq!(signature.parameters.len(), 1, "{signature:#?}");
         assert_eq!(signature.parameters[0].name.as_deref(), Some("code"));
         assert!(signature.parameters[0].optional, "{signature:#?}");
@@ -4542,6 +4782,7 @@ setup(name=\"fixture\", packages=[\"fixture\"], python_requires=\">=3.11\")
     }
 
     #[test]
+    #[hardwon("#3135: callable module values lacked exact non-returning signatures")]
     fn a_receiverless_nonstatic_call_is_never_projected() {
         let production = produce_stub_set(&[
             (
@@ -4564,6 +4805,7 @@ setup(name=\"fixture\", packages=[\"fixture\"], python_requires=\">=3.11\")
     }
 
     #[test]
+    #[hardwon("#3135: callable module values lacked exact non-returning signatures")]
     fn an_unprojectable_value_annotation_keeps_the_constant_surface() {
         let production = produce_stub_set(&[
             (
@@ -4614,6 +4856,7 @@ setup(name=\"fixture\", packages=[\"fixture\"], python_requires=\">=3.11\")
     }
 
     #[test]
+    #[hardwon("#3135: callable module values lacked exact non-returning signatures")]
     fn a_single_artifact_projects_its_own_callable_module_values() {
         let fixture = tempdir().unwrap();
         let path = fixture.path().join("single.pyi");
@@ -4665,21 +4908,7 @@ setup(name=\"fixture\", packages=[\"fixture\"], python_requires=\">=3.11\")
             production.diagnostics
         );
         let (_, members) = declaration_facts(&production);
-        let single = type_declaration_id(TypeIdentity {
-            ecosystem: "python",
-            name: "single",
-        });
-        let projected = members
-            .iter()
-            .find(|member| {
-                member.owner == single
-                    && member.name == "exit"
-                    && member.member_kind == MemberKind::Function
-            })
-            .unwrap_or_else(|| {
-                panic!("the same-file value projects its class's __call__: {members:#?}")
-            });
-        let signature = projected.signature.as_ref().unwrap();
+        let signature = callable_module_value_signature(members, "single", "exit");
         assert_eq!(signature.parameters.len(), 1, "{signature:#?}");
         assert!(
             matches!(
@@ -4691,75 +4920,62 @@ setup(name=\"fixture\", packages=[\"fixture\"], python_requires=\">=3.11\")
     }
 
     #[test]
-    fn explicit_named_imports_follow_a_stable_multi_hop_chain() {
-        let production = produce_stub_set(&[
-            ("pkg/public.pyi", "from .shim import TestCase as Public\n"),
-            ("pkg/shim.pyi", "from .case import TestCase as TestCase\n"),
-            ("pkg/case.pyi", "class TestCase: ...\n"),
-        ]);
-        let (types, _) = declaration_facts(&production);
+    #[hardwon("#3135: callable module values lacked exact non-returning signatures")]
+    fn stub_signature_qualifies_imported_return_annotations() {
+        let source = r#"import typing_extensions as t
+from typing import NoReturn as NR
+
+def first() -> NR: ...
+def second() -> t.Never: ...
+"#;
+        let tree = brokk_bifrost_python::declarations::parse_python_tree(source).unwrap();
+        let limits = ArtifactProducerLimits::default();
+        let mut diagnostics = BoundedProducerDiagnostics::new(&limits);
+        let mut collector = PythonApiCollector::new(
+            "sys",
+            Path::new("sys.pyi"),
+            "sys.pyi".to_owned(),
+            source,
+            &limits,
+            &mut diagnostics,
+        );
+        collector.collect(tree.root_node(), None);
+        let returns = collector
+            .members
+            .iter()
+            .filter(|member| matches!(member.name.as_str(), "first" | "second"))
+            .map(|member| {
+                member
+                    .signature
+                    .as_ref()
+                    .and_then(|signature| signature.returns.as_ref())
+                    .cloned()
+                    .expect("fixture functions have return annotations")
+            })
+            .collect::<Vec<_>>();
         assert_eq!(
-            type_aliases(types, "pkg.case.TestCase"),
-            ["pkg.public.Public", "pkg.shim.TestCase"],
-            "named re-export chains retain the declaring class identity"
+            returns,
+            [
+                TypeRef::Named {
+                    name: "typing.NoReturn".to_owned(),
+                    arguments: Vec::new(),
+                    nullable: false,
+                },
+                TypeRef::Named {
+                    name: "typing.Never".to_owned(),
+                    arguments: Vec::new(),
+                    nullable: false,
+                },
+            ]
         );
+        drop(collector);
+        let (diagnostics, suppressed) = diagnostics.finish();
+        assert!(diagnostics.is_empty(), "{diagnostics:#?}");
+        assert_eq!(suppressed, SuppressedDiagnostics::default());
     }
 
     #[test]
-    fn cyclic_explicit_named_imports_do_not_publish_an_alias() {
-        let production = produce_stub_set(&[
-            (
-                "pkg/a.pyi",
-                "class Thing: ...\nfrom .b import Thing as Thing\n",
-            ),
-            ("pkg/b.pyi", "from .a import Thing as Thing\n"),
-        ]);
-        let (types, _) = declaration_facts(&production);
-        assert!(
-            type_aliases(types, "pkg.a.Thing").is_empty(),
-            "a cyclic binding graph has no stable canonical export"
-        );
-    }
-
-    #[test]
-    fn conflicting_module_surfaces_do_not_publish_an_export_alias() {
-        let production = produce_stub_set(&[
-            ("pkg.pyi", "from first import Item as Public\n"),
-            ("pkg/__init__.pyi", "from second import Item as Public\n"),
-            ("first.pyi", "class Item: ...\n"),
-            ("second.pyi", "class Item: ...\n"),
-        ]);
-        let (types, _) = declaration_facts(&production);
-        for name in ["first.Item", "second.Item"] {
-            assert!(
-                type_aliases(types, name).is_empty(),
-                "conflicting source surfaces must not publish alias pkg.Public on {name}"
-            );
-        }
-    }
-
-    #[test]
-    fn ambiguous_conditional_explicit_imports_do_not_publish_an_alias() {
-        let production = produce_stub_set(&[
-            (
-                "pkg/__init__.pyi",
-                "import sys\n\nif sys.platform == \"win32\":\n    from .case import TestCase as Public\nelse:\n    from .other import TestCase as Public\n",
-            ),
-            ("pkg/case.pyi", "class TestCase: ...\n"),
-            ("pkg/other.pyi", "class TestCase: ...\n"),
-        ]);
-        let (types, _) = declaration_facts(&production);
-        assert!(
-            type_aliases(types, "pkg.case.TestCase").is_empty()
-                && type_aliases(types, "pkg.other.TestCase").is_empty(),
-            "conditional rebindings remain ambiguous rather than becoming unconditional aliases"
-        );
-    }
-
-    const WILDCARD_IMPL: &str =
-        "from typing import MutableSet as MutableSet\n\nclass Own: ...\n\n_private: int\n";
-
-    #[test]
+    #[hardwon("#2958: wildcard re-export shims did not resolve their exported targets")]
     fn a_wildcard_shim_publishes_the_public_names_its_source_module_exports() {
         let production = produce_stub_set(&[
             ("shim.pyi", "from _impl import *\n"),
@@ -4790,6 +5006,7 @@ setup(name=\"fixture\", packages=[\"fixture\"], python_requires=\">=3.11\")
     }
 
     #[test]
+    #[hardwon("#2958: wildcard re-export shims did not resolve their exported targets")]
     fn a_literal_dunder_all_decides_what_a_wildcard_binds() {
         let production = produce_stub_set(&[
             ("shim.pyi", "from _impl import *\n"),
@@ -4813,6 +5030,7 @@ setup(name=\"fixture\", packages=[\"fixture\"], python_requires=\">=3.11\")
     }
 
     #[test]
+    #[hardwon("#2958: wildcard re-export shims did not resolve their exported targets")]
     fn a_wildcard_this_production_cannot_read_keeps_the_unenumerated_marker() {
         let outside = produce_stub_set(&[
             ("shim.pyi", "from outside import *\n"),
@@ -4843,6 +5061,7 @@ setup(name=\"fixture\", packages=[\"fixture\"], python_requires=\">=3.11\")
     }
 
     #[test]
+    #[hardwon("#2958: wildcard re-export shims did not resolve their exported targets")]
     fn wildcards_chain_to_the_same_declaring_targets() {
         let production = produce_stub_set(&[
             ("shim2.pyi", "from shim import *\n"),
@@ -4861,6 +5080,7 @@ setup(name=\"fixture\", packages=[\"fixture\"], python_requires=\">=3.11\")
     }
 
     #[test]
+    #[hardwon("#2958: wildcard re-export shims did not resolve their exported targets")]
     fn a_guarded_wildcard_carries_its_condition_onto_the_names_it_binds() {
         let production = produce_stub_set(&[
             (
@@ -4889,6 +5109,7 @@ setup(name=\"fixture\", packages=[\"fixture\"], python_requires=\">=3.11\")
     }
 
     #[test]
+    #[hardwon("#2958: wildcard re-export shims did not resolve their exported targets")]
     fn a_hierarchy_edge_through_a_wildcard_shim_names_the_declaring_class() {
         let production = produce_stub_set(&[
             ("shim.pyi", "from _impl import *\n"),
@@ -5027,60 +5248,6 @@ def run(
             );
             assert!(!parameters.iter().any(|parameter| parameter.variadic));
         }
-        drop(collector);
-        let (diagnostics, suppressed) = diagnostics.finish();
-        assert!(diagnostics.is_empty(), "{diagnostics:#?}");
-        assert_eq!(suppressed, SuppressedDiagnostics::default());
-    }
-
-    #[test]
-    fn stub_signature_qualifies_imported_return_annotations() {
-        let source = r#"import typing_extensions as t
-from typing import NoReturn as NR
-
-def first() -> NR: ...
-def second() -> t.Never: ...
-"#;
-        let tree = brokk_bifrost_python::declarations::parse_python_tree(source).unwrap();
-        let limits = ArtifactProducerLimits::default();
-        let mut diagnostics = BoundedProducerDiagnostics::new(&limits);
-        let mut collector = PythonApiCollector::new(
-            "sys",
-            Path::new("sys.pyi"),
-            "sys.pyi".to_owned(),
-            source,
-            &limits,
-            &mut diagnostics,
-        );
-        collector.collect(tree.root_node(), None);
-        let returns = collector
-            .members
-            .iter()
-            .filter(|member| matches!(member.name.as_str(), "first" | "second"))
-            .map(|member| {
-                member
-                    .signature
-                    .as_ref()
-                    .and_then(|signature| signature.returns.as_ref())
-                    .cloned()
-                    .expect("fixture functions have return annotations")
-            })
-            .collect::<Vec<_>>();
-        assert_eq!(
-            returns,
-            [
-                TypeRef::Named {
-                    name: "typing.NoReturn".to_owned(),
-                    arguments: Vec::new(),
-                    nullable: false,
-                },
-                TypeRef::Named {
-                    name: "typing.Never".to_owned(),
-                    arguments: Vec::new(),
-                    nullable: false,
-                },
-            ]
-        );
         drop(collector);
         let (diagnostics, suppressed) = diagnostics.finish();
         assert!(diagnostics.is_empty(), "{diagnostics:#?}");

@@ -66,9 +66,7 @@ pub(in crate::analyzer::store) fn decode_ordinary_node_kind(
 
 fn endpoint_lead(endpoint: &EndpointSignature) -> (Option<i64>, Option<i64>, bool) {
     endpoint
-        .symbols()
-        .fixed()
-        .first()
+        .first_fixed_symbol()
         .map_or((None, None, false), |symbol| {
             let (key, shared) = semantic_cells(symbol.symbol());
             (key, shared, symbol.scopes().is_some())

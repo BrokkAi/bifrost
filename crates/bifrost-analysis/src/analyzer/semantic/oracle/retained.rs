@@ -109,6 +109,15 @@ fn visit_retained_artifacts<'a>(
                 | AccessPathRoot::ModuleObject(locator)
                 | AccessPathRoot::External(locator) => visit(locator.scope()),
                 AccessPathRoot::RuntimeObject(_) => {}
+                AccessPathRoot::FieldPath { base, .. } => {
+                    stack.push(RetainedNode::AccessRoot(base));
+                }
+                AccessPathRoot::CallSubstitution {
+                    procedure, context, ..
+                } => {
+                    stack.push(RetainedNode::CallContext(context));
+                    stack.push(RetainedNode::Procedure(procedure));
+                }
             },
             RetainedNode::AccessPath(path) => {
                 for selector in path.selectors().iter().rev() {

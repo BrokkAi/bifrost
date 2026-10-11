@@ -7,7 +7,8 @@
 
 use std::sync::Arc;
 
-use brokk_bifrost_core::analyzer::prepared_syntax::{PreparedSyntaxSource, PreparedSyntaxTree};
+use brokk_bifrost_core::analyzer::common::try_node_source_text as node_text;
+use brokk_bifrost_core::analyzer::prepared_syntax::PreparedSyntaxTree;
 use brokk_bifrost_php::aliases::{PhpFileContextIndex, resolve_php_type};
 use brokk_bifrost_php::graph::syntax::{object_creation_type, variable_identifier};
 use tree_sitter::Node;
@@ -17,13 +18,12 @@ use crate::analyzer::lexical_definitions::formal_parameter_slots_for_owner_with_
 use crate::analyzer::semantic::type_flow::{
     ClassHierarchy, ClassIdentity, ClassSeed, ExternalClassCache, ExternalMemberDeclaration,
     MemberAccessKind, MemberAccessQuery, MemberDeclaration, MemberLookup, MemberLookupHit,
-    TypeFlowAdapter, UnknownReason, external_class_identity, file_for_locator,
-    validate_prepared_syntax_for_procedure,
+    TypeFlowAdapter, UnknownReason, accessed_member_locator, external_class_identity,
+    file_for_locator, node_at_span,
 };
 use crate::analyzer::semantic::{
-    AdapterSemanticsVersion, AllocationKind, AllocationSite, CandidateCoverage, MemoryLocationKind,
-    ProcedureHandle, SemanticCallSite, SemanticValue, SemanticValueKind, SourceMappingKind,
-    SourceSpan,
+    AdapterSemanticsVersion, AllocationKind, AllocationSite, CandidateCoverage, ProcedureHandle,
+    SemanticCallSite, SemanticValue, SemanticValueKind, SourceMappingKind,
 };
 use crate::analyzer::semantic_model::{
     SemanticModelOverlay, SemanticModelSymbol, SemanticModelSymbolKind,
@@ -36,7 +36,7 @@ use crate::analyzer::usages::receiver_analysis::ReceiverAnalysisBudget;
 use crate::analyzer::usages::reference_site::{ResolvedReferenceSite, node_range};
 use crate::analyzer::{
     AnalyzerQueryScope, CodeUnit, CodeUnitIndex, Language, ProjectFile, QueryScope,
-    TypeHierarchyProvider, WorkspaceAnalyzer, resolve_analyzer,
+    TypeHierarchyProvider, WorkspaceAnalyzer,
 };
 use crate::hash::HashSet;
 use crate::path_utils::rel_path_string;
@@ -44,15 +44,8 @@ use crate::path_utils::rel_path_string;
 pub(crate) struct PhpTypeFlowAdapter;
 
 fn php_analyzer(workspace: &WorkspaceAnalyzer) -> &PhpAnalyzer {
-    resolve_analyzer::<PhpAnalyzer>(workspace.analyzer())
+    super::resolve_php_analyzer(workspace)
         .expect("PhpTypeFlowAdapter serves only workspaces that analyze PHP")
-}
-
-fn overlay_of(workspace: &WorkspaceAnalyzer) -> Option<Arc<SemanticModelOverlay>> {
-    workspace
-        .analyzer()
-        .active_semantic_model_snapshot()
-        .and_then(|snapshot| snapshot.semantic_model_overlay().cloned())
 }
 
 fn prepared_for_procedure(
@@ -62,11 +55,19 @@ fn prepared_for_procedure(
 ) -> Result<Arc<PreparedSyntaxTree>, UnknownReason> {
     let php = php_analyzer(workspace);
     let scope = AnalyzerQueryScope::new(php);
-    let prepared = php
-        .inner
-        .prepared_syntax(scope.token(), file)
-        .ok_or(UnknownReason::UncertainFlow)?;
-    validate_prepared_syntax_for_procedure(workspace, procedure, file, prepared)
+    let prepared = php.inner.prepared_syntax(scope.token(), file);
+    crate::analyzer::semantic::type_flow::prepared_syntax_for_procedure(
+        workspace, procedure, file, prepared,
+    )
+}
+
+fn prepared_for_locator(
+    workspace: &WorkspaceAnalyzer,
+    procedure: &ProcedureHandle,
+    locator: &crate::analyzer::semantic::SemanticLocator,
+) -> Option<Result<Arc<PreparedSyntaxTree>, UnknownReason>> {
+    let file = file_for_locator(workspace, locator)?;
+    Some(prepared_for_procedure(workspace, procedure, &file))
 }
 
 fn current_indexed_prepared(
@@ -74,21 +75,10 @@ fn current_indexed_prepared(
     file: &ProjectFile,
 ) -> Option<Arc<PreparedSyntaxTree>> {
     let scope = AnalyzerQueryScope::new(php);
-    let prepared = php.inner.prepared_syntax(scope.token(), file)?;
-    (matches!(prepared.backing(), PreparedSyntaxSource::Indexed(_))
-        && php.indexed_source_matches(file, prepared.source()))
-    .then_some(prepared)
-}
-
-fn node_at_span(prepared: &PreparedSyntaxTree, span: SourceSpan) -> Option<Node<'_>> {
-    prepared
-        .tree()
-        .root_node()
-        .named_descendant_for_byte_range(span.start_byte() as usize, span.end_byte() as usize)
-}
-
-fn node_text<'source>(node: Node<'_>, source: &'source str) -> Option<&'source str> {
-    node.utf8_text(source.as_bytes()).ok()
+    crate::analyzer::semantic::type_flow::current_indexed_prepared(
+        php.inner.prepared_syntax(scope.token(), file),
+        |prepared| php.indexed_source_matches(file, prepared.source()),
+    )
 }
 
 fn nearest_call(node: Node<'_>) -> Option<Node<'_>> {
@@ -194,7 +184,7 @@ fn identity_from_lookup(
         [] => {
             let mut cache = ExternalClassCache::default();
             Ok(external_class_identity(
-                overlay_of(workspace).as_deref(),
+                workspace.analyzer().semantic_model_overlay().as_deref(),
                 Language::Php,
                 &lookup.fqn,
                 lookup.semantic_model_id.as_deref(),
@@ -211,13 +201,13 @@ fn reference_site(
     focus: Node<'_>,
     source: &str,
 ) -> Option<ResolvedReferenceSite> {
-    Some(ResolvedReferenceSite {
-        path: rel_path_string(file),
-        text: node_text(expression, source)?.to_owned(),
-        range: node_range(expression),
-        focus_start_byte: focus.start_byte(),
-        focus_end_byte: focus.end_byte(),
-    })
+    Some(crate::analyzer::usages::common::build_reference_site(
+        rel_path_string(file),
+        node_text(expression, source)?.to_owned(),
+        node_range(expression),
+        focus.start_byte(),
+        focus.end_byte(),
+    ))
 }
 
 fn resolve_constructor(
@@ -304,7 +294,7 @@ fn nominal_identity(workspace: &WorkspaceAnalyzer, fqn: &str) -> NominalIdentity
         [] => {
             let mut cache = ExternalClassCache::default();
             external_class_identity(
-                overlay_of(workspace).as_deref(),
+                workspace.analyzer().semantic_model_overlay().as_deref(),
                 Language::Php,
                 fqn,
                 None,
@@ -471,7 +461,7 @@ fn resolved_external_bases(
     unit: &CodeUnit,
     workspace_ancestors: &[CodeUnit],
 ) -> (Vec<ClassIdentity>, bool) {
-    let overlay = overlay_of(workspace);
+    let overlay = workspace.analyzer().semantic_model_overlay();
     let mut external_cache = ExternalClassCache::default();
     let mut external = Vec::new();
     let mut unresolved = false;
@@ -684,7 +674,7 @@ fn workspace_member_lookup(
     if workspace_magic_present(php, &all_workspace_owners, kind) {
         return MemberLookup::Unknown(UnknownReason::DynamicAttributes);
     }
-    let overlay = overlay_of(workspace);
+    let overlay = workspace.analyzer().semantic_model_overlay();
     for base in external_bases {
         let ClassIdentity::External { symbol_id, .. } = base else {
             unreachable!("resolved external bases retain external identities")
@@ -715,17 +705,12 @@ fn accessed_member(
     procedure: &ProcedureHandle,
     site: MemberAccessQuery<'_>,
 ) -> Option<Box<str>> {
-    let semantics = procedure.semantics();
     match site {
         MemberAccessQuery::Call(call) => {
-            let callee = semantics.value(call.callee)?;
-            let mapping = semantics.source_mapping(callee.source)?;
-            if mapping.kind != SourceMappingKind::Exact {
-                return None;
-            }
-            let file = file_for_locator(workspace, &mapping.locator)?;
+            let locator = accessed_member_locator(procedure, MemberAccessQuery::Call(call))?;
+            let file = file_for_locator(workspace, locator)?;
             let prepared = prepared_for_procedure(workspace, procedure, &file).ok()?;
-            let node = node_at_span(&prepared, mapping.locator.anchor().span())?;
+            let node = node_at_span(&prepared, locator.anchor().span())?;
             let call = nearest_call(node)?;
             if !matches!(
                 call.kind(),
@@ -741,12 +726,10 @@ fn accessed_member(
                 .map(Box::from)
         }
         MemberAccessQuery::Load(location) => {
-            let MemoryLocationKind::Field { member, .. } = &location.kind else {
-                return None;
-            };
-            let file = file_for_locator(workspace, member)?;
+            let locator = accessed_member_locator(procedure, MemberAccessQuery::Load(location))?;
+            let file = file_for_locator(workspace, locator)?;
             let prepared = prepared_for_procedure(workspace, procedure, &file).ok()?;
-            let node = node_at_span(&prepared, member.anchor().span())?;
+            let node = node_at_span(&prepared, locator.anchor().span())?;
             if node.kind() == "variable_name" {
                 let mut ancestor = node.parent();
                 while let Some(candidate) = ancestor {
@@ -861,10 +844,10 @@ impl TypeFlowAdapter for PhpTypeFlowAdapter {
         if mapping.kind != SourceMappingKind::Exact {
             return ClassSeed::Unknown(UnknownReason::UncertainFlow);
         }
-        let Some(file) = file_for_locator(workspace, &mapping.locator) else {
+        let Some(prepared) = prepared_for_locator(workspace, procedure, &mapping.locator) else {
             return ClassSeed::NotApplicable;
         };
-        if let Err(reason) = prepared_for_procedure(workspace, procedure, &file) {
+        if let Err(reason) = prepared {
             return ClassSeed::Unknown(reason);
         }
         ClassSeed::Unknown(UnknownReason::ScalarReceiver)
@@ -888,10 +871,10 @@ impl TypeFlowAdapter for PhpTypeFlowAdapter {
         if mapping.kind != SourceMappingKind::Exact {
             return ClassSeed::NotApplicable;
         }
-        let Some(file) = file_for_locator(workspace, &mapping.locator) else {
+        let Some(prepared) = prepared_for_locator(workspace, procedure, &mapping.locator) else {
             return ClassSeed::NotApplicable;
         };
-        let prepared = match prepared_for_procedure(workspace, procedure, &file) {
+        let prepared = match prepared {
             Ok(prepared) => prepared,
             Err(reason) => return ClassSeed::Unknown(reason),
         };
@@ -968,7 +951,7 @@ impl TypeFlowAdapter for PhpTypeFlowAdapter {
                 workspace_member_lookup(workspace, unit, kind, member)
             }
             ClassIdentity::External { symbol_id, .. } => {
-                let Some(overlay) = overlay_of(workspace) else {
+                let Some(overlay) = workspace.analyzer().semantic_model_overlay() else {
                     return MemberLookup::Unknown(UnknownReason::ExternalNotModeled);
                 };
                 external_member_lookup(&overlay, symbol_id, kind, member)
@@ -983,20 +966,14 @@ impl TypeFlowAdapter for PhpTypeFlowAdapter {
     ) -> Option<ClassIdentity> {
         let file = file_for_locator(workspace, procedure.semantics().locator())?;
         let span = procedure.semantics().locator().anchor().span();
-        let range = crate::analyzer::Range {
-            start_byte: span.start_byte() as usize,
-            end_byte: span.end_byte() as usize,
-            start_line: span.start().line() as usize,
-            end_line: span.end().line() as usize,
-        };
-        let mut unit = workspace.analyzer().enclosing_code_unit(&file, &range)?;
-        loop {
-            if unit.is_class() && runtime_workspace_class(workspace, php_analyzer(workspace), &unit)
-            {
-                return Some(ClassIdentity::Workspace(unit));
-            }
-            unit = workspace.analyzer().parent_of(&unit)?;
-        }
+        let php = php_analyzer(workspace);
+        crate::analyzer::semantic::type_flow::enclosing_workspace_class_unit(
+            workspace.analyzer(),
+            &file,
+            span,
+            |unit| runtime_workspace_class(workspace, php, unit),
+        )
+        .map(ClassIdentity::Workspace)
     }
 
     fn class_hierarchy(
@@ -1026,7 +1003,7 @@ impl TypeFlowAdapter for PhpTypeFlowAdapter {
         let mut dynamic_attributes =
             workspace_magic_present(php, &workspace_owners, MemberAccessKind::Call)
                 || workspace_magic_present(php, &workspace_owners, MemberAccessKind::Load);
-        if let Some(overlay) = overlay_of(workspace) {
+        if let Some(overlay) = workspace.analyzer().semantic_model_overlay() {
             for external in &external_ancestors {
                 let ClassIdentity::External { symbol_id, .. } = external else {
                     unreachable!("external ancestors retain external identities")
@@ -1072,15 +1049,18 @@ impl TypeFlowAdapter for PhpTypeFlowAdapter {
 
 #[cfg(test)]
 mod tests {
+    use brokk_bifrost_test_macros::hardwon;
+
     use super::{PhpTypeFlowAdapter, php_analyzer, prepared_for_procedure};
     use crate::analyzer::semantic::{
-        CancellationToken, ClassIdentity, SemanticBudget, SemanticRequest, TypeFlowAdapter,
-        UnknownReason,
+        ClassIdentity, SemanticBudget, SemanticRequest, TypeFlowAdapter, UnknownReason,
     };
     use crate::analyzer::{AnalyzerConfig, CodeUnitIndex, Language};
+    use crate::cancellation::CancellationToken;
     use crate::inline_project::InlineTestProject;
 
     #[test]
+    #[hardwon("5d0b844b64cc: prepared PHP syntax must reject changed source content")]
     fn prepared_syntax_validator_accepts_exact_php_and_rejects_changed_content() {
         let project = InlineTestProject::with_language(Language::Php)
             .file("app.php", "<?php\nfunction target(): int { return 1; }\n")
@@ -1118,7 +1098,6 @@ mod tests {
             UnknownReason::UncertainFlow
         );
     }
-
     #[test]
     fn only_a_structurally_final_php_class_has_a_closed_descendant_inventory() {
         let project = InlineTestProject::with_language(Language::Php)

@@ -4,7 +4,7 @@ use std::hash::Hash;
 
 use crate::analyzer::semantic::{
     CallSiteHandle, CallTransfer, DispatchBoundaryKind, EvidenceCompleteness, IcfgEdgeId,
-    IcfgEdgeKind, IcfgNodeId, IcfgSnapshot, ProgramPointHandle, ProofStatus,
+    IcfgEdgeKind, IcfgNodeId, IcfgSnapshot, OracleCallContext, ProgramPointHandle, ProofStatus,
 };
 use brokk_bifrost_core::analyzer::dense_id::define_dense_id;
 
@@ -59,10 +59,9 @@ pub trait DataflowOutput<T> {
 
 /// Procedure-local semantic edge for one transfer-function evaluation.
 ///
-/// The descriptor deliberately omits snapshot-local IDs and expanded call
-/// contexts. A bounded-snapshot runner and a later summary runner can
-/// therefore invoke the same transfer relation without making client
-/// semantics depend on one materialized call stack.
+/// Summary descriptors retain the bounded caller suffix used for dispatch.
+/// Snapshot-local coordinates remain confined to the frozen input; they never
+/// identify contextual summary capture associations.
 #[derive(Debug, Clone, Copy)]
 pub struct DataflowEdge<'graph, Fact = ()> {
     kind: IcfgEdgeKind,
@@ -74,6 +73,8 @@ pub struct DataflowEdge<'graph, Fact = ()> {
     boundary: Option<&'graph DispatchBoundaryKind>,
     call_transfer: Option<&'graph CallTransfer>,
     summary_entry_fact: Option<Fact>,
+    call_context: Option<&'graph OracleCallContext>,
+    snapshot_edge: Option<IcfgEdgeId>,
 }
 
 impl<'graph, Fact> DataflowEdge<'graph, Fact> {
@@ -95,6 +96,8 @@ impl<'graph, Fact> DataflowEdge<'graph, Fact> {
             boundary: None,
             call_transfer: None,
             summary_entry_fact: None,
+            call_context: None,
+            snapshot_edge: None,
         }
     }
 
@@ -131,7 +134,7 @@ impl<'graph, Fact> DataflowEdge<'graph, Fact> {
         let edge = snapshot.edge(edge_id)?;
         let source = snapshot.node(edge.source)?;
         let target = snapshot.node(edge.target)?;
-        let descriptor = Self::new(
+        let mut descriptor = Self::new(
             edge.kind,
             edge.origin.as_ref(),
             source.point(),
@@ -139,6 +142,7 @@ impl<'graph, Fact> DataflowEdge<'graph, Fact> {
             &edge.proof,
             &edge.completeness,
         );
+        descriptor.snapshot_edge = Some(edge_id);
         Some(match edge.boundary.as_ref() {
             Some(boundary) => descriptor.with_boundary(boundary),
             None => descriptor,
@@ -178,8 +182,23 @@ impl<'graph, Fact> DataflowEdge<'graph, Fact> {
         self.call_transfer
     }
 
+    /// Exact edge identity within the snapshot that supplied this descriptor.
+    /// Summary descriptors leave it absent; contextual flow cannot replay there.
+    pub(crate) const fn snapshot_edge(&self) -> Option<IcfgEdgeId> {
+        self.snapshot_edge
+    }
+
     pub const fn summary_entry_fact(&self) -> Option<&Fact> {
         self.summary_entry_fact.as_ref()
+    }
+
+    pub(crate) const fn with_call_context(mut self, context: &'graph OracleCallContext) -> Self {
+        self.call_context = Some(context);
+        self
+    }
+
+    pub(crate) const fn call_context(&self) -> Option<&'graph OracleCallContext> {
+        self.call_context
     }
 }
 
@@ -224,6 +243,16 @@ pub trait DistributiveDataflowProblem {
     /// retained for completion accounting; only the interprocedural descent
     /// is suppressed, because the model is the call's whole behavior.
     fn call_replaced_by_model(&self, _call: &CallSiteHandle) -> bool {
+        false
+    }
+
+    /// Whether the model replacing this call is proven and complete in
+    /// every transfer it states (#3757). Such a model is the call's whole
+    /// behavior at the derived tier, so the solver crosses the call on the
+    /// caller's own continuation scaffolding, proven and complete, instead
+    /// of on the dispatch boundary's edges. The boundary is still retained
+    /// for completion accounting.
+    fn call_replaced_by_proven_model(&self, _call: &CallSiteHandle) -> bool {
         false
     }
 

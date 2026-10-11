@@ -1,0 +1,288 @@
+{
+  "schema_version": 2,
+  "pack_id": "bifrost.rust-tokio-fs",
+  "version": "0.1.0",
+  "producer": {
+    "name": "bifrost-reviewed-rust-codeql-parity-models",
+    "version": "0.1.0"
+  },
+  "language": "rust",
+  "ecosystem": "cargo",
+  "compatibility": {
+    "bifrost": ">=0.12.0, <1.0.0",
+    "toolchains": []
+  },
+  "provenance": {
+    "source": "Stubbed tokio filesystem APIs used by the Rust path-injection parity fixture; async lowering is deferred to #3851.",
+    "revision": "tokio-api-shape; CodeQL ae741615f3e178ce61289a651790dc67fcc18e19"
+  },
+  "license": "Apache-2.0",
+  "completeness": "complete",
+  "safety": {
+    "generated_code_only": false,
+    "review_required": false
+  },
+  "shards": [
+    {
+      "id": "declarations.bifrost.rust-tokio-fs",
+      "activation": [
+        {
+          "targets": [],
+          "configurations": []
+        }
+      ],
+      "payload": {
+        "kind": "declaration_facts",
+        "types": [
+          {
+            "id": "type.rust-codeql.tokio",
+            "name": "tokio",
+            "type_kind": "module",
+            "visibility": "public",
+            "locator": {
+              "kind": "artifact",
+              "path": "src/lib.rs",
+              "symbol": "tokio"
+            }
+          },
+          {
+            "id": "type.rust-codeql.tokio-fs",
+            "name": "tokio.fs",
+            "type_kind": "module",
+            "visibility": "public",
+            "locator": {
+              "kind": "artifact",
+              "path": "src/lib.rs",
+              "symbol": "tokio.fs"
+            }
+          },
+          {
+            "id": "type.rust-codeql.tokio-fs-file",
+            "name": "tokio.fs.File",
+            "type_kind": "struct",
+            "visibility": "public",
+            "locator": {
+              "kind": "artifact",
+              "path": "src/lib.rs",
+              "symbol": "tokio.fs.File"
+            }
+          }
+        ],
+        "members": [
+          {
+            "id": "member.rust-codeql.tokio-fs-read",
+            "owner": "type.rust-codeql.tokio-fs",
+            "name": "read",
+            "member_kind": "method",
+            "visibility": "public",
+            "is_static": true,
+            "callable_family_complete": true,
+            "signature": {
+              "parameters": [
+                {
+                  "name": "path",
+                  "type": {
+                    "kind": "named",
+                    "name": "untyped"
+                  }
+                }
+              ]
+            },
+            "locator": {
+              "kind": "artifact",
+              "path": "src/lib.rs",
+              "symbol": "tokio.fs.read"
+            }
+          },
+          {
+            "id": "member.rust-codeql.tokio-fs-write",
+            "owner": "type.rust-codeql.tokio-fs",
+            "name": "write",
+            "member_kind": "method",
+            "visibility": "public",
+            "is_static": true,
+            "callable_family_complete": true,
+            "signature": {
+              "parameters": [
+                {
+                  "name": "path",
+                  "type": {
+                    "kind": "named",
+                    "name": "untyped"
+                  }
+                },
+                {
+                  "name": "contents",
+                  "type": {
+                    "kind": "named",
+                    "name": "untyped"
+                  }
+                }
+              ]
+            },
+            "locator": {
+              "kind": "artifact",
+              "path": "src/lib.rs",
+              "symbol": "tokio.fs.write"
+            }
+          },
+          {
+            "id": "member.rust-codeql.tokio-fs-remove-file",
+            "owner": "type.rust-codeql.tokio-fs",
+            "name": "remove_file",
+            "member_kind": "method",
+            "visibility": "public",
+            "is_static": true,
+            "callable_family_complete": true,
+            "signature": {
+              "parameters": [
+                {
+                  "name": "path",
+                  "type": {
+                    "kind": "named",
+                    "name": "untyped"
+                  }
+                }
+              ]
+            },
+            "locator": {
+              "kind": "artifact",
+              "path": "src/lib.rs",
+              "symbol": "tokio.fs.remove_file"
+            }
+          },
+          {
+            "id": "member.rust-codeql.tokio-fs-create-dir-all",
+            "owner": "type.rust-codeql.tokio-fs",
+            "name": "create_dir_all",
+            "member_kind": "method",
+            "visibility": "public",
+            "is_static": true,
+            "callable_family_complete": true,
+            "signature": {
+              "parameters": [
+                {
+                  "name": "path",
+                  "type": {
+                    "kind": "named",
+                    "name": "untyped"
+                  }
+                }
+              ]
+            },
+            "locator": {
+              "kind": "artifact",
+              "path": "src/lib.rs",
+              "symbol": "tokio.fs.create_dir_all"
+            }
+          },
+          {
+            "id": "member.rust-codeql.tokio-fs-file-open",
+            "owner": "type.rust-codeql.tokio-fs-file",
+            "name": "open",
+            "member_kind": "method",
+            "visibility": "public",
+            "is_static": true,
+            "callable_family_complete": true,
+            "signature": {
+              "parameters": [
+                {
+                  "name": "path",
+                  "type": {
+                    "kind": "named",
+                    "name": "untyped"
+                  }
+                }
+              ]
+            },
+            "locator": {
+              "kind": "artifact",
+              "path": "src/lib.rs",
+              "symbol": "tokio.fs.File.open"
+            }
+          }
+        ],
+        "relations": []
+      }
+    },
+    {
+      "id": "summaries.bifrost.rust-tokio-fs",
+      "activation": [
+        {
+          "targets": [],
+          "configurations": []
+        }
+      ],
+      "payload": {
+        "kind": "procedure_summaries",
+        "summaries": [
+          {
+            "id": "summary.rust-codeql.tokio-fs-read",
+            "target": {
+              "path": "src/lib.rs",
+              "symbol": "tokio.fs.read",
+              "has_receiver": false,
+              "parameter_count": 1
+            },
+            "completeness": "complete",
+            "locations": [],
+            "transfers": [],
+            "effects": []
+          },
+          {
+            "id": "summary.rust-codeql.tokio-fs-write",
+            "target": {
+              "path": "src/lib.rs",
+              "symbol": "tokio.fs.write",
+              "has_receiver": false,
+              "parameter_count": 2
+            },
+            "completeness": "complete",
+            "locations": [],
+            "transfers": [],
+            "effects": []
+          },
+          {
+            "id": "summary.rust-codeql.tokio-fs-remove-file",
+            "target": {
+              "path": "src/lib.rs",
+              "symbol": "tokio.fs.remove_file",
+              "has_receiver": false,
+              "parameter_count": 1
+            },
+            "completeness": "complete",
+            "locations": [],
+            "transfers": [],
+            "effects": []
+          },
+          {
+            "id": "summary.rust-codeql.tokio-fs-create-dir-all",
+            "target": {
+              "path": "src/lib.rs",
+              "symbol": "tokio.fs.create_dir_all",
+              "has_receiver": false,
+              "parameter_count": 1
+            },
+            "completeness": "complete",
+            "locations": [],
+            "transfers": [],
+            "effects": []
+          },
+          {
+            "id": "summary.rust-codeql.tokio-fs-file-open",
+            "target": {
+              "path": "src/lib.rs",
+              "symbol": "tokio.fs.File.open",
+              "has_receiver": false,
+              "parameter_count": 1
+            },
+            "completeness": "complete",
+            "locations": [],
+            "transfers": [],
+            "effects": []
+          }
+        ]
+      }
+    }
+  ]
+}

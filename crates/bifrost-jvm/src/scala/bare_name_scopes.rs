@@ -24,9 +24,8 @@
 
 use std::collections::HashMap;
 
+use brokk_bifrost_core::analyzer::common::nonempty_node_source_text as identifier_text;
 use tree_sitter::Node;
-
-use crate::scala::graph::syntax::node_text;
 
 /// Template (class/object/trait/enum) declaration kinds that own members.
 const TEMPLATE_KINDS: [&str; 4] = [
@@ -125,8 +124,7 @@ impl ScalaBareNameDeclarationScopes {
 /// it opens into its own body.
 fn collect_templates(root: Node<'_>, source: &str) -> Vec<ScalaTemplate> {
     let mut templates = Vec::new();
-    let mut stack = vec![root];
-    while let Some(node) = stack.pop() {
+    walk_named_tree_reverse_preorder(root, |node| {
         if TEMPLATE_KINDS.contains(&node.kind())
             && let Some(name) = node
                 .child_by_field_name("name")
@@ -139,11 +137,7 @@ fn collect_templates(root: Node<'_>, source: &str) -> Vec<ScalaTemplate> {
                 opens: template_opens(node, source),
             });
         }
-        let mut cursor = node.walk();
-        for child in node.named_children(&mut cursor) {
-            stack.push(child);
-        }
-    }
+    });
     templates
 }
 
@@ -246,8 +240,7 @@ fn collect_declarations(
     templates: &[ScalaTemplate],
 ) -> Vec<(String, ScalaDeclarationOwner)> {
     let mut declarations = Vec::new();
-    let mut stack = vec![root];
-    while let Some(node) = stack.pop() {
+    walk_named_tree_reverse_preorder(root, |node| {
         if !TYPE_ONLY_DECLARATION_KINDS.contains(&node.kind()) {
             let names = declaration_names(node, source);
             if let Some(owner) = (!names.is_empty())
@@ -257,12 +250,19 @@ fn collect_declarations(
                 declarations.extend(names.into_iter().map(|name| (name, owner)));
             }
         }
+    });
+    declarations
+}
+
+fn walk_named_tree_reverse_preorder<'tree>(root: Node<'tree>, mut visit: impl FnMut(Node<'tree>)) {
+    let mut stack = vec![root];
+    while let Some(node) = stack.pop() {
+        visit(node);
         let mut cursor = node.walk();
         for child in node.named_children(&mut cursor) {
             stack.push(child);
         }
     }
-    declarations
 }
 
 /// The scope a declaration node belongs to, or `None` when the enclosing
@@ -327,14 +327,10 @@ fn named_segments(node: Node<'_>, source: &str) -> Vec<String> {
     names
 }
 
-fn identifier_text(node: Node<'_>, source: &str) -> Option<String> {
-    let text = node_text(node, source).trim();
-    (!text.is_empty()).then(|| text.to_string())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use brokk_bifrost_test_macros::hardwon;
     use tree_sitter::Parser;
 
     fn build(source: &str) -> ScalaBareNameDeclarationScopes {
@@ -351,6 +347,9 @@ mod tests {
     }
 
     #[test]
+    #[hardwon(
+        "#1783: Scala FIRD census bindability falsely counted declarations that a bare name cannot bind"
+    )]
     fn a_type_member_never_binds_a_bare_name() {
         let source = concat!(
             "trait Combine[A1] {\n",
@@ -365,6 +364,9 @@ mod tests {
     }
 
     #[test]
+    #[hardwon(
+        "#1783: Scala FIRD census bindability falsely counted declarations that a bare name cannot bind"
+    )]
     fn a_member_of_an_unrelated_template_does_not_bind() {
         let source = concat!(
             "final class Oneshot[A](var more: () => Int)\n",
@@ -384,6 +386,9 @@ mod tests {
     }
 
     #[test]
+    #[hardwon(
+        "#1783: Scala FIRD census bindability falsely counted declarations that a bare name cannot bind"
+    )]
     fn file_scope_supertype_self_type_and_import_members_bind() {
         let source = concat!(
             "trait Tokens { def ws(): Boolean = true }\n",
@@ -408,6 +413,9 @@ mod tests {
     }
 
     #[test]
+    #[hardwon(
+        "#1783: Scala FIRD census bindability falsely counted declarations that a bare name cannot bind"
+    )]
     fn an_enclosing_template_member_binds_a_nested_site() {
         let source = concat!(
             "object Outer {\n",
@@ -424,6 +432,9 @@ mod tests {
     }
 
     #[test]
+    #[hardwon(
+        "#1783: Scala FIRD census bindability falsely counted declarations that a bare name cannot bind"
+    )]
     fn a_local_binder_is_not_a_published_declaration() {
         let source = concat!(
             "object Runner {\n",

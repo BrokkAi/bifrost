@@ -81,7 +81,7 @@ normalized_kinds! {
     Import => "import": "Match an import declaration.",
     Parameter => "parameter": "Match a formal parameter declaration.",
     Module => "module": "Match a module or namespace declaration.",
-    // expression-ish kinds (kept flat; see ExecPlan decision log)
+    // expression-ish kinds
     Call => "call": "Match call expressions for functions, methods, or constructors.",
     ConcurrentSpawn => "concurrent_spawn": "Match a structured operation that starts a callable in a distinct concurrent task.",
     ResourceRelease => "resource_release": "Match a language construct that releases a resource at its own exit, such as a Java try-with-resources statement or a Python with statement.",
@@ -113,6 +113,54 @@ normalized_kinds! {
     WhileLoop => "while_loop": "Match a condition-controlled loop (while, do-while, or until).",
     Decorator => "decorator": "Match a decorator or annotation.",
     Block => "block": "Match a statement list that forms a lexical scope of its own, such as a method body, a bare block, or a switch body.",
+    // Origin appended Await before this branch appended its local-only kinds.
+    Await => "await": "Match an await expression that suspends asynchronous execution.",
+    // Keep additions at the end: normalized kind ordinals are persisted.
+    Comment => "comment": "Match a source comment token.",
+    SyntaxError => "syntax_error": "Match a source span reported by parser error recovery.",
+    // Comparison is a subtype of BinaryExpression; ComparisonChain is a
+    // subtype of Comparison so queries can select chains without pair roles.
+    BinaryExpression => "binary_expression": "Match a binary expression with grammar-backed left, right, and operator roles.",
+    Comparison => "comparison": "Match a comparison expression, including a pairwise comparison in a comparison chain.",
+    ComparisonChain => "comparison_chain": "Match a chained comparison whose pairwise operands and operators are not exposed as singular roles.",
+    Assertion => "assertion": "Match an assertion statement.",
+    // These synthetic facts describe a decoded Python regex value selected
+    // from a recognized `re` call. Appending them preserves existing ordinals.
+    RegexPattern => "regex_pattern": "Match a decoded Python regular-expression pattern value.",
+    RegexSequence => "regex_sequence": "Match a sequence of Python regular-expression terms.",
+    RegexGroup => "regex_group": "Match a group in a Python regular-expression pattern.",
+    RegexAlternation => "regex_alternation": "Match an alternation in a Python regular-expression pattern.",
+    RegexCharacterClass => "regex_character_class": "Match a character class in a Python regular-expression pattern.",
+    RegexCharacterRange => "regex_character_range": "Match a character range in a Python regular-expression class.",
+    RegexQuantifier => "regex_quantifier": "Match a quantifier in a Python regular-expression pattern.",
+    RegexAnchor => "regex_anchor": "Match an anchor or boundary escape in a Python regular-expression pattern.",
+    RegexEscape => "regex_escape": "Match an escape in a Python regular-expression pattern.",
+    RegexLiteral => "regex_literal": "Match a literal character in a Python regular-expression pattern.",
+    RegexWildcard => "regex_wildcard": "Match a wildcard atom in a Python regular-expression pattern.",
+    RegexRiskHostname => "regex_risk_hostname": "Match an unescaped-dot fact in a hostname-like regex pattern.",
+    RegexRiskRange => "regex_risk_range": "Match an overly broad ASCII character-range fact.",
+    RegexRiskBadTag => "regex_risk_bad_tag": "Match a bounded HTML tag-filter language-coverage risk.",
+    RegexRiskExponential => "regex_risk_exponential": "Match a statically identified exponential backtracking risk.",
+    RegexIncomplete => "regex_incomplete": "Match a regex analysis that could not establish a complete result.",
+    RegexRiskBackspaceEscape => "regex_risk_backspace_escape": "Match a backspace escape inside a Python regex character class.",
+    RegexRiskDuplicateClassCharacter => "regex_risk_duplicate_class_character": "Match a duplicate literal member in a Python regex character class.",
+    RegexRiskUnmatchableCaret => "regex_risk_unmatchable_caret": "Match a caret anchor that follows a consuming term in one regex branch.",
+    RegexRiskUnmatchableDollar => "regex_risk_unmatchable_dollar": "Match a dollar anchor that precedes a consuming term in one regex branch.",
+    RegexRiskIncompleteSpecialGroup => "regex_risk_incomplete_special_group": "Match an unsupported or incomplete Python regex special group.",
+    // Appended because kind ordinals are persisted.
+    TupleLiteral => "tuple_literal": "Match a tuple display literal, preserving tuple identity and ordered elements.",
+    ListLiteral => "list_literal": "Match a list display literal, preserving its ordered direct elements.",
+    RegexRiskPolynomial => "regex_risk_polynomial": "Match a statically identified polynomial-time Python regex backtracking risk.",
+    // Keep C and C++ statement kinds after the origin additions: normalized
+    // kind ordinals are persisted.
+    Switch => "switch": "Match a switch statement.",
+    Case => "case": "Match a switch case or default label.",
+    Label => "label": "Match a labeled statement target.",
+    Goto => "goto": "Match a goto statement.",
+    Break => "break": "Match a break statement.",
+    Continue => "continue": "Match a continue statement.",
+    CharacterLiteral => "character_literal": "Match a character literal.",
+    Yield => "yield": "Match a Python yield expression that suspends generator execution.",
 }
 
 impl NormalizedKind {
@@ -123,14 +171,60 @@ impl NormalizedKind {
         match self {
             Callable | Class | Import | Parameter | Module => Some(Declaration),
             Function | Method | Constructor | Lambda => Some(Callable),
-            StringLiteral | NumericLiteral | BooleanLiteral | NullLiteral | CollectionLiteral => {
-                Some(Literal)
-            }
+            StringLiteral | NumericLiteral | BooleanLiteral | NullLiteral | CharacterLiteral
+            | CollectionLiteral => Some(Literal),
+            TupleLiteral | ListLiteral => Some(CollectionLiteral),
             ForLoop | WhileLoop => Some(Loop),
-            Declaration | Call | ConcurrentSpawn | Assignment | FieldAccess | Identifier
-            | Literal | ResourceRelease | Return | Throw | Catch | If | Loop | Decorator
-            | Block | JsxElement | JsxAttribute | JsxSpreadAttribute | ObjectProperty
-            | ComputedProperty | SpreadElement => None,
+            ConcurrentSpawn => Some(Call),
+            Comparison => Some(BinaryExpression),
+            ComparisonChain => Some(Comparison),
+            RegexSequence | RegexGroup | RegexAlternation | RegexCharacterClass
+            | RegexCharacterRange | RegexQuantifier | RegexAnchor | RegexEscape | RegexLiteral
+            | RegexWildcard => Some(RegexPattern),
+            Declaration
+            | Call
+            | Assignment
+            | FieldAccess
+            | Identifier
+            | Literal
+            | ResourceRelease
+            | Return
+            | Throw
+            | Catch
+            | If
+            | Loop
+            | Decorator
+            | Block
+            | JsxElement
+            | JsxAttribute
+            | JsxSpreadAttribute
+            | ObjectProperty
+            | ComputedProperty
+            | SpreadElement
+            | Comment
+            | SyntaxError
+            | BinaryExpression
+            | Assertion
+            | RegexPattern
+            | RegexRiskHostname
+            | RegexRiskRange
+            | RegexRiskBadTag
+            | RegexRiskExponential
+            | RegexIncomplete
+            | RegexRiskBackspaceEscape
+            | RegexRiskDuplicateClassCharacter
+            | RegexRiskUnmatchableCaret
+            | RegexRiskUnmatchableDollar
+            | RegexRiskIncompleteSpecialGroup
+            | RegexRiskPolynomial
+            | Await
+            | Switch
+            | Case
+            | Label
+            | Goto
+            | Break
+            | Continue => None,
+            Yield => None,
         }
     }
 
@@ -146,6 +240,46 @@ impl NormalizedKind {
             current = kind.parent();
         }
         false
+    }
+
+    /// Whether a fact of this kind is a statement-level construct, which
+    /// occurs only in executable code: a conditional, a loop, a return, a
+    /// throw, a handler or a resource release.
+    ///
+    /// Syntax recovery that removes such a node can only hide it inside a
+    /// callable, so a recovered region outside every callable leaves a
+    /// selection of these kinds complete (#3777). Every other kind can also
+    /// occur in an initializer, an annotation, a default value or a
+    /// declaration list, so any recovered region in the file can hide it.
+    /// The subtypes of `loop` are statement-level with it.
+    pub fn is_statement_level(self) -> bool {
+        use NormalizedKind::*;
+        match self {
+            If | Loop | ForLoop | WhileLoop | Return | Throw | Catch | ResourceRelease
+            | Assertion | Switch | Case | Label | Goto | Break | Continue => true,
+            Declaration | Callable | Function | Method | Constructor | Lambda | Class | Import
+            | Parameter | Module | Call | ConcurrentSpawn | Assignment | FieldAccess
+            | Identifier | Literal | StringLiteral | NumericLiteral | BooleanLiteral
+            | NullLiteral | CharacterLiteral | CollectionLiteral | TupleLiteral | ListLiteral
+            | JsxElement | JsxAttribute | JsxSpreadAttribute | ObjectProperty
+            | ComputedProperty | SpreadElement | Decorator | Block | RegexPattern
+            | RegexSequence | RegexGroup | RegexAlternation | RegexCharacterClass
+            | RegexCharacterRange | RegexQuantifier | RegexAnchor | RegexEscape | RegexLiteral
+            | RegexWildcard | RegexRiskHostname | RegexRiskRange | RegexRiskBadTag
+            | RegexRiskExponential | RegexIncomplete => false,
+            RegexRiskBackspaceEscape
+            | RegexRiskDuplicateClassCharacter
+            | RegexRiskUnmatchableCaret
+            | RegexRiskUnmatchableDollar
+            | RegexRiskIncompleteSpecialGroup
+            | RegexRiskPolynomial
+            | Comment
+            | SyntaxError
+            | BinaryExpression
+            | Comparison
+            | ComparisonChain => false,
+            Await | Yield => false,
+        }
     }
 }
 
@@ -238,9 +372,9 @@ roles! {
     Receiver => "receiver": Pattern, "Constrain the receiver of a method call.",
     Arg => "args": PatternList, "Constrain positional arguments in order.",
     Kwarg => "kwargs": PatternMap, "Constrain named arguments by argument name.",
-    Left => "left": Pattern, "Constrain the left-hand side of an assignment.",
-    Right => "right": Pattern, "Constrain the right-hand side of an assignment.",
-    Operator => "operator": Pattern, "Constrain the grammar-backed assignment operator token.",
+    Left => "left": Pattern, "Constrain the left-hand side of an assignment or binary expression.",
+    Right => "right": Pattern, "Constrain the right-hand side of an assignment or binary expression.",
+    Operator => "operator": Pattern, "Constrain the grammar-backed assignment or binary operator token.",
     Module => "module": Pattern, "Constrain the module referenced by an import.",
     Decorator => "decorators": PatternList, "Constrain decorators or annotations in order.",
     Object => "object": Pattern, "Constrain the object of a field access.",
@@ -252,6 +386,10 @@ roles! {
     Children => "children": PatternList, "Constrain the source children of a JSX element in source order.",
     Value => "value": Pattern, "Constrain the exact value expression of an attribute, property, or spread.",
     Key => "key": Pattern, "Constrain the static key of an object property.",
+    TypeArguments => "type-arguments": PatternList, "Constrain the written generic type arguments of a call callee.",
+    Part => "parts": PatternList, "Constrain the literal parts of an implicitly concatenated string in order.",
+    // Appended to preserve persisted role ordinals.
+    Test => "test": Pattern, "Constrain the expression tested by an assertion or conditional.",
 }
 
 pub const SINGLE_TARGET_ROLES: &[Role] = &[
@@ -267,6 +405,7 @@ pub const SINGLE_TARGET_ROLES: &[Role] = &[
     Role::Tag,
     Role::Value,
     Role::Key,
+    Role::Test,
 ];
 
 pub const LIST_TARGET_ROLES: &[Role] = &[
@@ -275,6 +414,8 @@ pub const LIST_TARGET_ROLES: &[Role] = &[
     Role::Element,
     Role::Attributes,
     Role::Children,
+    Role::TypeArguments,
+    Role::Part,
 ];
 
 pub const MAP_TARGET_ROLES: &[Role] = &[Role::Kwarg];
@@ -302,7 +443,10 @@ impl Role {
             Role::Callee | Role::Receiver | Role::Arg | Role::Kwarg => {
                 matches!(kind, Call | ConcurrentSpawn)
             }
-            Role::Left | Role::Right | Role::Operator => kind == Assignment,
+            Role::Left | Role::Right | Role::Operator => matches!(
+                kind,
+                Assignment | BinaryExpression | Comparison | ComparisonChain
+            ),
             Role::Module => matches!(kind, Import | Declaration),
             Role::Decorator => matches!(
                 kind,
@@ -321,8 +465,12 @@ impl Role {
             // constraining it on `loop`/`while_loop` would silently narrow a
             // query to for-loops while reading as if it covered every loop.
             Role::Iterable => kind == ForLoop,
-            Role::Element => kind == CollectionLiteral,
+            Role::Element => matches!(kind, CollectionLiteral | TupleLiteral | ListLiteral),
+            Role::Part => kind == StringLiteral,
             Role::Tag | Role::Attributes | Role::Children => kind == JsxElement,
+            // Type arguments are written on a call callee, including a
+            // turbofish on a scoped type path.
+            Role::TypeArguments => matches!(kind, Call | ConcurrentSpawn),
             Role::Value => matches!(
                 kind,
                 JsxAttribute
@@ -330,8 +478,11 @@ impl Role {
                     | ObjectProperty
                     | ComputedProperty
                     | SpreadElement
+                    | Return
+                    | Throw
             ),
             Role::Key => kind == ObjectProperty,
+            Role::Test => matches!(kind, Assertion | If),
         }
     }
 }
@@ -365,6 +516,9 @@ mod tests {
         assert!(Lambda.satisfies(Callable));
         assert!(Class.satisfies(Declaration));
         assert!(Import.satisfies(Declaration));
+        assert!(Comparison.satisfies(BinaryExpression));
+        assert!(ComparisonChain.satisfies(Comparison));
+        assert!(ComparisonChain.satisfies(BinaryExpression));
         assert!(Parameter.satisfies(Declaration));
         assert!(Module.satisfies(Declaration));
         assert!(!Module.satisfies(Class));
@@ -377,6 +531,8 @@ mod tests {
         assert!(!Literal.satisfies(StringLiteral));
         assert!(!Callable.satisfies(Function));
         assert!(!Call.satisfies(Declaration));
+        assert!(ConcurrentSpawn.satisfies(Call));
+        assert!(ConcurrentSpawn.satisfies(ConcurrentSpawn));
         assert!(!Identifier.satisfies(Literal));
         assert!(!Loop.satisfies(ForLoop));
         assert!(!ForLoop.satisfies(WhileLoop));
@@ -396,17 +552,31 @@ mod tests {
     }
 
     #[test]
+    fn assertions_are_statement_level_comparisons_are_not() {
+        assert!(NormalizedKind::Assertion.is_statement_level());
+        assert!(!NormalizedKind::Comparison.is_statement_level());
+    }
+
+    #[test]
     fn role_validity_is_kind_scoped() {
         use NormalizedKind::*;
         assert!(Role::Callee.valid_for(Call));
         assert!(!Role::Callee.valid_for(Assignment));
         assert!(Role::Left.valid_for(Assignment));
+        assert!(Role::Left.valid_for(BinaryExpression));
+        assert!(Role::Right.valid_for(Comparison));
+        assert!(Role::Operator.valid_for(ComparisonChain));
+        assert!(Role::Test.valid_for(Assertion));
+        assert!(Role::Test.valid_for(If));
+        assert!(Role::Value.valid_for(Return));
         assert!(!Role::Left.valid_for(Call));
         assert!(Role::Decorator.valid_for(Function));
         assert!(Role::Decorator.valid_for(Class));
         assert!(Role::Decorator.valid_for(Parameter));
         assert!(Role::Decorator.valid_for(Declaration));
         assert!(!Role::Decorator.valid_for(Call));
+        assert!(Role::TypeArguments.valid_for(Call));
+        assert!(!Role::TypeArguments.valid_for(Assignment));
         assert!(Role::Module.valid_for(Import));
         assert!(Role::Object.valid_for(FieldAccess));
         assert!(!Role::Object.valid_for(Identifier));

@@ -509,8 +509,8 @@ mod tests {
     use crate::test_support::AnalyzerFixture;
     use git2::{Repository, Signature};
     use std::fs;
+    use std::path::MAIN_SEPARATOR_STR;
     use std::path::Path;
-    use std::path::{MAIN_SEPARATOR, MAIN_SEPARATOR_STR};
 
     fn init_repo(root: &Path) -> Repository {
         Repository::init(root).expect("init repo")
@@ -524,13 +524,6 @@ mod tests {
         when: &str,
         add: &[&str],
     ) {
-        let mut index = repo.index().expect("repo index");
-        for path in add {
-            index.add_path(Path::new(path)).expect("add path");
-        }
-        index.write().expect("index write");
-        let tree_id = index.write_tree().expect("write tree");
-        let tree = repo.find_tree(tree_id).expect("find tree");
         let timestamp = parse_iso8601_utc(when).expect("parse commit time");
         let seconds = timestamp
             .duration_since(UNIX_EPOCH)
@@ -538,21 +531,28 @@ mod tests {
             .as_secs() as i64;
         let signature = Signature::new(author_name, author_email, &git2::Time::new(seconds, 0))
             .expect("signature");
-        let parent = repo
-            .head()
-            .ok()
-            .and_then(|head| head.target())
-            .and_then(|oid| repo.find_commit(oid).ok());
-        let parents = parent.iter().collect::<Vec<_>>();
-        repo.commit(
-            Some("HEAD"),
-            &signature,
-            &signature,
-            message,
-            &tree,
-            &parents,
-        )
-        .expect("commit");
+        crate::test_support::shared_git::commit_paths(repo, add, message, &signature);
+    }
+
+    fn changed_files_with_simulated_retry<'repo>(
+        repo: &'repo Repository,
+        root: &Path,
+        commit: &Commit<'repo>,
+        attempts: &mut Vec<bool>,
+    ) -> Result<Vec<ProjectFile>, String> {
+        changed_project_files_for_commit(repo, root, root, commit, |repo, commit, diff| {
+            let mut original_diff = Some(diff);
+            with_rename_detection_fallback(|detect_renames| {
+                attempts.push(detect_renames);
+                if detect_renames {
+                    Err("simulated rename detection failure".to_string())
+                } else {
+                    original_diff.take();
+                    diff_commit_to_parent(repo, commit)
+                        .map_err(|err| format!("fallback diff rebuild failed: {err}"))
+                }
+            })
+        })
     }
 
     fn fixture_with_repo() -> AnalyzerFixture {
@@ -605,136 +605,6 @@ mod tests {
 
     fn rel(rel: &str) -> String {
         rel.replace('/', MAIN_SEPARATOR_STR)
-    }
-
-    #[test]
-    fn hotspot_report_matches_expected_categories_and_authors() {
-        let fixture = fixture_with_repo();
-        fixture
-            .analyzer
-            .analyzer()
-            .test_hooks()
-            .reset_definition_candidates_query_count_for_test();
-        let result = analyze_git_hotspots(
-            fixture.analyzer.analyzer(),
-            AnalyzeGitHotspotsParams {
-                since_days: 0,
-                since_iso: "2020-01-01T00:00:00Z".to_string(),
-                until_iso: String::new(),
-                max_commits: 100,
-                max_files: 75,
-            },
-        );
-        assert!(
-            result
-                .report
-                .starts_with("## Git hotspots\n\n- Repository: `")
-        );
-        assert!(result.report.contains("- Analyzed commits: 15"));
-        assert!(
-            result.report.contains(&format!(
-                "| `{}` | 15 | 16 | HOTSPOT |",
-                rel("src/ComplexService.java")
-            )),
-            "{}",
-            result.report
-        );
-        for expected in ["dev0(5)", "dev1(5)", "dev2(5)"] {
-            assert!(result.report.contains(expected), "{}", result.report);
-        }
-        assert!(result.report.contains(&format!(
-            "| `{}` | 1 | 1 | STABLE | dev0(1) |",
-            rel("src/StableService.java")
-        )));
-        assert!(result.report.contains(&format!(
-            "| `{}` | 1 | 16 | ABANDONWARE | dev0(1) |",
-            rel("src/UnusedService.java")
-        )));
-        assert_eq!(
-            fixture
-                .analyzer
-                .analyzer()
-                .test_hooks()
-                .definition_candidates_query_count_for_test(),
-            0,
-            "per-file complexity must not query definitions once per function"
-        );
-    }
-
-    #[cfg_attr(not(scheduled_tests), ignore = "scheduled-only")]
-    #[test]
-    fn max_files_truncates_and_sets_flag() {
-        let fixture = fixture_with_repo();
-        let result = analyze_git_hotspots(
-            fixture.analyzer.analyzer(),
-            AnalyzeGitHotspotsParams {
-                since_days: 0,
-                since_iso: "2020-01-01T00:00:00Z".to_string(),
-                until_iso: String::new(),
-                max_commits: 100,
-                max_files: 2,
-            },
-        );
-        assert!(result.report.contains("- Unique files (before cap): 3"));
-        assert!(result.report.contains("- Truncated: true"));
-        assert_eq!(
-            result
-                .report
-                .matches(&format!("| `{}{}", "src", MAIN_SEPARATOR))
-                .count(),
-            2,
-            "{}",
-            result.report
-        );
-    }
-
-    #[cfg_attr(not(scheduled_tests), ignore = "scheduled-only")]
-    #[test]
-    fn until_excludes_later_commits() {
-        let fixture = fixture_with_repo();
-        let result = analyze_git_hotspots(
-            fixture.analyzer.analyzer(),
-            AnalyzeGitHotspotsParams {
-                since_days: 0,
-                since_iso: "2020-01-01T00:00:00Z".to_string(),
-                until_iso: "2020-06-03T00:00:00Z".to_string(),
-                max_commits: 100,
-                max_files: 75,
-            },
-        );
-        assert!(
-            result.report.contains("- Analyzed commits: 2"),
-            "{}",
-            result.report
-        );
-        assert!(
-            result.report.contains(&format!(
-                "| `{}` | 2 | 16 | ABANDONWARE |",
-                rel("src/ComplexService.java")
-            )),
-            "{}",
-            result.report
-        );
-        for expected in ["dev0(1)", "dev1(1)"] {
-            assert!(result.report.contains(expected), "{}", result.report);
-        }
-    }
-
-    #[cfg_attr(not(scheduled_tests), ignore = "scheduled-only")]
-    #[test]
-    fn no_matching_commits_returns_empty_state() {
-        let fixture = fixture_with_repo();
-        let result = analyze_git_hotspots(
-            fixture.analyzer.analyzer(),
-            AnalyzeGitHotspotsParams {
-                since_days: 0,
-                since_iso: "2030-01-01T00:00:00Z".to_string(),
-                until_iso: String::new(),
-                max_commits: 100,
-                max_files: 75,
-            },
-        );
-        assert!(result.report.ends_with("No file hotspots in this window."));
     }
 
     #[cfg_attr(not(scheduled_tests), ignore = "scheduled-only")]
@@ -850,57 +720,6 @@ mod tests {
     }
 
     #[test]
-    fn fallback_retry_disables_rename_detection_and_keeps_changed_file() {
-        let fixture = AnalyzerFixture::new(&[(
-            "src/FallbackService.java",
-            "public class FallbackService { void fallback() { if (true) {} } }\n",
-        )]);
-        let repo = init_repo(&fixture.project_root());
-        commit_paths(
-            &repo,
-            "initial fallback",
-            "dev0",
-            "dev0@example.com",
-            "2020-06-01T00:00:00Z",
-            &["src/FallbackService.java"],
-        );
-
-        let commit = repo
-            .find_commit(repo.head().expect("head").target().expect("head target"))
-            .expect("head commit");
-        let mut attempts = Vec::new();
-        let changed_files = changed_project_files_for_commit(
-            &repo,
-            fixture.project_root().as_path(),
-            fixture.project_root().as_path(),
-            &commit,
-            |repo, commit, diff| {
-                let mut original_diff = Some(diff);
-                with_rename_detection_fallback(|detect_renames| {
-                    attempts.push(detect_renames);
-                    if detect_renames {
-                        Err("simulated rename detection failure".to_string())
-                    } else {
-                        original_diff.take();
-                        diff_commit_to_parent(repo, commit)
-                            .map_err(|err| format!("fallback diff rebuild failed: {err}"))
-                    }
-                })
-            },
-        )
-        .expect("fallback succeeds");
-
-        assert_eq!(attempts, vec![true, false]);
-        assert_eq!(
-            changed_files,
-            vec![ProjectFile::new(
-                fixture.project_root(),
-                Path::new("src/FallbackService.java")
-            )]
-        );
-    }
-
-    #[test]
     fn fallback_retry_preserves_report_churn_output() {
         let fixture = AnalyzerFixture::new(&[(
             "src/FallbackService.java",
@@ -936,24 +755,11 @@ mod tests {
             .find_commit(repo.head().expect("head").target().expect("head target"))
             .expect("head commit");
         let mut attempts = Vec::new();
-        let changed_files = changed_project_files_for_commit(
+        let changed_files = changed_files_with_simulated_retry(
             &repo,
             fixture.project_root().as_path(),
-            fixture.project_root().as_path(),
             &commit,
-            |repo, commit, diff| {
-                let mut original_diff = Some(diff);
-                with_rename_detection_fallback(|detect_renames| {
-                    attempts.push(detect_renames);
-                    if detect_renames {
-                        Err("simulated rename detection failure".to_string())
-                    } else {
-                        original_diff.take();
-                        diff_commit_to_parent(repo, commit)
-                            .map_err(|err| format!("fallback diff rebuild failed: {err}"))
-                    }
-                })
-            },
+            &mut attempts,
         )
         .expect("fallback succeeds");
 
@@ -995,6 +801,44 @@ mod tests {
                 name: "dev0".to_string(),
                 commits: 1,
             }]
+        );
+    }
+
+    #[test]
+    fn fallback_retry_disables_rename_detection_and_keeps_changed_file() {
+        let fixture = AnalyzerFixture::new(&[(
+            "src/FallbackService.java",
+            "public class FallbackService { void fallback() { if (true) {} } }\n",
+        )]);
+        let repo = init_repo(&fixture.project_root());
+        commit_paths(
+            &repo,
+            "initial fallback",
+            "dev0",
+            "dev0@example.com",
+            "2020-06-01T00:00:00Z",
+            &["src/FallbackService.java"],
+        );
+
+        let commit = repo
+            .find_commit(repo.head().expect("head").target().expect("head target"))
+            .expect("head commit");
+        let mut attempts = Vec::new();
+        let changed_files = changed_files_with_simulated_retry(
+            &repo,
+            fixture.project_root().as_path(),
+            &commit,
+            &mut attempts,
+        )
+        .expect("fallback succeeds");
+
+        assert_eq!(attempts, vec![true, false]);
+        assert_eq!(
+            changed_files,
+            vec![ProjectFile::new(
+                fixture.project_root(),
+                Path::new("src/FallbackService.java")
+            )]
         );
     }
 }

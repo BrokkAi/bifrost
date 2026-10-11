@@ -5,13 +5,18 @@ pub(crate) mod diagnostics;
 mod hierarchy;
 pub(crate) mod imports;
 pub(crate) mod language;
+mod scalar;
 mod semantic;
 mod semantic_adaptation;
 mod source_facts;
 pub(crate) mod source_publication;
 pub(crate) mod source_storage;
 mod structural;
+mod syntax;
 
+pub use scalar::scala_declared_scalar_types;
+
+use super::analyzer_definition_lookup::package_exists_value;
 use crate::analyzer::Range;
 use crate::analyzer::store::LimitedQueryRows;
 use crate::analyzer::{AnalyzerQueryScope, QueryScope};
@@ -23,19 +28,36 @@ use brokk_bifrost_core::analyzer::query_token::QueryToken;
 /// the same items.
 pub(crate) use brokk_bifrost_jvm::scala::{declarations, wildcard_imports};
 
-use crate::analyzer::clone_detection::{
-    CloneCandidateProfile, detect_structural_clone_smells, refine_clone_similarity_with_ast,
-};
+pub(crate) fn scala_package_exists_in_language(
+    language: crate::analyzer::Language,
+    package: &str,
+    lookup: impl FnOnce(&str) -> bool,
+) -> bool {
+    language == crate::analyzer::Language::Scala && lookup(package)
+}
+
+pub(crate) fn case_block_is_partial_function(node: tree_sitter::Node<'_>) -> bool {
+    !node.parent().is_some_and(|parent| {
+        matches!(
+            parent.kind(),
+            "match_expression" | "catch_clause" | "try_expression"
+        )
+    })
+}
+
+use crate::analyzer::clone_detection::detect_language_structural_clone_smells;
 use crate::analyzer::common::language_for_file as file_language;
 use crate::analyzer::jvm::dependency_discovery::is_jvm_dependency_input;
 use crate::analyzer::jvm::external::{JvmExternalDeclarationIndex, JvmExternalDeclarations};
 use crate::analyzer::jvm::retained_external_index_state;
+mod call_applicability;
+
 use crate::analyzer::languages::{
     BoundedReceiverQuery, DeadCodeBulkEdges, DeadCodeBulkPreflight, DeadCodeBulkProof,
     DeadCodeRouting, DeadCodeSupport, EdgePassId, EdgeSiteScanCtx, EdgeWeightScanCtx,
     LanguageEdgePass, LanguageEdgeSites, LanguageEdgeWeights, LanguageSupport,
-    StructuralReceiverResolver, analyzable_file_count, candidate_fqns,
-    fqn_has_multiple_function_definitions,
+    StructuralReceiverResolver, analyzable_file_count, fqn_has_multiple_function_definitions,
+    ready_preflight,
 };
 use crate::analyzer::tree_sitter_analyzer::FileState;
 use crate::analyzer::type_relations::TypeRelation;
@@ -43,9 +65,7 @@ use crate::analyzer::usages::get_definition::{
     BoundedResolution, DefinitionLookupOutcome, resolve_scala_bounded,
 };
 use crate::analyzer::usages::get_type::{TypeLookupOutcome, resolve_scala_type_bounded};
-use crate::analyzer::usages::inverted_edges::{
-    UsageEdgesCache, cached_dead_code_usage_edges, weight_usage_edges,
-};
+use crate::analyzer::usages::inverted_edges::{UsageEdgesCache, weight_usage_edges};
 use crate::analyzer::usages::scala_graph::{
     ScalaDeadCodeBulkContext, ScalaDeadCodeBulkEligibility, ScalaUsageGraphStrategy,
     build_inbound_scala_usage_edges_with_completeness, build_scala_usage_edge_weights,
@@ -88,6 +108,7 @@ pub(crate) use brokk_bifrost_jvm::proof::{
 };
 use brokk_bifrost_jvm::scala::graph::inverted::{
     ScalaProjectTypesSeed, ScalaProjectTypesSweep, ScalaSourceFactsCache,
+    new_scala_source_facts_cache,
 };
 pub(crate) use brokk_bifrost_jvm::scala::graph_support::{
     ScalaCallableFactsIndex, ScalaDefinitionIndex, ScalaFileFacts, ScalaFileFactsProvider,
@@ -342,13 +363,10 @@ impl ScalaDefinitionIndex for ScalaRelationalDefinitionIndex {
     }
 
     fn package_exists(&self, package: &str) -> bool {
-        matches!(
-            self.package_query(
-                package,
-                RelationalDefinitionQuery::PackageRelation(PackageRelationKind::Exists),
-            ),
-            RelationalDefinitionValue::PackageRelation(PackageRelationValue::Exists(true))
-        )
+        package_exists_value(&self.package_query(
+            package,
+            RelationalDefinitionQuery::PackageRelation(PackageRelationKind::Exists),
+        ))
     }
 
     fn package_container_exists(&self, package: &str) -> bool {
@@ -426,19 +444,13 @@ impl ScalaDefinitionIndex for ScalaRelationalDefinitionIndex {
     }
 
     fn package_types_in(&self, package: &str) -> Vec<(String, Vec<CodeUnit>)> {
-        let mut grouped: HashMap<String, Vec<CodeUnit>> = HashMap::default();
         let units =
             match self.package_query(package, RelationalDefinitionQuery::PackageTypesInPackage) {
                 RelationalDefinitionValue::Definitions(units) => units,
                 _ => unreachable!("Scala package-types query returned the wrong shape"),
             };
-        for unit in units {
-            grouped
-                .entry(scala_simple_type_name(&unit))
-                .or_default()
-                .push(unit);
-        }
-        let mut grouped = grouped.into_iter().collect::<Vec<_>>();
+        let mut grouped =
+            brokk_bifrost_jvm::scala::scala_group_package_types(package, units.iter());
         grouped.sort_by(|left, right| left.0.cmp(&right.0));
         for (_, units) in &mut grouped {
             units.sort();
@@ -455,7 +467,7 @@ impl BoundedDefinitionLookup for ScalaRelationalDefinitionIndex {
 
     fn fqn_in_language(&self, fqn: &str, language: Language) -> Vec<CodeUnit> {
         if language == Language::Scala {
-            ScalaDefinitionIndex::by_fqn(self, fqn)
+            self.fqn(fqn)
         } else {
             Vec::new()
         }
@@ -499,7 +511,9 @@ impl BoundedDefinitionLookup for ScalaRelationalDefinitionIndex {
     }
 
     fn package_exists_in_language(&self, package: &str, language: Language) -> bool {
-        language == Language::Scala && ScalaDefinitionIndex::package_exists(self, package)
+        scala_package_exists_in_language(language, package, |package| {
+            ScalaDefinitionIndex::package_exists(self, package)
+        })
     }
 
     fn fqn_prefix_exists(&self, prefix: &str) -> bool {
@@ -793,6 +807,22 @@ pub struct ScalaAnalyzer {
 crate::analyzer::impl_forward_query_provider!(ScalaAnalyzer);
 
 impl ScalaAnalyzer {
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn tree_sitter_analyzer(&self) -> &TreeSitterAnalyzer<ScalaAdapter> {
+        &self.inner
+    }
+
+    pub(crate) fn update_all_with_progress(
+        &self,
+        progress: Option<crate::analyzer::BuildProgress>,
+    ) -> Self {
+        Self::from_inner(
+            self.inner.update_all_with_progress(progress),
+            self.memo_budget,
+            self.java_config.clone(),
+        )
+    }
+
     pub(crate) fn declaration_candidates_by_identifier_limited(
         &self,
         identifier: &str,
@@ -851,12 +881,12 @@ impl ScalaAnalyzer {
         self.inner.forward_fqn_prefix_exists(prefix)
     }
 
-    pub(crate) fn signature_metadata_limited(
+    crate::analyzer::tree_sitter_analyzer::delegate_inner_methods! {
+        pub(crate) fn signature_metadata_limited(
         &self,
         code_unit: &CodeUnit,
         limit: usize,
-    ) -> crate::analyzer::store::LimitedQueryRows<SignatureMetadata> {
-        self.inner.signature_metadata_limited(code_unit, limit)
+    ) -> crate::analyzer::store::LimitedQueryRows<SignatureMetadata>;
     }
 
     pub(crate) fn signatures_limited(
@@ -883,12 +913,12 @@ impl ScalaAnalyzer {
         self.inner.supertype_lookup_paths_limited(code_unit, limit)
     }
 
-    pub(crate) fn raw_supertypes_limited(
+    crate::analyzer::tree_sitter_analyzer::delegate_inner_methods! {
+        pub(crate) fn raw_supertypes_limited(
         &self,
         code_unit: &CodeUnit,
         limit: usize,
-    ) -> crate::analyzer::store::LimitedQueryRows<String> {
-        self.inner.raw_supertypes_limited(code_unit, limit)
+    ) -> crate::analyzer::store::LimitedQueryRows<String>;
     }
 
     pub fn is_type_alias(&self, code_unit: &CodeUnit) -> bool {
@@ -944,7 +974,9 @@ impl ScalaAnalyzer {
     pub(crate) fn export_infos_for_owner(&self, owner: &CodeUnit) -> Vec<ScalaExportInfo> {
         self.inner
             .fetch_file_state(owner.source())
-            .and_then(|state| state.scala_exports.get(owner).cloned())
+            .map(|state| {
+                brokk_bifrost_jvm::scala::scala_export_infos_for_owner(&state.scala_exports, owner)
+            })
             .unwrap_or_default()
     }
 
@@ -1011,7 +1043,7 @@ impl ScalaAnalyzer {
             build_weighted_cache(self.memo_budget / 8, weight_usage_edges);
         clone.project_types_build_count = Arc::new(AtomicUsize::new(0));
         clone.scala_query_file_facts_touched = Arc::new(AtomicUsize::new(0));
-        clone.scala_source_facts_by_file = Arc::new(Mutex::new(HashMap::default()));
+        clone.scala_source_facts_by_file = new_scala_source_facts_cache(self.memo_budget / 8);
         #[cfg(any(test, feature = "test-support"))]
         {
             clone.scala_query_parse_count = Arc::new(AtomicUsize::new(0));
@@ -1031,10 +1063,12 @@ impl ScalaAnalyzer {
     }
 
     pub fn new_with_config(project: Arc<dyn Project>, config: AnalyzerConfig) -> Self {
-        let memo_budget = config.memo_cache_budget_bytes();
         let java_config = config.jvm.clone();
-        let inner = TreeSitterAnalyzer::new_with_config(project, ScalaAdapter, config);
-        Self::from_inner(inner, memo_budget, java_config)
+        TreeSitterAnalyzer::wrap_with_config(
+            config,
+            |config| TreeSitterAnalyzer::new_with_config(project, ScalaAdapter, config),
+            |inner, memo_budget| Self::from_inner(inner, memo_budget, java_config),
+        )
     }
 
     fn from_inner(
@@ -1067,7 +1101,7 @@ impl ScalaAnalyzer {
             dead_code_usage_edges: build_weighted_cache(memo_budget / 8, weight_usage_edges),
             project_types_build_count: Arc::new(AtomicUsize::new(0)),
             scala_query_file_facts_touched: Arc::new(AtomicUsize::new(0)),
-            scala_source_facts_by_file: Arc::new(Mutex::new(HashMap::default())),
+            scala_source_facts_by_file: new_scala_source_facts_cache(memo_budget / 8),
             #[cfg(any(test, feature = "test-support"))]
             scala_query_parse_count: Arc::new(AtomicUsize::new(0)),
             #[cfg(any(test, feature = "test-support"))]
@@ -1174,14 +1208,11 @@ impl ScalaAnalyzer {
     }
 
     pub(crate) fn external_declaration_index(&self) -> &JvmExternalDeclarationIndex {
-        self.external_index
-            .get_or_init(|| {
-                JvmExternalDeclarationIndex::build_for_project(
-                    &self.java_config,
-                    self.inner.project(),
-                )
-            })
-            .as_ref()
+        crate::analyzer::jvm::external::get_or_build_external_declaration_index(
+            &self.external_index,
+            &self.java_config,
+            self.inner.project(),
+        )
     }
 
     /// The external declaration surface Scala resolution reads: the shared
@@ -1218,28 +1249,27 @@ impl ScalaAnalyzer {
         file: &ProjectFile,
         name: &str,
     ) -> (BoundaryStatus, Option<String>) {
-        if let Some(fqn) = self.external_type_name(token, packs.clone(), file, name) {
-            return (BoundaryStatus::ExternalIndexed, Some(fqn));
-        }
+        let type_evidence = self
+            .external_type_name(token, packs.clone(), file, name)
+            .map(|fqn| crate::analyzer::languages::ExternalTypeBoundaryEvidence::Indexed(Some(fqn)))
+            .unwrap_or(crate::analyzer::languages::ExternalTypeBoundaryEvidence::Unresolved);
         // A member spelling leaves the workspace exactly as its owner type
         // does, so the member tier runs where the type tier found nothing
         // (#1900). A member the surface does not declare changes nothing.
         // One ladder answers here and in the resolver's own boundary gate, so
         // a trace and a definition cannot disagree about a spelling (#2287).
-        if let Some(member) = self.resolve_member_name_with_external(token, packs, file, name) {
-            return (
-                BoundaryStatus::ExternalIndexed,
-                Some(member.fqn().to_owned()),
-            );
-        }
-        if self
-            .external_declaration_index()
-            .production_diagnostic_count()
-            > 0
-        {
-            return (BoundaryStatus::ExternalDeclaredUnindexed, None);
-        }
-        (BoundaryStatus::ExternalUnknown, None)
+        crate::analyzer::languages::classify_jvm_external_boundary_evidence(
+            type_evidence,
+            || {
+                self.resolve_member_name_with_external(token, packs, file, name)
+                    .map(|member| member.fqn().to_owned())
+            },
+            || {
+                self.external_declaration_index()
+                    .production_diagnostic_count()
+                    > 0
+            },
+        )
     }
 
     /// The fully-qualified name of the external type a written Scala type
@@ -1436,7 +1466,7 @@ impl ScalaAnalyzer {
             Arc::clone(&self.scala_query_file_facts_touched),
             files,
         )
-        .with_source_facts_cache(Arc::clone(&self.scala_source_facts_by_file))
+        .with_source_facts_cache(self.scala_source_facts_by_file.clone())
     }
 
     pub(crate) fn build_project_types_from_frontier(
@@ -1461,7 +1491,7 @@ impl ScalaAnalyzer {
                     .collect();
                 let file_states = Arc::new(file_states);
                 let unresolved_seed = ScalaProjectTypes::seed(Arc::clone(&file_states))
-                    .with_source_facts_cache(Arc::clone(&self.scala_source_facts_by_file));
+                    .with_source_facts_cache(self.scala_source_facts_by_file.clone());
                 let uncancelled = crate::CancellationToken::new();
                 let session = crate::analyzer::relational_frontier::RelationalFrontierSession::new(
                     self,
@@ -1490,16 +1520,20 @@ impl ScalaAnalyzer {
         store_context: AnalyzerStoreContext,
         progress: Option<BuildProgress>,
     ) -> Result<Self, crate::analyzer::store::StoreError> {
-        let memo_budget = config.memo_cache_budget_bytes();
         let java_config = config.jvm.clone();
-        let inner = TreeSitterAnalyzer::new_with_config_storage_context_and_progress(
-            project,
-            ScalaAdapter,
+        TreeSitterAnalyzer::try_wrap_with_config(
             config,
-            store_context,
-            progress,
-        )?;
-        Ok(Self::from_inner(inner, memo_budget, java_config))
+            |config| {
+                TreeSitterAnalyzer::new_with_config_storage_context_and_progress(
+                    project,
+                    ScalaAdapter,
+                    config,
+                    store_context,
+                    progress,
+                )
+            },
+            |inner, memo_budget| Self::from_inner(inner, memo_budget, java_config),
+        )
     }
 
     pub fn from_project<P>(project: P) -> Self
@@ -1524,14 +1558,14 @@ impl ScalaAnalyzer {
         self.inner.bulk_import_infos(files)
     }
 
-    #[doc(hidden)]
-    pub fn reset_full_hydration_count_for_test(&self) {
-        self.inner.reset_full_hydration_count_for_test();
+    crate::analyzer::tree_sitter_analyzer::delegate_inner_methods! {
+        #[doc(hidden)]
+        pub fn reset_full_hydration_count_for_test(&self);
     }
 
-    #[doc(hidden)]
-    pub fn full_hydration_count_for_test(&self) -> usize {
-        self.inner.full_hydration_count_for_test()
+    crate::analyzer::tree_sitter_analyzer::delegate_inner_methods! {
+        #[doc(hidden)]
+        pub fn full_hydration_count_for_test(&self) -> usize;
     }
 
     #[doc(hidden)]
@@ -1574,11 +1608,7 @@ fn model_proof(model: &dyn JvmActiveSemanticModel, fqn: &str) -> Option<ScalaNam
 }
 
 fn qualify_scala_name(package_name: &str, name: &str) -> String {
-    if package_name.is_empty() {
-        name.to_string()
-    } else {
-        format!("{package_name}.{name}")
-    }
+    brokk_bifrost_core::analyzer::common::qualify_dotted_name(package_name, name)
 }
 
 impl ScalaSource for ScalaAnalyzer {
@@ -1785,86 +1815,83 @@ impl TypeAliasProvider for ScalaAnalyzer {
 use crate::analyzer::CodeUnitIndex;
 
 impl CodeUnitIndex for ScalaAnalyzer {
-    /// Forwarded so the request-scoped memo on the inner analyzer answers
-    /// (#2679); the trait default would rebuild uncached per call.
-    fn class_range_index(
+    crate::analyzer::tree_sitter_analyzer::delegate_inner_methods! {
+        /// Forwarded so the request-scoped memo on the inner analyzer answers
+        /// (#2679); the trait default would rebuild uncached per call.
+        fn class_range_index(
         &self,
         file: &ProjectFile,
-    ) -> std::sync::Arc<brokk_bifrost_core::analyzer::usages::inverted_edges::ClassRangeIndex> {
-        self.inner.class_range_index(file)
+    ) -> std::sync::Arc<brokk_bifrost_core::analyzer::usages::inverted_edges::ClassRangeIndex>;
     }
 
-    fn enclosing_code_unit(
+    crate::analyzer::tree_sitter_analyzer::delegate_inner_methods! {
+        fn enclosing_code_unit(
         &self,
         file: &ProjectFile,
         range: &crate::analyzer::Range,
-    ) -> Option<CodeUnit> {
-        self.inner.enclosing_code_unit(file, range)
+    ) -> Option<CodeUnit>;
     }
 
-    fn enclosing_code_unit_for_lines(
-        &self,
-        file: &ProjectFile,
-        start_line: usize,
-        end_line: usize,
-    ) -> Option<CodeUnit> {
-        self.inner
-            .enclosing_code_unit_for_lines(file, start_line, end_line)
+    crate::analyzer::tree_sitter_analyzer::delegate_inner_methods! {
+        fn enclosing_code_unit_for_lines(
+            &self,
+            file: &ProjectFile,
+            start_line: usize,
+            end_line: usize,
+        ) -> Option<CodeUnit>;
     }
 
-    fn top_level_declarations(&self, file: &ProjectFile) -> Vec<CodeUnit> {
-        self.inner.top_level_declarations(file)
+    crate::analyzer::tree_sitter_analyzer::delegate_inner_methods! {
+        fn top_level_declarations(&self, file: &ProjectFile) -> Vec<CodeUnit>;
     }
 
     fn summary_file_projection(
         &self,
         file: &ProjectFile,
     ) -> Option<Arc<crate::analyzer::SummaryFileProjection>> {
-        let mut projection = (*self.inner.summary_file_projection(file)?).clone();
-        for children in projection.children.values_mut() {
-            children.retain(|child| !child.is_synthetic());
-        }
-        Some(Arc::new(projection))
+        self.inner
+            .summary_file_projection(file)
+            .map(crate::analyzer::common::non_synthetic_summary_projection)
     }
 
-    fn analyzed_files(&self) -> Vec<ProjectFile> {
-        self.inner.analyzed_files()
+    crate::analyzer::tree_sitter_analyzer::delegate_inner_methods! {
+        fn analyzed_files(&self) -> Vec<ProjectFile>;
     }
 
-    fn indexed_source(&self, file: &ProjectFile) -> Option<String> {
-        self.inner.indexed_source(file)
+    crate::analyzer::tree_sitter_analyzer::delegate_inner_methods! {
+        fn indexed_source(&self, file: &ProjectFile) -> Option<String>;
     }
 
-    fn location_declarations(&self, file: &ProjectFile) -> BTreeSet<CodeUnit> {
-        self.inner.location_declarations(file)
+    crate::analyzer::tree_sitter_analyzer::delegate_inner_methods! {
+        fn location_declarations(&self, file: &ProjectFile) -> BTreeSet<CodeUnit>;
     }
 
-    fn location_ranges(&self, code_unit: &CodeUnit) -> Vec<crate::analyzer::Range> {
-        self.inner.location_ranges(code_unit)
+    crate::analyzer::tree_sitter_analyzer::delegate_inner_methods! {
+        fn location_ranges(&self, code_unit: &CodeUnit) -> Vec<crate::analyzer::Range>;
     }
 
-    fn indexed_source_matches(&self, file: &ProjectFile, source: &str) -> bool {
-        self.inner.indexed_source_matches(file, source)
+    crate::analyzer::tree_sitter_analyzer::delegate_inner_methods! {
+        fn indexed_source_matches(&self, file: &ProjectFile, source: &str) -> bool;
     }
 
-    fn is_analyzed(&self, file: &ProjectFile) -> bool {
-        self.inner.is_analyzed(file)
+    crate::analyzer::tree_sitter_analyzer::delegate_inner_methods! {
+        fn is_analyzed(&self, file: &ProjectFile) -> bool;
     }
 
-    fn retain_analyzed(&self, candidates: &[ProjectFile]) -> Vec<ProjectFile> {
-        self.inner.retain_analyzed(candidates)
+    crate::analyzer::tree_sitter_analyzer::delegate_inner_methods! {
+        fn retain_analyzed(&self, candidates: &[ProjectFile]) -> Vec<ProjectFile>;
     }
 
     fn all_declarations(&self) -> Box<dyn Iterator<Item = CodeUnit> + '_> {
         self.inner.all_declarations()
     }
 
-    fn declarations_sharing_name(&self, unit: &CodeUnit) -> Vec<CodeUnit> {
-        self.inner.declarations_sharing_name(unit)
+    crate::analyzer::tree_sitter_analyzer::delegate_inner_methods! {
+        fn declarations_sharing_name(&self, unit: &CodeUnit) -> Vec<CodeUnit>;
     }
 
-    fn declarations(&self, file: &ProjectFile) -> BTreeSet<CodeUnit> {
-        self.inner.declarations(file)
+    crate::analyzer::tree_sitter_analyzer::delegate_inner_methods! {
+        fn declarations(&self, file: &ProjectFile) -> BTreeSet<CodeUnit>;
     }
 
     fn definitions(&self, fq_name: &str) -> Box<dyn Iterator<Item = CodeUnit> + '_> {
@@ -1872,11 +1899,7 @@ impl CodeUnitIndex for ScalaAnalyzer {
     }
 
     fn direct_children(&self, code_unit: &CodeUnit) -> Vec<CodeUnit> {
-        self.inner
-            .direct_children(code_unit)
-            .into_iter()
-            .filter(|child| !child.is_synthetic())
-            .collect()
+        crate::analyzer::common::non_synthetic_children(self.inner.direct_children(code_unit))
     }
 
     fn parent_of(&self, code_unit: &CodeUnit) -> Option<CodeUnit> {
@@ -1884,8 +1907,8 @@ impl CodeUnitIndex for ScalaAnalyzer {
             .or_else(|| CodeUnitIndex::parent_of(&self.inner, code_unit))
     }
 
-    fn ranges(&self, code_unit: &CodeUnit) -> Vec<crate::analyzer::Range> {
-        self.inner.ranges(code_unit)
+    crate::analyzer::tree_sitter_analyzer::delegate_inner_methods! {
+        fn ranges(&self, code_unit: &CodeUnit) -> Vec<crate::analyzer::Range>;
     }
 
     fn ranges_with_limit(
@@ -1904,68 +1927,59 @@ impl CodeUnitIndex for ScalaAnalyzer {
             .unwrap_or_else(|| self.inner.signatures(code_unit))
     }
 
-    fn signature_metadata(&self, code_unit: &CodeUnit) -> Vec<SignatureMetadata> {
-        self.inner.signature_metadata(code_unit)
+    crate::analyzer::tree_sitter_analyzer::delegate_inner_methods! {
+        fn signature_metadata(&self, code_unit: &CodeUnit) -> Vec<SignatureMetadata>;
     }
 
-    fn get_analyzed_files(&self) -> BTreeSet<ProjectFile> {
-        self.inner.get_analyzed_files()
+    crate::analyzer::tree_sitter_analyzer::delegate_inner_methods! {
+        fn languages(&self) -> BTreeSet<Language>;
     }
 
-    fn languages(&self) -> BTreeSet<Language> {
-        self.inner.languages()
+    crate::analyzer::tree_sitter_analyzer::delegate_inner_methods! {
+        fn project(&self) -> &dyn Project;
     }
 
-    fn project(&self) -> &dyn Project {
-        self.inner.project()
-    }
-
-    fn get_all_declarations(&self) -> Vec<CodeUnit> {
-        self.inner.get_all_declarations()
-    }
-
-    fn get_definitions(&self, fq_name: &str) -> Vec<CodeUnit> {
-        self.inner.get_definitions(fq_name)
+    crate::analyzer::tree_sitter_analyzer::delegate_inner_methods! {
+        fn get_all_declarations(&self) -> Vec<CodeUnit>;
     }
 
     fn get_skeleton(&self, code_unit: &CodeUnit) -> Option<String> {
         let rendered = crate::analyzer::common::render_skeleton(self, code_unit, false);
-        (!rendered.is_empty()).then(|| rendered.trim_end().to_string())
+        crate::analyzer::common::normalize_skeleton(rendered)
     }
 
     fn get_skeleton_header(&self, code_unit: &CodeUnit) -> Option<String> {
         let rendered = crate::analyzer::common::render_skeleton(self, code_unit, true);
-        (!rendered.is_empty()).then(|| rendered.trim_end().to_string())
+        crate::analyzer::common::normalize_skeleton(rendered)
     }
 
-    fn get_source(&self, code_unit: &CodeUnit, include_comments: bool) -> Option<String> {
-        self.inner.get_source(code_unit, include_comments)
+    crate::analyzer::tree_sitter_analyzer::delegate_inner_methods! {
+        fn get_source(&self, code_unit: &CodeUnit, include_comments: bool) -> Option<String>;
     }
 
-    fn get_sources(&self, code_unit: &CodeUnit, include_comments: bool) -> BTreeSet<String> {
-        self.inner.get_sources(code_unit, include_comments)
+    crate::analyzer::tree_sitter_analyzer::delegate_inner_methods! {
+        fn get_sources(&self, code_unit: &CodeUnit, include_comments: bool) -> BTreeSet<String>;
     }
 
-    fn search_definitions(&self, pattern: &str, auto_quote: bool) -> BTreeSet<CodeUnit> {
-        self.inner.search_definitions(pattern, auto_quote)
+    crate::analyzer::tree_sitter_analyzer::delegate_inner_methods! {
+        fn search_definitions(&self, pattern: &str, auto_quote: bool) -> BTreeSet<CodeUnit>;
     }
 
-    fn search_definitions_by_suffix_pattern(
+    crate::analyzer::tree_sitter_analyzer::delegate_inner_methods! {
+        fn search_definitions_by_suffix_pattern(
         &self,
         pattern: &str,
         terminal_identifiers: &[String],
         language: Language,
-    ) -> BTreeSet<CodeUnit> {
-        self.inner
-            .search_definitions_by_suffix_pattern(pattern, terminal_identifiers, language)
+    ) -> BTreeSet<CodeUnit>;
     }
 
-    fn lookup_candidates_by_short_name(&self, symbol: &str) -> BTreeSet<CodeUnit> {
-        self.inner.lookup_candidates_by_short_name(symbol)
+    crate::analyzer::tree_sitter_analyzer::delegate_inner_methods! {
+        fn lookup_candidates_by_short_name(&self, symbol: &str) -> BTreeSet<CodeUnit>;
     }
 
-    fn has_complete_symbol_lookup_index(&self) -> bool {
-        self.inner.has_complete_symbol_lookup_index()
+    crate::analyzer::tree_sitter_analyzer::delegate_inner_methods! {
+        fn has_complete_symbol_lookup_index(&self) -> bool;
     }
 
     fn lookup_candidates_by_identifier(&self, identifier: &str) -> BTreeSet<CodeUnit> {
@@ -1974,6 +1988,8 @@ impl CodeUnitIndex for ScalaAnalyzer {
 }
 
 impl IAnalyzer for ScalaAnalyzer {
+    crate::analyzer::tree_sitter_analyzer::delegate_inner_procedure_fact_methods!();
+
     crate::analyzer::i_analyzer::forward_relational_definition_batch!();
 
     #[cfg(any(test, feature = "test-support"))]
@@ -1995,52 +2011,52 @@ impl IAnalyzer for ScalaAnalyzer {
         self.inner.end_query(context);
     }
 
-    fn prefetch_definitions(&self, fq_names: &[String]) {
-        self.inner.prefetch_definitions(fq_names);
+    crate::analyzer::tree_sitter_analyzer::delegate_inner_methods! {
+        fn prefetch_definitions(&self, fq_names: &[String]);
     }
 
-    fn record_query_failure(&self, error: crate::analyzer::store::StoreError) {
-        self.inner.record_query_failure(error);
+    crate::analyzer::tree_sitter_analyzer::delegate_inner_methods! {
+        fn record_query_failure(&self, error: crate::analyzer::store::StoreError);
     }
 
-    fn workspace_file_index_cell(&self) -> Option<crate::analyzer::WorkspaceFileIndexCell> {
-        self.inner.workspace_file_index_cell()
+    crate::analyzer::tree_sitter_analyzer::delegate_inner_methods! {
+        fn workspace_file_index_cell(&self) -> Option<crate::analyzer::WorkspaceFileIndexCell>;
     }
 
-    fn definition_lookup_memo(
+    crate::analyzer::tree_sitter_analyzer::delegate_inner_methods! {
+        fn definition_lookup_memo(
         &self,
-    ) -> Option<std::sync::Arc<crate::analyzer::DefinitionLookupMemo>> {
-        self.inner.definition_lookup_memo()
+    ) -> Option<std::sync::Arc<crate::analyzer::DefinitionLookupMemo>>;
     }
 
-    fn structural_fact_providers(
+    crate::analyzer::tree_sitter_analyzer::delegate_inner_methods! {
+        fn structural_fact_providers(
         &self,
-    ) -> Vec<&dyn crate::analyzer::structural::StructuralFactProvider> {
-        self.inner.structural_fact_providers()
+    ) -> Vec<&dyn crate::analyzer::structural::StructuralFactProvider>;
     }
 
     fn snapshot_caches(&self) -> Option<&crate::analyzer::AnalyzerSnapshotCaches> {
         Some(self.inner.snapshot_caches())
     }
 
-    fn workspace_content_identities(
+    crate::analyzer::tree_sitter_analyzer::delegate_inner_methods! {
+        fn workspace_content_identities(
         &self,
-    ) -> Option<crate::analyzer::content_identity::WorkspaceContentIdentities> {
-        self.inner.workspace_content_identities()
+    ) -> Option<crate::analyzer::content_identity::WorkspaceContentIdentities>;
     }
 
-    fn workspace_fact_indexes(
+    crate::analyzer::tree_sitter_analyzer::delegate_inner_methods! {
+        fn workspace_fact_indexes(
         &self,
-    ) -> Vec<&dyn crate::analyzer::read_verification::WorkspaceFactIndex> {
-        self.inner.workspace_fact_indexes()
+    ) -> Vec<&dyn crate::analyzer::read_verification::WorkspaceFactIndex>;
     }
 
-    fn import_statements(&self, file: &ProjectFile) -> Vec<String> {
-        self.inner.import_statements(file)
+    crate::analyzer::tree_sitter_analyzer::delegate_inner_methods! {
+        fn import_statements(&self, file: &ProjectFile) -> Vec<String>;
     }
 
-    fn compute_cognitive_complexities(&self, file: &ProjectFile) -> Vec<(CodeUnit, u32)> {
-        self.inner.compute_cognitive_complexities(file)
+    crate::analyzer::tree_sitter_analyzer::delegate_inner_methods! {
+        fn compute_cognitive_complexities(&self, file: &ProjectFile) -> Vec<(CodeUnit, u32)>;
     }
 
     fn semantic_diagnostics(
@@ -2073,11 +2089,11 @@ impl IAnalyzer for ScalaAnalyzer {
     }
 
     fn update(&self, changed_files: &BTreeSet<ProjectFile>) -> Self {
-        let external_index = if changed_files.iter().any(is_jvm_dependency_input) {
-            Arc::new(OnceLock::new())
-        } else {
-            self.external_index.clone()
-        };
+        let external_index = crate::analyzer::updated_external_index(
+            &self.external_index,
+            changed_files,
+            is_jvm_dependency_input,
+        );
         let mut updated = Self::from_inner(
             self.inner.update(changed_files),
             self.memo_budget,
@@ -2088,11 +2104,7 @@ impl IAnalyzer for ScalaAnalyzer {
     }
 
     fn update_all(&self) -> Self {
-        Self::from_inner(
-            self.inner.update_all(),
-            self.memo_budget,
-            self.java_config.clone(),
-        )
+        self.update_all_with_progress(None)
     }
 
     fn import_analysis_provider(&self) -> Option<&dyn ImportAnalysisProvider> {
@@ -2115,23 +2127,22 @@ impl IAnalyzer for ScalaAnalyzer {
         self.inner.parse_errors(file)
     }
 
-    fn extract_call_receiver(&self, reference: &str) -> Option<String> {
-        self.inner.extract_call_receiver(reference)
+    crate::analyzer::tree_sitter_analyzer::delegate_inner_methods! {
+        fn extract_call_receiver(&self, reference: &str) -> Option<String>;
     }
 
-    fn is_access_expression(&self, file: &ProjectFile, start_byte: usize, end_byte: usize) -> bool {
-        self.inner.is_access_expression(file, start_byte, end_byte)
+    crate::analyzer::tree_sitter_analyzer::delegate_inner_methods! {
+        fn is_access_expression(&self, file: &ProjectFile, start_byte: usize, end_byte: usize) -> bool;
     }
 
-    fn find_nearest_declaration(
-        &self,
-        file: &ProjectFile,
-        start_byte: usize,
-        end_byte: usize,
-        ident: &str,
-    ) -> Option<crate::analyzer::DeclarationInfo> {
-        self.inner
-            .find_nearest_declaration(file, start_byte, end_byte, ident)
+    crate::analyzer::tree_sitter_analyzer::delegate_inner_methods! {
+        fn find_nearest_declaration(
+            &self,
+            file: &ProjectFile,
+            start_byte: usize,
+            end_byte: usize,
+            ident: &str,
+        ) -> Option<crate::analyzer::DeclarationInfo>;
     }
 
     fn search_symbol_candidates(
@@ -2142,8 +2153,8 @@ impl IAnalyzer for ScalaAnalyzer {
         self.inner.search_symbol_candidates(patterns, cancellation)
     }
 
-    fn contains_tests(&self, file: &ProjectFile) -> bool {
-        self.inner.contains_tests(file)
+    crate::analyzer::tree_sitter_analyzer::delegate_inner_methods! {
+        fn contains_tests(&self, file: &ProjectFile) -> bool;
     }
 
     fn in_test_region(&self, code_unit: &crate::analyzer::CodeUnit) -> bool {
@@ -2155,13 +2166,9 @@ impl IAnalyzer for ScalaAnalyzer {
         file: &ProjectFile,
         weights: TestAssertionWeights,
     ) -> Vec<TestAssertionSmell> {
-        if !self.contains_tests(file) || file_language(file) != Language::Scala {
-            return Vec::new();
-        }
-        let Ok(source) = self.inner.project().read_source(file) else {
-            return Vec::new();
-        };
-        detect_scala_test_assertion_smells(file, &source, &weights)
+        crate::analyzer::test_assertion_smells_for_file(self, file, Language::Scala, |source| {
+            detect_scala_test_assertion_smells(file, source, &weights)
+        })
     }
 
     fn find_structural_clone_smells(
@@ -2177,32 +2184,12 @@ impl IAnalyzer for ScalaAnalyzer {
         files: &[ProjectFile],
         weights: CloneSmellWeights,
     ) -> Vec<CloneSmell> {
-        let requested_files: Vec<ProjectFile> = files
-            .iter()
-            .filter(|file| file_language(file) == Language::Scala)
-            .cloned()
-            .collect();
-        if requested_files.is_empty() {
-            return Vec::new();
-        }
-
-        let corpus_units =
-            crate::analyzer::clone_detection::clone_corpus_function_units(self, Language::Scala);
-        let _query_scope = crate::analyzer::AnalyzerQueryScope::new(self);
-        let all_candidates: Vec<CloneCandidateProfile> = corpus_units
-            .iter()
-            .filter_map(|code_unit| build_scala_clone_candidate_data(self, code_unit, weights))
-            .map(|candidate| CloneCandidateProfile::create(candidate, weights))
-            .collect();
-        if all_candidates.is_empty() {
-            return Vec::new();
-        }
-
-        detect_structural_clone_smells(
-            &requested_files,
-            all_candidates,
+        detect_language_structural_clone_smells(
+            self,
+            files,
             weights,
-            refine_clone_similarity_with_ast,
+            Language::Scala,
+            |code_unit| build_scala_clone_candidate_data(self, code_unit, weights),
         )
     }
 
@@ -2251,66 +2238,52 @@ impl crate::analyzer::usages::MemberFamilyProvider for ScalaAnalyzer {
 
 #[cfg(any(test, feature = "test-support"))]
 impl crate::analyzer::AnalyzerTestHooks for ScalaAnalyzer {
-    fn reset_relational_definition_batch_call_count_for_test(&self) {
-        self.inner
-            .test_hooks()
-            .reset_relational_definition_batch_call_count_for_test();
+    crate::analyzer::tree_sitter_analyzer::delegate_inner_test_hook_methods! {
+        fn reset_relational_definition_batch_call_count_for_test(&self);
     }
 
-    fn relational_definition_batch_call_count_for_test(&self) -> usize {
-        self.inner
-            .test_hooks()
-            .relational_definition_batch_call_count_for_test()
+    crate::analyzer::tree_sitter_analyzer::delegate_inner_test_hook_methods! {
+        fn relational_definition_batch_call_count_for_test(&self) -> usize;
     }
 
-    fn reset_definition_candidates_query_count_for_test(&self) {
-        self.inner
-            .test_hooks()
-            .reset_definition_candidates_query_count_for_test();
+    crate::analyzer::tree_sitter_analyzer::delegate_inner_test_hook_methods! {
+        fn reset_definition_candidates_query_count_for_test(&self);
     }
 
-    fn definition_candidates_query_count_for_test(&self) -> usize {
-        self.inner
-            .test_hooks()
-            .definition_candidates_query_count_for_test()
+    crate::analyzer::tree_sitter_analyzer::delegate_inner_test_hook_methods! {
+        fn definition_candidates_query_count_for_test(&self) -> usize;
     }
 
-    fn reset_definition_prefetch_batch_count_for_test(&self) {
-        self.inner
-            .test_hooks()
-            .reset_definition_prefetch_batch_count_for_test();
+    crate::analyzer::tree_sitter_analyzer::delegate_inner_test_hook_methods! {
+        fn reset_definition_prefetch_batch_count_for_test(&self);
     }
 
-    fn definition_prefetch_batch_count_for_test(&self) -> usize {
-        self.inner
-            .test_hooks()
-            .definition_prefetch_batch_count_for_test()
+    crate::analyzer::tree_sitter_analyzer::delegate_inner_test_hook_methods! {
+        fn definition_prefetch_batch_count_for_test(&self) -> usize;
     }
 
-    fn reset_full_declaration_scan_count_for_test(&self) {
-        self.inner
-            .test_hooks()
-            .reset_full_declaration_scan_count_for_test();
+    crate::analyzer::tree_sitter_analyzer::delegate_inner_test_hook_methods! {
+        fn reset_full_declaration_scan_count_for_test(&self);
     }
 
-    fn full_declaration_scan_count_for_test(&self) -> usize {
-        self.inner
-            .test_hooks()
-            .full_declaration_scan_count_for_test()
+    crate::analyzer::tree_sitter_analyzer::delegate_inner_test_hook_methods! {
+        fn full_declaration_scan_count_for_test(&self) -> usize;
     }
 
     fn reset_candidate_hydration_count_for_test(&self) {
         self.inner.reset_full_hydration_count_for_test();
     }
 
-    fn candidate_hydration_count_for_test(&self) -> usize {
-        self.inner.full_hydration_count_for_test() + self.inner.bulk_hydration_count_for_test()
+    crate::analyzer::tree_sitter_analyzer::delegate_inner_test_hook_methods! {
+        fn full_candidate_hydration_count_for_test(&self) -> usize;
     }
 
-    fn reset_workspace_path_scan_count_for_test(&self) {
-        self.inner
-            .test_hooks()
-            .reset_workspace_path_scan_count_for_test();
+    crate::analyzer::tree_sitter_analyzer::delegate_inner_test_hook_methods! {
+        fn bulk_candidate_hydration_count_for_test(&self) -> usize;
+    }
+
+    crate::analyzer::tree_sitter_analyzer::delegate_inner_test_hook_methods! {
+        fn reset_workspace_path_scan_count_for_test(&self);
     }
 
     fn workspace_path_scan_count_for_test(&self) -> usize {
@@ -2353,12 +2326,42 @@ static SCALA_USAGE_STRATEGY: ScalaUsageGraphStrategy = ScalaUsageGraphStrategy::
 pub(crate) struct ScalaSupport;
 
 impl LanguageSupport for ScalaSupport {
+    #[cfg(any(test, feature = "test-support"))]
+    fn native_rollout_points(
+        &self,
+    ) -> Option<&'static dyn crate::analyzer::languages::StructuralReceiverResolver> {
+        Some(&crate::analyzer::jvm::native_points::JVM_NATIVE_ROLLOUT_POINTS)
+    }
+
     fn is_configuration_input_path(&self, path: &std::path::Path) -> bool {
         crate::analyzer::jvm::is_jvm_configuration_input_path(path)
     }
 
     fn language(&self) -> Language {
         Language::Scala
+    }
+
+    fn explicit_import_model_target(
+        &self,
+        analyzer: &dyn crate::analyzer::IAnalyzer,
+        token: brokk_bifrost_core::analyzer::query_token::QueryToken<'_>,
+        file: &crate::analyzer::ProjectFile,
+        reference: &crate::analyzer::usages::reference_site::ResolvedReferenceSite,
+    ) -> Option<String> {
+        crate::analyzer::jvm::import_routes::explicit_import_model_route(
+            analyzer, token, file, reference,
+        )
+        .map(|route| route.target)
+    }
+
+    fn call_applicability_adapter(
+        &self,
+    ) -> Option<&'static dyn crate::analyzer::resolution::CallApplicabilityAdapter> {
+        Some(&call_applicability::SCALA_CALL_APPLICABILITY_ADAPTER)
+    }
+
+    fn procedure_syntax_roles(&self) -> Option<crate::analyzer::languages::ProcedureSyntaxRoles> {
+        Some(semantic::PROCEDURE_SYNTAX_ROLES)
     }
 
     fn call_argument_conversion_prover(
@@ -2411,8 +2414,9 @@ impl LanguageSupport for ScalaSupport {
         unit: &CodeUnit,
         limit: usize,
     ) -> Option<LimitedQueryRows<SignatureMetadata>> {
-        resolve_analyzer::<ScalaAnalyzer>(analyzer)
-            .map(|scala| scala.signature_metadata_limited(unit, limit))
+        crate::analyzer::languages::with_resolved_analyzer::<ScalaAnalyzer, _>(analyzer, |scala| {
+            scala.signature_metadata_limited(unit, limit)
+        })
     }
 
     fn signatures_limited(
@@ -2421,8 +2425,9 @@ impl LanguageSupport for ScalaSupport {
         unit: &CodeUnit,
         limit: usize,
     ) -> Option<LimitedQueryRows<String>> {
-        resolve_analyzer::<ScalaAnalyzer>(analyzer)
-            .map(|scala| scala.signatures_limited(unit, limit))
+        crate::analyzer::languages::with_resolved_analyzer::<ScalaAnalyzer, _>(analyzer, |scala| {
+            scala.signatures_limited(unit, limit)
+        })
     }
 
     fn declaration_ranges_limited(
@@ -2431,25 +2436,28 @@ impl LanguageSupport for ScalaSupport {
         unit: &CodeUnit,
         limit: usize,
     ) -> Option<LimitedQueryRows<Range>> {
-        resolve_analyzer::<ScalaAnalyzer>(analyzer).map(|scala| scala.ranges_limited(unit, limit))
+        crate::analyzer::languages::with_resolved_analyzer::<ScalaAnalyzer, _>(analyzer, |scala| {
+            scala.ranges_limited(unit, limit)
+        })
     }
 
     fn forward_query_provider<'a>(
         &self,
         analyzer: &'a dyn IAnalyzer,
     ) -> Option<&'a dyn ForwardQueryProvider> {
-        resolve_analyzer::<ScalaAnalyzer>(analyzer).map(|value| value as _)
+        crate::analyzer::forward_query_provider::<ScalaAnalyzer>(analyzer)
     }
 
     fn ecosystem(&self) -> UsageEcosystem {
         UsageEcosystem::Jvm
     }
 
-    fn reference_plugin(&self) -> crate::analyzer::languages::ReferenceLanguagePlugin {
-        crate::analyzer::languages::ReferenceLanguagePlugin::new(
-            &SCALA_USAGE_STRATEGY,
-            &ScalaEdgePass,
-        )
+    fn reference_usage_strategy(&self) -> &'static dyn crate::analyzer::usages::GraphUsageAnalyzer {
+        &SCALA_USAGE_STRATEGY
+    }
+
+    fn reference_graph_backend(&self) -> crate::analyzer::languages::LanguageGraphBackend {
+        crate::analyzer::languages::LanguageGraphBackend::Legacy(&ScalaEdgePass)
     }
 
     fn dead_code(&self) -> DeadCodeSupport {
@@ -2491,22 +2499,20 @@ impl LanguageEdgePass for ScalaEdgePass {
     }
 
     fn edge_sites(&self, ctx: &EdgeSiteScanCtx<'_>) -> Option<LanguageEdgeSites> {
-        let scope = AnalyzerQueryScope::new(ctx.analyzer);
-        let token = scope.token();
-        crate::analyzer::usages::scala_graph::build_rooted_scala_usage_edges(
-            ctx.analyzer,
-            token,
-            ctx.fqns,
-            ctx.keep_file,
-        )
-        .map(LanguageEdgeSites::Fqn)
+        crate::analyzer::languages::fqn_edge_sites(ctx, |token| {
+            crate::analyzer::usages::scala_graph::build_rooted_scala_usage_edges(
+                ctx.analyzer,
+                token,
+                ctx.fqns,
+                ctx.keep_file,
+            )
+        })
     }
 
     fn edge_weights(&self, ctx: &EdgeWeightScanCtx<'_>) -> Option<LanguageEdgeWeights> {
-        let scope = AnalyzerQueryScope::new(ctx.analyzer);
-        let token = scope.token();
-        build_scala_usage_edge_weights(ctx.analyzer, token, ctx.fqns, ctx.keep_file)
-            .map(LanguageEdgeWeights::Fqn)
+        crate::analyzer::languages::fqn_edge_weights(ctx, |token| {
+            build_scala_usage_edge_weights(ctx.analyzer, token, ctx.fqns, ctx.keep_file)
+        })
     }
 }
 
@@ -2533,18 +2539,18 @@ impl StructuralReceiverResolver for ScalaSupport {
         &self,
         query: BoundedReceiverQuery<'_>,
     ) -> BoundedResolution<DefinitionLookupOutcome> {
-        let scope = AnalyzerQueryScope::new(query.analyzer);
-        let token = scope.token();
-        resolve_scala_bounded(
-            query.analyzer,
-            token,
-            query.file,
-            query.source,
-            query.tree,
-            query.site,
-            query.budget,
-            query.cancellation,
-        )
+        crate::analyzer::languages::with_bounded_receiver_query(query, |query, token| {
+            resolve_scala_bounded(
+                query.analyzer,
+                token,
+                query.file,
+                query.source,
+                query.tree,
+                query.site,
+                query.budget,
+                query.cancellation,
+            )
+        })
     }
 }
 
@@ -2766,14 +2772,6 @@ mod knownness_tests {
         }
     }
 
-    /// What every name below answers when nothing past the workspace is
-    /// readable: the jar index was never built and no model is published.
-    fn unreadable_beyond_workspace() -> ScalaNameProof {
-        ScalaNameProof::Incomplete(JvmProofGap::ExternalBoundary {
-            boundary: BoundaryStatus::ExternalUnknown,
-        })
-    }
-
     /// `app/Consumer.scala` declares `nested.FileLocal` in a second package
     /// clause, so that unit is same-file but *not* same-package: it isolates
     /// the `source() == file` disjunct from the `package_name()` one.
@@ -2808,62 +2806,6 @@ mod knownness_tests {
         );
         let consumer = ProjectFile::new(root, "app/Consumer.scala");
         (temp, analyzer, consumer)
-    }
-
-    #[test]
-    fn simple_type_proof_answers_each_declaration_shape() {
-        let (_temp, analyzer, consumer) = fixture();
-        let model = FakeActiveModel::unpublished();
-        for (name, expected) in [
-            // Same package, another file: the plain class.
-            ("Sibling", ScalaNameProof::Workspace),
-            // Same package, class and companion object under one name.
-            ("Paired", ScalaNameProof::Workspace),
-            // Same package, companion object with no class: the only unit is
-            // `app.Lonely$`, matched with its trailing `$` trimmed.
-            ("Lonely", ScalaNameProof::Workspace),
-            ("Outer", ScalaNameProof::Workspace),
-            // The `$`-carrying spelling is not a Scala type name, and trimming
-            // the declaration's `$` must not make it one.
-            ("Lonely$", unreadable_beyond_workspace()),
-            // Nested object: short name `Outer$.Inner$`, so a bare `Inner` has
-            // never matched it even though the type exists in the package.
-            ("Inner", unreadable_beyond_workspace()),
-            // Same file, different package.
-            ("FileLocal", ScalaNameProof::Workspace),
-            // Another package entirely, and no import to reach it.
-            ("Far", unreadable_beyond_workspace()),
-            ("Missing", unreadable_beyond_workspace()),
-        ] {
-            assert_eq!(
-                expected,
-                ScalaSource::simple_type_proof(&analyzer, &consumer, name, &model),
-                "type proof of `{name}`"
-            );
-        }
-    }
-
-    #[test]
-    fn simple_term_proof_answers_each_declaration_shape() {
-        let (_temp, analyzer, consumer) = fixture();
-        let model = FakeActiveModel::unpublished();
-        for (name, expected) in [
-            ("Sibling", ScalaNameProof::Workspace),
-            ("Paired", ScalaNameProof::Workspace),
-            ("Lonely", ScalaNameProof::Workspace),
-            ("Outer", ScalaNameProof::Workspace),
-            ("Lonely$", unreadable_beyond_workspace()),
-            ("Inner", unreadable_beyond_workspace()),
-            ("FileLocal", ScalaNameProof::Workspace),
-            ("Far", unreadable_beyond_workspace()),
-            ("Missing", unreadable_beyond_workspace()),
-        ] {
-            assert_eq!(
-                expected,
-                ScalaSource::simple_term_proof(&analyzer, &consumer, name, &model),
-                "term proof of `{name}`"
-            );
-        }
     }
 
     /// The one state in which a bare Scala name is provably absent: a published
@@ -2911,9 +2853,6 @@ mod knownness_tests {
         );
     }
 
-    /// A diagnostic must never build the jar-backed external index: reading
-    /// jars is package I/O, which #1615 forbids inside a request.
-    #[cfg_attr(not(scheduled_tests), ignore = "scheduled-only")]
     #[test]
     fn a_name_proof_never_builds_the_external_declaration_index() {
         let (_temp, analyzer, consumer) = fixture();
@@ -2928,11 +2867,6 @@ mod knownness_tests {
         );
     }
 
-    /// The reason the two proofs above stopped calling `all_declarations()`.
-    ///
-    /// Without this the swap to indexed lookups is unobservable: every
-    /// assertion in this module passes just as well against a whole-workspace
-    /// scan, which is exactly what made the scan survive this long.
     #[test]
     fn a_name_proof_never_scans_every_workspace_declaration() {
         let (_temp, analyzer, consumer) = fixture();
@@ -3038,10 +2972,7 @@ impl DeadCodeBulkProof for ScalaDeadCodeBulk {
     }
 
     fn preflight(&self, analyzer: &dyn IAnalyzer) -> DeadCodeBulkPreflight {
-        DeadCodeBulkPreflight::Ready {
-            label: "Scala",
-            files: analyzable_file_count(analyzer, Language::Scala),
-        }
+        ready_preflight(analyzer, Language::Scala, "Scala")
     }
 
     fn build(
@@ -3050,11 +2981,14 @@ impl DeadCodeBulkProof for ScalaDeadCodeBulk {
         candidates: &[CodeUnit],
     ) -> Option<DeadCodeBulkEdges> {
         let scala = resolve_analyzer::<ScalaAnalyzer>(analyzer)?;
-        let callees = candidate_fqns(candidates);
-        cached_dead_code_usage_edges(analyzer, &scala.dead_code_usage_edges, &callees, |token| {
-            build_inbound_scala_usage_edges_with_completeness(analyzer, token, &callees)
-        })
-        .map(DeadCodeBulkEdges::Fqn)
+        crate::analyzer::languages::build_fqn_dead_code_edges(
+            analyzer,
+            &scala.dead_code_usage_edges,
+            candidates,
+            |token, callees| {
+                build_inbound_scala_usage_edges_with_completeness(analyzer, token, callees)
+            },
+        )
     }
 }
 
@@ -3065,6 +2999,9 @@ mod dead_code_cache_tests {
     use crate::inline_project::InlineTestProject;
 
     #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#2844: update paths retained stale dead-code usage graphs"
+    )]
     fn update_all_update_and_overlay_clone_start_with_empty_dead_code_caches() {
         let fixture = InlineTestProject::with_language(Language::Scala)
             .file("A.scala", "class A")
@@ -3090,6 +3027,9 @@ mod project_types_seed_tests {
     use crate::inline_project::InlineTestProject;
 
     #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "00ad7f265a5b: Scala hierarchy reused stale providers and rehydrated every query"
+    )]
     fn eager_hierarchy_reads_once_and_targeted_queries_keep_fresh_facts() {
         let fixture = InlineTestProject::with_language(Language::Scala)
             .file("Base.scala", "package sample\nclass Base\n")

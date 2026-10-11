@@ -5,7 +5,7 @@ description: What Bifrost provides and how it fits into Brokk workflows.
 
 Bifrost is Brokk's Rust-based static analysis engine for AI coding harnesses. It is built around structured repository facts rather than raw text search.
 
-Bifrost can parse mixed-language workspaces, expose code intelligence through MCP, run as an LSP server for editors, and serve Rust or Python callers directly.
+Bifrost can parse mixed-language workspaces, expose code intelligence through MCP, run one-shot queries and policy checks from the command line, and serve Rust or Python callers directly. Editors use the separate `bifrost-lsp` language server; see [LSP Server](/lsp/).
 
 ## Built for Large Repositories
 
@@ -19,7 +19,7 @@ models, result contract, design decisions, outlook, and related work.
 
 ## Language Coverage
 
-Bifrost includes analyzers for Java, JavaScript, TypeScript, Rust, Go, Python, C, C++, C#, PHP, Scala, Ruby, and Kotlin.
+Bifrost includes analyzers for Java, JavaScript, TypeScript, Rust, Go, Python, C, C++, C#, PHP, Scala, Ruby, and Kotlin. The [Languages reference](/reference/languages/) lists the file extensions each analyzer reads and the files it does not analyze, such as `.vue` templates and `.pyi` stubs.
 
 Bifrost uses Tree-sitter parsers as the common syntax foundation across those
 languages. The parsed trees are adapted into reusable analyzer concepts where
@@ -29,15 +29,11 @@ its compiler or interpreter model, Bifrost keeps language-specific modelling and
 sub-analysis instead of flattening those rules into a lowest-common-denominator
 abstraction.
 
-See [Language and Analysis Capabilities](/capabilities/) for the language-by-capability matrix, precision tiers, external-dependency boundary, bounded receiver provenance, experimental data-flow and typestate baseline, and remaining whole-program precision boundaries. If you are deciding which Bifrost surface to use, start with [Choose Bifrost](/choose-bifrost/).
+See [Language and Analysis Capabilities](/capabilities/) for the language-by-capability matrix, precision tiers, external-dependency boundary, bounded receiver provenance, experimental data-flow and typestate baseline, and remaining whole-program precision boundaries. The [Languages reference](/reference/languages/) has the complete per-language tables. If you are deciding which Bifrost surface to use, start with [Choose Bifrost](/choose-bifrost/).
 
 ## Main Surfaces
 
-- MCP server: code-navigation tools for AI agents.
-- LSP server: code-navigation features for editors.
-- CLI tool mode: one-shot terminal access to individual Bifrost tools.
-- Rust crate and Python wheel: embedded analyzer APIs.
-
-## Internal Documentation Boundary
-
-The rendered docs in this directory are for human readers. Internal agent notes live under `.agents/docs/`, and implementation ExecPlans live under `.agents/plans/`.
+- [MCP server](/mcp/): code-navigation tools for AI agents. The `bifrost` binary serves it.
+- [CLI](/cli/): one-shot tool calls, saved queries, an interactive query prompt, and policy scans from the terminal.
+- [Rust crate](/rust-library/) and [Python wheel](/python-client/): embedded analyzer APIs.
+- [LSP server](/lsp/): code-navigation features for editors. The separate `bifrost-lsp` program serves it, not the `bifrost` binary.

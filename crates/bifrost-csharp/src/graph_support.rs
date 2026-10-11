@@ -337,14 +337,10 @@ fn with_usage_definitions<R>(
     token: QueryToken<'_>,
     read: impl FnOnce(&dyn BoundedDefinitionLookup) -> R,
 ) -> R {
-    let mut read = Some(read);
-    let mut result = None;
-    source.with_usage_definitions(token, &mut |lookup| {
-        if let Some(read) = read.take() {
-            result = Some(read(lookup));
-        }
-    });
-    result.expect("C# definition lookup access must invoke its consumer exactly once")
+    brokk_bifrost_core::analyzer::definition_lookup::with_usage_definitions_once(
+        |consumer| source.with_usage_definitions(token, consumer),
+        read,
+    )
 }
 
 pub fn usage_declaration_candidates_by_identifier(
@@ -367,7 +363,7 @@ pub fn declaration_candidates_by_fqn(
     let arity_key = csharp_arity_preserving_full_name(fqn);
     candidates
         .into_iter()
-        .filter(|candidate| csharp_arity_preserving_full_name(&candidate.fq_name()) == arity_key)
+        .filter(|candidate| has_csharp_arity_key(candidate, &arity_key))
         .collect()
 }
 
@@ -386,11 +382,15 @@ pub fn declaration_candidates_by_fqn_limited(
     );
     if normalized {
         let arity_key = csharp_arity_preserving_full_name(fqn);
-        batch.rows.retain(|candidate| {
-            csharp_arity_preserving_full_name(&candidate.fq_name()) == arity_key
-        });
+        batch
+            .rows
+            .retain(|candidate| has_csharp_arity_key(candidate, &arity_key));
     }
     batch
+}
+
+fn has_csharp_arity_key(candidate: &CodeUnit, arity_key: &str) -> bool {
+    csharp_arity_preserving_full_name(&candidate.fq_name()) == arity_key
 }
 
 pub fn usage_member_candidates_for_owner(
@@ -417,24 +417,7 @@ fn usage_type_candidates_by_fqn_in(
     lookup: &dyn BoundedDefinitionLookup,
     fqn: &str,
 ) -> Vec<CodeUnit> {
-    let exact = lookup
-        .fqn(fqn)
-        .iter()
-        .filter(|unit| unit.is_class())
-        .cloned()
-        .collect::<Vec<_>>();
-    if !exact.is_empty() {
-        return exact;
-    }
-    let arity_key = csharp_arity_preserving_full_name(fqn);
-    lookup
-        .by_normalized_fqn(&csharp_normalize_full_name(fqn))
-        .iter()
-        .filter(|unit| {
-            unit.is_class() && csharp_arity_preserving_full_name(&unit.fq_name()) == arity_key
-        })
-        .cloned()
-        .collect()
+    usage_definition_candidates_by_fqn_in_filter(lookup, fqn, CodeUnit::is_class)
 }
 
 pub fn usage_type_candidates_by_fqn(
@@ -451,7 +434,19 @@ fn usage_definition_candidates_by_fqn_in(
     lookup: &dyn BoundedDefinitionLookup,
     fqn: &str,
 ) -> Vec<CodeUnit> {
-    let exact = lookup.fqn(fqn);
+    usage_definition_candidates_by_fqn_in_filter(lookup, fqn, |_| true)
+}
+
+fn usage_definition_candidates_by_fqn_in_filter(
+    lookup: &dyn BoundedDefinitionLookup,
+    fqn: &str,
+    mut include: impl FnMut(&CodeUnit) -> bool,
+) -> Vec<CodeUnit> {
+    let exact = lookup
+        .fqn(fqn)
+        .into_iter()
+        .filter(|unit| include(unit))
+        .collect::<Vec<_>>();
     if !exact.is_empty() {
         return exact;
     }
@@ -459,7 +454,9 @@ fn usage_definition_candidates_by_fqn_in(
     lookup
         .by_normalized_fqn(&csharp_normalize_full_name(fqn))
         .iter()
-        .filter(|unit| csharp_arity_preserving_full_name(&unit.fq_name()) == arity_key)
+        .filter(|unit| {
+            include(unit) && csharp_arity_preserving_full_name(&unit.fq_name()) == arity_key
+        })
         .cloned()
         .collect()
 }
@@ -539,17 +536,9 @@ pub fn arity_free_declaration_type_candidates_by_fqn(
         .into_iter()
         .filter(|unit| unit.is_class())
         .collect::<Vec<_>>();
-    let arity_key = csharp_arity_preserving_full_name(fqn);
-    let exact_arity = candidates
-        .iter()
-        .filter(|unit| csharp_arity_preserving_full_name(&unit.fq_name()) == arity_key)
-        .cloned()
-        .collect::<Vec<_>>();
-    if exact_arity.is_empty() {
-        candidates
-    } else {
-        exact_arity
-    }
+    let mut candidates = candidates;
+    retain_exact_arity_candidates(&mut candidates, fqn);
+    candidates
 }
 
 /// The persisted, budgeted counterpart of
@@ -569,21 +558,23 @@ pub fn arity_free_declaration_type_candidates_by_fqn_limited(
         &mut continue_query,
     );
     normalized.rows.retain(CodeUnit::is_class);
-    let arity_key = csharp_arity_preserving_full_name(fqn);
-    let has_exact_arity = normalized
-        .rows
-        .iter()
-        .any(|unit| csharp_arity_preserving_full_name(&unit.fq_name()) == arity_key);
-    if has_exact_arity {
-        normalized
-            .rows
-            .retain(|unit| csharp_arity_preserving_full_name(&unit.fq_name()) == arity_key);
-    } else if !normalized.complete {
+    if !retain_exact_arity_candidates(&mut normalized.rows, fqn) && !normalized.complete {
         // A later row may still be an exact arity-zero declaration, which has
         // precedence over every generic candidate already observed.
         normalized.rows.clear();
     }
     normalized
+}
+
+fn retain_exact_arity_candidates(candidates: &mut Vec<CodeUnit>, fqn: &str) -> bool {
+    let arity_key = csharp_arity_preserving_full_name(fqn);
+    let has_exact_arity = candidates
+        .iter()
+        .any(|candidate| has_csharp_arity_key(candidate, &arity_key));
+    if has_exact_arity {
+        candidates.retain(|candidate| has_csharp_arity_key(candidate, &arity_key));
+    }
+    has_exact_arity
 }
 
 // ---------------------------------------------------------------------------
@@ -696,27 +687,51 @@ pub fn compute_using_namespaces_of_limited(
     }
 
     let imports = source.import_info_of_limited(token, file, limit);
-    let mut namespaces: Vec<_> = imports
-        .rows
-        .into_iter()
-        .filter_map(|import| csharp_using_namespace(&import))
-        .collect();
+    combine_limited_local_global_imports(
+        imports,
+        limit,
+        continue_query,
+        |imports| {
+            imports
+                .into_iter()
+                .filter_map(|import| csharp_using_namespace(&import))
+                .collect()
+        },
+        |remaining, continue_query| {
+            source.global_using_namespaces_limited(remaining, continue_query)
+        },
+        |mut namespaces, globals| {
+            for namespace in globals {
+                if !namespaces.contains(&namespace) {
+                    namespaces.push(namespace);
+                }
+            }
+            namespaces
+        },
+    )
+}
+
+fn combine_limited_local_global_imports<T>(
+    imports: LimitedQueryRows<ImportInfo>,
+    limit: usize,
+    continue_query: &mut dyn FnMut() -> bool,
+    local_values: impl FnOnce(Vec<ImportInfo>) -> Vec<T>,
+    global_values: impl FnOnce(usize, &mut dyn FnMut() -> bool) -> LimitedQueryRows<T>,
+    merge: impl FnOnce(Vec<T>, Vec<T>) -> Vec<T>,
+) -> LimitedQueryRows<T> {
+    let local_rows = local_values(imports.rows);
     if !imports.complete {
-        return LimitedQueryRows::incomplete(namespaces, imports.inspected);
+        return LimitedQueryRows::incomplete(local_rows, imports.inspected);
     }
 
-    let globals = source
-        .global_using_namespaces_limited(limit.saturating_sub(imports.inspected), continue_query);
-    for namespace in globals.rows {
-        if !namespaces.contains(&namespace) {
-            namespaces.push(namespace);
-        }
-    }
+    let globals = global_values(limit.saturating_sub(imports.inspected), continue_query);
+    let rows = merge(local_rows, globals.rows);
     let inspected = imports.inspected.saturating_add(globals.inspected);
-    if !globals.complete {
-        return LimitedQueryRows::incomplete(namespaces, inspected);
+    if globals.complete {
+        LimitedQueryRows::complete(rows, inspected)
+    } else {
+        LimitedQueryRows::incomplete(rows, inspected)
     }
-    LimitedQueryRows::complete(namespaces, inspected)
 }
 
 // ---------------------------------------------------------------------------
@@ -1035,25 +1050,27 @@ pub fn compute_using_aliases_of_limited(
     }
 
     let imports = source.import_info_of_limited(token, file, limit);
-    let mut aliases: HashMap<String, String> = imports
-        .rows
-        .iter()
-        .filter_map(csharp_using_alias_from_import)
-        .collect();
-    if !imports.complete {
-        return LimitedQueryRows::incomplete(aliases.into_iter().collect(), imports.inspected);
-    }
-
-    let globals = source
-        .global_using_aliases_limited(limit.saturating_sub(imports.inspected), continue_query);
-    for (alias, target) in globals.rows {
-        aliases.entry(alias).or_insert(target);
-    }
-    let inspected = imports.inspected.saturating_add(globals.inspected);
-    if !globals.complete {
-        return LimitedQueryRows::incomplete(aliases.into_iter().collect(), inspected);
-    }
-    LimitedQueryRows::complete(aliases.into_iter().collect(), inspected)
+    combine_limited_local_global_imports(
+        imports,
+        limit,
+        continue_query,
+        |imports| {
+            imports
+                .iter()
+                .filter_map(csharp_using_alias_from_import)
+                .collect::<HashMap<String, String>>()
+                .into_iter()
+                .collect()
+        },
+        |remaining, continue_query| source.global_using_aliases_limited(remaining, continue_query),
+        |mut aliases, globals| {
+            let mut aliases: HashMap<String, String> = aliases.drain(..).collect();
+            for (alias, target) in globals {
+                aliases.entry(alias).or_insert(target);
+            }
+            aliases.into_iter().collect()
+        },
+    )
 }
 
 /// The uncached half of the analyzer's `global_using_namespaces`.
@@ -1067,10 +1084,7 @@ pub fn compute_global_using_namespaces(
         .flat_map(|file| source.import_info_of(token, &file).into_iter())
         .filter(|import| import.is_global)
         .filter_map(|import| csharp_using_namespace(&import))
-        .map(|namespace| {
-            normalize_csharp_type_fragment(namespace.strip_prefix("global::").unwrap_or(&namespace))
-        })
-        .filter(|namespace| !namespace.is_empty())
+        .filter_map(|namespace| normalize_global_using_target(&namespace))
         .collect()
 }
 
@@ -1086,10 +1100,7 @@ pub fn compute_global_using_namespaces_limited(
         .into_iter()
         .filter(|import| import.is_global)
         .filter_map(|import| csharp_using_namespace(&import))
-        .map(|namespace| {
-            normalize_csharp_type_fragment(namespace.strip_prefix("global::").unwrap_or(&namespace))
-        })
-        .filter(|namespace| !namespace.is_empty())
+        .filter_map(|namespace| normalize_global_using_target(&namespace))
         .collect();
     if !imports.complete {
         return LimitedQueryRows::incomplete(namespaces.into_iter().collect(), imports.inspected);
@@ -1136,21 +1147,26 @@ pub fn compute_global_static_using_type_names(
     source: &dyn CSharpSource,
     token: QueryToken<'_>,
 ) -> Vec<String> {
-    let mut names: Vec<_> = source
+    let mut names = compute_global_static_using_targets(source, token)
+        .into_iter()
+        .filter(|target| !target.is_empty())
+        .collect::<Vec<_>>();
+    names.sort();
+    names.dedup();
+    names
+}
+
+fn compute_global_static_using_targets(
+    source: &dyn CSharpSource,
+    token: QueryToken<'_>,
+) -> Vec<String> {
+    source
         .all_files()
         .into_iter()
         .flat_map(|file| source.import_info_of(token, &file).into_iter())
         .filter(|import| import.is_global)
-        .filter_map(|import| {
-            let target = csharp_static_using_from_import(&import)?;
-            let target =
-                normalize_csharp_type_fragment(target.strip_prefix("global::").unwrap_or(target));
-            (!target.is_empty()).then_some(target)
-        })
-        .collect();
-    names.sort();
-    names.dedup();
-    names
+        .filter_map(|import| normalized_static_using_target(&import))
+        .collect()
 }
 
 pub fn compute_global_static_using_type_names_limited(
@@ -1163,10 +1179,7 @@ pub fn compute_global_static_using_type_names_limited(
         .rows
         .iter()
         .filter(|import| import.is_global)
-        .filter_map(csharp_static_using_from_import)
-        .map(|target| {
-            normalize_csharp_type_fragment(target.strip_prefix("global::").unwrap_or(target))
-        })
+        .filter_map(normalized_static_using_target)
         .filter(|target| !target.is_empty())
         .collect();
     type_names.sort();
@@ -1184,17 +1197,8 @@ pub fn compute_global_static_using_types(
     token: QueryToken<'_>,
 ) -> Vec<CodeUnit> {
     let mut types = Vec::new();
-    for file in source.all_files() {
-        for target in source
-            .import_info_of(token, &file)
-            .iter()
-            .filter(|import| import.is_global)
-            .filter_map(csharp_static_using_from_import)
-        {
-            let target =
-                normalize_csharp_type_fragment(target.strip_prefix("global::").unwrap_or(target));
-            types.extend(type_candidates_by_fqn(source, token, &target, false));
-        }
+    for target in compute_global_static_using_targets(source, token) {
+        types.extend(type_candidates_by_fqn(source, token, &target, false));
     }
     types.sort();
     types.dedup();
@@ -1210,21 +1214,24 @@ pub fn compute_usage_global_static_using_types(
     token: QueryToken<'_>,
 ) -> Vec<CodeUnit> {
     let mut types = Vec::new();
-    for file in source.all_files() {
-        for target in source
-            .import_info_of(token, &file)
-            .iter()
-            .filter(|import| import.is_global)
-            .filter_map(csharp_static_using_from_import)
-        {
-            let target =
-                normalize_csharp_type_fragment(target.strip_prefix("global::").unwrap_or(target));
-            types.extend(type_candidates_by_fqn(source, token, &target, true));
-        }
+    for target in compute_global_static_using_targets(source, token) {
+        types.extend(type_candidates_by_fqn(source, token, &target, true));
     }
     types.sort();
     types.dedup();
     types
+}
+
+fn normalize_global_using_target(target: &str) -> Option<String> {
+    let target = target.strip_prefix("global::").unwrap_or(target);
+    let normalized = normalize_csharp_type_fragment(target);
+    (!normalized.is_empty()).then_some(normalized)
+}
+
+fn normalized_static_using_target(import: &ImportInfo) -> Option<String> {
+    let target = csharp_static_using_from_import(import)?;
+    let target = target.strip_prefix("global::").unwrap_or(target);
+    Some(normalize_csharp_type_fragment(target))
 }
 
 // ---------------------------------------------------------------------------
@@ -1505,6 +1512,30 @@ pub fn unique_logical_type(mut candidates: Vec<CodeUnit>) -> Option<CodeUnit> {
     candidates.into_iter().next()
 }
 
+/// Resolve the unique logical bases of each partial type part, then sort and
+/// deduplicate the resulting hierarchy edges. The callbacks retain each
+/// caller's query and cancellation policy; returning `None` stops the walk.
+pub fn logical_direct_ancestors(
+    parts: Vec<CodeUnit>,
+    mut raw_supertypes: impl FnMut(&CodeUnit) -> Option<Vec<String>>,
+    mut resolve_candidates: impl FnMut(&CodeUnit, &str) -> Option<Vec<CodeUnit>>,
+    mut accept_ancestor: impl FnMut(&CodeUnit) -> Option<()>,
+) -> Option<Vec<CodeUnit>> {
+    let mut ancestors = Vec::new();
+    for part in parts {
+        for raw in raw_supertypes(&part)? {
+            let candidates = resolve_candidates(&part, &raw)?;
+            let Some(ancestor) = unique_logical_type(candidates) else {
+                continue;
+            };
+            accept_ancestor(&ancestor)?;
+            ancestors.push(ancestor);
+        }
+    }
+    sort_dedup_type_candidates(&mut ancestors);
+    Some(ancestors)
+}
+
 // ---------------------------------------------------------------------------
 // Enclosing-type scopes
 // ---------------------------------------------------------------------------
@@ -1616,15 +1647,7 @@ pub fn partial_type_parts(source: &dyn CSharpSource, owner: &CodeUnit) -> Vec<Co
     if !owner.is_class() {
         return Vec::new();
     }
-    let owner_key = type_declaration_key(owner);
-    let mut parts: Vec<_> = source
-        .get_definitions(&owner.fq_name())
-        .into_iter()
-        .filter(|unit| unit.is_class() && type_declaration_key(unit) == owner_key)
-        .collect();
-    sort_type_candidates(&mut parts);
-    parts.dedup();
-    parts
+    partial_type_parts_for_owner(owner, source.get_definitions(&owner.fq_name()))
 }
 
 pub fn partial_type_parts_limited(
@@ -1665,14 +1688,22 @@ pub fn usage_partial_type_parts(
     if !owner.is_class() {
         return Vec::new();
     }
+    partial_type_parts_for_owner(
+        owner,
+        usage_definition_candidates_by_fqn(source, token, &owner.fq_name()),
+    )
+}
+
+fn partial_type_parts_for_owner(
+    owner: &CodeUnit,
+    candidates: impl IntoIterator<Item = CodeUnit>,
+) -> Vec<CodeUnit> {
+    let mut candidates = candidates.into_iter().collect::<Vec<_>>();
     let owner_key = type_declaration_key(owner);
-    let mut parts: Vec<_> = usage_definition_candidates_by_fqn(source, token, &owner.fq_name())
-        .into_iter()
-        .filter(|unit| unit.is_class() && type_declaration_key(unit) == owner_key)
-        .collect();
-    sort_type_candidates(&mut parts);
-    parts.dedup();
-    parts
+    candidates.retain(|unit| unit.is_class() && type_declaration_key(unit) == owner_key);
+    sort_type_candidates(&mut candidates);
+    candidates.dedup();
+    candidates
 }
 
 // ---------------------------------------------------------------------------
@@ -1681,17 +1712,8 @@ pub fn usage_partial_type_parts(
 // ---------------------------------------------------------------------------
 
 pub fn sort_dedup_type_candidates(candidates: &mut Vec<CodeUnit>) {
-    let mut keyed: Vec<_> = candidates
-        .drain(..)
-        .map(|unit| {
-            let key = type_declaration_key(&unit);
-            let source = brokk_bifrost_core::path_utils::rel_path_string(unit.source());
-            (unit, key, source)
-        })
-        .collect();
-    keyed.sort_by(|left, right| left.1.cmp(&right.1).then_with(|| left.2.cmp(&right.2)));
-    keyed.dedup_by(|left, right| left.1 == right.1);
-    candidates.extend(keyed.into_iter().map(|(unit, _, _)| unit));
+    sort_type_candidates(candidates);
+    candidates.dedup_by(|left, right| type_declaration_key(left) == type_declaration_key(right));
 }
 
 pub fn sort_type_candidates(candidates: &mut [CodeUnit]) {

@@ -3,9 +3,9 @@ title: JavaScript
 description: Query JavaScript member calls, arrows, class expressions, field access, and new expressions with query_code.
 ---
 
-> Last verified end to end: 2026-08-26 (`query_code` schema version 1).
+> Last verified end to end: 2026-10-01 (`query_code` schema version 1).
 
-For exact inbound and outbound symbol edges, proof tiers, and adapter-specific caveats, see [Reference Traversal](../reference-traversal/).
+For exact inbound and outbound symbol edges, proof tiers, and adapter-specific caveats, see [Reference Traversal](/code-query-tutorials/reference-traversal/).
 
 JavaScript normalizes functions, methods, constructors, arrows, class declarations and expressions, calls and `new`, imports, assignments, and member access. It does not invent keyword arguments for a language that has none.
 

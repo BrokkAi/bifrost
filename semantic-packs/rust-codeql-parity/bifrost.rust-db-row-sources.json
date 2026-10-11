@@ -1,0 +1,280 @@
+{
+  "schema_version": 2,
+  "pack_id": "bifrost.rust-db-row-sources",
+  "version": "0.1.0",
+  "producer": {
+    "name": "bifrost-reviewed-rust-threat-sources",
+    "version": "0.1.0"
+  },
+  "language": "rust",
+  "ecosystem": "cargo",
+  "compatibility": {
+    "bifrost": ">=0.12.0, <1.0.0",
+    "toolchains": []
+  },
+  "provenance": {
+    "source": "Reviewed database row source declarations and receiver-carrying summaries for postgres and rusqlite Row APIs.",
+    "revision": "database-row-api-shape"
+  },
+  "license": "Apache-2.0",
+  "completeness": "complete",
+  "safety": {
+    "generated_code_only": false,
+    "review_required": false
+  },
+  "shards": [
+    {
+      "id": "declarations.rust-codeql-parity.db-row-sources",
+      "activation": [
+        {
+          "targets": [],
+          "configurations": []
+        }
+      ],
+      "payload": {
+        "kind": "declaration_facts",
+        "types": [
+          {
+            "id": "type.cq01.rust-db.postgres-row",
+            "name": "postgres.Row",
+            "type_kind": "struct",
+            "visibility": "public",
+            "locator": {
+              "kind": "artifact",
+              "path": "src/row.rs",
+              "symbol": "postgres.Row"
+            }
+          },
+          {
+            "id": "type.cq01.rust-db.rusqlite-row",
+            "name": "rusqlite.Row",
+            "type_kind": "struct",
+            "visibility": "public",
+            "locator": {
+              "kind": "artifact",
+              "path": "src/row.rs",
+              "symbol": "rusqlite.Row"
+            }
+          }
+        ],
+        "members": [
+          {
+            "id": "member.cq01.rust-db-postgres-row-get",
+            "owner": "type.cq01.rust-db.postgres-row",
+            "name": "get",
+            "member_kind": "method",
+            "visibility": "public",
+            "is_static": false,
+            "callable_family_complete": true,
+            "signature": {
+              "parameters": [
+                {
+                  "name": "index",
+                  "type": {
+                    "kind": "named",
+                    "name": "untyped"
+                  }
+                }
+              ],
+              "returns": {
+                "kind": "named",
+                "name": "untyped"
+              }
+            },
+            "locator": {
+              "kind": "artifact",
+              "path": "src/row.rs",
+              "symbol": "postgres.Row.get"
+            }
+          },
+          {
+            "id": "member.cq01.rust-db-postgres-row-try_get",
+            "owner": "type.cq01.rust-db.postgres-row",
+            "name": "try_get",
+            "member_kind": "method",
+            "visibility": "public",
+            "is_static": false,
+            "callable_family_complete": true,
+            "signature": {
+              "parameters": [
+                {
+                  "name": "index",
+                  "type": {
+                    "kind": "named",
+                    "name": "untyped"
+                  }
+                }
+              ],
+              "returns": {
+                "kind": "named",
+                "name": "untyped"
+              }
+            },
+            "locator": {
+              "kind": "artifact",
+              "path": "src/row.rs",
+              "symbol": "postgres.Row.try_get"
+            }
+          },
+          {
+            "id": "member.cq01.rust-db-rusqlite-row-get",
+            "owner": "type.cq01.rust-db.rusqlite-row",
+            "name": "get",
+            "member_kind": "method",
+            "visibility": "public",
+            "is_static": false,
+            "callable_family_complete": true,
+            "signature": {
+              "parameters": [
+                {
+                  "name": "index",
+                  "type": {
+                    "kind": "named",
+                    "name": "untyped"
+                  }
+                }
+              ],
+              "returns": {
+                "kind": "named",
+                "name": "untyped"
+              }
+            },
+            "locator": {
+              "kind": "artifact",
+              "path": "src/row.rs",
+              "symbol": "rusqlite.Row.get"
+            }
+          },
+          {
+            "id": "member.cq01.rust-db-rusqlite-row-get_unwrap",
+            "owner": "type.cq01.rust-db.rusqlite-row",
+            "name": "get_unwrap",
+            "member_kind": "method",
+            "visibility": "public",
+            "is_static": false,
+            "callable_family_complete": true,
+            "signature": {
+              "parameters": [
+                {
+                  "name": "index",
+                  "type": {
+                    "kind": "named",
+                    "name": "untyped"
+                  }
+                }
+              ],
+              "returns": {
+                "kind": "named",
+                "name": "untyped"
+              }
+            },
+            "locator": {
+              "kind": "artifact",
+              "path": "src/row.rs",
+              "symbol": "rusqlite.Row.get_unwrap"
+            }
+          }
+        ],
+        "relations": []
+      }
+    },
+    {
+      "id": "summaries.rust-codeql-parity.db-row-sources",
+      "activation": [
+        {
+          "targets": [],
+          "configurations": []
+        }
+      ],
+      "payload": {
+        "kind": "procedure_summaries",
+        "summaries": [
+          {
+            "id": "summary.cq01.rust-db-postgres-row-get",
+            "target": {
+              "path": "src/row.rs",
+              "symbol": "postgres.Row.get",
+              "has_receiver": true,
+              "parameter_count": 1
+            },
+            "completeness": "complete",
+            "locations": [],
+            "transfers": [],
+            "effects": [
+              {
+                "kind": "allocation",
+                "event": "event.cq01.rust-db.postgres-row-get.result",
+                "output": {
+                  "kind": "normal_return"
+                }
+              }
+            ]
+          },
+          {
+            "id": "summary.cq01.rust-db-postgres-row-try_get",
+            "target": {
+              "path": "src/row.rs",
+              "symbol": "postgres.Row.try_get",
+              "has_receiver": true,
+              "parameter_count": 1
+            },
+            "completeness": "complete",
+            "locations": [],
+            "transfers": [],
+            "effects": [
+              {
+                "kind": "allocation",
+                "event": "event.cq01.rust-db.postgres-row-try-get.result",
+                "output": {
+                  "kind": "normal_return"
+                }
+              }
+            ]
+          },
+          {
+            "id": "summary.cq01.rust-db-rusqlite-row-get",
+            "target": {
+              "path": "src/row.rs",
+              "symbol": "rusqlite.Row.get",
+              "has_receiver": true,
+              "parameter_count": 1
+            },
+            "completeness": "complete",
+            "locations": [],
+            "transfers": [],
+            "effects": [
+              {
+                "kind": "allocation",
+                "event": "event.cq01.rust-db.rusqlite-row-get.result",
+                "output": {
+                  "kind": "normal_return"
+                }
+              }
+            ]
+          },
+          {
+            "id": "summary.cq01.rust-db-rusqlite-row-get_unwrap",
+            "target": {
+              "path": "src/row.rs",
+              "symbol": "rusqlite.Row.get_unwrap",
+              "has_receiver": true,
+              "parameter_count": 1
+            },
+            "completeness": "complete",
+            "locations": [],
+            "transfers": [],
+            "effects": [
+              {
+                "kind": "allocation",
+                "event": "event.cq01.rust-db.rusqlite-row-get-unwrap.result",
+                "output": {
+                  "kind": "normal_return"
+                }
+              }
+            ]
+          }
+        ]
+      }
+    }
+  ]
+}

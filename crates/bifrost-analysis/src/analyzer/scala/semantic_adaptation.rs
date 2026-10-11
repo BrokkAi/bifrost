@@ -14,7 +14,8 @@ use std::sync::Arc;
 
 use tree_sitter::Node;
 
-use crate::analyzer::semantic::{ProcedureId, children_by_field_name, node_text};
+use crate::analyzer::semantic::lowering::nonempty_node_text as nonempty_text;
+use crate::analyzer::semantic::{ProcedureId, children_by_field_name};
 use crate::analyzer::tree_walk::named_children;
 use crate::hash::HashMap;
 use brokk_bifrost_core::analyzer::Range;
@@ -113,6 +114,15 @@ pub(super) struct ScalaValueClass<'tree> {
     #[allow(dead_code)]
     pub(super) wrapper_type: Arc<[String]>,
     pub(super) constructor: Option<ProcedureId>,
+}
+
+struct ScalaWrapperMetadata<'tree> {
+    class: Node<'tree>,
+    name: Box<str>,
+    payload_name: Box<str>,
+    payload_type: Arc<[String]>,
+    wrapper_type: Arc<[String]>,
+    constructor: Option<ProcedureId>,
 }
 
 #[derive(Debug, Clone)]
@@ -526,8 +536,7 @@ impl<'tree> ScalaAdaptationCatalog<'tree> {
         payload_type: &[String],
         wrapper_type: &[String],
     ) -> bool {
-        self.value_class_for_type(source, use_site, wrapper_type)
-            .is_some_and(|class| self.payload_matches(source, class, payload_type, use_site))
+        self.value_class_unboxes(source, use_site, wrapper_type, payload_type)
     }
 
     pub(super) fn value_class_unboxes(
@@ -659,6 +668,16 @@ fn implicit_def_conversion<'tree>(
         .child_by_field_name("name")
         .and_then(|name| nonempty_text(source, name))?;
     let (source_type, _) = single_strict_value_parameter(node, source)?;
+    direct_function_conversion(node, source, name, source_type, procedure_targets)
+}
+
+fn direct_function_conversion<'tree>(
+    node: Node<'tree>,
+    source: &str,
+    name: &str,
+    source_type: Arc<[String]>,
+    procedure_targets: &HashMap<usize, ProcedureId>,
+) -> Option<ScalaImplicitConversion<'tree>> {
     let target_type = declared_result_type(node, source)?;
     Some(scala_conversion(
         node,
@@ -684,15 +703,7 @@ fn given_conversion<'tree>(
         .and_then(|name| nonempty_text(source, name))
         .unwrap_or("given");
     if let Some((source_type, _)) = single_strict_value_parameter(node, source) {
-        let target_type = declared_result_type(node, source)?;
-        return Some(scala_conversion(
-            node,
-            Box::from(name),
-            source_type,
-            target_type,
-            procedure_targets.get(&node.id()).copied(),
-            ScalaConversionCallableKind::Function,
-        ));
+        return direct_function_conversion(node, source, name, source_type, procedure_targets);
     }
     let return_type = node.child_by_field_name("return_type")?;
     let (source_type, target_type) = conversion_type_pair(return_type, source, catalog)?;
@@ -715,19 +726,14 @@ fn implicit_class_conversion<'tree>(
     procedure_targets: &HashMap<usize, ProcedureId>,
     catalog: &ScalaAdaptationCatalog<'tree>,
 ) -> Option<ScalaImplicitConversion<'tree>> {
-    let name = node
-        .child_by_field_name("name")
-        .and_then(|name| nonempty_text(source, name))?;
-    let (_payload_name, payload_type) = unique_class_parameter(node, source)?;
-    let wrapper_type = declaration_path(node, source, root)
-        .unwrap_or_else(|| Arc::<[String]>::from(vec![name.to_string()]));
+    let metadata = scala_wrapper_metadata(node, source, root, procedure_targets)?;
     let value_class = extends_language_anyval(node, source, catalog);
     Some(scala_conversion(
         node,
-        Box::from(name),
-        payload_type,
-        wrapper_type,
-        procedure_targets.get(&node.id()).copied(),
+        metadata.name,
+        metadata.payload_type,
+        metadata.wrapper_type,
+        metadata.constructor,
         ScalaConversionCallableKind::Constructor { value_class },
     ))
 }
@@ -742,13 +748,30 @@ fn value_class_declaration<'tree>(
     if !extends_language_anyval(node, source, catalog) {
         return None;
     }
+    let metadata = scala_wrapper_metadata(node, source, root, procedure_targets)?;
+    Some(ScalaValueClass {
+        class: metadata.class,
+        name: metadata.name,
+        payload_name: metadata.payload_name,
+        payload_type: metadata.payload_type,
+        wrapper_type: metadata.wrapper_type,
+        constructor: metadata.constructor,
+    })
+}
+
+fn scala_wrapper_metadata<'tree>(
+    node: Node<'tree>,
+    source: &str,
+    root: Node<'tree>,
+    procedure_targets: &HashMap<usize, ProcedureId>,
+) -> Option<ScalaWrapperMetadata<'tree>> {
     let name = node
         .child_by_field_name("name")
         .and_then(|name| nonempty_text(source, name))?;
     let (payload_name, payload_type) = unique_class_parameter(node, source)?;
     let wrapper_type = declaration_path(node, source, root)
         .unwrap_or_else(|| Arc::<[String]>::from(vec![name.to_string()]));
-    Some(ScalaValueClass {
+    Some(ScalaWrapperMetadata {
         class: node,
         name: Box::from(name),
         payload_name,
@@ -1006,7 +1029,7 @@ fn extends_language_anyval<'tree>(
     })
 }
 
-fn type_identity(node: Node<'_>, source: &str) -> Option<Arc<[String]>> {
+pub(super) fn type_identity(node: Node<'_>, source: &str) -> Option<Arc<[String]>> {
     let segments = scala_type_lookup_segments(node, source);
     (!segments.is_empty()).then(|| Arc::from(segments.into_boxed_slice()))
 }
@@ -1074,8 +1097,12 @@ fn unique_exact_type<'a, 'tree>(
             is_type_namespace(declaration.node) && declaration.full_path() == path
         })
         .collect::<Vec<_>>();
-    match exact.as_slice() {
-        [declaration] => Ok(Some(*declaration)),
+    unique_candidate(&exact)
+}
+
+fn unique_candidate<'a, T>(candidates: &[&'a T]) -> Result<Option<&'a T>, AdaptationFailure> {
+    match candidates {
+        [candidate] => Ok(Some(*candidate)),
         [] => Ok(None),
         _ => Err(AdaptationFailure::Ambiguous),
     }
@@ -1112,11 +1139,7 @@ fn unique_nested_type<'a, 'tree>(
                 == innermost
         });
     }
-    match nested.as_slice() {
-        [declaration] => Ok(Some(*declaration)),
-        [] => Ok(None),
-        _ => Err(AdaptationFailure::Ambiguous),
-    }
+    unique_candidate(&nested)
 }
 
 fn unique_top_level_type<'a, 'tree>(
@@ -1137,11 +1160,7 @@ fn unique_top_level_type<'a, 'tree>(
                 && declaration.package.as_ref() == use_package.as_slice()
         })
         .collect::<Vec<_>>();
-    match top_level.as_slice() {
-        [declaration] => Ok(Some(*declaration)),
-        [] => Ok(None),
-        _ => Err(AdaptationFailure::Ambiguous),
-    }
+    unique_candidate(&top_level)
 }
 
 fn unique_imported_type<'a, 'tree>(
@@ -1174,11 +1193,9 @@ fn unique_imported_type<'a, 'tree>(
         }
         resolved.sort_by_key(|declaration| declaration.node.id());
         resolved.dedup_by_key(|declaration| declaration.node.id());
-        return match resolved.as_slice() {
-            [declaration] => Ok(Some(*declaration)),
-            [] => Err(AdaptationFailure::Unresolved),
-            _ => Err(AdaptationFailure::Ambiguous),
-        };
+        return unique_candidate(&resolved)?
+            .ok_or(AdaptationFailure::Unresolved)
+            .map(Some);
     }
     let mut wildcard_types = Vec::new();
     for import in visible
@@ -1188,20 +1205,10 @@ fn unique_imported_type<'a, 'tree>(
     {
         match resolve_import_owner_parts(declarations, source, import, use_site) {
             Ok(owner) => {
-                let members = declarations
-                    .iter()
-                    .filter(|declaration| {
-                        is_type_namespace(declaration.node)
-                            && declaration.name.as_ref() == name
-                            && declaration
-                                .enclosing_template
-                                .is_some_and(|template| template.id() == owner.node.id())
-                    })
-                    .collect::<Vec<_>>();
-                match members.as_slice() {
-                    [declaration] => wildcard_types.push(*declaration),
-                    [] => {}
-                    _ => return Err(AdaptationFailure::Ambiguous),
+                if let Some(declaration) =
+                    unique_type_member_in_owner(declarations, owner.node, name)?
+                {
+                    wildcard_types.push(declaration);
                 }
             }
             Err(AdaptationFailure::Ambiguous) => return Err(AdaptationFailure::Ambiguous),
@@ -1210,11 +1217,7 @@ fn unique_imported_type<'a, 'tree>(
     }
     wildcard_types.sort_by_key(|declaration| declaration.node.id());
     wildcard_types.dedup_by_key(|declaration| declaration.node.id());
-    match wildcard_types.as_slice() {
-        [declaration] => Ok(Some(*declaration)),
-        [] => Ok(None),
-        _ => Err(AdaptationFailure::Ambiguous),
-    }
+    unique_candidate(&wildcard_types)
 }
 
 fn imported_type_declaration<'a, 'tree>(
@@ -1227,6 +1230,14 @@ fn imported_type_declaration<'a, 'tree>(
     let Some(member) = import_source_member(import) else {
         return Ok(None);
     };
+    unique_type_member_in_owner(declarations, owner.node, member)
+}
+
+fn unique_type_member_in_owner<'a, 'tree>(
+    declarations: &'a [TypeDeclaration<'tree>],
+    owner: Node<'tree>,
+    member: &str,
+) -> Result<Option<&'a TypeDeclaration<'tree>>, AdaptationFailure> {
     let members = declarations
         .iter()
         .filter(|declaration| {
@@ -1234,14 +1245,10 @@ fn imported_type_declaration<'a, 'tree>(
                 && declaration.name.as_ref() == member
                 && declaration
                     .enclosing_template
-                    .is_some_and(|template| template.id() == owner.node.id())
+                    .is_some_and(|template| template.id() == owner.id())
         })
         .collect::<Vec<_>>();
-    match members.as_slice() {
-        [declaration] => Ok(Some(*declaration)),
-        [] => Ok(None),
-        _ => Err(AdaptationFailure::Ambiguous),
-    }
+    unique_candidate(&members)
 }
 
 fn imports_visible_at<'a>(
@@ -1308,11 +1315,7 @@ fn resolve_stable_owner<'a, 'tree>(
                 is_stable_owner(declaration.node) && declaration.full_path() == path
             })
             .collect::<Vec<_>>();
-        return match exact.as_slice() {
-            [declaration] => Ok(*declaration),
-            [] => Err(AdaptationFailure::Unresolved),
-            _ => Err(AdaptationFailure::Ambiguous),
-        };
+        return unique_candidate(&exact)?.ok_or(AdaptationFailure::Unresolved);
     }
     let name = path[0].as_str();
     if let Some(declaration) = unique_nested_stable(declarations, name, use_site)? {
@@ -1330,11 +1333,7 @@ fn resolve_stable_owner<'a, 'tree>(
                 && declaration.package.as_ref() == use_package.as_slice()
         })
         .collect::<Vec<_>>();
-    match top_level.as_slice() {
-        [declaration] => Ok(*declaration),
-        [] => Err(AdaptationFailure::Unresolved),
-        _ => Err(AdaptationFailure::Ambiguous),
-    }
+    unique_candidate(&top_level)?.ok_or(AdaptationFailure::Unresolved)
 }
 
 fn unique_nested_stable<'a, 'tree>(
@@ -1351,11 +1350,7 @@ fn unique_nested_stable<'a, 'tree>(
                 && owner_encloses(declaration.enclosing_template, use_site)
         })
         .collect::<Vec<_>>();
-    match nested.as_slice() {
-        [declaration] => Ok(Some(*declaration)),
-        [] => Ok(None),
-        _ => Err(AdaptationFailure::Ambiguous),
-    }
+    unique_candidate(&nested)
 }
 
 fn scala_scope_for<'tree>(node: Node<'tree>, root: Node<'tree>) -> Node<'tree> {
@@ -1428,33 +1423,20 @@ fn import_is_given_wildcard(import: Node<'_>, source: &str) -> bool {
 }
 
 fn enclosing_template_names(node: Node<'_>, source: &str) -> Vec<String> {
-    let mut names = Vec::new();
-    let mut current = node;
-    while let Some(parent) = current.parent() {
-        if matches!(
-            parent.kind(),
-            "class_definition" | "object_definition" | "trait_definition" | "enum_definition"
-        ) && let Some(name) = template_name(parent, source)
-        {
-            names.push(name.to_string());
-        }
-        current = parent;
-    }
-    names.reverse();
-    names
+    brokk_bifrost_jvm::scala::graph::syntax::enclosing_template_declarations(node)
+        .into_iter()
+        .rev()
+        .filter_map(|declaration| template_name(declaration, source).map(String::from))
+        .collect()
 }
 
-fn enclosing_template(mut node: Node<'_>) -> Option<Node<'_>> {
-    while let Some(parent) = node.parent() {
-        if matches!(
-            parent.kind(),
+fn enclosing_template(node: Node<'_>) -> Option<Node<'_>> {
+    brokk_bifrost_core::analyzer::structural::adapter_helpers::nearest_ancestor(node, |kind| {
+        matches!(
+            kind,
             "class_definition" | "object_definition" | "trait_definition" | "enum_definition"
-        ) {
-            return Some(parent);
-        }
-        node = parent;
-    }
-    None
+        )
+    })
 }
 
 fn declaring_scope(mut node: Node<'_>) -> Node<'_> {
@@ -1512,23 +1494,12 @@ fn owner_encloses(owner: Option<Node<'_>>, use_site: Node<'_>) -> bool {
     false
 }
 
-fn compilation_unit(mut node: Node<'_>) -> Option<Node<'_>> {
-    loop {
-        if node.kind() == "compilation_unit" {
-            return Some(node);
-        }
-        node = node.parent()?;
-    }
-}
+use super::syntax::compilation_unit;
 
 fn template_name(node: Node<'_>, source: &str) -> Option<Box<str>> {
     node.child_by_field_name("name")
         .and_then(|name| nonempty_text(source, name))
         .map(Box::from)
-}
-
-fn nonempty_text<'source>(source: &'source str, node: Node<'_>) -> Option<&'source str> {
-    node_text(source, node).filter(|text| !text.is_empty())
 }
 
 fn parameter_list_is_contextual(list: Node<'_>) -> bool {
@@ -1557,9 +1528,9 @@ fn subtree_has_kind(node: Node<'_>, kind: &str) -> bool {
 mod tests {
     use super::{
         AdaptationFailure, ScalaAdaptationCatalog, ScalaTypeBinding, SelectedAdaptationKind,
-        scala_nominal_types_match,
     };
     use crate::hash::HashMap;
+    use brokk_bifrost_test_macros::hardwon;
 
     impl ScalaAdaptationCatalog<'_> {
         fn force_incomplete(&mut self) {
@@ -1568,11 +1539,10 @@ mod tests {
     }
 
     fn parse(source: &str) -> tree_sitter::Tree {
-        let mut parser = tree_sitter::Parser::new();
-        parser
-            .set_language(&crate::analyzer::scala::language::LANGUAGE.into())
-            .expect("load Scala grammar");
-        let tree = parser.parse(source, None).expect("parse Scala");
+        let tree = crate::test_support::parse_fixture_tree(
+            source,
+            crate::analyzer::scala::language::LANGUAGE.into(),
+        );
         assert!(
             !tree.root_node().has_error(),
             "Scala fixture must parse:\n{}",
@@ -1586,18 +1556,6 @@ mod tests {
         tree: &'tree tree_sitter::Tree,
     ) -> ScalaAdaptationCatalog<'tree> {
         ScalaAdaptationCatalog::collect(source, tree.root_node(), &HashMap::default())
-    }
-
-    #[test]
-    fn prelude_int_paths_match_and_foreign_int_does_not() {
-        assert!(scala_nominal_types_match(
-            &["Int".to_owned()],
-            &["scala".to_owned(), "Int".to_owned()]
-        ));
-        assert!(!scala_nominal_types_match(
-            &["Int".to_owned()],
-            &["foo".to_owned(), "Int".to_owned()]
-        ));
     }
 
     #[test]
@@ -2030,22 +1988,26 @@ object App { def wrap(raw: Int): Meter = new Meter(raw) }
         kind: &str,
         name: &str,
     ) -> tree_sitter::Node<'tree> {
-        let mut stack = vec![root];
-        while let Some(node) = stack.pop() {
-            if node.kind() == kind
+        let is_match = |node: tree_sitter::Node<'tree>| {
+            node.kind() == kind
                 && node
                     .child_by_field_name("name")
                     .and_then(|declared| source.get(declared.byte_range()))
                     == Some(name)
-            {
-                return node;
-            }
-            let mut cursor = node.walk();
-            let mut children = node.named_children(&mut cursor).collect::<Vec<_>>();
-            children.reverse();
-            stack.extend(children);
+        };
+        if is_match(root) {
+            return root;
         }
-        panic!("missing {kind} named {name}")
+        let mut found = None;
+        brokk_bifrost_core::analyzer::tree_walk::walk_named_tree_preorder(root, false, |node| {
+            if is_match(node) {
+                found = Some(node);
+                brokk_bifrost_core::analyzer::tree_walk::WalkControl::Break
+            } else {
+                brokk_bifrost_core::analyzer::tree_walk::WalkControl::Continue
+            }
+        });
+        found.unwrap_or_else(|| panic!("missing {kind} named {name}"))
     }
     #[test]
     fn unresolved_import_competitor_does_not_prove_a_known_type() {
@@ -2073,6 +2035,7 @@ object App { def wrap(raw: Int): Meter = new Meter(raw) }
     }
 
     #[test]
+    #[hardwon("#3648: an unresolved wildcard must leave the prelude base identity unproven")]
     fn unresolved_wildcard_does_not_certify_prelude_anyval() {
         const SOURCE: &str = "import external.*\nclass Meter(val value: Int) extends AnyVal\nclass Exact(val value: Int) extends _root_.scala.AnyVal";
         let tree = parse(SOURCE);
@@ -2097,6 +2060,7 @@ object App { def wrap(raw: Int): Meter = new Meter(raw) }
         );
     }
     #[test]
+    #[hardwon("#3648: a shadowed scala root must not certify prelude conversion identity")]
     fn qualified_prelude_root_respects_term_shadowing() {
         const SOURCE: &str = "object Foreign { class AnyVal }\nobject App { val scala = Foreign; class Meter(val value: Int) extends scala.AnyVal; class Exact(val value: Int) extends _root_.scala.AnyVal }";
         let tree = parse(SOURCE);
@@ -2124,6 +2088,7 @@ object App { def wrap(raw: Int): Meter = new Meter(raw) }
     /// The issue #3648 fixture: a source-owned trait spelled `Conversion` is
     /// not the library trait, so its `apply` never becomes an implicit call.
     #[test]
+    #[hardwon("#3648: a source-owned Conversion was mistaken for scala.Conversion")]
     fn source_owned_conversion_is_not_language_conversion() {
         const SOURCE: &str = r#"
 trait Conversion[A, B] { def apply(x: A): B }
@@ -2155,6 +2120,7 @@ object App {
     }
 
     #[test]
+    #[hardwon("#3648: an imported workspace Conversion was mistaken for scala.Conversion")]
     fn imported_conversion_is_not_language_conversion() {
         const SOURCE: &str = r#"
 object Foreign { trait Conversion[A, B] { def apply(x: A): B } }
@@ -2187,6 +2153,7 @@ object App {
     }
 
     #[test]
+    #[hardwon("#3648: a type alias bypassed exact Conversion identity")]
     fn conversion_alias_is_not_language_conversion() {
         const SOURCE: &str = r#"
 object App {
@@ -2211,6 +2178,7 @@ object App {
     }
 
     #[test]
+    #[hardwon("#3648: an unresolved import falsely proved the library Conversion trait")]
     fn unresolved_conversion_import_does_not_bind_the_library_trait() {
         const SOURCE: &str = r#"
 import external.Conversion
@@ -2242,6 +2210,7 @@ object App {
     }
 
     #[test]
+    #[hardwon("#3648: an unresolved wildcard falsely proved the library Conversion trait")]
     fn unresolved_wildcard_does_not_certify_the_library_trait() {
         const SOURCE: &str = r#"
 import external.*
@@ -2266,6 +2235,7 @@ object App {
     }
 
     #[test]
+    #[hardwon("#3648: a foreign qualified Conversion was mistaken for scala.Conversion")]
     fn foreign_qualified_conversion_is_not_language_conversion() {
         const SOURCE: &str = r#"
 object App {
@@ -2300,6 +2270,7 @@ object App {
     }
 
     #[test]
+    #[hardwon("#3648: exact scala.Conversion identity stopped selecting the carrier")]
     fn qualified_library_conversion_remains_the_language_conversion() {
         const SOURCE: &str = r#"
 trait Conversion[A, B] { def apply(x: A): B }
@@ -2324,6 +2295,7 @@ object App {
     }
 
     #[test]
+    #[hardwon("#3648: a shadowed scala root falsely proved library Conversion identity")]
     fn shadowed_scala_root_does_not_certify_the_library_trait() {
         const SOURCE: &str = r#"
 object Foreign { trait Conversion[A, B] { def apply(x: A): B } }

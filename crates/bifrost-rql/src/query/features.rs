@@ -38,50 +38,45 @@ impl CodeQuerySeed {
 }
 
 fn collect_referenced_kinds(pattern: &Pattern, out: &mut Vec<NormalizedKind>) {
-    out.extend(pattern.kinds.iter().copied());
-    out.extend(pattern.not_kinds.iter().copied());
-    if let Some(pattern) = &pattern.has {
-        collect_referenced_kinds(pattern, out);
-    }
-    if let Some(pattern) = &pattern.not_has {
-        collect_referenced_kinds(pattern, out);
-    }
-    for &role in Role::single_target_roles() {
-        if let Some(pattern) = pattern.single_role_pattern(role) {
-            collect_referenced_kinds(pattern, out);
-        }
-    }
-    for &role in Role::list_target_roles() {
-        for pattern in pattern.list_role_patterns(role) {
-            collect_referenced_kinds(pattern, out);
-        }
-    }
-    for (_, pattern) in &pattern.kwargs {
-        collect_referenced_kinds(pattern, out);
-    }
+    walk_patterns(pattern, |pattern, _| {
+        out.extend(pattern.kinds.iter().copied());
+        out.extend(pattern.not_kinds.iter().copied());
+    });
 }
 
 fn collect_used_roles(pattern: &Pattern, out: &mut Vec<Role>) {
-    if let Some(pattern) = &pattern.has {
-        collect_used_roles(pattern, out);
-    }
-    if let Some(pattern) = &pattern.not_has {
-        collect_used_roles(pattern, out);
-    }
-    for &role in Role::single_target_roles() {
-        if let Some(pattern) = pattern.single_role_pattern(role) {
+    walk_patterns(pattern, |_, role| {
+        if let Some(role) = role {
             out.push(role);
-            collect_used_roles(pattern, out);
         }
-    }
-    for &role in Role::list_target_roles() {
-        for pattern in pattern.list_role_patterns(role) {
-            out.push(role);
-            collect_used_roles(pattern, out);
+    });
+}
+
+fn walk_patterns(pattern: &Pattern, mut visit: impl FnMut(&Pattern, Option<Role>)) {
+    let mut pending = vec![(pattern, None)];
+    while let Some((pattern, role)) = pending.pop() {
+        visit(pattern, role);
+        if let Some(child) = &pattern.has {
+            pending.push((child, None));
         }
-    }
-    for (_, pattern) in &pattern.kwargs {
-        out.push(Role::Kwarg);
-        collect_used_roles(pattern, out);
+        if let Some(child) = &pattern.not_has {
+            pending.push((child, None));
+        }
+        if let Some(child) = &pattern.local_value {
+            pending.push((child, None));
+        }
+        for &role in Role::single_target_roles() {
+            if let Some(child) = pattern.single_role_pattern(role) {
+                pending.push((child, Some(role)));
+            }
+        }
+        for &role in Role::list_target_roles() {
+            for child in pattern.list_role_patterns(role) {
+                pending.push((child, Some(role)));
+            }
+        }
+        for (_, child) in &pattern.kwargs {
+            pending.push((child, Some(Role::Kwarg)));
+        }
     }
 }

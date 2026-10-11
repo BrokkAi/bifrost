@@ -229,18 +229,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn validates_dangling_edges_and_cycles() {
-        assert!(matches!(
-            PrecedenceGraph::try_new(["a"], [("a", "missing")]),
-            Err(PrecedenceError::DanglingEdge { .. })
-        ));
-        assert!(matches!(
-            PrecedenceGraph::try_new(["a", "b"], [("a", "b"), ("b", "a")]),
-            Err(PrecedenceError::Cycle { .. })
-        ));
-    }
-
-    #[test]
     fn finds_transitive_unique_winner_and_rejects_incomparable_winners() {
         let graph = PrecedenceGraph::try_new(
             ["broad", "specific", "most-specific", "other"],
@@ -257,6 +245,18 @@ mod tests {
         assert!(matches!(
             graph.unique_winner(["specific", "other"]),
             Err(PrecedenceError::AmbiguousWinners { .. })
+        ));
+    }
+
+    #[test]
+    fn validates_dangling_edges_and_cycles() {
+        assert!(matches!(
+            PrecedenceGraph::try_new(["a"], [("a", "missing")]),
+            Err(PrecedenceError::DanglingEdge { .. })
+        ));
+        assert!(matches!(
+            PrecedenceGraph::try_new(["a", "b"], [("a", "b"), ("b", "a")]),
+            Err(PrecedenceError::Cycle { .. })
         ));
     }
 }

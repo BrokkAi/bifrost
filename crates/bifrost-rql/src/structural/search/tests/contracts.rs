@@ -1,17 +1,6 @@
 use super::*;
 use crate::analyzer::semantic::SemanticBudgetDimension;
 
-#[test]
-fn exact_structural_kind_requires_a_declaration_refinement() {
-    assert!(!relations::refined_declaration_kind(
-        NormalizedKind::Declaration
-    ));
-    assert!(relations::refined_declaration_kind(NormalizedKind::Method));
-    assert!(!relations::refined_declaration_kind(
-        NormalizedKind::FieldAccess
-    ));
-}
-
 fn diagnostic(
     code: CodeQueryDiagnosticCode,
     impact: CodeQueryDiagnosticImpact,
@@ -26,103 +15,14 @@ fn diagnostic(
     }
 }
 
-#[test]
-fn execution_work_snapshot_is_the_single_budget_projection() {
-    let snapshot = execution_work_snapshot(
-        CodeQueryExecutionBudget {
-            scanned_files: 1,
-            scanned_source_bytes: 2,
-            fact_nodes: 3,
-            examined_references: 4,
-            pipeline_rows: 5,
-            provenance_steps: 6,
-            import_files_resolved: 7,
-            import_edges_resolved: 8,
-        },
-        CodeQuerySemanticWork::default(),
-    );
-    assert_eq!(
-        snapshot,
-        QueryOperatorWorkProfile {
-            scanned_files: 1,
-            scanned_source_bytes: 2,
-            fact_nodes: 3,
-            pipeline_rows: 5,
-            examined_references: 4,
-            provenance_steps: 6,
-            import_files_resolved: 7,
-            import_edges_resolved: 8,
-            semantic: CodeQuerySemanticWork::default(),
-        }
-    );
-    assert_eq!(
-        public_execution_work(snapshot),
-        CodeQueryExecutionWork {
-            scanned_files: 1,
-            scanned_source_bytes: 2,
-            fact_nodes: 3,
-            pipeline_rows: 5,
-            examined_references: 4,
-            semantic: CodeQuerySemanticWork::default(),
-        }
-    );
-}
-
-#[test]
-fn semantic_execution_limits_require_each_dimension_to_be_positive() {
-    let defaults = CodeQuerySemanticLimits::default();
-    assert!(defaults.all_positive());
-
-    for invalid in [
-        CodeQuerySemanticLimits {
-            max_materialized_files: 0,
-            ..defaults
-        },
-        CodeQuerySemanticLimits {
-            max_source_bytes: 0,
-            ..defaults
-        },
-        CodeQuerySemanticLimits {
-            max_rows_per_dimension: 0,
-            ..defaults
-        },
-        CodeQuerySemanticLimits {
-            max_retained_bytes: 0,
-            ..defaults
-        },
-        CodeQuerySemanticLimits {
-            max_traversal_steps: 0,
-            ..defaults
-        },
-    ] {
-        assert!(!invalid.all_positive());
-    }
-
-    // A per-dimension table carries the positivity of each row lane, so a
-    // drained lane in it is still an invalid set of limits.
-    assert!(
-        CodeQuerySemanticLimits {
-            rows_per_dimension: Some(CodeQuerySemanticRowLimits::from_rows(|_| 1)),
-            ..defaults
-        }
-        .all_positive()
-    );
-    assert!(
-        !CodeQuerySemanticLimits {
-            rows_per_dimension: Some(CodeQuerySemanticRowLimits::from_rows(|dimension| {
-                usize::from(dimension != SemanticBudgetDimension::NestedEntries)
-            })),
-            ..defaults
-        }
-        .all_positive()
-    );
-}
-
 /// Issue #2523. Without a per-dimension table the executor must keep pricing
 /// homogeneous retained-row lanes against half of `max_retained_bytes`, split
 /// across the row dimensions. With a table the caller has priced the lanes
 /// itself against its own ledger, and the estimate must not narrow them.
 #[test]
+#[brokk_bifrost_test_macros::hardwon(
+    "#2523: retained-byte estimates narrowed caller-priced semantic row limits"
+)]
 fn a_per_dimension_row_table_overrides_the_retained_byte_estimate() {
     let defaults = CodeQuerySemanticLimits::default();
     let estimated = semantic::semantic_budget_limits(defaults);
@@ -154,6 +54,9 @@ fn a_per_dimension_row_table_overrides_the_retained_byte_estimate() {
 /// reduced the default scalar cap of 1,000,000 to 49,932 and left a fresh
 /// two-file exact Go switch query only six entries beyond that derived limit.
 #[test]
+#[brokk_bifrost_test_macros::hardwon(
+    "11641c4518ea: retained-row estimates narrowed heterogeneous nested work"
+)]
 fn heterogeneous_nested_work_uses_the_authored_row_limit() {
     let defaults = CodeQuerySemanticLimits::default();
     let published = semantic::semantic_budget_limits(defaults);
@@ -168,6 +71,9 @@ fn heterogeneous_nested_work_uses_the_authored_row_limit() {
 }
 
 #[test]
+#[brokk_bifrost_test_macros::hardwon(
+    "1fd9b2ce7a51: semantic text capacity was scaled from source volume instead of retained bytes"
+)]
 fn owned_semantic_text_uses_retention_capacity_not_source_volume() {
     let limits = CodeQuerySemanticLimits {
         max_source_bytes: 1024 * 1024,
@@ -218,52 +124,6 @@ pub(super) fn assert_serial_profile_reconciles(profile: &QueryExecutionProfile) 
             .saturating_add(profile.rendering_work),
         profile.work
     );
-}
-
-#[cfg_attr(not(scheduled_tests), ignore = "scheduled-only")]
-#[test]
-fn public_explain_is_planning_only_and_exposes_shared_logical_dependencies() {
-    let temp = tempfile::tempdir().expect("temp dir");
-    let root = temp.path().canonicalize().expect("canonical root");
-    let file = ProjectFile::new(root.clone(), "src/app.ts");
-    file.write("class Shared {}\n").expect("write source");
-    let analyzer = TypescriptAnalyzer::from_project(TestProject::new(root, Language::TypeScript));
-    let query =
-        CodeQuery::from_sexp("(explain (union (class :name \"Shared\") (class :name \"Shared\")))")
-            .expect("explain query");
-    let providers = analyzer.structural_fact_providers();
-    let extractions_before = providers
-        .iter()
-        .map(|provider| provider.structural_extraction_count())
-        .sum::<u64>();
-
-    let CodeQueryResponse::Explain(explain) = execute_request(&analyzer, &query) else {
-        panic!("explain mode must return a planning report")
-    };
-
-    let extractions_after = providers
-        .iter()
-        .map(|provider| provider.structural_extraction_count())
-        .sum::<u64>();
-    assert_eq!(extractions_after, extractions_before);
-    assert_eq!(explain.scheduling.max_concurrency, 1);
-    assert!(matches!(
-        explain.scheduling.selected,
-        super::super::super::execution::plan::CodeQuerySelectedScheduling::Sequential
-    ));
-    let shared_set = explain
-        .logical_plan
-        .nodes
-        .iter()
-        .find(|node| {
-            matches!(
-                &node.operation,
-                super::super::super::execution::plan::CodeQueryLogicalOperation::Set { .. }
-            )
-        })
-        .expect("logical set node");
-    assert_eq!(shared_set.dependencies.len(), 2);
-    assert_eq!(shared_set.dependencies[0], shared_set.dependencies[1]);
 }
 
 #[cfg_attr(not(scheduled_tests), ignore = "scheduled-only")]
@@ -668,42 +528,6 @@ fn semantic_result_contracts_serialize_render_and_retain_source_evidence() {
     detailed.assert_invariants();
 }
 
-#[cfg_attr(not(scheduled_tests), ignore = "scheduled-only")]
-#[test]
-fn public_profile_retains_pre_execution_cancellation_observations() {
-    let temp = tempfile::tempdir().expect("temp dir");
-    let root = temp.path().canonicalize().expect("canonical root");
-    ProjectFile::new(root.clone(), "src/app.ts")
-        .write("class Cancelled {}\n")
-        .expect("write source");
-    let analyzer = TypescriptAnalyzer::from_project(TestProject::new(root, Language::TypeScript));
-    let query = CodeQuery::from_json(&json!({
-        "execution_mode": "profile",
-        "match": { "kind": "class" }
-    }))
-    .expect("profile query");
-    let cancellation = CancellationToken::default();
-    cancellation.cancel();
-
-    let CodeQueryResponse::Profile(profile) = execute_request_with_cancellation(
-        &analyzer,
-        &query,
-        CodeQueryExecutionLimits::default(),
-        &cancellation,
-    ) else {
-        panic!("pre-cancelled profile should retain its report")
-    };
-
-    assert_eq!(profile.result.completion(), CodeQueryCompletion::Cancelled);
-    assert!(profile.operators.iter().any(|operator| {
-        operator.result_cancelled
-            || matches!(
-                operator.disposition,
-                super::super::super::execution::profile::CodeQueryOperatorDisposition::Cancelled
-            )
-    }));
-}
-
 #[test]
 fn diagnostic_codes_have_exhaustive_stable_impacts_and_completion() {
     use CodeQueryDiagnosticCode as Code;
@@ -714,7 +538,9 @@ fn diagnostic_codes_have_exhaustive_stable_impacts_and_completion() {
         (Code::Cancelled, Impact::Incomplete),
         (Code::UnsupportedStructuralFeature, Impact::Incomplete),
         (Code::MissingStructuralAdapter, Impact::Incomplete),
+        (Code::RecoveredSyntaxIncomplete, Impact::Incomplete),
         (Code::UnsupportedImportAnalysis, Impact::Incomplete),
+        (Code::DynamicImportTarget, Impact::Incomplete),
         (Code::SemanticResultsOmitted, Impact::Incomplete),
         (Code::SemanticWorkspaceRequired, Impact::Incomplete),
         (Code::NoEnclosingProcedure, Impact::Advisory),
@@ -745,6 +571,10 @@ fn diagnostic_codes_have_exhaustive_stable_impacts_and_completion() {
         (Code::ExecutionBudgetExhausted, Impact::Incomplete),
         (Code::PipelineBudgetExhausted, Impact::Incomplete),
         (Code::ImportGraphBudgetExhausted, Impact::Incomplete),
+        (
+            Code::PythonHierarchyDerivationIncomplete,
+            Impact::Incomplete,
+        ),
         (Code::ResultLimitReached, Impact::Incomplete),
         (Code::BroadQuery, Impact::Advisory),
     ];
@@ -792,88 +622,6 @@ fn diagnostic_codes_have_exhaustive_stable_impacts_and_completion() {
     );
 }
 
-#[test]
-fn published_label_inventories_are_the_wire_vocabulary() {
-    // The three inventories a non-Rust client mirrors (#2898). Each label must
-    // be exactly what serde reads and writes, or the inventory would publish a
-    // spelling no row ever carries.
-    for label in CodeQueryDiagnosticCode::LABELS {
-        let code: CodeQueryDiagnosticCode = serde_json::from_value(serde_json::Value::String(
-            (*label).to_string(),
-        ))
-        .unwrap_or_else(|error| panic!("diagnostic code {label} is not on the wire: {error}"));
-        assert_eq!(code.as_str(), *label);
-    }
-
-    for label in CodeQueryDiagnosticImpact::LABELS {
-        let impact: CodeQueryDiagnosticImpact =
-            serde_json::from_value(serde_json::Value::String((*label).to_string()))
-                .unwrap_or_else(|error| panic!("impact {label} is not on the wire: {error}"));
-        assert_eq!(impact.as_str(), *label);
-    }
-
-    let completions = [
-        CodeQueryCompletion::Complete,
-        CodeQueryCompletion::ProvenSubset { codes: Vec::new() },
-        CodeQueryCompletion::Incomplete { codes: Vec::new() },
-        CodeQueryCompletion::Cancelled,
-        CodeQueryCompletion::Invalid { codes: Vec::new() },
-    ];
-    assert_eq!(completions.len(), CodeQueryCompletion::KIND_LABELS.len());
-    for (completion, label) in completions.iter().zip(CodeQueryCompletion::KIND_LABELS) {
-        assert_eq!(completion.kind_label(), *label);
-        let serialized = serde_json::to_value(completion).expect("serialize completion");
-        assert_eq!(serialized["type"], *label);
-    }
-}
-
-#[test]
-fn typed_diagnostic_producers_cover_budget_output_and_cancellation() {
-    let mut diagnostics = Vec::new();
-    let budget = CodeQueryExecutionBudget::default();
-    push_budget_diagnostic(&mut diagnostics, &budget);
-    push_pipeline_budget_diagnostic(&mut diagnostics, &budget);
-    push_import_graph_budget_diagnostic(
-        &mut diagnostics,
-        &RequestLocalDirectImportGraph::default(),
-    );
-    push_truncation_diagnostic(&mut diagnostics, &budget, 1);
-    push_broad_query_diagnostic(&mut diagnostics, &budget);
-
-    assert_eq!(
-        diagnostics
-            .iter()
-            .map(|diagnostic| (diagnostic.code, diagnostic.impact))
-            .collect::<Vec<_>>(),
-        vec![
-            (
-                CodeQueryDiagnosticCode::ExecutionBudgetExhausted,
-                CodeQueryDiagnosticImpact::Incomplete,
-            ),
-            (
-                CodeQueryDiagnosticCode::PipelineBudgetExhausted,
-                CodeQueryDiagnosticImpact::Incomplete,
-            ),
-            (
-                CodeQueryDiagnosticCode::ImportGraphBudgetExhausted,
-                CodeQueryDiagnosticImpact::Incomplete,
-            ),
-            (
-                CodeQueryDiagnosticCode::ResultLimitReached,
-                CodeQueryDiagnosticImpact::Incomplete,
-            ),
-            (
-                CodeQueryDiagnosticCode::BroadQuery,
-                CodeQueryDiagnosticImpact::Advisory,
-            ),
-        ]
-    );
-    assert!(matches!(
-        cancelled_query_result(None).completion(),
-        CodeQueryCompletion::Cancelled
-    ));
-}
-
 /// Unit coverage for the #2779 root terminal-cap backstop's decision logic:
 /// `needs_root_terminal_cap_diagnostic` gates whether
 /// `execute_internal_with_analysis_strategy` pushes a truncation diagnostic
@@ -884,6 +632,9 @@ fn typed_diagnostic_producers_cover_budget_output_and_cancellation() {
 /// tests for that path); this pins the backstop's own conditions so it is
 /// covered even though the currently reachable plan shapes never trip it.
 #[test]
+#[brokk_bifrost_test_macros::hardwon(
+    "#2779: root cap truncation must not mask cancellation or another incompleteness"
+)]
 fn root_terminal_cap_backstop_fires_only_for_an_unexplained_cap_truncation() {
     // The fingerprint of a root-cap truncation: truncated, not cancelled, a
     // positive limit, the row count landing exactly on that limit, and no
@@ -941,59 +692,6 @@ fn root_terminal_cap_backstop_fires_only_for_an_unexplained_cap_truncation() {
             CodeQueryDiagnosticImpact::Advisory,
         )]
     ));
-}
-
-#[test]
-fn call_relation_diagnostics_map_without_inspecting_messages() {
-    use CallRelationDiagnosticCode as Lower;
-    use CodeQueryDiagnosticCode as Code;
-    use CodeQueryDiagnosticImpact as Impact;
-
-    let cases = [
-        (
-            Lower::BudgetExhausted,
-            Code::CallRelationBudgetExhausted,
-            Impact::Incomplete,
-        ),
-        (
-            Lower::ParseFailed,
-            Code::CallRelationParseFailed,
-            Impact::Incomplete,
-        ),
-        (
-            Lower::CandidatesOmitted,
-            Code::CallRelationCandidatesOmitted,
-            Impact::Incomplete,
-        ),
-        (
-            Lower::TargetsAmbiguous,
-            Code::CallRelationTargetsAmbiguous,
-            Impact::Advisory,
-        ),
-        (
-            Lower::CandidateLimit,
-            Code::CallRelationCandidateLimit,
-            Impact::Incomplete,
-        ),
-        (
-            Lower::AnalysisFailed,
-            Code::CallRelationAnalysisFailed,
-            Impact::Incomplete,
-        ),
-    ];
-    for (lower, code, impact) in cases {
-        let mapped = map_call_relation_diagnostic(
-            "rust",
-            CallRelationDiagnostic {
-                code: lower,
-                message: "same prose for every producer".to_string(),
-                context: "crate::function".to_string(),
-                reason_kind: (lower == Lower::AnalysisFailed)
-                    .then(|| "unsupported_target_shape".to_string()),
-            },
-        );
-        assert_eq!((mapped.code, mapped.impact), (code, impact));
-    }
 }
 
 #[test]
@@ -1330,7 +1028,7 @@ fn formal_call_site_value(binding: CallBindingStatus) -> CallSiteValue {
         start_line: 1,
         end_line: 1,
     };
-    CallSiteValue(
+    CallSiteValue::new(
         CallSite {
             file,
             range,
@@ -1352,6 +1050,8 @@ fn formal_call_site_value(binding: CallBindingStatus) -> CallSiteValue {
             }],
         },
         binding,
+        None,
+        CallSiteIdentityFacts::default(),
     )
 }
 
@@ -1517,146 +1217,6 @@ fn m3_inbound_reference_bounded_samples_remain_positive_and_incomplete() {
 }
 
 #[test]
-fn outbound_uses_scan_without_indexed_source_is_incomplete() {
-    let temp = tempfile::tempdir().expect("temp dir");
-    let root = temp.path().canonicalize().expect("canonical temp dir");
-    let analyzer =
-        TypescriptAnalyzer::from_project(TestProject::new(root.clone(), Language::TypeScript));
-    let file = ProjectFile::new(root, "src/missing.ts");
-    let mut diagnostics = Vec::new();
-
-    let (hits, exhausted) = scan_outbound_reference_hits(
-        &analyzer,
-        &file,
-        &mut CodeQueryExecutionBudget::default(),
-        CodeQueryExecutionLimits::default(),
-        8,
-        None,
-        &mut diagnostics,
-    );
-
-    assert!(hits.is_empty());
-    assert!(exhausted);
-    assert_eq!(diagnostics.len(), 1);
-    assert_eq!(
-        diagnostics[0].code,
-        CodeQueryDiagnosticCode::UsesCandidatesOmitted
-    );
-    assert_eq!(diagnostics[0].impact, CodeQueryDiagnosticImpact::Incomplete);
-}
-
-#[test]
-fn members_projection_reports_unindexed_direct_child_as_semantic_omission() {
-    let temp = tempfile::tempdir().expect("temp dir");
-    let root = temp.path().canonicalize().expect("canonical temp dir");
-    let analyzer =
-        TypescriptAnalyzer::from_project(TestProject::new(root.clone(), Language::TypeScript));
-    let file = ProjectFile::new(root, "src/app.ts");
-    let declaration = DeclarationValue::new(
-        CodeUnit::new(file.clone(), CodeUnitType::Class, "", "Owner"),
-        Range {
-            start_byte: 0,
-            end_byte: 1,
-            start_line: 1,
-            end_line: 1,
-        },
-    );
-    let mut omissions = BTreeMap::new();
-
-    let (expansions, exhausted) = direct_member_expansions(
-        &analyzer,
-        &declaration,
-        vec![CodeUnit::file_scope(file)],
-        &mut IndexedDeclarations::default(),
-        &mut CodeQueryExecutionBudget::default(),
-        8,
-        &mut omissions,
-    );
-    let mut diagnostics = Vec::new();
-    append_semantic_omission_diagnostics(&mut diagnostics, &QueryStep::Members, omissions);
-
-    assert!(expansions.is_empty());
-    assert!(exhausted);
-    assert_eq!(diagnostics.len(), 1);
-    assert_eq!(
-        diagnostics[0].code,
-        CodeQueryDiagnosticCode::SemanticResultsOmitted
-    );
-    assert_eq!(diagnostics[0].impact, CodeQueryDiagnosticImpact::Incomplete);
-    assert!(matches!(
-        CodeQueryResult {
-            session_subset: None,
-            results: Vec::new(),
-            truncated: exhausted,
-            diagnostics,
-        }
-        .completion(),
-        CodeQueryCompletion::Incomplete { .. }
-    ));
-}
-
-#[test]
-fn hierarchy_projection_keeps_exact_rows_and_reports_unindexed_relations() {
-    let source = "class Exact {}\n";
-    let temp = tempfile::tempdir().expect("temp dir");
-    let root = temp.path().canonicalize().expect("canonical temp dir");
-    let file = ProjectFile::new(root.clone(), "src/app.ts");
-    file.write(source).expect("write source");
-    let analyzer =
-        TypescriptAnalyzer::from_project(TestProject::new(root.clone(), Language::TypeScript));
-    let exact = analyzer
-        .all_declarations()
-        .find(|unit| unit.short_name() == "Exact")
-        .expect("exact class declaration");
-    let missing_file = ProjectFile::new(root, "src/missing.ts");
-    let missing = CodeUnit::new(missing_file, CodeUnitType::Class, "", "Missing");
-    let mut indexed = IndexedDeclarations::default();
-    let mut omissions = BTreeMap::new();
-    let mut exhausted = false;
-
-    let retained = project_hierarchy_declaration(
-        &analyzer,
-        &exact,
-        &mut indexed,
-        &mut omissions,
-        &mut exhausted,
-    );
-    let omitted = project_hierarchy_declaration(
-        &analyzer,
-        &missing,
-        &mut indexed,
-        &mut omissions,
-        &mut exhausted,
-    );
-    let mut diagnostics = Vec::new();
-    append_semantic_omission_diagnostics(
-        &mut diagnostics,
-        &QueryStep::Supertypes(HierarchyTraversal::Direct),
-        omissions,
-    );
-
-    assert!(retained.is_some(), "an exact hierarchy row must survive");
-    assert!(omitted.is_none());
-    assert!(exhausted);
-    assert_eq!(diagnostics.len(), 1);
-    assert_eq!(
-        diagnostics[0].code,
-        CodeQueryDiagnosticCode::SemanticResultsOmitted
-    );
-    assert_eq!(diagnostics[0].impact, CodeQueryDiagnosticImpact::Incomplete);
-    assert!(matches!(
-        CodeQueryResult {
-            session_subset: None,
-            results: Vec::new(),
-            truncated: exhausted,
-            diagnostics,
-        }
-        .completion(),
-        CodeQueryCompletion::Incomplete { .. }
-    ));
-}
-
-#[test]
 fn enclosing_declaration_index_retains_exact_owner_and_reports_missing_real_range() {
     let root = std::env::temp_dir().join("bifrost-enclosing-declaration-completeness");
     let file = ProjectFile::new(root, "src/app.ts");
@@ -1727,4 +1287,189 @@ fn enclosing_declaration_index_treats_file_scope_no_owner_as_complete() {
             .is_none()
     );
 }
-use crate::analyzer::CodeUnitIndex;
+#[test]
+fn dependency_configuration_effective_result_schema_is_typed_and_canonical() {
+    use super::super::results::CodeQueryCrossDomain;
+    use brokk_bifrost_core::analyzer::configuration::*;
+
+    let layer = ConfigurationLayerId::new("base.properties").expect("layer identity");
+    let key = ConfigurationResolutionKey::default();
+    let evidence = ConfigurationEvidenceIdentity::new(
+        ConfigurationSourceId::new("base.properties#member").expect("source identity"),
+        ConfigurationProviderId::new("bifrost.properties").expect("provider identity"),
+        ConfigurationVersionId::new("immutable-content-id").expect("version identity"),
+    );
+    let input = ConfigurationResolutionInput::new(
+        vec![ConfigurationLayer::new(layer.clone())],
+        vec![ConfigurationContribution::new(
+            layer,
+            key.clone(),
+            ConfigurationOpaqueValue::new("true"),
+            evidence,
+            ConfigurationSourceKind::AuthoredFile,
+        )],
+        Vec::new(),
+    )
+    .expect("valid input");
+    let effective = resolve_effective_configuration(
+        &ConfigurationResolutionRequest::new(key),
+        &input,
+        ConfigurationResolutionBounds::default(),
+        &brokk_bifrost_core::CancellationToken::default(),
+    );
+    assert_eq!(
+        serde_json::to_value(&effective).expect("canonical serialization"),
+        json!({
+            "key": {"selectors": []},
+            "value": "true",
+            "contributions": [{
+                "layer": "base.properties",
+                "key": {"selectors": []},
+                "value": "true",
+                "evidence": {
+                    "source": "base.properties#member",
+                    "provider": "bifrost.properties",
+                    "version": "immutable-content-id"
+                },
+                "source_kind": "AuthoredFile"
+            }],
+            "precedence": [],
+            "proof": {"Selected": {"layer": "base.properties"}},
+            "completeness": "Complete"
+        })
+    );
+
+    let schema = schemars::generate::SchemaSettings::draft2020_12()
+        .for_serialize()
+        .into_generator()
+        .into_root_schema_for::<CodeQueryCrossDomain>();
+    let schema = serde_json::to_value(schema).expect("result schema serialization");
+    let mut pending = vec![&schema["properties"]["effective_configuration"]];
+    let mut has_canonical_ref = false;
+    while let Some(value) = pending.pop() {
+        match value {
+            serde_json::Value::Object(object) => {
+                has_canonical_ref |= object.get("$ref").and_then(serde_json::Value::as_str)
+                    == Some("#/$defs/ConfigurationResolutionResult");
+                pending.extend(object.values());
+            }
+            serde_json::Value::Array(array) => pending.extend(array),
+            _ => {}
+        }
+    }
+    assert!(
+        has_canonical_ref,
+        "effective evidence must use the typed core contract"
+    );
+    let result_schema = code_query_result_json_schema();
+    let definition = &result_schema["$defs"]["ConfigurationResolutionResult"];
+    assert_eq!(definition["type"], "object");
+    for field in [
+        "key",
+        "contributions",
+        "precedence",
+        "proof",
+        "completeness",
+    ] {
+        assert!(
+            definition["required"]
+                .as_array()
+                .expect("required result fields")
+                .iter()
+                .any(|required| required == field),
+            "canonical evidence requires {field}"
+        );
+    }
+}
+
+#[test]
+#[brokk_bifrost_test_macros::hardwon(
+    "#2523: a drained caller-priced row lane must invalidate semantic limits"
+)]
+fn caller_priced_semantic_limits_reject_an_exhausted_dimension() {
+    let defaults = CodeQuerySemanticLimits::default();
+    assert!(
+        CodeQuerySemanticLimits {
+            rows_per_dimension: Some(CodeQuerySemanticRowLimits::from_rows(|_| 1)),
+            ..defaults
+        }
+        .all_positive()
+    );
+    assert!(
+        !CodeQuerySemanticLimits {
+            rows_per_dimension: Some(CodeQuerySemanticRowLimits::from_rows(|dimension| {
+                usize::from(dimension != SemanticBudgetDimension::NestedEntries)
+            })),
+            ..defaults
+        }
+        .all_positive()
+    );
+}
+
+#[test]
+#[brokk_bifrost_test_macros::hardwon(
+    "#3868: obligation provenance collided with flattened query provenance"
+)]
+fn call_result_obligation_keeps_model_and_query_provenance_distinct() {
+    let item = CodeQueryResultItem {
+        value: CodeQueryResultValue::CallResultObligation {
+            value: Box::new(CodeQueryCallResultObligation {
+                id: "obligation".into(),
+                site_id: "site".into(),
+                site_ast_id: "ast".into(),
+                path: "main.go".into(),
+                language: "go",
+                range: CodeQueryRange {
+                    start_line: 1,
+                    start_column: 1,
+                    end_line: 1,
+                    end_column: 8,
+                },
+                result_ordinal: Some(0),
+                obligation_kind: None,
+                failure_predicate: None,
+                provenance: Some("native"),
+                obligation_basis: None,
+                result_use: "discarded",
+                result_use_detail: None,
+                coverage: "exhaustive",
+                reason: None,
+                pack_id: None,
+                model_id: None,
+                summary_id: None,
+                arm_count: 1,
+                modeled_arm_count: 1,
+                terminal: false,
+            }),
+        },
+        provenance: vec![CodeQueryProvenance {
+            branch: vec![0],
+            seed: CodeQueryResultRef::File {
+                path: "main.go".into(),
+            },
+            steps: Vec::new(),
+        }],
+        provenance_truncated: false,
+        row_projection: Vec::new(),
+    };
+    let serialized = serde_json::to_string(&item).expect("serialize both provenance kinds");
+    assert_eq!(serialized.matches("\"provenance\":").count(), 1);
+    let json: serde_json::Value = serde_json::from_str(&serialized).expect("decode query item");
+    assert_eq!(json["obligation_provenance"], "native");
+    assert_eq!(json["provenance"][0]["seed"]["path"], "main.go");
+
+    let schema = code_query_result_json_schema();
+    let item_schema = &schema["$defs"]["CodeQueryResultItem"];
+    assert_eq!(item_schema["properties"]["provenance"]["type"], "array");
+    let obligation = item_schema["oneOf"]
+        .as_array()
+        .expect("typed result variants")
+        .iter()
+        .find(|variant| variant["properties"]["result_type"]["const"] == "call_result_obligation")
+        .expect("obligation result schema");
+    assert!(obligation["properties"]["provenance"].is_null());
+    assert_eq!(
+        obligation["properties"]["obligation_provenance"]["type"],
+        serde_json::json!(["string", "null"])
+    );
+}

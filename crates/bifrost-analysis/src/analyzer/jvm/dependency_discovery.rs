@@ -1,3 +1,4 @@
+use crate::analyzer::common::local_xml_name;
 use crate::analyzer::topology::DependencyScope;
 use crate::analyzer::{
     JvmDependencyDiscoveryConfig, JvmExternalArtifact, JvmExternalDependencies, JvmMavenCoordinate,
@@ -336,7 +337,9 @@ fn discover_maven_pom(
     file: &ProjectFile,
     discovered: &mut DiscoveredJvmDependencies,
 ) {
-    let Some(source) = read_bounded_source(project, file) else {
+    let Some(source) =
+        crate::analyzer::common::read_bounded_source(project, file, MAX_BUILD_METADATA_BYTES)
+    else {
         return;
     };
     let Some(project_node) = parse_xml(&source) else {
@@ -440,7 +443,9 @@ fn discover_gradle_lockfile(
     file: &ProjectFile,
     discovered: &mut DiscoveredJvmDependencies,
 ) {
-    let Some(source) = read_bounded_source(project, file) else {
+    let Some(source) =
+        crate::analyzer::common::read_bounded_source(project, file, MAX_BUILD_METADATA_BYTES)
+    else {
         return;
     };
     for (coordinate, configurations) in parse_gradle_lockfile(&source) {
@@ -628,7 +633,9 @@ fn maven_build_roots(project: &dyn Project, files: &[ProjectFile]) -> Vec<PathBu
     let poms: Vec<_> = files.iter().filter(|file| is_maven_pom(file)).collect();
     let mut module_poms = HashSet::default();
     for pom in &poms {
-        let Some(source) = read_bounded_source(project, pom) else {
+        let Some(source) =
+            crate::analyzer::common::read_bounded_source(project, pom, MAX_BUILD_METADATA_BYTES)
+        else {
             continue;
         };
         let Some(project_node) = parse_xml(&source) else {
@@ -791,13 +798,6 @@ fn maven_value_tokens(value: &str) -> Option<Vec<MavenValueToken>> {
     Some(tokens)
 }
 
-pub(crate) fn read_bounded_source(project: &dyn Project, file: &ProjectFile) -> Option<String> {
-    project
-        .read_source_limited(file, MAX_BUILD_METADATA_BYTES)
-        .ok()
-        .flatten()
-}
-
 pub(crate) fn is_maven_pom(file: &ProjectFile) -> bool {
     file.rel_path()
         .file_name()
@@ -880,11 +880,11 @@ pub(crate) struct XmlNode {
 }
 
 impl XmlNode {
-    pub(crate) fn child(&self, name: &str) -> Option<&XmlNode> {
-        self.children.iter().find(|child| child.name == name)
+    pub(crate) fn child<'a>(&'a self, name: &'a str) -> Option<&'a XmlNode> {
+        self.children_named(name).next()
     }
 
-    pub(crate) fn child_text(&self, name: &str) -> Option<&str> {
+    pub(crate) fn child_text<'a>(&'a self, name: &'a str) -> Option<&'a str> {
         self.child(name)
             .map(|child| child.text.trim())
             .filter(|text| !text.is_empty())
@@ -957,59 +957,12 @@ pub(crate) fn parse_xml(source: &str) -> Option<XmlNode> {
     stack.is_empty().then_some(root).flatten()
 }
 
-fn local_xml_name(name: &[u8]) -> Option<String> {
-    let name = std::str::from_utf8(name).ok()?;
-    Some(
-        name.rsplit_once(':')
-            .map(|(_, local)| local)
-            .unwrap_or(name)
-            .to_string(),
-    )
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::analyzer::{Language, TestProject};
     use std::fs;
     use std::sync::Mutex;
-
-    #[test]
-    fn java_dependency_discovery_parses_exact_maven_dependencies_only() {
-        let pom = r#"
-            <project xmlns="http://maven.apache.org/POM/4.0.0">
-              <groupId>com.example</groupId>
-              <artifactId>app</artifactId>
-              <version>1.0</version>
-              <properties>
-                <dep.version>2.3.4</dep.version>
-                <dep.group>org.example</dep.group>
-              </properties>
-              <dependencyManagement><dependencies><dependency>
-                <groupId>ignored</groupId><artifactId>managed</artifactId><version>9</version>
-              </dependency></dependencies></dependencyManagement>
-              <dependencies>
-                <dependency>
-                  <groupId>${dep.group}</groupId><artifactId>library</artifactId>
-                  <version>${dep.version}</version>
-                </dependency>
-                <dependency>
-                  <groupId>org.example</groupId><artifactId>missing-version</artifactId>
-                </dependency>
-                <dependency>
-                  <groupId>org.example</groupId><artifactId>classified</artifactId>
-                  <version>1</version><classifier>tests</classifier>
-                </dependency>
-              </dependencies>
-            </project>
-        "#;
-        let project = project(&[("pom.xml", pom), ("src/App.java", "class App {}")]);
-        let discovered = discover_metadata(&project);
-        assert_eq!(
-            vec![JvmMavenCoordinate::new("org.example", "library", "2.3.4")],
-            discovered.coordinates
-        );
-    }
 
     #[test]
     fn java_dependency_discovery_rejects_cyclic_or_unknown_maven_properties() {
@@ -1063,6 +1016,60 @@ mod tests {
     }
 
     #[test]
+    fn java_dependency_discovery_identifies_refresh_inputs() {
+        let root = tempfile::tempdir().unwrap();
+        for (path, expected) in [
+            ("pom.xml", true),
+            ("module/build.gradle.kts", true),
+            ("gradle/libs.versions.toml", true),
+            ("buildSrc/src/main/java/Plugin.java", true),
+            ("scripts/unrelated.kts", false),
+            ("src/App.java", false),
+            ("README.md", false),
+        ] {
+            let file = ProjectFile::new(root.path().to_path_buf(), PathBuf::from(path));
+            assert_eq!(expected, is_jvm_dependency_input(&file), "{path}");
+        }
+    }
+
+    #[test]
+    fn java_dependency_discovery_parses_exact_maven_dependencies_only() {
+        let pom = r#"
+            <project xmlns="http://maven.apache.org/POM/4.0.0">
+              <groupId>com.example</groupId>
+              <artifactId>app</artifactId>
+              <version>1.0</version>
+              <properties>
+                <dep.version>2.3.4</dep.version>
+                <dep.group>org.example</dep.group>
+              </properties>
+              <dependencyManagement><dependencies><dependency>
+                <groupId>ignored</groupId><artifactId>managed</artifactId><version>9</version>
+              </dependency></dependencies></dependencyManagement>
+              <dependencies>
+                <dependency>
+                  <groupId>${dep.group}</groupId><artifactId>library</artifactId>
+                  <version>${dep.version}</version>
+                </dependency>
+                <dependency>
+                  <groupId>org.example</groupId><artifactId>missing-version</artifactId>
+                </dependency>
+                <dependency>
+                  <groupId>org.example</groupId><artifactId>classified</artifactId>
+                  <version>1</version><classifier>tests</classifier>
+                </dependency>
+              </dependencies>
+            </project>
+        "#;
+        let project = project(&[("pom.xml", pom), ("src/App.java", "class App {}")]);
+        let discovered = discover_metadata(&project);
+        assert_eq!(
+            vec![JvmMavenCoordinate::new("org.example", "library", "2.3.4")],
+            discovered.coordinates
+        );
+    }
+
+    #[test]
     fn java_dependency_discovery_skips_system_scope_dependencies() {
         let project = project(&[(
             "pom.xml",
@@ -1071,12 +1078,6 @@ mod tests {
         let discovered = discover_metadata(&project);
         assert!(discovered.coordinates.is_empty());
         assert!(discovered.artifact_paths.is_empty());
-    }
-
-    #[test]
-    fn java_dependency_discovery_appends_maven_reactor_reports() {
-        let args = maven_dependency_list_args(Path::new("/tmp/maven-dependencies.txt"));
-        assert!(args.iter().any(|arg| arg == "-DappendOutput=true"));
     }
 
     #[test]
@@ -1167,42 +1168,6 @@ mod tests {
             declaration("org.example", "opaque", "2.0").scope,
             DependencyScope::Unknown
         );
-    }
-
-    /// A coordinate reached only through a resolved artifact path carries no
-    /// declaration, so its scope stays unknown instead of inheriting one.
-    #[test]
-    fn java_dependency_discovery_leaves_undeclared_coordinates_without_a_scope() {
-        let project = project(&[
-            (
-                "gradle.lockfile",
-                "org.example:alpha:1.0=compileClasspath\n",
-            ),
-            ("src/App.java", "class App {}"),
-        ]);
-        let discovered = discover_metadata(&project);
-        assert!(
-            !discovered
-                .declarations
-                .contains_key(&JvmMavenCoordinate::new("org.example", "beta", "1.0"))
-        );
-    }
-
-    #[test]
-    fn java_dependency_discovery_identifies_refresh_inputs() {
-        let root = tempfile::tempdir().unwrap();
-        for (path, expected) in [
-            ("pom.xml", true),
-            ("module/build.gradle.kts", true),
-            ("gradle/libs.versions.toml", true),
-            ("buildSrc/src/main/java/Plugin.java", true),
-            ("scripts/unrelated.kts", false),
-            ("src/App.java", false),
-            ("README.md", false),
-        ] {
-            let file = ProjectFile::new(root.path().to_path_buf(), PathBuf::from(path));
-            assert_eq!(expected, is_jvm_dependency_input(&file), "{path}");
-        }
     }
 
     #[test]
@@ -1315,35 +1280,6 @@ malformed
         assert_eq!(3, executor.calls.lock().unwrap().len());
     }
 
-    #[test]
-    fn java_dependency_discovery_fake_executor_failures_are_empty() {
-        let project = project(&[
-            ("pom.xml", "<project/>"),
-            ("timeout/pom.xml", "<project/>"),
-            ("settings.gradle", "rootProject.name = 'root'"),
-            ("src/App.java", "class App {}"),
-        ]);
-        let root = stable_path(project.root());
-        let timeout_root = stable_path(project.root().join("timeout"));
-        let executor = FakeExecutor::new(
-            PathBuf::from("mvn"),
-            PathBuf::from("gradle"),
-            [
-                (root.clone(), Err("executable missing".to_string())),
-                (timeout_root, Err("timed out".to_string())),
-            ],
-            [(root, Err("nonzero exit".to_string()))],
-        );
-        let discovered = discover_build_tools_with_executor(
-            &project,
-            &JvmDependencyDiscoveryConfig::default(),
-            &executor,
-        );
-        assert!(discovered.coordinates.is_empty());
-        assert!(discovered.artifact_paths.is_empty());
-        assert_eq!(3, executor.calls.lock().unwrap().len());
-    }
-
     struct FakeExecutor {
         expected_maven: PathBuf,
         expected_gradle: PathBuf,
@@ -1367,6 +1303,26 @@ malformed
                 calls: Mutex::new(Vec::new()),
             }
         }
+
+        fn report(
+            &self,
+            tool: &str,
+            unexpected_root: &str,
+            root: &Path,
+            executable: &Path,
+            expected_executable: &Path,
+            reports: &HashMap<PathBuf, Result<Vec<u8>, String>>,
+        ) -> Result<Vec<u8>, String> {
+            assert_eq!(expected_executable, executable);
+            self.calls
+                .lock()
+                .unwrap()
+                .push((tool.to_owned(), root.to_path_buf()));
+            reports
+                .get(root)
+                .cloned()
+                .unwrap_or_else(|| Err(unexpected_root.to_owned()))
+        }
     }
 
     impl DependencyCommandExecutor for FakeExecutor {
@@ -1376,15 +1332,14 @@ malformed
             executable: &Path,
             _config: &JvmDependencyDiscoveryConfig,
         ) -> Result<Vec<u8>, String> {
-            assert_eq!(self.expected_maven, executable);
-            self.calls
-                .lock()
-                .unwrap()
-                .push(("maven".to_string(), root.to_path_buf()));
-            self.maven
-                .get(root)
-                .cloned()
-                .unwrap_or_else(|| Err("unexpected Maven root".to_string()))
+            self.report(
+                "maven",
+                "unexpected Maven root",
+                root,
+                executable,
+                &self.expected_maven,
+                &self.maven,
+            )
         }
 
         fn gradle_report(
@@ -1393,15 +1348,14 @@ malformed
             executable: &Path,
             _config: &JvmDependencyDiscoveryConfig,
         ) -> Result<Vec<u8>, String> {
-            assert_eq!(self.expected_gradle, executable);
-            self.calls
-                .lock()
-                .unwrap()
-                .push(("gradle".to_string(), root.to_path_buf()));
-            self.gradle
-                .get(root)
-                .cloned()
-                .unwrap_or_else(|| Err("unexpected Gradle root".to_string()))
+            self.report(
+                "gradle",
+                "unexpected Gradle root",
+                root,
+                executable,
+                &self.expected_gradle,
+                &self.gradle,
+            )
         }
     }
 

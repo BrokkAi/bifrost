@@ -29,6 +29,8 @@ use brokk_bifrost_js_ts::providers::{
     self, JsTsSource, compute_direct_ancestors, compute_relevant_imports,
     resolve_import_target_files, resolve_imported_code_units,
 };
+use moka::sync::Cache;
+use std::hash::Hash;
 use std::sync::Arc;
 
 /// A JS/TS source that also owns its memo bucket.
@@ -47,6 +49,23 @@ pub(crate) trait JsTsMemoSource: JsTsSource {
     /// accessor here lets all memo crossings publish the same workspace export
     /// index dependency, including cache hits, without enumerating files again.
     fn analyzer(&self) -> &dyn IAnalyzer;
+}
+
+fn memoized_set<K, T>(
+    cache: &Cache<K, Arc<HashSet<T>>>,
+    key: &K,
+    build: impl FnOnce() -> HashSet<T>,
+) -> Arc<HashSet<T>>
+where
+    K: Clone + Eq + Hash + Send + Sync + 'static,
+    T: Eq + Hash + Send + Sync + 'static,
+{
+    if let Some(cached) = cache.get(key) {
+        return cached;
+    }
+    let value = Arc::new(build());
+    cache.insert(key.clone(), Arc::clone(&value));
+    value
 }
 
 /// The one downcast from the framework's `&dyn IAnalyzer` to the JS/TS source
@@ -86,21 +105,9 @@ pub(crate) fn imported_code_units_of(
     token: QueryToken<'_>,
     file: &ProjectFile,
 ) -> Arc<HashSet<CodeUnit>> {
-    let caches = host.memo_caches();
-    if let Some(cached) = caches.imported_code_units.get(file) {
-        return cached;
-    }
-
-    let resolved = Arc::new(resolve_imported_code_units(
-        host,
-        file,
-        host.import_info_of(token, file),
-    ));
-
-    caches
-        .imported_code_units
-        .insert(file.clone(), Arc::clone(&resolved));
-    resolved
+    memoized_set(&host.memo_caches().imported_code_units, file, || {
+        resolve_imported_code_units(host, file, host.import_info_of(token, file))
+    })
 }
 
 /// `imports` is intentionally unused: `imported_code_units_of`'s cache is keyed by `file` alone and,
@@ -162,17 +169,10 @@ pub(crate) fn relevant_imports_for(
     token: QueryToken<'_>,
     code_unit: &CodeUnit,
 ) -> HashSet<String> {
-    let caches = host.memo_caches();
-    if let Some(cached) = caches.relevant_imports.get(code_unit) {
-        return (*cached).clone();
-    }
-
-    let relevant = compute_relevant_imports(host, token, code_unit);
-
-    caches
-        .relevant_imports
-        .insert(code_unit.clone(), Arc::new(relevant.clone()));
-    relevant
+    (*memoized_set(&host.memo_caches().relevant_imports, code_unit, || {
+        compute_relevant_imports(host, token, code_unit)
+    }))
+    .clone()
 }
 
 /// `imports` is intentionally unused, for the same reason as `imported_code_units_from_infos` above:
@@ -203,9 +203,11 @@ fn resolved_import_target_files(
     file: &ProjectFile,
 ) -> Arc<HashSet<ProjectFile>> {
     let caches = host.memo_caches();
-    caches.imported_target_files.get_with(file.clone(), || {
-        Arc::new(resolve_import_target_files(host, token, file))
-    })
+    crate::analyzer::common::import_target_files_from_cache(
+        &caches.imported_target_files,
+        file,
+        || resolve_import_target_files(host, token, file),
+    )
 }
 
 // --- Skeletons -------------------------------------------------------------
@@ -239,13 +241,9 @@ pub(crate) fn get_direct_descendants(
     host: &dyn JsTsMemoSource,
     code_unit: &CodeUnit,
 ) -> HashSet<CodeUnit> {
-    let uncancelled = crate::cancellation::CancellationToken::default();
-    get_direct_descendants_within(
-        host,
-        code_unit,
-        &DescendantIndexScope::whole_workspace(&uncancelled),
-    )
-    .expect("a descendant index that cannot stop always completes")
+    crate::analyzer::whole_workspace_descendants(|scope| {
+        get_direct_descendants_within(host, code_unit, scope)
+    })
 }
 
 /// The memo exists because the per-class ancestor misses behind this build
@@ -273,23 +271,32 @@ fn record_usage_index_scope(host: &dyn JsTsMemoSource) {
     }
 }
 
-/// Lazily-built, analyzer-cached JS/TS usage-resolution maps for the host's
-/// language. Built once per cache bucket and reused until `update`/`update_all`
-/// installs a fresh bucket.
-pub(crate) fn jsts_usage_index(host: &dyn JsTsMemoSource) -> Option<Arc<JsTsUsageIndex>> {
-    let language = host.language();
+fn memoized_usage_index(
+    host: &dyn JsTsMemoSource,
+    build_parallel: impl FnOnce() -> Option<JsTsUsageIndex>,
+    build_serial: impl FnOnce() -> Option<JsTsUsageIndex>,
+) -> Option<Arc<JsTsUsageIndex>> {
     let index = host
         .memo_caches()
         .jsts_usage_index
-        .get_or_try_build(
-            || build_jsts_usage_index(host, host.alias_resolver(), language, true).ok_or(()),
-            || build_jsts_usage_index(host, host.alias_resolver(), language, false).ok_or(()),
-        )
+        .get_or_try_build(|| build_parallel().ok_or(()), || build_serial().ok_or(()))
         .ok();
     if index.is_some() {
         record_usage_index_scope(host);
     }
     index
+}
+
+/// Lazily-built, analyzer-cached JS/TS usage-resolution maps for the host's
+/// language. Built once per cache bucket and reused until `update`/`update_all`
+/// installs a fresh bucket.
+pub(crate) fn jsts_usage_index(host: &dyn JsTsMemoSource) -> Option<Arc<JsTsUsageIndex>> {
+    let language = host.language();
+    memoized_usage_index(
+        host,
+        || build_jsts_usage_index(host, host.alias_resolver(), language, true),
+        || build_jsts_usage_index(host, host.alias_resolver(), language, false),
+    )
 }
 
 /// Prepare the usage index before a caller starts its own parallel file scan.
@@ -304,18 +311,11 @@ pub(crate) fn jsts_usage_index_for_parallel_scan(
     host: &dyn JsTsMemoSource,
 ) -> Option<Arc<JsTsUsageIndex>> {
     let language = host.language();
-    let index = host
-        .memo_caches()
-        .jsts_usage_index
-        .get_or_try_build(
-            || build_jsts_usage_index(host, host.alias_resolver(), language, true).ok_or(()),
-            || build_jsts_usage_index(host, host.alias_resolver(), language, false).ok_or(()),
-        )
-        .ok();
-    if index.is_some() {
-        record_usage_index_scope(host);
-    }
-    index
+    memoized_usage_index(
+        host,
+        || build_jsts_usage_index(host, host.alias_resolver(), language, true),
+        || build_jsts_usage_index(host, host.alias_resolver(), language, false),
+    )
 }
 
 pub(crate) fn jsts_usage_index_with_cancellation(
@@ -323,34 +323,25 @@ pub(crate) fn jsts_usage_index_with_cancellation(
     cancellation: &CancellationToken,
 ) -> Option<Arc<JsTsUsageIndex>> {
     let language = host.language();
-    let index = host
-        .memo_caches()
-        .jsts_usage_index
-        .get_or_try_build(
-            || {
-                build_jsts_usage_index_with_cancellation(
-                    host,
-                    host.alias_resolver(),
-                    language,
-                    true,
-                    Some(cancellation),
-                )
-                .ok_or(())
-            },
-            || {
-                build_jsts_usage_index_with_cancellation(
-                    host,
-                    host.alias_resolver(),
-                    language,
-                    false,
-                    Some(cancellation),
-                )
-                .ok_or(())
-            },
-        )
-        .ok();
-    if index.is_some() {
-        record_usage_index_scope(host);
-    }
-    index
+    memoized_usage_index(
+        host,
+        || {
+            build_jsts_usage_index_with_cancellation(
+                host,
+                host.alias_resolver(),
+                language,
+                true,
+                Some(cancellation),
+            )
+        },
+        || {
+            build_jsts_usage_index_with_cancellation(
+                host,
+                host.alias_resolver(),
+                language,
+                false,
+                Some(cancellation),
+            )
+        },
+    )
 }

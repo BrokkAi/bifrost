@@ -1,21 +1,16 @@
 //! Bounded, memoized cross-file walks over the per-file Rust usage facts.
 //!
-//! This is the third layer of `.agents/plans/rust-usage-index-v2.md`. Milestone
-//! 2a made the per-file questions store-backed and 2b did the same for the
-//! inverted-derivable ones; what this file carries is the group that is
-//! genuinely cross-file -- module-file resolution, physical ownership, alias
-//! routes, effective module domains, forward import edges, export chains, and
-//! macro scope visibility.
+//! This layer handles genuinely cross-file questions: module-file resolution,
+//! physical ownership and alias routes, effective module domains, forward
+//! import edges, export chains, and macro scope visibility.
 //!
-//! Each of those was a workspace-wide map built wholesale at index-build time.
-//! Here each is a walk from a seed, memoized in a bounded cache on the analyzer.
+//! These facts are now loaded as bounded, seed-based walks on the analyzer.
 //! The analyzer instance IS the generation: `RustAnalyzer::update` and
 //! `update_all` construct a fresh analyzer with fresh caches, so a cache living
-//! here needs only the query key. That is the same argument the Milestone 2b
-//! Decision Log records for `declaration_facts`, and it applies for the same
-//! reason: every derivation below consults analyzer state (structural parents,
-//! visibility, Cargo routes, the analyzed-file set), not only file bytes, so a
-//! content-hash key would claim an invariance these values do not have.
+//! here needs only the query key. Every derivation below consults analyzer
+//! state such as structural parents, visibility, Cargo routes, and the analyzed-
+//! file set. A content-hash key would claim an invariance these values do not
+//! have.
 
 use brokk_bifrost_core::analyzer::query_token::QueryToken;
 use moka::sync::Cache;
@@ -26,6 +21,9 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 
+use brokk_bifrost_core::analyzer::capabilities::{
+    ImportLookupDependency, ImportResolutionDependencies,
+};
 use brokk_bifrost_core::analyzer::{CodeUnit, ProjectFile};
 
 use crate::graph_support::{RustCargoRouteError, RustFactSource};
@@ -62,6 +60,10 @@ use brokk_bifrost_core::analyzer::rust_facts::RUST_OCCURRENCE_CODE;
 
 /// One module's bindings are asked for by `(file, module)`.
 pub type RustModuleBindingKey = (ProjectFile, ModuleKey);
+
+fn import_module_path_key(module: &ModuleKey) -> String {
+    format!("{}::{}", module.crate_root, module.components.join("::"))
+}
 
 /// The bounded caches the walks memoize into.
 ///
@@ -397,6 +399,19 @@ pub struct RustModuleBinding {
     /// re-export chain.
     pub origin: RustSymbolIdentity,
     pub domain: Domain,
+    /// Files that carried this binding from its declaration to this module.
+    /// Sorted and deduplicated so cyclic propagation reaches a fixed point.
+    pub route_files: Vec<ProjectFile>,
+}
+
+fn declared_value_for_identity<T: Clone>(
+    values: &[(RustSymbolIdentity, T)],
+    identity: &RustSymbolIdentity,
+) -> Option<T> {
+    values
+        .iter()
+        .find(|(candidate, _)| candidate == identity)
+        .map(|(_, value)| value.clone())
 }
 
 impl<'a> RustUsageWalks<'a> {
@@ -566,16 +581,31 @@ impl<'a> RustUsageWalks<'a> {
         self.files_in_module_package(&module.package())
     }
 
+    fn module_candidate_files(
+        &self,
+        resolved_module: &str,
+        probed_files: &[ProjectFile],
+    ) -> Vec<ProjectFile> {
+        let mut files = self
+            .files_in_module_package(resolved_module)
+            .as_ref()
+            .clone();
+        files.extend(probed_files.iter().cloned());
+        files.sort();
+        files.dedup();
+        files
+    }
+
     /// `rust_module_files_from_path`, memoized.
     pub fn probed_module_files_from_path(
         &self,
         file: &ProjectFile,
         module_specifier: &str,
     ) -> Arc<Vec<ProjectFile>> {
-        match rust_relative_module_path(file, module_specifier) {
-            Some(relative_module) => self.probe_module_files(file, relative_module),
-            None => Arc::new(Vec::new()),
-        }
+        self.probed_module_files_for_relative_path(
+            file,
+            rust_relative_module_path(file, module_specifier),
+        )
     }
 
     /// `rust_module_files_from_segments`, memoized.
@@ -584,7 +614,18 @@ impl<'a> RustUsageWalks<'a> {
         file: &ProjectFile,
         segments: &[String],
     ) -> Arc<Vec<ProjectFile>> {
-        match rust_relative_module_segments(file, segments) {
+        self.probed_module_files_for_relative_path(
+            file,
+            rust_relative_module_segments(file, segments),
+        )
+    }
+
+    fn probed_module_files_for_relative_path(
+        &self,
+        file: &ProjectFile,
+        relative_module: Option<PathBuf>,
+    ) -> Arc<Vec<ProjectFile>> {
+        match relative_module {
             Some(relative_module) => self.probe_module_files(file, relative_module),
             None => Arc::new(Vec::new()),
         }
@@ -651,18 +692,8 @@ impl<'a> RustUsageWalks<'a> {
                 .clone();
         };
 
-        let mut files = self
-            .files_in_module_package(&resolved_module)
-            .as_ref()
-            .clone();
-        files.extend(
-            self.probed_module_files_from_path(importing_file, module_specifier)
-                .iter()
-                .cloned(),
-        );
-        files.sort();
-        files.dedup();
-        files
+        let probed_files = self.probed_module_files_from_path(importing_file, module_specifier);
+        self.module_candidate_files(&resolved_module, &probed_files)
     }
 
     /// `RustModuleFiles::resolve_segments`: module resolution with no alias
@@ -735,17 +766,8 @@ impl<'a> RustUsageWalks<'a> {
             }
         };
 
-        let mut files = self
-            .files_in_module_package(&resolved_module)
-            .as_ref()
-            .clone();
-        files.extend(
-            self.probed_module_files_from_segments(importing_file, segments)
-                .iter()
-                .cloned(),
-        );
-        files.sort();
-        files.dedup();
+        let probed_files = self.probed_module_files_from_segments(importing_file, segments);
+        let files = self.module_candidate_files(&resolved_module, &probed_files);
         let mut routes = files
             .into_iter()
             .map(|file| RustResolvedModuleRoute {
@@ -1404,11 +1426,419 @@ impl<'a> RustUsageWalks<'a> {
             .insert(module.clone(), effective.clone());
         Ok(effective)
     }
+    /// The structured positive and negative lookups that can change this
+    /// importer's file edges. Candidates come from import facts and
+    /// Cargo/module identities, never from rendered source text.
+    pub fn import_resolution_dependencies_of(
+        &self,
+        file: &ProjectFile,
+    ) -> Result<ImportResolutionDependencies, RustCargoRouteError> {
+        self.import_resolution_dependencies_for_ordinals(file, None)
+    }
+
+    /// The structured lookup facts for selected source import ordinals. An
+    /// empty selection produces no facts; None means every import in the file.
+    pub fn import_resolution_dependencies_for_ordinals(
+        &self,
+        file: &ProjectFile,
+        selected_ordinals: Option<&[u32]>,
+    ) -> Result<ImportResolutionDependencies, RustCargoRouteError> {
+        let bindings = self.queries.import_bindings_of(file)?;
+        let selected = selected_ordinals.map(|ordinals| {
+            let mut selected = HashSet::default();
+            for ordinal in ordinals {
+                assert!(
+                    usize::try_from(*ordinal).is_ok_and(|index| index < bindings.len()),
+                    "selected Rust import ordinal exists in the source facts"
+                );
+                selected.insert(*ordinal);
+            }
+            selected
+        });
+        let path_identity = self.queries.path_identity_of(file);
+        let mut dependencies = ImportResolutionDependencies::default();
+        let mut seen_lookups = HashSet::default();
+        let mut seen_missing = HashSet::default();
+        let mut route_pending = VecDeque::new();
+
+        for (ordinal, binding) in bindings.iter().enumerate() {
+            if self.cancelled() {
+                return Err(RustCargoRouteError::Cancelled);
+            }
+            let import_ordinal = u32::try_from(ordinal)
+                .expect("one Rust source cannot contain more than u32 imports");
+            if selected
+                .as_ref()
+                .is_some_and(|selected| !selected.contains(&import_ordinal))
+            {
+                continue;
+            }
+            for prefix_len in 0..=binding.path.len() {
+                if prefix_len == 0
+                    && matches!(
+                        binding.path.first().map(String::as_str),
+                        Some("crate" | "self" | "super")
+                    )
+                {
+                    continue;
+                }
+                let name = binding.path.get(prefix_len).map(String::as_str);
+                let prefix = &binding.path[..prefix_len];
+                let requested_path = binding.path[prefix_len..].to_vec();
+                let mut candidate_modules = Vec::new();
+                if prefix.is_empty()
+                    || !matches!(
+                        prefix.first().map(String::as_str),
+                        Some("crate" | "self" | "super")
+                    )
+                {
+                    for depth in (0..=binding.importer_module.components.len()).rev() {
+                        let mut components = binding.importer_module.components[..depth].to_vec();
+                        components.extend(prefix.iter().cloned());
+                        candidate_modules.push(crate::usage::ModuleKey {
+                            crate_root: binding.importer_module.crate_root.clone(),
+                            components,
+                        });
+                    }
+                } else if let Some(package) = resolve_rust_module_segments_with_crate(
+                    &binding.owner_module,
+                    &path_identity.crate_root_package,
+                    prefix,
+                ) {
+                    candidate_modules.push(crate::usage::ModuleKey::with_crate_root(
+                        &path_identity.crate_root_package,
+                        &package,
+                    ));
+                }
+                if let Some(module) = self.external_candidate_module(file, prefix) {
+                    candidate_modules.push(module);
+                }
+                candidate_modules.sort_by_key(crate::usage::ModuleKey::package);
+                candidate_modules.dedup();
+
+                let mut candidate_files = HashSet::default();
+                for module in &candidate_modules {
+                    let module_files = self.files_in_module_package(&module.package());
+                    if !prefix.is_empty()
+                        && !self.module_package_is_present(module, &module_files)?
+                    {
+                        let key = import_module_path_key(module);
+                        if seen_missing.insert((import_ordinal, key.clone())) {
+                            dependencies
+                                .missing_module_path_keys
+                                .push((import_ordinal, key));
+                        }
+                    }
+                    for module_file in module_files.iter() {
+                        candidate_files.insert(module_file.clone());
+                        if !requested_path.is_empty() {
+                            route_pending.push_back((
+                                module_file.clone(),
+                                module.clone(),
+                                import_ordinal,
+                                requested_path.clone(),
+                            ));
+                        }
+                    }
+                }
+                if !prefix.is_empty() {
+                    for route in self.resolve_segments(file, &binding.owner_module, prefix)? {
+                        candidate_files.insert(route.target_file.clone());
+                        if !requested_path.is_empty() {
+                            route_pending.push_back((
+                                route.target_file,
+                                route.target_module,
+                                import_ordinal,
+                                requested_path.clone(),
+                            ));
+                        }
+                    }
+                }
+                for consulted_file in candidate_files {
+                    let Some(name) = name.or_else(|| binding.local_name.is_glob().then_some("*"))
+                    else {
+                        continue;
+                    };
+                    let key = (import_ordinal, consulted_file.clone(), name.to_owned());
+                    if seen_lookups.insert(key) {
+                        dependencies.lookups.push(ImportLookupDependency {
+                            import_ordinal,
+                            consulted_file,
+                            name: name.to_owned(),
+                        });
+                    }
+                }
+            }
+        }
+
+        let mut visited_routes = HashSet::default();
+        while let Some((route_file, route_module, import_ordinal, requested_path)) =
+            route_pending.pop_front()
+        {
+            if self.cancelled() {
+                return Err(RustCargoRouteError::Cancelled);
+            }
+            if !visited_routes.insert((
+                route_file.clone(),
+                route_module.clone(),
+                import_ordinal,
+                requested_path.clone(),
+            )) {
+                continue;
+            }
+            let Some(imported_name) = requested_path.first() else {
+                continue;
+            };
+            let route_identity = self.queries.path_identity_of(&route_file);
+            let dependency_key = (import_ordinal, route_file.clone(), imported_name.clone());
+            if seen_lookups.insert(dependency_key) {
+                dependencies.lookups.push(ImportLookupDependency {
+                    import_ordinal,
+                    consulted_file: route_file.clone(),
+                    name: imported_name.clone(),
+                });
+            }
+            let requested_name = imported_name.as_str();
+            for nested in self
+                .queries
+                .import_bindings_of(&route_file)?
+                .iter()
+                .filter(|binding| {
+                    binding.importer_module == route_module
+                        && matches!(binding.extent, RustImportExtent::Module { .. })
+                        && (binding.local_name.is_glob()
+                            || binding.local_name.named() == Some(requested_name))
+                })
+            {
+                let remaining_path = if nested.local_name.is_glob() {
+                    requested_path.clone()
+                } else {
+                    requested_path[1..].to_vec()
+                };
+                for prefix_len in 0..=nested.path.len() {
+                    let nested_name = nested.path.get(prefix_len).map(String::as_str);
+                    if prefix_len == 0
+                        && matches!(
+                            nested.path.first().map(String::as_str),
+                            Some("crate" | "self" | "super")
+                        )
+                    {
+                        continue;
+                    }
+                    let prefix = &nested.path[..prefix_len];
+                    let mut modules = Vec::new();
+                    if prefix.is_empty()
+                        || !matches!(
+                            prefix.first().map(String::as_str),
+                            Some("crate" | "self" | "super")
+                        )
+                    {
+                        for depth in (0..=nested.importer_module.components.len()).rev() {
+                            let mut components =
+                                nested.importer_module.components[..depth].to_vec();
+                            components.extend(prefix.iter().cloned());
+                            modules.push(ModuleKey {
+                                crate_root: nested.importer_module.crate_root.clone(),
+                                components,
+                            });
+                        }
+                    } else if let Some(package) = resolve_rust_module_segments_with_crate(
+                        &nested.owner_module,
+                        &route_identity.crate_root_package,
+                        prefix,
+                    ) {
+                        modules.push(ModuleKey::with_crate_root(
+                            &route_identity.crate_root_package,
+                            &package,
+                        ));
+                    }
+                    if let Some(module) = self.external_candidate_module(&route_file, prefix) {
+                        modules.push(module);
+                    }
+                    modules.sort_by_key(ModuleKey::package);
+                    modules.dedup();
+                    for module in modules {
+                        let module_files = self.files_in_module_package(&module.package());
+                        if !prefix.is_empty()
+                            && !self.module_package_is_present(&module, &module_files)?
+                        {
+                            let key = import_module_path_key(&module);
+                            if seen_missing.insert((import_ordinal, key.clone())) {
+                                dependencies
+                                    .missing_module_path_keys
+                                    .push((import_ordinal, key));
+                            }
+                        }
+                        for consulted_file in module_files.iter() {
+                            let Some(nested_name) =
+                                nested_name.or_else(|| nested.local_name.is_glob().then_some("*"))
+                            else {
+                                continue;
+                            };
+                            let key = (
+                                import_ordinal,
+                                consulted_file.clone(),
+                                nested_name.to_owned(),
+                            );
+                            if seen_lookups.insert(key) {
+                                dependencies.lookups.push(ImportLookupDependency {
+                                    import_ordinal,
+                                    consulted_file: consulted_file.clone(),
+                                    name: nested_name.to_owned(),
+                                });
+                            }
+                            if prefix_len == nested.path.len() && !remaining_path.is_empty() {
+                                route_pending.push_back((
+                                    consulted_file.clone(),
+                                    module.clone(),
+                                    import_ordinal,
+                                    remaining_path.clone(),
+                                ));
+                            }
+                        }
+                    }
+                    if !prefix.is_empty() {
+                        for route in
+                            self.resolve_segments(&route_file, &nested.owner_module, prefix)?
+                        {
+                            let Some(nested_name) =
+                                nested_name.or_else(|| nested.local_name.is_glob().then_some("*"))
+                            else {
+                                continue;
+                            };
+                            let key = (
+                                import_ordinal,
+                                route.target_file.clone(),
+                                nested_name.to_owned(),
+                            );
+                            if seen_lookups.insert(key) {
+                                dependencies.lookups.push(ImportLookupDependency {
+                                    import_ordinal,
+                                    consulted_file: route.target_file.clone(),
+                                    name: nested_name.to_owned(),
+                                });
+                            }
+                            if prefix_len == nested.path.len() && !remaining_path.is_empty() {
+                                route_pending.push_back((
+                                    route.target_file,
+                                    route.target_module,
+                                    import_ordinal,
+                                    remaining_path.clone(),
+                                ));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        for route in self.origin_routes_of(file)?.values().flatten() {
+            let import_ordinal = route.import_ordinal;
+            if selected
+                .as_ref()
+                .is_some_and(|selected| !selected.contains(&import_ordinal))
+            {
+                continue;
+            }
+            let mut names = vec![route.origin.name.as_str()];
+            if let Some(route_name) = route.path.first()
+                && !names.contains(&route_name.as_str())
+            {
+                names.push(route_name);
+            }
+            for consulted_file in &route.route_files {
+                for name in &names {
+                    let key = (import_ordinal, consulted_file.clone(), (*name).to_owned());
+                    if seen_lookups.insert(key) {
+                        dependencies.lookups.push(ImportLookupDependency {
+                            import_ordinal,
+                            consulted_file: consulted_file.clone(),
+                            name: (*name).to_owned(),
+                        });
+                    }
+                }
+            }
+        }
+
+        dependencies.lookups.sort_by(|left, right| {
+            left.import_ordinal
+                .cmp(&right.import_ordinal)
+                .then_with(|| left.consulted_file.cmp(&right.consulted_file))
+                .then_with(|| left.name.cmp(&right.name))
+        });
+        dependencies.missing_module_path_keys.sort_unstable();
+        Ok(dependencies)
+    }
+
+    fn external_candidate_module(
+        &self,
+        importing_file: &ProjectFile,
+        segments: &[String],
+    ) -> Option<ModuleKey> {
+        let (package, _) = self
+            .cargo_routes
+            .resolve_module_package_segments_with_kind(importing_file, segments)?;
+        let root_segments = segments.first().cloned().into_iter().collect::<Vec<_>>();
+        let (root_file, _) = self
+            .cargo_routes
+            .resolve_crate_root_file_segments_with_kind(importing_file, &root_segments)?;
+        let crate_root = self
+            .queries
+            .path_identity_of(&root_file)
+            .crate_root_package
+            .clone();
+        Some(ModuleKey::with_crate_root(&crate_root, &package))
+    }
+
+    fn module_package_is_present(
+        &self,
+        module: &ModuleKey,
+        candidate_files: &[ProjectFile],
+    ) -> Result<bool, RustCargoRouteError> {
+        let package = module.package();
+        for file in candidate_files {
+            let identity = self.queries.path_identity_of(file);
+            if identity.package == package {
+                return Ok(true);
+            }
+            let facts = self
+                .queries
+                .facts_of(file)?
+                .expect("module candidate files have live Rust facts");
+            if facts
+                .modules
+                .iter()
+                .filter(|fact| fact.is_inline)
+                .any(|fact| {
+                    let declared_package = if fact.module_name.is_empty() {
+                        identity.package.clone()
+                    } else {
+                        format!("{}.{}", identity.package, fact.module_name)
+                    };
+                    ModuleKey::with_crate_root(&identity.crate_root_package, &declared_package)
+                        == *module
+                })
+            {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
     // ---------------------------------------------------------------- layer 3
     // Forward import edges. `build_importer_reverse` produced these for every
     // file in the workspace and then bucketed them by target; one file's edges
     // are a per-file question once module resolution is lazy, and the reverse
     // direction becomes candidates-then-verify over them.
+
+    /// The canonical source-order import bindings used by edge and candidate
+    /// dependency ordinals.
+    pub fn import_bindings_of(
+        &self,
+        file: &ProjectFile,
+    ) -> Result<Arc<Vec<RustImportBinding>>, RustCargoRouteError> {
+        self.queries.import_bindings_of(file)
+    }
 
     /// Every import edge `file` originates, in source order.
     pub fn forward_import_edges_of(
@@ -1422,11 +1852,16 @@ impl<'a> RustUsageWalks<'a> {
             return Ok(cached);
         }
         let mut edges: Vec<RustImportEdge> = Vec::new();
-        for binding in self.queries.import_bindings_of(file)?.iter() {
+        for (ordinal, binding) in self.queries.import_bindings_of(file)?.iter().enumerate() {
             if self.cancelled() {
                 break;
             }
-            self.append_forward_import_edges(file, binding, &mut edges)?;
+            self.append_forward_import_edges(
+                file,
+                u32::try_from(ordinal).expect("one Rust file cannot contain more than u32 imports"),
+                binding,
+                &mut edges,
+            )?;
         }
         if self.cancelled() {
             return Err(RustCargoRouteError::Cancelled);
@@ -1441,6 +1876,7 @@ impl<'a> RustUsageWalks<'a> {
     fn append_forward_import_edges(
         &self,
         file: &ProjectFile,
+        import_ordinal: u32,
         binding: &RustImportBinding,
         edges: &mut Vec<RustImportEdge>,
     ) -> Result<(), RustCargoRouteError> {
@@ -1457,6 +1893,7 @@ impl<'a> RustUsageWalks<'a> {
         };
         let template = |target: RustResolvedModuleRoute, kind: RustImportEdgeKind| RustImportEdge {
             importer: file.clone(),
+            import_ordinal,
             importer_module: binding.importer_module.clone(),
             extent: binding.extent.clone(),
             source_path: binding.path.clone(),
@@ -1822,6 +2259,32 @@ impl<'a> RustUsageWalks<'a> {
 
     // ---------------------------------------------------- export chain walks
 
+    /// Module keys whose bindings are authored in `file`, including its path-
+    /// derived root module. The caller can ask `bindings_at` only for these
+    /// modules instead of scanning every module in the workspace.
+    pub fn binding_modules_of(
+        &self,
+        file: &ProjectFile,
+    ) -> Result<Vec<ModuleKey>, RustCargoRouteError> {
+        let identity = self.queries.path_identity_of(file);
+        let mut modules = HashSet::default();
+        modules.insert(self.queries.module_key_of(file, &identity.package));
+        for (module, _) in &self
+            .queries
+            .declaration_facts_of(file)?
+            .declared_module_domains
+        {
+            modules.insert(module.clone());
+        }
+        let mut modules = modules.into_iter().collect::<Vec<_>>();
+        modules.sort_by(|left, right| {
+            left.crate_root
+                .cmp(&right.crate_root)
+                .then_with(|| left.components.cmp(&right.components))
+        });
+        Ok(modules)
+    }
+
     /// Every name bound in `module` of `file`, declared there or imported into
     /// it, with the declaration each name ultimately reaches.
     pub fn bindings_at(
@@ -1886,6 +2349,7 @@ impl<'a> RustUsageWalks<'a> {
                         namespace: identity.namespace,
                         origin: identity.clone(),
                         domain: domain.clone(),
+                        route_files: vec![identity.file.clone()],
                     },
                 );
             }
@@ -1937,6 +2401,10 @@ impl<'a> RustUsageWalks<'a> {
                 else {
                     continue;
                 };
+                let mut route_files = incoming.route_files;
+                route_files.push(file.clone());
+                route_files.sort();
+                route_files.dedup();
                 push_unique_binding(
                     &mut bindings,
                     RustModuleBinding {
@@ -1944,6 +2412,7 @@ impl<'a> RustUsageWalks<'a> {
                         namespace: target.namespace,
                         origin: incoming.origin,
                         domain: effective,
+                        route_files,
                     },
                 );
             }
@@ -2052,6 +2521,7 @@ impl<'a> RustUsageWalks<'a> {
                     .entry(first_segment)
                     .or_default()
                     .push(RustOriginRoute {
+                        import_ordinal: edge.import_ordinal,
                         importer_module: edge.importer_module.clone(),
                         extent: edge.extent.clone(),
                         path,
@@ -2059,6 +2529,7 @@ impl<'a> RustUsageWalks<'a> {
                         namespace: target.namespace,
                         origin: binding.origin,
                         domain: effective,
+                        route_files: binding.route_files,
                         provenance: edge.provenance,
                         cfg_condition: edge.cfg_condition.clone(),
                     });
@@ -2188,6 +2659,59 @@ impl<'a> RustUsageWalks<'a> {
         });
         candidates.dedup();
         Ok(candidates)
+    }
+
+    /// Whether the selected crate targets provide Rust's standard macro
+    /// prelude. Prelude macro names are compiler/library imports rather than
+    /// source declarations, so they do not appear in `macro_declarations_named`.
+    /// Inspect the selected crate-root syntax at query time; retain no
+    /// workspace-wide prelude index.
+    pub fn standard_macro_prelude_enabled(
+        &self,
+        file: &ProjectFile,
+    ) -> Result<bool, RustCargoRouteError> {
+        let roots = self.cargo_routes.target_roots_for_file(file);
+        if roots.is_empty() {
+            return Ok(false);
+        }
+        for root_file in roots {
+            if self.cancelled() {
+                return Err(RustCargoRouteError::Cancelled);
+            }
+            let Some(prepared) = self.analyzer.prepared_syntax(self.token, &root_file) else {
+                return Err(RustCargoRouteError::Unavailable);
+            };
+            let source = prepared.source();
+            let syntax_root = prepared.tree().root_node();
+            let mut cursor = syntax_root.walk();
+            for attribute_item in syntax_root.named_children(&mut cursor) {
+                if self.cancelled() {
+                    return Err(RustCargoRouteError::Cancelled);
+                }
+                if attribute_item.kind() != "inner_attribute_item" {
+                    continue;
+                }
+                let Some(attribute_path) = attribute_item
+                    .named_child(0)
+                    .and_then(|attribute| attribute.named_child(0))
+                else {
+                    continue;
+                };
+                let Some(segments) = crate::graph_support::rust_path_segments(attribute_path)
+                else {
+                    continue;
+                };
+                if segments.len() == 1
+                    && matches!(
+                        crate::declarations::rust_node_text(segments[0], source),
+                        "no_implicit_prelude" | "no_std" | "no_core"
+                    )
+                {
+                    return Ok(false);
+                }
+            }
+        }
+        Ok(true)
     }
 
     /// Structured candidates from selected synthetic-std roots and exact
@@ -2523,13 +3047,8 @@ impl<'a> RustUsageWalks<'a> {
             if !visited.insert((scope.clone(), visible_after)) {
                 continue;
             }
-            let shadow_start = self
-                .macro_definitions_in_scope(&scope, &identity.name)?
-                .into_iter()
-                .filter(|(candidate, start)| candidate != declaration && *start >= visible_after)
-                .map(|(_, start)| start)
-                .min()
-                .unwrap_or(usize::MAX);
+            let shadow_start =
+                self.macro_shadow_start(declaration, &scope, &identity.name, visible_after)?;
             if scope == *caller_scope && visible_after <= caller_byte && caller_byte < shadow_start
             {
                 return Ok(Some(arrival_route));
@@ -2638,6 +3157,22 @@ impl<'a> RustUsageWalks<'a> {
             .collect())
     }
 
+    fn macro_shadow_start(
+        &self,
+        declaration: &CodeUnit,
+        scope: &RustMacroScopeKey,
+        name: &str,
+        visible_after: usize,
+    ) -> Result<usize, RustCargoRouteError> {
+        Ok(self
+            .macro_definitions_in_scope(scope, name)?
+            .into_iter()
+            .filter(|(candidate, start)| candidate != declaration && *start >= visible_after)
+            .map(|(_, start)| start)
+            .min()
+            .unwrap_or(usize::MAX))
+    }
+
     /// `macro_visible_ranges` for one macro: the byte ranges in which it is in
     /// scope, per scope, walking its own scope graph outward instead of
     /// building every macro's ranges up front.
@@ -2672,15 +3207,8 @@ impl<'a> RustUsageWalks<'a> {
                 if !visited.insert((scope.clone(), visible_after)) {
                     continue;
                 }
-                let shadow_start = self
-                    .macro_definitions_in_scope(&scope, &identity.name)?
-                    .into_iter()
-                    .filter(|(candidate, start)| {
-                        candidate != declaration && *start >= visible_after
-                    })
-                    .map(|(_, start)| start)
-                    .min()
-                    .unwrap_or(usize::MAX);
+                let shadow_start =
+                    self.macro_shadow_start(declaration, &scope, &identity.name, visible_after)?;
                 visible
                     .entry(scope.clone())
                     .or_default()
@@ -2712,6 +3240,17 @@ impl<'a> RustUsageWalks<'a> {
         Ok(visible)
     }
 
+    fn declaration_identity_from_facts(
+        facts: &[(CodeUnit, RustSymbolIdentity)],
+        declaration: &CodeUnit,
+    ) -> Option<RustSymbolIdentity> {
+        facts
+            .iter()
+            .filter(|(candidate, _)| candidate == declaration)
+            .map(|(_, identity)| identity.clone())
+            .next_back()
+    }
+
     /// The identity one declaration introduces.
     ///
     /// The v1 `declaration_identities` map was a `HashMap<CodeUnit, _>` filled
@@ -2721,14 +3260,11 @@ impl<'a> RustUsageWalks<'a> {
         &self,
         declaration: &CodeUnit,
     ) -> Result<Option<RustSymbolIdentity>, RustCargoRouteError> {
-        Ok(self
-            .queries
-            .declaration_facts_of(declaration.source())?
-            .identities
-            .iter()
-            .filter(|(candidate, _)| candidate == declaration)
-            .map(|(_, identity)| identity.clone())
-            .next_back())
+        let facts = self.queries.declaration_facts_of(declaration.source())?;
+        Ok(Self::declaration_identity_from_facts(
+            &facts.identities,
+            declaration,
+        ))
     }
 
     /// The exact source declarations that introduce `identity`.
@@ -2752,14 +3288,11 @@ impl<'a> RustUsageWalks<'a> {
         &self,
         declaration: &CodeUnit,
     ) -> Result<Option<RustSymbolIdentity>, RustCargoRouteError> {
-        Ok(self
-            .queries
-            .declaration_facts_of(declaration.source())?
-            .value_constructors
-            .iter()
-            .filter(|(candidate, _)| candidate == declaration)
-            .map(|(_, identity)| identity.clone())
-            .next_back())
+        let facts = self.queries.declaration_facts_of(declaration.source())?;
+        Ok(Self::declaration_identity_from_facts(
+            &facts.value_constructors,
+            declaration,
+        ))
     }
 
     /// `declaration_domains` for one identity: the visibility domains the
@@ -2768,13 +3301,8 @@ impl<'a> RustUsageWalks<'a> {
         &self,
         identity: &RustSymbolIdentity,
     ) -> Result<Option<Vec<Domain>>, RustCargoRouteError> {
-        Ok(self
-            .queries
-            .declaration_facts_of(&identity.file)?
-            .domains
-            .iter()
-            .find(|(candidate, _)| candidate == identity)
-            .map(|(_, domains)| domains.clone()))
+        let facts = self.queries.declaration_facts_of(&identity.file)?;
+        Ok(declared_value_for_identity(&facts.domains, identity))
     }
 
     /// `declaration_cfg_conditions` for one identity: the `#[cfg(...)]`
@@ -2787,13 +3315,8 @@ impl<'a> RustUsageWalks<'a> {
         &self,
         identity: &RustSymbolIdentity,
     ) -> Result<Option<Vec<RustCfgCondition>>, RustCargoRouteError> {
-        Ok(self
-            .queries
-            .declaration_facts_of(&identity.file)?
-            .cfg_conditions
-            .iter()
-            .find(|(candidate, _)| candidate == identity)
-            .map(|(_, conditions)| conditions.clone()))
+        let facts = self.queries.declaration_facts_of(&identity.file)?;
+        Ok(declared_value_for_identity(&facts.cfg_conditions, identity))
     }
 
     /// The exact visibility-domain/cfg pairs for one declaration identity.
@@ -2803,13 +3326,11 @@ impl<'a> RustUsageWalks<'a> {
         &self,
         identity: &RustSymbolIdentity,
     ) -> Result<Option<Vec<(Domain, RustCfgCondition)>>, RustCargoRouteError> {
-        Ok(self
-            .queries
-            .declaration_facts_of(&identity.file)?
-            .domain_cfg_occurrences
-            .iter()
-            .find(|(candidate, _)| candidate == identity)
-            .map(|(_, occurrences)| occurrences.clone()))
+        let facts = self.queries.declaration_facts_of(&identity.file)?;
+        Ok(declared_value_for_identity(
+            &facts.domain_cfg_occurrences,
+            identity,
+        ))
     }
 
     /// Macro declarations in the workspace named `name`. The v1 lookup scanned
@@ -2875,7 +3396,16 @@ fn edge_binds_identity(edge: &RustImportEdge, identity: &RustSymbolIdentity) -> 
 /// same triple reached twice through different edges must not bind twice here
 /// either.
 fn push_unique_binding(bindings: &mut Vec<RustModuleBinding>, binding: RustModuleBinding) {
-    if !bindings.contains(&binding) {
+    if let Some(existing) = bindings.iter_mut().find(|existing| {
+        existing.name == binding.name
+            && existing.namespace == binding.namespace
+            && existing.origin == binding.origin
+            && existing.domain == binding.domain
+    }) {
+        existing.route_files.extend(binding.route_files);
+        existing.route_files.sort();
+        existing.route_files.dedup();
+    } else {
         bindings.push(binding);
     }
 }

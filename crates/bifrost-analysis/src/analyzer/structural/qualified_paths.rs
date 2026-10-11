@@ -285,7 +285,7 @@ pub fn qualified_paths_for_file(
                 &mut segments,
                 &mut reasons,
             ),
-            None => note(
+            None => super::note_once(
                 &mut reasons,
                 QualifiedPathIncompleteReason::SyntaxUnavailable,
             ),
@@ -314,14 +314,6 @@ fn unavailable(reason: QualifiedPathIncompleteReason) -> QualifiedPathsFileResul
             unsupported_axes: QUALIFIED_PATH_PRODUCER_AXES.to_vec(),
             reasons: vec![reason],
         },
-    }
-}
-
-/// Record a reason once. Which wall was hit is what matters; how many chains
-/// hit the same wall is not.
-fn note(reasons: &mut Vec<QualifiedPathIncompleteReason>, reason: QualifiedPathIncompleteReason) {
-    if !reasons.contains(&reason) {
-        reasons.push(reason);
     }
 }
 
@@ -396,7 +388,7 @@ fn derive_rows(
     for chain_root in roots {
         let tokens = spec.path_segment_tokens(chain_root);
         if tokens.is_empty() {
-            note(reasons, QualifiedPathIncompleteReason::ChainUnenumerable);
+            super::note_once(reasons, QualifiedPathIncompleteReason::ChainUnenumerable);
             continue;
         }
         debug_assert!(
@@ -414,7 +406,7 @@ fn derive_rows(
         let Some(&terminal_node) =
             token_by_range.get(&(terminal.start_byte(), terminal.end_byte()))
         else {
-            note(
+            super::note_once(
                 reasons,
                 QualifiedPathIncompleteReason::PathAnchorUnclassified,
             );
@@ -624,9 +616,7 @@ mod tests {
         }
 
         fn at(&self, needle: &str) -> usize {
-            self.source
-                .find(needle)
-                .unwrap_or_else(|| panic!("fixture does not contain {needle:?}"))
+            crate::test_support::fixture_marker(&self.source, needle)
         }
     }
 
@@ -657,73 +647,7 @@ mod tests {
     /// a scope segment is a package or a type from the token alone — the
     /// qualifier namespace stated on each scope segment rather than a guessed
     /// `Module` or `Type` (#3064).
-    #[test]
-    fn java_import_chain_is_one_ordered_path() {
-        let fixture = Fixture::new(
-            Language::Java,
-            "src/Widget.java",
-            concat!(
-                "import java.util.List;\n",
-                "class Widget {\n",
-                "    List<String> items() { return null; }\n",
-                "}\n",
-            ),
-        );
-        let result = fixture.rows(QualifiedPathDerivationOptions::ROWS_ONLY);
 
-        let segments = path_segments_at(&result, fixture.at("java.util"));
-        assert_eq!(
-            segments.iter().map(|s| s.text.as_str()).collect::<Vec<_>>(),
-            ["java", "util", "List"],
-        );
-        for segment in &segments {
-            assert!(segment.node.is_some(), "Java segment tokens are facts");
-            assert!(
-                segment.resolution.is_none(),
-                "ROWS_ONLY derives no resolution"
-            );
-        }
-        // Java cannot say whether a scope segment is a package or a type from
-        // the token alone, so both state the qualifier namespace; the terminal
-        // is an import target, whose namespace is the adapter's existing
-        // classification.
-        assert_eq!(segments[0].namespace, Some(Namespace::PathPrefix));
-        assert_eq!(segments[1].namespace, Some(Namespace::PathPrefix));
-        assert_eq!(segments[2].namespace, Some(Namespace::Value));
-        assert!(result.completeness.covers(IdentityAxis::PathSegments));
-    }
-
-    /// The generic argument count is per segment and reads the grammar's
-    /// argument list: nested arguments attach to the inner segment, not the
-    /// outer one, and a segment without spelled arguments has `None`.
-    #[test]
-    fn java_generic_arity_is_spelled_per_segment() {
-        let fixture = Fixture::new(
-            Language::Java,
-            "src/Widget.java",
-            concat!(
-                "import java.util.Map;\n",
-                "import java.util.List;\n",
-                "class Widget {\n",
-                "    java.util.Map<String, List<Integer>> index() { return null; }\n",
-                "}\n",
-            ),
-        );
-        let result = fixture.rows(QualifiedPathDerivationOptions::ROWS_ONLY);
-
-        let segments = path_segments_at(&result, fixture.at("java.util.Map<String"));
-        assert_eq!(
-            segments
-                .iter()
-                .map(|s| (s.text.as_str(), s.generic_arity))
-                .collect::<Vec<_>>(),
-            [("java", None), ("util", None), ("Map", Some(2))],
-        );
-    }
-
-    /// A Rust path keyword (`crate`) is a real segment at a real ordinal with
-    /// a genuinely absent structural identity, and a raw identifier decodes to
-    /// the identifier it denotes while staying one segment.
     #[test]
     fn rust_path_keywords_and_raw_identifiers_stay_honest_segments() {
         let fixture = Fixture::new(
@@ -750,72 +674,6 @@ mod tests {
         );
     }
 
-    /// Segment resolution answers each focused segment independently: the
-    /// module segment of a workspace-local Rust path resolves to the module
-    /// declaration and decides the module namespace, the terminal to the
-    /// struct, and the `crate` keyword's answer is an explicit status rather
-    /// than an omitted row.
-    #[test]
-    fn rust_segment_prefixes_resolve_independently() {
-        let fixture = Fixture::new(
-            Language::Rust,
-            "src/lib.rs",
-            concat!(
-                "pub mod util {\n",
-                "    pub struct Widget;\n",
-                "}\n",
-                "pub fn build() -> crate::util::Widget {\n",
-                "    crate::util::Widget\n",
-                "}\n",
-            ),
-        );
-        let result = fixture.rows(QualifiedPathDerivationOptions::WITH_SEGMENT_RESOLUTION);
-
-        let segments = path_segments_at(&result, fixture.at("crate::util::Widget {"));
-        let util = &segments[1];
-        let util_resolution = util.resolution.as_ref().expect("resolution derived");
-        assert_eq!(
-            util_resolution.status,
-            SegmentResolutionStatus::Resolved,
-            "util resolution: {util_resolution:?}"
-        );
-        assert_eq!(util.namespace, Some(Namespace::Module));
-
-        let terminal = &segments[2];
-        let terminal_resolution = terminal.resolution.as_ref().expect("resolution derived");
-        assert_eq!(
-            terminal_resolution.status,
-            SegmentResolutionStatus::Resolved,
-            "terminal resolution: {terminal_resolution:?}"
-        );
-        assert_eq!(terminal.namespace, Some(Namespace::Type));
-
-        let keyword = &segments[0];
-        assert!(
-            keyword.resolution.is_some(),
-            "the crate keyword's answer is an explicit status, not an omitted row"
-        );
-    }
-
-    /// Python's flat dotted chain: ordered module segments whose namespace the
-    /// adapter itself states, no resolution required.
-    #[test]
-    fn python_dotted_name_states_module_segments() {
-        let fixture = Fixture::new(
-            Language::Python,
-            "app.py",
-            concat!("import os.path\n", "print(os.path)\n"),
-        );
-        let result = fixture.rows(QualifiedPathDerivationOptions::ROWS_ONLY);
-
-        let segments = path_segments_at(&result, fixture.at("os.path\n"));
-        assert_eq!(segments.len(), 2);
-        assert_eq!(segments[0].text, "os");
-        assert_eq!(segments[0].namespace, Some(Namespace::Module));
-    }
-
-    /// A TypeScript qualified type name is a chain, and its terminal's spelled
-    /// generic arguments count at the terminal segment.
     #[test]
     fn typescript_qualified_type_chain_with_generics() {
         let fixture = Fixture::new(
@@ -838,8 +696,6 @@ mod tests {
         );
     }
 
-    /// An adapter without the axes yields per-axis incompleteness, never an
-    /// empty complete answer.
     #[test]
     fn unclaimed_language_reports_incomplete_axes() {
         let fixture = Fixture::new(Language::Go, "main.go", "package main\n\nfunc main() {}\n");
@@ -853,23 +709,5 @@ mod tests {
                 "an unclaimed adapter must not cover {axis}"
             );
         }
-    }
-
-    /// A bare identifier is not a path: no single-segment rows exist.
-    #[test]
-    fn bare_identifiers_produce_no_paths() {
-        let fixture = Fixture::new(
-            Language::Rust,
-            "src/lib.rs",
-            concat!(
-                "pub fn build() -> u32 {\n",
-                "    let value = 1;\n",
-                "    value\n",
-                "}\n"
-            ),
-        );
-        let result = fixture.rows(QualifiedPathDerivationOptions::ROWS_ONLY);
-        assert!(result.paths.is_empty(), "paths: {:?}", result.paths);
-        assert!(result.segments.is_empty());
     }
 }

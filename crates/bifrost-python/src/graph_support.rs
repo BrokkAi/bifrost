@@ -25,10 +25,11 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tree_sitter::Node;
 
+use crate::bindings::{python_direct_scope_bindings_bounded, python_executable_scope_children};
 use crate::declarations::{
-    collect_python_identifiers, module_code_unit, parse_python_tree, python_declared_import_root,
-    python_import_root, python_module_name, python_project_module_components,
-    python_repeated_root_extension_dir,
+    collect_python_identifiers, module_code_unit, parse_python_tree, python_base_origin_node,
+    python_declared_import_root, python_import_root, python_module_name,
+    python_project_module_components, python_repeated_root_extension_dir,
 };
 use crate::imports::{
     PythonImportDetails, python_import_details, python_namespace_binding_module,
@@ -1238,11 +1239,31 @@ pub fn import_bindings_from_imports(
                     .map(str::to_string)
                     .unwrap_or_else(|| name.clone());
                 let module_candidate = format!("{resolved_module}.{name}");
-                if resolve_module_code_unit(python, Some(file), &module_candidate).is_some() {
+                let exported = resolve_exported_fqn(python, Some(file), &module_candidate);
+                let exported_module =
+                    if !exported.is_empty() && exported.iter().all(CodeUnit::is_module) {
+                        let mut paths = exported.iter().map(CodeUnit::fq_segment_texts);
+                        let path = paths
+                            .next()
+                            .expect("non-empty exported modules have a first path");
+                        paths
+                            .all(|candidate| candidate == path)
+                            .then(|| path.join("."))
+                    } else {
+                        None
+                    };
+                let implicit_submodule = if exported.is_empty()
+                    && resolve_module_code_unit(python, Some(file), &module_candidate).is_some()
+                {
+                    Some(module_candidate)
+                } else {
+                    None
+                };
+                if let Some(module_specifier) = exported_module.or(implicit_submodule) {
                     bindings.push((
                         local_name,
                         ImportBinding {
-                            module_specifier: module_candidate,
+                            module_specifier,
                             namespace_imported_module: None,
                             kind: ImportKind::Namespace,
                             imported_name: None,
@@ -1334,11 +1355,143 @@ pub fn resolve_base_class(
         return Some(imported.clone());
     }
 
+    if let Some(local) = resolve_preceding_local_class_base(python, token, code_unit, trimmed) {
+        return Some(local);
+    }
+
     let local_fq_name = format!("{}.{}", code_unit.package_name(), trimmed);
     python
         .definitions(&local_fq_name)
         .next()
         .or_else(|| python.definitions(trimmed).next())
+}
+
+fn class_definition_in_statement(node: Node<'_>) -> Option<Node<'_>> {
+    if node.kind() == "class_definition" {
+        return Some(node);
+    }
+    (node.kind() == "decorated_definition")
+        .then(|| {
+            let mut cursor = node.walk();
+            node.named_children(&mut cursor)
+                .find(|child| child.kind() == "class_definition")
+        })
+        .flatten()
+}
+
+fn declaration_statement(node: Node<'_>) -> Option<Node<'_>> {
+    match node.kind() {
+        "decorated_definition" if class_definition_in_statement(node).is_some() => Some(node),
+        "class_definition" => Some(
+            node.parent()
+                .filter(|parent| parent.kind() == "decorated_definition")
+                .unwrap_or(node),
+        ),
+        _ => None,
+    }
+}
+
+fn scope_statement_binds_name(node: Node<'_>, source: &str, name: &str) -> bool {
+    let mut stack = vec![node];
+    while let Some(node) = stack.pop() {
+        if node.kind() == "wildcard_import" {
+            return true;
+        }
+        if matches!(node.kind(), "global_statement" | "nonlocal_statement") {
+            let mut cursor = node.walk();
+            if node.named_children(&mut cursor).any(|child| {
+                child.kind() == "identifier"
+                    && child.utf8_text(source.as_bytes()).ok() == Some(name)
+            }) {
+                return true;
+            }
+        }
+        let Some(bindings) = python_direct_scope_bindings_bounded(node, source, || true) else {
+            return true;
+        };
+        if bindings
+            .iter()
+            .any(|binding| binding.declaration.utf8_text(source.as_bytes()).ok() == Some(name))
+        {
+            return true;
+        }
+        stack.extend(python_executable_scope_children(node));
+    }
+    false
+}
+
+fn resolve_preceding_local_class_base(
+    python: &dyn PythonSource,
+    token: QueryToken<'_>,
+    code_unit: &CodeUnit,
+    raw: &str,
+) -> Option<CodeUnit> {
+    let parent = python.parent_of(code_unit)?;
+    if !parent.is_function() && !parent.is_class() {
+        return None;
+    }
+    let prepared = python.prepared_syntax(token, code_unit.source())?;
+    let source = prepared.source();
+    let current_node = prepared.declaration_node(code_unit)?;
+    let current_statement = declaration_statement(current_node)?;
+    let current_class = class_definition_in_statement(current_statement)?;
+    let base_list = current_class.child_by_field_name("superclasses")?;
+    let mut base_cursor = base_list.walk();
+    if !base_list.named_children(&mut base_cursor).any(|base| {
+        let origin = python_base_origin_node(base);
+        origin.kind() == "identifier" && origin.utf8_text(source.as_bytes()).ok() == Some(raw)
+    }) {
+        return None;
+    }
+    let block = current_statement.parent()?;
+    let mut block_cursor = block.walk();
+    let siblings = block.named_children(&mut block_cursor).collect::<Vec<_>>();
+    let current_index = siblings
+        .iter()
+        .position(|sibling| sibling.id() == current_statement.id())?;
+
+    let mut preceding: Option<(usize, CodeUnit, Node<'_>)> = None;
+    for candidate in prepared.direct_children(&parent) {
+        if !candidate.is_class()
+            || candidate.source() != code_unit.source()
+            || candidate.identifier() != raw
+        {
+            continue;
+        }
+        let Some(candidate_node) = prepared.declaration_node(candidate) else {
+            continue;
+        };
+        let Some(candidate_statement) = declaration_statement(candidate_node) else {
+            continue;
+        };
+        if candidate_statement.parent().map(|node| node.id()) != Some(block.id())
+            || candidate_statement.start_byte() >= current_statement.start_byte()
+        {
+            continue;
+        }
+        if preceding
+            .as_ref()
+            .is_none_or(|(start, _, _)| candidate_statement.start_byte() > *start)
+        {
+            preceding = Some((
+                candidate_statement.start_byte(),
+                candidate.clone(),
+                candidate_statement,
+            ));
+        }
+    }
+    let (_, candidate, candidate_statement) = preceding?;
+    let candidate_index = siblings
+        .iter()
+        .position(|sibling| sibling.id() == candidate_statement.id())?;
+    if candidate_index >= current_index
+        || siblings[candidate_index + 1..current_index]
+            .iter()
+            .any(|statement| scope_statement_binds_name(*statement, source, raw))
+    {
+        return None;
+    }
+    Some(candidate)
 }
 
 pub fn render_skeleton_recursive(

@@ -26,17 +26,19 @@ use brokk_bifrost_analysis::analyzer::semantic::{
     WorkspaceRelativePath, WorkspaceRelativePathError,
 };
 use brokk_bifrost_analysis::workspace_document::{
-    WorkspaceDocumentError, WorkspaceRoot, read_workspace_document,
+    WorkspaceDocumentError, WorkspaceRoot, read_optional_workspace_document,
 };
 
 use super::classification::{TextValidationError, validate_required_text};
 use super::definition::{PolicyId, PolicyIdentifierError, Sha256ValueError};
 use super::finding_identity::PolicyFindingId;
 use super::report::PolicyReportDocument;
-use super::retained::{RetainedSize, retained_extra};
+use super::retained::{
+    RetainedSize, retained_extra, retained_size_with_extra, retained_size_with_field_extra,
+};
 use super::suppression::{
     AcceptedPolicyHash, PolicyEvaluationDate, PolicySuppressionPolicyHashState,
-    bounded_json_error_message, workspace_error_is_not_found,
+    bounded_json_error_message,
 };
 
 pub const DEFAULT_POLICY_BASELINE_PATH: &str = ".bifrost/baseline.json";
@@ -217,7 +219,7 @@ impl PolicyBaselineSource {
     }
 
     fn from_workspace_path(path: WorkspaceRelativePath) -> Result<Self, PolicyBaselineSourceError> {
-        if path.as_str().len() > MAX_POLICY_BASELINE_PATH_BYTES {
+        if crate::is_over_byte_limit(path.as_str(), MAX_POLICY_BASELINE_PATH_BYTES) {
             return Err(PolicyBaselineSourceError::TooLong {
                 max_bytes: MAX_POLICY_BASELINE_PATH_BYTES,
             });
@@ -264,14 +266,7 @@ impl fmt::Display for PolicyBaselineSourceError {
     }
 }
 
-impl std::error::Error for PolicyBaselineSourceError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self {
-            Self::Path(error) => Some(error),
-            Self::TooLong { .. } => None,
-        }
-    }
-}
+crate::impl_policy_source_error!(PolicyBaselineSourceError);
 
 /// Open a workspace capability once, then load and normalize its configured
 /// baseline document. Only an actual missing file maps to `Ok(None)`.
@@ -288,15 +283,16 @@ pub(crate) fn load_policy_baseline_from_root(
     options: &PolicyBaselineOptions,
 ) -> Result<Option<PolicyBaselineDocument>, PolicyBaselineLoadError> {
     let relative_path = Path::new(options.source.relative_path());
-    let document = match read_workspace_document(
+    let document = match read_optional_workspace_document(
         root,
         relative_path,
         &["json"],
         MAX_POLICY_BASELINE_DOCUMENT_BYTES,
-    ) {
-        Ok(document) => document,
-        Err(error) if workspace_error_is_not_found(&error) => return Ok(None),
-        Err(error) => return Err(PolicyBaselineLoadError::Workspace(error)),
+    )
+    .map_err(PolicyBaselineLoadError::Workspace)?
+    {
+        Some(document) => document,
+        None => return Ok(None),
     };
     parse_policy_baseline_document(document.source())
         .map(Some)
@@ -306,7 +302,7 @@ pub(crate) fn load_policy_baseline_from_root(
 pub fn parse_policy_baseline_document(
     source: &str,
 ) -> Result<PolicyBaselineDocument, PolicyBaselineDocumentError> {
-    if u64::try_from(source.len()).unwrap_or(u64::MAX) > MAX_POLICY_BASELINE_DOCUMENT_BYTES {
+    if crate::is_over_u64_byte_limit(source, MAX_POLICY_BASELINE_DOCUMENT_BYTES) {
         return Err(PolicyBaselineDocumentError::Validation(
             PolicyBaselineValidationError::DocumentTooLarge {
                 max_bytes: MAX_POLICY_BASELINE_DOCUMENT_BYTES,
@@ -464,10 +460,9 @@ impl fmt::Display for PolicyBaselineDocumentError {
                 message,
                 line,
                 column,
-            } => write!(
-                formatter,
-                "invalid baseline JSON at line {line}, column {column}: {message}"
-            ),
+            } => {
+                crate::fmt_policy_json_decode_error(formatter, "baseline", message, *line, *column)
+            }
             Self::Validation(error) => error.fmt(formatter),
         }
     }
@@ -962,16 +957,19 @@ impl RetainedSize for PolicyBaselineDocument {
 
 impl RetainedSize for PolicyBaselineSource {
     fn retained_size(&self) -> usize {
-        std::mem::size_of::<Self>().saturating_add(match self {
-            Self::Conventional => 0,
-            Self::Explicit(path) => retained_extra(path),
-        })
+        retained_size_with_extra(
+            self,
+            match self {
+                Self::Conventional => 0,
+                Self::Explicit(path) => retained_extra(path),
+            },
+        )
     }
 }
 
 impl RetainedSize for PolicyBaselineOptions {
     fn retained_size(&self) -> usize {
-        std::mem::size_of::<Self>().saturating_add(retained_extra(&self.source))
+        retained_size_with_field_extra(self, &self.source)
     }
 }
 
@@ -985,7 +983,7 @@ impl RetainedSize for PolicyFindingBaseline {
 
 impl RetainedSize for PolicyBaselineEntryReview {
     fn retained_size(&self) -> usize {
-        std::mem::size_of::<Self>().saturating_add(retained_extra(&self.policy_id))
+        retained_size_with_extra(self, retained_extra(&self.policy_id))
     }
 }
 

@@ -1,5 +1,3 @@
-use std::cell::Cell;
-
 use crate::analyzer::Language;
 use crate::analyzer::php::PhpAdapter;
 use crate::analyzer::store::AnalyzerStore;
@@ -84,16 +82,17 @@ fn php_declaration_source_facts_reopen_without_source_and_mount_exact_bridges() 
     std::fs::remove_file(file.abs_path()).unwrap();
     let store = AnalyzerStore::open_persistent(&path).unwrap();
     let generation = store.current_generation("php").unwrap();
-    let first = store
-        .php_source_facts(oid, generation, &PhpAdapter, &file, &|| true)
-        .unwrap()
-        .unwrap();
-    let mounted = store
-        .php_source_facts(oid, generation, &PhpAdapter, &second, &|| true)
-        .unwrap()
-        .unwrap();
+    let (first, mounted) = super::assert_source_facts_match_across_mounts(
+        &store,
+        generation,
+        &file,
+        &second,
+        |store, generation, file, cancellation| {
+            store.php_source_facts(oid, generation, &PhpAdapter, file, cancellation)
+        },
+        |read| &read.facts,
+    );
     assert_eq!(&first.facts, expected);
-    assert_eq!(first.facts, mounted.facts);
     assert_eq!(first.imports, state.source_facts.as_ref().unwrap().imports);
     assert_eq!(first.imports, mounted.imports);
     assert_eq!(
@@ -114,22 +113,9 @@ fn php_declaration_source_facts_reopen_without_source_and_mount_exact_bridges() 
             .flatten()
             .all(|unit| unit.source() == &second)
     );
-    let visits = Cell::new(0);
-    assert!(
-        store
-            .php_source_facts(oid, generation, &PhpAdapter, &file, &|| {
-                visits.set(visits.get() + 1);
-                visits.get() < 5
-            })
-            .unwrap()
-            .is_none()
-    );
-    assert!(
-        store
-            .php_source_facts(oid, generation, &PhpAdapter, &file, &|| true)
-            .unwrap()
-            .is_some()
-    );
+    super::assert_source_read_cancellation_retries(|cancellation| {
+        store.php_source_facts(oid, generation, &PhpAdapter, &file, cancellation)
+    });
 }
 
 #[test]
@@ -207,48 +193,41 @@ fn php_source_requires_a_sealed_canonical_source_manifest() {
 #[test]
 fn php_source_publication_count_and_cascade_are_enforced() {
     let fixture = InlineTestProject::with_language(Language::Php)
-        .file("types.php", "<?php\n")
+        .file("empty.php", "<?php\n")
+        .file("types.php", SOURCE)
         .build();
-    let file = fixture.file("types.php");
-    let state = parse_state(&PhpAdapter, &file);
-    let oid = oid_for(b"<?php\n");
+    let empty_file = fixture.file("empty.php");
+    let populated_file = fixture.file("types.php");
+    let empty_state = parse_state(&PhpAdapter, &empty_file);
+    let populated_state = parse_state(&PhpAdapter, &populated_file);
+    let empty_oid = oid_for(empty_state.source.as_bytes());
+    let populated_oid = oid_for(SOURCE.as_bytes());
     let store = AnalyzerStore::open_ephemeral().unwrap();
     let generation = store.current_generation("php").unwrap();
     store
-        .write_parsed_blob(oid, "php", &PhpAdapter, &state)
+        .write_parsed_blob(empty_oid, "php", &PhpAdapter, &empty_state)
+        .unwrap();
+    store
+        .write_parsed_blob(populated_oid, "php", &PhpAdapter, &populated_state)
         .unwrap();
     assert!(
         store
-            .php_source_facts(oid, generation, &PhpAdapter, &file, &|| true)
+            .php_source_facts(empty_oid, generation, &PhpAdapter, &empty_file, &|| true)
             .unwrap()
             .is_some()
     );
-    store
-        .conn
-        .execute(|conn| {
-            conn.execute("DELETE FROM blobs", [])?;
-            let count: i64 =
-                conn.query_row("SELECT COUNT(*) FROM source_php_manifests", [], |row| {
-                    row.get(0)
-                })?;
-            assert_eq!(count, 0, "blob deletion must cascade PHP publications");
-            Ok::<_, crate::analyzer::store::StoreError>(())
-        })
-        .unwrap();
-}
-
-#[test]
-fn php_source_populated_cascade_removes_nested_rows() {
-    let fixture = InlineTestProject::with_language(Language::Php)
-        .file("types.php", SOURCE)
-        .build();
-    let file = fixture.file("types.php");
-    let state = parse_state(&PhpAdapter, &file);
-    let oid = oid_for(SOURCE.as_bytes());
-    let store = AnalyzerStore::open_ephemeral().unwrap();
-    store
-        .write_parsed_blob(oid, "php", &PhpAdapter, &state)
-        .unwrap();
+    assert!(
+        store
+            .php_source_facts(
+                populated_oid,
+                generation,
+                &PhpAdapter,
+                &populated_file,
+                &|| true
+            )
+            .unwrap()
+            .is_some()
+    );
     store
         .conn
         .execute(|conn| {
@@ -270,7 +249,7 @@ fn php_source_populated_cascade_removes_nested_rows() {
                     })?;
                 assert_eq!(count, 0, "blob deletion must cascade {table}");
             }
-            Ok::<_, StoreError>(())
+            Ok::<_, crate::analyzer::store::StoreError>(())
         })
         .unwrap();
 }
@@ -294,13 +273,10 @@ fn php_source_lookup_seeks_populated_publications_before_and_after_statistics() 
             .write_parsed_blob(other, "php", &PhpAdapter, &state)
             .unwrap();
     }
-    for refreshed in [false, true] {
-        if refreshed {
-            store.refresh_planner_statistics().unwrap();
-        }
-        let conn = store.read_conn().unwrap();
-        let plan = conn
-            .prepare(&format!(
+    super::assert_source_lookup_plan(
+        &store,
+        |conn| {
+            conn.prepare(&format!(
                 "EXPLAIN QUERY PLAN {}",
                 crate::analyzer::php::source_storage::PHP_SOURCE_HEADER_SQL
             ))
@@ -316,24 +292,15 @@ fn php_source_lookup_seeks_populated_publications_before_and_after_statistics() 
             )
             .unwrap()
             .collect::<rusqlite::Result<Vec<_>>>()
-            .unwrap();
-        assert!(
-            plan.iter()
-                .any(|step| step.contains("SEARCH blob") && step.contains("INDEX")),
-            "{plan:#?}"
-        );
-        assert!(
-            plan.iter().all(|step| !step.starts_with("SCAN ")),
-            "canonical PHP lookup must seek the content identity: {plan:#?}"
-        );
-        drop(conn);
-        assert!(
+            .unwrap()
+        },
+        || {
             store
                 .php_source_facts(oid, generation, &PhpAdapter, &file, &|| true)
                 .unwrap()
                 .is_some()
-        );
-    }
+        },
+    );
 }
 
 #[test]
@@ -403,14 +370,17 @@ fn php_source_rejects_payload_accounting_corruption() {
     store
         .write_parsed_blob(oid, "php", &PhpAdapter, &state)
         .unwrap();
-    store.conn.execute(|conn| {
-        conn.execute_batch("DROP TRIGGER source_php_manifests_no_update_after_seal; UPDATE source_php_manifests SET payload_bytes = payload_bytes + 1;")?;
-        Ok::<_, StoreError>(())
-    }).unwrap();
-    assert!(
-        store
-            .php_source_facts(oid, generation, &PhpAdapter, &file, &|| true)
-            .is_err()
+    super::assert_reader_rejects_tampering(
+        || {
+            store.conn.execute(|conn| {
+                conn.execute_batch(
+                    "DROP TRIGGER source_php_manifests_no_update_after_seal;
+                     UPDATE source_php_manifests SET payload_bytes = payload_bytes + 1;",
+                )?;
+                Ok::<_, StoreError>(())
+            })
+        },
+        || store.php_source_facts(oid, generation, &PhpAdapter, &file, &|| true),
     );
 }
 
@@ -438,4 +408,55 @@ fn php_source_properties_preserve_sparse_shared_declaration_ids() {
         .unwrap()
         .unwrap();
     assert_eq!(read.facts, expected);
+}
+
+/// #4288: a grouped `use` with a trailing comma is valid PHP 7.2+, but
+/// tree-sitter-php 0.24.2 has no rule for it, so recovery inserts a phantom
+/// clause with an empty name; a `use` inside a function body and a bare
+/// `use ;` are the other recovery shapes the grammar admits as statements.
+/// The producer must hold its generic import list equal to the canonical
+/// source imports, because `ImportRows::from_imports` zips them by ordinal
+/// and asserts equal length. The pin asserts the equality invariant, not the
+/// counts, so it survives a grammar fix that stops synthesizing the phantom.
+#[test]
+fn php_import_projections_agree_on_recovery_import_shapes() {
+    let source = r#"<?php
+
+namespace Abraham\TwitterOAuth;
+
+use Abraham\TwitterOAuth\{
+    Consumer,
+    HmacSha1,
+    Response,
+    Token,
+    Util\JsonDecoder,
+};
+use Composer\CaBundle\CaBundle;
+
+class TwitterOAuth
+{
+    public function request(string $path): void
+    {
+        use function Vendor\helper;
+    }
+}
+
+use ;
+"#;
+    let fixture = InlineTestProject::with_language(Language::Php)
+        .file("src/TwitterOAuth.php", source)
+        .build();
+    let file = fixture.file("src/TwitterOAuth.php");
+    let state = parse_state(&PhpAdapter, &file);
+    let source_facts = state.source_facts.as_ref().unwrap();
+    assert_eq!(state.imports.len(), source_facts.imports.len());
+    assert_eq!(state.imports.len(), source_facts.generic_imports.len());
+    let oid = oid_for(source.as_bytes());
+    let store = AnalyzerStore::open_ephemeral().unwrap();
+    // Pre-fix this panicked in `ImportRows::from_imports`: the producer
+    // overwrote the generic list with a second interpretation that skipped
+    // the phantom clause and the nested `use`.
+    store
+        .write_parsed_blob(oid, "php", &PhpAdapter, &state)
+        .unwrap();
 }

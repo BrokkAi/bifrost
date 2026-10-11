@@ -75,13 +75,13 @@ impl RetainedRubyGems {
         match retained_discovery_verdict(self.evidence.as_deref(), name) {
             RetainedDiscoveryVerdict::NoDiscovery | RetainedDiscoveryVerdict::Undeclared => {
                 SemanticDiagnosticIncompleteReason::MissingDependencyDiscovery {
-                    boundary: BoundaryStatus::ExternalUnknown,
+                    boundary: crate::analyzer::semantic_model::missing_dependency_boundary(false),
                 }
             }
             RetainedDiscoveryVerdict::Truncated => SemanticDiagnosticIncompleteReason::Truncated,
             RetainedDiscoveryVerdict::Declared => {
                 SemanticDiagnosticIncompleteReason::MissingDependencyDiscovery {
-                    boundary: BoundaryStatus::ExternalDeclaredUnindexed,
+                    boundary: crate::analyzer::semantic_model::missing_dependency_boundary(true),
                 }
             }
         }
@@ -212,22 +212,6 @@ mod tests {
     }
 
     #[test]
-    fn ruby_require_boundary_reports_a_declared_gem_nothing_indexed() {
-        // Discovery reached the lockfile and named the gem; no activation
-        // published an overlay. That is exactly `ExternalDeclaredUnindexed`,
-        // and it is the one state the workspace activation path can leave
-        // behind, because evidence is retained only after preparation succeeds.
-        assert_eq!(
-            RubyGemBoundary::Incomplete(
-                SemanticDiagnosticIncompleteReason::MissingDependencyDiscovery {
-                    boundary: BoundaryStatus::ExternalDeclaredUnindexed
-                }
-            ),
-            gems(Some(evidence(&["widget"], true))).require_boundary("widget")
-        );
-    }
-
-    #[test]
     fn ruby_require_boundary_walks_a_gem_load_path_by_segment() {
         let surface = gems(Some(evidence(&["widget"], true)));
         // `widget/core` is published by the `widget` gem.
@@ -255,6 +239,22 @@ mod tests {
         assert_eq!(
             RubyGemBoundary::Incomplete(SemanticDiagnosticIncompleteReason::Truncated),
             gems(Some(evidence(&["widget"], false))).require_boundary("widget")
+        );
+    }
+
+    #[test]
+    fn ruby_require_boundary_reports_a_declared_gem_nothing_indexed() {
+        // Discovery reached the lockfile and named the gem; no activation
+        // published an overlay. That is exactly `ExternalDeclaredUnindexed`,
+        // and it is the one state the workspace activation path can leave
+        // behind, because evidence is retained only after preparation succeeds.
+        assert_eq!(
+            RubyGemBoundary::Incomplete(
+                SemanticDiagnosticIncompleteReason::MissingDependencyDiscovery {
+                    boundary: BoundaryStatus::ExternalDeclaredUnindexed
+                }
+            ),
+            gems(Some(evidence(&["widget"], true))).require_boundary("widget")
         );
     }
 

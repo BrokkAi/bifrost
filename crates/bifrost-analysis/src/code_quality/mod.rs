@@ -13,6 +13,10 @@ use crate::analyzer::{CodeUnit, IAnalyzer, ProjectFile, SummaryFileProjection};
 use crate::hash::HashMap;
 use crate::path_utils::{AmbiguousPathInput, ResolvedFileInput, WorkspaceFileResolver};
 use regex::Regex;
+
+pub(crate) const fn default_weight_sentinel() -> i32 {
+    -1
+}
 use std::collections::{BTreeSet, VecDeque};
 use std::sync::LazyLock;
 

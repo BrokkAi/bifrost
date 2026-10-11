@@ -4,6 +4,7 @@
 //! then compare every persisted identity to the parse product, so a coherent
 //! but independently reconstructed visibility table cannot satisfy the test.
 
+use brokk_bifrost_test_macros::hardwon;
 use std::collections::HashMap;
 
 use brokk_bifrost_core::analyzer::parsed_file::ParsedSourceFacts;
@@ -16,8 +17,8 @@ use rusqlite::{Connection, params};
 use crate::analyzer::Language;
 use crate::analyzer::java::JavaAdapter;
 use crate::analyzer::rust::RustAdapter;
-use crate::analyzer::store::tests::{oid_for, parse_state};
-use crate::analyzer::store::{AnalyzerStore, stored_unit_keys};
+use crate::analyzer::store::tests::{blob_id as rust_blob_id, oid_for, parse_state};
+use crate::analyzer::store::{AnalyzerStore, declaration_name, stored_unit_keys};
 use crate::analyzer::tree_sitter_analyzer::FileState;
 use crate::inline_project::InlineTestProject;
 
@@ -60,16 +61,6 @@ fn java_fixture() -> (
     (fixture, file, state)
 }
 
-fn declaration_name(
-    facts: &ParsedSourceFacts,
-    source: &str,
-    id: SourceDeclarationId,
-) -> Option<String> {
-    let name = facts.occurrences.declaration(id).name?;
-    let range = facts.occurrences.occurrence(name).range;
-    Some(source.get(range.start_byte..range.end_byte)?.to_owned())
-}
-
 fn blob_id(conn: &Connection, oid: git2::Oid) -> i64 {
     conn.query_row(
         "SELECT id FROM blobs WHERE blob_oid = ?1 AND lang = 'java'",
@@ -77,15 +68,6 @@ fn blob_id(conn: &Connection, oid: git2::Oid) -> i64 {
         |row| row.get(0),
     )
     .expect("published Java blob id")
-}
-
-fn rust_blob_id(conn: &Connection, oid: git2::Oid) -> i64 {
-    conn.query_row(
-        "SELECT id FROM blobs WHERE blob_oid = ?1 AND lang = 'rust'",
-        [oid.to_string()],
-        |row| row.get(0),
-    )
-    .expect("published Rust blob id")
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -228,18 +210,18 @@ fn assert_source_visibility_properties(state: &FileState) {
     ] {
         assert!(
             visibilities.iter().any(|fact| {
-                declaration_name(facts, JAVA_SOURCE, fact.declaration).as_deref() == Some(name)
+                declaration_name(facts, JAVA_SOURCE, fact.declaration) == name
                     && fact.visibility == expected
             }),
             "missing source visibility {name}={expected:?}"
         );
     }
     assert!(visibilities.iter().any(|fact| {
-        declaration_name(facts, JAVA_SOURCE, fact.declaration).as_deref() == Some("run")
+        declaration_name(facts, JAVA_SOURCE, fact.declaration) == "run"
             && fact.visibility == DeclaredVisibility::Public
     }));
     assert!(visibilities.iter().any(|fact| {
-        declaration_name(facts, JAVA_SOURCE, fact.declaration).as_deref() == Some("run")
+        declaration_name(facts, JAVA_SOURCE, fact.declaration) == "run"
             && fact.visibility == DeclaredVisibility::Private
     }));
 
@@ -251,10 +233,7 @@ fn assert_source_visibility_properties(state: &FileState) {
     for source_only in ["left", "right"] {
         let ids = visibilities
             .iter()
-            .filter(|fact| {
-                declaration_name(facts, JAVA_SOURCE, fact.declaration).as_deref()
-                    == Some(source_only)
-            })
+            .filter(|fact| declaration_name(facts, JAVA_SOURCE, fact.declaration) == source_only)
             .map(|fact| fact.declaration)
             .collect::<Vec<_>>();
         assert!(!ids.is_empty(), "source-only declaration {source_only}");
@@ -266,9 +245,7 @@ fn assert_source_visibility_properties(state: &FileState) {
     for native in ["FIRST", "SECOND"] {
         let ids = visibilities
             .iter()
-            .filter(|fact| {
-                declaration_name(facts, JAVA_SOURCE, fact.declaration).as_deref() == Some(native)
-            })
+            .filter(|fact| declaration_name(facts, JAVA_SOURCE, fact.declaration) == native)
             .map(|fact| fact.declaration)
             .collect::<Vec<_>>();
         assert!(!ids.is_empty(), "enum constant {native}");
@@ -304,7 +281,7 @@ fn assert_source_visibility_properties(state: &FileState) {
         state
             .source_declaration_metadata
             .iter()
-            .all(|link| declaration_name(facts, JAVA_SOURCE, link.declaration).is_some())
+            .all(|link| !declaration_name(facts, JAVA_SOURCE, link.declaration).is_empty())
     );
 }
 
@@ -638,7 +615,14 @@ fn java_visibility_publication_is_exact_across_reopen_reader_shapes_and_native_p
         }
     }
     store
-        .write_parsed_blob_at_generation(oid, "java", generation, &JavaAdapter, &stale_projection)
+        .write_parsed_blob_at_generation(
+            &crate::analyzer::store::test_blob_file(),
+            oid,
+            "java",
+            generation,
+            &JavaAdapter,
+            &stale_projection,
+        )
         .expect("publish complete Java visibility family");
     {
         let conn = store.read_conn().expect("read Java visibility publication");
@@ -702,7 +686,14 @@ fn empty_java_visibility_publication_is_present_and_distinct_from_legacy() {
     let store = AnalyzerStore::open_ephemeral().expect("empty Java visibility store");
     let generation = store.current_generation("java").expect("Java generation");
     store
-        .write_parsed_blob_at_generation(oid, "java", generation, &JavaAdapter, &state)
+        .write_parsed_blob_at_generation(
+            &crate::analyzer::store::test_blob_file(),
+            oid,
+            "java",
+            generation,
+            &JavaAdapter,
+            &state,
+        )
         .expect("publish empty Java visibility family");
     let conn = store.read_conn().expect("read empty Java publication");
     let id = blob_id(&conn, oid);
@@ -773,7 +764,14 @@ fn incomplete_java_visibility_bridges_fail_atomically_without_legacy_fallback() 
         let oid = oid_for(format!("failed-{missing}-java-visibility").as_bytes());
         let generation = store.current_generation("java").expect("Java generation");
         let error = store
-            .write_parsed_blob_at_generation(oid, "java", generation, &JavaAdapter, &state)
+            .write_parsed_blob_at_generation(
+                &crate::analyzer::store::test_blob_file(),
+                oid,
+                "java",
+                generation,
+                &JavaAdapter,
+                &state,
+            )
             .expect_err("missing canonical bridge must fail publication");
         assert!(
             error.to_string().contains("visibility")
@@ -827,7 +825,14 @@ fn legacy_visibility_rows_cannot_override_a_canonical_java_publication() {
     let oid = oid_for(b"legacy-does-not-win-java-visibility");
     let generation = store.current_generation("java").expect("Java generation");
     store
-        .write_parsed_blob_at_generation(oid, "java", generation, &JavaAdapter, &state)
+        .write_parsed_blob_at_generation(
+            &crate::analyzer::store::test_blob_file(),
+            oid,
+            "java",
+            generation,
+            &JavaAdapter,
+            &state,
+        )
         .expect("publish Java visibility");
     let conn = store.read_conn().expect("read canonical Java visibility");
     let id = blob_id(&conn, oid);
@@ -885,7 +890,14 @@ fn damaged_java_visibility_publication_is_unavailable_not_legacy() {
         let oid = oid_for(format!("corrupt-{corruption}-java-visibility").as_bytes());
         let generation = store.current_generation("java").expect("Java generation");
         store
-            .write_parsed_blob_at_generation(oid, "java", generation, &JavaAdapter, &state)
+            .write_parsed_blob_at_generation(
+                &crate::analyzer::store::test_blob_file(),
+                oid,
+                "java",
+                generation,
+                &JavaAdapter,
+                &state,
+            )
             .expect("publish Java visibility");
         let (_, snapshots) = visibility_workspace(&store, oid);
         let conn = store.read_conn().expect("read Java corruption fixture");
@@ -1197,6 +1209,7 @@ mod second { fn repeated() {} }
 }
 
 #[test]
+#[hardwon("1051035c2ed9: an empty Rust source family was not published as ready")]
 fn empty_rust_native_declaration_publication_is_ready_with_zero_count() {
     let fixture = InlineTestProject::with_language(Language::Rust)
         .file("src/lib.rs", "")

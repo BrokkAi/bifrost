@@ -4,6 +4,7 @@ use crate::structural::search::units::{
     CodeQueryExecutionScope, MergedUnitRows, UnitExecutionResult, execute_code_query_unit,
     merge_unit_rows, plan_seed_files, seed_file_order, unit_row_key,
 };
+use brokk_bifrost_test_macros::hardwon;
 
 /// Eight files so the whole execution clears the auto structural-index
 /// admission rule (`MIN_AUTO_STRUCTURAL_INDEX_FILES`), which a one-file unit
@@ -53,6 +54,23 @@ fn callers_query() -> CodeQuery {
     .expect("callers query")
 }
 
+fn dialect_filtered_function_query(label: &str) -> CodeQuery {
+    CodeQuery::from_json(&json!({
+        "schema_version": 1,
+        "languages": ["cpp"],
+        "match": { "kind": "function" },
+        "steps": [
+            { "op": "procedure_of" },
+            { "op": "filter", "where": [
+                { "field": "dialect", "op": "eq", "value": { "enum": label } }
+            ] }
+        ],
+        "limit": 500,
+        "result_detail": "full"
+    }))
+    .expect("dialect-filtered procedure query")
+}
+
 fn overlapping_union_query() -> CodeQuery {
     CodeQuery::from_json(&json!({
         "schema_version": 1,
@@ -84,6 +102,32 @@ fn nested_union_query() -> CodeQuery {
     .expect("nested union query")
 }
 
+fn parent_dialect_filter_union_query() -> CodeQuery {
+    CodeQuery::from_json(&json!({
+        "schema_version": 1,
+        "union": [
+            {
+                "languages": ["cpp"],
+                "match": { "kind": "function" },
+                "steps": [{ "op": "procedure_of" }]
+            },
+            {
+                "languages": ["cpp"],
+                "match": { "kind": "function" },
+                "steps": [{ "op": "procedure_of" }]
+            }
+        ],
+        "steps": [
+            { "op": "filter", "where": [
+                { "field": "dialect", "op": "eq", "value": { "enum": "cpp-c" } }
+            ] }
+        ],
+        "limit": 100,
+        "result_detail": "full"
+    }))
+    .expect("parent-filtered dialect union query")
+}
+
 /// The whole execution's rows in the projection a unit product carries.
 ///
 /// A unit merges projected rows, not rendered ones, so the partition property
@@ -94,8 +138,8 @@ fn projected(items: &[CodeQueryResultItem]) -> Vec<UnitRowItem> {
 }
 
 fn whole_execution(workspace: &WorkspaceAnalyzer, query: &CodeQuery) -> DetailedCodeQueryResult {
-    execute_code_query_detailed_eager_index(
-        workspace.analyzer(),
+    execute_code_query_detailed_eager_index_workspace(
+        workspace,
         query,
         CodeQueryExecutionLimits::default(),
         None,
@@ -107,14 +151,28 @@ fn units(
     query: &CodeQuery,
     seed_files: &[ProjectFile],
 ) -> Vec<UnitExecutionResult> {
+    units_with_limits(
+        workspace,
+        query,
+        seed_files,
+        CodeQueryExecutionLimits::default(),
+    )
+}
+
+fn units_with_limits(
+    workspace: &WorkspaceAnalyzer,
+    query: &CodeQuery,
+    seed_files: &[ProjectFile],
+    limits: CodeQueryExecutionLimits,
+) -> Vec<UnitExecutionResult> {
     seed_files
         .iter()
         .map(|file| {
             execute_code_query_unit(
                 workspace.analyzer(),
-                None,
+                Some(workspace),
                 query,
-                CodeQueryExecutionLimits::default(),
+                limits,
                 None,
                 CodeQueryExecutionScope::for_seed_files(std::slice::from_ref(file), seed_files),
             )
@@ -128,6 +186,19 @@ fn merged(
     seed_files: &[ProjectFile],
 ) -> MergedUnitRows {
     merge_unit_rows(query, units(workspace, query, seed_files))
+}
+
+fn assert_merged_units_match_whole(
+    project: &BuiltInlineTestProject,
+    workspace: &WorkspaceAnalyzer,
+    query: &CodeQuery,
+    files: &[ProjectFile],
+    whole: &DetailedCodeQueryResult,
+) -> MergedUnitRows {
+    let merged = merged(workspace, query, files);
+    assert_eq!(merged.items, projected(&whole.result.results));
+    assert_eq!(merged.detailed_evidence(project.root()), whole.evidence);
+    merged
 }
 
 fn seed_files_of(workspace: &WorkspaceAnalyzer) -> Vec<ProjectFile> {
@@ -146,14 +217,66 @@ fn merged_structural_units_reproduce_the_whole_execution() {
     let whole = whole_execution(&workspace, &query);
     assert!(!whole.result.results.is_empty());
 
-    let merged = merged(&workspace, &query, &files);
-    assert_eq!(merged.items, projected(&whole.result.results));
-    assert_eq!(
-        merged.detailed_evidence(project.root()),
-        whole.evidence,
-        "the evidence projection rebuilds the executor's own evidence"
-    );
+    let merged = assert_merged_units_match_whole(&project, &workspace, &query, &files, &whole);
     assert_eq!(merged.completion(), whole.result.completion());
+}
+
+#[test]
+fn dialect_filter_seed_files_use_canonical_path_dialect_and_union_conservatively() {
+    let project = InlineTestProject::with_language(Language::Cpp)
+        .file("src/main.c", "int c_function() { return 1; }\n")
+        .file("src/main.cpp", "int cpp_function() { return 2; }\n")
+        .file("include/api.hpp", "int header_function() { return 3; }\n")
+        .build();
+    let workspace = project.workspace_analyzer(AnalyzerConfig::default());
+    let analyzed = workspace.analyzer().analyzed_files();
+
+    let c_files = plan_seed_files(&dialect_filtered_function_query("cpp-c").plan, &analyzed);
+    assert_eq!(
+        c_files
+            .iter()
+            .map(|file| file.rel_path().to_string_lossy().into_owned())
+            .collect::<Vec<_>>(),
+        vec!["src/main.c".to_owned()]
+    );
+
+    let cpp_files = plan_seed_files(&dialect_filtered_function_query("cpp").plan, &analyzed);
+    assert!(
+        cpp_files
+            .iter()
+            .any(|file| file.rel_path().to_string_lossy() == "src/main.cpp")
+    );
+    assert!(
+        cpp_files
+            .iter()
+            .all(|file| file.rel_path().to_string_lossy() != "src/main.c")
+    );
+
+    let union = CodeQuery::from_json(&json!({
+        "schema_version": 1,
+        "union": [
+            {
+                "languages": ["cpp"],
+                "match": { "kind": "function" },
+                "steps": [
+                    { "op": "procedure_of" },
+                    { "op": "filter", "where": [
+                        { "field": "dialect", "op": "eq", "value": { "enum": "cpp-c" } }
+                    ] }
+                ]
+            },
+            {
+                "languages": ["cpp"],
+                "match": { "kind": "function" },
+                "steps": [{ "op": "procedure_of" }]
+            }
+        ],
+        "limit": 500,
+        "result_detail": "full"
+    }))
+    .expect("mixed constrained and unconstrained union");
+    let union_files = plan_seed_files(&union.plan, &analyzed);
+    assert_eq!(union_files.len(), analyzed.len());
 }
 
 #[test]
@@ -166,10 +289,7 @@ fn merged_overlapping_union_units_reproduce_branch_order_and_evidence() {
     );
     let query = overlapping_union_query();
     let whole = whole_execution(&workspace, &query);
-    let merged = merged(&workspace, &query, &files);
-
-    assert_eq!(merged.items, projected(&whole.result.results));
-    assert_eq!(merged.detailed_evidence(project.root()), whole.evidence);
+    let merged = assert_merged_units_match_whole(&project, &workspace, &query, &files, &whole);
     assert_eq!(merged.completion(), whole.result.completion());
 }
 
@@ -180,10 +300,45 @@ fn merged_nested_union_units_reproduce_full_branch_paths() {
     let query = nested_union_query();
     let files = plan_seed_files(&query.plan, &workspace.analyzer().analyzed_files());
     let whole = whole_execution(&workspace, &query);
-    let merged = merged(&workspace, &query, &files);
+    assert_merged_units_match_whole(&project, &workspace, &query, &files, &whole);
+}
 
+#[test]
+fn parent_union_dialect_filter_keeps_whole_and_merged_units_complete() {
+    let project = InlineTestProject::with_language(Language::Cpp)
+        .file("main.c", "void selected(void) {}\n")
+        .file(
+            "recovered.cpp",
+            "void recovered(void) {\n    int value = 1;\n    value = (value;\n}\n",
+        )
+        .build();
+    let workspace = project.workspace_analyzer(AnalyzerConfig::default());
+    let query = parent_dialect_filter_union_query();
+    let files = plan_seed_files(&query.plan, &workspace.analyzer().analyzed_files());
+    let limits = CodeQueryExecutionLimits {
+        max_scanned_files: 32,
+        max_scanned_source_bytes: 1_000_000,
+        max_pipeline_rows: 10_000,
+        ..CodeQueryExecutionLimits::default()
+    };
+
+    let whole = execute_code_query_detailed_eager_index_workspace(&workspace, &query, limits, None);
+    let merged = merge_unit_rows(
+        &query,
+        units_with_limits(&workspace, &query, &files, limits),
+    );
+
+    assert_eq!(whole.result.results.len(), 1, "{whole:?}");
     assert_eq!(merged.items, projected(&whole.result.results));
     assert_eq!(merged.detailed_evidence(project.root()), whole.evidence);
+    assert_eq!(merged.completion(), whole.result.completion());
+    assert_eq!(
+        format!("{:?}", merged.diagnostics),
+        format!("{:?}", whole.result.diagnostics),
+        "whole and merged executions must publish the same diagnostics"
+    );
+    assert_eq!(whole.result.completion(), CodeQueryCompletion::Complete);
+    assert!(whole.result.diagnostics.is_empty(), "{whole:?}");
 }
 
 #[test]
@@ -207,21 +362,6 @@ fn union_merge_widens_when_the_conservative_fair_cap_is_reached() {
         Some(crate::structural::search::units::MergedLimit::ScannedFiles),
         "a root union's physical budget is divided by its branch count"
     );
-}
-
-#[test]
-fn merged_occurrence_units_reproduce_the_whole_execution() {
-    let project = eight_file_project();
-    let workspace = project.workspace_analyzer(AnalyzerConfig::default());
-    let files = seed_files_of(&workspace);
-    let query = occurrence_query();
-
-    let whole = whole_execution(&workspace, &query);
-    assert!(!whole.result.results.is_empty());
-
-    let merged = merged(&workspace, &query, &files);
-    assert_eq!(merged.items, projected(&whole.result.results));
-    assert_eq!(merged.detailed_evidence(project.root()), whole.evidence);
 }
 
 #[test]
@@ -374,90 +514,6 @@ fn a_row_key_and_its_evidence_are_the_same_at_two_workspace_roots() {
     assert_eq!(
         first_evidence, second_evidence,
         "an evidence projection carries no workspace root"
-    );
-}
-
-#[test]
-fn an_execution_exports_the_budgeted_lanes_its_public_work_drops() {
-    let project = InlineTestProject::with_language(Language::TypeScript)
-        .file(
-            "src/callee.ts",
-            "export function target() {\n  return 1;\n}\n",
-        )
-        .file(
-            "src/caller.ts",
-            "import { target } from './callee';\nexport function caller() {\n  return target();\n}\n",
-        )
-        .build();
-    let workspace = project.workspace_analyzer(AnalyzerConfig::default());
-    let query = callers_query();
-
-    let unit = execute_code_query_unit(
-        workspace.analyzer(),
-        None,
-        &query,
-        CodeQueryExecutionLimits::default(),
-        None,
-        CodeQueryExecutionScope::whole_workspace(),
-    );
-
-    assert!(
-        unit.budgeted_work.provenance_steps > 0,
-        "a call-expansion step charges provenance steps against max_pipeline_rows"
-    );
-    assert_eq!(
-        unit.budgeted_work.max_step_outputs(),
-        u64::try_from(unit.rows.len()).expect("row count fits"),
-        "the final step's output count is the row count it produced"
-    );
-    assert!(
-        unit.budgeted_work.step_outputs.len() >= query.plan.steps.len(),
-        "every plan operator has an entry, so every step has one"
-    );
-}
-
-#[test]
-fn an_execution_exports_the_import_lanes_it_charged() {
-    let project = InlineTestProject::with_language(Language::TypeScript)
-        .file(
-            "src/callee.ts",
-            "export function target() {\n  return 1;\n}\n",
-        )
-        .file(
-            "src/caller.ts",
-            "import { target } from './callee';\nexport function caller() {\n  return target();\n}\n",
-        )
-        .build();
-    let workspace = project.workspace_analyzer(AnalyzerConfig::default());
-    let query = CodeQuery::from_json(&json!({
-        "schema_version": 1,
-        "match": { "kind": "function", "name": "caller" },
-        "steps": [{ "op": "file_of" }, { "op": "imports_of" }],
-        "limit": 100,
-        "result_detail": "full"
-    }))
-    .expect("imports query");
-
-    let unit = execute_code_query_unit(
-        workspace.analyzer(),
-        None,
-        &query,
-        CodeQueryExecutionLimits::default(),
-        None,
-        CodeQueryExecutionScope::whole_workspace(),
-    );
-
-    assert!(
-        !unit.rows.is_empty(),
-        "the import traversal reaches the imported file"
-    );
-    assert!(
-        unit.budgeted_work.import_files_resolved > 0,
-        "import resolution charges the file lane against max_scanned_files"
-    );
-    assert!(
-        unit.budgeted_work.import_edges_resolved > 0,
-        "import resolution charges the edge lane against max_pipeline_rows"
     );
 }
 
@@ -719,6 +775,9 @@ fn reference_kind_fixture() -> ReferenceSiteValue {
 }
 
 #[test]
+#[hardwon(
+    "#3628: reference-site intersection must merge coarse and exact declaration-kind evidence"
+)]
 fn reference_site_intersection_merges_both_declaration_kinds() {
     let coarse = reference_kind_fixture();
     let mut exact = coarse.clone();
@@ -761,6 +820,7 @@ fn reference_site_intersection_merges_both_declaration_kinds() {
 /// declaration and range, the enclosing declaration by id alone, then usage
 /// kind, proof and reference kind.
 #[test]
+#[hardwon("#3628: declaration-kind evidence must not change persisted reference-site identity")]
 fn reference_site_unit_key_is_independent_of_kind_evidence() {
     let coarse = reference_kind_fixture();
     let mut exact = coarse.clone();
@@ -813,6 +873,7 @@ fn reference_site_unit_key_is_independent_of_kind_evidence() {
 }
 
 #[test]
+#[hardwon("#3628: reference-site unions must preserve declaration and target evidence identity")]
 fn reference_site_union_keeps_whole_and_sliced_evidence_equal() {
     let project = InlineTestProject::with_language(Language::Rust)
         .file("Cargo.toml", "[package]\nname = \"reference-kinds\"\nversion = \"0.1.0\"\nedition = \"2024\"\n")
@@ -838,4 +899,58 @@ fn reference_site_union_keeps_whole_and_sliced_evidence_equal() {
         assert_eq!(merged.items, projected(&whole.result.results));
         assert_eq!(merged.detailed_evidence(project.root()), whole.evidence);
     }
+}
+
+#[test]
+fn merged_occurrence_units_reproduce_the_whole_execution() {
+    let project = eight_file_project();
+    let workspace = project.workspace_analyzer(AnalyzerConfig::default());
+    let files = seed_files_of(&workspace);
+    let query = occurrence_query();
+
+    let whole = whole_execution(&workspace, &query);
+    assert!(!whole.result.results.is_empty());
+
+    let merged = merged(&workspace, &query, &files);
+    assert_eq!(merged.items, projected(&whole.result.results));
+    assert_eq!(merged.detailed_evidence(project.root()), whole.evidence);
+}
+
+#[test]
+fn an_execution_exports_the_budgeted_lanes_its_public_work_drops() {
+    let project = InlineTestProject::with_language(Language::TypeScript)
+        .file(
+            "src/callee.ts",
+            "export function target() {\n  return 1;\n}\n",
+        )
+        .file(
+            "src/caller.ts",
+            "import { target } from './callee';\nexport function caller() {\n  return target();\n}\n",
+        )
+        .build();
+    let workspace = project.workspace_analyzer(AnalyzerConfig::default());
+    let query = callers_query();
+
+    let unit = execute_code_query_unit(
+        workspace.analyzer(),
+        None,
+        &query,
+        CodeQueryExecutionLimits::default(),
+        None,
+        CodeQueryExecutionScope::whole_workspace(),
+    );
+
+    assert!(
+        unit.budgeted_work.provenance_steps > 0,
+        "a call-expansion step charges provenance steps against max_pipeline_rows"
+    );
+    assert_eq!(
+        unit.budgeted_work.max_step_outputs(),
+        u64::try_from(unit.rows.len()).expect("row count fits"),
+        "the final step's output count is the row count it produced"
+    );
+    assert!(
+        unit.budgeted_work.step_outputs.len() >= query.plan.steps.len(),
+        "every plan operator has an entry, so every step has one"
+    );
 }

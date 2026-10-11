@@ -6,27 +6,14 @@
 //! they are re-exported below so every adapter still reaches them through
 //! `crate::analyzer::structural::adapter_helpers`.
 //!
-//! These three stay because [`occurrence_roles_of`] extracts facts through
-//! [`super::extract`], which is the engine this crate owns; keeping its two
-//! companions beside it keeps adapter test support in one place.
+//! The two remaining helpers stay because [`occurrence_roles_of`] extracts
+//! facts through [`super::extract`], which is the engine this crate owns.
+
+#[cfg(test)]
+pub(crate) use brokk_bifrost_core::analyzer::structural::adapter_helpers::assert_kind_table_matches_grammar;
 
 #[cfg(test)]
 use super::kinds::NormalizedKind;
-
-#[cfg(test)]
-pub fn assert_kind_table_matches_grammar(
-    grammar: tree_sitter::Language,
-    grammar_name: &str,
-    table: &[(&str, NormalizedKind)],
-) {
-    for (name, kind) in table {
-        assert_ne!(
-            grammar.id_for_node_kind(name, true),
-            0,
-            "node type {name:?} (mapped to {kind:?}) does not exist in {grammar_name}"
-        );
-    }
-}
 
 /// Every [`NormalizedKind::Block`] fact a spec produces for `source`, as its
 /// exact source text in fact (pre-order) order.
@@ -97,6 +84,26 @@ pub fn occurrence_roles_of<'source>(
         }
     }
     found
+}
+
+#[cfg(test)]
+pub fn assert_occurrence_roles_are_supported(
+    spec: &dyn super::spec::StructuralSpec,
+    grammar: &tree_sitter::Language,
+    source: &str,
+    language: &str,
+) {
+    let found = occurrence_roles_of(spec, grammar, source);
+    assert!(
+        !found.is_empty(),
+        "{language} fixture emitted no occurrences"
+    );
+    for (_, text, role) in &found {
+        assert!(
+            spec.occurrence_role_support().is_supported(*role),
+            "{language} emitted undeclared role {role:?} for {text:?}"
+        );
+    }
 }
 
 /// Assert that the token starting at `needle`'s first occurrence carries

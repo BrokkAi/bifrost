@@ -10,9 +10,9 @@
 
 use super::callable::{CallSiteContext, CallSiteFacts};
 use super::edges::ReferenceEdgeSupport;
-use super::facts::Span;
+use super::facts::{AssignmentShape, IntegerLiteralValue, Span};
 use super::kinds::{NormalizedKind, Role};
-use super::materialization::DeclarationMaterializationSupport;
+use super::materialization::{DeclarationMaterializationSupport, SourceExportFacts};
 use super::occurrences::{
     Namespace, OccurrenceRole, OccurrenceRoleSupport, default_occurrence_namespace,
 };
@@ -30,16 +30,39 @@ use crate::analyzer::{Language, Range};
 use crate::cancellation::CancellationToken;
 use tree_sitter::{Language as TsLanguage, Node};
 
-/// One source-backed leaf fact parsed from an opaque region of a primary node.
+pub const fn supports_role_without_iterable_or_element(role: Role) -> bool {
+    !matches!(role, Role::Iterable | Role::Element)
+}
+
+pub const fn supports_role_without_kwarg(role: Role) -> bool {
+    !matches!(role, Role::Kwarg)
+}
+
+/// Whether `kind` is a language-specific extra or is satisfied by a grammar
+/// kind-table entry.
+pub fn supports_kind_from_table(
+    kind: NormalizedKind,
+    extra_kinds: &[NormalizedKind],
+    kind_table: &[(&str, NormalizedKind)],
+) -> bool {
+    extra_kinds.contains(&kind)
+        || kind_table
+            .iter()
+            .any(|(_, fact_kind)| fact_kind.satisfies(kind))
+}
+
+/// One source-backed fact parsed from a structured value inside a primary node.
 ///
 /// The descriptor is owned because the secondary parse tree does not survive
-/// structural extraction. The extraction engine inserts the fact directly
-/// below the primary node passed to [`StructuralSpec::embedded_leaf_facts`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// structural extraction. Facts are supplied in pre-order; `parent` indexes a
+/// prior fact in the same vector, or `None` attaches below the primary node.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EmbeddedLeafFact {
     pub kind: NormalizedKind,
     pub range: Range,
-    pub occurrence_role: OccurrenceRole,
+    pub parent: Option<usize>,
+    pub construct: Option<String>,
+    pub occurrence_role: Option<OccurrenceRole>,
 }
 
 pub trait StructuralSpec: Send + Sync + 'static {
@@ -95,6 +118,21 @@ pub trait StructuralSpec: Send + Sync + 'static {
         kind
     }
 
+    /// Context-sensitive refinement with the parent index owned by the
+    /// structural walk. Adapters that need ancestry can override this hook so
+    /// each question is an indexed lookup rather than a tree-sitter re-descent.
+    fn refine_kind_with_parents<'tree>(
+        &self,
+        node: Node<'tree>,
+        kind: NormalizedKind,
+        enclosing: Option<NormalizedKind>,
+        source: &str,
+        context: &CallSiteContext,
+        _parents: &ParentIndex<'tree>,
+    ) -> NormalizedKind {
+        self.refine_kind(node, kind, enclosing, source, context)
+    }
+
     /// Whether this normalized node should become a fact at all. Use this for
     /// grammar nodes whose normalized kind is conditional on fields, such as
     /// variable declarators that are assignments only when they have values.
@@ -106,7 +144,12 @@ pub trait StructuralSpec: Send + Sync + 'static {
     ///
     /// The label describes source syntax only. It must not describe generated
     /// behavior. Adapters must derive it from the tree-sitter node and fields.
-    fn generator_construct(&self, _node: Node<'_>, _kind: NormalizedKind) -> Option<&'static str> {
+    fn generator_construct(
+        &self,
+        _node: Node<'_>,
+        _kind: NormalizedKind,
+        _source: &str,
+    ) -> Option<&'static str> {
         None
     }
 
@@ -123,7 +166,7 @@ pub trait StructuralSpec: Send + Sync + 'static {
     }
 
     /// What this adapter's grammar says about the call site at `node`, whose
-    /// normalized kind is [`NormalizedKind::Call`].
+    /// normalized kind satisfies [`NormalizedKind::Call`].
     ///
     /// `None` means "this language does not refine this site", which keeps the
     /// shared baseline: the call kind follows receiver presence, coverage is
@@ -153,6 +196,83 @@ pub trait StructuralSpec: Send + Sync + 'static {
         false
     }
 
+    /// Whether this adapter publishes parenthesized-expression state for all
+    /// normalized string-literal facts.
+    fn supports_string_literal_parenthesized(&self) -> bool {
+        false
+    }
+
+    /// Whether this adapter can decode supported string-literal source forms
+    /// into their language-neutral value. Individual unsupported forms may
+    /// still return `None`, which exact-value queries report as incomplete.
+    fn supports_string_literal_value(&self) -> bool {
+        false
+    }
+
+    /// Whether this normalized string-literal node has a known reason to lack
+    /// a decoded UTF-8 value, such as a byte string or parser-reported invalid
+    /// literal syntax. This per-node exception must not mask a missing decoder
+    /// for an otherwise supported valid literal.
+    fn string_literal_value_may_be_absent(&self, _node: Node<'_>, _source: &str) -> bool {
+        false
+    }
+
+    /// Exact decoded value of a node normalized as
+    /// [`NormalizedKind::StringLiteral`]. The adapter must read the grammar's
+    /// string-content and escape nodes rather than trimming source text.
+    fn string_literal_value(&self, _node: Node<'_>, _source: &str) -> Option<String> {
+        None
+    }
+
+    /// Whether a normalized string-literal expression has parenthesized
+    /// expression wrappers around it.
+    fn string_literal_parenthesized(&self, _node: Node<'_>) -> Option<bool> {
+        None
+    }
+
+    /// Whether this adapter records directly paired tuple/list assignment
+    /// shapes for the supported syntax it recognizes.
+    fn supports_assignment_shape(&self) -> bool {
+        false
+    }
+
+    /// Paired direct sequence sides of a multiple assignment, if both sides
+    /// have a supported tuple/list shape.
+    fn assignment_shape(&self, _node: Node<'_>) -> Option<AssignmentShape> {
+        None
+    }
+
+    /// Whether this adapter publishes integer literal values and permission bits.
+    fn supports_integer_literal_value(&self) -> bool {
+        false
+    }
+
+    /// Canonical decimal value, when queryable, and low 32 bits for a
+    /// grammar-backed integer literal.
+    fn integer_literal_value(&self, _node: Node<'_>, _source: &str) -> Option<IntegerLiteralValue> {
+        None
+    }
+
+    /// Whether a Python dictionary entry repeats an earlier key by decoded
+    /// literal value. `None` means the key syntax is outside the supported
+    /// literal subset.
+    fn duplicate_dictionary_key(&self, _node: Node<'_>, _source: &str) -> Option<bool> {
+        None
+    }
+
+    /// Whether this adapter can classify duplicate keys in dictionary
+    /// literals, including reporting unsupported key forms as incomplete.
+    fn supports_duplicate_dictionary_keys(&self) -> bool {
+        false
+    }
+
+    /// Whether this adapter records AST-backed async modifiers for every
+    /// callable fact it extracts. The default is unsupported so an unknown
+    /// property cannot silently become a clean miss.
+    fn supports_async_callable_value(&self) -> bool {
+        false
+    }
+
     /// Exact value of a node normalized as [`NormalizedKind::BooleanLiteral`].
     /// This default reads tree-sitter's underlying grammar symbol identity,
     /// which remains structured even when a grammar aliases both tokens to a
@@ -160,15 +280,7 @@ pub trait StructuralSpec: Send + Sync + 'static {
     /// wrapper, it reads that wrapper's sole non-extra child. It never reads
     /// source text.
     fn boolean_literal_value(&self, node: Node<'_>) -> Option<bool> {
-        fn value_of(symbol: &str) -> Option<bool> {
-            match symbol {
-                "true" => Some(true),
-                "false" => Some(false),
-                _ => None,
-            }
-        }
-
-        if let Some(value) = value_of(node.grammar_name()) {
+        if let Some(value) = super::adapter_helpers::boolean_literal_value(node.grammar_name()) {
             return Some(value);
         }
         let mut cursor = node.walk();
@@ -177,7 +289,13 @@ pub trait StructuralSpec: Send + Sync + 'static {
         if children.next().is_some() {
             return None;
         }
-        value_of(child.grammar_name())
+        super::adapter_helpers::boolean_literal_value(child.grammar_name())
+    }
+
+    /// Exact async property of a normalized callable. The default leaves the
+    /// property unknown; adapters must read callable modifiers from AST nodes.
+    fn async_callable_value(&self, _node: Node<'_>) -> Option<bool> {
+        None
     }
 
     /// Which occurrence roles this adapter classifies during [`Self::extract`].
@@ -212,6 +330,15 @@ pub trait StructuralSpec: Send + Sync + 'static {
     /// implemented. Adapters that record no materialization provenance yet
     /// return [`super::materialization::NO_MATERIALIZATION_SUPPORT`].
     fn materialization_support(&self) -> &DeclarationMaterializationSupport;
+
+    /// Source export declarations derived directly from a prepared parse tree.
+    ///
+    /// These rows are query-time facts. Adapters that do not use this source
+    /// form return `None`; Python uses it for a module-level `__all__` list so
+    /// its exports do not need a serialized materialization payload.
+    fn source_export_facts(&self, _root: Node<'_>, _source: &str) -> Option<SourceExportFacts> {
+        None
+    }
 
     /// Which parts of the reference-edge domain this adapter answers: whether
     /// forward (site-to-target) and inverse (target-to-site) edge projections
@@ -263,6 +390,22 @@ pub trait StructuralSpec: Send + Sync + 'static {
     /// axis supported but implements nothing reports incomplete rather than
     /// wrong.
     fn binding_activation(&self, _binder: Node<'_>, _scope: Range) -> Option<BindingActivation> {
+        None
+    }
+
+    /// What lexical binding, if any, a declaration-name token introduces.
+    ///
+    /// Most declaration names are not pure binders: their occurrence role
+    /// remains [`OccurrenceRole::DeclarationName`]. Some languages also have
+    /// declaration heads, such as named function declarations, that introduce
+    /// a lexical name while retaining that declaration role. Those adapters
+    /// state the environment fact here without emitting a second occurrence
+    /// row with [`OccurrenceRole::Binder`].
+    fn declaration_binding_activation(
+        &self,
+        _declaration_name: Node<'_>,
+        _scope: Range,
+    ) -> Option<BindingActivation> {
         None
     }
 
@@ -399,11 +542,12 @@ pub trait StructuralSpec: Send + Sync + 'static {
         None
     }
 
-    /// Parse source-backed leaf facts hidden inside an otherwise opaque node.
+    /// Parse source-backed facts hidden inside an otherwise opaque node.
     ///
-    /// The returned facts must be non-overlapping, ordered by source position,
-    /// and strictly contained by `node`. They become direct normalized children
-    /// of that node. Adapters must use a structured parser and must return no
+    /// The returned facts are in pre-order; a fact with no `parent` becomes a
+    /// direct normalized child of `node`, and other facts become children of
+    /// their earlier local parent. Every span must be contained by its parent
+    /// and by `node`. Adapters must use a structured parser and must return no
     /// fact when an exact source range is unavailable.
     fn embedded_leaf_facts(
         &self,
@@ -417,9 +561,7 @@ pub trait StructuralSpec: Send + Sync + 'static {
 
     /// Whether this adapter can produce facts satisfying `kind`.
     fn supports_kind(&self, kind: NormalizedKind) -> bool {
-        self.kind_table()
-            .iter()
-            .any(|(_, fact_kind)| fact_kind.satisfies(kind))
+        supports_kind_from_table(kind, &[NormalizedKind::SyntaxError], self.kind_table())
     }
 
     /// Attach the fact's name and role edges by reading AST fields of `node`.
@@ -476,6 +618,7 @@ pub struct PendingOccurrenceRole {
 /// nodes remain exact tree-sitter node keys until the structural collector has
 /// seen every event in the language-owned walk.
 pub struct RoleSink<'a> {
+    source: &'a str,
     parents: &'a crate::analyzer::tree_walk::ParentIndex<'a>,
     source_facts: &'a mut dyn SourceOccurrenceSink,
     name: Option<SourceOccurrenceId>,
@@ -501,12 +644,14 @@ pub enum RoleSinkStop {
 
 impl<'a> RoleSink<'a> {
     pub fn new(
+        source: &'a str,
         source_facts: &'a mut dyn SourceOccurrenceSink,
         max_roles: usize,
         cancellation: Option<&'a CancellationToken>,
         parents: &'a ParentIndex<'a>,
     ) -> Self {
         Self {
+            source,
             source_facts,
             name: None,
             roles: Vec::new(),
@@ -516,6 +661,12 @@ impl<'a> RoleSink<'a> {
             stop: None,
             parents,
         }
+    }
+
+    /// Source snapshot for adapters whose selected AST node contains an
+    /// opaque token tree that needs a grammar-backed secondary parse.
+    pub fn source(&self) -> &'a str {
+        self.source
     }
 
     /// The AST parent of `node`, answered from the walk's index.
@@ -591,6 +742,23 @@ impl<'a> RoleSink<'a> {
     /// Attach a role edge whose name is the span of `name_node`.
     pub fn role_named(&mut self, role: Role, target: Node<'_>, name_node: Node<'_>) {
         let _ = self.push(role, false, None, target, Some(name_node));
+    }
+
+    /// Attach the terminal name of a path and, when it spans multiple nodes,
+    /// the full path span as a second name edge.
+    pub fn role_named_between_nodes(
+        &mut self,
+        role: Role,
+        target: Node<'_>,
+        first: Node<'_>,
+        last: Node<'_>,
+    ) {
+        self.role_named(role, target, last);
+        self.role_named_span(
+            role,
+            target,
+            crate::analyzer::common::span_from_nodes(first, last),
+        );
     }
 
     /// Attach an argument role, preserving whether it came from a

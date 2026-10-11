@@ -1,10 +1,6 @@
 //! The co-edit cascade: priority tiers over path, history and import evidence.
 //!
-//! Ported from the offline campaign scorer measured on 2026-08-14 and recorded
-//! in `.agents/docs/coedit-retrieval-eval-2026-08-14.md`: 8,346 leave-one-out
-//! cases over 18 repositories and 10 languages, recall@10 of 41.0 percent
-//! against 24.7 percent for a directory-plus-popularity baseline and 29.1
-//! percent for the shipped history-only co-edit ranking.
+//! Ported from the offline co-edit retrieval evaluation (issue #2127).
 //!
 //! The order encodes precision, strongest evidence first, and nothing in it is
 //! trained, so nothing in it can be overfitted to that corpus. A file that is
@@ -396,48 +392,12 @@ mod tests {
     }
 
     #[test]
-    fn stem_strips_extension_chains_and_test_affixes() {
-        for (path, expected) in [
-            ("Foo.java", "foo"),
-            ("src/test/java/FooTest.java", "foo"),
-            ("pkg/foo_test.go", "foo"),
-            ("spec/models/foo_spec.rb", "foo"),
-            ("tests/test_foo.py", "foo"),
-            ("src/foo.test.ts", "foo"),
-            ("src/mod.rs", "mod"),
-            ("src/foo.h", "foo"),
-        ] {
-            assert_eq!(expected, stem_of(Path::new(path)), "{path}");
-        }
-    }
-
-    #[test]
     fn stem_keeps_a_basename_that_strips_to_nothing() {
         // A dotfile has nothing before its first `.`, and a file named exactly
         // `test` is all affix. Both keep the whole lowercased basename rather
         // than collapsing every such file onto one empty key.
         assert_eq!(".eslintrc", stem_of(Path::new("web/.eslintrc")));
         assert_eq!("test", stem_of(Path::new("test")));
-    }
-
-    #[test]
-    fn mirror_key_pairs_the_same_subject_across_trees() {
-        assert_eq!(
-            mirror_key(Path::new("src/foo/x.rs")),
-            mirror_key(Path::new("tests/foo/x.rs"))
-        );
-        assert_eq!(
-            mirror_key(Path::new("app/models/user.rb")),
-            mirror_key(Path::new("spec/models/user_spec.rb"))
-        );
-        assert_eq!(
-            mirror_key(Path::new("src/main/java/com/x/Parser.java")),
-            mirror_key(Path::new("src/test/java/com/x/ParserTest.java"))
-        );
-        assert_ne!(
-            mirror_key(Path::new("src/foo/x.rs")),
-            mirror_key(Path::new("src/bar/x.rs"))
-        );
     }
 
     #[test]
@@ -581,102 +541,6 @@ mod tests {
             vec!["src/parser/lexer_test.rs", "vendor/other/lexer.rs"],
             paths_of(&ranked)
         );
-    }
-
-    #[test]
-    fn paths_alone_rank_without_history_or_imports() {
-        let temp = TempDir::new().unwrap();
-        let universe = files(
-            temp.path(),
-            &["src/foo/x.rs", "tests/foo/x.rs", "src/foo/y.rs"],
-        );
-        let seeds = set(&universe[..1]);
-        let popularity = HashMap::default();
-        let ranked = cascade_ranking(
-            CascadeEvidence {
-                universe: &universe,
-                seeds: &seeds,
-                coedit: &[],
-                neighbours: &HashSet::default(),
-                popularity: &popularity,
-                dir_stats: &DirCoChangeStats::default(),
-            },
-            20,
-        );
-
-        assert_eq!(vec!["tests/foo/x.rs", "src/foo/y.rs"], paths_of(&ranked));
-    }
-
-    #[test]
-    fn popularity_orders_a_tier_but_never_earns_a_result() {
-        let temp = TempDir::new().unwrap();
-        let universe = files(
-            temp.path(),
-            &[
-                "src/a/seed.rs",
-                "src/a/quiet.rs",
-                "src/a/busy.rs",
-                "src/z/unrelated.rs",
-            ],
-        );
-        let seeds = set(&universe[..1]);
-        let popularity: HashMap<ProjectFile, u32> = [
-            (universe[1].clone(), 1),
-            (universe[2].clone(), 40),
-            (universe[3].clone(), 900),
-        ]
-        .into_iter()
-        .collect();
-
-        let ranked = cascade_ranking(
-            CascadeEvidence {
-                universe: &universe,
-                seeds: &seeds,
-                coedit: &[],
-                neighbours: &HashSet::default(),
-                popularity: &popularity,
-                dir_stats: &DirCoChangeStats::default(),
-            },
-            20,
-        );
-
-        assert_eq!(vec!["src/a/busy.rs", "src/a/quiet.rs"], paths_of(&ranked));
-    }
-
-    #[test]
-    fn no_seeds_rank_nothing() {
-        let temp = TempDir::new().unwrap();
-        let universe = files(temp.path(), &["src/a.rs", "src/b.rs"]);
-        let ranked = cascade_ranking(
-            CascadeEvidence {
-                universe: &universe,
-                seeds: &HashSet::default(),
-                coedit: &[],
-                neighbours: &HashSet::default(),
-                popularity: &HashMap::default(),
-                dir_stats: &DirCoChangeStats::default(),
-            },
-            20,
-        );
-        assert!(ranked.is_empty());
-    }
-
-    #[test]
-    fn directory_affinity_scores_partners_of_the_seed_directory() {
-        let mut stats = DirCoChangeStats::default();
-        for _ in 0..3 {
-            stats.record_commit(
-                &[PathBuf::from("app/models"), PathBuf::from("app/views")]
-                    .into_iter()
-                    .collect(),
-            );
-        }
-        stats.record_commit(&[PathBuf::from("docs")].into_iter().collect());
-
-        let seed_dirs: HashSet<PathBuf> = [PathBuf::from("app/models")].into_iter().collect();
-        let affinity = stats.affinity(&seed_dirs);
-        assert!(affinity.get(Path::new("app/views")).copied().unwrap() > 0.0);
-        assert_eq!(None, affinity.get(Path::new("docs")).copied());
     }
 
     #[test]

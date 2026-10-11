@@ -1,6 +1,7 @@
+use brokk_bifrost_test_macros::hardwon;
 use std::{path::PathBuf, sync::Arc};
 
-use git2::{ObjectType, Oid};
+use git2::Oid;
 use rusqlite::{params, params_from_iter};
 use tree_sitter::Parser;
 
@@ -27,10 +28,14 @@ use crate::analyzer::store::resolution_prepare::{
     ResolutionInteriorPreparation, prepare_resolution_bundle_with_unit_keys,
 };
 use crate::analyzer::store::test_adapters::LegacyJavaFixtureAdapter;
-use crate::analyzer::tree_sitter_analyzer::{FileState, LanguageAdapter, ParsedFile};
+use crate::analyzer::tree_sitter_analyzer::{
+    FileState, LanguageAdapter, ParsedFile, TreeSitterAnalyzer,
+};
 use crate::analyzer::typescript::TypescriptAdapter;
 use crate::analyzer::{CodeUnit, Language, ProjectFile};
 use crate::hash::HashMap;
+
+use super::test_blob_oid as oid;
 
 use super::*;
 
@@ -82,10 +87,6 @@ impl ManifestSnapshot {
     }
 }
 
-fn oid(label: impl AsRef<[u8]>) -> Oid {
-    Oid::hash_object(ObjectType::Blob, label.as_ref()).expect("test blob oid")
-}
-
 fn java_state(root: &std::path::Path, rich_resolution: bool) -> Arc<FileState> {
     let file = ProjectFile::new(root.to_path_buf(), "src/Model.java");
     file.write("package demo; class Model { int value; }\n")
@@ -131,6 +132,7 @@ fn java_state(root: &std::path::Path, rich_resolution: bool) -> Arc<FileState> {
         test_region_units: parsed.test_region_units,
         materialization_records: parsed.materialization_records,
         parse_errors: Some(Vec::new()),
+        completeness: parsed.completeness,
         parse_complete: true,
         additional_projections: Vec::new(),
     };
@@ -165,40 +167,61 @@ fn parsed_fixture_state<A: LanguageAdapter>(
     let mut parsed: ParsedFile = adapter.parse_file(&file, source, &tree);
     parsed.add_file_scope(&file, source);
     let contains_tests = adapter.contains_tests(&file, source, &tree, &parsed);
-    let declarations = parsed.declarations().clone();
-    Arc::new(FileState {
-        source: source.to_owned(),
-        package_name: parsed.package_name,
-        content_qualifier: parsed.content_qualifier,
-        top_level_declarations: parsed.top_level_declarations,
-        declarations,
-        definition_lookup_units: parsed.definition_lookup_units,
-        imports: parsed.imports,
-        scala_exports: parsed.scala_exports,
-        rust_usage_facts: parsed.rust_usage_facts,
-        source_facts: parsed.source_facts,
-        source_declaration_units: parsed.source_declaration_units,
-        source_declaration_metadata: parsed.source_declaration_metadata,
-        resolution_facts: parsed.resolution_facts,
-        raw_supertypes: parsed.raw_supertypes,
-        supertype_lookup_paths: parsed.supertype_lookup_paths,
-        type_identifiers: parsed.type_identifiers,
-        signatures: parsed.signatures,
-        signature_metadata: parsed.signature_metadata,
-        signature_metadata_signature_ordinals: parsed.signature_metadata_signature_ordinals,
-        cpp_template_metadata: parsed.cpp_template_metadata,
-        ruby_method_dispatch_modes: parsed.ruby_method_dispatch_modes,
-        ranges: parsed.ranges,
-        children: parsed.children,
-        scala_traits: parsed.scala_traits,
-        type_aliases: parsed.type_aliases,
+    Arc::new(TreeSitterAnalyzer::<A>::file_state_from_parsed(
+        source.to_owned(),
+        parsed,
         contains_tests,
-        test_region_units: parsed.test_region_units,
-        materialization_records: parsed.materialization_records,
-        parse_errors: Some(Vec::new()),
-        parse_complete: true,
-        additional_projections: Vec::new(),
-    })
+        Some(Vec::new()),
+        true,
+    ))
+}
+
+#[test]
+fn rust_attribute_macro_argument_keeps_its_primary_source_provenance() {
+    let source = r#"
+mod setup {
+    fn target() {}
+}
+
+struct SetupFn;
+impl SetupFn {
+    fn new(_: fn()) -> Self { Self }
+}
+
+macro_rules! setup_fn {
+    ($func:path) => { SetupFn::new($func) };
+}
+
+#[divan::bench(args = [setup_fn!(setup::target)])]
+fn bench() {}
+"#;
+    let state = parsed_fixture_state(&RustAdapter, "benches/throughput.rs", source);
+    let facts = state.source_facts.as_ref().expect("Rust source facts");
+    let occurrences = facts.occurrences.occurrences();
+    let primary_ranges = occurrences
+        .iter()
+        .filter(|occurrence| {
+            occurrence.provenance
+                == brokk_bifrost_core::analyzer::source_facts::SourceOccurrenceProvenance::PrimaryNode
+        })
+        .map(|occurrence| (occurrence.range.start_byte, occurrence.range.end_byte))
+        .collect::<std::collections::HashSet<_>>();
+    let has_embedded_primary_alias = facts.native_site_occurrences.iter().any(|site| {
+        let occurrence = facts.occurrences.occurrence(*site);
+        occurrence.provenance
+            == brokk_bifrost_core::analyzer::source_facts::SourceOccurrenceProvenance::Embedded
+            && primary_ranges.contains(&(occurrence.range.start_byte, occurrence.range.end_byte))
+    });
+    assert!(
+        has_embedded_primary_alias,
+        "fixture must retain both source mappings"
+    );
+
+    super::resolution_operation::rust_reference_context_sources(
+        facts,
+        &CancellationToken::default(),
+    )
+    .expect("an embedded reference with an exact primary range has source authority");
 }
 
 #[test]
@@ -225,7 +248,14 @@ fn canonical_source_publication_reopens_shared_native_and_structural_rows() {
             .ensure_language_epoch_value("rust", "canonical-source-test-v1")
             .unwrap();
         store
-            .write_parsed_blob_at_generation(content_oid, "rust", generation, &RustAdapter, &state)
+            .write_parsed_blob_at_generation(
+                &crate::analyzer::store::test_blob_file(),
+                content_oid,
+                "rust",
+                generation,
+                &RustAdapter,
+                &state,
+            )
             .unwrap();
         assert_eq!(
             store
@@ -318,15 +348,10 @@ fn rust_fact_probe_plan(
     oids: &[Oid],
     generation: GenerationId,
 ) -> Vec<String> {
-    let sql = AnalyzerStore::blobs_with_rust_facts_sql(oids.len());
-    let mut parameters = vec![
-        rusqlite::types::Value::Text("rust".to_owned()),
-        rusqlite::types::Value::Integer(generation.get()),
-    ];
-    parameters.extend(
-        oids.iter()
-            .map(|oid| rusqlite::types::Value::Text(oid.to_string())),
-    );
+    let oid_strings = oids.iter().map(Oid::to_string).collect::<Vec<_>>();
+    let (placeholders, parameters) =
+        super::rust_fact_oid_query_parameters("rust", generation, &oid_strings);
+    let sql = AnalyzerStore::blobs_with_rust_facts_sql(&placeholders);
     store.conn.execute(move |conn| {
         conn.prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
             .expect("prepare Rust fact publication probe plan")
@@ -358,7 +383,14 @@ fn rust_fact_probe_requires_complete_production_publication_and_route_witnesses(
         .collect();
     for content_oid in content_oids {
         store
-            .write_parsed_blob_at_generation(content_oid, "rust", generation, &RustAdapter, &state)
+            .write_parsed_blob_at_generation(
+                &crate::analyzer::store::test_blob_file(),
+                content_oid,
+                "rust",
+                generation,
+                &RustAdapter,
+                &state,
+            )
             .expect("persist production Rust fact probe fixture");
     }
 
@@ -445,7 +477,19 @@ fn prepare_with_adapter<A: LanguageAdapter>(
     required_projections: &[String],
     adapter: &A,
 ) -> PreparedParsedBlob {
+    let file = crate::analyzer::store::test_blob_file();
+    let syntax = crate::analyzer::tree_sitter_analyzer::reparse_retained_source(
+        adapter, &file, &state, None,
+    );
+    let syntax = match syntax {
+        crate::analyzer::tree_sitter_analyzer::PreparedSyntaxPreparation::Complete(Some(tree)) => {
+            tree
+        }
+        _ => panic!("test source must parse within its budget"),
+    };
     match AnalyzerStore::prepare_parsed_blob_at_generations(
+        &file,
+        &syntax,
         oid,
         PRIMARY,
         generations,
@@ -668,44 +712,7 @@ fn persisted_physical_logical_rows(store: &AnalyzerStore, keys: &[(Oid, &str)]) 
 }
 
 #[test]
-fn go_method_owner_frontier_survives_common_lowering_and_bundle_preparation() {
-    let source = "package p\nfunc (value *Remote) Method() *Remote { return value }\n";
-    let file = ProjectFile::new(
-        fixture_project_root("selected-go-context-does-not-touch-disk"),
-        "method.go",
-    );
-    let mut parser = Parser::new();
-    parser
-        .set_language(&tree_sitter_go::LANGUAGE.into())
-        .expect("configure Go parser");
-    let tree = parser.parse(source, None).expect("parse Go method fixture");
-    let facts =
-        brokk_bifrost_go::declarations::parse_go_file(&file, source, &tree).resolution_facts;
-    assert_eq!(facts.deferred_member_owners.len(), 1);
-
-    let lowered = crate::analyzer::resolution::lower_resolution_facts_for_selection(
-        BindingFragmentId::for_test(b"go-deferred-owner-m6a"),
-        crate::analyzer::resolution::test_shared_names(),
-        Language::Go,
-        &facts,
-    );
-    assert_eq!(lowered.common().deferred_member_owners.len(), 1);
-    let ResolutionInteriorPreparation::Prepared(prepared) =
-        prepare_resolution_bundle_with_unit_keys(&lowered, None, &CancellationToken::default())
-    else {
-        panic!("uncancelled Go deferred-owner preparation must finish");
-    };
-    // The deferred owner and the frontier it names are both interior detail
-    // now; what must survive preparation is the declaration the owner belongs
-    // to, which is the tier-1 semantic site.
-    let family = RESOLUTION_MANIFEST_COUNT_COLUMNS
-        .iter()
-        .position(|column| *column == "expected_semantic_site_count")
-        .expect("semantic site manifest family");
-    assert!(prepared.family_counts()[family] > 0);
-}
-
-#[test]
+#[hardwon("35bb5be9598c: Go calls inside if conditions lacked persisted inverse lookup headers")]
 fn go_reverse_lookup_headers_include_if_condition_call_callees() {
     let store = AnalyzerStore::open_ephemeral().expect("ephemeral Go resolution store");
     let source = "package pkg\n\ntype Widget struct{}\nfunc New() Widget { return Widget{} }\nfunc use() { if New().Name() == \"\" {} }\n";
@@ -738,6 +745,7 @@ fn go_reverse_lookup_headers_include_if_condition_call_callees() {
 }
 
 #[test]
+#[hardwon("a31af62cdcef: block-local cfg routes panicked lowering as placement boundaries")]
 fn rust_block_scoped_cfg_import_persists_its_predicate_and_local_binder() {
     // `zellij-server/src/lib.rs` gates a `use` inside a block expression. The
     // producer used to call that a placement boundary, and
@@ -776,194 +784,6 @@ fn rust_block_scoped_cfg_import_persists_its_predicate_and_local_binder() {
         retained[0].1.is_some(),
         "the retained import has a native local scope"
     );
-}
-
-#[test]
-fn rust_first_tranche_survives_common_lowering_and_bundle_preparation() {
-    let source = "use engine::Thing as LocalThing;\npub fn callee(value: i32) -> i32 { value }\nfn caller(input: i32) -> i32 { let local = input; callee(local) }\n";
-    let file = ProjectFile::new(
-        fixture_project_root("selected-rust-context-does-not-touch-disk"),
-        "lib.rs",
-    );
-    let mut parser = Parser::new();
-    parser
-        .set_language(&tree_sitter_rust::LANGUAGE.into())
-        .expect("configure Rust parser");
-    let tree = parser.parse(source, None).expect("parse Rust fixture");
-    let parsed = brokk_bifrost_rust::declarations::parse_rust_file(&file, source, &tree);
-    let unit_keys = parsed_unit_keys(&parsed);
-    let facts = parsed.resolution_facts;
-
-    assert!(!facts.identifiers.is_empty());
-    assert!(!facts.binders.is_empty());
-    assert_eq!(facts.root_imports.len(), 1);
-    // Root exports retain every named declaration as a candidate endpoint;
-    // terminal visibility is applied by the selected resolver.  The fixture
-    // has both the public callee and the private caller.
-    assert_eq!(facts.root_exports.len(), 2);
-    assert_eq!(facts.calls.len(), 1);
-    // `callee(local)` writes one actual; `callee` and `caller` each declare
-    // one parameter.
-    assert_eq!(facts.call_arguments.len(), 1);
-    assert_eq!(facts.callable_parameters.len(), 2);
-    assert!(
-        facts
-            .type_slots
-            .iter()
-            .any(|slot| slot.role == ResolutionTypeSlotRole::CallResult)
-    );
-    let mut point_gaps = facts
-        .gaps
-        .iter()
-        .map(|gap| {
-            let site = facts.sites[gap.site.index()];
-            (
-                &source[site.start_byte..site.end_byte],
-                gap.kind,
-                site.start_byte,
-                site.end_byte,
-            )
-        })
-        .collect::<Vec<_>>();
-    point_gaps.sort_by_key(|(_, kind, start_byte, end_byte)| (*start_byte, *end_byte, *kind));
-    assert_eq!(
-        point_gaps
-            .iter()
-            .map(|(spelling, kind, _, _)| (*spelling, *kind))
-            .collect::<Vec<_>>(),
-        // Both parameter lists and the argument list are exact, so only the
-        // callee's own obligation remains.
-        vec![
-            ("caller", ResolutionGapKind::UnsupportedVisibility),
-            ("callee", ResolutionGapKind::UnsupportedCallApplicability),
-        ],
-        "every retained Rust applicability gap must identify its source site"
-    );
-    assert!(
-        facts.reference_enumeration_gaps.is_empty(),
-        "unexpected enumeration gaps: {:?}",
-        facts.reference_enumeration_gaps
-    );
-    let lowered = crate::analyzer::resolution::lower_resolution_facts_for_selection(
-        BindingFragmentId::for_test(b"rust-first-resolution-tranche"),
-        crate::analyzer::resolution::test_shared_names(),
-        Language::Rust,
-        &facts,
-    );
-    assert!(!lowered.lexical().nodes().is_empty());
-    assert!(!lowered.lexical().paths().is_empty());
-    assert!(!lowered.lexical().semantics().is_empty());
-    assert_eq!(lowered.lexical().gaps().len(), 2);
-    assert!(lowered.lexical().gaps().iter().all(|gap| {
-        matches!(
-            gap.origin(),
-            LoweringGapOrigin::Extracted(
-                ResolutionGapKind::UnsupportedCallApplicability
-                    | ResolutionGapKind::UnsupportedVisibility
-            )
-        )
-    }));
-    assert_eq!(
-        lowered
-            .lexical()
-            .gaps()
-            .iter()
-            .filter(|gap| matches!(gap.frontier(), LoweringCoverageFrontier::Type { .. }))
-            .count(),
-        1,
-        "only the gap on a real type slot retains typed coverage"
-    );
-    assert_eq!(
-        lowered
-            .lexical()
-            .gaps()
-            .iter()
-            .filter(|gap| { matches!(gap.frontier(), LoweringCoverageFrontier::Reference { .. }) })
-            .count(),
-        1,
-        "the callee applicability gap retains one positioned reference frontier"
-    );
-    assert!(!lowered.lexical().gaps().iter().any(|gap| {
-        matches!(
-            gap.frontier(),
-            LoweringCoverageFrontier::Candidate {
-                direction: LoweredCandidateDirection::Forward,
-                ..
-            }
-        )
-    }));
-    let mut lowered_gap_sites = lowered
-        .lexical()
-        .gaps()
-        .iter()
-        .map(|gap| {
-            let site = facts.sites[gap.site().index()];
-            &source[site.start_byte..site.end_byte]
-        })
-        .collect::<Vec<_>>();
-    lowered_gap_sites.sort_unstable();
-    assert_eq!(
-        lowered_gap_sites,
-        vec!["callee", "caller"],
-        "lowered coverage keeps positioned and real-slot gap rows"
-    );
-
-    let ResolutionInteriorPreparation::Prepared(prepared) =
-        prepare_resolution_bundle_with_unit_keys(
-            &lowered,
-            Some(&unit_keys),
-            &CancellationToken::default(),
-        )
-    else {
-        panic!("uncancelled Rust first-tranche preparation must finish");
-    };
-    for family in [
-        "expected_semantic_site_count",
-        "expected_path_endpoint_header_count",
-    ] {
-        let index = RESOLUTION_MANIFEST_COUNT_COLUMNS
-            .iter()
-            .position(|column| *column == family)
-            .unwrap_or_else(|| panic!("manifest has {family}"));
-        assert!(prepared.family_counts()[index] > 0, "{family}");
-    }
-}
-
-#[test]
-fn rust_m6a_first_tranche_facts_all_prepare() {
-    let mut parser = Parser::new();
-    parser
-        .set_language(&tree_sitter_rust::LANGUAGE.into())
-        .expect("configure Rust parser");
-    for (path, source) in brokk_bifrost_rust::resolution_spike_fixture::M6A_RUST_WORKSPACE_FILES
-        .iter()
-        .filter(|(path, _)| path.ends_with(".rs"))
-    {
-        let file = ProjectFile::new(
-            fixture_project_root("selected-rust-context-does-not-touch-disk"),
-            *path,
-        );
-        let tree = parser.parse(source, None).expect("parse Rust spike file");
-        let parsed = brokk_bifrost_rust::declarations::parse_rust_file(&file, source, &tree);
-        let unit_keys = parsed_unit_keys(&parsed);
-        let lowered = crate::analyzer::resolution::lower_resolution_facts_for_selection(
-            BindingFragmentId::for_test(path.as_bytes()),
-            crate::analyzer::resolution::test_shared_names(),
-            Language::Rust,
-            &parsed.resolution_facts,
-        );
-        assert!(
-            matches!(
-                prepare_resolution_bundle_with_unit_keys(
-                    &lowered,
-                    Some(&unit_keys),
-                    &CancellationToken::default(),
-                ),
-                ResolutionInteriorPreparation::Prepared(_)
-            ),
-            "{path}"
-        );
-    }
 }
 
 #[test]
@@ -1133,7 +953,14 @@ fn persist_alias_fixture<A: LanguageAdapter>(
         .expect("alias generation");
     let state = parsed_fixture_state(adapter, relative_path, source);
     store
-        .write_parsed_blob_at_generation(oid, storage_language, generation, adapter, &state)
+        .write_parsed_blob_at_generation(
+            &crate::analyzer::store::test_blob_file(),
+            oid,
+            storage_language,
+            generation,
+            adapter,
+            &state,
+        )
         .expect("persist alias fixture");
     let first = manifest_snapshot(store, oid, storage_language);
     assert_eq!(
@@ -1143,7 +970,14 @@ fn persist_alias_fixture<A: LanguageAdapter>(
     );
     assert!(store.content_row_count(oid, storage_language).unwrap() > 0);
     store
-        .write_parsed_blob_at_generation(oid, storage_language, generation, adapter, &state)
+        .write_parsed_blob_at_generation(
+            &crate::analyzer::store::test_blob_file(),
+            oid,
+            storage_language,
+            generation,
+            adapter,
+            &state,
+        )
         .expect("repeat alias fixture persistence");
     assert_eq!(manifest_snapshot(store, oid, storage_language), first);
     assert!(store.contains_parsed_blob(oid, storage_language).unwrap());
@@ -1216,7 +1050,14 @@ fn production_writer_seals_common_visibility_for_a_non_java_fragment() {
             visibility: DeclaredVisibility::Public,
         });
     store
-        .write_parsed_blob_at_generation(oid, "go", generation, &GoAdapter, &state)
+        .write_parsed_blob_at_generation(
+            &crate::analyzer::store::test_blob_file(),
+            oid,
+            "go",
+            generation,
+            &GoAdapter,
+            &state,
+        )
         .expect("persist Go visibility fixture");
     let counts = store.conn.execute({
         let oid = oid.to_string();
@@ -1244,146 +1085,6 @@ fn production_writer_seals_common_visibility_for_a_non_java_fragment() {
 }
 
 #[test]
-fn complete_analysis_queries_seek_persistent_authority_tables() {
-    let store = AnalyzerStore::open_ephemeral().expect("ephemeral store");
-    let request = CompleteAnalysisBlobRequest::new(
-        oid(b"complete analysis query plan"),
-        PRIMARY,
-        [PROJECTION.to_owned()],
-    );
-    let conn = store.conn.lock().expect("store mutex");
-    sync_requested_parsed_blobs(
-        &conn,
-        &[(request.oid(), request.storage_language().to_owned())],
-    )
-    .expect("sync requested primary");
-    sync_requested_analysis_projections(&conn, std::slice::from_ref(&request))
-        .expect("sync requested projections");
-
-    let explain = |sql: &str| {
-        conn.prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
-            .expect("prepare complete-analysis plan")
-            .query_map([Language::Java.config_label()], |row| {
-                row.get::<_, String>(3)
-            })
-            .expect("query complete-analysis plan")
-            .collect::<std::result::Result<Vec<_>, _>>()
-            .expect("read complete-analysis plan")
-    };
-    let missing_plan = explain(MISSING_PUBLISHED_COMPLETE_ANALYSIS_SQL);
-    let projection_plan = explain(REQUIRED_EXISTING_ANALYSIS_PROJECTIONS_SQL);
-
-    assert_bounded_complete_analysis_plan(&missing_plan);
-    assert_bounded_complete_analysis_plan(&projection_plan);
-
-    for (alias, index) in [
-        ("primary_epoch", "PRIMARY KEY"),
-        ("primary_resolution_epoch", "PRIMARY KEY"),
-        ("primary_blob", "idx_blobs_lang_generation"),
-        ("primary_meta", "PRIMARY KEY"),
-        ("primary_interior", "PRIMARY KEY"),
-        ("projection", "PRIMARY KEY"),
-        ("independent", "PRIMARY KEY"),
-        ("projection_epoch", "PRIMARY KEY"),
-        ("projection_resolution_epoch", "PRIMARY KEY"),
-        ("projection_meta", "PRIMARY KEY"),
-        ("projection_interior", "PRIMARY KEY"),
-    ] {
-        assert_plan_search(&missing_plan, alias, index);
-    }
-    assert_plan_search(&missing_plan, "projection_blob", "sqlite_autoindex_blobs_1");
-    assert_plan_search(&missing_plan, "projection_blob", "(blob_oid=? AND lang=?)");
-    assert!(
-        missing_plan
-            .iter()
-            .any(|detail| detail.contains("CORRELATED SCALAR SUBQUERY")),
-        "optional projection validation must remain a per-request indexed probe: {missing_plan:#?}"
-    );
-
-    for (alias, index) in [
-        ("owner", "PRIMARY KEY"),
-        ("independent", "PRIMARY KEY"),
-        ("projection_epoch", "PRIMARY KEY"),
-        ("projection_resolution_epoch", "PRIMARY KEY"),
-        ("projection_meta", "PRIMARY KEY"),
-        ("projection_interior", "PRIMARY KEY"),
-    ] {
-        assert_plan_search(&projection_plan, alias, index);
-    }
-    assert_plan_search(
-        &projection_plan,
-        "projection_blob",
-        "sqlite_autoindex_blobs_1",
-    );
-    assert_plan_search(
-        &projection_plan,
-        "projection_blob",
-        "(blob_oid=? AND lang=?)",
-    );
-}
-
-#[test]
-fn stale_generation_reclamation_cost_plan_uses_gc_order_and_keyed_probes() {
-    let store = AnalyzerStore::open_ephemeral().expect("ephemeral store");
-    let conn = store.conn.lock().expect("store mutex");
-    let plan = conn
-        .prepare(&format!(
-            "EXPLAIN QUERY PLAN {}",
-            stale_generation_blob_costs_sql()
-        ))
-        .expect("prepare stale-generation GC plan")
-        .query_map([], |row| row.get::<_, String>(3))
-        .expect("query stale-generation GC plan")
-        .collect::<std::result::Result<Vec<_>, _>>()
-        .expect("read stale-generation GC plan");
-
-    let scans = plan
-        .iter()
-        .filter_map(|detail| {
-            detail
-                .split_once("SCAN ")
-                .and_then(|(_, tail)| tail.split_ascii_whitespace().next())
-        })
-        .collect::<Vec<_>>();
-    assert_eq!(
-        scans,
-        vec!["blobs"],
-        "GC may scan only the ordered blob inventory: {plan:#?}"
-    );
-    assert!(
-        plan.iter().any(|detail| {
-            detail.contains("SCAN blobs USING COVERING INDEX idx_blobs_lang_generation")
-        }),
-        "GC must consume stale blobs in its indexed order: {plan:#?}"
-    );
-    for alias in [
-        "epochs",
-        "meta",
-        "costs",
-        "manifest",
-        "reference_manifest",
-        "interior",
-    ] {
-        assert_plan_search(&plan, alias, "PRIMARY KEY");
-    }
-    // Schema 117 left one `facts` alias in the reclamation cost: the canonical
-    // source-fact manifest. The four retired `structural_fact_*` families each
-    // had one of the other probes.
-    assert_eq!(
-        plan.iter()
-            .filter(|detail| detail.contains("SEARCH facts USING PRIMARY KEY"))
-            .count(),
-        1,
-        "the canonical source-fact family must be a keyed correlated probe: {plan:#?}"
-    );
-    assert!(
-        plan.iter()
-            .all(|detail| { !detail.contains("AUTOMATIC") && !detail.contains("USE TEMP B-TREE") }),
-        "GC must not synthesize an index or sort its ordered inventory: {plan:#?}"
-    );
-}
-
-#[test]
 fn complete_analysis_repairs_legacy_and_optional_rows_once_with_directional_ownership() {
     let temp = tempfile::tempdir().expect("test directory");
     let state = java_state(temp.path(), false);
@@ -1405,6 +1106,7 @@ fn complete_analysis_repairs_legacy_and_optional_rows_once_with_directional_owne
                 &requests,
                 &generations,
                 Language::Java,
+                None,
             )
             .expect("chunked complete-analysis carrier");
         assert_eq!(
@@ -1456,6 +1158,7 @@ fn complete_analysis_repairs_legacy_and_optional_rows_once_with_directional_owne
             &legacy_request,
             &generations,
             Language::Java,
+            None,
         )
         .expect("legacy complete-analysis predicate");
     assert_eq!(missing.len(), 1);
@@ -1475,6 +1178,7 @@ fn complete_analysis_repairs_legacy_and_optional_rows_once_with_directional_owne
                 &legacy_request,
                 &generations,
                 Language::Java,
+                None,
             )
             .unwrap()
             .is_empty()
@@ -1496,6 +1200,7 @@ fn complete_analysis_repairs_legacy_and_optional_rows_once_with_directional_owne
                 &absent_optional_request,
                 &generations,
                 Language::Java,
+                None,
             )
             .unwrap()
             .is_empty(),
@@ -1526,6 +1231,7 @@ fn complete_analysis_repairs_legacy_and_optional_rows_once_with_directional_owne
             std::slice::from_ref(&owner_request),
             &generations,
             Language::Java,
+            None,
         )
         .unwrap();
     assert_eq!(missing.len(), 1);
@@ -1550,6 +1256,7 @@ fn complete_analysis_repairs_legacy_and_optional_rows_once_with_directional_owne
                 std::slice::from_ref(&owner_request),
                 &generations,
                 Language::Java,
+                None,
             )
             .unwrap()
             .is_empty(),
@@ -1579,6 +1286,7 @@ fn complete_analysis_repairs_legacy_and_optional_rows_once_with_directional_owne
                 &requests,
                 &generations,
                 Language::Java,
+                None,
             )
             .unwrap();
         assert_eq!(missing.len(), 1);
@@ -1691,7 +1399,14 @@ fn production_writer_repairs_corrupt_payload_costs_on_retry() {
         .expect("payload repair generation");
     let published_oid = oid(b"production payload repair");
     store
-        .write_parsed_blob_at_generation(published_oid, PRIMARY, generation, &JavaAdapter, &state)
+        .write_parsed_blob_at_generation(
+            &crate::analyzer::store::test_blob_file(),
+            published_oid,
+            PRIMARY,
+            generation,
+            &JavaAdapter,
+            &state,
+        )
         .expect("initial production persistence");
     let expected_cost = payload_cost(&store, published_oid, PRIMARY);
     let expected_manifest = manifest_snapshot(&store, published_oid, PRIMARY);
@@ -1699,6 +1414,7 @@ fn production_writer_repairs_corrupt_payload_costs_on_retry() {
         rewrite_payload_cost(&store, published_oid, PRIMARY, corrupt);
         store
             .write_parsed_blob_at_generation(
+                &crate::analyzer::store::test_blob_file(),
                 published_oid,
                 PRIMARY,
                 generation,
@@ -1997,6 +1713,8 @@ fn a_persisted_blob_carries_only_tier_one_families_at_a_bounded_row_cost() {
     let expected = super::resolution::PERSISTED_RESOLUTION_TABLES
         .iter()
         .map(|name| (*name).to_owned())
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
         .collect::<Vec<_>>();
     assert_eq!(
         persisted, expected,
@@ -2039,8 +1757,21 @@ fn a_persisted_blob_carries_only_tier_one_families_at_a_bounded_row_cost() {
             "resolution_type_components",
         ),
         (
+            "expected_declared_type_argument_count",
+            "resolution_declared_type_arguments",
+        ),
+        (
             "expected_underlying_type_count",
             "resolution_underlying_types",
+        ),
+        ("expected_type_argument_count", "resolution_type_arguments"),
+        (
+            "expected_generic_type_alias_parameter_count",
+            "resolution_generic_type_alias_parameters",
+        ),
+        (
+            "expected_generic_formal_count",
+            "resolution_generic_formals",
         ),
         (
             "expected_intrinsic_seed_count",
@@ -2302,6 +2033,7 @@ const MEMBER_ISOLATING_HOLDER: &str = concat!(
 /// the mention column: a relation names a blob only for an identity in that
 /// blob's own catalog.
 #[test]
+#[hardwon("dfb60686e6e4: name-mention mounts opened typed-fact blobs that held no requested fact")]
 fn a_typed_relation_opens_the_blobs_that_hold_its_fact_not_those_that_spell_the_name() {
     let route_digest = shared_callable_identity("shared_route");
     let member_digest = shared_callable_identity("shared_member");
@@ -2418,6 +2150,7 @@ fn shared_callable_identity(spelling: &str) -> [u8; 32] {
 /// the sweep is over the shared slice of the catalog and why most relations
 /// carry no rows at all.
 #[test]
+#[hardwon("dfb60686e6e4: persisted typed-fact membership drifted from the reader answer set")]
 fn every_typed_relation_names_exactly_the_shared_identities_its_read_answers() {
     const RICH_SOURCE: &str = concat!(
         "pub mod inner {\n",
@@ -2430,9 +2163,11 @@ fn every_typed_relation_names_exactly_the_shared_identities_its_read_answers() {
         "    impl Read for Thing {\n        fn read(&self) -> u32 {\n            self.field\n        }\n    }\n",
         "}\n",
         "use inner::{Read, Thing};\n",
+        "type ItemAlias<T> = Option<T>;\n",
         "pub fn use_it(thing: &Thing, absent: Absent) -> u32 {\n",
         "    Read::read(thing) + Thing::make(1).read() + absent.shared_member()\n",
         "}\n",
+        "pub fn use_alias(value: ItemAlias<Thing>) -> ItemAlias<Thing> { value }\n",
     );
     let mut sources = vec![
         ("src/rich.rs".to_owned(), RICH_SOURCE.to_owned()),
@@ -2602,6 +2337,21 @@ fn typed_relation_answers(
         TypedFactRelation::TypeComponentContainer => {
             answered!(visit_type_component_pages_for_containers, semantic)
         }
+        TypedFactRelation::DeclaredTypeArgumentOwner => {
+            answered!(visit_declared_type_argument_pages_for_owners, semantic)
+        }
+        TypedFactRelation::TypeArgumentApplication => {
+            answered!(visit_type_argument_pages_for_applications, semantic)
+        }
+        TypedFactRelation::GenericTypeAliasDefinition => {
+            answered!(
+                visit_generic_type_alias_parameter_pages_for_definitions,
+                semantic
+            )
+        }
+        TypedFactRelation::GenericFormalOwner => {
+            answered!(visit_generic_formal_pages_for_owners, semantic)
+        }
         TypedFactRelation::UnderlyingTypeDefinition => {
             answered!(visit_underlying_type_pages_for_definitions, semantic)
         }
@@ -2737,6 +2487,7 @@ fn persist_rust_scale_workspace(
         let state = parsed_fixture_state(&RustAdapter, &path, &source);
         store
             .write_parsed_blob_at_generation(
+                &crate::analyzer::store::test_blob_file(),
                 oid(source.as_bytes()),
                 "rust",
                 generation,
@@ -2761,31 +2512,6 @@ fn persist_rust_scale_workspace(
 /// spells the name, so the file count is the set the old relation gave; the
 /// relation itself is deleted, so the fixture's sources are the authority
 /// for that column.
-#[test]
-fn a_qualified_route_lookup_names_the_blobs_that_hold_a_route_not_those_that_mention_it() {
-    let digest = shared_callable_identity("shared_route");
-    let rows = [8usize, 24].map(|files| {
-        let store = persist_rust_scale_workspace(files, ROUTE_ISOLATING_HOLDER, |index| {
-            format!("pub struct S{index:04};\nimpl S{index:04} {{ pub fn shared_route(&self) -> usize {{ {index} }} }}\n")
-        });
-        (
-            files,
-            blobs_holding_relation(&store, TypedFactRelation::QualifiedRouteLookup, digest),
-        )
-    });
-    // Measured here: (8 files, 1 route blob) and (24, 1). Every file declares
-    // a member spelled `shared_route`, which puts the Callable lookup identity
-    // in its catalog, so the file count is what these two reads opened before;
-    // only the holder writes a call through a receiver, which is what makes a
-    // route.
-    eprintln!("qualified route lookup blobs (files, route): {rows:?}");
-    assert_eq!(
-        rows[0].1, rows[1].1,
-        "the route relation must not grow with the workspace: {rows:?}"
-    );
-    assert_eq!(rows[0].1, 1, "one blob holds the route: {rows:?}");
-}
-
 /// The route inventory opens the blobs that hold a route, not the selection.
 ///
 /// `visit_qualified_route_inventory_pages` has no lookup to key on: an
@@ -2798,6 +2524,7 @@ fn a_qualified_route_lookup_names_the_blobs_that_hold_a_route_not_those_that_men
 /// `prepare_typed_fact_lookups` asserts it -- so a blob that holds a route
 /// always has a row and the read loses nothing.
 #[test]
+#[hardwon("0670f752620a: open-tail route inventory lowered every selected blob")]
 fn the_route_inventory_names_the_blobs_that_hold_a_route_not_the_selection() {
     let rows = [8usize, 24].map(|files| {
         let store = persist_rust_scale_workspace(files, ROUTE_ISOLATING_HOLDER, |index| {
@@ -2888,4 +2615,431 @@ fn measured_resolution_payload(store: &AnalyzerStore, oid: Oid, lang: &str) -> u
         }
         bytes
     })
+}
+
+#[test]
+fn go_method_owner_frontier_survives_common_lowering_and_bundle_preparation() {
+    let source = "package p\nfunc (value *Remote) Method() *Remote { return value }\n";
+    let file = ProjectFile::new(
+        fixture_project_root("selected-go-context-does-not-touch-disk"),
+        "method.go",
+    );
+    let mut parser = Parser::new();
+    parser
+        .set_language(&tree_sitter_go::LANGUAGE.into())
+        .expect("configure Go parser");
+    let tree = parser.parse(source, None).expect("parse Go method fixture");
+    let facts =
+        brokk_bifrost_go::declarations::parse_go_file(&file, source, &tree).resolution_facts;
+    assert_eq!(facts.deferred_member_owners.len(), 1);
+
+    let lowered = crate::analyzer::resolution::lower_resolution_facts_for_selection(
+        BindingFragmentId::for_test(b"go-deferred-owner-m6a"),
+        crate::analyzer::resolution::test_shared_names(),
+        Language::Go,
+        &facts,
+    );
+    assert_eq!(lowered.common().deferred_member_owners.len(), 1);
+    let ResolutionInteriorPreparation::Prepared(prepared) =
+        prepare_resolution_bundle_with_unit_keys(&lowered, None, &CancellationToken::default())
+    else {
+        panic!("uncancelled Go deferred-owner preparation must finish");
+    };
+    // The deferred owner and the frontier it names are both interior detail
+    // now; what must survive preparation is the declaration the owner belongs
+    // to, which is the tier-1 semantic site.
+    let family = RESOLUTION_MANIFEST_COUNT_COLUMNS
+        .iter()
+        .position(|column| *column == "expected_semantic_site_count")
+        .expect("semantic site manifest family");
+    assert!(prepared.family_counts()[family] > 0);
+}
+
+#[test]
+fn rust_first_tranche_survives_common_lowering_and_bundle_preparation() {
+    let source = "use engine::Thing as LocalThing;\npub fn callee(value: i32) -> i32 { value }\nfn caller(input: i32) -> i32 { let local = input; callee(local) }\n";
+    let file = ProjectFile::new(
+        fixture_project_root("selected-rust-context-does-not-touch-disk"),
+        "lib.rs",
+    );
+    let mut parser = Parser::new();
+    parser
+        .set_language(&tree_sitter_rust::LANGUAGE.into())
+        .expect("configure Rust parser");
+    let tree = parser.parse(source, None).expect("parse Rust fixture");
+    let parsed = brokk_bifrost_rust::declarations::parse_rust_file(&file, source, &tree);
+    let unit_keys = parsed_unit_keys(&parsed);
+    let facts = parsed.resolution_facts;
+
+    assert!(!facts.identifiers.is_empty());
+    assert!(!facts.binders.is_empty());
+    assert_eq!(facts.root_imports.len(), 1);
+    // Root exports retain every named declaration as a candidate endpoint;
+    // terminal visibility is applied by the selected resolver.  The fixture
+    // has both the public callee and the private caller.
+    assert_eq!(facts.root_exports.len(), 2);
+    assert_eq!(facts.calls.len(), 1);
+    // `callee(local)` writes one actual; `callee` and `caller` each declare
+    // one parameter.
+    assert_eq!(facts.call_arguments.len(), 1);
+    assert_eq!(facts.callable_parameters.len(), 2);
+    assert!(
+        facts
+            .type_slots
+            .iter()
+            .any(|slot| slot.role == ResolutionTypeSlotRole::CallResult)
+    );
+    let mut point_gaps = facts
+        .gaps
+        .iter()
+        .map(|gap| {
+            let site = facts.sites[gap.site.index()];
+            (
+                &source[site.start_byte..site.end_byte],
+                gap.kind,
+                site.start_byte,
+                site.end_byte,
+            )
+        })
+        .collect::<Vec<_>>();
+    point_gaps.sort_by_key(|(_, kind, start_byte, end_byte)| (*start_byte, *end_byte, *kind));
+    assert_eq!(
+        point_gaps
+            .iter()
+            .map(|(spelling, kind, _, _)| (*spelling, *kind))
+            .collect::<Vec<_>>(),
+        // Both parameter lists and the argument list are exact, so only the
+        // callee's own obligation remains.
+        vec![
+            ("caller", ResolutionGapKind::UnsupportedVisibility),
+            ("callee", ResolutionGapKind::UnsupportedCallApplicability),
+        ],
+        "every retained Rust applicability gap must identify its source site"
+    );
+    assert!(
+        facts.reference_enumeration_gaps.is_empty(),
+        "unexpected enumeration gaps: {:?}",
+        facts.reference_enumeration_gaps
+    );
+    let lowered = crate::analyzer::resolution::lower_resolution_facts_for_selection(
+        BindingFragmentId::for_test(b"rust-first-resolution-tranche"),
+        crate::analyzer::resolution::test_shared_names(),
+        Language::Rust,
+        &facts,
+    );
+    assert!(!lowered.lexical().nodes().is_empty());
+    assert!(!lowered.lexical().paths().is_empty());
+    assert!(!lowered.lexical().semantics().is_empty());
+    assert_eq!(lowered.lexical().gaps().len(), 2);
+    assert!(lowered.lexical().gaps().iter().all(|gap| {
+        matches!(
+            gap.origin(),
+            LoweringGapOrigin::Extracted(
+                ResolutionGapKind::UnsupportedCallApplicability
+                    | ResolutionGapKind::UnsupportedVisibility
+            )
+        )
+    }));
+    assert_eq!(
+        lowered
+            .lexical()
+            .gaps()
+            .iter()
+            .filter(|gap| matches!(gap.frontier(), LoweringCoverageFrontier::Type { .. }))
+            .count(),
+        1,
+        "only the gap on a real type slot retains typed coverage"
+    );
+    assert_eq!(
+        lowered
+            .lexical()
+            .gaps()
+            .iter()
+            .filter(|gap| { matches!(gap.frontier(), LoweringCoverageFrontier::Reference { .. }) })
+            .count(),
+        1,
+        "the callee applicability gap retains one positioned reference frontier"
+    );
+    assert!(!lowered.lexical().gaps().iter().any(|gap| {
+        matches!(
+            gap.frontier(),
+            LoweringCoverageFrontier::Candidate {
+                direction: LoweredCandidateDirection::Forward,
+                ..
+            }
+        )
+    }));
+    let mut lowered_gap_sites = lowered
+        .lexical()
+        .gaps()
+        .iter()
+        .map(|gap| {
+            let site = facts.sites[gap.site().index()];
+            &source[site.start_byte..site.end_byte]
+        })
+        .collect::<Vec<_>>();
+    lowered_gap_sites.sort_unstable();
+    assert_eq!(
+        lowered_gap_sites,
+        vec!["callee", "caller"],
+        "lowered coverage keeps positioned and real-slot gap rows"
+    );
+
+    let ResolutionInteriorPreparation::Prepared(prepared) =
+        prepare_resolution_bundle_with_unit_keys(
+            &lowered,
+            Some(&unit_keys),
+            &CancellationToken::default(),
+        )
+    else {
+        panic!("uncancelled Rust first-tranche preparation must finish");
+    };
+    for family in [
+        "expected_semantic_site_count",
+        "expected_path_endpoint_header_count",
+    ] {
+        let index = RESOLUTION_MANIFEST_COUNT_COLUMNS
+            .iter()
+            .position(|column| *column == family)
+            .unwrap_or_else(|| panic!("manifest has {family}"));
+        assert!(prepared.family_counts()[index] > 0, "{family}");
+    }
+}
+
+#[test]
+fn unresolved_expression_macro_does_not_duplicate_reverse_gap_candidate() {
+    let source = "fn caller() { external_macro!(); }\n";
+    let file = ProjectFile::new(
+        fixture_project_root("unresolved-expression-macro-reverse-gap-candidate"),
+        "lib.rs",
+    );
+    let mut parser = Parser::new();
+    parser
+        .set_language(&tree_sitter_rust::LANGUAGE.into())
+        .expect("configure Rust parser");
+    let tree = parser.parse(source, None).expect("parse Rust fixture");
+    let parsed = brokk_bifrost_rust::declarations::parse_rust_file(&file, source, &tree);
+    let source_facts = parsed
+        .source_facts
+        .as_ref()
+        .expect("Rust parser publishes canonical source facts");
+    assert_eq!(source_facts.rust_items.macro_inputs.len(), 1);
+    let (macro_site, _) = source_facts.rust_items.macro_inputs[0]
+        .native_frontier
+        .expect("unresolved expression macro has a native frontier");
+    assert!(parsed.resolution_facts.gaps.iter().any(|gap| {
+        gap.site == macro_site && gap.kind == ResolutionGapKind::UnsupportedExpression
+    }));
+
+    let unit_keys = parsed_unit_keys(&parsed);
+    let lowered = crate::analyzer::resolution::lower_resolution_facts_for_selection(
+        BindingFragmentId::for_test(b"unresolved-expression-macro-reverse-gap-candidate"),
+        crate::analyzer::resolution::test_shared_names(),
+        Language::Rust,
+        &parsed.resolution_facts,
+    );
+    assert!(
+        lowered
+            .common()
+            .rust_reverse_gap_candidates
+            .iter()
+            .any(|candidate| candidate.site == macro_site)
+    );
+    let ResolutionInteriorPreparation::Prepared(prepared) =
+        prepare_resolution_bundle_with_source_facts(
+            &lowered,
+            &unit_keys,
+            Some(source_facts),
+            Some(source),
+            &CancellationToken::default(),
+        )
+        .expect("prepare unresolved expression macro resolution bundle")
+    else {
+        panic!("uncancelled unresolved macro preparation must finish");
+    };
+    let count_index = RESOLUTION_MANIFEST_COUNT_COLUMNS
+        .iter()
+        .position(|column| *column == "expected_rust_reverse_gap_candidate_count")
+        .expect("Rust reverse gap candidate family");
+    assert!(
+        prepared.family_counts()[count_index] > 0,
+        "the unresolved macro frontier retains a reverse gap candidate"
+    );
+}
+
+#[test]
+fn rust_m6a_first_tranche_facts_all_prepare() {
+    let mut parser = Parser::new();
+    parser
+        .set_language(&tree_sitter_rust::LANGUAGE.into())
+        .expect("configure Rust parser");
+    for (path, source) in brokk_bifrost_rust::resolution_spike_fixture::M6A_RUST_WORKSPACE_FILES
+        .iter()
+        .filter(|(path, _)| path.ends_with(".rs"))
+    {
+        let file = ProjectFile::new(
+            fixture_project_root("selected-rust-context-does-not-touch-disk"),
+            *path,
+        );
+        let tree = parser.parse(source, None).expect("parse Rust spike file");
+        let parsed = brokk_bifrost_rust::declarations::parse_rust_file(&file, source, &tree);
+        let unit_keys = parsed_unit_keys(&parsed);
+        let lowered = crate::analyzer::resolution::lower_resolution_facts_for_selection(
+            BindingFragmentId::for_test(path.as_bytes()),
+            crate::analyzer::resolution::test_shared_names(),
+            Language::Rust,
+            &parsed.resolution_facts,
+        );
+        assert!(
+            matches!(
+                prepare_resolution_bundle_with_unit_keys(
+                    &lowered,
+                    Some(&unit_keys),
+                    &CancellationToken::default(),
+                ),
+                ResolutionInteriorPreparation::Prepared(_)
+            ),
+            "{path}"
+        );
+    }
+}
+
+#[test]
+fn complete_analysis_queries_seek_persistent_authority_tables() {
+    let store = AnalyzerStore::open_ephemeral().expect("ephemeral store");
+    let request = CompleteAnalysisBlobRequest::new(
+        oid(b"complete analysis query plan"),
+        PRIMARY,
+        [PROJECTION.to_owned()],
+    );
+    let conn = store.conn.lock().expect("store mutex");
+    sync_requested_parsed_blobs(
+        &conn,
+        &[(request.oid(), request.storage_language().to_owned())],
+    )
+    .expect("sync requested primary");
+    sync_requested_analysis_projections(&conn, std::slice::from_ref(&request))
+        .expect("sync requested projections");
+
+    let explain = |sql: &str| {
+        conn.prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
+            .expect("prepare complete-analysis plan")
+            .query_map([Language::Java.config_label()], |row| {
+                row.get::<_, String>(3)
+            })
+            .expect("query complete-analysis plan")
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .expect("read complete-analysis plan")
+    };
+    let missing_plan = explain(MISSING_PUBLISHED_COMPLETE_ANALYSIS_SQL);
+    let projection_plan = explain(REQUIRED_EXISTING_ANALYSIS_PROJECTIONS_SQL);
+
+    assert_bounded_complete_analysis_plan(&missing_plan);
+    assert_bounded_complete_analysis_plan(&projection_plan);
+
+    for (alias, index) in [
+        ("primary_epoch", "PRIMARY KEY"),
+        ("primary_resolution_epoch", "PRIMARY KEY"),
+        ("primary_blob", "idx_blobs_lang_generation"),
+        ("primary_meta", "PRIMARY KEY"),
+        ("primary_interior", "PRIMARY KEY"),
+        ("projection", "PRIMARY KEY"),
+        ("independent", "PRIMARY KEY"),
+        ("projection_epoch", "PRIMARY KEY"),
+        ("projection_resolution_epoch", "PRIMARY KEY"),
+        ("projection_meta", "PRIMARY KEY"),
+        ("projection_interior", "PRIMARY KEY"),
+    ] {
+        assert_plan_search(&missing_plan, alias, index);
+    }
+    assert_plan_search(&missing_plan, "projection_blob", "sqlite_autoindex_blobs_1");
+    assert_plan_search(&missing_plan, "projection_blob", "(blob_oid=? AND lang=?)");
+    assert!(
+        missing_plan
+            .iter()
+            .any(|detail| detail.contains("CORRELATED SCALAR SUBQUERY")),
+        "optional projection validation must remain a per-request indexed probe: {missing_plan:#?}"
+    );
+
+    for (alias, index) in [
+        ("owner", "PRIMARY KEY"),
+        ("independent", "PRIMARY KEY"),
+        ("projection_epoch", "PRIMARY KEY"),
+        ("projection_resolution_epoch", "PRIMARY KEY"),
+        ("projection_meta", "PRIMARY KEY"),
+        ("projection_interior", "PRIMARY KEY"),
+    ] {
+        assert_plan_search(&projection_plan, alias, index);
+    }
+    assert_plan_search(
+        &projection_plan,
+        "projection_blob",
+        "sqlite_autoindex_blobs_1",
+    );
+    assert_plan_search(
+        &projection_plan,
+        "projection_blob",
+        "(blob_oid=? AND lang=?)",
+    );
+}
+
+#[test]
+fn stale_generation_reclamation_cost_plan_uses_gc_order_and_keyed_probes() {
+    let store = AnalyzerStore::open_ephemeral().expect("ephemeral store");
+    let conn = store.conn.lock().expect("store mutex");
+    let plan = conn
+        .prepare(&format!(
+            "EXPLAIN QUERY PLAN {}",
+            stale_generation_blob_costs_sql()
+        ))
+        .expect("prepare stale-generation GC plan")
+        .query_map([], |row| row.get::<_, String>(3))
+        .expect("query stale-generation GC plan")
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .expect("read stale-generation GC plan");
+
+    let scans = plan
+        .iter()
+        .filter_map(|detail| {
+            detail
+                .split_once("SCAN ")
+                .and_then(|(_, tail)| tail.split_ascii_whitespace().next())
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        scans,
+        vec!["blobs"],
+        "GC may scan only the ordered blob inventory: {plan:#?}"
+    );
+    assert!(
+        plan.iter().any(|detail| {
+            detail.contains("SCAN blobs USING COVERING INDEX idx_blobs_lang_generation")
+        }),
+        "GC must consume stale blobs in its indexed order: {plan:#?}"
+    );
+    for alias in [
+        "epochs",
+        "meta",
+        "costs",
+        "manifest",
+        "reference_manifest",
+        "interior",
+    ] {
+        assert_plan_search(&plan, alias, "PRIMARY KEY");
+    }
+    // Schema 117 left one `facts` alias in the reclamation cost: the canonical
+    // source-fact manifest. The four retired `structural_fact_*` families each
+    // had one of the other probes.
+    assert_eq!(
+        plan.iter()
+            .filter(|detail| detail.contains("SEARCH facts USING PRIMARY KEY"))
+            .count(),
+        1,
+        "the canonical source-fact family must be a keyed correlated probe: {plan:#?}"
+    );
+    assert!(
+        plan.iter()
+            .all(|detail| { !detail.contains("AUTOMATIC") && !detail.contains("USE TEMP B-TREE") }),
+        "GC must not synthesize an index or sort its ordered inventory: {plan:#?}"
+    );
 }

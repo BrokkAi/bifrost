@@ -117,7 +117,8 @@ git -C "${clone}" config user.email "41898282+github-actions[bot]@users.noreply.
 branch="$(git -C "${clone}" symbolic-ref --short HEAD)"
 
 find "${clone}" -mindepth 1 -maxdepth 1 -not -name .git -exec rm -rf {} +
-cp "${stage}/action.yml" "${stage}/README.md" "${stage}/LICENSE.md" "${clone}/"
+cp "${stage}/action.yml" "${stage}/README.md" "${stage}/LICENSE.md" \
+  "${clone}/"
 
 git -C "${clone}" add -A
 changed=1

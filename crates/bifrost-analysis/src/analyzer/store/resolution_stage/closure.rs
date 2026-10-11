@@ -185,13 +185,12 @@ impl SelectedResolutionStage<'_, '_> {
         })
     }
 
-    /// Close the open binder gaps of `host`'s structs and enums whose `serde`
-    /// helper the crate route proved inert: each item's derive name resolves
-    /// to serde's derive through the crate rows. `reasons` are the gaps'
-    /// runtime reason keys, ascending; the proof is the host's content and the
-    /// reasons themselves, since the rows that decided them belong to the
-    /// same selected revision.
-    pub(crate) fn close_serde_helper_reasons(
+    /// Close the open binder gaps of `host`'s items whose derive-helper
+    /// attributes the crate route proved unbound by any macro. `reasons` are
+    /// the gaps' runtime reason keys, ascending; the proof is the host's
+    /// content and the reasons themselves, since the rows that decided them
+    /// belong to the same selected revision.
+    pub(crate) fn close_derive_helper_reasons(
         &self,
         host: &SelectedResolutionMountRecord,
         reasons: &[i64],
@@ -199,9 +198,9 @@ impl SelectedResolutionStage<'_, '_> {
     ) -> Result<SelectedResolutionStageOutcome> {
         assert!(
             reasons.windows(2).all(|pair| pair[0] < pair[1]),
-            "serde helper reasons are ascending and distinct: {reasons:?}"
+            "derive-helper reasons are ascending and distinct: {reasons:?}"
         );
-        let mut hash = CanonicalHasher::new(b"bifrost-selected-serde-helper-closure:v1");
+        let mut hash = CanonicalHasher::new(b"bifrost-selected-derive-helper-closure:v1");
         hash.field("host", host.blob_oid().as_bytes());
         hash.field("host-epoch", host.producer_epoch().as_bytes());
         for reason in reasons {

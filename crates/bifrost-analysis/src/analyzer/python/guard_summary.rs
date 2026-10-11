@@ -6,14 +6,18 @@
 //! conservative.  All syntax access is through the prepared tree-sitter tree;
 //! there is no source-text parser here.
 
-use crate::analyzer::semantic_model::csmi::python::narrowing_annotation;
+use crate::analyzer::semantic_model::csmi::python::{
+    conditional_special_form_semantics, narrowing_annotation,
+};
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use brokk_bifrost_core::analyzer::common::try_node_source_text as node_text;
 use brokk_bifrost_core::analyzer::prepared_syntax::PreparedSyntaxTree;
 use brokk_bifrost_python::bindings::{
     PythonLexicalNameResolution, python_comprehension_binds_name_at,
-    python_direct_scope_bindings_bounded, python_type_parameter_binds_name_at,
+    python_direct_scope_bindings_bounded, python_executable_scope_children,
+    python_type_parameter_binds_name_at,
 };
 use brokk_bifrost_python::syntax::python_plain_string_literal;
 use tree_sitter::Node;
@@ -21,7 +25,7 @@ use tree_sitter::Node;
 use super::lexical_scope::python_lexical_scope_inventory_bounded;
 use super::type_flow::{
     PythonTypeFlowAdapter, builtin_base_is_unshadowed, current_indexed_prepared, node_at_span,
-    overlay_of, prepared_for_procedure, python_analyzer,
+    prepared_for_procedure, python_analyzer,
 };
 use crate::analyzer::lexical_definitions::formal_parameter_slots_for_owner;
 use crate::analyzer::semantic::type_flow::{
@@ -131,6 +135,18 @@ fn guard_call_outcome(
                 call.receiver.is_none(),
                 "a workspace-name callee is an identifier, which has no receiver"
             );
+            // A return annotation that names a predicate form is the function's
+            // own contract, so it decides the call even without a body summary.
+            if let Some((semantics, target)) =
+                workspace_annotation_target(adapter, workspace, &file, caller_source, function)
+            {
+                return Some(match single_positional_value(call) {
+                    Some(value) => predicate_refinement_outcome(
+                        adapter, workspace, atoms, value, semantics, target,
+                    ),
+                    None => CallGuardOutcome::Unmodeled { values },
+                });
+            }
             if let Some(argument) = narrowed
                 && let Some(verdicts) = workspace_summary_verdicts(
                     workspace,
@@ -272,7 +288,7 @@ fn external_predicate_refinement(
     call: &SemanticCallSite,
     atoms: &[&ClassIdentity],
 ) -> Option<CallGuardOutcome> {
-    let overlay = overlay_of(workspace)?;
+    let overlay = workspace.analyzer().semantic_model_overlay()?;
     let symbols = overlay.symbols_named(canonical);
     if semantic_model_callable_family_id(&symbols.records).is_none()
         || symbols.records.iter().any(|symbol| {
@@ -350,13 +366,7 @@ fn external_predicate_refinement(
                 return None;
             }
             let value = values[argument];
-            let class = predicate_target_class(&overlay, symbol, target).filter(|class| {
-                adapter.guard_classes_have_supported_instance_checks(
-                    workspace,
-                    std::slice::from_ref(class),
-                    Some(&overlay),
-                )
-            });
+            let class = predicate_target_class(&overlay, symbol, target);
             let current = (value, semantics, class);
             if let Some(previous) = &agreed {
                 if previous != &current {
@@ -368,18 +378,44 @@ fn external_predicate_refinement(
         }
     }
     let (value, semantics, class) = agreed?;
+    Some(predicate_refinement_outcome(
+        adapter, workspace, atoms, value, semantics, class,
+    ))
+}
+
+/// The branch outcome of one resolved predicate. Native annotations and
+/// standardized facts both reach this point, so they cannot disagree about what
+/// a branch means. `TypeIs` intersects the candidates on true and excludes
+/// them on false. `TypeGuard` replaces them on true and leaves false unchanged.
+/// A target the class domain cannot decide is explicit uncertainty.
+fn predicate_refinement_outcome(
+    adapter: &PythonTypeFlowAdapter,
+    workspace: &WorkspaceAnalyzer,
+    atoms: &[&ClassIdentity],
+    value: ValueId,
+    semantics: CsmiConditionalTypeSemantics,
+    class: Option<ClassIdentity>,
+) -> CallGuardOutcome {
+    let overlay = workspace.analyzer().semantic_model_overlay();
+    let class = class.filter(|class| {
+        adapter.guard_classes_have_supported_instance_checks(
+            workspace,
+            std::slice::from_ref(class),
+            overlay.as_deref(),
+        )
+    });
     match semantics {
-        CsmiConditionalTypeSemantics::PositiveOnly => Some(CallGuardOutcome::Replaced {
+        CsmiConditionalTypeSemantics::PositiveOnly => CallGuardOutcome::Replaced {
             value,
             target: class
                 .map(ClassSeed::ClassWithOpenBound)
                 .unwrap_or(ClassSeed::Unknown(UnknownReason::UnmodeledPredicate)),
-        }),
+        },
         CsmiConditionalTypeSemantics::Biconditional => {
             let Some(class) = class else {
-                return Some(CallGuardOutcome::Unmodeled {
+                return CallGuardOutcome::Unmodeled {
                     values: vec![value],
-                });
+                };
             };
             let verdicts = atoms
                 .iter()
@@ -393,12 +429,132 @@ fn external_predicate_refinement(
                     }
                 })
                 .collect();
-            Some(CallGuardOutcome::Intersected {
+            CallGuardOutcome::Intersected {
                 value,
                 verdicts,
                 target: ClassSeed::ClassWithOpenBound(class),
-            })
+            }
         }
+    }
+}
+
+/// A workspace predicate states its outcome in its own return annotation,
+/// `-> TypeIs[C]` or `-> TypeGuard[C]`, where the special form is the one this
+/// file's import binder proves. `None` means the callee has no such annotation.
+/// Otherwise the annotation is the contract: a target the class domain cannot
+/// decide yields `None` for the class, which the caller reports as unmodeled.
+fn workspace_annotation_target(
+    adapter: &PythonTypeFlowAdapter,
+    workspace: &WorkspaceAnalyzer,
+    file: &crate::analyzer::ProjectFile,
+    source: &str,
+    function: Node<'_>,
+) -> Option<(CsmiConditionalTypeSemantics, Option<ClassIdentity>)> {
+    let target = resolve_workspace_function(workspace, file, source, function)?;
+    let python = python_analyzer(workspace);
+    let target_prepared = current_indexed_prepared(python, target.source())?;
+    let target_function = target_function_node(python, &target_prepared, &target)?;
+    let (head, argument) =
+        subscripted_return_annotation(target_function.child_by_field_name("return_type")?)?;
+    let (module, member) = external_callee(
+        workspace,
+        target.source(),
+        target_prepared.source(),
+        target_prepared.tree().root_node(),
+        head,
+    )?;
+    let semantics = conditional_special_form_semantics(&format!("{module}.{member}"))?;
+    let class = predicate_annotation_class(
+        adapter,
+        workspace,
+        &target,
+        &target_prepared,
+        target_function,
+        argument,
+    );
+    Some((semantics, class))
+}
+
+/// The class a workspace predicate annotation names. The annotation is a
+/// contract only for an ordinary module-level function with one binding, and
+/// only for a plain class name: a subscript, a tuple, or `Callable[...]` names
+/// no single nominal class. Any failure to name the class leaves the target
+/// unmodeled, which the caller reports for it.
+fn predicate_annotation_class(
+    adapter: &PythonTypeFlowAdapter,
+    workspace: &WorkspaceAnalyzer,
+    target: &CodeUnit,
+    prepared: &PreparedSyntaxTree,
+    function: Node<'_>,
+    argument: Node<'_>,
+) -> Option<ClassIdentity> {
+    if !module_level_plain_function(target, function)
+        || !matches!(argument.kind(), "identifier" | "attribute")
+    {
+        return None;
+    }
+    let name = function.child_by_field_name("name")?;
+    if unique_module_binding(
+        prepared.tree().root_node(),
+        node_text(name, prepared.source())?,
+        prepared.source(),
+    )? != name
+    {
+        return None;
+    }
+    adapter
+        .guard_class_expression(workspace, target.source(), prepared, argument)
+        .ok()
+}
+
+/// The head and the type argument of a subscripted return annotation, such as
+/// `TypeIs[C]`. A tuple of arguments comes back as its own node, which names no
+/// single class.
+fn subscripted_return_annotation(returns: Node<'_>) -> Option<(Node<'_>, Node<'_>)> {
+    let annotation = if returns.kind() == "type" {
+        returns.named_child(0)?
+    } else {
+        returns
+    };
+    let (head, argument) = match annotation.kind() {
+        "subscript" => (
+            annotation.child_by_field_name("value")?,
+            annotation.child_by_field_name("subscript")?,
+        ),
+        // The bracketed arguments of a `generic_type` follow its name as one
+        // `type_parameter` list.
+        "generic_type" => {
+            let parameters = annotation.named_child(1)?;
+            let argument = if parameters.named_child_count() == 1 {
+                parameters.named_child(0)?
+            } else {
+                parameters
+            };
+            (annotation.named_child(0)?, argument)
+        }
+        _ => return None,
+    };
+    let argument = if argument.kind() == "type" {
+        argument.named_child(0)?
+    } else {
+        argument
+    };
+    Some((head, argument))
+}
+
+/// The subject of a predicate call that passes exactly one argument, by position.
+fn single_positional_value(call: &SemanticCallSite) -> Option<ValueId> {
+    match &call.arguments[..] {
+        [argument]
+            if argument.keyword.is_none()
+                && matches!(
+                    argument.expansion,
+                    CallArgumentExpansion::Direct(ArgumentDomain::Positional)
+                ) =>
+        {
+            Some(argument.value)
+        }
+        _ => None,
     }
 }
 
@@ -465,6 +621,7 @@ fn predicate_target_symbol<'overlay, 'target>(
     target: PredicateTarget<'target>,
 ) -> Option<(&'overlay SemanticModelSymbol, PredicateArguments<'target>)> {
     let (name, id, arguments) = match target {
+        PredicateTarget::Annotation(reference) if reference.contains_unknown() => return None,
         PredicateTarget::Annotation(TypeRef::Named {
             name,
             arguments,
@@ -578,6 +735,12 @@ fn ordinary_workspace_function(target: &CodeUnit, node: Node<'_>) -> bool {
     let Some(body) = node.child_by_field_name("body") else {
         return false;
     };
+    module_level_plain_function(target, node) && body_is_small_and_valid(body)
+}
+
+/// A synchronous, undecorated `def` at module level: the declaration a call
+/// reaches, with no class, wrapper, or nesting in between.
+fn module_level_plain_function(target: &CodeUnit, node: Node<'_>) -> bool {
     target.is_function()
         && !target.is_synthetic()
         && !target.owner_is_type_scope()
@@ -586,7 +749,6 @@ fn ordinary_workspace_function(target: &CodeUnit, node: Node<'_>) -> bool {
             .parent()
             .is_some_and(|parent| parent.kind() == "module")
         && !has_direct_token(node, "async")
-        && body_is_small_and_valid(body)
 }
 
 fn target_function_node<'tree>(
@@ -655,17 +817,7 @@ fn unique_module_binding<'tree>(
                 return None;
             }
         }
-        let excluded_body = matches!(
-            node.kind(),
-            "function_definition" | "class_definition" | "lambda"
-        )
-        .then(|| node.child_by_field_name("body"))
-        .flatten();
-        let mut cursor = node.walk();
-        stack.extend(
-            node.named_children(&mut cursor)
-                .filter(|child| Some(*child) != excluded_body),
-        );
+        stack.extend(python_executable_scope_children(node));
     }
     found
 }
@@ -827,29 +979,16 @@ impl ExpressionBuilder<'_> {
 }
 
 fn runtime_children(node: Node<'_>) -> Vec<Node<'_>> {
-    let mut cursor = node.walk();
-    node.named_children(&mut cursor)
+    brokk_bifrost_core::analyzer::tree_walk::named_children_iter(node)
         .filter(|child| !child.is_extra())
         .collect()
 }
 
 fn only_runtime_child(node: Node<'_>) -> Option<Node<'_>> {
-    let mut cursor = node.walk();
-    let mut children = node
-        .named_children(&mut cursor)
-        .filter(|child| !child.is_extra());
-    let child = children.next()?;
-    children.next().is_none().then_some(child)
+    crate::analyzer::tree_walk::single_named_child_matching(node, |child| !child.is_extra())
 }
 
-fn node_text<'source>(node: Node<'_>, source: &'source str) -> Option<&'source str> {
-    node.utf8_text(source.as_bytes()).ok()
-}
-
-fn has_direct_token(node: Node<'_>, kind: &str) -> bool {
-    let mut cursor = node.walk();
-    node.children(&mut cursor).any(|child| child.kind() == kind)
-}
+use brokk_bifrost_core::analyzer::tree_walk::has_child_of_kind as has_direct_token;
 
 /// Validate a small body before the bounded recursive expression lowerer.
 /// Evaluation, alias expansion and destruction of the resulting arena are

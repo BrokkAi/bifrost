@@ -36,7 +36,9 @@ use brokk_bifrost_core::analyzer::semantic_diagnostics::{
 };
 use brokk_bifrost_core::analyzer::structural::occurrences::OccurrenceRole;
 use brokk_bifrost_core::analyzer::structural::resolution::BoundaryStatus;
-use brokk_bifrost_core::analyzer::tree_walk::collect_parse_errors;
+use brokk_bifrost_core::analyzer::tree_walk::{
+    collect_parse_errors, find_ancestor, push_named_children_reversed_where_as,
+};
 use brokk_bifrost_core::analyzer::usages::model::{ImportBinder, ImportKind};
 use brokk_bifrost_core::analyzer::{BoundedDefinitionLookup, CodeUnit, ProjectFile, Range};
 use brokk_bifrost_core::hash::HashSet;
@@ -253,12 +255,22 @@ impl RustDiagnosticCollector<'_, '_> {
             return;
         }
         match node.kind() {
-            "source_file" => push_named_children(stack, node),
+            "source_file" => {
+                brokk_bifrost_core::analyzer::tree_walk::push_named_children_reversed_as(
+                    node,
+                    stack,
+                    ScanFrame::Node,
+                )
+            }
             "block" => {
                 scopes.enter();
                 seed_block_item_bindings(node, self.source, scopes);
                 stack.push(ScanFrame::ExitScope);
-                push_named_children(stack, node);
+                brokk_bifrost_core::analyzer::tree_walk::push_named_children_reversed_as(
+                    node,
+                    stack,
+                    ScanFrame::Node,
+                );
             }
             "function_item" | "function_signature_item" => {
                 scopes.enter_isolated();
@@ -266,19 +278,31 @@ impl RustDiagnosticCollector<'_, '_> {
                 seed_function_like_bindings(node, self.source, scopes);
                 seed_type_parameters(node, self.source, scopes);
                 stack.push(ScanFrame::ExitScope);
-                push_named_children(stack, node);
+                brokk_bifrost_core::analyzer::tree_walk::push_named_children_reversed_as(
+                    node,
+                    stack,
+                    ScanFrame::Node,
+                );
             }
             "closure_expression" => {
                 scopes.enter();
                 seed_function_like_bindings(node, self.source, scopes);
                 stack.push(ScanFrame::ExitScope);
-                push_named_children(stack, node);
+                brokk_bifrost_core::analyzer::tree_walk::push_named_children_reversed_as(
+                    node,
+                    stack,
+                    ScanFrame::Node,
+                );
             }
             "struct_item" | "enum_item" | "trait_item" | "type_item" | "impl_item" => {
                 scopes.enter();
                 seed_type_parameters(node, self.source, scopes);
                 stack.push(ScanFrame::ExitScope);
-                push_named_children(stack, node);
+                brokk_bifrost_core::analyzer::tree_walk::push_named_children_reversed_as(
+                    node,
+                    stack,
+                    ScanFrame::Node,
+                );
             }
             "let_declaration" => {
                 if let Some(value) = node.child_by_field_name("value") {
@@ -322,21 +346,41 @@ impl RustDiagnosticCollector<'_, '_> {
             "self_parameter" | "use_declaration" | "attribute_item" => {}
             "type_identifier" => {
                 self.check_type_identifier(node, scopes);
-                push_named_children(stack, node);
+                brokk_bifrost_core::analyzer::tree_walk::push_named_children_reversed_as(
+                    node,
+                    stack,
+                    ScanFrame::Node,
+                );
             }
             "scoped_type_identifier" => {
                 self.check_scoped_type_identifier(node, scopes);
-                push_named_children(stack, node);
+                brokk_bifrost_core::analyzer::tree_walk::push_named_children_reversed_as(
+                    node,
+                    stack,
+                    ScanFrame::Node,
+                );
             }
             "identifier" => {
                 self.check_value_identifier(node, scopes);
-                push_named_children(stack, node);
+                brokk_bifrost_core::analyzer::tree_walk::push_named_children_reversed_as(
+                    node,
+                    stack,
+                    ScanFrame::Node,
+                );
             }
             "scoped_identifier" => {
                 self.check_scoped_identifier(node, scopes);
-                push_named_children(stack, node);
+                brokk_bifrost_core::analyzer::tree_walk::push_named_children_reversed_as(
+                    node,
+                    stack,
+                    ScanFrame::Node,
+                );
             }
-            _ => push_named_children(stack, node),
+            _ => brokk_bifrost_core::analyzer::tree_walk::push_named_children_reversed_as(
+                node,
+                stack,
+                ScanFrame::Node,
+            ),
         }
     }
 
@@ -595,13 +639,12 @@ impl RustDiagnosticCollector<'_, '_> {
             crate::lexical_scope::enclosing_mod_item_range_at(self.root, reference_byte);
         let mut binder = ImportBinder::empty();
         for visible_use in &self.visible_uses {
-            if visible_use.mod_range != reference_mod {
-                continue;
-            }
-            if visible_use
-                .scope_range
-                .is_some_and(|(start, end)| !(start <= reference_byte && reference_byte < end))
-            {
+            if !crate::lexical_scope::use_statement_visible_at(
+                reference_byte,
+                reference_mod,
+                visible_use.mod_range,
+                visible_use.scope_range,
+            ) {
                 continue;
             }
             for import in &visible_use.imports {
@@ -634,13 +677,12 @@ impl RustDiagnosticCollector<'_, '_> {
         let reference_mod =
             crate::lexical_scope::enclosing_mod_item_range_at(self.root, reference_byte);
         for visible_use in &self.visible_uses {
-            if visible_use.mod_range != reference_mod {
-                continue;
-            }
-            if visible_use
-                .scope_range
-                .is_some_and(|(start, end)| !(start <= reference_byte && reference_byte < end))
-            {
+            if !crate::lexical_scope::use_statement_visible_at(
+                reference_byte,
+                reference_mod,
+                visible_use.mod_range,
+                visible_use.scope_range,
+            ) {
                 continue;
             }
             for import in &visible_use.imports {
@@ -685,8 +727,12 @@ impl RustDiagnosticCollector<'_, '_> {
     }
 
     fn record_resolved(&mut self, node: Node<'_>, boundary: BoundaryStatus) {
-        let range = node_range(node, self.line_starts);
-        self.report.push_resolved(range, boundary);
+        brokk_bifrost_core::analyzer::semantic_diagnostics::push_resolved_node(
+            &mut self.report,
+            node,
+            self.line_starts,
+            boundary,
+        );
     }
 }
 
@@ -730,7 +776,11 @@ fn path_segments(node: Node<'_>, source: &str) -> Vec<String> {
 fn is_crate_local_root(segments: &[String]) -> bool {
     segments
         .first()
-        .is_some_and(|root| matches!(root.as_str(), "crate" | "self" | "super"))
+        .is_some_and(|root| is_rust_crate_local_segment(root))
+}
+
+fn is_rust_crate_local_segment(root: &str) -> bool {
+    matches!(root, "crate" | "self" | "super")
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -830,37 +880,24 @@ fn collect_rust_use_bindings(root: Node<'_>, source: &str) -> Vec<RustUseBinding
     bindings
 }
 
-fn lexical_scope_kind(kind: &str) -> bool {
-    matches!(
-        kind,
-        "block" | "function_item" | "impl_item" | "trait_item" | "mod_item"
-    )
-}
-
-fn push_named_children<'tree>(stack: &mut Vec<ScanFrame<'tree>>, node: Node<'tree>) {
-    let mut cursor = node.walk();
-    let children: Vec<_> = node.named_children(&mut cursor).collect();
-    for child in children.into_iter().rev() {
-        stack.push(ScanFrame::Node(child));
-    }
-}
+use crate::lexical_scope::lexical_scope_kind;
 
 fn push_named_children_except<'tree>(
     stack: &mut Vec<ScanFrame<'tree>>,
     node: Node<'tree>,
     excluded_fields: &[&str],
 ) {
-    let mut cursor = node.walk();
-    let children: Vec<_> = node.named_children(&mut cursor).collect();
-    for child in children.into_iter().rev() {
-        if excluded_fields.iter().any(|field| {
-            node.child_by_field_name(field)
-                .is_some_and(|field_node| same_node(field_node, child))
-        }) {
-            continue;
-        }
-        stack.push(ScanFrame::Node(child));
-    }
+    push_named_children_reversed_where_as(
+        node,
+        stack,
+        |child| {
+            !excluded_fields.iter().any(|field| {
+                node.child_by_field_name(field)
+                    .is_some_and(|field_node| same_node(field_node, child))
+            })
+        },
+        ScanFrame::Node,
+    );
 }
 
 fn seed_function_like_bindings(node: Node<'_>, source: &str, scopes: &mut RustScopeStack) {
@@ -1031,13 +1068,11 @@ fn is_pattern_identifier(node: Node<'_>) -> bool {
 }
 
 fn is_inside_use(node: Node<'_>) -> bool {
-    has_ancestor(node, |ancestor| ancestor.kind() == "use_declaration")
+    find_ancestor(node, |ancestor| ancestor.kind() == "use_declaration").is_some()
 }
 
 fn is_inside_macro_invocation(node: Node<'_>) -> bool {
-    has_ancestor(node, |ancestor| {
-        matches!(ancestor.kind(), "macro_invocation" | "macro_definition")
-    })
+    crate::ownership::has_macro_ancestor(node)
 }
 
 /// The `cfg` attribute gating `node`, named exactly so a suppression reason can
@@ -1056,34 +1091,20 @@ fn enclosing_cfg_condition(node: Node<'_>, source: &str) -> Option<String> {
     None
 }
 
-fn has_ancestor(node: Node<'_>, predicate: impl Fn(Node<'_>) -> bool) -> bool {
-    let mut current = node.parent();
-    while let Some(parent) = current {
-        if predicate(parent) {
-            return true;
-        }
-        current = parent.parent();
-    }
-    false
-}
-
 fn is_crate_local_path(path_node: Node<'_>, source: &str) -> bool {
     let Some(root) = path_root(path_node) else {
         return false;
     };
-    matches!(node_text(root, source).trim(), "crate" | "self" | "super")
+    is_rust_crate_local_segment(node_text(root, source).trim())
 }
 
-fn path_root(mut node: Node<'_>) -> Option<Node<'_>> {
-    loop {
-        match node.kind() {
-            "scoped_identifier" | "scoped_type_identifier" => {
-                node = node.child_by_field_name("path")?;
-            }
-            "identifier" | "type_identifier" | "crate" | "self" | "super" => return Some(node),
-            _ => return None,
-        }
-    }
+fn path_root(node: Node<'_>) -> Option<Node<'_>> {
+    let node = crate::syntax::rust_path_root(node);
+    matches!(
+        node.kind(),
+        "identifier" | "type_identifier" | "crate" | "self" | "super"
+    )
+    .then_some(node)
 }
 
 fn is_rust_builtin_name(name: &str) -> bool {

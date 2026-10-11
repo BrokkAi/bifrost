@@ -7,19 +7,19 @@ use std::{
 };
 
 use crate::analyzer::semantic::{
-    CallSiteHandle, CallTransfer, IcfgEdgeKind, MatchedReturnProjection, ProcedureHandle,
-    ProcedureIcfgEdge, SemanticBudget, SemanticWork,
+    CallSiteHandle, CallTransfer, IcfgEdgeKind, MatchedReturnProjection, OracleLimits,
+    ProcedureHandle, ProcedureIcfgEdge, SemanticBudget, SemanticWork,
 };
 use crate::hash::{HashMap, HashSet};
 
 use super::{
     DataflowEdge, DataflowOutput, DataflowRequest, DistributiveDataflowProblem, FactId,
     IdeDataflowError, IdeEdgeFunctionId, IdeEntryTransfer, IdeMetrics, IdePointValue,
-    IdeSummaryDataflowResult, IdeValueId, PathQuality, PathQualityFrontier, ReusableEndSummary,
-    ReusableProcedureSummary, ReusableReachedFact, ReusableSummaryError, ReusableSummaryProvider,
-    SolverTermination, SolverWork, SummaryCallCycle, SummaryCalledProcedures, SummaryDataflowError,
-    SummaryDataflowResult, SummaryEntry, SummarySolveInput, WitnessRetentionLimits,
-    solve_with_reusable_end_summaries,
+    IdeSummaryDataflowResult, IdeValueId, NoReusableSummaries, PathQuality, PathQualityFrontier,
+    ReusableEndSummary, ReusableProcedureSummary, ReusableReachedFact, ReusableSummaryError,
+    ReusableSummaryProvider, SolverTermination, SolverWork, SummaryCallCycle,
+    SummaryCalledProcedures, SummaryDataflowError, SummaryDataflowResult, SummaryEntry,
+    SummarySolveInput, WitnessRetentionLimits, solve_with_reusable_end_summaries,
 };
 
 /// One fact transition coupled to its client-supplied edge function.
@@ -134,9 +134,7 @@ pub trait ReusableIdeSummaryProvider<Fact, EdgeFunction> {
     ) -> Result<Option<ReusableIdeProcedureSummary<Fact, EdgeFunction>>, SolverTermination>;
 }
 
-struct NoReusableIdeSummaries;
-
-impl<Fact, EdgeFunction> ReusableIdeSummaryProvider<Fact, EdgeFunction> for NoReusableIdeSummaries {
+impl<Fact, EdgeFunction> ReusableIdeSummaryProvider<Fact, EdgeFunction> for NoReusableSummaries {
     fn summary_for(
         &mut self,
         _procedure: &ProcedureHandle,
@@ -178,6 +176,11 @@ pub trait IdeDataflowProblem {
 
     /// See [`super::DistributiveDataflowProblem::call_replaced_by_model`].
     fn call_replaced_by_model(&self, _call: &CallSiteHandle) -> bool {
+        false
+    }
+
+    /// See [`super::DistributiveDataflowProblem::call_replaced_by_proven_model`].
+    fn call_replaced_by_proven_model(&self, _call: &CallSiteHandle) -> bool {
         false
     }
 
@@ -302,6 +305,8 @@ impl<'input, Fact, Value> IdeSummarySolveInput<'input, Fact, Value> {
 struct TransferKey<Fact> {
     edge: ProcedureIcfgEdge,
     call_transfer: Option<CallTransfer>,
+    caller_context: Option<crate::analyzer::semantic::OracleCallContext>,
+    callee_context: Option<crate::analyzer::semantic::OracleCallContext>,
     entry: Fact,
     input: Fact,
 }
@@ -378,14 +383,7 @@ where
     }
 
     fn mark_relation_exhausted(&mut self, staged_relations: usize, staged_meets: usize) {
-        self.attempted_work = Some(SolverWork {
-            ide_relations: self
-                .retained_relations
-                .saturating_add(staged_relations)
-                .saturating_add(1),
-            edge_function_operations: self.capture_meets.saturating_add(staged_meets),
-            ..SolverWork::default()
-        });
+        self.record_exhausted_work(staged_relations, staged_meets, 1, 0);
     }
 
     fn mark_capture_operations_exhausted(
@@ -393,11 +391,7 @@ where
         staged_relations: usize,
         attempted_meets: usize,
     ) {
-        self.attempted_work = Some(SolverWork {
-            ide_relations: self.retained_relations.saturating_add(staged_relations),
-            edge_function_operations: self.capture_meets.saturating_add(attempted_meets),
-            ..SolverWork::default()
-        });
+        self.record_exhausted_work(staged_relations, attempted_meets, 0, 0);
     }
 
     fn mark_functions_exhausted(
@@ -406,8 +400,21 @@ where
         staged_meets: usize,
         attempted_functions: usize,
     ) {
+        self.record_exhausted_work(staged_relations, staged_meets, 0, attempted_functions);
+    }
+
+    fn record_exhausted_work(
+        &mut self,
+        staged_relations: usize,
+        staged_meets: usize,
+        attempted_relations: usize,
+        attempted_functions: usize,
+    ) {
         self.attempted_work = Some(SolverWork {
-            ide_relations: self.retained_relations.saturating_add(staged_relations),
+            ide_relations: self
+                .retained_relations
+                .saturating_add(staged_relations)
+                .saturating_add(attempted_relations),
             edge_function_operations: self.capture_meets.saturating_add(staged_meets),
             edge_functions: attempted_functions,
             ..SolverWork::default()
@@ -608,6 +615,7 @@ where
     Problem: IdeDataflowProblem,
 {
     problem: &'problem Problem,
+    call_context_limits: Option<OracleLimits>,
     trace: RefCell<IdeTrace<Problem::Fact, Problem::EdgeFunction>>,
 }
 
@@ -620,9 +628,11 @@ where
         relation_limit: usize,
         capture_operation_limit: usize,
         function_limit: usize,
+        call_context_limits: Option<OracleLimits>,
     ) -> Self {
         Self {
             problem,
+            call_context_limits,
             trace: RefCell::new(IdeTrace::new(
                 relation_limit,
                 capture_operation_limit,
@@ -643,9 +653,22 @@ where
             &mut dyn DataflowOutput<IdeTransition<Problem::Fact, Problem::EdgeFunction>>,
         ),
     ) {
+        let caller_context = edge.call_context().cloned();
+        let callee_context = match (
+            self.call_context_limits,
+            edge.call_context(),
+            edge.call_transfer(),
+        ) {
+            (Some(limits), Some(context), Some(transfer)) => {
+                Some(context.extended(transfer.origin.clone(), limits))
+            }
+            _ => None,
+        };
         let key = TransferKey {
             edge: owned_edge(edge),
             call_transfer: edge.call_transfer().cloned(),
+            caller_context,
+            callee_context,
             entry: edge
                 .summary_entry_fact()
                 .copied()
@@ -757,6 +780,10 @@ where
 
     fn call_replaced_by_model(&self, call: &CallSiteHandle) -> bool {
         self.problem.call_replaced_by_model(call)
+    }
+
+    fn call_replaced_by_proven_model(&self, call: &CallSiteHandle) -> bool {
+        self.problem.call_replaced_by_proven_model(call)
     }
 
     fn is_flow_observation(&self, fact: &Self::Fact) -> bool {
@@ -946,7 +973,7 @@ where
         function: &EdgeFunction,
         request: &mut DataflowRequest<'_>,
     ) -> Result<IdeEdgeFunctionId, IdeRunFailure> {
-        if let Some(id) = self.ids.get(function).copied() {
+        if let Some(id) = interned_id(&self.ids, function) {
             return Ok(id);
         }
         self.intern(function.clone(), request)
@@ -1120,7 +1147,7 @@ where
         value: &Value,
         request: &mut DataflowRequest<'_>,
     ) -> Result<IdeValueId, IdeRunFailure> {
-        if let Some(id) = self.ids.get(value).copied() {
+        if let Some(id) = interned_id(&self.ids, value) {
             return Ok(id);
         }
         self.intern(value.clone(), request)
@@ -1169,16 +1196,30 @@ enum IdeRunFailure {
     Fatal(IdeDataflowError),
 }
 
+impl IdeRunFailure {
+    fn fatal(error: impl Into<IdeDataflowError>) -> Self {
+        Self::Fatal(error.into())
+    }
+}
+
 impl From<IdeDataflowError> for IdeRunFailure {
     fn from(error: IdeDataflowError) -> Self {
-        Self::Fatal(error)
+        Self::fatal(error)
     }
 }
 
 impl From<SummaryDataflowError> for IdeRunFailure {
     fn from(error: SummaryDataflowError) -> Self {
-        Self::Fatal(error.into())
+        Self::fatal(error)
     }
+}
+
+fn interned_id<T, Id>(ids: &HashMap<T, Id>, value: &T) -> Option<Id>
+where
+    T: Eq + Hash,
+    Id: Copy,
+{
+    ids.get(value).copied()
 }
 
 struct CompleteIdePhase<Value, EdgeFunction> {
@@ -1251,12 +1292,14 @@ where
         // no production consumer turns the omission into a user-visible
         // verdict, is written out at the matching site in
         // `Tabulator::apply_reusable_callee_summaries` in `summary.rs`.
-        if summary.exits.iter().any(|row| row.qualities.is_empty())
-            || summary
+        if !super::reusable_summary_rows_are_valid(
+            procedure,
+            summary.exits.iter().map(|row| row.qualities.as_ref()),
+            summary
                 .reached
                 .iter()
-                .any(|row| row.qualities.is_empty() || row.point.procedure() != procedure)
-        {
+                .map(|row| (row.qualities.as_ref(), row.point.procedure())),
+        ) {
             return Ok(None);
         }
         let mut reached = summary.reached.into_vec();
@@ -1365,12 +1408,36 @@ where
     Problem: IdeDataflowProblem,
     Provider: crate::analyzer::semantic::IcfgProvider + ?Sized,
 {
-    let mut reusable = NoReusableIdeSummaries;
+    let mut reusable = NoReusableSummaries;
     solve_ide_with_reusable_summaries(
         input,
         provider,
         problem,
         &mut reusable,
+        semantic_budget,
+        request,
+    )
+}
+
+pub(crate) fn solve_ide_with_summaries_with_call_context<Problem, Provider>(
+    input: IdeSummarySolveInput<'_, Problem::Fact, Problem::Value>,
+    provider: &Provider,
+    problem: &Problem,
+    call_context_limits: OracleLimits,
+    semantic_budget: &mut SemanticBudget,
+    request: &mut DataflowRequest<'_>,
+) -> IdeSolveOutcome<Problem>
+where
+    Problem: IdeDataflowProblem,
+    Provider: crate::analyzer::semantic::IcfgProvider + ?Sized,
+{
+    let mut reusable = NoReusableSummaries;
+    solve_ide_with_reusable_summaries_impl(
+        input,
+        provider,
+        problem,
+        &mut reusable,
+        Some(call_context_limits),
         semantic_budget,
         request,
     )
@@ -1390,6 +1457,56 @@ where
     Provider: crate::analyzer::semantic::IcfgProvider + ?Sized,
     Reusable: ReusableIdeSummaryProvider<Problem::Fact, Problem::EdgeFunction>,
 {
+    solve_ide_with_reusable_summaries_impl(
+        input,
+        provider,
+        problem,
+        reusable,
+        None,
+        semantic_budget,
+        request,
+    )
+}
+
+pub(crate) fn solve_ide_with_reusable_summaries_with_call_context<Problem, Provider, Reusable>(
+    input: IdeSummarySolveInput<'_, Problem::Fact, Problem::Value>,
+    provider: &Provider,
+    problem: &Problem,
+    reusable: &mut Reusable,
+    call_context_limits: OracleLimits,
+    semantic_budget: &mut SemanticBudget,
+    request: &mut DataflowRequest<'_>,
+) -> IdeSolveOutcome<Problem>
+where
+    Problem: IdeDataflowProblem,
+    Provider: crate::analyzer::semantic::IcfgProvider + ?Sized,
+    Reusable: ReusableIdeSummaryProvider<Problem::Fact, Problem::EdgeFunction>,
+{
+    solve_ide_with_reusable_summaries_impl(
+        input,
+        provider,
+        problem,
+        reusable,
+        Some(call_context_limits),
+        semantic_budget,
+        request,
+    )
+}
+
+fn solve_ide_with_reusable_summaries_impl<Problem, Provider, Reusable>(
+    input: IdeSummarySolveInput<'_, Problem::Fact, Problem::Value>,
+    provider: &Provider,
+    problem: &Problem,
+    reusable: &mut Reusable,
+    call_context_limits: Option<OracleLimits>,
+    semantic_budget: &mut SemanticBudget,
+    request: &mut DataflowRequest<'_>,
+) -> IdeSolveOutcome<Problem>
+where
+    Problem: IdeDataflowProblem,
+    Provider: crate::analyzer::semantic::IcfgProvider + ?Sized,
+    Reusable: ReusableIdeSummaryProvider<Problem::Fact, Problem::EdgeFunction>,
+{
     let initial_work = request.budget.used();
     let initial_semantic_work = semantic_budget.used();
     let seed_facts = bounded_seed_facts::<Problem>(&input, problem.zero_fact(), request);
@@ -1399,11 +1516,17 @@ where
         remaining.ide_relations,
         remaining.edge_function_operations,
         remaining.edge_functions,
+        call_context_limits,
     );
     let mut reusable_adapter = IdeReusableProviderAdapter::new(reusable);
+    let summary_input = SummarySolveInput::new(input.root(), &seed_facts.facts)
+        .with_witness_retention(input.witness_retention());
+    let summary_input = match call_context_limits {
+        Some(limits) => summary_input.with_call_context(limits),
+        None => summary_input,
+    };
     let fact_result = solve_with_reusable_end_summaries(
-        SummarySolveInput::new(input.root(), &seed_facts.facts)
-            .with_witness_retention(input.witness_retention()),
+        summary_input,
         provider,
         &adapter,
         &mut reusable_adapter,
@@ -2054,6 +2177,13 @@ where
                             transfer.callee_entry.clone(),
                             output_id,
                         );
+                        let callee_entry = record
+                            .key
+                            .callee_context
+                            .clone()
+                            .map_or(callee_entry.clone(), |context| {
+                                callee_entry.with_call_context(context)
+                            });
                         let target_entry = by_state
                             .get(&(
                                 callee_entry.clone(),
@@ -2115,6 +2245,8 @@ where
                             let return_key = TransferKey {
                                 edge: return_edge,
                                 call_transfer: None,
+                                caller_context: record.key.caller_context.clone(),
+                                callee_context: None,
                                 entry: entry_fact,
                                 input: exit_fact,
                             };
@@ -2586,23 +2718,5 @@ fn owned_edge<Fact>(edge: DataflowEdge<'_, Fact>) -> ProcedureIcfgEdge {
         proof: edge.proof().clone(),
         completeness: edge.completeness().clone(),
         boundary: edge.boundary().cloned(),
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn transition_and_seed_preserve_owned_components() {
-        let transition = IdeTransition::new(7_u8, [1_u8, 2]);
-        assert_eq!(transition.fact(), &7);
-        assert_eq!(transition.edge_function(), &[1, 2]);
-        assert_eq!(transition.into_parts(), (7, [1, 2]));
-
-        let seed = IdeDataflowSeed::new(3_u8, "qualified".to_owned());
-        assert_eq!(seed.fact(), &3);
-        assert_eq!(seed.value(), "qualified");
-        assert_eq!(seed.into_parts(), (3, "qualified".to_owned()));
     }
 }

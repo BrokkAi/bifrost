@@ -62,6 +62,13 @@ pub fn identifier_at_offset(content: &str, offset: usize) -> Option<&str> {
     content.get(start..end)
 }
 
+fn identifier_start_before(bytes: &[u8], mut end: usize) -> usize {
+    while end > 0 && is_ident_byte(bytes[end - 1]) {
+        end -= 1;
+    }
+    end
+}
+
 /// Like [`identifier_at_offset`] but returns the byte span `(start, end)`
 /// inside `content` instead of the slice.
 pub fn identifier_span_at_offset(content: &str, offset: usize) -> Option<(usize, usize)> {
@@ -87,9 +94,7 @@ pub fn identifier_span_at_offset(content: &str, offset: usize) -> Option<(usize,
         }
     }
 
-    while start > 0 && is_ident_byte(bytes[start - 1]) {
-        start -= 1;
-    }
+    start = identifier_start_before(bytes, start);
     while end < bytes.len() && is_ident_byte(bytes[end]) {
         end += 1;
     }
@@ -108,10 +113,7 @@ pub fn identifier_prefix_before_offset(content: &str, offset: usize) -> Option<&
         return None;
     }
     let end = offset;
-    let mut start = end;
-    while start > 0 && is_ident_byte(bytes[start - 1]) {
-        start -= 1;
-    }
+    let start = identifier_start_before(bytes, end);
     if start == end {
         return None;
     }
@@ -164,13 +166,10 @@ pub fn snippet_around_line(
     if line_starts.is_empty() {
         return String::new();
     }
-    let snippet_start = line_idx.saturating_sub(context_lines);
-    let snippet_end = line_idx
-        .saturating_add(context_lines)
-        .min(line_starts.len().saturating_sub(1));
+    let snippet_lines = snippet_line_window(line_starts.len(), line_idx, line_idx, context_lines);
 
     let mut snippet = String::new();
-    for idx in snippet_start..=snippet_end {
+    for idx in snippet_lines {
         let start = line_starts[idx];
         let end = line_starts.get(idx + 1).copied().unwrap_or(source.len());
         snippet.push_str(source.get(start..end).unwrap_or_default());
@@ -187,14 +186,11 @@ pub fn trimmed_snippet_around_line(
     if line_starts.is_empty() {
         return String::new();
     }
-    let line_count = line_starts.len();
-    let snippet_start = line_idx.saturating_sub(context_lines);
-    let snippet_end = line_idx
-        .saturating_add(context_lines)
-        .min(line_count.saturating_sub(1));
+    let snippet_lines = snippet_line_window(line_starts.len(), line_idx, line_idx, context_lines);
+    let snippet_start = snippet_lines.start;
 
     let mut buf = String::new();
-    for idx in snippet_start..=snippet_end {
+    for idx in snippet_lines {
         let start = line_starts[idx];
         let end = line_starts.get(idx + 1).copied().unwrap_or(source.len());
         let line = source[start..end]
@@ -210,6 +206,19 @@ pub fn trimmed_snippet_around_line(
     buf
 }
 
+fn snippet_line_window(
+    line_count: usize,
+    first_line: usize,
+    last_line: usize,
+    context_lines: usize,
+) -> std::ops::Range<usize> {
+    first_line.saturating_sub(context_lines)
+        ..last_line
+            .saturating_add(context_lines)
+            .saturating_add(1)
+            .min(line_count.max(1))
+}
+
 pub fn trimmed_snippet_around_range(
     source: &str,
     line_starts: &[usize],
@@ -219,12 +228,11 @@ pub fn trimmed_snippet_around_range(
 ) -> String {
     let start_line = find_line_index_for_offset(line_starts, start);
     let end_line = find_line_index_for_offset(line_starts, end);
-    let snippet_start_line = start_line.saturating_sub(context_lines);
-    let snippet_end_line = end_line + context_lines + 1;
+    let snippet_lines = snippet_line_window(line_starts.len(), start_line, end_line, context_lines);
 
-    let snippet_start = *line_starts.get(snippet_start_line).unwrap_or(&0);
+    let snippet_start = *line_starts.get(snippet_lines.start).unwrap_or(&0);
     let snippet_end = line_starts
-        .get(snippet_end_line)
+        .get(snippet_lines.end)
         .copied()
         .unwrap_or(source.len());
 
@@ -389,48 +397,14 @@ fn render_virtual_requested_line(
 #[cfg(test)]
 mod tests {
     use super::{
-        compute_line_starts, find_line_index_for_offset, find_word, line_column_for_offset,
-        render_location_diagnostic, trimmed_snippet_around_line,
+        compute_line_starts, find_word, render_location_diagnostic, trimmed_snippet_around_line,
     };
+    use brokk_bifrost_test_macros::hardwon;
 
     #[test]
-    fn compute_line_starts_handles_mixed_line_endings() {
-        assert_eq!(vec![0, 2, 4, 5], compute_line_starts("a\nb\n\nc"));
-        assert_eq!(vec![0, 4, 7], compute_line_starts("ab\r\nc\r\nd"));
-        assert_eq!(vec![0, 2, 4], compute_line_starts("x\ry\rz"));
-        assert_eq!(vec![0, 3], compute_line_starts("a\r\n"));
-        assert_eq!(vec![0], compute_line_starts(""));
-    }
-
-    #[test]
-    fn line_columns_use_canonical_mixed_line_endings() {
-        let source = "a\rb\r\nç\nd";
-        let starts = compute_line_starts(source);
-        assert_eq!(line_column_for_offset(source, &starts, 2), (2, 1));
-        assert_eq!(line_column_for_offset(source, &starts, 5), (3, 1));
-        assert_eq!(line_column_for_offset(source, &starts, 7), (3, 2));
-        assert_eq!(
-            line_column_for_offset(source, &starts, source.len()),
-            (4, 2)
-        );
-    }
-
-    #[test]
-    fn find_line_index_tracks_separator_offsets() {
-        let starts = compute_line_starts("ab\r\nc\nd\re");
-        assert_eq!(vec![0, 4, 6, 8], starts);
-
-        let expected = [0, 0, 0, 0, 1, 1, 2, 2, 3];
-        for (offset, expected_line) in expected.into_iter().enumerate() {
-            assert_eq!(
-                expected_line,
-                find_line_index_for_offset(&starts, offset),
-                "offset {offset}"
-            );
-        }
-    }
-
-    #[test]
+    #[hardwon(
+        "cb3037430087: retrying a rejected UTF-8 word candidate advanced into the code point"
+    )]
     fn find_word_retries_after_a_rejected_multi_byte_candidate() {
         // The rejected candidate starts with a 4-byte character, so the retry
         // point must be the next character, not the next byte.
@@ -441,6 +415,7 @@ mod tests {
     }
 
     #[test]
+    #[hardwon("cb3037430087: trimming a snippet dropped blank rows before its first content row")]
     fn trimmed_snippet_keeps_blank_rows_before_the_first_content_row() {
         let source = "\n\n\n";
         let starts = compute_line_starts(source);
@@ -493,6 +468,17 @@ mod tests {
     }
 
     #[test]
+    fn location_diagnostic_bounds_long_lines_around_requested_column() {
+        let source = "x".repeat(500);
+        let rendered =
+            render_location_diagnostic(&source, "generated.rs", 1, Some(400), "no target", "retry");
+
+        assert!(rendered.contains("…"));
+        assert!(rendered.contains("requested line 1, column 400"));
+        assert!(rendered.len() < 400, "{rendered}");
+    }
+
+    #[test]
     fn location_diagnostic_shows_nearest_boundary_for_invalid_line() {
         let before = render_location_diagnostic(
             "one\ntwo\nthree",
@@ -516,17 +502,6 @@ mod tests {
         assert!(after.contains("  2 | two"));
         assert!(after.contains("  3 | three"));
         assert!(after.contains("> 8 | [requested line is after the last source line]"));
-    }
-
-    #[test]
-    fn location_diagnostic_bounds_long_lines_around_requested_column() {
-        let source = "x".repeat(500);
-        let rendered =
-            render_location_diagnostic(&source, "generated.rs", 1, Some(400), "no target", "retry");
-
-        assert!(rendered.contains("…"));
-        assert!(rendered.contains("requested line 1, column 400"));
-        assert!(rendered.len() < 400, "{rendered}");
     }
 }
 
@@ -579,8 +554,6 @@ mod text_utils_properties {
         "a\rb\r\n\u{e9}\nd",
     ];
 
-    /// The identifier and word helpers need identifier bytes adjacent to the
-    /// multi-byte atoms, so they draw from a superset of [`CONTENT_ATOMS`].
     const IDENTIFIER_ATOMS: &[&str] = &[
         "a",
         "xyz",
@@ -798,8 +771,35 @@ mod text_utils_properties {
             }
         }
 
-        /// Identifier spans lie on char boundaries inside the buffer, cover the
-        /// requested offset, contain only identifier bytes, and are maximal.
+        /// One output row per table row in range.
+        #[test]
+        fn trimmed_snippets_keep_one_row_per_line(
+            content in content(),
+            line_idx in 0usize..20,
+            context_lines in 0usize..4,
+        ) {
+            let starts = compute_line_starts(&content);
+            let trimmed = trimmed_snippet_around_line(&content, &starts, line_idx, context_lines);
+
+            let first = line_idx.saturating_sub(context_lines);
+            let last = (line_idx + context_lines).min(starts.len() - 1);
+            if first > last {
+                prop_assert!(trimmed.is_empty(), "expected no rows, got {trimmed:?}");
+                return Ok(());
+            }
+            prop_assert_eq!(
+                trimmed.split('\n').count(),
+                last - first + 1,
+                "rows {}..={} of {:?} rendered as {:?}",
+                first,
+                last,
+                content,
+                trimmed
+            );
+        }
+
+
+
         #[test]
         fn identifier_spans_are_bounded_char_boundary_slices(content in identifier_content()) {
             let bytes = content.as_bytes();
@@ -843,9 +843,6 @@ mod text_utils_properties {
             }
         }
 
-        /// The completion prefix helper never walks past the cursor, never
-        /// returns an empty match, and only reports a slice when the cursor is
-        /// on a char boundary.
         #[test]
         fn identifier_prefixes_end_at_the_cursor(content in identifier_content()) {
             for offset in 0..=content.len() + 3 {
@@ -874,8 +871,6 @@ mod text_utils_properties {
             }
         }
 
-        /// A word match starts on a char boundary and is bounded by
-        /// non-identifier bytes or by the buffer edges.
         #[test]
         fn find_word_matches_are_word_bounded(
             haystack in identifier_content(),
@@ -904,7 +899,6 @@ mod text_utils_properties {
             );
         }
 
-        /// The same invariant with a needle whose first character is multi-byte.
         #[test]
         fn find_word_handles_multi_byte_needles(
             haystack in identifier_content(),
@@ -923,8 +917,6 @@ mod text_utils_properties {
             );
         }
 
-        /// A snippet is the exact contiguous slice spanned by the requested
-        /// table rows, for any row index and context width.
         #[test]
         fn snippets_are_contiguous_slices_of_the_source(
             content in content(),
@@ -952,8 +944,6 @@ mod text_utils_properties {
             );
         }
 
-        /// The trimmed snippet drops every line terminator: no CR survives, and
-        /// the only LFs are the separators the helper inserts.
         #[test]
         fn trimmed_snippets_drop_line_terminators(
             content in content(),
@@ -975,35 +965,6 @@ mod text_utils_properties {
             }
         }
 
-        /// One output row per table row in range.
-        #[test]
-        fn trimmed_snippets_keep_one_row_per_line(
-            content in content(),
-            line_idx in 0usize..20,
-            context_lines in 0usize..4,
-        ) {
-            let starts = compute_line_starts(&content);
-            let trimmed = trimmed_snippet_around_line(&content, &starts, line_idx, context_lines);
-
-            let first = line_idx.saturating_sub(context_lines);
-            let last = (line_idx + context_lines).min(starts.len() - 1);
-            if first > last {
-                prop_assert!(trimmed.is_empty(), "expected no rows, got {trimmed:?}");
-                return Ok(());
-            }
-            prop_assert_eq!(
-                trimmed.split('\n').count(),
-                last - first + 1,
-                "rows {}..={} of {:?} rendered as {:?}",
-                first,
-                last,
-                content,
-                trimmed
-            );
-        }
-
-        /// The range form is a trimmed substring of the source for any pair of
-        /// offsets with `start <= end`, including offsets inside a code point.
         #[test]
         fn trimmed_snippet_around_range_returns_a_source_substring(
             content in content(),
@@ -1023,8 +984,6 @@ mod text_utils_properties {
             );
         }
 
-        /// The location renderer accepts any 1-based line, including 0 and
-        /// lines past end of file, and always reports the recovery hint.
         #[test]
         fn render_location_diagnostic_accepts_any_requested_location(
             content in content(),

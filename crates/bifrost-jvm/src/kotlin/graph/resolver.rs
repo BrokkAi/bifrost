@@ -17,11 +17,16 @@
 
 use super::KotlinGraphSource;
 use super::extractor::ScanCtx;
-use crate::kotlin::declarations::kotlin_package_components;
+use crate::kotlin::declarations::{
+    kotlin_callable_arities_from_metadata, kotlin_callable_metadata_accepts_arity,
+    kotlin_package_components,
+};
 use crate::kotlin::imports::KOTLIN_DEFAULT_IMPORT_PACKAGES;
 use crate::kotlin::syntax::{
-    kotlin_call_arity, kotlin_callee, kotlin_is_navigation_kind, kotlin_navigation_member,
-    kotlin_navigation_receiver, kotlin_type_name_components, kotlin_unwrap_receiver,
+    kotlin_binding_type_components, kotlin_call_arity, kotlin_callee,
+    kotlin_dotted_navigation_components, kotlin_is_expression_kind, kotlin_is_navigation_kind,
+    kotlin_navigation_member, kotlin_navigation_receiver, kotlin_owner_label_matches,
+    kotlin_type_name_components, kotlin_unwrap_receiver,
 };
 use crate::kotlin::types::KotlinTypeName;
 use brokk_bifrost_core::analyzer::fq_name::{SegmentKind, segment_interner};
@@ -124,7 +129,17 @@ impl TargetSpec {
         if let Some(arities) = spec.callable_arities.as_mut() {
             for extra in targets.iter().skip(1) {
                 if extra.fq_name() == spec.fq_name {
-                    arities.extend(kotlin_callable_arities(graph, extra));
+                    // An empty set means at least one candidate has unknown
+                    // arity, so no known overload can narrow the result.
+                    if arities.is_empty() {
+                        break;
+                    }
+                    let extra_arities = kotlin_callable_arities(graph, extra);
+                    if extra_arities.is_empty() {
+                        arities.clear();
+                        break;
+                    }
+                    arities.extend(extra_arities);
                 }
             }
         }
@@ -258,12 +273,7 @@ pub fn kotlin_callable_arities(
     graph: &KotlinGraphSource<'_>,
     unit: &CodeUnit,
 ) -> HashSet<CallableArity> {
-    graph
-        .index
-        .signature_metadata(unit)
-        .iter()
-        .filter_map(SignatureMetadata::callable_arity)
-        .collect()
+    kotlin_callable_arities_from_metadata(&graph.index.signature_metadata(unit))
 }
 
 /// Whether `unit` is a Kotlin `companion object`.
@@ -597,7 +607,7 @@ fn this_receiver_fq_name(node: Node<'_>, ctx: &mut impl KotlinResolutionCtx) -> 
         Some(label) => owners.into_iter().find(|fqn| {
             fqn.rsplit('.')
                 .next()
-                .is_some_and(|terminal| terminal == label)
+                .is_some_and(|terminal| kotlin_owner_label_matches(terminal, &label))
         }),
         None => owners.into_iter().next(),
     }
@@ -609,25 +619,7 @@ fn navigation_type_fq_name(
     navigation: Node<'_>,
     ctx: &mut impl KotlinResolutionCtx,
 ) -> Option<String> {
-    let mut segments = Vec::new();
-    let mut current = navigation;
-    loop {
-        let member = kotlin_navigation_member(current)?;
-        segments.push(node_text(member, ctx.source()).to_string());
-        let receiver = kotlin_navigation_receiver(current)?;
-        match receiver.kind() {
-            kind if kotlin_is_navigation_kind(kind) => current = receiver,
-            "simple_identifier" => {
-                segments.push(node_text(receiver, ctx.source()).to_string());
-                break;
-            }
-            _ => return None,
-        }
-    }
-    segments.reverse();
-    if segments.iter().any(String::is_empty) {
-        return None;
-    }
+    let segments = kotlin_dotted_navigation_components(navigation, ctx.source())?;
     ctx.resolve_type_components(&segments, navigation.start_byte())
 }
 
@@ -671,6 +663,29 @@ fn call_result_type_fq_name(
         }
         _ => None,
     }
+}
+
+/// The type a Kotlin value binding writes or its initializer establishes.
+pub fn binding_type_fq_name(
+    binding: Node<'_>,
+    token: QueryToken<'_>,
+    ctx: &mut impl KotlinResolutionCtx,
+) -> Option<String> {
+    if let Some(components) = kotlin_binding_type_components(binding, ctx.source())
+        && let Some(fqn) = ctx.resolve_type_components(&components, binding.start_byte())
+    {
+        return Some(fqn);
+    }
+    let owner = if binding.kind() == "variable_declaration" {
+        binding.parent()?
+    } else {
+        binding
+    };
+    let initializer = named_children(owner)
+        .into_iter()
+        .rev()
+        .find(|child| kotlin_is_expression_kind(child.kind()))?;
+    receiver_type_fq_name(initializer, token, ctx, 0)
 }
 
 /// The declaration a bare call names: a member of an enclosing owner (or what it
@@ -743,6 +758,17 @@ pub fn member_unit(
     None
 }
 
+pub(crate) fn nearest_enclosing_member_unit(
+    owners: &[String],
+    member_name: &str,
+    arity: Option<usize>,
+    ctx: &mut impl KotlinResolutionCtx,
+) -> Option<CodeUnit> {
+    owners
+        .iter()
+        .find_map(|owner| member_unit(owner, member_name, arity, ctx))
+}
+
 fn declared_member_unit(
     graph: &KotlinGraphSource<'_>,
     owner_fqn: &str,
@@ -759,8 +785,10 @@ fn declared_member_unit(
                     if !unit.is_function() {
                         return true;
                     }
-                    let arities = kotlin_callable_arities(graph, unit);
-                    arities.is_empty() || arities.iter().any(|recorded| recorded.accepts(arity))
+                    kotlin_callable_metadata_accepts_arity(
+                        &graph.index.signature_metadata(unit),
+                        arity,
+                    )
                 })
         })
 }
@@ -874,22 +902,7 @@ pub fn owner_declares_member(
     member_name: &str,
     arity: Option<usize>,
 ) -> bool {
-    let Some(owner) = type_unit(graph, owner_fqn) else {
-        return false;
-    };
-    graph
-        .structural_members(owner.fq(), member_name)
-        .into_iter()
-        .any(|unit| {
-            ordinary_callable(graph, &unit)
-                && arity.is_none_or(|arity| {
-                    if !unit.is_function() {
-                        return true;
-                    }
-                    let arities = kotlin_callable_arities(graph, &unit);
-                    arities.is_empty() || arities.iter().any(|recorded| recorded.accepts(arity))
-                })
-        })
+    declared_member_unit(graph, owner_fqn, member_name, arity).is_some()
 }
 
 /// The file-level half of a Kotlin name scope: what the file declares itself to
@@ -1149,18 +1162,18 @@ impl<'a> KotlinNameResolver<'a> {
         ) else {
             return Vec::new();
         };
-        let mut owners = Vec::new();
         let mut lexical = Vec::new();
-        let mut current = Some(enclosing);
-        while let Some(unit) = current {
+        let mut owners = Vec::new();
+        for unit in crate::kotlin::types::kotlin_lexical_owner_chain(Some(enclosing), |unit| {
+            self.graph.index.parent_of(unit)
+        }) {
             if !owners
                 .iter()
                 .any(|owner: &CodeUnit| owner.fq() == unit.fq())
             {
                 owners.push(unit.clone());
-                lexical.push(unit.clone());
+                lexical.push(unit);
             }
-            current = self.graph.index.parent_of(&unit);
         }
 
         // A class can name a type its superclass declares, so what the lexical
@@ -1189,5 +1202,39 @@ impl<'a> KotlinNameResolver<'a> {
             frontier = next;
         }
         owners
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn call_matches_unknown_arity_overload_when_known_overload_rejects_it() {
+        let metadata = [
+            SignatureMetadata::new("target(first, second)", Vec::new())
+                .with_callable_arity(CallableArity::exact(2)),
+            SignatureMetadata::new("target(unknown shape)", Vec::new()),
+        ];
+        let call_arity = 1;
+        assert!(!metadata[0].callable_arity().unwrap().accepts(call_arity));
+
+        let target = CodeUnit::new(
+            ProjectFile::new(std::env::temp_dir(), "target.kt"),
+            brokk_bifrost_core::analyzer::model::CodeUnitType::Function,
+            "example",
+            "target",
+        );
+        let spec = TargetSpec {
+            target,
+            kind: TargetKind::Function,
+            fq_name: "example.target".to_owned(),
+            owner: None,
+            receiver_owner_fq_names: HashSet::default(),
+            declaration_owner_fq_names: HashSet::default(),
+            member_name: "target".to_owned(),
+            callable_arities: Some(kotlin_callable_arities_from_metadata(&metadata)),
+        };
+        assert!(spec.accepts_arity(call_arity));
     }
 }

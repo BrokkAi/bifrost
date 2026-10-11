@@ -5,12 +5,11 @@
 //! on one revision. Missing members become authoritative only after a bounded
 //! class-wide survey proves that the runtime surface is closed.
 
-use std::path::Path;
 use std::sync::Arc;
 #[cfg(test)]
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use brokk_bifrost_core::analyzer::prepared_syntax::{PreparedSyntaxSource, PreparedSyntaxTree};
+use brokk_bifrost_core::analyzer::prepared_syntax::PreparedSyntaxTree;
 use brokk_bifrost_core::analyzer::usages::receiver_analysis::{
     ReceiverAnalysisBudget, ReceiverAnalysisOutcome, ReceiverValue,
 };
@@ -30,13 +29,13 @@ use tree_sitter::Node;
 use super::{JavascriptSupport, TypescriptSupport, is_typescript_declaration_path};
 use crate::analyzer::js_ts::providers::resolve_js_ts_source;
 use crate::analyzer::lexical_definitions::formal_parameter_slots_for_owner_with_nodes;
+use crate::analyzer::semantic::type_flow::file_for_locator;
+use crate::analyzer::semantic::type_flow::node_at_span;
 use crate::analyzer::semantic::{
-    AdapterSemanticsVersion, AllocationKind, AllocationSite, CandidateCoverage, ClassHierarchy,
-    ClassIdentity, ClassSeed, ExternalMemberDeclaration, MemberAccessKind, MemberAccessQuery,
-    MemberDeclaration, MemberLookup, MemberLookupHit, MemoryLocationKind, ProcedureHandle,
-    SemanticCallSite, SemanticLocator, SemanticValue, SemanticValueKind, SourceMappingKind,
-    SourceSpan, StableDigest, TypeFlowAdapter, UnknownReason,
-    validate_prepared_syntax_for_procedure,
+    AdapterSemanticsVersion, AllocationKind, AllocationSite, ClassHierarchy, ClassIdentity,
+    ClassSeed, ExternalMemberDeclaration, MemberAccessKind, MemberAccessQuery, MemberDeclaration,
+    MemberLookup, ProcedureHandle, SemanticCallSite, SemanticValue, SemanticValueKind,
+    SourceMappingKind, StableDigest, TypeFlowAdapter, UnknownReason,
 };
 use crate::analyzer::semantic_model::{
     SemanticModelOverlay, SemanticModelSymbol, SemanticModelSymbolKind,
@@ -57,6 +56,7 @@ use crate::hash::{HashMap, HashSet};
 /// coverage truncated for every lookup rather than restarting the allowance
 /// for each queried member.
 const MAX_JS_TS_MEMBER_SURFACE_NODES: usize = 200_000;
+const REVIEWED_TYPESCRIPT_STRING_PACK_ID: &str = "bifrost.typescript.string-result-use-obligations";
 
 fn prepared_for(
     workspace: &WorkspaceAnalyzer,
@@ -83,18 +83,16 @@ fn current_prepared_for(
     language: Language,
     file: &ProjectFile,
 ) -> Option<Arc<PreparedSyntaxTree>> {
-    let prepared = prepared_for(workspace, language, file)?;
-    if !matches!(prepared.backing(), PreparedSyntaxSource::Indexed(_)) {
-        return None;
-    }
-    let matches = match language {
-        Language::JavaScript => resolve_analyzer::<JavascriptAnalyzer>(workspace.analyzer())?
-            .indexed_source_matches(file, prepared.source()),
-        Language::TypeScript => resolve_analyzer::<TypescriptAnalyzer>(workspace.analyzer())?
-            .indexed_source_matches(file, prepared.source()),
-        _ => unreachable!("the JS/TS adapter receives only JavaScript or TypeScript"),
-    };
-    matches.then_some(prepared)
+    crate::analyzer::semantic::type_flow::current_indexed_prepared(
+        prepared_for(workspace, language, file),
+        |prepared| match language {
+            Language::JavaScript => resolve_analyzer::<JavascriptAnalyzer>(workspace.analyzer())
+                .is_some_and(|analyzer| analyzer.indexed_source_matches(file, prepared.source())),
+            Language::TypeScript => resolve_analyzer::<TypescriptAnalyzer>(workspace.analyzer())
+                .is_some_and(|analyzer| analyzer.indexed_source_matches(file, prepared.source())),
+            _ => unreachable!("the JS/TS adapter receives only JavaScript or TypeScript"),
+        },
+    )
 }
 
 fn prepared_for_procedure(
@@ -103,39 +101,17 @@ fn prepared_for_procedure(
     procedure: &ProcedureHandle,
     file: &ProjectFile,
 ) -> Result<Arc<PreparedSyntaxTree>, UnknownReason> {
-    let Some(prepared) = prepared_for(workspace, language, file) else {
-        return Err(UnknownReason::UncertainFlow);
-    };
-    validate_prepared_syntax_for_procedure(workspace, procedure, file, prepared)
-}
-
-fn file_for_locator(
-    workspace: &WorkspaceAnalyzer,
-    locator: &SemanticLocator,
-) -> Option<ProjectFile> {
-    workspace
-        .analyzer()
-        .project()
-        .file_by_rel_path(Path::new(locator.path().as_str()))
-}
-
-fn node_at_span(prepared: &PreparedSyntaxTree, span: SourceSpan) -> Option<Node<'_>> {
-    prepared
-        .tree()
-        .root_node()
-        .named_descendant_for_byte_range(span.start_byte() as usize, span.end_byte() as usize)
-}
-
-fn overlay_of(workspace: &WorkspaceAnalyzer) -> Option<Arc<SemanticModelOverlay>> {
-    workspace
-        .analyzer()
-        .active_semantic_model_snapshot()
-        .and_then(|snapshot| snapshot.semantic_model_overlay().cloned())
+    crate::analyzer::semantic::type_flow::prepared_syntax_for_procedure(
+        workspace,
+        procedure,
+        file,
+        prepared_for(workspace, language, file),
+    )
 }
 
 enum ExternalType {
     Class(ClassIdentity),
-    Interface,
+    Interface(ClassIdentity),
 }
 
 fn js_ts_external_symbol(symbol: &SemanticModelSymbol) -> bool {
@@ -155,12 +131,13 @@ fn external_type_from_symbols<'a>(
     if symbols.next().is_some() {
         return None;
     }
+    let identity = ClassIdentity::External {
+        qualified_name: symbol.qualified_name.clone().into_boxed_str(),
+        symbol_id: symbol.id.clone().into_boxed_str(),
+    };
     match symbol.kind {
-        SemanticModelSymbolKind::Class => Some(ExternalType::Class(ClassIdentity::External {
-            qualified_name: symbol.qualified_name.clone().into_boxed_str(),
-            symbol_id: symbol.id.clone().into_boxed_str(),
-        })),
-        SemanticModelSymbolKind::Interface => Some(ExternalType::Interface),
+        SemanticModelSymbolKind::Class => Some(ExternalType::Class(identity)),
+        SemanticModelSymbolKind::Interface => Some(ExternalType::Interface(identity)),
         _ => unreachable!("external type candidates were filtered to class-like symbols"),
     }
 }
@@ -191,7 +168,7 @@ fn external_intrinsic_type(
 fn external_class(overlay: Option<&SemanticModelOverlay>, name: &str) -> Option<ClassIdentity> {
     match external_type(overlay, name)? {
         ExternalType::Class(identity) => Some(identity),
-        ExternalType::Interface => None,
+        ExternalType::Interface(_) => None,
     }
 }
 
@@ -232,17 +209,63 @@ fn sort_external_classes(classes: &mut [ClassIdentity]) {
 }
 
 fn exact_external_seed(workspace: &WorkspaceAnalyzer, name: &str) -> ClassSeed {
-    match external_intrinsic_type(overlay_of(workspace).as_deref(), name) {
+    match external_intrinsic_type(
+        workspace.analyzer().semantic_model_overlay().as_deref(),
+        name,
+    ) {
         Some(ExternalType::Class(identity)) => ClassSeed::Class(identity),
-        Some(ExternalType::Interface) => ClassSeed::Unknown(UnknownReason::OpenTypeBound),
+        Some(ExternalType::Interface(_)) => ClassSeed::Unknown(UnknownReason::OpenTypeBound),
+        None => ClassSeed::Unknown(UnknownReason::ExternalNotModeled),
+    }
+}
+
+/// TypeScript's primitive `string` type is declared by `lib.es5.d.ts` as an
+/// interface-shaped intrinsic. The reviewed builtin-receiver assumption makes
+/// that one canonical `String` interface an exact receiver identity for the
+/// TypeScript adapter; ordinary interfaces remain open everywhere else.
+fn exact_builtin_string_seed(workspace: &WorkspaceAnalyzer, language: Language) -> ClassSeed {
+    let overlay = workspace.analyzer().semantic_model_overlay();
+    if language == Language::TypeScript
+        && let Some(identity) = overlay.as_deref().and_then(|overlay| {
+            let records = overlay
+                .symbols_named("String")
+                .records
+                .into_iter()
+                .filter(|symbol| {
+                    js_ts_external_symbol(symbol)
+                        && symbol.provenance.pack_id == REVIEWED_TYPESCRIPT_STRING_PACK_ID
+                        && symbol.qualified_name == "String"
+                })
+                .collect::<Vec<_>>();
+            let [symbol] = records.as_slice() else {
+                return None;
+            };
+            Some(ClassIdentity::External {
+                qualified_name: symbol.qualified_name.clone().into_boxed_str(),
+                symbol_id: symbol.id.clone().into_boxed_str(),
+            })
+        })
+    {
+        return ClassSeed::Class(identity);
+    }
+    let external = external_intrinsic_type(overlay.as_deref(), "String");
+    match external {
+        Some(ExternalType::Class(identity)) => ClassSeed::Class(identity),
+        Some(ExternalType::Interface(identity)) if language == Language::TypeScript => {
+            ClassSeed::Class(identity)
+        }
+        Some(ExternalType::Interface(_)) => ClassSeed::Unknown(UnknownReason::OpenTypeBound),
         None => ClassSeed::Unknown(UnknownReason::ExternalNotModeled),
     }
 }
 
 fn open_external_seed(workspace: &WorkspaceAnalyzer, name: &str) -> ClassSeed {
-    match external_intrinsic_type(overlay_of(workspace).as_deref(), name) {
+    match external_intrinsic_type(
+        workspace.analyzer().semantic_model_overlay().as_deref(),
+        name,
+    ) {
         Some(ExternalType::Class(identity)) => ClassSeed::ClassWithOpenBound(identity),
-        Some(ExternalType::Interface) => ClassSeed::Unknown(UnknownReason::OpenTypeBound),
+        Some(ExternalType::Interface(_)) => ClassSeed::Unknown(UnknownReason::OpenTypeBound),
         None => ClassSeed::Unknown(UnknownReason::ExternalNotModeled),
     }
 }
@@ -265,6 +288,30 @@ fn is_untagged_template(node: Node<'_>) -> bool {
                 .child_by_field_name("arguments")
                 .is_some_and(|arguments| arguments.id() == node.id())
     })
+}
+
+fn exact_builtin_string_call_class(
+    workspace: &WorkspaceAnalyzer,
+    language: Language,
+    prepared: &PreparedSyntaxTree,
+    node: Node<'_>,
+) -> Option<ClassSeed> {
+    if node.kind() != "call_expression" {
+        return None;
+    }
+    let Some(function) = node.child_by_field_name("function") else {
+        return Some(ClassSeed::Unknown(UnknownReason::UnresolvedCall));
+    };
+    if !matches!(function.kind(), "identifier" | "type_identifier")
+        || slice(function, prepared.source()) != "String"
+    {
+        return Some(ClassSeed::NotApplicable);
+    }
+    let lexical = JsTsLexicalBindingIndex::build(prepared.tree().root_node(), prepared.source());
+    if lexical.is_bound_at("String", function.start_byte()) {
+        return Some(ClassSeed::Unknown(UnknownReason::UnresolvedCall));
+    }
+    Some(exact_builtin_string_seed(workspace, language))
 }
 
 fn declaration_node<'tree>(
@@ -429,14 +476,12 @@ fn exact_runtime_class_binding(
         && !target_lexical.is_binding_reassigned_at(target_name, name_node.start_byte())
 }
 
-fn constructor_is_inside_with(mut constructor: Node<'_>) -> bool {
-    while let Some(parent) = constructor.parent() {
-        if parent.kind() == "with_statement" {
-            return true;
-        }
-        constructor = parent;
-    }
-    false
+fn constructor_is_inside_with(constructor: Node<'_>) -> bool {
+    brokk_bifrost_core::analyzer::structural::adapter_helpers::nearest_ancestor(
+        constructor,
+        |kind| kind == "with_statement",
+    )
+    .is_some()
 }
 
 fn contains_direct_eval(prepared: &PreparedSyntaxTree) -> bool {
@@ -705,7 +750,7 @@ fn constructed_class(
                 }
                 name
             };
-            let overlay = overlay_of(workspace);
+            let overlay = workspace.analyzer().semantic_model_overlay();
             match external_type(overlay.as_deref(), external_name) {
                 Some(ExternalType::Class(identity))
                     if overlay.as_deref().is_some_and(|overlay| {
@@ -715,7 +760,9 @@ fn constructed_class(
                     ClassSeed::Class(identity)
                 }
                 Some(ExternalType::Class(identity)) => ClassSeed::ClassWithOpenBound(identity),
-                Some(ExternalType::Interface) => ClassSeed::Unknown(UnknownReason::OpenTypeBound),
+                Some(ExternalType::Interface(_)) => {
+                    ClassSeed::Unknown(UnknownReason::OpenTypeBound)
+                }
                 None => ClassSeed::Unknown(UnknownReason::ExternalNotModeled),
             }
         }
@@ -747,8 +794,10 @@ fn constant_class(
         return ClassSeed::NotApplicable;
     };
     match node.kind() {
-        "string" => exact_external_seed(workspace, "String"),
-        "template_string" if is_untagged_template(node) => exact_external_seed(workspace, "String"),
+        "string" => exact_builtin_string_seed(workspace, language),
+        "template_string" if is_untagged_template(node) => {
+            exact_builtin_string_seed(workspace, language)
+        }
         "true" | "false" => exact_external_seed(workspace, "Boolean"),
         // A Number literal is published as a typed numeric value; the
         // `number` tokens still reaching here are BigInt, legacy octal and
@@ -816,12 +865,15 @@ fn retained_value_class(
     if is_open_runtime_origin(node) {
         return ClassSeed::Unknown(UnknownReason::OpenTypeBound);
     }
+    let source = prepared.source();
+    if let Some(seed) = exact_builtin_string_call_class(workspace, language, &prepared, node) {
+        return seed;
+    }
+    let lexical = JsTsLexicalBindingIndex::build(prepared.tree().root_node(), source);
     if !matches!(node.kind(), "identifier" | "type_identifier") {
         return ClassSeed::NotApplicable;
     }
 
-    let source = prepared.source();
-    let lexical = JsTsLexicalBindingIndex::build(prepared.tree().root_node(), source);
     let name = slice(node, source);
     for binding in lexical.binding_identifier_ranges_at(name, node.start_byte()) {
         let Some(binding_node) = prepared
@@ -863,6 +915,33 @@ fn retained_value_class(
         }
     }
     ClassSeed::NotApplicable
+}
+
+fn computed_class(
+    workspace: &WorkspaceAnalyzer,
+    language: Language,
+    procedure: &ProcedureHandle,
+    value: &SemanticValue,
+) -> ClassSeed {
+    let mapping = procedure
+        .semantics()
+        .source_mapping(value.source)
+        .expect("a computed value retains a source mapping");
+    if mapping.kind != SourceMappingKind::Exact {
+        return ClassSeed::NotApplicable;
+    }
+    let Some(file) = file_for_locator(workspace, &mapping.locator) else {
+        return ClassSeed::NotApplicable;
+    };
+    let prepared = match prepared_for_procedure(workspace, language, procedure, &file) {
+        Ok(prepared) => prepared,
+        Err(reason) => return ClassSeed::Unknown(reason),
+    };
+    let Some(node) = node_at_span(&prepared, mapping.locator.anchor().span()) else {
+        return ClassSeed::NotApplicable;
+    };
+    exact_builtin_string_call_class(workspace, language, &prepared, node)
+        .unwrap_or(ClassSeed::NotApplicable)
 }
 
 fn object_literal_has_proto_setter(object: Node<'_>, source: &str) -> bool {
@@ -1007,6 +1086,12 @@ fn declared_parameter_class(
         annotation.kind(),
         "identifier" | "type_identifier" | "nested_type_identifier"
     ) {
+        if language == Language::TypeScript
+            && annotation.kind() == "predefined_type"
+            && slice(annotation, prepared.source()) == "string"
+        {
+            return exact_builtin_string_seed(workspace, language);
+        }
         return ClassSeed::Unknown(UnknownReason::OpenTypeBound);
     }
     let imports = compute_import_binder(prepared.source(), prepared.tree());
@@ -1049,9 +1134,14 @@ fn declared_parameter_class(
         },
         [] if annotation.kind() != "nested_type_identifier" => {
             let name = slice(annotation, prepared.source());
-            match external_type(overlay_of(workspace).as_deref(), name) {
+            match external_type(
+                workspace.analyzer().semantic_model_overlay().as_deref(),
+                name,
+            ) {
                 Some(ExternalType::Class(identity)) => ClassSeed::ClassWithOpenBound(identity),
-                Some(ExternalType::Interface) => ClassSeed::Unknown(UnknownReason::OpenTypeBound),
+                Some(ExternalType::Interface(_)) => {
+                    ClassSeed::Unknown(UnknownReason::OpenTypeBound)
+                }
                 None => ClassSeed::Unknown(UnknownReason::ExternalNotModeled),
             }
         }
@@ -1081,31 +1171,11 @@ fn accessed_member(
     procedure: &ProcedureHandle,
     site: MemberAccessQuery<'_>,
 ) -> Option<Box<str>> {
-    let semantics = procedure.semantics();
-    let locator = match site {
-        MemberAccessQuery::Call(call) => {
-            let callee = semantics.value(call.callee)?;
-            let mapping = semantics.source_mapping(callee.source)?;
-            (mapping.kind == SourceMappingKind::Exact).then_some(&mapping.locator)?
-        }
-        MemberAccessQuery::Load(location) => {
-            let MemoryLocationKind::Field { member, .. } = &location.kind else {
-                return None;
-            };
-            member
-        }
-    };
+    let locator = crate::analyzer::semantic::type_flow::accessed_member_locator(procedure, site)?;
     let file = file_for_locator(workspace, locator)?;
     let prepared = prepared_for_procedure(workspace, language, procedure, &file).ok()?;
     let node = node_at_span(&prepared, locator.anchor().span())?;
     member_name_at_node(node, prepared.source())
-}
-
-fn present(declaration: MemberDeclaration) -> MemberLookup {
-    MemberLookup::Present(MemberLookupHit {
-        declaration,
-        dispatch_coverage: CandidateCoverage::Open,
-    })
 }
 
 fn is_ordinary_instance_method(node: Node<'_>) -> bool {
@@ -1148,7 +1218,10 @@ fn external_member_lookup(
         return MemberLookup::Unknown(UnknownReason::PackIncomplete);
     };
     if !js_ts_external_symbol(owner)
-        || owner.kind != SemanticModelSymbolKind::Class
+        || !matches!(
+            owner.kind,
+            SemanticModelSymbolKind::Class | SemanticModelSymbolKind::Interface
+        )
         || owner.provenance.ambiguous
     {
         return MemberLookup::Unknown(UnknownReason::PackIncomplete);
@@ -1191,11 +1264,13 @@ fn external_member_lookup(
         if relevant.is_empty() {
             return MemberLookup::Unknown(UnknownReason::DynamicAttributes);
         }
-        return present(MemberDeclaration::External(ExternalMemberDeclaration::new(
-            relevant
-                .into_iter()
-                .map(|symbol| symbol.id.clone().into_boxed_str()),
-        )));
+        return crate::analyzer::semantic::type_flow::present_member(MemberDeclaration::External(
+            ExternalMemberDeclaration::new(
+                relevant
+                    .into_iter()
+                    .map(|symbol| symbol.id.clone().into_boxed_str()),
+            ),
+        ));
     }
     if surface.gaps.is_empty() && !member_surface_is_gapped {
         MemberLookup::Absent
@@ -1476,8 +1551,11 @@ fn resolve_class_expression(
         }
         name
     };
-    external_class(overlay_of(workspace).as_deref(), external_name)
-        .ok_or(UnknownReason::UnresolvedBase)
+    external_class(
+        workspace.analyzer().semantic_model_overlay().as_deref(),
+        external_name,
+    )
+    .ok_or(UnknownReason::UnresolvedBase)
 }
 
 fn workspace_surface_closure(
@@ -1750,11 +1828,7 @@ fn unshadowed_builtin_member(
 }
 
 fn call_arguments(call: Node<'_>) -> Vec<Node<'_>> {
-    let Some(arguments) = call.child_by_field_name("arguments") else {
-        return Vec::new();
-    };
-    let mut cursor = arguments.walk();
-    arguments.named_children(&mut cursor).collect()
+    brokk_bifrost_core::analyzer::tree_walk::named_children_by_field(call, "arguments")
 }
 
 fn object_literal_member_names(object: Node<'_>, source: &str) -> Result<Vec<Box<str>>, ()> {
@@ -2153,7 +2227,9 @@ fn workspace_member_lookup(
             .collect::<Vec<_>>();
         if !matches.is_empty() {
             sort_units(&mut matches);
-            return present(MemberDeclaration::Workspace(matches.remove(0)));
+            return crate::analyzer::semantic::type_flow::present_member(
+                MemberDeclaration::Workspace(matches.remove(0)),
+            );
         }
         let (owner_contains_member, owner_coverage) = class_member_shape(&prepared, owner, member);
         contains_member |= owner_contains_member
@@ -2162,7 +2238,7 @@ fn workspace_member_lookup(
             });
         coverage.include(owner_coverage);
     }
-    let overlay = overlay_of(workspace);
+    let overlay = workspace.analyzer().semantic_model_overlay();
     let mut external_reason = None;
     for base in &closure.external_bases {
         let ClassIdentity::External { symbol_id, .. } = base else {
@@ -2214,7 +2290,7 @@ fn member_lookup_with_surface_limit(
             workspace_member_lookup(workspace, language, kind, unit, member, max_nodes)
         }
         ClassIdentity::External { symbol_id, .. } => {
-            let Some(overlay) = overlay_of(workspace) else {
+            let Some(overlay) = workspace.analyzer().semantic_model_overlay() else {
                 return MemberLookup::Unknown(UnknownReason::ExternalNotModeled);
             };
             let modeled = external_member_lookup(&overlay, symbol_id, kind, member);
@@ -2309,6 +2385,15 @@ macro_rules! impl_js_ts_type_flow_adapter {
                 constant_class(workspace, $language, procedure, value)
             }
 
+            fn computed_class(
+                &self,
+                workspace: &WorkspaceAnalyzer,
+                procedure: &ProcedureHandle,
+                value: &SemanticValue,
+            ) -> ClassSeed {
+                computed_class(workspace, $language, procedure, value)
+            }
+
             fn allocation_class(
                 &self,
                 workspace: &WorkspaceAnalyzer,
@@ -2380,53 +2465,26 @@ impl_js_ts_type_flow_adapter!(
     JavascriptSupport,
     Language::JavaScript,
     "javascript-type-flow",
-    b"javascript-type-flow-closed-surface-v4"
+    b"javascript-type-flow-closed-surface-v6"
 );
 impl_js_ts_type_flow_adapter!(
     TypescriptSupport,
     Language::TypeScript,
     "typescript-type-flow",
-    b"typescript-type-flow-closed-surface-v4"
+    b"typescript-type-flow-closed-surface-v6"
 );
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::analyzer::semantic::{CancellationToken, SemanticBudget, SemanticRequest};
+    use crate::analyzer::semantic::{
+        CancellationToken, CandidateCoverage, SemanticBudget, SemanticRequest,
+    };
     use crate::analyzer::{AnalyzerConfig, OverlayProject, Project};
     use crate::inline_project::InlineTestProject;
-    use tree_sitter::{Parser, Tree};
-
-    fn parse_javascript(source: &str) -> Tree {
-        let mut parser = Parser::new();
-        parser
-            .set_language(&tree_sitter_javascript::LANGUAGE.into())
-            .expect("JavaScript grammar");
-        parser.parse(source, None).expect("JavaScript tree")
-    }
-
-    fn parse_typescript(source: &str) -> Tree {
-        let mut parser = Parser::new();
-        parser
-            .set_language(&tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into())
-            .expect("TypeScript grammar");
-        parser.parse(source, None).expect("TypeScript tree")
-    }
-
-    fn first_kind<'tree>(root: Node<'tree>, kind: &str) -> Node<'tree> {
-        let mut stack = vec![root];
-        while let Some(node) = stack.pop() {
-            if node.kind() == kind {
-                return node;
-            }
-            for index in (0..node.named_child_count()).rev() {
-                if let Some(child) = node.named_child(index) {
-                    stack.push(child);
-                }
-            }
-        }
-        panic!("missing {kind}")
-    }
+    use brokk_bifrost_test_macros::hardwon;
+    use std::path::Path;
+    use tree_sitter::Tree;
 
     fn active_import_is_value(source: &str) -> bool {
         let tree = parse_typescript(source);
@@ -2436,55 +2494,19 @@ mod tests {
         ranges.len() == 1 && active_binding_is_value_import(tree.root_node(), ranges[0])
     }
 
-    #[test]
-    fn constructor_import_proof_rejects_shadow_and_type_only_bindings() {
-        assert!(active_import_is_value("import { C } from './c'; new C();"));
-        assert!(!active_import_is_value(
-            "import type { C } from './c'; new C();"
-        ));
-        assert!(!active_import_is_value(
-            "import { C } from './c'; function root(C: unknown) { new C(); }"
-        ));
+    fn parse_javascript(source: &str) -> Tree {
+        brokk_bifrost_js_ts::test_support::parse_javascript(source)
     }
 
-    #[test]
-    fn derived_class_detection_handles_both_grammar_shapes() {
-        let javascript = parse_javascript("class Base {} class Child extends Base {}");
-        let typescript = parse_typescript(
-            "interface Shape {} class Base {} class Child extends Base implements Shape {}",
-        );
-        let js_child = first_kind(javascript.root_node(), "class_heritage")
-            .parent()
-            .expect("heritage has class parent");
-        let ts_child = first_kind(typescript.root_node(), "extends_clause")
-            .parent()
-            .expect("extends has heritage parent")
-            .parent()
-            .expect("heritage has class parent");
-
-        assert!(class_is_derived(js_child));
-        assert!(class_is_derived(ts_child));
+    fn parse_typescript(source: &str) -> Tree {
+        brokk_bifrost_js_ts::test_support::parse_typescript(source)
     }
 
-    #[test]
-    fn malformed_classes_and_ambient_files_cannot_support_exactness() {
-        let malformed = parse_javascript("class Broken { constructor(,) {} }");
-        let class = first_kind(malformed.root_node(), "class_declaration");
-        assert!(!syntax_is_complete(class));
-        let ambient = parse_typescript("declare class Ambient {}");
-        let ambient_class = first_kind(ambient.root_node(), "class_declaration");
-
-        for path in [
-            "types/widget.d.ts",
-            "types/widget.d.mts",
-            "types/widget.d.cts",
-        ] {
-            assert!(is_typescript_declaration_path(Path::new(path)), "{path}");
-        }
-        assert!(!is_typescript_declaration_path(Path::new(
-            "types/widget.ts"
-        )));
-        assert!(declaration_is_ambient(ambient_class));
+    fn first_kind<'tree>(root: Node<'tree>, kind: &str) -> Node<'tree> {
+        brokk_bifrost_core::analyzer::tree_walk::first_named_descendant_of_kind_inclusive(
+            root, kind,
+        )
+        .unwrap_or_else(|| panic!("missing {kind}"))
     }
 
     #[test]
@@ -2509,6 +2531,170 @@ mod tests {
     }
 
     #[test]
+    fn member_surface_survey_runs_once_per_request_and_resurveys_after_overlay_edit() {
+        const CLOSED: &str = "class Surface {}\n";
+        const OPEN: &str = "class Surface { [globalThis.key]() {} }\n";
+
+        for (language, path) in [
+            (Language::JavaScript, "app.js"),
+            (Language::TypeScript, "app.ts"),
+        ] {
+            let project = InlineTestProject::with_language(language)
+                .file(path, CLOSED)
+                .build();
+            let disk_workspace = project.workspace_analyzer(AnalyzerConfig::default());
+            let live = Arc::new(OverlayProject::new(project.project_dyn()));
+            let live_project: Arc<dyn Project> = live.clone();
+            let workspace = disk_workspace.clone_with_project(live_project);
+            let class = workspace
+                .analyzer()
+                .get_definitions("Surface")
+                .into_iter()
+                .find(CodeUnit::is_class)
+                .map(ClassIdentity::Workspace)
+                .expect("fixture has one Surface class");
+
+            let first_scope = AnalyzerQueryScope::new(workspace.analyzer());
+            let first_request =
+                member_surface_request(&workspace, language, MAX_JS_TS_MEMBER_SURFACE_NODES)
+                    .expect("an explicit query scope owns the JS/TS surface memo");
+            let first = member_lookup(&workspace, language, MemberAccessKind::Call, &class, "nope");
+            let repeated =
+                member_lookup(&workspace, language, MemberAccessKind::Call, &class, "nope");
+            assert_eq!(first, MemberLookup::Absent);
+            assert_eq!(repeated, first);
+            assert_eq!(first_request.memo.survey_count(), 1);
+            drop(first_scope);
+
+            assert!(live.set(project.file(path).abs_path(), OPEN.to_owned()));
+            let second_scope = AnalyzerQueryScope::new(workspace.analyzer());
+            let second_request =
+                member_surface_request(&workspace, language, MAX_JS_TS_MEMBER_SURFACE_NODES)
+                    .expect("the new query scope owns a fresh JS/TS surface memo");
+            assert_ne!(
+                second_request.key.language_content, first_request.key.language_content,
+                "an overlay edit must rotate prepared-syntax identity"
+            );
+            assert!(!Arc::ptr_eq(&first_request.memo, &second_request.memo));
+            assert_eq!(
+                member_lookup(&workspace, language, MemberAccessKind::Call, &class, "nope",),
+                MemberLookup::Unknown(UnknownReason::UncertainFlow)
+            );
+            assert_eq!(second_request.memo.survey_count(), 1);
+            drop(second_scope);
+        }
+    }
+
+    fn assert_prepared_revision_guard(
+        language: Language,
+        path: &str,
+        original: &str,
+        changed: &str,
+    ) {
+        let project = InlineTestProject::with_language(language)
+            .file(path, original)
+            .build();
+        let file = project.file(path);
+        let workspace = project.workspace_analyzer(AnalyzerConfig::default());
+        let cancellation = CancellationToken::default();
+        let mut budget = SemanticBudget::default();
+        let artifact = workspace
+            .materialize_program_semantics(
+                &file,
+                &mut SemanticRequest::new(&mut budget, &cancellation),
+            )
+            .expect("JS/TS semantic materialization succeeds")
+            .available_value()
+            .cloned()
+            .expect("JS/TS semantic artifact is available");
+        let procedure = artifact
+            .procedures()
+            .first()
+            .and_then(|procedure| artifact.procedure_handle(procedure.id()))
+            .expect("fixture has one procedure");
+
+        assert!(prepared_for_procedure(&workspace, language, &procedure, &file).is_ok());
+
+        std::fs::write(file.abs_path(), changed).expect("change fixture content");
+        let changed_workspace = project.workspace_analyzer(AnalyzerConfig::default());
+        assert_eq!(
+            prepared_for_procedure(&changed_workspace, language, &procedure, &file)
+                .expect_err("changed content cannot validate an old artifact"),
+            UnknownReason::UncertainFlow
+        );
+    }
+
+    #[test]
+    fn prepared_syntax_validator_rejects_changed_javascript_and_typescript_content() {
+        assert_prepared_revision_guard(
+            Language::JavaScript,
+            "app.js",
+            "function target() { return 1; }\n",
+            "function target() { return 2; }\n",
+        );
+        assert_prepared_revision_guard(
+            Language::TypeScript,
+            "app.ts",
+            "function target(): number { return 1; }\n",
+            "function target(): number { return 2; }\n",
+        );
+    }
+    #[test]
+    #[hardwon("3c0f4c55d0fb: a shadowed or type-only import must not prove a runtime constructor")]
+    fn constructor_import_proof_rejects_shadow_and_type_only_bindings() {
+        assert!(active_import_is_value("import { C } from './c'; new C();"));
+        assert!(!active_import_is_value(
+            "import type { C } from './c'; new C();"
+        ));
+        assert!(!active_import_is_value(
+            "import { C } from './c'; function root(C: unknown) { new C(); }"
+        ));
+    }
+
+    #[test]
+    #[hardwon("3c0f4c55d0fb: JS and TS class heritage use different grammar shapes")]
+    fn derived_class_detection_handles_both_grammar_shapes() {
+        let javascript = parse_javascript("class Base {} class Child extends Base {}");
+        let typescript = parse_typescript(
+            "interface Shape {} class Base {} class Child extends Base implements Shape {}",
+        );
+        let js_child = first_kind(javascript.root_node(), "class_heritage")
+            .parent()
+            .expect("heritage has class parent");
+        let ts_child = first_kind(typescript.root_node(), "extends_clause")
+            .parent()
+            .expect("extends has heritage parent")
+            .parent()
+            .expect("heritage has class parent");
+
+        assert!(class_is_derived(js_child));
+        assert!(class_is_derived(ts_child));
+    }
+
+    #[test]
+    #[hardwon("3c0f4c55d0fb: ambient or malformed classes must not prove runtime exactness")]
+    fn malformed_classes_and_ambient_files_cannot_support_exactness() {
+        let malformed = parse_javascript("class Broken { constructor(,) {} }");
+        let class = first_kind(malformed.root_node(), "class_declaration");
+        assert!(!syntax_is_complete(class));
+        let ambient = parse_typescript("declare class Ambient {}");
+        let ambient_class = first_kind(ambient.root_node(), "class_declaration");
+
+        for path in [
+            "types/widget.d.ts",
+            "types/widget.d.mts",
+            "types/widget.d.cts",
+        ] {
+            assert!(is_typescript_declaration_path(Path::new(path)), "{path}");
+        }
+        assert!(!is_typescript_declaration_path(Path::new(
+            "types/widget.ts"
+        )));
+        assert!(declaration_is_ambient(ambient_class));
+    }
+
+    #[test]
+    #[hardwon("26cea49c2589: static members and constructors are not instance methods")]
     fn only_ordinary_instance_methods_are_positive_workspace_members() {
         for (source, expected) in [
             ("class C { run() {} }", true),
@@ -2621,61 +2807,9 @@ mod tests {
     }
 
     #[test]
-    fn member_surface_survey_runs_once_per_request_and_resurveys_after_overlay_edit() {
-        const CLOSED: &str = "class Surface {}\n";
-        const OPEN: &str = "class Surface { [globalThis.key]() {} }\n";
-
-        for (language, path) in [
-            (Language::JavaScript, "app.js"),
-            (Language::TypeScript, "app.ts"),
-        ] {
-            let project = InlineTestProject::with_language(language)
-                .file(path, CLOSED)
-                .build();
-            let disk_workspace = project.workspace_analyzer(AnalyzerConfig::default());
-            let live = Arc::new(OverlayProject::new(project.project_dyn()));
-            let live_project: Arc<dyn Project> = live.clone();
-            let workspace = disk_workspace.clone_with_project(live_project);
-            let class = workspace
-                .analyzer()
-                .get_definitions("Surface")
-                .into_iter()
-                .find(CodeUnit::is_class)
-                .map(ClassIdentity::Workspace)
-                .expect("fixture has one Surface class");
-
-            let first_scope = AnalyzerQueryScope::new(workspace.analyzer());
-            let first_request =
-                member_surface_request(&workspace, language, MAX_JS_TS_MEMBER_SURFACE_NODES)
-                    .expect("an explicit query scope owns the JS/TS surface memo");
-            let first = member_lookup(&workspace, language, MemberAccessKind::Call, &class, "nope");
-            let repeated =
-                member_lookup(&workspace, language, MemberAccessKind::Call, &class, "nope");
-            assert_eq!(first, MemberLookup::Absent);
-            assert_eq!(repeated, first);
-            assert_eq!(first_request.memo.survey_count(), 1);
-            drop(first_scope);
-
-            assert!(live.set(project.file(path).abs_path(), OPEN.to_owned()));
-            let second_scope = AnalyzerQueryScope::new(workspace.analyzer());
-            let second_request =
-                member_surface_request(&workspace, language, MAX_JS_TS_MEMBER_SURFACE_NODES)
-                    .expect("the new query scope owns a fresh JS/TS surface memo");
-            assert_ne!(
-                second_request.key.language_content, first_request.key.language_content,
-                "an overlay edit must rotate prepared-syntax identity"
-            );
-            assert!(!Arc::ptr_eq(&first_request.memo, &second_request.memo));
-            assert_eq!(
-                member_lookup(&workspace, language, MemberAccessKind::Call, &class, "nope",),
-                MemberLookup::Unknown(UnknownReason::UncertainFlow)
-            );
-            assert_eq!(second_request.memo.survey_count(), 1);
-            drop(second_scope);
-        }
-    }
-
-    #[test]
+    #[hardwon(
+        "26cea49c2589: qualified TypeScript class annotations must retain their declaration identity"
+    )]
     fn qualified_typescript_class_annotation_retains_its_direct_class() {
         let source = "namespace Domain { export class Declared {} }\nexport function root(value: Domain.Declared) { return value; }\n";
         let project = InlineTestProject::with_language(Language::TypeScript)
@@ -2714,60 +2848,5 @@ mod tests {
             panic!("qualified annotation must retain its direct class: {seed:?}")
         };
         assert_eq!(identity.qualified_name(), "Domain.Declared");
-    }
-
-    fn assert_prepared_revision_guard(
-        language: Language,
-        path: &str,
-        original: &str,
-        changed: &str,
-    ) {
-        let project = InlineTestProject::with_language(language)
-            .file(path, original)
-            .build();
-        let file = project.file(path);
-        let workspace = project.workspace_analyzer(AnalyzerConfig::default());
-        let cancellation = CancellationToken::default();
-        let mut budget = SemanticBudget::default();
-        let artifact = workspace
-            .materialize_program_semantics(
-                &file,
-                &mut SemanticRequest::new(&mut budget, &cancellation),
-            )
-            .expect("JS/TS semantic materialization succeeds")
-            .available_value()
-            .cloned()
-            .expect("JS/TS semantic artifact is available");
-        let procedure = artifact
-            .procedures()
-            .first()
-            .and_then(|procedure| artifact.procedure_handle(procedure.id()))
-            .expect("fixture has one procedure");
-
-        assert!(prepared_for_procedure(&workspace, language, &procedure, &file).is_ok());
-
-        std::fs::write(file.abs_path(), changed).expect("change fixture content");
-        let changed_workspace = project.workspace_analyzer(AnalyzerConfig::default());
-        assert_eq!(
-            prepared_for_procedure(&changed_workspace, language, &procedure, &file)
-                .expect_err("changed content cannot validate an old artifact"),
-            UnknownReason::UncertainFlow
-        );
-    }
-
-    #[test]
-    fn prepared_syntax_validator_rejects_changed_javascript_and_typescript_content() {
-        assert_prepared_revision_guard(
-            Language::JavaScript,
-            "app.js",
-            "function target() { return 1; }\n",
-            "function target() { return 2; }\n",
-        );
-        assert_prepared_revision_guard(
-            Language::TypeScript,
-            "app.ts",
-            "function target(): number { return 1; }\n",
-            "function target(): number { return 2; }\n",
-        );
     }
 }

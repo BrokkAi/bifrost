@@ -1,0 +1,478 @@
+{
+  "schema_version": 2,
+  "pack_id": "bifrost.rust-web-response",
+  "version": "0.1.0",
+  "producer": {
+    "name": "bifrost-reviewed-rust-codeql-parity-models",
+    "version": "0.1.0"
+  },
+  "language": "rust",
+  "ecosystem": "cargo",
+  "compatibility": {
+    "bifrost": ">=0.12.0, <1.0.0",
+    "toolchains": []
+  },
+  "provenance": {
+    "source": "Reviewed Rust response-body API-shape stubs for CodeQL rust/xss: Actix web::Html, Warp reply::html, Axum response::Html, and HTTP Response constructors and builder body.",
+    "revision": "api-shape; CodeQL ae741615f3e178ce61289a651790dc67fcc18e19"
+  },
+  "license": "Apache-2.0",
+  "completeness": "complete",
+  "safety": {
+    "generated_code_only": false,
+    "review_required": false
+  },
+  "shards": [
+    {
+      "id": "declarations.bifrost.rust-web-response",
+      "activation": [
+        {
+          "targets": [],
+          "configurations": []
+        }
+      ],
+      "payload": {
+        "kind": "declaration_facts",
+        "types": [
+          {
+            "id": "type.rust-codeql.actix-web",
+            "name": "actix_web",
+            "type_kind": "module",
+            "visibility": "public",
+            "locator": {
+              "kind": "artifact",
+              "path": "src/api.rs",
+              "symbol": "actix_web"
+            }
+          },
+          {
+            "id": "type.rust-codeql.actix-web-web",
+            "name": "actix_web.web",
+            "type_kind": "module",
+            "visibility": "public",
+            "locator": {
+              "kind": "artifact",
+              "path": "src/api.rs",
+              "symbol": "actix_web.web"
+            }
+          },
+          {
+            "id": "type.rust-codeql.actix-web-web-html",
+            "name": "actix_web.web.Html",
+            "type_kind": "struct",
+            "visibility": "public",
+            "locator": {
+              "kind": "artifact",
+              "path": "src/api.rs",
+              "symbol": "actix_web.web.Html"
+            }
+          },
+          {
+            "id": "type.rust-codeql.warp",
+            "name": "warp",
+            "type_kind": "module",
+            "visibility": "public",
+            "locator": {
+              "kind": "artifact",
+              "path": "src/api.rs",
+              "symbol": "warp"
+            }
+          },
+          {
+            "id": "type.rust-codeql.warp-reply",
+            "name": "warp.reply",
+            "type_kind": "module",
+            "visibility": "public",
+            "locator": {
+              "kind": "artifact",
+              "path": "src/api.rs",
+              "symbol": "warp.reply"
+            }
+          },
+          {
+            "id": "type.rust-codeql.axum",
+            "name": "axum",
+            "type_kind": "module",
+            "visibility": "public",
+            "locator": {
+              "kind": "artifact",
+              "path": "src/api.rs",
+              "symbol": "axum"
+            }
+          },
+          {
+            "id": "type.rust-codeql.axum-response",
+            "name": "axum.response",
+            "type_kind": "module",
+            "visibility": "public",
+            "locator": {
+              "kind": "artifact",
+              "path": "src/api.rs",
+              "symbol": "axum.response"
+            }
+          },
+          {
+            "id": "type.rust-codeql.axum-response-html",
+            "name": "axum.response.Html",
+            "type_kind": "struct",
+            "visibility": "public",
+            "locator": {
+              "kind": "artifact",
+              "path": "src/api.rs",
+              "symbol": "axum.response.Html"
+            }
+          },
+          {
+            "id": "type.rust-codeql.http",
+            "name": "http",
+            "type_kind": "module",
+            "visibility": "public",
+            "locator": {
+              "kind": "artifact",
+              "path": "src/api.rs",
+              "symbol": "http"
+            }
+          },
+          {
+            "id": "type.rust-codeql.http-response",
+            "name": "http.Response",
+            "type_kind": "struct",
+            "visibility": "public",
+            "locator": {
+              "kind": "artifact",
+              "path": "src/api.rs",
+              "symbol": "http.Response"
+            }
+          },
+          {
+            "id": "type.rust-codeql.http-response-builder",
+            "name": "http.ResponseBuilder",
+            "type_kind": "struct",
+            "visibility": "public",
+            "locator": {
+              "kind": "artifact",
+              "path": "src/api.rs",
+              "symbol": "http.ResponseBuilder"
+            }
+          }
+        ],
+        "members": [
+          {
+            "id": "member.rust-codeql.actix-web-web-html-new",
+            "owner": "type.rust-codeql.actix-web-web-html",
+            "name": "new",
+            "member_kind": "method",
+            "visibility": "public",
+            "is_static": true,
+            "callable_family_complete": true,
+            "signature": {
+              "parameters": [
+                {
+                  "name": "body",
+                  "type": {
+                    "kind": "named",
+                    "name": "untyped"
+                  }
+                }
+              ],
+              "returns": {
+                "kind": "named",
+                "name": "actix_web.web.Html"
+              }
+            },
+            "locator": {
+              "kind": "artifact",
+              "path": "src/api.rs",
+              "symbol": "actix_web.web.Html.new"
+            }
+          },
+          {
+            "id": "member.rust-codeql.warp-reply-html",
+            "owner": "type.rust-codeql.warp-reply",
+            "name": "html",
+            "member_kind": "function",
+            "visibility": "public",
+            "is_static": true,
+            "callable_family_complete": true,
+            "signature": {
+              "parameters": [
+                {
+                  "name": "body",
+                  "type": {
+                    "kind": "named",
+                    "name": "untyped"
+                  }
+                }
+              ],
+              "returns": {
+                "kind": "named",
+                "name": "untyped"
+              }
+            },
+            "locator": {
+              "kind": "artifact",
+              "path": "src/api.rs",
+              "symbol": "warp.reply.html"
+            }
+          },
+          {
+            "id": "member.rust-codeql.axum-response-html",
+            "owner": "type.rust-codeql.axum-response",
+            "name": "Html",
+            "member_kind": "constructor",
+            "visibility": "public",
+            "is_static": true,
+            "callable_family_complete": true,
+            "signature": {
+              "parameters": [
+                {
+                  "name": "body",
+                  "type": {
+                    "kind": "named",
+                    "name": "untyped"
+                  }
+                }
+              ],
+              "returns": {
+                "kind": "named",
+                "name": "axum.response.Html"
+              }
+            },
+            "locator": {
+              "kind": "artifact",
+              "path": "src/api.rs",
+              "symbol": "axum.response.Html"
+            }
+          },
+          {
+            "id": "member.rust-codeql.http-response-new",
+            "owner": "type.rust-codeql.http-response",
+            "name": "new",
+            "member_kind": "method",
+            "visibility": "public",
+            "is_static": true,
+            "callable_family_complete": true,
+            "signature": {
+              "parameters": [
+                {
+                  "name": "body",
+                  "type": {
+                    "kind": "named",
+                    "name": "untyped"
+                  }
+                }
+              ],
+              "returns": {
+                "kind": "named",
+                "name": "http.Response"
+              }
+            },
+            "locator": {
+              "kind": "artifact",
+              "path": "src/api.rs",
+              "symbol": "http.Response.new"
+            }
+          },
+          {
+            "id": "member.rust-codeql.http-response-builder",
+            "owner": "type.rust-codeql.http-response",
+            "name": "builder",
+            "member_kind": "method",
+            "visibility": "public",
+            "is_static": true,
+            "callable_family_complete": true,
+            "signature": {
+              "parameters": [],
+              "returns": {
+                "kind": "named",
+                "name": "http.ResponseBuilder"
+              }
+            },
+            "locator": {
+              "kind": "artifact",
+              "path": "src/api.rs",
+              "symbol": "http.Response.builder"
+            }
+          },
+          {
+            "id": "member.rust-codeql.http-response-builder-body",
+            "owner": "type.rust-codeql.http-response-builder",
+            "name": "body",
+            "member_kind": "method",
+            "visibility": "public",
+            "is_static": false,
+            "callable_family_complete": true,
+            "signature": {
+              "parameters": [
+                {
+                  "name": "body",
+                  "type": {
+                    "kind": "named",
+                    "name": "untyped"
+                  }
+                }
+              ],
+              "returns": {
+                "kind": "named",
+                "name": "http.Response"
+              }
+            },
+            "locator": {
+              "kind": "artifact",
+              "path": "src/api.rs",
+              "symbol": "http.ResponseBuilder.body"
+            }
+          }
+        ],
+        "relations": []
+      }
+    },
+    {
+      "id": "summaries.bifrost.rust-web-response",
+      "activation": [
+        {
+          "targets": [],
+          "configurations": []
+        }
+      ],
+      "payload": {
+        "kind": "procedure_summaries",
+        "summaries": [
+          {
+            "id": "summary.rust-codeql.actix-web-web-html-new",
+            "target": {
+              "path": "src/api.rs",
+              "symbol": "actix_web.web.Html.new",
+              "has_receiver": false,
+              "parameter_count": 1
+            },
+            "completeness": "complete",
+            "locations": [],
+            "transfers": [
+              {
+                "input": {
+                  "kind": "parameter",
+                  "ordinal": 0
+                },
+                "exit_kind": "normal",
+                "output": {
+                  "kind": "normal_return"
+                }
+              }
+            ],
+            "effects": []
+          },
+          {
+            "id": "summary.rust-codeql.warp-reply-html",
+            "target": {
+              "path": "src/api.rs",
+              "symbol": "warp.reply.html",
+              "has_receiver": false,
+              "parameter_count": 1
+            },
+            "completeness": "complete",
+            "locations": [],
+            "transfers": [
+              {
+                "input": {
+                  "kind": "parameter",
+                  "ordinal": 0
+                },
+                "exit_kind": "normal",
+                "output": {
+                  "kind": "normal_return"
+                }
+              }
+            ],
+            "effects": []
+          },
+          {
+            "id": "summary.rust-codeql.axum-response-html",
+            "target": {
+              "path": "src/api.rs",
+              "symbol": "axum.response.Html",
+              "has_receiver": false,
+              "parameter_count": 1
+            },
+            "completeness": "complete",
+            "locations": [],
+            "transfers": [
+              {
+                "input": {
+                  "kind": "parameter",
+                  "ordinal": 0
+                },
+                "exit_kind": "normal",
+                "output": {
+                  "kind": "normal_return"
+                }
+              }
+            ],
+            "effects": []
+          },
+          {
+            "id": "summary.rust-codeql.http-response-new",
+            "target": {
+              "path": "src/api.rs",
+              "symbol": "http.Response.new",
+              "has_receiver": false,
+              "parameter_count": 1
+            },
+            "completeness": "complete",
+            "locations": [],
+            "transfers": [
+              {
+                "input": {
+                  "kind": "parameter",
+                  "ordinal": 0
+                },
+                "exit_kind": "normal",
+                "output": {
+                  "kind": "normal_return"
+                }
+              }
+            ],
+            "effects": []
+          },
+          {
+            "id": "summary.rust-codeql.http-response-builder",
+            "target": {
+              "path": "src/api.rs",
+              "symbol": "http.Response.builder",
+              "has_receiver": false,
+              "parameter_count": 0
+            },
+            "completeness": "complete",
+            "locations": [],
+            "transfers": [],
+            "effects": []
+          },
+          {
+            "id": "summary.rust-codeql.http-response-builder-body",
+            "target": {
+              "path": "src/api.rs",
+              "symbol": "http.ResponseBuilder.body",
+              "has_receiver": true,
+              "parameter_count": 1
+            },
+            "completeness": "complete",
+            "locations": [],
+            "transfers": [
+              {
+                "input": {
+                  "kind": "parameter",
+                  "ordinal": 0
+                },
+                "exit_kind": "normal",
+                "output": {
+                  "kind": "normal_return"
+                }
+              }
+            ],
+            "effects": []
+          }
+        ]
+      }
+    }
+  ]
+}

@@ -12,8 +12,8 @@ use std::collections::HashMap;
 
 use crate::analyzer::semantic::{
     CancellationToken, IcfgEdgeId, IcfgEdgeKind, IcfgNodeId, IcfgProvider, IcfgSnapshot,
-    IcfgSnapshotLimits, ProcedureHandle, ProgramPointHandle, SemanticBudget, SemanticProviderError,
-    SemanticRequest, SemanticWork,
+    IcfgSnapshotLimits, ProcedureHandle, ProgramPointHandle, SemanticBudget, SemanticOutcome,
+    SemanticProviderError, SemanticRequest, SemanticWork,
 };
 
 use super::{
@@ -304,7 +304,11 @@ where
     Fact: Copy + Eq + std::hash::Hash,
 {
     fn should_continue(&self) -> bool {
-        !self.cancellation.is_cancelled() && self.invalid_point.is_none() && self.exceeded.is_none()
+        super::should_continue(
+            self.cancellation,
+            self.invalid_point.is_some(),
+            self.exceeded.is_some(),
+        )
     }
 
     fn emit(&mut self, demand: BackwardSnapshotDemand<Fact>) -> bool {
@@ -478,13 +482,33 @@ where
     P: BackwardSnapshotProblem,
     Provider: IcfgProvider + ?Sized,
 {
-    let mut semantic_request = SemanticRequest::new(semantic_budget, request.cancellation);
-    let outcome = provider.snapshot(root, limits, &mut semantic_request)?;
-    let status = IcfgInputStatus::from_outcome(&outcome);
+    let outcome = acquire_backward_snapshot(
+        root,
+        limits,
+        provider,
+        semantic_budget,
+        request.cancellation,
+    )?;
     let semantic_work = outcome.work();
-    outcome
-        .available_value()
-        .ok_or(BackwardSnapshotDataflowError::MissingIcfgSnapshot { status })?;
     let input = IcfgSolveInput::try_from(&outcome).expect("the retained snapshot is available");
     solve_backward_demands_on_snapshot(input, problem, semantic_work, request)
+}
+
+pub(crate) fn acquire_backward_snapshot<Provider>(
+    root: &ProcedureHandle,
+    limits: IcfgSnapshotLimits,
+    provider: &Provider,
+    semantic_budget: &mut SemanticBudget,
+    cancellation: &CancellationToken,
+) -> Result<SemanticOutcome<IcfgSnapshot>, BackwardSnapshotDataflowError>
+where
+    Provider: IcfgProvider + ?Sized,
+{
+    let mut semantic_request = SemanticRequest::new(semantic_budget, cancellation);
+    let outcome = provider.snapshot(root, limits, &mut semantic_request)?;
+    let status = IcfgInputStatus::from_outcome(&outcome);
+    if outcome.available_value().is_none() {
+        return Err(BackwardSnapshotDataflowError::MissingIcfgSnapshot { status });
+    }
+    Ok(outcome)
 }

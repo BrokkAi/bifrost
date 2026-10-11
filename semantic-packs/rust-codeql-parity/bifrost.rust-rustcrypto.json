@@ -1,0 +1,608 @@
+{
+  "schema_version": 2,
+  "pack_id": "bifrost.rust-rustcrypto",
+  "version": "0.1.0",
+  "producer": {
+    "name": "bifrost-reviewed-rustcrypto-models",
+    "version": "0.1.0"
+  },
+  "language": "rust",
+  "ecosystem": "cargo",
+  "compatibility": {
+    "bifrost": ">=0.12.0, <1.0.0",
+    "toolchains": []
+  },
+  "provenance": {
+    "source": "RustCrypto API shapes used by the CQ10 identity and hasher-input fixtures.",
+    "revision": "api-shape"
+  },
+  "license": "Apache-2.0",
+  "completeness": "complete",
+  "safety": {
+    "generated_code_only": false,
+    "review_required": false
+  },
+  "shards": [
+    {
+      "id": "declarations.rustcrypto",
+      "activation": [
+        {
+          "targets": [],
+          "configurations": []
+        }
+      ],
+      "payload": {
+        "kind": "declaration_facts",
+        "types": [
+          {
+            "id": "type.rustcrypto.cbc",
+            "name": "cbc",
+            "type_kind": "module",
+            "visibility": "public",
+            "locator": {
+              "kind": "artifact",
+              "path": "src/cbc.rs",
+              "symbol": "cbc"
+            }
+          },
+          {
+            "id": "type.rustcrypto.cbc-encryptor",
+            "name": "cbc.Encryptor",
+            "type_kind": "struct",
+            "visibility": "public",
+            "locator": {
+              "kind": "artifact",
+              "path": "src/cbc.rs",
+              "symbol": "cbc.Encryptor"
+            }
+          },
+          {
+            "id": "type.rustcrypto.des",
+            "name": "des",
+            "type_kind": "module",
+            "visibility": "public",
+            "locator": {
+              "kind": "artifact",
+              "path": "src/des.rs",
+              "symbol": "des"
+            }
+          },
+          {
+            "id": "type.rustcrypto.des-des",
+            "name": "des.Des",
+            "type_kind": "struct",
+            "visibility": "public",
+            "locator": {
+              "kind": "artifact",
+              "path": "src/des.rs",
+              "symbol": "des.Des"
+            }
+          },
+          {
+            "id": "type.rustcrypto.aes",
+            "name": "aes",
+            "type_kind": "module",
+            "visibility": "public",
+            "locator": {
+              "kind": "artifact",
+              "path": "src/aes.rs",
+              "symbol": "aes"
+            }
+          },
+          {
+            "id": "type.rustcrypto.aes-aes256",
+            "name": "aes.Aes256",
+            "type_kind": "struct",
+            "visibility": "public",
+            "locator": {
+              "kind": "artifact",
+              "path": "src/aes.rs",
+              "symbol": "aes.Aes256"
+            }
+          },
+          {
+            "id": "type.rustcrypto.md5",
+            "name": "md5",
+            "type_kind": "module",
+            "visibility": "public",
+            "locator": {
+              "kind": "artifact",
+              "path": "src/md5.rs",
+              "symbol": "md5"
+            }
+          },
+          {
+            "id": "type.rustcrypto.md5-md5",
+            "name": "md5.Md5",
+            "type_kind": "struct",
+            "visibility": "public",
+            "locator": {
+              "kind": "artifact",
+              "path": "src/md5.rs",
+              "symbol": "md5.Md5"
+            }
+          },
+          {
+            "id": "type.rustcrypto.sha1",
+            "name": "sha1",
+            "type_kind": "module",
+            "visibility": "public",
+            "locator": {
+              "kind": "artifact",
+              "path": "src/sha1.rs",
+              "symbol": "sha1"
+            }
+          },
+          {
+            "id": "type.rustcrypto.sha1-sha1",
+            "name": "sha1.Sha1",
+            "type_kind": "struct",
+            "visibility": "public",
+            "locator": {
+              "kind": "artifact",
+              "path": "src/sha1.rs",
+              "symbol": "sha1.Sha1"
+            }
+          },
+          {
+            "id": "type.rustcrypto.sha3",
+            "name": "sha3",
+            "type_kind": "module",
+            "visibility": "public",
+            "locator": {
+              "kind": "artifact",
+              "path": "src/sha3.rs",
+              "symbol": "sha3"
+            }
+          },
+          {
+            "id": "type.rustcrypto.sha3-sha3-256",
+            "name": "sha3.Sha3_256",
+            "type_kind": "struct",
+            "visibility": "public",
+            "locator": {
+              "kind": "artifact",
+              "path": "src/sha3.rs",
+              "symbol": "sha3.Sha3_256"
+            }
+          }
+        ],
+        "members": [
+          {
+            "id": "member.rustcrypto.cbc-encryptor-new",
+            "owner": "type.rustcrypto.cbc-encryptor",
+            "name": "new",
+            "member_kind": "method",
+            "visibility": "public",
+            "is_static": true,
+            "callable_family_complete": true,
+            "signature": {
+              "parameters": [
+                { "name": "key", "type": { "kind": "named", "name": "untyped" } },
+                { "name": "iv", "type": { "kind": "named", "name": "untyped" } }
+              ],
+              "returns": { "kind": "named", "name": "cbc.Encryptor" }
+            },
+            "locator": {
+              "kind": "artifact",
+              "path": "src/cbc.rs",
+              "symbol": "cbc.Encryptor.new"
+            }
+          },
+          {
+            "id": "member.rustcrypto.md5-new",
+            "owner": "type.rustcrypto.md5-md5",
+            "name": "new",
+            "member_kind": "method",
+            "visibility": "public",
+            "is_static": true,
+            "callable_family_complete": true,
+            "signature": {
+              "parameters": [],
+              "returns": { "kind": "named", "name": "md5.Md5" }
+            },
+            "locator": {
+              "kind": "artifact",
+              "path": "src/md5.rs",
+              "symbol": "md5.Md5.new"
+            }
+          },
+          {
+            "id": "member.rustcrypto.md5-update",
+            "owner": "type.rustcrypto.md5-md5",
+            "name": "update",
+            "member_kind": "method",
+            "visibility": "public",
+            "is_static": false,
+            "callable_family_complete": true,
+            "signature": {
+              "parameters": [
+                { "name": "input", "type": { "kind": "named", "name": "untyped" } }
+              ],
+              "returns": { "kind": "named", "name": "untyped" }
+            },
+            "locator": {
+              "kind": "artifact",
+              "path": "src/md5.rs",
+              "symbol": "md5.Md5.update"
+            }
+          },
+          {
+            "id": "member.rustcrypto.md5-finalize",
+            "owner": "type.rustcrypto.md5-md5",
+            "name": "finalize",
+            "member_kind": "method",
+            "visibility": "public",
+            "is_static": false,
+            "callable_family_complete": true,
+            "signature": {
+              "parameters": [],
+              "returns": { "kind": "named", "name": "untyped" }
+            },
+            "locator": {
+              "kind": "artifact",
+              "path": "src/md5.rs",
+              "symbol": "md5.Md5.finalize"
+            }
+          },
+          {
+            "id": "member.rustcrypto.md5-compute",
+            "owner": "type.rustcrypto.md5",
+            "name": "compute",
+            "member_kind": "method",
+            "visibility": "public",
+            "is_static": true,
+            "callable_family_complete": true,
+            "signature": {
+              "parameters": [
+                { "name": "input", "type": { "kind": "named", "name": "untyped" } }
+              ],
+              "returns": { "kind": "named", "name": "untyped" }
+            },
+            "locator": {
+              "kind": "artifact",
+              "path": "src/md5.rs",
+              "symbol": "md5.compute"
+            }
+          },
+          {
+            "id": "member.rustcrypto.sha1-new",
+            "owner": "type.rustcrypto.sha1-sha1",
+            "name": "new",
+            "member_kind": "method",
+            "visibility": "public",
+            "is_static": true,
+            "callable_family_complete": true,
+            "signature": {
+              "parameters": [],
+              "returns": { "kind": "named", "name": "sha1.Sha1" }
+            },
+            "locator": {
+              "kind": "artifact",
+              "path": "src/sha1.rs",
+              "symbol": "sha1.Sha1.new"
+            }
+          },
+          {
+            "id": "member.rustcrypto.sha1-update",
+            "owner": "type.rustcrypto.sha1-sha1",
+            "name": "update",
+            "member_kind": "method",
+            "visibility": "public",
+            "is_static": false,
+            "callable_family_complete": true,
+            "signature": {
+              "parameters": [
+                { "name": "input", "type": { "kind": "named", "name": "untyped" } }
+              ],
+              "returns": { "kind": "named", "name": "untyped" }
+            },
+            "locator": {
+              "kind": "artifact",
+              "path": "src/sha1.rs",
+              "symbol": "sha1.Sha1.update"
+            }
+          },
+          {
+            "id": "member.rustcrypto.sha1-finalize",
+            "owner": "type.rustcrypto.sha1-sha1",
+            "name": "finalize",
+            "member_kind": "method",
+            "visibility": "public",
+            "is_static": false,
+            "callable_family_complete": true,
+            "signature": {
+              "parameters": [],
+              "returns": { "kind": "named", "name": "untyped" }
+            },
+            "locator": {
+              "kind": "artifact",
+              "path": "src/sha1.rs",
+              "symbol": "sha1.Sha1.finalize"
+            }
+          },
+          {
+            "id": "member.rustcrypto.sha3-new",
+            "owner": "type.rustcrypto.sha3-sha3-256",
+            "name": "new",
+            "member_kind": "method",
+            "visibility": "public",
+            "is_static": true,
+            "callable_family_complete": true,
+            "signature": {
+              "parameters": [],
+              "returns": { "kind": "named", "name": "sha3.Sha3_256" }
+            },
+            "locator": {
+              "kind": "artifact",
+              "path": "src/sha3.rs",
+              "symbol": "sha3.Sha3_256.new"
+            }
+          },
+          {
+            "id": "member.rustcrypto.sha3-update",
+            "owner": "type.rustcrypto.sha3-sha3-256",
+            "name": "update",
+            "member_kind": "method",
+            "visibility": "public",
+            "is_static": false,
+            "callable_family_complete": true,
+            "signature": {
+              "parameters": [
+                { "name": "input", "type": { "kind": "named", "name": "untyped" } }
+              ],
+              "returns": { "kind": "named", "name": "untyped" }
+            },
+            "locator": {
+              "kind": "artifact",
+              "path": "src/sha3.rs",
+              "symbol": "sha3.Sha3_256.update"
+            }
+          },
+          {
+            "id": "member.rustcrypto.sha3-finalize",
+            "owner": "type.rustcrypto.sha3-sha3-256",
+            "name": "finalize",
+            "member_kind": "method",
+            "visibility": "public",
+            "is_static": false,
+            "callable_family_complete": true,
+            "signature": {
+              "parameters": [],
+              "returns": { "kind": "named", "name": "untyped" }
+            },
+            "locator": {
+              "kind": "artifact",
+              "path": "src/sha3.rs",
+              "symbol": "sha3.Sha3_256.finalize"
+            }
+          }
+        ],
+        "relations": []
+      }
+    },
+    {
+      "id": "summaries.rustcrypto",
+      "activation": [
+        {
+          "targets": [],
+          "configurations": []
+        }
+      ],
+      "payload": {
+        "kind": "procedure_summaries",
+        "summaries": [
+          {
+            "id": "summary.rustcrypto.cbc-encryptor-new",
+            "target": {
+              "path": "src/cbc.rs",
+              "symbol": "cbc.Encryptor.new",
+              "has_receiver": false,
+              "parameter_count": 2
+            },
+            "completeness": "complete",
+            "locations": [],
+            "transfers": [],
+            "effects": [
+              {
+                "kind": "allocation",
+                "event": "event.rustcrypto.cbc-encryptor-new.result",
+                "output": { "kind": "normal_return" }
+              }
+            ]
+          },
+          {
+            "id": "summary.rustcrypto.md5-new",
+            "target": {
+              "path": "src/md5.rs",
+              "symbol": "md5.Md5.new",
+              "has_receiver": false,
+              "parameter_count": 0
+            },
+            "completeness": "complete",
+            "locations": [],
+            "transfers": [],
+            "effects": [
+              {
+                "kind": "allocation",
+                "event": "event.rustcrypto.md5-new.result",
+                "output": { "kind": "normal_return" }
+              }
+            ]
+          },
+          {
+            "id": "summary.rustcrypto.md5-update",
+            "target": {
+              "path": "src/md5.rs",
+              "symbol": "md5.Md5.update",
+              "has_receiver": true,
+              "parameter_count": 1
+            },
+            "completeness": "complete",
+            "locations": [],
+            "transfers": [],
+            "effects": [
+              {
+                "kind": "allocation",
+                "event": "event.rustcrypto.md5-update.result",
+                "output": { "kind": "normal_return" }
+              }
+            ]
+          },
+          {
+            "id": "summary.rustcrypto.md5-finalize",
+            "target": {
+              "path": "src/md5.rs",
+              "symbol": "md5.Md5.finalize",
+              "has_receiver": true,
+              "parameter_count": 0
+            },
+            "completeness": "complete",
+            "locations": [],
+            "transfers": [],
+            "effects": [
+              {
+                "kind": "allocation",
+                "event": "event.rustcrypto.md5-finalize.result",
+                "output": { "kind": "normal_return" }
+              }
+            ]
+          },
+          {
+            "id": "summary.rustcrypto.md5-compute",
+            "target": {
+              "path": "src/md5.rs",
+              "symbol": "md5.compute",
+              "has_receiver": false,
+              "parameter_count": 1
+            },
+            "completeness": "complete",
+            "locations": [],
+            "transfers": [],
+            "effects": [
+              {
+                "kind": "allocation",
+                "event": "event.rustcrypto.md5-compute.result",
+                "output": { "kind": "normal_return" }
+              }
+            ]
+          },
+          {
+            "id": "summary.rustcrypto.sha1-new",
+            "target": {
+              "path": "src/sha1.rs",
+              "symbol": "sha1.Sha1.new",
+              "has_receiver": false,
+              "parameter_count": 0
+            },
+            "completeness": "complete",
+            "locations": [],
+            "transfers": [],
+            "effects": [
+              {
+                "kind": "allocation",
+                "event": "event.rustcrypto.sha1-new.result",
+                "output": { "kind": "normal_return" }
+              }
+            ]
+          },
+          {
+            "id": "summary.rustcrypto.sha1-update",
+            "target": {
+              "path": "src/sha1.rs",
+              "symbol": "sha1.Sha1.update",
+              "has_receiver": true,
+              "parameter_count": 1
+            },
+            "completeness": "complete",
+            "locations": [],
+            "transfers": [],
+            "effects": [
+              {
+                "kind": "allocation",
+                "event": "event.rustcrypto.sha1-update.result",
+                "output": { "kind": "normal_return" }
+              }
+            ]
+          },
+          {
+            "id": "summary.rustcrypto.sha1-finalize",
+            "target": {
+              "path": "src/sha1.rs",
+              "symbol": "sha1.Sha1.finalize",
+              "has_receiver": true,
+              "parameter_count": 0
+            },
+            "completeness": "complete",
+            "locations": [],
+            "transfers": [],
+            "effects": [
+              {
+                "kind": "allocation",
+                "event": "event.rustcrypto.sha1-finalize.result",
+                "output": { "kind": "normal_return" }
+              }
+            ]
+          },
+          {
+            "id": "summary.rustcrypto.sha3-new",
+            "target": {
+              "path": "src/sha3.rs",
+              "symbol": "sha3.Sha3_256.new",
+              "has_receiver": false,
+              "parameter_count": 0
+            },
+            "completeness": "complete",
+            "locations": [],
+            "transfers": [],
+            "effects": [
+              {
+                "kind": "allocation",
+                "event": "event.rustcrypto.sha3-new.result",
+                "output": { "kind": "normal_return" }
+              }
+            ]
+          },
+          {
+            "id": "summary.rustcrypto.sha3-update",
+            "target": {
+              "path": "src/sha3.rs",
+              "symbol": "sha3.Sha3_256.update",
+              "has_receiver": true,
+              "parameter_count": 1
+            },
+            "completeness": "complete",
+            "locations": [],
+            "transfers": [],
+            "effects": [
+              {
+                "kind": "allocation",
+                "event": "event.rustcrypto.sha3-update.result",
+                "output": { "kind": "normal_return" }
+              }
+            ]
+          },
+          {
+            "id": "summary.rustcrypto.sha3-finalize",
+            "target": {
+              "path": "src/sha3.rs",
+              "symbol": "sha3.Sha3_256.finalize",
+              "has_receiver": true,
+              "parameter_count": 0
+            },
+            "completeness": "complete",
+            "locations": [],
+            "transfers": [],
+            "effects": [
+              {
+                "kind": "allocation",
+                "event": "event.rustcrypto.sha3-finalize.result",
+                "output": { "kind": "normal_return" }
+              }
+            ]
+          }
+        ]
+      }
+    }
+  ]
+}

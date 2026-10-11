@@ -17,7 +17,7 @@ use brokk_bifrost_core::analyzer::source_facts::{
 use brokk_bifrost_core::hash::{HashMap, HashSet};
 use tree_sitter::Node;
 
-use super::graph::return_type::java_type_name_components;
+use super::graph::return_type::{is_java_local_type_scope_node, java_type_name_components};
 use super::graph_support::{
     java_declared_type_parameters, java_type_parameter_bounds, java_type_parameter_in_scope,
     java_type_parameter_name, java_type_parameter_name_node,
@@ -339,7 +339,7 @@ enum JavaTypeChildren<'tree> {
     Leaf,
 }
 
-fn java_named_type_child(node: Node<'_>) -> Option<Node<'_>> {
+pub(super) fn java_named_type_child(node: Node<'_>) -> Option<Node<'_>> {
     let mut cursor = node.walk();
     node.named_children(&mut cursor)
         .find(|child| !matches!(child.kind(), "type_arguments" | "annotation"))
@@ -520,14 +520,7 @@ fn java_lexical_scope(node: Node<'_>, source: &str) -> Option<Vec<String>> {
 }
 
 fn is_java_class_like_kind(kind: &str) -> bool {
-    matches!(
-        kind,
-        "class_declaration"
-            | "interface_declaration"
-            | "enum_declaration"
-            | "record_declaration"
-            | "annotation_type_declaration"
-    )
+    super::declarations::is_class_like_declaration_kind(kind)
 }
 
 pub(crate) fn is_java_synthetic_class_body(node: Node<'_>) -> bool {
@@ -538,21 +531,6 @@ pub(crate) fn is_java_synthetic_class_body(node: Node<'_>) -> bool {
                 "object_creation_expression" | "enum_constant"
             )
         })
-}
-
-fn is_java_local_type_scope_node(kind: &str) -> bool {
-    matches!(
-        kind,
-        "method_declaration"
-            | "constructor_declaration"
-            | "compact_constructor_declaration"
-            | "block"
-            | "lambda_expression"
-            | "catch_clause"
-            | "enhanced_for_statement"
-            | "for_statement"
-            | "try_with_resources_statement"
-    )
 }
 
 impl JavaSourceTypeCollector {
@@ -631,274 +609,8 @@ impl JavaSourceTypeCollector {
     }
 }
 
-fn java_has_anonymous_class_body(node: Node<'_>) -> bool {
+pub(super) fn java_has_anonymous_class_body(node: Node<'_>) -> bool {
     let mut cursor = node.walk();
     node.named_children(&mut cursor)
         .any(|child| child.kind() == "class_body")
-}
-
-#[cfg(test)]
-mod producer_tests {
-    use super::*;
-    use brokk_bifrost_core::analyzer::ProjectFile;
-    use brokk_bifrost_core::analyzer::java_facts::JavaAnonymousReturnStatus;
-    use brokk_bifrost_core::analyzer::parsed_file::ParsedFile;
-    use brokk_bifrost_core::analyzer::source_facts::SourceFactRows;
-    use tree_sitter::Parser;
-
-    fn parse(source: &str) -> ParsedFile {
-        let mut parser = Parser::new();
-        parser
-            .set_language(&tree_sitter_java::LANGUAGE.into())
-            .expect("java grammar");
-        let tree = parser.parse(source, None).expect("java tree");
-        let file = ProjectFile::new(std::env::temp_dir().join("java-source-types"), "C.java");
-        super::super::declarations::parse_java_file(&file, source, &tree)
-    }
-
-    fn occurrence_text<'a>(
-        source: &'a str,
-        rows: &SourceFactRows,
-        occurrence: SourceOccurrenceId,
-    ) -> &'a str {
-        let range = rows.occurrence(occurrence).range;
-        &source[range.start_byte..range.end_byte]
-    }
-
-    #[test]
-    fn qualified_generic_owner_retains_nominal_path_and_native_terminal() {
-        use brokk_bifrost_core::analyzer::resolution_facts::{
-            ResolutionGapKind, ResolutionSiteKind,
-        };
-
-        let source = "class Box<T> { class Inner {} } class Factory { Box<String>.Inner make() { return null; } }";
-        let parsed = parse(source);
-        let source_facts = parsed.source_facts.as_ref().expect("source facts");
-        let facts = source_facts.java.as_ref().expect("Java source facts");
-        let return_type = facts.callable_returns.first().expect("method return");
-        let JavaTypeSyntaxShape::Named { name, .. } =
-            &facts.types[return_type.ty.expect("explicit return type").index()].shape
-        else {
-            panic!("qualified generic owner must retain its nominal path");
-        };
-        assert_eq!(name.path(), &["Box", "Inner"]);
-
-        let native = &parsed.resolution_facts;
-        let terminal = native
-            .sites
-            .iter()
-            .find(|site| {
-                site.kind == ResolutionSiteKind::MemberReference
-                    && &source[site.start_byte..site.end_byte] == "Inner"
-            })
-            .expect("native terminal reference survives unsupported generic owner");
-        assert!(native.gaps.iter().any(|gap| {
-            gap.site == terminal.id && gap.kind == ResolutionGapKind::AmbiguousQualifiedType
-        }));
-        assert!(
-            native
-                .gaps
-                .iter()
-                .any(|gap| gap.kind == ResolutionGapKind::UnsupportedTypeSyntax)
-        );
-    }
-
-    #[test]
-    fn producer_retains_incomplete_generic_base_and_array_dimensions() {
-        let source = "class C { List<?> wildcard(); List<int> primitive(); String[][] matrix(); }";
-        let parsed = parse(source);
-        let source_facts = parsed.source_facts.as_ref().expect("source facts");
-        let facts = source_facts.java.as_ref().expect("Java source facts");
-
-        let list_ids = facts
-            .types
-            .iter()
-            .enumerate()
-            .filter_map(|(index, fact)| match &fact.shape {
-                JavaTypeSyntaxShape::Named { name, .. }
-                    if name.path().len() == 1 && name.path()[0] == "List" =>
-                {
-                    Some(JavaSourceTypeId::new(index as u32))
-                }
-                _ => None,
-            })
-            .collect::<Vec<_>>();
-        assert!(!list_ids.is_empty(), "List base was captured");
-        let wildcard_generic = facts.types.iter().find(|fact| {
-            occurrence_text(source, &source_facts.occurrences, fact.occurrence).contains("List<?>")
-        });
-        let Some(wildcard_generic) = wildcard_generic else {
-            panic!("wildcard generic syntax is retained")
-        };
-        let JavaTypeSyntaxShape::Generic { base, arguments } = &wildcard_generic.shape else {
-            panic!(
-                "wildcard type has generic shape: {:?}",
-                wildcard_generic.shape
-            )
-        };
-        assert!(list_ids.contains(base));
-        assert_eq!(arguments.len(), 1);
-        assert!(matches!(
-            &facts.types[arguments[0].index()].shape,
-            JavaTypeSyntaxShape::Unknown
-        ));
-
-        let primitive_generic = facts.types.iter().find(|fact| {
-            matches!(
-                &fact.shape,
-                JavaTypeSyntaxShape::Generic { base, .. } if list_ids.contains(base)
-            ) && occurrence_text(source, &source_facts.occurrences, fact.occurrence)
-                .contains("List<int>")
-        });
-        let primitive_generic = primitive_generic.expect("primitive generic syntax is retained");
-        let JavaTypeSyntaxShape::Generic { arguments, .. } = &primitive_generic.shape else {
-            panic!(
-                "primitive type has generic shape: {:?}",
-                primitive_generic.shape
-            )
-        };
-        assert!(matches!(
-            &facts.types[arguments[0].index()].shape,
-            JavaTypeSyntaxShape::NonNominal
-        ));
-
-        let array = facts.types.iter().find_map(|fact| match &fact.shape {
-            JavaTypeSyntaxShape::Array { dimensions, .. }
-                if occurrence_text(source, &source_facts.occurrences, fact.occurrence)
-                    .contains("String[][]") =>
-            {
-                Some(*dimensions)
-            }
-            _ => None,
-        });
-        assert_eq!(array, Some(2));
-        assert!(facts.valid_links(&source_facts.occurrences));
-    }
-
-    #[test]
-    fn producer_binds_only_unqualified_type_parameter_and_records_local_scope() {
-        let source = "class C<T> { pkg.T qualified(); T plain(); void body() { class Local {} Local value; } }";
-        let parsed = parse(source);
-        let source_facts = parsed.source_facts.as_ref().expect("source facts");
-        let facts = source_facts.java.as_ref().expect("Java source facts");
-
-        let mut qualified_seen = false;
-        let mut qualified_parameter = false;
-        let mut plain_parameter = false;
-        for callable in &facts.callable_returns {
-            let Some(ty) = callable.ty else { continue };
-            let text = occurrence_text(
-                source,
-                &source_facts.occurrences,
-                facts.types[ty.index()].occurrence,
-            );
-            match &facts.types[ty.index()].shape {
-                JavaTypeSyntaxShape::Named { name, parameter } if text == "pkg.T" => {
-                    assert_eq!(name.path().len(), 2);
-                    assert_eq!(name.path()[0], "pkg");
-                    assert_eq!(name.path()[1], "T");
-                    qualified_seen = true;
-                    qualified_parameter = parameter.is_some();
-                }
-                JavaTypeSyntaxShape::Named { name, parameter } if text == "T" => {
-                    assert_eq!(name.path().len(), 1);
-                    assert_eq!(name.path()[0], "T");
-                    plain_parameter = parameter.is_some();
-                }
-                _ => {}
-            }
-        }
-        assert!(qualified_seen, "qualified return type was captured");
-        assert!(!qualified_parameter, "qualified terminal must not bind T");
-        assert!(
-            plain_parameter,
-            "unqualified T must bind the class parameter"
-        );
-
-        let local = facts.local_types.first().expect("local class fact");
-        let declaration = source_facts.occurrences.occurrence(
-            source_facts
-                .occurrences
-                .declaration(local.declaration)
-                .occurrence,
-        );
-        let scope = source_facts.occurrences.occurrence(local.lexical_scope);
-        assert!(scope.range.start_byte <= declaration.range.start_byte);
-        assert!(declaration.range.end_byte <= scope.range.end_byte);
-    }
-
-    #[test]
-    fn producer_does_not_expose_member_class_inside_local_class_as_local() {
-        let source = "class Outer { void host() { class Local { class Nested {} } } }";
-        let parsed = parse(source);
-        let source_facts = parsed.source_facts.as_ref().expect("source facts");
-        let facts = source_facts.java.as_ref().expect("Java source facts");
-        let names = facts
-            .local_types
-            .iter()
-            .map(|local| {
-                let declaration = source_facts.occurrences.declaration(local.declaration);
-                occurrence_text(
-                    source,
-                    &source_facts.occurrences,
-                    declaration.name.expect("local class has a name"),
-                )
-            })
-            .collect::<Vec<_>>();
-        assert_eq!(names, vec!["Local"]);
-        assert!(facts.valid_links(&source_facts.occurrences));
-    }
-
-    #[test]
-    fn producer_does_not_attach_anonymous_body_members_to_outer_type() {
-        let parsed = parse("class Outer { Runnable value = new Runnable() { void run() {} }; }");
-        let source_facts = parsed.source_facts.as_ref().expect("source facts");
-        let facts = source_facts.java.as_ref().expect("Java source facts");
-        assert!(facts.declaration_owners.is_empty());
-        assert!(facts.valid_links(&source_facts.occurrences));
-    }
-
-    #[test]
-    fn producer_publishes_all_anonymous_return_only_for_declared_nominal_types() {
-        let parsed = parse(
-            "class C { Runnable anonymous() { return new Runnable() {}; } Runnable mixed() { return null; } }",
-        );
-        let source_facts = parsed.source_facts.as_ref().expect("source facts");
-        let facts = source_facts.java.as_ref().expect("Java source facts");
-        let anonymous = facts
-            .anonymous_returns
-            .iter()
-            .find(|fact| fact.status == JavaAnonymousReturnStatus::AllAnonymous)
-            .expect("all-anonymous callable fact");
-        assert_eq!(anonymous.returns.len(), 1);
-        let mixed = facts
-            .anonymous_returns
-            .iter()
-            .find(|fact| fact.status == JavaAnonymousReturnStatus::Unknown)
-            .expect("mixed callable fact");
-        assert!(mixed.returns.is_empty());
-        assert!(facts.valid_links(&source_facts.occurrences));
-    }
-
-    #[test]
-    fn anonymous_return_completeness_ignores_unrelated_prior_type_rows() {
-        let parsed = parse(
-            "class C { void nothing(); int primitive(); List<?> wildcard(); Runnable anonymous() { return new Runnable() {}; } }",
-        );
-        let source_facts = parsed.source_facts.as_ref().expect("source facts");
-        let facts = source_facts.java.as_ref().expect("Java source facts");
-        let anonymous = facts
-            .anonymous_returns
-            .iter()
-            .find(|fact| {
-                facts
-                    .callable_returns
-                    .iter()
-                    .any(|callable| callable.callable == fact.callable)
-                    && fact.returns.len() == 1
-            })
-            .expect("anonymous return fact");
-        assert_eq!(anonymous.status, JavaAnonymousReturnStatus::AllAnonymous);
-        assert!(facts.valid_links(&source_facts.occurrences));
-    }
 }

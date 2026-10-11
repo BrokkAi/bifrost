@@ -29,15 +29,19 @@
 //! block twice.
 
 use crate::kotlin::supertypes::extract_kotlin_supertypes;
-use crate::kotlin::syntax::{kotlin_callee, kotlin_named_argument_label};
+use crate::kotlin::syntax::{
+    kotlin_call_trailing_lambda_body, kotlin_callee, kotlin_named_argument_label,
+    kotlin_value_arguments,
+};
 use brokk_bifrost_core::analyzer::common::node_source_text as node_text;
 use brokk_bifrost_core::analyzer::model::{TestAssertionSmell, TestAssertionWeights};
-use brokk_bifrost_core::analyzer::tree_walk::{
-    WalkControl, first_named_child_of_kind, named_children, walk_named_tree_preorder,
+use brokk_bifrost_core::analyzer::test_assertions::{
+    TestAssertionSignal, append_test_assertion_findings, compact_assertion_excerpt,
 };
+use brokk_bifrost_core::analyzer::tree_walk::{first_named_child_of_kind, named_children};
 use brokk_bifrost_core::analyzer::{CodeUnitIndex, Language, ProjectFile, test_paths};
 use brokk_bifrost_core::path_utils::rel_path_string;
-use tree_sitter::{Node, Parser};
+use tree_sitter::Node;
 
 use crate::kotlin::declarations::{KOTLIN_CLASS_LIKE_KINDS, kotlin_identifier_text};
 
@@ -98,36 +102,23 @@ const KOTLIN_CONSTANT_LITERAL_KINDS: &[&str] = &[
 const KIND_JUNIT: &str = "junit-assertion";
 const KIND_MOCK_VERIFICATION: &str = "mock-verification";
 const KIND_MEANINGFUL: &str = "meaningful-assertion";
-const KIND_NO_ASSERTIONS: &str = "no-assertions";
 const KIND_CONSTANT_TRUTH: &str = "constant-truth";
 const KIND_CONSTANT_EQUALITY: &str = "constant-equality";
 const KIND_SELF_COMPARISON: &str = "self-comparison";
 const KIND_NULLNESS_ONLY: &str = "nullness-only";
-const KIND_SHALLOW_ONLY: &str = "shallow-assertions-only";
 const KIND_OVERSPECIFIED_LITERAL: &str = "overspecified-literal";
 
 const TEST_ASSERTION_EXCERPT_MAX_LEN: usize = 180;
 
 /// Whether a Kotlin file contains any recognized test-framework evidence.
 pub fn kotlin_contains_tests(root: Node<'_>, source: &str) -> bool {
-    let mut found = false;
-    walk_named_tree_preorder(root, true, |node| {
-        found |= match node.kind() {
-            "annotation" => kotlin_test_annotation(node, source),
-            kind if KOTLIN_CLASS_LIKE_KINDS.contains(&kind) => {
-                kotlin_test_spec_supertype(node, source)
-            }
-            "call_expression" => kotlin_test_dsl_call(node, source),
-            "infix_expression" => kotlin_test_should_block(node, source),
-            _ => false,
-        };
-        if found {
-            WalkControl::SkipChildren
-        } else {
-            WalkControl::Continue
-        }
-    });
-    found
+    crate::test_detection::contains_test_node(root, |node| match node.kind() {
+        "annotation" => kotlin_test_annotation(node, source),
+        kind if KOTLIN_CLASS_LIKE_KINDS.contains(&kind) => kotlin_test_spec_supertype(node, source),
+        "call_expression" => kotlin_test_dsl_call(node, source),
+        "infix_expression" => kotlin_test_should_block(node, source),
+        _ => false,
+    })
 }
 
 /// Test evidence used only for a directly changed file. Kotlin compiler box
@@ -243,11 +234,7 @@ pub fn detect_kotlin_test_assertion_smells(
 }
 
 fn parse_kotlin_tree_for_tests(source: &str) -> Option<tree_sitter::Tree> {
-    let mut parser = Parser::new();
-    parser
-        .set_language(&crate::kotlin::language::LANGUAGE.into())
-        .ok()?;
-    parser.parse(source, None)
+    crate::kotlin::language::parse_tree(source)
 }
 
 fn collect_kotlin_test_cases<'tree>(
@@ -304,15 +291,6 @@ fn kotlin_function_body_node(function: Node<'_>) -> Option<Node<'_>> {
         .find(|child| child.kind() == "function_body")
 }
 
-/// The `lambda_literal` a DSL test call's trailing lambda holds
-/// (`test("name") { … }`), or `None` for a call with no trailing lambda —
-/// which names no scoreable body.
-fn kotlin_call_trailing_lambda_body(call: Node<'_>) -> Option<Node<'_>> {
-    let call_suffix = first_named_child_of_kind(call, "call_suffix")?;
-    let annotated_lambda = first_named_child_of_kind(call_suffix, "annotated_lambda")?;
-    first_named_child_of_kind(annotated_lambda, "lambda_literal")
-}
-
 fn analyze_kotlin_test_case(
     analyzer: &dyn CodeUnitIndex,
     file: &ProjectFile,
@@ -341,49 +319,27 @@ fn analyze_kotlin_test_case(
             .filter_map(|infix| kotlin_infix_assertion_signal(infix, source, weights)),
     );
 
-    let assertion_count = assertions.len() as i32;
-    if assertion_count == 0 {
-        out.push(TestAssertionSmell {
-            file: file.clone(),
-            enclosing_fq_name: enclosing,
-            assertion_kind: KIND_NO_ASSERTIONS.to_string(),
-            score: weights.no_assertion_weight,
-            assertion_count: 0,
-            reasons: vec![KIND_NO_ASSERTIONS.to_string()],
-            excerpt: compact_kotlin_excerpt(node_text(case.body, source)),
-            start_byte: case.body.start_byte(),
-        });
-        return;
-    }
-
-    for assertion in &assertions {
-        if assertion.score <= 0 {
-            continue;
-        }
-        out.push(TestAssertionSmell {
-            file: file.clone(),
-            enclosing_fq_name: enclosing.clone(),
-            assertion_kind: assertion.kind.clone(),
+    let assertions: Vec<_> = assertions
+        .into_iter()
+        .map(|assertion| TestAssertionSignal {
+            kind: assertion.kind,
             score: assertion.score,
-            assertion_count,
-            reasons: vec![assertion.reason.clone()],
-            excerpt: assertion.excerpt.clone(),
+            shallow: assertion.shallow,
+            meaningful: false,
+            reasons: vec![assertion.reason],
+            excerpt: assertion.excerpt,
             start_byte: assertion.start_byte,
-        });
-    }
-
-    if assertions.iter().all(|assertion| assertion.shallow) {
-        out.push(TestAssertionSmell {
-            file: file.clone(),
-            enclosing_fq_name: enclosing,
-            assertion_kind: KIND_SHALLOW_ONLY.to_string(),
-            score: weights.shallow_assertion_only_weight,
-            assertion_count,
-            reasons: vec![KIND_SHALLOW_ONLY.to_string()],
-            excerpt: compact_kotlin_excerpt(node_text(case.body, source)),
-            start_byte: case.body.start_byte(),
-        });
-    }
+        })
+        .collect();
+    append_test_assertion_findings(
+        file,
+        enclosing,
+        compact_assertion_excerpt(node_text(case.body, source), TEST_ASSERTION_EXCERPT_MAX_LEN),
+        case.body.start_byte(),
+        &assertions,
+        weights,
+        out,
+    );
 }
 
 #[derive(Clone)]
@@ -406,7 +362,7 @@ fn kotlin_call_assertion_signal(
         return None;
     }
     let name = kotlin_identifier_text(callee, source);
-    let text = compact_kotlin_excerpt(node_text(call, source));
+    let text = compact_assertion_excerpt(node_text(call, source), TEST_ASSERTION_EXCERPT_MAX_LEN);
 
     if KOTLIN_TEST_ASSERTION_CALLS.contains(&name) {
         return Some(classify_kotlin_junit_assertion(
@@ -519,7 +475,7 @@ fn kotlin_infix_assertion_signal(
     if !KOTEST_SHOULD_INFIX.contains(&name) {
         return None;
     }
-    let text = compact_kotlin_excerpt(node_text(infix, source));
+    let text = compact_assertion_excerpt(node_text(infix, source), TEST_ASSERTION_EXCERPT_MAX_LEN);
 
     let (mut kind, mut score) = if same_kotlin_expression(*left, *right, source) {
         if is_constant_kotlin_expression(*right) {
@@ -564,16 +520,7 @@ fn collect_nodes_by_kind<'tree>(root: Node<'tree>, kind: &str, out: &mut Vec<Nod
 }
 
 fn kotlin_call_argument_exprs(call: Node<'_>) -> Vec<Node<'_>> {
-    let Some(call_suffix) = named_children(call)
-        .into_iter()
-        .find(|child| child.kind() == "call_suffix")
-    else {
-        return Vec::new();
-    };
-    let Some(value_arguments) = named_children(call_suffix)
-        .into_iter()
-        .find(|child| child.kind() == "value_arguments")
-    else {
+    let Some(value_arguments) = kotlin_value_arguments(call) else {
         return Vec::new();
     };
     named_children(value_arguments)
@@ -604,7 +551,7 @@ fn is_constant_kotlin_expression(node: Node<'_>) -> bool {
 }
 
 fn same_kotlin_expression(left: Node<'_>, right: Node<'_>, source: &str) -> bool {
-    node_text(left, source).trim() == node_text(right, source).trim()
+    crate::same_expression_text(left, right, source)
 }
 
 fn contains_overspecified_kotlin_literal(
@@ -622,18 +569,5 @@ fn is_overspecified_kotlin_literal(
     weights: &TestAssertionWeights,
 ) -> bool {
     let threshold = weights.large_literal_length_threshold.max(0) as usize;
-    node.kind() == "string_literal" && node_text(node, source).len() >= threshold
-}
-
-fn compact_kotlin_excerpt(text: &str) -> String {
-    let compact = text.split_whitespace().collect::<Vec<_>>().join(" ");
-    if compact.chars().count() <= TEST_ASSERTION_EXCERPT_MAX_LEN {
-        return compact;
-    }
-    let mut truncated: String = compact
-        .chars()
-        .take(TEST_ASSERTION_EXCERPT_MAX_LEN)
-        .collect();
-    truncated.push_str("...");
-    truncated
+    crate::is_overspecified_string_literal(node, source, threshold)
 }

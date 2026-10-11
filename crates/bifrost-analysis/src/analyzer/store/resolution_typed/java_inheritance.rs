@@ -1,8 +1,10 @@
-//! Inheritance metadata for exact selected Java declarations, read per demand.
+//! Inheritance metadata for exact selected JVM declarations, read per demand.
 
 use super::*;
 use crate::analyzer::CodeUnitType;
-use crate::analyzer::resolution::{JavaInheritanceDeclaration, JavaInheritanceDeclarationKind};
+use crate::analyzer::resolution::{
+    JavaInheritanceDeclaration, JavaInheritanceDeclarationKind, language_has_jvm_semantics,
+};
 
 // Requests carry selected mount/semantic keys. Every subsequent join is keyed
 // by the selected blob and its source declaration; no workspace scan or live
@@ -11,10 +13,14 @@ pub(in crate::analyzer::store) const DECLARATIONS: &str = r#"
 SELECT request.mount_ordinal, request.key0, units.kind, meta.content_package,
        metadata.class_like_is_interface, metadata.callable_override_modifier,
        metadata.callable_is_static, metadata.callable_declared_visibility,
-       metadata.callable_modifiers_recorded
+       metadata.callable_modifiers_recorded, units.identifier,
+       EXISTS (SELECT 1 FROM main.code_unit_fq_segments AS segment
+               WHERE segment.blob_id=units.blob_id AND segment.unit_key=units.unit_key
+                 AND segment.seg_ordinal=units.fq_segment_count-1
+                 AND segment.seg_kind='companion')
 FROM temp.selected_resolution_typed_requests_1 AS request
 CROSS JOIN temp.selected_resolution_mounts AS mount
-  ON mount.mount_ordinal=request.mount_ordinal AND mount.semantic_language='java'
+  ON mount.mount_ordinal=request.mount_ordinal
 CROSS JOIN main.resolution_fragment_interiors AS interior
   ON interior.blob_id=mount.blob_id AND interior.lang=mount.storage_language
  AND interior.semantic_language=mount.semantic_language
@@ -55,11 +61,11 @@ pub(super) fn read(
             let Some(ordinal) = definition.ordinal() else {
                 continue;
             };
-            if selection
-                .mount_record_by_ordinal(SelectedResolutionMountOrdinal::new(ordinal))?
-                .semantic_language()
-                != Language::Java
-            {
+            if !language_has_jvm_semantics(
+                selection
+                    .mount_record_by_ordinal(SelectedResolutionMountOrdinal::new(ordinal))?
+                    .semantic_language(),
+            ) {
                 continue;
             }
             let Some(provenance) =
@@ -98,6 +104,7 @@ pub(super) fn read(
                 let kind = match kind {
                     CodeUnitType::Class => JavaInheritanceDeclarationKind::Type {
                         is_interface: row.get(4)?,
+                        is_singleton: row.get(10)?,
                     },
                     CodeUnitType::Function if row.get::<_, bool>(8)? => {
                         let modifier: Option<String> = row.get(5)?;
@@ -123,6 +130,7 @@ pub(super) fn read(
                 };
                 found.push(JavaInheritanceDeclaration {
                     definition,
+                    name: row.get(9)?,
                     package: row.get(3)?,
                     kind,
                 });

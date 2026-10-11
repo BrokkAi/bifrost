@@ -1,4 +1,5 @@
 use super::*;
+use brokk_bifrost_test_macros::hardwon;
 
 const OWNER: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 const OID: &str = "2222222222222222222222222222222222222222";
@@ -23,6 +24,9 @@ fn root(conn: &Connection, revision: i64) {
 }
 
 #[test]
+#[hardwon(
+    "3da13ca221f4: GC candidate snapshots could miss immutable resolution roots published concurrently"
+)]
 fn real_collector_preserves_roots_published_after_candidate_snapshot() {
     let temp = tempfile::tempdir().unwrap();
     let workspace = temp.path().canonicalize().unwrap();
@@ -83,6 +87,7 @@ fn real_collector_preserves_roots_published_after_candidate_snapshot() {
 }
 
 #[test]
+#[hardwon("3da13ca221f4: resolution-root collection work grew with unrelated revision history")]
 fn real_collector_root_seeks_have_constant_vm_work_across_history_sizes() {
     for state in PlannerStatisticsState::BOTH {
         let mut previous_vm = None;

@@ -250,7 +250,9 @@ impl<'source> RustDeclarationPropertyCollector<'source> {
             has_impl_or_trait_ancestor,
             nearest_declaration_boundary,
             trait_impl_member,
-            serde_helper_derive: crate::resolution::rust_item_serde_helper_derive(
+            derive_helper_attributes:
+                crate::resolution::rust_item_conditional_derive_helper_attributes(node, self.source),
+            generated_surface: crate::resolution::rust_item_has_generated_surface_boundary(
                 node,
                 self.source,
             ),

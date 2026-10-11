@@ -19,30 +19,73 @@
 //! and `has_token_child` -- followed when Kotlin's declaration walk moved into
 //! `brokk-bifrost-jvm`, since a language crate reads its own grammar's child
 //! slots with them; the first two are re-exported here for the callers already
-//! at this path, and `has_token_child` has no analysis-side caller left.
+//! at this path, and `has_token_child` has no analysis-side caller left. The
+//! kind-filtered collector and predicate-based sole-child selector also live
+//! in core and are re-exported here for analysis callers.
 
 use tree_sitter::Node;
+
+/// Find the first identifier with exact source text in preorder, including `root`.
+pub(crate) fn find_identifier_node<'tree>(
+    root: Node<'tree>,
+    source: &str,
+    expected: &str,
+) -> Option<Node<'tree>> {
+    let mut stack = vec![root];
+    while let Some(node) = stack.pop() {
+        if node.kind() == "identifier"
+            && brokk_bifrost_core::analyzer::common::try_node_source_text(node, source)
+                == Some(expected)
+        {
+            return Some(node);
+        }
+        stack.extend(
+            brokk_bifrost_core::analyzer::tree_walk::named_children_vec(node)
+                .into_iter()
+                .rev(),
+        );
+    }
+    None
+}
+
+pub(crate) fn body_contains_kind_outside_nested_callables(
+    body: Node<'_>,
+    target_kind: &str,
+    is_callable_kind: fn(&str) -> bool,
+) -> bool {
+    let mut stack = vec![body];
+    while let Some(node) = stack.pop() {
+        if node != body && is_callable_kind(node.kind()) {
+            continue;
+        }
+        if node.kind() == target_kind {
+            return true;
+        }
+        stack.extend(brokk_bifrost_core::analyzer::tree_walk::named_children_vec(
+            node,
+        ));
+    }
+    false
+}
 
 #[cfg(test)]
 pub(crate) use brokk_bifrost_core::analyzer::tree_walk::{TreeWalkAction, walk_tree_iterative};
 pub(crate) use brokk_bifrost_core::analyzer::tree_walk::{
-    children_iter, first_named_child_of_kind, named_children, named_children_iter,
-    node_for_exact_range, push_children_reversed, push_named_children_reversed,
-    push_named_children_reversed_as, subtree_contains,
+    child_by_field_or_named_child_of_kinds, children_iter, first_named_child_of_kind,
+    named_children, named_children_iter, node_for_exact_range, push_children_reversed,
+    push_named_children_reversed, push_named_children_reversed_as, single_named_child_matching,
+    subtree_contains,
 };
 
-/// All descendants of `node` (not including `node` itself) whose `kind()` equals
-/// `kind`, in pre-order (a node before its own descendants), iterative (explicit
-/// stack) depth-first search.
-///
-/// Its only current callers are test-only traversal helpers (this module's own
-/// unit tests, and `ruby::semantic`'s test-only `descendants_by_kind`). The one
-/// production candidate identified by the cross-language duplication survey
-/// (`rust::graph_support::named_descendants_of_kind`) performs a *post*-order
-/// walk that also matches the root node, which is an observably different
-/// contract, so it was deliberately left as its own copy rather than forced
-/// through this preorder/exclude-self helper.
-#[allow(dead_code)]
+pub(crate) fn call_arguments(node: Node<'_>) -> Vec<Node<'_>> {
+    child_by_field_or_named_child_of_kinds(node, "arguments", &["argument_list"])
+        .map(named_children)
+        .unwrap_or_default()
+}
+
+/// All named descendants of `node` (excluding `node`) whose kind matches,
+/// in source-order preorder, using an explicit stack.
+#[cfg(test)]
 pub(crate) fn descendants_of_kind<'tree>(node: Node<'tree>, kind: &str) -> Vec<Node<'tree>> {
     let mut out = Vec::new();
     let mut stack: Vec<Node<'tree>> = named_children(node).into_iter().rev().collect();
@@ -57,17 +100,27 @@ pub(crate) fn descendants_of_kind<'tree>(node: Node<'tree>, kind: &str) -> Vec<N
     out
 }
 
+/// All named nodes in source-order preorder, including `node` when it matches.
+#[cfg(test)]
+pub(crate) fn descendants_or_self_of_kind<'tree>(
+    node: Node<'tree>,
+    kind: &str,
+) -> Vec<Node<'tree>> {
+    let mut out = Vec::new();
+    if node.kind() == kind {
+        out.push(node);
+    }
+    out.extend(descendants_of_kind(node, kind));
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tree_sitter::Parser;
+    use brokk_bifrost_test_macros::hardwon;
 
     fn parse(source: &str) -> tree_sitter::Tree {
-        let mut parser = Parser::new();
-        parser
-            .set_language(&tree_sitter_rust::LANGUAGE.into())
-            .expect("set rust language");
-        parser.parse(source, None).expect("parse")
+        brokk_bifrost_rust::lexical_scope::parse_rust_tree(source).expect("parse Rust")
     }
 
     #[test]
@@ -100,29 +153,7 @@ mod tests {
     }
 
     #[test]
-    fn walk_tree_iterative_skip_prunes_descendants() {
-        let tree = parse("fn outer() { let x = 1; }");
-        let root = tree.root_node();
-        let mut visited: Vec<String> = Vec::new();
-        walk_tree_iterative(
-            root,
-            &mut visited,
-            |node, visited| {
-                visited.push(node.kind().to_string());
-                if node.kind() == "block" {
-                    // Prune: the block's children (the let-statement and its
-                    // descendants) must never be visited.
-                    return TreeWalkAction::Skip;
-                }
-                TreeWalkAction::Descend
-            },
-            |_| {},
-        );
-        assert!(visited.iter().any(|k| k == "block"));
-        assert!(!visited.iter().any(|k| k == "let_declaration"));
-    }
-
-    #[test]
+    #[hardwon("#1228: cooperative stop must prevent visiting later siblings")]
     fn issue_1228_walk_tree_iterative_can_stop_cooperatively() {
         let source = "fn first() {} fn stop() {} fn never() {}";
         let tree = parse(source);
@@ -144,35 +175,5 @@ mod tests {
         );
         assert!(visited.iter().any(|text| text.starts_with("fn stop")));
         assert!(!visited.iter().any(|text| text.starts_with("fn never")));
-    }
-
-    #[test]
-    fn subtree_contains_finds_nested_match() {
-        let tree = parse("fn outer() { fn inner() {} }");
-        let root = tree.root_node();
-        assert!(subtree_contains(root, |node| node.kind() == "function_item"));
-        assert!(!subtree_contains(root, |node| node.kind() == "struct_item"));
-    }
-
-    #[test]
-    fn descendants_of_kind_collects_all_matches_excluding_self() {
-        let tree = parse("fn outer() { fn inner() { fn innermost() {} } }");
-        let root = tree.root_node();
-        let functions = descendants_of_kind(root, "function_item");
-        assert_eq!(functions.len(), 3);
-
-        // Querying from a function_item root excludes that node itself.
-        let outer = functions[0];
-        let nested = descendants_of_kind(outer, "function_item");
-        assert_eq!(nested.len(), 2);
-    }
-
-    #[test]
-    fn named_children_returns_direct_children_in_source_order() {
-        let tree = parse("fn outer() {}");
-        let root = tree.root_node();
-        let children = named_children(root);
-        assert_eq!(children.len(), 1);
-        assert_eq!(children[0].kind(), "function_item");
     }
 }

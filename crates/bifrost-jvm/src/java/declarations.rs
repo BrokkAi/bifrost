@@ -1,8 +1,10 @@
+pub use brokk_bifrost_core::analyzer::common::node_source_text as node_text;
 use brokk_bifrost_core::analyzer::fq_name::{
-    FqName, SegmentId, SegmentKind, joined_segments, segment_interner,
+    FqName, SegmentKind, joined_segments, segment_interner,
 };
 use brokk_bifrost_core::analyzer::model::{
-    CallableArity, CallableOverrideModifier, JavaTypeConstructorShape, SignatureMetadata,
+    CallableArity, CallableOverrideModifier, DispatchExtensibility, JavaTypeConstructorShape,
+    SignatureMetadata,
 };
 use brokk_bifrost_core::analyzer::model::{DeclarationInfo, DeclarationKind};
 use brokk_bifrost_core::analyzer::parsed_file::{
@@ -46,11 +48,6 @@ pub fn java_modifier_keywords(node: Node<'_>) -> impl Iterator<Item = &'static s
     })
 }
 
-/// Intern one qualified-name segment in the process-global interner.
-fn java_segment(text: &str, kind: SegmentKind) -> SegmentId {
-    segment_interner().intern(text, kind)
-}
-
 /// Java's package path is stored `.`-joined in `package_name`.
 const JAVA_PACKAGE_SEPARATOR: &str = ".";
 
@@ -65,7 +62,7 @@ const JAVA_PACKAGE_SEPARATOR: &str = ".";
 pub(crate) fn java_package_fq(package_name: &str) -> FqName {
     let mut fq = FqName::new();
     for component in joined_segments(package_name, JAVA_PACKAGE_SEPARATOR) {
-        fq.push(java_segment(component, SegmentKind::Package));
+        fq.push(segment_interner().intern(component, SegmentKind::Package));
     }
     fq
 }
@@ -325,9 +322,9 @@ pub fn collect_type_identifiers(node: Node<'_>, source: &str, identifiers: &mut 
 
 /// Whether `node` is the `name` field of the declaration that encloses it.
 pub(super) fn is_declared_name(node: Node<'_>) -> bool {
-    node.parent()
-        .and_then(|parent| parent.child_by_field_name("name"))
-        == Some(node)
+    node.parent().is_some_and(|parent| {
+        brokk_bifrost_core::analyzer::structural::adapter_helpers::is_field_of(parent, node, "name")
+    })
 }
 
 /// Facts needed to publish one class-like scope, whichever form introduced it.
@@ -411,13 +408,12 @@ pub fn class_like_code_unit(
         Some(parent) => {
             let mut fq = parent.fq().clone();
             if let Some(coordinate) = &local_coordinate {
-                fq.push(java_segment(coordinate, SegmentKind::Nested));
+                fq.push(segment_interner().intern(coordinate, SegmentKind::Nested));
             }
-            fq.with_pushed(java_segment(simple_name, SegmentKind::Type))
+            fq.with_pushed(segment_interner().intern(simple_name, SegmentKind::Type))
         }
-        None => {
-            java_package_fq(package_name).with_pushed(java_segment(simple_name, SegmentKind::Type))
-        }
+        None => java_package_fq(package_name)
+            .with_pushed(segment_interner().intern(simple_name, SegmentKind::Type)),
     };
     Some(CodeUnit::new_fq(
         file.clone(),
@@ -516,7 +512,7 @@ fn enum_constant_class_scope<'tree>(
 ) -> JavaClassScopeFacts<'tree> {
     let line = constant.start_position().row;
     let column = constant.start_position().column;
-    let anon = java_segment(&format!("anon${line}:{column}"), SegmentKind::Nested);
+    let anon = segment_interner().intern(&format!("anon${line}:{column}"), SegmentKind::Nested);
     let short_name = format!("{}$anon${line}:{column}", declaring_enum.short_name());
     let fq = declaring_enum.fq().clone().with_pushed(anon);
     let header = source
@@ -549,11 +545,7 @@ fn record_source_declaration(
     node: Node<'_>,
     unit: &CodeUnit,
 ) -> SourceDeclarationId {
-    let occurrence = collector.intern_node(node);
-    let name = node
-        .child_by_field_name("name")
-        .map(|name| collector.intern_node(name));
-    let declaration = collector.declare(occurrence, name);
+    let declaration = collector.declare_node(node, node.child_by_field_name("name"));
     links.push((declaration, unit.clone()));
     declaration
 }
@@ -612,7 +604,7 @@ fn visit_callable<'tree>(
     let fq = parent
         .fq()
         .clone()
-        .with_pushed(java_segment(name, SegmentKind::Member));
+        .with_pushed(segment_interner().intern(name, SegmentKind::Member));
     let code_unit = CodeUnit::with_signature_and_fq(
         file.clone(),
         brokk_bifrost_core::analyzer::model::CodeUnitType::Function,
@@ -657,7 +649,10 @@ fn visit_callable<'tree>(
                     .unwrap_or_default(),
             )
             .with_callable_native(modifiers.is_native)
-            .with_callable_override_modifier(override_modifier),
+            .with_callable_override_modifier(override_modifier)
+            .with_dispatch_extensibility(java_callable_dispatch_extensibility(
+                node, modifiers, properties,
+            )),
         visibility,
     );
 
@@ -694,7 +689,7 @@ fn visit_compact_constructor<'tree>(
     let fq = parent
         .fq()
         .clone()
-        .with_pushed(java_segment(name, SegmentKind::Member));
+        .with_pushed(segment_interner().intern(name, SegmentKind::Member));
     let code_unit = CodeUnit::with_signature_and_fq(
         file.clone(),
         brokk_bifrost_core::analyzer::model::CodeUnitType::Function,
@@ -723,11 +718,43 @@ fn visit_compact_constructor<'tree>(
         )
         .with_callable_arity(properties.arity)
         .with_callable_modifiers(properties.is_static, properties.is_constructor, visibility)
-        .with_callable_parameter_types(canonical_parameter_type_texts(parameters, source)),
+        .with_callable_parameter_types(canonical_parameter_type_texts(parameters, source))
+        .with_dispatch_extensibility(DispatchExtensibility::Closed),
         visibility,
     );
 
     Some(code_unit)
+}
+
+fn java_callable_dispatch_extensibility(
+    node: Node<'_>,
+    modifiers: JavaDeclarationModifiers,
+    properties: JavaCallableProperties,
+) -> DispatchExtensibility {
+    if properties.is_constructor
+        || modifiers.is_static
+        || modifiers.is_final
+        || modifiers.explicit_visibility == Some(DeclaredVisibility::Private)
+        || enclosing_java_type_is_final(node)
+    {
+        DispatchExtensibility::Closed
+    } else {
+        DispatchExtensibility::Open
+    }
+}
+
+fn enclosing_java_type_is_final(node: Node<'_>) -> bool {
+    let mut ancestor = node.parent();
+    while let Some(current) = ancestor {
+        match current.kind() {
+            "record_declaration" => return true,
+            "class_declaration" => {
+                return java_modifier_keywords(current).any(|modifier| modifier == "final");
+            }
+            _ => ancestor = current.parent(),
+        }
+    }
+    false
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -763,7 +790,7 @@ fn visit_field_declaration<'tree>(
         let fq = parent
             .fq()
             .clone()
-            .with_pushed(java_segment(name, SegmentKind::Member));
+            .with_pushed(segment_interner().intern(name, SegmentKind::Member));
         let code_unit = CodeUnit::new_fq(
             file.clone(),
             brokk_bifrost_core::analyzer::model::CodeUnitType::Field,
@@ -832,7 +859,7 @@ fn visit_record_components(
         let fq = parent
             .fq()
             .clone()
-            .with_pushed(java_segment(name, SegmentKind::Member));
+            .with_pushed(segment_interner().intern(name, SegmentKind::Member));
         let code_unit = CodeUnit::new_fq(
             file.clone(),
             brokk_bifrost_core::analyzer::model::CodeUnitType::Field,
@@ -878,7 +905,7 @@ fn visit_enum_constant(
     let fq = parent
         .fq()
         .clone()
-        .with_pushed(java_segment(name, SegmentKind::Member));
+        .with_pushed(segment_interner().intern(name, SegmentKind::Member));
     let code_unit = CodeUnit::new_fq(
         file.clone(),
         brokk_bifrost_core::analyzer::model::CodeUnitType::Field,
@@ -952,7 +979,7 @@ fn lambda_code_unit(
 fn java_anonymous_scope_identity(parent: &CodeUnit, node: Node<'_>) -> (String, FqName) {
     let line = node.start_position().row;
     let column = node.start_position().column;
-    let anon = java_segment(&format!("anon${line}:{column}"), SegmentKind::Nested);
+    let anon = segment_interner().intern(&format!("anon${line}:{column}"), SegmentKind::Nested);
 
     if parent.is_function() || parent.is_synthetic() {
         let short_name = format!("{}$anon${line}:{column}", parent.short_name());
@@ -974,10 +1001,6 @@ fn java_anonymous_scope_identity(parent: &CodeUnit, node: Node<'_>) -> (String, 
     (short_name, fq.with_pushed(anon))
 }
 
-pub fn node_text<'a>(node: Node<'_>, source: &'a str) -> &'a str {
-    brokk_bifrost_core::analyzer::common::node_source_text(node, source)
-}
-
 pub fn normalize_whitespace(text: &str) -> String {
     brokk_bifrost_core::analyzer::common::collapse_whitespace(text)
 }
@@ -991,7 +1014,53 @@ pub fn parse_tree(source: &str) -> Option<Tree> {
 }
 
 pub fn is_comment_node(node: Node<'_>) -> bool {
-    matches!(node.kind(), "line_comment" | "block_comment")
+    brokk_bifrost_core::analyzer::tree_walk::is_comment_kind(node.kind())
+}
+
+/// Whether `node` is the object expression of a Java field or method access.
+pub fn java_field_access_is_selector_object(node: Node<'_>) -> bool {
+    node.parent().is_some_and(|parent| {
+        matches!(parent.kind(), "field_access" | "method_invocation")
+            && parent.child_by_field_name("object") == Some(node)
+    })
+}
+
+/// A declaration that introduces a name in one of Java's callable scopes.
+#[derive(Clone, Copy)]
+pub enum JavaScopeDeclaration<'tree> {
+    /// A direct child of a method, constructor, or compact-constructor parameter list.
+    MethodParameter(Node<'tree>),
+    /// The parameter declared by a catch clause.
+    CatchParameter(Node<'tree>),
+    /// The binding name declared by an enhanced-for statement.
+    EnhancedForName(Node<'tree>),
+}
+
+/// The method, catch, or enhanced-for bindings introduced by `node`.
+pub fn java_scope_declarations<'tree>(node: Node<'tree>) -> Vec<JavaScopeDeclaration<'tree>> {
+    match node.kind() {
+        "method_declaration" | "constructor_declaration" | "compact_constructor_declaration" => {
+            let Some(parameters) = node.child_by_field_name("parameters") else {
+                return Vec::new();
+            };
+            let mut cursor = parameters.walk();
+            parameters
+                .named_children(&mut cursor)
+                .map(JavaScopeDeclaration::MethodParameter)
+                .collect()
+        }
+        "catch_clause" => node
+            .child_by_field_name("parameter")
+            .map(JavaScopeDeclaration::CatchParameter)
+            .into_iter()
+            .collect(),
+        "enhanced_for_statement" => node
+            .child_by_field_name("name")
+            .map(JavaScopeDeclaration::EnhancedForName)
+            .into_iter()
+            .collect(),
+        _ => Vec::new(),
+    }
 }
 
 pub fn is_declaration_parent(kind: &str) -> bool {
@@ -1250,11 +1319,10 @@ fn class_signature(node: Node<'_>, source: &str) -> String {
         .child_by_field_name("body")
         .map(|body| body.start_byte())
         .unwrap_or(node.end_byte());
-    let header = source
-        .get(node.start_byte()..body_start)
-        .unwrap_or("")
-        .trim_end();
-    format!("{} {{", normalize_whitespace(header))
+    format!(
+        "{} {{",
+        crate::source_header(source, node.start_byte(), body_start)
+    )
 }
 
 fn callable_signature(node: Node<'_>, source: &str) -> String {
@@ -1262,7 +1330,7 @@ fn callable_signature(node: Node<'_>, source: &str) -> String {
         .child_by_field_name("body")
         .map(|body| body.start_byte())
         .unwrap_or(node.end_byte());
-    normalize_whitespace(source.get(node.start_byte()..end).unwrap_or("").trim_end())
+    crate::source_header(source, node.start_byte(), end)
 }
 
 fn canonical_parameters_signature(parameters: Node<'_>, source: &str) -> String {
@@ -1464,8 +1532,12 @@ fn java_type_constructor_shape(node: Node<'_>) -> Option<JavaTypeConstructorShap
             let body = node.child_by_field_name("body")?;
             let has_explicit_constructor = {
                 let mut cursor = body.walk();
-                body.named_children(&mut cursor)
-                    .any(|child| child.kind() == "constructor_declaration")
+                body.named_children(&mut cursor).any(|child| {
+                    matches!(
+                        child.kind(),
+                        "constructor_declaration" | "compact_constructor_declaration"
+                    )
+                })
             };
             Some(if has_explicit_constructor {
                 JavaTypeConstructorShape::NoImplicit
@@ -1580,7 +1652,7 @@ fn field_signature(field_node: Node<'_>, declarator: Node<'_>, source: &str) -> 
 
 fn literal_field_initializer<'a>(value: Node<'_>, source: &'a str) -> Option<&'a str> {
     let kind = value.kind();
-    if kind.ends_with("_literal") || matches!(kind, "true" | "false" | "null_literal" | "null") {
+    if crate::is_literal_initializer_kind(kind) {
         Some(node_text(value, source).trim())
     } else {
         None
@@ -1732,11 +1804,7 @@ impl<'tree, 'source, 'parsed> JavaPrimaryParseState<'tree, 'source, 'parsed> {
 
     fn intern_source_declaration(&mut self, node: Node<'_>) -> SourceDeclarationId {
         let collector = self.resolution.source_collector_mut();
-        let occurrence = collector.intern_node(node);
-        let name = node
-            .child_by_field_name("name")
-            .map(|name| collector.intern_node(name));
-        collector.declare(occurrence, name)
+        collector.declare_node(node, node.child_by_field_name("name"))
     }
 
     fn direct_member_of_current_type(&self, node: Node<'_>) -> bool {
@@ -1756,6 +1824,14 @@ impl<'tree, 'source, 'parsed> JavaPrimaryParseState<'tree, 'source, 'parsed> {
                 .is_some_and(|body| body.id() == owner.body_id)
     }
 
+    fn direct_member_of_interface_or_annotation(&self, node: Node<'_>) -> bool {
+        self.direct_member_of_current_type(node)
+            && matches!(
+                self.source_visibility_owners.last().map(|owner| owner.kind),
+                Some(JavaSourceOwnerKind::Interface | JavaSourceOwnerKind::Annotation)
+            )
+    }
+
     fn source_type_shape(
         &self,
         node: Node<'_>,
@@ -1768,11 +1844,7 @@ impl<'tree, 'source, 'parsed> JavaPrimaryParseState<'tree, 'source, 'parsed> {
                 | "enum_declaration"
                 | "record_declaration"
                 | "annotation_type_declaration"
-        ) || (self.direct_member_of_current_type(node)
-            && matches!(
-                self.source_visibility_owners.last().map(|owner| owner.kind),
-                Some(JavaSourceOwnerKind::Interface | JavaSourceOwnerKind::Annotation)
-            ));
+        ) || self.direct_member_of_interface_or_annotation(node);
         JavaTypeShape {
             is_static: has_parent && (modifiers.is_static || implicit_static),
             constructor_shape: java_type_constructor_shape(node),
@@ -1784,11 +1856,7 @@ impl<'tree, 'source, 'parsed> JavaPrimaryParseState<'tree, 'source, 'parsed> {
         node: Node<'_>,
         modifiers: JavaDeclarationModifiers,
     ) -> JavaFieldShape {
-        let implicit_static_final = self.direct_member_of_current_type(node)
-            && matches!(
-                self.source_visibility_owners.last().map(|owner| owner.kind),
-                Some(JavaSourceOwnerKind::Interface | JavaSourceOwnerKind::Annotation)
-            );
+        let implicit_static_final = self.direct_member_of_interface_or_annotation(node);
         JavaFieldShape {
             is_static: modifiers.is_static || implicit_static_final,
             is_final: modifiers.is_final || implicit_static_final,
@@ -2070,7 +2138,26 @@ impl<'tree, 'source, 'parsed> JavaPrimaryParseState<'tree, 'source, 'parsed> {
         None
     }
 
-    fn add_class_scope(&mut self, node: Node<'_>) -> bool {
+    fn register_class_scope(
+        &mut self,
+        unit: CodeUnit,
+        anchor: Node<'tree>,
+        raw_supertypes: Vec<String>,
+        parent: Option<CodeUnit>,
+    ) -> (CodeUnit, CodeUnit) {
+        let top_level = self.current_top_level().unwrap_or_else(|| unit.clone());
+        self.parsed.add_code_unit(
+            unit.clone(),
+            anchor,
+            self.source,
+            parent,
+            Some(top_level.clone()),
+        );
+        self.parsed.set_raw_supertypes(unit.clone(), raw_supertypes);
+        (unit, top_level)
+    }
+
+    fn add_class_scope(&mut self, node: Node<'tree>) -> bool {
         let parent = self.current_owner().cloned();
         let is_root = parent.is_none();
         let type_shape = self.resolution.source_type_shape_for(node);
@@ -2084,17 +2171,12 @@ impl<'tree, 'source, 'parsed> JavaPrimaryParseState<'tree, 'source, 'parsed> {
         ) else {
             return false;
         };
-        let unit = facts.unit.clone();
-        let top_level = self.current_top_level().unwrap_or_else(|| unit.clone());
-        self.parsed.add_code_unit(
-            unit.clone(),
+        let (unit, top_level) = self.register_class_scope(
+            facts.unit.clone(),
             facts.anchor,
-            self.source,
+            facts.raw_supertypes,
             parent,
-            Some(top_level.clone()),
         );
-        self.parsed
-            .set_raw_supertypes(unit.clone(), facts.raw_supertypes);
         let declaration = self.record_unit_source(node, &unit);
         let visibility = self.source_visibility(node);
         let mut metadata = SignatureMetadata::new(facts.signature, Vec::new())
@@ -2142,7 +2224,7 @@ impl<'tree, 'source, 'parsed> JavaPrimaryParseState<'tree, 'source, 'parsed> {
         true
     }
 
-    fn add_synthetic_class_scope(&mut self, node: Node<'_>) -> bool {
+    fn add_synthetic_class_scope(&mut self, node: Node<'tree>) -> bool {
         let Some(parent) = self.current_owner().cloned() else {
             return false;
         };
@@ -2168,17 +2250,8 @@ impl<'tree, 'source, 'parsed> JavaPrimaryParseState<'tree, 'source, 'parsed> {
             ),
             _ => return false,
         };
-        let unit = facts.unit;
-        let top_level = self.current_top_level().unwrap_or_else(|| unit.clone());
-        self.parsed.add_code_unit(
-            unit.clone(),
-            facts.anchor,
-            self.source,
-            Some(parent),
-            Some(top_level.clone()),
-        );
-        self.parsed
-            .set_raw_supertypes(unit.clone(), facts.raw_supertypes);
+        let (unit, top_level) =
+            self.register_class_scope(facts.unit, facts.anchor, facts.raw_supertypes, Some(parent));
         self.parsed.add_signature_with_metadata(
             unit.clone(),
             SignatureMetadata::new(facts.signature, Vec::new())
@@ -2193,7 +2266,7 @@ impl<'tree, 'source, 'parsed> JavaPrimaryParseState<'tree, 'source, 'parsed> {
         true
     }
 
-    fn enter_declaration(&mut self, node: Node<'_>, active: bool) {
+    fn enter_declaration(&mut self, node: Node<'tree>, active: bool) {
         let mut pushed = false;
         if active {
             match node.kind() {
@@ -2490,7 +2563,7 @@ impl<'tree, 'source, 'parsed> JavaPrimaryParseState<'tree, 'source, 'parsed> {
         }
     }
 
-    fn finish(mut self) {
+    fn finish(mut self, root: Node<'_>) {
         assert_eq!(self.structural_parents, [None]);
         assert!(self.declaration_contexts.is_empty());
         assert!(self.declaration_exits.is_empty());
@@ -2498,7 +2571,7 @@ impl<'tree, 'source, 'parsed> JavaPrimaryParseState<'tree, 'source, 'parsed> {
         assert!(self.source_visibility_exits.is_empty());
         let structural = self
             .structural
-            .finish()
+            .finish(root)
             .expect("complete Java preparation has no structural admission limit");
         let native: JavaResolutionExtraction = self.resolution.finish();
         let source_imports = std::mem::take(&mut self.source_imports);
@@ -2702,40 +2775,17 @@ pub fn parse_java_file(file: &ProjectFile, source: &str, tree: &Tree) -> ParsedF
         &call_site_context,
     );
     walk_java_primary_tree(root, &mut state);
-    state.finish();
+    state.finish(root);
     parsed
 }
 
 #[cfg(test)]
-mod relational_name_tests {
-    use super::*;
-    use brokk_bifrost_core::analyzer::Language;
-
-    #[test]
-    fn structured_lookup_canonicalization_matches_the_legacy_spelling() {
-        let interner = segment_interner();
-        let mut name = FqName::new();
-        name.push(interner.intern("com", SegmentKind::Package));
-        name.push(interner.intern("Outer", SegmentKind::Type));
-        name.push(interner.intern("Inner<T>", SegmentKind::Nested));
-        let exact = name.display_native(Language::Java, interner);
-        let structured = normalize_java_fq_name(&name).display_native(Language::Java, interner);
-        assert_eq!(structured, normalize_java_full_name(&exact));
-        assert_eq!(structured, "com.Outer.Inner");
-    }
-}
-
-#[cfg(test)]
 mod same_package_identifier_tests {
+
     use super::*;
-    use tree_sitter::Parser;
 
     fn parse(source: &str) -> Tree {
-        let mut parser = Parser::new();
-        parser
-            .set_language(&tree_sitter_java::LANGUAGE.into())
-            .expect("java grammar");
-        parser.parse(source, None).expect("java tree")
+        parse_tree(source).expect("java tree")
     }
 
     /// The `type_identifiers` family the coarse file graph reads for Java's
@@ -2744,6 +2794,7 @@ mod same_package_identifier_tests {
     /// `type_identifier`, so the walk has to keep capitalized identifiers --
     /// but not a declaration's own name, which is a definition rather than a
     /// reference.
+
     #[test]
     fn type_identifiers_keep_referenced_names_and_drop_declared_ones() {
         let source = r#"package sample;
@@ -2777,16 +2828,12 @@ class Outer {
 
 #[cfg(test)]
 mod source_shape_tests {
+
     use super::*;
     use brokk_bifrost_core::analyzer::model::JavaTypeConstructorShape;
-    use tree_sitter::Parser;
 
     fn parse(source: &str) -> ParsedFile {
-        let mut parser = Parser::new();
-        parser
-            .set_language(&tree_sitter_java::LANGUAGE.into())
-            .expect("java grammar");
-        let tree = parser.parse(source, None).expect("java tree");
+        let tree = parse_tree(source).expect("java tree");
         let file = ProjectFile::new(
             std::env::temp_dir().join("java-source-shape"),
             "src/Fixture.java",
@@ -2840,6 +2887,34 @@ mod source_shape_tests {
     }
 
     #[test]
+    fn callable_dispatch_extensibility_follows_java_finality() {
+        let parsed = parse(
+            "final class FinalOwner { void inherited() {} } \
+             class OpenOwner { void open() {} final void fixed() {} private void secret() {} static void shared() {} } \
+             record RecordOwner(int value) { void recordMethod() {} }",
+        );
+
+        for prefix in [
+            "void inherited",
+            "final void fixed",
+            "private void secret",
+            "static void shared",
+            "void recordMethod",
+        ] {
+            assert_eq!(
+                metadata(&parsed, prefix).dispatch_extensibility(),
+                Some(DispatchExtensibility::Closed),
+                "{prefix} has a declaration-side closed dispatch proof",
+            );
+        }
+        assert_eq!(
+            metadata(&parsed, "void open").dispatch_extensibility(),
+            Some(DispatchExtensibility::Open),
+            "an overridable instance method stays open",
+        );
+    }
+
+    #[test]
     fn synthetic_class_metadata_does_not_publish_source_constructor_shape() {
         let parsed =
             parse("class Outer { Runnable value = new Runnable() { public void run() {} }; }");
@@ -2859,12 +2934,14 @@ mod source_shape_tests {
 
 #[cfg(test)]
 mod type_parameter_metadata_tests {
+
     use super::*;
     use tree_sitter::Parser;
 
     /// A Java class-like declaration records its own type-parameter list, so a
     /// nongeneric class is a proven zero rather than the unread list an empty
     /// `type_parameters` used to mean (#1651).
+
     #[test]
     fn java_class_like_declarations_record_their_type_parameters() {
         let source = r#"package example;
@@ -2887,26 +2964,14 @@ public class Foo {
         let tree = parser.parse(source, None).expect("Java tree");
         let parsed = parse_java_file(&file, source, &tree);
 
-        let mut recorded = parsed
-            .signature_metadata
-            .iter()
-            .flat_map(|(unit, metadata)| {
-                metadata
-                    .iter()
-                    .filter(|entry| entry.type_parameters_recorded())
-                    .map(|entry| (unit.short_name().to_string(), entry.type_parameters().len()))
-            })
-            .collect::<Vec<_>>();
-        recorded.sort();
-        assert_eq!(
-            recorded,
-            vec![
-                ("Foo".to_string(), 0),
-                ("Foo.Colour".to_string(), 0),
-                ("Foo.Inner".to_string(), 1),
-                ("Foo.Pair".to_string(), 2),
+        crate::test_support::assert_recorded_type_parameter_counts(
+            &parsed,
+            &[
+                ("Foo", 0),
+                ("Foo.Colour", 0),
+                ("Foo.Inner", 1),
+                ("Foo.Pair", 2),
             ],
-            "a generic method's own parameters stay a callable fact, unrecorded here"
         );
     }
 }

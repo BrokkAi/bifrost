@@ -31,8 +31,22 @@ pub(in crate::analyzer) const CPP_SOURCE_HEADER_SQL: &str =
        AND source.publication_state = 'complete' AND meta.is_complete = 1 AND ready.available = 1";
 
 fn required<T>(value: Option<T>, label: &str) -> Result<T> {
-    value.ok_or_else(|| StoreError::new(format!("C++ source syntax is missing {label}")))
+    crate::analyzer::store::required_source_value(value, "C++ source syntax", label)
 }
+
+fn decode_base_access_specifier(value: &str) -> Result<CppAccessSpecifier> {
+    match value {
+        "public" => Ok(CppAccessSpecifier::Public),
+        "protected" => Ok(CppAccessSpecifier::Protected),
+        "private" => Ok(CppAccessSpecifier::Private),
+        "unknown" => Ok(CppAccessSpecifier::Unknown),
+        value => Err(StoreError::new(format!(
+            "invalid C++ base access specifier {value:?}"
+        ))),
+    }
+}
+
+type StoredCppBase = (bool, bool, CppAccessSpecifier, Vec<String>);
 
 impl AnalyzerStore {
     pub(crate) fn cpp_source_facts<A: LanguageAdapter>(
@@ -205,9 +219,9 @@ impl AnalyzerStore {
                     using.1.push(row.get(3)?);
                 }
             );
-            let mut bases: HashMap<u32, Vec<(bool, bool, Vec<String>)>> = HashMap::default();
+            let mut bases: HashMap<u32, Vec<StoredCppBase>> = HashMap::default();
             read_rows!(
-                "SELECT declaration_id, ordinal, is_virtual, absolute
+                "SELECT declaration_id, ordinal, is_virtual, absolute, access
              FROM source_cpp_bases WHERE blob_id = ?1 ORDER BY declaration_id, ordinal",
                 row,
                 {
@@ -220,6 +234,7 @@ impl AnalyzerStore {
                     list.push((
                         strict_bool(row.get(2)?, "C++ virtual base")?,
                         strict_bool(row.get(3)?, "C++ absolute base")?,
+                        decode_base_access_specifier(&row.get::<_, String>(4)?)?,
                         Vec::new(),
                     ));
                 }
@@ -239,10 +254,10 @@ impl AnalyzerStore {
                         .get_mut(base_ordinal)
                         .ok_or_else(|| StoreError::new("C++ base component ordinal is invalid"))?;
                     let ordinal: usize = row.get(2)?;
-                    if ordinal != base.2.len() {
+                    if ordinal != base.3.len() {
                         return Err(StoreError::new("non-dense C++ base components"));
                     }
-                    base.2.push(row.get(3)?);
+                    base.3.push(row.get(3)?);
                 }
             );
 
@@ -345,6 +360,8 @@ impl AnalyzerStore {
                 includes,
                 declarations: Vec::new(),
                 using_namespaces,
+                expressions: Vec::new(),
+                statement_facts: Default::default(),
             };
             read_rows!(
                 "SELECT declaration_id, occurrence_role, conditional_family_occurrence_id,
@@ -520,10 +537,13 @@ impl AnalyzerStore {
                             .collect(),
                         bases: bases_for_declaration
                             .into_iter()
-                            .map(|(is_virtual, absolute, components)| CppBaseSpecifierFact {
-                                components,
-                                is_virtual,
-                                absolute,
+                            .map(|(is_virtual, absolute, access, components)| {
+                                CppBaseSpecifierFact {
+                                    components,
+                                    is_virtual,
+                                    absolute,
+                                    access,
+                                }
                             })
                             .collect(),
                         callable_comparable_shapes,

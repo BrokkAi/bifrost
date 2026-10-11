@@ -1,12 +1,18 @@
 # Python process-input and os.system packs
 
+> Legacy transition copy: product pack authoring belongs in `bifrost-packs`
+> or the private premium pack repository. Follow [the placement policy](../../CONTRIBUTING.md#release-process).
+> Sources here are frozen pending verified v0.13.0 release and dependency migration.
+> The technical notes below describe retained contracts and test tooling.
+
 Three reviewed packs carry the first Python security contract:
 
 - `process-inputs/bifrost.python-process-inputs.json` publishes the `os`
   module's `environ` container and the `sys` module's `argv` container as
   runtime process inputs, with one keyed-read behavior each.
 - `os-command/bifrost.python-os-command-declarations.json` declares the `os`
-  module type and the exact `os.system(command)` member.
+  module type and exact `os.system`, `os.chmod`, `os.open`, `os.mkdir`, and
+  `os.makedirs` members.
 - `os-command/bifrost.python-os-command-summaries.json` carries that member's
   complete procedure summary: no transfer, and one escape effect on the
   command argument.
@@ -86,5 +92,5 @@ Compile the packs with:
 cargo run -p brokk-bifrost-semantic-packs --features release-tooling \
   --bin bifrost-semantic-pack -- compile \
   semantic-packs/python/process-inputs/bifrost.python-process-inputs.json \
-  crates/bifrost-semantic-packs/embedded/python-process-inputs
+  /path/to/test-output/python-process-inputs
 ```

@@ -4,6 +4,7 @@ use crate::analyzer::store::AnalyzerStore;
 use crate::analyzer::store::tests::{oid_for, parse_state};
 use crate::inline_project::InlineTestProject;
 use brokk_bifrost_core::analyzer::ruby_facts::{RubyLoadKind, RubyRuntimeBoundary};
+use brokk_bifrost_test_macros::hardwon;
 
 const SOURCE: &str = r#"require_relative "support"
 module Outer
@@ -261,6 +262,7 @@ fn ruby_source_publication_lookup_seeks_before_and_after_statistics() {
 }
 
 #[test]
+#[hardwon("3683ce96e2db: failed Ruby publication exposed partial source facts")]
 fn ruby_cancelled_and_failed_publications_rollback_family_rows_and_retry() {
     use crate::CancellationToken;
     use crate::analyzer::store::PersistBatchTargets;
@@ -342,6 +344,7 @@ fn ruby_cancelled_and_failed_publications_rollback_family_rows_and_retry() {
 }
 
 #[test]
+#[hardwon("3683ce96e2db: dynamic Ruby load calls lost their runtime boundary after reopen")]
 fn ruby_dynamic_load_arguments_and_receivers_remain_explicit_boundaries_after_reopen() {
     let cases = [
         (

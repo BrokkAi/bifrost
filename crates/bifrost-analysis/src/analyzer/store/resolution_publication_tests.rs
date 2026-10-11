@@ -3,6 +3,7 @@ use crate::analyzer::store::resolution_publication::{
     PublishedResolutionContent, ResolutionContentInput, ResolutionContentPublicationOutcome,
 };
 use crate::analyzer::store::resolution_selection::SelectedResolutionStale;
+use brokk_bifrost_test_macros::hardwon;
 
 const SOURCE: &str = "pub fn target() {}\npub fn caller() { target(); }\n";
 const HOST: &str = "src/lib.rs";
@@ -294,6 +295,7 @@ fn cached_parsed_content_checks_selected_semantic_language() {
 }
 
 #[test]
+#[hardwon("3da13ca2218b: cancellation after publication writes left partial content")]
 fn selected_publication_cancellation_after_writes_rolls_back_and_retries() {
     let store = AnalyzerStore::open_ephemeral().unwrap();
     let snapshot = owner(&store, '1');
@@ -377,6 +379,7 @@ fn counted_logical_store_rows(conn: &rusqlite::Connection, tables: &[String]) ->
 }
 
 #[test]
+#[hardwon("3da13ca2218b: legacy replacement and restored roots escaped complete row accounting")]
 fn parsed_legacy_replacement_and_restored_roots_are_fully_charged() {
     let store = AnalyzerStore::open_ephemeral().unwrap();
     let snapshot = owner(&store, '2');
@@ -453,6 +456,7 @@ fn parsed_legacy_replacement_and_restored_roots_are_fully_charged() {
 }
 
 #[test]
+#[hardwon("3da13ca2218b: prewrite accounting miscounted shared ids and multibyte payloads")]
 fn large_shared_ids_and_multibyte_payloads_fit_prewrite_estimates() {
     let store = AnalyzerStore::open_ephemeral().unwrap();
     let snapshot = owner(&store, '3');
@@ -495,6 +499,7 @@ fn large_shared_ids_and_multibyte_payloads_fit_prewrite_estimates() {
 }
 
 #[test]
+#[hardwon("3da13ca2218b: a collector snapshot deleted a blob admitted concurrently")]
 fn collector_snapshot_cannot_delete_an_externally_admitted_cached_blob() {
     use std::io::{BufRead, Write};
     const READY: &str = "RP_CACHED_ADMISSION_COMMITTED";
@@ -594,6 +599,12 @@ fn collector_snapshot_cannot_delete_an_externally_admitted_cached_blob() {
         .conn
         .execute(|conn| conn.execute("DELETE FROM workspace_resolution_content_roots", []))
         .unwrap();
+    // Keep this test focused on StoreError's primary and extended SQLite codes.
+    // Production writable connections now default to IMMEDIATE; explicitly
+    // restore DEFERRED only here to construct the stale-snapshot failure.
+    collector.conn.execute(|conn| {
+        conn.set_transaction_behavior(rusqlite::TransactionBehavior::Deferred);
+    });
     let pending = Arc::new(std::sync::Mutex::new(None::<PendingPublisher>));
     let callback_pending = Arc::clone(&pending);
     let result = collector.gc_with(move |candidate| {
@@ -644,6 +655,7 @@ fn collector_snapshot_cannot_delete_an_externally_admitted_cached_blob() {
 }
 
 #[test]
+#[hardwon("3da13ca2218b: core collection dropped roots published after its snapshot")]
 fn actual_cached_publisher_roots_survive_real_core_post_snapshot_collection() {
     use brokk_bifrost_core::{cache_gc, gitblob};
     let temp = tempfile::tempdir().unwrap();
@@ -1193,6 +1205,7 @@ fn callable_parameter_ownership_is_exact_indexed_and_cascades_with_linear_work()
 }
 
 #[test]
+#[hardwon("7733e6d12b42: node payload schema validation must charge newly stored fields")]
 fn node_payload_schema_checks_null_shapes_membership_and_exact_key_reads() {
     let store = AnalyzerStore::open_ephemeral().unwrap();
     let snapshot = owner(&store, '9');

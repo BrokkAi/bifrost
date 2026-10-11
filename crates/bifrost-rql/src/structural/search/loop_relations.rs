@@ -60,7 +60,7 @@ fn row(
             range: public_range(candidate.coordinates),
             body_range: candidate.body_coordinates.map(public_range),
             loop_kind: match candidate.kind {
-                LoopKind::While => "while",
+                LoopKind::While | LoopKind::Until => "while",
                 LoopKind::For => "for",
                 LoopKind::Do => "do",
             },
@@ -94,23 +94,21 @@ fn report_open(
     reason: impl std::fmt::Debug,
     diagnostics: &mut Vec<CodeQueryDiagnostic>,
 ) {
-    diagnostics.push(CodeQueryDiagnostic {
-        code: CodeQueryDiagnosticCode::LoopRelationDerivationIncomplete,
-        impact: CodeQueryDiagnosticImpact::Incomplete,
-        branch: Vec::new(),
-        language: procedure
+    diagnostics.push(super::incomplete_diagnostic(
+        CodeQueryDiagnosticCode::LoopRelationDerivationIncomplete,
+        procedure
             .handle
             .artifact()
             .key()
             .language()
             .language()
             .config_label(),
-        message: format!(
+        format!(
             "{} has open loop relation evidence: {reason:?}",
             procedure.wire_id()
         ),
-        exhausted_roots: Vec::new(),
-    });
+        Vec::new(),
+    ));
 }
 
 pub(super) fn loop_relation_expansions(
@@ -206,6 +204,7 @@ pub(super) fn loop_relation_expansions(
             let site = candidate.site.expect("qualified loop has a source site");
             let kind = match site.kind {
                 LoopKind::While => LoopSourceKind::While,
+                LoopKind::Until => LoopSourceKind::Until,
                 LoopKind::For => LoopSourceKind::For,
                 LoopKind::Do => LoopSourceKind::Do,
             };

@@ -11,7 +11,7 @@ use crate::analyzer::lexical_definitions::LexicalDefinition;
 use crate::analyzer::symbol_lookup::{
     CodeUnitResolution, FuzzyResolveBudget, FuzzyResolveStop, is_bare_symbol_query,
     resolve_codeunit_exact, resolve_codeunit_fuzzy, resolve_codeunit_fuzzy_bounded,
-    resolve_enclosing_codeunits, strip_trailing_call_suffix, symbol_selector_leaf,
+    resolve_enclosing_codeunits, strip_trailing_call_suffix,
 };
 use crate::analyzer::test_paths;
 use crate::analyzer::usages::get_definition::{
@@ -79,12 +79,11 @@ use selectors::{language_name, likely_file_target_extension};
 use scan_usages::{
     ScanUsageRequest, ScanUsagesWorkEntry, SymbolUsageRenderState, UsageHitRow,
     build_scan_usages_summary, classify_scan_usages_entry, function_like_macro_query,
-    usage_failure_hint,
 };
 #[cfg(test)]
 use selectors::{DefinitionCandidateRenderCache, definition_candidate_from_range};
 #[cfg(test)]
-use summaries::{route_summary_targets, trim_summary_signature};
+use summaries::route_summary_targets;
 
 // Re-export the exact previous public/pub(crate) surface of `searchtools.rs`
 // so that `crate::searchtools::X` keeps resolving for every existing
@@ -164,6 +163,7 @@ pub use scan_usages::UsageFailureInfo;
 pub use scan_usages::UsageFileGroup;
 pub use scan_usages::UsageGraphCallSite;
 pub use scan_usages::UsageGraphEdge;
+pub use scan_usages::UsageGraphIncompleteReason;
 pub use scan_usages::UsageGraphNode;
 pub use scan_usages::UsageGraphParams;
 pub use scan_usages::UsageGraphResult;
@@ -179,6 +179,7 @@ pub use scan_usages::scan_usages_by_location;
 pub use scan_usages::scan_usages_by_reference;
 #[cfg(test)]
 pub(crate) use scan_usages::selected_usage_graph_result;
+pub(crate) use scan_usages::usage_graph_at_lines;
 #[cfg(any(test, feature = "test-support"))]
 pub use scan_usages::{
     SelectedUsageGraphBuildOutcome, SelectedUsageGraphTelemetry,
@@ -323,10 +324,8 @@ pub const GET_SYMBOL_SOURCES_MAX_FILES_PER_TARGET: usize = 10;
 /// ranking is this tool's normal, intended use, so the cap only has to catch
 /// pathological explosions.
 ///
-/// The value is provisional. It comes from the Firefox measurement in
-/// `.agents/docs/codescale-grep-hard-checkpoint-2026-08-06.md` -- about 34 s of
-/// ranking for a broad six-pattern search -- without a candidate count for that
-/// workload. Record the measured count here and retune once one exists.
+/// The value is provisional because no candidate count is pinned for a broad
+/// search workload. Record that count before retuning the cap.
 pub const SEARCH_SYMBOLS_MAX_RANKED_CANDIDATES: usize = 10_000;
 
 /// What a too-broad target matched more of than the tool will process.

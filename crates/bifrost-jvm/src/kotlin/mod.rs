@@ -8,6 +8,7 @@ pub mod graph_support;
 pub mod hierarchy;
 pub mod imports;
 pub mod language;
+pub mod resolution;
 pub mod structural;
 pub mod supertypes;
 pub mod syntax;

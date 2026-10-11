@@ -1,10 +1,11 @@
 use crate::graph::resolver::JsTsUsageIndex;
 use crate::imports::resolve_js_ts_module_specifier;
-use crate::model::node_text;
 use crate::tsconfig::AliasResolver;
 use brokk_bifrost_core::analyzer::capabilities::{
     DescendantIndexScope, DirectDescendantIndex, TypeHierarchyProvider,
 };
+use brokk_bifrost_core::analyzer::common::nonempty_node_source_text as non_empty_node_text;
+use brokk_bifrost_core::analyzer::structural::adapter_helpers::first_named_child;
 use brokk_bifrost_core::analyzer::usages::model::ImportKind;
 use brokk_bifrost_core::analyzer::{CodeUnit, CodeUnitIndex, Language, ProjectFile};
 use brokk_bifrost_core::hash::{HashMap, HashSet};
@@ -191,16 +192,6 @@ fn type_reference_text(node: Node<'_>, source: &str) -> Option<String> {
     }
 }
 
-fn first_named_child(node: Node<'_>) -> Option<Node<'_>> {
-    let mut cursor = node.walk();
-    node.named_children(&mut cursor).next()
-}
-
-fn non_empty_node_text(node: Node<'_>, source: &str) -> Option<String> {
-    let text = node_text(node, source).trim();
-    (!text.is_empty()).then(|| text.to_string())
-}
-
 fn resolve_unique_type(
     analyzer: &dyn CodeUnitIndex,
     index: &JsTsUsageIndex,
@@ -247,21 +238,17 @@ fn resolve_imported_type(
         .import_bindings(source_file, local_name)
         .filter(|binding| binding.kind == ImportKind::Namespace)
     {
-        let module_files = resolve_js_ts_module_specifier(
-            source_file,
-            &binding.module_specifier,
-            language,
-            Some(alias_resolver),
-        );
-        candidates.extend(exported_type_declarations(
+        candidates.extend(imported_export_type_declarations(
             analyzer,
             index,
-            &module_files,
+            language,
+            alias_resolver,
+            source_file,
+            &binding.module_specifier,
             namespace_export,
         ));
     }
-    candidates.sort();
-    candidates.dedup();
+    sort_and_deduplicate_type_candidates(&mut candidates);
     candidates
 }
 
@@ -281,22 +268,41 @@ fn resolve_local_import_binding(
             ImportKind::CommonJsRequire => binding.imported_name.as_deref().unwrap_or("default"),
             ImportKind::Namespace | ImportKind::Glob => continue,
         };
-        let module_files = resolve_js_ts_module_specifier(
-            source_file,
-            &binding.module_specifier,
-            language,
-            Some(alias_resolver),
-        );
-        candidates.extend(exported_type_declarations(
+        candidates.extend(imported_export_type_declarations(
             analyzer,
             index,
-            &module_files,
+            language,
+            alias_resolver,
+            source_file,
+            &binding.module_specifier,
             exported_name,
         ));
     }
+    sort_and_deduplicate_type_candidates(&mut candidates);
+    candidates
+}
+
+fn imported_export_type_declarations(
+    analyzer: &dyn CodeUnitIndex,
+    index: &JsTsUsageIndex,
+    language: Language,
+    alias_resolver: &AliasResolver,
+    source_file: &ProjectFile,
+    module_specifier: &str,
+    exported_name: &str,
+) -> Vec<CodeUnit> {
+    let module_files = resolve_js_ts_module_specifier(
+        source_file,
+        module_specifier,
+        language,
+        Some(alias_resolver),
+    );
+    exported_type_declarations(analyzer, index, &module_files, exported_name)
+}
+
+fn sort_and_deduplicate_type_candidates(candidates: &mut Vec<CodeUnit>) {
     candidates.sort();
     candidates.dedup();
-    candidates
 }
 
 fn exported_type_declarations(

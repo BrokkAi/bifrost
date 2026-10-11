@@ -6,14 +6,15 @@ use super::plan::{ProcedureRefinements, TypeFlowDiscovery, TypeFlowPlanError};
 use super::refinement_sources::DefinitionSources;
 use crate::analyzer::WorkspaceAnalyzer;
 use crate::analyzer::semantic::{
-    CancellationToken, ClassAtom, ClassIdentity, IcfgProvider, ProcedureHandle,
-    ProcedurePortHandle, ProgramPointHandle, ProgramPointId, SemanticBudget, SemanticEffect,
-    SourceSite, SourceSiteKind, TypeFlowAdapter, UnknownReason, ValueId, WorkspaceIcfgProvider,
+    CancellationToken, ClassAtom, ClassIdentity, DynamicFieldNameSet, IcfgProvider,
+    ProcedureHandle, ProcedurePortHandle, ProgramPointHandle, ProgramPointId, SemanticBudget,
+    SemanticEffect, SourceSite, SourceSiteKind, TypeFlowAdapter, UnknownReason, ValueId,
+    WorkspaceIcfgProvider,
 };
 use crate::dataflow::{DataflowRequest, SolverBudget};
 use crate::hash::{HashMap, HashSet};
 use crate::value_flow::{
-    ClosureLimits, ValueFlowCache, ValueFlowCarrier, WorkspaceValueFlowProvider,
+    ClosureLimits, ValueFlowCache, ValueFlowCarrier, ValueFlowSourceId, WorkspaceValueFlowProvider,
     solve_value_flow_with_summaries,
 };
 
@@ -21,6 +22,7 @@ use crate::value_flow::{
 pub(super) struct PendingDynamicWrite {
     pub procedure: ProcedureHandle,
     pub receiver: Option<ValueId>,
+    pub names: DynamicFieldNameSet,
     pub site: SourceSite,
 }
 
@@ -34,6 +36,21 @@ pub struct DynamicWriteEvidence {
 }
 
 impl DynamicWriteEvidence {
+    /// A stable source location suitable for a conditional finding sentence.
+    pub fn location(&self) -> String {
+        let path = crate::analyzer::semantic::WorkspaceRelativePath::try_from_path(
+            self.site.file.rel_path(),
+        )
+        .expect("a workspace write has a portable relative path");
+        let position = self.site.span.start();
+        format!(
+            "{}:{}:{}",
+            path.as_str(),
+            position.line() + 1,
+            position.byte_column() + 1
+        )
+    }
+
     pub fn origin(&self) -> String {
         let path = crate::analyzer::semantic::WorkspaceRelativePath::try_from_path(
             self.site.file.rel_path(),
@@ -61,15 +78,18 @@ pub(super) struct ScopedDynamicWrite {
     pub bounds: Vec<ClassIdentity>,
     /// An unbounded receiver alternative can affect any class.
     pub global: bool,
+    /// Names this write can install, independent of its receiver scope.
+    pub names: DynamicFieldNameSet,
     pub evidence: DynamicWriteEvidence,
 }
 
 impl ScopedDynamicWrite {
-    pub fn open(site: SourceSite, reason: UnknownReason) -> Self {
+    pub fn open(site: SourceSite, names: DynamicFieldNameSet, reason: UnknownReason) -> Self {
         Self {
             classes: Vec::new(),
             bounds: Vec::new(),
             global: true,
+            names,
             evidence: DynamicWriteEvidence {
                 site,
                 reason: Some(reason),
@@ -78,6 +98,34 @@ impl ScopedDynamicWrite {
     }
 
     pub fn affects(
+        &self,
+        class: &ClassIdentity,
+        hierarchy: &crate::analyzer::semantic::ClassHierarchy,
+        member: &str,
+    ) -> bool {
+        let can_install_member = match &self.names {
+            DynamicFieldNameSet::Exact(names) => names.iter().any(|name| name.as_ref() == member),
+            DynamicFieldNameSet::Prefix(prefix) => member.starts_with(prefix.as_ref()),
+            DynamicFieldNameSet::Any => true,
+            DynamicFieldNameSet::None => false,
+        };
+        can_install_member && self.receiver_affects(class, hierarchy)
+    }
+
+    /// Removals cannot make an absent member present, but can still make an
+    /// existing member's slot contents uncertain.
+    pub fn may_change_slot_contents(
+        &self,
+        class: &ClassIdentity,
+        hierarchy: &crate::analyzer::semantic::ClassHierarchy,
+        member: &str,
+    ) -> bool {
+        (matches!(&self.names, DynamicFieldNameSet::None)
+            && self.receiver_affects(class, hierarchy))
+            || self.affects(class, hierarchy, member)
+    }
+
+    fn receiver_affects(
         &self,
         class: &ClassIdentity,
         hierarchy: &crate::analyzer::semantic::ClassHierarchy,
@@ -143,6 +191,197 @@ enum WriteObservation {
     },
 }
 
+enum StructuralWriteReceiverBound {
+    NotApplicable,
+    Bounded(Vec<ClassIdentity>),
+    Unbounded(UnknownReason),
+}
+
+fn dynamic_type_write_receiver_bounds(
+    workspace: &WorkspaceAnalyzer,
+    adapter: &dyn TypeFlowAdapter,
+    write: &PendingDynamicWrite,
+) -> StructuralWriteReceiverBound {
+    let Some(receiver) = write.receiver else {
+        return StructuralWriteReceiverBound::NotApplicable;
+    };
+    match adapter.dynamic_type_write_receiver_bounds(
+        workspace,
+        &write.procedure,
+        receiver,
+        write.site.span,
+    ) {
+        Ok(Some(bounds)) => StructuralWriteReceiverBound::Bounded(bounds),
+        Ok(None) => StructuralWriteReceiverBound::NotApplicable,
+        Err(reason) => StructuralWriteReceiverBound::Unbounded(reason),
+    }
+}
+
+fn non_escaping_nested_write_receiver_bounds(
+    workspace: &WorkspaceAnalyzer,
+    adapter: &dyn TypeFlowAdapter,
+    write: &PendingDynamicWrite,
+) -> StructuralWriteReceiverBound {
+    let Some(receiver) = write.receiver else {
+        return StructuralWriteReceiverBound::NotApplicable;
+    };
+    match adapter.non_escaping_nested_write_receiver_bounds(
+        workspace,
+        &write.procedure,
+        receiver,
+        write.site.span,
+    ) {
+        Ok(Some(bounds)) => StructuralWriteReceiverBound::Bounded(bounds),
+        Ok(None) => StructuralWriteReceiverBound::NotApplicable,
+        Err(reason) => StructuralWriteReceiverBound::Unbounded(reason),
+    }
+}
+
+fn field_value_write_receiver_bounds(
+    workspace: &WorkspaceAnalyzer,
+    adapter: &dyn TypeFlowAdapter,
+    slots: &FieldSlotIndex,
+    writes: &[PendingDynamicWrite],
+    write: &PendingDynamicWrite,
+) -> StructuralWriteReceiverBound {
+    let Some((owner, member)) =
+        adapter.dynamic_write_receiver_field(workspace, &write.procedure, write.site.span)
+    else {
+        return StructuralWriteReceiverBound::NotApplicable;
+    };
+    let Some(slot) = slots.slot(&owner, &member) else {
+        return StructuralWriteReceiverBound::Unbounded(UnknownReason::FieldSlotIncomplete);
+    };
+    let hierarchy = adapter.class_hierarchy(workspace, &owner);
+    for other in writes {
+        if other.site == write.site || !dynamic_names_may_change_member(&other.names, &member) {
+            continue;
+        }
+        if adapter
+            .dynamic_write_receiver_field(workspace, &other.procedure, other.site.span)
+            .is_some()
+        {
+            continue;
+        }
+        if adapter.dynamic_write_receiver_is_explicitly_unbounded(
+            workspace,
+            &other.procedure,
+            other.site.span,
+        ) {
+            return StructuralWriteReceiverBound::Unbounded(UnknownReason::DynamicFieldWrite);
+        }
+        let mut bounds = None;
+        if let Some(receiver) = other.receiver {
+            match adapter.dynamic_type_write_receiver_bounds(
+                workspace,
+                &other.procedure,
+                receiver,
+                other.site.span,
+            ) {
+                Ok(Some(classes)) => bounds = Some(classes),
+                Ok(None) => {}
+                Err(_) => {
+                    return StructuralWriteReceiverBound::Unbounded(
+                        UnknownReason::DynamicFieldWrite,
+                    );
+                }
+            }
+            if bounds.is_none() {
+                match adapter.non_escaping_nested_write_receiver_bounds(
+                    workspace,
+                    &other.procedure,
+                    receiver,
+                    other.site.span,
+                ) {
+                    Ok(Some(classes)) => bounds = Some(classes),
+                    Ok(None) => {}
+                    Err(_) => {
+                        return StructuralWriteReceiverBound::Unbounded(
+                            UnknownReason::DynamicFieldWrite,
+                        );
+                    }
+                }
+            }
+        }
+        if bounds.is_none() {
+            bounds = adapter
+                .dynamic_write_receiver_bound(workspace, &other.procedure, other.site.span)
+                .map(|class| vec![class]);
+        }
+        let Some(bounds) = bounds else {
+            return StructuralWriteReceiverBound::Unbounded(UnknownReason::DynamicFieldWrite);
+        };
+        if bounds.is_empty() {
+            continue;
+        }
+        if bounds.iter().any(|bound| {
+            bound == &owner
+                || hierarchy.ancestors.contains(bound)
+                || hierarchy
+                    .descendants
+                    .as_ref()
+                    .is_some_and(|descendants| descendants.contains(bound))
+        }) {
+            return StructuralWriteReceiverBound::Unbounded(UnknownReason::DynamicFieldWrite);
+        }
+    }
+    let mut bounds = Vec::new();
+    let mut stores = HashSet::default();
+    for (_, site) in &slot.atoms {
+        if !stores.insert((site.file.clone(), site.span)) {
+            continue;
+        }
+        match adapter.field_store_value_bounds(workspace, &site.file, site.span, &member) {
+            Ok(Some(classes)) => {
+                for class in classes {
+                    if !bounds.contains(&class) {
+                        bounds.push(class);
+                    }
+                }
+            }
+            Ok(None) => {
+                return StructuralWriteReceiverBound::Unbounded(UnknownReason::FieldSlotIncomplete);
+            }
+            Err(reason) => return StructuralWriteReceiverBound::Unbounded(reason),
+        }
+    }
+    if stores.is_empty() {
+        StructuralWriteReceiverBound::Unbounded(UnknownReason::FieldSlotIncomplete)
+    } else {
+        StructuralWriteReceiverBound::Bounded(bounds)
+    }
+}
+
+fn dynamic_names_may_change_member(names: &DynamicFieldNameSet, member: &str) -> bool {
+    match names {
+        DynamicFieldNameSet::Exact(names) => names.iter().any(|name| name.as_ref() == member),
+        DynamicFieldNameSet::Prefix(prefix) => member.starts_with(prefix.as_ref()),
+        DynamicFieldNameSet::Any => true,
+        // A removal cannot install a class, but it can invalidate this field's stored value.
+        DynamicFieldNameSet::None => true,
+    }
+}
+
+fn structural_write_receiver_bounds(
+    workspace: &WorkspaceAnalyzer,
+    adapter: &dyn TypeFlowAdapter,
+    slots: &FieldSlotIndex,
+    writes: &[PendingDynamicWrite],
+    write: &PendingDynamicWrite,
+) -> StructuralWriteReceiverBound {
+    match dynamic_type_write_receiver_bounds(workspace, adapter, write) {
+        StructuralWriteReceiverBound::NotApplicable => {
+            match non_escaping_nested_write_receiver_bounds(workspace, adapter, write) {
+                StructuralWriteReceiverBound::NotApplicable => {
+                    field_value_write_receiver_bounds(workspace, adapter, slots, writes, write)
+                }
+                bounded_or_unbounded => bounded_or_unbounded,
+            }
+        }
+        bounded_or_unbounded => bounded_or_unbounded,
+    }
+}
+
 impl WriteObservation {
     fn point(&self) -> &ProgramPointHandle {
         match self {
@@ -167,6 +406,10 @@ pub(super) fn survey(
     solver_budget: &mut SolverBudget,
     cancellation: &CancellationToken,
 ) -> Result<Vec<ScopedDynamicWrite>, TypeFlowPlanError> {
+    let structural_write_bounds = writes
+        .iter()
+        .map(|write| structural_write_receiver_bounds(workspace, adapter, slots, writes, write))
+        .collect::<Vec<_>>();
     let provider = WorkspaceIcfgProvider::new(workspace);
     let discovery = WorkspaceValueFlowProvider::with_oracle(
         provider.oracle().clone(),
@@ -175,23 +418,53 @@ pub(super) fn survey(
     );
     let mut effects = writes
         .iter()
-        .map(|write| ScopedDynamicWrite {
-            classes: Vec::new(),
-            bounds: Vec::new(),
-            global: false,
-            evidence: DynamicWriteEvidence {
-                site: write.site.clone(),
-                reason: None,
-            },
+        .zip(&structural_write_bounds)
+        .map(|(write, structural_bound)| {
+            let mut effect = ScopedDynamicWrite {
+                classes: Vec::new(),
+                bounds: Vec::new(),
+                global: false,
+                names: write.names.clone(),
+                evidence: DynamicWriteEvidence {
+                    site: write.site.clone(),
+                    reason: None,
+                },
+            };
+            match structural_bound {
+                StructuralWriteReceiverBound::NotApplicable => {}
+                StructuralWriteReceiverBound::Bounded(classes) => {
+                    apply_dynamic_receiver_bounds(workspace, adapter, &mut effect, classes);
+                }
+                StructuralWriteReceiverBound::Unbounded(reason) => {
+                    open_global(&mut effect, reason.clone());
+                }
+            }
+            effect
         })
         .collect::<Vec<_>>();
+    for (effect, write) in effects.iter_mut().zip(writes) {
+        if adapter.dynamic_write_receiver_is_explicitly_unbounded(
+            workspace,
+            &write.procedure,
+            write.site.span,
+        ) {
+            open_global(effect, UnknownReason::OpenTypeBound);
+        }
+    }
     // An immutable receiver has the same identity before an unsupported
     // continuation as at the write. Observe its entry port, including actual
     // unbound-call arguments; the enclosing class alone is not that proof.
     let mut stable_receivers = HashMap::default();
     let observations = writes
         .iter()
-        .map(|write| {
+        .zip(&structural_write_bounds)
+        .map(|(write, structural_bound)| {
+            if !matches!(
+                structural_bound,
+                StructuralWriteReceiverBound::NotApplicable
+            ) {
+                return None;
+            }
             let receiver = write.receiver?;
             let stable = stable_receivers
                 .entry(write.procedure.durable_key())
@@ -222,7 +495,7 @@ pub(super) fn survey(
                         .point_handle(point)
                         .expect("write point is live"),
                     event,
-                    carrier: ValueFlowCarrier::Value(
+                    carrier: ValueFlowCarrier::for_value(
                         write
                             .procedure
                             .value_handle(receiver)
@@ -239,21 +512,34 @@ pub(super) fn survey(
     // that bound where an observation fails scopes the write to its own
     // hierarchy instead of reopening every class in the workspace, which one
     // unobservable `setattr` in an unrelated module otherwise does.
-    let structural_receiver_classes = writes
+    let structural_receiver_bounds = writes
         .iter()
         .map(|write| {
-            let receiver = write.receiver?;
-            stable_receivers
-                .get(&write.procedure.durable_key())
-                .filter(|stable| stable.contains(&receiver))?;
-            adapter.enclosing_class(workspace, &write.procedure)
+            adapter
+                .dynamic_write_receiver_bound(workspace, &write.procedure, write.site.span)
+                .or_else(|| {
+                    let receiver = write.receiver?;
+                    stable_receivers
+                        .get(&write.procedure.durable_key())
+                        .filter(|stable| stable.contains(&receiver))?;
+                    adapter.enclosing_class(workspace, &write.procedure)
+                })
         })
         .collect::<Vec<_>>();
     let survey_demands = observations
         .iter()
-        .filter_map(|observation| match observation.as_ref()? {
-            WriteObservation::Event { carrier, .. }
-            | WriteObservation::ReceiverEntry { carrier, .. } => Some(carrier.clone()),
+        .zip(&structural_write_bounds)
+        .filter_map(|(observation, structural_bound)| {
+            if !matches!(
+                structural_bound,
+                StructuralWriteReceiverBound::NotApplicable
+            ) {
+                return None;
+            }
+            match observation.as_ref()? {
+                WriteObservation::Event { carrier, .. }
+                | WriteObservation::ReceiverEntry { carrier, .. } => Some(carrier.clone()),
+            }
         })
         .collect::<Vec<_>>();
     // A write whose receiver reaches a root parameter takes its identity from
@@ -273,10 +559,17 @@ pub(super) fn survey(
         if cancellation.is_cancelled() {
             return Err(TypeFlowPlanError::Cancelled);
         }
-        // A globally open write cannot be narrowed by another root. A
-        // bounded uncertainty still benefits from collecting its other
-        // observed receiver classes and bounds.
-        if effects.iter().all(|effect| effect.global) {
+        // A structural receiver proof is already complete. A global effect
+        // cannot be narrowed by another root, and only unhandled writes need
+        // the value-flow survey.
+        if writes
+            .iter()
+            .zip(&effects)
+            .zip(&structural_write_bounds)
+            .all(|((_, effect), bound)| {
+                effect.global || !matches!(bound, StructuralWriteReceiverBound::NotApplicable)
+            })
+        {
             break;
         }
         let plan = match TypeFlowDiscovery::new(
@@ -306,7 +599,12 @@ pub(super) fn survey(
                 writes
                     .iter()
                     .zip(&effects)
-                    .filter_map(|(write, effect)| (!effect.global).then_some(&write.procedure)),
+                    .zip(&structural_write_bounds)
+                    .filter_map(|((write, effect), bound)| {
+                        (!effect.global
+                            && matches!(bound, StructuralWriteReceiverBound::NotApplicable))
+                        .then_some(&write.procedure)
+                    }),
             ) {
                 return Ok(None);
             }
@@ -344,7 +642,11 @@ pub(super) fn survey(
         }
         if !writes
             .iter()
-            .any(|write| plan.value_flow().has_snapshot(&write.procedure))
+            .zip(&structural_write_bounds)
+            .any(|(write, bound)| {
+                matches!(bound, StructuralWriteReceiverBound::NotApplicable)
+                    && plan.value_flow().has_snapshot(&write.procedure)
+            })
         {
             continue;
         }
@@ -377,8 +679,16 @@ pub(super) fn survey(
         // The evidence index is built for exactly the points this survey asks
         // about, so the observation each write resolves to is settled first.
         let mut queried = HashSet::default();
-        for ((write, observation), effect) in writes.iter().zip(&observations).zip(&effects) {
-            if plan.value_flow().has_snapshot(&write.procedure)
+        for (((write, observation), effect), structural_bound) in writes
+            .iter()
+            .zip(&observations)
+            .zip(&effects)
+            .zip(&structural_write_bounds)
+        {
+            if matches!(
+                structural_bound,
+                StructuralWriteReceiverBound::NotApplicable
+            ) && plan.value_flow().has_snapshot(&write.procedure)
                 && !effect.global
                 && let Some(observation) = observation
             {
@@ -394,8 +704,18 @@ pub(super) fn survey(
                 continue;
             }
         };
-        for (index, (write, effect)) in writes.iter().zip(&mut effects).enumerate() {
-            if !plan.value_flow().has_snapshot(&write.procedure) || effect.global {
+        for (index, ((write, effect), structural_bound)) in writes
+            .iter()
+            .zip(&mut effects)
+            .zip(&structural_write_bounds)
+            .enumerate()
+        {
+            if !matches!(
+                structural_bound,
+                StructuralWriteReceiverBound::NotApplicable
+            ) || !plan.value_flow().has_snapshot(&write.procedure)
+                || effect.global
+            {
                 continue;
             }
             let Some(observation) = &observations[index] else {
@@ -403,7 +723,7 @@ pub(super) fn survey(
                     workspace,
                     adapter,
                     effect,
-                    structural_receiver_classes[index].as_ref(),
+                    structural_receiver_bounds[index].as_ref(),
                     UnknownReason::UnmodeledLoad,
                 );
                 continue;
@@ -432,7 +752,7 @@ pub(super) fn survey(
                         workspace,
                         adapter,
                         effect,
-                        structural_receiver_classes[index].as_ref(),
+                        structural_receiver_bounds[index].as_ref(),
                         UnknownReason::UnmodeledLoad,
                     );
                     continue;
@@ -445,7 +765,7 @@ pub(super) fn survey(
                         workspace,
                         adapter,
                         effect,
-                        structural_receiver_classes[index].as_ref(),
+                        structural_receiver_bounds[index].as_ref(),
                         UnknownReason::SemanticBudget,
                     );
                     continue;
@@ -465,11 +785,12 @@ pub(super) fn survey(
                             matches!(
                                 plan.source_site(source).kind,
                                 SourceSiteKind::DeclaredParameter | SourceSiteKind::RootReceiver
-                            )
+                            ) || class_source_has_open_type_bound(&plan, source)
+                                || structural_receiver_bounds[index].is_some()
                         }
                         ClassAtom::Unknown(UnknownReason::SelfReceiver)
                         | ClassAtom::Unknown(UnknownReason::OpenTypeBound) => true,
-                        ClassAtom::Unknown(_) => false,
+                        ClassAtom::Unknown(_) => structural_receiver_bounds[index].is_some(),
                     };
                     effect.global |= !source_is_bounded;
                 }
@@ -478,10 +799,17 @@ pub(super) fn survey(
                         if !effect.classes.contains(class) {
                             effect.classes.push(class.clone());
                         }
-                        if matches!(
+                        if let Some(bound) = structural_receiver_bounds[index].as_ref() {
+                            // Retain proven call-site receiver classes as well
+                            // as the structural fallback. An unbound method
+                            // call can supply an object outside its lexical
+                            // class, so observed classes remain authoritative.
+                            add_bound(workspace, adapter, effect, bound);
+                        } else if matches!(
                             plan.source_site(source).kind,
                             SourceSiteKind::DeclaredParameter | SourceSiteKind::RootReceiver
-                        ) {
+                        ) || class_source_has_open_type_bound(&plan, source)
+                        {
                             add_bound(workspace, adapter, effect, class);
                         }
                     }
@@ -504,29 +832,33 @@ pub(super) fn survey(
                     // surveyed as a root.
                     ClassAtom::Unknown(UnknownReason::RootParameter) => {
                         caller_dependent[index] = true;
+                        if let Some(class) = structural_receiver_bounds[index].as_ref() {
+                            add_bound(workspace, adapter, effect, class);
+                        }
                     }
                     ClassAtom::Unknown(UnknownReason::OpenTypeBound) => {
                         // Preserve the declared bound even if a guard excluded
                         // its concrete atom. Constructor replacement bounds
                         // make no subclass promise and remain explicitly open.
-                        let origin = plan.source_site(source);
-                        let mut bounded = false;
-                        for (candidate, _) in plan.value_flow().sources() {
-                            let site = plan.source_site(candidate);
-                            if site.file == origin.file
-                                && site.span == origin.span
-                                && site.kind == SourceSiteKind::DeclaredParameter
-                                && let ClassAtom::Class(class) = plan.atom(candidate)
-                            {
-                                add_bound(workspace, adapter, effect, class);
-                                bounded = true;
-                            }
-                        }
+                        let bounded =
+                            add_open_type_bound_sources(workspace, adapter, &plan, source, effect);
                         if !bounded {
-                            open_global(effect, UnknownReason::OpenTypeBound);
+                            open_or_bound(
+                                workspace,
+                                adapter,
+                                effect,
+                                structural_receiver_bounds[index].as_ref(),
+                                UnknownReason::OpenTypeBound,
+                            );
                         }
                     }
-                    ClassAtom::Unknown(reason) => open_global(effect, reason.clone()),
+                    ClassAtom::Unknown(reason) => open_or_bound(
+                        workspace,
+                        adapter,
+                        effect,
+                        structural_receiver_bounds[index].as_ref(),
+                        reason.clone(),
+                    ),
                 }
             }
             if !identity_observed {
@@ -534,7 +866,7 @@ pub(super) fn survey(
                     workspace,
                     adapter,
                     effect,
-                    structural_receiver_classes[index].as_ref(),
+                    structural_receiver_bounds[index].as_ref(),
                     UnknownReason::UnmodeledLoad,
                 );
             }
@@ -542,12 +874,18 @@ pub(super) fn survey(
     }
     if let Some(reason) = survey_failure {
         for (index, effect) in effects.iter_mut().enumerate() {
-            if !effect.global && (effect.classes.is_empty() || caller_dependent[index]) {
+            if !effect.global
+                && matches!(
+                    &structural_write_bounds[index],
+                    StructuralWriteReceiverBound::NotApplicable
+                )
+                && (effect.classes.is_empty() || caller_dependent[index])
+            {
                 open_or_bound(
                     workspace,
                     adapter,
                     effect,
-                    structural_receiver_classes[index].as_ref(),
+                    structural_receiver_bounds[index].as_ref(),
                     reason.clone(),
                 );
             }
@@ -574,6 +912,55 @@ fn mark_unsurveyed(
             caller_dependent[index] = true;
         }
     }
+}
+
+/// A `ClassWithOpenBound` seed gives its class and open remainder the same
+/// source range. Retained generic iteration values use `Unknown` source sites,
+/// so keep their class atom as a receiver bound just as for parameter seeds.
+fn class_source_has_open_type_bound(
+    plan: &super::plan::TypeFlowPlan,
+    source: ValueFlowSourceId,
+) -> bool {
+    let origin = plan.source_site(source);
+    origin.kind == SourceSiteKind::Unknown
+        && plan.value_flow().sources().any(|(candidate, _)| {
+            let site = plan.source_site(candidate);
+            site.file == origin.file
+                && site.span == origin.span
+                && matches!(
+                    plan.atom(candidate),
+                    ClassAtom::Unknown(UnknownReason::OpenTypeBound)
+                )
+        })
+}
+
+/// Add class seeds paired with one `OpenTypeBound` source at the same syntax
+/// site. Declared parameters use `DeclaredParameter` sites; structured loop
+/// element seeds use `Unknown` sites.
+fn add_open_type_bound_sources(
+    workspace: &WorkspaceAnalyzer,
+    adapter: &dyn TypeFlowAdapter,
+    plan: &super::plan::TypeFlowPlan,
+    source: ValueFlowSourceId,
+    effect: &mut ScopedDynamicWrite,
+) -> bool {
+    let origin = plan.source_site(source);
+    let mut bounded = false;
+    for (candidate, _) in plan.value_flow().sources() {
+        let site = plan.source_site(candidate);
+        if site.file == origin.file
+            && site.span == origin.span
+            && matches!(
+                site.kind,
+                SourceSiteKind::DeclaredParameter | SourceSiteKind::Unknown
+            )
+            && let ClassAtom::Class(class) = plan.atom(candidate)
+        {
+            add_bound(workspace, adapter, effect, class);
+            bounded = true;
+        }
+    }
+    bounded
 }
 
 /// Record what a write's receiver can be when an observation failed: the
@@ -606,6 +993,22 @@ fn add_bound(
     if !effect.bounds.contains(class) {
         effect.bounds.push(class.clone());
     }
+}
+
+fn apply_dynamic_receiver_bounds(
+    workspace: &WorkspaceAnalyzer,
+    adapter: &dyn TypeFlowAdapter,
+    effect: &mut ScopedDynamicWrite,
+    classes: &[ClassIdentity],
+) {
+    if classes
+        .iter()
+        .any(|class| adapter.class_hierarchy(workspace, class).unresolved_base)
+    {
+        open_global(effect, UnknownReason::OpenTypeBound);
+        return;
+    }
+    effect.bounds.extend(classes.iter().cloned());
 }
 
 fn open_global(effect: &mut ScopedDynamicWrite, reason: UnknownReason) {

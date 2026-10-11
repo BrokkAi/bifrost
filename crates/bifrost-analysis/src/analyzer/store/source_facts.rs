@@ -41,28 +41,145 @@ mod source_import_path_tests;
 use crate::analyzer::structural::facts::STRUCTURAL_FACTS_VERSION;
 use brokk_bifrost_core::analyzer::parsed_file::ParsedSourceFacts;
 use brokk_bifrost_core::analyzer::rust_facts::{
-    RustDeclarationBoundary, RustDeclarationKind, RustDeclarationPropertyFact, RustSerdeDerive,
+    RustDeclarationBoundary, RustDeclarationKind, RustDeclarationPropertyFact,
     RustValueConstructorProperties,
 };
-use brokk_bifrost_core::analyzer::source_facts::SourceDeclarationId;
 use brokk_bifrost_core::analyzer::source_facts::SourceOccurrenceId;
 use brokk_bifrost_core::analyzer::source_facts::SourceOccurrenceProvenance;
+use brokk_bifrost_core::analyzer::source_facts::{SourceDeclarationId, SourceImportId};
 use brokk_bifrost_core::analyzer::structural::code::VocabularyCode;
 use brokk_bifrost_core::analyzer::{CodeUnit, ProjectFile};
 use brokk_bifrost_core::hash::HashMap;
 
 use crate::CancellationToken;
+#[cfg(test)]
+use rusqlite::Connection;
 use rusqlite::{OptionalExtension, Transaction, params};
 
 use super::{Result, StoreError, usize_to_i64};
+
+#[cfg(test)]
+pub(crate) fn assert_source_facts_match_across_mounts<T, F>(
+    store: &super::AnalyzerStore,
+    generation: super::GenerationId,
+    first_file: &ProjectFile,
+    second_file: &ProjectFile,
+    mut read: impl FnMut(
+        &super::AnalyzerStore,
+        super::GenerationId,
+        &ProjectFile,
+        &dyn Fn() -> bool,
+    ) -> Result<Option<T>>,
+    facts: impl for<'a> Fn(&'a T) -> &'a F,
+) -> (T, T)
+where
+    F: std::fmt::Debug + PartialEq,
+{
+    let first = read(store, generation, first_file, &|| true)
+        .expect("read source facts at the first mount")
+        .expect("source facts published at the first mount");
+    let second = read(store, generation, second_file, &|| true)
+        .expect("read source facts at the second mount")
+        .expect("source facts published at the second mount");
+    assert_eq!(facts(&first), facts(&second));
+    (first, second)
+}
+
+#[cfg(test)]
+pub(crate) fn assert_source_read_cancellation_retries<T>(
+    mut read: impl FnMut(&dyn Fn() -> bool) -> Result<Option<T>>,
+) {
+    let visits = std::cell::Cell::new(0usize);
+    assert!(
+        read(&|| {
+            visits.set(visits.get() + 1);
+            visits.get() < 5
+        })
+        .expect("cancelled source-facts read")
+        .is_none(),
+        "source-facts read must stop when its visit budget expires"
+    );
+    assert!(
+        visits.get() >= 5,
+        "source-facts read skipped visit checkpoints"
+    );
+    assert!(
+        read(&|| true).expect("retry source-facts read").is_some(),
+        "a cancelled read must not poison the next source-facts read"
+    );
+}
+
+#[cfg(test)]
+pub(crate) fn assert_missing_then_republished<T>(
+    read: impl Fn() -> Result<Option<T>>,
+    republish: impl FnOnce() -> Result<()>,
+) {
+    assert!(
+        read().is_err(),
+        "a missing source publication must fail to read"
+    );
+    republish().expect("republish source facts");
+    assert!(
+        read().expect("read republished source facts").is_some(),
+        "a republished source family must be readable"
+    );
+}
+
+#[cfg(test)]
+pub(crate) fn assert_reader_rejects_tampering<T>(
+    tamper: impl FnOnce() -> Result<()>,
+    read: impl FnOnce() -> Result<T>,
+) {
+    tamper().expect("tamper with sealed source facts");
+    assert!(read().is_err(), "reader accepted tampered source facts");
+}
+
+#[cfg(test)]
+pub(crate) fn assert_source_lookup_plan(
+    store: &super::AnalyzerStore,
+    explain: impl Fn(&Connection) -> Vec<String>,
+    mut read_published: impl FnMut() -> bool,
+) {
+    for refreshed in [false, true] {
+        if refreshed {
+            store
+                .refresh_planner_statistics()
+                .expect("refresh source publication planner statistics");
+        }
+        let connection = store.read_conn().expect("source publication reader");
+        let plan = explain(&connection);
+        assert!(
+            plan.iter()
+                .any(|step| step.contains("SEARCH blob") && step.contains("INDEX")),
+            "source publication lookup did not seek its blob: {plan:#?}"
+        );
+        assert!(
+            plan.iter().all(|step| !step.starts_with("SCAN ")),
+            "source publication lookup must not scan: {plan:#?}"
+        );
+        drop(connection);
+        assert!(
+            read_published(),
+            "source publication lookup returned no facts"
+        );
+    }
+}
 
 pub(in crate::analyzer) fn source_occurrence(
     value: i64,
     label: &str,
 ) -> Result<brokk_bifrost_core::analyzer::source_facts::SourceOccurrenceId> {
-    let value = u32::try_from(value)
-        .map_err(|_| StoreError::new(format!("invalid {label} source occurrence id {value}")))?;
+    let value = checked_source_id(value, label, "source occurrence")?;
     Ok(brokk_bifrost_core::analyzer::source_facts::SourceOccurrenceId::new(value))
+}
+
+pub(in crate::analyzer) fn source_import(value: i64, label: &str) -> Result<SourceImportId> {
+    let value = checked_source_id(value, label, "source import")?;
+    Ok(SourceImportId::new(value))
+}
+
+pub(in crate::analyzer) fn checked_source_id(value: i64, label: &str, kind: &str) -> Result<u32> {
+    u32::try_from(value).map_err(|_| StoreError::new(format!("invalid {label} {kind} id {value}")))
 }
 
 pub(in crate::analyzer) fn nonnegative_usize(value: i64, label: &str) -> Result<usize> {
@@ -124,7 +241,9 @@ pub(super) const RUST_DECLARATION_PROPERTY_MANIFEST_SQL: &str =
 pub(super) const RUST_DECLARATION_PROPERTIES_SQL: &str =
     "SELECT declaration_id, visibility, cfg_condition, constructor_non_exhaustive,
             declaration_kind, macro_exported, trait_impl_member,
-            has_impl_or_trait_ancestor, nearest_declaration_boundary, serde_helper_derive
+            has_impl_or_trait_ancestor, nearest_declaration_boundary,
+            json(derive_helper_attributes),
+            generated_surface
              FROM source_rust_declaration_properties WHERE blob_id = ?1 ORDER BY declaration_id";
 
 fn decode_rust_declaration_boundary(boundary: i64) -> Result<RustDeclarationBoundary> {
@@ -325,23 +444,30 @@ impl super::AnalyzerStore {
         let tx = conn.transaction()?;
         super::require_current_generation(&tx, "rust", generation)?;
         let oid_text = oid.to_string();
-        let (blob_id, expected_properties, expected_fields, expected_links): (
-            i64,
-            usize,
-            usize,
-            usize,
-        ) = tx
+        let publication = tx
             .query_row(
                 RUST_DECLARATION_PROPERTY_MANIFEST_SQL,
                 params![oid_text, generation.get(), SOURCE_FACTS_VERSION],
                 |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
             )
-            .optional()?
-            .ok_or_else(|| {
-                StoreError::new(format!(
-                    "canonical Rust declaration publication unavailable for {oid} at {generation:?}"
-                ))
-            })?;
+            .optional()?;
+        let Some((blob_id, expected_properties, expected_fields, expected_links)) = publication
+        else {
+            return Err(StoreError::missing_required_source_facts(format!(
+                "canonical Rust declaration publication unavailable for {oid} at {generation:?}"
+            )));
+        };
+        let (blob_id, expected_properties, expected_fields, expected_links): (
+            i64,
+            usize,
+            usize,
+            usize,
+        ) = (
+            blob_id,
+            expected_properties,
+            expected_fields,
+            expected_links,
+        );
         let mut properties = HashMap::default();
         let mut statement = tx.prepare_cached(RUST_DECLARATION_PROPERTIES_SQL)?;
         let mut rows = statement.query([blob_id])?;
@@ -366,6 +492,22 @@ impl super::AnalyzerStore {
                     non_exhaustive,
                 })
             });
+            let helper_attributes = row
+                .get::<_, Option<String>>(9)?
+                .map(|encoded| {
+                    let names = serde_json::from_str::<Vec<String>>(&encoded).map_err(|error| {
+                        StoreError::new(format!(
+                            "invalid Rust derive-helper attribute names {encoded:?} for {oid}/{declaration:?}: {error}"
+                        ))
+                    })?;
+                    if names.is_empty() || names.windows(2).any(|pair| pair[0] >= pair[1]) {
+                        return Err(StoreError::new(format!(
+                            "Rust derive-helper attribute names are not nonempty, sorted and distinct for {oid}/{declaration:?}: {names:?}"
+                        )));
+                    }
+                    Ok(names)
+                })
+                .transpose()?;
             properties.insert(
                 declaration,
                 RustDeclarationPropertyFact {
@@ -375,16 +517,8 @@ impl super::AnalyzerStore {
                     trait_impl_member: row.get(6)?,
                     has_impl_or_trait_ancestor: row.get(7)?,
                     nearest_declaration_boundary: decode_rust_declaration_boundary(row.get(8)?)?,
-                    serde_helper_derive: row
-                        .get::<_, Option<String>>(9)?
-                        .map(|name| {
-                            RustSerdeDerive::from_name(&name).ok_or_else(|| {
-                                StoreError::new(format!(
-                                    "invalid Rust serde helper derive {name:?} for {oid}/{declaration:?}"
-                                ))
-                            })
-                        })
-                        .transpose()?,
+                    derive_helper_attributes: helper_attributes,
+                    generated_surface: strict_bool(row.get(10)?, "generated surface")?,
                     visibility,
                     cfg_condition,
                     value_constructor,
@@ -663,6 +797,42 @@ fn encode_structural_facts(
         push_json_optional(&mut node_json, call_coverage);
         node_json.push(',');
         push_json_optional(&mut node_json, continues);
+        node_json.push(',');
+        push_json_optional(&mut node_json, node.parenthesized.map(u8::from));
+        node_json.push(',');
+        match node.assignment_shape {
+            Some(shape) => node_json.push_str(
+                &serde_json::to_string(&shape)
+                    .expect("a structural assignment-shape value always serializes to JSON"),
+            ),
+            None => node_json.push_str("null"),
+        }
+        node_json.push(',');
+        match node.integer_literal_value.as_ref() {
+            Some(value) => node_json
+                .push_str(&serde_json::to_string(value).expect(
+                    "a canonical integer-literal value always serializes to readable JSON",
+                )),
+            None => node_json.push_str("null"),
+        }
+        node_json.push(',');
+        match node.duplicate_key {
+            Some(value) => node_json.push_str(if value { "true" } else { "false" }),
+            None => node_json.push_str("null"),
+        }
+        node_json.push(',');
+        match node.string_value.as_deref() {
+            Some(value) => node_json.push_str(
+                &serde_json::to_string(value).expect("a decoded string value serializes as JSON"),
+            ),
+            None => node_json.push_str("null"),
+        }
+        node_json.push(',');
+        match node.is_async {
+            Some(value) => write!(node_json, "{}", u8::from(value)),
+            None => write!(node_json, "null"),
+        }
+        .expect("writing to a String cannot fail");
         node_json.push(']');
     }
     node_json.push(']');
@@ -791,6 +961,7 @@ pub(super) fn source_fact_cost(
         .saturating_add(facts.native_declaration_sources.len())
         // One source_structural_facts row holds every node and role of the blob.
         .saturating_add(1)
+        .saturating_add(facts.structural.recovered_regions().len())
         .saturating_add(imports.parents)
         .saturating_add(imports.segments)
         .saturating_add(imports.scopes)
@@ -1153,6 +1324,21 @@ pub(super) fn insert_source_facts_tx(
         structural.roles,
         structural.occurrence_roles,
     ])?;
+    {
+        let mut insert = tx.prepare_cached(
+            "INSERT INTO source_structural_recovered_regions(blob_id, ordinal, start_byte, end_byte)
+             VALUES(?1, ?2, ?3, ?4)",
+        )?;
+        for (ordinal, region) in facts.structural.recovered_regions().iter().enumerate() {
+            check_cancelled(cancellation)?;
+            insert.execute(params![
+                blob_id,
+                usize_to_i64(ordinal)?,
+                usize_to_i64(region.start_byte)?,
+                usize_to_i64(region.end_byte)?,
+            ])?;
+        }
+    }
 
     check_cancelled(cancellation)?;
     tx.execute(

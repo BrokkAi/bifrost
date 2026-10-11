@@ -6,10 +6,10 @@ description: Take a query from RQL exploration to a native RQLP policy or tested
 A Bifrost rule begins as a versioned `CodeQuery`. It can remain an application-owned query integration, or it can become a native `.rqlp` policy with stable rule identity, severity, completeness, and human/JSON/SARIF reporting. This guide builds a small “direct calls to Python `eval`” query, then shows both production paths.
 
 > **Execution boundary:** Bifrost executes `.rqlp` policies whose analysis has
-> `:type match`, `:type taint`, `:type typestate`, or `:type assertion`.
-> Taint and typestate are bounded semantic analyses: their findings retain
-> completeness, uncertainty, and witness limits instead of converting partial
-> work into clean negatives.
+> `:type match`, `:type taint`, `:type typestate`, `:type assertion`, or
+> `:type flow`. Taint, typestate, and flow are bounded semantic analyses: their
+> findings retain completeness, uncertainty, and witness limits instead of
+> converting partial work into clean negatives.
 
 This example becomes a structural policy: it finds parsed call expressions whose callee is named `eval`. It does not prove runtime dispatch, taint, reachability, or data flow. Choose a graph step and proof filter when declaration identity matters, and choose another analysis engine when the policy requires an unsupported guarantee.
 
@@ -77,9 +77,10 @@ one policy document instead of writing a reporting adapter:
 Save it as one `.rqlp` file and run it with `bifrost --policy-file`. The policy
 owns finding identity and presentation while the nested RQL remains the same
 typed selector explored above. See [Static-Analysis
-Policies](/static-analysis-policies/) for endpoint libraries, taint and
+Policies](/static-analysis-policies/) for endpoint libraries, taint, flow, and
 typestate syntax, schema inference, composition, semantic execution and report
-parity. [Data Flow, Taint, and Typestate](/data-flow-and-typestate/) explains
+parity. The [policy reference](/reference/policies/) lists every RQLP record
+and field. [Data Flow, Taint, and Typestate](/data-flow-and-typestate/) explains
 the registered-query, policy, and external-summary boundaries.
 
 If an application needs the raw query result or custom domain logic rather than
@@ -119,7 +120,7 @@ with SearchToolsClient("/path/to/project") as client:
         languages=["python"],
         limit=1000,
         result_detail="full",
-        schema_version=2,
+        schema_version=1,
     )
 ```
 
@@ -128,41 +129,37 @@ The Python method accepts the canonical query fields as typed arguments; it does
 ### Rust
 
 ```rust
-use brokk_bifrost::rql::CodeQueryResult;
+use brokk_bifrost::CodeQueryResponse;
 use brokk_bifrost::SearchToolsService;
 use serde_json::json;
 use std::path::PathBuf;
 
-fn run_rule(root: PathBuf) -> Result<CodeQueryResult, String> {
+fn run_rule(root: PathBuf) -> Result<CodeQueryResponse, String> {
+    // Register the shipped semantic packs once per process.
+    brokk_bifrost::install_bifrost_semantic_model_packs()?;
     let service = SearchToolsService::new(root)?;
-    let result = service.query_code_result(json!({
+    let response = service.query_code_result(json!({
         "schema_version": 1,
         "languages": ["python"],
         "match": {"kind": "call", "callee": {"name": "eval"}},
         "limit": 1000,
         "result_detail": "full"
     })).map_err(|error| error.to_string())?;
-    Ok(result)
+    Ok(response)
 }
 ```
 
-`query_code_result` returns the Rust `CodeQueryResult` directly. Constructing `SearchToolsService` owns workspace indexing and file watching for a long-lived integration.
+`query_code_result` returns a typed `CodeQueryResponse`, not JSON. In the
+default results mode, `response.result()` returns the `CodeQueryResult`.
+Without `install_bifrost_semantic_model_packs()`, no shipped semantic pack
+activates in an embedding process. Constructing `SearchToolsService` owns
+workspace indexing and file watching for a long-lived integration.
 
 ## 5. Consume Every Result Variant
 
-Dispatch on `result_type` in JSON, the corresponding Python dataclass, or `CodeQueryResultValue` in Rust. Do not assume a pipeline will always end in a structural match: changing or appending a typed step changes the terminal value.
+Dispatch on `result_type` in JSON, the corresponding Python dataclass, or `CodeQueryResultValue` in Rust. Do not assume a pipeline will always end in a structural match: changing or appending a typed step changes the terminal value. A query with no steps returns `structural_match` rows; each typed step, such as `call-sites-to`, `references-of`, or `call-input`, returns its own result type.
 
-| `result_type` | Produced by | Consume as |
-| --- | --- | --- |
-| `structural_match` | A query with no steps | Parsed shape, source snippet, captures, enclosing symbol, and optional full ranges/ID. |
-| `declaration` | Enclosing, semantic-user, caller/callee, hierarchy, member, or owner steps | Exact indexed declaration identity and source range. |
-| `reference_site` | `references_of` | Exact source site, target declaration, optional enclosing declaration, reference kind, and proof. |
-| `call_site` | `call_sites_to` or `call_sites_from` | Caller, callee, call/callee ranges, receiver, arguments, call kind, and proof. |
-| `expression_site` | `call_input` | Direct receiver or formal-parameter expression at a resolved call site. |
-| `receiver_analysis` | `receiver_targets`, `points_to`, or `member_targets` | Explicit analysis outcome plus bounded receiver values or exact member declarations. |
-| `file` | `file_of`, `imports_of`, or `importers_of` | Exact project file reached by the pipeline. |
-
-In Python, the seven classes are `CodeQueryMatch`, `CodeQueryDeclaration`, `CodeQueryReferenceSite`, `CodeQueryCallSite`, `CodeQueryExpressionSite`, `CodeQueryReceiverAnalysis`, and `CodeQueryFile`. In Rust, match all variants of `brokk_bifrost::rql::CodeQueryResultValue` without a wildcard so a future result type becomes a compile-time integration decision.
+The set of `result_type` values is large and grows with the query vocabulary. The [CodeQuery reference](/reference/code-query/) lists every variant and the step that produces it, and the [Python client reference](/reference/python-client/) lists the matching dataclasses. In Rust, match all variants of `brokk_bifrost::rql::CodeQueryResultValue` without a wildcard so a future result type becomes a compile-time integration decision.
 
 Request `result_detail: "full"` when a report needs stable IDs, byte/line/column ranges, capture ranges, or decorator ranges. Compact mode is designed for agent context, not durable finding identity.
 
@@ -183,7 +180,7 @@ Use [Agent Result Safety](/agent-result-safety/) for the exact claim vocabulary 
 
 Keep the smallest source project that demonstrates a true positive, a nearby false positive, and any important language diagnostic. Assert the canonical query, complete tagged result, proof fields, and `truncated: false`; do not assert only a match count.
 
-For Bifrost's own documentation, the executable marker harness in `tests/code_query_tutorials.rs` builds inline projects from `code-query-fixture` blocks and executes paired RQL/JSON cases. External integrations can use their normal test framework, but should preserve the same properties:
+Use your normal test framework. Preserve these properties:
 
 - RQL and canonical JSON lower to the same query while RQL is part of authoring.
 - Every expected finding includes a stable project-relative path and exact range.
@@ -202,7 +199,7 @@ For a native `.rqlp` policy, use `--format human|json|sarif` instead. All three 
 ## Production Checklist
 
 - The saved query JSON pins `schema_version` and contains all query scope, or the `.rqlp` policy records whether independently resolved policy and nested RQL versions were explicit or compatible inferences.
-- The integration handles all seven terminal result variants and every receiver-analysis outcome.
+- The integration handles every `result_type` variant and every receiver-analysis outcome.
 - Errors, diagnostics, result truncation, proof tiers, and provenance truncation have explicit policy.
 - Fixture tests cover a true positive, a convincing negative, and relevant diagnostics.
 - A rule proposed from code review has positive and realistic near-miss fixtures

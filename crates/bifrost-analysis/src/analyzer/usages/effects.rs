@@ -39,7 +39,7 @@ use std::sync::Arc;
 use crate::analyzer::common::language_for_file;
 use crate::analyzer::i_analyzer::IAnalyzer;
 use crate::analyzer::semantic::cfg_algorithms::{
-    CfgAlgorithmBudget, CfgAlgorithmRequest, DenseBidirectionalGraph, strongly_connected_components,
+    CfgAlgorithmBudget, CfgAlgorithmRequest, DenseUsizeGraph, strongly_connected_components,
 };
 use crate::analyzer::semantic::{ExecutionTiming, LengthDelimitedDigest};
 use crate::analyzer::semantic_model::{
@@ -322,22 +322,17 @@ pub struct ModeledProcedureKey {
 /// if no active result contract shares the exact language, owner, member, and
 /// receiver shape, the workspace target is a conclusive non-match. A matching
 /// name remains an open identity gap and never becomes a positive modeled arm.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct ModeledProcedureName {
-    pub language: String,
-    pub owner: String,
-    pub member: String,
-    pub has_receiver: bool,
-}
-
 /// One canonical dispatch arm resolved without materializing semantic IR.
 ///
 /// Workspace declarations use the same persisted signature contract as the
 /// effect and data-flow consumers. Go external package functions and concrete
 /// receiver methods use one resolver-owned proof containing the canonical
 /// imported-member spelling, receiver application, and effective argument
-/// count. No independently lowered receiver or written-argument count enters
-/// this identity.
+/// count. A uniquely selected incomplete native-Java source declaration is
+/// retained for its exact signature key, but its resolver provenance says that
+/// the declaration is only candidate-local evidence and has no published
+/// workspace body. No independently lowered receiver or written-argument
+/// count enters this identity.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub struct ModeledCallTargetArm {
     pub key: ModeledProcedureKey,
@@ -378,12 +373,6 @@ pub enum ModeledCallTargetCoverage {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ModeledCallTargetLookup {
     pub arms: Vec<ModeledCallTargetArm>,
-    /// Structured Go workspace identities whose exact declaration-side key
-    /// could not be built because persisted signature metadata was missing or
-    /// ambiguous. These names may prove that an active model cannot apply, but
-    /// they are never promoted to positive arms: matching one means target
-    /// coverage is incomplete.
-    pub adjudicable_workspace_names: Vec<ModeledProcedureName>,
     /// Selector-base evidence retained by the same structured call-resolution
     /// pass. A value is sufficient only for negative model-applicability
     /// adjudication; it never mints a positive receiver target.
@@ -439,8 +428,6 @@ pub fn modeled_call_targets_for_shapes(
     limits: CallRelationLimits,
     cancellation: Option<&CancellationToken>,
 ) -> Vec<ModeledCallTargetLookup> {
-    use brokk_bifrost_core::analyzer::structural::callable::CallShapeCoverage;
-
     let file = shapes.first().map(|shape| &shape.outcome.file);
     debug_assert!(shapes.iter().all(|shape| Some(&shape.outcome.file) == file));
     let Some(file) = file else {
@@ -460,15 +447,14 @@ pub fn modeled_call_targets_for_shapes(
         cancellation,
     );
     shapes.iter().zip(lookups).map(|(shape, lookup)| {
-            if shape.outcome.coverage != CallShapeCoverage::Exact {
+            if !shape.outcome.coverage.is_exact() {
                 return ModeledCallTargetLookup {
                     arms: Vec::new(),
-                    adjudicable_workspace_names: Vec::new(),
                     call_application: ModeledCallApplication::Unknown,
                     coverage: ModeledCallTargetCoverage::Unsupported,
                 };
             }
-            let go_external_shape_supported = shape.arguments.iter().all(|argument| !argument.spread)
+            let external_shape_supported = shape.arguments.iter().all(|argument| !argument.spread)
                 && shape.groups.iter().all(|group| {
                     group.kind
                         == brokk_bifrost_core::analyzer::structural::callable::ArgumentListKind::Ordinary
@@ -476,9 +462,73 @@ pub fn modeled_call_targets_for_shapes(
             project_modeled_call_target_lookup(
                 analyzer,
                 shape,
-                go_external_shape_supported,
+                external_shape_supported,
                 lookup,
             )
+        })
+        .collect()
+}
+
+/// The workspace declarations resolved for a batch of exact native call
+/// shapes. This is the declaration-only projection used by native result
+/// obligations; semantic dispatch adds artifact-backed work that B4 does not
+/// need for C translation units.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NativeCallTargetLookup {
+    pub targets: Vec<CodeUnit>,
+    pub exhaustive: bool,
+}
+
+/// Resolve native call targets once for one exact source snapshot.
+///
+/// The batch is intentionally a narrow projection of the shared call
+/// relation. It carries the resolver's target set and closes it only when the
+/// resolver published a complete resolved answer with no residual boundary.
+/// Callers must retain the open result when any of those conditions fail.
+pub fn native_call_targets_for_shapes(
+    analyzer: &dyn IAnalyzer,
+    shapes: &[&CallShapeReport],
+    exact_source: Arc<str>,
+    limits: CallRelationLimits,
+    cancellation: Option<&CancellationToken>,
+) -> Vec<NativeCallTargetLookup> {
+    let file = shapes.first().map(|shape| &shape.outcome.file);
+    debug_assert!(shapes.iter().all(|shape| Some(&shape.outcome.file) == file));
+    let Some(file) = file else {
+        return Vec::new();
+    };
+    let scope = AnalyzerQueryScope::new(analyzer);
+    let lookups = CallRelationService::dispatch_many_at_bounded(
+        analyzer,
+        scope.token(),
+        file,
+        &shapes
+            .iter()
+            .map(|shape| shape.outcome.range)
+            .collect::<Vec<_>>(),
+        exact_source,
+        limits,
+        cancellation,
+    );
+    shapes
+        .iter()
+        .zip(lookups)
+        .map(|(shape, lookup)| {
+            let exhaustive = shape.outcome.coverage.is_exact()
+                && lookup.status == Some(DefinitionLookupStatus::Resolved)
+                && lookup.boundaries.is_empty()
+                && !lookup.cancelled
+                && !lookup.budget_exhausted
+                && !lookup.truncated
+                && !lookup.targets.is_empty();
+            NativeCallTargetLookup {
+                targets: lookup
+                    .targets
+                    .into_iter()
+                    .map(|target| target.definition)
+                    .collect(),
+                exhaustive,
+            }
         })
         .collect()
 }
@@ -486,11 +536,10 @@ pub fn modeled_call_targets_for_shapes(
 fn project_modeled_call_target_lookup(
     analyzer: &dyn IAnalyzer,
     shape: &CallShapeReport,
-    go_external_shape_supported: bool,
+    external_shape_supported: bool,
     lookup: super::call_relations::CallDispatchLookup,
 ) -> ModeledCallTargetLookup {
     let mut arms = Vec::new();
-    let mut adjudicable_workspace_names = Vec::new();
     let mut residual = 0usize;
     let mut potentially_modeled_residual = false;
     let mut unsupported = false;
@@ -500,39 +549,74 @@ fn project_modeled_call_target_lookup(
         .map_or(lookup.call_application, |proof| proof.call_application());
     for target in &lookup.targets {
         if let Some(key) = modeled_procedure_key_for_unit(analyzer, &target.definition) {
-            arms.push(ModeledCallTargetArm {
-                key,
-                origin: ModeledCallTargetOrigin::WorkspaceBody,
-            });
+            // A selected native-Java source declaration can supply the exact
+            // signature key while its executable body remains outside the
+            // workspace. Preserve the key, but keep the external origin so an
+            // activated summary is not replaced by a source-body claim.
+            let origin = if language_for_file(target.definition.source()) == Language::Java
+                && target.native_incomplete_source_reason.is_some()
+            {
+                ModeledCallTargetOrigin::UnmaterializedExternal
+            } else {
+                ModeledCallTargetOrigin::WorkspaceBody
+            };
+            arms.push(ModeledCallTargetArm { key, origin });
             continue;
         }
         residual = residual.saturating_add(1);
-        if language_for_file(target.definition.source()) == Language::Go
-            && let Some((owner, member)) =
-                crate::analyzer::semantic::split_qualified_member(&target.definition.fq_name())
-        {
-            adjudicable_workspace_names.push(ModeledProcedureName {
-                language: Language::Go.config_label().to_owned(),
-                owner: owner.to_owned(),
-                member: member.to_owned(),
-                has_receiver: target.definition.owner_is_type_scope(),
-            });
-        } else {
-            potentially_modeled_residual = true;
-        }
+        potentially_modeled_residual = true;
     }
     for boundary in &lookup.boundaries {
         match boundary {
             CallDispatchBoundaryKind::External {
                 callee_text: Some(target),
+                external_callee_identity: Some(identity),
                 ..
-            } if language_for_file(&shape.outcome.file) == Language::Go
-                && go_external_shape_supported =>
-            {
+            } if identity.language() == Language::Java => {
                 let exact = lookup
                     .exact_external_call
                     .as_ref()
                     .filter(|proof| proof.canonical_callee() == target.as_ref());
+                let has_receiver = exact.and_then(|proof| match proof.call_application() {
+                    CallApplicationKind::PackageFunction => Some(false),
+                    CallApplicationKind::BoundReceiver => Some(true),
+                    CallApplicationKind::ReceiverBindingUnknown | CallApplicationKind::Unknown => {
+                        None
+                    }
+                });
+                if identity.language() == language_for_file(&shape.outcome.file)
+                    && let (Some(proof), Some(has_receiver)) = (exact, has_receiver)
+                {
+                    arms.push(ModeledCallTargetArm {
+                        key: ModeledProcedureKey {
+                            language: identity.language().config_label().to_owned(),
+                            owner: identity.owner_fqn().to_owned(),
+                            member: identity.member().to_owned(),
+                            has_receiver,
+                            parameter_count: proof.parameter_count(),
+                        },
+                        origin: ModeledCallTargetOrigin::UnmaterializedExternal,
+                    });
+                } else {
+                    residual = residual.saturating_add(1);
+                    potentially_modeled_residual = true;
+                }
+            }
+            CallDispatchBoundaryKind::External {
+                callee_text: Some(target),
+                ..
+            } if language_for_file(&shape.outcome.file) == Language::Go
+                && external_shape_supported =>
+            {
+                let exact = lookup.exact_external_call.as_ref().filter(|proof| {
+                    // A receiver candidate from a type and selector alone
+                    // is not enough to mint a modeled method arm. Keep it
+                    // as an open boundary until the receiver method set
+                    // proves a concrete or interface dispatch contract.
+                    proof.canonical_callee() == target.as_ref()
+                        && (proof.call_application() != CallApplicationKind::BoundReceiver
+                            || proof.dispatch_extensibility().is_some())
+                });
                 let has_receiver = exact.and_then(|proof| match proof.call_application() {
                     CallApplicationKind::PackageFunction => Some(false),
                     CallApplicationKind::BoundReceiver => Some(true),
@@ -564,6 +648,55 @@ fn project_modeled_call_target_lookup(
                 }
             }
             CallDispatchBoundaryKind::External {
+                callee_text: Some(target),
+                external_callee_identity,
+                ..
+            } if language_for_file(&shape.outcome.file) == Language::Rust => {
+                let exact = external_shape_supported
+                    .then_some(lookup.exact_external_call.as_ref())
+                    .flatten()
+                    .filter(|proof| match proof.call_application() {
+                        CallApplicationKind::PackageFunction => {
+                            proof.canonical_callee() == target.as_ref()
+                        }
+                        CallApplicationKind::BoundReceiver => {
+                            external_callee_identity.as_ref().is_some_and(|identity| {
+                                proof.canonical_callee()
+                                    == format!("{}::{}", identity.owner_fqn(), identity.member())
+                            })
+                        }
+                        CallApplicationKind::ReceiverBindingUnknown
+                        | CallApplicationKind::Unknown => false,
+                    });
+                let has_receiver = exact.and_then(|proof| match proof.call_application() {
+                    CallApplicationKind::PackageFunction => Some(false),
+                    CallApplicationKind::BoundReceiver => Some(true),
+                    CallApplicationKind::ReceiverBindingUnknown | CallApplicationKind::Unknown => {
+                        None
+                    }
+                });
+                match (exact, has_receiver, external_callee_identity.as_ref()) {
+                    (Some(proof), Some(has_receiver), Some(identity))
+                        if identity.language() == Language::Rust =>
+                    {
+                        arms.push(ModeledCallTargetArm {
+                            key: ModeledProcedureKey {
+                                language: Language::Rust.config_label().to_owned(),
+                                owner: identity.owner_fqn().to_owned(),
+                                member: identity.member().to_owned(),
+                                has_receiver,
+                                parameter_count: proof.parameter_count(),
+                            },
+                            origin: ModeledCallTargetOrigin::UnmaterializedExternal,
+                        });
+                    }
+                    _ => {
+                        residual = residual.saturating_add(1);
+                        potentially_modeled_residual = true;
+                    }
+                }
+            }
+            CallDispatchBoundaryKind::External {
                 callee_text: Some(_),
                 ..
             } if language_for_file(&shape.outcome.file) == Language::Go
@@ -581,6 +714,13 @@ fn project_modeled_call_target_lookup(
             } if language_for_file(&shape.outcome.file) == Language::Go
                 && call_application == CallApplicationKind::BoundReceiver =>
             {
+                residual = residual.saturating_add(1);
+                potentially_modeled_residual = true;
+            }
+            CallDispatchBoundaryKind::External {
+                callee_text: Some(_),
+                ..
+            } if language_for_file(&shape.outcome.file) == Language::Rust => {
                 residual = residual.saturating_add(1);
                 potentially_modeled_residual = true;
             }
@@ -619,6 +759,16 @@ fn project_modeled_call_target_lookup(
                     DefinitionLookupStatus::NoDefinition | DefinitionLookupStatus::NotFound => {
                         potentially_modeled_residual = true;
                     }
+                    DefinitionLookupStatus::Unavailable | DefinitionLookupStatus::Incomplete
+                        if language_for_file(&shape.outcome.file) == Language::Go
+                            && external_shape_supported =>
+                    {
+                        // The call syntax is exact, but native Go resolution
+                        // could not finish identifying its target. Keep that
+                        // semantic uncertainty open; `Unsupported` is for a
+                        // call shape the analyzer cannot interpret.
+                        potentially_modeled_residual = true;
+                    }
                     DefinitionLookupStatus::UnsupportedLanguage
                     | DefinitionLookupStatus::Unavailable
                     | DefinitionLookupStatus::Incomplete
@@ -630,12 +780,14 @@ fn project_modeled_call_target_lookup(
                     }
                 }
             }
+            CallDispatchBoundaryKind::UnresolvedReason(_) => {
+                residual = residual.saturating_add(1);
+                potentially_modeled_residual = true;
+            }
         }
     }
     arms.sort();
     arms.dedup();
-    adjudicable_workspace_names.sort();
-    adjudicable_workspace_names.dedup();
 
     let coverage = if lookup.cancelled {
         ModeledCallTargetCoverage::Cancelled
@@ -643,11 +795,7 @@ fn project_modeled_call_target_lookup(
         ModeledCallTargetCoverage::Truncated
     } else if unsupported {
         ModeledCallTargetCoverage::Unsupported
-    } else if residual > 0
-        && arms.is_empty()
-        && adjudicable_workspace_names.is_empty()
-        && !potentially_modeled_residual
-    {
+    } else if residual > 0 && arms.is_empty() && !potentially_modeled_residual {
         ModeledCallTargetCoverage::Unmodeled
     } else if residual > 0 || lookup.status.is_none() {
         ModeledCallTargetCoverage::Open
@@ -656,7 +804,6 @@ fn project_modeled_call_target_lookup(
     };
     ModeledCallTargetLookup {
         arms,
-        adjudicable_workspace_names,
         call_application: match call_application {
             CallApplicationKind::PackageFunction => ModeledCallApplication::PackageFunction,
             CallApplicationKind::BoundReceiver => ModeledCallApplication::BoundReceiver,
@@ -1267,77 +1414,6 @@ fn witness_key(witness: &[EffectWitnessStep]) -> Vec<&str> {
     witness.iter().map(|step| step.site_id.as_str()).collect()
 }
 
-/// The dense call graph the SCC pass runs over.
-#[derive(Debug)]
-struct CallGraphView {
-    outgoing: Vec<Vec<usize>>,
-    incoming: Vec<Vec<usize>>,
-    edges: Vec<(usize, usize)>,
-}
-
-impl CallGraphView {
-    fn new(node_count: usize, edges: &[EffectGraphEdge]) -> Self {
-        let mut pairs = edges
-            .iter()
-            .map(|edge| (edge.caller, edge.callee))
-            .collect::<Vec<_>>();
-        pairs.sort_unstable();
-        pairs.dedup();
-        let mut outgoing = vec![Vec::new(); node_count];
-        let mut incoming = vec![Vec::new(); node_count];
-        for (index, &(caller, callee)) in pairs.iter().enumerate() {
-            outgoing[caller].push(index);
-            incoming[callee].push(index);
-        }
-        Self {
-            outgoing,
-            incoming,
-            edges: pairs,
-        }
-    }
-}
-
-impl DenseBidirectionalGraph for CallGraphView {
-    type Node = usize;
-    type Edge = usize;
-
-    fn node_count(&self) -> usize {
-        self.outgoing.len()
-    }
-
-    fn node_at(&self, index: usize) -> Option<Self::Node> {
-        (index < self.outgoing.len()).then_some(index)
-    }
-
-    fn node_index(&self, node: Self::Node) -> Option<usize> {
-        (node < self.outgoing.len()).then_some(node)
-    }
-
-    fn successors(
-        &self,
-        node: Self::Node,
-    ) -> impl DoubleEndedIterator<Item = (Self::Edge, Self::Node)> + ExactSizeIterator + '_ {
-        self.outgoing[node]
-            .iter()
-            .copied()
-            .map(|edge| (edge, self.edges[edge].1))
-    }
-
-    fn predecessors(
-        &self,
-        node: Self::Node,
-    ) -> impl DoubleEndedIterator<Item = (Self::Edge, Self::Node)> + ExactSizeIterator + '_ {
-        self.incoming[node]
-            .iter()
-            .copied()
-            .map(|edge| (edge, self.edges[edge].0))
-    }
-
-    fn edge_endpoints(&self, edge: Self::Edge) -> Option<(Self::Node, Self::Node)> {
-        self.edges.get(edge).copied()
-    }
-}
-
 /// Run the bounded deterministic fixpoint and project one report per procedure.
 ///
 /// The algorithm is a reverse-topological sweep over the graph's strongly
@@ -1356,7 +1432,10 @@ pub fn summarize_procedure_effects(
     budget: ProcedureEffectBudget,
 ) -> Vec<ProcedureEffectReport> {
     let node_count = graph.procedures.len();
-    let view = CallGraphView::new(node_count, &graph.edges);
+    let view = DenseUsizeGraph::new(
+        node_count,
+        graph.edges.iter().map(|edge| (edge.caller, edge.callee)),
+    );
     let cancellation = CancellationToken::new();
     let mut algorithm_budget = CfgAlgorithmBudget::default();
     let mut request = CfgAlgorithmRequest::new(&mut algorithm_budget, &cancellation);
@@ -1711,12 +1790,14 @@ pub fn modeled_procedure_key_for_unit(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::analyzer::structural::NormalizedKind;
     use crate::analyzer::usages::call_relations::{CallDispatchBoundaryKind, CallDispatchLookup};
+
     use crate::analyzer::usages::call_shape::call_shape_for_call;
     use crate::analyzer::usages::get_definition::ExactExternalCallProof;
+
     use crate::analyzer::{Language, ProjectFile};
     use crate::test_support::AnalyzerFixture;
+    use brokk_bifrost_test_macros::hardwon;
     use std::env;
 
     fn file() -> ProjectFile {
@@ -1786,23 +1867,24 @@ mod tests {
             .into_iter()
             .find_map(|provider| provider.structural_facts(&file))
             .expect("Go structural facts");
-        let start = source.rfind(call).expect("call exists");
-        let end = start + call.len();
-        let call_id = facts
-            .nodes()
-            .iter()
-            .enumerate()
-            .find(|(_, node)| {
-                node.kind == NormalizedKind::Call
-                    && node.range.start_byte == start
-                    && node.range.end_byte == end
-            })
-            .map(|(id, _)| u32::try_from(id).expect("fact node ID fits u32"))
-            .expect("exact call node");
+        let call_id = crate::analyzer::usages::test_support::call_node_id(source, &facts, call);
         (
             call_shape_for_call(&facts, &file, call_id).expect("exact call shape"),
             Arc::from(source),
         )
+    }
+
+    fn rust_shape(fixture: &AnalyzerFixture, source: &str, call: &str) -> CallShapeReport {
+        let file = ProjectFile::new(fixture.project_root(), "main.rs");
+        let facts = fixture
+            .analyzer
+            .analyzer()
+            .structural_fact_providers()
+            .into_iter()
+            .find_map(|provider| provider.structural_facts(&file))
+            .expect("Rust structural facts");
+        let call_id = crate::analyzer::usages::test_support::call_node_id(source, &facts, call);
+        call_shape_for_call(&facts, &file, call_id).expect("exact Rust call shape")
     }
 
     fn modeled_lookup(
@@ -1819,6 +1901,580 @@ mod tests {
             limits,
             cancellation,
         )
+    }
+
+    #[test]
+    #[hardwon(
+        "aa501216592e: Real Go fixtures ensure external typed receiver calls stay targetless and preserve bound-receiver classification, including a call-expression receiver"
+    )]
+    fn external_typed_go_receiver_is_adjudicated_without_minting_a_target() {
+        let source = r#"package main
+import "embed"
+var embedded embed.FS
+func factory() embed.FS { return embedded }
+func caller() {
+    _, _ = embedded.Open("book.xlsx")
+    _, _ = factory().Open("book.xlsx")
+}
+"#;
+        let fixture = AnalyzerFixture::new_for_language(Language::Go, &[("main.go", source)]);
+        let (shape, text) = go_shape(&fixture, source, "embedded.Open(\"book.xlsx\")");
+        let lookup = modeled_lookup(
+            &fixture,
+            &shape,
+            text,
+            CallRelationLimits {
+                max_files: 1,
+                max_source_bytes: usize::MAX,
+                max_candidates: 100,
+            },
+            None,
+        );
+        assert!(lookup.arms.is_empty(), "{lookup:#?}");
+        assert_eq!(lookup.coverage, ModeledCallTargetCoverage::Open);
+        assert_eq!(
+            lookup.call_application,
+            ModeledCallApplication::BoundReceiver,
+            "{lookup:#?}"
+        );
+
+        let (structured_shape, structured_text) =
+            go_shape(&fixture, source, "factory().Open(\"book.xlsx\")");
+        let structured = modeled_lookup(
+            &fixture,
+            &structured_shape,
+            structured_text,
+            CallRelationLimits {
+                max_files: 1,
+                max_source_bytes: usize::MAX,
+                max_candidates: 100,
+            },
+            None,
+        );
+        assert!(structured.arms.is_empty(), "{structured:#?}");
+        assert_eq!(structured.coverage, ModeledCallTargetCoverage::Open);
+        assert_eq!(
+            structured.call_application,
+            ModeledCallApplication::BoundReceiver,
+            "the structured call-expression base is a value: {structured:#?}"
+        );
+    }
+
+    #[test]
+    fn exact_call_execution_composes_with_declared_effect_timing() {
+        for (call_timing, effect_timing, expected) in [
+            (
+                ExecutionTiming::SameEvaluation,
+                ExecutionTiming::SameInvocation,
+                ExecutionTiming::SameInvocation,
+            ),
+            (
+                ExecutionTiming::SameInvocation,
+                ExecutionTiming::SameInvocation,
+                ExecutionTiming::SameInvocation,
+            ),
+            (
+                ExecutionTiming::DifferentTask,
+                ExecutionTiming::SameInvocation,
+                ExecutionTiming::DifferentTask,
+            ),
+            (
+                ExecutionTiming::DifferentTask,
+                ExecutionTiming::DeferredCallback,
+                ExecutionTiming::Unknown,
+            ),
+            (
+                ExecutionTiming::Unknown,
+                ExecutionTiming::SameInvocation,
+                ExecutionTiming::Unknown,
+            ),
+        ] {
+            let authored_timing = match effect_timing {
+                ExecutionTiming::DeferredCallback => EffectTiming::Deferred,
+                ExecutionTiming::Unknown => EffectTiming::Unknown,
+                _ => EffectTiming::Immediate,
+            };
+            let mut effect_arm = arm(
+                "target",
+                EffectProof::Proven,
+                ArmLookup::Declared(vec![declared(
+                    "acme.network_io",
+                    effect_timing,
+                    EffectCertainty::Definite,
+                )]),
+            );
+            effect_arm.execution_timing = call_timing;
+            let report = call_effect_report(
+                &file(),
+                "site",
+                "ast",
+                range(),
+                CallEffectSiteStatus::Answered {
+                    coverage: EffectCoverage::Exhaustive,
+                },
+                &[effect_arm],
+            );
+            assert_eq!(report.rows[0].timing, Some(authored_timing));
+            assert_eq!(report.rows[0].execution_timing, Some(expected));
+        }
+    }
+
+    #[test]
+    fn authored_immediate_effect_means_before_return_not_same_program_point() {
+        assert_eq!(
+            EffectTiming::from_compiled(CompiledDeclaredEffectTiming::Immediate),
+            EffectTiming::Immediate
+        );
+        assert_eq!(
+            declared_effect_execution_timing(CompiledDeclaredEffectTiming::Immediate),
+            ExecutionTiming::SameInvocation
+        );
+        assert_eq!(
+            declared_effect_execution_timing(CompiledDeclaredEffectTiming::Deferred),
+            ExecutionTiming::DeferredCallback
+        );
+        assert_eq!(
+            declared_effect_execution_timing(CompiledDeclaredEffectTiming::Unknown),
+            ExecutionTiming::Unknown
+        );
+    }
+
+    #[test]
+    fn an_unproven_arm_downgrades_a_definite_declaration_to_possible() {
+        let report = call_effect_report(
+            &file(),
+            "site",
+            "ast",
+            range(),
+            CallEffectSiteStatus::Answered {
+                coverage: EffectCoverage::Open,
+            },
+            &[arm(
+                "target",
+                EffectProof::Unproven,
+                ArmLookup::Declared(vec![declared(
+                    "acme.network_io",
+                    ExecutionTiming::SameEvaluation,
+                    EffectCertainty::Definite,
+                )]),
+            )],
+        );
+        assert_eq!(report.rows[0].certainty, Some(EffectCertainty::Possible));
+        assert_eq!(report.coverage, EffectCoverage::Open);
+    }
+
+    #[test]
+    fn a_proven_arm_never_promotes_a_possible_declaration() {
+        let report = call_effect_report(
+            &file(),
+            "site",
+            "ast",
+            range(),
+            CallEffectSiteStatus::Answered {
+                coverage: EffectCoverage::Exhaustive,
+            },
+            &[arm(
+                "target",
+                EffectProof::Proven,
+                ArmLookup::Declared(vec![declared(
+                    "acme.network_io",
+                    ExecutionTiming::SameEvaluation,
+                    EffectCertainty::Possible,
+                )]),
+            )],
+        );
+        assert_eq!(report.rows[0].certainty, Some(EffectCertainty::Possible));
+    }
+
+    #[test]
+    fn an_unmodeled_external_callee_opens_the_sites_coverage() {
+        let report = call_effect_report(
+            &file(),
+            "site",
+            "ast",
+            range(),
+            CallEffectSiteStatus::Answered {
+                coverage: EffectCoverage::Exhaustive,
+            },
+            &[arm(
+                "target",
+                EffectProof::Proven,
+                ArmLookup::Unmodeled { analyzable: false },
+            )],
+        );
+        assert_eq!(report.coverage, EffectCoverage::Open);
+        assert_eq!(report.rows[0].derivation, EffectDerivation::Incomplete);
+        assert_eq!(report.rows[0].reason, Some(EffectReason::CalleeUnmodeled));
+    }
+
+    fn procedure(name: &str, declared: Vec<BoundDeclaredEffect>) -> EffectGraphProcedure {
+        EffectGraphProcedure {
+            declaration_id: format!("decl:{name}"),
+            display_name: name.to_owned(),
+            declared,
+            basis: EffectNodeBasis::BodyRead,
+            declaration_only: false,
+            local_gaps: Vec::new(),
+        }
+    }
+
+    fn edge(caller: usize, callee: usize, site: &str) -> EffectGraphEdge {
+        EffectGraphEdge {
+            caller,
+            callee,
+            site_id: site.to_owned(),
+            certainty: EffectCertainty::Definite,
+            execution_timing: ExecutionTiming::SameEvaluation,
+        }
+    }
+
+    #[test]
+    fn a_two_hop_chain_is_transitive_and_retains_the_whole_witness() {
+        let graph = EffectGraph {
+            procedures: vec![
+                procedure("App.pure", Vec::new()),
+                procedure("App.helper", Vec::new()),
+                procedure(
+                    "AcmeHttpClient.send",
+                    vec![declared(
+                        "acme.network_io",
+                        ExecutionTiming::SameEvaluation,
+                        EffectCertainty::Definite,
+                    )],
+                ),
+            ],
+            edges: vec![edge(0, 1, "site.pure"), edge(1, 2, "site.helper")],
+            truncated: false,
+        };
+        let reports = summarize_procedure_effects(&graph, ProcedureEffectBudget::default());
+        let row = &reports[0].rows[0];
+        assert_eq!(row.depth, Some(2));
+        assert_eq!(row.classification, Some(EffectClassification::Transitive));
+        assert_eq!(
+            row.witness
+                .iter()
+                .map(|step| step.site_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["site.pure", "site.helper"]
+        );
+        assert_eq!(
+            row.witness_chain().as_deref(),
+            Some("App.pure -> App.helper -> AcmeHttpClient.send")
+        );
+    }
+
+    #[test]
+    fn a_recursive_cycle_converges_under_the_iteration_bound() {
+        let graph = EffectGraph {
+            procedures: vec![
+                procedure("App.a", Vec::new()),
+                procedure("App.b", Vec::new()),
+                procedure(
+                    "AcmeHttpClient.send",
+                    vec![declared(
+                        "acme.network_io",
+                        ExecutionTiming::SameEvaluation,
+                        EffectCertainty::Definite,
+                    )],
+                ),
+            ],
+            edges: vec![
+                edge(0, 1, "site.a"),
+                edge(1, 0, "site.b"),
+                edge(1, 2, "site.send"),
+            ],
+            truncated: false,
+        };
+        let reports = summarize_procedure_effects(&graph, ProcedureEffectBudget::default());
+        for report in reports.iter().take(2) {
+            assert_eq!(report.rows.len(), 1);
+            assert_eq!(report.rows[0].effect_id.as_deref(), Some("acme.network_io"));
+            assert_eq!(report.coverage, EffectCoverage::Exhaustive);
+        }
+        // The whole cycle is reachable, so both procedures carry the effect and
+        // neither report is truncated.
+        assert_eq!(reports[0].rows[0].depth, Some(2));
+        assert_eq!(reports[1].rows[0].depth, Some(1));
+    }
+
+    #[test]
+    fn a_deferred_declaration_stays_deferred_through_propagation() {
+        let graph = EffectGraph {
+            procedures: vec![
+                procedure("App.pure", Vec::new()),
+                procedure("App.helper", Vec::new()),
+                procedure(
+                    "AcmeScheduler.schedule",
+                    vec![declared(
+                        "acme.network_io",
+                        ExecutionTiming::DeferredCallback,
+                        EffectCertainty::Definite,
+                    )],
+                ),
+            ],
+            edges: vec![edge(0, 1, "site.pure"), edge(1, 2, "site.helper")],
+            truncated: false,
+        };
+        let reports = summarize_procedure_effects(&graph, ProcedureEffectBudget::default());
+        assert_eq!(reports[0].rows[0].timing, Some(EffectTiming::Deferred));
+        assert_eq!(
+            reports[0].rows[0].execution_timing,
+            Some(ExecutionTiming::DeferredCallback)
+        );
+    }
+
+    #[test]
+    fn call_edge_execution_timing_survives_transitive_propagation() {
+        for (execution_timing, expected) in [
+            (
+                ExecutionTiming::SameInvocation,
+                ExecutionTiming::SameInvocation,
+            ),
+            (
+                ExecutionTiming::DifferentTask,
+                ExecutionTiming::DifferentTask,
+            ),
+            (ExecutionTiming::Unknown, ExecutionTiming::Unknown),
+        ] {
+            let mut call = edge(0, 1, "site.call");
+            call.execution_timing = execution_timing;
+            let graph = EffectGraph {
+                procedures: vec![
+                    procedure("App.run", Vec::new()),
+                    procedure(
+                        "AcmeClient.send",
+                        vec![declared(
+                            "acme.network_io",
+                            ExecutionTiming::SameInvocation,
+                            EffectCertainty::Definite,
+                        )],
+                    ),
+                ],
+                edges: vec![call],
+                truncated: false,
+            };
+            let reports = summarize_procedure_effects(&graph, ProcedureEffectBudget::default());
+            assert_eq!(reports[0].rows[0].timing, Some(EffectTiming::Immediate));
+            assert_eq!(reports[0].rows[0].execution_timing, Some(expected));
+        }
+    }
+
+    #[test]
+    fn authored_timing_propagates_unchanged_and_disagreeing_origins_join_unknown() {
+        let graph = EffectGraph {
+            procedures: vec![
+                procedure("App.run", Vec::new()),
+                procedure(
+                    "AcmeClient.sendNow",
+                    vec![declared(
+                        "acme.network_io",
+                        ExecutionTiming::SameInvocation,
+                        EffectCertainty::Definite,
+                    )],
+                ),
+                procedure(
+                    "AcmeClient.sendLater",
+                    vec![declared(
+                        "acme.network_io",
+                        ExecutionTiming::DeferredCallback,
+                        EffectCertainty::Definite,
+                    )],
+                ),
+            ],
+            edges: vec![edge(0, 1, "site.now"), edge(0, 2, "site.later")],
+            truncated: false,
+        };
+        let reports = summarize_procedure_effects(&graph, ProcedureEffectBudget::default());
+        assert_eq!(reports[0].rows[0].timing, Some(EffectTiming::Unknown));
+        assert_eq!(
+            reports[0].rows[0].execution_timing,
+            Some(ExecutionTiming::Unknown)
+        );
+    }
+
+    #[test]
+    fn an_ambiguous_call_edge_downgrades_the_inherited_certainty() {
+        let mut ambiguous = edge(0, 1, "site.pure");
+        ambiguous.certainty = EffectCertainty::Possible;
+        let graph = EffectGraph {
+            procedures: vec![
+                procedure("App.pure", Vec::new()),
+                procedure(
+                    "AcmeHttpClient.send",
+                    vec![declared(
+                        "acme.network_io",
+                        ExecutionTiming::SameEvaluation,
+                        EffectCertainty::Definite,
+                    )],
+                ),
+            ],
+            edges: vec![ambiguous],
+            truncated: false,
+        };
+        let reports = summarize_procedure_effects(&graph, ProcedureEffectBudget::default());
+        assert_eq!(
+            reports[0].rows[0].certainty,
+            Some(EffectCertainty::Possible)
+        );
+    }
+
+    #[test]
+    fn an_unreadable_callee_opens_every_caller_that_reaches_it() {
+        let mut opaque = procedure("App.opaque", Vec::new());
+        opaque.basis = EffectNodeBasis::Unestablished;
+        let graph = EffectGraph {
+            procedures: vec![procedure("App.pure", Vec::new()), opaque],
+            edges: vec![edge(0, 1, "site.pure")],
+            truncated: false,
+        };
+        let reports = summarize_procedure_effects(&graph, ProcedureEffectBudget::default());
+        assert_eq!(reports[0].coverage, EffectCoverage::Open);
+        assert_eq!(reports[0].rows[0].derivation, EffectDerivation::Incomplete);
+        assert_eq!(
+            reports[0].rows[0].reason,
+            Some(EffectReason::ProcedureUnreadable)
+        );
+    }
+
+    #[hardwon(
+        "#2579: an authored external member summary failed to propagate effects while keeping the caller exhaustive"
+    )]
+    #[hardwon(
+        "#2579: Issue #2579 fixed authored summaries binding to external members and propagating their effects to callers"
+    )]
+    #[test]
+    fn a_summarized_leaf_keeps_its_callers_exhaustive_and_propagates_its_declaration() {
+        // The external member has no body and no outgoing edge. Its complete
+        // summary is what establishes its effect set, so the caller stays
+        // exhaustive and still inherits the declaration.
+        let mut external = procedure(
+            "java.io.Writer.write/1+recv",
+            vec![declared(
+                "io.stream_write",
+                ExecutionTiming::SameEvaluation,
+                EffectCertainty::Definite,
+            )],
+        );
+        external.basis = EffectNodeBasis::CompleteSummary;
+        let graph = EffectGraph {
+            procedures: vec![procedure("App.render", Vec::new()), external],
+            edges: vec![edge(0, 1, "site.render")],
+            truncated: false,
+        };
+        let reports = summarize_procedure_effects(&graph, ProcedureEffectBudget::default());
+        assert_eq!(reports[0].coverage, EffectCoverage::Exhaustive);
+        assert_eq!(
+            reports[0].rows[0].effect_id.as_deref(),
+            Some("io.stream_write")
+        );
+        assert_eq!(reports[0].rows[0].derivation, EffectDerivation::Declared);
+        assert_eq!(
+            reports[0].rows[0].witness_chain().as_deref(),
+            Some("App.render -> java.io.Writer.write/1+recv")
+        );
+    }
+
+    #[hardwon("#2579: a known empty external member summary made caller absence incomplete")]
+    #[test]
+    fn a_known_empty_summarized_leaf_leaves_its_caller_absence_exhaustive() {
+        let mut external = procedure("java.lang.String.length/0+recv", Vec::new());
+        external.basis = EffectNodeBasis::CompleteSummary;
+        let graph = EffectGraph {
+            procedures: vec![procedure("App.pure", Vec::new()), external],
+            edges: vec![edge(0, 1, "site.pure")],
+            truncated: false,
+        };
+        let reports = summarize_procedure_effects(&graph, ProcedureEffectBudget::default());
+        assert_eq!(reports[0].coverage, EffectCoverage::Exhaustive);
+        assert_eq!(reports[0].rows[0].derivation, EffectDerivation::None);
+        assert_eq!(reports[0].rows[0].reason, None);
+    }
+
+    #[test]
+    fn the_depth_bound_truncates_instead_of_dropping_the_answer() {
+        let graph = EffectGraph {
+            procedures: vec![
+                procedure("App.a", Vec::new()),
+                procedure("App.b", Vec::new()),
+                procedure(
+                    "AcmeHttpClient.send",
+                    vec![declared(
+                        "acme.network_io",
+                        ExecutionTiming::SameEvaluation,
+                        EffectCertainty::Definite,
+                    )],
+                ),
+            ],
+            edges: vec![edge(0, 1, "site.a"), edge(1, 2, "site.b")],
+            truncated: false,
+        };
+        let budget = ProcedureEffectBudget {
+            max_depth: 1,
+            ..ProcedureEffectBudget::default()
+        };
+        let reports = summarize_procedure_effects(&graph, budget);
+        assert_eq!(reports[0].rows.len(), 1);
+        assert!(reports[0].rows[0].terminal);
+        assert_eq!(reports[0].coverage, EffectCoverage::Truncated);
+        assert_eq!(
+            reports[0].rows[0].reason,
+            Some(EffectReason::ProcedureBudgetExhausted)
+        );
+    }
+
+    #[test]
+    fn the_fixpoint_is_deterministic_under_reordered_edges() {
+        let procedures = vec![
+            procedure("App.a", Vec::new()),
+            procedure("App.b", Vec::new()),
+            procedure(
+                "AcmeHttpClient.send",
+                vec![declared(
+                    "acme.network_io",
+                    ExecutionTiming::SameEvaluation,
+                    EffectCertainty::Definite,
+                )],
+            ),
+        ];
+        let forward = EffectGraph {
+            procedures: procedures.clone(),
+            edges: vec![
+                edge(0, 1, "site.a"),
+                edge(0, 2, "site.direct"),
+                edge(1, 2, "site.b"),
+            ],
+            truncated: false,
+        };
+        let reversed = EffectGraph {
+            procedures,
+            edges: vec![
+                edge(1, 2, "site.b"),
+                edge(0, 2, "site.direct"),
+                edge(0, 1, "site.a"),
+            ],
+            truncated: false,
+        };
+        assert_eq!(
+            summarize_procedure_effects(&forward, ProcedureEffectBudget::default()),
+            summarize_procedure_effects(&reversed, ProcedureEffectBudget::default())
+        );
+    }
+
+    #[test]
+    fn a_procedure_with_no_effect_and_a_complete_graph_states_an_exhaustive_absence() {
+        let graph = EffectGraph {
+            procedures: vec![
+                procedure("App.pure", Vec::new()),
+                procedure("App.helper", Vec::new()),
+            ],
+            edges: vec![edge(0, 1, "site.pure")],
+            truncated: false,
+        };
+        let reports = summarize_procedure_effects(&graph, ProcedureEffectBudget::default());
+        assert_eq!(reports[0].rows.len(), 1);
+        assert!(reports[0].rows[0].terminal);
+        assert_eq!(reports[0].rows[0].derivation, EffectDerivation::None);
+        assert_eq!(reports[0].coverage, EffectCoverage::Exhaustive);
     }
 
     #[test]
@@ -1896,16 +2552,8 @@ func caller(values []int) {
             "{shadowed_predeclared:#?}"
         );
         assert!(
-            shadowed_predeclared
-                .adjudicable_workspace_names
-                .iter()
-                .all(|name| name.owner != "os"),
-            "{shadowed_predeclared:#?}"
-        );
-        assert!(
-            !shadowed_predeclared.arms.is_empty()
-                || !shadowed_predeclared.adjudicable_workspace_names.is_empty(),
-            "the package declaration must resolve before predeclared-name adjudication: {shadowed_predeclared:#?}"
+            !shadowed_predeclared.arms.is_empty(),
+            "the shadowing package declaration must resolve to a target: {shadowed_predeclared:#?}"
         );
 
         let local_source = r#"package main
@@ -1933,10 +2581,6 @@ func caller(os opener) { _, _ = os.Open("book.xlsx") }
         assert_ne!(local_arm.key.owner, "os");
         assert_eq!(local_arm.key.member, "Open");
         assert!(local_arm.key.has_receiver);
-        assert!(
-            local.adjudicable_workspace_names.is_empty(),
-            "a keyed workspace target is a positive arm, not a negative-only name: {local:#?}"
-        );
         assert_eq!(
             local.call_application,
             ModeledCallApplication::BoundReceiver,
@@ -2152,6 +2796,116 @@ func caller(t *testing.T) { t.Fatal("stop") }
     }
 
     #[test]
+    fn exact_rust_static_and_bound_calls_keep_distinct_modeled_keys() {
+        let source = r#"use std::process::Command;
+fn caller(command: Command) {
+    Command::new("true");
+    command.new("true");
+}
+"#;
+        let fixture = AnalyzerFixture::new_for_language(Language::Rust, &[("main.rs", source)]);
+        let static_shape = rust_shape(&fixture, source, "Command::new(\"true\")");
+        let receiver_shape = rust_shape(&fixture, source, "command.new(\"true\")");
+        let identity = || {
+            crate::analyzer::semantic::ResolverOwnedExternalCalleeIdentity::new(
+                Language::Rust,
+                "std.process.Command",
+                "new",
+            )
+        };
+        let static_dispatch = CallDispatchLookup {
+            status: Some(DefinitionLookupStatus::UnresolvableImportBoundary),
+            call_application: CallApplicationKind::PackageFunction,
+            exact_external_call: Some(ExactExternalCallProof::rust_external_call(
+                "std::process::Command::new",
+                1,
+            )),
+            boundaries: vec![CallDispatchBoundaryKind::External {
+                callee_text: Some("std::process::Command::new".into()),
+                normalized_static_owner: None,
+                external_callee_identity: Some(identity()),
+            }],
+            ..CallDispatchLookup::default()
+        };
+        let static_target = project_modeled_call_target_lookup(
+            fixture.analyzer.analyzer(),
+            &static_shape,
+            true,
+            static_dispatch,
+        );
+        assert_eq!(
+            static_target.coverage,
+            ModeledCallTargetCoverage::Exhaustive
+        );
+        assert_eq!(static_target.arms.len(), 1, "{static_target:#?}");
+        assert_eq!(
+            &static_target.arms[0].key,
+            &ModeledProcedureKey {
+                language: "rust".to_owned(),
+                owner: "std.process.Command".to_owned(),
+                member: "new".to_owned(),
+                has_receiver: false,
+                parameter_count: 1,
+            }
+        );
+
+        let receiver_dispatch = CallDispatchLookup {
+            status: Some(DefinitionLookupStatus::UnresolvableImportBoundary),
+            call_application: CallApplicationKind::BoundReceiver,
+            dispatch_extensibility: Some(crate::analyzer::DispatchExtensibility::Closed),
+            exact_external_call: Some(ExactExternalCallProof::rust_bound_external_member(
+                "std.process.Command",
+                "new",
+                1,
+            )),
+            boundaries: vec![CallDispatchBoundaryKind::External {
+                callee_text: Some("std::process::Command::new".into()),
+                normalized_static_owner: None,
+                external_callee_identity: Some(identity()),
+            }],
+            ..CallDispatchLookup::default()
+        };
+        let receiver_target = project_modeled_call_target_lookup(
+            fixture.analyzer.analyzer(),
+            &receiver_shape,
+            true,
+            receiver_dispatch.clone(),
+        );
+        assert_eq!(
+            receiver_target.coverage,
+            ModeledCallTargetCoverage::Exhaustive
+        );
+        assert_eq!(receiver_target.arms.len(), 1, "{receiver_target:#?}");
+        assert_eq!(
+            &receiver_target.arms[0].key,
+            &ModeledProcedureKey {
+                language: "rust".to_owned(),
+                owner: "std.process.Command".to_owned(),
+                member: "new".to_owned(),
+                has_receiver: true,
+                parameter_count: 1,
+            }
+        );
+        assert_ne!(
+            static_target.arms[0].key, receiver_target.arms[0].key,
+            "an associated function and a value receiver stay distinct"
+        );
+
+        let unresolved = project_modeled_call_target_lookup(
+            fixture.analyzer.analyzer(),
+            &receiver_shape,
+            true,
+            CallDispatchLookup {
+                call_application: CallApplicationKind::ReceiverBindingUnknown,
+                exact_external_call: None,
+                ..receiver_dispatch
+            },
+        );
+        assert!(unresolved.arms.is_empty(), "{unresolved:#?}");
+        assert_eq!(unresolved.coverage, ModeledCallTargetCoverage::Open);
+    }
+
+    #[test]
     fn modeled_go_target_uses_resolver_effective_arity_for_a_sole_tuple_call() {
         let source = r#"package main
 import model "example.com/model"
@@ -2240,7 +2994,7 @@ func caller() { model.Duration(1) }
     }
 
     #[test]
-    fn external_typed_go_receiver_is_adjudicated_without_minting_a_target() {
+    fn external_typed_go_receiver_resolves_its_modeled_method_identity() {
         let source = r#"package main
 import "embed"
 var embedded embed.FS
@@ -2249,8 +3003,13 @@ func caller() {
     _, _ = embedded.Open("book.xlsx")
     _, _ = factory().Open("book.xlsx")
 }
-"#;
+        "#;
         let fixture = AnalyzerFixture::new_for_language(Language::Go, &[("main.go", source)]);
+        let overlay = crate::analyzer::semantic_model::go_external_receiver_test_overlay();
+        let _overlay_scope = crate::analyzer::AnalyzerQueryScope::with_semantic_model_overlay(
+            fixture.analyzer.analyzer(),
+            Some(overlay),
+        );
         let (shape, text) = go_shape(&fixture, source, "embedded.Open(\"book.xlsx\")");
         let lookup = modeled_lookup(
             &fixture,
@@ -2263,9 +3022,18 @@ func caller() {
             },
             None,
         );
-        assert!(lookup.arms.is_empty(), "{lookup:#?}");
-        assert!(lookup.adjudicable_workspace_names.is_empty(), "{lookup:#?}");
-        assert_eq!(lookup.coverage, ModeledCallTargetCoverage::Open);
+        let expected_arm = ModeledCallTargetArm {
+            key: ModeledProcedureKey {
+                language: "go".to_owned(),
+                owner: "embed.FS".to_owned(),
+                member: "Open".to_owned(),
+                has_receiver: true,
+                parameter_count: 1,
+            },
+            origin: ModeledCallTargetOrigin::UnmaterializedExternal,
+        };
+        assert_eq!(lookup.arms, vec![expected_arm.clone()], "{lookup:#?}");
+        assert_eq!(lookup.coverage, ModeledCallTargetCoverage::Exhaustive);
         assert_eq!(
             lookup.call_application,
             ModeledCallApplication::BoundReceiver,
@@ -2285,8 +3053,8 @@ func caller() {
             },
             None,
         );
-        assert!(structured.arms.is_empty(), "{structured:#?}");
-        assert_eq!(structured.coverage, ModeledCallTargetCoverage::Open);
+        assert_eq!(structured.arms, vec![expected_arm], "{structured:#?}");
+        assert_eq!(structured.coverage, ModeledCallTargetCoverage::Exhaustive);
         assert_eq!(
             structured.call_application,
             ModeledCallApplication::BoundReceiver,
@@ -2324,133 +3092,6 @@ func caller() {
         assert_eq!(report.coverage, EffectCoverage::Exhaustive);
         assert!(!row.terminal);
     }
-
-    #[test]
-    fn exact_call_execution_composes_with_declared_effect_timing() {
-        for (call_timing, effect_timing, expected) in [
-            (
-                ExecutionTiming::SameEvaluation,
-                ExecutionTiming::SameInvocation,
-                ExecutionTiming::SameInvocation,
-            ),
-            (
-                ExecutionTiming::SameInvocation,
-                ExecutionTiming::SameInvocation,
-                ExecutionTiming::SameInvocation,
-            ),
-            (
-                ExecutionTiming::DifferentTask,
-                ExecutionTiming::SameInvocation,
-                ExecutionTiming::DifferentTask,
-            ),
-            (
-                ExecutionTiming::DifferentTask,
-                ExecutionTiming::DeferredCallback,
-                ExecutionTiming::Unknown,
-            ),
-            (
-                ExecutionTiming::Unknown,
-                ExecutionTiming::SameInvocation,
-                ExecutionTiming::Unknown,
-            ),
-        ] {
-            let authored_timing = match effect_timing {
-                ExecutionTiming::DeferredCallback => EffectTiming::Deferred,
-                ExecutionTiming::Unknown => EffectTiming::Unknown,
-                _ => EffectTiming::Immediate,
-            };
-            let mut effect_arm = arm(
-                "target",
-                EffectProof::Proven,
-                ArmLookup::Declared(vec![declared(
-                    "acme.network_io",
-                    effect_timing,
-                    EffectCertainty::Definite,
-                )]),
-            );
-            effect_arm.execution_timing = call_timing;
-            let report = call_effect_report(
-                &file(),
-                "site",
-                "ast",
-                range(),
-                CallEffectSiteStatus::Answered {
-                    coverage: EffectCoverage::Exhaustive,
-                },
-                &[effect_arm],
-            );
-            assert_eq!(report.rows[0].timing, Some(authored_timing));
-            assert_eq!(report.rows[0].execution_timing, Some(expected));
-        }
-    }
-
-    #[test]
-    fn authored_immediate_effect_means_before_return_not_same_program_point() {
-        assert_eq!(
-            EffectTiming::from_compiled(CompiledDeclaredEffectTiming::Immediate),
-            EffectTiming::Immediate
-        );
-        assert_eq!(
-            declared_effect_execution_timing(CompiledDeclaredEffectTiming::Immediate),
-            ExecutionTiming::SameInvocation
-        );
-        assert_eq!(
-            declared_effect_execution_timing(CompiledDeclaredEffectTiming::Deferred),
-            ExecutionTiming::DeferredCallback
-        );
-        assert_eq!(
-            declared_effect_execution_timing(CompiledDeclaredEffectTiming::Unknown),
-            ExecutionTiming::Unknown
-        );
-    }
-
-    #[test]
-    fn an_unproven_arm_downgrades_a_definite_declaration_to_possible() {
-        let report = call_effect_report(
-            &file(),
-            "site",
-            "ast",
-            range(),
-            CallEffectSiteStatus::Answered {
-                coverage: EffectCoverage::Open,
-            },
-            &[arm(
-                "target",
-                EffectProof::Unproven,
-                ArmLookup::Declared(vec![declared(
-                    "acme.network_io",
-                    ExecutionTiming::SameEvaluation,
-                    EffectCertainty::Definite,
-                )]),
-            )],
-        );
-        assert_eq!(report.rows[0].certainty, Some(EffectCertainty::Possible));
-        assert_eq!(report.coverage, EffectCoverage::Open);
-    }
-
-    #[test]
-    fn a_proven_arm_never_promotes_a_possible_declaration() {
-        let report = call_effect_report(
-            &file(),
-            "site",
-            "ast",
-            range(),
-            CallEffectSiteStatus::Answered {
-                coverage: EffectCoverage::Exhaustive,
-            },
-            &[arm(
-                "target",
-                EffectProof::Proven,
-                ArmLookup::Declared(vec![declared(
-                    "acme.network_io",
-                    ExecutionTiming::SameEvaluation,
-                    EffectCertainty::Possible,
-                )]),
-            )],
-        );
-        assert_eq!(report.rows[0].certainty, Some(EffectCertainty::Possible));
-    }
-
     #[test]
     fn a_site_with_no_declared_effect_still_states_its_status() {
         let report = call_effect_report(
@@ -2473,28 +3114,6 @@ func caller() {
         assert_eq!(report.rows[0].reason, None);
         assert_eq!(report.coverage, EffectCoverage::Exhaustive);
     }
-
-    #[test]
-    fn an_unmodeled_external_callee_opens_the_sites_coverage() {
-        let report = call_effect_report(
-            &file(),
-            "site",
-            "ast",
-            range(),
-            CallEffectSiteStatus::Answered {
-                coverage: EffectCoverage::Exhaustive,
-            },
-            &[arm(
-                "target",
-                EffectProof::Proven,
-                ArmLookup::Unmodeled { analyzable: false },
-            )],
-        );
-        assert_eq!(report.coverage, EffectCoverage::Open);
-        assert_eq!(report.rows[0].derivation, EffectDerivation::Incomplete);
-        assert_eq!(report.rows[0].reason, Some(EffectReason::CalleeUnmodeled));
-    }
-
     #[test]
     fn an_interrupted_dispatch_states_the_typed_reason() {
         let report = call_effect_report(
@@ -2512,396 +3131,6 @@ func caller() {
         assert_eq!(
             report.rows[0].reason,
             Some(EffectReason::DispatchUnsupported)
-        );
-    }
-
-    fn procedure(name: &str, declared: Vec<BoundDeclaredEffect>) -> EffectGraphProcedure {
-        EffectGraphProcedure {
-            declaration_id: format!("decl:{name}"),
-            display_name: name.to_owned(),
-            declared,
-            basis: EffectNodeBasis::BodyRead,
-            declaration_only: false,
-            local_gaps: Vec::new(),
-        }
-    }
-
-    fn edge(caller: usize, callee: usize, site: &str) -> EffectGraphEdge {
-        EffectGraphEdge {
-            caller,
-            callee,
-            site_id: site.to_owned(),
-            certainty: EffectCertainty::Definite,
-            execution_timing: ExecutionTiming::SameEvaluation,
-        }
-    }
-
-    #[test]
-    fn a_direct_call_to_a_modeled_api_is_depth_one_and_direct() {
-        let graph = EffectGraph {
-            procedures: vec![
-                procedure("App.pure", Vec::new()),
-                procedure(
-                    "AcmeHttpClient.send",
-                    vec![declared(
-                        "acme.network_io",
-                        ExecutionTiming::SameEvaluation,
-                        EffectCertainty::Definite,
-                    )],
-                ),
-            ],
-            edges: vec![edge(0, 1, "site.pure")],
-            truncated: false,
-        };
-        let reports = summarize_procedure_effects(&graph, ProcedureEffectBudget::default());
-        let row = &reports[0].rows[0];
-        assert_eq!(row.effect_id.as_deref(), Some("acme.network_io"));
-        assert_eq!(row.depth, Some(1));
-        assert_eq!(row.classification, Some(EffectClassification::Direct));
-        assert_eq!(row.witness.len(), 1);
-        assert_eq!(row.witness_effect_site_id(), Some("site.pure"));
-        assert_eq!(reports[0].coverage, EffectCoverage::Exhaustive);
-    }
-
-    #[test]
-    fn a_two_hop_chain_is_transitive_and_retains_the_whole_witness() {
-        let graph = EffectGraph {
-            procedures: vec![
-                procedure("App.pure", Vec::new()),
-                procedure("App.helper", Vec::new()),
-                procedure(
-                    "AcmeHttpClient.send",
-                    vec![declared(
-                        "acme.network_io",
-                        ExecutionTiming::SameEvaluation,
-                        EffectCertainty::Definite,
-                    )],
-                ),
-            ],
-            edges: vec![edge(0, 1, "site.pure"), edge(1, 2, "site.helper")],
-            truncated: false,
-        };
-        let reports = summarize_procedure_effects(&graph, ProcedureEffectBudget::default());
-        let row = &reports[0].rows[0];
-        assert_eq!(row.depth, Some(2));
-        assert_eq!(row.classification, Some(EffectClassification::Transitive));
-        assert_eq!(
-            row.witness
-                .iter()
-                .map(|step| step.site_id.as_str())
-                .collect::<Vec<_>>(),
-            vec!["site.pure", "site.helper"]
-        );
-        assert_eq!(
-            row.witness_chain().as_deref(),
-            Some("App.pure -> App.helper -> AcmeHttpClient.send")
-        );
-    }
-
-    #[test]
-    fn a_recursive_cycle_converges_under_the_iteration_bound() {
-        let graph = EffectGraph {
-            procedures: vec![
-                procedure("App.a", Vec::new()),
-                procedure("App.b", Vec::new()),
-                procedure(
-                    "AcmeHttpClient.send",
-                    vec![declared(
-                        "acme.network_io",
-                        ExecutionTiming::SameEvaluation,
-                        EffectCertainty::Definite,
-                    )],
-                ),
-            ],
-            edges: vec![
-                edge(0, 1, "site.a"),
-                edge(1, 0, "site.b"),
-                edge(1, 2, "site.send"),
-            ],
-            truncated: false,
-        };
-        let reports = summarize_procedure_effects(&graph, ProcedureEffectBudget::default());
-        for report in reports.iter().take(2) {
-            assert_eq!(report.rows.len(), 1);
-            assert_eq!(report.rows[0].effect_id.as_deref(), Some("acme.network_io"));
-            assert_eq!(report.coverage, EffectCoverage::Exhaustive);
-        }
-        // The whole cycle is reachable, so both procedures carry the effect and
-        // neither report is truncated.
-        assert_eq!(reports[0].rows[0].depth, Some(2));
-        assert_eq!(reports[1].rows[0].depth, Some(1));
-    }
-
-    #[test]
-    fn a_deferred_declaration_stays_deferred_through_propagation() {
-        let graph = EffectGraph {
-            procedures: vec![
-                procedure("App.pure", Vec::new()),
-                procedure("App.helper", Vec::new()),
-                procedure(
-                    "AcmeScheduler.schedule",
-                    vec![declared(
-                        "acme.network_io",
-                        ExecutionTiming::DeferredCallback,
-                        EffectCertainty::Definite,
-                    )],
-                ),
-            ],
-            edges: vec![edge(0, 1, "site.pure"), edge(1, 2, "site.helper")],
-            truncated: false,
-        };
-        let reports = summarize_procedure_effects(&graph, ProcedureEffectBudget::default());
-        assert_eq!(reports[0].rows[0].timing, Some(EffectTiming::Deferred));
-        assert_eq!(
-            reports[0].rows[0].execution_timing,
-            Some(ExecutionTiming::DeferredCallback)
-        );
-    }
-
-    #[test]
-    fn call_edge_execution_timing_survives_transitive_propagation() {
-        for (execution_timing, expected) in [
-            (
-                ExecutionTiming::SameInvocation,
-                ExecutionTiming::SameInvocation,
-            ),
-            (
-                ExecutionTiming::DifferentTask,
-                ExecutionTiming::DifferentTask,
-            ),
-            (ExecutionTiming::Unknown, ExecutionTiming::Unknown),
-        ] {
-            let mut call = edge(0, 1, "site.call");
-            call.execution_timing = execution_timing;
-            let graph = EffectGraph {
-                procedures: vec![
-                    procedure("App.run", Vec::new()),
-                    procedure(
-                        "AcmeClient.send",
-                        vec![declared(
-                            "acme.network_io",
-                            ExecutionTiming::SameInvocation,
-                            EffectCertainty::Definite,
-                        )],
-                    ),
-                ],
-                edges: vec![call],
-                truncated: false,
-            };
-            let reports = summarize_procedure_effects(&graph, ProcedureEffectBudget::default());
-            assert_eq!(reports[0].rows[0].timing, Some(EffectTiming::Immediate));
-            assert_eq!(reports[0].rows[0].execution_timing, Some(expected));
-        }
-    }
-
-    #[test]
-    fn authored_timing_propagates_unchanged_and_disagreeing_origins_join_unknown() {
-        let graph = EffectGraph {
-            procedures: vec![
-                procedure("App.run", Vec::new()),
-                procedure(
-                    "AcmeClient.sendNow",
-                    vec![declared(
-                        "acme.network_io",
-                        ExecutionTiming::SameInvocation,
-                        EffectCertainty::Definite,
-                    )],
-                ),
-                procedure(
-                    "AcmeClient.sendLater",
-                    vec![declared(
-                        "acme.network_io",
-                        ExecutionTiming::DeferredCallback,
-                        EffectCertainty::Definite,
-                    )],
-                ),
-            ],
-            edges: vec![edge(0, 1, "site.now"), edge(0, 2, "site.later")],
-            truncated: false,
-        };
-        let reports = summarize_procedure_effects(&graph, ProcedureEffectBudget::default());
-        assert_eq!(reports[0].rows[0].timing, Some(EffectTiming::Unknown));
-        assert_eq!(
-            reports[0].rows[0].execution_timing,
-            Some(ExecutionTiming::Unknown)
-        );
-    }
-
-    #[test]
-    fn an_ambiguous_call_edge_downgrades_the_inherited_certainty() {
-        let mut ambiguous = edge(0, 1, "site.pure");
-        ambiguous.certainty = EffectCertainty::Possible;
-        let graph = EffectGraph {
-            procedures: vec![
-                procedure("App.pure", Vec::new()),
-                procedure(
-                    "AcmeHttpClient.send",
-                    vec![declared(
-                        "acme.network_io",
-                        ExecutionTiming::SameEvaluation,
-                        EffectCertainty::Definite,
-                    )],
-                ),
-            ],
-            edges: vec![ambiguous],
-            truncated: false,
-        };
-        let reports = summarize_procedure_effects(&graph, ProcedureEffectBudget::default());
-        assert_eq!(
-            reports[0].rows[0].certainty,
-            Some(EffectCertainty::Possible)
-        );
-    }
-
-    #[test]
-    fn an_unreadable_callee_opens_every_caller_that_reaches_it() {
-        let mut opaque = procedure("App.opaque", Vec::new());
-        opaque.basis = EffectNodeBasis::Unestablished;
-        let graph = EffectGraph {
-            procedures: vec![procedure("App.pure", Vec::new()), opaque],
-            edges: vec![edge(0, 1, "site.pure")],
-            truncated: false,
-        };
-        let reports = summarize_procedure_effects(&graph, ProcedureEffectBudget::default());
-        assert_eq!(reports[0].coverage, EffectCoverage::Open);
-        assert_eq!(reports[0].rows[0].derivation, EffectDerivation::Incomplete);
-        assert_eq!(
-            reports[0].rows[0].reason,
-            Some(EffectReason::ProcedureUnreadable)
-        );
-    }
-
-    #[test]
-    fn a_summarized_leaf_keeps_its_callers_exhaustive_and_propagates_its_declaration() {
-        // The external member has no body and no outgoing edge. Its complete
-        // summary is what establishes its effect set, so the caller stays
-        // exhaustive and still inherits the declaration.
-        let mut external = procedure(
-            "java.io.Writer.write/1+recv",
-            vec![declared(
-                "io.stream_write",
-                ExecutionTiming::SameEvaluation,
-                EffectCertainty::Definite,
-            )],
-        );
-        external.basis = EffectNodeBasis::CompleteSummary;
-        let graph = EffectGraph {
-            procedures: vec![procedure("App.render", Vec::new()), external],
-            edges: vec![edge(0, 1, "site.render")],
-            truncated: false,
-        };
-        let reports = summarize_procedure_effects(&graph, ProcedureEffectBudget::default());
-        assert_eq!(reports[0].coverage, EffectCoverage::Exhaustive);
-        assert_eq!(
-            reports[0].rows[0].effect_id.as_deref(),
-            Some("io.stream_write")
-        );
-        assert_eq!(reports[0].rows[0].derivation, EffectDerivation::Declared);
-        assert_eq!(
-            reports[0].rows[0].witness_chain().as_deref(),
-            Some("App.render -> java.io.Writer.write/1+recv")
-        );
-    }
-
-    #[test]
-    fn a_known_empty_summarized_leaf_leaves_its_caller_absence_exhaustive() {
-        let mut external = procedure("java.lang.String.length/0+recv", Vec::new());
-        external.basis = EffectNodeBasis::CompleteSummary;
-        let graph = EffectGraph {
-            procedures: vec![procedure("App.pure", Vec::new()), external],
-            edges: vec![edge(0, 1, "site.pure")],
-            truncated: false,
-        };
-        let reports = summarize_procedure_effects(&graph, ProcedureEffectBudget::default());
-        assert_eq!(reports[0].coverage, EffectCoverage::Exhaustive);
-        assert_eq!(reports[0].rows[0].derivation, EffectDerivation::None);
-        assert_eq!(reports[0].rows[0].reason, None);
-    }
-
-    #[test]
-    fn a_procedure_with_no_effect_and_a_complete_graph_states_an_exhaustive_absence() {
-        let graph = EffectGraph {
-            procedures: vec![
-                procedure("App.pure", Vec::new()),
-                procedure("App.helper", Vec::new()),
-            ],
-            edges: vec![edge(0, 1, "site.pure")],
-            truncated: false,
-        };
-        let reports = summarize_procedure_effects(&graph, ProcedureEffectBudget::default());
-        assert_eq!(reports[0].rows.len(), 1);
-        assert!(reports[0].rows[0].terminal);
-        assert_eq!(reports[0].rows[0].derivation, EffectDerivation::None);
-        assert_eq!(reports[0].coverage, EffectCoverage::Exhaustive);
-    }
-
-    #[test]
-    fn the_depth_bound_truncates_instead_of_dropping_the_answer() {
-        let graph = EffectGraph {
-            procedures: vec![
-                procedure("App.a", Vec::new()),
-                procedure("App.b", Vec::new()),
-                procedure(
-                    "AcmeHttpClient.send",
-                    vec![declared(
-                        "acme.network_io",
-                        ExecutionTiming::SameEvaluation,
-                        EffectCertainty::Definite,
-                    )],
-                ),
-            ],
-            edges: vec![edge(0, 1, "site.a"), edge(1, 2, "site.b")],
-            truncated: false,
-        };
-        let budget = ProcedureEffectBudget {
-            max_depth: 1,
-            ..ProcedureEffectBudget::default()
-        };
-        let reports = summarize_procedure_effects(&graph, budget);
-        assert_eq!(reports[0].rows.len(), 1);
-        assert!(reports[0].rows[0].terminal);
-        assert_eq!(reports[0].coverage, EffectCoverage::Truncated);
-        assert_eq!(
-            reports[0].rows[0].reason,
-            Some(EffectReason::ProcedureBudgetExhausted)
-        );
-    }
-
-    #[test]
-    fn the_fixpoint_is_deterministic_under_reordered_edges() {
-        let procedures = vec![
-            procedure("App.a", Vec::new()),
-            procedure("App.b", Vec::new()),
-            procedure(
-                "AcmeHttpClient.send",
-                vec![declared(
-                    "acme.network_io",
-                    ExecutionTiming::SameEvaluation,
-                    EffectCertainty::Definite,
-                )],
-            ),
-        ];
-        let forward = EffectGraph {
-            procedures: procedures.clone(),
-            edges: vec![
-                edge(0, 1, "site.a"),
-                edge(0, 2, "site.direct"),
-                edge(1, 2, "site.b"),
-            ],
-            truncated: false,
-        };
-        let reversed = EffectGraph {
-            procedures,
-            edges: vec![
-                edge(1, 2, "site.b"),
-                edge(0, 2, "site.direct"),
-                edge(0, 1, "site.a"),
-            ],
-            truncated: false,
-        };
-        assert_eq!(
-            summarize_procedure_effects(&forward, ProcedureEffectBudget::default()),
-            summarize_procedure_effects(&reversed, ProcedureEffectBudget::default())
         );
     }
 }

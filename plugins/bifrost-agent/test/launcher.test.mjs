@@ -16,7 +16,6 @@ import {
   STARTUP_MARGIN_MS,
   VERSION_PROBE_TIMEOUT_MS,
   buildBifrostArgs,
-  buildBifrostLspArgs,
   cacheRootFor,
   cleanupStaleInstallArtifacts,
   findOnPath,
@@ -34,7 +33,6 @@ import {
   releaseTargetFor,
   resolveBifrostBinary,
   resolveBifrostLaunch,
-  resolveBifrostLspLaunch,
   resolveWorkspaceRoot,
   schedulePreferredBifrostPreparation,
   sha256
@@ -518,10 +516,6 @@ if [ "$1" = "--version" ]; then
   echo "bifrost ${metadata.binaryVersion}"
   exit 0
 fi
-if [ "$1" = "pack-engine-profile" ]; then
-  echo "Unknown argument: pack-engine-profile" >&2
-  exit 2
-fi
 printf '%s\\n' "$@" > "${recordPath}"
 `);
 
@@ -558,10 +552,6 @@ test("Codex adapter selects package-root launcher from its host-specific manifes
 if [ "$1" = "--version" ]; then
   echo "bifrost ${metadata.binaryVersion}"
   exit 0
-fi
-if [ "$1" = "pack-engine-profile" ]; then
-  echo "Unknown argument: pack-engine-profile" >&2
-  exit 2
 fi
 printf '%s\\n' "$@" > "${recordPath}"
 `);
@@ -606,10 +596,6 @@ if [ "$1" = "--version" ]; then
   echo "bifrost ${metadata.binaryVersion}"
   exit 0
 fi
-if [ "$1" = "pack-engine-profile" ]; then
-  echo "Unknown argument: pack-engine-profile" >&2
-  exit 2
-fi
 printf '%s\\n' "$@" > "${recordPath}"
 `);
 
@@ -631,53 +617,6 @@ printf '%s\\n' "$@" > "${recordPath}"
   );
   assert.equal(path.isAbsolute(command), true);
   assert.equal(command.startsWith(packageDir), true);
-});
-
-test("Claude LSP manifest resolves the launcher against the project workspace", async () => {
-  if (process.platform === "win32") {
-    return;
-  }
-  const temp = await fsp.mkdtemp(path.join(os.tmpdir(), "bifrost launcher lsp test "));
-  const workspace = path.join(temp, "workspace with spaces");
-  const otherWorkspace = path.join(temp, "environment override");
-  const recordPath = path.join(temp, "args.txt");
-  const stubBinary = path.join(temp, "bifrost-stub");
-  const metadata = await readReleaseMetadata(path.join(packageDir, "bifrost-release.json"));
-  await fsp.mkdir(workspace);
-  await fsp.mkdir(otherWorkspace);
-  await writeExecutableFixture(stubBinary, `#!/bin/sh
-if [ "$1" = "--version" ]; then
-  echo "bifrost ${metadata.binaryVersion}"
-  exit 0
-fi
-if [ "$1" = "pack-engine-profile" ]; then
-  echo "Unknown argument: pack-engine-profile" >&2
-  exit 2
-fi
-printf '%s\\n' "$@" > "${recordPath}"
-`);
-
-  const lspConfig = JSON.parse(await fsp.readFile(path.join(packageDir, ".lsp.json"), "utf8"));
-  const server = lspConfig.bifrost;
-  const command = server.command.replace("${CLAUDE_PLUGIN_ROOT}", packageDir);
-  const args = server.args.map((arg) => arg.replace("${CLAUDE_PROJECT_DIR}", workspace));
-  await execFileAsync(command, args, {
-    cwd: packageDir,
-    env: {
-      ...process.env,
-      BIFROST_BINARY_PATH: stubBinary,
-      BIFROST_WORKSPACE_ROOT: otherWorkspace,
-      BIFROST_LAUNCHER_AUTO_INSTALL: "0"
-    }
-  });
-
-  assert.deepEqual(
-    (await fsp.readFile(recordPath, "utf8")).trim().split(/\r?\n/),
-    ["--root", workspace, "--lsp"]
-  );
-  assert.equal(path.isAbsolute(command), true);
-  assert.equal(command.startsWith(packageDir), true);
-  assert.equal(server.workspaceFolder.replace("${CLAUDE_PROJECT_DIR}", workspace), workspace);
 });
 
 test("resolves an explicit reusable launch without allowing env root override", async () => {
@@ -703,8 +642,6 @@ test("resolves an explicit reusable launch without allowing env root override", 
     toolset: "symbol|extended",
     metadata: { binaryVersion: "0.8.4", archiveSha256: {} },
     execFileImpl: async () => ({ stdout: "bifrost 0.8.4\n", stderr: "" }),
-    openPackProfileImpl: async () => { throw Object.assign(new Error("old fixture binary"), { code: "unsupported" }); },
-    onOpenPackDiagnostic: () => {}
   });
 
   assert.equal(resolved.command, binaryPath);
@@ -712,81 +649,6 @@ test("resolves an explicit reusable launch without allowing env root override", 
   assert.equal(resolved.env, env);
   assert.equal(resolved.source, "explicit");
   assert.deepEqual(resolved.args, ["--root", path.resolve(workspace), "--mcp", "symbol|extended"]);
-});
-
-test("resolves an explicit LSP launch without allowing env root override", async () => {
-  const temp = await fsp.mkdtemp(path.join(os.tmpdir(), "bifrost-launcher-test-"));
-  const workspace = path.join(temp, "workspace");
-  const otherWorkspace = path.join(temp, "other");
-  const binaryPath = path.join(temp, process.platform === "win32" ? "bifrost.exe" : "bifrost");
-  await fsp.mkdir(workspace);
-  await fsp.mkdir(otherWorkspace);
-  await fsp.writeFile(binaryPath, "#!/bin/sh\nexit 0\n");
-  if (process.platform !== "win32") {
-    await fsp.chmod(binaryPath, 0o755);
-  }
-  const env = {
-    BIFROST_BINARY_PATH: binaryPath,
-    BIFROST_WORKSPACE_ROOT: otherWorkspace,
-    BIFROST_LAUNCHER_AUTO_INSTALL: "0"
-  };
-
-  const resolved = await resolveBifrostLspLaunch({
-    root: workspace,
-    env,
-    metadata: { binaryVersion: "0.8.4", archiveSha256: {} },
-    execFileImpl: async () => ({ stdout: "bifrost 0.8.4\n", stderr: "" }),
-    openPackProfileImpl: async () => { throw Object.assign(new Error("old fixture binary"), { code: "unsupported" }); },
-    onOpenPackDiagnostic: () => {}
-  });
-
-  assert.equal(resolved.command, binaryPath);
-  assert.equal(resolved.cwd, path.resolve(workspace));
-  assert.equal(resolved.env, env);
-  assert.equal(resolved.source, "explicit");
-  assert.deepEqual(resolved.args, ["--root", path.resolve(workspace), "--lsp"]);
-});
-
-test("default launch applies qualified open-pack environment over embedded defaults", async (t) => {
-  const temp = await fsp.mkdtemp(path.join(os.tmpdir(), "bifrost-launcher-open-packs-"));
-  t.after(() => fsp.rm(temp, { recursive: true, force: true }));
-  const binary = path.join(temp, process.platform === "win32" ? "bifrost.exe" : "bifrost");
-  await fsp.mkdir(path.join(temp, "workspace"));
-  await writeExecutableFixture(binary, "#!/bin/sh\nexit 0\n");
-  const engineProfile = { engine_version: "0.13.0", capabilities: [] };
-  const receipt = { receipt_schema_version: 1, status: "qualified", selection_id: "a".repeat(64) };
-  const optionsSeen = [];
-  const env = {
-    BIFROST_BINARY_PATH: binary,
-    BIFROST_LAUNCHER_AUTO_INSTALL: "0",
-    BIFROST_LAUNCHER_CACHE_DIR: path.join(temp, "cache"),
-    BIFROST_OPEN_SEMANTIC_PACK_BUNDLE: "embedded-bundle"
-  };
-  const launch = await resolveBifrostLaunch({
-    root: path.join(temp, "workspace"),
-    env,
-    metadata: { binaryVersion: "0.8.4", archiveSha256: {} },
-    execFileImpl: async () => ({ stdout: "bifrost 0.8.4\n", stderr: "" }),
-    openPackProfileImpl: async () => engineProfile,
-    prepareOpenPacksImpl: async (options) => {
-      optionsSeen.push(options);
-      return {
-        env: {
-          BIFROST_OPEN_SEMANTIC_PACK_BUNDLE: "/cache/selection/semantic/bifrost-semantic-packs",
-          BIFROST_OPEN_POLICY_PACK_ROOT: "/cache/selection/source/rules",
-          BIFROST_SEMANTIC_PACK_CACHE_ROOT: "/cache/catalog-v1"
-        },
-        receipt
-      };
-    }
-  });
-  assert.equal(launch.env.BIFROST_OPEN_SEMANTIC_PACK_BUNDLE, "/cache/selection/semantic/bifrost-semantic-packs");
-  assert.equal(launch.env.BIFROST_OPEN_POLICY_PACK_ROOT, "/cache/selection/source/rules");
-  assert.equal(launch.env.BIFROST_SEMANTIC_PACK_CACHE_ROOT, "/cache/catalog-v1");
-  assert.equal(launch.openPackReceipt, receipt);
-  assert.equal(optionsSeen[0].engineProfile, engineProfile);
-  assert.equal(optionsSeen[0].offline, true, "disabled downloads restrict pack selection to verified cache");
-  assert.equal(optionsSeen[0].cacheDir, path.join(temp, "cache", "open-pack-releases"));
 });
 
 test("builds final Bifrost MCP args with explicit root and toolset", () => {
@@ -800,13 +662,6 @@ test("builds rootless Bifrost MCP args when the host supplies no explicit root",
   assert.deepEqual(
     buildBifrostArgs(null, "symbol|extended", ["--extra"]),
     ["--mcp", "symbol|extended", "--extra"]
-  );
-});
-
-test("builds final Bifrost LSP args without MCP arguments", () => {
-  assert.deepEqual(
-    buildBifrostLspArgs("C:\\workspace with spaces", ["--extra"]),
-    ["--root", "C:\\workspace with spaces", "--lsp", "--extra"]
   );
 });
 
@@ -834,21 +689,6 @@ test("parses launcher args", () => {
     toolset: "prepare",
     passThrough: ["--flag", "doctor"]
   });
-  assert.deepEqual(parseLauncherArgs(["--root", "/workspace", "--lsp", "--flag"]), {
-    command: "lsp",
-    json: false,
-    root: "/workspace",
-    toolset: "symbol|extended",
-    passThrough: ["--flag"]
-  });
-  assert.throws(
-    () => parseLauncherArgs(["--mcp", "core", "--lsp"]),
-    (error) => error instanceof LauncherError && error.code === "invalid_arguments"
-  );
-  assert.throws(
-    () => parseLauncherArgs(["--lsp", "--toolset=core"]),
-    (error) => error instanceof LauncherError && error.code === "invalid_arguments"
-  );
   assert.throws(
     () => parseLauncherArgs(["doctor", "--root", "/workspace"]),
     (error) => error instanceof LauncherError && error.code === "invalid_arguments"
@@ -1105,8 +945,6 @@ test("reusable launch API schedules preferred preparation for Pi and future adap
       archiveSha256: {}
     },
     execFileImpl: async () => ({ stdout: "bifrost 0.7.1\n", stderr: "" }),
-    openPackProfileImpl: async () => { throw Object.assign(new Error("old fixture binary"), { code: "unsupported" }); },
-    onOpenPackDiagnostic: () => {},
     spawnImpl: (...args) => {
       calls.push(args);
       return { once: () => {}, unref: () => {} };
@@ -1197,7 +1035,7 @@ test("server setup failures keep stdout clean and explain protocol-neutral recov
   const cacheRoot = path.join(temp, "cache");
   const launcher = path.join(packageDir, "bin", "bifrost-launcher.mjs");
 
-  for (const serverArgs of [["--mcp", "symbol|extended"], ["--lsp"]]) {
+  for (const serverArgs of [["--mcp", "symbol|extended"]]) {
     await assert.rejects(
       execFileAsync(process.execPath, [launcher, "--root", temp, ...serverArgs], {
         env: {
@@ -1274,9 +1112,6 @@ test(
       `#!/usr/bin/env node
 if (process.argv.includes("--version")) {
   console.log("bifrost ${metadata.binaryVersion}");
-} else if (process.argv.includes("pack-engine-profile")) {
-  console.error("Unknown argument: pack-engine-profile");
-  process.exitCode = 2;
 } else {
   process.on("SIGTERM", () => console.error("bifrost-child-saw-term"));
   console.error("bifrost-child-ready");

@@ -1,4 +1,5 @@
 use crate::access_chain::{JsTsImportedMemberChainResolution, resolve_import_member_chain};
+use crate::graph::common::enclosing_function_scope;
 use crate::graph::hits::{
     record_declared_reference_hit, record_hit, record_import_hit, record_reexport_hit,
     record_self_receiver_hit, record_unproven_hit,
@@ -14,16 +15,22 @@ use crate::providers::{JsTsSource, with_usage_definitions};
 use crate::syntax::{
     JsTsImportBinder, JsTsImportBindingResolution, JsTsLexicalBindingIndex,
     JsTsLexicalBindingScope, declarator_module_value_specifier, direct_pattern_binding,
-    direct_property_definitions, is_declaration_identifier, is_lexically_nested_type_declaration,
+    direct_property_definitions, for_each_parameter, is_declaration_identifier, is_function_like,
     is_named_function_expression_declaration, is_object_in_member_expression,
-    is_property_key_in_member, nested_type_identifier_parts, object_pattern_entries,
+    is_property_key_in_member, js_ts_is_class_scope_kind, lexically_nested_type_declaration_name,
+    nested_type_identifier_parts, object_literal_property_key_node, object_pattern_entries,
     pattern_binder_identifiers, slice, static_member_property, static_member_receiver,
-    typescript_enclosing_enum_initializer,
+    typescript_enclosing_enum_initializer, unquote,
 };
 use crate::ts_owners::ts_resolve_type_text_to_property_owners;
 use crate::type_text::ts_type_annotation_text;
-use brokk_bifrost_core::analyzer::js_ts_facts::JsTsReceiverBinding;
+use brokk_bifrost_core::analyzer::js_ts_facts::{
+    JsTsPropertyReceiverFact, JsTsReceiverBinding, JsTsSourceFacts,
+};
 use brokk_bifrost_core::analyzer::query_token::QueryToken;
+use brokk_bifrost_core::analyzer::tree_walk::{
+    first_named_child_of_kind as first_named_child_in_children, unwrap_parenthesized_expression,
+};
 use brokk_bifrost_core::analyzer::usages::graph_core::{ImportEdge, ImportEdgeKind};
 use brokk_bifrost_core::analyzer::usages::local_inference::{
     LocalInferenceConfig, LocalInferenceEngine,
@@ -114,7 +121,7 @@ pub fn scan_files_for_seeds(
         .as_deref()
         .map(|_| collect_target_property_receivers(host, target))
         .unwrap_or_default();
-    let target_short = target_seed_identifier(target, target_owner.as_ref());
+    let target_short = super::target_seed_identifier_from_owner(target, target_owner.as_ref());
     let reference_needle = target_member.as_deref().unwrap_or(&target_short);
     let target_owner_source = target_owner.as_ref().map(|owner| owner.source().clone());
     let script_global_bare_target = target_member.is_none()
@@ -258,6 +265,7 @@ pub fn scan_files_for_seeds(
                 target_short: &target_short,
                 target_member: target_member.as_deref(),
                 browser_global_object,
+                exported_local_property_root,
                 lookup_only_local_property,
                 local_property_definitions,
                 global_property_receivers: &global_property_receivers,
@@ -346,27 +354,10 @@ fn unique_script_global_binding(
     name: &str,
 ) -> bool {
     let target_fqn = target.fq_name();
-    let mut candidates = analyzer
-        .definitions(&target_fqn)
-        .filter(|candidate| code_unit_is_script_global_binding(host, candidate, name));
+    let mut candidates = analyzer.definitions(&target_fqn).filter(|candidate| {
+        crate::graph::source::code_unit_is_script_global_binding(host, candidate, name)
+    });
     candidates.next().as_ref() == Some(target) && candidates.next().is_none()
-}
-
-fn code_unit_is_script_global_binding(
-    host: &dyn JsTsSource,
-    candidate: &CodeUnit,
-    name: &str,
-) -> bool {
-    let Some(facts) = host.source_facts(candidate.source()) else {
-        return false;
-    };
-    if facts.facts.file_is_external_module {
-        return false;
-    }
-    let declarations = declaration_ids_for_unit(&facts, candidate);
-    facts.facts.declaration_bindings.iter().any(|binding| {
-        declarations.contains(&binding.declaration) && binding.name == name && binding.is_program
-    })
 }
 
 pub struct ScanCtx<'a> {
@@ -393,6 +384,9 @@ pub struct ScanCtx<'a> {
     /// Parentless JS direct-property targets that are definition-only in practice remain
     /// available for exact, same-file definition lookup and targeted usage scans.
     lookup_only_local_property: bool,
+    /// An exported local property can cross a module boundary only through
+    /// a target-specific import edge.
+    exported_local_property_root: Option<&'a str>,
     local_property_definitions: Option<Vec<LocalPropertyDefinition>>,
     /// Receiver chains the declaring file binds at program scope in a browser
     /// script, so any other script reading the same chain reads this target.
@@ -480,24 +474,34 @@ fn collect_target_property_receivers(
     host: &dyn JsTsSource,
     target: &CodeUnit,
 ) -> Vec<GlobalPropertyReceiver> {
-    let Some(facts) = host.source_facts(target.source()) else {
-        return Vec::new();
-    };
-    let declarations = declaration_ids_for_unit(&facts, target);
-    let mut receivers = facts
-        .facts
-        .property_receivers
-        .iter()
-        .filter(|property| declarations.contains(&property.declaration))
-        .map(|property| GlobalPropertyReceiver {
-            root: property.receiver_root.clone(),
-            members: property.members.clone(),
-        })
-        .collect::<Vec<_>>();
+    let mut receivers = collect_target_property_receivers_matching(host, target, |_, _| true);
     receivers
         .sort_by(|left, right| (&left.root, &left.members).cmp(&(&right.root, &right.members)));
     receivers.dedup();
     receivers
+}
+
+fn collect_target_property_receivers_matching(
+    host: &dyn JsTsSource,
+    target: &CodeUnit,
+    mut accepts: impl FnMut(&JsTsSourceFacts, &JsTsPropertyReceiverFact) -> bool,
+) -> Vec<GlobalPropertyReceiver> {
+    let Some(facts) = host.source_facts(target.source()) else {
+        return Vec::new();
+    };
+    let declarations = declaration_ids_for_unit(&facts, target);
+    facts
+        .facts
+        .property_receivers
+        .iter()
+        .filter(|property| {
+            declarations.contains(&property.declaration) && accepts(&facts.facts, property)
+        })
+        .map(|property| GlobalPropertyReceiver {
+            root: property.receiver_root.clone(),
+            members: property.members.clone(),
+        })
+        .collect()
 }
 
 /// The receiver chains through which another script can read `target_member`
@@ -512,26 +516,9 @@ fn collect_global_property_receivers(
     host: &dyn JsTsSource,
     target: &CodeUnit,
 ) -> Vec<GlobalPropertyReceiver> {
-    let Some(facts) = host.source_facts(target.source()) else {
-        return Vec::new();
-    };
-    if facts.facts.file_is_external_module {
-        return Vec::new();
-    }
-    let declarations = declaration_ids_for_unit(&facts, target);
-    facts
-        .facts
-        .property_receivers
-        .iter()
-        .filter(|property| {
-            declarations.contains(&property.declaration)
-                && matches!(property.binding, JsTsReceiverBinding::Program)
-        })
-        .map(|property| GlobalPropertyReceiver {
-            root: property.receiver_root.clone(),
-            members: property.members.clone(),
-        })
-        .collect()
+    collect_target_property_receivers_matching(host, target, |facts, property| {
+        !facts.file_is_external_module && matches!(property.binding, JsTsReceiverBinding::Program)
+    })
 }
 
 fn target_is_unbound_browser_global_property(host: &dyn JsTsSource, target: &CodeUnit) -> bool {
@@ -647,16 +634,6 @@ fn chained_assignment_aliases_for_local_property(
     aliases
 }
 
-fn unwrap_parenthesized_expression(mut node: Node<'_>) -> Node<'_> {
-    while node.kind() == "parenthesized_expression" {
-        let Some(child) = node.named_child(0) else {
-            break;
-        };
-        node = child;
-    }
-    node
-}
-
 fn local_property_receiver_alias(
     node: Node<'_>,
     source: &str,
@@ -709,7 +686,7 @@ fn local_property_receiver_alias(
 
 fn enclosing_class_range(mut node: Node<'_>) -> Option<(usize, usize)> {
     loop {
-        if matches!(node.kind(), "class" | "class_declaration") {
+        if js_ts_is_class_scope_kind(node.kind()) {
             return Some((node.start_byte(), node.end_byte()));
         }
         node = node.parent()?;
@@ -789,18 +766,6 @@ fn enclosing_function_node(mut node: Node<'_>) -> Option<Node<'_>> {
         }
         node = node.parent()?;
     }
-}
-
-fn is_function_like(kind: &str) -> bool {
-    matches!(
-        kind,
-        "arrow_function"
-            | "function_declaration"
-            | "function_expression"
-            | "generator_function"
-            | "generator_function_declaration"
-            | "method_definition"
-    )
 }
 
 fn object_assign_prototype_owner(function: Node<'_>, source: &str) -> Option<String> {
@@ -982,24 +947,22 @@ impl ScanCtx<'_> {
     }
 
     fn binds_target_value(&self, ident: &str) -> bool {
-        self.binding_engine
-            .resolve_symbol(ident)
-            .as_precise()
-            .is_some_and(|targets| targets.contains(TARGET_VALUE_BINDING))
+        self.binds_precise_target(ident, TARGET_VALUE_BINDING)
     }
 
     fn binds_imported_target_value(&self, ident: &str) -> bool {
-        self.binding_engine
-            .resolve_symbol(ident)
-            .as_precise()
-            .is_some_and(|targets| targets.contains(TARGET_IMPORTED_VALUE_BINDING))
+        self.binds_precise_target(ident, TARGET_IMPORTED_VALUE_BINDING)
     }
 
     fn binds_target_object(&self, ident: &str) -> bool {
+        self.binds_precise_target(ident, TARGET_OBJECT_BINDING)
+    }
+
+    fn binds_precise_target(&self, ident: &str, target: &str) -> bool {
         self.binding_engine
             .resolve_symbol(ident)
             .as_precise()
-            .is_some_and(|targets| targets.contains(TARGET_OBJECT_BINDING))
+            .is_some_and(|targets| targets.contains(target))
     }
 
     fn shadows_import_binding(&self, ident: &str) -> bool {
@@ -1031,10 +994,7 @@ impl ScanCtx<'_> {
     }
 
     fn is_lexically_shadowed(&self, name: &str) -> bool {
-        self.lexical_shadow_scopes
-            .iter()
-            .rev()
-            .any(|scope| scope.contains(name))
+        super::is_name_shadowed_in_scopes(&self.lexical_shadow_scopes, name)
     }
 }
 
@@ -1221,7 +1181,7 @@ fn scope_is_target_owner_body(scope: Node<'_>, ctx: &ScanCtx<'_>) -> bool {
     ctx.analyzer
         .ranges(owner)
         .iter()
-        .any(|range| range_within(&owner_range, range))
+        .any(|range| range.contains(&owner_range))
 }
 
 fn pattern_binds_target_member(pattern: Node<'_>, ctx: &ScanCtx<'_>) -> bool {
@@ -1340,15 +1300,10 @@ fn is_target_lexical_declaration_binding(name: Node<'_>, lhs: &str, ctx: &ScanCt
 }
 
 fn register_lexical_type_shadow(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
-    if !is_lexically_nested_type_declaration(node) {
-        return;
-    }
-    let Some(name) = node.child_by_field_name("name") else {
-        return;
-    };
-    let text = slice(name, ctx.source);
-    if text == ctx.target_short {
-        ctx.type_binding_engine.declare_shadow(text.to_string());
+    if let Some(name) = lexically_nested_type_declaration_name(node, ctx.source)
+        && name == ctx.target_short
+    {
+        ctx.type_binding_engine.declare_shadow(name.to_string());
     }
 }
 
@@ -1820,22 +1775,6 @@ fn expression_resolves_to_target_value(node: Node<'_>, ctx: &ScanCtx<'_>) -> boo
     slice(property, ctx.source) == target_member && expression_carries_target_object(object, ctx)
 }
 
-fn target_seed_identifier(target: &CodeUnit, target_owner: Option<&CodeUnit>) -> String {
-    if let Some(owner) = target_owner
-        && !owner.is_module()
-        && !owner.is_file_scope()
-    {
-        return owner.identifier().trim_end_matches("$static").to_string();
-    }
-    if is_static_member(target)
-        && let Some((owner, _)) = target.short_name().rsplit_once('.') // fqname-M4: package-less short_name owner; fq.parent() would render the package-qualified owner
-        && let Some(owner_name) = owner.rsplit('.').next()
-    {
-        return owner_name.to_string();
-    }
-    target.identifier().trim_end_matches("$static").to_string()
-}
-
 fn is_target_declaration_binding(
     name_node: Node<'_>,
     lhs: &str,
@@ -1857,7 +1796,7 @@ fn is_target_declaration_binding(
         .analyzer
         .ranges(ctx.target)
         .iter()
-        .any(|target_range| range_within(&range, target_range))
+        .any(|target_range| target_range.contains(&range))
     {
         return true;
     }
@@ -1869,7 +1808,7 @@ fn is_target_declaration_binding(
             .analyzer
             .ranges(owner)
             .iter()
-            .any(|owner_range| range_within(&range, owner_range))
+            .any(|owner_range| owner_range.contains(&range))
     {
         return true;
     }
@@ -1882,15 +1821,13 @@ fn is_target_declaration_binding(
     ctx.target_owner.is_some_and(|owner| &enclosing == owner)
 }
 
-fn range_within(inner: &Range, outer: &Range) -> bool {
-    outer.start_byte <= inner.start_byte && inner.end_byte <= outer.end_byte
-}
-
 fn register_function_parameters(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
     let Some(parameters) = node.child_by_field_name("parameters") else {
         return;
     };
-    register_pattern_bindings(parameters, ctx);
+    for_each_parameter(parameters, |parameter| {
+        register_pattern_bindings(parameter, ctx)
+    });
 }
 
 fn register_target_object_call_arguments(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
@@ -1966,7 +1903,7 @@ fn local_function_target_for_reference(reference: Node<'_>, ctx: &ScanCtx<'_>) -
         .lexical_bindings
         .as_ref()?
         .binding_scope_at(name, reference.start_byte())?;
-    let mut candidates = ctx
+    let candidates = ctx
         .definitions
         .file_identifier(ctx.file, name)
         .into_iter()
@@ -1980,9 +1917,7 @@ fn local_function_target_for_reference(reference: Node<'_>, ctx: &ScanCtx<'_>) -
             })
         })
         .collect::<Vec<_>>();
-    candidates.sort();
-    candidates.dedup();
-    (candidates.len() == 1).then(|| candidates.remove(0))
+    unique_local_function_target(candidates)
 }
 
 fn local_function_target_for_declaration(
@@ -1996,7 +1931,7 @@ fn local_function_target_for_declaration(
         start_line: 0,
         end_line: 0,
     };
-    let mut candidates = ctx
+    let candidates = ctx
         .definitions
         .file_identifier(ctx.file, name)
         .into_iter()
@@ -2005,9 +1940,13 @@ fn local_function_target_for_declaration(
             ctx.analyzer
                 .ranges(candidate)
                 .iter()
-                .any(|range| range_within(&function_range, range))
+                .any(|range| range.contains(&function_range))
         })
         .collect::<Vec<_>>();
+    unique_local_function_target(candidates)
+}
+
+fn unique_local_function_target(mut candidates: Vec<CodeUnit>) -> Option<CodeUnit> {
     candidates.sort();
     candidates.dedup();
     (candidates.len() == 1).then(|| candidates.remove(0))
@@ -2048,10 +1987,9 @@ fn register_scope_parameters(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
     let Some(parameters) = node.child_by_field_name("parameters") else {
         return;
     };
-    let mut cursor = parameters.walk();
-    for child in parameters.named_children(&mut cursor) {
-        register_parameter_binding(child, ctx);
-    }
+    for_each_parameter(parameters, |parameter| {
+        register_parameter_binding(parameter, ctx)
+    });
 }
 
 fn register_parameter_binding(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
@@ -2468,6 +2406,15 @@ fn handle_member_expression(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
             }
             return;
         }
+        // An exported local property cannot be reached from another module
+        // without the target-specific import edge. Do not pass an unrelated
+        // same-spelled local receiver to generic receiver facts.
+        if ctx.exported_local_property_root.is_some()
+            && !ctx.target_self_file
+            && ctx.edges.is_empty()
+        {
+            return;
+        }
     }
 
     if let (Some(global_object), Some(target_member)) =
@@ -2701,44 +2648,7 @@ fn handle_contextual_object_literal(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
 }
 
 fn contextual_object_literal_owners(node: Node<'_>, ctx: &ScanCtx<'_>) -> Vec<CodeUnit> {
-    if let Some(variable) = node
-        .parent()
-        .filter(|parent| parent.kind() == "variable_declarator")
-        && variable
-            .child_by_field_name("value")
-            .is_some_and(|value| value.id() == node.id())
-        && let Some(type_node) = variable.child_by_field_name("type")
-    {
-        return ts_resolve_type_text_to_property_owners(
-            ctx.host,
-            ctx.definitions,
-            ctx.file,
-            ctx.source,
-            &ctx.imports,
-            ctx.host.alias_resolver(),
-            ts_type_annotation_text(type_node, ctx.source).as_str(),
-            0,
-        );
-    }
-
-    let Some(return_statement) = node
-        .parent()
-        .filter(|parent| parent.kind() == "return_statement")
-    else {
-        return Vec::new();
-    };
-    let mut cursor = return_statement.walk();
-    if return_statement
-        .named_children(&mut cursor)
-        .next()
-        .is_none_or(|value| value.id() != node.id())
-    {
-        return Vec::new();
-    }
-    let Some(function) = enclosing_function_scope(node) else {
-        return Vec::new();
-    };
-    let Some(type_node) = function.child_by_field_name("return_type") else {
+    let Some(type_node) = crate::ts_owners::ts_contextual_object_literal_type_node(node) else {
         return Vec::new();
     };
     ts_resolve_type_text_to_property_owners(
@@ -2751,29 +2661,6 @@ fn contextual_object_literal_owners(node: Node<'_>, ctx: &ScanCtx<'_>) -> Vec<Co
         ts_type_annotation_text(type_node, ctx.source).as_str(),
         0,
     )
-}
-
-fn object_literal_property_key_node(property: Node<'_>) -> Option<Node<'_>> {
-    match property.kind() {
-        "pair" => property
-            .child_by_field_name("key")
-            .or_else(|| property.named_child(0)),
-        "shorthand_property_identifier" => Some(property),
-        "method_definition" => property.child_by_field_name("name"),
-        _ => None,
-    }
-}
-
-fn enclosing_function_scope(mut node: Node<'_>) -> Option<Node<'_>> {
-    loop {
-        if matches!(
-            node.kind(),
-            "function_declaration" | "function_expression" | "arrow_function" | "method_definition"
-        ) {
-            return Some(node);
-        }
-        node = node.parent()?;
-    }
 }
 
 fn commonjs_nested_member_matches(
@@ -3066,13 +2953,7 @@ fn this_receiver_matches_target(node: Node<'_>, ctx: &ScanCtx<'_>) -> bool {
 }
 
 pub fn simple_identifier_text<'a>(node: Node<'_>, source: &'a str) -> Option<&'a str> {
-    match node.kind() {
-        "identifier" | "type_identifier" => {
-            let text = slice(node, source);
-            (!text.is_empty()).then_some(text)
-        }
-        _ => None,
-    }
+    crate::graph::common::simple_identifier_text(node, source)
 }
 
 fn infer_receiver_binding(node: Node<'_>, ctx: &ScanCtx<'_>) -> Option<LocalBinding> {
@@ -3231,10 +3112,7 @@ fn expression_resolves_to_target_owner(node: Node<'_>, ctx: &ScanCtx<'_>) -> boo
         ctx.receiver_facts
             .resolve_receiver_node(node, ReceiverAnalysisBudget::default()),
         ReceiverAnalysisOutcome::Precise(values)
-            if values.iter().any(|value| {
-                let resolved = value.owner();
-                resolved.source() == owner.source() && resolved.fq_name() == owner.fq_name()
-            })
+            if values.iter().any(|value| receiver_value_matches_owner(value, owner))
     )
 }
 
@@ -3246,10 +3124,10 @@ fn expression_resolves_to_unrelated_owner(node: Node<'_>, ctx: &ScanCtx<'_>) -> 
         ctx.receiver_facts
             .resolve_receiver_node(node, ReceiverAnalysisBudget::default()),
         ReceiverAnalysisOutcome::Precise(values)
-            if !values.is_empty() && values.iter().all(|value| {
-                let resolved = value.owner();
-                resolved.source() != owner.source() || resolved.fq_name() != owner.fq_name()
-            })
+            if !values.is_empty()
+                && values
+                    .iter()
+                    .all(|value| !receiver_value_matches_owner(value, owner))
     )
 }
 
@@ -3265,11 +3143,13 @@ fn expression_iterates_target_owner(node: Node<'_>, ctx: &ScanCtx<'_>) -> bool {
         ctx.receiver_facts
             .resolve_iterable_element(node, ReceiverAnalysisBudget::default()),
         ReceiverAnalysisOutcome::Precise(values)
-            if values.iter().any(|value| {
-                let resolved = value.owner();
-                resolved.source() == owner.source() && resolved.fq_name() == owner.fq_name()
-            })
+            if values.iter().any(|value| receiver_value_matches_owner(value, owner))
     )
+}
+
+fn receiver_value_matches_owner(value: &ReceiverValue, owner: &CodeUnit) -> bool {
+    let resolved = value.owner();
+    resolved.source() == owner.source() && resolved.fq_name() == owner.fq_name()
 }
 
 fn has_target_type_annotation(node: Node<'_>, ctx: &ScanCtx<'_>) -> bool {
@@ -3350,9 +3230,7 @@ fn first_named_child_of_kind<'a>(node: Node<'a>, kind: &str) -> Option<Node<'a>>
     if node.kind() == kind {
         return Some(node);
     }
-    let mut cursor = node.walk();
-    node.named_children(&mut cursor)
-        .find(|child| child.kind() == kind)
+    first_named_child_in_children(node, kind)
 }
 
 // ===================================================================================
@@ -3501,9 +3379,7 @@ fn commonjs_export_target(node: Node<'_>, source: &str) -> Option<CommonJsExport
         return Some(CommonJsExportTarget::Named(property_name));
     }
 
-    if simple_identifier_text_for_source(object, source) == Some("module")
-        && property_name == "exports"
-    {
+    if commonjs_module_exports_object(node, source) {
         return Some(CommonJsExportTarget::ModuleExports);
     }
 
@@ -3618,6 +3494,24 @@ fn register_module_exports_bound_object(
     object_name: &str,
     index: &mut ExportIndex,
 ) {
+    register_module_exports_object_with_fallback(
+        object,
+        source,
+        |exported_name| format!("{object_name}.{exported_name}"),
+        index,
+    );
+}
+
+fn register_module_exports_object(node: Node<'_>, source: &str, index: &mut ExportIndex) {
+    register_module_exports_object_with_fallback(node, source, str::to_string, index);
+}
+
+fn register_module_exports_object_with_fallback(
+    object: Node<'_>,
+    source: &str,
+    mut fallback_local_name: impl FnMut(&str) -> String,
+    index: &mut ExportIndex,
+) {
     let mut cursor = object.walk();
     for child in object.named_children(&mut cursor) {
         match child.kind() {
@@ -3643,43 +3537,7 @@ fn register_module_exports_bound_object(
                     continue;
                 };
                 let local_name = local_export_name(value, source)
-                    .unwrap_or_else(|| format!("{object_name}.{exported_name}"));
-                index
-                    .exports_by_name
-                    .insert(exported_name, ExportEntry::Local { local_name });
-            }
-            _ => {}
-        }
-    }
-}
-
-fn register_module_exports_object(node: Node<'_>, source: &str, index: &mut ExportIndex) {
-    let mut cursor = node.walk();
-    for child in node.named_children(&mut cursor) {
-        match child.kind() {
-            "shorthand_property_identifier" | "shorthand_property_identifier_pattern" => {
-                let name = slice(child, source).trim();
-                if !name.is_empty() {
-                    index.exports_by_name.insert(
-                        name.to_string(),
-                        ExportEntry::Local {
-                            local_name: name.to_string(),
-                        },
-                    );
-                }
-            }
-            "pair" => {
-                let Some(key) = child.child_by_field_name("key") else {
-                    continue;
-                };
-                let Some(value) = child.child_by_field_name("value") else {
-                    continue;
-                };
-                let Some(exported_name) = property_name_text(key, source) else {
-                    continue;
-                };
-                let local_name =
-                    local_export_name(value, source).unwrap_or_else(|| exported_name.clone());
+                    .unwrap_or_else(|| fallback_local_name(&exported_name));
                 index
                     .exports_by_name
                     .insert(exported_name, ExportEntry::Local { local_name });
@@ -3884,85 +3742,85 @@ fn visit_export_statement(node: Node<'_>, source: &str, index: &mut ExportIndex)
     }
 }
 
-fn unquote(text: &str) -> String {
-    let trimmed = text.trim();
-    let stripped = trimmed
-        .strip_prefix('"')
-        .and_then(|t| t.strip_suffix('"'))
-        .or_else(|| {
-            trimmed
-                .strip_prefix('\'')
-                .and_then(|t| t.strip_suffix('\''))
-        });
-    stripped.unwrap_or(trimmed).to_string()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::syntax::compute_import_binder;
-    use brokk_bifrost_core::analyzer::usages::model::ImportKind;
-
-    fn parse_js(source: &str) -> Tree {
-        let mut parser = Parser::new();
-        parser
-            .set_language(&tree_sitter_javascript::LANGUAGE.into())
-            .unwrap();
-        parser.parse(source, None).unwrap()
-    }
+    use brokk_bifrost_test_macros::hardwon;
 
     #[test]
-    fn export_index_named_export() {
-        let src = "export class Foo {}\nexport function bar() {}";
-        let tree = parse_js(src);
-        let idx = compute_export_index(src, &tree);
-        assert!(idx.exports_by_name.contains_key("Foo"));
-        assert!(idx.exports_by_name.contains_key("bar"));
-    }
-
-    #[test]
-    fn export_index_named_reexport() {
-        let src = "export { Foo as Bar } from './other';";
-        let tree = parse_js(src);
-        let idx = compute_export_index(src, &tree);
-        match idx.exports_by_name.get("Bar") {
-            Some(ExportEntry::ReexportedNamed {
-                module_specifier,
-                imported_name,
-            }) => {
-                assert_eq!(module_specifier, "./other");
-                assert_eq!(imported_name, "Foo");
-            }
-            other => panic!("expected ReexportedNamed, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn import_binder_named_default_namespace() {
-        let src = r#"
-            import Foo, { bar as baz } from "./mod";
-            import * as ns from "./other";
-        "#;
-        let tree = parse_js(src);
-        let binder = compute_import_binder(src, &tree);
-        assert_eq!(
-            binder.binding("Foo").map(|b| b.kind),
-            Some(ImportKind::Default)
-        );
-        assert_eq!(
-            binder.binding("baz").map(|b| b.kind),
-            Some(ImportKind::Named)
-        );
-        assert_eq!(
-            binder.binding("ns").map(|b| b.kind),
-            Some(ImportKind::Namespace)
-        );
-    }
-
-    #[test]
+    #[hardwon("#2143: JSX construction was reported as a usage of every instance member")]
     fn jsx_component_name_does_not_match_an_instance_member_target() {
         assert!(jsx_element_name_matches_target(None, true));
         assert!(!jsx_element_name_matches_target(Some("_onEdit"), true));
         assert!(!jsx_element_name_matches_target(None, false));
+    }
+
+    #[test]
+    #[hardwon("#4271: abstract class member reads lacked class-scoped alias identity (c2138)")]
+    fn abstract_class_member_read_resolves_through_same_class_receiver_alias() {
+        let source = "abstract class Owner {\n  read() {\n    const local = this.member = {};\n    local.target = 1;\n    return this.member.target;\n  }\n}\n";
+        let tree = crate::test_support::parse_typescript(source);
+        let root = tree.root_node();
+        let mut nodes = vec![root];
+        let mut definition_property = None;
+        let mut reference = None;
+        while let Some(node) = nodes.pop() {
+            if node.kind() == "assignment_expression"
+                && let Some(left) = node.child_by_field_name("left")
+                && left.kind() == "member_expression"
+                && left
+                    .child_by_field_name("object")
+                    .is_some_and(|object| slice(object, source) == "local")
+                && let Some(property) = left.child_by_field_name("property")
+                && slice(property, source) == "target"
+            {
+                definition_property = Some(property);
+            }
+            if node.kind() == "member_expression"
+                && node
+                    .parent()
+                    .is_some_and(|parent| parent.kind() == "return_statement")
+                && node
+                    .child_by_field_name("property")
+                    .is_some_and(|property| slice(property, source) == "target")
+            {
+                reference = Some(node);
+            }
+            let mut cursor = node.walk();
+            nodes.extend(node.named_children(&mut cursor));
+        }
+
+        let definition_property = definition_property.expect("target property definition");
+        let target_range = Range {
+            start_byte: definition_property.start_byte(),
+            end_byte: definition_property.end_byte(),
+            start_line: definition_property.start_position().row,
+            end_line: definition_property.end_position().row,
+        };
+        let lexical_bindings = JsTsLexicalBindingIndex::build(root, source);
+        let definitions = collect_local_property_definitions(
+            root,
+            source,
+            &[target_range],
+            "target",
+            &lexical_bindings,
+            None,
+        );
+        assert_eq!(definitions.len(), 1);
+
+        let reference = reference.expect("abstract class member reference");
+        let object = reference
+            .child_by_field_name("object")
+            .expect("member receiver");
+        let property = reference
+            .child_by_field_name("property")
+            .expect("member name");
+        assert!(local_property_read_matches(
+            object,
+            property,
+            source,
+            &lexical_bindings,
+            &definitions,
+        ));
     }
 }

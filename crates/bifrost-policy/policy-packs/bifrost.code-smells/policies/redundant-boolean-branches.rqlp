@@ -1,4 +1,6 @@
-; Identify exactly complementary Boolean-literal returns on two immediate paths.
+; Identify exactly complementary Boolean-literal results on two immediate paths.
+; Kotlin expression-valued `if` forms are paired only in a function or lambda
+; result context; `when` and non-Boolean result contexts remain open.
 ; This rule is diagnostic-only: it does not prove a safe expression rewrite.
 (policy
   :schema-version 1
@@ -6,7 +8,7 @@
   :name "Redundant Boolean return branches"
   :message "the conditional paths return complementary Boolean literals"
   :severity warning
-  :description "The conditional's two immediate paths return opposite Boolean literals with no intervening work. The second path is an else arm or an adjacent return in the same block. The relation records whether the true path returns true or false. Review the intended result; no automatic replacement with the condition is implied because truthiness, conversions, and condition effects require separate proof."
+  :description "The conditional's two immediate paths return opposite Boolean literals with no intervening work. The second path is an else arm or an adjacent return in the same block. Kotlin expression-valued if forms are paired only when the expression is the declared Boolean result of a function or the tail result of a lambda. Rust also supports tail Boolean literals in if expressions, including an if expression returned directly. In Scala, an expression-valued if is claimed only when it is the enclosing method's Boolean result, including a block's last expression or an explicit return. Unsupported when, match arms, non-Boolean result contexts, macros and computed values stay open. The relation records whether the true path returns true or false. Review the intended result; no automatic replacement with the condition is implied because truthiness, conversions, and condition effects require separate proof."
   :help-uri "https://bifrost.brokk.ai/static-analysis-policies/#built-in-code-smell-pack"
   :tags ["correctness" "conditional" "code-smell"]
   :analysis (analysis

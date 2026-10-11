@@ -1,7 +1,5 @@
 use super::PhpAnalyzer;
-use crate::analyzer::{
-    CodeUnit, CodeUnitIndex, Language, OverlayProject, ProjectFile, resolve_analyzer,
-};
+use crate::analyzer::{CodeUnit, CodeUnitIndex, Language, OverlayProject, ProjectFile};
 use crate::inline_project::InlineTestProject;
 use crate::{AnalyzerConfig, WorkspaceAnalyzer};
 use brokk_bifrost_core::analyzer::php_facts::{
@@ -84,7 +82,7 @@ class Service {
 "#;
 
 fn php_analyzer(workspace: &WorkspaceAnalyzer) -> &PhpAnalyzer {
-    resolve_analyzer::<PhpAnalyzer>(workspace.analyzer()).expect("workspace has a PHP analyzer")
+    super::resolve_php_analyzer(workspace).expect("workspace has a PHP analyzer")
 }
 
 fn unit(php: &PhpAnalyzer, fqn: &str) -> CodeUnit {

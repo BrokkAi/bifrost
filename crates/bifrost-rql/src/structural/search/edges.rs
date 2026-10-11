@@ -120,16 +120,15 @@ impl SelectedEdgesOfTelemetry {
     }
 
     pub(super) fn record_complete_build(&self, index: &SelectedReferenceInverseIndex) {
-        self.inner
-            .complete_index_builds
-            .fetch_add(1, Ordering::Relaxed);
-        self.record_index(index);
+        self.record_index_build(&self.inner.complete_index_builds, index);
     }
 
     pub(super) fn record_incomplete_build(&self, index: &SelectedReferenceInverseIndex) {
-        self.inner
-            .incomplete_index_builds
-            .fetch_add(1, Ordering::Relaxed);
+        self.record_index_build(&self.inner.incomplete_index_builds, index);
+    }
+
+    fn record_index_build(&self, counter: &AtomicUsize, index: &SelectedReferenceInverseIndex) {
+        counter.fetch_add(1, Ordering::Relaxed);
         self.record_index(index);
     }
 

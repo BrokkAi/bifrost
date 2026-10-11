@@ -1,6 +1,12 @@
 use brokk_bifrost_core::analyzer::ProjectFile;
+use brokk_bifrost_core::analyzer::common::{collapse_whitespace, node_source_text as node_text};
 use brokk_bifrost_core::analyzer::model::{TestAssertionSmell, TestAssertionWeights};
+use brokk_bifrost_core::analyzer::test_assertions::{
+    TestAssertionSignal, append_test_assertion_findings, is_common_assertion_literal,
+    normalize_assertion_expression, oversized_quoted_literal,
+};
 use brokk_bifrost_core::analyzer::tree_walk::{WalkControl, walk_named_tree_preorder};
+use brokk_bifrost_core::path_utils::workspace_relative_slash_path;
 use regex::Regex;
 use std::sync::LazyLock;
 use tree_sitter::Node;
@@ -81,9 +87,8 @@ fn rust_token_tree_interior_text<'a>(token_tree: Node<'_>, source: &'a str) -> O
     if token_tree.kind() != "token_tree" {
         return None;
     }
-    let open = token_tree.child(0)?;
-    let close = token_tree.child(token_tree.child_count().checked_sub(1)?)?;
-    source.get(open.end_byte()..close.start_byte())
+    let interior = crate::declarations::rust_macro_token_tree_interior(token_tree)?;
+    source.get(interior.start_byte..interior.end_byte)
 }
 
 fn cfg_body_has_positive_test_token(body: &str) -> bool {
@@ -112,12 +117,6 @@ fn cfg_body_has_positive_test_token(body: &str) -> bool {
         token.clear();
     }
     token == "test"
-}
-
-fn node_text<'a>(node: Node<'_>, source: &'a str) -> &'a str {
-    source
-        .get(node.start_byte()..node.end_byte())
-        .unwrap_or_default()
 }
 
 static RUST_TEST_FN_RE: LazyLock<Regex> = LazyLock::new(|| {
@@ -179,57 +178,32 @@ fn analyze_rust_test_case(
     weights: &TestAssertionWeights,
     out: &mut Vec<TestAssertionSmell>,
 ) {
-    let assertions = collect_rust_assertions(body, weights);
-    let assertion_count = assertions.len() as i32;
-    let symbol = format!("{}::{}", file, name);
-
-    if assertion_count == 0 {
-        out.push(TestAssertionSmell {
-            file: file.clone(),
-            enclosing_fq_name: symbol,
-            assertion_kind: "no-assertions".to_string(),
-            score: weights.no_assertion_weight,
-            assertion_count: 0,
-            reasons: vec!["no-assertions".to_string()],
-            excerpt: compact_rust_excerpt(body),
-            start_byte,
-        });
-        return;
-    }
-
-    for assertion in &assertions {
-        if assertion.score <= 0 {
-            continue;
-        }
-        out.push(TestAssertionSmell {
-            file: file.clone(),
-            enclosing_fq_name: symbol.clone(),
-            assertion_kind: assertion.kind.clone(),
+    let symbol = format!(
+        "{}::{}",
+        workspace_relative_slash_path(file.rel_path()),
+        name
+    );
+    let assertions: Vec<_> = collect_rust_assertions(body, weights)
+        .into_iter()
+        .map(|assertion| TestAssertionSignal {
+            kind: assertion.kind,
             score: assertion.score,
-            assertion_count,
-            reasons: vec![assertion.reason.clone()],
-            excerpt: assertion.excerpt.clone(),
+            shallow: assertion.shallow,
+            meaningful: assertion.meaningful,
+            reasons: vec![assertion.reason],
+            excerpt: assertion.excerpt,
             start_byte: start_byte + assertion.start_byte,
-        });
-    }
-
-    if assertions.iter().all(|assertion| assertion.shallow) {
-        let score = (weights.shallow_assertion_only_weight
-            - rust_meaningful_assertion_credit(assertions.iter(), weights))
-        .max(0);
-        if score > 0 {
-            out.push(TestAssertionSmell {
-                file: file.clone(),
-                enclosing_fq_name: symbol,
-                assertion_kind: "shallow-assertions-only".to_string(),
-                score,
-                assertion_count,
-                reasons: vec!["shallow-assertions-only".to_string()],
-                excerpt: compact_rust_excerpt(body),
-                start_byte,
-            });
-        }
-    }
+        })
+        .collect();
+    append_test_assertion_findings(
+        file,
+        symbol,
+        collapse_whitespace(body),
+        start_byte,
+        &assertions,
+        weights,
+        out,
+    );
 }
 
 fn collect_rust_assertions(body: &str, weights: &TestAssertionWeights) -> Vec<RustAssertionSignal> {
@@ -259,7 +233,7 @@ fn collect_rust_assertions(body: &str, weights: &TestAssertionWeights) -> Vec<Ru
                 shallow: false,
                 meaningful: false,
                 reason: reason.to_string(),
-                excerpt: compact_rust_excerpt(whole.as_str()),
+                excerpt: collapse_whitespace(whole.as_str()),
                 start_byte: whole.start(),
             }
         } else if let Some(literal) = oversized_rust_literal(&left, &right, weights) {
@@ -269,7 +243,7 @@ fn collect_rust_assertions(body: &str, weights: &TestAssertionWeights) -> Vec<Ru
                 shallow: true,
                 meaningful: false,
                 reason: format!("overspecified-literal:{literal}"),
-                excerpt: compact_rust_excerpt(whole.as_str()),
+                excerpt: collapse_whitespace(whole.as_str()),
                 start_byte: whole.start(),
             }
         } else {
@@ -279,7 +253,7 @@ fn collect_rust_assertions(body: &str, weights: &TestAssertionWeights) -> Vec<Ru
                 shallow: false,
                 meaningful: true,
                 reason: "meaningful-assertion".to_string(),
-                excerpt: compact_rust_excerpt(whole.as_str()),
+                excerpt: collapse_whitespace(whole.as_str()),
                 start_byte: whole.start(),
             }
         };
@@ -297,7 +271,7 @@ fn collect_rust_assertions(body: &str, weights: &TestAssertionWeights) -> Vec<Ru
                 shallow: true,
                 meaningful: false,
                 reason: "constant-truth".to_string(),
-                excerpt: compact_rust_excerpt(whole.as_str()),
+                excerpt: collapse_whitespace(whole.as_str()),
                 start_byte: whole.start(),
             }
         } else if trimmed.contains(".is_some()") || trimmed.contains(".is_none()") {
@@ -307,7 +281,7 @@ fn collect_rust_assertions(body: &str, weights: &TestAssertionWeights) -> Vec<Ru
                 shallow: true,
                 meaningful: false,
                 reason: "nullness-only".to_string(),
-                excerpt: compact_rust_excerpt(whole.as_str()),
+                excerpt: collapse_whitespace(whole.as_str()),
                 start_byte: whole.start(),
             }
         } else {
@@ -317,7 +291,7 @@ fn collect_rust_assertions(body: &str, weights: &TestAssertionWeights) -> Vec<Ru
                 shallow: false,
                 meaningful: true,
                 reason: "meaningful-assertion".to_string(),
-                excerpt: compact_rust_excerpt(whole.as_str()),
+                excerpt: collapse_whitespace(whole.as_str()),
                 start_byte: whole.start(),
             }
         };
@@ -332,7 +306,7 @@ fn collect_rust_assertions(body: &str, weights: &TestAssertionWeights) -> Vec<Ru
             shallow: false,
             meaningful: true,
             reason: "meaningful-assertion".to_string(),
-            excerpt: compact_rust_excerpt(whole.as_str()),
+            excerpt: collapse_whitespace(whole.as_str()),
             start_byte: whole.start(),
         });
     }
@@ -340,34 +314,13 @@ fn collect_rust_assertions(body: &str, weights: &TestAssertionWeights) -> Vec<Ru
     assertions
 }
 
-fn rust_meaningful_assertion_credit<'a>(
-    assertions: impl Iterator<Item = &'a RustAssertionSignal>,
-    weights: &TestAssertionWeights,
-) -> i32 {
-    let count = assertions.filter(|assertion| assertion.meaningful).count() as i32;
-    let creditable = count.min(weights.meaningful_assertion_credit_cap.max(0));
-    weights.meaningful_assertion_credit.max(0) * creditable
-}
-
 fn normalize_rust_expr(expr: &str) -> String {
-    expr.trim()
-        .trim_end_matches(',')
-        .trim_matches(|ch| matches!(ch, '(' | ')' | ' '))
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ")
+    normalize_assertion_expression(expr.trim().trim_end_matches(','))
 }
 
 fn is_rust_literal(expr: &str) -> bool {
     let trimmed = expr.trim();
-    (trimmed.starts_with('"') && trimmed.ends_with('"'))
-        || matches!(trimmed, "true" | "false" | "None")
-        || trimmed.parse::<i64>().is_ok()
-        || trimmed.parse::<f64>().is_ok()
-}
-
-fn compact_rust_excerpt(text: &str) -> String {
-    text.split_whitespace().collect::<Vec<_>>().join(" ")
+    is_common_assertion_literal(trimmed) || matches!(trimmed, "true" | "false" | "None")
 }
 
 fn oversized_rust_literal(
@@ -375,12 +328,5 @@ fn oversized_rust_literal(
     right: &str,
     weights: &TestAssertionWeights,
 ) -> Option<String> {
-    [left, right].into_iter().find_map(|expr| {
-        let trimmed = expr.trim();
-        let unquoted = trimmed
-            .strip_prefix('"')
-            .and_then(|s| s.strip_suffix('"'))?;
-        (unquoted.len() >= weights.large_literal_length_threshold.max(0) as usize)
-            .then(|| trimmed.to_string())
-    })
+    oversized_quoted_literal(left, right, weights, &['"'])
 }

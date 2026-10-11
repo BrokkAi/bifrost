@@ -23,9 +23,13 @@ pub struct RustCrateTarget {
 
 /// Reuse Cargo's target discovery over an exact path inventory, without loading
 /// any source usage facts or compiling a selected resolution context.
+///
+/// `configuration` is the workspace's Cargo configuration files. Each target
+/// takes the cfg set and patches of the levels its Cargo workspace root reads.
 pub fn rust_crate_targets(
     paths: impl IntoIterator<Item = (PathBuf, Oid)>,
     manifests: Vec<RustSelectedManifestMount>,
+    configuration: &RustCargoConfiguration,
 ) -> Result<Vec<RustCrateTarget>, String> {
     let input = prepare_rust_selected_topology_input(
         paths.into_iter().map(
@@ -105,6 +109,7 @@ pub fn rust_crate_targets(
                                     fact,
                                     &input.manifests,
                                     &cargo_manifests,
+                                    configuration,
                                 )
                             {
                                 additions.push((target, feature.to_string()));
@@ -131,9 +136,13 @@ pub fn rust_crate_targets(
                     else {
                         continue;
                     };
-                    let Some(target) =
-                        dependency_manifest(path, fact, &input.manifests, &cargo_manifests)
-                    else {
+                    let Some(target) = dependency_manifest(
+                        path,
+                        fact,
+                        &input.manifests,
+                        &cargo_manifests,
+                        configuration,
+                    ) else {
                         continue;
                     };
                     for source in std::iter::once(value).chain(
@@ -167,6 +176,7 @@ pub fn rust_crate_targets(
     }
     let mut targets = Vec::new();
     let mut seen = BTreeSet::new();
+    let mut cfg_atoms_by_workspace = BTreeMap::<PathBuf, BTreeSet<String>>::new();
     for profile in inventory.profiles {
         if !seen.insert((
             profile.manifest_path.clone(),
@@ -192,11 +202,11 @@ pub fn rust_crate_targets(
         } else if kind == RustCallerTargetKind::Build {
             "build_script_build".into()
         } else {
-            let table = match kind {
-                RustCallerTargetKind::Binary => "bin",
-                RustCallerTargetKind::Test => "test",
-                RustCallerTargetKind::Example => "example",
-                RustCallerTargetKind::Bench => "bench",
+            let (table, cargo_kind) = match kind {
+                RustCallerTargetKind::Binary => ("bin", RustCargoTargetKind::Binary),
+                RustCallerTargetKind::Test => ("test", RustCargoTargetKind::Test),
+                RustCallerTargetKind::Example => ("example", RustCargoTargetKind::Example),
+                RustCallerTargetKind::Bench => ("bench", RustCargoTargetKind::Bench),
                 _ => unreachable!(),
             };
             let explicit = manifest
@@ -212,7 +222,7 @@ pub fn rust_crate_targets(
                         .and_then(toml::Value::as_str)
                         .map(|path| vec![PathBuf::from(path)])
                         .unwrap_or_else(|| {
-                            inferred_cargo_target_paths(table, name, &package.package_name)
+                            inferred_cargo_target_paths(cargo_kind, name, &package.package_name)
                         });
                     paths
                         .contains(&profile.target_root)
@@ -258,6 +268,7 @@ pub fn rust_crate_targets(
                     fact,
                     &input.manifests,
                     &cargo_manifests,
+                    configuration,
                 ),
             })
             .collect();
@@ -280,6 +291,19 @@ pub fn rust_crate_targets(
             ));
         }
         dependencies.dedup_by(|left, right| left.extern_name == right.extern_name);
+        // Cargo reads its configuration from where the workspace build runs.
+        let manifest_directory = profile.manifest_path.parent().unwrap_or(Path::new(""));
+        let workspace = cargo_workspace_manifest_directory(
+            Path::new(""),
+            manifest_directory,
+            &manifest.document,
+            &cargo_manifests,
+        )
+        .expect("a target's manifest declares a package");
+        let cfg_atoms = cfg_atoms_by_workspace
+            .entry(workspace)
+            .or_insert_with_key(|workspace| configuration.cfg_atoms(workspace))
+            .clone();
         targets.push(RustCrateTarget {
             root_path: normalize_selected_path(
                 profile.manifest_path.parent().unwrap_or(Path::new("")),
@@ -290,7 +314,7 @@ pub fn rust_crate_targets(
             kind,
             name,
             edition,
-            cfg_atoms: crate::cfg::default_cfg_atoms(),
+            cfg_atoms,
             features: features[&profile.manifest_path].clone(),
             dependencies,
             inventory_complete: inventory.target_inventory_complete,
@@ -300,11 +324,11 @@ pub fn rust_crate_targets(
 }
 
 fn dependency_tables() -> [(&'static str, RustCargoDependencyKind); 3] {
-    [
-        ("dependencies", RustCargoDependencyKind::Normal),
-        ("dev-dependencies", RustCargoDependencyKind::Development),
-        ("build-dependencies", RustCargoDependencyKind::Build),
-    ]
+    cargo_dependency_table_kinds(
+        RustCargoDependencyKind::Normal,
+        RustCargoDependencyKind::Development,
+        RustCargoDependencyKind::Build,
+    )
 }
 
 fn dependency_value<'a>(
@@ -349,13 +373,14 @@ fn dependency_value<'a>(
 
 /// The workspace manifest a dependency resolves to, by the same lookup the
 /// selected context uses: a `path`, a `workspace = true` entry, or a
-/// `[patch]` on the workspace manifest whose package version satisfies the
-/// dependency's requirement.
+/// `[patch]` on the workspace manifest or in its Cargo configuration whose
+/// package version satisfies the dependency's requirement.
 fn dependency_manifest(
     path: &Path,
     dependency: &RustCargoDependencyFact,
     manifests: &BTreeMap<PathBuf, RustSelectedManifestMount>,
     cargo_manifests: &CargoHashMap<PathBuf, RustCargoManifestDocument>,
+    configuration: &RustCargoConfiguration,
 ) -> Option<PathBuf> {
     let manifest = manifests.get(path)?;
     let table = match dependency.kind {
@@ -374,6 +399,7 @@ fn dependency_manifest(
         &dependency.manifest_name,
         raw_dependency,
         cargo_manifests,
+        configuration,
         &mut normalize_selected_path,
     )?;
     let target = directory.join("Cargo.toml");
@@ -386,6 +412,62 @@ fn dependency_manifest(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use brokk_bifrost_test_macros::hardwon;
+
+    /// A registry dependency that the workspace manifest patches to a member
+    /// with a matching version is that member, as Cargo builds it; a patch
+    /// whose version does not satisfy the requirement leaves it external.
+    #[test]
+    #[hardwon(
+        "5f781c22c33c: Version-compatible workspace patch facts link a registry requirement to a member while an incompatible version stays external."
+    )]
+    fn crate_inventory_follows_a_workspace_patch_to_a_member() {
+        for (requirement, patched) in [("0.1.0", true), ("2", false)] {
+            let manifests = vec![
+                RustSelectedManifestMount::from_source(
+                    "Cargo.toml",
+                    "[workspace]\nmembers=[\"a\",\"b\"]\n[patch.crates-io]\nb={path=\"b\"}\n",
+                )
+                .unwrap(),
+                RustSelectedManifestMount::from_source(
+                    "a/Cargo.toml",
+                    &format!(
+                        "[package]\nname=\"a\"\nedition=\"2021\"\n[dependencies]\nb=\"{requirement}\"\n"
+                    ),
+                )
+                .unwrap(),
+                RustSelectedManifestMount::from_source(
+                    "b/Cargo.toml",
+                    "[package]\nname=\"b\"\nversion=\"0.1.0\"\nedition=\"2021\"\n",
+                )
+                .unwrap(),
+            ];
+            let targets = rust_crate_targets(
+                ["a/src/lib.rs", "b/src/lib.rs"]
+                    .into_iter()
+                    .map(|path| (PathBuf::from(path), Oid::zero())),
+                manifests,
+                &RustCargoConfiguration::default(),
+            )
+            .unwrap();
+            let a = targets
+                .iter()
+                .find(|target| target.manifest_path == Path::new("a/Cargo.toml"))
+                .expect("a has a library target");
+            let routes = a
+                .dependencies
+                .iter()
+                .map(|dependency| {
+                    (
+                        dependency.extern_name.as_str(),
+                        dependency.manifest_path.as_deref(),
+                    )
+                })
+                .collect::<Vec<_>>();
+            let expected = patched.then_some(Path::new("b/Cargo.toml"));
+            assert_eq!(routes, vec![("b", expected)], "{requirement}: {a:?}");
+        }
+    }
 
     #[test]
     fn crate_inventory_uses_test_dependencies_and_same_package_library() {
@@ -416,6 +498,7 @@ mod tests {
             .into_iter()
             .map(|path| (PathBuf::from(path), Oid::zero())),
             manifests,
+            &RustCargoConfiguration::default(),
         )
         .unwrap();
         assert_eq!(targets.len(), 4);
@@ -439,51 +522,71 @@ mod tests {
     /// A registry dependency that the workspace manifest patches to a member
     /// with a matching version is that member, as Cargo builds it; a patch
     /// whose version does not satisfy the requirement leaves it external.
+
     #[test]
-    fn crate_inventory_follows_a_workspace_patch_to_a_member() {
-        for (requirement, patched) in [("0.1.0", true), ("2", false)] {
-            let manifests = vec![
-                RustSelectedManifestMount::from_source(
-                    "Cargo.toml",
-                    "[workspace]\nmembers=[\"a\",\"b\"]\n[patch.crates-io]\nb={path=\"b\"}\n",
-                )
-                .unwrap(),
-                RustSelectedManifestMount::from_source(
-                    "a/Cargo.toml",
-                    &format!(
-                        "[package]\nname=\"a\"\nedition=\"2021\"\n[dependencies]\nb=\"{requirement}\"\n"
-                    ),
-                )
-                .unwrap(),
-                RustSelectedManifestMount::from_source(
-                    "b/Cargo.toml",
-                    "[package]\nname=\"b\"\nversion=\"0.1.0\"\nedition=\"2021\"\n",
-                )
-                .unwrap(),
-            ];
-            let targets = rust_crate_targets(
-                ["a/src/lib.rs", "b/src/lib.rs"]
+    fn crate_inventory_follows_cargo_configuration_patches_and_cfg() {
+        let manifests = vec![
+            RustSelectedManifestMount::from_source(
+                "ws/Cargo.toml",
+                "[workspace]\nmembers=[\"a\",\"b\"]\n",
+            )
+            .unwrap(),
+            RustSelectedManifestMount::from_source(
+                "ws/a/Cargo.toml",
+                "[package]\nname=\"a\"\nedition=\"2021\"\n[dependencies]\nb=\"0.1\"\n",
+            )
+            .unwrap(),
+            RustSelectedManifestMount::from_source(
+                "ws/b/Cargo.toml",
+                "[package]\nname=\"b\"\nversion=\"0.1.0\"\nedition=\"2021\"\n",
+            )
+            .unwrap(),
+        ];
+        let configuration = |source: &str| {
+            RustCargoConfiguration::from_files([(
+                PathBuf::from("ws/.cargo/config.toml"),
+                crate::cargo_config::RustCargoConfigDocument::from_source_bytes(source.as_bytes())
+                    .unwrap(),
+            )])
+        };
+        let targets = |configuration: &RustCargoConfiguration| {
+            rust_crate_targets(
+                ["ws/a/src/lib.rs", "ws/b/src/lib.rs"]
                     .into_iter()
                     .map(|path| (PathBuf::from(path), Oid::zero())),
-                manifests,
+                manifests.clone(),
+                configuration,
             )
-            .unwrap();
+            .unwrap()
+        };
+        let route = |targets: &[RustCrateTarget]| {
             let a = targets
                 .iter()
-                .find(|target| target.manifest_path == Path::new("a/Cargo.toml"))
+                .find(|target| target.manifest_path == Path::new("ws/a/Cargo.toml"))
                 .expect("a has a library target");
-            let routes = a
-                .dependencies
+            a.dependencies[0].manifest_path.clone()
+        };
+
+        let unconfigured = targets(&RustCargoConfiguration::default());
+        assert_eq!(route(&unconfigured), None, "b stays a registry dependency");
+        assert!(
+            unconfigured
                 .iter()
-                .map(|dependency| {
-                    (
-                        dependency.extern_name.as_str(),
-                        dependency.manifest_path.as_deref(),
-                    )
-                })
-                .collect::<Vec<_>>();
-            let expected = patched.then_some(Path::new("b/Cargo.toml"));
-            assert_eq!(routes, vec![("b", expected)], "{requirement}: {a:?}");
+                .all(|target| !target.cfg_atoms.contains("fast"))
+        );
+
+        let configured = targets(&configuration(
+            "[build]\ntarget = \"wasm32-unknown-unknown\"\nrustflags = [\"--cfg\", \"fast\"]\n\
+             [patch.crates-io]\nb = { path = \"b\" }\n",
+        ));
+        assert_eq!(route(&configured), Some(PathBuf::from("ws/b/Cargo.toml")));
+        for target in &configured {
+            assert!(target.cfg_atoms.contains("fast"), "{target:?}");
+            assert!(
+                target.cfg_atoms.contains("target_arch = \"wasm32\""),
+                "{target:?}"
+            );
+            assert!(!target.cfg_atoms.contains("unix"), "{target:?}");
         }
     }
 
@@ -504,6 +607,7 @@ mod tests {
             .into_iter()
             .map(|path| (PathBuf::from(path), Oid::zero())),
             manifests,
+            &RustCargoConfiguration::default(),
         )
         .unwrap();
         assert_eq!(targets.len(), 4, "{targets:?}");

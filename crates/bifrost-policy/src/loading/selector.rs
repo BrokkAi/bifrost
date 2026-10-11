@@ -20,9 +20,9 @@ use brokk_bifrost_rql::sexp::{Expr, parse_sexp};
 use brokk_bifrost_rql::structural::CodeQuery;
 
 use super::super::source::{
-    ParsedRqlpDocument, PolicySourceDiagnostic, PolicySourceDiagnosticSeverity, PolicySourceError,
-    PolicySourceIdentity, PolicySourceIdentityError, PolicySourceRelatedDiagnostic,
-    UnresolvedPolicySelectorReference, workspace_policy_source_identity,
+    ParsedRqlpDocument, PolicySourceDiagnostic, PolicySourceError, PolicySourceIdentity,
+    PolicySourceIdentityError, PolicySourceRelatedDiagnostic, UnresolvedPolicySelectorReference,
+    source_error as policy_source_error, workspace_policy_source_identity,
 };
 
 const MAX_REFERENCED_RQL_BYTES: u64 = 64 * 1024;
@@ -417,21 +417,13 @@ fn source_error(
     referrer: &PolicySourceIdentity,
     reference_range: &Range<usize>,
 ) -> ReferencedRqlError {
-    ReferencedRqlError::Source {
-        source,
-        diagnostic: PolicySourceDiagnostic {
-            code,
-            severity: PolicySourceDiagnosticSeverity::Error,
-            message: message.into(),
-            range,
-            fix: None,
-            related: vec![PolicySourceRelatedDiagnostic {
-                source: referrer.clone(),
-                range: reference_range.clone(),
-                message: "referenced by this rql-file selector".to_string(),
-            }],
-        },
-    }
+    let mut diagnostic = policy_source_error(code, range, message).diagnostic;
+    diagnostic.related.push(PolicySourceRelatedDiagnostic {
+        source: referrer.clone(),
+        range: reference_range.clone(),
+        message: "referenced by this rql-file selector".to_string(),
+    });
+    ReferencedRqlError::Source { source, diagnostic }
 }
 
 #[derive(Debug)]

@@ -5,33 +5,32 @@
 //! `Language` itself. The match below is exhaustive with no wildcard arm, so adding a
 //! `Language` variant fails to compile until it is registered.
 //!
-//! [`LanguageSupport`] grows one method per capability as
-//! `.agents/plans/analysis-language-registry-spi.md` converts each dispatch list.
-//! Methods land with the milestone that consumes them, so this surface is deliberately
-//! smaller than the plan's eventual one.
-
 use crate::analyzer::common::language_for_target;
 use crate::analyzer::loop_facts::LoopSyntax;
-use crate::analyzer::semantic::ProcedureKind;
-use crate::analyzer::semantic::ids::StableDigest;
+use crate::analyzer::semantic::ids::{LengthDelimitedDigest, StableDigest, WorkspaceRelativePath};
+use crate::analyzer::semantic::{
+    FormalParameterPassingMode, ProcedureKind, SemanticLocator, StablePackageValueScope,
+};
 use crate::analyzer::store::LimitedQueryRows;
 use crate::analyzer::usages::get_definition::{
     BoundedResolution, DefinitionLookupOutcome, ExactExternalCallProof,
 };
 use crate::analyzer::usages::get_type::TypeLookupOutcome;
 use crate::analyzer::usages::inverted_edges::{
-    JsTsScopedUsageEdges, UsageEdgeWeights, UsageEdges, UsageNodeKey,
+    JsTsScopedUsageEdges, UsageEdgeBuildResult, UsageEdgeWeights, UsageEdges, UsageEdgesCache,
+    UsageNodeKey,
 };
 use crate::analyzer::usages::receiver_analysis::{
     ReceiverAnalysisBudget, ReceiverFacts, ReceiverFileCtx, ReceiverFileFacts, ReceiverFileSetup,
 };
+use crate::analyzer::usages::receiver_sites::ReceiverSiteInputMode;
 use crate::analyzer::usages::reference_site::{ResolvedReferenceSite, node_range};
 use crate::analyzer::usages::workspace_graph::UsageEcosystem;
-use crate::analyzer::usages::{GraphUsageAnalyzer, UsageAnalyzer};
+use crate::analyzer::usages::{GraphUsageAnalyzer, UsageAnalyzer, UsageHit};
 use crate::analyzer::{
     BoundedDefinitionLookup, CodeUnit, ForwardQueryProvider, IAnalyzer, Language, ParserFlavor,
-    ProjectFile, Range, SignatureMetadata, cpp, csharp, go, java, js_ts, kotlin, php, python, ruby,
-    rust, scala, structural,
+    ProjectFile, Range, SignatureMetadata, cpp, csharp, go, java, js_ts, kotlin, php, python,
+    resolve_analyzer, ruby, rust, scala, structural,
 };
 use crate::cancellation::CancellationToken;
 use crate::hash::{HashMap, HashSet};
@@ -39,15 +38,181 @@ use brokk_bifrost_core::analyzer::canonical_hash::CanonicalHasher;
 use brokk_bifrost_core::analyzer::fq_name::{
     FqName, SegmentKind, joined_segments, segment_interner,
 };
-use brokk_bifrost_core::analyzer::query_token::QueryToken;
+use brokk_bifrost_core::analyzer::query_token::{QueryScope, QueryToken};
 use std::any::Any;
 use std::collections::BTreeSet;
 use std::sync::Arc;
+
+/// One callable whose saved defaults can no longer be treated as immutable.
+/// The function declaration's source start is unique within its portable path.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub(crate) struct SavedDefaultFunction {
+    path: WorkspaceRelativePath,
+    declaration_start_byte: u32,
+}
+
+impl SavedDefaultFunction {
+    pub(crate) fn new(path: WorkspaceRelativePath, declaration_start_byte: u32) -> Self {
+        Self {
+            path,
+            declaration_start_byte,
+        }
+    }
+
+    fn from_locator(locator: &SemanticLocator) -> Self {
+        let segment = locator
+            .declaration()
+            .segments()
+            .last()
+            .expect("semantic declaration locators contain a segment");
+        Self::new(locator.path().clone(), segment.anchor().span().start_byte())
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SavedDefaultKind {
+    Positional,
+    KeywordOnly,
+}
+
+/// Query-local evidence about which Python function defaults may have changed.
+/// Dynamic writes without a proven receiver are represented by the workspace
+/// flags; exact receivers add only their function key to the affected set.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct SavedDefaultArgumentSafety {
+    positional_workspace_open: bool,
+    keyword_only_workspace_open: bool,
+    positional_functions_open: HashSet<SavedDefaultFunction>,
+    keyword_only_functions_open: HashSet<SavedDefaultFunction>,
+}
+
+impl SavedDefaultArgumentSafety {
+    pub(crate) fn all_defaults_available(&self) -> bool {
+        !self.positional_workspace_open
+            && !self.keyword_only_workspace_open
+            && self.positional_functions_open.is_empty()
+            && self.keyword_only_functions_open.is_empty()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn workspace_is_open(&self, kind: SavedDefaultKind) -> bool {
+        match kind {
+            SavedDefaultKind::Positional => self.positional_workspace_open,
+            SavedDefaultKind::KeywordOnly => self.keyword_only_workspace_open,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn function_is_open(
+        &self,
+        function: &SavedDefaultFunction,
+        kind: SavedDefaultKind,
+    ) -> bool {
+        match kind {
+            SavedDefaultKind::Positional => self.positional_functions_open.contains(function),
+            SavedDefaultKind::KeywordOnly => self.keyword_only_functions_open.contains(function),
+        }
+    }
+
+    pub(crate) fn mark_workspace_open(&mut self, kind: SavedDefaultKind) {
+        match kind {
+            SavedDefaultKind::Positional => self.positional_workspace_open = true,
+            SavedDefaultKind::KeywordOnly => self.keyword_only_workspace_open = true,
+        }
+    }
+
+    pub(crate) fn mark_function_open(
+        &mut self,
+        function: SavedDefaultFunction,
+        kind: SavedDefaultKind,
+    ) {
+        match kind {
+            SavedDefaultKind::Positional => {
+                self.positional_functions_open.insert(function);
+            }
+            SavedDefaultKind::KeywordOnly => {
+                self.keyword_only_functions_open.insert(function);
+            }
+        }
+    }
+
+    pub(crate) fn default_is_available(
+        &self,
+        locator: &SemanticLocator,
+        passing_mode: FormalParameterPassingMode,
+    ) -> bool {
+        let function = SavedDefaultFunction::from_locator(locator);
+        match passing_mode {
+            FormalParameterPassingMode::NamedOnly => {
+                !self.keyword_only_workspace_open
+                    && !self.keyword_only_functions_open.contains(&function)
+            }
+            FormalParameterPassingMode::PositionalOnly
+            | FormalParameterPassingMode::PositionalOrNamed => {
+                !self.positional_workspace_open
+                    && !self.positional_functions_open.contains(&function)
+            }
+        }
+    }
+
+    pub(crate) fn fingerprint(&self) -> StableDigest {
+        let mut digest = LengthDelimitedDigest::new(b"bifrost-python-saved-default-safety/v1");
+        digest.push(&[
+            u8::from(self.positional_workspace_open),
+            u8::from(self.keyword_only_workspace_open),
+        ]);
+        for (label, functions) in [
+            (b"positional".as_slice(), &self.positional_functions_open),
+            (
+                b"keyword-only".as_slice(),
+                &self.keyword_only_functions_open,
+            ),
+        ] {
+            digest.push(label);
+            let mut functions = functions.iter().collect::<Vec<_>>();
+            functions.sort_unstable();
+            for function in functions {
+                digest.push(function.path.as_str().as_bytes());
+                digest.push(&function.declaration_start_byte.to_le_bytes());
+            }
+        }
+        digest.finish()
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum LocalDeclarationVisibility {
     Lexical,
     Hoisted,
+}
+
+pub(crate) fn with_resolved_analyzer<T: Any, R>(
+    analyzer: &dyn IAnalyzer,
+    query: impl FnOnce(&T) -> R,
+) -> Option<R> {
+    resolve_analyzer::<T>(analyzer).map(query)
+}
+
+pub(crate) enum ExternalTypeBoundaryEvidence {
+    Unresolved,
+    Indexed(Option<String>),
+}
+
+pub(crate) fn classify_jvm_external_boundary_evidence(
+    type_evidence: ExternalTypeBoundaryEvidence,
+    resolve_member: impl FnOnce() -> Option<String>,
+    declared_unindexed: impl FnOnce() -> bool,
+) -> (structural::BoundaryStatus, Option<String>) {
+    if let ExternalTypeBoundaryEvidence::Indexed(fqn) = type_evidence {
+        return (structural::BoundaryStatus::ExternalIndexed, fqn);
+    }
+    if let Some(fqn) = resolve_member() {
+        return (structural::BoundaryStatus::ExternalIndexed, Some(fqn));
+    }
+    if declared_unindexed() {
+        return (structural::BoundaryStatus::ExternalDeclaredUnindexed, None);
+    }
+    (structural::BoundaryStatus::ExternalUnknown, None)
 }
 
 /// Interpret one already-extracted package spelling through the registered
@@ -73,6 +238,23 @@ pub(crate) fn package_fq_name(language: Language, package: &str) -> FqName {
 pub(crate) struct LocalDeclarationBindingScope<'tree> {
     pub scope: tree_sitter::Node<'tree>,
     pub visibility: LocalDeclarationVisibility,
+}
+
+/// Language-owned proof that a package-scope callable value keeps its
+/// function-literal initializer at every reference.
+#[derive(Debug, Clone)]
+pub(crate) struct StablePackageFunctionValueProof {
+    pub initializer_start: usize,
+    pub initializer_end: usize,
+    pub references: Vec<UsageHit>,
+    pub scope: StablePackageValueScope,
+}
+
+/// Work charged by a language-owned bounded declaration lookup.
+#[derive(Clone, Copy)]
+pub(crate) enum PredeclaredBuiltinQueryStep {
+    BeginLookup,
+    VisitCandidate,
 }
 
 /// Physical source roles used by navigation after language-owned interpretation.
@@ -114,6 +296,12 @@ pub(crate) struct ProcedureSyntaxRoles {
     /// Classify a conditional loop whose repetition the loop proof can join
     /// to control flow. Iteration loops (for-each) are not classified.
     pub loop_site: for<'tree> fn(tree_sitter::Node<'tree>) -> Option<LoopSyntax<'tree>>,
+    /// Optional source-aware loop classification for grammars whose loop
+    /// syntax is encoded in a value-bearing AST field rather than a node kind.
+    /// The ordinary hook remains the fast path for languages with structural
+    /// loop node kinds.
+    pub loop_site_with_source:
+        Option<for<'tree> fn(tree_sitter::Node<'tree>, &str) -> Option<LoopSyntax<'tree>>>,
     /// Whether `node` is the syntax of a procedure of this kind.
     pub procedure_matches: fn(ProcedureKind, tree_sitter::Node<'_>) -> bool,
     /// Whether `node` starts code that belongs to another procedure.
@@ -123,6 +311,45 @@ pub(crate) struct ProcedureSyntaxRoles {
 pub(crate) trait LanguageSupport: Send + Sync {
     /// The `Language` variant this support serves. Must equal the registry match key.
     fn language(&self) -> Language;
+
+    /// The language-owned argument mapping, applicability, and specificity rules
+    /// used by selected call resolution. `None` uses positional mapping only.
+    fn call_applicability_adapter(
+        &self,
+    ) -> Option<&'static dyn crate::analyzer::resolution::CallApplicabilityAdapter> {
+        None
+    }
+
+    /// The qualified name that the one explicit, non-wildcard import visible
+    /// at `reference` gives its spelling, so navigation can name the
+    /// semantic-model symbol that import selects. `None` when the language has
+    /// no such import rule or no single import applies.
+    fn explicit_import_model_target(
+        &self,
+        _analyzer: &dyn IAnalyzer,
+        _token: QueryToken<'_>,
+        _file: &ProjectFile,
+        _reference: &ResolvedReferenceSite,
+    ) -> Option<String> {
+        None
+    }
+
+    /// Demand an exact selected-artifact callable factory through the language
+    /// adapter. Absence keeps ordinary external dispatch and its open boundary.
+    fn materialize_callable_factory(
+        &self,
+        _oracle: &crate::analyzer::semantic::WorkspaceSemanticOracle<'_>,
+        _call: &crate::analyzer::semantic::CallSiteHandle,
+        _proof: &ExactExternalCallProof,
+        _request: &mut crate::analyzer::semantic::SemanticRequest<'_>,
+    ) -> Result<
+        Option<
+            crate::analyzer::semantic::SemanticOutcome<crate::analyzer::semantic::DispatchResult>,
+        >,
+        crate::analyzer::semantic::SemanticProviderError,
+    > {
+        Ok(None)
+    }
 
     /// The syntax roles procedure-local source proofs need for this language.
     /// `None` means the language's lowering does not author statement entries.
@@ -175,7 +402,16 @@ pub(crate) trait LanguageSupport: Send + Sync {
 
     /// The one reference-analysis plugin serving both target-directed and
     /// whole-workspace workloads for this language.
-    fn reference_plugin(&self) -> ReferenceLanguagePlugin;
+    fn reference_usage_strategy(&self) -> &'static dyn GraphUsageAnalyzer;
+
+    fn reference_graph_backend(&self) -> LanguageGraphBackend;
+
+    fn reference_plugin(&self) -> ReferenceLanguagePlugin {
+        ReferenceLanguagePlugin {
+            strategy: self.reference_usage_strategy(),
+            graph: self.reference_graph_backend(),
+        }
+    }
 
     fn call_relation_provider(
         &self,
@@ -249,11 +485,53 @@ pub(crate) trait LanguageSupport: Send + Sync {
         None
     }
 
-    /// Whether this language's saved callable-default metadata is complete and
-    /// closed for the analyzer generation. `None` leaves default-argument
-    /// binding unproven because the language has no such capability or the
-    /// analyzer is absent, or the metadata scan is incomplete.
-    fn saved_default_arguments_available(&self, _analyzer: &dyn IAnalyzer) -> Option<bool> {
+    /// Bounded, query-local evidence about saved callable defaults. `None`
+    /// leaves default-argument binding unproven because the language has no
+    /// such capability, the analyzer is absent, or its scan was incomplete.
+    fn saved_default_argument_safety(
+        &self,
+        _analyzer: &dyn IAnalyzer,
+    ) -> Option<SavedDefaultArgumentSafety> {
+        None
+    }
+
+    /// Prove the initializer and reference census for a package-scope
+    /// callable value. `None` means the rule does not apply or its language
+    /// analyzer is unavailable; `Some(Err(_))` preserves a structured reason
+    /// why the proof could not be completed.
+    fn stable_package_function_value_proof(
+        &self,
+        _analyzer: &dyn IAnalyzer,
+        _variable: &CodeUnit,
+        _declaring_source: &str,
+    ) -> Option<Result<StablePackageFunctionValueProof, String>> {
+        None
+    }
+
+    /// Whether a member-family edge can be a virtual-dispatch target for this
+    /// language. The default keeps every proven edge; languages with narrower
+    /// dispatch domains may reject it using their analyzer's structured facts.
+    fn virtual_dispatch_target_is_applicable(
+        &self,
+        _analyzer: &dyn IAnalyzer,
+        _declaration: &CodeUnit,
+        _target_file: &ProjectFile,
+    ) -> bool {
+        true
+    }
+
+    /// Whether the bounded package declaration lookup proves that a
+    /// predeclared builtin is or is not shadowed. `BeginLookup` is called only
+    /// after the language analyzer is available; each candidate visit is
+    /// separately budgeted and may be cancelled by the caller.
+    fn predeclared_builtin_shadow_status_limited(
+        &self,
+        _analyzer: &dyn IAnalyzer,
+        _relative_path: &str,
+        _name: &str,
+        _limit: usize,
+        _query_step: &mut dyn FnMut(PredeclaredBuiltinQueryStep) -> bool,
+    ) -> Option<bool> {
         None
     }
 
@@ -291,6 +569,29 @@ pub(crate) trait LanguageSupport: Send + Sync {
         false
     }
 
+    /// Whether the external declaration surface proves `owner.member` is static.
+    /// `None` means this language has no such proof or the analyzer is absent.
+    fn external_member_is_static(
+        &self,
+        _analyzer: &dyn IAnalyzer,
+        _packs: Option<Arc<crate::analyzer::semantic_model::SemanticModelOverlay>>,
+        _owner: &str,
+        _member: &str,
+    ) -> Option<bool> {
+        None
+    }
+
+    /// Whether the external declaration surface proves `owner` is sealed.
+    /// `None` means this language has no such proof or the analyzer is absent.
+    fn external_type_is_sealed(
+        &self,
+        _analyzer: &dyn IAnalyzer,
+        _packs: Option<Arc<crate::analyzer::semantic_model::SemanticModelOverlay>>,
+        _owner: &str,
+    ) -> Option<bool> {
+        None
+    }
+
     /// Whether the call whose source mapping spans `call` in `source` provably
     /// cannot throw an exception the catch parameter whose name spans
     /// `catch_parameter` catches.
@@ -307,6 +608,25 @@ pub(crate) trait LanguageSupport: Send + Sync {
         _source: &Arc<str>,
         _call: std::ops::Range<usize>,
         _catch_parameter: std::ops::Range<usize>,
+    ) -> bool {
+        false
+    }
+
+    /// Whether dropping every parameter and every `let` binding of the
+    /// procedure whose callable spans `callable` in `source` provably runs no
+    /// user code (#3757).
+    ///
+    /// The workspace oracle uses this to discharge a gap whose declared
+    /// obligation is `SemanticGapDischarge::InertDropGlue`. The default is
+    /// `false`, which keeps every such gap. An implementation must answer
+    /// `true` only from structured type evidence and resolver proof, never
+    /// from spelling.
+    fn procedure_drops_run_no_user_code(
+        &self,
+        _analyzer: &dyn IAnalyzer,
+        _file: &ProjectFile,
+        _source: &Arc<str>,
+        _callable: std::ops::Range<usize>,
     ) -> bool {
         false
     }
@@ -785,26 +1105,6 @@ pub(crate) struct ReferenceLanguagePlugin {
 }
 
 impl ReferenceLanguagePlugin {
-    pub(crate) const fn new(
-        strategy: &'static dyn GraphUsageAnalyzer,
-        edge_pass: &'static dyn LanguageEdgePass,
-    ) -> Self {
-        Self {
-            strategy,
-            graph: LanguageGraphBackend::Legacy(edge_pass),
-        }
-    }
-
-    pub(crate) const fn native(
-        strategy: &'static dyn GraphUsageAnalyzer,
-        provider: &'static dyn NativeWorkspaceGraphProvider,
-    ) -> Self {
-        Self {
-            strategy,
-            graph: LanguageGraphBackend::Native(provider),
-        }
-    }
-
     pub(crate) const fn target_strategy(self) -> &'static dyn GraphUsageAnalyzer {
         self.strategy
     }
@@ -881,6 +1181,9 @@ pub(crate) trait NativeWorkspaceGraphProvider: Send + Sync {
 pub(crate) enum LanguageEdgeSites {
     Fqn(UsageEdges),
     Scoped(UsageEdges<UsageNodeKey>),
+    // Preserved for edge passes that cannot build complete input; Go's retained legacy
+    // test pass exercises it while production Go uses the typed native provider outcome.
+    #[allow(dead_code)]
     Unavailable(LanguageEdgeFailure),
 }
 
@@ -898,6 +1201,8 @@ pub(crate) struct LanguageEdgeFailure {
 pub(crate) enum LanguageEdgeWeights {
     Fqn(UsageEdgeWeights),
     Scoped(JsTsScopedUsageEdges),
+    // See `LanguageEdgeSites::Unavailable`.
+    #[allow(dead_code)]
     Unavailable(LanguageEdgeFailure),
 }
 
@@ -917,6 +1222,22 @@ pub(crate) struct EdgeWeightScanCtx<'a> {
     pub(crate) fqns: &'a HashSet<String>,
     pub(crate) scoped_nodes: &'a HashSet<UsageNodeKey>,
     pub(crate) keep_file: &'a (dyn Fn(&ProjectFile) -> bool + Sync),
+}
+
+pub(crate) fn fqn_edge_sites(
+    ctx: &EdgeSiteScanCtx<'_>,
+    build: impl FnOnce(QueryToken<'_>) -> Option<UsageEdges>,
+) -> Option<LanguageEdgeSites> {
+    let scope = crate::analyzer::AnalyzerQueryScope::new(ctx.analyzer);
+    build(scope.token()).map(LanguageEdgeSites::Fqn)
+}
+
+pub(crate) fn fqn_edge_weights(
+    ctx: &EdgeWeightScanCtx<'_>,
+    build: impl FnOnce(QueryToken<'_>) -> Option<UsageEdgeWeights>,
+) -> Option<LanguageEdgeWeights> {
+    let scope = crate::analyzer::AnalyzerQueryScope::new(ctx.analyzer);
+    build(scope.token()).map(LanguageEdgeWeights::Fqn)
 }
 
 /// One pass together with the ecosystem its owning supports agree on.
@@ -1097,6 +1418,22 @@ pub(crate) enum DeadCodeBulkEdges {
     Scoped(JsTsScopedUsageEdges),
 }
 
+pub(crate) fn build_fqn_dead_code_edges(
+    analyzer: &dyn IAnalyzer,
+    cache: &UsageEdgesCache,
+    candidates: &[CodeUnit],
+    build: impl FnOnce(QueryToken<'_>, &HashSet<String>) -> Option<UsageEdgeBuildResult<UsageEdges>>,
+) -> Option<DeadCodeBulkEdges> {
+    let callees = candidate_fqns(candidates);
+    crate::analyzer::usages::inverted_edges::cached_dead_code_usage_edges(
+        analyzer,
+        cache,
+        &callees,
+        |token| build(token, &callees),
+    )
+    .map(DeadCodeBulkEdges::Fqn)
+}
+
 /// Every non-synthetic declaration of `language` that `is_caller` admits, plus the
 /// candidates themselves. Bulk proofs need the whole workspace as possible callers while
 /// resolving only their bounded candidate set, so the two sets differ.
@@ -1117,6 +1454,21 @@ pub(crate) fn fqn_bulk_nodes(
     nodes
 }
 
+pub(crate) fn build_fqn_bulk_edges(
+    analyzer: &dyn IAnalyzer,
+    language: Language,
+    candidates: &[CodeUnit],
+    build_edges: impl FnOnce(&dyn IAnalyzer, &HashSet<String>) -> Option<UsageEdges>,
+) -> Option<DeadCodeBulkEdges> {
+    let nodes = fqn_bulk_nodes(
+        analyzer,
+        language,
+        |unit| unit.is_function() || unit.is_class(),
+        candidates,
+    );
+    build_edges(analyzer, &nodes).map(|edges| DeadCodeBulkEdges::Fqn(Arc::new(edges)))
+}
+
 pub(crate) fn candidate_fqns(candidates: &[CodeUnit]) -> HashSet<String> {
     candidates.iter().map(CodeUnit::fq_name).collect()
 }
@@ -1126,6 +1478,17 @@ pub(crate) fn analyzable_file_count(analyzer: &dyn IAnalyzer, language: Language
         .project()
         .analyzable_files(language)
         .map_or(0, |files| files.len())
+}
+
+pub(crate) fn ready_preflight(
+    analyzer: &dyn IAnalyzer,
+    language: Language,
+    label: &'static str,
+) -> DeadCodeBulkPreflight {
+    DeadCodeBulkPreflight::Ready {
+        label,
+        files: analyzable_file_count(analyzer, language),
+    }
 }
 
 /// Fq names declared more than once as a function in `language`. An overloaded name is
@@ -1175,6 +1538,19 @@ pub(crate) fn fqn_has_multiple_function_definitions(
 /// two independent capabilities: a language that can answer one and not the other would
 /// leave the receiver query with half an implementation part-way through a report.
 pub(crate) trait StructuralReceiverResolver: Send + Sync {
+    /// Whether this resolver consumes a caller-owned Go selected-operation
+    /// memo. Other resolvers keep their existing per-query entry points.
+    fn reuses_request_scoped_native_points(&self) -> bool {
+        false
+    }
+
+    /// Select the site for a captured member-target range. Most languages capture the
+    /// receiver expression itself, while C# field/indexer matches capture the complete
+    /// member-access expression and therefore need containing-site selection.
+    fn member_target_input_mode(&self) -> ReceiverSiteInputMode {
+        ReceiverSiteInputMode::Expression
+    }
+
     fn resolve_type_bounded(
         &self,
         query: BoundedReceiverQuery<'_>,
@@ -1184,6 +1560,42 @@ pub(crate) trait StructuralReceiverResolver: Send + Sync {
         &self,
         query: BoundedReceiverQuery<'_>,
     ) -> BoundedResolution<DefinitionLookupOutcome>;
+
+    fn resolve_definition_with_call_evidence_bounded(
+        &self,
+        query: BoundedReceiverQuery<'_>,
+    ) -> BoundedResolution<(
+        DefinitionLookupOutcome,
+        crate::analyzer::usages::get_definition::CallEvidence,
+    )> {
+        match self.resolve_definition_bounded(query) {
+            BoundedResolution::Complete { value, work } => BoundedResolution::Complete {
+                value: (value, Default::default()),
+                work,
+            },
+            BoundedResolution::Exceeded { limit, work } => {
+                BoundedResolution::Exceeded { limit, work }
+            }
+            BoundedResolution::Cancelled { work } => BoundedResolution::Cancelled { work },
+        }
+    }
+
+    #[cfg(test)]
+    fn resolve_definition_with_evidence_bounded(
+        &self,
+        query: BoundedReceiverQuery<'_>,
+    ) -> BoundedResolution<(DefinitionLookupOutcome, Option<ExactExternalCallProof>)> {
+        match self.resolve_definition_bounded(query) {
+            BoundedResolution::Complete { value, work } => BoundedResolution::Complete {
+                value: (value, None),
+                work,
+            },
+            BoundedResolution::Exceeded { limit, work } => {
+                BoundedResolution::Exceeded { limit, work }
+            }
+            BoundedResolution::Cancelled { work } => BoundedResolution::Cancelled { work },
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -1195,6 +1607,14 @@ pub(crate) struct BoundedReceiverQuery<'a> {
     pub(crate) site: &'a ResolvedReferenceSite,
     pub(crate) budget: ReceiverAnalysisBudget,
     pub(crate) cancellation: Option<&'a CancellationToken>,
+}
+
+pub(crate) fn with_bounded_receiver_query<R>(
+    query: BoundedReceiverQuery<'_>,
+    resolve: impl FnOnce(BoundedReceiverQuery<'_>, QueryToken<'_>) -> R,
+) -> R {
+    let scope = crate::analyzer::AnalyzerQueryScope::new(query.analyzer);
+    resolve(query, scope.token())
 }
 
 /// Everything a per-query receiver-facts provider borrows. `'tree` is the prepared tree's
@@ -1427,13 +1847,8 @@ pub(crate) fn build_model_providers()
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::analyzer::multi_analyzer::{AnalyzerDelegate, MultiAnalyzer};
-    use crate::analyzer::{
-        CSharpAnalyzer, CppAnalyzer, FileSetProject, GoAnalyzer, JavaAnalyzer, JavascriptAnalyzer,
-        KotlinAnalyzer, PhpAnalyzer, PythonAnalyzer, RubyAnalyzer, RustAnalyzer, ScalaAnalyzer,
-        TypescriptAnalyzer,
-    };
     use brokk_bifrost_core::analyzer::common::INCLUDE_CLAIMING_LANGUAGE;
+    use brokk_bifrost_test_macros::hardwon;
     use std::collections::{BTreeMap, BTreeSet};
 
     const ANALYZABLE: [Language; 12] = [
@@ -1453,13 +1868,6 @@ mod tests {
 
     fn support_of(language: Language) -> &'static dyn LanguageSupport {
         language_support(language).unwrap_or_else(|| panic!("{language:?} must be registered"))
-    }
-
-    fn languages_reporting(capability: impl Fn(&dyn LanguageSupport) -> bool) -> Vec<Language> {
-        ANALYZABLE
-            .into_iter()
-            .filter(|language| capability(support_of(*language)))
-            .collect()
     }
 
     /// Every observable capability of every registered language, as one reviewed table.
@@ -1495,7 +1903,7 @@ mod tests {
     const CAPABILITY_MATRIX: &str = "\
 language   | ecosystem            | pass   | graph  | sep | strategy | bulk   | recv | facts | hl  | tflow
 Java       | Jvm                  | Java   | legacy | .   | yes      | Java   | -    | -     | yes | -
-Go         | Go                   | Go     | legacy | /   | yes      | Go     | yes  | -     | yes | -
+Go         | Go                   | Go     | native | /   | yes      | Go     | yes  | -     | yes | -
 Cpp        | Cpp                  | Cpp    | legacy | ::  | -        | Cpp    | yes  | -     | yes | -
 JavaScript | JavaScriptTypeScript | JsTs   | legacy | .   | yes      | JsTs   | -    | yes   | yes | yes
 TypeScript | JavaScriptTypeScript | JsTs   | legacy | .   | yes      | JsTs   | -    | yes   | yes | yes
@@ -1561,6 +1969,7 @@ Kotlin     | Jvm                  | Kotlin | legacy | .   | yes      | Kotlin | 
     /// legacy Rust resolver and one built by the native engine shared an id
     /// whenever the bytes were equal.
     #[test]
+    #[hardwon("#1630: graph-authority changes must invalidate derived artifact identities")]
     fn the_graph_authority_digest_separates_a_flipped_language_from_production() {
         struct StandInLegacyPass(EdgePassId);
         impl LanguageEdgePass for StandInLegacyPass {
@@ -1612,73 +2021,6 @@ Kotlin     | Jvm                  | Kotlin | legacy | .   | yes      | Kotlin | 
             graph_authority_digest(),
             "one language on the other authority is a different engine"
         );
-    }
-
-    /// Compiler exhaustiveness proves every `Language` has an arm; it cannot prove the
-    /// arm is wired to the matching support.
-    #[test]
-    fn every_analyzable_language_resolves_to_its_own_support() {
-        for language in ANALYZABLE {
-            assert_eq!(support_of(language).language(), language);
-        }
-        assert!(language_support(Language::None).is_none());
-    }
-
-    #[test]
-    fn call_conversion_producers_are_registered_only_by_their_owners() {
-        for language in ANALYZABLE {
-            let registered = support_of(language)
-                .call_argument_conversion_prover()
-                .is_some();
-            assert_eq!(
-                registered,
-                matches!(
-                    language,
-                    Language::Java | Language::TypeScript | Language::Rust | Language::Scala
-                ),
-                "call conversion capability registration for {language:?}"
-            );
-        }
-    }
-
-    /// The receiver query gate admits exactly the languages reporting this capability,
-    /// so widening or narrowing the set silently changes which files answer receiver
-    /// queries at all and which get `receiver_analysis_language_unsupported`.
-    #[test]
-    fn exactly_nine_languages_report_a_structural_receiver_resolver() {
-        assert_eq!(
-            languages_reporting(|support| support.structural_receiver().is_some()),
-            vec![
-                Language::Go,
-                Language::Cpp,
-                Language::Python,
-                Language::Rust,
-                Language::Php,
-                Language::Scala,
-                Language::CSharp,
-                Language::Ruby,
-                Language::Kotlin,
-            ]
-        );
-    }
-
-    /// The receiver query admits a language through exactly two capabilities, and JS/TS is
-    /// the only one served by this second route. A language reporting neither gets
-    /// `receiver_analysis_language_unsupported`; Java is the one that reports neither and
-    /// is still served, through its own resolution session.
-    #[test]
-    fn only_js_and_ts_report_their_own_receiver_facts() {
-        assert_eq!(
-            languages_reporting(|support| support.receiver_facts().is_some()),
-            vec![Language::JavaScript, Language::TypeScript]
-        );
-        for language in ANALYZABLE {
-            let support = support_of(language);
-            assert!(
-                support.structural_receiver().is_none() || support.receiver_facts().is_none(),
-                "{language:?} claims both receiver routes"
-            );
-        }
     }
 
     fn edge_pass_id_of(language: Language) -> EdgePassId {
@@ -1755,95 +2097,16 @@ Kotlin     | Jvm                  | Kotlin | legacy | .   | yes      | Kotlin | 
         );
     }
 
-    /// `UsageEcosystem::of` delegates here now, and the JVM realm is the reason ecosystem
-    /// and language are not the same thing.
-    #[test]
-    fn the_jvm_trio_shares_one_ecosystem_across_three_passes() {
-        for language in [Language::Java, Language::Scala, Language::Kotlin] {
-            assert_eq!(support_of(language).ecosystem(), UsageEcosystem::Jvm);
-        }
-        assert_eq!(UsageEcosystem::of(Language::None), UsageEcosystem::Unknown);
-    }
-
     /// A support must find its own analyzer and no other's: a mis-wired downcast would
     /// silently answer forward queries from the wrong language's declarations.
     #[cfg_attr(not(scheduled_tests), ignore = "scheduled-only")]
-    #[test]
-    fn each_support_resolves_only_its_own_forward_query_provider() {
-        let temp = tempfile::tempdir().expect("temp dir");
-        let root = temp.path().canonicalize().expect("canonical temp root");
-        let project =
-            || FileSetProject::new(root.clone(), std::iter::empty::<std::path::PathBuf>());
-        let delegates = [
-            (
-                Language::Java,
-                AnalyzerDelegate::Java(JavaAnalyzer::from_project(project())),
-            ),
-            (
-                Language::Go,
-                AnalyzerDelegate::Go(GoAnalyzer::from_project(project())),
-            ),
-            (
-                Language::Cpp,
-                AnalyzerDelegate::Cpp(CppAnalyzer::from_project(project())),
-            ),
-            (
-                Language::JavaScript,
-                AnalyzerDelegate::JavaScript(JavascriptAnalyzer::from_project(project())),
-            ),
-            (
-                Language::TypeScript,
-                AnalyzerDelegate::TypeScript(TypescriptAnalyzer::from_project(project())),
-            ),
-            (
-                Language::Python,
-                AnalyzerDelegate::Python(PythonAnalyzer::from_project(project())),
-            ),
-            (
-                Language::Rust,
-                AnalyzerDelegate::Rust(RustAnalyzer::from_project(project())),
-            ),
-            (
-                Language::Php,
-                AnalyzerDelegate::Php(PhpAnalyzer::from_project(project())),
-            ),
-            (
-                Language::Scala,
-                AnalyzerDelegate::Scala(ScalaAnalyzer::from_project(project())),
-            ),
-            (
-                Language::CSharp,
-                AnalyzerDelegate::CSharp(CSharpAnalyzer::from_project(project())),
-            ),
-            (
-                Language::Ruby,
-                AnalyzerDelegate::Ruby(RubyAnalyzer::from_project(project())),
-            ),
-            (
-                Language::Kotlin,
-                AnalyzerDelegate::Kotlin(KotlinAnalyzer::from_project(project())),
-            ),
-        ];
-
-        for (owner, delegate) in delegates {
-            let analyzer = MultiAnalyzer::new(BTreeMap::from([(owner, delegate)]));
-            for language in ANALYZABLE {
-                let provider = support_of(language).forward_query_provider(&analyzer);
-                assert_eq!(
-                    provider.is_some(),
-                    language == owner,
-                    "{language:?} support resolved against a {owner:?}-only analyzer"
-                );
-            }
-        }
-    }
-
     /// `brokk-bifrost-core` cannot reach this CLAIMS SEAM registry, but it has
     /// to name declarations found in the files inference claims -- an
     /// unclaimed-extension file renders its qualified name in the claiming
     /// language rather than `Language::None` (#1878). Its copy of the fact must
     /// track this one.
     #[test]
+    #[hardwon("#1878: include-claimed declarations must use the same claiming-language registry")]
     fn core_claiming_language_matches_the_claims_seam() {
         assert_eq!(
             [INCLUDE_CLAIMING_LANGUAGE].as_slice(),

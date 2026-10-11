@@ -7,33 +7,49 @@ Cursor has two independent Bifrost integrations:
 
 | Integration | Process | Surface |
 | --- | --- | --- |
-| Bifrost editor extension | `bifrost --root <workspace> --lsp` | Definitions, references, hover, rename, diagnostics, workspace symbols, RQL, and Rune editor features |
-| Bifrost agent plugin | Bifrost MCP server | Bifrost tools that Cursor agents can call |
+| Bifrost editor extension | Version 0.11.5: `bifrost --root <workspace> --lsp`, using its own Bifrost 0.11.5 binary. Next version: `bifrost-lsp --root <workspace>`. | Editor features such as definitions, references, hover, rename, diagnostics, and workspace symbols, plus RQL and Rune editor features |
+| Bifrost agent plugin | `bifrost --mcp symbol\|extended`, started by the plugin's launcher | Bifrost tools that Cursor agents can call |
 
-Install either integration for its own surface or install both. They use
-separate Bifrost processes even when both resolve the same managed release.
-Never point the agent plugin at the extension's LSP process.
+Install either integration for its own surface, or install both. They run
+separate processes. Never point the agent plugin at the extension's language
+server.
+
+:::caution[The language server moved to bifrost-lsp]
+Bifrost built after release 0.12.0 does not serve LSP: `bifrost --lsp` exits
+with an error. The language server is now the separate `bifrost-lsp` program, and
+`bifrost-lsp` has no release yet. The extension version on Open VSX, 0.11.5,
+still works because it downloads its own Bifrost 0.11.5 binary. See
+[LSP Server](/lsp/).
+:::
 
 ## Install the Editor Extension
 
 Install the [Bifrost extension from Open VSX](https://open-vsx.org/extension/brokk/bifrost-vscode),
 or open Cursor's **Extensions** view and search for `brokk.bifrost-vscode`.
 Confirm that the publisher is **brokk**, choose **Install**, and open a supported
-source workspace. With the default `auto` launch mode, choose **Install** when
-Cursor asks to install the Bifrost version pinned by the extension.
+source workspace. With the default `auto` launch mode, accept the prompt to
+install the managed server binary.
 
-Open **Output > Bifrost** and retain the lines showing the release download and
-the installed version and path. The managed installer downloads the platform
-archive and its `.sha256` sidecar from the matching GitHub Release, requires
-the sidecar checksum to equal the hash pinned into the extension package,
-checks the downloaded archive bytes against that hash, and runs
-`bifrost --version` before launching the language server. A visible Bifrost
-status item by itself does not prove those checks or the active workspace.
+Open **Output > Bifrost** and keep the lines that show the download and the
+installed version and path. The managed installer:
 
-To upgrade, choose **Update** for Bifrost in Cursor's Extensions view, fully
-quit and reopen Cursor, and confirm that the installed extension version and
-the managed Bifrost version match the intended release. If the managed binary
-is stale or cannot run, accept **Update** or **Reinstall** when prompted.
+1. downloads the platform archive and its `.sha256` file from the GitHub
+   release. Version 0.11.5 downloads Bifrost from BrokkAi/bifrost. The next
+   version downloads `bifrost-lsp` from BrokkAi/bifrost-lsp;
+2. checks that the `.sha256` file and the archive both match the hash built
+   into the extension package; and
+3. runs the binary with `--version` before it starts the language server.
+
+A visible Bifrost status item does not by itself show that these checks
+passed or that the server serves the active workspace.
+
+To upgrade, choose **Update** for Bifrost in Cursor's Extensions view. Fully
+quit and reopen Cursor. Then check the installed extension version and the
+managed server version in **Output > Bifrost**. If the extension asks to
+install a new managed binary, choose **Update**.
+
+See [VS Code LSP](/vscode/) for all extension settings, commands, and launch
+modes.
 
 ### Validate the Editor Extension
 
@@ -57,9 +73,9 @@ symbol, and confirm that Bifrost reports it before restoring the valid call and
 disabling the experimental setting.
 
 Pass only if every result belongs to the active checkout and **Output >
-Bifrost** shows the LSP launch for that workspace. Remove the temporary probe
-after retaining the Cursor version, extension version, managed Bifrost version,
-platform, output evidence, and operation results.
+Bifrost** shows the language-server launch for that workspace. Remove the
+temporary probe after you record the Cursor version, extension version,
+managed server version, platform, output, and operation results.
 
 ### Troubleshoot the Editor Extension
 
@@ -71,6 +87,9 @@ platform, output evidence, and operation results.
   `path` with `bifrost.serverPath` to diagnose a specific local binary.
 - Set `bifrost.debug` to `true` for LSP request tracing and lower
   `bifrost.slowRequestMs` when investigating latency.
+- If the output shows `the LSP server has moved out of this repository`, the
+  extension started a Bifrost CLI newer than 0.12.0. Use `auto` or `bundled`
+  mode, or point `bifrost.serverPath` at a server binary that serves LSP.
 - Do not use healthy MCP status as evidence that the editor extension works;
   it is a different process and protocol.
 
@@ -102,6 +121,35 @@ package from the Plugins view and repeat the GitHub install flow. Fully quit
 and reopen Cursor afterward, then confirm that the installed plugin metadata
 reports the expected version.
 
+### What the Plugin Installs
+
+The Cursor manifest of the plugin, version 0.12.0, installs one MCP server and
+eight subagents.
+
+| Item | Name | What it does |
+| --- | --- | --- |
+| MCP server | `bifrost` | Runs the plugin's launcher, which finds or installs a Bifrost binary and starts `bifrost --mcp symbol\|extended` over stdio. Cursor allows 180 seconds for startup and 300 seconds per tool call. |
+| Subagent | `architect-reviewer` | Reviews a pull request's design: coupling, cohesion, SOLID principles, abstraction levels, and fit with existing patterns. |
+| Subagent | `devops-reviewer` | Reviews infrastructure code, CI/CD configuration, resource management, logging, timeouts, and error handling. |
+| Subagent | `dry-reviewer` | Looks for code added in a pull request that duplicates logic already in the codebase. |
+| Subagent | `issue-diagnostician` | Finds the affected files and code paths for a GitHub issue and forms a root-cause hypothesis. |
+| Subagent | `issue-enhancer` | Adds source references, affected components, and technical context to a draft GitHub issue. |
+| Subagent | `issue-planner` | Turns a diagnosis into an ordered list of code changes with file paths and method names. |
+| Subagent | `security-reviewer` | Looks for injection, authentication bypass, data leaks, cryptographic misuse, backdoors, and vulnerable dependencies in a pull request. |
+| Subagent | `senior-dev-reviewer` | Checks that a pull request's changes match its description, and looks for unrelated changes, scope creep, incomplete refactors, and missing tests. |
+
+All eight subagents are read-only: they cannot use the Write or Edit tools.
+
+The package directory also contains four skills. The Cursor manifest does not
+list them.
+
+| Skill | What it covers |
+| --- | --- |
+| `bifrost-code-navigation` | Find definitions, references, call sites, and related files with `search_symbols`, `get_symbol_locations`, `scan_usages_by_location`, and `most_relevant_files`. |
+| `bifrost-code-reading` | Read implementation details and structure with `get_summaries` and `get_symbol_sources`. |
+| `bifrost-codebase-search` | Find symbols, code shapes, and files with `search_symbols`, `query_code`, `scan_usages_by_location`, and `most_relevant_files`. |
+| `bifrost-policy-checking` | Find policy packs and categories, run built-in and repository RQL policies, and read clean, finding, and unreliable results. |
+
 The portable package uses root `plugin.json` and `mcp.json` files. It can also
 include optional `skills/` files.
 Cursor still needs its native `.cursor-plugin/plugin.json` and
@@ -111,25 +159,12 @@ Cursor returns from `roots/list`. A connected MCP status or visible tool list is
 not sufficient evidence that both boundaries worked; complete the smoke test
 below.
 
-:::caution[Upgrade from Bifrost 0.8.9]
-Bifrost 0.8.10 is the minimum release with both the Cursor plugin-root launcher
-fix and support for Cursor's bare absolute workspace path. A 0.8.9 installation
-can appear connected while workspace-backed calls remain unbound. Upgrade,
-fully restart Cursor, and complete the exact-workspace smoke below rather than
-treating installation or a visible tool list as verification.
-
-If upgrading is temporarily impossible, 0.8.9 has an explicit compatibility
-override for one fixed project. Fully quit Cursor, change to that project, and
-start a new app process with:
-
-```bash
-BIFROST_WORKSPACE_ROOT="$(pwd)" cursor .
-```
-
-This bypasses Cursor's roots negotiation and authorizes exactly that directory.
-Fully quit and repeat the command when changing projects; do not use this
-override for a reusable or multi-root setup.
-:::
+If an agent reports that Bifrost is not bound to a workspace, Cursor did not
+supply a usable root. For one fixed project, you can bypass roots negotiation:
+fully quit Cursor, change to that project, and start Cursor with
+`BIFROST_WORKSPACE_ROOT="$(pwd)" cursor .`. The plugin launcher passes that
+directory to Bifrost as `--root`. Quit and repeat the command when you change
+projects. Do not use this for a multi-root setup.
 
 ## Local Plugin Testing
 
@@ -203,9 +238,8 @@ the installed plugin. Remove the temporary declaration after retaining the
 evidence.
 
 :::caution[Cursor Agents worktrees]
-In Cursor Agents 3.12.30, this host issue remains after upgrading to Bifrost
-0.8.10: `roots/list` can name the base repository while the agent composer
-shows a separate worktree. Bifrost correctly accepts the native root supplied
+In Cursor Agents 3.12.30, `roots/list` can name the base repository while the
+agent composer shows a separate worktree. Bifrost correctly accepts the native root supplied
 by Cursor, but it cannot infer that Cursor meant a different checkout. A
 relative result from a file shared by both checkouts cannot prove the binding
 is correct. When using a worktree, run the unique-declaration smoke above and

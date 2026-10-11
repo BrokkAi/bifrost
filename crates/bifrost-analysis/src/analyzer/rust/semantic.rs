@@ -4,87 +4,143 @@
 //! abrupt-completion routing, and immutable adjacency storage stay in the
 //! shared semantic substrate.
 
+use crate::analyzer::common::is_comment_kind;
+use crate::analyzer::semantic::lowering::{
+    ConditionTargets, ProcedureWork, ProcedureWorkHandler, ShortCircuitKind,
+    dispatch_procedure_work, emit_cleanup_completion_route, field_matches,
+    schedule_sequential_work, schedule_sequential_work_with_scopes,
+    schedule_short_circuit_condition,
+};
+use crate::analyzer::semantic::structural_identity::{
+    StructuralNodeIndex, StructuralNodeIndexOutcome,
+};
 use tree_sitter::Node;
 
-use brokk_bifrost_rust::declarations::{rust_node_text, rust_nominal_type_path};
+use brokk_bifrost_rust::declarations::{
+    rust_callable_dispatch_extensibility, rust_node_text, rust_nominal_type_path,
+};
+use brokk_bifrost_rust::format_args::{RustFormattingMacro, RustLoggingMacro, RustValueMacro};
+use brokk_bifrost_rust::macro_matcher::ExportedMacroDefinitions;
 use brokk_bifrost_rust::ownership::{
     RustOwnershipClass, RustOwnershipIncomplete, RustOwnershipIndex, RustReferenceCoercion,
     rust_dereference_operand, rust_node_is_in_unsafe_context, rust_reference_expression_value,
     rust_reference_is_mutable, rust_reference_type_referent,
 };
+use brokk_bifrost_rust::structural::RUST_STRUCTURAL_SPEC;
+use brokk_bifrost_rust::structural::call_function_target;
 use brokk_bifrost_rust::syntax::unwrap_attributes;
 
-use crate::analyzer::lexical_definitions::formal_parameter_slots_for_owner;
-use crate::analyzer::semantic::cfg::{
-    CleanupRegionId, CompletionKind, CompletionRequest, CompletionRoute, ProcedureCfgBuilder,
-    ScopeBinding, ScopeFrameId,
+use crate::analyzer::declared_scalar::{
+    DeclaredScalarType, rust_scalar_type_from_literal, rust_scalar_type_from_type,
 };
-use crate::analyzer::semantic::lowering::formal_multiplicity;
+use crate::analyzer::lexical_definitions::{
+    LexicalBindingResolution, binding_excluded_child_fields, formal_parameter_slots_for_owner,
+    resolve_lexical_binding_from_focus,
+};
+use crate::analyzer::semantic::cfg::{
+    CleanupRegionId, CleanupRouteOperation, CompletionKind, CompletionRequest, CompletionRoute,
+    ProcedureCfgBuilder, ScopeBinding, ScopeCleanupAction, ScopeFrameId,
+};
+use crate::analyzer::semantic::lowering::{completion_label, formal_multiplicity};
 use crate::analyzer::semantic::service::{ProgramSemanticsLowerer, SemanticAdapterIdentity};
 use crate::analyzer::semantic::*;
-use crate::analyzer::semantic_model::csmi::{
-    CsmiCollectionFlowBoundaryRoot, CsmiCollectionFlowShape, CsmiCollectionFlowSubstitution,
-    CsmiCollectionFlowTransfer, CsmiInputBoundaryRoot, CsmiOutputBoundaryRoot, CsmiProjection,
-};
 use crate::analyzer::semantic_model::{
-    CollectionFlowContract, DeferredYieldContract, SemanticModelCallApplication,
-    SemanticModelCallableKey, SemanticModelOverlay, SemanticModelOverlayDisposition,
+    SemanticModelCallApplication, SemanticModelCallableDisposition, SemanticModelCallableKey,
+    SemanticModelCompleteness, SemanticModelOverlay, SemanticModelOverlayDisposition,
+    SemanticModelSymbol, SemanticModelSymbolKind, TypeRef,
 };
 use crate::analyzer::tree_sitter_analyzer::{
     PreparedSyntaxTree, WalkControl, try_walk_named_tree_preorder,
 };
-use crate::analyzer::{DispatchExtensibility, IAnalyzer, Language, ProjectFile, RustAnalyzer};
+use crate::analyzer::{
+    DispatchExtensibility, Language, ProjectFile, RustAnalyzer, RustOverlayCrates,
+};
 use crate::hash::{HashMap, HashSet};
-use std::sync::Arc;
 
-const ADAPTER_VERSION: &[u8] = b"rust-value-semantics-v14";
+const ADAPTER_VERSION: &[u8] = b"rust-value-semantics-v31";
 const RUST_REPEAT_ARRAY_ELEMENT_CAP: u128 = 1024;
 /// Bound on the reference levels peeled from a method receiver while
 /// recovering the written type the call auto-derefs through. Real receiver
 /// chains are short, and the bound keeps a pathological chain from walking
 /// unbounded.
 const RUST_RECEIVER_DEREFERENCE_BOUND: usize = 8;
-/// Bound on the parentheses and borrows peeled from a keyed call's key
-/// argument while recovering the place whose value names the key.
-const RUST_KEY_PLACE_UNWRAP_BOUND: usize = 8;
 
-impl_program_semantics_provider!(RustAnalyzer, |analyzer| RustSemanticLowerer::new(analyzer));
-
-struct RustSemanticLowerer {
-    dependencies: DependencyFingerprint,
-    semantic_model_overlay: Option<Arc<SemanticModelOverlay>>,
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RustMacroCallCandidate {
+    Formatting(RustFormattingMacro),
+    Logging(RustLoggingMacro),
+    Value(RustValueMacro),
 }
 
-impl RustSemanticLowerer {
-    fn new(analyzer: &RustAnalyzer) -> Self {
-        let snapshot = analyzer.active_semantic_model_snapshot();
-        let dependencies = snapshot.as_ref().map_or_else(
-            || DependencyFingerprint::hash_bytes(b"no-intrafile-dependencies"),
-            |snapshot| {
-                let mut identity = b"rust-semantic-model-set-v1\0".to_vec();
-                identity
-                    .extend_from_slice(snapshot.active_models().active_model_set_hash().as_bytes());
-                DependencyFingerprint::hash_bytes(&identity)
-            },
+/// Select Rust's format-argument grammar from the structured macro path. This
+/// is only a syntax gate; query-time dispatch still proves the macro identity.
+fn rust_macro_call_candidate(path: Node<'_>, source: &str) -> Option<RustMacroCallCandidate> {
+    let segments = brokk_bifrost_rust::graph_support::rust_path_segments(path)?;
+    let terminal = segments.last()?;
+    let name = brokk_bifrost_core::analyzer::symbol_path::strip_raw_identifier_prefix(node_text(
+        source, *terminal,
+    )?);
+    if brokk_bifrost_rust::format_args::rust_value_macro(name).is_some() && segments.len() > 1 {
+        let owner = brokk_bifrost_core::analyzer::symbol_path::strip_raw_identifier_prefix(
+            node_text(source, segments[0])?,
         );
-        Self {
-            dependencies,
-            semantic_model_overlay: snapshot
-                .and_then(|snapshot| snapshot.semantic_model_overlay().cloned()),
+        if !matches!(owner, "std" | "core" | "alloc") {
+            return None;
         }
+    }
+    if segments.len() == 2 {
+        let owner = brokk_bifrost_core::analyzer::symbol_path::strip_raw_identifier_prefix(
+            node_text(source, segments[0])?,
+        );
+        if let Some(logging) = brokk_bifrost_rust::format_args::rust_logging_macro(owner, name) {
+            return Some(RustMacroCallCandidate::Logging(logging));
+        }
+    }
+    brokk_bifrost_rust::format_args::rust_formatting_macro(name)
+        .map(RustMacroCallCandidate::Formatting)
+        .or_else(|| {
+            brokk_bifrost_rust::format_args::rust_value_macro(name)
+                .map(RustMacroCallCandidate::Value)
+        })
+}
+
+fn exact_source_node(root: Node<'_>, range: tree_sitter::Range) -> Option<Node<'_>> {
+    let mut node = root;
+    loop {
+        if node.start_byte() == range.start_byte && node.end_byte() == range.end_byte {
+            return Some(node);
+        }
+        let mut cursor = node.walk();
+        let child = node
+            .named_children(&mut cursor)
+            .filter(|child| {
+                child.start_byte() <= range.start_byte && child.end_byte() >= range.end_byte
+            })
+            .min_by_key(|child| child.end_byte().saturating_sub(child.start_byte()));
+        let next = child?;
+        if next == node {
+            return None;
+        }
+        node = next;
     }
 }
 
+impl_program_semantics_provider!(RustAnalyzer, RustSemanticLowerer);
+
+/// Stateless: Rust lowering is file-local and consults no semantic model.
+pub(crate) struct RustSemanticLowerer;
+
 impl ProgramSemanticsLowerer for RustSemanticLowerer {
     fn identity(&self) -> SemanticAdapterIdentity {
-        SemanticAdapterIdentity {
-            adapter: AdapterSemanticsVersion::hash_bytes("rust", ADAPTER_VERSION)
-                .expect("adapter name is non-empty"),
-            configuration: ConfigurationFingerprint::hash_bytes(
-                b"rust-intrafile-execution-defaults-v1",
+        SemanticAdapterIdentity::for_adapter(
+            "rust",
+            ADAPTER_VERSION,
+            b"rust-intrafile-execution-defaults-v1",
+            crate::analyzer::semantic::lowering::semantic_model_dependency_fingerprint(
+                None,
+                b"rust-semantic-model-set-v1\0",
             ),
-            dependencies: self.dependencies,
-        }
+        )
     }
 
     fn capabilities(&self) -> SemanticCapabilities {
@@ -99,35 +155,60 @@ impl ProgramSemanticsLowerer for RustSemanticLowerer {
         cancellation: &CancellationToken,
     ) -> Result<SemanticOutcome<Vec<ProcedureSemanticsParts>>, SemanticProviderError> {
         let (inventory, initial_work) =
-            match enumerate_procedures(file, prepared, budget, cancellation)? {
-                ProcedureEnumeration::Complete {
+            match enumerate_procedures(file, prepared, budget, cancellation)?.into_lowering_input()
+            {
+                ProcedureLoweringInput::Complete {
                     value,
                     initial_work,
-                    ..
                 } => (value, initial_work),
-                ProcedureEnumeration::ExceededBudget { exceeded, work } => {
-                    return Ok(SemanticOutcome::ExceededBudget {
-                        partial: None,
-                        exceeded,
-                        work,
-                    });
-                }
-                ProcedureEnumeration::Cancelled { work } => {
-                    return Ok(SemanticOutcome::Cancelled {
-                        partial: None,
-                        work,
-                    });
-                }
+                ProcedureLoweringInput::Stopped(outcome) => return Ok(outcome),
             };
 
-        let RustProcedureInventory { specs, ownership } = inventory;
+        let RustProcedureInventory {
+            specs,
+            ownership,
+            exported_macro_definitions,
+        } = inventory;
+
+        let procedure_targets = specs
+            .iter()
+            .map(|spec| {
+                (
+                    spec.callable.id(),
+                    RustNestedProcedureTarget {
+                        id: spec.id,
+                        captures: spec.captures.clone(),
+                    },
+                )
+            })
+            .collect::<HashMap<_, _>>();
 
         // One file prescan, shared by every procedure: what this file states
         // about its own functions' return types, its struct declarations, and
         // which of those structs run no destructor.
         let facts = rust_file_facts(prepared);
-        let semantic_model_overlay = self.semantic_model_overlay.clone();
-
+        let mut initial_work = initial_work;
+        let structural_node_index = match StructuralNodeIndex::for_source(
+            &RUST_STRUCTURAL_SPEC,
+            prepared,
+            budget.limits().nested_entries,
+            cancellation,
+        )? {
+            StructuralNodeIndexOutcome::Complete { index, work_items } => {
+                initial_work = initial_work.conservative_add(SemanticWork {
+                    nested_entries: work_items,
+                    ..SemanticWork::default()
+                });
+                Some(index)
+            }
+            StructuralNodeIndexOutcome::Exceeded { .. } => None,
+            StructuralNodeIndexOutcome::Cancelled => {
+                return Ok(SemanticOutcome::Cancelled {
+                    partial: None,
+                    work: initial_work,
+                });
+            }
+        };
         lower_procedure_batch(
             &specs,
             initial_work,
@@ -136,12 +217,16 @@ impl ProgramSemanticsLowerer for RustSemanticLowerer {
             |spec, staged_budget, cancellation| {
                 lower_procedure(
                     prepared,
-                    &facts,
-                    &ownership,
+                    RustProcedureInputs {
+                        facts: &facts,
+                        ownership: &ownership,
+                        exported_macro_definitions: &exported_macro_definitions,
+                        procedure_targets: &procedure_targets,
+                        structural_node_index: structural_node_index.as_ref(),
+                    },
                     spec,
                     staged_budget,
                     cancellation,
-                    semantic_model_overlay.clone(),
                 )
             },
         )
@@ -149,55 +234,25 @@ impl ProgramSemanticsLowerer for RustSemanticLowerer {
 }
 
 fn rust_capabilities() -> SemanticCapabilities {
-    let mut builder = SemanticCapabilities::builder();
+    let mut builder = crate::analyzer::semantic::capabilities::tree_sitter_adapter_capabilities();
     for capability in [
-        SemanticCapability::Procedures,
-        SemanticCapability::EntryBoundary,
-        SemanticCapability::NormalExitBoundary,
-        SemanticCapability::ExceptionalExitBoundary,
-        SemanticCapability::BasicBlocks,
-        SemanticCapability::ProgramPoints,
-        SemanticCapability::ReturnFlow,
-        SemanticCapability::NormalCallContinuation,
-        SemanticCapability::ExceptionalCallContinuation,
-    ] {
-        builder = builder.complete(capability);
-    }
-    for capability in [
-        SemanticCapability::NormalControlFlow,
-        SemanticCapability::ExceptionalControlFlow,
-        SemanticCapability::CleanupControlFlow,
-        SemanticCapability::Calls,
-        SemanticCapability::DynamicDispatch,
-        SemanticCapability::CallableReferences,
-        SemanticCapability::Values,
-        SemanticCapability::Assignments,
-        SemanticCapability::Allocations,
-        SemanticCapability::LocalFlow,
-        SemanticCapability::ParameterFlow,
-        SemanticCapability::ReceiverFlow,
-        SemanticCapability::Captures,
+        // Same-file `static` reads have an exact declaration-backed location;
+        // references this adapter cannot resolve retain a local structured gap.
+        SemanticCapability::StaticMemory,
         SemanticCapability::AsyncSuspendResume,
         SemanticCapability::GeneratorSuspension,
-        SemanticCapability::DeferredExecution,
-        SemanticCapability::NonLocalControl,
-        SemanticCapability::ResourceManagement,
-        // Partial: a field or element store and load is lowered into a real
-        // memory row whenever the place is a single selector or a single
-        // constant index over a value this procedure can name (#2667). A
-        // dereference target, a destructuring target, a dynamic index, and a
-        // field whose declaring struct this file does not state each publish
-        // their own gap instead.
-        SemanticCapability::FieldMemory,
-        SemanticCapability::IndexMemory,
     ] {
         builder = builder.partial(capability);
     }
-    // Partial: this adapter normalizes exactly one condition shape, a literal
-    // `true` or `false`, and publishes nothing for any other decision. An
-    // absent guard row therefore means "not normalized here", never "this
-    // procedure has no decision" (#2443).
-    builder = builder.partial(SemanticCapability::GuardFacts);
+    // FieldMemory and IndexMemory stay partial: a field or element store and
+    // load is lowered into a real memory row whenever the place is a single
+    // selector or a single constant index over a value this procedure can
+    // name (#2667). Unsupported targets keep their structured gaps.
+    // GuardFacts stays partial: this adapter publishes guard rows for built-in primitive
+    // comparisons, Boolean truth tests, literal conditions, and structured
+    // integer comparisons with an integer literal or unambiguous same-file
+    // top-level const bound. An absent normalized predicate remains opaque
+    // because a non-primitive Rust operator may dispatch to user code (#2443).
     builder.build()
 }
 
@@ -210,20 +265,30 @@ struct ProcedureSpec<'tree> {
     kind: ProcedureKind,
     properties: ProcedureProperties,
     callable: Node<'tree>,
+    captures: Box<[RustCaptureSpec<'tree>]>,
+}
+
+#[derive(Clone)]
+struct RustCaptureSpec<'tree> {
+    name: Box<str>,
+    declaration_start: usize,
+    reference: Node<'tree>,
+    mode: CaptureMode,
+}
+
+#[derive(Clone)]
+struct RustNestedProcedureTarget<'tree> {
+    id: ProcedureId,
+    captures: Box<[RustCaptureSpec<'tree>]>,
 }
 
 struct RustProcedureInventory<'tree> {
     specs: Vec<ProcedureSpec<'tree>>,
     ownership: RustOwnershipIndex<'tree, 'tree>,
+    exported_macro_definitions: ExportedMacroDefinitions<'tree>,
 }
 
 type ProcedureEnumeration<'tree> = ProcedureInventoryOutcome<RustProcedureInventory<'tree>>;
-
-struct ProcedureEnumerationFrame<'tree> {
-    node: Node<'tree>,
-    lexical_parent: Option<ProcedureId>,
-    declaration_path: usize,
-}
 
 fn enumerate_procedures<'tree>(
     file: &ProjectFile,
@@ -249,84 +314,273 @@ fn enumerate_procedures<'tree>(
         Err(Some(stop)) => return Ok(stop.into_outcome()),
         Err(None) => return Ok(inventory.cancelled()),
     };
-    let mut specs = Vec::new();
-    let mut stack = vec![ProcedureEnumerationFrame {
-        node: root,
-        lexical_parent: None,
-        declaration_path: inventory.root_path(),
-    }];
-
-    while let Some(frame) = stack.pop() {
-        if cancellation.is_cancelled() {
-            return Ok(inventory.cancelled());
-        }
-        if let Err(stop) = inventory.charge_traversal_entry() {
-            return Ok(stop.into_outcome());
-        }
-        let child_path = frame.declaration_path;
-        let mut container_body_scope = None;
-        if let Some(segment_kind) = declaration_container_kind(frame.node) {
-            let name = declaration_container_name(prepared.source(), frame.node);
-            let anchor =
-                source_anchor(frame.node, 0).map_err(SemanticProviderError::invalid_identity)?;
-            let container_path = inventory.push_container(
-                frame.declaration_path,
-                segment_kind,
-                name.as_deref(),
-                anchor,
-            )?;
-            if let Some(body) = frame.node.child_by_field_name("body") {
-                container_body_scope = Some((body.id(), container_path));
+    let root_path = inventory.root_path();
+    let mut macro_definition_candidates = Vec::new();
+    let mut specs = match walk_procedure_tree(
+        root,
+        root_path,
+        &mut inventory,
+        cancellation,
+        named_children,
+        |frame, inventory| {
+            if frame.node.kind() == "macro_definition" {
+                macro_definition_candidates.push(frame.node);
             }
-        }
-        let mut callable_body_scope = None;
-
-        if let Some((kind, segment_kind, body, properties)) =
-            callable_shape(frame.node, frame.lexical_parent)
-        {
-            let name = callable_name(prepared.source(), frame.node);
-            let anchor =
-                source_anchor(frame.node, 0).map_err(SemanticProviderError::invalid_identity)?;
-            let identity = match inventory.allocate_procedure(
-                child_path,
-                segment_kind,
-                name.as_deref(),
-                anchor,
-            )? {
-                Ok(identity) => identity,
-                Err(stop) => return Ok(stop.into_outcome()),
+            let mut container_body = None;
+            if let Some(segment_kind) = declaration_container_kind(frame.node) {
+                let name = declaration_container_name(prepared.source(), frame.node);
+                let anchor = source_anchor(frame.node, 0)
+                    .map_err(SemanticProviderError::invalid_identity)?;
+                let container_path = inventory.push_container(
+                    frame.declaration_path,
+                    segment_kind,
+                    name.as_deref(),
+                    anchor,
+                )?;
+                if let Some(body) = frame.node.child_by_field_name("body") {
+                    container_body = Some((body.id(), container_path));
+                }
+            }
+            let mut callable_body = None;
+            let value = if let Some((kind, segment_kind, body, properties)) =
+                callable_shape(frame.node, frame.lexical_parent)
+            {
+                let name = callable_name(prepared.source(), frame.node);
+                let anchor = source_anchor(frame.node, 0)
+                    .map_err(SemanticProviderError::invalid_identity)?;
+                let identity = match inventory.allocate_procedure(
+                    frame.declaration_path,
+                    segment_kind,
+                    name.as_deref(),
+                    anchor,
+                )? {
+                    Ok(identity) => identity,
+                    Err(stop) => return Ok(ProcedureWalkStep::ExceededBudget(stop)),
+                };
+                callable_body = Some((body.id(), identity.id, identity.declaration_path));
+                Some(ProcedureSpec {
+                    id: identity.id,
+                    body,
+                    locator: identity.locator,
+                    lexical_parent: frame.lexical_parent,
+                    kind,
+                    properties,
+                    callable: frame.node,
+                    captures: Box::new([]),
+                })
+            } else {
+                None
             };
-            specs.push(ProcedureSpec {
-                id: identity.id,
-                body,
-                locator: identity.locator,
-                lexical_parent: frame.lexical_parent,
-                kind,
-                properties,
-                callable: frame.node,
-            });
-            callable_body_scope = Some((body.id(), identity.id, identity.declaration_path));
-        }
+            Ok(ProcedureWalkStep::Continue {
+                value,
+                scopes: ProcedureWalkScopes {
+                    container_body,
+                    callable_body,
+                },
+            })
+        },
+    )? {
+        ProcedureTreeWalkOutcome::Complete(specs) => specs,
+        ProcedureTreeWalkOutcome::ExceededBudget(stop) => return Ok(stop.into_outcome()),
+        ProcedureTreeWalkOutcome::Cancelled => return Ok(inventory.cancelled()),
+    };
 
-        let children = named_children(frame.node);
-        for child in children.into_iter().rev() {
-            let child_path = container_body_scope
-                .filter(|(body_id, _)| *body_id == child.id())
-                .map(|(_, path)| path)
-                .unwrap_or(child_path);
-            let (lexical_parent, declaration_path) = callable_body_scope
-                .filter(|(body_id, _, _)| *body_id == child.id())
-                .map(|(_, procedure, path)| (Some(procedure), path))
-                .unwrap_or((frame.lexical_parent, child_path));
-            stack.push(ProcedureEnumerationFrame {
-                node: child,
-                lexical_parent,
-                declaration_path,
-            });
+    match populate_rust_capture_specs(&mut specs, prepared.source(), &mut inventory, cancellation) {
+        Ok(()) => {}
+        Err(RustCapturePrepassStop::Budget(stop)) => return Ok(stop.into_outcome()),
+        Err(RustCapturePrepassStop::Cancelled) => return Ok(inventory.cancelled()),
+    }
+    let exported_macro_definitions =
+        ExportedMacroDefinitions::from_candidates(macro_definition_candidates, prepared.source());
+    Ok(inventory.complete(RustProcedureInventory {
+        specs,
+        ownership,
+        exported_macro_definitions,
+    }))
+}
+
+enum RustCapturePrepassStop {
+    Budget(crate::analyzer::semantic::inventory::ProcedureInventoryStop),
+    Cancelled,
+}
+
+/// Resolve closure free variables through the existing lexical scopes. Captures
+/// crossing another closure are relayed through each intervening environment.
+fn populate_rust_capture_specs<'tree>(
+    specs: &mut [ProcedureSpec<'tree>],
+    source: &str,
+    inventory: &mut ProcedureInventoryBuilder<'_>,
+    cancellation: &CancellationToken,
+) -> Result<(), RustCapturePrepassStop> {
+    let mut captures =
+        vec![HashMap::<(Box<str>, usize), RustCaptureSpec<'tree>>::default(); specs.len()];
+    for child_index in 0..specs.len() {
+        let child = &specs[child_index];
+        if !is_rust_closure_callable(child.callable) {
+            continue;
+        }
+        let mut pending = Vec::new();
+        try_walk_named_tree_preorder(child.body, true, |node| {
+            if cancellation.is_cancelled() {
+                return Err(RustCapturePrepassStop::Cancelled);
+            }
+            inventory
+                .charge_traversal_entry()
+                .map_err(RustCapturePrepassStop::Budget)?;
+            if node.id() != child.body.id() && is_rust_nested_execution_boundary(node) {
+                return Ok(WalkControl::SkipChildren);
+            }
+            if !matches!(node.kind(), "identifier" | "self") {
+                return Ok(WalkControl::Continue);
+            }
+            let Some(name) = node_text(source, node) else {
+                return Ok(WalkControl::Continue);
+            };
+            let Some(binding) = resolve_lexical_binding_from_focus(
+                Language::Rust,
+                node,
+                source,
+                node.start_byte(),
+                name,
+            ) else {
+                return Ok(WalkControl::Continue);
+            };
+            let definition = match binding {
+                LexicalBindingResolution::Parameter(definition)
+                | LexicalBindingResolution::OtherLocal(definition) => definition,
+            };
+            if child.callable.start_byte() <= definition.declaration_range.start_byte
+                && definition.declaration_range.end_byte <= child.callable.end_byte()
+            {
+                return Ok(WalkControl::Continue);
+            }
+            let Some(owner) = specs
+                .iter()
+                .filter(|candidate| {
+                    candidate.callable.start_byte() <= definition.declaration_range.start_byte
+                        && definition.declaration_range.end_byte <= candidate.callable.end_byte()
+                })
+                .min_by_key(|candidate| {
+                    candidate.callable.end_byte() - candidate.callable.start_byte()
+                })
+                .map(|candidate| candidate.id)
+            else {
+                return Ok(WalkControl::Continue);
+            };
+            pending.push((
+                Box::<str>::from(name),
+                definition.name_range.start_byte,
+                node,
+                owner,
+            ));
+            Ok(WalkControl::Continue)
+        })?;
+
+        for (name, declaration_start, reference, owner) in pending {
+            let mut target_id = child.id;
+            while target_id != owner {
+                let target = specs
+                    .iter()
+                    .find(|candidate| candidate.id == target_id)
+                    .expect("lexical parent procedure id resolves within this file");
+                if !is_rust_closure_callable(target.callable) {
+                    break;
+                }
+                let mode = rust_capture_mode(target.callable, reference);
+                let capture = RustCaptureSpec {
+                    name: name.clone(),
+                    declaration_start,
+                    reference,
+                    mode,
+                };
+                captures[target_id.index()]
+                    .entry((name.clone(), declaration_start))
+                    .and_modify(|existing| {
+                        if existing.mode != capture.mode {
+                            existing.mode = CaptureMode::Unknown;
+                        }
+                    })
+                    .or_insert(capture);
+                let Some(parent) = target.lexical_parent else {
+                    break;
+                };
+                target_id = parent;
+            }
         }
     }
 
-    Ok(inventory.complete(RustProcedureInventory { specs, ownership }))
+    for spec in specs {
+        let mut procedure_captures = captures[spec.id.index()]
+            .drain()
+            .map(|(_, capture)| capture)
+            .collect::<Vec<_>>();
+        procedure_captures.sort_by_key(|capture| (capture.declaration_start, capture.name.clone()));
+        spec.captures = procedure_captures.into_boxed_slice();
+    }
+    Ok(())
+}
+
+fn is_rust_closure_callable(node: Node<'_>) -> bool {
+    matches!(
+        node.kind(),
+        "closure_expression" | "async_block" | "gen_block"
+    )
+}
+
+fn rust_capture_mode(callable: Node<'_>, reference: Node<'_>) -> CaptureMode {
+    if direct_child_kind(callable, "move") {
+        return CaptureMode::Move;
+    }
+    if rust_capture_use_may_mutate(reference, callable) {
+        return CaptureMode::Unknown;
+    }
+    CaptureMode::LanguageDefined("rust_shared_borrow".into())
+}
+
+fn rust_capture_use_may_mutate(reference: Node<'_>, callable: Node<'_>) -> bool {
+    let mut current = reference;
+    while let Some(parent) = current.parent() {
+        if matches!(
+            parent.kind(),
+            "assignment_expression" | "compound_assignment_expr"
+        ) && parent
+            .child_by_field_name("left")
+            .is_some_and(|left| rust_node_contains(left, reference))
+        {
+            return true;
+        }
+        if parent.kind() == "reference_expression"
+            && direct_named_child_kind(parent, "mutable_specifier").is_some()
+            && parent
+                .child_by_field_name("value")
+                .is_some_and(|value| rust_node_contains(value, reference))
+        {
+            return true;
+        }
+        if parent.kind() == "call_expression"
+            && parent
+                .child_by_field_name("function")
+                .is_some_and(|function| rust_node_contains(function, reference))
+        {
+            return true;
+        }
+        if parent.id() == callable.id() {
+            break;
+        }
+        current = parent;
+    }
+    false
+}
+
+fn rust_node_contains(ancestor: Node<'_>, target: Node<'_>) -> bool {
+    let mut current = target;
+    while let Some(parent) = current.parent() {
+        if parent.id() == ancestor.id() {
+            return true;
+        }
+        current = parent;
+    }
+    ancestor.id() == target.id()
 }
 
 fn declaration_container_kind(node: Node<'_>) -> Option<DeclarationSegmentKind> {
@@ -408,10 +662,9 @@ fn impl_declares_type_parameter(impl_item: Node<'_>, source: &str, target: &str)
 }
 
 fn callable_name(source: &str, node: Node<'_>) -> Option<Box<str>> {
-    node.child_by_field_name("name")
-        .and_then(|name| nonempty_node_text(source, name))
-        .map(Box::<str>::from)
-        .or_else(|| enclosing_let_name(source, node))
+    crate::analyzer::semantic::lowering::callable_name_with_binding(source, node, || {
+        enclosing_let_name(source, node)
+    })
 }
 
 fn enclosing_let_name(source: &str, node: Node<'_>) -> Option<Box<str>> {
@@ -519,34 +772,16 @@ fn callable_shape<'tree>(
             } else {
                 ProcedureInvocationKind::Immediate
             },
-            dispatch_extensibility: rust_callable_dispatch_extensibility(node),
+            dispatch_extensibility: if node.kind() == "function_item" {
+                rust_callable_dispatch_extensibility(node)
+            } else {
+                DispatchExtensibility::Closed
+            },
             call_boundary: ProcedureCallBoundary::Direct,
             receiver_binding: Default::default(),
             construction_return: Default::default(),
         },
     ))
-}
-
-fn rust_callable_dispatch_extensibility(node: Node<'_>) -> DispatchExtensibility {
-    if node.kind() != "function_item" {
-        return DispatchExtensibility::Closed;
-    }
-    let mut parent = node.parent();
-    while let Some(candidate) = parent {
-        match candidate.kind() {
-            "trait_item" => return DispatchExtensibility::Open,
-            "impl_item" => {
-                return if candidate.child_by_field_name("trait").is_some() {
-                    DispatchExtensibility::Open
-                } else {
-                    DispatchExtensibility::Closed
-                };
-            }
-            "function_item" | "closure_expression" | "source_file" => break,
-            _ => parent = candidate.parent(),
-        }
-    }
-    DispatchExtensibility::Closed
 }
 
 fn has_impl_or_trait_parent(mut node: Node<'_>) -> bool {
@@ -577,37 +812,16 @@ fn function_has_self_parameter(node: Node<'_>) -> bool {
         })
 }
 
-fn field_matches(parent: Node<'_>, field: &str, child: Node<'_>) -> bool {
-    parent
-        .child_by_field_name(field)
-        .is_some_and(|candidate| candidate.id() == child.id())
-}
-
 type RustLoweringError = ProcedureLoweringError;
 
 type EdgeTarget = ControlTarget;
 
-#[derive(Debug, Clone, Copy)]
-enum Work<'tree> {
-    Statement {
-        node: Node<'tree>,
-        entry: ProgramPointId,
-        next: EdgeTarget,
-        scope: ScopeFrameId,
-    },
-    Expression {
-        node: Node<'tree>,
-        entry: ProgramPointId,
-        next: EdgeTarget,
-        scope: ScopeFrameId,
-    },
-    Condition {
-        node: Node<'tree>,
-        entry: ProgramPointId,
-        when_true: EdgeTarget,
-        when_false: EdgeTarget,
-        scope: ScopeFrameId,
-    },
+type Work<'tree> = ProcedureWork<'tree>;
+
+struct ScopedNodeSchedule<'schedule, 'tree> {
+    children: &'schedule [Node<'tree>],
+    entries: &'schedule [ProgramPointId],
+    scopes: &'schedule [ScopeFrameId],
 }
 
 struct LoweringContext<'tree, 'targets> {
@@ -615,28 +829,116 @@ struct LoweringContext<'tree, 'targets> {
     session: ProcedureLoweringSession<'targets>,
     expression_values: HashMap<usize, ValueId>,
     parameters: HashMap<Box<str>, ValueId>,
-    locals: HashMap<Box<str>, Vec<LocalBinding>>,
+    locals: HashMap<Box<str>, Vec<LocalBinding<'tree>>>,
+    captured_bindings: HashMap<Box<str>, ValueId>,
+    captured_binding_sources: HashMap<(Box<str>, usize), ValueId>,
+    procedure_targets: &'targets HashMap<usize, RustNestedProcedureTarget<'tree>>,
     /// Exact declared or structurally inferred type evidence for bindings.
     value_types: HashMap<ValueId, RustValueType<'tree>>,
+    /// Primitive scalar types that make comparison and Boolean truth tests
+    /// built in for this procedure.
+    scalar_types: HashMap<ValueId, DeclaredScalarType>,
     return_type: Option<Node<'tree>>,
+    procedure_body: Node<'tree>,
+    function_scope: ScopeFrameId,
+    normal_exit: ProgramPointId,
+    exceptional_exit: ProgramPointId,
+    cleanup_gap_exit_points: HashSet<ProgramPointId>,
     definitely_non_dropping: HashSet<ValueId>,
     /// What this file states about its own functions, structs, and destructors.
     facts: &'targets RustFileFacts<'tree>,
     ownership: &'targets RustOwnershipIndex<'tree, 'tree>,
+    exported_macro_definitions: &'targets ExportedMacroDefinitions<'tree>,
+    structural_node_index: Option<&'targets StructuralNodeIndex>,
     /// The struct or array shape each value provably holds, which is what lets
     /// a field or index place name a memory location this procedure owns.
     value_shapes: HashMap<ValueId, RustValueShape>,
-    /// The fallback memory-location identity for a field whose declaring
-    /// struct this file does not state, interned once per name per procedure
-    /// so a store and a load of the same name still meet.
-    field_locators: HashMap<Box<str>, SemanticLocator>,
     /// One value per distinct constant index magnitude, so equivalent integer
     /// literal spellings name the same index value.
     constant_index_values: HashMap<u128, ValueId>,
-    parameter_cleanup_required: bool,
+    /// Materialized same-file static locations, keyed by declaration name byte.
+    static_locations: HashMap<usize, MemoryLocationId>,
     receiver: Option<ValueId>,
     next_cleanup_region: usize,
-    semantic_model_overlay: Option<Arc<SemanticModelOverlay>>,
+    /// Cleanup regions whose droppable values are only parameters or direct
+    /// `let` bindings: the parameter region and lexical block regions.
+    binding_cleanup_regions: HashSet<CleanupRegionId>,
+    cleanup_nodes: HashMap<CleanupRegionId, Node<'tree>>,
+    binding_nodes: HashMap<ValueId, Node<'tree>>,
+    binding_places: HashMap<ValueId, SemanticPlace>,
+    cleanup_places_by_binding: HashMap<ValueId, Vec<SemanticPlace>>,
+    cleanup_owners_by_region: HashMap<CleanupRegionId, Vec<ValueId>>,
+    binding_metadata: HashMap<ValueId, PointMetadata>,
+    binding_scopes: HashMap<ValueId, (usize, usize, usize)>,
+    cleanup_drop_incompletes: HashMap<SemanticPlace, LifecycleIncompleteReason>,
+    parameter_values: Vec<ValueId>,
+    move_outs: Vec<MoveOutFact>,
+    pointer_origins: Vec<PointerOrigin>,
+    pointer_aliases: Vec<PointerAlias>,
+    pointer_accesses: Vec<PointerAccess>,
+    pointer_invalidations: Vec<PointerInvalidation>,
+    owner_lifetime_end_points: HashSet<(ValueId, ProgramPointId)>,
+    incomplete_facts: Vec<SemanticIncompleteFact>,
+    pointer_origins_by_place: HashMap<SemanticPlace, PointerOriginId>,
+    pointer_origins_by_owner: HashMap<ValueId, PointerOriginId>,
+    pointer_owner_lifetimes:
+        HashMap<ValueId, (PointerInvalidationTarget, PointerInvalidationCause)>,
+    manually_drop_values: HashSet<ValueId>,
+    pointer_origins_by_pointer: HashMap<ValueId, Vec<(PointerOriginId, PointerByteOffset)>>,
+    pointer_pointees_by_value: HashMap<ValueId, RustPointerPointee<'tree>>,
+    pointer_fact_targets_by_source: HashMap<ValueId, Vec<PendingPointerFactTransfer>>,
+}
+
+impl<'tree, 'targets> ProcedureWorkHandler<'tree> for LoweringContext<'tree, 'targets> {
+    fn cancellation_token(&self) -> &CancellationToken {
+        self.session.cancellation()
+    }
+
+    fn lower_statement(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        node: Node<'tree>,
+        entry: ProgramPointId,
+        next: ControlTarget,
+        scope: ScopeFrameId,
+        stack: &mut Vec<ProcedureWork<'tree>>,
+    ) -> Result<(), RustLoweringError> {
+        let node = unwrap_attributes(node);
+        self.session.record_statement_entry(builder, node, entry)?;
+        self.statement(builder, node, entry, next, scope, stack)
+    }
+
+    fn lower_expression(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        node: Node<'tree>,
+        entry: ProgramPointId,
+        next: ControlTarget,
+        scope: ScopeFrameId,
+        stack: &mut Vec<ProcedureWork<'tree>>,
+    ) -> Result<(), RustLoweringError> {
+        self.expression(builder, unwrap_attributes(node), entry, next, scope, stack)
+    }
+
+    fn lower_condition(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        node: Node<'tree>,
+        entry: ProgramPointId,
+        targets: ConditionTargets,
+        scope: ScopeFrameId,
+        stack: &mut Vec<ProcedureWork<'tree>>,
+    ) -> Result<(), RustLoweringError> {
+        self.condition(
+            builder,
+            unwrap_attributes(node),
+            entry,
+            targets.when_true,
+            targets.when_false,
+            scope,
+            stack,
+        )
+    }
 }
 
 /// The shape a value provably holds, as far as one file can state it.
@@ -662,29 +964,62 @@ enum RustValueType<'tree> {
 }
 
 #[derive(Debug, Clone, Copy)]
+enum RustPointerPointee<'tree> {
+    Type(Node<'tree>),
+    Byte,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PendingPointerFactTransfer {
+    target: ValueId,
+    point: ProgramPointId,
+    metadata: PointMetadata,
+}
+
+struct RustNormalizedGuard {
+    predicate: GuardPredicate,
+    subject: Option<ValueId>,
+    predicate_true_on_condition_true: bool,
+}
+
+#[derive(Debug, Clone, Copy)]
 enum RustTypeOperation {
     Dereference,
     Borrow { mutable: bool },
 }
 
 #[derive(Debug, Clone, Copy)]
-struct LocalBinding {
+struct LocalBinding<'tree> {
     declaration_start: usize,
     visible_from: usize,
     scope_start: usize,
     scope_end: usize,
     value: ValueId,
+    initializer: Option<Node<'tree>>,
+}
+
+struct RustProcedureInputs<'inputs, 'tree> {
+    facts: &'inputs RustFileFacts<'tree>,
+    ownership: &'inputs RustOwnershipIndex<'tree, 'tree>,
+    exported_macro_definitions: &'inputs ExportedMacroDefinitions<'tree>,
+    procedure_targets: &'inputs HashMap<usize, RustNestedProcedureTarget<'tree>>,
+    structural_node_index: Option<&'inputs StructuralNodeIndex>,
 }
 
 fn lower_procedure<'tree>(
     prepared: &'tree PreparedSyntaxTree,
-    facts: &RustFileFacts<'tree>,
-    ownership: &RustOwnershipIndex<'tree, 'tree>,
+    inputs: RustProcedureInputs<'_, 'tree>,
     spec: &ProcedureSpec<'tree>,
     budget: &SemanticBudget,
     cancellation: &CancellationToken,
-    semantic_model_overlay: Option<Arc<SemanticModelOverlay>>,
 ) -> Result<(ProcedureSemanticsParts, SemanticWork), RustLoweringError> {
+    let RustProcedureInputs {
+        facts,
+        ownership,
+        exported_macro_definitions,
+        procedure_targets,
+        structural_node_index,
+    } = inputs;
     let mut parts = ProcedureSemanticsParts::new(
         spec.id,
         spec.locator.clone(),
@@ -708,48 +1043,86 @@ fn lower_procedure<'tree>(
         expression_values: HashMap::default(),
         parameters: HashMap::default(),
         locals: HashMap::default(),
+        captured_bindings: HashMap::default(),
+        captured_binding_sources: HashMap::default(),
+        procedure_targets,
         value_types: HashMap::default(),
+        scalar_types: HashMap::default(),
         return_type: spec.callable.child_by_field_name("return_type"),
+        procedure_body: spec.body,
+        function_scope,
+        normal_exit,
+        exceptional_exit,
+        cleanup_gap_exit_points: HashSet::default(),
         definitely_non_dropping: HashSet::default(),
         facts,
         ownership,
+        exported_macro_definitions,
+        structural_node_index,
         value_shapes: HashMap::default(),
-        field_locators: HashMap::default(),
         constant_index_values: HashMap::default(),
-        parameter_cleanup_required: rust_parameters_may_require_drop(spec.callable),
+        static_locations: HashMap::default(),
         receiver: None,
         next_cleanup_region: 0,
-        semantic_model_overlay,
+        binding_cleanup_regions: HashSet::default(),
+        cleanup_nodes: HashMap::default(),
+        binding_nodes: HashMap::default(),
+        binding_places: HashMap::default(),
+        cleanup_places_by_binding: HashMap::default(),
+        cleanup_owners_by_region: HashMap::default(),
+        binding_metadata: HashMap::default(),
+        binding_scopes: HashMap::default(),
+        cleanup_drop_incompletes: HashMap::default(),
+        parameter_values: Vec::new(),
+        move_outs: Vec::new(),
+        pointer_origins: Vec::new(),
+        pointer_aliases: Vec::new(),
+        pointer_accesses: Vec::new(),
+        pointer_invalidations: Vec::new(),
+        owner_lifetime_end_points: HashSet::default(),
+        incomplete_facts: Vec::new(),
+        pointer_origins_by_place: HashMap::default(),
+        pointer_origins_by_owner: HashMap::default(),
+        pointer_owner_lifetimes: HashMap::default(),
+        manually_drop_values: HashSet::default(),
+        pointer_origins_by_pointer: HashMap::default(),
+        pointer_pointees_by_value: HashMap::default(),
+        pointer_fact_targets_by_source: HashMap::default(),
     };
-    context.emit_procedure_inputs(&mut builder, spec.callable)?;
-    let body_scope = if context.parameter_cleanup_required {
+    context.emit_procedure_inputs(&mut builder, entry, spec.callable)?;
+    context.emit_capture_inputs(&mut builder, entry, spec)?;
+    let body_scope = if !context.parameter_values.is_empty() {
         context.next_cleanup_region = 1;
-        builder.push_scope(
-            Some(function_scope),
-            ScopeBinding::Cleanup {
-                region: CleanupRegionId::new(0),
-            },
-        )
+        let region = CleanupRegionId::new(0);
+        let parameter_scope =
+            builder.push_scope(Some(function_scope), ScopeBinding::Cleanup { region });
+        let parameter_source = context
+            .parameter_values
+            .first()
+            .and_then(|value| context.binding_nodes.get(value))
+            .copied()
+            .unwrap_or(spec.callable);
+        context.cleanup_nodes.insert(region, parameter_source);
+        let has_cleanup_actions = context.register_binding_cleanup_actions(
+            &mut builder,
+            parameter_scope,
+            region,
+            &context.parameter_values.clone(),
+            entry,
+        )?;
+        if has_cleanup_actions {
+            context.binding_cleanup_regions.insert(region);
+            parameter_scope
+        } else {
+            function_scope
+        }
     } else {
         function_scope
     };
     context.emit_local_bindings(&mut builder, spec.body)?;
 
-    if context.parameter_cleanup_required {
-        context.add_drop_omission_gaps(
-            &mut builder,
-            normal_exit,
-            "parameter values may require implicit Drop at normal procedure exit",
-        )?;
-        context.add_drop_omission_gaps(
-            &mut builder,
-            exceptional_exit,
-            "parameter values may require implicit Drop while unwinding from the procedure",
-        )?;
-    }
-
     if spec.properties.is_async {
-        context.add_gap(
+        context.session.record_gap(
             &mut builder,
             entry,
             SemanticGapSubject::Procedure,
@@ -759,7 +1132,7 @@ fn lower_procedure<'tree>(
         )?;
     }
     if spec.properties.is_generator {
-        context.add_gap(
+        context.session.record_gap(
             &mut builder,
             entry,
             SemanticGapSubject::Procedure,
@@ -804,7 +1177,7 @@ fn lower_procedure<'tree>(
             },
         )?;
         if !rust_expression_has_direct_value_evidence(return_source) {
-            context.add_gap(
+            context.session.record_gap(
                 &mut builder,
                 implicit_return,
                 SemanticGapSubject::Value(return_value),
@@ -820,11 +1193,22 @@ fn lower_procedure<'tree>(
                 value: Some(return_value),
             },
         )?;
-        context.edge(
-            &mut builder,
-            implicit_return,
-            EdgeTarget::normal(normal_exit),
-        )?;
+        if body_scope == function_scope {
+            context.session.add_target_edge(
+                &mut builder,
+                implicit_return,
+                EdgeTarget::normal(normal_exit),
+            )?;
+        } else if let Some(route) = builder.resolve_completion(
+            body_scope,
+            &CompletionRequest::new(CompletionKind::Return, None),
+        ) {
+            context.route(&mut builder, implicit_return, &route)?;
+        } else {
+            return Err(RustLoweringError::Invalid(
+                "normal Rust return has no function cleanup continuation".into(),
+            ));
+        }
         EdgeTarget::normal(implicit_return)
     } else {
         EdgeTarget::normal(normal_exit)
@@ -845,23 +1229,157 @@ fn lower_procedure<'tree>(
         }
     };
     let mut pending = vec![initial];
-    context.edge(&mut builder, entry, EdgeTarget::normal(body_entry))?;
+    context
+        .session
+        .add_target_edge(&mut builder, entry, EdgeTarget::normal(body_entry))?;
 
-    drive_and_finish_procedure(
+    let (mut parts, mut work) = drive_and_finish_procedure(
         builder,
         pending.drain(..).rev(),
         entry,
         normal_exit,
         exceptional_exit,
         cancellation,
-        |builder, work, stack| context.step(builder, work, stack),
-    )
+        |builder, work, stack| dispatch_procedure_work(&mut context, builder, work, stack),
+    )?;
+    for (owner, point) in &context.owner_lifetime_end_points {
+        let point = *point;
+        let place = context
+            .binding_places
+            .get(owner)
+            .expect("every cleanup owner has a tracked binding place");
+        let metadata = *context
+            .binding_metadata
+            .get(owner)
+            .expect("every cleanup owner has binding source evidence");
+        let scope_end_at = ScopeEndAt::Point(point);
+        if context.pointer_origins_by_place.contains_key(place)
+            && !context.cleanup_places_by_binding.contains_key(owner)
+            && !parts
+                .scope_ends
+                .iter()
+                .any(|scope_end| &scope_end.place == place && scope_end.at == scope_end_at)
+        {
+            parts.scope_ends.push(ScopeEndFact {
+                place: place.clone(),
+                at: scope_end_at,
+                source: metadata.source,
+                evidence: metadata.evidence,
+            });
+        }
+        let invalidation = context.owner_invalidation(*owner);
+        if !context.value_is_manually_drop(*owner)
+            && let Some((target, cause)) = invalidation
+        {
+            context.pointer_invalidations.push(PointerInvalidation {
+                point,
+                target,
+                cause,
+                strength: PointerRelationStrength::Must,
+                source: metadata.source,
+                evidence: metadata.evidence,
+            });
+        }
+    }
+    let partial_evidence_reason = "Rust semantic evidence is partial at a typed incomplete fact";
+    let mut partial_evidence_count = 0_usize;
+    let mut partial_evidence_by_source_reason = HashMap::default();
+    for fact in &mut context.incomplete_facts {
+        let key = (fact.source, fact.reason);
+        let evidence = *partial_evidence_by_source_reason
+            .entry(key)
+            .or_insert_with(|| {
+                let id = EvidenceId::try_from_index(parts.evidence_rows.len())
+                    .expect("Rust incomplete evidence IDs fit the validated dense-ID domain");
+                parts.evidence_rows.push(Evidence {
+                    id,
+                    proof: ProofStatus::Proven,
+                    completeness: EvidenceCompleteness::Partial(partial_evidence_reason.into()),
+                    sources: Box::new([fact.source]),
+                });
+                partial_evidence_count += 1;
+                id
+            });
+        fact.evidence = evidence;
+    }
+    let pointer_rows = context
+        .pointer_origins
+        .len()
+        .saturating_add(context.pointer_aliases.len())
+        .saturating_add(context.pointer_accesses.len())
+        .saturating_add(context.pointer_invalidations.len())
+        .saturating_add(context.incomplete_facts.len())
+        .saturating_add(context.move_outs.len());
+    parts.pointer_origins.extend(context.pointer_origins);
+    parts.pointer_aliases.extend(context.pointer_aliases);
+    parts.pointer_accesses.extend(context.pointer_accesses);
+    parts
+        .pointer_invalidations
+        .extend(context.pointer_invalidations);
+    parts.incomplete_facts.extend(context.incomplete_facts);
+    parts.move_outs.extend(context.move_outs);
+    work = work.conservative_add(SemanticWork {
+        evidence: partial_evidence_count,
+        owned_text_bytes: partial_evidence_count.saturating_mul(partial_evidence_reason.len()),
+        nested_entries: pointer_rows.saturating_add(partial_evidence_count),
+        ..SemanticWork::default()
+    });
+    Ok((parts, work))
 }
 
 impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
+    fn emit_capture_inputs(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        entry: ProgramPointId,
+        spec: &ProcedureSpec<'tree>,
+    ) -> Result<(), RustLoweringError> {
+        let Some(lexical_parent) = spec.lexical_parent else {
+            debug_assert!(spec.captures.is_empty());
+            return Ok(());
+        };
+        for (index, capture) in spec.captures.iter().enumerate() {
+            let metadata = self.value_mapping(builder, capture.reference)?;
+            let value = self.session.add_value_with_metadata(
+                builder,
+                metadata,
+                SemanticValueKind::Local,
+            )?;
+            let location = self.session.add_memory_location(
+                builder,
+                entry,
+                MemoryLocationKind::Capture {
+                    lexical_parent,
+                    binding: Some(value),
+                },
+            )?;
+            let expected = MemoryLocationId::try_from_index(index)
+                .map_err(|_| RustLoweringError::Invalid("too many Rust captures".into()))?;
+            if location != expected {
+                return Err(RustLoweringError::Invalid(format!(
+                    "Rust capture destination must be {expected}, allocated {location}"
+                )));
+            }
+            self.append_effect(
+                builder,
+                entry,
+                SemanticEffect::MemoryLoad {
+                    kind: MemoryAccessKind::Capture,
+                    location,
+                    result: value,
+                },
+            )?;
+            self.captured_bindings.insert(capture.name.clone(), value);
+            self.captured_binding_sources
+                .insert((capture.name.clone(), capture.declaration_start), value);
+        }
+        Ok(())
+    }
+
     fn emit_procedure_inputs(
         &mut self,
         builder: &mut ProcedureCfgBuilder,
+        entry: ProgramPointId,
         callable: Node<'tree>,
     ) -> Result<(), RustLoweringError> {
         let layout = formal_parameter_slots_for_owner(Language::Rust, callable, self.source)
@@ -880,6 +1398,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 )
                 .unwrap_or(callable);
             let metadata = self.value_mapping(builder, node)?;
+            let place = self.local_binding_place(builder, metadata.source);
             let parameter_name = slot.unique_name().map(Box::<str>::from);
             let passing_mode = slot.passing_mode;
             let value = if slot.receiver {
@@ -906,8 +1425,32 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                     .ok_or_else(|| RustLoweringError::Invalid("too many parameters".into()))?;
                 value
             };
+            if let std::collections::hash_map::Entry::Vacant(entry) =
+                self.binding_places.entry(value)
+            {
+                entry.insert(place);
+                self.binding_metadata.insert(value, metadata);
+                self.binding_nodes.insert(value, node);
+                self.parameter_values.push(value);
+                let body = callable.child_by_field_name("body").unwrap_or(callable);
+                self.binding_scopes.insert(
+                    value,
+                    (body.start_byte(), body.start_byte(), body.end_byte()),
+                );
+            }
             if rust_parameter_is_definitely_non_dropping(node) {
                 self.definitely_non_dropping.insert(value);
+            }
+            if node
+                .child_by_field_name("type")
+                .is_some_and(|type_node| type_node.kind() == "pointer_type")
+            {
+                self.add_incomplete_fact(
+                    entry,
+                    SemanticIncompleteSubject::Value(value),
+                    SemanticIncompleteReason::Pointer(PointerIncompleteReason::RawPointerType),
+                    metadata,
+                );
             }
             // The declared parameter type states the shape directly. A
             // receiver declares none, so it takes the shape of the type its
@@ -927,6 +1470,12 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                     RustValueType::Declared(declared_type)
                 };
                 self.value_types.insert(value, value_type);
+                if !slot.receiver
+                    && let Some(scalar_type) =
+                        rust_scalar_type_from_type(self.source, declared_type)
+                {
+                    self.scalar_types.insert(value, scalar_type);
+                }
             }
             let declared_shape =
                 declared_type.and_then(|ty| rust_declared_type_shape(self.source, ty));
@@ -941,6 +1490,724 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             self.parameters.insert("self".into(), receiver);
         }
         Ok(())
+    }
+
+    fn local_binding_place(
+        &self,
+        builder: &ProcedureCfgBuilder,
+        source: SourceMappingId,
+    ) -> SemanticPlace {
+        let locator = &builder.source_mapping(source).locator;
+        SemanticPlace::LocalBinding(SemanticLocator::new(
+            locator.mount(),
+            locator.path().clone(),
+            locator.language(),
+            locator.declaration().clone(),
+            SemanticRole::Value,
+            locator.anchor(),
+        ))
+    }
+
+    fn register_binding_cleanup_actions(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        scope: ScopeFrameId,
+        region: CleanupRegionId,
+        values: &[ValueId],
+        source_point: ProgramPointId,
+    ) -> Result<bool, RustLoweringError> {
+        enum FieldWork<'tree> {
+            Expand {
+                type_node: Node<'tree>,
+                place: SemanticPlace,
+                member_path: Vec<String>,
+            },
+            Register(ScopeCleanupAction),
+        }
+
+        let mut any_cleanup_actions = false;
+        for value in values.iter().rev().copied() {
+            let Some(place) = self.binding_places.get(&value).cloned() else {
+                continue;
+            };
+            let mut binding_has_drop = false;
+            let mut cleanup_places = vec![place.clone()];
+            let metadata = *self
+                .binding_metadata
+                .get(&value)
+                .expect("each owned binding has declaration source evidence");
+            self.cleanup_owners_by_region
+                .entry(region)
+                .or_default()
+                .push(value);
+            let (behavior, incomplete) = self.drop_behavior(value);
+            if let Some(incomplete) = incomplete {
+                self.cleanup_drop_incompletes
+                    .insert(place.clone(), incomplete);
+            }
+            if self.value_is_manually_drop(value) {
+                self.cleanup_drop_incompletes
+                    .insert(place.clone(), LifecycleIncompleteReason::ManuallyDrop);
+            }
+            if !matches!(&behavior, DropBehavior::Trivial) {
+                builder.register_scope_cleanup_action(
+                    scope,
+                    ScopeCleanupAction::Drop {
+                        place: place.clone(),
+                        behavior,
+                        source: metadata.source,
+                        evidence: metadata.evidence,
+                    },
+                )?;
+                binding_has_drop = true;
+            }
+            if let Some(RustValueType::Declared(type_node)) = self.value_types.get(&value).copied()
+                && !self.type_is_manually_drop(type_node)
+            {
+                let member_path =
+                    rust_nominal_type_path(type_node, self.source).unwrap_or_default();
+                let mut pending = vec![FieldWork::Expand {
+                    type_node,
+                    place: place.clone(),
+                    member_path,
+                }];
+                while let Some(work) = pending.pop() {
+                    match work {
+                        FieldWork::Expand {
+                            type_node,
+                            place,
+                            member_path,
+                        } => {
+                            if self.type_is_manually_drop(type_node) {
+                                self.cleanup_drop_incompletes
+                                    .insert(place, LifecycleIncompleteReason::ManuallyDrop);
+                                continue;
+                            }
+                            match self.ownership.drop_fields_for_type(type_node) {
+                                Ok(fields) => {
+                                    for (index, (name, field_type)) in
+                                        fields.into_iter().enumerate()
+                                    {
+                                        let (field_behavior, field_incomplete) =
+                                            self.drop_behavior_for_type(field_type);
+                                        if field_incomplete.is_none()
+                                            && matches!(&field_behavior, DropBehavior::Trivial)
+                                            && matches!(
+                                                field_type.kind(),
+                                                "primitive_type"
+                                                    | "reference_type"
+                                                    | "pointer_type"
+                                                    | "unit_type"
+                                            )
+                                        {
+                                            continue;
+                                        }
+                                        let source_node = name.unwrap_or(field_type);
+                                        let field_metadata =
+                                            self.value_mapping(builder, source_node)?;
+                                        let selector = name
+                                            .and_then(|name| node_text(self.source, name))
+                                            .map(str::to_owned)
+                                            .unwrap_or_else(|| index.to_string());
+                                        let mut path = member_path.clone();
+                                        path.push(selector);
+                                        let anchor = source_anchor(source_node, 0)
+                                            .map_err(RustLoweringError::Invalid)?;
+                                        let member_segment = DeclarationSegment::named(
+                                            DeclarationSegmentKind::Namespace,
+                                            format!("rust-field:{}", path.join("::")),
+                                            SourceAnchor::new(
+                                                SourceSpan::new(
+                                                    SourcePosition::new(0, 0, 0),
+                                                    SourcePosition::new(0, 0, 0),
+                                                )
+                                                .expect(
+                                                    "zero-width field identity anchor is valid",
+                                                ),
+                                                0,
+                                            ),
+                                            0,
+                                        )
+                                        .expect("a structured Rust field path is non-empty");
+                                        let member_declaration =
+                                            DeclarationLocator::new(vec![member_segment]).expect(
+                                                "a Rust field member has one identity segment",
+                                            );
+                                        let procedure = self.session.locator();
+                                        let member = SemanticLocator::new(
+                                            procedure.mount(),
+                                            WorkspaceRelativePath::new(
+                                                crate::analyzer::semantic::RUST_FIELD_MEMBER_PATH,
+                                            )
+                                            .expect("canonical Rust field member path is portable"),
+                                            procedure.language(),
+                                            member_declaration,
+                                            SemanticRole::MemoryLocation,
+                                            anchor,
+                                        );
+                                        let location = self.session.add_memory_location(
+                                            builder,
+                                            source_point,
+                                            MemoryLocationKind::Field {
+                                                base: value,
+                                                member,
+                                            },
+                                        )?;
+                                        let field_place = SemanticPlace::MemoryLocation(location);
+                                        cleanup_places.push(field_place.clone());
+                                        if let Some(reason) = field_incomplete {
+                                            self.cleanup_drop_incompletes
+                                                .insert(field_place.clone(), reason);
+                                        }
+                                        pending.push(FieldWork::Expand {
+                                            type_node: field_type,
+                                            place: field_place.clone(),
+                                            member_path: path,
+                                        });
+                                        pending.push(FieldWork::Register(
+                                            ScopeCleanupAction::Drop {
+                                                place: field_place,
+                                                behavior: field_behavior,
+                                                source: field_metadata.source,
+                                                evidence: field_metadata.evidence,
+                                            },
+                                        ));
+                                    }
+                                }
+                                Err(reason) => {
+                                    self.cleanup_drop_incompletes.insert(
+                                        place,
+                                        match reason {
+                                            RustOwnershipIncomplete::GenericObligation => {
+                                                LifecycleIncompleteReason::GenericDropObligation
+                                            }
+                                            RustOwnershipIncomplete::MissingType => {
+                                                LifecycleIncompleteReason::MissingType
+                                            }
+                                            _ => LifecycleIncompleteReason::UnsupportedCleanup,
+                                        },
+                                    );
+                                }
+                            }
+                        }
+                        FieldWork::Register(action) => {
+                            if let ScopeCleanupAction::Drop { behavior, .. } = &action {
+                                if matches!(behavior, DropBehavior::Trivial) {
+                                    continue;
+                                }
+                                binding_has_drop = true;
+                            }
+                            builder.register_scope_cleanup_action(scope, action)?;
+                        }
+                    }
+                }
+            }
+            if binding_has_drop {
+                builder.register_scope_cleanup_action(
+                    scope,
+                    ScopeCleanupAction::ScopeEnd {
+                        place: place.clone(),
+                        source: metadata.source,
+                        evidence: metadata.evidence,
+                    },
+                )?;
+                self.cleanup_places_by_binding.insert(value, cleanup_places);
+                any_cleanup_actions = true;
+            }
+        }
+        Ok(any_cleanup_actions)
+    }
+
+    fn drop_behavior(&self, value: ValueId) -> (DropBehavior, Option<LifecycleIncompleteReason>) {
+        if self.value_is_manually_drop(value) {
+            return (DropBehavior::Trivial, None);
+        }
+        if matches!(
+            self.value_types.get(&value),
+            Some(RustValueType::Borrowed { .. })
+        ) {
+            return (DropBehavior::Trivial, None);
+        }
+        if self.definitely_non_dropping.contains(&value) {
+            return (DropBehavior::Trivial, None);
+        }
+        let Some(RustValueType::Declared(type_node)) = self.value_types.get(&value).copied() else {
+            return (
+                DropBehavior::Destructor(CallableTargetResolution::Unknown),
+                Some(LifecycleIncompleteReason::MissingType),
+            );
+        };
+        self.drop_behavior_for_type(type_node)
+    }
+
+    fn drop_behavior_for_type(
+        &self,
+        type_node: Node<'tree>,
+    ) -> (DropBehavior, Option<LifecycleIncompleteReason>) {
+        if self.type_is_manually_drop(type_node) {
+            return (DropBehavior::Trivial, None);
+        }
+        if matches!(
+            type_node.kind(),
+            "primitive_type" | "reference_type" | "pointer_type" | "unit_type"
+        ) {
+            return (DropBehavior::Trivial, None);
+        }
+        match self.ownership.drop_impl_method_for_type(type_node) {
+            Ok(Some(method)) => {
+                if let Some(target) = self.procedure_targets.get(&method.id()) {
+                    (
+                        DropBehavior::Destructor(CallableTargetResolution::Proven(
+                            CallableTarget::Local(target.id),
+                        )),
+                        None,
+                    )
+                } else {
+                    (
+                        DropBehavior::Destructor(CallableTargetResolution::Unknown),
+                        Some(LifecycleIncompleteReason::UnresolvedTraitDispatch),
+                    )
+                }
+            }
+            Ok(None) => match self.ownership.classify_type(type_node) {
+                RustOwnershipClass::ScalarCopy | RustOwnershipClass::AggregateCopy => {
+                    (DropBehavior::Trivial, None)
+                }
+                RustOwnershipClass::Incomplete(RustOwnershipIncomplete::GenericObligation) => (
+                    DropBehavior::Destructor(CallableTargetResolution::Unknown),
+                    Some(LifecycleIncompleteReason::GenericDropObligation),
+                ),
+                RustOwnershipClass::Incomplete(RustOwnershipIncomplete::MissingType) => (
+                    DropBehavior::Destructor(CallableTargetResolution::Unknown),
+                    Some(LifecycleIncompleteReason::MissingType),
+                ),
+                RustOwnershipClass::Incomplete(_) => (
+                    DropBehavior::Destructor(CallableTargetResolution::Unknown),
+                    Some(LifecycleIncompleteReason::UnresolvedTraitDispatch),
+                ),
+                _ => match self.ownership.drop_fields_for_type(type_node) {
+                    Ok(_) => (DropBehavior::Trivial, None),
+                    Err(RustOwnershipIncomplete::GenericObligation) => (
+                        DropBehavior::Destructor(CallableTargetResolution::Unknown),
+                        Some(LifecycleIncompleteReason::GenericDropObligation),
+                    ),
+                    Err(RustOwnershipIncomplete::MissingType) => (
+                        DropBehavior::Destructor(CallableTargetResolution::Unknown),
+                        Some(LifecycleIncompleteReason::MissingType),
+                    ),
+                    Err(_) => (
+                        DropBehavior::Destructor(CallableTargetResolution::Unknown),
+                        Some(LifecycleIncompleteReason::UnsupportedCleanup),
+                    ),
+                },
+            },
+            Err(RustOwnershipIncomplete::GenericObligation) => (
+                DropBehavior::Destructor(CallableTargetResolution::Unknown),
+                Some(LifecycleIncompleteReason::GenericDropObligation),
+            ),
+            Err(RustOwnershipIncomplete::MissingType) => (
+                DropBehavior::Destructor(CallableTargetResolution::Unknown),
+                Some(LifecycleIncompleteReason::MissingType),
+            ),
+            Err(_) => (
+                DropBehavior::Destructor(CallableTargetResolution::Unknown),
+                Some(LifecycleIncompleteReason::UnresolvedTraitDispatch),
+            ),
+        }
+    }
+
+    fn type_is_manually_drop(&self, type_node: Node<'tree>) -> bool {
+        let Some(path) = rust_type_path_node(type_node) else {
+            return false;
+        };
+        self.ownership
+            .resolves_standard_path(path, &["core", "mem", "ManuallyDrop"])
+            || self
+                .ownership
+                .resolves_standard_path(path, &["std", "mem", "ManuallyDrop"])
+    }
+
+    fn value_is_manually_drop(&self, value: ValueId) -> bool {
+        self.manually_drop_values.contains(&value)
+            || self.value_types.get(&value).is_some_and(|ty| {
+                matches!(ty, RustValueType::Declared(type_node) if self.type_is_manually_drop(*type_node))
+            })
+    }
+
+    fn add_stack_pointer_origin(
+        &mut self,
+        place: SemanticPlace,
+        byte_extent: Option<u128>,
+        point: ProgramPointId,
+        metadata: PointMetadata,
+    ) -> PointerOriginId {
+        if let Some(id) = self.pointer_origins_by_place.get(&place).copied() {
+            return id;
+        }
+        let id = PointerOriginId::try_from_index(self.pointer_origins.len())
+            .expect("Rust pointer origin IDs fit the validated dense-ID domain");
+        self.pointer_origins.push(PointerOrigin {
+            id,
+            point,
+            kind: PointerOriginKind::StackPlace {
+                place: place.clone(),
+            },
+            byte_extent,
+            source: metadata.source,
+            evidence: metadata.evidence,
+        });
+        self.pointer_origins_by_place.insert(place, id);
+        id
+    }
+
+    fn add_allocation_pointer_origin(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        pointer: ValueId,
+        byte_extent: Option<u128>,
+        allocation_kind: AllocationKind,
+        point: ProgramPointId,
+        metadata: PointMetadata,
+    ) -> Result<PointerOriginId, RustLoweringError> {
+        let allocation = self
+            .session
+            .add_allocation(builder, point, pointer, allocation_kind)?;
+        let id = PointerOriginId::try_from_index(self.pointer_origins.len())
+            .expect("Rust pointer origin IDs fit the validated dense-ID domain");
+        self.pointer_origins.push(PointerOrigin {
+            id,
+            point,
+            kind: PointerOriginKind::Allocation { allocation },
+            byte_extent,
+            source: metadata.source,
+            evidence: metadata.evidence,
+        });
+        Ok(id)
+    }
+
+    fn add_pointer_alias(
+        &mut self,
+        point: ProgramPointId,
+        pointer: ValueId,
+        origin: PointerOriginId,
+        byte_offset: PointerByteOffset,
+        strength: PointerRelationStrength,
+        metadata: PointMetadata,
+    ) {
+        let aliases = self.pointer_origins_by_pointer.entry(pointer).or_default();
+        if aliases.contains(&(origin, byte_offset)) {
+            return;
+        }
+        aliases.push((origin, byte_offset));
+        self.pointer_aliases.push(PointerAlias {
+            point,
+            pointer,
+            origin,
+            byte_offset,
+            strength,
+            source: metadata.source,
+            evidence: metadata.evidence,
+        });
+    }
+
+    fn register_pointer_fact_target(
+        &mut self,
+        source: ValueId,
+        target: ValueId,
+        point: ProgramPointId,
+        metadata: PointMetadata,
+    ) {
+        if source == target {
+            return;
+        }
+        let targets = self
+            .pointer_fact_targets_by_source
+            .entry(source)
+            .or_default();
+        let transfer = PendingPointerFactTransfer {
+            target,
+            point,
+            metadata,
+        };
+        if !targets.contains(&transfer) {
+            targets.push(transfer);
+        }
+    }
+
+    fn propagate_pointer_facts_to_targets(&mut self, source: ValueId) {
+        #[derive(Clone, Copy, PartialEq, Eq, Hash)]
+        enum Fact {
+            Alias(PointerOriginId, PointerByteOffset),
+            OwnerOrigin(PointerOriginId),
+            OwnerLifetime(PointerInvalidationTarget, PointerInvalidationCause),
+            PointeeByte,
+            PointeeType(usize),
+            ManuallyDrop,
+        }
+
+        if !self.pointer_fact_targets_by_source.contains_key(&source) {
+            return;
+        }
+        let mut pending = Vec::new();
+        let mut enqueued = HashSet::default();
+        {
+            let mut enqueue = |value, fact| {
+                if enqueued.insert((value, fact)) {
+                    pending.push((value, fact));
+                }
+            };
+            for (origin, offset) in self
+                .pointer_origins_by_pointer
+                .get(&source)
+                .into_iter()
+                .flatten()
+                .copied()
+            {
+                enqueue(source, Fact::Alias(origin, offset));
+            }
+            if let Some(origin) = self.pointer_origins_by_owner.get(&source).copied() {
+                enqueue(source, Fact::OwnerOrigin(origin));
+            }
+            if let Some((target, cause)) = self.pointer_owner_lifetimes.get(&source).copied() {
+                enqueue(source, Fact::OwnerLifetime(target, cause));
+            }
+            if let Some(pointee) = self.pointer_pointees_by_value.get(&source).copied() {
+                enqueue(
+                    source,
+                    match pointee {
+                        RustPointerPointee::Byte => Fact::PointeeByte,
+                        RustPointerPointee::Type(node) => Fact::PointeeType(node.id()),
+                    },
+                );
+            }
+            if self.manually_drop_values.contains(&source) {
+                enqueue(source, Fact::ManuallyDrop);
+            }
+        }
+
+        while let Some((value, fact)) = pending.pop() {
+            let targets = self
+                .pointer_fact_targets_by_source
+                .get(&value)
+                .cloned()
+                .unwrap_or_default();
+            for transfer in targets {
+                match fact {
+                    Fact::Alias(origin, offset) => self.add_pointer_alias(
+                        transfer.point,
+                        transfer.target,
+                        origin,
+                        offset,
+                        PointerRelationStrength::Must,
+                        transfer.metadata,
+                    ),
+                    Fact::OwnerOrigin(origin) => {
+                        self.pointer_origins_by_owner
+                            .insert(transfer.target, origin);
+                    }
+                    Fact::OwnerLifetime(target, cause) => {
+                        self.pointer_owner_lifetimes
+                            .insert(transfer.target, (target, cause));
+                    }
+                    Fact::PointeeByte => {
+                        self.pointer_pointees_by_value
+                            .insert(transfer.target, RustPointerPointee::Byte);
+                    }
+                    Fact::PointeeType(node_id) => {
+                        let Some(RustPointerPointee::Type(node)) =
+                            self.pointer_pointees_by_value.get(&value).copied()
+                        else {
+                            unreachable!("a typed-pointee transfer retains its source type");
+                        };
+                        assert_eq!(node.id(), node_id);
+                        self.pointer_pointees_by_value
+                            .insert(transfer.target, RustPointerPointee::Type(node));
+                    }
+                    Fact::ManuallyDrop => {
+                        self.manually_drop_values.insert(transfer.target);
+                    }
+                }
+                if enqueued.insert((transfer.target, fact)) {
+                    pending.push((transfer.target, fact));
+                }
+            }
+        }
+    }
+
+    fn add_pointer_access(
+        &mut self,
+        point: ProgramPointId,
+        pointer: ValueId,
+        kind: PointerAccessKind,
+        width: PointerAccessWidth,
+        metadata: PointMetadata,
+    ) {
+        self.pointer_accesses.push(PointerAccess {
+            point,
+            pointer,
+            kind,
+            width,
+            source: metadata.source,
+            evidence: metadata.evidence,
+        });
+    }
+
+    fn add_pointer_invalidation(
+        &mut self,
+        point: ProgramPointId,
+        target: PointerInvalidationTarget,
+        cause: PointerInvalidationCause,
+        strength: PointerRelationStrength,
+        metadata: PointMetadata,
+    ) {
+        self.pointer_invalidations.push(PointerInvalidation {
+            point,
+            target,
+            cause,
+            strength,
+            source: metadata.source,
+            evidence: metadata.evidence,
+        });
+    }
+
+    fn owner_invalidation(
+        &self,
+        owner: ValueId,
+    ) -> Option<(PointerInvalidationTarget, PointerInvalidationCause)> {
+        self.pointer_owner_lifetimes
+            .get(&owner)
+            .copied()
+            .or_else(|| {
+                self.pointer_origins_by_owner
+                    .get(&owner)
+                    .copied()
+                    .map(|origin| {
+                        (
+                            PointerInvalidationTarget::Origin(origin),
+                            PointerInvalidationCause::OwnerDropped,
+                        )
+                    })
+            })
+    }
+
+    fn transfer_pointer_owner_facts(&mut self, source: ValueId, target: ValueId) {
+        if let Some(origin) = self.pointer_origins_by_owner.remove(&source) {
+            self.pointer_origins_by_owner.insert(target, origin);
+        }
+        if let Some(invalidation) = self.pointer_owner_lifetimes.remove(&source) {
+            self.pointer_owner_lifetimes.insert(target, invalidation);
+        }
+        if self.manually_drop_values.remove(&source) {
+            self.manually_drop_values.insert(target);
+        }
+    }
+
+    fn add_incomplete_fact(
+        &mut self,
+        point: ProgramPointId,
+        subject: SemanticIncompleteSubject,
+        reason: SemanticIncompleteReason,
+        metadata: PointMetadata,
+    ) {
+        self.incomplete_facts.push(SemanticIncompleteFact {
+            point,
+            subject,
+            reason,
+            source: metadata.source,
+            evidence: metadata.evidence,
+        });
+    }
+
+    fn pointer_pointee(&self, node: Node<'tree>) -> Option<RustPointerPointee<'tree>> {
+        let node = unwrap_attributes(node);
+        if let Some(value) = self.expression_values.get(&node.id()).copied()
+            && let Some(pointee) = self.pointer_pointees_by_value.get(&value)
+        {
+            return Some(*pointee);
+        }
+        if let Some(value) = self.binding_value(node)
+            && let Some(pointee) = self.pointer_pointees_by_value.get(&value)
+        {
+            return Some(*pointee);
+        }
+        if let Some(RustValueType::Declared(type_node)) = self.expression_type(node)
+            && type_node.kind() == "pointer_type"
+        {
+            return type_node
+                .child_by_field_name("type")
+                .map(RustPointerPointee::Type);
+        }
+        if node.kind() != "call_expression" {
+            return None;
+        }
+        let function = call_function_target(node.child_by_field_name("function")?);
+        if self
+            .ownership
+            .resolves_standard_path(function, &["core", "alloc", "alloc"])
+            || self
+                .ownership
+                .resolves_standard_path(function, &["std", "alloc", "alloc"])
+            || self
+                .ownership
+                .resolves_standard_path(function, &["alloc", "alloc", "alloc"])
+        {
+            return Some(RustPointerPointee::Byte);
+        }
+        if self
+            .ownership
+            .resolves_standard_path(function, &["std", "boxed", "Box", "into_raw"])
+            || self
+                .ownership
+                .resolves_standard_path(function, &["alloc", "boxed", "Box", "into_raw"])
+        {
+            let argument = call_arguments(node).first().copied()?;
+            let RustValueType::Declared(owner_type) = self.expression_type(argument)? else {
+                return None;
+            };
+            return rust_generic_type_argument(owner_type, 0).map(RustPointerPointee::Type);
+        }
+        let receiver = rust_call_receiver(function)?;
+        let method = function
+            .child_by_field_name("field")
+            .and_then(|field| node_text(self.source, field))?;
+        if !matches!(method, "as_ptr" | "as_mut_ptr") {
+            return None;
+        }
+        let receiver_type = match self.expression_type(receiver)? {
+            RustValueType::Declared(type_node) => type_node,
+            RustValueType::Borrowed { referent, .. } => referent,
+        };
+        let receiver_path = rust_type_path_node(receiver_type)?;
+        if !self
+            .ownership
+            .resolves_standard_path(receiver_path, &["std", "vec", "Vec"])
+            && !self
+                .ownership
+                .resolves_standard_path(receiver_path, &["alloc", "vec", "Vec"])
+        {
+            return None;
+        }
+        rust_generic_type_argument(receiver_type, 0).map(RustPointerPointee::Type)
+    }
+
+    fn pointer_pointee_type(&self, node: Node<'tree>) -> Option<Node<'tree>> {
+        match self.pointer_pointee(node)? {
+            RustPointerPointee::Type(type_node) => Some(type_node),
+            RustPointerPointee::Byte => None,
+        }
+    }
+
+    fn is_raw_pointer_expression(&self, node: Node<'tree>) -> bool {
+        self.pointer_pointee(node).is_some()
+    }
+
+    fn pointer_width_for_expression(&self, node: Node<'tree>) -> PointerAccessWidth {
+        self.pointer_pointee(node)
+            .and_then(|pointee| match pointee {
+                RustPointerPointee::Type(type_node) => rust_type_byte_size(self.source, type_node),
+                RustPointerPointee::Byte => Some(1),
+            })
+            .map_or(PointerAccessWidth::Unknown, PointerAccessWidth::Exact)
     }
 
     fn emit_local_bindings(
@@ -959,65 +2226,88 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             }
             if node.kind() == "let_declaration"
                 && let Some(pattern) = node.child_by_field_name("pattern")
-                && let Some(name) = identity_binding_identifier(pattern)
-                && let Some(text) = node_text(self.source, name)
                 && let Some((scope_start, scope_end)) = rust_local_scope(node)
             {
-                let metadata = self.value_mapping(builder, name)?;
-                let value = self.session.add_value_with_metadata(
-                    builder,
-                    metadata,
-                    SemanticValueKind::Local,
-                )?;
-                self.locals
-                    .entry(text.into())
-                    .or_default()
-                    .push(LocalBinding {
-                        declaration_start: name.start_byte(),
-                        visible_from: node.end_byte(),
-                        scope_start,
-                        scope_end,
-                        value,
-                    });
-                // The declared type states the shape when there is one;
-                // otherwise the initializer does. The walk is preorder, so a
-                // local this initializer names was already classified, which
-                // is what lets `let alias = &original;` take `original`'s own
-                // struct shape.
-                let declared_type = node
-                    .child_by_field_name("type")
-                    .map(RustValueType::Declared)
-                    .or_else(|| {
-                        node.child_by_field_name("value")
-                            .and_then(|initializer| self.expression_type(initializer))
-                    });
-                if let Some(declared_type) = declared_type {
-                    self.value_types.insert(value, declared_type);
-                }
-                if let Some(shape) = node
-                    .child_by_field_name("type")
-                    .and_then(|ty| rust_declared_type_shape(self.source, ty))
-                    .or_else(|| {
-                        node.child_by_field_name("value")
-                            .and_then(|initializer| self.expression_shape(initializer))
-                    })
-                {
-                    self.value_shapes.insert(value, shape);
-                }
-                // An explicit primitive annotation decides the question on its
-                // own; otherwise the initializer has to prove it. The walk is
-                // preorder, so a local this initializer names was already
-                // classified.
-                if node
-                    .child_by_field_name("type")
-                    .is_some_and(|ty| ty.kind() == "primitive_type")
-                    || node
-                        .child_by_field_name("value")
-                        .is_some_and(|initializer| {
-                            self.expression_is_definitely_non_dropping(initializer)
-                        })
-                {
-                    self.definitely_non_dropping.insert(value);
+                let simple_binding = identity_binding_identifier(pattern).map(|name| name.id());
+                for name in rust_pattern_binding_identifiers(pattern) {
+                    let Some(text) = node_text(self.source, name) else {
+                        continue;
+                    };
+                    let metadata = self.value_mapping(builder, name)?;
+                    let place = self.local_binding_place(builder, metadata.source);
+                    let value = self.session.add_value_with_metadata(
+                        builder,
+                        metadata,
+                        SemanticValueKind::Local,
+                    )?;
+                    self.binding_places.insert(value, place);
+                    self.binding_metadata.insert(value, metadata);
+                    self.binding_nodes.insert(value, name);
+                    self.binding_scopes
+                        .insert(value, (node.end_byte(), scope_start, scope_end));
+                    self.locals
+                        .entry(text.into())
+                        .or_default()
+                        .push(LocalBinding {
+                            declaration_start: name.start_byte(),
+                            visible_from: node.end_byte(),
+                            scope_start,
+                            scope_end,
+                            value,
+                            initializer: node.child_by_field_name("value"),
+                        });
+                    if simple_binding == Some(name.id()) {
+                        // The declared type states the shape when there is one;
+                        // otherwise the initializer does. The walk is preorder, so a
+                        // local this initializer names was already classified, which is
+                        // what lets `let alias = &original;` take `original`'s own
+                        // struct shape. A destructuring pattern does not give each
+                        // binding the whole initializer's type or shape.
+                        let declared_type = node
+                            .child_by_field_name("type")
+                            .map(RustValueType::Declared)
+                            .or_else(|| {
+                                node.child_by_field_name("value")
+                                    .and_then(|initializer| self.expression_type(initializer))
+                            });
+                        if let Some(declared_type) = declared_type {
+                            self.value_types.insert(value, declared_type);
+                        }
+                        if let Some(scalar_type) = node
+                            .child_by_field_name("type")
+                            .and_then(|type_node| {
+                                rust_scalar_type_from_type(self.source, type_node)
+                            })
+                            .or_else(|| {
+                                node.child_by_field_name("value").and_then(|initializer| {
+                                    rust_scalar_type_from_literal(self.source, initializer)
+                                })
+                            })
+                        {
+                            self.scalar_types.insert(value, scalar_type);
+                        }
+                        if let Some(shape) = node
+                            .child_by_field_name("type")
+                            .and_then(|ty| rust_declared_type_shape(self.source, ty))
+                            .or_else(|| {
+                                node.child_by_field_name("value")
+                                    .and_then(|initializer| self.expression_shape(initializer))
+                            })
+                        {
+                            self.value_shapes.insert(value, shape);
+                        }
+                        if node
+                            .child_by_field_name("type")
+                            .is_some_and(|ty| ty.kind() == "primitive_type")
+                            || node
+                                .child_by_field_name("value")
+                                .is_some_and(|initializer| {
+                                    self.expression_is_definitely_non_dropping(initializer)
+                                })
+                        {
+                            self.definitely_non_dropping.insert(value);
+                        }
+                    }
                 }
             }
             // A `for` pattern binds a local too. Without it the loop variable
@@ -1041,11 +2331,19 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                         continue;
                     };
                     let metadata = self.value_mapping(builder, name)?;
+                    let place = self.local_binding_place(builder, metadata.source);
                     let value = self.session.add_value_with_metadata(
                         builder,
                         metadata,
                         SemanticValueKind::Local,
                     )?;
+                    self.binding_places.insert(value, place);
+                    self.binding_metadata.insert(value, metadata);
+                    self.binding_nodes.insert(value, name);
+                    self.binding_scopes.insert(
+                        value,
+                        (body.start_byte(), body.start_byte(), body.end_byte()),
+                    );
                     self.locals
                         .entry(text.into())
                         .or_default()
@@ -1055,6 +2353,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                             scope_start: body.start_byte(),
                             scope_end: body.end_byte(),
                             value,
+                            initializer: None,
                         });
                     if element_is_non_dropping {
                         self.definitely_non_dropping.insert(value);
@@ -1066,40 +2365,210 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
     }
 
     fn local_at(&self, name: &str, byte: usize) -> Option<ValueId> {
-        self.locals
-            .get(name)?
-            .iter()
-            .filter(|binding| {
-                binding.visible_from <= byte
-                    && binding.scope_start <= byte
-                    && byte < binding.scope_end
-            })
-            .min_by_key(|binding| {
-                (
-                    binding.scope_end - binding.scope_start,
-                    std::cmp::Reverse(binding.declaration_start),
-                )
-            })
+        self.local_binding_at(name, byte)
             .map(|binding| binding.value)
     }
 
+    fn local_binding_at(&self, name: &str, byte: usize) -> Option<&LocalBinding<'tree>> {
+        crate::analyzer::common::visible_local_binding(
+            self.locals.get(name)?,
+            byte,
+            |binding| (binding.visible_from, binding.scope_start, binding.scope_end),
+            |binding, (_, scope_start, scope_end)| {
+                (
+                    scope_end - scope_start,
+                    std::cmp::Reverse(binding.declaration_start),
+                )
+            },
+        )
+    }
+
     fn local_declaration_value(&self, name: &str, declaration_start: usize) -> Option<ValueId> {
-        self.locals
-            .get(name)?
-            .iter()
-            .find(|binding| binding.declaration_start == declaration_start)
-            .map(|binding| binding.value)
+        crate::analyzer::common::local_value_for_declaration(
+            self.locals
+                .get(name)?
+                .iter()
+                .map(|binding| (binding.declaration_start, binding.value)),
+            declaration_start,
+        )
+    }
+
+    fn capture_source_value(&self, capture: &RustCaptureSpec<'_>) -> Option<ValueId> {
+        self.local_declaration_value(&capture.name, capture.declaration_start)
+            .or_else(|| {
+                (capture.name.as_ref() == "self")
+                    .then_some(self.receiver)
+                    .flatten()
+            })
+            .or_else(|| self.parameters.get(&capture.name).copied())
+            .or_else(|| {
+                self.captured_binding_sources
+                    .get(&(capture.name.clone(), capture.declaration_start))
+                    .copied()
+            })
     }
 
     fn binding_value(&self, node: Node<'_>) -> Option<ValueId> {
         let node = unwrap_attributes(node);
         let name = node_text(self.source, node)?;
+        let name = name.strip_prefix("r#").unwrap_or(name);
         match node.kind() {
-            "self" => self.receiver,
+            "self" => self
+                .receiver
+                .or_else(|| self.captured_bindings.get(name).copied()),
             "identifier" => self
                 .local_at(name, node.start_byte())
-                .or_else(|| self.parameters.get(name).copied()),
+                .or_else(|| self.parameters.get(name).copied())
+                .or_else(|| self.captured_bindings.get(name).copied()),
             _ => None,
+        }
+    }
+
+    fn static_declaration_at(
+        &self,
+        node: Node<'tree>,
+        name: &str,
+    ) -> Option<&RustStaticDeclaration<'tree>> {
+        let mut best = None;
+        let mut best_scope_width = usize::MAX;
+        let mut ambiguous = false;
+        for declaration in &self.facts.static_declarations {
+            let scope = declaration.scope.byte_range();
+            if declaration.name.as_ref() != name
+                || scope.start > node.start_byte()
+                || node.end_byte() > scope.end
+            {
+                continue;
+            }
+            let width = scope.end - scope.start;
+            if width < best_scope_width {
+                best = Some(declaration);
+                best_scope_width = width;
+                ambiguous = false;
+            } else if width == best_scope_width {
+                ambiguous = true;
+            }
+        }
+        (!ambiguous).then_some(best).flatten()
+    }
+
+    fn static_location(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        point: ProgramPointId,
+        node: Node<'tree>,
+        name: &str,
+    ) -> Result<Option<MemoryLocationId>, RustLoweringError> {
+        let Some(declaration) = self.static_declaration_at(node, name) else {
+            return Ok(None);
+        };
+        let declaration_start = declaration.name_node.start_byte();
+        if let Some(location) = self.static_locations.get(&declaration_start).copied() {
+            return Ok(Some(location));
+        }
+        let anchor = source_anchor(declaration.name_node, 0).map_err(RustLoweringError::Invalid)?;
+        let member = DeclarationSegment::named(
+            DeclarationSegmentKind::Namespace,
+            format!("rust-static:{name}"),
+            anchor,
+            0,
+        )
+        .expect("a Rust static identifier is non-empty");
+        let declaration_path = DeclarationLocator::new(vec![member])
+            .expect("a Rust static locator has its declaration segment");
+        let procedure = self.session.locator();
+        let member = SemanticLocator::new(
+            procedure.mount(),
+            procedure.path().clone(),
+            procedure.language(),
+            declaration_path,
+            SemanticRole::MemoryLocation,
+            anchor,
+        );
+        let location = self.session.add_memory_location(
+            builder,
+            point,
+            MemoryLocationKind::Static { member },
+        )?;
+        self.static_locations.insert(declaration_start, location);
+        Ok(Some(location))
+    }
+
+    fn scalar_binding_operand(&self, node: Node<'tree>) -> Option<(ValueId, DeclaredScalarType)> {
+        let node = peel_rust_parentheses(node);
+        if !matches!(node.kind(), "identifier" | "self") {
+            return None;
+        }
+        let value = self.binding_value(node)?;
+        let scalar_type = self.scalar_types.get(&value).copied()?;
+        Some((value, scalar_type))
+    }
+
+    fn scalar_literal_operand(&self, node: Node<'tree>) -> Option<DeclaredScalarType> {
+        rust_scalar_type_from_literal(self.source, peel_rust_parentheses(node))
+    }
+
+    fn scalar_constant_operand(
+        &self,
+        node: Node<'tree>,
+    ) -> Option<(DeclaredScalarType, Option<u128>)> {
+        let node = peel_rust_parentheses(node);
+        if let Some(scalar_type) = self.scalar_literal_operand(node) {
+            return Some((scalar_type, None));
+        }
+        self.rust_integer_constant_value(node)
+            .map(|value| (DeclaredScalarType::Unsigned(128), Some(value)))
+    }
+
+    fn scalar_operator_is_builtin(&self, node: Node<'tree>) -> bool {
+        let node = unwrap_attributes(node);
+        if node.kind() == "unary_expression" {
+            return node.child(0).is_some_and(|operator| operator.kind() == "!")
+                && node
+                    .named_child(0)
+                    .and_then(|operand| self.scalar_binding_operand(operand))
+                    .is_some_and(|(_, scalar_type)| scalar_type == DeclaredScalarType::Boolean);
+        }
+        if node.kind() != "binary_expression" {
+            return false;
+        }
+        let Some(operator) = node.child_by_field_name("operator") else {
+            return false;
+        };
+        if !matches!(operator.kind(), "<" | "<=" | ">" | ">=" | "==" | "!=") {
+            return false;
+        }
+        let (Some(left), Some(right)) = (
+            node.child_by_field_name("left"),
+            node.child_by_field_name("right"),
+        ) else {
+            return false;
+        };
+        let left_binding = self.scalar_binding_operand(left);
+        let right_binding = self.scalar_binding_operand(right);
+        let left_literal = self.scalar_constant_operand(left);
+        let right_literal = self.scalar_constant_operand(right);
+        let integer = |scalar_type| {
+            matches!(
+                scalar_type,
+                DeclaredScalarType::Signed(_) | DeclaredScalarType::Unsigned(_)
+            )
+        };
+        match (left_binding, right_binding, left_literal, right_literal) {
+            (Some((_, left_type)), Some((_, right_type)), None, None) => {
+                ((integer(left_type) && integer(right_type))
+                    || (left_type == DeclaredScalarType::Boolean
+                        && right_type == DeclaredScalarType::Boolean))
+                    && (integer(left_type) || matches!(operator.kind(), "==" | "!="))
+            }
+            (Some((_, binding_type)), None, None, Some((literal_type, _)))
+            | (None, Some((_, binding_type)), Some((literal_type, _)), None) => {
+                (integer(binding_type) && integer(literal_type))
+                    || (matches!(operator.kind(), "==" | "!=")
+                        && binding_type == DeclaredScalarType::Boolean
+                        && literal_type == DeclaredScalarType::Boolean)
+            }
+            _ => false,
         }
     }
 
@@ -1111,6 +2580,15 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
     /// indirect/ambiguous calls, projections, and inferred literal defaults
     /// need resolver/type-checker facts this intrafile producer does not own.
     fn expression_type(&self, node: Node<'tree>) -> Option<RustValueType<'tree>> {
+        let node = unwrap_attributes(node);
+        if let Some(ty) = self
+            .expression_values
+            .get(&node.id())
+            .and_then(|value| self.value_types.get(value))
+            .copied()
+        {
+            return Some(ty);
+        }
         let mut current = node;
         let mut operations = Vec::new();
         let mut ty = loop {
@@ -1144,7 +2622,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 }
                 "call_expression" => {
                     let function = current.child_by_field_name("function")?;
-                    let function = unwrap_generic_function(function);
+                    let function = call_function_target(function);
                     if function.kind() != "identifier" || self.binding_value(function).is_some() {
                         return None;
                     }
@@ -1172,6 +2650,17 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             };
         }
         Some(ty)
+    }
+
+    fn is_standard_allocator_function(&self, function: Node<'tree>) -> bool {
+        self.ownership
+            .resolves_standard_path(function, &["core", "alloc", "alloc"])
+            || self
+                .ownership
+                .resolves_standard_path(function, &["std", "alloc", "alloc"])
+            || self
+                .ownership
+                .resolves_standard_path(function, &["alloc", "alloc", "alloc"])
     }
 
     fn dereferenced_type(&self, ty: RustValueType<'tree>) -> Option<RustValueType<'tree>> {
@@ -1392,18 +2881,73 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         target: ValueId,
         target_type: Option<RustValueType<'tree>>,
     ) -> Result<(), RustLoweringError> {
-        let classification = self.compatible_transfer_ownership(source_node, target_type);
+        let metadata = self.metadata(point)?;
+        self.register_pointer_fact_target(expression_source, target, point, metadata);
+        if let Some(leaf) = rust_transparent_value_leaf(source_node) {
+            let leaf_value = self.expression_value(builder, leaf, expression_value_kind(leaf))?;
+            self.register_pointer_fact_target(leaf_value, target, point, metadata);
+        }
+        let source_binding = self.transfer_source_value(source_node);
+        let tracked_owner = source_binding.is_some_and(|source| {
+            self.pointer_origins_by_owner.contains_key(&source)
+                || self.pointer_owner_lifetimes.contains_key(&source)
+                || self.manually_drop_values.contains(&source)
+        });
+        let classification = if tracked_owner {
+            RustOwnershipClass::Move
+        } else {
+            self.compatible_transfer_ownership(source_node, target_type)
+        };
+        let is_move = classification == RustOwnershipClass::Move;
         // Only an exact move consumes the binding itself. Copy and alias
         // relations keep the expression occurrence as their source, matching
         // the adapter's existing evaluation flow while giving a move kill the
         // binding identity that later-use reasoning observes.
         let source = if classification == RustOwnershipClass::Move {
-            self.transfer_source_value(source_node)
+            source_binding
                 .filter(|source| *source != target)
                 .unwrap_or(expression_source)
         } else {
             expression_source
         };
+        let aliases = self
+            .pointer_origins_by_pointer
+            .get(&source)
+            .cloned()
+            .or_else(|| {
+                self.transfer_source_value(source_node)
+                    .and_then(|source| self.pointer_origins_by_pointer.get(&source).cloned())
+            })
+            .unwrap_or_default();
+        let ownership_source = source_binding.unwrap_or(source);
+        if let Some(origin) = self
+            .pointer_origins_by_owner
+            .get(&ownership_source)
+            .copied()
+        {
+            self.pointer_origins_by_owner.insert(target, origin);
+        }
+        if let Some(lifetime) = self.owner_invalidation(ownership_source) {
+            self.pointer_owner_lifetimes.insert(target, lifetime);
+        }
+        if let Some(pointee) = self.pointer_pointee(source_node) {
+            self.pointer_pointees_by_value.insert(target, pointee);
+        }
+        if self.manually_drop_values.contains(&ownership_source) {
+            self.manually_drop_values.insert(target);
+        }
+        if !aliases.is_empty() {
+            for (origin, offset) in aliases {
+                self.add_pointer_alias(
+                    point,
+                    target,
+                    origin,
+                    offset,
+                    PointerRelationStrength::Must,
+                    metadata,
+                );
+            }
+        }
         self.append_effect(
             builder,
             point,
@@ -1459,7 +3003,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                         target,
                     },
                 )?;
-                self.add_gap(
+                self.session.record_gap(
                     builder,
                     point,
                     SemanticGapSubject::Value(target),
@@ -1484,6 +3028,93 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 target,
             },
         )?;
+        if is_move {
+            self.transfer_pointer_owner_facts(source, target);
+            let metadata = self.metadata(point)?;
+            if let Some(place) = self.binding_places.get(&source).cloned() {
+                self.move_outs.push(MoveOutFact {
+                    place,
+                    point,
+                    source_value: source,
+                    target_value: target,
+                    state_after: MoveOutState::Uninitialized,
+                    source: metadata.source,
+                    evidence: metadata.evidence,
+                });
+            } else if matches!(source_node.kind(), "field_expression" | "index_expression")
+                && let Some(base) = source_node
+                    .child_by_field_name("value")
+                    .and_then(|base| self.binding_value(base))
+                && let Some(place) = self.binding_places.get(&base).cloned()
+            {
+                self.move_outs.push(MoveOutFact {
+                    place: place.clone(),
+                    point,
+                    source_value: source,
+                    target_value: target,
+                    state_after: MoveOutState::PartiallyInitialized,
+                    source: metadata.source,
+                    evidence: metadata.evidence,
+                });
+                self.add_incomplete_fact(
+                    point,
+                    SemanticIncompleteSubject::Place(place),
+                    SemanticIncompleteReason::Lifecycle(LifecycleIncompleteReason::PartialMove),
+                    metadata,
+                );
+            }
+        }
+        Ok(())
+    }
+
+    fn append_consumed_move(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        point: ProgramPointId,
+        source_node: Node<'tree>,
+        target_value: ValueId,
+    ) -> Result<(), RustLoweringError> {
+        let Some(source_value) = self.transfer_source_value(source_node) else {
+            return Ok(());
+        };
+        if source_value == target_value {
+            return Ok(());
+        }
+        self.append_effect(
+            builder,
+            point,
+            SemanticEffect::Assignment {
+                target: target_value,
+                value: source_value,
+            },
+        )?;
+        self.append_effect(
+            builder,
+            point,
+            SemanticEffect::ValueFlow {
+                kind: ValueFlowKind::Transfer(ValueTransfer {
+                    kind: TransferKind::Move {
+                        invalidation: MoveInvalidation::Invalidated,
+                    },
+                    operation: TransferOperation::None,
+                }),
+                source: source_value,
+                target: target_value,
+            },
+        )?;
+        if let Some(place) = self.binding_places.get(&source_value).cloned() {
+            let metadata = self.metadata(point)?;
+            self.move_outs.push(MoveOutFact {
+                place,
+                point,
+                source_value,
+                target_value,
+                state_after: MoveOutState::Uninitialized,
+                source: metadata.source,
+                evidence: metadata.evidence,
+            });
+        }
+        self.transfer_pointer_owner_facts(source_value, target_value);
         Ok(())
     }
 
@@ -1506,7 +3137,8 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                     let name = node_text(self.source, current)?;
                     let value = self
                         .local_at(name, current.start_byte())
-                        .or_else(|| self.parameters.get(name).copied())?;
+                        .or_else(|| self.parameters.get(name).copied())
+                        .or_else(|| self.captured_bindings.get(name).copied())?;
                     break self.value_shapes.get(&value).cloned()?;
                 }
                 "parenthesized_expression" => current = first_named_child(current)?,
@@ -1612,47 +3244,83 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         }
     }
 
-    /// The memory-location identity of `base.field`, and whether it is the
-    /// field's own declaration.
-    ///
-    /// When this file does not state the declaration -- an unresolved base
-    /// shape, an imported struct, a name two structs share -- the locator
-    /// falls back to one interned per field name per procedure. That fallback
-    /// still lets a store and a load of one name meet, which anchoring each
-    /// occurrence separately would silently prevent, and the caller publishes
-    /// a field-identity gap for it.
+    /// The member identity of `base.field`, and whether this file knows its
+    /// declaration. An unresolved named selector or tuple index gets the same
+    /// canonical locator in every procedure and file; declaration/type
+    /// resolution remains a separate gap.
     fn memory_member_locator(
         &mut self,
         base: Node<'tree>,
         field: Node<'tree>,
-    ) -> Result<(SemanticLocator, bool), RustLoweringError> {
-        let name = node_text(self.source, field);
-        let declaration = self.field_declaration(base, field);
-        if let Some(name) = name
-            && declaration.is_none()
-            && let Some(locator) = self.field_locators.get(name)
-        {
-            return Ok((locator.clone(), false));
-        }
-        let anchor = match declaration {
-            Some(ref declaration) => declaration.anchor,
-            None => source_anchor(field, 0).map_err(RustLoweringError::Invalid)?,
-        };
+    ) -> Result<(SemanticLocator, bool, bool), RustLoweringError> {
         let procedure = self.session.locator();
-        let locator = SemanticLocator::new(
-            procedure.mount(),
-            procedure.path().clone(),
-            procedure.language(),
-            procedure.declaration().clone(),
-            SemanticRole::MemoryLocation,
-            anchor,
-        );
-        if declaration.is_none()
-            && let Some(name) = name
-        {
-            self.field_locators.insert(name.into(), locator.clone());
+        let declaration = self.field_declaration(base, field);
+        if let Some(declaration) = declaration {
+            let RustValueShape::Struct(owner) = self
+                .expression_shape(base)
+                .expect("field declaration resolution has a structured base")
+            else {
+                unreachable!("field declaration resolution requires a struct base")
+            };
+            let owner = DeclarationSegment::named(
+                DeclarationSegmentKind::Type,
+                owner.to_string(),
+                declaration.anchor,
+                0,
+            )
+            .expect("a declared Rust struct has a non-empty identifier");
+            let declaration_path = DeclarationLocator::new(vec![owner])
+                .expect("a Rust field locator has its owning struct segment");
+            return Ok((
+                SemanticLocator::new(
+                    procedure.mount(),
+                    procedure.path().clone(),
+                    procedure.language(),
+                    declaration_path,
+                    SemanticRole::MemoryLocation,
+                    declaration.anchor,
+                ),
+                true,
+                true,
+            ));
         }
-        Ok((locator, declaration.is_some()))
+
+        if let Some(member_key) = rust_field_member_key(self.source, field) {
+            // Rust auto-deref through user Deref/DerefMut is assumed to return
+            // the same target for the same base object. A Deref that returns
+            // different objects per call is outside this identity contract.
+            let position = SourcePosition::new(0, 0, 0);
+            let span = SourceSpan::new(position, position)
+                .expect("zero-width canonical member anchor is valid");
+            let anchor = SourceAnchor::new(span, 0);
+            let member = DeclarationSegment::named(
+                DeclarationSegmentKind::Namespace,
+                format!("rust-field:{member_key}"),
+                anchor,
+                0,
+            )
+            .expect("structured Rust member keys are non-empty");
+            let declaration = DeclarationLocator::new(vec![member])
+                .expect("a canonical Rust member locator has one segment");
+            let path =
+                WorkspaceRelativePath::new(crate::analyzer::semantic::RUST_FIELD_MEMBER_PATH)
+                    .expect("canonical Rust member path is portable");
+            return Ok((
+                SemanticLocator::new(
+                    procedure.mount(),
+                    path,
+                    procedure.language(),
+                    declaration,
+                    SemanticRole::MemoryLocation,
+                    anchor,
+                ),
+                false,
+                true,
+            ));
+        }
+
+        let anchor = source_anchor(field, 0).map_err(RustLoweringError::Invalid)?;
+        Ok((procedure.memory_location_at(anchor), false, false))
     }
 
     fn add_field_identity_gap(
@@ -1660,17 +3328,25 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         builder: &mut ProcedureCfgBuilder,
         point: ProgramPointId,
         location: MemoryLocationId,
+        exact_member_key: bool,
     ) -> Result<(), RustLoweringError> {
         self.session.add_gap_with_impacts(
             builder,
             point,
             SemanticGapSubject::MemoryLocation(location),
             SemanticCapability::FieldMemory,
-            SemanticGapImpacts::single(SemanticGapImpact::HeapRead)
-                .with(SemanticGapImpact::HeapWrite)
-                .with(SemanticGapImpact::Aliasing),
+            if exact_member_key {
+                // The declaration/type is still unresolved, but Rust has no
+                // overloaded field names. A proven base plus this AST member
+                // key identifies one field and keeps same-object coverage.
+                SemanticGapImpacts::NONE
+            } else {
+                SemanticGapImpacts::single(SemanticGapImpact::HeapRead)
+                    .with(SemanticGapImpact::HeapWrite)
+                    .with(SemanticGapImpact::Aliasing)
+            },
             SemanticGapKind::Unknown,
-            "Rust field occurrence is structured, but its struct declaration identity is not yet resolved",
+            "Rust field occurrence has no resolved declaration or supported AST member key",
         )?;
         Ok(())
     }
@@ -1691,8 +3367,12 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         let Some(index) = rust_integer_literal_value(self.source, node) else {
             return Ok(None);
         };
-        if let Some(value) = self.constant_index_values.get(&index).copied() {
-            self.expression_values.insert(node.id(), value);
+        if let Some(value) = crate::analyzer::common::reuse_cached_expression_value(
+            &self.constant_index_values,
+            &mut self.expression_values,
+            index,
+            node.id(),
+        ) {
             return Ok(Some((value, index)));
         }
         let value =
@@ -1766,18 +3446,12 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         point: ProgramPointId,
         location: MemoryLocationId,
     ) -> Result<(), RustLoweringError> {
-        self.session.add_gap_with_impacts(
+        self.session.add_unprojected_index_gap(
             builder,
             point,
-            SemanticGapSubject::MemoryLocation(location),
-            SemanticCapability::IndexMemory,
-            SemanticGapImpacts::single(SemanticGapImpact::HeapRead)
-                .with(SemanticGapImpact::HeapWrite)
-                .with(SemanticGapImpact::Aliasing),
-            SemanticGapKind::Unsupported,
+            location,
             "Rust dynamic index identity is not proven",
-        )?;
-        Ok(())
+        )
     }
 
     fn add_repeat_array_gap(
@@ -1819,6 +3493,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                     return self
                         .local_at(name, current.start_byte())
                         .or_else(|| self.parameters.get(name).copied())
+                        .or_else(|| self.captured_bindings.get(name).copied())
                         .is_some();
                 }
                 "field_expression" => {
@@ -1862,7 +3537,10 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         let mut pending = vec![node];
         while let Some(node) = pending.pop() {
             let node = unwrap_attributes(node);
-            if matches!(expression_value_kind(node), SemanticValueKind::Constant) {
+            if matches!(
+                expression_value_kind(node),
+                SemanticValueKind::Constant | SemanticValueKind::Boolean(_)
+            ) {
                 continue;
             }
             match node.kind() {
@@ -1871,6 +3549,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                         .and_then(|name| {
                             self.local_at(name, node.start_byte())
                                 .or_else(|| self.parameters.get(name).copied())
+                                .or_else(|| self.captured_bindings.get(name).copied())
                         })
                         .is_some_and(|value| self.definitely_non_dropping.contains(&value));
                     if !proven {
@@ -1995,6 +3674,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 };
                 self.local_at(name, left.start_byte())
                     .or_else(|| self.parameters.get(name).copied())
+                    .or_else(|| self.captured_bindings.get(name).copied())
                     .is_none_or(|target| !self.definitely_non_dropping.contains(&target))
             }
             // Overwriting a field or an element whose declared type is a
@@ -2007,23 +3687,6 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         }
     }
 
-    fn let_declaration_may_require_drop(&self, node: Node<'_>) -> bool {
-        let Some(pattern) = node.child_by_field_name("pattern") else {
-            return true;
-        };
-        if is_wildcard_pattern(pattern) {
-            return false;
-        }
-        let Some(name) = identity_binding_identifier(pattern) else {
-            return true;
-        };
-        let Some(name_text) = node_text(self.source, name) else {
-            return true;
-        };
-        self.local_declaration_value(name_text, name.start_byte())
-            .is_none_or(|value| !self.definitely_non_dropping.contains(&value))
-    }
-
     fn expression_value(
         &mut self,
         builder: &mut ProcedureCfgBuilder,
@@ -2031,20 +3694,19 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         kind: SemanticValueKind,
     ) -> Result<ValueId, RustLoweringError> {
         let node = unwrap_attributes(node);
-        if let Some(value) = self.expression_values.get(&node.id()) {
-            return Ok(*value);
-        }
-        let metadata = self.value_mapping(builder, node)?;
-        let value = self.session.insert_cached_value_with_metadata(
+        let kind = if node.kind() == "reference_expression" && rust_reference_is_mutable(node) {
+            SemanticValueKind::Address
+        } else {
+            rust_literal_value_kind(self.source, node).unwrap_or(kind)
+        };
+        self.session.cached_node_value(
             builder,
             &mut self.expression_values,
-            node.id(),
-            metadata,
+            node,
             kind,
-        )?;
-        Ok(value)
+            |session, builder, node| session.add_node_mapping(builder, node),
+        )
     }
-
     fn source_value(
         &mut self,
         builder: &mut ProcedureCfgBuilder,
@@ -2067,107 +3729,55 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             return Ok(());
         };
         let (source, kind) = if node.kind() == "self" {
-            (self.receiver, ValueFlowKind::Receiver)
+            self.captured_bindings
+                .get(name)
+                .copied()
+                .map(|value| (Some(value), ValueFlowKind::Local))
+                .unwrap_or((self.receiver, ValueFlowKind::Receiver))
         } else if node.kind() == "identifier" {
             if let Some(local) = self.local_at(name, node.start_byte()) {
                 (Some(local), ValueFlowKind::Local)
+            } else if let Some(captured) = self.captured_bindings.get(name).copied() {
+                (Some(captured), ValueFlowKind::Local)
             } else {
                 (self.parameters.get(name).copied(), ValueFlowKind::Parameter)
             }
         } else {
             (None, ValueFlowKind::Local)
         };
-        if let Some(source) = source
-            && source != target
+        if let Some(source) = source {
+            if source != target {
+                // The read is spelled by the name itself, not by the enclosing
+                // evaluation's point: for `x = y` that point is the whole
+                // assignment.
+                let metadata = self.value_mapping(builder, node)?;
+                self.session.append_effect_with_metadata(
+                    builder,
+                    point,
+                    metadata,
+                    SemanticEffect::ValueFlow {
+                        kind,
+                        source,
+                        target,
+                    },
+                )?;
+            }
+        } else if node.kind() == "identifier"
+            && let Some(location) = self.static_location(builder, point, node, name)?
         {
-            // The read is spelled by the name itself, not by the enclosing
-            // evaluation's point: for `x = y` that point is the whole
-            // assignment.
             let metadata = self.value_mapping(builder, node)?;
             self.session.append_effect_with_metadata(
                 builder,
                 point,
                 metadata,
-                SemanticEffect::ValueFlow {
-                    kind,
-                    source,
-                    target,
+                SemanticEffect::MemoryLoad {
+                    kind: MemoryAccessKind::Static,
+                    location,
+                    result: target,
                 },
             )?;
         }
         Ok(())
-    }
-
-    fn step(
-        &mut self,
-        builder: &mut ProcedureCfgBuilder,
-        work: Work<'tree>,
-        stack: &mut Vec<Work<'tree>>,
-    ) -> Result<(), RustLoweringError> {
-        if self.session.cancellation().is_cancelled() {
-            return Err(RustLoweringError::Cancelled(Box::default()));
-        }
-        let work = match work {
-            Work::Statement {
-                node,
-                entry,
-                next,
-                scope,
-            } => Work::Statement {
-                node: unwrap_attributes(node),
-                entry,
-                next,
-                scope,
-            },
-            Work::Expression {
-                node,
-                entry,
-                next,
-                scope,
-            } => Work::Expression {
-                node: unwrap_attributes(node),
-                entry,
-                next,
-                scope,
-            },
-            Work::Condition {
-                node,
-                entry,
-                when_true,
-                when_false,
-                scope,
-            } => Work::Condition {
-                node: unwrap_attributes(node),
-                entry,
-                when_true,
-                when_false,
-                scope,
-            },
-        };
-        match work {
-            Work::Statement {
-                node,
-                entry,
-                next,
-                scope,
-            } => {
-                self.session.record_statement_entry(builder, node, entry)?;
-                self.statement(builder, node, entry, next, scope, stack)
-            }
-            Work::Expression {
-                node,
-                entry,
-                next,
-                scope,
-            } => self.expression(builder, node, entry, next, scope, stack),
-            Work::Condition {
-                node,
-                entry,
-                when_true,
-                when_false,
-                scope,
-            } => self.condition(builder, node, entry, when_true, when_false, scope, stack),
-        }
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -2182,50 +3792,31 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         stack: &mut Vec<Work<'tree>>,
     ) -> Result<(), RustLoweringError> {
         match (node.kind(), rust_boolean_operator(node)) {
-            ("binary_expression", Some("&&")) => {
+            ("binary_expression", Some(operator @ ("&&" | "||"))) => {
                 let left = required_field(node, "left")?;
                 let right = required_field(node, "right")?;
                 let right_entry = self.point(builder, right, Vec::new())?;
-                stack.push(Work::Condition {
-                    node: right,
-                    entry: right_entry,
+                let kind = match operator {
+                    "&&" => ShortCircuitKind::And,
+                    "||" => ShortCircuitKind::Or,
+                    _ => unreachable!("the match arm selects Rust boolean operators"),
+                };
+                schedule_short_circuit_condition(
+                    stack,
+                    kind,
+                    (left, entry),
+                    (right, right_entry),
                     when_true,
                     when_false,
                     scope,
-                });
-                stack.push(Work::Condition {
-                    node: left,
-                    entry,
-                    when_true: EdgeTarget {
-                        point: right_entry,
-                        kind: ControlEdgeKind::ConditionalTrue,
+                    |node, entry, when_true, when_false, scope| Work::Condition {
+                        node,
+                        entry,
+                        when_true,
+                        when_false,
+                        scope,
                     },
-                    when_false,
-                    scope,
-                });
-                Ok(())
-            }
-            ("binary_expression", Some("||")) => {
-                let left = required_field(node, "left")?;
-                let right = required_field(node, "right")?;
-                let right_entry = self.point(builder, right, Vec::new())?;
-                stack.push(Work::Condition {
-                    node: right,
-                    entry: right_entry,
-                    when_true,
-                    when_false,
-                    scope,
-                });
-                stack.push(Work::Condition {
-                    node: left,
-                    entry,
-                    when_true,
-                    when_false: EdgeTarget {
-                        point: right_entry,
-                        kind: ControlEdgeKind::ConditionalFalse,
-                    },
-                    scope,
-                });
+                );
                 Ok(())
             }
             ("let_chain", _) => {
@@ -2251,30 +3842,67 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 });
                 Ok(())
             }
+            ("unary_expression", _)
+                if node.child(0).is_some_and(|operator| operator.kind() == "!") =>
+            {
+                let operand = node
+                    .named_child(0)
+                    .ok_or_else(|| missing_field(node, "operand"))?;
+                stack.push(Work::Condition {
+                    node: operand,
+                    entry,
+                    when_true: when_false,
+                    when_false: when_true,
+                    scope,
+                });
+                Ok(())
+            }
             _ => {
                 let decision = self.point(builder, node, Vec::new())?;
-                self.edge(builder, decision, when_true)?;
-                self.edge(builder, decision, when_false)?;
-                // A literal condition fixes its outcome at compile time. Both
-                // arms stay represented -- the dead one still holds call sites
-                // and declarations a consumer asks about -- and the guard row
-                // is what tells a solver which of them cannot execute.
-                if let Some(value) = rust_constant_condition(node) {
-                    let arm = |target: EdgeTarget| {
-                        Some(GuardArm {
-                            target_point: target.point,
-                            kind: target.kind,
-                        })
+                self.session.add_target_edge(builder, decision, when_true)?;
+                self.session
+                    .add_target_edge(builder, decision, when_false)?;
+
+                let normalized = self.normalize_condition(builder, node)?;
+                let (predicate, subject, true_target, false_target) = if let Some(normalized) =
+                    normalized
+                {
+                    let (true_target, false_target) = if normalized.predicate_true_on_condition_true
+                    {
+                        (when_true, when_false)
+                    } else {
+                        (when_false, when_true)
                     };
-                    self.session.add_guard_fact(
-                        builder,
-                        decision,
-                        GuardPredicate::ConstantBoolean { value },
-                        None,
-                        arm(when_true),
-                        arm(when_false),
-                    )?;
-                }
+                    (
+                        normalized.predicate,
+                        normalized.subject,
+                        true_target,
+                        false_target,
+                    )
+                } else {
+                    (
+                        GuardPredicate::Opaque {
+                            digest: GuardConditionDigest::from_syntax_kind(node.kind()),
+                        },
+                        Some(self.expression_value(builder, node, expression_value_kind(node))?),
+                        when_true,
+                        when_false,
+                    )
+                };
+                let arm = |target: EdgeTarget| {
+                    Some(GuardArm {
+                        target_point: target.point,
+                        kind: target.kind,
+                    })
+                };
+                self.session.add_guard_fact(
+                    builder,
+                    decision,
+                    predicate,
+                    subject,
+                    arm(true_target),
+                    arm(false_target),
+                )?;
                 stack.push(Work::Expression {
                     node,
                     entry,
@@ -2284,6 +3912,237 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 Ok(())
             }
         }
+    }
+
+    fn normalize_condition(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        node: Node<'tree>,
+    ) -> Result<Option<RustNormalizedGuard>, RustLoweringError> {
+        let node = peel_rust_parentheses(node);
+        if let Some(value) = rust_constant_condition(node) {
+            return Ok(Some(RustNormalizedGuard {
+                predicate: GuardPredicate::ConstantBoolean { value },
+                subject: None,
+                predicate_true_on_condition_true: true,
+            }));
+        }
+        if let Some((_, DeclaredScalarType::Boolean)) = self.scalar_binding_operand(node) {
+            let subject = self.expression_value(builder, node, expression_value_kind(node))?;
+            return Ok(Some(RustNormalizedGuard {
+                predicate: GuardPredicate::Truthy { value: subject },
+                subject: Some(subject),
+                predicate_true_on_condition_true: true,
+            }));
+        }
+        if node.kind() != "binary_expression" {
+            return Ok(None);
+        }
+        let (Some(operator), Some(left), Some(right)) = (
+            node.child_by_field_name("operator"),
+            node.child_by_field_name("left"),
+            node.child_by_field_name("right"),
+        ) else {
+            return Ok(None);
+        };
+        let operator = operator.kind();
+        let left = peel_rust_parentheses(left);
+        let right = peel_rust_parentheses(right);
+        let left_binding = self.scalar_binding_operand(left);
+        let right_binding = self.scalar_binding_operand(right);
+        let integer = |scalar_type| {
+            matches!(
+                scalar_type,
+                DeclaredScalarType::Signed(_) | DeclaredScalarType::Unsigned(_)
+            )
+        };
+        if let (Some((left_value, left_type)), Some((right_value, right_type))) =
+            (left_binding, right_binding)
+            && left_value == right_value
+            && ((integer(left_type) && integer(right_type))
+                || (left_type == DeclaredScalarType::Boolean
+                    && right_type == DeclaredScalarType::Boolean
+                    && matches!(operator, "==" | "!=")))
+        {
+            let value = match operator {
+                "<" | ">" | "!=" => false,
+                "<=" | ">=" | "==" => true,
+                _ => return Ok(None),
+            };
+            return Ok(Some(RustNormalizedGuard {
+                predicate: GuardPredicate::ConstantBoolean { value },
+                subject: None,
+                predicate_true_on_condition_true: true,
+            }));
+        }
+
+        let left_literal = self.scalar_constant_operand(left);
+        let right_literal = self.scalar_constant_operand(right);
+        if let Some((subject, subject_type, constant, constant_type, constant_value, reversed)) =
+            match (left_binding, right_binding, left_literal, right_literal) {
+                (Some((_, subject_type)), None, None, Some((constant_type, constant_value))) => {
+                    Some((
+                        left,
+                        subject_type,
+                        right,
+                        constant_type,
+                        constant_value,
+                        false,
+                    ))
+                }
+                (None, Some((_, subject_type)), Some((constant_type, constant_value)), None) => {
+                    Some((
+                        right,
+                        subject_type,
+                        left,
+                        constant_type,
+                        constant_value,
+                        true,
+                    ))
+                }
+                _ => None,
+            }
+        {
+            if integer(subject_type) && integer(constant_type) {
+                let constant = if let Some(value) = constant_value {
+                    self.expression_value(
+                        builder,
+                        constant,
+                        SemanticValueKind::UnsignedInteger(value),
+                    )?
+                } else {
+                    self.expression_value(builder, constant, expression_value_kind(constant))?
+                };
+                let subject =
+                    self.expression_value(builder, subject, expression_value_kind(subject))?;
+                let relation = match operator {
+                    "<" => Some(IntegerComparison::LessThan),
+                    "<=" => Some(IntegerComparison::LessThanOrEqual),
+                    ">" => Some(IntegerComparison::GreaterThan),
+                    ">=" => Some(IntegerComparison::GreaterThanOrEqual),
+                    _ => None,
+                };
+                let predicate = match (relation, operator) {
+                    (Some(relation), _) => GuardPredicate::OrderedIntegerComparison {
+                        relation: if reversed {
+                            relation.reverse()
+                        } else {
+                            relation
+                        },
+                        constant,
+                    },
+                    (None, "==") => GuardPredicate::ConstantEquality {
+                        negated: false,
+                        constant,
+                    },
+                    (None, "!=") => GuardPredicate::ConstantEquality {
+                        negated: true,
+                        constant,
+                    },
+                    (None, _) => return Ok(None),
+                };
+                return Ok(Some(RustNormalizedGuard {
+                    predicate,
+                    subject: Some(subject),
+                    predicate_true_on_condition_true: true,
+                }));
+            }
+
+            if subject_type == DeclaredScalarType::Boolean
+                && constant_type == DeclaredScalarType::Boolean
+                && matches!(operator, "==" | "!=")
+            {
+                let Some(constant_value) = rust_boolean_literal_value(self.source, constant) else {
+                    return Ok(None);
+                };
+                let subject =
+                    self.expression_value(builder, subject, expression_value_kind(subject))?;
+                let predicate_true_on_condition_true = if operator == "==" {
+                    constant_value
+                } else {
+                    !constant_value
+                };
+                return Ok(Some(RustNormalizedGuard {
+                    predicate: GuardPredicate::Truthy { value: subject },
+                    subject: Some(subject),
+                    predicate_true_on_condition_true,
+                }));
+            }
+        }
+
+        // A reviewed built-in operation can produce a scalar value without
+        // leaving a declared scalar type on the local. Keep the comparison
+        // fact structured in that case: the scalar operator gap remains, so
+        // this row does not claim that an unresolved implementation is a
+        // built-in operation. The row still gives the taint plan the exact
+        // binding and edge needed for its source-selective barrier.
+        let left_constant = self.rust_integer_constant_value(left);
+        let right_constant = self.rust_integer_constant_value(right);
+        if let Some((
+            fallback_subject,
+            fallback_constant_node,
+            fallback_constant_value,
+            fallback_reversed,
+        )) = match (left_constant, right_constant) {
+            (Some(value), None) => Some((right, left, value, true)),
+            (None, Some(value)) => Some((left, right, value, false)),
+            (Some(_), Some(_)) | (None, None) => None,
+        } {
+            let constant = self.expression_value(
+                builder,
+                fallback_constant_node,
+                SemanticValueKind::UnsignedInteger(fallback_constant_value),
+            )?;
+            let subject = self.expression_value(
+                builder,
+                fallback_subject,
+                expression_value_kind(fallback_subject),
+            )?;
+            let relation = match operator {
+                "<" => Some(IntegerComparison::LessThan),
+                "<=" => Some(IntegerComparison::LessThanOrEqual),
+                ">" => Some(IntegerComparison::GreaterThan),
+                ">=" => Some(IntegerComparison::GreaterThanOrEqual),
+                _ => None,
+            };
+            let predicate = match (relation, operator) {
+                (Some(relation), _) => GuardPredicate::OrderedIntegerComparison {
+                    relation: if fallback_reversed {
+                        relation.reverse()
+                    } else {
+                        relation
+                    },
+                    constant,
+                },
+                (None, "==") => GuardPredicate::ConstantEquality {
+                    negated: false,
+                    constant,
+                },
+                (None, "!=") => GuardPredicate::ConstantEquality {
+                    negated: true,
+                    constant,
+                },
+                (None, _) => return Ok(None),
+            };
+            return Ok(Some(RustNormalizedGuard {
+                predicate,
+                subject: Some(subject),
+                predicate_true_on_condition_true: true,
+            }));
+        }
+        Ok(None)
+    }
+
+    fn rust_integer_constant_value(&self, node: Node<'tree>) -> Option<u128> {
+        let node = unwrap_attributes(node);
+        if let Some(value) = rust_integer_literal_value(self.source, node) {
+            return Some(value);
+        }
+        if node.kind() != "identifier" || self.binding_value(node).is_some() {
+            return None;
+        }
+        let name = node_text(self.source, node)?;
+        self.facts.integer_constants.get(name).copied().flatten()
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -2298,13 +4157,14 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         stack: &mut Vec<Work<'tree>>,
     ) -> Result<(), RustLoweringError> {
         if conditions.is_empty() {
-            return self.edge(builder, entry, when_true);
+            return self.session.add_target_edge(builder, entry, when_true);
         }
         let entries = conditions
             .iter()
             .map(|condition| self.point(builder, *condition, Vec::new()))
             .collect::<Result<Vec<_>, _>>()?;
-        self.edge(builder, entry, EdgeTarget::normal(entries[0]))?;
+        self.session
+            .add_target_edge(builder, entry, EdgeTarget::normal(entries[0]))?;
         for index in (0..conditions.len()).rev() {
             let success = entries
                 .get(index + 1)
@@ -2367,7 +4227,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             | "empty_statement"
             | "attribute_item"
             | "inner_attribute_item"
-            | "attributes" => self.edge(builder, entry, next),
+            | "attributes" => self.session.add_target_edge(builder, entry, next),
             _ if is_rust_expression(node.kind()) => {
                 stack.push(Work::Expression {
                     node,
@@ -2391,22 +4251,10 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         scope: ScopeFrameId,
         stack: &mut Vec<Work<'tree>>,
     ) -> Result<(), RustLoweringError> {
-        let has_drop_obligations = named_children(node)
+        let children = named_children(node)
             .into_iter()
-            .filter(|child| child.kind() == "let_declaration")
-            .any(|child| self.let_declaration_may_require_drop(child));
-        let scope_exit = has_drop_obligations
-            .then(|| self.point(builder, node, Vec::new()))
-            .transpose()?;
-        let effective_next = scope_exit.map(EdgeTarget::normal).unwrap_or(next);
-        if let Some(scope_exit) = scope_exit {
-            self.add_drop_omission_gaps(
-                builder,
-                scope_exit,
-                "values introduced by direct let bindings may require implicit Drop at this lexical scope exit",
-            )?;
-            self.edge(builder, scope_exit, next)?;
-        }
+            .filter(|child| child.kind() != "label")
+            .collect::<Vec<_>>();
         let label = direct_named_child_kind(node, "label");
         let labeled_scope = if let Some(label) = label {
             let label = node_text(self.source, label).map(Box::<str>::from);
@@ -2422,21 +4270,88 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         } else {
             scope
         };
-        let block_scope = if has_drop_obligations {
-            self.push_cleanup_scope(builder, labeled_scope)?
+
+        let entries = children
+            .iter()
+            .map(|child| {
+                self.point(
+                    builder,
+                    execution_node(unwrap_attributes(*child)),
+                    Vec::new(),
+                )
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let mut child_scopes = Vec::with_capacity(children.len());
+        let mut active_scope = labeled_scope;
+        let mut has_cleanup_actions = false;
+        for (index, child) in children.iter().copied().enumerate() {
+            child_scopes.push(active_scope);
+            if child.kind() != "let_declaration" || child.child_by_field_name("value").is_none() {
+                continue;
+            }
+            let values = self.declaration_binding_values(child);
+            if values.is_empty() {
+                continue;
+            }
+            let cleanup_source = child.child_by_field_name("pattern").unwrap_or(child);
+            let cleanup_scope = self.push_cleanup_scope(builder, active_scope, cleanup_source)?;
+            let region = CleanupRegionId::new(
+                u32::try_from(self.next_cleanup_region - 1)
+                    .expect("push_cleanup_scope allocated this region"),
+            );
+            if self.register_binding_cleanup_actions(
+                builder,
+                cleanup_scope,
+                region,
+                &values,
+                entries[index],
+            )? {
+                has_cleanup_actions = true;
+            }
+            self.binding_cleanup_regions.insert(region);
+            active_scope = cleanup_scope;
+        }
+
+        let function_fallthrough =
+            node.id() == self.procedure_body.id() && next.point == self.normal_exit;
+        let stop_before = if function_fallthrough {
+            self.function_scope
         } else {
             labeled_scope
         };
-        let children = named_children(node)
-            .into_iter()
-            .filter(|child| child.kind() != "label")
-            .collect::<Vec<_>>();
-        self.schedule_nodes(
+        let needs_scope_exit =
+            has_cleanup_actions || (function_fallthrough && scope != self.function_scope);
+        let scope_exit = if needs_scope_exit {
+            Some(self.session.add_cleanup_boundary_point(builder, node)?)
+        } else {
+            None
+        };
+        let effective_next = scope_exit.map(EdgeTarget::normal).unwrap_or(next);
+        let cleanup_target = if next.kind == ControlEdgeKind::Normal {
+            next.point
+        } else if scope_exit.is_some() {
+            let relay = self.session.add_cleanup_boundary_point(builder, node)?;
+            self.session.add_target_edge(builder, relay, next)?;
+            relay
+        } else {
+            next.point
+        };
+        let route =
+            builder.normal_cleanup_completion_until(active_scope, stop_before, cleanup_target);
+        if let Some(scope_exit) = scope_exit {
+            self.route(builder, scope_exit, &route)?;
+        } else if active_scope != stop_before {
+            self.record_owner_lifetime_ends(&route);
+        }
+        self.schedule_nodes_with_scopes(
             builder,
             entry,
-            &children,
+            ScopedNodeSchedule {
+                children: &children,
+                entries: &entries,
+                scopes: &child_scopes,
+            },
             effective_next,
-            block_scope,
             stack,
         )
     }
@@ -2445,35 +4360,63 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         &mut self,
         builder: &mut ProcedureCfgBuilder,
         parent: ScopeFrameId,
+        source: Node<'tree>,
     ) -> Result<ScopeFrameId, RustLoweringError> {
         let region = CleanupRegionId::new(
             u32::try_from(self.next_cleanup_region)
                 .map_err(|_| RustLoweringError::Invalid("too many Rust cleanup regions".into()))?,
         );
         self.next_cleanup_region += 1;
+        self.cleanup_nodes.insert(region, source);
         Ok(builder.push_scope(Some(parent), ScopeBinding::Cleanup { region }))
     }
 
+    fn declaration_binding_values(&self, declaration: Node<'tree>) -> Vec<ValueId> {
+        let mut values = Vec::new();
+        let Some(pattern) = declaration.child_by_field_name("pattern") else {
+            return values;
+        };
+        for name in rust_pattern_binding_identifiers(pattern) {
+            let Some(text) = node_text(self.source, name) else {
+                continue;
+            };
+            if let Some(value) = self.local_declaration_value(text, name.start_byte()) {
+                values.push(value);
+            }
+        }
+        values
+    }
+
+    /// Publish the omitted implicit `Drop` at `point`.
+    ///
+    /// `discharge` is the proof obligation for cleanup routing, resource
+    /// release, and destructor unwinding: `InertDropGlue` when every value
+    /// this drop can destroy is a parameter or a `let` binding of the
+    /// procedure, which the workspace oracle can type (#3757); `None` otherwise.
     fn add_drop_omission_gaps(
         &mut self,
         builder: &mut ProcedureCfgBuilder,
         point: ProgramPointId,
         context: &str,
+        discharge: SemanticGapDischarge,
     ) -> Result<(), RustLoweringError> {
-        for (capability, kind, detail) in [
+        for (capability, kind, gap_discharge, detail) in [
             (
                 SemanticCapability::CleanupControlFlow,
                 SemanticGapKind::Unknown,
+                discharge,
                 "implicit Drop order and cleanup routing are not lowered",
             ),
             (
                 SemanticCapability::ResourceManagement,
                 SemanticGapKind::Unknown,
+                discharge,
                 "resource release depends on inferred types and Drop implementations",
             ),
             (
                 SemanticCapability::Calls,
                 SemanticGapKind::Unknown,
+                SemanticGapDischarge::None,
                 "implicit Drop::drop invocations are not emitted as fabricated call sites",
             ),
             // The unwind edge a panicking destructor would take is simply not
@@ -2484,16 +4427,19 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             (
                 SemanticCapability::ExceptionalControlFlow,
                 SemanticGapKind::Unsupported,
+                discharge,
                 "destructor unwinding and destructor panic routing are not lowered",
             ),
         ] {
-            self.add_gap(
+            self.session.add_gap_with_impacts_and_discharge(
                 builder,
                 point,
                 SemanticGapSubject::Point,
                 capability,
+                SemanticGapImpacts::NONE,
                 kind,
-                &format!("{context}; {detail}"),
+                gap_discharge,
+                format!("{context}; {detail}"),
             )?;
         }
         Ok(())
@@ -2512,7 +4458,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         let value = node.child_by_field_name("value");
         let alternative = node.child_by_field_name("alternative");
         let Some(value) = value else {
-            return self.edge(builder, entry, next);
+            return self.session.add_target_edge(builder, entry, next);
         };
         let binding = self.point(builder, node, Vec::new())?;
         if let Some(pattern) = node.child_by_field_name("pattern") {
@@ -2527,6 +4473,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                         builder,
                         binding,
                         "a temporary discarded by a wildcard let may require immediate Drop at the end of the statement",
+                        SemanticGapDischarge::InertDropGlue,
                     )?;
                 }
             } else if let Some(name) = identity_binding_identifier(pattern) {
@@ -2551,7 +4498,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                         .map(RustValueType::Declared),
                 )?;
             } else {
-                self.add_gap(
+                self.session.record_gap(
                     builder,
                     binding,
                     SemanticGapSubject::Point,
@@ -2568,7 +4515,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             // both represented as edges below. What the pattern binds is a
             // value question, already published by the `LocalFlow` gap above
             // for any pattern this adapter does not lower as identity flow.
-            self.edge(
+            self.session.add_target_edge(
                 builder,
                 binding,
                 EdgeTarget {
@@ -2576,7 +4523,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                     kind: ControlEdgeKind::ConditionalTrue,
                 },
             )?;
-            self.edge(
+            self.session.add_target_edge(
                 builder,
                 binding,
                 EdgeTarget {
@@ -2584,7 +4531,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                     kind: ControlEdgeKind::ConditionalFalse,
                 },
             )?;
-            self.edge(builder, success, next)?;
+            self.session.add_target_edge(builder, success, next)?;
             stack.push(Work::Statement {
                 node: alternative,
                 entry: alternative_entry,
@@ -2592,7 +4539,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 scope,
             });
         } else {
-            self.edge(builder, binding, next)?;
+            self.session.add_target_edge(builder, binding, next)?;
         }
         stack.push(Work::Expression {
             node: value,
@@ -2657,7 +4604,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             "try_block" => self.try_block(builder, node, entry, scope, stack),
             "await_expression" => self.await_expression(builder, node, entry, next, scope, stack),
             "yield_expression" => self.yield_expression(builder, node, entry, scope, stack),
-            "macro_invocation" => self.macro_boundary(builder, node, entry),
+            "macro_invocation" => self.macro_invocation(builder, node, entry, next, scope),
             "block" => self.block(builder, node, entry, next, scope, stack),
             "unsafe_block" => {
                 let block = first_named_child(node).ok_or_else(|| missing_field(node, "block"))?;
@@ -2670,7 +4617,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 Ok(())
             }
             "const_block" => {
-                self.add_gap(
+                self.session.record_gap(
                     builder,
                     entry,
                     SemanticGapSubject::Point,
@@ -2678,7 +4625,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                     SemanticGapKind::Unsupported,
                     "inline const evaluation happens at compile time and is not represented as runtime control flow",
                 )?;
-                self.edge(builder, entry, next)
+                self.session.add_target_edge(builder, entry, next)
             }
             "binary_expression" if rust_boolean_operator(node).is_some() => {
                 let merge = self.point(builder, node, Vec::new())?;
@@ -2694,7 +4641,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                     .collect::<Result<Vec<_>, _>>()?;
                 self.session
                     .append_language_defined_value_flows(builder, merge, operands, result)?;
-                self.edge(builder, merge, next)?;
+                self.session.add_target_edge(builder, merge, next)?;
                 stack.push(Work::Condition {
                     node,
                     entry,
@@ -2709,6 +4656,12 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                     scope,
                 });
                 Ok(())
+            }
+            "unary_expression"
+                if rust_dereference_operand(node)
+                    .is_some_and(|operand| self.is_raw_pointer_expression(operand)) =>
+            {
+                self.raw_pointer_dereference(builder, node, entry, next, scope, stack)
             }
             "unary_expression"
                 if rust_dereference_operand(node)
@@ -2749,7 +4702,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             }
             "let_chain" => {
                 let merge = self.point(builder, node, Vec::new())?;
-                self.edge(builder, merge, next)?;
+                self.session.add_target_edge(builder, merge, next)?;
                 stack.push(Work::Condition {
                     node,
                     entry,
@@ -2778,7 +4731,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             kind if is_runtime_leaf(kind) => {
                 let value = self.expression_value(builder, node, expression_value_kind(node))?;
                 self.emit_lexical_input_flow(builder, node, entry, value)?;
-                self.edge(builder, entry, next)
+                self.session.add_target_edge(builder, entry, next)
             }
             kind if is_runtime_container(kind) => {
                 let children = runtime_expression_children(node);
@@ -2803,7 +4756,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         let result = self.expression_value(builder, node, SemanticValueKind::Temporary)?;
         self.session
             .add_allocation(builder, terminal, result, kind)?;
-        self.edge(builder, terminal, next)?;
+        self.session.add_target_edge(builder, terminal, next)?;
         let children = runtime_expression_children(node);
         self.schedule_expressions(
             builder,
@@ -2902,7 +4855,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 self.emit_array_element_store(builder, terminal, node, result, ordinal, value)?;
             }
         }
-        self.edge(builder, terminal, next)?;
+        self.session.add_target_edge(builder, terminal, next)?;
         let children = runtime_expression_children(node);
         self.schedule_expressions(
             builder,
@@ -2927,13 +4880,57 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         let left = required_field(node, "left")?;
         let right = required_field(node, "right")?;
         let terminal = self.point(builder, node, Vec::new())?;
+        if left.kind() == "unary_expression"
+            && let Some(pointer_node) = rust_dereference_operand(left)
+            && self.is_raw_pointer_expression(pointer_node)
+        {
+            let pointer =
+                self.expression_value(builder, pointer_node, expression_value_kind(pointer_node))?;
+            let value = self.expression_value(builder, right, expression_value_kind(right))?;
+            let width = self.pointer_width_for_expression(pointer_node);
+            let metadata = self.metadata(terminal)?;
+            self.add_pointer_access(terminal, pointer, PointerAccessKind::Write, width, metadata);
+            if width == PointerAccessWidth::Unknown {
+                self.add_incomplete_fact(
+                    terminal,
+                    SemanticIncompleteSubject::Value(pointer),
+                    SemanticIncompleteReason::Pointer(PointerIncompleteReason::UnknownLayout),
+                    metadata,
+                );
+            }
+            let location = self.session.add_memory_location(
+                builder,
+                terminal,
+                MemoryLocationKind::Dereference { address: pointer },
+            )?;
+            self.append_effect(
+                builder,
+                terminal,
+                SemanticEffect::MemoryStore {
+                    kind: MemoryAccessKind::Dereference,
+                    location,
+                    value,
+                },
+            )?;
+            self.session.add_target_edge(builder, terminal, next)?;
+            self.schedule_expressions(
+                builder,
+                entry,
+                &[pointer_node, right],
+                EdgeTarget::normal(terminal),
+                scope,
+                stack,
+            )?;
+            return Ok(());
+        }
         if left.kind() == "identifier" {
             let name = node_text(self.source, left).ok_or_else(|| {
                 RustLoweringError::Invalid("Rust assignment has an invalid target range".into())
             })?;
             let target = self
                 .local_at(name, left.start_byte())
-                .or_else(|| self.parameters.get(name).copied());
+                .or_else(|| self.parameters.get(name).copied())
+                .or_else(|| self.captured_bindings.get(name).copied());
             if let Some(target) = target {
                 let value = self.expression_value(builder, right, expression_value_kind(right))?;
                 let target_type = self.value_types.get(&target).copied();
@@ -2946,7 +4943,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                     target_type,
                 )?;
             } else {
-                self.add_gap(
+                self.session.record_gap(
                     builder,
                     terminal,
                     SemanticGapSubject::Point,
@@ -2960,9 +4957,10 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                     builder,
                     terminal,
                     "assignment may replace a live value",
+                    SemanticGapDischarge::None,
                 )?;
             }
-            self.edge(builder, terminal, next)?;
+            self.session.add_target_edge(builder, terminal, next)?;
             stack.push(Work::Expression {
                 node: right,
                 entry,
@@ -2990,7 +4988,8 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                     let field = required_field(place, "field")?;
                     let base_value =
                         self.expression_value(builder, base, expression_value_kind(base))?;
-                    let (member, resolved) = self.memory_member_locator(base, field)?;
+                    let (member, resolved, exact_member_key) =
+                        self.memory_member_locator(base, field)?;
                     let location = self.session.add_memory_location(
                         builder,
                         terminal,
@@ -3000,7 +4999,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                         },
                     )?;
                     if !resolved {
-                        self.add_field_identity_gap(builder, terminal, location)?;
+                        self.add_field_identity_gap(builder, terminal, location, exact_member_key)?;
                     }
                     self.append_effect(
                         builder,
@@ -3055,7 +5054,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             }
             evaluations
         } else {
-            self.add_gap(
+            self.session.record_gap(
                 builder,
                 terminal,
                 SemanticGapSubject::Point,
@@ -3078,6 +5077,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 builder,
                 terminal,
                 "place assignment may invoke custom DerefMut or IndexMut behavior and may replace a live value",
+                SemanticGapDischarge::None,
             )?;
         } else if left.kind() == "index_expression" {
             // The abort edge an out-of-range index would take is not lowered.
@@ -3087,7 +5087,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             // drop-omission family already carries this exact scoped fact in
             // that family's own `ExceptionalControlFlow` row, and #2638's
             // contract allows only one row per (point, subject, capability).
-            self.add_gap(
+            self.session.record_gap(
                 builder,
                 terminal,
                 SemanticGapSubject::Point,
@@ -3096,7 +5096,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 "an index store may abort on an out-of-range index; that abort edge is not lowered",
             )?;
         }
-        self.edge(builder, terminal, next)?;
+        self.session.add_target_edge(builder, terminal, next)?;
         self.schedule_expressions(
             builder,
             entry,
@@ -3141,7 +5141,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 target,
             },
         )?;
-        self.edge(builder, terminal, next)?;
+        self.session.add_target_edge(builder, terminal, next)?;
         stack.push(Work::Expression {
             node: value,
             entry,
@@ -3170,11 +5170,143 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         // the operand's history here instead published a gap the conversion
         // does not actually have.
         let source = self.expression_value(builder, value, expression_value_kind(value))?;
+        let modelled_allocator_result = value.kind() == "call_expression"
+            && value
+                .child_by_field_name("function")
+                .map(call_function_target)
+                .is_some_and(|function| self.is_standard_allocator_function(function));
+        let pointer_to_pointer_cast = node
+            .child_by_field_name("type")
+            .is_some_and(|type_node| type_node.kind() == "pointer_type")
+            && (modelled_allocator_result
+                || self.expression_type(value).is_some_and(|value_type| {
+                    matches!(
+                        value_type,
+                        RustValueType::Declared(type_node) if type_node.kind() == "pointer_type"
+                    )
+                }));
+        if pointer_to_pointer_cast {
+            let metadata = self.metadata(terminal)?;
+            self.register_pointer_fact_target(source, target, terminal, metadata);
+        }
         self.session
             .append_language_defined_value_flows(builder, terminal, [source], target)?;
-        self.edge(builder, terminal, next)?;
+        if let Some(target_type) = node
+            .child_by_field_name("type")
+            .filter(|type_node| type_node.kind() == "pointer_type")
+        {
+            self.value_types
+                .insert(target, RustValueType::Declared(target_type));
+            let reference = peel_rust_parentheses(value);
+            if reference.kind() == "reference_expression"
+                && let Some(referent) = rust_reference_expression_value(reference)
+                && let Some(binding) = self.binding_value(referent)
+                && let Some(place) = self.binding_places.get(&binding).cloned()
+            {
+                let metadata = self.metadata(terminal)?;
+                let extent = self.value_types.get(&binding).and_then(|ty| match ty {
+                    RustValueType::Declared(type_node) => {
+                        rust_type_byte_size(self.source, *type_node)
+                    }
+                    RustValueType::Borrowed { .. } => None,
+                });
+                let origin = self.add_stack_pointer_origin(place, extent, terminal, metadata);
+                self.add_pointer_alias(
+                    terminal,
+                    target,
+                    origin,
+                    PointerByteOffset::Exact(0),
+                    PointerRelationStrength::Must,
+                    metadata,
+                );
+            } else {
+                let metadata = self.metadata(terminal)?;
+                let aliases = self
+                    .pointer_origins_by_pointer
+                    .get(&source)
+                    .cloned()
+                    .or_else(|| {
+                        self.binding_value(value).and_then(|binding| {
+                            self.pointer_origins_by_pointer.get(&binding).cloned()
+                        })
+                    })
+                    .unwrap_or_default();
+                if aliases.is_empty() {
+                    if self
+                        .expression_type(value)
+                        .is_none_or(|ty| !matches!(ty, RustValueType::Declared(type_node) if type_node.kind() == "pointer_type"))
+                    {
+                        self.add_incomplete_fact(
+                            terminal,
+                            SemanticIncompleteSubject::Value(target),
+                            SemanticIncompleteReason::Pointer(
+                                PointerIncompleteReason::UnsupportedOperation,
+                            ),
+                            metadata,
+                        );
+                    }
+                } else {
+                    for (origin, offset) in aliases {
+                        self.add_pointer_alias(
+                            terminal,
+                            target,
+                            origin,
+                            offset,
+                            PointerRelationStrength::Must,
+                            metadata,
+                        );
+                    }
+                }
+            }
+        }
+        self.session.add_target_edge(builder, terminal, next)?;
         stack.push(Work::Expression {
             node: value,
+            entry,
+            next: EdgeTarget::normal(terminal),
+            scope,
+        });
+        Ok(())
+    }
+
+    fn raw_pointer_dereference(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        node: Node<'tree>,
+        entry: ProgramPointId,
+        next: EdgeTarget,
+        scope: ScopeFrameId,
+        stack: &mut Vec<Work<'tree>>,
+    ) -> Result<(), RustLoweringError> {
+        let operand = rust_dereference_operand(node)
+            .expect("a raw pointer dereference has a structured operand");
+        let terminal = self.point(builder, node, Vec::new())?;
+        let pointer = self.expression_value(builder, operand, expression_value_kind(operand))?;
+        let width = self.pointer_width_for_expression(operand);
+        let metadata = self.metadata(terminal)?;
+        self.add_pointer_access(terminal, pointer, PointerAccessKind::Read, width, metadata);
+        self.session.record_gap(
+            builder,
+            terminal,
+            SemanticGapSubject::Point,
+            SemanticCapability::Calls,
+            SemanticGapKind::Unknown,
+            "raw-pointer dereference remains outside the exact builtin-reference proof",
+        )?;
+        if width == PointerAccessWidth::Unknown {
+            self.add_incomplete_fact(
+                terminal,
+                SemanticIncompleteSubject::Value(pointer),
+                SemanticIncompleteReason::Pointer(PointerIncompleteReason::UnknownLayout),
+                metadata,
+            );
+        }
+        let result = self.expression_value(builder, node, expression_value_kind(node))?;
+        self.session
+            .append_language_defined_value_flows(builder, terminal, [pointer], result)?;
+        self.session.add_target_edge(builder, terminal, next)?;
+        stack.push(Work::Expression {
+            node: operand,
             entry,
             next: EdgeTarget::normal(terminal),
             scope,
@@ -3207,15 +5339,17 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             .collect::<Result<Vec<_>, _>>()?;
         self.session
             .append_language_defined_value_flows(builder, terminal, operands, result)?;
-        self.add_gap(
-            builder,
-            terminal,
-            SemanticGapSubject::Point,
-            SemanticCapability::Calls,
-            SemanticGapKind::Unknown,
-            implicit_runtime_call_reason(node.kind())
-                .expect("operator expressions carry an implicit-call reason"),
-        )?;
+        if !self.scalar_operator_is_builtin(node) {
+            self.session.record_gap(
+                builder,
+                terminal,
+                SemanticGapSubject::Point,
+                SemanticCapability::Calls,
+                SemanticGapKind::Unknown,
+                implicit_runtime_call_reason(node.kind())
+                    .expect("operator expressions carry an implicit-call reason"),
+            )?;
+        }
         if rust_operation_can_abort(node) {
             self.add_non_rejoining_exceptional_exit_gap(
                 builder,
@@ -3224,7 +5358,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 "arithmetic overflow, division by zero, or an invalid dereference may abort here; that abort edge is not lowered",
             )?;
         }
-        self.edge(builder, terminal, next)?;
+        self.session.add_target_edge(builder, terminal, next)?;
         self.schedule_expressions(
             builder,
             entry,
@@ -3251,7 +5385,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         let access = self.point(builder, node, Vec::new())?;
         let result = self.expression_value(builder, node, expression_value_kind(node))?;
         let base_value = self.expression_value(builder, base, expression_value_kind(base))?;
-        let (member, resolved) = self.memory_member_locator(base, field)?;
+        let (member, resolved, exact_member_key) = self.memory_member_locator(base, field)?;
         let location = self.session.add_memory_location(
             builder,
             access,
@@ -3261,7 +5395,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             },
         )?;
         if !resolved {
-            self.add_field_identity_gap(builder, access, location)?;
+            self.add_field_identity_gap(builder, access, location, exact_member_key)?;
         }
         self.append_effect(
             builder,
@@ -3276,7 +5410,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         // own projection: no autoderef step reaches a user `Deref`, and the
         // projection itself cannot abort. Any other base keeps both claims.
         if !self.place_access_is_language_defined(node) {
-            self.add_gap(
+            self.session.record_gap(
                 builder,
                 access,
                 SemanticGapSubject::Point,
@@ -3284,7 +5418,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 SemanticGapKind::Unknown,
                 "field projection may require implicit autoderef operations that are not emitted as call sites",
             )?;
-            self.add_gap(
+            self.session.record_gap(
                 builder,
                 access,
                 SemanticGapSubject::Point,
@@ -3293,7 +5427,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 "an implicit Rust autoderef may abort here; that abort edge is not lowered",
             )?;
         }
-        self.edge(builder, access, next)?;
+        self.session.add_target_edge(builder, access, next)?;
         self.schedule_expressions(
             builder,
             entry,
@@ -3324,29 +5458,10 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         let access = self.point(builder, node, Vec::new())?;
         let result = self.expression_value(builder, node, expression_value_kind(node))?;
         let base_value = self.expression_value(builder, *base, expression_value_kind(*base))?;
-        // A keyed collection read on a receiver whose exact type and complete
-        // active contract are proven names its own aggregate location; an
-        // array or unproven base keeps the element-identity proof below.
-        let keyed_lookup = self.modeled_hashmap_lookup_flow(*base, "index").is_some();
-        let (index, constant_index, identity) = if keyed_lookup {
-            let key = Some(self.keyed_place_value(builder, *index_node)?);
-            (
-                key,
-                None,
-                crate::analyzer::semantic::IndexedLocationIdentity::Aggregate,
-            )
-        } else {
-            let indexed = self.index_value(builder, *index_node)?;
-            let (index, constant_index) = indexed
-                .map_or((None, None), |(value, constant_index)| {
-                    (Some(value), Some(constant_index))
-                });
-            (
-                index,
-                constant_index,
-                crate::analyzer::semantic::IndexedLocationIdentity::Element,
-            )
-        };
+        let indexed = self.index_value(builder, *index_node)?;
+        let (index, constant_index) = indexed.map_or((None, None), |(value, constant_index)| {
+            (Some(value), Some(constant_index))
+        });
         let location = self.session.add_memory_location(
             builder,
             access,
@@ -3354,10 +5469,10 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 base: base_value,
                 index,
                 constant_index,
-                identity,
+                identity: crate::analyzer::semantic::IndexedLocationIdentity::Element,
             },
         )?;
-        if !keyed_lookup && index.is_none() {
+        if index.is_none() {
             self.add_dynamic_index_gap(builder, access, location)?;
         }
         self.append_effect(
@@ -3369,8 +5484,63 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 result,
             },
         )?;
-        if !keyed_lookup && !self.place_access_is_language_defined(node) {
-            self.add_gap(
+        if self.pointer_pointee_type(*base).is_some() {
+            let width = self
+                .pointer_pointee_type(*base)
+                .and_then(|element| rust_type_byte_size(self.source, element))
+                .map_or(PointerAccessWidth::Unknown, PointerAccessWidth::Exact);
+            let aliases = self
+                .pointer_origins_by_pointer
+                .get(&base_value)
+                .cloned()
+                .or_else(|| {
+                    self.binding_value(*base)
+                        .and_then(|binding| self.pointer_origins_by_pointer.get(&binding).cloned())
+                })
+                .unwrap_or_default();
+            let pointer = if aliases.is_empty() {
+                base_value
+            } else {
+                let address = self.value(builder, access, SemanticValueKind::Address)?;
+                let element_size = match width {
+                    PointerAccessWidth::Exact(size) => Some(size),
+                    PointerAccessWidth::ValueTimes { .. } | PointerAccessWidth::Unknown => None,
+                };
+                for (origin, base_offset) in aliases {
+                    let offset = match (base_offset, element_size, constant_index) {
+                        (PointerByteOffset::Exact(base), Some(size), Some(index)) => {
+                            i128::try_from(index)
+                                .ok()
+                                .and_then(|index| index.checked_mul(i128::try_from(size).ok()?))
+                                .and_then(|index| base.checked_add(index))
+                                .map_or(PointerByteOffset::Unknown, PointerByteOffset::Exact)
+                        }
+                        _ => PointerByteOffset::Unknown,
+                    };
+                    self.add_pointer_alias(
+                        access,
+                        address,
+                        origin,
+                        offset,
+                        PointerRelationStrength::Must,
+                        self.metadata(access)?,
+                    );
+                }
+                address
+            };
+            let metadata = self.metadata(access)?;
+            self.add_pointer_access(access, pointer, PointerAccessKind::Read, width, metadata);
+            if width == PointerAccessWidth::Unknown {
+                self.add_incomplete_fact(
+                    access,
+                    SemanticIncompleteSubject::Value(pointer),
+                    SemanticIncompleteReason::Pointer(PointerIncompleteReason::UnknownLayout),
+                    metadata,
+                );
+            }
+        }
+        if !self.place_access_is_language_defined(node) {
+            self.session.record_gap(
                 builder,
                 access,
                 SemanticGapSubject::Point,
@@ -3380,7 +5550,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             )?;
         }
         // Built in or not, an index read may abort on an out-of-range index.
-        self.add_gap(
+        self.session.record_gap(
             builder,
             access,
             SemanticGapSubject::Point,
@@ -3388,7 +5558,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             SemanticGapKind::Unsupported,
             "indexing may abort on an out-of-range index; that abort edge is not lowered",
         )?;
-        self.edge(builder, access, next)?;
+        self.session.add_target_edge(builder, access, next)?;
         self.schedule_expressions(
             builder,
             entry,
@@ -3412,7 +5582,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         let boundary = self.point(builder, node, Vec::new())?;
         let reason = implicit_runtime_call_reason(node.kind())
             .expect("implicit-call expressions are dispatched by node kind");
-        self.add_gap(
+        self.session.record_gap(
             builder,
             boundary,
             SemanticGapSubject::Point,
@@ -3424,7 +5594,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             // Not lowering the abort edge is `Unsupported`, the shape the
             // shared implicit-abort discharge closes; an operation that cannot
             // abort publishes nothing at all.
-            self.add_gap(
+            self.session.record_gap(
                 builder,
                 boundary,
                 SemanticGapSubject::Point,
@@ -3440,7 +5610,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             .child_by_field_name("left")
             .is_none_or(|left| self.assignment_replaces_droppable_value(left))
         {
-            self.add_gap(
+            self.session.record_gap(
                 builder,
                 boundary,
                 SemanticGapSubject::Point,
@@ -3448,7 +5618,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 SemanticGapKind::Unknown,
                 "assignment may replace a live value, but its implicit Drop order and cleanup control are not lowered",
             )?;
-            self.add_gap(
+            self.session.record_gap(
                 builder,
                 boundary,
                 SemanticGapSubject::Point,
@@ -3457,7 +5627,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 "resource release for the value replaced by assignment depends on its inferred type and Drop implementation",
             )?;
         }
-        self.edge(builder, boundary, next)?;
+        self.session.add_target_edge(builder, boundary, next)?;
         let children = runtime_expression_children(node);
         self.schedule_expressions(
             builder,
@@ -3487,7 +5657,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         let condition_entry = self.point(builder, condition, Vec::new())?;
         let consequence_has_bindings = condition_introduces_pattern_bindings(condition);
         let consequence_scope = if consequence_has_bindings {
-            self.push_cleanup_scope(builder, scope)?
+            self.push_cleanup_scope(builder, scope, condition)?
         } else {
             scope
         };
@@ -3498,6 +5668,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 builder,
                 consequence_entry.expect("scheduled branch has an entry"),
                 "values introduced by an if-let condition may require implicit Drop when the consequence completes",
+                SemanticGapDischarge::None,
             )?;
         }
         let alternative_entry = alternative
@@ -3517,7 +5688,8 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             },
             scope,
         });
-        self.edge(builder, entry, EdgeTarget::normal(condition_entry))
+        self.session
+            .add_target_edge(builder, entry, EdgeTarget::normal(condition_entry))
     }
 
     fn schedule_branch(
@@ -3570,7 +5742,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         // selected pattern *binds* is still unknown, and that is published per
         // arm, on the value it binds.
         if arms.is_empty() {
-            self.edge(builder, decision, next)?;
+            self.session.add_target_edge(builder, decision, next)?;
         } else {
             let candidates = arms
                 .iter()
@@ -3582,7 +5754,8 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 .collect::<Result<Vec<_>, _>>()?;
             let mut arm_scopes = Vec::with_capacity(arms.len());
             for (index, candidate) in candidates.iter().enumerate() {
-                arm_scopes.push(self.push_cleanup_scope(builder, scope)?);
+                let pattern = required_field(arms[index], "pattern")?;
+                arm_scopes.push(self.push_cleanup_scope(builder, scope, pattern)?);
                 // Only an arm that actually binds a name introduces a value
                 // whose identity and drop obligation are unresolved. A literal
                 // or wildcard arm introduces neither.
@@ -3593,7 +5766,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                     continue;
                 }
                 let bound = self.value(builder, *candidate, SemanticValueKind::Local)?;
-                self.add_gap(
+                self.session.record_gap(
                     builder,
                     *candidate,
                     SemanticGapSubject::Value(bound),
@@ -3605,10 +5778,11 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                     builder,
                     *candidate,
                     "values introduced by a selected match pattern may require implicit Drop when the arm completes",
+                    SemanticGapDischarge::None,
                 )?;
             }
             for candidate in &candidates {
-                self.edge(
+                self.session.add_target_edge(
                     builder,
                     decision,
                     EdgeTarget {
@@ -3643,7 +5817,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                         scope: arm_scopes[index],
                     });
                 } else {
-                    self.edge(
+                    self.session.add_target_edge(
                         builder,
                         candidates[index],
                         EdgeTarget {
@@ -3698,7 +5872,8 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             },
             scope: loop_scope,
         });
-        self.edge(builder, entry, EdgeTarget::normal(body_entry))
+        self.session
+            .add_target_edge(builder, entry, EdgeTarget::normal(body_entry))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -3729,7 +5904,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         );
         let body_has_bindings = condition_introduces_pattern_bindings(condition);
         let body_scope = if body_has_bindings {
-            self.push_cleanup_scope(builder, loop_scope)?
+            self.push_cleanup_scope(builder, loop_scope, condition)?
         } else {
             loop_scope
         };
@@ -3738,6 +5913,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 builder,
                 body_entry,
                 "values introduced by a while-let condition may require implicit Drop after each selected iteration",
+                SemanticGapDischarge::None,
             )?;
         }
         stack.push(Work::Statement {
@@ -3762,7 +5938,8 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             },
             scope: loop_scope,
         });
-        self.edge(builder, entry, EdgeTarget::normal(condition_entry))
+        self.session
+            .add_target_edge(builder, entry, EdgeTarget::normal(condition_entry))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -3789,7 +5966,8 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 continue_edge_kind: ControlEdgeKind::LoopBack,
             },
         );
-        let body_scope = self.push_cleanup_scope(builder, loop_scope)?;
+        let pattern = required_field(node, "pattern")?;
+        let body_scope = self.push_cleanup_scope(builder, loop_scope, pattern)?;
         // The values the pattern binds are values of this procedure like any
         // other: each derives from the iterable. Publishing that element-of
         // relation is what carries a tainted collection into a loop body. A
@@ -3806,6 +5984,15 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                     .and_then(|text| self.local_declaration_value(text, name.start_byte()))
             })
             .collect::<Vec<_>>();
+        let region = CleanupRegionId::new(
+            u32::try_from(self.next_cleanup_region - 1)
+                .expect("push_cleanup_scope allocated this region"),
+        );
+        let _has_cleanup_actions = self
+            .register_binding_cleanup_actions(builder, body_scope, region, &elements, body_entry)?;
+        if !elements.is_empty() {
+            self.binding_cleanup_regions.insert(region);
+        }
         if !elements.is_empty() {
             let iterable_value =
                 self.expression_value(builder, iterable, expression_value_kind(iterable))?;
@@ -3829,9 +6016,10 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 builder,
                 body_entry,
                 "the per-iteration for-pattern value may require implicit Drop after the selected iteration",
+                SemanticGapDischarge::None,
             )?;
         }
-        self.add_gap(
+        self.session.record_gap(
             builder,
             test,
             SemanticGapSubject::Point,
@@ -3842,7 +6030,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         // No `NormalControlFlow` gap: both successors of the exhaustion test
         // are represented below, so claiming the loop's control flow is
         // unknown over-states what is missing.
-        self.edge(
+        self.session.add_target_edge(
             builder,
             test,
             EdgeTarget {
@@ -3850,7 +6038,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 kind: ControlEdgeKind::ConditionalTrue,
             },
         )?;
-        self.edge(
+        self.session.add_target_edge(
             builder,
             test,
             EdgeTarget {
@@ -3905,7 +6093,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             entry
         };
         if value.is_some() {
-            self.add_gap(
+            self.session.record_gap(
                 builder,
                 terminal,
                 SemanticGapSubject::Point,
@@ -4010,7 +6198,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         // successor set is complete. Which one runs is a value question, and
         // the unlowered `Try::branch` and `FromResidual` calls below already
         // state that the value question is open.
-        self.add_gap(
+        self.session.record_gap(
             builder,
             branch,
             SemanticGapSubject::Point,
@@ -4018,7 +6206,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             SemanticGapKind::Unknown,
             "Try::branch and FromResidual conversion are implicit calls not emitted as fabricated call sites",
         )?;
-        self.edge(
+        self.session.add_target_edge(
             builder,
             branch,
             EdgeTarget {
@@ -4026,7 +6214,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 kind: ControlEdgeKind::ConditionalTrue,
             },
         )?;
-        self.edge(
+        self.session.add_target_edge(
             builder,
             branch,
             EdgeTarget {
@@ -4041,7 +6229,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 value: Some(residual_value),
             },
         )?;
-        self.add_gap(
+        self.session.record_gap(
             builder,
             residual,
             SemanticGapSubject::Value(residual_value),
@@ -4049,7 +6237,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             SemanticGapKind::Unknown,
             "the ? residual path may drop temporaries and enclosing locals before returning",
         )?;
-        self.add_gap(
+        self.session.record_gap(
             builder,
             residual,
             SemanticGapSubject::Value(residual_value),
@@ -4077,7 +6265,8 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
     ) -> Result<(), RustLoweringError> {
         first_named_child(node).ok_or_else(|| missing_field(node, "block"))?;
         let boundary = self.point(builder, node, Vec::new())?;
-        self.edge(builder, entry, EdgeTarget::normal(boundary))?;
+        self.session
+            .add_target_edge(builder, entry, EdgeTarget::normal(boundary))?;
         for (capability, kind, detail) in [
             (
                 SemanticCapability::NormalControlFlow,
@@ -4110,7 +6299,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 "the try-block result value is not represented",
             ),
         ] {
-            self.add_gap(
+            self.session.record_gap(
                 builder,
                 boundary,
                 SemanticGapSubject::Point,
@@ -4133,6 +6322,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         stack: &mut Vec<Work<'tree>>,
     ) -> Result<(), RustLoweringError> {
         let awaited_node = first_named_child(node);
+        let structural_node_index = self.structural_node_index;
         let AwaitScaffold {
             suspend,
             normal_resume: normal,
@@ -4141,11 +6331,50 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         } = self
             .session
             .add_await_scaffold(builder, |session, builder| {
-                session.add_node_mapping(builder, node)
+                let range = node.byte_range();
+                let occurrence = session.next_source_occurrence(range.start, range.end);
+                let anchor = source_anchor(node, occurrence).map_err(RustLoweringError::Invalid)?;
+                let ast_identity = structural_node_index.and_then(|index| index.identity(node));
+                session.add_mapping_with_ast_identity(
+                    builder,
+                    anchor,
+                    SourceMappingKind::Exact,
+                    ast_identity,
+                )
             })?;
-        self.edge(builder, normal, next)?;
-        self.abrupt(builder, exceptional, scope, CompletionKind::Throw, None)?;
-        self.add_gap(
+        self.session.add_target_edge(builder, normal, next)?;
+        let live_places = self
+            .binding_scopes
+            .iter()
+            .filter(|(_, (live_from, scope_start, scope_end))| {
+                *live_from <= node.start_byte()
+                    && *scope_start <= node.start_byte()
+                    && node.end_byte() <= *scope_end
+            })
+            .flat_map(|(value, _)| {
+                self.cleanup_places_by_binding
+                    .get(value)
+                    .into_iter()
+                    .flatten()
+                    .cloned()
+            })
+            .collect::<Vec<_>>();
+        if let Some(cancellation_route) =
+            builder.resolve_cancellation(scope, self.exceptional_exit, &live_places)
+        {
+            if !completion_has_unrouted_drop(&cancellation_route) {
+                self.add_drop_omission_gaps(
+                    builder,
+                    exceptional,
+                    "the awaited future temporary may require implicit Drop on exceptional resume",
+                    SemanticGapDischarge::None,
+                )?;
+            }
+            self.route(builder, exceptional, &cancellation_route)?;
+        } else {
+            self.abrupt(builder, exceptional, scope, CompletionKind::Throw, None)?;
+        }
+        self.session.record_gap(
             builder,
             suspend,
             SemanticGapSubject::Point,
@@ -4153,7 +6382,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             SemanticGapKind::Unsupported,
             "Future::poll, executor scheduling, wakeups, pinning, repeated pending states, and the conservative exceptional boundary require async refinement",
         )?;
-        self.add_gap(
+        self.session.record_gap(
             builder,
             suspend,
             SemanticGapSubject::Point,
@@ -4161,7 +6390,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             SemanticGapKind::Unknown,
             "IntoFuture::into_future and Future::poll are implicit calls not emitted as fabricated call sites",
         )?;
-        self.add_gap(
+        self.session.record_gap(
             builder,
             suspend,
             SemanticGapSubject::Point,
@@ -4177,7 +6406,8 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 scope,
             });
         } else {
-            self.edge(builder, entry, EdgeTarget::normal(suspend))?;
+            self.session
+                .add_target_edge(builder, entry, EdgeTarget::normal(suspend))?;
         }
         Ok(())
     }
@@ -4196,7 +6426,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         } else {
             entry
         };
-        self.add_gap(
+        self.session.record_gap(
             builder,
             suspend,
             SemanticGapSubject::Point,
@@ -4215,12 +6445,605 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         Ok(())
     }
 
+    fn macro_invocation(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        node: Node<'tree>,
+        entry: ProgramPointId,
+        next: EdgeTarget,
+        scope: ScopeFrameId,
+    ) -> Result<(), RustLoweringError> {
+        let local_macro =
+            brokk_bifrost_rust::macro_matcher::match_local_macro_invocation_with_definitions(
+                node,
+                self.source,
+                self.exported_macro_definitions,
+            )
+            .is_some();
+        let Some(path) = node.child_by_field_name("macro") else {
+            self.macro_boundary(builder, node, entry)?;
+            return Ok(());
+        };
+        let address_of_name = brokk_bifrost_rust::graph_support::rust_path_segments(path)
+            .and_then(|segments| segments.last().copied())
+            .and_then(|segment| node_text(self.source, segment));
+        let address_of_candidate = matches!(address_of_name, Some("addr_of" | "addr_of_mut"));
+        let Some(candidate) = rust_macro_call_candidate(path, self.source) else {
+            let boundary = self.macro_boundary(builder, node, entry)?;
+            if address_of_candidate {
+                let value = self.expression_value(builder, node, SemanticValueKind::Address)?;
+                self.add_incomplete_fact(
+                    boundary,
+                    SemanticIncompleteSubject::Value(value),
+                    SemanticIncompleteReason::Pointer(
+                        PointerIncompleteReason::UnsupportedOperation,
+                    ),
+                    self.metadata(boundary)?,
+                );
+            }
+            return Ok(());
+        };
+        if local_macro && !matches!(&candidate, RustMacroCallCandidate::Formatting(_)) {
+            self.macro_boundary(builder, node, entry)?;
+            return Ok(());
+        }
+        self.builtin_macro_call(builder, node, path, candidate, entry, next, scope)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn builtin_macro_call(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        node: Node<'tree>,
+        path: Node<'tree>,
+        candidate: RustMacroCallCandidate,
+        entry: ProgramPointId,
+        next: EdgeTarget,
+        scope: ScopeFrameId,
+    ) -> Result<(), RustLoweringError> {
+        let argument_evaluation = self.point(builder, node, Vec::new())?;
+        let invoke = self.point(builder, node, Vec::new())?;
+        let normal = self.point(builder, node, Vec::new())?;
+        let exceptional = self.point(builder, node, Vec::new())?;
+        // Match call_expression lowering: the callable value is anchored to
+        // the structured path's terminal name, which exact-call dispatch maps
+        // back to the full path from the invocation's source range.
+        let callable_anchor = rust_callable_anchor(path);
+        let callee = self.source_value(builder, callable_anchor, SemanticValueKind::Callable)?;
+        let result = self.expression_value(builder, node, SemanticValueKind::Temporary)?;
+        let thrown = self.source_value(builder, callable_anchor, SemanticValueKind::Exception)?;
+        let resolution = CallableTargetResolution::Unknown;
+        let metadata = self.metadata(invoke)?;
+        // SemanticCallSite has no macro-specific callable kind. A formatting
+        // invocation uses its Function form; exact macro identity is resolved
+        // later by ordinary query-time dispatch from the structured AST path.
+        self.append_effect(
+            builder,
+            invoke,
+            SemanticEffect::CallableReference {
+                result: callee,
+                callable: CallableValue {
+                    kind: CallableReferenceKind::Function,
+                    targets: resolution.clone(),
+                    target_evidence: metadata.evidence,
+                    bound_receiver: None,
+                    environment: None,
+                },
+            },
+        )?;
+
+        let sink_argument_count = match candidate {
+            RustMacroCallCandidate::Formatting(
+                RustFormattingMacro::Print
+                | RustFormattingMacro::Println
+                | RustFormattingMacro::Eprint
+                | RustFormattingMacro::Eprintln
+                | RustFormattingMacro::Panic,
+            ) => Some(1),
+            RustMacroCallCandidate::Logging(RustLoggingMacro::Log) => Some(5),
+            RustMacroCallCandidate::Value(
+                RustValueMacro::AssertEq
+                | RustValueMacro::AssertNe
+                | RustValueMacro::DebugAssertEq
+                | RustValueMacro::DebugAssertNe,
+            ) => Some(4),
+            RustMacroCallCandidate::Value(
+                RustValueMacro::Assert
+                | RustValueMacro::DebugAssert
+                | RustValueMacro::Unreachable
+                | RustValueMacro::Todo
+                | RustValueMacro::Unimplemented
+                | RustValueMacro::Panic
+                | RustValueMacro::Dbg,
+            ) => Some(1),
+            _ => None,
+        };
+        let is_sink_macro = sink_argument_count.is_some();
+        let has_writer_receiver = matches!(
+            candidate,
+            RustMacroCallCandidate::Formatting(macro_kind) if macro_kind.has_writer_receiver()
+        );
+        let mut vector_element_count = None;
+        let parsed = match candidate {
+            RustMacroCallCandidate::Value(RustValueMacro::Matches) => {
+                brokk_bifrost_rust::format_args::rust_matches_macro_scrutinee(node, self.source)
+                    .map(|argument| vec![argument])
+            }
+            RustMacroCallCandidate::Value(RustValueMacro::Vec) => {
+                brokk_bifrost_rust::format_args::rust_vec_macro_arguments(node, self.source).map(
+                    |arguments| match arguments {
+                        brokk_bifrost_rust::format_args::RustVecMacroArguments::Elements(
+                            elements,
+                        ) => {
+                            vector_element_count = Some(elements.len());
+                            elements
+                        }
+                        brokk_bifrost_rust::format_args::RustVecMacroArguments::Repeated(
+                            repeated,
+                        ) => {
+                            vector_element_count = Some(1);
+                            vec![repeated.element, repeated.count]
+                        }
+                    },
+                )
+            }
+            _ => brokk_bifrost_rust::format_args::rust_format_macro_arguments(node, self.source),
+        };
+        let arguments = parsed.as_ref().ok();
+        let mut complete = arguments.is_some();
+        let mut receiver = None;
+        let mut call_arguments = Vec::new();
+        let mut argument_values = Vec::new();
+        if let Some(arguments) = arguments {
+            if matches!(
+                candidate,
+                RustMacroCallCandidate::Value(RustValueMacro::Dbg)
+            ) && arguments.len() != 1
+            {
+                complete = false;
+            }
+            if has_writer_receiver {
+                if let Some(writer) = arguments.first() {
+                    receiver = Some(self.format_macro_argument_value(
+                        builder,
+                        node,
+                        argument_evaluation,
+                        writer,
+                    )?);
+                } else {
+                    complete = false;
+                }
+            }
+            for (index, argument) in arguments.iter().enumerate() {
+                if has_writer_receiver && index == 0 {
+                    continue;
+                }
+                let value =
+                    self.format_macro_argument_value(builder, node, argument_evaluation, argument)?;
+                argument_values.push(value);
+                if !is_sink_macro {
+                    call_arguments.push(SemanticCallArgument::direct(
+                        value,
+                        ArgumentDomain::Positional,
+                    ));
+                }
+            }
+
+            let format_index = match candidate {
+                RustMacroCallCandidate::Formatting(macro_kind) => {
+                    Some(usize::from(macro_kind.has_writer_receiver()))
+                }
+                RustMacroCallCandidate::Logging(_) => arguments.iter().position(|argument| {
+                    argument.name.is_none()
+                        && exact_source_node(node, argument.value_range).is_some_and(|value| {
+                            matches!(value.kind(), "string_literal" | "raw_string_literal")
+                        })
+                }),
+                RustMacroCallCandidate::Value(
+                    RustValueMacro::Assert | RustValueMacro::DebugAssert,
+                ) if arguments.len() > 1 => Some(1),
+                RustMacroCallCandidate::Value(
+                    RustValueMacro::AssertEq
+                    | RustValueMacro::AssertNe
+                    | RustValueMacro::DebugAssertEq
+                    | RustValueMacro::DebugAssertNe,
+                ) if arguments.len() > 2 => Some(2),
+                RustMacroCallCandidate::Value(
+                    RustValueMacro::Panic
+                    | RustValueMacro::Unreachable
+                    | RustValueMacro::Todo
+                    | RustValueMacro::Unimplemented,
+                ) => arguments
+                    .first()
+                    .filter(|argument| {
+                        exact_source_node(node, argument.value_range).is_some_and(|value| {
+                            matches!(value.kind(), "string_literal" | "raw_string_literal")
+                        })
+                    })
+                    .map(|_| 0),
+                _ => None,
+            };
+            let expects_format = matches!(
+                candidate,
+                RustMacroCallCandidate::Formatting(_) | RustMacroCallCandidate::Logging(_)
+            ) || matches!(
+                candidate,
+                RustMacroCallCandidate::Value(RustValueMacro::Assert | RustValueMacro::DebugAssert)
+                    if arguments.len() > 1
+            ) || matches!(
+                candidate,
+                RustMacroCallCandidate::Value(
+                    RustValueMacro::AssertEq
+                        | RustValueMacro::AssertNe
+                        | RustValueMacro::DebugAssertEq
+                        | RustValueMacro::DebugAssertNe
+                ) if arguments.len() > 2
+            );
+            if expects_format && format_index.is_none() {
+                complete = false;
+            }
+            if let Some(format_index) = format_index {
+                let decoded_format = arguments
+                    .get(format_index)
+                    .and_then(|argument| exact_source_node(node, argument.value_range))
+                    .filter(|literal| {
+                        matches!(literal.kind(), "string_literal" | "raw_string_literal")
+                    })
+                    .and_then(|literal| {
+                        brokk_bifrost_rust::cargo_routes::rust_static_string_literal(
+                            literal,
+                            self.source,
+                        )
+                    });
+                if let Some(decoded_format) = decoded_format {
+                    match brokk_bifrost_rust::format_args::parse_rust_format_string(&decoded_format)
+                    {
+                        Ok(format) => {
+                            let positional = arguments
+                                .iter()
+                                .skip(format_index + 1)
+                                .filter(|argument| argument.name.is_none())
+                                .collect::<Vec<_>>();
+                            let named = arguments
+                                .iter()
+                                .filter_map(|argument| argument.name.as_deref())
+                                .collect::<HashSet<_>>();
+                            let mut implicit_index = 0;
+                            for reference in format.references.iter() {
+                                match reference {
+                                    brokk_bifrost_rust::format_args::RustFormatArgumentReference::Implicit => {
+                                        if positional.get(implicit_index).is_none() {
+                                            complete = false;
+                                        }
+                                        implicit_index += 1;
+                                    }
+                                    brokk_bifrost_rust::format_args::RustFormatArgumentReference::Index(index) => {
+                                        if positional.get(*index).is_none() {
+                                            complete = false;
+                                        }
+                                    }
+                                    brokk_bifrost_rust::format_args::RustFormatArgumentReference::Name(name) => {
+                                        if named.contains(name.as_ref()) {
+                                            continue;
+                                        }
+                                        if let Some(value) = self.format_capture_value(name, node.start_byte()) {
+                                            if is_sink_macro {
+                                                argument_values.push(value);
+                                            } else {
+                                                call_arguments.push(SemanticCallArgument::direct(
+                                                    value,
+                                                    ArgumentDomain::Positional,
+                                                ));
+                                            }
+                                        } else {
+                                            complete = false;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        Err(_) => complete = false,
+                    }
+                } else {
+                    complete = false;
+                }
+            }
+
+            let mut sink_operands = Vec::new();
+            let mut assertion_references = None;
+            match candidate {
+                RustMacroCallCandidate::Formatting(
+                    RustFormattingMacro::Print
+                    | RustFormattingMacro::Println
+                    | RustFormattingMacro::Eprint
+                    | RustFormattingMacro::Eprintln
+                    | RustFormattingMacro::Panic,
+                )
+                | RustMacroCallCandidate::Logging(_)
+                | RustMacroCallCandidate::Value(
+                    RustValueMacro::Panic
+                    | RustValueMacro::Unreachable
+                    | RustValueMacro::Todo
+                    | RustValueMacro::Unimplemented,
+                ) => sink_operands.extend(argument_values.iter().copied()),
+                RustMacroCallCandidate::Value(
+                    RustValueMacro::Assert | RustValueMacro::DebugAssert,
+                ) => sink_operands.extend(argument_values.iter().skip(1).copied()),
+                RustMacroCallCandidate::Value(
+                    RustValueMacro::AssertEq
+                    | RustValueMacro::AssertNe
+                    | RustValueMacro::DebugAssertEq
+                    | RustValueMacro::DebugAssertNe,
+                ) => {
+                    let mut references = Vec::new();
+                    for index in 0..2 {
+                        if let (Some(argument), Some(value)) =
+                            (arguments.get(index), argument_values.get(index))
+                        {
+                            let reference = self.borrow_macro_argument_value(
+                                builder,
+                                argument,
+                                argument_evaluation,
+                                *value,
+                            )?;
+                            references.push(reference);
+                            sink_operands.push(reference);
+                        } else {
+                            complete = false;
+                        }
+                    }
+                    if let [left, right] = references.as_slice() {
+                        assertion_references = Some((*left, *right));
+                    }
+                    sink_operands.extend(argument_values.iter().skip(2).copied());
+                }
+                RustMacroCallCandidate::Value(RustValueMacro::Dbg) => {
+                    if let (Some(argument), Some(value)) =
+                        (arguments.first(), argument_values.first())
+                    {
+                        sink_operands.push(self.borrow_macro_argument_value(
+                            builder,
+                            argument,
+                            argument_evaluation,
+                            *value,
+                        )?);
+                    }
+                }
+                _ => {}
+            }
+
+            if let Some(argument_count) = sink_argument_count {
+                let aggregate = self.value_at_source_range(
+                    builder,
+                    node.range(),
+                    SemanticValueKind::Temporary,
+                )?;
+                self.session.append_language_defined_value_flows(
+                    builder,
+                    argument_evaluation,
+                    sink_operands,
+                    aggregate,
+                )?;
+                call_arguments = if let Some((left, right)) = assertion_references {
+                    let assertion_kind = match candidate {
+                        RustMacroCallCandidate::Value(
+                            RustValueMacro::AssertNe | RustValueMacro::DebugAssertNe,
+                        ) => "Ne",
+                        _ => "Eq",
+                    };
+                    let kind_value = self.value_at_source_range(
+                        builder,
+                        node.range(),
+                        SemanticValueKind::ConstantString(assertion_kind.into()),
+                    )?;
+                    [kind_value, left, right, aggregate]
+                        .into_iter()
+                        .map(|value| {
+                            SemanticCallArgument::direct(value, ArgumentDomain::Positional)
+                        })
+                        .collect()
+                } else {
+                    (0..argument_count)
+                        .map(|_| {
+                            SemanticCallArgument::direct(aggregate, ArgumentDomain::Positional)
+                        })
+                        .collect()
+                };
+            }
+        }
+
+        match candidate {
+            RustMacroCallCandidate::Value(RustValueMacro::Dbg) => {
+                if let Some(value) = argument_values.first() {
+                    self.session.append_language_defined_value_flows(
+                        builder,
+                        argument_evaluation,
+                        [*value],
+                        result,
+                    )?;
+                }
+            }
+            RustMacroCallCandidate::Value(RustValueMacro::Vec) => {
+                let element_count = vector_element_count.unwrap_or_default();
+                self.session.append_language_defined_value_flows(
+                    builder,
+                    argument_evaluation,
+                    argument_values.iter().take(element_count).copied(),
+                    result,
+                )?;
+                call_arguments = argument_values
+                    .iter()
+                    .take(element_count)
+                    .copied()
+                    .map(|value| SemanticCallArgument::direct(value, ArgumentDomain::Positional))
+                    .collect();
+            }
+            _ => {}
+        }
+
+        let call_site = self.session.add_call_site(
+            builder,
+            CallSiteScaffold {
+                point: invoke,
+                callee,
+                receiver,
+                arguments: call_arguments.into_boxed_slice(),
+                normal_results: Box::new([]),
+                result: Some(result),
+                thrown: Some(thrown),
+                declared_targets: resolution.clone(),
+                normal_continuation: normal,
+                exceptional_continuation: exceptional,
+            },
+        )?;
+        self.session
+            .add_target_edge(builder, entry, EdgeTarget::normal(argument_evaluation))?;
+        self.session
+            .add_target_edge(builder, argument_evaluation, EdgeTarget::normal(invoke))?;
+        self.session
+            .add_target_edge(builder, invoke, EdgeTarget::normal(normal))?;
+        self.session.add_target_edge(
+            builder,
+            invoke,
+            EdgeTarget {
+                point: exceptional,
+                kind: ControlEdgeKind::Exceptional,
+            },
+        )?;
+        self.session.add_target_edge(builder, normal, next)?;
+        self.add_droppable_initializer_temporary_gap(builder, node, exceptional, scope)?;
+        self.abrupt(builder, exceptional, scope, CompletionKind::Throw, None)?;
+        // This is the same query-deferred target representation and paired
+        // refinement gaps as an ordinary Rust path call. A user macro remains
+        // open when its resolved identity has no intrinsic summary.
+        self.resolution_gaps(builder, invoke, callee, call_site, &resolution)?;
+        if matches!(
+            candidate,
+            RustMacroCallCandidate::Formatting(RustFormattingMacro::Panic)
+                | RustMacroCallCandidate::Value(
+                    RustValueMacro::Panic
+                        | RustValueMacro::Unreachable
+                        | RustValueMacro::Todo
+                        | RustValueMacro::Unimplemented
+                )
+        ) {
+            // The terminal macro name selects argument grammar, but query-time
+            // dispatch has not yet proved the exact macro identity. Keep the
+            // normal-completion boundary open until exact call resolution.
+            let subject = SemanticGapSubject::CallSite(call_site);
+            self.session.add_gap_with_impacts_and_discharge(
+                builder,
+                invoke,
+                subject,
+                SemanticCapability::NormalControlFlow,
+                SemanticGapImpacts::for_gap(SemanticCapability::NormalControlFlow, subject),
+                SemanticGapKind::Unknown,
+                SemanticGapDischarge::CallResolution,
+                "diverging macro identity is unresolved, so normal completion remains open",
+            )?;
+        }
+        if !complete {
+            self.session.record_gap(
+                builder,
+                invoke,
+                SemanticGapSubject::CallSite(call_site),
+                SemanticCapability::Values,
+                SemanticGapKind::Unknown,
+                "built-in macro arguments or placeholder references are malformed, unavailable, or unresolved",
+            )?;
+        }
+        Ok(())
+    }
+
+    fn format_macro_argument_value(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        invocation: Node<'tree>,
+        point: ProgramPointId,
+        argument: &brokk_bifrost_rust::format_args::RustFormatMacroArgument,
+    ) -> Result<ValueId, RustLoweringError> {
+        let value = self.value_at_source_range(
+            builder,
+            argument.value_range,
+            SemanticValueKind::Temporary,
+        )?;
+        let bindings = argument
+            .binding_ranges
+            .iter()
+            .filter_map(|range| exact_source_node(invocation, *range))
+            .filter_map(|identifier| self.binding_value(identifier))
+            .collect::<Vec<_>>();
+        self.session
+            .append_language_defined_value_flows(builder, point, bindings, value)?;
+        Ok(value)
+    }
+
+    fn borrow_macro_argument_value(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        argument: &brokk_bifrost_rust::format_args::RustFormatMacroArgument,
+        point: ProgramPointId,
+        value: ValueId,
+    ) -> Result<ValueId, RustLoweringError> {
+        let borrowed =
+            self.value_at_source_range(builder, argument.value_range, SemanticValueKind::Address)?;
+        self.session
+            .append_language_defined_value_flows(builder, point, [value], borrowed)?;
+        Ok(borrowed)
+    }
+
+    fn format_capture_value(&self, name: &str, byte: usize) -> Option<ValueId> {
+        if name == "self" {
+            return self
+                .receiver
+                .or_else(|| self.captured_bindings.get(name).copied());
+        }
+        self.local_at(name, byte)
+            .or_else(|| self.parameters.get(name).copied())
+            .or_else(|| self.captured_bindings.get(name).copied())
+    }
+
+    fn value_at_source_range(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        range: tree_sitter::Range,
+        kind: SemanticValueKind,
+    ) -> Result<ValueId, RustLoweringError> {
+        let start = range.start_point;
+        let end = range.end_point;
+        let source_position = |byte, point: tree_sitter::Point| {
+            Ok::<_, RustLoweringError>(SourcePosition::new(
+                u32::try_from(byte)
+                    .map_err(|_| RustLoweringError::Invalid("source byte exceeds u32".into()))?,
+                u32::try_from(point.row)
+                    .map_err(|_| RustLoweringError::Invalid("source line exceeds u32".into()))?,
+                u32::try_from(point.column)
+                    .map_err(|_| RustLoweringError::Invalid("source column exceeds u32".into()))?,
+            ))
+        };
+        let span = SourceSpan::new(
+            source_position(range.start_byte, start)?,
+            source_position(range.end_byte, end)?,
+        )
+        .map_err(|error| RustLoweringError::Invalid(error.to_string()))?;
+        let anchor = SourceAnchor::new(
+            span,
+            self.session
+                .next_source_occurrence(range.start_byte, range.end_byte),
+        );
+        let metadata = self
+            .session
+            .add_mapping(builder, anchor, SourceMappingKind::Exact)?;
+        self.session
+            .add_value_with_metadata(builder, metadata, kind)
+    }
+
     fn macro_boundary(
         &mut self,
         builder: &mut ProcedureCfgBuilder,
         node: Node<'tree>,
         entry: ProgramPointId,
-    ) -> Result<(), RustLoweringError> {
+    ) -> Result<ProgramPointId, RustLoweringError> {
         // Keep macro-expansion uncertainty on a source-mapped boundary for the
         // invocation itself. The incoming point may carry a distinct gap (for
         // example, implicit Drop uncertainty for a match-arm binding), so
@@ -4228,8 +7051,17 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         // contract and conflate the two semantic causes. No continuation is
         // fabricated after an opaque expansion.
         let boundary = self.point(builder, node, Vec::new())?;
-        self.edge(builder, entry, EdgeTarget::normal(boundary))?;
-        self.add_gap(
+        self.session
+            .add_target_edge(builder, entry, EdgeTarget::normal(boundary))?;
+        self.add_incomplete_fact(
+            boundary,
+            SemanticIncompleteSubject::Procedure,
+            SemanticIncompleteReason::Lifecycle(
+                LifecycleIncompleteReason::UnsupportedMacroExpansion,
+            ),
+            self.metadata(boundary)?,
+        );
+        self.session.record_gap(
             builder,
             boundary,
             SemanticGapSubject::Point,
@@ -4237,7 +7069,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             SemanticGapKind::Unsupported,
             "macro token-tree expansion is unavailable; control after this invocation is intentionally not fabricated",
         )?;
-        self.add_gap(
+        self.session.record_gap(
             builder,
             boundary,
             SemanticGapSubject::Point,
@@ -4245,7 +7077,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             SemanticGapKind::Unsupported,
             "calls produced by macro expansion are unavailable and no textual macro parser is used",
         )?;
-        self.add_gap(
+        self.session.record_gap(
             builder,
             boundary,
             SemanticGapSubject::Point,
@@ -4253,7 +7085,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             SemanticGapKind::Unsupported,
             "macro expansion may introduce panic or other exceptional behavior that is unavailable",
         )?;
-        self.add_gap(
+        self.session.record_gap(
             builder,
             boundary,
             SemanticGapSubject::Point,
@@ -4261,7 +7093,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             SemanticGapKind::Unsupported,
             "macro expansion may introduce return, break, continue, or other non-local control that is unavailable",
         )?;
-        self.add_gap(
+        self.session.record_gap(
             builder,
             boundary,
             SemanticGapSubject::Point,
@@ -4269,260 +7101,15 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             SemanticGapKind::Unsupported,
             "macro expansion may introduce scope exits or cleanup control that is unavailable",
         )?;
-        self.add_gap(
+        self.session.record_gap(
             builder,
             boundary,
             SemanticGapSubject::Point,
             SemanticCapability::ResourceManagement,
             SemanticGapKind::Unsupported,
             "resource acquisition and release produced by macro expansion are unavailable",
-        )
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    /// A receiver-method `insert` or `get` whose receiver type, callable,
-    /// and complete active contract are proven lowers to the keyed memory
-    /// access the contract describes instead of an unmodeled external call.
-    /// Anything else returns `None` and keeps the generic call lowering with
-    /// its gaps.
-    #[allow(clippy::too_many_arguments)]
-    fn modeled_hashmap_call(
-        &mut self,
-        builder: &mut ProcedureCfgBuilder,
-        node: Node<'tree>,
-        entry: ProgramPointId,
-        next: EdgeTarget,
-        scope: ScopeFrameId,
-        stack: &mut Vec<Work<'tree>>,
-    ) -> Result<Option<()>, RustLoweringError> {
-        let function = match node.child_by_field_name("function") {
-            // A turbofish changes generic applicability, which this consumer
-            // does not model; the generic call lowering keeps its gaps.
-            Some(function) if function.kind() == "field_expression" => function,
-            _ => return Ok(None),
-        };
-        let member = match function
-            .child_by_field_name("field")
-            .and_then(|field| node_text(self.source, field))
-        {
-            Some(member @ ("insert" | "get")) => member,
-            _ => return Ok(None),
-        };
-        let receiver = match function.child_by_field_name("value") {
-            Some(receiver) => receiver,
-            None => return Ok(None),
-        };
-        let arguments = call_arguments(node);
-        match (member, arguments.as_slice()) {
-            ("insert", [key, value]) => {
-                if self.modeled_hashmap_insert_flow(receiver).is_none() {
-                    return Ok(None);
-                }
-                self.lower_modeled_hashmap_insert(
-                    builder, node, receiver, *key, *value, entry, next, scope, stack,
-                )
-                .map(Some)
-            }
-            ("get", [key]) => {
-                if self.modeled_hashmap_lookup_flow(receiver, "get").is_none() {
-                    return Ok(None);
-                }
-                self.lower_modeled_hashmap_get(
-                    builder, node, receiver, *key, entry, next, scope, stack,
-                )
-                .map(Some)
-            }
-            _ => Ok(None),
-        }
-    }
-
-    /// `map.insert(key, value)` as the contract describes it: the previous
-    /// entry under the key is the call's result, and the inserted value is
-    /// stored under that key in the receiver's contents.
-    #[allow(clippy::too_many_arguments)]
-    fn lower_modeled_hashmap_insert(
-        &mut self,
-        builder: &mut ProcedureCfgBuilder,
-        node: Node<'tree>,
-        receiver: Node<'tree>,
-        key_node: Node<'tree>,
-        value_node: Node<'tree>,
-        entry: ProgramPointId,
-        next: EdgeTarget,
-        scope: ScopeFrameId,
-        stack: &mut Vec<Work<'tree>>,
-    ) -> Result<(), RustLoweringError> {
-        let access = self.point(builder, node, Vec::new())?;
-        let base = self.expression_value(builder, receiver, expression_value_kind(receiver))?;
-        let key = self.keyed_place_value(builder, key_node)?;
-        let value =
-            self.expression_value(builder, value_node, expression_value_kind(value_node))?;
-        let location = self.session.add_memory_location(
-            builder,
-            access,
-            MemoryLocationKind::Index {
-                base,
-                index: Some(key),
-                constant_index: None,
-                identity: crate::analyzer::semantic::IndexedLocationIdentity::Aggregate,
-            },
         )?;
-        self.append_effect(
-            builder,
-            access,
-            SemanticEffect::MemoryStore {
-                kind: MemoryAccessKind::Index,
-                location,
-                value,
-            },
-        )?;
-        self.add_gap(
-            builder,
-            access,
-            SemanticGapSubject::Point,
-            SemanticCapability::ExceptionalControlFlow,
-            SemanticGapKind::Unsupported,
-            "HashMap::insert may abort on allocation failure; that abort edge is not lowered",
-        )?;
-        self.edge(builder, access, next)?;
-        self.schedule_expressions(
-            builder,
-            entry,
-            &[receiver, key_node, value_node],
-            EdgeTarget::normal(access),
-            scope,
-            stack,
-        )
-    }
-
-    /// `map.get(key)` as the contract describes it: the entry value under the
-    /// key is the call's result. `get` is infallible, so unlike the index
-    /// form this publishes no abort gap.
-    #[allow(clippy::too_many_arguments)]
-    fn lower_modeled_hashmap_get(
-        &mut self,
-        builder: &mut ProcedureCfgBuilder,
-        node: Node<'tree>,
-        receiver: Node<'tree>,
-        key_node: Node<'tree>,
-        entry: ProgramPointId,
-        next: EdgeTarget,
-        scope: ScopeFrameId,
-        stack: &mut Vec<Work<'tree>>,
-    ) -> Result<(), RustLoweringError> {
-        let access = self.point(builder, node, Vec::new())?;
-        let base = self.expression_value(builder, receiver, expression_value_kind(receiver))?;
-        let key = self.keyed_place_value(builder, key_node)?;
-        let result = self.expression_value(builder, node, expression_value_kind(node))?;
-        let location = self.session.add_memory_location(
-            builder,
-            access,
-            MemoryLocationKind::Index {
-                base,
-                index: Some(key),
-                constant_index: None,
-                identity: crate::analyzer::semantic::IndexedLocationIdentity::Aggregate,
-            },
-        )?;
-        self.append_effect(
-            builder,
-            access,
-            SemanticEffect::MemoryLoad {
-                kind: MemoryAccessKind::Index,
-                location,
-                result,
-            },
-        )?;
-        self.edge(builder, access, next)?;
-        self.schedule_expressions(
-            builder,
-            entry,
-            &[receiver, key_node],
-            EdgeTarget::normal(access),
-            scope,
-            stack,
-        )
-    }
-
-    /// The exact active collection-flow contract for one receiver method, or
-    /// nothing when the receiver's type identity, the callable, or the flow
-    /// record is not proven. The overlay callable match must be unique, the
-    /// collection-flow record must be the only record for that callable, and
-    /// the record must carry complete coverage and provenance.
-    fn modeled_collection_flow(
-        &self,
-        receiver: Node<'tree>,
-        member: &str,
-        parameter_count: usize,
-    ) -> Option<&CollectionFlowContract> {
-        let overlay = self.semantic_model_overlay.as_deref()?;
-        let callable = self.modeled_receiver_callable(receiver, member, parameter_count)?;
-        let flows = overlay.collection_flows_for(&callable.id);
-        if flows.disposition != SemanticModelOverlayDisposition::Unique {
-            return None;
-        }
-        let [flow] = flows.records.as_slice() else {
-            return None;
-        };
-        flow.is_complete().then_some(flow)
-    }
-
-    /// Resolve a written receiver type and exact active callable before
-    /// interpreting any profile attached to it.
-    fn modeled_receiver_callable(
-        &self,
-        receiver: Node<'tree>,
-        member: &str,
-        parameter_count: usize,
-    ) -> Option<&crate::analyzer::semantic_model::SemanticModelSymbol> {
-        let overlay = self.semantic_model_overlay.as_deref()?;
-        let segments = self.receiver_qualified_type_identity(receiver)?;
-        if segments.len() < 2 {
-            return None;
-        }
-        let owner = segments.join(".");
-        let parameter_count = u32::try_from(parameter_count).ok()?;
-        overlay
-            .callable_for_application(
-                SemanticModelCallableKey::new(
-                    Language::Rust.config_label(),
-                    &owner,
-                    member,
-                    true,
-                    parameter_count,
-                ),
-                &SemanticModelCallApplication::positional(parameter_count),
-            )
-            .unique()
-    }
-
-    /// Keep a deferred factory distinct from a during-call transfer. The
-    /// eligible contract alone cannot establish the concrete result-to-resume
-    /// handle relation or Rust item/lifetime adaptation.
-    fn modeled_deferred_factory(&self, node: Node<'tree>) -> Option<&DeferredYieldContract> {
-        let function = node.child_by_field_name("function")?;
-        if function.kind() != "field_expression" {
-            return None;
-        }
-        let receiver = function.child_by_field_name("value")?;
-        let member = node_text(self.source, function.child_by_field_name("field")?)?;
-        let callable =
-            self.modeled_receiver_callable(receiver, member, call_arguments(node).len())?;
-        let overlay = self.semantic_model_overlay.as_deref()?;
-        let mut contracts = overlay
-            .deferred_yield_contracts()
-            .iter()
-            .filter(|contract| {
-                contract.factory == callable.id
-                    && contract.provenance.pack_digest == callable.provenance.pack_digest
-            });
-        let contract = contracts.next()?;
-        if contracts.next().is_some() || !contract.is_complete() {
-            return None;
-        }
-        let matched =
-            overlay.deferred_yields_for(&contract.factory, &contract.resume, &contract.handle_type);
-        (matched.disposition == SemanticModelOverlayDisposition::Unique).then_some(contract)
+        Ok(boundary)
     }
 
     /// The qualified type path the receiver's written type proves, through
@@ -4530,7 +7117,19 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
     /// A terminal name this file shadows or binds ambiguously stays
     /// unresolved.
     fn receiver_qualified_type_identity(&self, receiver: Node<'tree>) -> Option<Vec<Box<str>>> {
-        let mut ty = self.expression_type(receiver)?;
+        let Some(mut ty) = self.expression_type(receiver) else {
+            let name = node_text(self.source, receiver)?;
+            let initializer = self
+                .local_binding_at(name, receiver.start_byte())?
+                .initializer?;
+            let function = (initializer.kind() == "call_expression")
+                .then(|| initializer.child_by_field_name("function"))
+                .flatten()
+                .map(call_function_target)?;
+            return self
+                .vec_constructor_type_identity(function)
+                .map(|(segments, _)| segments);
+        };
         for _ in 0..RUST_RECEIVER_DEREFERENCE_BOUND {
             match self.dereferenced_type(ty) {
                 Some(inner) => ty = inner,
@@ -4553,60 +7152,49 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         Some(segments)
     }
 
+    fn vec_constructor_type_fact(
+        &self,
+        function: Node<'tree>,
+        call_site: CallSiteId,
+    ) -> Option<CallReceiverTypeFact> {
+        let (receiver_type, member) = self.vec_constructor_type_identity(function)?;
+        Some(CallReceiverTypeFact {
+            call_site,
+            receiver_type: receiver_type.into_boxed_slice(),
+            member,
+        })
+    }
+
+    fn vec_constructor_type_identity(
+        &self,
+        function: Node<'tree>,
+    ) -> Option<(Vec<Box<str>>, Box<str>)> {
+        let path = call_function_target(function);
+        for (owner, identity) in [
+            (&["std", "vec", "Vec"][..], &["std", "vec", "Vec"][..]),
+            (&["alloc", "vec", "Vec"][..], &["alloc", "vec", "Vec"][..]),
+        ] {
+            for member in ["new", "with_capacity"] {
+                let expected = [owner, &[member][..]].concat();
+                if self.ownership.resolves_standard_path(path, &expected) {
+                    return Some((
+                        identity
+                            .iter()
+                            .map(|segment| Box::<str>::from(*segment))
+                            .collect(),
+                        member.into(),
+                    ));
+                }
+            }
+        }
+        None
+    }
+
     fn use_binding_identity(&self, terminal: &str) -> Option<&Vec<Box<str>>> {
         if self.facts.shadowed_type_names.contains(terminal) {
             return None;
         }
         self.facts.use_bindings.get(terminal)?.as_ref()
-    }
-
-    /// The value that names a keyed location's key. `key` and `&key`
-    /// address the same key value, so a key argument that names a proven
-    /// local or parameter keys on that value; any other shape keeps the
-    /// expression's own value. A clone is a fresh value and deliberately
-    /// keys on nothing its source keys on.
-    fn keyed_place_value(
-        &mut self,
-        builder: &mut ProcedureCfgBuilder,
-        key_node: Node<'tree>,
-    ) -> Result<ValueId, RustLoweringError> {
-        if let Some(place) = rust_keyed_place_node(key_node)
-            && let Some(value) = self.binding_value(place)
-        {
-            return Ok(value);
-        }
-        self.expression_value(builder, key_node, expression_value_kind(key_node))
-    }
-
-    fn modeled_hashmap_insert_flow(
-        &self,
-        receiver: Node<'tree>,
-    ) -> Option<&CollectionFlowContract> {
-        let flow = self.modeled_collection_flow(receiver, "insert", 2)?;
-        if !receiver_substitution_is_proven(flow) || !receiver_root_is_keyed(flow) {
-            return None;
-        }
-        flow.payload
-            .transfers
-            .iter()
-            .any(transfer_stores_parameter_value_into_receiver)
-            .then_some(flow)
-    }
-
-    fn modeled_hashmap_lookup_flow(
-        &self,
-        receiver: Node<'tree>,
-        member: &str,
-    ) -> Option<&CollectionFlowContract> {
-        let flow = self.modeled_collection_flow(receiver, member, 1)?;
-        if !receiver_substitution_is_proven(flow) || !receiver_root_is_keyed(flow) {
-            return None;
-        }
-        flow.payload
-            .transfers
-            .iter()
-            .any(transfer_reads_keyed_entry_value_to_result)
-            .then_some(flow)
     }
 
     fn call_expression(
@@ -4618,28 +7206,13 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         scope: ScopeFrameId,
         stack: &mut Vec<Work<'tree>>,
     ) -> Result<(), RustLoweringError> {
-        if self
-            .modeled_hashmap_call(builder, node, entry, next, scope, stack)?
-            .is_some()
-        {
-            return Ok(());
-        }
         let invoke = self.point(builder, node, Vec::new())?;
-        if self.modeled_deferred_factory(node).is_some() {
-            self.add_gap(
-                builder,
-                invoke,
-                SemanticGapSubject::Point,
-                SemanticCapability::DeferredExecution,
-                SemanticGapKind::Unsupported,
-                "active deferred-yield factory requires concrete handle-flow, item adaptation, and lifetime proof before later resume; construction is not an eager item transfer",
-            )?;
-        }
         let normal = self.point(builder, node, Vec::new())?;
         let exceptional = self.point(builder, node, Vec::new())?;
         let function = required_field(node, "function")?;
         let callable_anchor = rust_callable_anchor(function);
-        let callee = self.source_value(builder, callable_anchor, SemanticValueKind::Callable)?;
+        let callee =
+            self.expression_value(builder, callable_anchor, SemanticValueKind::Callable)?;
         let result = self.expression_value(builder, node, SemanticValueKind::Temporary)?;
         let thrown = self.source_value(builder, callable_anchor, SemanticValueKind::Exception)?;
         let receiver_node = rust_call_receiver(function);
@@ -4671,13 +7244,27 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         )?;
 
         let arguments = call_arguments(node);
-        let argument_values = arguments
+        let call_argument_values = arguments
             .iter()
             .map(|argument| {
                 self.expression_value(builder, *argument, expression_value_kind(*argument))
-                    .map(|value| SemanticCallArgument::direct(value, ArgumentDomain::Positional))
             })
             .collect::<Result<Vec<_>, _>>()?;
+        self.emit_pointer_call_facts(
+            builder,
+            function,
+            receiver_node,
+            receiver,
+            &arguments,
+            &call_argument_values,
+            invoke,
+            normal,
+            result,
+        )?;
+        let argument_values = call_argument_values
+            .iter()
+            .map(|value| SemanticCallArgument::direct(*value, ArgumentDomain::Positional))
+            .collect::<Vec<_>>();
         let call_site = self.session.add_call_site(
             builder,
             CallSiteScaffold {
@@ -4693,8 +7280,31 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 exceptional_continuation: exceptional,
             },
         )?;
-        self.edge(builder, invoke, EdgeTarget::normal(normal))?;
-        self.edge(
+        // Calls whose receiver or associated owner this file proves publish
+        // that structural identity beside the call site. Model contracts are
+        // applied from this fact when a query reaches the call.
+        let receiver_fact = if function.kind() == "field_expression"
+            && let Some(receiver) = function.child_by_field_name("value")
+            && let Some(segments) = self.receiver_qualified_type_identity(receiver)
+            && segments.len() >= 2
+            && let Some(member) = function
+                .child_by_field_name("field")
+                .and_then(|field| node_text(self.source, field))
+        {
+            Some(CallReceiverTypeFact {
+                call_site,
+                receiver_type: segments.into_boxed_slice(),
+                member: Box::from(member),
+            })
+        } else {
+            self.vec_constructor_type_fact(function, call_site)
+        };
+        if let Some(fact) = receiver_fact {
+            builder.add_call_receiver_type_fact(fact)?;
+        }
+        self.session
+            .add_target_edge(builder, invoke, EdgeTarget::normal(normal))?;
+        self.session.add_target_edge(
             builder,
             invoke,
             EdgeTarget {
@@ -4702,9 +7312,68 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 kind: ControlEdgeKind::Exceptional,
             },
         )?;
-        self.edge(builder, normal, next)?;
+        // A local passed as `&mut local` may be written through the borrow
+        // during the call, and the borrow's value is that local's own value
+        // (a reference expression is transparent here). After the call the
+        // local therefore may hold whatever the borrowed value holds, so a
+        // callee's write through the borrow, or an input source bound to the
+        // argument, reaches the local's later reads (#3757). The write-back
+        // preserves value-flow transport for taint and points-to consumers,
+        // but its runtime value is unknown to scalar consumers.
+        for (argument, value) in arguments.iter().zip(call_argument_values.iter()) {
+            if argument.kind() == "reference_expression"
+                && direct_named_child_kind(*argument, "mutable_specifier").is_some()
+                && let Some(local) = argument
+                    .child_by_field_name("value")
+                    .and_then(|place| self.binding_value(place))
+            {
+                self.append_effect(
+                    builder,
+                    normal,
+                    SemanticEffect::ValueFlow {
+                        kind: ValueFlowKind::LanguageDefined,
+                        source: *value,
+                        target: local,
+                    },
+                )?;
+            }
+        }
+        self.session.add_target_edge(builder, normal, next)?;
+        self.add_droppable_initializer_temporary_gap(builder, node, exceptional, scope)?;
         self.abrupt(builder, exceptional, scope, CompletionKind::Throw, None)?;
-        self.resolution_gaps(builder, invoke, callee, call_site, &resolution)?;
+        if receiver_node.is_some() {
+            // The receiver adjustment is part of the question the call's
+            // resolution answers, so it rides on the call-target gap instead
+            // of a second point-scoped gap that no resolution can close
+            // (#3757). The Rust resolver reaches a method only through the
+            // receiver's own type after built-in reference dereferences; it
+            // reports a `Deref` method surface as unsupported instead of
+            // following it. A call it resolves completely therefore ran no
+            // user `Deref` or `DerefMut` to find its target, and an exact
+            // external identity is minted from the same written receiver
+            // type. An unresolved call keeps the gap as a residual call.
+            debug_assert!(matches!(resolution, CallableTargetResolution::Unknown));
+            self.session.record_gap(
+                builder,
+                invoke,
+                SemanticGapSubject::Value(callee),
+                SemanticCapability::CallableReferences,
+                SemanticGapKind::Unknown,
+                "callable target requires whole-program Rust dispatch refinement",
+            )?;
+            self.session.add_gap_with_impacts_and_discharge(
+                builder,
+                invoke,
+                SemanticGapSubject::CallSite(call_site),
+                SemanticCapability::Calls,
+                SemanticGapImpacts::single(SemanticGapImpact::CallEvaluation),
+                SemanticGapKind::Unknown,
+                SemanticGapDischarge::CallResolution,
+                "call target requires whole-program Rust dispatch refinement; method receiver autoderef and autoref adjustments may invoke Deref or DerefMut and are not emitted as call sites",
+            )?;
+        } else {
+            self.resolution_gaps(builder, invoke, callee, call_site, &resolution)?;
+        }
         let generic_call = function.kind() == "generic_function";
         let dispatch_detail = match (generic_call, receiver_node.is_some()) {
             (true, true) => Some(
@@ -4719,7 +7388,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             (false, false) => None,
         };
         if let Some(detail) = dispatch_detail {
-            self.add_gap(
+            self.session.record_gap(
                 builder,
                 invoke,
                 SemanticGapSubject::CallSite(call_site),
@@ -4729,21 +7398,10 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             )?;
         }
         if receiver_node.is_some() {
-            self.session.add_gap_with_impacts(
+            self.add_non_rejoining_exceptional_exit_gap(
                 builder,
                 invoke,
-                SemanticGapSubject::Point,
-                SemanticCapability::Calls,
-                SemanticGapImpacts::single(SemanticGapImpact::CallEvaluation),
-                SemanticGapKind::Unknown,
-                "method receiver autoderef and autoref adjustments may invoke Deref or DerefMut and are not emitted as call sites",
-            )?;
-            self.add_gap(
-                builder,
-                invoke,
-                SemanticGapSubject::Point,
-                SemanticCapability::ExceptionalControlFlow,
-                SemanticGapKind::Unsupported,
+                scope,
                 "implicit method receiver adjustments may abort; that abort edge is not lowered",
             )?;
         }
@@ -4759,6 +7417,813 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
+    fn emit_pointer_call_facts(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        function: Node<'tree>,
+        receiver_node: Option<Node<'tree>>,
+        receiver_value: Option<ValueId>,
+        arguments: &[Node<'tree>],
+        argument_values: &[ValueId],
+        invoke: ProgramPointId,
+        normal: ProgramPointId,
+        result: ValueId,
+    ) -> Result<(), RustLoweringError> {
+        let metadata = self.metadata(invoke)?;
+        let path = call_function_target(function);
+        let is_read = self
+            .ownership
+            .resolves_standard_path(path, &["core", "ptr", "read"])
+            || self
+                .ownership
+                .resolves_standard_path(path, &["std", "ptr", "read"]);
+        let is_read_unaligned = self
+            .ownership
+            .resolves_standard_path(path, &["core", "ptr", "read_unaligned"])
+            || self
+                .ownership
+                .resolves_standard_path(path, &["std", "ptr", "read_unaligned"]);
+        let is_from_raw_parts = self
+            .ownership
+            .resolves_standard_path(path, &["core", "slice", "from_raw_parts"])
+            || self
+                .ownership
+                .resolves_standard_path(path, &["std", "slice", "from_raw_parts"]);
+        let is_alloc = self.is_standard_allocator_function(path);
+        let is_dealloc = self
+            .ownership
+            .resolves_standard_path(path, &["core", "alloc", "dealloc"])
+            || self
+                .ownership
+                .resolves_standard_path(path, &["std", "alloc", "dealloc"])
+            || self
+                .ownership
+                .resolves_standard_path(path, &["alloc", "alloc", "dealloc"]);
+        let is_box_into_raw = self
+            .ownership
+            .resolves_standard_path(path, &["std", "boxed", "Box", "into_raw"])
+            || self
+                .ownership
+                .resolves_standard_path(path, &["alloc", "boxed", "Box", "into_raw"]);
+        let is_box_new = self
+            .ownership
+            .resolves_standard_path(path, &["std", "boxed", "Box", "new"])
+            || self
+                .ownership
+                .resolves_standard_path(path, &["alloc", "boxed", "Box", "new"]);
+        let is_box_from_raw = self
+            .ownership
+            .resolves_standard_path(path, &["std", "boxed", "Box", "from_raw"])
+            || self
+                .ownership
+                .resolves_standard_path(path, &["alloc", "boxed", "Box", "from_raw"]);
+        let is_drop = self
+            .ownership
+            .resolves_standard_path(path, &["core", "mem", "drop"])
+            || self
+                .ownership
+                .resolves_standard_path(path, &["std", "mem", "drop"]);
+        let is_forget = self
+            .ownership
+            .resolves_standard_path(path, &["core", "mem", "forget"])
+            || self
+                .ownership
+                .resolves_standard_path(path, &["std", "mem", "forget"]);
+        let is_manually_drop_drop = self
+            .ownership
+            .resolves_standard_path(path, &["core", "mem", "ManuallyDrop", "drop"])
+            || self
+                .ownership
+                .resolves_standard_path(path, &["std", "mem", "ManuallyDrop", "drop"]);
+        let is_manually_drop_new = self
+            .ownership
+            .resolves_standard_path(path, &["core", "mem", "ManuallyDrop", "new"])
+            || self
+                .ownership
+                .resolves_standard_path(path, &["std", "mem", "ManuallyDrop", "new"]);
+        let is_manually_drop_into_inner = self
+            .ownership
+            .resolves_standard_path(path, &["core", "mem", "ManuallyDrop", "into_inner"])
+            || self
+                .ownership
+                .resolves_standard_path(path, &["std", "mem", "ManuallyDrop", "into_inner"]);
+        let is_manually_drop_operation =
+            is_manually_drop_new || is_manually_drop_drop || is_manually_drop_into_inner;
+        let receiver_type = receiver_node.and_then(|receiver| self.expression_type(receiver));
+        let receiver_declared_type = receiver_type.map(|ty| match ty {
+            RustValueType::Declared(node) => node,
+            RustValueType::Borrowed { referent, .. } => referent,
+        });
+        let method_name = path
+            .child_by_field_name("field")
+            .and_then(|field| node_text(self.source, field));
+        let modeled_raw_pointer_receiver = receiver_node
+            .is_some_and(|receiver| self.is_raw_pointer_expression(receiver))
+            && matches!(
+                method_name,
+                Some("read" | "read_unaligned" | "as_ref" | "cast" | "add")
+            );
+        let modeled_raw_pointer_arguments = is_read
+            || is_read_unaligned
+            || is_from_raw_parts
+            || is_alloc
+            || is_dealloc
+            || is_box_new
+            || is_box_into_raw
+            || is_box_from_raw
+            || is_drop
+            || is_forget;
+        if !modeled_raw_pointer_receiver && !modeled_raw_pointer_arguments {
+            for (argument, value) in arguments.iter().zip(argument_values) {
+                if self
+                    .expression_type(*argument)
+                    .is_some_and(|ty| matches!(ty, RustValueType::Declared(node) if node.kind() == "pointer_type"))
+                {
+                    self.add_incomplete_fact(
+                        invoke,
+                        SemanticIncompleteSubject::Value(*value),
+                        SemanticIncompleteReason::Pointer(PointerIncompleteReason::ExternalEscape),
+                        metadata,
+                    );
+                }
+            }
+        }
+        if receiver_declared_type.is_some_and(|type_node| type_node.kind() == "pointer_type")
+            && !modeled_raw_pointer_receiver
+            && let Some(receiver_value) = receiver_value
+        {
+            self.add_incomplete_fact(
+                invoke,
+                SemanticIncompleteSubject::Value(receiver_value),
+                SemanticIncompleteReason::Pointer(PointerIncompleteReason::UnsupportedOperation),
+                metadata,
+            );
+        }
+
+        if is_read || is_read_unaligned {
+            if let (Some(argument), Some(pointer)) = (arguments.first(), argument_values.first()) {
+                let width = self.pointer_width_for_expression(*argument);
+                let pointer = self.binding_value(*argument).unwrap_or(*pointer);
+                self.add_pointer_access(invoke, pointer, PointerAccessKind::Read, width, metadata);
+                if width == PointerAccessWidth::Unknown {
+                    self.add_incomplete_fact(
+                        invoke,
+                        SemanticIncompleteSubject::Value(pointer),
+                        SemanticIncompleteReason::Pointer(PointerIncompleteReason::UnknownLayout),
+                        metadata,
+                    );
+                }
+            }
+        } else if is_from_raw_parts {
+            if let ([pointer_node, _length_node], [pointer, length]) = (arguments, argument_values)
+            {
+                if let Some(pointer_type) =
+                    self.expression_type(*pointer_node).and_then(|ty| match ty {
+                        RustValueType::Declared(type_node)
+                            if type_node.kind() == "pointer_type" =>
+                        {
+                            Some(type_node)
+                        }
+                        RustValueType::Borrowed { .. } | RustValueType::Declared(_) => None,
+                    })
+                {
+                    self.value_types
+                        .insert(result, RustValueType::Declared(pointer_type));
+                }
+                let width = self
+                    .pointer_pointee_type(*pointer_node)
+                    .and_then(|element| {
+                        rust_type_byte_size(self.source, element).map(|multiplier| {
+                            PointerAccessWidth::ValueTimes {
+                                value: *length,
+                                multiplier,
+                            }
+                        })
+                    });
+                let width = width.unwrap_or(PointerAccessWidth::Unknown);
+                let pointer = self.binding_value(*pointer_node).unwrap_or(*pointer);
+                self.add_pointer_access(invoke, pointer, PointerAccessKind::Read, width, metadata);
+                if width == PointerAccessWidth::Unknown {
+                    self.add_incomplete_fact(
+                        invoke,
+                        SemanticIncompleteSubject::Value(pointer),
+                        SemanticIncompleteReason::Pointer(PointerIncompleteReason::UnknownLayout),
+                        metadata,
+                    );
+                }
+                let aliases = self
+                    .pointer_origins_by_pointer
+                    .get(&pointer)
+                    .cloned()
+                    .or_else(|| {
+                        self.binding_value(*pointer_node).and_then(|binding| {
+                            self.pointer_origins_by_pointer.get(&binding).cloned()
+                        })
+                    })
+                    .unwrap_or_default();
+                for (origin, offset) in aliases {
+                    self.add_pointer_alias(
+                        invoke,
+                        result,
+                        origin,
+                        offset,
+                        PointerRelationStrength::Must,
+                        metadata,
+                    );
+                }
+            }
+        } else if is_dealloc {
+            if let Some(pointer) =
+                arguments
+                    .first()
+                    .zip(argument_values.first())
+                    .map(|(argument, value)| {
+                        let argument = peel_rust_parentheses(*argument);
+                        // A raw-pointer-to-raw-pointer cast keeps the address.
+                        // Anchor deallocation to the source binding so a helper
+                        // parameter remains visible to interprocedural flow.
+                        let pointer_cast = if argument.kind() == "type_cast_expression"
+                            && argument
+                                .child_by_field_name("type")
+                                .is_some_and(|target| target.kind() == "pointer_type")
+                        {
+                            argument
+                                .child_by_field_name("value")
+                                .filter(|operand| {
+                                    matches!(
+                                        self.expression_type(*operand),
+                                        Some(RustValueType::Declared(ty))
+                                            if ty.kind() == "pointer_type"
+                                    )
+                                })
+                                .and_then(|operand| self.binding_value(operand))
+                        } else {
+                            None
+                        };
+                        pointer_cast.unwrap_or(*value)
+                    })
+            {
+                self.add_pointer_invalidation(
+                    invoke,
+                    PointerInvalidationTarget::Pointer(pointer),
+                    PointerInvalidationCause::Deallocated,
+                    PointerRelationStrength::Must,
+                    metadata,
+                );
+            }
+        } else if is_alloc {
+            self.pointer_pointees_by_value
+                .insert(result, RustPointerPointee::Byte);
+            let origin = self.add_allocation_pointer_origin(
+                builder,
+                result,
+                None,
+                AllocationKind::LanguageDefined("rust_allocator".into()),
+                invoke,
+                metadata,
+            )?;
+            self.add_pointer_alias(
+                invoke,
+                result,
+                origin,
+                PointerByteOffset::Exact(0),
+                PointerRelationStrength::Must,
+                metadata,
+            );
+            self.add_incomplete_fact(
+                invoke,
+                SemanticIncompleteSubject::PointerOrigin(origin),
+                SemanticIncompleteReason::Pointer(PointerIncompleteReason::UnknownAllocationExtent),
+                metadata,
+            );
+        } else if is_box_new {
+            let byte_extent = arguments
+                .first()
+                .and_then(|argument| self.expression_type(*argument))
+                .and_then(|ty| match ty {
+                    RustValueType::Declared(type_node) => {
+                        rust_type_byte_size(self.source, type_node)
+                    }
+                    RustValueType::Borrowed { .. } => None,
+                });
+            let origin = self.add_allocation_pointer_origin(
+                builder,
+                result,
+                byte_extent,
+                AllocationKind::LanguageDefined("rust_box_allocation".into()),
+                invoke,
+                metadata,
+            )?;
+            self.add_pointer_alias(
+                invoke,
+                result,
+                origin,
+                PointerByteOffset::Exact(0),
+                PointerRelationStrength::Must,
+                metadata,
+            );
+            self.pointer_origins_by_owner.insert(result, origin);
+            self.pointer_owner_lifetimes.insert(
+                result,
+                (
+                    PointerInvalidationTarget::Origin(origin),
+                    PointerInvalidationCause::OwnerDropped,
+                ),
+            );
+            if byte_extent.is_none() {
+                self.add_incomplete_fact(
+                    invoke,
+                    SemanticIncompleteSubject::PointerOrigin(origin),
+                    SemanticIncompleteReason::Pointer(
+                        PointerIncompleteReason::UnknownAllocationExtent,
+                    ),
+                    metadata,
+                );
+            }
+        } else if is_box_from_raw {
+            if let Some((argument, pointer)) = arguments.first().zip(argument_values.first()) {
+                let pointer = self.binding_value(*argument).unwrap_or(*pointer);
+                self.add_pointer_invalidation(
+                    invoke,
+                    PointerInvalidationTarget::Pointer(pointer),
+                    PointerInvalidationCause::OwnershipTransferred,
+                    PointerRelationStrength::Must,
+                    metadata,
+                );
+                self.pointer_owner_lifetimes.insert(
+                    result,
+                    (
+                        PointerInvalidationTarget::Pointer(pointer),
+                        PointerInvalidationCause::Deallocated,
+                    ),
+                );
+                if let Some(pointee) = self.pointer_pointee_type(*argument) {
+                    self.value_types
+                        .insert(result, RustValueType::Declared(pointee));
+                }
+            }
+        } else if is_box_into_raw {
+            let existing_origin = arguments
+                .first()
+                .and_then(|argument| self.binding_value(*argument))
+                .and_then(|owner| self.pointer_origins_by_owner.get(&owner).copied())
+                .or_else(|| {
+                    argument_values
+                        .first()
+                        .and_then(|owner| self.pointer_origins_by_owner.get(owner).copied())
+                });
+            if let Some((argument, value)) = arguments.first().zip(argument_values.first()) {
+                self.append_consumed_move(builder, invoke, *argument, *value)?;
+            }
+            let byte_extent = arguments
+                .first()
+                .and_then(|argument| self.expression_type(*argument))
+                .and_then(|type_node| match type_node {
+                    RustValueType::Declared(type_node) => rust_generic_type_argument(type_node, 0),
+                    RustValueType::Borrowed { .. } => None,
+                })
+                .and_then(|type_node| rust_type_byte_size(self.source, type_node));
+            if let Some(pointee) = arguments.first().and_then(|argument| {
+                self.expression_type(*argument)
+                    .and_then(|type_node| match type_node {
+                        RustValueType::Declared(type_node) => {
+                            rust_generic_type_argument(type_node, 0)
+                        }
+                        RustValueType::Borrowed { .. } => None,
+                    })
+            }) {
+                self.pointer_pointees_by_value
+                    .insert(result, RustPointerPointee::Type(pointee));
+            }
+            let origin = if let Some(origin) = existing_origin {
+                origin
+            } else {
+                self.add_allocation_pointer_origin(
+                    builder,
+                    result,
+                    byte_extent,
+                    AllocationKind::LanguageDefined("rust_box_allocation".into()),
+                    invoke,
+                    metadata,
+                )?
+            };
+            self.add_pointer_alias(
+                invoke,
+                result,
+                origin,
+                PointerByteOffset::Exact(0),
+                PointerRelationStrength::Must,
+                metadata,
+            );
+            self.pointer_origins_by_owner.remove(&result);
+            self.pointer_owner_lifetimes.remove(&result);
+            if byte_extent.is_none() {
+                self.add_incomplete_fact(
+                    invoke,
+                    SemanticIncompleteSubject::PointerOrigin(origin),
+                    SemanticIncompleteReason::Pointer(
+                        PointerIncompleteReason::UnknownAllocationExtent,
+                    ),
+                    metadata,
+                );
+            }
+        } else if is_drop {
+            if let Some((argument, argument_value)) = arguments
+                .first()
+                .zip(argument_values.first())
+                .map(|(a, v)| (*a, *v))
+            {
+                let owner = self.binding_value(argument).or_else(|| {
+                    (self.pointer_owner_lifetimes.contains_key(&argument_value)
+                        || self.pointer_origins_by_owner.contains_key(&argument_value))
+                    .then_some(argument_value)
+                });
+                let manually_drop_owner =
+                    owner.is_some_and(|owner| self.value_is_manually_drop(owner));
+                let owner_invalidation = if manually_drop_owner {
+                    None
+                } else {
+                    owner.and_then(|owner| self.owner_invalidation(owner))
+                };
+                let owns_pointer_origin = owner_invalidation.is_some();
+                if owns_pointer_origin
+                    || self.compatible_transfer_ownership(argument, None)
+                        == RustOwnershipClass::Move
+                {
+                    let consumed = self.value(builder, invoke, SemanticValueKind::Temporary)?;
+                    self.append_consumed_move(builder, invoke, argument, consumed)?;
+                }
+                if let Some(owner) = owner
+                    && let Some(place) = self.binding_places.get(&owner).cloned()
+                {
+                    let (behavior, incomplete) = self.drop_behavior(owner);
+                    builder.emit_cleanup_action_fact(
+                        invoke,
+                        &ScopeCleanupAction::Drop {
+                            place: place.clone(),
+                            behavior,
+                            source: metadata.source,
+                            evidence: metadata.evidence,
+                        },
+                    )?;
+                    if let Some(reason) = incomplete {
+                        self.incomplete_facts.push(SemanticIncompleteFact {
+                            point: invoke,
+                            subject: SemanticIncompleteSubject::Place(place),
+                            reason: SemanticIncompleteReason::Lifecycle(reason),
+                            source: metadata.source,
+                            evidence: metadata.evidence,
+                        });
+                    }
+                }
+                if manually_drop_owner {
+                    let subject = owner
+                        .and_then(|owner| self.binding_places.get(&owner).cloned())
+                        .map_or(
+                            SemanticIncompleteSubject::Value(argument_value),
+                            SemanticIncompleteSubject::Place,
+                        );
+                    self.add_incomplete_fact(
+                        invoke,
+                        subject,
+                        SemanticIncompleteReason::Lifecycle(
+                            LifecycleIncompleteReason::ManuallyDrop,
+                        ),
+                        metadata,
+                    );
+                }
+                if let Some((target, cause)) = owner_invalidation {
+                    self.add_pointer_invalidation(
+                        invoke,
+                        target,
+                        cause,
+                        PointerRelationStrength::Must,
+                        metadata,
+                    );
+                }
+            }
+        } else if is_forget {
+            if let Some((argument, argument_value)) = arguments.first().zip(argument_values.first())
+            {
+                let consumed = self.value(builder, invoke, SemanticValueKind::Temporary)?;
+                self.append_consumed_move(builder, invoke, *argument, consumed)?;
+                let subject = self
+                    .binding_value(*argument)
+                    .and_then(|owner| self.binding_places.get(&owner).cloned())
+                    .map_or(
+                        SemanticIncompleteSubject::Value(*argument_value),
+                        SemanticIncompleteSubject::Place,
+                    );
+                self.add_incomplete_fact(
+                    invoke,
+                    subject,
+                    SemanticIncompleteReason::Lifecycle(LifecycleIncompleteReason::ForgottenOwner),
+                    metadata,
+                );
+            }
+        } else if is_manually_drop_operation {
+            if is_manually_drop_new && let Some(argument) = arguments.first() {
+                self.append_consumed_move(builder, invoke, *argument, result)?;
+                if let Some(source) = argument_values.first().copied() {
+                    self.transfer_pointer_owner_facts(source, result);
+                }
+                self.manually_drop_values.insert(result);
+            } else if is_manually_drop_into_inner && let Some(argument) = arguments.first() {
+                self.append_consumed_move(builder, invoke, *argument, result)?;
+                if let Some(source) = argument_values.first().copied() {
+                    self.transfer_pointer_owner_facts(source, result);
+                }
+                self.manually_drop_values.remove(&result);
+            }
+            if is_manually_drop_drop
+                && let Some(owner) = arguments
+                    .first()
+                    .and_then(|argument| rust_reference_expression_value(*argument))
+                    .and_then(|value| self.binding_value(value))
+                && let Some((target, cause)) = self.owner_invalidation(owner)
+            {
+                self.add_pointer_invalidation(
+                    invoke,
+                    target,
+                    cause,
+                    PointerRelationStrength::Must,
+                    metadata,
+                );
+            }
+            let subject = arguments
+                .first()
+                .and_then(|argument| self.binding_value(*argument))
+                .and_then(|owner| self.binding_places.get(&owner).cloned())
+                .map_or(
+                    SemanticIncompleteSubject::Value(result),
+                    SemanticIncompleteSubject::Place,
+                );
+            self.add_incomplete_fact(
+                invoke,
+                subject,
+                SemanticIncompleteReason::Lifecycle(LifecycleIncompleteReason::ManuallyDrop),
+                metadata,
+            );
+        } else if let (Some(receiver_node), Some(receiver_value), Some(method)) =
+            (receiver_node, receiver_value, method_name)
+        {
+            let receiver_is_vec = receiver_declared_type
+                .and_then(rust_type_path_node)
+                .is_some_and(|type_path| {
+                    self.ownership
+                        .resolves_standard_path(type_path, &["std", "vec", "Vec"])
+                        || self
+                            .ownership
+                            .resolves_standard_path(type_path, &["alloc", "vec", "Vec"])
+                });
+            let receiver_is_raw_pointer = self.is_raw_pointer_expression(receiver_node);
+
+            if receiver_is_vec && matches!(method, "as_ptr" | "as_mut_ptr") {
+                if let Some(pointee) = receiver_declared_type
+                    .and_then(|type_node| rust_generic_type_argument(type_node, 0))
+                {
+                    self.pointer_pointees_by_value
+                        .insert(result, RustPointerPointee::Type(pointee));
+                }
+                let owner = self.binding_value(receiver_node);
+                let origin = if let Some(origin) =
+                    owner.and_then(|owner| self.pointer_origins_by_owner.get(&owner).copied())
+                {
+                    origin
+                } else {
+                    self.add_allocation_pointer_origin(
+                        builder,
+                        result,
+                        None,
+                        AllocationKind::LanguageDefined("rust_vec_buffer".into()),
+                        invoke,
+                        metadata,
+                    )?
+                };
+                self.add_pointer_alias(
+                    invoke,
+                    result,
+                    origin,
+                    PointerByteOffset::Exact(0),
+                    PointerRelationStrength::Must,
+                    metadata,
+                );
+                if let Some(owner) = owner {
+                    self.pointer_origins_by_owner.insert(owner, origin);
+                    self.pointer_owner_lifetimes.insert(
+                        owner,
+                        (
+                            PointerInvalidationTarget::Origin(origin),
+                            PointerInvalidationCause::OwnerDropped,
+                        ),
+                    );
+                }
+                self.add_incomplete_fact(
+                    invoke,
+                    SemanticIncompleteSubject::PointerOrigin(origin),
+                    SemanticIncompleteReason::Pointer(
+                        PointerIncompleteReason::UnknownAllocationExtent,
+                    ),
+                    metadata,
+                );
+            } else if receiver_is_vec && method == "push" {
+                if let Some(owner) = self.binding_value(receiver_node)
+                    && let Some(origin) = self.pointer_origins_by_owner.get(&owner).copied()
+                {
+                    self.add_pointer_invalidation(
+                        invoke,
+                        PointerInvalidationTarget::Origin(origin),
+                        PointerInvalidationCause::PossibleReallocation,
+                        PointerRelationStrength::May,
+                        metadata,
+                    );
+                }
+            } else if receiver_is_raw_pointer
+                && matches!(method, "read" | "read_unaligned" | "as_ref")
+            {
+                let width = self.pointer_width_for_expression(receiver_node);
+                self.add_pointer_access(
+                    invoke,
+                    receiver_value,
+                    PointerAccessKind::Read,
+                    width,
+                    metadata,
+                );
+                if width == PointerAccessWidth::Unknown {
+                    self.add_incomplete_fact(
+                        invoke,
+                        SemanticIncompleteSubject::Value(receiver_value),
+                        SemanticIncompleteReason::Pointer(PointerIncompleteReason::UnknownLayout),
+                        metadata,
+                    );
+                }
+            } else if receiver_is_raw_pointer && method == "cast" {
+                if let Some(type_argument) = rust_call_type_argument(function, 0) {
+                    self.value_types
+                        .insert(result, RustValueType::Declared(type_argument));
+                    self.pointer_pointees_by_value
+                        .insert(result, RustPointerPointee::Type(type_argument));
+                }
+                self.session.append_language_defined_value_flows(
+                    builder,
+                    normal,
+                    [receiver_value],
+                    result,
+                )?;
+                let aliases = self
+                    .pointer_origins_by_pointer
+                    .get(&receiver_value)
+                    .cloned()
+                    .or_else(|| {
+                        self.binding_value(receiver_node)
+                            .and_then(|value| self.pointer_origins_by_pointer.get(&value).cloned())
+                    })
+                    .unwrap_or_default();
+                for (origin, offset) in aliases {
+                    self.add_pointer_alias(
+                        invoke,
+                        result,
+                        origin,
+                        offset,
+                        PointerRelationStrength::Must,
+                        metadata,
+                    );
+                }
+            } else if receiver_is_raw_pointer && method == "add" {
+                if let Some(pointer_type) =
+                    receiver_declared_type.filter(|type_node| type_node.kind() == "pointer_type")
+                {
+                    self.value_types
+                        .insert(result, RustValueType::Declared(pointer_type));
+                }
+                if let Some(pointee) = self.pointer_pointee(receiver_node) {
+                    self.pointer_pointees_by_value.insert(result, pointee);
+                }
+                self.session.append_language_defined_value_flows(
+                    builder,
+                    normal,
+                    [receiver_value],
+                    result,
+                )?;
+                if let Some(offset_node) = arguments.first() {
+                    let offset_value = argument_values.first().copied();
+                    let element_size =
+                        self.pointer_pointee(receiver_node)
+                            .and_then(|pointee| match pointee {
+                                RustPointerPointee::Type(element) => {
+                                    rust_type_byte_size(self.source, element)
+                                }
+                                RustPointerPointee::Byte => Some(1),
+                            });
+                    let base_aliases = self
+                        .pointer_origins_by_pointer
+                        .get(&receiver_value)
+                        .cloned()
+                        .or_else(|| {
+                            self.binding_value(receiver_node).and_then(|value| {
+                                self.pointer_origins_by_pointer.get(&value).cloned()
+                            })
+                        })
+                        .unwrap_or_default();
+                    for (origin, base_offset) in base_aliases {
+                        let byte_offset = match (
+                            base_offset,
+                            element_size,
+                            rust_integer_literal_value(self.source, *offset_node),
+                            offset_value,
+                        ) {
+                            (PointerByteOffset::Exact(base), Some(size), Some(count), _) => {
+                                i128::try_from(count)
+                                    .ok()
+                                    .and_then(|count| count.checked_mul(i128::try_from(size).ok()?))
+                                    .and_then(|bytes| base.checked_add(bytes))
+                                    .map_or(PointerByteOffset::Unknown, PointerByteOffset::Exact)
+                            }
+                            (PointerByteOffset::Exact(0), Some(1), None, Some(value)) => {
+                                PointerByteOffset::Value(value)
+                            }
+                            _ => PointerByteOffset::Unknown,
+                        };
+                        self.add_pointer_alias(
+                            invoke,
+                            result,
+                            origin,
+                            byte_offset,
+                            PointerRelationStrength::Must,
+                            metadata,
+                        );
+                        if byte_offset == PointerByteOffset::Unknown {
+                            self.add_incomplete_fact(
+                                invoke,
+                                SemanticIncompleteSubject::PointerOrigin(origin),
+                                SemanticIncompleteReason::Pointer(
+                                    PointerIncompleteReason::UnknownLayout,
+                                ),
+                                metadata,
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        self.propagate_pointer_facts_to_targets(result);
+        Ok(())
+    }
+
+    fn call_is_droppable_let_initializer(&self, node: Node<'tree>) -> bool {
+        let mut child = node;
+        let mut parent = child.parent();
+        while let Some(ancestor) = parent {
+            match ancestor.kind() {
+                "let_declaration" => {
+                    return field_matches(ancestor, "value", child)
+                        && self
+                            .declaration_binding_values(ancestor)
+                            .iter()
+                            .any(|value| {
+                                !matches!(self.drop_behavior(*value).0, DropBehavior::Trivial)
+                            });
+                }
+                "function_item"
+                | "function_signature_item"
+                | "closure_expression"
+                | "async_block"
+                | "gen_block" => return false,
+                _ => {
+                    child = ancestor;
+                    parent = ancestor.parent();
+                }
+            }
+        }
+        false
+    }
+
+    fn add_droppable_initializer_temporary_gap(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        node: Node<'tree>,
+        exceptional: ProgramPointId,
+        scope: ScopeFrameId,
+    ) -> Result<(), RustLoweringError> {
+        if self.call_is_droppable_let_initializer(node)
+            && !builder
+                .resolve_completion(scope, &CompletionRequest::new(CompletionKind::Throw, None))
+                .is_some_and(|route| completion_has_unrouted_drop(&route))
+        {
+            self.add_drop_omission_gaps(
+                builder,
+                exceptional,
+                "a droppable let initializer may create temporaries whose exceptional cleanup is not lowered",
+                // The owning let binding's drop behavior is the proof input;
+                // the workspace oracle keeps unknown or user-defined Drop
+                // implementations open and discharges only proven-inert glue.
+                SemanticGapDischarge::InertDropGlue,
+            )?;
+        }
+        Ok(())
+    }
+
     fn callable_expression(
         &mut self,
         builder: &mut ProcedureCfgBuilder,
@@ -4766,40 +8231,98 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         entry: ProgramPointId,
         next: EdgeTarget,
     ) -> Result<(), RustLoweringError> {
-        let result = self.value(builder, entry, SemanticValueKind::Callable)?;
-        let metadata = self.metadata(entry)?;
+        let result = self.expression_value(builder, node, SemanticValueKind::Callable)?;
+        let target = self.procedure_targets.get(&node.id());
+        let targets = target.map_or(CallableTargetResolution::Unknown, |target| {
+            CallableTargetResolution::Proven(CallableTarget::Local(target.id))
+        });
+        let environment = if target.is_some_and(|target| !target.captures.is_empty()) {
+            Some(self.session.add_allocation(
+                builder,
+                entry,
+                result,
+                AllocationKind::ClosureEnvironment,
+            )?)
+        } else {
+            None
+        };
         let callable = CallableValue {
             kind: CallableReferenceKind::Lambda,
-            targets: CallableTargetResolution::Unknown,
-            target_evidence: metadata.evidence,
+            targets: targets.clone(),
+            target_evidence: self.metadata(entry)?.evidence,
             bound_receiver: None,
-            environment: None,
+            environment,
         };
         self.append_effect(
             builder,
             entry,
             SemanticEffect::CallableCreation { result, callable },
         )?;
-        self.add_gap(
-            builder,
-            entry,
-            SemanticGapSubject::Value(result),
-            SemanticCapability::CallableReferences,
-            SemanticGapKind::Unknown,
-            "closure target and captured environment require location-first callable refinement",
-        )?;
-        self.add_gap(
-            builder,
-            entry,
-            SemanticGapSubject::Value(result),
-            SemanticCapability::Captures,
-            SemanticGapKind::Unknown,
-            "closure capture identities and capture modes require lexical capture refinement",
-        )?;
+        let Some(target) = target else {
+            self.session.record_gap(
+                builder,
+                entry,
+                SemanticGapSubject::Value(result),
+                SemanticCapability::CallableReferences,
+                SemanticGapKind::Unknown,
+                "closure syntax has no materialized procedure target",
+            )?;
+            self.session.record_gap(
+                builder,
+                entry,
+                SemanticGapSubject::Value(result),
+                SemanticCapability::Captures,
+                SemanticGapKind::Unknown,
+                "closure capture environment cannot be tied to a materialized target",
+            )?;
+            return self.session.add_target_edge(builder, entry, next);
+        };
+        if let Some(environment) = environment {
+            let mut capture_environment_unresolved = false;
+            for (index, capture) in target.captures.iter().enumerate() {
+                let Some(captured) = self.capture_source_value(capture) else {
+                    capture_environment_unresolved = true;
+                    continue;
+                };
+                let destination = MemoryLocationId::try_from_index(index)
+                    .map_err(|_| RustLoweringError::Invalid("too many Rust captures".into()))?;
+                let capture_id = self.session.add_capture(
+                    builder,
+                    entry,
+                    result,
+                    target.id,
+                    environment,
+                    CaptureSource::Value(captured),
+                    destination,
+                    capture.mode.clone(),
+                )?;
+                if capture.mode == CaptureMode::Unknown {
+                    capture_environment_unresolved = true;
+                    self.session.record_gap(
+                        builder,
+                        entry,
+                        SemanticGapSubject::Capture(capture_id),
+                        SemanticCapability::Captures,
+                        SemanticGapKind::Unknown,
+                        "Rust closure capture may require a mutable borrow or receiver adjustment",
+                    )?;
+                }
+            }
+            if capture_environment_unresolved {
+                self.session.record_gap(
+                    builder,
+                    entry,
+                    SemanticGapSubject::Value(result),
+                    SemanticCapability::Captures,
+                    SemanticGapKind::Unknown,
+                    "Rust closure environment contains a capture whose source or mode is unresolved",
+                )?;
+            }
+        }
         if matches!(node.kind(), "async_block" | "gen_block")
             || (node.kind() == "closure_expression" && direct_child_kind(node, "async"))
         {
-            self.add_gap(
+            self.session.record_gap(
                 builder,
                 entry,
                 SemanticGapSubject::Point,
@@ -4808,7 +8331,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 "creating this callable does not immediately execute its deferred body",
             )?;
         }
-        self.edge(builder, entry, next)
+        self.session.add_target_edge(builder, entry, next)
     }
 
     fn unhandled_control_syntax(
@@ -4817,56 +8340,39 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         node: Node<'tree>,
         entry: ProgramPointId,
     ) -> Result<(), RustLoweringError> {
-        let detail = format!(
-            "{} runtime/control syntax is not yet lowered structurally",
-            node.kind()
-        );
-        self.add_gap(
-            builder,
-            entry,
-            SemanticGapSubject::Point,
-            SemanticCapability::NormalControlFlow,
-            SemanticGapKind::Unsupported,
-            &detail,
-        )
+        self.session
+            .add_unhandled_control_syntax_gap(builder, entry, node.kind())
+            .map(|_| ())
     }
 
-    fn schedule_nodes(
+    fn schedule_nodes_with_scopes(
         &mut self,
         builder: &mut ProcedureCfgBuilder,
         entry: ProgramPointId,
-        children: &[Node<'tree>],
+        schedule: ScopedNodeSchedule<'_, 'tree>,
         next: EdgeTarget,
-        scope: ScopeFrameId,
         stack: &mut Vec<Work<'tree>>,
     ) -> Result<(), RustLoweringError> {
-        if children.is_empty() {
-            return self.edge(builder, entry, next);
+        if schedule.children.is_empty() {
+            return self.session.add_target_edge(builder, entry, next);
         }
-        let entries = children
-            .iter()
-            .map(|child| {
-                self.point(
-                    builder,
-                    execution_node(unwrap_attributes(*child)),
-                    Vec::new(),
-                )
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        self.edge(builder, entry, EdgeTarget::normal(entries[0]))?;
-        for index in (0..children.len()).rev() {
-            let child_next = entries
-                .get(index + 1)
-                .copied()
-                .map(EdgeTarget::normal)
-                .unwrap_or(next);
-            stack.push(Work::Statement {
-                node: children[index],
-                entry: entries[index],
-                next: child_next,
+        debug_assert_eq!(schedule.children.len(), schedule.entries.len());
+        debug_assert_eq!(schedule.children.len(), schedule.scopes.len());
+        self.session
+            .add_target_edge(builder, entry, EdgeTarget::normal(schedule.entries[0]))?;
+        schedule_sequential_work_with_scopes(
+            stack,
+            schedule.children,
+            schedule.entries,
+            next,
+            schedule.scopes,
+            |_, node, entry, next, scope| Work::Statement {
+                node,
+                entry,
+                next,
                 scope,
-            });
-        }
+            },
+        );
         Ok(())
     }
 
@@ -4880,26 +8386,27 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         stack: &mut Vec<Work<'tree>>,
     ) -> Result<(), RustLoweringError> {
         if children.is_empty() {
-            return self.edge(builder, entry, next);
+            return self.session.add_target_edge(builder, entry, next);
         }
         let entries = children
             .iter()
             .map(|child| self.point(builder, unwrap_attributes(*child), Vec::new()))
             .collect::<Result<Vec<_>, _>>()?;
-        self.edge(builder, entry, EdgeTarget::normal(entries[0]))?;
-        for index in (0..children.len()).rev() {
-            let child_next = entries
-                .get(index + 1)
-                .copied()
-                .map(EdgeTarget::normal)
-                .unwrap_or(next);
-            stack.push(Work::Expression {
-                node: children[index],
-                entry: entries[index],
-                next: child_next,
+        self.session
+            .add_target_edge(builder, entry, EdgeTarget::normal(entries[0]))?;
+        schedule_sequential_work(
+            stack,
+            children,
+            &entries,
+            next,
+            scope,
+            |_, node, entry, next, scope| Work::Expression {
+                node,
+                entry,
+                next,
                 scope,
-            });
-        }
+            },
+        );
         Ok(())
     }
 
@@ -4914,21 +8421,15 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         let Some(route) = builder.resolve_completion(scope, &CompletionRequest::new(kind, label))
         else {
             if matches!(kind, CompletionKind::Break | CompletionKind::Continue) {
-                let detail = format!(
-                    "{} completion has no matching represented target",
-                    completion_label(kind)
-                );
-                self.add_gap(
+                self.session.add_unmatched_completion_gap(
                     builder,
                     from,
-                    SemanticGapSubject::Point,
+                    kind,
                     if label.is_some() {
                         SemanticCapability::NonLocalControl
                     } else {
                         SemanticCapability::NormalControlFlow
                     },
-                    SemanticGapKind::Unsupported,
-                    &detail,
                 )?;
                 return Ok(());
             }
@@ -4946,54 +8447,114 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         from: ProgramPointId,
         route: &CompletionRoute,
     ) -> Result<(), RustLoweringError> {
-        if !route.cleanups().is_empty() {
-            let detail = format!(
-                "{} lexical scope(s) with possible implicit Drop are exited by this abrupt completion",
-                route.cleanups().len()
-            );
-            for (capability, kind, reason) in [
-                (
-                    SemanticCapability::CleanupControlFlow,
-                    SemanticGapKind::Unknown,
-                    "implicit Drop order and cleanup routing are not lowered",
-                ),
-                (
-                    SemanticCapability::ResourceManagement,
-                    SemanticGapKind::Unknown,
-                    "RAII resource release depends on inferred local types and Drop implementations",
-                ),
-                (
-                    SemanticCapability::Calls,
-                    SemanticGapKind::Unknown,
-                    "implicit Drop::drop invocations are not emitted as fabricated call sites",
-                ),
-                // As in `add_drop_omission_gaps`: an unlowered destructor
-                // unwind edge is `Unsupported`, the shape the shared
-                // implicit-abort discharge can close.
-                (
-                    SemanticCapability::ExceptionalControlFlow,
-                    SemanticGapKind::Unsupported,
-                    "destructor unwinding and destructor panic routing are not lowered",
-                ),
-            ] {
-                self.add_gap(
+        let has_unrouted_drop = completion_has_unrouted_drop(route);
+        self.record_owner_lifetime_ends(route);
+        for operation in route.operations() {
+            let CleanupRouteOperation::Action(ScopeCleanupAction::Drop {
+                place,
+                behavior,
+                source,
+                evidence,
+            }) = operation
+            else {
+                continue;
+            };
+            if matches!(
+                behavior,
+                DropBehavior::Destructor(CallableTargetResolution::Unknown)
+            ) {
+                let reason = self
+                    .cleanup_drop_incompletes
+                    .get(place)
+                    .copied()
+                    .unwrap_or(LifecycleIncompleteReason::UnsupportedCleanup);
+                self.incomplete_facts.push(SemanticIncompleteFact {
+                    point: from,
+                    subject: SemanticIncompleteSubject::Place(place.clone()),
+                    reason: SemanticIncompleteReason::Lifecycle(reason),
+                    source: *source,
+                    evidence: *evidence,
+                });
+            } else if let Some(reason) = self.cleanup_drop_incompletes.get(place).copied() {
+                self.incomplete_facts.push(SemanticIncompleteFact {
+                    point: from,
+                    subject: SemanticIncompleteSubject::Place(place.clone()),
+                    reason: SemanticIncompleteReason::Lifecycle(reason),
+                    source: *source,
+                    evidence: *evidence,
+                });
+            }
+        }
+        if has_unrouted_drop {
+            let discharge = if self.cleanup_route_drops_are_binding_only(route) {
+                SemanticGapDischarge::InertDropGlue
+            } else {
+                SemanticGapDischarge::None
+            };
+            self.add_drop_omission_gaps(
+                builder,
+                from,
+                "scope exit crosses a destructor whose invocation is not routed as an ICFG call",
+                discharge,
+            )?;
+            let destination = route.destination().target();
+            if (destination == self.normal_exit || destination == self.exceptional_exit)
+                && self.cleanup_gap_exit_points.insert(destination)
+            {
+                self.add_drop_omission_gaps(
                     builder,
-                    from,
-                    SemanticGapSubject::Point,
-                    capability,
-                    kind,
-                    &format!("{detail}; {reason}"),
+                    destination,
+                    "procedure exit crosses a destructor whose invocation is not routed as an ICFG call",
+                    discharge,
                 )?;
             }
         }
-        self.edge(
-            builder,
-            from,
-            EdgeTarget {
-                point: route.destination().target(),
-                kind: route.destination().edge_kind(),
-            },
-        )
+        emit_cleanup_completion_route(builder, &mut self.session, from, route)
+    }
+
+    fn cleanup_route_drops_are_binding_only(&self, route: &CompletionRoute) -> bool {
+        let mut cleanup_index = 0;
+        let mut has_drop = false;
+        let mut binding_only = true;
+        for operation in route.operations() {
+            match operation {
+                CleanupRouteOperation::Action(ScopeCleanupAction::Drop {
+                    behavior: DropBehavior::Destructor(_),
+                    ..
+                }) => {
+                    let region = route
+                        .cleanups()
+                        .get(cleanup_index)
+                        .expect("drop action belongs to a cleanup region");
+                    has_drop = true;
+                    binding_only &= self.binding_cleanup_regions.contains(region);
+                }
+                CleanupRouteOperation::Region {
+                    cleanup_index: actual_index,
+                    region,
+                } => {
+                    assert_eq!(*actual_index, cleanup_index);
+                    assert_eq!(Some(region), route.cleanups().get(cleanup_index));
+                    cleanup_index += 1;
+                }
+                CleanupRouteOperation::Action(_) => {}
+            }
+        }
+        has_drop && binding_only
+    }
+
+    fn record_owner_lifetime_ends(&mut self, route: &CompletionRoute) {
+        let point = route.destination().target();
+        for operation in route.operations() {
+            let CleanupRouteOperation::Region { region, .. } = operation else {
+                continue;
+            };
+            if let Some(owners) = self.cleanup_owners_by_region.get(region) {
+                for owner in owners {
+                    self.owner_lifetime_end_points.insert((*owner, point));
+                }
+            }
+        }
     }
 
     fn resolution_gaps(
@@ -5021,17 +8582,8 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         node: Node<'tree>,
         effects: Vec<SemanticEffect>,
     ) -> Result<ProgramPointId, RustLoweringError> {
-        let metadata = self.mapping(builder, node)?;
-        self.session.add_point(builder, metadata, effects)
-    }
-
-    fn mapping(
-        &mut self,
-        builder: &mut ProcedureCfgBuilder,
-        node: Node<'tree>,
-    ) -> Result<PointMetadata, RustLoweringError> {
         self.session
-            .add_node_mapping(builder, unwrap_attributes(node))
+            .add_node_point(builder, unwrap_attributes(node), effects)
     }
 
     fn value_mapping(
@@ -5039,12 +8591,8 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         builder: &mut ProcedureCfgBuilder,
         node: Node<'tree>,
     ) -> Result<PointMetadata, RustLoweringError> {
-        let node = unwrap_attributes(node);
-        let range = node.byte_range();
-        let occurrence = self.session.next_source_occurrence(range.start, range.end);
-        let anchor = source_anchor(node, occurrence).map_err(RustLoweringError::Invalid)?;
         self.session
-            .add_mapping(builder, anchor, SourceMappingKind::Exact)
+            .add_node_mapping(builder, unwrap_attributes(node))
     }
 
     fn metadata(&self, point: ProgramPointId) -> Result<PointMetadata, RustLoweringError> {
@@ -5069,20 +8617,6 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         self.session.append_effect(builder, point, effect)
     }
 
-    fn add_gap(
-        &mut self,
-        builder: &mut ProcedureCfgBuilder,
-        point: ProgramPointId,
-        subject: SemanticGapSubject,
-        capability: SemanticCapability,
-        kind: SemanticGapKind,
-        detail: &str,
-    ) -> Result<(), RustLoweringError> {
-        self.session
-            .add_gap(builder, point, subject, capability, kind, detail)?;
-        Ok(())
-    }
-
     /// Rust aborts do not resume normal evaluation after the failing
     /// operation. Preserve that proof on this exceptional-flow gap only when
     /// the exact evaluation scope has no already-active cleanup user code.
@@ -5098,6 +8632,10 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             .expect("a Rust evaluation scope must resolve abort completion");
         let discharge = if route.cleanups().is_empty() {
             SemanticGapDischarge::NonRejoiningExceptionalExit
+        } else if self.cleanup_route_drops_are_binding_only(&route) {
+            // The active cleanups destroy only parameters and `let`
+            // bindings, which the workspace oracle can prove inert (#3757).
+            SemanticGapDischarge::NonRejoiningExceptionalExitAfterInertDrops
         } else {
             SemanticGapDischarge::None
         };
@@ -5113,24 +8651,27 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         )?;
         Ok(())
     }
+}
 
-    fn edge(
-        &self,
-        builder: &mut ProcedureCfgBuilder,
-        source_point: ProgramPointId,
-        target: EdgeTarget,
-    ) -> Result<(), RustLoweringError> {
-        self.session
-            .add_edge(builder, source_point, target.point, target.kind)
-    }
+fn completion_has_unrouted_drop(route: &CompletionRoute) -> bool {
+    route.operations().iter().any(|operation| {
+        matches!(
+            operation,
+            CleanupRouteOperation::Action(ScopeCleanupAction::Drop {
+                behavior: DropBehavior::Destructor(_),
+                ..
+            })
+        )
+    })
 }
 
 fn call_operand_evaluations(call: Node<'_>) -> Result<Vec<Node<'_>>, RustLoweringError> {
     let function = required_field(call, "function")?;
     let mut result = Vec::new();
-    let runtime_function = unwrap_generic_function(function);
+    let runtime_function = call_function_target(function);
     match runtime_function.kind() {
-        "identifier" | "scoped_identifier" => {}
+        "identifier" => result.push(runtime_function),
+        "scoped_identifier" => {}
         "field_expression" => {
             if let Some(receiver) = runtime_function.child_by_field_name("value") {
                 result.push(receiver);
@@ -5151,18 +8692,8 @@ fn call_arguments(node: Node<'_>) -> Vec<Node<'_>> {
         .collect()
 }
 
-fn unwrap_generic_function(mut function: Node<'_>) -> Node<'_> {
-    while function.kind() == "generic_function" {
-        let Some(inner) = function.child_by_field_name("function") else {
-            break;
-        };
-        function = inner;
-    }
-    function
-}
-
 fn rust_callable_anchor(function: Node<'_>) -> Node<'_> {
-    let function = unwrap_generic_function(function);
+    let function = call_function_target(function);
     match function.kind() {
         "field_expression" => function.child_by_field_name("field").unwrap_or(function),
         "scoped_identifier" | "scoped_type_identifier" => {
@@ -5173,12 +8704,17 @@ fn rust_callable_anchor(function: Node<'_>) -> Node<'_> {
 }
 
 fn rust_call_receiver(function: Node<'_>) -> Option<Node<'_>> {
-    let function = unwrap_generic_function(function);
+    let function = call_function_target(function);
     (function.kind() == "field_expression")
         .then(|| function.child_by_field_name("value"))
         .flatten()
 }
 
+/// The identifier bound to the whole value of `pattern`.
+///
+/// `ref x` is excluded: it binds a reference to the value (`&T`), not the
+/// value itself, so it carries neither the value's type nor its drop.
+/// `single_binding_identifier` accepts `ref x` because it only needs the name.
 fn identity_binding_identifier(mut pattern: Node<'_>) -> Option<Node<'_>> {
     loop {
         match pattern.kind() {
@@ -5239,8 +8775,11 @@ fn rust_pattern_binding_identifiers(pattern: Node<'_>) -> Vec<Node<'_>> {
             "scoped_identifier" => continue,
             _ => {}
         }
-        let excluded = ["type", "condition"]
-            .into_iter()
+        // `condition` is the `if` guard of a `match_pattern` (`Some(x) if x > 0`).
+        let excluded = binding_excluded_child_fields(Language::Rust, current.kind())
+            .iter()
+            .copied()
+            .chain(["condition"])
             .filter_map(|field| current.child_by_field_name(field))
             .map(|node| node.id())
             .collect::<Vec<_>>();
@@ -5275,13 +8814,81 @@ fn is_rust_nested_execution_boundary(node: Node<'_>) -> bool {
     )
 }
 
+fn peel_rust_parentheses(mut node: Node<'_>) -> Node<'_> {
+    loop {
+        node = unwrap_attributes(node);
+        if node.kind() != "parenthesized_expression" {
+            return node;
+        }
+        let Some(inner) = first_named_child(node) else {
+            return node;
+        };
+        node = inner;
+    }
+}
+
+fn rust_boolean_literal_value(source: &str, node: Node<'_>) -> Option<bool> {
+    let node = peel_rust_parentheses(node);
+    match node.kind() {
+        "true" => Some(true),
+        "false" => Some(false),
+        "boolean_literal" => match source.get(node.byte_range())? {
+            "true" => Some(true),
+            "false" => Some(false),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+fn rust_literal_value_kind(source: &str, node: Node<'_>) -> Option<SemanticValueKind> {
+    let node = peel_rust_parentheses(node);
+    if let Some(value) = rust_boolean_literal_value(source, node) {
+        return Some(SemanticValueKind::Boolean(value));
+    }
+    if node.kind() == "integer_literal" {
+        let text = source.get(node.byte_range())?;
+        if text.starts_with("0b") || text.starts_with("0o") || text.starts_with("0x") {
+            return None;
+        }
+        let (value, suffix) = rust_integer_literal_parts(source, node)?;
+        return if suffix.is_empty() || suffix.starts_with("u") {
+            Some(SemanticValueKind::UnsignedInteger(value))
+        } else {
+            Some(SemanticValueKind::SignedInteger(
+                i128::try_from(value).ok()?,
+            ))
+        };
+    }
+    if node.kind() == "unary_expression"
+        && node.child(0).is_some_and(|operator| operator.kind() == "-")
+    {
+        let operand = node.named_child(0)?;
+        return match rust_literal_value_kind(source, operand)? {
+            SemanticValueKind::UnsignedInteger(value) => Some(SemanticValueKind::SignedInteger(
+                i128::try_from(value).ok()?.checked_neg()?,
+            )),
+            SemanticValueKind::SignedInteger(value) => {
+                Some(SemanticValueKind::SignedInteger(value.checked_neg()?))
+            }
+            _ => None,
+        };
+    }
+    None
+}
+
 fn expression_value_kind(node: Node<'_>) -> SemanticValueKind {
     let node = unwrap_attributes(node);
     match node.kind() {
         "closure_expression" | "async_block" | "gen_block" => SemanticValueKind::Callable,
-        kind if kind.ends_with("_literal")
-            || matches!(kind, "true" | "false" | "unit_expression") =>
-        {
+        "true" => SemanticValueKind::Boolean(true),
+        "false" => SemanticValueKind::Boolean(false),
+        "boolean_literal" => match node.child(0).map(|child| child.kind()) {
+            Some("true") => SemanticValueKind::Boolean(true),
+            Some("false") => SemanticValueKind::Boolean(false),
+            _ => SemanticValueKind::Constant,
+        },
+        kind if kind.ends_with("_literal") || kind == "unit_expression" => {
             SemanticValueKind::Constant
         }
         _ => SemanticValueKind::Temporary,
@@ -5291,7 +8898,7 @@ fn expression_value_kind(node: Node<'_>) -> SemanticValueKind {
 /// Whether this expression's lowering already publishes where its value came
 /// from, so a tail-expression return needs no value-refinement gap.
 fn rust_expression_has_direct_value_evidence(node: Node<'_>) -> bool {
-    let node = unwrap_attributes(node);
+    let node = rust_transparent_value_leaf(node).unwrap_or_else(|| unwrap_attributes(node));
     matches!(
         node.kind(),
         "call_expression"
@@ -5371,6 +8978,61 @@ fn rust_declared_type_shape(source: &str, ty: Node<'_>) -> Option<RustValueShape
     }
 }
 
+fn rust_type_path_node(ty: Node<'_>) -> Option<Node<'_>> {
+    match ty.kind() {
+        "generic_type" => ty.child_by_field_name("type"),
+        "type_identifier" | "scoped_type_identifier" => Some(ty),
+        _ => None,
+    }
+}
+
+fn rust_call_type_argument(function: Node<'_>, index: usize) -> Option<Node<'_>> {
+    let arguments = function.child_by_field_name("type_arguments")?;
+    named_children(arguments).get(index).copied()
+}
+
+fn rust_generic_type_argument(type_node: Node<'_>, index: usize) -> Option<Node<'_>> {
+    let arguments = type_node.child_by_field_name("type_arguments")?;
+    named_children(arguments)
+        .into_iter()
+        .filter(|argument| {
+            matches!(
+                argument.kind(),
+                "primitive_type"
+                    | "unit_type"
+                    | "never_type"
+                    | "reference_type"
+                    | "pointer_type"
+                    | "array_type"
+                    | "slice_type"
+                    | "tuple_type"
+                    | "type_identifier"
+                    | "scoped_type_identifier"
+                    | "generic_type"
+            )
+        })
+        .nth(index)
+}
+
+fn rust_type_byte_size(source: &str, ty: Node<'_>) -> Option<u128> {
+    match ty.kind() {
+        "primitive_type" => match node_text(source, ty)?.trim() {
+            "i8" | "u8" | "bool" => Some(1),
+            "i16" | "u16" => Some(2),
+            "i32" | "u32" | "f32" | "char" => Some(4),
+            "i64" | "u64" | "f64" => Some(8),
+            "i128" | "u128" | "f128" => Some(16),
+            _ => None,
+        },
+        "array_type" => {
+            let element = ty.child_by_field_name("element")?;
+            let length = rust_integer_literal_value(source, ty.child_by_field_name("length")?)?;
+            rust_type_byte_size(source, element)?.checked_mul(length)
+        }
+        _ => None,
+    }
+}
+
 /// The `Self` type of the `impl` block this callable is declared in.
 /// Whether this expression is written by the assignment that contains it.
 ///
@@ -5412,6 +9074,18 @@ fn rust_parameter_is_definitely_non_dropping(node: Node<'_>) -> bool {
     node.child_by_field_name("type")
         .is_some_and(rust_type_is_definitely_non_dropping)
         || rust_type_is_definitely_non_dropping(node)
+        || rust_self_parameter_is_borrowed(node)
+}
+
+/// `&self` and `&mut self` borrow the receiver: the grammar spells the borrow
+/// as an anonymous `&` token inside `self_parameter`, which has no `type`
+/// field. A by-value `self` owns the receiver and may run its destructor.
+pub(super) fn rust_self_parameter_is_borrowed(node: Node<'_>) -> bool {
+    if node.kind() != "self_parameter" {
+        return false;
+    }
+    let mut cursor = node.walk();
+    node.children(&mut cursor).any(|child| child.kind() == "&")
 }
 
 /// What one struct declaration in this file states about one of its fields.
@@ -5435,6 +9109,10 @@ struct RustFieldDeclaration {
 /// Python adapter's `instance_field_proofs` takes, and it is stated here so a
 /// reader does not mistake any of these for a whole-crate proof.
 struct RustFileFacts<'tree> {
+    /// Same-file top-level integer constants keyed by their bare identifier.
+    /// `None` marks a duplicate or unsupported initializer, which no longer
+    /// proves one constant identity.
+    integer_constants: HashMap<Box<str>, Option<u128>>,
     /// One unambiguous same-file bare function name and its declared return
     /// type. Duplicate names retain `None` rather than selecting by spelling.
     function_return_types: HashMap<Box<str>, Option<Node<'tree>>>,
@@ -5451,13 +9129,55 @@ struct RustFileFacts<'tree> {
     /// bound terminal name. `None` marks a name bound by more than one item,
     /// which no longer proves one path.
     use_bindings: HashMap<Box<str>, Option<Vec<Box<str>>>>,
+    /// Import paths used only to derive Rust modeled receiver owners. This
+    /// recognizes explicit aliases without widening the shared import
+    /// consumer's deliberately narrower clause contract.
+    receiver_use_bindings: HashMap<Box<str>, Option<Vec<Box<str>>>>,
     /// Type-namespace names this file declares, which may shadow a `use`
     /// binding; a name here resolves through no import.
     shadowed_type_names: HashSet<Box<str>>,
+    /// Source-declared types for parameters, locals, statics, and constants.
+    /// These are per-file facts reused by receiver matching and remain tied to
+    /// this file's syntax tree.
+    typed_bindings: Vec<RustTypedBinding<'tree>>,
+    /// Structured same-file static declarations and their lexical item scopes.
+    static_declarations: Vec<RustStaticDeclaration<'tree>>,
+}
+
+struct RustStaticDeclaration<'tree> {
+    name: Box<str>,
+    name_node: Node<'tree>,
+    scope: Node<'tree>,
+}
+
+#[derive(Debug, Clone)]
+struct RustTypedBinding<'tree> {
+    name: Box<str>,
+    declaration_start: usize,
+    visible_from: usize,
+    scope_start: usize,
+    scope_end: usize,
+    kind: RustTypedBindingKind,
+    declared_type: Option<Node<'tree>>,
+    initializer: Option<Node<'tree>>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RustTypedBindingKind {
+    Parameter,
+    Local,
+    StaticOrConst,
 }
 
 fn rust_file_facts<'tree>(prepared: &'tree PreparedSyntaxTree) -> RustFileFacts<'tree> {
-    let source = prepared.source();
+    rust_file_facts_from_tree(prepared.source(), prepared.tree())
+}
+
+fn rust_file_facts_from_tree<'tree>(
+    source: &'tree str,
+    tree: &'tree tree_sitter::Tree,
+) -> RustFileFacts<'tree> {
+    let mut integer_constants: HashMap<Box<str>, Option<u128>> = HashMap::default();
     let mut function_return_types: HashMap<Box<str>, Option<Node<'tree>>> = HashMap::default();
     let mut non_dropping_return_functions: HashMap<Box<str>, bool> = HashMap::default();
     let mut struct_fields: HashMap<(Box<str>, Box<str>), Option<RustFieldDeclaration>> =
@@ -5469,8 +9189,11 @@ fn rust_file_facts<'tree>(prepared: &'tree PreparedSyntaxTree) -> RustFileFacts<
     let mut disqualified: HashSet<Box<str>> = HashSet::default();
     let mut every_struct_drops = false;
     let mut use_bindings: HashMap<Box<str>, Option<Vec<Box<str>>>> = HashMap::default();
+    let mut receiver_use_bindings: HashMap<Box<str>, Option<Vec<Box<str>>>> = HashMap::default();
     let mut shadowed_type_names: HashSet<Box<str>> = HashSet::default();
-    let mut stack = vec![prepared.tree().root_node()];
+    let mut typed_bindings = Vec::new();
+    let mut static_declarations = Vec::new();
+    let mut stack = vec![tree.root_node()];
     while let Some(node) = stack.pop() {
         match node.kind() {
             "function_item" => {
@@ -5502,6 +9225,7 @@ fn rust_file_facts<'tree>(prepared: &'tree PreparedSyntaxTree) -> RustFileFacts<
                     .child_by_field_name("name")
                     .and_then(|name| node_text(source, name))
                 {
+                    shadowed_type_names.insert(name.into());
                     let fields = node
                         .child_by_field_name("body")
                         .filter(|body| body.kind() == "field_declaration_list")
@@ -5545,6 +9269,111 @@ fn rust_file_facts<'tree>(prepared: &'tree PreparedSyntaxTree) -> RustFileFacts<
                     }
                 }
             }
+            "parameter" => {
+                if let Some(pattern) = node.child_by_field_name("pattern")
+                    && let Some(name) = identity_binding_identifier(pattern)
+                    && let Some(name_text) = node_text(source, name)
+                    && let Some((scope_start, scope_end)) = rust_local_scope(node)
+                {
+                    typed_bindings.push(RustTypedBinding {
+                        name: name_text.into(),
+                        declaration_start: name.start_byte(),
+                        visible_from: node.end_byte(),
+                        scope_start,
+                        scope_end,
+                        kind: RustTypedBindingKind::Parameter,
+                        declared_type: node.child_by_field_name("type"),
+                        initializer: None,
+                    });
+                }
+            }
+            "self_parameter" => {
+                if let Some((scope_start, scope_end)) = rust_local_scope(node)
+                    && let Some(declared_type) = rust_impl_self_type(node)
+                {
+                    typed_bindings.push(RustTypedBinding {
+                        name: "self".into(),
+                        declaration_start: node.start_byte(),
+                        visible_from: node.end_byte(),
+                        scope_start,
+                        scope_end,
+                        kind: RustTypedBindingKind::Parameter,
+                        declared_type: Some(declared_type),
+                        initializer: None,
+                    });
+                }
+            }
+            "let_declaration" => {
+                if let Some(pattern) = node.child_by_field_name("pattern")
+                    && let Some(name) = identity_binding_identifier(pattern)
+                    && let Some(name_text) = node_text(source, name)
+                    && let Some((scope_start, scope_end)) = rust_local_scope(node)
+                {
+                    typed_bindings.push(RustTypedBinding {
+                        name: name_text.into(),
+                        declaration_start: name.start_byte(),
+                        visible_from: node.end_byte(),
+                        scope_start,
+                        scope_end,
+                        kind: RustTypedBindingKind::Local,
+                        declared_type: node.child_by_field_name("type"),
+                        initializer: node.child_by_field_name("value"),
+                    });
+                }
+            }
+            "static_item" | "const_item" => {
+                if node.kind() == "const_item"
+                    && node
+                        .parent()
+                        .is_some_and(|parent| parent.kind() == "source_file")
+                    && let Some(name) = node
+                        .child_by_field_name("name")
+                        .and_then(|name| node_text(source, name))
+                {
+                    let value = node
+                        .child_by_field_name("value")
+                        .and_then(|value| rust_integer_constant_value(source, value));
+                    match integer_constants.entry(name.into()) {
+                        std::collections::hash_map::Entry::Vacant(entry) => {
+                            entry.insert(value);
+                        }
+                        std::collections::hash_map::Entry::Occupied(mut entry) => {
+                            entry.insert(None);
+                        }
+                    }
+                }
+                if let Some(name) = node.child_by_field_name("name")
+                    && let Some(name_text) = node_text(source, name)
+                {
+                    let (scope_start, scope_end) =
+                        rust_local_scope(node).unwrap_or((0, source.len()));
+                    typed_bindings.push(RustTypedBinding {
+                        name: name_text.into(),
+                        declaration_start: name.start_byte(),
+                        visible_from: if scope_start == 0 { 0 } else { node.end_byte() },
+                        scope_start,
+                        scope_end,
+                        kind: RustTypedBindingKind::StaticOrConst,
+                        declared_type: node.child_by_field_name("type"),
+                        initializer: None,
+                    });
+                }
+                // Statics are also memory locations for resource identity
+                // (#3850); constants are values, not places.
+                if node.kind() == "static_item"
+                    && let (Some(name_node), Some(scope)) = (
+                        node.child_by_field_name("name"),
+                        rust_item_lexical_scope(node),
+                    )
+                    && let Some(name) = node_text(source, name_node)
+                {
+                    static_declarations.push(RustStaticDeclaration {
+                        name: name.into(),
+                        name_node,
+                        scope,
+                    });
+                }
+            }
             "impl_item" => {
                 let implements_drop = node
                     .child_by_field_name("trait")
@@ -5575,21 +9404,29 @@ fn rust_file_facts<'tree>(prepared: &'tree PreparedSyntaxTree) -> RustFileFacts<
                     .parent()
                     .is_some_and(|parent| parent.kind() == "source_file")
                     && let Some(clause) = node.named_child(0)
-                    && let Some(bindings) = rust_use_clause_bindings(clause, source)
                 {
-                    for (terminal, segments) in bindings {
-                        if segments.len() < 2 {
-                            continue;
+                    let bindings = rust_use_clause_bindings(clause, source);
+                    if let Some(bindings) = bindings.as_ref() {
+                        for (terminal, segments) in bindings {
+                            record_rust_use_binding(
+                                &mut receiver_use_bindings,
+                                terminal.clone(),
+                                segments.clone(),
+                            );
                         }
-                        match use_bindings.entry(terminal) {
-                            std::collections::hash_map::Entry::Vacant(entry) => {
-                                entry.insert(Some(segments));
+                    } else if let Some(bindings) =
+                        rust_receiver_use_alias_clause_bindings(clause, source)
+                    {
+                        for (terminal, segments) in bindings {
+                            record_rust_use_binding(&mut receiver_use_bindings, terminal, segments);
+                        }
+                    }
+                    if let Some(bindings) = bindings {
+                        for (terminal, segments) in bindings {
+                            if segments.len() < 2 {
+                                continue;
                             }
-                            std::collections::hash_map::Entry::Occupied(mut entry) => {
-                                if entry.get().as_deref() != Some(segments.as_slice()) {
-                                    entry.insert(None);
-                                }
-                            }
+                            record_rust_use_binding(&mut use_bindings, terminal, segments);
                         }
                     }
                 }
@@ -5647,13 +9484,568 @@ fn rust_file_facts<'tree>(prepared: &'tree PreparedSyntaxTree) -> RustFileFacts<
     }
 
     RustFileFacts {
+        integer_constants,
         function_return_types,
         non_dropping_return_functions,
         struct_fields,
         plain_structs,
         use_bindings,
+        receiver_use_bindings,
         shadowed_type_names,
+        typed_bindings,
+        static_declarations,
     }
+}
+
+/// The nearest Rust item scope that owns a static declaration. Block-local
+/// statics and module-level statics use the same structured name lookup while
+/// the narrower scope wins over an enclosing module declaration.
+fn rust_item_lexical_scope(item: Node<'_>) -> Option<Node<'_>> {
+    let mut current = item.parent()?;
+    loop {
+        if matches!(current.kind(), "source_file" | "declaration_list" | "block") {
+            return Some(current);
+        }
+        current = current.parent()?;
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct RustSourceRange {
+    start: usize,
+    end: usize,
+}
+
+impl RustSourceRange {
+    fn of(node: Node<'_>) -> Self {
+        Self {
+            start: node.start_byte(),
+            end: node.end_byte(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct RustReceiverBindingFact {
+    declaration_start: usize,
+    visible_from: usize,
+    scope_start: usize,
+    scope_end: usize,
+    kind: RustTypedBindingKind,
+    declared_type: Option<RustSourceRange>,
+    initializer: Option<RustSourceRange>,
+}
+
+/// Query-scoped source facts needed to bind a value receiver to one exact
+/// active Rust model owner. The fact set is built once for one blob inside a
+/// definition batch; all syntax is retained as byte ranges, not tree nodes.
+pub(crate) struct RustReceiverTypeFacts {
+    bindings: HashMap<Box<str>, Vec<RustReceiverBindingFact>>,
+    function_return_types: HashMap<Box<str>, Option<RustSourceRange>>,
+    use_bindings: HashMap<Box<str>, Option<Vec<Box<str>>>>,
+    shadowed_type_names: HashSet<Box<str>>,
+}
+
+const RUST_PRELUDE_MODEL_OWNERS: &[(&[&str], &str)] = &[
+    (&["std", "boxed", "Box"], "std.boxed.Box"),
+    (&["alloc", "boxed", "Box"], "alloc.boxed.Box"),
+    (&["std", "vec", "Vec"], "std.vec.Vec"),
+    (&["alloc", "vec", "Vec"], "alloc.vec.Vec"),
+    (&["std", "string", "String"], "std.string.String"),
+    (&["alloc", "string", "String"], "alloc.string.String"),
+];
+
+enum RustReceiverTypeWork<'tree> {
+    Expression(Node<'tree>),
+    DeclaredType(Node<'tree>),
+    ModelReceiverCall {
+        member: Box<str>,
+        parameter_count: u32,
+    },
+}
+
+impl RustReceiverTypeFacts {
+    pub(crate) fn from_tree(source: &str, tree: &tree_sitter::Tree) -> Self {
+        let facts = rust_file_facts_from_tree(source, tree);
+        Self::from_file_facts(&facts)
+    }
+
+    fn from_file_facts(facts: &RustFileFacts<'_>) -> Self {
+        let mut bindings: HashMap<Box<str>, Vec<RustReceiverBindingFact>> = HashMap::default();
+        for binding in &facts.typed_bindings {
+            bindings
+                .entry(binding.name.clone())
+                .or_default()
+                .push(RustReceiverBindingFact {
+                    declaration_start: binding.declaration_start,
+                    visible_from: binding.visible_from,
+                    scope_start: binding.scope_start,
+                    scope_end: binding.scope_end,
+                    kind: binding.kind,
+                    declared_type: binding.declared_type.map(RustSourceRange::of),
+                    initializer: binding.initializer.map(RustSourceRange::of),
+                });
+        }
+        Self {
+            bindings,
+            function_return_types: facts
+                .function_return_types
+                .iter()
+                .map(|(name, return_type)| (name.clone(), return_type.map(RustSourceRange::of)))
+                .collect(),
+            use_bindings: facts.receiver_use_bindings.clone(),
+            shadowed_type_names: facts.shadowed_type_names.clone(),
+        }
+    }
+
+    /// Derive the exact active-model owner of one value expression. Unknown,
+    /// conflicting, trait, and incomplete types remain unresolved.
+    pub(crate) fn owner_of_expression(
+        &self,
+        source: &str,
+        tree: &tree_sitter::Tree,
+        expression: Node<'_>,
+        overlay: &SemanticModelOverlay,
+    ) -> Option<String> {
+        self.owner_of_expression_with_ownership(source, tree, expression, overlay, None)
+    }
+
+    fn owner_of_expression_with_ownership(
+        &self,
+        source: &str,
+        tree: &tree_sitter::Tree,
+        expression: Node<'_>,
+        overlay: &SemanticModelOverlay,
+        ownership: Option<&RustOwnershipIndex<'_, '_>>,
+    ) -> Option<String> {
+        if !self.has_unresolved_receiver_binding(source, expression) {
+            return None;
+        }
+        let mut pending = vec![RustReceiverTypeWork::Expression(expression)];
+        let mut results = Vec::<Option<String>>::new();
+        while let Some(work) = pending.pop() {
+            match work {
+                RustReceiverTypeWork::Expression(node) => {
+                    let node = unwrap_attributes(node);
+                    match node.kind() {
+                        "parenthesized_expression" => match first_named_child(node) {
+                            Some(inner) => pending.push(RustReceiverTypeWork::Expression(inner)),
+                            None => results.push(None),
+                        },
+                        "reference_expression" => match rust_reference_expression_value(node) {
+                            Some(inner) => pending.push(RustReceiverTypeWork::Expression(inner)),
+                            None => results.push(None),
+                        },
+                        "unary_expression" => match rust_dereference_operand(node) {
+                            Some(inner) => pending.push(RustReceiverTypeWork::Expression(inner)),
+                            None => results.push(None),
+                        },
+                        "identifier" | "self" => {
+                            let name = if node.kind() == "self" {
+                                "self"
+                            } else {
+                                let Some(name) = node_text(source, node) else {
+                                    results.push(None);
+                                    continue;
+                                };
+                                name
+                            };
+                            let Some(binding) = self.binding_at(name, node.start_byte()) else {
+                                results.push(None);
+                                continue;
+                            };
+                            let range = binding.declared_type.or(binding.initializer);
+                            match range.and_then(|range| rust_node_at_range(tree, range)) {
+                                Some(value)
+                                    if binding.declared_type
+                                        == Some(RustSourceRange::of(value)) =>
+                                {
+                                    pending.push(RustReceiverTypeWork::DeclaredType(value));
+                                }
+                                Some(value) => {
+                                    pending.push(RustReceiverTypeWork::Expression(value))
+                                }
+                                None => results.push(None),
+                            }
+                        }
+                        "struct_expression" => match node.child_by_field_name("name") {
+                            Some(ty) => pending.push(RustReceiverTypeWork::DeclaredType(ty)),
+                            None => results.push(None),
+                        },
+                        "type_cast_expression" => match node.child_by_field_name("type") {
+                            Some(ty) => pending.push(RustReceiverTypeWork::DeclaredType(ty)),
+                            None => results.push(None),
+                        },
+                        "call_expression" => {
+                            let Some(function) = node.child_by_field_name("function") else {
+                                results.push(None);
+                                continue;
+                            };
+                            let function = call_function_target(function);
+                            if function.kind() == "field_expression" {
+                                let Some(receiver) = function.child_by_field_name("value") else {
+                                    results.push(None);
+                                    continue;
+                                };
+                                let Some(member) = function
+                                    .child_by_field_name("field")
+                                    .and_then(|field| node_text(source, field))
+                                else {
+                                    results.push(None);
+                                    continue;
+                                };
+                                let Ok(parameter_count) = u32::try_from(call_arguments(node).len())
+                                else {
+                                    results.push(None);
+                                    continue;
+                                };
+                                pending.push(RustReceiverTypeWork::ModelReceiverCall {
+                                    member: member.into(),
+                                    parameter_count,
+                                });
+                                pending.push(RustReceiverTypeWork::Expression(receiver));
+                            } else if matches!(function.kind(), "identifier" | "scoped_identifier")
+                            {
+                                match self.path_call_return_type(
+                                    source, tree, function, node, overlay, ownership,
+                                ) {
+                                    Some(owner) => results.push(Some(owner)),
+                                    None => results.push(None),
+                                }
+                            } else {
+                                results.push(None);
+                            }
+                        }
+                        _ => results.push(None),
+                    }
+                }
+                RustReceiverTypeWork::DeclaredType(ty) => {
+                    results.push(self.source_type_owner(source, ty, overlay));
+                }
+                RustReceiverTypeWork::ModelReceiverCall {
+                    member,
+                    parameter_count,
+                } => {
+                    let Some(receiver_owner) = results.pop().flatten() else {
+                        results.push(None);
+                        continue;
+                    };
+                    results.push(self.model_call_return_type(
+                        overlay,
+                        &receiver_owner,
+                        &member,
+                        true,
+                        parameter_count,
+                    ));
+                }
+            }
+        }
+        (results.len() == 1)
+            .then(|| results.pop().flatten())
+            .flatten()
+    }
+
+    fn has_unresolved_receiver_binding(&self, source: &str, expression: Node<'_>) -> bool {
+        let mut node = unwrap_attributes(expression);
+        loop {
+            match node.kind() {
+                "parenthesized_expression" => {
+                    let Some(inner) = first_named_child(node) else {
+                        return false;
+                    };
+                    node = inner;
+                }
+                "reference_expression" => {
+                    let Some(inner) = rust_reference_expression_value(node) else {
+                        return false;
+                    };
+                    node = inner;
+                }
+                "unary_expression" => {
+                    let Some(inner) = rust_dereference_operand(node) else {
+                        return false;
+                    };
+                    node = inner;
+                }
+                "identifier" | "self" => {
+                    let name = if node.kind() == "self" {
+                        "self"
+                    } else if let Some(name) = node_text(source, node) {
+                        name
+                    } else {
+                        return false;
+                    };
+                    let Some(binding) = self.binding_at(name, node.start_byte()) else {
+                        return false;
+                    };
+                    return match binding.kind {
+                        // Native proof runs first. When it declines, the active
+                        // model can still identify an explicitly typed external
+                        // receiver or follow a model-backed local initializer.
+                        RustTypedBindingKind::Local => {
+                            binding.declared_type.is_some() || binding.initializer.is_some()
+                        }
+                        RustTypedBindingKind::Parameter => binding.declared_type.is_some(),
+                        // Some resolver versions do not classify block-local
+                        // static/const items as value bindings. Preserve the
+                        // declared-type fallback for those item nodes only.
+                        RustTypedBindingKind::StaticOrConst => binding.declared_type.is_some(),
+                    };
+                }
+                // The upstream resolver handles modeled returns when it can
+                // establish the call identity from its own source facts. G03
+                // fills only the gap where an active model's structured return
+                // type supplies the receiver owner (for example, an imported
+                // alias to Command::new). owner_of_expression still requires a
+                // unique, complete callable and nominal return type.
+                "call_expression" => return true,
+                _ => return false,
+            }
+        }
+    }
+
+    fn binding_at(&self, name: &str, byte: usize) -> Option<RustReceiverBindingFact> {
+        let bindings = self.bindings.get(name)?;
+        let best = bindings
+            .iter()
+            .filter(|binding| {
+                binding.visible_from <= byte
+                    && binding.scope_start <= byte
+                    && byte < binding.scope_end
+            })
+            .min_by_key(|binding| {
+                (
+                    binding.scope_end - binding.scope_start,
+                    std::cmp::Reverse(binding.declaration_start),
+                )
+            })?;
+        Some(*best)
+    }
+
+    fn source_type_owner(
+        &self,
+        source: &str,
+        ty: Node<'_>,
+        overlay: &SemanticModelOverlay,
+    ) -> Option<String> {
+        let segments = rust_nominal_type_path(ty, source)?;
+        let owner = self.qualified_path_identity(segments, ty.start_byte())?;
+        let symbol = unique_rust_model_symbol(overlay, &owner)?;
+        matches!(
+            symbol.kind,
+            SemanticModelSymbolKind::Struct
+                | SemanticModelSymbolKind::Enum
+                | SemanticModelSymbolKind::Union
+        )
+        .then(|| symbol.qualified_name.clone())
+    }
+
+    fn path_call_return_type(
+        &self,
+        source: &str,
+        tree: &tree_sitter::Tree,
+        function: Node<'_>,
+        call: Node<'_>,
+        overlay: &SemanticModelOverlay,
+        ownership: Option<&RustOwnershipIndex<'_, '_>>,
+    ) -> Option<String> {
+        let segments = brokk_bifrost_rust::graph_support::rust_path_segments(function)?;
+        let names = segments
+            .iter()
+            .map(|segment| node_text(source, *segment).map(str::to_owned))
+            .collect::<Option<Vec<_>>>()?;
+        let call_start = call.start_byte();
+        if names.len() > 1 {
+            let member = names.last()?;
+            let parameter_count = u32::try_from(call_arguments(call).len()).ok()?;
+            if let Some(ownership) = ownership {
+                for &(standard_owner_path, model_owner) in RUST_PRELUDE_MODEL_OWNERS {
+                    let mut expected = standard_owner_path.to_vec();
+                    expected.push(member.as_str());
+                    if ownership.resolves_standard_path(function, &expected)
+                        && let Some(return_owner) = self.model_call_return_type(
+                            overlay,
+                            model_owner,
+                            member,
+                            false,
+                            parameter_count,
+                        )
+                    {
+                        return Some(return_owner);
+                    }
+                }
+            }
+        }
+        if names.len() == 1 {
+            let name = names.first()?;
+            if function.kind() == "identifier" && self.binding_at(name, call_start).is_some() {
+                return None;
+            }
+            if let Some(path) = self.imported_path(name, call_start) {
+                let mut full_path = path;
+                let parameter_count = u32::try_from(call_arguments(call).len()).ok()?;
+                let member = full_path.pop()?;
+                let owner = full_path.join(".");
+                return self.model_call_return_type(
+                    overlay,
+                    &owner,
+                    &member,
+                    false,
+                    parameter_count,
+                );
+            }
+            let return_type = self.function_return_types.get(name.as_str())?.as_ref()?;
+            return rust_node_at_range(tree, *return_type)
+                .and_then(|ty| self.source_type_owner(source, ty, overlay));
+        }
+        let mut full_path = self.qualified_path_segments(names, call_start)?;
+        let member = full_path.pop()?;
+        let owner = full_path.join(".");
+        let parameter_count = u32::try_from(call_arguments(call).len()).ok()?;
+        self.model_call_return_type(overlay, &owner, &member, false, parameter_count)
+    }
+
+    fn model_call_return_type(
+        &self,
+        overlay: &SemanticModelOverlay,
+        owner: &str,
+        member: &str,
+        has_receiver: bool,
+        parameter_count: u32,
+    ) -> Option<String> {
+        let owner_symbol = unique_rust_model_symbol(overlay, owner)?;
+        if !matches!(
+            owner_symbol.kind,
+            SemanticModelSymbolKind::Module
+                | SemanticModelSymbolKind::Struct
+                | SemanticModelSymbolKind::Enum
+                | SemanticModelSymbolKind::Union
+        ) {
+            return None;
+        }
+        let callable = overlay.callable_for_application(
+            SemanticModelCallableKey::new(
+                Language::Rust.config_label(),
+                owner,
+                member,
+                has_receiver,
+                parameter_count,
+            ),
+            &SemanticModelCallApplication::positional(parameter_count),
+        );
+        if callable.disposition != SemanticModelCallableDisposition::Unique {
+            return None;
+        }
+        let [callable] = callable.records.as_slice() else {
+            return None;
+        };
+        if !callable.externally_visible()
+            || callable.provenance.ambiguous
+            || callable.provenance.completeness != SemanticModelCompleteness::Complete
+        {
+            return None;
+        }
+        let returned = callable.structured_signature()?.returns.as_ref()?;
+        self.model_type_ref_owner(overlay, returned)
+    }
+
+    fn model_type_ref_owner(
+        &self,
+        overlay: &SemanticModelOverlay,
+        mut reference: &TypeRef,
+    ) -> Option<String> {
+        loop {
+            match reference {
+                TypeRef::ByRef { element, .. } | TypeRef::Pointer { element } => {
+                    reference = element;
+                }
+                TypeRef::Declared { id, .. } => {
+                    let matched = overlay.symbols_with_id(id);
+                    if matched.disposition != SemanticModelOverlayDisposition::Unique {
+                        return None;
+                    }
+                    let [symbol] = matched.records.as_slice() else {
+                        return None;
+                    };
+                    let resolved = unique_rust_model_symbol(overlay, &symbol.qualified_name)?;
+                    return nominal_rust_model_type(resolved)
+                        .then(|| resolved.qualified_name.clone());
+                }
+                TypeRef::Named { name, .. } => {
+                    let symbol = unique_rust_model_symbol(overlay, name)?;
+                    return nominal_rust_model_type(symbol).then(|| symbol.qualified_name.clone());
+                }
+                _ => return None,
+            }
+        }
+    }
+
+    fn qualified_path_identity(&self, segments: Vec<String>, byte: usize) -> Option<String> {
+        self.qualified_path_segments(segments, byte)
+            .map(|segments| segments.join("."))
+    }
+
+    fn qualified_path_segments(
+        &self,
+        mut segments: Vec<String>,
+        byte: usize,
+    ) -> Option<Vec<String>> {
+        let first = segments.first()?;
+        if self.shadowed_type_names.contains(first.as_str()) {
+            return None;
+        }
+        if let Some(imported) = self.imported_path(first, byte) {
+            let mut qualified = imported;
+            qualified.extend(segments.into_iter().skip(1));
+            segments = qualified;
+        }
+        Some(segments)
+    }
+
+    fn imported_path(&self, name: &str, _byte: usize) -> Option<Vec<String>> {
+        self.use_bindings
+            .get(name)?
+            .as_ref()
+            .map(|segments| segments.iter().map(|segment| segment.to_string()).collect())
+    }
+}
+
+fn rust_node_at_range<'tree>(
+    tree: &'tree tree_sitter::Tree,
+    range: RustSourceRange,
+) -> Option<Node<'tree>> {
+    let node = tree
+        .root_node()
+        .named_descendant_for_byte_range(range.start, range.end)?;
+    (node.start_byte() == range.start && node.end_byte() == range.end).then_some(node)
+}
+
+fn nominal_rust_model_type(symbol: &SemanticModelSymbol) -> bool {
+    symbol.owner_id.is_none()
+        && symbol.language == Language::Rust.config_label()
+        && symbol.externally_visible()
+        && !symbol.provenance.ambiguous
+        && symbol.provenance.completeness == SemanticModelCompleteness::Complete
+        && matches!(
+            symbol.kind,
+            SemanticModelSymbolKind::Struct
+                | SemanticModelSymbolKind::Enum
+                | SemanticModelSymbolKind::Union
+        )
+}
+
+fn unique_rust_model_symbol<'a>(
+    overlay: &'a SemanticModelOverlay,
+    identity: &str,
+) -> Option<&'a SemanticModelSymbol> {
+    let symbol = RustOverlayCrates::new(Some(overlay)).referenceable_symbol(identity)?;
+    (symbol.owner_id.is_none()
+        && symbol.language == Language::Rust.config_label()
+        && symbol.qualified_name == identity
+        && symbol.externally_visible()
+        && !symbol.provenance.ambiguous
+        && symbol.provenance.completeness == SemanticModelCompleteness::Complete)
+        .then_some(symbol)
 }
 
 /// The explicit terminal bindings one top-level `use` clause makes, as
@@ -5683,6 +10075,73 @@ fn rust_use_clause_bindings(clause: Node<'_>, source: &str) -> Option<Vec<RustUs
         }
         "use_list" => rust_use_list_bindings(clause, Vec::new(), source),
         _ => None,
+    }
+}
+
+fn rust_receiver_use_alias_clause_bindings(
+    clause: Node<'_>,
+    source: &str,
+) -> Option<Vec<RustUseBinding>> {
+    let mut pending = vec![(clause, Vec::<Box<str>>::new())];
+    let mut bindings = Vec::new();
+    while let Some((node, prefix)) = pending.pop() {
+        match node.kind() {
+            "use_as_clause" => {
+                let mut path = prefix;
+                path.extend(rust_use_path_segments(
+                    node.child_by_field_name("path")?,
+                    source,
+                )?);
+                let alias = node_text(source, node.child_by_field_name("alias")?)?;
+                if alias != "_" {
+                    bindings.push((alias.into(), path));
+                }
+            }
+            "scoped_use_list" => {
+                let mut nested_prefix = prefix;
+                if let Some(path) = node.child_by_field_name("path") {
+                    nested_prefix.extend(rust_use_path_segments(path, source)?);
+                }
+                pending.push((node.child_by_field_name("list")?, nested_prefix));
+            }
+            "use_list" => {
+                for child in named_children(node).into_iter().rev() {
+                    pending.push((child, prefix.clone()));
+                }
+            }
+            "identifier" => {
+                let name: Box<str> = node_text(source, node)?.into();
+                let mut path = prefix;
+                path.push(name.clone());
+                bindings.push((name, path));
+            }
+            "scoped_identifier" => {
+                let mut path = prefix;
+                path.extend(rust_use_path_segments(node, source)?);
+                let terminal = path.last()?.clone();
+                bindings.push((terminal, path));
+            }
+            "self" => {}
+            _ => return None,
+        }
+    }
+    Some(bindings)
+}
+
+fn record_rust_use_binding(
+    bindings: &mut HashMap<Box<str>, Option<Vec<Box<str>>>>,
+    terminal: Box<str>,
+    segments: Vec<Box<str>>,
+) {
+    match bindings.entry(terminal) {
+        std::collections::hash_map::Entry::Vacant(entry) => {
+            entry.insert(Some(segments));
+        }
+        std::collections::hash_map::Entry::Occupied(mut entry) => {
+            if entry.get().as_deref() != Some(segments.as_slice()) {
+                entry.insert(None);
+            }
+        }
     }
 }
 
@@ -5730,120 +10189,32 @@ fn rust_use_list_bindings(
 }
 
 fn rust_use_path_segments(node: Node<'_>, source: &str) -> Option<Vec<Box<str>>> {
-    match node.kind() {
-        "identifier" | "crate" | "self" | "super" => Some(vec![node_text(source, node)?.into()]),
-        "scoped_identifier" => {
-            let mut segments = rust_use_path_segments(node.child_by_field_name("path")?, source)?;
-            segments.push(node_text(source, node.child_by_field_name("name")?)?.into());
-            Some(segments)
-        }
-        _ => None,
+    if !matches!(
+        node.kind(),
+        "identifier" | "crate" | "self" | "super" | "scoped_identifier"
+    ) {
+        return None;
     }
-}
-
-/// Whether one CSMI projection selects one named component of the keyed
-/// entry chosen by the given boundary selector.
-fn projection_is_entry_component(
-    projection: Option<&CsmiProjection>,
-    selector_kind: &str,
-    selector_position: u32,
-    component: &str,
-) -> bool {
-    let Some(projection) = projection else {
-        return false;
-    };
-    let [entry, selected_component] = projection.steps.as_slice() else {
-        return false;
-    };
-    entry.kind == "entry"
-        && entry
-            .args
-            .as_ref()
-            .and_then(|args| args.get("key"))
-            .and_then(|key| key.get("kind"))
-            .and_then(serde_json::Value::as_str)
-            == Some(selector_kind)
-        && entry
-            .args
-            .as_ref()
-            .and_then(|args| args.get("key"))
-            .and_then(|key| key.get("position"))
-            .and_then(serde_json::Value::as_u64)
-            == Some(u64::from(selector_position))
-        && selected_component.kind == component
-}
-
-fn receiver_substitution_is_proven(flow: &CollectionFlowContract) -> bool {
-    !matches!(
-        flow.payload.receiver_substitution,
-        Some(
-            CsmiCollectionFlowSubstitution::Unknown { .. }
-                | CsmiCollectionFlowSubstitution::Unsupported { .. }
-        )
-    )
-}
-
-fn receiver_root_is_keyed(flow: &CollectionFlowContract) -> bool {
-    flow.payload.roots.iter().any(|root| {
-        matches!(
-            &root.root,
-            CsmiCollectionFlowBoundaryRoot::Input(CsmiInputBoundaryRoot::Receiver(_))
-        ) && matches!(root.shape, CsmiCollectionFlowShape::Keyed { .. })
-    })
-}
-
-/// The transfer that reads the keyed entry chosen by the call's key
-/// argument into the callable's normal result, which is what `get` returns
-/// and what `insert` returns as the previous entry.
-fn transfer_reads_keyed_entry_value_to_result(transfer: &CsmiCollectionFlowTransfer) -> bool {
-    matches!(&transfer.source.root, CsmiInputBoundaryRoot::Receiver(_))
-        && projection_is_entry_component(
-            transfer.source.projection.as_ref(),
-            "parameter",
-            0,
-            "entry-value",
-        )
-        && matches!(
-            &transfer.destination.root,
-            CsmiOutputBoundaryRoot::Result(_)
-        )
-        && transfer.destination.projection.is_none()
-}
-
-/// The transfer that stores the call's second argument under the keyed
-/// entry the first argument names, which is what `insert` proves. The
-/// complete contract proves nothing else about insert's return; its absence
-/// is the model's claim that the return carries no keyed-entry flow.
-fn transfer_stores_parameter_value_into_receiver(transfer: &CsmiCollectionFlowTransfer) -> bool {
-    matches!(
-        &transfer.source.root,
-        CsmiInputBoundaryRoot::Parameter(parameter) if parameter.position == 1
-    ) && transfer.source.projection.is_none()
-        && matches!(
-            &transfer.destination.root,
-            CsmiOutputBoundaryRoot::Receiver(_)
-        )
-        && projection_is_entry_component(
-            transfer.destination.projection.as_ref(),
-            "parameter",
-            0,
-            "entry-value",
-        )
-}
-
-/// The place node a keyed call's key argument names, after peeling the
-/// parentheses and borrows that are only calling convention. `None` keeps
-/// the argument's own expression value.
-fn rust_keyed_place_node<'tree>(key_node: Node<'tree>) -> Option<Node<'tree>> {
-    let mut current = key_node;
-    for _ in 0..RUST_KEY_PLACE_UNWRAP_BOUND {
-        match current.kind() {
-            "parenthesized_expression" => current = first_named_child(current)?,
-            "reference_expression" => current = rust_reference_expression_value(current)?,
-            _ => return Some(current),
-        }
+    let segments = brokk_bifrost_rust::graph_support::rust_path_segments(node)?;
+    if brokk_bifrost_rust::graph_support::rust_path_is_leading_absolute(node)
+        || segments
+            .iter()
+            .any(|segment| !matches!(segment.kind(), "identifier" | "crate" | "self" | "super"))
+    {
+        return None;
     }
-    None
+    segments
+        .into_iter()
+        .map(|segment| {
+            Some(
+                source
+                    .get(segment.start_byte()..segment.end_byte())?
+                    .trim()
+                    .to_string()
+                    .into_boxed_str(),
+            )
+        })
+        .collect()
 }
 
 /// Whether iterating this expression yields elements that own no `Drop`.
@@ -5864,8 +10235,11 @@ fn rust_constant_condition(condition: Node<'_>) -> Option<bool> {
     let mut cursor = condition;
     loop {
         match cursor.kind() {
-            "true" => return Some(true),
-            "false" => return Some(false),
+            "true" | "false" => {
+                return brokk_bifrost_core::analyzer::structural::adapter_helpers::boolean_literal_value(
+                    cursor.kind(),
+                );
+            }
             // `boolean_literal` wraps the `true`/`false` keyword, which the
             // grammar spells as an anonymous token.
             "boolean_literal" => cursor = cursor.child(0)?,
@@ -5918,9 +10292,20 @@ fn rust_operation_can_abort(node: Node<'_>) -> bool {
                 matches!(operator.kind(), "+" | "-" | "*" | "/" | "%" | "<<" | ">>")
             }),
         // `unary_expression` spells its operator as an anonymous first child.
-        "unary_expression" => node
-            .child(0)
-            .is_some_and(|operator| matches!(operator.kind(), "-" | "*")),
+        "unary_expression" => {
+            let operator = node.child(0).map(|operator| operator.kind());
+            match operator {
+                Some("-")
+                    if node
+                        .named_child(0)
+                        .is_some_and(|operand| operand.kind() == "integer_literal") =>
+                {
+                    false
+                }
+                Some("-" | "*") => true,
+                _ => false,
+            }
+        }
         "compound_assignment_expr" => {
             node.child_by_field_name("operator")
                 .is_some_and(|operator| {
@@ -5945,6 +10330,35 @@ fn rust_operation_can_abort(node: Node<'_>) -> bool {
 /// surrounding source or macro text.
 fn rust_integer_literal_value(source: &str, node: Node<'_>) -> Option<u128> {
     rust_integer_literal_parts(source, node).map(|(value, _)| value)
+}
+
+/// Canonical member identity read from a tree-sitter `field_expression`'s
+/// `field` child. The AST classifies named members and tuple indices, so this
+/// does not need a declaration lookup or source-text search.
+fn rust_field_member_key(source: &str, field: Node<'_>) -> Option<String> {
+    match field.kind() {
+        "field_identifier" => {
+            let name = node_text(source, field)?;
+            Some(format!("named:{}", name.strip_prefix("r#").unwrap_or(name)))
+        }
+        "integer_literal" => {
+            rust_integer_literal_value(source, field).map(|index| format!("tuple:{index}"))
+        }
+        _ => None,
+    }
+}
+
+fn rust_integer_constant_value(source: &str, node: Node<'_>) -> Option<u128> {
+    let mut cursor = unwrap_attributes(node);
+    loop {
+        match cursor.kind() {
+            "parenthesized_expression" => {
+                cursor = first_named_child(cursor)?;
+            }
+            "integer_literal" => return rust_integer_literal_value(source, cursor),
+            _ => return None,
+        }
+    }
 }
 
 /// Retain the token's type suffix when a consumer must check a contextual
@@ -6006,17 +10420,6 @@ pub(super) fn rust_integer_literal_parts<'source>(
         return None;
     }
     Some((value, suffix))
-}
-
-fn rust_parameters_may_require_drop(callable: Node<'_>) -> bool {
-    callable
-        .child_by_field_name("parameters")
-        .map(named_children)
-        .is_some_and(|parameters| {
-            parameters
-                .into_iter()
-                .any(|parameter| !rust_parameter_is_definitely_non_dropping(parameter))
-        })
 }
 
 /// The runtime initializer expression(s) represented by a Rust array
@@ -6125,6 +10528,19 @@ fn block_tail_expression(block: Node<'_>) -> Option<Node<'_>> {
     }
 }
 
+fn rust_transparent_value_leaf(mut node: Node<'_>) -> Option<Node<'_>> {
+    let original = node.id();
+    loop {
+        node = unwrap_attributes(node);
+        match node.kind() {
+            "parenthesized_expression" => node = first_named_child(node)?,
+            "unsafe_block" => node = first_named_child(node)?,
+            "block" => node = block_tail_expression(node)?,
+            _ => return (node.id() != original).then_some(node),
+        }
+    }
+}
+
 fn rust_boolean_operator(node: Node<'_>) -> Option<&'static str> {
     match node.child_by_field_name("operator")?.kind() {
         "&&" => Some("&&"),
@@ -6139,16 +10555,9 @@ fn control_label(node: Node<'_>, source: &str) -> Option<Box<str>> {
         .map(Box::<str>::from)
 }
 
-fn direct_named_child_kind<'tree>(node: Node<'tree>, kind: &str) -> Option<Node<'tree>> {
-    let mut cursor = node.walk();
-    node.named_children(&mut cursor)
-        .find(|child| child.kind() == kind)
-}
-
-fn direct_child_kind(node: Node<'_>, kind: &str) -> bool {
-    let mut cursor = node.walk();
-    node.children(&mut cursor).any(|child| child.kind() == kind)
-}
+use brokk_bifrost_core::analyzer::tree_walk::{
+    first_named_child_of_kind as direct_named_child_kind, has_child_of_kind as direct_child_kind,
+};
 
 fn condition_introduces_pattern_bindings(node: Node<'_>) -> bool {
     let mut stack = vec![node];
@@ -6192,6 +10601,7 @@ pub(crate) const PROCEDURE_SYNTAX_ROLES: crate::analyzer::languages::ProcedureSy
                 _ => None,
             }
         },
+        loop_site_with_source: None,
         procedure_matches: |_, node| {
             matches!(
                 node.kind(),
@@ -6326,6 +10736,10 @@ fn is_runtime_leaf(kind: &str) -> bool {
 }
 
 fn is_compile_time_syntax(kind: &str) -> bool {
+    // Rust casts evaluate at runtime despite the type-related node prefix.
+    if kind == "type_cast_expression" {
+        return false;
+    }
     kind.starts_with("type_")
         || kind.ends_with("_type")
         || matches!(
@@ -6344,7 +10758,7 @@ fn is_compile_time_syntax(kind: &str) -> bool {
         )
 }
 
-fn named_children(node: Node<'_>) -> Vec<Node<'_>> {
+pub(super) fn named_children(node: Node<'_>) -> Vec<Node<'_>> {
     let mut cursor = node.walk();
     node.named_children(&mut cursor)
         .filter(|child| !is_comment_kind(child.kind()))
@@ -6360,47 +10774,422 @@ fn first_named_child(node: Node<'_>) -> Option<Node<'_>> {
         .map(unwrap_attributes)
 }
 
-fn is_comment_kind(kind: &str) -> bool {
-    matches!(kind, "line_comment" | "block_comment")
-}
-
 fn required_field<'tree>(node: Node<'tree>, field: &str) -> Result<Node<'tree>, RustLoweringError> {
-    node.child_by_field_name(field)
+    crate::analyzer::semantic::lowering::required_field_or_else(node, field, missing_field)
         .map(unwrap_attributes)
-        .ok_or_else(|| missing_field(node, field))
 }
 
-fn missing_field(node: Node<'_>, field: &str) -> RustLoweringError {
-    RustLoweringError::Invalid(format!(
-        "{} node at bytes {}..{} is missing structured field {field}",
-        node.kind(),
-        node.start_byte(),
-        node.end_byte()
-    ))
+#[cfg(test)]
+mod semantic_lowering_tests {
+    use std::sync::Arc;
+
+    use super::*;
+    use crate::analyzer::LanguageDialect;
+    use crate::analyzer::semantic::service::{
+        ProgramSemanticsLowerer, semantic_artifact_key_from_content,
+    };
+    use crate::analyzer::tree_sitter_analyzer::{PreparedSourceOrigin, PreparedSyntaxSource};
+    use crate::text_utils::compute_line_starts;
+
+    fn lower_fixture(source: &str) -> Vec<ProcedureSemanticsParts> {
+        let mut parser = tree_sitter::Parser::new();
+        parser
+            .set_language(&tree_sitter_rust::LANGUAGE.into())
+            .expect("Rust grammar is valid");
+        let tree = parser.parse(source, None).expect("fixture parses");
+        assert!(
+            !tree.root_node().has_error(),
+            "{}",
+            tree.root_node().to_sexp()
+        );
+        let prepared = PreparedSyntaxTree::new(
+            PreparedSyntaxSource::Exact(Arc::<str>::from(source)),
+            tree,
+            compute_line_starts(source),
+            LanguageDialect::Standard(Language::Rust),
+            PreparedSourceOrigin::Disk,
+            None,
+        );
+        let lowerer = RustSemanticLowerer;
+        let file = ProjectFile::new(std::env::temp_dir(), "capture.rs");
+        let SemanticOutcome::Complete { value, .. } = lowerer
+            .lower(
+                &file,
+                &prepared,
+                &SemanticBudget::default(),
+                &CancellationToken::default(),
+            )
+            .expect("Rust lowering succeeds")
+        else {
+            panic!("fixture lowering must complete");
+        };
+        value
+    }
+
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#4848: pointer calls in opaque macro invocations must not become source call facts"
+    )]
+    fn pointer_calls_inside_macro_invocations_remain_opaque() {
+        const SOURCE: &str = r#"
+macro_rules! forward { ($($tokens:tt)*) => { $($tokens)* }; }
+unsafe fn f(pointer: *const u8) {
+    unsafe { core::ptr::read(pointer); }
+    forward!(core::ptr::read(pointer));
+}
+"#;
+        let procedures = lower_fixture(SOURCE);
+        let [procedure] = procedures.as_slice() else {
+            panic!("one source procedure is expected");
+        };
+
+        assert_eq!(procedure.call_sites.len(), 1);
+        assert_eq!(procedure.pointer_accesses.len(), 1);
+    }
+
+    #[test]
+    fn rust_closures_publish_exact_targets_and_capture_modes() {
+        const SOURCE: &str = r#"
+fn outer() {
+    let (sender, _receiver) = channel();
+    let detached = async move { sender.send(()); };
+    let span = acquire_span();
+    let callback = || inspect(span.id);
+    let mut value = 0;
+    let mutating = || { value = 1; };
 }
 
-const fn completion_label(kind: CompletionKind) -> &'static str {
-    match kind {
-        CompletionKind::Normal => "normal",
-        CompletionKind::Return => "return",
-        CompletionKind::Throw => "throw",
-        CompletionKind::Break => "break",
-        CompletionKind::Continue => "continue",
-        _ => "unsupported completion",
+fn with_parameters(span: &Span, doc_id: u64) {
+    let borrowed_parameter = || inspect(span.owner.id);
+    let moved_parameter = move || inspect(doc_id);
+}
+"#;
+        let procedures = lower_fixture(SOURCE);
+        let parent = procedures
+            .iter()
+            .find(|procedure| {
+                procedure.lexical_parent.is_none()
+                    && procedure.locator.anchor().span().start_byte() as usize
+                        == SOURCE.find("fn outer").expect("outer function")
+            })
+            .expect("outer procedure");
+        let child_for = |name: &str| {
+            procedures.iter().find(|procedure| {
+                procedure.lexical_parent == Some(parent.id)
+                    && procedure.locator.anchor().span().start_byte() as usize
+                        == SOURCE.find(name).expect("fixture name")
+            })
+        };
+
+        let detached = child_for("async move").expect("async task body");
+        let sender_capture = parent
+            .captures
+            .iter()
+            .find(|capture| capture.target == detached.id)
+            .expect("captured sender row");
+        assert_eq!(sender_capture.mode, CaptureMode::Move);
+        let CaptureSource::Value(sender_value) = sender_capture.captured else {
+            panic!("the moved sender capture has an exact parent value");
+        };
+        let sender_source = parent
+            .values
+            .iter()
+            .find(|value| value.id == sender_value)
+            .and_then(|value| {
+                parent
+                    .source_mappings
+                    .iter()
+                    .find(|mapping| mapping.id == value.source)
+            })
+            .expect("captured sender value retains its lexical source");
+        let sender_span = sender_source.locator.anchor().span();
+        assert_eq!(
+            &SOURCE[sender_span.start_byte() as usize..sender_span.end_byte() as usize],
+            "sender",
+            "capture source must identify the destructured sender binding"
+        );
+        assert!(
+            parent
+                .points
+                .iter()
+                .flat_map(|point| &point.events)
+                .any(|event| {
+                    event.effect
+                        == SemanticEffect::CaptureBind {
+                            capture: sender_capture.id,
+                        }
+                })
+        );
+        assert!(detached.memory_locations.iter().any(|location| {
+            location.id == sender_capture.destination
+                && matches!(
+                    location.kind,
+                    MemoryLocationKind::Capture {
+                        lexical_parent,
+                        binding: Some(_)
+                    } if lexical_parent == parent.id
+                )
+        }));
+        assert!(
+            detached
+                .points
+                .iter()
+                .flat_map(|point| &point.events)
+                .any(|event| {
+                    matches!(
+                        event.effect,
+                        SemanticEffect::MemoryLoad {
+                            kind: MemoryAccessKind::Capture,
+                            location,
+                            ..
+                        } if location == sender_capture.destination
+                    )
+                })
+        );
+        let callable_event = parent
+            .points
+            .iter()
+            .flat_map(|point| &point.events)
+            .find_map(|event| match &event.effect {
+                SemanticEffect::CallableCreation { callable, .. }
+                    if callable.targets
+                        == CallableTargetResolution::Proven(CallableTarget::Local(detached.id)) =>
+                {
+                    Some(callable)
+                }
+                _ => None,
+            })
+            .expect("exact callable target");
+        assert!(callable_event.environment.is_some());
+
+        let callback = child_for("|| inspect").expect("borrowed callback");
+        assert!(parent.captures.iter().any(|capture| {
+            capture.target == callback.id
+                && capture.mode == CaptureMode::LanguageDefined("rust_shared_borrow".into())
+        }));
+
+        let mutating = child_for("|| { value").expect("mutable callback");
+        assert!(parent.captures.iter().any(|capture| {
+            capture.target == mutating.id && capture.mode == CaptureMode::Unknown
+        }));
+        assert!(parent.gaps.iter().any(|gap| {
+            gap.capability == SemanticCapability::Captures
+                && matches!(gap.subject, SemanticGapSubject::Capture(_))
+        }));
+
+        let parameter_parent = procedures
+            .iter()
+            .find(|procedure| {
+                procedure.lexical_parent.is_none()
+                    && procedure.locator.anchor().span().start_byte() as usize
+                        == SOURCE
+                            .find("fn with_parameters")
+                            .expect("parameter function")
+            })
+            .expect("function with closure capture parameters");
+        for (closure_source, binding_name, expected_mode) in [
+            (
+                "|| inspect(span.owner.id)",
+                "span",
+                CaptureMode::LanguageDefined("rust_shared_borrow".into()),
+            ),
+            ("move || inspect(doc_id)", "doc_id", CaptureMode::Move),
+        ] {
+            let closure = procedures
+                .iter()
+                .find(|procedure| {
+                    procedure.lexical_parent == Some(parameter_parent.id)
+                        && procedure.locator.anchor().span().start_byte() as usize
+                            == SOURCE.find(closure_source).expect("parameter closure")
+                })
+                .expect("parameter closure procedure");
+            let capture = parameter_parent
+                .captures
+                .iter()
+                .find(|capture| capture.target == closure.id)
+                .expect("parameter capture row");
+            assert_eq!(capture.mode, expected_mode);
+            let CaptureSource::Value(value_id) = capture.captured else {
+                panic!("parameter capture has an exact value source");
+            };
+            let value = parameter_parent
+                .values
+                .iter()
+                .find(|value| value.id == value_id)
+                .expect("parameter capture value retains its parameter identity");
+            assert!(
+                matches!(
+                    &value.kind,
+                    SemanticValueKind::Parameter {
+                        name: Some(name),
+                        ..
+                    } if name.as_ref() == binding_name
+                ),
+                "captured source resolves to parameter `{binding_name}`: {value:#?}"
+            );
+        }
+    }
+
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "eaae4724689f: a runtime cast was filtered from a Rust index place"
+    )]
+    fn rust_index_store_with_casted_index_lowers_as_dynamic_memory_location() {
+        let procedures =
+            lower_fixture("fn store(slice: &mut [u8], index: u8) { slice[index as usize] = 1; }\n");
+        let procedure = procedures
+            .iter()
+            .find(|procedure| procedure.lexical_parent.is_none())
+            .expect("store procedure");
+        let location_id = procedure
+            .points
+            .iter()
+            .flat_map(|point| &point.events)
+            .find_map(|event| match &event.effect {
+                SemanticEffect::MemoryStore {
+                    kind: MemoryAccessKind::Index,
+                    location,
+                    ..
+                } => Some(*location),
+                _ => None,
+            })
+            .expect("indexed assignment publishes a memory store");
+        let location = procedure
+            .memory_locations
+            .iter()
+            .find(|location| location.id == location_id)
+            .expect("indexed store location");
+        assert!(matches!(
+            &location.kind,
+            MemoryLocationKind::Index { index: None, .. }
+        ));
+        assert!(procedure.gaps.iter().any(|gap| {
+            gap.capability == SemanticCapability::IndexMemory
+                && matches!(
+                    &gap.subject,
+                    SemanticGapSubject::MemoryLocation(id) if *id == location_id
+                )
+        }));
+    }
+
+    /// The source text of the value each capture row of the closure starting
+    /// at the first occurrence of `closure_text` captures.
+    fn captured_names(
+        procedures: &[ProcedureSemanticsParts],
+        source: &str,
+        closure_text: &str,
+    ) -> Vec<String> {
+        let closure_start = source.find(closure_text).expect("closure in fixture");
+        let closure = procedures
+            .iter()
+            .find(|procedure| {
+                procedure.lexical_parent.is_some()
+                    && procedure.locator.anchor().span().start_byte() as usize == closure_start
+            })
+            .expect("closure procedure");
+        procedures
+            .iter()
+            .flat_map(|parent| {
+                parent
+                    .captures
+                    .iter()
+                    .filter(move |capture| capture.target == closure.id)
+                    .map(move |capture| {
+                        let captured_mapping = match capture.captured {
+                            CaptureSource::Value(value) => {
+                                parent
+                                    .values
+                                    .iter()
+                                    .find(|candidate| candidate.id == value)
+                                    .expect("captured value exists")
+                                    .source
+                            }
+                            CaptureSource::Location(location) => {
+                                parent
+                                    .memory_locations
+                                    .iter()
+                                    .find(|candidate| candidate.id == location)
+                                    .expect("captured location exists")
+                                    .source
+                            }
+                        };
+                        let mapping = parent
+                            .source_mappings
+                            .iter()
+                            .find(|mapping| mapping.id == captured_mapping)
+                            .expect("captured value has a source mapping");
+                        let span = mapping.locator.anchor().span();
+                        source[span.start_byte() as usize..span.end_byte() as usize].to_owned()
+                    })
+            })
+            .collect()
+    }
+
+    /// The lowered procedures must also pass artifact validation, which is
+    /// where the missing capture binding was reported.
+    fn assert_artifact_builds(procedures: Vec<ProcedureSemanticsParts>, source: &str) {
+        let file = ProjectFile::new(std::env::temp_dir(), "capture.rs");
+        let key = semantic_artifact_key_from_content(
+            &file,
+            LanguageDialect::Standard(Language::Rust),
+            ContentIdentity::hash_bytes(source.as_bytes()),
+            None,
+            RustSemanticLowerer.identity(),
+        )
+        .expect("fixture has a semantic artifact key");
+        SemanticArtifact::try_new(key, RustSemanticLowerer.capabilities(), procedures)
+            .expect("the lowered fixture validates");
+    }
+
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "eb9926938572: a let tuple-struct pattern bound its constructor as a local, so a closure naming it captured an undeclared binding"
+    )]
+    fn a_closure_naming_a_let_pattern_constructor_captures_nothing() {
+        const SOURCE: &str = r#"
+fn f(o: Option<i32>) {
+    let Some(_x) = o;
+    let c = || Some(1);
+    c();
+}
+"#;
+        let procedures = lower_fixture(SOURCE);
+        assert!(captured_names(&procedures, SOURCE, "|| Some(1)").is_empty());
+        assert_artifact_builds(procedures, SOURCE);
+    }
+
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "eb9926938572: a let-else tuple-struct pattern bound its constructor, so a closure comparing against Some(\"x\") failed capture validation"
+    )]
+    fn a_closure_comparing_with_a_let_else_constructor_captures_only_its_operands() {
+        const SOURCE: &str = r#"
+fn has_modifier(node: Node<'_>, source: &str) -> bool {
+    let Some(_modifiers) = node.parent() else {
+        return false;
+    };
+    children_iter(node).any(|modifier| node_text(modifier, source) == Some("x"))
+}
+"#;
+        let procedures = lower_fixture(SOURCE);
+        // The parameter's source mapping spans its whole declaration; the
+        // point is that the closure captures this one parameter and no
+        // constructor.
+        assert_eq!(
+            captured_names(&procedures, SOURCE, "|modifier|"),
+            ["source: &str"]
+        );
+        assert_artifact_builds(procedures, SOURCE);
     }
 }
 
 #[cfg(test)]
 mod grouped_attribute_ast_tests {
     use super::*;
-    use tree_sitter::Parser;
 
     fn parse(source: &str) -> tree_sitter::Tree {
-        let mut parser = Parser::new();
-        parser
-            .set_language(&tree_sitter_rust::LANGUAGE.into())
-            .expect("Rust grammar");
-        let tree = parser.parse(source, None).expect("Rust tree");
+        let tree =
+            crate::test_support::parse_fixture_tree(source, tree_sitter_rust::LANGUAGE.into());
         assert!(
             !tree.root_node().has_error(),
             "fixture must parse without recovery:\n{}",
@@ -6410,6 +11199,9 @@ mod grouped_attribute_ast_tests {
     }
 
     #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#3208: grouped attribute wrappers split Rust declarations and expression values"
+    )]
     fn adapter_children_replace_attribute_wrappers_with_their_items() {
         let source = concat!(
             "#[derive(Debug)]\n",
@@ -6436,6 +11228,9 @@ mod grouped_attribute_ast_tests {
     }
 
     #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#3208: attributed tail expressions lost their payload value after the grammar switch"
+    )]
     fn an_attributed_tail_expression_is_lowered_as_its_value() {
         let source = "#[cfg(any())] fn f() -> i32 { #[cfg(any())] 1 }\n";
         let tree = parse(source);
@@ -6449,6 +11244,9 @@ mod grouped_attribute_ast_tests {
     }
 
     #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#3208: grouped attributes were mistaken for Rust array elements"
+    )]
     fn grouped_attributes_are_not_array_elements() {
         let source = "fn f() { let values = [#[allow(dead_code)] 1]; }\n";
         let tree = parse(source);
@@ -6467,6 +11265,91 @@ mod grouped_attribute_ast_tests {
         let elements = rust_array_initializer_elements(array);
         assert_eq!(elements.len(), 1);
         assert_eq!(elements[0].kind(), "integer_literal");
+    }
+
+    #[test]
+    fn boolean_literals_retain_their_scalar_values() {
+        let source = "fn f() { consume(true); consume(false); }\n";
+        let tree = parse(source);
+        let true_start = source.find("true").expect("true literal");
+        let false_start = source.find("false").expect("false literal");
+        let true_node = tree
+            .root_node()
+            .named_descendant_for_byte_range(true_start, true_start + 4)
+            .expect("true node");
+        let false_node = tree
+            .root_node()
+            .named_descendant_for_byte_range(false_start, false_start + 5)
+            .expect("false node");
+        assert_eq!(
+            expression_value_kind(true_node),
+            SemanticValueKind::Boolean(true)
+        );
+        assert_eq!(
+            expression_value_kind(false_node),
+            SemanticValueKind::Boolean(false)
+        );
+    }
+}
+
+#[cfg(test)]
+mod receiver_type_fact_tests {
+    use super::*;
+    use tree_sitter::Parser;
+
+    fn parse(source: &str) -> tree_sitter::Tree {
+        let mut parser = Parser::new();
+        parser
+            .set_language(&tree_sitter_rust::LANGUAGE.into())
+            .expect("Rust grammar");
+        parser.parse(source, None).expect("Rust tree")
+    }
+
+    #[test]
+    fn explicit_rust_receiver_bindings_retain_type_and_initializer_ranges() {
+        let source = concat!(
+            "use std::sync::Mutex;\n",
+            "struct Child;\n",
+            "fn make() -> Child { Child }\n",
+            "fn caller(parameter: Mutex<()>) {\n",
+            "    let local: Mutex<()> = parameter;\n",
+            "    let child = make();\n",
+            "    static LOCK: Mutex<()> = unsafe { std::mem::zeroed() };\n",
+            "    const COUNT: u32 = 1;\n",
+            "    let _ = (local, child, LOCK, COUNT);\n",
+            "}\n",
+        );
+        let tree = parse(source);
+        let facts = RustReceiverTypeFacts::from_tree(source, &tree);
+        let file_facts = rust_file_facts_from_tree(source, &tree);
+        let use_byte = source.find("let _ =").expect("binding use");
+
+        for name in ["parameter", "local", "LOCK", "COUNT"] {
+            assert!(
+                facts.binding_at(name, use_byte).is_some(),
+                "the explicit Rust binding `{name}` remains available in its lexical scope"
+            );
+        }
+        let lock = facts.binding_at("LOCK", use_byte).expect("static binding");
+        let lock_type = lock.declared_type.expect("static declared type");
+        assert_eq!(&source[lock_type.start..lock_type.end], "Mutex<()>");
+        assert!(lock.initializer.is_none(), "the declared static type wins");
+        assert_eq!(file_facts.static_declarations.len(), 1);
+        assert_eq!(file_facts.static_declarations[0].name.as_ref(), "LOCK");
+
+        let parameter = facts
+            .binding_at("parameter", use_byte)
+            .expect("parameter binding");
+        let parameter_type = parameter.declared_type.expect("parameter declared type");
+        assert_eq!(
+            &source[parameter_type.start..parameter_type.end],
+            "Mutex<()>"
+        );
+
+        let child = facts.binding_at("child", use_byte).expect("local binding");
+        let initializer = child.initializer.expect("local initializer");
+        assert_eq!(&source[initializer.start..initializer.end], "make()");
+        assert!(facts.function_return_types.contains_key("make"));
     }
 }
 

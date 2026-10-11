@@ -1,4 +1,4 @@
-//! Translation from a verified CSMI v0.1 logical pack into Bifrost authoring
+//! Translation from a verified CSMI logical pack into Bifrost authoring
 //! types. No CSMI sidecar or producer-specific metadata is consulted.
 
 use crate::analyzer::semantic_model::{
@@ -7,34 +7,77 @@ use crate::analyzer::semantic_model::{
 };
 
 use super::canonical::{canonical_pack_manifest, sha256_hex};
+use super::cpp::{cpp_key_native_id, cpp_symbol_key_from_core};
 use super::identity::{JVM_IDENTITY_SCHEME, JVM_IDENTITY_VERSION, type_symbol_id};
 use super::model::*;
 use super::pack::{CsmiLogicalPack, CsmiResourceResolver};
 use super::validate::{CsmiVocabularySupport, validate_csmi_pack};
 use crate::analyzer::semantic_model::{
-    ActivationSelector, AuthoredPayload, AuthoredProcedureSummary, AuthoredProcedureTarget,
-    AuthoredSemanticModelPack, AuthoredShard, AuthoredSummaryExitKind, AuthoredSummaryInput,
-    AuthoredSummaryLocation, AuthoredSummaryLocationKind, AuthoredSummaryOutput,
-    AuthoredSummaryTransfer, CollectionFlowFact, CollectionFlowsPayload, Compatibility,
-    CompilerOptions, Completeness, CppArtifactDigest, CppArtifactSelector, CppCallableKind,
-    CppCallableSignature, CppCanonicalType, CppDescriptorRole, CppDigestAlgorithm, CppDirectHeader,
-    CppFundamentalTypeName, CppHeaderClosure, CppIdentityStability, CppLanguage,
-    CppPortabilityEvidence, CppPortableSymbolKey, CppPortableSymbolRecord, CppReferenceKind,
-    CppResolutionContextRecord, CppResolutionContextRef, CppSpecialMemberEvidence,
-    CppSpecialMemberOperation, CppSymbolDescriptor, CppTypeAliasEvidence, CppTypeQualifier,
+    ActivationSelector, AuthoredPayload, AuthoredProcedureFormal,
+    AuthoredProcedureFormalPassingMode, AuthoredProcedureFormalVariadicKind,
+    AuthoredProcedureSummary, AuthoredProcedureTarget, AuthoredSemanticModelPack, AuthoredShard,
+    AuthoredSummaryExitKind, AuthoredSummaryInput, AuthoredSummaryLocation,
+    AuthoredSummaryLocationKind, AuthoredSummaryOutput, AuthoredSummaryTransfer,
+    CollectionFlowFact, CollectionFlowsPayload, Compatibility, CompilerOptions, Completeness,
+    CppCallableKind, CppCallableSignature, CppCanonicalType, CppDirectHeader,
+    CppFundamentalTypeName, CppHeaderClosure, CppLanguage, CppPortabilityEvidence,
+    CppPortableSymbolKey, CppPortableSymbolRecord, CppReferenceKind, CppResolutionContextRecord,
+    CppSpecialMemberEvidence, CppSpecialMemberOperation, CppTypeAliasEvidence, CppTypeQualifier,
     ImplicitOperation, KeyedReadBehavior, KeyedReadObservation, Locator, MemberFact, MemberKind,
-    NameSelector, NormalResultTransferPartition, Parameter, ParameterPassingMode,
+    NameSelector, NormalResultTransferPartition, Parameter, ParameterPassingMode, ParameterRole,
     PortableProfileEvidence, Producer, Provenance, PythonCorrespondenceEvidence,
     PythonCorrespondenceSymbol, ReceiverFact, RuntimeContractsPayload,
     RuntimeGlobalBindingEvidence, RuntimeGlobalExposure, RuntimeValueExtension,
-    RuntimeValuesPayload, Safety, Signature, SummaryMoveInvalidation, SummaryValuePreservation,
-    SummaryValueTransfer, SummaryValueTransferKind, SummaryValueTransferLimitation,
-    SummaryValueTransferLimitationKind, SummaryValueTransferOperation, TransferPartitionLimitation,
+    RuntimeValuesPayload, Safety, Signature, SummaryValueTransfer, TransferPartitionLimitation,
     TransferPartitionSource, TransferPartitionStatus, TypeCopySemantics, TypeFact, TypeKind,
     TypeMoveSemantics, TypeRef, TypeValueSemantics, Visibility, compile_pack,
 };
 use serde_json::Value;
 use std::collections::{BTreeSet, HashMap};
+
+trait RuntimeExtensionPayload: serde::de::DeserializeOwned {
+    fn family_name(&self) -> &'static str;
+}
+
+impl RuntimeExtensionPayload for CsmiRuntimeValuesPayload {
+    fn family_name(&self) -> &'static str {
+        self.family()
+    }
+}
+
+impl RuntimeExtensionPayload
+    for crate::analyzer::semantic_model::runtime_contracts::CsmiRuntimeContractsV2Payload
+{
+    fn family_name(&self) -> &'static str {
+        self.family()
+    }
+}
+
+fn for_each_runtime_extension_payload<T: RuntimeExtensionPayload>(
+    model: &CsmiSemanticModel,
+    version: &str,
+    mut visit: impl FnMut(&CsmiExtensionFact, T) -> Result<(), CsmiImportError>,
+) -> Result<(), CsmiImportError> {
+    for fact in &model.extension_facts {
+        if fact.vocabulary != CSMI_RUNTIME_VALUES_PROFILE_ID || fact.version != version {
+            continue;
+        }
+        let payload: T = serde_json::from_value(fact.payload.clone()).map_err(|error| {
+            CsmiImportError::Unsupported {
+                path: format!("extensionFacts.{}.payload", fact.family),
+                semantic: error.to_string(),
+            }
+        })?;
+        if payload.family_name() != fact.family {
+            return Err(CsmiImportError::Unsupported {
+                path: format!("extensionFacts.{}.family", fact.family),
+                semantic: format!("payload kind belongs to {}", payload.family_name()),
+            });
+        }
+        visit(fact, payload)?;
+    }
+    Ok(())
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CsmiImportError {
@@ -238,6 +281,26 @@ fn import_semantic_document(
             });
         }
     };
+    // Structural profile recognition does not establish an executable native
+    // callback consumer. Reject this boundary explicitly until exact identity,
+    // field state and possible invocation are represented natively.
+    if model
+        .vocabulary_uses
+        .iter()
+        .any(|use_| use_.identifier == CSMI_CALLABLE_VALUES_PROFILE_ID)
+        || model
+            .extension_facts
+            .iter()
+            .any(|fact| fact.vocabulary == CSMI_CALLABLE_VALUES_PROFILE_ID)
+        || model.completeness_statements.iter().any(|statement| {
+            statement.vocabulary.as_deref() == Some(CSMI_CALLABLE_VALUES_PROFILE_ID)
+        })
+    {
+        return Err(CsmiImportError::Unsupported {
+            path: "semanticModels[0].callable-values".to_owned(),
+            semantic: "callable-values native execution requires exact declaration mapping, effective field state and a generic during-call consumer".to_owned(),
+        });
+    }
     let runtime_values = import_runtime_values(model, document.default_provenance.as_deref())?;
     let runtime_contracts =
         import_runtime_contracts(model, document, document.default_provenance.as_deref())?;
@@ -525,13 +588,31 @@ fn import_semantic_document(
                     == Some(declaration.symbol.as_str())
                 && statement.scope.get("aspect").and_then(Value::as_str) == Some("callable-shape")
         });
+        // A Python callable shape describes this declaration only. Native
+        // callable_family_complete is stronger: it closes an enumerated
+        // overload/family surface, which a single CSMI declaration cannot
+        // prove. Keep the two completeness claims independent.
         let callable_family_complete = !python_identity
             && callable_shape_statement
                 .is_some_and(|statement| statement.status == CsmiCoverageStatus::Complete);
+        let exact_return_classes = shape
+            .return_classes
+            .iter()
+            .enumerate()
+            .map(|(index, class)| {
+                type_ref(
+                    class,
+                    &reference_types,
+                    &format!("declarations.callable.returnClasses[{index}]"),
+                )
+            })
+            .collect::<Result<Vec<_>, _>>()?;
         member_ids.insert(declaration.symbol.clone(), member_id.clone());
         members.push(MemberFact {
             non_overridable: None,
             ambient_use: None,
+            value_type: None,
+            proxied_type: None,
             id: member_id,
             owner: owner_id,
             name: member_name,
@@ -549,6 +630,7 @@ fn import_semantic_document(
             implicit_operation: None,
             explicit_operation: None,
             callable_family_complete,
+            exact_return_classes,
             signature: Some(signature),
             receiver: if matches!(
                 shape.receiver,
@@ -611,6 +693,91 @@ fn import_semantic_document(
             if let Some(evidence) = callable_shape_evidence {
                 evidence.evidence_sha256 = super::python::callable_shape_evidence_digest(evidence);
             }
+        }
+    }
+    if python_identity {
+        for declaration in &model.declarations {
+            if declaration.category != CsmiDeclarationCategory::Value {
+                continue;
+            }
+            let identity = python_keys.get(&declaration.symbol).ok_or_else(|| {
+                CsmiImportError::Identity(format!(
+                    "module value {} has no Python identity",
+                    declaration.symbol
+                ))
+            })?;
+            let name = identity
+                .descriptors
+                .last()
+                .filter(|descriptor| descriptor.role == CsmiDescriptorRole::Term)
+                .and_then(|descriptor| descriptor.name.clone())
+                .ok_or_else(|| {
+                    CsmiImportError::Identity(format!(
+                        "module value {} has no terminal term descriptor",
+                        declaration.symbol
+                    ))
+                })?;
+            let owner_symbol = declaration.owner.as_ref().ok_or_else(|| {
+                CsmiImportError::Identity(format!(
+                    "module value {} has no namespace owner",
+                    declaration.symbol
+                ))
+            })?;
+            let owner = type_ids.get(owner_symbol).cloned().ok_or_else(|| {
+                CsmiImportError::Identity(format!(
+                    "unknown module value namespace owner {owner_symbol}"
+                ))
+            })?;
+            let value_type = declared_class_type_ref(
+                declaration
+                    .value_type
+                    .as_ref()
+                    .expect("Python value type was validated"),
+                &reference_types,
+                "declarations.valueType",
+            )?;
+            let proxied_type = declaration
+                .proxied_type
+                .as_ref()
+                .map(|declared_type| {
+                    declared_class_type_ref(
+                        declared_type,
+                        &reference_types,
+                        "declarations.proxiedType",
+                    )
+                })
+                .transpose()?;
+            members.push(MemberFact {
+                non_overridable: None,
+                ambient_use: None,
+                value_type: Some(value_type),
+                proxied_type,
+                id: super::python::native_id(identity),
+                owner,
+                name,
+                member_kind: MemberKind::Field,
+                visibility: Visibility::Public,
+                is_static: true,
+                is_abstract: false,
+                is_virtual: false,
+                implicit_operation: None,
+                explicit_operation: None,
+                callable_family_complete: false,
+                exact_return_classes: Vec::new(),
+                signature: None,
+                receiver: None,
+                extension_receiver: None,
+                extension_receiver_constraints: Vec::new(),
+                aliases: Vec::new(),
+                guard: None,
+                locator: Locator::Interchange {
+                    path: format!("csmi/{pack_digest}.json"),
+                    symbol: declaration.symbol.clone(),
+                    identity: Box::new(identity.clone()),
+                    profile_evidence: None,
+                    callable_shape_evidence: None,
+                },
+            });
         }
     }
     import_value_transfer_facts(model, &type_ids, &member_ids, &mut types, &mut members)?;
@@ -835,6 +1002,7 @@ fn import_semantic_document(
         for (key, (selector, types, members)) in artifact_facts {
             let declaration_artifact_shard = key == declaration_key;
             declaration_shards.push(AuthoredShard {
+                callable_values: None,
                 id: format!(
                     "csmi.{pack_digest}.declarations.{}",
                     &sha256_hex(&key)[..16]
@@ -889,6 +1057,7 @@ fn import_semantic_document(
         }
         for (key, (selector, summaries)) in summary_artifacts {
             let summary_shard = AuthoredShard {
+                callable_values: None,
                 id: format!(
                     "csmi.{pack_digest}.procedure-summaries.{}",
                     &sha256_hex(&key)[..16]
@@ -908,6 +1077,7 @@ fn import_semantic_document(
         declaration_shards
     } else {
         let shard = AuthoredShard {
+            callable_values: None,
             id: format!("csmi.{pack_digest}.summaries"),
             activation: selectors,
             payload: AuthoredPayload::DeclarationFacts {
@@ -922,6 +1092,7 @@ fn import_semantic_document(
             conditional_type_refinements,
         };
         let summary_shard = AuthoredShard {
+            callable_values: None,
             id: format!("csmi.{pack_digest}.procedure-summaries"),
             activation: shard.activation.clone(),
             payload: AuthoredPayload::ProcedureSummaries { summaries },
@@ -1151,52 +1322,39 @@ fn import_runtime_values(
         binding_evidence: Vec::new(),
         observations: Vec::new(),
     };
-    for fact in &model.extension_facts {
-        if fact.vocabulary != CSMI_RUNTIME_VALUES_PROFILE_ID
-            || fact.version != CSMI_RUNTIME_VALUES_PROFILE_VERSION
-        {
-            continue;
-        }
-        let wire: CsmiRuntimeValuesPayload =
-            serde_json::from_value(fact.payload.clone()).map_err(|error| {
-                CsmiImportError::Unsupported {
-                    path: format!("extensionFacts.{}.payload", fact.family),
-                    semantic: error.to_string(),
+    for_each_runtime_extension_payload::<CsmiRuntimeValuesPayload>(
+        model,
+        CSMI_RUNTIME_VALUES_PROFILE_VERSION,
+        |fact, wire| {
+            match wire {
+                CsmiRuntimeValuesPayload::RuntimeGlobalExposure(record) => {
+                    let mut native: RuntimeGlobalExposure = native_runtime_record(record)?;
+                    native.provenance = runtime_provenance(fact, default_provenance);
+                    native.extensions = runtime_extensions(&fact.extensions);
+                    payload.exposures.push(native);
                 }
-            })?;
-        if wire.family() != fact.family {
-            return Err(CsmiImportError::Unsupported {
-                path: format!("extensionFacts.{}.family", fact.family),
-                semantic: format!("payload kind belongs to {}", wire.family()),
-            });
-        }
-        match wire {
-            CsmiRuntimeValuesPayload::RuntimeGlobalExposure(record) => {
-                let mut native: RuntimeGlobalExposure = native_runtime_record(record)?;
-                native.provenance = runtime_provenance(fact, default_provenance);
-                native.extensions = runtime_extensions(&fact.extensions);
-                payload.exposures.push(native);
+                CsmiRuntimeValuesPayload::KeyedReadBehavior(record) => {
+                    let mut native: KeyedReadBehavior = native_runtime_record(record)?;
+                    native.provenance = runtime_provenance(fact, default_provenance);
+                    native.extensions = runtime_extensions(&fact.extensions);
+                    payload.behaviors.push(native);
+                }
+                CsmiRuntimeValuesPayload::RuntimeGlobalBindingEvidence(record) => {
+                    let mut native: RuntimeGlobalBindingEvidence = native_runtime_record(record)?;
+                    native.provenance = runtime_provenance(fact, default_provenance);
+                    native.extensions = runtime_extensions(&fact.extensions);
+                    payload.binding_evidence.push(native);
+                }
+                CsmiRuntimeValuesPayload::KeyedReadObservation(record) => {
+                    let mut native: KeyedReadObservation = native_runtime_record(record)?;
+                    native.provenance = runtime_provenance(fact, default_provenance);
+                    native.extensions = runtime_extensions(&fact.extensions);
+                    payload.observations.push(native);
+                }
             }
-            CsmiRuntimeValuesPayload::KeyedReadBehavior(record) => {
-                let mut native: KeyedReadBehavior = native_runtime_record(record)?;
-                native.provenance = runtime_provenance(fact, default_provenance);
-                native.extensions = runtime_extensions(&fact.extensions);
-                payload.behaviors.push(native);
-            }
-            CsmiRuntimeValuesPayload::RuntimeGlobalBindingEvidence(record) => {
-                let mut native: RuntimeGlobalBindingEvidence = native_runtime_record(record)?;
-                native.provenance = runtime_provenance(fact, default_provenance);
-                native.extensions = runtime_extensions(&fact.extensions);
-                payload.binding_evidence.push(native);
-            }
-            CsmiRuntimeValuesPayload::KeyedReadObservation(record) => {
-                let mut native: KeyedReadObservation = native_runtime_record(record)?;
-                native.provenance = runtime_provenance(fact, default_provenance);
-                native.extensions = runtime_extensions(&fact.extensions);
-                payload.observations.push(native);
-            }
-        }
-    }
+            Ok(())
+        },
+    )?;
     Ok((payload.record_count() > 0).then_some(payload))
 }
 
@@ -1216,38 +1374,32 @@ fn import_runtime_contracts(
             bindings: Vec::new(),
             observations: Vec::new(),
         };
-    for fact in &model.extension_facts {
-        if fact.vocabulary != CSMI_RUNTIME_VALUES_PROFILE_ID
-            || fact.version
-                != crate::analyzer::semantic_model::runtime_contracts::RUNTIME_VALUES_V2_VERSION
-        {
-            continue;
-        }
-        let record: crate::analyzer::semantic_model::runtime_contracts::CsmiRuntimeContractsV2Payload =
-            serde_json::from_value(fact.payload.clone()).map_err(|error| CsmiImportError::Unsupported {
-                path: format!("extensionFacts.{}.payload", fact.family),
-                semantic: error.to_string(),
-            })?;
-        if record.family() != fact.family {
-            return Err(CsmiImportError::Unsupported {
-                path: format!("extensionFacts.{}.family", fact.family),
-                semantic: format!("payload kind belongs to {}", record.family()),
-            });
-        }
-        match record {
-            CsmiRuntimeContractsV2Payload::RuntimeContract(record) => {
-                payload.contracts.push(record)
+    for_each_runtime_extension_payload::<
+        crate::analyzer::semantic_model::runtime_contracts::CsmiRuntimeContractsV2Payload,
+    >(
+        model,
+        crate::analyzer::semantic_model::runtime_contracts::RUNTIME_VALUES_V2_VERSION,
+        |_fact, record| {
+            match record {
+                CsmiRuntimeContractsV2Payload::RuntimeContract(record) => {
+                    payload.contracts.push(record)
+                }
+                CsmiRuntimeContractsV2Payload::RuntimeTarget(record) => {
+                    payload.targets.push(record)
+                }
+                CsmiRuntimeContractsV2Payload::RuntimeActivation(record) => {
+                    payload.activations.push(record)
+                }
+                CsmiRuntimeContractsV2Payload::RuntimeBinding(record) => {
+                    payload.bindings.push(record)
+                }
+                CsmiRuntimeContractsV2Payload::RuntimeObservation(record) => {
+                    payload.observations.push(*record)
+                }
             }
-            CsmiRuntimeContractsV2Payload::RuntimeTarget(record) => payload.targets.push(record),
-            CsmiRuntimeContractsV2Payload::RuntimeActivation(record) => {
-                payload.activations.push(record)
-            }
-            CsmiRuntimeContractsV2Payload::RuntimeBinding(record) => payload.bindings.push(record),
-            CsmiRuntimeContractsV2Payload::RuntimeObservation(record) => {
-                payload.observations.push(*record)
-            }
-        }
-    }
+            Ok(())
+        },
+    )?;
     if payload.is_empty() {
         return Ok(None);
     }
@@ -1516,11 +1668,7 @@ fn import_deferred_member_id(
     member_ids: &HashMap<String, String>,
     path: &str,
 ) -> Result<String, CsmiImportError> {
-    member_ids.get(id).cloned().ok_or_else(|| {
-        CsmiImportError::Identity(format!(
-            "unresolved deferred-yield callable symbol {id} at {path}"
-        ))
-    })
+    import_deferred_symbol_id(id, member_ids, path, "callable")
 }
 
 fn import_deferred_type_id(
@@ -1528,9 +1676,18 @@ fn import_deferred_type_id(
     type_ids: &HashMap<String, String>,
     path: &str,
 ) -> Result<String, CsmiImportError> {
-    type_ids.get(id).cloned().ok_or_else(|| {
+    import_deferred_symbol_id(id, type_ids, path, "type")
+}
+
+fn import_deferred_symbol_id(
+    id: &str,
+    symbols: &HashMap<String, String>,
+    path: &str,
+    kind: &str,
+) -> Result<String, CsmiImportError> {
+    symbols.get(id).cloned().ok_or_else(|| {
         CsmiImportError::Identity(format!(
-            "unresolved deferred-yield type symbol {id} at {path}"
+            "unresolved deferred-yield {kind} symbol {id} at {path}"
         ))
     })
 }
@@ -1541,71 +1698,14 @@ fn import_deferred_yield_payload(
     member_ids: &HashMap<String, String>,
     path: &str,
 ) -> Result<(), CsmiImportError> {
-    payload.factory =
-        import_deferred_member_id(&payload.factory, member_ids, &format!("{path}.factory"))?;
-    payload.resume =
-        import_deferred_member_id(&payload.resume, member_ids, &format!("{path}.resume"))?;
-    payload.handle_type = import_deferred_type_id(
-        &payload.handle_type,
-        type_ids,
-        &format!("{path}.handleType"),
-    )?;
-    if let Some(CsmiDeferredYieldSubstitution::ReceiverArguments { declaration }) =
-        &mut payload.receiver_substitution
-    {
-        *declaration = import_deferred_type_id(
-            declaration,
-            type_ids,
-            &format!("{path}.receiverSubstitution.declaration"),
-        )?;
-    }
-    for (position, root) in payload.roots.iter_mut().enumerate() {
-        let root_path = format!("{path}.roots[{position}]");
-        root.callable = import_deferred_member_id(
-            &root.callable,
-            member_ids,
-            &format!("{root_path}.callable"),
-        )?;
-        import_deferred_yield_shape(&mut root.shape, type_ids, &format!("{root_path}.shape"))?;
-    }
-    import_deferred_yield_location(
-        &mut payload.construction.source,
-        member_ids,
-        &format!("{path}.construction.source"),
-    )?;
-    import_deferred_yield_location(
-        &mut payload.construction.handle,
-        member_ids,
-        &format!("{path}.construction.handle"),
-    )?;
-    import_deferred_yield_location(
-        &mut payload.resume_contract.handle_input,
-        member_ids,
-        &format!("{path}.resumeContract.handleInput"),
-    )?;
-    import_deferred_yield_location(
-        &mut payload.resume_contract.yielded_result,
-        member_ids,
-        &format!("{path}.resumeContract.yieldedResult"),
-    )?;
-    import_deferred_yield_location(
-        &mut payload.resume_contract.factory_result_flow.factory_result,
-        member_ids,
-        &format!("{path}.resumeContract.factoryResultFlow.factoryResult"),
-    )?;
-    import_deferred_yield_location(
-        &mut payload.resume_contract.factory_result_flow.resume_input,
-        member_ids,
-        &format!("{path}.resumeContract.factoryResultFlow.resumeInput"),
-    )?;
-    for (position, member) in payload.yield_contract.members.iter_mut().enumerate() {
-        import_deferred_yield_location(
-            &mut member.source,
-            member_ids,
-            &format!("{path}.yield.members[{position}].source"),
-        )?;
-    }
-    Ok(())
+    super::deferred_yield::remap_payload(
+        payload,
+        path,
+        |id, path| import_deferred_member_id(id, member_ids, path),
+        |id, path| import_deferred_type_id(id, type_ids, path),
+        |location, path| import_deferred_yield_location(location, member_ids, path),
+        |shape, path| import_deferred_yield_shape(shape, type_ids, path),
+    )
 }
 
 fn import_deferred_yield_location(
@@ -1623,25 +1723,9 @@ fn import_deferred_yield_shape(
     type_ids: &HashMap<String, String>,
     path: &str,
 ) -> Result<(), CsmiImportError> {
-    let mut stack = vec![(shape, path.to_owned())];
-    while let Some((shape, path)) = stack.pop() {
-        match shape {
-            CsmiDeferredYieldShape::Value { r#type } => {
-                import_deferred_yield_type_expression(r#type, type_ids, &format!("{path}.type"))?;
-            }
-            CsmiDeferredYieldShape::Product { components } => {
-                for (position, component) in components.iter_mut().enumerate().rev() {
-                    stack.push((component, format!("{path}.components[{position}]")));
-                }
-            }
-            CsmiDeferredYieldShape::Keyed { key, value, .. } => {
-                stack.push((value, format!("{path}.value")));
-                stack.push((key, format!("{path}.key")));
-            }
-            CsmiDeferredYieldShape::Unknown { .. } => {}
-        }
-    }
-    Ok(())
+    super::deferred_yield::visit_shape(shape, path, |r#type, path| {
+        import_deferred_yield_type_expression(r#type, type_ids, path)
+    })
 }
 
 fn import_deferred_yield_type_expression(
@@ -1686,46 +1770,18 @@ fn runtime_pack_identity(
     let mut languages = BTreeSet::new();
     for exposure in &payload.exposures {
         for language in &exposure.languages {
-            let normalized = crate::analyzer::LanguageDialect::from_config_label(language)
-                .map(|dialect| dialect.semantic_pack_label().to_owned())
-                .ok_or_else(|| CsmiImportError::Unsupported {
-                    path: "runtime-global-exposure.languages".to_owned(),
-                    semantic: format!("unsupported Bifrost runtime language {language:?}"),
-                })?;
-            languages.insert(normalized);
+            languages.insert(normalize_runtime_language(
+                language,
+                "runtime-global-exposure.languages",
+            )?);
         }
     }
-    let language = match requested_language {
-        Some(requested) => crate::analyzer::LanguageDialect::from_config_label(requested)
-            .map(|dialect| dialect.semantic_pack_label().to_owned())
-            .ok_or_else(|| CsmiImportError::Unsupported {
-                path: "import.target_language".to_owned(),
-                semantic: format!("unsupported Bifrost import language {requested:?}"),
-            })
-            .and_then(|normalized| {
-                if languages.contains(&normalized) {
-                    Ok(normalized)
-                } else {
-                    Err(CsmiImportError::Unsupported {
-                        path: "import.target_language".to_owned(),
-                        semantic: format!(
-                            "runtime exposure does not apply to requested language {requested:?}"
-                        ),
-                    })
-                }
-            })?,
-        None if languages.len() == 1 => languages
-            .into_iter()
-            .next()
-            .expect("one runtime language exists"),
-        None => {
-            return Err(CsmiImportError::Unsupported {
-                path: "runtime-global-exposure.languages".to_owned(),
-                semantic: "a multi-language runtime document requires an explicit import target"
-                    .to_owned(),
-            });
-        }
-    };
+    let language = select_runtime_language(
+        languages,
+        requested_language,
+        "runtime-global-exposure.languages",
+        "runtime exposure",
+    )?;
     if payload
         .exposures
         .iter()
@@ -1747,60 +1803,26 @@ fn runtime_contract_pack_identity(
     let mut languages = BTreeSet::new();
     for contract in &payload.contracts {
         for language in &contract.definition.languages {
-            let normalized = crate::analyzer::LanguageDialect::from_config_label(language)
-                .map(|dialect| dialect.semantic_pack_label().to_owned())
-                .ok_or_else(|| CsmiImportError::Unsupported {
-                    path: "runtime-contracts.contract.definition.languages".to_owned(),
-                    semantic: format!("unsupported Bifrost runtime language {language:?}"),
-                })?;
-            languages.insert(normalized);
+            languages.insert(normalize_runtime_language(
+                language,
+                "runtime-contracts.contract.definition.languages",
+            )?);
         }
     }
     // A binding is the most precise language claim when a producer emits a
     // contract whose language set describes several source dialects.
     for binding in &payload.bindings {
-        let normalized = crate::analyzer::LanguageDialect::from_config_label(&binding.language)
-            .map(|dialect| dialect.semantic_pack_label().to_owned())
-            .ok_or_else(|| CsmiImportError::Unsupported {
-                path: "runtime-bindings.language".to_owned(),
-                semantic: format!(
-                    "unsupported Bifrost runtime language {:?}",
-                    binding.language
-                ),
-            })?;
-        languages.insert(normalized);
+        languages.insert(normalize_runtime_language(
+            &binding.language,
+            "runtime-bindings.language",
+        )?);
     }
-    let language = match requested_language {
-        Some(requested) => crate::analyzer::LanguageDialect::from_config_label(requested)
-            .map(|dialect| dialect.semantic_pack_label().to_owned())
-            .ok_or_else(|| CsmiImportError::Unsupported {
-                path: "import.target_language".to_owned(),
-                semantic: format!("unsupported Bifrost import language {requested:?}"),
-            })
-            .and_then(|normalized| {
-                if languages.contains(&normalized) {
-                    Ok(normalized)
-                } else {
-                    Err(CsmiImportError::Unsupported {
-                        path: "import.target_language".to_owned(),
-                        semantic: format!(
-                            "runtime contract does not apply to requested language {requested:?}"
-                        ),
-                    })
-                }
-            })?,
-        None if languages.len() == 1 => languages
-            .into_iter()
-            .next()
-            .expect("one runtime contract language exists"),
-        None => {
-            return Err(CsmiImportError::Unsupported {
-                path: "runtime-contracts.contract.definition.languages".to_owned(),
-                semantic: "a multi-language runtime document requires an explicit import target"
-                    .to_owned(),
-            });
-        }
-    };
+    let language = select_runtime_language(
+        languages,
+        requested_language,
+        "runtime-contracts.contract.definition.languages",
+        "runtime contract",
+    )?;
     // The current runtime-contract profile's supported target is Node. Keep
     // this mapping explicit until another ecosystem has a reviewed native
     // activation contract; accepting an unknown ecosystem would make a
@@ -1821,6 +1843,52 @@ fn runtime_contract_pack_identity(
         });
     }
     Ok((language, "npm".to_owned()))
+}
+
+fn normalize_runtime_language(language: &str, path: &str) -> Result<String, CsmiImportError> {
+    crate::analyzer::LanguageDialect::from_config_label(language)
+        .map(|dialect| dialect.semantic_pack_label().to_owned())
+        .ok_or_else(|| CsmiImportError::Unsupported {
+            path: path.to_owned(),
+            semantic: format!("unsupported Bifrost runtime language {language:?}"),
+        })
+}
+
+fn select_runtime_language(
+    languages: BTreeSet<String>,
+    requested_language: Option<&str>,
+    languages_path: &str,
+    claim: &str,
+) -> Result<String, CsmiImportError> {
+    match requested_language {
+        Some(requested) => crate::analyzer::LanguageDialect::from_config_label(requested)
+            .map(|dialect| dialect.semantic_pack_label().to_owned())
+            .ok_or_else(|| CsmiImportError::Unsupported {
+                path: "import.target_language".to_owned(),
+                semantic: format!("unsupported Bifrost import language {requested:?}"),
+            })
+            .and_then(|normalized| {
+                if languages.contains(&normalized) {
+                    Ok(normalized)
+                } else {
+                    Err(CsmiImportError::Unsupported {
+                        path: "import.target_language".to_owned(),
+                        semantic: format!(
+                            "{claim} does not apply to requested language {requested:?}"
+                        ),
+                    })
+                }
+            }),
+        None if languages.len() == 1 => Ok(languages
+            .into_iter()
+            .next()
+            .expect("one normalized runtime language exists")),
+        None => Err(CsmiImportError::Unsupported {
+            path: languages_path.to_owned(),
+            semantic: "a multi-language runtime document requires an explicit import target"
+                .to_owned(),
+        }),
+    }
 }
 
 fn runtime_profile_digests(model: &CsmiSemanticModel) -> Result<Vec<String>, CsmiImportError> {
@@ -1901,7 +1969,7 @@ fn import_cpp_portability(
                 .into_iter()
                 .map(|header| CppDirectHeader {
                     include_name: header.include_name,
-                    artifact: cpp_artifact_selector(header.artifact),
+                    artifact: header.artifact.into(),
                 })
                 .collect(),
             header_closure: CppHeaderClosure::Complete,
@@ -1960,7 +2028,7 @@ fn import_cpp_portability(
                     CsmiImportError::Identity(format!("unknown alias {}", alias.alias))
                 })?,
                 target: cpp_canonical_type(alias.target, &key_ids)?,
-                resolution_context: cpp_context_ref(alias.resolution_context),
+                resolution_context: alias.resolution_context.into(),
             }),
             CsmiCppProfilePayload::SpecialMember(member) => {
                 let member = *member;
@@ -2006,7 +2074,7 @@ fn import_cpp_portability(
                             .transpose()?,
                     },
                     member_disambiguator: member.member_disambiguator,
-                    resolution_context: cpp_context_ref(member.resolution_context),
+                    resolution_context: member.resolution_context.into(),
                 });
             }
         }
@@ -2019,22 +2087,6 @@ fn import_cpp_portability(
     })
 }
 
-fn cpp_artifact_selector(selector: CsmiCppArtifactSelector) -> CppArtifactSelector {
-    CppArtifactSelector {
-        purl: selector.purl,
-        digests: selector
-            .digests
-            .into_iter()
-            .map(|digest| CppArtifactDigest {
-                algorithm: CppDigestAlgorithm::Sha256,
-                coverage: digest.coverage,
-                canonicalization: digest.canonicalization,
-                value: digest.value,
-            })
-            .collect(),
-    }
-}
-
 fn cpp_language(language: CsmiCppLanguage) -> CppLanguage {
     match language {
         CsmiCppLanguage::C => CppLanguage::C,
@@ -2042,158 +2094,15 @@ fn cpp_language(language: CsmiCppLanguage) -> CppLanguage {
     }
 }
 
-fn cpp_symbol_key_from_core(
-    symbol: &CsmiSymbolDefinition,
-    model_selectors: &[CsmiArtifactSelector],
-) -> Result<CppPortableSymbolKey, CsmiImportError> {
-    let selectors = symbol
-        .artifact_selectors
-        .clone()
-        .unwrap_or_else(|| model_selectors.to_vec())
-        .into_iter()
-        .map(cpp_core_artifact_selector)
-        .collect::<Result<Vec<_>, _>>()?;
-    Ok(CppPortableSymbolKey {
-        artifact_selectors: selectors,
-        scheme: symbol.scheme.clone(),
-        scheme_version: symbol.scheme_version.clone(),
-        stability: CppIdentityStability::Portable,
-        descriptors: symbol
-            .descriptors
-            .iter()
-            .map(|descriptor| {
-                Ok(CppSymbolDescriptor {
-                    role: match descriptor.role {
-                        CsmiDescriptorRole::Namespace => CppDescriptorRole::Namespace,
-                        CsmiDescriptorRole::Type => CppDescriptorRole::Type,
-                        CsmiDescriptorRole::Callable => CppDescriptorRole::Callable,
-                        other => {
-                            return Err(CsmiImportError::Identity(format!(
-                                "unsupported C++ descriptor role {other:?}"
-                            )));
-                        }
-                    },
-                    name: descriptor.name.clone().ok_or_else(|| {
-                        CsmiImportError::Identity("C++ descriptor has no name".to_owned())
-                    })?,
-                    disambiguator: descriptor.disambiguator.clone().ok_or_else(|| {
-                        CsmiImportError::Identity("C++ descriptor has no disambiguator".to_owned())
-                    })?,
-                })
-            })
-            .collect::<Result<Vec<_>, _>>()?,
-    })
-}
-
-fn cpp_core_artifact_selector(
-    selector: CsmiArtifactSelector,
-) -> Result<CppArtifactSelector, CsmiImportError> {
-    let digests = selector
-        .digests
-        .into_iter()
-        .map(|digest| {
-            if digest.algorithm != CsmiDigestAlgorithm::Sha256 {
-                return Err(CsmiImportError::Unsupported {
-                    path: "symbols.artifactSelectors.digests.algorithm".to_owned(),
-                    semantic: format!(
-                        "C++ portable identity requires sha-256, found {:?}",
-                        digest.algorithm
-                    ),
-                });
-            }
-            Ok(CppArtifactDigest {
-                algorithm: CppDigestAlgorithm::Sha256,
-                coverage: digest.coverage,
-                canonicalization: digest.canonicalization,
-                value: digest.value,
-            })
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-    Ok(CppArtifactSelector {
-        purl: selector.purl,
-        digests,
-    })
-}
-
 fn cpp_native_id_from_core(
     symbol: &CsmiSymbolDefinition,
     model_selectors: &[CsmiArtifactSelector],
 ) -> Result<String, CsmiImportError> {
     let key = cpp_symbol_key_from_core(symbol, model_selectors)?;
-    let dto = CsmiCppSymbolKey {
-        artifact_selectors: key
-            .artifact_selectors
-            .iter()
-            .map(|selector| CsmiCppArtifactSelector {
-                purl: selector.purl.clone(),
-                digests: selector
-                    .digests
-                    .iter()
-                    .map(|digest| CsmiCppArtifactDigest {
-                        algorithm: CsmiCppDigestAlgorithm::Sha256,
-                        coverage: digest.coverage.clone(),
-                        canonicalization: digest.canonicalization.clone(),
-                        value: digest.value.clone(),
-                    })
-                    .collect(),
-            })
-            .collect(),
-        scheme: key.scheme,
-        scheme_version: key.scheme_version,
-        stability: CsmiCppIdentityStability::Portable,
-        descriptors: key
-            .descriptors
-            .into_iter()
-            .map(|descriptor| CsmiCppDescriptor {
-                role: match descriptor.role {
-                    CppDescriptorRole::Namespace => CsmiCppDescriptorRole::Namespace,
-                    CppDescriptorRole::Type => CsmiCppDescriptorRole::Type,
-                    CppDescriptorRole::Callable => CsmiCppDescriptorRole::Callable,
-                },
-                name: descriptor.name,
-                disambiguator: descriptor.disambiguator,
-            })
-            .collect(),
-    };
+    let dto = CsmiCppSymbolKey::from(&key);
     let bytes = super::canonical::canonical_json(&dto)
         .map_err(|error| CsmiImportError::Identity(error.to_string()))?;
     Ok(format!("cpp.{}", sha256_hex(&bytes)))
-}
-
-fn cpp_key_native_id(
-    key: &CsmiCppSymbolKey,
-    key_ids: &[(CppPortableSymbolKey, String)],
-) -> Result<String, CsmiImportError> {
-    let key = CppPortableSymbolKey {
-        artifact_selectors: key
-            .artifact_selectors
-            .clone()
-            .into_iter()
-            .map(cpp_artifact_selector)
-            .collect(),
-        scheme: key.scheme.clone(),
-        scheme_version: key.scheme_version.clone(),
-        stability: CppIdentityStability::Portable,
-        descriptors: key
-            .descriptors
-            .iter()
-            .map(|descriptor| CppSymbolDescriptor {
-                role: match descriptor.role {
-                    CsmiCppDescriptorRole::Namespace => CppDescriptorRole::Namespace,
-                    CsmiCppDescriptorRole::Type => CppDescriptorRole::Type,
-                    CsmiCppDescriptorRole::Callable => CppDescriptorRole::Callable,
-                },
-                name: descriptor.name.clone(),
-                disambiguator: descriptor.disambiguator.clone(),
-            })
-            .collect(),
-    };
-    key_ids
-        .iter()
-        .find_map(|(candidate, native)| (candidate == &key).then(|| native.clone()))
-        .ok_or_else(|| {
-            CsmiImportError::Identity("C++ symbol key is not declared by the model".to_owned())
-        })
 }
 
 fn cpp_canonical_type(
@@ -2236,16 +2145,6 @@ fn cpp_canonical_type(
             referent: Box::new(cpp_canonical_type(*value.referent, key_ids)?),
         },
     })
-}
-
-fn cpp_context_ref(value: CsmiCppResolutionContext) -> CppResolutionContextRef {
-    CppResolutionContextRef {
-        vocabulary: CSMI_C_CPP_RESOLUTION_PROFILE_ID.to_owned(),
-        version: value.version,
-        context_digest: value.context_digest,
-        language: CppLanguage::Cpp,
-        header_closure: CppHeaderClosure::Complete,
-    }
 }
 
 fn selector_from_csmi(
@@ -2400,53 +2299,48 @@ fn signature_from_shape(
         .iter()
         .enumerate()
         .map(|(position, parameter)| {
-            let parameter_type =
-                parameter
-                    .parameter_type
-                    .as_ref()
-                    .ok_or_else(|| CsmiImportError::Unsupported {
-                        path: format!("declarations.callable.parameters[{position}].type"),
-                        semantic: "parameter is missing its type expression".to_owned(),
-                    })?;
-            Ok(Parameter {
-                name: parameter.label.clone(),
-                r#type: type_ref(
+            let parameter_type = match parameter.parameter_type.as_ref() {
+                Some(parameter_type) => type_ref(
                     parameter_type,
                     references,
                     &format!("declarations.callable.parameters[{position}].type"),
                 )?,
+                None => TypeRef::Unknown,
+            };
+            Ok(Parameter {
+                name: parameter.label.clone(),
+                r#type: parameter_type,
                 optional: !parameter.required,
                 variadic: matches!(
                     parameter.binding,
                     CsmiParameterBinding::VariadicPositional | CsmiParameterBinding::VariadicNamed
                 ),
                 passing_mode: match parameter.binding {
-                    CsmiParameterBinding::PositionalOnly => ParameterPassingMode::PositionalOnly,
+                    CsmiParameterBinding::PositionalOnly
+                    | CsmiParameterBinding::VariadicPositional => {
+                        ParameterPassingMode::PositionalOnly
+                    }
                     CsmiParameterBinding::NamedOnly | CsmiParameterBinding::VariadicNamed => {
                         ParameterPassingMode::NamedOnly
                     }
                     _ => ParameterPassingMode::PositionalOrNamed,
                 },
+                role: parameter.role.map(|role| match role {
+                    CsmiParameterRole::Request => ParameterRole::Request,
+                }),
             })
         })
         .collect::<Result<Vec<_>, CsmiImportError>>()?;
     let returns = shape
         .results
         .first()
-        .map(|result| {
-            let result_type =
-                result
-                    .result_type
-                    .as_ref()
-                    .ok_or_else(|| CsmiImportError::Unsupported {
-                        path: "declarations.callable.results[0].type".to_owned(),
-                        semantic: "result is missing its type expression".to_owned(),
-                    })?;
-            type_ref(
+        .map(|result| match result.result_type.as_ref() {
+            Some(result_type) => type_ref(
                 result_type,
                 references,
                 "declarations.callable.results[0].type",
-            )
+            ),
+            None => Ok(TypeRef::Unknown),
         })
         .transpose()?;
     Ok(Signature {
@@ -2454,6 +2348,30 @@ fn signature_from_shape(
         parameters,
         returns,
     })
+}
+
+fn declared_class_type_ref(
+    declared_type: &CsmiDeclaredClassType,
+    references: &HashMap<String, TypeRef>,
+    path: &str,
+) -> Result<TypeRef, CsmiImportError> {
+    match declared_type {
+        CsmiDeclaredClassType::Reference { symbol } => {
+            references.get(symbol).cloned().ok_or_else(|| {
+                CsmiImportError::Identity(format!(
+                    "unresolved declared class type {symbol} at {path}"
+                ))
+            })
+        }
+        CsmiDeclaredClassType::External {
+            language: CsmiExternalTypeLanguage::Python,
+            descriptors,
+        } => {
+            let qualified_name = super::python::external_class_qualified_name(descriptors)
+                .map_err(CsmiImportError::Identity)?;
+            Ok(TypeRef::named(qualified_name))
+        }
+    }
 }
 
 fn type_ref(
@@ -2502,10 +2420,7 @@ fn type_ref(
                 intrinsic.identifier, intrinsic.vocabulary, intrinsic.version
             ),
         }),
-        CsmiTypeExpression::Unknown(_) => Err(CsmiImportError::Unsupported {
-            path: path.to_owned(),
-            semantic: "unknown type expressions are not supported".to_owned(),
-        }),
+        CsmiTypeExpression::Unknown(_) => Ok(TypeRef::Unknown),
     }
 }
 
@@ -2555,13 +2470,50 @@ fn summary_from_csmi(
         path: owner,
         symbol,
         has_receiver: shape.receiver.is_some() || shape.kind == CsmiCallableKind::Constructor,
-        variadic: shape.parameters.last().is_some_and(|parameter| {
+        variadic: shape.parameters.iter().any(|parameter| {
             matches!(
                 parameter.binding,
                 CsmiParameterBinding::VariadicPositional | CsmiParameterBinding::VariadicNamed
             )
         }),
         parameter_count: shape.parameters.len() as u32,
+        formals: shape
+            .parameters
+            .iter()
+            .map(|parameter| AuthoredProcedureFormal {
+                // Positional-only and rest formals may omit a CSMI label. Their
+                // names do not participate in binding, but the authored target
+                // still requires a unique name for each structured slot.
+                name: parameter
+                    .label
+                    .clone()
+                    .unwrap_or_else(|| format!("__csmi_formal_{}", parameter.position)),
+                optional: !parameter.required,
+                passing_mode: match parameter.binding {
+                    CsmiParameterBinding::PositionalOnly
+                    | CsmiParameterBinding::VariadicPositional => {
+                        AuthoredProcedureFormalPassingMode::PositionalOnly
+                    }
+                    CsmiParameterBinding::PositionalOrNamed => {
+                        AuthoredProcedureFormalPassingMode::PositionalOrNamed
+                    }
+                    CsmiParameterBinding::NamedOnly | CsmiParameterBinding::VariadicNamed => {
+                        AuthoredProcedureFormalPassingMode::NamedOnly
+                    }
+                },
+                variadic_kind: match parameter.binding {
+                    CsmiParameterBinding::VariadicPositional => {
+                        Some(AuthoredProcedureFormalVariadicKind::Positional)
+                    }
+                    CsmiParameterBinding::VariadicNamed => {
+                        Some(AuthoredProcedureFormalVariadicKind::Keyword)
+                    }
+                    CsmiParameterBinding::PositionalOnly
+                    | CsmiParameterBinding::PositionalOrNamed
+                    | CsmiParameterBinding::NamedOnly => None,
+                },
+            })
+            .collect(),
     };
     let transfers = summary
         .transfers
@@ -2660,6 +2612,7 @@ fn summary_from_csmi(
         transfer_partitions,
         effects: Vec::new(),
         concurrency_effects: Vec::new(),
+        returned_callables: Vec::new(),
         declared_effects: Vec::new(),
         preconditions: None,
         result_contracts: Vec::new(),
@@ -2874,67 +2827,10 @@ fn value_transfer_from_csmi(
             path: "procedureSummaries.transfers.extensions.payload".to_owned(),
             semantic: error.to_string(),
         })?;
-    let kind = match payload.transfer_kind {
-        CsmiValueTransferKind::Copy {} => SummaryValueTransferKind::Copy {},
-        CsmiValueTransferKind::AggregateCopy {} => SummaryValueTransferKind::AggregateCopy {},
-        CsmiValueTransferKind::Move { invalidation } => SummaryValueTransferKind::Move {
-            invalidation: match invalidation {
-                CsmiMoveInvalidation::Invalidated => SummaryMoveInvalidation::Invalidated,
-                CsmiMoveInvalidation::Unknown => SummaryMoveInvalidation::Unknown,
-            },
-        },
-        CsmiValueTransferKind::Conversion { preservation } => {
-            SummaryValueTransferKind::Conversion {
-                preservation: match preservation {
-                    CsmiValuePreservation::Identity => SummaryValuePreservation::Identity,
-                    CsmiValuePreservation::Preserving => SummaryValuePreservation::Preserving,
-                    CsmiValuePreservation::Changing => SummaryValuePreservation::Changing,
-                    CsmiValuePreservation::Unknown => SummaryValuePreservation::Unknown,
-                },
-            }
-        }
-        CsmiValueTransferKind::Boxing {} => SummaryValueTransferKind::Boxing {},
-        CsmiValueTransferKind::Unboxing {} => SummaryValueTransferKind::Unboxing {},
-    };
-    let operation = match payload.operation {
-        CsmiValueTransferOperation::None {} => SummaryValueTransferOperation::None {},
-        CsmiValueTransferOperation::Implicit { symbol } => {
-            SummaryValueTransferOperation::Implicit {
-                member: member_ids.get(&symbol).cloned().ok_or_else(|| {
-                    CsmiImportError::Identity(format!("unknown implicit operation symbol {symbol}"))
-                })?,
-            }
-        }
-        CsmiValueTransferOperation::Unknown { limitation } => {
-            SummaryValueTransferOperation::Unknown {
-                limitation: SummaryValueTransferLimitation {
-                    kind: match limitation.kind {
-                        CsmiProfileLimitationKind::BudgetExhausted => {
-                            SummaryValueTransferLimitationKind::BudgetExhausted
-                        }
-                        CsmiProfileLimitationKind::Cancelled => {
-                            SummaryValueTransferLimitationKind::Cancelled
-                        }
-                        CsmiProfileLimitationKind::Unsupported => {
-                            SummaryValueTransferLimitationKind::Unsupported
-                        }
-                        CsmiProfileLimitationKind::UnresolvedIdentity => {
-                            SummaryValueTransferLimitationKind::UnresolvedIdentity
-                        }
-                        CsmiProfileLimitationKind::AmbiguousIdentity => {
-                            SummaryValueTransferLimitationKind::AmbiguousIdentity
-                        }
-                        CsmiProfileLimitationKind::IncompleteInput => {
-                            SummaryValueTransferLimitationKind::IncompleteInput
-                        }
-                        CsmiProfileLimitationKind::Other => {
-                            SummaryValueTransferLimitationKind::Other
-                        }
-                    },
-                    message: limitation.message,
-                },
-            }
-        }
-    };
-    Ok(SummaryValueTransfer { kind, operation })
+    let compiled = super::value_transfer::compiled_from_csmi(payload, |symbol| {
+        member_ids.get(symbol).cloned().ok_or_else(|| {
+            CsmiImportError::Identity(format!("unknown implicit operation symbol {symbol}"))
+        })
+    })?;
+    Ok(super::super::conversion::authored_summary_value_transfer_from_compiled(&compiled))
 }

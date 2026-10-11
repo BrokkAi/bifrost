@@ -1,0 +1,870 @@
+{
+  "schema_version": 2,
+  "pack_id": "bifrost.rust-std-io-write",
+  "version": "0.1.0",
+  "producer": {
+    "name": "bifrost-reviewed-rust-codeql-parity-models",
+    "version": "0.1.0"
+  },
+  "language": "rust",
+  "ecosystem": "cargo",
+  "compatibility": {
+    "bifrost": ">=0.12.0, <1.0.0",
+    "toolchains": []
+  },
+  "provenance": {
+    "source": "Rust standard-library stdout/stderr handles and Write methods used by CodeQL rust/log-injection, plus the String and str value carriers needed to reach those direct sinks.",
+    "revision": "rust-std-1.100; CodeQL ae741615f3e178ce61289a651790dc67fcc18e19"
+  },
+  "license": "Apache-2.0",
+  "completeness": "complete",
+  "safety": {
+    "generated_code_only": false,
+    "review_required": false
+  },
+  "shards": [
+    {
+      "id": "declarations.bifrost.rust-std-io-write",
+      "activation": [
+        {
+          "targets": [],
+          "configurations": []
+        }
+      ],
+      "payload": {
+        "kind": "declaration_facts",
+        "types": [
+          {
+            "id": "type.rust-sql.std",
+            "name": "std",
+            "type_kind": "module",
+            "visibility": "public",
+            "locator": {
+              "kind": "artifact",
+              "path": "library/std/src/lib.rs",
+              "symbol": "std"
+            }
+          },
+          {
+            "id": "type.rust-sql.std-io",
+            "name": "std.io",
+            "type_kind": "module",
+            "visibility": "public",
+            "locator": {
+              "kind": "artifact",
+              "path": "library/std/src/io/mod.rs",
+              "symbol": "std.io"
+            }
+          },
+          {
+            "id": "type.rust-codeql.std-io-stdout",
+            "name": "std.io.Stdout",
+            "type_kind": "struct",
+            "visibility": "public",
+            "locator": {
+              "kind": "artifact",
+              "path": "library/std/src/io/stdio.rs",
+              "symbol": "std.io.Stdout"
+            }
+          },
+          {
+            "id": "type.rust-codeql.std-io-stderr",
+            "name": "std.io.Stderr",
+            "type_kind": "struct",
+            "visibility": "public",
+            "locator": {
+              "kind": "artifact",
+              "path": "library/std/src/io/stdio.rs",
+              "symbol": "std.io.Stderr"
+            }
+          },
+          {
+            "id": "type.rust-codeql.std-io-stdout-lock",
+            "name": "std.io.StdoutLock",
+            "type_kind": "struct",
+            "visibility": "public",
+            "locator": {
+              "kind": "artifact",
+              "path": "library/std/src/io/stdio.rs",
+              "symbol": "std.io.StdoutLock"
+            }
+          },
+          {
+            "id": "type.rust-codeql.std-io-stderr-lock",
+            "name": "std.io.StderrLock",
+            "type_kind": "struct",
+            "visibility": "public",
+            "locator": {
+              "kind": "artifact",
+              "path": "library/std/src/io/stdio.rs",
+              "symbol": "std.io.StderrLock"
+            }
+          },
+          {
+            "id": "type.rust-codeql.std-primitive",
+            "name": "std.primitive",
+            "type_kind": "module",
+            "visibility": "public",
+            "locator": {
+              "kind": "artifact",
+              "path": "library/core/src/primitive.rs",
+              "symbol": "std.primitive"
+            }
+          },
+          {
+            "id": "type.rust-codeql.std-primitive-str",
+            "name": "std.primitive.str",
+            "type_kind": "type_alias",
+            "visibility": "public",
+            "locator": {
+              "kind": "artifact",
+              "path": "library/core/src/str/mod.rs",
+              "symbol": "std.primitive.str"
+            }
+          },
+          {
+            "id": "type.rust-codeql.std-string",
+            "name": "std.string",
+            "type_kind": "module",
+            "visibility": "public",
+            "locator": {
+              "kind": "artifact",
+              "path": "library/alloc/src/lib.rs",
+              "symbol": "std.string"
+            }
+          },
+          {
+            "id": "type.rust-codeql.std-string-string",
+            "name": "std.string.String",
+            "type_kind": "struct",
+            "visibility": "public",
+            "locator": {
+              "kind": "artifact",
+              "path": "library/alloc/src/string.rs",
+              "symbol": "std.string.String"
+            }
+          }
+        ],
+        "members": [
+          {
+            "id": "member.rust-codeql.std-io-stdout",
+            "owner": "type.rust-sql.std-io",
+            "name": "stdout",
+            "member_kind": "method",
+            "visibility": "public",
+            "is_static": true,
+            "callable_family_complete": true,
+            "signature": {
+              "parameters": [],
+              "returns": {
+                "kind": "named",
+                "name": "std.io.Stdout"
+              }
+            },
+            "locator": {
+              "kind": "artifact",
+              "path": "library/std/src/io/stdio.rs",
+              "symbol": "std.io.stdout"
+            }
+          },
+          {
+            "id": "member.rust-codeql.std-io-stderr",
+            "owner": "type.rust-sql.std-io",
+            "name": "stderr",
+            "member_kind": "method",
+            "visibility": "public",
+            "is_static": true,
+            "callable_family_complete": true,
+            "signature": {
+              "parameters": [],
+              "returns": {
+                "kind": "named",
+                "name": "std.io.Stderr"
+              }
+            },
+            "locator": {
+              "kind": "artifact",
+              "path": "library/std/src/io/stdio.rs",
+              "symbol": "std.io.stderr"
+            }
+          },
+          {
+            "id": "member.rust-codeql.std-io-stdout-lock",
+            "owner": "type.rust-codeql.std-io-stdout",
+            "name": "lock",
+            "member_kind": "method",
+            "visibility": "public",
+            "is_static": false,
+            "callable_family_complete": true,
+            "signature": {
+              "parameters": [],
+              "returns": {
+                "kind": "named",
+                "name": "std.io.StdoutLock"
+              }
+            },
+            "locator": {
+              "kind": "artifact",
+              "path": "library/std/src/io/stdio.rs",
+              "symbol": "std.io.Stdout.lock"
+            }
+          },
+          {
+            "id": "member.rust-codeql.std-io-stderr-lock",
+            "owner": "type.rust-codeql.std-io-stderr",
+            "name": "lock",
+            "member_kind": "method",
+            "visibility": "public",
+            "is_static": false,
+            "callable_family_complete": true,
+            "signature": {
+              "parameters": [],
+              "returns": {
+                "kind": "named",
+                "name": "std.io.StderrLock"
+              }
+            },
+            "locator": {
+              "kind": "artifact",
+              "path": "library/std/src/io/stdio.rs",
+              "symbol": "std.io.Stderr.lock"
+            }
+          },
+          {
+            "id": "member.rust-codeql.std-io-stdout-write",
+            "owner": "type.rust-codeql.std-io-stdout",
+            "name": "write",
+            "member_kind": "method",
+            "visibility": "public",
+            "is_static": false,
+            "callable_family_complete": true,
+            "signature": {
+              "parameters": [
+                {
+                  "name": "buffer",
+                  "type": {
+                    "kind": "named",
+                    "name": "untyped"
+                  }
+                }
+              ],
+              "returns": {
+                "kind": "named",
+                "name": "std.io.Result"
+              }
+            },
+            "locator": {
+              "kind": "artifact",
+              "path": "library/std/src/io/mod.rs",
+              "symbol": "std.io.Stdout.write"
+            }
+          },
+          {
+            "id": "member.rust-codeql.std-io-stdout-write-all",
+            "owner": "type.rust-codeql.std-io-stdout",
+            "name": "write_all",
+            "member_kind": "method",
+            "visibility": "public",
+            "is_static": false,
+            "callable_family_complete": true,
+            "signature": {
+              "parameters": [
+                {
+                  "name": "buffer",
+                  "type": {
+                    "kind": "named",
+                    "name": "untyped"
+                  }
+                }
+              ],
+              "returns": {
+                "kind": "named",
+                "name": "std.io.Result"
+              }
+            },
+            "locator": {
+              "kind": "artifact",
+              "path": "library/std/src/io/mod.rs",
+              "symbol": "std.io.Stdout.write_all"
+            }
+          },
+          {
+            "id": "member.rust-codeql.std-io-stderr-write",
+            "owner": "type.rust-codeql.std-io-stderr",
+            "name": "write",
+            "member_kind": "method",
+            "visibility": "public",
+            "is_static": false,
+            "callable_family_complete": true,
+            "signature": {
+              "parameters": [
+                {
+                  "name": "buffer",
+                  "type": {
+                    "kind": "named",
+                    "name": "untyped"
+                  }
+                }
+              ],
+              "returns": {
+                "kind": "named",
+                "name": "std.io.Result"
+              }
+            },
+            "locator": {
+              "kind": "artifact",
+              "path": "library/std/src/io/mod.rs",
+              "symbol": "std.io.Stderr.write"
+            }
+          },
+          {
+            "id": "member.rust-codeql.std-io-stderr-write-all",
+            "owner": "type.rust-codeql.std-io-stderr",
+            "name": "write_all",
+            "member_kind": "method",
+            "visibility": "public",
+            "is_static": false,
+            "callable_family_complete": true,
+            "signature": {
+              "parameters": [
+                {
+                  "name": "buffer",
+                  "type": {
+                    "kind": "named",
+                    "name": "untyped"
+                  }
+                }
+              ],
+              "returns": {
+                "kind": "named",
+                "name": "std.io.Result"
+              }
+            },
+            "locator": {
+              "kind": "artifact",
+              "path": "library/std/src/io/mod.rs",
+              "symbol": "std.io.Stderr.write_all"
+            }
+          },
+          {
+            "id": "member.rust-codeql.std-io-stdout-lock-write",
+            "owner": "type.rust-codeql.std-io-stdout-lock",
+            "name": "write",
+            "member_kind": "method",
+            "visibility": "public",
+            "is_static": false,
+            "callable_family_complete": true,
+            "signature": {
+              "parameters": [
+                {
+                  "name": "buffer",
+                  "type": {
+                    "kind": "named",
+                    "name": "untyped"
+                  }
+                }
+              ],
+              "returns": {
+                "kind": "named",
+                "name": "std.io.Result"
+              }
+            },
+            "locator": {
+              "kind": "artifact",
+              "path": "library/std/src/io/mod.rs",
+              "symbol": "std.io.StdoutLock.write"
+            }
+          },
+          {
+            "id": "member.rust-codeql.std-io-stdout-lock-write-all",
+            "owner": "type.rust-codeql.std-io-stdout-lock",
+            "name": "write_all",
+            "member_kind": "method",
+            "visibility": "public",
+            "is_static": false,
+            "callable_family_complete": true,
+            "signature": {
+              "parameters": [
+                {
+                  "name": "buffer",
+                  "type": {
+                    "kind": "named",
+                    "name": "untyped"
+                  }
+                }
+              ],
+              "returns": {
+                "kind": "named",
+                "name": "std.io.Result"
+              }
+            },
+            "locator": {
+              "kind": "artifact",
+              "path": "library/std/src/io/mod.rs",
+              "symbol": "std.io.StdoutLock.write_all"
+            }
+          },
+          {
+            "id": "member.rust-codeql.std-io-stderr-lock-write",
+            "owner": "type.rust-codeql.std-io-stderr-lock",
+            "name": "write",
+            "member_kind": "method",
+            "visibility": "public",
+            "is_static": false,
+            "callable_family_complete": true,
+            "signature": {
+              "parameters": [
+                {
+                  "name": "buffer",
+                  "type": {
+                    "kind": "named",
+                    "name": "untyped"
+                  }
+                }
+              ],
+              "returns": {
+                "kind": "named",
+                "name": "std.io.Result"
+              }
+            },
+            "locator": {
+              "kind": "artifact",
+              "path": "library/std/src/io/mod.rs",
+              "symbol": "std.io.StderrLock.write"
+            }
+          },
+          {
+            "id": "member.rust-codeql.std-io-stderr-lock-write-all",
+            "owner": "type.rust-codeql.std-io-stderr-lock",
+            "name": "write_all",
+            "member_kind": "method",
+            "visibility": "public",
+            "is_static": false,
+            "callable_family_complete": true,
+            "signature": {
+              "parameters": [
+                {
+                  "name": "buffer",
+                  "type": {
+                    "kind": "named",
+                    "name": "untyped"
+                  }
+                }
+              ],
+              "returns": {
+                "kind": "named",
+                "name": "std.io.Result"
+              }
+            },
+            "locator": {
+              "kind": "artifact",
+              "path": "library/std/src/io/mod.rs",
+              "symbol": "std.io.StderrLock.write_all"
+            }
+          },
+          {
+            "id": "member.rust-codeql.std-primitive-str-as-bytes",
+            "owner": "type.rust-codeql.std-primitive-str",
+            "name": "as_bytes",
+            "member_kind": "method",
+            "visibility": "public",
+            "is_static": false,
+            "callable_family_complete": true,
+            "signature": {
+              "parameters": []
+            },
+            "locator": {
+              "kind": "artifact",
+              "path": "library/core/src/str/mod.rs",
+              "symbol": "std.primitive.str.as_bytes"
+            }
+          },
+          {
+            "id": "member.rust-codeql.std-string-string-as-bytes",
+            "owner": "type.rust-codeql.std-string-string",
+            "name": "as_bytes",
+            "member_kind": "method",
+            "visibility": "public",
+            "is_static": false,
+            "callable_family_complete": true,
+            "signature": {
+              "parameters": []
+            },
+            "locator": {
+              "kind": "artifact",
+              "path": "library/alloc/src/string.rs",
+              "symbol": "std.string.String.as_bytes"
+            }
+          },
+          {
+            "id": "member.rust-codeql.std-primitive-str-replace",
+            "owner": "type.rust-codeql.std-primitive-str",
+            "name": "replace",
+            "member_kind": "method",
+            "visibility": "public",
+            "is_static": false,
+            "callable_family_complete": true,
+            "signature": {
+              "parameters": [
+                {
+                  "name": "pattern",
+                  "type": {
+                    "kind": "named",
+                    "name": "untyped"
+                  }
+                },
+                {
+                  "name": "replacement",
+                  "type": {
+                    "kind": "named",
+                    "name": "untyped"
+                  }
+                }
+              ],
+              "returns": {
+                "kind": "named",
+                "name": "std.string.String"
+              }
+            },
+            "locator": {
+              "kind": "artifact",
+              "path": "library/core/src/str/mod.rs",
+              "symbol": "std.primitive.str.replace"
+            }
+          },
+          {
+            "id": "member.rust-codeql.std-string-string-replace",
+            "owner": "type.rust-codeql.std-string-string",
+            "name": "replace",
+            "member_kind": "method",
+            "visibility": "public",
+            "is_static": false,
+            "callable_family_complete": true,
+            "signature": {
+              "parameters": [
+                {
+                  "name": "pattern",
+                  "type": {
+                    "kind": "named",
+                    "name": "untyped"
+                  }
+                },
+                {
+                  "name": "replacement",
+                  "type": {
+                    "kind": "named",
+                    "name": "untyped"
+                  }
+                }
+              ],
+              "returns": {
+                "kind": "named",
+                "name": "std.string.String"
+              }
+            },
+            "locator": {
+              "kind": "artifact",
+              "path": "library/alloc/src/string.rs",
+              "symbol": "std.string.String.replace"
+            }
+          }
+        ],
+        "relations": []
+      }
+    },
+    {
+      "id": "summaries.bifrost.rust-std-io-write",
+      "activation": [
+        {
+          "targets": [],
+          "configurations": []
+        }
+      ],
+      "payload": {
+        "kind": "procedure_summaries",
+        "summaries": [
+          {
+            "id": "summary.rust-codeql.std-io-stdout",
+            "target": {
+              "path": "library/std/src/io/stdio.rs",
+              "symbol": "std.io.stdout",
+              "has_receiver": false,
+              "parameter_count": 0
+            },
+            "completeness": "complete",
+            "locations": [],
+            "transfers": [],
+            "effects": [
+              {
+                "kind": "allocation",
+                "event": "event.rust-codeql.std-io-stdout.result",
+                "output": {
+                  "kind": "normal_return"
+                }
+              }
+            ]
+          },
+          {
+            "id": "summary.rust-codeql.std-io-stderr",
+            "target": {
+              "path": "library/std/src/io/stdio.rs",
+              "symbol": "std.io.stderr",
+              "has_receiver": false,
+              "parameter_count": 0
+            },
+            "completeness": "complete",
+            "locations": [],
+            "transfers": [],
+            "effects": [
+              {
+                "kind": "allocation",
+                "event": "event.rust-codeql.std-io-stderr.result",
+                "output": {
+                  "kind": "normal_return"
+                }
+              }
+            ]
+          },
+          {
+            "id": "summary.rust-codeql.std-io-stdout-lock",
+            "target": {
+              "path": "library/std/src/io/stdio.rs",
+              "symbol": "std.io.Stdout.lock",
+              "has_receiver": true,
+              "parameter_count": 0
+            },
+            "completeness": "complete",
+            "locations": [],
+            "transfers": [],
+            "effects": [
+              {
+                "kind": "allocation",
+                "event": "event.rust-codeql.std-io-stdout-lock.result",
+                "output": {
+                  "kind": "normal_return"
+                }
+              }
+            ]
+          },
+          {
+            "id": "summary.rust-codeql.std-io-stderr-lock",
+            "target": {
+              "path": "library/std/src/io/stdio.rs",
+              "symbol": "std.io.Stderr.lock",
+              "has_receiver": true,
+              "parameter_count": 0
+            },
+            "completeness": "complete",
+            "locations": [],
+            "transfers": [],
+            "effects": [
+              {
+                "kind": "allocation",
+                "event": "event.rust-codeql.std-io-stderr-lock.result",
+                "output": {
+                  "kind": "normal_return"
+                }
+              }
+            ]
+          },
+          {
+            "id": "summary.rust-codeql.std-io-stdout-write",
+            "target": {
+              "path": "library/std/src/io/mod.rs",
+              "symbol": "std.io.Stdout.write",
+              "has_receiver": true,
+              "parameter_count": 1
+            },
+            "completeness": "complete",
+            "locations": [],
+            "transfers": [],
+            "effects": []
+          },
+          {
+            "id": "summary.rust-codeql.std-io-stdout-write-all",
+            "target": {
+              "path": "library/std/src/io/mod.rs",
+              "symbol": "std.io.Stdout.write_all",
+              "has_receiver": true,
+              "parameter_count": 1
+            },
+            "completeness": "complete",
+            "locations": [],
+            "transfers": [],
+            "effects": []
+          },
+          {
+            "id": "summary.rust-codeql.std-io-stderr-write",
+            "target": {
+              "path": "library/std/src/io/mod.rs",
+              "symbol": "std.io.Stderr.write",
+              "has_receiver": true,
+              "parameter_count": 1
+            },
+            "completeness": "complete",
+            "locations": [],
+            "transfers": [],
+            "effects": []
+          },
+          {
+            "id": "summary.rust-codeql.std-io-stderr-write-all",
+            "target": {
+              "path": "library/std/src/io/mod.rs",
+              "symbol": "std.io.Stderr.write_all",
+              "has_receiver": true,
+              "parameter_count": 1
+            },
+            "completeness": "complete",
+            "locations": [],
+            "transfers": [],
+            "effects": []
+          },
+          {
+            "id": "summary.rust-codeql.std-io-stdout-lock-write",
+            "target": {
+              "path": "library/std/src/io/mod.rs",
+              "symbol": "std.io.StdoutLock.write",
+              "has_receiver": true,
+              "parameter_count": 1
+            },
+            "completeness": "complete",
+            "locations": [],
+            "transfers": [],
+            "effects": []
+          },
+          {
+            "id": "summary.rust-codeql.std-io-stdout-lock-write-all",
+            "target": {
+              "path": "library/std/src/io/mod.rs",
+              "symbol": "std.io.StdoutLock.write_all",
+              "has_receiver": true,
+              "parameter_count": 1
+            },
+            "completeness": "complete",
+            "locations": [],
+            "transfers": [],
+            "effects": []
+          },
+          {
+            "id": "summary.rust-codeql.std-io-stderr-lock-write",
+            "target": {
+              "path": "library/std/src/io/mod.rs",
+              "symbol": "std.io.StderrLock.write",
+              "has_receiver": true,
+              "parameter_count": 1
+            },
+            "completeness": "complete",
+            "locations": [],
+            "transfers": [],
+            "effects": []
+          },
+          {
+            "id": "summary.rust-codeql.std-io-stderr-lock-write-all",
+            "target": {
+              "path": "library/std/src/io/mod.rs",
+              "symbol": "std.io.StderrLock.write_all",
+              "has_receiver": true,
+              "parameter_count": 1
+            },
+            "completeness": "complete",
+            "locations": [],
+            "transfers": [],
+            "effects": []
+          },
+          {
+            "id": "summary.rust-codeql.std-primitive-str-as-bytes",
+            "target": {
+              "path": "library/core/src/str/mod.rs",
+              "symbol": "std.primitive.str.as_bytes",
+              "has_receiver": true,
+              "parameter_count": 0
+            },
+            "completeness": "complete",
+            "locations": [],
+            "transfers": [
+              {
+                "input": {
+                  "kind": "receiver"
+                },
+                "exit_kind": "normal",
+                "output": {
+                  "kind": "normal_return"
+                }
+              }
+            ],
+            "effects": []
+          },
+          {
+            "id": "summary.rust-codeql.std-string-string-as-bytes",
+            "target": {
+              "path": "library/alloc/src/string.rs",
+              "symbol": "std.string.String.as_bytes",
+              "has_receiver": true,
+              "parameter_count": 0
+            },
+            "completeness": "complete",
+            "locations": [],
+            "transfers": [
+              {
+                "input": {
+                  "kind": "receiver"
+                },
+                "exit_kind": "normal",
+                "output": {
+                  "kind": "normal_return"
+                }
+              }
+            ],
+            "effects": []
+          },
+          {
+            "id": "summary.rust-codeql.std-primitive-str-replace",
+            "target": {
+              "path": "library/core/src/str/mod.rs",
+              "symbol": "std.primitive.str.replace",
+              "has_receiver": true,
+              "parameter_count": 2
+            },
+            "completeness": "complete",
+            "locations": [],
+            "transfers": [
+              {
+                "input": {
+                  "kind": "receiver"
+                },
+                "exit_kind": "normal",
+                "output": {
+                  "kind": "normal_return"
+                }
+              }
+            ],
+            "effects": []
+          },
+          {
+            "id": "summary.rust-codeql.std-string-string-replace",
+            "target": {
+              "path": "library/alloc/src/string.rs",
+              "symbol": "std.string.String.replace",
+              "has_receiver": true,
+              "parameter_count": 2
+            },
+            "completeness": "complete",
+            "locations": [],
+            "transfers": [
+              {
+                "input": {
+                  "kind": "receiver"
+                },
+                "exit_kind": "normal",
+                "output": {
+                  "kind": "normal_return"
+                }
+              }
+            ],
+            "effects": []
+          }
+        ]
+      }
+    }
+  ]
+}

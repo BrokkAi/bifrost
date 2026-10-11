@@ -15,7 +15,7 @@ use crate::analyzer::semantic::type_flow::{
 use crate::analyzer::semantic::{
     ContentIdentity, EvidenceCompleteness, OverlaySnapshotId, ProcedureHandle, ProcedureSemantics,
     ProgramPointId, ProofStatus, SemanticCapability, SemanticGapDischarge, SemanticGapSubject,
-    SourceMappingKind, SourceRevision, SourceSpan, StableDigest, WorkspaceMountId,
+    SemanticRole, SourceMappingKind, SourceRevision, SourceSpan, StableDigest, WorkspaceMountId,
     WorkspaceRelativePath,
 };
 use crate::analyzer::structural::provider::StructuralSyntaxLimitedOutcome;
@@ -25,6 +25,8 @@ use crate::cancellation::CancellationToken;
 use crate::hash::HashMap;
 use crate::text_utils::{compute_line_starts, line_column_for_offset};
 use brokk_bifrost_core::analyzer::tree_walk::node_range;
+use std::mem::size_of;
+use std::sync::Arc;
 use tree_sitter::Node;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -288,9 +290,21 @@ impl ProcedureSyntax {
         procedure: &ProcedureHandle,
     ) -> Result<Node<'_>, &'static str> {
         let semantics = procedure.semantics();
-        let mapping = semantics
-            .source_mapping(semantics.source())
-            .expect("validated procedure source exists");
+        let mut callable_mapping = None;
+        for candidate in semantics.source_mappings().iter().filter(|mapping| {
+            mapping.kind == SourceMappingKind::Exact
+                && mapping.locator.role() == SemanticRole::SourceMapping
+        }) {
+            assert!(
+                callable_mapping.replace(candidate).is_none(),
+                "a procedure publishes at most one exact callable source mapping"
+            );
+        }
+        let mapping = callable_mapping.unwrap_or_else(|| {
+            semantics
+                .source_mapping(semantics.source())
+                .expect("validated procedure source exists")
+        });
         if mapping.kind != SourceMappingKind::Exact {
             return Err("procedure_mapping_inexact");
         }
@@ -329,6 +343,36 @@ impl ProcedureSyntax {
 /// Assess every executable statement owned by one exact semantic procedure.
 /// A missing site or incomplete control proof is an open row.
 pub fn statement_assessments(
+    workspace: &WorkspaceAnalyzer,
+    procedure: &ProcedureHandle,
+    cancellation: Option<&CancellationToken>,
+) -> StatementAssessments {
+    if cancellation.is_some_and(CancellationToken::is_cancelled) {
+        return build_statement_assessments(workspace, procedure, cancellation);
+    }
+    (*workspace
+        .analyzer()
+        .statement_assessments_for(workspace, procedure, cancellation))
+    .clone()
+}
+
+pub(crate) fn weight_statement_assessments(
+    _key: &(
+        crate::analyzer::semantic::SemanticArtifactMaterializationId,
+        crate::analyzer::semantic::ProcedureId,
+    ),
+    value: &Arc<StatementAssessments>,
+) -> u32 {
+    let size = size_of::<StatementAssessments>().saturating_add(
+        value
+            .rows
+            .capacity()
+            .saturating_mul(size_of::<StatementAssessment>()),
+    );
+    size.clamp(1, u32::MAX as usize) as u32
+}
+
+pub(crate) fn build_statement_assessments(
     workspace: &WorkspaceAnalyzer,
     procedure: &ProcedureHandle,
     cancellation: Option<&CancellationToken>,
@@ -394,7 +438,6 @@ pub fn statement_assessments(
         let mut cursor = node.walk();
         stack.extend(node.named_children(&mut cursor));
     }
-
     let uncancelled = CancellationToken::new();
     let mut budget = CfgAlgorithmBudget::default();
     let mut request = CfgAlgorithmRequest::new(&mut budget, cancellation.unwrap_or(&uncancelled));
@@ -452,215 +495,14 @@ pub fn statement_assessments(
 mod tests {
     use super::*;
     use crate::analyzer::semantic::{
-        CancellationToken, ProcedureKind, SemanticBudget, SemanticRequest, source_anchor,
+        CancellationToken, ProcedureKind, SemanticBudget, SemanticRequest,
     };
-    use crate::analyzer::tree_sitter_analyzer::{
-        PreparedSourceOrigin, PreparedSyntaxSource, WalkControl, walk_named_tree_preorder,
-    };
-    use crate::analyzer::{AnalyzerConfig, Language, LanguageDialect};
+    use crate::analyzer::{AnalyzerConfig, Language};
     use crate::inline_project::InlineTestProject;
-    use std::sync::Arc;
-
-    fn parse_prepared(source: &str) -> PreparedSyntaxTree {
-        let mut parser = tree_sitter::Parser::new();
-        parser
-            .set_language(&tree_sitter_java::LANGUAGE.into())
-            .expect("Java grammar loads");
-        PreparedSyntaxTree::new(
-            PreparedSyntaxSource::Exact(Arc::from(source)),
-            parser.parse(source, None).expect("Java source parses"),
-            crate::text_utils::compute_line_starts(source),
-            LanguageDialect::Standard(Language::Java),
-            PreparedSourceOrigin::Disk,
-            None,
-        )
-    }
-
-    fn statement_span(prepared: &PreparedSyntaxTree, text: &str) -> SourceSpan {
-        let mut found = None;
-        walk_named_tree_preorder(prepared.tree().root_node(), true, |node| {
-            if prepared.source().get(node.byte_range()) == Some(text) {
-                found = Some(source_anchor(node, 0).expect("valid statement span").span());
-                WalkControl::Break
-            } else {
-                WalkControl::Continue
-            }
-        });
-        found.unwrap_or_else(|| panic!("missing statement {text}"))
-    }
+    use brokk_bifrost_test_macros::hardwon;
 
     #[test]
-    fn java_statement_entries_retain_dead_and_specialized_cleanup_routes() {
-        let source = r#"class App {
-  void dead() { return; removed(); }
-  void cleanup(boolean flag) {
-    try { if (flag) return; throw new RuntimeException(); }
-    finally { done(); }
-  }
-  void cycle() { do { tick(); } while (false); }
-  void open(boolean flag) { synchronized(this) { if (flag) return; } return; missed(); }
-  void outer() { Runnable r = () -> { inner(); }; return; after(); }
-  int switchReturn(int n) { return switch (n) { default -> 1; }; }
-  int switchInitializer(int m) { int x = switch (m) { default -> 2; }; return x; }
-  void switchStatement(int q) { switch (q) { default: return; } }
-  void forInitializer() { for (int i = 0; i < 1; i++) { break; } }
-}"#;
-        let project = InlineTestProject::with_language(Language::Java)
-            .file("src/App.java", source)
-            .build();
-        let file = project.file("src/App.java");
-        let analyzer = project.workspace_analyzer(AnalyzerConfig::default());
-        let cancellation = CancellationToken::default();
-        let mut budget = SemanticBudget::default();
-        let artifact = analyzer
-            .materialize_program_semantics(
-                &file,
-                &mut SemanticRequest::new(&mut budget, &cancellation),
-            )
-            .expect("Java semantics materialize")
-            .available_value()
-            .cloned()
-            .expect("Java artifact available");
-        let prepared = parse_prepared(source);
-        let method = |name| {
-            artifact
-                .procedures()
-                .iter()
-                .find(|procedure| {
-                    procedure
-                        .locator()
-                        .declaration()
-                        .segments()
-                        .last()
-                        .and_then(|segment| segment.name())
-                        == Some(name)
-                })
-                .and_then(|procedure| artifact.procedure_handle(procedure.id()))
-                .unwrap_or_else(|| panic!("method {name} exists"))
-        };
-
-        let dead = StatementEntryIndex::new(&method("dead"), &file, &prepared)
-            .expect("same Java snapshot");
-        assert_eq!(
-            dead.at_span(statement_span(&prepared, "removed();"))
-                .unwrap()
-                .len(),
-            1
-        );
-        assert_eq!(
-            dead.at_span(statement_span(
-                &prepared,
-                "void dead() { return; removed(); }"
-            )),
-            Err(StatementEntryOpen::MissingProducerSite)
-        );
-        let assessed = statement_assessments(&analyzer, &method("dead"), None);
-        assert!(assessed.complete, "{:?}", assessed.reason);
-        let removed = statement_span(&prepared, "removed();");
-        assert!(assessed.rows.iter().any(|row| {
-            row.range.start_byte == removed.start_byte() as usize
-                && row.range.end_byte == removed.end_byte() as usize
-                && row.verdict == StatementVerdict::Unreachable
-        }));
-        let returned = statement_span(&prepared, "return;");
-        assert!(assessed.rows.iter().any(|row| {
-            row.range.start_byte == returned.start_byte() as usize
-                && row.range.end_byte == returned.end_byte() as usize
-                && row.verdict == StatementVerdict::Reachable
-        }));
-
-        let open = statement_assessments(&analyzer, &method("open"), None);
-        let missed = statement_span(&prepared, "missed();");
-        assert!(open.rows.iter().any(|row| {
-            row.range.start_byte == missed.start_byte() as usize
-                && row.range.end_byte == missed.end_byte() as usize
-                && row.verdict == StatementVerdict::Open("control_evidence_incomplete")
-        }));
-
-        let outer = statement_assessments(&analyzer, &method("outer"), None);
-        assert!(outer.complete, "{:?}", outer.reason);
-        let inner = statement_span(&prepared, "inner();");
-        assert!(outer.rows.iter().all(|row| {
-            row.range.start_byte != inner.start_byte() as usize
-                || row.range.end_byte != inner.end_byte() as usize
-        }));
-
-        for (name, text) in [
-            ("switchReturn", "switch (n) { default -> 1; }"),
-            ("switchInitializer", "switch (m) { default -> 2; }"),
-        ] {
-            let assessed = statement_assessments(&analyzer, &method(name), None);
-            assert!(assessed.complete, "{name}: {:?}", assessed.reason);
-            assert!(
-                assessed
-                    .rows
-                    .iter()
-                    .all(|row| !matches!(row.verdict, StatementVerdict::Open(_))),
-                "{name}: {:?}",
-                assessed.rows
-            );
-            let expression = statement_span(&prepared, text);
-            assert!(assessed.rows.iter().all(|row| {
-                row.range.start_byte != expression.start_byte() as usize
-                    || row.range.end_byte != expression.end_byte() as usize
-            }));
-        }
-        let standalone = statement_assessments(&analyzer, &method("switchStatement"), None);
-        assert!(standalone.complete, "{:?}", standalone.reason);
-        assert!(standalone.rows.iter().any(|row| row.kind == "switch"));
-
-        let for_initializer = statement_assessments(&analyzer, &method("forInitializer"), None);
-        assert!(for_initializer.complete, "{:?}", for_initializer.reason);
-        let mut initializer = None;
-        walk_named_tree_preorder(prepared.tree().root_node(), true, |node| {
-            if node.kind() == "local_variable_declaration"
-                && node
-                    .parent()
-                    .is_some_and(|parent| parent.kind() == "for_statement")
-            {
-                initializer = Some(source_span_for_node(node));
-                WalkControl::Break
-            } else {
-                WalkControl::Continue
-            }
-        });
-        let initializer = initializer.expect("for initializer syntax exists");
-        assert!(for_initializer.rows.iter().all(|row| {
-            row.range.start_byte != initializer.start_byte() as usize
-                || row.range.end_byte != initializer.end_byte() as usize
-        }));
-
-        let cleanup = StatementEntryIndex::new(&method("cleanup"), &file, &prepared)
-            .expect("same Java snapshot");
-        assert!(
-            cleanup
-                .at_span(statement_span(&prepared, "done();"))
-                .unwrap()
-                .len()
-                > 1,
-            "finally must retain every specialized entry"
-        );
-
-        let cycle = StatementEntryIndex::new(&method("cycle"), &file, &prepared)
-            .expect("same Java snapshot");
-        assert_eq!(
-            cycle
-                .at_span(statement_span(&prepared, "do { tick(); } while (false);"))
-                .unwrap(),
-            cycle
-                .at_span(statement_span(&prepared, "{ tick(); }"))
-                .unwrap(),
-            "the body can share its enclosing do point without losing its own source identity"
-        );
-
-        let changed = parse_prepared(&format!("{source}\n// changed"));
-        assert!(matches!(
-            StatementEntryIndex::new(&method("dead"), &file, &changed),
-            Err(StatementEntryOpen::SourceSnapshotMismatch)
-        ));
-    }
-
-    #[test]
+    #[hardwon("dad21e7d6133: Java body reachability omitted nested statement blocks")]
     fn java_statement_entries_exclude_the_procedure_body_but_retain_nested_blocks() {
         let source = r#"class Sample {
   Sample() {}

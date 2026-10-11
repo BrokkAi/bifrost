@@ -1,7 +1,7 @@
 {
   "schema_version": 2,
   "pack_id": "bifrost.python-os-command-declarations",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "producer": {
     "name": "bifrost-reviewed-python-models",
     "version": "0.1.0"
@@ -24,7 +24,7 @@
   },
   "shards": [
     {
-      "id": "declarations.python-os-system",
+      "id": "declarations.python-os-commands",
       "activation": [
         {
           "targets": [],
@@ -76,6 +76,80 @@
               "path": "os.py",
               "symbol": "os.system(command)"
             }
+          },
+          {
+            "id": "member.python.os.chmod",
+            "owner": "type.python.os",
+            "name": "chmod",
+            "member_kind": "function",
+            "visibility": "public",
+            "is_static": true,
+            "callable_family_complete": true,
+            "signature": {
+              "parameters": [
+                { "name": "path", "type": { "kind": "named", "name": "builtins.object" } },
+                { "name": "mode", "type": { "kind": "named", "name": "builtins.int" } },
+                { "name": "dir_fd", "type": { "kind": "named", "name": "builtins.int" }, "optional": true, "passing_mode": "named_only" },
+                { "name": "follow_symlinks", "type": { "kind": "named", "name": "builtins.bool" }, "optional": true, "passing_mode": "named_only" }
+              ],
+              "returns": { "kind": "named", "name": "builtins.NoneType" }
+            },
+            "locator": { "kind": "artifact", "path": "os.pyi", "symbol": "os.chmod" }
+          },
+          {
+            "id": "member.python.os.open",
+            "owner": "type.python.os",
+            "name": "open",
+            "member_kind": "function",
+            "visibility": "public",
+            "is_static": true,
+            "callable_family_complete": true,
+            "signature": {
+              "parameters": [
+                { "name": "path", "type": { "kind": "named", "name": "builtins.object" } },
+                { "name": "flags", "type": { "kind": "named", "name": "builtins.int" } },
+                { "name": "mode", "type": { "kind": "named", "name": "builtins.int" }, "optional": true },
+                { "name": "dir_fd", "type": { "kind": "named", "name": "builtins.int" }, "optional": true, "passing_mode": "named_only" }
+              ],
+              "returns": { "kind": "named", "name": "builtins.int" }
+            },
+            "locator": { "kind": "artifact", "path": "os.pyi", "symbol": "os.open" }
+          },
+          {
+            "id": "member.python.os.mkdir",
+            "owner": "type.python.os",
+            "name": "mkdir",
+            "member_kind": "function",
+            "visibility": "public",
+            "is_static": true,
+            "callable_family_complete": true,
+            "signature": {
+              "parameters": [
+                { "name": "path", "type": { "kind": "named", "name": "builtins.object" } },
+                { "name": "mode", "type": { "kind": "named", "name": "builtins.int" }, "optional": true },
+                { "name": "dir_fd", "type": { "kind": "named", "name": "builtins.int" }, "optional": true, "passing_mode": "named_only" }
+              ],
+              "returns": { "kind": "named", "name": "builtins.NoneType" }
+            },
+            "locator": { "kind": "artifact", "path": "os.pyi", "symbol": "os.mkdir" }
+          },
+          {
+            "id": "member.python.os.makedirs",
+            "owner": "type.python.os",
+            "name": "makedirs",
+            "member_kind": "function",
+            "visibility": "public",
+            "is_static": true,
+            "callable_family_complete": true,
+            "signature": {
+              "parameters": [
+                { "name": "name", "type": { "kind": "named", "name": "builtins.object" } },
+                { "name": "mode", "type": { "kind": "named", "name": "builtins.int" }, "optional": true },
+                { "name": "exist_ok", "type": { "kind": "named", "name": "builtins.bool" }, "optional": true }
+              ],
+              "returns": { "kind": "named", "name": "builtins.NoneType" }
+            },
+            "locator": { "kind": "artifact", "path": "os.pyi", "symbol": "os.makedirs" }
           }
         ],
         "relations": []

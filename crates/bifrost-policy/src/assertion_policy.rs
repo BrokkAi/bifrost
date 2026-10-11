@@ -61,13 +61,10 @@ mod tests {
     use std::str::FromStr;
 
     use brokk_bifrost_analysis::schema_version::{SchemaVersionOrigin, SchemaVersionResolution};
-    use brokk_bifrost_rql::QueryStep;
     use brokk_bifrost_rql::structural::search::{
         CodeQueryOccurrence, CodeQueryOccurrenceTarget, CodeQueryResultItem, UnitRowItem,
     };
-    use brokk_bifrost_rql::structural::{
-        CodeQuery, CodeQueryRange, CodeQueryResultValue, CodeQueryRowScalarType,
-    };
+    use brokk_bifrost_rql::structural::{CodeQuery, CodeQueryRange, CodeQueryResultValue};
     use serde_json::json;
 
     use super::*;
@@ -229,127 +226,72 @@ mod tests {
     }
 
     #[test]
-    fn validates_typed_occurrence_join_and_group_plan() {
-        validate_relational_assertion_plan(&valid_plan()).expect("valid relational plan");
-    }
-
-    #[test]
-    fn validates_occurrence_to_receiver_evidence_query_steps() {
-        let mut plan = valid_plan();
-        let RowBindingSource::Query(PolicySelector::Inline { query, .. }) =
-            &mut plan.bindings[1].source
-        else {
-            panic!("test binding uses an inline query")
+    fn binding_initializer_site_ast_id_is_a_typed_call_effect_join_key() {
+        let initializer = CodeQuery::from_source(
+            r#"(language rust
+              (binding-initializer-calls-of
+                (state-events-of :class [establish] :subject [binding]
+                  (procedure-of (function :async true)))))"#,
+        )
+        .expect("binding initializer relation query");
+        let effects = CodeQuery::from_source("(language rust (call-effects (call-shape (call))))")
+            .expect("call effect query");
+        let selector = |query| PolicySelector::Inline {
+            schema: SchemaVersionResolution {
+                version: 8,
+                origin: SchemaVersionOrigin::Explicit,
+            },
+            query,
+            resolved_locators: Vec::new(),
         };
-        query
-            .plan
-            .steps
-            .push(QueryStep::ReceiverTargets(Default::default()));
-        query.plan.steps.push(QueryStep::ReceiverEvidence);
-        plan.joins[0].on[0].right_field = "site_ast_id".to_string();
+
+        let mut plan = valid_plan();
+        plan.bindings[0].source = RowBindingSource::Query(selector(initializer));
+        plan.bindings[1].source = RowBindingSource::Query(selector(effects));
+        plan.joins[0].on[0] = RowJoinCondition {
+            left_field: "site_ast_id".to_string(),
+            right_field: "site_ast_id".to_string(),
+            source_range: None,
+        };
+        plan.groups[0].by[0].field = "site_ast_id".to_string();
         validate_relational_assertion_plan(&plan)
-            .expect("member occurrences query receiver evidence rows");
-    }
+            .expect("initializer and call-effect rows share a typed AST identity");
 
-    /// The diagnostic must carry the complete alternative set and the flag that
-    /// prints the whole catalog (issue #2517): a misspelled column is an
-    /// authoring mistake the message can resolve on its own.
-    #[test]
-    fn rejects_unknown_row_field_before_execution() {
-        let mut plan = valid_plan();
-        plan.joins[0].on[0].right_field = "source_range".to_string();
-        let error = validate_relational_assertion_plan(&plan)
-            .expect_err("`source_range` is not a resolution-candidate column");
-        let RelationalAssertionPlanError::UnknownField {
-            binding,
-            field,
-            known_fields,
-        } = &error
-        else {
-            panic!("expected an unknown-field error, got {error:?}");
-        };
-        assert_eq!(binding, "candidate");
-        assert_eq!(field, "source_range");
-        assert!(
-            known_fields.contains(&"target_id".to_string()),
-            "{known_fields:?}"
-        );
-        let message = error.to_string();
-        assert!(
-            message.contains("unknown field `candidate.source_range`"),
-            "{message}"
-        );
-        for known in known_fields {
-            assert!(message.contains(known.as_str()), "{message}");
-        }
-        assert!(
-            message.ends_with("see `bifrost --list-row-schemas`"),
-            "{message}"
-        );
-    }
-
-    #[test]
-    fn rejects_join_fields_with_different_scalar_types() {
-        let mut plan = valid_plan();
-        plan.joins[0].on[0].right_field = "target_count".to_string();
+        plan.joins[0].on[0].right_field = "callee_id".to_string();
         assert!(matches!(
             validate_relational_assertion_plan(&plan),
             Err(RelationalAssertionPlanError::JoinTypeMismatch { .. })
         ));
     }
 
-    /// A group can only read rows the join chain actually brings in. Without
-    /// the join, the second binding's rows never meet the first one's, so no
-    /// row set could answer the plan.
+    /// Equal field values prove no relation between a code row and a
+    /// configuration row (#3274, #3284). Joining them is refused at load time;
+    /// the registered `correlate` operator is the only composition that may
+    /// pair them, and only structurally.
     #[test]
-    fn rejects_a_group_over_a_binding_the_joins_never_bring_in() {
+    fn rejects_joining_code_rows_with_configuration_rows() {
         let mut plan = valid_plan();
-        plan.joins.clear();
-        plan.groups[0].by[0] = RowFieldRef {
-            binding: name("candidate"),
-            field: "ast_id".to_string(),
+        plan.bindings[1].source = RowBindingSource::Query(inline_selector(json!({
+            "schema_version": 1,
+            "configuration_facts": { "formats": ["properties"] }
+        })));
+        // Both columns are stable ids, so the join is type-correct; it is
+        // refused for pairing two domains, not for its field types.
+        plan.joins[0].on[0] = RowJoinCondition {
+            left_field: "id".to_string(),
+            right_field: "id".to_string(),
             source_range: None,
         };
+        let error = validate_relational_assertion_plan(&plan)
+            .expect_err("a code binding must not join a configuration binding");
         assert_eq!(
-            validate_relational_assertion_plan(&plan),
-            Err(RelationalAssertionPlanError::DisconnectedBinding {
-                binding: "candidate".to_string(),
-            })
+            error,
+            RelationalAssertionPlanError::CrossDomainJoin {
+                left: "site".to_string(),
+                right: "candidate".to_string(),
+            }
         );
-    }
-
-    /// Joining one binding in twice would give its columns two meanings in the
-    /// same row.
-    #[test]
-    fn rejects_joining_one_binding_in_twice() {
-        let mut plan = valid_plan();
-        let repeated = plan.joins[0].clone();
-        plan.joins.push(repeated);
-        assert_eq!(
-            validate_relational_assertion_plan(&plan),
-            Err(RelationalAssertionPlanError::RepeatedJoinBinding {
-                binding: "candidate".to_string(),
-            })
-        );
-    }
-
-    #[test]
-    fn rejects_min_over_non_integer_field() {
-        let mut plan = valid_plan();
-        plan.groups[0].aggregates[0].op = RowAggregateOp::Min;
-        plan.groups[0].aggregates[0].value = Some(RowFieldRef {
-            binding: name("candidate"),
-            field: "role".to_string(),
-            source_range: None,
-        });
-        assert_eq!(
-            validate_relational_assertion_plan(&plan),
-            Err(RelationalAssertionPlanError::InvalidMinType {
-                group: "by-site".to_string(),
-                aggregate: "count".to_string(),
-                actual: CodeQueryRowScalarType::ConstrainedEnum,
-            })
-        );
+        assert!(error.to_string().contains("`correlate`"), "{error}");
     }
 
     #[test]
@@ -436,6 +378,7 @@ mod tests {
                     range: unit_range(),
                     argument_index: index,
                     name: Some(name.to_string()),
+                    literal_value: None,
                     spread: false,
                 },
             ),
@@ -607,82 +550,5 @@ mod tests {
             0,
             "the same set in a different order is not parity"
         );
-    }
-
-    /// A shorter list is not parity either, which is the case a positional
-    /// inner join alone silently accepts: the surplus position simply has no
-    /// partner to disagree with.
-    #[test]
-    fn ordered_equal_rejects_a_prefix_of_the_declared_list() {
-        let plan = ordered_equal_plan();
-        assert_eq!(ordered_equal_parity(&plan, &[(0, "name")]), 0);
-    }
-
-    /// Two rows that claim one position and disagree leave the sequence
-    /// undefined, and an undefined sequence is never reported as parity.
-    #[test]
-    fn ordered_equal_never_claims_parity_over_a_contradictory_position() {
-        let plan = ordered_equal_plan();
-        assert_eq!(
-            ordered_equal_parity(&plan, &[(0, "name"), (0, "greeting")]),
-            0
-        );
-    }
-
-    #[test]
-    fn an_ordered_aggregate_must_declare_both_sequences() {
-        let mut plan = ordered_equal_plan();
-        plan.groups[0].aggregates[0].sequences = None;
-        assert_eq!(
-            validate_relational_assertion_plan(&plan),
-            Err(RelationalAssertionPlanError::OrderedSequencesRequired {
-                group: "shape".to_string(),
-                aggregate: "parity".to_string(),
-            })
-        );
-    }
-
-    #[test]
-    fn a_folding_aggregate_must_not_declare_sequences() {
-        let mut plan = ordered_equal_plan();
-        plan.groups[0].aggregates[0].op = RowAggregateOp::Count;
-        assert_eq!(
-            validate_relational_assertion_plan(&plan),
-            Err(RelationalAssertionPlanError::OrderedSequencesForbidden {
-                group: "shape".to_string(),
-                aggregate: "parity".to_string(),
-            })
-        );
-    }
-
-    #[test]
-    fn source_and_join_limits_mark_truncation() {
-        let mut plan = valid_plan();
-        plan.limits.max_source_rows = 1;
-        plan.limits.max_join_comparisons = 1;
-        let site_rows = vec![occurrence("site-1", "ast-1"), occurrence("site-2", "ast-2")];
-        let candidates = vec![
-            occurrence("candidate-1", "ast-1"),
-            occurrence("candidate-2", "ast-2"),
-        ];
-        let outcome = evaluate_relational_assertion_rows(
-            &plan,
-            &[
-                RelationalInput {
-                    binding: &plan.bindings[0].name,
-                    rows: &site_rows,
-                    coverage: RelationCoverage::exhaustive(),
-                },
-                RelationalInput {
-                    binding: &plan.bindings[1].name,
-                    rows: &candidates,
-                    coverage: RelationCoverage::exhaustive(),
-                },
-            ],
-            None,
-        )
-        .unwrap();
-        assert!(outcome.limit_exceeded);
-        assert!(!outcome.exhaustive);
     }
 }

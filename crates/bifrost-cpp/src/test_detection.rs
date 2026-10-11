@@ -10,7 +10,12 @@
 //! (MSTest) all expand from macros the grammar cannot see through.
 
 use brokk_bifrost_core::analyzer::ProjectFile;
+use brokk_bifrost_core::analyzer::common::collapse_whitespace;
 use brokk_bifrost_core::analyzer::model::{TestAssertionSmell, TestAssertionWeights};
+use brokk_bifrost_core::analyzer::test_assertions::{
+    TestAssertionSignal, append_test_assertion_findings, is_common_assertion_literal,
+    normalize_assertion_expression,
+};
 use regex::Regex;
 use std::sync::LazyLock;
 
@@ -76,52 +81,28 @@ fn analyze_cpp_test_case(
     weights: &TestAssertionWeights,
     out: &mut Vec<TestAssertionSmell>,
 ) {
-    let assertions = collect_cpp_assertions(body, weights);
-    let assertion_count = assertions.len() as i32;
     let symbol = file.to_string();
-
-    if assertion_count == 0 {
-        out.push(TestAssertionSmell {
-            file: file.clone(),
-            enclosing_fq_name: symbol,
-            assertion_kind: "no-assertions".to_string(),
-            score: weights.no_assertion_weight,
-            assertion_count: 0,
-            reasons: vec!["no-assertions".to_string()],
-            excerpt: compact_cpp_excerpt(body),
-            start_byte,
-        });
-        return;
-    }
-
-    for assertion in &assertions {
-        if assertion.score <= 0 {
-            continue;
-        }
-        out.push(TestAssertionSmell {
-            file: file.clone(),
-            enclosing_fq_name: symbol.clone(),
-            assertion_kind: assertion.kind.clone(),
+    let assertions: Vec<_> = collect_cpp_assertions(body, weights)
+        .into_iter()
+        .map(|assertion| TestAssertionSignal {
+            kind: assertion.kind,
             score: assertion.score,
-            assertion_count,
-            reasons: vec![assertion.reason.clone()],
-            excerpt: assertion.excerpt.clone(),
+            shallow: assertion.shallow,
+            meaningful: false,
+            reasons: vec![assertion.reason],
+            excerpt: assertion.excerpt,
             start_byte: start_byte + assertion.start_byte,
-        });
-    }
-
-    if assertions.iter().all(|assertion| assertion.shallow) {
-        out.push(TestAssertionSmell {
-            file: file.clone(),
-            enclosing_fq_name: symbol,
-            assertion_kind: "shallow-assertions-only".to_string(),
-            score: weights.shallow_assertion_only_weight,
-            assertion_count,
-            reasons: vec!["shallow-assertions-only".to_string()],
-            excerpt: compact_cpp_excerpt(body),
-            start_byte,
-        });
-    }
+        })
+        .collect();
+    append_test_assertion_findings(
+        file,
+        symbol,
+        collapse_whitespace(body),
+        start_byte,
+        &assertions,
+        weights,
+        out,
+    );
 }
 
 fn collect_cpp_assertions(body: &str, weights: &TestAssertionWeights) -> Vec<CppAssertionSignal> {
@@ -141,7 +122,7 @@ fn collect_cpp_assertions(body: &str, weights: &TestAssertionWeights) -> Vec<Cpp
             score,
             shallow,
             reason: kind.to_string(),
-            excerpt: compact_cpp_excerpt(whole.as_str()),
+            excerpt: collapse_whitespace(whole.as_str()),
             start_byte: whole.start(),
         });
     }
@@ -170,7 +151,7 @@ fn collect_cpp_assertions(body: &str, weights: &TestAssertionWeights) -> Vec<Cpp
                 score,
                 shallow: false,
                 reason: reason.to_string(),
-                excerpt: compact_cpp_excerpt(whole.as_str()),
+                excerpt: collapse_whitespace(whole.as_str()),
                 start_byte: whole.start(),
             }
         } else if matcher == "NE" && (is_cpp_null_literal(&left) || is_cpp_null_literal(&right)) {
@@ -179,7 +160,7 @@ fn collect_cpp_assertions(body: &str, weights: &TestAssertionWeights) -> Vec<Cpp
                 score: weights.nullness_only_weight,
                 shallow: true,
                 reason: "nullness-only".to_string(),
-                excerpt: compact_cpp_excerpt(whole.as_str()),
+                excerpt: collapse_whitespace(whole.as_str()),
                 start_byte: whole.start(),
             }
         } else {
@@ -188,7 +169,7 @@ fn collect_cpp_assertions(body: &str, weights: &TestAssertionWeights) -> Vec<Cpp
                 score: 0,
                 shallow: false,
                 reason: "meaningful-assertion".to_string(),
-                excerpt: compact_cpp_excerpt(whole.as_str()),
+                excerpt: collapse_whitespace(whole.as_str()),
                 start_byte: whole.start(),
             }
         };
@@ -210,28 +191,16 @@ pub fn cpp_contains_tests(source: &str) -> bool {
 }
 
 fn normalize_cpp_expr(expr: &str) -> String {
-    expr.trim()
-        .trim_end_matches(';')
-        .trim_matches(|ch| matches!(ch, '(' | ')' | ' '))
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ")
+    normalize_assertion_expression(expr.trim().trim_end_matches(';'))
 }
 
 fn is_cpp_literal(expr: &str) -> bool {
     let trimmed = expr.trim();
-    (trimmed.starts_with('"') && trimmed.ends_with('"'))
-        || matches!(trimmed, "true" | "false" | "nullptr" | "NULL")
-        || trimmed.parse::<i64>().is_ok()
-        || trimmed.parse::<f64>().is_ok()
+    is_common_assertion_literal(trimmed) || matches!(trimmed, "true" | "false" | "nullptr" | "NULL")
 }
 
 fn is_cpp_null_literal(expr: &str) -> bool {
     matches!(expr.trim(), "nullptr" | "NULL")
-}
-
-fn compact_cpp_excerpt(text: &str) -> String {
-    text.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 fn extract_braced_body(source: &str, open_brace_index: usize) -> Option<(&str, usize)> {
@@ -257,4 +226,28 @@ fn extract_braced_body(source: &str, open_brace_index: usize) -> Option<(&str, u
         }
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn nonpositive_shallow_only_score_emits_no_finding() {
+        let file = ProjectFile::new(
+            std::env::current_dir().expect("test working directory"),
+            "shallow-only.cpp",
+        );
+        let mut weights = TestAssertionWeights::defaults();
+        weights.constant_truth_weight = 0;
+        weights.shallow_assertion_only_weight = 0;
+
+        let findings = detect_cpp_test_assertion_smells(
+            &file,
+            "TEST(Suite, case) { EXPECT_TRUE(true); }",
+            &weights,
+        );
+
+        assert!(findings.is_empty(), "unexpected findings: {findings:?}");
+    }
 }

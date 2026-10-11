@@ -80,9 +80,11 @@ fn definition_status_incomplete_reason(status: &str) -> Option<DefinitionLookupI
 fn definition_lookup_diagnostics_completion(
     diagnostics: &[crate::analyzer::usages::get_definition::DefinitionLookupDiagnostic],
 ) -> (bool, Option<DefinitionLookupIncompleteReason>) {
-    let incomplete_reason = diagnostics
-        .iter()
-        .find_map(|diagnostic| definition_lookup_incomplete_reason_for_kind(&diagnostic.kind));
+    let incomplete_reason = definition_lookup_incomplete_reason_for_kinds(
+        diagnostics
+            .iter()
+            .map(|diagnostic| diagnostic.kind.as_str()),
+    );
     (incomplete_reason.is_none(), incomplete_reason)
 }
 
@@ -556,6 +558,7 @@ pub(super) fn render_definition_reference_lookup(
             ),
         });
     }
+    diagnostics.extend(unclosed_construct_diagnostic(&definitions));
     let (mut complete, incomplete_reason) =
         definition_result_completion(outcome.status.as_str(), &diagnostics);
     if terminal_incomplete {

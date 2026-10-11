@@ -1,8 +1,4 @@
-//! Test-support Go incoming-call projection from selected inverse evidence.
-//!
-//! Go call relations remain on the incumbent production route until the Go
-//! consumer flip. This adapter projects only selected inverse rows and never
-//! discovers callees independently.
+//! Go call relations projected from selected inverse and forward operations.
 
 use super::GoAnalyzer;
 use super::selected_reverse::{GoSelectedReverseOutcome, go_selected_inverse_for};
@@ -21,7 +17,7 @@ use crate::analyzer::{CodeUnit, CodeUnitIndex, IAnalyzer, ProjectFile, resolve_a
 use crate::hash::{HashMap, HashSet};
 use std::sync::Arc;
 
-/// Native Go call-relation projection. Kept out of Go production dispatch.
+/// Native Go call-relation projection used by Go production dispatch.
 pub struct GoNativeCallRelations;
 
 impl CallRelationProvider for GoNativeCallRelations {
@@ -54,15 +50,15 @@ impl CallRelationProvider for GoNativeCallRelations {
             return CallRelationResult {
                 truncated: true,
                 proof_authority: UsageProofAuthority::Native,
-                diagnostics: vec![diagnostic(
-                    CallRelationDiagnosticCode::BudgetExhausted,
-                    format!(
+                diagnostics: vec![CallRelationDiagnostic {
+                    code: CallRelationDiagnosticCode::BudgetExhausted,
+                    message: format!(
                         "native Go incoming-call budget omitted {}",
                         target.fq_name()
                     ),
-                    target.fq_name().to_string(),
-                    "native_call_budget_exhausted",
-                )],
+                    context: target.fq_name().to_string(),
+                    reason_kind: None,
+                }],
                 ..CallRelationResult::default()
             };
         }
@@ -96,20 +92,35 @@ impl CallRelationProvider for GoNativeCallRelations {
 
     fn outgoing(
         &self,
-        _analyzer: &dyn IAnalyzer,
+        analyzer: &dyn IAnalyzer,
         caller: &CodeUnit,
-        _limits: CallRelationLimits,
-        _cancellation: Option<&CancellationToken>,
+        limits: CallRelationLimits,
+        cancellation: Option<&CancellationToken>,
     ) -> CallRelationResult {
-        unavailable(
-            "native Go outgoing calls are not part of this slice",
+        let cancellation = cancellation.cloned().unwrap_or_default();
+        if cancellation.is_cancelled() {
+            return CallRelationResult {
+                cancelled: true,
+                proof_authority: UsageProofAuthority::Native,
+                ..CallRelationResult::default()
+            };
+        }
+        let Some(go) = resolve_analyzer::<GoAnalyzer>(analyzer) else {
+            return unavailable("native Go analyzer is unavailable", caller);
+        };
+        super::native_outgoing::outgoing(
+            go,
             caller,
+            limits,
+            brokk_bifrost_core::analyzer::usages::receiver_analysis::ReceiverAnalysisBudget::default(),
+            &cancellation,
         )
     }
 }
 
 /// Public test-support entry point for comparing the native adapter with the
 /// incumbent Go call relation path.
+#[cfg(any(test, feature = "test-support"))]
 pub fn go_native_incoming_calls(
     analyzer: &dyn IAnalyzer,
     target: &CodeUnit,

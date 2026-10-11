@@ -16,29 +16,35 @@ use std::collections::BTreeSet;
 use std::rc::Rc;
 
 use rusqlite::types::Value;
-use rusqlite::{Connection, Row, params_from_iter};
+use rusqlite::{Connection, OptionalExtension, Row, params_from_iter};
 
 use crate::CancellationToken;
 use crate::analyzer::Language;
 use brokk_bifrost_core::analyzer::structural::resolution::DeclaredVisibility;
 
 use crate::analyzer::resolution::{
-    BindingFragmentId, BindingNodeId, DeferredMemberOwnerLookupName, LoweredBindingProjection,
-    LoweredCallApplicabilityObligation, LoweredCallableSignatureProperty,
+    BindingFragmentId, BindingNodeId, CompanionTypeRelation, DeferredMemberOwnerLookupName,
+    LoweredBindingProjection, LoweredCallApplicabilityObligation, LoweredCallableSignatureProperty,
     LoweredConstructionRequirementProperty, LoweredDeclarationTypeProperty,
-    LoweredDeclarationVisibilityProperty, LoweredDeferredMemberOwner, LoweredDefinitionPropertyGap,
-    LoweredIntrinsicSeed, LoweredMemberOwnerProperty, LoweredMemberScopeProperty,
-    LoweredRustDeclarationAuthority, LoweredRustReferenceContext, LoweredSupertypeProperty,
-    LoweredTypeComponent, LoweredTypeTransfer, LoweredTypedFrontier, LoweredUnderlyingType,
-    MAX_TYPED_FACT_ROWS_PER_PAGE, PolledCompletionAccumulator, QualifiedRouteSlotLookup,
+    LoweredDeclarationVisibilityProperty, LoweredDeclaredTypeArgument, LoweredDeferredMemberOwner,
+    LoweredDefinitionPropertyGap, LoweredGenericFormal, LoweredGenericTypeAliasParameter,
+    LoweredIntrinsicSeed, LoweredIntrinsicTypeDescriptor, LoweredMemberOwnerProperty,
+    LoweredMemberScopeProperty, LoweredRustDeclarationAuthority, LoweredRustReferenceContext,
+    LoweredSupertypeProperty, LoweredTypeArgument, LoweredTypeComponent, LoweredTypeTransfer,
+    LoweredTypedFrontier, LoweredUnderlyingType, MAX_TYPED_FACT_ROWS_PER_PAGE, NamedArgumentLabel,
+    NamedArgumentLabelRead, PolledCompletionAccumulator, QualifiedRouteSlotLookup,
     ResolutionCompletion, ResolutionIncompleteReason, RustImplementedTraits,
     SelectedGapReasonProvenance, SelectedNodeProvenance, SelectedQualifiedRoute,
     SelectedResolutionMountOrdinal, SelectedSemanticProvenance, SelectedTypeFrontierCompletion,
     SelectedTypedFactSource, SelectedTypedRow, SemanticId, SharedNameInterner,
-    TypedFactPageVisitor, TypedFactReadOutcome, TypedFactRequest,
+    TypedFactPageVisitor, TypedFactReadOutcome, TypedFactRequest, language_identity_domain,
+    language_type_qualifiers_search_companion_members,
 };
 
-use super::resolution::{TypedFactRelation, with_resolution_read_progress_handler};
+use super::resolution::{
+    TypedFactRelation, json_array, mount_ordinal, nonnegative_i64, read_resolution_statement,
+    require_selected_mount_record,
+};
 use super::resolution_authority::SelectedResolutionAuthority;
 use super::resolution_prepare::rust_authority;
 use super::resolution_prepare::typed_rows::{self, TypedRowContext};
@@ -75,13 +81,7 @@ impl<'selection, 'store> SelectedResolutionTypedSource<'selection, 'store> {
     ) -> Self {
         Self::with_authority(
             selection,
-            Rc::new(SelectedResolutionAuthority::new(
-                selection.connection(),
-                selection.shared_name_table(),
-                selection.requested_mount_rows(),
-                selection.persisted_mount_count(),
-                selection.authority_validations(),
-            )),
+            Rc::new(SelectedResolutionAuthority::from_selection(selection)),
         )
     }
 
@@ -94,6 +94,188 @@ impl<'selection, 'store> SelectedResolutionTypedSource<'selection, 'store> {
             selected_interiors_validation_stamp: Cell::new(None),
             authority,
         }
+    }
+
+    /// Read a positioned named-argument label from its exact selected source
+    /// site. The call row supplies the callee reference that the resolution
+    /// engine must select before the label can name a parameter.
+    fn read_named_argument_label_for_reference(
+        &self,
+        reference: SemanticId,
+        cancellation: &CancellationToken,
+    ) -> StoreResult<NamedArgumentLabelRead> {
+        if cancellation.is_cancelled() || !self.validate_selected_interiors(cancellation)? {
+            return Ok(NamedArgumentLabelRead::Cancelled);
+        }
+        assert!(
+            reference.shared_name_id().is_none(),
+            "positioned named-argument labels have fragment-local reference identities"
+        );
+        let Some(coordinates) = self.semantic_coordinates(
+            &[reference],
+            TypedFactRelation::CallApplicabilityCalleeReference,
+            cancellation,
+        )?
+        else {
+            return Ok(NamedArgumentLabelRead::Cancelled);
+        };
+        if cancellation.is_cancelled() {
+            return Ok(NamedArgumentLabelRead::Cancelled);
+        }
+        let Some(coordinate) = coordinates.first().copied() else {
+            return Ok(NamedArgumentLabelRead::Missing);
+        };
+        assert_eq!(
+            coordinates.len(),
+            1,
+            "a positioned label belongs to one mount"
+        );
+        assert_eq!(coordinate.space, RequestKeySpace::Local);
+        let mount = self.mount(coordinate.mount)?;
+        let reference_site = coordinate.keys[0];
+        let Some(found) = self.read_statement(cancellation, |conn| {
+            let mut statement = conn.prepare_cached(
+                "SELECT call_site, label FROM main.resolution_named_argument_labels \
+                 WHERE blob_id=?1 AND reference_site=?2",
+            )?;
+            let row = statement
+                .query_row([mount.blob_id(), reference_site], |row| {
+                    Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+                })
+                .optional()?;
+            Ok(Some(row))
+        })?
+        else {
+            return Ok(NamedArgumentLabelRead::Cancelled);
+        };
+        let Some((call_site, spelling)) = found else {
+            return Ok(NamedArgumentLabelRead::Missing);
+        };
+        let call_site = u32::try_from(call_site).map_err(|_| {
+            invalid_fact(format!("named-argument call site is invalid: {call_site}"))
+        })?;
+        let call_site =
+            brokk_bifrost_core::analyzer::resolution_facts::ResolutionSiteId::new(call_site);
+        let call_identity =
+            crate::analyzer::resolution::call_semantic_identity(call_site).fragment_local_digest();
+        let Some(callee_sites) = self.read_statement(cancellation, |conn| {
+            let mut statement = conn.prepare_cached(
+                "SELECT obligation.callee_reference \
+                 FROM main.resolution_semantic_catalog AS call_identity \
+                 JOIN main.resolution_call_obligations AS obligation \
+                   ON obligation.blob_id=call_identity.blob_id \
+                  AND obligation.call=call_identity.local_key \
+                 WHERE call_identity.blob_id=?1 AND call_identity.identity_digest=?2 \
+                 ORDER BY obligation.callee_reference LIMIT 2",
+            )?;
+            let mut rows =
+                statement.query(rusqlite::params![mount.blob_id(), call_identity.as_slice()])?;
+            let mut sites = Vec::new();
+            while let Some(row) = rows.next()? {
+                if cancellation.is_cancelled() {
+                    return Ok(None);
+                }
+                let site = nonnegative_i64(row, 0, "named-argument callee site")?;
+                sites.push(u32::try_from(site).map_err(|_| {
+                    invalid_fact(format!("named-argument callee site is invalid: {site}"))
+                })?);
+            }
+            Ok(Some(sites))
+        })?
+        else {
+            return Ok(NamedArgumentLabelRead::Cancelled);
+        };
+        if callee_sites.len() > 1 {
+            return Err(invalid_fact(format!(
+                "named-argument call site has multiple callee references: {call_site:?}"
+            )));
+        }
+        let callee_reference = callee_sites.first().copied().map(|site| {
+            crate::analyzer::resolution::mounted_site_semantic(
+                mount.fragment_id(),
+                brokk_bifrost_core::analyzer::resolution_facts::ResolutionSiteId::new(site),
+            )
+        });
+        Ok(NamedArgumentLabelRead::Found(NamedArgumentLabel {
+            call: crate::analyzer::resolution::mounted_site_semantic(
+                mount.fragment_id(),
+                call_site,
+            ),
+            callee_reference,
+            spelling,
+        }))
+    }
+
+    /// Resolve a label only within the exact selected callable's parameter
+    /// rows. Multiple matches are not guessed; the caller reports the label
+    /// as incomplete.
+    fn read_callable_parameter_for_label(
+        &self,
+        callable: SemanticId,
+        label: &str,
+        cancellation: &CancellationToken,
+    ) -> StoreResult<Option<SemanticId>> {
+        if cancellation.is_cancelled() || !self.validate_selected_interiors(cancellation)? {
+            return Ok(None);
+        }
+        assert!(
+            callable.shared_name_id().is_none(),
+            "a selected callable declaration has a fragment-local identity"
+        );
+        let Some(coordinates) = self.semantic_coordinates(
+            &[callable],
+            TypedFactRelation::CallableSignatureDefinition,
+            cancellation,
+        )?
+        else {
+            return Ok(None);
+        };
+        if cancellation.is_cancelled() {
+            return Ok(None);
+        }
+        let mut matches = Vec::new();
+        for coordinate in coordinates {
+            if cancellation.is_cancelled() {
+                return Ok(None);
+            }
+            assert_eq!(coordinate.request_ordinal, 0);
+            assert_eq!(coordinate.space, RequestKeySpace::Local);
+            let mount = self.mount(coordinate.mount)?;
+            let callable_site = coordinate.keys[0];
+            let Some(mut parameter_sites) = self.read_statement(cancellation, |conn| {
+                let mut statement = conn.prepare_cached(
+                    "SELECT parameter_site FROM main.resolution_callable_parameter_semantics \
+                     WHERE blob_id=?1 AND callable_site=?2 AND label=?3 \
+                     ORDER BY list_ordinal, ordinal LIMIT 2",
+                )?;
+                let mut rows =
+                    statement.query(rusqlite::params![mount.blob_id(), callable_site, label])?;
+                let mut sites = Vec::new();
+                while let Some(row) = rows.next()? {
+                    if cancellation.is_cancelled() {
+                        return Ok(None);
+                    }
+                    let site = nonnegative_i64(row, 0, "callable parameter site")?;
+                    sites.push(u32::try_from(site).map_err(|_| {
+                        invalid_fact(format!("callable parameter site is invalid: {site}"))
+                    })?);
+                }
+                Ok(Some(sites))
+            })?
+            else {
+                return Ok(None);
+            };
+            matches.extend(parameter_sites.drain(..).map(|site| {
+                crate::analyzer::resolution::mounted_site_semantic(
+                    mount.fragment_id(),
+                    brokk_bifrost_core::analyzer::resolution_facts::ResolutionSiteId::new(site),
+                )
+            }));
+            if matches.len() > 1 {
+                return Ok(None);
+            }
+        }
+        Ok((matches.len() == 1).then_some(matches[0]))
     }
 
     /// The mounts whose authority can answer a request of this relation keyed
@@ -182,14 +364,11 @@ impl<'selection, 'store> SelectedResolutionTypedSource<'selection, 'store> {
         &self,
         ordinal: SelectedResolutionMountOrdinal,
     ) -> StoreResult<std::sync::Arc<SelectedResolutionMountRecord>> {
-        self.selection
-            .persisted_mount_record(ordinal)?
-            .ok_or_else(|| {
-                invalid_fact(format!(
-                    "selected typed row names unknown mount ordinal {}",
-                    ordinal.get()
-                ))
-            })
+        require_selected_mount_record(
+            self.selection.persisted_mount_record(ordinal)?,
+            ordinal,
+            "typed",
+        )
     }
 
     fn read_statement<T>(
@@ -197,16 +376,7 @@ impl<'selection, 'store> SelectedResolutionTypedSource<'selection, 'store> {
         cancellation: &CancellationToken,
         job: impl FnOnce(&Connection) -> StoreResult<Option<T>>,
     ) -> StoreResult<Option<T>> {
-        if cancellation.is_cancelled() {
-            return Ok(None);
-        }
-        match with_resolution_read_progress_handler(self.selection.connection(), cancellation, job)
-        {
-            Err(error) if error.is_sqlite_interrupted() && cancellation.is_cancelled() => Ok(None),
-            Err(error) => Err(error),
-            Ok(_) if cancellation.is_cancelled() => Ok(None),
-            Ok(result) => Ok(result),
-        }
+        read_resolution_statement(self.selection.connection(), cancellation, job)
     }
 
     fn empty_outcome(&self, cancellation: &CancellationToken) -> StoreResult<TypedFactReadOutcome> {
@@ -233,9 +403,12 @@ impl<'selection, 'store> SelectedResolutionTypedSource<'selection, 'store> {
             return Ok(!cancellation.is_cancelled());
         }
         let expected = self.selection.persisted_mount_count();
-        let Some((rows, complete)) = self.read_statement(cancellation, |conn| {
+        // One aggregate read, as the lexical source's sentinel does: a loop that
+        // decoded each mount record would make every typed read cost one
+        // statement per workspace file.
+        let Some((mounted, with_interior)) = self.read_statement(cancellation, |conn| {
             let mut statement = conn.prepare_cached(
-                r#"SELECT m.mount_ordinal, interior.blob_id
+                r#"SELECT COUNT(*), COUNT(interior.blob_id)
                    FROM temp.selected_resolution_mounts AS m
                    LEFT JOIN main.resolution_fragment_interiors AS interior
                      ON interior.blob_id = m.blob_id
@@ -247,35 +420,25 @@ impl<'selection, 'store> SelectedResolutionTypedSource<'selection, 'store> {
                     AND EXISTS (
                       SELECT 1 FROM main.source_fact_readiness AS visibility
                       WHERE visibility.blob_id = m.blob_id AND visibility.available = 1
-                    )
-                   ORDER BY m.mount_ordinal"#,
+                    )"#,
             )?;
-            let mut rows = statement.query([])?;
-            let mut decoded = 0_usize;
-            while let Some(row) = rows.next()? {
-                if cancellation.is_cancelled() {
-                    return Ok(None);
-                }
-                let ordinal = mount_ordinal(row, 0, "selected typed sentinel mount")?;
-                self.mount(ordinal)?;
-                if row.get::<_, Option<i64>>(1)?.is_none() {
-                    return Err(invalid_fact(format!(
-                        "selected typed mount {} lost its exact complete interior",
-                        ordinal.get()
-                    )));
-                }
-                decoded = decoded
-                    .checked_add(1)
-                    .expect("selected mount count fits usize");
-            }
-            Ok(Some((decoded, true)))
+            let counts = statement
+                .query_row([], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)))?;
+            Ok(Some(counts))
         })?
         else {
             return Ok(false);
         };
-        if !complete || rows != expected {
+        if with_interior != mounted {
             return Err(invalid_fact(format!(
-                "selected typed sentinel expected {expected} mounts, decoded {rows}"
+                "{} of {mounted} selected typed mounts lost their exact complete interior",
+                mounted - with_interior
+            )));
+        }
+        let mounted = usize::try_from(mounted).expect("selected mount count fits usize");
+        if mounted != expected {
+            return Err(invalid_fact(format!(
+                "selected typed sentinel expected {expected} mounts, decoded {mounted}"
             )));
         }
         if cancellation.is_cancelled() {
@@ -605,25 +768,6 @@ fn invalid_fact(message: impl Into<String>) -> StoreError {
     StoreError::new(message)
 }
 
-fn mount_ordinal(
-    row: &Row<'_>,
-    index: usize,
-    label: &str,
-) -> StoreResult<SelectedResolutionMountOrdinal> {
-    let value = nonnegative_i64(row, index, label)?;
-    let value = u32::try_from(value)
-        .map_err(|_| invalid_fact(format!("{label} {value} does not fit u32")))?;
-    Ok(SelectedResolutionMountOrdinal::new(value))
-}
-
-fn nonnegative_i64(row: &Row<'_>, index: usize, label: &str) -> StoreResult<i64> {
-    let value: i64 = row.get(index)?;
-    if value < 0 {
-        return Err(invalid_fact(format!("{label} cannot be negative: {value}")));
-    }
-    Ok(value)
-}
-
 fn usize_from_nonnegative(row: &Row<'_>, index: usize, label: &str) -> StoreResult<usize> {
     usize::try_from(nonnegative_i64(row, index, label)?)
         .map_err(|_| invalid_fact(format!("{label} does not fit usize")))
@@ -662,7 +806,7 @@ pub(super) mod shared_request_probe {
     }
 
     pub(super) fn observe(relation: TypedFactRelation, requests: usize, mounts: usize) {
-        let index = usize::try_from(relation.code()).expect("a relation code is nonnegative");
+        let index = counter_index(relation);
         REQUESTS.with(|counters| counters[index].set(counters[index].get() + requests));
         MOUNTS.with(|counters| counters[index].set(counters[index].get() + mounts));
     }
@@ -684,17 +828,82 @@ pub(super) mod shared_request_probe {
     /// The shared requests this relation answered, and the distinct mounts
     /// they resolved to, since the last [`reset`].
     pub(crate) fn observed(relation: TypedFactRelation) -> (usize, usize) {
-        let index = usize::try_from(relation.code()).expect("a relation code is nonnegative");
+        let index = counter_index(relation);
         (
             REQUESTS.with(|counters| counters[index].get()),
             MOUNTS.with(|counters| counters[index].get()),
         )
     }
+
+    fn counter_index(relation: TypedFactRelation) -> usize {
+        usize::try_from(relation.code()).expect("a relation code is nonnegative")
+    }
+}
+
+enum RustFragmentCoordinate {
+    FragmentLocal((SelectedResolutionMountOrdinal, i64)),
+    Cancelled,
+    Unplaced,
+}
+
+fn rust_fragment_coordinate(
+    authority: &SelectedResolutionAuthority<'_>,
+    semantic: SemanticId,
+    cancellation: &CancellationToken,
+) -> StoreResult<RustFragmentCoordinate> {
+    let Some(provenance) = authority.semantic_catalog_provenance(semantic, cancellation)? else {
+        return Ok(RustFragmentCoordinate::Cancelled);
+    };
+    let Some(SelectedSemanticProvenance::FragmentLocal(local)) = provenance else {
+        return Ok(RustFragmentCoordinate::Unplaced);
+    };
+    Ok(RustFragmentCoordinate::FragmentLocal((
+        local.mount().ordinal(),
+        local.local_key().get(),
+    )))
 }
 
 impl SelectedTypedFactSource for SelectedResolutionTypedSource<'_, '_> {
+    fn named_argument_label_for_reference(
+        &self,
+        reference: SemanticId,
+        cancellation: &CancellationToken,
+    ) -> StoreResult<NamedArgumentLabelRead> {
+        self.read_named_argument_label_for_reference(reference, cancellation)
+    }
+
+    fn callable_parameter_for_label(
+        &self,
+        callable: SemanticId,
+        label: &str,
+        cancellation: &CancellationToken,
+    ) -> StoreResult<Option<SemanticId>> {
+        self.read_callable_parameter_for_label(callable, label, cancellation)
+    }
+
     fn selection_has_java_semantics(&self) -> bool {
         self.selection.has_java_semantics()
+    }
+
+    fn selection_has_jvm_semantics(&self) -> bool {
+        self.selection.has_jvm_semantics()
+    }
+
+    fn fragment_type_qualifiers_search_companion_members(
+        &self,
+        fragment: BindingFragmentId,
+    ) -> StoreResult<bool> {
+        let Some(ordinal) = self.selection.mount_ordinal_for_fragment(fragment) else {
+            return Ok(false);
+        };
+        let record = self.selection.mount_record_by_ordinal(ordinal)?;
+        Ok(language_type_qualifiers_search_companion_members(
+            record.semantic_language(),
+        ))
+    }
+
+    fn intrinsic_reverse_index_uses_shared_type_names(&self) -> bool {
+        true
     }
 
     fn rust_crate_access(
@@ -763,21 +972,15 @@ impl SelectedTypedFactSource for SelectedResolutionTypedSource<'_, '_> {
         {
             return Ok(RustImplementedTraits::Traits(Vec::new()));
         }
-        let mut coordinates = [None, None];
-        for (slot, semantic) in coordinates.iter_mut().zip([owner, reference]) {
-            let Some(provenance) = self
-                .authority
-                .semantic_catalog_provenance(semantic, cancellation)?
-            else {
-                return Ok(RustImplementedTraits::Cancelled);
-            };
-            let Some(SelectedSemanticProvenance::FragmentLocal(local)) = provenance else {
-                return Ok(RustImplementedTraits::Unplaced);
-            };
-            *slot = Some((local.mount().ordinal(), local.local_key().get()));
-        }
-        let [Some(owner), Some(reference)] = coordinates else {
-            unreachable!("both coordinates are read above")
+        let owner = match rust_fragment_coordinate(&self.authority, owner, cancellation)? {
+            RustFragmentCoordinate::FragmentLocal(coordinate) => coordinate,
+            RustFragmentCoordinate::Cancelled => return Ok(RustImplementedTraits::Cancelled),
+            RustFragmentCoordinate::Unplaced => return Ok(RustImplementedTraits::Unplaced),
+        };
+        let reference = match rust_fragment_coordinate(&self.authority, reference, cancellation)? {
+            RustFragmentCoordinate::FragmentLocal(coordinate) => coordinate,
+            RustFragmentCoordinate::Cancelled => return Ok(RustImplementedTraits::Cancelled),
+            RustFragmentCoordinate::Unplaced => return Ok(RustImplementedTraits::Unplaced),
         };
         super::resolution_operation::rust_crate_rows::implemented_traits_nameable_at(
             self.selection,
@@ -812,21 +1015,15 @@ impl SelectedTypedFactSource for SelectedResolutionTypedSource<'_, '_> {
         {
             return Ok(RustImplementedTraits::Traits(Vec::new()));
         }
-        let mut coordinates = [None, None];
-        for (slot, semantic) in coordinates.iter_mut().zip([owner, reference]) {
-            let Some(provenance) = self
-                .authority
-                .semantic_catalog_provenance(semantic, cancellation)?
-            else {
-                return Ok(RustImplementedTraits::Cancelled);
-            };
-            let Some(SelectedSemanticProvenance::FragmentLocal(local)) = provenance else {
-                return Ok(RustImplementedTraits::Unplaced);
-            };
-            *slot = Some((local.mount().ordinal(), local.local_key().get()));
-        }
-        let [Some(owner), Some(reference)] = coordinates else {
-            unreachable!("both coordinates are read above")
+        let owner = match rust_fragment_coordinate(&self.authority, owner, cancellation)? {
+            RustFragmentCoordinate::FragmentLocal(coordinate) => coordinate,
+            RustFragmentCoordinate::Cancelled => return Ok(RustImplementedTraits::Cancelled),
+            RustFragmentCoordinate::Unplaced => return Ok(RustImplementedTraits::Unplaced),
+        };
+        let reference = match rust_fragment_coordinate(&self.authority, reference, cancellation)? {
+            RustFragmentCoordinate::FragmentLocal(coordinate) => coordinate,
+            RustFragmentCoordinate::Cancelled => return Ok(RustImplementedTraits::Cancelled),
+            RustFragmentCoordinate::Unplaced => return Ok(RustImplementedTraits::Unplaced),
         };
         super::resolution_operation::rust_crate_rows::trait_nameable_at(
             self.selection,
@@ -855,18 +1052,14 @@ impl SelectedTypedFactSource for SelectedResolutionTypedSource<'_, '_> {
         {
             return Ok(RustImplementedTraits::Traits(Vec::new()));
         }
-        let Some(provenance) = self
-            .authority
-            .semantic_catalog_provenance(member, cancellation)?
-        else {
-            return Ok(RustImplementedTraits::Cancelled);
-        };
-        let Some(SelectedSemanticProvenance::FragmentLocal(local)) = provenance else {
-            return Ok(RustImplementedTraits::Unplaced);
+        let coordinate = match rust_fragment_coordinate(&self.authority, member, cancellation)? {
+            RustFragmentCoordinate::FragmentLocal(coordinate) => coordinate,
+            RustFragmentCoordinate::Cancelled => return Ok(RustImplementedTraits::Cancelled),
+            RustFragmentCoordinate::Unplaced => return Ok(RustImplementedTraits::Unplaced),
         };
         super::resolution_operation::rust_crate_rows::impl_item_traits(
             self.selection,
-            (local.mount().ordinal(), local.local_key().get()),
+            coordinate,
             cancellation,
         )
     }
@@ -877,6 +1070,14 @@ impl SelectedTypedFactSource for SelectedResolutionTypedSource<'_, '_> {
         cancellation: &CancellationToken,
     ) -> StoreResult<Option<Vec<crate::analyzer::resolution::JavaAccessEndpoint>>> {
         java_access::read(self, semantics, cancellation)
+    }
+
+    fn jvm_access_endpoints(
+        &self,
+        semantics: &[SemanticId],
+        cancellation: &CancellationToken,
+    ) -> StoreResult<Option<Vec<crate::analyzer::resolution::JvmAccessEndpoint>>> {
+        java_access::read_jvm(self, semantics, cancellation)
     }
 
     fn go_callable_lookups(
@@ -914,7 +1115,7 @@ impl SelectedTypedFactSource for SelectedResolutionTypedSource<'_, '_> {
             let Some(recipe) = recipe else {
                 continue;
             };
-            if recipe.semantic_language() == Language::Go.config_label()
+            if recipe.identity_domain() == language_identity_domain(Language::Go)
                 && matches!(
                     recipe.namespace(),
                     ResolutionNamespace::Value | ResolutionNamespace::Callable
@@ -1106,33 +1307,20 @@ impl SelectedTypedFactSource for SelectedResolutionTypedSource<'_, '_> {
                 ResolutionCompletion::Complete,
             ));
         }
-        for mounts in self.selection.mounts()?.chunks(PAGE_ROWS) {
-            let mut page = Vec::with_capacity(mounts.len());
-            for mount in mounts {
-                if cancellation.is_cancelled() {
-                    return Ok(TypedFactReadOutcome::cancelled(
-                        ResolutionCompletion::Complete,
-                    ));
-                }
-                page.push(mount.fragment_id());
-            }
-            let keep_going = visitor.visit_page(&page)?;
-            if cancellation.is_cancelled() {
-                return Ok(TypedFactReadOutcome::cancelled(
-                    ResolutionCompletion::Complete,
-                ));
-            }
-            if !keep_going {
-                return Ok(TypedFactReadOutcome::stopped(
-                    ResolutionCompletion::Complete,
-                ));
-            }
-        }
-        Ok(if self.validate_selected_interiors(cancellation)? {
-            TypedFactReadOutcome::exhausted(ResolutionCompletion::Complete)
-        } else {
-            TypedFactReadOutcome::cancelled(ResolutionCompletion::Complete)
-        })
+        let outcome = crate::analyzer::resolution::visit_mapped_typed_pages(
+            self.selection.mounts()?,
+            PAGE_ROWS,
+            cancellation,
+            |mount| mount.fragment_id(),
+            visitor,
+        )?;
+        Ok(
+            if outcome.is_exhausted() && !self.validate_selected_interiors(cancellation)? {
+                TypedFactReadOutcome::cancelled(ResolutionCompletion::Complete)
+            } else {
+                outcome
+            },
+        )
     }
 
     fn read_selected_reverse_inventory_completion(
@@ -1208,35 +1396,27 @@ impl SelectedTypedFactSource for SelectedResolutionTypedSource<'_, '_> {
         cancellation: &CancellationToken,
         visitor: &mut TypedFactPageVisitor<'_, SelectedTypedRow<LoweredTypedFrontier>>,
     ) -> StoreResult<TypedFactReadOutcome> {
-        visit_combined_typed_rows(
+        self.visit_local_and_staged_typed_rows(
             cancellation,
             visitor,
-            |visitor| {
-                let Some(mounts) = self.local_keys_by_mount(
+            |source, cancellation| {
+                source.local_keys_by_mount(
                     slots.as_slice(),
                     TypedFactRelation::TypedFrontierSlot,
                     cancellation,
-                )?
-                else {
-                    return cancelled();
-                };
-                self.visit_typed_rows(
-                    &mounts,
-                    typed_rows::TYPE_FRONTIERS_BY_SLOT_SQL,
-                    cancellation,
-                    visitor,
-                    |context, row| {
-                        Ok(SelectedTypedRow::new(
-                            context.fragment,
-                            typed_rows::decode_type_frontier(
-                                context,
-                                row.get(0)?,
-                                row.get(1)?,
-                                row.get(2)?,
-                            ),
-                        ))
-                    },
                 )
+            },
+            typed_rows::TYPE_FRONTIERS_BY_SLOT_SQL,
+            |context, row| {
+                Ok(SelectedTypedRow::new(
+                    context.fragment,
+                    typed_rows::decode_type_frontier(
+                        context,
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                    ),
+                ))
             },
             |visitor| {
                 super::resolution_stage::typed::visit_typed_frontier_pages(
@@ -1255,44 +1435,14 @@ impl SelectedTypedFactSource for SelectedResolutionTypedSource<'_, '_> {
         cancellation: &CancellationToken,
         visitor: &mut TypedFactPageVisitor<'_, SelectedTypedRow<LoweredTypedFrontier>>,
     ) -> StoreResult<TypedFactReadOutcome> {
-        visit_combined_typed_rows(
-            cancellation,
-            visitor,
-            |visitor| {
-                let Some(mounts) = self.local_keys_by_mount(
-                    references.as_slice(),
-                    TypedFactRelation::TypeIdentityObservationReference,
-                    cancellation,
-                )?
-                else {
-                    return cancelled();
-                };
-                self.visit_typed_rows(
-                    &mounts,
-                    typed_rows::TYPE_FRONTIERS_BY_REFERENCE_SQL,
-                    cancellation,
-                    visitor,
-                    |context, row| {
-                        Ok(SelectedTypedRow::new(
-                            context.fragment,
-                            typed_rows::decode_type_frontier(
-                                context,
-                                row.get(0)?,
-                                row.get(1)?,
-                                row.get(2)?,
-                            ),
-                        ))
-                    },
-                )
-            },
-            |visitor| {
-                super::resolution_stage::typed::visit_type_identity_observation_pages_for_references(
-                    self.selection,
-                    references,
-                    cancellation,
-                    visitor,
-                )
-            },
+        self.visit_local_and_staged_typed_rows(
+            cancellation, visitor, |source, cancellation| source.local_keys_by_mount(
+                references.as_slice(), TypedFactRelation::TypeIdentityObservationReference, cancellation,
+            ), typed_rows::TYPE_FRONTIERS_BY_REFERENCE_SQL, |context, row| {
+                Ok(SelectedTypedRow::new(context.fragment, typed_rows::decode_type_frontier(context, row.get(0)?, row.get(1)?, row.get(2)?)))
+            }, |visitor| super::resolution_stage::typed::visit_type_identity_observation_pages_for_references(
+                self.selection, references, cancellation, visitor,
+            ),
         )
     }
 
@@ -1347,12 +1497,22 @@ impl SelectedTypedFactSource for SelectedResolutionTypedSource<'_, '_> {
             }
         }
         let mut main_requests = Vec::new();
+        let mut hosts = Vec::new();
         for (host, keys) in mounts {
             let base =
                 super::resolution_stage::codec::encode_semantic(SemanticId::local(host.get(), 0));
+            hosts.push(host.get());
             for key in keys {
                 main_requests.push(serde_json::json!([host.get(), key, base]));
             }
+        }
+        // The frontier read drops the reasons the stage closed, and a
+        // derive-helper gap closes only once its declaration is decided.
+        if !self
+            .selection
+            .decide_derive_helpers_of_mounts(hosts, cancellation)?
+        {
+            return cancelled();
         }
         let main_requests =
             serde_json::to_string(&main_requests).expect("frontier main request JSON");
@@ -1371,32 +1531,24 @@ impl SelectedTypedFactSource for SelectedResolutionTypedSource<'_, '_> {
         cancellation: &CancellationToken,
         visitor: &mut TypedFactPageVisitor<'_, SelectedTypedRow<LoweredTypeTransfer>>,
     ) -> StoreResult<TypedFactReadOutcome> {
-        let Some(mounts) = self.local_keys_by_mount(
-            source_slots.as_slice(),
-            TypedFactRelation::TypeTransferSourceSlot,
-            cancellation,
-        )?
-        else {
-            return cancelled();
-        };
-        visit_combined_typed_rows(
+        self.visit_local_and_staged_typed_rows(
             cancellation,
             visitor,
-            |collector| {
-                self.visit_typed_rows(
-                    &mounts,
-                    typed_rows::TYPE_TRANSFERS_BY_SOURCE_SQL,
+            |source, cancellation| {
+                source.local_keys_by_mount(
+                    source_slots.as_slice(),
+                    TypedFactRelation::TypeTransferSourceSlot,
                     cancellation,
-                    collector,
-                    decode_transfer,
                 )
             },
-            |collector| {
+            typed_rows::TYPE_TRANSFERS_BY_SOURCE_SQL,
+            decode_transfer,
+            |visitor| {
                 super::resolution_stage::typed::visit_type_transfer_pages_from_sources(
                     self.selection,
                     source_slots,
                     cancellation,
-                    collector,
+                    visitor,
                 )
             },
         )
@@ -1408,26 +1560,18 @@ impl SelectedTypedFactSource for SelectedResolutionTypedSource<'_, '_> {
         cancellation: &CancellationToken,
         visitor: &mut TypedFactPageVisitor<'_, SelectedTypedRow<LoweredTypeTransfer>>,
     ) -> StoreResult<TypedFactReadOutcome> {
-        visit_combined_typed_rows(
+        self.visit_local_and_staged_typed_rows(
             cancellation,
             visitor,
-            |visitor| {
-                let Some(mounts) = self.local_keys_by_mount(
+            |source, cancellation| {
+                source.local_keys_by_mount(
                     target_slots.as_slice(),
                     TypedFactRelation::TypeTransferTargetSlot,
                     cancellation,
-                )?
-                else {
-                    return cancelled();
-                };
-                self.visit_typed_rows(
-                    &mounts,
-                    typed_rows::TYPE_TRANSFERS_BY_TARGET_SQL,
-                    cancellation,
-                    visitor,
-                    decode_transfer,
                 )
             },
+            typed_rows::TYPE_TRANSFERS_BY_TARGET_SQL,
+            decode_transfer,
             |visitor| {
                 super::resolution_stage::typed::visit_type_transfer_pages_to_targets(
                     self.selection,
@@ -1487,6 +1631,198 @@ impl SelectedTypedFactSource for SelectedResolutionTypedSource<'_, '_> {
         )
     }
 
+    fn visit_declared_type_argument_pages_for_owners(
+        &self,
+        owners: TypedFactRequest<'_, SemanticId>,
+        cancellation: &CancellationToken,
+        visitor: &mut TypedFactPageVisitor<'_, SelectedTypedRow<LoweredDeclaredTypeArgument>>,
+    ) -> StoreResult<TypedFactReadOutcome> {
+        let Some(mounts) = self.local_keys_by_mount(
+            owners.as_slice(),
+            TypedFactRelation::DeclaredTypeArgumentOwner,
+            cancellation,
+        )?
+        else {
+            return cancelled();
+        };
+        visit_combined_typed_rows(
+            cancellation,
+            visitor,
+            |visitor| {
+                self.visit_typed_rows(
+                    &mounts,
+                    typed_rows::DECLARED_TYPE_ARGUMENTS_BY_OWNER_SQL,
+                    cancellation,
+                    visitor,
+                    |context, row| {
+                        Ok(SelectedTypedRow::new(
+                            context.fragment,
+                            LoweredDeclaredTypeArgument::new(
+                                context.semantic(row.get(0)?),
+                                u32::try_from(row.get::<_, i64>(1)?)
+                                    .expect("declared type argument ordinal fits u32"),
+                                context.semantic(row.get(2)?),
+                            ),
+                        ))
+                    },
+                )
+            },
+            |visitor| {
+                super::resolution_stage::typed::visit_declared_type_argument_pages_for_owners(
+                    self.selection,
+                    owners,
+                    cancellation,
+                    visitor,
+                )
+            },
+        )
+    }
+
+    fn visit_type_argument_pages_for_applications(
+        &self,
+        applications: TypedFactRequest<'_, SemanticId>,
+        cancellation: &CancellationToken,
+        visitor: &mut TypedFactPageVisitor<'_, SelectedTypedRow<LoweredTypeArgument>>,
+    ) -> StoreResult<TypedFactReadOutcome> {
+        let Some(mounts) = self.local_keys_by_mount(
+            applications.as_slice(),
+            TypedFactRelation::TypeArgumentApplication,
+            cancellation,
+        )?
+        else {
+            return cancelled();
+        };
+        visit_combined_typed_rows(
+            cancellation,
+            visitor,
+            |visitor| {
+                self.visit_typed_rows(
+                    &mounts,
+                    typed_rows::TYPE_ARGUMENTS_BY_APPLICATION_SQL,
+                    cancellation,
+                    visitor,
+                    |context, row| {
+                        Ok(SelectedTypedRow::new(
+                            context.fragment,
+                            typed_rows::decode_type_argument(
+                                context,
+                                row.get(0)?,
+                                row.get(1)?,
+                                row.get(2)?,
+                                row.get(3)?,
+                                row.get(4)?,
+                            ),
+                        ))
+                    },
+                )
+            },
+            |visitor| {
+                super::resolution_stage::typed::visit_type_argument_pages_for_applications(
+                    self.selection,
+                    applications,
+                    cancellation,
+                    visitor,
+                )
+            },
+        )
+    }
+
+    fn visit_generic_type_alias_parameter_pages_for_definitions(
+        &self,
+        definitions: TypedFactRequest<'_, SemanticId>,
+        cancellation: &CancellationToken,
+        visitor: &mut TypedFactPageVisitor<'_, SelectedTypedRow<LoweredGenericTypeAliasParameter>>,
+    ) -> StoreResult<TypedFactReadOutcome> {
+        let Some(mounts) = self.local_keys_by_mount(
+            definitions.as_slice(),
+            TypedFactRelation::GenericTypeAliasDefinition,
+            cancellation,
+        )?
+        else {
+            return cancelled();
+        };
+        visit_combined_typed_rows(
+            cancellation,
+            visitor,
+            |visitor| {
+                self.visit_typed_rows(
+                    &mounts,
+                    typed_rows::GENERIC_TYPE_ALIAS_PARAMETERS_BY_ALIAS_SQL,
+                    cancellation,
+                    visitor,
+                    |context, row| {
+                        Ok(SelectedTypedRow::new(
+                            context.fragment,
+                            typed_rows::decode_generic_type_alias_parameter(
+                                context,
+                                row.get(0)?,
+                                row.get(1)?,
+                                row.get(2)?,
+                                row.get(3)?,
+                                row.get(4)?,
+                                row.get(5)?,
+                            ),
+                        ))
+                    },
+                )
+            },
+            |visitor| {
+                super::resolution_stage::typed::visit_generic_type_alias_parameter_pages_for_definitions(
+                    self.selection,
+                    definitions,
+                    cancellation,
+                    visitor,
+                )
+            },
+        )
+    }
+
+    fn visit_generic_formal_pages_for_owners(
+        &self,
+        owners: TypedFactRequest<'_, SemanticId>,
+        cancellation: &CancellationToken,
+        visitor: &mut TypedFactPageVisitor<'_, SelectedTypedRow<LoweredGenericFormal>>,
+    ) -> StoreResult<TypedFactReadOutcome> {
+        let Some(mounts) = self.local_keys_by_mount(
+            owners.as_slice(),
+            TypedFactRelation::GenericFormalOwner,
+            cancellation,
+        )?
+        else {
+            return cancelled();
+        };
+        visit_combined_typed_rows(
+            cancellation,
+            visitor,
+            |visitor| {
+                self.visit_typed_rows(
+                    &mounts,
+                    typed_rows::GENERIC_FORMALS_BY_OWNER_SQL,
+                    cancellation,
+                    visitor,
+                    |context, row| {
+                        Ok(SelectedTypedRow::new(
+                            context.fragment,
+                            LoweredGenericFormal::new(
+                                context.semantic(row.get(0)?),
+                                u32::try_from(row.get::<_, i64>(1)?)
+                                    .expect("stored generic formal ordinal fits u32"),
+                                context.semantic(row.get(2)?),
+                            ),
+                        ))
+                    },
+                )
+            },
+            |visitor| {
+                super::resolution_stage::typed::visit_generic_formal_pages_for_owners(
+                    self.selection,
+                    owners,
+                    cancellation,
+                    visitor,
+                )
+            },
+        )
+    }
     fn visit_underlying_type_pages_for_definitions(
         &self,
         definitions: TypedFactRequest<'_, SemanticId>,
@@ -1535,26 +1871,18 @@ impl SelectedTypedFactSource for SelectedResolutionTypedSource<'_, '_> {
         cancellation: &CancellationToken,
         visitor: &mut TypedFactPageVisitor<'_, SelectedTypedRow<LoweredIntrinsicSeed>>,
     ) -> StoreResult<TypedFactReadOutcome> {
-        visit_combined_typed_rows(
+        self.visit_local_and_staged_typed_rows(
             cancellation,
             visitor,
-            |visitor| {
-                let Some(mounts) = self.local_keys_by_mount(
+            |source, cancellation| {
+                source.local_keys_by_mount(
                     slots.as_slice(),
                     TypedFactRelation::IntrinsicSeedSlot,
                     cancellation,
-                )?
-                else {
-                    return cancelled();
-                };
-                self.visit_typed_rows(
-                    &mounts,
-                    typed_rows::INTRINSIC_SEEDS_BY_SLOT_SQL,
-                    cancellation,
-                    visitor,
-                    decode_intrinsic_seed,
                 )
             },
+            typed_rows::INTRINSIC_SEEDS_BY_SLOT_SQL,
+            decode_intrinsic_seed,
             |visitor| {
                 super::resolution_stage::typed::visit_intrinsic_seed_pages_for_slots(
                     self.selection,
@@ -1608,32 +1936,53 @@ impl SelectedTypedFactSource for SelectedResolutionTypedSource<'_, '_> {
         )
     }
 
+    fn visit_intrinsic_type_descriptor_pages_for_type_identities(
+        &self,
+        type_identities: TypedFactRequest<'_, SemanticId>,
+        cancellation: &CancellationToken,
+        visitor: &mut TypedFactPageVisitor<'_, SelectedTypedRow<LoweredIntrinsicTypeDescriptor>>,
+    ) -> StoreResult<TypedFactReadOutcome> {
+        self.visit_local_and_staged_typed_rows(
+            cancellation,
+            visitor,
+            |source, cancellation| {
+                source.shared_keys_by_mount(
+                    type_identities.as_slice(),
+                    TypedFactRelation::IntrinsicSeedTypeIdentity,
+                    cancellation,
+                )
+            },
+            typed_rows::INTRINSIC_TYPE_DESCRIPTORS_BY_IDENTITY_SQL,
+            decode_intrinsic_type_descriptor,
+            |visitor| {
+                super::resolution_stage::typed::visit_intrinsic_type_descriptor_pages_for_type_identities(
+                    self.selection,
+                    type_identities,
+                    cancellation,
+                    visitor,
+                )
+            },
+        )
+    }
+
     fn visit_binding_projection_pages_for_references(
         &self,
         references: TypedFactRequest<'_, SemanticId>,
         cancellation: &CancellationToken,
         visitor: &mut TypedFactPageVisitor<'_, SelectedTypedRow<LoweredBindingProjection>>,
     ) -> StoreResult<TypedFactReadOutcome> {
-        visit_combined_typed_rows(
+        self.visit_local_and_staged_typed_rows(
             cancellation,
             visitor,
-            |visitor| {
-                let Some(mounts) = self.local_keys_by_mount(
+            |source, cancellation| {
+                source.local_keys_by_mount(
                     references.as_slice(),
                     TypedFactRelation::BindingProjectionReference,
                     cancellation,
-                )?
-                else {
-                    return cancelled();
-                };
-                self.visit_typed_rows(
-                    &mounts,
-                    typed_rows::BINDING_PROJECTIONS_BY_REFERENCE_SQL,
-                    cancellation,
-                    visitor,
-                    decode_binding_projection,
                 )
             },
+            typed_rows::BINDING_PROJECTIONS_BY_REFERENCE_SQL,
+            decode_binding_projection,
             |visitor| {
                 super::resolution_stage::typed::visit_binding_projection_pages_for_references(
                     self.selection,
@@ -1651,26 +2000,18 @@ impl SelectedTypedFactSource for SelectedResolutionTypedSource<'_, '_> {
         cancellation: &CancellationToken,
         visitor: &mut TypedFactPageVisitor<'_, SelectedTypedRow<LoweredBindingProjection>>,
     ) -> StoreResult<TypedFactReadOutcome> {
-        visit_combined_typed_rows(
+        self.visit_local_and_staged_typed_rows(
             cancellation,
             visitor,
-            |visitor| {
-                let Some(mounts) = self.local_keys_by_mount(
+            |source, cancellation| {
+                source.local_keys_by_mount(
                     output_slots.as_slice(),
                     TypedFactRelation::BindingProjectionOutputSlot,
                     cancellation,
-                )?
-                else {
-                    return cancelled();
-                };
-                self.visit_typed_rows(
-                    &mounts,
-                    typed_rows::BINDING_PROJECTIONS_BY_OUTPUT_SQL,
-                    cancellation,
-                    visitor,
-                    decode_binding_projection,
                 )
             },
+            typed_rows::BINDING_PROJECTIONS_BY_OUTPUT_SQL,
+            decode_binding_projection,
             |visitor| {
                 super::resolution_stage::typed::visit_binding_projection_pages_for_outputs(
                     self.selection,
@@ -1688,26 +2029,18 @@ impl SelectedTypedFactSource for SelectedResolutionTypedSource<'_, '_> {
         cancellation: &CancellationToken,
         visitor: &mut TypedFactPageVisitor<'_, SelectedQualifiedRoute>,
     ) -> StoreResult<TypedFactReadOutcome> {
-        visit_combined_typed_rows(
+        self.visit_local_and_staged_typed_rows(
             cancellation,
             visitor,
-            |visitor| {
-                let Some(mounts) = self.local_keys_by_mount(
+            |source, cancellation| {
+                source.local_keys_by_mount(
                     references.as_slice(),
                     TypedFactRelation::QualifiedRouteReference,
                     cancellation,
-                )?
-                else {
-                    return cancelled();
-                };
-                self.visit_typed_rows(
-                    &mounts,
-                    typed_rows::QUALIFIED_ROUTES_BY_REFERENCE_SQL,
-                    cancellation,
-                    visitor,
-                    decode_qualified_route,
                 )
             },
+            typed_rows::QUALIFIED_ROUTES_BY_REFERENCE_SQL,
+            decode_qualified_route,
             |visitor| {
                 super::resolution_stage::typed::visit_qualified_route_pages_for_references(
                     self.selection,
@@ -1842,26 +2175,18 @@ impl SelectedTypedFactSource for SelectedResolutionTypedSource<'_, '_> {
         cancellation: &CancellationToken,
         visitor: &mut TypedFactPageVisitor<'_, SelectedQualifiedRoute>,
     ) -> StoreResult<TypedFactReadOutcome> {
-        visit_combined_typed_rows(
+        self.visit_local_and_staged_typed_rows(
             cancellation,
             visitor,
-            |visitor| {
-                let Some(mounts) = self.local_keys_by_mount(
+            |source, cancellation| {
+                source.local_keys_by_mount(
                     qualifier_slots.as_slice(),
                     TypedFactRelation::QualifiedRouteQualifierSlot,
                     cancellation,
-                )?
-                else {
-                    return cancelled();
-                };
-                self.visit_typed_rows(
-                    &mounts,
-                    typed_rows::QUALIFIED_ROUTES_BY_QUALIFIER_SLOT_SQL,
-                    cancellation,
-                    visitor,
-                    decode_qualified_route,
                 )
             },
+            typed_rows::QUALIFIED_ROUTES_BY_QUALIFIER_SLOT_SQL,
+            decode_qualified_route,
             |visitor| {
                 super::resolution_stage::typed::visit_qualified_route_pages_for_qualifier_slots(
                     self.selection,
@@ -1921,26 +2246,18 @@ impl SelectedTypedFactSource for SelectedResolutionTypedSource<'_, '_> {
         cancellation: &CancellationToken,
         visitor: &mut TypedFactPageVisitor<'_, SelectedQualifiedRoute>,
     ) -> StoreResult<TypedFactReadOutcome> {
-        visit_combined_typed_rows(
+        self.visit_local_and_staged_typed_rows(
             cancellation,
             visitor,
-            |visitor| {
-                let Some(mounts) = self.local_keys_by_mount(
+            |source, cancellation| {
+                source.local_keys_by_mount(
                     reasons.as_slice(),
                     TypedFactRelation::QualifiedRouteGapReason,
                     cancellation,
-                )?
-                else {
-                    return cancelled();
-                };
-                self.visit_typed_rows(
-                    &mounts,
-                    typed_rows::QUALIFIED_ROUTES_BY_GAP_REASON_SQL,
-                    cancellation,
-                    visitor,
-                    decode_qualified_route,
                 )
             },
+            typed_rows::QUALIFIED_ROUTES_BY_GAP_REASON_SQL,
+            decode_qualified_route,
             |visitor| {
                 super::resolution_stage::typed::visit_qualified_route_pages_for_gap_reasons(
                     self.selection,
@@ -1989,26 +2306,18 @@ impl SelectedTypedFactSource for SelectedResolutionTypedSource<'_, '_> {
         cancellation: &CancellationToken,
         visitor: &mut TypedFactPageVisitor<'_, SelectedTypedRow<LoweredDeclarationTypeProperty>>,
     ) -> StoreResult<TypedFactReadOutcome> {
-        visit_combined_typed_rows(
+        self.visit_local_and_staged_typed_rows(
             cancellation,
             visitor,
-            |visitor| {
-                let Some(mounts) = self.local_keys_by_mount(
+            |source, cancellation| {
+                source.local_keys_by_mount(
                     definitions.as_slice(),
                     TypedFactRelation::DeclarationTypeDefinition,
                     cancellation,
-                )?
-                else {
-                    return cancelled();
-                };
-                self.visit_typed_rows(
-                    &mounts,
-                    typed_rows::DECLARATION_TYPES_BY_DEFINITION_SQL,
-                    cancellation,
-                    visitor,
-                    decode_declaration_type,
                 )
             },
+            typed_rows::DECLARATION_TYPES_BY_DEFINITION_SQL,
+            decode_declaration_type,
             |visitor| {
                 super::resolution_stage::typed::visit_declaration_type_pages_for_definitions(
                     self.selection,
@@ -2026,26 +2335,18 @@ impl SelectedTypedFactSource for SelectedResolutionTypedSource<'_, '_> {
         cancellation: &CancellationToken,
         visitor: &mut TypedFactPageVisitor<'_, SelectedTypedRow<LoweredDeclarationTypeProperty>>,
     ) -> StoreResult<TypedFactReadOutcome> {
-        visit_combined_typed_rows(
+        self.visit_local_and_staged_typed_rows(
             cancellation,
             visitor,
-            |visitor| {
-                let Some(mounts) = self.local_keys_by_mount(
+            |source, cancellation| {
+                source.local_keys_by_mount(
                     slots.as_slice(),
                     TypedFactRelation::DeclarationTypeSlot,
                     cancellation,
-                )?
-                else {
-                    return cancelled();
-                };
-                self.visit_typed_rows(
-                    &mounts,
-                    typed_rows::DECLARATION_TYPES_BY_SLOT_SQL,
-                    cancellation,
-                    visitor,
-                    decode_declaration_type,
                 )
             },
+            typed_rows::DECLARATION_TYPES_BY_SLOT_SQL,
+            decode_declaration_type,
             |visitor| {
                 super::resolution_stage::typed::visit_declaration_type_pages_for_slots(
                     self.selection,
@@ -2118,26 +2419,18 @@ impl SelectedTypedFactSource for SelectedResolutionTypedSource<'_, '_> {
         cancellation: &CancellationToken,
         visitor: &mut TypedFactPageVisitor<'_, SelectedTypedRow<LoweredMemberScopeProperty>>,
     ) -> StoreResult<TypedFactReadOutcome> {
-        visit_combined_typed_rows(
+        self.visit_local_and_staged_typed_rows(
             cancellation,
             visitor,
-            |visitor| {
-                let Some(mounts) = self.local_keys_by_mount(
+            |source, cancellation| {
+                source.local_keys_by_mount(
                     definitions.as_slice(),
                     TypedFactRelation::MemberScopeDefinition,
                     cancellation,
-                )?
-                else {
-                    return cancelled();
-                };
-                self.visit_typed_rows(
-                    &mounts,
-                    typed_rows::MEMBER_SCOPES_BY_DEFINITION_SQL,
-                    cancellation,
-                    visitor,
-                    decode_member_scope,
                 )
             },
+            typed_rows::MEMBER_SCOPES_BY_DEFINITION_SQL,
+            decode_member_scope,
             |visitor| {
                 super::resolution_stage::typed::visit_member_scope_pages_for_definitions(
                     self.selection,
@@ -2149,27 +2442,47 @@ impl SelectedTypedFactSource for SelectedResolutionTypedSource<'_, '_> {
         )
     }
 
+    fn visit_companion_relation_pages_for_enclosing_types(
+        &self,
+        enclosing_types: TypedFactRequest<'_, SemanticId>,
+        cancellation: &CancellationToken,
+        visitor: &mut TypedFactPageVisitor<'_, SelectedTypedRow<CompanionTypeRelation>>,
+    ) -> StoreResult<TypedFactReadOutcome> {
+        self.visit_local_and_staged_typed_rows(
+            cancellation,
+            visitor,
+            |source, cancellation| {
+                source.local_keys_by_mount(
+                    enclosing_types.as_slice(),
+                    TypedFactRelation::MemberScopeDefinition,
+                    cancellation,
+                )
+            },
+            typed_rows::COMPANION_RELATIONS_BY_ENCLOSING_TYPE_SQL,
+            decode_companion_relation,
+            |visitor| {
+                let _ = visitor;
+                Ok(if cancellation.is_cancelled() {
+                    TypedFactReadOutcome::cancelled(ResolutionCompletion::Complete)
+                } else {
+                    TypedFactReadOutcome::exhausted(ResolutionCompletion::Complete)
+                })
+            },
+        )
+    }
+
     fn visit_member_scope_pages_for_heads(
         &self,
         heads: TypedFactRequest<'_, BindingNodeId>,
         cancellation: &CancellationToken,
         visitor: &mut TypedFactPageVisitor<'_, SelectedTypedRow<LoweredMemberScopeProperty>>,
     ) -> StoreResult<TypedFactReadOutcome> {
-        visit_combined_typed_rows(
+        self.visit_local_and_staged_typed_rows(
             cancellation,
             visitor,
-            |visitor| {
-                let Some(mounts) = self.node_keys_by_mount(heads.as_slice(), cancellation)? else {
-                    return cancelled();
-                };
-                self.visit_typed_rows(
-                    &mounts,
-                    typed_rows::MEMBER_SCOPES_BY_HEAD_SQL,
-                    cancellation,
-                    visitor,
-                    decode_member_scope,
-                )
-            },
+            |source, cancellation| source.node_keys_by_mount(heads.as_slice(), cancellation),
+            typed_rows::MEMBER_SCOPES_BY_HEAD_SQL,
+            decode_member_scope,
             |visitor| {
                 super::resolution_stage::typed::visit_member_scope_pages_for_heads(
                     self.selection,
@@ -2187,26 +2500,18 @@ impl SelectedTypedFactSource for SelectedResolutionTypedSource<'_, '_> {
         cancellation: &CancellationToken,
         visitor: &mut TypedFactPageVisitor<'_, SelectedTypedRow<LoweredMemberOwnerProperty>>,
     ) -> StoreResult<TypedFactReadOutcome> {
-        visit_combined_typed_rows(
+        self.visit_local_and_staged_typed_rows(
             cancellation,
             visitor,
-            |visitor| {
-                let Some(mounts) = self.local_keys_by_mount(
+            |source, cancellation| {
+                source.local_keys_by_mount(
                     definitions.as_slice(),
                     TypedFactRelation::MemberOwnerDefinition,
                     cancellation,
-                )?
-                else {
-                    return cancelled();
-                };
-                self.visit_typed_rows(
-                    &mounts,
-                    typed_rows::MEMBER_OWNERS_BY_DEFINITION_SQL,
-                    cancellation,
-                    visitor,
-                    decode_member_owner,
                 )
             },
+            typed_rows::MEMBER_OWNERS_BY_DEFINITION_SQL,
+            decode_member_owner,
             |visitor| {
                 super::resolution_stage::typed::visit_member_owner_pages_for_definitions(
                     self.selection,
@@ -2224,26 +2529,18 @@ impl SelectedTypedFactSource for SelectedResolutionTypedSource<'_, '_> {
         cancellation: &CancellationToken,
         visitor: &mut TypedFactPageVisitor<'_, SelectedTypedRow<LoweredMemberOwnerProperty>>,
     ) -> StoreResult<TypedFactReadOutcome> {
-        visit_combined_typed_rows(
+        self.visit_local_and_staged_typed_rows(
             cancellation,
             visitor,
-            |visitor| {
-                let Some(mounts) = self.local_keys_by_mount(
+            |source, cancellation| {
+                source.local_keys_by_mount(
                     owner_definitions.as_slice(),
                     TypedFactRelation::MemberOwnerOwnerDefinition,
                     cancellation,
-                )?
-                else {
-                    return cancelled();
-                };
-                self.visit_typed_rows(
-                    &mounts,
-                    typed_rows::MEMBER_OWNERS_BY_OWNER_SQL,
-                    cancellation,
-                    visitor,
-                    decode_member_owner,
                 )
             },
+            typed_rows::MEMBER_OWNERS_BY_OWNER_SQL,
+            decode_member_owner,
             |visitor| {
                 super::resolution_stage::typed::visit_member_owner_pages_for_owners(
                     self.selection,
@@ -2261,26 +2558,18 @@ impl SelectedTypedFactSource for SelectedResolutionTypedSource<'_, '_> {
         cancellation: &CancellationToken,
         visitor: &mut TypedFactPageVisitor<'_, SelectedTypedRow<LoweredDeferredMemberOwner>>,
     ) -> StoreResult<TypedFactReadOutcome> {
-        visit_combined_typed_rows(
+        self.visit_local_and_staged_typed_rows(
             cancellation,
             visitor,
-            |visitor| {
-                let Some(mounts) = self.local_keys_by_mount(
+            |source, cancellation| {
+                source.local_keys_by_mount(
                     definitions.as_slice(),
                     TypedFactRelation::DeferredMemberOwnerDefinition,
                     cancellation,
-                )?
-                else {
-                    return cancelled();
-                };
-                self.visit_typed_rows(
-                    &mounts,
-                    typed_rows::DEFERRED_MEMBER_OWNERS_BY_DEFINITION_SQL,
-                    cancellation,
-                    visitor,
-                    decode_deferred_member_owner,
                 )
             },
+            typed_rows::DEFERRED_MEMBER_OWNERS_BY_DEFINITION_SQL,
+            decode_deferred_member_owner,
             |visitor| {
                 super::resolution_stage::typed::visit_deferred_member_owner_pages_for_definitions(
                     self.selection,
@@ -2298,31 +2587,23 @@ impl SelectedTypedFactSource for SelectedResolutionTypedSource<'_, '_> {
         cancellation: &CancellationToken,
         visitor: &mut TypedFactPageVisitor<'_, SelectedTypedRow<LoweredDeferredMemberOwner>>,
     ) -> StoreResult<TypedFactReadOutcome> {
-        visit_combined_typed_rows(
+        self.visit_local_and_staged_typed_rows(
             cancellation,
             visitor,
-            |visitor| {
+            |source, cancellation| {
                 let semantics = lookups
                     .as_slice()
                     .iter()
                     .map(|lookup| lookup.lookup())
                     .collect::<Vec<_>>();
-                let Some(mounts) = self.shared_keys_by_mount(
+                source.shared_keys_by_mount(
                     &semantics,
                     TypedFactRelation::DeferredMemberOwnerLookup,
                     cancellation,
-                )?
-                else {
-                    return cancelled();
-                };
-                self.visit_typed_rows(
-                    &mounts,
-                    typed_rows::DEFERRED_MEMBER_OWNERS_BY_LOOKUP_SQL,
-                    cancellation,
-                    visitor,
-                    decode_deferred_member_owner,
                 )
             },
+            typed_rows::DEFERRED_MEMBER_OWNERS_BY_LOOKUP_SQL,
+            decode_deferred_member_owner,
             |visitor| {
                 super::resolution_stage::typed::visit_deferred_member_owner_pages_for_lookup_names(
                     self.selection,
@@ -2343,44 +2624,14 @@ impl SelectedTypedFactSource for SelectedResolutionTypedSource<'_, '_> {
             SelectedTypedRow<LoweredConstructionRequirementProperty>,
         >,
     ) -> StoreResult<TypedFactReadOutcome> {
-        visit_combined_typed_rows(
-            cancellation,
-            visitor,
-            |visitor| {
-                let Some(mounts) = self.local_keys_by_mount(
-                    definitions.as_slice(),
-                    TypedFactRelation::ConstructionRequirementDefinition,
-                    cancellation,
-                )?
-                else {
-                    return cancelled();
-                };
-                self.visit_typed_rows(
-                    &mounts,
-                    typed_rows::CONSTRUCTION_REQUIREMENTS_BY_DEFINITION_SQL,
-                    cancellation,
-                    visitor,
-                    |context, row| {
-                        Ok(SelectedTypedRow::new(
-                            context.fragment,
-                            typed_rows::decode_construction_requirement(
-                                context,
-                                row.get(0)?,
-                                row.get(1)?,
-                                row.get(2)?,
-                            ),
-                        ))
-                    },
-                )
-            },
-            |visitor| {
-                super::resolution_stage::typed::visit_construction_requirement_pages_for_definitions(
-                    self.selection,
-                    definitions,
-                    cancellation,
-                    visitor,
-                )
-            },
+        self.visit_local_and_staged_typed_rows(
+            cancellation, visitor, |source, cancellation| source.local_keys_by_mount(
+                definitions.as_slice(), TypedFactRelation::ConstructionRequirementDefinition, cancellation,
+            ), typed_rows::CONSTRUCTION_REQUIREMENTS_BY_DEFINITION_SQL, |context, row| {
+                Ok(SelectedTypedRow::new(context.fragment, typed_rows::decode_construction_requirement(context, row.get(0)?, row.get(1)?, row.get(2)?)))
+            }, |visitor| super::resolution_stage::typed::visit_construction_requirement_pages_for_definitions(
+                self.selection, definitions, cancellation, visitor,
+            ),
         )
     }
 
@@ -2390,26 +2641,18 @@ impl SelectedTypedFactSource for SelectedResolutionTypedSource<'_, '_> {
         cancellation: &CancellationToken,
         visitor: &mut TypedFactPageVisitor<'_, SelectedTypedRow<LoweredSupertypeProperty>>,
     ) -> StoreResult<TypedFactReadOutcome> {
-        visit_combined_typed_rows(
+        self.visit_local_and_staged_typed_rows(
             cancellation,
             visitor,
-            |visitor| {
-                let Some(mounts) = self.local_keys_by_mount(
+            |source, cancellation| {
+                source.local_keys_by_mount(
                     definitions.as_slice(),
                     TypedFactRelation::SupertypeDefinition,
                     cancellation,
-                )?
-                else {
-                    return cancelled();
-                };
-                self.visit_typed_rows(
-                    &mounts,
-                    typed_rows::SUPERTYPES_BY_DEFINITION_SQL,
-                    cancellation,
-                    visitor,
-                    decode_supertype,
                 )
             },
+            typed_rows::SUPERTYPES_BY_DEFINITION_SQL,
+            decode_supertype,
             |visitor| {
                 super::resolution_stage::typed::visit_supertype_pages_for_definitions(
                     self.selection,
@@ -2427,26 +2670,18 @@ impl SelectedTypedFactSource for SelectedResolutionTypedSource<'_, '_> {
         cancellation: &CancellationToken,
         visitor: &mut TypedFactPageVisitor<'_, SelectedTypedRow<LoweredSupertypeProperty>>,
     ) -> StoreResult<TypedFactReadOutcome> {
-        visit_combined_typed_rows(
+        self.visit_local_and_staged_typed_rows(
             cancellation,
             visitor,
-            |visitor| {
-                let Some(mounts) = self.local_keys_by_mount(
+            |source, cancellation| {
+                source.local_keys_by_mount(
                     references.as_slice(),
                     TypedFactRelation::SupertypeReference,
                     cancellation,
-                )?
-                else {
-                    return cancelled();
-                };
-                self.visit_typed_rows(
-                    &mounts,
-                    typed_rows::SUPERTYPES_BY_REFERENCE_SQL,
-                    cancellation,
-                    visitor,
-                    decode_supertype,
                 )
             },
+            typed_rows::SUPERTYPES_BY_REFERENCE_SQL,
+            decode_supertype,
             |visitor| {
                 super::resolution_stage::typed::visit_supertype_pages_for_references(
                     self.selection,
@@ -2464,26 +2699,18 @@ impl SelectedTypedFactSource for SelectedResolutionTypedSource<'_, '_> {
         cancellation: &CancellationToken,
         visitor: &mut TypedFactPageVisitor<'_, SelectedTypedRow<LoweredSupertypeProperty>>,
     ) -> StoreResult<TypedFactReadOutcome> {
-        visit_combined_typed_rows(
+        self.visit_local_and_staged_typed_rows(
             cancellation,
             visitor,
-            |visitor| {
-                let Some(mounts) = self.local_keys_by_mount(
+            |source, cancellation| {
+                source.local_keys_by_mount(
                     frontiers.as_slice(),
                     TypedFactRelation::SupertypeFrontier,
                     cancellation,
-                )?
-                else {
-                    return cancelled();
-                };
-                self.visit_typed_rows(
-                    &mounts,
-                    typed_rows::SUPERTYPES_BY_FRONTIER_SQL,
-                    cancellation,
-                    visitor,
-                    decode_supertype,
                 )
             },
+            typed_rows::SUPERTYPES_BY_FRONTIER_SQL,
+            decode_supertype,
             |visitor| {
                 super::resolution_stage::typed::visit_supertype_pages_for_frontiers(
                     self.selection,
@@ -2501,37 +2728,29 @@ impl SelectedTypedFactSource for SelectedResolutionTypedSource<'_, '_> {
         cancellation: &CancellationToken,
         visitor: &mut TypedFactPageVisitor<'_, SelectedTypedRow<LoweredDefinitionPropertyGap>>,
     ) -> StoreResult<TypedFactReadOutcome> {
-        visit_combined_typed_rows(
+        self.visit_local_and_staged_typed_rows(
             cancellation,
             visitor,
-            |visitor| {
-                let Some(mounts) = self.local_keys_by_mount(
+            |source, cancellation| {
+                source.local_keys_by_mount(
                     definitions.as_slice(),
                     TypedFactRelation::DefinitionPropertyGapDefinition,
                     cancellation,
-                )?
-                else {
-                    return cancelled();
-                };
-                self.visit_typed_rows(
-                    &mounts,
-                    typed_rows::DEFINITION_PROPERTY_GAPS_BY_DEFINITION_SQL,
-                    cancellation,
-                    visitor,
-                    |context, row| {
-                        Ok(SelectedTypedRow::new(
-                            context.fragment,
-                            typed_rows::decode_definition_property_gap(
-                                context,
-                                row.get(0)?,
-                                row.get(1)?,
-                                row.get(2)?,
-                                row.get(3)?,
-                                row.get(4)?,
-                            ),
-                        ))
-                    },
                 )
+            },
+            typed_rows::DEFINITION_PROPERTY_GAPS_BY_DEFINITION_SQL,
+            |context, row| {
+                Ok(SelectedTypedRow::new(
+                    context.fragment,
+                    typed_rows::decode_definition_property_gap(
+                        context,
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ),
+                ))
             },
             |visitor| {
                 super::resolution_stage::typed::visit_definition_property_gap_pages_for_definitions(
@@ -2602,34 +2821,12 @@ impl SelectedTypedFactSource for SelectedResolutionTypedSource<'_, '_> {
             SelectedTypedRow<LoweredCallApplicabilityObligation>,
         >,
     ) -> StoreResult<TypedFactReadOutcome> {
-        visit_combined_typed_rows(
-            cancellation,
-            visitor,
-            |visitor| {
-                let Some(mounts) = self.local_keys_by_mount(
-                    callee_references.as_slice(),
-                    TypedFactRelation::CallApplicabilityCalleeReference,
-                    cancellation,
-                )?
-                else {
-                    return cancelled();
-                };
-                self.visit_typed_rows(
-                    &mounts,
-                    typed_rows::CALL_OBLIGATIONS_BY_CALLEE_SQL,
-                    cancellation,
-                    visitor,
-                    decode_call_obligation,
-                )
-            },
-            |visitor| {
-                super::resolution_stage::typed::visit_call_applicability_pages_for_callee_references(
-                    self.selection,
-                    callee_references,
-                    cancellation,
-                    visitor,
-                )
-            },
+        self.visit_local_and_staged_typed_rows(
+            cancellation, visitor, |source, cancellation| source.local_keys_by_mount(
+                callee_references.as_slice(), TypedFactRelation::CallApplicabilityCalleeReference, cancellation,
+            ), typed_rows::CALL_OBLIGATIONS_BY_CALLEE_SQL, decode_call_obligation, |visitor| super::resolution_stage::typed::visit_call_applicability_pages_for_callee_references(
+                self.selection, callee_references, cancellation, visitor,
+            ),
         )
     }
 
@@ -2642,26 +2839,18 @@ impl SelectedTypedFactSource for SelectedResolutionTypedSource<'_, '_> {
             SelectedTypedRow<LoweredCallApplicabilityObligation>,
         >,
     ) -> StoreResult<TypedFactReadOutcome> {
-        visit_combined_typed_rows(
+        self.visit_local_and_staged_typed_rows(
             cancellation,
             visitor,
-            |visitor| {
-                let Some(mounts) = self.local_keys_by_mount(
+            |source, cancellation| {
+                source.local_keys_by_mount(
                     reasons.as_slice(),
                     TypedFactRelation::CallApplicabilityGapReason,
                     cancellation,
-                )?
-                else {
-                    return cancelled();
-                };
-                self.visit_typed_rows(
-                    &mounts,
-                    typed_rows::CALL_OBLIGATIONS_BY_REASON_SQL,
-                    cancellation,
-                    visitor,
-                    decode_call_obligation,
                 )
             },
+            typed_rows::CALL_OBLIGATIONS_BY_REASON_SQL,
+            decode_call_obligation,
             |visitor| {
                 super::resolution_stage::typed::visit_call_applicability_pages_for_gap_reasons(
                     self.selection,
@@ -2679,31 +2868,23 @@ impl SelectedTypedFactSource for SelectedResolutionTypedSource<'_, '_> {
         cancellation: &CancellationToken,
         visitor: &mut TypedFactPageVisitor<'_, SelectedTypedRow<LoweredCallableSignatureProperty>>,
     ) -> StoreResult<TypedFactReadOutcome> {
-        visit_combined_typed_rows(
+        self.visit_local_and_staged_typed_rows(
             cancellation,
             visitor,
-            |visitor| {
-                let Some(mounts) = self.local_keys_by_mount(
+            |source, cancellation| {
+                source.local_keys_by_mount(
                     definitions.as_slice(),
                     TypedFactRelation::CallableSignatureDefinition,
                     cancellation,
-                )?
-                else {
-                    return cancelled();
-                };
-                self.visit_typed_rows(
-                    &mounts,
-                    typed_rows::CALLABLE_SIGNATURES_BY_DEFINITION_SQL,
-                    cancellation,
-                    visitor,
-                    |context, row| {
-                        let body: String = row.get(1)?;
-                        Ok(SelectedTypedRow::new(
-                            context.fragment,
-                            typed_rows::decode_callable_signature(context, row.get(0)?, &body),
-                        ))
-                    },
                 )
+            },
+            typed_rows::CALLABLE_SIGNATURES_BY_DEFINITION_SQL,
+            |context, row| {
+                let body: String = row.get(1)?;
+                Ok(SelectedTypedRow::new(
+                    context.fragment,
+                    typed_rows::decode_callable_signature(context, row.get(0)?, &body),
+                ))
             },
             |visitor| {
                 super::resolution_stage::typed::visit_callable_signature_pages_for_definitions(
@@ -2761,6 +2942,29 @@ impl SelectedTypedFactSource for SelectedResolutionTypedSource<'_, '_> {
                     visitor,
                 )
             },
+        )
+    }
+
+    fn visit_rust_reason_owners(
+        &self,
+        reasons: TypedFactRequest<'_, SemanticId>,
+        cancellation: &CancellationToken,
+        visitor: &mut TypedFactPageVisitor<'_, (SemanticId, SemanticId)>,
+    ) -> StoreResult<TypedFactReadOutcome> {
+        let Some(mounts) = self.local_keys_by_mount(
+            reasons.as_slice(),
+            TypedFactRelation::GapReasonProvenanceReason,
+            cancellation,
+        )?
+        else {
+            return cancelled();
+        };
+        self.visit_typed_rows(
+            &mounts,
+            super::resolution_operation::rust_crate_access::REASON_OWNERS_SQL,
+            cancellation,
+            visitor,
+            |context, row| Ok((context.semantic(row.get(0)?), context.semantic(row.get(1)?))),
         )
     }
 }
@@ -2856,6 +3060,17 @@ fn decode_intrinsic_seed(
     ))
 }
 
+fn decode_intrinsic_type_descriptor(
+    context: TypedRowContext,
+    row: &Row<'_>,
+) -> StoreResult<SelectedTypedRow<LoweredIntrinsicTypeDescriptor>> {
+    let spelling: String = row.get(2)?;
+    Ok(SelectedTypedRow::new(
+        context.fragment,
+        typed_rows::decode_intrinsic_type_descriptor(context, row.get(0)?, row.get(1)?, &spelling),
+    ))
+}
+
 fn decode_binding_projection(
     context: TypedRowContext,
     row: &Row<'_>,
@@ -2916,6 +3131,16 @@ fn decode_member_scope(
     ))
 }
 
+fn decode_companion_relation(
+    context: TypedRowContext,
+    row: &Row<'_>,
+) -> StoreResult<SelectedTypedRow<CompanionTypeRelation>> {
+    Ok(SelectedTypedRow::new(
+        context.fragment,
+        CompanionTypeRelation::new(context.semantic(row.get(0)?), context.semantic(row.get(1)?)),
+    ))
+}
+
 fn decode_member_owner(
     context: TypedRowContext,
     row: &Row<'_>,
@@ -2925,13 +3150,13 @@ fn decode_member_owner(
     let compatibility: String = row.get(5)?;
     Ok(SelectedTypedRow::new(
         context.fragment,
-        LoweredMemberOwnerProperty::new(
+        typed_rows::decode_member_owner_fields(
             context.semantic(row.get(0)?),
             context.semantic(row.get(1)?),
             context.node(row.get(2)?),
-            typed_rows::member_kind_from_label(&kind),
-            typed_rows::member_access_from_label(&access),
-            typed_rows::member_qualifier_compatibility_from_label(&compatibility),
+            &kind,
+            &access,
+            &compatibility,
         ),
     ))
 }
@@ -2953,7 +3178,14 @@ fn decode_supertype(
 ) -> StoreResult<SelectedTypedRow<LoweredSupertypeProperty>> {
     Ok(SelectedTypedRow::new(
         context.fragment,
-        typed_rows::decode_supertype(context, row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?),
+        typed_rows::decode_supertype(
+            context,
+            row.get(0)?,
+            row.get(1)?,
+            row.get(2)?,
+            row.get(3)?,
+            row.get(4)?,
+        ),
     ))
 }
 
@@ -3047,6 +3279,29 @@ impl<'selection, 'store> SelectedResolutionTypedSource<'selection, 'store> {
         Ok(Some(group_keys(coordinates.into_iter())))
     }
 
+    /// Visit one request's selected local rows and matching staged rows.
+    fn visit_local_and_staged_typed_rows<T: TypedRowEvidence + Clone>(
+        &self,
+        cancellation: &CancellationToken,
+        visitor: &mut TypedFactPageVisitor<'_, T>,
+        local_mounts: impl FnOnce(&Self, &CancellationToken) -> StoreResult<Option<Vec<MountKeys>>>,
+        sql: &str,
+        decode: impl Fn(TypedRowContext, &Row<'_>) -> StoreResult<T>,
+        stage: impl FnOnce(&mut TypedFactPageVisitor<'_, T>) -> StoreResult<TypedFactReadOutcome>,
+    ) -> StoreResult<TypedFactReadOutcome> {
+        visit_combined_typed_rows(
+            cancellation,
+            visitor,
+            |visitor| {
+                let Some(mounts) = local_mounts(self, cancellation)? else {
+                    return cancelled();
+                };
+                self.visit_typed_rows(&mounts, sql, cancellation, visitor, decode)
+            },
+            stage,
+        )
+    }
+
     /// Read one typed question from rows: one statement per blob, its keys
     /// delivered as one JSON array, its rows decoded by one function and paged
     /// out in the order the statement produced them.
@@ -3061,7 +3316,7 @@ impl<'selection, 'store> SelectedResolutionTypedSource<'selection, 'store> {
         let mut evidence = PolledCompletionAccumulator::new(cancellation);
         for (ordinal, keys) in mounts {
             let mount = &*self.mount(*ordinal)?;
-            let key_array = json_integer_array(keys.iter().copied());
+            let key_array = json_array(keys.iter().copied());
             let Some(rows) = self.decode_page(
                 mount,
                 sql,
@@ -3170,6 +3425,7 @@ impl<'selection, 'store> SelectedResolutionTypedSource<'selection, 'store> {
         let context = TypedRowContext {
             fragment: mount.fragment_id(),
             ordinal: mount.ordinal().get(),
+            language: mount.semantic_language(),
             names: &names,
         };
         self.read_statement(cancellation, |conn| {
@@ -3179,7 +3435,7 @@ impl<'selection, 'store> SelectedResolutionTypedSource<'selection, 'store> {
         })
     }
 
-    fn page_out<T>(
+    pub(in crate::analyzer::store) fn page_out<T>(
         rows: &[T],
         cancellation: &CancellationToken,
         visitor: &mut TypedFactPageVisitor<'_, T>,
@@ -3204,7 +3460,7 @@ impl<'selection, 'store> SelectedResolutionTypedSource<'selection, 'store> {
     }
 }
 
-enum PageOutcome {
+pub(in crate::analyzer::store) enum PageOutcome {
     Exhausted,
     Stopped,
     Cancelled,
@@ -3232,18 +3488,6 @@ fn group_keys(coordinates: impl Iterator<Item = RequestCoordinate>) -> Vec<Mount
 
 /// One batch of integer keys as the JSON array a `json_each(?)` statement
 /// takes (milestone 6's rule, as `store/resolution_lexical.rs` states it).
-fn json_integer_array(keys: impl Iterator<Item = i64>) -> String {
-    let mut out = String::from("[");
-    for (position, key) in keys.enumerate() {
-        if position > 0 {
-            out.push(',');
-        }
-        out.push_str(&key.to_string());
-    }
-    out.push(']');
-    out
-}
-
 /// One batch of `(qualifier slot, lookup)` pairs as a JSON array of two-element
 /// arrays, which is the exact composite key the interior's index carries.
 fn json_pair_array(pairs: impl Iterator<Item = (i64, i64)>) -> String {
@@ -3335,10 +3579,12 @@ no_typed_row_evidence!(
     LoweredRustReferenceContext,
     LoweredRustDeclarationAuthority,
     LoweredTypedFrontier,
+    LoweredIntrinsicTypeDescriptor,
     LoweredBindingProjection,
     LoweredDeclarationTypeProperty,
     LoweredDeclarationVisibilityProperty,
     LoweredMemberScopeProperty,
+    CompanionTypeRelation,
     LoweredMemberOwnerProperty,
     LoweredDeferredMemberOwner,
     LoweredConstructionRequirementProperty,
@@ -3352,6 +3598,11 @@ impl TypedRowEvidence for SelectedTypedRow<LoweredTypeTransfer> {
 }
 
 impl TypedRowEvidence for SelectedTypedRow<LoweredTypeComponent> {}
+impl TypedRowEvidence for SelectedTypedRow<LoweredTypeArgument> {}
+impl TypedRowEvidence for SelectedTypedRow<LoweredGenericTypeAliasParameter> {}
+impl TypedRowEvidence for SelectedTypedRow<LoweredGenericFormal> {}
+
+impl TypedRowEvidence for SelectedTypedRow<LoweredDeclaredTypeArgument> {}
 
 impl TypedRowEvidence for SelectedTypedRow<LoweredUnderlyingType> {}
 
@@ -3362,6 +3613,7 @@ impl TypedRowEvidence for SelectedTypedRow<LoweredIntrinsicSeed> {
 }
 
 impl TypedRowEvidence for SelectedGapReasonProvenance {}
+impl TypedRowEvidence for (SemanticId, SemanticId) {}
 
 impl TypedRowEvidence for SelectedTypeFrontierCompletion {
     fn include_evidence(&self, evidence: &mut PolledCompletionAccumulator<'_>) {
@@ -3536,8 +3788,13 @@ mod row_evidence_tests {
                 Ok::<_, StoreError>((outcome, rows))
             };
             let live = CancellationToken::new();
-            let (_, before) = read(&live).unwrap();
-            assert!(!before.is_empty());
+            let before = if damage == "unrelated" {
+                let (_, before) = read(&live).unwrap();
+                assert!(!before.is_empty());
+                Some(before)
+            } else {
+                None
+            };
             match damage {
                 "withdrawn_blob" => {
                     // Sealed source requirements cannot be edited independently.
@@ -3584,7 +3841,7 @@ mod row_evidence_tests {
             if damage == "unrelated" {
                 let (outcome, after) = read(&live).unwrap();
                 assert!(outcome.is_exhausted());
-                assert_eq!(after, before);
+                assert_eq!(Some(after), before);
             } else {
                 assert!(
                     read(&live).is_err(),
@@ -3832,110 +4089,11 @@ mod row_evidence_tests {
     }
 
     #[test]
-    fn combined_typed_cancellation_keeps_an_unemitted_decode_prefix() {
-        let cancellation = CancellationToken::new();
-        let reason = ResolutionIncompleteReason::UnsupportedSemantic(SemanticId::local(0, 71));
-        let expected = ResolutionCompletion::incomplete([reason]);
-        let mut visited = false;
-        let outcome = visit_combined_typed_rows::<SelectedTypedRow<LoweredIntrinsicSeed>>(
-            &cancellation,
-            &mut TypedFactPageVisitor::new(&mut |_| {
-                visited = true;
-                Ok(true)
-            }),
-            |_| {
-                Ok(TypedFactReadOutcome::exhausted(
-                    ResolutionCompletion::Complete,
-                ))
-            },
-            |_| {
-                cancellation.cancel();
-                Ok(TypedFactReadOutcome::cancelled(expected.clone()))
-            },
-        )
-        .unwrap();
-        assert!(!visited);
-        assert_eq!(outcome, TypedFactReadOutcome::cancelled(expected));
-    }
-
-    #[test]
-    fn combined_typed_rows_keep_multiplicity_and_unemitted_stage_evidence() {
-        use brokk_bifrost_core::analyzer::usages::receiver_analysis::ReceiverAnalysisBudget;
-        use brokk_bifrost_core::analyzer::usages::resolution_session::{
-            BoundedResolution, ResolutionSession,
-        };
-        let context = TypedRowContext {
-            fragment: BindingFragmentId::for_test(b"combined-row-evidence"),
-            ordinal: 0,
-            names: crate::analyzer::resolution::test_shared_names(),
-        };
-        let ordinary = seed(context, 1);
-        let stage = seed(context, 2);
-        for stop in [false, true] {
-            let cancellation = CancellationToken::new();
-            let session = ResolutionSession::bounded(
-                ReceiverAnalysisBudget {
-                    max_scope_nodes: 3,
-                    ..ReceiverAnalysisBudget::default()
-                },
-                Some(&cancellation),
-            );
-            let mut emitted = Vec::new();
-            let outcome = visit_combined_typed_rows(
-                &cancellation,
-                &mut TypedFactPageVisitor::with_maximum_rows_in_session(
-                    &mut |page| {
-                        emitted.extend_from_slice(page);
-                        Ok(!stop)
-                    },
-                    1,
-                    &session,
-                ),
-                |collector| {
-                    assert!(collector.visit_page(&[ordinary.clone(), ordinary.clone()])?);
-                    Ok(TypedFactReadOutcome::exhausted(
-                        ResolutionCompletion::Complete,
-                    ))
-                },
-                |collector| {
-                    assert!(collector.visit_page(std::slice::from_ref(&stage))?);
-                    Ok(TypedFactReadOutcome::exhausted(
-                        ResolutionCompletion::Complete,
-                    ))
-                },
-            )
-            .unwrap();
-            let BoundedResolution::Complete { work, .. } = session.finish(()) else {
-                panic!("three emitted rows must fit the exact three-step budget");
-            };
-            assert_eq!(work.scope_nodes, if stop { 1 } else { 3 });
-            assert_eq!(work.scope_nodes, emitted.len());
-            assert_eq!(work.setup_nodes, 0);
-            assert_eq!(work.summary_expansions, 0);
-            if stop {
-                assert_eq!(emitted, vec![ordinary.clone()]);
-                let expected = ResolutionCompletion::incomplete([101, 102].map(|reason| {
-                    ResolutionIncompleteReason::UnsupportedSemantic(context.semantic(reason))
-                }));
-                assert_eq!(outcome, TypedFactReadOutcome::stopped(expected));
-            } else {
-                assert_eq!(
-                    emitted,
-                    vec![ordinary.clone(), ordinary.clone(), stage.clone()]
-                );
-                assert_eq!(
-                    outcome,
-                    TypedFactReadOutcome::exhausted(ResolutionCompletion::Complete)
-                );
-            }
-        }
-    }
-
-    #[test]
     fn row_decode_and_preloaded_stop_preserve_the_same_observed_evidence() {
         let context = TypedRowContext {
             fragment: BindingFragmentId::for_test(b"row-evidence"),
             ordinal: 0,
+            language: crate::analyzer::Language::Java,
             names: crate::analyzer::resolution::test_shared_names(),
         };
         let seed = seed(context, 1);
@@ -4030,64 +4188,6 @@ mod row_evidence_tests {
             assert_eq!(actual_rows, expected_rows);
             assert_eq!(actual.terminal(), expected.terminal());
             assert_eq!(actual.evidence(), expected.evidence());
-        }
-    }
-
-    #[test]
-    fn eager_typed_decode_retains_unemitted_rows_and_cancelled_decode_prefix() {
-        let context = TypedRowContext {
-            fragment: BindingFragmentId::for_test(b"eager-row-evidence"),
-            ordinal: 0,
-            names: crate::analyzer::resolution::test_shared_names(),
-        };
-        let seeds = (1..=3).map(|slot| seed(context, slot)).collect::<Vec<_>>();
-        let conn = Connection::open_in_memory().unwrap();
-        for cancel_at in [None, Some(2_usize)] {
-            let cancellation = CancellationToken::new();
-            let mut evidence = PolledCompletionAccumulator::new(&cancellation);
-            let mut statement = conn
-                .prepare("SELECT 0 UNION ALL SELECT 1 UNION ALL SELECT 2")
-                .unwrap();
-            let rows = decode_typed_page(
-                context,
-                &mut statement.query([]).unwrap(),
-                &cancellation,
-                &|_, row| {
-                    let index: usize = row.get(0)?;
-                    if cancel_at == Some(index + 1) {
-                        cancellation.cancel();
-                    }
-                    Ok(seeds[index].clone())
-                },
-                &mut evidence,
-            )
-            .unwrap();
-            if cancel_at.is_some() {
-                assert!(rows.is_none());
-            } else {
-                let mut emitted = 0;
-                let terminal = SelectedResolutionTypedSource::page_out(
-                    &rows.unwrap(),
-                    &cancellation,
-                    &mut TypedFactPageVisitor::with_maximum_rows(
-                        &mut |page| {
-                            emitted += page.len();
-                            Ok(false)
-                        },
-                        1,
-                    ),
-                )
-                .unwrap();
-                assert!(matches!(terminal, PageOutcome::Stopped));
-                assert_eq!(emitted, 1);
-            }
-            let count = cancel_at.unwrap_or(seeds.len());
-            let expected = ResolutionCompletion::incomplete((1..=count).map(|slot| {
-                ResolutionIncompleteReason::UnsupportedSemantic(
-                    context.semantic((slot + 100) as i64),
-                )
-            }));
-            assert_eq!(evidence.finish_semantic().0, expected);
         }
     }
 }

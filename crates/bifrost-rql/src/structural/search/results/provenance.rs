@@ -1,8 +1,9 @@
 use super::*;
+use crate::query::QueryValueKind as QueryKind;
 use schemars::JsonSchema;
 
 #[cfg_attr(feature = "query-result-fixtures", derive(Default))]
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, JsonSchema)]
 pub struct CodeQuerySourceSite {
     pub path: String,
     pub range: CodeQueryRange,
@@ -180,6 +181,12 @@ pub enum CodeQueryResultRef {
         range: CodeQueryRange,
         evidence_kind: &'static str,
     },
+    PointsToCandidate {
+        id: String,
+        site_id: String,
+        path: String,
+        range: CodeQueryRange,
+    },
     FieldWriteValue {
         id: String,
         assignment_ast_id: String,
@@ -231,6 +238,14 @@ pub enum CodeQueryResultRef {
         range: CodeQueryRange,
         ordinal: usize,
         relation: &'static str,
+    },
+    PythonHierarchyFact {
+        id: String,
+        root_id: String,
+        path: String,
+        range: CodeQueryRange,
+        fact_kind: &'static str,
+        outcome: &'static str,
     },
     CallShape {
         id: String,
@@ -385,14 +400,6 @@ pub enum CodeQueryResultRef {
         verdict: &'static str,
         proof: &'static str,
     },
-    ConcurrentAccessConflict {
-        id: String,
-        path: String,
-        range: CodeQueryRange,
-        ordering: &'static str,
-        protection: &'static str,
-        proof: &'static str,
-    },
     ClassSetRow {
         id: String,
         path: String,
@@ -433,6 +440,21 @@ pub enum CodeQueryResultRef {
         path: String,
         range: CodeQueryRange,
         role: &'static str,
+        coverage: &'static str,
+    },
+    LiteralOccurrence {
+        id: String,
+        path: String,
+        range: CodeQueryRange,
+        kind: &'static str,
+        coverage: &'static str,
+    },
+    CallableMetrics {
+        id: String,
+        callable_id: Option<String>,
+        site_id: String,
+        path: String,
+        range: CodeQueryRange,
         coverage: &'static str,
     },
     SignatureParameter {
@@ -540,6 +562,14 @@ pub enum CodeQueryResultRef {
         procedure_id: String,
         event_class: &'static str,
     },
+    BindingInitializerCall {
+        id: String,
+        establishment_event_id: String,
+        site_ast_id: String,
+        path: String,
+        range: CodeQueryRange,
+        initializer_role: &'static str,
+    },
     FlowRelation {
         id: String,
         path: String,
@@ -573,6 +603,12 @@ pub enum CodeQueryResultRef {
         loop_kind: &'static str,
         verdict: &'static str,
     },
+    CppExpression {
+        id: String,
+        path: String,
+        range: CodeQueryRange,
+        kind: &'static str,
+    },
     FailureHandlerState {
         id: String,
         path: String,
@@ -587,6 +623,28 @@ pub enum CodeQueryResultRef {
         procedure_id: String,
         statement_kind: &'static str,
         verdict: &'static str,
+    },
+    PendingCleanupFlow {
+        id: String,
+        path: String,
+        range: CodeQueryRange,
+        procedure_id: String,
+        cleanup_kind: &'static str,
+        pending_kind: &'static str,
+        verdict: &'static str,
+    },
+    PythonRuleFact {
+        id: String,
+        path: String,
+        range: CodeQueryRange,
+        relation: &'static str,
+        outcome: &'static str,
+    },
+    RustPointerFinding {
+        id: String,
+        path: String,
+        range: CodeQueryRange,
+        relation: &'static str,
     },
     Guard {
         id: String,
@@ -659,11 +717,23 @@ pub enum CodeQueryResultRef {
         fq_name: String,
         origin: &'static str,
     },
+    DependencyEvidence {
+        id: String,
+        path: String,
+    },
     ConfigurationFact {
         id: String,
         fact_id: String,
         path: String,
         range: CodeQueryRange,
+    },
+    CrossDomain {
+        id: String,
+        operator: &'static str,
+        domain: &'static str,
+        path: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        range: Option<CodeQueryRange>,
     },
 }
 
@@ -671,85 +741,98 @@ impl CodeQueryResultRef {
     /// The public wire label of this reference's family: the same
     /// `snake_case` tag its serialization carries.
     ///
-    /// Stated once here, beside the enum it describes, so no consumer
-    /// restates all 63 variant names and drifts from the wire form.
+    /// `QueryValueKind` owns the label mapping shared with query execution.
     pub const fn kind_label(&self) -> &'static str {
+        self.query_value_kind().label()
+    }
+
+    const fn query_value_kind(&self) -> QueryKind {
         match self {
-            Self::StructuralMatch { .. } => "structural_match",
-            Self::Declaration { .. } => "declaration",
-            Self::Procedure { .. } => "procedure",
-            Self::FlowEndpoint { .. } => "flow_endpoint",
-            Self::FlowWitness { .. } => "flow_witness",
-            Self::AbsentMemberWitness { .. } => "absent_member_witness",
-            Self::TaintFinding { .. } => "taint_finding",
-            Self::ProgramPoint { .. } => "program_point",
-            Self::ControlEdge { .. } => "control_edge",
-            Self::TypestateFinding { .. } => "typestate_finding",
-            Self::TypestateWitness { .. } => "typestate_witness",
-            Self::File { .. } => "file",
-            Self::ReferenceSite { .. } => "reference_site",
-            Self::CallSite { .. } => "call_site",
-            Self::ExpressionSite { .. } => "expression_site",
-            Self::JsxAttributeValue { .. } => "jsx_attribute_value",
-            Self::ReceiverAnalysis { .. } => "receiver_analysis",
-            Self::MemberTargetAnalysis { .. } => "member_target_analysis",
-            Self::ReceiverOutcome { .. } => "receiver_outcome",
-            Self::ReceiverEvidence { .. } => "receiver_evidence",
-            Self::FieldWriteValue { .. } => "field_write_value",
-            Self::RuntimeKeyedReadValue { .. } => "keyed_read_value",
-            Self::DispatchOutcome { .. } => "dispatch_outcome",
-            Self::DispatchTarget { .. } => "dispatch_target",
-            Self::MemberFamily { .. } => "member_family",
-            Self::MemberFamilyEdge { .. } => "member_family_edge",
-            Self::CallShape { .. } => "call_shape",
-            Self::CallResult { .. } => "call_result",
-            Self::ResultSubjectUse { .. } => "result_subject_use",
-            Self::CallArgumentGroup { .. } => "call_argument_group",
-            Self::CallArgument { .. } => "call_argument",
-            Self::CallBinding { .. } => "call_binding",
-            Self::CallEffect { .. } => "call_effect",
-            Self::CallResultContract { .. } => "call_result_contract",
-            Self::CallResultObligation { .. } => "call_result_obligation",
-            Self::ResultContractUse { .. } => "result_contract_use",
-            Self::ResultContractFailureUse { .. } => "result_contract_failure_use",
-            Self::NilnessOperation { .. } => "nilness_operation",
-            Self::SwitchCoverage { .. } => "switch_coverage",
-            Self::AssignmentRelation { .. } => "assignment_relation",
-            Self::ConcurrentAccessConflict { .. } => "concurrent_access_conflict",
-            Self::ClassSetRow { .. } => "class_set_row",
-            Self::AbsentMemberFinding { .. } => "absent_member_finding",
-            Self::DetachedTaskTransfer { .. } => "detached_task_transfer",
-            Self::ProcedureEffect { .. } => "procedure_effect",
-            Self::CallableSignature { .. } => "callable_signature",
-            Self::SignatureParameter { .. } => "signature_parameter",
-            Self::DecoratedParameter { .. } => "decorated_parameter",
-            Self::CallableApplicability { .. } => "callable_applicability",
-            Self::OverloadSelection { .. } => "overload_selection",
-            Self::MemberSelection { .. } => "member_selection",
-            Self::Occurrence { .. } => "occurrence",
-            Self::LexicalScope { .. } => "lexical_scope",
-            Self::Binding { .. } => "binding",
-            Self::ResolutionCandidate { .. } => "resolution_candidate",
-            Self::CandidateHop { .. } => "candidate_hop",
-            Self::ReferenceEdge { .. } => "reference_edge",
-            Self::StateEvent { .. } => "state_event",
-            Self::FlowRelation { .. } => "flow_relation",
-            Self::ControlRelation { .. } => "control_relation",
-            Self::BranchRelation { .. } => "branch_relation",
-            Self::LoopRelation { .. } => "loop_relation",
-            Self::FailureHandlerState { .. } => "failure_handler_state",
-            Self::StatementReachability { .. } => "statement_reachability",
-            Self::Guard { .. } => "guard",
-            Self::RewritePath { .. } => "rewrite_path",
-            Self::SourceSet { .. } => "source_set",
-            Self::BuildTarget { .. } => "build_target",
-            Self::TopologyEdge { .. } => "topology_edge",
-            Self::QualifiedPath { .. } => "qualified_path",
-            Self::PathSegment { .. } => "path_segment",
-            Self::GenerationSite { .. } => "generation_site",
-            Self::Export { .. } => "export",
-            Self::DeclarationState { .. } => "declaration_state",
-            Self::ConfigurationFact { .. } => "configuration_fact",
+            Self::StructuralMatch { .. } => QueryKind::StructuralMatch,
+            Self::Declaration { .. } => QueryKind::Declaration,
+            Self::Procedure { .. } => QueryKind::Procedure,
+            Self::FlowEndpoint { .. } => QueryKind::FlowEndpoint,
+            Self::FlowWitness { .. } => QueryKind::FlowWitness,
+            Self::AbsentMemberWitness { .. } => QueryKind::AbsentMemberWitness,
+            Self::TaintFinding { .. } => QueryKind::TaintFinding,
+            Self::ProgramPoint { .. } => QueryKind::ProgramPoint,
+            Self::ControlEdge { .. } => QueryKind::ControlEdge,
+            Self::TypestateFinding { .. } => QueryKind::TypestateFinding,
+            Self::TypestateWitness { .. } => QueryKind::TypestateWitness,
+            Self::File { .. } => QueryKind::File,
+            Self::ReferenceSite { .. } => QueryKind::ReferenceSite,
+            Self::CallSite { .. } => QueryKind::CallSite,
+            Self::ExpressionSite { .. } => QueryKind::ExpressionSite,
+            Self::JsxAttributeValue { .. } => QueryKind::JsxAttributeValue,
+            Self::ReceiverAnalysis { .. } => QueryKind::ReceiverAnalysis,
+            Self::MemberTargetAnalysis { .. } => QueryKind::MemberTargetAnalysis,
+            Self::ReceiverOutcome { .. } => QueryKind::ReceiverOutcome,
+            Self::ReceiverEvidence { .. } => QueryKind::ReceiverEvidence,
+            Self::PointsToCandidate { .. } => QueryKind::PointsToCandidate,
+            Self::FieldWriteValue { .. } => QueryKind::FieldWriteValue,
+            Self::RuntimeKeyedReadValue { .. } => QueryKind::KeyedReadValue,
+            Self::DispatchOutcome { .. } => QueryKind::DispatchOutcome,
+            Self::DispatchTarget { .. } => QueryKind::DispatchTarget,
+            Self::MemberFamily { .. } => QueryKind::MemberFamily,
+            Self::MemberFamilyEdge { .. } => QueryKind::MemberFamilyEdge,
+            Self::PythonHierarchyFact { .. } => QueryKind::PythonHierarchyFact,
+            Self::CallShape { .. } => QueryKind::CallShape,
+            Self::CallResult { .. } => QueryKind::CallResult,
+            Self::ResultSubjectUse { .. } => QueryKind::ResultSubjectUse,
+            Self::CallArgumentGroup { .. } => QueryKind::CallArgumentGroup,
+            Self::CallArgument { .. } => QueryKind::CallArgument,
+            Self::CallBinding { .. } => QueryKind::CallBinding,
+            Self::CallEffect { .. } => QueryKind::CallEffect,
+            Self::CallResultContract { .. } => QueryKind::CallResultContract,
+            Self::CallResultObligation { .. } => QueryKind::CallResultObligation,
+            Self::ResultContractUse { .. } => QueryKind::ResultContractUse,
+            Self::ResultContractFailureUse { .. } => QueryKind::ResultContractFailureUse,
+            Self::NilnessOperation { .. } => QueryKind::NilnessOperation,
+            Self::SwitchCoverage { .. } => QueryKind::SwitchCoverage,
+            Self::AssignmentRelation { .. } => QueryKind::AssignmentRelation,
+            Self::ClassSetRow { .. } => QueryKind::ClassSetRow,
+            Self::AbsentMemberFinding { .. } => QueryKind::AbsentMemberFinding,
+            Self::DetachedTaskTransfer { .. } => QueryKind::DetachedTaskTransfer,
+            Self::ProcedureEffect { .. } => QueryKind::ProcedureEffect,
+            Self::CallableSignature { .. } => QueryKind::CallableSignature,
+            Self::LiteralOccurrence { .. } => QueryKind::LiteralOccurrence,
+            Self::CallableMetrics { .. } => QueryKind::CallableMetrics,
+            Self::SignatureParameter { .. } => QueryKind::SignatureParameter,
+            Self::DecoratedParameter { .. } => QueryKind::DecoratedParameter,
+            Self::CallableApplicability { .. } => QueryKind::CallableApplicability,
+            Self::OverloadSelection { .. } => QueryKind::OverloadSelection,
+            Self::MemberSelection { .. } => QueryKind::MemberSelection,
+            Self::Occurrence { .. } => QueryKind::Occurrence,
+            Self::LexicalScope { .. } => QueryKind::LexicalScope,
+            Self::Binding { .. } => QueryKind::Binding,
+            Self::ResolutionCandidate { .. } => QueryKind::ResolutionCandidate,
+            Self::CandidateHop { .. } => QueryKind::CandidateHop,
+            Self::ReferenceEdge { .. } => QueryKind::ReferenceEdge,
+            Self::StateEvent { .. } => QueryKind::StateEvent,
+            Self::BindingInitializerCall { .. } => QueryKind::BindingInitializerCall,
+            Self::FlowRelation { .. } => QueryKind::FlowRelation,
+            Self::ControlRelation { .. } => QueryKind::ControlRelation,
+            Self::BranchRelation { .. } => QueryKind::BranchRelation,
+            Self::LoopRelation { .. } => QueryKind::LoopRelation,
+            Self::CppExpression { .. } => QueryKind::CppExpression,
+            Self::FailureHandlerState { .. } => QueryKind::FailureHandlerState,
+            Self::StatementReachability { .. } => QueryKind::StatementReachability,
+            Self::PendingCleanupFlow { .. } => QueryKind::PendingCleanupFlow,
+            Self::PythonRuleFact { .. } => QueryKind::PythonRuleFact,
+            Self::RustPointerFinding { .. } => QueryKind::RustPointerFinding,
+            Self::Guard { .. } => QueryKind::Guard,
+            Self::RewritePath { .. } => QueryKind::RewritePath,
+            Self::SourceSet { .. } => QueryKind::SourceSet,
+            Self::BuildTarget { .. } => QueryKind::BuildTarget,
+            Self::TopologyEdge { .. } => QueryKind::TopologyEdge,
+            Self::QualifiedPath { .. } => QueryKind::QualifiedPath,
+            Self::PathSegment { .. } => QueryKind::PathSegment,
+            Self::GenerationSite { .. } => QueryKind::GenerationSite,
+            Self::Export { .. } => QueryKind::Export,
+            Self::DeclarationState { .. } => QueryKind::DeclarationState,
+            Self::DependencyEvidence { .. } => QueryKind::DependencyEvidence,
+            Self::ConfigurationFact { .. } => QueryKind::ConfigurationFact,
+            Self::CrossDomain { .. } => QueryKind::CrossDomain,
         }
     }
 
@@ -778,12 +861,14 @@ impl CodeQueryResultRef {
             | Self::MemberTargetAnalysis { path, .. }
             | Self::ReceiverOutcome { path, .. }
             | Self::ReceiverEvidence { path, .. }
+            | Self::PointsToCandidate { path, .. }
             | Self::FieldWriteValue { path, .. }
             | Self::RuntimeKeyedReadValue { path, .. }
             | Self::DispatchOutcome { path, .. }
             | Self::DispatchTarget { path, .. }
             | Self::MemberFamily { path, .. }
             | Self::MemberFamilyEdge { path, .. }
+            | Self::PythonHierarchyFact { path, .. }
             | Self::CallShape { path, .. }
             | Self::CallResult { path, .. }
             | Self::ResultSubjectUse { path, .. }
@@ -798,12 +883,13 @@ impl CodeQueryResultRef {
             | Self::NilnessOperation { path, .. }
             | Self::SwitchCoverage { path, .. }
             | Self::AssignmentRelation { path, .. }
-            | Self::ConcurrentAccessConflict { path, .. }
             | Self::ClassSetRow { path, .. }
             | Self::AbsentMemberFinding { path, .. }
             | Self::DetachedTaskTransfer { path, .. }
             | Self::ProcedureEffect { path, .. }
             | Self::CallableSignature { path, .. }
+            | Self::LiteralOccurrence { path, .. }
+            | Self::CallableMetrics { path, .. }
             | Self::SignatureParameter { path, .. }
             | Self::DecoratedParameter { path, .. }
             | Self::CallableApplicability { path, .. }
@@ -816,12 +902,17 @@ impl CodeQueryResultRef {
             | Self::CandidateHop { path, .. }
             | Self::ReferenceEdge { path, .. }
             | Self::StateEvent { path, .. }
+            | Self::BindingInitializerCall { path, .. }
             | Self::FlowRelation { path, .. }
             | Self::ControlRelation { path, .. }
             | Self::BranchRelation { path, .. }
             | Self::LoopRelation { path, .. }
+            | Self::CppExpression { path, .. }
             | Self::FailureHandlerState { path, .. }
             | Self::StatementReachability { path, .. }
+            | Self::PendingCleanupFlow { path, .. }
+            | Self::PythonRuleFact { path, .. }
+            | Self::RustPointerFinding { path, .. }
             | Self::Guard { path, .. }
             | Self::RewritePath { path, .. }
             | Self::SourceSet { path, .. }
@@ -832,7 +923,9 @@ impl CodeQueryResultRef {
             | Self::GenerationSite { path, .. }
             | Self::Export { path, .. }
             | Self::DeclarationState { path, .. }
-            | Self::ConfigurationFact { path, .. } => path,
+            | Self::DependencyEvidence { path, .. }
+            | Self::ConfigurationFact { path, .. }
+            | Self::CrossDomain { path, .. } => path,
         }
     }
 }
@@ -854,7 +947,9 @@ pub struct CodeQueryCapture {
 }
 
 #[cfg_attr(feature = "query-result-fixtures", derive(Default))]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, JsonSchema,
+)]
 pub struct CodeQueryRange {
     pub start_line: usize,
     pub start_column: usize,

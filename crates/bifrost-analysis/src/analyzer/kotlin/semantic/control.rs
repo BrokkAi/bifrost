@@ -1,3 +1,5 @@
+use crate::analyzer::semantic::lowering::schedule_sequential_work;
+
 use super::syntax::*;
 use super::values::KotlinConstructionProof;
 use super::*;
@@ -44,6 +46,8 @@ pub(super) fn lower_procedure<'tree, 'targets>(
         expression_values: HashMap::default(),
         parameters: HashMap::default(),
         locals: HashMap::default(),
+        scalar_types: HashMap::default(),
+        mutable_locals: HashSet::default(),
         delegated_locals: HashSet::default(),
         local_callables: HashMap::default(),
         constructible_types,
@@ -423,11 +427,11 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
     /// Publish one normalized guard fact for a decision the condition lowering
     /// just made.
     ///
-    /// Only a constant boolean is normalized today. Everything else this
-    /// lowerer decides is recorded `Opaque` rather than guessed, so an absent
-    /// guard row means the condition lowering made no decision at that point
-    /// at all -- which is what makes the [`SemanticCapability::GuardFacts`]
-    /// entry readable.
+    /// Literal booleans, typed primitive truth tests, and typed primitive
+    /// comparisons are normalized. Everything else this lowerer decides is
+    /// recorded `Opaque` rather than guessed, so an absent guard row means the
+    /// condition lowering made no decision at that point at all -- which is
+    /// what makes the [`SemanticCapability::GuardFacts`] entry readable.
     fn record_guard(
         &mut self,
         builder: &mut ProcedureCfgBuilder,
@@ -442,8 +446,8 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 kind: target.kind,
             })
         };
-        let (predicate, subject) = match self.normalize_condition(condition) {
-            Some(predicate) => (predicate, None),
+        let (predicate, subject) = match self.normalize_condition(builder, condition)? {
+            Some(normalized) => normalized,
             None => (
                 GuardPredicate::Opaque {
                     digest: GuardConditionDigest::from_syntax_kind(condition.kind()),
@@ -476,23 +480,142 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
     /// decision of its own. [`Self::condition`] already peels both by
     /// recursion, so this loop only matters on the fallback paths that reach
     /// [`Self::opaque_condition`] with a wrapper still attached.
-    fn normalize_condition(&self, condition: Node<'tree>) -> Option<GuardPredicate> {
+    fn normalize_condition(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        condition: Node<'tree>,
+    ) -> Result<Option<(GuardPredicate, Option<ValueId>)>, KotlinLoweringError> {
         let mut cursor = condition;
         let mut negated = false;
         loop {
             match cursor.kind() {
-                "parenthesized_expression" => cursor = first_named_child(cursor)?,
+                "parenthesized_expression" => {
+                    let Some(inner) = first_named_child(cursor) else {
+                        return Ok(None);
+                    };
+                    cursor = inner;
+                }
                 "prefix_expression" if has_token(cursor, "!") => {
                     negated = !negated;
-                    cursor = unary_operand(cursor)?;
+                    let Some(inner) = unary_operand(cursor) else {
+                        return Ok(None);
+                    };
+                    cursor = inner;
                 }
                 _ => break,
             }
         }
-        let value = boolean_literal_value(self.prepared.source(), cursor)?;
-        Some(GuardPredicate::ConstantBoolean {
-            value: value != negated,
-        })
+        let source = self.prepared.source();
+        if let Some(value) = boolean_literal_value(source, cursor) {
+            return Ok(Some((
+                GuardPredicate::ConstantBoolean {
+                    value: value != negated,
+                },
+                None,
+            )));
+        }
+        if self.scalar_type(cursor) == Some(KotlinScalarType::Boolean) {
+            let value = self.expression_value(builder, cursor, expression_value_kind(cursor))?;
+            return Ok(Some((GuardPredicate::Truthy { value }, Some(value))));
+        }
+        if !matches!(
+            cursor.kind(),
+            "comparison_expression" | "equality_expression"
+        ) {
+            return Ok(None);
+        }
+        let operands = binary_operands(cursor);
+        let (Some(left), Some(right)) = (operands.first().copied(), operands.get(1).copied())
+        else {
+            return Ok(None);
+        };
+        let Some(operator) = first_token(cursor) else {
+            return Ok(None);
+        };
+
+        // A scalar compared with itself has no user-defined dispatch. Double
+        // and other floating-point values have no scalar binding fact here.
+        if let (Some(left_value), Some(right_value)) =
+            (self.bound_value(left), self.bound_value(right))
+            && left_value == right_value
+            && self.scalar_type(left).is_some()
+        {
+            let value = match operator {
+                "<" | ">" => false,
+                "<=" | ">=" | "==" => true,
+                "!=" => false,
+                _ => return Ok(None),
+            };
+            let subject = self.expression_value(builder, left, expression_value_kind(left))?;
+            return Ok(Some((
+                GuardPredicate::ConstantBoolean {
+                    value: value != negated,
+                },
+                Some(subject),
+            )));
+        }
+
+        let left_integer = kotlin_decimal_integer_value(left, source).is_some();
+        let right_integer = kotlin_decimal_integer_value(right, source).is_some();
+        let left_boolean = boolean_literal_value(source, left).is_some();
+        let right_boolean = boolean_literal_value(source, right).is_some();
+        let (subject, constant, reversed) = match (left_integer, right_integer) {
+            (false, true) => (left, right, false),
+            (true, false) => (right, left, true),
+            _ if !left_integer && right_boolean => (left, right, false),
+            _ if left_boolean && !right_boolean => (right, left, true),
+            _ => return Ok(None),
+        };
+        let Some(subject_type) = self.scalar_type(subject) else {
+            return Ok(None);
+        };
+        let value = self.expression_value(builder, constant, expression_value_kind(constant))?;
+        let predicate = if boolean_literal_value(source, constant).is_some() {
+            if subject_type != KotlinScalarType::Boolean || !matches!(operator, "==" | "!=") {
+                return Ok(None);
+            }
+            GuardPredicate::ConstantEquality {
+                negated: (operator == "!=") != negated,
+                constant: value,
+            }
+        } else if kotlin_decimal_integer_value(constant, source).is_some() {
+            if !matches!(
+                subject_type,
+                KotlinScalarType::Int
+                    | KotlinScalarType::Long
+                    | KotlinScalarType::Short
+                    | KotlinScalarType::Byte
+            ) {
+                return Ok(None);
+            }
+            if matches!(operator, "==" | "!=") {
+                GuardPredicate::ConstantEquality {
+                    negated: (operator == "!=") != negated,
+                    constant: value,
+                }
+            } else {
+                let relation = match operator {
+                    "<" => IntegerComparison::LessThan,
+                    "<=" => IntegerComparison::LessThanOrEqual,
+                    ">" => IntegerComparison::GreaterThan,
+                    ">=" => IntegerComparison::GreaterThanOrEqual,
+                    _ => return Ok(None),
+                };
+                let relation = if reversed {
+                    relation.reverse()
+                } else {
+                    relation
+                };
+                GuardPredicate::OrderedIntegerComparison {
+                    relation: if negated { relation.negate() } else { relation },
+                    constant: value,
+                }
+            }
+        } else {
+            return Ok(None);
+        };
+        let subject = self.expression_value(builder, subject, expression_value_kind(subject))?;
+        Ok(Some((predicate, Some(subject))))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -591,6 +714,17 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             "when_expression" => self.when_expression(builder, node, entry, next, scope, stack),
             "try_expression" => self.try_expression(builder, node, entry, next, scope, stack),
             "elvis_expression" => self.elvis(builder, node, entry, next, scope, stack),
+            "prefix_expression" if is_integer_update(node) => {
+                self.integer_update(builder, node, entry, next, scope, stack)
+            }
+            "prefix_expression"
+                if kotlin_decimal_integer_value(node, self.prepared.source()).is_some() =>
+            {
+                let Some(operand) = unary_operand(node) else {
+                    return self.edge(builder, entry, next);
+                };
+                self.schedule_expressions(builder, entry, &[operand], next, scope, stack)
+            }
             "postfix_expression" => self.postfix(builder, node, entry, next, scope, stack),
             "jump_expression" => self.jump(builder, node, entry, next, scope, stack),
             "lambda_literal" | "anonymous_function" => {
@@ -745,15 +879,17 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         scope: ScopeFrameId,
         stack: &mut Vec<Work<'tree>>,
     ) -> Result<(), KotlinLoweringError> {
-        if is_operator_convention(node) {
-            self.add_gap(
-                builder,
-                entry,
-                SemanticGapSubject::Point,
-                SemanticCapability::Calls,
-                SemanticGapKind::Unsupported,
-                "infix and operator-convention calls are not yet call sites",
-            )?;
+        if is_operator_convention(node, self.prepared.source()) {
+            if !self.is_supported_scalar_operation(node) {
+                self.add_gap(
+                    builder,
+                    entry,
+                    SemanticGapSubject::Point,
+                    SemanticCapability::Calls,
+                    SemanticGapKind::Unsupported,
+                    "infix and operator-convention calls are not yet call sites",
+                )?;
+            }
         } else if !is_structured_operation(node.kind()) {
             let detail = format!(
                 "{} runtime/control syntax is not yet lowered structurally",
@@ -877,6 +1013,76 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         Ok(())
     }
 
+    fn is_supported_scalar_operation(&self, node: Node<'tree>) -> bool {
+        if !matches!(node.kind(), "comparison_expression" | "equality_expression") {
+            return false;
+        }
+        let operands = binary_operands(node);
+        let (Some(left), Some(right)) = (operands.first().copied(), operands.get(1).copied())
+        else {
+            return false;
+        };
+        let Some(operator) = first_token(node) else {
+            return false;
+        };
+        if !matches!(operator, "<" | "<=" | ">" | ">=" | "==" | "!=") {
+            return false;
+        }
+        if self
+            .bound_value(left)
+            .zip(self.bound_value(right))
+            .is_some_and(|(left_value, right_value)| {
+                left_value == right_value && self.scalar_type(left).is_some()
+            })
+        {
+            return true;
+        }
+        let source = self.prepared.source();
+        let left_literal = kotlin_decimal_integer_value(left, source).is_some()
+            || boolean_literal_value(source, left).is_some();
+        let right_literal = kotlin_decimal_integer_value(right, source).is_some()
+            || boolean_literal_value(source, right).is_some();
+        let subject = match (left_literal, right_literal) {
+            (false, true) => left,
+            (true, false) => right,
+            _ => return false,
+        };
+        let Some(scalar) = self.scalar_type(subject) else {
+            return false;
+        };
+        (boolean_literal_value(source, if left_literal { left } else { right }).is_some()
+            && scalar == KotlinScalarType::Boolean
+            && matches!(operator, "==" | "!="))
+            || (kotlin_decimal_integer_value(if left_literal { left } else { right }, source)
+                .is_some()
+                && is_kotlin_integral_type(scalar))
+    }
+
+    fn compound_integer_offset(
+        &self,
+        target_node: Node<'tree>,
+        value_node: Node<'tree>,
+        assignment: Node<'tree>,
+    ) -> Option<SignedIntegerMagnitude> {
+        let AssignmentTarget::Name(name) = assignment_target(target_node) else {
+            return None;
+        };
+        let target = self.bound_value(name)?;
+        if self.delegated_locals.contains(&target)
+            || !self.scalar_type(name).is_some_and(is_kotlin_integral_type)
+        {
+            return None;
+        }
+        let value = kotlin_decimal_integer_value(value_node, self.prepared.source())?;
+        let magnitude = value.unsigned_abs();
+        let negative = match first_token(assignment) {
+            Some("+=") => value < 0,
+            Some("-=") => value >= 0,
+            _ => return None,
+        };
+        Some(SignedIntegerMagnitude::new(negative, magnitude))
+    }
+
     fn assignment(
         &mut self,
         builder: &mut ProcedureCfgBuilder,
@@ -900,15 +1106,11 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         // operator convention, and (for `op`) writes the result back. The
         // read happens before the write whichever convention resolves.
         let compound = is_compound_assignment(node);
+        let compound_offset = compound
+            .then(|| self.compound_integer_offset(target_node, value_node, node))
+            .flatten();
+        let compound_gap = compound && compound_offset.is_none();
         let value = if compound {
-            self.add_gap(
-                builder,
-                terminal,
-                SemanticGapSubject::Point,
-                SemanticCapability::Calls,
-                SemanticGapKind::Unsupported,
-                "compound assignment resolves through an operator convention (op or opAssign), which is not yet a call site",
-            )?;
             // A simple name is read as itself; a member or index target is
             // read through its unlowered assignable expression.
             let read = match assignment_target(target_node) {
@@ -917,12 +1119,24 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             };
             let current = self.expression_value(builder, read, expression_value_kind(read))?;
             let result = self.value(builder, terminal, SemanticValueKind::Temporary)?;
-            self.session.append_language_defined_value_flows(
-                builder,
-                terminal,
-                [current, operand],
-                result,
-            )?;
+            if let Some(offset) = compound_offset {
+                self.append_effect(
+                    builder,
+                    terminal,
+                    SemanticEffect::ValueFlow {
+                        kind: ValueFlowKind::IntegerOffset { offset },
+                        source: current,
+                        target: result,
+                    },
+                )?;
+            } else {
+                self.session.append_language_defined_value_flows(
+                    builder,
+                    terminal,
+                    [current, operand],
+                    result,
+                )?;
+            }
             evaluations.push(read);
             result
         } else {
@@ -930,19 +1144,26 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         };
         match assignment_target(target_node) {
             AssignmentTarget::Name(name) => {
+                let mut calls_gap_recorded = false;
                 if let Some(text) = node_text(self.prepared.source(), name) {
                     let local = self.local_at(text, name.start_byte());
                     let target = local.or_else(|| self.parameters.get(text).copied());
                     if let Some(target) = target {
                         if self.delegated_locals.contains(&target) {
+                            let detail = if compound_gap {
+                                "compound assignment and delegated local assignment resolve through operator (op or opAssign) and delegate setValue conventions, which are not yet call sites"
+                            } else {
+                                "assigning a delegated local calls the delegate's setValue, which is not yet a call site"
+                            };
                             self.add_gap(
                                 builder,
                                 terminal,
                                 SemanticGapSubject::Point,
                                 SemanticCapability::Calls,
                                 SemanticGapKind::Unsupported,
-                                "assigning a delegated local calls the delegate's setValue, which is not yet a call site",
+                                detail,
                             )?;
+                            calls_gap_recorded = true;
                         }
                         let kind = if local.is_some() {
                             ValueFlowKind::Local
@@ -955,8 +1176,28 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                         )?;
                     }
                 }
+                if compound_gap && !calls_gap_recorded {
+                    self.add_gap(
+                        builder,
+                        terminal,
+                        SemanticGapSubject::Point,
+                        SemanticCapability::Calls,
+                        SemanticGapKind::Unsupported,
+                        "compound assignment resolves through an operator convention (op or opAssign), which is not yet a call site",
+                    )?;
+                }
             }
             AssignmentTarget::Field { base, member } => {
+                if compound_gap {
+                    self.add_gap(
+                        builder,
+                        terminal,
+                        SemanticGapSubject::Point,
+                        SemanticCapability::Calls,
+                        SemanticGapKind::Unsupported,
+                        "compound assignment resolves through an operator convention (op or opAssign), which is not yet a call site",
+                    )?;
+                }
                 let base_value =
                     self.expression_value(builder, base, expression_value_kind(base))?;
                 let location = self.session.add_memory_location(
@@ -982,6 +1223,11 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 evaluations.push(base);
             }
             AssignmentTarget::Index { base, index } => {
+                let detail = if compound_gap {
+                    "compound indexed assignment resolves through both the operator (op or opAssign) and indexed set conventions, which are not yet call sites"
+                } else {
+                    "indexed assignment resolves through the `set` operator convention, which is not yet a call site"
+                };
                 let base_value =
                     self.expression_value(builder, base, expression_value_kind(base))?;
                 let index_value = index
@@ -1005,7 +1251,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                     SemanticGapSubject::Point,
                     SemanticCapability::Calls,
                     SemanticGapKind::Unsupported,
-                    "indexed assignment resolves through the `set` operator convention, which is not yet a call site",
+                    detail,
                 )?;
                 self.append_effect(
                     builder,
@@ -1019,7 +1265,19 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 evaluations.push(base);
                 evaluations.extend(index);
             }
-            AssignmentTarget::Opaque(target) => evaluations.push(target),
+            AssignmentTarget::Opaque(target) => {
+                if compound_gap {
+                    self.add_gap(
+                        builder,
+                        terminal,
+                        SemanticGapSubject::Point,
+                        SemanticCapability::Calls,
+                        SemanticGapKind::Unsupported,
+                        "compound assignment resolves through an operator convention (op or opAssign), which is not yet a call site",
+                    )?;
+                }
+                evaluations.push(target);
+            }
         }
         evaluations.push(value_node);
         self.edge(builder, terminal, next)?;
@@ -1734,7 +1992,86 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         Ok(())
     }
 
-    /// `a!!` completes normally or raises, and `a++`/`a--` are operator calls.
+    /// Lower `x++` and `x--` when the operand is a proven Kotlin integral
+    /// binding. The scalar consumer applies the offset in the binding domain,
+    /// so a JVM overflow becomes unknown instead of wrapping into a proof.
+    fn integer_update(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        node: Node<'tree>,
+        entry: ProgramPointId,
+        next: EdgeTarget,
+        scope: ScopeFrameId,
+        stack: &mut Vec<Work<'tree>>,
+    ) -> Result<(), KotlinLoweringError> {
+        let Some(operand) = unary_operand(node) else {
+            return self.opaque_operation(builder, node, entry, next, scope, stack);
+        };
+        let Some(target) = self.bound_value(operand).filter(|_| {
+            self.scalar_type(operand)
+                .is_some_and(is_kotlin_integral_type)
+        }) else {
+            return self.opaque_operation(builder, node, entry, next, scope, stack);
+        };
+        let operation = self.point(builder, node, Vec::new())?;
+        let terminal = self.point(builder, node, Vec::new())?;
+        let old = self.expression_value(builder, operand, expression_value_kind(operand))?;
+        let computed = self.value(builder, terminal, SemanticValueKind::Temporary)?;
+        let offset = SignedIntegerMagnitude::new(has_token(node, "--"), 1);
+        self.append_effect(
+            builder,
+            terminal,
+            SemanticEffect::ValueFlow {
+                kind: ValueFlowKind::IntegerOffset { offset },
+                source: old,
+                target: computed,
+            },
+        )?;
+        let result = self.expression_value(builder, node, expression_value_kind(node))?;
+        let returned = if node.kind() == "prefix_expression" {
+            computed
+        } else {
+            old
+        };
+        self.append_effect(
+            builder,
+            terminal,
+            SemanticEffect::Assignment {
+                target: result,
+                value: returned,
+            },
+        )?;
+        self.append_effect(
+            builder,
+            terminal,
+            SemanticEffect::Assignment {
+                target,
+                value: computed,
+            },
+        )?;
+        self.append_effect(
+            builder,
+            terminal,
+            SemanticEffect::ValueFlow {
+                kind: ValueFlowKind::Local,
+                source: computed,
+                target,
+            },
+        )?;
+        self.edge(builder, operation, EdgeTarget::normal(terminal))?;
+        self.edge(builder, terminal, next)?;
+        self.schedule_expressions(
+            builder,
+            entry,
+            &[operand],
+            EdgeTarget::normal(operation),
+            scope,
+            stack,
+        )
+    }
+
+    /// `a!!` completes normally or raises; unsupported postfix operators stay
+    /// opaque and retain the existing operator-convention gap.
     fn postfix(
         &mut self,
         builder: &mut ProcedureCfgBuilder,
@@ -1744,6 +2081,9 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         scope: ScopeFrameId,
         stack: &mut Vec<Work<'tree>>,
     ) -> Result<(), KotlinLoweringError> {
+        if is_integer_update(node) {
+            return self.integer_update(builder, node, entry, next, scope, stack);
+        }
         if !has_token(node, "!!") {
             return self.opaque_operation(builder, node, entry, next, scope, stack);
         }
@@ -2340,6 +2680,36 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 },
             },
         )?;
+        let writes_captured_mutable = target.as_ref().is_some_and(|target| {
+            target.captures.iter().any(|capture| {
+                self.local_declaration_value(&capture.name, capture.declaration_start)
+                    .is_some_and(|value| {
+                        self.mutable_locals.contains(&value)
+                            && lambda_writes_name(node, &capture.name, self.prepared.source())
+                    })
+            })
+        });
+        // The inventory currently publishes only immutable `val` capture
+        // slots. A closure write to an outer `var` therefore has no capture
+        // row to match; recover that missing alias fact from the structured
+        // assignment target and the parent lexical binding.
+        if writes_captured_mutable
+            || lambda_writes_mutable_local(
+                node,
+                &self.locals,
+                &self.mutable_locals,
+                self.prepared.source(),
+            )
+        {
+            self.add_gap(
+                builder,
+                entry,
+                SemanticGapSubject::Point,
+                SemanticCapability::Captures,
+                SemanticGapKind::Unsupported,
+                "a lambda writes a captured mutable local, so its value may change across the call",
+            )?;
+        }
         if let (Some(target), Some(environment), Some(captured), Some(destination)) = (
             target.as_ref(),
             environment,
@@ -2538,29 +2908,28 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             .map(|(child, _)| self.point(builder, *child, Vec::new()))
             .collect::<Result<Vec<_>, _>>()?;
         self.edge(builder, entry, EdgeTarget::normal(entries[0]))?;
-        for index in (0..items.len()).rev() {
-            let child_next = entries
-                .get(index + 1)
-                .copied()
-                .map(EdgeTarget::normal)
-                .unwrap_or(next);
-            let (node, label) = items[index];
-            stack.push(match label {
+        schedule_sequential_work(
+            stack,
+            &items,
+            &entries,
+            next,
+            scope,
+            |_, (node, label), entry, next, scope| match label {
                 Some(label) => Work::LabeledStatement {
                     node,
                     label,
-                    entry: entries[index],
-                    next: child_next,
+                    entry,
+                    next,
                     scope,
                 },
                 None => Work::Statement {
                     node,
-                    entry: entries[index],
-                    next: child_next,
+                    entry,
+                    next,
                     scope,
                 },
-            });
-        }
+            },
+        );
         Ok(())
     }
 
@@ -2581,19 +2950,19 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             .map(|child| self.point(builder, *child, Vec::new()))
             .collect::<Result<Vec<_>, _>>()?;
         self.edge(builder, entry, EdgeTarget::normal(entries[0]))?;
-        for index in (0..children.len()).rev() {
-            let child_next = entries
-                .get(index + 1)
-                .copied()
-                .map(EdgeTarget::normal)
-                .unwrap_or(next);
-            stack.push(Work::Expression {
-                node: children[index],
-                entry: entries[index],
-                next: child_next,
+        schedule_sequential_work(
+            stack,
+            children,
+            &entries,
+            next,
+            scope,
+            |_, node, entry, next, scope| Work::Expression {
+                node,
+                entry,
+                next,
                 scope,
-            });
-        }
+            },
+        );
         Ok(())
     }
 
@@ -2616,7 +2985,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             ) {
                 let detail = format!(
                     "{} completion has no matching represented target",
-                    completion_label(kind)
+                    kind.label()
                 );
                 self.add_gap(
                     builder,
@@ -2633,7 +3002,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             }
             return Err(KotlinLoweringError::Invalid(format!(
                 "{} completion has no matching structured continuation",
-                completion_label(kind)
+                kind.label()
             )));
         };
         self.route(builder, from, &route, stack)
@@ -2695,21 +3064,14 @@ fn boolean_literal_value(source: &str, node: Node<'_>) -> Option<bool> {
     if node.kind() != "boolean_literal" {
         return None;
     }
-    match node_text(source, node)? {
-        "true" => Some(true),
-        "false" => Some(false),
-        _ => None,
-    }
+    brokk_bifrost_core::analyzer::structural::adapter_helpers::boolean_literal_value(node_text(
+        source, node,
+    )?)
 }
 
 /// The value of an `integer_literal`, or `None` when it is not a plain decimal
 /// the adapter can read exactly.
-fn integer_literal_value(source: &str, node: Node<'_>) -> Option<i64> {
-    (node.kind() == "integer_literal")
-        .then(|| node_text(source, node))
-        .flatten()
-        .and_then(|text| text.parse().ok())
-}
+use crate::analyzer::common::integer_literal_value;
 
 /// Whether an integer-literal-bounded Kotlin range provably yields at least one
 /// element, so the loop body runs before the header's exit test is ever taken.
@@ -2764,7 +3126,7 @@ pub(super) fn kotlin_range_has_first_iteration(source: &str, iterable: Node<'_>)
 
 /// Operations Kotlin resolves through an operator convention: a member call the
 /// source never spells.
-fn is_operator_convention(node: Node<'_>) -> bool {
+fn is_operator_convention(node: Node<'_>, source: &str) -> bool {
     match node.kind() {
         "infix_expression"
         | "additive_expression"
@@ -2773,11 +3135,83 @@ fn is_operator_convention(node: Node<'_>) -> bool {
         | "equality_expression"
         | "range_expression" => true,
         "prefix_expression" | "postfix_expression" => {
-            has_token(node, "++") || has_token(node, "--") || has_token(node, "-")
+            has_token(node, "++")
+                || has_token(node, "--")
+                || (has_token(node, "-") && kotlin_decimal_integer_value(node, source).is_none())
         }
         "check_expression" => has_token(node, "in"),
         _ => false,
     }
+}
+
+fn is_integer_update(node: Node<'_>) -> bool {
+    matches!(node.kind(), "prefix_expression" | "postfix_expression")
+        && (has_token(node, "++") || has_token(node, "--"))
+}
+
+fn is_kotlin_integral_type(scalar: KotlinScalarType) -> bool {
+    matches!(
+        scalar,
+        KotlinScalarType::Int
+            | KotlinScalarType::Long
+            | KotlinScalarType::Short
+            | KotlinScalarType::Byte
+    )
+}
+
+fn lambda_writes_name(lambda: Node<'_>, name: &str, source: &str) -> bool {
+    let mut stack = vec![lambda];
+    while let Some(node) = stack.pop() {
+        if node.kind() == "assignment"
+            && let Some((target, _)) = assignment_parts(node)
+            && let AssignmentTarget::Name(target) = assignment_target(target)
+            && node_text(source, target) == Some(name)
+        {
+            return true;
+        }
+        if is_integer_update(node)
+            && unary_operand(node).and_then(|operand| node_text(source, operand)) == Some(name)
+        {
+            return true;
+        }
+        stack.extend(named_children(node));
+    }
+    false
+}
+
+fn lambda_writes_mutable_local(
+    lambda: Node<'_>,
+    locals: &HashMap<Box<str>, Vec<LocalBinding>>,
+    mutable_locals: &HashSet<ValueId>,
+    source: &str,
+) -> bool {
+    let mut stack = vec![lambda];
+    while let Some(node) = stack.pop() {
+        let written_name = if node.kind() == "assignment" {
+            assignment_parts(node).and_then(|(target, _)| match assignment_target(target) {
+                AssignmentTarget::Name(name) => node_text(source, name),
+                _ => None,
+            })
+        } else if is_integer_update(node) {
+            unary_operand(node).and_then(|operand| node_text(source, operand))
+        } else {
+            None
+        };
+        if let Some(name) = written_name
+            && locals.get(name).is_some_and(|bindings| {
+                bindings.iter().any(|binding| {
+                    binding.visible_from <= lambda.start_byte()
+                        && binding.scope_start <= lambda.start_byte()
+                        && lambda.start_byte() < binding.scope_end
+                        && mutable_locals.contains(&binding.value)
+                })
+            })
+        {
+            return true;
+        }
+        stack.extend(named_children(node));
+    }
+    false
 }
 
 /// Syntax the adapter evaluates opaquely on purpose, with no missing call

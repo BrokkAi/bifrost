@@ -290,44 +290,35 @@ impl NearMissTruncation {
     }
 
     fn omit_candidates(&mut self, count: u64) {
-        if count == 0 {
-            return;
-        }
-        self.candidates_truncated = true;
-        self.omitted_candidates_lower_bound =
-            self.omitted_candidates_lower_bound.saturating_add(count);
+        super::add_omitted_amount(
+            &mut self.candidates_truncated,
+            &mut self.omitted_candidates_lower_bound,
+            count,
+        );
     }
 
     fn omit_executions(&mut self, count: u64) {
-        if count == 0 {
-            return;
-        }
-        self.executions_truncated = true;
-        self.omitted_executions_lower_bound =
-            self.omitted_executions_lower_bound.saturating_add(count);
+        super::add_omitted_amount(
+            &mut self.executions_truncated,
+            &mut self.omitted_executions_lower_bound,
+            count,
+        );
     }
 
     fn omit_bytes(&mut self, bytes: u64) {
-        if bytes == 0 {
-            return;
-        }
-        self.bytes_truncated = true;
-        self.omitted_bytes_lower_bound = self.omitted_bytes_lower_bound.saturating_add(bytes);
+        super::add_omitted_amount(
+            &mut self.bytes_truncated,
+            &mut self.omitted_bytes_lower_bound,
+            bytes,
+        );
     }
 
     fn omit_text_bytes(&mut self, bytes: u64) {
-        if bytes == 0 {
-            return;
-        }
-        self.text_truncated = true;
-        self.omitted_text_bytes_lower_bound =
-            self.omitted_text_bytes_lower_bound.saturating_add(bytes);
-    }
-}
-
-impl RetainedSize for NearMissTruncation {
-    fn retained_size(&self) -> usize {
-        size_of::<Self>()
+        super::add_omitted_amount(
+            &mut self.text_truncated,
+            &mut self.omitted_text_bytes_lower_bound,
+            bytes,
+        );
     }
 }
 
@@ -408,7 +399,7 @@ impl PolicyNearMissRanking {
     /// Serialize to canonical JSON. Field order is declaration order, so two
     /// equal rankings render byte-identically.
     pub fn to_json(&self) -> String {
-        serde_json::to_string(self).expect("the near-miss model is serializable")
+        super::serialize_json(self, "the near-miss model is serializable")
     }
 }
 

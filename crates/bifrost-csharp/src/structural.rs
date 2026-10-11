@@ -2,7 +2,8 @@
 
 use crate::syntax::{csharp_conditional_member_access, csharp_member_name};
 use brokk_bifrost_core::analyzer::structural::adapter_helpers::{
-    attach_role_with_derived_name, attach_terminal_callee, first_named_child,
+    attach_decorators_under, attach_role_with_derived_name, attach_terminal_callee,
+    csharp_integer_literal_value, first_named_child,
 };
 use brokk_bifrost_core::analyzer::structural::callable::{
     CallKind, CallSiteContext, CallSiteFacts,
@@ -10,7 +11,7 @@ use brokk_bifrost_core::analyzer::structural::callable::{
 use brokk_bifrost_core::analyzer::structural::edges::{
     INVERSE_REFERENCE_EDGE_SUPPORT, ReferenceEdgeSupport,
 };
-use brokk_bifrost_core::analyzer::structural::facts::Span;
+use brokk_bifrost_core::analyzer::structural::facts::IntegerLiteralValue;
 use brokk_bifrost_core::analyzer::structural::kinds::{NormalizedKind, Role};
 use brokk_bifrost_core::analyzer::structural::materialization::{
     DeclarationMaterializationSupport, NO_MATERIALIZATION_SUPPORT,
@@ -20,6 +21,10 @@ use brokk_bifrost_core::analyzer::structural::occurrences::{
 };
 use brokk_bifrost_core::analyzer::structural::resolution::{
     BindingActivation, BindingKind, EnvironmentAxis, HoistingClass, LexicalEnvironmentSupport,
+};
+use brokk_bifrost_core::analyzer::structural::result_use::{
+    CallResultUse, CallResultUseIndex, CallResultUseOpenReason, CallResultUseSite,
+    IntentionalDiscardKind,
 };
 use brokk_bifrost_core::analyzer::structural::routes::{
     IdentityAxis, IdentityRouteSupport, RouteHopKind,
@@ -34,15 +39,179 @@ pub struct CSharpStructuralSpec;
 
 pub static CSHARP_STRUCTURAL_SPEC: CSharpStructuralSpec = CSharpStructuralSpec;
 
+/// Classify the syntax around one exact C# invocation expression.
+///
+/// C# expression statements drop a result. The language's explicit discard
+/// assignment (`_ = call()`) is retained as intentional discard, while every
+/// other ordinary expression context consumes the value. Conditional access
+/// is left open because nullable receiver dispatch is not the exact
+/// `System.String` proof required by the reviewed BCL adapter.
+pub fn csharp_call_result_use(call: Node<'_>, source: &str) -> CallResultUseSite {
+    let default = if call.kind() != "invocation_expression"
+        || call.has_error()
+        || has_recovery_ancestor(call)
+        || has_recovery_descendant(call)
+    {
+        CallResultUse::Open(CallResultUseOpenReason::RecoveredSyntax)
+    } else if has_deferred_ancestor(call) {
+        CallResultUse::Open(CallResultUseOpenReason::DeferredContext)
+    } else if has_conditional_access(call) {
+        CallResultUse::Open(CallResultUseOpenReason::UnsupportedSyntax)
+    } else {
+        let mut expression = call;
+        loop {
+            let Some(parent) = expression.parent() else {
+                break CallResultUse::Open(CallResultUseOpenReason::UnclassifiedSyntax);
+            };
+            if parent.is_error() || parent.is_missing() {
+                break CallResultUse::Open(CallResultUseOpenReason::RecoveredSyntax);
+            }
+            match parent.kind() {
+                "parenthesized_expression"
+                    if parent.named_child_count() == 1
+                        && parent
+                            .named_child(0)
+                            .is_some_and(|child| child.id() == expression.id()) =>
+                {
+                    expression = parent;
+                }
+                "assignment_expression"
+                    if parent
+                        .child_by_field_name("right")
+                        .is_some_and(|right| right.id() == expression.id()) =>
+                {
+                    let discard = parent.child_by_field_name("left").is_some_and(|left| {
+                        left.kind() == "identifier"
+                            && left
+                                .utf8_text(source.as_bytes())
+                                .is_ok_and(|text| text == "_")
+                    });
+                    break if discard {
+                        CallResultUse::IntentionalDiscard(
+                            IntentionalDiscardKind::CSharpDiscardAssignment,
+                        )
+                    } else {
+                        CallResultUse::Consumed
+                    };
+                }
+                "expression_statement"
+                    if parent.named_child_count() == 1
+                        && parent
+                            .named_child(0)
+                            .is_some_and(|child| child.id() == expression.id()) =>
+                {
+                    break CallResultUse::Discarded;
+                }
+                "lambda_expression" | "anonymous_method_expression" => {
+                    break CallResultUse::Open(CallResultUseOpenReason::DeferredContext);
+                }
+                _ => break CallResultUse::Consumed,
+            }
+        }
+    };
+    CallResultUseSite::new(call.start_byte(), call.end_byte(), default)
+}
+
+fn has_recovery_ancestor(mut node: Node<'_>) -> bool {
+    while let Some(parent) = node.parent() {
+        if parent.is_error() || parent.is_missing() {
+            return true;
+        }
+        node = parent;
+    }
+    false
+}
+
+fn has_recovery_descendant(root: Node<'_>) -> bool {
+    let mut stack = vec![root];
+    while let Some(node) = stack.pop() {
+        if node.id() != root.id() && (node.is_error() || node.is_missing()) {
+            return true;
+        }
+        for index in (0..node.named_child_count()).rev() {
+            stack.push(node.named_child(index).expect("named child exists"));
+        }
+    }
+    false
+}
+
+fn has_deferred_ancestor(mut node: Node<'_>) -> bool {
+    while let Some(parent) = node.parent() {
+        if matches!(
+            parent.kind(),
+            "lambda_expression" | "anonymous_method_expression"
+        ) {
+            return true;
+        }
+        node = parent;
+    }
+    false
+}
+
+fn has_conditional_access_ancestor(mut node: Node<'_>) -> bool {
+    while let Some(parent) = node.parent() {
+        if parent.kind() == "conditional_access_expression" {
+            return true;
+        }
+        node = parent;
+    }
+    false
+}
+
+fn has_conditional_access(call: Node<'_>) -> bool {
+    call.child_by_field_name("function")
+        .is_some_and(|function| function.kind() == "conditional_access_expression")
+        || has_conditional_access_ancestor(call)
+}
+
+/// One source-snapshot index of exact C# invocation spans.
+#[derive(Debug, Clone)]
+pub struct CSharpCallResultUseIndex {
+    inner: CallResultUseIndex,
+}
+
+impl CSharpCallResultUseIndex {
+    pub fn new(root: Node<'_>, source: &str) -> Self {
+        let mut sites = Vec::new();
+        let mut stack = vec![root];
+        while let Some(node) = stack.pop() {
+            if node.kind() == "invocation_expression" {
+                sites.push(csharp_call_result_use(node, source));
+            }
+            for index in (0..node.named_child_count()).rev() {
+                stack.push(node.named_child(index).expect("named child exists"));
+            }
+        }
+        Self {
+            inner: CallResultUseIndex::new(sites),
+        }
+    }
+
+    pub fn at_span(
+        &self,
+        start_byte: usize,
+        end_byte: usize,
+    ) -> Result<&CallResultUseSite, CallResultUseOpenReason> {
+        self.inner.at_span(start_byte, end_byte)
+    }
+
+    pub fn sites(&self) -> &[CallResultUseSite] {
+        self.inner.sites()
+    }
+}
+
 static CSHARP_OCCURRENCE_ROLE_SUPPORT: OccurrenceRoleSupport = OccurrenceRoleSupport::NONE
     .supported(OccurrenceRole::MemberPosition)
     .supported(OccurrenceRole::Binder);
 
 pub const CSHARP_KIND_TABLE: &[(&str, NormalizedKind)] = &[
+    ("comment", NormalizedKind::Comment),
     ("invocation_expression", NormalizedKind::Call),
     ("object_creation_expression", NormalizedKind::Call),
     ("member_access_expression", NormalizedKind::FieldAccess),
     ("conditional_access_expression", NormalizedKind::FieldAccess),
+    ("element_access_expression", NormalizedKind::FieldAccess),
+    ("await_expression", NormalizedKind::Await),
     ("method_declaration", NormalizedKind::Method),
     ("constructor_declaration", NormalizedKind::Constructor),
     ("local_function_statement", NormalizedKind::Function),
@@ -72,7 +241,7 @@ pub const CSHARP_KIND_TABLE: &[(&str, NormalizedKind)] = &[
     ("string_literal", NormalizedKind::StringLiteral),
     ("verbatim_string_literal", NormalizedKind::StringLiteral),
     ("raw_string_literal", NormalizedKind::StringLiteral),
-    ("character_literal", NormalizedKind::StringLiteral),
+    ("character_literal", NormalizedKind::CharacterLiteral),
     ("prefix_unary_expression", NormalizedKind::NumericLiteral),
     ("integer_literal", NormalizedKind::NumericLiteral),
     ("real_literal", NormalizedKind::NumericLiteral),
@@ -90,21 +259,7 @@ pub const CSHARP_KIND_TABLE: &[(&str, NormalizedKind)] = &[
     ("do_statement", NormalizedKind::WhileLoop),
 ];
 
-fn last_named_child<'tree>(node: Node<'tree>) -> Option<Node<'tree>> {
-    (0..node.named_child_count())
-        .rev()
-        .find_map(|index| node.named_child(index))
-}
-
-fn expression_target_node(mut node: Node<'_>) -> Node<'_> {
-    while matches!(node.kind(), "expression" | "parenthesized_expression") {
-        let Some(child) = first_named_child(node) else {
-            break;
-        };
-        node = child;
-    }
-    node
-}
+use brokk_bifrost_core::analyzer::tree_walk::{expression_target_node, last_named_child};
 
 fn expression_name_node<'tree>(expression: Node<'tree>) -> Option<Node<'tree>> {
     let mut current = expression_target_node(expression);
@@ -133,13 +288,118 @@ fn is_numeric_literal_node(node: Node<'_>) -> bool {
 }
 
 fn is_signed_numeric_prefix(node: Node<'_>) -> bool {
-    node.kind() == "prefix_unary_expression"
-        && last_named_child(node)
-            .map(expression_target_node)
-            .is_some_and(is_numeric_literal_node)
-        && (0..node.child_count())
-            .filter_map(|index| node.child(index))
-            .any(|child| !child.is_named() && matches!(child.kind(), "+" | "-"))
+    if node.kind() != "prefix_unary_expression" {
+        return false;
+    }
+    let operator = (0..node.child_count())
+        .filter_map(|index| node.child(index))
+        .find(|child| !child.is_named() && matches!(child.kind(), "+" | "-"))
+        .map(|child| child.kind());
+    brokk_bifrost_core::analyzer::tree_walk::is_signed_numeric_operand(
+        last_named_child(node).map(expression_target_node),
+        operator,
+        is_numeric_literal_node,
+    )
+}
+
+fn csharp_string_literal_value(node: Node<'_>, source: &str) -> Option<String> {
+    let spelling = node.utf8_text(source.as_bytes()).ok()?;
+    match node.kind() {
+        "string_literal" => {
+            let content = spelling.strip_prefix('"')?.strip_suffix('"')?;
+            decode_csharp_cooked_string(content)
+        }
+        "verbatim_string_literal" => {
+            let opening = spelling.find('"')?;
+            let prefix = spelling.get(..opening)?;
+            if !prefix.contains('@') {
+                return None;
+            }
+            let content = spelling.get(opening + 1..spelling.len().checked_sub(1)?)?;
+            let mut value = String::with_capacity(content.len());
+            let mut chars = content.chars();
+            while let Some(character) = chars.next() {
+                if character == '"' {
+                    if chars.next() != Some('"') {
+                        return None;
+                    }
+                    value.push('"');
+                } else {
+                    value.push(character);
+                }
+            }
+            Some(value)
+        }
+        "character_literal" => {
+            let content = spelling.strip_prefix('\'')?.strip_suffix('\'')?;
+            decode_csharp_cooked_string(content)
+        }
+        // Raw strings have indentation and interpolation rules that depend on
+        // the complete literal token. Leave unsupported forms incomplete
+        // rather than publishing a guessed value.
+        "raw_string_literal" => None,
+        _ => None,
+    }
+}
+
+fn decode_csharp_cooked_string(content: &str) -> Option<String> {
+    let mut value = String::with_capacity(content.len());
+    let mut chars = content.chars().peekable();
+    while let Some(character) = chars.next() {
+        if character != '\\' {
+            value.push(character);
+            continue;
+        }
+        let escape = chars.next()?;
+        let decoded = match escape {
+            'a' => '\x07',
+            'b' => '\x08',
+            'f' => '\x0c',
+            'n' => '\n',
+            'r' => '\r',
+            't' => '\t',
+            'v' => '\x0b',
+            '0' => '\0',
+            '\\' => '\\',
+            '\'' => '\'',
+            '"' => '"',
+            '\n' => continue,
+            '\r' => {
+                if chars.peek() == Some(&'\n') {
+                    chars.next();
+                }
+                continue;
+            }
+            'x' => decode_csharp_unicode_escape(&mut chars, 1, 4)?,
+            'u' => decode_csharp_unicode_escape(&mut chars, 4, 4)?,
+            'U' => decode_csharp_unicode_escape(&mut chars, 8, 8)?,
+            _ => return None,
+        };
+        value.push(decoded);
+    }
+    Some(value)
+}
+
+fn decode_csharp_unicode_escape(
+    chars: &mut std::iter::Peekable<std::str::Chars<'_>>,
+    minimum_digits: usize,
+    maximum_digits: usize,
+) -> Option<char> {
+    let mut digits = String::new();
+    while digits.len() < maximum_digits {
+        let Some(character) = chars.peek().copied() else {
+            break;
+        };
+        if !character.is_ascii_hexdigit() {
+            break;
+        }
+        chars.next();
+        digits.push(character);
+    }
+    if digits.len() < minimum_digits {
+        return None;
+    }
+    char::from_u32(u32::from_str_radix(&digits, 16).ok()?)
 }
 
 fn is_inside_signed_numeric_wrapper(node: Node<'_>) -> bool {
@@ -344,11 +604,18 @@ fn csharp_binding_activation(binder: Node<'_>, scope: Range) -> Option<BindingAc
     }
 }
 
-fn first_argument_value(argument: Node<'_>) -> Option<Node<'_>> {
+pub fn first_argument_value(argument: Node<'_>) -> Option<Node<'_>> {
+    if argument.kind() != "argument" {
+        return Some(argument);
+    }
     let keyword = argument.child_by_field_name("name");
-    (0..argument.named_child_count())
-        .filter_map(|index| argument.named_child(index))
-        .find(|child| keyword.is_none_or(|keyword| child.id() != keyword.id()))
+    argument
+        .child_by_field_name("value")
+        .or_else(|| argument.child_by_field_name("expression"))
+        .or_else(|| {
+            brokk_bifrost_core::analyzer::tree_walk::named_children_iter(argument)
+                .find(|child| keyword.is_none_or(|keyword| child.id() != keyword.id()))
+        })
 }
 
 fn attach_argument_roles(sink: &mut RoleSink<'_>, arguments: Node<'_>) {
@@ -374,26 +641,13 @@ fn attach_argument_roles(sink: &mut RoleSink<'_>, arguments: Node<'_>) {
 }
 
 fn attach_decorators(sink: &mut RoleSink<'_>, declaration: Node<'_>) {
-    for index in 0..declaration.named_child_count() {
-        let Some(child) = declaration.named_child(index) else {
-            continue;
-        };
-        if child.kind() != "attribute_list" {
-            continue;
-        }
-        for attr_index in 0..child.named_child_count() {
-            if let Some(attribute) = child.named_child(attr_index)
-                && attribute.kind() == "attribute"
-            {
-                attach_role_with_derived_name(
-                    sink,
-                    Role::Decorator,
-                    attribute,
-                    expression_name_node,
-                );
-            }
-        }
-    }
+    attach_decorators_under(
+        sink,
+        declaration,
+        "attribute_list",
+        &["attribute"],
+        expression_name_node,
+    );
 }
 
 fn variable_declarator_value(node: Node<'_>) -> Option<Node<'_>> {
@@ -414,34 +668,13 @@ fn using_type_node(node: Node<'_>) -> Option<Node<'_>> {
         .find(|child| alias.is_none_or(|alias| child.id() != alias.id()))
 }
 
-fn span_from(first: Node<'_>, last: Node<'_>) -> Span {
-    Span {
-        start_byte: first.start_byte(),
-        end_byte: last.end_byte(),
-    }
-}
-
-fn leftmost_name_node(mut node: Node<'_>) -> Option<Node<'_>> {
-    loop {
-        match node.kind() {
-            "identifier" | "predefined_type" => return Some(node),
-            "generic_name" | "qualified_name" | "alias_qualified_name" => {
-                node = node
-                    .child_by_field_name("qualifier")
-                    .or_else(|| node.child_by_field_name("alias"))
-                    .or_else(|| first_named_child(node))?;
-            }
-            _ => return first_named_child(node),
-        }
-    }
-}
-
 fn attach_module_binding(sink: &mut RoleSink<'_>, target: Node<'_>, name: Node<'_>) {
-    sink.role_named(Role::Module, target, name);
-    if let Some(first) = leftmost_name_node(target)
+    if let Some(first) = crate::syntax::csharp_type_leftmost_identifier(target)
         && first.id() != name.id()
     {
-        sink.role_named_span(Role::Module, target, span_from(first, name));
+        sink.role_named_between_nodes(Role::Module, target, first, name);
+    } else {
+        sink.role_named(Role::Module, target, name);
     }
 }
 
@@ -464,6 +697,26 @@ impl StructuralSpec for CSharpStructuralSpec {
 
     fn supports_boolean_literal_value(&self) -> bool {
         true
+    }
+
+    fn supports_integer_literal_value(&self) -> bool {
+        true
+    }
+
+    fn integer_literal_value(&self, node: Node<'_>, source: &str) -> Option<IntegerLiteralValue> {
+        csharp_integer_literal_value(node, source)
+    }
+
+    fn supports_string_literal_value(&self) -> bool {
+        true
+    }
+
+    fn string_literal_value_may_be_absent(&self, node: Node<'_>, source: &str) -> bool {
+        csharp_string_literal_value(node, source).is_none()
+    }
+
+    fn string_literal_value(&self, node: Node<'_>, source: &str) -> Option<String> {
+        csharp_string_literal_value(node, source)
     }
 
     fn parser_included_ranges(&self, source: &str) -> Option<Vec<tree_sitter::Range>> {
@@ -508,7 +761,9 @@ impl StructuralSpec for CSharpStructuralSpec {
 
     fn supports_role(&self, role: Role) -> bool {
         // #2647: not yet extracted by this adapter.
-        !matches!(role, Role::Iterable | Role::Element)
+        brokk_bifrost_core::analyzer::structural::spec::supports_role_without_iterable_or_element(
+            role,
+        )
     }
 
     fn occurrence_role_support(&self) -> &OccurrenceRoleSupport {
@@ -587,6 +842,21 @@ impl StructuralSpec for CSharpStructuralSpec {
                 }
             }
             NormalizedKind::FieldAccess => {
+                if node.kind() == "element_access_expression" {
+                    if let Some(object) = node.child_by_field_name("expression") {
+                        attach_role_with_derived_name(
+                            sink,
+                            Role::Object,
+                            object,
+                            expression_name_node,
+                        );
+                    }
+                    // The source syntax has no identifier for an indexer. The
+                    // analysis resolver supplies the CLR property name `Item`
+                    // after it has selected this structured AST node.
+                    sink.role(Role::Field, node);
+                    return;
+                }
                 let field = if node.kind() == "conditional_access_expression" {
                     conditional_member_binding(node)
                         .and_then(|binding| binding.child_by_field_name("name"))
@@ -656,6 +926,9 @@ impl StructuralSpec for CSharpStructuralSpec {
                             expression_name_node,
                         );
                     }
+                    if let Some(operator) = node.child_by_field_name("operator") {
+                        sink.role_named(Role::Operator, operator, operator);
+                    }
                 }
             },
             NormalizedKind::Import => attach_import_modules(sink, node),
@@ -677,14 +950,10 @@ impl StructuralSpec for CSharpStructuralSpec {
 mod tests {
     use super::*;
     use brokk_bifrost_core::analyzer::structural::occurrences::OccurrenceRole;
-    use tree_sitter::{Parser, Tree};
+    use tree_sitter::Tree;
 
     fn parse(source: &str) -> Tree {
-        let mut parser = Parser::new();
-        parser
-            .set_language(&tree_sitter_c_sharp::LANGUAGE.into())
-            .expect("C# grammar loads");
-        let tree = parser.parse(source, None).expect("C# source parses");
+        let tree = crate::test_support::parse_raw_csharp(source);
         assert!(
             !tree.root_node().has_error(),
             "{}",
@@ -755,10 +1024,92 @@ mod tests {
     }
 
     #[test]
-    fn csharp_support_advertises_only_member_position() {
-        let support = CSHARP_STRUCTURAL_SPEC.occurrence_role_support();
-        assert!(support.is_supported(OccurrenceRole::MemberPosition));
-        assert!(!support.is_supported(OccurrenceRole::ReceiverPosition));
-        assert!(!support.is_supported(OccurrenceRole::ValueReference));
+    fn string_literals_publish_decoded_values() {
+        let source = r#"class Probe {
+            string cooked = ".example.com";
+            string escaped = "\u002F";
+            string verbatim = @"/";
+        }"#;
+        let tree = parse(source);
+        let mut pending = vec![tree.root_node()];
+        let mut values = Vec::new();
+        while let Some(node) = pending.pop() {
+            if matches!(
+                node.kind(),
+                "string_literal" | "verbatim_string_literal" | "character_literal"
+            ) {
+                values.push(csharp_string_literal_value(node, source));
+            }
+            pending
+                .extend((0..node.named_child_count()).filter_map(|index| node.named_child(index)));
+        }
+        values.sort();
+        assert_eq!(
+            values,
+            vec![
+                Some(".example.com".to_owned()),
+                Some("/".to_owned()),
+                Some("/".to_owned())
+            ]
+        );
+    }
+
+    #[test]
+    fn result_use_index_classifies_csharp_uses() {
+        let source = r#"
+            class Runner {
+                void Sink(string value) { }
+
+                void Run(string value) {
+                    value.Trim();
+                    Sink(value.Trim());
+                    _ = value.Trim();
+                    value?.Trim();
+                }
+            }
+        "#;
+        let tree = parse(source);
+        let root = tree.root_node();
+        let mut calls = Vec::new();
+        let mut pending = vec![root];
+        while let Some(node) = pending.pop() {
+            if node.kind() == "invocation_expression"
+                && node
+                    .child_by_field_name("function")
+                    .is_some_and(|function| {
+                        matches!(
+                            function.kind(),
+                            "member_access_expression" | "conditional_access_expression"
+                        )
+                    })
+            {
+                calls.push(node);
+            }
+            pending
+                .extend((0..node.named_child_count()).filter_map(|index| node.named_child(index)));
+        }
+        calls.sort_by_key(|call| call.start_byte());
+        let index = CSharpCallResultUseIndex::new(root, source);
+        let uses: Vec<_> = calls
+            .iter()
+            .map(|call| {
+                index
+                    .at_span(call.start_byte(), call.end_byte())
+                    .expect("member call has an indexed result-use site")
+                    .default_use()
+            })
+            .collect();
+
+        assert_eq!(uses.len(), 4);
+        assert!(matches!(uses[0], CallResultUse::Discarded));
+        assert!(matches!(uses[1], CallResultUse::Consumed));
+        assert!(matches!(
+            uses[2],
+            CallResultUse::IntentionalDiscard(IntentionalDiscardKind::CSharpDiscardAssignment)
+        ));
+        assert!(matches!(
+            uses[3],
+            CallResultUse::Open(CallResultUseOpenReason::UnsupportedSyntax)
+        ));
     }
 }

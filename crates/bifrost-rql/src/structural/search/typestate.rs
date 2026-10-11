@@ -1,20 +1,20 @@
 use std::sync::Arc;
 
 use super::witness_projection::{
-    hash_public_locator, locator_file, locator_range, public_evidence, retain_prefix_by_bytes,
-    saturating_u64,
+    hash_public_locator, locator_file, locator_range, map_witness_step_kind, public_call_site,
+    public_evidence, public_program_point_site, retain_prefix_by_bytes, saturating_u64,
 };
 use super::{
-    CodeQueryDiagnostic, CodeQueryDiagnosticCode, CodeQueryDiagnosticImpact,
-    CodeQuerySemanticCompleteness, CodeQuerySemanticEvidence, CodeQuerySemanticProof,
-    CodeQuerySourceSite, CodeQueryTypestateCertainty, CodeQueryTypestateFinding,
-    CodeQueryTypestateFindingKind, CodeQueryTypestateLimits, CodeQueryTypestateSubject,
-    CodeQueryTypestateUncertainty, CodeQueryTypestateWitness, CodeQueryTypestateWitnessStep,
-    CodeQueryTypestateWitnessStepKind, CodeQueryTypestateWork, SemanticProcedureValue,
+    CodeQueryDiagnostic, CodeQueryDiagnosticCode, CodeQuerySemanticCompleteness,
+    CodeQuerySemanticEvidence, CodeQuerySemanticProof, CodeQueryTypestateCertainty,
+    CodeQueryTypestateFinding, CodeQueryTypestateFindingKind, CodeQueryTypestateLimits,
+    CodeQueryTypestateSubject, CodeQueryTypestateUncertainty, CodeQueryTypestateWitness,
+    CodeQueryTypestateWitnessStep, CodeQueryTypestateWitnessStepKind, CodeQueryTypestateWork,
+    SemanticProcedureValue, push_deduplicated_diagnostic,
 };
 use crate::analyzer::semantic::{
-    CallSiteHandle, IcfgProvider, IcfgProviderBehaviorIdentity, LengthDelimitedDigest,
-    ProcedureHandle, ProgramPointHandle, SemanticBudget, SemanticLocator, WorkspaceIcfgProvider,
+    IcfgProvider, IcfgProviderBehaviorIdentity, LengthDelimitedDigest, ProcedureHandle,
+    SemanticBudget, SemanticLocator, WorkspaceIcfgProvider,
 };
 use crate::analyzer::semantic_model::ActiveSemanticModelSnapshot;
 use crate::analyzer::{ProjectFile, WorkspaceAnalyzer};
@@ -25,7 +25,7 @@ use crate::structural::analysis_context::{
 };
 use brokk_bifrost_flow::dataflow::{
     DataflowRequest, SemanticInputStatus, SolverBudget, SolverTermination, SummaryReadRecorder,
-    SummaryWitnessStepKind, WitnessReconstructionLimits,
+    WitnessReconstructionLimits,
 };
 use brokk_bifrost_flow::typestate::{
     CompiledProtocol, ProductionSummaryLifecycleCounters, ProductionTypestateExecutionContext,
@@ -98,7 +98,8 @@ impl TypestateQueryState {
         active_semantic_model_snapshot: Option<Arc<ActiveSemanticModelSnapshot>>,
     ) -> Vec<SemanticTypestateFindingValue> {
         let Some(analysis_context) = analysis_context else {
-            self.push_diagnostic(
+            push_deduplicated_diagnostic(
+                &mut self.diagnostics,
                 CodeQueryDiagnosticCode::UnresolvedProtocolReference,
                 format!(
                     "typestate protocol reference `{protocol_ref}` was not supplied by the host"
@@ -107,7 +108,8 @@ impl TypestateQueryState {
             return Vec::new();
         };
         let Some(handle) = analysis_context.handle(protocol_ref) else {
-            self.push_diagnostic(
+            push_deduplicated_diagnostic(
+                &mut self.diagnostics,
                 CodeQueryDiagnosticCode::UnresolvedProtocolReference,
                 format!("typestate protocol reference `{protocol_ref}` is not registered"),
             );
@@ -178,7 +180,8 @@ impl TypestateQueryState {
                     Ok(solved) => solved,
                     Err(error) => {
                         self.work.failed_solves = self.work.failed_solves.saturating_add(1);
-                        self.push_diagnostic(
+                        push_deduplicated_diagnostic(
+                            &mut self.diagnostics,
                             CodeQueryDiagnosticCode::TypestateProviderFailed,
                             format!("typestate analysis failed: {error}"),
                         );
@@ -199,7 +202,8 @@ impl TypestateQueryState {
                     }
                     SolverTermination::Cancelled => {
                         self.work.cancelled_solves = self.work.cancelled_solves.saturating_add(1);
-                        self.push_diagnostic(
+                        push_deduplicated_diagnostic(
+                            &mut self.diagnostics,
                             CodeQueryDiagnosticCode::Cancelled,
                             "typestate solver was cancelled".to_string(),
                         );
@@ -207,7 +211,8 @@ impl TypestateQueryState {
                     SolverTermination::ExceededBudget(exceeded) => {
                         self.work.budget_exhausted_solves =
                             self.work.budget_exhausted_solves.saturating_add(1);
-                        self.push_diagnostic(
+                        push_deduplicated_diagnostic(
+                            &mut self.diagnostics,
                             CodeQueryDiagnosticCode::TypestateSolverBudgetExhausted,
                             exceeded.to_string(),
                         );
@@ -236,7 +241,8 @@ impl TypestateQueryState {
                     Ok(report) => report,
                     Err(TypestateFlowProblemError::FindingBudgetExceeded) => {
                         self.work.finding_budget_exhausted = true;
-                        self.push_diagnostic(
+                        push_deduplicated_diagnostic(
+                            &mut self.diagnostics,
                             CodeQueryDiagnosticCode::TypestateFindingBudgetExhausted,
                             "typestate finding or witness reconstruction budget was exhausted"
                                 .to_string(),
@@ -246,7 +252,8 @@ impl TypestateQueryState {
                         return Vec::new();
                     }
                     Err(TypestateFlowProblemError::FindingCancelled) => {
-                        self.push_diagnostic(
+                        push_deduplicated_diagnostic(
+                            &mut self.diagnostics,
                             CodeQueryDiagnosticCode::Cancelled,
                             "typestate finding collection was cancelled".to_string(),
                         );
@@ -256,7 +263,8 @@ impl TypestateQueryState {
                     }
                     Err(error) => {
                         self.work.failed_solves = self.work.failed_solves.saturating_add(1);
-                        self.push_diagnostic(
+                        push_deduplicated_diagnostic(
+                            &mut self.diagnostics,
                             CodeQueryDiagnosticCode::TypestateProviderFailed,
                             format!("typestate finding collection failed: {error}"),
                         );
@@ -294,7 +302,8 @@ impl TypestateQueryState {
                     }
                 }
                 if report.omitted() > 0 {
-                    self.push_diagnostic(
+                    push_deduplicated_diagnostic(
+                        &mut self.diagnostics,
                         CodeQueryDiagnosticCode::TypestateFindingBudgetExhausted,
                         format!(
                             "typestate finding retention omitted at least {} finding(s)",
@@ -303,7 +312,8 @@ impl TypestateQueryState {
                     );
                 }
                 if !report.analysis_complete() {
-                    self.push_diagnostic(
+                    push_deduplicated_diagnostic(
+                        &mut self.diagnostics,
                         CodeQueryDiagnosticCode::TypestateAnalysisPartial,
                         "typestate analysis retained incomplete semantic evidence".to_string(),
                     );
@@ -429,30 +439,13 @@ impl TypestateQueryState {
                 CodeQueryDiagnosticCode::TypestateRegistrationStale
             }
         };
-        self.push_diagnostic(code, error.to_string());
-    }
-
-    fn push_diagnostic(&mut self, code: CodeQueryDiagnosticCode, message: String) {
-        if self
-            .diagnostics
-            .iter()
-            .any(|diagnostic| diagnostic.code == code && diagnostic.message == message)
-        {
-            return;
-        }
-        self.diagnostics.push(CodeQueryDiagnostic {
-            code,
-            impact: CodeQueryDiagnosticImpact::Incomplete,
-            branch: Vec::new(),
-            language: "workspace",
-            message,
-            exhausted_roots: Vec::new(),
-        });
+        push_deduplicated_diagnostic(&mut self.diagnostics, code, error.to_string());
     }
 
     fn record_semantic_status(&mut self, status: SemanticInputStatus) {
         match status {
-            SemanticInputStatus::Unsupported { capability } => self.push_diagnostic(
+            SemanticInputStatus::Unsupported { capability } => push_deduplicated_diagnostic(
+                &mut self.diagnostics,
                 CodeQueryDiagnosticCode::TypestateCapabilityUnsupported,
                 format!(
                     "typestate analysis requires unsupported semantic capability `{}`",
@@ -461,12 +454,14 @@ impl TypestateQueryState {
             ),
             SemanticInputStatus::ExceededBudget { exceeded } => {
                 self.semantic_budget_exhausted = true;
-                self.push_diagnostic(
+                push_deduplicated_diagnostic(
+                    &mut self.diagnostics,
                     CodeQueryDiagnosticCode::SemanticBudgetExhausted,
                     format!("typestate semantic input exceeded its budget: {exceeded}"),
                 );
             }
-            SemanticInputStatus::Cancelled => self.push_diagnostic(
+            SemanticInputStatus::Cancelled => push_deduplicated_diagnostic(
+                &mut self.diagnostics,
                 CodeQueryDiagnosticCode::Cancelled,
                 "typestate semantic input materialization was cancelled".to_string(),
             ),
@@ -514,7 +509,8 @@ impl TypestateQueryState {
 
     pub(super) fn witness_truncated(&mut self, count: usize) {
         if count > 0 {
-            self.push_diagnostic(
+            push_deduplicated_diagnostic(
+                &mut self.diagnostics,
                 CodeQueryDiagnosticCode::TypestateWitnessTruncated,
                 format!("typestate witness projection truncated {count} witness(es)"),
             );
@@ -746,66 +742,20 @@ fn public_witness_step(
     step: brokk_bifrost_flow::typestate::TypestateWitnessStep<'_>,
 ) -> CodeQueryTypestateWitnessStep {
     CodeQueryTypestateWitnessStep {
-        kind: match step.kind() {
-            SummaryWitnessStepKind::Seed => CodeQueryTypestateWitnessStepKind::Seed,
-            SummaryWitnessStepKind::Edge(kind) => CodeQueryTypestateWitnessStepKind::Edge {
-                edge_kind: kind.label(),
-            },
-            SummaryWitnessStepKind::EndSummaryGap(kind) => {
-                CodeQueryTypestateWitnessStepKind::EndSummaryGap {
-                    return_kind: match kind {
-                        crate::analyzer::semantic::ReturnTransferKind::Normal => "normal",
-                        crate::analyzer::semantic::ReturnTransferKind::Exceptional => "exceptional",
-                    },
-                }
-            }
-        },
-        source: program_point_site(workspace, step.source()),
+        kind: map_witness_step_kind(
+            step.kind(),
+            CodeQueryTypestateWitnessStepKind::Seed,
+            |edge_kind| CodeQueryTypestateWitnessStepKind::Edge { edge_kind },
+            |return_kind| CodeQueryTypestateWitnessStepKind::EndSummaryGap { return_kind },
+        ),
+        source: public_program_point_site(workspace, step.source()),
         target: step
             .target()
-            .map(|target| program_point_site(workspace, target)),
-        origin: step.origin().map(|origin| call_site(workspace, origin)),
+            .map(|target| public_program_point_site(workspace, target)),
+        origin: step
+            .origin()
+            .map(|origin| public_call_site(workspace, origin)),
         evidence: public_evidence(step.proof(), step.completeness()),
-    }
-}
-
-fn program_point_site(
-    workspace: &WorkspaceAnalyzer,
-    handle: &ProgramPointHandle,
-) -> CodeQuerySourceSite {
-    let point = handle
-        .procedure()
-        .semantics()
-        .point(handle.id())
-        .expect("validated witness point resolves");
-    let locator = &handle
-        .procedure()
-        .semantics()
-        .source_mapping(point.source)
-        .expect("validated witness point has source mapping")
-        .locator;
-    public_site(workspace, locator)
-}
-
-fn call_site(workspace: &WorkspaceAnalyzer, handle: &CallSiteHandle) -> CodeQuerySourceSite {
-    let call = handle
-        .procedure()
-        .semantics()
-        .call_site(handle.id())
-        .expect("validated witness call resolves");
-    let locator = &handle
-        .procedure()
-        .semantics()
-        .source_mapping(call.source)
-        .expect("validated witness call has source mapping")
-        .locator;
-    public_site(workspace, locator)
-}
-
-fn public_site(workspace: &WorkspaceAnalyzer, locator: &SemanticLocator) -> CodeQuerySourceSite {
-    CodeQuerySourceSite {
-        path: locator.path().as_str().to_string(),
-        range: locator_range(workspace, locator),
     }
 }
 

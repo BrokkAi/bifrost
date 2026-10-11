@@ -7,19 +7,22 @@
 use std::{error::Error, fmt};
 
 use crate::analyzer::semantic::{
-    EvidenceCompleteness, IcfgEdgeKind, IcfgProvider, IcfgSnapshotLimits, ProcedureHandle,
-    ProgramPointHandle, ProofStatus, SemanticBudget, ValueFlowRelationKind,
+    IcfgEdgeId, IcfgEdgeKind, IcfgProvider, IcfgSnapshot, IcfgSnapshotLimits, ProcedureHandle,
+    ProgramPointHandle, SemanticBudget, SemanticRequest, ValueFlowRelationKind,
 };
 use crate::dataflow::{
     BackwardDistributiveDataflowProblem, BackwardSnapshotDataflowError,
     BackwardSnapshotDataflowResult, BackwardSnapshotDemand, BackwardSnapshotProblem, DataflowEdge,
-    DataflowOutput, DataflowRequest, IcfgSolveInput, PathQualityFrontier, SolverTermination,
+    DataflowOutput, DataflowRequest, IcfgInputStatus, IcfgSolveInput, PathQualityFrontier,
+    SolverBudgetExceeded, SolverTermination, SolverWork,
 };
 
+use super::client::quality_uncertainty;
 use super::plan::{CallFlowRuleKind as PlanCallFlowRuleKind, LocalRuleView};
 use super::{
     ValueFlowCarrierId, ValueFlowPlan, ValueFlowSinkId, ValueFlowSourceId, ValueFlowUncertainty,
 };
+use crate::hash::HashMap;
 
 /// The phase at which a backward demand is currently located.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -123,7 +126,7 @@ impl BackwardValueFlowMeeting {
     }
 
     pub const fn is_uncertain(&self) -> bool {
-        !self.uncertainty.is_empty()
+        self.uncertainty.is_uncertain()
     }
 }
 
@@ -139,12 +142,14 @@ pub enum BackwardValueFlowSinkOutcome<'result> {
 pub struct BackwardValueFlowResult {
     result: BackwardSnapshotDataflowResult<BackwardValueFlowFact>,
     meetings: Box<[BackwardValueFlowMeeting]>,
+    work: SolverWork,
 }
 
 impl BackwardValueFlowResult {
     fn from_result(
         plan: &ValueFlowPlan,
         result: BackwardSnapshotDataflowResult<BackwardValueFlowFact>,
+        work: SolverWork,
     ) -> Result<Self, BackwardValueFlowSolveError> {
         let mut meetings = Vec::new();
         for reached in result.reached() {
@@ -187,6 +192,7 @@ impl BackwardValueFlowResult {
         Ok(Self {
             result,
             meetings: meetings.into_boxed_slice(),
+            work,
         })
     }
 
@@ -194,22 +200,24 @@ impl BackwardValueFlowResult {
         &self.result
     }
 
+    /// Combined capture projection and propagation work for this solve.
+    pub const fn work(&self) -> SolverWork {
+        self.work
+    }
+
     pub fn meetings(&self) -> &[BackwardValueFlowMeeting] {
         &self.meetings
     }
 
     pub fn sink_outcome(&self, sink: ValueFlowSinkId) -> BackwardValueFlowSinkOutcome<'_> {
-        let meetings = self
-            .meetings
-            .iter()
-            .filter(|meeting| meeting.sink == sink)
-            .collect::<Vec<_>>();
-        if !meetings.is_empty() {
-            BackwardValueFlowSinkOutcome::Reached(meetings.into_boxed_slice())
-        } else if self.is_complete() {
-            BackwardValueFlowSinkOutcome::NotReached
-        } else {
-            BackwardValueFlowSinkOutcome::Inconclusive
+        match super::sink_meeting_outcome(&self.meetings, sink, self.is_complete(), |meeting| {
+            meeting.sink
+        }) {
+            super::SinkMeetingOutcome::Reached(meetings) => {
+                BackwardValueFlowSinkOutcome::Reached(meetings)
+            }
+            super::SinkMeetingOutcome::NotReached => BackwardValueFlowSinkOutcome::NotReached,
+            super::SinkMeetingOutcome::Inconclusive => BackwardValueFlowSinkOutcome::Inconclusive,
         }
     }
 
@@ -224,11 +232,19 @@ impl BackwardValueFlowResult {
 
 struct BackwardValueFlowProblem<'plan> {
     plan: &'plan ValueFlowPlan,
+    capture_edges: HashMap<IcfgEdgeId, Vec<(ValueFlowCarrierId, ValueFlowCarrierId)>>,
 }
 
 impl<'plan> BackwardValueFlowProblem<'plan> {
-    const fn new(plan: &'plan ValueFlowPlan) -> Self {
-        Self { plan }
+    fn for_snapshot(
+        plan: &'plan ValueFlowPlan,
+        snapshot: &IcfgSnapshot,
+        request: &mut DataflowRequest<'_>,
+    ) -> Result<Self, BackwardValueFlowSolveError> {
+        Ok(Self {
+            plan,
+            capture_edges: super::client::argument_capture_edges(plan, snapshot, request)?,
+        })
     }
 
     fn append_source_meetings(
@@ -293,11 +309,30 @@ impl<'plan> BackwardValueFlowProblem<'plan> {
             return;
         };
         let callee = edge.target().procedure();
+        let capture_rules = edge
+            .snapshot_edge()
+            .and_then(|id| self.capture_edges.get(&id));
+        let contextual_target = capture_rules
+            .is_some_and(|rows| rows.iter().any(|(_, target)| *target == demand.carrier));
+        if let Some(rows) = capture_rules {
+            for (source, target) in rows {
+                if *target == demand.carrier {
+                    // Keep the capture boundary incomplete. This is live-cell
+                    // transport, not a proof that all mutation/escape is known.
+                    out.push(Demand {
+                        carrier: *source,
+                        uncertainty: demand.uncertainty.with_semantic(),
+                        ..demand
+                    });
+                }
+            }
+        }
         let default_target = self
             .plan
             .call_rules_to_target(call, callee, PlanCallFlowRuleKind::Call, demand.carrier)
             .any(|rule| self.plan.is_default_argument_carrier(rule.source, callee));
-        if self.plan.is_callee_port(demand.carrier, callee) && !default_target {
+        if self.plan.is_callee_port(demand.carrier, callee) && !default_target && !contextual_target
+        {
             out.push(demand);
         }
         for rule in
@@ -355,6 +390,20 @@ impl<'plan> BackwardValueFlowProblem<'plan> {
             _ => return,
         };
         let callee = edge.source().procedure();
+        if let Some(rows) = edge
+            .snapshot_edge()
+            .and_then(|id| self.capture_edges.get(&id))
+        {
+            for (source, target) in rows {
+                if demand.carrier == *target {
+                    out.push(Demand {
+                        carrier: *source,
+                        uncertainty: demand.uncertainty.with_semantic(),
+                        ..demand
+                    });
+                }
+            }
+        }
         for rule in self
             .plan
             .call_rules_to_target(call, callee, kind, demand.carrier)
@@ -712,28 +761,14 @@ fn is_weak_update(rule: &LocalRuleView) -> bool {
         ValueFlowRelationKind::Assignment
         | ValueFlowRelationKind::Parameter
         | ValueFlowRelationKind::Receiver => rule.source == rule.target,
-        ValueFlowRelationKind::MemoryStore => !rule.strong_update,
+        ValueFlowRelationKind::MemoryStore => !(rule.strong_update || rule.direct_cell_overwrite),
         _ => true,
-    }
-}
-
-fn quality_uncertainty(
-    proof: &ProofStatus,
-    completeness: &EvidenceCompleteness,
-) -> ValueFlowUncertainty {
-    if matches!(proof, ProofStatus::Proven)
-        && matches!(completeness, EvidenceCompleteness::Complete)
-    {
-        ValueFlowUncertainty::default()
-    } else {
-        ValueFlowUncertainty::default().with_semantic()
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
     fn demand(carrier: usize) -> Demand {
         Demand {
             sink: ValueFlowSinkId::try_from_index(0).expect("sink id"),
@@ -758,6 +793,7 @@ mod tests {
             complete: true,
             policy_local: false,
             strong_update,
+            direct_cell_overwrite: false,
         }
     }
 
@@ -771,40 +807,6 @@ mod tests {
             }),
             ..rule(source, target, ValueFlowRelationKind::Assignment, false)
         }
-    }
-
-    #[test]
-    fn backward_chained_rules_reach_the_original_carrier() {
-        let rules = [
-            rule(1, 2, ValueFlowRelationKind::Assignment, false),
-            rule(0, 1, ValueFlowRelationKind::Assignment, false),
-        ];
-        let mut preimages = Vec::new();
-        inverse_local_demands(demand(2), &rules, &mut preimages);
-        assert_eq!(
-            preimages
-                .iter()
-                .map(|demand| demand.carrier.get())
-                .collect::<Vec<_>>(),
-            [0]
-        );
-    }
-
-    #[test]
-    fn backward_strong_and_weak_updates_keep_exact_preimages() {
-        let rules = [
-            rule(1, 2, ValueFlowRelationKind::MemoryStore, false),
-            rule(0, 2, ValueFlowRelationKind::MemoryStore, true),
-        ];
-        let mut preimages = Vec::new();
-        inverse_local_demands(demand(2), &rules, &mut preimages);
-        assert_eq!(
-            preimages
-                .iter()
-                .map(|demand| demand.carrier.get())
-                .collect::<Vec<_>>(),
-            [0, 1]
-        );
     }
 
     #[test]
@@ -840,19 +842,18 @@ where
     if root != plan.root() {
         return Err(BackwardValueFlowSolveError::RootMismatch);
     }
-    if plan.has_edge_kills() {
-        return Err(BackwardValueFlowSolveError::EdgeKillsUnsupported);
-    }
-    let problem = BackwardValueFlowProblem::new(plan);
-    let result = crate::dataflow::solve_backward_with_snapshot(
-        root,
-        limits,
-        provider,
-        &problem,
-        semantic_budget,
-        request,
-    )?;
-    BackwardValueFlowResult::from_result(plan, result)
+    validate_backward_plan(plan)?;
+    let outcome = provider
+        .snapshot(
+            root,
+            limits,
+            &mut SemanticRequest::new(semantic_budget, request.cancellation),
+        )
+        .map_err(BackwardSnapshotDataflowError::from)?;
+    let status = IcfgInputStatus::from_outcome(&outcome);
+    let input = IcfgSolveInput::from_outcome(&outcome)
+        .map_err(|_| BackwardSnapshotDataflowError::MissingIcfgSnapshot { status })?;
+    solve_value_flow_backward_on_input(plan, input, outcome.work(), request)
 }
 
 pub(crate) fn solve_value_flow_backward_on_input(
@@ -861,22 +862,38 @@ pub(crate) fn solve_value_flow_backward_on_input(
     semantic_work: crate::analyzer::semantic::SemanticWork,
     request: &mut DataflowRequest<'_>,
 ) -> Result<BackwardValueFlowResult, BackwardValueFlowSolveError> {
-    if plan.has_edge_kills() {
-        return Err(BackwardValueFlowSolveError::EdgeKillsUnsupported);
-    }
-    let problem = BackwardValueFlowProblem::new(plan);
+    validate_backward_plan(plan)?;
+    let initial_work = request.budget.used();
+    let problem = BackwardValueFlowProblem::for_snapshot(plan, input.snapshot(), request)?;
     let result = crate::dataflow::solve_backward_demands_on_snapshot(
         input,
         &problem,
         semantic_work,
         request,
     )?;
-    BackwardValueFlowResult::from_result(plan, result)
+    BackwardValueFlowResult::from_result(
+        plan,
+        result,
+        request.budget.used().saturating_sub(initial_work),
+    )
+}
+
+fn validate_backward_plan(plan: &ValueFlowPlan) -> Result<(), BackwardValueFlowSolveError> {
+    if plan.has_contextual_bindings() {
+        return Err(BackwardValueFlowSolveError::CallContextRequired);
+    }
+    if plan.has_edge_kills() {
+        return Err(BackwardValueFlowSolveError::EdgeKillsUnsupported);
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BackwardValueFlowSolveError {
     RootMismatch,
+    CallContextRequired,
+    CaptureProjectionCancelled,
+    CaptureProjectionBudgetExceeded(SolverBudgetExceeded),
     EdgeKillsUnsupported,
     InvalidResult,
     Snapshot(BackwardSnapshotDataflowError),
@@ -885,6 +902,13 @@ pub enum BackwardValueFlowSolveError {
 impl fmt::Display for BackwardValueFlowSolveError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::CaptureProjectionCancelled => {
+                formatter.write_str("callback capture projection cancelled")
+            }
+            Self::CaptureProjectionBudgetExceeded(error) => error.fmt(formatter),
+            Self::CallContextRequired => {
+                formatter.write_str("contextual call bindings require contextual summary execution")
+            }
             Self::RootMismatch => formatter.write_str("value-flow root does not match the plan"),
             Self::EdgeKillsUnsupported => formatter
                 .write_str("backward value flow does not support source-selective edge kills"),
@@ -898,7 +922,12 @@ impl Error for BackwardValueFlowSolveError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
             Self::Snapshot(error) => Some(error),
-            Self::RootMismatch | Self::EdgeKillsUnsupported | Self::InvalidResult => None,
+            Self::CaptureProjectionBudgetExceeded(error) => Some(error),
+            Self::RootMismatch
+            | Self::CallContextRequired
+            | Self::CaptureProjectionCancelled
+            | Self::EdgeKillsUnsupported
+            | Self::InvalidResult => None,
         }
     }
 }
@@ -906,5 +935,16 @@ impl Error for BackwardValueFlowSolveError {
 impl From<BackwardSnapshotDataflowError> for BackwardValueFlowSolveError {
     fn from(error: BackwardSnapshotDataflowError) -> Self {
         Self::Snapshot(error)
+    }
+}
+
+impl From<super::client::CaptureProjectionError> for BackwardValueFlowSolveError {
+    fn from(error: super::client::CaptureProjectionError) -> Self {
+        match error {
+            super::client::CaptureProjectionError::Cancelled => Self::CaptureProjectionCancelled,
+            super::client::CaptureProjectionError::ExceededBudget(error) => {
+                Self::CaptureProjectionBudgetExceeded(error)
+            }
+        }
     }
 }

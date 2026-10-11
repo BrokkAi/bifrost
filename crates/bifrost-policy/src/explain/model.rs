@@ -19,6 +19,8 @@ use std::str::FromStr;
 use serde::{Serialize, Serializer};
 use sha2::{Digest, Sha256};
 
+use brokk_bifrost_analysis::analyzer::canonical_hash::write_length_prefixed as write_field;
+
 use crate::definition::{PolicyAnalysisType, PolicyId};
 use crate::finding::{PolicyIncompleteReason, PolicySourceLocation};
 use crate::finding_identity::PolicyFindingId;
@@ -188,10 +190,7 @@ impl ExplanationNodeId {
 
 impl fmt::Display for ExplanationNodeId {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        for byte in self.0 {
-            write!(formatter, "{byte:02x}")?;
-        }
-        Ok(())
+        brokk_bifrost_analysis::analyzer::canonical_hash::write_lower_hex(&self.0, formatter)
     }
 }
 
@@ -200,13 +199,7 @@ impl Serialize for ExplanationNodeId {
     where
         S: Serializer,
     {
-        serializer.collect_str(self)
-    }
-}
-
-impl RetainedSize for ExplanationNodeId {
-    fn retained_size(&self) -> usize {
-        size_of::<Self>()
+        crate::serialize_display_value(self, serializer)
     }
 }
 
@@ -318,6 +311,14 @@ pub enum ExplanationSubject {
         byte_start: u64,
         byte_end: u64,
     },
+    /// One explicit flow or taint candidate: the origin (source) position the
+    /// tracked value should enter at, and the observation (sink) position it
+    /// should reach (issue 3686). Added after `bifrost_policy_explanation/v2`
+    /// shipped; it is additive, because no earlier question produces it.
+    FlowCandidate {
+        source: ExplanationPosition,
+        observation: ExplanationPosition,
+    },
 }
 
 impl RetainedSize for ExplanationSubject {
@@ -325,7 +326,34 @@ impl RetainedSize for ExplanationSubject {
         size_of::<Self>().saturating_add(match self {
             Self::Finding { location, .. } => retained_extra(location),
             Self::Candidate { path, .. } => path.capacity(),
+            Self::FlowCandidate {
+                source,
+                observation,
+            } => source
+                .path
+                .capacity()
+                .saturating_add(observation.path.capacity()),
         })
+    }
+}
+
+/// One nominated position inside a [`ExplanationSubject::FlowCandidate`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ExplanationPosition {
+    pub(super) path: String,
+    pub(super) byte_start: u64,
+    pub(super) byte_end: u64,
+}
+
+impl ExplanationPosition {
+    pub fn path(&self) -> &str {
+        &self.path
+    }
+    pub const fn byte_start(&self) -> u64 {
+        self.byte_start
+    }
+    pub const fn byte_end(&self) -> u64 {
+        self.byte_end
     }
 }
 
@@ -383,11 +411,11 @@ impl ExplanationTruncation {
     }
 
     fn omit_nodes(&mut self, count: u64) {
-        if count == 0 {
-            return;
-        }
-        self.nodes_truncated = true;
-        self.omitted_nodes_lower_bound = self.omitted_nodes_lower_bound.saturating_add(count);
+        super::add_omitted_amount(
+            &mut self.nodes_truncated,
+            &mut self.omitted_nodes_lower_bound,
+            count,
+        );
     }
 
     fn omit_depth_levels(&mut self, levels: u64) {
@@ -399,26 +427,19 @@ impl ExplanationTruncation {
     }
 
     fn omit_bytes(&mut self, bytes: u64) {
-        if bytes == 0 {
-            return;
-        }
-        self.bytes_truncated = true;
-        self.omitted_bytes_lower_bound = self.omitted_bytes_lower_bound.saturating_add(bytes);
+        super::add_omitted_amount(
+            &mut self.bytes_truncated,
+            &mut self.omitted_bytes_lower_bound,
+            bytes,
+        );
     }
 
     fn omit_text_bytes(&mut self, bytes: u64) {
-        if bytes == 0 {
-            return;
-        }
-        self.text_truncated = true;
-        self.omitted_text_bytes_lower_bound =
-            self.omitted_text_bytes_lower_bound.saturating_add(bytes);
-    }
-}
-
-impl RetainedSize for ExplanationTruncation {
-    fn retained_size(&self) -> usize {
-        size_of::<Self>()
+        super::add_omitted_amount(
+            &mut self.text_truncated,
+            &mut self.omitted_text_bytes_lower_bound,
+            bytes,
+        );
     }
 }
 
@@ -488,10 +509,7 @@ impl ExplanationGeneration {
 
 impl fmt::Display for ExplanationGeneration {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        for byte in self.0 {
-            write!(formatter, "{byte:02x}")?;
-        }
-        Ok(())
+        brokk_bifrost_analysis::analyzer::canonical_hash::write_lower_hex(&self.0, formatter)
     }
 }
 
@@ -500,7 +518,7 @@ impl Serialize for ExplanationGeneration {
     where
         S: Serializer,
     {
-        serializer.collect_str(self)
+        crate::serialize_display_value(self, serializer)
     }
 }
 
@@ -541,12 +559,6 @@ impl FromStr for ExplanationGeneration {
             return Err(ExplanationGenerationParseError);
         }
         Ok(Self(bytes))
-    }
-}
-
-impl RetainedSize for ExplanationGeneration {
-    fn retained_size(&self) -> usize {
-        size_of::<Self>()
     }
 }
 
@@ -628,7 +640,7 @@ impl PolicyExplanation {
     /// Serialize to canonical JSON. Field order is declaration order, so two
     /// equal explanations render byte-identically.
     pub fn to_json(&self) -> String {
-        serde_json::to_string(self).expect("the explanation model is serializable")
+        super::serialize_json(self, "the explanation model is serializable")
     }
 }
 
@@ -802,9 +814,15 @@ pub const WHY_ADAPTER_ANALYSIS_TYPES: &[PolicyAnalysisType] = &[
     PolicyAnalysisType::Flow,
 ];
 
-/// The analysis families [`super::explain_candidate`] can answer `why-not` for.
-pub const WHY_NOT_ADAPTER_ANALYSIS_TYPES: &[PolicyAnalysisType] =
-    &[PolicyAnalysisType::Match, PolicyAnalysisType::Assertion];
+/// The analysis families `why-not` can answer for: [`super::explain_candidate`]
+/// for `match` and `assertion`, and [`super::explain_flow_candidate`] for
+/// `flow` and `taint`.
+pub const WHY_NOT_ADAPTER_ANALYSIS_TYPES: &[PolicyAnalysisType] = &[
+    PolicyAnalysisType::Match,
+    PolicyAnalysisType::Assertion,
+    PolicyAnalysisType::Flow,
+    PolicyAnalysisType::Taint,
+];
 
 /// The analysis families [`super::rank_near_misses`] can rank candidates for.
 ///
@@ -861,6 +879,13 @@ pub enum ExplainError {
     },
     /// The nominated candidate range ends before it starts.
     ReversedCandidateRange { start: u64, end: u64 },
+    /// A `flow` or `taint` candidate is a pair: the origin (source) position
+    /// and the observation (sink) position. One position does not say which
+    /// value the question is about, so it is refused rather than guessed.
+    CandidateSourceRequired { analysis_type: PolicyAnalysisType },
+    /// A source position was nominated for a family whose candidate is one
+    /// position, so the extra position would be silently ignored.
+    CandidateSourceUnsupported { analysis_type: PolicyAnalysisType },
     /// The limits cannot hold even the mandatory root of an explanation.
     BudgetExhausted { limit: ExplanationBudgetLimit },
     /// The host could not load, select, or evaluate the policy an explanation
@@ -951,6 +976,19 @@ impl fmt::Display for ExplainError {
             Self::ReversedCandidateRange { start, end } => write!(
                 formatter,
                 "candidate byte range start {start} exceeds end {end}"
+            ),
+            Self::CandidateSourceRequired { analysis_type } => write!(
+                formatter,
+                "a why_not candidate for a {} policy names a source position as well as the \
+                 observation position; supply candidate_source (MCP) or \
+                 --explain-candidate-source (CLI)",
+                analysis_type.label()
+            ),
+            Self::CandidateSourceUnsupported { analysis_type } => write!(
+                formatter,
+                "a why_not candidate for a {} policy is one position; a source position \
+                 applies only to flow and taint policies",
+                analysis_type.label()
             ),
             Self::BudgetExhausted { limit } => write!(
                 formatter,
@@ -1329,11 +1367,6 @@ fn node_id(path: &[u32], node: &RetainedRaw, children: &[ExplanationNode]) -> Ex
 
 fn write_len(hasher: &mut Sha256, len: usize) {
     hasher.update(u64::try_from(len).unwrap_or(u64::MAX).to_be_bytes());
-}
-
-fn write_field(hasher: &mut Sha256, bytes: &[u8]) {
-    write_len(hasher, bytes.len());
-    hasher.update(bytes);
 }
 
 fn write_optional_field(hasher: &mut Sha256, value: Option<&str>) {

@@ -2,8 +2,7 @@
 //!
 //! A unit is one policy evaluated over one partition of the workspace -- for
 //! the match family, one seed file -- together with the exact set of inputs
-//! that execution read (`.agents/plans/impact-sliced-diff-base.md`,
-//! Milestone 2). Two runs over two workspaces may share a unit's product when
+//! that execution read. Runs over two workspaces may share a unit's product when
 //! every one of those reads still denotes the same content, which is what
 //! [`verify_read_set`] decides.
 //!
@@ -16,8 +15,8 @@
 
 use serde::de::{self, DeserializeSeed, MapAccess, SeqAccess, Visitor};
 use serde::{Deserializer, Serialize};
-use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
+use std::sync::{Mutex, OnceLock};
 
 use brokk_bifrost_analysis::analyzer::invalidation::{ArtifactVerdictLog, BudgetMode};
 use brokk_bifrost_analysis::analyzer::read_ledger::read_set_digest;
@@ -62,7 +61,22 @@ const NO_ACTIVE_MODELS: &str = "bifrost-policy-unit:no-active-models:v1";
 /// Bump this whenever a change makes either something this engine would no
 /// longer mint.
 ///
-/// The current value carries #3513: a declaration row is identified by its
+/// The current value carries #3387: a Rust call nested below `std`, `core`, or
+/// `alloc` keeps its extern-prelude identity when no activated model declares
+/// its owner/member surface, records an extraction gap for it, or summarizes
+/// it. When a model speaks to that path, its declaration gate decides whether
+/// the callable identity is proven. Cached findings and open-coverage results
+/// from the preceding engine can therefore disagree and must be recomputed.
+///
+/// The preceding value carried #3757: a Rust procedure whose implicit drops run
+/// no user code, whose method calls resolve completely, or whose std calls the
+/// reviewed std table models now concludes where the preceding engine left it
+/// open, and a finding of a derived-complete run is definite where the
+/// preceding engine reported it possible. A cached taint row from the
+/// preceding engine still carries the open coverage and the possible
+/// certainty, so it must be recomputed rather than replayed.
+///
+/// The preceding value carried #3513: a declaration row is identified by its
 /// code unit and covered range, and the optional structural leaf kind is
 /// presentation evidence the executor merges into the surviving row instead of
 /// part of the key. A cached row from the preceding engine spells one
@@ -108,7 +122,9 @@ const NO_ACTIVE_MODELS: &str = "bifrost-policy-unit:no-active-models:v1";
 /// this change exists to fix. The previous value was #3022, which took the byte
 /// anchors out of the locator's declaration segments; the one before that was
 /// #2968, which took the binding-plan hash out of the finding identity itself.
-const POLICY_SUBSTRATE_EPOCH: &str = "bifrost-policy-unit:substrate:3513-declaration-row-identity";
+// #3868 preserves cross-domain witness labels and dependency mitigation proof
+// in cached terminals. Older projected units lack this evidence and must miss.
+const POLICY_SUBSTRATE_EPOCH: &str = "bifrost-policy-unit:substrate:3868-dependency-configuration-terminal-evidence-and-3757-rust-drops-calls-and-definite-findings-python-hierarchy-match-terminal-taint-source-observation-and-binder-3387-model-aware-nested-stdlib-identities";
 
 /// The epoch every unit key and the evaluation row key carry.
 fn policy_substrate_epoch() -> StableDigest {
@@ -158,7 +174,7 @@ fn policy_substrate_epoch() -> StableDigest {
 /// projection authority drops a projection that names any other compile. A
 /// root served across a compile boundary therefore reports nothing rather
 /// than reporting something wrong, which is the one failure a store must not
-/// have (`.agents/plans/impact-sliced-diff-base.md`, Decision Log (5d)).
+/// have.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum UnitPartition {
     Seed {
@@ -345,8 +361,7 @@ pub(crate) struct RootProduct {
 /// of the product because those allowances are shared: a run that reused this
 /// root still has to charge what the root's own solve cost, or a later root
 /// would see an allowance no whole evaluation would have given it and the
-/// sliced run would reach a lane later than the whole run does
-/// (`.agents/plans/impact-sliced-diff-base.md`, Decision Log (5c)).
+/// sliced run would reach a lane later than the whole run does.
 #[derive(Debug, Clone, Copy, Default, Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct RootWork {
@@ -381,11 +396,10 @@ pub(crate) struct RootWork {
 /// The three charges are what this unit took out of the session's shared
 /// semantic ledgers, so a run that reuses the unit leaves those ledgers where
 /// the execution left them and the compile's remaining budget after the last
-/// unit is the budget a whole-workspace selector execution would have left
-/// (`.agents/plans/impact-sliced-diff-base.md`, Decision Log (5c)). There is
-/// no artifact charge: a unit whose execution retained artifact allocations is
-/// never published, because the allocations are process-local and a reused
-/// unit could not hand them to the compile.
+/// unit is the budget a whole-workspace selector execution would have left.
+/// There is no artifact charge: a unit whose execution retained artifact
+/// allocations is never published, because those allocations are process-local
+/// and a reused unit could not hand them to the compile.
 #[derive(Debug, Clone, Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct SelectorProduct {
@@ -516,6 +530,21 @@ struct ProjectionListSeed<'a> {
     budget: &'a PolicyBudget,
 }
 
+fn collect_seeded_sequence<'de, A, S>(
+    mut sequence: A,
+    mut seed: impl FnMut() -> S,
+) -> Result<Vec<S::Value>, A::Error>
+where
+    A: SeqAccess<'de>,
+    S: DeserializeSeed<'de>,
+{
+    let mut values = Vec::with_capacity(sequence.size_hint().unwrap_or_default());
+    while let Some(value) = sequence.next_element_seed(seed())? {
+        values.push(value);
+    }
+    Ok(values)
+}
+
 impl<'de> DeserializeSeed<'de> for ProjectionListSeed<'_> {
     type Value = Vec<TypestateProjectedFinding>;
 
@@ -534,17 +563,11 @@ impl<'de> Visitor<'de> for ProjectionListSeed<'_> {
         formatter.write_str("a list of projected typestate violations")
     }
 
-    fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
+    fn visit_seq<A>(self, seq: A) -> Result<Self::Value, A::Error>
     where
         A: SeqAccess<'de>,
     {
-        let mut projections = Vec::with_capacity(seq.size_hint().unwrap_or_default());
-        while let Some(projection) =
-            seq.next_element_seed(TypestateProjectedFindingSeed::new(self.budget))?
-        {
-            projections.push(projection);
-        }
-        Ok(projections)
+        collect_seeded_sequence(seq, || TypestateProjectedFindingSeed::new(self.budget))
     }
 }
 
@@ -677,15 +700,11 @@ impl<'de> Visitor<'de> for FindingListSeed<'_> {
         formatter.write_str("a list of policy findings")
     }
 
-    fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
+    fn visit_seq<A>(self, seq: A) -> Result<Self::Value, A::Error>
     where
         A: SeqAccess<'de>,
     {
-        let mut findings = Vec::with_capacity(seq.size_hint().unwrap_or_default());
-        while let Some(finding) = seq.next_element_seed(PolicyFindingSeed::new(self.budget))? {
-            findings.push(finding);
-        }
-        Ok(findings)
+        collect_seeded_sequence(seq, || PolicyFindingSeed::new(self.budget))
     }
 }
 
@@ -695,6 +714,12 @@ impl<'de> Visitor<'de> for FindingListSeed<'_> {
 /// `reads` is the ledger's own key set and `read_digest` is derived from it at
 /// construction, so the two can never disagree about which reads a unit's
 /// verification must cover.
+///
+/// `snapshot` is the content identity of the workspace whose name-index
+/// answers the unit read. A name-index read is proved by the names that moved
+/// between two workspaces, which holds only for a read set whose index answers
+/// are the first workspace's, so a reader verifies a unit's index reads only
+/// against what moved since that snapshot.
 #[derive(Debug, Clone)]
 pub struct PolicyUnit {
     key: PolicyUnitKey,
@@ -702,15 +727,18 @@ pub struct PolicyUnit {
     reads: Vec<ReadKey>,
     read_digest: ReadSetDigest,
     budget_mode: BudgetMode,
+    snapshot: StableDigest,
 }
 
 impl PolicyUnit {
-    /// Publish one unit's product under the reads that produced it.
+    /// Publish one unit's product under the reads that produced it, whose
+    /// name-index answers are those of the workspace identified by `snapshot`.
     pub(crate) fn new(
         key: PolicyUnitKey,
         product: PolicyUnitProduct,
         reads: Vec<ReadKey>,
         budget_mode: BudgetMode,
+        snapshot: StableDigest,
     ) -> Self {
         let read_digest = read_set_digest(&reads);
         Self {
@@ -719,6 +747,7 @@ impl PolicyUnit {
             reads,
             read_digest,
             budget_mode,
+            snapshot,
         }
     }
 
@@ -741,6 +770,20 @@ impl PolicyUnit {
     pub const fn budget_mode(&self) -> BudgetMode {
         self.budget_mode
     }
+
+    /// The content identity of the workspace whose name-index answers this
+    /// unit read.
+    pub const fn snapshot(&self) -> StableDigest {
+        self.snapshot
+    }
+
+    /// Whether any read of this unit is a name-index probe, the one kind of
+    /// read whose proof depends on the snapshot that recorded it.
+    pub fn reads_name_index(&self) -> bool {
+        self.reads
+            .iter()
+            .any(|read| matches!(read, ReadKey::Index { .. }))
+    }
 }
 
 /// Where published units are looked up and published.
@@ -748,7 +791,7 @@ impl PolicyUnit {
 /// One evaluation batch owns one store. Milestone 3 adds the persisted
 /// implementation behind the same two operations; nothing above this trait
 /// knows which one it is holding.
-pub trait PolicyUnitStore {
+pub trait PolicyUnitStore: Send {
     /// Load every unit `keys` names, before the lookups start.
     ///
     /// One policy asks about every seed file of the workspace, so a store that
@@ -1038,6 +1081,7 @@ fn unit_row(unit: &PolicyUnit) -> Result<PolicyUnitRow, PolicyUnitStoreError> {
         product,
         read_set_digest: *unit.read_digest.digest().as_bytes(),
         reads: unit.reads.clone(),
+        content_identity: *unit.snapshot.as_bytes(),
     })
 }
 
@@ -1092,7 +1136,13 @@ pub fn unit_of_row(
     budget: &PolicyBudget,
 ) -> Result<PolicyUnit, PolicyUnitStoreError> {
     let product = product_of_row(&row, budget)?;
-    let unit = PolicyUnit::new(key, product, row.reads, BudgetMode::Exhaustive);
+    let unit = PolicyUnit::new(
+        key,
+        product,
+        row.reads,
+        BudgetMode::Exhaustive,
+        StableDigest::from_array(row.content_identity),
+    );
     if unit.read_digest.digest().as_bytes() != &row.read_set_digest {
         return Err(PolicyUnitStoreError::new(
             "a published unit's read set does not digest to the identity it was published under"
@@ -1170,63 +1220,124 @@ impl WorkspaceUnitInputs {
     }
 }
 
+/// The content identity of one analyzed workspace snapshot, as a unit records
+/// the workspace that computed it.
+///
+/// The whole-workspace content identity folds every analyzed path with the
+/// blob it resolves to, every overlay, the per-language analysis epochs and
+/// the analyzer configuration, and carries no absolute path. Two snapshots
+/// with one identity therefore publish the same facts to every name index,
+/// which is the property a unit's index reads depend on. `None` when the
+/// analyzer states no identity, and such a workspace cannot publish or reuse a
+/// unit at all.
+pub fn workspace_snapshot(workspace: &WorkspaceAnalyzer) -> Option<StableDigest> {
+    workspace
+        .analyzer()
+        .workspace_content_identities()?
+        .whole_workspace()
+        .map(|identity| StableDigest::from_array(*identity.as_bytes()))
+}
+
+/// The two snapshots a comparison is between.
+///
+/// A unit computed on either one can be verified here: one computed on `base`
+/// against what moved between the base and the head, and one computed on
+/// `head` against the head itself. A unit computed on any other snapshot has
+/// read index answers this comparison says nothing about, and is recomputed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct UnitSnapshots {
+    /// The workspace the head is compared against.
+    pub base: StableDigest,
+    /// The workspace this evaluation runs on. Every unit it publishes carries
+    /// this identity.
+    pub head: StableDigest,
+}
+
+impl UnitSnapshots {
+    /// A comparison of one snapshot with itself: a full scan, or the base
+    /// half of a diff run.
+    pub const fn of(snapshot: StableDigest) -> Self {
+        Self {
+            base: snapshot,
+            head: snapshot,
+        }
+    }
+}
+
 /// Everything one evaluation needs to reuse units instead of recomputing them.
 ///
 /// Its presence is the whole condition: an evaluation that holds one has a
 /// store to look units up in and a workspace to verify them against, and one
 /// that does not executes exactly as it always has. There is no mode to set.
 ///
-/// The base half of a `--diff-base` run holds one too. Its store starts empty,
-/// so every unit is computed and published; its changed facts are the base
-/// against itself, which is the honest statement that nothing moved between
-/// the workspace its units were published against and the workspace they were
-/// published from.
+/// The base half of a `--diff-base` run holds one too. Its changed facts are
+/// the base against itself, which states that nothing moved, so it reuses
+/// exactly the units an earlier run computed on this same base -- a full scan
+/// of the base revision, or an earlier evaluation of it -- and recomputes
+/// every other one.
 pub struct PolicyIncrementalContext<'a> {
-    store: &'a RefCell<dyn PolicyUnitStore>,
+    store: &'a Mutex<dyn PolicyUnitStore>,
     workspace: &'a WorkspaceAnalyzer,
     changed: &'a ChangedFacts,
+    /// What moved between the head and itself, built from `changed` the first
+    /// time a unit computed on the head asks. Unused when the two snapshots
+    /// are one, because `changed` already says exactly that.
+    head_unchanged: OnceLock<ChangedFacts>,
+    snapshots: UnitSnapshots,
     inputs: WorkspaceUnitInputs,
     base: IncrementalBaseState,
     reuse_existing: bool,
     verdicts: ArtifactVerdictLog,
-    runs: RefCell<Vec<PolicyIncrementalRun>>,
-    units: RefCell<Vec<(PolicyId, Vec<PolicyUnitKey>)>>,
+    runs: Mutex<Vec<PolicyIncrementalRun>>,
+    units: Mutex<Vec<(PolicyId, Vec<PolicyUnitKey>)>>,
     /// Recomputed units stay provisional until their policy's complete unit
     /// key set is recorded. A sliced attempt can widen after recomputing one
     /// or more units; those products must not become visible to later runs.
-    staged: RefCell<HashMap<PolicyId, HashMap<PolicyUnitKey, PolicyUnit>>>,
+    staged: Mutex<HashMap<PolicyId, HashMap<PolicyUnitKey, PolicyUnit>>>,
 }
 
 impl<'a> PolicyIncrementalContext<'a> {
     pub fn new(
-        store: &'a RefCell<dyn PolicyUnitStore>,
+        store: &'a Mutex<dyn PolicyUnitStore>,
         workspace: &'a WorkspaceAnalyzer,
         changed: &'a ChangedFacts,
         inputs: WorkspaceUnitInputs,
         base: IncrementalBaseState,
+        snapshots: UnitSnapshots,
     ) -> Self {
+        debug_assert_eq!(
+            workspace_snapshot(workspace),
+            Some(snapshots.head),
+            "a context publishes under the identity of the workspace it evaluates"
+        );
         Self {
             store,
             workspace,
             changed,
+            head_unchanged: OnceLock::new(),
+            snapshots,
             inputs,
             base,
             reuse_existing: true,
             verdicts: ArtifactVerdictLog::default(),
-            runs: RefCell::new(Vec::new()),
-            units: RefCell::new(Vec::new()),
-            staged: RefCell::new(HashMap::new()),
+            runs: Mutex::new(Vec::new()),
+            units: Mutex::new(Vec::new()),
+            staged: Mutex::new(HashMap::new()),
         }
     }
 
-    /// Publish complete units from a full scan without trusting an earlier
-    /// unit. Comparing this workspace with itself cannot establish that an
-    /// older unit's cross-file dependencies are unchanged.
+    /// Publish complete units from a full scan without reusing any.
+    ///
+    /// A full scan is the exhaustive evaluation every other run is compared
+    /// with, so it computes every unit afresh. What it publishes carries the
+    /// scanned snapshot's identity, which is what lets a later diff run whose
+    /// base is that snapshot reuse it.
     pub fn for_publication(
-        store: &'a RefCell<dyn PolicyUnitStore>,
+        store: &'a Mutex<dyn PolicyUnitStore>,
         workspace: &'a WorkspaceAnalyzer,
         changed: &'a ChangedFacts,
         inputs: WorkspaceUnitInputs,
+        snapshot: StableDigest,
     ) -> Self {
         let mut context = Self::new(
             store,
@@ -1234,6 +1345,7 @@ impl<'a> PolicyIncrementalContext<'a> {
             changed,
             inputs,
             IncrementalBaseState::Evaluated,
+            UnitSnapshots::of(snapshot),
         );
         context.reuse_existing = false;
         context
@@ -1243,7 +1355,59 @@ impl<'a> PolicyIncrementalContext<'a> {
         self.reuse_existing
     }
 
-    pub const fn store(&self) -> &'a RefCell<dyn PolicyUnitStore> {
+    /// The content identity of the workspace this context evaluates.
+    pub const fn snapshot(&self) -> StableDigest {
+        self.snapshots.head
+    }
+
+    /// The snapshot whose name-index answers a unit computed here with
+    /// `reads` holds.
+    ///
+    /// The head computed it, but when none of its index probes names a name
+    /// that moved between the base and the head, the head answered every one
+    /// of them exactly as the base would: that is what the changed-name set
+    /// states. Such a unit is published as the base's, so a later head
+    /// compared with the same base verifies it against its own difference
+    /// from that base. A unit that probed a moved name holds only on this
+    /// head. An incomplete changed-name set proves nothing about the base.
+    pub fn publication_snapshot(&self, reads: &[ReadKey]) -> StableDigest {
+        let base_answers = self.changed.is_complete()
+            && reads.iter().all(|read| match read {
+                ReadKey::Index { family, key } => !self.changed.contains(*family, key),
+                _ => true,
+            });
+        if base_answers {
+            self.snapshots.base
+        } else {
+            self.snapshots.head
+        }
+    }
+
+    /// What moved between the snapshot that computed a unit and this
+    /// context's head, or `None` when the unit was computed on a snapshot this
+    /// comparison is not between.
+    ///
+    /// Only a name-index read depends on the answer: every other read is
+    /// checked against the head itself. A name-index read is proved by the
+    /// names that moved since the snapshot that recorded it, so a unit from
+    /// the base is checked against what moved between the base and the head,
+    /// a unit from the head against nothing, and a unit from anywhere else
+    /// cannot be checked at all.
+    pub fn changed_since(&self, unit_snapshot: StableDigest) -> Option<&ChangedFacts> {
+        if unit_snapshot == self.snapshots.head {
+            if self.snapshots.base == self.snapshots.head {
+                Some(self.changed)
+            } else {
+                Some(self.head_unchanged.get_or_init(|| self.changed.head_only()))
+            }
+        } else if unit_snapshot == self.snapshots.base {
+            Some(self.changed)
+        } else {
+            None
+        }
+    }
+
+    pub const fn store(&self) -> &'a Mutex<dyn PolicyUnitStore> {
         self.store
     }
 
@@ -1270,13 +1434,22 @@ impl<'a> PolicyIncrementalContext<'a> {
         // A successful sliced attempt has already committed through
         // record_units. Drop anything left by a widened or failed attempt, so
         // provisional products cannot leak into a later policy attempt.
-        self.staged.borrow_mut().remove(&run.policy_id);
-        self.runs.borrow_mut().push(run);
+        self.staged
+            .lock()
+            .expect("policy incremental staged units mutex poisoned")
+            .remove(&run.policy_id);
+        self.runs
+            .lock()
+            .expect("policy incremental runs mutex poisoned")
+            .push(run);
     }
 
     /// Keep one recomputed unit provisional until its policy succeeds.
     pub(crate) fn stage_unit(&self, policy_id: PolicyId, unit: PolicyUnit) {
-        let mut staged = self.staged.borrow_mut();
+        let mut staged = self
+            .staged
+            .lock()
+            .expect("policy incremental staged units mutex poisoned");
         let units = staged.entry(policy_id).or_default();
         assert!(
             units.insert(unit.key.clone(), unit).is_none(),
@@ -1292,7 +1465,8 @@ impl<'a> PolicyIncrementalContext<'a> {
     pub fn record_units(&self, policy_id: PolicyId, keys: Vec<PolicyUnitKey>) {
         let mut staged = self
             .staged
-            .borrow_mut()
+            .lock()
+            .expect("policy incremental staged units mutex poisoned")
             .remove(&policy_id)
             .unwrap_or_default();
         let mut seen = HashSet::with_capacity(keys.len());
@@ -1310,23 +1484,35 @@ impl<'a> PolicyIncrementalContext<'a> {
             staged.is_empty(),
             "every recomputed unit must be included in the complete unit-key set"
         );
-        let mut store = self.store.borrow_mut();
-        for unit in committed {
-            store.publish(unit);
+        {
+            let mut store = self.store.lock().expect("policy-unit store mutex poisoned");
+            for unit in committed {
+                store.publish(unit);
+            }
         }
-        self.units.borrow_mut().push((policy_id, keys));
+        self.units
+            .lock()
+            .expect("policy incremental units mutex poisoned")
+            .push((policy_id, keys));
     }
 
     /// The units each policy's product was merged from, in policy order.
     pub fn published_units(&self) -> Vec<(PolicyId, Vec<PolicyUnitKey>)> {
-        self.units.borrow().clone()
+        self.units
+            .lock()
+            .expect("policy incremental units mutex poisoned")
+            .clone()
     }
 
     /// The review of everything this evaluation reused, in policy order.
     pub fn review(&self) -> PolicyIncrementalReview {
         PolicyIncrementalReview {
             base: self.base,
-            policies: self.runs.borrow().clone(),
+            policies: self
+                .runs
+                .lock()
+                .expect("policy incremental runs mutex poisoned")
+                .clone(),
         }
     }
 }
@@ -1434,6 +1620,12 @@ impl WidenReason {
 /// policy enumerated forty units and recomputed one before the merge reached a
 /// cap" is the diagnosis a reader needs, and a widened policy that reported
 /// zeros would hide it.
+///
+/// The `base_` fields say the same of the base revision's evaluation of this
+/// policy in the same run. They are zero when the run evaluated no base -- it
+/// served the base from a stored evaluation, or reuse was off -- and a base
+/// that reused every unit an earlier scan of that revision published reports
+/// them all as reused.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct PolicyIncrementalRun {
     pub policy_id: PolicyId,
@@ -1444,6 +1636,10 @@ pub struct PolicyIncrementalRun {
     pub units_unbounded: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub widen_reason: Option<WidenReason>,
+    pub base_units_reused: u64,
+    pub base_units_recomputed: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub base_widen_reason: Option<WidenReason>,
 }
 
 impl PolicyIncrementalRun {
@@ -1471,7 +1667,22 @@ impl PolicyIncrementalRun {
             units_recomputed: 0,
             units_unbounded: 0,
             widen_reason: Some(reason),
+            base_units_reused: 0,
+            base_units_recomputed: 0,
+            base_widen_reason: None,
         }
+    }
+
+    /// Record what the base evaluation of the same policy did with its units.
+    fn with_base(mut self, base: &Self) -> Self {
+        assert_eq!(
+            self.policy_id, base.policy_id,
+            "a base run describes the same policy as the head run it annotates"
+        );
+        self.base_units_reused = base.units_reused;
+        self.base_units_recomputed = base.units_recomputed;
+        self.base_widen_reason = base.widen_reason;
+        self
     }
 }
 
@@ -1493,20 +1704,27 @@ pub struct PolicyIncrementalReview {
 /// other would ship two spellings of the same state.
 impl Serialize for IncrementalBaseState {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        serializer.serialize_str(self.stable_label())
+        serialize_stable_label(self.stable_label(), serializer)
     }
 }
 
 impl Serialize for IncrementalMode {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        serializer.serialize_str(self.stable_label())
+        serialize_stable_label(self.stable_label(), serializer)
     }
 }
 
 impl Serialize for WidenReason {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        serializer.serialize_str(self.stable_label())
+        serialize_stable_label(self.stable_label(), serializer)
     }
+}
+
+fn serialize_stable_label<S: serde::Serializer>(
+    label: &str,
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    serializer.serialize_str(label)
 }
 
 impl PolicyIncrementalReview {
@@ -1534,6 +1752,40 @@ impl PolicyIncrementalReview {
 
     pub const fn base(&self) -> IncrementalBaseState {
         self.base
+    }
+
+    /// This review with each policy annotated by what the base evaluation of
+    /// that policy, in the same run, did with its units.
+    ///
+    /// A policy the base did not evaluate keeps zero base counts: there was
+    /// no base work for it to describe.
+    pub fn with_base_runs(self, base: &Self) -> Self {
+        let policies = self
+            .policies
+            .into_iter()
+            .map(|run| match base.policy(&run.policy_id) {
+                Some(base_run) => run.with_base(base_run),
+                None => run,
+            })
+            .collect();
+        Self {
+            base: self.base,
+            policies,
+        }
+    }
+
+    /// How many units the base evaluation in this run reused.
+    pub fn reused_base_units(&self) -> u64 {
+        self.policies
+            .iter()
+            .fold(0, |total, run| total.saturating_add(run.base_units_reused))
+    }
+
+    /// How many units the base evaluation in this run recomputed.
+    pub fn recomputed_base_units(&self) -> u64 {
+        self.policies.iter().fold(0, |total, run| {
+            total.saturating_add(run.base_units_recomputed)
+        })
     }
 
     pub fn policies(&self) -> &[PolicyIncrementalRun] {
@@ -1585,6 +1837,9 @@ mod tests {
                     units_recomputed: 1,
                     units_unbounded: 0,
                     widen_reason: None,
+                    base_units_reused: 38,
+                    base_units_recomputed: 2,
+                    base_widen_reason: Some(WidenReason::MergedLimitReached),
                 },
                 PolicyIncrementalRun::whole_family(whole.clone()),
             ],

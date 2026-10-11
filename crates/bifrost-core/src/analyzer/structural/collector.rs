@@ -7,12 +7,12 @@
 //! remain outside this crate.
 
 use super::callable::CallSiteContext;
-use super::facts::{NormalizedNode, RoleTarget, StructuralFactRows};
+use super::facts::{NormalizedNode, RoleTarget, Span, StructuralFactRows};
 use super::kinds::NormalizedKind;
 use super::occurrences::OccurrenceRole;
 use super::spec::{PendingRoleTarget, RoleSink, RoleSinkParts, RoleSinkStop, StructuralSpec};
 use crate::analyzer::source_facts::PrimarySourceFactCollector;
-use crate::analyzer::tree_walk::{ParentIndex, node_range};
+use crate::analyzer::tree_walk::{ParentIndex, collect_parse_errors, node_range};
 use crate::cancellation::CancellationToken;
 use crate::compact_graph::CompactRowsBuilder;
 use crate::hash::HashMap;
@@ -95,8 +95,7 @@ impl<'a, 'tree> StructuralFactCollector<'a, 'tree> {
     }
 
     fn is_cancelled(&self) -> bool {
-        self.cancellation
-            .is_some_and(CancellationToken::is_cancelled)
+        crate::cancellation::optional_is_cancelled(self.cancellation)
     }
 
     fn admit(&self) -> Result<(), StructuralFactCollectorStop> {
@@ -148,18 +147,67 @@ impl<'a, 'tree> StructuralFactCollector<'a, 'tree> {
         } else {
             None
         };
+        let parenthesized = if normalized_kind == NormalizedKind::StringLiteral {
+            let value = self.spec.string_literal_parenthesized(node);
+            assert!(
+                !self.spec.supports_string_literal_parenthesized() || value.is_some(),
+                "{} structural adapter declares string-literal parenthesization support but grammar node {} has no exact value",
+                self.spec.language().config_label(),
+                node.grammar_name()
+            );
+            value
+        } else {
+            None
+        };
+        let is_async = normalized_kind
+            .satisfies(NormalizedKind::Callable)
+            .then(|| self.spec.async_callable_value(node))
+            .flatten();
+        let string_value = if normalized_kind == NormalizedKind::StringLiteral {
+            let value = self.spec.string_literal_value(node, self.source);
+            let requires_string_value = self.spec.supports_string_literal_value()
+                && matches!(node.kind(), "string_literal" | "raw_string_literal")
+                && !self
+                    .spec
+                    .string_literal_value_may_be_absent(node, self.source);
+            assert!(
+                !requires_string_value || value.is_some(),
+                "{} structural adapter declares string-literal value support but grammar node {} has no exact value",
+                self.spec.language().config_label(),
+                node.grammar_name()
+            );
+            value
+        } else {
+            None
+        };
+        let assignment_shape = (normalized_kind == NormalizedKind::Assignment)
+            .then(|| self.spec.assignment_shape(node))
+            .flatten();
+        let integer_literal_value = (normalized_kind == NormalizedKind::NumericLiteral)
+            .then(|| self.spec.integer_literal_value(node, self.source))
+            .flatten();
+        let duplicate_key = (normalized_kind == NormalizedKind::ObjectProperty)
+            .then(|| self.spec.duplicate_dictionary_key(node, self.source))
+            .flatten();
         self.nodes.push(NormalizedNode {
             kind: normalized_kind,
             occurrence,
             boolean_value,
+            parenthesized,
+            assignment_shape,
+            integer_literal_value,
+            duplicate_key,
+            is_async,
+            string_value,
             construct: self
                 .spec
-                .generator_construct(node, normalized_kind)
+                .generator_construct(node, normalized_kind, self.source)
                 .map(str::to_owned),
             parent: enclosing_normalized_id,
             name: None,
             subtree_end: fact_id + 1,
-            call_site: (normalized_kind == NormalizedKind::Call)
+            call_site: normalized_kind
+                .satisfies(NormalizedKind::Call)
                 .then(|| self.spec.call_site_facts(node, self.source, self.context))
                 .flatten(),
         });
@@ -169,28 +217,21 @@ impl<'a, 'tree> StructuralFactCollector<'a, 'tree> {
             "one AST node must produce at most one normalized fact"
         );
 
-        let embedded =
+        let embedded_facts =
             self.spec
                 .embedded_leaf_facts(node, normalized_kind, self.source, self.cancellation);
         if self.is_cancelled() {
             return Err(StructuralFactCollectorStop::Cancelled);
         }
-        let mut previous_end = range.start_byte;
-        for embedded in embedded {
+        let embedded_base = u32::try_from(self.nodes.len())
+            .expect("embedded structural fact ids must fit in a u32 before allocation");
+        for (embedded_index, embedded) in embedded_facts.iter().enumerate() {
             assert!(
-                embedded.range.start_byte < embedded.range.end_byte
-                    && range.start_byte <= embedded.range.start_byte
-                    && embedded.range.end_byte <= range.end_byte
-                    && (range.start_byte < embedded.range.start_byte
-                        || embedded.range.end_byte < range.end_byte),
-                "embedded fact range {:?} must be nonempty and contained by anchor {:?}",
+                range.start_byte <= embedded.range.start_byte
+                    && embedded.range.end_byte <= range.end_byte,
+                "embedded fact range {:?} must be contained by anchor {:?}",
                 embedded.range,
                 range
-            );
-            assert!(
-                embedded.range.start_byte >= previous_end,
-                "embedded facts must be ordered and non-overlapping: previous end {previous_end}, next {:?}",
-                embedded.range
             );
             assert!(
                 self.source.is_char_boundary(embedded.range.start_byte)
@@ -198,6 +239,20 @@ impl<'a, 'tree> StructuralFactCollector<'a, 'tree> {
                 "embedded fact range {:?} must use UTF-8 boundaries",
                 embedded.range
             );
+            if let Some(parent) = embedded.parent {
+                assert!(
+                    parent < embedded_index,
+                    "embedded fact {embedded_index} must refer to an earlier local parent {parent}"
+                );
+                let parent_fact = &embedded_facts[parent];
+                assert!(
+                    parent_fact.range.start_byte <= embedded.range.start_byte
+                        && embedded.range.end_byte <= parent_fact.range.end_byte,
+                    "embedded fact range {:?} must be contained by embedded parent {:?}",
+                    embedded.range,
+                    parent_fact.range
+                );
+            }
             self.admit()?;
             let embedded_id = u32::try_from(self.nodes.len())
                 .expect("embedded structural fact ids must fit in a u32 before allocation");
@@ -206,18 +261,38 @@ impl<'a, 'tree> StructuralFactCollector<'a, 'tree> {
                 kind: embedded.kind,
                 occurrence,
                 boolean_value: None,
-                construct: None,
-                parent: Some(fact_id),
+                parenthesized: None,
+                assignment_shape: None,
+                integer_literal_value: None,
+                duplicate_key: None,
+                is_async: None,
+                string_value: None,
+                construct: embedded.construct.clone(),
+                parent: Some(
+                    embedded
+                        .parent
+                        .map_or(fact_id, |parent| embedded_base + parent as u32),
+                ),
                 name: None,
                 subtree_end: embedded_id + 1,
                 call_site: None,
             });
             self.pending_roles.push(Vec::new());
-            self.pending_occurrence_roles.push(PendingOccurrence {
-                target: PendingOccurrenceTarget::Fact(embedded_id),
-                role: embedded.occurrence_role,
-            });
-            previous_end = embedded.range.end_byte;
+            if let Some(role) = embedded.occurrence_role {
+                self.pending_occurrence_roles.push(PendingOccurrence {
+                    target: PendingOccurrenceTarget::Fact(embedded_id),
+                    role,
+                });
+            }
+        }
+        for (embedded_index, embedded) in embedded_facts.iter().enumerate().rev() {
+            let embedded_id = embedded_base + embedded_index as u32;
+            let parent_id = embedded
+                .parent
+                .map_or(fact_id, |parent| embedded_base + parent as u32);
+            self.nodes[parent_id as usize].subtree_end = self.nodes[parent_id as usize]
+                .subtree_end
+                .max(self.nodes[embedded_id as usize].subtree_end);
         }
         Ok(fact_id)
     }
@@ -234,6 +309,7 @@ impl<'a, 'tree> StructuralFactCollector<'a, 'tree> {
         'tree: 'borrow,
     {
         RoleSink::new(
+            self.source,
             source_facts,
             self.max_work_items
                 .saturating_sub(self.nodes.len().saturating_add(self.role_count)),
@@ -249,6 +325,11 @@ impl<'a, 'tree> StructuralFactCollector<'a, 'tree> {
     /// passes a complete [`ParentIndex::new`] to [`Self::new`] instead.
     pub fn record_children(&mut self, node: Node<'tree>) {
         self.parents.record_children(node);
+    }
+
+    /// Return the parent index maintained by this structural walk.
+    pub fn parents(&self) -> &ParentIndex<'tree> {
+        &self.parents
     }
 
     /// Finish role extraction for `fact_id`, retaining exact AST node keys for
@@ -287,11 +368,33 @@ impl<'a, 'tree> StructuralFactCollector<'a, 'tree> {
         Ok(())
     }
 
-    /// Finalize parent subtree bounds and resolve all temporary AST node keys.
-    pub fn finish(self) -> Result<StructuralFactRows, StructuralFactCollectorStop> {
+    /// Finalize parent subtree bounds, resolve all temporary AST node keys, and
+    /// record the regions error recovery produced in the tree under `root`.
+    ///
+    /// `root` is the root of the tree the walk visited. Recovered regions are
+    /// read from the tree rather than from the walk's events because an
+    /// `ERROR` region is exactly where the walk may have admitted no fact.
+    pub fn finish(self, root: Node<'_>) -> Result<StructuralFactRows, StructuralFactCollectorStop> {
         if self.is_cancelled() {
             return Err(StructuralFactCollectorStop::Cancelled);
         }
+        let mut parse_errors = Vec::new();
+        collect_parse_errors(root, &mut parse_errors);
+        let recovered_regions = parse_errors
+            .into_iter()
+            .map(|error| {
+                assert!(
+                    error.range.end_byte <= self.source.len(),
+                    "recovered region {:?} ends past the {}-byte source",
+                    error.range,
+                    self.source.len()
+                );
+                Span {
+                    start_byte: error.range.start_byte,
+                    end_byte: error.range.end_byte,
+                }
+            })
+            .collect();
         let StructuralFactCollector {
             mut nodes,
             fact_by_ast_node,
@@ -389,6 +492,7 @@ impl<'a, 'tree> StructuralFactCollector<'a, 'tree> {
             nodes,
             roles.finish(),
             occurrence_rows.finish(),
+            recovered_regions,
         ))
     }
 }

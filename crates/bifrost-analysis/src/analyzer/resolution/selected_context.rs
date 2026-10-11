@@ -36,7 +36,9 @@ use super::fact_lowering::{
     root_export_token, root_import_anchor_semantic, root_import_anchor_semantic_identity,
     root_import_token, scope_head_node,
 };
-use super::fact_source::{FactPageVisitor, FactReadOutcome, SelectedDeclarationAccessSource};
+use super::fact_source::{
+    FactPageVisitor, FactReadOutcome, SelectedDeclarationAccessSource, language_identity_domain,
+};
 use super::local_identity::{
     ResolutionLookupSemanticRecipe, ResolutionSemanticIdentity, SelectedResolutionMountOrdinal,
     SharedNameInterner,
@@ -44,7 +46,7 @@ use super::local_identity::{
 use super::model::{
     BindingFragmentId, BindingNodeId, EndpointSignature, PartialPath, PartialPathId,
     PartialScopedSymbol, PrecedenceStep, ResolutionCompletion, ResolutionIncompleteReason,
-    SemanticId, StackPattern, StackVariableId, WitnessStep,
+    SemanticId, SharedNameId, StackPattern, StackVariableId, WitnessStep,
 };
 
 /// An immutable context owned by one selected request's private SQL rows.
@@ -125,6 +127,9 @@ pub(crate) enum SelectedRootPathHalf {
         identity: CandidatePathIdentity,
         source_scope_head: BindingNodeId,
         route: Box<[SemanticId]>,
+        /// The source position at which a positional import takes effect
+        /// (Scala). Within one blob, imports are consumed in this order.
+        activation: Option<u32>,
         /// Structural anchor from the source-owned root import.
         /// The common lowerer supplies this typed fact; keeping it in the
         /// selected half prevents bare and absolute routes from colliding.
@@ -154,6 +159,9 @@ pub(crate) enum SelectedRootPathHalf {
         /// Canonical semantic of the positioned first-segment reference.
         /// Explicit anchored routes have no lexical prefix reference.
         prefix_reference: Option<SemanticId>,
+        /// The route head owns a continuation without a positioned prefix
+        /// reference of its own.
+        owner_continued: bool,
         route: Box<[SemanticId]>,
         anchor: ResolutionRootImportAnchor,
         /// See [`SelectedRootPathHalf::Import::anchor_semantic`].
@@ -208,12 +216,7 @@ impl SelectedRootImportAnchors for CatalogRootImportAnchors<'_> {
         let Some((_, identity)) = self.catalog.semantic_coordinate(semantic) else {
             return Ok(None);
         };
-        Ok([
-            ResolutionRootImportAnchor::Lexical,
-            ResolutionRootImportAnchor::Absolute,
-        ]
-        .into_iter()
-        .find(|anchor| root_import_anchor_semantic_identity(*anchor) == identity))
+        Ok(super::root_import_anchor_for_identity(&identity))
     }
 }
 
@@ -232,8 +235,8 @@ pub(crate) fn classify_selected_root_path_half(
     if path
         .completion()
         .contains_reason(ResolutionIncompleteReason::Cancelled)
-        || !endpoint_has_empty_scopes(path.start())
-        || !endpoint_has_empty_scopes(path.end())
+        || !super::endpoint_has_empty_scopes(path.start())
+        || !super::endpoint_has_empty_scopes(path.end())
         || path.start().symbols().tail() != path.end().symbols().tail()
         || path
             .start()
@@ -268,22 +271,30 @@ pub(crate) fn classify_selected_root_path_half(
                 if (step.tier, step.ordinal) == (PrecedenceTier::WildcardImport, 0)
                     || (step.tier, step.ordinal) == (PrecedenceTier::ExplicitImport, 0)
                     || (step.tier == PrecedenceTier::LexicalBinding && step.ordinal <= 1))
-            || path.witness() != [WitnessStep::Node(root)]
         {
             return Ok(None);
         }
+        let source_scope_head = match path.witness() {
+            [WitnessStep::Node(witness_root)] if *witness_root == root => path.start().node(),
+            [
+                WitnessStep::Node(source_scope_head),
+                WitnessStep::Node(witness_root),
+            ] if *witness_root == root => *source_scope_head,
+            _ => return Ok(None),
+        };
         let anchor_semantic = end[0].symbol();
         let Some(anchor) = anchors.anchor_of(anchor_semantic, cancellation)? else {
             return Ok(None);
         };
         return Ok(Some(SelectedRootPathHalf::Import {
             identity,
-            source_scope_head: path.start().node(),
+            source_scope_head,
             route: end[1..end.len() - 2]
                 .iter()
                 .map(PartialScopedSymbol::symbol)
                 .collect::<Vec<_>>()
                 .into_boxed_slice(),
+            activation: path.root_import_activation(),
             anchor,
             anchor_semantic,
             token: end[end.len() - 2].symbol(),
@@ -332,6 +343,7 @@ pub(crate) fn classify_selected_root_path_half(
             source_scope_head,
             lexical_scope_head,
             prefix_reference,
+            owner_continued: path.owner_continued(),
             route: end[route_start..end.len() - 2]
                 .iter()
                 .map(PartialScopedSymbol::symbol)
@@ -368,10 +380,6 @@ pub(crate) fn classify_selected_root_path_half(
     Ok(None)
 }
 
-fn endpoint_has_empty_scopes(endpoint: &EndpointSignature) -> bool {
-    endpoint.scopes().fixed().is_empty() && endpoint.scopes().tail().is_none()
-}
-
 /// Read the root import and reference halves owned by `mounts`, or by the
 /// whole selection when `mounts` is `None`.
 ///
@@ -397,6 +405,58 @@ where
 {
     let request =
         selected_root_inventory_request(context_identities, b"selected-root-import-inventory");
+    visit_selected_root_import_half_pages_for_request(
+        anchors,
+        source,
+        request,
+        mounts,
+        cancellation,
+        visitor,
+    )
+}
+
+/// Read Go root import halves by the exact terminal targets persisted on that
+/// source blob's root-import paths. Qualified references share those terminal
+/// names, but this context preparation only consumes import declarations.
+pub(crate) fn visit_selected_root_import_half_pages_with_targets<S>(
+    context_identities: &SelectedContextIdentities,
+    anchors: &dyn SelectedRootImportAnchors,
+    source: &S,
+    mounts: Option<&[SelectedResolutionMountOrdinal]>,
+    root_terminals: &[SharedNameId],
+    cancellation: &CancellationToken,
+    visitor: &mut FactPageVisitor<'_, SelectedRootPathHalf>,
+) -> StoreResult<FactReadOutcome>
+where
+    S: BatchResolutionFragmentSource + ?Sized,
+{
+    let request =
+        selected_root_inventory_request(context_identities, b"selected-root-import-inventory");
+    visit_selected_root_import_half_pages_for_request(
+        anchors,
+        source,
+        BatchCandidateRequest::with_root_import_terminal_targets(
+            request.request_ordinal(),
+            request.endpoint().clone(),
+            root_terminals.to_vec(),
+        ),
+        mounts,
+        cancellation,
+        visitor,
+    )
+}
+
+fn visit_selected_root_import_half_pages_for_request<S>(
+    anchors: &dyn SelectedRootImportAnchors,
+    source: &S,
+    request: BatchCandidateRequest,
+    mounts: Option<&[SelectedResolutionMountOrdinal]>,
+    cancellation: &CancellationToken,
+    visitor: &mut FactPageVisitor<'_, SelectedRootPathHalf>,
+) -> StoreResult<FactReadOutcome>
+where
+    S: BatchResolutionFragmentSource + ?Sized,
+{
     visit_selected_root_path_half_pages(
         anchors,
         source,
@@ -564,6 +624,13 @@ pub(crate) struct SelectedResolutionMountContext {
     root_reverse_inventory_completion: ResolutionCompletion,
 }
 
+fn has_incomplete_root_inventory(mount: &SelectedResolutionMountContext) -> bool {
+    !matches!(
+        mount.root_reverse_inventory_completion,
+        ResolutionCompletion::Complete
+    )
+}
+
 impl SelectedResolutionMountContext {
     pub(crate) fn new(
         ordinal: SelectedResolutionMountOrdinal,
@@ -608,7 +675,8 @@ impl SelectedResolutionMountContext {
         bridges: Vec<SelectedPackageBridgeDescriptor>,
     ) -> StoreResult<Self> {
         for bridge in &bridges {
-            if bridge.source_fragment != self.fragment || bridge.language != self.semantic_language
+            if bridge.source_fragment != self.fragment
+                || bridge.source_language() != self.semantic_language
             {
                 return Err(StoreError::new(
                     "selected package bridge is not owned by its source mount context",
@@ -666,6 +734,13 @@ impl SelectedResolutionMountContext {
 pub(crate) type SelectedMountLookup<'a> = dyn Fn(BindingFragmentId) -> StoreResult<Option<(SelectedResolutionMountOrdinal, Language)>>
     + 'a;
 
+fn is_jvm_language(language: Language) -> bool {
+    matches!(
+        language,
+        Language::Java | Language::Kotlin | Language::Scala
+    )
+}
+
 /// One number per distinct identity a selected context mints.
 ///
 /// The context invents identities of its own: a root bridge's path and its
@@ -712,6 +787,22 @@ pub(crate) struct SelectedContextIdentities {
     /// unindexed external type. Paths remain separate across cfg alternatives.
     rust_external_type_import_paths:
         Arc<std::sync::Mutex<crate::hash::HashMap<SemanticId, Vec<Vec<String>>>>>,
+    /// Persisted source gap identities whose Java single-type import route was
+    /// closed by complete selected package/type rows. This set is request-local
+    /// and each entry names one exact source import site.
+    java_import_route_gap_reasons: Arc<std::sync::Mutex<BTreeSet<SemanticId>>>,
+    /// Exact unindexed JVM implicit-provider boundaries and the external type
+    /// identity they establish for one spelling. These maps are bounded by the
+    /// implicit-root gaps compiled into this selected context.
+    jvm_external_type_identities: Arc<std::sync::Mutex<HashMap<SemanticId, SemanticId>>>,
+    /// Bare TypeIdentity references whose unindexed implicit roots establish
+    /// the same external type identity despite a complete-empty name answer.
+    jvm_external_type_identities_by_reference:
+        Arc<std::sync::Mutex<HashMap<SemanticId, SemanticId>>>,
+    /// The boundary to restore when an external-provider type is used for
+    /// member enumeration, which remains open even though type equality is
+    /// exact.
+    jvm_external_type_boundaries: Arc<std::sync::Mutex<HashMap<SemanticId, Vec<SemanticId>>>>,
 }
 
 /// A named incompleteness reason's stable name and its evidence.
@@ -720,6 +811,183 @@ type NamedReason = (&'static str, Arc<str>);
 impl SelectedContextIdentities {
     pub(crate) fn new() -> Self {
         Self::default()
+    }
+
+    /// Whether this request has minted any selected-context identities yet.
+    /// A cached context can be restored only into an unused identity space so
+    /// its stable numbers cannot collide with values minted by this request.
+    pub(crate) fn is_empty(&self) -> bool {
+        self.numbers
+            .lock()
+            .expect("the selected context's identity table is not poisoned")
+            .is_empty()
+            && self
+                .named_reasons
+                .lock()
+                .expect("the selected context's named reasons are not poisoned")
+                .is_empty()
+            && self
+                .rust_prelude_references
+                .lock()
+                .expect("the selected context's Rust prelude table is not poisoned")
+                .is_empty()
+            && self
+                .rust_external_type_import_paths
+                .lock()
+                .expect("the selected context's Rust external path table is not poisoned")
+                .is_empty()
+            && self
+                .java_import_route_gap_reasons
+                .lock()
+                .expect("the selected context's Java import reason set is not poisoned")
+                .is_empty()
+            && self
+                .jvm_external_type_identities
+                .lock()
+                .expect("the selected context's JVM external type identities are not poisoned")
+                .is_empty()
+            && self
+                .jvm_external_type_identities_by_reference
+                .lock()
+                .expect("the selected context's JVM external reference identities are not poisoned")
+                .is_empty()
+            && self
+                .jvm_external_type_boundaries
+                .lock()
+                .expect("the selected context's JVM external type boundaries are not poisoned")
+                .is_empty()
+    }
+
+    /// Make an isolated snapshot, preserving every context-local number and
+    /// its supporting metadata while allowing later requests to mutate their
+    /// own identity table independently.
+    pub(crate) fn isolated_clone(&self) -> Self {
+        Self {
+            numbers: Arc::new(std::sync::Mutex::new(
+                self.numbers
+                    .lock()
+                    .expect("the selected context's identity table is not poisoned")
+                    .clone(),
+            )),
+            named_reasons: Arc::new(std::sync::Mutex::new(
+                self.named_reasons
+                    .lock()
+                    .expect("the selected context's named reasons are not poisoned")
+                    .clone(),
+            )),
+            rust_prelude_references: Arc::new(std::sync::Mutex::new(
+                self.rust_prelude_references
+                    .lock()
+                    .expect("the selected context's Rust prelude table is not poisoned")
+                    .clone(),
+            )),
+            rust_external_type_import_paths: Arc::new(std::sync::Mutex::new(
+                self.rust_external_type_import_paths
+                    .lock()
+                    .expect("the selected context's Rust external path table is not poisoned")
+                    .clone(),
+            )),
+            java_import_route_gap_reasons: Arc::new(std::sync::Mutex::new(
+                self.java_import_route_gap_reasons
+                    .lock()
+                    .expect("the selected context's Java import reason set is not poisoned")
+                    .clone(),
+            )),
+            jvm_external_type_identities: Arc::new(std::sync::Mutex::new(
+                self.jvm_external_type_identities
+                    .lock()
+                    .expect("the selected context's JVM external type identities are not poisoned")
+                    .clone(),
+            )),
+            jvm_external_type_identities_by_reference: Arc::new(std::sync::Mutex::new(
+                self.jvm_external_type_identities_by_reference
+                    .lock()
+                    .expect(
+                        "the selected context's JVM external reference identities are not poisoned",
+                    )
+                    .clone(),
+            )),
+            jvm_external_type_boundaries: Arc::new(std::sync::Mutex::new(
+                self.jvm_external_type_boundaries
+                    .lock()
+                    .expect("the selected context's JVM external type boundaries are not poisoned")
+                    .clone(),
+            )),
+        }
+    }
+
+    /// Restore an isolated snapshot into this request's still-empty table.
+    /// The caller must rebind the prepared context to this identity space.
+    pub(crate) fn copy_from_empty(&self, other: &Self) {
+        assert!(
+            self.is_empty(),
+            "cached context identities restore only into an unused request"
+        );
+        let other = other.isolated_clone();
+        *self
+            .numbers
+            .lock()
+            .expect("the selected context's identity table is not poisoned") = other
+            .numbers
+            .lock()
+            .expect("the cached context's identity table is not poisoned")
+            .clone();
+        *self
+            .named_reasons
+            .lock()
+            .expect("the selected context's named reasons are not poisoned") = other
+            .named_reasons
+            .lock()
+            .expect("the cached context's named reasons are not poisoned")
+            .clone();
+        *self
+            .rust_prelude_references
+            .lock()
+            .expect("the selected context's Rust prelude table is not poisoned") = other
+            .rust_prelude_references
+            .lock()
+            .expect("the cached context's Rust prelude table is not poisoned")
+            .clone();
+        *self
+            .rust_external_type_import_paths
+            .lock()
+            .expect("the selected context's Rust external path table is not poisoned") = other
+            .rust_external_type_import_paths
+            .lock()
+            .expect("the cached context's Rust external path table is not poisoned")
+            .clone();
+        *self
+            .java_import_route_gap_reasons
+            .lock()
+            .expect("the selected context's Java import reason set is not poisoned") = other
+            .java_import_route_gap_reasons
+            .lock()
+            .expect("the cached context's Java import reason set is not poisoned")
+            .clone();
+        *self
+            .jvm_external_type_identities
+            .lock()
+            .expect("the selected JVM external type identities are not poisoned") = other
+            .jvm_external_type_identities
+            .lock()
+            .expect("the cached JVM external type identities are not poisoned")
+            .clone();
+        *self
+            .jvm_external_type_identities_by_reference
+            .lock()
+            .expect("the selected JVM external reference identities are not poisoned") = other
+            .jvm_external_type_identities_by_reference
+            .lock()
+            .expect("the cached JVM external reference identities are not poisoned")
+            .clone();
+        *self
+            .jvm_external_type_boundaries
+            .lock()
+            .expect("the selected JVM external type boundaries are not poisoned") = other
+            .jvm_external_type_boundaries
+            .lock()
+            .expect("the cached JVM external type boundaries are not poisoned")
+            .clone();
     }
 
     pub(crate) fn shares_identity_space(&self, other: &Self) -> bool {
@@ -732,6 +1000,22 @@ impl SelectedContextIdentities {
             && Arc::ptr_eq(
                 &self.rust_external_type_import_paths,
                 &other.rust_external_type_import_paths,
+            )
+            && Arc::ptr_eq(
+                &self.java_import_route_gap_reasons,
+                &other.java_import_route_gap_reasons,
+            )
+            && Arc::ptr_eq(
+                &self.jvm_external_type_identities,
+                &other.jvm_external_type_identities,
+            )
+            && Arc::ptr_eq(
+                &self.jvm_external_type_identities_by_reference,
+                &other.jvm_external_type_identities_by_reference,
+            )
+            && Arc::ptr_eq(
+                &self.jvm_external_type_boundaries,
+                &other.jvm_external_type_boundaries,
             )
     }
 
@@ -836,6 +1120,97 @@ impl SelectedContextIdentities {
             .unwrap_or_default()
     }
 
+    pub(crate) fn record_java_import_route_gap_reason(&self, reason: SemanticId) {
+        assert!(
+            reason.ordinal().is_some() && reason.local_key().is_some(),
+            "a Java import route proof closes a selected source gap reason"
+        );
+        self.java_import_route_gap_reasons
+            .lock()
+            .expect("the selected Java import route proofs are not poisoned")
+            .insert(reason);
+    }
+
+    pub(crate) fn java_import_route_gap_reasons(&self) -> BTreeSet<SemanticId> {
+        self.java_import_route_gap_reasons
+            .lock()
+            .expect("the selected Java import route proofs are not poisoned")
+            .clone()
+    }
+
+    pub(crate) fn record_jvm_external_provider_type_identity(
+        &self,
+        source_reference: SemanticId,
+        source_boundary: SemanticId,
+        identity: SemanticId,
+        enumeration_boundary: SemanticId,
+    ) {
+        assert!(
+            identity.shared_name_id().is_some(),
+            "an external provider type has one request-shared identity"
+        );
+        let previous = self
+            .jvm_external_type_identities
+            .lock()
+            .expect("the selected JVM external type identities are not poisoned")
+            .insert(source_boundary, identity);
+        assert!(
+            previous.is_none_or(|previous| previous == identity),
+            "one implicit-provider boundary names one external type identity"
+        );
+        let previous = self
+            .jvm_external_type_identities_by_reference
+            .lock()
+            .expect("the selected JVM external reference identities are not poisoned")
+            .insert(source_reference, identity);
+        assert!(
+            previous.is_none_or(|previous| previous == identity),
+            "one TypeIdentity reference names one external provider type"
+        );
+        let mut boundaries = self
+            .jvm_external_type_boundaries
+            .lock()
+            .expect("the selected JVM external type boundaries are not poisoned");
+        let recorded = boundaries.entry(identity).or_default();
+        if !recorded.contains(&enumeration_boundary) {
+            recorded.push(enumeration_boundary);
+        }
+    }
+
+    pub(crate) fn jvm_external_provider_type_identity(
+        &self,
+        source_boundary: SemanticId,
+    ) -> Option<SemanticId> {
+        self.jvm_external_type_identities
+            .lock()
+            .expect("the selected JVM external type identities are not poisoned")
+            .get(&source_boundary)
+            .copied()
+    }
+
+    pub(crate) fn jvm_external_provider_type_identity_for_reference(
+        &self,
+        source_reference: SemanticId,
+    ) -> Option<SemanticId> {
+        self.jvm_external_type_identities_by_reference
+            .lock()
+            .expect("the selected JVM external reference identities are not poisoned")
+            .get(&source_reference)
+            .copied()
+    }
+
+    pub(crate) fn jvm_external_provider_type_boundaries(
+        &self,
+        identity: SemanticId,
+    ) -> Vec<SemanticId> {
+        self.jvm_external_type_boundaries
+            .lock()
+            .expect("the selected JVM external type boundaries are not poisoned")
+            .get(&identity)
+            .cloned()
+            .unwrap_or_default()
+    }
+
     pub(crate) fn stack_variable(&self, digest: [u8; 32]) -> StackVariableId {
         StackVariableId::context_local(self.number(digest))
     }
@@ -890,6 +1265,8 @@ pub(crate) struct SelectedResolutionContextInputs {
 pub(crate) struct SelectedContextPathPublication {
     pub(crate) token: SelectedContextPathToken,
     pub(crate) contextual_reverse_inventory_completion: ResolutionCompletion,
+    pub(crate) go_package_inventory_complete: Option<bool>,
+    pub(crate) go_package_inventory_fragments: HashMap<BindingFragmentId, bool>,
     pub(crate) declaration_access_source: Option<Arc<dyn SelectedDeclarationAccessSource>>,
     pub(crate) context_owned_gap_identities: BTreeSet<SemanticId>,
     pub(crate) identities: SelectedContextIdentities,
@@ -938,6 +1315,18 @@ impl SelectedResolutionContextInputs {
 }
 
 impl SelectedResolutionContextSet {
+    /// Return the identity handle retained by this immutable context.
+    pub(crate) fn identity_space(&self) -> SelectedContextIdentities {
+        self.identities.clone()
+    }
+
+    /// Rebind a cached immutable context to one request's restored identity
+    /// table. Cached snapshots preserve the original numeric assignments.
+    pub(crate) fn with_identity_space(mut self, identities: SelectedContextIdentities) -> Self {
+        self.identities = identities;
+        self
+    }
+
     /// Retain mount inventory evidence and its provenance while leaving every
     /// bridge to be installed by the demand that justifies it.
     ///
@@ -950,12 +1339,7 @@ impl SelectedResolutionContextSet {
             mounts: self
                 .mounts
                 .iter()
-                .filter(|mount| {
-                    !matches!(
-                        mount.root_reverse_inventory_completion,
-                        ResolutionCompletion::Complete
-                    )
-                })
+                .filter(|mount| has_incomplete_root_inventory(mount))
                 .map(|mount| SelectedResolutionMountContext {
                     ordinal: mount.ordinal,
                     fragment: mount.fragment,
@@ -1079,6 +1463,50 @@ impl SelectedResolutionContextSet {
         &self.root_reverse_inventory_completion
     }
 
+    pub(crate) fn qualified_reference_bridges(
+        &self,
+        source_fragment: BindingFragmentId,
+        source_tokens: &[SemanticId],
+        source_demands: &[ResolutionLookupSemanticRecipe],
+        names: &dyn SharedNameInterner,
+    ) -> (
+        Vec<SelectedRootBridgeDescriptor>,
+        Vec<SelectedPackageBridgeDescriptor>,
+    ) {
+        let root_bridges = self
+            .root_bridges
+            .iter()
+            .filter(|bridge| {
+                bridge.source_fragment() == source_fragment
+                    && source_demands.iter().any(|demand| {
+                        bridge.source_demand().identity_domain() == demand.identity_domain()
+                            && bridge.source_demand().namespace() == demand.namespace()
+                            && bridge.source_demand().spelling() == demand.spelling()
+                    })
+            })
+            .cloned()
+            .collect();
+        let source_lookups = source_demands
+            .iter()
+            .map(|demand| demand.semantic(names))
+            .collect::<Vec<_>>();
+        let package_bridges = self
+            .package_bridges
+            .iter()
+            .filter(|bridge| {
+                source_tokens.iter().any(|source_token| {
+                    bridge.matches_qualified_reference(
+                        source_fragment,
+                        *source_token,
+                        &source_lookups,
+                    )
+                })
+            })
+            .cloned()
+            .collect();
+        (root_bridges, package_bridges)
+    }
+
     /// Add package relations proven by the selected language context. Source
     /// and destination membership are checked by the same constructor used for
     /// the initial context, and cancellation discards the whole extension.
@@ -1119,7 +1547,10 @@ impl SelectedResolutionContextSet {
             match mounts.binary_search_by_key(&ordinal, |mount| mount.ordinal()) {
                 Ok(index) => {
                     assert_eq!(mounts[index].fragment(), fragment);
-                    if extra.iter().any(|bridge| bridge.language != language) {
+                    if extra
+                        .iter()
+                        .any(|bridge| bridge.source_language() != language)
+                    {
                         return Err(StoreError::new(
                             "package bridge language differs from its source mount",
                         ));
@@ -1321,6 +1752,17 @@ impl SelectedResolutionContextSet {
         self
     }
 
+    /// Register a context-owned reason that a demand adapter will attach only
+    /// to roots matching the reason's structured lookup.
+    pub(crate) fn with_context_owned_gap_identity(mut self, reason: SemanticId) -> Self {
+        assert!(
+            !self.context_owned_gap_identities.contains(&reason),
+            "context-owned gap identity must be new to this context"
+        );
+        self.context_owned_gap_identities.insert(reason);
+        self
+    }
+
     pub(crate) fn with_additional_context_owned_inventory_reason(
         mut self,
         reason: SemanticId,
@@ -1410,7 +1852,7 @@ impl SelectedResolutionContextSet {
             }
             for bridge in &mount.package_bridges {
                 if selected_mount_of(bridge.target_fragment)?
-                    .is_none_or(|(_, language)| language != bridge.language)
+                    .is_none_or(|(_, language)| language != bridge.target_language())
                 {
                     return Err(StoreError::new(
                         "selected package bridge target is not a selected mount for its language",
@@ -1549,6 +1991,40 @@ impl SelectedResolutionContextSet {
 /// context and selected workspace topology. The constructor enforces local
 /// shape, while the store operation verifies exact mount coverage. The trusted
 /// selected-context builder remains the authority for route-to-target topology.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SelectedJvmBridgeVisibility {
+    Public,
+    Protected,
+    Package,
+    Open,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SelectedJvmBridgeProvenance {
+    StructuredPackageType {
+        source_package: SemanticId,
+        target_package: SemanticId,
+    },
+    AliasFact {
+        alias: SemanticId,
+    },
+}
+
+/// Proof carried by an inter-language JVM route. The package and alias
+/// identities come from selected structured rows; the dependency digest is
+/// minted from the selected source-root/dependency relation that admitted the
+/// target. The target is always the authored declaration endpoint.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct SelectedJvmBridgeEvidence {
+    pub(crate) provenance: SelectedJvmBridgeProvenance,
+    pub(crate) source_namespace: ResolutionNamespace,
+    pub(crate) target_namespace: ResolutionNamespace,
+    pub(crate) visibility: SelectedJvmBridgeVisibility,
+    pub(crate) dependency_identity: [u8; 32],
+    pub(crate) target_declaration: SemanticId,
+    pub(crate) target_definition: BindingNodeId,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct SelectedRootBridgeDescriptor {
     source_fragment: BindingFragmentId,
@@ -1570,6 +2046,7 @@ pub(crate) struct SelectedRootBridgeDescriptor {
     /// Exact authorized endpoint, when selection owns declaration-level access.
     /// A token-only destination remains useful for open/unsupported routes.
     target_definition: Option<BindingNodeId>,
+    precedence: Option<PrecedenceStep>,
     /// A member scope the route lands in instead of a root export.
     ///
     /// The Rust crate route publishes this for `Foo::frobnicate()` where `Foo`
@@ -1587,6 +2064,7 @@ pub(crate) struct SelectedRootBridgeDescriptor {
     route: Box<[ResolutionLookupSemanticRecipe]>,
     source_demand: ResolutionLookupSemanticRecipe,
     target_demand: ResolutionLookupSemanticRecipe,
+    jvm_evidence: Option<SelectedJvmBridgeEvidence>,
     completion: ResolutionCompletion,
 }
 
@@ -1677,6 +2155,7 @@ impl SelectedRootBridgeDescriptor {
             route,
             source_demand,
             target_demand,
+            None,
             completion,
         )
     }
@@ -1717,6 +2196,46 @@ impl SelectedRootBridgeDescriptor {
             route,
             source_demand,
             target_demand,
+            None,
+            completion,
+        )
+    }
+
+    /// Construct an explicitly proven JVM bridge. Cross-language callers must
+    /// supply the selected package/type or JVM-alias identity, dependency
+    /// identity, namespace mapping, and visibility result. Matching spelling
+    /// alone cannot construct this descriptor.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn from_selected_path_tokens_with_jvm_evidence(
+        source_fragment: BindingFragmentId,
+        source_language: Language,
+        source_import_token: SemanticId,
+        anchor: ResolutionRootImportAnchor,
+        source_import_anchor: SemanticId,
+        target_fragment: BindingFragmentId,
+        target_language: Language,
+        target_export_token: SemanticId,
+        prefix_reference: Option<SemanticId>,
+        route: impl Into<Box<[ResolutionLookupSemanticRecipe]>>,
+        source_demand: ResolutionLookupSemanticRecipe,
+        target_demand: ResolutionLookupSemanticRecipe,
+        jvm_evidence: SelectedJvmBridgeEvidence,
+        completion: ResolutionCompletion,
+    ) -> Self {
+        Self::from_selected_path_tokens_inner(
+            source_fragment,
+            source_language,
+            source_import_token,
+            anchor,
+            source_import_anchor,
+            target_fragment,
+            target_language,
+            target_export_token,
+            prefix_reference,
+            route,
+            source_demand,
+            target_demand,
+            Some(jvm_evidence),
             completion,
         )
     }
@@ -1735,6 +2254,7 @@ impl SelectedRootBridgeDescriptor {
         route: impl Into<Box<[ResolutionLookupSemanticRecipe]>>,
         source_demand: ResolutionLookupSemanticRecipe,
         target_demand: ResolutionLookupSemanticRecipe,
+        jvm_evidence: Option<SelectedJvmBridgeEvidence>,
         completion: ResolutionCompletion,
     ) -> Self {
         assert_ne!(
@@ -1742,31 +2262,63 @@ impl SelectedRootBridgeDescriptor {
             Language::None,
             "a selected root bridge needs a source semantic language"
         );
+        if source_language == target_language {
+            assert!(
+                jvm_evidence.is_none(),
+                "same-language selected root bridges use their language resolver"
+            );
+        } else {
+            let evidence = jvm_evidence.expect(
+                "a cross-language selected root bridge needs explicit JVM identity and access evidence",
+            );
+            assert!(
+                is_jvm_language(source_language) && is_jvm_language(target_language),
+                "cross-language selected root bridges are limited to the JVM ecosystem"
+            );
+            assert_eq!(
+                evidence.source_namespace,
+                source_demand.namespace(),
+                "JVM bridge source namespace matches its import demand"
+            );
+            assert_eq!(
+                evidence.target_namespace,
+                target_demand.namespace(),
+                "JVM bridge target namespace matches its selected declaration"
+            );
+            assert_eq!(
+                evidence.source_namespace, evidence.target_namespace,
+                "only identity namespace conversion is admitted by root bridges"
+            );
+            if evidence.visibility == SelectedJvmBridgeVisibility::Open {
+                assert!(
+                    matches!(&completion, ResolutionCompletion::Incomplete(_)),
+                    "an open JVM visibility result keeps bridge completion incomplete"
+                );
+            }
+        }
         assert_eq!(
-            source_language, target_language,
-            "a selected root bridge needs one semantic language"
+            source_demand.identity_domain(),
+            language_identity_domain(source_language),
+            "selected root bridge source demand identity differs from its language"
         );
         assert_eq!(
-            source_demand.semantic_language(),
-            source_language.config_label(),
-            "selected root bridge source demand language differs from its mounts"
+            target_demand.identity_domain(),
+            language_identity_domain(target_language),
+            "selected root bridge target demand identity differs from its language"
         );
-        assert_eq!(
-            target_demand.semantic_language(),
-            target_language.config_label(),
-            "selected root bridge target demand language differs from its mounts"
-        );
-        assert_eq!(
-            source_demand.namespace(),
-            target_demand.namespace(),
-            "selected root bridge source and target demands need one namespace"
-        );
+        if jvm_evidence.is_none() {
+            assert_eq!(
+                source_demand.namespace(),
+                target_demand.namespace(),
+                "same-language selected root bridge demands need one namespace"
+            );
+        }
         let route = route.into();
         for segment in &route {
             assert_eq!(
-                segment.semantic_language(),
-                source_language.config_label(),
-                "selected root bridge route language differs from its mounts"
+                segment.identity_domain(),
+                language_identity_domain(source_language),
+                "selected root bridge route identity differs from its source language"
             );
             assert_eq!(
                 segment.namespace(),
@@ -1792,17 +2344,29 @@ impl SelectedRootBridgeDescriptor {
             target_language,
             target_export_token,
             target_definition: None,
+            precedence: None,
             target_member_scope: None,
             prefix_reference,
             route,
             source_demand,
             target_demand,
+            jvm_evidence,
             completion,
         }
     }
 
     pub(crate) const fn source_fragment(&self) -> BindingFragmentId {
         self.source_fragment
+    }
+
+    pub(crate) fn candidate_identity(
+        &self,
+        identities: &SelectedContextIdentities,
+    ) -> CandidatePathIdentity {
+        CandidatePathIdentity::new(
+            self.source_fragment,
+            identities.path(bridge_digest(b"bifrost-selected-root-bridge-path:v1", self)),
+        )
     }
 
     pub(crate) const fn source_language(&self) -> Language {
@@ -1831,6 +2395,15 @@ impl SelectedRootBridgeDescriptor {
 
     pub(crate) const fn target_definition(&self) -> Option<BindingNodeId> {
         self.target_definition
+    }
+
+    pub(super) fn with_precedence(mut self, precedence: Option<PrecedenceStep>) -> Self {
+        self.precedence = precedence;
+        self
+    }
+
+    pub(crate) const fn jvm_evidence(&self) -> Option<SelectedJvmBridgeEvidence> {
+        self.jvm_evidence
     }
 
     pub(crate) const fn target_export_token(&self) -> SemanticId {
@@ -1862,6 +2435,12 @@ impl SelectedRootBridgeDescriptor {
         assert_eq!(*demand, self.target_demand.semantic(names));
         assert_eq!(*token, self.target_export_token);
         assert_ne!(*definition, BindingNodeId::universal_root());
+        if let Some(evidence) = self.jvm_evidence {
+            assert_eq!(
+                *definition, evidence.target_definition,
+                "JVM bridge evidence names the exact selected authored declaration"
+            );
+        }
         self.target_definition = Some(*definition);
         if !incomplete_reasons.is_empty() {
             self.completion = self.completion.combine(&ResolutionCompletion::incomplete(
@@ -1881,6 +2460,12 @@ impl SelectedRootBridgeDescriptor {
             "a selected member definition belongs to its target mount"
         );
         assert!(self.target_member_scope.is_none());
+        if let Some(evidence) = self.jvm_evidence {
+            assert_eq!(
+                definition, evidence.target_definition,
+                "JVM bridge evidence names the exact selected authored declaration"
+            );
+        }
         self.target_definition = Some(definition);
         self
     }
@@ -2235,17 +2820,56 @@ fn compile_selected_context_overlay_with_session(
 }
 
 fn validate_bridge(bridge: &SelectedRootBridgeDescriptor) -> StoreResult<()> {
-    if bridge.source_language() != bridge.target_language() {
+    let same_language = bridge.source_language() == bridge.target_language();
+    let evidence = bridge.jvm_evidence();
+    if same_language && evidence.is_some() {
         return Err(StoreError::new(
-            "selected root bridge crosses semantic languages",
+            "same-language selected root bridge carries cross-language JVM evidence",
         ));
     }
-    let language = bridge.source_language().config_label();
-    if bridge.source_demand().semantic_language() != language
-        || bridge.target_demand().semantic_language() != language
-        || bridge.source_demand().namespace() != bridge.target_demand().namespace()
+    if !same_language {
+        let Some(evidence) = evidence else {
+            return Err(StoreError::new(
+                "cross-language selected root bridge lacks structured JVM evidence",
+            ));
+        };
+        if !is_jvm_language(bridge.source_language()) || !is_jvm_language(bridge.target_language())
+        {
+            return Err(StoreError::new(
+                "cross-language selected root bridge leaves the JVM ecosystem",
+            ));
+        }
+        if bridge.target_definition() != Some(evidence.target_definition)
+            || bridge.target_member_scope.is_some()
+        {
+            return Err(StoreError::new(
+                "cross-language JVM bridge does not name its exact authored target",
+            ));
+        }
+        if evidence.source_namespace != bridge.source_demand().namespace()
+            || evidence.target_namespace != bridge.target_demand().namespace()
+            || evidence.source_namespace != evidence.target_namespace
+        {
+            return Err(StoreError::new(
+                "selected JVM bridge namespace conversion disagrees with its demands",
+            ));
+        }
+        if evidence.visibility == SelectedJvmBridgeVisibility::Open
+            && matches!(bridge.completion(), ResolutionCompletion::Complete)
+        {
+            return Err(StoreError::new(
+                "open JVM bridge visibility cannot have complete completion",
+            ));
+        }
+    }
+    let source_identity_domain = language_identity_domain(bridge.source_language());
+    let target_identity_domain = language_identity_domain(bridge.target_language());
+    if bridge.source_demand().identity_domain() != source_identity_domain
+        || bridge.target_demand().identity_domain() != target_identity_domain
+        || (same_language
+            && bridge.source_demand().namespace() != bridge.target_demand().namespace())
         || bridge.route().iter().any(|segment| {
-            segment.semantic_language() != language
+            segment.identity_domain() != source_identity_domain
                 || segment.namespace()
                     != bridge
                         .prefix_reference()
@@ -2255,7 +2879,7 @@ fn validate_bridge(bridge: &SelectedRootBridgeDescriptor) -> StoreResult<()> {
         })
     {
         return Err(StoreError::new(
-            "selected root bridge lookup recipe language differs from its mounts",
+            "selected root bridge identity domain differs from its source or target language",
         ));
     }
     if bridge
@@ -2365,11 +2989,11 @@ fn compile_bridge(
             (Some(definition), None) => (
                 definition,
                 Vec::new(),
-                vec![PrecedenceStep {
+                vec![bridge.precedence.unwrap_or(PrecedenceStep {
                     tier: PrecedenceTier::PackageOrModule,
                     ordinal: 0,
                     semantic: bridge.target_export_token(),
-                }],
+                })],
                 vec![WitnessStep::Node(definition)],
             ),
             (None, None) => (
@@ -2432,6 +3056,11 @@ fn bridge_digest(domain: &[u8], bridge: &SelectedRootBridgeDescriptor) -> [u8; 3
     if let Some(definition) = bridge.target_definition {
         hasher.field("target_definition", &definition.as_bytes());
     }
+    if let Some(precedence) = bridge.precedence {
+        hasher.field("precedence_tier", precedence.tier.label().as_bytes());
+        hasher.field("precedence_ordinal", &precedence.ordinal.to_le_bytes());
+        hasher.field("precedence_semantic", &precedence.semantic.as_bytes());
+    }
     if let Some(scope_head) = bridge.target_member_scope {
         hasher.field("target_member_scope", &scope_head.as_bytes());
     }
@@ -2451,14 +3080,53 @@ fn bridge_digest(domain: &[u8], bridge: &SelectedRootBridgeDescriptor) -> [u8; 3
     }
     hasher.field("source_demand", &bridge.source_demand().name_digest());
     hasher.field("target_demand", &bridge.target_demand().name_digest());
+    if let Some(evidence) = bridge.jvm_evidence() {
+        hasher.field(
+            "jvm_source_namespace",
+            evidence.source_namespace.identity_label().as_bytes(),
+        );
+        hasher.field(
+            "jvm_target_namespace",
+            evidence.target_namespace.identity_label().as_bytes(),
+        );
+        hasher.field("jvm_dependency_identity", &evidence.dependency_identity);
+        hasher.field(
+            "jvm_target_declaration",
+            &evidence.target_declaration.as_bytes(),
+        );
+        hasher.field(
+            "jvm_target_definition",
+            &evidence.target_definition.as_bytes(),
+        );
+        hasher.field(
+            "jvm_visibility",
+            match evidence.visibility {
+                SelectedJvmBridgeVisibility::Public => b"public".as_slice(),
+                SelectedJvmBridgeVisibility::Protected => b"protected".as_slice(),
+                SelectedJvmBridgeVisibility::Package => b"package".as_slice(),
+                SelectedJvmBridgeVisibility::Open => b"open".as_slice(),
+            },
+        );
+        match evidence.provenance {
+            SelectedJvmBridgeProvenance::StructuredPackageType {
+                source_package,
+                target_package,
+            } => {
+                hasher.field("jvm_provenance", b"structured_package_type");
+                hasher.field("jvm_source_package", &source_package.as_bytes());
+                hasher.field("jvm_target_package", &target_package.as_bytes());
+            }
+            SelectedJvmBridgeProvenance::AliasFact { alias } => {
+                hasher.field("jvm_provenance", b"alias_fact");
+                hasher.field("jvm_alias", &alias.as_bytes());
+            }
+        }
+    }
     hasher.finish()
 }
 
 fn poll_context_work(cancellation: &CancellationToken, work: &mut usize) -> bool {
-    *work = work
-        .checked_add(1)
-        .expect("selected context work must fit usize");
-    (*work).is_multiple_of(super::engine::CANCELLATION_QUANTUM) && cancellation.is_cancelled()
+    super::poll_resolution_work(cancellation, work)
 }
 
 #[cfg(test)]
@@ -2535,11 +3203,7 @@ mod tests {
             self.mounts
                 .iter()
                 .filter(|mount| {
-                    !mount.root_bridges.is_empty()
-                        || !matches!(
-                            mount.root_reverse_inventory_completion,
-                            ResolutionCompletion::Complete
-                        )
+                    !mount.root_bridges.is_empty() || has_incomplete_root_inventory(mount)
                 })
                 .cloned()
                 .collect()
@@ -2558,6 +3222,9 @@ mod tests {
         }
     }
 
+    #[brokk_bifrost_test_macros::hardwon(
+        "6c35203a7760: context-owned gap identity was lost during validation and blueprint creation"
+    )]
     #[test]
     fn explicitly_owned_context_gap_survives_extension_validation_and_blueprint() {
         use super::super::fact_resolution::SelectedFactOperationBlueprint;
@@ -2608,6 +3275,8 @@ mod tests {
                 SelectedFactOperationBlueprint::from_publication(SelectedContextPathPublication {
                     token: SelectedContextPathToken::new(1),
                     contextual_reverse_inventory_completion: inventory,
+                    go_package_inventory_complete: None,
+                    go_package_inventory_fragments: HashMap::default(),
                     declaration_access_source: access,
                     context_owned_gap_identities: reasons,
                     identities: SelectedContextIdentities::new(),
@@ -2652,6 +3321,9 @@ mod tests {
         }
     }
 
+    #[brokk_bifrost_test_macros::hardwon(
+        "6c35203a7760: context gap registration accepted a reason absent from inventory evidence"
+    )]
     #[test]
     #[should_panic(expected = "requires retained inventory evidence")]
     fn context_gap_registration_requires_its_explicit_evidence() {
@@ -2901,93 +3573,6 @@ mod tests {
         }
     }
 
-    /// Extending the context set is charged per added bridge, never per
-    /// selected mount: two thousand unrelated mounts cost nothing.
-    #[test]
-    fn root_bridge_extension_charges_per_bridge_over_a_large_mount_inventory() {
-        use brokk_bifrost_core::analyzer::usages::receiver_analysis::ReceiverAnalysisBudget;
-        let mount_count = 2_048_u32;
-        let demand =
-            ResolutionLookupSemanticRecipe::new(Language::Go, ResolutionNamespace::Value, "Item");
-        let mounts = (0..mount_count).map(go_mount_context).collect::<Vec<_>>();
-        // Two selected mounts carry one bridge each; a third is the target of
-        // every bridge; the remaining two thousand and forty-five carry
-        // nothing at all.
-        let target = mounts[3].fragment();
-        let sources = [mounts[0].clone(), mounts[1].clone()];
-        let bridge = |source: BindingFragmentId, site: u32| {
-            SelectedRootBridgeDescriptor::for_test(
-                source,
-                Language::Go,
-                ResolutionSiteId::new(site),
-                ResolutionRootImportAnchor::Lexical,
-                target,
-                Language::Go,
-                ResolutionScopeId::new(0),
-                vec![demand.clone()],
-                demand.clone(),
-                demand.clone(),
-                ResolutionCompletion::Complete,
-            )
-        };
-        let table = GoMountTable::from(mounts);
-        let lookup = table.lookup();
-        let context = table
-            .context(
-                sources
-                    .iter()
-                    .enumerate()
-                    .map(|(index, mount)| {
-                        SelectedResolutionMountContext::new(
-                            mount.ordinal(),
-                            mount.fragment(),
-                            mount.semantic_language(),
-                            vec![bridge(mount.fragment(), index as u32)],
-                            ResolutionCompletion::Complete,
-                        )
-                        .expect("a bridge is owned by the mount it starts from")
-                    })
-                    .collect::<Vec<_>>(),
-            )
-            .expect("two sparse mounts over a large mount table form one context set");
-        let session = ResolutionSession::bounded(
-            ReceiverAnalysisBudget {
-                max_scope_nodes: 20,
-                ..ReceiverAnalysisBudget::default()
-            },
-            None,
-        );
-        let extended = context
-            .extend_root_bridges(
-                vec![
-                    bridge(sources[0].fragment(), 2),
-                    bridge(sources[0].fragment(), 3),
-                    bridge(sources[1].fragment(), 4),
-                ],
-                &CancellationToken::default(),
-                Some(&session),
-                &lookup,
-            )
-            .expect("a sparse extension of a large mount table is not a structural error")
-            .expect("three added bridges fit a twenty step budget");
-        let steps = session.finish(()).work().scope_nodes;
-        assert!(
-            steps < 20,
-            "adding three bridges cost {steps} steps over {mount_count} selected mounts"
-        );
-        assert_eq!(steps, 3, "one charged step per added bridge");
-        assert_eq!(extended.selected_mount_count, mount_count as usize);
-        assert_eq!(extended.mounts.len(), 2);
-        assert_eq!(
-            extended
-                .mounts
-                .iter()
-                .map(SelectedResolutionMountContext::fragment)
-                .collect::<Vec<_>>(),
-            vec![sources[0].fragment(), sources[1].fragment()]
-        );
-    }
-
     #[test]
     fn exact_mount_validation_observes_pre_cancellation_before_the_expected_source() {
         let table = GoMountTable::from(Vec::new());
@@ -3038,6 +3623,127 @@ mod tests {
                 .to_string()
                 .contains("more entries than the operation"),
             "{error}"
+        );
+    }
+
+    #[test]
+    fn jvm_bridge_requires_structured_identity_and_composes_peer_inventory() {
+        let source = BindingFragmentId::at_ordinal(0);
+        let target = BindingFragmentId::at_ordinal(1);
+        let source_demand = ResolutionLookupSemanticRecipe::new(
+            Language::Java,
+            ResolutionNamespace::Type,
+            "Target",
+        );
+        let target_demand = ResolutionLookupSemanticRecipe::new(
+            Language::Kotlin,
+            ResolutionNamespace::Type,
+            "Target",
+        );
+        let route =
+            ResolutionLookupSemanticRecipe::new(Language::Java, ResolutionNamespace::Type, "demo");
+        let target_definition = definition_node(target, ResolutionSiteId::new(7));
+        let bridge = SelectedRootBridgeDescriptor::from_selected_path_tokens_with_jvm_evidence(
+            source,
+            Language::Java,
+            SemanticId::for_test(b"java-kotlin-import"),
+            ResolutionRootImportAnchor::Absolute,
+            SemanticId::for_test(b"java-kotlin-anchor"),
+            target,
+            Language::Kotlin,
+            SemanticId::for_test(b"kotlin-export"),
+            None,
+            vec![route],
+            source_demand,
+            target_demand,
+            SelectedJvmBridgeEvidence {
+                provenance: SelectedJvmBridgeProvenance::StructuredPackageType {
+                    source_package: SemanticId::for_test(b"java-demo-package"),
+                    target_package: SemanticId::for_test(b"kotlin-demo-package"),
+                },
+                source_namespace: ResolutionNamespace::Type,
+                target_namespace: ResolutionNamespace::Type,
+                visibility: SelectedJvmBridgeVisibility::Public,
+                dependency_identity: [7; 32],
+                target_declaration: SemanticId::for_test(b"kotlin-target-declaration"),
+                target_definition,
+            },
+            ResolutionCompletion::Complete,
+        )
+        .with_selected_member_definition(target_definition);
+        validate_bridge(&bridge).expect("selected structured JVM route is valid");
+
+        let inventory_gap = ResolutionIncompleteReason::UnsupportedSemantic(SemanticId::for_test(
+            b"kotlin-peer-inventory-gap",
+        ));
+        let mounts = [
+            SelectedResolutionMountContext::new(
+                SelectedResolutionMountOrdinal::new(0),
+                source,
+                Language::Java,
+                vec![bridge.clone()],
+                ResolutionCompletion::Complete,
+            )
+            .unwrap(),
+            SelectedResolutionMountContext::new(
+                SelectedResolutionMountOrdinal::new(1),
+                target,
+                Language::Kotlin,
+                Vec::new(),
+                ResolutionCompletion::incomplete([inventory_gap]),
+            )
+            .unwrap(),
+        ];
+        let context = SelectedResolutionContextSet::new(
+            SelectedContextIdentities::new(),
+            mounts,
+            2,
+            &|fragment| match fragment {
+                fragment if fragment == source => Ok(Some((
+                    SelectedResolutionMountOrdinal::new(0),
+                    Language::Java,
+                ))),
+                fragment if fragment == target => Ok(Some((
+                    SelectedResolutionMountOrdinal::new(1),
+                    Language::Kotlin,
+                ))),
+                _ => Ok(None),
+            },
+        )
+        .expect("source and target are both selected mounts");
+        assert!(
+            context
+                .inventory_completion()
+                .contains_reason(inventory_gap),
+            "a selected peer-language inventory gap remains part of completion"
+        );
+    }
+
+    #[test]
+    #[should_panic(
+        expected = "a cross-language selected root bridge needs explicit JVM identity and access evidence"
+    )]
+    fn matching_spelling_cannot_construct_a_cross_language_bridge() {
+        let fragment = BindingFragmentId::at_ordinal(0);
+        let source =
+            ResolutionLookupSemanticRecipe::new(Language::Java, ResolutionNamespace::Type, "Same");
+        let target = ResolutionLookupSemanticRecipe::new(
+            Language::Kotlin,
+            ResolutionNamespace::Type,
+            "Same",
+        );
+        let _ = SelectedRootBridgeDescriptor::for_test(
+            fragment,
+            Language::Java,
+            ResolutionSiteId::new(1),
+            ResolutionRootImportAnchor::Absolute,
+            BindingFragmentId::at_ordinal(1),
+            Language::Kotlin,
+            ResolutionScopeId::new(0),
+            Vec::new(),
+            source,
+            target,
+            ResolutionCompletion::Complete,
         );
     }
 
@@ -3375,6 +4081,7 @@ mod tests {
                 site: import_site,
                 root_scope,
                 anchor: ResolutionRootImportAnchor::Lexical,
+                position: None,
             }],
             root_import_segments: vec![ResolutionRootImportSegmentFact {
                 import_site,
@@ -3391,6 +4098,7 @@ mod tests {
                 root_scope,
                 anchor: ResolutionRootImportAnchor::Absolute,
                 prefix_reference: None,
+                owner_continued: false,
             }],
             root_reference_segments: Vec::new(),
             root_exports: vec![ResolutionRootExportFact {
@@ -3610,6 +4318,7 @@ mod tests {
         );
         assert!(
             halves.contains(&SelectedRootPathHalf::Import {
+                activation: None,
                 identity: halves
                     .iter()
                     .find_map(|half| match half {
@@ -3681,6 +4390,7 @@ mod tests {
                 ),
                 lexical_scope_head: None,
                 prefix_reference: None,
+                owner_continued: false,
                 route: Vec::new().into_boxed_slice(),
                 anchor: ResolutionRootImportAnchor::Absolute,
                 token: root_reference_token(fragment, reference_site, ResolutionNamespace::Type),

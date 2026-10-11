@@ -30,11 +30,7 @@ impl TypestateCompilationFailure {
     }
 
     pub(crate) fn failed(reason: PolicyFailureReason, message: impl Into<Box<str>>) -> Self {
-        Self::Failed {
-            reason,
-            message: message.into(),
-            work: PolicyWorkReport::default(),
-        }
+        Self::failed_with_work(reason, message, PolicyWorkReport::default())
     }
 
     pub(crate) fn failed_with_work(

@@ -1,19 +1,19 @@
 # Bifrost for Zed
 
-Local Zed extension scaffold for validating Bifrost's LSP mode.
+Local Zed extension scaffold for the language server. The language server is the
+separate `bifrost-lsp` program from
+[BrokkAi/bifrost-lsp](https://github.com/BrokkAi/bifrost-lsp); this repository
+no longer builds it. See `docs/src/content/docs/zed-lsp.md` for status.
 
 ## Development
 
-Build Bifrost from the repository root:
-
-```bash
-cargo build --bin bifrost
-```
+Put a `bifrost-lsp` binary on `PATH`, or set `lsp.bifrost-rust.binary.path` to
+its absolute path for a single language.
 
 Open Zed, run `zed: install dev extension`, and select `editors/zed`.
 
-For the first smoke test, put the Bifrost binary on `PATH` and configure the
-language to use only the Bifrost adapter:
+For the first smoke test, configure the language to use only the Bifrost
+adapter:
 
 ```json
 {
@@ -27,13 +27,13 @@ language to use only the Bifrost adapter:
 
 Avoid `lsp.bifrost-rust.binary.path` for local testing. Zed treats that as a
 direct language-server binary override and starts it without the extension's
-`--root <worktree-root> --lsp` arguments.
+`--root <worktree-root>` argument.
 
-The extension starts Bifrost with:
+The extension starts the language server with:
 
 ```bash
-bifrost --root <worktree-root> --lsp
+bifrost-lsp --root <worktree-root>
 ```
 
-Any `lsp.bifrost.binary.arguments` values are appended after `--lsp` and can
+Any `lsp.bifrost.binary.arguments` values are appended after `--root` and can
 be used for local debugging flags.

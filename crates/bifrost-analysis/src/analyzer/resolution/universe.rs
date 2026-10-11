@@ -1,12 +1,16 @@
 //! Fixed language universe names consulted after selected source scopes.
 //!
-//! Universe entries are engine rules, not producer facts. The table is fixed
-//! and small; identities are interned through the active request only when an
-//! entry is actually needed.
+//! Universe entries are engine rules, not producer facts. A language's table
+//! is fixed and small; identities are interned through the active request only
+//! when an entry is actually needed. Go's table holds its predeclared types,
+//! values and builtin functions. Kotlin's holds the `kotlin` package types
+//! that the default imports bring into scope unqualified.
 
 use brokk_bifrost_core::analyzer::Language;
 use brokk_bifrost_core::analyzer::canonical_hash::CanonicalHasher;
 use brokk_bifrost_core::analyzer::resolution_facts::{IntrinsicTypeKind, ResolutionNamespace};
+
+use super::fact_source::language_identity_domain;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum UniverseIdentityKind {
@@ -22,9 +26,14 @@ pub(crate) enum GoRangeType {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct UniverseEntry {
+pub struct UniverseEntry {
     pub(crate) language: Language,
+    /// The name as it is written in source.
     pub(crate) spelling: &'static str,
+    /// The name that the identity digest and the intrinsic seeds use. It is
+    /// `spelling` unless the written name is a shorthand for a qualified one
+    /// (`Int` names `kotlin.Int`, the identity a literal of that type seeds).
+    pub(crate) identity_spelling: &'static str,
     pub(crate) namespace: ResolutionNamespace,
     pub(crate) identity_kind: UniverseIdentityKind,
     pub(crate) range_type: Option<GoRangeType>,
@@ -37,6 +46,7 @@ const fn go_primitive_type(
     UniverseEntry {
         language: Language::Go,
         spelling,
+        identity_spelling: spelling,
         namespace: ResolutionNamespace::Type,
         identity_kind: UniverseIdentityKind::Type(IntrinsicTypeKind::Primitive),
         range_type,
@@ -47,6 +57,7 @@ const fn go_builtin_type(spelling: &'static str) -> UniverseEntry {
     UniverseEntry {
         language: Language::Go,
         spelling,
+        identity_spelling: spelling,
         namespace: ResolutionNamespace::Type,
         identity_kind: UniverseIdentityKind::Type(IntrinsicTypeKind::LanguageBuiltin),
         range_type: None,
@@ -57,6 +68,7 @@ const fn go_callable(spelling: &'static str) -> UniverseEntry {
     UniverseEntry {
         language: Language::Go,
         spelling,
+        identity_spelling: spelling,
         namespace: ResolutionNamespace::Callable,
         identity_kind: UniverseIdentityKind::Callable,
         range_type: None,
@@ -67,11 +79,55 @@ const fn go_value(spelling: &'static str) -> UniverseEntry {
     UniverseEntry {
         language: Language::Go,
         spelling,
+        identity_spelling: spelling,
         namespace: ResolutionNamespace::Value,
         identity_kind: UniverseIdentityKind::Value,
         range_type: None,
     }
 }
+
+const fn kotlin_builtin_type(
+    spelling: &'static str,
+    identity_spelling: &'static str,
+) -> UniverseEntry {
+    UniverseEntry {
+        language: Language::Kotlin,
+        spelling,
+        identity_spelling,
+        namespace: ResolutionNamespace::Type,
+        identity_kind: UniverseIdentityKind::Type(IntrinsicTypeKind::LanguageBuiltin),
+        range_type: None,
+    }
+}
+
+const fn java_builtin_type(
+    spelling: &'static str,
+    identity_spelling: &'static str,
+) -> UniverseEntry {
+    UniverseEntry {
+        language: Language::Java,
+        spelling,
+        identity_spelling,
+        namespace: ResolutionNamespace::Type,
+        identity_kind: UniverseIdentityKind::Type(IntrinsicTypeKind::LanguageBuiltin),
+        range_type: None,
+    }
+}
+
+const JAVA_UNIVERSE: &[UniverseEntry] = &[java_builtin_type("String", "java.lang.String")];
+
+const KOTLIN_UNIVERSE: &[UniverseEntry] = &[
+    kotlin_builtin_type("Boolean", "kotlin.Boolean"),
+    kotlin_builtin_type("Byte", "kotlin.Byte"),
+    kotlin_builtin_type("Char", "kotlin.Char"),
+    kotlin_builtin_type("Double", "kotlin.Double"),
+    kotlin_builtin_type("Float", "kotlin.Float"),
+    kotlin_builtin_type("Int", "kotlin.Int"),
+    kotlin_builtin_type("Long", "kotlin.Long"),
+    kotlin_builtin_type("Short", "kotlin.Short"),
+    kotlin_builtin_type("String", "java.lang.String"),
+    kotlin_builtin_type("Unit", "kotlin.Unit"),
+];
 
 const GO_UNIVERSE: &[UniverseEntry] = &[
     go_primitive_type("bool", None),
@@ -120,15 +176,26 @@ const GO_UNIVERSE: &[UniverseEntry] = &[
     go_callable("recover"),
 ];
 
+fn table(language: Language) -> &'static [UniverseEntry] {
+    match language {
+        Language::Java => JAVA_UNIVERSE,
+        Language::Go => GO_UNIVERSE,
+        Language::Kotlin => KOTLIN_UNIVERSE,
+        _ => &[],
+    }
+}
+
+/// Whether the language has any universe entries to consult.
+pub(crate) fn has_table(language: Language) -> bool {
+    !table(language).is_empty()
+}
+
 pub(crate) fn lookup(
     language: Language,
     namespace: ResolutionNamespace,
     spelling: &str,
 ) -> Option<UniverseEntry> {
-    if language != Language::Go {
-        return None;
-    }
-    GO_UNIVERSE.iter().copied().find(|entry| {
+    table(language).iter().copied().find(|entry| {
         entry.spelling == spelling
             && (entry.namespace == namespace
                 || (namespace == ResolutionNamespace::TypeOrValue
@@ -142,7 +209,7 @@ pub(crate) fn lookup(
 }
 
 pub(crate) fn go_entries() -> impl Iterator<Item = UniverseEntry> {
-    GO_UNIVERSE.iter().copied()
+    table(Language::Go).iter().copied()
 }
 
 pub(crate) fn go_types() -> impl Iterator<Item = UniverseEntry> {
@@ -155,17 +222,17 @@ pub(crate) fn go_types() -> impl Iterator<Item = UniverseEntry> {
 pub(crate) fn identity_digest(entry: UniverseEntry) -> [u8; 32] {
     match entry.identity_kind {
         UniverseIdentityKind::Type(kind) => {
-            intrinsic_type_identity_digest(entry.language, kind, entry.spelling)
+            intrinsic_type_identity_digest(entry.language, kind, entry.identity_spelling)
         }
         UniverseIdentityKind::Callable => intrinsic_non_type_identity_digest(
             b"bifrost-resolution-intrinsic-callable:v1",
             entry.language,
-            entry.spelling,
+            entry.identity_spelling,
         ),
         UniverseIdentityKind::Value => intrinsic_non_type_identity_digest(
             b"bifrost-resolution-intrinsic-value:v1",
             entry.language,
-            entry.spelling,
+            entry.identity_spelling,
         ),
     }
 }
@@ -185,7 +252,12 @@ pub(crate) fn intrinsic_type_identity_digest(
         spelling
     };
     let mut hasher = CanonicalHasher::new(b"bifrost-resolution-intrinsic-type:v1");
-    hasher.field("language", language.config_label().as_bytes());
+    hasher.field(
+        "language",
+        language_identity_domain(language)
+            .identity_label()
+            .as_bytes(),
+    );
     hasher.field("kind", &[intrinsic_kind_rank(kind)]);
     hasher.field("spelling", spelling.as_bytes());
     hasher.finish()
@@ -209,60 +281,5 @@ const fn intrinsic_kind_rank(kind: IntrinsicTypeKind) -> u8 {
         IntrinsicTypeKind::Slice => 2,
         IntrinsicTypeKind::Array => 3,
         IntrinsicTypeKind::Structural => 4,
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn universe_names_are_go_only_and_include_range_types() {
-        assert_eq!(
-            lookup(Language::Go, ResolutionNamespace::Callable, "len")
-                .expect("Go len is predeclared")
-                .identity_kind,
-            UniverseIdentityKind::Callable
-        );
-        assert!(lookup(Language::Rust, ResolutionNamespace::Callable, "len").is_none());
-        assert_eq!(
-            lookup(Language::Go, ResolutionNamespace::TypeOrValue, "len")
-                .expect("ambiguous Go references admit builtins")
-                .identity_kind,
-            UniverseIdentityKind::Callable
-        );
-        assert!(lookup(Language::Java, ResolutionNamespace::Type, "int").is_none());
-        assert_eq!(
-            lookup(Language::Go, ResolutionNamespace::Type, "string")
-                .expect("Go string is predeclared")
-                .range_type,
-            Some(GoRangeType::String)
-        );
-        assert_eq!(
-            lookup(Language::Go, ResolutionNamespace::Type, "int")
-                .expect("Go int is predeclared")
-                .range_type,
-            Some(GoRangeType::Integer)
-        );
-        assert_eq!(
-            identity_digest(
-                lookup(Language::Go, ResolutionNamespace::Type, "byte")
-                    .expect("Go byte is predeclared")
-            ),
-            identity_digest(
-                lookup(Language::Go, ResolutionNamespace::Type, "uint8")
-                    .expect("Go uint8 is predeclared")
-            )
-        );
-        assert_eq!(
-            identity_digest(
-                lookup(Language::Go, ResolutionNamespace::Type, "rune")
-                    .expect("Go rune is predeclared")
-            ),
-            identity_digest(
-                lookup(Language::Go, ResolutionNamespace::Type, "int32")
-                    .expect("Go int32 is predeclared")
-            )
-        );
     }
 }

@@ -42,7 +42,7 @@ use super::coverage::{
 use super::ir::{
     DEFAULT_MAX_REPRESENTATIVE_TUPLES, IrAggregate, IrAggregateOp, IrColumn, IrCompareOp,
     IrJoinKind, IrOperand, IrOrderedSequence, IrPredicate, IrRelationId, IrRelationOp,
-    RelationalPlanIr, RowScalar,
+    RelationalPlanIr, RowScalar, index_of_column, row_literal_type,
 };
 
 /// One row of one binding that contributed to a violated group, addressed by
@@ -242,7 +242,7 @@ struct EvalRelation {
 
 impl EvalRelation {
     fn index_of(&self, column: &IrColumn) -> Option<usize> {
-        self.layout.iter().position(|candidate| candidate == column)
+        index_of_column(self.layout.iter(), column)
     }
 }
 
@@ -1445,6 +1445,12 @@ const fn ordered(left: u64, op: IrCompareOp, right: u64) -> bool {
 }
 
 fn scalar_matches_literal(actual: &RowScalar, expected: &RowLiteral) -> bool {
+    if !actual
+        .scalar_type()
+        .accepts_literal_type(row_literal_type(expected))
+    {
+        return false;
+    }
     match (actual, expected) {
         (RowScalar::StableId(actual), RowLiteral::String(expected))
         | (RowScalar::String(actual), RowLiteral::String(expected))
@@ -1453,6 +1459,7 @@ fn scalar_matches_literal(actual: &RowScalar, expected: &RowLiteral) -> bool {
             actual == expected
         }
         (RowScalar::StringList(actual), RowLiteral::StringList(expected)) => actual == expected,
+        (RowScalar::IntegerList(actual), RowLiteral::IntegerList(expected)) => actual == expected,
         (RowScalar::Integer(actual), RowLiteral::Integer(expected)) => actual == expected,
         (RowScalar::Boolean(actual), RowLiteral::Boolean(expected)) => actual == expected,
         _ => false,

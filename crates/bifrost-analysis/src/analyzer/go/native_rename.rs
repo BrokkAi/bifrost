@@ -1,23 +1,20 @@
-//! Test-support Go rename from selected inverse edges.
+//! Go rename from selected inverse edges.
 //!
 //! Edits are collected only from complete, proven native inverse rows. A
-//! frozen project overlay supplies the counterfactual source world; the same
-//! selected Go inverse operation must produce the same proven binding sites
-//! after the edit before the edit set is returned.
+//! saved-state query over selected scopes, imports and package summaries
+//! rejects captures and rebindings before returning the edit set.
 
 use super::GoAnalyzer;
-use super::selected_reverse::{GoSelectedReverseOutcome, go_selected_inverse_for};
+use super::selected_reverse::{GoSelectedReverseOutcome, go_selected_inverse_for_rename_original};
 use crate::CancellationToken;
-use crate::analyzer::CodeUnitIndex;
-use crate::analyzer::OverlayProject;
+use crate::analyzer::resolution::seam_profile::{GoRenamePhase, go_rename_phase};
 use crate::analyzer::structural::reference_edges::{EdgeCompleteness, EdgeDerivationResult};
 use crate::analyzer::usages::{DEFAULT_MAX_FILES, DEFAULT_MAX_USAGES, UsageProof};
 use crate::analyzer::{CodeUnit, IAnalyzer, Language, Project, ProjectFile, resolve_analyzer};
 use crate::symbol_rename::{
     MAX_RENAME_IDENTIFIER_BYTES, RenameEdit, RenameFailure, RenameFileEdits, RenameResult,
 };
-use std::collections::{BTreeMap, BTreeSet};
-use std::sync::Arc;
+use std::collections::BTreeMap;
 
 /// Native Go rename preparation. It remains outside Go production dispatch.
 pub struct GoNativeRenameProvider;
@@ -36,42 +33,9 @@ impl crate::symbol_rename::RenameProvider for GoNativeRenameProvider {
     }
 }
 
-struct CounterfactualFile {
-    hypothetical: String,
-    edits: Box<[RenameEdit]>,
-}
-
-impl CounterfactualFile {
-    fn hypothetical_range_to_original(
-        &self,
-        start_byte: usize,
-        end_byte: usize,
-    ) -> Option<(usize, usize)> {
-        let mut delta = 0_i128;
-        for edit in &self.edits {
-            let hypothetical_start = usize::try_from(edit.start_byte as i128 + delta).ok()?;
-            let hypothetical_end = hypothetical_start.checked_add(edit.new_text.len())?;
-            if start_byte == hypothetical_start && end_byte == hypothetical_end {
-                return Some((edit.start_byte, edit.end_byte));
-            }
-            if end_byte <= hypothetical_start {
-                break;
-            }
-            if start_byte < hypothetical_end {
-                return None;
-            }
-            delta +=
-                edit.new_text.len() as i128 - edit.end_byte.checked_sub(edit.start_byte)? as i128;
-        }
-        Some((
-            usize::try_from(start_byte as i128 - delta).ok()?,
-            usize::try_from(end_byte as i128 - delta).ok()?,
-        ))
-    }
-}
-
 /// Test-support entry point for running Go's native rename implementation
 /// without registering it in production language dispatch.
+#[cfg(any(test, feature = "test-support"))]
 pub fn go_native_rename(
     analyzer: &dyn IAnalyzer,
     project: &dyn Project,
@@ -108,15 +72,26 @@ fn native_go_rename(
         return Err(failure("cancelled", "native Go rename was cancelled"));
     }
     let generation = project.analysis_generation();
-    let original = match go_selected_inverse_for(go, target, cancellation) {
-        GoSelectedReverseOutcome::Ready(answer) => answer,
-        outcome => {
-            return Err(failure(
-                "incomplete_analysis",
-                format!("native Go inverse selection failed: {outcome:?}"),
-            ));
-        }
-    };
+    let (original, conflict) =
+        match go_selected_inverse_for_rename_original(go, target, new_name, cancellation) {
+            (GoSelectedReverseOutcome::Ready(answer), conflict) => (answer, conflict),
+            (GoSelectedReverseOutcome::Unavailable(reason), _) => {
+                return Err(failure("incomplete_analysis", reason));
+            }
+            (GoSelectedReverseOutcome::Stale(reason), _) => {
+                return Err(failure("incomplete_analysis", reason));
+            }
+            (GoSelectedReverseOutcome::Cancelled, _) => {
+                return Err(failure("cancelled", "native Go rename was cancelled"));
+            }
+            (GoSelectedReverseOutcome::StoreError(reason), _) => {
+                return Err(failure("incomplete_analysis", reason));
+            }
+        };
+    if let Some(conflict) = conflict {
+        return Err(failure("capture_or_rebinding", conflict));
+    }
+    let edit_assembly_phase = go_rename_phase(GoRenamePhase::EditAssembly);
     require_complete_proven(&original, "original")?;
     if original.edges.len() > DEFAULT_MAX_USAGES {
         return Err(failure(
@@ -232,47 +207,13 @@ fn native_go_rename(
             new_text: new_name.to_owned(),
         });
 
-    let counterfactual_files =
-        build_counterfactual_files(edits_by_file, target.identifier(), new_name)?;
+    let rename_files = build_rename_files(edits_by_file, target.identifier(), new_name)?;
     let result = RenameResult {
         target: target.clone(),
         old_name: target.identifier().to_owned(),
-        files: counterfactual_files
-            .iter()
-            .filter_map(|(file, contents)| {
-                (!contents.edits.is_empty()).then_some(RenameFileEdits {
-                    file: file.clone(),
-                    edits: contents.edits.to_vec(),
-                })
-            })
-            .collect(),
+        files: rename_files,
     };
-
-    let hypothetical_go = counterfactual_analyzer(go, &counterfactual_files)?;
-    let original_parent = go.parent_of(target);
-    let hypothetical_target =
-        find_counterfactual_target(&hypothetical_go, target, original_parent.as_ref(), new_name)?;
-    let hypothetical =
-        match go_selected_inverse_for(&hypothetical_go, &hypothetical_target, cancellation) {
-            GoSelectedReverseOutcome::Ready(answer) => answer,
-            outcome => {
-                return Err(failure(
-                    "incomplete_analysis",
-                    format!("counterfactual Go inverse selection failed: {outcome:?}"),
-                ));
-            }
-        };
-    require_complete_proven(&hypothetical, "counterfactual")?;
-    let original_sites = inverse_site_positions(&original, None)?;
-    let hypothetical_sites = inverse_site_positions(&hypothetical, Some(&counterfactual_files))?;
-    if original_sites != hypothetical_sites {
-        return Err(failure(
-            "capture_or_rebinding",
-            format!(
-                "Go rename changes selected binding sites: original={original_sites:?}, counterfactual={hypothetical_sites:?}"
-            ),
-        ));
-    }
+    drop(edit_assembly_phase);
     if cancellation.is_cancelled() || project.analysis_generation() != generation {
         return Err(failure(
             "incomplete_analysis",
@@ -282,12 +223,12 @@ fn native_go_rename(
     Ok(result)
 }
 
-fn build_counterfactual_files(
+fn build_rename_files(
     edits_by_file: BTreeMap<ProjectFile, (String, Vec<RenameEdit>)>,
     old_name: &str,
     new_name: &str,
-) -> Result<BTreeMap<ProjectFile, CounterfactualFile>, RenameFailure> {
-    let mut files = BTreeMap::new();
+) -> Result<Vec<RenameFileEdits>, RenameFailure> {
+    let mut files = Vec::new();
     for (file, (original, mut edits)) in edits_by_file {
         edits.sort_by_key(|edit| (edit.start_byte, edit.end_byte));
         edits.dedup_by_key(|edit| (edit.start_byte, edit.end_byte));
@@ -312,74 +253,22 @@ fn build_counterfactual_files(
                 ));
             }
         }
-        let mut hypothetical = original.clone();
-        for edit in edits.iter().rev() {
-            hypothetical.replace_range(edit.start_byte..edit.end_byte, &edit.new_text);
+        if !edits.is_empty() {
+            files.push(RenameFileEdits { file, edits });
         }
-        files.insert(
-            file,
-            CounterfactualFile {
-                hypothetical,
-                edits: edits.into_boxed_slice(),
-            },
-        );
     }
     Ok(files)
-}
-
-fn counterfactual_analyzer(
-    go: &GoAnalyzer,
-    files: &BTreeMap<ProjectFile, CounterfactualFile>,
-) -> Result<GoAnalyzer, RenameFailure> {
-    let overlay = Arc::new(OverlayProject::new(go.inner.shared_project()));
-    for (file, contents) in files {
-        if !overlay.set(file.abs_path().to_path_buf(), contents.hypothetical.clone()) {
-            return Err(failure(
-                "incomplete_analysis",
-                format!("cannot mount Go rename overlay for {file}"),
-            ));
-        }
-    }
-    let project: Arc<dyn Project> = Arc::new(overlay.snapshot());
-    Ok(go.clone_with_project(project))
-}
-
-fn find_counterfactual_target(
-    go: &GoAnalyzer,
-    target: &CodeUnit,
-    original_parent: Option<&CodeUnit>,
-    new_name: &str,
-) -> Result<CodeUnit, RenameFailure> {
-    let mut matches = go
-        .get_all_declarations()
-        .into_iter()
-        .filter(|candidate| {
-            candidate.identifier() == new_name
-                && candidate.kind() == target.kind()
-                && candidate.package_name() == target.package_name()
-                && go.parent_of(candidate).as_ref() == original_parent
-        })
-        .collect::<Vec<_>>();
-    matches.sort();
-    matches.dedup();
-    match matches.as_slice() {
-        [candidate] => Ok(candidate.clone()),
-        _ => Err(failure(
-            "capture_or_rebinding",
-            format!("counterfactual Go target is absent or ambiguous: {matches:?}"),
-        )),
-    }
 }
 
 fn require_complete_proven(
     result: &EdgeDerivationResult,
     world: &str,
 ) -> Result<(), RenameFailure> {
-    if result.completeness != EdgeCompleteness::Complete
-        || result
-            .edges
-            .iter()
-            .any(|edge| edge.proof != UsageProof::Proven)
+    require_complete_inventory(result, world)?;
+    if result
+        .edges
+        .iter()
+        .any(|edge| edge.proof != UsageProof::Proven)
     {
         return Err(failure(
             "incomplete_analysis",
@@ -389,32 +278,17 @@ fn require_complete_proven(
     Ok(())
 }
 
-fn inverse_site_positions(
+fn require_complete_inventory(
     result: &EdgeDerivationResult,
-    counterfactual_files: Option<&BTreeMap<ProjectFile, CounterfactualFile>>,
-) -> Result<BTreeSet<(ProjectFile, usize, usize)>, RenameFailure> {
-    let mut positions = BTreeSet::new();
-    for edge in &result.edges {
-        let range = match counterfactual_files.and_then(|files| files.get(&edge.site.file)) {
-            Some(file) => file
-                .hypothetical_range_to_original(
-                    edge.site.range.start_byte,
-                    edge.site.range.end_byte,
-                )
-                .ok_or_else(|| {
-                    failure(
-                        "incomplete_analysis",
-                        format!(
-                            "counterfactual Go inverse range overlaps an edit: {:?}",
-                            edge.site
-                        ),
-                    )
-                })?,
-            None => (edge.site.range.start_byte, edge.site.range.end_byte),
-        };
-        positions.insert((edge.site.file.clone(), range.0, range.1));
+    world: &str,
+) -> Result<(), RenameFailure> {
+    if result.completeness != EdgeCompleteness::Complete {
+        return Err(failure(
+            "incomplete_analysis",
+            format!("{world} Go inverse inventory is incomplete: {result:?}"),
+        ));
     }
-    Ok(positions)
+    Ok(())
 }
 
 fn failure(kind: &'static str, message: impl Into<String>) -> RenameFailure {

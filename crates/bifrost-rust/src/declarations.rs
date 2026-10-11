@@ -1,10 +1,13 @@
 use crate::syntax::{item_has_path_attribute, unwrap_attributes};
+#[cfg(test)]
+use brokk_bifrost_core::analyzer::Range;
 use brokk_bifrost_core::analyzer::common::{IdentifierSigil, node_ident_text};
-use brokk_bifrost_core::analyzer::fq_name::{FqName, SegmentId, SegmentKind, segment_interner};
+use brokk_bifrost_core::analyzer::fq_name::{FqName, SegmentKind, segment_interner};
 use brokk_bifrost_core::analyzer::model::StructuredTypeIdentityBuilder;
 use brokk_bifrost_core::analyzer::model::{
-    CodeUnitType, DeclarationKind, DispatchExtensibility, PackageAnchor, ParameterMetadata,
-    SignatureMetadata, StructuredTypeIdentity, StructuredTypeName,
+    CodeUnitType, DeclarationKind, DispatchExtensibility, ImportInfo, PackageAnchor,
+    ParameterMetadata, SignatureMetadata, StructuredTypeIdentity, StructuredTypeName,
+    child_fq_base,
 };
 use brokk_bifrost_core::analyzer::parsed_file::{ParsedFile, ParsedSourceFacts, SourceImportFact};
 use brokk_bifrost_core::analyzer::resolution_facts::ResolutionDefinitionUnitFact;
@@ -20,12 +23,14 @@ use brokk_bifrost_core::analyzer::structural::callable::CallSiteContext;
 use brokk_bifrost_core::analyzer::structural::collector::StructuralFactCollector;
 use brokk_bifrost_core::analyzer::structural::resolution::DeclaredVisibility;
 use brokk_bifrost_core::analyzer::structural::spec::{CompiledKinds, StructuralSpec};
-use brokk_bifrost_core::analyzer::tree_walk::TreeWalkAction;
+use brokk_bifrost_core::analyzer::tree_walk::{
+    NamedChildren, TreeWalkAction, named_children_iter, node_range,
+};
 use brokk_bifrost_core::analyzer::usages::model::{ImportBinder, ImportBinding, ImportKind};
-use brokk_bifrost_core::analyzer::{CodeUnit, ProjectFile, Range};
+use brokk_bifrost_core::analyzer::{CodeUnit, ProjectFile};
 use brokk_bifrost_core::hash::{HashMap, HashSet};
 use std::collections::BTreeSet;
-use tree_sitter::{Node, Parser, Tree, TreeCursor};
+use tree_sitter::{Node, Parser, Tree};
 
 use crate::declaration_properties::{
     RustDeclarationPropertyCollector, is_rust_named_declaration_kind,
@@ -39,16 +44,11 @@ use crate::type_syntax::RustTypeSourceCollector;
 /// structured name round-trips to the legacy string.
 const RUST_MODULE_SCOPE_SEGMENT: &str = "_module_";
 
-/// Intern one qualified-name segment in the process-global interner.
-fn rust_segment(text: &str, kind: SegmentKind) -> SegmentId {
-    segment_interner().intern(text, kind)
-}
-
 pub fn rust_file_package_fq(file: &ProjectFile) -> FqName {
     with_rust_package_components(file, |components| {
         let mut fq = FqName::new();
         for component in components {
-            fq.push(rust_segment(component, SegmentKind::Package));
+            fq.push(segment_interner().intern(component, SegmentKind::Package));
         }
         fq
     })
@@ -60,18 +60,9 @@ pub fn rust_semantic_package_fq(package_name: &str) -> FqName {
         .split('.')
         .filter(|component| !component.is_empty())
     {
-        fq.push(rust_segment(component, SegmentKind::Package));
+        fq.push(segment_interner().intern(component, SegmentKind::Package));
     }
     fq
-}
-
-/// The [`FqName`] a child declaration extends: its lexical parent's structured
-/// name when nested, otherwise the file's package prefix.
-fn rust_child_fq_base(parent: Option<&CodeUnit>, file: &ProjectFile) -> FqName {
-    match parent {
-        Some(parent) => parent.fq().clone(),
-        None => rust_file_package_fq(file),
-    }
 }
 
 use crate::imports::{
@@ -135,11 +126,7 @@ impl RustItemSourceSink for RustPrimaryItemSourceSink<'_, '_> {
         if let Some(declaration) = self.properties.ensure_primary(node, self.collector) {
             return declaration;
         }
-        let occurrence = self.collector.intern_node(node);
-        let name = node
-            .child_by_field_name("name")
-            .map(|name| self.collector.intern_node(name));
-        self.collector.declare(occurrence, name)
+        crate::item_sources::declare_primary_node(self.collector, node)
     }
 }
 
@@ -149,11 +136,7 @@ impl RustDeclarationSourceBridge for RustPrimaryDeclarationSourceBridge<'_, '_, 
     }
 
     fn record(&mut self, node: Node<'_>, unit: &CodeUnit) -> SourceDeclarationId {
-        let occurrence = self.collector.intern_node(node);
-        let name = node
-            .child_by_field_name("name")
-            .map(|name| self.collector.intern_node(name));
-        let declaration = self.collector.declare(occurrence, name);
+        let declaration = crate::item_sources::declare_primary_node(self.collector, node);
         self.properties.record_primary(declaration, node);
         self.links.push((declaration, unit.clone()));
         declaration
@@ -307,24 +290,14 @@ impl RustEmbeddedSourceMap {
         );
         let mut ids = Vec::new();
         for (projected, nodes) in rust_import_projection_with_source_nodes(node, source, "") {
-            let declaration = self.intern_node(nodes.declaration, collector);
-            let target = nodes.target.map(|node| self.intern_node(node, collector));
-            let alias = nodes.alias.map(|node| self.intern_node(node, collector));
-            let lexical_scopes = nodes
-                .lexical_scopes
-                .iter()
-                .map(|scope| self.intern_node(*scope, collector))
-                .collect();
             let source_import_id = SourceImportId::try_from_index(source_imports.len())
                 .expect("source import ids must fit in a u32");
-            let mut source_import = SourceImportFact::from_import(
+            let (source_import, _) = source_import_from_nodes(
                 projected.import.info,
-                declaration,
-                target,
-                alias,
-                lexical_scopes,
+                projected.import.is_macro_use,
+                &nodes,
+                |node| self.intern_node(node, collector),
             );
-            source_import.is_macro_use = projected.import.is_macro_use;
             source_imports.push(source_import);
             ids.push(source_import_id);
         }
@@ -769,32 +742,45 @@ fn attach_import_source_occurrences<'source, 'tree>(
     for (import, nodes) in imports.iter_mut().zip(source_nodes) {
         assert_eq!(nodes.target.is_none(), import.import.info.is_wildcard);
         assert_eq!(nodes.alias.is_some(), import.import.info.alias.is_some());
-        let declaration = collector.intern_node(nodes.declaration);
-        let target = nodes.target.map(|node| collector.intern_node(node));
-        let alias = nodes.alias.map(|node| collector.intern_node(node));
-        let lexical_scopes = nodes
-            .lexical_scopes
-            .iter()
-            .map(|scope| collector.intern_node(*scope))
-            .collect();
+        let (source_import, occurrences) = source_import_from_nodes(
+            import.import.info.clone(),
+            import.import.is_macro_use,
+            nodes,
+            |node| collector.intern_node(node),
+        );
         let source_import_id = SourceImportId::try_from_index(source_imports.len())
             .expect("source import ids must fit in a u32");
-        let mut source_import = SourceImportFact::from_import(
-            import.import.info.clone(),
-            declaration,
-            target,
-            alias,
-            lexical_scopes,
-        );
-        source_import.is_macro_use = import.import.is_macro_use;
         source_imports.push(source_import);
         import.source_import_id = Some(source_import_id);
-        import.source_occurrences = Some(RustImportSourceOccurrences {
+        import.source_occurrences = Some(occurrences);
+    }
+}
+
+fn source_import_from_nodes<'tree>(
+    info: ImportInfo,
+    is_macro_use: bool,
+    nodes: &RustImportSourceNodes<'tree>,
+    mut intern: impl FnMut(Node<'tree>) -> SourceOccurrenceId,
+) -> (SourceImportFact, RustImportSourceOccurrences) {
+    let declaration = intern(nodes.declaration);
+    let target = nodes.target.map(&mut intern);
+    let alias = nodes.alias.map(&mut intern);
+    let lexical_scopes = nodes
+        .lexical_scopes
+        .iter()
+        .map(|scope| intern(*scope))
+        .collect();
+    let mut source_import =
+        SourceImportFact::from_import(info, declaration, target, alias, lexical_scopes);
+    source_import.is_macro_use = is_macro_use;
+    (
+        source_import,
+        RustImportSourceOccurrences {
             declaration,
             target,
             alias,
-        });
-    }
+        },
+    )
 }
 
 /// The `(short_name, fq)` identity every Rust type-namespace declaration
@@ -813,7 +799,8 @@ fn rust_type_declaration_identity(
     let short_name = parent
         .map(|parent| format!("{}.{}", parent.short_name(), name))
         .unwrap_or_else(|| name.to_string());
-    let fq = rust_child_fq_base(parent, file).with_pushed(rust_segment(name, SegmentKind::Type));
+    let fq = child_fq_base(parent, || rust_file_package_fq(file))
+        .with_pushed(segment_interner().intern(name, SegmentKind::Type));
     (short_name, fq)
 }
 
@@ -1882,14 +1869,14 @@ impl<'source, 'parsed, 'tree> RustPrimaryParseState<'source, 'parsed, 'tree> {
         }
     }
 
-    fn finish(mut self) {
+    fn finish(mut self, root: Node<'_>) {
         assert_eq!(self.structural_parents, [None]);
         assert!(self.declarations.parsed.source_declaration_units.is_empty());
         self.declarations.parsed.source_declaration_units =
             std::mem::take(&mut self.declarations.source_declaration_units);
         let structural = self
             .structural
-            .finish()
+            .finish(root)
             .expect("complete Rust preparation has no structural admission limit or cancellation");
         let mut native = self.native.finish();
         // Native lowering already records inherited access (trait members,
@@ -1934,10 +1921,16 @@ impl<'source, 'parsed, 'tree> RustPrimaryParseState<'source, 'parsed, 'tree> {
                 }
             })
             .collect::<Vec<_>>();
+        self.declarations
+            .parsed
+            .separate_source_declaration_metadata_visibility_alternatives(
+                &declaration_visibilities,
+            );
         let source_visibilities = declaration_visibilities
             .iter()
             .map(|fact| (fact.declaration, fact.visibility))
             .collect::<HashMap<_, _>>();
+        apply_rust_source_metadata_visibility(self.declarations.parsed, &source_visibilities);
         let mut visibility_gaps = native.facts.gaps.iter()
             .filter(|gap| gap.kind == brokk_bifrost_core::analyzer::resolution_facts::ResolutionGapKind::UnsupportedVisibility)
             .map(|gap| gap.site).collect::<HashSet<_>>();
@@ -2140,7 +2133,7 @@ pub fn parse_rust_file(file: &ProjectFile, source: &str, tree: &Tree) -> ParsedF
         },
         |native_exit, state| state.exit(native_exit),
     );
-    traversal.finish();
+    traversal.finish(root);
 
     parsed
 }
@@ -2171,14 +2164,73 @@ fn add_rust_signature_metadata(
     unit: CodeUnit,
     metadata: SignatureMetadata,
 ) {
-    let metadata_ordinal = parsed.add_signature_with_metadata(unit.clone(), metadata);
-    parsed.source_declaration_metadata.push(
-        brokk_bifrost_core::analyzer::parsed_file::SourceDeclarationMetadataLink {
-            declaration,
-            unit,
-            metadata_ordinal,
-        },
-    );
+    parsed.add_signature_with_source_declaration_metadata(declaration, unit, metadata);
+}
+
+/// Apply the canonical source visibility to metadata after native declaration
+/// analysis has resolved inherited visibility (notably trait implementation
+/// members). This happens after parsing one file and before publishing its
+/// facts, so equal display metadata is split only where the source facts say it
+/// has different visibility.
+fn apply_rust_source_metadata_visibility(
+    parsed: &mut ParsedFile,
+    source_visibilities: &HashMap<SourceDeclarationId, DeclaredVisibility>,
+) {
+    let metadata = std::mem::take(&mut parsed.signature_metadata);
+    let signature_ordinals = std::mem::take(&mut parsed.signature_metadata_signature_ordinals);
+    let links = std::mem::take(&mut parsed.source_declaration_metadata);
+    let mut linked_rows = HashSet::default();
+
+    for mut link in links {
+        let old_ordinal = link.metadata_ordinal;
+        let row = &metadata[&link.unit][old_ordinal];
+        let signature_ordinal = signature_ordinals[&link.unit][old_ordinal];
+        let visibility = *source_visibilities
+            .get(&link.declaration)
+            .expect("Rust source metadata declaration has canonical visibility");
+        link.metadata_ordinal = parsed.add_metadata_for_signature(
+            link.unit.clone(),
+            signature_ordinal,
+            row.clone().with_source_declared_visibility(visibility),
+        );
+        linked_rows.insert((link.unit.clone(), old_ordinal));
+        parsed.source_declaration_metadata.push(link);
+    }
+
+    for (unit, rows) in metadata {
+        let signature_ordinals = signature_ordinals
+            .get(&unit)
+            .expect("Rust metadata has its signature ordinals");
+        for (ordinal, (row, &signature_ordinal)) in rows.iter().zip(signature_ordinals).enumerate()
+        {
+            if !linked_rows.contains(&(unit.clone(), ordinal)) {
+                assert!(
+                    unit.is_synthetic(),
+                    "Rust source metadata rows all link to a source declaration for {unit:?}"
+                );
+                parsed.add_metadata_for_signature(unit.clone(), signature_ordinal, row.clone());
+            }
+        }
+    }
+}
+
+fn rust_named_item_name<'source>(node: Node<'_>, source: &'source str) -> Option<&'source str> {
+    let name = rust_node_text(node.child_by_field_name("name")?, source).trim();
+    (!name.is_empty()).then_some(name)
+}
+
+fn record_rust_code_unit(
+    parsed: &mut ParsedFile,
+    source_bridge: &mut dyn RustDeclarationSourceBridge,
+    node: Node<'_>,
+    code_unit: &CodeUnit,
+    in_test_region: bool,
+) -> SourceDeclarationId {
+    let declaration = source_bridge.record(node, code_unit);
+    if in_test_region {
+        parsed.mark_test_region(code_unit);
+    }
+    declaration
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2192,11 +2244,7 @@ fn register_rust_class_like(
     parsed: &mut ParsedFile,
     source_bridge: &mut dyn RustDeclarationSourceBridge,
 ) -> Option<CodeUnit> {
-    let name_node = node.child_by_field_name("name")?;
-    let name = rust_node_text(name_node, source).trim();
-    if name.is_empty() {
-        return None;
-    }
+    let name = rust_named_item_name(node, source)?;
 
     let in_test_region = parent_in_test_region || rust_item_carries_test_attribute(node, source);
     let (short_name, fq) = rust_type_declaration_identity(file, parent, name);
@@ -2215,10 +2263,8 @@ fn register_rust_class_like(
         parent.cloned(),
         Some(top_level.clone()),
     );
-    let declaration = source_bridge.record(node, &code_unit);
-    if in_test_region {
-        parsed.mark_test_region(&code_unit);
-    }
+    let declaration =
+        record_rust_code_unit(parsed, source_bridge, node, &code_unit, in_test_region);
     add_rust_signature_metadata(
         parsed,
         declaration,
@@ -2241,17 +2287,14 @@ fn register_rust_module(
     parsed: &mut ParsedFile,
     source_bridge: &mut dyn RustDeclarationSourceBridge,
 ) -> Option<CodeUnit> {
-    let name_node = node.child_by_field_name("name")?;
-    let name = rust_node_text(name_node, source).trim();
-    if name.is_empty() {
-        return None;
-    }
+    let name = rust_named_item_name(node, source)?;
 
     let in_test_region = parent_in_test_region || rust_item_carries_test_attribute(node, source);
     let short_name = parent
         .map(|parent| format!("{}.{}", parent.short_name(), name))
         .unwrap_or_else(|| name.to_string());
-    let fq = rust_child_fq_base(parent, file).with_pushed(rust_segment(name, SegmentKind::Package));
+    let fq = child_fq_base(parent, || rust_file_package_fq(file))
+        .with_pushed(segment_interner().intern(name, SegmentKind::Package));
     let code_unit = CodeUnit::new_fq(
         file.clone(),
         CodeUnitType::Module,
@@ -2267,10 +2310,7 @@ fn register_rust_module(
         parent.cloned(),
         Some(top_level.clone()),
     );
-    source_bridge.record(node, &code_unit);
-    if in_test_region {
-        parsed.mark_test_region(&code_unit);
-    }
+    record_rust_code_unit(parsed, source_bridge, node, &code_unit, in_test_region);
     let signature = if node.child_by_field_name("body").is_some() {
         format!("mod {name} {{")
     } else {
@@ -2318,11 +2358,7 @@ fn visit_rust_function(
     parsed: &mut ParsedFile,
     source_bridge: &mut dyn RustDeclarationSourceBridge,
 ) -> Option<CodeUnit> {
-    let name_node = node.child_by_field_name("name")?;
-    let name = rust_node_text(name_node, source).trim();
-    if name.is_empty() {
-        return None;
-    }
+    let name = rust_named_item_name(node, source)?;
 
     let in_test_region = parent_in_test_region || rust_item_carries_test_attribute(node, source);
     // `proc_macro_derive(Name)` exports its argument, not the function's name.
@@ -2350,7 +2386,8 @@ fn visit_rust_function(
     let short_name = parent
         .map(|parent| format!("{}.{}", parent.short_name(), name))
         .unwrap_or_else(|| name.to_string());
-    let fq = rust_child_fq_base(parent, file).with_pushed(rust_segment(name, SegmentKind::Member));
+    let fq = child_fq_base(parent, || rust_file_package_fq(file))
+        .with_pushed(segment_interner().intern(name, SegmentKind::Member));
     let code_unit = rust_inherit_package_anchor(
         CodeUnit::with_signature_and_fq(
             file.clone(),
@@ -2371,10 +2408,8 @@ fn visit_rust_function(
         parent.cloned(),
         Some(top_level),
     );
-    let declaration = source_bridge.record(node, &code_unit);
-    if in_test_region {
-        parsed.mark_test_region(&code_unit);
-    }
+    let declaration =
+        record_rust_code_unit(parsed, source_bridge, node, &code_unit, in_test_region);
     let signature = rust_function_signature(node, source);
     add_rust_signature_metadata(
         parsed,
@@ -2396,11 +2431,7 @@ fn visit_rust_macro(
     parsed: &mut ParsedFile,
     source_bridge: &mut dyn RustDeclarationSourceBridge,
 ) -> Option<CodeUnit> {
-    let name_node = node.child_by_field_name("name")?;
-    let name = rust_node_text(name_node, source).trim();
-    if name.is_empty() {
-        return None;
-    }
+    let name = rust_named_item_name(node, source)?;
 
     let in_test_region = parent_in_test_region || rust_item_carries_test_attribute(node, source);
     register_rust_macro(
@@ -2431,7 +2462,8 @@ fn register_rust_macro(
     let short_name = parent
         .map(|parent| format!("{}.{}", parent.short_name(), name))
         .unwrap_or_else(|| name.to_string());
-    let fq = rust_child_fq_base(parent, file).with_pushed(rust_segment(name, SegmentKind::Member));
+    let fq = child_fq_base(parent, || rust_file_package_fq(file))
+        .with_pushed(segment_interner().intern(name, SegmentKind::Member));
     let code_unit = CodeUnit::new_fq(
         file.clone(),
         CodeUnitType::Macro,
@@ -2440,12 +2472,9 @@ fn register_rust_macro(
         fq,
     );
     let top_level = parent.cloned().unwrap_or_else(|| code_unit.clone());
-    let range = rust_range_from_node(node);
+    let range = node_range(node);
     parsed.add_code_unit_with_range(code_unit.clone(), range, parent.cloned(), Some(top_level));
-    source_bridge.record(node, &code_unit);
-    if in_test_region {
-        parsed.mark_test_region(&code_unit);
-    }
+    record_rust_code_unit(parsed, source_bridge, node, &code_unit, in_test_region);
     parsed.add_signature(code_unit.clone(), signature);
     Some(code_unit)
 }
@@ -2577,12 +2606,11 @@ struct RustEmbeddedReplayContext {
 
 struct RustEmbeddedReplayFrame<'graph> {
     scope: Node<'graph>,
-    cursor: TreeCursor<'graph>,
+    children: NamedChildren<'graph>,
     tree_id: usize,
     context: usize,
     kind: RustEmbeddedReplayScope,
     phase: RustEmbeddedReplayPhase,
-    started: bool,
 }
 
 impl<'graph> RustEmbeddedReplayFrame<'graph> {
@@ -2594,40 +2622,22 @@ impl<'graph> RustEmbeddedReplayFrame<'graph> {
         phase: RustEmbeddedReplayPhase,
     ) -> Self {
         Self {
-            cursor: scope.walk(),
+            children: named_children_iter(scope),
             scope,
             tree_id,
             context,
             kind,
             phase,
-            started: false,
         }
     }
 
     fn reset(&mut self, phase: RustEmbeddedReplayPhase) {
-        self.cursor = self.scope.walk();
+        self.children = named_children_iter(self.scope);
         self.phase = phase;
-        self.started = false;
     }
 
     fn next_named_child(&mut self) -> Option<Node<'graph>> {
-        let moved = if self.started {
-            self.cursor.goto_next_sibling()
-        } else {
-            self.started = true;
-            self.cursor.goto_first_child()
-        };
-        if !moved {
-            return None;
-        }
-        loop {
-            if self.cursor.node().is_named() {
-                return Some(self.cursor.node());
-            }
-            if !self.cursor.goto_next_sibling() {
-                return None;
-            }
-        }
+        self.children.next()
     }
 }
 
@@ -2642,6 +2652,19 @@ struct RustEmbeddedReplayDriver<'graph, 'source, 'external, 'collector> {
     embedded_import_ids: &'external mut Vec<SourceImportId>,
     contexts: Vec<RustEmbeddedReplayContext>,
     frames: Vec<RustEmbeddedReplayFrame<'graph>>,
+}
+
+fn bind_rust_source_imports(
+    source_imports: &[SourceImportFact],
+    source_import_ids: &[SourceImportId],
+    binder: &mut ImportBinder,
+) {
+    for source_import_id in source_import_ids {
+        let source_import = source_imports
+            .get(source_import_id.index())
+            .expect("embedded import cache references a source import");
+        crate::lexical_scope::insert_rust_source_import_binding(binder, source_import);
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2689,21 +2712,17 @@ impl<'graph, 'source, 'external, 'collector>
         } = admission;
         let root = self.trees[tree_id].tree.root_node();
         let import_binder = self.bind_root_imports(tree_id, root);
-        let context = self.contexts.len();
-        self.contexts.push(RustEmbeddedReplayContext {
+        self.push_context_frame(
             parent,
             package_name,
             import_binder,
             in_test_region,
             replay_macro_definitions,
-        });
-        self.frames.push(RustEmbeddedReplayFrame::new(
             root,
             tree_id,
-            context,
             scope,
             RustEmbeddedReplayPhase::Visit,
-        ));
+        );
     }
 
     fn bind_root_imports(&mut self, tree_id: usize, root: Node<'graph>) -> ImportBinder {
@@ -2715,14 +2734,9 @@ impl<'graph, 'source, 'external, 'collector>
                 continue;
             }
             let source_import_ids = self.source_bridge.source_import_ids(tree_id, child);
-            for source_import_id in source_import_ids {
-                let source_import = self
-                    .source_imports
-                    .get(source_import_id.index())
-                    .expect("embedded import cache references a source import");
-                crate::lexical_scope::insert_rust_source_import_binding(&mut binder, source_import);
-                self.embedded_import_ids.push(*source_import_id);
-            }
+            bind_rust_source_imports(self.source_imports, source_import_ids, &mut binder);
+            self.embedded_import_ids
+                .extend_from_slice(source_import_ids);
         }
         binder
     }
@@ -2733,16 +2747,34 @@ impl<'graph, 'source, 'external, 'collector>
             return;
         }
         let source_import_ids = self.source_bridge.source_import_ids(tree_id, child);
-        for source_import_id in source_import_ids {
-            let source_import = self
-                .source_imports
-                .get(source_import_id.index())
-                .expect("embedded import cache references a source import");
-            crate::lexical_scope::insert_rust_source_import_binding(
-                &mut self.contexts[context].import_binder,
-                source_import,
-            );
-        }
+        let source_imports = self.source_imports;
+        let binder = &mut self.contexts[context].import_binder;
+        bind_rust_source_imports(source_imports, source_import_ids, binder);
+    }
+
+    fn push_context_frame(
+        &mut self,
+        parent: Option<CodeUnit>,
+        package_name: String,
+        import_binder: ImportBinder,
+        in_test_region: bool,
+        replay_macro_definitions: bool,
+        scope: Node<'graph>,
+        tree_id: usize,
+        kind: RustEmbeddedReplayScope,
+        phase: RustEmbeddedReplayPhase,
+    ) {
+        let context = self.contexts.len();
+        self.contexts.push(RustEmbeddedReplayContext {
+            parent,
+            package_name,
+            import_binder,
+            in_test_region,
+            replay_macro_definitions,
+        });
+        self.frames.push(RustEmbeddedReplayFrame::new(
+            scope, tree_id, context, kind, phase,
+        ));
     }
 
     fn push_scope(
@@ -2759,22 +2791,22 @@ impl<'graph, 'source, 'external, 'collector>
         let Some(scope) = node.child_by_field_name("body") else {
             return;
         };
-        let context = self.contexts.len();
-        self.contexts.push(RustEmbeddedReplayContext {
-            parent,
-            package_name,
-            import_binder,
-            in_test_region,
-            replay_macro_definitions,
-        });
         let phase = if kind == RustEmbeddedReplayScope::Module {
             RustEmbeddedReplayPhase::BindModule
         } else {
             RustEmbeddedReplayPhase::Visit
         };
-        self.frames.push(RustEmbeddedReplayFrame::new(
-            scope, tree_id, context, kind, phase,
-        ));
+        self.push_context_frame(
+            parent,
+            package_name,
+            import_binder,
+            in_test_region,
+            replay_macro_definitions,
+            scope,
+            tree_id,
+            kind,
+            phase,
+        );
     }
 
     fn run(&mut self) {
@@ -3196,7 +3228,7 @@ fn rust_reparsed_items_are_indexable(root: Node<'_>) -> bool {
     saw_item
 }
 
-fn rust_is_indexable_item_kind(kind: &str) -> bool {
+pub(crate) fn rust_is_indexable_item_kind(kind: &str) -> bool {
     matches!(
         kind,
         "function_item"
@@ -3244,22 +3276,27 @@ pub fn rust_unqualified_macro_invocation_name<'a>(
 /// name of their own and are still items: a group that parses as one is not an
 /// expression, which is the question here.
 pub(crate) fn rust_node_is_item(node: Node<'_>) -> bool {
+    rust_node_can_carry_item_attributes(node.kind())
+        || matches!(
+            node.kind(),
+            "attribute_item" | "extern_crate_declaration" | "inner_attribute_item"
+        )
+}
+
+pub(crate) fn rust_node_can_carry_item_attributes(kind: &str) -> bool {
     matches!(
-        node.kind(),
+        kind,
         "associated_type"
-            | "attribute_item"
             | "const_item"
             | "enum_item"
-            | "extern_crate_declaration"
             | "foreign_mod_item"
             | "function_item"
             | "function_signature_item"
             | "impl_item"
-            | "inner_attribute_item"
             | "macro_definition"
             | "mod_item"
-            | "static_item"
             | "struct_item"
+            | "static_item"
             | "trait_item"
             | "type_item"
             | "union_item"
@@ -3296,10 +3333,7 @@ pub(crate) fn rust_macro_invocation_source_position(node: Node<'_>) -> RustItemM
 }
 
 fn rust_is_identifier_like(node: Node<'_>) -> bool {
-    matches!(
-        node.kind(),
-        "identifier" | "reserved_identifier" | "_reserved_identifier"
-    )
+    crate::syntax::rust_identifier_kind_like(node.kind())
 }
 
 /// Re-exported from core, where the persisted Rust module-route facts that
@@ -3513,10 +3547,17 @@ fn rust_macro_delegate_arguments_replay_items(
             pending.extend(node.named_children(&mut cursor));
         }
     }
+    rust_each_item_parameter_occurs_once(item_parameters, &seen)
+        && seen.len() == item_parameters.len()
+}
+
+fn rust_each_item_parameter_occurs_once(
+    item_parameters: &HashMap<String, usize>,
+    occurrences: &HashMap<String, usize>,
+) -> bool {
     item_parameters
         .keys()
-        .all(|parameter| seen.get(parameter) == Some(&1))
-        && seen.len() == item_parameters.len()
+        .all(|parameter| occurrences.get(parameter) == Some(&1))
 }
 
 fn rust_item_repetition_replays_parameters(
@@ -3528,10 +3569,14 @@ fn rust_item_repetition_replays_parameters(
     repetition
         .children(&mut cursor)
         .all(|child| match child.kind() {
-            "$" | "(" | ")" | "*" | "+" | "?" => true,
+            kind if rust_repetition_control_token(kind) => true,
             "metavariable" => item_parameters.contains_key(rust_node_text(child, source).trim()),
             _ => false,
         })
+}
+
+fn rust_repetition_control_token(kind: &str) -> bool {
+    matches!(kind, "$" | "(" | ")" | "*" | "+" | "?")
 }
 
 fn rust_builtin_macro_does_not_replay_item_arguments(name: &str) -> bool {
@@ -3583,13 +3628,13 @@ pub(crate) fn rust_macro_definition_expands_to_its_arguments_only(
     if rules.is_empty() {
         return false;
     }
+    if !rust_macro_definition_all_rules_replay_item_parameters(node, source) {
+        return false;
+    }
     rules.into_iter().all(|rule| {
         let Some(expansion) = rule.child_by_field_name("right") else {
             return false;
         };
-        if !rust_macro_rule_replays_item_parameters(rule, source) {
-            return false;
-        }
         let mut pending = vec![expansion];
         while let Some(current) = pending.pop() {
             let mut cursor = current.walk();
@@ -4068,9 +4113,7 @@ fn rust_macro_rule_replays_item_parameters(rule: Node<'_>, source: &str) -> bool
         let mut cursor = node.walk();
         stack.extend(node.named_children(&mut cursor));
     }
-    item_parameters
-        .keys()
-        .all(|parameter| occurrences.get(parameter) == Some(&1))
+    rust_each_item_parameter_occurs_once(&item_parameters, &occurrences)
 }
 
 fn rust_macro_rule_item_parameters(pattern: Node<'_>, source: &str) -> HashMap<String, usize> {
@@ -4156,7 +4199,7 @@ fn rust_item_repetition_pattern_is_safe(
     let mut cursor = repetition.walk();
     for child in repetition.children(&mut cursor) {
         match child.kind() {
-            "$" | "(" | ")" | "*" | "+" | "?" => {}
+            kind if rust_repetition_control_token(kind) => {}
             "token_binding_pattern" => {
                 let Some(name) = child.child_by_field_name("name") else {
                     return false;
@@ -4195,15 +4238,6 @@ fn rust_attribute_meta_pattern_is_safe(attribute: Node<'_>, source: &str) -> boo
     saw_meta
 }
 
-fn rust_range_from_node(node: Node<'_>) -> Range {
-    Range {
-        start_byte: node.start_byte(),
-        end_byte: node.end_byte(),
-        start_line: node.start_position().row + 1,
-        end_line: node.end_position().row + 1,
-    }
-}
-
 #[allow(clippy::too_many_arguments)]
 fn register_rust_field(
     file: &ProjectFile,
@@ -4232,12 +4266,11 @@ fn register_rust_field(
     // scope; a member sits directly under its owner.
     let fq = match parent {
         Some(parent) => parent.fq().clone(),
-        None => rust_file_package_fq(file).with_pushed(rust_segment(
-            RUST_MODULE_SCOPE_SEGMENT,
-            SegmentKind::Package,
-        )),
+        None => rust_file_package_fq(file).with_pushed(
+            segment_interner().intern(RUST_MODULE_SCOPE_SEGMENT, SegmentKind::Package),
+        ),
     }
-    .with_pushed(rust_segment(&name, SegmentKind::Member));
+    .with_pushed(segment_interner().intern(&name, SegmentKind::Member));
     let code_unit = rust_inherit_package_anchor(
         CodeUnit::with_signature_and_fq(
             file.clone(),
@@ -4258,10 +4291,8 @@ fn register_rust_field(
         parent.cloned(),
         Some(top_level),
     );
-    let declaration = source_bridge.record(node, &code_unit);
-    if in_test_region {
-        parsed.mark_test_region(&code_unit);
-    }
+    let declaration =
+        record_rust_code_unit(parsed, source_bridge, node, &code_unit, in_test_region);
     add_rust_signature_metadata(
         parsed,
         declaration,
@@ -4340,11 +4371,7 @@ fn visit_rust_alias(
     parsed: &mut ParsedFile,
     source_bridge: &mut dyn RustDeclarationSourceBridge,
 ) -> Option<CodeUnit> {
-    let name_node = node.child_by_field_name("name")?;
-    let name = rust_node_text(name_node, source).trim();
-    if name.is_empty() {
-        return None;
-    }
+    let name = rust_named_item_name(node, source)?;
     let in_test_region = parent_in_test_region || rust_item_carries_test_attribute(node, source);
     let (short_name, fq) = rust_type_declaration_identity(file, parent, name);
     let code_unit = rust_inherit_package_anchor(
@@ -4367,10 +4394,8 @@ fn visit_rust_alias(
         parent.cloned(),
         Some(top_level),
     );
-    let declaration = source_bridge.record(node, &code_unit);
-    if in_test_region {
-        parsed.mark_test_region(&code_unit);
-    }
+    let declaration =
+        record_rust_code_unit(parsed, source_bridge, node, &code_unit, in_test_region);
     add_rust_signature_metadata(
         parsed,
         declaration,
@@ -4470,11 +4495,7 @@ fn rust_impl_owner(
     };
 
     rust_declared_impl_owner(parsed, &identity).or_else(|| {
-        let expected_fqn = if identity.package_name.is_empty() {
-            identity.short_name.clone()
-        } else {
-            format!("{}.{}", identity.package_name, identity.short_name)
-        };
+        let expected_fqn = rust_impl_owner_fqn(&identity);
         let local_short_name = if package_name.is_empty() {
             Some(expected_fqn)
         } else if identity.package_name == package_name {
@@ -4519,7 +4540,7 @@ fn rust_impl_owner(
             } else {
                 SegmentKind::Package
             };
-            fq.push(rust_segment(component, kind));
+            fq.push(segment_interner().intern(component, kind));
         }
         let owner = CodeUnit::new_fq(
             file.clone(),
@@ -4539,11 +4560,7 @@ fn rust_declared_impl_owner(
     parsed: &ParsedFile,
     identity: &RustImplOwnerIdentity,
 ) -> Option<CodeUnit> {
-    let expected_fqn = if identity.package_name.is_empty() {
-        identity.short_name.clone()
-    } else {
-        format!("{}.{}", identity.package_name, identity.short_name)
-    };
+    let expected_fqn = rust_impl_owner_fqn(identity);
     parsed
         .declarations()
         .iter()
@@ -4554,6 +4571,14 @@ fn rust_declared_impl_owner(
                     || unit.fq_name() == expected_fqn)
         })
         .cloned()
+}
+
+fn rust_impl_owner_fqn(identity: &RustImplOwnerIdentity) -> String {
+    if identity.package_name.is_empty() {
+        identity.short_name.clone()
+    } else {
+        format!("{}.{}", identity.package_name, identity.short_name)
+    }
 }
 
 /// The module path that a `use` binding's local name stands for when that name
@@ -4884,7 +4909,7 @@ fn rust_callable_parameter_type_spellings(
         .collect()
 }
 
-fn rust_callable_dispatch_extensibility(node: Node<'_>) -> DispatchExtensibility {
+pub fn rust_callable_dispatch_extensibility(node: Node<'_>) -> DispatchExtensibility {
     let mut parent = node.parent();
     while let Some(candidate) = parent {
         match candidate.kind() {
@@ -4906,8 +4931,12 @@ fn rust_callable_dispatch_extensibility(node: Node<'_>) -> DispatchExtensibility
 #[cfg(test)]
 mod structured_package_tests {
     use super::*;
+    use brokk_bifrost_test_macros::hardwon;
 
     #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#3339: Rust attributed impl members lost canonical identity and test scope during indexing"
+    )]
     fn attributed_impl_members_retain_identity_and_test_scope() {
         let source = r#"
 pub struct Number { value: String }
@@ -4967,6 +4996,9 @@ impl View for Number {
     }
 
     #[test]
+    #[hardwon(
+        "b4987fa569be: Real proc_macro and proc_macro_attribute items become macro declarations while proc_macro_derive keeps the function identifier and kind across comments."
+    )]
     fn procedural_macro_kinds_preserve_declaration_identifiers() {
         let source = r#"
 #[proc_macro]
@@ -5003,6 +5035,9 @@ pub fn plain() {}
     }
 
     #[test]
+    #[hardwon(
+        "f25cb966d79d: Preserves a leading-dot directory as one package segment in the declaration's structured identity."
+    )]
     fn hidden_directory_is_one_structured_rust_package_segment() {
         let source = "pub struct Pattern;\n";
         let mut parser = tree_sitter::Parser::new();
@@ -5207,6 +5242,9 @@ use crate::root::After;
     }
 
     #[test]
+    #[hardwon(
+        "3bb3fbdffb31: Checks grouped import leaves share declaration identity while exact names and spans remain distinct across mounts."
+    )]
     fn coordinated_imports_publish_exact_shared_source_occurrences() {
         let source = "use crate::model::{Thing as Local, lower, *};\nextern crate ext as external;\nfn local() {\n    use crate::local::Item as LocalItem;\n}\n";
         let mut parser = tree_sitter::Parser::new();
@@ -5603,6 +5641,9 @@ replay! {
     }
 
     #[test]
+    #[hardwon(
+        "1673c7f02ef3: Tree-sitter distinguishes shorthand and typed self receivers from free/associated functions, and the adapter must classify both receivers as non-static."
+    )]
     fn callable_metadata_records_rust_self_parameter_structurally() {
         let source = "pub fn free(value: i32) {}\n\nstruct Thing;\nimpl Thing {\n    fn method(&self, value: i32) {}\n    fn typed(self: Box<Self>) {}\n    fn associated(value: i32) {}\n}\n";
         let mut parser = tree_sitter::Parser::new();
@@ -5642,8 +5683,144 @@ replay! {
         assert!(associated.callable_modifiers_recorded());
         assert!(associated.callable_is_static());
     }
+}
+
+fn rust_parameter_label_nodes(parameters_node: Node<'_>) -> Vec<Node<'_>> {
+    brokk_bifrost_core::analyzer::tree_walk::named_children_iter(parameters_node)
+        .filter_map(rust_parameter_label_node)
+        .collect()
+}
+
+pub(crate) fn rust_parameter_label_node(parameter: Node<'_>) -> Option<Node<'_>> {
+    match parameter.kind() {
+        "parameter" => parameter
+            .child_by_field_name("pattern")
+            .map(|pattern| rust_parameter_pattern_label_node(pattern).unwrap_or(pattern)),
+        "self_parameter" => Some(parameter),
+        _ => None,
+    }
+}
+
+fn rust_parameter_pattern_label_node(pattern: Node<'_>) -> Option<Node<'_>> {
+    let mut pending = vec![pattern];
+    while let Some(node) = pending.pop() {
+        match node.kind() {
+            "identifier" => return Some(node),
+            "mut_pattern" | "ref_pattern" => {
+                let mut cursor = node.walk();
+                let children = node.named_children(&mut cursor).collect::<Vec<_>>();
+                pending.extend(children.into_iter().rev());
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+fn rust_macro_signature(node: Node<'_>, source: &str) -> String {
+    rust_node_text(node, source)
+        .lines()
+        .find(|line| line.contains("macro_rules!"))
+        .map(str::trim)
+        .unwrap_or("macro_rules!")
+        .to_string()
+}
+
+/// Every type identifier named anywhere in `source`, parsed standalone rather
+/// than read off an indexed file: callers pass ad hoc snippets that the
+/// analyzer has never seen.
+pub fn rust_type_identifiers(source: &str) -> BTreeSet<String> {
+    let mut parser = Parser::new();
+    parser
+        .set_language(&tree_sitter_rust::LANGUAGE.into())
+        .expect("failed to load rust parser");
+    let Some(tree) = parser.parse(source, None) else {
+        return BTreeSet::new();
+    };
+    let mut identifiers = HashSet::default();
+    walk_rust_primary_tree(
+        tree.root_node(),
+        &mut identifiers,
+        |node, _, _, identifiers| {
+            collect_rust_type_identifier(node, source, identifiers);
+            (true, TreeWalkAction::Skip)
+        },
+        |_, _| {},
+    );
+    identifiers.into_iter().collect()
+}
+
+fn collect_rust_type_identifier(node: Node<'_>, source: &str, identifiers: &mut HashSet<String>) {
+    match node.kind() {
+        "identifier" | "type_identifier" | "field_identifier" => {
+            let text = rust_node_text(node, source).trim();
+            if !text.is_empty() {
+                identifiers.insert(text.to_string());
+            }
+        }
+        _ => {}
+    }
+}
+
+#[cfg(test)]
+mod embedded_replay_tests {
+    use super::*;
+    use brokk_bifrost_test_macros::hardwon;
+
+    fn parse_fixture(source: &str) -> ParsedFile {
+        crate::test_helpers::parse_rust_fixture(source)
+    }
 
     #[test]
+    fn cfg_alternatives_keep_distinct_source_metadata_visibility() {
+        use brokk_bifrost_core::analyzer::structural::resolution::DeclaredVisibility;
+        use std::collections::HashMap;
+
+        let parsed = parse_fixture(
+            r#"
+#[cfg(unix)]
+pub fn platform_entry() {}
+
+#[cfg(windows)]
+fn platform_entry() {}
+"#,
+        );
+        let facts = parsed.source_facts.as_ref().expect("Rust source facts");
+        let visibility_by_declaration = facts
+            .declaration_visibilities
+            .as_ref()
+            .expect("declaration visibility facts")
+            .iter()
+            .map(|fact| (fact.declaration, fact.visibility))
+            .collect::<HashMap<_, _>>();
+        let links = parsed
+            .source_declaration_metadata
+            .iter()
+            .filter(|link| link.unit.short_name() == "platform_entry")
+            .collect::<Vec<_>>();
+        assert_eq!(links.len(), 2, "source metadata links: {links:?}");
+        assert_ne!(
+            links[0].metadata_ordinal, links[1].metadata_ordinal,
+            "cfg alternatives with the same display signature keep separate metadata rows"
+        );
+        let visibilities = links
+            .iter()
+            .map(|link| visibility_by_declaration[&link.declaration])
+            .collect::<Vec<_>>();
+        assert!(
+            visibilities.contains(&DeclaredVisibility::Public),
+            "{visibilities:?}"
+        );
+        assert!(
+            visibilities.contains(&DeclaredVisibility::Private),
+            "{visibilities:?}"
+        );
+    }
+
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "4bada8825287: repeated header text shifted Rust parameter spans away from their AST nodes"
+    )]
     fn parameter_metadata_uses_ast_offsets_after_repeated_header_text() {
         let source = r#"
 // The parameter text also occurs before the real parameter list.
@@ -5710,6 +5887,9 @@ fn repeated<T: Marker<{ "(r#type: u8, other: u8)".len() }>>(r#type: u8, other: u
     }
 
     #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "2c19a7df8c9c: Rust signature rendering stopped at header punctuation instead of AST bodies"
+    )]
     fn signatures_stop_at_ast_bodies_not_header_braces_or_semicolons() {
         let source = r#"
 struct Tuple<const N: usize>([u8; { N }]);
@@ -5863,234 +6043,9 @@ trait Api<const N: usize> { fn signature(value: [u8; { N }]) -> [u8; { N }] wher
     }
 
     #[test]
-    fn native_definition_crosswalk_selects_one_repeated_parser_unit_identity() {
-        use brokk_bifrost_core::analyzer::resolution_facts::ResolutionIdentifierRole;
-
-        let source = concat!(
-            "macro_rules! repeated { () => {} }\n",
-            "macro_rules! repeated { ($value:expr) => {} }\n",
-        );
-        let mut parser = tree_sitter::Parser::new();
-        parser
-            .set_language(&tree_sitter_rust::LANGUAGE.into())
-            .expect("Rust parser language");
-        let tree = parser.parse(source, None).expect("parse Rust fixture");
-        let temp = tempfile::tempdir().expect("tempdir");
-        let file = ProjectFile::new(
-            temp.path().canonicalize().expect("canonical root"),
-            "lib.rs",
-        );
-        let parsed = parse_rust_file(&file, source, &tree);
-        let names = parsed
-            .resolution_facts
-            .names
-            .iter()
-            .map(|name| (name.id, name.spelling.as_str()))
-            .collect::<HashMap<_, _>>();
-        let repeated_declarations = parsed
-            .resolution_facts
-            .identifiers
-            .iter()
-            .filter(|identifier| {
-                identifier.role == ResolutionIdentifierRole::Declaration
-                    && names[&identifier.name] == "repeated"
-            })
-            .map(|identifier| identifier.site)
-            .collect::<Vec<_>>();
-        assert_eq!(repeated_declarations.len(), 2);
-
-        let repeated_crosswalks = parsed
-            .resolution_facts
-            .definition_units
-            .iter()
-            .filter(|crosswalk| crosswalk.unit.identifier() == "repeated")
-            .collect::<Vec<_>>();
-        assert_eq!(repeated_crosswalks.len(), 1);
-        assert_eq!(repeated_crosswalks[0].declaration, repeated_declarations[0]);
-        assert!(repeated_crosswalks[0].unit.is_macro());
-    }
-
-    #[test]
-    fn native_definition_crosswalk_includes_top_level_constants_and_statics() {
-        use brokk_bifrost_core::analyzer::resolution_facts::ResolutionIdentifierRole;
-
-        let source = "pub const EXPORTED: usize = 1;\nstatic LOCAL: usize = 2;\n";
-        let mut parser = tree_sitter::Parser::new();
-        parser
-            .set_language(&tree_sitter_rust::LANGUAGE.into())
-            .expect("Rust parser language");
-        let tree = parser.parse(source, None).expect("parse Rust fixture");
-        let temp = tempfile::tempdir().expect("tempdir");
-        let file = ProjectFile::new(
-            temp.path().canonicalize().expect("canonical root"),
-            "lib.rs",
-        );
-        let parsed = parse_rust_file(&file, source, &tree);
-        let names = parsed
-            .resolution_facts
-            .names
-            .iter()
-            .map(|name| (name.id, name.spelling.as_str()))
-            .collect::<HashMap<_, _>>();
-
-        for name in ["EXPORTED", "LOCAL"] {
-            let declaration = parsed
-                .resolution_facts
-                .identifiers
-                .iter()
-                .find(|identifier| {
-                    identifier.role == ResolutionIdentifierRole::Declaration
-                        && names[&identifier.name] == name
-                })
-                .unwrap_or_else(|| panic!("missing {name} declaration"));
-            let crosswalk = parsed
-                .resolution_facts
-                .definition_units
-                .iter()
-                .find(|crosswalk| crosswalk.declaration == declaration.site)
-                .unwrap_or_else(|| panic!("missing {name} definition crosswalk"));
-            assert_eq!(crosswalk.unit.identifier(), name);
-            assert!(crosswalk.unit.is_field());
-        }
-    }
-
-    #[test]
-    fn union_declarations_are_indexed_and_crosswalked_at_module_depths() {
-        let source = concat!(
-            "pub union Root { word: u32, bytes: [u8; 4] }\n",
-            "mod nested { pub union Inner { word: u32, bytes: [u8; 4] } }\n",
-        );
-        let mut parser = tree_sitter::Parser::new();
-        parser
-            .set_language(&tree_sitter_rust::LANGUAGE.into())
-            .expect("Rust parser language");
-        let tree = parser.parse(source, None).expect("parse Rust fixture");
-        let temp = tempfile::tempdir().expect("tempdir");
-        let file = ProjectFile::new(
-            temp.path().canonicalize().expect("canonical root"),
-            "src/lib.rs",
-        );
-        let parsed = parse_rust_file(&file, source, &tree);
-        let mut indexed_unions = parsed
-            .top_level_declarations
-            .iter()
-            .chain(parsed.children.values().flatten())
-            .filter(|unit| matches!(unit.identifier(), "Root" | "Inner"))
-            .map(CodeUnit::identifier)
-            .collect::<Vec<_>>();
-        indexed_unions.sort_unstable();
-        assert_eq!(indexed_unions, ["Inner", "Root"]);
-
-        let mut crosswalked_unions = parsed
-            .resolution_facts
-            .definition_units
-            .iter()
-            .filter(|crosswalk| matches!(crosswalk.unit.identifier(), "Root" | "Inner"))
-            .map(|crosswalk| crosswalk.unit.identifier())
-            .collect::<Vec<_>>();
-        crosswalked_unions.sort_unstable();
-        assert_eq!(crosswalked_unions, ["Inner", "Root"]);
-    }
-}
-
-fn rust_parameter_label_nodes(parameters_node: Node<'_>) -> Vec<Node<'_>> {
-    let mut cursor = parameters_node.walk();
-    parameters_node
-        .named_children(&mut cursor)
-        .filter_map(rust_parameter_label_node)
-        .collect()
-}
-
-pub(crate) fn rust_parameter_label_node(parameter: Node<'_>) -> Option<Node<'_>> {
-    match parameter.kind() {
-        "parameter" => parameter
-            .child_by_field_name("pattern")
-            .map(|pattern| rust_parameter_pattern_label_node(pattern).unwrap_or(pattern)),
-        "self_parameter" => Some(parameter),
-        _ => None,
-    }
-}
-
-fn rust_parameter_pattern_label_node(pattern: Node<'_>) -> Option<Node<'_>> {
-    let mut pending = vec![pattern];
-    while let Some(node) = pending.pop() {
-        match node.kind() {
-            "identifier" => return Some(node),
-            "mut_pattern" | "ref_pattern" => {
-                let mut cursor = node.walk();
-                let children = node.named_children(&mut cursor).collect::<Vec<_>>();
-                pending.extend(children.into_iter().rev());
-            }
-            _ => {}
-        }
-    }
-    None
-}
-
-fn rust_macro_signature(node: Node<'_>, source: &str) -> String {
-    rust_node_text(node, source)
-        .lines()
-        .find(|line| line.contains("macro_rules!"))
-        .map(str::trim)
-        .unwrap_or("macro_rules!")
-        .to_string()
-}
-
-/// Every type identifier named anywhere in `source`, parsed standalone rather
-/// than read off an indexed file: callers pass ad hoc snippets that the
-/// analyzer has never seen.
-pub fn rust_type_identifiers(source: &str) -> BTreeSet<String> {
-    let mut parser = Parser::new();
-    parser
-        .set_language(&tree_sitter_rust::LANGUAGE.into())
-        .expect("failed to load rust parser");
-    let Some(tree) = parser.parse(source, None) else {
-        return BTreeSet::new();
-    };
-    let mut identifiers = HashSet::default();
-    walk_rust_primary_tree(
-        tree.root_node(),
-        &mut identifiers,
-        |node, _, _, identifiers| {
-            collect_rust_type_identifier(node, source, identifiers);
-            (true, TreeWalkAction::Skip)
-        },
-        |_, _| {},
-    );
-    identifiers.into_iter().collect()
-}
-
-fn collect_rust_type_identifier(node: Node<'_>, source: &str, identifiers: &mut HashSet<String>) {
-    match node.kind() {
-        "identifier" | "type_identifier" | "field_identifier" => {
-            let text = rust_node_text(node, source).trim();
-            if !text.is_empty() {
-                identifiers.insert(text.to_string());
-            }
-        }
-        _ => {}
-    }
-}
-
-#[cfg(test)]
-mod embedded_replay_tests {
-    use super::*;
-
-    fn parse_fixture(source: &str) -> ParsedFile {
-        let mut parser = tree_sitter::Parser::new();
-        parser
-            .set_language(&tree_sitter_rust::LANGUAGE.into())
-            .expect("Rust parser language");
-        let tree = parser.parse(source, None).expect("parse Rust fixture");
-        let temp = tempfile::tempdir().expect("temporary workspace");
-        let file = ProjectFile::new(
-            temp.path().canonicalize().expect("canonical root"),
-            "src/lib.rs",
-        );
-        parse_rust_file(&file, source, &tree)
-    }
-
-    #[test]
+    #[hardwon(
+        "a832f523dbdf: Two identical macro arguments must retain distinct closure binding occurrences after coordinate rebasing."
+    )]
     fn repeated_macro_closure_bindings_keep_their_own_source_occurrences() {
         let source = "macro_rules! apply { ($f:expr) => { $f }; }\nfn test() { apply!(|a| a); apply!(|a| a); }\n";
         let parsed = parse_fixture(source);
@@ -6540,6 +6495,9 @@ helper::wrap! { use crate::{Hidden, HiddenOther}; extern crate rejected; }
     }
 
     #[test]
+    #[hardwon(
+        "03fd15e93c0b: Records error-bearing macro roots with their invocation parent context and syntax status."
+    )]
     fn parsed_error_roots_retain_embedded_context_and_syntax() {
         use brokk_bifrost_core::analyzer::rust_facts::{
             RustItemMacroExpansion, RustSourceContextKind,
@@ -7366,6 +7324,9 @@ wrap! {
     }
 
     #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "6e97fe1854b0: deeply nested Rust macro replay overflowed or reordered declarations"
+    )]
     fn wide_nested_embedded_macros_preserve_declaration_order() {
         let width = 128;
         let mut source = String::from("wrap! { ");
@@ -7599,58 +7560,37 @@ wrap! { pub mod second; }
             );
         }
     }
+}
 
-    #[test]
-    fn coordinated_replay_parses_each_macro_interior_once() {
-        let source = r#"
-wrap! { pub mod first; nested! { pub mod child; } }
-wrap! { pub mod second; }
-stringify! { pub mod route_only; }
-"#;
-        let (parsed, (parses, requests)) =
-            crate::lexical_scope::with_rust_tree_parse_counts_for_test(|| parse_fixture(source));
-        assert_eq!(
-            requests, 4,
-            "one raw-tree parse for each primary or nested macro invocation"
-        );
-        // Four replay trees plus one enumeration attempt for each of the
-        // three item-position invocations the native walk reaches (`wrap!`
-        // twice and `stringify!`; `nested!` is inside `wrap!`'s interior and
-        // is replayed, not visited). An attempt parses the first group of the
-        // token tree, `pub mod first`, `pub mod second` and `pub mod
-        // route_only`, none of which is an expression, so each invocation
-        // keeps its reference-enumeration gap. Those parses go through
-        // `parse_rust_tree_uncached`, which raises this counter and not the
-        // request counter above; the request count is replay's alone, and it
-        // is what pins that no interior is replayed twice.
-        assert_eq!(
-            parses, 7,
-            "declaration and route projections share the same four replay trees"
-        );
-        let source_facts = parsed.source_facts.as_ref().expect("source facts");
-        let route_only = source_facts
-            .rust_declaration_properties
-            .iter()
-            .find(|property| {
-                let Some(name) = source_facts
-                    .occurrences
-                    .declaration(property.declaration)
-                    .name
-                else {
-                    return false;
-                };
-                let range = source_facts.occurrences.occurrence(name).range;
-                source.get(range.start_byte..range.end_byte) == Some("route_only")
-            })
-            .expect("builtin route-only property");
-        assert!(
-            !parsed
-                .source_declaration_units
-                .iter()
-                .any(|(declaration, _)| *declaration == route_only.declaration),
-            "route-only builtin item has no display declaration link"
-        );
+#[cfg(test)]
+mod passthrough_macro_tests {
+    use super::*;
+
+    fn parse_fixture(source: &str) -> ParsedFile {
+        crate::test_helpers::parse_rust_fixture(source)
     }
+
+    /// One source item inside a macro invocation is one source declaration.
+    ///
+    /// `lower_macro_bindings` states the invariant this pins
+    /// (`crate::resolution`, "declaration replay owns the declarations an item
+    /// macro expands to in this blob, and minting a second set beside them
+    /// would give one source item two declarations"). It does not hold for an
+    /// invocation whose definition is not visible: declaration replay mints an
+    /// `Embedded` declaration carrying the `CodeUnit`, and
+    /// `lower_definition_less_macro_arguments` parses the same argument group
+    /// and lowers it through the ordinary fragment walk, minting a second
+    /// `PrimaryNode` declaration that takes the native site and the bridge.
+    ///
+    /// The two then disagree: the first has the identifier, the unit and
+    /// `ModuleOrFile`; the second has the definition site and
+    /// `LocalBlockOrFunction`, because the argument group parses inside a
+    /// block. `rust_crate_exports` joins declarations to bridges, so the item
+    /// gets no export row and a qualified path answers a decided absence for an
+    /// item that exists.
+    ///
+    /// No macro definition is visible in this fixture, which is the point: the
+    /// split is not the passthrough path and does not depend on the classifier.
 
     #[test]
     fn malformed_nested_replay_is_ignored_without_losing_outer_items() {
@@ -7697,17 +7637,10 @@ mod declaration_property_tests {
         RustCfgCondition, RustDeclarationBoundary, RustDeclarationKind,
     };
     use brokk_bifrost_core::analyzer::source_facts::SourceOccurrenceProvenance;
+    use brokk_bifrost_test_macros::hardwon;
 
     fn parse_fixture(source: &str) -> (ParsedFile, String) {
-        let mut parser = tree_sitter::Parser::new();
-        parser
-            .set_language(&tree_sitter_rust::LANGUAGE.into())
-            .expect("Rust parser language");
-        let tree = parser.parse(source, None).expect("parse Rust fixture");
-        let temp = tempfile::tempdir().expect("temporary workspace");
-        let root = temp.path().canonicalize().expect("canonical root");
-        let file = ProjectFile::new(root, "src/lib.rs");
-        let parsed = parse_rust_file(&file, source, &tree);
+        let parsed = crate::test_helpers::parse_rust_fixture(source);
         (parsed, source.to_owned())
     }
 
@@ -7717,9 +7650,94 @@ mod declaration_property_tests {
         id: SourceDeclarationId,
     ) -> Option<&'a str> {
         let facts = parsed.source_facts.as_ref().expect("source facts");
-        let name = facts.occurrences.declaration(id).name?;
-        let range = facts.occurrences.occurrence(name).range;
-        source.get(range.start_byte..range.end_byte)
+        facts.declaration_name(source, id)
+    }
+
+    #[test]
+    #[hardwon(
+        "#4459: unknown item attributes withheld source declaration bridges instead of retaining an uncertain source candidate"
+    )]
+    fn transforming_attributes_keep_source_declaration_bridges_and_gaps() {
+        let source = r#"
+#[runtime::entry]
+pub fn transformed() {}
+
+#[command]
+pub struct Command;
+
+#[cfg_attr(feature = "cli", derive(Clone))]
+pub enum Output { Ready }
+
+#[runtime::service]
+pub trait Service {
+    #[runtime::route]
+    fn call(&self);
+}
+
+#[runtime::module]
+pub mod nested {
+    pub fn inside() {}
+}
+
+pub struct Engine;
+
+#[runtime::extensions]
+impl Engine {
+    #[runtime::route]
+    fn run(&self) {}
+}
+"#;
+        let (parsed, source) = parse_fixture(source);
+        let facts = parsed.source_facts.as_ref().expect("source facts");
+        for name in [
+            "transformed",
+            "Command",
+            "Output",
+            "Service",
+            "call",
+            "nested",
+            "inside",
+            "Engine",
+            "run",
+        ] {
+            let declarations = facts
+                .rust_declaration_properties
+                .iter()
+                .filter(|property| {
+                    declaration_name(&parsed, &source, property.declaration) == Some(name)
+                })
+                .map(|property| property.declaration)
+                .collect::<Vec<_>>();
+            assert_eq!(declarations.len(), 1, "{name}: {declarations:?}");
+            assert_eq!(
+                facts
+                    .native_declaration_sources
+                    .iter()
+                    .filter(|bridge| bridge.1 == declarations[0])
+                    .count(),
+                1,
+                "{name} must have one native source bridge"
+            );
+        }
+
+        assert!(
+            parsed.resolution_facts.gaps.iter().any(|gap| {
+                gap.kind
+                    == brokk_bifrost_core::analyzer::resolution_facts::ResolutionGapKind::UnsupportedScopeOrBinder
+            }),
+            "attribute expansion uncertainty remains explicit"
+        );
+        assert!(
+            parsed
+                .resolution_facts
+                .reference_enumeration_gaps
+                .iter()
+                .any(|gap| {
+                    gap.kind
+                        == brokk_bifrost_core::analyzer::resolution_facts::ResolutionGapKind::UnsupportedScopeOrBinder
+                }),
+            "attribute expansion keeps reference enumeration open"
+        );
     }
 
     #[test]
@@ -8040,6 +8058,70 @@ type Alias = u8;
     }
 
     #[test]
+    fn cfg_and_item_macro_declarations_have_source_properties() {
+        use brokk_bifrost_core::analyzer::source_facts::SourceDeclarationId;
+
+        let fixtures = [
+            (
+                r#"
+#[cfg(all(test, feature = "autodiff", feature = "flex"))]
+mod autodiff_context_tests {
+    fn device() {}
+}
+"#,
+                "device",
+                CodeUnitType::Function,
+            ),
+            (
+                r#"
+cfg_net! {
+    pub struct TcpListener {
+        io: PollEvented<mio::net::TcpListener>,
+    }
+}
+"#,
+                "io",
+                CodeUnitType::Field,
+            ),
+        ];
+
+        for (source, name, kind) in fixtures {
+            let parsed = crate::test_helpers::parse_rust_fixture(source);
+            let facts = parsed.source_facts.as_ref().expect("Rust source facts");
+            assert!(
+                parsed
+                    .declarations()
+                    .iter()
+                    .any(|unit| unit.identifier() == name && unit.kind() == kind),
+                "fixture should produce {kind:?} {name}"
+            );
+            let properties: HashSet<SourceDeclarationId> = facts
+                .rust_declaration_properties
+                .iter()
+                .map(|property| property.declaration)
+                .collect();
+            let linked_units: HashSet<_> = parsed
+                .source_declaration_units
+                .iter()
+                .map(|(_, unit)| unit)
+                .collect();
+
+            for unit in parsed.declarations() {
+                assert!(
+                    linked_units.contains(unit),
+                    "declared Rust CodeUnit has no source declaration bridge: {unit:?}"
+                );
+            }
+            for (declaration, unit) in &parsed.source_declaration_units {
+                assert!(
+                    properties.contains(declaration),
+                    "Rust CodeUnit has no source properties: {unit:?} ({declaration:?})"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn trait_and_inherent_impl_members_keep_distinct_properties() {
         let source = r#"
 struct Subject;
@@ -8128,33 +8210,7 @@ wrap! {
             Some("embedded_macro")
         );
     }
-}
 
-#[cfg(test)]
-mod passthrough_macro_tests {
-    use super::*;
-
-    /// One source item inside a macro invocation is one source declaration.
-    ///
-    /// `lower_macro_bindings` states the invariant this pins
-    /// (`crate::resolution`, "declaration replay owns the declarations an item
-    /// macro expands to in this blob, and minting a second set beside them
-    /// would give one source item two declarations"). It does not hold for an
-    /// invocation whose definition is not visible: declaration replay mints an
-    /// `Embedded` declaration carrying the `CodeUnit`, and
-    /// `lower_definition_less_macro_arguments` parses the same argument group
-    /// and lowers it through the ordinary fragment walk, minting a second
-    /// `PrimaryNode` declaration that takes the native site and the bridge.
-    ///
-    /// The two then disagree: the first has the identifier, the unit and
-    /// `ModuleOrFile`; the second has the definition site and
-    /// `LocalBlockOrFunction`, because the argument group parses inside a
-    /// block. `rust_crate_exports` joins declarations to bridges, so the item
-    /// gets no export row and a qualified path answers a decided absence for an
-    /// item that exists.
-    ///
-    /// No macro definition is visible in this fixture, which is the point: the
-    /// split is not the passthrough path and does not depend on the classifier.
     #[test]
     fn a_macro_wrapped_item_is_one_source_declaration() {
         let source = "my_cfg! {\n    pub fn poll_proceed() -> u32 {\n        42\n    }\n}\n";
@@ -8198,15 +8254,8 @@ mod passthrough_macro_tests {
         );
     }
 
-    /// A proven-passthrough invocation's items are declared once and bridged.
-    ///
-    /// The macro is visible and every rule replays its item arguments, so the
-    /// persisted lowering declares the items against the identity declaration
-    /// replay gave them: one declaration for the item, carrying the unit, and a
-    /// native definition site bridged to that same declaration. Without the
-    /// bridge the crate rows have no export row for the item and a qualified
-    /// path answers a decided absence for something that exists.
     #[test]
+    #[hardwon("619a6c1b0a02: proven same-file passthrough declarations were treated as absent")]
     fn proven_passthrough_items_are_declared_once_and_bridged() {
         let source = "macro_rules! my_cfg {\n    ($($item:item)*) => { $($item)* };\n}\n\nmy_cfg! {\n    pub fn poll_proceed() -> u32 {\n        42\n    }\n    pub mod child;\n}\n";
         let mut parser = tree_sitter::Parser::new();
@@ -8254,6 +8303,9 @@ mod passthrough_macro_tests {
     }
 
     #[test]
+    #[hardwon(
+        "36d2ca4645e4: Accepts faithful item replay rules and rejects decoration, drops, stringification, nested/qualified invocations, and mixed captures."
+    )]
     fn item_passthrough_classifier_requires_a_safe_matcher_and_faithful_replay() {
         let source = r#"
 macro_rules! replay { ($($item:item)*) => { $( #[cfg(any())] $item )* }; }
@@ -8295,10 +8347,6 @@ macro_rules! mixed { ($name:ident, $item:item) => { $item }; }
         }
     }
 
-    /// The activation a passthrough adds to each replayed item is read from
-    /// the transcriber's attributes at the replay depth: `cfg` predicates are
-    /// conjoined, documentation attributes add nothing, and anything else --
-    /// or rules that disagree -- leaves it unknown.
     #[test]
     fn passthrough_decoration_records_added_cfg_and_nothing_else() {
         let source = r#"
@@ -8372,6 +8420,7 @@ macro_rules! opaque { ($($item:item)*) => { unknown! { $($item)* } }; }
     }
 
     #[test]
+    #[hardwon("d4ee7fa49612: inert built-in token macros were replayed as emitted Rust items")]
     fn built_in_token_macros_are_not_item_passthroughs() {
         for name in [
             "cfg",
@@ -8399,6 +8448,9 @@ macro_rules! opaque { ($($item:item)*) => { unknown! { $($item)* } }; }
     }
 
     #[test]
+    #[hardwon(
+        "b2c56ed54d0c: Ensures a user type named f16 still owns its impl method even though the grammar token is primitive_type."
+    )]
     fn primitive_spelling_does_not_hide_a_user_types_impl_members() {
         let source = "pub struct f16; impl f16 { pub fn to_f32(&self) -> f32 { 0.0 } }";
         let mut parser = tree_sitter::Parser::new();
@@ -8420,6 +8472,9 @@ macro_rules! opaque { ($($item:item)*) => { unknown! { $($item)* } }; }
     }
 
     #[test]
+    #[hardwon(
+        "36d2ca4645e4: Checks nearest visible same-name macro rules control expansion, excluding shadowed, qualified, and out-of-scope declarations."
+    )]
     fn declaration_expansion_uses_the_latest_visible_same_name_macro() {
         let source = r#"
 macro_rules! wrapper { ($($item:item)*) => { $($item)* }; }
@@ -8492,6 +8547,7 @@ fn local_module() {
 #[cfg(test)]
 mod test_region_taint_tests {
     use super::*;
+    use brokk_bifrost_test_macros::hardwon;
 
     /// Parse `source` as `src/lib.rs` and return the set of short names for the
     /// declarations recorded in the per-declaration test-region taint side-map.
@@ -8514,7 +8570,36 @@ mod test_region_taint_tests {
             .collect()
     }
 
+    fn recorded_arities(source: &str) -> Vec<(String, usize)> {
+        let mut parser = tree_sitter::Parser::new();
+        parser
+            .set_language(&tree_sitter_rust::LANGUAGE.into())
+            .expect("Rust parser language");
+        let tree = parser.parse(source, None).expect("parse Rust fixture");
+        let temp = tempfile::tempdir().expect("tempdir");
+        let file = ProjectFile::new(
+            temp.path().canonicalize().expect("canonical root"),
+            "src/lib.rs",
+        );
+        let parsed = parse_rust_file(&file, source, &tree);
+        let mut recorded = parsed
+            .signature_metadata
+            .iter()
+            .flat_map(|(unit, metadata)| {
+                metadata
+                    .iter()
+                    .filter(|entry| entry.type_parameters_recorded())
+                    .map(|entry| (unit.short_name().to_string(), entry.type_parameters().len()))
+            })
+            .collect::<Vec<_>>();
+        recorded.sort();
+        recorded
+    }
+
     #[test]
+    #[hardwon(
+        "79b4093815f9: The issue reproduction taints the inline test module and child while preserving production declarations before and after."
+    )]
     fn inline_cfg_test_module_taints_only_the_test_symbols() {
         // The issue's exact shape: a production fn plus an inline
         // `#[cfg(test)] mod tests`. Production API must stay untainted.
@@ -8537,6 +8622,9 @@ pub fn after_tests() {}
     }
 
     #[test]
+    #[hardwon(
+        "79b4093815f9: Recognizes built-in, tokio, and custom namespaced test attributes while leaving the production function untainted."
+    )]
     fn test_attributed_free_functions_are_tainted() {
         let tainted = tainted_short_names(
             r#"
@@ -8559,6 +8647,9 @@ pub fn production() {}
     }
 
     #[test]
+    #[hardwon(
+        "79b4093815f9: Test-region taint propagates through multiple nested modules to functions and types."
+    )]
     fn nested_modules_inside_cfg_test_inherit_the_taint() {
         let tainted = tainted_short_names(
             r#"
@@ -8582,6 +8673,9 @@ mod outer {
     }
 
     #[test]
+    #[hardwon(
+        "79b4093815f9: Positive nested cfg(test) taints symbols, while cfg(not(test)) keeps a production module untainted."
+    )]
     fn cfg_all_test_feature_is_tainted_but_cfg_not_test_is_not() {
         let positive = tainted_short_names(
             r#"
@@ -8609,6 +8703,9 @@ mod prod_only {
     }
 
     #[test]
+    #[hardwon(
+        "79b4093815f9: A production type after an inline test module remains outside the tainted region."
+    )]
     fn production_symbol_after_a_test_module_is_untainted() {
         let tainted = tainted_short_names(
             r#"
@@ -8625,6 +8722,9 @@ pub struct Widget {}
     }
 
     #[test]
+    #[hardwon(
+        "79b4093815f9: Test taint reaches reparsed macro items from invocation attributes and inner item attributes, but not sibling production items."
+    )]
     fn cfg_test_gated_macro_region_taints_reparsed_items() {
         // A `#[cfg(test)]`-gated item-position macro invocation taints the items
         // recovered through the #1015 reparse path, both when the attribute sits
@@ -8654,6 +8754,9 @@ passthrough! {
     }
 
     #[test]
+    #[hardwon(
+        "79b4093815f9: A cfg(test) impl taints its method without tainting the production owner type."
+    )]
     fn test_impl_taints_members_not_the_owner_type() {
         let tainted = tainted_short_names(
             r#"
@@ -8676,43 +8779,7 @@ impl Widget {
             "impl member should be tainted: {tainted:?}"
         );
     }
-}
 
-#[cfg(test)]
-mod type_parameter_metadata_tests {
-    use super::*;
-
-    /// The recorded `(short_name, arity)` pairs of every declaration whose
-    /// signature metadata read a type-parameter list.
-    fn recorded_arities(source: &str) -> Vec<(String, usize)> {
-        let mut parser = tree_sitter::Parser::new();
-        parser
-            .set_language(&tree_sitter_rust::LANGUAGE.into())
-            .expect("Rust parser language");
-        let tree = parser.parse(source, None).expect("parse Rust fixture");
-        let temp = tempfile::tempdir().expect("tempdir");
-        let file = ProjectFile::new(
-            temp.path().canonicalize().expect("canonical root"),
-            "src/lib.rs",
-        );
-        let parsed = parse_rust_file(&file, source, &tree);
-        let mut recorded = parsed
-            .signature_metadata
-            .iter()
-            .flat_map(|(unit, metadata)| {
-                metadata
-                    .iter()
-                    .filter(|entry| entry.type_parameters_recorded())
-                    .map(|entry| (unit.short_name().to_string(), entry.type_parameters().len()))
-            })
-            .collect::<Vec<_>>();
-        recorded.sort();
-        recorded
-    }
-
-    /// Every Rust type declaration records its own parameter list, so a
-    /// nongeneric type is a proven zero rather than an unread list (#1651).
-    /// Lifetimes and const generics are parameters of that list and count.
     #[test]
     fn rust_type_declarations_record_their_type_parameters() {
         let recorded = recorded_arities(

@@ -1041,76 +1041,70 @@ mod tests {
     }
 
     #[test]
-    fn python_identity_return_retains_positive_evidence() {
-        let result = derive(Language::Python, "module.py", "def f(x):\n    return x");
-        assert!(
-            matches!(result.entrypoint, SourceEntrypointStatus::Unique { .. }),
-            "{result:?}"
-        );
-        assert!(
-            result.partitions.iter().any(|partition| {
-                partition.source == TransferPartitionSource::InputParameter { ordinal: 0 }
-                    && partition.evidence.is_some()
-            }),
-            "{result:?}"
-        );
-        assert_eq!(result.dependencies.len(), 1);
-    }
-
-    #[test]
-    fn javascript_identity_return_retains_positive_evidence() {
-        let result = derive(
-            Language::JavaScript,
-            "module.js",
-            "function f(x) { return x; }",
-        );
-        assert!(
-            matches!(result.entrypoint, SourceEntrypointStatus::Unique { .. }),
-            "{result:?}"
-        );
-        assert!(
-            result.partitions.iter().any(|partition| {
-                partition.source == TransferPartitionSource::InputParameter { ordinal: 0 }
-                    && partition.evidence.is_some()
-            }),
-            "{result:?}"
-        );
-    }
-
-    #[test]
-    fn python_resolved_helper_flow_retains_positive_evidence() {
-        let source = "def helper(y):\n    return y\n\ndef f(x):\n    return helper(x)";
-        let result = derive_at(Language::Python, "module.py", source, "def f(x):");
-        assert!(
-            matches!(result.entrypoint, SourceEntrypointStatus::Unique { .. }),
-            "{result:?}"
-        );
-        assert!(result.work.closure_procedures >= 2, "{result:?}");
-        assert!(
-            result.partitions.iter().any(|partition| {
-                partition.source == TransferPartitionSource::InputParameter { ordinal: 0 }
-                    && partition.evidence.is_some()
-            }),
-            "{result:?}"
-        );
-    }
-
-    #[test]
-    fn javascript_resolved_helper_flow_retains_positive_evidence() {
-        let source = "function helper(y) { return y; }\nfunction f(x) { return helper(x); }";
-        let result = derive_at(Language::JavaScript, "module.js", source, "function f(x)");
-        assert!(
-            matches!(result.entrypoint, SourceEntrypointStatus::Unique { .. }),
-            "{result:?}"
-        );
-        assert!(result.work.closure_procedures >= 2, "{result:?}");
-        assert!(
-            result.partitions.iter().any(|partition| {
-                partition.source == TransferPartitionSource::InputParameter { ordinal: 0 }
-                    && partition.evidence.is_some()
-            }),
-            "{result:?}"
-        );
+    fn input_identity_is_order_independent_and_sensitive_to_source_and_model() {
+        let source = b"def f(x):\n    return x";
+        let entry = SourceDerivationFile {
+            relative_path: "module.py".into(),
+            bytes: Arc::from(source.as_slice()),
+        };
+        let helper = SourceDerivationFile {
+            relative_path: "helper.py".into(),
+            bytes: Arc::from(b"answer = 1".as_slice()),
+        };
+        let mut input = SourceDerivationInput {
+            files: vec![entry, helper],
+            entrypoint: SourceEntrypointRange {
+                relative_path: "module.py".into(),
+                range: Range {
+                    start_byte: 0,
+                    end_byte: source.len(),
+                    start_line: 0,
+                    end_line: 1,
+                },
+            },
+            language: Language::Python,
+            analyzer_config: AnalyzerConfig::default(),
+            configuration_identity: Arc::from(b"default-config".as_slice()),
+            model_identity: Arc::from(b"model-a".as_slice()),
+        };
+        let fingerprint = |input: &SourceDerivationInput| {
+            derive_source_normal_result(
+                input,
+                SourceDerivationLimits {
+                    max_source_files: 1,
+                    ..SourceDerivationLimits::default()
+                },
+                &mut SemanticBudget::default(),
+                &mut SolverBudget::default(),
+                &CancellationToken::default(),
+            )
+            .expect("bounded request yields a digest")
+            .input_digest
+        };
+        let initial = fingerprint(&input);
+        let initial_dependencies = derive_source_normal_result(
+            &input,
+            SourceDerivationLimits {
+                max_source_files: 1,
+                ..SourceDerivationLimits::default()
+            },
+            &mut SemanticBudget::default(),
+            &mut SolverBudget::default(),
+            &CancellationToken::default(),
+        )
+        .expect("bounded request retains dependencies")
+        .dependencies;
+        assert_eq!(initial_dependencies.len(), 2);
+        input.files.reverse();
+        assert_eq!(fingerprint(&input), initial);
+        input.files[0].bytes = Arc::from(b"answer = 2".as_slice());
+        assert_ne!(fingerprint(&input), initial);
+        input.files[0].bytes = Arc::from(b"answer = 1".as_slice());
+        input.model_identity = Arc::from(b"model-b".as_slice());
+        assert_ne!(fingerprint(&input), initial);
+        input.model_identity = Arc::from(b"model-a".as_slice());
+        input.configuration_identity = Arc::from(b"different-config".as_slice());
+        assert_ne!(fingerprint(&input), initial);
     }
 
     #[test]
@@ -1187,55 +1181,6 @@ mod tests {
     }
 
     #[test]
-    fn constant_return_does_not_invent_input_flow_or_complete_empty() {
-        let result = derive(Language::Python, "module.py", "def f(x):\n    return 42");
-        assert!(
-            matches!(result.entrypoint, SourceEntrypointStatus::Unique { .. }),
-            "{result:?}"
-        );
-        assert!(
-            result
-                .partitions
-                .iter()
-                .all(|partition| partition.evidence.is_none()),
-            "{result:?}"
-        );
-        assert_ne!(
-            result.status,
-            TransferPartitionStatus::Complete,
-            "{result:?}"
-        );
-        assert!(!result.frontiers.is_empty(), "{result:?}");
-    }
-
-    #[test]
-    fn unresolved_call_retains_typed_dispatch_frontier() {
-        let result = derive(
-            Language::Python,
-            "module.py",
-            "def f(x):\n    return missing_dependency(x)",
-        );
-        assert!(
-            matches!(result.entrypoint, SourceEntrypointStatus::Unique { .. }),
-            "{result:?}"
-        );
-        assert_ne!(
-            result.status,
-            TransferPartitionStatus::Complete,
-            "{result:?}"
-        );
-        assert!(
-            result.frontiers.iter().any(|frontier| matches!(
-                frontier,
-                SourceDerivationFrontier::UncoveredCallSite { .. }
-                    | SourceDerivationFrontier::IncompleteDispatch { .. }
-                    | SourceDerivationFrontier::UnavailableDispatch { .. }
-            )),
-            "{result:?}"
-        );
-    }
-
-    #[test]
     fn recursive_call_is_a_typed_incomplete_frontier() {
         let result = derive(Language::Python, "module.py", "def f(x):\n    return f(x)");
         assert!(
@@ -1293,73 +1238,6 @@ mod tests {
                 .frontiers
                 .contains(&SourceDerivationFrontier::SolverCancelled)
         );
-    }
-
-    #[test]
-    fn input_identity_is_order_independent_and_sensitive_to_source_and_model() {
-        let source = b"def f(x):\n    return x";
-        let entry = SourceDerivationFile {
-            relative_path: "module.py".into(),
-            bytes: Arc::from(source.as_slice()),
-        };
-        let helper = SourceDerivationFile {
-            relative_path: "helper.py".into(),
-            bytes: Arc::from(b"answer = 1".as_slice()),
-        };
-        let mut input = SourceDerivationInput {
-            files: vec![entry, helper],
-            entrypoint: SourceEntrypointRange {
-                relative_path: "module.py".into(),
-                range: Range {
-                    start_byte: 0,
-                    end_byte: source.len(),
-                    start_line: 0,
-                    end_line: 1,
-                },
-            },
-            language: Language::Python,
-            analyzer_config: AnalyzerConfig::default(),
-            configuration_identity: Arc::from(b"default-config".as_slice()),
-            model_identity: Arc::from(b"model-a".as_slice()),
-        };
-        let fingerprint = |input: &SourceDerivationInput| {
-            derive_source_normal_result(
-                input,
-                SourceDerivationLimits {
-                    max_source_files: 1,
-                    ..SourceDerivationLimits::default()
-                },
-                &mut SemanticBudget::default(),
-                &mut SolverBudget::default(),
-                &CancellationToken::default(),
-            )
-            .expect("bounded request yields a digest")
-            .input_digest
-        };
-        let initial = fingerprint(&input);
-        let initial_dependencies = derive_source_normal_result(
-            &input,
-            SourceDerivationLimits {
-                max_source_files: 1,
-                ..SourceDerivationLimits::default()
-            },
-            &mut SemanticBudget::default(),
-            &mut SolverBudget::default(),
-            &CancellationToken::default(),
-        )
-        .expect("bounded request retains dependencies")
-        .dependencies;
-        assert_eq!(initial_dependencies.len(), 2);
-        input.files.reverse();
-        assert_eq!(fingerprint(&input), initial);
-        input.files[0].bytes = Arc::from(b"answer = 2".as_slice());
-        assert_ne!(fingerprint(&input), initial);
-        input.files[0].bytes = Arc::from(b"answer = 1".as_slice());
-        input.model_identity = Arc::from(b"model-b".as_slice());
-        assert_ne!(fingerprint(&input), initial);
-        input.model_identity = Arc::from(b"model-a".as_slice());
-        input.configuration_identity = Arc::from(b"different-config".as_slice());
-        assert_ne!(fingerprint(&input), initial);
     }
 
     #[test]

@@ -165,6 +165,7 @@ pub(crate) fn compose_taint_policy(
     let resolved_spec = ResolvedTaintPolicySpec::new(
         spec.mode,
         spec.call_modeling,
+        spec.threat_models.clone(),
         sources.endpoints,
         sinks.endpoints,
         sanitizers,
@@ -191,6 +192,21 @@ struct RoleSelection<T> {
     manifests: Vec<ResolvedMatchDirectoryManifest>,
 }
 
+fn local_endpoint_dependency<'a>(
+    identity: &ResolvedEndpointIdentity,
+    role: EndpointRole,
+    universe: &'a EndpointUniverse,
+) -> Result<&'a ResolvedEndpointDependency, CompositionError> {
+    let dependency =
+        universe
+            .get(identity)
+            .ok_or_else(|| CompositionError::MissingLocalEndpointDependency {
+                identity: identity.clone(),
+            })?;
+    universe.validate_role_and_taint(identity, role, true)?;
+    Ok(dependency)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn select_sources(
     policy_id: &PolicyId,
@@ -209,12 +225,7 @@ fn select_sources(
             policy_id: policy_id.clone(),
             entry_id: entry.id.clone(),
         };
-        let dependency = universe.get(&identity).ok_or_else(|| {
-            CompositionError::MissingLocalEndpointDependency {
-                identity: identity.clone(),
-            }
-        })?;
-        universe.validate_role_and_taint(&identity, EndpointRole::Source, true)?;
+        let dependency = local_endpoint_dependency(&identity, EndpointRole::Source, universe)?;
         validate_source_model(entry, dependency)?;
         identities.push(identity);
     }
@@ -290,12 +301,7 @@ fn select_sinks(
             policy_id: policy_id.clone(),
             entry_id: entry.id.clone(),
         };
-        let dependency = universe.get(&identity).ok_or_else(|| {
-            CompositionError::MissingLocalEndpointDependency {
-                identity: identity.clone(),
-            }
-        })?;
-        universe.validate_role_and_taint(&identity, EndpointRole::Sink, true)?;
+        let dependency = local_endpoint_dependency(&identity, EndpointRole::Sink, universe)?;
         validate_sink_model(entry, dependency)?;
         identities.push(identity);
     }
@@ -359,19 +365,16 @@ fn validate_source_model(
 ) -> Result<(), CompositionError> {
     let expected_taint = EndpointTaintSemantics::Source {
         labels: entry.labels.clone(),
+        threat_model: entry.threat_model,
         evidence: entry.evidence.clone(),
     };
-    if dependency.model.display_name != entry.display_name
-        || dependency.model.categories != entry.categories
-        || dependency.model.binding != policy_port_to_endpoint_binding(&entry.bind)
-        || dependency.model.taint.as_ref() != Some(&expected_taint)
-        || !dependency.model.supersedes.is_empty()
-    {
-        return Err(CompositionError::EndpointHashCollision {
-            identity: dependency.identity.clone(),
-        });
-    }
-    Ok(())
+    validate_endpoint_model(
+        entry.display_name.as_str(),
+        &entry.categories,
+        &policy_port_to_endpoint_binding(&entry.bind),
+        &expected_taint,
+        dependency,
+    )
 }
 
 fn validate_sink_model(
@@ -383,10 +386,26 @@ fn validate_sink_model(
         tags: entry.tags.clone(),
         impacts: entry.impacts.clone(),
     };
-    if dependency.model.display_name != entry.display_name
-        || dependency.model.categories != entry.categories
-        || dependency.model.binding != policy_port_to_endpoint_binding(&entry.dangerous_operand)
-        || dependency.model.taint.as_ref() != Some(&expected_taint)
+    validate_endpoint_model(
+        entry.display_name.as_str(),
+        &entry.categories,
+        &policy_port_to_endpoint_binding(&entry.dangerous_operand),
+        &expected_taint,
+        dependency,
+    )
+}
+
+fn validate_endpoint_model(
+    display_name: &str,
+    categories: &[PolicyCategoryId],
+    binding: &PolicyEndpointBinding,
+    taint: &EndpointTaintSemantics,
+    dependency: &ResolvedEndpointDependency,
+) -> Result<(), CompositionError> {
+    if dependency.model.display_name != display_name
+        || dependency.model.categories != categories
+        || &dependency.model.binding != binding
+        || dependency.model.taint.as_ref() != Some(taint)
         || !dependency.model.supersedes.is_empty()
     {
         return Err(CompositionError::EndpointHashCollision {
@@ -396,10 +415,28 @@ fn validate_sink_model(
     Ok(())
 }
 
+fn resolved_taint_endpoint<D>(
+    dependency: &ResolvedEndpointDependency,
+    definition: D,
+) -> ResolvedTaintEndpoint<D> {
+    ResolvedTaintEndpoint::new(
+        dependency.identity.clone(),
+        dependency.semantic_hash,
+        dependency.analysis_projection_hash,
+        definition,
+        dependency.origins.clone(),
+    )
+}
+
 fn resolved_source_from_dependency(
     dependency: &ResolvedEndpointDependency,
 ) -> Result<ResolvedTaintEndpoint<ResolvedTaintSourceDefinition>, CompositionError> {
-    let Some(EndpointTaintSemantics::Source { labels, evidence }) = &dependency.model.taint else {
+    let Some(EndpointTaintSemantics::Source {
+        labels,
+        threat_model,
+        evidence,
+    }) = &dependency.model.taint
+    else {
         return Err(
             CompositionError::EndpointMissingOrMismatchedTaintSemantics {
                 identity: dependency.identity.clone(),
@@ -407,19 +444,17 @@ fn resolved_source_from_dependency(
             },
         );
     };
-    Ok(ResolvedTaintEndpoint::new(
-        dependency.identity.clone(),
-        dependency.semantic_hash,
-        dependency.analysis_projection_hash,
+    Ok(resolved_taint_endpoint(
+        dependency,
         ResolvedTaintSourceDefinition {
             display_name: dependency.model.display_name.clone(),
             categories: dependency.model.categories.clone(),
             selector_path: dependency.selector_path.clone(),
             bind: crate::catalog::endpoint_binding_to_port(&dependency.model.binding),
             labels: labels.clone(),
+            threat_model: *threat_model,
             evidence: evidence.clone(),
         },
-        dependency.origins.clone(),
     ))
 }
 
@@ -439,10 +474,8 @@ fn resolved_sink_from_dependency(
             },
         );
     };
-    Ok(ResolvedTaintEndpoint::new(
-        dependency.identity.clone(),
-        dependency.semantic_hash,
-        dependency.analysis_projection_hash,
+    Ok(resolved_taint_endpoint(
+        dependency,
         ResolvedTaintSinkDefinition {
             display_name: dependency.model.display_name.clone(),
             categories: dependency.model.categories.clone(),
@@ -452,7 +485,6 @@ fn resolved_sink_from_dependency(
             tags: tags.clone(),
             impacts: impacts.clone(),
         },
-        dependency.origins.clone(),
     ))
 }
 
@@ -473,34 +505,12 @@ where
     if !set.include_matches.is_empty() {
         return Err(CompositionError::UnsupportedMatchComposition { set: kind });
     }
-    let mut result = Vec::new();
-    let mut identities = HashSet::new();
-    for entry in &set.entries {
-        let identity = ResolvedEndpointIdentity::Local {
-            policy_id: policy_id.clone(),
-            entry_id: entry.entry_id().clone(),
-        };
-        if !identities.insert(identity.clone()) {
-            return Err(CompositionError::DuplicateComposedEntry {
-                kind,
-                id: entry.entry_id().clone(),
-            });
-        }
-        let base = format!(
-            "/analysis/{set_name}/entries/{}",
-            json_pointer_segment(entry.entry_id().as_str())
-        );
-        result.push(ResolvedTaintAuxiliary::new(
-            identity,
-            PolicySelectorPath::new(format!("{base}/selector"))
-                .map_err(|error| CompositionError::LoadedModel(error.to_string()))?,
-            definition(entry),
-            vec![EndpointOrigin::PolicyLocal {
-                path: PolicyDependencyPath::new(base)
-                    .map_err(|error| CompositionError::LoadedModel(error.to_string()))?,
-            }],
-        ));
-    }
+    let mut result =
+        compose_local_store_entries(policy_id, &set.entries, set_name, kind, &definition)?;
+    let mut identities = result
+        .iter()
+        .map(|entry| entry.identity.clone())
+        .collect::<HashSet<_>>();
     for reference in &set.include_sets {
         let catalog = catalogs.resolve(reference)?;
         let catalog_identity = resolved_catalog_identity(catalogs, reference)?;
@@ -583,10 +593,6 @@ where
     Ok(result)
 }
 
-fn json_pointer_segment(value: &str) -> String {
-    value.replace('~', "~0").replace('/', "~1")
-}
-
 /// Entry points (#2692) are policy-local source-role endpoints. No registered
 /// catalog or match set carries an entry-point vocabulary, so only local
 /// entries compose; their dependencies were minted alongside the local source
@@ -614,12 +620,7 @@ fn select_entry_points(
                 policy_id: policy_id.clone(),
                 entry_id: entry.id.clone(),
             };
-            let dependency = universe.get(&identity).ok_or_else(|| {
-                CompositionError::MissingLocalEndpointDependency {
-                    identity: identity.clone(),
-                }
-            })?;
-            universe.validate_role_and_taint(&identity, EndpointRole::Source, true)?;
+            let dependency = local_endpoint_dependency(&identity, EndpointRole::Source, universe)?;
             resolved_source_from_dependency(dependency)
         })
         .collect()
@@ -841,31 +842,12 @@ fn merge_manifests(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{EndpointAnalysisProjectionHash, EndpointSemanticHash};
+    use crate::test_support::inline_match_selector as selector;
     use brokk_bifrost_analysis::schema_version::{SchemaVersionOrigin, SchemaVersionResolution};
-    use brokk_bifrost_rql::structural::{CodeQuery, SCHEMA_VERSION};
-
-    fn selector(name: &str) -> PolicySelector {
-        PolicySelector::Inline {
-            schema: SchemaVersionResolution {
-                version: SCHEMA_VERSION as u32,
-                origin: SchemaVersionOrigin::Explicit,
-            },
-            query: CodeQuery::from_sexp(&format!(r#"(call :callee (name "{name}"))"#)).unwrap(),
-            resolved_locators: Vec::new(),
-        }
-    }
+    use brokk_bifrost_rql::structural::SCHEMA_VERSION;
 
     fn source(id: &str) -> TaintSourceSpec {
-        TaintSourceSpec {
-            id: TaintEntryId::new(id).unwrap(),
-            display_name: format!("source {id}"),
-            categories: vec![PolicyCategoryId::new("input.user").unwrap()],
-            selector: selector(id),
-            bind: PolicyPort::ReturnValue,
-            labels: vec![TaintLabel::new("user-controlled").unwrap()],
-            evidence: None,
-        }
+        crate::test_support::taint_source_spec(id, &format!("source {id}"), id, "user-controlled")
     }
 
     fn sink(id: &str) -> TaintSinkSpec {
@@ -899,6 +881,7 @@ mod tests {
                 policy_port_to_endpoint_binding(&entry.bind),
                 Some(EndpointTaintSemantics::Source {
                     labels: entry.labels.clone(),
+                    threat_model: entry.threat_model,
                     evidence: entry.evidence.clone(),
                 }),
                 vec![],
@@ -944,33 +927,26 @@ mod tests {
             EndpointRole::Source => "sources",
             EndpointRole::Sink => "sinks",
         };
-        ResolvedEndpointDependency::new(
+        crate::test_support::resolved_endpoint_dependency(
             identity,
-            EndpointDefinitionSchemaResolution::PolicyDocument {
-                resolution: SchemaVersionResolution {
-                    version: 1,
-                    origin: SchemaVersionOrigin::Explicit,
-                },
+            SchemaVersionResolution {
+                version: 1,
+                origin: SchemaVersionOrigin::Explicit,
             },
             PolicySelectorPath::new(format!(
                 "/analysis/{kind}/entries/{}/selector",
                 entry_id.as_str()
             ))
             .unwrap(),
-            ResolvedEndpointSelectorSchemas::Query(SchemaVersionResolution {
+            SchemaVersionResolution {
                 version: SCHEMA_VERSION as u32,
                 origin: SchemaVersionOrigin::Explicit,
-            }),
+            },
             model,
-            EndpointSemanticHash::from_bytes([seed; 32]),
-            EndpointAnalysisProjectionHash::from_bytes([seed.wrapping_add(64); 32]),
-            vec![EndpointOrigin::PolicyLocal {
-                path: PolicyDependencyPath::new(format!(
-                    "/analysis/{kind}/entries/{}",
-                    entry_id.as_str()
-                ))
+            PolicyDependencyPath::new(format!("/analysis/{kind}/entries/{}", entry_id.as_str()))
                 .unwrap(),
-            }],
+            seed,
+            seed.wrapping_add(64),
         )
     }
 
@@ -1003,6 +979,7 @@ mod tests {
         let spec = TaintPolicySpec {
             mode: MayMode::May,
             call_modeling: CallModelingSpec::default(),
+            threat_models: vec![],
             sources: TaintEndpointSet {
                 include_sets: vec![],
                 include_matches: vec![],
@@ -1089,6 +1066,7 @@ mod tests {
         let spec = TaintPolicySpec {
             mode: MayMode::May,
             call_modeling: CallModelingSpec::default(),
+            threat_models: vec![],
             sources: TaintEndpointSet {
                 include_sets: vec![],
                 include_matches: vec![],
@@ -1165,6 +1143,7 @@ mod tests {
         let base = |combinations| TaintPolicySpec {
             mode: MayMode::May,
             call_modeling: CallModelingSpec::default(),
+            threat_models: vec![],
             sources: TaintEndpointSet {
                 include_sets: vec![],
                 include_matches: vec![],

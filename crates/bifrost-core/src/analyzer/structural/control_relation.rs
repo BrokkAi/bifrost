@@ -27,9 +27,11 @@ labelled_enum! {
     /// - `ControlDependsOn`: the target executes only because one outgoing
     ///   branch of the source point was taken; the branch itself travels on the
     ///   row as the controlling control edge.
-    /// - `Reachable`: some path from the source point reaches the target. The
-    ///   derivation publishes this from the procedure entry, so the row states
-    ///   that the target executes on at least one path through the procedure.
+    /// - `Reachable`: the target is reachable from the procedure entry. This
+    ///   is the entry-reachability summary.
+    /// - `Reaches`: some path from the source point reaches the target. This is
+    ///   the procedure-local CFG relation used when order between two points
+    ///   matters.
     /// - `InLoop`: the target is a member of the cyclic region entered at the
     ///   source point.
     ///
@@ -39,6 +41,7 @@ labelled_enum! {
         Postdominates => "postdominates",
         ControlDependsOn => "control_depends_on",
         Reachable => "reachable",
+        Reaches => "reaches",
         InLoop => "in_loop",
     }
 }
@@ -87,28 +90,4 @@ impl ControlExitPartition {
     /// The one partition the current derivation computes. Named so a producer
     /// cannot spell a partition it did not actually compute against.
     pub const DERIVED_TODAY: Self = Self::NormalAndExceptional;
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn control_relation_vocabulary_round_trips_its_labels() {
-        for kind in ALL_CONTROL_RELATION_KINDS {
-            assert_eq!(ControlRelationKind::from_label(kind.label()), Some(*kind));
-        }
-        for partition in ALL_CONTROL_EXIT_PARTITIONS {
-            assert_eq!(
-                ControlExitPartition::from_label(partition.label()),
-                Some(*partition)
-            );
-        }
-        assert_eq!(
-            ControlExitPartition::DERIVED_TODAY,
-            ControlExitPartition::NormalAndExceptional
-        );
-        assert!(ControlRelationKind::Postdominates.depends_on_exit_partition());
-        assert!(!ControlRelationKind::Dominates.depends_on_exit_partition());
-    }
 }

@@ -1,10 +1,10 @@
 //! Compile-time proof that a request scope is open (issue #2414 step 3).
 //!
-//! The syntax information tier is the bottom rung of the ladder described in
-//! `.agents/plans/issue-2414-tier-ladder-enforcement.md`: reaching it parses a
-//! file. Parsing is only cheap when a request scope is open, because the
-//! scope owns the memoization that keeps one file's tree alive across the
-//! hundreds of accessor calls a single usage scan makes. Every ticket in the
+//! The syntax information tier is the bottom rung of the ladder (#2414):
+//! reaching it parses a file. Parsing is only cheap when a request scope is
+//! open, because the scope owns the memoization that keeps one file's tree
+//! alive across the hundreds of accessor calls a single usage scan makes.
+//! Every ticket in the
 //! #1175/#1181 re-parse defect family was the same mistake: a chain that
 //! reached a syntax accessor with no scope anywhere above it, so each call
 //! re-parsed.

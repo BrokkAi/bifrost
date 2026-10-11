@@ -17,6 +17,10 @@ installation, and activation tooling.
 Compilation alone does not install, store, match, or activate a pack; those
 operations belong to the catalog and generation-scoped runtime described below.
 
+This page explains how packs work and how to use them. The
+[Semantic Pack Reference](/reference/semantic-packs/) lists every pack field,
+every `.bifrost/packs.json` field, the shipped packs, and every pack command.
+
 > **Current runtime boundary:** Bifrost can compile, defensively decode,
 > install, strictly activate, and match semantic-model packs for one analyzer
 > generation. A successful runtime acquisition also publishes an immutable
@@ -31,16 +35,18 @@ Together, the catalog and runtime can install, select, activate, account for, qu
 
 Packs do not contain executable code, arbitrary templates, fake source, or
 unbounded evaluator inputs. Generator expressions are bounded trees of
-literals, declared scalar captures, ordered concatenation, and named ASCII case
-transforms. Procedure summaries are bounded typed records, not executable
+literals, declared captures, ordered concatenation, named ASCII case
+transforms, and conditionals that compare two expressions for equality or a
+prefix. Procedure summaries are bounded typed records, not executable
 models or source-text matching rules.
 
 ## Native format compatibility
 
-New native packs use schema `8`. Their `compatibility` object contains
+New native packs use schema `9`. Their `compatibility` object contains
 `toolchains` and omits `bifrost`; reader support for the native schema determines
-format admission. An engine-version field in a schema-8 pack is rejected.
-Producer versions still identify the generator and remain part of provenance.
+format admission. An engine-version field in a schema-8 or schema-9 pack is
+rejected. Producer versions still identify the generator and remain part of
+provenance.
 
 Historical native schemas `2` through `7` retain their required, valid
 `compatibility.bifrost` range and enforce it during selection and activation.
@@ -54,18 +60,57 @@ results retain their completeness diagnostics.
 
 ## Workspace pack activation
 
-The CLI policy runner, MCP host, and LSP host share one workspace activation
-contract: `.bifrost/packs.json`. The document is optional and, when present,
-must use schema version `1`:
+CLI policy runs and every `SearchToolsService` session (the MCP server,
+one-shot `--tool` and `--query-file` runs, and the Rust and Python libraries)
+share one workspace activation contract: `.bifrost/packs.json`. The document is optional. When present, it
+must use schema version `1` and must list `ecosystems`:
 
 ```json
 {
   "schema_version": 1,
   "catalog": ".bifrost/semantic-pack-catalog",
   "ecosystems": ["jvm", "python"],
-  "enable": ["org.example:jdk-21"]
+  "enable": ["org.example.jdk-21"]
 }
 ```
+
+`ecosystems` names the dependency ecosystems to discover. It is required. An
+empty array explicitly disables ambient dependency-pack activation. An unknown
+or duplicate label is an error. When the document is absent, the shared host
+path selects every ecosystem that serves a language present in the workspace.
+An explicit `enable` entry can satisfy a pack's `review_required` gate; it
+cannot bypass compatibility checks. Activation does not establish that a
+behavioral summary has been reviewed. To accept reviewed summary contracts,
+record an independent receipt for the exact compiled pack manifest:
+
+```json
+{
+  "schema_version": 1,
+  "ecosystems": [],
+  "enable": ["org.example.reviewed-api"],
+  "accept_reviews": [{
+    "pack_id": "org.example.reviewed-api",
+    "manifest_digest": "<exact lowercase SHA-256 of the compiled manifest>"
+  }]
+}
+```
+
+The digest pins the pack's exact summary model identities, content digests and
+contract versions. Accept a receipt only after reviewing those behavioral
+contracts. A changed pack needs a new review receipt. `accept_reviews` does not
+activate a pack or bypass compatibility, complete-summary, call-target or
+argument-binding checks. Without an applicable receipt, summary-backed taint
+findings remain possible.
+
+A retained source-to-sink path may establish a definite finding when every
+relied-upon summary has accepted review evidence and complete, exact binding.
+Its proof reasons retain the authored model dependencies. Raw authored transfer
+proof stays authored, and a conclusive run relying on those summaries reports
+`proven_by_summary`. Genuine gaps and truncated evidence remain separate limits.
+The
+[workspace pack document reference](/reference/semantic-packs/) lists every
+field, the nine ecosystem labels, the size limits, and the optional
+`python_runtime_environments` bindings.
 
 `catalog` is a workspace-relative catalog directory. Omitting it stores locally
 generated packs in the repository's versioned `.bifrost/cache` catalog, shared
@@ -89,12 +134,7 @@ integrity. On Unix, unchanged JDK source ZIPs also avoid rereading the archive
 using file identity and change timestamps. Other platforms retain exact reads.
 The analysis catalog and activation APIs do not download packs or dependencies.
 Hosts acquire compatible open content into their persistent cache; see
-[Cached and offline installation](#cached-and-offline-installation). `ecosystems` names
-the dependency ecosystems to discover, and may be an empty array to explicitly
-disable ambient dependency-pack activation.
-When the document is absent, the shared host path selects every ecosystem that
-serves a language present in the workspace. An explicit `enable` entry can
-satisfy a pack's `review_required` gate; it cannot bypass compatibility checks.
+[Cached and offline installation](#cached-and-offline-installation).
 
 Java rules that use reviewed JDK return-value obligations also require an
 explicit source-tree binding in `.bifrost/jvm-toolchains.json`:
@@ -111,10 +151,11 @@ explicit source-tree binding in `.bifrost/jvm-toolchains.json`:
 
 Source roots are workspace-relative; `.` binds the entire workspace. JDK homes
 may be absolute or relative to the workspace. The deepest matching source root
-wins. Equally specific bindings to different homes remain ambiguous. The CLI,
-MCP and LSP load these bindings when constructing the workspace; restart a
-running host after changing them. Missing or ambiguous bindings leave reviewed
-result obligations incomplete. Discovering a JDK through `JAVA_HOME` alone
+wins. Equally specific bindings to different homes remain ambiguous. Every
+host reads these bindings when it builds the workspace, and an invalid document
+makes the build fail. Restart a running host after changing them. Missing or
+ambiguous bindings leave reviewed result obligations incomplete. The
+[reference](/reference/semantic-packs/) lists the fields and limits. Discovering a JDK through `JAVA_HOME` alone
 does not select it for these rules.
 
 The selected installation must provide supported declaration artifacts such as
@@ -126,14 +167,21 @@ the file did not exist; I/O exceptions are separate. A discarded-status note
 does not establish that the caller intended to handle that status.
 
 The same transaction mints workspace evidence the reviewed runtime packs need.
-Besides one intrinsic language/ecosystem row per present language, a workspace
-whose root `package.json` (`engines.node` or `volta.node`), `.nvmrc`, or
-`.node-version` pins the reviewed Node revision `22.11.0` supplies one Node
-artifact row per present JavaScript/TypeScript language. The row carries the
-reviewed distribution-archive digest and profile configuration, so the shipped
-runtime-values packs activate with the same evidence the in-process tests
-supply. A workspace that pins another revision, or pins nothing, mints no such
-row; the pack stays `incompatible` and the activation report's reason names the
+It mints one intrinsic language row per present language. The row's ecosystem
+is fixed per language, for example `maven` for Java, Scala, and Kotlin, and
+`pypi` for Python; the reference lists all of them. A workspace that contains
+Python also gets one row that carries the reviewed Python process-input
+profile digest as its configuration. That row activates
+`bifrost.python-process-inputs` (`os.environ` and `sys.argv`) without a version
+pin, because the Python standard library defines these inputs for every
+conforming implementation.
+
+A workspace whose root `package.json` (`engines.node` or `volta.node`),
+`.nvmrc`, or `.node-version` pins the reviewed Node revision `22.11.0` gets one
+Node artifact row per present JavaScript/TypeScript language. The row carries
+the reviewed distribution-archive digest and profile configuration that the
+shipped runtime-values packs require. A workspace that pins another revision,
+or pins nothing, mints no such row; the pack stays `incompatible` and the activation report's reason names the
 artifact coordinate and the reviewed predicates it requires. Only a declaration
 of the exact reviewed revision counts -- a range such as `>=22` or a moving
 label such as `lts/*` names no reviewed artifact.
@@ -157,16 +205,25 @@ Pending or limited behavior remains visible in the receipt and does not establis
 complete coverage. Historical schema 1 releases retain their original engine
 bounds and qualification requirements.
 
-The packs repository provides `release-contract/discover.py` for online
-selection and `--offline` selection from verified cached manifests and
-artifacts. Supply a trusted engine profile containing the exact engine build,
-supported schemas and capabilities; do not infer them from a version label.
-Retain the selection receipt for the lifetime of the scan. Follow the
-[release contract](https://github.com/BrokkAi/bifrost-packs/tree/main/release-contract)
-for acquisition commands and profile requirements.
+The `bifrost` executable reads its engine profile in-process and performs
+release discovery only for commands that activate policy or MCP packs. It
+enumerates both release streams, validates the exact rules-to-packs pin, and
+selects the newest complete eligible pair. `bifrost pack-engine-profile`
+continues to print this build's profile as JSON for inspection; the
+[reference](/reference/semantic-packs/) lists its fields. The selector verifies
+the cached manifest inventory on every use, refreshes it after one hour, and
+hash-checks cached or downloaded artifacts before safe extraction.
 
-After downloading, verifying, and safely extracting a native bundle, install
-it with the running engine's portable command:
+Set `BIFROST_OPEN_PACKS_OFFLINE=1` to use only the verified cache. Set
+`BIFROST_OPEN_PACKS_REFRESH=1` to ignore the cached manifest inventory and
+discover current releases; these controls cannot be combined.
+`BIFROST_LAUNCHER_AUTO_INSTALL=0` also disables pack downloads. If no
+eligible pair exists, or network access is unavailable and the cache is empty,
+the binary reports a diagnostic and continues with embedded packs. Invalid
+profiles, release metadata, and corrupt cached content fail explicitly.
+
+For manual installation, download, verify, and safely extract a native bundle,
+then install it with the running engine's portable command:
 
 ```bash
 bifrost install-semantic-packs /path/to/bifrost-semantic-packs /path/to/cache
@@ -183,10 +240,16 @@ export BIFROST_OPEN_POLICY_PACK_ROOT=/path/to/extracted-rules/rules
 bifrost --root /path/to/project --mcp 'symbol|extended'
 ```
 
-These directories belong to the host's persistent cache, as in SlopCop's
-image-owned pack installation. A configured malformed native bundle or policy
-catalog fails explicitly. Policy manifests and authored hashes are checked by
-the same catalog loader used for embedded policies. Runtime activation still
+When both `BIFROST_OPEN_SEMANTIC_PACK_BUNDLE` and
+`BIFROST_OPEN_POLICY_PACK_ROOT` are unset, the `bifrost` binary supplies its
+verified selection before the existing native and policy installers run.
+Setting either variable supplies host-owned content and disables automatic
+acquisition. The native bundle replaces embedded semantic registration; it is
+not merged with it. An empty value, malformed bundle, or bundle that installs
+no compatible pack makes activation fail. A policy report then carries
+`pack-activation-failed`, and the run exits 2. A malformed policy catalog also
+fails explicitly. Policy manifests and authored hashes are checked by the
+same catalog loader used for embedded policies. Runtime activation still
 requires the exact modeled dependency artifacts and workspace evidence;
 installation alone does not establish applicability or complete coverage.
 
@@ -198,12 +261,11 @@ artifact merely because its pack ID matches.
 
 ## Generated-pack acquisition
 
-The facade no longer installs a network acquisition provider pointing at
-engine release assets. Plugins and image builders acquire open content from
-Bifrost-packs outside analysis and pass a verified cached selection to the
-server. Local generation remains available for exact dependency artifacts
-missing from the catalog. Generic analysis and catalog activation remain
-network-free.
+Open content is acquired by the `bifrost` executable before runtime pack
+activation, using the optional `download` feature in
+`brokk-bifrost-semantic-packs`. Analysis, generic catalog activation, and local
+dependency generation remain network-free. Local generation remains available
+for exact dependency artifacts missing from the catalog.
 
 Policy reports expose whether dependency activation was `default`,
 `configured`, or `disabled`, together with the selected, missing,
@@ -211,11 +273,23 @@ incompatible, version-mismatched, rejected, or otherwise incomplete decisions.
 Activation failures and incomplete runtime state remain typed and attributable;
 they do not become a clean negative.
 
+Every language whose discovery ran reports the standard-library pack it
+expects, even when nothing selects it: `bifrost.python-stdlib`,
+`bifrost.php-builtin`, `bifrost.rust-stdlib`, and `bifrost.typescript-stdlib`
+(which also explains that no pack declares a JavaScript standard library). The
+reason begins with the language. A workspace that declares no toolchain
+version gets a `rejected` decision naming the files Bifrost read. A declared
+toolchain with no installed pack gets a `missing` decision naming the
+Bifrost-packs install route. Each Node built-in module that a JavaScript or
+TypeScript file imports and no active pack declares, such as `fs`, gets a
+`missing` decision named `node:<module>`. Online and offline runs record the
+same decisions, because none of them involves the network.
+
 ## Authoring and review tools
 
-Build the authoring binary with the `release-tooling` feature. It extends the
-existing release commands. It uses the production source parser, schema,
-compiler, catalog, and activation resolver.
+The `bifrost-semantic-pack` binary uses the production source parser, schema,
+compiler, catalog, and activation resolver. Build it with the
+`release-tooling` feature:
 
 ```text
 cargo run -p brokk-bifrost-semantic-packs --features release-tooling \
@@ -237,6 +311,13 @@ those production diagnostics.
 `compile` writes the canonical `manifest.json` and exact shard bytes. A second
 run accepts identical files. It rejects an existing file with different bytes.
 This behavior prevents an authoring command from replacing reviewed output.
+
+`csmi-check FILE` validates a CSMI semantic document or pack manifest and
+reports structural, semantic, integrity, and per-profile results. The binary
+also has release commands (`generate`, `merge`, `verify`, `install`) and
+summary-conversion commands. The
+[command reference](/reference/semantic-packs/) lists every command, its
+arguments, its JSON report format, and its exit status.
 
 Human output is the default. `--format json` returns a stable versioned report.
 Status 0 means that the result is complete and has no finding. Status 1 means
@@ -327,9 +408,12 @@ A repository can opt in to direct YAML or JSON files at this path:
 ```
 
 Run `bifrost-semantic-pack workspace-check WORKSPACE` during review. Discovery
-does not recurse. It rejects symbolic links, non-files, files outside the
-canonical workspace, excessive files, and excessive source bytes. Each result
-contains the exact source SHA-256 and compiled semantic digest.
+does not recurse. It reads files with the extension `.json`, `.yaml`, or
+`.yml` and ignores other files without a diagnostic. It rejects symbolic
+links, non-files, and files outside the canonical workspace. It allows at most
+1,024 directory entries (`limit.workspace_files`) and 64 MiB per file
+(`limit.source_bytes`). Each result contains the exact source SHA-256 and
+compiled semantic digest.
 
 Discovery is not ambient activation. A host calls
 `register_workspace_semantic_models`, which discovers each file, compiles it,
@@ -346,16 +430,15 @@ These hosts run the reviewed workspace route:
 
 | Host | When it runs | On failure |
 | --- | --- | --- |
-| `bifrost --policy-file` | every policy run, including the diff base, when the directory exists | a `workspace-model-load-failed` report diagnostic and exit 2 |
-| The MCP host | at workspace bind, with `BIFROST_WORKSPACE_SEMANTIC_MODELS=on` | the bind fails with the source path named |
+| A CLI policy run without `--sources`: `bifrost --policy`, `--policy-file`, and `bifrost scan` | every policy run, including the diff base, when the directory exists | a `workspace-model-load-failed` report diagnostic and exit 2 |
+| A `SearchToolsService` session: the MCP server, one-shot `--tool` and `--query-file` runs, a policy run with `--sources`, and the Rust and Python libraries | when the session activates packs, with `BIFROST_WORKSPACE_SEMANTIC_MODELS=on` (also `1` or `enabled`) | the session records a failed activation; a policy run in that session reports `pack-activation-failed` and exits 2 |
 
-The LSP host does not run this reviewed workspace-model route. It shares the
-same `.bifrost/packs.json` dependency-pack activation contract as the CLI and
-MCP hosts through its background scheduler.
+`BIFROST_WORKSPACE_SEMANTIC_MODELS` is off by default. It also accepts `off`,
+`0`, and `disabled`; any other value is an error.
 
 A pack that declares `safety.review_required` stays inert on every host until
-an `enable` control names its pack id. `bifrost --policy-file` reads that list
-from `.bifrost/packs.json` and reports an inert pack as a
+an `enable` control names its pack id. Both routes read that list from
+`.bifrost/packs.json`. A policy report shows an inert pack as a
 `workspace-model-inert` warning.
 
 Procedure-summary targets use the declaration identity that Bifrost publishes;
@@ -383,16 +466,19 @@ qualifies nothing by package, such as JavaScript, TypeScript, or Ruby. Do not
 author a bare symbol for a member that has an owner: a qualified symbol and a
 bare symbol name different declarations.
 
-For a declaration with a variadic final formal, set `variadic: true` and count
-that tail once in `parameter_count`; a target with three total formals then
-matches calls with two or more actual arguments. Fixed-arity targets continue
-to require an exact count. Variadic applicability is used only for canonical
-member call-shape matching; exact artifact-and-symbol lookup still names the
-one authored formal declaration. A version-one summary cannot yet describe
-flow from or a refinement of the variadic tail itself: authoring validation
-rejects claims that reference the final formal ordinal. Fixed-prefix claims,
-such as Testify's refinement of `err` before `msgAndArgs`, apply at every
-accepted actual arity.
+Set `variadic: true` when a target declares a rest formal, and count every
+declared formal, including rest formals, in `parameter_count`. Schema fourteen
+formals identify a positional rest (`*args`), a keyword rest (`**kwargs`), or
+one rest slot that accepts both domains. A callable may declare one positional
+and one keyword rest formal. Each direct extra positional or unmatched named
+actual binds to the corresponding rest formal; an empty rest collection is
+valid. Calls with `*values` or `**options` spreads and unmatched keywords
+without a keyword-rest formal remain incomplete. Older unstructured variadic
+summaries retain their one-final-formal rule. Fixed-prefix claims, such as
+Testify's refinement of `err` before `msgAndArgs`, apply at every accepted
+actual arity. A summary still cannot describe flow from or a refinement of a
+rest formal itself: authoring validation rejects claims that reference a
+variadic-tail ordinal.
 
 For example, a free function declared as `parse_ruby_tree` in
 `crates/bifrost-ruby/src/declarations.rs` is authored as
@@ -419,8 +505,8 @@ Analyzer hosts can use these public library functions:
   node, and result limits. The caller supplies reviewed structured selectors
   and labels each family as `model_eligible_generator` or
   `inspectable_source_macro`.
-- `run_semantic_model_conformance` checks a version-one golden fixture against
-  the production overlay and matcher.
+- `run_semantic_model_conformance` checks a golden fixture (fixture format
+  version 1) against the production overlay and matcher.
 
 The scan classification is explicit. A call-shaped AST node does not prove
 that generated output is safe to model. The scan never uses regular
@@ -442,26 +528,75 @@ rules failed closed, so production emitted neither rule.
 
 ## Version and extension rules
 
-Every source pack must contain a `schema_version` this build supports, which is
-`2`, `3`, or `4`. The field is mandatory: omitted, zero, and unsupported versions fail
-instead of falling back. Every object rejects unknown fields, and every variant
-is explicitly tagged. A schema addition takes a new version number and a new
-checked-in schema rather than silently widening a number that already shipped.
+Every source pack must contain a `schema_version` this build supports, from
+`2` through `16`. The field is mandatory: omitted, zero, and unsupported versions
+fail instead of falling back. Every object rejects unknown fields, and every
+variant is explicitly tagged. A schema addition takes a new version number and
+a new checked-in schema rather than silently widening a number that already
+shipped.
 
-Producers write `5`. Reading a set of versions rather than one exact number is
-what lets an installed version-two pack or release asset keep loading across the
-bump and be regenerated on its producer's normal cadence. A field a version
-introduces is rejected in a pack that declares an earlier version, so a pack that
-an older reader accepts by its number is one that older reader can also parse:
-`ambient_use` on a `schema_version: 2` pack is a validation error, not an
-additive field.
+Producers write `16`. Schema sixteen adds `exact_return_classes` to callable
+declarations. This author-written set lists every runtime class a callable can
+return; it does not follow from the return annotation or callable-shape
+completeness. Without the claim, the result remains an open class bound.
+Schema fifteen added typed module-value
+facts and request roles on callable parameters. Reading a set of versions rather
+than one exact number is what lets an installed older pack or release asset keep
+loading across the bump and be regenerated on its producer's normal cadence. A
+field or variant a version introduces is rejected in a pack that declares an
+earlier version, so a pack that an older reader accepts by its number is one
+that older reader can also parse:
+`ambient_use` on a `schema_version: 2` pack is a validation error,
+not an additive field. Schema eleven added structured
+procedure-formal names,
+passing modes, and default-presence facts. These let a summary bind supplied
+positional or keyword actuals while leaving only declared-default formals
+unbound. Schema eleven also introduced reviewed channel-close and
+returned-callable invocation effects.
+
+Schema twelve remains supported and carries the reviewed concurrency effects,
+using channel identities declared by the model. Unresolved context or callable
+identities remain open. Schema thirteen combines both histories' structured
+formals and reviewed effect fields. Schema fourteen adds a directional kind to
+structured rest formals, so direct extra positional or unmatched named actuals
+bind exactly; call-site spreads remain incomplete.
+
+Version ten adds native callable-value facts and scoped coverage to authored
+shards. A callable value names the exact declaration and invocation shape that
+produces it, while coverage records which source locations were reviewed.
+
+Version nine adds `kind: unknown` for a parameter or result type port whose
+type is unavailable. It preserves the fact that the port exists while leaving
+its type unresolved. This differs from an absent result port and from an
+incomplete signature or body; none of those absences supplies an unknown type
+for a known port.
 
 The machine-readable contract is
-[`schemas/semantic-model-pack-v5.schema.json`](https://github.com/BrokkAi/bifrost/blob/master/schemas/semantic-model-pack-v5.schema.json).
+[`schemas/semantic-model-pack-v16.schema.json`](https://github.com/BrokkAi/bifrost/blob/master/schemas/semantic-model-pack-v16.schema.json).
 It is generated from `AuthoredSemanticModelPack`; a repository test requires
 the checked-in bytes to match the Rust-derived schema exactly.
-[`schemas/semantic-model-pack-v2.schema.json`](https://github.com/BrokkAi/bifrost/blob/master/schemas/semantic-model-pack-v2.schema.json)
-and the version-three and version-four schemas stay checked in as frozen descriptions.
+The version-two through version-eight schemas stay checked in as frozen
+descriptions.
+
+The [version table](/reference/semantic-packs/) lists each version's additions
+and the validation code for each gate.
+
+Version eight removes `compatibility.bifrost`. Version-seven and older
+packs retain the required engine range; version-eight and newer packs omit it.
+The `producer` version still names the tool that wrote the pack, but it does not
+gate activation. When a catalog is upgraded, existing packs keep their bytes and
+digests. Toolchain requirements, artifact identity, selectors, and integrity
+checks continue to apply for every version.
+
+Version seven adds `no_concurrency_effects` to procedure summaries. It is a
+reviewed claim that the procedure neither synchronizes with caller-visible
+memory nor retains it for concurrent work. Only a `complete` summary with no
+`concurrency_effects` may make it.
+
+Version six adds `callable_surface_complete` to `TypeFact`. It is a positive
+inventory claim: every directly declared, externally visible callable and
+every direct hierarchy edge of the type is in the pack. It does not cover
+inherited members, fields, effects, or overload applicability.
 
 Version five adds reviewed normal-result use obligations to procedure summaries.
 An obligation names one normal-result ordinal and either a pure transformation
@@ -496,9 +631,11 @@ directly into types that reject unknown fields.
 ## Envelope and activation
 
 The envelope records a stable pack ID and semantic version, producer identity,
-language and ecosystem, Bifrost/toolchain compatibility, provenance, an SPDX
+language and ecosystem, toolchain compatibility (and an engine version range in
+versions `2` through `7`), provenance, an SPDX
 license expression, completeness, safety metadata, and independently loadable
-shards.
+shards. The [envelope reference](/reference/semantic-packs/) lists each field,
+whether it is required, and its allowed values.
 
 Each shard has one or more activation selectors. A selector can identify a
 package, module, or declared toolchain using an exact name and optional SemVer
@@ -509,11 +646,13 @@ to avoid reading unrelated payloads, then strictly rechecks every populated
 selector field. Missing evidence never satisfies a constraint.
 
 A version constraint states the compatible range the pack's extracted API
-surface serves, not the one build it was extracted from. A pinned spec must
-bound that range above, so a pack cannot answer for an API surface it was never
-extracted from; `validate` rejects an open requirement such as `>=21.0.0`. The
-exact build stays recorded as the pack version, the pinned artifact digests,
-and the upstream provenance revision. Because activation no longer implies that
+surface serves, not the one build it was extracted from. A pinned release spec
+must bound that range above, so a pack cannot answer for an API surface it was
+never extracted from; `bifrost-semantic-pack generate` rejects an open
+requirement such as `>=21.0.0` in a spec. Authored packs are not subject to
+this check: `validate` accepts an open requirement. The exact build stays
+recorded as the pack version, the pinned artifact digests, and the upstream
+provenance revision. Because activation no longer implies that
 the workspace runs that exact build, the activation decision names both the
 build the pack carries and the requirement that admitted the workspace: a
 selected pack's reason in `packs.decisions` reads `pack version 21.0.8; matched
@@ -529,13 +668,14 @@ selectors. Ephemeral and durable workspace-produced sources outrank generated,
 installed, pre-shipped, and embedded sources in that order. A workspace control
 outranks a user control, but neither can bypass compatibility. Packs marked
 `review_required` need an explicit compatible enable. Equal-rank conflicting
-facts remain conflicts instead of becoming a last-write-wins answer.
+facts remain conflicts instead of becoming a last-write-wins answer. The
+[discovery and precedence reference](/reference/semantic-packs/) gives the
+full selection order and the activation status values.
 
 The generation-scoped runtime owns every selected decoded shard and builds
 exact-key postings for type and member IDs and names, aliases, relation IDs and
-directions, and every schema-version-one generator trigger. Lookups do not read
-SQLite, pack files, or unrelated postings; schema version one has no wildcard
-fallback path. Work, index entries, working bytes, retained bytes, and
+directions, and every generator trigger. Lookups do not read SQLite, pack
+files, or unrelated postings; the matcher has no wildcard fallback path. Work, index entries, working bytes, retained bytes, and
 explanations are bounded. Cancellation, corruption, stale generations, and
 exhausted budgets never publish a complete cached value.
 
@@ -602,14 +742,16 @@ It is not part of the project filesystem: overlay records never appear in
 file watching or source-cache operations.
 
 The overlay also evaluates active generator-rule shards against the analyzer's
-normalized structural facts. Schema-v1 language-construct and annotation
-triggers, scalar matched-node/enclosing-declaration/argument captures, bounded
-template expressions, and typed declaration, relation, and alias emissions are
-supported. Fully qualified annotation triggers require the same qualified
-spelling in the decorator AST span; an unqualified same-name annotation is not
-a match. Resolved-owner/call triggers and repeated argument captures remain
-inactive until the analyzer can supply their typed resolver evidence; Bifrost
-does not replace that missing evidence with source-text matching.
+normalized structural facts. It evaluates `language_construct`, `annotation`,
+`annotated_field`, `macro_invocation`, and `generator_invocation` triggers,
+every capture source except `resolved_owner`, bounded template expressions,
+and typed declaration, relation, and alias emissions. A fully qualified
+annotation trigger matches the same qualified spelling. An unqualified
+annotation matches a qualified trigger only when exactly one non-wildcard
+import in scope binds it to that qualified name. `resolved_owner` and
+`resolved_call` triggers never match until the analyzer can supply their typed
+resolver evidence; Bifrost does not replace that missing evidence with
+source-text matching.
 
 Every overlay declaration has one honest location. If the pack's locator names
 a real declaration in the current analyzer snapshot and the exact symbol and
@@ -627,8 +769,8 @@ navigation targets fail closed, and an absent target is reported instead of
 falling back to the model declaration.
 
 Symbol search, symbol locations, definition and modeled-usage results,
-CodeQuery declaration projections, MCP and Python JSON, and LSP workspace
-symbol/type-hierarchy values preserve the overlay provenance. It includes the
+CodeQuery declaration projections, and MCP and Python JSON preserve the
+overlay provenance. It includes the
 active-model hash, pack semantic digest and identity/version, producer and
 version, stable record ID, catalog source and activation explanation, origin,
 proof kind, completeness, and ambiguity. Model relations are reported as
@@ -834,23 +976,15 @@ so an unknown coordinate and an uninterpreted guard both keep the declaration.
 The declared `platform` is therefore the interpreter's own `sys.platform`
 value, the same vocabulary a stub's platform guard names.
 
-The LSP host accepts the same explicit boundary in initialization options. All
-paths are resolved from the workspace root; `semanticPackCatalog` is a
-host-chosen writable catalog, never an interpreter or package-cache lookup.
-
-```json
-{
-  "pythonEnvironment": {
-    "implementation": "cpython",
-    "version": "3.12.3",
-    "platform": "darwin",
-    "standardLibraryRoot": "./.bifrost/python/stdlib",
-    "bundledStubRoots": ["./.bifrost/python/stubs"],
-    "distributionRoots": ["./.bifrost/python/site-packages"],
-    "semanticPackCatalog": "./.bifrost/semantic-packs"
-  }
-}
-```
+A library host supplies this environment in
+`AnalyzerConfig::python.environment` (`PythonEnvironmentConfig`): the
+implementation, version, `platform`, `standard_library_root`,
+`bundled_stub_roots`, and `distribution_roots`. Separately,
+`.bifrost/packs.json` can bind a source tree to installed wheels through
+`python_runtime_environments`, so Bifrost can verify the installed files
+against the original wheel archives without running Python. The
+[reference](/reference/semantic-packs/) describes that field. The separately
+distributed `bifrost-lsp` server documents its own initialization options.
 
 Ruby records likewise use passive, host-supplied evidence. A
 `RubyDependencyApiEvidence` row identifies one `Gemfile.lock` by path and
@@ -911,6 +1045,20 @@ request, and activate it through the normal semantic-model runtime. Archive
 members receive digest-qualified logical locations and never become project
 files.
 
+Three more adapters read only local files. The npm adapter reads
+`package-lock.json` and `npm-shrinkwrap.json` lockfiles and the manifests of
+locally installed packages to find exact declaration entry points; it does not
+add dependency files to the workspace. The Composer adapter reads
+`composer.lock`, `vendor/composer/installed.json`, and installed package trees
+under approved vendor roots, with at most 64 autoload rules per package; it
+never runs Composer, a Composer script, or a plugin. The C++ adapter reads
+`compile_commands.json` and builds packs from the headers reachable from
+include roots outside the workspace. The Python dependency resolver reads the
+configured environment described above, or, when none is configured, the
+workspace's declared toolchain to select a standard-library pack. The
+[ecosystem table](/reference/semantic-packs/) maps each `.bifrost/packs.json`
+label to its languages, input files, and bounds.
+
 Preparation is bounded by dependency, artifact, total-byte, producer,
 compiler, and diagnostic limits. It checks cancellation between file chunks,
 JAR entries or source files, CLI metadata batches, and every
@@ -937,8 +1085,11 @@ typed hierarchy edges, aliases, extension surfaces, navigation/reference
 relations, and typed source or artifact locators. Type and member facts carry
 visibility and relevant modifiers. Language-facing names retain ordinary
 language spelling such as `TValue`, `_value`, or `getURL`; only pack and fact
-identities use Bifrost's lowercase stable-ID grammar. The complete checked
-fixture below is compiled by the integration suite.
+identities use Bifrost's lowercase stable-ID grammar. The
+[declaration facts reference](/reference/semantic-packs/) lists every field of
+`TypeFact`, `MemberFact`, `Signature`, `Parameter`, and `TypeRef`, with its
+default and the meaning of its absence. The example below is a complete,
+valid pack.
 
 A curated declaration pack may remain globally `partial` while one reviewed
 fixed-arity member sets `callable_family_complete: true`. The claim covers only
@@ -1032,8 +1183,10 @@ an exact package function or concrete result type must be selected at a call
 site. The companions are deliberately `partial` package surfaces: each
 declaration is a positive identity and signature fact, while an unlisted
 package member remains unknown rather than proved absent. Separate companions
-ship for `os`, `errors`, `log`, `net`, `net/url`, and Testify `require`; the
-`testing` pack already carries its partial concrete-receiver declarations. Keeping a
+ship for `os`, `errors`, `log`, `net`, `net/url`, `net/http`, `bytes`,
+`encoding/pem`, `crypto/x509`, `sync/atomic`, the concurrency summaries, and
+Testify `require` and `assert`; the `testing` pack already carries its partial
+concrete-receiver declarations. Keeping a
 partial declaration surface out of a complete behavior pack also preserves the
 envelope invariant that a partial pack cannot claim a complete summary. The
 declarations-only `path/filepath` pack publishes the module plus the exact
@@ -1045,17 +1198,22 @@ without attaching a behavior summary to `Join`.
 
 A generator shard declares a typed trigger, trigger-relative capture bindings,
 and typed declaration, alias, or relation emissions. Capture sources identify
-the matched node, enclosing declaration, resolved owner, one argument, an
-argument suffix, or a named annotation argument. A projection then requests a
-name, stable ID, type, text, or path. The compiler checks that each source is
-available for its trigger and that its projection, declared value kind, and
-cardinality agree.
+the matched node, the enclosing declaration, the owning type, the owned fields
+(all, mutable only, or uninitialized final only), the resolved owner, one
+argument, an argument suffix, or a named annotation argument. A projection then
+requests a name, stable ID, type, text, or path. The compiler checks that each
+source is available for its trigger and that its projection, declared value
+kind, and cardinality agree. Each source has one required cardinality.
 
-A scalar expression cannot use an optional or repeated capture. Language-name
+A `many` capture produces one emission for each value; several `many`
+captures in one rule must produce the same number of values. A `group` capture
+keeps its values together in one emission, where `repeated_parameters` renders
+once per value. A template cannot use an `optional` capture. Language-name
 positions accept identifier or stable-ID captures, type positions accept only
 type captures, and stable-ID positions accept only stable-ID captures. Unknown
 captures and stable-ID templates with unsafe boundaries or case transforms fail
-compilation.
+compilation. The [generator rules reference](/reference/semantic-packs/) lists
+every trigger, capture source, template operation, and emission.
 
 <!-- semantic-model-doc-test:tests/fixtures/semantic-model-packs/generator-rules-v1.yaml -->
 ```yaml
@@ -1156,14 +1314,15 @@ that the qualifier names the target owner. Instance transforms bind with
 inconclusive rather than being guessed. This field remains a boolean and its
 canonical key is unchanged.
 
-Transfers connect a receiver or zero-based parameter to a normal return,
-receiver, exceptional return, declared capture, or declared heap location.
+Transfers connect a receiver or zero-based parameter to a normal return, an
+indexed normal result of a multi-result procedure, the receiver, an
+exceptional return, a declared capture, or a declared heap location.
 Each transfer carries an explicit normal or exceptional exit kind, matching the
 reusable-summary contract even when an exceptional exit writes a heap or
 capture location.
 Effects represent allocation, calls to another summary in the same pack,
-escapes, unknown calls, unknown-call boundaries, and explicitly ambiguous call
-sets. Inputs must exist on the target, outputs must reference a location of the
+escapes, unknown calls, unknown-call boundaries, explicitly ambiguous call
+sets, and sanitizers that remove named taint labels on a declared transfer. Inputs must exist on the target, outputs must reference a location of the
 right kind, call targets must exist, and all collections have fixed validation
 budgets. Duplicate targets and duplicate IDs are rejected across shards.
 
@@ -1194,8 +1353,12 @@ call performs an effect without new analyzer code. Each entry carries:
   execution may).
 
 A summary may declare at most 64 effects, and one summary may not repeat an
-`id`. Declared effects do not satisfy the rule that a summary must carry at
-least one transfer or effect. Two activated summaries that match the same
+`id`. A `partial` summary must carry substantive content: a transfer, a
+complete transfer partition, an effect, a concurrency effect, a precondition
+review, a result contract, a result-use obligation, a conditional refinement
+or write, a normal-return refinement, a class decorator identity, or
+`normal_continuation_absent`. Declared effects alone do not satisfy that rule.
+A `complete` summary may be empty. Two activated summaries that match the same
 procedure and disagree about their declared effects resolve to a conflict and
 are not used. Omitting the field changes no digest, so a pack that declares no
 effects keeps the compiled bytes and the digests it had before the field
@@ -1236,6 +1399,13 @@ after compilation and decoding; a partial pack cannot claim a `complete`
 record. Completeness is evidence metadata only and does not enable matching or
 flow application.
 
+Summaries can also carry concurrency effects, transfer partitions,
+conditional result refinements and indirect writes, normal-return type
+refinements, `covers_overrides`, `ordinary_heap_unchanged`, and a class
+decorator identity. The
+[procedure summaries reference](/reference/semantic-packs/) lists every field,
+its minimum schema version, and its validation rules.
+
 ```yaml
 payload:
   kind: procedure_summaries
@@ -1274,6 +1444,17 @@ payload:
           certainty: possible
 ```
 
+## Shipped packs
+
+The engine embeds 42 reviewed packs: Scala case-class and Lombok and getset
+generator rules, JDK 21 result-use obligations, Node runtime-values,
+child-process, and `Buffer` packs, Python process-input and `os.system` packs,
+and Go standard-library, concurrency, and Testify packs. Hosts register them
+when they bootstrap the catalog. Most activate when the workspace contains the
+pack's language. The eight Node packs set `safety.review_required` and also need
+an `enable` entry. The [shipped packs table](/reference/semantic-packs/) lists
+each pack, what it models, and what activates it.
+
 ## Reviewed Node runtime packs
 
 The embedded registry ships reviewed Node runtime packs for JavaScript
@@ -1295,7 +1476,8 @@ callee the activated packs do not summarize keeps the run inconclusive.
 
 Runtime-values activation is a layered contract. An exposure authored as
 `enabled` is intrinsically eligible within its model; it never bypasses
-pack activation. Every shipped pack sets `safety.review_required`, so
+pack activation. Every shipped Node runtime pack sets
+`safety.review_required`, so
 activation additionally needs exact host-supplied evidence -- language,
 npm ecosystem, the exact Node artifact coordinates and digest, and the
 reviewed profile configuration -- plus an explicit compatible `enable`
@@ -1356,7 +1538,7 @@ SHA-256 of the exact byte sequence named above. Semantic hashes use
 domain-separated length framing:
 `SHA256(u64be(domain_length) || domain || u64be(byte_length) || bytes)`. The
 shard domain is `bifrost.semantic-model.shard.semantic.v1`; the manifest domain
-is `bifrost.semantic-model.manifest.v1`. “Canonical JSON” here means the compact
+is `bifrost.semantic-model.manifest.v1`. "Canonical JSON" here means the compact
 UTF-8 field order emitted by this schema's compiler, not RFC 8785.
 
 Automatic storage uses fixed raw DEFLATE level 6 only when it saves at least

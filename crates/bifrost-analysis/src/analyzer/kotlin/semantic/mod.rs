@@ -47,8 +47,9 @@ use crate::analyzer::semantic::*;
 use crate::analyzer::tree_sitter_analyzer::{
     PreparedSyntaxTree, WalkControl, try_walk_named_tree_preorder,
 };
-use crate::analyzer::{KotlinAnalyzer, Language, ProjectFile, Range};
+use crate::analyzer::{KotlinAnalyzer, Language, ProjectFile};
 use crate::hash::{HashMap, HashSet};
+use brokk_bifrost_jvm::kotlin::syntax::KotlinScalarType;
 use brokk_bifrost_jvm::kotlin::value_classes::{
     KotlinActualEvidence, KotlinAdaptationIncomplete, KotlinAdaptationOutcome, KotlinCalleeBinding,
     KotlinCarrier, KotlinConstructorSelection, KotlinUnderlyingMatch, KotlinValueAdaptation,
@@ -63,7 +64,16 @@ use brokk_bifrost_jvm::kotlin::value_classes::{
 /// Bumped for #3664: a capture slot whose enclosing procedure publishes no
 /// binding now carries a typed `Captures` gap instead of failing the
 /// capture-contract validator.
-const ADAPTER_VERSION: &[u8] = b"kotlin-value-semantics-v10";
+///
+/// Bumped for #3551: typed Kotlin scalar bindings, literal values, and
+/// primitive guard facts are published to the semantic IR.
+///
+/// Bumped for the compound indexed-assignment gap contract: operator and
+/// indexed-set conventions now share one point-scoped Calls gap.
+///
+/// Bumped for Kotlin Batch 6: the semantic identity now accompanies the
+/// Kotlin B1/A6 syntax hooks and their conservative result boundaries.
+const ADAPTER_VERSION: &[u8] = b"kotlin-value-semantics-v14";
 
 impl_program_semantics_provider!(KotlinAnalyzer, KotlinSemanticLowerer);
 
@@ -71,14 +81,12 @@ struct KotlinSemanticLowerer;
 
 impl ProgramSemanticsLowerer for KotlinSemanticLowerer {
     fn identity(&self) -> SemanticAdapterIdentity {
-        SemanticAdapterIdentity {
-            adapter: AdapterSemanticsVersion::hash_bytes("kotlin", ADAPTER_VERSION)
-                .expect("adapter name is non-empty"),
-            configuration: ConfigurationFingerprint::hash_bytes(
-                b"kotlin-intrafile-execution-defaults-v1",
-            ),
-            dependencies: DependencyFingerprint::hash_bytes(b"no-intrafile-dependencies"),
-        }
+        SemanticAdapterIdentity::for_adapter(
+            "kotlin",
+            ADAPTER_VERSION,
+            b"kotlin-intrafile-execution-defaults-v1",
+            DependencyFingerprint::hash_bytes(b"no-intrafile-dependencies"),
+        )
     }
 
     fn capabilities(&self) -> SemanticCapabilities {
@@ -366,6 +374,10 @@ struct LoweringContext<'tree, 'targets> {
     expression_values: HashMap<usize, ValueId>,
     parameters: HashMap<Box<str>, ValueId>,
     locals: HashMap<Box<str>, Vec<LocalBinding>>,
+    /// Kotlin primitive scalar types proven for local and parameter values.
+    scalar_types: HashMap<ValueId, KotlinScalarType>,
+    /// Mutable local bindings, used to keep captured writes open.
+    mutable_locals: HashSet<ValueId>,
     /// Locals declared `by` a delegate. Reading or assigning one calls the
     /// delegate's `getValue` or `setValue`, which is not a binding access.
     delegated_locals: HashSet<ValueId>,
@@ -413,10 +425,9 @@ fn lexical_capture_destination(
     captures_receiver: bool,
     capture_index: usize,
 ) -> Result<MemoryLocationId, KotlinLoweringError> {
-    let index = capture_index
-        .checked_add(usize::from(captures_receiver))
-        .ok_or_else(|| KotlinLoweringError::Invalid("too many Kotlin captures".into()))?;
-    let index = u32::try_from(index)
-        .map_err(|_| KotlinLoweringError::Invalid("too many Kotlin captures".into()))?;
-    Ok(MemoryLocationId::new(index))
+    crate::analyzer::semantic::lowering::lexical_capture_destination(
+        captures_receiver,
+        capture_index,
+        "Kotlin",
+    )
 }

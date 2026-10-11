@@ -3,6 +3,7 @@ use crate::imports::{
     commonjs_require_module_specifier_from_declarator, js_ts_module_identity,
     parse_commonjs_require_bindings_from_node, require_call_module_specifier,
 };
+pub use brokk_bifrost_core::analyzer::common::node_source_text as slice;
 use brokk_bifrost_core::analyzer::js_ts_facts::JsTsSourceFacts;
 use brokk_bifrost_core::analyzer::model::StructuredImportPath;
 use brokk_bifrost_core::analyzer::parsed_file::SourceImportFact;
@@ -14,10 +15,23 @@ use brokk_bifrost_core::analyzer::usages::model::{ImportBinding, ImportKind};
 use brokk_bifrost_core::analyzer::usages::reference_site::smallest_named_node_covering;
 use brokk_bifrost_core::analyzer::{Language, ProjectFile, Range};
 use brokk_bifrost_core::hash::{HashMap, HashSet};
-use tree_sitter::{Node, Parser, Tree};
+use tree_sitter::{Node, Tree};
 
 pub const MAX_IMPORT_BINDING_RECORDS_PER_NAME: usize = 64;
 pub const MAX_STATIC_IMPORT_BINDINGS_PER_NAME: usize = MAX_IMPORT_BINDING_RECORDS_PER_NAME;
+
+/// Whether a tree-sitter node kind represents a JavaScript/TypeScript callable.
+pub fn is_function_like(kind: &str) -> bool {
+    matches!(
+        kind,
+        "function_declaration"
+            | "function_expression"
+            | "generator_function_declaration"
+            | "generator_function"
+            | "arrow_function"
+            | "method_definition"
+    )
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum JsTsImportBindingActivation {
@@ -263,31 +277,12 @@ impl JsTsImportBinder {
         binding: ImportBinding,
         provenance: JsTsImportBindingProvenance,
     ) {
-        // Preserve every source event up to the native provenance cap. The
-        // compatibility projection below deduplicates identical static
-        // candidates, while proof-sensitive consumers retain the duplicate
-        // events and fail closed when the bounded provenance is truncated.
-        let record_count = self
-            .provenance_bindings
-            .get(&local_name)
-            .map_or(0, Vec::len);
-        if record_count >= MAX_IMPORT_BINDING_RECORDS_PER_NAME {
-            self.truncated_names.insert(local_name.clone());
-            return;
-        }
-        let mut provenance = provenance;
-        provenance.order = provenance.declaration_range.start_byte;
-        let record = JsTsImportBinding {
-            local_name: local_name.clone(),
+        self.bind_record(JsTsImportBinding {
+            local_name,
             binding,
             is_static: true,
             provenance,
-        };
-        self.provenance_bindings
-            .entry(local_name.clone())
-            .or_default()
-            .push(record);
-        self.rebuild_projection(&local_name);
+        });
     }
 
     fn bind_commonjs(
@@ -296,6 +291,16 @@ impl JsTsImportBinder {
         binding: ImportBinding,
         provenance: JsTsImportBindingProvenance,
     ) {
+        self.bind_record(JsTsImportBinding {
+            local_name,
+            binding,
+            is_static: false,
+            provenance,
+        });
+    }
+
+    fn bind_record(&mut self, mut record: JsTsImportBinding) {
+        let local_name = record.local_name.clone();
         let record_count = self
             .provenance_bindings
             .get(&local_name)
@@ -304,14 +309,7 @@ impl JsTsImportBinder {
             self.truncated_names.insert(local_name);
             return;
         }
-        let mut provenance = provenance;
-        provenance.order = provenance.declaration_range.start_byte;
-        let record = JsTsImportBinding {
-            local_name: local_name.clone(),
-            binding,
-            is_static: false,
-            provenance,
-        };
+        record.provenance.order = record.provenance.declaration_range.start_byte;
         self.provenance_bindings
             .entry(local_name.clone())
             .or_default()
@@ -352,18 +350,20 @@ impl JsTsImportBinder {
         Some(&self.bindings.get(local_name)?.last()?.binding)
     }
 
-    pub fn bindings_for(&self, local_name: &str) -> impl Iterator<Item = &ImportBinding> {
-        self.bindings
-            .get(local_name)
-            .into_iter()
-            .flat_map(|bindings| bindings.iter().map(|binding| &binding.binding))
-    }
-
-    pub fn direct_bindings_for(&self, local_name: &str) -> impl Iterator<Item = &ImportBinding> {
+    fn projected_bindings_for(&self, local_name: &str) -> impl Iterator<Item = &JsTsImportBinding> {
         self.bindings
             .get(local_name)
             .into_iter()
             .flat_map(|bindings| bindings.iter())
+    }
+
+    pub fn bindings_for(&self, local_name: &str) -> impl Iterator<Item = &ImportBinding> {
+        self.projected_bindings_for(local_name)
+            .map(|binding| &binding.binding)
+    }
+
+    pub fn direct_bindings_for(&self, local_name: &str) -> impl Iterator<Item = &ImportBinding> {
+        self.projected_bindings_for(local_name)
             .filter(|binding| {
                 binding.is_static
                     && matches!(
@@ -391,10 +391,7 @@ impl JsTsImportBinder {
     /// reject this broader ambiguity; direct-definition resolution keeps using
     /// [`Self::has_competing_direct_imports`] for its narrower candidate set.
     pub fn has_competing_static_imports(&self, local_name: &str) -> bool {
-        self.bindings
-            .get(local_name)
-            .into_iter()
-            .flat_map(|bindings| bindings.iter())
+        self.projected_bindings_for(local_name)
             .filter(|binding| binding.is_static)
             .nth(1)
             .is_some()
@@ -604,7 +601,11 @@ struct JsTsBindingScopeState {
 
 impl JsTsLexicalBindingScope {
     pub fn contains(&self, byte: usize) -> bool {
-        self.start_byte <= byte && byte < self.end_byte
+        brokk_bifrost_core::analyzer::model::byte_range_contains(
+            self.start_byte,
+            self.end_byte,
+            byte,
+        )
     }
 }
 
@@ -1151,13 +1152,9 @@ impl JsTsLexicalBindingIndex {
         let Some(scope) = self.binding_scope_at(name, byte) else {
             return false;
         };
-        self.assignments_by_name
-            .get(name)
-            .is_some_and(|assignments| {
-                assignments
-                    .iter()
-                    .any(|assignment| self.binding_scope_at(name, *assignment) == Some(scope))
-            })
+        self.assignment_sites_for_scope(name, scope)
+            .next()
+            .is_some()
     }
 
     /// The target-identifier start bytes of every assignment, update, and
@@ -1168,13 +1165,7 @@ impl JsTsLexicalBindingIndex {
         let Some(scope) = self.binding_scope_at(name, byte) else {
             return Vec::new();
         };
-        self.assignments_by_name
-            .get(name)
-            .into_iter()
-            .flatten()
-            .copied()
-            .filter(|assignment| self.binding_scope_at(name, *assignment) == Some(scope))
-            .collect()
+        self.assignment_sites_for_scope(name, scope).collect()
     }
 
     /// Whether an assignment or update rebinds the active lexical binding of
@@ -1183,13 +1174,21 @@ impl JsTsLexicalBindingIndex {
         let Some(scope) = self.binding_scope_at(name, byte) else {
             return false;
         };
+        self.assignment_sites_for_scope(name, scope)
+            .any(|assignment| assignment < byte)
+    }
+
+    fn assignment_sites_for_scope<'a>(
+        &'a self,
+        name: &'a str,
+        scope: JsTsLexicalBindingScope,
+    ) -> impl Iterator<Item = usize> + 'a {
         self.assignments_by_name
             .get(name)
-            .is_some_and(|assignments| {
-                assignments.iter().any(|assignment| {
-                    *assignment < byte && self.binding_scope_at(name, *assignment) == Some(scope)
-                })
-            })
+            .into_iter()
+            .flatten()
+            .copied()
+            .filter(move |assignment| self.binding_scope_at(name, *assignment) == Some(scope))
     }
 
     /// Resolve a source alias to a known runtime-global spelling at a use
@@ -1340,6 +1339,108 @@ pub fn pattern_binder_identifiers(pattern: Node<'_>) -> Vec<Node<'_>> {
     binders
 }
 
+/// Visit each direct parameter child in source order.
+pub(crate) fn for_each_parameter<'tree>(
+    parameters: Node<'tree>,
+    mut visit: impl FnMut(Node<'tree>),
+) {
+    let mut cursor = parameters.walk();
+    for parameter in parameters.named_children(&mut cursor) {
+        visit(parameter);
+    }
+}
+
+/// The nonempty name of the indexed parameter selected by a dialect's binder rule.
+pub fn parameter_name_at_index<'tree>(
+    function: Node<'tree>,
+    source: &str,
+    parameter_index: usize,
+    mut name_node: impl FnMut(Node<'tree>) -> Option<Node<'tree>>,
+) -> Option<String> {
+    let parameters = function.child_by_field_name("parameters")?;
+    let mut cursor = parameters.walk();
+    parameters
+        .named_children(&mut cursor)
+        .filter_map(&mut name_node)
+        .nth(parameter_index)
+        .map(|name| slice(name, source).trim().to_string())
+        .filter(|name| !name.is_empty())
+}
+
+/// Find a function body's direct return that preserves one parameter's object shape.
+/// The language supplies nested-scope and expression rules; the iterative tree walk is shared.
+pub(crate) fn function_returns_parameter_shape<'tree>(
+    node: Node<'tree>,
+    root_id: usize,
+    is_nested_scope: impl Fn(&str) -> bool,
+    mut expression_preserves_shape: impl FnMut(Node<'tree>) -> bool,
+) -> bool {
+    let mut stack = vec![node];
+    while let Some(node) = stack.pop() {
+        if node.id() != root_id && is_nested_scope(node.kind()) {
+            continue;
+        }
+        if node.kind() == "return_statement" {
+            let mut cursor = node.walk();
+            if node
+                .named_children(&mut cursor)
+                .next()
+                .is_some_and(&mut expression_preserves_shape)
+            {
+                return true;
+            }
+            continue;
+        }
+        for index in (0..node.named_child_count()).rev() {
+            if let Some(child) = node.named_child(index) {
+                stack.push(child);
+            }
+        }
+    }
+    false
+}
+
+/// Check whether an identifier expression or object spread preserves a parameter's shape.
+/// The caller supplies expression unwrapping and source-name rules for its dialect.
+pub(crate) fn expression_preserves_parameter_shape<'tree>(
+    expression: Node<'tree>,
+    parameter_name: &str,
+    mut unwrap_expression: impl FnMut(Node<'tree>) -> Option<Node<'tree>>,
+    mut names_parameter: impl FnMut(Node<'tree>, &str) -> bool,
+) -> bool {
+    let Some(expression) = unwrap_expression(expression) else {
+        return false;
+    };
+    if matches!(expression.kind(), "identifier" | "property_identifier")
+        && names_parameter(expression, parameter_name)
+    {
+        return true;
+    }
+    if expression.kind() != "object" {
+        return false;
+    }
+    let mut cursor = expression.walk();
+    expression.named_children(&mut cursor).any(|child| {
+        child.kind() == "spread_element"
+            && child
+                .named_child(0)
+                .and_then(&mut unwrap_expression)
+                .is_some_and(|spread| names_parameter(spread, parameter_name))
+    })
+}
+
+/// The key node of a supported JavaScript/TypeScript object-literal property.
+pub fn object_literal_property_key_node(property: Node<'_>) -> Option<Node<'_>> {
+    match property.kind() {
+        "pair" => property
+            .child_by_field_name("key")
+            .or_else(|| property.named_child(0)),
+        "shorthand_property_identifier" => Some(property),
+        "method_definition" => property.child_by_field_name("name"),
+        _ => None,
+    }
+}
+
 pub fn direct_property_definitions<'tree>(
     root: Node<'tree>,
     source: &str,
@@ -1354,7 +1455,7 @@ pub fn direct_property_definitions<'tree>(
         if let Some((receiver, property)) = receiver
             && target_ranges
                 .iter()
-                .any(|range| range_contains_node(range, property))
+                .any(|range| range.contains(&node_source_range(property)))
         {
             let definition = JsTsDirectPropertyDefinition {
                 receiver,
@@ -1620,14 +1721,8 @@ struct JsTsRuntimePathSegment<'tree> {
     optional: bool,
 }
 
-fn transparent_runtime_node(mut node: Node<'_>) -> Node<'_> {
-    while node.kind() == "parenthesized_expression" {
-        let Some(child) = node.named_child(0) else {
-            break;
-        };
-        node = child;
-    }
-    node
+fn transparent_runtime_node(node: Node<'_>) -> Node<'_> {
+    brokk_bifrost_core::analyzer::tree_walk::unwrap_parenthesized_expression(node)
 }
 
 fn runtime_path<'tree>(
@@ -3057,22 +3152,8 @@ fn static_member_root(mut node: Node<'_>) -> Option<Node<'_>> {
 /// than one per direction.
 pub fn js_program_is_external_module(root: Node<'_>, source: &str) -> bool {
     let mut cursor = root.walk();
-    root.named_children(&mut cursor).any(|statement| {
-        matches!(statement.kind(), "import_statement" | "export_statement")
-            || subtree_contains(statement, |node| {
-                (node.kind() == "call_expression"
-                    && node.child_by_field_name("function").is_some_and(|callee| {
-                        callee.kind() == "identifier" && slice(callee, source) == "require"
-                    }))
-                    || (node.kind() == "assignment_expression"
-                        && node
-                            .child_by_field_name("left")
-                            .and_then(static_member_root)
-                            .is_some_and(|root| {
-                                matches!(slice(root, source), "exports" | "module")
-                            }))
-            })
-    })
+    root.named_children(&mut cursor)
+        .any(|statement| subtree_contains(statement, |node| external_module_evidence(node, source)))
 }
 
 /// One primary traversal event that proves the program is an external module.
@@ -3092,18 +3173,7 @@ pub(crate) fn external_module_evidence(node: Node<'_>, source: &str) -> bool {
                 .is_some_and(|root| matches!(slice(root, source), "exports" | "module")))
 }
 
-fn range_contains_node(range: &Range, node: Node<'_>) -> bool {
-    range.start_byte <= node.start_byte() && node.end_byte() <= range.end_byte
-}
-
-fn node_source_range(node: Node<'_>) -> Range {
-    Range {
-        start_byte: node.start_byte(),
-        end_byte: node.end_byte(),
-        start_line: node.start_position().row,
-        end_line: node.end_position().row,
-    }
-}
+use brokk_bifrost_core::analyzer::usages::reference_site::node_range as node_source_range;
 
 fn node_scope(node: Node<'_>) -> JsTsLexicalBindingScope {
     JsTsLexicalBindingScope {
@@ -3173,19 +3243,32 @@ pub fn js_ts_var_declarator_binding_scope<'tree>(declarator: Node<'tree>) -> Opt
     js_ts_variable_declarator_binding_scope(declarator)
 }
 
+/// Whether a syntax node starts a JavaScript or TypeScript `var` scope.
+pub fn js_ts_is_var_scope_kind(kind: &str) -> bool {
+    matches!(
+        kind,
+        "program"
+            | "function_declaration"
+            | "generator_function_declaration"
+            | "function_expression"
+            | "generator_function"
+            | "arrow_function"
+            | "method_definition"
+    )
+}
+
+/// Whether a JavaScript or TypeScript syntax node introduces class scope.
+pub fn js_ts_is_class_scope_kind(kind: &str) -> bool {
+    matches!(
+        kind,
+        "class" | "class_declaration" | "abstract_class_declaration"
+    )
+}
+
 fn var_binding_scope_node(node: Node<'_>) -> Option<Node<'_>> {
     let mut current = node.parent();
     while let Some(parent) = current {
-        if matches!(
-            parent.kind(),
-            "program"
-                | "function_declaration"
-                | "generator_function_declaration"
-                | "function_expression"
-                | "generator_function"
-                | "arrow_function"
-                | "method_definition"
-        ) {
+        if js_ts_is_var_scope_kind(parent.kind()) {
             return Some(parent);
         }
         current = parent.parent();
@@ -3207,10 +3290,6 @@ fn for_in_declaration_kind<'tree>(
             "var" => Some("var"),
             _ => None,
         })
-}
-
-pub fn slice<'a>(node: Node<'_>, source: &'a str) -> &'a str {
-    brokk_bifrost_core::analyzer::common::node_source_text(node, source)
 }
 
 /// The runtime operand of a TypeScript type-only wrapper. `x as T`,
@@ -3235,6 +3314,44 @@ pub fn ts_type_wrapper_operand(node: Node<'_>) -> Option<Node<'_>> {
         }
         _ => None,
     }
+}
+
+/// Find an object literal through the expression wrappers shared by JS/TS
+/// shape analysis. TypeScript-only wrappers cannot occur in a JavaScript tree.
+pub(crate) fn js_ts_object_literal_value(node: Node<'_>) -> Option<Node<'_>> {
+    let mut stack = vec![node];
+    while let Some(node) = stack.pop() {
+        match node.kind() {
+            "object" => return Some(node),
+            "parenthesized_expression"
+            | "as_expression"
+            | "satisfies_expression"
+            | "type_assertion" => {
+                for index in (0..node.named_child_count()).rev() {
+                    if let Some(child) = node.named_child(index) {
+                        stack.push(child);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+pub(crate) fn first_preserved_object_literal_call_argument<'tree>(
+    call: Node<'tree>,
+    mut preserves: impl FnMut(usize) -> bool,
+) -> Option<Node<'tree>> {
+    let arguments = call.child_by_field_name("arguments")?;
+    let mut cursor = arguments.walk();
+    arguments
+        .named_children(&mut cursor)
+        .enumerate()
+        .find_map(|(index, argument)| {
+            let object = js_ts_object_literal_value(argument)?;
+            preserves(index).then_some(object)
+        })
 }
 
 /// The asserted type of `x as T`, `x satisfies T` or `<T>x`. `None` for
@@ -3272,9 +3389,16 @@ pub fn ts_type_wrapper_type(node: Node<'_>) -> Option<Node<'_>> {
 /// binder and the definition route ask this question of the same field, so they
 /// ask it here.
 pub fn js_ts_statement_module_specifier(statement: Node<'_>, source: &str) -> Option<String> {
+    js_ts_statement_module_source(statement, source).map(|(_, specifier)| specifier)
+}
+
+pub fn js_ts_statement_module_source<'tree>(
+    statement: Node<'tree>,
+    source: &str,
+) -> Option<(Node<'tree>, String)> {
     let source_node = statement.child_by_field_name("source")?;
     let specifier = unquote(slice(source_node, source));
-    (!specifier.is_empty()).then_some(specifier)
+    (!specifier.is_empty()).then_some((source_node, specifier))
 }
 
 pub fn nested_type_identifier_parts(node: Node<'_>) -> Option<(Node<'_>, Node<'_>)> {
@@ -3316,6 +3440,18 @@ pub fn is_lexically_nested_type_declaration(node: Node<'_>) -> bool {
         current = parent.parent();
     }
     false
+}
+
+pub fn lexically_nested_type_declaration_name<'source>(
+    node: Node<'_>,
+    source: &'source str,
+) -> Option<&'source str> {
+    if !is_lexically_nested_type_declaration(node) {
+        return None;
+    }
+    let name = node.child_by_field_name("name")?;
+    let text = slice(name, source);
+    (!text.is_empty()).then_some(text)
 }
 
 pub fn is_declaration_identifier(node: Node<'_>) -> bool {
@@ -3698,20 +3834,30 @@ pub fn is_catch_clause_binder(node: Node<'_>) -> bool {
     })
 }
 
+/// Whether a JavaScript or TypeScript syntax node introduces a diagnostics or
+/// usage-graph scope.
+pub(crate) fn introduces_js_ts_scope(kind: &str) -> bool {
+    matches!(
+        kind,
+        "statement_block"
+            | "arrow_function"
+            | "function_expression"
+            | "generator_function"
+            | "function_declaration"
+            | "method_definition"
+            | "catch_clause"
+    )
+}
+
 pub fn is_property_key_in_member(node: Node<'_>) -> bool {
-    let Some(parent) = node.parent() else {
-        return false;
-    };
-    if parent.kind() != "member_expression" {
-        return false;
-    }
-    parent
-        .child_by_field_name("property")
-        .map(|property| property.id() == node.id())
-        .unwrap_or(false)
+    is_member_expression_child(node, "property")
 }
 
 pub fn is_object_in_member_expression(node: Node<'_>) -> bool {
+    is_member_expression_child(node, "object")
+}
+
+fn is_member_expression_child(node: Node<'_>, field: &str) -> bool {
     let Some(parent) = node.parent() else {
         return false;
     };
@@ -3719,8 +3865,8 @@ pub fn is_object_in_member_expression(node: Node<'_>) -> bool {
         return false;
     }
     parent
-        .child_by_field_name("object")
-        .map(|object| object.id() == node.id())
+        .child_by_field_name(field)
+        .map(|child| child.id() == node.id())
         .unwrap_or(false)
 }
 
@@ -4305,7 +4451,7 @@ fn visit_import_statement(
     }
 }
 
-fn unquote(text: &str) -> String {
+pub(crate) fn unquote(text: &str) -> String {
     let trimmed = text.trim();
     let stripped = trimmed
         .strip_prefix('"')
@@ -4319,10 +4465,8 @@ fn unquote(text: &str) -> String {
 }
 
 pub fn parse_js_ts_tree(file: &ProjectFile, source: &str, language: Language) -> Option<Tree> {
-    let mut parser = Parser::new();
     let tree_sitter_language = crate::parse::js_ts_tree_sitter_language_for_file(file, language)?;
-    parser.set_language(&tree_sitter_language).ok()?;
-    parser.parse(source, None)
+    crate::parse::parse_with_language(source, &tree_sitter_language).ok()?
 }
 
 #[cfg(test)]
@@ -4334,22 +4478,19 @@ mod tests {
         SourceFactRows, SourceImportId, SourceOccurrence, SourceOccurrenceId,
         SourceOccurrenceProvenance,
     };
-    use tree_sitter::Parser;
-
+    use brokk_bifrost_test_macros::hardwon;
     fn parse_javascript(source: &str) -> Tree {
-        let mut parser = Parser::new();
-        parser
-            .set_language(&tree_sitter_javascript::LANGUAGE.into())
-            .expect("JavaScript grammar");
-        parser.parse(source, None).expect("JavaScript tree")
+        crate::test_support::parse_javascript(source)
     }
 
     fn parse_typescript(source: &str) -> Tree {
-        let mut parser = Parser::new();
-        parser
-            .set_language(&tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into())
-            .expect("TypeScript grammar");
-        parser.parse(source, None).expect("TypeScript tree")
+        crate::test_support::parse_typescript(source)
+    }
+
+    fn parse_tsx(source: &str) -> Tree {
+        crate::parse::parse_with_language(source, &tree_sitter_typescript::LANGUAGE_TSX.into())
+            .expect("TSX grammar")
+            .expect("TSX tree")
     }
 
     fn published_import(identifier: &str, module: &str) -> SourceImportFact {
@@ -4431,12 +4572,665 @@ mod tests {
         assert!(!binder.has_competing_direct_imports("relay"));
     }
 
-    fn parse_tsx(source: &str) -> Tree {
-        let mut parser = Parser::new();
-        parser
-            .set_language(&tree_sitter_typescript::LANGUAGE_TSX.into())
-            .expect("TSX grammar");
-        parser.parse(source, None).expect("TSX tree")
+    #[test]
+    fn runtime_reads_mark_unrelated_property_and_coercion_effects_unknown() {
+        let source = "const value = other.foo; const input = process.env.DFB_INPUT;";
+        let tree = parse_javascript(source);
+        let facts = extract_js_ts_runtime_reads(tree.root_node(), source, 32);
+        assert_eq!(
+            facts.accessor_coverage,
+            JsTsRuntimeAccessorCoverage::UnknownAccessorEffects
+        );
+        assert_eq!(facts.reads.len(), 1, "{facts:#?}");
+        assert_eq!(
+            facts.reads[0].mutation,
+            JsTsRuntimeMutationEvidence::UnknownEffects
+        );
+
+        let source = "const value = other + 1; process.env.DFB_INPUT;";
+        let tree = parse_javascript(source);
+        let facts = extract_js_ts_runtime_reads(tree.root_node(), source, 32);
+        assert_eq!(
+            facts.accessor_coverage,
+            JsTsRuntimeAccessorCoverage::UnknownAccessorEffects
+        );
+    }
+
+    #[test]
+    fn runtime_global_aliases_keep_hoisting_and_later_shadowing() {
+        for (source, expected) in [
+            (
+                "const host = globalThis; host.process.env.INPUT;",
+                Some("globalThis"),
+            ),
+            (
+                "const host = globalThis; const globalThis = {}; host.process.env.INPUT;",
+                None,
+            ),
+            (
+                "for (var host = globalThis; ready; ) {} host.process.env.INPUT;",
+                Some("globalThis"),
+            ),
+            (
+                "for (let host = globalThis; ready; ) {} host.process.env.INPUT;",
+                None,
+            ),
+            (
+                "function f() { const host = globalThis; let globalThis = {}; host.process.env.INPUT; }",
+                None,
+            ),
+        ] {
+            let tree = parse_javascript(source);
+            let bindings = JsTsLexicalBindingIndex::build(tree.root_node(), source);
+            let read = source.rfind("host.process").expect("alias use");
+            assert_eq!(
+                bindings.runtime_global_alias_at("host", read),
+                expected,
+                "{source}"
+            );
+        }
+    }
+
+    #[test]
+    fn runtime_read_effects_scope_to_the_read_own_function() {
+        // An external call in one function must not poison a read in
+        // another, or a reviewed sink call could never share a module with
+        // its source (#3329). Direct writes stay module-wide.
+        let source = r#"
+const cp = require("child_process");
+function readEnv() {
+  return process.env.DFB_INPUT;
+}
+function run() {
+  cp.execSync(readEnv());
+}
+run();
+"#;
+        let tree = parse_javascript(source);
+        let facts = extract_js_ts_runtime_reads(tree.root_node(), source, 64);
+        assert!(facts.complete, "{facts:#?}");
+        let read = facts
+            .reads
+            .iter()
+            .find(|read| read.root_name == "process")
+            .expect("the env read is extracted");
+        assert_eq!(read.mutation, JsTsRuntimeMutationEvidence::NoKnownWrite);
+        assert_eq!(
+            read.accessor,
+            JsTsRuntimeAccessorCoverage::NoKnownAccessorEffects
+        );
+        assert!(matches!(
+            read.execution,
+            JsTsRuntimeExecutionContext::DeferredFunction(_)
+        ));
+        // The module-wide summary still reports the external call.
+        assert_eq!(facts.effect_coverage, JsTsRuntimeEffectCoverage::Unknown);
+    }
+
+    #[test]
+    #[hardwon("#3462: hazards after a runtime read incorrectly poisoned that read")]
+    fn runtime_read_hazards_are_ordered_against_the_read() {
+        // A hazard that runs after the read cannot change the value the read
+        // already returned, so a reviewed sink call can share a function with
+        // the runtime source it consumes (#3462). The DataFlowBench
+        // native-source-sink witness is exactly this shape.
+        let source = r#"
+const child_process = require("child_process");
+function run() {
+  const value = process.env.DFB_INPUT;
+  child_process.execSync(value);
+}
+run();
+"#;
+        let tree = parse_javascript(source);
+        let facts = extract_js_ts_runtime_reads(tree.root_node(), source, 64);
+        assert!(facts.complete, "{facts:#?}");
+        let read = facts
+            .reads
+            .iter()
+            .find(|read| read.access == JsTsRuntimeAccessKey::Property("DFB_INPUT".into()))
+            .expect("the runtime source read is extracted");
+        assert_eq!(
+            read.mutation,
+            JsTsRuntimeMutationEvidence::NoKnownWrite,
+            "{facts:#?}"
+        );
+        assert_eq!(
+            read.accessor,
+            JsTsRuntimeAccessorCoverage::NoKnownAccessorEffects,
+            "{facts:#?}"
+        );
+        // The module-wide summary still reports the external call and the
+        // unknown member beside the read.
+        assert_eq!(facts.effect_coverage, JsTsRuntimeEffectCoverage::Unknown);
+        assert_eq!(
+            facts.accessor_coverage,
+            JsTsRuntimeAccessorCoverage::UnknownAccessorEffects
+        );
+
+        // The same hazard before the read still poisons it.
+        let before = r#"
+const child_process = require("child_process");
+function run() {
+  child_process.execSync("ls");
+  const value = process.env.DFB_INPUT;
+}
+"#;
+        let tree = parse_javascript(before);
+        let facts = extract_js_ts_runtime_reads(tree.root_node(), before, 64);
+        let read = facts
+            .reads
+            .iter()
+            .find(|read| read.access == JsTsRuntimeAccessKey::Property("DFB_INPUT".into()))
+            .expect("the later read is extracted");
+        assert_eq!(read.mutation, JsTsRuntimeMutationEvidence::UnknownEffects);
+        assert_eq!(
+            read.accessor,
+            JsTsRuntimeAccessorCoverage::UnknownAccessorEffects
+        );
+
+        // An iteration construct runs the read again after a following
+        // hazard, so a loop-carried hazard still poisons it.
+        let looped = r#"
+const child_process = require("child_process");
+function run() {
+  while (true) {
+    const value = process.env.DFB_INPUT;
+    child_process.execSync(value);
+  }
+}
+"#;
+        let tree = parse_javascript(looped);
+        let facts = extract_js_ts_runtime_reads(tree.root_node(), looped, 64);
+        let read = facts
+            .reads
+            .iter()
+            .find(|read| read.access == JsTsRuntimeAccessKey::Property("DFB_INPUT".into()))
+            .expect("the loop read is extracted");
+        assert_eq!(read.mutation, JsTsRuntimeMutationEvidence::UnknownEffects);
+        assert_eq!(
+            read.accessor,
+            JsTsRuntimeAccessorCoverage::UnknownAccessorEffects
+        );
+    }
+
+    #[test]
+    #[hardwon("#1951: program binding writes and local shadows were conflated")]
+    fn program_binding_reassignment_is_recorded_and_local_shadows_are_not() {
+        let source = r#"
+function target() {}
+function untouched() {}
+
+target = function () {};
+
+function local_shadow() {
+  let untouched = 1;
+  untouched = 2;
+}
+
+function property_write(box) {
+  box.untouched = 3;
+}
+"#;
+        let tree = parse_javascript(source);
+        let index = JsTsLexicalBindingIndex::build(tree.root_node(), source);
+        assert!(index.is_program_binding_reassigned("target", tree.root_node()));
+        assert!(!index.is_program_binding_reassigned("untouched", tree.root_node()));
+        assert!(!index.is_program_binding_reassigned("missing", tree.root_node()));
+    }
+
+    #[test]
+    #[hardwon("#2807: callback capture confused same-named bindings in nested scopes")]
+    fn lexical_binding_reassignment_distinguishes_same_spelled_scopes() {
+        let source = r#"
+function outer() {
+  const stable = () => 1;
+  {
+    let stable = () => 2;
+    stable();
+    stable = () => 3;
+    stable();
+  }
+  stable();
+}
+"#;
+        let tree = parse_javascript(source);
+        let index = JsTsLexicalBindingIndex::build(tree.root_node(), source);
+        let inner_use_before_assignment = source.find("stable();").expect("first inner use");
+        let inner_use_after_assignment = source
+            .get(inner_use_before_assignment + 1..)
+            .and_then(|remaining| remaining.find("stable();"))
+            .map(|offset| inner_use_before_assignment + 1 + offset)
+            .expect("second inner use");
+        let outer_use = source.rfind("stable();").expect("outer stable use");
+
+        assert!(index.is_binding_reassigned_at("stable", inner_use_before_assignment));
+        assert!(index.is_binding_reassigned_at("stable", inner_use_after_assignment));
+        assert!(!index.is_binding_reassigned_at("stable", outer_use));
+        assert!(!index.is_binding_reassigned_at("missing", outer_use));
+        assert!(!index.is_binding_reassigned_before_at("stable", inner_use_before_assignment));
+        assert!(index.is_binding_reassigned_before_at("stable", inner_use_after_assignment));
+        assert!(!index.is_binding_reassigned_before_at("stable", outer_use));
+        assert!(!index.is_binding_reassigned_before_at("missing", outer_use));
+    }
+
+    #[test]
+    fn bare_for_in_and_for_of_targets_reassign_the_active_binding() {
+        let source = r#"
+class Item {}
+for (Item of values) {}
+for (Item in object) {}
+new Item();
+"#;
+        let tree = parse_javascript(source);
+        let index = JsTsLexicalBindingIndex::build(tree.root_node(), source);
+        let construction = source.rfind("Item").expect("constructor use");
+
+        assert!(index.is_binding_reassigned_at("Item", construction));
+    }
+
+    #[test]
+    #[hardwon("#1440: duplicate CommonJS declarations were incorrectly ambiguous")]
+    fn commonjs_redeclaration_replaces_binding_without_static_ambiguity() {
+        let source = r#"
+var { relay } = require("./a");
+relay();
+var { relay } = require("./b");
+relay();
+"#;
+        let tree = parse_javascript(source);
+        let imports = compute_import_binder(source, &tree);
+
+        assert_eq!(imports.bindings_for("relay").count(), 1);
+        assert_eq!(
+            imports
+                .binding("relay")
+                .map(|binding| binding.module_specifier.as_str()),
+            Some("./b")
+        );
+        assert!(!imports.has_competing_direct_imports("relay"));
+    }
+
+    #[test]
+    fn import_binder_accepts_a_file_whose_root_is_an_error_node() {
+        // Flow-typed JavaScript that the JavaScript grammar cannot recover:
+        // tree-sitter yields an `ERROR` root instead of `program`. Minimized
+        // from react's ReactDOMLegacyServerNode.js.
+        let source = "function renderToString(\n  children: ReactNodeList,\n  options?: ServerOptions,\nfunction renderToStaticMarkup(\n  options?: ServerOptions,\n): string {\n  return renderToStringImpl(";
+        let tree = parse_javascript(source);
+        assert_eq!(tree.root_node().kind(), "ERROR");
+
+        let imports = compute_import_binder(source, &tree);
+
+        assert!(imports.binding("renderToStringImpl").is_none());
+        assert_eq!(imports.bindings_for("renderToStringImpl").count(), 0);
+    }
+
+    #[test]
+    #[hardwon("#3119: CommonJS binding selection ignored the use-site declaration")]
+    fn commonjs_binding_at_use_keeps_early_and_late_declarations_distinct() {
+        let source = r#"
+var mapping = require("./first");
+mapping;
+var mapping = require("./second");
+mapping;
+"#;
+        let tree = parse_javascript(source);
+        let imports = compute_import_binder(source, &tree);
+        let first_use = source.find("mapping;").expect("first use");
+        let second_use = source.rfind("mapping;").expect("second use");
+
+        let JsTsImportBindingResolution::Exact(first) = imports.binding_at("mapping", first_use)
+        else {
+            panic!("first use should resolve exactly");
+        };
+        let JsTsImportBindingResolution::Exact(second) = imports.binding_at("mapping", second_use)
+        else {
+            panic!("second use should resolve exactly");
+        };
+        assert_eq!(first.binding.module_specifier, "./first");
+        assert_eq!(second.binding.module_specifier, "./second");
+        assert_eq!(imports.binding_records_for("mapping").len(), 2);
+        assert!(first.provenance.order < second.provenance.order);
+    }
+
+    #[test]
+    #[hardwon("#3119: typed module values ignored the active namespace binding")]
+    fn typed_module_values_use_the_namespace_binding_active_at_the_type_query() {
+        let source = r#"
+const inactive = importActual<typeof Later>();
+var M = require("./first");
+const early = importActual<typeof M>();
+var M = require("./second");
+const late = importActual<typeof M>();
+var Later = require("./later");
+"#;
+        let tree = parse_typescript(source);
+        let imports = compute_import_binder(source, &tree);
+
+        assert_eq!(
+            imports
+                .binding("early")
+                .map(|binding| binding.module_specifier.as_str()),
+            Some("./first")
+        );
+        assert_eq!(
+            imports
+                .binding("late")
+                .map(|binding| binding.module_specifier.as_str()),
+            Some("./second")
+        );
+        assert!(imports.binding("inactive").is_none());
+    }
+
+    #[test]
+    #[hardwon("#3119: shadowed and reassigned CommonJS bindings were not rejected")]
+    fn commonjs_binding_at_use_fails_closed_for_shadow_and_reassignment() {
+        let source = r#"
+var mapping = require("./mapping");
+function parameter(mapping) {
+  mapping;
+}
+function local() {
+  let mapping = require("./local");
+  mapping;
+}
+mapping;
+mapping = require("./other");
+mapping;
+"#;
+        let tree = parse_javascript(source);
+        let imports = compute_import_binder(source, &tree);
+        let parameter_use = source.find("  mapping;\n}").expect("parameter use") + 2;
+        let local_use = source.find("  mapping;\n}\nmapping;").expect("local use") + 2;
+        let before_reassignment = source
+            .find("mapping;\nmapping =")
+            .expect("program use before reassignment");
+        let after_reassignment = source
+            .rfind("mapping;")
+            .expect("program use after reassignment");
+
+        assert_eq!(
+            imports.binding_at("mapping", parameter_use),
+            JsTsImportBindingResolution::Shadowed
+        );
+        assert_eq!(
+            imports.binding_at("mapping", local_use),
+            JsTsImportBindingResolution::Shadowed
+        );
+        assert_eq!(
+            imports.binding_at("mapping", before_reassignment),
+            JsTsImportBindingResolution::Reassigned
+        );
+        assert_eq!(
+            imports.binding_at("mapping", after_reassignment),
+            JsTsImportBindingResolution::Reassigned
+        );
+    }
+
+    #[test]
+    #[hardwon("#1440: CommonJS bindings were counted as competing static imports")]
+    fn commonjs_binding_does_not_count_as_competing_static_import() {
+        let source = r#"
+var { relay } = require("./commonjs");
+import { relay } from "./static";
+relay();
+"#;
+        let tree = parse_javascript(source);
+        let imports = compute_import_binder(source, &tree);
+
+        assert_eq!(imports.direct_bindings_for("relay").count(), 1);
+        assert_eq!(imports.resolvable_direct_bindings_for("relay").count(), 2);
+        assert!(!imports.has_competing_direct_imports("relay"));
+    }
+
+    fn find_node<'tree>(root: Node<'tree>, source: &str, text: &str) -> Node<'tree> {
+        crate::test_support::first_named_node_matching_reverse_preorder(root, |node| {
+            slice(node, source) == text
+        })
+        .unwrap_or_else(|| panic!("missing node `{text}`"))
+    }
+
+    #[test]
+    fn static_member_receiver_rejects_private_property_segments() {
+        let source = "class Box { #inner; read(other) { return other.#inner.value; } }";
+        let tree = parse_javascript(source);
+        let private_receiver = find_node(tree.root_node(), source, "other.#inner");
+
+        assert_eq!("member_expression", private_receiver.kind());
+        assert_eq!(
+            "private_property_identifier",
+            private_receiver
+                .child_by_field_name("property")
+                .expect("private property")
+                .kind()
+        );
+        assert!(static_member_receiver(private_receiver, source).is_none());
+    }
+
+    #[test]
+    #[hardwon("#1926: private property reads and writes stopped resolving to class fields")]
+    fn static_member_property_names_a_private_field_access() {
+        let source = "class Box { #inner; read(other) { return other.#inner.value; } }";
+        let tree = parse_javascript(source);
+        let private_access = find_node(tree.root_node(), source, "other.#inner");
+
+        let (name_node, name) =
+            static_member_property(private_access, source).expect("private property name");
+        assert_eq!("#inner", name);
+        assert_eq!("private_property_identifier", name_node.kind());
+        assert_eq!(
+            "#inner",
+            slice(name_node, source),
+            "the `#` belongs to the name the class indexed it under"
+        );
+    }
+
+    #[test]
+    #[hardwon("#2066: an import lost to the active same-file declaration token")]
+    fn lexical_binding_index_retains_the_active_declaration_token() {
+        let source = r#"
+const fresh = require("fresh");
+function outer(fresh) {
+  return fresh();
+}
+fresh();
+"#;
+        let tree = parse_javascript(source);
+        let bindings = JsTsLexicalBindingIndex::build(tree.root_node(), source);
+        let program_use = source.rfind("fresh();").expect("program fresh use");
+        let parameter_use = source.find("return fresh").expect("parameter fresh use") + 7;
+
+        assert_eq!(
+            bindings.binding_identifier_ranges_at("fresh", program_use),
+            vec![Range {
+                start_byte: source.find("fresh =").expect("program binder"),
+                end_byte: source.find("fresh =").expect("program binder") + "fresh".len(),
+                start_line: 1,
+                end_line: 1,
+            }]
+        );
+        assert_eq!(
+            bindings.binding_identifier_ranges_at("fresh", parameter_use),
+            vec![Range {
+                start_byte: source.find("fresh) {").expect("parameter binder"),
+                end_byte: source.find("fresh) {").expect("parameter binder") + "fresh".len(),
+                start_line: 2,
+                end_line: 2,
+            }]
+        );
+    }
+
+    #[test]
+    #[hardwon("#1943: TypeScript class bindings were missing from receiver resolution")]
+    fn lexical_binding_index_tracks_typescript_class_names() {
+        let source = r#"
+export class ApiClient {
+  static create() {}
+}
+
+ApiClient.create();
+"#;
+        let tree = parse_typescript(source);
+        let bindings = JsTsLexicalBindingIndex::build(tree.root_node(), source);
+        let use_byte = source.rfind("ApiClient.create").expect("static class use");
+
+        assert!(bindings.is_program_binding_at("ApiClient", use_byte, tree.root_node()));
+    }
+
+    fn assert_module_member_mutation(source: &str, free: bool) {
+        for parse in [parse_javascript, parse_typescript] {
+            let tree = parse(source);
+            assert_eq!(
+                module_member_is_mutation_free(
+                    tree.root_node(),
+                    source,
+                    "child_process",
+                    "execSync"
+                ),
+                free,
+                "{source}"
+            );
+        }
+    }
+
+    #[test]
+    #[hardwon("#3406: a writable module member could be patched after import")]
+    fn module_member_mutation_free_holds_for_read_only_receivers() {
+        for source in [
+            r#"const cp = require("child_process");
+function run(command) { cp.execSync(command); }
+"#,
+            r#"const cp = require("node:child_process");
+cp.execSync("ls");
+cp.readFileSync("x");
+"#,
+            r#"import * as cp from "child_process";
+cp.execSync("ls");
+"#,
+            r#"import cp from "child_process";
+cp.execSync("ls");
+"#,
+            r#"import cp = require("child_process");
+cp.execSync("ls");
+"#,
+            // A write to a different member of the same module is not a write
+            // to the closed member.
+            r#"const cp = require("child_process");
+cp.readFileSync = wrap;
+cp.execSync("ls");
+"#,
+            // A destructured binding imports the member value, not the object:
+            // rebinding it cannot patch the module.
+            r#"const { execSync } = require("child_process");
+execSync = fake;
+"#,
+            // A same-named member of an unrelated object is not the module
+            // member.
+            r#"const cp = require("child_process");
+function run(opts) { opts.execSync = fake; cp.execSync("ls"); }
+"#,
+            // A shadowed binding is not the module binding.
+            r#"const cp = require("child_process");
+function g(cp) { cp.execSync = fake; }
+cp.execSync("ls");
+"#,
+            // No module binding anywhere: nothing here can patch the module.
+            r#"function run(opts) { opts.execSync = fake; }
+"#,
+        ] {
+            assert_module_member_mutation(source, true);
+        }
+    }
+
+    #[test]
+    #[hardwon("#3406: a writable module member could be patched after import")]
+    fn module_member_mutation_poisons_writes_and_escapes() {
+        for source in [
+            r#"const cp = require("child_process");
+cp.execSync = fake;
+"#,
+            r#"const cp = require("child_process");
+cp.execSync += suffix;
+"#,
+            r#"const cp = require("child_process");
+cp.execSync++;
+"#,
+            r#"const cp = require("child_process");
+delete cp.execSync;
+"#,
+            r#"const cp = require("child_process");
+for (cp.execSync of batches) {}
+"#,
+            r#"const cp = require("child_process");
+cp["execSync"] = fake;
+"#,
+            r#"const cp = require("child_process");
+cp[selected] = fake;
+"#,
+            r#"require("child_process").execSync = fake;
+"#,
+            r#"function patch() {
+  const cp = require("child_process");
+  cp.execSync = fake;
+}
+"#,
+            r#"import * as cp from "child_process";
+cp.execSync = fake;
+"#,
+            r#"const cp = require("node:child_process");
+cp.execSync = fake;
+"#,
+            // An alias can carry the module object to an unseen writer.
+            r#"const cp = require("child_process");
+const aliased = cp;
+"#,
+            r#"const cp = require("child_process");
+patch(cp);
+"#,
+            r#"const cp = require("child_process");
+Object.assign(cp, { execSync: fake });
+"#,
+            r#"const cp = require("child_process");
+export { cp };
+"#,
+            r#"const cp = require("child_process");
+module.exports = cp;
+"#,
+        ] {
+            assert_module_member_mutation(source, false);
+        }
+    }
+
+    #[test]
+    #[hardwon("#3406: TypeScript import-equals mutation escaped the member proof")]
+    fn module_member_mutation_tracks_typescript_import_equals_requires() {
+        for (source, free) in [
+            (
+                r#"import cp = require("child_process");
+cp.execSync("ls");
+"#,
+                true,
+            ),
+            (
+                r#"import cp = require("child_process");
+cp.execSync = fake;
+"#,
+                false,
+            ),
+        ] {
+            let tree = parse_typescript(source);
+            assert_eq!(
+                module_member_is_mutation_free(
+                    tree.root_node(),
+                    source,
+                    "child_process",
+                    "execSync"
+                ),
+                free,
+                "{source}"
+            );
+        }
     }
 
     #[test]
@@ -4661,65 +5455,6 @@ host.process.argv[2] = value;
     }
 
     #[test]
-    fn runtime_reads_mark_unrelated_property_and_coercion_effects_unknown() {
-        let source = "const value = other.foo; const input = process.env.DFB_INPUT;";
-        let tree = parse_javascript(source);
-        let facts = extract_js_ts_runtime_reads(tree.root_node(), source, 32);
-        assert_eq!(
-            facts.accessor_coverage,
-            JsTsRuntimeAccessorCoverage::UnknownAccessorEffects
-        );
-        assert_eq!(facts.reads.len(), 1, "{facts:#?}");
-        assert_eq!(
-            facts.reads[0].mutation,
-            JsTsRuntimeMutationEvidence::UnknownEffects
-        );
-
-        let source = "const value = other + 1; process.env.DFB_INPUT;";
-        let tree = parse_javascript(source);
-        let facts = extract_js_ts_runtime_reads(tree.root_node(), source, 32);
-        assert_eq!(
-            facts.accessor_coverage,
-            JsTsRuntimeAccessorCoverage::UnknownAccessorEffects
-        );
-    }
-
-    #[test]
-    fn runtime_global_aliases_keep_hoisting_and_later_shadowing() {
-        for (source, expected) in [
-            (
-                "const host = globalThis; host.process.env.INPUT;",
-                Some("globalThis"),
-            ),
-            (
-                "const host = globalThis; const globalThis = {}; host.process.env.INPUT;",
-                None,
-            ),
-            (
-                "for (var host = globalThis; ready; ) {} host.process.env.INPUT;",
-                Some("globalThis"),
-            ),
-            (
-                "for (let host = globalThis; ready; ) {} host.process.env.INPUT;",
-                None,
-            ),
-            (
-                "function f() { const host = globalThis; let globalThis = {}; host.process.env.INPUT; }",
-                None,
-            ),
-        ] {
-            let tree = parse_javascript(source);
-            let bindings = JsTsLexicalBindingIndex::build(tree.root_node(), source);
-            let read = source.rfind("host.process").expect("alias use");
-            assert_eq!(
-                bindings.runtime_global_alias_at("host", read),
-                expected,
-                "{source}"
-            );
-        }
-    }
-
-    #[test]
     fn runtime_reads_track_global_this_process_alias_and_nested_shadow() {
         let source = r#"
 const host = globalThis;
@@ -4761,42 +5496,6 @@ host.process.env.DFB_INPUT;
             facts.reads[0].access,
             JsTsRuntimeAccessKey::Property("DFB_INPUT".into())
         );
-    }
-
-    #[test]
-    fn runtime_read_effects_scope_to_the_read_own_function() {
-        // An external call in one function must not poison a read in
-        // another, or a reviewed sink call could never share a module with
-        // its source (#3329). Direct writes stay module-wide.
-        let source = r#"
-const cp = require("child_process");
-function readEnv() {
-  return process.env.DFB_INPUT;
-}
-function run() {
-  cp.execSync(readEnv());
-}
-run();
-"#;
-        let tree = parse_javascript(source);
-        let facts = extract_js_ts_runtime_reads(tree.root_node(), source, 64);
-        assert!(facts.complete, "{facts:#?}");
-        let read = facts
-            .reads
-            .iter()
-            .find(|read| read.root_name == "process")
-            .expect("the env read is extracted");
-        assert_eq!(read.mutation, JsTsRuntimeMutationEvidence::NoKnownWrite);
-        assert_eq!(
-            read.accessor,
-            JsTsRuntimeAccessorCoverage::NoKnownAccessorEffects
-        );
-        assert!(matches!(
-            read.execution,
-            JsTsRuntimeExecutionContext::DeferredFunction(_)
-        ));
-        // The module-wide summary still reports the external call.
-        assert_eq!(facts.effect_coverage, JsTsRuntimeEffectCoverage::Unknown);
     }
 
     #[test]
@@ -4847,92 +5546,6 @@ function read() {
                     || read.mutation == JsTsRuntimeMutationEvidence::KnownWriteAndUnknownEffects
             }),
             "a module-wide write poisons every scope: {facts:#?}"
-        );
-    }
-
-    #[test]
-    fn runtime_read_hazards_are_ordered_against_the_read() {
-        // A hazard that runs after the read cannot change the value the read
-        // already returned, so a reviewed sink call can share a function with
-        // the runtime source it consumes (#3462). The DataFlowBench
-        // native-source-sink witness is exactly this shape.
-        let source = r#"
-const child_process = require("child_process");
-function run() {
-  const value = process.env.DFB_INPUT;
-  child_process.execSync(value);
-}
-run();
-"#;
-        let tree = parse_javascript(source);
-        let facts = extract_js_ts_runtime_reads(tree.root_node(), source, 64);
-        assert!(facts.complete, "{facts:#?}");
-        let read = facts
-            .reads
-            .iter()
-            .find(|read| read.access == JsTsRuntimeAccessKey::Property("DFB_INPUT".into()))
-            .expect("the runtime source read is extracted");
-        assert_eq!(
-            read.mutation,
-            JsTsRuntimeMutationEvidence::NoKnownWrite,
-            "{facts:#?}"
-        );
-        assert_eq!(
-            read.accessor,
-            JsTsRuntimeAccessorCoverage::NoKnownAccessorEffects,
-            "{facts:#?}"
-        );
-        // The module-wide summary still reports the external call and the
-        // unknown member beside the read.
-        assert_eq!(facts.effect_coverage, JsTsRuntimeEffectCoverage::Unknown);
-        assert_eq!(
-            facts.accessor_coverage,
-            JsTsRuntimeAccessorCoverage::UnknownAccessorEffects
-        );
-
-        // The same hazard before the read still poisons it.
-        let before = r#"
-const child_process = require("child_process");
-function run() {
-  child_process.execSync("ls");
-  const value = process.env.DFB_INPUT;
-}
-"#;
-        let tree = parse_javascript(before);
-        let facts = extract_js_ts_runtime_reads(tree.root_node(), before, 64);
-        let read = facts
-            .reads
-            .iter()
-            .find(|read| read.access == JsTsRuntimeAccessKey::Property("DFB_INPUT".into()))
-            .expect("the later read is extracted");
-        assert_eq!(read.mutation, JsTsRuntimeMutationEvidence::UnknownEffects);
-        assert_eq!(
-            read.accessor,
-            JsTsRuntimeAccessorCoverage::UnknownAccessorEffects
-        );
-
-        // An iteration construct runs the read again after a following
-        // hazard, so a loop-carried hazard still poisons it.
-        let looped = r#"
-const child_process = require("child_process");
-function run() {
-  while (true) {
-    const value = process.env.DFB_INPUT;
-    child_process.execSync(value);
-  }
-}
-"#;
-        let tree = parse_javascript(looped);
-        let facts = extract_js_ts_runtime_reads(tree.root_node(), looped, 64);
-        let read = facts
-            .reads
-            .iter()
-            .find(|read| read.access == JsTsRuntimeAccessKey::Property("DFB_INPUT".into()))
-            .expect("the loop read is extracted");
-        assert_eq!(read.mutation, JsTsRuntimeMutationEvidence::UnknownEffects);
-        assert_eq!(
-            read.accessor,
-            JsTsRuntimeAccessorCoverage::UnknownAccessorEffects
         );
     }
 
@@ -4996,229 +5609,6 @@ function run() {
                 "{facts:#?}"
             );
         }
-    }
-
-    #[test]
-    fn program_binding_reassignment_is_recorded_and_local_shadows_are_not() {
-        let source = r#"
-function target() {}
-function untouched() {}
-
-target = function () {};
-
-function local_shadow() {
-  let untouched = 1;
-  untouched = 2;
-}
-
-function property_write(box) {
-  box.untouched = 3;
-}
-"#;
-        let tree = parse_javascript(source);
-        let index = JsTsLexicalBindingIndex::build(tree.root_node(), source);
-        assert!(index.is_program_binding_reassigned("target", tree.root_node()));
-        assert!(!index.is_program_binding_reassigned("untouched", tree.root_node()));
-        assert!(!index.is_program_binding_reassigned("missing", tree.root_node()));
-    }
-
-    #[test]
-    fn lexical_binding_reassignment_distinguishes_same_spelled_scopes() {
-        let source = r#"
-function outer() {
-  const stable = () => 1;
-  {
-    let stable = () => 2;
-    stable();
-    stable = () => 3;
-    stable();
-  }
-  stable();
-}
-"#;
-        let tree = parse_javascript(source);
-        let index = JsTsLexicalBindingIndex::build(tree.root_node(), source);
-        let inner_use_before_assignment = source.find("stable();").expect("first inner use");
-        let inner_use_after_assignment = source
-            .get(inner_use_before_assignment + 1..)
-            .and_then(|remaining| remaining.find("stable();"))
-            .map(|offset| inner_use_before_assignment + 1 + offset)
-            .expect("second inner use");
-        let outer_use = source.rfind("stable();").expect("outer stable use");
-
-        assert!(index.is_binding_reassigned_at("stable", inner_use_before_assignment));
-        assert!(index.is_binding_reassigned_at("stable", inner_use_after_assignment));
-        assert!(!index.is_binding_reassigned_at("stable", outer_use));
-        assert!(!index.is_binding_reassigned_at("missing", outer_use));
-        assert!(!index.is_binding_reassigned_before_at("stable", inner_use_before_assignment));
-        assert!(index.is_binding_reassigned_before_at("stable", inner_use_after_assignment));
-        assert!(!index.is_binding_reassigned_before_at("stable", outer_use));
-        assert!(!index.is_binding_reassigned_before_at("missing", outer_use));
-    }
-
-    #[test]
-    fn bare_for_in_and_for_of_targets_reassign_the_active_binding() {
-        let source = r#"
-class Item {}
-for (Item of values) {}
-for (Item in object) {}
-new Item();
-"#;
-        let tree = parse_javascript(source);
-        let index = JsTsLexicalBindingIndex::build(tree.root_node(), source);
-        let construction = source.rfind("Item").expect("constructor use");
-
-        assert!(index.is_binding_reassigned_at("Item", construction));
-    }
-
-    #[test]
-    fn commonjs_redeclaration_replaces_binding_without_static_ambiguity() {
-        let source = r#"
-var { relay } = require("./a");
-relay();
-var { relay } = require("./b");
-relay();
-"#;
-        let tree = parse_javascript(source);
-        let imports = compute_import_binder(source, &tree);
-
-        assert_eq!(imports.bindings_for("relay").count(), 1);
-        assert_eq!(
-            imports
-                .binding("relay")
-                .map(|binding| binding.module_specifier.as_str()),
-            Some("./b")
-        );
-        assert!(!imports.has_competing_direct_imports("relay"));
-    }
-
-    #[test]
-    fn import_binder_accepts_a_file_whose_root_is_an_error_node() {
-        // Flow-typed JavaScript that the JavaScript grammar cannot recover:
-        // tree-sitter yields an `ERROR` root instead of `program`. Minimized
-        // from react's ReactDOMLegacyServerNode.js.
-        let source = "function renderToString(\n  children: ReactNodeList,\n  options?: ServerOptions,\nfunction renderToStaticMarkup(\n  options?: ServerOptions,\n): string {\n  return renderToStringImpl(";
-        let tree = parse_javascript(source);
-        assert_eq!(tree.root_node().kind(), "ERROR");
-
-        let imports = compute_import_binder(source, &tree);
-
-        assert!(imports.binding("renderToStringImpl").is_none());
-        assert_eq!(imports.bindings_for("renderToStringImpl").count(), 0);
-    }
-
-    #[test]
-    fn commonjs_binding_at_use_keeps_early_and_late_declarations_distinct() {
-        let source = r#"
-var mapping = require("./first");
-mapping;
-var mapping = require("./second");
-mapping;
-"#;
-        let tree = parse_javascript(source);
-        let imports = compute_import_binder(source, &tree);
-        let first_use = source.find("mapping;").expect("first use");
-        let second_use = source.rfind("mapping;").expect("second use");
-
-        let JsTsImportBindingResolution::Exact(first) = imports.binding_at("mapping", first_use)
-        else {
-            panic!("first use should resolve exactly");
-        };
-        let JsTsImportBindingResolution::Exact(second) = imports.binding_at("mapping", second_use)
-        else {
-            panic!("second use should resolve exactly");
-        };
-        assert_eq!(first.binding.module_specifier, "./first");
-        assert_eq!(second.binding.module_specifier, "./second");
-        assert_eq!(imports.binding_records_for("mapping").len(), 2);
-        assert!(first.provenance.order < second.provenance.order);
-    }
-
-    #[test]
-    fn typed_module_values_use_the_namespace_binding_active_at_the_type_query() {
-        let source = r#"
-const inactive = importActual<typeof Later>();
-var M = require("./first");
-const early = importActual<typeof M>();
-var M = require("./second");
-const late = importActual<typeof M>();
-var Later = require("./later");
-"#;
-        let tree = parse_typescript(source);
-        let imports = compute_import_binder(source, &tree);
-
-        assert_eq!(
-            imports
-                .binding("early")
-                .map(|binding| binding.module_specifier.as_str()),
-            Some("./first")
-        );
-        assert_eq!(
-            imports
-                .binding("late")
-                .map(|binding| binding.module_specifier.as_str()),
-            Some("./second")
-        );
-        assert!(imports.binding("inactive").is_none());
-    }
-
-    #[test]
-    fn commonjs_binding_at_use_fails_closed_for_shadow_and_reassignment() {
-        let source = r#"
-var mapping = require("./mapping");
-function parameter(mapping) {
-  mapping;
-}
-function local() {
-  let mapping = require("./local");
-  mapping;
-}
-mapping;
-mapping = require("./other");
-mapping;
-"#;
-        let tree = parse_javascript(source);
-        let imports = compute_import_binder(source, &tree);
-        let parameter_use = source.find("  mapping;\n}").expect("parameter use") + 2;
-        let local_use = source.find("  mapping;\n}\nmapping;").expect("local use") + 2;
-        let before_reassignment = source
-            .find("mapping;\nmapping =")
-            .expect("program use before reassignment");
-        let after_reassignment = source
-            .rfind("mapping;")
-            .expect("program use after reassignment");
-
-        assert_eq!(
-            imports.binding_at("mapping", parameter_use),
-            JsTsImportBindingResolution::Shadowed
-        );
-        assert_eq!(
-            imports.binding_at("mapping", local_use),
-            JsTsImportBindingResolution::Shadowed
-        );
-        assert_eq!(
-            imports.binding_at("mapping", before_reassignment),
-            JsTsImportBindingResolution::Reassigned
-        );
-        assert_eq!(
-            imports.binding_at("mapping", after_reassignment),
-            JsTsImportBindingResolution::Reassigned
-        );
-    }
-
-    #[test]
-    fn commonjs_binding_does_not_count_as_competing_static_import() {
-        let source = r#"
-var { relay } = require("./commonjs");
-import { relay } from "./static";
-relay();
-"#;
-        let tree = parse_javascript(source);
-        let imports = compute_import_binder(source, &tree);
-
-        assert_eq!(imports.direct_bindings_for("relay").count(), 1);
-        assert_eq!(imports.resolvable_direct_bindings_for("relay").count(), 2);
-        assert!(!imports.has_competing_direct_imports("relay"));
     }
 
     #[test]
@@ -5317,37 +5707,6 @@ relay();
         );
     }
 
-    fn find_node<'tree>(root: Node<'tree>, source: &str, text: &str) -> Node<'tree> {
-        let mut stack = vec![root];
-        while let Some(node) = stack.pop() {
-            if slice(node, source) == text {
-                return node;
-            }
-            let mut cursor = node.walk();
-            for child in node.named_children(&mut cursor) {
-                stack.push(child);
-            }
-        }
-        panic!("missing node `{text}`");
-    }
-
-    #[test]
-    fn static_member_receiver_rejects_private_property_segments() {
-        let source = "class Box { #inner; read(other) { return other.#inner.value; } }";
-        let tree = parse_javascript(source);
-        let private_receiver = find_node(tree.root_node(), source, "other.#inner");
-
-        assert_eq!("member_expression", private_receiver.kind());
-        assert_eq!(
-            "private_property_identifier",
-            private_receiver
-                .child_by_field_name("property")
-                .expect("private property")
-                .kind()
-        );
-        assert!(static_member_receiver(private_receiver, source).is_none());
-    }
-
     #[test]
     fn admitted_property_node_matches_live_query_receiver() {
         for (source, declaration, member) in [
@@ -5378,6 +5737,9 @@ relay();
     }
 
     #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "88df6b734434: object method shorthand was missing from direct property definitions"
+    )]
     fn direct_property_definitions_include_object_method_shorthand() {
         let source = "const Tools = { parse(value) { return value; } };";
         let tree = parse_javascript(source);
@@ -5397,23 +5759,6 @@ relay();
         assert_eq!(slice(definitions[0].receiver.root, source), "Tools");
         assert!(definitions[0].receiver.members.is_empty());
         assert_eq!(definitions[0].property_range, target_range);
-    }
-
-    #[test]
-    fn static_member_property_names_a_private_field_access() {
-        let source = "class Box { #inner; read(other) { return other.#inner.value; } }";
-        let tree = parse_javascript(source);
-        let private_access = find_node(tree.root_node(), source, "other.#inner");
-
-        let (name_node, name) =
-            static_member_property(private_access, source).expect("private property name");
-        assert_eq!("#inner", name);
-        assert_eq!("private_property_identifier", name_node.kind());
-        assert_eq!(
-            "#inner",
-            slice(name_node, source),
-            "the `#` belongs to the name the class indexed it under"
-        );
     }
 
     #[test]
@@ -5500,6 +5845,9 @@ task[dynamic](); task["fi\nish"]();"#;
     }
 
     #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "224d16abca2b: for-of and single-parameter arrow bindings were missed"
+    )]
     fn lexical_binding_index_tracks_for_of_and_single_arrow_parameters() {
         let source = r#"
 function render(tasks) {
@@ -5523,56 +5871,9 @@ function render(tasks) {
     }
 
     #[test]
-    fn lexical_binding_index_retains_the_active_declaration_token() {
-        let source = r#"
-const fresh = require("fresh");
-function outer(fresh) {
-  return fresh();
-}
-fresh();
-"#;
-        let tree = parse_javascript(source);
-        let bindings = JsTsLexicalBindingIndex::build(tree.root_node(), source);
-        let program_use = source.rfind("fresh();").expect("program fresh use");
-        let parameter_use = source.find("return fresh").expect("parameter fresh use") + 7;
-
-        assert_eq!(
-            bindings.binding_identifier_ranges_at("fresh", program_use),
-            vec![Range {
-                start_byte: source.find("fresh =").expect("program binder"),
-                end_byte: source.find("fresh =").expect("program binder") + "fresh".len(),
-                start_line: 1,
-                end_line: 1,
-            }]
-        );
-        assert_eq!(
-            bindings.binding_identifier_ranges_at("fresh", parameter_use),
-            vec![Range {
-                start_byte: source.find("fresh) {").expect("parameter binder"),
-                end_byte: source.find("fresh) {").expect("parameter binder") + "fresh".len(),
-                start_line: 2,
-                end_line: 2,
-            }]
-        );
-    }
-
-    #[test]
-    fn lexical_binding_index_tracks_typescript_class_names() {
-        let source = r#"
-export class ApiClient {
-  static create() {}
-}
-
-ApiClient.create();
-"#;
-        let tree = parse_typescript(source);
-        let bindings = JsTsLexicalBindingIndex::build(tree.root_node(), source);
-        let use_byte = source.rfind("ApiClient.create").expect("static class use");
-
-        assert!(bindings.is_program_binding_at("ApiClient", use_byte, tree.root_node()));
-    }
-
-    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "224d16abca2b: var for-of bindings were scoped to the loop"
+    )]
     fn lexical_binding_index_keeps_var_for_of_function_scoped() {
         let source = r#"
 function render(tasks) {
@@ -5620,6 +5921,9 @@ function read() {
     }
 
     #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "224d16abca2b: bare for-of targets were misclassified as declarations"
+    )]
     fn lexical_binding_index_does_not_declare_bare_for_of_target() {
         let source = "for (task of tasks) { consume(task.status); }";
         let tree = parse_javascript(source);
@@ -5627,157 +5931,5 @@ function read() {
         let use_byte = source.find("task.status").expect("task use");
 
         assert!(!bindings.is_bound_at("task", use_byte));
-    }
-
-    fn assert_module_member_mutation(source: &str, free: bool) {
-        for parse in [parse_javascript, parse_typescript] {
-            let tree = parse(source);
-            assert_eq!(
-                module_member_is_mutation_free(
-                    tree.root_node(),
-                    source,
-                    "child_process",
-                    "execSync"
-                ),
-                free,
-                "{source}"
-            );
-        }
-    }
-
-    #[test]
-    fn module_member_mutation_free_holds_for_read_only_receivers() {
-        for source in [
-            r#"const cp = require("child_process");
-function run(command) { cp.execSync(command); }
-"#,
-            r#"const cp = require("node:child_process");
-cp.execSync("ls");
-cp.readFileSync("x");
-"#,
-            r#"import * as cp from "child_process";
-cp.execSync("ls");
-"#,
-            r#"import cp from "child_process";
-cp.execSync("ls");
-"#,
-            r#"import cp = require("child_process");
-cp.execSync("ls");
-"#,
-            // A write to a different member of the same module is not a write
-            // to the closed member.
-            r#"const cp = require("child_process");
-cp.readFileSync = wrap;
-cp.execSync("ls");
-"#,
-            // A destructured binding imports the member value, not the object:
-            // rebinding it cannot patch the module.
-            r#"const { execSync } = require("child_process");
-execSync = fake;
-"#,
-            // A same-named member of an unrelated object is not the module
-            // member.
-            r#"const cp = require("child_process");
-function run(opts) { opts.execSync = fake; cp.execSync("ls"); }
-"#,
-            // A shadowed binding is not the module binding.
-            r#"const cp = require("child_process");
-function g(cp) { cp.execSync = fake; }
-cp.execSync("ls");
-"#,
-            // No module binding anywhere: nothing here can patch the module.
-            r#"function run(opts) { opts.execSync = fake; }
-"#,
-        ] {
-            assert_module_member_mutation(source, true);
-        }
-    }
-
-    #[test]
-    fn module_member_mutation_poisons_writes_and_escapes() {
-        for source in [
-            r#"const cp = require("child_process");
-cp.execSync = fake;
-"#,
-            r#"const cp = require("child_process");
-cp.execSync += suffix;
-"#,
-            r#"const cp = require("child_process");
-cp.execSync++;
-"#,
-            r#"const cp = require("child_process");
-delete cp.execSync;
-"#,
-            r#"const cp = require("child_process");
-for (cp.execSync of batches) {}
-"#,
-            r#"const cp = require("child_process");
-cp["execSync"] = fake;
-"#,
-            r#"const cp = require("child_process");
-cp[selected] = fake;
-"#,
-            r#"require("child_process").execSync = fake;
-"#,
-            r#"function patch() {
-  const cp = require("child_process");
-  cp.execSync = fake;
-}
-"#,
-            r#"import * as cp from "child_process";
-cp.execSync = fake;
-"#,
-            r#"const cp = require("node:child_process");
-cp.execSync = fake;
-"#,
-            // An alias can carry the module object to an unseen writer.
-            r#"const cp = require("child_process");
-const aliased = cp;
-"#,
-            r#"const cp = require("child_process");
-patch(cp);
-"#,
-            r#"const cp = require("child_process");
-Object.assign(cp, { execSync: fake });
-"#,
-            r#"const cp = require("child_process");
-export { cp };
-"#,
-            r#"const cp = require("child_process");
-module.exports = cp;
-"#,
-        ] {
-            assert_module_member_mutation(source, false);
-        }
-    }
-
-    #[test]
-    fn module_member_mutation_tracks_typescript_import_equals_requires() {
-        for (source, free) in [
-            (
-                r#"import cp = require("child_process");
-cp.execSync("ls");
-"#,
-                true,
-            ),
-            (
-                r#"import cp = require("child_process");
-cp.execSync = fake;
-"#,
-                false,
-            ),
-        ] {
-            let tree = parse_typescript(source);
-            assert_eq!(
-                module_member_is_mutation_free(
-                    tree.root_node(),
-                    source,
-                    "child_process",
-                    "execSync"
-                ),
-                free,
-                "{source}"
-            );
-        }
     }
 }

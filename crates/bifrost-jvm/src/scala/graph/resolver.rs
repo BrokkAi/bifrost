@@ -205,36 +205,20 @@ fn inherited_companion_apply_fallback_is_unambiguous(
         return false;
     }
 
-    let normalized_owner = scala_normalized_fq_name(&owner.fq_name());
-    let normalized_owners = types.definitions_by_normalized_fqn(&normalized_owner);
-    let mut companions = normalized_owners.iter().filter(|candidate| {
-        candidate.is_class()
-            && *candidate != owner
-            && types.type_accepts_object_roles(scala, candidate)
-    });
-    let Some(companion) = companions.next() else {
+    let Some(companion) = types.unique_inherited_object_companion(scala, owner) else {
         return false;
     };
-    if companions.next().is_some() {
-        return false;
-    }
-
-    let Some(facts) = scala.forward_owner_facts(companion) else {
-        return false;
-    };
-    !facts.supertype_lookup_paths.is_empty()
-        && std::iter::once(companion.clone())
-            .chain(types.exact_ancestors(companion))
-            .all(|candidate_owner| {
-                !types
-                    .exact_member_declarations(scala, &candidate_owner, "apply")
-                    .into_iter()
-                    .any(|candidate| {
-                        candidate.is_function()
-                            && scala.structural_parent_of(&candidate).as_ref()
-                                == Some(&candidate_owner)
-                    })
-            })
+    std::iter::once(companion.clone())
+        .chain(types.exact_ancestors(&companion))
+        .all(|candidate_owner| {
+            !types
+                .exact_member_declarations(scala, &candidate_owner, "apply")
+                .into_iter()
+                .any(|candidate| {
+                    candidate.is_function()
+                        && scala.structural_parent_of(&candidate).as_ref() == Some(&candidate_owner)
+                })
+        })
 }
 
 struct InheritedMemberOwners {
@@ -698,7 +682,7 @@ pub fn package_name_of(scala: &dyn ScalaSource, file: &ProjectFile) -> Option<St
 }
 
 pub fn scala_normalized_fq_name(fq_name: &str) -> String {
-    fq_name.replace("$.", ".").trim_end_matches('$').to_string()
+    crate::scala::scala_normalize_full_name(fq_name)
 }
 
 pub fn scala_display_name(unit: &CodeUnit) -> String {

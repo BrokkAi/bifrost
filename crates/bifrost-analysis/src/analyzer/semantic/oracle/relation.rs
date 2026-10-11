@@ -418,8 +418,7 @@ impl Eq for OracleRelationHandle {}
 
 impl Hash for OracleRelationHandle {
     fn hash<H: Hasher>(&self, state: &mut H) {
-        Arc::as_ptr(&self.arena).hash(state);
-        self.id.hash(state);
+        crate::analyzer::semantic::hash_arc_key(&self.arena, &self.id, state);
     }
 }
 
@@ -604,8 +603,7 @@ impl<T> OracleCandidate<T> {
     }
 
     pub const fn is_proven_complete(&self) -> bool {
-        matches!(self.proof, ProofStatus::Proven)
-            && matches!(self.completeness, EvidenceCompleteness::Complete)
+        self.proof.establishes_complete_evidence(&self.completeness)
     }
 
     pub fn value(&self) -> &T {
@@ -727,24 +725,47 @@ pub(super) fn validate_candidate_provenance<T>(
         .next();
     let mut seen = std::collections::HashSet::new();
     for candidate in candidates {
-        if candidate.provenance().is_empty()
-            || candidate.provenance().iter().any(|relation| {
-                relation.owner() != owner
-                    || relation.record().kind() != kind
-                    || relation.record().evidence().is_empty()
-                    || first.is_some_and(|first| !first.same_arena(relation))
-                    || !seen.insert(relation.clone())
-            })
-        {
-            return Err(OracleContractError::InvalidRelationIdentity);
-        }
-        if candidate.provenance().iter().any(|relation| {
-            !relation
-                .record()
-                .supports_quality(candidate.proof(), candidate.completeness())
-        }) {
-            return Err(OracleContractError::InvalidRelationQuality);
-        }
+        validate_provenance_identity(candidate.provenance(), owner, kind, first, &mut seen)?;
+        validate_provenance_quality(
+            candidate.provenance(),
+            candidate.proof(),
+            candidate.completeness(),
+        )?;
+    }
+    Ok(())
+}
+
+pub(super) fn validate_provenance_identity(
+    relations: &[OracleRelationHandle],
+    owner: &OracleRelationOwner,
+    kind: OracleRelationKind,
+    first: Option<&OracleRelationHandle>,
+    seen: &mut std::collections::HashSet<OracleRelationHandle>,
+) -> Result<(), OracleContractError> {
+    if relations.is_empty()
+        || relations.iter().any(|relation| {
+            relation.owner() != owner
+                || relation.record().kind() != kind
+                || relation.record().evidence().is_empty()
+                || first.is_some_and(|first| !first.same_arena(relation))
+                || !seen.insert(relation.clone())
+        })
+    {
+        return Err(OracleContractError::InvalidRelationIdentity);
+    }
+    Ok(())
+}
+
+pub(super) fn validate_provenance_quality(
+    relations: &[OracleRelationHandle],
+    proof: &ProofStatus,
+    completeness: &EvidenceCompleteness,
+) -> Result<(), OracleContractError> {
+    if relations
+        .iter()
+        .any(|relation| !relation.record().supports_quality(proof, completeness))
+    {
+        return Err(OracleContractError::InvalidRelationQuality);
     }
     Ok(())
 }

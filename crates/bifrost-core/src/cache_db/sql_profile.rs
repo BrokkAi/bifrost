@@ -18,11 +18,14 @@
 //! one workload: the runner names the output file, and nothing here tags a
 //! route.
 
-use std::collections::HashMap;
+use std::cell::{Cell, RefCell};
+use std::collections::{HashMap, HashSet};
+use std::fs::OpenOptions;
+use std::hash::{DefaultHasher, Hash, Hasher};
 use std::io::Write;
 use std::path::PathBuf;
 use std::sync::{Mutex, Once, OnceLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use rusqlite::trace::{TraceEvent, TraceEventCodes};
 use rusqlite::{Connection, StatementStatus};
@@ -57,13 +60,18 @@ const EXPANDED_SAMPLE_CAP_BYTES: usize = 16 * 1024;
 /// atomically, so a killed process loses at most this much of its tail.
 const FLUSH_INTERVAL: Duration = Duration::from_secs(2);
 
+/// Distinct expanded statement invocations retained per request. The profile
+/// only needs enough identities to establish repeated key reads; this cap
+/// bounds request-local diagnostic memory on whole-workspace operations.
+const REQUEST_BINDING_CAP: usize = 1 << 21;
+
 /// Which opener produced the connection a statement ran on.
 ///
 /// The role is a property of the open site, not of the caller: the garbage
 /// collector and the store writer both open through `open_unified_connection`
 /// and both record as [`ConnectionRole::Writer`]. The workload label on the
 /// dump file is what separates them.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 #[repr(u8)]
 pub(crate) enum ConnectionRole {
     Writer,
@@ -75,6 +83,159 @@ pub(crate) enum ConnectionRole {
     VersionProbe,
     Cleanup,
     Ephemeral,
+}
+
+struct ActiveStatement {
+    role: ConnectionRole,
+    sql: String,
+    keys: Option<usize>,
+    rows: u64,
+}
+
+thread_local! {
+    static ACTIVE_STATEMENTS: RefCell<Vec<ActiveStatement>> = const { RefCell::new(Vec::new()) };
+    static LOGICAL_KEY_COUNT: Cell<Option<usize>> = const { Cell::new(None) };
+}
+
+#[derive(Default)]
+struct RequestStatement {
+    sql: String,
+    role: Option<ConnectionRole>,
+    executions: u64,
+    total_nanos: u128,
+    max_nanos: u64,
+    rows: u64,
+    row_histogram: HashMap<u64, u64>,
+    key_histogram: HashMap<u64, u64>,
+    repeated_expanded_invocations: u64,
+    untracked_expanded_invocations: u64,
+}
+
+struct RequestAggregate {
+    tool: String,
+    started: Instant,
+    overlapped: bool,
+    statements: HashMap<u64, RequestStatement>,
+    seen_bindings: HashSet<(u64, u64)>,
+}
+
+impl RequestAggregate {
+    fn new(tool: &str) -> Self {
+        Self {
+            tool: tool.to_string(),
+            started: Instant::now(),
+            overlapped: false,
+            statements: HashMap::new(),
+            seen_bindings: HashSet::new(),
+        }
+    }
+
+    fn record(
+        &mut self,
+        role: ConnectionRole,
+        sql: &str,
+        expanded: Option<&str>,
+        elapsed: Duration,
+        keys: Option<usize>,
+        rows: u64,
+    ) {
+        let mut family_hasher = DefaultHasher::new();
+        role.hash(&mut family_hasher);
+        sql.hash(&mut family_hasher);
+        let family = family_hasher.finish();
+        let nanos = u64::try_from(elapsed.as_nanos()).unwrap_or(u64::MAX);
+        let statement = self.statements.entry(family).or_default();
+        if statement.role.is_none() {
+            statement.role = Some(role);
+            statement.sql = sql.to_string();
+        }
+        statement.executions += 1;
+        statement.total_nanos += u128::from(nanos);
+        statement.max_nanos = statement.max_nanos.max(nanos);
+        statement.rows += rows;
+        *statement.row_histogram.entry(rows).or_default() += 1;
+        if let Some(keys) = keys {
+            *statement.key_histogram.entry(keys as u64).or_default() += 1;
+        }
+        let Some(expanded) = expanded else {
+            statement.untracked_expanded_invocations += 1;
+            return;
+        };
+        let mut binding_hasher = DefaultHasher::new();
+        expanded.hash(&mut binding_hasher);
+        let binding = (family, binding_hasher.finish());
+        if self.seen_bindings.contains(&binding) {
+            statement.repeated_expanded_invocations += 1;
+        } else if self.seen_bindings.len() < REQUEST_BINDING_CAP {
+            self.seen_bindings.insert(binding);
+        } else {
+            statement.untracked_expanded_invocations += 1;
+        }
+    }
+
+    fn render(self) -> String {
+        let mut statements = self
+            .statements
+            .into_values()
+            .map(|statement| {
+                let key_samples = statement.key_histogram.values().sum::<u64>();
+                let one_key_executions = statement.key_histogram.get(&1).copied().unwrap_or(0);
+                let row_histogram = statement
+                    .row_histogram
+                    .into_iter()
+                    .map(|(key, count)| (key.to_string(), count))
+                    .collect::<std::collections::BTreeMap<_, _>>();
+                let key_histogram = statement
+                    .key_histogram
+                    .into_iter()
+                    .map(|(key, count)| (key.to_string(), count))
+                    .collect::<std::collections::BTreeMap<_, _>>();
+                serde_json::json!({
+                    "role": statement.role.expect("profiled statement role is set").as_str(),
+                    "sql": statement.sql,
+                    "executions": statement.executions,
+                    "total_nanos": statement.total_nanos.to_string(),
+                    "max_nanos": statement.max_nanos,
+                    "rows": statement.rows,
+                    "row_histogram": row_histogram,
+                    "key_histogram": key_histogram,
+                    "key_samples": key_samples,
+                    "one_key_executions": one_key_executions,
+                    "repeated_expanded_invocations": statement.repeated_expanded_invocations,
+                    "untracked_expanded_invocations": statement.untracked_expanded_invocations,
+                })
+            })
+            .collect::<Vec<_>>();
+        statements.sort_by(|left, right| {
+            left["role"]
+                .as_str()
+                .cmp(&right["role"].as_str())
+                .then_with(|| left["sql"].as_str().cmp(&right["sql"].as_str()))
+        });
+        serde_json::json!({
+            "kind": "request",
+            "tool": self.tool,
+            "wall_ms": self.started.elapsed().as_secs_f64() * 1000.0,
+            "overlapped": self.overlapped,
+            "expanded_binding_cap": REQUEST_BINDING_CAP,
+            "distinct_expanded_bindings": self.seen_bindings.len(),
+            "statements": statements,
+        })
+        .to_string()
+    }
+}
+
+/// A request-local SQL family profile. Its statement totals and histograms are
+/// written beside the process-wide dump as `<profile>.requests.jsonl`.
+pub struct RequestScope {
+    profile: Option<&'static Profile>,
+    counted: bool,
+}
+
+/// Restore the caller's logical-key cardinality after a reader method returns.
+pub struct KeyScope {
+    previous: Option<usize>,
+    active: bool,
 }
 
 impl ConnectionRole {
@@ -133,8 +294,10 @@ impl StatementReuse {
 struct Statement {
     reuse: StatementReuse,
     executions: u64,
+    decoded_rows: u64,
     total_nanos: u128,
     max_nanos: u64,
+    rows: u64,
     /// First seen, capped at [`EXPANDED_SAMPLE_CAP_BYTES`]. `None` when SQLite
     /// could not expand the statement.
     expanded_sample: Option<String>,
@@ -147,8 +310,10 @@ struct Statement {
 struct Overflow {
     reuse: StatementReuse,
     executions: u64,
+    decoded_rows: u64,
     total_nanos: u128,
     max_nanos: u64,
+    rows: u64,
     first: Option<(ConnectionRole, String)>,
 }
 
@@ -157,6 +322,7 @@ struct Aggregate {
     /// allocating a key.
     by_role: [HashMap<String, Statement>; ConnectionRole::ALL.len()],
     distinct: usize,
+    decoded_rows: u64,
     overflow: Overflow,
     /// Starts true so the first flush writes a dump even for a process that
     /// issued no statement at all.
@@ -166,18 +332,71 @@ struct Aggregate {
 struct Profile {
     path: PathBuf,
     aggregate: Mutex<Aggregate>,
+    request_output: Mutex<Option<std::fs::File>>,
+    active_request: Mutex<Option<RequestAggregate>>,
 }
 
 impl Profile {
     fn new(path: PathBuf) -> Self {
+        let request_path = path.with_extension("requests.jsonl");
+        let request_output = match OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(&request_path)
+        {
+            Ok(file) => Some(file),
+            Err(error) => {
+                eprintln!(
+                    "Bifrost SQL request profile could not create {}: {error}",
+                    request_path.display()
+                );
+                None
+            }
+        };
         Self {
             path,
             aggregate: Mutex::new(Aggregate {
                 by_role: std::array::from_fn(|_| HashMap::new()),
                 distinct: 0,
+                decoded_rows: 0,
                 overflow: Overflow::default(),
                 dirty: true,
             }),
+            request_output: Mutex::new(request_output),
+            active_request: Mutex::new(None),
+        }
+    }
+
+    fn record_request_statement(
+        &self,
+        role: ConnectionRole,
+        sql: &str,
+        expanded: Option<&str>,
+        elapsed: Duration,
+        keys: Option<usize>,
+        rows: u64,
+    ) {
+        if let Some(request) = self
+            .active_request
+            .lock()
+            .expect("SQL request profile poisoned")
+            .as_mut()
+        {
+            request.record(role, sql, expanded, elapsed, keys, rows);
+        }
+    }
+
+    fn finish_request(&self, request: RequestAggregate) {
+        let line = request.render();
+        let mut output = self
+            .request_output
+            .lock()
+            .expect("SQL request profile output poisoned");
+        if let Some(output) = output.as_mut()
+            && let Err(error) = writeln!(output, "{line}").and_then(|()| output.flush())
+        {
+            eprintln!("Bifrost SQL request profile could not write a line: {error}");
         }
     }
 }
@@ -204,6 +423,75 @@ fn profile() -> Option<&'static Profile> {
         .as_ref()
 }
 
+/// Open a per-MCP-request SQL profile. The full statement family table is
+/// appended to the sidecar named by [`PROFILE_PATH_ENV`] when this scope drops.
+pub fn request_scope(tool: &str) -> RequestScope {
+    let Some(profile) = profile() else {
+        return RequestScope {
+            profile: None,
+            counted: false,
+        };
+    };
+    let mut active = profile
+        .active_request
+        .lock()
+        .expect("SQL request profile poisoned");
+    if let Some(active) = active.as_mut() {
+        active.overlapped = true;
+        return RequestScope {
+            profile: Some(profile),
+            counted: false,
+        };
+    }
+    *active = Some(RequestAggregate::new(tool));
+    RequestScope {
+        profile: Some(profile),
+        counted: true,
+    }
+}
+
+impl Drop for RequestScope {
+    fn drop(&mut self) {
+        if !self.counted {
+            return;
+        }
+        let Some(profile) = self.profile else {
+            return;
+        };
+        let request = profile
+            .active_request
+            .lock()
+            .expect("SQL request profile poisoned")
+            .take()
+            .expect("counted SQL request scope owns an open request");
+        profile.finish_request(request);
+    }
+}
+
+/// Set the logical key count for SQL statements issued by the current reader
+/// method. Nested reader methods restore the previous count on return.
+pub fn key_scope(keys: usize) -> KeyScope {
+    if profile().is_none() {
+        return KeyScope {
+            previous: None,
+            active: false,
+        };
+    }
+    let previous = LOGICAL_KEY_COUNT.with(|count| count.replace(Some(keys)));
+    KeyScope {
+        previous,
+        active: true,
+    }
+}
+
+impl Drop for KeyScope {
+    fn drop(&mut self) {
+        if self.active {
+            LOGICAL_KEY_COUNT.with(|count| count.set(self.previous));
+        }
+    }
+}
+
 /// Install the profile hook on one analyzer-store connection.
 ///
 /// Called from the single opener in `cache_db`, so no connection can be missed.
@@ -226,7 +514,10 @@ pub(crate) fn install(conn: &Connection, role: ConnectionRole) {
         }
     });
     conn.trace_v2(
-        TraceEventCodes::SQLITE_TRACE_PROFILE | TraceEventCodes::SQLITE_TRACE_CLOSE,
+        TraceEventCodes::SQLITE_TRACE_STMT
+            | TraceEventCodes::SQLITE_TRACE_PROFILE
+            | TraceEventCodes::SQLITE_TRACE_ROW
+            | TraceEventCodes::SQLITE_TRACE_CLOSE,
         Some(callback_for(role)),
     );
 }
@@ -249,22 +540,107 @@ fn callback_for(role: ConnectionRole) -> fn(TraceEvent<'_>) {
 
 fn on_event<const ROLE: u8>(event: TraceEvent<'_>) {
     match event {
-        TraceEvent::Profile(statement, elapsed) => record(
-            ConnectionRole::from_index(ROLE),
-            statement.sql().as_ref(),
-            statement.expanded_sql(),
-            elapsed,
-            statement.get_status(StatementStatus::Run),
-            statement.get_status(StatementStatus::RePrepare),
-        ),
-        // A closing connection is the last chance a process that exits without
-        // dropping into the background writer's next tick gets to be complete.
+        TraceEvent::Stmt(statement, _) => {
+            let role = ConnectionRole::from_index(ROLE);
+            let active = ActiveStatement {
+                role,
+                sql: statement.sql().into_owned(),
+                keys: LOGICAL_KEY_COUNT.with(Cell::get),
+                rows: 0,
+            };
+            ACTIVE_STATEMENTS.with(|current| current.borrow_mut().push(active));
+        }
+        TraceEvent::Row(statement) => {
+            let role = ConnectionRole::from_index(ROLE);
+            ACTIVE_STATEMENTS.with(|current| {
+                if let Some(active) = current.borrow_mut().last_mut() {
+                    active.rows += 1;
+                }
+            });
+            record_decoded_row(role, statement.sql().as_ref());
+        }
+        TraceEvent::Profile(statement, elapsed) => {
+            let role = ConnectionRole::from_index(ROLE);
+            let sql = statement.sql();
+            let (keys, rows) = ACTIVE_STATEMENTS.with(|current| {
+                let mut active = current.borrow_mut();
+                active
+                    .iter()
+                    .rposition(|entry| entry.role == role && entry.sql == sql.as_ref())
+                    .map(|index| active.remove(index))
+                    .map_or((None, 0), |entry| (entry.keys, entry.rows))
+            });
+            let expanded = statement.expanded_sql();
+            record(
+                role,
+                sql.as_ref(),
+                expanded.clone(),
+                elapsed,
+                statement.get_status(StatementStatus::Run),
+                statement.get_status(StatementStatus::RePrepare),
+                rows,
+            );
+            if let Some(profile) = profile() {
+                profile.record_request_statement(
+                    role,
+                    sql.as_ref(),
+                    expanded.as_deref(),
+                    elapsed,
+                    keys,
+                    rows,
+                );
+            }
+        }
         TraceEvent::Close(_) => flush(),
-        // `install` registers PROFILE and CLOSE only; `TraceEvent` is
-        // `#[non_exhaustive]`, so the arm is the enum's requirement, not a
-        // reachable state.
         _ => {}
     }
+}
+
+fn record_decoded_row(role: ConnectionRole, sql: &str) {
+    let Some(profile) = profile() else {
+        return;
+    };
+    let mut aggregate = profile
+        .aggregate
+        .lock()
+        .expect("SQL profile aggregate poisoned");
+    aggregate.decoded_rows = aggregate
+        .decoded_rows
+        .checked_add(1)
+        .expect("SQL profile decoded row count fits u64");
+    let index = role as usize;
+    if let Some(statement) = aggregate.by_role[index].get_mut(sql) {
+        statement.decoded_rows = statement
+            .decoded_rows
+            .checked_add(1)
+            .expect("statement decoded row count fits u64");
+    } else if aggregate.distinct < STATEMENT_CAP {
+        aggregate.distinct += 1;
+        aggregate.by_role[index].insert(
+            sql.to_string(),
+            Statement {
+                reuse: StatementReuse::default(),
+                executions: 0,
+                decoded_rows: 1,
+                total_nanos: 0,
+                max_nanos: 0,
+                rows: 0,
+                expanded_sample: None,
+                expanded_truncated: false,
+            },
+        );
+    } else {
+        aggregate.overflow.decoded_rows = aggregate
+            .overflow
+            .decoded_rows
+            .checked_add(1)
+            .expect("overflow decoded row count fits u64");
+        aggregate
+            .overflow
+            .first
+            .get_or_insert_with(|| (role, sql.to_string()));
+    }
+    aggregate.dirty = true;
 }
 
 fn record(
@@ -274,6 +650,7 @@ fn record(
     elapsed: Duration,
     runs: i32,
     reprepares: i32,
+    rows: u64,
 ) {
     let profile = profile().expect("SQL profile hook installed without a profile");
     let nanos = u64::try_from(elapsed.as_nanos()).unwrap_or(u64::MAX);
@@ -288,6 +665,10 @@ fn record(
         statement.executions += 1;
         statement.total_nanos += u128::from(nanos);
         statement.max_nanos = statement.max_nanos.max(nanos);
+        statement.rows = statement.rows.saturating_add(rows);
+        if statement.expanded_sample.is_none() && !statement.expanded_truncated {
+            (statement.expanded_sample, statement.expanded_truncated) = expanded_sample(expanded);
+        }
         return;
     }
     if aggregate.distinct >= STATEMENT_CAP {
@@ -296,13 +677,33 @@ fn record(
         overflow.executions += 1;
         overflow.total_nanos += u128::from(nanos);
         overflow.max_nanos = overflow.max_nanos.max(nanos);
+        overflow.rows = overflow.rows.saturating_add(rows);
         overflow
             .first
             .get_or_insert_with(|| (role, sql.to_string()));
         return;
     }
     aggregate.distinct += 1;
-    let (expanded_sample, expanded_truncated) = match expanded {
+    let (expanded_sample, expanded_truncated) = expanded_sample(expanded);
+    let mut reuse = StatementReuse::default();
+    reuse.observe(runs, reprepares);
+    aggregate.by_role[index].insert(
+        sql.to_string(),
+        Statement {
+            reuse,
+            executions: 1,
+            decoded_rows: 0,
+            total_nanos: u128::from(nanos),
+            max_nanos: nanos,
+            rows,
+            expanded_sample,
+            expanded_truncated,
+        },
+    );
+}
+
+fn expanded_sample(expanded: Option<String>) -> (Option<String>, bool) {
+    match expanded {
         Some(text) => {
             let truncated = text.len() > EXPANDED_SAMPLE_CAP_BYTES;
             let mut end = EXPANDED_SAMPLE_CAP_BYTES.min(text.len());
@@ -312,20 +713,7 @@ fn record(
             (Some(text[..end].to_string()), truncated)
         }
         None => (None, false),
-    };
-    let mut reuse = StatementReuse::default();
-    reuse.observe(runs, reprepares);
-    aggregate.by_role[index].insert(
-        sql.to_string(),
-        Statement {
-            reuse,
-            executions: 1,
-            total_nanos: u128::from(nanos),
-            max_nanos: nanos,
-            expanded_sample,
-            expanded_truncated,
-        },
-    );
+    }
 }
 
 /// Executions and total nanoseconds over every statement recorded so far, or
@@ -338,6 +726,14 @@ fn record(
 /// would mean snapshotting and writing those entries once per request, which is
 /// a different instrument.
 pub fn totals() -> Option<(u64, u128)> {
+    let (executions, _, nanos) = totals_with_rows()?;
+    Some((executions, nanos))
+}
+
+/// Executions, SQLite rows yielded, and total nanoseconds recorded so far, or
+/// `None` when the instrument is off. The row count includes SQLite internal
+/// schema rows, matching the selected-operation trace used by point-work pins.
+pub fn totals_with_rows() -> Option<(u64, u64, u128)> {
     let profile = profile()?;
     let aggregate = profile
         .aggregate
@@ -345,13 +741,15 @@ pub fn totals() -> Option<(u64, u128)> {
         .expect("SQL profile aggregate poisoned");
     let mut executions = aggregate.overflow.executions;
     let mut nanos = aggregate.overflow.total_nanos;
+    let mut rows = aggregate.overflow.rows;
     for statements in &aggregate.by_role {
         for statement in statements.values() {
             executions += statement.executions;
             nanos += statement.total_nanos;
+            rows = rows.saturating_add(statement.rows);
         }
     }
-    Some((executions, nanos))
+    Some((executions, aggregate.decoded_rows, nanos))
 }
 
 /// Write the dump now. The background writer calls this; a long-lived server
@@ -406,6 +804,7 @@ fn render(profile: &Profile) -> Option<String> {
         "statement_cap": STATEMENT_CAP,
         "expanded_sample_cap_bytes": EXPANDED_SAMPLE_CAP_BYTES,
         "distinct_statements": aggregate.distinct,
+        "decoded_rows": aggregate.decoded_rows,
         "flush_interval_ms": FLUSH_INTERVAL.as_millis(),
     })
     .to_string();
@@ -418,6 +817,7 @@ fn render(profile: &Profile) -> Option<String> {
                     "role": role.as_str(),
                     "sql": sql,
                     "executions": statement.executions,
+                    "decoded_rows": statement.decoded_rows,
                     "first_run_executions": statement.reuse.first_run_executions,
                     "reused_executions": statement.reuse.reused_executions,
                     "executions_with_reprepare_on_every_run": statement.reuse.executions_with_reprepare_on_every_run,
@@ -425,6 +825,7 @@ fn render(profile: &Profile) -> Option<String> {
                     "max_statement_reprepares": statement.reuse.max_statement_reprepares,
                     "total_nanos": statement.total_nanos.to_string(),
                     "max_nanos": statement.max_nanos,
+                    "rows": statement.rows,
                     "expanded_sql": statement.expanded_sample,
                     "expanded_truncated": statement.expanded_truncated,
                 })
@@ -440,6 +841,7 @@ fn render(profile: &Profile) -> Option<String> {
                 "first_role": role.as_str(),
                 "first_sql": sql,
                 "executions": aggregate.overflow.executions,
+                "decoded_rows": aggregate.overflow.decoded_rows,
                 "first_run_executions": aggregate.overflow.reuse.first_run_executions,
                 "reused_executions": aggregate.overflow.reuse.reused_executions,
                 "executions_with_reprepare_on_every_run": aggregate.overflow.reuse.executions_with_reprepare_on_every_run,
@@ -447,6 +849,7 @@ fn render(profile: &Profile) -> Option<String> {
                 "max_statement_reprepares": aggregate.overflow.reuse.max_statement_reprepares,
                 "total_nanos": aggregate.overflow.total_nanos.to_string(),
                 "max_nanos": aggregate.overflow.max_nanos,
+                "rows": aggregate.overflow.rows,
             })
             .to_string(),
         );
@@ -491,6 +894,7 @@ mod tests {
         );
 
         let profiled = open_readonly_connection(&db).expect("reader for the profile test");
+        let (_, rows_before, _) = totals_with_rows().expect("profile totals before marker queries");
         for _ in 0..3 {
             let marker: i64 = profiled
                 .query_row("SELECT 1717", [], |row| row.get(0))
@@ -505,6 +909,8 @@ mod tests {
                 .expect("cached marker result");
             assert_eq!(marker, 1818);
         }
+        let (_, rows_after, _) = totals_with_rows().expect("profile totals after marker queries");
+        assert_eq!(rows_after - rows_before, 6);
         flush();
 
         let dump = std::fs::read_to_string(&dump_path).expect("profile dump");
@@ -513,10 +919,26 @@ mod tests {
             .map(|line| serde_json::from_str(line).expect("profile dump line"))
             .collect();
         assert_eq!(lines[0]["kind"], "header", "dump lines: {lines:?}");
+        assert!(lines[0]["decoded_rows"].as_u64().is_some());
         let statements: Vec<&serde_json::Value> = lines
             .iter()
             .filter(|line| line["kind"] == "statement")
             .collect();
+        let statement_rows = statements
+            .iter()
+            .map(|line| line["decoded_rows"].as_u64().expect("statement row total"))
+            .sum::<u64>();
+        let overflow_rows = lines
+            .iter()
+            .find(|line| line["kind"] == "overflow")
+            .map_or(0, |line| {
+                line["decoded_rows"].as_u64().expect("overflow row total")
+            });
+        assert_eq!(
+            statement_rows + overflow_rows,
+            lines[0]["decoded_rows"].as_u64().expect("global row total"),
+            "statement row totals partition the global total: {lines:?}"
+        );
         assert!(
             !statements
                 .iter()
@@ -530,11 +952,13 @@ mod tests {
         assert_eq!(marker.len(), 1, "dump statements: {statements:?}");
         assert_eq!(marker[0]["first_run_executions"], 3);
         assert_eq!(marker[0]["reused_executions"], 0);
+        assert_eq!(marker[0]["decoded_rows"], 3);
         let cached = statements
             .iter()
             .find(|line| line["sql"] == "SELECT 1818")
             .expect("cached statement profile");
         assert_eq!(cached["executions"], 3);
+        assert_eq!(cached["decoded_rows"], 3);
         assert_eq!(cached["first_run_executions"], 1);
         assert_eq!(cached["reused_executions"], 2);
         assert_eq!(cached["max_statement_runs"], 3);

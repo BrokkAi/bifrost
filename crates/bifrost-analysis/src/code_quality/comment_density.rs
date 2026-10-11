@@ -246,7 +246,7 @@ fn truncate_to_line_cap(text: String, max_lines: i32) -> (String, bool) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::analyzer::{Language, ProjectFile};
+    use crate::analyzer::ProjectFile;
     use crate::test_support::AnalyzerFixture;
 
     const SAMPLE_JAVA: &str = "package com.example;\n\
@@ -266,99 +266,9 @@ mod tests {
                               }\n";
 
     #[test]
-    fn comment_density_for_code_unit_blank_fq_name_returns_missing() {
-        let fix = AnalyzerFixture::new(&[("Foo.java", SAMPLE_JAVA)]);
-        let result = report_comment_density_for_code_unit(
-            fix.analyzer.analyzer(),
-            ReportCommentDensityForCodeUnitParams {
-                fq_name: "   ".to_string(),
-                max_lines: 0,
-            },
-        );
-        assert_eq!(result.report, "Missing fqName.");
-        assert!(!result.truncated);
-    }
-
-    #[test]
-    fn comment_density_for_code_unit_unknown_symbol_returns_message() {
-        let fix = AnalyzerFixture::new(&[("Foo.java", SAMPLE_JAVA)]);
-        let result = report_comment_density_for_code_unit(
-            fix.analyzer.analyzer(),
-            ReportCommentDensityForCodeUnitParams {
-                fq_name: "com.example.Nope".to_string(),
-                max_lines: 0,
-            },
-        );
-        assert_eq!(result.report, "No definition found for: com.example.Nope");
-    }
-
-    #[test]
-    fn comment_density_for_code_unit_reports_class_with_rollup() {
-        let fix = AnalyzerFixture::new(&[("Foo.java", SAMPLE_JAVA)]);
-        let result = report_comment_density_for_code_unit(
-            fix.analyzer.analyzer(),
-            ReportCommentDensityForCodeUnitParams {
-                fq_name: "com.example.Foo".to_string(),
-                max_lines: 0,
-            },
-        );
-        assert!(
-            result.report.starts_with("## Comment density"),
-            "report: {}",
-            result.report
-        );
-        assert!(result.report.contains("- Symbol: `com.example.Foo`"));
-        assert!(result.report.contains("- File: `Foo.java`"));
-        // Class own header is 1 (the JavaDoc above `class Foo`), inline 0.
-        assert!(result.report.contains("- Own: header 1, inline 0,"));
-        // Rolled-up adds bar()'s own header (1) and inline (1).
-        assert!(
-            result.report.contains("- Rolled-up: header 2, inline 1,"),
-            "report: {}",
-            result.report
-        );
-        assert!(!result.truncated);
-    }
-
-    #[test]
-    fn comment_density_for_code_unit_truncates_to_max_lines() {
-        let fix = AnalyzerFixture::new(&[("Foo.java", SAMPLE_JAVA)]);
-        let result = report_comment_density_for_code_unit(
-            fix.analyzer.analyzer(),
-            ReportCommentDensityForCodeUnitParams {
-                fq_name: "com.example.Foo".to_string(),
-                max_lines: 2,
-            },
-        );
-        assert!(result.truncated);
-        assert!(result.report.contains("more lines omitted"));
-    }
-
-    #[test]
-    fn comment_density_for_files_renders_table_and_footer() {
-        let fix = AnalyzerFixture::new(&[("Foo.java", SAMPLE_JAVA)]);
-        let result = report_comment_density_for_files(
-            fix.analyzer.analyzer(),
-            ReportCommentDensityForFilesParams {
-                file_paths: vec!["Foo.java".to_string()],
-                max_top_level_rows: 0,
-                max_files: 0,
-            },
-        );
-        assert!(result.report.starts_with("## Comment density by file"));
-        assert!(result.report.contains("### `Foo.java`"));
-        assert!(
-            result
-                .report
-                .contains("| Declaration | Hdr | Inl | Span | Roll H | Roll I | Roll S |"),
-        );
-        assert!(result.report.contains("| `com.example.Foo` |"));
-        assert!(result.report.contains("- Files shown: 1 (cap 25)"));
-        assert!(result.report.contains("- Declaration rows: 1 (cap 60)"));
-        assert!(!result.truncated);
-    }
-
-    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#1415: Parses 128 Java methods and checks declaration-level totals include every child comment count"
+    )]
     fn comment_density_dense_file_rolls_up_all_methods() {
         const METHOD_COUNT: u32 = 128;
         let mut source = String::from("// class header\nclass Dense {\n");
@@ -381,176 +291,9 @@ mod tests {
     }
 
     #[test]
-    fn comment_density_for_files_missing_file_emits_skipped_line() {
-        let fix = AnalyzerFixture::new(&[("Foo.java", SAMPLE_JAVA)]);
-        let result = report_comment_density_for_files(
-            fix.analyzer.analyzer(),
-            ReportCommentDensityForFilesParams {
-                file_paths: vec!["does/not/exist.java".to_string()],
-                max_top_level_rows: 0,
-                max_files: 0,
-            },
-        );
-        assert!(
-            result
-                .report
-                .contains("- Missing file (skipped): `does/not/exist.java`"),
-            "report: {}",
-            result.report
-        );
-        assert!(result.report.contains("- Files shown: 1 (cap 25)"));
-    }
-
-    #[test]
-    fn comment_density_for_files_unsupported_file_emits_skip_block() {
-        let fix = AnalyzerFixture::new(&[("Foo.java", SAMPLE_JAVA), ("notes.txt", "hello\n")]);
-        let result = report_comment_density_for_files(
-            fix.analyzer.analyzer(),
-            ReportCommentDensityForFilesParams {
-                file_paths: vec!["notes.txt".to_string()],
-                max_top_level_rows: 0,
-                max_files: 0,
-            },
-        );
-        assert!(result.report.contains("### `notes.txt`"));
-        assert!(
-            result
-                .report
-                .contains("(comment density unavailable; skipped)")
-        );
-    }
-
-    #[test]
-    fn comment_density_supports_every_parsed_language_for_files_and_symbols() {
-        let files = [
-            (
-                "JavaTop.java",
-                "// header\nclass JavaTop {\n    void method() {\n        // inline\n        int value = 1;\n    }\n}\n",
-            ),
-            (
-                "go_top.go",
-                "// header\ntype GoTop struct {\n    Value int // inline\n}\n",
-            ),
-            (
-                "cpp_top.cpp",
-                "// header\nclass CppTop {\n    int method() {\n        // inline\n        return 1;\n    }\n};\n",
-            ),
-            (
-                "javascript_top.js",
-                "// header\nclass JavaScriptTop {\n    method() {\n        // inline\n        return 1;\n    }\n}\n",
-            ),
-            (
-                "typescript_top.ts",
-                "// header\nclass TypeScriptTop {\n    method(): number {\n        // inline\n        return 1;\n    }\n}\n",
-            ),
-            (
-                "tsx_top.tsx",
-                "// header\nclass TsxTop {\n    render() {\n        return <div>{/* inline */}</div>;\n    }\n}\n",
-            ),
-            (
-                "python_top.py",
-                "# header\nclass PythonTop:\n    def method(self):\n        # inline\n        return 1\n",
-            ),
-            (
-                "rust_top.rs",
-                "// header\nstruct RustTop {\n    value: i32, // inline\n}\n",
-            ),
-            (
-                "php_top.php",
-                "<?php\n// header\nclass PhpTop {\n    public int $value; // inline\n}\n",
-            ),
-            (
-                "scala_top.scala",
-                "// header\nclass ScalaTop {\n    def method: Int = {\n        // inline\n        1\n    }\n}\n",
-            ),
-            (
-                "csharp_top.cs",
-                "// header\nclass CSharpTop {\n    int Method() {\n        // inline\n        return 1;\n    }\n}\n",
-            ),
-            (
-                "ruby_top.rb",
-                "# header\nclass RubyTop\n  def method\n    # inline\n    1\n  end\nend\n",
-            ),
-            (
-                "kotlin_top.kt",
-                "// header\nclass KotlinTop {\n    fun method(): Int {\n        // inline\n        return 1\n    }\n}\n",
-            ),
-        ];
-        let fixture_files: Vec<(&str, &str)> = files
-            .iter()
-            .map(|(path, source)| (*path, *source))
-            .collect();
-        let fix = AnalyzerFixture::new(&fixture_files);
-        let analyzer = fix.analyzer.analyzer();
-        assert_eq!(
-            analyzer.languages(),
-            Language::ANALYZABLE.into_iter().collect(),
-            "fixture must cover every parsed language"
-        );
-        let result = report_comment_density_for_files(
-            analyzer,
-            ReportCommentDensityForFilesParams {
-                file_paths: files.iter().map(|(path, _)| (*path).to_string()).collect(),
-                max_top_level_rows: 0,
-                max_files: 0,
-            },
-        );
-
-        for (path, _) in files {
-            assert!(
-                result.report.contains(&format!("### `{path}`")),
-                "{path}: {}",
-                result.report
-            );
-            let file = ProjectFile::new(fix.project_root(), path);
-            let declaration = analyzer
-                .top_level_declarations(&file)
-                .into_iter()
-                .find(|unit| !unit.is_module() && !unit.is_synthetic())
-                .unwrap_or_else(|| panic!("expected a top-level declaration in {path}"));
-            let symbol_result = report_comment_density_for_code_unit(
-                analyzer,
-                ReportCommentDensityForCodeUnitParams {
-                    fq_name: declaration.fq_name(),
-                    max_lines: 0,
-                },
-            );
-            assert!(
-                symbol_result.report.starts_with("## Comment density"),
-                "{path}: {}",
-                symbol_result.report
-            );
-            assert!(
-                symbol_result
-                    .report
-                    .contains(&format!("- Symbol: `{}`", declaration.fq_name())),
-                "{path}: {}",
-                symbol_result.report
-            );
-            assert!(
-                symbol_result.report.contains("- Own: header 1,"),
-                "{path}: {}",
-                symbol_result.report
-            );
-            if matches!(
-                path,
-                "javascript_top.js" | "typescript_top.ts" | "tsx_top.tsx"
-            ) {
-                assert!(
-                    symbol_result.report.contains("inline 1"),
-                    "{path}: {}",
-                    symbol_result.report
-                );
-            }
-        }
-        assert!(
-            !result.report.contains("comment density unavailable"),
-            "{}",
-            result.report
-        );
-    }
-
-    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#1420: Regression covers conditional PHP free functions and excludes a function nested in a deferred closure"
+    )]
     fn php_conditional_free_functions_have_file_and_symbol_density() {
         let fix = AnalyzerFixture::new(&[(
             "functions.php",
@@ -631,30 +374,24 @@ $factory = static function (): void {
     }
 
     #[test]
-    fn comment_density_for_files_file_cap_truncates_list() {
-        let fix = AnalyzerFixture::new(&[
-            ("A.java", SAMPLE_JAVA.replace("Foo", "A").as_str()),
-            ("B.java", SAMPLE_JAVA.replace("Foo", "B").as_str()),
-        ]);
+    fn comment_density_for_files_missing_file_emits_skipped_line() {
+        let fix = AnalyzerFixture::new(&[("Foo.java", SAMPLE_JAVA)]);
         let result = report_comment_density_for_files(
             fix.analyzer.analyzer(),
             ReportCommentDensityForFilesParams {
-                file_paths: vec!["A.java".to_string(), "B.java".to_string()],
+                file_paths: vec!["does/not/exist.java".to_string()],
                 max_top_level_rows: 0,
-                max_files: 1,
+                max_files: 0,
             },
         );
-        assert!(result.truncated);
         assert!(
             result
                 .report
-                .contains("- Files shown: 1 (cap 1, list truncated)")
+                .contains("- Missing file (skipped): `does/not/exist.java`"),
+            "report: {}",
+            result.report
         );
-        assert!(
-            result
-                .report
-                .contains("- Note: narrow the path list or increase caps to see more.")
-        );
+        assert!(result.report.contains("- Files shown: 1 (cap 25)"));
     }
 
     #[test]

@@ -14,6 +14,12 @@ macro_rules! count_idents {
 macro_rules! impl_program_semantics_provider {
     ($analyzer:ty, |$context:ident| $lowerer:expr) => {
         impl $crate::analyzer::semantic::ProgramSemanticsProvider for $analyzer {
+            fn capabilities(&self) -> $crate::analyzer::semantic::SemanticCapabilities {
+                let $context = self;
+                let lowerer = $lowerer;
+                $crate::analyzer::semantic::service::ProgramSemanticsLowerer::capabilities(&lowerer)
+            }
+
             fn current_artifact_source(
                 &self,
                 file: &$crate::analyzer::ProjectFile,
@@ -45,11 +51,36 @@ macro_rules! impl_program_semantics_provider {
                 let lowerer = $lowerer;
                 self.inner
                     .materialize_semantics_with_lowerer(&lowerer, file, request)
+            }
+
+            fn stored_partial_flows(
+                &self,
+                file: &$crate::analyzer::ProjectFile,
+                key: &$crate::analyzer::semantic::SemanticArtifactKey,
+                procedure: $crate::analyzer::semantic::ProcedureId,
+            ) -> Result<
+                Option<$crate::analyzer::semantic::partial_flow::ProcedurePartialFlows>,
+                $crate::analyzer::semantic::SemanticProviderError,
+            > {
+                self.inner.stored_partial_flows(file, key, procedure)
+            }
+
+            fn has_complete_semantic_ir_rows(
+                &self,
+                file: &$crate::analyzer::ProjectFile,
+                key: &$crate::analyzer::semantic::SemanticArtifactKey,
+            ) -> Result<bool, $crate::analyzer::semantic::SemanticProviderError> {
+                self.inner.has_complete_semantic_ir_rows(file, key)
             }
         }
     };
     ($analyzer:ty, $lowerer:expr) => {
         impl $crate::analyzer::semantic::ProgramSemanticsProvider for $analyzer {
+            fn capabilities(&self) -> $crate::analyzer::semantic::SemanticCapabilities {
+                let lowerer = $lowerer;
+                $crate::analyzer::semantic::service::ProgramSemanticsLowerer::capabilities(&lowerer)
+            }
+
             fn current_artifact_source(
                 &self,
                 file: &$crate::analyzer::ProjectFile,
@@ -79,12 +110,49 @@ macro_rules! impl_program_semantics_provider {
                 let lowerer = $lowerer;
                 self.inner
                     .materialize_semantics_with_lowerer(&lowerer, file, request)
+            }
+
+            fn stored_partial_flows(
+                &self,
+                file: &$crate::analyzer::ProjectFile,
+                key: &$crate::analyzer::semantic::SemanticArtifactKey,
+                procedure: $crate::analyzer::semantic::ProcedureId,
+            ) -> Result<
+                Option<$crate::analyzer::semantic::partial_flow::ProcedurePartialFlows>,
+                $crate::analyzer::semantic::SemanticProviderError,
+            > {
+                self.inner.stored_partial_flows(file, key, procedure)
+            }
+
+            fn has_complete_semantic_ir_rows(
+                &self,
+                file: &$crate::analyzer::ProjectFile,
+                key: &$crate::analyzer::semantic::SemanticArtifactKey,
+            ) -> Result<bool, $crate::analyzer::semantic::SemanticProviderError> {
+                self.inner.has_complete_semantic_ir_rows(file, key)
             }
         }
     };
 }
 
 pub(crate) use impl_program_semantics_provider;
+
+pub(crate) fn hash_arc_key<T: ?Sized, K: std::hash::Hash, H: std::hash::Hasher>(
+    owner: &std::sync::Arc<T>,
+    key: &K,
+    state: &mut H,
+) {
+    std::hash::Hash::hash(&std::sync::Arc::as_ptr(owner), state);
+    std::hash::Hash::hash(key, state);
+}
+
+pub(crate) fn completeness_reason_bytes(completeness: &EvidenceCompleteness) -> usize {
+    completeness.retained_heap_bytes()
+}
+
+pub(crate) const fn procedure_relays_receiver_capture(kind: ProcedureKind) -> bool {
+    matches!(kind, ProcedureKind::Lambda)
+}
 
 pub mod binding_origins;
 pub mod capabilities;
@@ -97,6 +165,7 @@ pub mod ir;
 pub mod leases;
 pub(crate) mod lowering;
 pub mod oracle;
+pub mod partial_flow;
 pub mod property_reaching;
 pub mod provider;
 pub mod render;
@@ -105,6 +174,13 @@ pub mod statement_entries;
 pub(crate) mod structural_identity;
 pub mod type_flow;
 pub mod workspace_oracle;
+
+#[cfg(test)]
+pub(crate) fn floating_value_for_test(value: f64) -> SemanticValueKind {
+    SemanticValueKind::FloatingPoint {
+        bits: value.to_bits(),
+    }
+}
 
 pub use crate::cancellation::CancellationToken;
 pub use binding_origins::*;
@@ -125,11 +201,12 @@ pub use service::{SemanticCacheRevivalCensus, SemanticMaterializationCensus};
 pub use statement_entries::*;
 pub use type_flow::{
     CallGuardOutcome, ClassAtom, ClassBodyMemberBinding, ClassHierarchy, ClassIdentity, ClassSeed,
-    DispatchHint, DispatchHintCallSiteKey, DispatchHintSet, DispatchHints, DynamicFieldWrite,
+    ConstructorResultEvidence, ConstructorResultOrigin, DispatchHint, DispatchHintCallSiteKey,
+    DispatchHintSet, DispatchHints, DynamicFieldNameSet, DynamicFieldWrite, ExactResultProducer,
     ExternalMemberDeclaration, MemberAccessKind, MemberAccessQuery, MemberDeclaration,
-    MemberLookup, MemberLookupHit, NarrowingVerdict, NormalReturnTypeConstraint, SourceSite,
-    SourceSiteKind, TypeFlowAdapter, UnknownReason, source_site_kind_tag, type_flow_adapter,
-    validate_prepared_syntax_for_procedure,
+    MemberLookup, MemberLookupHit, MemberReceiverQuery, NarrowingVerdict,
+    NormalReturnTypeConstraint, SourceSite, SourceSiteKind, TypeFlowAdapter, UnknownReason,
+    source_site_kind_tag, type_flow_adapter, validate_prepared_syntax_for_procedure,
 };
 pub use workspace_oracle::*;
 

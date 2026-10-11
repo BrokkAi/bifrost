@@ -1,6 +1,6 @@
 {
   "name": "bifrost",
-  "version": "0.13.0",
+  "version": "0.13.1",
   "description": "Multi-language code intelligence and Brokk/Bifrost engineering workflows.",
   "author": {
     "name": "Brokk",
@@ -25,6 +25,5 @@
     "./agents/security-reviewer.md",
     "./agents/senior-dev-reviewer.md"
   ],
-  "mcpServers": "./claude-mcp.json",
-  "lspServers": "./.lsp.json"
+  "mcpServers": "./claude-mcp.json"
 }

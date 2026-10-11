@@ -6,7 +6,7 @@ use super::super::branch_relations::{
 use super::super::provider::StructuralSyntaxLimitedOutcome;
 use super::results::{
     CodeQueryBranchRelation, CodeQueryDiagnostic, CodeQueryDiagnosticCode,
-    CodeQueryDiagnosticImpact, CodeQueryRange, CodeQueryResultRef, DetailedCodeQueryKey,
+    CodeQueryDiagnosticImpact, CodeQueryResultRef, DetailedCodeQueryKey,
 };
 use super::scalar_conditions::{
     ScalarConditionGap, ScalarConditionOutcome, ScalarConditionVerdict, scalar_condition_outcomes,
@@ -20,6 +20,7 @@ use crate::analyzer::usages::get_definition::{
 };
 use brokk_bifrost_core::analyzer::prepared_syntax::PreparedSyntaxTree;
 use brokk_bifrost_rql::{BranchRelationFilter, BranchRelationKind};
+use tree_sitter::Node;
 
 const MAX_BRANCH_SOURCE_BYTES: usize = 1024 * 1024;
 
@@ -44,14 +45,59 @@ impl BranchRelationValue {
     }
 }
 
-fn public_range(facts: &FileFacts, range: Range) -> CodeQueryRange {
-    super::render::range_for_span(
-        facts,
-        Span {
-            start_byte: range.start_byte,
-            end_byte: range.end_byte,
-        },
-    )
+/// Whether one branch-relation kind has a producer for this language.
+///
+/// The preflight uses the same table as row expansion. A relation omitted by
+/// this table is an explicit unsupported capability, not an empty supported
+/// relation.
+pub(super) fn supports_relation(language: Language, relation: BranchRelationKind) -> bool {
+    let pilot = matches!(
+        language,
+        Language::Java
+            | Language::JavaScript
+            | Language::TypeScript
+            | Language::Python
+            | Language::Go
+            | Language::CSharp
+            | Language::Rust
+            | Language::Scala
+    );
+    let structural_only = matches!(
+        language,
+        Language::Kotlin | Language::Php | Language::Ruby | Language::Cpp
+    );
+    let scalar_producer = matches!(
+        language,
+        Language::Kotlin | Language::Php | Language::Ruby | Language::Cpp
+    );
+    let empty_arm_supported = matches!(language, Language::CSharp | Language::Cpp);
+    match relation {
+        BranchRelationKind::IdenticalBodies
+        | BranchRelationKind::RepeatedCondition
+        | BranchRelationKind::RedundantBooleanReturn => pilot || structural_only,
+        BranchRelationKind::ContradictoryCondition => pilot || (structural_only && scalar_producer),
+        BranchRelationKind::SubsumedCondition => false,
+        BranchRelationKind::EmptyArm => empty_arm_supported,
+    }
+}
+
+/// The relation kinds selected by the branch step's filter semantics.
+pub(super) fn requested_relations(
+    language: Language,
+    filter: &BranchRelationFilter,
+) -> Vec<BranchRelationKind> {
+    if filter.relations.is_empty() {
+        BranchRelationKind::ALL
+            .iter()
+            .copied()
+            .filter(|relation| {
+                *relation != BranchRelationKind::EmptyArm
+                    || supports_relation(language, BranchRelationKind::EmptyArm)
+            })
+            .collect()
+    } else {
+        filter.relations.clone()
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -80,11 +126,11 @@ fn make_value(
             id,
             path: rel_path_string(&seed.file),
             language: seed.language.config_label(),
-            range: public_range(&seed.facts, later),
+            range: super::render::public_range(&seed.facts, later),
             owner_id,
-            owner_range: public_range(&seed.facts, owner),
-            earlier_range: public_range(&seed.facts, earlier),
-            later_range: public_range(&seed.facts, later),
+            owner_range: super::render::public_range(&seed.facts, owner),
+            earlier_range: super::render::public_range(&seed.facts, earlier),
+            later_range: super::render::public_range(&seed.facts, later),
             earlier_ordinal,
             later_ordinal,
             relation,
@@ -132,34 +178,10 @@ pub(super) fn branch_relation_expansions(
     if seed.facts.node(seed.fact_match.node).kind != NormalizedKind::If {
         return Vec::new();
     }
-    let selected = if filter.relations.is_empty() {
-        BranchRelationKind::ALL.to_vec()
-    } else {
-        filter.relations.clone()
-    };
-    // These languages answer the structural relations but have no scalar
-    // condition producer.
-    let pilot = matches!(
-        seed.language,
-        Language::Java
-            | Language::JavaScript
-            | Language::TypeScript
-            | Language::Python
-            | Language::Go
-    );
-    let structural_only = matches!(
-        seed.language,
-        Language::CSharp
-            | Language::Kotlin
-            | Language::Rust
-            | Language::Scala
-            | Language::Php
-            | Language::Ruby
-            | Language::Cpp
-    );
-    let (unsupported, selected): (Vec<_>, Vec<_>) = selected.into_iter().partition(|relation| {
-        !pilot && !(structural_only && *relation != BranchRelationKind::ContradictoryCondition)
-    });
+    let selected = requested_relations(seed.language, filter);
+    let (unsupported, selected): (Vec<_>, Vec<_>) = selected
+        .into_iter()
+        .partition(|relation| !supports_relation(seed.language, *relation));
     for relation in &unsupported {
         report(
             cache,
@@ -185,6 +207,7 @@ pub(super) fn branch_relation_expansions(
                 | BranchRelationKind::RepeatedCondition
                 | BranchRelationKind::ContradictoryCondition
                 | BranchRelationKind::RedundantBooleanReturn
+                | BranchRelationKind::EmptyArm
         )
     }) {
         report(
@@ -210,6 +233,7 @@ pub(super) fn branch_relation_expansions(
                     | BranchRelationKind::RepeatedCondition
                     | BranchRelationKind::ContradictoryCondition
                     | BranchRelationKind::RedundantBooleanReturn
+                    | BranchRelationKind::EmptyArm
             )
         })
         .collect();
@@ -254,12 +278,13 @@ pub(super) fn branch_relation_expansions(
         let reason = failure.expect("syntax failure has a reason");
         return open_selected(cache, seed, &supported, reason, owner, diagnostics);
     };
-    let rows = if supported.iter().any(|relation| {
+    let mut rows = if supported.iter().any(|relation| {
         matches!(
             relation,
             BranchRelationKind::IdenticalBodies
                 | BranchRelationKind::RepeatedCondition
                 | BranchRelationKind::RedundantBooleanReturn
+                | BranchRelationKind::EmptyArm
         )
     }) {
         if seed.language == Language::Java
@@ -276,6 +301,18 @@ pub(super) fn branch_relation_expansions(
     } else {
         Vec::new()
     };
+    if seed.language == Language::Php && supported.contains(&BranchRelationKind::RepeatedCondition)
+    {
+        qualify_php_repeated_conditions(
+            workspace,
+            semantic,
+            cache,
+            seed,
+            &syntax,
+            cancellation,
+            &mut rows,
+        );
+    }
     let mut expansions: Vec<_> = rows
         .into_iter()
         .filter(|row| filter.accepts(row.kind.label()))
@@ -325,6 +362,234 @@ pub(super) fn branch_relation_expansions(
         ));
     }
     expansions
+}
+
+/// Structural comparison can establish that two PHP conditions have the same
+/// spelling, but PHP's dynamic values still need the scalar proof used by A5.
+/// Qualify only repeated-condition rows: a distinct condition is already a
+/// complete near miss, while an equal condition with an unknown value must
+/// keep the policy result open.
+#[allow(clippy::too_many_arguments)]
+fn qualify_php_repeated_conditions(
+    workspace: Option<&WorkspaceAnalyzer>,
+    semantic: &mut Option<SemanticQueryContext<'_>>,
+    cache: &mut BranchRelationTraversalCache,
+    seed: &SeedMatch,
+    syntax: &Arc<PreparedSyntaxTree>,
+    cancellation: Option<&CancellationToken>,
+    rows: &mut [branch_relations::BranchRelationRow],
+) {
+    let Some(workspace) = workspace else {
+        open_php_repeated_rows(rows);
+        return;
+    };
+    let Some(semantic) = semantic.as_mut() else {
+        open_php_repeated_rows(rows);
+        return;
+    };
+    let procedures = semantic.cfg().procedure_of_match(seed);
+    let [procedure] = procedures.as_slice() else {
+        open_php_repeated_rows(rows);
+        return;
+    };
+    let uncancelled = CancellationToken::new();
+    let outcomes = scalar_outcomes_for_procedure(
+        workspace,
+        cache,
+        &seed.file,
+        procedure,
+        syntax,
+        cancellation.unwrap_or(&uncancelled),
+    );
+    for row in rows.iter_mut().filter(|row| {
+        row.kind == branch_relations::BranchRelationKind::RepeatedCondition
+            && row.verdict == BranchRelationVerdict::Proven
+    }) {
+        let stable = match &outcomes {
+            Ok(outcomes) => php_chain_condition_ranges(syntax, row.owner).is_some_and(|chain| {
+                chain
+                    .get(row.earlier_ordinal..=row.later_ordinal)
+                    .is_some_and(|conditions| {
+                        conditions
+                            .iter()
+                            .all(|range| php_condition_has_stable_outcome(syntax, *range, outcomes))
+                    })
+            }),
+            Err(_) => false,
+        };
+        if !stable {
+            row.verdict = BranchRelationVerdict::Open(BranchOpenReason::UnsupportedCondition);
+        }
+    }
+}
+
+fn open_php_repeated_rows(rows: &mut [branch_relations::BranchRelationRow]) {
+    for row in rows.iter_mut().filter(|row| {
+        row.kind == branch_relations::BranchRelationKind::RepeatedCondition
+            && row.verdict == BranchRelationVerdict::Proven
+    }) {
+        row.verdict = BranchRelationVerdict::Open(BranchOpenReason::LexicalBindingUnavailable);
+    }
+}
+
+fn scalar_outcomes_for_procedure(
+    workspace: &WorkspaceAnalyzer,
+    cache: &mut BranchRelationTraversalCache,
+    file: &ProjectFile,
+    procedure: &SemanticProcedureValue,
+    syntax: &Arc<PreparedSyntaxTree>,
+    cancellation: &CancellationToken,
+) -> Result<Vec<ScalarConditionOutcome>, ScalarConditionGap> {
+    if let Some(outcomes) = cache.scalar.get(&procedure.handle) {
+        return outcomes.clone();
+    }
+    let outcomes = scalar_condition_outcomes(
+        workspace,
+        file,
+        &procedure.handle,
+        Arc::clone(syntax),
+        cancellation,
+    );
+    cache
+        .scalar
+        .insert(procedure.handle.clone(), outcomes.clone());
+    outcomes
+}
+
+fn php_condition_has_stable_outcome(
+    syntax: &PreparedSyntaxTree,
+    range: (usize, usize),
+    outcomes: &[ScalarConditionOutcome],
+) -> bool {
+    let Some(mut condition) = syntax
+        .tree()
+        .root_node()
+        .named_descendant_for_byte_range(range.0, range.1)
+        .filter(|node| node.start_byte() == range.0 && node.end_byte() == range.1)
+    else {
+        return false;
+    };
+    let mut ranges = vec![(condition.start_byte(), condition.end_byte())];
+    while condition.kind() == "parenthesized_expression" && condition.named_child_count() == 1 {
+        condition = condition.named_child(0).expect("one named condition child");
+        ranges.push((condition.start_byte(), condition.end_byte()));
+    }
+    let matching = outcomes.iter().filter(|outcome| {
+        ranges.iter().any(|(start, end)| {
+            (*start <= outcome.condition_start_byte && outcome.condition_end_byte <= *end)
+                || (outcome.condition_start_byte <= *start && *end <= outcome.condition_end_byte)
+        })
+    });
+    let matching = matching.map(|outcome| outcome.verdict).collect::<Vec<_>>();
+    !matching.is_empty()
+        && matching.iter().all(|verdict| {
+            matches!(
+                verdict,
+                ScalarConditionVerdict::AlwaysFalse
+                    | ScalarConditionVerdict::AlwaysTrue
+                    | ScalarConditionVerdict::BothFeasible
+                    | ScalarConditionVerdict::Open(ScalarConditionGap::UnreachableDecision)
+            ) || (php_strict_null_identity_condition(condition)
+                && matches!(
+                    verdict,
+                    ScalarConditionVerdict::Open(ScalarConditionGap::UnknownScalar)
+                ))
+        })
+}
+
+/// Strict identity against `null` has no coercion or user dispatch. An exact
+/// local or parameter can therefore be compared repeatedly even when its
+/// incoming value is unknown; the structural relation has already proved
+/// that no intervening write or call changes that binding.
+fn php_strict_null_identity_condition(mut condition: Node<'_>) -> bool {
+    loop {
+        match condition.kind() {
+            "parenthesized_expression" if condition.named_child_count() == 1 => {
+                condition = condition.named_child(0).expect("one named condition child");
+            }
+            "unary_op_expression"
+                if condition
+                    .child_by_field_name("operator")
+                    .is_some_and(|operator| operator.kind() == "!") =>
+            {
+                let Some(operand) = condition.child_by_field_name("argument") else {
+                    return false;
+                };
+                condition = operand;
+            }
+            _ => break,
+        }
+    }
+    if condition.kind() != "binary_expression"
+        || !condition
+            .child_by_field_name("operator")
+            .is_some_and(|operator| matches!(operator.kind(), "===" | "!=="))
+    {
+        return false;
+    }
+    let (Some(left), Some(right)) = (
+        condition.child_by_field_name("left"),
+        condition.child_by_field_name("right"),
+    ) else {
+        return false;
+    };
+    let left = peel_php_condition_parentheses(left);
+    let right = peel_php_condition_parentheses(right);
+    (left.kind() == "null" && right.kind() == "variable_name")
+        || (right.kind() == "null" && left.kind() == "variable_name")
+}
+
+fn peel_php_condition_parentheses(mut node: Node<'_>) -> Node<'_> {
+    while node.kind() == "parenthesized_expression" && node.named_child_count() == 1 {
+        node = node.named_child(0).expect("one named expression child");
+    }
+    node
+}
+
+fn php_chain_condition_ranges(
+    syntax: &PreparedSyntaxTree,
+    owner: Range,
+) -> Option<Vec<(usize, usize)>> {
+    let mut current = syntax
+        .tree()
+        .root_node()
+        .named_descendant_for_byte_range(owner.start_byte, owner.end_byte)
+        .filter(|node| {
+            node.kind() == "if_statement"
+                && node.start_byte() == owner.start_byte
+                && node.end_byte() == owner.end_byte
+        })?;
+    let mut ranges = Vec::new();
+    loop {
+        let condition = current.child_by_field_name("condition")?;
+        ranges.push((condition.start_byte(), condition.end_byte()));
+        let mut next = None;
+        let mut cursor = current.walk();
+        for alternative in current.children_by_field_name("alternative", &mut cursor) {
+            match alternative.kind() {
+                "else_if_clause" => {
+                    let condition = alternative.child_by_field_name("condition")?;
+                    ranges.push((condition.start_byte(), condition.end_byte()));
+                }
+                "else_clause"
+                    if alternative
+                        .child_by_field_name("body")
+                        .is_some_and(|body| body.kind() == "if_statement") =>
+                {
+                    next = alternative.child_by_field_name("body");
+                }
+                "else_clause" => {}
+                _ => return None,
+            }
+        }
+        if ranges.len() > 16 {
+            return None;
+        }
+        match next {
+            Some(next) => current = next,
+            None => return Some(ranges),
+        }
+    }
 }
 
 fn resolve_java_members(
@@ -410,8 +675,16 @@ fn scalar_condition_expansions(
         .root_node()
         .named_descendant_for_byte_range(owner.start_byte, owner.end_byte)
         .filter(|node| {
-            node.kind() == "if_statement"
-                && node.start_byte() == owner.start_byte
+            matches!(
+                node.kind(),
+                "if_statement"
+                    | "if_expression"
+                    | "if"
+                    | "unless"
+                    | "if_modifier"
+                    | "unless_modifier"
+                    | "conditional"
+            ) && node.start_byte() == owner.start_byte
                 && node.end_byte() == owner.end_byte
         })
     else {

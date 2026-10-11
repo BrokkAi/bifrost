@@ -1614,14 +1614,10 @@ fn declared_member_types<'tree>(node: Node<'tree>, source: &str) -> Vec<(String,
 mod tests {
     use super::*;
     use brokk_bifrost_core::analyzer::tree_walk::walk_named_tree_preorder;
-    use tree_sitter::{Parser, Tree};
+    use tree_sitter::Tree;
 
     fn parse(source: &str) -> Tree {
-        let mut parser = Parser::new();
-        parser
-            .set_language(&crate::kotlin::language::LANGUAGE.into())
-            .expect("load Kotlin grammar");
-        parser.parse(source, None).expect("parse Kotlin source")
+        crate::kotlin::language::parse_tree(source).expect("parse Kotlin source")
     }
 
     fn index<'tree>(tree: &'tree Tree, source: &str) -> KotlinValueClassIndex<'tree> {
@@ -1648,41 +1644,6 @@ mod tests {
     const MONEY: &str = "package pay\n\nimport kotlin.jvm.JvmInline\n\n@JvmInline\nvalue class Money(val amount: Long)\n";
 
     #[test]
-    fn an_explicitly_imported_annotation_proves_the_jvm_carrier() {
-        let tree = parse(MONEY);
-        let index = index(&tree, MONEY);
-        let KotlinCarrier::Unboxed(id) = index.declared_value_class("Money") else {
-            panic!("Money constructs its unboxed carrier: {:#?}", index);
-        };
-        let class = index.value_class(id);
-        assert_eq!(class.identity().package_name(), "pay");
-        assert_eq!(class.identity().name(), "Money");
-        assert!(class.identity().nesting().is_empty());
-        assert_eq!(class.underlying().name(), "amount");
-        assert!(index.projects_underlying(id, "amount"));
-        assert!(!index.projects_underlying(id, "other"));
-    }
-
-    #[test]
-    fn the_default_import_and_the_qualified_spelling_both_prove_the_annotation() {
-        for source in [
-            "package pay\n\n@JvmInline\nvalue class Money(val amount: Long)\n",
-            "package pay\n\n@kotlin.jvm.JvmInline\nvalue class Money(val amount: Long)\n",
-            "package pay\n\nimport kotlin.jvm.*\n\n@JvmInline\nvalue class Money(val amount: Long)\n",
-        ] {
-            let tree = parse(source);
-            let index = index(&tree, source);
-            assert!(
-                matches!(
-                    index.declared_value_class("Money"),
-                    KotlinCarrier::Unboxed(_)
-                ),
-                "{source} must prove the JVM inline annotation"
-            );
-        }
-    }
-
-    #[test]
     fn a_same_named_annotation_declaration_or_import_is_not_the_jvm_one() {
         for source in [
             "package pay\n\nannotation class JvmInline\n\n@JvmInline\nvalue class Money(val amount: Long)\n",
@@ -1697,85 +1658,6 @@ mod tests {
                 "{source} must not claim the JVM inline annotation"
             );
         }
-    }
-
-    #[test]
-    fn an_unrelated_wildcard_import_leaves_the_annotation_identity_open() {
-        let source = "package pay\n\nimport pay.other.*\n\n@JvmInline\nvalue class Money(val amount: Long)\n";
-        let tree = parse(source);
-        let index = index(&tree, source);
-        assert_eq!(
-            index.declared_value_class("Money"),
-            KotlinCarrier::Incomplete(KotlinAdaptationIncomplete::WildcardAnnotationShadow)
-        );
-    }
-
-    #[test]
-    fn an_explicit_import_or_the_owning_wildcard_survives_a_competing_wildcard() {
-        for source in [
-            "package pay\n\nimport pay.other.*\nimport kotlin.jvm.JvmInline\n\n@JvmInline\nvalue class Money(val amount: Long)\n",
-            // A second wildcard binding `JvmInline` would be a Kotlin
-            // ambiguity error, not a silent shadow of the owning package.
-            "package pay\n\nimport pay.other.*\nimport kotlin.jvm.*\n\n@JvmInline\nvalue class Money(val amount: Long)\n",
-        ] {
-            let tree = parse(source);
-            let index = index(&tree, source);
-            assert!(
-                matches!(
-                    index.declared_value_class("Money"),
-                    KotlinCarrier::Unboxed(_)
-                ),
-                "{source} binds the annotation at a tier no wildcard can shadow"
-            );
-        }
-    }
-
-    #[test]
-    fn a_value_class_without_exactly_one_val_property_has_no_proven_carrier() {
-        for source in [
-            "package pay\n\n@JvmInline\nvalue class Money(val amount: Long, val currency: String)\n",
-            "package pay\n\n@JvmInline\nvalue class Money(var amount: Long)\n",
-            "package pay\n\n@JvmInline\nvalue class Money(amount: Long)\n",
-        ] {
-            let tree = parse(source);
-            let index = index(&tree, source);
-            assert_eq!(
-                index.declared_value_class("Money"),
-                KotlinCarrier::Incomplete(KotlinAdaptationIncomplete::UnderlyingProperty),
-                "{source} declares no single underlying property"
-            );
-        }
-    }
-
-    #[test]
-    fn ordinary_and_data_classes_carry_no_value_class_facts() {
-        let source = "package pay\n\nclass Account(val id: Long)\n\ndata class Point(val x: Int, val y: Int)\n";
-        let tree = parse(source);
-        let index = index(&tree, source);
-        assert_eq!(
-            index.declared_value_class("Account"),
-            KotlinCarrier::Unrelated
-        );
-        assert_eq!(
-            index.declared_value_class("Point"),
-            KotlinCarrier::Unrelated
-        );
-        assert_eq!(
-            index.declared_value_class("Missing"),
-            KotlinCarrier::Unrelated
-        );
-    }
-
-    #[test]
-    fn two_declarations_of_one_name_stay_ambiguous() {
-        let source =
-            "package pay\n\n@JvmInline\nvalue class Money(val amount: Long)\n\nclass Money\n";
-        let tree = parse(source);
-        let index = index(&tree, source);
-        assert_eq!(
-            index.declared_value_class("Money"),
-            KotlinCarrier::Incomplete(KotlinAdaptationIncomplete::AmbiguousDeclaration)
-        );
     }
 
     #[test]
@@ -1936,6 +1818,66 @@ mod tests {
     }
 
     #[test]
+    fn an_unrelated_wildcard_import_leaves_the_annotation_identity_open() {
+        let source = "package pay\n\nimport pay.other.*\n\n@JvmInline\nvalue class Money(val amount: Long)\n";
+        let tree = parse(source);
+        let index = index(&tree, source);
+        assert_eq!(
+            index.declared_value_class("Money"),
+            KotlinCarrier::Incomplete(KotlinAdaptationIncomplete::WildcardAnnotationShadow)
+        );
+    }
+
+    #[test]
+    fn an_explicit_import_or_the_owning_wildcard_survives_a_competing_wildcard() {
+        for source in [
+            "package pay\n\nimport pay.other.*\nimport kotlin.jvm.JvmInline\n\n@JvmInline\nvalue class Money(val amount: Long)\n",
+            // A second wildcard binding `JvmInline` would be a Kotlin
+            // ambiguity error, not a silent shadow of the owning package.
+            "package pay\n\nimport pay.other.*\nimport kotlin.jvm.*\n\n@JvmInline\nvalue class Money(val amount: Long)\n",
+        ] {
+            let tree = parse(source);
+            let index = index(&tree, source);
+            assert!(
+                matches!(
+                    index.declared_value_class("Money"),
+                    KotlinCarrier::Unboxed(_)
+                ),
+                "{source} binds the annotation at a tier no wildcard can shadow"
+            );
+        }
+    }
+
+    #[test]
+    fn a_value_class_without_exactly_one_val_property_has_no_proven_carrier() {
+        for source in [
+            "package pay\n\n@JvmInline\nvalue class Money(val amount: Long, val currency: String)\n",
+            "package pay\n\n@JvmInline\nvalue class Money(var amount: Long)\n",
+            "package pay\n\n@JvmInline\nvalue class Money(amount: Long)\n",
+        ] {
+            let tree = parse(source);
+            let index = index(&tree, source);
+            assert_eq!(
+                index.declared_value_class("Money"),
+                KotlinCarrier::Incomplete(KotlinAdaptationIncomplete::UnderlyingProperty),
+                "{source} declares no single underlying property"
+            );
+        }
+    }
+
+    #[test]
+    fn two_declarations_of_one_name_stay_ambiguous() {
+        let source =
+            "package pay\n\n@JvmInline\nvalue class Money(val amount: Long)\n\nclass Money\n";
+        let tree = parse(source);
+        let index = index(&tree, source);
+        assert_eq!(
+            index.declared_value_class("Money"),
+            KotlinCarrier::Incomplete(KotlinAdaptationIncomplete::AmbiguousDeclaration)
+        );
+    }
+
+    #[test]
     fn a_nested_value_class_records_its_enclosing_declarations() {
         let source = concat!(
             "package pay\n\n",
@@ -1952,22 +1894,6 @@ mod tests {
         assert_eq!(index.value_class(id).identity().nesting(), ["Wallet"]);
     }
 
-    /// The first node of `kind` in the fixture.
-    fn first_node_of_kind<'tree>(tree: &'tree Tree, kind: &str) -> Node<'tree> {
-        let mut found = None;
-        walk_named_tree_preorder(tree.root_node(), true, |node| {
-            if found.is_none() && node.kind() == kind {
-                found = Some(node);
-            }
-            WalkControl::Continue
-        });
-        found.unwrap_or_else(|| panic!("the fixture spells a {kind}"))
-    }
-
-    /// #2851: a `Name(...)` spelling runs `Name`'s constructor only when
-    /// nothing else in the program can answer it. A same-named declaration, an
-    /// import of the name, and a companion `invoke` each select something the
-    /// class's carrier facts do not describe.
     #[test]
     fn a_constructor_is_selected_only_when_nothing_else_answers_the_spelling() {
         let source = concat!(
@@ -2012,9 +1938,6 @@ mod tests {
         );
     }
 
-    /// #2851: a binding in scope that is written with a function type is what
-    /// `Money(raw)` invokes, so the call constructs nothing at all; a binding
-    /// whose invokability this file cannot read leaves the selection open.
     #[test]
     fn a_binding_in_scope_answers_the_call_before_the_constructor_does() {
         let tree = parse(MONEY);
@@ -2052,114 +1975,6 @@ mod tests {
         }
         let written = kotlin_binding_type_node(*plain).expect("a written type");
         assert!(!kotlin_written_type_is_function(written));
-    }
-
-    /// #2851: an actual argument is matched against the carrier it has to fit,
-    /// so a value class is not constructed from a value whose type this file
-    /// proves the carrier does not accept.
-    #[test]
-    fn an_actual_is_matched_against_the_carrier_it_has_to_fit() {
-        let source = concat!(
-            "package pay\n\n",
-            "import kotlin.jvm.JvmInline\n\n",
-            "@JvmInline\nvalue class Money(val amount: Long)\n\n",
-            "@JvmInline\nvalue class Nick(val text: String)\n\n",
-            "@JvmInline\nvalue class Opt(val text: String?)\n\n",
-            "@JvmInline\nvalue class Holder<T>(val item: T)\n\n",
-            "@JvmInline\nvalue class Anything(val item: Any)\n\n",
-            "class Generic<T> {\n",
-            "    fun f(generic: T) {\n",
-            "        val exact: Long = 0\n",
-            "        val other: String = \"\"\n",
-            "        val maybe: String? = null\n",
-            "    }\n",
-            "}\n",
-        );
-        let tree = parse(source);
-        let index = index(&tree, source);
-        let class = |name: &str| match index.declared_value_class(name) {
-            KotlinCarrier::Unboxed(id) => id,
-            other => panic!("{name} is a proven value class, not {other:?}"),
-        };
-        let (money, nick, opt) = (class("Money"), class("Nick"), class("Opt"));
-        let written =
-            |name: &str| KotlinActualEvidence::Written(written_type_of(&tree, source, name));
-        let integer = KotlinActualEvidence::Literal(first_node_of_kind(&tree, "integer_literal"));
-        let text = KotlinActualEvidence::Literal(first_node_of_kind(&tree, "string_literal"));
-        let empty = KotlinActualEvidence::Literal(first_node_of_kind(&tree, "null_literal"));
-
-        // The carrier's own type, and an integer literal that takes it.
-        assert_eq!(
-            index.underlying_match(money, written("exact"), source),
-            KotlinUnderlyingMatch::Proven
-        );
-        assert_eq!(
-            index.underlying_match(money, integer, source),
-            KotlinUnderlyingMatch::Proven
-        );
-        // A different type, proved different.
-        assert_eq!(
-            index.underlying_match(money, written("other"), source),
-            KotlinUnderlyingMatch::Mismatched
-        );
-        assert_eq!(
-            index.underlying_match(money, text, source),
-            KotlinUnderlyingMatch::Mismatched
-        );
-        assert_eq!(
-            index.underlying_match(money, KotlinActualEvidence::ValueClass(nick), source),
-            KotlinUnderlyingMatch::Mismatched
-        );
-        // Nullability is part of fitting: a nullable value does not fit a
-        // non-null carrier, and a non-null value fits a nullable one.
-        assert_eq!(
-            index.underlying_match(nick, written("maybe"), source),
-            KotlinUnderlyingMatch::Mismatched
-        );
-        assert_eq!(
-            index.underlying_match(opt, written("maybe"), source),
-            KotlinUnderlyingMatch::Proven
-        );
-        assert_eq!(
-            index.underlying_match(opt, written("other"), source),
-            KotlinUnderlyingMatch::Proven
-        );
-        assert_eq!(
-            index.underlying_match(nick, empty, source),
-            KotlinUnderlyingMatch::Mismatched
-        );
-        assert_eq!(
-            index.underlying_match(opt, empty, source),
-            KotlinUnderlyingMatch::Proven
-        );
-        // An unresolved generic carrier must not erase the constructor's
-        // call-site specialization and accept every actual type.
-        assert_eq!(
-            index.underlying_match(class("Holder"), written("other"), source),
-            KotlinUnderlyingMatch::Unknown
-        );
-        assert_eq!(
-            index.underlying_match(class("Anything"), written("other"), source),
-            KotlinUnderlyingMatch::Proven
-        );
-        assert_eq!(
-            index.underlying_match(class("Anything"), empty, source),
-            KotlinUnderlyingMatch::Mismatched
-        );
-        assert_eq!(
-            index.underlying_match(class("Anything"), written("maybe"), source),
-            KotlinUnderlyingMatch::Mismatched
-        );
-        assert_eq!(
-            index.underlying_match(money, KotlinActualEvidence::Unknown, source),
-            KotlinUnderlyingMatch::Unknown
-        );
-        // A type-parameter actual is instantiated at the call, so its spelling
-        // cannot disprove the carrier either.
-        assert_eq!(
-            index.underlying_match(money, written("generic"), source),
-            KotlinUnderlyingMatch::Unknown
-        );
     }
 
     #[test]

@@ -243,13 +243,13 @@ struct CanonicalWorkspaceUsageGraphProjection {
 #[cfg(test)]
 impl CanonicalWorkspaceUsageGraphProjection {
     fn into_workspace_graph(self, cancellation: &CancellationToken) -> Option<WorkspaceUsageGraph> {
-        let edges = projected_edges_into_ranking_edges(&self.nodes, self.edges, cancellation)?;
-        Some(WorkspaceUsageGraph {
-            nodes: self.nodes,
-            edges,
+        projected_graph_into_workspace_graph(
+            self.nodes,
+            self.edges,
+            cancellation,
             #[cfg(test)]
-            resolved_ecosystems: self.resolved_ecosystems,
-        })
+            self.resolved_ecosystems,
+        )
     }
 }
 
@@ -276,6 +276,22 @@ fn projected_edges_into_ranking_edges(
     Some(ranking_edges)
 }
 
+#[cfg(any(test, feature = "test-support"))]
+fn projected_graph_into_workspace_graph(
+    nodes: Vec<WorkspaceUsageNode>,
+    edges: Vec<CanonicalWorkspaceUsageProjectedEdge>,
+    cancellation: &CancellationToken,
+    #[cfg(test)] resolved_ecosystems: Vec<UsageEcosystem>,
+) -> Option<WorkspaceUsageGraph> {
+    let edges = projected_edges_into_ranking_edges(&nodes, edges, cancellation)?;
+    Some(WorkspaceUsageGraph {
+        nodes,
+        edges,
+        #[cfg(test)]
+        resolved_ecosystems,
+    })
+}
+
 enum CanonicalWorkspaceUsageGraphProjectionOutcome {
     Complete(CanonicalWorkspaceUsageGraphProjection),
     Incomplete(CanonicalWorkspaceUsageGraphProjection),
@@ -291,6 +307,7 @@ struct CanonicalWorkspaceUsageGraphAccumulator {
     site_file_ids: HashMap<ProjectFile, usize>,
     site_files: Vec<ProjectFile>,
     proven_callsites: HashSet<(usize, usize, usize)>,
+    graph_callsites: HashSet<(usize, usize, usize)>,
     unproven_sites: HashSet<(usize, usize, usize)>,
     /// The names this build's unresolved forward bindings spell, or `None`
     /// when one of them has no identifier this route could read. Bounded by
@@ -331,6 +348,7 @@ impl CanonicalWorkspaceUsageGraphAccumulator {
             site_file_ids: HashMap::default(),
             site_files: Vec::new(),
             proven_callsites: HashSet::default(),
+            graph_callsites: HashSet::default(),
             unproven_sites: HashSet::default(),
             unresolved_names: Some(BTreeSet::new()),
             strongest_kind_by_line: HashMap::default(),
@@ -417,6 +435,8 @@ impl CanonicalWorkspaceUsageGraphAccumulator {
             }
 
             let external_usage = row.included_in(UsageHitSurface::ExternalUsages);
+            let ambiguous_candidate =
+                row.ambiguous_candidate && row.proof == UsageProof::Unproven && external_usage;
             let unproven_self_receiver =
                 row.proof == UsageProof::Unproven && row.usage_kind == UsageHitKind::SelfReceiver;
             if !external_usage && !unproven_self_receiver {
@@ -424,13 +444,16 @@ impl CanonicalWorkspaceUsageGraphAccumulator {
             }
 
             let mut site_file = None;
-            if row.proof == UsageProof::Proven {
+            if row.proof == UsageProof::Proven || ambiguous_candidate {
                 // Preserve the legacy cap boundary: a proven external target
-                // site counts before definition-overlap and caller-node
-                // exclusions.
+                // site and each exact ambiguous candidate count before
+                // definition-overlap and caller-node exclusions.
                 let file = self.site_file_id(&row.site.file);
-                self.proven_callsites
-                    .insert((target, file, row.site.range.start_byte));
+                let callsite = (target, file, row.site.range.start_byte);
+                self.graph_callsites.insert(callsite);
+                if row.proof == UsageProof::Proven {
+                    self.proven_callsites.insert(callsite);
+                }
                 site_file = Some(file);
             }
 
@@ -447,7 +470,9 @@ impl CanonicalWorkspaceUsageGraphAccumulator {
                 let file = self.site_file_id(&row.site.file);
                 self.unproven_sites
                     .insert((target, file, row.site.range.start_byte));
-                continue;
+                if !ambiguous_candidate {
+                    continue;
+                }
             }
 
             let Some(source) = source else {
@@ -531,11 +556,18 @@ impl CanonicalWorkspaceUsageGraphAccumulator {
         );
 
         let mut proven_inbound = vec![0_usize; self.nodes.len()];
-        for (target, _, _) in self.proven_callsites {
+        for (target, _, _) in self.proven_callsites.iter().copied() {
             if cancellation.is_cancelled() {
                 return CanonicalWorkspaceUsageGraphProjectionOutcome::Cancelled;
             }
             proven_inbound[target] = proven_inbound[target].saturating_add(1);
+        }
+        let mut graph_inbound = vec![0_usize; self.nodes.len()];
+        for (target, _, _) in self.graph_callsites {
+            if cancellation.is_cancelled() {
+                return CanonicalWorkspaceUsageGraphProjectionOutcome::Cancelled;
+            }
+            graph_inbound[target] = graph_inbound[target].saturating_add(1);
         }
         for (target, _, _) in self.unproven_sites {
             if cancellation.is_cancelled() {
@@ -544,7 +576,7 @@ impl CanonicalWorkspaceUsageGraphAccumulator {
             self.nodes[target].unproven_inbound =
                 self.nodes[target].unproven_inbound.saturating_add(1);
         }
-        for (target, total) in proven_inbound.iter().copied().enumerate() {
+        for (target, total) in graph_inbound.into_iter().enumerate() {
             if cancellation.is_cancelled() {
                 return CanonicalWorkspaceUsageGraphProjectionOutcome::Cancelled;
             }
@@ -675,13 +707,13 @@ impl SelectedWorkspaceUsageGraphProjection {
         cancellation: &CancellationToken,
     ) -> Option<(WorkspaceUsageGraph, u64, usize, usize, usize)> {
         assert_eq!(self.raw_proven_inbound().len(), self.nodes.len());
-        let edges = projected_edges_into_ranking_edges(&self.nodes, self.edges, cancellation)?;
-        let graph = WorkspaceUsageGraph {
-            nodes: self.nodes,
-            edges,
+        let graph = projected_graph_into_workspace_graph(
+            self.nodes,
+            self.edges,
+            cancellation,
             #[cfg(test)]
-            resolved_ecosystems: self.resolved_ecosystems,
-        };
+            self.resolved_ecosystems,
+        )?;
         Some((
             graph,
             self.generation,
@@ -1844,6 +1876,7 @@ fn usage_reference_kind(kind: Option<ReferenceKind>) -> (UsageReferenceKind, boo
 #[cfg(test)]
 mod tests {
     use super::*;
+
     use crate::analyzer::resolution::{
         FactReferenceEdgeSelectedFragment, PreloadedFactResolutionService,
         SelectedFactResolutionEngine,
@@ -1858,10 +1891,8 @@ mod tests {
     const CANONICAL_GENERATION: u64 = 17;
 
     fn test_file(path: &str) -> ProjectFile {
-        ProjectFile::new(
-            std::env::current_dir().expect("the test working directory must be available"),
-            path,
-        )
+        let root = std::env::current_dir().expect("the test working directory must be available");
+        crate::analyzer::common::project_file_for_test(&root, path)
     }
 
     fn test_range(start_byte: usize, end_byte: usize, line: usize) -> Range {
@@ -1923,12 +1954,32 @@ mod tests {
             target: target.clone(),
             reference_kind,
             proof,
+            ambiguous_candidate: false,
             usage_kind: UsageHitKind::Reference,
             site_class: SiteClass::UseSite,
             owner_relation: OwnerRelation::External,
             provenance: EdgeProvenance::Forward,
             generation: CANONICAL_GENERATION,
         }
+    }
+
+    fn stage_permuted_batches(
+        make_accumulator: impl Fn() -> CanonicalWorkspaceUsageGraphAccumulator,
+        first_batch: &[ReferenceEdgeRow],
+        second_batch: &[ReferenceEdgeRow],
+        cancellation: &CancellationToken,
+    ) -> (
+        CanonicalWorkspaceUsageGraphAccumulator,
+        CanonicalWorkspaceUsageGraphAccumulator,
+    ) {
+        let mut forward = make_accumulator();
+        assert!(forward.stage_rows(first_batch, cancellation));
+        assert!(forward.stage_rows(second_batch, cancellation));
+
+        let mut reverse = make_accumulator();
+        assert!(reverse.stage_rows(second_batch, cancellation));
+        assert!(reverse.stage_rows(first_batch, cancellation));
+        (forward, reverse)
     }
 
     fn complete_canonical_graph(
@@ -1957,6 +2008,118 @@ mod tests {
                 panic!("an uncancelled canonical projection must not cancel")
             }
         }
+    }
+
+    #[derive(Debug, PartialEq, Eq)]
+    struct SelectedJavaBuildMetrics {
+        complete: bool,
+        generation: u64,
+        reference_count: usize,
+        projected_edge_count: usize,
+        batch_count: usize,
+        node_count: usize,
+        edge_count: usize,
+        incomplete_node_count: usize,
+        retained_bytes: usize,
+    }
+
+    fn selected_java_build_metrics(
+        outcome: SelectedWorkspaceUsageRankingBuildOutcome,
+    ) -> SelectedJavaBuildMetrics {
+        let (complete, graph) = match outcome {
+            SelectedWorkspaceUsageRankingBuildOutcome::Complete(graph) => (true, graph),
+            SelectedWorkspaceUsageRankingBuildOutcome::Incomplete(graph) => (false, graph),
+            SelectedWorkspaceUsageRankingBuildOutcome::Cancelled => {
+                panic!("an uncancelled selected Java build must publish a graph")
+            }
+            SelectedWorkspaceUsageRankingBuildOutcome::Stale => {
+                panic!("a stable selected Java build must not be stale")
+            }
+            SelectedWorkspaceUsageRankingBuildOutcome::Unavailable(reason) => {
+                panic!("selected Java graph inputs must be available: {reason}")
+            }
+        };
+        SelectedJavaBuildMetrics {
+            complete,
+            generation: graph.generation(),
+            reference_count: graph.reference_count(),
+            projected_edge_count: graph.projected_edge_count(),
+            batch_count: graph.batch_count(),
+            node_count: graph.node_count(),
+            edge_count: graph.edge_count(),
+            incomplete_node_count: graph.incomplete_node_count(),
+            retained_bytes: graph.retained_bytes(),
+        }
+    }
+
+    fn selected_java_ranking_adapter_fixture() -> (
+        BuiltInlineTestProject,
+        SelectedWorkspaceUsageRankingGraph,
+        ProjectFile,
+        Vec<ProjectFile>,
+    ) {
+        let project = InlineTestProject::with_language(Language::Java)
+            .file("src/Seed.java", "class Seed {}\n")
+            .file("src/ZCallTarget.java", "class ZCallTarget {}\n")
+            .file("src/AMemberTarget.java", "class AMemberTarget {}\n")
+            .build();
+        let seed = project.file("src/Seed.java");
+        let call_target = project.file("src/ZCallTarget.java");
+        let member_target = project.file("src/AMemberTarget.java");
+        let mut node_indices_by_file = HashMap::default();
+        node_indices_by_file.insert(seed.clone(), vec![0]);
+        node_indices_by_file.insert(call_target.clone(), vec![1]);
+        node_indices_by_file.insert(member_target.clone(), vec![2]);
+        let graph = WorkspaceUsageRankingGraph {
+            nodes: vec![
+                WorkspaceUsageRankingNode {
+                    primary_file: seed.clone(),
+                    seed_files: vec![seed.clone()],
+                    incomplete: false,
+                    contains_tests: None,
+                },
+                WorkspaceUsageRankingNode {
+                    primary_file: call_target.clone(),
+                    seed_files: vec![call_target.clone()],
+                    incomplete: false,
+                    contains_tests: None,
+                },
+                WorkspaceUsageRankingNode {
+                    primary_file: member_target.clone(),
+                    seed_files: vec![member_target.clone()],
+                    incomplete: false,
+                    contains_tests: None,
+                },
+            ],
+            edges: vec![
+                WorkspaceUsageEdge {
+                    from: 0,
+                    to: 1,
+                    counts: UsageReferenceCounts {
+                        calls: 1,
+                        ..UsageReferenceCounts::default()
+                    },
+                },
+                WorkspaceUsageEdge {
+                    from: 0,
+                    to: 2,
+                    counts: UsageReferenceCounts {
+                        members: 1,
+                        ..UsageReferenceCounts::default()
+                    },
+                },
+            ],
+            node_indices_by_file,
+            resolved_ecosystems: vec![UsageEcosystem::Jvm],
+        };
+        let graph = SelectedWorkspaceUsageRankingGraph {
+            graph,
+            generation: CANONICAL_GENERATION,
+            reference_count: 2,
+            projected_edge_count: 2,
+            batch_count: 1,
+        };
+        (project, graph, seed, vec![call_target, member_target])
     }
 
     fn node_index(graph: &WorkspaceUsageGraph, declaration: &CodeUnit) -> usize {
@@ -2870,26 +3033,6 @@ mod tests {
     }
 
     #[test]
-    fn canonical_accumulator_accepts_a_valid_empty_batch_stream() {
-        let mut accumulator = CanonicalWorkspaceUsageGraphAccumulator::new(
-            canonical_catalog(std::iter::empty::<(CodeUnit, Vec<Range>)>()),
-            BTreeSet::from([UsageEcosystem::Jvm]),
-            HashSet::default(),
-        );
-        let cancellation = CancellationToken::default();
-        assert!(accumulator.stage_rows(&[], &cancellation));
-        assert!(accumulator.stage_rows(&[], &cancellation));
-
-        let graph = complete_canonical_graph(accumulator.finish(
-            CANONICAL_GENERATION,
-            &EdgeCompleteness::Complete,
-            &cancellation,
-        ));
-        assert!(graph.nodes.is_empty());
-        assert!(graph.edges.is_empty());
-    }
-
-    #[test]
     fn canonical_accumulator_cancellation_discards_a_staged_prefix() {
         let caller_file = test_file("src/Caller.java");
         let target_file = test_file("src/Target.java");
@@ -2969,23 +3112,23 @@ mod tests {
         let selected = BTreeSet::from([UsageEcosystem::Jvm]);
         let cancellation = CancellationToken::default();
         let admitted = HashSet::from_iter([first_file.clone(), second_file.clone()]);
-        let mut forward = CanonicalWorkspaceUsageGraphAccumulator::new(
-            make_catalog(),
-            selected.clone(),
-            admitted.clone(),
+        let (forward, reverse) = stage_permuted_batches(
+            || {
+                CanonicalWorkspaceUsageGraphAccumulator::new(
+                    make_catalog(),
+                    selected.clone(),
+                    admitted.clone(),
+                )
+            },
+            &first_batch,
+            &second_batch,
+            &cancellation,
         );
-        assert!(forward.stage_rows(&first_batch, &cancellation));
-        assert!(forward.stage_rows(&second_batch, &cancellation));
         let forward = complete_canonical_graph(forward.finish(
             CANONICAL_GENERATION,
             &EdgeCompleteness::Complete,
             &cancellation,
         ));
-
-        let mut reverse =
-            CanonicalWorkspaceUsageGraphAccumulator::new(make_catalog(), selected, admitted);
-        assert!(reverse.stage_rows(&second_batch, &cancellation));
-        assert!(reverse.stage_rows(&first_batch, &cancellation));
         let reverse = complete_canonical_graph(reverse.finish(
             CANONICAL_GENERATION,
             &EdgeCompleteness::Complete,
@@ -3051,25 +3194,24 @@ mod tests {
         ];
         let selected = BTreeSet::from([UsageEcosystem::Jvm]);
         let cancellation = CancellationToken::default();
-
         let admitted = HashSet::from_iter([caller_file.clone(), other_file.clone()]);
-        let mut forward = CanonicalWorkspaceUsageGraphAccumulator::new(
-            make_catalog(),
-            selected.clone(),
-            admitted.clone(),
+        let (forward, reverse) = stage_permuted_batches(
+            || {
+                CanonicalWorkspaceUsageGraphAccumulator::new(
+                    make_catalog(),
+                    selected.clone(),
+                    admitted.clone(),
+                )
+            },
+            &first_batch,
+            &second_batch,
+            &cancellation,
         );
-        assert!(forward.stage_rows(&first_batch, &cancellation));
-        assert!(forward.stage_rows(&second_batch, &cancellation));
         let forward = complete_canonical_projection(forward.finish_projection(
             CANONICAL_GENERATION,
             &EdgeCompleteness::Complete,
             &cancellation,
         ));
-
-        let mut reverse =
-            CanonicalWorkspaceUsageGraphAccumulator::new(make_catalog(), selected, admitted);
-        assert!(reverse.stage_rows(&second_batch, &cancellation));
-        assert!(reverse.stage_rows(&first_batch, &cancellation));
         let reverse = complete_canonical_projection(reverse.finish_projection(
             CANONICAL_GENERATION,
             &EdgeCompleteness::Complete,
@@ -3152,6 +3294,843 @@ mod tests {
         assert!(
             ranking.edges.is_empty(),
             "the established byte-site ranking cap remains unchanged"
+        );
+    }
+
+    #[test]
+    fn canonical_rows_deduplicate_lines_and_keep_the_strongest_kind() {
+        let caller_file = test_file("src/Caller.java");
+        let target_file = test_file("src/Target.java");
+        let other_file = test_file("src/Other.java");
+        let caller = test_unit(&caller_file, CodeUnitType::Function, "Caller.run");
+        let target = test_unit(&target_file, CodeUnitType::Class, "Target");
+        let other = test_unit(&other_file, CodeUnitType::Class, "Other");
+        let catalog = canonical_catalog([
+            (caller.clone(), vec![test_range(0, 80, 1)]),
+            (target.clone(), vec![test_range(0, 80, 1)]),
+            (other.clone(), vec![test_range(0, 80, 1)]),
+        ]);
+        let rows = vec![
+            canonical_row(
+                &caller_file,
+                test_range(120, 126, 7),
+                &caller,
+                &target,
+                Some(ReferenceKind::TypeReference),
+                UsageProof::Proven,
+            ),
+            canonical_row(
+                &caller_file,
+                test_range(130, 136, 7),
+                &caller,
+                &target,
+                Some(ReferenceKind::MethodCall),
+                UsageProof::Proven,
+            ),
+            canonical_row(
+                &caller_file,
+                test_range(140, 146, 8),
+                &caller,
+                &target,
+                Some(ReferenceKind::FieldRead),
+                UsageProof::Proven,
+            ),
+            canonical_row(
+                &caller_file,
+                test_range(150, 156, 9),
+                &caller,
+                &other,
+                Some(ReferenceKind::FieldWrite),
+                UsageProof::Proven,
+            ),
+        ];
+        let selected = BTreeSet::from([UsageEcosystem::Jvm]);
+        let graph =
+            complete_canonical_graph(reduce_canonical_reference_edges_to_workspace_usage_graph(
+                catalog,
+                &rows,
+                &EdgeCompleteness::Complete,
+                &selected,
+                &CancellationToken::default(),
+            ));
+
+        let caller = node_index(&graph, &caller);
+        let target = node_index(&graph, &target);
+        let edge = graph
+            .edges
+            .iter()
+            .find(|edge| edge.from == caller && edge.to == target)
+            .expect("the proven caller-to-target edge must be retained");
+        assert_eq!(
+            edge.counts,
+            UsageReferenceCounts {
+                calls: 1,
+                members: 1,
+                ..UsageReferenceCounts::default()
+            },
+            "one file line is one weight and its strongest category wins"
+        );
+        assert!(
+            graph
+                .edges
+                .windows(2)
+                .all(|edges| (edges[0].from, edges[0].to) < (edges[1].from, edges[1].to)),
+            "canonical edges must be strictly sorted by exact node indices"
+        );
+    }
+
+    #[test]
+    fn canonical_callsite_cap_deduplicates_bytes_and_counts_definition_overlap() {
+        let caller_file = test_file("src/Caller.java");
+        let target_file = test_file("src/Target.java");
+        let caller = test_unit(&caller_file, CodeUnitType::Function, "Caller.run");
+        let target = test_unit(&target_file, CodeUnitType::Class, "Target");
+        let target_member = test_unit(&target_file, CodeUnitType::Function, "Target.inside");
+        let make_catalog = || {
+            canonical_catalog([
+                (caller.clone(), vec![test_range(0, 80, 1)]),
+                (target.clone(), vec![test_range(0, 50, 1)]),
+                (target_member.clone(), vec![test_range(10, 20, 2)]),
+            ])
+        };
+        let mut rows = (0..MAX_CALLSITES)
+            .map(|index| {
+                canonical_row(
+                    &caller_file,
+                    test_range(100 + index, 101 + index, 8),
+                    &caller,
+                    &target,
+                    Some(ReferenceKind::FieldRead),
+                    UsageProof::Proven,
+                )
+            })
+            .collect::<Vec<_>>();
+        rows.push(rows[0].clone());
+        let selected = BTreeSet::from([UsageEcosystem::Jvm]);
+
+        let graph_at_cap =
+            complete_canonical_graph(reduce_canonical_reference_edges_to_workspace_usage_graph(
+                make_catalog(),
+                &rows,
+                &EdgeCompleteness::Complete,
+                &selected,
+                &CancellationToken::default(),
+            ));
+        let target_at_cap = node_index(&graph_at_cap, &target);
+        assert_eq!(graph_at_cap.nodes[target_at_cap].truncated_inbound, None);
+        assert!(
+            graph_at_cap
+                .edges
+                .iter()
+                .any(|edge| edge.to == target_at_cap),
+            "an exact duplicate byte offset must not push a target over the cap"
+        );
+
+        rows.push(canonical_row(
+            &target_file,
+            test_range(12, 13, 2),
+            &target_member,
+            &target,
+            Some(ReferenceKind::FieldRead),
+            UsageProof::Proven,
+        ));
+        let truncated =
+            complete_canonical_graph(reduce_canonical_reference_edges_to_workspace_usage_graph(
+                make_catalog(),
+                &rows,
+                &EdgeCompleteness::Complete,
+                &selected,
+                &CancellationToken::default(),
+            ));
+        let truncated_target = node_index(&truncated, &target);
+        assert_eq!(
+            truncated.nodes[truncated_target].truncated_inbound,
+            Some(MAX_CALLSITES + 1),
+            "the legacy cap counts a proven target site before definition-overlap exclusion"
+        );
+        assert!(
+            truncated
+                .edges
+                .iter()
+                .all(|edge| edge.to != truncated_target),
+            "every proven inbound edge to a truncated target must be removed"
+        );
+    }
+
+    #[test]
+    fn canonical_unproven_rows_are_target_local_and_never_add_topology_or_cap() {
+        let caller_file = test_file("src/Caller.java");
+        let target_file = test_file("src/Target.java");
+        let python_caller_file = test_file("src/caller.py");
+        let python_target_file = test_file("src/target.py");
+        let caller = test_unit(&caller_file, CodeUnitType::Function, "Caller.run");
+        let target = test_unit(&target_file, CodeUnitType::Class, "Target");
+        let python_caller = test_unit(
+            &python_caller_file,
+            CodeUnitType::Function,
+            "PythonCaller.run",
+        );
+        let python_target = test_unit(&python_target_file, CodeUnitType::Class, "PythonTarget");
+        let make_catalog = || {
+            canonical_catalog([
+                (caller.clone(), vec![test_range(0, 80, 1)]),
+                (target.clone(), vec![test_range(0, 80, 1)]),
+                (python_caller.clone(), vec![test_range(0, 80, 1)]),
+                (python_target.clone(), vec![test_range(0, 80, 1)]),
+            ])
+        };
+        let first = canonical_row(
+            &caller_file,
+            test_range(100, 106, 7),
+            &caller,
+            &target,
+            Some(ReferenceKind::MethodCall),
+            UsageProof::Unproven,
+        );
+        let rows = vec![
+            first.clone(),
+            first,
+            canonical_row(
+                &caller_file,
+                test_range(120, 126, 8),
+                &caller,
+                &target,
+                Some(ReferenceKind::MethodCall),
+                UsageProof::Unproven,
+            ),
+            canonical_row(
+                &python_caller_file,
+                test_range(100, 106, 7),
+                &python_caller,
+                &python_target,
+                Some(ReferenceKind::MethodCall),
+                UsageProof::Unproven,
+            ),
+        ];
+        let selected = BTreeSet::from([UsageEcosystem::Jvm]);
+        let outcome = reduce_canonical_reference_edges_to_workspace_usage_graph(
+            make_catalog(),
+            &rows,
+            &EdgeCompleteness::Incomplete {
+                reasons: vec![EdgeIncompleteReason::ForwardResolutionIncomplete],
+            },
+            &selected,
+            &CancellationToken::default(),
+        );
+        let CanonicalWorkspaceUsageGraphBuildOutcome::Incomplete(graph) = outcome else {
+            panic!("incomplete forward input must produce an incomplete graph");
+        };
+        let target_index = node_index(&graph, &target);
+        let python_target = node_index(&graph, &python_target);
+        assert_eq!(graph.nodes[target_index].unproven_inbound, 2);
+        assert_eq!(graph.nodes[target_index].truncated_inbound, None);
+        assert_eq!(graph.nodes[python_target].unproven_inbound, 0);
+        assert!(graph.edges.iter().all(|edge| edge.to != target_index));
+        assert_eq!(graph.resolved_ecosystems, vec![UsageEcosystem::Jvm]);
+
+        let mut ambiguous_candidate = canonical_row(
+            &caller_file,
+            test_range(140, 146, 9),
+            &caller,
+            &target,
+            Some(ReferenceKind::MethodCall),
+            UsageProof::Unproven,
+        );
+        ambiguous_candidate.ambiguous_candidate = true;
+        let CanonicalWorkspaceUsageGraphBuildOutcome::Complete(candidate_graph) =
+            reduce_canonical_reference_edges_to_workspace_usage_graph(
+                make_catalog(),
+                &[ambiguous_candidate],
+                &EdgeCompleteness::Complete,
+                &selected,
+                &CancellationToken::default(),
+            )
+        else {
+            panic!("closed ambiguous candidates retain exact graph identities");
+        };
+        let caller = node_index(&candidate_graph, &caller);
+        let target = node_index(&candidate_graph, &target);
+        assert_eq!(candidate_graph.edges.len(), 1);
+        assert_eq!(candidate_graph.edges[0].from, caller);
+        assert_eq!(candidate_graph.edges[0].to, target);
+        assert_eq!(candidate_graph.edges[0].counts.calls, 1);
+        assert_eq!(candidate_graph.nodes[target].unproven_inbound, 1);
+
+        let cancellation = CancellationToken::new();
+        cancellation.cancel();
+        assert!(matches!(
+            reduce_canonical_reference_edges_to_workspace_usage_graph(
+                make_catalog(),
+                &rows,
+                &EdgeCompleteness::Complete,
+                &selected,
+                &cancellation,
+            ),
+            CanonicalWorkspaceUsageGraphBuildOutcome::Cancelled
+        ));
+        assert!(matches!(
+            reduce_canonical_reference_edges_to_workspace_usage_graph(
+                make_catalog(),
+                &rows,
+                &EdgeCompleteness::Incomplete {
+                    reasons: vec![EdgeIncompleteReason::Cancelled],
+                },
+                &selected,
+                &CancellationToken::default(),
+            ),
+            CanonicalWorkspaceUsageGraphBuildOutcome::Cancelled
+        ));
+    }
+
+    #[test]
+    fn canonical_static_and_missing_kinds_are_other_and_keep_the_graph_incomplete() {
+        let caller_file = test_file("src/Caller.java");
+        let target_file = test_file("src/Target.java");
+        let caller = test_unit(&caller_file, CodeUnitType::Function, "Caller.run");
+        let target = test_unit(&target_file, CodeUnitType::Function, "Target.run");
+        let catalog = canonical_catalog([
+            (caller.clone(), vec![test_range(0, 80, 1)]),
+            (target.clone(), vec![test_range(0, 80, 1)]),
+        ]);
+        let rows = vec![
+            canonical_row(
+                &caller_file,
+                test_range(100, 106, 7),
+                &caller,
+                &target,
+                Some(ReferenceKind::StaticReference),
+                UsageProof::Proven,
+            ),
+            canonical_row(
+                &caller_file,
+                test_range(120, 126, 8),
+                &caller,
+                &target,
+                None,
+                UsageProof::Proven,
+            ),
+        ];
+        let selected = BTreeSet::from([UsageEcosystem::Jvm]);
+        let outcome = reduce_canonical_reference_edges_to_workspace_usage_graph(
+            catalog,
+            &rows,
+            &EdgeCompleteness::Complete,
+            &selected,
+            &CancellationToken::default(),
+        );
+        let CanonicalWorkspaceUsageGraphBuildOutcome::Incomplete(graph) = outcome else {
+            panic!("coarse static/missing kinds must keep exact weighting incomplete");
+        };
+        let caller = node_index(&graph, &caller);
+        let target = node_index(&graph, &target);
+        let edge = graph
+            .edges
+            .iter()
+            .find(|edge| edge.from == caller && edge.to == target)
+            .expect("best-effort rows must remain useful positive evidence");
+        assert_eq!(
+            edge.counts,
+            UsageReferenceCounts {
+                other: 2,
+                ..UsageReferenceCounts::default()
+            }
+        );
+    }
+
+    #[test]
+    fn canonical_complete_outcome_requires_every_ranking_axis() {
+        let caller_file = test_file("src/Caller.java");
+        let target_file = test_file("src/Target.java");
+        let caller = test_unit(&caller_file, CodeUnitType::Function, "Caller.run");
+        let target = test_unit(&target_file, CodeUnitType::Function, "Target.run");
+        let make_catalog = || {
+            canonical_catalog([
+                (caller.clone(), vec![test_range(0, 80, 1)]),
+                (target.clone(), vec![test_range(0, 80, 1)]),
+            ])
+        };
+        let rows = [canonical_row(
+            &caller_file,
+            test_range(100, 106, 7),
+            &caller,
+            &target,
+            Some(ReferenceKind::MethodCall),
+            UsageProof::Proven,
+        )];
+        let selected = BTreeSet::from([UsageEcosystem::Jvm]);
+
+        for axis in [
+            EdgeAxis::ForwardProjection,
+            EdgeAxis::OwnerClassification,
+            EdgeAxis::KindClassification,
+        ] {
+            assert!(matches!(
+                reduce_canonical_reference_edges_to_workspace_usage_graph(
+                    make_catalog(),
+                    &rows,
+                    &EdgeCompleteness::Incomplete {
+                        reasons: vec![EdgeIncompleteReason::AxisUnsupported(axis)],
+                    },
+                    &selected,
+                    &CancellationToken::default(),
+                ),
+                CanonicalWorkspaceUsageGraphBuildOutcome::Incomplete(_)
+            ));
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "row generation must match its catalog generation")]
+    fn canonical_mixed_generation_rows_fail_closed() {
+        let caller_file = test_file("src/Caller.java");
+        let target_file = test_file("src/Target.java");
+        let caller = test_unit(&caller_file, CodeUnitType::Function, "Caller.run");
+        let target = test_unit(&target_file, CodeUnitType::Function, "Target.run");
+        let catalog = canonical_catalog([
+            (caller.clone(), vec![test_range(0, 80, 1)]),
+            (target.clone(), vec![test_range(0, 80, 1)]),
+        ]);
+        let current = canonical_row(
+            &caller_file,
+            test_range(100, 106, 7),
+            &caller,
+            &target,
+            Some(ReferenceKind::MethodCall),
+            UsageProof::Proven,
+        );
+        let mut stale = current.clone();
+        stale.generation = CANONICAL_GENERATION + 1;
+
+        let _ = reduce_canonical_reference_edges_to_workspace_usage_graph(
+            catalog,
+            &[current, stale],
+            &EdgeCompleteness::Complete,
+            &BTreeSet::from([UsageEcosystem::Jvm]),
+            &CancellationToken::default(),
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "status generation must match its catalog generation")]
+    fn canonical_status_generation_mismatch_fails_closed_without_rows() {
+        let target_file = test_file("src/Target.java");
+        let target = test_unit(&target_file, CodeUnitType::Class, "Target");
+        let catalog = canonical_catalog([(target, vec![test_range(0, 80, 1)])]);
+
+        let _ = reduce_canonical_reference_edge_rows_to_workspace_usage_graph(
+            catalog,
+            &[],
+            CANONICAL_GENERATION + 1,
+            &EdgeCompleteness::Complete,
+            &BTreeSet::from([UsageEcosystem::Jvm]),
+            &CancellationToken::default(),
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "canonical reference-edge target")]
+    fn canonical_graph_target_rows_fail_closed_when_the_crosswalk_is_missing() {
+        let caller_file = test_file("src/Caller.java");
+        let target_file = test_file("src/Target.java");
+        let caller = test_unit(&caller_file, CodeUnitType::Function, "Caller.run");
+        let target = test_unit(&target_file, CodeUnitType::Function, "Target.run");
+        let catalog = canonical_catalog([(caller.clone(), vec![test_range(0, 80, 1)])]);
+        let rows = [canonical_row(
+            &caller_file,
+            test_range(100, 106, 7),
+            &caller,
+            &target,
+            Some(ReferenceKind::MethodCall),
+            UsageProof::Proven,
+        )];
+
+        let _ = reduce_canonical_reference_edges_to_workspace_usage_graph(
+            catalog,
+            &rows,
+            &EdgeCompleteness::Complete,
+            &BTreeSet::from([UsageEcosystem::Jvm]),
+            &CancellationToken::default(),
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "canonical reference-edge source")]
+    fn canonical_graph_source_rows_fail_closed_when_the_crosswalk_is_missing() {
+        let caller_file = test_file("src/Caller.java");
+        let target_file = test_file("src/Target.java");
+        let caller = test_unit(&caller_file, CodeUnitType::Function, "Caller.run");
+        let target = test_unit(&target_file, CodeUnitType::Function, "Target.run");
+        let catalog = canonical_catalog([(target.clone(), vec![test_range(0, 80, 1)])]);
+        let rows = [canonical_row(
+            &caller_file,
+            test_range(100, 106, 7),
+            &caller,
+            &target,
+            Some(ReferenceKind::MethodCall),
+            UsageProof::Proven,
+        )];
+
+        let _ = reduce_canonical_reference_edges_to_workspace_usage_graph(
+            catalog,
+            &rows,
+            &EdgeCompleteness::Complete,
+            &BTreeSet::from([UsageEcosystem::Jvm]),
+            &CancellationToken::default(),
+        );
+    }
+
+    #[test]
+    fn canonical_field_targets_are_skipped_and_field_sources_are_inbound_only() {
+        let caller_file = test_file("src/Caller.java");
+        let target_file = test_file("src/Target.java");
+        let field_source_file = test_file("src/FieldSource.java");
+        let caller = test_unit(&caller_file, CodeUnitType::Function, "Caller.run");
+        let target = test_unit(&target_file, CodeUnitType::Class, "Target");
+        let field_target = test_unit(&target_file, CodeUnitType::Field, "Target.value");
+        let field_source = test_unit(&field_source_file, CodeUnitType::Field, "FieldSource.value");
+        let catalog = canonical_catalog([
+            (caller.clone(), vec![test_range(0, 80, 1)]),
+            (target.clone(), vec![test_range(0, 80, 1)]),
+        ]);
+        let mut rows = vec![canonical_row(
+            &caller_file,
+            test_range(100, 106, 7),
+            &caller,
+            &field_target,
+            Some(ReferenceKind::FieldRead),
+            UsageProof::Proven,
+        )];
+        rows.extend((0..=MAX_CALLSITES).map(|index| {
+            canonical_row(
+                &field_source_file,
+                test_range(100 + index, 101 + index, 8),
+                &field_source,
+                &target,
+                Some(ReferenceKind::FieldRead),
+                UsageProof::Proven,
+            )
+        }));
+        rows.push(canonical_row(
+            &field_source_file,
+            test_range(MAX_CALLSITES + 200, MAX_CALLSITES + 201, 9),
+            &field_source,
+            &target,
+            Some(ReferenceKind::FieldRead),
+            UsageProof::Unproven,
+        ));
+
+        let graph =
+            complete_canonical_graph(reduce_canonical_reference_edges_to_workspace_usage_graph(
+                catalog,
+                &rows,
+                &EdgeCompleteness::Complete,
+                &BTreeSet::from([UsageEcosystem::Jvm]),
+                &CancellationToken::default(),
+            ));
+        let target = node_index(&graph, &target);
+        assert_eq!(graph.nodes.len(), 2, "fields are not rankable graph nodes");
+        assert_eq!(
+            graph.nodes[target].truncated_inbound,
+            Some(MAX_CALLSITES + 1),
+            "proven field-owned sites count toward the target cap before caller-node rejection"
+        );
+        assert_eq!(graph.nodes[target].unproven_inbound, 1);
+        assert!(graph.edges.is_empty(), "field owners never add topology");
+    }
+
+    #[test]
+    fn canonical_unproven_self_receivers_preserve_field_and_sibling_uncertainty() {
+        const SOURCE: &str = "package fixture;\nclass Owner {\n    int value = helper();\n    int helper() { return sibling(); }\n    int sibling() { return 1; }\n    int recursive() { return recursive(); }\n}\n";
+        let project = InlineTestProject::with_language(Language::Java)
+            .file("src/Owner.java", SOURCE)
+            .build();
+        let file = project.file("src/Owner.java");
+        let analyzer = JavaAnalyzer::new(project.project_dyn());
+        let declarations = analyzer.declarations(&file);
+        let declaration = |name: &str, field: bool| {
+            declarations
+                .iter()
+                .find(|unit| {
+                    unit.terminal_name() == name
+                        && if field {
+                            unit.is_field()
+                        } else {
+                            unit.is_callable()
+                        }
+                })
+                .unwrap_or_else(|| panic!("the real Java analyzer must retain Owner.{name}"))
+                .clone()
+        };
+        let field = declaration("value", true);
+        let helper = declaration("helper", false);
+        let sibling = declaration("sibling", false);
+        let recursive = declaration("recursive", false);
+        let catalog = CanonicalWorkspaceUsageCatalog::build_with_cancellation(
+            &analyzer,
+            &CancellationToken::default(),
+        )
+        .expect("the real stable analyzer snapshot must build a canonical catalog");
+        let generation = catalog.generation;
+        let self_receiver_row =
+            |marker: &str, token: &str, enclosing: &CodeUnit, target: &CodeUnit| {
+                let marker_start = SOURCE
+                    .find(marker)
+                    .unwrap_or_else(|| panic!("the fixture must contain {marker}"));
+                let start = marker_start
+                    + marker
+                        .find(token)
+                        .unwrap_or_else(|| panic!("{marker} must contain {token}"));
+                let mut row = canonical_row(
+                    &file,
+                    test_range(start, start + token.len(), 1),
+                    enclosing,
+                    target,
+                    Some(ReferenceKind::MethodCall),
+                    UsageProof::Unproven,
+                );
+                row.usage_kind = UsageHitKind::SelfReceiver;
+                row.generation = generation;
+                row
+            };
+        let rows = [
+            self_receiver_row("value = helper()", "helper", &field, &helper),
+            self_receiver_row("return sibling()", "sibling", &helper, &sibling),
+            self_receiver_row("return recursive()", "recursive", &recursive, &recursive),
+        ];
+
+        let graph = complete_canonical_graph(
+            reduce_canonical_reference_edge_rows_to_workspace_usage_graph(
+                catalog,
+                &rows,
+                generation,
+                &EdgeCompleteness::Complete,
+                &BTreeSet::from([UsageEcosystem::Jvm]),
+                &CancellationToken::default(),
+            ),
+        );
+        let helper = node_index(&graph, &helper);
+        let sibling = node_index(&graph, &sibling);
+        let recursive = node_index(&graph, &recursive);
+        assert_eq!(
+            graph.nodes[helper].unproven_inbound, 1,
+            "an implicit call owned by a field remains target-local uncertainty"
+        );
+        assert_eq!(
+            graph.nodes[sibling].unproven_inbound, 1,
+            "a non-recursive same-owner sibling call remains target-local uncertainty"
+        );
+        assert_eq!(
+            graph.nodes[recursive].unproven_inbound, 0,
+            "a truly recursive grouped self edge remains excluded"
+        );
+        assert!(
+            graph
+                .nodes
+                .iter()
+                .all(|node| node.truncated_inbound.is_none()),
+            "unproven self-receivers never consume the proven callsite cap"
+        );
+        assert!(
+            graph.edges.is_empty(),
+            "unproven self-receivers never add ranking topology"
+        );
+    }
+
+    #[test]
+    fn canonical_grouped_self_and_every_definition_span_are_excluded() {
+        let part_a_file = test_file("src/Widget.PartA.cs");
+        let part_b_file = test_file("src/Widget.PartB.cs");
+        let caller_file = test_file("src/Caller.cs");
+        let target_a = test_unit(&part_a_file, CodeUnitType::Class, "Widget");
+        let target_b = test_unit(&part_b_file, CodeUnitType::Class, "Widget");
+        let target_member = test_unit(&part_b_file, CodeUnitType::Function, "Widget.inside");
+        let caller = test_unit(&caller_file, CodeUnitType::Function, "Caller.run");
+        let catalog = canonical_catalog([
+            (
+                target_a.clone(),
+                vec![test_range(10, 100, 1), test_range(110, 120, 10)],
+            ),
+            (
+                target_b.clone(),
+                vec![test_range(200, 300, 20), test_range(320, 330, 30)],
+            ),
+            (target_member.clone(), vec![test_range(315, 335, 29)]),
+            (caller.clone(), vec![test_range(0, 80, 1)]),
+        ]);
+        let target_catalog_index = catalog
+            .index_for_id(&target_a.declaration_id())
+            .expect("the grouped target belongs to the canonical catalog");
+        assert_eq!(catalog.declaration_spans(target_catalog_index).len(), 4);
+        let rows = vec![
+            canonical_row(
+                &part_b_file,
+                test_range(400, 406, 40),
+                &target_b,
+                &target_a,
+                Some(ReferenceKind::FieldRead),
+                UsageProof::Proven,
+            ),
+            canonical_row(
+                &part_b_file,
+                test_range(322, 328, 30),
+                &target_member,
+                &target_a,
+                Some(ReferenceKind::FieldRead),
+                UsageProof::Proven,
+            ),
+            canonical_row(
+                &part_b_file,
+                test_range(323, 329, 30),
+                &target_member,
+                &target_a,
+                Some(ReferenceKind::FieldRead),
+                UsageProof::Unproven,
+            ),
+            canonical_row(
+                &caller_file,
+                test_range(100, 106, 7),
+                &caller,
+                &target_a,
+                Some(ReferenceKind::FieldRead),
+                UsageProof::Proven,
+            ),
+        ];
+        let selected = BTreeSet::from([UsageEcosystem::CSharp]);
+        let graph =
+            complete_canonical_graph(reduce_canonical_reference_edges_to_workspace_usage_graph(
+                catalog,
+                &rows,
+                &EdgeCompleteness::Complete,
+                &selected,
+                &CancellationToken::default(),
+            ));
+        let target = node_index(&graph, &target_a);
+        let caller = node_index(&graph, &caller);
+        let target_member = node_index(&graph, &target_member);
+        assert_eq!(graph.nodes[target].declaration_ids.len(), 2);
+        assert_eq!(graph.nodes[target].unproven_inbound, 0);
+        assert!(
+            graph
+                .edges
+                .iter()
+                .any(|edge| edge.from == caller && edge.to == target)
+        );
+        assert!(
+            graph
+                .edges
+                .iter()
+                .all(|edge| !(edge.from == target_member && edge.to == target)),
+            "a site inside a grouped declaration's non-primary range is not graph topology"
+        );
+        assert!(
+            graph.edges.iter().all(|edge| edge.from != target),
+            "two declarations grouped into one node form a self edge even when their IDs differ"
+        );
+    }
+
+    #[test]
+    fn canonical_workspace_boundary_ignores_only_field_target_kind_uncertainty() {
+        const SOURCE: &str = "package fixture;\nclass Target { int value; void run() {} }\nclass Caller { void call(Target target) { target.value = 1; target.run(); } }\n";
+        let project = InlineTestProject::with_language(Language::Java)
+            .file("src/Fixture.java", SOURCE)
+            .build();
+        let file = project.file("src/Fixture.java");
+        let analyzer = JavaAnalyzer::new(project.project_dyn());
+        let declarations = analyzer.declarations(&file);
+        let caller = declarations
+            .iter()
+            .find(|unit| unit.is_callable() && unit.terminal_name() == "call")
+            .expect("the real Java analyzer must retain Caller.call")
+            .clone();
+        let target = declarations
+            .iter()
+            .find(|unit| unit.is_callable() && unit.terminal_name() == "run")
+            .expect("the real Java analyzer must retain Target.run")
+            .clone();
+        let field = declarations
+            .iter()
+            .find(|unit| unit.is_field() && unit.terminal_name() == "value")
+            .expect("the real Java analyzer must retain Target.value")
+            .clone();
+        let catalog = CanonicalWorkspaceUsageCatalog::build_with_cancellation(
+            &analyzer,
+            &CancellationToken::default(),
+        )
+        .expect("the real stable analyzer snapshot must build a canonical catalog");
+        let generation = catalog.generation;
+        assert!(
+            catalog.index_for_id(&field.declaration_id()).is_none(),
+            "canonical fields stay outside the workspace ranking node domain"
+        );
+
+        let value_start = SOURCE
+            .find("target.value")
+            .expect("the fixture must contain its field use")
+            + "target.".len();
+        let mut field_row = canonical_row(
+            &file,
+            test_range(value_start, value_start + "value".len(), 3),
+            &caller,
+            &field,
+            None,
+            UsageProof::Proven,
+        );
+        field_row.generation = generation;
+        let canonical_completeness = EdgeCompleteness::Incomplete {
+            reasons: vec![EdgeIncompleteReason::AxisUnsupported(
+                EdgeAxis::KindClassification,
+            )],
+        };
+        assert!(
+            !canonical_completeness.covers(EdgeAxis::KindClassification),
+            "the broad canonical stream still reports its field-only kind gap"
+        );
+        let field_graph = complete_canonical_graph(
+            reduce_canonical_reference_edge_rows_to_workspace_usage_graph(
+                catalog,
+                &[field_row],
+                generation,
+                &EdgeCompleteness::Complete,
+                &BTreeSet::from([UsageEcosystem::Jvm]),
+                &CancellationToken::default(),
+            ),
+        );
+        assert!(
+            field_graph.edges.is_empty(),
+            "a field target contributes no ranking topology"
+        );
+
+        let catalog = CanonicalWorkspaceUsageCatalog::build_with_cancellation(
+            &analyzer,
+            &CancellationToken::default(),
+        )
+        .expect("the same stable snapshot must rebuild exactly");
+        let call_start = SOURCE
+            .find("target.run")
+            .expect("the fixture must contain its callable use")
+            + "target.".len();
+        let mut callable_row = canonical_row(
+            &file,
+            test_range(call_start, call_start + "run".len(), 3),
+            &caller,
+            &target,
+            None,
+            UsageProof::Proven,
+        );
+        callable_row.generation = generation;
+        assert!(
+            matches!(
+                reduce_canonical_reference_edge_rows_to_workspace_usage_graph(
+                    catalog,
+                    &[callable_row],
+                    generation,
+                    &EdgeCompleteness::Complete,
+                    &BTreeSet::from([UsageEcosystem::Jvm]),
+                    &CancellationToken::default(),
+                ),
+                CanonicalWorkspaceUsageGraphBuildOutcome::Incomplete(_)
+            ),
+            "missing kind evidence on a rankable target must remain visible even if an upstream status incorrectly claims the axis"
         );
     }
 
@@ -3246,118 +4225,6 @@ mod tests {
             error.to_string().contains("cover different fragments"),
             "unexpected snapshot coverage error: {error}"
         );
-    }
-
-    #[derive(Debug, PartialEq, Eq)]
-    struct SelectedJavaBuildMetrics {
-        complete: bool,
-        generation: u64,
-        reference_count: usize,
-        projected_edge_count: usize,
-        batch_count: usize,
-        node_count: usize,
-        edge_count: usize,
-        incomplete_node_count: usize,
-        retained_bytes: usize,
-    }
-
-    fn selected_java_build_metrics(
-        outcome: SelectedWorkspaceUsageRankingBuildOutcome,
-    ) -> SelectedJavaBuildMetrics {
-        let (complete, graph) = match outcome {
-            SelectedWorkspaceUsageRankingBuildOutcome::Complete(graph) => (true, graph),
-            SelectedWorkspaceUsageRankingBuildOutcome::Incomplete(graph) => (false, graph),
-            SelectedWorkspaceUsageRankingBuildOutcome::Cancelled => {
-                panic!("an uncancelled selected Java build must publish a graph")
-            }
-            SelectedWorkspaceUsageRankingBuildOutcome::Stale => {
-                panic!("a stable selected Java build must not be stale")
-            }
-            SelectedWorkspaceUsageRankingBuildOutcome::Unavailable(reason) => {
-                panic!("selected Java graph inputs must be available: {reason}")
-            }
-        };
-        SelectedJavaBuildMetrics {
-            complete,
-            generation: graph.generation(),
-            reference_count: graph.reference_count(),
-            projected_edge_count: graph.projected_edge_count(),
-            batch_count: graph.batch_count(),
-            node_count: graph.node_count(),
-            edge_count: graph.edge_count(),
-            incomplete_node_count: graph.incomplete_node_count(),
-            retained_bytes: graph.retained_bytes(),
-        }
-    }
-
-    fn selected_java_ranking_adapter_fixture() -> (
-        BuiltInlineTestProject,
-        SelectedWorkspaceUsageRankingGraph,
-        ProjectFile,
-        Vec<ProjectFile>,
-    ) {
-        let project = InlineTestProject::with_language(Language::Java)
-            .file("src/Seed.java", "class Seed {}\n")
-            .file("src/ZCallTarget.java", "class ZCallTarget {}\n")
-            .file("src/AMemberTarget.java", "class AMemberTarget {}\n")
-            .build();
-        let seed = project.file("src/Seed.java");
-        let call_target = project.file("src/ZCallTarget.java");
-        let member_target = project.file("src/AMemberTarget.java");
-        let mut node_indices_by_file = HashMap::default();
-        node_indices_by_file.insert(seed.clone(), vec![0]);
-        node_indices_by_file.insert(call_target.clone(), vec![1]);
-        node_indices_by_file.insert(member_target.clone(), vec![2]);
-        let graph = WorkspaceUsageRankingGraph {
-            nodes: vec![
-                WorkspaceUsageRankingNode {
-                    primary_file: seed.clone(),
-                    seed_files: vec![seed.clone()],
-                    incomplete: false,
-                    contains_tests: None,
-                },
-                WorkspaceUsageRankingNode {
-                    primary_file: call_target.clone(),
-                    seed_files: vec![call_target.clone()],
-                    incomplete: false,
-                    contains_tests: None,
-                },
-                WorkspaceUsageRankingNode {
-                    primary_file: member_target.clone(),
-                    seed_files: vec![member_target.clone()],
-                    incomplete: false,
-                    contains_tests: None,
-                },
-            ],
-            edges: vec![
-                WorkspaceUsageEdge {
-                    from: 0,
-                    to: 1,
-                    counts: UsageReferenceCounts {
-                        calls: 1,
-                        ..UsageReferenceCounts::default()
-                    },
-                },
-                WorkspaceUsageEdge {
-                    from: 0,
-                    to: 2,
-                    counts: UsageReferenceCounts {
-                        members: 1,
-                        ..UsageReferenceCounts::default()
-                    },
-                },
-            ],
-            node_indices_by_file,
-            resolved_ecosystems: vec![UsageEcosystem::Jvm],
-        };
-        let graph = SelectedWorkspaceUsageRankingGraph {
-            graph,
-            generation: CANONICAL_GENERATION,
-            reference_count: 2,
-            projected_edge_count: 2,
-            batch_count: 1,
-        };
-        (project, graph, seed, vec![call_target, member_target])
     }
 
     #[test]
@@ -3708,846 +4575,6 @@ mod tests {
             CanonicalWorkspaceUsageCatalog::build_with_cancellation(&analyzer, &cancelled)
                 .is_none(),
             "cancellation must publish no partial canonical catalog"
-        );
-    }
-
-    #[test]
-    fn canonical_workspace_boundary_ignores_only_field_target_kind_uncertainty() {
-        const SOURCE: &str = "package fixture;\nclass Target { int value; void run() {} }\nclass Caller { void call(Target target) { target.value = 1; target.run(); } }\n";
-        let project = InlineTestProject::with_language(Language::Java)
-            .file("src/Fixture.java", SOURCE)
-            .build();
-        let file = project.file("src/Fixture.java");
-        let analyzer = JavaAnalyzer::new(project.project_dyn());
-        let declarations = analyzer.declarations(&file);
-        let caller = declarations
-            .iter()
-            .find(|unit| unit.is_callable() && unit.terminal_name() == "call")
-            .expect("the real Java analyzer must retain Caller.call")
-            .clone();
-        let target = declarations
-            .iter()
-            .find(|unit| unit.is_callable() && unit.terminal_name() == "run")
-            .expect("the real Java analyzer must retain Target.run")
-            .clone();
-        let field = declarations
-            .iter()
-            .find(|unit| unit.is_field() && unit.terminal_name() == "value")
-            .expect("the real Java analyzer must retain Target.value")
-            .clone();
-        let catalog = CanonicalWorkspaceUsageCatalog::build_with_cancellation(
-            &analyzer,
-            &CancellationToken::default(),
-        )
-        .expect("the real stable analyzer snapshot must build a canonical catalog");
-        let generation = catalog.generation;
-        assert!(
-            catalog.index_for_id(&field.declaration_id()).is_none(),
-            "canonical fields stay outside the workspace ranking node domain"
-        );
-
-        let value_start = SOURCE
-            .find("target.value")
-            .expect("the fixture must contain its field use")
-            + "target.".len();
-        let mut field_row = canonical_row(
-            &file,
-            test_range(value_start, value_start + "value".len(), 3),
-            &caller,
-            &field,
-            None,
-            UsageProof::Proven,
-        );
-        field_row.generation = generation;
-        let canonical_completeness = EdgeCompleteness::Incomplete {
-            reasons: vec![EdgeIncompleteReason::AxisUnsupported(
-                EdgeAxis::KindClassification,
-            )],
-        };
-        assert!(
-            !canonical_completeness.covers(EdgeAxis::KindClassification),
-            "the broad canonical stream still reports its field-only kind gap"
-        );
-        let field_graph = complete_canonical_graph(
-            reduce_canonical_reference_edge_rows_to_workspace_usage_graph(
-                catalog,
-                &[field_row],
-                generation,
-                &EdgeCompleteness::Complete,
-                &BTreeSet::from([UsageEcosystem::Jvm]),
-                &CancellationToken::default(),
-            ),
-        );
-        assert!(
-            field_graph.edges.is_empty(),
-            "a field target contributes no ranking topology"
-        );
-
-        let catalog = CanonicalWorkspaceUsageCatalog::build_with_cancellation(
-            &analyzer,
-            &CancellationToken::default(),
-        )
-        .expect("the same stable snapshot must rebuild exactly");
-        let call_start = SOURCE
-            .find("target.run")
-            .expect("the fixture must contain its callable use")
-            + "target.".len();
-        let mut callable_row = canonical_row(
-            &file,
-            test_range(call_start, call_start + "run".len(), 3),
-            &caller,
-            &target,
-            None,
-            UsageProof::Proven,
-        );
-        callable_row.generation = generation;
-        assert!(
-            matches!(
-                reduce_canonical_reference_edge_rows_to_workspace_usage_graph(
-                    catalog,
-                    &[callable_row],
-                    generation,
-                    &EdgeCompleteness::Complete,
-                    &BTreeSet::from([UsageEcosystem::Jvm]),
-                    &CancellationToken::default(),
-                ),
-                CanonicalWorkspaceUsageGraphBuildOutcome::Incomplete(_)
-            ),
-            "missing kind evidence on a rankable target must remain visible even if an upstream status incorrectly claims the axis"
-        );
-    }
-
-    #[test]
-    fn canonical_rows_deduplicate_lines_and_keep_the_strongest_kind() {
-        let caller_file = test_file("src/Caller.java");
-        let target_file = test_file("src/Target.java");
-        let other_file = test_file("src/Other.java");
-        let caller = test_unit(&caller_file, CodeUnitType::Function, "Caller.run");
-        let target = test_unit(&target_file, CodeUnitType::Class, "Target");
-        let other = test_unit(&other_file, CodeUnitType::Class, "Other");
-        let catalog = canonical_catalog([
-            (caller.clone(), vec![test_range(0, 80, 1)]),
-            (target.clone(), vec![test_range(0, 80, 1)]),
-            (other.clone(), vec![test_range(0, 80, 1)]),
-        ]);
-        let rows = vec![
-            canonical_row(
-                &caller_file,
-                test_range(120, 126, 7),
-                &caller,
-                &target,
-                Some(ReferenceKind::TypeReference),
-                UsageProof::Proven,
-            ),
-            canonical_row(
-                &caller_file,
-                test_range(130, 136, 7),
-                &caller,
-                &target,
-                Some(ReferenceKind::MethodCall),
-                UsageProof::Proven,
-            ),
-            canonical_row(
-                &caller_file,
-                test_range(140, 146, 8),
-                &caller,
-                &target,
-                Some(ReferenceKind::FieldRead),
-                UsageProof::Proven,
-            ),
-            canonical_row(
-                &caller_file,
-                test_range(150, 156, 9),
-                &caller,
-                &other,
-                Some(ReferenceKind::FieldWrite),
-                UsageProof::Proven,
-            ),
-        ];
-        let selected = BTreeSet::from([UsageEcosystem::Jvm]);
-        let graph =
-            complete_canonical_graph(reduce_canonical_reference_edges_to_workspace_usage_graph(
-                catalog,
-                &rows,
-                &EdgeCompleteness::Complete,
-                &selected,
-                &CancellationToken::default(),
-            ));
-
-        let caller = node_index(&graph, &caller);
-        let target = node_index(&graph, &target);
-        let edge = graph
-            .edges
-            .iter()
-            .find(|edge| edge.from == caller && edge.to == target)
-            .expect("the proven caller-to-target edge must be retained");
-        assert_eq!(
-            edge.counts,
-            UsageReferenceCounts {
-                calls: 1,
-                members: 1,
-                ..UsageReferenceCounts::default()
-            },
-            "one file line is one weight and its strongest category wins"
-        );
-        assert!(
-            graph
-                .edges
-                .windows(2)
-                .all(|edges| (edges[0].from, edges[0].to) < (edges[1].from, edges[1].to)),
-            "canonical edges must be strictly sorted by exact node indices"
-        );
-    }
-
-    #[test]
-    fn canonical_callsite_cap_deduplicates_bytes_and_counts_definition_overlap() {
-        let caller_file = test_file("src/Caller.java");
-        let target_file = test_file("src/Target.java");
-        let caller = test_unit(&caller_file, CodeUnitType::Function, "Caller.run");
-        let target = test_unit(&target_file, CodeUnitType::Class, "Target");
-        let target_member = test_unit(&target_file, CodeUnitType::Function, "Target.inside");
-        let make_catalog = || {
-            canonical_catalog([
-                (caller.clone(), vec![test_range(0, 80, 1)]),
-                (target.clone(), vec![test_range(0, 50, 1)]),
-                (target_member.clone(), vec![test_range(10, 20, 2)]),
-            ])
-        };
-        let mut rows = (0..MAX_CALLSITES)
-            .map(|index| {
-                canonical_row(
-                    &caller_file,
-                    test_range(100 + index, 101 + index, 8),
-                    &caller,
-                    &target,
-                    Some(ReferenceKind::FieldRead),
-                    UsageProof::Proven,
-                )
-            })
-            .collect::<Vec<_>>();
-        rows.push(rows[0].clone());
-        let selected = BTreeSet::from([UsageEcosystem::Jvm]);
-
-        let graph_at_cap =
-            complete_canonical_graph(reduce_canonical_reference_edges_to_workspace_usage_graph(
-                make_catalog(),
-                &rows,
-                &EdgeCompleteness::Complete,
-                &selected,
-                &CancellationToken::default(),
-            ));
-        let target_at_cap = node_index(&graph_at_cap, &target);
-        assert_eq!(graph_at_cap.nodes[target_at_cap].truncated_inbound, None);
-        assert!(
-            graph_at_cap
-                .edges
-                .iter()
-                .any(|edge| edge.to == target_at_cap),
-            "an exact duplicate byte offset must not push a target over the cap"
-        );
-
-        rows.push(canonical_row(
-            &target_file,
-            test_range(12, 13, 2),
-            &target_member,
-            &target,
-            Some(ReferenceKind::FieldRead),
-            UsageProof::Proven,
-        ));
-        let truncated =
-            complete_canonical_graph(reduce_canonical_reference_edges_to_workspace_usage_graph(
-                make_catalog(),
-                &rows,
-                &EdgeCompleteness::Complete,
-                &selected,
-                &CancellationToken::default(),
-            ));
-        let truncated_target = node_index(&truncated, &target);
-        assert_eq!(
-            truncated.nodes[truncated_target].truncated_inbound,
-            Some(MAX_CALLSITES + 1),
-            "the legacy cap counts a proven target site before definition-overlap exclusion"
-        );
-        assert!(
-            truncated
-                .edges
-                .iter()
-                .all(|edge| edge.to != truncated_target),
-            "every proven inbound edge to a truncated target must be removed"
-        );
-    }
-
-    #[test]
-    fn canonical_unproven_rows_are_target_local_and_never_add_topology_or_cap() {
-        let caller_file = test_file("src/Caller.java");
-        let target_file = test_file("src/Target.java");
-        let python_caller_file = test_file("src/caller.py");
-        let python_target_file = test_file("src/target.py");
-        let caller = test_unit(&caller_file, CodeUnitType::Function, "Caller.run");
-        let target = test_unit(&target_file, CodeUnitType::Class, "Target");
-        let python_caller = test_unit(
-            &python_caller_file,
-            CodeUnitType::Function,
-            "PythonCaller.run",
-        );
-        let python_target = test_unit(&python_target_file, CodeUnitType::Class, "PythonTarget");
-        let make_catalog = || {
-            canonical_catalog([
-                (caller.clone(), vec![test_range(0, 80, 1)]),
-                (target.clone(), vec![test_range(0, 80, 1)]),
-                (python_caller.clone(), vec![test_range(0, 80, 1)]),
-                (python_target.clone(), vec![test_range(0, 80, 1)]),
-            ])
-        };
-        let first = canonical_row(
-            &caller_file,
-            test_range(100, 106, 7),
-            &caller,
-            &target,
-            Some(ReferenceKind::MethodCall),
-            UsageProof::Unproven,
-        );
-        let rows = vec![
-            first.clone(),
-            first,
-            canonical_row(
-                &caller_file,
-                test_range(120, 126, 8),
-                &caller,
-                &target,
-                Some(ReferenceKind::MethodCall),
-                UsageProof::Unproven,
-            ),
-            canonical_row(
-                &python_caller_file,
-                test_range(100, 106, 7),
-                &python_caller,
-                &python_target,
-                Some(ReferenceKind::MethodCall),
-                UsageProof::Unproven,
-            ),
-        ];
-        let selected = BTreeSet::from([UsageEcosystem::Jvm]);
-        let outcome = reduce_canonical_reference_edges_to_workspace_usage_graph(
-            make_catalog(),
-            &rows,
-            &EdgeCompleteness::Incomplete {
-                reasons: vec![EdgeIncompleteReason::ForwardResolutionIncomplete],
-            },
-            &selected,
-            &CancellationToken::default(),
-        );
-        let CanonicalWorkspaceUsageGraphBuildOutcome::Incomplete(graph) = outcome else {
-            panic!("incomplete forward input must produce an incomplete graph");
-        };
-        let target = node_index(&graph, &target);
-        let python_target = node_index(&graph, &python_target);
-        assert_eq!(graph.nodes[target].unproven_inbound, 2);
-        assert_eq!(graph.nodes[target].truncated_inbound, None);
-        assert_eq!(graph.nodes[python_target].unproven_inbound, 0);
-        assert!(graph.edges.iter().all(|edge| edge.to != target));
-        assert_eq!(graph.resolved_ecosystems, vec![UsageEcosystem::Jvm]);
-
-        let cancellation = CancellationToken::new();
-        cancellation.cancel();
-        assert!(matches!(
-            reduce_canonical_reference_edges_to_workspace_usage_graph(
-                make_catalog(),
-                &rows,
-                &EdgeCompleteness::Complete,
-                &selected,
-                &cancellation,
-            ),
-            CanonicalWorkspaceUsageGraphBuildOutcome::Cancelled
-        ));
-        assert!(matches!(
-            reduce_canonical_reference_edges_to_workspace_usage_graph(
-                make_catalog(),
-                &rows,
-                &EdgeCompleteness::Incomplete {
-                    reasons: vec![EdgeIncompleteReason::Cancelled],
-                },
-                &selected,
-                &CancellationToken::default(),
-            ),
-            CanonicalWorkspaceUsageGraphBuildOutcome::Cancelled
-        ));
-    }
-
-    #[test]
-    fn canonical_static_and_missing_kinds_are_other_and_keep_the_graph_incomplete() {
-        let caller_file = test_file("src/Caller.java");
-        let target_file = test_file("src/Target.java");
-        let caller = test_unit(&caller_file, CodeUnitType::Function, "Caller.run");
-        let target = test_unit(&target_file, CodeUnitType::Function, "Target.run");
-        let catalog = canonical_catalog([
-            (caller.clone(), vec![test_range(0, 80, 1)]),
-            (target.clone(), vec![test_range(0, 80, 1)]),
-        ]);
-        let rows = vec![
-            canonical_row(
-                &caller_file,
-                test_range(100, 106, 7),
-                &caller,
-                &target,
-                Some(ReferenceKind::StaticReference),
-                UsageProof::Proven,
-            ),
-            canonical_row(
-                &caller_file,
-                test_range(120, 126, 8),
-                &caller,
-                &target,
-                None,
-                UsageProof::Proven,
-            ),
-        ];
-        let selected = BTreeSet::from([UsageEcosystem::Jvm]);
-        let outcome = reduce_canonical_reference_edges_to_workspace_usage_graph(
-            catalog,
-            &rows,
-            &EdgeCompleteness::Complete,
-            &selected,
-            &CancellationToken::default(),
-        );
-        let CanonicalWorkspaceUsageGraphBuildOutcome::Incomplete(graph) = outcome else {
-            panic!("coarse static/missing kinds must keep exact weighting incomplete");
-        };
-        let caller = node_index(&graph, &caller);
-        let target = node_index(&graph, &target);
-        let edge = graph
-            .edges
-            .iter()
-            .find(|edge| edge.from == caller && edge.to == target)
-            .expect("best-effort rows must remain useful positive evidence");
-        assert_eq!(
-            edge.counts,
-            UsageReferenceCounts {
-                other: 2,
-                ..UsageReferenceCounts::default()
-            }
-        );
-    }
-
-    #[test]
-    fn canonical_complete_outcome_requires_every_ranking_axis() {
-        let caller_file = test_file("src/Caller.java");
-        let target_file = test_file("src/Target.java");
-        let caller = test_unit(&caller_file, CodeUnitType::Function, "Caller.run");
-        let target = test_unit(&target_file, CodeUnitType::Function, "Target.run");
-        let make_catalog = || {
-            canonical_catalog([
-                (caller.clone(), vec![test_range(0, 80, 1)]),
-                (target.clone(), vec![test_range(0, 80, 1)]),
-            ])
-        };
-        let rows = [canonical_row(
-            &caller_file,
-            test_range(100, 106, 7),
-            &caller,
-            &target,
-            Some(ReferenceKind::MethodCall),
-            UsageProof::Proven,
-        )];
-        let selected = BTreeSet::from([UsageEcosystem::Jvm]);
-
-        for axis in [
-            EdgeAxis::ForwardProjection,
-            EdgeAxis::OwnerClassification,
-            EdgeAxis::KindClassification,
-        ] {
-            assert!(matches!(
-                reduce_canonical_reference_edges_to_workspace_usage_graph(
-                    make_catalog(),
-                    &rows,
-                    &EdgeCompleteness::Incomplete {
-                        reasons: vec![EdgeIncompleteReason::AxisUnsupported(axis)],
-                    },
-                    &selected,
-                    &CancellationToken::default(),
-                ),
-                CanonicalWorkspaceUsageGraphBuildOutcome::Incomplete(_)
-            ));
-        }
-    }
-
-    #[test]
-    #[should_panic(expected = "row generation must match its catalog generation")]
-    fn canonical_mixed_generation_rows_fail_closed() {
-        let caller_file = test_file("src/Caller.java");
-        let target_file = test_file("src/Target.java");
-        let caller = test_unit(&caller_file, CodeUnitType::Function, "Caller.run");
-        let target = test_unit(&target_file, CodeUnitType::Function, "Target.run");
-        let catalog = canonical_catalog([
-            (caller.clone(), vec![test_range(0, 80, 1)]),
-            (target.clone(), vec![test_range(0, 80, 1)]),
-        ]);
-        let current = canonical_row(
-            &caller_file,
-            test_range(100, 106, 7),
-            &caller,
-            &target,
-            Some(ReferenceKind::MethodCall),
-            UsageProof::Proven,
-        );
-        let mut stale = current.clone();
-        stale.generation = CANONICAL_GENERATION + 1;
-
-        let _ = reduce_canonical_reference_edges_to_workspace_usage_graph(
-            catalog,
-            &[current, stale],
-            &EdgeCompleteness::Complete,
-            &BTreeSet::from([UsageEcosystem::Jvm]),
-            &CancellationToken::default(),
-        );
-    }
-
-    #[test]
-    #[should_panic(expected = "status generation must match its catalog generation")]
-    fn canonical_status_generation_mismatch_fails_closed_without_rows() {
-        let target_file = test_file("src/Target.java");
-        let target = test_unit(&target_file, CodeUnitType::Class, "Target");
-        let catalog = canonical_catalog([(target, vec![test_range(0, 80, 1)])]);
-
-        let _ = reduce_canonical_reference_edge_rows_to_workspace_usage_graph(
-            catalog,
-            &[],
-            CANONICAL_GENERATION + 1,
-            &EdgeCompleteness::Complete,
-            &BTreeSet::from([UsageEcosystem::Jvm]),
-            &CancellationToken::default(),
-        );
-    }
-
-    #[test]
-    fn canonical_metadata_stays_out_of_the_legacy_primary_only_catalog() {
-        let caller_file = test_file("src/Caller.java");
-        let target_file = test_file("src/Target.java");
-        let caller = test_unit(&caller_file, CodeUnitType::Function, "Caller.run");
-        let target = test_unit(&target_file, CodeUnitType::Function, "Target.run");
-        let catalog = WorkspaceUsageCatalog::from_declarations(
-            vec![
-                (caller.clone(), Some(test_range(0, 80, 1))),
-                (target.clone(), Some(test_range(0, 80, 1))),
-            ],
-            &CancellationToken::default(),
-        )
-        .expect("the legacy catalog still builds for legacy consumers");
-        let canonical = CanonicalWorkspaceUsageCatalog::from_declarations_with_all_ranges(
-            vec![
-                (caller, vec![test_range(0, 80, 1)]),
-                (target, vec![test_range(0, 80, 1)]),
-            ],
-            CANONICAL_GENERATION,
-            &CancellationToken::default(),
-        )
-        .expect("the canonical wrapper builds separately");
-
-        assert_eq!(catalog.nodes.len(), canonical.nodes().len());
-        assert_eq!(
-            canonical.declaration_spans_by_node.len(),
-            canonical.nodes().len()
-        );
-    }
-
-    #[test]
-    #[should_panic(expected = "canonical reference-edge target")]
-    fn canonical_graph_target_rows_fail_closed_when_the_crosswalk_is_missing() {
-        let caller_file = test_file("src/Caller.java");
-        let target_file = test_file("src/Target.java");
-        let caller = test_unit(&caller_file, CodeUnitType::Function, "Caller.run");
-        let target = test_unit(&target_file, CodeUnitType::Function, "Target.run");
-        let catalog = canonical_catalog([(caller.clone(), vec![test_range(0, 80, 1)])]);
-        let rows = [canonical_row(
-            &caller_file,
-            test_range(100, 106, 7),
-            &caller,
-            &target,
-            Some(ReferenceKind::MethodCall),
-            UsageProof::Proven,
-        )];
-
-        let _ = reduce_canonical_reference_edges_to_workspace_usage_graph(
-            catalog,
-            &rows,
-            &EdgeCompleteness::Complete,
-            &BTreeSet::from([UsageEcosystem::Jvm]),
-            &CancellationToken::default(),
-        );
-    }
-
-    #[test]
-    #[should_panic(expected = "canonical reference-edge source")]
-    fn canonical_graph_source_rows_fail_closed_when_the_crosswalk_is_missing() {
-        let caller_file = test_file("src/Caller.java");
-        let target_file = test_file("src/Target.java");
-        let caller = test_unit(&caller_file, CodeUnitType::Function, "Caller.run");
-        let target = test_unit(&target_file, CodeUnitType::Function, "Target.run");
-        let catalog = canonical_catalog([(target.clone(), vec![test_range(0, 80, 1)])]);
-        let rows = [canonical_row(
-            &caller_file,
-            test_range(100, 106, 7),
-            &caller,
-            &target,
-            Some(ReferenceKind::MethodCall),
-            UsageProof::Proven,
-        )];
-
-        let _ = reduce_canonical_reference_edges_to_workspace_usage_graph(
-            catalog,
-            &rows,
-            &EdgeCompleteness::Complete,
-            &BTreeSet::from([UsageEcosystem::Jvm]),
-            &CancellationToken::default(),
-        );
-    }
-
-    #[test]
-    fn canonical_field_targets_are_skipped_and_field_sources_are_inbound_only() {
-        let caller_file = test_file("src/Caller.java");
-        let target_file = test_file("src/Target.java");
-        let field_source_file = test_file("src/FieldSource.java");
-        let caller = test_unit(&caller_file, CodeUnitType::Function, "Caller.run");
-        let target = test_unit(&target_file, CodeUnitType::Class, "Target");
-        let field_target = test_unit(&target_file, CodeUnitType::Field, "Target.value");
-        let field_source = test_unit(&field_source_file, CodeUnitType::Field, "FieldSource.value");
-        let catalog = canonical_catalog([
-            (caller.clone(), vec![test_range(0, 80, 1)]),
-            (target.clone(), vec![test_range(0, 80, 1)]),
-        ]);
-        let mut rows = vec![canonical_row(
-            &caller_file,
-            test_range(100, 106, 7),
-            &caller,
-            &field_target,
-            Some(ReferenceKind::FieldRead),
-            UsageProof::Proven,
-        )];
-        rows.extend((0..=MAX_CALLSITES).map(|index| {
-            canonical_row(
-                &field_source_file,
-                test_range(100 + index, 101 + index, 8),
-                &field_source,
-                &target,
-                Some(ReferenceKind::FieldRead),
-                UsageProof::Proven,
-            )
-        }));
-        rows.push(canonical_row(
-            &field_source_file,
-            test_range(MAX_CALLSITES + 200, MAX_CALLSITES + 201, 9),
-            &field_source,
-            &target,
-            Some(ReferenceKind::FieldRead),
-            UsageProof::Unproven,
-        ));
-
-        let graph =
-            complete_canonical_graph(reduce_canonical_reference_edges_to_workspace_usage_graph(
-                catalog,
-                &rows,
-                &EdgeCompleteness::Complete,
-                &BTreeSet::from([UsageEcosystem::Jvm]),
-                &CancellationToken::default(),
-            ));
-        let target = node_index(&graph, &target);
-        assert_eq!(graph.nodes.len(), 2, "fields are not rankable graph nodes");
-        assert_eq!(
-            graph.nodes[target].truncated_inbound,
-            Some(MAX_CALLSITES + 1),
-            "proven field-owned sites count toward the target cap before caller-node rejection"
-        );
-        assert_eq!(graph.nodes[target].unproven_inbound, 1);
-        assert!(graph.edges.is_empty(), "field owners never add topology");
-    }
-
-    #[test]
-    fn canonical_unproven_self_receivers_preserve_field_and_sibling_uncertainty() {
-        const SOURCE: &str = "package fixture;\nclass Owner {\n    int value = helper();\n    int helper() { return sibling(); }\n    int sibling() { return 1; }\n    int recursive() { return recursive(); }\n}\n";
-        let project = InlineTestProject::with_language(Language::Java)
-            .file("src/Owner.java", SOURCE)
-            .build();
-        let file = project.file("src/Owner.java");
-        let analyzer = JavaAnalyzer::new(project.project_dyn());
-        let declarations = analyzer.declarations(&file);
-        let declaration = |name: &str, field: bool| {
-            declarations
-                .iter()
-                .find(|unit| {
-                    unit.terminal_name() == name
-                        && if field {
-                            unit.is_field()
-                        } else {
-                            unit.is_callable()
-                        }
-                })
-                .unwrap_or_else(|| panic!("the real Java analyzer must retain Owner.{name}"))
-                .clone()
-        };
-        let field = declaration("value", true);
-        let helper = declaration("helper", false);
-        let sibling = declaration("sibling", false);
-        let recursive = declaration("recursive", false);
-        let catalog = CanonicalWorkspaceUsageCatalog::build_with_cancellation(
-            &analyzer,
-            &CancellationToken::default(),
-        )
-        .expect("the real stable analyzer snapshot must build a canonical catalog");
-        let generation = catalog.generation;
-        let self_receiver_row =
-            |marker: &str, token: &str, enclosing: &CodeUnit, target: &CodeUnit| {
-                let marker_start = SOURCE
-                    .find(marker)
-                    .unwrap_or_else(|| panic!("the fixture must contain {marker}"));
-                let start = marker_start
-                    + marker
-                        .find(token)
-                        .unwrap_or_else(|| panic!("{marker} must contain {token}"));
-                let mut row = canonical_row(
-                    &file,
-                    test_range(start, start + token.len(), 1),
-                    enclosing,
-                    target,
-                    Some(ReferenceKind::MethodCall),
-                    UsageProof::Unproven,
-                );
-                row.usage_kind = UsageHitKind::SelfReceiver;
-                row.generation = generation;
-                row
-            };
-        let rows = [
-            self_receiver_row("value = helper()", "helper", &field, &helper),
-            self_receiver_row("return sibling()", "sibling", &helper, &sibling),
-            self_receiver_row("return recursive()", "recursive", &recursive, &recursive),
-        ];
-
-        let graph = complete_canonical_graph(
-            reduce_canonical_reference_edge_rows_to_workspace_usage_graph(
-                catalog,
-                &rows,
-                generation,
-                &EdgeCompleteness::Complete,
-                &BTreeSet::from([UsageEcosystem::Jvm]),
-                &CancellationToken::default(),
-            ),
-        );
-        let helper = node_index(&graph, &helper);
-        let sibling = node_index(&graph, &sibling);
-        let recursive = node_index(&graph, &recursive);
-        assert_eq!(
-            graph.nodes[helper].unproven_inbound, 1,
-            "an implicit call owned by a field remains target-local uncertainty"
-        );
-        assert_eq!(
-            graph.nodes[sibling].unproven_inbound, 1,
-            "a non-recursive same-owner sibling call remains target-local uncertainty"
-        );
-        assert_eq!(
-            graph.nodes[recursive].unproven_inbound, 0,
-            "a truly recursive grouped self edge remains excluded"
-        );
-        assert!(
-            graph
-                .nodes
-                .iter()
-                .all(|node| node.truncated_inbound.is_none()),
-            "unproven self-receivers never consume the proven callsite cap"
-        );
-        assert!(
-            graph.edges.is_empty(),
-            "unproven self-receivers never add ranking topology"
-        );
-    }
-
-    #[test]
-    fn canonical_grouped_self_and_every_definition_span_are_excluded() {
-        let part_a_file = test_file("src/Widget.PartA.cs");
-        let part_b_file = test_file("src/Widget.PartB.cs");
-        let caller_file = test_file("src/Caller.cs");
-        let target_a = test_unit(&part_a_file, CodeUnitType::Class, "Widget");
-        let target_b = test_unit(&part_b_file, CodeUnitType::Class, "Widget");
-        let target_member = test_unit(&part_b_file, CodeUnitType::Function, "Widget.inside");
-        let caller = test_unit(&caller_file, CodeUnitType::Function, "Caller.run");
-        let catalog = canonical_catalog([
-            (
-                target_a.clone(),
-                vec![test_range(10, 100, 1), test_range(110, 120, 10)],
-            ),
-            (
-                target_b.clone(),
-                vec![test_range(200, 300, 20), test_range(320, 330, 30)],
-            ),
-            (target_member.clone(), vec![test_range(315, 335, 29)]),
-            (caller.clone(), vec![test_range(0, 80, 1)]),
-        ]);
-        let target_catalog_index = catalog
-            .index_for_id(&target_a.declaration_id())
-            .expect("the grouped target belongs to the canonical catalog");
-        assert_eq!(catalog.declaration_spans(target_catalog_index).len(), 4);
-        let rows = vec![
-            canonical_row(
-                &part_b_file,
-                test_range(400, 406, 40),
-                &target_b,
-                &target_a,
-                Some(ReferenceKind::FieldRead),
-                UsageProof::Proven,
-            ),
-            canonical_row(
-                &part_b_file,
-                test_range(322, 328, 30),
-                &target_member,
-                &target_a,
-                Some(ReferenceKind::FieldRead),
-                UsageProof::Proven,
-            ),
-            canonical_row(
-                &part_b_file,
-                test_range(323, 329, 30),
-                &target_member,
-                &target_a,
-                Some(ReferenceKind::FieldRead),
-                UsageProof::Unproven,
-            ),
-            canonical_row(
-                &caller_file,
-                test_range(100, 106, 7),
-                &caller,
-                &target_a,
-                Some(ReferenceKind::FieldRead),
-                UsageProof::Proven,
-            ),
-        ];
-        let selected = BTreeSet::from([UsageEcosystem::CSharp]);
-        let graph =
-            complete_canonical_graph(reduce_canonical_reference_edges_to_workspace_usage_graph(
-                catalog,
-                &rows,
-                &EdgeCompleteness::Complete,
-                &selected,
-                &CancellationToken::default(),
-            ));
-        let target = node_index(&graph, &target_a);
-        let caller = node_index(&graph, &caller);
-        let target_member = node_index(&graph, &target_member);
-        assert_eq!(graph.nodes[target].declaration_ids.len(), 2);
-        assert_eq!(graph.nodes[target].unproven_inbound, 0);
-        assert!(
-            graph
-                .edges
-                .iter()
-                .any(|edge| edge.from == caller && edge.to == target)
-        );
-        assert!(
-            graph
-                .edges
-                .iter()
-                .all(|edge| !(edge.from == target_member && edge.to == target)),
-            "a site inside a grouped declaration's non-primary range is not graph topology"
-        );
-        assert!(
-            graph.edges.iter().all(|edge| edge.from != target),
-            "two declarations grouped into one node form a self edge even when their IDs differ"
         );
     }
 }
